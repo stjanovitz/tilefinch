@@ -800,6 +800,137 @@ static void navigation_retire_frame_descendants(
     }
 }
 
+static bool navigation_relayout_static_fallback(NavigationSession *session);
+
+static void navigation_retire_unloaded_frame(NavigationSession *session,
+                                             NavigationFrame *frame,
+                                             const char *reason)
+{
+    if (frame->fetch_pending) {
+        (void) fetch_scheduler_cancel(session->page.resource_scheduler,
+                                      frame->fetch_request_id, reason);
+        (void) fetch_scheduler_discard(session->page.resource_scheduler,
+                                       frame->fetch_request_id);
+    }
+    navigation_drop_frame_messages(session, frame);
+    navigation_frame_presentation_destroy(session, frame);
+    script_runtime_destroy(frame->runtime);
+    frame->runtime = NULL;
+    images_destroy(&frame->images);
+    document_destroy(&frame->document);
+    frame->fetch_pending = false;
+    frame->loaded = false;
+    frame->retired = true;
+}
+
+/* A page realm that has run out of heap is retired the same way wherever
+   that is noticed: its DOM, stylesheet and layout stay, scripts stop with
+   "JavaScript stopped at its memory limit", and the static-content cascade
+   is rebuilt. Returns false when the realm still has room, so the caller's
+   failure is not a memory failure and keeps its own handling. */
+static bool navigation_retire_exhausted_page_realm(NavigationSession *session)
+{
+    if (!navigation_retire_exhausted_script_realms(session, false))
+        return false;
+    /* Frames that had not loaded can no longer start: the realm that owns
+       their elements' WindowProxies is gone, and the runtime pump that would
+       complete them stops with it. Release their fetches now instead of
+       leaving them pending for the page's lifetime. Loaded frames keep their
+       presentation, as after any other script OOM. */
+    for (size_t i = 0; i < session->page.frame_count; i++) {
+        NavigationFrame *frame = &session->page.frames[i];
+        if (!frame->retired && !frame->loaded)
+            navigation_retire_unloaded_frame(
+                session, frame, "page JavaScript stopped");
+    }
+    /* A refused rebuild keeps the committed layout usable. */
+    (void) navigation_relayout_static_fallback(session);
+    return true;
+}
+
+/* The parent realm could not set up an iframe it discovered (on a page at
+   its JS heap limit, creating the frame's WindowProxy runs out of memory).
+   That costs the frame, not the document: drop the frame's record, fetch and
+   queued messages, and stop discovery in this context for this pass. A top
+   realm that is out of heap is retired as for any other script OOM, so the
+   page commits and paints without JavaScript. Returns false only when a
+   failed DOM refresh has already destroyed the page, which stays a refused
+   commit. */
+static bool navigation_contain_frame_setup_failure(
+    NavigationSession *session, ScriptRuntime *parent_runtime,
+    size_t parent_frame_slot_plus_one, NavigationFrame *frame)
+{
+    if (session->page.runtime == NULL
+        || navigation_retire_failed_document_refresh(
+               session, parent_runtime)) return false;
+    session->frames_failed++;
+    if (frame != NULL && !frame->retired)
+        navigation_retire_unloaded_frame(session, frame, "iframe setup failed");
+    if (parent_frame_slot_plus_one == 0
+        && navigation_retire_exhausted_page_realm(session)) return true;
+    /* The realm survives (a child frame's realm, or a refusal that left
+       room): its WindowProxy for the element must not claim a live browsing
+       context that has no C frame behind it, so mark it closed. */
+    if (frame != NULL) {
+        (void) script_runtime_set_frame_window_state(
+            parent_runtime, frame->parent_handle, false, false, false, NULL,
+            false, navigation_frame_parent_result(session, frame));
+        if (navigation_retire_failed_document_refresh(
+                session, parent_runtime)) return false;
+    }
+    return true;
+}
+
+/* A frame's load or error event runs author handlers in the parent realm. A
+   handler that runs the top realm out of heap retires it as for any other
+   script OOM; *retired then tells the caller that parent_runtime is gone (it
+   ends discovery). False keeps the event's own failures (a DOM refresh that
+   destroyed the page, a refused relayout) transactional.
+
+   The realms can also be gone without this function retiring them: the
+   relayout a handler's mutation requests (or, before the event, the one
+   that published the frame's snapshot) may be refused for memory and lay
+   the page out again as static, retiring every realm. parent_runtime is
+   then freed, so its liveness is decided from the page's own pointers
+   before each use, and that retirement is reported the same way. */
+static bool navigation_dispatch_frame_event_contained(
+    NavigationSession *session, ScriptRuntime *parent_runtime,
+    size_t parent_frame_slot_plus_one, lxb_dom_node_t *node,
+    const char *event_type, bool *retired)
+{
+    *retired = false;
+    if (!navigation_frame_parent_realm_live(
+            session, parent_runtime, parent_frame_slot_plus_one)) {
+        /* Every realm already stopped with the page kept: nothing can
+           listen. Anything else stays the refusal it always was. */
+        *retired = session->page.loaded && session->page.runtime == NULL;
+        return *retired;
+    }
+    size_t rejections = script_runtime_heap_rejections(parent_runtime);
+    if (!navigation_dispatch_frame_parent_event(
+            session, parent_runtime, parent_frame_slot_plus_one, node,
+            event_type)) return false;
+    if (!navigation_frame_parent_realm_live(
+            session, parent_runtime, parent_frame_slot_plus_one)) {
+        *retired = true;
+        return true;
+    }
+    *retired = parent_frame_slot_plus_one == 0
+        && script_runtime_heap_rejections(parent_runtime) > rejections
+        && navigation_retire_exhausted_page_realm(session);
+    return true;
+}
+
+/* A frame that cannot start gets an error event (see above). */
+static bool navigation_dispatch_frame_setup_error(
+    NavigationSession *session, ScriptRuntime *parent_runtime,
+    size_t parent_frame_slot_plus_one, lxb_dom_node_t *node, bool *retired)
+{
+    return navigation_dispatch_frame_event_contained(
+        session, parent_runtime, parent_frame_slot_plus_one, node, "error",
+        retired);
+}
+
 static bool navigation_load_frames_for_context(
     NavigationSession *session, ScriptRuntime *parent_runtime,
     const PocDocument *parent_document, const char *parent_url,
@@ -823,10 +954,14 @@ static bool navigation_load_frames_for_context(
         return true;
     }
     if (count == 0) return true;
+    bool realm_retired = false;
     if (parent_frame_slot_plus_one == 0
         && !script_runtime_configure_messaging(
             parent_runtime, false, true, false, true,
-            navigation_queue_frame_message, session)) return false;
+            navigation_queue_frame_message, session)) {
+        return navigation_contain_frame_setup_failure(
+            session, parent_runtime, parent_frame_slot_plus_one, NULL);
+    }
     for (size_t i = 0; i < count; i++) {
         lxb_dom_node_t *node = script_runtime_node_handle_resolve_connected(
             parent_runtime, handles[i]);
@@ -916,11 +1051,12 @@ static bool navigation_load_frames_for_context(
         if (append_frame) {
             if (session->page.frame_count >= NAVIGATION_FRAME_LIMIT) {
                 session->frames_failed++;
-                if (!navigation_dispatch_frame_parent_event(
+                if (!navigation_dispatch_frame_setup_error(
                         session, parent_runtime,
-                        parent_frame_slot_plus_one, node, "error")) {
+                        parent_frame_slot_plus_one, node, &realm_retired)) {
                     return false;
                 }
+                if (realm_retired) return true;
                 continue;
             }
             frame = &session->page.frames[session->page.frame_count];
@@ -953,11 +1089,12 @@ static bool navigation_load_frames_for_context(
             session->next_frame_lifecycle_generation;
         if (session->page.resource_scheduler == NULL) {
             session->frames_failed++;
-            if (!navigation_dispatch_frame_parent_event(
+            if (!navigation_dispatch_frame_setup_error(
                     session, parent_runtime,
-                    parent_frame_slot_plus_one, node, "error")) {
+                    parent_frame_slot_plus_one, node, &realm_retired)) {
                 return false;
             }
+            if (realm_retired) return true;
             continue;
         }
         char cached_hint_tokens[BROWSER_CLIENT_HINT_TOKEN_LIMIT] = {0};
@@ -997,17 +1134,27 @@ static bool navigation_load_frames_for_context(
                 parent_runtime, frame->parent_handle, true,
                 same_origin, frame->opaque_origin, frame->url,
                 false,
-                navigation_frame_parent_result(session, frame))) return false;
+                navigation_frame_parent_result(session, frame))) {
+            return navigation_contain_frame_setup_failure(
+                session, parent_runtime, parent_frame_slot_plus_one, frame);
+        }
         if (!frame->fetch_pending) {
             session->frames_failed++;
-            if (!navigation_dispatch_frame_parent_event(
+            if (!navigation_dispatch_frame_setup_error(
                     session, parent_runtime,
-                    parent_frame_slot_plus_one, node, "error")) {
+                    parent_frame_slot_plus_one, node, &realm_retired)) {
                 return false;
             }
+            if (realm_retired) return true;
         }
     }
-    return navigation_deliver_frame_messages(session);
+    if (navigation_deliver_frame_messages(session)) return true;
+    /* As at the runtime pump's own delivery point: a realm out of heap is
+       retired with the page kept, anything else stays a failure. */
+    if (session->page.runtime == NULL
+        || !navigation_retire_exhausted_page_realm(session)) return false;
+    session->performance.frame_message_soft_failures++;
+    return true;
 }
 
 static bool navigation_load_frames(NavigationSession *session,
@@ -1376,20 +1523,22 @@ static bool navigation_complete_frame(NavigationSession *session,
                                     sizeof(retry_url))) {
             fetch_result_destroy(fetch);
             session->frames_failed++;
-            return navigation_dispatch_frame_parent_event(
+            bool realm_retired = false;
+            return navigation_dispatch_frame_setup_error(
                 session, frame->parent_runtime,
                 frame->parent_frame_slot_plus_one,
-                frame->element, "error");
+                frame->element, &realm_retired);
         }
         char hint_origin[TILEFINCH_ORIGIN_SERIALIZED_LIMIT];
         if (!tilefinch_url_origin(retry_url, hint_origin,
                               sizeof(hint_origin))) {
             fetch_result_destroy(fetch);
             session->frames_failed++;
-            return navigation_dispatch_frame_parent_event(
+            bool realm_retired = false;
+            return navigation_dispatch_frame_setup_error(
                 session, frame->parent_runtime,
                 frame->parent_frame_slot_plus_one,
-                frame->element, "error");
+                frame->element, &realm_retired);
         }
         /* Critical-CH belongs to the final response origin, not to an earlier
            redirector.  Restart that canonical URL directly so high-entropy
@@ -1407,10 +1556,11 @@ static bool navigation_complete_frame(NavigationSession *session,
         frame->fetch_pending = frame->fetch_request_id != 0;
         if (!frame->fetch_pending) {
             session->frames_failed++;
-            if (!navigation_dispatch_frame_parent_event(
-                    session, frame->parent_runtime,
-                    frame->parent_frame_slot_plus_one,
-                    frame->element, "error")) return false;
+            bool realm_retired = false;
+            return navigation_dispatch_frame_setup_error(
+                session, frame->parent_runtime,
+                frame->parent_frame_slot_plus_one,
+                frame->element, &realm_retired);
         }
         return true;
     }
@@ -1528,19 +1678,37 @@ static bool navigation_complete_frame(NavigationSession *session,
         frame->fetch_pending = false;
         frame->loaded = false;
         frame->retired = true;
+        /* The child is released before its error listener runs and before a
+           parent out of heap is retired below (which destroys every frame
+           realm), so neither can reach its half-torn-down state. */
+        ScriptRuntime *parent_runtime = frame->parent_runtime;
+        size_t parent_slot_plus_one = frame->parent_frame_slot_plus_one;
+        lxb_dom_node_t *element = frame->element;
         bool state_ok = script_runtime_set_frame_window_state(
-            frame->parent_runtime, frame->parent_handle, false, false, false,
+            parent_runtime, frame->parent_handle, false, false, false,
             NULL, false, navigation_frame_parent_result(session, frame));
-        bool event_ok = navigation_dispatch_frame_parent_event(
-            session, frame->parent_runtime,
-            frame->parent_frame_slot_plus_one,
-            frame->element, "error");
         navigation_frame_presentation_destroy(session, frame);
         script_runtime_destroy(frame->runtime);
         frame->runtime = NULL;
         images_destroy(&frame->images);
         document_destroy(&frame->document);
-        return state_ok && event_ok;
+        /* The parent realm could not record the frame (or, for a frame that
+           loaded, its committed document): on a page at its JS heap limit,
+           the WindowProxy update runs out of memory. That costs the frame,
+           as at discovery: a top realm out of heap is retired and the page
+           continues without JavaScript. Only a DOM refresh that destroyed
+           the page fails the turn. */
+        if (!state_ok) {
+            if (navigation_retire_failed_document_refresh(
+                    session, parent_runtime)) return false;
+            if (parent_slot_plus_one == 0
+                && navigation_retire_exhausted_page_realm(session))
+                return true;
+        }
+        bool realm_retired = false;
+        return navigation_dispatch_frame_setup_error(
+            session, parent_runtime, parent_slot_plus_one, element,
+            &realm_retired);
     }
     frame->loaded = true;
     session->frames_loaded++;
@@ -1550,11 +1718,41 @@ static bool navigation_complete_frame(NavigationSession *session,
         script_runtime_report_roots(frame->runtime, stderr, "frame-loaded",
                                     "child", frame->parent_handle);
     }
-    return navigation_dispatch_frame_parent_event(
+    bool realm_retired = false;
+    return navigation_dispatch_frame_event_contained(
         session, frame->parent_runtime,
         frame->parent_frame_slot_plus_one,
-        frame->element, "load");
+        frame->element, "load", &realm_retired);
 }
+
+#if !defined(__PSP__)
+/* The unit fetch backend has no frame responses: complete a discovered frame
+   with a synthetic response, as the runtime pump does when its fetch ends. */
+bool navigation_test_complete_frame(NavigationSession *session,
+                                    NavigationFrame *frame, long status_code,
+                                    const char *html, size_t length)
+{
+    if (session == NULL || frame == NULL || html == NULL
+        || length == SIZE_MAX) return false;
+    FetchResult *fetch = fetch_result_create(session->budget);
+    if (fetch == NULL) return false;
+    fetch->data = budget_malloc(session->budget, length + 1u);
+    if (fetch->data == NULL) {
+        fetch_result_free(fetch);
+        return false;
+    }
+    memcpy(fetch->data, html, length);
+    fetch->data[length] = '\0';
+    fetch->length = length;
+    fetch->capacity = length + 1u;
+    fetch->status_code = status_code;
+    snprintf(fetch->content_type, sizeof(fetch->content_type), "text/html");
+    frame->fetch_pending = true;
+    bool completed = navigation_complete_frame(session, frame, true, fetch);
+    fetch_result_free(fetch);
+    return completed;
+}
+#endif
 
 static bool navigation_progress_frames(NavigationSession *session)
 {
@@ -1579,6 +1777,9 @@ static bool navigation_progress_frames(NavigationSession *session)
             return false;
         }
         fetch_result_free(fetch);
+        /* Completion retired a page realm that ran out of heap, with every
+           frame that had not loaded and every queued message. */
+        if (session->page.runtime == NULL) return true;
     }
     return navigation_deliver_frame_messages(session);
 }

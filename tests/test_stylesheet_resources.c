@@ -2034,6 +2034,105 @@ static bool test_image_failure_records_follow_retries(void)
     return ok && clean;
 }
 
+/* A video decoder (or a frame snapshot) adopts its surface into the page's
+   table while a deferred priority load is still in flight. Abandoning that
+   load rolls back only what the load itself added: the adopted surface, whose
+   producer keeps writing to the pixels, stays in the table with its bytes
+   accounted, instead of being freed under the producer. */
+static bool test_priority_rollback_keeps_adopted_surface(void)
+{
+    static const char html[] =
+        "<!doctype html><body><img id=slow src='slow.svg'>"
+        "<video id=player></video></body>";
+    static const char document_url[] = "https://adopt.example/page";
+    static const char slow_url[] = "https://adopt.example/slow.svg";
+    static const char image_accept[] =
+#if defined(TILEFINCH_DISABLE_GIF)
+        "image/png,image/jpeg,image/webp,image/svg+xml,image/*;q=0.8,"
+        "*/*;q=0.5";
+#else
+        "image/png,image/jpeg,image/gif,image/webp,image/svg+xml,"
+        "image/*;q=0.8,*/*;q=0.5";
+#endif
+    static const StylesheetReplayRecord slow[] = {{
+        .url = slow_url, .effective_url = slow_url,
+        .body = "<svg xmlns='http://www.w3.org/2000/svg' width='4' "
+                "height='3'><rect width='4' height='3'/></svg>",
+        .content_type = "image/svg+xml",
+        .request_accept = image_accept, .request_sec_fetch_dest = "image",
+        .request_sec_fetch_mode = "no-cors",
+        .request_referer = document_url,
+        .request_sec_fetch_site = "same-origin",
+        .request_credential_origin = document_url,
+        .request_initiator_url = document_url,
+        .request_referrer_source = document_url,
+        .request_referrer_policy = "strict-origin-when-cross-origin",
+        .status = 200, .request_send_low_client_hints = true,
+        .async_delay_pumps = 200
+    }};
+    char directory[128] = {0};
+    bool written = write_stylesheet_replay(directory, slow, 1);
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    PocDocument document = {0};
+    Stylesheet stylesheet = {0};
+    ImageResources images = {0};
+    char replay_error[256] = {0};
+    bool ok = written && installed
+        && document_parse(&document, &budget, html, sizeof(html) - 1u, 17)
+        && stylesheet_build(&stylesheet, &budget, &document, 480);
+    lxb_dom_node_t *root = ok ? lxb_dom_interface_node(document.html) : NULL;
+    lxb_dom_node_t *image = root ? find_element_id(root, "slow") : NULL;
+    lxb_dom_node_t *video = root ? find_element_id(root, "player") : NULL;
+    ok = ok && image != NULL && video != NULL;
+    FetchScheduler *scheduler = ok
+        ? fetch_scheduler_create(&budget, 2, 1024 * 1024) : NULL;
+    bool replaying = scheduler != NULL && fetch_trace_replay_begin(
+        directory, replay_error, sizeof(replay_error));
+    ImagePriorityTarget target = {
+        .node = image, .kind = IMAGE_PRIORITY_KIND_DOCUMENT
+    };
+    ImagePriorityLoadJob *job = replaying ? images_priority_load_begin(
+        &document, &stylesheet, &images, &target, &budget,
+        document_url, document_url, "strict-origin-when-cross-origin",
+        8, 64 * 1024, 16 * 1024, 1024 * 1024, 5000, scheduler, NULL) : NULL;
+    bool pending = job != NULL
+        && images_priority_load_pump(job) == IMAGE_PRIORITY_LOAD_PENDING;
+    size_t retained = images.count;
+    size_t decoded_before = images.stats.decoded_bytes;
+    unsigned char *pixels = pending
+        ? budget_malloc_category(&budget, BUDGET_CATEGORY_RESOURCE,
+                                 16u * 9u * 4u) : NULL;
+    if (pixels != NULL) memset(pixels, 0x5a, 16u * 9u * 4u);
+    bool adopted = pixels != NULL && images_adopt_decoded_surface(
+        &images, &budget, video, pixels, 16, 9);
+    if (pixels != NULL && !adopted) budget_free(&budget, pixels);
+    images_priority_load_destroy(job);
+    const ImageResource *kept = images_find_node(&images, video);
+    ok = ok && pending && adopted && kept != NULL && kept->pixels == pixels
+        && kept->owns_pixels && kept->pixels[0] == 0x5a
+        && images.count == retained + 1u
+        && images.stats.decoded_bytes == decoded_before + 16u * 9u * 4u
+        && images_find_node(&images, image) == NULL;
+    if (!ok) {
+        fprintf(stderr,
+                "priority rollback adopted surface replay='%s' pending=%d "
+                "adopted=%d kept=%d count=%zu/%zu decoded=%zu/%zu\n",
+                replay_error, pending, adopted, kept != NULL, images.count,
+                retained, images.stats.decoded_bytes, decoded_before);
+    }
+    if (replaying) fetch_trace_end();
+    if (scheduler != NULL) fetch_scheduler_destroy(scheduler);
+    images_destroy(&images);
+    stylesheet_destroy(&stylesheet);
+    document_destroy(&document);
+    bool clean = budget.current == 0;
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    if (directory[0] != '\0') remove_stylesheet_replay(directory, 1);
+    return ok && clean;
+}
+
 /* A news header carries twenty-odd inline-SVG glyphs before its first
    photograph. Icon-sized rasters (and short data: placeholders) must not
    spend the per-page image count meant for network images; a large inline
@@ -4319,6 +4418,335 @@ static bool test_rebuild_skipped_retained_import_is_not_applied(void)
     return ok;
 }
 
+/* A sheet parsed in slices (stopping after every rule) must equal the
+   same source parsed whole: rule order, layers, cascade keys, declarations
+   and variables. The synthetic source nests style rules in named layers,
+   media and supports blocks (which a slice may stop inside) and in an
+   anonymous layer and a container query (which it parses whole). */
+static uint64_t sliced_sheet_digest(const Stylesheet *sheet)
+{
+    uint64_t hash = UINT64_C(1469598103934665603);
+#define SLICED_MIX(value) do { \
+        hash ^= (uint64_t) (value); hash *= UINT64_C(1099511628211); \
+    } while (0)
+    for (size_t i = 0; i < sheet->count; i++) {
+        const StyleRule *rule = &sheet->rules[i];
+        for (size_t k = 0; k < rule->selector_length; k++)
+            SLICED_MIX((unsigned char) rule->selector[k]);
+        SLICED_MIX(rule->declaration_index);
+        SLICED_MIX(rule->origin);
+        SLICED_MIX(rule->layer);
+        SLICED_MIX(rule->specificity);
+        SLICED_MIX(rule->order);
+        SLICED_MIX(rule->important);
+        SLICED_MIX(rule->pseudo);
+    }
+    SLICED_MIX(sheet->count);
+    SLICED_MIX(sheet->declaration_count);
+    SLICED_MIX(sheet->variable_count);
+    SLICED_MIX(sheet->layer_count);
+    SLICED_MIX(sheet->next_order);
+#undef SLICED_MIX
+    return hash;
+}
+
+static char *sliced_parse_source(size_t *length)
+{
+    size_t capacity = 256u * 1024u;
+    char *css = malloc(capacity);
+    if (css == NULL) return NULL;
+    size_t used = 0;
+#define SLICED_APPEND(...) do { \
+        int written = snprintf(css + used, capacity - used, __VA_ARGS__); \
+        if (written < 0 || (size_t) written >= capacity - used) { \
+            free(css); return NULL; } \
+        used += (size_t) written; \
+    } while (0)
+    SLICED_APPEND("@layer base, components, utilities;"
+                  ":root{--tone:#102030;--gap:3px}");
+    SLICED_APPEND("@layer base{");
+    for (int i = 0; i < 120; i++)
+        SLICED_APPEND(".b%d,.b%d>i{margin-left:%dpx;color:#%06x}",
+                      i, i, i % 9, i * 4099 & 0xffffff);
+    SLICED_APPEND("@media (min-width:1px){");
+    for (int i = 0; i < 60; i++)
+        SLICED_APPEND(".m%d{padding:%dpx var(--gap)}", i, i % 5);
+    SLICED_APPEND("@supports (display:flex){");
+    for (int i = 0; i < 40; i++)
+        SLICED_APPEND(".s%d{display:flex;--local%d:%d}", i, i, i);
+    SLICED_APPEND("}}}");
+    SLICED_APPEND("@layer{");
+    for (int i = 0; i < 30; i++)
+        SLICED_APPEND(".a%d{border-top:%dpx solid red}", i, i % 4);
+    SLICED_APPEND("}");
+    SLICED_APPEND("@container (min-width:100px){");
+    for (int i = 0; i < 20; i++)
+        SLICED_APPEND(".q%d{width:%dpx}", i, 10 + i);
+    SLICED_APPEND("}");
+    SLICED_APPEND("@font-face{font-family:Sliced;src:url(/f.woff2)}"
+                  "@keyframes spin{to{opacity:.5}}");
+    SLICED_APPEND("@layer utilities{");
+    for (int i = 0; i < 150; i++)
+        SLICED_APPEND(".u%d{color:var(--tone)!important;"
+                      "font-family:Sliced}.u%d:hover{opacity:.%d}",
+                      i, i, i % 9 + 1);
+    SLICED_APPEND(".nest{color:#111;& .child{color:#222}"
+                  "@media (min-width:1px){margin:1px}}");
+    SLICED_APPEND("@media (max-width:1px){.never{color:red}}");
+    SLICED_APPEND("@media (min-width:1px){:root{--tone:#405060}}}");
+    SLICED_APPEND(".tail{color:var(--tone)}");
+#undef SLICED_APPEND
+    *length = used;
+    return css;
+}
+
+static bool test_sliced_parse_matches_whole_parse(void)
+{
+    size_t length = 0;
+    char *css = sliced_parse_source(&length);
+    if (css == NULL) return false;
+    uint64_t digests[2] = {0};
+    size_t steps = 0;
+    bool ok = true;
+    for (int sliced = 0; sliced < 2 && ok; sliced++) {
+        Budget budget;
+        budget_init(&budget, 32u * MIB);
+        bool installed = budget_install_lexbor(&budget);
+        PocDocument document = {0};
+        static const char html[] = "<p class=tail>x</p>";
+        Stylesheet sheet = {0};
+        ok = installed
+            && document_parse(&document, &budget, html, sizeof(html) - 1u,
+                              17)
+            && stylesheet_build(&sheet, &budget, &document, 480);
+        if (ok && !sliced) {
+            ok = stylesheet_add_css_from_context(
+                &sheet, css, length, "https://sliced.test/a.css", "", NULL);
+        } else if (ok) {
+            StyleCssSlicedParse *parse = stylesheet_sliced_parse_begin(
+                &sheet, css, length, "https://sliced.test/a.css", "", NULL);
+            StyleCssSliceResult result = STYLE_CSS_SLICE_FAILED;
+            size_t progress = stylesheet_sliced_parse_progress(parse);
+            ok = progress == 0 && stylesheet_sliced_parse_progress(NULL) == 0;
+            /* A deadline already past stops after every rule. */
+            do {
+                result = parse == NULL ? STYLE_CSS_SLICE_FAILED
+                    : stylesheet_sliced_parse_step(parse, 1u);
+                size_t next = stylesheet_sliced_parse_progress(parse);
+                ok = ok && next >= progress && next <= length
+                    /* Reading progress must not itself advance the clock. */
+                    && stylesheet_sliced_parse_progress(parse) == next;
+                progress = next;
+                steps++;
+            } while (ok && result == STYLE_CSS_SLICE_MORE && steps < 100000u);
+            ok = ok && result == STYLE_CSS_SLICE_DONE && progress == length;
+            stylesheet_sliced_parse_release(parse);
+        }
+        if (ok) digests[sliced] = sliced_sheet_digest(&sheet);
+        stylesheet_destroy(&sheet);
+        document_destroy(&document);
+        if (installed) ok = budget_uninstall_lexbor(&budget) && ok;
+        ok = ok && budget.current == 0
+            && budget_active_allocations(&budget, NULL) == 0;
+    }
+    free(css);
+    /* Several hundred top-level and nested rules: the slices are many. */
+    bool equal = ok && digests[0] == digests[1] && steps > 300u;
+    if (!equal) {
+        fprintf(stderr, "sliced parse ok=%d digests=%016llx/%016llx "
+                        "steps=%zu\n", ok, (unsigned long long) digests[0],
+                (unsigned long long) digests[1], steps);
+    }
+    return equal;
+}
+
+/* Abandoning a sliced parse midway leaves a sheet that can still be
+   destroyed and reclaims every allocation. */
+static bool test_sliced_parse_release_midway(void)
+{
+    size_t length = 0;
+    char *css = sliced_parse_source(&length);
+    if (css == NULL) return false;
+    Budget budget;
+    budget_init(&budget, 32u * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    PocDocument document = {0};
+    static const char html[] = "<p>x</p>";
+    Stylesheet sheet = {0};
+    bool ok = installed
+        && document_parse(&document, &budget, html, sizeof(html) - 1u, 17)
+        && stylesheet_build(&sheet, &budget, &document, 480);
+    StyleCssSlicedParse *parse = ok ? stylesheet_sliced_parse_begin(
+        &sheet, css, length, NULL, NULL, NULL) : NULL;
+    for (int i = 0; ok && i < 25; i++)
+        ok = stylesheet_sliced_parse_step(parse, 1u) == STYLE_CSS_SLICE_MORE;
+    ok = ok && sheet.rule_batch_active;
+    stylesheet_sliced_parse_release(parse);
+    ok = ok && !sheet.rule_batch_active;
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    if (installed) ok = budget_uninstall_lexbor(&budget) && ok;
+    free(css);
+    return ok && budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0;
+}
+
+static const StyleRule *sliced_find_rule(const Stylesheet *sheet,
+                                         const char *selector)
+{
+    size_t length = strlen(selector);
+    for (size_t i = 0; i < sheet->count; i++) {
+        if (sheet->rules[i].selector_length == length
+            && memcmp(sheet->rules[i].selector, selector, length) == 0)
+            return &sheet->rules[i];
+    }
+    return NULL;
+}
+
+/* A sliced pass that defers a large first sheet stops there: the second
+   link and a later <style> are neither queued nor parsed until the deferred
+   parse finishes, and appending them afterwards keeps document order (the
+   second sheet's rule wins). Before the fix, queueing the second link
+   flushed (and deferred) the first, the second link was queued anyway and
+   the pass's final flush parsed it at once, ahead of the first sheet. */
+static bool test_sliced_pass_stops_at_deferred_sheet(void)
+{
+    static const char document_url[] = "https://slice-order.test/page.html";
+    static const char first_url[] = "https://slice-order.test/a.css";
+    static const char second_url[] = "https://slice-order.test/b.css";
+    static const char html[] =
+        "<!doctype html><link rel=stylesheet href=a.css>"
+        "<link rel=stylesheet href=b.css>"
+        "<style>.inline-after{margin-left:7px}</style>"
+        "<body><div id=target class=probe>ordered</div></body>";
+    size_t first_capacity = 40u * 1024u;
+    char *first_body = malloc(first_capacity);
+    if (first_body == NULL) return false;
+    size_t used = 0;
+    for (int i = 0; used + 64u < first_capacity - 64u; i++) {
+        int written = snprintf(first_body + used, first_capacity - used,
+                               ".filler%d{margin-top:%dpx}", i, i % 7);
+        if (written <= 0) break;
+        used += (size_t) written;
+    }
+    snprintf(first_body + used, first_capacity - used,
+             ".probe{color:#111111}");
+    const StylesheetReplayRecord replay[] = {{
+        .url = first_url, .body = first_body, .effective_url = first_url,
+        .request_referer = document_url,
+        .request_sec_fetch_site = "same-origin",
+        .request_credential_origin = document_url,
+        .request_initiator_url = document_url,
+        .request_referrer_source = document_url,
+        .request_referrer_policy = "unsafe-url",
+        .response_cache_control = "max-age=3600", .status = 200
+    }, {
+        .url = second_url,
+        .body = ".probe{color:#222222}.only-second{color:#333333}",
+        .effective_url = second_url,
+        .request_referer = document_url,
+        .request_sec_fetch_site = "same-origin",
+        .request_credential_origin = document_url,
+        .request_initiator_url = document_url,
+        .request_referrer_source = document_url,
+        .request_referrer_policy = "unsafe-url",
+        .response_cache_control = "max-age=3600", .status = 200
+    }};
+    char replay_directory[128] = {0};
+    bool replay_written = write_stylesheet_replay(
+        replay_directory, replay, sizeof(replay) / sizeof(replay[0]));
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    PocDocument document = {0};
+    Stylesheet stylesheet = {0};
+    StylesheetDocumentResources resources = {0};
+    ExternalStylesheetStats stats = {0};
+    StylesheetParseDeferral deferral = { .minimum_bytes = 16u * 1024u };
+    FetchScheduler *scheduler = NULL;
+    bool replaying = false;
+    ViewportContext viewport;
+    bool ok = replay_written && installed
+        && viewport_context_init(&viewport, 480, 272, 480, 272)
+        && document_parse(&document, &budget, html, sizeof(html) - 1u, 17)
+        && stylesheet_build_context_deferred(
+               &stylesheet, &budget, &document, &viewport)
+        && (scheduler = fetch_scheduler_create(
+                &budget, 4, 4u * 128u * 1024u)) != NULL;
+    lxb_dom_node_t *root = document.html == NULL ? NULL
+        : lxb_dom_interface_node(document.html);
+    lxb_dom_node_t *first_link = find_element_href(root, "a.css");
+    lxb_dom_node_t *second_link = find_element_href(root, "b.css");
+    lxb_dom_node_t *inline_style = NULL;
+    for (lxb_dom_node_t *node = second_link; node != NULL;
+         node = node->next) {
+        size_t length = 0;
+        const char *name = document_element_name(node, &length);
+        if (name != NULL && length == 5 && memcmp(name, "style", 5) == 0) {
+            inline_style = node;
+            break;
+        }
+    }
+    if (ok) {
+        char error[256] = {0};
+        replaying = fetch_trace_replay_begin(
+            replay_directory, error, sizeof(error));
+        ok = replaying && first_link != NULL && second_link != NULL
+            && inline_style != NULL
+            && stylesheets_load_external_sliced(
+                   &document, &stylesheet, &budget, document_url,
+                   document_url, "unsafe-url", 4, 256u * 1024u,
+                   128u * 1024u, 1000, scheduler, NULL, &resources, &stats,
+                   &deferral);
+    }
+    /* The pass stopped at the deferred first sheet. */
+    bool stopped = ok && deferral.parse != NULL
+        && deferral.element == first_link
+        && sliced_find_rule(&stylesheet, ".only-second") == NULL
+        && sliced_find_rule(&stylesheet, ".inline-after") == NULL;
+    StyleCssSliceResult step = STYLE_CSS_SLICE_MORE;
+    for (size_t i = 0; stopped && step == STYLE_CSS_SLICE_MORE
+                       && i < 100000u; i++)
+        step = stylesheet_parse_deferral_step(&deferral, 1u, &stats);
+    stylesheet_parse_deferral_release(&deferral);
+    lxb_dom_node_t *suffix[] = { second_link, inline_style };
+    size_t consumed = 0;
+    bool appended = stopped && step == STYLE_CSS_SLICE_DONE
+        && stylesheets_append_ordered_suffix_sliced(
+               &stylesheet, &budget, suffix, 2, document_url, document_url,
+               "unsafe-url", &document.content_security_policy, 4,
+               256u * 1024u, 128u * 1024u, 1000, scheduler, NULL,
+               &resources, &stats, &deferral, &consumed)
+        && deferral.parse == NULL && consumed == 2
+        && (!stylesheet.rule_batch_active
+            || stylesheet_end_rule_batch(&stylesheet));
+    lxb_dom_node_t *target = find_element_id(root, "target");
+    ComputedStyle computed = appended
+        ? style_for_node(&stylesheet, target, NULL) : (ComputedStyle) {0};
+    bool ordered = appended && target != NULL && computed.color == 0x222222
+        && sliced_find_rule(&stylesheet, ".only-second") != NULL
+        && sliced_find_rule(&stylesheet, ".inline-after") != NULL;
+    if (!ordered) {
+        fprintf(stderr, "sliced pass ok=%d stopped=%d step=%d appended=%d "
+                        "consumed=%zu color=%06x rules=%zu second=%d\n",
+                ok, stopped, (int) step, appended, consumed,
+                (unsigned) computed.color, stylesheet.count,
+                sliced_find_rule(&stylesheet, ".only-second") != NULL);
+    }
+    if (replaying) fetch_trace_end();
+    stylesheet_parse_deferral_release(&deferral);
+    fetch_scheduler_destroy(scheduler);
+    stylesheet_document_resources_destroy(&resources);
+    stylesheet_destroy(&stylesheet);
+    document_destroy(&document);
+    bool clean = budget.current == 0;
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    if (replay_written) remove_stylesheet_replay(
+        replay_directory, sizeof(replay) / sizeof(replay[0]));
+    free(first_body);
+    return ordered && clean;
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2 && strcmp(argv[1], "--skipped-import-only") == 0)
@@ -4336,6 +4764,9 @@ int main(int argc, char **argv)
     }                                                                        \
 } while (0)
     RUN_TEST(test_nonmatching_media_settles_without_applying);
+    RUN_TEST(test_sliced_parse_matches_whole_parse);
+    RUN_TEST(test_sliced_parse_release_midway);
+    RUN_TEST(test_sliced_pass_stops_at_deferred_sheet);
     RUN_TEST(test_response_ledger_copy_is_transactional);
     RUN_TEST(test_fetched_stylesheet_publication_refusal_sweep);
     RUN_TEST(test_redirected_publication_refusal_sweep);
@@ -4368,6 +4799,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_icon_images_do_not_spend_image_count);
     RUN_TEST(test_image_limits_record_no_failure);
     RUN_TEST(test_image_failure_records_follow_retries);
+    RUN_TEST(test_priority_rollback_keeps_adopted_surface);
     RUN_TEST(test_css_paint_layers_keep_distinct_resources);
     RUN_TEST(test_invalid_href_has_terminal_state);
     RUN_TEST(test_blocker_bypasses_fresh_cached_stylesheet);

@@ -1,4 +1,6 @@
 #include "tilefinch/browser_engine.h"
+#include "tilefinch/media_discovery.h"
+#include "tilefinch/media_failure_message.h"
 #include "tilefinch/file_download.h"
 #include "tilefinch_test_faults.h"
 #include "tilefinch_compiler.h"
@@ -27,6 +29,15 @@
 #define BROWSER_FONT_IDLE_READ_BYTES (16u * KIB)
 #define BROWSER_BLANK_READER_SETTLE_TICKS 12u
 #define BROWSER_RECOVERY_SETTLE_US UINT64_C(250000)
+/* A declared media card on a healthy page decodes its poster only while
+   this much of the engine budget stays free; below it the card is the
+   browser-colored box with its title, duration and play glyph. */
+#define BROWSER_MEDIA_CARD_POSTER_HEADROOM (2u * MIB)
+/* Insertion attempts after a transient refusal, per navigation. */
+#define BROWSER_MEDIA_CARD_REFUSAL_RETRIES 2u
+/* The declared media card's settle window ends this long after commit
+   even on a page whose scripts never go quiet. */
+#define BROWSER_MEDIA_CARD_SETTLE_CAP_US UINT64_C(3000000)
 
 /* What a history traversal restores in its target document. */
 typedef struct {
@@ -156,6 +167,22 @@ typedef struct {
     bool topics_publishing;
 } BrowserEngineYoutube;
 
+typedef enum {
+    BROWSER_EMBED_HOP_PHASE_IDLE = 0,
+    BROWSER_EMBED_HOP_PHASE_WAITING,
+    BROWSER_EMBED_HOP_PHASE_PLAYING
+} BrowserEngineEmbedHopPhase;
+
+/* See browser_engine/embed_hop.inc. */
+typedef struct {
+    BrowserEngineEmbedHopPhase phase;
+    bool committed;
+    uint32_t seen_generation;
+    uint64_t committed_before_us;
+    uint64_t committed_us;
+    uint64_t started_us;
+} BrowserEngineEmbedHop;
+
 struct BrowserEngine {
     BrowserConfig config;
     Budget budget;
@@ -243,6 +270,9 @@ struct BrowserEngine {
     uint64_t page_dark_generation;
     BrowserEngineYoutube youtube;
     bool autofocus_pending;
+    /* A page update retired the page because memory refused it; taken once
+       by the frontend (browser_engine_take_page_memory_retirement). */
+    bool page_memory_retirement_pending;
     size_t render_relayout_generation;
     uint64_t render_shell_serial;
     uint64_t initial_tile_hold_started_us;
@@ -268,6 +298,19 @@ struct BrowserEngine {
     uint64_t declared_media_outcome_generation;
     size_t declared_media_outcome_content_generation;
     BrowserDeclaredMediaCard declared_media_outcome;
+    /* Transient insertion refusals (allocation, relayout, shell) on the
+       current navigation; a few are retried after another settle window. */
+    uint64_t declared_media_refusal_generation;
+    unsigned declared_media_refusals;
+    /* Why the last settled decision was made, for the frontend log. */
+    const char *declared_media_reason;
+    BrowserEngineEmbedHop embed_hop;
+    /* browser_engine_hold_page_network: the held page domain (retained). */
+    bool page_network_held;
+    FetchSchedulerDomain *held_page_domain;
+    /* browser_engine_make_media_room stopped this page's scripts. */
+    bool media_room_scripts_stopped;
+    uint64_t media_room_generation;
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     BrowserEngineCreationMetrics creation_metrics;
 #endif
@@ -284,9 +327,17 @@ static BrowserEngine *active_engine;
 static bool browser_engine_restore_controls(
     NavigationSession *navigation,
     const NavigationHistoryControl *controls, size_t count);
+static void browser_engine_embed_hop_navigation(
+    BrowserEngine *engine, const ControllerAction *action);
 
 #if !defined(__PSP__)
 static uint64_t browser_engine_test_recovery_time_us;
+static uint64_t browser_engine_test_recovery_elapsed_us;
+
+void browser_engine_test_set_recovery_elapsed_us(uint64_t elapsed_us)
+{
+    browser_engine_test_recovery_elapsed_us = elapsed_us;
+}
 
 void browser_engine_test_refuse_next_render_shell_init(void)
 {
@@ -446,6 +497,10 @@ static size_t browser_engine_reclaim_accelerators(void *opaque,
     if (reclaimed < needed_bytes)
         reclaimed += navigation_yield_style_memos(
             &engine->navigation, engine->navigation_work.load);
+    /* And the page's remembered JSON responses (media discovery). */
+    if (reclaimed < needed_bytes)
+        reclaimed += media_json_responses_release(
+            &engine->navigation.page.document);
     return reclaimed;
 }
 
@@ -1053,6 +1108,9 @@ static bool browser_engine_report_retired_update(
     BrowserEngine *engine, const char *phase)
 {
     browser_engine_reset_shell(engine);
+    engine->page_memory_retirement_pending = strcmp(
+        engine->navigation.last_error,
+        NAVIGATION_PAGE_OUT_OF_MEMORY_ERROR) == 0;
     return set_error_code(engine, TILEFINCH_SUBSYSTEM_ENGINE,
         TILEFINCH_DIAGNOSTIC_INTERNAL_FAILED, phase,
         engine->navigation.last_error[0] != '\0'
@@ -1683,6 +1741,7 @@ bool browser_engine_shutdown(BrowserEngine *engine)
             && budget_active_allocations(&engine->budget, NULL) == 0;
     }
     browser_engine_cancel_navigation(engine, "browser engine shutdown");
+    browser_engine_release_page_network(engine);
     (void) browser_engine_youtube_cancel(engine);
     budget_free(&engine->budget, engine->script_form_body);
     engine->script_form_body = NULL;
@@ -2702,6 +2761,7 @@ bool browser_engine_begin_navigation_url(
     BrowserEngine *engine, const char *url, size_t maximum_bytes,
     long timeout_ms, bool record_history)
 {
+    browser_engine_embed_hop_navigation(engine, NULL);
     /* An explicit replacement (Reload) requests fresh provider facts.
        History moves use their own entry point and retain bounded reuse. */
     if (engine != NULL && !record_history && engine->navigation.page.loaded)
@@ -2735,6 +2795,7 @@ bool browser_engine_begin_navigation_action(
             TILEFINCH_DIAGNOSTIC_INVALID_INPUT, "navigation-action",
             "controller action does not contain a navigation");
     }
+    browser_engine_embed_hop_navigation(engine, action);
     const char *current_url =
         navigation_active_document_url(&engine->navigation);
     if (current_url != NULL) {
@@ -2847,6 +2908,7 @@ bool browser_engine_begin_navigation_history(
             TILEFINCH_DIAGNOSTIC_INVALID_INPUT, "navigation-history",
             "history navigation cannot be started");
     }
+    browser_engine_embed_hop_navigation(engine, NULL);
     BrowserHistoryRestore restore;
     if (!browser_engine_prepare_history(engine, forward, &restore)) {
         return set_error_code(engine, TILEFINCH_SUBSYSTEM_ENGINE,
@@ -3119,6 +3181,39 @@ size_t browser_engine_cancel_network_work(
     return cancelled + navigation_cancel_network_work(&engine->navigation, reason);
 }
 
+size_t browser_engine_hold_page_network(
+    BrowserEngine *engine, const char *reason)
+{
+    if (engine == NULL || !engine->navigation_ready) return 0;
+    FetchSchedulerDomain *domain = engine->navigation.page.fetch_domain;
+    if (engine->page_network_held && engine->held_page_domain == domain)
+        return 0;
+    browser_engine_release_page_network(engine);
+    size_t stopped = browser_engine_youtube_cancel(engine)
+        + navigation_hold_network_work(&engine->navigation, reason);
+    /* Retained so the release reaches this domain even after the page
+       that owned it is gone. */
+    engine->held_page_domain = fetch_scheduler_domain_retain(domain);
+    if (engine->held_page_domain == NULL)
+        fetch_scheduler_domain_set_held(domain, false);
+    engine->page_network_held = true;
+    return stopped;
+}
+
+void browser_engine_release_page_network(BrowserEngine *engine)
+{
+    if (engine == NULL || !engine->page_network_held) return;
+    fetch_scheduler_domain_set_held(engine->held_page_domain, false);
+    fetch_scheduler_domain_release(engine->held_page_domain);
+    engine->held_page_domain = NULL;
+    engine->page_network_held = false;
+}
+
+bool browser_engine_page_network_held(const BrowserEngine *engine)
+{
+    return engine != NULL && engine->page_network_held;
+}
+
 BrowserNavigationJobStatus browser_engine_navigation_status(
     const BrowserEngine *engine)
 {
@@ -3170,6 +3265,69 @@ bool browser_engine_stop_page_scripts(BrowserEngine *engine)
              sizeof(engine->navigation.page.script_result.summary),
              "Page scripts stopped");
     return true;
+}
+
+BrowserMediaRoomStep browser_engine_make_media_room(
+    BrowserEngine *engine, size_t needed_bytes, unsigned *stage)
+{
+    if (engine == NULL || stage == NULL
+        || engine->state != BROWSER_ENGINE_ACTIVE)
+        return BROWSER_MEDIA_ROOM_NONE;
+    Budget *budget = &engine->budget;
+    for (;;) {
+        if (needed_bytes != 0 && budget_remaining(budget) >= needed_bytes)
+            return BROWSER_MEDIA_ROOM_NONE;
+        switch (*stage) {
+        case 0: {
+            /* Everything that leaves the page as it is: staged fonts, a
+               collected and trimmed script heap, session caches, decoded
+               images, resident tiles (redrawn on return). */
+            (*stage)++;
+            BrowserOptionalMemoryReclaim reclaim;
+            size_t before = budget_remaining(budget);
+            (void) browser_engine_reclaim_optional_memory(engine, &reclaim);
+            (void) budget_make_room(
+                budget, needed_bytes != 0 ? needed_bytes : SIZE_MAX);
+            if (budget_remaining(budget) > before)
+                return BROWSER_MEDIA_ROOM_OPTIONAL;
+            break;
+        }
+        case 1:
+            /* Then the page's scripts, as a script that ran out of memory
+               would lose them: its DOM, layout and position stay for the
+               return, and the page says its scripts were stopped. */
+            (*stage)++;
+            if (browser_engine_stop_page_scripts(engine)) {
+                engine->media_room_scripts_stopped = true;
+                engine->media_room_generation =
+                    browser_engine_page_generation(engine);
+                BrowserOptionalMemoryReclaim reclaim;
+                (void) browser_engine_reclaim_optional_memory(
+                    engine, &reclaim);
+                return BROWSER_MEDIA_ROOM_SCRIPTS_STOPPED;
+            }
+            break;
+        default:
+            return BROWSER_MEDIA_ROOM_NONE;
+        }
+    }
+}
+
+bool browser_engine_take_media_room_scripts_stopped(BrowserEngine *engine)
+{
+    if (engine == NULL || !engine->media_room_scripts_stopped) return false;
+    engine->media_room_scripts_stopped = false;
+    return engine->navigation.page.loaded
+        && engine->media_room_generation
+            == browser_engine_page_generation(engine);
+}
+
+bool browser_engine_take_page_memory_retirement(BrowserEngine *engine)
+{
+    if (engine == NULL || !engine->page_memory_retirement_pending)
+        return false;
+    engine->page_memory_retirement_pending = false;
+    return !engine->navigation.page.loaded;
 }
 
 bool browser_engine_page_memory_rescued(const BrowserEngine *engine)
@@ -3586,6 +3744,7 @@ bool browser_engine_load_url_with_limits(
     if (maximum_bytes == 0 || timeout_ms <= 0) return set_error_code(
         engine, TILEFINCH_SUBSYSTEM_NETWORK, TILEFINCH_DIAGNOSTIC_INVALID_INPUT,
         "url-load", "URL load limits are invalid");
+    browser_engine_embed_hop_navigation(engine, NULL);
     BrowserEngineUrlLoad load = {
         .url = url,
         .record_history = record_history
@@ -3654,6 +3813,7 @@ bool browser_engine_load_url_with_limits(
 
 bool browser_engine_history_move(BrowserEngine *engine, bool forward)
 {
+    browser_engine_embed_hop_navigation(engine, NULL);
     if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
         || !engine->navigation_ready) return set_error_code(
             engine, TILEFINCH_SUBSYSTEM_ENGINE,
@@ -4077,6 +4237,64 @@ bool browser_engine_scroll_to_edge(BrowserEngine *engine, bool bottom)
                   engine->config.device.framebuffer_height));
 }
 
+/* What a scroll press can change that the next frame shows. */
+typedef struct {
+    int scroll_y;
+    uint32_t scroll_generation;
+    size_t relayouts, render_relayouts, render_focus_paint;
+    uint64_t render_shell;
+    bool loaded, provisional, tile_hold;
+} BrowserScrollMark;
+
+static void browser_engine_scroll_mark(const BrowserEngine *engine,
+                                       BrowserScrollMark *mark)
+{
+    const NavigationEntry *entry = navigation_current(&engine->navigation);
+    mark->scroll_y = entry != NULL ? entry->scroll_y : -1;
+    mark->scroll_generation = engine->navigation.page.layout.scroll_generation;
+    mark->relayouts = engine->navigation.incremental_relayouts;
+    mark->render_relayouts = engine->render_relayout_generation;
+    mark->render_focus_paint = engine->render_focus_paint_generation;
+    mark->render_shell = engine->render_shell_serial;
+    mark->loaded = engine->navigation.page.loaded;
+    mark->provisional = engine->navigation.page.layout_provisional;
+    mark->tile_hold = engine->initial_tile_hold;
+}
+
+bool browser_engine_scroll(BrowserEngine *engine,
+                           BrowserScrollRequest request, int amount,
+                           bool *changed)
+{
+    if (changed != NULL) *changed = false;
+    if (engine == NULL) return false;
+    BrowserScrollMark before, after;
+    browser_engine_scroll_mark(engine, &before);
+    bool succeeded;
+    switch (request) {
+        case BROWSER_SCROLL_BY:
+            succeeded = browser_engine_scroll_by(engine, amount); break;
+        case BROWSER_SCROLL_PAGE:
+            succeeded = browser_engine_scroll_page(engine, amount); break;
+        case BROWSER_SCROLL_EDGE:
+            succeeded = browser_engine_scroll_to_edge(engine, amount != 0);
+            break;
+        default:
+            return false;
+    }
+    if (!succeeded || changed == NULL) return succeeded;
+    browser_engine_scroll_mark(engine, &after);
+    *changed = after.scroll_y != before.scroll_y
+        || after.scroll_generation != before.scroll_generation
+        || after.relayouts != before.relayouts
+        || after.render_relayouts != before.render_relayouts
+        || after.render_focus_paint != before.render_focus_paint
+        || after.render_shell != before.render_shell
+        || after.loaded != before.loaded || !after.loaded
+        || after.provisional != before.provisional
+        || after.tile_hold != before.tile_hold;
+    return true;
+}
+
 #include "browser_engine/find.inc"
 
 bool browser_engine_text_value(const BrowserEngine *engine, char *output,
@@ -4482,6 +4700,7 @@ bool browser_engine_execute_action(BrowserEngine *engine,
         clear_error(engine);
         return true;
     }
+    browser_engine_embed_hop_navigation(engine, action);
     const char *method = action->type == CONTROLLER_ACTION_FORM_SUBMIT
         ? action->method : "GET";
     if (action->type == CONTROLLER_ACTION_NAVIGATE
@@ -5866,6 +6085,13 @@ bool browser_engine_page_document_url(
     return true;
 }
 
+const struct TilefinchContentSecurityPolicy *
+browser_engine_page_content_security_policy(const BrowserEngine *engine)
+{
+    return engine == NULL
+        ? NULL : &engine->navigation.page.document.content_security_policy;
+}
+
 long browser_engine_last_http_status(const BrowserEngine *engine)
 {
     const NavigationSession *navigation =
@@ -6006,6 +6232,7 @@ bool browser_engine_apply_user_css(
 }
 
 #include "browser_engine/reader_recovery.inc"
+#include "browser_engine/embed_hop.inc"
 
 const NavigationSession *browser_engine_navigation_view(
     const BrowserEngine *engine)

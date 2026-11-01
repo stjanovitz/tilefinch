@@ -340,6 +340,20 @@ static bool script_parse_line(
         snprintf(step->mark, sizeof(step->mark), "%s", fields[1]);
         return true;
     }
+    if (strcmp(command, "focus-page-media") == 0) {
+        if (field_count != 1u || advance_in_text_entry) {
+            *reason = "focus-page-media takes no operands";
+            return false;
+        }
+        step = script_push(script);
+        if (step == NULL) { *reason = "too many steps"; return false; }
+        step->kind = (uint8_t) PSP_INPUT_SCRIPT_STEP_PAGE_ACTION;
+        step->advance_while_busy = advance_while_busy;
+        step->advance_when_painted = advance_when_painted;
+        step->page_action = (uint8_t) PSP_INPUT_SCRIPT_PAGE_ACTION_FOCUS_MEDIA;
+        step->ticks = 1u;
+        return true;
+    }
     if (strcmp(command, "end") == 0) {
         if (field_count != 1u || advance_while_busy || advance_when_painted
             || advance_in_text_entry) {
@@ -476,6 +490,7 @@ void psp_input_script_interrupt(PspInputScript *script)
     if (script == NULL || !script->armed) return;
     script->finished = true;
     script->mark = NULL;
+    script->page_action = 0u;
 }
 
 bool psp_input_script_eof_pending(const PspInputScript *script)
@@ -489,6 +504,13 @@ bool psp_input_script_eof_pending(const PspInputScript *script)
 const char *psp_input_script_mark(const PspInputScript *script)
 {
     return script == NULL ? NULL : script->mark;
+}
+
+PspInputScriptPageAction psp_input_script_page_action(
+    const PspInputScript *script)
+{
+    return script == NULL ? PSP_INPUT_SCRIPT_PAGE_ACTION_NONE
+        : (PspInputScriptPageAction) script->page_action;
 }
 
 bool psp_input_script_exit_pending(const PspInputScript *script)
@@ -547,6 +569,7 @@ bool psp_input_script_advance_with_page(
     }
     if (script == NULL) return false;
     script->mark = NULL;
+    script->page_action = 0u;
     script->pressed_us = 0;
     if (!script->armed || script->finished) return false;
     while (script->step < script->step_count && script->step_remaining == 0u) {
@@ -605,6 +628,9 @@ bool psp_input_script_advance_with_page(
     if (step->kind == (uint8_t) PSP_INPUT_SCRIPT_STEP_MARK
         && script->step_remaining == step->ticks)
         script->mark = step->mark;
+    if (step->kind == (uint8_t) PSP_INPUT_SCRIPT_STEP_PAGE_ACTION
+        && script->step_remaining == step->ticks)
+        script->page_action = step->page_action;
     bool holding = step->kind == (uint8_t) PSP_INPUT_SCRIPT_STEP_HOLD
         || (step->kind == (uint8_t) PSP_INPUT_SCRIPT_STEP_ANALOG
             && step->buttons != 0);

@@ -648,9 +648,42 @@ static bool psp_media_present_prepare(
     return true;
 }
 
+static bool psp_media_swdec_ge_submit(
+    const PspMediaPresentPlan *plan, const MediaVideoFrame *frame,
+    uint16_t *vram, bool chrome_paints, PspMediaPresentGeCost *cost);
+
+/* A picture drawn into a back buffer counts as displayed only once that
+   buffer is published: a draw the graphics engine fails, or a publication
+   that does not happen, must not count. The presenters record the picture
+   here and the publishing caller settles it. */
+static struct {
+    bool pending;
+    int path;
+    MediaVideoFrame frame;
+} psp_media_displayed_pending;
+
+static void psp_media_note_displayed_after_publish(
+    const MediaVideoFrame *frame, int path)
+{
+    psp_media_displayed_pending.frame = *frame;
+    psp_media_displayed_pending.path = path;
+    psp_media_displayed_pending.pending = true;
+}
+
+static void psp_media_settle_displayed(bool published)
+{
+    if (!psp_media_displayed_pending.pending) return;
+    psp_media_displayed_pending.pending = false;
+    if (published && psp_active_media != NULL)
+        media_playback_note_frame_displayed(
+            psp_active_media->playback, &psp_media_displayed_pending.frame,
+            psp_media_displayed_pending.path);
+}
+
 /* The Sharp option, and every present that reaches the 16-bit surface. The
-   graphics engine is not consulted here at all: it draws into the 32-bit
-   video surface and nowhere else. */
+   graphics engine draws here only for the software decoder's 16-bit
+   pictures (psp_media_swdec_ge_submit); every other picture it draws into
+   the 32-bit video surface. */
 static bool psp_present_media_frame(
     uint16_t *vram, const MediaVideoFrame *frame, bool chrome_paints)
 {
@@ -693,21 +726,32 @@ static bool psp_present_media_frame(
         && (psp_active_media == NULL
             || !media_playback_borrow_video_slot(
                 psp_active_media->playback, (unsigned) frame->slot,
-                frame->generation))) return false;
-    bool scaled = psp_media_present_software(&plan, frame, vram);
-    if (frame->slot >= 0)
+                frame->generation))) {
+        psp_vprobe_present_borrow_refused();
+        return false;
+    }
+    /* A submitted draw keeps the borrow until psp_media_swdec_ge_finish. */
+    PspMediaPresentGeCost cost = {0, 0, 0};
+    bool drawn = psp_media_swdec_ge_submit(
+        &plan, frame, vram, chrome_paints, &cost);
+    bool scaled = drawn || psp_media_present_software(&plan, frame, vram);
+    if (frame->slot >= 0 && !drawn)
         media_playback_release_video_read(
             psp_active_media->playback, (unsigned) frame->slot);
     if (!scaled) return false;
-    psp_media_fill_bands(vram, &plan);
+    if (drawn) {
+        mode = PSP_MEDIA_PRESENT_MODE_GE_SMOOTH;
+        reason = "swdec-565";
+    } else {
+        psp_media_fill_bands(vram, &plan);
+    }
     psp_media_present_report(mode, reason, frame, &plan, NULL);
-    PspMediaPresentGeCost cost = {0, 0, 0};
     psp_media_present_account(
-        record, frame, &plan, generation, started_us, &cost, false,
+        record, frame, &plan, generation, started_us, &cost, drawn,
         chrome_paints);
-    media_playback_note_frame_displayed(
-        psp_active_media->playback, frame,
-        MEDIA_PSP_PRESENT_PATH_SOFTWARE);
+    psp_media_note_displayed_after_publish(
+        frame, drawn ? MEDIA_PSP_PRESENT_PATH_GE_DIRECT
+                     : MEDIA_PSP_PRESENT_PATH_SOFTWARE);
     return true;
 }
 
@@ -822,9 +866,8 @@ finished:
     psp_media_present_account(
         record, frame, full, generation, started_us, cost, true,
         chrome_paints);
-    media_playback_note_frame_displayed(
-        psp_active_media->playback, frame,
-        MEDIA_PSP_PRESENT_PATH_GE_STRIPS);
+    psp_media_note_displayed_after_publish(
+        frame, MEDIA_PSP_PRESENT_PATH_GE_STRIPS);
     return true;
 }
 
@@ -919,13 +962,11 @@ static bool psp_present_media_frame_video(
     psp_media_present_account(
         record, frame, &plan, generation, started_us, cost, true,
         chrome_paints);
-    /* The picture is on the screen. This is the only milestone that says so:
-       everything upstream reports ownership changing hands. */
-    if (psp_active_media != NULL)
-        media_playback_note_frame_displayed(
-        psp_active_media->playback, frame,
-        texture.staged ? MEDIA_PSP_PRESENT_PATH_GE_STAGED
-                       : MEDIA_PSP_PRESENT_PATH_GE_DIRECT);
+    /* The picture reaches the screen once its buffer is published; that
+       is the only milestone that says so (psp_media_settle_displayed). */
+    psp_media_note_displayed_after_publish(
+        frame, texture.staged ? MEDIA_PSP_PRESENT_PATH_GE_STAGED
+                              : MEDIA_PSP_PRESENT_PATH_GE_DIRECT);
     return true;
 }
 
@@ -957,12 +998,16 @@ static bool psp_media_complete_wide_pass(PspMediaPresentGeCost *cost)
  */
 static bool psp_media_video_surface_follow(bool video_owns_screen)
 {
-    bool want = video_owns_screen
-        && psp_media_present_requested_mode()
-             == PSP_MEDIA_PRESENT_MODE_GE_SMOOTH
-        /* NULL while the engine has not failed. A latched-off engine must not
-           be given the panel and then hand it straight back. */
-        && psp_media_present_ge_reason() == NULL;
+    /* A NULL reason means the engine has not failed: a latched-off engine
+       must not be given the panel and then hand it straight back. Neither
+       may a 16-bit picture, which the surface always refuses. */
+    bool want = psp_media_present_video_surface_wanted(
+        video_owns_screen,
+        psp_media_present_requested_mode()
+            == PSP_MEDIA_PRESENT_MODE_GE_SMOOTH,
+        psp_media_present_ge_reason() == NULL,
+        psp_active_media != NULL
+            && psp_active_media->frame.format == MEDIA_PIXEL_RGBA8888);
     if (want == psp_display_video_active(&psp_display)) return want;
     if (!want) {
         (void) psp_display_video_end(&psp_display);
@@ -982,6 +1027,93 @@ static bool psp_media_video_surface_follow(bool video_owns_screen)
     }
     psp_media_present_forget_buffers();
     return true;
+}
+
+/*
+ * The software decoder's 16-bit pictures, drawn by the graphics engine into
+ * the 16-bit page buffer without the presenting thread waiting on it.
+ *
+ * The reverted attempt (91ca746f) drew them into the 32-bit video surface and
+ * synced straight after the submit, ahead of the chrome, the due-time wait
+ * and the vblank wait: the thread spent 29.5ms a frame in that sync, because
+ * one panel-wide sprite read the slot from main RAM with no texture-cache
+ * reuse. Here the draw is sliced (psp_media_present_ge_submit), the bands are
+ * filled before it so nothing else writes those rows, and the completion is
+ * collected by psp_media_swdec_ge_finish just before the buffer is latched,
+ * after the due-time wait the draw overlaps. The slot stays borrowed until
+ * then, so the decoder cannot reuse it under the engine.
+ *
+ * Chrome blends over the picture and would need the rows first, so a frame
+ * with visible chrome keeps the software scaler, as do a slot the engine
+ * cannot address (above 0x0A000000, or unaligned), a geometry with no quads,
+ * Sharp, and an engine latched off.
+ */
+static bool psp_media_swdec_ge_pending;
+static unsigned psp_media_swdec_ge_slot;
+
+static bool psp_media_swdec_ge_finish(void);
+
+static bool psp_media_swdec_ge_submit(
+    const PspMediaPresentPlan *plan, const MediaVideoFrame *frame,
+    uint16_t *vram, bool chrome_paints, PspMediaPresentGeCost *cost)
+{
+    if (frame->format != MEDIA_PIXEL_RGB565 || frame->slot < 0) return false;
+    uintptr_t address = (uintptr_t) frame->pixels & 0x1fffffffu;
+    unsigned path = PSP_VPROBE_SWDEC_GE;
+    if (psp_media_present_requested_mode() != PSP_MEDIA_PRESENT_MODE_GE_SMOOTH
+        || psp_media_present_ge_reason() != NULL
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        || psp_vprobe_swdec_mode == 1
+#endif
+        ) path = PSP_VPROBE_SWDEC_OFF;
+    else if (chrome_paints) path = PSP_VPROBE_SWDEC_CHROME;
+    else if (address >= 0x0a000000u || (address & 15u) != 0)
+        path = PSP_VPROBE_SWDEC_ADDRESS;
+    else if (plan->quad_count == 0) path = PSP_VPROBE_SWDEC_GEOMETRY;
+    if (path == PSP_VPROBE_SWDEC_GE) {
+        psp_media_fill_bands(vram, plan);
+        PspMediaPresentTexture texture = {
+            .pixels = frame->pixels,
+            .stride_pixels = frame->stride_pixels,
+            .rgb565 = true
+        };
+        if (psp_media_present_ge_submit(
+                plan, &texture, (uint32_t *) vram, cost)) {
+            psp_media_swdec_ge_slot = (unsigned) frame->slot;
+            psp_media_swdec_ge_pending = true;
+            psp_vprobe_swdec_present(path, cost);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+            /* 3: the reverted placement, synced at once, for the A/B. */
+            if (psp_vprobe_swdec_mode == 3)
+                (void) psp_media_swdec_ge_finish();
+#endif
+            return true;
+        }
+        path = PSP_VPROBE_SWDEC_REFUSED;
+    }
+    psp_vprobe_swdec_present(path, NULL);
+    return false;
+}
+
+/* Collect a submitted 16-bit draw before its buffer is latched, then hand the
+   slot back. Normally the engine has finished during the due-time wait; if
+   not, feed the decoder while it runs and only then wait. False means the
+   engine failed and the buffer holds no picture. */
+static bool psp_media_swdec_ge_finish(void)
+{
+    if (!psp_media_swdec_ge_pending) return true;
+    psp_media_swdec_ge_pending = false;
+    bool drawing = psp_media_present_ge_drawing();
+    if (drawing && psp_active_media != NULL)
+        (void) psp_media_pump_while_drawing(psp_active_media);
+    PspMediaPresentGeCost cost = {0, 0, 0};
+    bool drawn = psp_media_present_ge_complete(&cost);
+    if (psp_active_media != NULL)
+        media_playback_release_video_read(
+            psp_active_media->playback, psp_media_swdec_ge_slot);
+    psp_vprobe_swdec_finish(drawing, &cost, drawn);
+    if (!drawn) psp_media_present_forget_buffers();
+    return drawn;
 }
 
 static bool psp_media_track_menu_blit(
@@ -1031,6 +1163,7 @@ static bool psp_present_video_surface(void)
 {
     PspVprobeVideo probe;
     psp_vprobe_video_begin(&probe);
+    psp_media_settle_displayed(false);
     uint32_t *vram = psp_display_video_back_buffer(&psp_display);
     PspMediaPresentGeCost cost = {0, 0, 0};
     uint32_t feedback_key = psp_ui_media_menu_feedback_key(&psp_active_media->ui);
@@ -1114,6 +1247,7 @@ static bool psp_present_video_surface(void)
         printf("tilefinch-media-present: priority-restore=0x%08X\n",
                (unsigned) restored);
     psp_vprobe_video_publish_returned(published);
+    psp_media_settle_displayed(published);
     if (published) {
         psp_media_presented(psp_active_media);
         psp_media_menu_deferred_us = 0;
@@ -1252,6 +1386,7 @@ bool psp_present_internal(
         if (media_replaces_page) {
             bool overlay_paints =
                 psp_ui_media_overlay_paints(&psp_active_media->ui);
+            psp_media_settle_displayed(false);
             psp_vprobe_video_skipped(false);
             (void) psp_present_media_frame(
                 vram, &psp_active_media->frame,
@@ -1277,9 +1412,14 @@ bool psp_present_internal(
        scanout buffer directly caused visibly half-updated title bars and
        loading flicker on physical hardware. */
     psp_vprobe_phase_composed(&phase, native_surface);
+    /* A submitted 16-bit draw is collected after the due-time wait it
+       overlaps and before the latch, and always before this returns. */
     bool published = (!media_replaces_page
         || psp_media_wait_video_due(psp_active_media))
+        && psp_media_swdec_ge_finish()
         && psp_display_publish(&psp_display);
+    if (!published) (void) psp_media_swdec_ge_finish();
+    psp_media_settle_displayed(published);
     psp_vprobe_phase_published(
         &phase, published, media_visible, media_replaces_page, frame, ui,
         vram);

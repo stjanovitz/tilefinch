@@ -246,6 +246,8 @@ static struct {
     /* The frame's wait was the page-task yield, not a vblank. */
     bool task_yield;
     bool fast_followup;
+    bool media_polling, media_followup;
+    uint32_t media_wait_us;
     bool timer_known, timer_frame;
     int64_t due_us;
 } psp_loop_timing;
@@ -271,8 +273,92 @@ void psp_loop_timing_begin(void)
     }
 }
 
+/* The software video window's main-thread CPU split: thread run time of
+   the idle and present phases by part (MediaSwdecCpuKind), read only at
+   part boundaries and only while the window is open (sleep adds no run
+   time). A part outside its phase (a present from another phase) is
+   ignored, so the parts stay disjoint scopes of the one thread. */
+#define PSP_LOOP_CPU_NONE MEDIA_SWDEC_CPU_KINDS
+static unsigned psp_loop_cpu_phase = LOOP_WAIT;
+static unsigned psp_loop_cpu_kind = PSP_LOOP_CPU_NONE;
+static uint64_t psp_loop_cpu_mark;
+
+static void psp_loop_cpu_switch(unsigned kind)
+{
+    unsigned was = psp_loop_cpu_kind;
+    psp_loop_cpu_kind = kind;
+    if (!media_psp_swdec_window_cpu_wanted()) {
+        psp_loop_cpu_mark = 0;
+        return;
+    }
+    if (was == kind || (was == PSP_LOOP_CPU_NONE && kind == PSP_LOOP_CPU_NONE))
+        return;
+    SceKernelThreadRunStatus status = {.size = sizeof(status)};
+    if (sceKernelReferThreadRunStatus(sceKernelGetThreadId(), &status) < 0)
+        return;
+    uint64_t now = ((uint64_t) status.runClocks.hi << 32)
+        | status.runClocks.low;
+    if (was != PSP_LOOP_CPU_NONE && psp_loop_cpu_mark != 0)
+        media_psp_swdec_window_cpu_add(was, now - psp_loop_cpu_mark);
+    psp_loop_cpu_mark = kind != PSP_LOOP_CPU_NONE ? now : 0;
+}
+
+static unsigned psp_loop_cpu_phase_kind(unsigned phase)
+{
+    return phase == LOOP_IDLE ? MEDIA_SWDEC_CPU_IDLE
+        : phase == LOOP_PRESENT ? MEDIA_SWDEC_CPU_PRESENT
+        : PSP_LOOP_CPU_NONE;
+}
+
+static const uint8_t psp_loop_cpu_parent[MEDIA_SWDEC_CPU_KINDS] = {
+    [MEDIA_SWDEC_CPU_IDLE] = PSP_LOOP_CPU_NONE,
+    [MEDIA_SWDEC_CPU_PLAYER] = MEDIA_SWDEC_CPU_IDLE,
+    [MEDIA_SWDEC_CPU_TRANSPORT] = MEDIA_SWDEC_CPU_PLAYER,
+    [MEDIA_SWDEC_CPU_CLOCK] = MEDIA_SWDEC_CPU_PLAYER,
+    [MEDIA_SWDEC_CPU_FEED] = MEDIA_SWDEC_CPU_PLAYER,
+    [MEDIA_SWDEC_CPU_TAKE] = MEDIA_SWDEC_CPU_PLAYER,
+    [MEDIA_SWDEC_CPU_PRESENT] = PSP_LOOP_CPU_NONE,
+    [MEDIA_SWDEC_CPU_ENTRY] = MEDIA_SWDEC_CPU_PRESENT,
+    [MEDIA_SWDEC_CPU_COMPOSE] = MEDIA_SWDEC_CPU_PRESENT,
+    [MEDIA_SWDEC_CPU_SUBMIT] = MEDIA_SWDEC_CPU_PRESENT,
+    [MEDIA_SWDEC_CPU_PROBE] = MEDIA_SWDEC_CPU_PRESENT,
+    [MEDIA_SWDEC_CPU_PRESENTED] = MEDIA_SWDEC_CPU_PRESENT,
+    [MEDIA_SWDEC_CPU_SUBTITLE] = MEDIA_SWDEC_CPU_PROBE,
+    [MEDIA_SWDEC_CPU_ROUTE] = MEDIA_SWDEC_CPU_PLAYER,
+    [MEDIA_SWDEC_CPU_PREP] = MEDIA_SWDEC_CPU_PLAYER,
+    [MEDIA_SWDEC_CPU_MID] = MEDIA_SWDEC_CPU_PLAYER,
+    [MEDIA_SWDEC_CPU_TAIL] = MEDIA_SWDEC_CPU_PLAYER,
+    [MEDIA_SWDEC_CPU_SCRIPT] = MEDIA_SWDEC_CPU_PLAYER,
+};
+
+void media_swdec_cpu_begin(unsigned kind)
+{
+    if (kind >= MEDIA_SWDEC_CPU_KINDS
+        || psp_loop_cpu_kind >= MEDIA_SWDEC_CPU_KINDS) return;
+    unsigned parent = psp_loop_cpu_parent[kind];
+    if (parent == psp_loop_cpu_kind
+        || parent == psp_loop_cpu_parent[psp_loop_cpu_kind])
+        psp_loop_cpu_switch(kind);
+}
+
+void media_swdec_cpu_end(unsigned kind)
+{
+    if (kind < MEDIA_SWDEC_CPU_KINDS && psp_loop_cpu_kind == kind)
+        psp_loop_cpu_switch(psp_loop_cpu_parent[kind]);
+}
+
+void media_swdec_cpu_end_within(unsigned kind)
+{
+    if (kind < MEDIA_SWDEC_CPU_KINDS
+        && psp_loop_cpu_kind < MEDIA_SWDEC_CPU_KINDS
+        && psp_loop_cpu_parent[psp_loop_cpu_kind] == kind)
+        psp_loop_cpu_switch(kind);
+}
+
 void psp_loop_timing_phase(unsigned phase)
 {
+    psp_loop_cpu_phase = phase;
+    psp_loop_cpu_switch(psp_loop_cpu_phase_kind(phase));
     if (!psp_loop_timing.active) return;
     uint64_t now = (uint64_t) sceKernelGetSystemTimeWide();
     psp_loop_timing.us[psp_loop_timing.phase] += now - psp_loop_timing.last;
@@ -313,7 +399,8 @@ void psp_loop_timing_end(void)
     }
     printf("tilefinch-loop-timing: begin-us=%llu end-us=%llu "
            "wait=%llu input=%llu action=%llu probe=%llu navigation=%llu "
-           "runtime=%llu idle=%llu raster=%llu present=%llu images=%llu tail=%llu\n",
+           "runtime=%llu idle=%llu raster=%llu present=%llu images=%llu tail=%llu "
+           "media-wait=%u/%u/%u\n",
            (unsigned long long) psp_loop_timing.start,
            (unsigned long long) psp_loop_timing.last,
            (unsigned long long) psp_loop_timing.us[LOOP_WAIT],
@@ -326,7 +413,10 @@ void psp_loop_timing_end(void)
            (unsigned long long) psp_loop_timing.us[LOOP_RASTER],
            (unsigned long long) psp_loop_timing.us[LOOP_PRESENT],
            (unsigned long long) psp_loop_timing.us[LOOP_IMAGES],
-           (unsigned long long) psp_loop_timing.us[LOOP_TAIL]);
+           (unsigned long long) psp_loop_timing.us[LOOP_TAIL],
+           psp_loop_timing.media_polling ? 1u : 0u,
+           psp_loop_timing.media_followup ? 1u : 0u,
+           (unsigned) psp_loop_timing.media_wait_us);
     psp_loop_work_print();
     psp_loop_timing.active = false;
 }
@@ -347,6 +437,15 @@ void psp_loop_timing_note_wait(bool task_yield, bool fast_followup)
 {
     psp_loop_timing.task_yield = task_yield;
     psp_loop_timing.fast_followup = fast_followup;
+}
+
+void psp_loop_timing_note_media_wait(bool polling, bool followup,
+                                    uint32_t waited_us)
+{
+    psp_loop_timing.media_polling = polling;
+    psp_loop_timing.media_followup = followup;
+    psp_loop_timing.media_wait_us = waited_us;
+    if (polling) media_psp_swdec_note_presenter_wait(waited_us);
 }
 
 static void psp_loop_ready_sample(void)

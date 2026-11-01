@@ -211,7 +211,7 @@ static void psp_media_scale_row_rgba(
 
 static void psp_media_scale_row_rgb565(
     uint16_t *out, const uint16_t *row, const uint32_t *column_offset,
-    int output_width, bool identity_columns)
+    int output_width, bool identity_columns, bool pair_aligned)
 {
     if (identity_columns) {
         memcpy(out, row, (size_t) output_width * sizeof(*out));
@@ -221,7 +221,21 @@ static void psp_media_scale_row_rgb565(
        16-bit array, so the cast never widens the alignment requirement --
        which matters on Allegrex, where unaligned loads are a trap. */
     const unsigned char *base = (const unsigned char *) row;
-    for (int x = 0; x < output_width; x++) {
+    int x = 0;
+    if (pair_aligned) {
+        /* Two gathered pixels per 32-bit store, as the RGBA path does: the
+           software decoder's 426x240 pictures reach the panel through this
+           loop, 130 thousand pixels a frame, on the browser thread. */
+        uint32_t *pair = (uint32_t *) (void *) out;
+        for (; x + 1 < output_width; x += 2) {
+            uint32_t low = *(const uint16_t *) (const void *)
+                (base + column_offset[x]);
+            uint32_t high = *(const uint16_t *) (const void *)
+                (base + column_offset[x + 1]);
+            *pair++ = psp_media_scale_pair(low, high);
+        }
+    }
+    for (; x < output_width; x++) {
         out[x] = *(const uint16_t *) (const void *)
             (base + column_offset[x]);
     }
@@ -294,7 +308,7 @@ void psp_media_scale_blit(
             psp_media_scale_row_rgb565(
                 out, (const uint16_t *) (const void *) row,
                 map->column_offset, map->output_width,
-                map->identity_columns);
+                map->identity_columns, pair_aligned);
         }
         out += destination_stride_pixels;
     }

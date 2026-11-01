@@ -31,7 +31,7 @@ coding agents are capable of. A web browser tests all three.
 | Feature | Support |
 |---|---|
 | **Web browsing** | Real HTTPS pages with JavaScript, bounded WebAssembly and WebSockets, cookies, images, mobile layout, and TrueType text. No proxy or companion computer is involved. |
-| **Native media** | YouTube (through its lightweight provider) and compatible HTML `<video>`/`<audio>` elements open in one native player. Official builds use the PSP's firmware decoder for 240p/360p Baseline/Main MP4 and 240p HLS with AAC-LC, including YouTube live streams and premieres. Seeking, buffering status, preferred audio and subtitle languages, track selection, resumable downloads, and audio-only playback are built in. An optional, separately built decoder adds 240p H.264 High. |
+| **Native media** | YouTube (through its lightweight provider) and compatible HTML `<video>`/`<audio>` elements open in one native player. Official builds use the PSP's firmware decoder for 240p/360p Baseline/Main MP4 and 240p HLS with AAC-LC, including YouTube live streams and premieres. Seeking, buffering status, preferred audio and subtitle languages, track selection, resumable downloads, and audio-only playback are built in. An optional, separately built decoder adds 240p H.264 High, and 240p Baseline/Main streams the firmware refuses (more than 3 reference frames, B-frame pyramids). |
 | **Tabs and navigation** | Five tabs, bookmarks, history, address and search suggestions, find in page, optional session restore, and optional one-tab hibernation. |
 | **Ad blocking** | Conservative request blocking and cosmetic hiding are on by default. Custom uBlock/EasyList-style rules and per-site exceptions are supported. |
 | **Cookie notices** | Common consent banners are hidden without clicking Accept or creating consent cookies; individual sites can be exempted. |
@@ -64,7 +64,7 @@ coding agents are capable of. A web browser tests all three.
 | **Useful pixels before the download ends** | Streaming HTML and CSS, preload discovery, resumable layout, priority for visible resources, lazily loaded bootstrap modules, and bounded caches of compiled styles and scripts all aim at first paint on a 333 MHz in-order core. |
 | **Deterministic rendering** | Host and PSP share the same layout and rasterizer, down to ordered RGB565 dithering. Fidelity floors measured against Chrome references may only move upward ([fidelity workflow](docs/FIDELITY.md)). |
 | **Firmware video acceleration** | A raw-NAL bridge and a bounded H.264 recovery-point rewriter feed the PSP's Media Engine, and two guarded decode surfaces overlap color conversion with presentation ([media state machine](docs/engineering/PSP_MEDIA_SESSION_STATE.md)). |
-| **Optional two-core video** | A user-built add-on decodes 240p H.264 High by giving CABAC, deblocking, audio, and color conversion to the Media Engine while the CPU reconstructs rows. Official binaries deliberately leave it out. |
+| **Optional two-core video** | A user-built add-on decodes 240p H.264 High, Main and Baseline (CABAC or CAVLC) by giving entropy decoding, deblocking, audio, and color conversion to the Media Engine while the CPU reconstructs rows. Official binaries deliberately leave it out. |
 | **360p on a 480×272 screen** | 640×360 frames pass through EDRAM as two guarded strips, and the GE scales them bilinearly with no per-pixel CPU pass ([device envelope](docs/engineering/PSP_ENVELOPE.md)). |
 | **Explicit lifecycle ownership** | Media and networking use pure reducers, epoch-tokened services, consumer leases, pumped teardown, and quarantine, so memory is never freed beneath live firmware or worker activity ([architecture](docs/ARCHITECTURE.md)). |
 | **Security without pretending to sandbox** | HTTPS-first navigation, CORS, CSP, SRI, private-network protection, partition-aware resource authority, cookie controls, and signed A/B updates are enforced within a documented shared-process model ([security model](docs/SECURITY_MODEL.md)). |
@@ -158,7 +158,12 @@ Compatible Baseline/Main MP4 and HLS, live streams included, keep using the
 PSP's firmware. To add the 240p High-profile path, build the add-on from its
 pinned upstream source by following
 [Optional PSP software decoder](docs/DEVELOPMENT.md#optional-psp-software-decoder),
-then copy its three files to `PSP/GAME/TILEFINCH/components/swdec/`.
+then copy its three files to `PSP/GAME/TILEFINCH/components/swdec/`. The
+official EBOOT loads it as is: when the add-on is installed, the browser keeps
+2 MiB more of the PSP's memory free for it at startup. A software-decoded
+video needs about 10 MB while it plays; on a page that holds that much, the
+page's scripts are stopped to make room, and the page says so when the player
+closes.
 
 That directory sits outside both app slots, so signed updates keep the
 add-on. Update metadata records the decoder ABI: if a future update changes

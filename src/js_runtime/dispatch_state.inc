@@ -130,6 +130,56 @@ bool script_runtime_dispatch_activation_node(ScriptRuntime *runtime,
         runtime, node, 0, 0, 0, 0, 0, 0, result);
 }
 
+/* Popunder guard input: a new gesture forgets the previous one's window
+   request and hyperlink, then records the HTTP(S) destination of the
+   hyperlink (if any) that the activation targets, before any listener can
+   change it. */
+static void runtime_note_activation_target(DomBridge *bridge,
+                                           lxb_dom_node_t *node,
+                                           bool gesture_start)
+{
+    if (gesture_start) {
+        bridge->new_window_expires_ms = 0;
+        bridge->new_window_site = 0;
+        budget_free(bridge->budget, bridge->activation_link_url);
+        bridge->activation_link_url = NULL;
+        bridge->activation_link_default = false;
+    }
+    if (bridge->activation_link_url != NULL) return;
+    /* Only an HTML hyperlink found within the bounded walk is the pressed
+       link; exhausting the walk finds none. */
+    lxb_dom_node_t *link = NULL;
+    lxb_dom_node_t *at = node;
+    for (size_t depth = 0; at != NULL && depth < 64;
+         depth++, at = at->parent) {
+        if (at->type == LXB_DOM_NODE_TYPE_ELEMENT
+            && at->ns == LXB_NS_HTML
+            && (at->local_name == LXB_TAG_A
+                || at->local_name == LXB_TAG_AREA)
+            && lxb_dom_element_has_attribute(lxb_dom_interface_element(at),
+                   (const lxb_char_t *) "href", 4)) {
+            link = at;
+            break;
+        }
+    }
+    if (link == NULL || lxb_dom_element_has_attribute(
+            lxb_dom_interface_element(link),
+            (const lxb_char_t *) "download", 8)) return;
+    size_t length = 0;
+    const char *href = document_attribute(link, "href", &length);
+    char reference[TILEFINCH_URL_SERIALIZED_LIMIT];
+    char resolved[TILEFINCH_URL_SERIALIZED_LIMIT];
+    const char *base = js_rt_bridge_calculated_base_url(bridge);
+    if (length >= sizeof(reference) || base == NULL) return;
+    if (href != NULL) memcpy(reference, href, length);
+    reference[length] = '\0';
+    if (!tilefinch_url_resolve(base, reference, resolved, sizeof(resolved))
+        || (strncmp(resolved, "https://", 8) != 0
+            && strncmp(resolved, "http://", 7) != 0)) return;
+    bridge->activation_link_url = js_rt_dynamic_copy_text(
+        bridge->budget, resolved);
+}
+
 bool script_runtime_dispatch_pointer_node(
     ScriptRuntime *runtime, lxb_dom_node_t *node, unsigned phase,
     int client_x, int client_y, int offset_x, int offset_y,
@@ -153,8 +203,10 @@ bool script_runtime_dispatch_pointer_node(
     };
     JSValue returned = JS_UNDEFINED;
     bool trusted_activation = phase == 0u || phase == 2u || phase == 5u;
-    if (trusted_activation)
+    if (trusted_activation) {
         js_rt_bridge_notify_user_activation(&runtime->bridge);
+        runtime_note_activation_target(&runtime->bridge, node, phase != 5u);
+    }
     runtime->result.event_dispatch_entered = true;
     if (result != NULL) result->event_dispatch_entered = true;
     js_rt_saturating_add_size(
@@ -439,8 +491,22 @@ bool script_runtime_consume_navigation(ScriptRuntime *runtime, char *url,
     runtime->bridge.navigation_requested = false;
     runtime->bridge.navigation_replace = false;
     runtime->bridge.navigation_user_activated = false;
+    runtime->bridge.navigation_follows_link = false;
     runtime->bridge.navigation_url[0] = '\0';
     return true;
+}
+
+void script_runtime_note_link_default(ScriptRuntime *runtime)
+{
+    if (runtime == NULL) return;
+    DomBridge *bridge = &runtime->bridge;
+    bridge->activation_link_default = true;
+    if (!bridge->navigation_follows_link) return;
+    bridge->navigation_requested = false;
+    bridge->navigation_replace = false;
+    bridge->navigation_user_activated = false;
+    bridge->navigation_follows_link = false;
+    bridge->navigation_url[0] = '\0';
 }
 
 bool script_runtime_has_pending_navigation(const ScriptRuntime *runtime)
@@ -1049,6 +1115,13 @@ void script_runtime_set_node_retirement_callback(
     runtime->bridge.node_retirement = callback;
     runtime->bridge.node_retirement_opaque =
         callback == NULL ? NULL : opaque;
+}
+
+void script_runtime_relocate_node_retirement_opaque(ScriptRuntime *runtime,
+                                                    void *opaque)
+{
+    if (runtime == NULL || runtime->bridge.node_retirement == NULL) return;
+    runtime->bridge.node_retirement_opaque = opaque;
 }
 
 bool script_runtime_set_page_scroll(ScriptRuntime *runtime, int scroll_y)

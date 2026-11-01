@@ -686,10 +686,12 @@ static int psp_network_join_step(PspNetwork *network, uint64_t now_us)
     return 0;
 }
 
+#include "psp_network_shutdown.inc"
+
 bool psp_network_begin(PspNetwork *network, int profile_index)
 {
     if (network == NULL || profile_index <= 0) return false;
-    memset(network, 0, sizeof(*network));
+    psp_network_reset_ladder(network);
     network->requested_profile_index = profile_index;
     network->diagnostics_enabled = psp_network_diagnostics_enabled();
     network->profile_index = profile_index;
@@ -760,6 +762,10 @@ PspNetworkStatus psp_network_pump(PspNetwork *network,
             return psp_network_finish_pump(
                 network, phase, pump_started_us);
         }
+        if (network->common_loaded) {
+            network->status = PSP_NETWORK_LOADING_INET;
+            break;
+        }
         PspUtilityModuleLoadDisposition common_disposition =
             psp_utility_load_net_module(
                 PSP_NET_MODULE_COMMON, &result);
@@ -774,6 +780,10 @@ PspNetworkStatus psp_network_pump(PspNetwork *network,
         network->status = PSP_NETWORK_LOADING_INET;
         break;
     case PSP_NETWORK_LOADING_INET: {
+        if (network->inet_loaded) {
+            network->status = PSP_NETWORK_INITIALIZING_CORE;
+            break;
+        }
         PspUtilityModuleLoadDisposition inet_disposition =
             psp_utility_load_net_module(
                 PSP_NET_MODULE_INET, &result);
@@ -1106,154 +1116,6 @@ bool psp_network_rejoin_pump(
         return true;
     }
     return false;
-}
-
-static void psp_network_shutdown_result(
-    PspNetworkShutdownReport *report, uint32_t bit, int result)
-{
-    report->attempted_mask |= bit;
-    if (result < 0) {
-        report->failure_mask |= bit;
-        if (report->first_error == 0) report->first_error = result;
-    }
-}
-
-void psp_network_shutdown_begin(
-    PspNetwork *network, PspNetworkShutdownOperation *operation)
-{
-    if (operation == NULL) return;
-    memset(operation, 0, sizeof(*operation));
-    if (network == NULL) {
-        operation->phase = PSP_NETWORK_SHUTDOWN_COMPLETE;
-        return;
-    }
-    operation->started_us = psp_network_now_us();
-    operation->leave_started_us = operation->started_us;
-    operation->report.final_apctl_state = network->apctl_state;
-    operation->report.free_memory_before =
-        (size_t) sceKernelTotalFreeMemSize();
-    operation->report.maximum_free_block_before =
-        (size_t) sceKernelMaxFreeMemSize();
-    operation->phase = network->apctl_initialized
-        ? PSP_NETWORK_SHUTDOWN_LEAVING
-        : PSP_NETWORK_SHUTDOWN_TERM_RESOLVER;
-}
-
-bool psp_network_shutdown_pump(
-    PspNetwork *network, PspNetworkShutdownOperation *operation)
-{
-    if (network == NULL || operation == NULL
-        || operation->phase == PSP_NETWORK_SHUTDOWN_COMPLETE)
-        return true;
-    PspNetworkShutdownReport *report = &operation->report;
-    switch (operation->phase) {
-    case PSP_NETWORK_SHUTDOWN_LEAVING: {
-        int state = PSP_NET_APCTL_STATE_DISCONNECTED;
-        int queried = sceNetApctlGetState(&state);
-        report->disconnect_polls++;
-        if (queried < 0) {
-            psp_network_shutdown_result(
-                report, UINT32_C(1) << 7, queried);
-            state = network->apctl_state;
-            operation->leave_timed_out = true;
-            operation->phase = PSP_NETWORK_SHUTDOWN_TERM_APCTL;
-        } else {
-            network->apctl_state = state;
-            report->final_apctl_state = state;
-            if (state == PSP_NET_APCTL_STATE_DISCONNECTED) {
-                operation->phase = PSP_NETWORK_SHUTDOWN_TERM_APCTL;
-            } else if (!network->disconnect_started) {
-                int disconnected = sceNetApctlDisconnect();
-                psp_network_shutdown_result(
-                    report, UINT32_C(1) << 0, disconnected);
-                if (disconnected >= 0)
-                    network->disconnect_started = true;
-                else {
-                    operation->leave_timed_out = true;
-                    operation->phase = PSP_NETWORK_SHUTDOWN_TERM_APCTL;
-                }
-            } else if (psp_network_now_us() - operation->leave_started_us
-                       >= PSP_NETWORK_DISCONNECT_WAIT_US) {
-                operation->leave_timed_out = true;
-                operation->phase = PSP_NETWORK_SHUTDOWN_TERM_APCTL;
-            }
-        }
-        report->disconnect_wait_us =
-            psp_network_now_us() - operation->leave_started_us;
-        return false;
-    }
-    case PSP_NETWORK_SHUTDOWN_TERM_APCTL:
-        if (network->apctl_initialized)
-            psp_network_shutdown_result(
-                report, UINT32_C(1) << 1, sceNetApctlTerm());
-        network->apctl_initialized = false;
-        network->connect_started = false;
-        network->disconnect_started = false;
-        operation->phase = PSP_NETWORK_SHUTDOWN_TERM_RESOLVER;
-        return false;
-    case PSP_NETWORK_SHUTDOWN_TERM_RESOLVER:
-        if (network->resolver_initialized)
-            psp_network_shutdown_result(
-                report, UINT32_C(1) << 2, sceNetResolverTerm());
-        network->resolver_initialized = false;
-        operation->phase = PSP_NETWORK_SHUTDOWN_TERM_INET;
-        return false;
-    case PSP_NETWORK_SHUTDOWN_TERM_INET:
-        if (network->inet_initialized)
-            psp_network_shutdown_result(
-                report, UINT32_C(1) << 3, sceNetInetTerm());
-        network->inet_initialized = false;
-        operation->phase = PSP_NETWORK_SHUTDOWN_TERM_CORE;
-        return false;
-    case PSP_NETWORK_SHUTDOWN_TERM_CORE:
-        if (network->core_initialized)
-            psp_network_shutdown_result(
-                report, UINT32_C(1) << 4, sceNetTerm());
-        network->core_initialized = false;
-        operation->phase = PSP_NETWORK_SHUTDOWN_UNLOAD_INET;
-        return false;
-    case PSP_NETWORK_SHUTDOWN_UNLOAD_INET:
-        if (network->inet_owned)
-            psp_network_shutdown_result(
-                report, UINT32_C(1) << 5,
-                sceUtilityUnloadNetModule(PSP_NET_MODULE_INET));
-        network->inet_owned = false;
-        network->inet_loaded = false;
-        operation->phase = PSP_NETWORK_SHUTDOWN_UNLOAD_COMMON;
-        return false;
-    case PSP_NETWORK_SHUTDOWN_UNLOAD_COMMON:
-        if (network->common_owned)
-            psp_network_shutdown_result(
-                report, UINT32_C(1) << 6,
-                sceUtilityUnloadNetModule(PSP_NET_MODULE_COMMON));
-        network->common_owned = false;
-        network->common_loaded = false;
-        report->elapsed_us = psp_network_now_us() - operation->started_us;
-        report->free_memory_after =
-            (size_t) sceKernelTotalFreeMemSize();
-        report->maximum_free_block_after =
-            (size_t) sceKernelMaxFreeMemSize();
-        memset(network, 0, sizeof(*network));
-        operation->phase = PSP_NETWORK_SHUTDOWN_COMPLETE;
-        return true;
-    case PSP_NETWORK_SHUTDOWN_IDLE:
-    case PSP_NETWORK_SHUTDOWN_COMPLETE:
-    default:
-        return true;
-    }
-}
-
-void psp_network_shutdown(
-    PspNetwork *network, PspNetworkShutdownReport *report)
-{
-    if (network == NULL) return;
-    PspNetworkShutdownOperation operation;
-    psp_network_shutdown_begin(network, &operation);
-    while (!psp_network_shutdown_pump(network, &operation)) {
-        if (operation.phase == PSP_NETWORK_SHUTDOWN_LEAVING)
-            (void) sceKernelDelayThread(PSP_NETWORK_DISCONNECT_POLL_US);
-    }
-    if (report != NULL) *report = operation.report;
 }
 
 const char *psp_network_status_name(PspNetworkStatus status)

@@ -15,6 +15,13 @@ from native_capture import (StaleHeightError, VIEWS, build_five_view_commands,
 from native_visual_trace import prepare_native_visual_trace
 
 LAB = None
+HOST_MEDIA = False
+if '--host-media' in sys.argv:
+    index = sys.argv.index('--host-media')
+    if sys.argv[index + 1] not in ('0', '1'):
+        raise ValueError('--host-media requires the configured value 0 or 1')
+    HOST_MEDIA = sys.argv[index + 1] == '1'
+    del sys.argv[index:index + 2]
 if '--lab' in sys.argv:
     index = sys.argv.index('--lab')
     LAB = Path(sys.argv[index + 1]).resolve()
@@ -243,7 +250,12 @@ class NativeCaptureTests(unittest.TestCase):
                 '--commands', str(commands), '--no-loop-capture'],
                 capture_output=True, text=True, timeout=20)
             self.assertEqual(requests, [], 'media bypassed the hermetic HTTP replay')
-            self.assertIn('network media unavailable during HTTP replay', run.stderr)
+            self.assertNotEqual(run.returncode, 0)
+            # CMake supplies the actual backend availability, not a guess
+            # based on whichever error the program happened to produce.
+            expected = ('network media unavailable during HTTP replay'
+                        if HOST_MEDIA else 'this build has no FFmpeg host backend')
+            self.assertIn(expected, run.stderr)
         finally:
             server.shutdown()
             server.server_close()

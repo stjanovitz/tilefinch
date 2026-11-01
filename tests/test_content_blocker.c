@@ -198,8 +198,67 @@ static int test_cosmetic_class_families(void)
     return 0;
 }
 
+/* The embed hop's player page: its own third-party requests also refuse
+   the generic player-page list (analytics, consent, captcha SDKs...), on
+   top of BASIC; no other page does, OFF blocks nothing, and the per-site
+   allowlist still exempts the page. */
+static int test_player_page_list(void)
+{
+    Budget budget;
+    budget_init(&budget, 1024u * 1024u);
+    ContentBlocker *blocker = content_blocker_create(&budget);
+    CHECK(blocker != NULL
+          && content_blocker_configure(blocker, CONTENT_BLOCKER_BASIC, NULL));
+    const char *player = "https://player.example.test/embed/42";
+    const char *analytics = "https://www.google-analytics.com/analytics.js";
+    const char *consent = "https://cdn.cookielaw.org/consent.js";
+    CHECK(!content_blocker_would_block(blocker, analytics, player, "script",
+                                       "no-cors")
+          && !content_blocker_player_page(blocker, player));
+    content_blocker_set_player_page(blocker, player);
+    CHECK(content_blocker_player_page(blocker, player)
+          && content_blocker_player_page(
+                 blocker, "https://www.example.test/other")
+          && !content_blocker_player_page(blocker, "https://news.test/"));
+    CHECK(content_blocker_would_block(blocker, analytics, player, "script",
+                                      "no-cors")
+          && content_blocker_would_block(blocker, consent, player, "", "cors")
+          /* Ads stay blocked as BASIC blocks them. */
+          && content_blocker_would_block(
+                 blocker, "https://securepubads.doubleclick.net/x.js",
+                 player, "script", "no-cors")
+          /* First-party and the player's own CDN are untouched. */
+          && !content_blocker_would_block(
+                 blocker, "https://api.example.test/v1/play/42", player, "",
+                 "cors")
+          && !content_blocker_would_block(
+                 blocker, "https://cdn.video.test/live/42/index.m3u8", player,
+                 "", "cors")
+          /* Another page keeps BASIC only. */
+          && !content_blocker_would_block(blocker, analytics,
+                                          "https://news.test/story", "script",
+                                          "no-cors"));
+    const char *const allowed[] = {"example.test"};
+    CHECK(content_blocker_set_allowed_sites(blocker, allowed, 1u)
+          && !content_blocker_would_block(blocker, analytics, player,
+                                          "script", "no-cors")
+          && content_blocker_set_allowed_sites(blocker, NULL, 0u));
+    CHECK(content_blocker_configure(blocker, CONTENT_BLOCKER_OFF, NULL)
+          && !content_blocker_would_block(blocker, analytics, player,
+                                          "script", "no-cors")
+          && content_blocker_configure(blocker, CONTENT_BLOCKER_BASIC, NULL));
+    content_blocker_set_player_page(blocker, NULL);
+    CHECK(!content_blocker_would_block(blocker, analytics, player, "script",
+                                       "no-cors")
+          && !content_blocker_player_page(blocker, player));
+    content_blocker_destroy(blocker);
+    CHECK(budget.current == 0u);
+    return 0;
+}
+
 int main(void)
 {
+    CHECK(test_player_page_list() == 0);
     CHECK(test_prefix_scan_boundaries() == 0);
     CHECK(test_cosmetic_class_families() == 0);
     Budget budget;

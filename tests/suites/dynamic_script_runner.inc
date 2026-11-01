@@ -46,6 +46,8 @@ int main(void)
     if (!test_stalled_dynamic_script_does_not_block_later_ones(&budget)) {
         failures++;
     }
+    if (!test_open_fetch_does_not_starve_later_fetches(&budget)) failures++;
+    if (!test_media_hold_requeues_page_network(&budget)) failures++;
     if (!test_compile_over_heap_is_refused_with_realm_intact(&budget)) {
         failures++;
     }

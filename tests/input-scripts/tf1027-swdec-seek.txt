@@ -1,0 +1,47 @@
+# Seeks during playback, for either decoder: the swdec-seek scenario (426x240
+# High, software decoder) and fw-seek (640x360 Main, keyint 250, firmware
+# decoder) use the same neutral page layout: Down/Up land on the video and
+# Cross opens it. Five seeks, each a Right/Left preview (+-10 s; the double
+# Right previews +20 s) committed with Cross a few hundred milliseconds
+# later. Before each seek the script waits until the player is playing again
+# (until-live with the native @media-playing probe in
+# tf1027-swdec-seek.until.js: visible, playing, not resolving, not seeking,
+# not buffering). Cross means "commit" only while a preview is showing; a
+# preview pressed while the previous seek is still resolving is dropped when
+# that seek completes, and the next Cross then pauses the player. Fixed
+# delays between seeks made that happen on the device, so they are gone.
+# After the last seek, 12 s of playback, and Circle closes the player.
+#
+# Listen for garbled, repeated or missing sound after each seek; the picture
+# must move again after each one. Each timed press prints
+# tilefinch-input-request with wait-us (press due time to the loop turn that
+# sampled it), and each until step tilefinch-input-script: until-met. The
+# teardown prints tilefinch-swdec-audio-span (gaps, gap-max, gap-hist),
+# -audio (underruns) and -realtime (fps, ratio) for the software decoder.
+wait-page 90
+tap down
+tap up
+mark-page before-play
+tap cross
+until-live 1800
+tap-after-live 4000 right
+tap-after-live 250 cross
+until-live 1800
+tap-after-live 300 left
+tap-after-live 250 cross
+until-live 1800
+tap-after-live 300 right
+tap-after-live 150 right
+tap-after-live 250 cross
+until-live 1800
+tap-after-live 300 left
+tap-after-live 250 cross
+until-live 1800
+tap-after-live 300 left
+tap-after-live 250 cross
+until-live 1800
+mark-live after-seeks
+tap-after-live 12000 circle
+wait-live 120
+mark-live after-close
+end

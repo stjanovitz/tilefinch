@@ -1007,6 +1007,10 @@ static inline unsigned layout_node_box_clip_margin(
           >> LAYOUT_CLIP_MARGIN_SHIFT;
 }
 
+/* The fourth packed clip-box value represents an empty clip-path. It is
+   never an authored overflow-clip box and adds no per-node storage. */
+#define LAYOUT_NODE_CLIP_EMPTY 3u
+
 static inline StyleOverflowClipBox layout_node_box_clip_box(
     const LayoutNodeBox *box)
 {
@@ -1020,16 +1024,24 @@ static inline void layout_node_box_clip_rect(
     const LayoutNodeBox *box, int origin_x, int origin_y,
     int *left, int *top, int *right, int *bottom)
 {
+    if (box->clip_path_clip
+        && box->clip_flags_reserved == LAYOUT_NODE_CLIP_EMPTY) {
+        *left = *right = origin_x;
+        *top = *bottom = origin_y;
+        return;
+    }
     StyleOverflowClipBox clip_box = layout_node_box_clip_box(box);
     int margin = (int) layout_node_box_clip_margin(box);
-    int width = clip_box == STYLE_OVERFLOW_CLIP_BORDER_BOX
-        ? box->width
-        : (clip_box == STYLE_OVERFLOW_CLIP_CONTENT_BOX
-           ? box->width - 2 * box->clip_inset_left : box->client_width);
-    int height = clip_box == STYLE_OVERFLOW_CLIP_BORDER_BOX
-        ? box->height
-        : (clip_box == STYLE_OVERFLOW_CLIP_CONTENT_BOX
-           ? box->height - 2 * box->clip_inset_top : box->client_height);
+    /* A border-box clip-path region is the border box inset by the path's
+       own symmetric insets. */
+    bool inset_border_box = clip_box == STYLE_OVERFLOW_CLIP_CONTENT_BOX
+        || (clip_box == STYLE_OVERFLOW_CLIP_BORDER_BOX && box->clip_path_clip);
+    int width = inset_border_box ? box->width - 2 * box->clip_inset_left
+        : (clip_box == STYLE_OVERFLOW_CLIP_BORDER_BOX
+           ? box->width : box->client_width);
+    int height = inset_border_box ? box->height - 2 * box->clip_inset_top
+        : (clip_box == STYLE_OVERFLOW_CLIP_BORDER_BOX
+           ? box->height : box->client_height);
     if (width < 0) width = 0;
     if (height < 0) height = 0;
     *left = origin_x + box->clip_inset_left - margin;
@@ -1712,6 +1724,45 @@ const ControlRegion *layout_control_at(const LayoutDocument *layout,
                                        int x, int y);
 const LayoutNodeBox *layout_box_for_node(const LayoutDocument *layout,
                                          const lxb_dom_node_t *node);
+/* A layout's element boxes lent to image loading (images_set_layout_boxes):
+   a view of a live layout, or the box array taken from one about to be
+   released (a full rebuild releases its layout before it loads images). */
+struct ImageLayoutBoxes {
+    const LayoutDocument *layout;
+    LayoutNodeBox *taken;
+    size_t taken_count;
+    Budget *budget;
+    int scale_numerator;
+    int scale_denominator;
+    /* The page's next layout decodes, before it is painted, what this load
+       leaves for it (images_retarget_decode_awaiting): a WebP background
+       with no known box keeps its encoded bytes until then instead of
+       decoding at its source size. */
+    bool decode_after_layout;
+};
+void layout_lend_image_boxes(const LayoutDocument *layout,
+                             ImageLayoutBoxes *boxes);
+/* Only the CSS-to-device scale of `viewport`, no boxes: for loads whose
+   targets carry their own areas (ImagePriorityTarget background_sized). */
+void layout_lend_image_scale(const ViewportContext *viewport,
+                             ImageLayoutBoxes *boxes);
+/* Before `layout` is destroyed: keep the boxes a lend views (no copy). */
+void layout_keep_image_boxes(LayoutDocument *layout, ImageLayoutBoxes *boxes);
+void layout_release_image_boxes(ImageLayoutBoxes *boxes);
+/* The border box (CSS pixels) of `node` in the lent boxes. */
+bool layout_image_box_size(const ImageLayoutBoxes *boxes,
+                           const lxb_dom_node_t *node, int *width,
+                           int *height);
+/* The device-pixel raster that paints a single-layer CSS background of
+   source_width x source_height in an area of area_width x area_height CSS
+   pixels, under the style's background-size (cover, contain, explicit or
+   auto) and the layout's CSS-to-device scale: the size layout and paint
+   draw one tile at. False when it cannot be decided. */
+bool layout_background_raster_size(
+    uint8_t fit, uint8_t size_flags, int size_width, int size_height,
+    int area_width, int area_height, int scale_numerator,
+    int scale_denominator, int source_width, int source_height,
+    int *width, int *height);
 /* The face a DRAW_TEXT command measures and paints with. Measurement and
    paint both resolve through here so they always agree on the face. */
 const FontFace *draw_command_face(const LayoutDocument *layout,
@@ -1786,6 +1837,55 @@ bool layout_scroll_node_chain(LayoutDocument *layout, lxb_dom_node_t *node,
 bool layout_scroll_node_settle(LayoutDocument *layout, lxb_dom_node_t *node);
 bool layout_scroll_node_reveal(LayoutDocument *layout,
                                lxb_dom_node_t *node);
+/* Scrolls the containers enclosing node, innermost first, until the given
+   rect (node's laid-out geometry, before any scroll offset) is inside each
+   one's scrollport, as scrollIntoView({block:"nearest"}) does. Containers
+   node escapes as positioned content are left alone. */
+bool layout_scroll_rect_reveal(LayoutDocument *layout, lxb_dom_node_t *node,
+                               int x, int y, int width, int height);
+
+/* Where a node's laid-out geometry is presented once the scroll containers
+   around it have scrolled, matching paint: geometry retained for node (a
+   link or control region, its node box) moves by (dx, dy), and what of it
+   is visible lies inside the clip_* edges of every enclosing scroll
+   container (on the axes clipped_x/clipped_y say are bounded), in the same
+   document space as the moved geometry, before any position:fixed shift.
+   Only scroll containers are counted, not every overflow clip. A scroll
+   container node escapes as positioned content (its containing block lies
+   above the container) neither moves nor clips it. */
+typedef struct {
+    int dx;
+    int dy;
+    int clip_left;
+    int clip_top;
+    int clip_right;
+    int clip_bottom;
+    bool clipped_x;
+    bool clipped_y;
+} LayoutScrollPlacement;
+/* A per-pass snapshot of the scroll containers, so a caller placing many
+   regions in one pass skips the ancestor walk for regions outside them. */
+#define LAYOUT_SCROLL_PLACEMENT_INDEX_LIMIT 16u
+typedef struct {
+    const LayoutDocument *layout;
+    size_t node_box_count;
+    size_t count;
+    bool complete;
+    const lxb_dom_node_t *containers[LAYOUT_SCROLL_PLACEMENT_INDEX_LIMIT];
+} LayoutScrollPlacementIndex;
+void layout_scroll_placement_prepare(const LayoutDocument *layout,
+                                     LayoutScrollPlacementIndex *index);
+/* Whether any scroll container encloses node; false leaves an identity
+   placement. index may be NULL or one prepared for this layout. */
+bool layout_node_scroll_placement(const LayoutDocument *layout,
+                                  const LayoutScrollPlacementIndex *index,
+                                  const lxb_dom_node_t *node,
+                                  LayoutScrollPlacement *placement);
+/* The same placement, but clipped by every overflow clip around node that
+   it does not escape, scrolling or not (what paint clips it to). */
+bool layout_node_overflow_placement(const LayoutDocument *layout,
+                                    const lxb_dom_node_t *node,
+                                    LayoutScrollPlacement *placement);
 LayoutCursor layout_cursor_for_node(const Stylesheet *stylesheet,
                                     lxb_dom_node_t *node);
 LayoutScrollbarWidth layout_root_scrollbar_width(

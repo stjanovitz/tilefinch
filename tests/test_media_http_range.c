@@ -23,10 +23,15 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <string.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 #include "tilefinch/budget.h"
+#include "tilefinch/content_blocker.h"
+#include "tilefinch/content_security_policy.h"
+#include "tilefinch/media_candidates.h"
 #include "tilefinch/media_http.h"
+#include "tilefinch/session.h"
 #include "tilefinch/media_mp4.h"
 #include "tilefinch/platform.h"
 #include "../src/media_backend_psp_policy.h"
@@ -45,6 +50,47 @@ static int failures;
 static unsigned char expected_byte(uint64_t at)
 {
     return (unsigned char) ((at * 31u + 7u) & 0xFFu);
+}
+
+/*
+ * Which lane a range takes. A page range carries page authority that only
+ * the scheduler's browser-thread hop walk applies on every hop, so it must
+ * never be handed to the worker's fixed/stream media path, which refuses
+ * that shape (and so refused every page <video> window on the PSP). Provider
+ * ranges keep the worker path.
+ */
+static void test_range_route_policy(void)
+{
+    CHECK(media_http_range_route_select(false, true, true)
+          == MEDIA_HTTP_RANGE_ROUTE_PAGE_SCHEDULER_WORKER_HOPS);
+    CHECK(media_http_range_route_select(false, false, true)
+          == MEDIA_HTTP_RANGE_ROUTE_WORKER);
+    CHECK(media_http_range_route_select(false, true, false)
+          == MEDIA_HTTP_RANGE_ROUTE_SCHEDULER);
+    CHECK(media_http_range_route_select(false, false, false)
+          == MEDIA_HTTP_RANGE_ROUTE_SCHEDULER);
+    CHECK(media_http_range_route_select(true, true, true)
+          == MEDIA_HTTP_RANGE_ROUTE_TRANSPORT);
+    CHECK(media_http_range_route_select(true, false, true)
+          == MEDIA_HTTP_RANGE_ROUTE_TRANSPORT);
+    CHECK(strcmp(media_http_range_route_name(
+                     MEDIA_HTTP_RANGE_ROUTE_WORKER),
+                 "background-worker") == 0);
+    /* A refused request shape, an absent worker and a full queue are three
+       different failures and must not read alike. */
+    const char *shape = media_http_background_refusal_reason(
+        FETCH_BACKGROUND_ENQUEUE_UNSUPPORTED);
+    const char *absent = media_http_background_refusal_reason(
+        FETCH_BACKGROUND_ENQUEUE_UNAVAILABLE);
+    const char *full = media_http_background_refusal_reason(
+        FETCH_BACKGROUND_ENQUEUE_SATURATED);
+    CHECK(strstr(shape, "request shape") != NULL
+          && strstr(shape, "queue") == NULL);
+    CHECK(strstr(absent, "unavailable") != NULL
+          && strstr(absent, "queue") == NULL);
+    CHECK(strstr(full, "queue full") != NULL);
+    CHECK(strcmp(shape, absent) != 0 && strcmp(shape, full) != 0
+          && strcmp(absent, full) != 0);
 }
 
 static void test_video_lookahead_policy(void)
@@ -651,6 +697,464 @@ static void test_standard_range_header(int port, uint64_t length)
             CHECK(bytes[at] == expected_byte(at));
         media_http_range_destroy(range);
     }
+    CHECK(budget.current == 0);
+}
+
+/*
+ * Page video URLs commonly answer with a redirect to a CDN on another origin.
+ * The fixture's other origin is the same server reached as `localhost`
+ * instead of 127.0.0.1. A page-originated range follows it under the page's
+ * own per-hop policy; a refused target is never requested (the server's
+ * refused-sink counts any request that reaches one).
+ */
+typedef struct {
+    Budget budget;
+    BrowserSession session;
+    bool session_ready;
+    TilefinchContentSecurityPolicy *policy;
+    ContentBlocker *blocker;
+    char document[128];
+    char url[256];
+    TilefinchRequestContext context;
+} PageRangeFixture;
+
+static bool page_range_fixture_init(
+    PageRangeFixture *fixture, int port, const char *path)
+{
+    memset(fixture, 0, sizeof(*fixture));
+    budget_init(&fixture->budget, 8u * 1024u * 1024u);
+    fixture->session_ready = browser_session_init(
+        &fixture->session, &fixture->budget, 64u * 1024u);
+    snprintf(fixture->document, sizeof(fixture->document),
+             "http://127.0.0.1:%d/watch", port);
+    snprintf(fixture->url, sizeof(fixture->url),
+             "http://127.0.0.1:%d/%s", port, path);
+    fixture->context = (TilefinchRequestContext) {
+        .target_url = fixture->url,
+        .initiator_url = fixture->document,
+        .top_level_url = fixture->document,
+        .method = "GET",
+        .mode = TILEFINCH_REQUEST_MODE_NO_CORS,
+        .credentials = TILEFINCH_CREDENTIALS_INCLUDE,
+        .destination = TILEFINCH_DESTINATION_MEDIA
+    };
+    return fixture->session_ready;
+}
+
+static void page_range_fixture_destroy(PageRangeFixture *fixture)
+{
+    fixture->session.content_blocker = NULL;
+    content_blocker_destroy(fixture->blocker);
+    budget_free(&fixture->budget, fixture->policy);
+    if (fixture->session_ready) browser_session_destroy(&fixture->session);
+    CHECK(fixture->budget.current == 0);
+}
+
+static MediaHttpRange *page_range_open(
+    PageRangeFixture *fixture, uint64_t length)
+{
+    MediaHttpRangeOptions options = {
+        .cache_bytes = 64u * 1024u,
+        .timeout_ms = 15000,
+        .connect_timeout_ms = 3000,
+        .referer = fixture->document,
+        .standard_range_header = true,
+        .page_request_context = &fixture->context,
+        .content_security_policy = fixture->policy
+    };
+    char error[256] = {0};
+    MediaHttpRange *range = media_http_range_create(
+        &fixture->budget, &fixture->session, fixture->url, length,
+        &options, error, sizeof(error));
+    if (range == NULL) printf("page range open failed: %s\n", error);
+    return range;
+}
+
+/* Reads the first bytes; true when they arrived and match the fixture. */
+static bool page_range_reads(MediaHttpRange *range, char *error,
+                             size_t error_size)
+{
+    MediaRangeReader reader = media_http_range_reader(range);
+    unsigned char bytes[16] = {0};
+    bool read = reader.read(reader.opaque, 0, bytes, sizeof(bytes));
+    if (!read && reader.describe_failure != NULL)
+        (void) reader.describe_failure(reader.opaque, error, error_size);
+    for (size_t at = 0; read && at < sizeof(bytes); at++)
+        if (bytes[at] != expected_byte(at)) return false;
+    return read;
+}
+
+static void test_page_video_follows_cross_origin_redirect(
+    int port, uint64_t fragmented_length, unsigned fragments,
+    unsigned per_fragment)
+{
+    PageRangeFixture fixture;
+    CHECK(page_range_fixture_init(
+        &fixture, port, "xredirect/fragment206/media.mp4"));
+    MediaHttpRange *range = page_range_open(&fixture, fragmented_length);
+    CHECK(range != NULL);
+    if (range != NULL) {
+        /* Demux the whole fragmented movie through the redirect: every
+           window the demuxer asks for is a fresh request that is redirected
+           to the other origin and admitted there. */
+        MediaRangeReader reader = media_http_range_reader(range);
+        char error[256] = {0};
+        MediaMp4Demux *demux = media_mp4_open(
+            &fixture.budget, &reader, NULL, error, sizeof(error));
+        if (demux == NULL) printf("redirected open failed: %s\n", error);
+        CHECK(demux != NULL);
+        unsigned char *payload = malloc(256u * 1024u);
+        unsigned samples = 0;
+        MediaMp4Sample sample = {0};
+        bool have_sample = false;
+        for (unsigned step = 0; demux != NULL && payload != NULL
+             && step < 20000u; step++) {
+            if (!have_sample && !media_mp4_next_sample(demux, &sample)) {
+                if (!media_mp4_would_block(demux)) break;
+                (void) media_http_range_pump(range);
+                usleep(500);
+                continue;
+            }
+            have_sample = true;
+            if (!media_mp4_read_sample(
+                    demux, &sample, payload, 256u * 1024u)) {
+                if (!media_mp4_would_block(demux)) break;
+                (void) media_http_range_pump(range);
+                usleep(500);
+                continue;
+            }
+            have_sample = false;
+            samples++;
+        }
+        CHECK(samples == fragments * per_fragment);
+        MediaHttpRangeStats stats = {0};
+        CHECK(media_http_range_stats(range, &stats)
+              && stats.window_installs >= 2u && stats.failures == 0u);
+        free(payload);
+        media_mp4_close(demux);
+        media_http_range_destroy(range);
+    }
+    page_range_fixture_destroy(&fixture);
+}
+
+static void expect_page_redirect_refused(
+    PageRangeFixture *fixture, uint64_t length, const char *what)
+{
+    MediaHttpRange *range = page_range_open(fixture, length);
+    CHECK(range != NULL);
+    if (range == NULL) return;
+    char error[256] = {0};
+    bool read = page_range_reads(range, error, sizeof(error));
+    if (read) printf("redirect to %s was followed\n", what);
+    CHECK(!read);
+    /* A refused hop refuses this rendition for good, so the native player
+       moves on to the page's next video candidate. */
+    if (!media_candidate_refused(error))
+        printf("redirect to %s refused as \"%s\"\n", what, error);
+    CHECK(media_candidate_refused(error));
+    media_http_range_destroy(range);
+}
+
+/* One page-media probe of fixture->url (or, with probe false, the plain
+   reopen request an HLS open sends), routed as the PSP routes it. */
+static MediaHttpProbeRoute page_probe(
+    PageRangeFixture *fixture, bool probe, long *status,
+    uint64_t *complete_length)
+{
+    char range[64];
+    FetchRequest transport = {
+        .allow_http_errors = true,
+        .accept = "video/mp4,video/*;q=0.9,*/*;q=0.5",
+        .connect_timeout_ms = 3000,
+        .redirect_same_origin_only = false
+    };
+    if (probe) {
+        CHECK(media_http_build_probe_range_header(range, sizeof(range)));
+        transport.extra_headers = range;
+    }
+    FetchPreparedPageRequest prepared;
+    MediaHttpProbeRoute route = MEDIA_HTTP_PROBE_REFUSED;
+    *status = 0;
+    FetchResult *result = fetch_result_create(&fixture->budget);
+    if (result != NULL && fetch_prepare_page_request_context(
+            &fixture->context, fixture->document, NULL, &fixture->session,
+            NULL, NULL, &transport, &prepared, NULL)) {
+        bool fetched = fetch_request_cancelable(
+            &fixture->budget, fixture->url,
+            fetch_prepared_page_request(&prepared), 32u * 1024u, 15000,
+            NULL, NULL, result);
+        *status = result->status_code;
+        route = media_http_probe_route(
+            &fixture->session, &fixture->context, true, result, fetched,
+            complete_length);
+    }
+    fetch_result_free(result);
+    return route;
+}
+
+/*
+ * The page-media probe at an extensionless address. A server that honours
+ * Range answers a playlist served as text/plain or octet-stream with only
+ * what was asked for; one byte could not say it was a playlist (text/plain
+ * read as an error page, octet-stream as an MP4). A cookie the playlist
+ * response sets must reach the reopen that follows.
+ */
+static void test_page_media_probe_routes(int port, uint64_t length)
+{
+    static const char *const playlists[] = {"probe/text", "probe/octet"};
+    uint64_t complete = 0;
+    long status = 0;
+    for (size_t at = 0; at < 2u; at++) {
+        PageRangeFixture fixture;
+        CHECK(page_range_fixture_init(&fixture, port, playlists[at]));
+        MediaHttpProbeRoute route = page_probe(
+            &fixture, true, &status, &complete);
+        if (route != MEDIA_HTTP_PROBE_HLS)
+            printf("%s probe routed %d (HTTP %ld)\n", playlists[at],
+                   (int) route, status);
+        CHECK(status == 206 && route == MEDIA_HTTP_PROBE_HLS);
+        page_range_fixture_destroy(&fixture);
+    }
+
+    /* An MP4 still routes to the range source with its whole length. */
+    PageRangeFixture movie;
+    CHECK(page_range_fixture_init(&movie, port, "partial206/media.mp4"));
+    CHECK(page_probe(&movie, true, &status, &complete)
+              == MEDIA_HTTP_PROBE_RANGE
+          && status == 206 && complete == length);
+    page_range_fixture_destroy(&movie);
+
+    PageRangeFixture gated;
+    CHECK(page_range_fixture_init(&gated, port, "probe/gated"));
+    CHECK(page_probe(&gated, true, &status, &complete)
+              == MEDIA_HTTP_PROBE_HLS
+          && status == 206);
+    (void) page_probe(&gated, false, &status, &complete);
+    if (status != 200) printf("gated playlist reopen answered %ld\n", status);
+    CHECK(status == 200);
+    page_range_fixture_destroy(&gated);
+}
+
+static void test_page_video_redirect_refusals(int port, uint64_t length)
+{
+    /* CSP media-src admits only the document's own origin. */
+    PageRangeFixture fixture;
+    CHECK(page_range_fixture_init(
+        &fixture, port, "xredirect/refused-sink/media.mp4"));
+    static const char header[] =
+        "content-security-policy: media-src 'self'\n";
+    fixture.policy = budget_malloc(&fixture.budget, sizeof(*fixture.policy));
+    CHECK(fixture.policy != NULL);
+    if (fixture.policy != NULL) {
+        tilefinch_csp_init(fixture.policy);
+        CHECK(tilefinch_csp_parse_response_headers(
+            fixture.policy, fixture.document, header,
+            sizeof(header) - 1u, false));
+        expect_page_redirect_refused(&fixture, length, "a CSP-refused host");
+    }
+    page_range_fixture_destroy(&fixture);
+
+    /* The content blocker blocks media from the other origin. A blocker
+       rule needs a registrable host, so the target is a *.localhost name
+       (resolved to loopback); the control below proves that very redirect
+       is followed when no rule applies. */
+    CHECK(page_range_fixture_init(
+        &fixture, port,
+        "xredirect-host/media-cdn.localhost/refused-sink/media.mp4"));
+    char list_path[64];
+    snprintf(list_path, sizeof(list_path),
+             "tilefinch-media-redirect-list-%ld", (long) getpid());
+    int descriptor = open(
+        list_path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    static const char list[] = "||media-cdn.localhost^$media\n";
+    bool written = descriptor >= 0
+        && write(descriptor, list, sizeof(list) - 1u)
+               == (ssize_t) (sizeof(list) - 1u);
+    if (descriptor >= 0) close(descriptor);
+    fixture.blocker = content_blocker_create(&fixture.budget);
+    CHECK(written && fixture.blocker != NULL
+          && content_blocker_configure(
+                 fixture.blocker, CONTENT_BLOCKER_CUSTOM, list_path));
+    if (descriptor >= 0) unlink(list_path);
+    fixture.session.content_blocker = fixture.blocker;
+    expect_page_redirect_refused(&fixture, length, "a blocked host");
+    page_range_fixture_destroy(&fixture);
+    CHECK(page_range_fixture_init(
+        &fixture, port,
+        "xredirect-host/media-cdn.localhost/partial206/media.mp4"));
+    MediaHttpRange *control = page_range_open(&fixture, length);
+    char control_error[256] = {0};
+    bool control_read = control != NULL
+        && page_range_reads(control, control_error, sizeof(control_error));
+    if (!control_read)
+        printf("unblocked control redirect failed: %s\n", control_error);
+    CHECK(control_read);
+    media_http_range_destroy(control);
+    page_range_fixture_destroy(&fixture);
+
+    /* A disallowed scheme, and a URL carrying credentials. */
+    CHECK(page_range_fixture_init(&fixture, port, "xredirect-ftp/media.mp4"));
+    expect_page_redirect_refused(&fixture, length, "an ftp URL");
+    page_range_fixture_destroy(&fixture);
+    CHECK(page_range_fixture_init(
+        &fixture, port, "xredirect-credentials/media.mp4"));
+    expect_page_redirect_refused(&fixture, length, "a URL with credentials");
+    page_range_fixture_destroy(&fixture);
+
+    /* A loop between the two origins stops at the hop limit; the server
+       checks how far the chain went. */
+    CHECK(page_range_fixture_init(&fixture, port, "xredirect-loop/0"));
+    expect_page_redirect_refused(&fixture, length, "an endless loop");
+    page_range_fixture_destroy(&fixture);
+}
+
+static bool any_http_url(const char *url)
+{
+    return url != NULL && strncmp(url, "http://", 7u) == 0;
+}
+
+/* A native provider range (no page authority, a media-host validator) keeps
+   the fixed-origin rule even when its validator would admit the target. */
+static void test_provider_range_keeps_same_origin_redirects(
+    int port, uint64_t length)
+{
+    Budget budget;
+    budget_init(&budget, 8u * 1024u * 1024u);
+    char url[256];
+    snprintf(url, sizeof(url),
+             "http://127.0.0.1:%d/xredirect/partial206/media.mp4", port);
+    MediaHttpRangeOptions options = {
+        .cache_bytes = 64u * 1024u,
+        .timeout_ms = 15000,
+        .connect_timeout_ms = 3000,
+        .standard_range_header = true,
+        .url_validator = any_http_url
+    };
+    char error[256] = {0};
+    MediaHttpRange *range = media_http_range_create(
+        &budget, NULL, url, length, &options, error, sizeof(error));
+    CHECK(range != NULL);
+    if (range != NULL) {
+        CHECK(!page_range_reads(range, error, sizeof(error)));
+        media_http_range_destroy(range);
+    }
+    CHECK(budget.current == 0);
+}
+
+/* Reads `length` bytes at `offset` blocking, true when they match. */
+static bool range_reads_at(MediaHttpRange *range, uint64_t offset,
+                           size_t length)
+{
+    MediaRangeReader reader = media_http_range_reader(range);
+    unsigned char bytes[64] = {0};
+    if (length > sizeof(bytes)) length = sizeof(bytes);
+    if (!reader.read(reader.opaque, offset, bytes, length)) {
+        char detail[192] = {0};
+        if (reader.describe_failure != NULL)
+            (void) reader.describe_failure(
+                reader.opaque, detail, sizeof(detail));
+        printf("read at %llu failed: %s\n", (unsigned long long) offset,
+               detail);
+        return false;
+    }
+    for (size_t at = 0; at < length; at++)
+        if (bytes[at] != expected_byte(offset + at)) return false;
+    return true;
+}
+
+/*
+ * The PSP page-video defect, reproduced on the host. With the transport
+ * worker available, every page range window was put on the worker, whose
+ * media admission refuses a page request (page context, cookies, CSP, a
+ * Range header, no fixed-origin validator), so the open failed with "was not
+ * admitted: background transport queue full or unavailable". The host stubs
+ * the worker; the seam makes the route decision see it as available.
+ *
+ * The page range must instead take its own scheduler and play several
+ * sequential windows, including the streamed readahead successor, which the
+ * provider-only stream-shape gate also refused for any page request.
+ */
+static void test_page_range_route_with_worker_available(
+    int port, uint64_t length)
+{
+    PageRangeFixture fixture;
+    CHECK(page_range_fixture_init(
+        &fixture, port, "partial206/media.mp4"));
+    media_http_test_force_background_available(1);
+    MediaHttpRangeOptions options = {
+        .cache_bytes = 64u * 1024u,
+        .lookahead_windows = 2u,
+        .initial_lookahead_windows = 1u,
+        .stream_publication_bytes = 16u * 1024u,
+        .timeout_ms = 15000,
+        .connect_timeout_ms = 3000,
+        .referer = fixture.document,
+        .standard_range_header = true,
+        .page_request_context = &fixture.context
+    };
+    char error[256] = {0};
+    MediaHttpRange *range = media_http_range_create(
+        &fixture.budget, &fixture.session, fixture.url, length,
+        &options, error, sizeof(error));
+    media_http_test_force_background_available(-1);
+    CHECK(range != NULL);
+    if (range != NULL) {
+        CHECK(media_http_range_route(range)
+              == MEDIA_HTTP_RANGE_ROUTE_PAGE_SCHEDULER_WORKER_HOPS);
+        CHECK(range_reads_at(range, 0, 16));
+        CHECK(range_reads_at(range, 8u * 1024u, 16));
+        media_http_range_set_aggressive_readahead(range, true);
+        MediaHttpRangeStats stats = {0};
+        for (unsigned frame = 0; frame < 4000u; frame++) {
+            (void) media_http_range_pump(range);
+            CHECK(media_http_range_stats(range, &stats));
+            if (stats.lookahead_installs >= 1 || stats.failures != 0)
+                break;
+            usleep(1000);
+        }
+        CHECK(stats.lookahead_installs >= 1 && stats.failures == 0);
+        for (uint64_t at = 64u * 1024u; at < 256u * 1024u
+             && at + 64u <= length; at += 64u * 1024u)
+            CHECK(range_reads_at(range, at, 64));
+        CHECK(media_http_range_stats(range, &stats)
+              && stats.failures == 0 && stats.requests >= 4u
+              && stats.lookahead_promotions >= 1u
+              && stats.last_http_status == 206);
+        media_http_range_destroy(range);
+    }
+    page_range_fixture_destroy(&fixture);
+}
+
+/* A provider range (no page authority, fixed-origin validator) keeps the
+   worker's own media path, byte-identical to before. The host worker is a
+   stub (it never initializes), so its window fails, and the error names the
+   unavailable transport rather than a full queue. */
+static void test_provider_range_keeps_worker_route(int port, uint64_t length)
+{
+    Budget budget;
+    budget_init(&budget, 8u * 1024u * 1024u);
+    media_http_test_force_background_available(1);
+    MediaHttpRange *range = open_range_with_lookahead(
+        &budget, "query200", port, length, 64u * 1024u);
+    media_http_test_force_background_available(-1);
+    CHECK(range != NULL);
+    if (range != NULL) {
+        CHECK(media_http_range_route(range) == MEDIA_HTTP_RANGE_ROUTE_WORKER);
+        MediaRangeReader reader = media_http_range_reader(range);
+        unsigned char bytes[8] = {0};
+        CHECK(!reader.read(reader.opaque, 0, bytes, sizeof(bytes)));
+        char detail[256] = {0};
+        CHECK(reader.describe_failure(reader.opaque, detail, sizeof(detail)));
+        CHECK(strstr(detail, "unavailable") != NULL
+              && strstr(detail, "queue full") == NULL);
+        media_http_range_destroy(range);
+    }
+    /* Without the seam the same range is the host's plain scheduler. */
+    range = open_range_with_lookahead(
+        &budget, "query200", port, length, 64u * 1024u);
+    CHECK(range != NULL
+          && media_http_range_route(range) == MEDIA_HTTP_RANGE_ROUTE_SCHEDULER);
+    media_http_range_destroy(range);
     CHECK(budget.current == 0);
 }
 
@@ -2519,6 +3023,7 @@ int main(int argc, char **argv)
           && !media_http_parse_content_range(
                  "bytes 17-38/4096", 17, 39, 23,
                  &complete_length));
+    test_range_route_policy();
     test_buffering_policy_hysteresis();
     test_buffering_burst_and_slow_recovery_scenario();
     test_range_window_liveness_policy();
@@ -2568,6 +3073,19 @@ int main(int argc, char **argv)
     test_standard_range_header(port, length);
     puts("test: an audio-only source advertises an audio representation");
     test_audio_range_representation(port, length);
+    puts("test: page video follows a redirect to another origin and plays");
+    test_page_video_follows_cross_origin_redirect(
+        port, fragmented_length, fragments, per_fragment);
+    puts("test: the page-media probe routes extensionless playlists");
+    test_page_media_probe_routes(port, length);
+    puts("test: page video redirects are refused by policy and hop limit");
+    test_page_video_redirect_refusals(port, length);
+    puts("test: a page range takes its scheduler while the worker exists");
+    test_page_range_route_with_worker_available(port, length);
+    puts("test: a provider range keeps the worker route");
+    test_provider_range_keeps_worker_route(port, length);
+    puts("test: a provider range keeps its same-origin redirect rule");
+    test_provider_range_keeps_same_origin_redirects(port, length);
     puts("test: a read across a window boundary fetches both");
     test_window_crossing(port, length);
     puts("test: a poll never waits and completes on a later pump");

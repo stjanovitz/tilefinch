@@ -563,7 +563,8 @@ bool psp_run_initial_page_load(
            "metadata=%lluus runtime-startup=%lluus stylesheet=%lluus "
            "mutation-checkpoint=%lluus script=%lluus script-compile=%lluus "
            "script-execute=%lluus eof-metadata=%lluus eof-preload=%lluus "
-           "finish=%lluus\n",
+           "finish=%lluus style-prepare=%zu/%zu pumps=%zu max-step=%lluus "
+           "total=%lluus\n",
            (unsigned long long) performance->parser_feed_us,
            (unsigned long long) performance->parser_callback_us,
            (unsigned long long) performance->parser_metadata_us,
@@ -575,7 +576,13 @@ bool psp_run_initial_page_load(
            (unsigned long long) performance->parser_script_execute_us,
            (unsigned long long) performance->parser_eof_metadata_us,
            (unsigned long long) performance->parser_eof_preload_us,
-           (unsigned long long) performance->parser_finish_us);
+           (unsigned long long) performance->parser_finish_us,
+           performance->blocking_stylesheet_prepared,
+           performance->blocking_stylesheet_prepare_abandoned,
+           performance->blocking_stylesheet_prepare_pumps,
+           (unsigned long long)
+               performance->blocking_stylesheet_prepare_max_step_us,
+           (unsigned long long) performance->blocking_stylesheet_prepare_us);
 #endif
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     psp_load_experience_report("initial", engine, &metrics);

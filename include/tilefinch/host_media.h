@@ -35,6 +35,8 @@ typedef struct {
     bool audio_output_active;
     bool playing;
     bool ended;
+    /* A live stream: a rolling window with no duration to seek in. */
+    bool live;
     int resolved_itag;
     size_t resolver_bytes;
     char source_kind[24];

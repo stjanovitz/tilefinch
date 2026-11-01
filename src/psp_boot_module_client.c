@@ -1,5 +1,6 @@
 /* Linked only into the relocatable browser. crt0 must park before newlib
-   reserves the heap, not at the beginning of the application's main(). */
+   reserves the heap, not at the beginning of the application's main():
+   psp_heap_reserve.c's __libcglue_init wrapper calls in here first. */
 #include <pspkernel.h>
 #include <pspkerror.h>
 #include <pspmodulemgr.h>
@@ -11,7 +12,6 @@
 #include "tilefinch/psp_log.h"
 #endif
 
-extern void __real___libcglue_init(int, char **);
 extern int __real_main(int, char **);
 #ifdef TILEFINCH_PSP_BOOT_UNWRAPPED_SEMAPHORE
 extern int __real_sceKernelWaitSema(SceUID, int, SceUInt *);
@@ -88,8 +88,9 @@ static bool parent_valid(const PspBootModuleArgument *arg)
     return false;
 }
 
-void __wrap___libcglue_init(int argc, char **argv)
+void psp_boot_module_before_libc(int *argc_pointer, char **argv)
 {
+    int argc = *argc_pointer;
     if (argc > 1 && argv != NULL && argv[argc - 1] != NULL
         && strncmp(argv[argc - 1], PSP_BOOT_MODULE_PREFIX,
                    sizeof(PSP_BOOT_MODULE_PREFIX) - 1u) == 0) {
@@ -111,7 +112,7 @@ void __wrap___libcglue_init(int argc, char **argv)
         module_handoff = true;
         argv[--argc] = NULL;
     }
-    __real___libcglue_init(argc, argv);
+    *argc_pointer = argc;
 }
 
 int __wrap_main(int argc, char **argv)

@@ -13,6 +13,28 @@ import generate_ui_translations as generator
 
 
 class ResourceTests(unittest.TestCase):
+    def test_published_v12_resources_remain_immutable(self):
+        resources = ROOT / "_resource_identity_probe"
+        published = {
+            "translations/ui/v12/es.tful": "ccebd012a6ee6461359f268879b5074953d47372b81620760520aef962b6b2c3",
+            "translations/ui/v12/fr.tful": "201207ac1648e6b33835d953d56240ce36c97bfa01404fac934133a136d50348",
+            "translations/ui/v12/de.tful": "9a2fd56ed2977e18aeb4e36dc2516049a3b426f104bddeb02bbf2632157b3b85",
+            "translations/ui/v12/ja.tful": "e953599ca0656a440827121b93e66c3287fe79719d446a96eb6241c8de6e356d",
+            "translations/ui/v12/ru.tful": "90000a901c8a6e8b099a8035ef823f76fe35b0800842d020980265cb199c8f94",
+            "translations/ui/v12/uk.tful": "ae530b69f9273ea8a3f8df7f49aa6fc484931b2b1b714e72158db87b8bf6d0e2",
+            "translations/ui/v12/zh-hans.tful": "aefe41554e8073bf9e0cc8e4b167b0cb11f372ae0535cb660dafec1beffb94b0",
+            "translations/ui/v12/ko.tful": "33eb4fd570c4d13430f0b1d09ef3f8bafb4e62471d07809357a7a4cae37f5f4d",
+            "translations/ui/v12/hi.tful": "f268cc60c6108e5e45086a89fe8ce232ac2e1f430f6d46c91fa1936d7aec19b7",
+            "translations/ui/v12/ar.tful": "e8631ddcab36163a7ca3e0402f0fa4505e9bac312638ff3a966e80280d9635ca",
+            "translations/ui/v12/pt.tful": "73e1ebd6ee1d83780324df7c425becc3c16aae20592550ec514c13d5ffd8e1d1",
+            "translations/ui/v12/bn.tful": "844408ff42aae65bf8ed29cf31ecc8a1bd69c3072976dbdc5a0f143836e5875e",
+            "translations/ui/v12/as.tful": "5f8cc75142e272b0690b2df97102b65f854b78ad5bd8874938016e85fbd73595",
+        }
+        generated = generator.outputs(resources)
+        for key, digest in published.items():
+            self.assertEqual(hashlib.sha256(generated[resources / key]).hexdigest(),
+                             digest, key)
+
     def test_new_locale_preserves_existing_resource_identity(self):
         manifest = generator.outputs()[ROOT / "src/generated/ui_languages.inc"].decode()
         resources = ROOT / "_resource_identity_probe"
@@ -26,13 +48,13 @@ class ResourceTests(unittest.TestCase):
         old_languages = generator.CATALOGS[6][1]
         rows = generator.read_rows(7, old_languages)
         for column, (code, label, glyphs) in enumerate(old_languages, 1):
-            self.assertIn(f'"translations/ui/v12/{code}.tful"', manifest)
-        self.assertIn('"translations/ui/v12/pt.tful"', manifest)
+            self.assertIn(f'"translations/ui/v13/{code}.tful"', manifest)
+        self.assertIn('"translations/ui/v13/pt.tful"', manifest)
         portuguese = generator.read_rows(8, generator.CATALOGS[7][1])
         self.assertGreaterEqual({row[0] for row in portuguese}, {row[0] for row in rows})
         self.assertEqual(dict(portuguese)["Portuguese"], "Português")
-        self.assertIn('"translations/ui/v12/bn.tful"', manifest)
-        self.assertIn('"translations/ui/v12/as.tful"', manifest)
+        self.assertIn('"translations/ui/v13/bn.tful"', manifest)
+        self.assertIn('"translations/ui/v13/as.tful"', manifest)
 
     def test_download_labels_have_translations(self):
         rows = generator.read_rows(generator.ACTIVE_VERSION, generator.CATALOGS[-1][1])
@@ -78,7 +100,9 @@ class ResourceTests(unittest.TestCase):
     def test_provider_templates_have_translations(self):
         languages = generator.CATALOGS[-1][1]
         keys = {row[0] for row in generator.read_rows(generator.ACTIVE_VERSION, languages)}
-        source = (ROOT / "src/youtube_lite.c").read_text() + (ROOT / "src/youtube_library.inc").read_text()
+        source = "".join((ROOT / name).read_text() for name in (
+            "src/youtube_lite.c", "src/youtube_library.inc", "src/youtube_related.inc",
+            "src/youtube_channel.inc"))
         # Only inspect C literals, not the explanatory template comment.
         tokens = re.findall(r'''"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|/\*[\s\S]*?\*/|//[^\n]*''', source)
         labels = {label for token in tokens if token.startswith('"')

@@ -2,7 +2,7 @@
 # PPSSPP at 111 MHz; traces live under perf/traces (not committed) and are
 # pinned by trace_sha256. '-' means none. See docs/engineering/PERF_JOURNEYS.md.
 name	script	url	trace	trace_sha256	data_dir	boot	cpu_mhz
-home-menu	menu-tour	-	-	-	-	-	-
+home-menu	menu-tour	-	-	-	tests/fixtures/ppsspp-menu-tour-data	-	-
 site-restore	site-restore	-	-	-	tests/fixtures/ppsspp-site-data	-	-
 article-scroll-during-load	scroll-during-load-live	https://en.wikipedia.org/w/index.php?search=PlayStation+Portable&title=Special%3ASearch&go=Go	wikipedia-article	cb64d13e10e7dab00e861ea88689261c6128c2048ac81ad719af123d63455783	-	-	-
 article-page-down-fast	scroll-fast-live	https://en.wikipedia.org/w/index.php?search=PlayStation+Portable&title=Special%3ASearch&go=Go	wikipedia-article	cb64d13e10e7dab00e861ea88689261c6128c2048ac81ad719af123d63455783	-	-	-

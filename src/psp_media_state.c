@@ -623,7 +623,16 @@ static void psp_media_transition_dormant(
             PSP_MEDIA_FAILURE_NONE);
         break;
     case PSP_MEDIA_EVENT_CLOSE:
-        decision->deliberate_noop = true;
+        if (event->retain_pipeline) {
+            decision->deliberate_noop = true;
+        } else {
+            /* Route departure destroys the hidden backend too. Retaining
+               DORMANT here would strand the next OPEN in quiescing after
+               its physical resources had already been released. */
+            psp_media_enter_quiescing(
+                decision, PSP_MEDIA_QUIESCE_TARGET_IDLE,
+                PSP_MEDIA_FAILURE_NONE);
+        }
         break;
     case PSP_MEDIA_EVENT_SUSPEND:
         psp_media_enter_quiescing(

@@ -32,12 +32,12 @@
   const decodeUtf8ValidNative = __tilefinchRealmGlobal.__tilefinchDecodeUtf8Valid;
   const encodeUtf8Native = __tilefinchRealmGlobal.__tilefinchEncodeUtf8;
   const encodingNameNative = __tilefinchRealmGlobal.__tilefinchEncodingName;
-  const decodeSingleByteNative = __tilefinchRealmGlobal.__tilefinchDecodeSingleByte;
+  const decodeBytesNative = __tilefinchRealmGlobal.__tilefinchDecodeBytes;
   const cryptoRandomFillNative = __tilefinchRealmGlobal.__tilefinchCryptoRandomFill;
   delete __tilefinchRealmGlobal.__tilefinchDecodeUtf8Valid;
   delete __tilefinchRealmGlobal.__tilefinchEncodeUtf8;
   delete __tilefinchRealmGlobal.__tilefinchEncodingName;
-  delete __tilefinchRealmGlobal.__tilefinchDecodeSingleByte;
+  delete __tilefinchRealmGlobal.__tilefinchDecodeBytes;
   const trustedString = String,
     trustedStringToWellFormed = Function.call.bind(
       String.prototype.toWellFormed,
@@ -633,12 +633,15 @@
       functionToString = Function.prototype.toString,
       /* Marked functions print exactly as QuickJS prints its own natives
          (and as Safari, whose user agent we present, prints natives), so
-         every platform function has one source shape. */
-      nativeAwareToString = function toString() {
-        return nativeMethodSet.has(this)
-          ? "function " + (this.name || "") + "() {\n    [native code]\n}"
-          : functionToString.call(this);
-      };
+         every platform function has one source shape. A method, like the
+         native it replaces: no own `prototype` and not a constructor. */
+      nativeAwareToString = {
+        toString() {
+          return nativeMethodSet.has(this)
+            ? "function " + (this.name || "") + "() {\n    [native code]\n}"
+            : functionToString.call(this);
+        },
+      }.toString;
     nativeMethodSet.add(nativeAwareToString);
     __tilefinchRealmGlobal.__tilefinchMarkNativeFunction = (value) => {
       if (typeof value === "function") nativeMethodSet.add(value);
@@ -1018,7 +1021,9 @@
         [Symbol.iterator]() { return this; },
       };
     };
-  class TilefinchURLSearchParams {
+  /* Named as the interface: the class name is what `name` and toString()
+     report. */
+  const TilefinchURLSearchParams = class URLSearchParams {
     constructor(query = "", changed = null) {
       this.items = [];
       this.changed = changed;
@@ -1163,7 +1168,7 @@
         .map((pair) => enc(pair[0]) + "=" + enc(pair[1]))
         .join("&");
     }
-  }
+  };
   const tilefinchURLInput = (value) =>
     tilefinchUSVString(value).replace(
       /[^\x21-\x7e]/gu, (char) => encodeURIComponent(char));
@@ -1187,21 +1192,24 @@
     return "?" + value.replace(
       /[^\x21-\x7e]|[ #]/gu, (char) => encodeURIComponent(char));
   };
-  class TilefinchURL {
+  const TilefinchURL = class URL {
     constructor(input, base) {
       const text = tilefinchURLInput(input);
       if (/^blob:/i.test(text)) {
         this._setBlob(text);
         return;
       }
-      const resolved = __tilefinchResolveURL(
-        text,
-        base === undefined
-          ? tilefinchURLInput(
-              __tilefinchRealmGlobal.__tilefinchLocationHref || "https://example.invalid/",
-            )
-          : tilefinchURLInput(base),
-      );
+      /* A base passed by script must itself be a URL, but only relative
+         input is resolved against it: an opaque base (blob:, data:,
+         about:blank) rejects relative input and leaves absolute input
+         alone. The document's own URL keeps its fallback (a fixture file
+         path or an about:blank document still resolves relative input). */
+      const own = base === undefined,
+        baseText = tilefinchURLInput(own
+          ? __tilefinchRealmGlobal.__tilefinchLocationHref || "https://example.invalid/"
+          : base),
+        resolved = (own || /^[A-Za-z][A-Za-z0-9+.-]*:/.test(baseText)) &&
+          __tilefinchResolveURL(text, baseText, own);
       if (!resolved) throw new TypeError("Invalid URL");
       this._set(resolved);
     }
@@ -1368,7 +1376,7 @@
     toJSON() {
       return this.href;
     }
-  }
+  };
   /* URL.parse and URL.canParse follow the URL Standard: without a base, a
      relative input fails. (The constructor still resolves such input
      against the document URL, as it always has here.) */
@@ -1495,7 +1503,9 @@
         if (name === null)
           throw new RangeError("The encoding label is not supported");
         this.encoding = trustedStringLower(name);
-        this._encodingKind = this.encoding === "utf-8" ? 0 : 1;
+        this._encodingKind = this.encoding === "utf-8" ? 0
+          : this.encoding === "utf-16le" ? 2
+          : this.encoding === "utf-16be" ? 3 : 1;
         this.fatal = !!options.fatal;
         this.ignoreBOM = !!options.ignoreBOM;
         this._pending = new Uint8Array();
@@ -1516,7 +1526,7 @@
         if (this._encodingKind === 1) {
           if (bytes.length > textDecoderMaximumBytes)
             throw new RangeError("decoded input exceeds bounded size");
-          const decoded = decodeSingleByteNative(
+          const decoded = decodeBytesNative(
             this.encoding, bytes, this.fatal);
           if (decoded === null)
             throw new TypeError("invalid " + this.encoding + " data");
@@ -1534,6 +1544,31 @@
         this._pending = new Uint8Array();
         if (bytes.length > textDecoderMaximumBytes)
           throw new RangeError("decoded input exceeds bounded size");
+        if (this._encodingKind > 1) {
+          /* UTF-16: strip a leading BOM here, carry an odd byte or a final
+             high surrogate while streaming, and decode the rest natively. */
+          const big = this._encodingKind === 3;
+          let start = 0,
+            end = bytes.length;
+          if (!this.ignoreBOM && !this._bomSeen && end >= 2 &&
+              bytes[0] === (big ? 0xfe : 0xff) &&
+              bytes[1] === (big ? 0xff : 0xfe)) start = 2;
+          if (stream) {
+            end -= (end - start) & 1;
+            const high = end - start >= 2 ? bytes[end - (big ? 2 : 1)] : 0;
+            if (high >= 0xd8 && high <= 0xdb) end -= 2;
+            if (end !== bytes.length) this._pending = bytes.slice(end);
+            if (end > start || start) this._bomSeen = true;
+          } else this._bomSeen = false;
+          const decoded = decodeBytesNative(
+            this.encoding, bytes.subarray(start, end), this.fatal);
+          if (decoded === null) {
+            this._pending = new Uint8Array();
+            this._bomSeen = false;
+            throw new TypeError("invalid " + this.encoding + " data");
+          }
+          return decoded;
+        }
         if (!stream && !hadPending && decodeUtf8ValidNative) {
           const decoded = decodeUtf8ValidNative(
             bytes, !this.ignoreBOM && !this._bomSeen);
@@ -1968,6 +2003,33 @@
       return cachedFormControls(this);
     },
   });
+  /* The form owner's scope for an inline event handler of one of its
+     controls (dom.js): HTMLFormElement's named properties (listed controls by
+     id or name, LegacyOverrideBuiltIns) ahead of its members, so
+     `onclick="user.value"` reads a sibling control. The name table follows
+     every DOM mutation, including name and id writes; between mutations each
+     identifier the handler resolves through this scope costs one map probe. */
+  __tilefinchRealmGlobal.__tilefinchFormHandlerScope = (form) => {
+    let version = -1,
+      names = null;
+    const named = (key) => {
+      if (typeof key !== "string") return null;
+      const current = nativeDomVersion?.(false);
+      if (names === null || current !== version || !(current >= 0)) {
+        names = new Map();
+        for (const control of cachedFormControls(form))
+          for (const name of [control.id, control.name])
+            if (name && !names.has(name)) names.set(name, control);
+        version = current;
+      }
+      return names.get(key) ?? null;
+    };
+    return new Proxy(form, {
+      has: (target, key) => named(key) !== null || Reflect.has(target, key),
+      get: (target, key) => named(key) ?? Reflect.get(target, key, target),
+      set: (target, key, value) => Reflect.set(target, key, value, target),
+    });
+  };
   Object.defineProperties(HTMLFieldSetElement.prototype, {
     elements: {
       configurable: true,
@@ -2787,10 +2849,10 @@
     HTMLSelectElement.prototype,
   ]) {
     Object.defineProperties(prototype, validationDescriptors);
-    prototype.setCustomValidity = function (message) {
+    prototype.setCustomValidity = function setCustomValidity(message) {
       this.__customValidity = String(message);
     };
-    prototype.checkValidity = function () {
+    prototype.checkValidity = function checkValidity() {
       if (!this.willValidate || this.validity.valid) return true;
       this.dispatchEvent(
         __tilefinchTrustedEvent(new Event("invalid", { cancelable: true })),
@@ -5113,7 +5175,10 @@
       configurable: true,
       enumerable: true,
       get() {
-        return __tilefinchDocumentBaseURI();
+        /* A document without a network URL (a fixture file path) has no
+           base of its own; its location's fallback URL serves as one. */
+        const base = __tilefinchDocumentBaseURI();
+        return /^[A-Za-z][A-Za-z0-9+.-]*:/.test(base) ? base : location.href;
       },
     },
     domain: {
@@ -7119,12 +7184,20 @@
   });
   /* Tilefinch does not create auxiliary browsing contexts. Explicitly
      returning null keeps links/forms from acquiring an opener relationship
-     through a partial window.open implementation. */
+     through a partial window.open implementation. The host notes the
+     requested URL for its popunder guard. */
+  const noteNewWindow = __tilefinchRealmGlobal.__tilefinchNoteNewWindow;
   Object.defineProperty(__tilefinchRealmGlobal, "open", {
     configurable: false,
     enumerable: false,
     writable: false,
-    value: { open: (url = undefined, target = undefined) => null }.open,
+    value: {
+      open: (url = undefined, target = undefined) => {
+        const href = url === undefined ? "" : String(url);
+        if (noteNewWindow) noteNewWindow(href);
+        return null;
+      },
+    }.open,
   });
   Object.defineProperty(__tilefinchRealmGlobal, "location", Object.getOwnPropertyDescriptor({
     get location() {
@@ -7635,20 +7708,19 @@
   __tilefinchRealmGlobal.__tilefinchCommitSameDocument = (url, oldURL) => {
     setSynchronizedLocation(url);
     historyLength++;
-    const event = new Event("hashchange");
-    event.oldURL = String(oldURL);
-    event.newURL = location.href;
-    __tilefinchRealmGlobal.dispatchEvent(event);
+    __tilefinchRealmGlobal.dispatchEvent(new HashChangeEvent("hashchange", {
+      oldURL: String(oldURL),
+      newURL: location.href,
+    }));
   };
   __tilefinchRealmGlobal.__tilefinchRestoreSameDocument = (url, oldURL) => {
     setSynchronizedLocation(url);
-    const pop = new Event("popstate");
-    pop.state = historyState;
-    __tilefinchRealmGlobal.dispatchEvent(pop);
-    const event = new Event("hashchange");
-    event.oldURL = String(oldURL);
-    event.newURL = location.href;
-    __tilefinchRealmGlobal.dispatchEvent(event);
+    __tilefinchRealmGlobal.dispatchEvent(
+      new PopStateEvent("popstate", { state: historyState }));
+    __tilefinchRealmGlobal.dispatchEvent(new HashChangeEvent("hashchange", {
+      oldURL: String(oldURL),
+      newURL: location.href,
+    }));
   };
   const windowMessageHandlers = new Map(),
     setWindowMessageHandler = (type, value) => {

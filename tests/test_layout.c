@@ -890,6 +890,10 @@ int main(int argc, char **argv)
         return test_clamp_requires_vertical_box();
     if (argc == 2 && strcmp(argv[1], "--negative-float-margin-only") == 0)
         return test_negative_margin_reaches_enclosing_floats();
+    if (argc == 2 && strcmp(argv[1], "--empty-clip-only") == 0)
+        return test_empty_clip_path_controls();
+    if (argc == 2 && strcmp(argv[1], "--clip-path-border-box-only") == 0)
+        return test_clip_path_border_box_reference();
     if (argc == 2 && strcmp(argv[1], "--system-font-family-only") == 0)
         return test_system_font_family_identity();
     if (argc == 2 && strcmp(argv[1], "--percentage-image-auto-only") == 0)

@@ -597,6 +597,13 @@ typedef struct {
        that still before sound begins even when an edit list makes its PTS
        slightly later than zero. */
     bool (*ready_video_start_us)(const void *opaque, uint64_t *start_us);
+    /* Optional bounded sleep until an empty video queue receives a picture.
+       True means the wait completed (including timeout); false keeps the
+       frontend's ordinary pacing fallback. Never takes or owns a picture. */
+    bool (*wait_video_ready)(void *opaque, uint32_t timeout_us);
+    /* Optional bounded sleep until a retained picture is due on the observed
+       audio clock. False keeps ordinary pacing; never claims a surface. */
+    bool (*wait_video_due)(void *opaque, uint32_t timeout_us);
     /* Optional lock-free count at the final display funnel. Startup audio is
        released only after the first primed picture has reached the LCD, not
        merely after the browser has borrowed or staged it. */
@@ -707,6 +714,11 @@ typedef struct {
      * later keyframe cannot turn heap fragmentation into a mid-play failure.
      */
     bool preallocate_maximum_packet_bytes;
+    /* Optional maximum_packet_bytes-sized allocation from the same Budget,
+       reserved before a device backend fragments the heap. Ownership moves
+       to playback only on successful creation; on failure it stays with the
+       caller. A supplied reservation always preallocates the maximum. */
+    unsigned char *reserved_packet;
 } MediaPlaybackOptions;
 
 typedef struct MediaPlayback MediaPlayback;
@@ -764,8 +776,9 @@ typedef struct {
      * Residency is not proof of backend acceptance; actual alternate attempts
      * and accepted packets are counted separately below.
      *
-     * Adaptive streams only: a progressive MP4 carries both tracks in one
-     * source, where there is no other source to have offered.
+     * A source carrying both tracks (progressive MP4, muxed HLS) offers its
+     * own next buffered AAC unit behind a held video head when it implements
+     * the peek/take pair; without the pair there is nothing to have offered.
      */
     size_t head_blocks;          /* blocks with a selected sample in hand */
     size_t head_block_video;     /* ...where the blocked head was video */
@@ -848,6 +861,8 @@ unsigned media_playback_ready_video_frames(const MediaPlayback *playback);
 unsigned media_playback_startup_ready_frames(const MediaPlayback *playback);
 bool media_playback_ready_video_start_us(
     const MediaPlayback *playback, uint64_t *start_us);
+bool media_playback_wait_video_ready(MediaPlayback *playback, uint32_t timeout_us);
+bool media_playback_wait_video_due(MediaPlayback *playback, uint32_t timeout_us);
 size_t media_playback_displayed_video_frames(const MediaPlayback *playback);
 void media_playback_set_presentation_clock_us(
     MediaPlayback *playback, uint64_t clock_us);
@@ -954,6 +969,13 @@ MediaPlaybackSourcePrimeStatus media_playback_prepare_seek_sources(
 bool media_playback_seek(MediaPlayback *playback, uint64_t target_us,
                          uint64_t *actual_us, char *error,
                          size_t error_size);
+/* Keyframe-accurate seek: video resumes at the random-access sample at or
+   before the target, and audio at that same position rather than at the
+   target, so nothing has to be decoded forward to the target before sound
+   and picture resume. */
+bool media_playback_seek_keyframe(MediaPlayback *playback,
+                                  uint64_t target_us, uint64_t *actual_us,
+                                  char *error, size_t error_size);
 /* Decoder-resetting recovery seek to the first actual video keyframe after
  * target_us. This is intentionally distinct from an ordinary scrub seek,
  * which rounds to the keyframe at or before its target. */
@@ -997,6 +1019,17 @@ typedef enum {
  * addresses either way.
  */
 void media_psp_backend_reserve_pool(void);
+/* The software decoder borrows the reserved pool for its arenas: blocks of
+   low, contiguous, Media Engine visible memory. The first is taken only
+   while no firmware buffer is in the pool (NULL otherwise, or without a
+   pool); further ones follow it while room lasts (media_psp_me_pool_claimable
+   says how much), and the pool is rewound once every block is released.
+   While it is claimed, firmware buffers come from the heap. The caller
+   charges the bytes to its Budget, as the firmware backend does. */
+void *media_psp_me_pool_claim(size_t bytes);
+size_t media_psp_me_pool_claimable(void);
+bool media_psp_me_pool_owns(const void *pointer);
+void media_psp_me_pool_unclaim(void *block);
 /* Lower bound established by the bounded early-boot admission probe. This is
    diagnostic only: callers must not use it for allocation decisions. */
 size_t media_psp_backend_heap_capacity_lower_bound(void);
@@ -1036,6 +1069,10 @@ bool media_psp_swdec_backend_create_sources(
     const MediaSampleSource *audio_source,
     const TilefinchSwdecComponentApi *component,
     MediaBackend *backend, char *error, size_t error_size);
+/* The Budget bytes the last video create above asked for at open, 0 when
+   it failed before sizing them. A caller refused for room uses it as the
+   amount to make before trying again. */
+size_t media_psp_swdec_backend_last_working_set(void);
 /* AAC-only form used after software decode has taken ownership of the Media
    Engine. It deliberately allocates no H.264 state or RGB surfaces. */
 bool media_psp_swdec_backend_create_audio(
@@ -1043,6 +1080,81 @@ bool media_psp_swdec_backend_create_audio(
     const TilefinchSwdecComponentApi *component,
     MediaBackend *backend, char *error, size_t error_size);
 bool media_psp_swdec_backend_quarantined(void);
+/* Validation builds (boot.cfg validation_swdec_audio_scan): scan every
+   played software-decoded audio block for its peak level. Off by default so
+   timing runs leave the audio thread's per-block work as shipped; a no-op
+   in shipping builds. Call before any video opens. */
+void media_psp_swdec_set_audio_scan(bool enabled);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+/* boot.cfg validation_playback_ab bit 0: software video decodes at fixed
+   full quality (no reduced-decode rungs). Call before any video opens. */
+void media_psp_swdec_set_full_quality(bool enabled);
+/* boot.cfg validation_playback_ab bit 2: software video fills its whole
+   picture ring, taking slots above 0x0A000000 once the low blocks run out
+   (main-CPU colour conversion and scaling for those), as before the ring
+   stopped at the low blocks. Call before any video opens. */
+void media_psp_swdec_set_keep_high_slots(bool enabled);
+/* boot.cfg validation_playback_ab bit 3 (value 8): the reduced quality
+   rungs drop non-reference pictures (one in two or one in four) as before,
+   instead of only skipping their deblocking. Call before any video opens. */
+void media_psp_swdec_set_drop_ladder(bool enabled);
+/* Validation bit 4: retain the old one-frame-ahead discard rule alongside
+   the old presenter pacing for a matched end-to-end comparison. */
+void media_psp_swdec_set_legacy_deadline(bool enabled);
+/* validation_swdec_reference bit 8: accepted-block clock and the old
+   pre-feed frame-selection timestamp, for same-binary cadence comparisons. */
+void media_psp_swdec_set_legacy_audio_clock(bool enabled);
+bool media_psp_swdec_legacy_audio_clock(void);
+/* validation_swdec_reference bit 9: retain refresh-only waits, internal-job
+   redraws and routine HLS delivery ahead of presentation. */
+void media_psp_swdec_set_legacy_due_wait(bool enabled);
+bool media_psp_swdec_legacy_due_wait(void);
+/* validation_swdec_reference bit 10: use at most nine normally admitted
+   picture slots, preserving allocation/recovery. Tests must verify nine. */
+void media_psp_swdec_set_fixed_nine_slots(bool enabled);
+void media_psp_swdec_note_presenter_wait(uint32_t waited_us);
+/* The steady window's main-thread CPU split (tilefinch-swdec-window-work
+   main-split): true while a software video's window is open; the loop then
+   adds the thread run time of each part below. Parts nest (each names its
+   parent) and are disjoint: a part's own time excludes its children's. */
+typedef enum {
+    MEDIA_SWDEC_CPU_IDLE = 0,     /* idle phase: page idle work */
+    MEDIA_SWDEC_CPU_PLAYER,       /* idle: the rest of the media frame */
+    MEDIA_SWDEC_CPU_TRANSPORT,    /* player: range pump (fetch, demux) */
+    MEDIA_SWDEC_CPU_CLOCK,        /* player: presentation clock step */
+    MEDIA_SWDEC_CPU_FEED,         /* player: decoder advance units */
+    MEDIA_SWDEC_CPU_TAKE,         /* player: take the due picture */
+    MEDIA_SWDEC_CPU_PRESENT,      /* present phase: the rest */
+    MEDIA_SWDEC_CPU_ENTRY,        /* present: entry, video-surface path */
+    MEDIA_SWDEC_CPU_COMPOSE,      /* present: base copy, chrome, video draw */
+    MEDIA_SWDEC_CPU_SUBMIT,       /* present: due wait, GE finish, publish */
+    MEDIA_SWDEC_CPU_PROBE,        /* present: validation present probes */
+    MEDIA_SWDEC_CPU_PRESENTED,    /* present: the player's presented step */
+    MEDIA_SWDEC_CPU_SUBTITLE,     /* probe: the input script's caption sampler */
+    MEDIA_SWDEC_CPU_ROUTE,        /* player: route, page network, scopes */
+    MEDIA_SWDEC_CPU_PREP,         /* player: advance before the range pump */
+    MEDIA_SWDEC_CPU_MID,          /* player: advance between feed and take */
+    MEDIA_SWDEC_CPU_TAIL,         /* player: advance after the take */
+    MEDIA_SWDEC_CPU_SCRIPT,       /* player: the page media element's state */
+    MEDIA_SWDEC_CPU_KINDS
+} MediaSwdecCpuKind;
+bool media_psp_swdec_window_cpu_wanted(void);
+void media_psp_swdec_window_cpu_add(unsigned kind, uint64_t us);
+/* Enter or leave a part of the current phase (psp_app_validation_loop.c);
+   a part whose parent is not the current part, or a sibling's, is
+   ignored, and so is its end. */
+void media_swdec_cpu_begin(unsigned kind);
+void media_swdec_cpu_end(unsigned kind);
+/* Ends a part of `kind` left open (an early return), returning to kind. */
+void media_swdec_cpu_end_within(unsigned kind);
+#define MEDIA_SWDEC_CPU_BEGIN(kind) media_swdec_cpu_begin(kind)
+#define MEDIA_SWDEC_CPU_END(kind) media_swdec_cpu_end(kind)
+#define MEDIA_SWDEC_CPU_END_WITHIN(kind) media_swdec_cpu_end_within(kind)
+#else
+#define MEDIA_SWDEC_CPU_BEGIN(kind) ((void) 0)
+#define MEDIA_SWDEC_CPU_END(kind) ((void) 0)
+#define MEDIA_SWDEC_CPU_END_WITHIN(kind) ((void) 0)
+#endif
 /*
  * A backend whose worker or firmware audio channel could not prove that it
  * released borrowed queue memory is intentionally leaked rather than freed.

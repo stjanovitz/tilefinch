@@ -207,6 +207,18 @@ void fetch_scheduler_domain_release(FetchSchedulerDomain *domain)
     (void) domain;
 }
 
+void fetch_scheduler_domain_set_held(FetchSchedulerDomain *domain, bool held)
+{
+    (void) domain;
+    (void) held;
+}
+
+bool fetch_scheduler_held(const FetchScheduler *scheduler)
+{
+    (void) scheduler;
+    return false;
+}
+
 bool fetch_scheduler_domain_metrics(const FetchSchedulerDomain *domain, FetchSchedulerDomainMetrics *metrics)
 {
     (void) domain;

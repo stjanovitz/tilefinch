@@ -85,6 +85,30 @@ int main(void)
     CHECK(youtube_playlist_failed(q) && !youtube_playlist_loading(q));
     CHECK(!youtube_playlist_pump(q, NULL));
     youtube_playlist_destroy(q);
+    /* A failed continuation remains retryable. A newer queue choice must
+       replace a ready video rather than publishing the old selection. */
+    q = youtube_playlist_begin(&budget, &session, url, 11, false, NULL);
+    CHECK(q); make_page(&page, 0, 12, true);
+    CHECK(youtube_playlist_accept_page(q, &page));
+    CHECK(youtube_playlist_take_video(q, video, sizeof(video)));
+    CHECK(youtube_playlist_step(q, 1));
+    make_page(&page, 13, 12, true); /* Continuation disagrees with its base. */
+    CHECK(!youtube_playlist_accept_page(q, &page));
+    CHECK(youtube_playlist_failed(q) && youtube_playlist_can_retry(q));
+    CHECK(!youtube_playlist_take_video(q, video, sizeof(video)));
+    youtube_playlist_retry(q);
+    CHECK(!youtube_playlist_failed(q) && youtube_playlist_loading(q));
+    make_page(&page, 12, 12, true);
+    CHECK(youtube_playlist_accept_page(q, &page));
+    CHECK(youtube_playlist_select(q, 14));
+    CHECK(youtube_playlist_take_video(q, video, sizeof(video)));
+    CHECK(strstr(video, "TFTEST00014") && youtube_playlist_position(q) == 14);
+    CHECK(!youtube_playlist_take_video(q, video, sizeof(video)));
+    CHECK(youtube_playlist_step(q, -1));
+    CHECK(youtube_playlist_take_video(q, video, sizeof(video)));
+    CHECK(strstr(video, "TFTEST00013"));
+    CHECK(youtube_playlist_select(q, 24) && youtube_playlist_loading(q));
+    youtube_playlist_destroy(q); /* Cancel while a later page is pending. */
     q = youtube_playlist_begin(&budget, &session,
         "https://www.youtube.com/playlist?list=PLfixture&tilefinch_base=24", 10, true, "TFTEST99999");
     CHECK(q); make_page(&page, 0, 12, false);

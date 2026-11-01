@@ -2971,6 +2971,81 @@ static JSValue autoinit_fixture_function(JSContext *context, JSValueConst self,
     return JS_UNDEFINED;
 }
 
+static int run_bigint_decrement(void)
+{
+    RegexpGuardState state = { .refuse_from = SIZE_MAX };
+    JSRuntime *runtime = JS_NewRuntime2(&regexp_guard_functions, &state);
+    JSContext *context = runtime ? JS_NewContext(runtime) : NULL;
+    if (!context) return 1;
+    const char source[] =
+        "(()=>{const n=1n<<80n;let a=n,b=-n;--a;--b;"
+        "return a===n-1n&&b===-n-1n})()";
+    JSValue result = JS_Eval(context, source, sizeof(source) - 1,
+                             "<bigint-decrement>", JS_EVAL_TYPE_GLOBAL);
+    bool okay = !JS_IsException(result) && JS_ToBool(context, result) == 1;
+    JS_FreeValue(context, result);
+    if (JS_HasException(context))
+        JS_FreeValue(context, JS_GetException(context));
+    JS_FreeContext(context);
+    JS_FreeRuntime(runtime);
+    if (!okay) fprintf(stderr, "wide bigint decrement changed the wrong amount\n");
+    return !okay || state.corrupted || state.live;
+}
+
+static int run_inherited_autoinit_refusals(void)
+{
+    unsigned refusals = 0;
+    bool reached = true;
+    for (size_t point = 0; reached && point < 64; point++) {
+        RegexpGuardState state = { .refuse_from = SIZE_MAX };
+        JSRuntime *runtime = JS_NewRuntime2(&regexp_guard_functions, &state);
+        JSContext *context = runtime ? JS_NewContext(runtime) : NULL;
+        if (!context) return 1;
+        JSValue prototype = JS_NewObject(context);
+        char names[128][24];
+        JSCFunctionListEntry entries[128];
+        JSValue children[128], values[128];
+        for (unsigned i = 0; i < 128; i++) {
+            snprintf(names[i], sizeof(names[i]), "lazyInherited%u", i);
+            entries[i] = (JSCFunctionListEntry) JS_CFUNC_DEF(
+                names[i], 0, autoinit_fixture_function);
+            children[i] = JS_NewObjectProto(context, prototype);
+            values[i] = JS_NewObject(context);
+            if (JS_IsException(children[i]) || JS_IsException(values[i])) return 1;
+        }
+        if (JS_SetPropertyFunctionList(context, prototype, entries, 128) < 0)
+            return 1;
+        size_t start = state.calls;
+        state.refuse_from = start + point;
+        for (unsigned i = 0; i < 128; i++) {
+            if (JS_SetPropertyStr(context, children[i], names[i], values[i]) < 0) {
+                refusals++;
+                JS_FreeValue(context, JS_GetException(context));
+            }
+        }
+        reached = state.calls > start + point;
+        state.refuse_from = SIZE_MAX;
+        /* The write consumes its value even if materializing the inherited
+           lazy property fails. The prototype must remain retryable. */
+        bool okay = true;
+        for (unsigned i = 0; i < 128; i++) {
+            JSValue retry = JS_GetPropertyStr(context, prototype, names[i]);
+            okay = JS_IsFunction(context, retry) && okay;
+            JS_FreeValue(context, retry);
+            JS_FreeValue(context, children[i]);
+        }
+        JS_FreeValue(context, prototype);
+        JS_FreeContext(context);
+        JS_FreeRuntime(runtime);
+        if (!okay || state.corrupted || state.live) {
+            fprintf(stderr, "inherited autoinit point=%zu live=%zu\n",
+                    point, state.live);
+            return 1;
+        }
+    }
+    return reached || !refusals;
+}
+
 static int run_global_autoinit_refusals(void)
 {
     for (unsigned once = 0; once < 2; once++) {
@@ -3309,6 +3384,10 @@ static int run_set_prototype_refusals(void)
 
 int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--bigint-decrement-only") == 0)
+        return run_bigint_decrement();
+    if (argc == 2 && strcmp(argv[1], "--inherited-autoinit-only") == 0)
+        return run_inherited_autoinit_refusals();
     if (argc == 2 && strcmp(argv[1], "--small-source-only") == 0)
         return run_small_child_source_lifetime();
     if (argc == 2 && strcmp(argv[1], "--set-prototype-only") == 0)
@@ -3337,6 +3416,8 @@ int main(int argc, char **argv)
     if (run_function_metadata_refusals() != 0) return 1;
     if (run_context_creation_refusals() != 0) return 1;
     if (run_global_autoinit_refusals() != 0) return 1;
+    if (run_inherited_autoinit_refusals() != 0) return 1;
+    if (run_bigint_decrement() != 0) return 1;
     if (run_bound_function_refusals() != 0) return 1;
     if (run_float_array_indexed_stores() != 0) return 1;
 

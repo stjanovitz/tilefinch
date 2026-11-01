@@ -5,6 +5,17 @@ independently-added control flags. The state machine is the shipping lifecycle
 authority. Decoder, demux, transport, DMA, presentation, and buffer ownership
 remain separate backend responsibilities.
 
+HLS recovery covers both on-demand and live playlists. Network quiescence can
+retire an outstanding worker request; it never permits restarting a response
+inside already-consumed segment bytes. Playlist opens use the existing bounded
+retry allowance, while failed segment pipelines reopen from the saved VOD
+position or the new live edge. Explicit Retry retires any retained pipeline
+before opening a new generation and preserves the saved play/pause intent.
+Online opens publish one network demand, then wait incrementally under the
+existing open deadline and cancellation scope. Offline playback bypasses this
+check. Terminal playback failures quiesce their owners instead of leaving a
+failed panel over a controller that still says Playing.
+
 Audio supply does not introduce another playback state machine. The backend's
 read-only admission policy uses the lifecycle machine's existing play/buffering
 intent and the bounded PCM/compressed queues. Reset, refusal recovery, and a
@@ -246,6 +257,17 @@ no-ops, not absent cases. Important non-obvious cells include:
 
 Host tests enumerate the full event/state product, require a handled result,
 and check the resource invariant after every result.
+
+Track indices belong to the currently resolved catalog. When an open discards
+that catalog, it also removes the old audio/subtitle choices until resolution
+publishes their replacements; chapter and queue navigation remain available.
+An audio choice made after catalog publication may supersede an opening
+pipeline even before a playback owner exists. Its replacement carries the
+newest committed seek, otherwise the existing continuation, and its paused or
+playing intent. Stale job flags must not turn a paused continuation back on.
+The known duration survives a same-video resolver refresh so the continuation
+can accept seek and chapter input while disconnected. A different route clears
+that duration; resolved URLs and formats are never retained by this rule.
 
 ## Effects and invoked services
 

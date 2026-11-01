@@ -28,6 +28,13 @@ struct MediaPlayback {
        (normally one small AAC AU), under the same per-packet cap and Budget;
        it never reserves a second maximum-sized video buffer up front. */
     bool packet_loaded[2];
+    /* One source carrying both tracks (progressive MP4, muxed HLS TS) gets
+       the same protection through a second lane: while the source's head is
+       held by the backend, slot one may take the source's next buffered AAC
+       unit out of order (peek_track_sample/take_track_sample). A lane-one
+       unit is always taken -- copied and removed from the source -- before
+       it is pending, so the source can never return it again. */
+    bool muxed_audio_lane;
     bool playing;
     bool ended;
     MediaPlaybackJobStats job_stats;
@@ -116,12 +123,29 @@ static bool playback_note_head_block(
     if (playback->pending[selected].kind == MEDIA_MP4_TRACK_VIDEO)
         playback->job_stats.head_block_video++;
     else playback->job_stats.head_block_audio++;
-    /* One source carrying both tracks has no alternate to have offered. */
-    if (playback->source_count < 2) return false;
+    /* A source carrying both tracks without a muxed audio lane has no
+       alternate to have offered. With one, only a held video head is
+       overtaken: AAC units of one source never pass each other. */
+    if (playback->source_count < 2
+        && (!playback->muxed_audio_lane
+            || playback->pending[selected].kind != MEDIA_MP4_TRACK_VIDEO))
+        return false;
     size_t other = selected == 0 ? 1u : 0u;
-    if (!playback->have_pending[other]) return false;
+    MediaMp4Sample peeked = {0};
+    bool lane_peek = false;
+    if (!playback->have_pending[other]) {
+        /* The muxed lane is empty: ask the shared source, without consuming
+           or fetching, whether a buffered AAC unit waits behind the held
+           video head. */
+        if (!playback->muxed_audio_lane || other != 1u
+            || !playback->source[0].ops->peek_track_sample(
+                   playback->source[0].opaque, MEDIA_MP4_TRACK_AUDIO,
+                   &peeked)) return false;
+        lane_peek = true;
+    }
     playback->job_stats.head_alt_pending++;
-    uint64_t alternate = playback->pending_time_us[other];
+    uint64_t alternate = lane_peek ? sample_time_us(&peeked)
+                                   : playback->pending_time_us[other];
     if (alternate > horizon) return false;
     playback->job_stats.head_alt_in_horizon++;
     /* Normal merge order selects the earliest sample. A split seek may hold
@@ -135,12 +159,49 @@ static bool playback_note_head_block(
     } else {
         playback->job_stats.head_alt_behind++;
     }
-    const MediaSampleSource *other_source = &playback->source[other];
-    if (!playback->packet_loaded[other]
-        && !other_source->ops->sample_resident(
-            other_source->opaque, &playback->pending[other]))
-        return allow_refill;
+    /* A lane peek only describes buffered payloads. */
+    if (!lane_peek) {
+        const MediaSampleSource *other_source =
+            &playback->source[playback->muxed_audio_lane ? 0u : other];
+        if (!playback->packet_loaded[other]
+            && !other_source->ops->sample_resident(
+                other_source->opaque, &playback->pending[other]))
+            return allow_refill;
+    }
     playback->job_stats.head_alt_resident++;
+    return true;
+}
+
+static size_t playback_lane_count(const MediaPlayback *playback)
+{
+    return playback->muxed_audio_lane ? 2u : playback->source_count;
+}
+
+/*
+ * Lane one of a muxed source: take its earliest buffered, not yet returned AAC
+ * unit when it is inside the decode horizon. Called only while the source's
+ * own head is held for this bounded call. Nothing is fetched; a unit that is
+ * not buffered, not due, or not yet affordable is left in the source.
+ */
+static bool playback_take_muxed_audio(MediaPlayback *playback,
+                                      uint64_t horizon)
+{
+    if (playback->have_pending[1]) return true;
+    MediaSampleSource *source = &playback->source[0];
+    MediaMp4Sample sample;
+    if (!source->ops->peek_track_sample(
+            source->opaque, MEDIA_MP4_TRACK_AUDIO, &sample)) return false;
+    uint64_t time_us = sample_time_us(&sample);
+    if (time_us > horizon
+        || playback_ensure_packet_capacity(
+               playback, 1u, sample.size, NULL, 0) != PLAYBACK_PACKET_READY
+        || !source->ops->take_track_sample(
+               source->opaque, &sample, playback->packet[1],
+               playback->packet_capacity[1])) return false;
+    playback->pending[1] = sample;
+    playback->pending_time_us[1] = time_us;
+    playback->have_pending[1] = true;
+    playback->packet_loaded[1] = true;
     return true;
 }
 
@@ -174,6 +235,7 @@ MediaPlayback *media_playback_create_sources(
     }
     size_t largest = 0;
     bool has_audio = audio_source != NULL;
+    bool has_video = false;
     const MediaSampleSource *sources[2] = {video_source, audio_source};
     size_t source_count = audio_source == NULL ? 1u : 2u;
     if (audio_source != NULL && !source_valid(audio_source)) {
@@ -194,6 +256,7 @@ MediaPlayback *media_playback_create_sources(
             }
             if (info.largest_sample > largest) largest = info.largest_sample;
             if (info.kind == MEDIA_MP4_TRACK_AUDIO) has_audio = true;
+            if (info.kind == MEDIA_MP4_TRACK_VIDEO) has_video = true;
         }
     }
     size_t maximum = options != NULL && options->maximum_packet_bytes != 0
@@ -212,9 +275,12 @@ MediaPlayback *media_playback_create_sources(
         return NULL;
     }
     size_t initial_capacity = options != NULL
-        && options->preallocate_maximum_packet_bytes ? maximum : largest;
-    playback->packet[0] = budget_malloc_category(
-        budget, BUDGET_CATEGORY_RESOURCE, initial_capacity);
+        && (options->preallocate_maximum_packet_bytes
+            || options->reserved_packet != NULL) ? maximum : largest;
+    playback->packet[0] = options != NULL ? options->reserved_packet : NULL;
+    if (playback->packet[0] == NULL)
+        playback->packet[0] = budget_malloc_category(
+            budget, BUDGET_CATEGORY_RESOURCE, initial_capacity);
     if (playback->packet[0] == NULL) {
         budget_free(budget, playback);
         playback_error(error, error_size,
@@ -233,6 +299,9 @@ MediaPlayback *media_playback_create_sources(
     playback->audio_start_us =
         options == NULL ? 0 : options->audio_start_us;
     playback->has_audio = has_audio;
+    playback->muxed_audio_lane = source_count == 1u && has_audio && has_video
+        && video_source->ops->peek_track_sample != NULL
+        && video_source->ops->take_track_sample != NULL;
     playback->playing = true;
     return playback;
 }
@@ -326,7 +395,8 @@ static MediaPlaybackAdvanceResult playback_advance_bounded(
      * clock horizon. The next public call starts from the earliest source
      * again, so neither track can be skipped indefinitely.
      */
-    size_t deferred_source = playback->source_count;
+    size_t lanes = playback_lane_count(playback);
+    size_t deferred_source = lanes;
     MediaPlaybackAdvanceResult status = MEDIA_PLAYBACK_ADVANCE_COMPLETE;
     bool source_blocked = false;
     while (true) {
@@ -378,10 +448,14 @@ static MediaPlaybackAdvanceResult playback_advance_bounded(
                 }
             }
         }
-        size_t selected = playback->source_count;
+        /* A held muxed head lends this call to its audio lane. */
+        if (playback->muxed_audio_lane && deferred_source == 0u
+            && !prepared_only)
+            (void) playback_take_muxed_audio(playback, horizon);
+        size_t selected = lanes;
         uint64_t selected_time = UINT64_MAX;
         bool held_audio_pending = false;
-        for (size_t source = 0; source < playback->source_count; source++) {
+        for (size_t source = 0; source < lanes; source++) {
             if (source == deferred_source) continue;
             if (!playback->have_pending[source]) continue;
             /* In the split form source one is contractually audio. During a
@@ -392,31 +466,30 @@ static MediaPlaybackAdvanceResult playback_advance_bounded(
                 continue;
             }
             uint64_t candidate = playback->pending_time_us[source];
-            if (selected == playback->source_count
-                || candidate < selected_time) {
+            if (selected == lanes || candidate < selected_time) {
                 selected = source;
                 selected_time = candidate;
             }
         }
-        if (selected == playback->source_count && prepared_only) {
+        if (selected == lanes && prepared_only) {
             status = MEDIA_PLAYBACK_ADVANCE_PENDING;
             break;
         }
-        if (selected == playback->source_count
-            && deferred_source != playback->source_count) {
+        if (selected == lanes
+            && deferred_source != lanes) {
             /* The other source advanced as far as this bounded call allowed;
                the original blocked head is intentionally still pending for
                the next call. It is not end-of-stream and must never drain. */
             status = MEDIA_PLAYBACK_ADVANCE_PENDING;
             break;
         }
-        if (selected == playback->source_count && held_audio_pending) {
+        if (selected == lanes && held_audio_pending) {
             /* The video source is caught up for this horizon. Audio is
                intentionally retained, not EOF and not a drain condition. */
             status = MEDIA_PLAYBACK_ADVANCE_PENDING;
             break;
         }
-        if (selected == playback->source_count && source_blocked) {
+        if (selected == lanes && source_blocked) {
             /* Nothing to submit and at least one source is still fetching:
                this is a pending pipeline, not a drained one. Draining here
                would publish end-of-stream in the middle of a refill. */
@@ -425,7 +498,7 @@ static MediaPlaybackAdvanceResult playback_advance_bounded(
             status = MEDIA_PLAYBACK_ADVANCE_PENDING;
             break;
         }
-        if (selected == playback->source_count) {
+        if (selected == lanes) {
             playback->job_stats.source_ended_breaks++;
             if (playback->backend.drain == NULL) {
                 playback->ended = true;
@@ -482,11 +555,22 @@ static MediaPlaybackAdvanceResult playback_advance_bounded(
             && (selected != 0
                 || playback->pending[selected].kind
                    == MEDIA_MP4_TRACK_AUDIO)) {
+            /* A source whose next_sample only peeks must be told, or it
+               offers this unit again forever. A muxed lane-one unit was
+               already taken from its source. */
+            MediaSampleSource *dropped =
+                &playback->source[playback->muxed_audio_lane ? 0u : selected];
+            if (!playback->packet_loaded[selected]
+                && dropped->ops->discard_sample != NULL)
+                dropped->ops->discard_sample(
+                    dropped->opaque, &playback->pending[selected]);
             playback->have_pending[selected] = false;
+            playback->packet_loaded[selected] = false;
             processed++;
             continue;
         }
-        MediaSampleSource *selected_source = &playback->source[selected];
+        MediaSampleSource *selected_source =
+            &playback->source[playback->muxed_audio_lane ? 0u : selected];
         /* Scanout service may collect a codec job and submit bytes already
            staged by an ordinary visit, but never allocate or read a source.
            Even a locally available file can block on storage or USB. */
@@ -525,7 +609,7 @@ static MediaPlaybackAdvanceResult playback_advance_bounded(
                     playback, selected, horizon, false);
                 status = MEDIA_PLAYBACK_ADVANCE_PENDING;
                 if (can_bypass
-                    && deferred_source == playback->source_count) {
+                    && deferred_source == lanes) {
                     deferred_source = selected;
                     playback->job_stats.head_alt_bypasses++;
                     continue;
@@ -567,12 +651,12 @@ static MediaPlaybackAdvanceResult playback_advance_bounded(
                alternate demand/install its next window: a residency-only
                gate would deadlock again at the end of the current audio
                window. Its nonblocking read can yield, with both heads kept. */
-            if (can_bypass && deferred_source == playback->source_count) {
+            if (can_bypass && deferred_source == lanes) {
                 deferred_source = selected;
                 playback->job_stats.head_alt_bypasses++;
                 continue;
             }
-            if (deferred_source != playback->source_count)
+            if (deferred_source != lanes)
                 playback->job_stats.head_alt_blocked++;
             break;
         }
@@ -586,7 +670,7 @@ static MediaPlaybackAdvanceResult playback_advance_bounded(
         playback->have_pending[selected] = false;
         processed++;
         playback->job_stats.packets_submitted++;
-        if (deferred_source != playback->source_count
+        if (deferred_source != lanes
             && selected != deferred_source)
             playback->job_stats.head_alt_submitted++;
         /*
@@ -710,6 +794,25 @@ bool media_playback_ready_video_start_us(
         && playback->backend.ready_video_start_us != NULL
         && playback->backend.ready_video_start_us(
             playback->backend.opaque, start_us);
+}
+
+bool media_playback_wait_video_ready(MediaPlayback *playback, uint32_t timeout_us)
+{
+    /* Never turn an optional pacing callback into an unbounded input wait. */
+    if (timeout_us > 17000u) timeout_us = 17000u;
+    return playback != NULL && timeout_us != 0
+        && playback->backend.wait_video_ready != NULL
+        && playback->backend.wait_video_ready(
+            playback->backend.opaque, timeout_us);
+}
+
+bool media_playback_wait_video_due(MediaPlayback *playback, uint32_t timeout_us)
+{
+    if (timeout_us > 17000u) timeout_us = 17000u;
+    return playback != NULL && timeout_us != 0
+        && playback->backend.wait_video_due != NULL
+        && playback->backend.wait_video_due(
+            playback->backend.opaque, timeout_us);
 }
 
 size_t media_playback_displayed_video_frames(const MediaPlayback *playback)
@@ -887,7 +990,8 @@ uint64_t media_playback_buffered_until_us(const MediaPlayback *playback)
 {
     if (playback == NULL) return 0;
     uint64_t buffered = playback->buffered_until_us;
-    for (size_t source = 0; source < playback->source_count; source++) {
+    for (size_t source = 0; source < playback_lane_count(playback);
+         source++) {
         if (playback->have_pending[source]) {
             uint64_t pending = playback->pending_time_us[source];
             if (pending > buffered) buffered = pending;
@@ -958,7 +1062,31 @@ bool media_playback_warm_audio(MediaPlayback *playback, uint64_t target_us,
         playback, 1, target_us, error, error_size);
 }
 
-#define MEDIA_PLAYBACK_PRIME_MAXIMUM_SKIPPED_SAMPLES 64u
+/* How many samples a seek prime may step over between the keyframe the
+   demuxer resumed at and the first sample at the target. Stepping is a walk
+   of the in-memory sample table, not a read or a decode. A muxed source
+   steps over both tracks, so a long GOP needs hundreds: x264's default
+   keyint 250 at 30 fps is 8.3 s, about 250 video and 360 AAC samples ahead
+   of a target just before the next keyframe; the former cap of 64 failed
+   every seek more than about a second past a keyframe. 2048 covers a GOP of
+   roughly 28 s of 30 fps video with 44.1 kHz AAC. A target beyond it fails
+   the prime with this message, and the PSP session then resumes from the
+   keyframe instead (psp_media_seek_prime_fallback). */
+#define MEDIA_PLAYBACK_PRIME_MAXIMUM_SKIPPED_SAMPLES 2048u
+
+static bool playback_source_has_video(const MediaPlayback *playback,
+                                      size_t index)
+{
+    if (index >= playback->source_count
+        || !source_valid(&playback->source[index])) return false;
+    const MediaSampleSource *source = &playback->source[index];
+    for (size_t i = 0; i < source->ops->track_count(source->opaque); i++) {
+        MediaMp4TrackInfo info;
+        if (source->ops->track_info(source->opaque, i, &info)
+            && info.kind == MEDIA_MP4_TRACK_VIDEO) return true;
+    }
+    return false;
+}
 
 static MediaPlaybackSourcePrimeStatus playback_prime_source(
     MediaPlayback *playback, size_t index, uint64_t target_us,
@@ -989,12 +1117,19 @@ static MediaPlaybackSourcePrimeStatus playback_prime_source(
     MediaMp4Sample sample = {0};
     bool found = false;
     bool scan_limit_reached = false;
+    /* A source whose next_sample only peeks (HLS) offers the same head on
+       every call, and stepping past it would consume it: the restoring seek
+       below would then refetch the segment, every poll, so a split HLS audio
+       rendition never primed at a target inside a segment. Its head at the
+       landing proves delivery there has begun; playback drops the units
+       before the target as it reaches them, as for muxed audio. */
+    bool peek_only = source->ops->discard_sample != NULL;
     for (unsigned skipped = 0;
          skipped <= MEDIA_PLAYBACK_PRIME_MAXIMUM_SKIPPED_SAMPLES;
          skipped++) {
         if (!source->ops->next_sample(source->opaque, &sample)) break;
         uint64_t time_us = sample_time_us(&sample);
-        if (!at_or_after_target || time_us >= target_us) {
+        if (!at_or_after_target || time_us >= target_us || peek_only) {
             found = true;
             if (sample_us != NULL) *sample_us = time_us;
             break;
@@ -1077,6 +1212,21 @@ MediaPlaybackSourcePrimeStatus media_playback_prime_audio_source(
     MediaPlayback *playback, uint64_t target_us, uint64_t *sample_us,
     char *error, size_t error_size)
 {
+    if (sample_us != NULL) *sample_us = target_us;
+    /* Muxed audio shares source zero with the video, which the video prime
+       has already made resident at the keyframe the decode starts from;
+       the stream is read forward from there. Scanning and reading ahead to
+       the target as well asked the source for a second, later window: when
+       keyframe and target sit in different windows (a long GOP at any
+       bitrate past one window), each poll's restoring seek pulled the
+       window back to the keyframe and cancelled the target's read, and the
+       prime never became ready -- a firmware seek 7.5 s past a keyint-250
+       keyframe stayed "resolving" until the player closed. */
+    if (playback != NULL && playback->source_count == 1u
+        && playback_source_has_video(playback, 0u))
+        return playback->packet[0] == NULL
+            ? MEDIA_PLAYBACK_SOURCE_PRIME_FAILED
+            : MEDIA_PLAYBACK_SOURCE_PRIME_READY;
     size_t source = playback != NULL && playback->has_audio
             && playback->source_count == 1u
         ? 0u : 1u;
@@ -1112,6 +1262,7 @@ MediaPlaybackSourcePrimeStatus media_playback_prepare_seek_sources(
 static bool media_playback_seek_internal(MediaPlayback *playback,
                                          uint64_t target_us,
                                          bool strictly_after,
+                                         bool audio_at_keyframe,
                                          uint64_t *actual_us, char *error,
                                          size_t error_size)
 {
@@ -1165,7 +1316,8 @@ static bool media_playback_seek_internal(MediaPlayback *playback,
        audio demux rounds to its unit immediately before the selected video
        point, and that pre-landing unit must not play ahead of the recovered
        picture. */
-    playback->audio_start_us = strictly_after ? selected_us : target_us;
+    playback->audio_start_us = strictly_after || audio_at_keyframe
+        ? selected_us : target_us;
     playback->ended = false;
     if (actual_us != NULL) *actual_us = selected_us;
     return true;
@@ -1176,7 +1328,15 @@ bool media_playback_seek(MediaPlayback *playback, uint64_t target_us,
                          size_t error_size)
 {
     return media_playback_seek_internal(
-        playback, target_us, false, actual_us, error, error_size);
+        playback, target_us, false, false, actual_us, error, error_size);
+}
+
+bool media_playback_seek_keyframe(MediaPlayback *playback,
+                                  uint64_t target_us, uint64_t *actual_us,
+                                  char *error, size_t error_size)
+{
+    return media_playback_seek_internal(
+        playback, target_us, false, true, actual_us, error, error_size);
 }
 
 bool media_playback_seek_after(MediaPlayback *playback, uint64_t target_us,
@@ -1184,7 +1344,7 @@ bool media_playback_seek_after(MediaPlayback *playback, uint64_t target_us,
                                size_t error_size)
 {
     return media_playback_seek_internal(
-        playback, target_us, true, actual_us, error, error_size);
+        playback, target_us, true, false, actual_us, error, error_size);
 }
 
 size_t media_playback_packet_bytes(const MediaPlayback *playback)

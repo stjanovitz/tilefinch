@@ -98,7 +98,8 @@ static void psp_network_enter_starting(PspNetworkSupervisorDecision *decision)
 {
     psp_network_clear_children(&decision->next);
     decision->next.state = PSP_NETWORK_SUPERVISOR_STARTING;
-    decision->next.stack = PSP_NETWORK_STACK_NONE;
+    if (decision->next.stack != PSP_NETWORK_STACK_MODULES_ONLY)
+        decision->next.stack = PSP_NETWORK_STACK_NONE;
     decision->next.admission_open = false;
     decision->next.retained_lease_count = 0;
     decision->commands |= PSP_NETWORK_COMMAND_START_LADDER;
@@ -144,7 +145,7 @@ static void psp_network_enter_stopping(
 }
 
 static void psp_network_finish_stopping(
-    PspNetworkSupervisorDecision *decision)
+    PspNetworkSupervisorDecision *decision, PspNetworkStackState remaining)
 {
     PspNetworkStoppingTarget target = decision->next.stopping_target;
     PspNetworkTarget desired = decision->next.target;
@@ -159,6 +160,8 @@ static void psp_network_finish_stopping(
         decision->next.failure = PSP_NETWORK_FAILURE_NONE;
         break;
     case PSP_NETWORK_STOP_TARGET_OFFLINE:
+        if (remaining == PSP_NETWORK_STACK_MODULES_ONLY)
+            decision->next.stack = remaining;
         decision->next.state = PSP_NETWORK_SUPERVISOR_OFFLINE;
         decision->next.failure = failure == PSP_NETWORK_FAILURE_NONE
             ? PSP_NETWORK_FAILURE_START : failure;
@@ -167,6 +170,8 @@ static void psp_network_finish_stopping(
         decision->next.state = PSP_NETWORK_SUPERVISOR_SUSPENDED_OFF;
         break;
     case PSP_NETWORK_STOP_TARGET_RESTART:
+        if (remaining == PSP_NETWORK_STACK_MODULES_ONLY)
+            decision->next.stack = remaining;
         decision->next.target = desired;
         psp_network_enter_starting(decision);
         break;
@@ -190,7 +195,7 @@ static void psp_network_begin_leave_or_finish(
         return;
     }
     if (decision->next.stack == PSP_NETWORK_STACK_NONE) {
-        psp_network_finish_stopping(decision);
+        psp_network_finish_stopping(decision, PSP_NETWORK_STACK_NONE);
         return;
     }
     decision->next.stopping_phase = PSP_NETWORK_STOP_LEAVE_APCTL;
@@ -215,6 +220,18 @@ static void psp_network_apply_target(
     PspNetworkTarget target)
 {
     decision->next.target = target;
+    /* Offline may retain code modules, never live services. Off and suspend
+       still have to run the ownership-aware unload before reporting done. */
+    if (decision->next.state == PSP_NETWORK_SUPERVISOR_OFFLINE
+        && decision->next.stack == PSP_NETWORK_STACK_MODULES_ONLY
+        && target.kind != PSP_NETWORK_TARGET_READY) {
+        psp_network_enter_stopping(decision,
+            target.kind == PSP_NETWORK_TARGET_SUSPEND
+                ? PSP_NETWORK_STOP_TARGET_SUSPENDED_OFF
+                : PSP_NETWORK_STOP_TARGET_OFF,
+            PSP_NETWORK_FAILURE_NONE);
+        return;
+    }
     if (decision->next.state == PSP_NETWORK_SUPERVISOR_STOPPING) {
         if (target.kind == PSP_NETWORK_TARGET_READY)
             decision->next.stopping_target = PSP_NETWORK_STOP_TARGET_RESTART;
@@ -367,7 +384,7 @@ static void psp_network_transition_stopping(
         if (event->type == PSP_NETWORK_EVENT_RUNG_UNWOUND)
             decision->commands |= PSP_NETWORK_COMMAND_UNWIND_ONE_RUNG;
         else if (event->type == PSP_NETWORK_EVENT_UNWOUND)
-            psp_network_finish_stopping(decision);
+            psp_network_finish_stopping(decision, snapshot->stack);
         break;
     case PSP_NETWORK_STOP_NONE:
     default:
@@ -486,14 +503,17 @@ uint32_t psp_network_supervisor_violations(
     bool stack_ok = false;
     switch (machine->state) {
     case PSP_NETWORK_SUPERVISOR_OFF:
-    case PSP_NETWORK_SUPERVISOR_OFFLINE:
     case PSP_NETWORK_SUPERVISOR_SUSPENDED_OFF:
         stack_ok = machine->stack == PSP_NETWORK_STACK_NONE;
+        break;
+    case PSP_NETWORK_SUPERVISOR_OFFLINE:
+        stack_ok = machine->stack == PSP_NETWORK_STACK_NONE
+            || machine->stack == PSP_NETWORK_STACK_MODULES_ONLY;
         break;
     case PSP_NETWORK_SUPERVISOR_STARTING:
     case PSP_NETWORK_SUPERVISOR_STOPPING:
         stack_ok = machine->stack >= PSP_NETWORK_STACK_NONE
-            && machine->stack <= PSP_NETWORK_STACK_RETAINED_WEDGED;
+            && machine->stack <= PSP_NETWORK_STACK_MODULES_ONLY;
         break;
     case PSP_NETWORK_SUPERVISOR_READY:
     case PSP_NETWORK_SUPERVISOR_REJOINING:

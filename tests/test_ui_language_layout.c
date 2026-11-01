@@ -854,6 +854,31 @@ static bool test_state_text(PspUiState *ui, TilefinchGlyphProvider *provider)
         if (!english || strlen(headlines[at]) <= 32u)
             CHECK(shown_whole(tilefinch_ui_text(headlines[at])));
     }
+    /* A video the PSP cannot play: each headline with its details line
+       (media_failure_message.c), both translated and whole. */
+    static const char *const failures[][2] = {
+        {"OPTIONAL VIDEO DECODER NEEDED", "Install it for low res. See README"},
+        {"VIDEO DECODER COULDN'T START", "Not enough memory"},
+        {"VIDEO DECODER COULDN'T START", "Decoder rebuild needed"},
+        {"VIDEO DECODER COULDN'T START", "Files missing. See README"},
+        {"VIDEO DECODER COULDN'T START", "0x800200D9"},
+        {"PSP CAN'T PLAY THIS VIDEO FORMAT", "Uses a B-frame pyramid"},
+        {"PSP CAN'T PLAY THIS VIDEO FORMAT", "Uses over 3 reference frames"},
+        {"PSP CAN'T PLAY THIS VIDEO FORMAT", "PSP decoder refused its pictures"},
+        {"PSP CAN'T PLAY THIS VIDEO FORMAT", "High profile, over 432x240"},
+        {"PSP CAN'T PLAY THIS VIDEO FORMAT", "Unsupported H.264 profile"},
+        {"PSP CAN'T PLAY THIS VIDEO FORMAT", "Picture size too large"},
+        {"PSP CAN'T PLAY THIS VIDEO FORMAT", "No supported codec"},
+        {"VIDEO SOURCE COULD NOT OPEN", "HTTP 403"},
+        {"STREAM OFFLINE OR NOT AVAILABLE", "HTTP 404"},
+    };
+    for (size_t at = 0; at < sizeof(failures) / sizeof(failures[0]); at++) {
+        media = (PspUiMediaState) {.visible = true, .controls_visible = true};
+        psp_ui_media_set_error_reason(&media, failures[at][0], failures[at][1]);
+        CHECK(paint_media(&media, provider) && validate_frame(ui));
+        CHECK(shown_whole(tilefinch_ui_text(failures[at][0]))
+              && shown_whole(tilefinch_ui_text(failures[at][1])));
+    }
     for (size_t at = 0; at < sizeof(progress) / sizeof(progress[0]); at++) {
         media = (PspUiMediaState) {.visible = true, .controls_visible = true,
                                    .resolving = true};
@@ -1318,6 +1343,122 @@ static bool test_composed_toasts(PspUiState *ui, TilefinchGlyphProvider *provide
     ui->status[0] = '\0';
     ui->toast_kind = PSP_UI_TOAST_PLAIN;
     ui->browser_ui_scale = 1;
+    return true;
+}
+
+static bool legend_button(const char *text)
+{
+    static const char *const buttons[] = {"X", "O", "TRI", "START", "□"};
+    for (size_t at = 0; at < sizeof(buttons) / sizeof(buttons[0]); at++)
+        if (!strcmp(text, buttons[at])) return true;
+    return false;
+}
+
+/* The page hint row, measured with the bound chrome faces: nothing
+   overlaps or clips, a word sits closer to its own glyph than to the next
+   pair's glyph, and the legend stays clear of the right-hand readouts. */
+static bool check_legend_runs(const char *what, unsigned scale)
+{
+    CHECK(!run_overflow && run_count > 0);
+    bool fail = false;
+    for (size_t i = 0; i < run_count; i++) {
+        const TextRun *a = &runs[i];
+        /* Only a page-supplied name or portal host may ellipsize. */
+        static const char *const fixed[] = {
+            "Open", "Edit", "Back", "Bar", "Search", "Enter", "Reload",
+            "Cancel", "100%", "B999+"
+        };
+        bool must_fit = legend_button(a->text);
+        for (size_t at = 0; at < sizeof(fixed) / sizeof(fixed[0]); at++)
+            must_fit |= !strcmp(a->text, fixed[at]);
+        if ((must_fit && a->truncated) || a->missing_glyph
+            || a->left < 0 || a->right > WIDTH)
+            fail = true;
+        for (size_t j = i + 1; j < run_count; j++) {
+            const TextRun *b = &runs[j];
+            int gap = a->right <= b->left ? b->left - a->right
+                : b->right <= a->left ? a->left - b->right : -1;
+            bool inner = legend_button(a->text) && j == i + 1
+                && !legend_button(b->text);
+            /* glyph -> its word: 2..8 px of ink; anything else: a pair gap */
+            if (inner ? gap < 2 || gap > UI_LEGEND_INNER_GAP + 4
+                      : gap < UI_LEGEND_PAIR_GAP - 3)
+                fail = true;
+        }
+    }
+    if (fail) {
+        fprintf(stderr, "legend row %s scale=%u:\n", what, scale);
+        for (size_t r = 0; r < run_count; r++)
+            fprintf(stderr, "  '%s' ink=%d..%d%s%s\n", runs[r].text, runs[r].left,
+                    runs[r].right, runs[r].truncated ? " truncated" : "",
+                    runs[r].missing_glyph ? " missing" : "");
+        return false;
+    }
+    return true;
+}
+
+static bool test_page_legend_row(void)
+{
+    for (unsigned scale = 1; scale <= 2; scale++) {
+        for (unsigned variant = 0; variant < 6; variant++) {
+            PspUiState ui;
+            psp_ui_init(&ui);
+            ui.screen = PSP_UI_SCREEN_PAGE;
+            ui.chrome_visible = true;
+            ui.browser_ui_scale = scale;
+            ui.focus_editable = variant == 1;
+            ui.page_requests_blocked = variant == 2 ? 1234u : 0u;
+            if (variant == 3 || variant == 4) {
+                ui.focus_label_valid = true;
+                snprintf(ui.focus_label, sizeof(ui.focus_label), "%s",
+                    variant == 3 ? "Like"
+                        : "A focused control whose name is far wider than the row");
+            }
+            if (variant == 5) {
+                ui.captive_portal_active = true;
+                snprintf(ui.url, sizeof(ui.url), "%s",
+                    "http://a-very-long-captive-portal-host-name.example.net/login");
+            }
+            run_count = 0; run_overflow = false;
+            draw_bottom_bar(&ui, storage, WIDTH, HEIGHT, STRIDE, 0, 0, 0);
+            char what[32];
+            snprintf(what, sizeof(what), "variant=%u", variant);
+            CHECK(check_legend_runs(what, scale));
+            size_t buttons = 0;
+            for (size_t r = 0; r < run_count; r++)
+                buttons += legend_button(runs[r].text);
+            /* Every pair fits at both scales today; the fit policy below
+               handles a narrower row. */
+            CHECK(buttons == (variant >= 3 ? (variant == 5 ? 1u : 2u) : 5u));
+        }
+    }
+    /* The fit policy drops the lowest-kept pair first, never overflows,
+       and keeps display order. */
+    static const UiLegendPair pairs[] = {
+        {"X", "Open", 4u}, {"O", "Back", 3u}, {"TRI", "Bar", 0u},
+        {"START", "Search", 2u}, {"□", "Reload", 1u}
+    };
+    for (unsigned scale = 1; scale <= 2; scale++) {
+        size_t previous = 6;
+        for (int space = 480; space >= 0; space -= 4) {
+            bool shown[5];
+            legend_row_fit(pairs, 5, space, (int) scale, shown);
+            int total = 0;
+            size_t visible = 0;
+            for (size_t at = 0; at < 5; at++) {
+                if (!shown[at]) continue;
+                total += button_legend_width(pairs[at].button, pairs[at].label,
+                                             (int) scale)
+                    + (visible++ ? UI_LEGEND_PAIR_GAP : 0);
+            }
+            CHECK(total <= space && visible <= previous);
+            /* Dropped pairs are exactly the lowest `keep` values. */
+            for (size_t at = 0; at < 5; at++)
+                CHECK(shown[at] == (pairs[at].keep >= 5u - visible));
+            previous = visible;
+        }
+        CHECK(previous == 0);
+    }
     return true;
 }
 
@@ -1786,6 +1927,7 @@ static bool test_all_languages(void)
     psp_ui_set_chrome_fonts(font_set_face(&fonts, FONT_SANS),
         font_set_face_variant(&fonts, FONT_SANS, false, true), 1);
     CHECK(test_square_button_symbol());
+    CHECK(test_page_legend_row());
     CHECK(test_bidi_glyph_raster(&fonts, &budget));
     for (unsigned language = 0; language < TILEFINCH_UI_LANGUAGE_COUNT; language++) {
         TilefinchUiTranslation *translation;
@@ -1843,15 +1985,21 @@ static bool test_all_languages(void)
                     snprintf(ui.focus_label, sizeof(ui.focus_label), "%s", name);
                     CHECK(paint(&ui, provider));
                     bool named = false;
+                    /* The name keeps a pair gap before the "O Back" legend. */
+                    int back_left = WIDTH;
+                    for (size_t r = 0; r < run_count; r++)
+                        if (!strcmp(runs[r].text, "O")) back_left = runs[r].left;
+                    CHECK(back_left < WIDTH);
                     for (size_t r = 0; r < run_count; r++) {
                         if (!strcmp(runs[r].text, tilefinch_ui_text(action_names[a]))) {
                             if (runs[r].missing_glyph || runs[r].truncated || runs[r].left < 7
-                                || runs[r].right > WIDTH - 92)
+                                || runs[r].right > back_left - UI_LEGEND_PAIR_GAP + 2)
                                 fprintf(stderr, "focus hint locale=%s scale=%u key=%s ink=%d..%d missing=%u truncated=%u text=%s\n",
                                     language_code, scale, action_names[a], runs[r].left, runs[r].right,
                                     runs[r].missing_glyph, runs[r].truncated, runs[r].text);
                             CHECK(!runs[r].missing_glyph && !runs[r].truncated
-                                  && runs[r].left >= 7 && runs[r].right <= WIDTH - 92);
+                                  && runs[r].left >= 7
+                                  && runs[r].right <= back_left - UI_LEGEND_PAIR_GAP + 2);
                             named = true;
                         }
                     }

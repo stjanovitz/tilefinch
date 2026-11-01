@@ -704,9 +704,47 @@ static bool test_row_copy_refuses_invalid_or_overlapping_bands(void)
     return true;
 }
 
+static bool test_player_pacing_credit_follows_success_not_format(void)
+{
+    CHECK(fake_reset());
+    PspDisplay display;
+    CHECK(psp_display_begin(&display, &fake_backend));
+    unsigned observed = 0;
+    CHECK(!psp_display_take_pacing_credit(&display, true, &observed));
+    /* Software video uses RGB565; firmware video uses RGBA8888. Both
+       publish through the same successful-vblank fence. */
+    for (unsigned format = 0; format < 2; format++) {
+        if (format != 0) {
+            CHECK(psp_display_video_begin(&display));
+            CHECK(psp_display_take_pacing_credit(&display, true, &observed));
+        }
+        CHECK(psp_display_publish(&display));
+        CHECK(psp_display_take_pacing_credit(&display, true, &observed));
+        CHECK(!psp_display_take_pacing_credit(&display, true, &observed));
+        fake.present_result = -1;
+        CHECK(!psp_display_publish(&display));
+        CHECK(!psp_display_take_pacing_credit(&display, true, &observed));
+        fake.present_result = 0;
+        CHECK(psp_display_publish(&display));
+        CHECK(psp_display_take_pacing_credit(&display, true, &observed));
+        /* A pause/page turn consumes the observation without lending a
+           stale credit to the next resumed player turn. */
+        CHECK(psp_display_publish(&display));
+        CHECK(!psp_display_take_pacing_credit(&display, false, &observed));
+        CHECK(!psp_display_take_pacing_credit(&display, true, &observed));
+    }
+    display.presents = UINT32_MAX;
+    display.rejections = 0;
+    CHECK(!psp_display_take_pacing_credit(&display, false, &observed));
+    CHECK(psp_display_publish(&display));
+    CHECK(psp_display_take_pacing_credit(&display, true, &observed));
+    return true;
+}
+
 int main(void)
 {
-    bool ok = test_row_copy_preserves_pixels_padding_and_display_state()
+    bool ok = test_player_pacing_credit_follows_success_not_format()
+        && test_row_copy_preserves_pixels_padding_and_display_state()
         && test_serviced_publication_keeps_rotation_behind_the_latch()
         && test_row_copy_refuses_invalid_or_overlapping_bands()
         && test_cursor_cadence_excludes_idle_but_not_slow_motion()

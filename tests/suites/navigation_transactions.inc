@@ -855,6 +855,588 @@ static bool test_late_script_oom_frees_queued_frame_messages(void)
         && clean;
 }
 
+/* Iframe setup in a page realm at its JS heap limit. The author script
+   exhausts the realm from inside the frame-setup step itself (an accessor
+   the bootstrap reads there, or the frame's error listener), so the
+   allocator refusal lands in that step whatever the arenas have left. */
+#define FRAME_OOM_EXHAUST_JS \
+    "globalThis.hoard=null;globalThis.exhaust=()=>{let h=null;" \
+    "for(const n of [65536,4096,512,64]){try{for(;;)" \
+    "h={b:new ArrayBuffer(n),n:h}}catch(e){}}" \
+    "try{for(;;)h={n:h}}catch(e){}globalThis.hoard=h};"
+
+static bool frame_oom_layout_has_text(const NavigationSession *navigation,
+                                      const char *needle)
+{
+    size_t needle_length = strlen(needle);
+    for (size_t i = 0; i < navigation->page.layout.count; i++) {
+        const DrawCommand *command = &navigation->page.layout.commands[i];
+        if (command->type == DRAW_TEXT && command->text != NULL
+            && strncmp(command->text, needle, needle_length) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* Every frame record the failed setup touched is retired with nothing still
+   owned: no fetch, realm, document or queued message. */
+static bool frame_oom_records_released(const NavigationSession *navigation)
+{
+    for (size_t i = 0; i < navigation->page.frame_count; i++) {
+        const NavigationFrame *frame = &navigation->page.frames[i];
+        if (!frame->retired || frame->fetch_pending || frame->loaded
+            || frame->runtime != NULL || frame->document.html != NULL)
+            return false;
+    }
+    return navigation->page.message_count == 0u;
+}
+
+/* The page committed, paints, and stopped JavaScript the way every other
+   realm OOM does. */
+static bool frame_oom_page_degraded(const NavigationSession *navigation)
+{
+    return navigation->page.loaded && navigation->page.runtime == NULL
+        && navigation->page.script_memory_limited
+        && strcmp(navigation->page.script_result.summary,
+                  "JavaScript stopped at its memory limit") == 0
+        && frame_oom_layout_has_text(navigation, "Survivor");
+}
+
+static bool frame_oom_session_init(Budget *budget,
+                                   NavigationSession *navigation,
+                                   bool *lexbor_installed)
+{
+    budget_init(budget, 16 * MIB);
+    *lexbor_installed = budget_install_lexbor(budget);
+    if (!*lexbor_installed || !navigation_init(navigation, budget, 4))
+        return false;
+    navigation_enable_scripts(navigation, 3 * MIB, 1000);
+    navigation_enable_document_scripts(navigation, 4, 64 * 1024, 32 * 1024,
+                                       1000);
+    /* Exercises exhaustion itself: keep the configured heap fixed. */
+    navigation_set_fixed_script_memory_limits(navigation, true);
+    return true;
+}
+
+static bool frame_oom_session_clean(Budget *budget,
+                                    NavigationSession *navigation,
+                                    bool ready, bool lexbor_installed)
+{
+    if (ready) navigation_destroy(navigation);
+    bool clean = budget->current == 0
+        && budget_active_allocations(budget, NULL) == 0
+        && budget_categories_reconcile(budget);
+    if (lexbor_installed) clean = budget_uninstall_lexbor(budget) && clean;
+    return clean;
+}
+
+/* A later navigation in the same session starts its iframe normally. */
+static bool frame_oom_next_page_starts_frames(NavigationSession *navigation)
+{
+    static const char next_html[] =
+        "<!doctype html><body><p>Next page</p>"
+        "<iframe src='https://frame-oom-next.test/child.html'></iframe>"
+        "</body>";
+    size_t discovered = navigation->frames_discovered;
+    uint64_t generation = navigation_begin(navigation);
+    bool committed = navigation_commit_html(
+        navigation, generation, "https://frame-oom-next.test/", next_html,
+        sizeof(next_html) - 1u, 480, NULL, NULL, true);
+    /* The unit fetch backend has no frame responses: the frame is set up
+       in the new realm and its fetch then fails as on any test page. */
+    return committed && navigation->page.runtime != NULL
+        && navigation->frames_discovered == discovered + 1u
+        && navigation->page.frame_count == 1u
+        && !navigation->page.frames[0].retired
+        && navigation->page.frames[0].parent_runtime
+               == navigation->page.runtime;
+}
+
+static bool frame_oom_report(const char *name, const NavigationSession *n,
+                             bool committed, bool degraded, bool dropped,
+                             bool idle, bool next)
+{
+    bool ok = committed && degraded && dropped && idle && next;
+    if (!ok) {
+        fprintf(stderr,
+                "%s committed=%d degraded=%d dropped=%d idle=%d next=%d "
+                "runtime=%p frames=%zu discovered=%zu failed=%zu "
+                "summary=\"%s\" error=\"%s\" last=\"%s\"\n",
+                name, committed, degraded, dropped, idle, next,
+                (void *) n->page.runtime, n->page.frame_count,
+                n->frames_discovered, n->frames_failed,
+                n->page.script_result.summary, n->page.script_result.error,
+                n->last_error);
+    }
+    return ok;
+}
+
+static bool test_frame_window_setup_oom_commits_top_document(void)
+{
+    /* The bootstrap reads the iframe's isConnected while it creates the
+       frame's WindowProxy (script_runtime_set_frame_window_state). The
+       accessor exhausts the realm there, once, for the first iframe; the
+       second iframe must not start after the realm is retired. */
+    static const char html[] =
+        "<!doctype html><title>Frame setup OOM</title><body><main>"
+        "<h1>Survivor heading</h1><p>The top document commits and paints "
+        "although its realm ran out of memory creating an iframe window."
+        "</p></main>"
+        "<iframe id=victim src='https://frame-oom.test/a.html'></iframe>"
+        "<iframe id=later src='https://frame-oom.test/b.html'></iframe>"
+        "<script>" FRAME_OOM_EXHAUST_JS
+        "let armed=true;Object.defineProperty(Object.getPrototypeOf("
+        "document.getElementById('victim')),'isConnected',{configurable:true,"
+        "get(){if(armed&&this.id==='victim'){armed=false;exhaust()}"
+        "return true}})"
+        "</script></body>";
+    Budget budget;
+    bool lexbor_installed = false;
+    NavigationSession navigation = {0};
+    bool ready = frame_oom_session_init(&budget, &navigation,
+                                        &lexbor_installed);
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool committed = ready && navigation_commit_html(
+        &navigation, generation, "https://frame-oom.test/", html,
+        sizeof(html) - 1u, 480, NULL, NULL, true);
+    bool degraded = committed && frame_oom_page_degraded(&navigation);
+    bool dropped = committed && navigation.page.frame_count == 1u
+        && navigation.frames_discovered == 1u
+        && navigation.frames_failed == 1u
+        && frame_oom_records_released(&navigation);
+    /* The retired page keeps ticking as a static page. */
+    bool idle = committed && navigation_advance_runtime(&navigation, 16, 4);
+    bool next = degraded && dropped && idle
+        && frame_oom_next_page_starts_frames(&navigation);
+    bool ok = frame_oom_report("frame window OOM", &navigation, committed,
+                               degraded, dropped, idle, next);
+    bool clean = frame_oom_session_clean(&budget, &navigation, ready,
+                                         lexbor_installed);
+    return ok && clean;
+}
+
+static bool test_frame_error_event_oom_commits_top_document(void)
+{
+    /* The unit fetch backend cannot start a frame fetch, so discovery
+       dispatches an error event at the first iframe while setting it up; its
+       listener exhausts the realm. The second iframe must not start after
+       the realm is retired. */
+    static const char html[] =
+        "<!doctype html><title>Frame error OOM</title><body><main>"
+        "<h1>Survivor heading</h1><p>The top document commits and paints "
+        "although a frame error listener ran its realm out of memory."
+        "</p></main>"
+        "<iframe id=victim src='https://frame-oom.test/a.html'></iframe>"
+        "<iframe id=later src='https://frame-oom.test/b.html'></iframe>"
+        "<script>" FRAME_OOM_EXHAUST_JS
+        "document.getElementById('victim').addEventListener('error',"
+        "()=>exhaust())</script></body>";
+    Budget budget;
+    bool lexbor_installed = false;
+    NavigationSession navigation = {0};
+    bool ready = frame_oom_session_init(&budget, &navigation,
+                                        &lexbor_installed);
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool committed = ready && navigation_commit_html(
+        &navigation, generation, "https://frame-oom.test/", html,
+        sizeof(html) - 1u, 480, NULL, NULL, true);
+    bool degraded = committed && frame_oom_page_degraded(&navigation);
+    bool dropped = committed && navigation.page.frame_count == 1u
+        && navigation.frames_discovered == 1u
+        && navigation.frames_failed == 1u
+        && frame_oom_records_released(&navigation);
+    bool idle = committed && navigation_advance_runtime(&navigation, 16, 4);
+    bool next = degraded && dropped && idle
+        && frame_oom_next_page_starts_frames(&navigation);
+    bool ok = frame_oom_report("frame error OOM", &navigation, committed,
+                               degraded, dropped, idle, next);
+    bool clean = frame_oom_session_clean(&budget, &navigation, ready,
+                                         lexbor_installed);
+    return ok && clean;
+}
+
+static bool frame_oom_ignore_message(void *opaque, ScriptRuntime *source,
+                                     long target_frame_handle,
+                                     const char *json,
+                                     const char *target_origin,
+                                     const char *task_kind,
+                                     uint64_t task_sequence)
+{
+    (void) opaque; (void) source; (void) target_frame_handle; (void) json;
+    (void) target_origin; (void) task_kind; (void) task_sequence;
+    return false;
+}
+
+static bool test_frame_messaging_refusal_keeps_page_and_realm(void)
+{
+    /* Configuring a top realm's messaging allocates nothing, so it cannot
+       run out of memory; its one refusal is a realm that already has child
+       frame globals. Force that, then insert an iframe: the runtime turn
+       that discovers it keeps the page and its healthy realm, starts no
+       frame, and the realm keeps running. */
+    static const char html[] =
+        "<!doctype html><title>Frame messaging refusal</title><body><main>"
+        "<h1>Survivor heading</h1><p>Text.</p></main></body>";
+    Budget budget;
+    bool lexbor_installed = false;
+    NavigationSession navigation = {0};
+    bool ready = frame_oom_session_init(&budget, &navigation,
+                                        &lexbor_installed);
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool committed = ready && navigation_commit_html(
+        &navigation, generation, "https://frame-oom.test/", html,
+        sizeof(html) - 1u, 480, NULL, NULL, true);
+    ScriptResult probe = {0};
+    bool forced = committed
+        && script_runtime_configure_messaging(
+            navigation.page.runtime, true, true, false, true,
+            frame_oom_ignore_message, NULL)
+        && !script_runtime_configure_messaging(
+            navigation.page.runtime, false, true, false, true,
+            frame_oom_ignore_message, NULL)
+        && script_runtime_evaluate_diagnostic(
+            navigation.page.runtime,
+            "const f=document.createElement('iframe');"
+            "f.src='https://frame-oom.test/late.html';"
+            "document.body.appendChild(f);",
+            "frame-oom-test", &probe);
+    size_t failed_before = navigation.frames_failed;
+    bool advanced = forced
+        && navigation_advance_runtime(&navigation, 16, 4);
+    bool contained = advanced && navigation.page.loaded
+        && navigation.page.runtime != NULL
+        && navigation.page.frame_count == 0u
+        && navigation.frames_failed == failed_before + 1u
+        && frame_oom_layout_has_text(&navigation, "Survivor");
+    bool alive = contained
+        && script_runtime_evaluate_diagnostic(
+            navigation.page.runtime, "'alive'", "frame-oom-test", &probe)
+        && navigation_advance_runtime(&navigation, 16, 4);
+    bool ok = frame_oom_report("frame messaging refusal", &navigation,
+                               committed, forced && advanced, contained,
+                               alive, true);
+    bool clean = frame_oom_session_clean(&budget, &navigation, ready,
+                                         lexbor_installed);
+    return ok && clean;
+}
+
+/* Frame completion: the runtime pump finishes a discovered frame's fetch
+   and the parent realm records the result (its WindowProxy state, then a
+   load or error event). The page commits with one iframe whose fetch the
+   unit backend refused at discovery; the test completes that same frame
+   with a synthetic response, as the pump would. */
+static bool frame_completion_oom_commit(NavigationSession *navigation,
+                                        const char *html, size_t length,
+                                        const char *arm_js)
+{
+    uint64_t generation = navigation_begin(navigation);
+    ScriptResult probe = {0};
+    return navigation_commit_html(
+               navigation, generation, "https://frame-oom.test/", html,
+               length, 480, NULL, NULL, true)
+        && navigation->page.runtime != NULL
+        && navigation->page.frame_count == 1u
+        && !navigation->page.frames[0].retired
+        && !navigation->page.frames[0].fetch_pending
+        && (arm_js == NULL
+            || script_runtime_evaluate_diagnostic(
+                   navigation->page.runtime, arm_js, "frame-oom-test",
+                   &probe));
+}
+
+static const char frame_completion_child_html[] =
+    "<!doctype html><body><p>Child document</p></body>";
+
+static bool test_frame_completion_window_state_oom_keeps_page(void)
+{
+    /* The parent realm runs out of heap while it records the completed
+       frame: the WindowProxy lookup the bootstrap makes in that step is
+       wrapped to exhaust the realm and then allocate. The pump used to fail
+       the turn ("dynamic frame completion failed"); the frame is dropped and
+       the page continues without JavaScript. */
+    static const char html[] =
+        "<!doctype html><title>Frame completion OOM</title><body><main>"
+        "<h1>Survivor heading</h1><p>The page keeps painting although its "
+        "realm ran out of memory recording a completed iframe.</p></main>"
+        "<iframe id=victim src='https://frame-oom.test/a.html'></iframe>"
+        "<script>" FRAME_OOM_EXHAUST_JS "</script></body>";
+    static const char arm[] =
+        "const frameWindow=globalThis.__tilefinchFrameWindow;"
+        "globalThis.__tilefinchFrameWindow=h=>{exhaust();"
+        "return [frameWindow(h)][0]};";
+    Budget budget;
+    bool lexbor_installed = false;
+    NavigationSession navigation = {0};
+    bool ready = frame_oom_session_init(&budget, &navigation,
+                                        &lexbor_installed);
+    bool committed = ready && frame_completion_oom_commit(
+        &navigation, html, sizeof(html) - 1u, arm);
+    bool completed = committed && navigation_test_complete_frame(
+        &navigation, &navigation.page.frames[0], 200,
+        frame_completion_child_html,
+        sizeof(frame_completion_child_html) - 1u);
+    bool degraded = completed && frame_oom_page_degraded(&navigation);
+    bool dropped = completed && navigation.page.frame_count == 1u
+        && navigation.frames_failed == 2u
+        && navigation.frames_loaded == 0u
+        && frame_oom_records_released(&navigation);
+    bool idle = completed && navigation_advance_runtime(&navigation, 16, 4);
+    bool next = degraded && dropped && idle
+        && frame_oom_next_page_starts_frames(&navigation);
+    bool ok = frame_oom_report("frame completion window OOM", &navigation,
+                               completed, degraded, dropped, idle, next);
+    bool clean = frame_oom_session_clean(&budget, &navigation, ready,
+                                         lexbor_installed);
+    return ok && clean;
+}
+
+static bool test_frame_load_event_oom_retires_realm(void)
+{
+    /* A load listener that runs the top realm out of heap retires it at
+       once, as at discovery; the loaded frame keeps its snapshot. */
+    static const char html[] =
+        "<!doctype html><title>Frame load OOM</title><body><main>"
+        "<h1>Survivor heading</h1><p>The page keeps painting although a "
+        "frame load listener ran its realm out of memory.</p></main>"
+        "<iframe id=victim src='https://frame-oom.test/a.html'></iframe>"
+        "<script>" FRAME_OOM_EXHAUST_JS
+        "document.getElementById('victim').addEventListener('load',"
+        "()=>exhaust())</script></body>";
+    Budget budget;
+    bool lexbor_installed = false;
+    NavigationSession navigation = {0};
+    bool ready = frame_oom_session_init(&budget, &navigation,
+                                        &lexbor_installed);
+    bool committed = ready && frame_completion_oom_commit(
+        &navigation, html, sizeof(html) - 1u, NULL);
+    bool completed = committed && navigation_test_complete_frame(
+        &navigation, &navigation.page.frames[0], 200,
+        frame_completion_child_html,
+        sizeof(frame_completion_child_html) - 1u);
+    const NavigationFrame *frame = &navigation.page.frames[0];
+    bool degraded = completed && frame_oom_page_degraded(&navigation);
+    bool kept = completed && navigation.frames_loaded == 1u
+        && frame->loaded && !frame->retired && frame->runtime == NULL
+        && navigation.page.message_count == 0u;
+    bool idle = completed && navigation_advance_runtime(&navigation, 16, 4);
+    bool next = degraded && kept && idle
+        && frame_oom_next_page_starts_frames(&navigation);
+    bool ok = frame_oom_report("frame load OOM", &navigation, completed,
+                               degraded, kept, idle, next);
+    bool clean = frame_oom_session_clean(&budget, &navigation, ready,
+                                         lexbor_installed);
+    return ok && clean;
+}
+
+static bool test_frame_completion_error_event_oom_retires_realm(void)
+{
+    /* The frame's response fails (404), and the error listener the
+       completion dispatches runs the top realm out of heap. The listener is
+       armed only after commit: discovery already dispatched one error. */
+    static const char html[] =
+        "<!doctype html><title>Frame failure OOM</title><body><main>"
+        "<h1>Survivor heading</h1><p>The page keeps painting although a "
+        "frame error listener ran its realm out of memory.</p></main>"
+        "<iframe id=victim src='https://frame-oom.test/a.html'></iframe>"
+        "<script>" FRAME_OOM_EXHAUST_JS "globalThis.armed=false;"
+        "document.getElementById('victim').addEventListener('error',"
+        "()=>{if(globalThis.armed)exhaust()})</script></body>";
+    Budget budget;
+    bool lexbor_installed = false;
+    NavigationSession navigation = {0};
+    bool ready = frame_oom_session_init(&budget, &navigation,
+                                        &lexbor_installed);
+    bool committed = ready && frame_completion_oom_commit(
+        &navigation, html, sizeof(html) - 1u, "globalThis.armed=true");
+    bool completed = committed && navigation_test_complete_frame(
+        &navigation, &navigation.page.frames[0], 404,
+        frame_completion_child_html,
+        sizeof(frame_completion_child_html) - 1u);
+    bool degraded = completed && frame_oom_page_degraded(&navigation);
+    bool dropped = completed && navigation.frames_failed == 2u
+        && navigation.frames_loaded == 0u
+        && frame_oom_records_released(&navigation);
+    bool idle = completed && navigation_advance_runtime(&navigation, 16, 4);
+    bool next = degraded && dropped && idle
+        && frame_oom_next_page_starts_frames(&navigation);
+    bool ok = frame_oom_report("frame completion error OOM", &navigation,
+                               completed, degraded, dropped, idle, next);
+    bool clean = frame_oom_session_clean(&budget, &navigation, ready,
+                                         lexbor_installed);
+    return ok && clean;
+}
+
+/* A frame event whose relayout memory refuses. The relayout lays the page
+   out again as static and retires every realm, including the parent realm
+   the event was addressed to; the event wrapper then read that freed
+   realm's heap-rejection counter. Error: the listener's own mutation
+   requests the relayout, so the read followed the dispatch. Load: the
+   journal pending when the frame's snapshot is published makes that
+   publication relayout the refused one, so the wrapper got the frame's
+   stale parent pointer before dispatching anything. The budget is clamped
+   at the relayout's first checkpoint, as in the mutation-pressure test; no
+   synthetic fault is used. Fails under the sanitize preset without the
+   liveness check. */
+typedef struct {
+    NavigationSession *navigation;
+    bool armed;
+    bool clamped;
+} FrameRelayoutClamp;
+
+static bool frame_relayout_clamp_checkpoint(void *context, const char *phase,
+                                            size_t work)
+{
+    FrameRelayoutClamp *clamp = context;
+    if (clamp->armed && work == 1u
+        && strcmp(phase, "page-scroll-servable") == 0) {
+        clamp->navigation->budget->limit =
+            clamp->navigation->budget->current;
+        clamp->armed = false;
+        clamp->clamped = true;
+    }
+    return true;
+}
+
+static size_t frame_event_relayout_html(char *html, size_t capacity)
+{
+    size_t length = (size_t) snprintf(html, capacity,
+        "<!doctype html><title>Frame event relayout</title>"
+        "<style>p{margin:0;height:24px}</style><body><main>"
+        "<h1>Survivor heading</h1>");
+    for (size_t i = 0; i < 400; i++) {
+        int n = snprintf(html + length, capacity - length,
+                         "<p>Retained frame-event row %zu</p>", i);
+        if (n < 0 || (size_t) n >= capacity - length) return 0;
+        length += (size_t) n;
+    }
+    int n = snprintf(html + length, capacity - length,
+        "</main><iframe id=victim src='https://frame-oom.test/a.html'>"
+        "</iframe><script>globalThis.armed=false;"
+        "document.getElementById('victim').addEventListener('error',"
+        "()=>{if(globalThis.armed)document.body.style.fontSize='18px'})"
+        "</script></body>");
+    if (n < 0 || (size_t) n >= capacity - length) return 0;
+    return length + (size_t) n;
+}
+
+static bool test_frame_event_static_relayout_case(bool load_event)
+{
+    char html[32768];
+    size_t length = frame_event_relayout_html(html, sizeof(html));
+    if (length == 0) return false;
+    Budget budget;
+    bool lexbor_installed = false;
+    NavigationSession navigation = {0};
+    bool ready = frame_oom_session_init(&budget, &navigation,
+                                        &lexbor_installed);
+    if (ready) navigation.relayout_preview_threshold_us = UINT64_MAX;
+    bool committed = ready && frame_completion_oom_commit(
+        &navigation, html, length, load_event
+            ? "document.body.style.fontSize='18px'"
+            : "globalThis.armed=true");
+    size_t original_limit = budget.limit;
+    FrameRelayoutClamp clamp = { &navigation, true, false };
+    TilefinchPlatformServices services = {
+        .context = &clamp, .cooperate = frame_relayout_clamp_checkpoint };
+    bool completed = false;
+    if (committed) {
+        /* Publish frame snapshots into the page's own image table, as an
+           engine-owned page does (the commit above had no shell images). */
+        navigation.images = &navigation.page.images;
+        layout_reuse_cache_destroy(navigation.page.layout_reuse);
+        navigation.page.layout_reuse = NULL;
+        tilefinch_platform_set_services(&services);
+        completed = navigation_test_complete_frame(
+            &navigation, &navigation.page.frames[0],
+            load_event ? 200 : 404, frame_completion_child_html,
+            sizeof(frame_completion_child_html) - 1u);
+        tilefinch_platform_set_services(NULL);
+    }
+    budget.limit = original_limit;
+    const NavigationFrame *frame = &navigation.page.frames[0];
+    bool degraded = completed && clamp.clamped
+        && frame_oom_page_degraded(&navigation)
+        && navigation.performance.mutation_layout_script_retirements == 1u
+        && navigation.last_error[0] == '\0';
+    bool settled = completed && (load_event
+        ? navigation.frames_loaded == 1u && frame->loaded && !frame->retired
+          && frame->runtime == NULL && frame->presentation != NULL
+          && navigation.page.message_count == 0u
+        : navigation.frames_failed == 2u && navigation.frames_loaded == 0u
+          && frame_oom_records_released(&navigation));
+    bool idle = completed && navigation_advance_runtime(&navigation, 16, 4);
+    bool next = degraded && settled && idle
+        && frame_oom_next_page_starts_frames(&navigation);
+    bool ok = frame_oom_report(load_event ? "frame load static relayout"
+                                          : "frame error static relayout",
+                               &navigation, completed, degraded, settled,
+                               idle, next);
+    if (!ok) fprintf(stderr, "frame-event-relayout clamped=%d "
+                     "retirements=%zu retries=%zu\n", clamp.clamped,
+                     navigation.performance.mutation_layout_script_retirements,
+                     navigation.performance.mutation_layout_pressure_retries);
+    bool clean = frame_oom_session_clean(&budget, &navigation, ready,
+                                         lexbor_installed);
+    return ok && clean;
+}
+
+static bool test_frame_event_static_relayout_keeps_page(void)
+{
+    return test_frame_event_static_relayout_case(false)
+        && test_frame_event_static_relayout_case(true);
+}
+
+/* The same refusal from the history scroll reflection at the start of a
+   runtime turn: its relayout keeps the page as static with every realm
+   stopped. The turn then advanced the absent realm and failed ("JavaScript
+   scheduler tick failed"); it is an idle tick like any other turn of a page
+   whose realm was retired. */
+static bool test_scroll_reflection_static_relayout_keeps_page(void)
+{
+    char html[32768];
+    size_t length = frame_event_relayout_html(html, sizeof(html));
+    if (length == 0) return false;
+    Budget budget;
+    bool lexbor_installed = false;
+    NavigationSession navigation = {0};
+    bool ready = frame_oom_session_init(&budget, &navigation,
+                                        &lexbor_installed);
+    if (ready) navigation.relayout_preview_threshold_us = UINT64_MAX;
+    bool committed = ready && frame_completion_oom_commit(
+        &navigation, html, length, "document.body.style.fontSize='18px'")
+        && navigation_current(&navigation) != NULL;
+    size_t original_limit = budget.limit;
+    FrameRelayoutClamp clamp = { &navigation, true, false };
+    TilefinchPlatformServices services = {
+        .context = &clamp, .cooperate = frame_relayout_clamp_checkpoint };
+    bool advanced = false;
+    if (committed) {
+        layout_reuse_cache_destroy(navigation.page.layout_reuse);
+        navigation.page.layout_reuse = NULL;
+        navigation.committed_scroll_reflection_pending = true;
+        tilefinch_platform_set_services(&services);
+        advanced = navigation_advance_runtime(&navigation, 16, 4);
+        tilefinch_platform_set_services(NULL);
+    }
+    budget.limit = original_limit;
+    bool degraded = advanced && clamp.clamped
+        && frame_oom_page_degraded(&navigation)
+        && navigation.performance.mutation_layout_script_retirements == 1u
+        && navigation.last_error[0] == '\0';
+    bool idle = advanced && navigation_advance_runtime(&navigation, 16, 4);
+    bool next = degraded && idle
+        && frame_oom_next_page_starts_frames(&navigation);
+    bool ok = frame_oom_report("scroll reflection static relayout",
+                               &navigation, committed, degraded, advanced,
+                               idle, next);
+    if (!ok) fprintf(stderr, "scroll-reflection-relayout clamped=%d "
+                     "retirements=%zu\n", clamp.clamped,
+                     navigation.performance.mutation_layout_script_retirements);
+    bool clean = frame_oom_session_clean(&budget, &navigation, ready,
+                                         lexbor_installed);
+    return ok && clean;
+}
+
 static bool test_authored_oom_text_does_not_trigger_static_recovery(void)
 {
     static const char html[] =
@@ -2336,6 +2918,85 @@ static bool test_style_preload_event_promotion(void)
     return ok && clean;
 }
 
+/* The common deferred-stylesheet idiom: a parser-inserted sheet with a
+   non-matching media list whose onload attribute switches it to "all". The
+   sheet is fetched although its media does not match, so its load event
+   must fire and the swapped media must apply its rules. Here the deferred
+   sheet is what makes a late-appended click-through overlay fixed; without
+   it the overlay's button was laid out after the whole (tall) document. The
+   print sheet uses the bare `if(media!='all')media='all'` form, which
+   resolves `media` through the handler's element scope. */
+static bool test_deferred_media_stylesheet_onload_swap(void)
+{
+    static const char html[] =
+        "<!doctype html><style>body{margin:0}#feed{height:4000px}</style>"
+        "<link id=late rel=stylesheet href='/deferred.css' media=none "
+        "onload=\"loads++;this.media='all'\">"
+        "<link id=prn rel=stylesheet href='/print.css' media=print "
+        "onload=\"loads++;if(media!='all')media='all'\">"
+        "<script>globalThis.loads=0;</script>"
+        "<body><a href='/first'>First</a><div id=feed>Feed</div>"
+        "<p id=other>Other</p>"
+        "<div id=gate><div class=card><p>Notice</p>"
+        "<button id=enter>Continue</button></div></div></body>";
+    static const unsigned char css[] =
+        "#gate{position:fixed;top:0;left:0;width:100%;height:100%;"
+        "overflow-y:auto;color:#123456}";
+    static const unsigned char print_css[] = "#other{color:#654321}";
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    BrowserSession browser = {0};
+    NavigationSession navigation = {0};
+    bool browser_ready = installed
+        && browser_session_init(&browser, &budget, 64 * 1024);
+    bool ready = browser_ready && put_stylesheet_cache(
+        &browser, "https://deferred-style.test/document",
+        "https://deferred-style.test/deferred.css", css, sizeof(css) - 1)
+        && put_stylesheet_cache(
+            &browser, "https://deferred-style.test/document",
+            "https://deferred-style.test/print.css", print_css,
+            sizeof(print_css) - 1)
+        && navigation_init(&navigation, &budget, 4);
+    if (ready) {
+        navigation_attach_browser_session(&navigation, &browser);
+        navigation_enable_scripts(&navigation, 4 * MIB, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 4, 32 * 1024, 16 * 1024, 1000);
+        navigation_enable_external_resources(
+            &navigation, 16, 64 * 1024, 16 * 1024,
+            1, 16 * 1024, 16 * 1024, 64 * 1024, 1000);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool ok = ready && navigation_commit_html(
+        &navigation, generation, "https://deferred-style.test/document",
+        html, sizeof(html) - 1, 480, NULL, NULL, true);
+    for (size_t i = 0; ok && i < 8; i++)
+        ok = navigation_advance_runtime(&navigation, 16, 8);
+    ScriptResult result = {0};
+    ok = ok && script_runtime_evaluate_diagnostic(navigation.page.runtime,
+        "const gate=document.getElementById('gate');"
+        "const enter=document.getElementById('enter').getBoundingClientRect();"
+        "pocSummary=loads+':'+document.getElementById('late').media+':'"
+        "+getComputedStyle(gate).position+':'+getComputedStyle(gate).color+':'"
+        "+getComputedStyle(document.getElementById('other')).color+':'"
+        "+(enter.top>=0&&enter.bottom<=innerHeight)",
+        "<deferred-media-result>", &result);
+    bool expected = ok && strcmp(result.summary,
+        "2:all:fixed:rgb(18, 52, 86):rgb(101, 67, 33):true") == 0;
+    if (!expected) fprintf(stderr,
+        "deferred media summary=%s error=%s nav=%s events=%zu\n",
+        result.summary, result.error, navigation.last_error,
+        navigation.performance.stylesheet_event_dispatches);
+    if (ready) navigation_destroy(&navigation);
+    if (browser_ready) browser_session_destroy(&browser);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return expected && clean;
+}
+
 /* One committed page under the given stylesheet admission limits. Every
    response is served from the HTTP cache, so nothing reaches the network. */
 static bool style_preload_lane_case(
@@ -2714,6 +3375,54 @@ static bool test_dynamic_stylesheet_href_base_and_reinsert_lifecycle(void)
         && budget_categories_reconcile(&budget);
     if (lexbor_installed) clean = budget_uninstall_lexbor(&budget) && clean;
     return ok && clean;
+}
+
+/* The staged body of a low-memory replacement (every embed hop) holds the
+   whole document while the page being left is still resident. A 1.14 MiB
+   player page staged past 1 MiB used to double its buffer, asking the page
+   budget for an extra MiB; with less room than that left the request failed
+   and the hop ended as "stream consumer rejected response body". */
+static bool test_staged_body_growth_is_bounded(void)
+{
+    bool ok = navigation_staging_capacity(0, 1, 8u * MIB) == 4096u
+        && navigation_staging_capacity(4096u, 4097u, 8u * MIB) == 8192u
+        && navigation_staging_capacity(8192u, 100u, 8u * MIB) == 8192u
+        && navigation_staging_capacity(128u * 1024u, 200u * 1024u, 8u * MIB)
+               == 256u * 1024u
+        /* Past 256 KiB: a quarter at a time, never a doubling. */
+        && navigation_staging_capacity(MIB, MIB + 1u, 8u * MIB)
+               == MIB + MIB / 4u
+        && navigation_staging_capacity(MIB, 1191575u, 8u * MIB)
+               == MIB + MIB / 4u
+        /* The cap is exact and a request beyond it is refused. */
+        && navigation_staging_capacity(7u * MIB, 7u * MIB + 1u, 8u * MIB)
+               == 8u * MIB
+        && navigation_staging_capacity(MIB, 1191575u, 1191575u) == 1191575u
+        && navigation_staging_capacity(MIB, 8u * MIB + 1u, 8u * MIB) == 0;
+    /* Every step is a valid capacity, so staging N bytes by 16 KiB
+       deliveries never holds more than N + N/4 + 4 KiB. */
+    size_t capacity = 0, peak_step = 0;
+    for (size_t staged = 16u * 1024u; ok && staged <= 1191575u + 16u * 1024u;
+         staged += 16u * 1024u) {
+        size_t next = navigation_staging_capacity(capacity, staged, 8u * MIB);
+        ok = next >= staged && next >= capacity;
+        if (next - capacity > peak_step) peak_step = next - capacity;
+        capacity = next;
+    }
+    ok = ok && peak_step <= 512u * 1024u
+        && capacity <= 1208000u + 1208000u / 4u + 4096u;
+    /* Under a page budget with 512 KiB to spare beyond a 1 MiB staged
+       body, the bounded growth fits where a doubling did not. */
+    Budget budget;
+    budget_init(&budget, MIB + 512u * 1024u + 4096u);
+    unsigned char *staged = budget_malloc(&budget, MIB);
+    size_t grown_to = navigation_staging_capacity(MIB, 1191575u, 8u * MIB);
+    unsigned char *grown = staged == NULL ? NULL
+        : budget_realloc(&budget, staged, grown_to);
+    ok = ok && grown != NULL
+        && budget_realloc(&budget, grown, 2u * MIB) == NULL;
+    budget_free(&budget, grown != NULL ? grown : staged);
+    return ok && budget.current == 0;
 }
 
 static bool test_low_memory_replacement_success(void)

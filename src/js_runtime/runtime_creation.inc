@@ -278,9 +278,14 @@ static BootstrapBytecodeResult runtime_evaluate_bootstrap_bytecode(
     }
 #endif
     uint64_t started = js_rt_monotonic_time_ns();
+    /* PLATFORM_METHODS: the bootstrap's lowerCamelCase `function`s are
+       WebIDL operations and, like native ones, have no `prototype` and are
+       not constructors. (The host-only source fallback compiles them as
+       ordinary functions.) */
     JSValue function = JS_ReadObject(
         runtime->context, bytecode->data, bytecode->bytecode_length,
-        JS_READ_OBJ_BYTECODE | JS_READ_OBJ_ROM_DATA);
+        JS_READ_OBJ_BYTECODE | JS_READ_OBJ_ROM_DATA |
+            JS_READ_OBJ_PLATFORM_METHODS);
     uint64_t deserialized = js_rt_monotonic_time_ns();
     uint64_t restore_us =
         deserialized >= started
@@ -1953,7 +1958,7 @@ static const JsRtNative runtime_natives_first[] = {
     { "__tilefinchCssSupports", js_css_supports, 2, 0 },
     { "__tilefinchFontShorthandValid", js_font_shorthand_valid, 1, 0 },
     { "__tilefinchCompileInlineEventHandler",
-      js_compile_inline_event_handler, 1, 0 },
+      js_compile_inline_event_handler, 4, 0 },
     { "__tilefinchStylesheetHasMotionKeyframes",
       js_stylesheet_has_motion_keyframes, 0, 0 },
     { "__tilefinchWasmAvailable", js_wasm_available, 0, 0 },
@@ -2089,7 +2094,7 @@ static const JsRtNative runtime_natives_second[] = {
     { "__tilefinchCookieGet", js_cookie_get, 0, 0 },
     { "__tilefinchCookieSet", js_cookie_set, 1, 0 },
     { "__tilefinchConsoleLog", js_console_log, 1, 0 },
-    { "__tilefinchResolveURL", js_resolve_url, 2, 0 },
+    { "__tilefinchResolveURL", js_resolve_url, 3, 0 },
     { "__tilefinchDocumentBaseURI", js_document_base_uri, 0, 0 },
     { "__tilefinchCurrentDocumentURL", js_current_document_url, 0, 0 },
     { "__tilefinchSecureContext", js_secure_context, 0, 0 },
@@ -2108,8 +2113,7 @@ static const JsRtNative runtime_natives_third[] = {
     { "__tilefinchDecodeUtf8Valid",
       js_utf8_decode_valid, 2, JS_RT_NATIVE_TRANSIENT },
     { "__tilefinchEncodingName", js_encoding_name, 1, JS_RT_NATIVE_TRANSIENT },
-    { "__tilefinchDecodeSingleByte",
-      js_decode_single_byte, 3, JS_RT_NATIVE_TRANSIENT },
+    { "__tilefinchDecodeBytes", js_decode_bytes, 3, JS_RT_NATIVE_TRANSIENT },
     { "__tilefinchEncodeUtf8", js_utf8_encode, 1, JS_RT_NATIVE_TRANSIENT },
     { "__tilefinchDetachArrayBuffer", js_detach_array_buffer, 1, 0 },
     { "__tilefinchIsProxy", js_is_proxy, 1, 0 },
@@ -2130,6 +2134,7 @@ static const JsRtNative runtime_natives_third[] = {
     { "__tilefinchDateNow", js_date_now, 1, 0 },
     { "__tilefinchPostMessage", js_post_message, 3, 0 },
     { "__tilefinchRequestNavigation", js_request_navigation, 2, 0 },
+    { "__tilefinchNoteNewWindow", js_note_new_window, 1, JS_RT_NATIVE_TRANSIENT },
     { "__tilefinchUserActivationState",
       js_user_activation_state, 0, JS_RT_NATIVE_TRANSIENT },
     { "__tilefinchRequestMedia", js_request_media, 4, 0 },

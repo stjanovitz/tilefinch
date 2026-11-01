@@ -162,6 +162,14 @@ print their wall time: the whole corpus takes about 60 s on an M-series Mac
 probe pass about 70 s and the revisit pass about 30 s. For a branch that
 changes Basic view or script admission, compare the `--probe` passes too.
 
+A page's corpus `meta.json` may carry `"replay_lab_args"`, a list of extra
+lab arguments for that page only. A private canary capture can use
+`--limit-mb 26` to keep a working page near its memory boundary, while its
+ordinary counterpart keeps the PSP's 32 MiB envelope. This makes unnecessary
+retention visible as `InternalError: out of memory` in its `lab.log`.
+Keep site-specific canary targets and comparisons of legacy versus modern
+bundles in the private capture inventory rather than this public manifest.
+
 `compare.py` groups metrics by planned change: A (JavaScript cost: compile,
 execute, pre-paint and non-essential pre-paint time, heap), B (memory: peaks
 by category, decoded images, retained layout), C (Reader and Basic

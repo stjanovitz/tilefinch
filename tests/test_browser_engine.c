@@ -1,6 +1,7 @@
 #include "browser_engine_test_support.h"
 #include "../src/tilefinch_test_faults.h"
 #include "tilefinch/content_blocker.h"
+#include "tilefinch/media_candidates.h"
 #include "tilefinch/platform.h"
 #include "tilefinch/budget_quickjs.h"
 #include "tilefinch/site_adapter.h"
@@ -10,6 +11,7 @@
 #include "tilefinch/youtube_resolver.h"
 #include "tilefinch/psp_ui.h"
 #include "tilefinch/psp_ui_settings.h"
+#include "tilefinch/psp_input_page_media.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -261,20 +263,25 @@ static bool capture_provisional_present(
     return true;
 }
 
+#include "suites/youtube_page_data.inc"
 #include "suites/browser_engine_lifecycle.inc"
 #include "suites/browser_engine_navigation.inc"
 #include "suites/browser_engine_adapters.inc"
 #include "suites/youtube_login_journey.inc"
 #include "suites/youtube_navigation_journey.inc"
+#include "suites/youtube_watch_next.inc"
 #include "suites/browser_engine_teardown.inc"
 
 int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--scroll-noop-only") == 0)
+        return test_scroll_noop_reports_unchanged();
     if (argc == 2 && strcmp(argv[1], "--grid-columns-only") == 0)
         return test_computed_grid_columns();
     if (argc == 2 && strcmp(argv[1], "--basic-recovery-only") == 0) {
         CHECK(test_basic_view_admission_and_presentation() == 0);
         CHECK(test_basic_view_recovery_memory_limited_with_navigation() == 0);
+        CHECK(test_basic_view_recovery_live_realm_oom() == 0);
         CHECK(test_basic_view_recovery_large_and_hidden_pages() == 0);
         return 0;
     }
@@ -285,24 +292,41 @@ int main(int argc, char **argv)
     }
     if (argc == 2 && strcmp(argv[1], "--history-step-only") == 0)
         return test_native_history_step_cancels_idle_work();
+    if (argc == 2 && strcmp(argv[1], "--page-media-only") == 0)
+        return test_page_video_activation()
+            || test_page_video_rendition_candidates()
+            || test_page_video_script_candidates()
+            || test_page_video_data_candidate_activation()
+            || test_page_video_prefers_own_video()
+            || test_page_video_json_renditions()
+            || test_embed_hop_flow()
+            || test_declared_media_card_live_player()
+            || test_page_audio_activation();
     if (argc == 2 && strcmp(argv[1], "--script-limits-only") == 0)
         return test_script_limit_derivation();
     if (argc == 2 && strcmp(argv[1], "--page-queries-only") == 0)
         return test_frontend_page_queries_copy_engine_state();
     if (argc == 2 && strcmp(argv[1], "--empty-document-only") == 0)
         return test_empty_native_document();
+    if (argc == 2 && strcmp(argv[1], "--media-room-only") == 0)
+        return test_media_room_reclaims_page_memory();
     if (argc == 2 && strcmp(argv[1], "--fixed-images-only") == 0)
         return test_fixed_image_publication();
     if (argc == 2 && strcmp(argv[1], "--fixed-image-repaint-only") == 0)
         return test_deferred_image_relayout_requests_repaint();
     if (argc == 2 && strcmp(argv[1], "--deferred-image-events-only") == 0)
         return test_deferred_image_retry_fires_load();
+    if (argc == 2 && strcmp(argv[1], "--youtube-page-data-only") == 0)
+        return test_youtube_page_data_carriers()
+            || test_youtube_page_data_rejects();
     if (argc == 2 && strcmp(argv[1], "--youtube-login-journey") == 0)
         return test_youtube_login_journey() || test_youtube_personalized_home()
             || test_youtube_rating_status_confirmation() || test_youtube_like_action()
             || test_youtube_library_actions() || test_youtube_library_native_action();
     if (argc == 2 && strcmp(argv[1], "--youtube-navigation-journey") == 0)
         return test_youtube_provider_layout_states() || test_youtube_filters_and_chapters();
+    if (argc == 2 && strcmp(argv[1], "--youtube-watch-next-only") == 0)
+        return test_youtube_watch_next_cards() || test_youtube_history_page();
     if ((argc == 4 || argc == 5)
         && (strcmp(argv[1], "--native-navigation-replay") == 0
             || strcmp(argv[1], "--native-navigation-strict-replay") == 0)) {
@@ -441,6 +465,8 @@ int main(int argc, char **argv)
     CHECK(test_sibling_focus_retains_unrelated_matches() == 0);
     CHECK(test_required_rebuild_pressure_keeps_static_document() == 0);
     CHECK(test_empty_native_document() == 0);
+    CHECK(test_media_room_reclaims_page_memory() == 0);
+    CHECK(test_page_network_hold_ownership() == 0);
     CHECK(test_engine_lifecycle() == 0);
     CHECK(profile_staged_font_replay(TILEFINCH_TEST_SOURCE_DIR
         "/tests/fixtures/http-pointer-search", "https://search-journey.test/",
@@ -483,7 +509,13 @@ int main(int argc, char **argv)
     CHECK(test_frontend_page_queries_copy_engine_state() == 0);
     CHECK(test_post_mutation_document_refresh_refusal_retires_shell() == 0);
     CHECK(test_page_video_activation() == 0);
+    CHECK(test_page_video_rendition_candidates() == 0);
+    CHECK(test_page_video_script_candidates() == 0);
     CHECK(test_page_video_data_candidate_activation() == 0);
+    CHECK(test_page_video_prefers_own_video() == 0);
+    CHECK(test_page_video_json_renditions() == 0);
+    CHECK(test_embed_hop_flow() == 0);
+    CHECK(test_declared_media_card_live_player() == 0);
     CHECK(test_page_audio_activation() == 0);
     CHECK(test_structured_audio_preview_activation() == 0);
     CHECK(test_nomodule_capability_suppression() == 0);
@@ -525,6 +557,7 @@ int main(int argc, char **argv)
     CHECK(test_provisional_preview_retries_and_refreshes(true) == 0);
     CHECK(test_provisional_preview_empty_backoff() == 0);
     CHECK(test_large_static_page_commits_provisionally() == 0);
+    CHECK(test_scroll_noop_reports_unchanged() == 0);
     CHECK(test_bounded_focus_frontend_settles() == 0);
     CHECK(test_bounded_focus_pending_mutations_settle() == 0);
     CHECK(test_preview_scrolls_ahead_during_load() == 0);
@@ -545,6 +578,8 @@ int main(int argc, char **argv)
     CHECK(test_youtube_library_native_action() == 0);
     CHECK(test_youtube_provider_layout_states() == 0);
     CHECK(test_youtube_filters_and_chapters() == 0);
+    CHECK(test_youtube_watch_next_cards() == 0);
+    CHECK(test_youtube_history_page() == 0);
     CHECK(test_youtube_like_action() == 0);
     CHECK(test_youtube_missing_initial_data_terminates() == 0);
     CHECK(test_google_search_compatibility_adapter() == 0);
@@ -553,8 +588,10 @@ int main(int argc, char **argv)
     CHECK(test_reader_switch_reuses_page_stylesheet_responses() == 0);
     CHECK(test_blank_reader_frontend_recovery() == 0);
     CHECK(test_declared_media_card_recovery() == 0);
+    CHECK(test_focus_page_media() == 0);
     CHECK(test_basic_view_admission_and_presentation() == 0);
     CHECK(test_basic_view_recovery_memory_limited_with_navigation() == 0);
+    CHECK(test_basic_view_recovery_live_realm_oom() == 0);
     CHECK(test_basic_view_recovery_large_and_hidden_pages() == 0);
     CHECK(test_basic_view_native_root_provenance() == 0);
     CHECK(test_basic_view_handle_capacity_is_transactional() == 0);

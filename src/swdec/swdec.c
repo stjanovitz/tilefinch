@@ -10,12 +10,14 @@
 #include "swdec.h"
 #include "swdec_arena.h"
 #include "swdec_bounds.h"
+#include "swdec_diag.h"
 
 #include <string.h>
 
 #include <libavcodec/avcodec.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/log.h>
+#include "libavcodec/h274.h"
 
 static int au_nal_ref_idc(const uint8_t *au, size_t n);
 
@@ -33,14 +35,7 @@ struct swdec {
 
 size_t swdec_arena_bytes(int max_width, int max_height, int max_refs)
 {
-    /* Sized from measurement (arena_peak on host and device); ffmpeg's h264
-       keeps refs+2 frames in its pool plus per-MB tables and slice context.
-       Generous by design; the harness reports true peak so it can tighten. */
-    size_t w = (size_t) ((max_width + 31) & ~31), h = (size_t) ((max_height + 31) & ~31);
-    size_t pic = (w + 64) * (h + 64) * 3 / 2;
-    size_t pics = pic * (size_t) (max_refs + 4);
-    size_t mbs = ((size_t) max_width / 16 + 1) * ((size_t) max_height / 16 + 1);
-    return pics + mbs * 1024 + 1536 * 1024;
+    return swdec_arena_estimate(max_width, max_height, max_refs);
 }
 
 swdec *swdec_open(void *arena, size_t arena_bytes,
@@ -197,6 +192,9 @@ void swdec_stats_get(const swdec *d, swdec_stats *out)
 void swdec_close(swdec *d)
 {
     if (d == NULL) return;
+    /* film grain synthesis allocates its pattern database in this arena on
+       first use; drop it before the arena goes back to the browser */
+    ff_h274_film_grain_db_free();
     if (d->frame) av_frame_free(&d->frame);
     if (d->pkt) av_packet_free(&d->pkt);
     if (d->ctx) avcodec_free_context(&d->ctx);
@@ -239,7 +237,9 @@ int swdec_audio_decode(swdec_audio *a, const uint8_t *adts, size_t adts_bytes, s
         memcpy(a->pkt->data, adts, adts_bytes);
         rc = avcodec_send_packet(a->ctx, a->pkt);
         av_packet_unref(a->pkt);
-        if (rc < 0 && rc != AVERROR(EAGAIN)) return -3;
+        /* The decoder's own code (AVERROR, below -5) says why; the browser
+           reports it. */
+        if (rc < 0 && rc != AVERROR(EAGAIN)) return rc < -5 ? rc : -3;
     }
     rc = avcodec_receive_frame(a->ctx, a->frame);
     if (rc == 0) {
@@ -256,6 +256,11 @@ int swdec_audio_decode(swdec_audio *a, const uint8_t *adts, size_t adts_bytes, s
     }
     if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) return 0;
     return -4;
+}
+
+void swdec_audio_flush(swdec_audio *a)
+{
+    if (a != NULL && a->ctx != NULL) avcodec_flush_buffers(a->ctx);
 }
 
 void swdec_audio_close(swdec_audio *a)

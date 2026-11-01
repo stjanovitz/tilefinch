@@ -792,6 +792,10 @@ int layout_node_box_effective_clip_radius_code(
     if (layout == NULL || box == NULL) return 0;
     int code = layout_node_box_clip_radius_code(layout, box);
     StyleOverflowClipBox clip_box = layout_node_box_clip_box(box);
+    /* A border-box clip-path radius already describes the path region. */
+    if (box->clip_path_clip && clip_box == STYLE_OVERFLOW_CLIP_BORDER_BOX) {
+        return code;
+    }
     int border_inset_x = (box->width - box->client_width) / 2;
     int border_inset_y = (box->height - box->client_height) / 2;
     if (border_inset_x < 0) border_inset_x = 0;
@@ -2025,6 +2029,7 @@ LayoutBuildStatus layout_build_job_pump(LayoutBuildJob *job)
                 ? job->viewport_height : job->bottom, job->context);
         if (job->context->cancelled) { okay = false; break; }
         job->preview_truncated = job->context->preview_truncated;
+        layout_size_background_visuals(&job->layout);
         tilefinch_platform_trace_step("finish-trace");
         layout_job_trace_finished(job);
         job->layout.performance.finalize_us =
@@ -2389,25 +2394,25 @@ static void *clone_array(Budget *budget, const void *source, size_t count,
     return copy;
 }
 
-void layout_note_unresolved_external_visual(
+ImagePriorityTarget *layout_note_unresolved_external_visual(
     LayoutContext *context, lxb_dom_node_t *node, const char *source,
     uint8_t kind, PseudoElement pseudo)
 {
-    if (context == NULL || context->layout == NULL || node == NULL) return;
+    if (context == NULL || context->layout == NULL || node == NULL)
+        return NULL;
     LayoutDocument *layout = context->layout;
     layout->unresolved_external_visuals = true;
     if (context->preview_y_limit <= 0
-        && !context->record_unresolved_visuals) return;
+        && !context->record_unresolved_visuals) return NULL;
     for (size_t i = 0; i < layout->visual_priority_count; i++) {
-        const ImagePriorityTarget *target =
-            &layout->visual_priority_targets[i];
+        ImagePriorityTarget *target = &layout->visual_priority_targets[i];
         if (target->node == node && target->source == source
             && target->kind == kind
-            && target->pseudo == (uint8_t) pseudo) return;
+            && target->pseudo == (uint8_t) pseudo) return target;
     }
     if (layout->visual_priority_count == LAYOUT_VISUAL_PRIORITY_LIMIT) {
         layout->visual_priority_overflow = true;
-        return;
+        return NULL;
     }
     if (layout->visual_priority_count == layout->visual_priority_capacity) {
         size_t capacity = layout->visual_priority_capacity == 0
@@ -2420,18 +2425,36 @@ void layout_note_unresolved_external_visual(
             capacity * sizeof(*targets));
         if (targets == NULL) {
             layout->visual_priority_overflow = true;
-            return;
+            return NULL;
         }
         layout->visual_priority_targets = targets;
         layout->visual_priority_capacity = capacity;
     }
-    layout->visual_priority_targets[layout->visual_priority_count++] =
-        (ImagePriorityTarget) {
-            .node = node,
-            .source = source,
-            .kind = kind,
-            .pseudo = (uint8_t) pseudo
-        };
+    ImagePriorityTarget *target =
+        &layout->visual_priority_targets[layout->visual_priority_count++];
+    *target = (ImagePriorityTarget) {
+        .node = node,
+        .source = source,
+        .kind = kind,
+        .pseudo = (uint8_t) pseudo
+    };
+    return target;
+}
+
+void layout_size_background_visuals(LayoutDocument *layout)
+{
+    if (layout == NULL) return;
+    for (size_t i = 0; i < layout->visual_priority_count; i++) {
+        ImagePriorityTarget *target = &layout->visual_priority_targets[i];
+        if (!target->background_sized) continue;
+        const LayoutNodeBox *box = layout_box_for_node(layout, target->node);
+        bool known = box != NULL && box->width > 0 && box->height > 0;
+        target->display_width = !known ? 0
+            : (box->width > UINT16_MAX ? UINT16_MAX : (uint16_t) box->width);
+        target->display_height = !known ? 0
+            : (box->height > UINT16_MAX
+               ? UINT16_MAX : (uint16_t) box->height);
+    }
 }
 
 bool layout_clone_visual(LayoutDocument *visual,
@@ -2992,6 +3015,92 @@ const LayoutNodeBox *layout_box_for_node(const LayoutDocument *layout,
     if (layout == NULL || node == NULL) return NULL;
     size_t index = layout_node_box_index(layout, node);
     return index == SIZE_MAX ? NULL : &layout->node_boxes[index];
+}
+
+void layout_lend_image_boxes(const LayoutDocument *layout,
+                             ImageLayoutBoxes *boxes)
+{
+    if (boxes == NULL) return;
+    memset(boxes, 0, sizeof(*boxes));
+    if (layout == NULL || layout->node_box_count == 0
+        || layout->viewport.scale_numerator <= 0
+        || layout->viewport.scale_denominator <= 0) return;
+    boxes->layout = layout;
+    boxes->scale_numerator = layout->viewport.scale_numerator;
+    boxes->scale_denominator = layout->viewport.scale_denominator;
+}
+
+void layout_lend_image_scale(const ViewportContext *viewport,
+                             ImageLayoutBoxes *boxes)
+{
+    if (boxes == NULL) return;
+    memset(boxes, 0, sizeof(*boxes));
+    if (viewport == NULL || viewport->scale_numerator <= 0
+        || viewport->scale_denominator <= 0) return;
+    boxes->scale_numerator = viewport->scale_numerator;
+    boxes->scale_denominator = viewport->scale_denominator;
+}
+
+static int layout_image_box_order(const void *left, const void *right)
+{
+    uintptr_t a = (uintptr_t) ((const LayoutNodeBox *) left)->node;
+    uintptr_t b = (uintptr_t) ((const LayoutNodeBox *) right)->node;
+    return a < b ? -1 : (a > b ? 1 : 0);
+}
+
+void layout_keep_image_boxes(LayoutDocument *layout, ImageLayoutBoxes *boxes)
+{
+    if (layout == NULL || boxes == NULL || boxes->layout != layout) return;
+    boxes->taken = layout->node_boxes;
+    boxes->taken_count = layout->node_box_count;
+    /* Ordered by node, in place, so each background's lookup is a binary
+       search rather than a scan of every box (layout_image_box_size). */
+    if (boxes->taken != NULL && boxes->taken_count > 1)
+        qsort(boxes->taken, boxes->taken_count, sizeof(*boxes->taken),
+              layout_image_box_order);
+    boxes->budget = layout->budget;
+    boxes->layout = NULL;
+    layout->node_boxes = NULL;
+    layout->node_box_count = 0;
+    layout->node_box_capacity = 0;
+}
+
+void layout_release_image_boxes(ImageLayoutBoxes *boxes)
+{
+    if (boxes == NULL) return;
+    if (boxes->taken != NULL) budget_free(boxes->budget, boxes->taken);
+    memset(boxes, 0, sizeof(*boxes));
+}
+
+bool layout_image_box_size(const ImageLayoutBoxes *boxes,
+                           const lxb_dom_node_t *node, int *width,
+                           int *height)
+{
+    if (boxes == NULL || node == NULL) return false;
+    const LayoutNodeBox *box = NULL;
+    if (boxes->layout != NULL) {
+        box = layout_box_for_node(boxes->layout, node);
+    } else {
+        uintptr_t key = (uintptr_t) node;
+        size_t low = 0, high = boxes->taken_count;
+        while (low < high) {
+#ifndef __PSP__
+            tilefinch_test_faults()->layout_image_box_probes++;
+#endif
+            size_t middle = low + (high - low) / 2u;
+            uintptr_t at = (uintptr_t) boxes->taken[middle].node;
+            if (at == key) {
+                box = &boxes->taken[middle];
+                break;
+            }
+            if (at < key) low = middle + 1u;
+            else high = middle;
+        }
+    }
+    if (box == NULL || box->width <= 0 || box->height <= 0) return false;
+    *width = box->width;
+    *height = box->height;
+    return true;
 }
 
 LayoutNodeBox *layout_box_for_node_mutable(

@@ -1868,6 +1868,19 @@ static void document_parser_discard_doomed_script_text(
     }
 }
 
+lxb_dom_node_t *document_parser_open_script(const DocumentParser *parser)
+{
+    if (parser == NULL || !parser->active || parser->failed
+        || parser->tokenizer == NULL
+        || parser->tokenizer->state != document_script_data_state())
+        return NULL;
+    lxb_html_tree_t *tree = parser->original_token_context;
+    lxb_dom_node_t *current = tree == NULL
+        ? NULL : lxb_html_tree_current_node(tree);
+    return current != NULL && current->local_name == LXB_TAG_SCRIPT
+            && current->ns == LXB_NS_HTML ? current : NULL;
+}
+
 /* Return the unused tail of Lexbor's temporary token buffer. Only called
    between input windows, where no tokenizer state function is running: the
    tokenizer then refers to its buffer solely through start/pos/end and
@@ -2575,13 +2588,26 @@ static bool document_static_navigation_duplicate(
     return false;
 }
 
+/* Author children may still be wrapped by a live realm: `replace` (when
+   given) lets its bridge retire or keep them instead of freeing them here. */
+static bool document_replace_author_children(
+    PocDocument *document, lxb_dom_node_t *element,
+    const char *markup, size_t length,
+    DocumentInnerHtmlReplaceCallback replace, void *replace_opaque)
+{
+    return replace != NULL
+        ? replace(replace_opaque, document, element, markup, length)
+        : document_set_element_inner_html(document, element, markup, length);
+}
+
 /* Some server-rendered mobile headers leave an empty hydration placeholder
    while retaining a complete desktop navigation in the same header.  When
    page script was deliberately shed, turn that authored navigation into a
    small disclosure rather than inventing destinations or leaving a dead
    blank.  The scan, output, and number of copied links are all fixed-size. */
 static bool document_install_static_navigation_fallback(
-    PocDocument *document)
+    PocDocument *document, DocumentInnerHtmlReplaceCallback replace,
+    void *replace_opaque)
 {
     if (document == NULL || document->html == NULL) return false;
     lxb_dom_node_t *root = lxb_dom_interface_node(document->html);
@@ -2665,7 +2691,8 @@ static bool document_install_static_navigation_fallback(
         target = placeholder->parent;
     }
     bool changed = valid
-        && document_set_element_inner_html(document, target, markup, used);
+        && document_replace_author_children(
+               document, target, markup, used, replace, replace_opaque);
     budget_free(document->budget, markup);
     return changed;
 }
@@ -2949,7 +2976,9 @@ static bool document_install_recovered_app_header(PocDocument *document)
    otherwise empty shell, parse that bounded fragment exactly as a no-script
    user agent would. This is content-shaped recovery: useful active body text
    always wins, and script-bearing fallback markup is rejected. */
-static bool document_install_static_noscript_fallback(PocDocument *document)
+static bool document_install_static_noscript_fallback(
+    PocDocument *document, DocumentInnerHtmlReplaceCallback replace,
+    void *replace_opaque)
 {
     lxb_dom_node_t *body = document_body_node(document);
     if (body == NULL
@@ -2977,8 +3006,9 @@ static bool document_install_static_noscript_fallback(PocDocument *document)
                 }
             }
             return visible >= 24u && !contains_script
-                && document_set_element_inner_html(document, body,
-                                                   markup, length)
+                && document_replace_author_children(
+                       document, body, markup, length,
+                       replace, replace_opaque)
                 && document_refresh(document);
         }
         node = document_bounded_next(node, body, false);
@@ -2986,9 +3016,12 @@ static bool document_install_static_noscript_fallback(PocDocument *document)
     return false;
 }
 
-bool document_install_static_shell_fallback(PocDocument *document)
+bool document_install_static_shell_fallback(
+    PocDocument *document, DocumentInnerHtmlReplaceCallback replace,
+    void *replace_opaque)
 {
-    if (document_install_static_noscript_fallback(document)) return true;
+    if (document_install_static_noscript_fallback(
+            document, replace, replace_opaque)) return true;
     lxb_dom_node_t *body = document_body_node(document);
     lxb_dom_node_t *target = document_static_shell_target(body);
     size_t description_length = 0;
@@ -2996,7 +3029,8 @@ bool document_install_static_shell_fallback(PocDocument *document)
         document, &description_length);
     if (body == NULL || target == NULL || description == NULL) {
         bool navigation_changed =
-            document_install_static_navigation_fallback(document);
+            document_install_static_navigation_fallback(
+                document, replace, replace_opaque);
         bool app_header_changed = navigation_changed ? false
             : document_install_recovered_app_header(document);
         return (navigation_changed || app_header_changed)
@@ -3041,7 +3075,8 @@ bool document_install_static_shell_fallback(PocDocument *document)
                           "published summary is shown instead.</p></main>");
 #undef APPEND_LITERAL
     bool changed = valid
-        && document_set_element_inner_html(document, target, markup, used)
+        && document_replace_author_children(
+               document, target, markup, used, replace, replace_opaque)
         && document_refresh(document);
     budget_free(document->budget, markup);
     return changed;
@@ -3445,6 +3480,7 @@ void document_destroy(PocDocument *document)
     }
     if (document->budget != NULL) {
         media_declared_video_cache_destroy(document);
+        (void) media_json_responses_release(document);
         document_cssom_sheets_destroy(document);
         document_nonce_registry_destroy(document);
         document_adopted_sheets_destroy(document);

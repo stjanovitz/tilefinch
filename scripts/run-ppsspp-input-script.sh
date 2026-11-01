@@ -16,7 +16,9 @@
 #     --offline-library DIR
 #                       seed an exact offline/ directory into the isolated run
 #     --data-dir DIR    seed profile and site-data files into the run's data
-#                       directory (for example tests/fixtures/ppsspp-site-data)
+#                       directory (for example tests/fixtures/ppsspp-site-data,
+#                       or tests/fixtures/ppsspp-menu-tour-data: screenshots
+#                       only, default profile)
 #     --trace DIR       serve every request from this recorded HTTP trace
 #                       (a --capture-http directory) instead of the network,
 #                       so page loads take the same emulated time every run
@@ -245,8 +247,10 @@ if [ -n "$data_seed" ]; then
         /*) ;;
         *) data_seed="$root/$data_seed" ;;
     esac
-    [ -f "$data_seed/profile.cfg" ] || {
-        printf 'data seed has no profile.cfg: %s\n' "$data_seed" >&2
+    # A seed may hold only data files (menu-tour's screenshots); without a
+    # profile.cfg the run starts from the default profile as usual.
+    [ -d "$data_seed" ] || {
+        printf 'data seed is not a directory: %s\n' "$data_seed" >&2
         exit 2
     }
     # The optional-component stage installs its own profile.cfg.

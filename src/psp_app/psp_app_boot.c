@@ -3,6 +3,7 @@
 #include "psp_app_internal.h"
 #include "psp_app_boot.h"
 #include "psp_app_validation.h"
+#include "tilefinch/psp_swdec_component.h"
 #include "tilefinch/psp_time.h"
 #include "tilefinch_compiler.h"
 
@@ -240,6 +241,30 @@ TILEFINCH_COLD_PATH PspStartupFailure psp_boot_load_config(
         process->config.validation_media_refusal_reset != 0);
     media_psp_backend_set_reset_mode(
         (int) process->config.validation_media_reset_mode);
+    media_psp_swdec_set_audio_scan(
+        process->config.validation_swdec_audio_scan != 0);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    psp_swdec_component_set_validation_flags(
+        (uint32_t) process->config.validation_swdec_reference);
+    media_psp_swdec_set_legacy_audio_clock(
+        (process->config.validation_swdec_reference & 256) != 0);
+    media_psp_swdec_set_legacy_due_wait(
+        (process->config.validation_swdec_reference & 512) != 0);
+    media_psp_swdec_set_fixed_nine_slots(
+        (process->config.validation_swdec_reference & 1024) != 0);
+    media_psp_swdec_set_full_quality(
+        (process->config.validation_playback_ab & 1) != 0);
+    media_psp_swdec_set_keep_high_slots(
+        (process->config.validation_playback_ab & 4) != 0);
+    media_psp_swdec_set_drop_ladder(
+        (process->config.validation_playback_ab & 8) != 0);
+    media_psp_swdec_set_legacy_deadline(
+        (process->config.validation_playback_ab & 16) != 0);
+    psp_vprobe_swdec_mode = (int) process->config.validation_swdec_present;
+    psp_media_present_ge_unsliced(psp_vprobe_swdec_mode == 2);
+    printf("tilefinch-swdec-present: validation mode=%d\n",
+           psp_vprobe_swdec_mode);
+#endif
     printf("tilefinch-psp-script: url=%s trace=%s ticks=%ld limit=%ldMB "
            "heap=%ldMB window=%ldKB profile=%s network-profile=%ld "
            "dump-frame=%ld validation-cancel-ms=%ld "

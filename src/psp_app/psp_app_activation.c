@@ -256,18 +256,17 @@ void psp_app_route_controller_action(
                       &app->browser->media, action->url, entry_url,
                       browser_engine_page_generation(engine),
                       action->media_node_handle, action->media_mode,
-                      action->media_credentials, true, false)
-                : action->media_kind == MEDIA_DISCOVERY_HLS
-                ? psp_media_open_page_hls(
-                      &app->browser->media, action->url, entry_url,
+                      action->media_credentials,
+                      browser_engine_page_content_security_policy(engine),
+                      true, false)
+                : psp_media_open_page_candidates(
+                      &app->browser->media, action->url,
+                      action->media_kind, action->body,
+                      action->body_length, entry_url,
                       browser_engine_page_generation(engine),
                       action->media_node_handle, action->media_mode,
-                      action->media_credentials, true, false)
-                : psp_media_open_page_source(
-                      &app->browser->media, action->url, entry_url,
-                      browser_engine_page_generation(engine),
-                      action->media_node_handle, action->media_mode,
-                      action->media_credentials, true, false));
+                      action->media_credentials,
+                      browser_engine_page_content_security_policy(engine)));
         (void) browser_engine_update_media_state(
             engine, action->media_node_handle,
             opened ? SCRIPT_MEDIA_STATE_LOADING
@@ -335,7 +334,7 @@ void psp_app_route_controller_action(
                 &app->browser->youtube_preresolve);
         }
         if (opened) {
-            (void) browser_engine_cancel_network_work(
+            (void) browser_engine_hold_page_network(
                 engine, "provider video selected");
             /* Reclaim only when the selected decoder cannot fit.
                Even then the loop presents the player before it
@@ -591,6 +590,44 @@ void psp_app_route_controller_action(
         }
         psp_ui_show_status(
             &app->process->presentation.ui, browser_engine_last_error(engine), 300);
+    }
+}
+
+/* The embed hop (browser_engine.h): Play's player-page navigation went
+   through the ordinary route above; while it lasts, the loop polls here
+   once per frame. The first own stream opens as a page video at once;
+   closing that player, nothing playable in time, or a stream that answers
+   it is offline or not available, goes Back. */
+__attribute__((noinline))
+void psp_app_embed_hop_tick(PspApp *app, PspAppFrameState *frame)
+{
+    BrowserEngine *engine = app->browser->engine;
+    ControllerAction action;
+    BrowserEmbedHopStatus status =
+        browser_engine_embed_hop_poll(engine, &action);
+    bool back = false;
+    if (status == BROWSER_EMBED_HOP_READY) {
+        psp_app_route_controller_action(
+            app, frame, app->views->frame, &action);
+    } else if (status == BROWSER_EMBED_HOP_TIMED_OUT) {
+        psp_ui_show_status(&app->process->presentation.ui,
+                           "NO PLAYABLE VIDEO FOUND", 240);
+        back = true;
+    } else if (status == BROWSER_EMBED_HOP_PLAYING
+               && !app->browser->media.ui.visible) {
+        back = browser_engine_embed_hop_take_return(engine);
+    } else if (status == BROWSER_EMBED_HOP_PLAYING
+               && app->browser->media.ui.failed
+               && browser_engine_embed_hop_take_unavailable(
+                      engine, app->browser->media.ui.status)) {
+        psp_media_close(&app->browser->media);
+        psp_ui_show_status(&app->process->presentation.ui,
+                           "STREAM OFFLINE OR NOT AVAILABLE", 240);
+        back = true;
+    }
+    if (back) {
+        PspUiIntent intent = {.action = PSP_UI_ACTION_BACK};
+        psp_app_dispatch_action(app, frame, &intent);
     }
 }
 

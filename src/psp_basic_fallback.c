@@ -55,3 +55,9 @@ bool psp_basic_fallback_navigation_reloadable(long http_status,
     return !internal_url
         && http_status >= 200 && http_status <= 299;
 }
+
+bool psp_basic_fallback_boot_page_examined(bool loaded, bool native_home,
+                                           bool internal_url)
+{
+    return loaded && !native_home && !internal_url;
+}

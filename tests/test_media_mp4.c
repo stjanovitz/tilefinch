@@ -80,6 +80,9 @@ typedef struct {
     bool drain_tail_pending;
     bool queue_once;
     bool hold_submit;
+    bool ready_wait_result;
+    unsigned ready_wait_calls;
+    uint32_t ready_wait_timeout_us;
     size_t presentation_borrows;
     size_t presentation_releases;
     size_t presentation_staged;
@@ -221,6 +224,14 @@ static void backend_destroy(void *opaque)
 {
     BackendFixture *fixture = opaque;
     if (fixture != NULL) fixture->destroyed++;
+}
+
+static bool backend_wait_ready(void *opaque, uint32_t timeout_us)
+{
+    BackendFixture *fixture = opaque;
+    fixture->ready_wait_calls++;
+    fixture->ready_wait_timeout_us = timeout_us;
+    return fixture->ready_wait_result;
 }
 
 static bool http_fixture_range(
@@ -1186,8 +1197,715 @@ static bool device_fixture_audio_seek(const char *path)
     return okay;
 }
 
+/*
+ * Parameter sets of four 640x360 Main 3.0 x264 clips bisected on a PSP-3000
+ * through the firmware decoder, plus two with NAL HRD and colour VUI:
+ *   a  no B-frames, 3 refs                      plays
+ *   b  2 B-frames, no pyramid, 3 refs           plays
+ *   c  3 B-frames, normal pyramid, 4 refs       first access unit refused
+ *   d  2 B-frames, strict pyramid, 3 refs       refused after the opening
+ *   e  as b, with nal-hrd and colour description
+ *   f  as d, with nal-hrd and colour description
+ */
+static const unsigned char reference_sps_a[] = {
+    0x67, 0x4d, 0x40, 0x1e, 0xd9, 0x00, 0xa0, 0x2f, 0xf9, 0x70, 0x11, 0x00,
+    0x00, 0x03, 0x00, 0x01, 0x00, 0x00, 0x03, 0x00, 0x3c, 0x0f, 0x16, 0x2e,
+    0x48
+};
+static const unsigned char reference_sps_b[] = {
+    0x67, 0x4d, 0x40, 0x1e, 0xe8, 0x80, 0x50, 0x17, 0xfc, 0xb8, 0x08, 0x80,
+    0x00, 0x00, 0x03, 0x00, 0x80, 0x00, 0x00, 0x1e, 0x07, 0x8b, 0x16, 0x89
+};
+static const unsigned char reference_sps_c[] = {
+    0x67, 0x4d, 0x40, 0x1e, 0xec, 0xa0, 0x50, 0x17, 0xfc, 0xb8, 0x08, 0x80,
+    0x00, 0x00, 0x03, 0x00, 0x80, 0x00, 0x00, 0x1e, 0x07, 0x8b, 0x16, 0xcb
+};
+static const unsigned char reference_sps_d[] = {
+    0x67, 0x4d, 0x40, 0x1e, 0xec, 0x80, 0x50, 0x17, 0xfc, 0xb8, 0x08, 0x80,
+    0x00, 0x00, 0x03, 0x00, 0x80, 0x00, 0x00, 0x1e, 0x07, 0x8b, 0x16, 0xcb
+};
+static const unsigned char reference_sps_e[] = {
+    0x67, 0x4d, 0x40, 0x1e, 0xe8, 0x80, 0x50, 0x17, 0xfc, 0xb8, 0x0b, 0x50,
+    0x20, 0x20, 0x14, 0x00, 0x00, 0x03, 0x00, 0x04, 0x00, 0x00, 0x03, 0x00,
+    0xf1, 0x81, 0x00, 0x02, 0xab, 0x90, 0x00, 0x2a, 0xb9, 0xa6, 0xc3, 0x00,
+    0x78, 0xb1, 0x68, 0x90
+};
+static const unsigned char reference_sps_f[] = {
+    0x67, 0x4d, 0x40, 0x1e, 0xec, 0x80, 0x50, 0x17, 0xfc, 0xb8, 0x0b, 0x50,
+    0x20, 0x20, 0x14, 0x00, 0x00, 0x03, 0x00, 0x04, 0x00, 0x00, 0x03, 0x00,
+    0xf1, 0x81, 0x00, 0x02, 0xab, 0x90, 0x00, 0x2a, 0xb9, 0xa6, 0xc3, 0x00,
+    0x78, 0xb1, 0x6c, 0xb0
+};
+static const unsigned char reference_pps[] = {0x68, 0xeb, 0xe3, 0xcb, 0x20};
+
+static bool reference_sps_matches(
+    const unsigned char *sps, size_t length, unsigned refs,
+    unsigned reorder, unsigned buffering,
+    MediaH264FirmwareReferences expected)
+{
+    MediaH264SpsReferences parsed;
+    uint16_t width = 0, height = 0;
+    return media_h264_sps_references(sps, length, &parsed)
+        && parsed.max_num_ref_frames == refs
+        && parsed.bitstream_restriction
+        && parsed.max_num_reorder_frames == reorder
+        && parsed.max_dec_frame_buffering == buffering
+        && media_h264_psp_firmware_references(&parsed) == expected
+        && media_h264_sps_dimensions(sps, length, &width, &height)
+        && width == 640u && height == 360u;
+}
+
+static size_t make_reference_avcc(
+    unsigned char *output, const unsigned char *sps, size_t sps_length)
+{
+    size_t at = 0;
+    output[at++] = 1;
+    output[at++] = sps[1];
+    output[at++] = sps[2];
+    output[at++] = sps[3];
+    output[at++] = 0xff;
+    output[at++] = 0xe1;
+    output[at++] = (unsigned char) (sps_length >> 8u);
+    output[at++] = (unsigned char) sps_length;
+    memcpy(output + at, sps, sps_length);
+    at += sps_length;
+    output[at++] = 1;
+    output[at++] = 0;
+    output[at++] = (unsigned char) sizeof(reference_pps);
+    memcpy(output + at, reference_pps, sizeof(reference_pps));
+    return at + sizeof(reference_pps);
+}
+
+static size_t make_reference_annexb(
+    unsigned char *output, const unsigned char *sps, size_t sps_length)
+{
+    static const unsigned char start[] = {0, 0, 0, 1};
+    size_t at = 0;
+    memcpy(output + at, start, sizeof(start));
+    at += sizeof(start);
+    memcpy(output + at, sps, sps_length);
+    at += sps_length;
+    memcpy(output + at, start, sizeof(start));
+    at += sizeof(start);
+    memcpy(output + at, reference_pps, sizeof(reference_pps));
+    return at + sizeof(reference_pps);
+}
+
+/* A Baseline SPS (416x240) declaring `refs` reference frames. */
+static size_t make_refs_sps(unsigned char output[64], uint32_t refs)
+{
+    SpsFixture sps = {0};
+    sps_bits(&sps, 0x67, 8);
+    sps_bits(&sps, 66, 8);
+    sps_bits(&sps, 0, 8);
+    sps_bits(&sps, 30, 8);
+    sps_ue(&sps, 0);
+    sps_ue(&sps, 0);
+    sps_ue(&sps, 0);
+    sps_ue(&sps, 0);
+    sps_ue(&sps, refs);      /* max_num_ref_frames */
+    sps_bits(&sps, 0, 1);
+    sps_ue(&sps, 25);        /* 26 macroblocks wide */
+    sps_ue(&sps, 14);        /* 15 high */
+    sps_bits(&sps, 1, 1);
+    sps_bits(&sps, 1, 1);
+    sps_bits(&sps, 0, 1);
+    sps_bits(&sps, 0, 1);
+    sps_bits(&sps, 1, 1);
+    size_t length = (sps.bit + 7u) / 8u;
+    memcpy(output, sps.bytes, length);
+    return length;
+}
+
+/* A 416x240 SPS with the given profile and coding format. */
+static size_t make_format_sps(unsigned char output[64], uint32_t profile,
+                              uint32_t chroma, uint32_t depth_minus8,
+                              uint32_t frame_only)
+{
+    SpsFixture sps = {0};
+    sps_bits(&sps, 0x67, 8);
+    sps_bits(&sps, profile, 8);
+    sps_bits(&sps, 0, 8);
+    sps_bits(&sps, 30, 8);
+    sps_ue(&sps, 0);
+    if (profile == 100u || profile == 110u || profile == 122u
+        || profile == 244u) {
+        sps_ue(&sps, chroma);
+        if (chroma == 3u) sps_bits(&sps, 0, 1);
+        sps_ue(&sps, depth_minus8);
+        sps_ue(&sps, depth_minus8);
+        sps_bits(&sps, 0, 1);   /* qpprime_y_zero_transform_bypass */
+        sps_bits(&sps, 0, 1);   /* no scaling matrices */
+    }
+    sps_ue(&sps, 0);
+    sps_ue(&sps, 0);
+    sps_ue(&sps, 0);
+    sps_ue(&sps, 3);            /* max_num_ref_frames */
+    sps_bits(&sps, 0, 1);
+    sps_ue(&sps, 25);
+    sps_ue(&sps, frame_only ? 14 : 6);
+    sps_bits(&sps, frame_only, 1);
+    if (!frame_only) sps_bits(&sps, 0, 1);   /* mb_adaptive_frame_field */
+    sps_bits(&sps, 1, 1);
+    sps_bits(&sps, 0, 1);
+    sps_bits(&sps, 0, 1);
+    sps_bits(&sps, 1, 1);
+    size_t length = (sps.bit + 7u) / 8u;
+    memcpy(output, sps.bytes, length);
+    return length;
+}
+
+static int test_sps_held_frames(void)
+{
+    puts("test: the software decoder's arena depth comes from the SPS");
+    unsigned char sps[64];
+    unsigned char config[128];
+    unsigned frames = 99;
+    size_t sps_length = make_refs_sps(sps, 5u);
+    size_t length = make_reference_avcc(config, sps, sps_length);
+    CHECK(media_h264_config_sps_frames(config, length, false, &frames)
+              == MEDIA_H264_SPS_FRAMES_KNOWN
+          && frames == 5u);
+    sps_length = make_refs_sps(sps, 16u);
+    length = make_reference_annexb(config, sps, sps_length);
+    CHECK(media_h264_config_sps_frames(config, length, true, &frames)
+              == MEDIA_H264_SPS_FRAMES_KNOWN
+          && frames == 16u);
+    /* max_dec_frame_buffering above the reference count wins. */
+    length = make_reference_avcc(
+        config, reference_sps_d, sizeof(reference_sps_d));
+    CHECK(media_h264_config_sps_frames(config, length, false, &frames)
+              == MEDIA_H264_SPS_FRAMES_KNOWN
+          && frames == 4u);
+    /* An SPS this parser cannot follow leaves the depth unknown. */
+    length = make_reference_avcc(
+        config, reference_sps_c, sizeof(reference_sps_c) - 3u);
+    CHECK(media_h264_config_sps_frames(config, length, false, &frames)
+          == MEDIA_H264_SPS_FRAMES_UNREADABLE);
+    CHECK(media_h264_config_sps_frames(NULL, 0, false, &frames)
+              == MEDIA_H264_SPS_FRAMES_ABSENT
+          && frames == 0u);
+
+    /* In-band: a length-prefixed IDR access unit carrying a new SPS, an
+       Annex-B one, and one with no SPS at all. */
+    unsigned char sample[128];
+    sps_length = make_refs_sps(sps, 7u);
+    size_t at = 0;
+    sample[at++] = 0; sample[at++] = 0; sample[at++] = 0;
+    sample[at++] = (unsigned char) sps_length;
+    memcpy(sample + at, sps, sps_length);
+    at += sps_length;
+    static const unsigned char idr[] = {0x65, 0x88, 0x84, 0x00};
+    sample[at++] = 0; sample[at++] = 0; sample[at++] = 0;
+    sample[at++] = (unsigned char) sizeof(idr);
+    memcpy(sample + at, idr, sizeof(idr));
+    at += sizeof(idr);
+    CHECK(media_h264_sample_sps_frames(sample, at, 4u, &frames)
+              == MEDIA_H264_SPS_FRAMES_KNOWN
+          && frames == 7u);
+    length = make_reference_annexb(config, sps, sps_length);
+    CHECK(media_h264_sample_sps_frames(config, length, 0u, &frames)
+              == MEDIA_H264_SPS_FRAMES_KNOWN
+          && frames == 7u);
+    static const unsigned char annexb_idr[] = {0, 0, 0, 1, 0x65, 0x88, 0x84};
+    CHECK(media_h264_sample_sps_frames(
+              annexb_idr, sizeof(annexb_idr), 0u, &frames)
+              == MEDIA_H264_SPS_FRAMES_ABSENT
+          && frames == 0u);
+    /* A length that runs past the sample stops the walk. */
+    sample[3] = 0x7f;
+    CHECK(media_h264_sample_sps_frames(sample, at, 4u, &frames)
+          == MEDIA_H264_SPS_FRAMES_ABSENT);
+
+    puts("test: the software decoder is offered CABAC streams only");
+    /* reference_pps is CABAC (entropy_coding_mode_flag 1); the Baseline
+       PPS (68 ce 3c 80) is CAVLC. */
+    length = make_reference_avcc(
+        config, reference_sps_b, sizeof(reference_sps_b));
+    CHECK(media_h264_config_entropy(config, length, false)
+          == MEDIA_H264_ENTROPY_CABAC);
+    length = make_reference_annexb(
+        config, reference_sps_b, sizeof(reference_sps_b));
+    CHECK(media_h264_config_entropy(config, length, true)
+          == MEDIA_H264_ENTROPY_CABAC);
+    static const unsigned char cavlc_pps[] = {0x68, 0xce, 0x3c, 0x80};
+    static const unsigned char start[] = {0, 0, 0, 1};
+    sps_length = make_refs_sps(sps, 5u);
+    at = 0;
+    memcpy(config + at, start, 4); at += 4;
+    memcpy(config + at, sps, sps_length); at += sps_length;
+    memcpy(config + at, start, 4); at += 4;
+    memcpy(config + at, cavlc_pps, sizeof(cavlc_pps)); at += sizeof(cavlc_pps);
+    CHECK(media_h264_config_entropy(config, at, true)
+          == MEDIA_H264_ENTROPY_CAVLC);
+    at = 0;
+    config[at++] = 1; config[at++] = sps[1]; config[at++] = sps[2];
+    config[at++] = sps[3]; config[at++] = 0xff; config[at++] = 0xe1;
+    config[at++] = 0; config[at++] = (unsigned char) sps_length;
+    memcpy(config + at, sps, sps_length); at += sps_length;
+    config[at++] = 1; config[at++] = 0;
+    config[at++] = (unsigned char) sizeof(cavlc_pps);
+    memcpy(config + at, cavlc_pps, sizeof(cavlc_pps)); at += sizeof(cavlc_pps);
+    CHECK(media_h264_config_entropy(config, at, false)
+          == MEDIA_H264_ENTROPY_CAVLC);
+    puts("test: the software decoder takes progressive 8-bit 4:2:0 only");
+    {
+        static const struct {
+            uint32_t profile, chroma, depth, frame_only;
+            MediaH264SoftwareCoding want;
+        } cases[] = {
+            {66u, 1u, 0u, 1u, MEDIA_H264_SOFTWARE_CODING_SUPPORTED},
+            {100u, 1u, 0u, 1u, MEDIA_H264_SOFTWARE_CODING_SUPPORTED},
+            {66u, 1u, 0u, 0u, MEDIA_H264_SOFTWARE_CODING_UNSUPPORTED},
+            {100u, 1u, 0u, 0u, MEDIA_H264_SOFTWARE_CODING_UNSUPPORTED},
+            {122u, 2u, 0u, 1u, MEDIA_H264_SOFTWARE_CODING_UNSUPPORTED},
+            {110u, 1u, 2u, 1u, MEDIA_H264_SOFTWARE_CODING_UNSUPPORTED},
+            {244u, 3u, 0u, 1u, MEDIA_H264_SOFTWARE_CODING_UNSUPPORTED},
+        };
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            unsigned char format_sps[64];
+            size_t format_length = make_format_sps(
+                format_sps, cases[i].profile, cases[i].chroma,
+                cases[i].depth, cases[i].frame_only);
+            length = make_reference_avcc(config, format_sps, format_length);
+            CHECK(media_h264_config_software_coding(config, length, false)
+                  == cases[i].want);
+            length = make_reference_annexb(
+                config, format_sps, format_length);
+            CHECK(media_h264_config_software_coding(config, length, true)
+                  == cases[i].want);
+        }
+        CHECK(media_h264_config_software_coding(NULL, 0, true)
+              == MEDIA_H264_SOFTWARE_CODING_UNKNOWN);
+    }
+    puts("test: reorder-free streams let colour conversion start early");
+    length = make_reference_avcc(
+        config, reference_sps_a, sizeof(reference_sps_a));   /* reorder 0 */
+    CHECK(media_h264_config_reorder_free(config, length, false));
+    length = make_reference_annexb(
+        config, reference_sps_a, sizeof(reference_sps_a));
+    CHECK(media_h264_config_reorder_free(config, length, true));
+    length = make_reference_avcc(
+        config, reference_sps_b, sizeof(reference_sps_b));   /* reorder 1 */
+    CHECK(!media_h264_config_reorder_free(config, length, false));
+    sps_length = make_refs_sps(sps, 5u);                    /* Baseline */
+    length = make_reference_avcc(config, sps, sps_length);
+    CHECK(media_h264_config_reorder_free(config, length, false));
+    {
+        unsigned char main_sps[64];
+        size_t main_length = make_format_sps(main_sps, 77u, 1u, 0u, 1u);
+        length = make_reference_avcc(config, main_sps, main_length);
+        /* Main without a VUI may reorder. */
+        CHECK(!media_h264_config_reorder_free(config, length, false));
+    }
+    CHECK(!media_h264_config_reorder_free(NULL, 0, true));
+    /* No parameter sets: unknown, and the decoder is still tried. */
+    CHECK(media_h264_config_entropy(config, 7u, false)
+              == MEDIA_H264_ENTROPY_UNKNOWN
+          && media_h264_config_entropy(NULL, 0, true)
+              == MEDIA_H264_ENTROPY_UNKNOWN);
+    return 0;
+}
+
+static int test_firmware_reference_structure(void)
+{
+    puts("test: SPS reference structure separates the firmware's B-pyramid "
+         "refusals");
+    CHECK(reference_sps_matches(
+        reference_sps_a, sizeof(reference_sps_a), 3u, 0u, 3u,
+        MEDIA_H264_FIRMWARE_REFERENCES_SUPPORTED));
+    CHECK(reference_sps_matches(
+        reference_sps_b, sizeof(reference_sps_b), 3u, 1u, 3u,
+        MEDIA_H264_FIRMWARE_REFERENCES_SUPPORTED));
+    CHECK(reference_sps_matches(
+        reference_sps_c, sizeof(reference_sps_c), 4u, 2u, 4u,
+        MEDIA_H264_FIRMWARE_REFERENCES_PYRAMID));
+    CHECK(reference_sps_matches(
+        reference_sps_d, sizeof(reference_sps_d), 3u, 2u, 4u,
+        MEDIA_H264_FIRMWARE_REFERENCES_PYRAMID));
+    CHECK(reference_sps_matches(
+        reference_sps_e, sizeof(reference_sps_e), 3u, 1u, 3u,
+        MEDIA_H264_FIRMWARE_REFERENCES_SUPPORTED));
+    CHECK(reference_sps_matches(
+        reference_sps_f, sizeof(reference_sps_f), 3u, 2u, 4u,
+        MEDIA_H264_FIRMWARE_REFERENCES_PYRAMID));
+
+    /* Only page media is refused on a declared pyramid before firmware has
+       seen it; provider and offline streams treat it as a routing hint.
+       Too many references is refused everywhere. */
+    CHECK(media_h264_firmware_references_conclusive(
+        MEDIA_H264_FIRMWARE_REFERENCES_PYRAMID, true));
+    CHECK(!media_h264_firmware_references_conclusive(
+        MEDIA_H264_FIRMWARE_REFERENCES_PYRAMID, false));
+    CHECK(media_h264_firmware_references_conclusive(
+        MEDIA_H264_FIRMWARE_REFERENCES_TOO_MANY, false)
+          && media_h264_firmware_references_conclusive(
+              MEDIA_H264_FIRMWARE_REFERENCES_TOO_MANY, true));
+    CHECK(!media_h264_firmware_references_conclusive(
+        MEDIA_H264_FIRMWARE_REFERENCES_SUPPORTED, true));
+
+    /* Without bitstream_restriction only the reference count is known. */
+    MediaH264SpsReferences bare = {.max_num_ref_frames = 3u};
+    CHECK(media_h264_psp_firmware_references(&bare)
+          == MEDIA_H264_FIRMWARE_REFERENCES_SUPPORTED);
+    bare.max_num_ref_frames = 4u;
+    CHECK(media_h264_psp_firmware_references(&bare)
+          == MEDIA_H264_FIRMWARE_REFERENCES_TOO_MANY);
+    unsigned char no_vui[64] = {0};
+    size_t no_vui_length = make_baseline_sps(no_vui, 29u, 16u);
+    MediaH264SpsReferences parsed;
+    CHECK(media_h264_sps_references(no_vui, no_vui_length, &parsed)
+          && parsed.max_num_ref_frames == 1u
+          && !parsed.bitstream_restriction
+          && media_h264_psp_firmware_references(&parsed)
+              == MEDIA_H264_FIRMWARE_REFERENCES_SUPPORTED);
+
+    /* A VUI cut short is unreadable, not a verdict: firmware stays the
+       judge, and geometry is still admitted from the fields before it. */
+    uint16_t width = 0, height = 0;
+    CHECK(!media_h264_sps_references(
+              reference_sps_c, sizeof(reference_sps_c) - 3u, &parsed)
+          && parsed.max_num_ref_frames == 0u
+          && media_h264_sps_dimensions(
+              reference_sps_c, sizeof(reference_sps_c) - 3u,
+              &width, &height)
+          && width == 640u && height == 360u);
+
+    unsigned char config[96];
+    size_t length = make_reference_avcc(
+        config, reference_sps_b, sizeof(reference_sps_b));
+    CHECK(media_h264_avcc_firmware_references(config, length)
+          == MEDIA_H264_FIRMWARE_REFERENCES_SUPPORTED);
+    length = make_reference_avcc(
+        config, reference_sps_c, sizeof(reference_sps_c));
+    CHECK(media_h264_avcc_firmware_references(config, length)
+          == MEDIA_H264_FIRMWARE_REFERENCES_PYRAMID);
+    CHECK(media_h264_avcc_firmware_references(config, 7u)
+          == MEDIA_H264_FIRMWARE_REFERENCES_SUPPORTED);
+    /* The firmware level range, read from the first SPS: up to Level 3.0
+       is admitted; above it the open path routes to the software decoder
+       or the next rendition. Unreadable configs are judged elsewhere. */
+    {
+        unsigned char level_sps[sizeof(reference_sps_b)];
+        memcpy(level_sps, reference_sps_b, sizeof(level_sps));
+        unsigned char level_config[96];
+        static const unsigned char levels[] = {9, 13, 30, 31, 40};
+        for (size_t i = 0; i < sizeof(levels); i++) {
+            level_sps[3] = levels[i];
+            bool admitted = levels[i] <= 30u;
+            size_t level_length = make_reference_avcc(
+                level_config, level_sps, sizeof(level_sps));
+            CHECK(media_h264_avcc_firmware_level_supported(
+                      level_config, level_length) == admitted);
+            level_length = make_reference_annexb(
+                level_config, level_sps, sizeof(level_sps));
+            CHECK(media_h264_annexb_firmware_level_supported(
+                      level_config, level_length) == admitted);
+        }
+        CHECK(media_h264_avcc_firmware_level_supported(NULL, 0)
+              && media_h264_annexb_firmware_level_supported(NULL, 0));
+    }
+    length = make_reference_annexb(
+        config, reference_sps_d, sizeof(reference_sps_d));
+    CHECK(media_h264_annexb_firmware_references(config, length)
+          == MEDIA_H264_FIRMWARE_REFERENCES_PYRAMID);
+    length = make_reference_annexb(
+        config, reference_sps_a, sizeof(reference_sps_a));
+    CHECK(media_h264_annexb_firmware_references(config, length)
+          == MEDIA_H264_FIRMWARE_REFERENCES_SUPPORTED);
+
+    CHECK(media_h264_firmware_references_refusal(
+              MEDIA_H264_FIRMWARE_REFERENCES_SUPPORTED) == NULL
+          && strcmp(media_h264_firmware_references_refusal(
+                        MEDIA_H264_FIRMWARE_REFERENCES_PYRAMID),
+                    "unsupported H.264 stream (B-frame pyramid)") == 0
+          && media_h264_firmware_references_refusal(
+                 MEDIA_H264_FIRMWARE_REFERENCES_TOO_MANY) != NULL);
+    return 0;
+}
+
+/*
+ * A progressive MP4 merges its tracks by decode time, so it cannot hide AAC
+ * behind later video the way a muxed TS can. It still strands the clock: a
+ * video unit the decoder refuses (no free picture surface) stops the merge,
+ * and the DAC drains to that unit's time and stops while the picture it is
+ * waiting for is due later. The same muxed audio lane must keep AAC supplied
+ * up to the decode horizon -- in order, once each -- without reaching for
+ * bytes, and hand the head back when the decoder takes video again.
+ */
+typedef struct {
+    bool hold_video;
+    unsigned video_accepted;
+    unsigned video_refused;
+    unsigned audio_accepted;
+    bool audio_out_of_order;
+    uint64_t last_audio_ticks;
+    uint64_t audio_end_us;
+} HeldVideoBackend;
+
+static MediaBackendResult held_video_submit(
+    void *opaque, const MediaMp4Sample *sample,
+    const unsigned char *bytes, size_t length,
+    char *error, size_t error_size)
+{
+    (void) bytes; (void) error; (void) error_size;
+    HeldVideoBackend *backend = opaque;
+    if (length != sample->size) return MEDIA_BACKEND_ERROR;
+    if (sample->kind == MEDIA_MP4_TRACK_VIDEO) {
+        if (backend->hold_video) {
+            backend->video_refused++;
+            return MEDIA_BACKEND_WOULD_BLOCK;
+        }
+        backend->video_accepted++;
+        return MEDIA_BACKEND_ACCEPTED;
+    }
+    if (backend->audio_accepted != 0
+        && sample->dts <= backend->last_audio_ticks)
+        backend->audio_out_of_order = true;
+    backend->last_audio_ticks = sample->dts;
+    backend->audio_end_us = media_ticks_to_us(
+        sample->dts + sample->duration, sample->timescale);
+    backend->audio_accepted++;
+    return MEDIA_BACKEND_ACCEPTED;
+}
+
+static bool held_video_advance(void *opaque, uint64_t clock_us,
+                               char *error, size_t error_size)
+{
+    (void) opaque; (void) clock_us; (void) error; (void) error_size;
+    return true;
+}
+
+static MediaBackendResult held_video_drain(
+    void *opaque, char *error, size_t error_size)
+{
+    (void) opaque; (void) error; (void) error_size;
+    return MEDIA_BACKEND_END;
+}
+
+static void held_video_destroy(void *opaque) { (void) opaque; }
+
+static bool held_video_allow_bypass(const void *opaque, int kind)
+{
+    const HeldVideoBackend *backend = opaque;
+    return kind == MEDIA_MP4_TRACK_VIDEO && backend->hold_video;
+}
+
+static int test_progressive_held_video_keeps_audio_supplied(const char *path)
+{
+    puts("test: a held progressive video head keeps AAC supplied");
+    FILE *file = fopen(path, "rb");
+    CHECK(file != NULL && fseek(file, 0, SEEK_END) == 0);
+    long end = ftell(file);
+    CHECK(end > 0 && end <= 512 * 1024 && fseek(file, 0, SEEK_SET) == 0);
+    unsigned char *bytes = malloc((size_t) end);
+    CHECK(bytes != NULL
+          && fread(bytes, 1, (size_t) end, file) == (size_t) end);
+    CHECK(fclose(file) == 0);
+    Budget budget;
+    budget_init(&budget, 4 * 1024 * 1024);
+    FixtureReader fixture_reader = {.bytes = bytes, .length = (size_t) end};
+    MediaRangeReader reader = {
+        .opaque = &fixture_reader, .length = (size_t) end,
+        .read = fixture_read, .poll = fixture_poll,
+        .resident = fixture_resident
+    };
+    char error[256] = {0};
+    MediaMp4Demux *demux = media_mp4_open(
+        &budget, &reader, NULL, error, sizeof(error));
+    CHECK(demux != NULL);
+    uint32_t video_samples = 0, audio_samples = 0;
+    for (size_t at = 0; at < media_mp4_track_count(demux); at++) {
+        MediaMp4TrackInfo info;
+        CHECK(media_mp4_track_info(demux, at, &info));
+        if (info.kind == MEDIA_MP4_TRACK_VIDEO)
+            video_samples = info.sample_count;
+        if (info.kind == MEDIA_MP4_TRACK_AUDIO)
+            audio_samples = info.sample_count;
+    }
+    CHECK(video_samples > 2u && audio_samples > 8u);
+    HeldVideoBackend fixture = {0};
+    MediaBackend backend = {
+        .opaque = &fixture,
+        .submit = held_video_submit,
+        .drain = held_video_drain,
+        .advance = held_video_advance,
+        .destroy = held_video_destroy,
+        .allow_submit_bypass = held_video_allow_bypass
+    };
+    MediaPlaybackOptions options = {.decode_lead_us = 250000u};
+    MediaPlayback *playback = media_playback_create(
+        &budget, demux, &backend, &options, error, sizeof(error));
+    CHECK(playback != NULL);
+    /* Let the first picture through, then hold every later video unit. */
+    CHECK(media_playback_advance_bounded(
+              playback, 0, 1u, error, sizeof(error))
+          != MEDIA_PLAYBACK_ADVANCE_ERROR);
+    while (fixture.video_accepted == 0u && fixture.audio_accepted < 64u)
+        CHECK(media_playback_advance_bounded(
+                  playback, fixture.audio_end_us, 1u, error, sizeof(error))
+              != MEDIA_PLAYBACK_ADVANCE_ERROR);
+    CHECK(fixture.video_accepted == 1u);
+    fixture.hold_video = true;
+    /* The clock is what the DAC was given; the horizon rides on it. */
+    for (unsigned visit = 0; visit < 64u; visit++)
+        CHECK(media_playback_advance_bounded(
+                  playback, fixture.audio_end_us, 4u, error, sizeof(error))
+              != MEDIA_PLAYBACK_ADVANCE_ERROR);
+    CHECK(fixture.video_refused != 0u && fixture.video_accepted == 1u);
+    /* Audio ran on past the refused unit, the whole way to the end. */
+    CHECK(fixture.audio_accepted == audio_samples
+          && !fixture.audio_out_of_order);
+    fixture.hold_video = false;
+    for (unsigned visit = 0;
+         visit < 256u && !media_playback_ended(playback); visit++)
+        CHECK(media_playback_advance_bounded(
+                  playback, UINT64_MAX / 2u, 4u, error, sizeof(error))
+              != MEDIA_PLAYBACK_ADVANCE_ERROR);
+    CHECK(media_playback_ended(playback)
+          && fixture.video_accepted == video_samples
+          && fixture.audio_accepted == audio_samples
+          && !fixture.audio_out_of_order);
+    media_playback_destroy(playback);
+    media_mp4_close(demux);
+    CHECK(budget.current == 0);
+    free(bytes);
+    return 0;
+}
+
+/*
+ * The MP4 lane under a range source that will not serve the bytes. Unbuffered
+ * AAC must not be reached for at all (the lane never polls), and a resident
+ * claim the read then refuses must leave that unit in the demuxer, untaken,
+ * with no error and the head's would-block record untouched, so it is
+ * offered again and played once when the read succeeds.
+ */
+static int test_progressive_lane_refused_range_read(const char *path)
+{
+    puts("test: the MP4 lane survives a refused range read");
+    FILE *file = fopen(path, "rb");
+    CHECK(file != NULL && fseek(file, 0, SEEK_END) == 0);
+    long end = ftell(file);
+    CHECK(end > 0 && end <= 512 * 1024 && fseek(file, 0, SEEK_SET) == 0);
+    unsigned char *bytes = malloc((size_t) end);
+    CHECK(bytes != NULL
+          && fread(bytes, 1, (size_t) end, file) == (size_t) end);
+    CHECK(fclose(file) == 0);
+    Budget budget;
+    budget_init(&budget, 4 * 1024 * 1024);
+    char error[256] = {0};
+    /* Where the 20th AAC frame lives. */
+    FixtureReader probe_reader = {.bytes = bytes, .length = (size_t) end};
+    MediaRangeReader probe_source = {
+        .opaque = &probe_reader, .length = (size_t) end, .read = fixture_read
+    };
+    MediaMp4Demux *probe = media_mp4_open(
+        &budget, &probe_source, NULL, error, sizeof(error));
+    CHECK(probe != NULL);
+    const unsigned refused_index = 20u;
+    uint64_t refused_offset = 0;
+    unsigned video_samples = 0, audio_samples = 0;
+    MediaMp4Sample sample;
+    while (media_mp4_next_sample(probe, &sample)) {
+        if (sample.kind == MEDIA_MP4_TRACK_AUDIO) {
+            if (audio_samples == refused_index) refused_offset = sample.offset;
+            audio_samples++;
+        } else {
+            video_samples++;
+        }
+    }
+    media_mp4_close(probe);
+    CHECK(refused_offset != 0 && audio_samples > refused_index + 4u);
+
+    FixtureReader fixture_reader = {.bytes = bytes, .length = (size_t) end};
+    MediaRangeReader reader = {
+        .opaque = &fixture_reader, .length = (size_t) end,
+        .read = fixture_read, .poll = fixture_poll,
+        .resident = fixture_resident
+    };
+    MediaMp4Demux *demux = media_mp4_open(
+        &budget, &reader, NULL, error, sizeof(error));
+    CHECK(demux != NULL);
+    HeldVideoBackend fixture = {0};
+    MediaBackend backend = {
+        .opaque = &fixture,
+        .submit = held_video_submit,
+        .drain = held_video_drain,
+        .advance = held_video_advance,
+        .destroy = held_video_destroy,
+        .allow_submit_bypass = held_video_allow_bypass
+    };
+    MediaPlaybackOptions options = {.decode_lead_us = 250000u};
+    MediaPlayback *playback = media_playback_create(
+        &budget, demux, &backend, &options, error, sizeof(error));
+    CHECK(playback != NULL);
+    while (fixture.video_accepted == 0u && fixture.audio_accepted < 64u)
+        CHECK(media_playback_advance_bounded(
+                  playback, fixture.audio_end_us, 1u, error, sizeof(error))
+              != MEDIA_PLAYBACK_ADVANCE_ERROR);
+    CHECK(fixture.video_accepted == 1u);
+    fixture.hold_video = true;
+    /* Visit until the next picture has been copied and refused. */
+    for (unsigned visit = 0; visit < 16u && fixture.video_refused == 0u;
+         visit++)
+        CHECK(media_playback_advance_bounded(
+                  playback, fixture.audio_end_us, 1u, error, sizeof(error))
+              != MEDIA_PLAYBACK_ADVANCE_ERROR);
+    CHECK(fixture.video_refused != 0u);
+    /* Video held, its packet already copied. Nothing is buffered: the lane
+       peeks residency and stops, without one poll. */
+    unsigned audio_before = fixture.audio_accepted;
+    CHECK(audio_before < refused_index);
+    fixture_reader.block_polls = 1000u;
+    size_t polls = fixture_reader.polls;
+    for (unsigned visit = 0; visit < 16u; visit++)
+        CHECK(media_playback_advance_bounded(
+                  playback, fixture.audio_end_us, 4u, error, sizeof(error))
+              != MEDIA_PLAYBACK_ADVANCE_ERROR);
+    CHECK(fixture.video_refused != 0u
+          && fixture.audio_accepted == audio_before
+          && fixture_reader.polls == polls
+          && fixture_reader.block_polls == 1000u);
+    fixture_reader.block_polls = 0;
+    /* Buffered, but the read of frame 20 fails. */
+    fixture_reader.fail_offset = (size_t) refused_offset;
+    fixture_reader.fail_enabled = true;
+    for (unsigned visit = 0; visit < 64u; visit++)
+        CHECK(media_playback_advance_bounded(
+                  playback, fixture.audio_end_us, 4u, error, sizeof(error))
+              != MEDIA_PLAYBACK_ADVANCE_ERROR);
+    CHECK(fixture.audio_accepted == refused_index
+          && !fixture.audio_out_of_order
+          && !media_mp4_last_error(demux, error, sizeof(error))
+          && !media_mp4_would_block(demux));
+    fixture_reader.fail_enabled = false;
+    for (unsigned visit = 0; visit < 64u; visit++)
+        CHECK(media_playback_advance_bounded(
+                  playback, fixture.audio_end_us, 4u, error, sizeof(error))
+              != MEDIA_PLAYBACK_ADVANCE_ERROR);
+    CHECK(fixture.audio_accepted == audio_samples
+          && !fixture.audio_out_of_order && fixture.video_accepted == 1u);
+    fixture.hold_video = false;
+    for (unsigned visit = 0;
+         visit < 256u && !media_playback_ended(playback); visit++)
+        CHECK(media_playback_advance_bounded(
+                  playback, UINT64_MAX / 2u, 4u, error, sizeof(error))
+              != MEDIA_PLAYBACK_ADVANCE_ERROR);
+    CHECK(media_playback_ended(playback)
+          && fixture.video_accepted == video_samples
+          && fixture.audio_accepted == audio_samples
+          && !fixture.audio_out_of_order);
+    media_playback_destroy(playback);
+    media_mp4_close(demux);
+    CHECK(budget.current == 0);
+    free(bytes);
+    return 0;
+}
+
 int main(void)
 {
+    if (test_firmware_reference_structure() != 0) return 1;
+    if (test_sps_held_frames() != 0) return 1;
     puts("test: embedded PSP decoder fixtures are admissible");
     CHECK(validate_device_media_fixture(
               TILEFINCH_TEST_MEDIA_FIXTURE_240, 320, 240));
@@ -1195,6 +1913,10 @@ int main(void)
               TILEFINCH_TEST_MEDIA_FIXTURE_360, 640, 360));
     puts("test: audio tracks seek to their last sample before the target");
     CHECK(device_fixture_audio_seek(TILEFINCH_TEST_MEDIA_FIXTURE_240));
+    if (test_progressive_held_video_keeps_audio_supplied(
+            TILEFINCH_TEST_MEDIA_FIXTURE_360) != 0) return 1;
+    if (test_progressive_lane_refused_range_read(
+            TILEFINCH_TEST_MEDIA_FIXTURE_360) != 0) return 1;
     puts("test: tick conversion rounds down exactly and saturates");
     CHECK(ticks_to_us_matches_reference());
     puts("test: lazy sidx is confined to globally ordered single-track files");
@@ -2385,6 +3107,34 @@ int main(void)
         .maximum_packet_bytes = 16,
         .preallocate_maximum_packet_bytes = true
     };
+    unsigned char *reserved_packet = budget_malloc(&budget, 16u);
+    CHECK(reserved_packet != NULL);
+    MediaPlaybackOptions reserved_options = playback_options;
+    reserved_options.reserved_packet = reserved_packet;
+    size_t reserved_owned = budget.current;
+    budget_inject_failure_after(&budget, 0);
+    CHECK(media_playback_create(&budget, demux, &backend, &reserved_options,
+                                error, sizeof(error)) == NULL);
+    budget_clear_failure_injection(&budget);
+    CHECK(budget.current == reserved_owned);
+    /* Only the small playback record may allocate now. In particular, a
+       fragmented heap must not require another large packet allocation. */
+    budget_inject_failure_after(&budget, 1);
+    MediaPlayback *reserved_playback = media_playback_create(
+        &budget, demux, &backend, &reserved_options, error, sizeof(error));
+    budget_clear_failure_injection(&budget);
+    CHECK(reserved_playback != NULL);
+    if (reserved_playback != NULL) {
+        CHECK(media_playback_packet_bytes(reserved_playback) == 16u);
+        CHECK(!media_playback_wait_video_ready(reserved_playback, 16000u));
+        CHECK(!media_playback_wait_video_due(reserved_playback, 16000u));
+        media_playback_destroy(reserved_playback);
+    } else {
+        budget_free(&budget, reserved_packet);
+    }
+    backend_fixture = (BackendFixture) {.queue_once = true};
+    backend.wait_video_ready = backend_wait_ready;
+    backend.wait_video_due = backend_wait_ready;
     size_t playback_owned_before = budget.current;
     for (size_t refusal = 0u; refusal < 2u; refusal++) {
         size_t failures_before = budget.injected_failure_count;
@@ -2410,6 +3160,27 @@ int main(void)
                == MEDIA_PLAYBACK_ADVANCE_PENDING
           && backend_fixture.submitted == 1
           && backend_fixture.advanced == 1);
+    CHECK(!media_playback_wait_video_ready(NULL, 16000u));
+    CHECK(!media_playback_wait_video_ready(playback, 0u)
+          && backend_fixture.ready_wait_calls == 0u);
+    CHECK(!media_playback_wait_video_ready(playback, 16000u)
+          && backend_fixture.ready_wait_calls == 1u
+          && backend_fixture.ready_wait_timeout_us == 16000u);
+    backend_fixture.ready_wait_result = true;
+    CHECK(media_playback_wait_video_ready(playback, UINT32_MAX)
+          && backend_fixture.ready_wait_calls == 2u
+          && backend_fixture.ready_wait_timeout_us == 17000u);
+    CHECK(!media_playback_wait_video_due(NULL, 16000u));
+    CHECK(!media_playback_wait_video_due(playback, 0u)
+          && backend_fixture.ready_wait_calls == 2u);
+    backend_fixture.ready_wait_result = false;
+    CHECK(!media_playback_wait_video_due(playback, 3000u)
+          && backend_fixture.ready_wait_calls == 3u
+          && backend_fixture.ready_wait_timeout_us == 3000u);
+    backend_fixture.ready_wait_result = true;
+    CHECK(media_playback_wait_video_due(playback, UINT32_MAX)
+          && backend_fixture.ready_wait_calls == 4u
+          && backend_fixture.ready_wait_timeout_us == 17000u);
     MediaVideoFrame presentation_frame = {
         .slot = 7,
         .generation = 9
@@ -2909,6 +3680,49 @@ int main(void)
           && decoder_policy.me_boot_type == 1
           && !psp_media_decoder_policy(
               PSP_MEDIA_AVC_PROFILE_BASELINE, 30, 240, 426, false,
+              &decoder_policy));
+    /*
+     * Every tall Baseline shape the wide test flags takes the large-picture
+     * program, not only heights above 360: a 202x360 Constrained Baseline
+     * 1.3 rendition was refused on a device as "profile/level 66/13".
+     * Level is a ceiling only -- 1.0 through 3.0 are admitted alike -- and
+     * landscape Baseline beyond the screen stays refused.
+     */
+    static const unsigned firmware_levels[] = {9, 10, 11, 12, 13, 20, 21,
+                                               22, 30};
+    for (size_t i = 0;
+         i < sizeof(firmware_levels) / sizeof(firmware_levels[0]); i++) {
+        CHECK(psp_video_avc_level_supported(firmware_levels[i])
+              && psp_media_decoder_policy(
+                  PSP_MEDIA_AVC_PROFILE_BASELINE, firmware_levels[i], 202,
+                  360, true, &decoder_policy)
+              && decoder_policy.mpeg_mode == 5
+              && decoder_policy.me_boot_type == 1
+              && psp_media_decoder_policy(
+                  PSP_MEDIA_AVC_PROFILE_BASELINE, firmware_levels[i], 320,
+                  240, false, &decoder_policy)
+              && decoder_policy.mpeg_mode == 4);
+    }
+    CHECK(!psp_video_avc_level_supported(0)
+          && !psp_video_avc_level_supported(31)
+          && !psp_media_decoder_policy(
+              PSP_MEDIA_AVC_PROFILE_BASELINE, 31, 202, 360, true,
+              &decoder_policy)
+          && !psp_media_decoder_policy(
+              PSP_MEDIA_AVC_PROFILE_BASELINE, 13, 202, 360, false,
+              &decoder_policy)
+          && psp_media_decoder_policy(
+              PSP_MEDIA_AVC_PROFILE_BASELINE, 13, 272, 273, true,
+              &decoder_policy)
+          && decoder_policy.mpeg_mode == 5
+          && psp_media_decoder_policy(
+              PSP_MEDIA_AVC_PROFILE_BASELINE, 13, 272, 480, true,
+              &decoder_policy)
+          && !psp_media_decoder_policy(
+              PSP_MEDIA_AVC_PROFILE_BASELINE, 13, 273, 360, true,
+              &decoder_policy)
+          && !psp_media_decoder_policy(
+              PSP_MEDIA_AVC_PROFILE_BASELINE, 13, 272, 481, true,
               &decoder_policy));
     /*
      * Baseline that fits the screen runs on the Main-profile program (create
@@ -3941,6 +4755,49 @@ int main(void)
           && psp_media_codec_poll_delay_us(1000u, 900u) == 100u
           && psp_media_codec_poll_delay_us(1000u, 1000u) == 0u
           && psp_media_codec_poll_delay_us(1000u, 1001u) == 0u);
+
+    puts("test: software-decoded fullscreen video paces the loop to vblank");
+    /* A turn after a published picture never waits: the present already
+       waited for the latch. Otherwise the firmware path keeps its short
+       poll and software decode, whose worker runs below the browser, waits
+       one display refresh instead of taking ~3 polls of CPU from it. */
+    CHECK(psp_media_fullscreen_loop_wait(false, true)
+              == PSP_MEDIA_LOOP_WAIT_NONE
+          && psp_media_fullscreen_loop_wait(true, true)
+              == PSP_MEDIA_LOOP_WAIT_NONE
+          && psp_media_fullscreen_loop_wait(false, false)
+              == PSP_MEDIA_LOOP_WAIT_POLL
+          && psp_media_fullscreen_loop_wait(true, false)
+              == PSP_MEDIA_LOOP_WAIT_VBLANK);
+    CHECK(psp_media_ready_followup_due(100000u, 40000u, 80000u));
+    CHECK(!psp_media_ready_followup_due(100001u, 40000u, 80000u));
+    CHECK(psp_media_ready_followup_due(70000u, 40000u, 80000u));
+    CHECK(!psp_media_ready_followup_due(80001u, 0u, 80000u));
+    CHECK(psp_media_ready_followup_due(UINT64_MAX, 40000u,
+                                      UINT64_MAX - 20000u));
+    CHECK(!psp_media_ready_followup_due(UINT64_MAX, 40000u,
+                                       UINT64_MAX - 20001u));
+    CHECK(psp_media_take_clock_refresh(100u, true, false, true, 120u) == 120u);
+    CHECK(psp_media_take_clock_refresh(100u, true, false, true, 90u) == 100u);
+    CHECK(psp_media_take_clock_refresh(100u, false, false, true, 120u) == 100u);
+    CHECK(psp_media_take_clock_refresh(100u, true, true, true, 120u) == 100u);
+    CHECK(psp_media_take_clock_refresh(100u, true, false, false, 120u) == 100u);
+    CHECK(psp_media_take_clock_refresh(UINT64_MAX, true, false, true, 120u)
+          == UINT64_MAX);
+    for (unsigned before = 0; before < 2; before++) {
+        bool after = !before;
+        CHECK(!psp_media_decode_pending_visual_change(before, after, true, true, false));
+        CHECK(psp_media_decode_pending_visual_change(before, after, false, true, false));
+        CHECK(psp_media_decode_pending_visual_change(before, after, true, false, false));
+        CHECK(psp_media_decode_pending_visual_change(before, after, true, true, true));
+        CHECK(!psp_media_decode_pending_visual_change(before, before, false, false, true));
+    }
+    for (unsigned flags = 0; flags < 64; flags++) {
+        CHECK(psp_media_hls_delivery_after_present(
+            (flags & 1) != 0, (flags & 2) != 0, (flags & 4) != 0,
+            (flags & 8) != 0, (flags & 16) != 0, (flags & 32) != 0)
+            == (flags == 15));
+    }
 
     puts("test: a stalled pipeline names the cause above the consequence");
     /* A clock the source has not outrun is an ordinary stall, and the older

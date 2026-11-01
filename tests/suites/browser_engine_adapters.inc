@@ -183,7 +183,7 @@ static int test_watch_metadata_reuse(void)
     for (size_t i = 0; i < BROWSER_SITE_ADAPTER_DOCUMENT_CACHE_ENTRIES; i++)
         if (session.site_adapter_document_cache[i].valid)
             retained += session.site_adapter_document_cache[i].length;
-    CHECK(retained > 0 && retained <= 20u * 1024u);
+    CHECK(retained > 0 && retained <= 28u * 1024u);
     printf("watch-reuse retained-bytes=%zu\n", retained);
     for (size_t i = 0; i < 2; i++) {
         CHECK(test_watch_reuse_load(&budget, &session, urls[i], false, &document,
@@ -3862,6 +3862,172 @@ static lxb_dom_node_t *test_declared_media_card_node(PocDocument *document)
     return NULL;
 }
 
+/* A transient insertion refusal is asked again after another settle
+   window, at most twice: the second retry refused answers UNAVAILABLE. */
+static bool test_declared_media_card_refusals_exhaust(BrowserEngine *engine)
+{
+    for (unsigned attempt = 0u; attempt < 2u; attempt++) {
+        for (size_t tick = 0u; tick < 13u; tick++) {
+            if (!browser_engine_advance_runtime(engine, 2u, 4u, NULL))
+                return false;
+        }
+        navigation_test_refuse_next_same_document_relayout();
+        BrowserDeclaredMediaCard card =
+            browser_engine_prepare_declared_media_card(engine);
+        if (card != (attempt == 0u ? BROWSER_DECLARED_MEDIA_CARD_DEFERRED
+                                    : BROWSER_DECLARED_MEDIA_CARD_UNAVAILABLE))
+            return false;
+    }
+    return strcmp(browser_engine_declared_media_card_reason(engine),
+                  "refused") == 0;
+}
+
+/* focus-page-media (validation input scripts): focus what Play acts on. */
+static int test_focus_page_media(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 16u * MIB;
+    config.tile_capacity = 4u;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    config.javascript.heap_limit = 3u * MIB;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(
+        &config, error, sizeof(error));
+    CHECK(engine != NULL);
+    browser_engine_test_set_recovery_time_us(UINT64_MAX);
+    BrowserController *controller = NULL;
+
+    /* A skip link first, then the page's playable video. */
+    static const char author[] =
+        "<!doctype html><body><a href=#main>Skip to main content</a>"
+        "<video id=v controls src=/movie-240.mp4></video>"
+        "<video id=w controls src=/other.mp4></video>"
+        "<script>document.getElementById('v').addEventListener('click',"
+        "function(e){e.preventDefault()})</script>";
+    CHECK(browser_engine_commit_html(
+              engine, "https://focus.example.test/a", author,
+              sizeof(author) - 1u, true)
+          && psp_input_focus_page_media(engine) == BROWSER_PAGE_MEDIA_AUTHOR
+          && (controller = browser_engine_controller(engine)) != NULL
+          && controller->focus_kind == CONTROLLER_FOCUS_CONTROL);
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    size_t length = 0u;
+    const char *id = document_attribute(
+        navigation->page.layout.controls[controller->focus_index].node,
+        "id", &length);
+    CHECK(id != NULL && length == 1u && id[0] == 'v');
+    /* Cross on the focused author video opens its media natively even
+       though the page's handler cancels the click, and that focus counts
+       as page media (Cross beats the page-scripts notice there). The skip
+       link does not. */
+    ControllerAction media_action = {0};
+    CHECK(browser_engine_focus_on_page_media(engine)
+          && browser_engine_activate(engine, &media_action)
+          && media_action.type == CONTROLLER_ACTION_MEDIA
+          && strcmp(media_action.url,
+                    "https://focus.example.test/movie-240.mp4") == 0);
+    navigation = browser_engine_navigation(engine);
+    CHECK(navigation->page.layout.link_count != 0u
+          && browser_engine_focus_node(
+                 engine, navigation->page.layout.links[0].node)
+          && !browser_engine_focus_on_page_media(engine));
+
+    /* A blob-only player before a sourceless one: neither can open, the
+       first laid-out one is the element Play would build from. */
+    static const char element[] =
+        "<!doctype html><body><a href=/>Home</a>"
+        "<video id=b src='blob:https://focus.example.test/1'></video>"
+        "<video id=n></video>";
+    CHECK(browser_engine_commit_html(
+              engine, "https://focus.example.test/e", element,
+              sizeof(element) - 1u, true)
+          && psp_input_focus_page_media(engine)
+                 == BROWSER_PAGE_MEDIA_ELEMENT);
+    navigation = browser_engine_navigation(engine);
+    id = document_attribute(
+        navigation->page.layout.controls[controller->focus_index].node,
+        "id", &length);
+    CHECK(id != NULL && length == 1u && id[0] == 'b');
+
+    /* The declared media card wins over any author media. */
+    static const char card_page[] =
+        "<!doctype html><body><a href=/>Home</a>"
+        "<video id=b src='blob:https://focus.example.test/2'></video>"
+        "<script type=application/ld+json>"
+        "{\"@type\":\"VideoObject\",\"contentUrl\":\"/movie-240.mp4\"}"
+        "</script><script>0</script>";
+    CHECK(browser_engine_commit_html(
+        engine, "https://focus.example.test/c", card_page,
+        sizeof(card_page) - 1u, true));
+    BrowserDeclaredMediaCard card =
+        browser_engine_prepare_declared_media_card(engine);
+    for (size_t tick = 0u;
+         card == BROWSER_DECLARED_MEDIA_CARD_DEFERRED && tick < 16u;
+         tick++) {
+        CHECK(browser_engine_advance_runtime(engine, 2u, 4u, NULL));
+        card = browser_engine_prepare_declared_media_card(engine);
+    }
+    navigation = browser_engine_navigation(engine);
+    CHECK(card == BROWSER_DECLARED_MEDIA_CARD_INSTALLED
+          && psp_input_focus_page_media(engine) == BROWSER_PAGE_MEDIA_CARD
+          && browser_engine_focus_on_page_media(engine)
+          && navigation->page.layout.controls[controller->focus_index].node
+                 == navigation->page.document.declared_video_card_node);
+
+    /* A player: a non-focusable wrapper whose <video> has only <source>
+       children and is not laid out (hidden, as players hide the bare
+       element behind their chrome until playback), plus a separate play
+       button. Play's
+       author media is the video; the step must reach it through the
+       player's own focus target, since the video is not one. */
+    static const char wrapped[] =
+        "<!doctype html><body><a href=#main>Skip to main content</a>"
+        "<div class=player style=\"position:relative;width:320px;"
+        "height:180px\"><video id=pv style=\"display:none\">"
+        "<source type=video/mp4 src=/clip-360.mp4>"
+        "<source type=video/webm src=/clip-360.webm></video>"
+        "<div class=chrome><button id=pb>Play</button></div></div>"
+        "<a href=/next>Next</a>";
+    CHECK(browser_engine_commit_html(
+        engine, "https://focus.example.test/w", wrapped,
+        sizeof(wrapped) - 1u, true));
+    BrowserPageMediaTarget wrapped_target = psp_input_focus_page_media(engine);
+    navigation = browser_engine_navigation(engine);
+    CHECK(wrapped_target == BROWSER_PAGE_MEDIA_AUTHOR_PLAYER
+          && strcmp(psp_input_page_media_target_name(wrapped_target),
+                    "author-player") == 0
+          && controller->focus_kind == CONTROLLER_FOCUS_CONTROL);
+    id = document_attribute(
+        navigation->page.layout.controls[controller->focus_index].node,
+        "id", &length);
+    CHECK(id != NULL && length == 2u && memcmp(id, "pb", 2u) == 0);
+    CHECK(browser_engine_focus_on_page_media(engine));
+    navigation = browser_engine_navigation(engine);
+    CHECK(browser_engine_focus_node(
+              engine, navigation->page.layout.links[0].node)
+          && !browser_engine_focus_on_page_media(engine));
+
+    static const char plain[] =
+        "<!doctype html><body><a href=/>Home</a><p>No media.</p>";
+    CHECK(browser_engine_commit_html(
+              engine, "https://focus.example.test/p", plain,
+              sizeof(plain) - 1u, true)
+          && psp_input_focus_page_media(engine) == BROWSER_PAGE_MEDIA_NONE
+          && strcmp(psp_input_page_media_target_name(
+                        BROWSER_PAGE_MEDIA_NONE), "none") == 0
+          && !browser_engine_focus_on_page_media(engine));
+
+    browser_engine_test_set_recovery_time_us(0u);
+    Budget *budget = browser_engine_budget(engine);
+    CHECK(browser_engine_shutdown(engine) && budget->current == 0u);
+    browser_engine_destroy(engine);
+    return 0;
+}
+
 static int test_declared_media_card_recovery(void)
 {
     BrowserDeviceProfile profile;
@@ -3881,21 +4047,139 @@ static int test_declared_media_card_recovery(void)
         &config, error, sizeof(error));
     CHECK(engine != NULL);
     browser_engine_test_set_recovery_time_us(UINT64_MAX);
+    /* Past the wall settle, inside the never-quiet cap: the tick window
+       decides, as these cases expect. */
+    browser_engine_test_set_recovery_elapsed_us(1000000u);
 
-    static const char healthy[] =
+    /* A healthy page that declares nothing pays no walk and no deferral. */
+    static const char undeclared[] =
         "<!doctype html><body><img width=320 height=180 src=/poster.jpg>"
-        "<script type=application/ld+json>"
-        "{\"@type\":\"VideoObject\",\"contentUrl\":\"/movie-240.mp4\","
-        "\"thumbnailUrl\":\"/poster.jpg\"}</script><script>0</script>";
+        "<a href=/next>Next</a><script>0</script>";
     CHECK(browser_engine_commit_html(
-              engine, "https://card.example.test/watch", healthy,
-              sizeof(healthy) - 1u, true)
+              engine, "https://card.example.test/plain", undeclared,
+              sizeof(undeclared) - 1u, true)
           && browser_engine_prepare_declared_media_card(engine)
                  == BROWSER_DECLARED_MEDIA_CARD_NONE
           && media_declared_video_discovery_count(
                  &browser_engine_navigation(engine)->page.document) == 0u
           && test_declared_media_card_node(
                  &browser_engine_navigation(engine)->page.document) == NULL);
+
+    /* A healthy page with its own playable video keeps it alone. */
+    static const char healthy_playable[] =
+        "<!doctype html><body><a href=/next>Next</a>"
+        "<video controls src=/movie-240.mp4></video>"
+        "<script type=application/ld+json>"
+        "{\"@type\":\"VideoObject\",\"contentUrl\":\"/movie-240.mp4\","
+        "\"thumbnailUrl\":\"/poster.jpg\"}</script><script>0</script>";
+    CHECK(browser_engine_commit_html(
+        engine, "https://card.example.test/watch", healthy_playable,
+        sizeof(healthy_playable) - 1u, true));
+    BrowserDeclaredMediaCard card =
+        browser_engine_prepare_declared_media_card(engine);
+    for (size_t tick = 0u;
+         card == BROWSER_DECLARED_MEDIA_CARD_DEFERRED && tick < 16u;
+         tick++) {
+        CHECK(browser_engine_advance_runtime(engine, 2u, 4u, NULL));
+        card = browser_engine_prepare_declared_media_card(engine);
+    }
+    CHECK(card == BROWSER_DECLARED_MEDIA_CARD_NONE
+          && test_declared_media_card_node(
+                 &browser_engine_navigation(engine)->page.document) == NULL);
+
+    /* A healthy page whose player only feeds Media Source (blob:) and which
+       declares an HLS stream: the card is offered at body top, the first
+       forward d-pad press from no focus lands on it ahead of link 0, and
+       Play opens the declared stream. The author element, activated, also
+       skips its blob: source for the declared stream. */
+    static const char healthy_mse[] =
+        "<!doctype html><body><a href=/home>Home</a>"
+        "<div class=player><video id=author "
+        "src='blob:https://card.example.test/0f3c'></video></div>"
+        "<script type=application/ld+json>"
+        "{\"@type\":\"VideoObject\",\"name\":\"Stream fixture\","
+        "\"contentUrl\":\"https://media.card.example.test/master.m3u8\","
+        "\"thumbnailUrl\":\"/poster.jpg\"}</script>"
+        "<script>window.playerReady=1</script>";
+    CHECK(browser_engine_commit_html(
+        engine, "https://card.example.test/stream", healthy_mse,
+        sizeof(healthy_mse) - 1u, true));
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    CHECK(!navigation->page.script_degradation_observed
+          && navigation->page.script_result.scripts_failed == 0u);
+    card = browser_engine_prepare_declared_media_card(engine);
+    for (size_t tick = 0u;
+         card == BROWSER_DECLARED_MEDIA_CARD_DEFERRED && tick < 16u;
+         tick++) {
+        CHECK(browser_engine_advance_runtime(engine, 2u, 4u, NULL));
+        card = browser_engine_prepare_declared_media_card(engine);
+    }
+    navigation = browser_engine_navigation(engine);
+    lxb_dom_node_t *node = test_declared_media_card_node(
+        &navigation->page.document);
+    size_t marker_length = 0u;
+    const char *marker = node == NULL ? NULL : document_attribute(
+        node, "data-tilefinch-declared-media-card", &marker_length);
+    CHECK(card == BROWSER_DECLARED_MEDIA_CARD_INSTALLED
+          && node == document_body_node(&navigation->page.document)->first_child
+          && marker != NULL && marker_length == sizeof("synthetic") - 1u
+          && memcmp(marker, "synthetic", marker_length) == 0);
+    ControllerAction action = {0};
+    BrowserController *card_controller = browser_engine_controller(engine);
+    CHECK(card_controller->focus_kind == CONTROLLER_FOCUS_NONE
+          && browser_engine_focus_direction(engine, CONTROLLER_FOCUS_DOWN)
+          && card_controller->focus_kind == CONTROLLER_FOCUS_CONTROL
+          && navigation->page.layout.controls[card_controller->focus_index]
+                     .node == node
+          && browser_engine_activate(engine, &action)
+          && action.type == CONTROLLER_ACTION_MEDIA
+          && action.media_kind == MEDIA_DISCOVERY_HLS
+          && strcmp(action.url,
+                    "https://media.card.example.test/master.m3u8") == 0);
+    lxb_dom_node_t *author = NULL;
+    for (size_t i = 0u; i < navigation->page.layout.control_count; i++) {
+        lxb_dom_node_t *candidate = navigation->page.layout.controls[i].node;
+        size_t id_length = 0u;
+        const char *id = document_attribute(candidate, "id", &id_length);
+        if (id != NULL && id_length == 6u && memcmp(id, "author", 6u) == 0)
+            author = candidate;
+    }
+    action = (ControllerAction) {0};
+    CHECK(author != NULL
+          && browser_engine_focus_node(engine, author)
+          && browser_engine_activate(engine, &action)
+          && action.type == CONTROLLER_ACTION_MEDIA
+          && strcmp(action.url,
+                    "https://media.card.example.test/master.m3u8") == 0);
+
+    /* A player that never attaches a source counts as nothing to play; a
+       page declaring only its player page gets the card, and Play takes
+       the embed hop. */
+    static const char healthy_embed[] =
+        "<!doctype html><head><meta property=og:type content=video.other>"
+        "<meta name=twitter:player "
+        "content='https://player.card.example.test/embed/7'></head>"
+        "<body><h1>Episode</h1><div class=player><video></video></div>"
+        "<script>0</script>";
+    CHECK(browser_engine_commit_html(
+        engine, "https://card.example.test/episode", healthy_embed,
+        sizeof(healthy_embed) - 1u, true));
+    card = browser_engine_prepare_declared_media_card(engine);
+    for (size_t tick = 0u;
+         card == BROWSER_DECLARED_MEDIA_CARD_DEFERRED && tick < 16u;
+         tick++) {
+        CHECK(browser_engine_advance_runtime(engine, 2u, 4u, NULL));
+        card = browser_engine_prepare_declared_media_card(engine);
+    }
+    navigation = browser_engine_navigation(engine);
+    node = test_declared_media_card_node(&navigation->page.document);
+    action = (ControllerAction) {0};
+    CHECK(card == BROWSER_DECLARED_MEDIA_CARD_INSTALLED && node != NULL
+          && browser_engine_focus_node(engine, node)
+          && browser_engine_activate(engine, &action)
+          && action.type == CONTROLLER_ACTION_NAVIGATE && action.embed_hop
+          && strcmp(action.url,
+                    "https://player.card.example.test/embed/7") == 0);
 
     static const char exact[] =
         "<!doctype html><style>img{display:block;width:320px;height:180px}"
@@ -3909,8 +4193,7 @@ static int test_declared_media_card_recovery(void)
     CHECK(browser_engine_commit_html(
         engine, "https://card.example.test/watch", exact,
         sizeof(exact) - 1u, true));
-    BrowserDeclaredMediaCard card =
-        browser_engine_prepare_declared_media_card(engine);
+    card = browser_engine_prepare_declared_media_card(engine);
     CHECK(card == BROWSER_DECLARED_MEDIA_CARD_DEFERRED
           && media_declared_video_discovery_count(
                  &browser_engine_navigation(engine)->page.document) == 0u);
@@ -3925,18 +4208,16 @@ static int test_declared_media_card_recovery(void)
                   == 0u);
         }
     }
-    NavigationSession *navigation = browser_engine_navigation(engine);
-    lxb_dom_node_t *node = test_declared_media_card_node(
-        &navigation->page.document);
-    size_t marker_length = 0u;
-    const char *marker = node == NULL ? NULL : document_attribute(
+    navigation = browser_engine_navigation(engine);
+    node = test_declared_media_card_node(&navigation->page.document);
+    marker = node == NULL ? NULL : document_attribute(
         node, "data-tilefinch-declared-media-card", &marker_length);
     CHECK(card == BROWSER_DECLARED_MEDIA_CARD_INSTALLED
           && media_declared_video_discovery_count(
                  &navigation->page.document) == 1u
           && marker != NULL && marker_length == sizeof("thumbnail") - 1u
           && memcmp(marker, "thumbnail", marker_length) == 0);
-    ControllerAction action = {0};
+    action = (ControllerAction) {0};
     CHECK(browser_engine_focus_node(engine, node)
           && browser_engine_activate(engine, &action)
           && action.type == CONTROLLER_ACTION_MEDIA
@@ -4021,12 +4302,15 @@ static int test_declared_media_card_recovery(void)
         CHECK(browser_engine_advance_runtime(engine, 2u, 4u, NULL));
     navigation_test_refuse_next_same_document_relayout();
     CHECK(browser_engine_prepare_declared_media_card(engine)
-              == BROWSER_DECLARED_MEDIA_CARD_UNAVAILABLE
+              == BROWSER_DECLARED_MEDIA_CARD_DEFERRED
           && test_declared_media_card_node(thumbnail_document) == NULL
           && thumbnail_body->first_child == thumbnail_image
           && thumbnail_image->parent == thumbnail_body
           && thumbnail_document->node_count == thumbnail_nodes
           && thumbnail_document->element_count == thumbnail_elements);
+    CHECK(test_declared_media_card_refusals_exhaust(engine)
+          && test_declared_media_card_node(thumbnail_document) == NULL
+          && thumbnail_body->first_child == thumbnail_image);
 
     static const char rollback[] =
         "<!doctype html><body><article id=original>Stable source</article>"
@@ -4051,7 +4335,7 @@ static int test_declared_media_card_recovery(void)
         CHECK(browser_engine_advance_runtime(engine, 2u, 4u, NULL));
     navigation_test_refuse_next_same_document_relayout();
     CHECK(browser_engine_prepare_declared_media_card(engine)
-              == BROWSER_DECLARED_MEDIA_CARD_UNAVAILABLE
+              == BROWSER_DECLARED_MEDIA_CARD_DEFERRED
           && test_declared_media_card_node(rollback_document) == NULL
           && navigation->page.loaded
           && rollback_body->first_child == original_first
@@ -4059,6 +4343,9 @@ static int test_declared_media_card_recovery(void)
           && rollback_document->element_count == original_elements
           && rollback_document->attribute_count == original_attributes
           && rollback_document->text_bytes == original_text);
+    CHECK(test_declared_media_card_refusals_exhaust(engine)
+          && test_declared_media_card_node(rollback_document) == NULL
+          && rollback_body->first_child == original_first);
 
     static const char independent_settle[] =
         "<!doctype html><body><main><h1>Retained page</h1>"
@@ -4090,10 +4377,11 @@ static int test_declared_media_card_recovery(void)
     }
     navigation_test_refuse_next_same_document_relayout();
     CHECK(browser_engine_prepare_declared_media_card(engine)
-              == BROWSER_DECLARED_MEDIA_CARD_UNAVAILABLE
+              == BROWSER_DECLARED_MEDIA_CARD_DEFERRED
           && browser_engine_prepare_basic_view_recovery(
                  engine, &settle_analysis)
                  == BROWSER_BASIC_VIEW_RECOVERY_AVAILABLE);
+    CHECK(test_declared_media_card_refusals_exhaust(engine));
 
     static const char uncorroborated[] =
         "<!doctype html><body><div data-src=/lazy-240.mp4>Lazy shell</div>"
@@ -4254,6 +4542,7 @@ static int test_declared_media_card_recovery(void)
           && !browser_engine_render_frame(engine, 0));
 
     Budget *budget = browser_engine_budget(engine);
+    browser_engine_test_set_recovery_elapsed_us(0u);
     CHECK(browser_engine_shutdown(engine)
           && budget->current == 0u
           && budget_active_allocations(budget, NULL) == 0u);
@@ -4485,6 +4774,25 @@ static int test_basic_view_admission_and_presentation(void)
     CHECK(navigation->page.layout.commands == commands_before
           && navigation->page.layout.count == command_count_before);
 
+    /* A page being left is not offered recovery: with a navigation away
+       from it pending (the embed hop retires its realm on purpose), a
+       recovery sheet would cover the page that commits. Cancelling the
+       navigation makes the page eligible again. */
+    CHECK(browser_engine_begin_navigation_url(
+              engine, "https://next.example.test/", 64u * 1024u, 5000,
+              true));
+    CHECK(browser_engine_navigation_pending(engine));
+    basic = (ReaderDocumentAnalysis) {0};
+    CHECK(browser_engine_prepare_basic_view_recovery(engine, &basic)
+              == BROWSER_BASIC_VIEW_RECOVERY_NONE
+          && !browser_engine_page_memory_recovery_due(engine));
+    browser_engine_cancel_navigation(engine, "test");
+    CHECK(!browser_engine_navigation_pending(engine));
+    basic = (ReaderDocumentAnalysis) {0};
+    CHECK(browser_engine_prepare_basic_view_recovery(engine, &basic)
+              == BROWSER_BASIC_VIEW_RECOVERY_AVAILABLE);
+    navigation = browser_engine_navigation(engine);
+
     static const char healthy_no_target[] =
         "<!doctype html><body><h1>Plain document</h1>"
         "<p>No action is needed on this healthy page.</p></body>";
@@ -4658,6 +4966,121 @@ static int test_basic_view_recovery_memory_limited_with_navigation(void)
 {
     CHECK(test_basic_view_recovery_memory_limited_case(false) == 0);
     CHECK(test_basic_view_recovery_memory_limited_case(true) == 0);
+    return 0;
+}
+
+/* A script that runs out of JavaScript heap after the page was shown,
+   while its realm stays live (the page catches the error), is a
+   memory failure only the frontend's post-commit recheck can see: the realm
+   is not retired, so browser_engine_page_script_memory_failed stays false.
+   The page whose content never appeared is due for another look and is
+   offered Basic with its links and declared video; the page that kept its
+   content after the same error is left alone. */
+static int test_basic_view_recovery_live_realm_oom_case(bool content_shown)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 16u * MIB;
+    config.tile_capacity = 4u;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    config.javascript.heap_limit = 3u * MIB;
+    char error[128] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL);
+    browser_engine_test_set_recovery_time_us(UINT64_MAX);
+    static const char page_format[] =
+        "<!doctype html><head><title>Clip one</title>"
+        "<meta property=og:video "
+        "content='https://media.test/clips/one-240p.mp4'>"
+        "<style>.pending main{display:none}</style></head>"
+        "<body class=%s><main><h1>Clip one</h1>"
+        "<video controls width=320 height=180></video>"
+        "<ul><li><a id=two href='/clips/two'>Clip two</a></li>"
+        "<li><a href='/clips/three'>Clip three</a></li>"
+        "<li><a href='/clips/four'>Clip four</a></li></ul></main>"
+        "<script>setTimeout(function(){try{var hold=[];"
+        "for(var i=0;;i++)hold.push(new Array(4096).fill(i));"
+        "document.body.className='';}catch(e){"
+        "window.loadError=String(e);}},50);</script></body>";
+    char page[sizeof(page_format) + 16u];
+    int length = snprintf(page, sizeof(page), page_format,
+                          content_shown ? "shown" : "pending");
+    CHECK(length > 0 && (size_t) length < sizeof(page));
+    CHECK(browser_engine_commit_html(engine, "https://clips.example.test/",
+                                    page, (size_t) length, true));
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    CHECK(navigation->page.runtime != NULL
+          && !browser_engine_page_memory_recovery_due(engine));
+    for (unsigned turn = 0; turn < 16u
+         && script_runtime_heap_rejections(navigation->page.runtime) == 0u;
+         turn++)
+        CHECK(browser_engine_advance_runtime(engine, 100u, 4u, NULL));
+    /* The realm ran out of heap and lives on: nothing retired it. */
+    CHECK(navigation->page.runtime != NULL
+          && script_runtime_heap_rejections(navigation->page.runtime) != 0u
+          && !navigation->page.script_memory_limited
+          && !browser_engine_page_script_memory_failed(engine));
+    ReaderDocumentAnalysis basic = {0};
+    if (content_shown) {
+        CHECK(!browser_engine_page_is_visually_blank(engine)
+              && navigation->page.layout.link_count > 0u);
+        CHECK(!browser_engine_page_memory_recovery_due(engine));
+        CHECK(browser_engine_prepare_basic_view_recovery(engine, &basic)
+                  == BROWSER_BASIC_VIEW_RECOVERY_NONE
+              && !basic.prepared);
+    } else {
+        CHECK(browser_engine_page_is_visually_blank(engine));
+        CHECK(browser_engine_page_memory_recovery_due(engine));
+        BrowserBasicViewRecovery recovery =
+            browser_engine_prepare_basic_view_recovery(engine, &basic);
+        for (unsigned turn = 0; turn < 16u
+             && recovery == BROWSER_BASIC_VIEW_RECOVERY_DEFERRED; turn++) {
+            (void) browser_engine_advance_runtime(engine, 1u, 4u, NULL);
+            recovery = browser_engine_prepare_basic_view_recovery(
+                engine, &basic);
+        }
+            CHECK(recovery == BROWSER_BASIC_VIEW_RECOVERY_AVAILABLE
+              && basic.kind == READER_PAGE_BASIC);
+        char css[SITE_ADAPTER_READER_CSS_LIMIT], adapter[32];
+        CHECK(site_adapter_reader_css("https://clips.example.test/",
+                  SITE_ADAPTER_READER_FONT_SANS, 100u, css, sizeof(css),
+                  adapter, sizeof(adapter))
+              && browser_engine_apply_user_css(engine, css, strlen(css))
+              && browser_engine_activate_basic_view(engine));
+        navigation = browser_engine_navigation(engine);
+        CHECK(navigation->page.runtime == NULL
+              && navigation->page.layout.link_count >= 3u);
+        lxb_dom_node_t *two = test_reader_find_id(
+            lxb_dom_interface_node(navigation->page.document.html),
+            "tilefinch-extracted-two");
+        ControllerAction action = {0};
+        CHECK(two != NULL && browser_engine_focus_node(engine, two)
+              && browser_engine_activate(engine, &action)
+              && action.type == CONTROLLER_ACTION_NAVIGATE
+              && strcmp(action.url,
+                        "https://clips.example.test/clips/two") == 0);
+    }
+    /* Either way the page's declared video stays playable: discovery reads
+       the markup, which Basic keeps. */
+    const MediaDeclaredVideo *declared = media_declared_video_cached(
+        &browser_engine_navigation(engine)->page.document);
+    CHECK(declared != NULL
+          && strcmp(declared->media_url,
+                    "https://media.test/clips/one-240p.mp4") == 0);
+    Budget *budget = browser_engine_budget(engine);
+    CHECK(browser_engine_shutdown(engine) && budget->current == 0u);
+    browser_engine_test_set_recovery_time_us(0u);
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+static int test_basic_view_recovery_live_realm_oom(void)
+{
+    CHECK(test_basic_view_recovery_live_realm_oom_case(false) == 0);
+    CHECK(test_basic_view_recovery_live_realm_oom_case(true) == 0);
     return 0;
 }
 

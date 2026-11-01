@@ -51,7 +51,7 @@ static void heavy_measure(ScriptRuntime *runtime, ScriptHeavyState *state)
     state->waiting_ms = script_admission_start_ms(state->waiting_bytes);
     state->memory_needed =
         script_admission_run_memory(state->waiting_bytes);
-    state->memory_free = script_runtime_heap_available(runtime);
+    state->memory_free = script_runtime_heap_admission_available(runtime);
     /* What the server sent, measured once: at commit, before deferred and
        dynamic author scripts build anything (script_runtime_heavy_commit),
        or else the first time anyone asks. */

@@ -2,6 +2,7 @@
 #define TILEFINCH_SWDEC_CSC_MASK_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 /*
@@ -12,6 +13,27 @@
  */
 #define SWDEC_CSC_MASK_WORDS 2u
 #define SWDEC_CSC_MASK_UNITS (SWDEC_CSC_MASK_WORDS * 32u)
+
+static inline unsigned swdec_csc_unit_count(int height)
+{
+    return height > 0 && height <= (int) SWDEC_CSC_MASK_UNITS * 8
+        ? ((unsigned) height + 7u) / 8u : 0u;
+}
+
+/* A known, complete picture can be split without delaying publication by
+ * another frame. Reserve one third of its eight-row units for the ME; the
+ * CPU owns the suffix until it withdraws the offer and joins the ME.
+ * The boundary must separate whole destination cache lines on both cores.
+ * Return all units when only serial ownership is safe or worthwhile. */
+static inline unsigned swdec_csc_cpu_first(
+    unsigned units, const void *destination, unsigned stride_pixels,
+    bool me_available)
+{
+    return me_available && destination != NULL && stride_pixels != 0u
+        && units >= 6u && units <= SWDEC_CSC_MASK_UNITS
+        && ((uintptr_t) destination & 63u) == 0u
+        && (stride_pixels & 3u) == 0u ? units / 3u : units;
+}
 
 typedef struct {
     volatile uint32_t words[SWDEC_CSC_MASK_WORDS];

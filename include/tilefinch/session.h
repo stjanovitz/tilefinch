@@ -527,6 +527,9 @@ typedef struct BrowserSession {
     size_t cache_stale_hits;
     size_t cache_misses;
     size_t cache_evictions;
+    /* Of those, classic script bodies given back to a page realm short of
+       room to grow (browser_session_cache_release_script_bodies). */
+    size_t cache_script_body_releases;
     size_t site_adapter_document_clock;
     size_t client_hint_clock;
     /* Global page policy. HTTP cache remains independently configurable. */
@@ -1003,6 +1006,12 @@ size_t browser_session_lazy_bundle_pending_count(
 /* Drops queued records (of one top-level site, or all with NULL). */
 void browser_session_lazy_bundle_pending_clear(BrowserSession *session,
                                                const char *partition);
+/* How many queued records hold `body`, and (frees only, like the reclaim)
+   finishing those records' digests so that they let it go. */
+size_t browser_session_lazy_bundle_pending_holds(
+    const BrowserSession *session, const BrowserSharedBody *body);
+void browser_session_lazy_bundle_pending_release_body(
+    BrowserSession *session, const BrowserSharedBody *body);
 /* Releases the bodies of queued records that hold their last reference,
    oldest first, until `target_bytes` are released, finishing each one's
    digest first so the record itself is kept (stored at the next idle
@@ -1324,6 +1333,20 @@ bool browser_session_cache_revalidate_module(
    returned physical-byte count. */
 size_t browser_session_cache_reclaim(BrowserSession *session,
                                      size_t target_bytes);
+/* Evicts least-recently-used classic script response entries whose body
+   nothing else holds (but queued bundle records, which then finish their
+   digests and let it go) and which carry no attached bytecode, until at least
+   target_bytes of the page Budget has become available or none is left.
+   Such a body is only source the page has compiled: losing it costs a
+   revisit a refetch, never the compiled bytecode (kept apart, keyed by the
+   source digest). It frees and never allocates, so the realm's growth hook
+   may call it from inside an allocation: a classic script entry is
+   borrowed without a lease on its body only between a loader's match and
+   its lease (script_loader.c, js_fetch_cors.c dynamic scripts, the
+   document preload scan), and none of those runs JavaScript in between.
+   Returns the bytes physically freed. */
+size_t browser_session_cache_release_script_bodies(BrowserSession *session,
+                                                   size_t target_bytes);
 /* Evicts older HTTP entries until a bounded working set can be inserted
    without evicting its own earliest members. */
 bool browser_session_cache_reserve_working_set(

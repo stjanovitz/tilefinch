@@ -52,7 +52,7 @@ static void interactive_media_print_status(const InteractiveMediaSession *media)
            "dropped=%zu packets=%zu audio-streams=%zu audio-packets=%zu "
            "audio-samples=%llu/%llu audio-dropped=%llu audio-format=%u/%u "
            "audio-output=%s audio-time-us=%llu av-skew-us=%lld "
-           "working-set=%zu\n",
+           "working-set=%zu live=%d\n",
            stats.ended ? "ended" : (stats.playing ? "playing" : "paused"),
            stats.source_kind, stats.resolved_itag, stats.resolver_bytes,
            stats.video_codec, stats.audio_codec,
@@ -70,7 +70,7 @@ static void interactive_media_print_status(const InteractiveMediaSession *media)
            stats.audio_output_active ? "native" : "decode-only",
            (unsigned long long) stats.audio_time_us,
            (long long) stats.audio_video_skew_us,
-           stats.working_set_bytes);
+           stats.working_set_bytes, stats.live ? 1 : 0);
 #else
     (void) media;
     puts("media status=disabled");
@@ -87,6 +87,11 @@ static bool interactive_media_sync_ui(InteractiveMediaSession *media)
                      stats.playing, stats.ended,
                      stats.current_time_us, stats.duration_us,
                      stats.title);
+    /* As the PSP session does for a live stream: LIVE, no seek bar. */
+    if (stats.live) {
+        media->ui.live = true;
+        media->ui.seek_enabled = false;
+    }
 #endif
     return true;
 }

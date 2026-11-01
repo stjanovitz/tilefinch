@@ -475,6 +475,107 @@ static JSValue js_post_message(JSContext *context,
     return JS_UNDEFINED;
 }
 
+/* FNV-1a over a URL up to its fragment; 0 means "none". */
+static uint64_t js_rt_popunder_hash(const char *url)
+{
+    if (url == NULL || url[0] == '\0') return 0;
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (const char *at = url; *at != '\0' && *at != '#'; at++) {
+        hash ^= (unsigned char) *at;
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash == 0 ? 1 : hash;
+}
+
+/* The popunder guard compares sites (scheme and registrable domain). */
+static uint64_t js_rt_popunder_site(const char *url)
+{
+    char site[TILEFINCH_ORIGIN_SERIALIZED_LIMIT];
+    return url != NULL && tilefinch_url_site_key(url, site, sizeof(site))
+        ? js_rt_popunder_hash(site) : 0;
+}
+
+/* Popunder guard. Tilefinch opens no auxiliary windows, so a page that
+   answers a user activation by opening the content in a new window and
+   sending this (opener) document elsewhere would replace the page the user
+   asked for with that other destination. While the activation that asked
+   for the window is transient, a script navigation of the top-level
+   document is refused when its site is none of: the document's, the
+   requested window's, and the activated hyperlink's destination's. The
+   hyperlink, when there is one, is followed instead: it is what the user
+   pressed. Unless the page cancelled the click, the browser follows it as
+   the click's default action, so the guard leaves it to that one load
+   (script_runtime_note_link_default). Runs at both ends of the pattern,
+   since pages call window.open() and assign location in either order. */
+static void js_rt_bridge_filter_popunder(DomBridge *bridge)
+{
+    if (bridge == NULL || !bridge->navigation_requested
+        || bridge->new_window_expires_ms == 0 || bridge->host == NULL
+        || bridge->host->document_scope != SCRIPT_DOCUMENT_SCOPE_TOP_LEVEL
+        || bridge->document_url == NULL) return;
+    if (js_rt_bridge_elapsed_ms(bridge) >= bridge->new_window_expires_ms) {
+        bridge->new_window_expires_ms = 0;
+        return;
+    }
+    uint64_t target = js_rt_popunder_site(bridge->navigation_url);
+    if (target == 0 || target == js_rt_popunder_site(bridge->document_url)
+        || target == bridge->new_window_site
+        || target == js_rt_popunder_site(bridge->activation_link_url))
+        return;
+    bool follow_link = bridge->activation_link_url != NULL
+        && !bridge->activation_link_default
+        && js_rt_popunder_hash(bridge->activation_link_url)
+               != js_rt_popunder_hash(bridge->document_url);
+#if !defined(TILEFINCH_NO_TRACE)
+    if (getenv("TILEFINCH_TRACE_NAVIGATION_REQUESTS") != NULL) {
+        fprintf(stderr,
+                "tilefinch-script-navigation: refused=popunder url=\"%s\" "
+                "follow=\"%s\"\n", bridge->navigation_url,
+                follow_link ? bridge->activation_link_url : "");
+    }
+#endif
+    bridge->navigation_requested = false;
+    bridge->navigation_replace = false;
+    bridge->navigation_user_activated = false;
+    bridge->navigation_url[0] = '\0';
+    if (!follow_link) return;
+    snprintf(bridge->navigation_url, sizeof(bridge->navigation_url), "%s",
+             bridge->activation_link_url);
+    bridge->navigation_requested = true;
+    bridge->navigation_user_activated = true;
+    bridge->navigation_follows_link = true;
+}
+
+/* window.open() opens nothing (it returns null). During a user activation,
+   a request for an HTTP(S) document arms the popunder guard. A blank
+   window, which the page would fill itself, does not: pages commonly fall
+   back to navigating in place when such a window fails to open. */
+static JSValue js_note_new_window(JSContext *context,
+                                  JSValueConst this_value,
+                                  int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    if (bridge == NULL || argc < 1
+        || !js_rt_bridge_user_activation_is_active(bridge))
+        return JS_UNDEFINED;
+    size_t length = 0;
+    const char *url = JS_ToCStringLen(context, &length, argv[0]);
+    if (url == NULL) return JS_EXCEPTION;
+    char resolved[TILEFINCH_URL_SERIALIZED_LIMIT];
+    const char *base = js_rt_bridge_calculated_base_url(bridge);
+    bool document = length > 0 && length < sizeof(resolved) && base != NULL
+        && tilefinch_url_resolve(base, url, resolved, sizeof(resolved))
+        && (strncmp(resolved, "https://", 8) == 0
+            || strncmp(resolved, "http://", 7) == 0);
+    JS_FreeCString(context, url);
+    if (!document) return JS_UNDEFINED;
+    bridge->new_window_site = js_rt_popunder_site(resolved);
+    bridge->new_window_expires_ms = bridge->user_activation_expires_ms;
+    js_rt_bridge_filter_popunder(bridge);
+    return JS_UNDEFINED;
+}
+
 static JSValue js_request_navigation(JSContext *context,
                                      JSValueConst this_value,
                                      int argc, JSValueConst *argv)
@@ -497,6 +598,7 @@ static JSValue js_request_navigation(JSContext *context,
     snprintf(bridge->navigation_url, sizeof(bridge->navigation_url), "%s",
              url);
     bridge->navigation_requested = true;
+    bridge->navigation_follows_link = false;
     JS_RT_XHR_COUNT(bridge->host, navigation_accepted);
     bridge->navigation_replace = argc > 1
                                  && JS_ToBool(context, argv[1]) > 0;
@@ -513,6 +615,7 @@ static JSValue js_request_navigation(JSContext *context,
     }
 #endif
     JS_FreeCString(context, url);
+    js_rt_bridge_filter_popunder(bridge);
     return JS_UNDEFINED;
 }
 
@@ -1440,8 +1543,20 @@ static JSValue js_resolve_url(JSContext *context, JSValueConst this_value,
         }
         base = base_argument;
     }
-    const char *effective_base = base != NULL && strstr(base, "://") != NULL
-                                 ? base : "https://fixture.invalid/";
+    /* __tilefinchResolveURL(input, base, documentBase). The resolver
+       parses only http(s) bases. An opaque base passed by script (blob:,
+       data:, about:blank: no '/' after the scheme) is used as given, so
+       absolute input resolves and relative input fails. The document's
+       own URL (a fixture file path, about:blank) and a hierarchical
+       non-special base such as "x:/", which pages use to normalize paths,
+       resolve against the fixture, whose path is the same. */
+    bool document_base = argc > 2 && JS_ToBool(context, argv[2]) > 0;
+    const char *colon = base == NULL ? NULL : strchr(base, ':');
+    bool opaque = base_argument != NULL && !document_base && colon != NULL
+        && colon[1] != '/';
+    const char *effective_base = opaque
+        || (base != NULL && strstr(base, "://") != NULL)
+        ? base : "https://fixture.invalid/";
     char resolved[4096];
     bool ok = tilefinch_url_resolve(effective_base, reference, resolved,
                                  sizeof(resolved));
@@ -1479,6 +1594,10 @@ static bool bridge_set_document_url(DomBridge *bridge, const char *url)
        frozen URL; a document with no base will recalculate from the new URL
        after the dirty bit below is set. */
     if (js_rt_bridge_calculated_base_url(bridge) == NULL) return false;
+    /* pushState/replaceState to another URL: the page may now show another
+       video, so declarations the old URL's markup made are forgotten. */
+    if (strcmp(bridge->document_url, normalized) != 0)
+        media_declared_video_cache_destroy(bridge->document);
     memcpy(bridge->document_url, normalized, strlen(normalized) + 1);
     bridge->document_base_dirty = true;
     bridge->document_url_revision++;
@@ -1676,6 +1795,32 @@ static bool js_text_decoder_single_byte(TilefinchEncoding encoding)
         || encoding == TILEFINCH_ENCODING_X_USER_DEFINED;
 }
 
+static bool js_text_decoder_utf16(TilefinchEncoding encoding)
+{
+    return encoding == TILEFINCH_ENCODING_UTF16LE
+        || encoding == TILEFINCH_ENCODING_UTF16BE;
+}
+
+/* True when `bytes` are whole UTF-16 code units with every surrogate
+   paired: what fatal UTF-16 decoding accepts. */
+static bool js_utf16_well_formed(const unsigned char *bytes, size_t length,
+                                 bool big_endian)
+{
+    if ((length & 1u) != 0u) return false;
+    unsigned high = big_endian ? 0u : 1u;
+    for (size_t at = 0; at < length; at += 2u) {
+        unsigned unit = (unsigned) bytes[at + high] << 8
+            | bytes[at + (high ^ 1u)];
+        if (unit < 0xd800u || unit > 0xdfffu) continue;
+        if (unit > 0xdbffu || at + 2u >= length) return false;
+        unsigned next = (unsigned) bytes[at + 2u + high] << 8
+            | bytes[at + 2u + (high ^ 1u)];
+        if (next < 0xdc00u || next > 0xdfffu) return false;
+        at += 2u;
+    }
+    return true;
+}
+
 static TilefinchEncoding js_text_decoder_encoding(JSContext *context,
                                                   JSValueConst label)
 {
@@ -1688,8 +1833,8 @@ static TilefinchEncoding js_text_decoder_encoding(JSContext *context,
 }
 
 /* __tilefinchEncodingName(label): the name of the encoding `label` names,
-   when TextDecoder can decode it (UTF-8, which the bootstrap decodes, or a
-   single-byte encoding); otherwise null. */
+   when TextDecoder can decode it (UTF-8, which the bootstrap decodes,
+   UTF-16LE/BE or a single-byte encoding); otherwise null. */
 static JSValue js_encoding_name(JSContext *context, JSValueConst this_value,
                                 int argc, JSValueConst *argv)
 {
@@ -1697,22 +1842,26 @@ static JSValue js_encoding_name(JSContext *context, JSValueConst this_value,
     if (argc < 1) return JS_NULL;
     TilefinchEncoding encoding = js_text_decoder_encoding(context, argv[0]);
     if (encoding != TILEFINCH_ENCODING_UTF8
-        && !js_text_decoder_single_byte(encoding)) return JS_NULL;
+        && !js_text_decoder_single_byte(encoding)
+        && !js_text_decoder_utf16(encoding)) return JS_NULL;
     return JS_NewString(context, tilefinch_encoding_name(encoding));
 }
 
-/* __tilefinchDecodeSingleByte(name, bytes, fatal): `bytes` (a Uint8Array)
-   decoded with a single-byte encoding; null when fatal and a byte has no
-   mapping (none of these tables maps a byte to U+FFFD). */
-static JSValue js_decode_single_byte(JSContext *context,
-                                     JSValueConst this_value,
-                                     int argc, JSValueConst *argv)
+/* __tilefinchDecodeBytes(name, bytes, fatal): `bytes` (a Uint8Array)
+   decoded completely with a single-byte encoding or UTF-16LE/BE (the
+   bootstrap strips the BOM and carries streamed partial units); null when
+   fatal and a byte has no mapping (none of the single-byte tables maps a
+   byte to U+FFFD) or a UTF-16 surrogate or unit is incomplete. */
+static JSValue js_decode_bytes(JSContext *context,
+                               JSValueConst this_value,
+                               int argc, JSValueConst *argv)
 {
     (void) this_value;
     if (argc < 3) return JS_ThrowTypeError(context, "byte array required");
     TilefinchEncoding encoding = js_text_decoder_encoding(context, argv[0]);
     int fatal = JS_ToBool(context, argv[2]);
-    if (!js_text_decoder_single_byte(encoding) || fatal < 0)
+    bool utf16 = js_text_decoder_utf16(encoding);
+    if ((!utf16 && !js_text_decoder_single_byte(encoding)) || fatal < 0)
         return JS_ThrowRangeError(context, "unsupported encoding");
     size_t offset = 0u, length = 0u, bytes_per_element = 0u;
     JSValue buffer = JS_GetTypedArrayBuffer(
@@ -1726,6 +1875,13 @@ static JSValue js_decode_single_byte(JSContext *context,
         JS_FreeValue(context, buffer);
         return JS_ThrowTypeError(context, "byte array required");
     }
+    const unsigned char *input = bytes == NULL ? NULL : bytes + offset;
+    if (fatal && utf16
+        && !js_utf16_well_formed(
+               input, length, encoding == TILEFINCH_ENCODING_UTF16BE)) {
+        JS_FreeValue(context, buffer);
+        return JS_NULL;
+    }
     /* Each byte becomes at most three UTF-8 bytes; keep the decoder's
        eight bytes of headroom so one call consumes everything. */
     size_t capacity = tilefinch_decoder_maximum_output(encoding, length) + 8u;
@@ -1736,13 +1892,13 @@ static JSValue js_decode_single_byte(JSContext *context,
     }
     TilefinchDecoder decoder;
     tilefinch_decoder_init(&decoder, encoding);
-    const unsigned char *input = bytes == NULL ? NULL : bytes + offset;
     size_t remaining = length;
     size_t written = tilefinch_decoder_decode(
         &decoder, &input, &remaining, output, capacity, true);
     JS_FreeValue(context, buffer);
     bool refused = false;
-    for (size_t at = 0; fatal && !refused && at + 3u <= written; at++)
+    for (size_t at = 0; fatal && !utf16 && !refused && at + 3u <= written;
+         at++)
         refused = output[at] == 0xefu && output[at + 1u] == 0xbfu
             && output[at + 2u] == 0xbdu;
     JSValue result = remaining != 0u
@@ -2787,7 +2943,22 @@ static JSValue js_queue_checkpoint_continuation(
    exact attribute body through this host-only path so CSP's unsafe-eval gate
    can remain closed while script-src's unsafe-inline decision is still
    honoured.  The bootstrap calls this lazily on first dispatch and retains a
-   bounded number of compiled handlers. */
+   bounded number of compiled handlers.
+
+   HTML runs the body with the element, its form owner (form-associated
+   elements only) and the document on the scope chain ahead of the global
+   object, so `onload="media='all'"` assigns the link's media.  Arguments 1..3
+   are those scope objects, outermost first (document, form, element); each
+   non-object is skipped.  With scopes present the body is compiled inside one
+   sloppy enclosing function,
+
+       (function(){with(this[0])with(this[1])return function(event){BODY}})
+
+   which is called once with the array of scope objects as `this`.  `this` is
+   a keyword, never an identifier lookup, so no helper name is visible to (or
+   shadowable by) the handler body or the scope objects, and the handler's
+   own `this` stays the dispatch receiver.  `with` lives only in the
+   enclosing function, so a body that opts into strict mode stays valid. */
 static JSValue js_compile_inline_event_handler(JSContext *context,
                                                JSValueConst this_value,
                                                int argc,
@@ -2811,6 +2982,12 @@ static JSValue js_compile_inline_event_handler(JSContext *context,
         return JS_NULL;
     }
 
+    enum { INLINE_HANDLER_SCOPE_LIMIT = 3 };
+    JSValueConst scopes[INLINE_HANDLER_SCOPE_LIMIT];
+    size_t scope_count = 0;
+    for (int i = 1; i < argc && i <= INLINE_HANDLER_SCOPE_LIMIT; i++)
+        if (JS_IsObject(argv[i])) scopes[scope_count++] = argv[i];
+
     size_t source_length = 0;
     const char *source = JS_ToCStringLen(context, &source_length, argv[0]);
     if (source == NULL) return JS_EXCEPTION;
@@ -2821,31 +2998,61 @@ static JSValue js_compile_inline_event_handler(JSContext *context,
                                   "inline event handler exceeds bounded size");
     }
 
-    static const char prefix[] = "(function(event){\n";
-    static const char suffix[] = "\n})";
-    if (source_length > SIZE_MAX - sizeof(prefix) - sizeof(suffix)) {
-        JS_FreeCString(context, source);
-        return JS_ThrowRangeError(context, "inline event handler is too large");
-    }
-    size_t length = sizeof(prefix) - 1u + source_length
-        + sizeof(suffix) - 1u;
+    static const char scope_prefix[] = "function(){";
+    static const char scope_with[] = "with(this[0])";
+    static const char scope_return[] = "return ";
+    static const char prefix[] = "function(event){\n";
+    static const char suffix[] = "\n}";
+    size_t scope_text = scope_count == 0 ? 0u
+        : sizeof(scope_prefix) - 1u + scope_count * (sizeof(scope_with) - 1u)
+            + sizeof(scope_return) - 1u + 1u;
+    size_t length = 1u + scope_text + sizeof(prefix) - 1u + source_length
+        + sizeof(suffix) - 1u + 1u;
     char *program = budget_malloc(bridge->host->budget, length + 1u);
     if (program == NULL) {
         JS_FreeCString(context, source);
         return JS_ThrowOutOfMemory(context);
     }
     size_t used = 0;
+    program[used++] = '(';
+    if (scope_count > 0) {
+        memcpy(program + used, scope_prefix, sizeof(scope_prefix) - 1u);
+        used += sizeof(scope_prefix) - 1u;
+        for (size_t i = 0; i < scope_count; i++) {
+            memcpy(program + used, scope_with, sizeof(scope_with) - 1u);
+            program[used + 10u] = (char) ('0' + i);
+            used += sizeof(scope_with) - 1u;
+        }
+        memcpy(program + used, scope_return, sizeof(scope_return) - 1u);
+        used += sizeof(scope_return) - 1u;
+    }
     memcpy(program + used, prefix, sizeof(prefix) - 1u);
     used += sizeof(prefix) - 1u;
     memcpy(program + used, source, source_length);
     used += source_length;
-    memcpy(program + used, suffix, sizeof(suffix));
+    memcpy(program + used, suffix, sizeof(suffix) - 1u);
+    used += sizeof(suffix) - 1u;
+    if (scope_count > 0) program[used++] = '}';
+    program[used++] = ')';
+    program[used] = '\0';
     JS_FreeCString(context, source);
     JSValue function = JS_Eval(context, program, length,
                                "<inline-event-handler>",
                                JS_EVAL_TYPE_GLOBAL);
     budget_free(bridge->host->budget, program);
-    return function;
+    if (scope_count == 0 || JS_IsException(function)) return function;
+    JSValue chain = JS_NewArray(context);
+    for (size_t i = 0; i < scope_count && !JS_IsException(chain); i++)
+        if (JS_SetPropertyUint32(context, chain, (uint32_t) i,
+                                 JS_DupValue(context, scopes[i])) < 0) {
+            JS_FreeValue(context, chain);
+            chain = JS_EXCEPTION;
+        }
+    JSValue handler = JS_IsException(chain) ? JS_EXCEPTION
+        : JS_Call(context, function, chain, 0, NULL);
+    JS_FreeValue(context, chain);
+    JS_FreeValue(context, function);
+    return handler;
 }
 
 static JSValue script_profile_native_value(JSContext *context,

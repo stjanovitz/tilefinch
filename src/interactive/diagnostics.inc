@@ -74,6 +74,13 @@ static void print_http_replay_ledger(void)
     }
     if (!any) printf("none");
     putchar('\n');
+    if (stats.media_lane_request_count != 0 || stats.range_slice_count != 0
+        || stats.media_alias_count != 0) {
+        printf("http-replay-media lane-requests=%zu lane-served=%zu "
+               "range-slices=%zu aliases=%zu\n",
+               stats.media_lane_request_count, stats.media_lane_served_count,
+               stats.range_slice_count, stats.media_alias_count);
+    }
 }
 
 static size_t visual_evidence_decimal_digits(size_t value)

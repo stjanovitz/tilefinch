@@ -64,6 +64,8 @@ typedef struct {
     bool module;
     bool validate_request_context;
     bool document;
+    /* A same-origin page fetch() rather than a script element. */
+    bool fetch;
 } ScriptReplayRecord;
 
 static uint64_t replay_body_hash(const char *data, size_t length)
@@ -93,7 +95,8 @@ static bool write_module_replay_metadata(
         ? document_url : record->referrer_url;
     const char *referrer_policy = record->referrer_policy == NULL
         ? "" : record->referrer_policy;
-    bool contextual = record->module || record->validate_request_context;
+    bool cors = record->module || record->fetch;
+    bool contextual = cors || record->validate_request_context;
     char referer[TILEFINCH_URL_SERIALIZED_LIMIT];
     if (!fetch_compute_referrer(
             referrer_source, record->url, referrer_policy,
@@ -114,7 +117,7 @@ static bool write_module_replay_metadata(
         "request-cookie-bytes=0\nrequest-has-cf-clearance=0\n"
         "request-extra-header-bytes=0\nrequest-extra-header-shape=\n"
         "request-allow-http-errors=1\nrequest-enforce-cors=%d\n"
-        "request-redirect-same-origin-only=0\n"
+        "request-redirect-same-origin-only=%d\n"
         "request-cors-cached-response-validated=0\n"
         "request-if-none-match=\nrequest-if-modified-since=\n"
         "request-referer=%s\nrequest-origin=%s\nrequest-accept=%s\n"
@@ -138,14 +141,14 @@ static bool write_module_replay_metadata(
         record->url, record->url, success ? 1 : 0, record->delay_pumps,
         record->external_cancel ? 1 : 0,
         success ? "" : "fixture transport failure",
-        record->module ? 1 : 0, contextual ? referer : "",
-        record->module ? origin : "",
+        cors ? 1 : 0, record->fetch ? 1 : 0, contextual ? referer : "",
+        cors ? origin : "",
         contextual ? "*/*" : "",
-        contextual ? "script" : "",
-        record->module ? "cors" : contextual ? "no-cors" : "",
+        record->fetch ? "empty" : contextual ? "script" : "",
+        cors ? "cors" : contextual ? "no-cors" : "",
         contextual ? "same-origin" : "",
-        record->module ? 2 : 0,
-        contextual ? (record->module ? origin : document_url) : "",
+        cors ? 2 : 0,
+        contextual ? (cors ? origin : document_url) : "",
         contextual ? document_url : "",
         contextual ? referrer_source : "",
         contextual ? referrer_policy : "",

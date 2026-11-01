@@ -103,6 +103,159 @@ void js_rt_heap_census(ScriptRuntime *runtime, JSMemoryUsage *usage)
     JS_ComputeMemoryUsage(runtime->runtime, usage);
 }
 
+#if defined(CONFIG_TILEFINCH_HEAP_DETAIL) && !defined(TILEFINCH_NO_TRACE)
+/* Heap composition census (host lab only, CONFIG_TILEFINCH_HEAP_DETAIL).
+   TILEFINCH_TRACE_JS_HEAP_DETAIL=1 prints
+   a heap composition census (jsmem-* lines on stderr) at the first safe
+   point after the realm's allocator refused a request, at every
+   TILEFINCH_TRACE_JS_HEAP_DETAIL_STEP_KB (default 4096) high-water step, and with each
+   memory report. TILEFINCH_TRACE_JS_HEAP_DETAIL=gc also collects after an OOM
+   census and takes a second one, measuring what a forced GC would free. */
+static int jsmem_mode(void)
+{
+    static int mode = -1;
+    if (mode < 0) {
+        const char *value = getenv("TILEFINCH_TRACE_JS_HEAP_DETAIL");
+        mode = value == NULL || value[0] == '\0' ? 0
+            : strcmp(value, "gc") == 0 ? 2 : 1;
+    }
+    return mode;
+}
+
+bool js_rt_jsmem_enabled(void)
+{
+    return jsmem_mode() != 0;
+}
+
+static size_t jsmem_step(void)
+{
+    static size_t step = 0;
+    if (step == 0) {
+        const char *value = getenv("TILEFINCH_TRACE_JS_HEAP_DETAIL_STEP_KB");
+        long kb = value == NULL ? 4096 : atol(value);
+        step = (size_t) (kb > 0 ? kb : 4096) * 1024u;
+    }
+    return step;
+}
+
+typedef struct {
+    unsigned sequence;
+    const void *runtime;
+} JsmemRowContext;
+
+static void jsmem_row(void *opaque, const char *kind, const char *name,
+                      const int64_t *values, int count)
+{
+    const JsmemRowContext *row = opaque;
+    fprintf(stderr, "jsmem-row seq=%u rt=%p kind=%s", row->sequence,
+            row->runtime, kind);
+    for (int i = 0; i < count; i++)
+        fprintf(stderr, " v%d=%lld", i, (long long) values[i]);
+    fprintf(stderr, " name=\"");
+    for (const char *c = name; c != NULL && *c != '\0'; c++)
+        fputc(*c == '"' || (unsigned char) *c < 32 ? '_' : *c, stderr);
+    fprintf(stderr, "\"\n");
+}
+
+void js_rt_jsmem_census(ScriptRuntime *runtime, const char *reason, bool gc)
+{
+    if (runtime == NULL || runtime->runtime == NULL) return;
+    for (int pass = 0; pass < (gc ? 2 : 1); pass++) {
+        if (pass == 1) JS_RunGC(runtime->runtime);
+        JsmemRowContext row = {++runtime->jsmem_sequence,
+                               (const void *) runtime};
+        uint64_t started = js_rt_monotonic_time_ns();
+        JSMemoryUsage usage;
+        js_rt_heap_census(runtime, &usage);
+        fprintf(stderr,
+                "jsmem-census seq=%u rt=%p reason=%s%s pool-current=%zu "
+                "pool-peak=%zu pool-reserved=%zu rejections=%zu "
+                "retained=%lld atoms=%lld/%lld strings=%lld/%lld "
+                "objects=%lld/%lld props=%lld shapes=%lld/%lld "
+                "funcs=%lld/%lld code=%lld pc2line=%lld binaries=%lld/%lld",
+                row.sequence, row.runtime, reason, pass ? "-aftergc" : "",
+                budget_quickjs_pool_js_malloc_current(runtime->quickjs_pool),
+                budget_quickjs_pool_js_malloc_peak(runtime->quickjs_pool),
+                budget_quickjs_pool_reserved_current(runtime->quickjs_pool),
+                budget_quickjs_pool_rejection_count(runtime->quickjs_pool),
+                (long long) usage.memory_used_size,
+                (long long) usage.atom_count, (long long) usage.atom_size,
+                (long long) usage.str_count, (long long) usage.str_size,
+                (long long) usage.obj_count, (long long) usage.obj_size,
+                (long long) usage.prop_size,
+                (long long) usage.shape_count, (long long) usage.shape_size,
+                (long long) usage.js_func_count,
+                (long long) usage.js_func_size,
+                (long long) usage.js_func_code_size,
+                (long long) usage.js_func_pc2line_size,
+                (long long) usage.binary_object_count,
+                (long long) usage.binary_object_size);
+        if (runtime->budget != NULL) {
+            fprintf(stderr, " budget=%zu", runtime->budget->current);
+            for (size_t i = 0; i < BUDGET_CATEGORY_COUNT; i++)
+                fprintf(stderr, " %s=%zu",
+                        budget_category_name((BudgetCategory) i),
+                        runtime->budget->categories[i].current);
+        }
+        {
+            BudgetQuickJSActivity activity;
+            budget_quickjs_pool_activity(runtime->quickjs_pool, &activity);
+            fprintf(stderr, " reject-old=%zu reject-new=%zu reject-live=%zu",
+                    activity.rejected_old_bytes, activity.rejected_new_bytes,
+                    activity.rejected_live_bytes);
+        }
+        if (runtime->jsmem_compile_name != NULL) {
+            fprintf(stderr, " compiling-bytes=%zu compiling=",
+                    runtime->jsmem_compile_bytes);
+            for (const char *c = runtime->jsmem_compile_name;
+                 *c != '\0'; c++)
+                fputc(*c == ' ' || (unsigned char) *c < 33 ? '_' : *c, stderr);
+        }
+        fprintf(stderr, " wrappers=%zu\n", runtime->bridge.node_count);
+        JS_ComputeMemoryDetail(runtime->runtime, jsmem_row, &row);
+        if (getenv("TILEFINCH_TRACE_JS_HEAP_DETAIL_RESOURCE") != NULL && pass == 0
+            && strncmp(reason, "oom", 3) == 0 && runtime->budget != NULL
+            && runtime->jsmem_oom_censuses == 1)
+            budget_report_active(runtime->budget, BUDGET_CATEGORY_RESOURCE,
+                                 4096, stderr);
+        fprintf(stderr, "jsmem-end seq=%u census-us=%llu\n", row.sequence,
+                (unsigned long long) ((js_rt_monotonic_time_ns() - started)
+                                      / UINT64_C(1000)));
+    }
+}
+
+void js_rt_jsmem_census_check(ScriptRuntime *runtime, const char *where,
+                              bool safe)
+{
+    int mode = jsmem_mode();
+    if (mode == 0 || runtime == NULL || runtime->quickjs_pool == NULL)
+        return;
+    size_t rejections = budget_quickjs_pool_rejection_count(
+        runtime->quickjs_pool);
+    if (rejections > runtime->jsmem_rejections_seen) {
+        runtime->jsmem_rejections_seen = rejections;
+        if (runtime->jsmem_oom_censuses < 6) {
+            runtime->jsmem_oom_censuses++;
+            char reason[64];
+            snprintf(reason, sizeof(reason), "oom-%s", where);
+            js_rt_jsmem_census(runtime, reason, mode == 2 && safe);
+        }
+        return;
+    }
+    size_t current = budget_quickjs_pool_js_malloc_current(
+        runtime->quickjs_pool);
+    if (runtime->jsmem_next_high_water == 0)
+        runtime->jsmem_next_high_water = jsmem_step();
+    if (current >= runtime->jsmem_next_high_water) {
+        while (runtime->jsmem_next_high_water <= current)
+            runtime->jsmem_next_high_water += jsmem_step();
+        char reason[64];
+        snprintf(reason, sizeof(reason), "hw-%s", where);
+        js_rt_jsmem_census(runtime, reason, false);
+    }
+}
+#endif
+
 size_t script_runtime_heap_used(const ScriptRuntime *runtime)
 {
     return runtime == NULL || runtime->quickjs_pool == NULL ? 0
@@ -136,6 +289,23 @@ static size_t script_runtime_current_limit(const ScriptRuntime *runtime)
             ? SIZE_MAX : limit + runtime->boot_window_bytes;
     }
     return limit;
+}
+
+/* From the growth hook: the response cache's sole-owned classic script
+   bodies (source this page compiled) give way for `needed` more bytes. */
+static void script_runtime_release_script_bodies(ScriptRuntime *runtime,
+                                                 size_t needed)
+{
+    if (runtime->session == NULL
+        || runtime->session->budget != runtime->budget || needed == 0)
+        return;
+    size_t releases = runtime->session->cache_script_body_releases;
+    size_t freed = browser_session_cache_release_script_bodies(
+        runtime->session, needed);
+    js_rt_saturating_add_size(&runtime->result.script_body_cache_releases,
+        runtime->session->cache_script_body_releases - releases);
+    js_rt_saturating_add_size(
+        &runtime->result.script_body_cache_released_bytes, freed);
 }
 
 /* Called by the allocator (no JavaScript, and no allocation except the
@@ -181,6 +351,48 @@ size_t js_rt_heap_growth_hook(void *opaque, size_t live, size_t growth,
        from the Budget after the raise, so it is not spare: counting it let
        the realm end up to one unused step below the page reserve. */
     size_t granted = live < limit ? limit - live : 0;
+    /* Then the cached bodies of classic scripts, as much as this step
+       needs: the page compiled them, and a revisit can fetch them again. */
+    size_t wanted = runtime->heap_growth_reserve > SIZE_MAX - granted
+            || runtime->heap_growth_reserve + granted > SIZE_MAX - step
+        ? SIZE_MAX : runtime->heap_growth_reserve + granted + step;
+    if (free_bytes < wanted) {
+        script_runtime_release_script_bodies(runtime, wanted - free_bytes);
+        free_bytes = budget_remaining(runtime->budget);
+    }
+    /* Then the body of the script running now: compiled before it started,
+       it is read again only by a refetch. Its cached copy, if any, is then
+       the cache's alone. */
+    if (free_bytes < wanted && runtime->running_source.release != NULL) {
+        ScriptSourceReleaseFn release = runtime->running_source.release;
+        runtime->running_source.release = NULL;
+        release(runtime->running_source.opaque);
+        runtime->running_source.released = true;
+        runtime->result.script_body_sources_released++;
+        js_rt_saturating_add_size(
+            &runtime->result.script_body_sources_released_bytes,
+            runtime->running_source.length);
+        free_bytes = budget_remaining(runtime->budget);
+        if (free_bytes < wanted) {
+            script_runtime_release_script_bodies(runtime,
+                                                 wanted - free_bytes);
+            free_bytes = budget_remaining(runtime->budget);
+        }
+    }
+    /* Last, retained function source no uncompiled function needs gives
+       way before growth is refused (evaluation.inc, "Function source
+       outside the heap"): unlike a body, dropped text is not fetched
+       again. Compression allocates only Budget memory (smaller than what
+       it frees), as the memory rescue below does. */
+    if (runtime->source_store != NULL
+        && runtime->heap_growth_reserve <= SIZE_MAX - granted
+        && runtime->heap_growth_reserve + granted <= SIZE_MAX - needed
+        && free_bytes < runtime->heap_growth_reserve + granted + needed) {
+        (void) js_rt_source_store_relieve(
+            runtime, runtime->heap_growth_reserve + granted + needed
+                         - free_bytes);
+        free_bytes = budget_remaining(runtime->budget);
+    }
     if (free_bytes <= runtime->heap_growth_reserve
         || free_bytes - runtime->heap_growth_reserve <= granted) goto refuse;
     size_t spare = free_bytes - runtime->heap_growth_reserve - granted;
@@ -204,6 +416,31 @@ refuse:
        per realm. */
     js_rt_memory_rescue_capture(runtime);
     return 0;
+}
+
+void script_runtime_offer_source_release(ScriptRuntime *runtime,
+                                         ScriptSourceReleaseFn release,
+                                         void *opaque)
+{
+    if (runtime == NULL) return;
+    runtime->source_release = release;
+    runtime->source_release_opaque = opaque;
+    runtime->source_released = false;
+}
+
+bool script_runtime_source_released(const ScriptRuntime *runtime)
+{
+    return runtime != NULL && runtime->source_released;
+}
+
+bool script_runtime_withdraw_source_release(ScriptRuntime *runtime)
+{
+    if (runtime == NULL) return false;
+    bool released = runtime->source_released;
+    runtime->source_release = NULL;
+    runtime->source_release_opaque = NULL;
+    runtime->source_released = false;
+    return released;
 }
 
 /* Collection pacing wants garbage headroom above the live graph, but the
@@ -350,6 +587,15 @@ static size_t js_rt_gc_pacing(void *opaque, size_t live, size_t limit,
     if (runtime == NULL || js_rt_gc_growth_pct() == 0
         || js_rt_gc_pacing_disabled())
         return proposed;
+    /* Script text moved to the function-source store (evaluation.inc,
+       "Function source outside the heap") was part of `live` when it sat
+       in the heap. Without it QuickJS re-arms (at half of live) sooner and
+       collects the same object graph more often for the same allocation;
+       space collections as if the text were still live, up to the limit. */
+    size_t text = script_source_store_text_bytes(runtime->source_store) / 2u;
+    if (text != 0 && proposed > live && proposed < limit) {
+        proposed = text > limit - proposed ? limit : proposed + text;
+    }
     /* QuickJS's own re-arm (half the live heap, or half the remaining
        headroom near the limit) stands while it leaves an amortized step,
        and always far from the limit (a small heap early in startup). */
@@ -425,6 +671,23 @@ size_t script_runtime_heap_available(const ScriptRuntime *runtime)
     if (growable > runtime->heap_growth_ceiling - limit)
         growable = runtime->heap_growth_ceiling - limit;
     return remaining > SIZE_MAX - growable ? SIZE_MAX : remaining + growable;
+}
+
+bool script_error_reports_out_of_memory(const char *error)
+{
+    return error != NULL
+        && (strstr(error, "out of memory") != NULL
+            || strcmp(error, "null") == 0);
+}
+
+size_t script_runtime_heap_admission_available(const ScriptRuntime *runtime)
+{
+    size_t available = script_runtime_heap_available(runtime);
+    if (runtime == NULL || runtime->source_store == NULL) return available;
+    /* The text would be in the heap; what holds it now stays counted in
+       the Budget, so this is never above what the unstripped realm had. */
+    size_t text = script_source_store_text_bytes(runtime->source_store);
+    return available > text ? available - text : 0;
 }
 
 void script_runtime_heap_growth(const ScriptRuntime *runtime,

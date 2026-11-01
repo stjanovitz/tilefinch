@@ -8,6 +8,7 @@
 #include "tilefinch/script_lazy.h"
 #include "tilefinch/sha256.h"
 #include "tilefinch/url.h"
+#include "script_text_lz.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -227,193 +228,6 @@ static ScriptLazyRuntimeBundle *lazy_bundle_find(ScriptRuntime *runtime,
     return NULL;
 }
 
-#define SCRIPT_LAZY_LZ_HASH_BITS 14u
-#define SCRIPT_LAZY_LZ_HASH_SIZE (1u << SCRIPT_LAZY_LZ_HASH_BITS)
-
-static uint32_t lazy_lz_word(const unsigned char *source)
-{
-    uint32_t word;
-    memcpy(&word, source, sizeof(word));
-    return word;
-}
-
-static size_t lazy_lz_hash(uint32_t word)
-{
-    return (size_t) ((word * UINT32_C(2654435761))
-                     >> (32u - SCRIPT_LAZY_LZ_HASH_BITS));
-}
-
-static bool lazy_lz_emit_length(unsigned char *output, size_t capacity,
-                                size_t *at, size_t length)
-{
-    while (length >= 255) {
-        if (*at >= capacity) return false;
-        output[(*at)++] = 255;
-        length -= 255;
-    }
-    if (*at >= capacity) return false;
-    output[(*at)++] = (unsigned char) length;
-    return true;
-}
-
-/* A small independent LZ4-compatible block encoder keeps cold factory source
-   compact without adding a PSP runtime dependency. Blocks are per factory,
-   so first-call compilation and Function#toString never inflate a complete
-   multi-megabyte bundle. */
-static size_t lazy_lz_compress_block(
-    const unsigned char *source, size_t length,
-    unsigned char *output, size_t capacity, uint32_t *table)
-{
-    memset(table, 0, SCRIPT_LAZY_LZ_HASH_SIZE * sizeof(*table));
-    size_t anchor = 0, input = 0, out = 0;
-    while (input + 4 <= length) {
-        size_t hash = lazy_lz_hash(lazy_lz_word(source + input));
-        uint32_t encoded = table[hash];
-        table[hash] = input < UINT32_MAX ? (uint32_t) input + 1u : 0;
-        if (encoded == 0) {
-            input++;
-            continue;
-        }
-        size_t match = (size_t) encoded - 1u;
-        if (match >= input || input - match > UINT16_MAX
-            || match + 4 > length
-            || memcmp(source + match, source + input, 4) != 0) {
-            input++;
-            continue;
-        }
-        size_t matched = 4;
-        while (input + matched < length
-               && source[match + matched] == source[input + matched]) {
-            matched++;
-        }
-        if (out >= capacity) return 0;
-        size_t token_at = out++;
-        size_t literals = input - anchor;
-        unsigned token = (unsigned) (literals < 15 ? literals : 15) << 4;
-        if (literals >= 15
-            && !lazy_lz_emit_length(output, capacity, &out,
-                                    literals - 15)) return 0;
-        if (literals > capacity - out) return 0;
-        memcpy(output + out, source + anchor, literals);
-        out += literals;
-        if (capacity - out < 2) return 0;
-        size_t distance = input - match;
-        output[out++] = (unsigned char) distance;
-        output[out++] = (unsigned char) (distance >> 8);
-        size_t match_code = matched - 4;
-        token |= (unsigned) (match_code < 15 ? match_code : 15);
-        if (match_code >= 15
-            && !lazy_lz_emit_length(output, capacity, &out,
-                                    match_code - 15)) return 0;
-        output[token_at] = (unsigned char) token;
-        input += matched;
-        anchor = input;
-    }
-    size_t literals = length - anchor;
-    if (out >= capacity) return 0;
-    size_t token_at = out++;
-    output[token_at] = (unsigned char) ((literals < 15 ? literals : 15) << 4);
-    if (literals >= 15
-        && !lazy_lz_emit_length(output, capacity, &out,
-                                literals - 15)) return 0;
-    if (literals > capacity - out) return 0;
-    memcpy(output + out, source + anchor, literals);
-    return out + literals;
-}
-
-static bool lazy_lz_read_length(const unsigned char *input,
-                                size_t input_length, size_t *input_at,
-                                size_t *length)
-{
-    for (;;) {
-        if (*input_at >= input_length) return false;
-        unsigned value = input[(*input_at)++];
-        if (*length > SIZE_MAX - value) return false;
-        *length += value;
-        if (value != 255) return true;
-    }
-}
-
-static bool lazy_lz_decompress_block(
-    const unsigned char *input, size_t input_length,
-    unsigned char *output, size_t output_length)
-{
-    size_t in = 0, out = 0;
-    while (in < input_length) {
-        unsigned token = input[in++];
-        size_t literals = token >> 4;
-        if (literals == 15
-            && !lazy_lz_read_length(
-                input, input_length, &in, &literals)) return false;
-        if (literals > input_length - in
-            || literals > output_length - out) return false;
-        memcpy(output + out, input + in, literals);
-        in += literals;
-        out += literals;
-        if (in == input_length) return out == output_length;
-        if (input_length - in < 2) return false;
-        size_t distance = (size_t) input[in]
-                        | (size_t) input[in + 1] << 8;
-        in += 2;
-        if (distance == 0 || distance > out) return false;
-        size_t matched = token & 15u;
-        if (matched == 15
-            && !lazy_lz_read_length(
-                input, input_length, &in, &matched)) return false;
-        if (matched > SIZE_MAX - 4) return false;
-        matched += 4;
-        if (matched > output_length - out) return false;
-        for (size_t i = 0; i < matched; i++) {
-            output[out + i] = output[out + i - distance];
-        }
-        out += matched;
-    }
-    return out == output_length;
-}
-
-/* Verify a compressed image against its original without materializing a
-   second full-size output. Match references point backward into bytes already
-   checked in original, which is equivalent to comparing a decoded block. */
-static bool lazy_lz_decompress_matches(
-    const unsigned char *input, size_t input_length,
-    const unsigned char *original, size_t original_length)
-{
-    size_t in = 0, out = 0;
-    while (in < input_length) {
-        unsigned token = input[in++];
-        size_t literals = token >> 4;
-        if (literals == 15
-            && !lazy_lz_read_length(
-                input, input_length, &in, &literals)) return false;
-        if (literals > input_length - in
-            || literals > original_length - out
-            || memcmp(input + in, original + out, literals) != 0) {
-            return false;
-        }
-        in += literals;
-        out += literals;
-        if (in == input_length) return out == original_length;
-        if (input_length - in < 2) return false;
-        size_t distance = (size_t) input[in]
-                        | (size_t) input[in + 1] << 8;
-        in += 2;
-        if (distance == 0 || distance > out) return false;
-        size_t matched = token & 15u;
-        if (matched == 15
-            && !lazy_lz_read_length(
-                input, input_length, &in, &matched)) return false;
-        if (matched > SIZE_MAX - 4) return false;
-        matched += 4;
-        if (matched > original_length - out) return false;
-        for (size_t i = 0; i < matched; i++) {
-            if (original[out + i] != original[out + i - distance]) {
-                return false;
-            }
-        }
-        out += matched;
-    }
-    return out == original_length;
-}
 
 static bool lazy_compress_exact_block(
     ScriptRuntime *runtime, const unsigned char *input, size_t input_length,
@@ -432,10 +246,10 @@ static bool lazy_compress_exact_block(
         budget_free(runtime->budget, compressed);
         return false;
     }
-    size_t written = lazy_lz_compress_block(
+    size_t written = script_text_lz_compress(
         input, input_length, compressed, capacity, table);
     bool verified = written != 0
-        && lazy_lz_decompress_matches(
+        && script_text_lz_matches(
             compressed, written, input, input_length);
     if (!verified) {
         budget_free(runtime->budget, compressed);
@@ -491,7 +305,7 @@ static bool lazy_factory_program(Budget *budget,
                bundle->source + factory->source_offset,
                factory->source_length);
     } else {
-        restored = lazy_lz_decompress_block(
+        restored = script_text_lz_decompress(
             factory->compressed_source,
             factory->compressed_source_length,
             (unsigned char *) copy + prefix_length,
@@ -528,7 +342,7 @@ static JSValue lazy_factory_source_string(
     unsigned char *source = budget_malloc(
         runtime->budget, factory->source_length);
     if (source == NULL
-        || !lazy_lz_decompress_block(
+        || !script_text_lz_decompress(
                factory->compressed_source,
                factory->compressed_source_length,
                source, factory->source_length)) {
@@ -1332,7 +1146,7 @@ static bool lazy_store_factory_sources(
     }
     uint32_t *table = budget_malloc(
         runtime->budget,
-        SCRIPT_LAZY_LZ_HASH_SIZE * sizeof(*table));
+        SCRIPT_TEXT_LZ_HASH_SIZE * sizeof(*table));
     if (table == NULL) return false;
     /* No factory is compiled here: each one is compiled, and so checked,
        when it first runs (lazy_factory_compile). A factory that never runs

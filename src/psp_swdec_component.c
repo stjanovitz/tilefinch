@@ -11,10 +11,34 @@
 
 #define printf psp_log_printf
 
-/* psp-size currently reports 4,751,096 bytes for the user component and
-   2,717 bytes for the resident helper. Keep modest loader/alignment headroom
-   and fail admission before asking the firmware for untracked memory. */
-#define PSP_SWDEC_COMPONENT_RESIDENT_BYTES (5u * 1024u * 1024u)
+/* Loading the component charges the page Budget nothing. The user PRX
+   (1,970,644 bytes loaded for the release build, 2,036,356 with the
+   validation diagnostics and the reference CABAC copy) and its start thread come from user-partition
+   memory that boot leaves outside the newlib heap whenever the add-on is
+   installed (psp_heap_reserve.c); the resident helper (about 3 KiB) loads
+   into kernel memory. The component's own C library allocates from a 16 KiB
+   pool inside its image (swdec_component_psp.c), and every decoder buffer
+   is taken from the Budget when a stream opens (media_backend_psp_swdec.c).
+   The 5 MiB this used to reserve predates both: it charged pages for memory
+   the heap never gave up. */
+
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+/* boot.cfg validation_swdec_* flags for the component's start block,
+   published at boot before anything can open a video. */
+static uint32_t component_validation_flags;
+
+void psp_swdec_component_set_validation_flags(uint32_t flags)
+{
+    component_validation_flags = flags;
+}
+
+static volatile uint32_t component_window_mark;
+
+void psp_swdec_component_window_step(void)
+{
+    component_window_mark++;
+}
+#endif
 
 static void component_error(
     char *error, size_t error_size, const char *format, ...)
@@ -28,12 +52,19 @@ static void component_error(
 
 static void component_log(const char *format, ...)
 {
-    char line[256];
+    /* The validation component's stage report runs to about 330 bytes; a
+       256-byte line cut its last fields and its newline. */
+    char line[512];
     va_list arguments;
     va_start(arguments, format);
     vsnprintf(line, sizeof(line), format, arguments);
     va_end(arguments);
     printf("tilefinch-swdec: %s", line);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    /* Component lines are rare and often the last words before a Media
+       Engine stall takes the device down; push each one to the log file. */
+    (void) psp_log_flush(true);
+#endif
 }
 
 static bool component_file_exists(const char *path)
@@ -45,9 +76,8 @@ static bool component_file_exists(const char *path)
 }
 
 /* Release the user module only while it cannot own the Media Engine. A stop or
-   unload failure deliberately retains the budget reservation: firmware still
-   owns the resident bytes, so reporting them free would make later admission
-   unsafe even if the component itself is no longer usable. */
+   unload failure keeps the module id: firmware still owns its memory, so the
+   component must not be loaded again on top of it. */
 static bool component_unload_module(PspSwdecComponent *component)
 {
     if (component == NULL || component->module_id < 0 || component->took_me)
@@ -70,7 +100,6 @@ static bool component_unload_module(PspSwdecComponent *component)
     }
     component->module_id = -1;
     memset(&component->api, 0, sizeof(component->api));
-    budget_reservation_release(&component->resident_reservation);
     return true;
 }
 
@@ -78,20 +107,11 @@ static void component_failed_message(
     const PspSwdecComponent *component,
     char *error, size_t error_size)
 {
-    if (component != NULL
-        && component->failure == PSP_SWDEC_COMPONENT_FAILURE_MISSING) {
-        component_error(error, error_size,
-                        "OPTIONAL VIDEO DECODER NOT INSTALLED - SEE README");
-    } else if (component != NULL
-               && component->failure == PSP_SWDEC_COMPONENT_FAILURE_REBUILD) {
-        component_error(error, error_size,
-                        "OPTIONAL VIDEO DECODER NEEDS REBUILD - SEE README");
-    } else {
-        component_error(error, error_size,
-                        "optional video decoder is unavailable (0x%08x)",
-                        component == NULL ? 0u
-                            : (unsigned) component->last_native_error);
-    }
+    tilefinch_swdec_component_failure_message(
+        component == NULL ? TILEFINCH_SWDEC_FAILURE_RUNTIME
+                          : component->failure,
+        component == NULL ? 0 : component->last_native_error,
+        error, error_size);
 }
 
 static bool component_program_path(
@@ -162,21 +182,10 @@ static bool psp_swdec_component_load(
                         "OPTIONAL VIDEO DECODER IS INCOMPLETE - SEE README");
         return false;
     }
-    if (!budget_reservation_acquire(
-            &component->resident_reservation, component->budget,
-            BUDGET_CATEGORY_RESOURCE,
-            PSP_SWDEC_COMPONENT_RESIDENT_BYTES)) {
-        component->state = PSP_SWDEC_COMPONENT_FAILED;
-        component->failure = PSP_SWDEC_COMPONENT_FAILURE_RUNTIME;
-        component_error(error, error_size,
-                        "software decoder component exceeds memory budget");
-        return false;
-    }
     if (!component_program_path(
             component, "tilefinch-swdec.prx", path, sizeof(path))) {
         component->state = PSP_SWDEC_COMPONENT_FAILED;
         component->failure = PSP_SWDEC_COMPONENT_FAILURE_RUNTIME;
-        budget_reservation_release(&component->resident_reservation);
         component_error(error, error_size,
                         "software decoder component path is unavailable");
         return false;
@@ -186,55 +195,82 @@ static bool psp_swdec_component_load(
         component->last_native_error = module;
         component->state = PSP_SWDEC_COMPONENT_FAILED;
         component->failure = PSP_SWDEC_COMPONENT_FAILURE_RUNTIME;
-        budget_reservation_release(&component->resident_reservation);
         component_error(error, error_size,
                         "software decoder load failed (0x%08x)",
                         (unsigned) module);
         return false;
     }
     component->module_id = module;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    /* The longer start block carries the validation flags (same ABI). */
+    TilefinchSwdecComponentValidationStart start = {
+        .start = {
+            .magic = TILEFINCH_SWDEC_COMPONENT_MAGIC,
+            .abi_version = TILEFINCH_SWDEC_COMPONENT_ABI_VERSION,
+            .struct_size = sizeof(start),
+            .api = &component->api
+        },
+        .validation_flags = component_validation_flags,
+        .window_mark = &component_window_mark
+    };
+    if (component_validation_flags != 0)
+        component_log("validation flags 0x%x\n",
+                      (unsigned) component_validation_flags);
+#else
     TilefinchSwdecComponentStart start = {
         .magic = TILEFINCH_SWDEC_COMPONENT_MAGIC,
         .abi_version = TILEFINCH_SWDEC_COMPONENT_ABI_VERSION,
         .struct_size = sizeof(start),
         .api = &component->api
     };
+#endif
     int status = -1;
     int result = sceKernelStartModule(
         module, sizeof(start), &start, &status, NULL);
     component->module_started = result >= 0;
-    if (result < 0 || status != 0
-        || component->api.magic != TILEFINCH_SWDEC_COMPONENT_MAGIC
-        || component->api.abi_version
-             != TILEFINCH_SWDEC_COMPONENT_ABI_VERSION
-        || component->api.struct_size < sizeof(component->api)
-        || component->api.attach_me == NULL
-        || component->api.detach_me == NULL
-        || component->api.restore_me == NULL
-        || component->api.arena_bytes == NULL
-        || component->api.open == NULL
-        || component->api.decode == NULL
-        || component->api.set_speed == NULL
-        || component->api.close == NULL
-        || component->api.bind_aux_arena == NULL
-        || component->api.recover_me == NULL
-        || component->api.me_failed == NULL
-        || component->api.audio_setup == NULL
-        || component->api.audio_submit == NULL
-        || component->api.audio_done == NULL
-        || component->api.audio_pcm == NULL
-        || component->api.audio_reset == NULL
-        || component->api.audio_shutdown == NULL
-        || component->api.csc_begin == NULL
-        || component->api.csc_picture == NULL
-        || component->api.csc_close == NULL
-        || component->api.csc_off == NULL) {
-        component->last_native_error = result < 0 ? result : status;
+    bool api_valid = result >= 0 && status == 0
+        && component->api.magic == TILEFINCH_SWDEC_COMPONENT_MAGIC
+        && component->api.abi_version
+             == TILEFINCH_SWDEC_COMPONENT_ABI_VERSION
+        && component->api.struct_size >= sizeof(component->api)
+        && component->api.attach_me != NULL
+        && component->api.detach_me != NULL
+        && component->api.restore_me != NULL
+        && component->api.arena_bytes != NULL
+        && component->api.open != NULL
+        && component->api.decode != NULL
+        && component->api.set_speed != NULL
+        && component->api.close != NULL
+        && component->api.bind_aux_arena != NULL
+        && component->api.recover_me != NULL
+        && component->api.me_failed != NULL
+        && component->api.audio_setup != NULL
+        && component->api.audio_submit != NULL
+        && component->api.audio_done != NULL
+        && component->api.audio_pcm != NULL
+        && component->api.audio_reset != NULL
+        && component->api.audio_shutdown != NULL
+        && component->api.csc_begin != NULL
+        && component->api.csc_picture != NULL
+        && component->api.csc_close != NULL
+        && component->api.csc_off != NULL;
+    TilefinchSwdecFailure start_failure =
+        tilefinch_swdec_component_start_failure(result, status, api_valid);
+    if (start_failure != TILEFINCH_SWDEC_FAILURE_NONE) {
+        /* A firmware refusal to start the module (memory for its start
+           thread, most often) is not a sign of a stale component: only
+           module_start's own refusal or a foreign API table are. */
         component->state = PSP_SWDEC_COMPONENT_FAILED;
-        component->failure = PSP_SWDEC_COMPONENT_FAILURE_REBUILD;
+        component->failure = start_failure;
         memset(&component->api, 0, sizeof(component->api));
         (void) component_unload_module(component);
-        component_failed_message(component, error, error_size);
+        component->last_native_error = result < 0 ? result : status;
+        if (start_failure == TILEFINCH_SWDEC_FAILURE_RUNTIME)
+            component_error(error, error_size,
+                            "software decoder start failed (0x%08x)",
+                            (unsigned) result);
+        else
+            component_failed_message(component, error, error_size);
         return false;
     }
     component->state = PSP_SWDEC_COMPONENT_LOADED;

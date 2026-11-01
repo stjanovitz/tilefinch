@@ -7,6 +7,7 @@
 
 #include "media_backend_psp_policy.h"
 #include "psp_media_session_internal.h"
+#include "tilefinch/media_failure_message.h"
 #include "tilefinch/platform.h"
 #include "tilefinch/psp_log.h"
 #include "tilefinch/user_agent.h"
@@ -214,10 +215,19 @@ void psp_media_raise_error(
     if (media == NULL) return;
     bool was_failed = media->ui.failed;
     psp_media_reset_rotation(media);
-    if (reason != NULL) {
-        psp_ui_media_set_error_reason(&media->ui, message, reason);
+    /* Engine text naming a known cause (a decoder route, a coding the PSP
+       cannot play, a 4xx answer) is shown as a short catalog headline with
+       the cause on the details line. The log below keeps the engine text. */
+    MediaFailureMessage friendly;
+    const char *shown = message, *shown_reason = reason;
+    if (reason == NULL && media_failure_message(message, &friendly)) {
+        shown = friendly.headline;
+        shown_reason = friendly.details;
+    }
+    if (shown_reason != NULL) {
+        psp_ui_media_set_error_reason(&media->ui, shown, shown_reason);
     } else {
-        psp_ui_media_set_error(&media->ui, message);
+        psp_ui_media_set_error(&media->ui, shown);
     }
     bool youtube_route = !media->offline_source && !media->page_source
         && youtube_watch_url_supported(media->source);
@@ -1079,6 +1089,7 @@ bool psp_media_backend_stats_snapshot(
 void psp_media_pipeline_destroy(PspMediaSession *media)
 {
     if (media == NULL) return;
+    media->open_network_pending = false;
     media->presentation_deferred = false;
     psp_media_buffering_end(media, psp_media_now_us(media));
     youtube_resolve_job_destroy(media->resolver_job);
@@ -1209,6 +1220,22 @@ void psp_media_pipeline_destroy(PspMediaSession *media)
        picture was in it, because the next session's first frame must stage
        rather than trust what a previous one left. */
     media->present_stage_identity = 0;
+    MediaBackendStats rendition_stats = {0};
+    if (!media->use_swdec
+        && psp_media_backend_stats_snapshot(media, &rendition_stats)) {
+        media->rendition_prior_pictures =
+            rendition_stats.decoded_video_frames
+                > SIZE_MAX - media->rendition_prior_pictures
+            ? SIZE_MAX
+            : media->rendition_prior_pictures
+                + rendition_stats.decoded_video_frames;
+        media->rendition_prior_refusals =
+            rendition_stats.refused_video_packets
+                > SIZE_MAX - media->rendition_prior_refusals
+            ? SIZE_MAX
+            : media->rendition_prior_refusals
+                + rendition_stats.refused_video_packets;
+    }
     media_playback_destroy(media->playback);
     psp_media_hls_destroy(media->hls);
     media_mp4_close(media->demux);
@@ -1220,6 +1247,7 @@ void psp_media_pipeline_destroy(PspMediaSession *media)
     media->playback = NULL;
     media->present_error[0] = '\0';
     media->hls = NULL;
+    media->hls_delivery_deferred = false;
     media->hls_source = (MediaSampleSource) {0};
     media->hls_audio_source = (MediaSampleSource) {0};
     media->demux = NULL;
@@ -1294,6 +1322,9 @@ void psp_media_shutdown(PspMediaSession *media)
     psp_media_pipeline_destroy(media);
     budget_free(media->budget, media->caption_catalog);
     media->caption_catalog = NULL;
+    budget_free(media->budget, media->page_content_security_policy);
+    media->page_content_security_policy = NULL;
+    psp_media_page_candidates_release(media);
     psp_media_set_transport_priority(media, false);
     psp_media_finish_synchronous_quiesce(
         media, "shutdown-released");
@@ -1556,6 +1587,7 @@ static void psp_media_prepare_route_kind(
             media->page_source = false;
             media->page_audio = false;
             media->page_hls = false;
+            psp_media_page_candidates_release(media);
             media->page_document_url[0] = '\0';
             media->page_media_node_handle = 0;
             media->suspended_for_internal_view = false;
@@ -1651,6 +1683,11 @@ static void psp_media_prepare_route_kind(
     media->page_source = direct_page_route;
     media->page_audio = direct_page_route && direct_page_audio;
     media->page_hls = false;
+    media->hls_selection_bound = PSP_MEDIA_HLS_BOUND_FIRMWARE;
+    /* A further page rendition opens through here too and keeps the rest
+       of its list; any other route ends it. */
+    if (!media->page_candidate_advancing)
+        psp_media_page_candidates_release(media);
     media->audio_only = media->page_audio
         || (!direct_page_route && !offline_route
             && browser_profile_youtube_audio_only(media->profile));
@@ -1675,6 +1712,9 @@ static void psp_media_prepare_route_kind(
     media->quality_fallback_attempted = false;
     psp_media_continuation_clear(&media->continuation);
     psp_media_target_clear(&media->pending_target);
+    /* A new route must not inherit another video's known timeline, even
+       when its explicit start position creates a continuation below. */
+    media->stream.duration_ms = 0;
     media->reopen_seek_completion_pending = false;
     /* A new route starts a new incident. The cap is not a process/session
        lifetime allowance; it bounds candidate replacements until this route
@@ -1684,6 +1724,8 @@ static void psp_media_prepare_route_kind(
     media->transport_next_expiry_check_us = 0;
     media->failure_report_level = 0;
     media->quality_fallbacks = 0;
+    media->rendition_prior_pictures = 0;
+    media->rendition_prior_refusals = 0;
     media->accumulated_decoded_video_frames = 0;
     media->accumulated_dropped_video_frames = 0;
     media->accumulated_discarded_seek_video_frames = 0;
@@ -1918,17 +1960,52 @@ static bool psp_media_playlist_tick(PspMediaSession *media)
     return changed;
 }
 
+const TilefinchContentSecurityPolicy *psp_media_page_content_security_policy(
+    const PspMediaSession *media)
+{
+    const TilefinchContentSecurityPolicy *policy = media == NULL
+        ? NULL : media->page_content_security_policy;
+    return policy != NULL && policy->header_present ? policy : NULL;
+}
+
+/* Overwrites the session copy in place: a live range or HLS context of the
+   route being replaced may still hold the pointer until the route change
+   destroys its pipeline. A refused copy refuses the open (fail closed). */
+static bool psp_media_snapshot_page_policy(
+    PspMediaSession *media, const TilefinchContentSecurityPolicy *policy)
+{
+    if (policy == NULL || !policy->header_present) {
+        if (media->page_content_security_policy != NULL)
+            tilefinch_csp_init(media->page_content_security_policy);
+        return true;
+    }
+    if (media->page_content_security_policy == NULL) {
+        media->page_content_security_policy = budget_malloc_category(
+            media->budget, BUDGET_CATEGORY_NAVIGATION,
+            sizeof(*media->page_content_security_policy));
+        if (media->page_content_security_policy == NULL) return false;
+    }
+    if (media->page_content_security_policy != policy) {
+        memcpy(media->page_content_security_policy, policy,
+               sizeof(*policy));
+    }
+    return true;
+}
+
 static bool psp_media_open_page_source_kind(
     PspMediaSession *media, const char *source_url,
     const char *document_url, uint64_t generation,
     int64_t node_handle, TilefinchRequestMode mode,
-    TilefinchCredentialsMode credentials, bool audio_only,
-    bool autoplay, bool reload_source)
+    TilefinchCredentialsMode credentials,
+    const TilefinchContentSecurityPolicy *content_security_policy,
+    bool audio_only, bool autoplay, bool reload_source)
 {
     if (media == NULL || source_url == NULL || document_url == NULL
         || node_handle < 0
         || (strncmp(source_url, "https://", 8u) != 0
-            && strncmp(source_url, "http://", 7u) != 0)) return false;
+            && strncmp(source_url, "http://", 7u) != 0)
+        || !psp_media_snapshot_page_policy(
+               media, content_security_policy)) return false;
     /* load() is an explicit resource-selection restart even when the URL did
        not change. Play on the same source retains the cheap pipeline reuse. */
     bool same_route = !reload_source && media->page_source
@@ -1937,8 +2014,10 @@ static bool psp_media_open_page_source_kind(
         && media->generation == generation
         && strcmp(media->source, source_url) == 0
         && strcmp(media->page_document_url, document_url) == 0;
-    snprintf(media->page_document_url,
-             sizeof(media->page_document_url), "%s", document_url);
+    if (document_url != media->page_document_url) {
+        snprintf(media->page_document_url,
+                 sizeof(media->page_document_url), "%s", document_url);
+    }
     media->page_media_node_handle = node_handle;
     media->page_media_mode = mode;
     media->page_media_credentials = credentials;
@@ -1981,34 +2060,41 @@ bool psp_media_open_page_source(
     PspMediaSession *media, const char *source_url,
     const char *document_url, uint64_t generation,
     int64_t node_handle, TilefinchRequestMode mode,
-    TilefinchCredentialsMode credentials, bool autoplay,
-    bool reload_source)
+    TilefinchCredentialsMode credentials,
+    const TilefinchContentSecurityPolicy *content_security_policy,
+    bool autoplay, bool reload_source)
 {
     return psp_media_open_page_source_kind(
         media, source_url, document_url, generation, node_handle,
-        mode, credentials, false, autoplay, reload_source);
+        mode, credentials, content_security_policy, false, autoplay,
+        reload_source);
 }
 
 bool psp_media_open_page_audio(
     PspMediaSession *media, const char *source_url,
     const char *document_url, uint64_t generation,
     int64_t node_handle, TilefinchRequestMode mode,
-    TilefinchCredentialsMode credentials, bool autoplay,
-    bool reload_source)
+    TilefinchCredentialsMode credentials,
+    const TilefinchContentSecurityPolicy *content_security_policy,
+    bool autoplay, bool reload_source)
 {
     return psp_media_open_page_source_kind(
         media, source_url, document_url, generation, node_handle,
-        mode, credentials, true, autoplay, reload_source);
+        mode, credentials, content_security_policy, true, autoplay,
+        reload_source);
 }
 
 bool psp_media_open_page_hls(
     PspMediaSession *media, const char *source_url,
     const char *document_url, uint64_t generation,
     int64_t node_handle, TilefinchRequestMode mode,
-    TilefinchCredentialsMode credentials, bool autoplay,
-    bool reload_source)
+    TilefinchCredentialsMode credentials,
+    const TilefinchContentSecurityPolicy *content_security_policy,
+    bool autoplay, bool reload_source)
 {
-    if (media == NULL) return false;
+    if (media == NULL
+        || !psp_media_snapshot_page_policy(
+               media, content_security_policy)) return false;
     bool same_route = !reload_source && media->page_source && media->page_hls
         && media->generation == generation
         && strcmp(media->source, source_url) == 0
@@ -2028,15 +2114,148 @@ bool psp_media_open_page_hls(
     }
     bool opened = psp_media_open_page_source(
         media, source_url, document_url, generation, node_handle,
-        mode, credentials, autoplay, reload_source || !same_route);
+        mode, credentials, content_security_policy, autoplay,
+        reload_source || !same_route);
     if (opened) media->page_hls = true;
     return opened;
+}
+
+void psp_media_page_candidates_release(PspMediaSession *media)
+{
+    if (media == NULL) return;
+    budget_free(media->budget, media->page_candidates);
+    media->page_candidates = NULL;
+    media->page_candidates_length = 0;
+    media->page_candidates_cursor = 0;
+}
+
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+/* Page-video device pass: which rendition each open used, in order, so the
+   fallback sequence reads directly beside its page-candidate refusals.
+   ordinal is 1 for the first candidate; total counts it and the further
+   renditions the activation packed. */
+static void psp_media_log_page_candidate(
+    unsigned ordinal, size_t total, MediaDiscoveryKind kind, bool opened,
+    const char *url)
+{
+    printf("tilefinch-page-media: event=candidate ordinal=%u of=%zu "
+           "kind=%s opened=%d url=\"%.200s\"\n",
+           ordinal, total,
+           kind == MEDIA_DISCOVERY_HLS ? "hls"
+               : kind == MEDIA_DISCOVERY_MP4 ? "mp4" : "other",
+           opened ? 1 : 0, url == NULL ? "" : url);
+}
+#endif
+
+static bool psp_media_open_page_candidate(
+    PspMediaSession *media, const char *url, MediaDiscoveryKind kind,
+    const char *document_url, uint64_t generation, int64_t node_handle,
+    TilefinchRequestMode mode, TilefinchCredentialsMode credentials,
+    const TilefinchContentSecurityPolicy *content_security_policy)
+{
+    /* Each candidate is a fresh resource selection, as the activation that
+       chose the first one was. */
+    return kind == MEDIA_DISCOVERY_HLS
+        ? psp_media_open_page_hls(
+              media, url, document_url, generation, node_handle, mode,
+              credentials, content_security_policy, true, false)
+        : psp_media_open_page_source(
+              media, url, document_url, generation, node_handle, mode,
+              credentials, content_security_policy, true, false);
+}
+
+bool psp_media_open_page_candidates(
+    PspMediaSession *media, const char *url, MediaDiscoveryKind kind,
+    const char *alternates, size_t alternates_length,
+    const char *document_url, uint64_t generation, int64_t node_handle,
+    TilefinchRequestMode mode, TilefinchCredentialsMode credentials,
+    const TilefinchContentSecurityPolicy *content_security_policy)
+{
+    if (media == NULL || url == NULL || document_url == NULL) return false;
+    psp_media_page_candidates_release(media);
+    bool opened = psp_media_open_page_candidate(
+        media, url, kind, document_url, generation, node_handle, mode,
+        credentials, content_security_policy);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    size_t candidate_total = 1u
+        + (alternates == NULL
+               || alternates_length > MEDIA_CANDIDATE_PACKED_CAPACITY
+               ? 0u : media_candidates_count(alternates, alternates_length));
+    psp_media_log_page_candidate(1u, candidate_total, kind, opened, url);
+#endif
+    if (alternates == NULL || alternates_length == 0
+        || alternates_length > MEDIA_CANDIDATE_PACKED_CAPACITY) return opened;
+    /* Without the copy the first candidate is the only one, as before. */
+    char *copy = budget_malloc_category(
+        media->budget, BUDGET_CATEGORY_NAVIGATION, alternates_length);
+    if (copy == NULL) return opened;
+    memcpy(copy, alternates, alternates_length);
+    MediaDiscoveryKind next_kind = MEDIA_DISCOVERY_NONE;
+    size_t cursor = 0;
+    const char *next = NULL;
+    while (!opened
+           && (next = media_candidates_next(
+                   copy, alternates_length, &cursor, &next_kind)) != NULL) {
+        opened = psp_media_open_page_candidate(
+            media, next, next_kind, document_url, generation, node_handle,
+            mode, credentials, content_security_policy);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        psp_media_log_page_candidate(
+            1u + (unsigned) media_candidates_count(copy, cursor),
+            candidate_total, next_kind, opened, next);
+#endif
+    }
+    if (!opened || cursor >= alternates_length) {
+        budget_free(media->budget, copy);
+        return opened;
+    }
+    media->page_candidates = copy;
+    media->page_candidates_length = alternates_length;
+    media->page_candidates_cursor = cursor;
+    return true;
+}
+
+bool psp_media_open_next_page_candidate(PspMediaSession *media)
+{
+    if (media == NULL || media->page_candidates == NULL) return false;
+    MediaDiscoveryKind kind = MEDIA_DISCOVERY_NONE;
+    const char *url;
+    while ((url = media_candidates_next(
+                media->page_candidates, media->page_candidates_length,
+                &media->page_candidates_cursor, &kind)) != NULL) {
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        /* Counted before the open, which owns the list while it runs. */
+        unsigned candidate_ordinal = 1u + (unsigned) media_candidates_count(
+            media->page_candidates, media->page_candidates_cursor);
+        size_t candidate_total = 1u + media_candidates_count(
+            media->page_candidates, media->page_candidates_length);
+        char candidate_url[201];
+        snprintf(candidate_url, sizeof(candidate_url), "%s", url);
+#endif
+        media->page_candidate_advancing = true;
+        bool opened = psp_media_open_page_candidate(
+            media, url, kind, media->page_document_url, media->generation,
+            media->page_media_node_handle, media->page_media_mode,
+            media->page_media_credentials,
+            /* The opening document's snapshot; overwriting it with itself
+               is a no-op. */
+            psp_media_page_content_security_policy(media));
+        media->page_candidate_advancing = false;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        psp_media_log_page_candidate(
+            candidate_ordinal, candidate_total, kind, opened, candidate_url);
+#endif
+        if (opened) return true;
+    }
+    psp_media_page_candidates_release(media);
+    return false;
 }
 
 void psp_media_close(PspMediaSession *media)
 {
     if (media == NULL) return;
     youtube_playlist_destroy(media->playlist); media->playlist = NULL;
+    psp_media_page_candidates_release(media);
     media->ui_presentation.queue_active = false;
     media->ui_presentation.track_menu_open = false;
     psp_media_session_checkpoint(media, "close-begin");
@@ -2129,59 +2348,6 @@ bool psp_media_reclaim_hidden_pipeline_for_navigation(
         return false;
     }
     return psp_media_reclaim_hidden_pipeline(media);
-}
-
-static void psp_media_request_user_retry(PspMediaSession *media)
-{
-    /* Called only by execute_intent, after its session NULL guard. */
-    if (media->source[0] == '\0') return;
-    if (!psp_media_continuation_reopening(&media->continuation)
-        && media->playback != NULL)
-        psp_media_remember_retry_state(media, false);
-    /* An explicit recovery choice is a new incident initiated by the user,
-       so it receives a fresh bounded candidate allowance. */
-    media->transport_reresolve_attempts = 0;
-    media->transport_refresh_rearm_us = 0;
-    media->transport_next_expiry_check_us = 0;
-    media->failure_report_level = 0;
-    media->open_service_pending = true;
-    psp_ui_media_set_resolving(&media->ui, "YouTube video");
-    psp_media_dispatch(media, (PspMediaEvent) {
-        .type = PSP_MEDIA_EVENT_RETRY
-    }, "retry-intent");
-}
-
-static void psp_media_request_track_reopen(PspMediaSession *media)
-{
-    if (media == NULL || media->source[0] == '\0'
-        || media->playback == NULL) return;
-    uint64_t resume_us = psp_media_recovery_position_us(media);
-    bool resume_playing = media->ui.playing
-        || psp_media_machine_wants_playing(media)
-        || media->job_resume_playing;
-    psp_media_dispatch(media, (PspMediaEvent) {
-        .type = PSP_MEDIA_EVENT_CLOSE,
-        .retain_pipeline = false
-    }, "track-switch-close");
-    psp_media_pipeline_destroy(media);
-    psp_media_finish_synchronous_quiesce(media, "track-switch-released");
-    if (media_psp_backend_quarantined()) {
-        psp_media_job_failed(
-            media, "track switch", "VIDEO DECODER NEEDS APP RESTART");
-        return;
-    }
-    media->clock_us = resume_us;
-    psp_media_continuation_reopen(
-        &media->continuation, resume_us, resume_playing);
-    media->reopen_seek_completion_pending = true;
-    media->open_service_pending = true;
-    psp_media_dispatch(media, (PspMediaEvent) {
-        .type = PSP_MEDIA_EVENT_OPEN,
-        .autoplay = resume_playing,
-        .has_separate_audio = false,
-        .audio_only = media->audio_only
-    }, "track-switch-open");
-    psp_ui_media_set_resolving(&media->ui, "Switching audio");
 }
 
 static void psp_media_reset_subtitle_document(PspMediaSession *media,
@@ -2992,11 +3158,75 @@ static bool psp_media_start_pending_preview_commit(
     return true;
 }
 
+/*
+ * The candidate-refusal reason for a stream the firmware decoder refused from
+ * its opening pictures (psp_media_avc_rendition_opening_refused), or
+ * `fallback` when the rendition's counters do not say that. A fallback that
+ * the backend marked as a first-picture refusal loses that mark once the
+ * rendition decoded pictures on an earlier backend.
+ */
+static const char *psp_media_opening_refusal_reason(
+    PspMediaSession *media, const char *fallback)
+{
+    MediaBackendStats stats = {0};
+    if (media == NULL) return fallback;
+    fallback = media_candidate_failure_after_pictures(
+        fallback, media->rendition_prior_pictures);
+    if (media->use_swdec || media->playback == NULL
+        || !media_playback_backend_stats(media->playback, &stats)
+        || !psp_media_avc_rendition_opening_refused(
+               media->rendition_prior_pictures,
+               media->rendition_prior_refusals,
+               stats.decoded_video_frames, stats.refused_video_packets))
+        return fallback;
+    return MEDIA_H264_OPENING_REFUSAL;
+}
+
+static bool psp_media_defer_hls_delivery(const PspMediaSession *media)
+{
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    if (media_psp_swdec_legacy_due_wait()) return false;
+#endif
+    return psp_media_hls_delivery_after_present(media->hls != NULL,
+        media->use_swdec, media->have_frame,
+        media->ui.visible && media->ui.playing
+            && media->machine.state == PSP_MEDIA_SESSION_PLAYING,
+        media->range != NULL || media->audio_range != NULL
+            || media->job_phase != PSP_MEDIA_JOB_NONE
+            || media->audio_hold.applied || media->pause_boundary_pending
+            || media->seek_floor.armed || media->machine.preview_active
+            || psp_media_startup_active(&media->startup),
+        media->ui.buffering);
+}
+
+void psp_media_service_after_present(PspMediaSession *media)
+{
+    if (media == NULL || !media->hls_delivery_deferred) return;
+    media->hls_delivery_deferred = false;
+    /* Input may have closed/reopened or paused this pipeline. Never carry
+       the old delivery obligation into another transaction. */
+    if (media->hls != NULL && media->ui.visible && media->ui.playing
+        && media->machine.state == PSP_MEDIA_SESSION_PLAYING
+        && media->job_phase == PSP_MEDIA_JOB_NONE) {
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        uint64_t started_us = psp_media_now_us(media);
+#endif
+        psp_media_pump_ranges(media);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        psp_media_telemetry_report_slow_unit(media, "after-present-hls",
+            psp_media_now_us(media) - started_us);
+#endif
+    }
+}
+
 bool psp_media_advance(
     PspMediaSession *media, unsigned elapsed_ms,
     const TilefinchCancellation *cancellation)
 {
     if (media == NULL) return false;
+    /* Each part below ends where the next begins; the caller ends whichever
+       one an early return leaves open. */
+    MEDIA_SWDEC_CPU_BEGIN(MEDIA_SWDEC_CPU_PREP);
     psp_media_session_checkpoint(media, "advance-begin");
     /* Before anything else this frame: a decoded slot may be held by a
        transfer nobody is tracking, and every path below assumes the ownership
@@ -3144,7 +3374,12 @@ bool psp_media_advance(
     media->advance_previous_playing =
         media->machine.state == PSP_MEDIA_SESSION_PLAYING
         && (media->have_frame || media->audio_only);
-    psp_media_pump_ranges(media);
+    MEDIA_SWDEC_CPU_BEGIN(MEDIA_SWDEC_CPU_TRANSPORT);
+    if (psp_media_defer_hls_delivery(media))
+        media->hls_delivery_deferred = true;
+    else
+        psp_media_pump_ranges(media);
+    MEDIA_SWDEC_CPU_END(MEDIA_SWDEC_CPU_TRANSPORT);
     /* The frame's own transport step, outside any pump unit -- if the stall
        lives here rather than inside a unit, this is what names it. */
     psp_media_telemetry_report_slow_unit(
@@ -3152,6 +3387,9 @@ bool psp_media_advance(
     if (psp_media_retry_transport_expiry(media)) {
         return true;
     }
+    /* The clock part brackets the step from outside: the step's text is
+       compiled on its own by the SDK contract tests. */
+    MEDIA_SWDEC_CPU_BEGIN(MEDIA_SWDEC_CPU_CLOCK);
     if (media->machine.state == PSP_MEDIA_SESSION_PLAYING
         && !media->machine.preview_active
         && !media->audio_hold.applied) {
@@ -3194,6 +3432,7 @@ bool psp_media_advance(
         }
     }
     char error[256] = {0};
+    MEDIA_SWDEC_CPU_END(MEDIA_SWDEC_CPU_CLOCK);
     bool first_frame_pending = psp_media_first_frame_pending(
         media->have_frame, media->first_frame_opened_us);
     bool awaiting_pause_boundary =
@@ -3212,6 +3451,7 @@ bool psp_media_advance(
     /* Telemetry only: which part of the frame a conversion completing on the
        codec worker landed in. See media_psp_backend_set_loop_phase. */
     media_psp_backend_set_loop_phase(PSP_MEDIA_LOOP_PHASE_PUMP);
+    MEDIA_SWDEC_CPU_BEGIN(MEDIA_SWDEC_CPU_FEED);
     MediaPlaybackAdvanceResult advance;
     if (media->present_error[0] != '\0') {
         snprintf(error, sizeof(error), "%s", media->present_error);
@@ -3286,6 +3526,7 @@ bool psp_media_advance(
          */
         break;
     }
+    MEDIA_SWDEC_CPU_BEGIN(MEDIA_SWDEC_CPU_MID);
     media_psp_backend_set_loop_phase(PSP_MEDIA_LOOP_PHASE_OTHER);
     if (catch_up) {
         MediaPlaybackJobStats pumped = {0};
@@ -3305,9 +3546,7 @@ bool psp_media_advance(
            false cadence outlier. All source counters remain cumulative, so
            the teardown report loses no information. */
     }
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
     bool indicator_was_buffering = media->ui.buffering;
-#endif
     if (first_frame_pending) {
         /* Time the browser spent blocked inside the bounded pump. The codec
            worker is asynchronous, so seconds here mean an HTTP range read. */
@@ -3342,12 +3581,17 @@ bool psp_media_advance(
            error. Spend the same bounded re-resolution budget as progressive
            delivery and reopen at the new live edge; decoder failures remain
            on their existing recovery path. */
-        bool live_delivery_failed = media->stream.live_hls
-            && psp_media_hls_failed(media->hls);
+        bool hls_delivery_failed = psp_media_hls_failed(media->hls);
+        /* A stream whose coding the firmware decoder refuses cannot be
+           helped by a fresh URL; another rendition can. Other mid-playback
+           failures keep their existing recovery. */
+        const char *failure = psp_media_opening_refusal_reason(media, error);
+        if (strstr(failure, MEDIA_H264_UNSUPPORTED_STREAM) != NULL
+            && psp_media_retry_page_candidate(media, failure)) return true;
         if (psp_media_retry_delivery_failure(
-                media, "decode", error, live_delivery_failed)) return true;
+                media, "decode", failure, hls_delivery_failed)) return true;
         if (psp_media_retry_240p(
-                media, "decode", error, false)) return true;
+                media, "decode", failure, false)) return true;
         MediaHttpRangeStats video_http = {0};
         MediaHttpRangeStats audio_http = {0};
         (void) media_http_range_stats(media->range, &video_http);
@@ -3361,12 +3605,6 @@ bool psp_media_advance(
                 "action=failed video-failures=%zu audio-failures=%zu\n",
                 status, video_http.failures, audio_http.failures);
         }
-        bool retry_playing = media->ui.playing;
-        psp_media_remember_retry_state(media, retry_playing);
-        psp_media_release_presentation_preroll(media);
-        media_playback_set_playing(media->playback, false);
-        media->ui.playing = false;
-        media->decode_job_pending = false;
         /* Retire the first-frame transaction with the failure. Leaving it
            armed kept decode_work_pending true, so the pump ran on: the
            backend's specific reason (an AVC status code, or the raw-NAL
@@ -3374,13 +3612,15 @@ bool psp_media_advance(
            "VIDEO DECODER MADE NO PROGRESS" and then by the first-frame
            timeout -- the generic label users end up reporting. */
         psp_media_retire_first_frame(media);
-        psp_media_raise_error(media, error, NULL);
         MediaPlaybackJobStats stats = {0};
         media_playback_job_stats(media->playback, &stats);
         printf("tilefinch-media: advance failed: %s calls=%zu yielded=%zu "
                "packets=%zu would-block=%zu\n",
-               error, stats.calls, stats.yielded_calls,
+               failure, stats.calls, stats.yielded_calls,
                stats.packets_submitted, stats.would_block_calls);
+        psp_media_job_failed(media, "decode", failure);
+        psp_media_pipeline_destroy(media);
+        psp_media_finish_synchronous_quiesce(media, "decode-failed-released");
         return true;
     }
     if (media->audio_only)
@@ -3412,6 +3652,21 @@ bool psp_media_advance(
        frozen public clock. Decoder admission uses that lead; early/late frame
        decisions below must not. */
     uint64_t take_clock_us = media->clock_us;
+    if (media->use_swdec
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        && !media_psp_swdec_legacy_audio_clock()
+#endif
+        ) {
+        uint64_t fresh_audio_us = 0;
+        bool fresh_audio = media_playback_audio_cursor_us(
+            media->playback, &fresh_audio_us);
+        take_clock_us = psp_media_take_clock_refresh(take_clock_us,
+            media->ui.playing,
+            priming_before_take || media->machine.preview_active
+                || psp_media_startup_active(&media->startup)
+                || media->seek_floor.armed,
+            fresh_audio, fresh_audio_us);
+    }
     /* Wide firmware pictures need two synchronous GE strips before scanout.
        Prepare within one extra display interval, but leave the public/DAC
        clock untouched. The final publication fence rechecks the ordinary
@@ -3488,9 +3743,13 @@ bool psp_media_advance(
         }
     }
     if (!media->presentation_deferred
-        && (!psp_media_startup_active(&media->startup) || startup_claim_allowed))
+        && (!psp_media_startup_active(&media->startup) || startup_claim_allowed)) {
+        MEDIA_SWDEC_CPU_BEGIN(MEDIA_SWDEC_CPU_TAKE);
         received_frame =
             media_playback_take_video_frame(media->playback, &frame);
+        MEDIA_SWDEC_CPU_END(MEDIA_SWDEC_CPU_TAKE);
+    }
+    MEDIA_SWDEC_CPU_BEGIN(MEDIA_SWDEC_CPU_TAIL);
     frame_progress = frame_progress || received_frame;
     PspUiMediaPresentation *p = &media->ui_presentation;
     p->rotation_hint_always = browser_profile_rotate_hint_always(media->profile);
@@ -3770,6 +4029,11 @@ bool psp_media_advance(
         media->decode_no_progress_ms = 0;
     if (decode_watchdog_active && media->decode_no_progress_ms
         >= psp_media_decode_no_progress_budget_ms(source_refilling)) {
+        const char *opening_refusal =
+            psp_media_opening_refusal_reason(media, NULL);
+        if (opening_refusal != NULL
+            && psp_media_retry_page_candidate(media, opening_refusal))
+            return true;
         if (psp_media_delivery_candidate_stalled(media)
             && psp_media_retry_delivery_failure(
                    media, "no-progress", "MEDIA SOURCE MADE NO PROGRESS",
@@ -3888,8 +4152,14 @@ bool psp_media_advance(
             return true;
         }
     }
-    if (was_pending != media->decode_job_pending) changed = true;
     bool ended = media_playback_ended(media->playback);
+    bool pending_visual = psp_media_decode_pending_visual_change(was_pending,
+        media->decode_job_pending, media->have_frame, media->ui.playing, ended);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    if (media->use_swdec && media_psp_swdec_legacy_due_wait())
+        pending_visual = was_pending != media->decode_job_pending;
+#endif
+    changed = pending_visual || changed;
     if (ended && !media->machine.ended) {
         psp_media_dispatch(media, (PspMediaEvent) {
             .type = PSP_MEDIA_EVENT_PLAYBACK_ENDED
@@ -3931,6 +4201,7 @@ bool psp_media_advance(
                (unsigned long long) buffered);
 #endif
     psp_ui_media_set_buffering(&media->ui, buffering, buffered);
+    changed = (indicator_was_buffering != buffering) || changed;
     psp_ui_media_tick(&media->ui, elapsed_ms);
     /* Captions are optional background work. The old ordering parsed as much
        as 8 KiB before ranges, codec submission, audio queueing and frame

@@ -3413,6 +3413,72 @@
     document_destroy(&worker_lifecycle_document);
     CHECK(budget.current == 0);
 
+    puts("test: SharedWorker is a refusing shell and Worker still runs");
+    {
+        PocDocument shared_document;
+        CHECK(document_parse(
+            &shared_document, &budget, worker_lifecycle_page,
+            strlen(worker_lifecycle_page), 8));
+        ScriptResult shared_result = {0};
+        ScriptRuntime *shared_runtime = script_runtime_create_deferred(
+            &shared_document, &budget, 4 * MIB, 1000,
+            "https://shared-worker.test/", NULL, &shared_result);
+        CHECK(shared_runtime != NULL);
+        /* The shell answers feature detection and refuses construction
+           without activating the Worker module. */
+        CHECK(script_runtime_evaluate_diagnostic(
+            shared_runtime,
+            "(()=>{const shape=[typeof SharedWorker,!window.SharedWorker,"
+            "SharedWorker.name,SharedWorker.length,"
+            "Object.prototype.toString.call(SharedWorker.prototype),"
+            "Function.prototype.toString.call(SharedWorker).includes("
+            "'[native code]'),"
+            "Object.getPrototypeOf(SharedWorker.prototype)==="
+            "EventTarget.prototype];"
+            "const refusal=construct=>{try{construct();return 'constructed'}"
+            "catch(error){return (error instanceof DOMException?'dom:':'')"
+            "+error.name+(error instanceof DOMException?':'+error.code:'')}};"
+            "shape.push(refusal(()=>new SharedWorker('/shared.js')),"
+            "refusal(()=>new SharedWorker(URL.createObjectURL("
+            "new Blob(['onconnect=()=>{}'])),{name:'n'})),"
+            "refusal(()=>new SharedWorker()),"
+            "refusal(()=>SharedWorker('/shared.js')));"
+            "pocSummary=shape.join(',')})()",
+            "<shared-worker-shell>", &shared_result));
+        const char *expected_shell =
+            "function,false,SharedWorker,1,[object SharedWorker],true,true,"
+            "dom:NotSupportedError:9,dom:NotSupportedError:9,TypeError,"
+            "TypeError";
+        if (strcmp(shared_result.summary, expected_shell) != 0)
+            fprintf(stderr, "shared worker shell summary=%s error=%s\n",
+                    shared_result.summary, shared_result.error);
+        CHECK(strcmp(shared_result.summary, expected_shell) == 0
+              && shared_result.bootstrap_lazy_module_loads == 0);
+        /* A dedicated Worker still works next to it, and its realm does not
+           see SharedWorker (the interface is exposed to Window only). */
+        CHECK(script_runtime_evaluate_diagnostic(
+            shared_runtime,
+            "(()=>{const url=URL.createObjectURL(new Blob(["
+            "\"onmessage=e=>postMessage(e.data+':'+typeof SharedWorker)\"]));"
+            "const worker=new Worker(url);URL.revokeObjectURL(url);"
+            "worker.onmessage=event=>{pocSummary='worker:'+event.data;"
+            "worker.terminate()};worker.postMessage('ping');"
+            "pocSummary='pending'})()",
+            "<shared-worker-dedicated>", &shared_result));
+        for (size_t turn = 0; turn < 8; turn++)
+            CHECK(script_runtime_advance(shared_runtime, turn, 8,
+                                         &shared_result));
+        if (strcmp(shared_result.summary, "worker:ping:undefined") != 0)
+            fprintf(stderr, "shared worker dedicated summary=%s error=%s\n",
+                    shared_result.summary, shared_result.error);
+        CHECK(strcmp(shared_result.summary, "worker:ping:undefined") == 0
+              && shared_result.bootstrap_lazy_module_loads == 1
+              && shared_result.bootstrap_lazy_module_failures == 0);
+        script_runtime_destroy(shared_runtime);
+        document_destroy(&shared_document);
+        CHECK(budget.current == 0);
+    }
+
     puts("test: Worker startup refusal rolls back its bounded realm slot");
     CHECK(document_parse(
         &worker_lifecycle_document, &budget, worker_lifecycle_page,
@@ -4828,6 +4894,44 @@
         fprintf(stderr, "worker import summary=%s error=%s\n",
                 worker_import_result.summary, worker_import_result.error);
     CHECK(strcmp(worker_import_result.summary, "loaded:NetworkError") == 0);
+    script_runtime_destroy(worker_import_runtime);
+    document_destroy(&worker_import_document);
+    CHECK(budget.current == 0);
+
+    puts("test: a blob Worker imports absolute URLs, not relative ones");
+    CHECK(document_parse(
+        &worker_import_document, &budget, worker_lifecycle_page,
+        strlen(worker_lifecycle_page), 8));
+    memset(&worker_import_result, 0, sizeof(worker_import_result));
+    worker_import_runtime = script_runtime_create_deferred(
+        &worker_import_document, &budget, 4 * MIB, 1000,
+        "https://worker-import.test/", NULL, &worker_import_result);
+    /* The absolute import must reach the script fetch (which the injected
+       failure answers without the network) instead of failing to resolve
+       against the blob: worker URL; the relative one cannot resolve. */
+    fetch_inject_failure_once(FETCH_INJECT_TLS);
+    CHECK(worker_import_runtime != NULL
+          && script_runtime_evaluate_diagnostic(
+              worker_import_runtime,
+              "(()=>{pocSummary='pending';const source='const r=[];for(const u of'"
+              "+'[\"https://worker-import.test/lib.js\",\"lib.js\"])'"
+              "+'try{importScripts(u);r.push(\"loaded\")}catch(e){r.push(e.name)}'"
+              "+'postMessage(r.join(\":\"))',"
+              "url=URL.createObjectURL(new Blob([source])),worker=new Worker(url);"
+              "worker.onmessage=event=>{pocSummary=event.data;worker.terminate();"
+              "URL.revokeObjectURL(url)}})()",
+              "<worker-import-absolute>", &worker_import_result));
+    for (size_t worker_turn = 0; worker_turn < 8; worker_turn++) {
+        CHECK(script_runtime_advance(
+            worker_import_runtime, worker_turn, 8,
+            &worker_import_result));
+    }
+    fetch_inject_failure_once(FETCH_INJECT_NONE);
+    if (strcmp(worker_import_result.summary, "NetworkError:SyntaxError") != 0)
+        fprintf(stderr, "worker absolute import summary=%s error=%s\n",
+                worker_import_result.summary, worker_import_result.error);
+    CHECK(strcmp(worker_import_result.summary,
+                 "NetworkError:SyntaxError") == 0);
     script_runtime_destroy(worker_import_runtime);
     document_destroy(&worker_import_document);
     CHECK(budget.current == 0);

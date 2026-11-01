@@ -2,6 +2,7 @@
 #include "tilefinch/budget_quickjs.h"
 #include "tilefinch/content_blocker.h"
 #include "tilefinch/fetch.h"
+#include "tilefinch/media_discovery.h"
 #include "tilefinch/request_context.h"
 #include "tilefinch/resource_integrity.h"
 #include "tilefinch/script_admission.h"
@@ -20,6 +21,7 @@
 #include "tilefinch/text_encoding.h"
 
 #include "js_runtime_internal.h"
+#include "js_source_store.h"
 #include "image_decode_internal.h"
 #include "tilefinch/image_retarget.h"
 

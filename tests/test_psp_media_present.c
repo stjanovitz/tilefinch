@@ -757,6 +757,19 @@ static bool test_portrait_probe_window(void)
     return true;
 }
 
+/* PSP-3000 latch probe: a 16-bit software-decoder picture entered the 32-bit
+   surface, was refused, and was handed back on every frame, so scanout went
+   565 -> 8888 -> 565 with a black page buffer every third flip. */
+static bool test_rgb565_stays_off_the_video_surface(void)
+{
+    CHECK(psp_media_present_video_surface_wanted(true, true, true, true));
+    CHECK(!psp_media_present_video_surface_wanted(true, true, true, false));
+    CHECK(!psp_media_present_video_surface_wanted(true, true, false, true));
+    CHECK(!psp_media_present_video_surface_wanted(true, false, true, true));
+    CHECK(!psp_media_present_video_surface_wanted(false, true, true, true));
+    return true;
+}
+
 int main(void)
 {
     struct { const char *name; bool (*run)(void); } cases[] = {
@@ -781,6 +794,8 @@ int main(void)
         {"ungeable-geometry-still-plans-the-rect",
          test_ungeable_geometry_still_plans_the_rect},
         {"identity-skip-semantics", test_identity_skip_semantics},
+        {"rgb565-stays-off-the-video-surface",
+         test_rgb565_stays_off_the_video_surface},
         {"mode-names", test_mode_names},
         {"host-has-no-graphics-engine", test_host_has_no_graphics_engine}
     };

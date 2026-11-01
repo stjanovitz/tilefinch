@@ -88,9 +88,15 @@
 /* The three colour bytes. The fourth is the primitive's under GU_TCC_RGB and
    the panel ignores it in 8888, so no comparison here may include it. */
 #define PSP_MEDIA_PRESENT_RGB_MASK UINT32_C(0x00ffffff)
+/* 128 bytes of 16-bit texels per slice; at most 16 slices per quad. */
+#define PSP_MEDIA_PRESENT_SLICE_TEXELS 64.0f
+#define PSP_MEDIA_PRESENT_SLICE_LIMIT 16
 
 static unsigned int __attribute__((aligned(64)))
     psp_media_present_ge_list[PSP_MEDIA_PRESENT_GE_LIST_BYTES / 4u];
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+static bool psp_media_present_ge_unsliced_draw;
+#endif
 
 /* Texture coordinates first, then position: the order sceGuDrawArray expects
    for GU_TEXTURE_32BITF | GU_VERTEX_32BITF. */
@@ -823,6 +829,10 @@ static unsigned psp_media_present_texture_extent(unsigned value)
 
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
 static bool psp_media_ge_stage_rows_enabled = true;
+void psp_media_present_ge_unsliced(bool unsliced)
+{
+    psp_media_present_ge_unsliced_draw = unsliced;
+}
 static uint32_t psp_media_ge_stage_rows_copies;
 void psp_media_present_ge_stage_rows_enabled(bool enabled)
 {
@@ -1023,20 +1033,22 @@ bool psp_media_present_ge_submit(
      * neighbouring line is disturbed.
      */
     const PspMediaPresentRect *video = &plan->video;
-    void *rows = destination
-        + (size_t) video->y * (size_t) PSP_MEDIA_PRESENT_VRAM_STRIDE;
+    /* A 16-bit page buffer has the same 512-pixel pitch at half the bytes. */
+    unsigned pixel_bytes = texture->rgb565 ? 2u : 4u;
+    void *rows = (unsigned char *) destination + (size_t) video->y
+        * (size_t) PSP_MEDIA_PRESENT_VRAM_STRIDE * pixel_bytes;
     unsigned row_bytes = (unsigned) video->height
-        * (unsigned) PSP_MEDIA_PRESENT_VRAM_STRIDE * 4u;
+        * (unsigned) PSP_MEDIA_PRESENT_VRAM_STRIDE * pixel_bytes;
     sceKernelDcacheWritebackInvalidateRange(rows, row_bytes);
 
     uint64_t started_us = (uint64_t) sceKernelGetSystemTimeWide();
     sceGuStart(GU_DIRECT, psp_media_present_ge_uncached_list());
     /* 8888 in, 8888 out. The one line this whole change exists for: with the
        target's format equal to the texture's, the rasterizer moves bytes and
-       names no channel. */
+       names no channel. 5650 in, 5650 out is the same statement at 16 bits. */
+    int format = texture->rgb565 ? GU_PSM_5650 : GU_PSM_8888;
     sceGuDrawBufferList(
-        GU_PSM_8888, (void *) (uintptr_t) offset,
-        PSP_MEDIA_PRESENT_VRAM_STRIDE);
+        format, (void *) (uintptr_t) offset, PSP_MEDIA_PRESENT_VRAM_STRIDE);
     sceGuOffset(
         2048u - (unsigned) (PSP_MEDIA_PRESENT_SCREEN_WIDTH / 2),
         2048u - (unsigned) (PSP_MEDIA_PRESENT_SCREEN_HEIGHT / 2));
@@ -1070,7 +1082,7 @@ bool psp_media_present_ge_submit(
      * the swizzle the earlier version applied was pure per-picture overhead and
      * is gone.
      */
-    sceGuTexMode(GU_PSM_8888, 0, 0, GU_FALSE);
+    sceGuTexMode(format, 0, 0, GU_FALSE);
     /* The decoder's alpha byte means nothing on an opaque panel. */
     sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGB);
     sceGuTexFilter(GU_LINEAR, GU_LINEAR);
@@ -1092,7 +1104,7 @@ bool psp_media_present_ge_submit(
         int column = texture->staged && plan->quad_count == 1
             ? 0 : quad->texture_column;
         const unsigned char *texels = (const unsigned char *) texture->pixels
-            + (size_t) column * 4u;
+            + (size_t) column * pixel_bytes;
         sceGuTexImage(
             0, quad->texture_width, quad->texture_height,
             texture->stride_pixels, texels);
@@ -1102,7 +1114,28 @@ bool psp_media_present_ge_submit(
            third. Flush unconditionally -- there is no address the cache can be
            assumed to still be right about. */
         sceGuTexFlush();
-        int vertex_count = quad->clockwise ? 4 : 2;
+        /*
+         * A 16-bit picture is read straight from main RAM, and one sprite the
+         * width of the panel walks every texel row end to end per output row:
+         * the texture cache cannot keep a row band that wide, so each band is
+         * fetched again for every row it serves. The reverted attempt drew
+         * exactly that and waited 29.5ms a frame. Columns of
+         * PSP_MEDIA_PRESENT_SLICE_TEXELS keep a band resident; each slice
+         * edge is a whole destination column on the one global mapping, so
+         * the seams sample what the unsliced draw would.
+         */
+        int slices = 1;
+        if (texture->rgb565 && !quad->clockwise
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+            && !psp_media_present_ge_unsliced_draw
+#endif
+            ) {
+            slices = (int) ((quad->u1 - quad->u0)
+                            / PSP_MEDIA_PRESENT_SLICE_TEXELS) + 1;
+            if (slices > PSP_MEDIA_PRESENT_SLICE_LIMIT)
+                slices = PSP_MEDIA_PRESENT_SLICE_LIMIT;
+        }
+        int vertex_count = quad->clockwise ? 4 : 2 * slices;
         PspMediaPresentGeVertex *vertices =
             sceGuGetMemory(vertex_count * (int) sizeof(*vertices));
         if (vertices == NULL) {
@@ -1112,10 +1145,22 @@ bool psp_media_present_ge_submit(
         if (quad->clockwise) {
             psp_media_present_clockwise_vertices(quad, vertices);
         } else {
-            vertices[0] = (PspMediaPresentGeVertex) {
-                quad->u0, quad->v0, quad->x0, quad->y0, 0.0f};
-            vertices[1] = (PspMediaPresentGeVertex) {
-                quad->u1, quad->v1, quad->x1, quad->y1, 0.0f};
+            /* Slice k is vertices 2k (near corner) and 2k+1 (far corner). */
+            float width = quad->x1 - quad->x0;
+            float texels_per_column = (quad->u1 - quad->u0) / width;
+            for (int at = 0; at < vertex_count; at++) {
+                int edge = (at + 1) / 2;
+                float x = quad->x1, u = quad->u1;
+                if (edge < slices) {
+                    x = quad->x0 + (float) (int) (width * (float) edge
+                                                  / (float) slices);
+                    u = quad->u0 + (x - quad->x0) * texels_per_column;
+                }
+                bool far = (at & 1) != 0;
+                vertices[at] = (PspMediaPresentGeVertex) {
+                    u, far ? quad->v1 : quad->v0,
+                    x, far ? quad->y1 : quad->y0, 0.0f};
+            }
         }
         sceGuDrawArray(
             quad->clockwise ? GU_TRIANGLE_FAN : GU_SPRITES,
@@ -1620,6 +1665,10 @@ bool psp_media_present_ge_stage_rows(
 void psp_media_present_ge_stage_rows_enabled(bool enabled)
 {
     (void) enabled;
+}
+void psp_media_present_ge_unsliced(bool unsliced)
+{
+    (void) unsliced;
 }
 uint32_t psp_media_present_ge_stage_rows_copies(void)
 {

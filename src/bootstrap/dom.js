@@ -914,7 +914,9 @@ const __tilefinchRealmGlobal = this;
     cachedNode, derefReference, retentionStats, nativeNodeStateCleanups,
     wrapperListeners, hasOwnProperty,
   });
-  const propertyHandlerRecordToken = {},
+  const formAssociatedTags =
+      " button fieldset input object output select textarea img ",
+    propertyHandlerRecordToken = {},
     installEventHandler = (
       node, type, callback, token = propertyHandlerRecordToken,
     ) => {
@@ -965,7 +967,17 @@ const __tilefinchRealmGlobal = this;
       if (source === null) return null;
       let callable = null;
       try {
-        callable = __tilefinchRealmGlobal.__tilefinchCompileInlineEventHandler(source);
+        /* HTML's handler scope: element, then its form owner when it is
+           form-associated, then its document, then the global object. */
+        const form = formAssociatedTags.includes(" " + node.localName + " ")
+          ? node.form
+          : null;
+        const formScope = form
+          ? __tilefinchRealmGlobal.__tilefinchFormHandlerScope?.(form) ?? form
+          : null;
+        callable = __tilefinchRealmGlobal.__tilefinchCompileInlineEventHandler(
+          source, node.ownerDocument, formScope, node,
+        );
       } catch (error) {
         __tilefinchReportUncaught(error, "inline " + name);
       }
@@ -1553,9 +1565,10 @@ const __tilefinchRealmGlobal = this;
   class HTMLSourceElement extends HTMLElement {}
   class HTMLSlotElement extends HTMLElement {}
   /* The rest of the HTML standard's element-interface table. None has a
-     member of its own here, so one class body serves them all, and their
-     prototypes share HTMLElement's native wrapper layer (see
-     nativeElementPrototype) instead of each costing a layer of its own. */
+     member of its own here (area and base get `target` below), so one class
+     body serves them all, and their prototypes share HTMLElement's native
+     wrapper layer (see nativeElementPrototype) instead of each costing a
+     layer of its own. */
   const sharedLayerPrototypes = [];
   for (const stem of (
       "Area Base BR Data DataList DList Directory Embed Font Frame HR " +
@@ -1575,6 +1588,33 @@ const __tilefinchRealmGlobal = this;
       writable: true,
       value: constructor,
     });
+  }
+  /* Members HTML gives only some interfaces: `action` is HTMLFormElement's
+     alone and `target` belongs to forms, links and <base>. On every element
+     they made `'action' in div` true and let an <input>'s inline handler
+     read its own action (the page URL) ahead of its form's. */
+  {
+    const target = reflectString("target");
+    Object.defineProperties(HTMLFormElement.prototype, {
+      action: accessor("action", {
+        get action() {
+          const value = this.getAttribute("action") || "";
+          try {
+            return new URL(value || location.href, location.href).href;
+          } catch {
+            return value;
+          }
+        },
+        set action(value) {
+          this.setAttribute("action", String(value));
+        },
+      }),
+      target,
+    });
+    for (const prototype of [HTMLAnchorElement.prototype,
+                             __tilefinchRealmGlobal.HTMLAreaElement.prototype,
+                             __tilefinchRealmGlobal.HTMLBaseElement.prototype])
+      Object.defineProperty(prototype, "target", target);
   }
   /* " tag=index " into sharedLayerPrototypes, read once per tag name. */
   const sharedLayerTags =
@@ -3115,6 +3155,10 @@ const __tilefinchRealmGlobal = this;
       configurable: true, enumerable: true,
       get() { return this.documentElement || null; },
     },
+    childElementCount: {
+      configurable: true, enumerable: true,
+      get() { return this.documentElement ? 1 : 0; },
+    },
     parentNode: documentNull,
     parentElement: documentNull,
     previousSibling: documentNull,
@@ -3382,7 +3426,7 @@ const __tilefinchRealmGlobal = this;
       this.innerHTML = String(html);
     };
   if (typeof Document === "function")
-    Document.parseHTMLUnsafe = function (html) {
+    Document.parseHTMLUnsafe = function parseHTMLUnsafe(html) {
       return new DOMParser().parseFromString(String(html), "text/html");
     };
   /* Web Animations introspection over the animations Element.animate
@@ -3613,7 +3657,10 @@ const __tilefinchRealmGlobal = this;
     }
     return prototype;
   };
-  const classListOwner = Symbol("classList owner");
+  /* A token list's owner element and the attribute it reflects (`class`
+     for classList, inherited from the prototype; `sandbox` is own). */
+  const classListOwner = Symbol("classList owner"),
+    tokenListAttribute = Symbol("token list attribute");
   const classListNode = (list) => {
     const node = list?.[classListOwner];
     if (!node) throw new TypeError("Invalid classList receiver");
@@ -3622,7 +3669,7 @@ const __tilefinchRealmGlobal = this;
   const classListTokens = (list) =>
         [
           ...new Set(
-            String(classListNode(list).getAttribute("class") || "")
+            String(classListNode(list).getAttribute(list[tokenListAttribute]) || "")
               .split(/\s+/)
               .filter(Boolean),
           ),
@@ -3639,12 +3686,20 @@ const __tilefinchRealmGlobal = this;
         return token;
       };
   const writeClassTokens = (list, values) =>
-    classListNode(list).setAttribute("class", values.join(" "));
-  const classListDescriptors = Object.getOwnPropertyDescriptors({
+    classListNode(list).setAttribute(list[tokenListAttribute], values.join(" "));
+  /* DOMTokenList is a real interface: pages (and anti-adblock integrity
+     checks, which walk window.DOMTokenList.prototype.add) find its members
+     on the prototype, and each list holds only its owner. */
+  const DOMTokenList = class DOMTokenList {
+    constructor() {
+      throw new TypeError("Illegal constructor");
+    }
+  };
+  Object.defineProperties(DOMTokenList.prototype, Object.getOwnPropertyDescriptors({
       contains(token) {
         token = String(token);
         return token !== "" &&
-          String(classListNode(this).getAttribute("class") || "")
+          String(classListNode(this).getAttribute(this[tokenListAttribute]) || "")
             .split(/\s+/)
             .includes(token);
       },
@@ -3658,10 +3713,10 @@ const __tilefinchRealmGlobal = this;
         const removed = new Set(values.map(validateClassToken));
         const before = classListTokens(this),
           after = before.filter((value) => !removed.has(value));
-        if (classListNode(this).getAttribute("class") !== null)
+        if (classListNode(this).getAttribute(this[tokenListAttribute]) !== null)
           writeClassTokens(this, after);
       },
-      toggle(token, force) {
+      toggle(token, force = undefined) {
         token = validateClassToken(token);
         /* One parse: the same writes add() and remove() would make. */
         const tokens = classListTokens(this),
@@ -3705,10 +3760,10 @@ const __tilefinchRealmGlobal = this;
         return classListTokens(this).length;
       },
       get value() {
-        return classListNode(this).getAttribute("class") || "";
+        return classListNode(this).getAttribute(this[tokenListAttribute]) || "";
       },
       set value(value) {
-        classListNode(this).setAttribute("class", String(value));
+        classListNode(this).setAttribute(this[tokenListAttribute], String(value));
       },
       values() {
         return classListTokens(this)[Symbol.iterator]();
@@ -3721,21 +3776,33 @@ const __tilefinchRealmGlobal = this;
       entries() {
         return classListTokens(this).entries();
       },
-      forEach(callback, thisArg) {
+      forEach(callback, thisArg = undefined) {
         classListTokens(this).forEach((value, index) =>
           callback.call(thisArg, value, index, this),
         );
       },
-      [Symbol.iterator]() {
-        return this.values();
-      },
       toString() {
         return this.value;
       },
-      supports() {
+      supports(token) {
         throw new TypeError("classList does not define supported tokens");
       },
-    });
+    }));
+  /* WebIDL iterable: @@iterator is `values` itself, not enumerable. */
+  Object.defineProperties(DOMTokenList.prototype, {
+    [Symbol.iterator]: {
+      configurable: true,
+      writable: true,
+      value: DOMTokenList.prototype.values,
+    },
+    [Symbol.toStringTag]: { configurable: true, value: "DOMTokenList" },
+    [tokenListAttribute]: { value: "class" },
+  });
+  Object.defineProperty(__tilefinchRealmGlobal, "DOMTokenList", {
+    configurable: true,
+    writable: true,
+    value: DOMTokenList,
+  });
   const classListProxyHandler = {
       get(target, key, receiver) {
         if (typeof key === "string" && /^\d+$/.test(key))
@@ -3748,11 +3815,11 @@ const __tilefinchRealmGlobal = this;
         return key in target;
       },
     };
-  function makeClassList(node) {
-    // Share executable state, but retain the same per-list own properties
-    // and strong owner relationship used by native wrapper leases.
-    const list = Object.defineProperties({}, classListDescriptors);
+  function makeClassList(node, attribute = undefined) {
+    // Keep the strong owner relationship used by native wrapper leases.
+    const list = Object.create(DOMTokenList.prototype);
     Object.defineProperty(list, classListOwner, { value: node });
+    if (attribute) Object.defineProperty(list, tokenListAttribute, { value: attribute });
     return new Proxy(list, classListProxyHandler);
   }
   const classListValue = Symbol("classList value");
@@ -4106,51 +4173,6 @@ const __tilefinchRealmGlobal = this;
     record.__tilefinchAttributeLocalName = localName;
     return record;
   };
-  function makeTokenList(node, attribute) {
-    return {
-      contains(token) {
-        return String(node.getAttribute(attribute) || "")
-          .split(/\s+/)
-          .includes(String(token));
-      },
-      add(...tokens) {
-        const set = new Set(
-          String(node.getAttribute(attribute) || "")
-            .split(/\s+/)
-            .filter(Boolean),
-        );
-        for (const token of tokens) set.add(String(token));
-        node.setAttribute(attribute, [...set].join(" "));
-      },
-      remove(...tokens) {
-        const removed = new Set(tokens.map(String));
-        node.setAttribute(
-          attribute,
-          String(node.getAttribute(attribute) || "")
-            .split(/\s+/)
-            .filter((token) => token && !removed.has(token))
-            .join(" "),
-        );
-      },
-      toggle(token, force) {
-        token = String(token);
-        const present = this.contains(token),
-          next = force === undefined ? !present : !!force;
-        if (next && !present) this.add(token);
-        else if (!next && present) this.remove(token);
-        return next;
-      },
-      get value() {
-        return node.getAttribute(attribute) || "";
-      },
-      set value(value) {
-        node.setAttribute(attribute, String(value));
-      },
-      toString() {
-        return this.value;
-      },
-    };
-  }
   /* HTML innerText is the rendered text, which the host computes from the
      computed styles (__tilefinchRenderedText); it answers undefined for an
      element that is not being rendered, which reads its textContent. */
@@ -4339,17 +4361,6 @@ const __tilefinchRealmGlobal = this;
     set type(value) {
       this.setAttribute("type", String(value));
     },
-    get action() {
-      const value = this.getAttribute("action") || "";
-      try {
-        return new URL(value || location.href, location.href).href;
-      } catch {
-        return value;
-      }
-    },
-    set action(value) {
-      this.setAttribute("action", String(value));
-    },
     get checked() {
       return this.hasAttribute("checked");
     },
@@ -4475,6 +4486,9 @@ const __tilefinchRealmGlobal = this;
       const values = this.children;
       return values.length ? values[values.length - 1] : null;
     },
+    get childElementCount() {
+      return __tilefinchChildren(this.__handle).length;
+    },
     get src() {
       return this.getAttribute("src") || "";
     },
@@ -4503,12 +4517,6 @@ const __tilefinchRealmGlobal = this;
     },
     set rel(value) {
       this.setAttribute("rel", value);
-    },
-    get target() {
-      return this.getAttribute("target") || "";
-    },
-    set target(value) {
-      this.setAttribute("target", value);
     },
     get width() {
       if (this instanceof HTMLCanvasElement) {
@@ -4547,7 +4555,7 @@ const __tilefinchRealmGlobal = this;
       this.setAttribute("height", value);
     },
     get sandbox() {
-      return makeTokenList(this, "sandbox");
+      return makeClassList(this, "sandbox");
     },
     set sandbox(value) {
       this.setAttribute("sandbox", String(value));
@@ -6834,6 +6842,42 @@ const __tilefinchRealmGlobal = this;
     writable: true,
     value: nativeNodeReceiverDescriptors.replaceChildren.value,
   });
+  /* Likewise the rest of the layer's standard members, as the same
+     functions (wrappers still find the layer first). Pages hook and
+     capture them on the interface prototypes: Object.getOwnPropertyDescriptor
+     (Element.prototype, "innerHTML"), and anti-adblock loaders keep
+     "pristine" copies of Node.prototype.textContent or
+     HTMLIFrameElement.prototype.contentWindow and wipe the page when one
+     is missing. Members a prototype defines itself are kept. */
+  for (const [prototype, names] of [
+    [Node.prototype, "nodeType nodeName ownerDocument parentNode parentElement childNodes firstChild lastChild previousSibling nextSibling nodeValue textContent cloneNode removeChild replaceChild"],
+    [Element.prototype, "namespaceURI localName tagName id className attributes innerHTML children firstElementChild lastElementChild childElementCount previousElementSibling nextElementSibling before after replaceWith remove getBoundingClientRect getClientRects scrollIntoView scroll scrollTo scrollBy scrollTop scrollLeft scrollWidth scrollHeight clientTop clientLeft clientWidth clientHeight role ariaAtomic ariaLive"],
+    [HTMLElement.prototype, "innerText hidden tabIndex contentEditable isContentEditable dataset offsetParent offsetTop offsetLeft offsetWidth offsetHeight"],
+    [HTMLIFrameElement.prototype, "src name width height contentDocument contentWindow"],
+    [HTMLScriptElement.prototype, "src type async defer"],
+    [HTMLAnchorElement.prototype, "href hreflang rel type"],
+    [HTMLImageElement.prototype, "src width height"],
+    [HTMLTemplateElement.prototype, "content"],
+  ])
+    for (const name of names.split(" "))
+      if (!Object.hasOwn(prototype, name) && nativeNodeReceiverDescriptors[name])
+        Object.defineProperty(prototype, name, nativeNodeReceiverDescriptors[name]);
+  /* DOM's [Unscopable] members: a `with` scope over the object skips them,
+     so a bare `remove()` in an inline handler is not element.remove(). */
+  for (const [prototype, names] of [
+    [Element.prototype, "after append before prepend remove replaceChildren replaceWith slot"],
+    [CharacterData.prototype, "after before remove replaceWith"],
+    [DocumentType.prototype, "after before remove replaceWith"],
+    [Document.prototype, "append prepend replaceChildren"],
+    [DocumentFragment.prototype, "append prepend replaceChildren"],
+  ]) {
+    const unscopables = Object.create(null);
+    for (const name of names.split(" ")) unscopables[name] = true;
+    Object.defineProperty(prototype, Symbol.unscopables, {
+      configurable: true,
+      value: unscopables,
+    });
+  }
   Object.defineProperties(Element.prototype, Object.getOwnPropertyDescriptors({
     hasAttributes() {
       /* Lit asks this of every element it walks; answer from the native
@@ -7141,11 +7185,11 @@ const __tilefinchRealmGlobal = this;
     );
     return hits.map((hit) => hit.element).reverse();
   };
-  document.elementsFromPoint = function (x, y) {
+  document.elementsFromPoint = function elementsFromPoint(x, y) {
     if (arguments.length < 2) throw new TypeError("Two coordinates required");
     return hitTestElements(x, y);
   };
-  document.elementFromPoint = function (x, y) {
+  document.elementFromPoint = function elementFromPoint(x, y) {
     if (arguments.length < 2) throw new TypeError("Two coordinates required");
     return hitTestElements(x, y)[0] || null;
   };
@@ -8008,7 +8052,7 @@ const __tilefinchRealmGlobal = this;
         passive: true,
       });
     };
-    __tilefinchRealmGlobal.IntersectionObserver = class {
+    __tilefinchRealmGlobal.IntersectionObserver = class IntersectionObserver {
       constructor(callback, options = {}) {
         if (typeof callback !== "function")
           throw new TypeError("callback required");

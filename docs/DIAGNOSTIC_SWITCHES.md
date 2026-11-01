@@ -55,6 +55,9 @@ but the code and its strings ship.
 | `TILEFINCH_TRACE_JS_PROPERTY_FAULTS` | 1 | `src/diagnostic_trace.h` | host | Bounded property tracing; numeric values trace all events, `absent` traces failed `in`, and `fault` traces null/undefined bases (property-fault-trace builds only). |
 | `TILEFINCH_TRACE_JS_REJECT_STACK` | 1 | `src/budget.c` | host | Backtrace at each refused QuickJS pool request. |
 | `TILEFINCH_TRACE_JS_ROOTS` | 2 | `src/diagnostic_trace.h` | lab binary | Script runtime root reports at frame failure and teardown. |
+| `TILEFINCH_TRACE_JS_HEAP_DETAIL` | 1 | `src/js_runtime/document_state.inc` | host | Heap composition census of a realm (`jsmem-census`, `jsmem-row ... kind=K v0=.. name="N"`, `jsmem-end`, stderr): allocator arenas vs large blocks, GC object types, every class (objects, property arrays, payload such as array elements, Map records, ArrayBuffer data), per script file (functions, bytecode, lazy stubs, line tables, own and shared source text, closures), instances per prototype (top 80, by constructor name), strings by size band, atoms, hashed shapes, pending jobs, `Function.prototype.toString` calls; the header has the Budget categories, pool totals, the last refused request and the script being compiled. Taken at the first safe point after the realm's allocator refuses a request (at most 6 per realm), at each high-water step and with each memory report. `gc` also collects after an OOM census and takes a second (`reason=...-aftergc`): what a forced GC would have freed. Read with `tools/jsmem_report.py`. Compiled only into host builds (`CONFIG_TILEFINCH_HEAP_DETAIL`). |
+| `TILEFINCH_TRACE_JS_HEAP_DETAIL_RESOURCE` | 1 | `src/js_runtime/document_state.inc` | host | With `TILEFINCH_TRACE_JS_HEAP_DETAIL`, list the page's live Resource-category allocations of 4 KiB or more (`active-allocation`) at the first OOM census. |
+| `TILEFINCH_TRACE_JS_HEAP_DETAIL_STEP_KB` | 1 | `src/js_runtime/document_state.inc` | host | High-water step of `TILEFINCH_TRACE_JS_HEAP_DETAIL`, in KiB (default 4096). |
 | `TILEFINCH_TRACE_JS_STARTUP` | 1 | `src/diagnostic_trace.h` | host | Per-bootstrap-module timing and the per-module heap census. |
 | `TILEFINCH_TRACE_LAYOUT` | 2 | `src/layout.c` | host | Layout tracing. |
 | `TILEFINCH_TRACE_LAYOUT_CLASS` | 1 | `src/layout.c` | host | Class name whose layout is traced. |
@@ -65,7 +68,7 @@ but the code and its strings ship.
 | `TILEFINCH_TRACE_MUTATION_JOURNAL` | 9 | `src/navigation/layout_reuse.inc` | host | Print each script mutation journal record (kind, element, attribute, exact changed-token count) as layout reuse invalidation consumes it, the resets and scoped `:has()` invalidation it caused, each build's reuse-cache style hits and misses, and why a journal could not skip its relayout as hidden-only. |
 | `TILEFINCH_TRACE_RELAYOUT_CENSUS` | 2 | `src/layout_reuse.c` | host | Print one line per relayout (the path it took: full, build, or which skip; its time; the element styles its build reused and resolved; reuse-cache resets; commands and height), and each growth of the layout reuse cache's style table. |
 | `TILEFINCH_TRACE_MUTATION_POLICY` | 1 | `src/diagnostic_trace.h` | host | Mutation classification (resource rebuild, image scan) per DOM change. |
-| `TILEFINCH_TRACE_NAVIGATION_REQUESTS` | 1 | `src/js_runtime/host_primitives.inc` | host | Script-initiated navigations. |
+| `TILEFINCH_TRACE_NAVIGATION_REQUESTS` | 2 | `src/js_runtime/host_primitives.inc` | host | Script-initiated navigations. |
 | `TILEFINCH_TRACE_NETWORK_RESPONSES` | 2 | `src/js_fetch_cors.c` | host | Page network responses (first 64 bytes). |
 | `TILEFINCH_TRACE_PAINT` | 2 | `src/layout.c` | host | Paint tracing. |
 | `TILEFINCH_TRACE_PREVIEW_LAYOUT` | 1 | `src/navigation/progressive_preview.inc` | host | Progressive preview layout attribution. |
@@ -144,7 +147,8 @@ but the code and its strings ship.
 | `TILEFINCH_DISABLE_SELECTOR_APPEND_REUSE` | 1 | `src/style_sheet.c` | host | Rebuild the selector program on every stylesheet append instead of preserving it. |
 | `TILEFINCH_DISABLE_STYLE_TABLE_GROWTH` | 1 | `src/layout_reuse.c` | host | Keep the layout reuse cache's style table at its initial 1024 entries even when a build walks more styled elements than it holds. |
 | `TILEFINCH_DISABLE_STYLE_APPEND` | 1 | `src/navigation/relayout.inc` | host | Rebuild the page stylesheet for every script-inserted `<style>` element instead of appending it in place. |
-| `TILEFINCH_DISABLE_STYLESHEET_CONTINUATION` | 1 | `src/navigation/stylesheet_checkpoint.inc` | host | Disable resumable stylesheet parsing across checkpoints. |
+| `TILEFINCH_DISABLE_STYLESHEET_CONTINUATION` | 2 | `src/navigation/style_prepare.inc` | host | Disable resumable stylesheet parsing across checkpoints. |
+| `TILEFINCH_DISABLE_STYLESHEET_PREPARE` | 1 | `src/navigation/style_prepare.inc` | host | Build a parser-blocking script's stylesheet inside its checkpoint instead of across parser pumps. |
 | `TILEFINCH_DISABLE_STYLESHEET_FRAGMENT_CACHE` | 1 | `src/resources.c` | host | Do not cache compiled stylesheet fragments in the shared body store. |
 | `TILEFINCH_DISABLE_STYLESHEET_PARSED_IR` | 1 | `src/resources.c` | host | Do not cache the parsed stylesheet IR in the shared body store. |
 | `TILEFINCH_DISABLE_STYLESHEET_RULE_BATCH` | 1 | `src/resources.c` | host | Insert stylesheet rules one at a time instead of batching. |
@@ -168,6 +172,8 @@ but the code and its strings ship.
 | `TILEFINCH_JS_LAZY_FUNCTIONS` | 1 | `src/js_runtime/evaluation.inc` | always, set by the PSP app | Minimum source bytes of a page function compiled lazily on first call; 0 compiles every function eagerly. The PSP app exports it only when `boot.cfg` sets `lazy_functions`. |
 | `TILEFINCH_JS_PREPARSE` | 1 | `src/js_runtime/evaluation.inc` | host / PSP validation | `0` parses the body of every lazily compiled function in full when its script compiles, instead of validating it with the preparser (preparsing). |
 | `TILEFINCH_JS_POOL_TRIM_RETRY` | 1 | `src/budget.c` | host / PSP validation | Set to 0 to disable the trim-and-retry on a refused QuickJS pool request. |
+| `TILEFINCH_JS_SOURCE_STORE` | 1 | `src/js_runtime/evaluation.inc` | host / PSP validation | Where a classic page script of at least 8 KiB keeps its `Function.prototype.toString()` text (docs/ARCHITECTURE.md, "Function source outside the heap"): unset (or `pressure`) is the shipping policy, `plain` never compresses, `lz` compresses every block as the script compiles, `keep` keeps the text in the QuickJS heap as before, `strip` keeps none (toString() answers `[native code]`; for A/B measurement only). |
+| `TILEFINCH_JS_SOURCE_STORE_MIN_KB` | 1 | `src/js_runtime/evaluation.inc` | host / PSP validation | Smallest classic page script, in KiB, whose text goes to the function-source store (default 8). |
 | `TILEFINCH_JS_STACK_KB` | 1 | `src/js_runtime/runtime_creation.inc` | host / PSP validation | QuickJS native stack limit, in KiB. |
 | `TILEFINCH_SELECTOR_COOPERATE_VISITS` | 1 | `src/style_sheet/declarations.inc` | host | Selector matching visits between cooperative checkpoints. |
 | `TILEFINCH_VARIABLE_CACHE_ENTRIES` | 1 | `src/style_sheet/declarations.inc` | host | Custom-property cache capacity. |

@@ -1,4 +1,5 @@
 #include "tilefinch/reader_mode.h"
+#include "tilefinch/media_discovery.h"
 #include "tilefinch/layout.h"
 #include "tilefinch/platform.h"
 #include "tilefinch/site_adapter.h"
@@ -2754,8 +2755,43 @@ static bool test_declared_video_synthesizes_watch_surface(void)
     return true;
 }
 
+/* A page that declares only its player page (twitter:player) gets Basic
+   view's card too: Play opens that page (the embed hop). */
+static bool test_declared_player_page_card(void)
+{
+    static const char html[] =
+        "<!doctype html><head><meta property=og:title content='Live clip'>"
+        "<meta name=twitter:player content='https://player.test/embed/42'>"
+        "</head><body><article><h1>Live clip</h1><p>The story around the "
+        "clip, rendered on the server.</p></article></body>";
+    Budget budget;
+    budget_init(&budget, 32u * 1024u * 1024u);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet stylesheet = {0};
+    ReaderDocumentAnalysis analysis = {0};
+    CHECK(document_parse(
+              &document, &budget, html, sizeof(html) - 1u, 117u)
+          && stylesheet_build(&stylesheet, &budget, &document, 480)
+          && media_declared_video_cached(&document) == NULL
+          && reader_document_prepare_basic_complete_with_stylesheet(
+                 &document, &stylesheet, &analysis)
+          && analysis.kind == READER_PAGE_BASIC);
+    lxb_dom_node_t *root = find_direct_reader_root(&document);
+    lxb_dom_node_t *video = find_named_within(root, "video");
+    CHECK(video != NULL
+          && has_attribute(video, "data-tilefinch-declared-media-card")
+          && document.reader_declared_video_card_node == video);
+    stylesheet_destroy(&stylesheet);
+    document_destroy(&document);
+    CHECK(budget_uninstall_lexbor(&budget) && budget.current == 0u
+          && budget_categories_reconcile(&budget));
+    return true;
+}
+
 int main(void)
 {
+    if (!test_declared_player_page_card()) return 1;
     if (!test_article()
         || !test_refresh_refusal_rolls_back_extracted_reader()
         || !test_static_fallback_respects_bare_hidden_body()

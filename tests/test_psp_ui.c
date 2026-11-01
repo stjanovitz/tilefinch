@@ -4526,6 +4526,55 @@ static bool test_media_continuation_keeps_the_timeline_live(void)
     CHECK(psp_ui_media_update(&media, &circle).action
           == PSP_UI_MEDIA_ACTION_CLOSE);
 
+    /* During recovery the previous track indices are invalidated, but
+       chapters must remain usable. Shoulder navigation must not offer a
+       stale subtitle Off action to a still-running resolver. */
+    PspUiMediaPresentation presentation;
+    psp_ui_media_bind_presentation(&media, &presentation);
+    MediaChapter chapters[] = {{.seconds = 0, .title = "Start"},
+                               {.seconds = 30, .title = "Later"}};
+    psp_ui_media_set_chapters(&media, chapters, 2);
+    psp_ui_media_set_resolving(&media, "Recovering");
+    psp_ui_media_set_tracks(&media, NULL, 0, -1, NULL, 0, -1);
+    psp_ui_media_set_continuation(&media, 0, duration_us, true);
+    PspUiInput menu = {.pressed = PSP_UI_BUTTON_TOOLBAR,
+                      .analog_x = 128, .analog_y = 128};
+    (void) psp_ui_media_update(&media, &menu);
+    CHECK(presentation.track_menu_open
+          && presentation.track_menu_tab == PSP_UI_MEDIA_TAB_CHAPTERS);
+    menu.pressed = PSP_UI_BUTTON_PAGE_DOWN;
+    (void) psp_ui_media_update(&media, &menu);
+    CHECK(presentation.track_menu_tab == PSP_UI_MEDIA_TAB_CHAPTERS);
+    menu.pressed = PSP_UI_BUTTON_DOWN;
+    (void) psp_ui_media_update(&media, &menu);
+    intent = psp_ui_media_update(&media, &cross);
+    CHECK(intent.action == PSP_UI_MEDIA_ACTION_SEEK
+          && intent.seek_time_us == UINT64_C(30000000));
+
+    PspUiMediaTrack tracks[] = {{"Original"}, {"Alternate"}};
+    psp_ui_media_set_tracks(&media, tracks, 2, 0, tracks, 2, -1);
+    psp_ui_media_cancel_seek_preview(&media);
+    menu.pressed = PSP_UI_BUTTON_TOOLBAR;
+    (void) psp_ui_media_update(&media, &menu);
+    menu.pressed = PSP_UI_BUTTON_PAGE_DOWN;
+    (void) psp_ui_media_update(&media, &menu);
+    CHECK(presentation.track_menu_tab == PSP_UI_MEDIA_TAB_AUDIO);
+    menu.pressed = PSP_UI_BUTTON_DOWN;
+    (void) psp_ui_media_update(&media, &menu);
+    intent = psp_ui_media_update(&media, &cross);
+    CHECK(intent.action == PSP_UI_MEDIA_ACTION_SELECT_AUDIO_TRACK
+          && intent.track_index == 1);
+    /* Once the current catalog is published, captions and Off work even
+       before the replacement playback owner has finished priming. */
+    menu.pressed = PSP_UI_BUTTON_TOOLBAR;
+    (void) psp_ui_media_update(&media, &menu);
+    menu.pressed = PSP_UI_BUTTON_PAGE_UP;
+    (void) psp_ui_media_update(&media, &menu);
+    CHECK(presentation.track_menu_tab == PSP_UI_MEDIA_TAB_SUBTITLES);
+    intent = psp_ui_media_update(&media, &cross);
+    CHECK(intent.action == PSP_UI_MEDIA_ACTION_SELECT_SUBTITLE_TRACK
+          && intent.track_index == UINT8_MAX);
+
     /* No duration, or a hidden player: nothing to restore. */
     psp_ui_media_init(&media);
     psp_ui_media_set_resolving(&media, "YouTube video");

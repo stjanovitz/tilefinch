@@ -55,7 +55,7 @@ void psp_media_telemetry_report_slow_unit(
     (void) media_http_range_stats(media->range, &video);
     (void) media_http_range_stats(media->audio_range, &audio);
     printf(
-        "tilefinch-media-slow-unit: stage=%s unit=%lluus "
+        "tilefinch-media-slow-unit: stage=%s unit=%lluus at-us=%llu "
         "video-pump-max=%lluus video-install-max=%lluus video-pumps=%zu "
         "audio-pump-max=%lluus audio-install-max=%lluus audio-pumps=%zu "
         "video-new-conn=%zu video-handshakes=%zu video-handshake-max=%lluus "
@@ -63,6 +63,7 @@ void psp_media_telemetry_report_slow_unit(
         "window-pending=%d/%d inflight=%zu/%zu\n",
         stage == NULL ? "unknown" : stage,
         (unsigned long long) unit_us,
+        (unsigned long long) psp_media_internal_now_us(media),
         (unsigned long long) video.pump_max_us,
         (unsigned long long) video.install_max_us, video.pump_calls,
         (unsigned long long) audio.pump_max_us,

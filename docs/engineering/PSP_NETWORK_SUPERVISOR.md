@@ -57,16 +57,18 @@ still be executing inside it.
 
 | State | Network resources | Admission |
 |---|---|---|
-| `Off`, `Offline`, `SuspendedOff` | no rungs | closed |
+| `Off`, `SuspendedOff` | no rungs | closed |
+| `Offline` | no services; utility modules may remain resident | closed |
 | `Starting` | none through partial/full, owned by inner ladder | closed |
 | `Ready` | full stack | open |
 | `Rejoining` | full stack | closed |
 | `Stopping` | current stack until reverse unwind completes | closed |
 | `SuspendedRetained` | full or retained-wedged stack | closed |
 
-`Offline` always means teardown has completed; retry can never construct a
-second stack over residual resources. `SuspendedRetained` preserves the
-already-proven fast resume path. A suspend deadline that expires during lease
+`Offline` means service teardown has completed; retry can never construct a
+second stack over initialized services. Resident utility modules retain their
+ownership flags and are reused by Retry, or unloaded on Off/suspend.
+`SuspendedRetained` preserves the already-proven fast resume path. A suspend deadline that expires during lease
 drain retains the stack and its outstanding lease rather than calling
 `sceNetInetTerm` underneath curl or the resolver.
 
@@ -174,6 +176,16 @@ one pump per browser frame. Compatibility call sites that require teardown to
 finish before their next local action synchronously *drive that same pump*
 with heartbeat/cancellation opportunities; there is no hidden firmware poll
 loop inside the service.
+
+Recovery-target restarts and offline failures terminate APCTL, resolver, Inet
+and core services but retain the already-loaded utility modules. The new ladder resets connection
+state while preserving their loaded/owned flags, and does not load a second
+copy. This avoids a firmware module-reload refusal with a live page/media
+heap. Ordinary shutdown, cancellation to Off, and suspension from Offline
+still unload owned modules. `tilefinch-psp-network-restart-tests` executes the
+production shutdown service with fake firmware calls, checking retained and
+adopted ownership, later full cleanup, and a changed shutdown target. The
+supervisor suite checks Offline-to-Retry, Off and suspend with resident modules.
 
 A navigation arriving during `Rejoining` or restart-target `Stopping` drives
 that same recovery service with the demand quota and keeps presenting its

@@ -49,7 +49,8 @@ static const char *private_snapshot_navigation_error_kind(const char *message)
         {"response effective", "response-policy"},
         {"document referrer", "response-policy"},
         {"external font", "font"}, {"visible image", "priority-image"},
-        {"external image", "image"}, {"history", "history"}
+        {"external image", "image"}, {"history", "history"},
+        {NAVIGATION_PAGE_OUT_OF_MEMORY_ERROR, "memory"}
     };
     for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); i++)
         if (strncmp(message, types[i].prefix, strlen(types[i].prefix)) == 0)

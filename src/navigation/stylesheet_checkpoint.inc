@@ -4,10 +4,31 @@ static void navigation_stream_mark_parser_refusal(
 static void navigation_stream_drop_previews(
     NavigationDocumentStream *stream);
 
+/* Drops an unfinished stylesheet preparation (style_prepare.inc). Its
+   deferred parse borrows the blocking sheet, so this precedes any release
+   of that sheet; the partly built sheet itself is the caller's to drop. */
+static void navigation_stream_style_prepare_cancel(
+    NavigationDocumentStream *stream)
+{
+    NavigationStylePrepare *prepare = &stream->style_prepare;
+    if (prepare->phase == NAVIGATION_STYLE_PREPARE_IDLE
+        && prepare->inputs == NULL && prepare->deferral.parse == NULL)
+        return;
+    stylesheet_parse_deferral_release(&prepare->deferral);
+    if (stream->session != NULL)
+        budget_free(stream->session->budget, prepare->inputs);
+    prepare->inputs = NULL;
+    prepare->input_count = 0;
+    prepare->next_input = 0;
+    prepare->phase = NAVIGATION_STYLE_PREPARE_IDLE;
+}
+
 static void navigation_stream_release_blocking_stylesheet(
     NavigationDocumentStream *stream)
 {
     if (stream == NULL) return;
+    navigation_stream_style_prepare_cancel(stream);
+    stream->style_prepare.fresh = false;
     /* Retained previews borrow the sheet's web fonts (and, through stream
        teardown, which releases the sheet first, the DOM). */
     navigation_stream_drop_previews(stream);

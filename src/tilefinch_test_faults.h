@@ -136,6 +136,9 @@ typedef struct {
     /* Host observation for index-refusal tests: linear node-box lookups.
        Reset by the test; never present on the PSP. */
     unsigned long long layout_node_box_scans;
+    /* Host work observation: kept layout boxes an image walk's background
+       lookups (layout_image_box_size) compare. Reset by the test. */
+    unsigned long long layout_image_box_probes;
     /* Host work observation: display-list commands the colour-only focus
        recolour visits. Reset by the test. */
     unsigned long long focus_color_command_visits;

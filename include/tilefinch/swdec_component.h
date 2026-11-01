@@ -73,4 +73,37 @@ typedef struct {
     TilefinchSwdecComponentApi *api;
 } TilefinchSwdecComponentStart;
 
+/* Validation browsers start the component with this longer block; its
+   struct_size says the trailing field is there. A component reads the field
+   only when struct_size covers it, and an older component ignores it, so
+   either side may be older and the ABI stays the same. Only a validation
+   component acts on the flags.
+
+   window_mark (when struct_size covers it): the browser's steady-window
+   counter, odd while the window is open. A validation component reports
+   its stage figures for the window, between swdec-window start and end
+   lines, when it sees the value change at a decode. */
+typedef struct {
+    TilefinchSwdecComponentStart start;
+    uint32_t validation_flags;
+    const volatile uint32_t *window_mark;
+} TilefinchSwdecComponentValidationStart;
+
+/* boot.cfg validation_swdec_reference (a bit mask) for same-binary device
+   A/B of a validation add-on: 1 = the motion-compensation kernels before
+   the shared-pass versions, 2 = every macroblock on the generic
+   reconstruction path, 4 = fixed-size edge-emulation regions, 8 = jobs
+   that carry the whole parsed caches, 16 = chroma MC one plane per call,
+   32 = the (no-op) prefetch calls made, 64 = chroma prediction kept in
+   reconstruction instead of the Media Engine's parser, 128 = the chroma
+   qualification replay runs (swdec_chroma_replay.c). */
+#define TILEFINCH_SWDEC_VALIDATION_REFERENCE UINT32_C(1)
+#define TILEFINCH_SWDEC_VALIDATION_MB_GENERIC UINT32_C(2)
+#define TILEFINCH_SWDEC_VALIDATION_EDGE_FULL UINT32_C(4)
+#define TILEFINCH_SWDEC_VALIDATION_JOB_FULL UINT32_C(8)
+#define TILEFINCH_SWDEC_VALIDATION_CHROMA_SPLIT UINT32_C(16)
+#define TILEFINCH_SWDEC_VALIDATION_PREFETCH UINT32_C(32)
+#define TILEFINCH_SWDEC_VALIDATION_CHROMA_CPU UINT32_C(64)
+#define TILEFINCH_SWDEC_VALIDATION_CHROMA_REPLAY UINT32_C(128)
+
 #endif

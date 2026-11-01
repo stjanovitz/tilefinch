@@ -502,6 +502,50 @@ static bool test_inline_svg_css_viewport_preserves_circle(void)
     return okay && budget.current == 0;
 }
 
+/* Font-relative width/height attributes (the 1em icon idiom) and ones CSS
+   overrides rasterize at their computed size: before, the rasterizer read
+   "1em" as nothing and fell back to the 256-unit viewBox, a 256 KiB raster
+   per 16-24 px icon. */
+static bool test_inline_svg_font_relative_attributes_use_computed_size(void)
+{
+    static const char html[] =
+        "<!doctype html><style>.s{width:24px;height:24px}</style>"
+        "<div id=em style='font-size:20px'><svg width=1em height=1em "
+        "viewBox='0 0 256 256'><rect width=256 height=256 fill='blue'/>"
+        "</svg></div>"
+        "<div id=css><svg class=s width=1em height=1em "
+        "viewBox='0 0 256 256'><rect width=256 height=256 fill='red'/>"
+        "</svg></div>"
+        "<div id=pct><svg class=s width='100%' height='100%' "
+        "viewBox='0 0 256 256'><rect width=256 height=256 fill='green'/>"
+        "</svg></div>";
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 4);
+    if (ready) navigation_enable_external_resources(&navigation,
+        2, 32768, 16384, 8, 524288, 262144, MIB, 1000);
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool okay = ready && navigation_commit_html(&navigation, generation,
+        "https://em-icons.test/", html, sizeof(html) - 1u,
+        480, NULL, NULL, true);
+    const ImageResource *em = okay ? svg_retarget_icon(&navigation, "em") : NULL;
+    const ImageResource *css = okay ? svg_retarget_icon(&navigation, "css") : NULL;
+    const ImageResource *pct = okay ? svg_retarget_icon(&navigation, "pct") : NULL;
+    okay = em != NULL && em->width == 20 && em->height == 20
+        && svg_retarget_pixel(em, 10, 10)[2] > 240
+        && css != NULL && css->width == 24 && css->height == 24
+        && svg_retarget_pixel(css, 12, 12)[0] > 240
+        && pct != NULL && pct->width == 24 && pct->height == 24;
+    if (!okay) fprintf(stderr, "font-relative SVG size %dx%d %dx%d %dx%d\n",
+        em == NULL ? 0 : em->width, em == NULL ? 0 : em->height,
+        css == NULL ? 0 : css->width, css == NULL ? 0 : css->height,
+        pct == NULL ? 0 : pct->width, pct == NULL ? 0 : pct->height);
+    if (ready) navigation_destroy(&navigation);
+    return okay && budget.current == 0;
+}
+
 /* Icons with a 256-unit viewBox (two inline, one a data: <img>) painted at
    20 px keep 20x20 rasters, and a sprite sheet painted through a 20 px tile
    of its 40x20 background size keeps the whole sheet at 40x20. A hidden

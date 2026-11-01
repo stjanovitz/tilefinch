@@ -72,7 +72,7 @@ _Static_assert(
 static bool script_heap_pressure_required(
     ScriptRuntime *runtime, size_t working_bytes, size_t reserve_bytes)
 {
-    size_t remaining = script_runtime_heap_available(runtime);
+    size_t remaining = script_runtime_heap_admission_available(runtime);
     return working_bytes > remaining
         || reserve_bytes > remaining - working_bytes;
 }
@@ -909,6 +909,34 @@ static void script_lazy_source_release(void *opaque)
     browser_shared_body_release((BrowserSharedBody *) opaque);
 }
 
+/* The body of the external classic script being run, which the realm may
+   take back while it runs (script_runtime_offer_source_release): the
+   response's own buffer, or this load's lease on the cached body. Frees
+   only: it runs inside an allocation. */
+typedef struct {
+    FetchResult *fetch;
+    ScriptCacheSource *cached;
+    const char *source;
+} ScriptSourceOwner;
+
+static void script_source_owner_release(void *opaque)
+{
+    ScriptSourceOwner *owner = opaque;
+    if (owner->cached != NULL && owner->cached->data != NULL
+        && owner->source == owner->cached->data) {
+        script_cache_source_release(owner->cached);
+    } else if (owner->fetch != NULL && owner->fetch->data != NULL
+               && owner->source == owner->fetch->data) {
+        if (owner->fetch->shared_body != NULL)
+            browser_shared_body_release(owner->fetch->shared_body);
+        else
+            budget_free(owner->fetch->budget, owner->fetch->data);
+        owner->fetch->shared_body = NULL;
+        owner->fetch->data = NULL;
+        owner->fetch->capacity = 0;
+    }
+}
+
 static bool script_evaluate_external_node(
     ScriptRuntime *runtime, Budget *budget, lxb_dom_node_t *node,
     const char *source,
@@ -1009,6 +1037,7 @@ static bool script_evaluate_external_node(
               runtime, node, source, source_length, request_url,
               response_url, response_no_store, result);
     script_metrics_record_execution_time(metrics, evaluation_started_ns);
+    if (script_runtime_source_released(runtime)) source = NULL;
     if (!ok) {
         metrics->execution_failures++;
         script_record_watchdog_miss(
@@ -1624,12 +1653,19 @@ static bool execute_external_node(
                   request_referrer_policy,
                   cached->module_response_referrer_policy)
             : NULL;
+        ScriptSourceOwner owner = {
+            .cached = &cached_source, .source = cached_source.data
+        };
+        if (!module && !has_lazy_plan)
+            script_runtime_offer_source_release(
+                runtime, script_source_owner_release, &owner);
         bool ok = script_evaluate_external_node(
             runtime, budget, node, cached_source.data, cached_length,
             resolved,
             module ? cached->module_effective_url : resolved,
             module, module_policy, module_credentials, cached_source.body,
             has_lazy_plan ? &lazy_plan : NULL, false, metrics);
+        (void) script_runtime_withdraw_source_release(runtime);
         if (has_lazy_plan) script_lazy_webpack_plan_destroy(&lazy_plan);
         script_cache_source_release(&cached_source);
         if (ok) {
@@ -1640,6 +1676,12 @@ static bool execute_external_node(
         else metrics->failed++;
         return true;
     }
+    /* Lease the stale body before anything can run JavaScript: until then
+       the entry is only borrowed, and a realm growing short of memory
+       releases unleased script bodies (js_rt_heap_growth_hook). */
+    ScriptCacheSource cached_source = {0};
+    bool cached_source_ready = cached != NULL
+        && script_cache_source_acquire(budget, cached, &cached_source);
     bool pressure_capped = false;
     if (!script_bound_network_working_set(
             runtime, budget, &response_limit, &pressure_capped, metrics)) {
@@ -1647,6 +1689,7 @@ static bool execute_external_node(
             fprintf(stderr, "script-network-bound-reject url=%s\n",
                     resolved);
         }
+        script_cache_source_release(&cached_source);
         script_runtime_script_quota_abort(runtime, &quota);
         (void) script_runtime_dispatch_node(runtime, node, "error", NULL);
         return true;
@@ -1654,9 +1697,6 @@ static bool execute_external_node(
     bool caller_source_limit_enforced =
         !pressure_capped && response_limit == maximum_file_bytes;
     metrics->attempted++; script_trace_attempt(resolved);
-    ScriptCacheSource cached_source = {0};
-    bool cached_source_ready = cached != NULL
-        && script_cache_source_acquire(budget, cached, &cached_source);
     FetchRequest transport = {
         .allow_http_errors = true,
         .send_low_client_hints = true,
@@ -1872,12 +1912,19 @@ static bool execute_external_node(
                     ? cached->module_response_referrer_policy
                     : response_referrer_policy)
             : NULL;
+        bool no_store = script_response_no_store(fetch);
+        ScriptSourceOwner owner = {
+            .fetch = fetch, .cached = &cached_source, .source = source
+        };
+        if (!module && !has_lazy_plan)
+            script_runtime_offer_source_release(
+                runtime, script_source_owner_release, &owner);
         ok = script_evaluate_external_node(
             runtime, budget, node, source, source_length, resolved,
             response_url, module, module_policy, module_credentials,
             source_body,
-            has_lazy_plan ? &lazy_plan : NULL,
-            script_response_no_store(fetch), metrics);
+            has_lazy_plan ? &lazy_plan : NULL, no_store, metrics);
+        (void) script_runtime_withdraw_source_release(runtime);
     } else {
         (void) script_runtime_dispatch_node(runtime, node, "error", NULL);
     }
@@ -2054,7 +2101,10 @@ static void script_wait_for_fetch_capacity(FetchScheduler *scheduler,
     uint64_t limit = timeout_ms > 0
         ? (uint64_t) timeout_ms * UINT64_C(1000) : UINT64_C(15000000);
     size_t turns = 0;
-    while (fetch_scheduler_enqueue_would_block(scheduler, bytes)
+    /* A held page domain frees nothing until the player closes: do not
+       wait out the timeout on the browser thread for it. */
+    while (!fetch_scheduler_held(scheduler)
+           && fetch_scheduler_enqueue_would_block(scheduler, bytes)
            && tilefinch_platform_monotonic_time_us() - started < limit) {
         (void) fetch_scheduler_pump(scheduler, 1, 10);
         if (!tilefinch_platform_cooperate("fetch", ++turns)) break;

@@ -202,6 +202,12 @@ typedef struct {
     PendingStylesheet pending[STYLESHEET_FETCH_CONCURRENCY];
     size_t pending_count;
     size_t batch_limit;
+    /* A sliced pass (StylesheetParseDeferral): set once a sheet's parse was
+       deferred, which ends the pass after that source. */
+    StylesheetParseDeferral *deferral;
+    /* The <link> whose response flush_stylesheet_batch is applying. */
+    lxb_dom_node_t *applying_element;
+    bool halted;
     double started_ms;
     double deadline_ms;
     uint64_t slice_started_us;
@@ -1539,6 +1545,71 @@ static void stylesheet_artifacts_store(
 #endif
 }
 
+/* A sliced pass defers one sheet at a time: a top-level external source
+   large enough to matter and small enough to keep default source options
+   (the large-source policy borrows this pass's selector census). */
+static bool stylesheet_parse_deferrable(const ResourceContext *context,
+                                        unsigned depth, size_t css_length)
+{
+    const StylesheetParseDeferral *deferral = context->deferral;
+    return deferral != NULL && deferral->minimum_bytes != 0
+        && deferral->parse == NULL && !context->halted && depth == 0
+        && css_length >= deferral->minimum_bytes
+        && css_length < STYLESHEET_LARGE_SOURCE_BYTES;
+}
+
+/* Starts the deferred parse over bytes the deferral keeps alive: the
+   shared response body when the bytes are its, the stable copy taken for a
+   cached response, or else a copy. Ends the pass after this source. */
+static bool stylesheet_defer_parse(
+    ResourceContext *context, const unsigned char *css_data,
+    size_t css_length, FetchResult *fetched, BrowserSharedBody *stable_body,
+    unsigned char **stable_cached, const char *source_base,
+    const char *referrer_policy, const StyleSourceOptions *source,
+    size_t rules_before, size_t variables_before)
+{
+    StylesheetParseDeferral *deferral = context->deferral;
+    BrowserSharedBody *body = NULL;
+    unsigned char *copy = NULL;
+    /* Sharing may move a fresh response's buffer: read it again after. */
+    if (fetched != NULL && css_data == (const unsigned char *) fetched->data
+        && fetch_result_share_body(fetched)) {
+        css_data = (const unsigned char *) fetched->data;
+        body = browser_shared_body_retain(fetched->shared_body);
+    } else if (stable_body != NULL
+               && (const unsigned char *) stable_body->data == css_data) {
+        body = browser_shared_body_retain(stable_body);
+    } else if (*stable_cached != NULL
+               && *stable_cached == css_data) {
+        copy = *stable_cached;
+        *stable_cached = NULL;
+    } else {
+        copy = budget_malloc(context->budget, css_length);
+        if (copy == NULL) return false;
+        memcpy(copy, css_data, css_length);
+        css_data = copy;
+    }
+    if (body == NULL && copy == NULL) return false;
+    StyleCssSlicedParse *parse = stylesheet_sliced_parse_begin(
+        context->sheet, (const char *) css_data, css_length, source_base,
+        referrer_policy, source);
+    if (parse == NULL) {
+        browser_shared_body_release(body);
+        budget_free(context->budget, copy);
+        return false;
+    }
+    deferral->parse = parse;
+    deferral->body = body;
+    deferral->copy = copy;
+    deferral->budget = context->budget;
+    deferral->sheet = context->sheet;
+    deferral->element = context->applying_element;
+    deferral->rules_before = rules_before;
+    deferral->variables_before = variables_before;
+    context->halted = true;
+    return true;
+}
+
 static bool apply_stylesheet_data(ResourceContext *context,
                                   const char *resolved,
                                   const StylesheetResponseProvenance *provenance,
@@ -1747,6 +1818,28 @@ static bool apply_stylesheet_data(ResourceContext *context,
         } else if (ir_result == STYLE_PARSED_IR_FAILED) {
             parsed = false;
         }
+    }
+    if (parsed && ir_result == STYLE_PARSED_IR_REJECTED
+        && stylesheet_parse_deferrable(context, depth, css_length)) {
+        if (!use_cached && context->session != NULL && fetched != NULL
+            && !fetched->response_limit_exceeded) {
+            (void) cache_store_fetch(
+                context->session, resolved, fetched, &stable_provenance,
+                request_context, resource_grant);
+            css_data = (const unsigned char *) fetched->data;
+        }
+        bool deferred = stylesheet_defer_parse(
+            context, css_data, css_length, fetched, stable_body,
+            &stable_cached, source_base, stable_provenance.referrer_policy,
+            &source, rules_before, variables_before);
+        if (deferred) context->stats->loaded++;
+        browser_shared_body_release(compiled_fragment);
+        browser_shared_body_release(parsed_ir);
+        budget_free(context->budget, source_base);
+        budget_free(context->budget, stable_cached);
+        browser_shared_body_release(stable_body);
+        *applied = deferred;
+        return deferred;
     }
     if (parsed && ir_result == STYLE_PARSED_IR_REJECTED) {
         if (ir_eligible) context->stats->parsed_ir_misses++;
@@ -2567,6 +2660,7 @@ static bool flush_stylesheet_batch(ResourceContext *context)
             }
             size_t refused_before = context->stats->skipped_limit;
             bool applied = false;
+            context->applying_element = pending->element;
             if (!settle_stylesheet_data(
                     context, pending->url, &provenance, css_data,
                     css_length, 0,
@@ -2829,6 +2923,9 @@ static bool queue_stylesheet_link(ResourceContext *context,
     }
     if (context->pending_count == context->batch_limit
         && !flush_stylesheet_batch(context)) return false;
+    /* That flush deferred the previous sheet's parse: this link waits for
+       the suffix pass that follows it, so the cascade keeps its order. */
+    if (context->halted) return true;
     /* The flush settles charges; read this lane's again. */
     charged = stylesheet ? stats->bytes : stats->preload_bytes;
     size_t remaining = charged < byte_limit ? byte_limit - charged : 0;
@@ -2999,6 +3096,7 @@ static bool process_stylesheet_node(
            batched, preserving parallel fetch without changing the author
            cascade. */
         if (!flush_stylesheet_batch(context)) return false;
+        if (context->halted) return true;
         StylesheetResponseProvenance inline_sheet = {
             .response_url = context->base_url,
             .known = true
@@ -3075,6 +3173,7 @@ static bool walk(ResourceContext *context, lxb_dom_node_t *node)
     for (;;) {
         if (!resource_work(context, 1, false)) return false;
         if (!process_stylesheet_node(context, node)) return false;
+        if (context->halted) return true;
         if (node->first_child != NULL) {
             node = node->first_child;
             continue;
@@ -3179,7 +3278,29 @@ static bool stylesheets_append_ordered_suffix_impl(
     size_t maximum_total_bytes, size_t maximum_single_bytes,
     long timeout_ms, FetchScheduler *scheduler, BrowserSession *session,
     StylesheetDocumentResources *resources,
-    ExternalStylesheetStats *stats, bool rule_batch);
+    ExternalStylesheetStats *stats, bool rule_batch,
+    StylesheetParseDeferral *deferral, size_t *consumed);
+
+bool stylesheets_append_ordered_suffix_sliced(
+    Stylesheet *sheet, Budget *budget, lxb_dom_node_t *const *nodes,
+    size_t node_count, const char *base_url, const char *document_url,
+    const char *document_referrer_policy,
+    const TilefinchContentSecurityPolicy *content_security_policy,
+    size_t maximum_count,
+    size_t maximum_total_bytes, size_t maximum_single_bytes,
+    long timeout_ms, FetchScheduler *scheduler, BrowserSession *session,
+    StylesheetDocumentResources *resources,
+    ExternalStylesheetStats *stats, StylesheetParseDeferral *deferral,
+    size_t *consumed)
+{
+    if (deferral == NULL || deferral->parse != NULL || consumed == NULL)
+        return false;
+    return stylesheets_append_ordered_suffix_impl(
+        sheet, budget, nodes, node_count, base_url, document_url,
+        document_referrer_policy, content_security_policy, maximum_count,
+        maximum_total_bytes, maximum_single_bytes, timeout_ms, scheduler,
+        session, resources, stats, true, deferral, consumed);
+}
 
 bool stylesheets_append_ordered_suffix_with_context(
     Stylesheet *sheet, Budget *budget, lxb_dom_node_t *const *nodes,
@@ -3196,7 +3317,7 @@ bool stylesheets_append_ordered_suffix_with_context(
         sheet, budget, nodes, node_count, base_url, document_url,
         document_referrer_policy, content_security_policy, maximum_count,
         maximum_total_bytes, maximum_single_bytes, timeout_ms, scheduler,
-        session, resources, stats, true);
+        session, resources, stats, true, NULL, NULL);
 }
 
 bool stylesheets_settle_style_preloads_with_context(
@@ -3224,7 +3345,7 @@ bool stylesheets_settle_style_preloads_with_context(
         sheet, budget, nodes, node_count, base_url, document_url,
         document_referrer_policy, content_security_policy, maximum_count,
         maximum_total_bytes, maximum_single_bytes, timeout_ms, scheduler,
-        session, resources, stats, false);
+        session, resources, stats, false, NULL, NULL);
 }
 
 static bool stylesheets_append_ordered_suffix_impl(
@@ -3236,7 +3357,8 @@ static bool stylesheets_append_ordered_suffix_impl(
     size_t maximum_total_bytes, size_t maximum_single_bytes,
     long timeout_ms, FetchScheduler *scheduler, BrowserSession *session,
     StylesheetDocumentResources *resources,
-    ExternalStylesheetStats *stats, bool rule_batch)
+    ExternalStylesheetStats *stats, bool rule_batch,
+    StylesheetParseDeferral *deferral, size_t *consumed)
 {
     char normalized_document_policy[STYLESHEET_REFERRER_POLICY_LIMIT];
     stylesheet_referrer_policy_normalize_or_default(
@@ -3249,6 +3371,11 @@ static bool stylesheets_append_ordered_suffix_impl(
         || maximum_total_bytes == 0 || maximum_single_bytes == 0
         || timeout_ms <= 0 || scheduler == NULL || stats == NULL
         || (resources != NULL && resources->budget != budget)) return false;
+    /* A sliced pass keeps one rule batch open from the pass that deferred a
+       parse until its caller ends it, so the cascade is ordered and indexed
+       once for the whole sheet. */
+    bool inherited_batch = deferral != NULL && sheet->rule_batch_active;
+    if (inherited_batch) rule_batch = false;
     if (rule_batch && !stylesheet_begin_rule_batch(sheet)) return false;
     ResourceContext context = {
         .sheet = sheet,
@@ -3265,7 +3392,8 @@ static bool stylesheets_append_ordered_suffix_impl(
         .session = session,
         .document_resources = resources,
         .stats = stats,
-        .batch_limit = STYLESHEET_FETCH_BATCH,
+        .batch_limit = deferral != NULL ? 1u : STYLESHEET_FETCH_BATCH,
+        .deferral = deferral,
         .started_ms = resource_now_ms(),
         .slice_started_us = tilefinch_platform_monotonic_time_us()
     };
@@ -3300,15 +3428,28 @@ static bool stylesheets_append_ordered_suffix_impl(
         context.hash_count++;
     }
     bool ok = true;
-    for (size_t i = 0; ok && i < node_count; i++) {
+    size_t processed = 0;
+    for (size_t i = 0; ok && i < node_count && !context.halted; i++) {
         ok = resource_work(&context, 1, false)
             && process_stylesheet_node(&context, nodes[i]);
+        processed = i + 1u;
     }
+    /* A pass that deferred a sheet consumed the nodes through that sheet's
+       link; the node whose processing flushed it was not processed. */
+    for (size_t i = 0; context.halted && deferral->element != NULL
+                       && i < processed; i++) {
+        if (nodes[i] == deferral->element) {
+            processed = i + 1u;
+            break;
+        }
+    }
+    if (consumed != NULL) *consumed = processed;
     tilefinch_platform_trace_step("css-flush");
     if (ok) ok = flush_stylesheet_batch(&context);
     else abandon_stylesheet_batch(
         &context, "stylesheet suffix continuation cancelled");
-    if (rule_batch && !stylesheet_end_rule_batch(sheet)) ok = false;
+    if (rule_batch && !context.halted && !stylesheet_end_rule_batch(sheet))
+        ok = false;
     resource_finish_slice(&context);
     double elapsed = resource_now_ms() - context.started_ms;
     if (elapsed < 0.0) elapsed = 0.0;
@@ -3322,6 +3463,15 @@ static bool stylesheets_append_ordered_suffix_impl(
     return ok;
 }
 
+static bool stylesheets_load_external_impl(
+    const PocDocument *document, Stylesheet *sheet, Budget *budget,
+    const char *base_url, const char *document_url,
+    const char *document_referrer_policy, size_t maximum_count,
+    size_t maximum_total_bytes, size_t maximum_single_bytes,
+    long timeout_ms, FetchScheduler *scheduler, BrowserSession *session,
+    StylesheetDocumentResources *resources,
+    ExternalStylesheetStats *stats, StylesheetParseDeferral *deferral);
+
 bool stylesheets_load_external_tracked_with_context(
     const PocDocument *document, Stylesheet *sheet, Budget *budget,
     const char *base_url, const char *document_url,
@@ -3330,6 +3480,39 @@ bool stylesheets_load_external_tracked_with_context(
     long timeout_ms, FetchScheduler *scheduler, BrowserSession *session,
     StylesheetDocumentResources *resources,
     ExternalStylesheetStats *stats)
+{
+    return stylesheets_load_external_impl(
+        document, sheet, budget, base_url, document_url,
+        document_referrer_policy, maximum_count, maximum_total_bytes,
+        maximum_single_bytes, timeout_ms, scheduler, session, resources,
+        stats, NULL);
+}
+
+bool stylesheets_load_external_sliced(
+    const PocDocument *document, Stylesheet *sheet, Budget *budget,
+    const char *base_url, const char *document_url,
+    const char *document_referrer_policy, size_t maximum_count,
+    size_t maximum_total_bytes, size_t maximum_single_bytes,
+    long timeout_ms, FetchScheduler *scheduler, BrowserSession *session,
+    StylesheetDocumentResources *resources,
+    ExternalStylesheetStats *stats, StylesheetParseDeferral *deferral)
+{
+    if (deferral == NULL || deferral->parse != NULL) return false;
+    return stylesheets_load_external_impl(
+        document, sheet, budget, base_url, document_url,
+        document_referrer_policy, maximum_count, maximum_total_bytes,
+        maximum_single_bytes, timeout_ms, scheduler, session, resources,
+        stats, deferral);
+}
+
+static bool stylesheets_load_external_impl(
+    const PocDocument *document, Stylesheet *sheet, Budget *budget,
+    const char *base_url, const char *document_url,
+    const char *document_referrer_policy, size_t maximum_count,
+    size_t maximum_total_bytes, size_t maximum_single_bytes,
+    long timeout_ms, FetchScheduler *scheduler, BrowserSession *session,
+    StylesheetDocumentResources *resources,
+    ExternalStylesheetStats *stats, StylesheetParseDeferral *deferral)
 {
     char normalized_document_policy[STYLESHEET_REFERRER_POLICY_LIMIT];
     stylesheet_referrer_policy_normalize_or_default(
@@ -3380,6 +3563,7 @@ bool stylesheets_load_external_tracked_with_context(
 #ifndef TILEFINCH_NO_TRACE
     batch_rules = getenv("TILEFINCH_DISABLE_STYLESHEET_RULE_BATCH") == NULL;
 #endif
+    if (deferral != NULL && sheet->rule_batch_active) batch_rules = false;
     if (batch_rules && !stylesheet_begin_rule_batch(sheet)) {
         if (owns_scheduler) fetch_scheduler_destroy(scheduler);
         return false;
@@ -3399,7 +3583,8 @@ bool stylesheets_load_external_tracked_with_context(
         .session = session,
         .document_resources = resources,
         .stats = stats,
-        .batch_limit = STYLESHEET_FETCH_BATCH,
+        .batch_limit = deferral != NULL ? 1u : STYLESHEET_FETCH_BATCH,
+        .deferral = deferral,
         .started_ms = resource_now_ms(),
         .slice_started_us = tilefinch_platform_monotonic_time_us()
     };
@@ -3423,8 +3608,9 @@ bool stylesheets_load_external_tracked_with_context(
     } else {
         parallel_working = SIZE_MAX;
     }
-    if (budget_pressure_required(budget, parallel_working,
-                                 2u * 1024u * 1024u)) {
+    if (deferral == NULL
+        && budget_pressure_required(budget, parallel_working,
+                                    2u * 1024u * 1024u)) {
         context.batch_limit = 1;
         if (resources != NULL) resources->pressure_serializations++;
         size_t avoided = maximum_single_bytes
@@ -3451,8 +3637,9 @@ bool stylesheets_load_external_tracked_with_context(
     if (ok) ok = flush_stylesheet_batch(&context);
     else abandon_stylesheet_batch(&context,
                                    "stylesheet discovery cancelled");
-    if (ok) ok = process_adopted_sheets(&context, document);
-    if (batch_rules && !stylesheet_end_rule_batch(sheet)) ok = false;
+    if (ok && !context.halted) ok = process_adopted_sheets(&context, document);
+    if (batch_rules && !context.halted && !stylesheet_end_rule_batch(sheet))
+        ok = false;
     resource_finish_slice(&context);
     if (ok) {
         sheet->document_rules_deferred = false;
@@ -3703,4 +3890,34 @@ StylesheetDocumentResourceState stylesheet_document_resources_link_state(
         }
     }
     return STYLESHEET_DOCUMENT_RESOURCE_EMPTY;
+}
+
+StyleCssSliceResult stylesheet_parse_deferral_step(
+    StylesheetParseDeferral *deferral, uint64_t deadline_us,
+    ExternalStylesheetStats *stats)
+{
+    if (deferral == NULL || deferral->parse == NULL)
+        return STYLE_CSS_SLICE_FAILED;
+    StyleCssSliceResult result =
+        stylesheet_sliced_parse_step(deferral->parse, deadline_us);
+    if (result == STYLE_CSS_SLICE_DONE && stats != NULL) {
+        const Stylesheet *sheet = deferral->sheet;
+        stats->rules_added += sheet->count >= deferral->rules_before
+            ? sheet->count - deferral->rules_before : 0;
+        stats->variables_added +=
+            sheet->variable_count >= deferral->variables_before
+            ? sheet->variable_count - deferral->variables_before : 0;
+    }
+    return result;
+}
+
+void stylesheet_parse_deferral_release(StylesheetParseDeferral *deferral)
+{
+    if (deferral == NULL) return;
+    stylesheet_sliced_parse_release(deferral->parse);
+    browser_shared_body_release(deferral->body);
+    if (deferral->copy != NULL) budget_free(deferral->budget, deferral->copy);
+    size_t minimum_bytes = deferral->minimum_bytes;
+    memset(deferral, 0, sizeof(*deferral));
+    deferral->minimum_bytes = minimum_bytes;
 }

@@ -96,137 +96,734 @@ index 703b27a..1af4542 100644
          fill_rectangle(&sl->non_zero_count_cache[scan8[16]], 4, 4, 8, 0, 1);
          fill_rectangle(&sl->non_zero_count_cache[scan8[32]], 4, 4, 8, 0, 1);
 diff --git a/libavcodec/h264_mb.c b/libavcodec/h264_mb.c
-index 67fa980..1c8a6d1 100644
+index 67fa980..d8b8503 100644
 --- a/libavcodec/h264_mb.c
 +++ b/libavcodec/h264_mb.c
-@@ -36,6 +36,7 @@
+@@ -36,6 +36,34 @@
  #include "qpeldsp.h"
  #include "rectangle.h"
  #include "threadframe.h"
 +#include "swdec_stages.h"
++#include "swdec_recon_stats.h"
++#include "swdec_chroma_rec.h"
++#ifdef SWDEC_FRAME_ONLY
++#define SWDEC_PARSER_CHROMA(sl) ((sl)->swdec_chroma_pred != NULL)
++#else
++#define SWDEC_PARSER_CHROMA(sl) 0
++#endif
++#include "swdec_pipe.h"
++#if defined(SWDEC_DIAGNOSTICS) && SWDEC_DIAGNOSTICS
++#define SWDEC_MB_REFERENCE swdec_mb_generic
++#define SWDEC_EDGE_FULL swdec_edge_full
++#define SWDEC_CHROMA_SPLIT swdec_chroma_split
++#define SWDEC_PREFETCH_CALLS swdec_prefetch_calls
++/* Validation builds: 1 keeps the (no-op) prefetch calls. */
++int swdec_prefetch_calls;
++/* Validation builds: 1 runs chroma MC one plane per call. */
++int swdec_chroma_split;
++/* Validation builds: 1 emulates the fixed 21x21 / 9x9 edge regions. */
++int swdec_edge_full;
++/* Validation builds: 1 keeps every macroblock on the generic path. */
++int swdec_mb_generic;
++#else
++#define SWDEC_MB_REFERENCE 0
++#define SWDEC_EDGE_FULL 0
++#define SWDEC_CHROMA_SPLIT 0
++#define SWDEC_PREFETCH_CALLS 0
++#endif
  
  static inline int get_lowest_part_list_y(H264SliceContext *sl,
                                           int n, int height, int y_offset, int list)
-@@ -247,9 +248,13 @@ static av_always_inline void mc_dir_part(const H264Context *h, H264SliceContext
+@@ -203,6 +231,274 @@ static void await_references(const H264Context *h, H264SliceContext *sl)
+         }
+ }
+ 
++#if defined(SWDEC_DIAGNOSTICS) && SWDEC_DIAGNOSTICS
++void (*swdec_recon_mark)(int mark);
++unsigned (*swdec_rt_now)(void);
++int swdec_rt_on;
++unsigned swdec_rt_us[SWDEC_RT_COUNT], swdec_rt_calls[SWDEC_RT_COUNT];
++unsigned swdec_rt_mbs[2];
++unsigned swdec_qpel_calls[3][16], swdec_qpel_avg;
++#endif
++
++#ifdef SWDEC_FRAME_ONLY
++/* ------------------------------------------------------------------ */
++/* Chroma prediction on the parser (swdec): scalar integer kernels for   */
++/* the Media Engine (no VFPU, and none of the PSP DSP tables), on private */
++/* 8x8 blocks, with the arithmetic of FFmpeg's C references for 8-bit    */
++/* pixels: h264chroma_template.c (put/avg) and h264dsp_template.c        */
++/* (weight/biweight). References outside the picture are read at clamped */
++/* coordinates, which is what emulated_edge_mc provides.                 */
++/* ------------------------------------------------------------------ */
++static inline int swdec_cp_clamp(int v, int hi) { return v < 0 ? 0 : v > hi ? hi : v; }
++static inline uint8_t swdec_cp_clip8(int v) { return (uint8_t) (v < 0 ? 0 : v > 255 ? 255 : v); }
++
++static void swdec_cp_mc(uint8_t *d, const uint8_t *ref, int s, int pw, int ph,
++                        int mx, int my, int w, int hh, int avg)
++{
++    const int cx = mx >> 3, cy = my >> 3, fx = mx & 7, fy = my & 7;
++    const int A = (8 - fx) * (8 - fy), B = fx * (8 - fy), C = (8 - fx) * fy, D = fx * fy;
++    const int inside = cx >= 0 && cy >= 0 && cx + w + 1 <= pw && cy + hh + 1 <= ph;
++    for (int j = 0; j < hh; j++, d += 8) {
++        if (inside) {
++            const uint8_t *p = ref + (cy + j) * s + cx;
++            for (int i = 0; i < w; i++) {
++                int v = (A * p[i] + B * p[i + 1] + C * p[i + s] + D * p[i + s + 1] + 32) >> 6;
++                d[i] = (uint8_t) (avg ? (d[i] + v + 1) >> 1 : v);
++            }
++        } else {
++            const int y0 = swdec_cp_clamp(cy + j, ph - 1), y1 = swdec_cp_clamp(cy + j + 1, ph - 1);
++            for (int i = 0; i < w; i++) {
++                const int x0 = swdec_cp_clamp(cx + i, pw - 1), x1 = swdec_cp_clamp(cx + i + 1, pw - 1);
++                int v = (A * ref[y0 * s + x0] + B * ref[y0 * s + x1]
++                         + C * ref[y1 * s + x0] + D * ref[y1 * s + x1] + 32) >> 6;
++                d[i] = (uint8_t) (avg ? (d[i] + v + 1) >> 1 : v);
++            }
++        }
++    }
++}
++
++static void swdec_cp_weight(uint8_t *d, int w, int hh, int log2, int weight, int off)
++{
++    int offset = (int) ((unsigned) off << log2);
++    if (log2) offset += 1 << (log2 - 1);
++    for (int j = 0; j < hh; j++, d += 8)
++        for (int i = 0; i < w; i++)
++            d[i] = swdec_cp_clip8((d[i] * weight + offset) >> log2);
++}
++
++static void swdec_cp_biweight(uint8_t *d, const uint8_t *src, int w, int hh, int log2,
++                              int weightd, int weights, int off)
++{
++    const int offset = (int) ((unsigned) ((off + 1) | 1) << log2);
++    for (int j = 0; j < hh; j++, d += 8, src += 8)
++        for (int i = 0; i < w; i++)
++            d[i] = swdec_cp_clip8((src[i] * weights + d[i] * weightd + offset) >> (log2 + 1));
++}
++
++/* one partition, as mc_part / mc_part_std / mc_part_weighted (4:2:0
++   frame macroblocks); x_off, y_off and the partition size are in chroma
++   samples within the macroblock; 0 when the partition is not predictable
++   here */
++static int swdec_cp_part(const H264Context *h, const H264SliceContext *sl,
++                         const SwdecChromaMotion *m,
++                         uint8_t (*pred)[64], uint8_t (*tmp)[64],
++                         int n, int w, int hh, int x_off, int y_off, int list0, int list1)
++{
++    const int s = (int) sl->uvlinesize, pw = 8 * h->mb_width, ph = 8 * h->mb_height;
++    const int ax = x_off + 8 * m->mb_x, ay = y_off + 8 * m->mb_y;
++    const int o = y_off * 8 + x_off;
++    int refn[2] = { -1, -1 };
++    const H264Ref *ref[2] = { NULL, NULL };
++    for (int l = 0; l < 2; l++) {
++        if (!(l ? list1 : list0)) continue;
++        refn[l] = m->ref_cache[l][scan8[n]];
++        if (refn[l] < 0 || refn[l] >= 48) return 0;
++        ref[l] = &sl->ref_list[l][refn[l]];
++        if (!ref[l]->data[1] || !ref[l]->data[2]) return 0;
++    }
++#define MV(l) m->mv_cache[l][scan8[n]][0] + ax * 8, m->mv_cache[l][scan8[n]][1] + ay * 8
++    const int weighted = (sl->pwt.use_weight == 2 && list0 && list1
++                          && sl->pwt.implicit_weight[refn[0]][refn[1]][m->mb_y & 1] != 32)
++                         || sl->pwt.use_weight == 1;
++    for (int p = 0; p < 2; p++) {
++        if (!weighted) {
++            if (list0) swdec_cp_mc(pred[p] + o, ref[0]->data[1 + p], s, pw, ph, MV(0), w, hh, 0);
++            if (list1) swdec_cp_mc(pred[p] + o, ref[1]->data[1 + p], s, pw, ph, MV(1), w, hh, list0);
++        } else if (list0 && list1) {
++            swdec_cp_mc(pred[p] + o, ref[0]->data[1 + p], s, pw, ph, MV(0), w, hh, 0);
++            swdec_cp_mc(tmp[p] + o, ref[1]->data[1 + p], s, pw, ph, MV(1), w, hh, 0);
++            if (sl->pwt.use_weight == 2) {
++                const int w0 = sl->pwt.implicit_weight[refn[0]][refn[1]][m->mb_y & 1];
++                swdec_cp_biweight(pred[p] + o, tmp[p] + o, w, hh, 5, w0, 64 - w0, 0);
++            } else {
++                swdec_cp_biweight(pred[p] + o, tmp[p] + o, w, hh,
++                                  sl->pwt.chroma_log2_weight_denom,
++                                  sl->pwt.chroma_weight[refn[0]][0][p][0],
++                                  sl->pwt.chroma_weight[refn[1]][1][p][0],
++                                  sl->pwt.chroma_weight[refn[0]][0][p][1]
++                                  + sl->pwt.chroma_weight[refn[1]][1][p][1]);
++            }
++        } else {
++            const int l = list1 ? 1 : 0;
++            swdec_cp_mc(pred[p] + o, ref[l]->data[1 + p], s, pw, ph, MV(l), w, hh, 0);
++            if (sl->pwt.use_weight_chroma)
++                swdec_cp_weight(pred[p] + o, w, hh, sl->pwt.chroma_log2_weight_denom,
++                                sl->pwt.chroma_weight[refn[l]][l][p][0],
++                                sl->pwt.chroma_weight[refn[l]][l][p][1]);
++        }
++    }
++#undef MV
++    return 1;
++}
++
++/* the whole inter macroblock, partitions walked as hl_motion does */
++int ff_swdec_chroma_predict(const H264Context *h, const H264SliceContext *sl,
++                            const SwdecChromaMotion *m, uint8_t pred[2][64])
++{
++    const int mb_type = h->cur_pic.mb_type[m->mb_xy];
++    uint8_t tmp[2][64];
++    if (!IS_INTER(mb_type) || sl->uvlinesize > 1024) return 0;
++#define PART(n, w, hh, x, y, l0, l1) \
++    do { if (!swdec_cp_part(h, sl, m, pred, tmp, n, w, hh, x, y, l0, l1)) return 0; } while (0)
++    if (IS_16X16(mb_type)) {
++        PART(0, 8, 8, 0, 0, IS_DIR(mb_type, 0, 0), IS_DIR(mb_type, 0, 1));
++    } else if (IS_16X8(mb_type)) {
++        PART(0, 8, 4, 0, 0, IS_DIR(mb_type, 0, 0), IS_DIR(mb_type, 0, 1));
++        PART(8, 8, 4, 0, 4, IS_DIR(mb_type, 1, 0), IS_DIR(mb_type, 1, 1));
++    } else if (IS_8X16(mb_type)) {
++        PART(0, 4, 8, 0, 0, IS_DIR(mb_type, 0, 0), IS_DIR(mb_type, 0, 1));
++        PART(4, 4, 8, 4, 0, IS_DIR(mb_type, 1, 0), IS_DIR(mb_type, 1, 1));
++    } else if (IS_8X8(mb_type)) {
++        for (int i = 0; i < 4; i++) {
++            const int sub = m->sub_mb_type[i], n = 4 * i;
++            const int x = (i & 1) << 2, y = (i & 2) << 1;
++            const int l0 = IS_DIR(sub, 0, 0), l1 = IS_DIR(sub, 0, 1);
++            if (IS_SUB_8X8(sub)) {
++                PART(n, 4, 4, x, y, l0, l1);
++            } else if (IS_SUB_8X4(sub)) {
++                PART(n, 4, 2, x, y, l0, l1);
++                PART(n + 2, 4, 2, x, y + 2, l0, l1);
++            } else if (IS_SUB_4X8(sub)) {
++                PART(n, 2, 4, x, y, l0, l1);
++                PART(n + 1, 2, 4, x + 2, y, l0, l1);
++            } else {
++                for (int j = 0; j < 4; j++)
++                    PART(n + j, 2, 2, x + 2 * (j & 1), y + (j & 2), l0, l1);
++            }
++        }
++    } else {
++        return 0;
++    }
++#undef PART
++    return 1;
++}
++#endif
++
++#if defined(SWDEC_DIAGNOSTICS) && SWDEC_DIAGNOSTICS && defined(SWDEC_FRAME_ONLY)
++/* Chroma prediction recorder (swdec_chroma_rec.h): one row at a time, on
++   the main core only, while swdec_chroma_rec_on is set. */
++int swdec_chroma_rec_on;
++SwdecChromaRec swdec_chroma_rec __attribute__((aligned(64)));
++static struct {
++    int on, mb;
++    const uint8_t *cb, *cr, *tmp;
++    ptrdiff_t stride;
++} cr_mb;
++static void cr_mb_begin(const H264Context *h, const H264SliceContext *sl,
++                        const uint8_t *cb, const uint8_t *cr)
++{
++    SwdecChromaRec *r = &swdec_chroma_rec;
++    cr_mb.on = 0;
++    if (!swdec_chroma_rec_on || r->overflow || sl->swdec_chroma_pred) return;
++    if (r->mbs >= SWDEC_CR_MAX_MBS || sl->mb_uvlinesize > 512) { r->overflow = 1; return; }
++    cr_mb.on = 1; cr_mb.mb = r->mbs;
++    cr_mb.cb = cb; cr_mb.cr = cr; cr_mb.tmp = sl->bipred_scratchpad;
++    cr_mb.stride = sl->mb_uvlinesize;
++    r->ref_stride = (int) sl->mb_uvlinesize;
++    r->pic_w = 8 * h->mb_width; r->pic_h = 8 * h->mb_height; r->mb_y = sl->mb_y;
++    r->chroma_ctx = &h->h264chroma; r->dsp_ctx = &h->h264dsp; r->vdsp_ctx = &h->vdsp;
++}
++/* a new operation whose Cb destination is dst_cb (the prediction or the
++   bi-prediction scratch); NULL ends the row's recording as unsupported */
++static SwdecChromaOp *cr_op(const uint8_t *dst_cb)
++{
++    SwdecChromaRec *r = &swdec_chroma_rec;
++    if (!cr_mb.on) return NULL;
++    const ptrdiff_t s = cr_mb.stride;
++    ptrdiff_t off = dst_cb - cr_mb.cb;
++    int buf = SWDEC_CR_PIC;
++    if (!(off >= 0 && off < 8 * s && off % s < 8)) {
++        off = dst_cb - cr_mb.tmp;
++        buf = SWDEC_CR_TMP;
++        if (!(off >= 0 && off < 8 * s && off % s < 8)) off = -1;
++    }
++    if (off < 0 || r->ops >= SWDEC_CR_MAX_OPS) { r->overflow = 1; cr_mb.on = 0; return NULL; }
++    SwdecChromaOp *o = &r->op[r->ops++];
++    memset(o, 0, sizeof(*o));
++    o->buf = buf; o->x = off % s; o->y = off / s; o->mb = cr_mb.mb;
++    return o;
++}
++static void cr_mb_end(void)
++{
++    SwdecChromaRec *r = &swdec_chroma_rec;
++    if (!cr_mb.on) return;
++    for (int y = 0; y < 8; y++) {
++        memcpy(r->expect[cr_mb.mb][0] + 8 * y, cr_mb.cb + y * cr_mb.stride, 8);
++        memcpy(r->expect[cr_mb.mb][1] + 8 * y, cr_mb.cr + y * cr_mb.stride, 8);
++    }
++    r->mbs++;
++    cr_mb.on = 0;
++}
++#define SWDEC_CR_MB_BEGIN(h, sl, cb, cr) cr_mb_begin(h, sl, cb, cr)
++#define SWDEC_CR_MB_END() cr_mb_end()
++
++/* The recorded operations through the main core's own kernels (the
++   recorder's check, and the CPU cost of the same work). */
++void swdec_chroma_rec_cpu_replay(const SwdecChromaRec *r, uint8_t (*out)[2][64])
++{
++    static uint8_t buf[2][2][10 * 512] __attribute__((aligned(16)));
++    static uint8_t emu[2][10 * 512] __attribute__((aligned(16)));
++    const H264ChromaContext *cc = r->chroma_ctx;
++    const H264DSPContext *dsp = r->dsp_ctx;
++    const VideoDSPContext *vd = r->vdsp_ctx;
++    const ptrdiff_t s = r->ref_stride;
++    int k = 0;
++    for (int mb = 0; mb < r->mbs; mb++) {
++        for (int b = 0; b < 2; b++)
++            for (int p = 0; p < 2; p++)
++                for (int y = 0; y < 8; y++) memset(buf[b][p] + y * s, 0, 8);
++        for (; k < r->ops && r->op[k].mb == mb; k++) {
++            const SwdecChromaOp *o = &r->op[k];
++            const int wi = o->w == 8 ? 0 : o->w == 4 ? 1 : 2;
++            for (int p = 0; p < 2; p++) {
++                uint8_t *d = buf[o->buf][p] + o->y * s + o->x;
++                if (o->type == SWDEC_CR_MC) {
++                    const uint8_t *src = o->ref[p] + o->cy * s + o->cx;
++                    if (o->cx < 0 || o->cy < 0 || o->cx + o->w + 1 > r->pic_w
++                        || o->cy + o->h + 1 > r->pic_h) {
++                        vd->emulated_edge_mc(emu[p], src, s, s, o->w + 1, o->h + 1,
++                                             o->cx, o->cy, r->pic_w, r->pic_h);
++                        src = emu[p];
++                    }
++                    (o->avg ? cc->avg_h264_chroma_pixels_tab
++                            : cc->put_h264_chroma_pixels_tab)[wi](d, src, s, o->h, o->fx, o->fy);
++                } else if (o->type == SWDEC_CR_WEIGHT) {
++                    dsp->weight_pixels_tab[wi + 1](d, s, o->h, o->log2, o->wa[p], o->off[p]);
++                } else {
++                    dsp->biweight_pixels_tab[wi + 1](d, buf[SWDEC_CR_TMP][p] + o->ty * s + o->tx,
++                                                          s, o->h, o->log2, o->wa[p], o->wb[p], o->off[p]);
++                }
++            }
++        }
++        for (int p = 0; p < 2; p++)
++            for (int y = 0; y < 8; y++) memcpy(out[mb][p] + 8 * y, buf[SWDEC_CR_PIC][p] + y * s, 8);
++    }
++}
++#else
++#define SWDEC_CR_MB_BEGIN(h, sl, cb, cr) ((void) 0)
++#define SWDEC_CR_MB_END() ((void) 0)
++#endif
++
+ static av_always_inline void mc_dir_part(const H264Context *h, H264SliceContext *sl,
+                                          H264Ref *pic,
+                                          int n, int square, int height,
+@@ -229,6 +525,31 @@ static av_always_inline void mc_dir_part(const H264Context *h, H264SliceContext
+     const int pic_height = 16 * h->mb_height >> MB_FIELD(sl);
+     int ysh;
+ 
++#ifdef SWDEC_FRAME_ONLY
++    /* swdec: emulate only the samples this partition's filter reads (its
++     * width and height, plus 2 before and 3 after in a direction with a
++     * fractional offset), and only when they leave the picture. The kernels
++     * may load a few bytes either side of that and ignore them. Chroma has
++     * its own footprint (+1 for the bilinear tap) and check below.
++     * swdec_edge_full (validation builds) keeps the fixed 21x21 region. */
++    int exact = !SWDEC_EDGE_FULL;
++    int part_w = square ? height : delta == height ? 2 * height : height >> 1;
++    if (exact) {
++        const int fx = mx & 3, fy = my & 3;
++        const int x0 = full_mx - (fx ? 2 : 0), y0 = full_my - (fy ? 2 : 0);
++        const int bw = part_w + (fx ? 5 : 0), bh = height + (fy ? 5 : 0);
++        if (x0 < 0 || y0 < 0 || x0 + bw > pic_width || y0 + bh > pic_height) {
++            SWDEC_RT_BEGIN(r_ex);
++            h->vdsp.emulated_edge_mc(sl->edge_emu_buffer,
++                                     pic->data[0] + x0 + y0 * sl->mb_linesize,
++                                     sl->mb_linesize, sl->mb_linesize,
++                                     bw, bh, x0, y0, pic_width, pic_height);
++            SWDEC_RT_END(r_ex, SWDEC_RT_EDGE);
++            src_y = sl->edge_emu_buffer + (full_mx - x0) + (full_my - y0) * sl->mb_linesize;
++        }
++    } else
++#endif
++    {
+     if (mx & 7)
+         extra_width -= 3;
+     if (my & 7)
+@@ -238,21 +559,46 @@ static av_always_inline void mc_dir_part(const H264Context *h, H264SliceContext
+         full_my                <          0 - extra_height ||
+         full_mx + 16 /*FIXME*/ > pic_width  + extra_width  ||
+         full_my + 16 /*FIXME*/ > pic_height + extra_height) {
++        SWDEC_RT_BEGIN(r_ey);
+         h->vdsp.emulated_edge_mc(sl->edge_emu_buffer,
+                                  src_y - (2 << pixel_shift) - 2 * sl->mb_linesize,
+                                  sl->mb_linesize, sl->mb_linesize,
+                                  16 + 5, 16 + 5 /*FIXME*/, full_mx - 2,
+                                  full_my - 2, pic_width, pic_height);
++        SWDEC_RT_END(r_ey, SWDEC_RT_EDGE);
+         src_y = sl->edge_emu_buffer + (2 << pixel_shift) + 2 * sl->mb_linesize;
          emu   = 1;
      }
++    }
  
 +    {
 +    SWDEC_STAGE_BEGIN(t_qpel);
++#if defined(SWDEC_DIAGNOSTICS) && SWDEC_DIAGNOSTICS
++    if (swdec_recon_mark) {
++        const qpel_mc_func (*put)[16] = h->h264qpel.put_h264_qpel_pixels_tab;
++        const qpel_mc_func (*avg)[16] = h->h264qpel.avg_h264_qpel_pixels_tab;
++        int size = qpix_op == put[0] || qpix_op == avg[0] ? 0
++                 : qpix_op == put[1] || qpix_op == avg[1] ? 1 : 2;
++        swdec_qpel_calls[size][luma_xy] += square ? 1 : 2;
++        swdec_qpel_avg += qpix_op == avg[0] || qpix_op == avg[1] || qpix_op == avg[2];
++    }
++#endif
++    SWDEC_RT_BEGIN(r_y);
      qpix_op[luma_xy](dest_y, src_y, sl->mb_linesize); // FIXME try variable height perhaps?
      if (!square)
          qpix_op[luma_xy](dest_y + delta, src_y + delta, sl->mb_linesize);
++    SWDEC_RT_END(r_y, !luma_xy ? SWDEC_RT_LUMA_FULL
++                 : !(luma_xy & 3) || !(luma_xy & 12) ? SWDEC_RT_LUMA_1D
++                 : SWDEC_RT_LUMA_2D);
 +    SWDEC_STAGE_END(t_qpel, 5);
 +    }
  
      if (CONFIG_GRAY && h->flags & AV_CODEC_FLAG_GRAY)
          return;
-@@ -304,9 +309,13 @@ static av_always_inline void mc_dir_part(const H264Context *h, H264SliceContext
++#ifdef SWDEC_FRAME_ONLY
++    if (sl->swdec_chroma_pred)   /* the parser predicted chroma (copied after hl_motion) */
++        return;
++#endif
+ 
+     if (chroma_idc == 3 /* yuv444 */) {
+         src_cb = pic->data[1] + offset;
+@@ -296,27 +642,105 @@ static av_always_inline void mc_dir_part(const H264Context *h, H264SliceContext
+              (my >> ysh) * sl->mb_uvlinesize;
+     src_cr = pic->data[2] + ((mx >> 3) * (1 << pixel_shift)) +
+              (my >> ysh) * sl->mb_uvlinesize;
++#ifdef SWDEC_FRAME_ONLY
++    int chroma_w = 9, chroma_h = 8 * chroma_idc + 1;
++    if (exact) {
++        const int cx = mx >> 3, cy = my >> 3;
++        chroma_w = (part_w >> 1) + 1;
++        chroma_h = (height >> 1) + 1;
++        emu = cx < 0 || cy < 0
++            || cx + (part_w >> 1) + ((mx & 7) != 0) > pic_width >> 1
++            || cy + (height >> 1) + ((my & 7) != 0) > pic_height >> 1;
++    }
++    /* swdec: both planes in one call when the kernel pairs them (same
++     * vector and weights); swdec_chroma_split (validation builds) keeps
++     * one call per plane. */
++#if defined(SWDEC_DIAGNOSTICS) && SWDEC_DIAGNOSTICS
++    {
++        SwdecChromaOp *o = cr_op(dest_cb);
++        if (o) {
++            const H264ChromaContext *cc = &h->h264chroma;
++            o->type = SWDEC_CR_MC;
++            o->w = part_w >> 1; o->h = height >> 1;
++            o->cx = mx >> 3; o->cy = my >> 3; o->fx = mx & 7; o->fy = my & 7;
++            o->avg = chroma_op == cc->avg_h264_chroma_pixels_tab[0]
++                  || chroma_op == cc->avg_h264_chroma_pixels_tab[1]
++                  || chroma_op == cc->avg_h264_chroma_pixels_tab[2];
++            o->ref[0] = pic->data[1]; o->ref[1] = pic->data[2];
++        }
++    }
++#endif
++    if (exact && !SWDEC_CHROMA_SPLIT) {
++        const H264ChromaContext *cc = &h->h264chroma;
++        h264_chroma2_mc_func op2 =
++              chroma_op == cc->put_h264_chroma_pixels_tab[0] ? cc->put_h264_chroma2_pixels_tab[0]
++            : chroma_op == cc->put_h264_chroma_pixels_tab[1] ? cc->put_h264_chroma2_pixels_tab[1]
++            : chroma_op == cc->avg_h264_chroma_pixels_tab[0] ? cc->avg_h264_chroma2_pixels_tab[0]
++            : chroma_op == cc->avg_h264_chroma_pixels_tab[1] ? cc->avg_h264_chroma2_pixels_tab[1]
++            : NULL;
++        if (op2) {
++            if (emu) {
++                uint8_t *emu_cr = sl->edge_emu_buffer + 16 * sl->mb_uvlinesize;
++                SWDEC_RT_BEGIN(r_e2);
++                h->vdsp.emulated_edge_mc(sl->edge_emu_buffer, src_cb,
++                                         sl->mb_uvlinesize, sl->mb_uvlinesize,
++                                         chroma_w, chroma_h, mx >> 3, my >> 3,
++                                         pic_width >> 1, pic_height >> 1);
++                h->vdsp.emulated_edge_mc(emu_cr, src_cr,
++                                         sl->mb_uvlinesize, sl->mb_uvlinesize,
++                                         chroma_w, chroma_h, mx >> 3, my >> 3,
++                                         pic_width >> 1, pic_height >> 1);
++                SWDEC_RT_END(r_e2, SWDEC_RT_EDGE);
++                src_cb = sl->edge_emu_buffer;
++                src_cr = emu_cr;
++            }
++            SWDEC_RT_BEGIN(r_c2);
++            op2(dest_cb, dest_cr, src_cb, src_cr, sl->mb_uvlinesize,
++                height >> 1, mx & 7, my & 7);
++            SWDEC_RT_END(r_c2, SWDEC_RT_CHROMA);
++            return;
++        }
++    }
++#else
++    const int chroma_w = 9, chroma_h = 8 * chroma_idc + 1;
++#endif
+ 
+     if (emu) {
++        SWDEC_RT_BEGIN(r_e);
+         h->vdsp.emulated_edge_mc(sl->edge_emu_buffer, src_cb,
+                                  sl->mb_uvlinesize, sl->mb_uvlinesize,
+-                                 9, 8 * chroma_idc + 1, (mx >> 3), (my >> ysh),
++                                 chroma_w, chroma_h, (mx >> 3), (my >> ysh),
                                   pic_width >> 1, pic_height >> (chroma_idc == 1 /* yuv420 */));
++        SWDEC_RT_END(r_e, SWDEC_RT_EDGE);
          src_cb = sl->edge_emu_buffer;
      }
 +    {
 +    SWDEC_STAGE_BEGIN(t_chroma);
++    SWDEC_RT_BEGIN(r_t_chroma);
      chroma_op(dest_cb, src_cb, sl->mb_uvlinesize,
                height >> (chroma_idc == 1 /* yuv420 */),
                mx & 7, ((unsigned)my << (chroma_idc == 2 /* yuv422 */)) & 7);
++    SWDEC_RT_END(r_t_chroma, SWDEC_RT_CHROMA);
 +    SWDEC_STAGE_END(t_chroma, 6);
 +    }
  
      if (emu) {
++        SWDEC_RT_BEGIN(r_e);
          h->vdsp.emulated_edge_mc(sl->edge_emu_buffer, src_cr,
-@@ -315,8 +324,12 @@ static av_always_inline void mc_dir_part(const H264Context *h, H264SliceContext
+                                  sl->mb_uvlinesize, sl->mb_uvlinesize,
+-                                 9, 8 * chroma_idc + 1, (mx >> 3), (my >> ysh),
++                                 chroma_w, chroma_h, (mx >> 3), (my >> ysh),
                                   pic_width >> 1, pic_height >> (chroma_idc == 1 /* yuv420 */));
++        SWDEC_RT_END(r_e, SWDEC_RT_EDGE);
          src_cr = sl->edge_emu_buffer;
      }
 +    {
 +    SWDEC_STAGE_BEGIN(t_chroma2);
++    SWDEC_RT_BEGIN(r_t_chroma2);
      chroma_op(dest_cr, src_cr, sl->mb_uvlinesize, height >> (chroma_idc == 1 /* yuv420 */),
                mx & 7, ((unsigned)my << (chroma_idc == 2 /* yuv422 */)) & 7);
++    SWDEC_RT_END(r_t_chroma2, SWDEC_RT_CHROMA);
 +    SWDEC_STAGE_END(t_chroma2, 6);
 +    }
  }
  
  static av_always_inline void mc_part_std(const H264Context *h, H264SliceContext *sl,
-@@ -421,6 +434,7 @@ static av_always_inline void mc_part_weighted(const H264Context *h, H264SliceCon
+@@ -421,12 +845,38 @@ static av_always_inline void mc_part_weighted(const H264Context *h, H264SliceCon
                      x_offset, y_offset, qpix_put, chroma_put,
                      pixel_shift, chroma_idc);
  
 +        SWDEC_STAGE_BEGIN(t_w);
++        SWDEC_RT_BEGIN(r_t_w);
++#if defined(SWDEC_DIAGNOSTICS) && SWDEC_DIAGNOSTICS && defined(SWDEC_FRAME_ONLY)
++        {
++            SwdecChromaOp *o = cr_op(dest_cb);
++            if (o) {
++                const int pw = square ? height : delta == height ? 2 * height : height >> 1;
++                o->type = SWDEC_CR_BIWEIGHT; o->w = pw >> 1; o->h = chroma_height;
++                o->tx = (tmp_cb - sl->bipred_scratchpad) % sl->mb_uvlinesize;
++                o->ty = (tmp_cb - sl->bipred_scratchpad) / sl->mb_uvlinesize;
++                if (sl->pwt.use_weight == 2) {
++                    int w0 = sl->pwt.implicit_weight[refn0][refn1][sl->mb_y & 1];
++                    o->log2 = 5;
++                    o->wa[0] = o->wa[1] = w0; o->wb[0] = o->wb[1] = 64 - w0;
++                } else {
++                    o->log2 = sl->pwt.chroma_log2_weight_denom;
++                    for (int p = 0; p < 2; p++) {
++                        o->wa[p] = sl->pwt.chroma_weight[refn0][0][p][0];
++                        o->wb[p] = sl->pwt.chroma_weight[refn1][1][p][0];
++                        o->off[p] = sl->pwt.chroma_weight[refn0][0][p][1]
++                                  + sl->pwt.chroma_weight[refn1][1][p][1];
++                    }
++                }
++            }
++        }
++#endif
          if (sl->pwt.use_weight == 2) {
              int weight0 = sl->pwt.implicit_weight[refn0][refn1][sl->mb_y & 1];
              int weight1 = 64 - weight0;
-@@ -454,6 +468,7 @@ static av_always_inline void mc_part_weighted(const H264Context *h, H264SliceCon
+             luma_weight_avg(dest_y, tmp_y, sl->mb_linesize,
+                             height, 5, weight0, weight1, 0);
+-            if (!CONFIG_GRAY || !(h->flags & AV_CODEC_FLAG_GRAY)) {
++            if ((!CONFIG_GRAY || !(h->flags & AV_CODEC_FLAG_GRAY)) && !SWDEC_PARSER_CHROMA(sl)) {
+                 chroma_weight_avg(dest_cb, tmp_cb, sl->mb_uvlinesize,
+                                   chroma_height, 5, weight0, weight1, 0);
+                 chroma_weight_avg(dest_cr, tmp_cr, sl->mb_uvlinesize,
+@@ -439,7 +889,7 @@ static av_always_inline void mc_part_weighted(const H264Context *h, H264SliceCon
+                             sl->pwt.luma_weight[refn1][1][0],
+                             sl->pwt.luma_weight[refn0][0][1] +
+                             sl->pwt.luma_weight[refn1][1][1]);
+-            if (!CONFIG_GRAY || !(h->flags & AV_CODEC_FLAG_GRAY)) {
++            if ((!CONFIG_GRAY || !(h->flags & AV_CODEC_FLAG_GRAY)) && !SWDEC_PARSER_CHROMA(sl)) {
+                 chroma_weight_avg(dest_cb, tmp_cb, sl->mb_uvlinesize, chroma_height,
+                                   sl->pwt.chroma_log2_weight_denom,
+                                   sl->pwt.chroma_weight[refn0][0][0][0],
+@@ -454,6 +904,8 @@ static av_always_inline void mc_part_weighted(const H264Context *h, H264SliceCon
                                    sl->pwt.chroma_weight[refn1][1][1][1]);
              }
          }
++        SWDEC_RT_END(r_t_w, SWDEC_RT_WEIGHT);
 +        SWDEC_STAGE_END(t_w, 7);
      } else {
          int list     = list1 ? 1 : 0;
          int refn     = sl->ref_cache[list][scan8[n]];
-@@ -462,6 +477,7 @@ static av_always_inline void mc_part_weighted(const H264Context *h, H264SliceCon
+@@ -462,12 +914,26 @@ static av_always_inline void mc_part_weighted(const H264Context *h, H264SliceCon
                      dest_y, dest_cb, dest_cr, x_offset, y_offset,
                      qpix_put, chroma_put, pixel_shift, chroma_idc);
  
 +        SWDEC_STAGE_BEGIN(t_w2);
++        SWDEC_RT_BEGIN(r_t_w2);
          luma_weight_op(dest_y, sl->mb_linesize, height,
                         sl->pwt.luma_log2_weight_denom,
                         sl->pwt.luma_weight[refn][list][0],
-@@ -478,6 +494,7 @@ static av_always_inline void mc_part_weighted(const H264Context *h, H264SliceCon
+                        sl->pwt.luma_weight[refn][list][1]);
+-        if (!CONFIG_GRAY || !(h->flags & AV_CODEC_FLAG_GRAY)) {
++        if ((!CONFIG_GRAY || !(h->flags & AV_CODEC_FLAG_GRAY)) && !SWDEC_PARSER_CHROMA(sl)) {
+             if (sl->pwt.use_weight_chroma) {
++#if defined(SWDEC_DIAGNOSTICS) && SWDEC_DIAGNOSTICS && defined(SWDEC_FRAME_ONLY)
++                SwdecChromaOp *o = cr_op(dest_cb);
++                if (o) {
++                    const int pw = square ? height : delta == height ? 2 * height : height >> 1;
++                    o->type = SWDEC_CR_WEIGHT; o->w = pw >> 1; o->h = chroma_height;
++                    o->log2 = sl->pwt.chroma_log2_weight_denom;
++                    for (int p = 0; p < 2; p++) {
++                        o->wa[p] = sl->pwt.chroma_weight[refn][list][p][0];
++                        o->off[p] = sl->pwt.chroma_weight[refn][list][p][1];
++                    }
++                }
++#endif
+                 chroma_weight_op(dest_cb, sl->mb_uvlinesize, chroma_height,
+                                  sl->pwt.chroma_log2_weight_denom,
+                                  sl->pwt.chroma_weight[refn][list][0][0],
+@@ -478,6 +944,8 @@ static av_always_inline void mc_part_weighted(const H264Context *h, H264SliceCon
                                   sl->pwt.chroma_weight[refn][list][1][1]);
              }
          }
++        SWDEC_RT_END(r_t_w2, SWDEC_RT_WEIGHT);
 +        SWDEC_STAGE_END(t_w2, 7);
      }
  }
  
+@@ -485,6 +953,13 @@ static av_always_inline void prefetch_motion(const H264Context *h, H264SliceCont
+                                              int list, int pixel_shift,
+                                              int chroma_idc)
+ {
++    /* swdec: the PSP build's prefetch is a no-op (videodsp just_return), so
++     * the address arithmetic and two indirect calls per list are skipped;
++     * swdec_prefetch_calls (validation builds) keeps them. */
++#ifdef SWDEC_FRAME_ONLY
++    if (!SWDEC_PREFETCH_CALLS)
++        return;
++#endif
+     /* fetch pixels for estimated mv 4 macroblocks ahead
+      * optimized for 64byte cache lines */
+     const int refn = sl->ref_cache[list][scan8[0]];
+@@ -801,8 +1276,24 @@ void ff_h264_hl_decode_mb(const H264Context *h, H264SliceContext *sl)
+ {
+     const int mb_xy   = sl->mb_xy;
+     const int mb_type = h->cur_pic.mb_type[mb_xy];
++#ifdef SWDEC_FRAME_ONLY
++    /* swdec: the library is built CONFIG_SMALL, which sent every macroblock
++     * down the generic path. Ordinary 8-bit macroblocks take the
++     * specialised one (as in a normal build); the special cases keep the
++     * generic path, and this build decodes 8-bit 4:2:0 only. Validation
++     * builds keep everything generic under swdec_mb_generic. */
++    int is_complex    = SWDEC_MB_REFERENCE || sl->is_complex ||
++                        IS_INTRA_PCM(mb_type) || sl->qscale == 0;
++
++    if (is_complex)
++        hl_decode_mb_complex(h, sl);
++    else
++        hl_decode_mb_simple_8(h, sl);
++    return;
++#else
+     int is_complex    = CONFIG_SMALL || sl->is_complex ||
+                         IS_INTRA_PCM(mb_type) || sl->qscale == 0;
++#endif
+ 
+     if (CHROMA444(h)) {
+         if (is_complex || h->pixel_shift)
 diff --git a/libavcodec/h264_mb_template.c b/libavcodec/h264_mb_template.c
-index ee8c81a..8396399 100644
+index ee8c81a..826cfdb 100644
 --- a/libavcodec/h264_mb_template.c
 +++ b/libavcodec/h264_mb_template.c
-@@ -177,6 +177,7 @@ static av_noinline void FUNC(hl_decode_mb)(const H264Context *h, H264SliceContex
+@@ -57,8 +57,13 @@ static av_noinline void FUNC(hl_decode_mb)(const H264Context *h, H264SliceContex
+     dest_cb = h->cur_pic.f->data[1] +  (mb_x << PIXEL_SHIFT) * 8 + mb_y * sl->uvlinesize * block_h;
+     dest_cr = h->cur_pic.f->data[2] +  (mb_x << PIXEL_SHIFT) * 8 + mb_y * sl->uvlinesize * block_h;
+ 
++#ifdef SWDEC_FRAME_ONLY
++    if (SWDEC_PREFETCH_CALLS)   /* a no-op on the PSP (see prefetch_motion) */
++#endif
++    {
+     h->vdsp.prefetch(dest_y  + (sl->mb_x & 3) * 4 * sl->linesize   + (64 << PIXEL_SHIFT), sl->linesize,       4);
+     h->vdsp.prefetch(dest_cb + (sl->mb_x & 7)     * sl->uvlinesize + (64 << PIXEL_SHIFT), dest_cr - dest_cb, 2);
++    }
+ 
+     h->list_counts[mb_xy] = sl->list_count;
+ 
+@@ -151,6 +156,7 @@ static av_noinline void FUNC(hl_decode_mb)(const H264Context *h, H264SliceContex
+         }
+     } else {
+         if (IS_INTRA(mb_type)) {
++            SWDEC_RT_BEGIN(r_intra);
+             if (sl->deblocking_filter)
+                 xchg_mb_border(h, sl, dest_y, dest_cb, dest_cr, linesize,
+                                uvlinesize, 1, 0, SIMPLE, PIXEL_SHIFT);
+@@ -167,6 +173,7 @@ static av_noinline void FUNC(hl_decode_mb)(const H264Context *h, H264SliceContex
+             if (sl->deblocking_filter)
+                 xchg_mb_border(h, sl, dest_y, dest_cb, dest_cr, linesize,
+                                uvlinesize, 0, 0, SIMPLE, PIXEL_SHIFT);
++            SWDEC_RT_END(r_intra, SWDEC_RT_INTRA);
+         } else {
+             if (chroma422) {
+                 FUNC(hl_motion_422)(h, sl, dest_y, dest_cb, dest_cr,
+@@ -177,6 +184,9 @@ static av_noinline void FUNC(hl_decode_mb)(const H264Context *h, H264SliceContex
                                h->h264dsp.weight_pixels_tab,
                                h->h264dsp.biweight_pixels_tab);
              } else {
 +                SWDEC_STAGE_BEGIN(t_mc);
++                SWDEC_RT_BEGIN(r_mc);
++                SWDEC_CR_MB_BEGIN(h, sl, dest_cb, dest_cr);
                  FUNC(hl_motion_420)(h, sl, dest_y, dest_cb, dest_cr,
                                h->h264qpel.put_h264_qpel_pixels_tab,
                                h->h264chroma.put_h264_chroma_pixels_tab,
-@@ -184,9 +185,12 @@ static av_noinline void FUNC(hl_decode_mb)(const H264Context *h, H264SliceContex
+@@ -184,9 +194,24 @@ static av_noinline void FUNC(hl_decode_mb)(const H264Context *h, H264SliceContex
                                h->h264chroma.avg_h264_chroma_pixels_tab,
                                h->h264dsp.weight_pixels_tab,
                                h->h264dsp.biweight_pixels_tab);
++                SWDEC_CR_MB_END();
++#ifdef SWDEC_FRAME_ONLY
++                if (sl->swdec_chroma_pred) {   /* the parser's prediction, before the residual */
++                    const uint8_t *pc = sl->swdec_chroma_pred;
++                    for (int r = 0; r < 8; r++) {
++                        memcpy(dest_cb + r * uvlinesize, pc + 8 * r, 8);
++                        memcpy(dest_cr + r * uvlinesize, pc + 64 + 8 * r, 8);
++                    }
++                }
++#endif
++                SWDEC_RT_END(r_mc, SWDEC_RT_MOTION);
 +                SWDEC_STAGE_END(t_mc, 3);
              }
          }
  
 +        {
 +        SWDEC_STAGE_BEGIN(t_idct);
++        SWDEC_RT_BEGIN(r_idct);
          hl_decode_mb_idct_luma(h, sl, mb_type, SIMPLE, transform_bypass,
                                 PIXEL_SHIFT, block_offset, linesize, dest_y, 0);
  
-@@ -244,6 +248,8 @@ static av_noinline void FUNC(hl_decode_mb)(const H264Context *h, H264SliceContex
+@@ -244,6 +269,9 @@ static av_noinline void FUNC(hl_decode_mb)(const H264Context *h, H264SliceContex
                                       sl->non_zero_count_cache);
              }
          }
++        SWDEC_RT_END(r_idct, SWDEC_RT_IDCT);
 +        SWDEC_STAGE_END(t_idct, 4);
 +        }
      }
  }
  
 diff --git a/libavcodec/h264_slice.c b/libavcodec/h264_slice.c
-index e3b4436..354f329 100644
+index e3b4436..94dd2fc 100644
 --- a/libavcodec/h264_slice.c
 +++ b/libavcodec/h264_slice.c
-@@ -38,6 +38,17 @@
+@@ -38,6 +38,19 @@
  #include "avcodec.h"
  #include "h264.h"
  #include "h264dec.h"
 +#include "swdec_stages.h"
++#include "swdec_recon_stats.h"
 +#include "swdec_pipe.h"
 +#include <stddef.h>
 +#define SWDEC_RING_SLOT_BASE (16 * 48 + 256)     /* swdec coefficient ring slot for 8-bit: mb + padding, in int16 (x2 for high depth) */
 +#define SWDEC_RING_SLOT(h) (SWDEC_RING_SLOT_BASE << (h)->pixel_shift)
++static int swdec_ring_dirty = 1;              /* a slice failed since the ring was last zeroed */
 +#if defined(SWDEC_STAGE_TIMING) && SWDEC_STAGE_TIMING
 +extern int swdec_probe_norecon;
 +#define SWDEC_RECON_ENABLED (!swdec_probe_norecon)
@@ -236,32 +833,38 @@ index e3b4436..354f329 100644
  #include "h264data.h"
  #include "h264chroma.h"
  #include "h264_ps.h"
-@@ -544,6 +555,9 @@ static int h264_frame_start(H264Context *h)
+@@ -544,7 +557,15 @@ static int h264_frame_start(H264Context *h)
      for (i = 0; i < h->nb_slice_ctx; i++) {
          h->slice_ctx[i].linesize   = h->cur_pic_ptr->f->linesize[0];
          h->slice_ctx[i].uvlinesize = h->cur_pic_ptr->f->linesize[1];
-+        if (h->slice_ctx[i].swdec_ring)   /* swdec row batching: fresh zero ring per frame */
++        /* swdec row batching: the IDCTs clear every coefficient block they
++           consume (ring slots are reused every other row on that promise),
++           so only a slice that failed can leave coefficients behind; zero
++           the ring for the next frame only then */
++        if (h->slice_ctx[i].swdec_ring && swdec_ring_dirty)
 +            memset(h->slice_ctx[i].swdec_ring, 0, (size_t) h->slice_ctx[i].swdec_ring_slots * SWDEC_RING_SLOT(h) * sizeof(int16_t));
 +        h->slice_ctx[i].swdec_njobs = 0;
      }
++    swdec_ring_dirty = 0;
  
      if (CONFIG_ERROR_RESILIENCE && h->enable_er) {
-@@ -576,6 +590,14 @@ static int h264_frame_start(H264Context *h)
+         ff_er_frame_start(&h->er);
+@@ -576,6 +597,14 @@ static int h264_frame_start(H264Context *h)
      h->postpone_filter = 0;
  
      h->mb_aff_frame = h->ps.sps->mb_aff && (h->picture_structure == PICT_FRAME);
 +#ifdef SWDEC_FRAME_ONLY
 +    if (!h->ps.sps->frame_mbs_only_flag || h->ps.sps->mb_aff || h->picture_structure != PICT_FRAME ||
-+        h->ps.sps->chroma_format_idc != 1 || !h->ps.pps->cabac || h->ps.sps->bit_depth_luma != 8 ||
++        h->ps.sps->chroma_format_idc != 1 || h->ps.sps->bit_depth_luma != 8 ||
 +        h->ps.sps->bit_depth_chroma != 8) {
-+        av_log(h->avctx, AV_LOG_ERROR, "swdec: only progressive 8-bit 4:2:0 CABAC streams are supported in this build\n");
++        av_log(h->avctx, AV_LOG_ERROR, "swdec: only progressive 8-bit 4:2:0 streams are supported in this build\n");
 +        return AVERROR_PATCHWELCOME;
 +    }
 +#endif
  
      if (h->sei.common.unregistered.x264_build >= 0)
          h->x264_build = h->sei.common.unregistered.x264_build;
-@@ -2436,7 +2458,15 @@ static int fill_filter_caches(const H264Context *h, H264SliceContext *sl, int mb
+@@ -2436,7 +2465,15 @@ static int fill_filter_caches(const H264Context *h, H264SliceContext *sl, int mb
      return 0;
  }
  
@@ -277,7 +880,7 @@ index e3b4436..354f329 100644
  {
      uint8_t *dest_y, *dest_cb, *dest_cr;
      int linesize, uvlinesize, mb_x, mb_y;
-@@ -2483,8 +2513,11 @@ static void loop_filter(const H264Context *h, H264SliceContext *sl, int start_x,
+@@ -2483,8 +2520,11 @@ static void loop_filter(const H264Context *h, H264SliceContext *sl, int start_x,
                      linesize   = sl->mb_linesize   = sl->linesize;
                      uvlinesize = sl->mb_uvlinesize = sl->uvlinesize;
                  }
@@ -291,7 +894,7 @@ index e3b4436..354f329 100644
                  if (fill_filter_caches(h, sl, mb_type))
                      continue;
                  sl->chroma_qp[0] = get_chroma_qp(h->ps.pps, 0, h->cur_pic.qscale_table[mb_xy]);
-@@ -2562,9 +2595,430 @@ static void er_add_slice(H264SliceContext *sl,
+@@ -2562,9 +2602,748 @@ static void er_add_slice(H264SliceContext *sl,
      }
  }
  
@@ -320,14 +923,94 @@ index e3b4436..354f329 100644
 +    const uint8_t *intra_pcm_ptr;
 +    int16_t *mb;
 +    uint16_t sub_mb_type[4];
-+    uint8_t non_zero_count_cache[15 * 8];
-+    int8_t intra4x4_pred_mode_cache[5 * 8];
-+    int8_t ref_cache[2][5 * 8];
-+    int16_t mv_cache[2][5 * 8][2];
-+    int16_t mb_luma_dc[3][16 * 2];
++    uint8_t non_zero_count_cache[15 * 8] __attribute__((aligned(8)));
++    int8_t intra4x4_pred_mode_cache[5 * 8] __attribute__((aligned(8)));
++    int8_t ref_cache[2][5 * 8] __attribute__((aligned(8)));
++    int16_t mv_cache[2][5 * 8][2] __attribute__((aligned(16)));
++    int16_t mb_luma_dc[3][16 * 2] __attribute__((aligned(16)));
++    /* the parser's chroma prediction (Cb, Cr): last, on two cache lines of
++       its own, which the main core reads only once the parser has published
++       them (see swdec_chroma_service) */
++    uint8_t chroma_pred[2][64] __attribute__((aligned(64)));
 +} SwdecMbJob;
++_Static_assert(offsetof(SwdecMbJob, chroma_pred) % 64 == 0 && sizeof(SwdecMbJob) % 64 == 0,
++               "the chroma predictions own their cache lines");
 +
++/* Chroma prediction on the Media Engine, off the main core's critical path.
++ * The parser publishes each row as soon as it is parsed. Whenever it then
++ * waits for the main core (for a free row buffer, or draining at the
++ * slice's end) it predicts the chroma of the published rows, macroblock by
++ * macroblock in order, writing each inter macroblock's complete prediction
++ * into its job through the uncached alias and then publishing how many of
++ * the row's macroblocks are done; it goes back to parsing as soon as a row
++ * buffer is free. The main core, reaching an inter macroblock, uses the
++ * parser's prediction when the macroblock is done; otherwise it claims the
++ * rest of the row (and predicts chroma itself, as before). Each side writes
++ * only its own words, through the uncached pipe, and checks the other's
++ * after its own write (as the CSC slot claim does): the parser marks the
++ * macroblock it is about to predict and checks the claim, the main core
++ * claims and then checks the mark. So the main core waits only while the
++ * parser is part-way through that very macroblock, at most a bounded time,
++ * after which it predicts itself; the parser writes only into that row's
++ * job slots, which the main core then never reads, and is done with them
++ * before it parses into the buffer again.
++ * Validation: swdec_chroma_cpu keeps chroma on the main core,
++ * swdec_chroma_force predicts on the parser even without the Media Engine
++ * (in step with the main core: the bench's gate), swdec_chroma_partial
++ * stops it part-way through rows so the main core takes over their rest. */
++#if defined(SWDEC_DIAGNOSTICS) && SWDEC_DIAGNOSTICS
++int swdec_chroma_cpu, swdec_chroma_force, swdec_chroma_partial;
++unsigned swdec_chroma_stats[SWDEC_CHROMA_STATS];
++#define SWDEC_CHROMA_ACTIVE ((swdec_me_enabled || swdec_chroma_force) && !swdec_chroma_cpu)
++#define SWDEC_CHROMA_COUNT(i, n) (swdec_chroma_stats[i] += (n))
++#else
++#define SWDEC_CHROMA_ACTIVE (swdec_me_enabled)
++#define SWDEC_CHROMA_COUNT(i, n) ((void) 0)
++#endif
++#define SWDEC_JOB_SAVE(h, sl, j) do { \
++        SwdecMbJob *j_ = (j); \
++        swdec_job_save((sl), j_, IS_INTRA((h)->cur_pic.mb_type[(sl)->mb_xy])); \
++    } while (0)
++
++/* What reconstruction reads of a macroblock's caches (8-bit 4:2:0 frame
++ * pictures; the neighbour entries serve only motion-vector prediction and
++ * stay with the parser): the 4x4 block entries of the luma rows 1-4 and
++ * chroma rows 6-9 / 11-14 (columns 4-7), the three DC entries, and luma DC
++ * plane 0. A job carries just those; swdec_job_full (validation builds)
++ * copies the whole caches as before. */
++#if defined(SWDEC_DIAGNOSTICS) && SWDEC_DIAGNOSTICS
++int swdec_job_full;
++#define SWDEC_JOB_FULL swdec_job_full
++#else
++#define SWDEC_JOB_FULL 0
++#endif
++#define SWDEC_COPY_BLOCK_ROWS(dst, src, first, rows) \
++    do { for (int r_ = (first); r_ < (first) + (rows); r_++) \
++        memcpy(&(dst)[r_ * 8 + 4], &(src)[r_ * 8 + 4], 4 * sizeof((dst)[0])); } while (0)
++static av_always_inline void swdec_job_copy_nnz(uint8_t *dst, const uint8_t *src)
++{
++    SWDEC_COPY_BLOCK_ROWS(dst, src, 1, 4);
++    SWDEC_COPY_BLOCK_ROWS(dst, src, 6, 4);
++    SWDEC_COPY_BLOCK_ROWS(dst, src, 11, 4);
++    dst[0] = src[0]; dst[5 * 8] = src[5 * 8]; dst[10 * 8] = src[10 * 8];   /* scan8[48..50] */
++}
++static av_always_inline void swdec_job_copy_motion(int8_t (*dref)[5 * 8], int16_t (*dmv)[5 * 8][2],
++                                                   const int8_t (*sref)[5 * 8], const int16_t (*smv)[5 * 8][2])
++{
++    for (int l = 0; l < 2; l++) {
++        SWDEC_COPY_BLOCK_ROWS(dref[l], sref[l], 1, 4);
++        SWDEC_COPY_BLOCK_ROWS(dmv[l], smv[l], 1, 4);
++    }
++}
++
++#if defined(SWDEC_DIAGNOSTICS) && SWDEC_DIAGNOSTICS
 +int swdec_rowbatch = 1;   /* runtime switch (the harness A/Bs it) */
++/* diagnosis modes 2 (deblock inline, no concurrency) and 3 (serialized) */
++#define SWDEC_DEBLOCK_ON_PARSER(mode) ((mode) == 1 || (mode) == 3)
++#else
++#define swdec_rowbatch 1
++#define SWDEC_DEBLOCK_ON_PARSER(mode) ((mode) == 1)
++#endif
 +static int swdec_batch_enabled(const H264Context *h)
 +{
 +    return swdec_rowbatch && !FRAME_MBAFF(h) && h->picture_structure == PICT_FRAME;
@@ -364,6 +1047,11 @@ index e3b4436..354f329 100644
 +    SwdecRowRec drec[SWDEC_DQ];
 +    SwdecRowRec dprev;          /* consumer-side: row awaiting its lag-1 publish */
 +    int dprev_valid;
++    /* chroma per row buffer [seq & 1], each word one side's, holding
++       SWDEC_CME(row seq, macroblock index) (0: none) */
++    volatile unsigned cme_busy[2];   /* parser: predicting this macroblock */
++    volatile unsigned cme_done[2];   /* parser: this many in RAM (| SWDEC_CME_STOP: no more) */
++    volatile unsigned ccpu_from[2];  /* main core: owns the row from this macroblock on */
 +} SwdecPipe;
 +
 +int swdec_me_enabled = 0;
@@ -372,7 +1060,9 @@ index e3b4436..354f329 100644
 +void (*swdec_me_post_deblock)(void) = NULL;                 /* parser core: write back its D-cache after filtering */
 +void (*swdec_me_aux)(void) = NULL;                          /* parser core: extra idle-time work (audio decoding) */
 +void (*swdec_me_csc_row)(const struct H264Context *h, int mb_row) = NULL;   /* parser core: convert the now-final row above */                                   /* set by the harness/app when the ME runs the parser */
++#if defined(SWDEC_DIAGNOSTICS) && SWDEC_DIAGNOSTICS
 +int swdec_validate_force = 0;   /* validate jobs even in sequential mode (host diagnosis) */
++#endif
 +int swdec_pipe_bad = 0;                                     /* consumer saw an inconsistent row record (1) or job (2/3) */
 +int swdec_pipe_bad_info[6];
 +int (*swdec_me_run_slice)(struct AVCodecContext *avctx, void *sl) = NULL;   /* CPU dispatcher (swdec.c, PSP) */
@@ -382,11 +1072,37 @@ index e3b4436..354f329 100644
 +void (*swdec_me_pre_publish)(void) = NULL;                  /* ME side: write back its D-cache before publishing */
 +void (*swdec_cpu_pre_consume)(const H264Context *h, int mb_y) = NULL;  /* CPU side: invalidate the row's tables */
 +void (*swdec_cpu_post_consume)(void *p, size_t n) = NULL;   /* CPU side: writeback-invalidate ring/jobs of the row */
-+static SwdecPipe swdec_pipe_storage __attribute__((aligned(64)));
++#if defined(SWDEC_DIAGNOSTICS) && SWDEC_DIAGNOSTICS
++void (*swdec_stage_mark)(int mark) = NULL;                   /* optional stage clock (component diagnostic builds) */
++#define SWDEC_MARK(m) do { if (swdec_stage_mark) swdec_stage_mark(m); } while (0)
++#else
++#define SWDEC_MARK(m) do { } while (0)
++#endif
++/* Both cores use the pipe through the uncached alias, so it must own whole
++   cache lines: a neighbouring variable the CPU writes through the cache
++   would otherwise carry a stale copy of the pipe's last line back to RAM
++   when its line is written back. */
++static union {
++    SwdecPipe pipe;
++    unsigned char lines[(sizeof(SwdecPipe) + 63u) & ~(size_t) 63u];
++} swdec_pipe_box __attribute__((aligned(64)));
++#define swdec_pipe_storage (swdec_pipe_box.pipe)
 +static SwdecPipe *swdec_pipe = &swdec_pipe_storage;         /* alias used by whoever runs this code (see swdec_pipe_set) */
-+void swdec_pipe_set(void *unc) { swdec_pipe = unc ? (SwdecPipe *) unc : &swdec_pipe_storage; }
++static ptrdiff_t swdec_unc_offset;                          /* the same alias's offset, for the chroma predictions */
++void swdec_pipe_set(void *unc)
++{
++    swdec_pipe = unc ? (SwdecPipe *) unc : &swdec_pipe_storage;
++    swdec_unc_offset = (char *) swdec_pipe - (char *) &swdec_pipe_storage;
++}
 +void *swdec_pipe_get(void) { return &swdec_pipe_storage; }
-+void swdec_pipe_reset(void) { swdec_pipe->prod_seq = swdec_pipe->cons_seq = swdec_pipe->status = 0; swdec_pipe->dprod = swdec_pipe->dcons = 0; swdec_pipe->dprev_valid = 0; swdec_pipe->parse_done = swdec_pipe->tail_pushed = 0; }
++void swdec_pipe_reset(void)
++{
++    swdec_pipe->prod_seq = swdec_pipe->cons_seq = swdec_pipe->status = 0;
++    swdec_pipe->dprod = swdec_pipe->dcons = 0; swdec_pipe->dprev_valid = 0;
++    swdec_pipe->parse_done = swdec_pipe->tail_pushed = 0;
++    for (int b = 0; b < 2; b++)
++        swdec_pipe->cme_busy[b] = swdec_pipe->cme_done[b] = swdec_pipe->ccpu_from[b] = 0;
++}
 +void swdec_pipe_slice_begin(void) { swdec_pipe->parse_done = swdec_pipe->tail_pushed = 0; }
 +void swdec_pipe_set_parse_done(void) { SWDEC_MB(); swdec_pipe->parse_done = 1; }
 +int  swdec_pipe_parse_done(void) { return swdec_pipe->parse_done; }
@@ -409,7 +1125,7 @@ index e3b4436..354f329 100644
 +        av_freep(&sl->swdec_jobs_base);
 +        sl->swdec_ring_slots = 0;
 +        sl->swdec_ring_base = av_mallocz(2 * half + 64);
-+        sl->swdec_jobs_base = av_malloc(2 * jhalf + 64);
++        sl->swdec_jobs_base = av_mallocz(2 * jhalf + 64);   /* entries a job does not carry stay defined */
 +        if (!sl->swdec_ring_base || !sl->swdec_jobs_base)
 +            return AVERROR(ENOMEM);
 +        sl->swdec_ring = (int16_t *) (((uintptr_t) sl->swdec_ring_base + 63) & ~(uintptr_t) 63);
@@ -435,6 +1151,7 @@ index e3b4436..354f329 100644
 +    j->topright_samples_available = sl->topright_samples_available;
 +    j->intra_pcm_ptr = sl->intra_pcm_ptr;
 +    j->mb = sl->mb;
++    if (SWDEC_JOB_FULL) {
 +    memcpy(j->non_zero_count_cache, sl->non_zero_count_cache, sizeof j->non_zero_count_cache);
 +    if (intra) {
 +        memcpy(j->intra4x4_pred_mode_cache, sl->intra4x4_pred_mode_cache, sizeof j->intra4x4_pred_mode_cache);
@@ -443,6 +1160,16 @@ index e3b4436..354f329 100644
 +        memcpy(j->sub_mb_type, sl->sub_mb_type, sizeof j->sub_mb_type);
 +        memcpy(j->ref_cache, sl->ref_cache, sizeof j->ref_cache);
 +        memcpy(j->mv_cache, sl->mv_cache, sizeof j->mv_cache);
++    }
++    } else {
++        swdec_job_copy_nnz(j->non_zero_count_cache, sl->non_zero_count_cache);
++        if (intra) {
++            SWDEC_COPY_BLOCK_ROWS(j->intra4x4_pred_mode_cache, sl->intra4x4_pred_mode_cache, 1, 4);
++            memcpy(j->mb_luma_dc[0], sl->mb_luma_dc[0], sizeof j->mb_luma_dc[0]);
++        } else {
++            memcpy(j->sub_mb_type, sl->sub_mb_type, sizeof j->sub_mb_type);
++            swdec_job_copy_motion(j->ref_cache, j->mv_cache, sl->ref_cache, sl->mv_cache);
++        }
 +    }
 +    j->intra = intra;
 +#if defined(SWDEC_PIPE_VALIDATE) && SWDEC_PIPE_VALIDATE
@@ -476,6 +1203,8 @@ index e3b4436..354f329 100644
 +    sl->topright_samples_available = j->topright_samples_available;
 +    sl->intra_pcm_ptr = j->intra_pcm_ptr;
 +    sl->mb = j->mb;
++    sl->swdec_chroma_pred = NULL;   /* set by the consumer when the parser predicted it */
++    if (SWDEC_JOB_FULL) {
 +    memcpy(sl->non_zero_count_cache, j->non_zero_count_cache, sizeof j->non_zero_count_cache);
 +    if (j->intra) {
 +        memcpy(sl->intra4x4_pred_mode_cache, j->intra4x4_pred_mode_cache, sizeof j->intra4x4_pred_mode_cache);
@@ -485,6 +1214,129 @@ index e3b4436..354f329 100644
 +        memcpy(sl->ref_cache, j->ref_cache, sizeof j->ref_cache);
 +        memcpy(sl->mv_cache, j->mv_cache, sizeof j->mv_cache);
 +    }
++    } else {
++        swdec_job_copy_nnz(sl->non_zero_count_cache, j->non_zero_count_cache);
++        if (j->intra) {
++            SWDEC_COPY_BLOCK_ROWS(sl->intra4x4_pred_mode_cache, j->intra4x4_pred_mode_cache, 1, 4);
++            memcpy(sl->mb_luma_dc[0], j->mb_luma_dc[0], sizeof sl->mb_luma_dc[0]);
++        } else {
++            memcpy(sl->sub_mb_type, j->sub_mb_type, sizeof j->sub_mb_type);
++            swdec_job_copy_motion(sl->ref_cache, sl->mv_cache, j->ref_cache, j->mv_cache);
++        }
++    }
++}
++
++/* the parser's slice context, for the chroma service (parser core only) */
++static H264SliceContext *swdec_chroma_sl;
++
++/* a row's tag: 24 bits, never 0 (rows 16,777,215 apart share one: about
++   ten hours of 450 rows a second, and a stale word must also have outlived
++   them), above the macroblock index */
++#define SWDEC_CME_TAG(seq) ((unsigned) (seq) % 0xFFFFFFu + 1u)
++#define SWDEC_CME(seq, k) ((SWDEC_CME_TAG(seq) << 8) | (unsigned) (k))
++#define SWDEC_CME_STOP 128u
++#define SWDEC_CME_MAX_MBS 127   /* rows wider are left to the main core */
++#define SWDEC_CME_IS(w, seq) (((w) >> 8) == SWDEC_CME_TAG(seq))
++#define SWDEC_CME_K(w) ((int) ((w) & 127u))
++
++/* Parser core: predict the chroma of the published rows (see
++   SWDEC_CHROMA_ACTIVE above); with yield, return as soon as a row buffer is
++   free, so parsing goes on. */
++static void swdec_chroma_service(const H264Context *h, int yield)
++{
++    /* the prediction is made in this core's cache and copied out uncached:
++       whole lines of its own, as this core's dirty lines reach RAM later */
++    static uint8_t pred[2][64] __attribute__((aligned(64)));
++    SwdecPipe *pipe = swdec_pipe;
++    H264SliceContext *sl = swdec_chroma_sl;
++    if (!sl || !SWDEC_CHROMA_ACTIVE) return;
++    for (int seq = pipe->cons_seq; seq < pipe->prod_seq; seq++) {
++        const int b = seq & 1;
++        int k = 0;
++        const unsigned done = pipe->cme_done[b];
++        if (SWDEC_CME_IS(done, seq)) {
++            if (done & SWDEC_CME_STOP) continue;
++            k = SWDEC_CME_K(done);
++        }
++        const SwdecRowRec r = pipe->rec[b];
++        if (r.njobs > SWDEC_CME_MAX_MBS) continue;
++        int last = r.njobs;
++#if defined(SWDEC_DIAGNOSTICS) && SWDEC_DIAGNOSTICS
++        if (swdec_chroma_partial)   /* validation: stop part-way (0 to all) */
++            last = FFMIN(last, (seq * 5 + r.mb_y) % (r.njobs + 2));
++#endif
++        SwdecMbJob *jobs = (SwdecMbJob *) ((char *) sl->swdec_jobs + (size_t) b * sl->swdec_jobs_stride);
++        for (; k < r.njobs; k++) {
++            if (yield && pipe->cons_seq >= pipe->prod_seq - 1)
++                break;                              /* a buffer is free: parse */
++            const SwdecMbJob *j = &jobs[k];
++            pipe->cme_busy[b] = SWDEC_CME(seq, k);
++            SWDEC_MB();
++            const unsigned from = pipe->ccpu_from[b];
++            if (k >= last || (SWDEC_CME_IS(from, seq) && SWDEC_CME_K(from) <= k)) {
++                pipe->cme_done[b] = SWDEC_CME(seq, k) | SWDEC_CME_STOP;   /* the main core's from here */
++                break;
++            }
++            if (!j->intra) {
++                const SwdecChromaMotion m = { j->mb_x, j->mb_y, j->mb_xy,
++                                              j->sub_mb_type, j->ref_cache, j->mv_cache };
++                if (!ff_swdec_chroma_predict(h, sl, &m, pred)) {
++                    pipe->cme_done[b] = SWDEC_CME(seq, k) | SWDEC_CME_STOP;
++                    break;
++                }
++                uint32_t *dst = (uint32_t *) ((char *) j->chroma_pred + swdec_unc_offset);
++                const uint32_t *src = (const uint32_t *) pred;
++                for (int w = 0; w < 32; w++)
++                    dst[w] = src[w];
++                SWDEC_MB();
++            }
++            pipe->cme_done[b] = SWDEC_CME(seq, k + 1);
++        }
++        pipe->cme_busy[b] = 0;
++        if (k < r.njobs && !(pipe->cme_done[b] & SWDEC_CME_STOP))
++            break;                                  /* yielded */
++    }
++}
++
++/* Main core, at inter macroblock k of row seq (in order): its chroma
++   prediction when the parser's may be used, else NULL, and from then on the
++   row is the main core's (*own): the parser will not write it. */
++static const uint8_t *swdec_chroma_take(SwdecMbJob *jobs, int seq, int k, int *own)
++{
++    SwdecPipe *pipe = swdec_pipe;
++    const int b = seq & 1;
++    if (k >= SWDEC_CME_MAX_MBS) {   /* never the parser's (see swdec_chroma_service) */
++        SWDEC_CHROMA_COUNT(1, 1);
++        return NULL;
++    }
++    unsigned done = pipe->cme_done[b];
++    if (SWDEC_CME_IS(done, seq) && SWDEC_CME_K(done) > k)
++        goto parser;
++    if (!*own) {
++        pipe->ccpu_from[b] = SWDEC_CME(seq, k);
++        *own = 1;
++        SWDEC_CHROMA_COUNT(4, 1);
++        SWDEC_MB();
++        done = pipe->cme_done[b];
++        if (SWDEC_CME_IS(done, seq) && SWDEC_CME_K(done) > k)
++            goto parser;
++    }
++    if (pipe->cme_busy[b] == SWDEC_CME(seq, k)) {
++        /* part-way through this very macroblock: wait for it, bounded */
++        unsigned spins = 0;
++        SWDEC_CHROMA_COUNT(2, 1);
++        while (pipe->cme_busy[b] == SWDEC_CME(seq, k) && ++spins < (1u << 16)) { }
++        SWDEC_CHROMA_COUNT(3, spins);
++        SWDEC_MB();
++        done = pipe->cme_done[b];
++        if (SWDEC_CME_IS(done, seq) && SWDEC_CME_K(done) > k)
++            goto parser;
++    }
++    SWDEC_CHROMA_COUNT(1, 1);
++    return NULL;
++parser:
++    SWDEC_CHROMA_COUNT(0, 1);
++    return jobs[k].chroma_pred[0];
 +}
 +
 +/* reconstruct every parsed-but-pending macroblock, then put the parser's
@@ -509,7 +1361,13 @@ index e3b4436..354f329 100644
 +            pipe->cons_seq = pipe->prod_seq;
 +            return;
 +        }
++        SWDEC_MARK(SWDEC_MARK_CPU_PRE);
++        SWDEC_RMARK(SWDEC_RMARK_ROW);
 +        if (swdec_cpu_pre_consume) swdec_cpu_pre_consume(h, rec.mb_y);
++        SWDEC_MARK(SWDEC_MARK_CPU_RECON);
++        SWDEC_RMARK(SWDEC_RMARK_RECON);
++        const int chroma_me = SWDEC_CHROMA_ACTIVE;
++        int chroma_own = 0;
 +        {
 +            SWDEC_STAGE_BEGIN(t_recon);
 +            for (int i = 0; i < rec.njobs; i++) {
@@ -568,12 +1426,31 @@ index e3b4436..354f329 100644
 +                    }
 +                }
 +#endif
-+                swdec_job_restore(rsl, &jobs[i]);
++#if defined(SWDEC_DIAGNOSTICS) && SWDEC_DIAGNOSTICS
++                swdec_rt_on = swdec_recon_mark
++                    && (jobs[i].mb_x + rec.mb_y) % SWDEC_RT_SAMPLE == 0;
++                swdec_rt_mbs[0]++;
++                swdec_rt_mbs[1] += swdec_rt_on;
++#endif
++                SWDEC_RT_BEGIN(r_mb);
++                {
++                    SWDEC_RT_BEGIN(r_restore);
++                    swdec_job_restore(rsl, &jobs[i]);
++                    if (chroma_me && !jobs[i].intra)
++                        rsl->swdec_chroma_pred = swdec_chroma_take(jobs, seq, i, &chroma_own);
++                    SWDEC_RT_END(r_restore, SWDEC_RT_RESTORE);
++                }
 +                if (SWDEC_RECON_ENABLED)
 +                    ff_h264_hl_decode_mb(h, rsl);
++                SWDEC_RT_END(r_mb, SWDEC_RT_MB);
 +            }
++#if defined(SWDEC_DIAGNOSTICS) && SWDEC_DIAGNOSTICS
++            swdec_rt_on = 0;
++#endif
 +            SWDEC_STAGE_END(t_recon, 1);
 +        }
++        SWDEC_MARK(SWDEC_MARK_CPU_BORDER);
++        SWDEC_RMARK(SWDEC_RMARK_BORDER);
 +        if (rec.x_end > rec.x_start) {
 +            SWDEC_STAGE_BEGIN(t_lf);
 +            rsl->mb_x = rec.x_end; rsl->mb_y = rec.mb_y;
@@ -581,8 +1458,10 @@ index e3b4436..354f329 100644
 +                loop_filter_ex(h, rsl, rec.x_start, rec.x_end, 1);   /* backup borders only */
 +                if (pipe->dprev_valid) {
 +                    swdec_pipe_deblock_publish(h, &pipe->dprev);     /* row above: border exchange done */
++#if defined(SWDEC_DIAGNOSTICS) && SWDEC_DIAGNOSTICS
 +                    if (swdec_me_deblock == 3)
 +                        while (pipe->dcons < pipe->dprod) { }        /* diagnosis: serialize deblock vs later CPU work */
++#endif
 +                }
 +                pipe->dprev = rec;
 +                pipe->dprev_valid = 1;
@@ -591,11 +1470,15 @@ index e3b4436..354f329 100644
 +            }
 +            SWDEC_STAGE_END(t_lf, 2);
 +        }
++        SWDEC_MARK(SWDEC_MARK_CPU_POST);
++        SWDEC_RMARK(SWDEC_RMARK_POST);
 +        if (swdec_cpu_post_consume) {
 +            swdec_cpu_post_consume(sl->swdec_ring + (size_t) rec.buf * h->mb_width * SWDEC_RING_SLOT(h),
 +                                   (size_t) h->mb_width * SWDEC_RING_SLOT(h) * sizeof(int16_t));
 +            swdec_cpu_post_consume(jobs, (size_t) rec.njobs * sizeof(SwdecMbJob));
 +        }
++        SWDEC_MARK(SWDEC_MARK_CPU_ROW_END);
++        SWDEC_RMARK(SWDEC_RMARK_ROW_END);
 +        SWDEC_MB();
 +        pipe->cons_seq = seq + 1;
 +    }
@@ -610,12 +1493,16 @@ index e3b4436..354f329 100644
 +{
 +    const H264Context *h = hv;
 +    SwdecPipe *pipe = swdec_pipe;
++    if (pipe->parse_done && swdec_me_enabled)
++        swdec_chroma_service(h, 0);   /* drain: the slice's last rows */
 +    while (pipe->dcons < pipe->dprod) {
 +        SWDEC_MB();
 +        SwdecRowRec r = pipe->drec[pipe->dcons & (SWDEC_DQ - 1)];
 +        H264SliceContext *dsl = h->swdec_dsl;
 +        dsl->mb_x = r.x_end; dsl->mb_y = r.mb_y;
++        SWDEC_MARK(SWDEC_MARK_ME_DEBLOCK);
 +        loop_filter_ex(h, dsl, r.x_start, r.x_end, 2);
++        SWDEC_MARK(SWDEC_MARK_ME_DEBLOCK_END);
 +        /* filtering row mb_y finished the shared border of the row above:
 +           that row's pixels are final now - convert it while it is cache-hot */
 +        if (swdec_me_csc_row && r.mb_y > 0 && r.x_end >= h->mb_width)
@@ -631,19 +1518,34 @@ index e3b4436..354f329 100644
 +    SwdecPipe *pipe = swdec_pipe;
 +    if (r->x_end <= r->x_start)
 +        return;
-+    if (swdec_cpu_flush_row) swdec_cpu_flush_row(h, r->mb_y);
-+    while (pipe->dprod - pipe->dcons >= SWDEC_DQ) { }   /* queue full: filter core behind */
++    if (swdec_cpu_flush_row) {
++        SWDEC_RMARK(SWDEC_RMARK_FLUSH);
++        swdec_cpu_flush_row(h, r->mb_y);
++        SWDEC_RMARK(SWDEC_RMARK_FLUSH_END);
++    }
++    if (pipe->dprod - pipe->dcons >= SWDEC_DQ) {
++        SWDEC_RMARK(SWDEC_RMARK_SPIN);
++        SWDEC_SPIN_WHILE(pipe->dprod - pipe->dcons >= SWDEC_DQ, 1);   /* queue full: filter core behind */
++        SWDEC_RMARK(SWDEC_RMARK_SPIN_END);
++    }
 +    pipe->drec[pipe->dprod & (SWDEC_DQ - 1)] = *r;
 +    SWDEC_MB();
 +    pipe->dprod = pipe->dprod + 1;
 +    SWDEC_MB();
++#if defined(SWDEC_DIAGNOSTICS) && SWDEC_DIAGNOSTICS
 +    if (swdec_me_deblock == 2)
 +        swdec_pipe_deblock_service(h);   /* diagnosis: same split, no concurrency */
++#endif
 +}
 +
-+int swdec_me_tail_cpu = 1;   /* frame-tail work stealing: the CPU deblocks the held-back
-+                                row itself instead of queueing it and idling on the ME
-+                                (which is still busy with audio at slice end) */
++/* frame-tail work stealing: the CPU deblocks the held-back row itself
++   instead of queueing it and idling on the ME (which is still busy with
++   audio at slice end). Always on; diagnostic builds can A/B it. */
++#if defined(SWDEC_DIAGNOSTICS) && SWDEC_DIAGNOSTICS
++int swdec_me_tail_cpu = 1;
++#else
++#define swdec_me_tail_cpu 1
++#endif
 +/* CPU, end of slice: everything reconstructed; push (or steal) the held-back row */
 +void swdec_pipe_deblock_flush(const void *hv)
 +{
@@ -652,17 +1554,27 @@ index e3b4436..354f329 100644
 +    if (pipe->dprev_valid) {
 +        if (swdec_me_tail_cpu && h->swdec_rsl) {
 +            SwdecRowRec r = pipe->dprev;
-+            while (pipe->dcons < pipe->dprod) { }   /* the row above is queued: it must finish
++            SWDEC_RMARK(SWDEC_RMARK_TAIL);
++            if (pipe->dcons < pipe->dprod) {
++                SWDEC_RMARK(SWDEC_RMARK_SPIN);
++                SWDEC_SPIN_WHILE(pipe->dcons < pipe->dprod, 2);   /* the row above is queued: it must finish
 +                                                       first (shared boundary lines) */
++                SWDEC_RMARK(SWDEC_RMARK_SPIN_END);
++            }
 +            if (r.x_end > r.x_start) {
 +                H264SliceContext *rsl = h->swdec_rsl;
-+                if (swdec_cpu_flush_row) swdec_cpu_flush_row(h, r.mb_y);   /* rows above were ME-filtered */
++                if (swdec_cpu_flush_row) {   /* rows above were ME-filtered */
++                    SWDEC_RMARK(SWDEC_RMARK_FLUSH);
++                    swdec_cpu_flush_row(h, r.mb_y);
++                    SWDEC_RMARK(SWDEC_RMARK_FLUSH_END);
++                }
 +                rsl->mb_x = r.x_end; rsl->mb_y = r.mb_y;
 +                loop_filter_ex(h, rsl, r.x_start, r.x_end, 2);
 +                if (swdec_cpu_post_consume) {   /* make the filtered pixels visible to RAM readers */
 +                    /* pixel writeback happens via the frame-level invalidate at hand-off end */
 +                }
 +            }
++            SWDEC_RMARK(SWDEC_RMARK_TAIL_END);
 +        } else {
 +            swdec_pipe_deblock_publish(h, &pipe->dprev);
 +        }
@@ -688,9 +1600,13 @@ index e3b4436..354f329 100644
 +    SWDEC_MB();
 +    pipe->prod_seq = seq + 1;
 +    SWDEC_MB();
-+    if (!swdec_me_enabled)
++    if (!swdec_me_enabled) {
++#if defined(SWDEC_DIAGNOSTICS) && SWDEC_DIAGNOSTICS
++        if (swdec_chroma_force) swdec_chroma_service(h, 0);   /* bench: in step */
++#endif
 +        swdec_pipe_consume(h, sl);
-+    else if (swdec_me_deblock == 1 || swdec_me_deblock == 3)
++    }
++    else if (SWDEC_DEBLOCK_ON_PARSER(swdec_me_deblock))
 +        swdec_pipe_deblock_service(h);      /* parser core: filter finished rows while recon runs */
 +    if (swdec_me_enabled && swdec_me_aux)
 +        swdec_me_aux();
@@ -700,12 +1616,16 @@ index e3b4436..354f329 100644
 +static void swdec_pipe_wait_buffer_slow(const H264Context *h)
 +{
 +    SwdecPipe *pipe = swdec_pipe;
++    SWDEC_MARK(SWDEC_MARK_ME_WAIT);
 +    while (pipe->cons_seq < pipe->prod_seq - 1) {
-+        if (swdec_me_enabled && (swdec_me_deblock == 1 || swdec_me_deblock == 3))
++        if (swdec_me_enabled)
++            swdec_chroma_service(h, 1);      /* the main core needs it first */
++        if (swdec_me_enabled && SWDEC_DEBLOCK_ON_PARSER(swdec_me_deblock))
 +            swdec_pipe_deblock_service(h);
 +        if (swdec_me_enabled && swdec_me_aux)
 +            swdec_me_aux();
 +    }
++    SWDEC_MARK(SWDEC_MARK_ME_WAIT_END);
 +}
 +static av_always_inline void swdec_pipe_wait_buffer(const H264Context *h)
 +{
@@ -719,10 +1639,11 @@ index e3b4436..354f329 100644
  {
      H264SliceContext *sl = arg;
 +    sl->mb = sl->mb_storage;   /* swdec: batched CABAC slices re-point this per macroblock */
++    swdec_chroma_sl = sl;      /* the chroma service runs on this core */
      const H264Context *h = sl->h264;
      int lf_x_start = sl->mb_x;
      int orig_deblock = sl->deblocking_filter;
-@@ -2573,9 +3027,11 @@ static int decode_slice(struct AVCodecContext *avctx, void *arg)
+@@ -2573,9 +3352,11 @@ static int decode_slice(struct AVCodecContext *avctx, void *arg)
      sl->linesize   = h->cur_pic_ptr->f->linesize[0];
      sl->uvlinesize = h->cur_pic_ptr->f->linesize[1];
  
@@ -737,7 +1658,7 @@ index e3b4436..354f329 100644
  
      sl->mb_skip_run = -1;
  
-@@ -2610,20 +3066,45 @@ static int decode_slice(struct AVCodecContext *avctx, void *arg)
+@@ -2610,20 +3391,44 @@ static int decode_slice(struct AVCodecContext *avctx, void *arg)
  
          ff_h264_init_cabac_states(h, sl);
  
@@ -775,8 +1696,7 @@ index e3b4436..354f329 100644
 -                ff_h264_hl_decode_mb(h, sl);
 +            if (ret >= 0) {
 +                if (batch) {
-+                    swdec_job_save(sl, (SwdecMbJob *) ((char *) sl->swdec_jobs + (size_t) swdec_pipe_buf() * sl->swdec_jobs_stride) + sl->swdec_njobs++,
-+                                   IS_INTRA(h->cur_pic.mb_type[sl->mb_xy]));
++                    SWDEC_JOB_SAVE(h, sl, (SwdecMbJob *) ((char *) sl->swdec_jobs + (size_t) swdec_pipe_buf() * sl->swdec_jobs_stride) + sl->swdec_njobs++);
 +                } else if (SWDEC_RECON_ENABLED) {
 +                    SWDEC_STAGE_BEGIN(t_recon);
 +                    ff_h264_hl_decode_mb(h, sl);
@@ -786,7 +1706,7 @@ index e3b4436..354f329 100644
  
              // FIXME optimal? or let mb_decode decode 16x32 ?
              if (ret >= 0 && FRAME_MBAFF(h)) {
-@@ -2639,9 +3120,10 @@ static int decode_slice(struct AVCodecContext *avctx, void *arg)
+@@ -2639,9 +3444,10 @@ static int decode_slice(struct AVCodecContext *avctx, void *arg)
  
              if ((h->workaround_bugs & FF_BUG_TRUNCATED) &&
                  sl->cabac.bytestream > sl->cabac.bytestream_end + 2) {
@@ -798,7 +1718,7 @@ index e3b4436..354f329 100644
                      loop_filter(h, sl, lf_x_start, sl->mb_x + 1);
                  goto finish;
              }
-@@ -2652,16 +3134,24 @@ static int decode_slice(struct AVCodecContext *avctx, void *arg)
+@@ -2652,16 +3458,24 @@ static int decode_slice(struct AVCodecContext *avctx, void *arg)
                         "error while decoding MB %d %d, bytestream %td\n",
                         sl->mb_x, sl->mb_y,
                         sl->cabac.bytestream_end - sl->cabac.bytestream);
@@ -824,7 +1744,7 @@ index e3b4436..354f329 100644
                  if (FIELD_OR_MBAFF_PICTURE(h)) {
                      ++sl->mb_y;
                      if (FRAME_MBAFF(h) && sl->mb_y < h->mb_height)
-@@ -2672,9 +3162,10 @@ static int decode_slice(struct AVCodecContext *avctx, void *arg)
+@@ -2672,29 +3486,57 @@ static int decode_slice(struct AVCodecContext *avctx, void *arg)
              if (eos || sl->mb_y >= h->mb_height) {
                  ff_tlog(h->avctx, "slice end %d %d\n",
                          get_bits_count(&sl->gb), sl->gb.size_in_bits);
@@ -836,22 +1756,104 @@ index e3b4436..354f329 100644
                      loop_filter(h, sl, lf_x_start, sl->mb_x);
                  goto finish;
              }
-@@ -2715,7 +3206,9 @@ static int decode_slice(struct AVCodecContext *avctx, void *arg)
+         }
+     } else {
++        /* swdec: CAVLC slices are row-batched exactly as CABAC ones are
++           (parse into the ring and job lists, reconstruct and deblock per
++           published row), so the split pipeline can run their parser on the
++           Media Engine too. */
++        const int batch = swdec_batch_enabled(h);
++        if (batch) {
++            if (!swdec_me_enabled) {
++                if (swdec_ring_setup((H264Context *) h, sl) < 0)
++                    return AVERROR(ENOMEM);
++                memcpy(h->swdec_rsl, sl, sizeof(*sl));
++            }
++            swdec_pipe_wait_buffer(h);
++        }
+         for (;;) {
+             int ret;
+ 
+             if (sl->mb_x + sl->mb_y * h->mb_width >= sl->next_slice_idx) {
+                 av_log(h->avctx, AV_LOG_ERROR, "Slice overlaps with next at %d\n",
+                        sl->next_slice_idx);
++                if (batch) swdec_pipe_publish(h, sl, sl->mb_y, lf_x_start, lf_x_start);
+                 er_add_slice(sl, sl->resync_mb_x, sl->resync_mb_y, sl->mb_x,
+                              sl->mb_y, ER_MB_ERROR);
+                 return AVERROR_INVALIDDATA;
+             }
+ 
+-            ret = ff_h264_decode_mb_cavlc(h, sl);
++            if (batch)
++                sl->mb = sl->swdec_ring + ((size_t) swdec_pipe_buf() * h->mb_width + sl->mb_x) * SWDEC_RING_SLOT(h);
++            {
++                SWDEC_STAGE_BEGIN(t_parse);
++                ret = ff_h264_decode_mb_cavlc(h, sl);
++                SWDEC_STAGE_END(t_parse, 0);
++            }
+ 
+-            if (ret >= 0)
+-                ff_h264_hl_decode_mb(h, sl);
++            if (ret >= 0) {
++                if (batch) {
++                    SWDEC_JOB_SAVE(h, sl, (SwdecMbJob *) ((char *) sl->swdec_jobs + (size_t) swdec_pipe_buf() * sl->swdec_jobs_stride) + sl->swdec_njobs++);
++                } else if (SWDEC_RECON_ENABLED) {
++                    SWDEC_STAGE_BEGIN(t_recon);
++                    ff_h264_hl_decode_mb(h, sl);
++                    SWDEC_STAGE_END(t_recon, 1);
++                }
++            }
+ 
+             // FIXME optimal? or let mb_decode decode 16x32 ?
+             if (ret >= 0 && FRAME_MBAFF(h)) {
+@@ -2709,16 +3551,24 @@ static int decode_slice(struct AVCodecContext *avctx, void *arg)
+             if (ret < 0) {
+                 av_log(h->avctx, AV_LOG_ERROR,
+                        "error while decoding MB %d %d\n", sl->mb_x, sl->mb_y);
++                if (batch) swdec_pipe_publish(h, sl, sl->mb_y, lf_x_start, lf_x_start);
+                 er_add_slice(sl, sl->resync_mb_x, sl->resync_mb_y, sl->mb_x,
+                              sl->mb_y, ER_MB_ERROR);
+                 return ret;
              }
  
              if (++sl->mb_x >= h->mb_width) {
-+                SWDEC_STAGE_BEGIN(t_lf);
-                 loop_filter(h, sl, lf_x_start, sl->mb_x);
-+                SWDEC_STAGE_END(t_lf, 2);
+-                loop_filter(h, sl, lf_x_start, sl->mb_x);
++                if (batch) {
++                    swdec_pipe_publish(h, sl, sl->mb_y, lf_x_start, sl->mb_x);
++                } else {
++                    SWDEC_STAGE_BEGIN(t_lf);
++                    loop_filter(h, sl, lf_x_start, sl->mb_x);
++                    SWDEC_STAGE_END(t_lf, 2);
++                }
                  sl->mb_x = lf_x_start = 0;
                  decode_finish_row(h, sl);
                  ++sl->mb_y;
-@@ -2794,7 +3287,26 @@ int ff_h264_execute_decode_slices(H264Context *h)
++                if (batch && sl->mb_y < h->mb_height) swdec_pipe_wait_buffer(h);
+                 if (FIELD_OR_MBAFF_PICTURE(h)) {
+                     ++sl->mb_y;
+                     if (FRAME_MBAFF(h) && sl->mb_y < h->mb_height)
+@@ -2750,11 +3600,14 @@ static int decode_slice(struct AVCodecContext *avctx, void *arg)
+                 if (get_bits_left(&sl->gb) == 0) {
+                     er_add_slice(sl, sl->resync_mb_x, sl->resync_mb_y,
+                                  sl->mb_x - 1, sl->mb_y, ER_MB_END);
+-                    if (sl->mb_x > lf_x_start)
++                    if (batch)
++                        swdec_pipe_publish(h, sl, sl->mb_y, lf_x_start, sl->mb_x);
++                    else if (sl->mb_x > lf_x_start)
+                         loop_filter(h, sl, lf_x_start, sl->mb_x);
+ 
+                     goto finish;
+                 } else {
++                    if (batch) swdec_pipe_publish(h, sl, sl->mb_y, lf_x_start, lf_x_start);
+                     er_add_slice(sl, sl->resync_mb_x, sl->resync_mb_y, sl->mb_x,
+                                  sl->mb_y, ER_MB_ERROR);
+ 
+@@ -2794,10 +3647,31 @@ int ff_h264_execute_decode_slices(H264Context *h)
          h->slice_ctx[0].next_slice_idx = h->mb_width * h->mb_height;
          h->postpone_filter = 0;
  
 -        ret = decode_slice(avctx, &h->slice_ctx[0]);
-+        if (swdec_me_enabled && swdec_me_run_slice && swdec_batch_enabled(h) && CABAC(h)) {
++        if (swdec_me_enabled && swdec_me_run_slice && swdec_batch_enabled(h)) {
 +            /* CPU-side preparation, then the Media Engine runs decode_slice() as the
 +               producer while this core consumes rows (see swdec_me_run_slice) */
 +            H264SliceContext *sl0 = &h->slice_ctx[0];
@@ -872,15 +1874,24 @@ index e3b4436..354f329 100644
 +            ret = decode_slice(avctx, &h->slice_ctx[0]);
 +        }
          h->mb_y = h->slice_ctx[0].mb_y;
-         if (ret < 0)
+-        if (ret < 0)
++        if (ret < 0) {
++            swdec_ring_dirty = 1;
              goto finish;
++        }
+     } else {
+         av_assert0(context_count > 0);
+         for (i = 0; i < context_count; i++) {
 diff --git a/libavcodec/h264chroma.c b/libavcodec/h264chroma.c
-index 0d152de..bebb862 100644
+index 0d152de..3dcd429 100644
 --- a/libavcodec/h264chroma.c
 +++ b/libavcodec/h264chroma.c
-@@ -44,6 +44,9 @@ av_cold void ff_h264chroma_init(H264ChromaContext *c, int bit_depth)
+@@ -43,7 +43,12 @@ av_cold void ff_h264chroma_init(H264ChromaContext *c, int bit_depth)
+     } else {
          SET_CHROMA(8);
      }
++    c->put_h264_chroma2_pixels_tab[0] = c->put_h264_chroma2_pixels_tab[1] = NULL;
++    c->avg_h264_chroma2_pixels_tab[0] = c->avg_h264_chroma2_pixels_tab[1] = NULL;
  
 +#if defined(SWDEC_PSP_ASM) && SWDEC_PSP_ASM
 +    ff_h264chroma_init_psp(c, bit_depth);
@@ -889,10 +1900,25 @@ index 0d152de..bebb862 100644
      ff_h264chroma_init_aarch64(c, bit_depth);
  #elif ARCH_ARM
 diff --git a/libavcodec/h264chroma.h b/libavcodec/h264chroma.h
-index 9c81c18..c59e324 100644
+index 9c81c18..3b7bbac 100644
 --- a/libavcodec/h264chroma.h
 +++ b/libavcodec/h264chroma.h
-@@ -31,6 +31,7 @@ typedef struct H264ChromaContext {
+@@ -24,13 +24,22 @@
+ 
+ typedef void (*h264_chroma_mc_func)(uint8_t *dst /*align 8*/, const uint8_t *src /*align 1*/, ptrdiff_t srcStride, int h, int x, int y);
+ 
++/* swdec: both chroma planes of one partition in one call (same vector);
++   NULL where no such kernel exists. */
++typedef void (*h264_chroma2_mc_func)(uint8_t *dst_cb, uint8_t *dst_cr,
++                                     const uint8_t *src_cb, const uint8_t *src_cr,
++                                     ptrdiff_t stride, int h, int x, int y);
++
+ typedef struct H264ChromaContext {
+     h264_chroma_mc_func put_h264_chroma_pixels_tab[4];
+     h264_chroma_mc_func avg_h264_chroma_pixels_tab[4];
++    h264_chroma2_mc_func put_h264_chroma2_pixels_tab[2];
++    h264_chroma2_mc_func avg_h264_chroma2_pixels_tab[2];
+ } H264ChromaContext;
  
  void ff_h264chroma_init(H264ChromaContext *c, int bit_depth);
  
@@ -927,29 +1953,31 @@ index 809a938..2410db0 100644
      h->nb_slice_ctx = 0;
  
 diff --git a/libavcodec/h264dec.h b/libavcodec/h264dec.h
-index 74fd09d..91d8595 100644
+index 74fd09d..540ea71 100644
 --- a/libavcodec/h264dec.h
 +++ b/libavcodec/h264dec.h
 @@ -48,7 +48,12 @@
  
  /* Compiling in interlaced support reduces the speed
   * of progressive decoding by about 2%. */
-+/* swdec: SWDEC_FRAME_ONLY compiles the decoder for progressive 8-bit 4:2:0 CABAC
-+ * streams only (MBAFF/PAFF/4:2:2/4:4:4/CAVLC checks become constants; such
-+ * streams are rejected at the slice header). */
++/* swdec: SWDEC_FRAME_ONLY compiles the decoder for progressive 8-bit 4:2:0
++ * streams only (MBAFF/PAFF/4:2:2/4:4:4 checks become constants; such streams
++ * are rejected at the slice header). CABAC and CAVLC both decode. */
 +#ifndef SWDEC_FRAME_ONLY
  #define ALLOW_INTERLACE
 +#endif
  
  #define FMO 0
  
-@@ -81,6 +86,14 @@
+@@ -81,6 +86,16 @@
  #endif
  #define FIELD_OR_MBAFF_PICTURE(h) (FRAME_MBAFF(h) || FIELD_PICTURE(h))
  
 +#ifdef SWDEC_FRAME_ONLY
++/* CABAC stays a run-time choice outside the entropy decoders (h264_cabac.c
++ * and h264_cavlc.c fix it to 1 and 0): CAVLC Baseline streams decode too. */
 +#ifndef CABAC
-+#define CABAC(h) 1
++#define CABAC(h) (h)->ps.pps->cabac
 +#endif
 +#define CHROMA(h)    1
 +#define CHROMA422(h) 0
@@ -958,7 +1986,7 @@ index 74fd09d..91d8595 100644
  #ifndef CABAC
  #define CABAC(h) (h)->ps.pps->cabac
  #endif
-@@ -88,6 +101,7 @@
+@@ -88,6 +103,7 @@
  #define CHROMA(h)    ((h)->ps.sps->chroma_format_idc)
  #define CHROMA422(h) ((h)->ps.sps->chroma_format_idc == 2)
  #define CHROMA444(h) ((h)->ps.sps->chroma_format_idc == 3)
@@ -966,7 +1994,7 @@ index 74fd09d..91d8595 100644
  
  #define IS_REF0(a)         ((a) & MB_TYPE_REF0)
  #define IS_8x8DCT(a)       ((a) & MB_TYPE_8x8DCT)
-@@ -304,12 +318,25 @@ typedef struct H264SliceContext {
+@@ -304,12 +320,27 @@ typedef struct H264SliceContext {
      DECLARE_ALIGNED(8, uint16_t, sub_mb_type)[4];
  
      /// as a DCT coefficient is int32_t in high depth, we need to reserve twice the space.
@@ -987,13 +2015,15 @@ index 74fd09d..91d8595 100644
 +    int swdec_ring_slots;
 +    void *swdec_jobs;               /* 64-aligned, two halves of swdec_jobs_stride bytes */
 +    int swdec_njobs;
++    const uint8_t *swdec_chroma_pred;  /* swdec: this macroblock's chroma prediction from the
++                                          parser (Cb then Cr, 8x8 each); NULL: predict here */
 +    size_t swdec_jobs_stride;
 +    void *swdec_ring_base, *swdec_jobs_base;
 +
      uint8_t (*mvd_table[2])[2];
  
      /**
-@@ -349,6 +376,8 @@ typedef struct H264Context {
+@@ -349,6 +380,8 @@ typedef struct H264Context {
      H264Picture last_pic_for_ec;
  
      H264SliceContext *slice_ctx;
@@ -1323,10 +2353,10 @@ index 0000000..111b2ac
 +#endif /* AVCODEC_PSP_CABAC_H */
 diff --git a/libavcodec/psp/h264chroma_psp.c b/libavcodec/psp/h264chroma_psp.c
 new file mode 100644
-index 0000000..f10e0b7
+index 0000000..fb3bb6f
 --- /dev/null
 +++ b/libavcodec/psp/h264chroma_psp.c
-@@ -0,0 +1,313 @@
+@@ -0,0 +1,461 @@
 +/*
 + * H.264 chroma motion compensation for the PSP VFPU (8-bit 4:2:0).
 + *
@@ -1618,6 +2648,150 @@ index 0000000..f10e0b7
 +    }
 +}
 +
++/* ------------------------------------------------------------------ */
++/* Cb and Cr together (2026-10-29): one call per partition for both      */
++/* planes (same vector, so the same weights): the weights are set up     */
++/* once, and each row runs the Cb and Cr chains interleaved, which also  */
++/* gives the 4-wide case two independent chains to hide the VFPU         */
++/* latency. Same arithmetic, so the same bytes as two single-plane calls.*/
++/* Registers: Cb rows M0/M1, Cr rows M4/M5; Cb outputs C200/C210 (temps   */
++/* C220/C230), Cr outputs C600/C610 (temps C620/C630); avg destinations  */
++/* C300..C330; constants M7.                                             */
++/* ------------------------------------------------------------------ */
++#define CH2_PUT2(q1, s1, a1, o1, q2, s2, a2, o2) \
++    "vf2id.q " q1 ", " q1 ", 17\n\t" "vf2id.q " q2 ", " q2 ", 17\n\t" \
++    "vi2uc.q " s1 ", " q1 "\n\t"     "vi2uc.q " s2 ", " q2 "\n\t" \
++    "sv.s  " s1 ", " o1 "(" a1 ")\n\t" "sv.s  " s2 ", " o2 "(" a2 ")\n\t"
++#define CH2_AVG2(q1, dq1, s1, a1, o1, q2, dq2, s2, a2, o2) \
++    "vf2id.q " q1 ", " q1 ", 17\n\t" "vf2id.q " q2 ", " q2 ", 17\n\t" \
++    "vi2f.q " q1 ", " q1 ", 23\n\t"  "vi2f.q " q2 ", " q2 ", 23\n\t" \
++    "vadd.q " q1 ", " q1 ", " dq1 "\n\t" "vadd.q " q2 ", " q2 ", " dq2 "\n\t" \
++    "vadd.q " q1 ", " q1 ", C720\n\t"  "vadd.q " q2 ", " q2 ", C720\n\t" \
++    "vf2id.q " q1 ", " q1 ", 22\n\t" "vf2id.q " q2 ", " q2 ", 22\n\t" \
++    "vi2uc.q " s1 ", " q1 "\n\t"     "vi2uc.q " s2 ", " q2 "\n\t" \
++    "sv.s  " s1 ", " o1 "(" a1 ")\n\t" "sv.s  " s2 ", " o2 "(" a2 ")\n\t"
++/* destination word -> (d-128) quad */
++#define CH2_DST(q, sreg, w) \
++    "mtv   " w ", " sreg "\n\tvc2i.s " q ", " sreg "\n\tvi2f.q " q ", " q ", 24\n\t"
++
++static av_always_inline void chroma2_mc_psp(uint8_t *dcb, uint8_t *dcr,
++                                            const uint8_t *scb, const uint8_t *scr,
++                                            ptrdiff_t stride, int h, int x, int y,
++                                            int width, int avg)
++{
++    const int A = (8 - x) * (8 - y), B = x * (8 - y), C = (8 - x) * y, D = x * y;
++    chroma_consts cst;
++    cst.k[0] = cst.k[1] = cst.k[2] = cst.k[3] = 32.f + 128.f * 64.f;
++    cst.c129[0] = cst.c129[1] = cst.c129[2] = cst.c129[3] = 129.f;
++
++    if (D) {
++        cst.w[0] = (float) A; cst.w[1] = (float) B; cst.w[2] = (float) C; cst.w[3] = (float) D;
++        __asm__ volatile ("lv.q C700, 0(%0)\n\tlv.q C710, 16(%0)\n\tlv.q C720, 32(%0)\n\t" : : "r"(&cst) : "memory");
++        if (width == 8) {
++            {
++                uint32_t b0 = psp_ulw(scb) ^ PSP_PIX_XOR, b1 = psp_ulw(scb + 1) ^ PSP_PIX_XOR;
++                uint32_t b2 = psp_ulw(scb + 4) ^ PSP_PIX_XOR, b3 = psp_ulw(scb + 5) ^ PSP_PIX_XOR;
++                uint32_t r0 = psp_ulw(scr) ^ PSP_PIX_XOR, r1 = psp_ulw(scr + 1) ^ PSP_PIX_XOR;
++                uint32_t r2 = psp_ulw(scr + 4) ^ PSP_PIX_XOR, r3 = psp_ulw(scr + 5) ^ PSP_PIX_XOR;
++                __asm__ volatile (CH_LOADROW8("0", "%0", "%1", "%2", "%3") CH_LOADROW8("4", "%4", "%5", "%6", "%7")
++                                  : : "r"(b0), "r"(b1), "r"(b2), "r"(b3), "r"(r0), "r"(r1), "r"(r2), "r"(r3));
++            }
++            for (int i = 0; i < h; i++) {
++                const uint8_t *sb = scb + (i + 1) * stride, *sr = scr + (i + 1) * stride;
++                uint32_t b0 = psp_ulw(sb) ^ PSP_PIX_XOR, b1 = psp_ulw(sb + 1) ^ PSP_PIX_XOR;
++                uint32_t b2 = psp_ulw(sb + 4) ^ PSP_PIX_XOR, b3 = psp_ulw(sb + 5) ^ PSP_PIX_XOR;
++                uint32_t r0 = psp_ulw(sr) ^ PSP_PIX_XOR, r1 = psp_ulw(sr + 1) ^ PSP_PIX_XOR;
++                uint32_t r2 = psp_ulw(sr + 4) ^ PSP_PIX_XOR, r3 = psp_ulw(sr + 5) ^ PSP_PIX_XOR;
++                uint8_t *db = dcb + i * stride, *dr = dcr + i * stride;
++                uint32_t e0 = 0, e1 = 0, e2 = 0, e3 = 0;
++                if (avg) {
++                    e0 = psp_lw(db) ^ PSP_PIX_XOR; e1 = psp_lw(db + 4) ^ PSP_PIX_XOR;
++                    e2 = psp_lw(dr) ^ PSP_PIX_XOR; e3 = psp_lw(dr + 4) ^ PSP_PIX_XOR;
++                }
++#define CH2_ROW8(CB, NB, CR, NR, STORE) \
++    __asm__ volatile ( \
++        CH_LOADROW8(NB, "%0", "%1", "%2", "%3") CH_LOADROW8(NR, "%4", "%5", "%6", "%7") \
++        CH_BILIN2("C200", "C220", "C" CB "00", "C" CB "10", "C" NB "00", "C" NB "10", \
++                  "C600", "C620", "C" CR "00", "C" CR "10", "C" NR "00", "C" NR "10") \
++        CH_BILIN2("C210", "C230", "C" CB "20", "C" CB "30", "C" NB "20", "C" NB "30", \
++                  "C610", "C630", "C" CR "20", "C" CR "30", "C" NR "20", "C" NR "30") \
++        STORE \
++        : : "r"(b0), "r"(b1), "r"(b2), "r"(b3), "r"(r0), "r"(r1), "r"(r2), "r"(r3), \
++            [db]"r"(db), [dr]"r"(dr), [e0]"r"(e0), [e1]"r"(e1), [e2]"r"(e2), [e3]"r"(e3) : "memory")
++#define CH2_STORE8_PUT \
++    CH2_PUT2("C200", "S220", "%[db]", "0", "C600", "S620", "%[dr]", "0") \
++    CH2_PUT2("C210", "S221", "%[db]", "4", "C610", "S621", "%[dr]", "4")
++#define CH2_STORE8_AVG \
++    CH2_DST("C300", "S300", "%[e0]") CH2_DST("C310", "S310", "%[e1]") \
++    CH2_DST("C320", "S320", "%[e2]") CH2_DST("C330", "S330", "%[e3]") \
++    CH2_AVG2("C200", "C300", "S220", "%[db]", "0", "C600", "C320", "S620", "%[dr]", "0") \
++    CH2_AVG2("C210", "C310", "S221", "%[db]", "4", "C610", "C330", "S621", "%[dr]", "4")
++                if (i & 1) {
++                    if (!avg) CH2_ROW8("1", "0", "5", "4", CH2_STORE8_PUT);
++                    else      CH2_ROW8("1", "0", "5", "4", CH2_STORE8_AVG);
++                } else {
++                    if (!avg) CH2_ROW8("0", "1", "4", "5", CH2_STORE8_PUT);
++                    else      CH2_ROW8("0", "1", "4", "5", CH2_STORE8_AVG);
++                }
++#undef CH2_ROW8
++            }
++        } else { /* width 4 */
++            {
++                uint32_t b0 = psp_ulw(scb) ^ PSP_PIX_XOR, b1 = psp_ulw(scb + 1) ^ PSP_PIX_XOR;
++                uint32_t r0 = psp_ulw(scr) ^ PSP_PIX_XOR, r1 = psp_ulw(scr + 1) ^ PSP_PIX_XOR;
++                __asm__ volatile (CH_LOADROW4("0", "%0", "%1") CH_LOADROW4("4", "%2", "%3")
++                                  : : "r"(b0), "r"(b1), "r"(r0), "r"(r1));
++            }
++            for (int i = 0; i < h; i++) {
++                const uint8_t *sb = scb + (i + 1) * stride, *sr = scr + (i + 1) * stride;
++                uint32_t b0 = psp_ulw(sb) ^ PSP_PIX_XOR, b1 = psp_ulw(sb + 1) ^ PSP_PIX_XOR;
++                uint32_t r0 = psp_ulw(sr) ^ PSP_PIX_XOR, r1 = psp_ulw(sr + 1) ^ PSP_PIX_XOR;
++                uint8_t *db = dcb + i * stride, *dr = dcr + i * stride;
++                uint32_t e0 = 0, e2 = 0;
++                if (avg) { e0 = psp_lw(db) ^ PSP_PIX_XOR; e2 = psp_lw(dr) ^ PSP_PIX_XOR; }
++#define CH2_ROW4(CB, NB, CR, NR, STORE) \
++    __asm__ volatile ( \
++        CH_LOADROW4(NB, "%0", "%1") CH_LOADROW4(NR, "%2", "%3") \
++        CH_BILIN2("C200", "C220", "C" CB "00", "C" CB "10", "C" NB "00", "C" NB "10", \
++                  "C600", "C620", "C" CR "00", "C" CR "10", "C" NR "00", "C" NR "10") \
++        STORE \
++        : : "r"(b0), "r"(b1), "r"(r0), "r"(r1), \
++            [db]"r"(db), [dr]"r"(dr), [e0]"r"(e0), [e2]"r"(e2) : "memory")
++#define CH2_STORE4_PUT CH2_PUT2("C200", "S220", "%[db]", "0", "C600", "S620", "%[dr]", "0")
++#define CH2_STORE4_AVG \
++    CH2_DST("C300", "S300", "%[e0]") CH2_DST("C320", "S320", "%[e2]") \
++    CH2_AVG2("C200", "C300", "S220", "%[db]", "0", "C600", "C320", "S620", "%[dr]", "0")
++                if (i & 1) {
++                    if (!avg) CH2_ROW4("1", "0", "5", "4", CH2_STORE4_PUT);
++                    else      CH2_ROW4("1", "0", "5", "4", CH2_STORE4_AVG);
++                } else {
++                    if (!avg) CH2_ROW4("0", "1", "4", "5", CH2_STORE4_PUT);
++                    else      CH2_ROW4("0", "1", "4", "5", CH2_STORE4_AVG);
++                }
++#undef CH2_ROW4
++            }
++        }
++    } else {
++        /* one-dimensional and copy cases: per plane, sharing nothing worth
++           the code; the single-plane kernel handles them */
++        chroma_mc_psp(dcb, scb, stride, h, x, y, width, avg);
++        chroma_mc_psp(dcr, scr, stride, h, x, y, width, avg);
++    }
++}
++
++static void put_h264_chroma2_mc8_psp(uint8_t *dcb, uint8_t *dcr, const uint8_t *scb, const uint8_t *scr,
++                                     ptrdiff_t stride, int h, int x, int y)
++{ chroma2_mc_psp(dcb, dcr, scb, scr, stride, h, x, y, 8, 0); }
++static void put_h264_chroma2_mc4_psp(uint8_t *dcb, uint8_t *dcr, const uint8_t *scb, const uint8_t *scr,
++                                     ptrdiff_t stride, int h, int x, int y)
++{ chroma2_mc_psp(dcb, dcr, scb, scr, stride, h, x, y, 4, 0); }
++static void avg_h264_chroma2_mc8_psp(uint8_t *dcb, uint8_t *dcr, const uint8_t *scb, const uint8_t *scr,
++                                     ptrdiff_t stride, int h, int x, int y)
++{ chroma2_mc_psp(dcb, dcr, scb, scr, stride, h, x, y, 8, 1); }
++static void avg_h264_chroma2_mc4_psp(uint8_t *dcb, uint8_t *dcr, const uint8_t *scb, const uint8_t *scr,
++                                     ptrdiff_t stride, int h, int x, int y)
++{ chroma2_mc_psp(dcb, dcr, scb, scr, stride, h, x, y, 4, 1); }
++
 +static void put_h264_chroma_mc8_psp(uint8_t *dst, const uint8_t *src, ptrdiff_t stride, int h, int x, int y)
 +{ chroma_mc_psp(dst, src, stride, h, x, y, 8, 0); }
 +static void put_h264_chroma_mc4_psp(uint8_t *dst, const uint8_t *src, ptrdiff_t stride, int h, int x, int y)
@@ -1635,6 +2809,10 @@ index 0000000..f10e0b7
 +    c->put_h264_chroma_pixels_tab[1] = put_h264_chroma_mc4_psp;
 +    c->avg_h264_chroma_pixels_tab[0] = avg_h264_chroma_mc8_psp;
 +    c->avg_h264_chroma_pixels_tab[1] = avg_h264_chroma_mc4_psp;
++    c->put_h264_chroma2_pixels_tab[0] = put_h264_chroma2_mc8_psp;
++    c->put_h264_chroma2_pixels_tab[1] = put_h264_chroma2_mc4_psp;
++    c->avg_h264_chroma2_pixels_tab[0] = avg_h264_chroma2_mc8_psp;
++    c->avg_h264_chroma2_pixels_tab[1] = avg_h264_chroma2_mc4_psp;
 +}
 +
 +#else
@@ -1642,10 +2820,10 @@ index 0000000..f10e0b7
 +#endif
 diff --git a/libavcodec/psp/h264dsp_psp.c b/libavcodec/psp/h264dsp_psp.c
 new file mode 100644
-index 0000000..cd72095
+index 0000000..b6928b3
 --- /dev/null
 +++ b/libavcodec/psp/h264dsp_psp.c
-@@ -0,0 +1,1504 @@
+@@ -0,0 +1,1516 @@
 +/*
 + * H.264 DSP kernels for the PSP (Allegrex + VFPU): weighted prediction.
 + *
@@ -1673,7 +2851,9 @@ index 0000000..cd72095
 +   C loop_filter_strength are compile-time and stay), 1 = all VFPU kernels
 +   except chroma deblocking, 2 = everything. Lets one binary A/B itself. */
 +int swdec_psp_level = 2;
++#if defined(SWDEC_DIAGNOSTICS) && SWDEC_DIAGNOSTICS
 +int swdec_psp_lf = 0;      /* loop-filter kernels: bit0 luma, bit1 chroma (needs level >= 1); both lose to C on hardware -> off */
++#endif
 +
 +/* Constants live in M700 for the duration of a call:
 + *   S700 = ws (scaled), S701 = wd (scaled), C710 = K broadcast. */
@@ -2181,6 +3361,11 @@ index 0000000..cd72095
 +    }
 +}
 +
++/* The deblocking kernels below (VFPU and scheduled C), the swdec_psp_lf
++   switch that selects them, their test hooks and the no-op measurement
++   kernels exist for diagnostic builds only: every one lost to the C
++   reference filters on hardware, so a release build always deblocks in C. */
++#if defined(SWDEC_DIAGNOSTICS) && SWDEC_DIAGNOSTICS
 +/* ------------------------------------------------------------------ */
 +/* Chroma deblocking (4:2:0), normal and intra, both directions          */
 +/* ------------------------------------------------------------------ */
@@ -3092,6 +4277,7 @@ index 0000000..cd72095
 +
 +static void lf_noop_tc(uint8_t *pix, ptrdiff_t stride, int alpha, int beta, int8_t *tc0) { (void) pix; (void) stride; (void) alpha; (void) beta; (void) tc0; }
 +static void lf_noop(uint8_t *pix, ptrdiff_t stride, int alpha, int beta) { (void) pix; (void) stride; (void) alpha; (void) beta; }
++#endif /* SWDEC_DIAGNOSTICS */
 +
 +av_cold void ff_h264dsp_init_psp(H264DSPContext *c, const int bit_depth,
 +                                 const int chroma_format_idc)
@@ -3107,6 +4293,7 @@ index 0000000..cd72095
 +    c->idct8_add4      = h264_idct8_add4_psp;
 +    if (chroma_format_idc <= 1) {
 +        c->idct_add8   = h264_idct_add8_psp;
++#if defined(SWDEC_DIAGNOSTICS) && SWDEC_DIAGNOSTICS
 +#if defined(SWDEC_PSP_LF_CHROMA) && SWDEC_PSP_LF_CHROMA
 +        if (swdec_psp_lf & 16) {
 +        c->v_loop_filter_chroma       = h264_v_loop_filter_chroma_psp;
@@ -3121,7 +4308,9 @@ index 0000000..cd72095
 +        c->v_loop_filter_chroma_intra = lfc_v_chroma_intra;
 +        c->h_loop_filter_chroma_intra = lfc_h_chroma_intra;
 +        }
++#endif
 +    }
++#if defined(SWDEC_DIAGNOSTICS) && SWDEC_DIAGNOSTICS
 +    if (swdec_psp_lf & 1) {
 +        c->v_loop_filter_luma       = lfc_v_luma;
 +        c->h_loop_filter_luma       = lfc_h_luma;
@@ -3139,6 +4328,7 @@ index 0000000..cd72095
 +        c->v_loop_filter_luma_intra = h264_v_loop_filter_luma_intra_psp;
 +        c->h_loop_filter_luma_intra = h264_h_loop_filter_luma_intra_psp;
 +    }
++#endif
 +    c->weight_pixels_tab[0]   = weight_h264_pixels16_psp;
 +    c->weight_pixels_tab[1]   = weight_h264_pixels8_psp;
 +    c->weight_pixels_tab[2]   = weight_h264_pixels4_psp;
@@ -3152,10 +4342,10 @@ index 0000000..cd72095
 +#endif
 diff --git a/libavcodec/psp/h264qpel_psp.c b/libavcodec/psp/h264qpel_psp.c
 new file mode 100644
-index 0000000..2fdaa5f
+index 0000000..3b7a591
 --- /dev/null
 +++ b/libavcodec/psp/h264qpel_psp.c
-@@ -0,0 +1,678 @@
+@@ -0,0 +1,854 @@
 +/*
 + * H.264 luma quarter-pel motion compensation for the PSP VFPU (8-bit).
 + *
@@ -3179,7 +4369,9 @@ index 0000000..2fdaa5f
 + * results are bit-identical to the C reference.
 + *
 + * Only the 8x8 (and via four calls, 16x16) sizes are covered; 4x4 uses the
-+ * C code (rare at these bitrates, and half the VFPU lanes would idle).
++ * C code (rare at these bitrates, and half the VFPU lanes would idle). The
++ * hv family (mc21/12/22/32/23) shares its horizontal pass instead: see the
++ * shared-pass versions below.
 + *
 + * VFPU allocation inside a kernel: M0-M3 inputs, M4/M5 outputs, M6 temps
 + * (C630 = 255 broadcast), M7 constants.
@@ -3201,6 +4393,12 @@ index 0000000..2fdaa5f
 +#include "vfpu_util.h"
 +
 +extern int swdec_psp_level;
++#if defined(SWDEC_DIAGNOSTICS) && SWDEC_DIAGNOSTICS
++/* Validation builds: 1 keeps the motion-compensation kernels as they were
++   before the shared-pass hv family (same-binary device A/B). Read when a
++   decoder is initialised. */
++int swdec_mc_reference;
++#endif
 +
 +/* M700: S700 = 20, S701 = -5, S702 = 1/32, S703 = 1/1024
 +   C710 = 128.5 (= 4112/32 = 131584/1024: rounding after the scale),
@@ -3768,10 +4966,10 @@ index 0000000..2fdaa5f
 +    qpel8_h((uint8_t *) halfH, 32, src + hoff * stride, stride, 8, HM_TMPF);
 +    qpel8_hv(dst, src, stride, avg ? VM_L2TMPF_DST : VM_L2TMPF, halfH);
 +}
-+static av_noinline void put_qpel8_mc21_psp(uint8_t *dst, const uint8_t *src, ptrdiff_t stride) { qpel8_hv_h(dst, src, stride, 0, 0); }
-+static av_noinline void put_qpel8_mc23_psp(uint8_t *dst, const uint8_t *src, ptrdiff_t stride) { qpel8_hv_h(dst, src, stride, 1, 0); }
-+static av_noinline void avg_qpel8_mc21_psp(uint8_t *dst, const uint8_t *src, ptrdiff_t stride) { qpel8_hv_h(dst, src, stride, 0, 1); }
-+static av_noinline void avg_qpel8_mc23_psp(uint8_t *dst, const uint8_t *src, ptrdiff_t stride) { qpel8_hv_h(dst, src, stride, 1, 1); }
++static av_unused av_noinline void put_qpel8_mc21_psp(uint8_t *dst, const uint8_t *src, ptrdiff_t stride) { qpel8_hv_h(dst, src, stride, 0, 0); }
++static av_unused av_noinline void put_qpel8_mc23_psp(uint8_t *dst, const uint8_t *src, ptrdiff_t stride) { qpel8_hv_h(dst, src, stride, 1, 0); }
++static av_unused av_noinline void avg_qpel8_mc21_psp(uint8_t *dst, const uint8_t *src, ptrdiff_t stride) { qpel8_hv_h(dst, src, stride, 0, 1); }
++static av_unused av_noinline void avg_qpel8_mc23_psp(uint8_t *dst, const uint8_t *src, ptrdiff_t stride) { qpel8_hv_h(dst, src, stride, 1, 1); }
 +
 +/* mc12/mc32: halfV (columns +0 / +1) averaged with hv */
 +static av_always_inline void qpel8_hv_v(uint8_t *dst, const uint8_t *src, ptrdiff_t stride, int voff, int avg)
@@ -3786,9 +4984,138 @@ index 0000000..2fdaa5f
 +static av_noinline void avg_qpel8_mc12_psp(uint8_t *dst, const uint8_t *src, ptrdiff_t stride) { qpel8_hv_v(dst, src, stride, 0, 1); }
 +static av_noinline void avg_qpel8_mc32_psp(uint8_t *dst, const uint8_t *src, ptrdiff_t stride) { qpel8_hv_v(dst, src, stride, 1, 1); }
 +
++/* ------------------------------------------------------------------ */
++/* Shared-pass versions of the hv family (2026-10-29). Bit-identical:    */
++/* the same values through the same VFPU steps, computed once.           */
++/*  - mc21/mc23: the half-sample row halfH is the clipped, floored raw   */
++/*    horizontal sum that the hv pass has already computed (rows 0..7 or  */
++/*    1..8 of its tmp), instead of a second horizontal filter;            */
++/*  - 16x16 mc22/21/23/12/32: each 8-wide column filters its 21 source   */
++/*    rows horizontally once for both 8x8 tiles, instead of 13 per tile. */
++/* swdec_mc_reference (validation builds) selects the versions above.    */
++/* ------------------------------------------------------------------ */
++
++/* halfH (8 rows x 8 floats, 32 B stride) = floor(clip(raw/32 + 128.5)) of
++   eight raw rows: exactly what HB_TMPF stores from the same sums */
++static av_noinline void qpel8_halfh_from_raw(float *half, const float *raw)
++{
++    __asm__ volatile (
++        "vzero.q C620\n\t"
++        "lv.q C400, 0(%1)\n\t"   "lv.q C410, 32(%1)\n\t"  "lv.q C420, 64(%1)\n\t"  "lv.q C430, 96(%1)\n\t"
++        "lv.q C500, 16(%1)\n\t"  "lv.q C510, 48(%1)\n\t"  "lv.q C520, 80(%1)\n\t"  "lv.q C530, 112(%1)\n\t"
++        HB_XCLIP() HB_F2ID("0") HB_I2F("0")
++        "sv.q C400, 0(%0)\n\t"   "sv.q C410, 32(%0)\n\t"  "sv.q C420, 64(%0)\n\t"  "sv.q C430, 96(%0)\n\t"
++        "sv.q C500, 16(%0)\n\t"  "sv.q C510, 48(%0)\n\t"  "sv.q C520, 80(%0)\n\t"  "sv.q C530, 112(%0)\n\t"
++        "lv.q C400, 128(%1)\n\t" "lv.q C410, 160(%1)\n\t" "lv.q C420, 192(%1)\n\t" "lv.q C430, 224(%1)\n\t"
++        "lv.q C500, 144(%1)\n\t" "lv.q C510, 176(%1)\n\t" "lv.q C520, 208(%1)\n\t" "lv.q C530, 240(%1)\n\t"
++        HB_XCLIP() HB_F2ID("0") HB_I2F("0")
++        "sv.q C400, 128(%0)\n\t" "sv.q C410, 160(%0)\n\t" "sv.q C420, 192(%0)\n\t" "sv.q C430, 224(%0)\n\t"
++        "sv.q C500, 144(%0)\n\t" "sv.q C510, 176(%0)\n\t" "sv.q C520, 208(%0)\n\t" "sv.q C530, 240(%0)\n\t"
++        : : "r"(half), "r"(raw) : "memory");
++}
++
++/* the vertical pass of one 8x8 hv tile over raw rows tmp (13 rows) */
++static av_always_inline void qpel8_hv_v2(uint8_t *dst, ptrdiff_t stride, const float *tmp,
++                                         int mode, const float *l2f)
++{
++    qpel8_v_half(dst, stride, 0, 0, tmp, mode, l2f, 1);
++    qpel8_v_half(dst + 4, stride, 0, 0, tmp + 4, mode, l2f ? l2f + 4 : 0, 1);
++}
++
++/* kind: 0 = hv (mc22), 1 = halfH rows +hoff (mc21/mc23), 2 = halfV columns +voff (mc12/mc32) */
++static av_always_inline void qpel8_hvfam_v2(uint8_t *dst, const uint8_t *src, ptrdiff_t stride,
++                                            int kind, int off, int avg)
++{
++    float tmp[13 * 8 + 8] __attribute__((aligned(16)));
++    float half[8 * 8] __attribute__((aligned(16)));
++    LOAD_CONSTS();
++    if (kind == 2)
++        qpel8_v((uint8_t *) half, 32, src + off, stride, VM_TMPF, half);
++    qpel8_h((uint8_t *) tmp, 32, src - 2 * stride, stride, 13, HM_RAWF);
++    if (kind == 1)
++        qpel8_halfh_from_raw(half, tmp + (2 + off) * 8);
++    qpel8_hv_v2(dst, stride, tmp,
++                kind ? (avg ? VM_L2TMPF_DST : VM_L2TMPF) : (avg ? VM_AVGDST : VM_PUT),
++                kind ? half : 0);
++}
++static av_noinline void put_qpel8_mc21_v2(uint8_t *dst, const uint8_t *src, ptrdiff_t stride) { qpel8_hvfam_v2(dst, src, stride, 1, 0, 0); }
++static av_noinline void put_qpel8_mc23_v2(uint8_t *dst, const uint8_t *src, ptrdiff_t stride) { qpel8_hvfam_v2(dst, src, stride, 1, 1, 0); }
++static av_noinline void avg_qpel8_mc21_v2(uint8_t *dst, const uint8_t *src, ptrdiff_t stride) { qpel8_hvfam_v2(dst, src, stride, 1, 0, 1); }
++static av_noinline void avg_qpel8_mc23_v2(uint8_t *dst, const uint8_t *src, ptrdiff_t stride) { qpel8_hvfam_v2(dst, src, stride, 1, 1, 1); }
++
++/* one 8-wide column of a 16x16 hv-family block: 21 raw rows, two tiles */
++static av_noinline void qpel16_hvfam_col_v2(uint8_t *dst, const uint8_t *src, ptrdiff_t stride,
++                                            int kind, int off, int avg)
++{
++    float tmp[21 * 8 + 8] __attribute__((aligned(16)));
++    float half[8 * 8] __attribute__((aligned(16)));
++    const int mode = kind ? (avg ? VM_L2TMPF_DST : VM_L2TMPF) : (avg ? VM_AVGDST : VM_PUT);
++    LOAD_CONSTS();
++    qpel8_h((uint8_t *) tmp, 32, src - 2 * stride, stride, 21, HM_RAWF);
++    for (int t = 0; t < 2; t++) {
++        uint8_t *d = dst + 8 * t * stride;
++        const uint8_t *s = src + 8 * t * stride;
++        if (kind == 1)
++            qpel8_halfh_from_raw(half, tmp + (8 * t + 2 + off) * 8);
++        else if (kind == 2)
++            qpel8_v((uint8_t *) half, 32, s + off, stride, VM_TMPF, half);
++        qpel8_hv_v2(d, stride, tmp + 8 * t * 8, mode, kind ? half : 0);
++    }
++}
++#define MC16_HV2(op, xy, kind, off, avg) \
++static void op##_qpel16_mc##xy##_v2(uint8_t *dst, const uint8_t *src, ptrdiff_t stride) \
++{ \
++    qpel16_hvfam_col_v2(dst, src, stride, kind, off, avg); \
++    qpel16_hvfam_col_v2(dst + 8, src + 8, stride, kind, off, avg); \
++}
++MC16_HV2(put, 22, 0, 0, 0) MC16_HV2(avg, 22, 0, 0, 1)
++MC16_HV2(put, 21, 1, 0, 0) MC16_HV2(avg, 21, 1, 0, 1)
++MC16_HV2(put, 23, 1, 1, 0) MC16_HV2(avg, 23, 1, 1, 1)
++MC16_HV2(put, 12, 2, 0, 0) MC16_HV2(avg, 12, 2, 0, 1)
++MC16_HV2(put, 32, 2, 1, 0) MC16_HV2(avg, 32, 2, 1, 1)
++
++/* 16x16 horizontal and diagonal positions by 8-wide columns: one
++   horizontal call of 16 rows (and one constants load) per column instead
++   of two 8-row calls, then the vertical halves per tile as before. */
++static av_noinline void qpel16_h_col_v2(uint8_t *dst, const uint8_t *src, ptrdiff_t stride, int mode)
++{
++    LOAD_CONSTS();
++    qpel8_h(dst, stride, src, stride, 16, mode);
++}
++#define MC16_H2(op, xy, mode) \
++static void op##_qpel16_mc##xy##_v2(uint8_t *dst, const uint8_t *src, ptrdiff_t stride) \
++{ \
++    qpel16_h_col_v2(dst, src, stride, mode); \
++    qpel16_h_col_v2(dst + 8, src + 8, stride, mode); \
++}
++MC16_H2(put, 10, HM_L2X0) MC16_H2(avg, 10, HM_L2X0_DST)
++MC16_H2(put, 20, HM_PUT)  MC16_H2(avg, 20, HM_AVGDST)
++MC16_H2(put, 30, HM_L2X1) MC16_H2(avg, 30, HM_L2X1_DST)
++
++static av_noinline void qpel16_diag_col_v2(uint8_t *dst, const uint8_t *src, ptrdiff_t stride,
++                                           int hoff, int voff, int avg)
++{
++    float halfH[16 * 8] __attribute__((aligned(16)));
++    LOAD_CONSTS();
++    qpel8_h((uint8_t *) halfH, 32, src + hoff * stride, stride, 16, HM_TMPF);
++    for (int t = 0; t < 2; t++)
++        qpel8_v(dst + 8 * t * stride, stride, src + 8 * t * stride + voff, stride,
++                avg ? VM_L2TMPF_DST : VM_L2TMPF, halfH + 64 * t);
++}
++#define MC16_D2(op, xy, hoff, voff, avg) \
++static void op##_qpel16_mc##xy##_v2(uint8_t *dst, const uint8_t *src, ptrdiff_t stride) \
++{ \
++    qpel16_diag_col_v2(dst, src, stride, hoff, voff, avg); \
++    qpel16_diag_col_v2(dst + 8, src + 8, stride, hoff, voff, avg); \
++}
++MC16_D2(put, 11, 0, 0, 0) MC16_D2(avg, 11, 0, 0, 1)
++MC16_D2(put, 31, 0, 1, 0) MC16_D2(avg, 31, 0, 1, 1)
++MC16_D2(put, 13, 1, 0, 0) MC16_D2(avg, 13, 1, 0, 1)
++MC16_D2(put, 33, 1, 1, 0) MC16_D2(avg, 33, 1, 1, 1)
++
 +/* 16x16 = four 8x8 */
 +#define MC16(op, xy) \
-+static void op##_qpel16_mc##xy##_psp(uint8_t *dst, const uint8_t *src, ptrdiff_t stride) \
++static av_unused void op##_qpel16_mc##xy##_psp(uint8_t *dst, const uint8_t *src, ptrdiff_t stride) \
 +{ \
 +    op##_qpel8_mc##xy##_psp(dst, src, stride); \
 +    op##_qpel8_mc##xy##_psp(dst + 8, src + 8, stride); \
@@ -3814,21 +5141,60 @@ index 0000000..2fdaa5f
 +    c->op##_h264_qpel_pixels_tab[idx][ 3] = op##_qpel##sz##_mc30_psp; \
 +    c->op##_h264_qpel_pixels_tab[idx][ 4] = op##_qpel##sz##_mc01_psp; \
 +    c->op##_h264_qpel_pixels_tab[idx][ 5] = op##_qpel##sz##_mc11_psp; \
-+    c->op##_h264_qpel_pixels_tab[idx][ 6] = op##_qpel##sz##_mc21_psp; \
 +    c->op##_h264_qpel_pixels_tab[idx][ 7] = op##_qpel##sz##_mc31_psp; \
 +    c->op##_h264_qpel_pixels_tab[idx][ 8] = op##_qpel##sz##_mc02_psp; \
-+    c->op##_h264_qpel_pixels_tab[idx][ 9] = op##_qpel##sz##_mc12_psp; \
-+    c->op##_h264_qpel_pixels_tab[idx][10] = op##_qpel##sz##_mc22_psp; \
-+    c->op##_h264_qpel_pixels_tab[idx][11] = op##_qpel##sz##_mc32_psp; \
 +    c->op##_h264_qpel_pixels_tab[idx][12] = op##_qpel##sz##_mc03_psp; \
 +    c->op##_h264_qpel_pixels_tab[idx][13] = op##_qpel##sz##_mc13_psp; \
-+    c->op##_h264_qpel_pixels_tab[idx][14] = op##_qpel##sz##_mc23_psp; \
 +    c->op##_h264_qpel_pixels_tab[idx][15] = op##_qpel##sz##_mc33_psp;
 +    SET(put, 0, 16)
 +    SET(put, 1, 8)
 +    SET(avg, 0, 16)
 +    SET(avg, 1, 8)
 +#undef SET
++#if defined(SWDEC_DIAGNOSTICS) && SWDEC_DIAGNOSTICS
++    if (swdec_mc_reference) {
++#define SET_HV(op, idx, sz) \
++        c->op##_h264_qpel_pixels_tab[idx][ 1] = op##_qpel##sz##_mc10_psp; \
++        c->op##_h264_qpel_pixels_tab[idx][ 2] = op##_qpel##sz##_mc20_psp; \
++        c->op##_h264_qpel_pixels_tab[idx][ 3] = op##_qpel##sz##_mc30_psp; \
++        c->op##_h264_qpel_pixels_tab[idx][ 5] = op##_qpel##sz##_mc11_psp; \
++        c->op##_h264_qpel_pixels_tab[idx][ 7] = op##_qpel##sz##_mc31_psp; \
++        c->op##_h264_qpel_pixels_tab[idx][13] = op##_qpel##sz##_mc13_psp; \
++        c->op##_h264_qpel_pixels_tab[idx][15] = op##_qpel##sz##_mc33_psp; \
++        c->op##_h264_qpel_pixels_tab[idx][ 6] = op##_qpel##sz##_mc21_psp; \
++        c->op##_h264_qpel_pixels_tab[idx][ 9] = op##_qpel##sz##_mc12_psp; \
++        c->op##_h264_qpel_pixels_tab[idx][10] = op##_qpel##sz##_mc22_psp; \
++        c->op##_h264_qpel_pixels_tab[idx][11] = op##_qpel##sz##_mc32_psp; \
++        c->op##_h264_qpel_pixels_tab[idx][14] = op##_qpel##sz##_mc23_psp;
++        SET_HV(put, 0, 16)
++        SET_HV(put, 1, 8)
++        SET_HV(avg, 0, 16)
++        SET_HV(avg, 1, 8)
++#undef SET_HV
++        return;
++    }
++#endif
++#define SET2(op) \
++    c->op##_h264_qpel_pixels_tab[0][ 1] = op##_qpel16_mc10_v2; \
++    c->op##_h264_qpel_pixels_tab[0][ 2] = op##_qpel16_mc20_v2; \
++    c->op##_h264_qpel_pixels_tab[0][ 3] = op##_qpel16_mc30_v2; \
++    c->op##_h264_qpel_pixels_tab[0][ 5] = op##_qpel16_mc11_v2; \
++    c->op##_h264_qpel_pixels_tab[0][ 7] = op##_qpel16_mc31_v2; \
++    c->op##_h264_qpel_pixels_tab[0][13] = op##_qpel16_mc13_v2; \
++    c->op##_h264_qpel_pixels_tab[0][15] = op##_qpel16_mc33_v2; \
++    c->op##_h264_qpel_pixels_tab[0][ 6] = op##_qpel16_mc21_v2; \
++    c->op##_h264_qpel_pixels_tab[0][ 9] = op##_qpel16_mc12_v2; \
++    c->op##_h264_qpel_pixels_tab[0][10] = op##_qpel16_mc22_v2; \
++    c->op##_h264_qpel_pixels_tab[0][11] = op##_qpel16_mc32_v2; \
++    c->op##_h264_qpel_pixels_tab[0][14] = op##_qpel16_mc23_v2; \
++    c->op##_h264_qpel_pixels_tab[1][ 6] = op##_qpel8_mc21_v2; \
++    c->op##_h264_qpel_pixels_tab[1][ 9] = op##_qpel8_mc12_psp; \
++    c->op##_h264_qpel_pixels_tab[1][10] = op##_qpel8_mc22_psp; \
++    c->op##_h264_qpel_pixels_tab[1][11] = op##_qpel8_mc32_psp; \
++    c->op##_h264_qpel_pixels_tab[1][14] = op##_qpel8_mc23_v2;
++    SET2(put)
++    SET2(avg)
++#undef SET2
 +}
 +
 +#else
@@ -3912,10 +5278,10 @@ index 0000000..b901e21
 +#endif
 diff --git a/libavcodec/swdec_pipe.h b/libavcodec/swdec_pipe.h
 new file mode 100644
-index 0000000..9d6d53c
+index 0000000..7b9faa6
 --- /dev/null
 +++ b/libavcodec/swdec_pipe.h
-@@ -0,0 +1,36 @@
+@@ -0,0 +1,134 @@
 +/* swdec row pipeline: producer (parser, CPU or Media Engine) / consumer (CPU
 +   reconstruction + deblocking) hand-off. See h264_slice.c. */
 +#ifndef AVCODEC_SWDEC_PIPE_H
@@ -3924,8 +5290,23 @@ index 0000000..9d6d53c
 +struct H264Context;
 +struct AVCodecContext;
 +extern int swdec_me_enabled;
++struct H264SliceContext;
++/* swdec: a parsed macroblock's motion as its job holds it (the 4x4 block
++   entries of the caches, scan8 layout) */
++typedef struct SwdecChromaMotion {
++    int mb_x, mb_y, mb_xy;
++    const uint16_t *sub_mb_type;
++    const int8_t (*ref_cache)[5 * 8];
++    const int16_t (*mv_cache)[5 * 8][2];
++} SwdecChromaMotion;
++/* the macroblock's complete chroma prediction from the parsed motion
++   (h264_mb.c), scalar, for the Media Engine; 0 when it cannot */
++int ff_swdec_chroma_predict(const struct H264Context *h, const struct H264SliceContext *sl,
++                            const SwdecChromaMotion *m, uint8_t pred[2][64]);
 +extern int swdec_me_deblock;
++#if defined(SWDEC_DIAGNOSTICS) && SWDEC_DIAGNOSTICS
 +extern int swdec_me_tail_cpu;
++#endif
 +extern void (*swdec_cpu_flush_row)(const struct H264Context *h, int mb_y);
 +extern void (*swdec_me_post_deblock)(void);
 +extern void (*swdec_me_aux)(void);
@@ -3938,7 +5319,32 @@ index 0000000..9d6d53c
 +int  swdec_pipe_parse_done(void);
 +void swdec_pipe_set_tail_pushed(void);
 +int  swdec_pipe_tail_pushed(void);
++#if defined(SWDEC_DIAGNOSTICS) && SWDEC_DIAGNOSTICS
 +extern int swdec_validate_force;
++/* 1: motion-compensation kernels as before the shared-pass hv family
++   (psp/h264qpel_psp.c); read when a decoder is initialised. */
++extern int swdec_mc_reference;
++/* 1: every macroblock on h264_mb.c's generic path, as the CONFIG_SMALL
++   build had it (h264_mb.c). */
++extern int swdec_mb_generic;
++/* 1: fixed-size edge emulation regions as before (h264_mb.c). */
++extern int swdec_edge_full;
++/* 1: chroma MC one plane per call, as before (h264_mb.c). */
++extern int swdec_chroma_split;
++/* 1: chroma prediction stays in reconstruction (h264_slice.c); the
++   parser predicts chroma even without the Media Engine (the bench); the
++   parser stops part-way through rows (the bench). */
++extern int swdec_chroma_cpu, swdec_chroma_force, swdec_chroma_partial;
++/* inter macroblocks whose chroma came from the parser, ones the main core
++   predicted, macroblocks it waited for, its wait loop iterations, rows it
++   claimed the rest of */
++#define SWDEC_CHROMA_STATS 5
++extern unsigned swdec_chroma_stats[SWDEC_CHROMA_STATS];
++/* 1: the PSP's no-op prefetch calls are made, as before (h264_mb.c). */
++extern int swdec_prefetch_calls;
++/* 1: jobs carry the whole parsed caches as before (h264_slice.c). */
++extern int swdec_job_full;
++#endif
 +extern int swdec_pipe_bad;
 +extern int swdec_pipe_bad_info[6];
 +extern int (*swdec_me_run_slice)(struct AVCodecContext *avctx, void *sl);
@@ -3951,13 +5357,71 @@ index 0000000..9d6d53c
 +void *swdec_pipe_get(void);           /* the pipe's plain address */
 +void  swdec_pipe_reset(void);
 +void  swdec_pipe_consume_all(void *h, void *sl);
++
++/* Diagnostic builds (SWDEC_DIAGNOSTICS) only: one switch for every
++   measurement and test path in the decoder, and the finer flags need it. */
++#if !(defined(SWDEC_DIAGNOSTICS) && SWDEC_DIAGNOSTICS) && (defined(SWDEC_SPIN_DIAG) \
++    || (defined(SWDEC_PIPE_VALIDATE) && SWDEC_PIPE_VALIDATE))
++#error "swdec diagnostic flags need SWDEC_DIAGNOSTICS=1"
++#endif
++
++#if defined(SWDEC_DIAGNOSTICS) && SWDEC_DIAGNOSTICS
++/* Optional stage clock for component diagnostic builds (NULL until a
++   component installs it: one load and branch per row). CPU marks bracket
++   the parts of reconstructing a published row; ME marks bracket deblocking
++   a row and waiting for the CPU to free a ring buffer. */
++enum {
++    SWDEC_MARK_CPU_PRE = 0,        /* row tables: cache invalidation */
++    SWDEC_MARK_CPU_RECON,          /* macroblock reconstruction */
++    SWDEC_MARK_CPU_BORDER,         /* border backup + deblock publish */
++    SWDEC_MARK_CPU_POST,           /* ring and job cache maintenance */
++    SWDEC_MARK_CPU_ROW_END,
++    SWDEC_MARK_ME_DEBLOCK,
++    SWDEC_MARK_ME_DEBLOCK_END,
++    SWDEC_MARK_ME_WAIT,
++    SWDEC_MARK_ME_WAIT_END
++};
++extern void (*swdec_stage_mark)(int mark);
++#endif
++
++/* CPU spin-waits on the other core. They end when the condition clears or
++   when the Media Engine is declared dead: the component's watchdog stops a
++   stalled ME and clears swdec_me_enabled (me_fail), and a wait on a core
++   that will never answer must not spin the decode worker forever. The rows
++   of that one picture are then left as they are; the slice dispatcher
++   reports the failure and recovery restarts the ME between jobs. A
++   component diagnostic build compiles h264_slice.c with SWDEC_SPIN_DIAG:
++   each wait site then reports once, through swdec_spin_report, when it has
++   spun for more than 2 s. */
++#define SWDEC_ME_ALIVE() (*(volatile int *) &swdec_me_enabled != 0)
++#ifdef SWDEC_SPIN_DIAG
++extern unsigned (*swdec_spin_now_us)(void);
++extern void (*swdec_spin_report)(int site, int prod, int cons, int dprod, int dcons);
++#define SWDEC_SPIN_WHILE(cond, site) do {                                      \
++        static int swdec_spin_said_;                                          \
++        unsigned swdec_spin_n_ = 0;                                           \
++        unsigned swdec_spin_t0_ = swdec_spin_now_us ? swdec_spin_now_us() : 0; \
++        while ((cond) && SWDEC_ME_ALIVE()) {                                  \
++            if (!swdec_spin_said_ && (++swdec_spin_n_ & 4095u) == 0           \
++                && swdec_spin_now_us                                          \
++                && swdec_spin_now_us() - swdec_spin_t0_ > 2000000u) {         \
++                swdec_spin_said_ = 1;                                         \
++                if (swdec_spin_report)                                        \
++                    swdec_spin_report(site, pipe->prod_seq, pipe->cons_seq,   \
++                                      pipe->dprod, pipe->dcons);              \
++            }                                                                 \
++        }                                                                     \
++    } while (0)
++#else
++#define SWDEC_SPIN_WHILE(cond, site) while ((cond) && SWDEC_ME_ALIVE()) { }
++#endif
 +#endif
 diff --git a/libavcodec/swdec_stages.h b/libavcodec/swdec_stages.h
 new file mode 100644
-index 0000000..44a3870
+index 0000000..dcaa668
 --- /dev/null
 +++ b/libavcodec/swdec_stages.h
-@@ -0,0 +1,17 @@
+@@ -0,0 +1,20 @@
 +/* swdec: optional per-stage cycle attribution (device profiling aid).
 + * Compiled in with -DSWDEC_STAGE_TIMING=1 and switched at run time via
 + * swdec_stage_on (a load and a branch per macroblock when off); the harness
@@ -3965,6 +5429,9 @@ index 0000000..44a3870
 +#ifndef AVCODEC_SWDEC_STAGES_H
 +#define AVCODEC_SWDEC_STAGES_H
 +#if defined(SWDEC_STAGE_TIMING) && SWDEC_STAGE_TIMING
++#if !(defined(SWDEC_DIAGNOSTICS) && SWDEC_DIAGNOSTICS)
++#error "SWDEC_STAGE_TIMING is a diagnostic build: it needs SWDEC_DIAGNOSTICS=1"
++#endif
 +extern unsigned swdec_stage_us[12];
 +extern int swdec_stage_on;
 +unsigned swdec_stage_now(void);
@@ -3975,3 +5442,275 @@ index 0000000..44a3870
 +#define SWDEC_STAGE_END(v, i) do { } while (0)
 +#endif
 +#endif
+diff --git a/libavcodec/swdec_recon_stats.h b/libavcodec/swdec_recon_stats.h
+new file mode 100644
+index 0000000..4504a51
+--- /dev/null
++++ b/libavcodec/swdec_recon_stats.h
+@@ -0,0 +1,59 @@
++/* swdec: main-core reconstruction attribution (validation builds only).
++ *
++ * The PSP's user mode has no cheap cycle counter, so kernels are timed with
++ * the 1 MHz system clock on a sample of macroblocks only: one in
++ * SWDEC_RT_SAMPLE positions of each row, rotating from row to row, and the
++ * component scales the sample by all macroblocks over sampled ones. Each
++ * macroblock row's phases are marked through swdec_recon_mark. Only code
++ * that runs on the main core is hooked; the parser and the Media Engine
++ * never touch these. */
++#ifndef AVCODEC_SWDEC_RECON_STATS_H
++#define AVCODEC_SWDEC_RECON_STATS_H
++#define SWDEC_RT_SAMPLE 8
++enum {
++    SWDEC_RT_LUMA_FULL,   /* luma MC, full-sample positions */
++    SWDEC_RT_LUMA_1D,     /* luma MC, horizontal or vertical interpolation */
++    SWDEC_RT_LUMA_2D,     /* luma MC, two-dimensional positions */
++    SWDEC_RT_CHROMA,      /* chroma MC (both planes) */
++    SWDEC_RT_WEIGHT,      /* weighted prediction */
++    SWDEC_RT_EDGE,        /* edge emulation */
++    SWDEC_RT_IDCT,        /* inverse transforms and residual add */
++    SWDEC_RT_INTRA,       /* intra prediction and its border exchange */
++    SWDEC_RT_MOTION,      /* all inter prediction of the macroblock (holds the
++                             MC, weight and edge buckets) */
++    SWDEC_RT_RESTORE,     /* the parsed job copied back into the slice context */
++    SWDEC_RT_MB,          /* the whole macroblock: restore + reconstruction */
++    SWDEC_RT_COUNT
++};
++enum {
++    SWDEC_RMARK_ROW,          /* row begins: cache maintenance before recon */
++    SWDEC_RMARK_RECON,        /* reconstruction of the row's macroblocks */
++    SWDEC_RMARK_BORDER,       /* border backup and deblock publication */
++    SWDEC_RMARK_POST,         /* cache maintenance after the row */
++    SWDEC_RMARK_ROW_END,
++    SWDEC_RMARK_FLUSH,        /* row flush before publishing (nested) */
++    SWDEC_RMARK_FLUSH_END,
++    SWDEC_RMARK_SPIN,         /* a spin wait on the deblocking queue (nested) */
++    SWDEC_RMARK_SPIN_END,
++    SWDEC_RMARK_TAIL,         /* the slice's last row deblocked on the CPU */
++    SWDEC_RMARK_TAIL_END
++};
++#if defined(SWDEC_DIAGNOSTICS) && SWDEC_DIAGNOSTICS
++extern void (*swdec_recon_mark)(int mark);   /* NULL: attribution off */
++extern unsigned (*swdec_rt_now)(void);       /* the component's clock */
++extern int swdec_rt_on;                      /* this macroblock is sampled */
++extern unsigned swdec_rt_us[SWDEC_RT_COUNT], swdec_rt_calls[SWDEC_RT_COUNT];
++extern unsigned swdec_rt_mbs[2];             /* macroblocks: all, sampled */
++/* luma MC calls of every macroblock by block size (16, 8, 4) and quarter-
++   sample position (x + 4 y), and how many of them average (bi-prediction) */
++extern unsigned swdec_qpel_calls[3][16], swdec_qpel_avg;
++#define SWDEC_RT_BEGIN(v) unsigned v = swdec_rt_on ? swdec_rt_now() : 0u
++#define SWDEC_RT_END(v, i) do { if (swdec_rt_on) { \
++        swdec_rt_us[i] += swdec_rt_now() - (v); swdec_rt_calls[i]++; } } while (0)
++#define SWDEC_RMARK(m) do { if (swdec_recon_mark) swdec_recon_mark(m); } while (0)
++#else
++#define SWDEC_RT_BEGIN(v) do { } while (0)
++#define SWDEC_RT_END(v, i) do { } while (0)
++#define SWDEC_RMARK(m) do { } while (0)
++#endif
++#endif
+diff --git a/libavcodec/swdec_chroma_rec.h b/libavcodec/swdec_chroma_rec.h
+new file mode 100644
+index 0000000..3bdb799
+--- /dev/null
++++ b/libavcodec/swdec_chroma_rec.h
+@@ -0,0 +1,46 @@
++/* swdec: recorded chroma prediction of one macroblock row (validation
++ * builds only), for the chroma-on-the-Media-Engine qualification replay.
++ *
++ * While a row is being recorded, every inter macroblock's chroma
++ * prediction is captured as the operations the reconstruction performed
++ * (bilinear put/avg from a reference position, uni/bi weighting) and the
++ * prediction it produced (both planes, 8x8, before the residual). The
++ * component replays the operations through the CPU kernels and through
++ * scalar kernels on the Media Engine and compares both with the recorded
++ * prediction (src/swdec/swdec_chroma_replay.c). */
++#ifndef AVCODEC_SWDEC_CHROMA_REC_H
++#define AVCODEC_SWDEC_CHROMA_REC_H
++#include <stdint.h>
++#include <stddef.h>
++
++enum { SWDEC_CR_MC, SWDEC_CR_WEIGHT, SWDEC_CR_BIWEIGHT };
++#define SWDEC_CR_PIC 0      /* destination: the macroblock's prediction */
++#define SWDEC_CR_TMP 1      /* destination: the bi-prediction scratch */
++
++typedef struct SwdecChromaOp {
++    uint8_t type, buf, x, y;        /* destination block within the 8x8 */
++    uint8_t w, h, avg, mb;          /* size; MC: average with destination; macroblock index */
++    int16_t cx, cy;                 /* MC: integer chroma position in the reference */
++    uint8_t fx, fy, log2, pad;      /* MC: eighth-sample fraction; weights: denominator */
++    uint8_t tx, ty, pad2[2];        /* bi-weight: the scratch block it reads */
++    int16_t wa[2], wb[2], off[2];   /* weights for Cb, Cr: weight/weightd, weights, offset */
++    const uint8_t *ref[2];          /* MC: reference Cb, Cr planes */
++} SwdecChromaOp;
++
++#define SWDEC_CR_MAX_OPS 384
++#define SWDEC_CR_MAX_MBS 32
++typedef struct SwdecChromaRec {
++    int ops, mbs, overflow, mb_y;
++    int ref_stride, pic_w, pic_h;   /* chroma plane stride and coded size */
++    const void *chroma_ctx, *dsp_ctx, *vdsp_ctx;   /* CPU kernels (H264ChromaContext etc.) */
++    SwdecChromaOp op[SWDEC_CR_MAX_OPS];
++    uint8_t expect[SWDEC_CR_MAX_MBS][2][64];       /* the CPU's prediction, Cb and Cr */
++} SwdecChromaRec;
++
++#if defined(SWDEC_DIAGNOSTICS) && SWDEC_DIAGNOSTICS
++extern int swdec_chroma_rec_on;                    /* the component asks for this row */
++extern SwdecChromaRec swdec_chroma_rec;
++/* replay a record through the CPU's own kernels into out[mb][plane][64] */
++void swdec_chroma_rec_cpu_replay(const SwdecChromaRec *r, uint8_t (*out)[2][64]);
++#endif
++#endif
+diff --git a/libavcodec/h274.c b/libavcodec/h274.c
+index 93ad2d1..3db1550 100644
+--- a/libavcodec/h274.c
++++ b/libavcodec/h274.c
+@@ -44,7 +44,14 @@ typedef struct H274FilmGrainDatabase {
+     atomic_uint residency[6];
+ } H274FilmGrainDatabase;
+ 
+-static H274FilmGrainDatabase film_grain_db;
++/* Tilefinch swdec: the 692 KiB database is allocated on first use from the
++ * decoder arena instead of occupying the PSP module image as .bss. */
++static H274FilmGrainDatabase *film_grain_db;
++
++void ff_h274_film_grain_db_free(void)
++{
++    av_freep(&film_grain_db);
++}
+ 
+ static const int8_t Gaussian_LUT[2048+4];
+ static const uint32_t Seed_LUT[256];
+@@ -123,17 +130,17 @@ static void init_slice(uint8_t h, uint8_t v)
+ {
+     static AVMutex mutex = AV_MUTEX_INITIALIZER;
+     unsigned bitpos = h * 13 + v;
+-    unsigned res = atomic_load_explicit(&film_grain_db.residency[bitpos / 32],
++    unsigned res = atomic_load_explicit(&film_grain_db->residency[bitpos / 32],
+                                         memory_order_acquire);
+ 
+     if (res & (1U << (bitpos & 31)))
+         return;
+ 
+     ff_mutex_lock(&mutex);
+-    res = atomic_load_explicit(&film_grain_db.residency[bitpos / 32], memory_order_relaxed);
++    res = atomic_load_explicit(&film_grain_db->residency[bitpos / 32], memory_order_relaxed);
+     if (!(res & (1U << (bitpos & 31)))) {
+-        init_slice_c(film_grain_db.db[h][v], h, v);
+-        atomic_store_explicit(&film_grain_db.residency[bitpos / 32],
++        init_slice_c(film_grain_db->db[h][v], h, v);
++        atomic_store_explicit(&film_grain_db->residency[bitpos / 32],
+                               res | (1U << (bitpos & 31)), memory_order_release);
+     }
+     ff_mutex_unlock(&mutex);
+@@ -228,7 +235,7 @@ static av_always_inline void generate(int8_t *out, int out_stride,
+         scale = -scale;
+ 
+     synth_grain_8x8_c(out, out_stride, scale, shift,
+-                      &film_grain_db.db[h][v][y_offset][x_offset]);
++                      &film_grain_db->db[h][v][y_offset][x_offset]);
+ 
+     if (deblock)
+         deblock_8x8_c(out, out_stride);
+@@ -254,6 +261,9 @@ int ff_h274_apply_film_grain(AVFrame *out_frame, const AVFrame *in_frame,
+     if (in_frame->format != AV_PIX_FMT_YUV420P)
+         return AVERROR_PATCHWELCOME;
+ 
++    if (!film_grain_db && !(film_grain_db = av_mallocz(sizeof(*film_grain_db))))
++        return AVERROR(ENOMEM);
++
+     for (int c = 0; c < 3; c++) {
+         static const uint8_t color_offset[3] = { 0, 85, 170 };
+         uint32_t seed = Seed_LUT[(params->seed + color_offset[c]) % 256];
+diff --git a/libavcodec/h274.h b/libavcodec/h274.h
+index 7bbc3e8..718ba87 100644
+--- a/libavcodec/h274.h
++++ b/libavcodec/h274.h
+@@ -53,6 +53,9 @@ static inline int ff_h274_film_grain_params_supported(int model_id, enum AVPixel
+ int ff_h274_apply_film_grain(AVFrame *out, const AVFrame *in,
+                              const AVFilmGrainParams *params);
+ 
++// Tilefinch swdec: release the lazily allocated grain database.
++void ff_h274_film_grain_db_free(void);
++
+ typedef struct H274HashContext H274HashContext;
+ 
+ typedef struct H274SEIPictureHash {
+diff --git a/libavutil/tx.c b/libavutil/tx.c
+index 05c132a..aec6f98 100644
+--- a/libavutil/tx.c
++++ b/libavutil/tx.c
+@@ -337,9 +337,9 @@ static const FFTXCodelet * const ff_tx_null_list[] = {
+ };
+ 
+ /* Array of all compiled codelet lists. Order is irrelevant. */
++/* Tilefinch swdec: the decoder only uses AV_TX_INT32_*; leaving the float and
++ * double codelets out keeps their code and tables out of the PSP module. */
+ static const FFTXCodelet * const * const codelet_list[] = {
+-    ff_tx_codelet_list_float_c,
+-    ff_tx_codelet_list_double_c,
+     ff_tx_codelet_list_int32_c,
+     ff_tx_null_list,
+ #if HAVE_X86ASM
+diff --git a/libavutil/tx_template.c b/libavutil/tx_template.c
+index ecee572..139c4e5 100644
+--- a/libavutil/tx_template.c
++++ b/libavutil/tx_template.c
+@@ -29,6 +29,9 @@
+ #define TABLE_DEF(name, size) \
+     DECLARE_ALIGNED(32, TXSample, TX_TAB(ff_tx_tab_ ##name))[size]
+ 
++/* Tilefinch swdec: split-radix tables and codelets stop at 2048. The AAC
++ * decoder needs at most 512, and the larger zero-filled tables would add
++ * about 1 MiB of .bss to the PSP module image. */
+ #define SR_POW2_TABLES \
+     SR_TABLE(8)        \
+     SR_TABLE(16)       \
+@@ -38,13 +41,7 @@
+     SR_TABLE(256)      \
+     SR_TABLE(512)      \
+     SR_TABLE(1024)     \
+-    SR_TABLE(2048)     \
+-    SR_TABLE(4096)     \
+-    SR_TABLE(8192)     \
+-    SR_TABLE(16384)    \
+-    SR_TABLE(32768)    \
+-    SR_TABLE(65536)    \
+-    SR_TABLE(131072)   \
++    SR_TABLE(2048)
+ 
+ #define SR_TABLE(len) \
+     TABLE_DEF(len, len/4 + 1);
+@@ -145,7 +142,7 @@ av_cold void TX_TAB(ff_tx_init_tabs)(int len)
+ {
+     int factor_2 = ff_ctz(len);
+     if (factor_2) {
+-        int idx = factor_2 - 3;
++        int idx = FFMIN(factor_2 - 3, (int)FF_ARRAY_ELEMS(sr_tabs_init_once) - 1);
+         for (int i = 0; i <= idx; i++)
+             ff_thread_once(&sr_tabs_init_once[i],
+                             sr_tabs_init_funcs[i]);
+@@ -714,12 +711,6 @@ DECL_SR_CODELET(256,128,64)
+ DECL_SR_CODELET(512,256,128)
+ DECL_SR_CODELET(1024,512,256)
+ DECL_SR_CODELET(2048,1024,512)
+-DECL_SR_CODELET(4096,2048,1024)
+-DECL_SR_CODELET(8192,4096,2048)
+-DECL_SR_CODELET(16384,8192,4096)
+-DECL_SR_CODELET(32768,16384,8192)
+-DECL_SR_CODELET(65536,32768,16384)
+-DECL_SR_CODELET(131072,65536,32768)
+ 
+ static av_cold int TX_NAME(ff_tx_fft_init)(AVTXContext *s,
+                                            const FFTXCodelet *cd,
+@@ -2146,12 +2137,6 @@ const FFTXCodelet * const TX_NAME(ff_tx_codelet_list)[] = {
+     &TX_NAME(ff_tx_fft512_ns_def),
+     &TX_NAME(ff_tx_fft1024_ns_def),
+     &TX_NAME(ff_tx_fft2048_ns_def),
+-    &TX_NAME(ff_tx_fft4096_ns_def),
+-    &TX_NAME(ff_tx_fft8192_ns_def),
+-    &TX_NAME(ff_tx_fft16384_ns_def),
+-    &TX_NAME(ff_tx_fft32768_ns_def),
+-    &TX_NAME(ff_tx_fft65536_ns_def),
+-    &TX_NAME(ff_tx_fft131072_ns_def),
+ 
+     /* Prime factor codelets */
+     &TX_NAME(ff_tx_fft3_ns_def),

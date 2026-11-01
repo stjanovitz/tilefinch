@@ -1,7 +1,9 @@
 static void js_rt_runtime_finish_slice_state(ScriptRuntime *runtime)
 {
     watchdog_finish_slice(&runtime->watchdog);
-    runtime->result.interrupted = runtime->watchdog.interrupted;
+    /* an entry stopped for refused allocations ran out of memory, not time */
+    runtime->result.interrupted = runtime->watchdog.interrupted
+        && !runtime->watchdog.memory_exhausted;
 #if defined(CONFIG_EXECUTION_PROFILE)
     if (runtime->result.interrupted)
         JS_DumpExecutionProfile(runtime->runtime);

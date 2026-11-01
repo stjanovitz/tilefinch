@@ -452,6 +452,10 @@ validation_media_reset_mode=2             # 0 in-place / 1 recreate / 2 no-touch
 validation_media_refusal_reset=1          # reposition-recovery on AU refusals
 validation_media_au_dump=0                # per-AU dump (256KiB cap, truncate/run)
 validation_latch_probe=0                  # invasive full-frame flicker hashes; opt in only
+validation_swdec_audio_scan=0             # 1 scans every software-decoded audio block for peaks
+validation_swdec_reference=0              # mask: 1 old MC, 2 generic MB, 4 full edge, 8 full jobs, 16 split chroma, 32 prefetch, 64 chroma on CPU, 128 replay, 256 old audio clock, 512 old presentation scheduling, 1024 cap picture slots at nine
+validation_playback_ab=0                  # mask: 1 swdec fixed full quality (no reduced decodes), 2 per-frame chrome sync under the player, 4 picture ring may use high (main-CPU) slots, 8 reduced rungs drop non-reference pictures (old ladder), 16 old software pacing and one-frame-ahead discard rule
+validation_swdec_present=0                # swdec pictures: 0 GE async (shipping), 1 CPU scaler, 2 GE unsliced, 3 GE synced at once
 ```
 
 An `input_script=` key arms the scripted-input harness instead; note its

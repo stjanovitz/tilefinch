@@ -74,6 +74,10 @@ are kept in `build-preset-psp-validation/perf-journeys-latest/<journey>/`.
       supervisor queued during page work and replayed afterwards.
     - A press that a later one replaced before its frame completed is
       reported too (`superseded=1`), when its replacement completes.
+    - A press that cannot move the page (at its edge, or on a page that
+      does not scroll) owes no frame and draws none. It is reported at
+      once (`noop=1`), timed from the press to that report. These stay out
+      of the percentiles above; their worst time is `scroll.noop_max_ms`.
   - `layout.*`: steps and total time building a provisional page's remaining
     layout (`tilefinch-layout-completion`).
   - `ui.*`: frame composition cadence at exit.

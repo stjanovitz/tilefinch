@@ -1412,13 +1412,20 @@ static void psp_media_log_failure(
  * the video at all, and the event=me-memory line printed before the first
  * decode reports every address either way, so an exhausted pool cannot hide.
  */
+/* Set while the software decoder holds the pool (media_psp_me_pool_claim):
+   firmware buffers then come from the heap and a firmware teardown must not
+   rewind storage the decoder is using. */
+static bool psp_media_pool_claimed;
+static unsigned psp_media_pool_claims;
+
 static void *psp_media_alloc_shared(size_t bytes, size_t alignment)
 {
     if (bytes == 0 || bytes > SIZE_MAX - 63u) return NULL;
     size_t needed = 0;
     size_t remaining = 0;
-    bool had_pool = psp_media_pool_available(&psp_media_pool);
-    void *block = psp_media_pool_alloc(
+    bool had_pool = !psp_media_pool_claimed
+        && psp_media_pool_available(&psp_media_pool);
+    void *block = psp_media_pool_claimed ? NULL : psp_media_pool_alloc(
         &psp_media_pool, bytes, alignment, &needed, &remaining);
     if (block != NULL) return block;
     /* A reservation that was never taken already said so once at boot; only
@@ -1556,6 +1563,45 @@ static size_t psp_media_probe_heap_capacity(void)
  * is a budget change, not a memory change -- and this commit is only moving
  * where in physical memory the buffers live.
  */
+void *media_psp_me_pool_claim(size_t bytes)
+{
+    /* The first block needs a pool with no firmware buffer in it; later
+       blocks follow it until the decoder releases every one. */
+    if (psp_media_pool_claims == 0 && psp_media_pool.cursor != 0) return NULL;
+    void *block = psp_media_pool_alloc(
+        &psp_media_pool, bytes, PSP_MEDIA_POOL_ALIGNMENT, NULL, NULL);
+    if (block != NULL) {
+        psp_media_pool_claims++;
+        psp_media_pool_claimed = true;
+    }
+    return block;
+}
+
+size_t media_psp_me_pool_claimable(void)
+{
+    if (psp_media_pool_claims == 0 && psp_media_pool.cursor != 0) return 0;
+    size_t remaining = psp_media_pool_remaining(&psp_media_pool);
+    /* Room for the next block's alignment. */
+    return remaining > PSP_MEDIA_POOL_ALIGNMENT
+        ? (remaining - PSP_MEDIA_POOL_ALIGNMENT)
+              & ~(PSP_MEDIA_POOL_ALIGNMENT - 1u)
+        : 0;
+}
+
+bool media_psp_me_pool_owns(const void *pointer)
+{
+    return psp_media_pool_claimed
+        && psp_media_pool_owns(&psp_media_pool, pointer);
+}
+
+void media_psp_me_pool_unclaim(void *block)
+{
+    if (!media_psp_me_pool_owns(block) || psp_media_pool_claims == 0) return;
+    if (--psp_media_pool_claims != 0) return;
+    psp_media_pool_claimed = false;
+    (void) psp_media_pool_reset(&psp_media_pool);
+}
+
 void media_psp_backend_reserve_pool(void)
 {
     if (psp_media_pool.base != NULL) return;
@@ -3986,8 +4032,18 @@ static MediaBackendResult psp_media_decode_staged_video(
         /* The failure line syncs the card, so it goes last: the dump above
            rides that sync rather than paying for one of its own. */
         psp_media_log_failure(backend, stage_name, status);
+        /* Firmware took a real access unit into the decode stage and
+           refused it before this stream produced any picture: that is the
+           stream's coding, not a damaged packet, so another rendition may
+           still play (media_candidate_refused). */
+        bool first_picture_refused =
+            failed_stage == PSP_MEDIA_CODEC_STAGE_AVC_DECODE
+            && refused_es_size != 0
+            && backend->stats.decoded_video_frames == 0;
         psp_media_error(
-            error, error_size, "PSP AVC %s failed: 0x%08X",
+            error, error_size, "%sPSP AVC %s failed: 0x%08X",
+            first_picture_refused
+                ? MEDIA_H264_FIRST_PICTURE_REFUSAL ": " : "",
             stage_name, (unsigned) status);
         return MEDIA_BACKEND_ERROR;
     }
@@ -7630,7 +7686,7 @@ static void psp_media_destroy(void *opaque)
        quarantine returns earlier and has already poisoned the pool. Rewinding
        here is what lets the next stream reuse the same low, Media Engine
        visible storage instead of allocating wherever the heap has grown to. */
-    (void) psp_media_pool_reset(&psp_media_pool);
+    if (!psp_media_pool_claimed) (void) psp_media_pool_reset(&psp_media_pool);
     budget_reservation_release(&backend->external);
     Budget *budget = backend->budget;
     memset(backend, 0, sizeof(*backend));
@@ -7930,6 +7986,28 @@ static bool psp_media_backend_create_track_info(
         psp_media_destroy(backend);
         return false;
     }
+    /* Refuse what firmware is known to refuse before it costs a Media
+       Engine boot -- and before a first-access-unit refusal latches the
+       wide program off for every later video. A declared pyramid is the
+       open path's call (media_h264_firmware_references_conclusive): page
+       media with one never reaches this decoder, and elsewhere firmware
+       judges it. */
+    MediaH264FirmwareReferences reference_verdict = backend->video_annexb
+        ? media_h264_annexb_firmware_references(
+            backend->video.codec_config,
+            backend->video.codec_config_length)
+        : media_h264_avcc_firmware_references(
+            backend->video.codec_config,
+            backend->video.codec_config_length);
+    const char *reference_refusal =
+        reference_verdict == MEDIA_H264_FIRMWARE_REFERENCES_TOO_MANY
+            ? media_h264_firmware_references_refusal(reference_verdict)
+            : NULL;
+    if (reference_refusal != NULL) {
+        psp_media_error(error, error_size, "%s", reference_refusal);
+        psp_media_destroy(backend);
+        return false;
+    }
     bool h264_compat_enabled = !backend->video_annexb
         && media_h264_psp_compat_init(
             &backend->h264_compat, backend->video.codec_config,
@@ -7994,8 +8072,9 @@ static bool psp_media_backend_create_track_info(
             &decoder_policy)) {
         psp_media_error(
             error, error_size,
-            "PSP AVC profile/level unsupported: %u/%u",
-            avc_profile, avc_level);
+            MEDIA_H264_FIRMWARE_LEVEL_REFUSAL ": %u/%u at %ux%u",
+            avc_profile, avc_level, backend->decoded_width,
+            backend->decoded_height);
         psp_media_destroy(backend);
         return false;
     }

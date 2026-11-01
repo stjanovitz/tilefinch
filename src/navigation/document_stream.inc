@@ -1106,6 +1106,63 @@ static void navigation_stream_progress_preloads(
     }
 }
 
+/* Past the speculation deadline, the render-blocking style preloads still
+   running are cancelled and left to the ordered loader. */
+static void navigation_stream_cancel_style_preloads(
+    NavigationDocumentStream *stream)
+{
+    for (size_t i = 0; i < stream->preload_count; i++) {
+        NavigationPreload *preload = &stream->preloads[i];
+        if (!preload->render_blocking_style
+            || preload->node == NULL || preload->request_id == 0
+            || preload->complete) continue;
+        FetchRequestProgress progress = {0};
+        if (fetch_scheduler_request_progress(
+                stream->scheduler, preload->request_id, &progress)) {
+            stream->session->performance
+                .stylesheet_preload_timeout_bytes +=
+                    progress.received_body_bytes;
+            stream->session->performance
+                .stylesheet_preload_timeout_requests++;
+            if (progress.status_code != 0) {
+                stream->session->performance
+                    .stylesheet_preload_timeout_responses++;
+            }
+        }
+        (void) fetch_scheduler_cancel(
+            stream->scheduler, preload->request_id,
+            "stylesheet speculation deadline exceeded");
+        FetchResult *result =
+            fetch_result_create(stream->session->budget);
+        bool ignored = false;
+        if (result != NULL) {
+            (void) fetch_scheduler_take(
+                stream->scheduler, preload->request_id,
+                &ignored, result);
+        }
+        fetch_result_free(result);
+        preload->request_id = 0;
+        preload->complete = true;
+        stream->session->preloads_deferred++;
+    }
+}
+
+/* One non-blocking look at the render-blocking style preloads: true once
+   none is still running (completed, or cancelled past the deadline). */
+static bool navigation_stream_poll_style_preloads(
+    NavigationDocumentStream *stream)
+{
+    if (stream == NULL || stream->scheduler == NULL) return true;
+    navigation_stream_progress_preloads(stream, false);
+    if (navigation_stream_active_style_preloads(stream) == 0) return true;
+    if (stream->preload_deadline_us != 0
+        && navigation_now_us() >= stream->preload_deadline_us) {
+        navigation_stream_cancel_style_preloads(stream);
+        return true;
+    }
+    return false;
+}
+
 static void navigation_stream_settle_style_preloads(
     NavigationDocumentStream *stream)
 {
@@ -1116,40 +1173,7 @@ static void navigation_stream_settle_style_preloads(
         if (navigation_stream_active_style_preloads(stream) == 0) return;
         if (stream->preload_deadline_us != 0
             && navigation_now_us() >= stream->preload_deadline_us) {
-            for (size_t i = 0; i < stream->preload_count; i++) {
-                NavigationPreload *preload = &stream->preloads[i];
-                if (!preload->render_blocking_style
-                    || preload->node == NULL || preload->request_id == 0
-                    || preload->complete) continue;
-                FetchRequestProgress progress = {0};
-                if (fetch_scheduler_request_progress(
-                        stream->scheduler, preload->request_id, &progress)) {
-                    stream->session->performance
-                        .stylesheet_preload_timeout_bytes +=
-                            progress.received_body_bytes;
-                    stream->session->performance
-                        .stylesheet_preload_timeout_requests++;
-                    if (progress.status_code != 0) {
-                        stream->session->performance
-                            .stylesheet_preload_timeout_responses++;
-                    }
-                }
-                (void) fetch_scheduler_cancel(
-                    stream->scheduler, preload->request_id,
-                    "stylesheet speculation deadline exceeded");
-                FetchResult *result =
-                    fetch_result_create(stream->session->budget);
-                bool ignored = false;
-                if (result != NULL) {
-                    (void) fetch_scheduler_take(
-                        stream->scheduler, preload->request_id,
-                        &ignored, result);
-                }
-                fetch_result_free(result);
-                preload->request_id = 0;
-                preload->complete = true;
-                stream->session->preloads_deferred++;
-            }
+            navigation_stream_cancel_style_preloads(stream);
             return;
         }
         FetchPumpQuota quota = {

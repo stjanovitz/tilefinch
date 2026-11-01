@@ -1,0 +1,1 @@
+<!doctype html><title>Sliced stylesheet order</title><link rel="stylesheet" href="/first.css"><link rel="stylesheet" href="/second.css"><body><p class="probe">probe</p><script>globalThis.pocSummary='probe:'+getComputedStyle(document.querySelector('.probe')).color</script></body>

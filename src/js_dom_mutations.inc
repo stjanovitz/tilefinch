@@ -584,10 +584,11 @@ static void bridge_mutated_summarized(
        overflowing the PSP's fixed mutation journal before it is appended. */
     if (node != NULL && !bridge_node_is_connected(node)) return;
     /* A declaration miss is valid only for the DOM generation that was
-       scanned. Author mutation may hydrate metadata or a playable element;
+       scanned. Author mutation may hydrate metadata or a playable element,
+       or remove the declarations (the kept one then stays the answer);
        native card insertion does not pass through this bridge and therefore
        keeps its already-bound selection. */
-    media_declared_video_cache_destroy(bridge->document);
+    media_declared_video_cache_invalidate(bridge->document);
     document_note_connected_mutation(bridge->document);
     js_rt_bridge_computed_style_note_mutation(
         bridge, kind, node, attribute, attribute_length,

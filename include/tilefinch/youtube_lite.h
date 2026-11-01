@@ -46,7 +46,9 @@ typedef enum {
     YOUTUBE_LITE_ROUTE_WATCH,
     YOUTUBE_LITE_ROUTE_CHANNEL,
     YOUTUBE_LITE_ROUTE_PLAYLISTS,
-    YOUTUBE_LITE_ROUTE_PLAYLIST
+    YOUTUBE_LITE_ROUTE_PLAYLIST,
+    /* The signed-in account's watch history, /feed/history. */
+    YOUTUBE_LITE_ROUTE_HISTORY
 } YoutubeLiteRoute;
 
 #define YOUTUBE_PLAYLIST_TITLE_BYTES 128u
@@ -328,6 +330,9 @@ bool youtube_lite_account_diagnostics(const YoutubeLiteFeedJob *job,
    never expose it in diagnostics, JavaScript, files or the private control
    channel. */
 int youtube_lite_test_feed_authentication(const char *json, size_t length);
+/* The page builder as for a signed-in session. */
+bool youtube_lite_test_build_signed_in(Budget *budget, const char *url,
+    const char *source, size_t length, YoutubeLiteDocument *document);
 bool youtube_lite_test_feed_authorization(BrowserSession *session,
     const TilefinchRequestContext *context, uint64_t seconds,
     char *output, size_t capacity);

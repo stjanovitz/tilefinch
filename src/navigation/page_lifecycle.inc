@@ -497,6 +497,52 @@ static bool navigation_install_minimal_stylesheet_fallback(
     return true;
 }
 
+/* Lend the page's committed layout boxes to its image table for one pass
+   of image loading (images_set_layout_boxes), so CSS backgrounds decode at
+   the size that layout paints them. No copy: the lend views the live
+   layout, and a full rebuild keeps its box array when it releases the
+   layout before loading images (navigation_keep_image_boxes). */
+static void navigation_lend_image_boxes(NavigationSession *session,
+                                        ImageLayoutBoxes *boxes)
+{
+    layout_lend_image_boxes(
+        session != NULL && session->page.loaded
+            ? &session->page.layout : NULL, boxes);
+    if (boxes->layout != NULL)
+        images_set_layout_boxes(&session->page.images, boxes);
+}
+
+/* Lend only the page's CSS-to-device scale, for priority loads whose
+   background targets carry the area their recording layout gave them. */
+static void navigation_lend_image_scale(NavigationSession *session,
+                                        ImageLayoutBoxes *boxes)
+{
+    layout_lend_image_scale(&session->viewport, boxes);
+    images_set_layout_boxes(&session->page.images, boxes);
+}
+
+static void navigation_keep_image_boxes(NavigationSession *session)
+{
+    layout_keep_image_boxes(&session->page.layout,
+                            session->page.images.layout_boxes);
+}
+
+/* Release boxes a full rebuild kept, once its images are loaded. */
+static void navigation_drop_image_boxes(NavigationSession *session)
+{
+    ImageLayoutBoxes *boxes = session->page.images.layout_boxes;
+    images_set_layout_boxes(&session->page.images, NULL);
+    layout_release_image_boxes(boxes);
+}
+
+static void navigation_return_image_boxes(NavigationSession *session,
+                                          ImageLayoutBoxes *boxes)
+{
+    if (session == NULL) return;
+    images_set_layout_boxes(&session->page.images, NULL);
+    layout_release_image_boxes(boxes);
+}
+
 static void navigation_ensure_layout_reuse(NavigationSession *session)
 {
     if (session == NULL || session->page.layout_reuse != NULL
@@ -1834,6 +1880,26 @@ static bool navigation_retire_failed_document_refresh(
     return true;
 }
 
+/* Whether a realm a frame event is addressed to is still one this page
+   owns: the top realm, or the realm of the given live frame slot. Pointer
+   identity only, never a dereference: a relayout that memory refused can
+   retire every realm (the static fallback) while a caller still holds the
+   pointer it read before, and that realm is already freed. Retiring every
+   realm clears the page's pointers and the page creates none afterwards
+   (its runtime pump stops), so a freed address cannot reappear here. */
+static bool navigation_frame_parent_realm_live(
+    const NavigationSession *session, const ScriptRuntime *parent_runtime,
+    size_t parent_frame_slot_plus_one)
+{
+    if (session == NULL || parent_runtime == NULL) return false;
+    if (parent_frame_slot_plus_one == 0)
+        return parent_runtime == session->page.runtime;
+    size_t slot = parent_frame_slot_plus_one - 1u;
+    return slot < session->page.frame_count
+        && !session->page.frames[slot].retired
+        && session->page.frames[slot].runtime == parent_runtime;
+}
+
 static bool navigation_dispatch_frame_parent_event(
     NavigationSession *session, ScriptRuntime *parent_runtime,
     size_t parent_frame_slot_plus_one, lxb_dom_node_t *node,
@@ -1841,16 +1907,14 @@ static bool navigation_dispatch_frame_parent_event(
 {
     if (session == NULL || parent_runtime == NULL || node == NULL
         || event_type == NULL) return false;
+    if (!navigation_frame_parent_realm_live(
+            session, parent_runtime, parent_frame_slot_plus_one))
+        return false;
     ScriptResult *result = &session->page.script_result;
     NavigationFrame *parent = NULL;
     if (parent_frame_slot_plus_one != 0) {
-        size_t slot = parent_frame_slot_plus_one - 1u;
-        if (slot >= session->page.frame_count) return false;
-        parent = &session->page.frames[slot];
-        if (parent->retired || parent->runtime != parent_runtime) return false;
+        parent = &session->page.frames[parent_frame_slot_plus_one - 1u];
         result = &parent->script_result;
-    } else if (parent_runtime != session->page.runtime) {
-        return false;
     }
     bool dispatched = script_runtime_dispatch_node(
         parent_runtime, node, event_type, result);
@@ -1932,7 +1996,8 @@ static bool navigation_retire_exhausted_script_realms_mode(
         heap_rejections > session->page.script_heap_rejections_seen;
     session->page.script_heap_rejections_seen = heap_rejections;
     bool explicit_oom = new_rejection
-        && strstr(session->page.script_result.error, "out of memory") != NULL;
+        && script_error_reports_out_of_memory(
+               session->page.script_result.error);
     /* With memory-pressure growth a small margin under the current limit is
        normal; exhaustion means the realm cannot obtain more. */
     size_t remaining = script_runtime_heap_available(
@@ -2148,6 +2213,16 @@ static void navigation_adopt_stylesheet_events(
     for (lxb_dom_node_t *node = root; node != NULL;
          node = navigation_next_document_node(root, node)) {
         if (!navigation_is_stylesheet_link(node)) continue;
+        /* A markup onload/onerror handler exists from element creation, so
+           a browser always delivers the completion to it. The deferred-CSS
+           idiom (media="print" or "none" with onload switching media to
+           "all") depends on that; adopting such a link silently left its
+           rules disabled forever. */
+        lxb_dom_element_t *element = lxb_dom_interface_element(node);
+        if (lxb_dom_element_has_attribute(
+                element, (const lxb_char_t *) "onload", 6u)
+            || lxb_dom_element_has_attribute(
+                element, (const lxb_char_t *) "onerror", 7u)) continue;
         char resolved[4096];
         uint64_t hash = 0;
         (void) navigation_resolve_stylesheet_link(
@@ -2199,9 +2274,10 @@ static StylesheetDocumentResourceState navigation_stylesheet_link_state(
 
 /* Link stylesheet completion is an author-observable browser event.  Initial
    parser-owned links have already completed before the author runtime starts,
-   so they are adopted without a late event.  Links appended by scripts are
-   dispatched only after the bounded stylesheet ledger reaches a terminal
-   state.  Recording the node before calling JavaScript makes re-entrant DOM
+   so they are adopted without a late event, except those whose markup carries
+   an onload/onerror handler (see navigation_adopt_stylesheet_events).  Those
+   and links appended by scripts are dispatched only after the bounded
+   stylesheet ledger reaches a terminal state.  Recording the node before calling JavaScript makes re-entrant DOM
    work exactly-once without adding private attributes to the page. */
 static bool navigation_dispatch_stylesheet_events_timed(
     NavigationSession *session, const char *base_url);

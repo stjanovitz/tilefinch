@@ -513,6 +513,22 @@ void browser_engine_cancel_navigation(BrowserEngine *engine,
  */
 size_t browser_engine_cancel_network_work(
     BrowserEngine *engine, const char *reason);
+/*
+ * While the native player owns the screen the committed page's optional
+ * network work stops and stays stopped. In-flight dynamic scripts are
+ * requeued, not failed: their elements wait as on a slow network and start
+ * again, in order, after release. Every other page request is cancelled as
+ * browser_engine_cancel_network_work does (its normal error path). The
+ * page's fetch domain then admits nothing new until release: fetch()/XHR
+ * and new scripts stay queued, image loads wait out their own timeouts.
+ * Player, resolver and probe schedulers are outside the page domain.
+ * Idempotent for one page domain; returns the requests requeued or
+ * cancelled.
+ */
+size_t browser_engine_hold_page_network(
+    BrowserEngine *engine, const char *reason);
+void browser_engine_release_page_network(BrowserEngine *engine);
+bool browser_engine_page_network_held(const BrowserEngine *engine);
 BrowserNavigationJobStatus browser_engine_navigation_status(
     const BrowserEngine *engine);
 bool browser_engine_navigation_pending(const BrowserEngine *engine);
@@ -537,10 +553,38 @@ bool browser_engine_heavy_page(BrowserEngine *engine,
                                ScriptHeavyState *state);
 bool browser_engine_answer_heavy_page(BrowserEngine *engine, bool run);
 bool browser_engine_stop_page_scripts(BrowserEngine *engine);
+/*
+ * Room for a media decoder that the Budget refused. Each call takes the
+ * next step towards `needed_bytes` unused (0: as much as the step frees),
+ * least destructive first, and says which it took, so the caller can try
+ * its allocation again after each:
+ *   OPTIONAL         fonts staged for later, a collected and trimmed script
+ *                    heap, session caches, decoded images, resident tiles;
+ *   SCRIPTS_STOPPED  the page's realms, as browser_engine_stop_page_scripts
+ *                    (its DOM and position stay for the return);
+ *   NONE             the room is there, or nothing is left to give.
+ * `*stage` starts at 0 for each open. When the scripts were stopped,
+ * browser_engine_take_media_room_scripts_stopped says so once, while the
+ * same page is still committed (not after an embed hop's Back).
+ */
+typedef enum {
+    BROWSER_MEDIA_ROOM_NONE = 0,
+    BROWSER_MEDIA_ROOM_OPTIONAL,
+    BROWSER_MEDIA_ROOM_SCRIPTS_STOPPED
+} BrowserMediaRoomStep;
+BrowserMediaRoomStep browser_engine_make_media_room(
+    BrowserEngine *engine, size_t needed_bytes, unsigned *stage);
+bool browser_engine_take_media_room_scripts_stopped(BrowserEngine *engine);
 /* True once the committed page's realm ran out of memory, took the
    server-rendered body down with it, and the engine put that body back and
    retired the realm (navigation_page_memory_rescued). */
 bool browser_engine_page_memory_rescued(const BrowserEngine *engine);
+
+/* True once after a page update (a runtime turn, input, background work)
+   retired the page because memory refused its layout or style even with
+   its scripts stopped (NAVIGATION_PAGE_OUT_OF_MEMORY_ERROR), while no other
+   page has replaced it. */
+bool browser_engine_take_page_memory_retirement(BrowserEngine *engine);
 
 bool browser_engine_parser_script_time(const BrowserEngine *engine,
                                       uint64_t *used_us, uint64_t *limit_us);
@@ -634,6 +678,45 @@ bool browser_engine_execute_action(BrowserEngine *engine,
                                    const ControllerAction *action,
                                    size_t maximum_bytes,
                                    long timeout_ms);
+/*
+ * The embed hop. When Play finds nothing playable on a page that declares a
+ * player page, the controller returns a navigation with embed_hop set;
+ * executing it (browser_engine_execute_action or
+ * browser_engine_begin_navigation_action) starts the hop, and any other
+ * navigation ends it. While browser_engine_embed_hop_active, the frontend
+ * polls once per frame:
+ * - WAITING: the player page is loading or running;
+ * - READY: *action is the page-video action for the player page's first
+ *   identity-matched stream; open it at once as any page video;
+ * - PLAYING: the hop's player is open; once it closes,
+ *   browser_engine_embed_hop_take_return says whether to go Back to the
+ *   original page. When it fails because the stream is offline or not
+ *   available, browser_engine_embed_hop_take_unavailable ends the hop as
+ *   TIMED_OUT does, with that message instead;
+ * - TIMED_OUT: nothing playable within BROWSER_EMBED_HOP_TIMEOUT_US of the
+ *   player page's commit; the hop has ended, so say so and go Back;
+ * - NONE: no hop (or it ended because the load failed or the user left).
+ */
+#define BROWSER_EMBED_HOP_TIMEOUT_US UINT64_C(45000000)
+typedef enum {
+    BROWSER_EMBED_HOP_NONE = 0,
+    BROWSER_EMBED_HOP_WAITING,
+    BROWSER_EMBED_HOP_READY,
+    BROWSER_EMBED_HOP_PLAYING,
+    BROWSER_EMBED_HOP_TIMED_OUT
+} BrowserEmbedHopStatus;
+bool browser_engine_embed_hop_active(const BrowserEngine *engine);
+BrowserEmbedHopStatus browser_engine_embed_hop_poll(
+    BrowserEngine *engine, ControllerAction *action);
+bool browser_engine_embed_hop_take_return(BrowserEngine *engine);
+/* FAILURE is the hop's open failure: engine text, or the failed-video
+   panel's headline. When it is a MEDIA_FAILURE_STREAM_UNAVAILABLE one
+   (media_failure_message.h), the hop ends and this says whether to go Back
+   (the player page is still current); the frontend closes the player and
+   shows that headline. Any other failure keeps the hop: its panel stays
+   and closing it goes Back as usual. */
+bool browser_engine_embed_hop_take_unavailable(BrowserEngine *engine,
+                                               const char *failure);
 /* Semantic input commands retain no queued input allocation. DOM mutation,
  * script dispatch, and relayout still use their ordinary bounded page budget.
  * Device-space scroll and pointer coordinates use the configured framebuffer
@@ -657,6 +740,24 @@ LayoutScrollbarWidth browser_engine_root_scrollbar_width(
 bool browser_engine_scroll_step(BrowserEngine *engine, int direction,
                                 unsigned held_frames);
 bool browser_engine_scroll_page(BrowserEngine *engine, int direction);
+/*
+ * The scroll presses a frontend presents from. Same work and return as
+ * browser_engine_scroll_by (amount = delta), browser_engine_scroll_page
+ * (amount = direction) or browser_engine_scroll_to_edge (amount != 0 for the
+ * bottom), and *changed says whether a new frame is owed: the document or a
+ * nested scroller moved, a relayout or focus paint was applied, the render
+ * shell changed or the first-paint hold was released. A press at a page's
+ * edge (or on a page that cannot scroll) succeeds with *changed false, and
+ * the frontend skips the redraw.
+ */
+typedef enum {
+    BROWSER_SCROLL_BY,
+    BROWSER_SCROLL_PAGE,
+    BROWSER_SCROLL_EDGE
+} BrowserScrollRequest;
+bool browser_engine_scroll(BrowserEngine *engine,
+                           BrowserScrollRequest request, int amount,
+                           bool *changed);
 /*
  * While a provisional page's layout completion runs (from one of its
  * cooperative checkpoints), the committed page can still be paged: the
@@ -1009,6 +1110,13 @@ bool browser_engine_page_loaded(const BrowserEngine *engine);
    runtime was retired after degrading. Not ordinary widget errors or
    JavaScript disabled for the site. */
 bool browser_engine_page_script_memory_failed(const BrowserEngine *engine);
+/* Whether a memory failure should send the current page back through the
+   recovery checks (Basic view fallback): its scripts failed for memory as
+   above, or its realm is still live after QuickJS refused it heap (an "out
+   of memory" the page caught or reported) and the page shows little: it
+   paints nothing, or it has nothing to focus and activate. A page that
+   keeps its content and actions after such an error is left alone. */
+bool browser_engine_page_memory_recovery_due(const BrowserEngine *engine);
 /*
  * Copies of the current history entry, so the frontend never borrows engine
  * history. They return false, with empty text and zero scroll, when there is
@@ -1030,6 +1138,11 @@ bool browser_engine_history_peek(
    without an active navigation session. */
 bool browser_engine_page_document_url(
     const BrowserEngine *engine, char *url, size_t url_capacity);
+/* The committed document's Content-Security-Policy, which native page
+   media snapshots so every redirect hop is checked against media-src.
+   NULL when there is no engine. */
+const struct TilefinchContentSecurityPolicy *
+browser_engine_page_content_security_policy(const BrowserEngine *engine);
 /* Incremental relayouts of the current session so far; a change across an
    operation means it relaid out the page. */
 size_t browser_engine_page_incremental_relayouts(const BrowserEngine *engine);
@@ -1091,6 +1204,9 @@ void browser_engine_test_refuse_next_render_shell_init(void);
 /* Deterministic wall clock for recovery-settle tests. Zero restores the
    platform monotonic clock. */
 void browser_engine_test_set_recovery_time_us(uint64_t now_us);
+/* Recovery time since commit as every recovery-settle check sees it,
+   overriding the clock above; zero restores it. */
+void browser_engine_test_set_recovery_elapsed_us(uint64_t elapsed_us);
 /* The name of the index-th idle step in run order, NULL past the end. */
 const char *browser_engine_test_idle_step_name(size_t index);
 #endif
@@ -1162,11 +1278,44 @@ typedef enum {
     BROWSER_DECLARED_MEDIA_CARD_DEFERRED
 } BrowserDeclaredMediaCard;
 /* Install at most one engine-owned play surface for explicit page video
-   metadata. Existing <video> elements are never mutated. DOM insertion is
-   admitted only after the same script-degradation and author-settle boundary
-   used by automatic Basic recovery, and is transactional on every refusal. */
+   metadata when the page offers no author video or audio that page media
+   can open (none, or only ones with no source or a blob: source).
+   Existing media elements are never mutated. A degraded page (script
+   failure or memory refusal) and a healthy page whose parser kept a
+   declaration both qualify; insertion waits for the same author-settle
+   boundary used by automatic Basic recovery (12 runtime ticks and 250 ms),
+   and is transactional on every refusal. */
 BrowserDeclaredMediaCard browser_engine_prepare_declared_media_card(
     BrowserEngine *engine);
+/* Why the last settled card decision was made: "installed", "refused",
+   "author-media", "no-declaration", "no-body", "not-loaded", or "none"
+   before any decision (static text, never NULL). */
+const char *browser_engine_declared_media_card_reason(
+    const BrowserEngine *engine);
+/* What Play on the page acts on, as a d-pad focus target: the declared
+   media card; else the first author video or audio element in document
+   order that page media can open (browser_engine_author_media_openable),
+   else the first other one, each focused itself when it is a focus target
+   or through the first focus target of its nearest enclosing element (its
+   player's control). Bounded DOM and layout walks. */
+typedef enum {
+    BROWSER_PAGE_MEDIA_NONE = 0,
+    BROWSER_PAGE_MEDIA_CARD,
+    BROWSER_PAGE_MEDIA_AUTHOR,
+    BROWSER_PAGE_MEDIA_AUTHOR_PLAYER,
+    BROWSER_PAGE_MEDIA_ELEMENT,
+    BROWSER_PAGE_MEDIA_ELEMENT_PLAYER
+} BrowserPageMediaTarget;
+BrowserPageMediaTarget browser_engine_page_media_target(
+    BrowserEngine *engine, lxb_dom_node_t **focus_target);
+/* Whether d-pad focus is on page media: the card, an author video or audio
+   element, or the target above. Cross there plays, whatever page notice is
+   showing. */
+bool browser_engine_focus_on_page_media(BrowserEngine *engine);
+/* Whether an author <video>/<audio> offers a source page media can open:
+   a non-empty, non-blob: src, or such a <source> child (bounded). The one
+   rule the declared media card and validation focus-page-media share. */
+bool browser_engine_author_media_openable(lxb_dom_node_t *media);
 void browser_engine_set_reader_candidate_mode(BrowserEngine *engine,
                                               bool enabled);
 bool browser_engine_reader_analysis(

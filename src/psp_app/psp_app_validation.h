@@ -37,6 +37,18 @@ typedef enum {
     PSP_VPROBE_DEFER_RENDER
 } PspVprobeDeferral;
 
+/* Where a software-decoded 16-bit picture went: the graphics engine, or the
+   software scaler and why (psp_media_swdec_ge_submit). */
+enum {
+    PSP_VPROBE_SWDEC_GE,
+    PSP_VPROBE_SWDEC_OFF,      /* Sharp, engine latched off, or A/B mode 1 */
+    PSP_VPROBE_SWDEC_CHROME,   /* chrome blends over the picture */
+    PSP_VPROBE_SWDEC_ADDRESS,  /* slot above 0x0A000000 or unaligned */
+    PSP_VPROBE_SWDEC_GEOMETRY, /* no quads */
+    PSP_VPROBE_SWDEC_REFUSED,  /* the submit itself refused */
+    PSP_VPROBE_SWDEC_PATHS
+};
+
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
 
 /* src/psp_script_main.c, shared with the validation units. */
@@ -207,8 +219,11 @@ void psp_loop_timing_bind(PspBrowserResources *browser);
 void psp_loop_timing_begin(void);
 void psp_loop_timing_phase(unsigned phase);
 void psp_loop_timing_note_wait(bool task_yield, bool fast_followup);
+void psp_loop_timing_note_media_wait(bool polling, bool followup,
+                                    uint32_t waited_us);
 void psp_loop_timing_end(void);
 #define PSP_LOOP_PHASE(phase) psp_loop_timing_phase(phase)
+
 
 /* Validation frame steps, measured with the frame sets
    (cmake/CheckPspHotSymbolSizes.cmake). */
@@ -321,6 +336,16 @@ void psp_media_present_report(
     const PspMediaPresentTexture *texture);
 void psp_vprobe_present_account(
     uint64_t started_us, const PspMediaPresentGeCost *cost, bool drawn);
+/* A video present that could not draw because its decoder slot was no
+   longer borrowable (counted by the periodic present probe line). */
+void psp_vprobe_present_borrow_refused(void);
+/* boot.cfg validation_swdec_present: 0 engine (shipping), 1 software scaler,
+   2 engine unsliced, 3 engine synced at once (the reverted placement). */
+extern int psp_vprobe_swdec_mode;
+void psp_vprobe_swdec_present(
+    unsigned path, const PspMediaPresentGeCost *cost);
+void psp_vprobe_swdec_finish(
+    bool drawing, const PspMediaPresentGeCost *cost, bool drawn);
 void psp_load_scroll_note_press(void);
 void psp_load_scroll_note_moved(void);
 
@@ -583,6 +608,20 @@ static inline void psp_vprobe_present_account(
     uint64_t started_us, const PspMediaPresentGeCost *cost, bool drawn)
 {
     (void) started_us;
+    (void) cost;
+    (void) drawn;
+}
+static inline void psp_vprobe_present_borrow_refused(void) {}
+static inline void psp_vprobe_swdec_present(
+    unsigned path, const PspMediaPresentGeCost *cost)
+{
+    (void) path;
+    (void) cost;
+}
+static inline void psp_vprobe_swdec_finish(
+    bool drawing, const PspMediaPresentGeCost *cost, bool drawn)
+{
+    (void) drawing;
     (void) cost;
     (void) drawn;
 }

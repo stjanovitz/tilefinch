@@ -1,0 +1,18 @@
+# Start on a page with native playable media. The fixed software-decoder
+# window opens after five seconds and samples thirty seconds. Buffer routine
+# diagnostics throughout it; pause before flushing, then close normally.
+wait-live 1200
+wait-page 300
+mark-page loaded
+focus-page-media
+mark-page before-play
+tap cross
+until-live 1350
+mark-live video-measure-start
+mark-live playing
+tap-after-live 45000 cross
+mark-live video-measure-end
+tap-live circle
+wait-live 150
+mark closed
+end

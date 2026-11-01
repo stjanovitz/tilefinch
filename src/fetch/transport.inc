@@ -320,6 +320,109 @@ static bool fetch_github_release_url_allowed(const char *value)
     return github_exact || content_subdomain;
 }
 
+/*
+ * Every per-hop rule a resolved redirect target must pass before a request
+ * byte is sent to it: mixed-content downgrade, the shared target policy (CSP
+ * for the request's destination, captive-portal confinement, mixed content),
+ * the blocked-origin list, the content blocker, the updater's host policy and
+ * any native validator. The scheduler's hop walk and the page-media worker
+ * hops (fetch_page_redirect_next) both decide here, so neither can drift.
+ */
+static bool fetch_redirect_target_admitted(
+    const FetchRequest *base, const BrowserSession *security_session,
+    const char *current_url, const char *next)
+{
+    bool admitted_portal_target = security_session != NULL
+        && browser_session_captive_portal_url_allowed(
+               security_session, next);
+    if (tilefinch_url_is_downgrade(current_url, next)
+        && !fetch_request_mixed_override(base)
+        && !admitted_portal_target) return false;
+    if (!fetch_request_target_allowed_with_session(
+            base, security_session, next)) return false;
+    if (fetch_origin_blocked(next)
+        || fetch_request_content_blocked(base, next)) return false;
+    if (base != NULL
+        && base->redirect_policy == FETCH_REDIRECT_GITHUB_RELEASE
+        && !fetch_github_release_url_allowed(next)) return false;
+    if (base != NULL
+        && base->redirect_url_validator != NULL
+        && !base->redirect_url_validator(next)) return false;
+    return true;
+}
+
+bool fetch_page_redirect_next(
+    const FetchRequest *page_request, const char *current_url,
+    const FetchResult *response, char *next, size_t next_size,
+    bool *block_private_network)
+{
+    if (block_private_network != NULL) *block_private_network = true;
+    if (next != NULL && next_size != 0) next[0] = '\0';
+    if (page_request == NULL || page_request->page_context == NULL
+        || page_request->prepared_page_version
+               != FETCH_PREPARED_PAGE_REQUEST_VERSION
+        || current_url == NULL || response == NULL || next == NULL
+        || next_size == 0) return false;
+    long status = response->status_code;
+    if (status != 301 && status != 302 && status != 303
+        && status != 307 && status != 308) return false;
+    char location[TILEFINCH_URL_SERIALIZED_LIMIT];
+    char resolved[TILEFINCH_URL_SERIALIZED_LIMIT];
+    char secured[TILEFINCH_URL_SERIALIZED_LIMIT];
+    char key[TILEFINCH_URL_SERIALIZED_LIMIT];
+    BrowserSession *session = (BrowserSession *) page_request->cookie_session;
+    if (!fetch_response_header_value(
+            response, "location", location, sizeof(location))
+        || !tilefinch_url_resolve(
+               current_url, location, resolved, sizeof(resolved))
+        || !fetch_request_prepare_security_url_with_session(
+               page_request, session, resolved, false, secured)
+        || !tilefinch_url_request_key(secured, key, sizeof(key))
+        || !fetch_redirect_target_admitted(
+               page_request, session, current_url, key)) return false;
+    size_t length = strlen(key);
+    if (length >= next_size) return false;
+    memcpy(next, key, length + 1u);
+    if (block_private_network != NULL) {
+        *block_private_network =
+            fetch_request_private_network_protected_with_session(
+                page_request, session, key);
+    }
+    return true;
+}
+
+bool fetch_page_request_first_hop(
+    const FetchRequest *page_request, char *target, size_t target_size,
+    bool *block_private_network)
+{
+    if (block_private_network != NULL) *block_private_network = true;
+    if (page_request == NULL || page_request->page_context == NULL
+        || page_request->prepared_page_version
+               != FETCH_PREPARED_PAGE_REQUEST_VERSION
+        || target == NULL || target_size == 0
+        || !page_request_target_matches(page_request, target)) return false;
+    char secured[TILEFINCH_URL_SERIALIZED_LIMIT];
+    char key[TILEFINCH_URL_SERIALIZED_LIMIT];
+    BrowserSession *session = (BrowserSession *) page_request->cookie_session;
+    /* The initial request's own preparation (HSTS, passive mixed-content
+       upgrade), then the per-hop gate with no previous hop to downgrade
+       from, exactly as the scheduler admits an enqueued URL. */
+    if (!fetch_request_prepare_security_url_with_session(
+            page_request, session, target, true, secured)
+        || !tilefinch_url_request_key(secured, key, sizeof(key))
+        || !fetch_redirect_target_admitted(page_request, session, key, key))
+        return false;
+    size_t length = strlen(key);
+    if (length >= target_size) return false;
+    memcpy(target, key, length + 1u);
+    if (block_private_network != NULL) {
+        *block_private_network =
+            fetch_request_private_network_protected_with_session(
+                page_request, session, key);
+    }
+    return true;
+}
+
 static bool fetch_hop_advance(FetchHopState *hop,
                               const FetchResult *response)
 {
@@ -365,22 +468,8 @@ static bool fetch_hop_advance(FetchHopState *hop,
         }
     }
     const FetchRequest *base = hop->base;
-    bool admitted_portal_target = hop->security_session != NULL
-        && browser_session_captive_portal_url_allowed(
-               hop->security_session, next);
-    if (tilefinch_url_is_downgrade(hop->url, next)
-        && !fetch_request_mixed_override(base)
-        && !admitted_portal_target) return false;
-    if (!fetch_request_target_allowed_with_session(
-            base, hop->security_session, next)) return false;
-    if (fetch_origin_blocked(next)
-        || fetch_request_content_blocked(base, next)) return false;
-    if (base != NULL
-        && base->redirect_policy == FETCH_REDIRECT_GITHUB_RELEASE
-        && !fetch_github_release_url_allowed(next)) return false;
-    if (base != NULL
-        && base->redirect_url_validator != NULL
-        && !base->redirect_url_validator(next)) return false;
+    if (!fetch_redirect_target_admitted(
+            base, hop->security_session, hop->url, next)) return false;
     /* Redirect admission is per hop.  The guard points at stable hop-owned
        storage, so updating it here changes the socket policy before the next
        URL can be configured or any request bytes can be sent. */
@@ -1544,6 +1633,9 @@ typedef struct {
     uint64_t background_request_id;
     bool background_backend;
     bool background_allowed;
+    /* Nonzero: issue worker hops with the foreground-media descriptor
+       priority and this publication quantum (page media ranges). */
+    size_t background_media_publication_bytes;
     bool background_headers_delivered;
     bool domain_slot_reserved;
     bool tls12_retry_attempted;
@@ -1559,6 +1651,8 @@ struct FetchSchedulerDomain {
     size_t rejected_enqueues;
     size_t active_views;
     size_t peak_active_views;
+    /* fetch_scheduler_domain_set_held: no new admissions. */
+    bool held;
 };
 
 struct FetchScheduler {
@@ -1575,6 +1669,7 @@ struct FetchScheduler {
     size_t pump_cursor;
     bool global_acquired;
     bool background_transport_enabled;
+    size_t background_media_publication_bytes;
     unsigned char *background_chunk;
     size_t background_chunk_capacity;
     FetchTlsHandshakeCounters tls_counters;

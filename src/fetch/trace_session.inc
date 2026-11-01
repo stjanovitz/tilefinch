@@ -753,7 +753,12 @@ bool fetch_trace_replay_stats(FetchTraceReplayStats *stats)
         .reusable_claim_count =
             fetch_trace.replay_reusable_claim_count,
         .occurrence_exhausted_count =
-            fetch_trace.replay_occurrence_exhausted_count
+            fetch_trace.replay_occurrence_exhausted_count,
+        .media_lane_request_count =
+            fetch_trace.replay_media_lane_request_count,
+        .media_lane_served_count = fetch_trace.replay_media_lane_served_count,
+        .range_slice_count = fetch_trace.replay_range_slice_count,
+        .media_alias_count = fetch_trace.replay_media_alias_count
     };
     return true;
 }

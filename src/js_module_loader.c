@@ -1504,6 +1504,41 @@ size_t script_runtime_pending_bytecode_count(const ScriptRuntime *runtime)
     return runtime == NULL ? 0 : runtime->bytecode_pending_count;
 }
 
+static size_t pending_bytecode_heap_reserve(size_t source_length);
+
+size_t script_runtime_release_pending_bytecode_for_heap(
+    ScriptRuntime *runtime, bool growth_refused)
+{
+    if (runtime == NULL || runtime->context == NULL
+        || runtime->bytecode_pending_count == 0
+        || runtime->bytecode_pending_busy) return 0;
+    size_t dropped = 0;
+    /* A queued compile pins its whole function tree, including the code of
+       every function the page never called, until idle work stores it. A
+       busy page may give idle work no turn before it runs short, and the
+       next store's own check comes only with the next script. Once the
+       store would be skipped anyway (the same reserve
+       pending_bytecode_store_oldest checks), or the page has already been
+       refused memory, the page needs the heap more than the table needs
+       the entry. Oldest first, as the store-time check drops them. */
+    size_t at = 0;
+    while (at < runtime->bytecode_pending_count) {
+        if (growth_refused
+            || script_runtime_heap_available(runtime)
+                   < pending_bytecode_heap_reserve(
+                         runtime->bytecode_pending[at].source_length)) {
+            pending_bytecode_remove(runtime, at,
+                                    growth_refused ? "drop-heap-refused"
+                                                   : "drop-heap-pressure");
+            dropped++;
+        } else {
+            at++;
+        }
+    }
+    pending_bytecode_trim(runtime);
+    return dropped;
+}
+
 static bool pending_bytecode_same_record(const ScriptBytecodePending *entry,
                                          const BrowserScriptBytecodeKey *key)
 {
@@ -1756,6 +1791,10 @@ static bool pending_bytecode_store_oldest(ScriptRuntime *runtime,
                    runtime->module_bytecode_generation)) {
         result = "skip-table-full";
     } else {
+        /* Serializing allocates in the realm heap, and a collection there
+           may release queued stores (script_runtime_gc_hook): keep `entry`
+           in place until it is removed below. */
+        runtime->bytecode_pending_busy = true;
         uint8_t *bytecode = JS_WriteObject(runtime->context, &length,
                                            entry->compiled,
                                            JS_WRITE_OBJ_BYTECODE);
@@ -1774,6 +1813,7 @@ static bool pending_bytecode_store_oldest(ScriptRuntime *runtime,
             js_free(runtime->context, bytecode);
             result = stored ? stored_label : "put-refused";
         }
+        runtime->bytecode_pending_busy = false;
     }
     bool stored = result == stored_label;
     if (stored) {
@@ -1918,6 +1958,17 @@ static bool script_runtime_evaluate_external_typed_at(
     bool dispatch_completion, const char *classic_cache_url,
     uint32_t classic_ordinal, bool response_no_store, ScriptResult *result)
 {
+    /* Taken here so that a nested evaluation never sees the offer. */
+    ScriptSourceReleaseFn release_source = NULL;
+    void *release_opaque = NULL;
+    ScriptRunningSource outer_running = {0};
+    bool running_armed = false;
+    if (runtime != NULL) {
+        release_source = runtime->source_release;
+        release_opaque = runtime->source_release_opaque;
+        runtime->source_release = NULL;
+        runtime->source_release_opaque = NULL;
+    }
     /* A NULL source is an installed app's classic script restored as
        bytecode only (browser_session_offline_script_*). */
     if (runtime == NULL || script_node == NULL
@@ -2073,9 +2124,20 @@ static bool script_runtime_evaluate_external_typed_at(
                         SCRIPT_COMPILE_SOURCE_EXTERNAL, &runtime->result);
                 if (cache_admitted) {
                     uint64_t restore_started_ns = js_rt_monotonic_time_ns();
+                    /* Its functions read their text from the script's
+                       (evaluation.inc, "Function source outside the
+                       heap"). */
+                    uint32_t restore_source = js_rt_source_store_begin_restore(
+                        runtime, evaluated_source, evaluated_length);
                     compiled = JS_ReadObject(
                         runtime->context, cached->data, cached->length,
                         JS_READ_OBJ_BYTECODE);
+                    if (!js_rt_source_store_end_restore(
+                            runtime, restore_source, evaluated_source)
+                        && !JS_IsException(compiled)) {
+                        JS_FreeValue(runtime->context, compiled);
+                        compiled = JS_ThrowOutOfMemory(runtime->context);
+                    }
                     runtime->result.external_script_bytecode_restore_us +=
                         (js_rt_monotonic_time_ns() - restore_started_ns)
                         / 1000u;
@@ -2117,8 +2179,17 @@ static bool script_runtime_evaluate_external_typed_at(
                 browser_shared_body_release(cached);
             } else if (keyed) {
                 bool disk_hit = false;
+                uint32_t restore_source = js_rt_source_store_begin_restore(
+                    runtime, evaluated_source, evaluated_length);
                 compiled = classic_bytecode_restore(
                     runtime, &key, name, &cache_admitted, &disk_hit);
+                if (!js_rt_source_store_end_restore(
+                        runtime, restore_source, evaluated_source)
+                    && !JS_IsUndefined(compiled)) {
+                    /* compiled from source below instead */
+                    JS_FreeValue(runtime->context, compiled);
+                    compiled = JS_UNDEFINED;
+                }
                 restored = !JS_IsUndefined(compiled);
 #ifndef TILEFINCH_NO_TRACE
                 if (disk_hit) census_lookup = "hit-disk";
@@ -2151,9 +2222,28 @@ static bool script_runtime_evaluate_external_typed_at(
                 }
             }
             if (evaluated) {
+                /* Compiled or restored, the run and its microtask
+                   checkpoint read none of the source (QuickJS, or for a
+                   script of 8 KiB or more the realm's function-source
+                   store, filled before this point, keeps its own copy of
+                   what lazy functions and toString need):
+                   meanwhile the realm may take the whole body back if it
+                   runs short. Only the innermost run's; an outer one's is
+                   restored after. */
+                outer_running = runtime->running_source;
+                running_armed = true;
+                runtime->running_source = (ScriptRunningSource) {
+                    .release = source == NULL ? NULL : release_source,
+                    .opaque = release_opaque,
+                    .length = source_length
+                };
                 evaluated = js_rt_evaluate_compiled_source(
                     runtime->context, compiled, name, evaluated_length,
                     &runtime->result);
+                if (runtime->running_source.released) {
+                    source = NULL;
+                    evaluated_source = NULL;
+                }
             }
         } else if (module) {
             bool previous_no_store = runtime->module_root_no_store;
@@ -2194,6 +2284,13 @@ static bool script_runtime_evaluate_external_typed_at(
      */
     if (evaluated && dispatch_completion) {
         evaluated = js_rt_runtime_refresh(runtime);
+    }
+    if (running_armed) {
+        if (runtime->running_source.released) {
+            runtime->source_released = true;
+            source = NULL;
+        }
+        runtime->running_source = outer_running;
     }
     budget_free(runtime->budget, instrumented);
     budget_free(runtime->budget, decoded);

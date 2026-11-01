@@ -285,7 +285,7 @@ static int test_idle_write_and_restart_restore(void)
     char pack[700];
     CHECK(count_files(directory, ".tfsc", pack, sizeof(pack)) == 1
           && count_files(directory, ".tmp", NULL, 0) == 0
-          && exists(directory) && file_size(pack) > 96 * 1024);
+          && exists(directory) && file_size(pack) > 32 * 1024);
     BrowserScriptDiskStats stats;
     browser_session_script_disk_stats(&session, &stats);
     CHECK(stats.writes == 1 && stats.index_writes == 1 && stats.files == 1

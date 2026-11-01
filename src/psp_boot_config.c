@@ -107,12 +107,15 @@ bool psp_boot_config_automated(const PspBootConfig *config)
         || config->validation_raster_fixture_auto != 0
         || config->validation_power_test_auto != 0
         || config->validation_ge_present_probe != 0
-        || config->validation_webgl_ge_probe != 0
         || config->validation_js_bench != 0
         || config->js_bench_dir[0] != '\0'
         || config->js_bench_only[0] != '\0'
         || config->validation_csc_order_probe != 0
         || config->validation_latch_probe != 0
+        || config->validation_swdec_audio_scan != 0
+        || config->validation_swdec_reference != 0
+        || config->validation_playback_ab != 0
+        || config->validation_swdec_present != 0
         || config->validation_media_range_probe != 0
         || config->validation_update_auto != 0
         || config->validation_update_url[0] != '\0'
@@ -158,12 +161,15 @@ void psp_boot_config_disable_automation(PspBootConfig *config)
     config->validation_raster_fixture_auto = 0;
     config->validation_power_test_auto = 0;
     config->validation_ge_present_probe = 0;
-    config->validation_webgl_ge_probe = 0;
     config->validation_js_bench = 0;
     config->js_bench_dir[0] = '\0';
     config->js_bench_only[0] = '\0';
     config->validation_csc_order_probe = 0;
     config->validation_latch_probe = 0;
+    config->validation_swdec_audio_scan = 0;
+    config->validation_swdec_reference = 0;
+    config->validation_playback_ab = 0;
+    config->validation_swdec_present = 0;
     config->validation_media_range_probe = 0;
     config->validation_update_auto = 0;
     config->validation_update_url[0] = '\0';
@@ -320,8 +326,6 @@ static bool psp_boot_config_load_one(
             loaded.validation_raster_fixture_auto = atol(value);
         } else if (strcmp(line, "validation_ge_present_probe") == 0) {
             loaded.validation_ge_present_probe = atol(value);
-        } else if (strcmp(line, "validation_webgl_ge_probe") == 0) {
-            loaded.validation_webgl_ge_probe = atol(value);
         } else if (strcmp(line, "validation_js_bench") == 0) {
             loaded.validation_js_bench = atol(value);
         } else if (strcmp(line, "js_bench_dir") == 0) {
@@ -334,6 +338,14 @@ static bool psp_boot_config_load_one(
             loaded.validation_csc_order_probe = atol(value);
         } else if (strcmp(line, "validation_latch_probe") == 0) {
             loaded.validation_latch_probe = atol(value);
+        } else if (strcmp(line, "validation_swdec_audio_scan") == 0) {
+            loaded.validation_swdec_audio_scan = atol(value);
+        } else if (strcmp(line, "validation_swdec_reference") == 0) {
+            loaded.validation_swdec_reference = atol(value);
+        } else if (strcmp(line, "validation_playback_ab") == 0) {
+            loaded.validation_playback_ab = atol(value);
+        } else if (strcmp(line, "validation_swdec_present") == 0) {
+            loaded.validation_swdec_present = atol(value);
         } else if (strcmp(line, "validation_media_range_probe") == 0) {
             loaded.validation_media_range_probe = atol(value);
         } else if (strcmp(line, "validation_update_auto") == 0) {
@@ -672,10 +684,6 @@ bool psp_boot_config_validate(
             || config->validation_ge_present_probe == 1,
         "validation_ge_present_probe");
     REQUIRE_CONFIG(
-        config->validation_webgl_ge_probe == 0
-            || config->validation_webgl_ge_probe == 1,
-        "validation_webgl_ge_probe");
-    REQUIRE_CONFIG(
         config->validation_js_bench >= 0 && config->validation_js_bench <= 64,
         "validation_js_bench");
     REQUIRE_CONFIG(
@@ -686,6 +694,22 @@ bool psp_boot_config_validate(
         config->validation_latch_probe == 0
             || config->validation_latch_probe == 1,
         "validation_latch_probe");
+    REQUIRE_CONFIG(
+        config->validation_swdec_audio_scan == 0
+            || config->validation_swdec_audio_scan == 1,
+        "validation_swdec_audio_scan");
+    REQUIRE_CONFIG(
+        config->validation_swdec_reference >= 0
+            && config->validation_swdec_reference <= 2047,
+        "validation_swdec_reference");
+    REQUIRE_CONFIG(
+        config->validation_playback_ab >= 0
+            && config->validation_playback_ab <= 31,
+        "validation_playback_ab");
+    REQUIRE_CONFIG(
+        config->validation_swdec_present >= 0
+            && config->validation_swdec_present <= 3,
+        "validation_swdec_present");
     REQUIRE_CONFIG(
         config->validation_media_range_probe == 0
             || config->validation_media_range_probe == 1,

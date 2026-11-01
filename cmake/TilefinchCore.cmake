@@ -13,6 +13,8 @@ set(TILEFINCH_CORE_SOURCES
     src/content_security_policy.c
     src/controller.c
     src/media_discovery.c
+    src/media_candidates.c
+    src/media_failure_message.c
     src/json_scan.c
     src/linked_video_preview.c
     src/danzeff_input.c
@@ -46,6 +48,8 @@ set(TILEFINCH_CORE_SOURCES
     src/js_wasm_bridge.c
     src/js_fetch_cors.c
     src/js_lazy_webpack.c
+    src/script_text_lz.c
+    src/js_source_store.c
     src/js_module_loader.c
     src/js_runtime.c
     src/layout.c
@@ -55,6 +59,7 @@ set(TILEFINCH_CORE_SOURCES
     src/swdec/swdec_ts.c
     src/media_source.c
     src/media_http.c
+    src/media_worker_request.c
     src/layout_block.c
     src/layout_block_decoration.c
     src/layout_block_flexrow.c

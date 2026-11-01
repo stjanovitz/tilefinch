@@ -31,6 +31,7 @@ extern void psp_transport_probe_tls_sessions(char *output, size_t size)
 #define FETCH_BACKGROUND_METHOD_CAPACITY 16u
 #define FETCH_BACKGROUND_FETCH_TOKEN_CAPACITY 64u
 
+#include "background_chunk.h"
 #include "background_slot_policy.h"
 
 bool fetch_background_transport_stream_shape_supported(
@@ -313,6 +314,8 @@ typedef struct {
     size_t maximum_bytes;
     size_t stream_chunk_target;
     size_t length;
+    /* A streaming chunk's first byte in its buffer (background_chunk.h). */
+    size_t chunk_offset;
     long timeout_ms;
     long connect_timeout_ms;
     uint64_t started_us;
@@ -858,11 +861,14 @@ static size_t fetch_background_receive_body(
     }
     unsigned char *buffer = fetch_background_slot_buffer(slot);
     if (buffer == NULL) return 0;
+    unsigned char *append = fetch_background_chunk_reserve(
+        buffer, buffer_capacity, &slot->chunk_offset, slot->length, length);
+    if (append == NULL) return 0;
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     if (slot->total_length == 0 && length != 0)
         fetch_background_timeline(slot, "first-body", 0);
 #endif
-    memcpy(buffer + slot->length, data, length);
+    memcpy(append, data, length);
     slot->length += length;
     slot->total_length += length;
     atomic_store_explicit(
@@ -1443,6 +1449,7 @@ static bool fetch_background_follow_redirect(FetchBackgroundSlot *slot)
     }
     slot->redirects++;
     slot->length = 0;
+    slot->chunk_offset = 0;
     slot->total_length = 0;
     atomic_store_explicit(
         &slot->received_body_bytes, 0u, memory_order_release);
@@ -1763,6 +1770,7 @@ static void fetch_background_start_queued(void)
                 memory_order_acq_rel, memory_order_acquire)) continue;
         slot->buffer_index = buffer;
         slot->length = 0;
+        slot->chunk_offset = 0;
         slot->total_length = 0;
         slot->transfer_done = false;
         slot->curl_paused = false;
@@ -1858,6 +1866,7 @@ static void fetch_background_retire_cancelled(void)
                 continue;
             if (claimed_ready) {
                 slot->length = 0;
+                slot->chunk_offset = 0;
                 atomic_store_explicit(
                     &slot->chunk_bytes, 0u, memory_order_release);
                 atomic_store_explicit(
@@ -1867,6 +1876,7 @@ static void fetch_background_retire_cancelled(void)
         }
         fetch_background_slot_release_curl(slot);
         slot->length = 0;
+        slot->chunk_offset = 0;
         slot->transfer_done = true;
         atomic_store_explicit(
             &slot->chunk_bytes, 0u, memory_order_release);
@@ -2877,11 +2887,15 @@ static int fetch_background_worker_main(SceSize args, void *argp)
 
 bool fetch_background_transport_available(void)
 {
-    /* The worker transport neither records nor replays an HTTP trace. While
-       one is active every user falls back to the traced browser-thread path
-       (the scheduler, page media) or declines optional work (the resolver,
-       HLS, subtitles, preconnect), so a journey never reaches the live
-       network and a capture holds every request its replay will make. */
+    /* A response-keyed replay answers worker requests from its records
+       (trace_media_lane.inc). */
+    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_active(), true);
+    /* The worker transport itself neither records nor replays an HTTP
+       trace. While one is active without the replay lane every user falls
+       back to the traced browser-thread path (the scheduler, page media) or
+       declines optional work (the resolver, HLS, subtitles, preconnect), so a
+       journey never reaches the live network and a capture holds every
+       request its replay will make. */
     return !fetch_trace_active();
 }
 
@@ -2921,6 +2935,8 @@ void fetch_background_transport_cooperate(uint64_t now_us)
 
 bool fetch_background_transport_initialize(Budget *budget)
 {
+    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_active(),
+        fetch_replay_lane_initialize());
     if (fetch_background.initialized)
         return fetch_background.budget == budget;
     if (budget == NULL) return false;
@@ -3084,6 +3100,7 @@ fail:
 static bool fetch_background_preconnect_begin(
     Budget *budget, const char *origin, long timeout_ms)
 {
+    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_active(), false);
     if (origin == NULL || origin[0] == '\0' || timeout_ms <= 0
         || strlen(origin) >= sizeof(fetch_background.preconnect.origin)
         || atomic_load_explicit(
@@ -3170,6 +3187,10 @@ static uint64_t fetch_background_transport_enqueue_stream_internal(
     size_t publication_bytes, bool foreground_media,
     FetchBackgroundEnqueueStatus *status)
 {
+    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_active(),
+        fetch_replay_lane_enqueue(url, request, maximum_bytes, timeout_ms,
+                                  true, single_hop, publication_bytes,
+                                  status));
     if (status != NULL) *status = FETCH_BACKGROUND_ENQUEUE_UNAVAILABLE;
     if (!fetch_background.initialized) return 0;
     if (atomic_load_explicit(
@@ -3315,6 +3336,7 @@ static uint64_t fetch_background_transport_enqueue_stream_internal(
         slot->header_status = 0;
         slot->response_headers_complete = false;
         slot->length = 0;
+        slot->chunk_offset = 0;
         slot->total_length = 0;
         slot->location[0] = '\0';
         slot->content_range[0] = '\0';
@@ -3407,10 +3429,21 @@ uint64_t fetch_background_transport_enqueue_hop_stream(
         FETCH_BACKGROUND_STREAM_CHUNK_TARGET, false, NULL);
 }
 
+uint64_t fetch_background_transport_enqueue_media_hop_stream_sized_diagnosed(
+    const char *url, const FetchRequest *request,
+    size_t maximum_bytes, long timeout_ms, size_t publication_bytes,
+    FetchBackgroundEnqueueStatus *status)
+{
+    return fetch_background_transport_enqueue_stream_internal(
+        url, request, maximum_bytes, timeout_ms, true,
+        publication_bytes, true, status);
+}
+
 bool fetch_background_transport_hop_supported(
     const char *url, const FetchRequest *request,
     size_t maximum_bytes, long timeout_ms)
 {
+    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_active(), true);
     return fetch_background.initialized
         && fetch_background_stream_request_supported(
                url, request, maximum_bytes, timeout_ms, true);
@@ -3422,6 +3455,9 @@ static uint64_t fetch_background_transport_enqueue_fixed_internal(
     bool foreground_media,
     FetchBackgroundEnqueueStatus *status)
 {
+    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_active(),
+        fetch_replay_lane_enqueue(url, request, maximum_bytes, timeout_ms,
+                                  false, false, 0, status));
     if (status != NULL) *status = FETCH_BACKGROUND_ENQUEUE_UNAVAILABLE;
     if (!fetch_background.initialized) return 0;
     if (atomic_load_explicit(
@@ -3519,6 +3555,7 @@ static uint64_t fetch_background_transport_enqueue_fixed_internal(
         slot->tls12_retry_attempted = false;
         slot->header_status = 0;
         slot->length = 0;
+        slot->chunk_offset = 0;
         slot->total_length = 0;
         memcpy(slot->initial_url, url, url_length + 1u);
         memcpy(slot->url, url, url_length + 1u);
@@ -3588,6 +3625,8 @@ uint64_t fetch_background_transport_enqueue_media_diagnosed(
 bool fetch_background_transport_progress(
     uint64_t request_id, FetchBackgroundProgress *progress)
 {
+    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_owns(request_id),
+        fetch_replay_lane_progress(request_id, progress));
     unsigned index = fetch_background_id_slot(request_id);
     if (!fetch_background.initialized || progress == NULL
         || index >= FETCH_BACKGROUND_REQUEST_LIMIT) return false;
@@ -3861,6 +3900,8 @@ static void fetch_background_copy_media_response(
 bool fetch_background_transport_take_headers(
     uint64_t request_id, FetchResult *metadata)
 {
+    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_owns(request_id),
+        fetch_replay_lane_take_headers(request_id, metadata));
     unsigned index = fetch_background_id_slot(request_id);
     if (!fetch_background.initialized || metadata == NULL
         || index >= FETCH_BACKGROUND_REQUEST_LIMIT) return false;
@@ -3879,6 +3920,8 @@ bool fetch_background_transport_take_headers(
 bool fetch_background_transport_take_media_headers(
     uint64_t request_id, FetchBackgroundMediaResponse *metadata)
 {
+    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_owns(request_id),
+        fetch_replay_lane_take_media_headers(request_id, metadata));
     unsigned index = fetch_background_id_slot(request_id);
     if (!fetch_background.initialized || metadata == NULL
         || index >= FETCH_BACKGROUND_REQUEST_LIMIT) return false;
@@ -3898,6 +3941,9 @@ bool fetch_background_transport_take_chunk(
     uint64_t request_id, unsigned char *destination,
     size_t capacity, size_t *length)
 {
+    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_owns(request_id),
+        fetch_replay_lane_take_chunk(request_id, destination, capacity,
+                                     length));
     unsigned index = fetch_background_id_slot(request_id);
     if (!fetch_background.initialized || destination == NULL
         || length == NULL || index >= FETCH_BACKGROUND_REQUEST_LIMIT) {
@@ -3920,12 +3966,15 @@ bool fetch_background_transport_take_chunk(
             memory_order_release);
         return false;
     }
+    /* Take from the chunk's front and advance past it: the rest stays
+       where it is (background_chunk.h). */
     size_t taken = available < capacity ? available : capacity;
-    memcpy(destination, source, taken);
+    memcpy(destination, source + slot->chunk_offset, taken);
     size_t remaining = available - taken;
     *length = taken;
+    slot->chunk_offset = fetch_background_chunk_advance(
+        slot->chunk_offset, taken, remaining);
     if (remaining != 0) {
-        memmove(source, source + taken, remaining);
         slot->length = remaining;
         atomic_store_explicit(
             &slot->chunk_bytes, (unsigned) remaining,
@@ -3935,6 +3984,7 @@ bool fetch_background_transport_take_chunk(
             memory_order_release);
     } else {
         slot->length = 0;
+        slot->chunk_offset = 0;
         atomic_store_explicit(
             &slot->chunk_bytes, 0u, memory_order_release);
         atomic_store_explicit(
@@ -3964,6 +4014,9 @@ bool fetch_background_transport_take_fetch_result_consumed(
     uint64_t request_id, Budget *budget, FetchResult *result,
     size_t consumed_body_bytes)
 {
+    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_owns(request_id),
+        fetch_replay_lane_take_fetch_result(request_id, budget, result,
+                                            consumed_body_bytes));
     unsigned index = fetch_background_id_slot(request_id);
     if (!fetch_background.initialized || budget == NULL || result == NULL
         || index >= FETCH_BACKGROUND_REQUEST_LIMIT) return false;
@@ -4053,6 +4106,9 @@ bool fetch_background_transport_take_media_result_consumed(
     uint64_t request_id, FetchBackgroundMediaResponse *result,
     size_t consumed_body_bytes)
 {
+    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_owns(request_id),
+        fetch_replay_lane_take_media_result(request_id, result,
+                                            consumed_body_bytes));
     unsigned index = fetch_background_id_slot(request_id);
     if (!fetch_background.initialized || result == NULL
         || index >= FETCH_BACKGROUND_REQUEST_LIMIT) return false;
@@ -4087,6 +4143,9 @@ bool fetch_background_transport_take_media(
     uint64_t request_id, unsigned char *destination,
     size_t capacity, FetchBackgroundMediaResponse *result)
 {
+    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_owns(request_id),
+        fetch_replay_lane_take_media(request_id, destination, capacity,
+                                     result));
     unsigned index = fetch_background_id_slot(request_id);
     if (!fetch_background.initialized || result == NULL
         || index >= FETCH_BACKGROUND_REQUEST_LIMIT) return false;
@@ -4132,6 +4191,8 @@ bool fetch_background_transport_take(
     uint64_t request_id, unsigned char *destination,
     size_t capacity, FetchBackgroundResult *result)
 {
+    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_owns(request_id),
+        fetch_replay_lane_take(request_id, destination, capacity, result));
     unsigned index = fetch_background_id_slot(request_id);
     if (!fetch_background.initialized || result == NULL
         || index >= FETCH_BACKGROUND_REQUEST_LIMIT) return false;
@@ -4175,6 +4236,8 @@ bool fetch_background_transport_take(
 bool fetch_background_transport_cancel(
     uint64_t request_id, const char *reason)
 {
+    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_owns(request_id),
+        fetch_replay_lane_cancel(request_id));
     (void) reason;
     unsigned index = fetch_background_id_slot(request_id);
     if (!fetch_background.initialized
@@ -4192,6 +4255,7 @@ bool fetch_background_transport_cancel(
                 FETCH_BACKGROUND_CHUNK_TAKING,
                 memory_order_acq_rel, memory_order_acquire)) {
             slot->length = 0;
+            slot->chunk_offset = 0;
             atomic_store_explicit(
                 &slot->chunk_bytes, 0u, memory_order_release);
             atomic_store_explicit(
@@ -4250,6 +4314,7 @@ uint64_t fetch_background_websocket_open(
     Budget *budget, const char *url, const FetchRequest *request,
     const char *protocols, long timeout_ms)
 {
+    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_active(), 0);
     char admitted_url[TILEFINCH_URL_SERIALIZED_LIMIT];
     bool protect_private_network = false;
     if (budget == NULL || url == NULL || request == NULL || timeout_ms <= 0
@@ -4575,6 +4640,8 @@ static bool fetch_background_all_free(void)
 
 size_t fetch_background_transport_active_operations(void)
 {
+    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_active(),
+        fetch_replay_lane_operations());
     if (!fetch_background.initialized) return 0;
     fetch_background_websocket_reap_closed();
     size_t active = atomic_load_explicit(
@@ -4596,6 +4663,9 @@ size_t fetch_background_transport_active_operations(void)
 
 void fetch_background_transport_request_quiesce(void)
 {
+#ifndef TILEFINCH_NO_FETCH_TRACE
+    fetch_replay_lane_cancel_all();
+#endif
     if (!fetch_background.initialized) return;
     fetch_background_preconnect_retire();
     for (unsigned i = 0; i < FETCH_BACKGROUND_REQUEST_LIMIT; i++) {
@@ -4620,6 +4690,8 @@ void fetch_background_transport_request_quiesce(void)
 
 bool fetch_background_transport_is_quiesced(void)
 {
+    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_active(),
+                            fetch_replay_lane_operations() == 0);
     return !fetch_background.initialized || fetch_background_all_free();
 }
 
@@ -4647,6 +4719,9 @@ void fetch_background_transport_set_media_priority(bool active)
 
 bool fetch_background_transport_quiesce(unsigned timeout_ms)
 {
+#ifndef TILEFINCH_NO_FETCH_TRACE
+    fetch_replay_lane_cancel_all();
+#endif
     if (!fetch_background.initialized) return true;
     fetch_background_transport_request_quiesce();
     uint64_t started_us = fetch_background_now_us();
@@ -4661,6 +4736,9 @@ bool fetch_background_transport_quiesce(unsigned timeout_ms)
 
 bool fetch_background_transport_shutdown(unsigned timeout_ms)
 {
+#ifndef TILEFINCH_NO_FETCH_TRACE
+    fetch_replay_lane_cancel_all();
+#endif
     fetch_cancel_ca_bundle_preparation();
     if (!fetch_background.initialized) return true;
     if (!fetch_background_transport_quiesce(timeout_ms)) return false;
@@ -4742,10 +4820,16 @@ bool fetch_background_transport_shutdown(unsigned timeout_ms)
 
 #else
 
-bool fetch_background_transport_available(void) { return false; }
+bool fetch_background_transport_available(void)
+{
+    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_active(), true);
+    return false;
+}
 void fetch_background_transport_cooperate(uint64_t now_us) { (void) now_us; }
 bool fetch_background_transport_initialize(Budget *budget)
 {
+    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_active(),
+        fetch_replay_lane_initialize());
     (void) budget;
     return false;
 }
@@ -4753,6 +4837,9 @@ bool fetch_background_transport_take_fetch_result_consumed(
     uint64_t request_id, Budget *budget, FetchResult *result,
     size_t consumed_body_bytes)
 {
+    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_owns(request_id),
+        fetch_replay_lane_take_fetch_result(request_id, budget, result,
+                                            consumed_body_bytes));
     (void) request_id; (void) budget; (void) result;
     (void) consumed_body_bytes;
     return false;
@@ -4761,6 +4848,9 @@ bool fetch_background_transport_take_media_result_consumed(
     uint64_t request_id, FetchBackgroundMediaResponse *result,
     size_t consumed_body_bytes)
 {
+    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_owns(request_id),
+        fetch_replay_lane_take_media_result(request_id, result,
+                                            consumed_body_bytes));
     (void) request_id; (void) result; (void) consumed_body_bytes;
     return false;
 }
@@ -4768,6 +4858,9 @@ bool fetch_background_transport_take_media(
     uint64_t request_id, unsigned char *destination,
     size_t capacity, FetchBackgroundMediaResponse *result)
 {
+    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_owns(request_id),
+        fetch_replay_lane_take_media(request_id, destination, capacity,
+                                     result));
     (void) request_id; (void) destination; (void) capacity; (void) result;
     return false;
 }
@@ -4775,6 +4868,9 @@ uint64_t fetch_background_transport_enqueue(
     const char *url, const FetchRequest *request,
     size_t maximum_bytes, long timeout_ms)
 {
+    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_active(),
+        fetch_replay_lane_enqueue(url, request, maximum_bytes, timeout_ms,
+                                  false, false, 0, NULL));
     (void) url; (void) request; (void) maximum_bytes; (void) timeout_ms;
     return 0;
 }
@@ -4782,6 +4878,9 @@ uint64_t fetch_background_transport_enqueue_stream(
     const char *url, const FetchRequest *request,
     size_t maximum_bytes, long timeout_ms)
 {
+    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_active(),
+        fetch_replay_lane_enqueue(url, request, maximum_bytes, timeout_ms,
+                                  true, false, 0, NULL));
     (void) url; (void) request; (void) maximum_bytes; (void) timeout_ms;
     return 0;
 }
@@ -4790,6 +4889,9 @@ uint64_t fetch_background_transport_enqueue_stream_diagnosed(
     size_t maximum_bytes, long timeout_ms,
     FetchBackgroundEnqueueStatus *status)
 {
+    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_active(),
+        fetch_replay_lane_enqueue(url, request, maximum_bytes, timeout_ms,
+                                  true, false, 0, status));
     (void) url; (void) request; (void) maximum_bytes; (void) timeout_ms;
     if (status != NULL) *status = FETCH_BACKGROUND_ENQUEUE_UNAVAILABLE;
     return 0;
@@ -4799,6 +4901,9 @@ uint64_t fetch_background_transport_enqueue_media_stream_diagnosed(
     size_t maximum_bytes, long timeout_ms,
     FetchBackgroundEnqueueStatus *status)
 {
+    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_active(),
+        fetch_replay_lane_enqueue(url, request, maximum_bytes, timeout_ms,
+                                  true, false, 0, status));
     (void) url; (void) request; (void) maximum_bytes; (void) timeout_ms;
     if (status != NULL) *status = FETCH_BACKGROUND_ENQUEUE_UNAVAILABLE;
     return 0;
@@ -4807,6 +4912,9 @@ uint64_t fetch_background_transport_enqueue_stream_sized(
     const char *url, const FetchRequest *request,
     size_t maximum_bytes, long timeout_ms, size_t publication_bytes)
 {
+    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_active(),
+        fetch_replay_lane_enqueue(url, request, maximum_bytes, timeout_ms,
+                                  true, false, publication_bytes, NULL));
     (void) url; (void) request; (void) maximum_bytes; (void) timeout_ms;
     (void) publication_bytes;
     return 0;
@@ -4816,6 +4924,9 @@ uint64_t fetch_background_transport_enqueue_media_stream_sized_diagnosed(
     size_t maximum_bytes, long timeout_ms, size_t publication_bytes,
     FetchBackgroundEnqueueStatus *status)
 {
+    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_active(),
+        fetch_replay_lane_enqueue(url, request, maximum_bytes, timeout_ms,
+                                  true, false, publication_bytes, status));
     (void) url; (void) request; (void) maximum_bytes; (void) timeout_ms;
     (void) publication_bytes;
     if (status != NULL) *status = FETCH_BACKGROUND_ENQUEUE_UNAVAILABLE;
@@ -4826,6 +4937,9 @@ uint64_t fetch_background_transport_enqueue_media_diagnosed(
     size_t maximum_bytes, long timeout_ms,
     FetchBackgroundEnqueueStatus *status)
 {
+    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_active(),
+        fetch_replay_lane_enqueue(url, request, maximum_bytes, timeout_ms,
+                                  false, false, 0, status));
     (void) url; (void) request; (void) maximum_bytes; (void) timeout_ms;
     if (status != NULL) *status = FETCH_BACKGROUND_ENQUEUE_UNAVAILABLE;
     return 0;
@@ -4834,19 +4948,38 @@ uint64_t fetch_background_transport_enqueue_hop_stream(
     const char *url, const FetchRequest *request,
     size_t maximum_bytes, long timeout_ms)
 {
+    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_active(),
+        fetch_replay_lane_enqueue(url, request, maximum_bytes, timeout_ms,
+                                  true, true, 0, NULL));
     (void) url; (void) request; (void) maximum_bytes; (void) timeout_ms;
+    return 0;
+}
+uint64_t fetch_background_transport_enqueue_media_hop_stream_sized_diagnosed(
+    const char *url, const FetchRequest *request,
+    size_t maximum_bytes, long timeout_ms, size_t publication_bytes,
+    FetchBackgroundEnqueueStatus *status)
+{
+    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_active(),
+        fetch_replay_lane_enqueue(url, request, maximum_bytes, timeout_ms,
+                                  true, true, publication_bytes, status));
+    (void) url; (void) request; (void) maximum_bytes; (void) timeout_ms;
+    (void) publication_bytes;
+    if (status != NULL) *status = FETCH_BACKGROUND_ENQUEUE_UNAVAILABLE;
     return 0;
 }
 bool fetch_background_transport_hop_supported(
     const char *url, const FetchRequest *request,
     size_t maximum_bytes, long timeout_ms)
 {
+    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_active(), true);
     (void) url; (void) request; (void) maximum_bytes; (void) timeout_ms;
     return false;
 }
 bool fetch_background_transport_progress(
     uint64_t request_id, FetchBackgroundProgress *progress)
 {
+    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_owns(request_id),
+        fetch_replay_lane_progress(request_id, progress));
     (void) request_id; (void) progress;
     return false;
 }
@@ -4859,12 +4992,16 @@ bool fetch_background_transport_metrics(
 bool fetch_background_transport_take_headers(
     uint64_t request_id, FetchResult *metadata)
 {
+    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_owns(request_id),
+        fetch_replay_lane_take_headers(request_id, metadata));
     (void) request_id; (void) metadata;
     return false;
 }
 bool fetch_background_transport_take_media_headers(
     uint64_t request_id, FetchBackgroundMediaResponse *metadata)
 {
+    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_owns(request_id),
+        fetch_replay_lane_take_media_headers(request_id, metadata));
     (void) request_id; (void) metadata;
     return false;
 }
@@ -4872,12 +5009,19 @@ bool fetch_background_transport_take_chunk(
     uint64_t request_id, unsigned char *destination,
     size_t capacity, size_t *length)
 {
+    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_owns(request_id),
+        fetch_replay_lane_take_chunk(request_id, destination, capacity,
+                                     length));
     (void) request_id; (void) destination; (void) capacity; (void) length;
     return false;
 }
 bool fetch_background_transport_take_fetch_result(
     uint64_t request_id, Budget *budget, FetchResult *result)
 {
+    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_owns(request_id),
+        fetch_replay_lane_take_fetch_result(
+            request_id, budget, result,
+            result == NULL ? 0 : result->length));
     (void) request_id; (void) budget; (void) result;
     return false;
 }
@@ -4885,12 +5029,16 @@ bool fetch_background_transport_take(
     uint64_t request_id, unsigned char *destination,
     size_t capacity, FetchBackgroundResult *result)
 {
+    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_owns(request_id),
+        fetch_replay_lane_take(request_id, destination, capacity, result));
     (void) request_id; (void) destination; (void) capacity; (void) result;
     return false;
 }
 bool fetch_background_transport_cancel(
     uint64_t request_id, const char *reason)
 {
+    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_owns(request_id),
+        fetch_replay_lane_cancel(request_id));
     (void) request_id; (void) reason;
     return false;
 }
@@ -4898,9 +5046,24 @@ void fetch_background_transport_wait(unsigned milliseconds)
 {
     (void) milliseconds;
 }
-size_t fetch_background_transport_active_operations(void) { return 0; }
-void fetch_background_transport_request_quiesce(void) {}
-bool fetch_background_transport_is_quiesced(void) { return true; }
+size_t fetch_background_transport_active_operations(void)
+{
+    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_active(),
+        fetch_replay_lane_operations());
+    return 0;
+}
+void fetch_background_transport_request_quiesce(void)
+{
+#ifndef TILEFINCH_NO_FETCH_TRACE
+    fetch_replay_lane_cancel_all();
+#endif
+}
+bool fetch_background_transport_is_quiesced(void)
+{
+    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_active(),
+                            fetch_replay_lane_operations() == 0);
+    return true;
+}
 bool fetch_background_transport_take_network_regression_hint(void)
 {
     return false;
@@ -4912,11 +5075,17 @@ void fetch_background_transport_set_media_priority(bool active)
 }
 bool fetch_background_transport_quiesce(unsigned timeout_ms)
 {
+#ifndef TILEFINCH_NO_FETCH_TRACE
+    fetch_replay_lane_cancel_all();
+#endif
     (void) timeout_ms;
     return true;
 }
 bool fetch_background_transport_shutdown(unsigned timeout_ms)
 {
+#ifndef TILEFINCH_NO_FETCH_TRACE
+    fetch_replay_lane_cancel_all();
+#endif
     (void) timeout_ms;
     return true;
 }

@@ -328,6 +328,23 @@ size_t navigation_cancel_network_work(
     return cancelled;
 }
 
+size_t navigation_hold_network_work(
+    NavigationSession *session, const char *reason)
+{
+    if (session == NULL) return 0;
+    /* Requeue before cancelling: the cancel would settle those script
+       requests as load failures. */
+    size_t stopped = script_runtime_requeue_dynamic_scripts(
+        session->page.runtime);
+    for (size_t i = 0; i < session->page.frame_count; i++) {
+        stopped += script_runtime_requeue_dynamic_scripts(
+            session->page.frames[i].runtime);
+    }
+    stopped += navigation_cancel_network_work(session, reason);
+    fetch_scheduler_domain_set_held(session->page.fetch_domain, true);
+    return stopped;
+}
+
 static void navigation_deferred_images_finish(NavigationSession *session)
 {
     if (session == NULL) return;
@@ -1157,6 +1174,8 @@ NavigationBackgroundWorkOutcome navigation_run_background_resources(
         size_t loaded_before = page->images.stats.loaded;
         uintptr_t image_base = (uintptr_t) page->images.items;
         size_t image_count = page->images.count;
+        ImageLayoutBoxes image_scale;
+        navigation_lend_image_scale(session, &image_scale);
         bool loaded = images_load_external_priority_targets(
             &page->document, &page->stylesheet, &page->images, targets,
             count, session->budget, page->resource_base_url,
@@ -1166,6 +1185,7 @@ NavigationBackgroundWorkOutcome navigation_run_background_resources(
             session->maximum_decoded_image_bytes,
             session->resource_timeout_ms, page->resource_scheduler,
             session->browser_session);
+        navigation_return_image_boxes(session, &image_scale);
         budget_free(session->budget, targets);
         navigation_rebind_appended_images(session, image_base, image_count);
         session->images = &page->images;
@@ -1192,6 +1212,8 @@ NavigationBackgroundWorkOutcome navigation_run_background_resources(
     size_t image_count = images->count;
     session->performance.background_image_batches++;
     navigation_ensure_layout_reuse(session);
+    ImageLayoutBoxes image_boxes;
+    navigation_lend_image_boxes(session, &image_boxes);
     bool loaded = images_load_external_reusing_layout_styles(
         &session->page.document, &session->page.stylesheet, images,
         session->budget, session->page.resource_base_url,
@@ -1202,6 +1224,7 @@ NavigationBackgroundWorkOutcome navigation_run_background_resources(
         session->resource_timeout_ms, session->page.resource_scheduler,
         session->browser_session, session->page.layout_reuse,
         session->fonts, session->viewport.css_width);
+    navigation_return_image_boxes(session, &image_boxes);
     navigation_rebind_appended_images(session, image_base, image_count);
     if (!loaded) {
         session->page.image_continuation_pending = false;

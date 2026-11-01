@@ -511,6 +511,46 @@ static bool test_retained_pipeline_is_dormant_not_idle(void)
     return true;
 }
 
+static bool test_navigation_releases_dormant_pipeline_before_reopen(void)
+{
+    PspMediaMachine machine = psp_media_machine_initial();
+    for (unsigned reopen = 0; reopen < 3; reopen++) {
+        CHECK(open_to_priming(&machine, true, true));
+        CHECK(apply(&machine, (PspMediaEvent) {
+            .type = PSP_MEDIA_EVENT_PRIME_READY
+        }));
+        CHECK(apply(&machine, (PspMediaEvent) {
+            .type = PSP_MEDIA_EVENT_CLOSE,
+            .retain_pipeline = true
+        }));
+        CHECK(machine.state == PSP_MEDIA_SESSION_DORMANT);
+        PspMediaDecision retained = psp_media_machine_transition(
+            &machine, &(PspMediaEvent) {
+                .type = PSP_MEDIA_EVENT_CLOSE,
+                .retain_pipeline = true
+            });
+        CHECK(retained.handled && retained.deliberate_noop);
+        CHECK(retained.next.state == PSP_MEDIA_SESSION_DORMANT);
+        /* Back to the library destroys the retained backend synchronously.
+           Its controller must retire the same owner before the next OPEN. */
+        PspMediaDecision departing = psp_media_machine_transition(
+            &machine, &(PspMediaEvent) {
+                .type = PSP_MEDIA_EVENT_CLOSE,
+                .retain_pipeline = false
+            });
+        CHECK(departing.handled && !departing.deliberate_noop);
+        CHECK(departing.command == PSP_MEDIA_COMMAND_STOP_ADMISSION);
+        machine = departing.next;
+        CHECK(machine.state == PSP_MEDIA_SESSION_QUIESCING);
+        CHECK(machine.quiesce_target == PSP_MEDIA_QUIESCE_TARGET_IDLE);
+        CHECK(quiesce_successfully(&machine));
+        CHECK(machine.state == PSP_MEDIA_SESSION_IDLE);
+        CHECK(machine.pipeline == PSP_MEDIA_PIPELINE_NONE);
+        CHECK(!machine.has_plan);
+    }
+    return true;
+}
+
 static PspMediaMachine valid_machine_for_state(PspMediaSessionState state)
 {
     PspMediaMachine machine = psp_media_machine_initial();
@@ -773,6 +813,7 @@ int main(void)
         || !test_backend_quarantine_finishes_failure()
         || !test_open_escape_and_suspend_close()
         || !test_retained_pipeline_is_dormant_not_idle()
+        || !test_navigation_releases_dormant_pipeline_before_reopen()
         || !test_event_state_grid_is_total()
         || !test_resource_invariants_reject_impossible_states()
         || !test_service_tokens_are_monotonic_and_reject_stale_results()

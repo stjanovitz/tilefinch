@@ -18,6 +18,22 @@ bool tilefinch_swdec_component_path(
             paths, relative, output, output_size);
 }
 
+bool tilefinch_swdec_component_prx_path_for_program(
+    const char *argv0, char *output, size_t output_size)
+{
+    static const char suffix[] = "/components/"
+        TILEFINCH_SWDEC_COMPONENT_DIRECTORY "/tilefinch-swdec.prx";
+    TilefinchInstallPaths paths;
+    if (output == NULL || output_size == 0
+        || !tilefinch_install_paths_derive(argv0, &paths)) return false;
+    size_t root = strlen(paths.install_root);
+    if (root >= output_size || sizeof(suffix) > output_size - root)
+        return false;
+    memcpy(output, paths.install_root, root);
+    memcpy(output + root, suffix, sizeof(suffix));
+    return true;
+}
+
 TilefinchSwdecComponentInfoStatus tilefinch_swdec_component_info_parse(
     const char *bytes, size_t length, uint16_t *abi_version)
 {
@@ -64,4 +80,37 @@ TilefinchSwdecComponentInfoStatus tilefinch_swdec_component_info_read(
     if (!read_ok || trailing != EOF)
         return TILEFINCH_SWDEC_COMPONENT_INFO_INVALID;
     return tilefinch_swdec_component_info_parse(bytes, length, abi_version);
+}
+
+TilefinchSwdecFailure tilefinch_swdec_component_start_failure(
+    int start_result, int module_status, bool api_valid)
+{
+    if (start_result < 0) return TILEFINCH_SWDEC_FAILURE_RUNTIME;
+    if (module_status != 0 || !api_valid)
+        return TILEFINCH_SWDEC_FAILURE_REBUILD;
+    return TILEFINCH_SWDEC_FAILURE_NONE;
+}
+
+void tilefinch_swdec_component_failure_message(
+    TilefinchSwdecFailure failure, int native_error,
+    char *output, size_t output_size)
+{
+    if (output == NULL || output_size == 0) return;
+    switch (failure) {
+    case TILEFINCH_SWDEC_FAILURE_MISSING:
+        snprintf(output, output_size,
+                 "OPTIONAL VIDEO DECODER NOT INSTALLED - SEE README");
+        break;
+    case TILEFINCH_SWDEC_FAILURE_REBUILD:
+        snprintf(output, output_size,
+                 "OPTIONAL VIDEO DECODER NEEDS REBUILD - SEE README");
+        break;
+    case TILEFINCH_SWDEC_FAILURE_RUNTIME:
+    case TILEFINCH_SWDEC_FAILURE_NONE:
+    default:
+        snprintf(output, output_size,
+                 "optional video decoder is unavailable (0x%08x)",
+                 (unsigned) native_error);
+        break;
+    }
 }

@@ -106,6 +106,15 @@ typedef struct {
     uint64_t source_hash;
     uint16_t display_width;
     uint16_t display_height;
+    /* CSS background only (image_note_background_area): the painting area
+       in the page's last layout, zero when unknown, and its
+       background-size. */
+    uint16_t background_area_width;
+    uint16_t background_area_height;
+    uint16_t background_size_width;
+    uint16_t background_size_height;
+    uint8_t background_size_flags;
+    uint8_t background_fit;
     bool is_mask;
     bool is_background;
     PseudoElement pseudo;
@@ -191,6 +200,15 @@ typedef struct {
     size_t priority_target_count;
     uint16_t current_display_width;
     uint16_t current_display_height;
+    /* The element background being discovered: its area in the borrowed
+       layout boxes and its background-size (pending_add_target copies it). */
+    const ImageLayoutBoxes *layout_boxes;
+    uint16_t current_background_area_width;
+    uint16_t current_background_area_height;
+    uint16_t current_background_size_width;
+    uint16_t current_background_size_height;
+    uint8_t current_background_size_flags;
+    uint8_t current_background_fit;
     bool preserve_staged_document_images;
     bool defer_document_images;
     lxb_dom_node_t *const *deferred_nodes;
@@ -1332,7 +1350,8 @@ bool images_adopt_decoded_surface(ImageResources *images, Budget *budget,
         .source_height = height,
         .width = width,
         .height = height,
-        .owns_pixels = true
+        .owns_pixels = true,
+        .adopted_surface = true
     });
     if (!added || images->count == before) return false;
     images->stats.discovered++;
@@ -1427,7 +1446,8 @@ bool images_replace_with_decoded_surface(ImageResources *images,
         .source_height = height,
         .width = width,
         .height = height,
-        .owns_pixels = true
+        .owns_pixels = true,
+        .adopted_surface = true
     };
     images->budget = budget;
     images->stats.decoded_bytes += surface_bytes;
@@ -2270,6 +2290,14 @@ static bool pending_add_target(ImageLoadContext *context,
         .source_hash = source_hash,
         .display_width = context->current_display_width,
         .display_height = context->current_display_height,
+        .background_area_width = is_background && !is_mask
+            ? context->current_background_area_width : 0,
+        .background_area_height = is_background && !is_mask
+            ? context->current_background_area_height : 0,
+        .background_size_width = context->current_background_size_width,
+        .background_size_height = context->current_background_size_height,
+        .background_size_flags = context->current_background_size_flags,
+        .background_fit = context->current_background_fit,
         .is_mask = is_mask,
         .is_background = is_background,
         .pseudo = pseudo
@@ -2320,6 +2348,56 @@ static bool image_layout_decode_target(
     }
     if (width <= 0 || height <= 0
         || width >= source_width || height >= source_height) return false;
+    *target_width = width;
+    *target_height = height;
+    return true;
+}
+
+/* Whether every element waiting for this response paints it as a CSS
+   background (not a mask). */
+static bool image_pending_backgrounds_only(const PendingImageFetch *pending)
+{
+    if (pending == NULL || pending->target_count == 0) return false;
+    for (size_t i = 0; i < pending->target_count; i++) {
+        if (!pending->targets[i].is_background
+            || pending->targets[i].is_mask) return false;
+    }
+    return true;
+}
+
+/* The decode size of a raster painted only as CSS backgrounds whose areas
+   the borrowed layout knows: the largest tile any of them paints, when that
+   is below the source size in both axes (never an enlargement). */
+static bool image_background_decode_target(
+    const ImageLoadContext *context, const PendingImageFetch *pending,
+    int source_width, int source_height, int *target_width,
+    int *target_height)
+{
+    const ImageLayoutBoxes *boxes = context->layout_boxes;
+    if (boxes == NULL || pending == NULL || pending->target_count == 0
+        || source_width <= 0 || source_height <= 0) return false;
+    int width = 0, height = 0;
+    for (size_t i = 0; i < pending->target_count; i++) {
+        const PendingImageTarget *target = &pending->targets[i];
+        int tile_width = 0, tile_height = 0;
+        if (!target->is_background || target->is_mask
+            || target->pseudo != PSEUDO_NONE
+            || target->background_area_width == 0
+            || target->background_area_height == 0
+            || !layout_background_raster_size(
+                   target->background_fit, target->background_size_flags,
+                   target->background_size_width,
+                   target->background_size_height,
+                   target->background_area_width,
+                   target->background_area_height,
+                   boxes->scale_numerator, boxes->scale_denominator,
+                   source_width, source_height, &tile_width, &tile_height))
+            return false;
+        if (tile_width > width) width = tile_width;
+        if (tile_height > height) height = tile_height;
+    }
+    if (width <= 0 || height <= 0 || width >= source_width
+        || height >= source_height) return false;
     *target_width = width;
     *target_height = height;
     return true;
@@ -2775,6 +2853,8 @@ static bool finish_image_fetch(ImageLoadContext *context,
     }
     const unsigned char *encoded = (const unsigned char *) fetched->data;
     bool is_webp = false;
+    bool background_sized = false;
+    bool await_layout = false;
     if (!is_svg) {
         uint64_t probe_checkpoint = budget_checkpoint(context->budget);
         size_t probe_baseline = context->budget->current;
@@ -2893,6 +2973,27 @@ static bool finish_image_fetch(ImageLoadContext *context,
             && image_layout_decode_target(
                 pending, source_width, source_height,
                 &layout_width, &layout_height);
+        /* A CSS background decoded now (every WebP, and any raster an eager
+           walk decodes) takes the tile its element's last layout paints,
+           from its box and background-size, instead of the viewport width:
+           a cover background in a short, wide box needs more source width
+           than the viewport. Rasters left encoded are already decoded at
+           their painted size by paint. */
+        if (!layout_sized && (context->eager_decode_rasters || is_webp)
+            && image_background_decode_target(
+                   context, pending, source_width, source_height,
+                   &layout_width, &layout_height)) {
+            layout_sized = true;
+            background_sized = true;
+        }
+        /* A WebP background whose box no layout knows yet, in a load the
+           page's next layout follows: keep it encoded and let that layout
+           decode it at the size it paints, before it is painted. */
+        await_layout = !layout_sized && is_webp
+            && !context->eager_decode_rasters
+            && context->layout_boxes != NULL
+            && context->layout_boxes->decode_after_layout
+            && image_pending_backgrounds_only(pending);
         if (layout_sized) {
             width = layout_width;
             height = layout_height;
@@ -2936,6 +3037,19 @@ static bool finish_image_fetch(ImageLoadContext *context,
                               .is_background = primary.is_background,
                               .pseudo = primary.pseudo,
                               .owns_pixels = is_svg};
+    if (background_sized) {
+        /* Display retargeting decodes it again at source size if a later
+           layout paints it larger than this tile. */
+        resource.full_width = source_width;
+        resource.full_height = source_height;
+        resource.retarget_flags |= IMAGE_RETARGET_SHRUNK;
+    }
+    if (await_layout) {
+        resource.full_width = width;
+        resource.full_height = height;
+        resource.retarget_flags |=
+            IMAGE_RETARGET_DROPPED | IMAGE_RETARGET_AWAITING_LAYOUT;
+    }
     if (is_svg && !external_use && pixels != NULL
         && decoded <= IMAGE_SVG_DECODED_CACHE_BYTES) {
         /* Rasterizing an SVG is one uninterruptible parse+fill (a 10 KB
@@ -3005,7 +3119,7 @@ static bool finish_image_fetch(ImageLoadContext *context,
            available.  Keeping only the pixels also prevents a visible hero
            from repeatedly attempting an impossible late decode after the
            rest of the page has consumed the budget. */
-        if (context->eager_decode_rasters || is_webp) {
+        if ((context->eager_decode_rasters || is_webp) && !await_layout) {
             unsigned char *decoded_pixels = NULL;
             ImageDecodeStatus decode_status = image_resource_decode_checked(
                 &resource, context->budget, &decoded_pixels);
@@ -4042,6 +4156,35 @@ static bool image_discovery_prefilter_disabled(void)
 #endif
 }
 
+/* The painting area of `node`'s single-layer background in the borrowed
+   layout boxes (its border box: never smaller than the area layout paints)
+   and its background-size, for pending_add_target. The root and body
+   backgrounds paint the whole canvas, not their box, and are left alone. */
+static void image_note_background_area(ImageLoadContext *context,
+                                       const lxb_dom_node_t *node,
+                                       const ComputedStyle *style,
+                                       const StylePaintStack *paint)
+{
+    context->current_background_area_width = 0;
+    context->current_background_area_height = 0;
+    int width = 0, height = 0;
+    if (node->local_name == LXB_TAG_HTML || node->local_name == LXB_TAG_BODY
+        || !layout_image_box_size(context->layout_boxes, node,
+                                  &width, &height)) return;
+    uint8_t fit = style->background_fit;
+    if (paint != NULL && paint->background_count != 0
+        && paint->backgrounds[0].fit != 0)
+        fit = paint->backgrounds[0].fit;
+    context->current_background_area_width =
+        width > UINT16_MAX ? UINT16_MAX : (uint16_t) width;
+    context->current_background_area_height =
+        height > UINT16_MAX ? UINT16_MAX : (uint16_t) height;
+    context->current_background_size_width = style->background_width;
+    context->current_background_size_height = style->background_height;
+    context->current_background_size_flags = style->background_size_flags;
+    context->current_background_fit = fit;
+}
+
 static bool image_process_node(
     ImageLoadContext *context, lxb_dom_node_t *node,
     const ComputedStyle *parent, ComputedStyle *style, bool *traverse)
@@ -4160,11 +4303,15 @@ static bool image_process_node(
                && style->background_image_kind
                   == STYLE_BACKGROUND_IMAGE_URL
                && style->background_image != NULL
-               && style->background_image[0] != '\0'
-               && !load_stylesheet_image_node(
-                      context, node, style->background_image,
-                      strlen(style->background_image), false, true,
-                      PSEUDO_NONE)) return false;
+               && style->background_image[0] != '\0') {
+        image_note_background_area(context, node, style, paint);
+        bool loaded = load_stylesheet_image_node(
+            context, node, style->background_image,
+            strlen(style->background_image), false, true, PSEUDO_NONE);
+        context->current_background_area_width = 0;
+        context->current_background_area_height = 0;
+        if (!loaded) return false;
+    }
     if (*traverse && layered_mask) {
         for (size_t i = 0; i < paint->mask_count; i++) {
             const StylePaintLayer *layer = &paint->masks[i];
@@ -4461,9 +4608,28 @@ static bool image_process_priority_target(
     if ((!is_mask && !is_background) || target->source == NULL
         || target->source[0] == '\0'
         || target->pseudo > (uint8_t) PSEUDO_AFTER) return false;
-    return load_stylesheet_image_node(
+    /* The recording layout's area and background-size for an element
+       background, so an eager decode takes the tile it paints (a cover
+       background in a short, wide box needs more than the viewport width)
+       without resolving the element's style again. */
+    if (is_background && target->background_sized
+        && target->pseudo == (uint8_t) PSEUDO_NONE) {
+        context->current_background_area_width = target->display_width;
+        context->current_background_area_height = target->display_height;
+        context->current_background_size_width =
+            target->background_size_width;
+        context->current_background_size_height =
+            target->background_size_height;
+        context->current_background_size_flags =
+            target->background_size_flags;
+        context->current_background_fit = target->background_fit;
+    }
+    bool loaded = load_stylesheet_image_node(
         context, target->node, target->source, strlen(target->source),
         is_mask, is_background, (PseudoElement) target->pseudo);
+    context->current_background_area_width = 0;
+    context->current_background_area_height = 0;
+    return loaded;
 }
 
 static bool walk_images(ImageLoadContext *context, lxb_dom_node_t *node,
@@ -4516,8 +4682,19 @@ static void images_rollback_optional_suffix(
     if (images == NULL || images->budget == NULL || retained_stats == NULL
         || retained_count > images->count) return;
     image_failures_rollback(images, retained_count, retained_failure_serial);
+    /* A surface adopted while the load ran is not the load's to discard:
+       its producer still holds and writes the pixels. Keep it, with its
+       accounting, in front of the discarded suffix. */
+    size_t write = retained_count;
+    size_t adopted_bytes = 0;
     for (size_t i = retained_count; i < images->count; i++) {
         ImageResource *item = &images->items[i];
+        if (item->adopted_surface) {
+            adopted_bytes += (size_t) item->width * (size_t) item->height * 4u;
+            /* Every slot before i past write was released already. */
+            images->items[write++] = *item;
+            continue;
+        }
         image_canvas_native_forget(item);
         image_resource_release_owned_pixels(images->budget, item);
         if (item->owns_encoded) {
@@ -4528,8 +4705,9 @@ static void images_rollback_optional_suffix(
             }
         }
     }
-    images->count = retained_count;
+    images->count = write;
     images->stats = *retained_stats;
+    images->stats.decoded_bytes += adopted_bytes;
     images->stats.priority_retained_on_failure++;
     images->priority_staged = retained_priority_staged;
 }
@@ -4598,8 +4776,10 @@ static bool images_load_external_impl(
         if (scheduler == NULL) return false;
     }
     if (images->budget == NULL) {
+        ImageLayoutBoxes *boxes = images->layout_boxes;
         memset(images, 0, sizeof(*images));
         images->budget = budget;
+        images->layout_boxes = boxes;
     } else if (images->budget != budget) {
         if (owns_scheduler) fetch_scheduler_destroy(scheduler);
         return false;
@@ -4634,6 +4814,7 @@ static bool images_load_external_impl(
         .fonts = fonts,
         .viewport_width = viewport_width > 0
             ? viewport_width : stylesheet->viewport_width,
+        .layout_boxes = images->layout_boxes,
         .priority_targets = priority_targets,
         .priority_target_count = priority_target_count,
         .preserve_staged_document_images =
@@ -4978,7 +5159,8 @@ bool images_rebuild_external_reusing_rasters(
 {
     if (images == NULL || budget == NULL
         || (images->budget != NULL && images->budget != budget)) return false;
-    ImageResources replacement = {.budget = budget};
+    ImageResources replacement = {.budget = budget,
+                                  .layout_boxes = images->layout_boxes};
     const ImageResources *lenders = images->count == 0 ? NULL : images;
 #ifndef TILEFINCH_NO_TRACE
     if (getenv("TILEFINCH_DISABLE_SVG_REFRESH_REUSE") != NULL) lenders = NULL;
@@ -5885,6 +6067,12 @@ const ImageResource *images_find_pseudo_background(
     return NULL;
 }
 
+void images_set_layout_boxes(ImageResources *images,
+                             ImageLayoutBoxes *boxes)
+{
+    if (images != NULL) images->layout_boxes = boxes;
+}
+
 void images_destroy(ImageResources *images)
 {
     if (images == NULL) return;
@@ -5908,5 +6096,9 @@ void images_destroy(ImageResources *images)
         budget_free(images->budget, images->items);
         budget_free(images->budget, images->failures);
     }
+    /* The lender of layout boxes (images_set_layout_boxes) takes them back
+       itself; a table emptied for a rebuild keeps them for its next load. */
+    ImageLayoutBoxes *boxes = images->layout_boxes;
     memset(images, 0, sizeof(*images));
+    images->layout_boxes = boxes;
 }

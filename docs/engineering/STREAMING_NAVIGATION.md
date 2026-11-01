@@ -88,6 +88,25 @@ known. Immediate CSS, parser-blocking scripts, and visible images outrank
 speculation. Unsupported or lower-value preloads remain ordinary later
 resource work.
 
+The parser does not do that stylesheet work inside the pump that feeds a
+script's end tag. It stops feeding just before the end tag of an open
+parser-blocking script whose realm or sheet is not ready, then prepares both
+over the following pumps, each bounded by the parser's time quota
+(`src/navigation/style_prepare.inc`):
+
+1. It creates the script realm.
+2. It polls the render-blocking style preloads; it never waits on them.
+3. It builds the sheet. An external sheet of 16 KB or more is parsed in
+   slices that stop at rule boundaries (`StyleCssSlicedParse`,
+   `StylesheetParseDeferral`).
+
+The end tag is then fed, and the checkpoint reuses the sheet by fingerprint.
+A streaming preview with a stale sheet starts the same preparation. Anything
+unexpected abandons the preparation and the checkpoint builds as before.
+`blocking-stylesheets ... prepared=` (lab) and `style-prepare=` (PSP
+validation log) count preparations, abandoned ones, pumps, and the longest
+step.
+
 Stylesheet suffixes preserve compiler/index state when the input order remains
 valid. `@font-face` discovery occurs during the CSS parse. Preview layout is
 skipped when the parsed prefix cannot affect visible pixels, and otherwise

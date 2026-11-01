@@ -1060,7 +1060,8 @@ static bool reader_extract_declared_video(
     ReaderExtractBuffer *output, const MediaDeclaredVideo *declared)
 {
     if (output == NULL || declared == NULL
-        || declared->media_url[0] == '\0') return false;
+        || (declared->media_url[0] == '\0'
+            && declared->embed_url[0] == '\0')) return false;
     if (!reader_extract_literal(
             output,
             "<video controls data-tilefinch-declared-media-card=reader "
@@ -3498,8 +3499,10 @@ static bool reader_document_prepare_basic_internal(
         && source_layout->image_style_generation == document_style_generation()
         && source_layout->image_sheet_generation == stylesheet->build_generation)
         output.source_layout = source_layout;
+    /* Basic view's card also offers a page that declares only its player
+       page (the embed hop). */
     const MediaDeclaredVideo *declared_video =
-        media_declared_video_cached(document);
+        media_declared_video_or_embed_cached(document);
     bool synthesize_declared_video = declared_video != NULL
         && !reader_document_has_video_element(document);
     bool okay = reader_extract_literal(

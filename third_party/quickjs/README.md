@@ -24,6 +24,39 @@ patch on a patch, and a validation rewrite rejected already-patched trees),
 and every engine change was reviewable only as a patch file. Now an engine
 change is an ordinary diff.
 
+`JS_ComputeMemoryDetail` (host builds only: `CONFIG_TILEFINCH_HEAP_DETAIL`,
+never defined for the PSP) is a read-only, allocation-free heap walk for the
+lab's `TILEFINCH_TRACE_JS_HEAP_DETAIL` census (docs/DEVELOPMENT.md,
+"JavaScript heap composition"). It is also kept as
+`patches/bellard-quickjs-04be246-heap-detail.patch`, a layer of the
+default stack (below `json-direct`, change 34, and external-source), so
+the lab variants can reverse it to reach their pinned baseline and
+re-apply it.
+
+External function source (`JS_SetExternalSourceHooks`, also kept as
+`patches/bellard-quickjs-04be246-external-source.patch`, now the top layer
+of the default stack): a script compiled with `JS_STRIP_SOURCE` after the
+embedder names its text (`JS_SetExternalSourceId`) records, per function,
+only the offset and length of its `Function.prototype.toString()` text in
+that text (`JSFunctionBytecode.source_external`, the offset sharing the
+`debug.source` slot), and a lazily compiled function records where the text
+it compiles from starts instead of copying it. `toString()` and first-call
+compiles read through the embedder's hook; a `toString()` whose text the
+embedder dropped answers with the `[native code]` form; an optional
+`query` hook (`JS_SetExternalSourceQuery`) says, before anything is
+allocated, whether the text is still there and whether it is all ASCII, so
+that answer needs no room for the text and non-ASCII text is decoded a
+window at a time without a first full read. A reference-counted
+record per text tells the embedder when no function refers to it any more
+(`release`) and when uncompiled lazy functions still need it (`pin`).
+`JS_WriteObject` writes the offsets (source kind 2, a lazy flag bit and
+span); `JS_ReadObject` binds them to the text named for that read and
+refuses bytecode whose lazy functions would have no text.
+`tilefinch-quickjs-external-source-tests` compares every function form
+against the unstripped engine, eagerly, lazily and after a bytecode round
+trip. Browser policy: docs/ARCHITECTURE.md, "Function source outside the
+heap".
+
 Prototype changes release their retained proposed prototype if copy-on-write
 shape preparation refuses an allocation. The original prototype remains
 unchanged; failed bootstrap setup must not leave that retained reference and
@@ -36,6 +69,13 @@ when the initializer or the global variable reference is refused, so a later
 access retries. Upstream cleared the record first and left a permanent
 `undefined`. `test_quickjs_oom --global-autoinit-only` checks that every
 global and ordinary-object entry is still a function after a refusal.
+The inherited-property write path also releases its consumed assigned value
+when lazy initialization refuses memory (upstream `5febaaa49f`).
+`test_quickjs_oom --inherited-autoinit-only` checks this ownership contract,
+retryable prototype initialization, and complete teardown.
+The 64-bit-limb host build also carries upstream `ef5c6e356c`'s signed
+decrement operand; `--bigint-decrement-only` checks both positive and
+negative wide values. The 32-bit PSP retains the same arithmetic result.
 
 Closures with exactly one capture and no home-object requirement store that
 capture in the otherwise unused home-object slot. Indexed capture accesses
@@ -564,6 +604,40 @@ so its difference from malloc usage must not be described as reclaimable memory.
     (`test_js_responsiveness --event-state-oom-only`). Compiled out under
     `__PSP__`. The lab-variant baseline and variant pins moved with this
     change.
+34. `json-direct` — JSON.parse without a UTF-8 copy. `JSON.parse` used
+    to convert its argument with `JS_ToCStringLen` and tokenize the copy:
+    three bytes per character reserved for a 16-bit string, length plus
+    one byte per non-ASCII character for a Latin-1 one (pure ASCII was
+    already read in place). On two captured video
+    pages that copy (0.7 and 1.25 MB) was the request the heap refused.
+    It now tokenizes the flat string itself (`json_next_token_direct()`:
+    one instance for 8-bit and 16-bit characters, with the whitespace,
+    string-content and digit loops written per width), strict JSON only;
+    the UTF-8 tokenizer stays for `JS_ParseJSON*` (import maps, the
+    embedder, JSON5). The parser state's buffer pointers address the
+    string's characters, so source positions are
+    `(ptr - buf_start) >> is_wide_char`; values, reviver source text,
+    `__proto__` keys, the stack check per token, and every error message
+    and line:column are those the UTF-8 path gives for the copy (columns
+    count a surrogate pair, or a lone surrogate, as one, as before). A
+    string without escapes is one substring copy instead of a
+    per-character buffer; an escaped one gets one buffer sized to its
+    decoded length, 16-bit only if a character anywhere in it or a \u
+    escape needs it, rather than one grown or widened by reallocation with
+    both copies live; integers of at most nine digits skip `js_atod()`,
+    longer numbers in 8-bit text are converted in place (16-bit text is
+    narrowed into one buffer of the number's length); identifiers
+    other than `true`/`false`/`null` no longer allocate an atom to be
+    reported. `tests/test_quickjs_json_parse.c` compares JSON.parse with
+    the UTF-8 path (exposed to the test as `__utf8Parse`) on every
+    truncation and single-character substitution of a set of ASCII,
+    Latin-1 and UTF-16 documents and checks that a large parse fits a
+    heap in which the copy is refused. Also kept as
+    `patches/bellard-quickjs-04be246-json-direct.patch`, a layer of the
+    default stack (just below external-source); the variant pins moved with this change.
+    Any change to quickjs.c moves `TILEFINCH_QUICKJS_ENGINE_ID`, so the
+    persistent compiled-script tier is rebuilt, and the PSP QuickJS PGO
+    profile must be retrained before a release.
 
 FinalizationRegistry callbacks use a separate runtime-owned job list. The
 host drains it through `JS_ExecutePendingCleanupJob` as bounded tasks after
@@ -571,6 +645,15 @@ promise checkpoints, not as promise reactions. Both queues retain their
 callback arguments and realms under the QuickJS allocator and are released
 at teardown; retired realms never execute queued callbacks. The native API
 refuses cleanup while a script or promise checkpoint is active.
+
+`JS_READ_OBJ_PLATFORM_METHODS` marks bytecode as the embedder's platform
+code. While it is read, plain `function`s whose names begin with a
+lowercase ASCII letter lose `has_prototype`: like native WebIDL operations
+they get no own `prototype` property and are not constructors. Classes,
+generators, async functions, other names and all page code are unchanged.
+The browser bootstrap is read with it; `tilefinch-web-conformance-tests`
+checks a sample of operations and that author functions keep their
+`prototype` and constructors.
 
 ## Lab variants
 

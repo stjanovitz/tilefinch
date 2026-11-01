@@ -122,10 +122,23 @@ static bool navigation_test_consume_parser_checkpoint_fault(
         (unsigned) NAVIGATION_TEST_PARSER_CHECKPOINT_NONE;
     return true;
 }
+
+/* An armed fault belongs to the checkpoint it names: stylesheet
+   preparation leaves such a checkpoint to do its own work. */
+static bool navigation_test_parser_checkpoint_fault_armed(void)
+{
+    return tilefinch_test_faults()->parser_checkpoint_fault
+        != (unsigned) NAVIGATION_TEST_PARSER_CHECKPOINT_NONE;
+}
 #else
 static bool navigation_test_consume_parser_checkpoint_fault(unsigned fault)
 {
     (void) fault;
+    return false;
+}
+
+static bool navigation_test_parser_checkpoint_fault_armed(void)
+{
     return false;
 }
 #endif
@@ -246,6 +259,12 @@ static bool navigation_stream_suppress_optional_parser_work(
 #define NAVIGATION_PARSER_SCRIPT_STAGE_SPENT_WORK \
     SCRIPT_ADMISSION_LEGACY_UNIT_BYTES
 #define NAVIGATION_PARSER_SCRIPT_STAGE_MAX_US 20000000u
+/* A player page opened by the embed hop exists to run its player. One
+   such page's parser-blocking player bundle (a 1.1 MB inline script) took
+   19.6-19.9 s on a PSP, astride the ordinary limit: one run played, the
+   next stopped all JavaScript at the deadline and never found its stream.
+   The hop's own timeout still bounds the page after it commits. */
+#define NAVIGATION_PARSER_SCRIPT_STAGE_PLAYER_MAX_US 40000000u
 #define NAVIGATION_PARSER_SCRIPT_FAILURE_LIMIT 3u
 
 typedef enum {
@@ -296,14 +315,21 @@ static size_t navigation_parser_script_stage_work_limit(
     return NAVIGATION_PARSER_SCRIPT_STAGE_FALLBACK_WORK;
 }
 
-static uint64_t navigation_parser_script_stage_time_limit_us(void)
+static uint64_t navigation_parser_script_stage_time_limit_us(
+    const NavigationSession *session)
 {
 #if !defined(__PSP__)
     if (navigation_parser_script_stage_test_time_limit_us != 0u) {
-        return navigation_parser_script_stage_test_time_limit_us;
+        uint64_t limit = navigation_parser_script_stage_test_time_limit_us;
+        return session != NULL && session->parser_script_stage_extended
+            ? limit * (NAVIGATION_PARSER_SCRIPT_STAGE_PLAYER_MAX_US
+                       / NAVIGATION_PARSER_SCRIPT_STAGE_MAX_US)
+            : limit;
     }
 #endif
-    return NAVIGATION_PARSER_SCRIPT_STAGE_MAX_US;
+    return session != NULL && session->parser_script_stage_extended
+        ? NAVIGATION_PARSER_SCRIPT_STAGE_PLAYER_MAX_US
+        : NAVIGATION_PARSER_SCRIPT_STAGE_MAX_US;
 }
 
 static bool navigation_stream_open_parser_script_circuit(
@@ -380,7 +406,8 @@ static bool navigation_stream_account_parser_script(
         >= NAVIGATION_PARSER_SCRIPT_FAILURE_LIMIT) {
         summary = "Limited page: JavaScript stopped after repeated failures";
     } else if (stream->parser_script_stage_us
-               >= navigation_parser_script_stage_time_limit_us()) {
+               >= navigation_parser_script_stage_time_limit_us(
+                      stream->session)) {
         summary = "Limited page: JavaScript stopped after its parser time limit";
         reason = NAVIGATION_PARSER_SCRIPT_BREAKER_TIME;
     } else if (stream->parser_script_stage_work
@@ -438,7 +465,8 @@ navigation_stream_prepare_parser_script_allowance(
 {
     if (stream == NULL || stream->session == NULL || allowance == NULL)
         return NAVIGATION_PARSER_SCRIPT_ALLOWANCE_FAILED;
-    uint64_t time_limit = navigation_parser_script_stage_time_limit_us();
+    uint64_t time_limit =
+        navigation_parser_script_stage_time_limit_us(stream->session);
     size_t work_limit = navigation_parser_script_stage_work_limit(stream);
     /* Parser callbacks also include metadata, stylesheet construction and
        transport settlement. Only author JavaScript consumes this breaker;
@@ -662,6 +690,11 @@ navigation_stream_metadata_checkpoint(NavigationDocumentStream *stream)
 {
     if (stream == NULL) return NAVIGATION_PARSER_CHECKPOINT_HARD_FAILURE;
     if (stream->optional_work_shed) return NAVIGATION_PARSER_CHECKPOINT_OK;
+    /* The head is complete and no later parser script has run yet: keep
+       the server markup's video declarations before scripts can remove
+       them (once per document). */
+    if (stream->head_closed && stream->parser != NULL)
+        media_declared_video_keep_parsed(&stream->parser->document);
     bool refused = navigation_test_consume_parser_checkpoint_fault(
         NAVIGATION_TEST_PARSER_CHECKPOINT_METADATA);
     if (!refused) refused = !navigation_stream_scan_metadata(stream);
@@ -719,6 +752,9 @@ static bool navigation_stream_element_closed(void *opaque,
     }
     if (name == NULL || name_length != 6
         || memcmp(name, "script", 6) != 0) return true;
+    /* A body-level declaration: keep it before a later script runs. */
+    if (!stream->optional_work_shed)
+        media_declared_video_keep_closed(document, element);
     return navigation_stream_script_closed(stream, document, element);
 }
 
@@ -1004,7 +1040,10 @@ static TILEFINCH_OUT_OF_LINE bool navigation_stream_script_closed(
         && stream->blocking_stylesheet_fingerprint_valid
         && stream->blocking_stylesheet_fingerprint == fingerprint;
     if (reuse) {
-        session->performance.blocking_stylesheet_reuses++;
+        /* A sheet prepared across parser pumps for this checkpoint was
+           counted as its build (or continuation) there. */
+        if (!stream->style_prepare.fresh)
+            session->performance.blocking_stylesheet_reuses++;
     } else {
         bool continued = navigation_stream_try_continue_stylesheet(
             stream, document, fingerprint);
@@ -1018,6 +1057,7 @@ static TILEFINCH_OUT_OF_LINE bool navigation_stream_script_closed(
                 stream, NAVIGATION_PARSER_REFUSAL_STYLESHEET);
         }
     }
+    stream->style_prepare.fresh = false;
     script_runtime_set_stylesheet(stream->runtime,
                                   &stream->blocking_stylesheet);
     script_runtime_invalidate_document_base(stream->runtime);

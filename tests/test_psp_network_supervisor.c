@@ -325,6 +325,46 @@ static bool test_cancelled_start_retains_honest_failure(void)
     return true;
 }
 
+static bool test_offline_module_ownership(void)
+{
+    PspNetworkSnapshot resident = snapshot_for(PSP_NETWORK_STACK_MODULES_ONLY, 0);
+    PspNetworkSupervisor stopped = psp_network_supervisor_initial();
+    stopped.state = PSP_NETWORK_SUPERVISOR_STOPPING;
+    stopped.stack = PSP_NETWORK_STACK_PARTIAL;
+    stopped.stopping_phase = PSP_NETWORK_STOP_UNWIND_RUNGS;
+    stopped.stopping_target = PSP_NETWORK_STOP_TARGET_OFFLINE;
+    CHECK(apply(&stopped, resident, (PspNetworkSupervisorEvent) {
+        .type = PSP_NETWORK_EVENT_UNWOUND }));
+    CHECK(stopped.state == PSP_NETWORK_SUPERVISOR_OFFLINE);
+    CHECK(stopped.stack == PSP_NETWORK_STACK_MODULES_ONLY);
+    CHECK(!stopped.admission_open);
+    for (unsigned kind = PSP_NETWORK_TARGET_OFF;
+         kind <= PSP_NETWORK_TARGET_SUSPEND; kind++) {
+        PspNetworkSupervisor machine = stopped;
+        CHECK(apply(&machine, resident, (PspNetworkSupervisorEvent) {
+            .type = PSP_NETWORK_EVENT_TARGET_CHANGED,
+            .target = target((PspNetworkTargetKind) kind,
+                             PSP_NETWORK_TARGET_CAUSE_NAVIGATION, 1) }));
+        CHECK(machine.stack == PSP_NETWORK_STACK_MODULES_ONLY);
+        if (kind == PSP_NETWORK_TARGET_READY) {
+            CHECK(machine.state == PSP_NETWORK_SUPERVISOR_STARTING);
+        } else {
+            CHECK(machine.state == PSP_NETWORK_SUPERVISOR_STOPPING);
+            CHECK(machine.stopping_target == (kind == PSP_NETWORK_TARGET_OFF
+                ? PSP_NETWORK_STOP_TARGET_OFF : PSP_NETWORK_STOP_TARGET_SUSPENDED_OFF));
+            CHECK(apply(&machine, resident, (PspNetworkSupervisorEvent) {
+                .type = PSP_NETWORK_EVENT_ADMISSION_STOPPED }));
+            CHECK(machine.stopping_phase == PSP_NETWORK_STOP_LEAVE_APCTL);
+            CHECK(apply(&machine, resident, (PspNetworkSupervisorEvent) {
+                .type = PSP_NETWORK_EVENT_APCTL_DISCONNECTED }));
+            CHECK(apply(&machine, snapshot_for(PSP_NETWORK_STACK_NONE, 0),
+                (PspNetworkSupervisorEvent) {.type = PSP_NETWORK_EVENT_UNWOUND}));
+            CHECK(machine.stack == PSP_NETWORK_STACK_NONE);
+        }
+    }
+    return true;
+}
+
 static PspNetworkSupervisor canonical_machine(
     PspNetworkSupervisorState state)
 {
@@ -433,6 +473,7 @@ int main(void)
         || !test_off_timeout_quarantines_until_release()
         || !test_rejoin_escalates_through_full_restart()
         || !test_cancelled_start_retains_honest_failure()
+        || !test_offline_module_ownership()
         || !test_event_state_grid_is_total()
         || !test_demand_scaled_pump_policy())
         return 1;

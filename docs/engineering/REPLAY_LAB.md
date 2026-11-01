@@ -44,6 +44,69 @@ Selected records are still parsed by the authoritative trace parser. The
 selector does not bypass response hashes, quotas, retained delays, CORS,
 cookies, or cancellation semantics.
 
+### Recorded page video (media replay)
+
+Page video on the PSP fetches through the background transport worker
+(HLS playlists and segments, provider range windows), which neither records
+nor replays. During a response-keyed replay a replay lane
+(`src/fetch/trace_media_lane.inc`, lab and validation builds only) takes
+every worker request and answers it at enqueue, on the browser thread, from
+the same records; the body is read from the record file as the caller takes
+chunks. Media requests (lane requests and page requests with a video/audio
+destination: the page-media probe and range reader) follow media rules
+instead of the occurrence sequence above:
+
+1. records are reusable data: among successful records for the key, the one
+   holding most of the requested window wins, the later record on ties;
+2. a `Range` window is cut from a stored 200 or a covering 206 and served as
+   206 with exact Content-Range and Content-Length (a stored 206 holding the
+   whole resource answers a request without Range as 200); a window whose
+   first byte is not stored fails, and a window is checked against the
+   stored file length instead of the whole-body hash;
+3. with no record for the URL, the recorded effective URL is tried, then the
+   same origin and path with a different query when every such record is
+   for one recorded URL (per-session signing tokens; never a `range=`
+   query);
+4. a single-hop request for a record that followed a redirect is answered
+   with that redirect, so the caller's redirect policy and playlist rebase
+   run as live.
+
+The host lab records media through the PSP's own code:
+`record-page-media [SECONDS [MAX-MB]]` under `--capture-http` follows the
+page's media action (including an embed hop), captures HLS as
+`psp_media_hls.c` requests it up to SECONDS of video (MAX-MB bounds the
+bytes), and captures a progressive file as one Range response of up to
+MAX-MB. `check-page-media [SECONDS]` under `--replay-http-response-keyed`
+opens the recording through the same path (`src/media_replay_check.c`) and
+reads every sample to SECONDS, proving the device will find each media
+request. Each line also names the decoder the PSP open path would give the
+video (`decoder=firmware|software|refused`, with the SPS `profile` and
+`level`); a refused candidate moves on to the page's next one in the PSP's
+order (`candidate=N/M`), and `chosen=N of=M` names the one that would play.
+Recording walks the same way. A progressive file is judged before it is
+recorded in bulk: from its first 2 MiB, or, when the moov is not there (a
+file indexed at its end), from its top-level box headers and the moov read
+by targeted Range requests, all captured. A refused file keeps only those
+reads and the walk records the next candidate, up to the first one that
+would play; a file whose verdict cannot be taken is recorded and the next
+candidate is recorded too. An HLS candidate plays when either selection
+bound plays (the firmware variant first; the software one is a fallback).
+MAX-MB bounds the bytes of the whole walk. With `focused` first (`check-page-media focused 60`), both take
+the media action Cross builds on the focused element instead of the
+page's, so a script can move focus onto the declared media card (the lab's
+`tick` and `pump` insert it as the PSP does, printing
+`loop-media-card installed`) and prove its Play.
+`check-page-media 60 seek=20` then seeks an HLS stream to 20 s the way the
+player does (the video source picks the segment holding the target, a
+separate audio rendition follows to that landing) and prints
+`loop-page-media-seek` with the stream's duration, the landing, the first
+video and audio times there and the audio units playback would drop; the
+landing's segments must be in the recording. On a retained qualification
+recording, seeks to 7, 9, 20 and 33 s land at 6.00, 7.80, 19.80 and
+31.80 s with sound 10-30 ms after the picture and nothing dropped.
+`tilefinch-trace-media-replay-tests` covers both lanes and the seek with a
+generated stream.
+
 ### Volatile client identifiers
 
 Some pages mint a fresh identifier into every request and the server echoes

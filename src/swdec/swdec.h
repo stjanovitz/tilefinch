@@ -74,6 +74,8 @@ swdec_audio *swdec_audio_open(void *arena, size_t arena_bytes);
    yet, negative on error */
 int swdec_audio_decode(swdec_audio *a, const uint8_t *adts, size_t adts_bytes,
                        swdec_audio_frame *out);
+/* Drop the decoder's state (after a run of failed frames). */
+void swdec_audio_flush(swdec_audio *a);
 void swdec_audio_close(swdec_audio *a);
 void swdec_close(swdec *d);
 

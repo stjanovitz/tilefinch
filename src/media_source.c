@@ -72,6 +72,18 @@ static size_t mp4_retained_bytes(const void *opaque)
     return media_mp4_retained_bytes(opaque);
 }
 
+static bool mp4_peek_track_sample(void *opaque, MediaMp4TrackKind kind,
+                                  MediaMp4Sample *sample)
+{
+    return media_mp4_peek_track_sample(opaque, kind, sample);
+}
+
+static bool mp4_take_track_sample(void *opaque, const MediaMp4Sample *sample,
+                                  void *destination, size_t capacity)
+{
+    return media_mp4_take_track_sample(opaque, sample, destination, capacity);
+}
+
 static const MediaSampleSourceOps mp4_source_ops = {
     .track_count = mp4_track_count,
     .track_info = mp4_track_info,
@@ -85,7 +97,9 @@ static const MediaSampleSourceOps mp4_source_ops = {
     .seek_after_us = mp4_seek_after_us,
     .prepare_seek_us = mp4_prepare_seek_us,
     .rewind = mp4_rewind,
-    .retained_bytes = mp4_retained_bytes
+    .retained_bytes = mp4_retained_bytes,
+    .peek_track_sample = mp4_peek_track_sample,
+    .take_track_sample = mp4_take_track_sample
 };
 
 bool media_sample_source_from_mp4(MediaMp4Demux *demux,

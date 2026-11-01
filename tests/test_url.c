@@ -101,6 +101,18 @@ int main(void)
     CHECK(tilefinch_url_resolve("https://example.com/a/", "//Other.test/x",
                              output, sizeof(output)));
     CHECK(strcmp(output, "https://other.test/x") == 0);
+    /* An absolute reference ignores the base, even one that cannot be a
+       base; a relative reference against such a base fails. */
+    CHECK(tilefinch_url_resolve("blob:https://example.com/uuid",
+                             "https://example.com/a.js", output,
+                             sizeof(output)));
+    CHECK(strcmp(output, "https://example.com/a.js") == 0);
+    CHECK(tilefinch_url_resolve("about:blank", "http://example.com/b",
+                             output, sizeof(output)));
+    CHECK(strcmp(output, "http://example.com/b") == 0);
+    CHECK(!tilefinch_url_resolve("blob:https://example.com/uuid", "a.js",
+                              output, sizeof(output)));
+    CHECK(!tilefinch_url_resolve("about:blank", "", output, sizeof(output)));
 
     CHECK(!tilefinch_url_parse("javascript:alert(1)", &url));
     CHECK(!tilefinch_url_parse("https:///missing-host", &url));

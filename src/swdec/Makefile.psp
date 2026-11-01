@@ -2,7 +2,10 @@ PSPSDK := $(shell psp-config --pspsdk-path)
 
 TARGET := tilefinch-swdec
 OBJS := swdec_component_psp.o swdec.o swdec_arena.o swdec_me.o \
-        swdec_meload.o
+        swdec_csc.o swdec_recon_diag.o swdec_chroma_replay.o swdec_meload.o
+# Optional prebuilt objects for one-off variants (default: none); listed
+# before the libraries, so they replace the matching archive members.
+OBJS += $(SWDEC_EXTRA_OBJS)
 INCDIR := $(SWDEC_SOURCE_DIR) $(TILEFINCH_SOURCE_DIR)/include \
           $(TILEFINCH_SOURCE_DIR)/src \
           $(FFMPEG_SOURCE_DIR)
@@ -12,9 +15,36 @@ CFLAGS := -O2 -G0 -Wall -Wextra -std=gnu11 -DPSP \
           -DHAVE_AV_CONFIG_H -DSWDEC_ME=1 -DSWDEC_ME_DEBLOCK=1 \
           -DSWDEC_FRAME_ONLY=1 -DSWDEC_PSP_ASM=1 \
           -DSWDEC_LF_STRENGTH_C=1 -DSWDEC_PSP_LF_CHROMA=1
+# SWDEC_DIAGNOSTICS=1 (validation trees) compiles in the component's
+# diagnostics and the stage report; it needs FFMPEG_LIBRARY_DIR to be the
+# matching diagnostic FFmpeg build. Release builds leave it 0. See
+# swdec_diag.h.
+ifeq ($(SWDEC_DIAGNOSTICS),1)
+CFLAGS += -DSWDEC_DIAGNOSTICS=1 -DSWDEC_STAGE_DIAG=1
+endif
+# Optional extra flags for one-off component variants (default: none). The
+# finer diagnostic flags among them need SWDEC_DIAGNOSTICS=1.
+CFLAGS += $(SWDEC_EXTRA_CFLAGS)
 ASFLAGS := $(CFLAGS)
 LIBS := -lavcodec -lavutil -lpspsdk -lm
+# No C start-up (see swdec_component_psp.c): module_start reads the start
+# block itself, and newlib allocations go to a small fixed pool.
+LDFLAGS := -nostartfiles \
+           $(foreach f,malloc calloc realloc free memalign _malloc_r _calloc_r _realloc_r _free_r _memalign_r,-Wl,--wrap=$(f))
 BUILD_PRX := 1
+PRX_EXPORTS := exports.exp
 EXTRA_TARGETS := tilefinch-swdec.prx
 
 include $(PSPSDK)/lib/build.mak
+
+# build.mak relinks only when an object changes. Rebuild one object whenever
+# the prepared FFmpeg libraries change, so a re-prepared tree is linked in.
+swdec_component_psp.o: $(FFMPEG_LIBRARY_DIR)/libavcodec.a \
+                       $(FFMPEG_LIBRARY_DIR)/libavutil.a
+
+# build.mak tracks no header dependencies: rebuild every C object when one
+# of the component's own headers changes (the arena size lives in
+# swdec_bounds.h, for one), so a staged add-on is never stale.
+swdec_component_psp.o swdec.o swdec_arena.o swdec_me.o swdec_csc.o \
+swdec_recon_diag.o swdec_chroma_replay.o: \
+    $(wildcard $(SWDEC_SOURCE_DIR)/*.h)

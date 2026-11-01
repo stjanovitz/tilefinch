@@ -174,6 +174,14 @@ bool psp_app_heavy_poll(PspApp *app)
         interactive->heavy_shell_since_us = 0;
         interactive->heavy_measure_countdown = 0;
     }
+    /* A software-decoded video needed the room the page's scripts held
+       (browser_engine_make_media_room). Said once, back on the page. */
+    if (ui->screen == PSP_UI_SCREEN_PAGE
+        && browser_engine_take_media_room_scripts_stopped(engine)) {
+        psp_ui_show_status(ui, "PAGE SCRIPTS STOPPED: NOT ENOUGH MEMORY",
+                           PSP_HEAVY_STATUS_FRAMES);
+        return true;
+    }
     /* The page's scripts ran out of memory and wiped it; the engine put the
        server's page back and stopped them. Its realm is gone, so this comes
        before the heavy state. */

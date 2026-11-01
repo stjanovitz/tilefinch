@@ -58,6 +58,8 @@ void script_runtime_destroy(ScriptRuntime *runtime)
     }
     budget_free(runtime->bridge.budget, runtime->bridge.media_source);
     runtime->bridge.media_source = NULL;
+    budget_free(runtime->bridge.budget, runtime->bridge.activation_link_url);
+    runtime->bridge.activation_link_url = NULL;
     js_rt_bridge_computed_style_cache_free(&runtime->bridge);
     js_rt_bridge_wrapper_refs_free(&runtime->bridge);
     budget_free(runtime->bridge.budget, runtime->bridge.node_owner_tags);
@@ -174,6 +176,12 @@ void script_runtime_destroy(ScriptRuntime *runtime)
         script_census_detach(runtime->runtime);
         JS_FreeRuntime(runtime->runtime);
     }
+    /* After the runtime: freeing its functions released their texts. */
+#if defined(PSP_BROWSER_BELLARD_QUICKJS) && !defined(TILEFINCH_NO_TRACE)
+    js_rt_source_store_census(runtime);
+#endif
+    script_source_store_destroy(runtime->source_store);
+    runtime->source_store = NULL;
     /* Every opaque finalizer has run while its Budget owner remained live;
        wrapper finalizers were the last users of the handle table. */
     js_rt_bridge_node_table_free(&runtime->bridge);

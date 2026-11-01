@@ -187,6 +187,7 @@ hold COUNT BUTTONS
 press COUNT BUTTONS
 stick COUNT DIRECTION [BUTTONS]
 mark NAME
+focus-page-media
 end
 ```
 
@@ -284,6 +285,26 @@ not for background resources to finish. These steps run only in the main
 input loop, never inside a runtime cooperation callback. They are useful for
 checking focus and disclosure controls during page startup. Neither suffix
 turns the earlier provisional navigation preview into an interactive document.
+
+`focus-page-media` is one idle frame on which the harness moves d-pad focus
+to whatever Play would act on, so the d-pad path, which differs per site and
+between the lab and the device, does not decide what a following `tap cross`
+plays. It prefers the declared media card when the page has one, then the
+first author `<video>` or `<audio>` in document order with a source page media
+can open (a non-empty, non-`blob:` `src` or `<source>`: the same
+`browser_engine_author_media_openable` rule the card uses to decide that a page
+has its own video), then the first other author media element, whose
+activation builds the same declared or discovered candidates as the page's
+Play. An element that is not itself a focus target (hidden or covered by its
+player's chrome) is reached through the first focus target of its nearest
+enclosing element that has one, usually the player's play button, whose Cross
+runs the page's own play. It logs `tilefinch-input-script: step=N
+action=focus-page-media
+target=card|author|author-player|element|element-player|none` (`none` leaves
+focus where it was). It
+accepts the `-page` and `-live` suffixes. Cross then plays through the normal
+user path. Like the rest of the harness it is compiled out of shipping builds
+(`src/psp_input_page_media.c` is a validation-only source).
 
 `until COUNT` idles like `wait COUNT` but ends early once the page is ready:
 when a `<script>.until.js` probe sits beside the script, the main loop
@@ -1419,6 +1440,13 @@ chrome theme, and video scaling.
 Text-entry modals, live navigation, site data, screenshots, and seeded
 collection deletion use separate scenarios because they need external state or
 clock-derived output.
+
+The home-menu performance journey runs the tour with
+`--data-dir tests/fixtures/ppsspp-menu-tour-data`, three fixed-name
+screenshot files and no profile. The screenshot list then scrolls a little
+past one screen, so its page-down and page-up presses move the page, and the
+repeated ones are no-ops at its ends. Without the seed every one is a no-op.
+The receiver trace does not change either way.
 
 `site-restore` idles on native HOME and must be run with
 `--data-dir tests/fixtures/ppsspp-site-data`, which seeds a profile with

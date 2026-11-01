@@ -75,6 +75,89 @@ static int test_empty_native_document(void)
     return 0;
 }
 
+/* A software-decoded video needs about 15 MB of the page's Budget at once.
+   A page whose scripts hold that gives it back step by step: optional
+   memory first, then its scripts, keeping its DOM for the return. */
+static int test_media_room_reclaims_page_memory(void)
+{
+    BrowserConfig config;
+    browser_config_init(&config, NULL);
+    config.memory_limit = 32u * MIB;
+    config.tile_capacity = 2;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    config.javascript.heap_limit = 20u * MIB;
+    config.resources.enabled = false;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL);
+    static const char page[] = "<!doctype html><title>Talk</title>"
+        "<h1>A long talk page</h1><p>Its player script holds a lot.</p>"
+        "<script>globalThis.keep = [];"
+        "for (let i = 0; i < 12; i++)"
+        "  keep.push(new Uint8Array(1048576).fill(i));"
+        "globalThis.pocSummary = 'held ' + keep.length;</script>";
+    CHECK(browser_engine_commit_html(engine, "https://talk.test/watch",
+                                     page, sizeof(page) - 1u, true));
+    const NavigationSession *navigation = browser_engine_navigation_view(engine);
+    CHECK(navigation->page.runtime != NULL
+          && strcmp(navigation->page.script_result.summary, "held 12") == 0);
+    Budget *budget = browser_engine_budget(engine);
+    uint64_t generation = browser_engine_page_generation(engine);
+
+    /* Room that is already there costs the page nothing. */
+    unsigned stage = 0;
+    CHECK(browser_engine_make_media_room(engine, 1u * MIB, &stage)
+              == BROWSER_MEDIA_ROOM_NONE
+          && navigation->page.runtime != NULL
+          && !browser_engine_take_media_room_scripts_stopped(engine));
+
+    /* More than is free, less than the scripts hold. */
+    size_t free_before = budget_remaining(budget);
+    size_t needed = free_before + 8u * MIB;
+    CHECK(budget_malloc(budget, needed) == NULL);
+    stage = 0;
+    unsigned steps = 0;
+    bool scripts_stopped = false;
+    void *working_set = NULL;
+    for (;;) {
+        working_set = budget_malloc(budget, needed);
+        if (working_set != NULL) break;
+        BrowserMediaRoomStep step =
+            browser_engine_make_media_room(engine, needed, &stage);
+        if (step == BROWSER_MEDIA_ROOM_NONE) break;
+        if (step == BROWSER_MEDIA_ROOM_SCRIPTS_STOPPED) scripts_stopped = true;
+        CHECK(++steps <= 2u);
+    }
+    CHECK(working_set != NULL && scripts_stopped);
+    /* The page is still committed with its DOM; only its scripts are gone. */
+    CHECK(navigation->page.loaded && navigation->page.runtime == NULL
+          && browser_engine_page_generation(engine) == generation
+          && strcmp(navigation->page.document.title, "Talk") == 0
+          && strcmp(navigation->page.script_result.summary,
+                    "Page scripts stopped") == 0);
+    budget_free(budget, working_set);
+
+    /* After the player closes, the page renders, and says once that its
+       scripts were stopped. */
+    CHECK(browser_engine_refresh_shell(engine)
+          && browser_engine_render_frame(engine, NULL));
+    size_t count = 0;
+    CHECK(browser_engine_framebuffer(engine, &count) != NULL
+          && count == 480u * 272u);
+    CHECK(browser_engine_take_media_room_scripts_stopped(engine)
+          && !browser_engine_take_media_room_scripts_stopped(engine));
+    /* Nothing further to give: the next open is refused, not looped. */
+    stage = 0;
+    CHECK(browser_engine_make_media_room(engine, SIZE_MAX, &stage)
+              != BROWSER_MEDIA_ROOM_SCRIPTS_STOPPED);
+    CHECK(browser_engine_make_media_room(engine, SIZE_MAX, &stage)
+          == BROWSER_MEDIA_ROOM_NONE);
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    return 0;
+}
+
 static int test_engine_lifecycle(void)
 {
     BrowserDeviceProfile profile;
@@ -706,6 +789,234 @@ static int test_page_video_activation(void)
     return 0;
 }
 
+/* Collects the action's packed further renditions as one '|'-joined
+   string of "<kind>:<url>" entries. */
+static void media_action_alternates(
+    const ControllerAction *action, char *output, size_t capacity)
+{
+    size_t written = 0, cursor = 0;
+    MediaDiscoveryKind kind = MEDIA_DISCOVERY_NONE;
+    output[0] = '\0';
+    for (const char *url;
+         (url = media_candidates_next(
+              action->body, action->body_length, &cursor, &kind)) != NULL;) {
+        int count = snprintf(output + written, capacity - written, "%s%d:%s",
+                             written == 0 ? "" : "|", (int) kind, url);
+        if (count < 0 || (size_t) count >= capacity - written) break;
+        written += (size_t) count;
+    }
+}
+
+static bool activate_page_video(
+    BrowserEngine *engine, const char *url, const char *page,
+    ControllerAction *action)
+{
+    memset(action, 0, sizeof(*action));
+    return browser_engine_commit_html(
+               engine, url, page, strlen(page), true)
+        && browser_engine_focus_move(engine, true)
+        && browser_engine_activate(engine, action)
+        && action->type == CONTROLLER_ACTION_MEDIA;
+}
+
+/* A <video> offering several renditions plays the one the PSP policy ranks
+   first (the lowest at or above 240p), and carries the rest, then the
+   page's declared and discovered video, for the native route to fall back
+   on when a rendition is refused. */
+static int test_page_video_rendition_candidates(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 16u * MIB;
+    config.session_cache_limit = 256u * 1024u;
+    config.maximum_document_bytes = 64u * 1024u;
+    config.tile_capacity = 2;
+    config.javascript.enabled = true;
+    char error[256] = {0};
+    char alternates[1024];
+    BrowserEngine *engine = browser_engine_create(
+        &config, error, sizeof(error));
+    CHECK(engine != NULL);
+    ControllerAction action;
+
+    /* The small rendition is listed last, behind larger ones, under the
+       hint attributes players commonly use. */
+    static const char ranked[] =
+        "<!doctype html><title>Renditions</title><body>"
+        "<video controls width=320 height=180>"
+        "<source src=v-720.mp4 type=video/mp4 size=720>"
+        "<source src=v-480.mp4 type=video/mp4 res=480>"
+        "<source src=v-360.mp4 type=video/mp4 data-quality=360p>"
+        "<source src=v-240.mp4 type=video/mp4 label='240p'>"
+        "</video></body>";
+    CHECK(activate_page_video(
+              engine, "https://video.test/watch/1", ranked, &action)
+          && strcmp(action.url, "https://video.test/watch/v-240.mp4") == 0
+          && action.media_kind == MEDIA_DISCOVERY_MP4
+          && !action.media_audio_only);
+    media_action_alternates(&action, alternates, sizeof(alternates));
+    CHECK(strcmp(alternates,
+                 "1:https://video.test/watch/v-360.mp4|"
+                 "1:https://video.test/watch/v-480.mp4|"
+                 "1:https://video.test/watch/v-720.mp4") == 0);
+
+    /* Below 240p ranks after every rendition at or above it; a source whose
+       media query does not match the screen is never a candidate; the page's
+       declared video follows the element's own sources. */
+    static const char declared[] =
+        "<!doctype html><title>Declared</title>"
+        "<meta property=og:video content=/declared.mp4><body>"
+        "<video controls width=320 height=180>"
+        "<source src=v-144.mp4 data-res=144>"
+        "<source src=v-wide.mp4 size=240 media='(min-width: 1000px)'>"
+        "<source src=v-1080.mp4 height=1080>"
+        "</video></body>";
+    CHECK(activate_page_video(
+              engine, "https://video.test/watch/2", declared, &action)
+          && strcmp(action.url, "https://video.test/watch/v-1080.mp4") == 0);
+    media_action_alternates(&action, alternates, sizeof(alternates));
+    CHECK(strcmp(alternates,
+                 "1:https://video.test/watch/v-144.mp4|"
+                 "1:https://video.test/declared.mp4") == 0);
+
+    /* Without hints, document order; a declared URL that repeats a source
+       is not tried twice. */
+    static const char unhinted[] =
+        "<!doctype html><title>Plain</title>"
+        "<meta property=og:video content=/watch/second.mp4><body>"
+        "<video controls width=320 height=180>"
+        "<source src=first.mp4 type=video/mp4>"
+        "<source src=second.mp4 type=video/mp4>"
+        "</video></body>";
+    CHECK(activate_page_video(
+              engine, "https://video.test/watch/3", unhinted, &action)
+          && strcmp(action.url, "https://video.test/watch/first.mp4") == 0);
+    media_action_alternates(&action, alternates, sizeof(alternates));
+    CHECK(strcmp(alternates, "1:https://video.test/watch/second.mp4") == 0);
+
+    /* A src attribute is the element's only reference, as in HTML. */
+    static const char own_src[] =
+        "<!doctype html><title>Src</title><body>"
+        "<video controls width=320 height=180 src=own.mp4>"
+        "<source src=ignored.mp4 size=240></video></body>";
+    CHECK(activate_page_video(
+              engine, "https://video.test/watch/4", own_src, &action)
+          && strcmp(action.url, "https://video.test/watch/own.mp4") == 0
+          && action.body_length == 0);
+
+    /* A page whose player data names a direct MP4 and an HLS stream keeps
+       the stream as the fallback: it can offer a rendition the file lacks. */
+    static const char player_data[] =
+        "<!doctype html><title>Player data</title><body>"
+        "<video controls width=320 height=180></video>"
+        "<script>var player={\"file\":\"/files/clip-480.mp4\","
+        "\"stream\":\"/streams/clip/master.m3u8\"};</script></body>";
+    CHECK(activate_page_video(
+              engine, "https://video.test/watch/7", player_data, &action)
+          && strcmp(action.url, "https://video.test/files/clip-480.mp4") == 0
+          && action.media_kind == MEDIA_DISCOVERY_MP4);
+    media_action_alternates(&action, alternates, sizeof(alternates));
+    CHECK(strcmp(alternates,
+                 "2:https://video.test/streams/clip/master.m3u8") == 0);
+
+    /* An untyped WebM source gives way to the playable one after it. */
+    static const char webm_first[] =
+        "<!doctype html><title>WebM</title><body>"
+        "<video controls width=320 height=180>"
+        "<source src=clip.webm><source src=clip.mp4 size=360>"
+        "<source src=clip.m3u8></video></body>";
+    CHECK(activate_page_video(
+              engine, "https://video.test/watch/5", webm_first, &action)
+          && strcmp(action.url, "https://video.test/watch/clip.mp4") == 0
+          && action.media_kind == MEDIA_DISCOVERY_MP4);
+    media_action_alternates(&action, alternates, sizeof(alternates));
+    CHECK(strcmp(alternates, "2:https://video.test/watch/clip.m3u8") == 0);
+
+    /* WebM alone still reaches the platform, which explains the refusal. */
+    static const char webm_only[] =
+        "<!doctype html><title>WebM only</title><body>"
+        "<video controls width=320 height=180>"
+        "<source src=only.webm></video></body>";
+    CHECK(activate_page_video(
+              engine, "https://video.test/watch/6", webm_only, &action)
+          && strcmp(action.url, "https://video.test/watch/only.webm") == 0
+          && action.media_kind == MEDIA_DISCOVERY_WEBM
+          && action.body_length == 0);
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+/* A player set up from an inline script names its renditions only there.
+   Those references join the candidate list behind the markup's, through
+   the same URL resolution and media-src policy as every other. */
+static int test_page_video_script_candidates(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 16u * MIB;
+    config.session_cache_limit = 256u * 1024u;
+    config.maximum_document_bytes = 64u * 1024u;
+    config.tile_capacity = 2;
+    config.javascript.enabled = true;
+    char error[256] = {0};
+    char alternates[1024];
+    BrowserEngine *engine = browser_engine_create(
+        &config, error, sizeof(error));
+    CHECK(engine != NULL);
+    ControllerAction action;
+
+    /* The element's MP4 may be refused for its size; the HLS master in the
+       player call (escaped slashes) is the fallback. */
+    static const char player_call[] =
+        "<!doctype html><title>Player call</title><body>"
+        "<video controls width=320 height=180>"
+        "<source src=/clip/clip-480.mp4 type=video/mp4></video>"
+        "<script>window.stage && stage.setStream("
+        "'https:\\/\\/video.test\\/clip\\/hls\\/master.m3u8');</script>"
+        "</body>";
+    CHECK(activate_page_video(
+              engine, "https://video.test/watch/8", player_call, &action)
+          && strcmp(action.url, "https://video.test/clip/clip-480.mp4") == 0
+          && action.media_kind == MEDIA_DISCOVERY_MP4);
+    media_action_alternates(&action, alternates, sizeof(alternates));
+    CHECK(strcmp(alternates,
+                 "2:https://video.test/clip/hls/master.m3u8") == 0);
+
+    /* media-src admits the page's own origin only: the CDN stream is never
+       a candidate, the same-origin file is. */
+    static const char guarded[] =
+        "<!doctype html><title>Guarded</title><body>"
+        "<video controls width=320 height=180></video>"
+        "<script>window.stage && stage.setup({"
+        "hls: \"https://cdn.video.test/clip/master.m3u8\","
+        "mp4_low: \"/clip/clip-low.mp4\"});</script></body>";
+    memset(&action, 0, sizeof(action));
+    bool committed = browser_engine_commit_html(
+        engine, "https://video.test/watch/9", guarded,
+        sizeof(guarded) - 1u, true);
+    static const char guarded_csp[] =
+        "content-security-policy: media-src 'self'\n";
+    committed = committed
+        && tilefinch_csp_parse_response_headers(
+            &browser_engine_navigation(engine)->page.document
+                 .content_security_policy,
+            "https://video.test/watch/9", guarded_csp,
+            sizeof(guarded_csp) - 1u, false);
+    CHECK(committed && browser_engine_focus_move(engine, true)
+          && browser_engine_activate(engine, &action)
+          && action.type == CONTROLLER_ACTION_MEDIA
+          && strcmp(action.url, "https://video.test/clip/clip-low.mp4") == 0
+          && action.body_length == 0);
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    return 0;
+}
+
 static int test_page_video_data_candidate_activation(void)
 {
     BrowserDeviceProfile profile;
@@ -742,6 +1053,765 @@ static int test_page_video_data_candidate_activation(void)
     browser_engine_destroy(engine);
     return 0;
 }
+
+/* Video pages often list related videos next to the player: hover
+   previews in data attributes, a carousel's preview clips in a JSON blob,
+   the next video in the player's own configuration. Activation plays the
+   page's own video: an ID from the page's address in the path, or the
+   player's container, outranks preview and related-video references, which
+   still play when nothing else is offered. */
+static int test_page_video_prefers_own_video(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 16u * MIB;
+    config.session_cache_limit = 256u * 1024u;
+    config.maximum_document_bytes = 64u * 1024u;
+    config.tile_capacity = 2;
+    config.javascript.enabled = true;
+    char error[256] = {0};
+    char alternates[1024];
+    BrowserEngine *engine = browser_engine_create(
+        &config, error, sizeof(error));
+    CHECK(engine != NULL);
+    ControllerAction action;
+
+    /* The page's own video is only in the player's setup call. Related
+       previews sit in a separate JSON blob, in data-preview attributes and
+       in thumbnails' data-src, and come first in markup order. */
+    static const char own_in_config[] =
+        "<!doctype html><head><title>Watch</title>"
+        "<link rel=canonical href='https://video.test/watch/123456/'>"
+        "<meta property=og:type content=video.other></head><body>"
+        "<div class=player><div class=stage>"
+        "<video controls width=320 height=180></video></div>"
+        "<script>window.player && player.setup({sources:[{label:'480p',"
+        "file:\"https:\\/\\/media.test\\/v\\/123456\\/clip-480.mp4\"}],"
+        "nextVideo:{url:'/watch/222222/',"
+        "video:'https://media.test/v/222222/clip-240.mp4'}});</script>"
+        "</div>"
+        "<script type=application/json>{\"items\":[{\"url\":"
+        "\"/watch/333333/\",\"preview\":"
+        "\"https://media.test/v/333333/clip-240.mp4\"}]}</script>"
+        "<ul class=related-videos><li><a href=/watch/444444/ "
+        "data-preview='https://media.test/v/444444/hover-240.mp4'>"
+        "<img class=thumb alt='' "
+        "data-src='https://media.test/v/444444/clip-240.mp4'></a></li></ul>"
+        "</body>";
+    CHECK(activate_page_video(
+              engine, "https://video.test/watch/123456/", own_in_config,
+              &action)
+          && strcmp(action.url,
+                    "https://media.test/v/123456/clip-480.mp4") == 0
+          && action.media_kind == MEDIA_DISCOVERY_MP4);
+    /* og:type=video alone declares no URL of its own: the page-load
+       markup scan behind it would have put a preview first. */
+    media_action_alternates(&action, alternates, sizeof(alternates));
+    CHECK(alternates[0] == '\0');
+
+    /* A page offering only previews still plays one, by the ordinary
+       quality policy. */
+    static const char only_previews[] =
+        "<!doctype html><title>Previews</title><body>"
+        "<video controls width=320 height=180></video>"
+        "<script type=application/json>{\"related\":["
+        "{\"preview\":\"https://media.test/previews/555555/a-480.mp4\"},"
+        "{\"preview\":\"https://media.test/previews/666666/b-360.mp4\"}]}"
+        "</script></body>";
+    CHECK(activate_page_video(
+              engine, "https://video.test/watch/123456/", only_previews,
+              &action)
+          && strcmp(action.url,
+                    "https://media.test/previews/666666/b-360.mp4") == 0);
+
+    /* No markers at all: an earlier reference to another video loses to
+       the one whose path carries the page's ID, whatever their qualities. */
+    static const char id_match[] =
+        "<!doctype html><title>IDs</title><body>"
+        "<video controls width=320 height=180></video>"
+        "<script>window.rail = {a: 'https://media.test/v/777777/c-360.mp4'};"
+        "</script>"
+        "<script>window.player && player.load("
+        "'https://media.test/v/123456/c-720.mp4');</script></body>";
+    CHECK(activate_page_video(
+              engine, "https://video.test/watch/123456/", id_match, &action)
+          && strcmp(action.url,
+                    "https://media.test/v/123456/c-720.mp4") == 0);
+
+    /* A slug in the page's address identifies its video the same way. */
+    static const char slug_match[] =
+        "<!doctype html><title>Slugs</title><body>"
+        "<video controls width=320 height=180></video>"
+        "<div data-src='https://media.test/clips/other-clip-name-360.mp4'>"
+        "</div>"
+        "<div data-src='https://media.test/clips/my-garden-tour-720.mp4'>"
+        "</div></body>";
+    CHECK(activate_page_video(
+              engine, "https://video.test/videos/my-garden-tour.html",
+              slug_match, &action)
+          && strcmp(action.url,
+                    "https://media.test/clips/my-garden-tour-720.mp4") == 0);
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+typedef struct {
+    const char *url;
+    const char *content_type;
+    const char *body;
+    /* One extra response header line ("name: value"), or NULL. */
+    const char *header;
+} JsonMediaRecord;
+
+#define JSON_MEDIA_RECORD_LIMIT 16u
+
+static bool write_json_media_replay(
+    char directory[128], const JsonMediaRecord *records, size_t count)
+{
+    /* mkdtemp's template: six trailing 'X's. */
+    char template_suffix[7];
+    memset(template_suffix, 'X', 6u);
+    template_suffix[6] = '\0';
+    snprintf(directory, 128, "/tmp/tilefinch-json-media-%s",
+             template_suffix);
+    if (mkdtemp(directory) == NULL) return false;
+    bool ok = true;
+    for (size_t i = 0; ok && i < count; i++) {
+        char path[192];
+        size_t length = strlen(records[i].body);
+        snprintf(path, sizeof(path), "%s/%04zu.body", directory, i);
+        FILE *body = fopen(path, "wb");
+        ok = body != NULL
+            && fwrite(records[i].body, 1, length, body) == length;
+        if (body != NULL) ok = fclose(body) == 0 && ok;
+        uint64_t hash = UINT64_C(14695981039346656037);
+        for (size_t at = 0; at < length; at++) {
+            hash ^= (unsigned char) records[i].body[at];
+            hash *= UINT64_C(1099511628211);
+        }
+        snprintf(path, sizeof(path), "%s/%04zu.meta", directory, i);
+        FILE *meta = ok ? fopen(path, "wb") : NULL;
+        ok = meta != NULL && fprintf(
+            meta,
+            "psp-http-trace=10\ncookie-values=redacted\n"
+            "method=GET\nurl=%s\nlogical-request-url=%s\nsuccess=1\n"
+            "async-delay-pumps=0\nexternal-cancel=0\n"
+            "transport-timeout=0\nredirect-origin-tainted=0\nerror=\n"
+            "request-body-length=0\n"
+            "request-body-hash=cbf29ce484222325\nrequest-content-type=\n"
+            "request-cookie-bytes=0\nrequest-has-cf-clearance=0\n"
+            "request-extra-header-bytes=0\nrequest-extra-header-shape=\n"
+            "request-allow-http-errors=1\nrequest-enforce-cors=0\n"
+            "request-redirect-same-origin-only=0\n"
+            "request-cors-cached-response-validated=0\n"
+            "request-if-none-match=\nrequest-if-modified-since=\n"
+            "request-referer=\nrequest-origin=\nrequest-accept=\n"
+            "request-sec-fetch-dest=\nrequest-sec-fetch-mode=\n"
+            "request-sec-fetch-site=\nrequest-send-client-hints=0\n"
+            "request-client-hint-tokens=\nrequest-client-hint-origin=\n"
+            "request-send-low-client-hints=1\nrequest-sec-fetch-user=0\n"
+            "request-upgrade-insecure=0\nrequest-user-agent=\n"
+            "request-diagnostic-mobile-safari=0\nrequest-credentials=0\n"
+            "request-credential-origin=\nrequest-initiator-url=\n"
+            "request-referrer-source=\nrequest-referrer-policy=\n"
+            "status=200\nlength=%zu\nresponse-body-hash=%016llx\n"
+            "effective-url=%s\ncontent-type=%s\netag=\nlast-modified=\n"
+            "cf-mitigated=\naccept-ch=\ncritical-ch=\nserver=fixture\n"
+            "cf-ray=\nresponse-referrer-policy-metadata-valid=1\n"
+            "response-referrer-policy-present=0\n"
+            "response-referrer-policy=\n"
+            "response-security-headers-truncated=0\n"
+            "response-header-count=%d\nset-cookie-count=0\n"
+            "response-header-0=content-type: %s\n",
+            records[i].url, records[i].url, length,
+            (unsigned long long) hash, records[i].url,
+            records[i].content_type, records[i].header == NULL ? 1 : 2,
+            records[i].content_type) > 0;
+        if (ok && records[i].header != NULL)
+            ok = fprintf(meta, "response-header-1=%s\n",
+                         records[i].header) > 0;
+        if (meta != NULL) ok = fclose(meta) == 0 && ok;
+    }
+    char path[192];
+    snprintf(path, sizeof(path), "%s/trace.meta", directory);
+    FILE *clock = ok ? fopen(path, "wb") : NULL;
+    ok = clock != NULL
+        && fprintf(clock, "psp-http-trace-clock=1\norigin-ms=1000\n") > 0;
+    if (clock != NULL) ok = fclose(clock) == 0 && ok;
+    return ok;
+}
+
+static void remove_json_media_replay(const char *directory, size_t count)
+{
+    char path[192];
+    for (size_t i = 0; i < count; i++) {
+        snprintf(path, sizeof(path), "%s/%04zu.body", directory, i);
+        (void) unlink(path);
+        snprintf(path, sizeof(path), "%s/%04zu.meta", directory, i);
+        (void) unlink(path);
+    }
+    snprintf(path, sizeof(path), "%s/trace.meta", directory);
+    (void) unlink(path);
+    (void) rmdir(directory);
+}
+
+/* Loads a replayed page whose script fetches `endpoint`, lets the fetch
+   complete, and activates its video. Reports how many requests the
+   activation itself issued. */
+static bool json_media_activate(
+    BrowserEngine *engine, const char *url, ControllerAction *action,
+    size_t *activation_requests, bool *remembered)
+{
+    memset(action, 0, sizeof(*action));
+    if (!browser_engine_load_url(engine, url, true)) return false;
+    for (unsigned step = 0; step < 32u; step++)
+        (void) browser_engine_advance_runtime(engine, 16, 16, NULL);
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    *remembered = navigation->page.document.media_json_responses[0] != NULL;
+    FetchTraceReplayStats before = {0}, after = {0};
+    (void) fetch_trace_replay_stats(&before);
+    bool activated = browser_engine_focus_move(engine, true)
+        && browser_engine_activate(engine, action)
+        && action->type == CONTROLLER_ACTION_MEDIA;
+    (void) fetch_trace_replay_stats(&after);
+    *activation_requests = after.request_count - before.request_count;
+    return activated;
+}
+
+#define JSON_MEDIA_PAGE(endpoint_) \
+    "<!doctype html><title>Watch</title><body><div class=player>" \
+    "<video controls width=320 height=180></video>" \
+    "<script>var player={mediaDefinitions:[{format:'mp4'," \
+    "videoUrl:'" endpoint_ "'}]};fetch('" endpoint_ "')" \
+    ".then(function(r){return r.text()}).then(function(t){" \
+    "document.title='fetched '+t.length})</script></div>" \
+    "<ul class=related><li><img class=thumb alt='' " \
+    "data-src='https://media.test/v/777777/clip-360.mp4'></li></ul>" \
+    "</body>"
+#define JSON_MEDIA_PREVIEW "https://media.test/v/777777/clip-360.mp4"
+#define JSON_MEDIA_RENDITIONS \
+    "[{\"quality\":\"720\",\"videoUrl\":\"https:\\/\\/cdn.test\\/v\\/a.mp4\"," \
+    "\"format\":\"mp4\",\"defaultQuality\":false}," \
+    "{\"videoUrl\":\"https://cdn.test/v/b.mp4\",\"quality\":\"480\"," \
+    "\"format\":\"mp4\"}," \
+    "{\"format\":\"mp4\",\"quality\":240," \
+    "\"videoUrl\":\"https://cdn.test/v/c.mp4\"}]"
+
+/* Many players fetch their rendition list as JSON from their own origin:
+   the page names only the endpoint. Activation reads the rendition lists
+   the page's own scripts fetched (never fetching anything itself), with
+   the ordinary URL resolution, CSP media-src check and quality policy. A
+   non-JSON response is never remembered, and page-load discovery never
+   reads what was. */
+static int test_page_video_json_renditions(void)
+{
+    static char oversized[96u * 1024u + 512u];
+    int used = snprintf(oversized, sizeof(oversized),
+        "[{\"quality\":\"240\",\"videoUrl\":\"https://cdn.test/v/c.mp4\","
+        "\"pad\":\"");
+    CHECK(used > 0);
+    memset(oversized + used, 'x', 96u * 1024u);
+    memcpy(oversized + used + 96u * 1024u, "\"}]", 4u);
+    const JsonMediaRecord records[] = {
+        {"https://video.test/watch/1/", "text/html",
+         JSON_MEDIA_PAGE("https://video.test/media/mp4/?s=one"), NULL},
+        {"https://video.test/media/mp4/?s=one",
+         "application/json; charset=utf-8", JSON_MEDIA_RENDITIONS, NULL},
+        /* Root-relative files whose kind only a format key names; the
+           endpoint's address carries the page's ID. */
+        {"https://video.test/watch/123456/", "text/html",
+         JSON_MEDIA_PAGE("/api/video/123456/sources"), NULL},
+        {"https://video.test/api/video/123456/sources", "application/json",
+         "{\"id\":123456,\"renditions\":[{\"label\":\"360p\","
+         "\"file\":\"/stream/q360\",\"type\":\"video/mp4\"},"
+         "{\"label\":\"240p\",\"file\":\"/stream/q240\","
+         "\"type\":\"video/mp4\"}]}", NULL},
+        {"https://video.test/watch/3/", "text/html",
+         JSON_MEDIA_PAGE("https://api.test/media/mp4/?s=three"), NULL},
+        {"https://api.test/media/mp4/?s=three", "application/json",
+         JSON_MEDIA_RENDITIONS, "access-control-allow-origin: *"},
+        {"https://video.test/watch/4/", "text/html",
+         JSON_MEDIA_PAGE("/media/mp4/?s=four"),
+         "content-security-policy: media-src https://media.test"},
+        {"https://video.test/media/mp4/?s=four", "application/json",
+         JSON_MEDIA_RENDITIONS, NULL},
+        {"https://video.test/watch/5/", "text/html",
+         JSON_MEDIA_PAGE("/media/mp4/?s=five"), NULL},
+        {"https://video.test/media/mp4/?s=five", "application/json",
+         oversized, NULL},
+        {"https://video.test/watch/6/", "text/html",
+         JSON_MEDIA_PAGE("/media/mp4/?s=six"), NULL},
+        {"https://video.test/media/mp4/?s=six", "application/javascript",
+         "setup(" JSON_MEDIA_RENDITIONS ")", NULL},
+        /* Qualities named by the keys the renditions sit under, and an HLS
+           stream beside the files. */
+        {"https://video.test/watch/7/", "text/html",
+         JSON_MEDIA_PAGE("/xhr/video/7"), NULL},
+        {"https://video.test/xhr/video/7", "application/json",
+         "{\"sources\":{\"mp4\":{\"720p HD\":{\"src\":"
+         "\"https://cdn.test/s/x7.mp4\"},\"240p\":{\"src\":"
+         "\"https://cdn.test/s/x2.mp4\"}},\"hls\":{\"auto\":{\"src\":"
+         "\"https://cdn.test/s/master.m3u8\"}}}}", NULL},
+    };
+    const size_t count = sizeof(records) / sizeof(records[0]);
+    CHECK(count <= JSON_MEDIA_RECORD_LIMIT);
+    char directory[128] = {0}, error[256] = {0};
+    CHECK(write_json_media_replay(directory, records, count)
+          && fetch_trace_replay_begin_response_keyed(
+                 directory, error, sizeof(error)));
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 16u * MIB;
+    config.session_cache_limit = 256u * 1024u;
+    config.tile_capacity = 2;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    BrowserEngine *engine = browser_engine_create(
+        &config, error, sizeof(error));
+    CHECK(engine != NULL);
+    ControllerAction action;
+    size_t requests = 0;
+    bool remembered = false;
+
+    /* The page names only its endpoint; the rendition list ranks above a
+       related video's preview, and its 240p rendition wins by the quality
+       key, whatever the key order or the URL says. */
+    CHECK(json_media_activate(engine, "https://video.test/watch/1/",
+                              &action, &requests, &remembered)
+          && remembered && requests == 0u
+          && strcmp(action.url, "https://cdn.test/v/c.mp4") == 0
+          && action.media_kind == MEDIA_DISCOVERY_MP4);
+    /* Page-load discovery never reads the remembered responses. */
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    char found[512];
+    CHECK(media_discover_document_candidate(
+              &navigation->page.document, found, sizeof(found), NULL)
+          && strcmp(found, JSON_MEDIA_PREVIEW) == 0);
+    /* The memo is an optional cache: it yields when the Budget needs
+       room. */
+    Budget *budget = browser_engine_budget(engine);
+    (void) budget_make_room(budget, budget->limit);
+    CHECK(navigation->page.document.media_json_responses[0] == NULL);
+
+    /* A format key names the kind of a suffix-less, root-relative file. */
+    CHECK(json_media_activate(engine, "https://video.test/watch/123456/",
+                              &action, &requests, &remembered)
+          && remembered && requests == 0u
+          && strcmp(action.url, "https://video.test/stream/q240") == 0
+          && action.media_kind == MEDIA_DISCOVERY_MP4);
+
+    /* A cross-origin response the page may read is remembered too, and
+       activation fetches nothing itself. */
+    CHECK(json_media_activate(engine, "https://video.test/watch/3/",
+                              &action, &requests, &remembered)
+          && remembered && requests == 0u
+          && strcmp(action.url, "https://cdn.test/v/c.mp4") == 0);
+
+    /* The page's CSP media-src refuses the rendition's host. */
+    CHECK(!json_media_activate(engine, "https://video.test/watch/4/",
+                               &action, &requests, &remembered)
+          && remembered && strstr(action.url, "cdn.test") == NULL);
+
+    /* A body past 64 KiB is read to its first 256 KiB; a non-JSON body
+       is ignored. */
+    CHECK(json_media_activate(engine, "https://video.test/watch/5/",
+                              &action, &requests, &remembered)
+          && remembered
+          && strcmp(action.url, "https://cdn.test/v/c.mp4") == 0);
+    CHECK(json_media_activate(engine, "https://video.test/watch/6/",
+                              &action, &requests, &remembered)
+          && !remembered
+          && strcmp(action.url, JSON_MEDIA_PREVIEW) == 0);
+
+    char alternates[1024];
+    CHECK(json_media_activate(engine, "https://video.test/watch/7/",
+                              &action, &requests, &remembered)
+          && remembered
+          && strcmp(action.url, "https://cdn.test/s/x2.mp4") == 0);
+    media_action_alternates(&action, alternates, sizeof(alternates));
+    CHECK(strcmp(alternates, "2:https://cdn.test/s/master.m3u8") == 0);
+
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    fetch_trace_end();
+    remove_json_media_replay(directory, count);
+    return 0;
+}
+
+#define EMBED_HOP_PAGE(id_) \
+    "<!doctype html><title>Watch</title><meta property=og:title " \
+    "content=\"Clip " id_ "\"><meta name=twitter:player " \
+    "content=https://player.test/embed/" id_ "><body><p>Story</p>" \
+    "<video controls width=320 height=180></video></body>"
+#define EMBED_HOP_PLAYER(id_) \
+    "<!doctype html><title>Player</title><body><script>" \
+    "fetch('https://cdn.test/measurements/" id_ "-1555KB.ts')" \
+    ".then(function(r){return r.text()}).then(function(){" \
+    "return fetch('https://api.test/related?id=" id_ "')})" \
+    ".then(function(r){return r.text()}).then(function(){" \
+    "return fetch('https://api.test/v1/play/" id_ "')})" \
+    ".then(function(r){return r.text()}).then(function(t){" \
+    "document.title='fetched '+t.length})</script></body>"
+#define EMBED_HOP_ALLOW "access-control-allow-origin: *"
+
+static BrowserEmbedHopStatus embed_hop_run(
+    BrowserEngine *engine, ControllerAction *action, unsigned steps)
+{
+    BrowserEmbedHopStatus status = BROWSER_EMBED_HOP_NONE;
+    for (unsigned step = 0; step < steps; step++) {
+        (void) browser_engine_advance_runtime(engine, 16, 16, NULL);
+        status = browser_engine_embed_hop_poll(engine, action);
+        if (status != BROWSER_EMBED_HOP_WAITING) break;
+    }
+    return status;
+}
+
+/* The embed hop: a page with nothing playable that declares a player page
+   offers it from the declared-video card and from its <video>; executing
+   that navigation loads the player page, and the first stream its own
+   requests name (identity-matched; never a bandwidth-test download or a
+   related video) is handed over as a page-video action. Closing the
+   player goes Back to the page; a player page that names nothing playable
+   times out (and Back restores the page too); any other navigation ends
+   the hop. */
+static int test_embed_hop_flow(void)
+{
+    const JsonMediaRecord records[] = {
+        {"https://news.test/watch/1/", "text/html", EMBED_HOP_PAGE("abc123"),
+         NULL},
+        {"https://player.test/embed/abc123", "text/html",
+         EMBED_HOP_PLAYER("abc123"), NULL},
+        {"https://cdn.test/measurements/abc123-1555KB.ts", "video/mp2t",
+         "G@\x11\x10" "abc123 m3u8 mp4 .m3u8 binary-ish payload",
+         EMBED_HOP_ALLOW},
+        {"https://api.test/related?id=abc123", "application/json",
+         "[{\"id\":\"777777\",\"hls\":\"https://cdn.test/777777/index.m3u8\"}]",
+         EMBED_HOP_ALLOW},
+        {"https://api.test/v1/play/abc123", "application/json",
+         "{\"data\":\"https:\\/\\/cdn.test\\/live\\/abc123\\/index.m3u8"
+         "?token=t\\u0026e=9\"}", EMBED_HOP_ALLOW},
+        {"https://news.test/watch/2/", "text/html", EMBED_HOP_PAGE("zzz999"),
+         NULL},
+        {"https://player.test/embed/zzz999", "text/html",
+         EMBED_HOP_PLAYER("zzz999"), NULL},
+        {"https://cdn.test/measurements/zzz999-1555KB.ts", "video/mp2t",
+         "G@\x11\x10" "zzz999", EMBED_HOP_ALLOW},
+        {"https://api.test/related?id=zzz999", "application/json",
+         "[{\"id\":\"888888\",\"mp4\":\"https://cdn.test/888888.mp4\"}]",
+         EMBED_HOP_ALLOW},
+        {"https://api.test/v1/play/zzz999", "application/json",
+         "{\"state\":\"offline\",\"poster\":\"https://cdn.test/p.jpg\","
+         "\"error\":\"https://cdn.test/static/error.mp4\"}", EMBED_HOP_ALLOW},
+        {"https://news.test/other/", "text/html",
+         "<!doctype html><title>Other</title><p>Other page</p>", NULL},
+    };
+    const size_t count = sizeof(records) / sizeof(records[0]);
+    CHECK(count <= JSON_MEDIA_RECORD_LIMIT);
+    char directory[128] = {0}, error[256] = {0};
+    CHECK(write_json_media_replay(directory, records, count)
+          && fetch_trace_replay_begin_response_keyed(
+                 directory, error, sizeof(error)));
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 16u * MIB;
+    config.session_cache_limit = 256u * 1024u;
+    config.tile_capacity = 2;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    BrowserEngine *engine = browser_engine_create(
+        &config, error, sizeof(error));
+    CHECK(engine != NULL);
+    browser_engine_test_set_recovery_time_us(1000000u);
+    ControllerAction action;
+    char url[NAVIGATION_URL_LIMIT];
+
+    /* The card's Play and the page's own <video> both offer the hop. */
+    CHECK(browser_engine_load_url(engine, "https://news.test/watch/1/", true));
+    BrowserController *controller = browser_engine_controller(engine);
+    memset(&action, 0, sizeof(action));
+    CHECK(controller_build_document_media_action(controller, &action)
+          && action.type == CONTROLLER_ACTION_NAVIGATE && action.embed_hop
+          && strcmp(action.url, "https://player.test/embed/abc123") == 0);
+    memset(&action, 0, sizeof(action));
+    CHECK(browser_engine_focus_move(engine, true)
+          && browser_engine_activate(engine, &action)
+          && action.type == CONTROLLER_ACTION_NAVIGATE && action.embed_hop
+          && strcmp(action.url, "https://player.test/embed/abc123") == 0
+          && !browser_engine_embed_hop_active(engine));
+
+    /* The player page loads with the player-page blocklist for its own
+       requests only, and hands over its own stream. */
+    CHECK(browser_engine_execute_action(engine, &action, 4u * MIB, 20000)
+          && browser_engine_embed_hop_active(engine)
+          && browser_engine_current_entry(engine, url, sizeof(url), NULL)
+          && strcmp(url, "https://player.test/embed/abc123") == 0);
+    ContentBlockerMetrics blocker = {0};
+    CHECK(browser_engine_content_blocker_metrics(engine, &blocker));
+    CHECK(embed_hop_run(engine, &action, 64u) == BROWSER_EMBED_HOP_READY
+          && action.type == CONTROLLER_ACTION_MEDIA
+          && action.media_kind == MEDIA_DISCOVERY_HLS
+          && strcmp(action.url, "https://cdn.test/live/abc123/index.m3u8"
+                                "?token=t&e=9") == 0
+          && action.body_length == 0u
+          && browser_engine_embed_hop_poll(engine, &action)
+                 == BROWSER_EMBED_HOP_PLAYING);
+    /* The player closed: Back restores the page. */
+    CHECK(browser_engine_embed_hop_take_return(engine)
+          && !browser_engine_embed_hop_active(engine)
+          && browser_engine_history_move(engine, false)
+          && browser_engine_current_entry(engine, url, sizeof(url), NULL)
+          && strcmp(url, "https://news.test/watch/1/") == 0
+          && browser_engine_page_loaded(engine));
+
+    /* The stream answers that it is offline (its open failed with a
+       STREAM OFFLINE OR NOT AVAILABLE failure, as engine text or as the
+       panel's headline): the hop ends, as the timeout does, and Back
+       restores the page. A format refusal keeps the hop and its panel. */
+    static const char *const unavailable[] = {
+        "HLS response authority refused (HTTP 404)",
+        "STREAM OFFLINE OR NOT AVAILABLE\nHTTP 404"
+    };
+    for (size_t at = 0; at < 2u; at++) {
+        memset(&action, 0, sizeof(action));
+        CHECK(controller_build_document_media_action(
+                  browser_engine_controller(engine), &action)
+              && action.embed_hop
+              && browser_engine_execute_action(
+                     engine, &action, 4u * MIB, 20000)
+              && embed_hop_run(engine, &action, 64u)
+                     == BROWSER_EMBED_HOP_READY
+              && !browser_engine_embed_hop_take_unavailable(
+                     engine, "PSP CAN'T PLAY THIS VIDEO FORMAT\n"
+                             "Unsupported H.264 profile")
+              && !browser_engine_embed_hop_take_unavailable(
+                     engine, "HLS response authority refused (HTTP 403)")
+              && browser_engine_embed_hop_poll(engine, &action)
+                     == BROWSER_EMBED_HOP_PLAYING
+              && browser_engine_embed_hop_take_unavailable(
+                     engine, unavailable[at])
+              && !browser_engine_embed_hop_active(engine)
+              && !browser_engine_embed_hop_take_unavailable(
+                     engine, unavailable[at])
+              && browser_engine_history_move(engine, false)
+              && browser_engine_current_entry(engine, url, sizeof(url), NULL)
+              && strcmp(url, "https://news.test/watch/1/") == 0
+              && browser_engine_page_loaded(engine));
+    }
+
+    /* A player page naming only a related video and an error clip: no
+       hand-over, then the timeout, and Back. */
+    CHECK(browser_engine_load_url(engine, "https://news.test/watch/2/", true));
+    memset(&action, 0, sizeof(action));
+    CHECK(controller_build_document_media_action(
+              browser_engine_controller(engine), &action)
+          && action.embed_hop
+          && browser_engine_execute_action(engine, &action, 4u * MIB, 20000)
+          && embed_hop_run(engine, &action, 48u)
+                 == BROWSER_EMBED_HOP_WAITING);
+    browser_engine_test_set_recovery_time_us(
+        1000000u + BROWSER_EMBED_HOP_TIMEOUT_US - 1u);
+    CHECK(browser_engine_embed_hop_poll(engine, &action)
+          == BROWSER_EMBED_HOP_WAITING);
+    browser_engine_test_set_recovery_time_us(
+        1000000u + BROWSER_EMBED_HOP_TIMEOUT_US);
+    CHECK(browser_engine_embed_hop_poll(engine, &action)
+              == BROWSER_EMBED_HOP_TIMED_OUT
+          && !browser_engine_embed_hop_active(engine)
+          && browser_engine_history_move(engine, false)
+          && browser_engine_current_entry(engine, url, sizeof(url), NULL)
+          && strcmp(url, "https://news.test/watch/2/") == 0);
+
+    /* Any other navigation ends a hop in progress. */
+    memset(&action, 0, sizeof(action));
+    CHECK(controller_build_document_media_action(
+              browser_engine_controller(engine), &action)
+          && browser_engine_execute_action(engine, &action, 4u * MIB, 20000)
+          && browser_engine_embed_hop_active(engine)
+          && browser_engine_load_url(engine, "https://news.test/other/", true)
+          && !browser_engine_embed_hop_active(engine)
+          && browser_engine_embed_hop_poll(engine, &action)
+                 == BROWSER_EMBED_HOP_NONE);
+
+    browser_engine_test_set_recovery_time_us(0u);
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    fetch_trace_end();
+    remove_json_media_replay(directory, count);
+    return 0;
+}
+
+/* The device case behind the declared media card on a page that keeps
+   running: a network (streamed) load whose head declares an HLS
+   VideoObject, whose application stays busy (a timer), some of whose
+   chunks fail to load (dynamic_scripts_failed, so the page counts as
+   degraded although its realm runs), and whose player mounts a laid-out
+   <video> with no source beside the declared poster image. The card must
+   be the synthetic one at body top (the live page's poster is not
+   wrapped, and its sourceless video does not stand in for the card), the
+   first Down from no focus lands on it, and Play opens the stream. The
+   frontend's order is followed: asked at commit, then after each runtime
+   turn while deferred. */
+#define BUSY_PAGE \
+    "<!doctype html><html><head><title>Busy</title>" \
+    "<script type=\"application/ld+json\">{\"@type\":\"VideoObject\"," \
+    "\"contentUrl\":\"https://media.talk.test/busy.m3u8\"}</script>" \
+    "</head><body><a href=\"/\">Home</a><p>Busy page.</p><script>" \
+    "setInterval(function(){document.title='Busy';},16);" \
+    "fetch('https://talk.test/never.json');</script></body></html>"
+/* Hold one record's answer for good: a fetch that never ends. */
+static bool test_json_media_replay_delay(const char *directory, size_t index)
+{
+    char path[192];
+    snprintf(path, sizeof(path), "%s/%04zu.meta", directory, index);
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) return false;
+    char meta[4096];
+    size_t length = fread(meta, 1u, sizeof(meta) - 1u, file);
+    fclose(file);
+    meta[length] = '\0';
+    const char *wanted = "async-delay-pumps=0\n";
+    char *at = strstr(meta, wanted);
+    if (at == NULL) return false;
+    file = fopen(path, "wb");
+    if (file == NULL) return false;
+    bool ok = fwrite(meta, 1u, (size_t) (at - meta), file)
+                  == (size_t) (at - meta)
+        && fputs("async-delay-pumps=100000000\n", file) >= 0
+        && fputs(at + strlen(wanted), file) >= 0;
+    return fclose(file) == 0 && ok;
+}
+#define LIVE_PLAYER_PAGE \
+    "<!doctype html><html><head><title>Talk</title>" \
+    "<script type=\"application/ld+json\">{\"@context\":" \
+    "\"https://schema.org\",\"@type\":\"VideoObject\"," \
+    "\"name\":\"Talk fixture\"," \
+    "\"thumbnailUrl\":\"https://talk.test/poster.jpg\"," \
+    "\"contentUrl\":\"https://media.talk.test/master.m3u8\"}</script>" \
+    "</head><body><header><a href=\"/\">Home</a></header><main>" \
+    "<div id=player style=\"position:relative;width:320px;height:180px\">" \
+    "<img src=\"https://talk.test/poster.jpg\" " \
+    "style=\"position:absolute;left:0;top:0;width:320px;height:180px\">" \
+    "</div><p>Talk transcript text.</p><a href=\"/next\">Next talk</a>" \
+    "</main><script>" \
+    "var v=document.createElement('video');" \
+    "v.style.width='320px';v.style.height='180px';" \
+    "document.getElementById('player').appendChild(v);" \
+    "setInterval(function(){document.title='Talk';},40);" \
+    "var s=document.createElement('script');" \
+    "s.src='https://talk.test/chunk-missing.js';" \
+    "document.head.appendChild(s);</script></body></html>"
+
+static int test_declared_media_card_live_player(void)
+{
+    const JsonMediaRecord records[] = {
+        {"https://talk.test/watch/", "text/html", LIVE_PLAYER_PAGE, NULL},
+        {"https://talk.test/busy/", "text/html", BUSY_PAGE, NULL},
+        {"https://talk.test/never.json", "application/json", "{}", NULL},
+    };
+    char directory[128] = {0}, error[256] = {0};
+    CHECK(write_json_media_replay(directory, records, 3u)
+          && test_json_media_replay_delay(directory, 2u)
+          && fetch_trace_replay_begin_response_keyed(
+                 directory, error, sizeof(error)));
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 16u * MIB;
+    config.session_cache_limit = 256u * 1024u;
+    config.tile_capacity = 2;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    BrowserEngine *engine = browser_engine_create(
+        &config, error, sizeof(error));
+    CHECK(engine != NULL);
+    CHECK(browser_engine_load_url(engine, "https://talk.test/watch/", true));
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    /* Past the 250 ms wall settle, inside the 3 s cap: the tick window
+       decides. */
+    browser_engine_test_set_recovery_time_us(
+        navigation->page.committed_us + 1000000u);
+    BrowserDeclaredMediaCard card =
+        browser_engine_prepare_declared_media_card(engine);
+    for (size_t tick = 0u;
+         card == BROWSER_DECLARED_MEDIA_CARD_DEFERRED && tick < 64u;
+         tick++) {
+        CHECK(browser_engine_advance_runtime(engine, 16u, 4u, NULL));
+        card = browser_engine_prepare_declared_media_card(engine);
+    }
+    navigation = browser_engine_navigation(engine);
+    PocDocument *document = &navigation->page.document;
+    /* The device condition: degraded by failed chunks, still running. */
+    CHECK(navigation->page.script_result.dynamic_scripts_failed != 0u
+          && script_runtime_has_pending_author_work(navigation->page.runtime));
+    lxb_dom_node_t *node = document->declared_video_card_node;
+    size_t marker_length = 0u;
+    const char *marker = node == NULL ? NULL : document_attribute(
+        node, "data-tilefinch-declared-media-card", &marker_length);
+    CHECK(card == BROWSER_DECLARED_MEDIA_CARD_INSTALLED
+          && strcmp(browser_engine_declared_media_card_reason(engine),
+                    "installed") == 0
+          && node == document_body_node(document)->first_child
+          && marker != NULL && marker_length == sizeof("synthetic") - 1u
+          && memcmp(marker, "synthetic", marker_length) == 0);
+    ControllerAction action;
+    memset(&action, 0, sizeof(action));
+    BrowserController *controller = browser_engine_controller(engine);
+    CHECK(controller->focus_kind == CONTROLLER_FOCUS_NONE
+          && browser_engine_focus_direction(engine, CONTROLLER_FOCUS_DOWN)
+          && controller->focus_kind == CONTROLLER_FOCUS_CONTROL
+          && navigation->page.layout.controls[controller->focus_index].node
+                 == node
+          && browser_engine_activate(engine, &action)
+          && action.type == CONTROLLER_ACTION_MEDIA
+          && action.media_kind == MEDIA_DISCOVERY_HLS
+          && strcmp(action.url, "https://media.talk.test/master.m3u8") == 0);
+
+    /* A page that never goes quiet: a 16 ms timer and a fetch that never
+       answers. The tick window cannot settle in time, so the wall-clock cap
+       (3 s after commit) decides, with no further runtime turns needed. */
+    CHECK(browser_engine_load_url(engine, "https://talk.test/busy/", true));
+    navigation = browser_engine_navigation(engine);
+    const uint64_t committed = navigation->page.committed_us;
+    browser_engine_test_set_recovery_time_us(committed + 500000u);
+    card = browser_engine_prepare_declared_media_card(engine);
+    for (size_t tick = 0u; tick < 4u; tick++)
+        CHECK(browser_engine_advance_runtime(engine, 16u, 4u, NULL));
+    CHECK(card == BROWSER_DECLARED_MEDIA_CARD_DEFERRED
+          && script_runtime_has_pending_author_work(navigation->page.runtime)
+          && browser_engine_prepare_declared_media_card(engine)
+                 == BROWSER_DECLARED_MEDIA_CARD_DEFERRED);
+    browser_engine_test_set_recovery_time_us(committed + 2900000u);
+    CHECK(browser_engine_prepare_declared_media_card(engine)
+              == BROWSER_DECLARED_MEDIA_CARD_DEFERRED);
+    browser_engine_test_set_recovery_time_us(committed + 3000000u);
+    card = browser_engine_prepare_declared_media_card(engine);
+    navigation = browser_engine_navigation(engine);
+    node = navigation->page.document.declared_video_card_node;
+    memset(&action, 0, sizeof(action));
+    CHECK(card == BROWSER_DECLARED_MEDIA_CARD_INSTALLED
+          && script_runtime_has_pending_author_work(navigation->page.runtime)
+          && node == document_body_node(&navigation->page.document)->first_child
+          && browser_engine_focus_node(engine, node)
+          && browser_engine_activate(engine, &action)
+          && strcmp(action.url, "https://media.talk.test/busy.m3u8") == 0);
+
+    browser_engine_test_set_recovery_time_us(0u);
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    fetch_trace_end();
+    remove_json_media_replay(directory, 3u);
+    return 0;
+}
+#undef BUSY_PAGE
+#undef LIVE_PLAYER_PAGE
 
 static int test_page_audio_activation(void)
 {
@@ -6270,5 +7340,45 @@ static int test_script_limit_derivation(void)
     CHECK(!browser_config_apply_script_limits(
               NULL, SCRIPT_EXECUTION_PROFILE_LAB, 32u, 1u * MIB,
               512u * 1024u));
+    return 0;
+}
+
+/* browser_engine_hold_page_network's ownership: one hold per page domain,
+   released explicitly or at shutdown (the retained domain reference). The
+   script/fetch behaviour of a hold is covered at the navigation layer
+   (tilefinch-dynamic-script-async-tests). */
+static int test_page_network_hold_ownership(void)
+{
+    BrowserConfig config;
+    browser_config_init(&config, NULL);
+    config.memory_limit = 16u * MIB;
+    config.resources.enabled = false;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL && browser_engine_commit_html(
+        engine, "https://page-hold.test/", "<p>page</p>", 11u, true));
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    FetchScheduler *view = fetch_scheduler_create_in_domain(
+        navigation->page.fetch_domain, 1, 4096);
+    CHECK(view != NULL && !fetch_scheduler_held(view)
+          && !browser_engine_page_network_held(engine));
+    (void) browser_engine_hold_page_network(engine, "video selected");
+    CHECK(browser_engine_page_network_held(engine)
+          && fetch_scheduler_held(view)
+          && fetch_scheduler_enqueue_would_block(view, 1024)
+          && browser_engine_hold_page_network(engine, "again") == 0u);
+    FetchRequest request = {.method = "GET"};
+    CHECK(fetch_scheduler_enqueue(view, "https://page-hold.test/a",
+                                  &request, 1024, 1000) == 0
+          && strcmp(fetch_scheduler_last_error(view),
+                    "page network held") == 0);
+    browser_engine_release_page_network(engine);
+    CHECK(!browser_engine_page_network_held(engine)
+          && !fetch_scheduler_held(view));
+    fetch_scheduler_destroy(view);
+    (void) browser_engine_hold_page_network(engine, "video selected");
+    CHECK(browser_engine_page_network_held(engine)
+          && browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
     return 0;
 }

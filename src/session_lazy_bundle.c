@@ -275,3 +275,29 @@ size_t browser_session_lazy_bundle_pending_reclaim(BrowserSession *session,
     }
     return released;
 }
+
+size_t browser_session_lazy_bundle_pending_holds(
+    const BrowserSession *session, const BrowserSharedBody *body)
+{
+    size_t holds = 0;
+    for (size_t i = 0; body != NULL
+             && i < browser_session_lazy_bundle_pending_count(session); i++)
+        if (session->lazy_bundle_pending->records[i].body == body) holds++;
+    return holds;
+}
+
+void browser_session_lazy_bundle_pending_release_body(
+    BrowserSession *session, const BrowserSharedBody *body)
+{
+    for (size_t i = 0; body != NULL
+             && i < browser_session_lazy_bundle_pending_count(session); i++) {
+        BrowserLazyBundlePendingRecord *entry =
+            &session->lazy_bundle_pending->records[i];
+        if (entry->body != body) continue;
+        pending_digest(session, entry, SIZE_MAX);
+        if (!entry->digested) {
+            pending_remove(session, i);
+            i--;
+        }
+    }
+}

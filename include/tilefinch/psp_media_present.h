@@ -237,6 +237,10 @@ typedef struct {
        width for a staged one, whose rows are exactly as wide as the texture. */
     int stride_pixels;
     bool staged;
+    /* PSP 5650 pixels (the software decoder's slot) drawn into a 16-bit page
+       buffer -- texture and target share the format, so no channel moves --
+       in narrow column slices the texture cache can hold. */
+    bool rgb565;
 } PspMediaPresentTexture;
 
 /*
@@ -335,6 +339,9 @@ bool psp_media_present_ge_stage_rows(
 /* Same-binary comparison of the copy only; no change to decoder/scanout. */
 void psp_media_present_ge_stage_rows_enabled(bool enabled);
 uint32_t psp_media_present_ge_stage_rows_copies(void);
+/* boot.cfg validation_swdec_present=2: draw 16-bit pictures as one sprite
+   per quad, as the reverted attempt did, to isolate the slicing. */
+void psp_media_present_ge_unsliced(bool unsliced);
 #endif
 
 /* Draw one retained opaque RGB565 UI rectangle into an RGBA8888 video back
@@ -751,6 +758,17 @@ bool psp_media_present_skip_allowed(
     const PspMediaPresentRecord *record, uint64_t identity,
     uint64_t generation, const PspMediaPresentRect *video,
     unsigned buffer_index, bool chrome_paints);
+
+/*
+ * Whether the 32-bit GE video surface should own the panel for this present.
+ * The surface only draws RGBA8888 pictures. A 16-bit picture (the software
+ * decoder's) is refused after the surface has been entered, and entering
+ * anyway switched scanout 565 -> 8888 -> 565 on every frame: the bridge
+ * frame, then a page buffer the hand-back left black, every third flip.
+ */
+bool psp_media_present_video_surface_wanted(
+    bool video_owns_screen, bool ge_smooth_requested, bool engine_ready,
+    bool picture_rgba8888);
 
 /* Note an overlay-free present of `identity` at `video`. */
 void psp_media_present_record(

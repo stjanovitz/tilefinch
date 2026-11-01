@@ -82,14 +82,7 @@ bool psp_media_request_seek_with_resume(
        range windows ordinary playback needed. Keep the current picture and
        move only the target marker; Cross below performs one committed seek. */
     if (preview) {
-        if (psp_media_scrub_begin(&media->scrub, resume_playing))
-            media->job_restore_us = media->clock_us;
-        if (!media->machine.preview_active) {
-            psp_media_session_dispatch_event(media, (PspMediaEvent) {
-                .type = PSP_MEDIA_EVENT_PREVIEW_STARTED
-            }, "preview-started");
-        }
-        psp_ui_media_set_seek_preview(&media->ui, target_us);
+        psp_media_begin_preview(media, target_us, resume_playing);
         return true;
     }
     if (!media->audio_only && psp_media_seek_reopens_backend(
@@ -341,6 +334,33 @@ bool psp_media_seek_decode_pump(
                     media, "seek-prime", error, false)) return true;
             if (psp_media_retry_240p(
                     media, "seek-prime", error, false)) return true;
+            /* Never leave playback stopped and silent: resume from the
+               keyframe the demuxer already holds (shown from there, audio
+               aligned to it). */
+            uint64_t keyframe_us = 0;
+            char fallback_error[256] = {0};
+            uint64_t fallback_actual_us = 0;
+            if (psp_media_seek_prime_fallback(
+                    media->job_prime_fell_back, target_us,
+                    media->job_actual_us, &keyframe_us)
+                && media_playback_seek(
+                    media->playback, keyframe_us, &fallback_actual_us,
+                    fallback_error, sizeof(fallback_error))) {
+                printf("tilefinch-media-job: seek-prime-fallback "
+                       "target=%lluus keyframe=%lluus actual=%lluus "
+                       "reason=\"%s\"\n",
+                       (unsigned long long) target_us,
+                       (unsigned long long) keyframe_us,
+                       (unsigned long long) fallback_actual_us, error);
+                media->job_prime_fell_back = true;
+                media->job_target_us = keyframe_us;
+                media->job_actual_us = fallback_actual_us;
+                media->job_prime_audio_us = keyframe_us;
+                media->job_prime_ready_mask = 0;
+                media->clock_us = keyframe_us;
+                psp_media_seek_floor_arm(&media->seek_floor, keyframe_us);
+                return true;
+            }
             psp_media_job_failed(
                 media, "seek prime",
                 error[0] == '\0' ? "SEEK SOURCE COULD NOT PRIME" : error);
@@ -415,10 +435,26 @@ bool psp_media_seek_decode_pump(
         media->have_frame = false;
         memset(&media->frame, 0, sizeof(media->frame));
         uint64_t actual_us = 0;
+        /* Software-decoded video seeks to the keyframe. Landing exactly on
+           the target means decoding every reference picture from the
+           keyframe first, with picture and sound held: on the device that
+           was up to 6 s on an 8.3 s GOP, with the non-reference pictures
+           already skipped (the dispatcher drops them as late), at ~26 ms
+           a decode. Resuming at the keyframe brings both back as soon as
+           the first picture and ~0.5 s of audio are decoded, as many
+           players do for fast seeks. Previews and restores still decode to
+           their exact still, and the firmware decoder keeps exact seeks. */
+        bool keyframe_seek = psp_media_seek_lands_on_keyframe(
+            media->use_swdec, media->audio_only,
+            media->job_preview || restore);
         if (prepared == MEDIA_PLAYBACK_SOURCE_PRIME_FAILED
-            || !media_playback_seek(
-                media->playback, target_us, &actual_us,
-                error, sizeof(error))) {
+            || !(keyframe_seek
+                     ? media_playback_seek_keyframe(
+                           media->playback, target_us, &actual_us,
+                           error, sizeof(error))
+                     : media_playback_seek(
+                           media->playback, target_us, &actual_us,
+                           error, sizeof(error)))) {
             if (psp_media_retry_delivery_failure(
                     media, "seek-reset", error, false)) return true;
             if (psp_media_retry_240p(
@@ -464,6 +500,14 @@ bool psp_media_seek_decode_pump(
                (unsigned long long) target_us,
                (unsigned long long) actual_us,
                media->job_resume_playing ? 1 : 0);
+        if (!decodes_to_the_target && keyframe_seek
+            && actual_us < target_us) {
+            printf("tilefinch-media-job: seek-keyframe target=%lluus "
+                   "keyframe=%lluus\n", (unsigned long long) target_us,
+                   (unsigned long long) actual_us);
+            target_us = actual_us;
+            media->job_target_us = actual_us;
+        }
         if (!decodes_to_the_target) {
             /* A committed seek is complete only after both source windows it
                will actually consume are resident. This is a cooperative job:
@@ -476,6 +520,7 @@ bool psp_media_seek_decode_pump(
             media->job_actual_us = actual_us;
             media->job_prime_audio_us = target_us;
             media->job_prime_ready_mask = 0;
+            media->job_prime_fell_back = false;
             media->job_phase = PSP_MEDIA_JOB_SEEK_PRIME;
             return true;
         }

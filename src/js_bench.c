@@ -26,6 +26,8 @@
 #include "tilefinch/platform.h"
 #include "tilefinch/script_lazy.h"
 
+#include "js_source_store.h"
+
 #define JS_BENCH_LINE_MAX 320
 #define JS_BENCH_TRACE_RECORDS_MAX 4096
 #define JS_BENCH_TRACE_BODY_MAX (4u * 1024u * 1024u)
@@ -218,6 +220,31 @@ static const JsBenchKernel js_bench_kernels[] = {
      " for(let i=0;i<6;i++) src='['+src+','+src+']'; let c=0;"
      " for(let i=0;i<n;i++){ c+=JSON.stringify(JSON.parse(src)).length; }"
      " return c; })"},
+    /* JSON.parse alone over one input built outside the timed call: small
+       (~130 B, one record), medium (~8 KB, 64 records) and large (~260 KB,
+       2048 records) text, each as an ASCII, a Latin-1 (an e-acute in every
+       name: still one byte per character) and a UTF-16 string (CJK and an
+       astral pair in every name). Records mix integers, decimals,
+       booleans, null, an array and an escaped string. */
+#define JS_BENCH_JSON_PARSE(name, iterations, records, ch)                  \
+    {name, iterations, 0,                                                   \
+     "(function(){ const r=[]; for(let i=0;i<" #records ";i++){"            \
+     " r.push({id:i,name:'item " ch " '+i,tags:['alpha','beta'],"           \
+     "price:i*1.25,ok:(i&1)===0,note:'line1\\nline2 \"q\"',nil:null}); }"   \
+     " const src=JSON.stringify(" #records "===1?r[0]:r);"                  \
+     " return function(n){ let c=0; for(let i=0;i<n;i++){"                  \
+     " const v=JSON.parse(src); c=(c+(v.length|0)+(v.id|0))|0; }"           \
+     " return c; }; })()"}
+    JS_BENCH_JSON_PARSE("json_parse_ascii_s", 5000, 1, "x"),
+    JS_BENCH_JSON_PARSE("json_parse_latin1_s", 5000, 1, "\\u00e9"),
+    JS_BENCH_JSON_PARSE("json_parse_utf16_s", 5000, 1, "\\u4e2d\\ud83d\\ude00"),
+    JS_BENCH_JSON_PARSE("json_parse_ascii_m", 100, 64, "x"),
+    JS_BENCH_JSON_PARSE("json_parse_latin1_m", 100, 64, "\\u00e9"),
+    JS_BENCH_JSON_PARSE("json_parse_utf16_m", 100, 64, "\\u4e2d\\ud83d\\ude00"),
+    JS_BENCH_JSON_PARSE("json_parse_ascii_l", 4, 2048, "x"),
+    JS_BENCH_JSON_PARSE("json_parse_latin1_l", 4, 2048, "\\u00e9"),
+    JS_BENCH_JSON_PARSE("json_parse_utf16_l", 4, 2048, "\\u4e2d\\ud83d\\ude00"),
+#undef JS_BENCH_JSON_PARSE
     {"regexp", 20000, 0,
      "(function(n){ const re=/([a-z]+)-(\\d+)/; let c=0;"
      " for(let i=0;i<n;i++){ const m=re.exec('item-'+(i&255)+' abc-42 tail');"
@@ -417,11 +444,14 @@ static int js_bench_selection_valid(const JsBenchOptions *options)
             known = js_bench_selection_name(text + start, span, "poll")
                 || js_bench_selection_name(text + start, span, "gc")
                 || js_bench_selection_name(text + start, span,
-                                           "compile_synthetic");
+                                           "compile_synthetic")
+                || js_bench_selection_name(text + start, span, "tostring");
         if (!known && (js_bench_selection_name(text + start, span,
                                                 "compile_trace")
                        || js_bench_selection_name(text + start, span,
-                                                  "compile_peak")))
+                                                  "compile_peak")
+                       || js_bench_selection_name(text + start, span,
+                                                  "source_store")))
             known = options->trace_dir != NULL
                 && options->trace_dir[0] != '\0';
         if (!known) return 0;
@@ -1017,6 +1047,384 @@ void js_bench_default_options(JsBenchOptions *options)
     options->memory_limit = 16u * 1024u * 1024u;
 }
 
+/* ---- function source outside the heap (js_source_store.h) ---- */
+
+typedef struct {
+    ScriptSourceStore *store;
+} JsBenchSourceHooks;
+
+static int js_bench_source_read(void *opaque, uint32_t id, uint32_t offset,
+                                uint32_t length, char *dest)
+{
+    JsBenchSourceHooks *hooks = opaque;
+    return script_source_store_read(hooks->store, id, offset, length, dest);
+}
+
+static int js_bench_source_query(void *opaque, uint32_t id, uint32_t offset,
+                                 uint32_t length)
+{
+    JsBenchSourceHooks *hooks = opaque;
+    return script_source_store_query(hooks->store, id, offset, length);
+}
+
+static void js_bench_source_release(void *opaque, uint32_t id)
+{
+    JsBenchSourceHooks *hooks = opaque;
+    script_source_store_release(hooks->store, id);
+}
+
+/* Compiles `source` as a classic script on a fresh context: with its text
+   in the heap (store == NULL) or stripped with the text in `store` (added
+   inside the timed region, as the browser does). Returns the compile time
+   and the QuickJS heap the compiled script retains, or -1. */
+static int js_bench_compile_classic(JsBenchRuntime *bench,
+                                    JsBenchSourceHooks *hooks,
+                                    const char *source, size_t length,
+                                    uint64_t *elapsed_ns, size_t *retained)
+{
+    JSContext *context = JS_NewContext(bench->runtime);
+    if (context == NULL) return -1;
+    JS_RunGC(bench->runtime);
+    size_t before = budget_quickjs_pool_js_malloc_current(bench->pool);
+    uint64_t started_ns = js_bench_now_ns(), add_ns = 0;
+    uint32_t id = 0;
+    if (hooks != NULL) {
+        id = script_source_store_add(hooks->store, source, length);
+        add_ns = js_bench_now_ns() - started_ns;
+        /* A sample must measure preserved text: the store must hold the
+           whole text and read it back exactly (checked outside the timed
+           region) or the sample fails. */
+        char *back = id == 0 ? NULL : malloc(length);
+        bool stored = back != NULL
+            && script_source_store_read(hooks->store, id, 0,
+                                        (uint32_t) length, back) == 0
+            && memcmp(back, source, length) == 0;
+        free(back);
+        if (!stored) {
+            script_source_store_release(hooks->store, id);
+            JS_FreeContext(context);
+            return -1;
+        }
+        JS_SetStripInfo(bench->runtime, JS_STRIP_SOURCE);
+        (void) JS_SetExternalSourceId(bench->runtime, id, (uint32_t) length);
+        started_ns = js_bench_now_ns();
+    }
+    JSValue value = JS_Eval(context, source, length, "bench.js",
+                            JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+    if (hooks != NULL) {
+        JS_SetStripInfo(bench->runtime, 0);
+        uint32_t pending = JS_SetExternalSourceId(bench->runtime, 0, 0);
+        if (pending != 0) script_source_store_release(hooks->store, pending);
+    }
+    *elapsed_ns = add_ns + (js_bench_now_ns() - started_ns);
+    size_t after = budget_quickjs_pool_js_malloc_current(bench->pool);
+    *retained = after > before ? after - before : 0;
+    int status = 0;
+    if (JS_IsException(value)) {
+        /* -2: not a classic script (a module); -1: anything else */
+        JSValue exception = JS_GetException(context);
+        JSValue name = JS_GetPropertyStr(context, exception, "name");
+        const char *text = JS_ToCString(context, name);
+        status = text != NULL && strcmp(text, "SyntaxError") == 0 ? -2 : -1;
+        if (text != NULL) JS_FreeCString(context, text);
+        JS_FreeValue(context, name);
+        JS_FreeValue(context, exception);
+    }
+    JS_FreeValue(context, value);
+    JS_FreeContext(context);
+    return status;
+}
+
+/* Per trace JavaScript record of at least 8 KiB (the browser's threshold):
+   the cost of keeping its text out of the heap (a plain copy, or LZ
+   blocks), and its compile with the text in the heap against stripped
+   with the text in a store (plain, the browser's default while a page has
+   room, and LZ). Best of `repeat` each. */
+static void js_bench_run_source_store(JsBenchSession *session,
+                                      JsBenchRuntime *bench,
+                                      uint32_t lazy_threshold)
+{
+    const char *dir = session->options->trace_dir;
+    char path[512];
+    uint64_t copy_ns = 0, lz_ns = 0, keep_ns = 0, plain_ns = 0, lzc_ns = 0;
+    uint64_t bytes = 0, lz_bytes = 0, keep_heap = 0, store_heap = 0;
+    unsigned files = 0, failures = 0, skipped = 0;
+    JsBenchSourceHooks hooks = {NULL};
+    ScriptSourceStore *plain = script_source_store_create(
+        &bench->budget, SCRIPT_SOURCE_STORE_COMPRESS_NEVER);
+    ScriptSourceStore *lz = script_source_store_create(
+        &bench->budget, SCRIPT_SOURCE_STORE_COMPRESS_EAGER);
+    if (plain == NULL || lz == NULL) {
+        session->failed++;
+        script_source_store_destroy(plain);
+        script_source_store_destroy(lz);
+        return;
+    }
+    /* every variant compiles with the same lazy-function settings */
+    JS_SetLazyFunctionThreshold(bench->runtime, (unsigned) lazy_threshold);
+    JS_SetLazyFunctionPreparse(bench->runtime, 1);
+    JS_SetExternalSourceHooks(bench->runtime, js_bench_source_read,
+                              js_bench_source_release, NULL, &hooks);
+    for (unsigned index = 0; index < JS_BENCH_TRACE_RECORDS_MAX; index++) {
+        (void) snprintf(path, sizeof path, "%s/%04u.meta", dir, index);
+        int javascript = js_bench_meta_is_javascript(path);
+        if (javascript < 0) break;
+        if (!javascript) continue;
+        (void) snprintf(path, sizeof path, "%s/%04u.body", dir, index);
+        size_t length = 0;
+        char *source = js_bench_read_file(path, &length);
+        if (source == NULL || length < 8u * 1024u) {
+            free(source);
+            continue;
+        }
+        uint64_t best[5] = {UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX,
+                            UINT64_MAX};
+        size_t held = 0, heap_keep = 0, heap_store = 0;
+        int okay = 1;
+        /* Only classic scripts: one that does not compile as one (a
+           module) is not a sample. */
+        {
+            uint64_t ns = 0;
+            int status = js_bench_compile_classic(bench, NULL, source, length,
+                                                  &ns, &heap_keep);
+            if (status == -2) {
+                free(source);
+                skipped++;
+                continue;
+            }
+            if (status != 0) okay = 0;
+        }
+        for (unsigned attempt = 0; okay && attempt < session->options->repeat;
+             attempt++) {
+            uint64_t t0 = js_bench_now_ns();
+            uint32_t id = script_source_store_add(plain, source, length);
+            uint64_t t1 = js_bench_now_ns();
+            script_source_store_release(plain, id);
+            uint64_t t2 = js_bench_now_ns();
+            uint32_t lz_id = script_source_store_add(lz, source, length);
+            uint64_t t3 = js_bench_now_ns();
+            ScriptSourceStoreStats stats;
+            script_source_store_stats(lz, &stats);
+            held = stats.held_bytes;
+            script_source_store_release(lz, lz_id);
+            if (id == 0 || lz_id == 0) { okay = 0; break; }
+            if (t1 - t0 < best[0]) best[0] = t1 - t0;
+            if (t3 - t2 < best[1]) best[1] = t3 - t2;
+            uint64_t ns = 0;
+            if (js_bench_compile_classic(bench, NULL, source, length, &ns,
+                                         &heap_keep) != 0) { okay = 0; break; }
+            if (ns < best[2]) best[2] = ns;
+            hooks.store = plain;
+            if (js_bench_compile_classic(bench, &hooks, source, length, &ns,
+                                         &heap_store) != 0) { okay = 0; break; }
+            if (ns < best[3]) best[3] = ns;
+            hooks.store = lz;
+            if (js_bench_compile_classic(bench, &hooks, source, length, &ns,
+                                         &heap_store) != 0) { okay = 0; break; }
+            if (ns < best[4]) best[4] = ns;
+        }
+        free(source);
+        if (!okay) {
+            failures++;
+            session->failed++;
+            js_bench_emitf(session, "tilefinch-js-bench: kernel=source_store "
+                           "record=%04u error=\"sample\"", index);
+            continue;
+        }
+        files++;
+        bytes += length;
+        lz_bytes += held;
+        copy_ns += best[0];
+        lz_ns += best[1];
+        keep_ns += best[2];
+        plain_ns += best[3];
+        lzc_ns += best[4];
+        keep_heap += heap_keep;
+        store_heap += heap_store;
+        if (session->options->scale == 0 && files >= 3) break;
+    }
+    JS_SetExternalSourceHooks(bench->runtime, NULL, NULL, NULL, NULL);
+    script_source_store_destroy(plain);
+    script_source_store_destroy(lz);
+    session->total_ns += keep_ns;
+    js_bench_emitf(session,
+                   "tilefinch-js-bench: kernel=source_store files=%u failed=%u "
+                   "not-classic=%u "
+                   "bytes=%llu lz-bytes=%llu copy-us=%llu lz-us=%llu "
+                   "compile-keep-us=%llu compile-plain-us=%llu "
+                   "compile-lz-us=%llu heap-keep=%llu heap-store=%llu",
+                   files, failures, skipped, (unsigned long long) bytes,
+                   (unsigned long long) lz_bytes,
+                   (unsigned long long) (copy_ns / 1000u),
+                   (unsigned long long) (lz_ns / 1000u),
+                   (unsigned long long) (keep_ns / 1000u),
+                   (unsigned long long) (plain_ns / 1000u),
+                   (unsigned long long) (lzc_ns / 1000u),
+                   (unsigned long long) keep_heap,
+                   (unsigned long long) store_heap);
+    if (files == 0) session->failed++;
+}
+
+/* Function.prototype.toString() latency: 1536 functions of about 115 bytes
+   (about 180 KiB of text, eleven 16 KiB blocks), with the text in the heap
+   (keep), in plain store blocks, or in LZ blocks read cold (cycling through
+   eight functions an eighth of the text apart, more blocks than the store
+   keeps decoded: a block decode up to the function per call) and warm (the
+   last function again: no decode). The UTF-8 line repeats it for functions
+   with a non-ASCII string literal, with and without the store's ASCII
+   record (JS_SetExternalSourceQuery()): without it, toString() reads the
+   whole text once to find it is not ASCII, then again a window at a
+   time. */
+typedef struct {
+    int store;      /* 0: text in the heap; else a ScriptSourceStoreCompression + 1 */
+    int query;      /* install the query hook */
+    int cold;       /* cycle through eight functions */
+} JsBenchToStringMode;
+
+/* ns per toString() call for `source` under `mode`, or 0 on failure. */
+static uint64_t js_bench_tostring_case(JsBenchSession *session,
+                                       JsBenchRuntime *bench,
+                                       const char *source, size_t length,
+                                       uint64_t iterations,
+                                       JsBenchToStringMode mode)
+{
+    static const char probe_source[] =
+        "(function(n,cold){var fs=globalThis.fs,k=fs.length,t=0;"
+        "for(var i=0;i<n;i++){t+=fs[cold?k-1-((i&7)*(k>>3)):k-1].toString()"
+        ".length}"
+        "return t})";
+    JsBenchSourceHooks hooks = {NULL};
+    if (mode.store != 0) {
+        hooks.store = script_source_store_create(&bench->budget,
+            (ScriptSourceStoreCompression) (mode.store - 1));
+        if (hooks.store == NULL) return 0;
+        JS_SetExternalSourceHooks(bench->runtime, js_bench_source_read,
+                                  js_bench_source_release, NULL, &hooks);
+        if (mode.query)
+            JS_SetExternalSourceQuery(bench->runtime, js_bench_source_query);
+    }
+    JSContext *context = JS_NewContext(bench->runtime);
+    uint64_t best = UINT64_MAX;
+    int okay = context != NULL;
+    if (okay) {
+        uint32_t id = 0;
+        JS_SetLazyFunctionThreshold(bench->runtime, 128u);
+        JS_SetLazyFunctionPreparse(bench->runtime, 1);
+        if (hooks.store != NULL) {
+            id = script_source_store_add(hooks.store, source, length);
+            okay = id != 0;
+            JS_SetStripInfo(bench->runtime, JS_STRIP_SOURCE);
+            (void) JS_SetExternalSourceId(bench->runtime, id,
+                                          (uint32_t) length);
+        }
+        JSValue result = JS_Eval(context, source, length, "tostring.js",
+                                 JS_EVAL_TYPE_GLOBAL);
+        JS_SetStripInfo(bench->runtime, 0);
+        (void) JS_SetExternalSourceId(bench->runtime, 0, 0);
+        okay = okay && !JS_IsException(result);
+        JS_FreeValue(context, result);
+    }
+    JSValue probe = okay ? JS_Eval(context, probe_source,
+                                   sizeof(probe_source) - 1u, "probe.js",
+                                   JS_EVAL_TYPE_GLOBAL) : JS_UNDEFINED;
+    okay = okay && JS_IsFunction(context, probe);
+    for (unsigned attempt = 0; okay && attempt < session->options->repeat;
+         attempt++) {
+        JSValue args[2] = {JS_NewInt64(context, (int64_t) iterations),
+                           JS_NewBool(context, mode.cold)};
+        uint64_t started = js_bench_now_ns();
+        JSValue value = JS_Call(context, probe, JS_UNDEFINED, 2, args);
+        uint64_t elapsed = js_bench_now_ns() - started;
+        okay = !JS_IsException(value);
+        JS_FreeValue(context, value);
+        if (elapsed < best) best = elapsed;
+    }
+    if (!okay && context != NULL)
+        js_bench_report_exception(session, context, "tostring");
+    JS_FreeValue(context, probe);
+    if (context != NULL) JS_FreeContext(context);
+    JS_RunGC(bench->runtime);
+    JS_SetExternalSourceHooks(bench->runtime, NULL, NULL, NULL, NULL);
+    JS_SetExternalSourceQuery(bench->runtime, NULL);
+    script_source_store_destroy(hooks.store);
+    if (!okay) return 0;
+    session->total_ns += best;
+    uint64_t per = best / (iterations == 0 ? 1 : iterations);
+    return per == 0 ? 1 : per;
+}
+
+/* The bench script: 1536 functions (with a non-ASCII literal each when
+   `utf8`) and globalThis.fs listing them; NULL on failure. */
+static char *js_bench_tostring_source(int utf8, size_t *length_out)
+{
+    enum { FUNCTIONS = 1536 };
+    size_t capacity = FUNCTIONS * 256u + 256u, length = 0;
+    char *source = malloc(capacity);
+    if (source == NULL) return NULL;
+    for (unsigned i = 0; i < FUNCTIONS; i++) {
+        length += (size_t) snprintf(source + length, capacity - length,
+            "function f%u(a,b){var c=a*%u+b;if(c>%u){c-=a}for(var i=0;i<3;"
+            "i++){c+=i*b}return [a,b,c].join('%s')+'%u'}\n", i, i, i * 7u,
+            utf8 ? "\xc3\xa9" : "/", i);
+    }
+    length += (size_t) snprintf(source + length, capacity - length,
+        "globalThis.fs=[");
+    for (unsigned i = 0; i < FUNCTIONS; i++)
+        length += (size_t) snprintf(source + length, capacity - length,
+                                    "%sf%u", i ? "," : "", i);
+    length += (size_t) snprintf(source + length, capacity - length, "];");
+    *length_out = length;
+    return source;
+}
+
+static void js_bench_run_tostring(JsBenchSession *session,
+                                  JsBenchRuntime *bench)
+{
+    enum { PLAIN = SCRIPT_SOURCE_STORE_COMPRESS_NEVER + 1,
+           LZ = SCRIPT_SOURCE_STORE_COMPRESS_EAGER + 1 };
+    uint64_t iterations = js_bench_iterations(session->options, 2000);
+    size_t length = 0;
+    char *source = js_bench_tostring_source(0, &length);
+    if (source == NULL) { session->failed++; return; }
+    static const JsBenchToStringMode ascii_modes[4] = {
+        {0, 0, 1}, {PLAIN, 1, 1}, {LZ, 1, 1}, {LZ, 1, 0}};
+    uint64_t ns_per[5] = {0, 0, 0, 0, 0};
+    for (int mode = 0; mode < 4; mode++) {
+        ns_per[mode] = js_bench_tostring_case(session, bench, source, length,
+                                              iterations, ascii_modes[mode]);
+        if (ns_per[mode] == 0) { session->failed++; break; }
+    }
+    js_bench_emitf(session,
+                   "tilefinch-js-bench: kernel=tostring iters=%llu bytes=%zu "
+                   "keep-ns=%llu plain-ns=%llu lz_cold-ns=%llu lz_warm-ns=%llu",
+                   (unsigned long long) iterations, length,
+                   (unsigned long long) ns_per[0],
+                   (unsigned long long) ns_per[1],
+                   (unsigned long long) ns_per[2],
+                   (unsigned long long) ns_per[3]);
+    free(source);
+    source = js_bench_tostring_source(1, &length);
+    if (source == NULL) { session->failed++; return; }
+    static const JsBenchToStringMode utf8_modes[5] = {
+        {0, 0, 1}, {PLAIN, 0, 1}, {PLAIN, 1, 1}, {LZ, 0, 0}, {LZ, 1, 0}};
+    for (int mode = 0; mode < 5; mode++) {
+        ns_per[mode] = js_bench_tostring_case(session, bench, source, length,
+                                              iterations, utf8_modes[mode]);
+        if (ns_per[mode] == 0) { session->failed++; break; }
+    }
+    js_bench_emitf(session,
+                   "tilefinch-js-bench: kernel=tostring_utf8 iters=%llu "
+                   "bytes=%zu keep-ns=%llu plain-read-twice-ns=%llu "
+                   "plain-ns=%llu lz_warm-read-twice-ns=%llu lz_warm-ns=%llu",
+                   (unsigned long long) iterations, length,
+                   (unsigned long long) ns_per[0],
+                   (unsigned long long) ns_per[1],
+                   (unsigned long long) ns_per[2],
+                   (unsigned long long) ns_per[3],
+                   (unsigned long long) ns_per[4]);
+    free(source);
+}
+
 int js_bench_run(const JsBenchOptions *options, JsBenchEmit emit,
                  void *opaque)
 {
@@ -1074,6 +1482,12 @@ int js_bench_run(const JsBenchOptions *options, JsBenchEmit emit,
     if (effective.trace_dir != NULL && effective.trace_dir[0] != '\0'
         && js_bench_selected(&effective, "compile_trace"))
         js_bench_run_compile_trace(&session, &bench, effective.lazy_threshold);
+    if (js_bench_selected(&effective, "tostring"))
+        js_bench_run_tostring(&session, &bench);
+    if (effective.trace_dir != NULL && effective.trace_dir[0] != '\0'
+        && js_bench_selected(&effective, "source_store"))
+        js_bench_run_source_store(&session, &bench,
+                                  effective.lazy_threshold);
     js_bench_runtime_close(&bench);
     /* Opens its own runtime per record, so only on explicit request. */
     if (effective.trace_dir != NULL && effective.trace_dir[0] != '\0'

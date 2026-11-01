@@ -7,6 +7,7 @@
 #include "tilefinch/budget.h"
 #include "tilefinch/install_paths.h"
 #include "tilefinch/swdec_component.h"
+#include "tilefinch/swdec_component_store.h"
 
 typedef enum {
     PSP_SWDEC_COMPONENT_COLD = 0,
@@ -16,12 +17,11 @@ typedef enum {
     PSP_SWDEC_COMPONENT_FAILED
 } PspSwdecComponentState;
 
-typedef enum {
-    PSP_SWDEC_COMPONENT_FAILURE_NONE = 0,
-    PSP_SWDEC_COMPONENT_FAILURE_MISSING,
-    PSP_SWDEC_COMPONENT_FAILURE_REBUILD,
-    PSP_SWDEC_COMPONENT_FAILURE_RUNTIME
-} PspSwdecComponentFailure;
+typedef TilefinchSwdecFailure PspSwdecComponentFailure;
+#define PSP_SWDEC_COMPONENT_FAILURE_NONE TILEFINCH_SWDEC_FAILURE_NONE
+#define PSP_SWDEC_COMPONENT_FAILURE_MISSING TILEFINCH_SWDEC_FAILURE_MISSING
+#define PSP_SWDEC_COMPONENT_FAILURE_REBUILD TILEFINCH_SWDEC_FAILURE_REBUILD
+#define PSP_SWDEC_COMPONENT_FAILURE_RUNTIME TILEFINCH_SWDEC_FAILURE_RUNTIME
 
 /*
  * Process-lifetime owner for the optional software decoder.
@@ -30,13 +30,12 @@ typedef enum {
  * a route needs the component. `took_me` is deliberately monotonic between
  * suspend cycles: after the first successful attach, ordinary firmware AVC
  * must not be used until restore has completed. The user PRX may be unloaded
- * only after a successful ME restore; a partial takeover retains both module
- * and budget reservation rather than freeing executable memory still in use.
+ * only after a successful ME restore; a partial takeover retains the module
+ * rather than freeing executable memory still in use.
  */
 typedef struct {
     Budget *budget;
     const TilefinchInstallPaths *install_paths;
-    BudgetReservation resident_reservation;
     TilefinchSwdecComponentApi api;
     int module_id;
     int last_native_error;
@@ -47,6 +46,15 @@ typedef struct {
     bool shared_install;
 } PspSwdecComponent;
 
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+/* Validation builds only: TILEFINCH_SWDEC_VALIDATION_* flags (boot.cfg
+   validation_swdec_reference) for the component's start block, set at boot
+   before the component loads. */
+void psp_swdec_component_set_validation_flags(uint32_t flags);
+/* The steady window (swdec_window.h) opened or closed: advance the mark the
+   component's start block points at. */
+void psp_swdec_component_window_step(void);
+#endif
 void psp_swdec_component_init(
     PspSwdecComponent *component, Budget *budget,
     const TilefinchInstallPaths *install_paths);

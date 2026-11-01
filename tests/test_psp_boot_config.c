@@ -87,6 +87,27 @@ static int test_game_audio_reference_selector(void)
     config.validation_game_audio_reference = 2;
     CHECK(!psp_boot_config_validate(&config, &invalid));
     CHECK(strcmp(invalid, "validation_game_audio_reference") == 0);
+    config.validation_game_audio_reference = 0;
+    config.validation_swdec_reference = 1536;
+    CHECK(psp_boot_config_validate(&config, &invalid));
+    config.validation_swdec_reference = 2047;
+    CHECK(psp_boot_config_validate(&config, &invalid));
+    config.validation_swdec_reference = 2048;
+    CHECK(!psp_boot_config_validate(&config, &invalid));
+    CHECK(strcmp(invalid, "validation_swdec_reference") == 0);
+    config.validation_swdec_reference = 0;
+    config.validation_playback_ab = 31;
+    CHECK(psp_boot_config_validate(&config, &invalid));
+    config.validation_playback_ab = 32;
+    CHECK(!psp_boot_config_validate(&config, &invalid));
+    CHECK(strcmp(invalid, "validation_playback_ab") == 0);
+    config.validation_playback_ab = 0;
+    config.validation_swdec_present = 3;
+    CHECK(psp_boot_config_validate(&config, &invalid));
+    config.validation_swdec_present = 4;
+    CHECK(!psp_boot_config_validate(&config, &invalid));
+    CHECK(strcmp(invalid, "validation_swdec_present") == 0);
+    config.validation_swdec_present = 0;
 
     /* Automation is any automation key away from its reset value: an input
        script counts as much as a trace replay (the missing-catalog offer
@@ -558,7 +579,6 @@ int main(void)
     shipping.validation_raster_fixture_auto = 1;
     shipping.validation_power_test_auto = 1;
     shipping.validation_ge_present_probe = 1;
-    shipping.validation_webgl_ge_probe = 1;
     shipping.validation_js_bench = 2;
     snprintf(shipping.js_bench_only, sizeof(shipping.js_bench_only), "%s",
              "own_hot_int,binding_move_ref");
@@ -566,6 +586,10 @@ int main(void)
              "replay-trace");
     shipping.validation_csc_order_probe = 1;
     shipping.validation_latch_probe = 1;
+    shipping.validation_swdec_audio_scan = 1;
+    shipping.validation_swdec_reference = 1;
+    shipping.validation_playback_ab = 3;
+    shipping.validation_swdec_present = 1;
     shipping.validation_media_range_probe = 1;
     shipping.validation_update_auto = 1;
     snprintf(shipping.validation_update_url,
@@ -605,12 +629,15 @@ int main(void)
     CHECK(shipping.validation_raster_fixture_auto == 0);
     CHECK(shipping.validation_power_test_auto == 0);
     CHECK(shipping.validation_ge_present_probe == 0);
-    CHECK(shipping.validation_webgl_ge_probe == 0);
     CHECK(shipping.validation_js_bench == 0);
     CHECK(shipping.js_bench_dir[0] == '\0');
     CHECK(shipping.js_bench_only[0] == '\0');
     CHECK(shipping.validation_csc_order_probe == 0);
     CHECK(shipping.validation_latch_probe == 0);
+    CHECK(shipping.validation_swdec_audio_scan == 0);
+    CHECK(shipping.validation_swdec_reference == 0);
+    CHECK(shipping.validation_playback_ab == 0);
+    CHECK(shipping.validation_swdec_present == 0);
     CHECK(shipping.validation_media_range_probe == 0);
     CHECK(shipping.validation_update_auto == 0);
     CHECK(shipping.validation_update_url[0] == '\0');
@@ -651,12 +678,15 @@ int main(void)
         "validation_media_stability_seconds=900\n"
         "validation_raster_fixture_auto=1\n"
         "validation_ge_present_probe=1\n"
-        "validation_webgl_ge_probe=1\n"
         "validation_js_bench=3\n"
         "js_bench_dir=replay-trace\n"
         "js_bench_only=own_hot_int,binding_move_ref\n"
         "validation_csc_order_probe=1\n"
         "validation_latch_probe=1\n"
+        "validation_swdec_audio_scan=1\n"
+        "validation_swdec_reference=1\n"
+        "validation_playback_ab=1\n"
+        "validation_swdec_present=2\n"
         "validation_media_range_probe=1\n"
         "validation_update_auto=1\n"
         "validation_js_profile=0\n"
@@ -686,7 +716,6 @@ int main(void)
     /* The present probe draws its own pictures and needs no document, so
        unlike the other probes it must not force an engine-first boot. */
     CHECK(config.validation_ge_present_probe == 1);
-    CHECK(config.validation_webgl_ge_probe == 1);
     CHECK(config.validation_js_bench == 3);
     CHECK(strcmp(config.js_bench_dir, "replay-trace") == 0);
     CHECK(strcmp(config.js_bench_only, "own_hot_int,binding_move_ref") == 0);
@@ -694,6 +723,10 @@ int main(void)
        embedded fixture and never navigates. */
     CHECK(config.validation_csc_order_probe == 1);
     CHECK(config.validation_latch_probe == 1);
+    CHECK(config.validation_swdec_audio_scan == 1);
+    CHECK(config.validation_swdec_reference == 1);
+    CHECK(config.validation_playback_ab == 1);
+    CHECK(config.validation_swdec_present == 2);
     /* The range probe resolves its own stream from `url` and never commits a
        document either, so it too leaves the shipping boot order alone. */
     CHECK(config.validation_media_range_probe == 1);
@@ -720,7 +753,7 @@ int main(void)
     CHECK(!psp_boot_config_automation_requires_engine_first(&config)
           || config.validation_media_fixture_auto != 0);
     CHECK(warning.calls == 1);
-    CHECK(warning.line == 30);
+    CHECK(warning.line == 33);
     CHECK(strcmp(warning.key, "mystery") == 0);
     CHECK(strcmp(config.developer_update_url,
                  "https://192.0.2.1/beta/latest.tfum") == 0);

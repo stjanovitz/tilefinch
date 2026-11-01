@@ -610,12 +610,165 @@ static int test_news_svg_viewbox_ratio(void)
     return 0;
 }
 
+static int test_empty_clip_path_controls(void)
+{
+    puts("test: empty inset clips hide native control ink without losing geometry");
+    Budget budget;
+    budget_init(&budget, 4u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    static const char page[] =
+        "<!doctype html><style>body{margin:0;background:white}"
+        ".hidden{position:absolute;left:20px;clip-path:inset(50%);"
+        "overflow:hidden;padding:0;border:0;background:red}"
+        "#tiny{top:30px;width:1px;height:1px}"
+        "#wide{top:70px;width:120px;height:20px}"
+        "#text{top:110px;width:101px;height:31px}"
+        "#partial{position:absolute;left:20px;top:160px;width:80px;"
+        "height:40px;background:red;clip-path:inset(10px)}"
+        "#percent{position:absolute;left:20px;top:210px;width:120px;"
+        "height:40px;background:red;clip-path:inset(25%)}"
+        "#visible{position:absolute;left:220px;top:20px;width:140px;"
+        "height:24px}</style><body>"
+        "<input id=tiny class=hidden type=file>"
+        "<input id=wide class=hidden type=file>"
+        "<div id=text class=hidden>Clipped text</div>"
+        "<div id=partial></div><div id=percent></div>"
+        "<input id=visible type=file></body>";
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument layout = {0};
+    CHECK(document_parse(&document, &budget, page, sizeof(page) - 1u, 23)
+          && stylesheet_build(&sheet, &budget, &document, 480)
+          && layout_build(&layout, &budget, &document, &sheet, NULL, NULL, 480));
+    const LayoutNodeBox *tiny = layout_box_for_node(&layout,
+        find_id(lxb_dom_interface_node(document.html), "tiny"));
+    CHECK(tiny != NULL && tiny->width == 1 && tiny->height == 1);
+    TileCache cache = {0};
+    static uint16_t frame[480u * 272u];
+    CHECK(tile_cache_init(&cache, &budget, &layout, 8)
+          && tile_cache_set_frame(&cache, frame, 480u * 272u)
+          && tile_cache_render_frame(&cache, 0, 480, 272, NULL));
+    const uint16_t white = test_rgb565(0xffffff);
+    for (unsigned y = 0; y < 150; y++)
+        for (unsigned x = 0; x < 200; x++) {
+            if (frame[y * 480u + x] != white) {
+                fprintf(stderr, "empty clip leaked ink at %u,%u\n", x, y);
+                CHECK(false);
+            }
+        }
+    CHECK(frame[180u * 480u + 60u] == test_rgb565(0xff0000)
+          && frame[180u * 480u + 21u] == white
+          && frame[180u * 480u + 99u] == white);
+    CHECK(frame[225u * 480u + 55u] == test_rgb565(0xff0000)
+          && frame[225u * 480u + 40u] == white
+          && frame[225u * 480u + 120u] == white
+          && frame[215u * 480u + 60u] == white
+          && frame[245u * 480u + 60u] == white);
+    bool visible_ink = false;
+    for (unsigned y = 20; y < 44; y++)
+        for (unsigned x = 220; x < 360; x++)
+            visible_ink |= frame[y * 480u + x] != white;
+    CHECK(visible_ink);
+    tile_cache_destroy(&cache);
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+static int test_clip_path_border_box_reference(void)
+{
+    puts("test: clip-path keeps the element's border box and scroll paint");
+    Budget budget;
+    budget_init(&budget, 4u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    static const char page[] =
+        "<!doctype html><style>body{margin:0;background:white}"
+        "div{position:absolute;background:red;border:0 solid black}"
+        "div div{position:static;background:blue}"
+        "#inset{left:20px;top:20px;width:60px;height:40px;border-width:6px;"
+        "clip-path:inset(0)}"
+        "#asym{left:120px;top:20px;width:60px;height:40px;"
+        "border-width:3px 12px 9px 2px;clip-path:inset(1px)}"
+        "#circle{left:220px;top:20px;width:60px;height:60px;"
+        "border-width:6px;clip-path:circle(50%)}"
+        "#overflow{left:320px;top:20px;width:60px;height:40px;"
+        "border-width:4px 12px 4px 2px;overflow:hidden;clip-path:inset(0)}"
+        "#overflow div{width:200px;height:100px}"
+        "#scroller{left:20px;top:120px;width:100px;height:40px;"
+        "overflow:auto;clip-path:inset(0)}"
+        "#scroller div{margin-top:60px;height:100px}"
+        "#plain{left:220px;top:120px;width:60px;height:20px;"
+        "clip-path:inset(0)}#plain div{height:100px}"
+        "#empty{left:320px;top:120px;width:60px;height:40px;"
+        "border-width:6px;overflow:hidden;clip-path:inset(50%)}"
+        "</style><body><div id=inset></div><div id=asym></div>"
+        "<div id=circle></div><div id=overflow><div></div></div>"
+        "<div id=scroller><div></div></div><div id=plain><div></div></div>"
+        "<div id=empty></div></body>";
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument layout = {0};
+    CHECK(document_parse(&document, &budget, page, sizeof(page) - 1u, 23)
+          && stylesheet_build(&sheet, &budget, &document, 480)
+          && layout_build(&layout, &budget, &document, &sheet, NULL, NULL, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    /* The scroller still scrolls; a path alone never makes a scroller. */
+    lxb_dom_node_t *scroller = find_id(root, "scroller");
+    lxb_dom_node_t *plain = find_id(root, "plain");
+    CHECK(layout_scroll_node(&layout, scroller, 0, 20)
+          && layout_scroll_node(&layout, plain, 0, 20));
+    CHECK(layout_box_for_node(&layout, scroller)->scroll_y == 20
+          && layout_box_for_node(&layout, plain)->scroll_y == 0);
+    TileCache cache = {0};
+    static uint16_t frame[480u * 272u];
+    CHECK(tile_cache_init(&cache, &budget, &layout, 8)
+          && tile_cache_set_frame(&cache, frame, 480u * 272u)
+          && tile_cache_render_frame(&cache, 0, 480, 272, NULL));
+    const uint16_t white = test_rgb565(0xffffff);
+    const uint16_t black = test_rgb565(0);
+    const uint16_t red = test_rgb565(0xff0000);
+    const uint16_t blue = test_rgb565(0x0000ff);
+#define PIXEL(x, y) frame[(unsigned) (y) * 480u + (unsigned) (x)]
+    /* inset(0) is the border box: every border side survives. */
+    CHECK(PIXEL(22, 45) == black && PIXEL(50, 22) == black
+          && PIXEL(90, 45) == black && PIXEL(50, 70) == black
+          && PIXEL(50, 45) == red);
+    /* Asymmetric borders: a one-pixel inset of the 74x52 border box. */
+    CHECK(PIXEL(120, 40) == white && PIXEL(121, 40) == black
+          && PIXEL(192, 40) == black && PIXEL(193, 40) == white
+          && PIXEL(150, 20) == white && PIXEL(150, 21) == black
+          && PIXEL(150, 70) == black && PIXEL(150, 71) == white
+          && PIXEL(150, 40) == red);
+    /* circle(50%) of the 72x72 border box keeps its border ring. */
+    CHECK(PIXEL(222, 56) == black && PIXEL(256, 22) == black
+          && PIXEL(256, 56) == red && PIXEL(221, 21) == white);
+    /* Own overflow clip: the border stays and descendants stop at the
+       asymmetric padding edge. */
+    CHECK(PIXEL(321, 40) == black && PIXEL(388, 40) == black
+          && PIXEL(330, 40) == blue && PIXEL(330, 22) == black);
+    /* Scrolling moves the scroller's content, not its own background. */
+    CHECK(PIXEL(60, 150) == red && PIXEL(60, 125) == red);
+    for (unsigned y = 120; y < 172; y++)
+        for (unsigned x = 320; x < 392; x++) CHECK(PIXEL(x, y) == white);
+#undef PIXEL
+    tile_cache_destroy(&cache);
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 static int test_news_compat(void)
 {
     CHECK(test_news_grid_wide_spans() == 0);
     CHECK(test_news_block_content_links() == 0);
     CHECK(test_news_grid_locked_rows_first() == 0);
     CHECK(test_news_clip_path_clips_fixed() == 0);
+    CHECK(test_empty_clip_path_controls() == 0);
+    CHECK(test_clip_path_border_box_reference() == 0);
     CHECK(test_news_svg_viewbox_ratio() == 0);
     return 0;
 }

@@ -1,0 +1,727 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -24514,6 +24514,10 @@
+     BOOL is_module; /* parsing a module */
+     BOOL allow_html_comments;
+     BOOL ext_json; /* JSON parsing: true if accepting JSON superset */
++    /* Tilefinch: JSON.parse reads its argument in place (see
++       json_next_token_direct()); the buffer pointers then address this
++       string's 8- or 16-bit characters. NULL for UTF-8 input. */
++    JSString *json_src;
+     GetLineColCache get_line_col_cache;
+     BOOL lazy_entry; /* js_parse_function_decl2() compiles a lazy function */
+     /* see js_preparse_function_body() */
+@@ -24771,6 +24775,36 @@
+     s->ptr = ptr;
+     *pcol_num = s->col_num;
+     return s->line_num;
++}
++
++/* Tilefinch: get_line_col() for JSON.parse reading its string in place.
++   The column counts code points as get_line_col() counts them in the
++   UTF-8 copy JSON.parse used to make: a surrogate pair is one, a lone
++   surrogate is one. */
++static no_inline int json_direct_line_col(JSParseState *s, const uint8_t *ptr,
++                                          int *pcol_num)
++{
++    const JSString *p = s->json_src;
++    uint32_t i, end, len = p->len;
++    int line_num = 0, col_num = 0, c;
++
++    end = (uint32_t)(ptr - s->buf_start) >> p->is_wide_char;
++    if (end > len)
++        end = len;
++    for(i = 0; i < end; i++) {
++        c = p->is_wide_char ? p->u.str16[i] : p->u.str8[i];
++        if (c == '\n') {
++            line_num++;
++            col_num = 0;
++            continue;
++        }
++        if (is_hi_surrogate(c) && i + 1 < end &&
++            is_lo_surrogate(p->u.str16[i + 1]))
++            i++;
++        col_num++;
++    }
++    *pcol_num = col_num;
++    return line_num;
+ }
+ 
+ /* 'ptr' is the position of the error in the source */
+@@ -24791,7 +24825,10 @@
+         JS_ThrowOutOfMemory(ctx);
+         return -1;
+     }
+-    line_num = get_line_col(&col_num, s->buf_start, ptr - s->buf_start);
++    if (unlikely(s->json_src))
++        line_num = json_direct_line_col(s, ptr, &col_num);
++    else
++        line_num = get_line_col(&col_num, s->buf_start, ptr - s->buf_start);
+     if (line_num == 0)
+         col_num += s->first_line_column;
+     JS_ThrowError2(ctx, JS_SYNTAX_ERROR, fmt, ap, FALSE);
+@@ -25987,9 +26024,438 @@
+     s->token.val = TOK_NUMBER;
+     s->token.u.num.val = JS_NewFloat64(s->ctx, d);
+     *pp = p;
++    return 0;
++}
++
++/* Tilefinch: JSON.parse tokenizes its argument string in place, reading
++   its Latin-1 (8-bit) or UTF-16 (16-bit) characters, instead of first
++   making a UTF-8 copy of it (up to three bytes per character, refused at
++   0.7-1.3 MB on video pages that ran out of memory exactly there). Strict
++   JSON only: ext_json is never set here. Tokens, values, positions and
++   error messages are those json_next_token() gives for that UTF-8 copy.
++   s->buf_start, s->buf_ptr and s->token.ptr address the string's
++   characters, so a position is (ptr - buf_start) >> is_wide_char
++   characters; json_direct_line_col() reports errors. One instance serves
++   both widths; only the loops over whitespace and string content, where
++   the time goes, are written per width. A string without escapes becomes
++   a substring of the input, so it is copied once. */
++
++#define JSON_DIRECT_CH(i) (wide ? p->u.str16[i] : p->u.str8[i])
++#define JSON_DIRECT_PEEK(i) ((i) < len ? JSON_DIRECT_CH(i) : 0)
++#define JSON_DIRECT_PTR(i) (s->buf_start + ((size_t)(i) << wide))
++
++/* The first index at or after 'i' that is not plain string content: a
++   quote, a backslash, a control character, or the end. */
++static inline uint32_t json_direct_scan_plain(const JSString *p, uint32_t i)
++{
++    uint32_t len = p->len, c;
++
++    if (p->is_wide_char) {
++        const uint16_t *q = p->u.str16;
++        for(; i < len; i++) {
++            c = q[i];
++            if (c == '"' || c == '\\' || c < 0x20)
++                break;
++        }
++    } else {
++        const uint8_t *q = p->u.str8;
++        for(; i < len; i++) {
++            c = q[i];
++            if (c == '"' || c == '\\' || c < 0x20)
++                break;
++        }
++    }
++    return i;
++}
++
++/* The first index at or after 'i' that is not JSON whitespace */
++static inline uint32_t json_direct_skip_space(const JSString *p, uint32_t i)
++{
++    uint32_t len = p->len, c;
++
++    if (p->is_wide_char) {
++        const uint16_t *q = p->u.str16;
++        for(; i < len; i++) {
++            c = q[i];
++            if (c != ' ' && c != '\t' && c != '\n' && c != '\r')
++                break;
++        }
++    } else {
++        const uint8_t *q = p->u.str8;
++        for(; i < len; i++) {
++            c = q[i];
++            if (c != ' ' && c != '\t' && c != '\n' && c != '\r')
++                break;
++        }
++    }
++    return i;
++}
++
++/* The first index at or after 'i' that is not an ASCII digit */
++static inline uint32_t json_direct_skip_digits(const JSString *p, uint32_t i)
++{
++    uint32_t len = p->len;
++
++    if (p->is_wide_char) {
++        while (i < len && is_digit(p->u.str16[i]))
++            i++;
++    } else {
++        while (i < len && is_digit(p->u.str8[i]))
++            i++;
++    }
++    return i;
++}
++
++/* Whether characters [i, i + strlen(word)) spell 'word' */
++static no_inline BOOL json_direct_is_word(const JSString *p, uint32_t i,
++                                         const char *word)
++{
++    for(; *word != '\0'; word++, i++) {
++        if ((p->is_wide_char ? p->u.str16[i] : p->u.str8[i]) != (uint8_t)*word)
++            return FALSE;
++    }
++    return TRUE;
++}
++
++/* The first byte of character 'i' in UTF-8, as the UTF-8 tokenizer
++   prints it in "Unexpected token '%c'" (0 at the end of the input). */
++static no_inline int json_direct_utf8_lead(const JSString *p, uint32_t i)
++{
++    uint32_t c;
++
++    if (i >= p->len)
++        return 0;
++    c = p->is_wide_char ? p->u.str16[i] : p->u.str8[i];
++    if (c < 0x80)
++        return c;
++    if (c < 0x800)
++        return 0xc0 | (c >> 6);
++    if (is_hi_surrogate(c) && i + 1 < p->len &&
++        is_lo_surrogate(p->u.str16[i + 1]))
++        return 0xf0 | (from_surrogate(c, p->u.str16[i + 1]) >> 18);
++    return 0xe0 | (c >> 12);
++}
++
++/* A number with a fraction, an exponent or more than nine digits:
++   characters [start, end) are its validated ASCII text. 8-bit text is
++   converted in place: js_atod() stops at the first character that cannot
++   continue the number, and the scanner has consumed every one that could
++   (an 8-bit JSString is also NUL-terminated). Only 16-bit text is
++   narrowed, into a stack buffer or, past 63 characters, one allocation of
++   the number's own length freed at once. */
++static no_inline int json_direct_atod(JSParseState *s, uint32_t start,
++                                      uint32_t end, double *pd)
++{
++    const JSString *p = s->json_src;
++    JSATODTempMem atod_mem;
++    char tmp[64], *buf = tmp;
++    uint32_t i, n = end - start;
++
++    if (!p->is_wide_char) {
++        *pd = js_atod((const char *)p->u.str8 + start, NULL, 10, 0, &atod_mem);
++        return 0;
++    }
++    if (n >= sizeof(tmp)) {
++        buf = js_malloc(s->ctx, n + 1);
++        if (!buf)
++            return -1;
++    }
++    for(i = 0; i < n; i++)
++        buf[i] = p->u.str16[start + i];
++    buf[n] = '\0';
++    *pd = js_atod(buf, NULL, 10, 0, &atod_mem);
++    if (buf != tmp)
++        js_free(s->ctx, buf);
++    return 0;
++}
++
++/* '*pi' is the opening quote */
++static int json_direct_string(JSParseState *s, uint32_t *pi)
++{
++    JSContext *ctx = s->ctx;
++    JSString *p = s->json_src;
++    const int wide = p->is_wide_char;
++    uint32_t len = p->len, i, j, start, c;
++    int k, h;
++    StringBuffer b_s, *b = &b_s;
++    JSValue val;
++
++    start = *pi + 1;
++    j = json_direct_scan_plain(p, start);
++    if (unlikely(j >= len)) {
++        js_parse_error(s, "Unexpected end of JSON input");
++        return -1;
++    }
++    if (JSON_DIRECT_CH(j) == '"') {
++        val = js_sub_string(ctx, p, start, j);
++        if (JS_IsException(val))
++            return -1;
++        i = j + 1;
++        goto done;
++    }
++    /* An escape: size the buffer once, for the decoded length up to the
++       closing quote and 16-bit only if a character or a \u escape needs
++       it, so a long string is neither grown by reallocation with both
++       copies live nor given the raw length (six characters per \u
++       escape). The width comes from the whole string, the plain prefix
++       before the first escape included, so a 16-bit string is never
++       widened from a narrow buffer. A malformed escape is reported by the
++       loop below; the buffer then still grows as usual. */
++    {
++        uint32_t wide_out = 0, n = 0;
++        i = start;
++        while (i < len) {
++            c = JSON_DIRECT_CH(i);
++            if (c == '"' || c < 0x20)
++                break;
++            n++;
++            if (c == '\\') {
++                if (i + 5 < len && JSON_DIRECT_CH(i + 1) == 'u') {
++                    uint32_t u = 0;
++                    for(k = 2; k < 6; k++) {
++                        h = from_hex(JSON_DIRECT_CH(i + k));
++                        if (h < 0)
++                            break;
++                        u = (u << 4) | h;
++                    }
++                    if (k == 6) {
++                        if (u > 0xff)
++                            wide_out = 1;
++                        i += 6;
++                        continue;
++                    }
++                }
++                i += 2;
++                continue;
++            }
++            if (c > 0xff)
++                wide_out = 1;
++            i++;
++        }
++        if (string_buffer_init2(ctx, b, n, wide_out))
++            goto fail;
++    }
++    i = start;
++    for(;;) {
++        /* [i, j) is plain content */
++        if (string_buffer_concat(b, p, i, j))
++            goto fail;
++        i = j;
++        if (i >= len)
++            goto end_of_input;
++        c = JSON_DIRECT_CH(i);
++        i++;
++        if (c == '"')
++            break;
++        if (c < 0x20) {
++            js_parse_error_pos(s, JSON_DIRECT_PTR(i - 1),
++                               "Bad control character in string literal");
++            goto fail;
++        }
++        /* a backslash */
++        c = JSON_DIRECT_PEEK(i);
++        i++;
++        switch(c) {
++        case 'b':   c = '\b'; break;
++        case 'f':   c = '\f'; break;
++        case 'n':   c = '\n'; break;
++        case 'r':   c = '\r'; break;
++        case 't':   c = '\t'; break;
++        case '\\':  break;
++        case '/':   break;
++        case '"':   break;
++        case 'u':
++            c = 0;
++            for(k = 0; k < 4; k++) {
++                h = from_hex(JSON_DIRECT_PEEK(i));
++                i++;
++                if (h < 0) {
++                    js_parse_error_pos(s, JSON_DIRECT_PTR(i - 1),
++                                       "Bad Unicode escape");
++                    goto fail;
++                }
++                c = (c << 4) | h;
++            }
++            break;
++        default:
++            if (i > len)
++                goto end_of_input;
++            js_parse_error_pos(s, JSON_DIRECT_PTR(i - 1),
++                               "Bad escaped character");
++            goto fail;
++        }
++        if (string_buffer_putc16(b, c))
++            goto fail;
++        j = json_direct_scan_plain(p, i);
++    }
++    val = string_buffer_end(b);
++    if (JS_IsException(val))
++        return -1;
++ done:
++    s->token.val = TOK_STRING;
++    s->token.u.str.sep = '"';
++    s->token.u.str.str = val;
++    *pi = i;
+     return 0;
++ end_of_input:
++    js_parse_error(s, "Unexpected end of JSON input");
++ fail:
++    string_buffer_free(b);
++    return -1;
+ }
+ 
++/* '*pi' is a '-' or a digit */
++static int json_direct_number(JSParseState *s, uint32_t *pi)
++{
++    JSString *p = s->json_src;
++    const int wide = p->is_wide_char;
++    uint32_t len = p->len, i, k, start, int_start, v, c;
++    BOOL is_int = TRUE;
++    double d;
++
++    i = start = *pi;
++    c = JSON_DIRECT_CH(i);
++    if (c == '-') {
++        i++;
++        c = JSON_DIRECT_PEEK(i);
++    }
++    if (!is_digit(c))
++        return js_parse_error_pos(s, JSON_DIRECT_PTR(i), "Unexpected token '%c'",
++                                  json_direct_utf8_lead(p, i));
++    if (c == '0' && is_digit(JSON_DIRECT_PEEK(i + 1)))
++        return js_parse_error_pos(s, JSON_DIRECT_PTR(i), "Unexpected number");
++    int_start = i;
++    i = json_direct_skip_digits(p, i);
++    c = JSON_DIRECT_PEEK(i);
++    if (c == '.') {
++        is_int = FALSE;
++        i++;
++        if (!is_digit(JSON_DIRECT_PEEK(i)))
++            return js_parse_error_pos(s, JSON_DIRECT_PTR(i),
++                                      "Unterminated fractional number");
++        i = json_direct_skip_digits(p, i);
++        c = JSON_DIRECT_PEEK(i);
++    }
++    if (c == 'e' || c == 'E') {
++        is_int = FALSE;
++        i++;
++        c = JSON_DIRECT_PEEK(i);
++        if (c == '+' || c == '-')
++            i++;
++        if (!is_digit(JSON_DIRECT_PEEK(i)))
++            return js_parse_error_pos(s, JSON_DIRECT_PTR(i),
++                                      "Exponent part is missing a number");
++        i = json_direct_skip_digits(p, i);
++    }
++    if (is_int && i - int_start <= 9) {
++        /* Exactly what js_atod() and JS_NewFloat64() give, without the
++           double conversions (software floating point on the PSP). */
++        v = 0;
++        for(k = int_start; k < i; k++)
++            v = v * 10 + (JSON_DIRECT_CH(k) - '0');
++        if (int_start == start)
++            s->token.u.num.val = JS_NewInt32(s->ctx, v);
++        else if (v != 0)
++            s->token.u.num.val = JS_NewInt32(s->ctx, -(int32_t)v);
++        else
++            s->token.u.num.val = __JS_NewFloat64(s->ctx, -0.0);
++    } else {
++        if (json_direct_atod(s, start, i, &d))
++            return -1;
++        s->token.u.num.val = JS_NewFloat64(s->ctx, d);
++    }
++    s->token.val = TOK_NUMBER;
++    *pi = i;
++    return 0;
++}
++
++/* json_next_token() has checked the stack and freed the token; inlined
++   there, since a call per token cost 2-3% of a parse in PPSSPP */
++static force_inline int json_next_token_direct(JSParseState *s)
++{
++    JSString *p = s->json_src;
++    const int wide = p->is_wide_char;
++    uint32_t len = p->len, i, start, n, c;
++    JSAtom atom;
++
++    s->last_ptr = s->buf_ptr;
++    i = json_direct_skip_space(p, (uint32_t)(s->buf_ptr - s->buf_start) >> wide);
++    s->token.ptr = JSON_DIRECT_PTR(i);
++    if (i >= len) {
++        s->token.val = TOK_EOF;
++        goto done;
++    }
++    c = JSON_DIRECT_CH(i);
++    switch(c) {
++    case '\"':
++        if (json_direct_string(s, &i))
++            goto fail;
++        break;
++    case 'a': case 'b': case 'c': case 'd':
++    case 'e': case 'f': case 'g': case 'h':
++    case 'i': case 'j': case 'k': case 'l':
++    case 'm': case 'n': case 'o': case 'p':
++    case 'q': case 'r': case 's': case 't':
++    case 'u': case 'v': case 'w': case 'x':
++    case 'y': case 'z':
++    case 'A': case 'B': case 'C': case 'D':
++    case 'E': case 'F': case 'G': case 'H':
++    case 'I': case 'J': case 'K': case 'L':
++    case 'M': case 'N': case 'O': case 'P':
++    case 'Q': case 'R': case 'S': case 'T':
++    case 'U': case 'V': case 'W': case 'X':
++    case 'Y': case 'Z':
++    case '_':
++    case '$':
++        /* Only true, false and null are values; any other identifier is
++           reported from its text, so it needs no atom. */
++        start = i++;
++        while (i < len && (c = JSON_DIRECT_CH(i)) < 128 &&
++               lre_is_id_continue_byte(c))
++            i++;
++        n = i - start;
++        atom = JS_ATOM_NULL;
++        if (n == 4 && json_direct_is_word(p, start, "true"))
++            atom = JS_ATOM_true;
++        else if (n == 4 && json_direct_is_word(p, start, "null"))
++            atom = JS_ATOM_null;
++        else if (n == 5 && json_direct_is_word(p, start, "false"))
++            atom = JS_ATOM_false;
++        s->token.u.ident.atom = atom;
++        s->token.u.ident.has_escape = FALSE;
++        s->token.u.ident.is_reserved = FALSE;
++        s->token.val = TOK_IDENT;
++        break;
++    case '-':
++    case '0':
++    case '1': case '2': case '3': case '4':
++    case '5': case '6': case '7': case '8':
++    case '9':
++        if (json_direct_number(s, &i))
++            goto fail;
++        break;
++    default:
++        if (c >= 128) {
++            js_parse_error(s, "unexpected character");
++            goto fail;
++        }
++        s->token.val = c;
++        i++;
++        break;
++    }
++ done:
++    s->buf_ptr = JSON_DIRECT_PTR(i);
++    return 0;
++
++ fail:
++    s->token.val = TOK_ERROR;
++    return -1;
++}
++
++#undef JSON_DIRECT_CH
++#undef JSON_DIRECT_PEEK
++#undef JSON_DIRECT_PTR
++
+ static __exception int json_next_token(JSParseState *s)
+ {
+     const uint8_t *p;
+@@ -26001,6 +26467,9 @@
+     }
+ 
+     free_token(s, &s->token);
++
++    if (s->json_src)
++        return json_next_token_direct(s);
+ 
+     p = s->last_ptr = s->buf_ptr;
+  redo:
+@@ -57126,6 +57595,16 @@
+     pr->value = JS_DupValue(ctx, val);
+     pr->u.primitive.source_pos = source_pos;
+     pr->u.primitive.source_len = source_len;
++}
++
++/* The current token's source span, in characters of the input string */
++static void json_parse_record_init_token(JSParseState *s, JSONParseRecord *pr,
++                                         JSValueConst val)
++{
++    int shift = s->json_src ? s->json_src->is_wide_char : 0;
++    json_parse_record_init_primitive(s->ctx, pr, val,
++                                     (s->token.ptr - s->buf_start) >> shift,
++                                     (s->buf_ptr - s->token.ptr) >> shift);
+ }
+ 
+ static int json_parse_record_resize_hash(JSContext *ctx, JSONParseRecordObject *po, uint32_t new_hash_size)
+@@ -57230,6 +57709,23 @@
+     pr->value = JS_UNDEFINED; /* fail safe */
+ }
+ 
++/* "unexpected token" for a 16-bit input read in place: the token is one
++   ASCII character or an ASCII identifier (json_next_token_direct()), and
++   the message holds at most 255 bytes. Kept out of the recursive
++   json_parse_value() frame. */
++static no_inline void json_direct_unexpected_token(JSParseState *s)
++{
++    const uint16_t *p = (const uint16_t *)s->token.ptr;
++    char buf[256];
++    size_t i, n = (s->buf_ptr - s->token.ptr) >> 1;
++
++    if (n > sizeof(buf))
++        n = sizeof(buf);
++    for(i = 0; i < n; i++)
++        buf[i] = p[i];
++    js_parse_error(s, "unexpected token: '%.*s'", (int)n, buf);
++}
++
+ /* 'pr' can be NULL */
+ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr)
+ {
+@@ -57355,9 +57851,7 @@
+     case TOK_STRING:
+         val = JS_DupValue(ctx, s->token.u.str.str);
+         if (pr) {
+-            json_parse_record_init_primitive(ctx, pr, val, 
+-                                             s->token.ptr - s->buf_start,
+-                                             s->buf_ptr - s->token.ptr);
++            json_parse_record_init_token(s, pr, val);
+         }
+         if (json_next_token(s))
+             goto fail;
+@@ -57365,9 +57859,7 @@
+     case TOK_NUMBER:
+         val = s->token.u.num.val;
+         if (pr) {
+-            json_parse_record_init_primitive(ctx, pr, val, 
+-                                             s->token.ptr - s->buf_start,
+-                                             s->buf_ptr - s->token.ptr);
++            json_parse_record_init_token(s, pr, val);
+         }
+         if (json_next_token(s))
+             goto fail;
+@@ -57377,16 +57869,12 @@
+             s->token.u.ident.atom == JS_ATOM_true) {
+             val = JS_NewBool(ctx, s->token.u.ident.atom == JS_ATOM_true);
+             if (pr) {
+-                json_parse_record_init_primitive(ctx, pr, val, 
+-                                                 s->token.ptr - s->buf_start,
+-                                                 s->buf_ptr - s->token.ptr);
++                json_parse_record_init_token(s, pr, val);
+             }
+         } else if (s->token.u.ident.atom == JS_ATOM_null) {
+             val = JS_NULL;
+             if (pr) {
+-                json_parse_record_init_primitive(ctx, pr, val, 
+-                                                 s->token.ptr - s->buf_start,
+-                                                 s->buf_ptr - s->token.ptr);
++                json_parse_record_init_token(s, pr, val);
+             }
+         } else if (s->token.u.ident.atom == JS_ATOM_NaN && s->ext_json) {
+             /* Note: json5 identifier handling is ambiguous e.g. is 
+@@ -57404,6 +57892,8 @@
+     def_token:
+         if (s->token.val == TOK_EOF) {
+             js_parse_error(s, "Unexpected end of JSON input");
++        } else if (s->json_src && s->json_src->is_wide_char) {
++            json_direct_unexpected_token(s);
+         } else {
+             js_parse_error(s, "unexpected token: '%.*s'",
+                            (int)(s->buf_ptr - s->token.ptr), s->token.ptr);
+@@ -57417,14 +57907,11 @@
+     return JS_EXCEPTION;
+ }
+ 
+-JSValue JS_ParseJSON3(JSContext *ctx, const char *buf, size_t buf_len,
+-                      const char *filename, int flags, JSONParseRecord *pr)
++static no_inline JSValue json_parse_text(JSParseState *s, JSONParseRecord *pr)
+ {
+-    JSParseState s1, *s = &s1;
++    JSContext *ctx = s->ctx;
+     JSValue val = JS_UNDEFINED;
+ 
+-    js_parse_init(ctx, s, buf, buf_len, filename, 0);
+-    s->ext_json = ((flags & JS_PARSE_JSON_EXT) != 0);
+     if (json_next_token(s))
+         goto fail;
+     val = json_parse_value(s, pr);
+@@ -57441,6 +57928,31 @@
+     JS_FreeValue(ctx, val);
+     free_token(s, &s->token);
+     return JS_EXCEPTION;
++}
++
++/* not inlined into JS_ParseJSON() and JS_ParseJSON2() (code size) */
++no_inline JSValue JS_ParseJSON3(JSContext *ctx, const char *buf, size_t buf_len,
++                                const char *filename, int flags,
++                                JSONParseRecord *pr)
++{
++    JSParseState s1, *s = &s1;
++
++    js_parse_init(ctx, s, buf, buf_len, filename, 0);
++    s->ext_json = ((flags & JS_PARSE_JSON_EXT) != 0);
++    return json_parse_text(s, pr);
++}
++
++/* Tilefinch: JSON.parse() of a flat string, read in place (see
++   json_next_token_direct()). The caller keeps 'p' alive. */
++static JSValue json_parse_string_direct(JSContext *ctx, JSString *p,
++                                        JSONParseRecord *pr)
++{
++    JSParseState s1, *s = &s1;
++
++    js_parse_init(ctx, s, (const char *)p->u.str8,
++                  (size_t)p->len << p->is_wide_char, "<input>", 0);
++    s->json_src = p;
++    return json_parse_text(s, pr);
+ }
+ 
+ JSValue JS_ParseJSON2(JSContext *ctx, const char *buf, size_t buf_len,
+@@ -57458,7 +57970,7 @@
+ /* if pr != NULL, then pr->value = holder by construction */
+ static JSValue internalize_json_property(JSContext *ctx, JSValueConst holder,
+                                          JSAtom name, JSValueConst reviver,
+-                                         const char *text_str, JSONParseRecord *pr)
++                                         JSString *text, JSONParseRecord *pr)
+ {
+     JSValue val, new_el, name_val, res, context;
+     JSValueConst args[3];
+@@ -57517,7 +58029,7 @@
+             } else {
+                 prop = JS_DupAtom(ctx, atoms[i].atom);
+             }
+-            new_el = internalize_json_property(ctx, val, prop, reviver, text_str, pr);
++            new_el = internalize_json_property(ctx, val, prop, reviver, text, pr);
+             if (JS_IsException(new_el)) {
+                 JS_FreeAtom(ctx, prop);
+                 goto fail;
+@@ -57533,8 +58045,9 @@
+         }
+     } else {
+         if (pr) {
+-            new_el = JS_NewStringLen(ctx, text_str + pr->u.primitive.source_pos,
+-                                     pr->u.primitive.source_len);
++            new_el = js_sub_string(ctx, text, pr->u.primitive.source_pos,
++                                   pr->u.primitive.source_pos +
++                                   pr->u.primitive.source_len);
+             if (JS_IsException(new_el))
+                 goto fail;
+             if (JS_DefinePropertyValue(ctx, context, JS_ATOM_source, new_el, JS_PROP_C_W_E) < 0)
+@@ -57564,13 +58077,14 @@
+ static JSValue js_json_parse(JSContext *ctx, JSValueConst this_val,
+                              int argc, JSValueConst *argv)
+ {
+-    JSValue obj;
+-    const char *str;
+-    size_t len;
+-    
+-    str = JS_ToCStringLen(ctx, &len, argv[0]);
+-    if (!str)
++    JSValue obj, text;
++    JSString *str;
++
++    /* Tilefinch: parse the string itself, not a UTF-8 copy of it */
++    text = JS_ToString(ctx, argv[0]);
++    if (JS_IsException(text))
+         return JS_EXCEPTION;
++    str = JS_VALUE_GET_STRING(text);
+     if (argc > 1 && JS_IsFunction(ctx, argv[1])) {
+         JSONParseRecord pr_s, *pr = &pr_s, *pr1;
+         JSValue root;
+@@ -57587,7 +58101,7 @@
+         if (!pr1)
+             goto fail1;
+ 
+-        obj = JS_ParseJSON3(ctx, str, len, "<input>", 0, pr1);
++        obj = json_parse_string_direct(ctx, str, pr1);
+         if (JS_IsException(obj))
+             goto fail1;
+         
+@@ -57605,12 +58119,12 @@
+         json_free_parse_record(ctx, pr);
+         JS_FreeValue(ctx, root);
+     } else {
+-        obj = JS_ParseJSON3(ctx, str, len, "<input>", 0, NULL);
++        obj = json_parse_string_direct(ctx, str, NULL);
+     }
+-    JS_FreeCString(ctx, str);
++    JS_FreeValue(ctx, text);
+     return obj;
+  fail:
+-    JS_FreeCString(ctx, str);
++    JS_FreeValue(ctx, text);
+     return JS_EXCEPTION;
+ }
+ 

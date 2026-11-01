@@ -22,6 +22,7 @@
 #include "tilefinch/js_runtime.h"
 #include "../src/image_decode_internal.h"
 #include "../src/data_url.h"
+#include "../src/tilefinch_test_faults.h"
 
 #define STB_IMAGE_WRITE_STATIC
 #define STB_IMAGE_WRITE_IMPLEMENTATION
@@ -932,6 +933,270 @@ static int test_rebuild_during_detached_decode(Budget *budget)
     return 0;
 }
 
+static void base64_append(char *out, size_t capacity, size_t *used,
+                          const unsigned char *data, size_t length)
+{
+    static const char digits[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    for (size_t i = 0; i < length && *used + 4u < capacity; i += 3u) {
+        unsigned value = (unsigned) data[i] << 16;
+        if (i + 1u < length) value |= (unsigned) data[i + 1u] << 8;
+        if (i + 2u < length) value |= data[i + 2u];
+        out[(*used)++] = digits[(value >> 18) & 63u];
+        out[(*used)++] = digits[(value >> 12) & 63u];
+        out[(*used)++] = i + 1u < length ? digits[(value >> 6) & 63u] : '=';
+        out[(*used)++] = i + 2u < length ? digits[value & 63u] : '=';
+    }
+    out[*used] = '\0';
+}
+
+static const ImageResource *background_with_source(
+    const ImageResources *images, int width, int height)
+{
+    for (size_t i = 0; i < images->count; i++) {
+        const ImageResource *item = &images->items[i];
+        if (item->is_background && item->source_width == width
+            && item->source_height == height) return item;
+    }
+    return NULL;
+}
+
+/* A CSS background decoded while its element's layout is known is decoded
+   at the tile that layout paints, from the box and background-size: a cover
+   background in a short, wide box keeps more source width than the viewport
+   (the clamp that once made a 1448 px banner blocky), a small box gets a
+   small decode, and auto size keeps the natural size. On the first commit,
+   before any layout exists, a WebP background stays encoded until the
+   commit's layout is built and is then decoded at the tile it paints,
+   before that layout is painted. A background target a layout recorded
+   (a visual batch, a preview's priority targets) carries its box and
+   background-size, so its eager decode takes the same tile rather than a
+   viewport-wide copy. */
+static int test_background_decodes_at_layout_tile(Budget *budget)
+{
+    CHECK(budget_install_lexbor(budget));
+    Bytes banner = webp_solid(1920, 384, 30, 60, 200);
+    Bytes icon = webp_solid(512, 512, 200, 40, 40);
+    Bytes natural = webp_solid(64, 32, 40, 200, 40);
+    static char page[8192];
+    size_t used = (size_t) snprintf(page, sizeof(page),
+        "<!doctype html><meta name=viewport content='width=device-width'>"
+        "<style>body{margin:0}div{background-repeat:no-repeat}"
+        "#banner{width:480px;height:200px;background-size:cover;"
+        "background-image:url(data:image/webp;base64,");
+    base64_append(page, sizeof(page), &used, banner.data, banner.length);
+    used += (size_t) snprintf(page + used, sizeof(page) - used,
+        ")}#icon{width:32px;height:32px;background-size:cover;"
+        "background-image:url(data:image/webp;base64,");
+    base64_append(page, sizeof(page), &used, icon.data, icon.length);
+    used += (size_t) snprintf(page + used, sizeof(page) - used,
+        ")}#natural{width:200px;height:100px;"
+        "background-image:url(data:image/webp;base64,");
+    base64_append(page, sizeof(page), &used, natural.data, natural.length);
+    used += (size_t) snprintf(page + used, sizeof(page) - used,
+        ")}</style><div id=banner></div><div id=icon></div>"
+        "<div id=natural></div>");
+    CHECK(used + 1u < sizeof(page));
+    free(banner.data);
+    free(icon.data);
+    free(natural.data);
+    static NavigationSession navigation;
+    CHECK(navigation_init(&navigation, budget, 2));
+    navigation_enable_external_resources(&navigation, 2, 32768, 32768,
+        8, 4u * MIB, 4u * MIB, 8u * MIB, 1500);
+    CHECK(navigation_commit_html(&navigation, navigation_begin(&navigation),
+        "https://banner.test/", page, used, 480, NULL, NULL, true));
+    const ImageResource *wide = background_with_source(
+        &navigation.page.images, 1920, 384);
+    const ImageResource *small = background_with_source(
+        &navigation.page.images, 512, 512);
+    const ImageResource *kept = background_with_source(
+        &navigation.page.images, 64, 32);
+    CHECK(wide != NULL && wide->pixels != NULL
+          && wide->width == 1000 && wide->height == 200
+          && wide->full_width == 1920 && wide->full_height == 384
+          && (wide->retarget_flags & IMAGE_RETARGET_SHRUNK) != 0
+          && (wide->retarget_flags & IMAGE_RETARGET_AWAITING_LAYOUT) == 0);
+    CHECK(small != NULL && small->pixels != NULL
+          && small->width == 32 && small->height == 32);
+    CHECK(kept != NULL && kept->pixels != NULL
+          && kept->width == 64 && kept->height == 32);
+    CHECK(wide->pixels[2] == 200 && small->pixels[0] == 200);
+    CHECK(navigation.page.images.stats.decoded_bytes
+          == (1000u * 200u + 32u * 32u + 64u * 32u) * 4u);
+    /* A rebuild after layout decodes again, at the painted tile. */
+    navigation.style_rebuild_required = true;
+    CHECK(navigation_relayout(&navigation) && navigation.page.loaded);
+    wide = background_with_source(&navigation.page.images, 1920, 384);
+    small = background_with_source(&navigation.page.images, 512, 512);
+    kept = background_with_source(&navigation.page.images, 64, 32);
+    if (wide == NULL || small == NULL || kept == NULL
+        || wide->width != 1000 || wide->height != 200
+        || small->width != 32 || small->height != 32
+        || kept->width != 64 || kept->height != 32)
+        fprintf(stderr, "background tiles %dx%d %dx%d %dx%d\n",
+                wide == NULL ? 0 : wide->width, wide == NULL ? 0 : wide->height,
+                small == NULL ? 0 : small->width,
+                small == NULL ? 0 : small->height,
+                kept == NULL ? 0 : kept->width, kept == NULL ? 0 : kept->height);
+    CHECK(wide != NULL && wide->pixels != NULL
+          && wide->width == 1000 && wide->height == 200
+          && wide->full_width == 1920 && wide->full_height == 384);
+    CHECK(small != NULL && small->pixels != NULL
+          && small->width == 32 && small->height == 32);
+    CHECK(kept != NULL && kept->width == 64 && kept->height == 32);
+    /* The decoded colour survives the reduction. */
+    CHECK(wide->pixels[2] == 200 && small->pixels[0] == 200);
+
+    /* Priority targets: a preview layout without the images records each
+       unresolved background with its box and background-size. */
+    static ImageResources fresh;
+    memset(&fresh, 0, sizeof(fresh));
+    LayoutDocument preview = {0};
+    bool truncated = false;
+    CHECK(layout_build_context_preview(
+        &preview, budget, &navigation.page.document,
+        &navigation.page.stylesheet, navigation.fonts, &fresh,
+        &navigation.viewport, NULL, 4 * navigation.viewport.css_height,
+        &truncated));
+    CHECK(preview.visual_priority_count == 3);
+    ImagePriorityTarget targets[3];
+    memcpy(targets, preview.visual_priority_targets, sizeof(targets));
+    layout_destroy(&preview);
+    for (size_t i = 0; i < 3; i++)
+        CHECK(targets[i].kind == IMAGE_PRIORITY_KIND_BACKGROUND
+              && targets[i].background_sized);
+    CHECK(targets[0].display_width == 480 && targets[0].display_height == 200
+          && targets[0].background_fit == LAYOUT_IMAGE_FIT_COVER);
+    CHECK(targets[1].display_width == 32 && targets[1].display_height == 32);
+    /* Without a scale the loader keeps its viewport clamp. */
+    CHECK(images_load_external_priority_targets(
+        &navigation.page.document, &navigation.page.stylesheet, &fresh,
+        targets, 3, budget, "https://banner.test/", "https://banner.test/",
+        NULL, 8, 4u * MIB, 4u * MIB, 8u * MIB, 1500, NULL, NULL));
+    wide = background_with_source(&fresh, 1920, 384);
+    CHECK(wide != NULL && wide->pixels != NULL
+          && wide->width == 480 && wide->height == 96);
+    images_destroy(&fresh);
+    /* With the page's scale lent, each takes the tile it paints. */
+    memset(&fresh, 0, sizeof(fresh));
+    ImageLayoutBoxes scale;
+    layout_lend_image_scale(&navigation.viewport, &scale);
+    images_set_layout_boxes(&fresh, &scale);
+    CHECK(images_load_external_priority_targets(
+        &navigation.page.document, &navigation.page.stylesheet, &fresh,
+        targets, 3, budget, "https://banner.test/", "https://banner.test/",
+        NULL, 8, 4u * MIB, 4u * MIB, 8u * MIB, 1500, NULL, NULL));
+    images_set_layout_boxes(&fresh, NULL);
+    wide = background_with_source(&fresh, 1920, 384);
+    small = background_with_source(&fresh, 512, 512);
+    kept = background_with_source(&fresh, 64, 32);
+    CHECK(wide != NULL && wide->pixels != NULL
+          && wide->width == 1000 && wide->height == 200
+          && wide->full_width == 1920 && wide->full_height == 384
+          && (wide->retarget_flags & IMAGE_RETARGET_SHRUNK) != 0);
+    CHECK(small != NULL && small->pixels != NULL
+          && small->width == 32 && small->height == 32);
+    CHECK(kept != NULL && kept->width == 64 && kept->height == 32);
+    CHECK(wide->pixels[2] == 200 && small->pixels[0] == 200);
+    images_destroy(&fresh);
+    navigation_destroy(&navigation);
+    CHECK(budget->current == 0 && budget_uninstall_lexbor(budget));
+    return 0;
+}
+
+/* A full rebuild keeps the old layout's boxes for its image walk; each
+   background's box lookup in them is a sorted search, so a page with many
+   boxes and many backgrounds costs a few probes per background rather than
+   a scan of every box. */
+static int test_background_box_lookup_scales(Budget *budget)
+{
+    CHECK(budget_install_lexbor(budget));
+    Bytes dot = webp_solid(4, 4, 10, 20, 30);
+    enum { BOXES = 5000, BACKGROUNDS = 500 };
+    size_t capacity = 64u * 1024u + BOXES * 24u;
+    char *page = malloc(capacity);
+    CHECK(page != NULL);
+    size_t used = (size_t) snprintf(page, capacity,
+        "<!doctype html><meta name=viewport content='width=device-width'>"
+        "<style>body{margin:0}div{height:2px}"
+        ".b{background-image:url(data:image/webp;base64,");
+    base64_append(page, capacity, &used, dot.data, dot.length);
+    used += (size_t) snprintf(page + used, capacity - used, ")}</style>");
+    free(dot.data);
+    for (int i = 0; i < BOXES; i++)
+        used += (size_t) snprintf(page + used, capacity - used,
+            i % (BOXES / BACKGROUNDS) == 0 ? "<div class=b></div>"
+                                           : "<div></div>");
+    CHECK(used + 1u < capacity);
+    static NavigationSession navigation;
+    CHECK(navigation_init(&navigation, budget, 2));
+    navigation_enable_external_resources(&navigation, 2, 32768, 32768,
+        8, 4u * MIB, 4u * MIB, 8u * MIB, 1500);
+    CHECK(navigation_commit_html(&navigation, navigation_begin(&navigation),
+        "https://boxes.test/", page, used, 480, NULL, NULL, true));
+    free(page);
+    CHECK(navigation.page.layout.node_box_count >= BOXES);
+    tilefinch_test_faults()->layout_image_box_probes = 0;
+    uint64_t started = tilefinch_platform_monotonic_time_us();
+    navigation.style_rebuild_required = true;
+    CHECK(navigation_relayout(&navigation) && navigation.page.loaded);
+    uint64_t elapsed = tilefinch_platform_monotonic_time_us() - started;
+    unsigned long long probes =
+        tilefinch_test_faults()->layout_image_box_probes;
+    printf("background box lookup: %llu probes, rebuild %llu us\n",
+           probes, (unsigned long long) elapsed);
+    CHECK(probes != 0 && probes <= BACKGROUNDS * 16u);
+    navigation_destroy(&navigation);
+    CHECK(budget->current == 0 && budget_uninstall_lexbor(budget));
+    return 0;
+}
+
+/* With external resources off a full rebuild loads no images, so it frees
+   the old layout's boxes with the layout rather than keeping them for an
+   image walk: its peak holds one box array, not two. */
+static int test_rebuild_without_resources_frees_boxes(Budget *budget)
+{
+    CHECK(budget_install_lexbor(budget));
+    enum { BOXES = 20000 };
+    size_t capacity = 1024u + BOXES * 12u;
+    char *page = malloc(capacity);
+    CHECK(page != NULL);
+    size_t used = (size_t) snprintf(page, capacity,
+        "<!doctype html><meta name=viewport content='width=device-width'>"
+        "<style>body{margin:0}div{height:2px}</style>");
+    for (int i = 0; i < BOXES; i++)
+        used += (size_t) snprintf(page + used, capacity - used,
+                                  "<div></div>");
+    CHECK(used + 1u < capacity);
+    static NavigationSession navigation;
+    CHECK(navigation_init(&navigation, budget, 2));
+    CHECK(navigation_commit_html(&navigation, navigation_begin(&navigation),
+        "https://boxes.test/", page, used, 480, NULL, NULL, true));
+    free(page);
+    size_t box_bytes = navigation.page.layout.node_box_capacity
+        * sizeof(LayoutNodeBox);
+    CHECK(navigation.page.layout.node_box_count >= BOXES);
+    /* After a warming rebuild, the next one's peak above its start: the
+       replaced layout, boxes included, is freed before the new one is
+       built, so this page's rebuild peaks about 1.2 box arrays up. Keeping
+       the old array for an image walk that never runs raised it to 2.2. */
+    navigation.style_rebuild_required = true;
+    CHECK(navigation_relayout(&navigation) && navigation.page.loaded);
+    size_t start = budget->current;
+    budget->peak = start;
+    navigation.style_rebuild_required = true;
+    CHECK(navigation_relayout(&navigation) && navigation.page.loaded);
+    size_t rise = budget->peak - start;
+    if (rise >= box_bytes * 3u / 2u)
+        fprintf(stderr, "rebuild rose %zu with %zu-byte box arrays\n",
+                rise, box_bytes);
+    CHECK(rise < box_bytes * 3u / 2u);
+    navigation_destroy(&navigation);
+    CHECK(budget->current == 0 && budget_uninstall_lexbor(budget));
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     Budget budget;
@@ -952,6 +1217,9 @@ int main(int argc, char **argv)
         {"webp-alpha", test_webp_alpha_byte_history},
         {"webp-alpha-filters", test_webp_alpha_filters},
         {"rebuild-preload", test_rebuild_during_detached_decode},
+        {"background-layout-tile", test_background_decodes_at_layout_tile},
+        {"background-box-lookup", test_background_box_lookup_scales},
+        {"rebuild-frees-boxes", test_rebuild_without_resources_frees_boxes},
     };
     for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); i++) {
         if (only != NULL && strcmp(only, tests[i].name) != 0) continue;

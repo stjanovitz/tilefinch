@@ -108,9 +108,24 @@ bool layout_block_emit_decoration(
         }
     } else if (style->background_image_kind == STYLE_BACKGROUND_IMAGE_URL
         && !image_resource_available(element_background)) {
-        layout_note_unresolved_external_visual(
+        ImagePriorityTarget *target = layout_note_unresolved_external_visual(
             context, node, style->background_image,
             IMAGE_PRIORITY_KIND_BACKGROUND, PSEUDO_NONE);
+        /* Its tile size, for the loader (the area is filled in once the
+           box is final). The root and body backgrounds paint the canvas,
+           not their box. */
+        if (target != NULL && node->local_name != LXB_TAG_HTML
+            && node->local_name != LXB_TAG_BODY) {
+            uint8_t fit = style->background_fit;
+            if (paint_stack != NULL && paint_stack->background_count != 0
+                && paint_stack->backgrounds[0].fit != 0)
+                fit = paint_stack->backgrounds[0].fit;
+            target->background_size_width = style->background_width;
+            target->background_size_height = style->background_height;
+            target->background_size_flags = style->background_size_flags;
+            target->background_fit = fit;
+            target->background_sized = true;
+        }
     }
     size_t background_index = (size_t) -1;
     size_t background_gradient_index = (size_t) -1;

@@ -2737,6 +2737,32 @@ int main(void) {
         self.assertNotIn("PSP_HEAP_SIZE_KB(-4096);", source)
         self.assertNotIn("PSP_HEAP_SIZE_KB(-2048);", source)
 
+    def test_decoder_reserve_is_chosen_before_newlib_claims_the_heap(self):
+        # PSPSDK's _sbrk reads the threshold on its first call, which comes
+        # from inside __libcglue_init. Both browser images must wrap that
+        # function, and one wrapper must serve both (the relocatable browser
+        # links every object of the static EBOOT).
+        targets = (ROOT / "cmake/TilefinchTargets.cmake").read_text(
+            encoding="utf-8")
+        self.assertEqual(targets.count('"LINKER:--wrap=__libcglue_init"'), 2)
+        self.assertIn("src/psp_heap_reserve.c", targets)
+        self.assertNotIn("TILEFINCH_PSP_SWDEC_COMPONENT_BUILD", targets)
+        reserve = without_comments(
+            (ROOT / "src/psp_heap_reserve.c").read_text(encoding="utf-8"))
+        wrapper = reserve[reserve.index("void __wrap___libcglue_init("):]
+        handoff = wrapper.index("psp_boot_module_before_libc(&argc, argv)")
+        threshold = wrapper.index("sce_newlib_heap_threshold_kb_size =")
+        real = wrapper.index("__real___libcglue_init(argc, argv)")
+        self.assertLess(handoff, threshold)
+        self.assertLess(threshold, real)
+        # Nothing before the real init may allocate or format.
+        for call in ("malloc", "printf", "fopen", "tilefinch_swdec_component_path("):
+            self.assertNotIn(call, wrapper[:real])
+        client = without_comments(
+            (ROOT / "src/psp_boot_module_client.c").read_text(encoding="utf-8"))
+        self.assertNotIn("__wrap___libcglue_init", client)
+        self.assertNotIn("__real___libcglue_init", client)
+
     def test_nonblocking_code_does_not_use_timed_thread_waits(self):
         offenders = []
         for path in sorted((ROOT / "src").rglob("*")):
@@ -4387,8 +4413,8 @@ int main(void) {
         preview = request[
             request.index("if (preview) {"):
             request.index("if (!media->audio_only && psp_media_seek_reopens_backend(")]
-        self.assertIn("PSP_MEDIA_EVENT_PREVIEW_STARTED", preview)
-        self.assertIn("psp_ui_media_set_seek_preview", preview)
+        # The extracted transition is exercised by psp-media-scrub-tests.
+        self.assertIn("psp_media_begin_preview", preview)
         self.assertIn("return true", preview)
         self.assertNotIn("media_playback_seek(", preview)
         self.assertNotIn("media_playback_warm_", preview)
@@ -4575,7 +4601,8 @@ int main(void) {
 typedef struct {
     MediaPlayback *playback;
     struct {bool playing;} ui;
-    bool have_frame, presentation_deferred;
+    bool have_frame, presentation_deferred, use_swdec;
+    struct {bool preview_active;} machine;
     PspMediaAudioHold audio_hold;
     PspMediaStartupPreroll startup;
     PspMediaSeekFloor seek_floor;
@@ -4609,6 +4636,7 @@ static void retire(PspMediaSession *media) {
 ''' + retire + r'''
 }
 static void prepare(PspMediaSession *media) {bool frame_progress=false;
+    bool priming_before_take=!media->have_frame || media->audio_hold.applied;
 ''' + take + '\n(void)frame_progress;\n}\n' + due + wait + r'''
 #define CHECK(x) do{if(!(x)){fprintf(stderr,"deadline line %d: %s\n",__LINE__,#x);return 1;}}while(0)
 int main(void) {
@@ -4909,11 +4937,24 @@ int main(void) {
                 encoding="utf-8"))
         create = source[source.index(
             "bool media_psp_swdec_backend_create_sources("):]
-        for field in ("decoder_arena", "aux_arena", "rgb_ring",
-                      "audio_packets"):
-            self.assertRegex(
-                create,
-                rf"{field}\s*=\s*budget_malloc_cacheline_category\(")
+        self.assertIn('"decoder-arena"', create)
+        # The pool alternative is cache-line aligned too (64-byte blocks).
+        self.assertIn("media_psp_me_pool_claim(backend->decoder_arena_bytes)",
+                      create)
+        helpers = source[
+            source.index("static void *swdec_take_pool_block("):
+            source.index("static uint16_t *swdec_rgb_slot(")]
+        self.assertIn("media_psp_me_pool_claim(bytes)", helpers)
+        # Every heap fallback goes through the cache-line allocator, and
+        # the arenas and audio packets only take blocks the ME can reach.
+        self.assertIn("return budget_malloc_cacheline_category(", helpers)
+        self.assertIn("swdec_alloc_me_visible(", helpers)
+        aux = helpers[helpers.index("static bool swdec_take_aux_arena("):]
+        self.assertIn("swdec_take_low_heap_block(", aux[:aux.index("\n}\n")])
+        packets = helpers[
+            helpers.index("static bool swdec_take_audio_packets("):]
+        self.assertIn("swdec_take_low_heap_block(",
+                      packets[:packets.index("\n}\n")])
         submit = source[
             source.index("static MediaBackendResult swdec_submit("):
             source.index("static MediaBackendResult swdec_drain(")]
@@ -4924,7 +4965,7 @@ int main(void) {
         self.assertIn("uint64_t pts_us = mapping->pts_us", publish)
         self.assertIn("uint64_t duration_us = mapping->duration_us", publish)
         self.assertIn("state->pts_us = pts_us", publish)
-        self.assertNotIn("state->pts_us = backend->job_pts_us", publish)
+        self.assertNotIn("state->pts_us = job->pts_us", publish)
         # A flush reserves an output surface just like an ordinary decode.
         # The returned picture's source AU supplies timing, while conversion
         # is bound only after receive_frame identifies that picture.
@@ -4932,20 +4973,25 @@ int main(void) {
             source.index("static MediaBackendResult swdec_drain("):
             source.index("static bool swdec_advance(")]
         self.assertIn("int slot = swdec_find_free_slot(backend)", drain)
-        self.assertIn("backend->job_slot = slot", drain)
+        self.assertIn("job->slot = slot", drain)
         decode = source[
             source.index("static void swdec_decode_job("):
             source.index("static int swdec_worker_main(")]
         self.assertIn("if (result == 1) swdec_publish_picture", decode)
         self.assertIn("backend->api->csc_picture(", publish)
-        self.assertIn("int slot = backend->job_slot", publish)
+        self.assertIn("int slot = job->slot", publish)
         self.assertIn("sceKernelDcacheInvalidateRange(", publish)
         self.assertIn("backend->rgb_slot_bytes", publish)
         self.assertIn(
             "backend->rgb_slot_bytes = swdec_cache_extent(", create)
         self.assertIn("backend->rgb_slot_bytes, picture", publish)
+        # Video units now reach the decoder through the access-unit queue;
+        # the geometry admission runs where a queued unit is dispatched.
+        dispatch = source[
+            source.index("static MediaBackendResult swdec_dispatch_queued("):
+            source.index("static MediaBackendResult swdec_submit(")]
         self.assertIn(
-            "media_h264_annexb_sample_is_admitted(", submit)
+            "media_h264_annexb_sample_is_admitted(", dispatch)
         release_prior = source[
             source.index("static void swdec_release_prior_claim("):
             source.index("static bool swdec_take_video_frame(")]
@@ -4979,11 +5025,11 @@ int main(void) {
             opened.index("else if (media->page_source")]
         self.assertIn("media_h264_annexb_decoder_route(", hls)
         self.assertIn("MEDIA_H264_DECODER_ROUTE_HIGH_EXTENSION", hls)
-        self.assertIn("psp_swdec_component_prepare(", hls)
+        self.assertIn("psp_media_prepare_software_route(", hls)
         self.assertNotIn("media->decoder_profile_idc = 100u", hls)
         playback = opened[
-            opened.index("static bool psp_media_create_playback("):
-            opened.index("static bool psp_media_create_audio_http_range(")]
+            opened.index("static bool psp_media_create_playback_once("):
+            opened.index("static bool psp_media_create_playback(")]
         self.assertIn("media_psp_backend_create_sources(", playback)
         self.assertIn("media_psp_swdec_backend_create_sources(", playback)
         self.assertIn("media_playback_create_sources(", playback)
@@ -5002,7 +5048,7 @@ int main(void) {
         hls_transport = without_comments(
             (ROOT / "src/psp_media_hls.c").read_text(encoding="utf-8"))
         self.assertIn(
-            ".raw_gzip_encoding = raw_gzip", hls_transport,
+            ".raw_gzip_encoding = request->raw_gzip", hls_transport,
             "pumpable HLS must own incremental playlist decompression")
         gzip_pump = without_comments(
             (ROOT / "src/psp_hls_gzip.c").read_text(encoding="utf-8"))
@@ -5035,9 +5081,9 @@ int main(void) {
         self.assertIn("component->took_me", cleanup)
         self.assertIn("sceKernelStopModule(", cleanup)
         self.assertIn("sceKernelUnloadModule(", cleanup)
-        self.assertLess(
-            cleanup.index("sceKernelUnloadModule("),
-            cleanup.index("budget_reservation_release("))
+        # Loading charges the page budget nothing (the PRX is outside the
+        # heap), so there is no reservation to release on unload.
+        self.assertNotIn("budget_reservation", source)
         prepare = source[
             source.index("bool psp_swdec_component_prepare("):
             source.index("bool psp_swdec_component_suspend(")]
@@ -5072,7 +5118,10 @@ int main(void) {
         create = source[
             source.index("MediaHttpRange *media_http_range_create("):
             source.index("MediaRangeReader media_http_range_reader(")]
-        self.assertIn("fetch_background_transport_available()", create)
+        # The worker availability now reaches the route through a host seam;
+        # the route itself is covered behaviourally by
+        # tilefinch-media-http-range-tests (test_range_route_policy).
+        self.assertIn("range_background_available()", create)
         issue = source[
             source.index("static RangeFillIssueStatus range_fill_issue("):
             source.index("static bool range_fill_install(")]
@@ -5110,9 +5159,7 @@ int main(void) {
             source.index("static PspPageMediaProbeStatus psp_media_page_probe("):
             source.index("static void psp_media_page_track_metadata(")]
         self.assertIn("fetch_prepare_page_request_context(", probe)
-        self.assertIn("fetch_scheduler_create(", probe)
-        self.assertIn("fetch_scheduler_enable_background_transport(", probe)
-        self.assertIn("fetch_scheduler_enqueue(", probe)
+        self.assertIn("media_http_probe_enqueue_background(", probe)
         self.assertIn("fetch_scheduler_request_progress(", probe)
         self.assertIn("fetch_scheduler_take(", probe)
         self.assertNotIn(
@@ -5523,6 +5570,9 @@ int main(void) {
         source = (ROOT / "src/psp_script_main.c").read_text()
         start = source.index("static TILEFINCH_OUT_OF_LINE void psp_wait_before_interactive_input(")
         body = source[start:source.index("\n\nstatic TILEFINCH_OUT_OF_LINE bool psp_update_page_fullscreen", start)]
+        display = (ROOT / "src/psp_display.c").read_text()
+        start = display.index("bool psp_display_take_pacing_credit(")
+        credit = display[start:display.index("\nuint16_t *psp_display_back_buffer", start)]
         compiler = shutil.which("cc")
         if compiler is None:
             self.skipTest("host C compiler unavailable")
@@ -5530,11 +5580,36 @@ int main(void) {
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include "media_backend_psp_policy.h"
 #define TILEFINCH_OUT_OF_LINE
 #define WORK_LEDGER_SLEEP 0
-#define PSP_MEDIA_FULLSCREEN_POLL_YIELD_US 2000u
 #define PSP_PAGE_TASK_YIELD_US 4000u
-static struct { unsigned presents; bool video; } psp_display;
+typedef struct { unsigned presents,rejections; bool video; } PspDisplay;
+static PspDisplay psp_display;
+typedef struct {
+    bool use_swdec,audio_only;
+    void *playback;
+    uint64_t clock_us;
+    struct { uint64_t duration_us; } frame;
+} PspMediaSession;
+static PspMediaSession media;
+static bool have_ready;
+static uint64_t ready_us,audio_us;
+static bool media_playback_ready_video_start_us(void *p,uint64_t *out) {
+    (void)p;*out=ready_us;return have_ready;
+}
+static bool media_playback_audio_cursor_us(void *p,uint64_t *out) {
+    (void)p;*out=audio_us;return true;
+}
+static unsigned media_playback_ready_video_frames(void *p) {
+    (void)p;return have_ready ? 1u : 0u;
+}
+static bool media_playback_wait_video_ready(void *p,uint32_t timeout) {
+    (void)p;(void)timeout;return false;
+}
+static bool media_playback_wait_video_due(void *p,uint32_t timeout) {
+    (void)p;(void)timeout;return false;
+}
 static unsigned delays,vblanks,wait_us,enters,leaves;
 static bool psp_display_video_active(const void *display) {
     (void)display;return psp_display.video;
@@ -5543,37 +5618,45 @@ static unsigned work_ledger_enter(unsigned kind) { (void)kind;return ++enters; }
 static void work_ledger_leave(unsigned token) { if(token==enters)leaves++; }
 static int sceKernelDelayThread(unsigned us) { delays++;wait_us=us;return 0; }
 static int sceDisplayWaitVblankStart(void) { vblanks++;return 0; }
-''' + body + r'''
+''' + credit + body + r'''
 #define CHECK(x) do { if(!(x)) { fprintf(stderr,"wait line %d: %s\n",__LINE__,#x);return 1; } } while(0)
 static void reset(void) { delays=vblanks=wait_us=0; }
 int main(void) {
-    psp_wait_before_interactive_input(false,false,false,0);
+    psp_wait_before_interactive_input(false,&media,false,false,false,0);
     CHECK(vblanks==1 && !delays);
     psp_display.video=true;reset();
-    psp_wait_before_interactive_input(true,false,false,0);
+    psp_wait_before_interactive_input(true,&media,false,false,false,0);
     CHECK(delays==1 && wait_us==2000 && !vblanks);
     for(unsigned at=0;at<256;at++) {
         ++psp_display.presents;reset(); /* successful, fenced publication */
-        psp_wait_before_interactive_input(true,false,false,0);
+        psp_wait_before_interactive_input(true,&media,false,false,false,0);
         CHECK(!delays && !vblanks);
         reset(); /* early/empty turn, or rejected publication: no credit */
-        psp_wait_before_interactive_input(true,false,false,0);
+        psp_wait_before_interactive_input(true,&media,false,false,false,0);
         CHECK(delays==1 && wait_us==2000 && !vblanks);
         ++psp_display.presents;reset();
-        psp_wait_before_interactive_input(false,false,false,0); /* pause */
+        psp_wait_before_interactive_input(false,&media,false,false,false,0); /* pause */
         CHECK(vblanks==1 && !delays);
-        reset();psp_wait_before_interactive_input(true,false,false,0);
+        reset();psp_wait_before_interactive_input(true,&media,false,false,false,0);
         CHECK(delays==1 && wait_us==2000 && !vblanks); /* no stale pause credit */
     }
     psp_display.video=false;++psp_display.presents;reset();
-    psp_wait_before_interactive_input(true,false,false,0);
-    CHECK(delays==1 && wait_us==2000 && !vblanks); /* page publication is not video */
-    reset();psp_wait_before_interactive_input(false,true,false,0);
+    psp_wait_before_interactive_input(false,&media,false,false,false,0);
+    CHECK(vblanks==1 && !delays); /* page publication is not video */
+    reset();psp_wait_before_interactive_input(false,&media,false,true,false,0);
     CHECK(!delays && !vblanks);
-    reset();psp_wait_before_interactive_input(false,true,false,777);
+    reset();psp_wait_before_interactive_input(false,&media,false,true,false,777);
     CHECK(delays==1 && wait_us==777 && !vblanks);
-    reset();psp_wait_before_interactive_input(false,false,true,0);
+    reset();psp_wait_before_interactive_input(false,&media,false,false,true,0);
     CHECK(delays==1 && wait_us==4000 && !vblanks);
+    /* The software path uses RGB565, not the RGBA video surface. */
+    media.use_swdec=true;media.frame.duration_us=40000u;reset();
+    psp_wait_before_interactive_input(true,&media,false,false,false,0);
+    CHECK(vblanks==1 && !delays);
+    ++psp_display.presents;reset();
+    have_ready=true;ready_us=100000u;audio_us=80000u;
+    psp_wait_before_interactive_input(true,&media,false,false,false,0);
+    CHECK(!delays && !vblanks);
     CHECK(enters==leaves);
     return 0;
 }
@@ -5582,6 +5665,7 @@ int main(void) {
             path = Path(temporary)
             (path / "wait.c").write_text(fixture)
             compiled = subprocess.run([compiler, "-std=c11", "-O3",
+                "-I", str(ROOT / "src"),
                 str(path / "wait.c"), "-o", str(path / "wait")], capture_output=True)
             self.assertEqual(compiled.returncode, 0, compiled.stderr)
             result = subprocess.run([str(path / "wait")], capture_output=True)
@@ -8621,9 +8705,11 @@ int main(void) {
     def test_native_track_changes_preserve_playback_ownership(self):
         session = without_comments(
             (ROOT / "src/psp_media_session.c").read_text(encoding="utf-8"))
-        audio = session[
-            session.index("static void psp_media_request_track_reopen("):
-            session.index("static void psp_media_reset_subtitle_document(")]
+        retry = without_comments(
+            (ROOT / "src/psp_media_retry.c").read_text(encoding="utf-8"))
+        audio = retry[
+            retry.index("void psp_media_request_track_reopen("):
+            retry.index("void psp_media_request_user_retry(")]
         self.assertIn("psp_media_recovery_position_us(media)", audio)
         self.assertIn("psp_media_machine_wants_playing(media)", audio)
         self.assertLess(
@@ -8795,13 +8881,11 @@ int main(void) {
     def test_video_open_prioritizes_media_and_does_not_wait_for_readahead(self):
         main = without_comments(
             (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
-        route_start = main.index("bool media_open_was_pending =")
-        route = main[
-            route_start:
-            main.index("psp_log_set_phase(PSP_LOG_PHASE_MEDIA)", route_start)]
-        self.assertLess(
-            route.index("psp_media_prepare_route("),
-            route.index("browser_engine_cancel_network_work("))
+        route_end = main.index("psp_log_set_phase(PSP_LOG_PHASE_MEDIA)")
+        route_start = main.rindex("psp_media_prepare_route(", 0, route_end)
+        route = main[route_start:route_end]
+        self.assertIn("browser_engine_hold_page_network(", route)
+        self.assertIn("browser_engine_release_page_network(", route)
         self.assertIn('"video selected"', route)
 
         open_source = without_comments(
@@ -9021,7 +9105,7 @@ int main(void) {
             actions.index("bool opened = entry_url != NULL"):
             actions.index("action->prefer_native_media = false;")]
         opened = handoff[handoff.index("if (opened) {"):]
-        self.assertIn("browser_engine_cancel_network_work(", opened)
+        self.assertIn("browser_engine_hold_page_network(", opened)
         self.assertIn("provider_handoff_present_pending", opened)
         self.assertLess(
             opened.index("browser_engine_prepare_optional_memory_reclaim("),
@@ -9127,7 +9211,7 @@ int main(void) {
         session = without_comments(psp_media_session_sources())
         first_frame = session[
             session.index("PspMediaFirstFrameVerdict verdict"):
-            session.index("if (was_pending != media->decode_job_pending)")]
+            session.index("bool ended = media_playback_ended(media->playback);")]
         self.assertIn("psp_media_delivery_candidate_stalled(media)", first_frame)
         self.assertIn("psp_media_retry_delivery_failure(", first_frame)
         self.assertIn('"first-frame-stalled-candidate"', first_frame)
@@ -9490,7 +9574,7 @@ int main(void) {
         preceding = main[max(0, sites[0] - 400):sites[0]]
         self.assertIn("psp_exit_handoff(exit_to)", preceding)
         self.assertIn("#ifdef TILEFINCH_PSP_VALIDATION_LOG", preceding)
-        # Every mode that stops the process reaches the funnel: the six
+        # Every mode that stops the process reaches the funnel: the five
         # validation qualifications plus the ordinary clean exit. Scan past the
         # funnel's own definition, which is above every caller.
         qualify = without_comments(
@@ -9503,7 +9587,6 @@ int main(void) {
             sorted([
                 "process->config.exit_to",
                 "config->exit_to",
-                "exit_to",
                 "exit_to",
                 "exit_to",
                 "exit_to",

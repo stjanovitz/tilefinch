@@ -6,8 +6,20 @@ int main(int argc, char **argv)
         return 1;                                                            \
     }                                                                        \
 } while (0)
+    if (argc == 2 && strcmp(argv[1], "--sliced-stylesheet-only") == 0)
+        return test_parser_blocking_stylesheet_prepared_in_slices()
+            && test_sliced_stylesheet_keeps_document_order() ? 0 : 1;
     if (argc == 2 && strcmp(argv[1], "--parser-timers-only") == 0) {
         RUN_TEST(test_parser_timers_progress_before_eof);
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--declarations-head-wipe-only") == 0) {
+        RUN_TEST(test_streamed_declarations_survive_head_wipe);
+        RUN_TEST(test_streamed_body_declaration_survives_removal);
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--deferred-media-only") == 0) {
+        RUN_TEST(test_deferred_media_stylesheet_onload_swap);
         return 0;
     }
     if (argc == 2 && strcmp(argv[1], "--initial-fragment-only") == 0) {
@@ -39,11 +51,18 @@ int main(int argc, char **argv)
     if (argc == 2 && strcmp(argv[1], "--replacement-pressure-only") == 0) {
         RUN_TEST(test_runtime_navigation_releases_large_incumbent);
         RUN_TEST(test_mutation_layout_pressure_releases_invalid_incumbent);
+        RUN_TEST(test_full_rebuild_style_pressure_stops_scripts);
         RUN_TEST(test_stable_relayout_scroll_defers_author_reflection);
         RUN_TEST(test_optional_image_layout_refusal_retains_page);
         RUN_TEST(test_optional_initial_image_refusal_retains_page);
         RUN_TEST(test_initial_layout_pressure_uses_minimal_style);
         puts("replacement pressure tests passed");
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--frame-event-relayout-only") == 0) {
+        RUN_TEST(test_frame_event_static_relayout_keeps_page);
+    RUN_TEST(test_scroll_reflection_static_relayout_keeps_page);
+        puts("frame event relayout tests passed");
         return 0;
     }
     if (argc == 2 && strcmp(argv[1], "--legacy-charset-only") == 0) {
@@ -71,6 +90,7 @@ int main(int argc, char **argv)
     }
     if (argc == 2 && strcmp(argv[1], "--image-retarget-only") == 0) {
         RUN_TEST(test_inline_svg_css_viewport_preserves_circle);
+        RUN_TEST(test_inline_svg_font_relative_attributes_use_computed_size);
         RUN_TEST(test_nested_svg_viewports_preserve_atlas_geometry);
         RUN_TEST(test_svg_local_clips_preserve_artwork);
         RUN_TEST(test_svg_solid_luminance_mask);
@@ -114,6 +134,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_parser_refusal_stops_speculative_preview_retries);
     RUN_TEST(test_display_retarget_follows_painted_size);
     RUN_TEST(test_inline_svg_css_viewport_preserves_circle);
+    RUN_TEST(test_inline_svg_font_relative_attributes_use_computed_size);
     RUN_TEST(test_nested_svg_viewports_preserve_atlas_geometry);
     RUN_TEST(test_svg_local_clips_preserve_artwork);
     RUN_TEST(test_svg_solid_luminance_mask);
@@ -134,8 +155,11 @@ int main(int argc, char **argv)
     RUN_TEST(test_optional_image_layout_refusal_retains_page);
     RUN_TEST(test_optional_initial_image_refusal_retains_page);
     RUN_TEST(test_initial_layout_pressure_uses_minimal_style);
+    RUN_TEST(test_null_exception_reads_as_out_of_memory);
+    RUN_TEST(test_node_retirement_observer_relocates);
     RUN_TEST(test_runtime_navigation_releases_large_incumbent);
     RUN_TEST(test_mutation_layout_pressure_releases_invalid_incumbent);
+    RUN_TEST(test_full_rebuild_style_pressure_stops_scripts);
     RUN_TEST(test_stable_relayout_scroll_defers_author_reflection);
     RUN_TEST(test_static_images_retry_after_transient_idle_failure);
     RUN_TEST(test_visible_lazy_static_image_waits_until_idle);
@@ -151,6 +175,8 @@ int main(int argc, char **argv)
     RUN_TEST(test_commit_appends_late_body_style);
     RUN_TEST(test_parser_checkpoint_refusals_preserve_server_dom);
     RUN_TEST(test_parser_head_cssom_preserves_initialization);
+    RUN_TEST(test_streamed_declarations_survive_head_wipe);
+    RUN_TEST(test_streamed_body_declaration_survives_removal);
     RUN_TEST(test_parser_script_stage_circuit_preserves_actions);
     RUN_TEST(test_parser_transport_failures_do_not_retire_realm);
     RUN_TEST(test_parser_script_stage_watchdog_and_failure_reset);
@@ -159,6 +185,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_parser_mutation_checkpoint_uses_stage_deadline_counted);
     RUN_TEST(test_parser_timers_progress_before_eof);
     RUN_TEST(test_parser_script_stage_clock);
+    RUN_TEST(test_parser_script_stage_extended_for_player_page);
     RUN_TEST(test_parser_classic_script_import);
     RUN_TEST(test_parser_insertions_reach_mutation_observers);
     RUN_TEST(test_late_server_actions_refresh_hydration_snapshot);
@@ -168,6 +195,8 @@ int main(int argc, char **argv)
     RUN_TEST(test_streaming_stylesheet_continuation_converges);
     RUN_TEST(test_streaming_preview_rejects_incomplete_external_css);
     RUN_TEST(test_streaming_stylesheet_follows_late_viewport);
+    RUN_TEST(test_parser_blocking_stylesheet_prepared_in_slices);
+    RUN_TEST(test_sliced_stylesheet_keeps_document_order);
     RUN_TEST(test_streaming_preview_cancel_is_transient);
     RUN_TEST(test_parser_blocking_script_classification);
     RUN_TEST(test_valid_meta_referrer_overrides_response_policy);
@@ -193,13 +222,23 @@ int main(int argc, char **argv)
     RUN_TEST(test_memory_exhaustion_restores_torn_down_server_page);
     RUN_TEST(test_memory_refusal_keeps_intact_page_and_realm);
     RUN_TEST(test_late_script_oom_frees_queued_frame_messages);
+    RUN_TEST(test_frame_window_setup_oom_commits_top_document);
+    RUN_TEST(test_frame_error_event_oom_commits_top_document);
+    RUN_TEST(test_frame_messaging_refusal_keeps_page_and_realm);
+    RUN_TEST(test_frame_completion_window_state_oom_keeps_page);
+    RUN_TEST(test_frame_load_event_oom_retires_realm);
+    RUN_TEST(test_frame_completion_error_event_oom_retires_realm);
+    RUN_TEST(test_frame_event_static_relayout_keeps_page);
+    RUN_TEST(test_scroll_reflection_static_relayout_keeps_page);
     RUN_TEST(test_cross_origin_image_taints_canvas);
     RUN_TEST(test_legacy_charset_documents_decode);
     RUN_TEST(test_authored_oom_text_does_not_trigger_static_recovery);
     RUN_TEST(test_late_oom_static_relayout_refusal_is_transactional);
+    RUN_TEST(test_staged_body_growth_is_bounded);
     RUN_TEST(test_low_memory_replacement_success);
     RUN_TEST(test_streaming_dynamic_stylesheets_are_not_adopted);
     RUN_TEST(test_style_preload_event_promotion);
+    RUN_TEST(test_deferred_media_stylesheet_onload_swap);
     RUN_TEST(test_style_preloads_never_crowd_out_stylesheets);
     RUN_TEST(test_stylesheet_sources_insert_in_document_order);
     RUN_TEST(test_adopted_sources_insert_between_existing);

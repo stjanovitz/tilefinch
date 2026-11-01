@@ -431,6 +431,16 @@ struct JSRuntime {
     JSSharedArrayBufferFunctions sab_funcs;
     /* see JS_SetStripInfo() */
     uint8_t strip_flags;
+    /* see JS_SetExternalSourceHooks() */
+    JSExternalSourceReadFunc *external_source_read;
+    JSExternalSourceReleaseFunc *external_source_release;
+    JSExternalSourcePinFunc *external_source_pin;
+    JSExternalSourceQueryFunc *external_source_query;
+    void *external_source_opaque;
+    uint32_t external_source_pending_id; /* 0: none */
+    /* the record a compile repeated without preparsing takes over */
+    struct JSFunctionSource *external_source_carry;
+    uint32_t external_source_pending_length;
     /* see JS_SetLazyFunctionThreshold() */
     uint32_t lazy_function_threshold;
     /* see JS_SetLazyFunctionPreparse() */
@@ -795,10 +805,32 @@ typedef enum JSFunctionKindEnum {
    bytecode reference: retaining a child must not retain its parent/realm. */
 typedef struct JSFunctionSource {
     uint32_t ref_count;
+    /* Tilefinch: non-zero for text kept by the embedder (see
+       JS_SetExternalSourceHooks()); bytes and string are then NULL and
+       length is the length of the whole text */
+    uint32_t external_id;
+    /* uncompiled lazy functions that read the external text */
+    uint32_t lazy_readers;
     size_t length;
     char *bytes;
     JSString *string;
 } JSFunctionSource;
+
+/* Tilefinch: one more (delta 1) or one fewer (-1) uncompiled lazy function
+   reads external text 'owner' (see JS_SetExternalSourceHooks()) */
+static void js_external_source_require(JSRuntime *rt, JSFunctionSource *owner,
+                                       int delta)
+{
+    if (delta > 0) {
+        if (owner->lazy_readers++ == 0 && rt->external_source_pin)
+            rt->external_source_pin(rt->external_source_opaque,
+                                    owner->external_id, 1);
+    } else if (owner->lazy_readers > 0) {
+        if (--owner->lazy_readers == 0 && rt->external_source_pin)
+            rt->external_source_pin(rt->external_source_opaque,
+                                    owner->external_id, 0);
+    }
+}
 
 static void js_free_function_source(JSRuntime *rt, char *source,
                                     JSFunctionSource *owner)
@@ -806,12 +838,52 @@ static void js_free_function_source(JSRuntime *rt, char *source,
     if (!owner) {
         js_free_rt(rt, source);
     } else if (--owner->ref_count == 0) {
-        if (owner->string)
+        if (owner->external_id) {
+            if (rt->external_source_release)
+                rt->external_source_release(rt->external_source_opaque,
+                                            owner->external_id);
+        } else if (owner->string)
             JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_STRING, owner->string));
         else
             js_free_rt(rt, owner->bytes);
         js_free_rt(rt, owner);
     }
+}
+
+/* Tilefinch: the record for external text 'id' (see
+   JS_SetExternalSourceHooks()), with one reference, or NULL (and the id
+   released) if it cannot be allocated */
+static JSFunctionSource *js_new_external_source(JSRuntime *rt, uint32_t id,
+                                                uint32_t length)
+{
+    JSFunctionSource *owner = js_malloc_rt(rt, sizeof(*owner));
+    if (!owner) {
+        if (rt->external_source_release)
+            rt->external_source_release(rt->external_source_opaque, id);
+        return NULL;
+    }
+    owner->ref_count = 1;
+    owner->external_id = id;
+    owner->lazy_readers = 0;
+    owner->length = length;
+    owner->bytes = NULL;
+    owner->string = NULL;
+    return owner;
+}
+
+/* Takes the pending external text id, if any (see JS_SetExternalSourceId()) */
+static JSFunctionSource *js_take_external_source(JSRuntime *rt)
+{
+    uint32_t id = rt->external_source_pending_id;
+    JSFunctionSource *carried = rt->external_source_carry;
+    if (carried) {
+        rt->external_source_carry = NULL;
+        return carried;
+    }
+    if (!id)
+        return NULL;
+    rt->external_source_pending_id = 0;
+    return js_new_external_source(rt, id, rt->external_source_pending_length);
 }
 
 /* A function compiled lazily (see JS_SetLazyFunctionThreshold()) has this
@@ -826,12 +898,17 @@ typedef struct JSLazyFunction {
     uint32_t source_len;
     uint32_t param_offset; /* first token of the parameter list, from the text start */
     uint32_t nested_threshold; /* JS_SetLazyFunctionThreshold() for inner functions */
+    /* Tilefinch: with external text (JSFunctionBytecode.source_external),
+       where the text the body compiles from starts in it; if 'source' is
+       NULL, it is read from there (source_len bytes) */
+    uint32_t external_offset;
     uint8_t func_type; /* JSParseFunctionEnum */
     uint8_t parent_js_mode;
     uint8_t parent_func_kind;
     uint8_t is_module : 1;
     uint8_t parent_static_init : 1;
     uint8_t strip_source : 1; /* inner functions are compiled without toString() text */
+    uint8_t external_source : 1; /* external_offset is valid */
 } JSLazyFunction;
 
 typedef struct JSFunctionBytecode {
@@ -857,7 +934,11 @@ typedef struct JSFunctionBytecode {
        byte_code_buf starts an allocation of its own that also holds the
        constant pool and variable definitions */
     uint8_t has_lazy_body : 1;
-    /* XXX: 8 bits available */
+    /* Tilefinch: the toString() text is external (see
+       JS_SetExternalSourceHooks()): debug.source_owner is its record and
+       debug.source_offset, not debug.source, says where the text starts */
+    uint8_t source_external : 1;
+    /* XXX: 7 bits available */
     uint8_t *byte_code_buf; /* (self pointer) */
     int byte_code_len;
     JSAtom func_name;
@@ -886,10 +967,19 @@ typedef struct JSFunctionBytecode {
         int source_len; 
         int pc2line_len;
         uint8_t *pc2line_buf;
-        char *source;
+        union {
+            char *source; /* !source_external */
+            uint32_t source_offset; /* source_external */
+        };
         JSFunctionSource *source_owner;
     } debug;
 } JSFunctionBytecode;
+
+/* The function's own toString() text in the heap, or NULL */
+static inline char *js_function_heap_source(const JSFunctionBytecode *b)
+{
+    return b->has_debug && !b->source_external ? b->debug.source : NULL;
+}
 
 /* While a lazily compiled function has no body (is_lazy), its empty
    bytecode (byte_code_len, cpool_count, arg_count and var_count are 0)
@@ -898,6 +988,14 @@ typedef struct JSFunctionBytecode {
 static inline JSLazyFunction *js_lazy_function_of(const JSFunctionBytecode *b)
 {
     return b->is_lazy ? (JSLazyFunction *)b->byte_code_buf : NULL;
+}
+
+/* Tilefinch: TRUE if the uncompiled lazy function 'b' reads the text it
+   compiles from external text (see JS_SetExternalSourceHooks()) */
+static inline BOOL js_lazy_reads_external(const JSFunctionBytecode *b)
+{
+    const JSLazyFunction *lz = js_lazy_function_of(b);
+    return lz && lz->external_source && !lz->source && b->source_external;
 }
 
 typedef struct JSBoundFunction {
@@ -2714,6 +2812,31 @@ void JS_SetSharedArrayBufferFunctions(JSRuntime *rt,
 void JS_SetStripInfo(JSRuntime *rt, int flags)
 {
     rt->strip_flags = flags;
+}
+
+void JS_SetExternalSourceHooks(JSRuntime *rt, JSExternalSourceReadFunc *read,
+                               JSExternalSourceReleaseFunc *release,
+                               JSExternalSourcePinFunc *pin, void *opaque)
+{
+    rt->external_source_read = read;
+    rt->external_source_release = release;
+    rt->external_source_pin = pin;
+    rt->external_source_opaque = opaque;
+}
+
+void JS_SetExternalSourceQuery(JSRuntime *rt,
+                               JSExternalSourceQueryFunc *query)
+{
+    rt->external_source_query = query;
+}
+
+uint32_t JS_SetExternalSourceId(JSRuntime *rt, uint32_t source_id,
+                                uint32_t length)
+{
+    uint32_t pending = rt->external_source_pending_id;
+    rt->external_source_pending_id = source_id;
+    rt->external_source_pending_length = source_id ? length : 0;
+    return pending;
 }
 
 int JS_GetStripInfo(JSRuntime *rt)
@@ -8021,7 +8144,12 @@ static void compute_bytecode_size(JSFunctionBytecode *b, JSMemoryUsage_helper *h
     }
     if (b->has_debug) {
         js_func_size += sizeof(*b) - offsetof(JSFunctionBytecode, debug);
-        if (b->debug.source) {
+        if (b->source_external) {
+            /* only the record: the text is not in the heap */
+            JSFunctionSource *owner = b->debug.source_owner;
+            hp->memory_used_count += 1.0 / owner->ref_count;
+            hp->js_func_size += (double)sizeof(*owner) / owner->ref_count;
+        } else if (b->debug.source) {
             JSFunctionSource *owner = b->debug.source_owner;
             if (owner) {
                 hp->memory_used_count += 2.0 / owner->ref_count;
@@ -11751,8 +11879,10 @@ int JS_SetPropertyInternal(JSContext *ctx, JSValueConst obj,
                 return call_setter(ctx, pr->u.getset.setter, this_obj, val, flags);
             } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_AUTOINIT) {
                 /* Instantiate property and retry (potentially useless) */
-                if (JS_AutoInitProperty(ctx, p1, prop, pr, prs))
+                if (JS_AutoInitProperty(ctx, p1, prop, pr, prs)) {
+                    JS_FreeValue(ctx, val);
                     return -1;
+                }
                 goto retry2;
             } else if (!(prs->flags & JS_PROP_WRITABLE)) {
                 goto read_only_prop;
@@ -16752,7 +16882,8 @@ static no_inline __exception int js_unary_arith_slow(JSContext *ctx,
                 {
                     JSBigIntBuf buf2;
                     JSBigInt *p2;
-                    p2 = js_bigint_set_si(&buf2, 2 * (op - OP_dec) - 1);
+                    v = 2 * (op - OP_dec) - 1;
+                    p2 = js_bigint_set_si(&buf2, v);
                     r = js_bigint_add(ctx, p1, p2, 0);
                 }
                 break;
@@ -24453,6 +24584,12 @@ typedef struct JSFunctionDef {
     int source_len;
     uint32_t source_start; /* exact copied span in get_line_col_cache->buf_start */
     JSFunctionSource *source_owner;
+    /* Tilefinch: the text is external (JSParseState.external_source):
+       source is NULL, source_owner is its record and source_start is the
+       offset of the text in it */
+    unsigned int source_external : 1;
+    /* with external text, the offset of the parse buffer in it */
+    uint32_t external_base;
 
     JSModuleDef *module; /* != NULL when parsing a module */
     BOOL has_await; /* TRUE if await is used (used in module eval) */
@@ -24514,6 +24651,10 @@ typedef struct JSParseState {
     BOOL is_module; /* parsing a module */
     BOOL allow_html_comments;
     BOOL ext_json; /* JSON parsing: true if accepting JSON superset */
+    /* Tilefinch: JSON.parse reads its argument in place (see
+       json_next_token_direct()); the buffer pointers then address this
+       string's 8- or 16-bit characters. NULL for UTF-8 input. */
+    JSString *json_src;
     GetLineColCache get_line_col_cache;
     BOOL lazy_entry; /* js_parse_function_decl2() compiles a lazy function */
     /* see js_preparse_function_body() */
@@ -24527,6 +24668,12 @@ typedef struct JSParseState {
     /* Tilefinch: JSRuntime.tf_out_of_memory_throws when the parse began
        (see js_parse_error_v()) */
     uint32_t out_of_memory_throws;
+    /* Tilefinch: the external text this buffer is part of, starting at
+       external_base (see JS_SetExternalSourceHooks()), or NULL. Functions
+       compiled under JS_STRIP_SOURCE refer to it instead of copying their
+       text. One reference is held for the parse. */
+    JSFunctionSource *external_source;
+    uint32_t external_base;
 } JSParseState;
 
 typedef struct JSOpCode {
@@ -24773,6 +24920,36 @@ static int get_line_col_cached(GetLineColCache *s, int *pcol_num, const uint8_t 
     return s->line_num;
 }
 
+/* Tilefinch: get_line_col() for JSON.parse reading its string in place.
+   The column counts code points as get_line_col() counts them in the
+   UTF-8 copy JSON.parse used to make: a surrogate pair is one, a lone
+   surrogate is one. */
+static no_inline int json_direct_line_col(JSParseState *s, const uint8_t *ptr,
+                                          int *pcol_num)
+{
+    const JSString *p = s->json_src;
+    uint32_t i, end, len = p->len;
+    int line_num = 0, col_num = 0, c;
+
+    end = (uint32_t)(ptr - s->buf_start) >> p->is_wide_char;
+    if (end > len)
+        end = len;
+    for(i = 0; i < end; i++) {
+        c = p->is_wide_char ? p->u.str16[i] : p->u.str8[i];
+        if (c == '\n') {
+            line_num++;
+            col_num = 0;
+            continue;
+        }
+        if (is_hi_surrogate(c) && i + 1 < end &&
+            is_lo_surrogate(p->u.str16[i + 1]))
+            i++;
+        col_num++;
+    }
+    *pcol_num = col_num;
+    return line_num;
+}
+
 /* 'ptr' is the position of the error in the source */
 static int js_parse_error_v(JSParseState *s, const uint8_t *ptr, const char *fmt, va_list ap)
 {
@@ -24791,7 +24968,10 @@ static int js_parse_error_v(JSParseState *s, const uint8_t *ptr, const char *fmt
         JS_ThrowOutOfMemory(ctx);
         return -1;
     }
-    line_num = get_line_col(&col_num, s->buf_start, ptr - s->buf_start);
+    if (unlikely(s->json_src))
+        line_num = json_direct_line_col(s, ptr, &col_num);
+    else
+        line_num = get_line_col(&col_num, s->buf_start, ptr - s->buf_start);
     if (line_num == 0)
         col_num += s->first_line_column;
     JS_ThrowError2(ctx, JS_SYNTAX_ERROR, fmt, ap, FALSE);
@@ -25990,6 +26170,435 @@ static int json_parse_number(JSParseState *s, const uint8_t **pp)
     return 0;
 }
 
+/* Tilefinch: JSON.parse tokenizes its argument string in place, reading
+   its Latin-1 (8-bit) or UTF-16 (16-bit) characters, instead of first
+   making a UTF-8 copy of it (up to three bytes per character, refused at
+   0.7-1.3 MB on video pages that ran out of memory exactly there). Strict
+   JSON only: ext_json is never set here. Tokens, values, positions and
+   error messages are those json_next_token() gives for that UTF-8 copy.
+   s->buf_start, s->buf_ptr and s->token.ptr address the string's
+   characters, so a position is (ptr - buf_start) >> is_wide_char
+   characters; json_direct_line_col() reports errors. One instance serves
+   both widths; only the loops over whitespace and string content, where
+   the time goes, are written per width. A string without escapes becomes
+   a substring of the input, so it is copied once. */
+
+#define JSON_DIRECT_CH(i) (wide ? p->u.str16[i] : p->u.str8[i])
+#define JSON_DIRECT_PEEK(i) ((i) < len ? JSON_DIRECT_CH(i) : 0)
+#define JSON_DIRECT_PTR(i) (s->buf_start + ((size_t)(i) << wide))
+
+/* The first index at or after 'i' that is not plain string content: a
+   quote, a backslash, a control character, or the end. */
+static inline uint32_t json_direct_scan_plain(const JSString *p, uint32_t i)
+{
+    uint32_t len = p->len, c;
+
+    if (p->is_wide_char) {
+        const uint16_t *q = p->u.str16;
+        for(; i < len; i++) {
+            c = q[i];
+            if (c == '"' || c == '\\' || c < 0x20)
+                break;
+        }
+    } else {
+        const uint8_t *q = p->u.str8;
+        for(; i < len; i++) {
+            c = q[i];
+            if (c == '"' || c == '\\' || c < 0x20)
+                break;
+        }
+    }
+    return i;
+}
+
+/* The first index at or after 'i' that is not JSON whitespace */
+static inline uint32_t json_direct_skip_space(const JSString *p, uint32_t i)
+{
+    uint32_t len = p->len, c;
+
+    if (p->is_wide_char) {
+        const uint16_t *q = p->u.str16;
+        for(; i < len; i++) {
+            c = q[i];
+            if (c != ' ' && c != '\t' && c != '\n' && c != '\r')
+                break;
+        }
+    } else {
+        const uint8_t *q = p->u.str8;
+        for(; i < len; i++) {
+            c = q[i];
+            if (c != ' ' && c != '\t' && c != '\n' && c != '\r')
+                break;
+        }
+    }
+    return i;
+}
+
+/* The first index at or after 'i' that is not an ASCII digit */
+static inline uint32_t json_direct_skip_digits(const JSString *p, uint32_t i)
+{
+    uint32_t len = p->len;
+
+    if (p->is_wide_char) {
+        while (i < len && is_digit(p->u.str16[i]))
+            i++;
+    } else {
+        while (i < len && is_digit(p->u.str8[i]))
+            i++;
+    }
+    return i;
+}
+
+/* Whether characters [i, i + strlen(word)) spell 'word' */
+static no_inline BOOL json_direct_is_word(const JSString *p, uint32_t i,
+                                         const char *word)
+{
+    for(; *word != '\0'; word++, i++) {
+        if ((p->is_wide_char ? p->u.str16[i] : p->u.str8[i]) != (uint8_t)*word)
+            return FALSE;
+    }
+    return TRUE;
+}
+
+/* The first byte of character 'i' in UTF-8, as the UTF-8 tokenizer
+   prints it in "Unexpected token '%c'" (0 at the end of the input). */
+static no_inline int json_direct_utf8_lead(const JSString *p, uint32_t i)
+{
+    uint32_t c;
+
+    if (i >= p->len)
+        return 0;
+    c = p->is_wide_char ? p->u.str16[i] : p->u.str8[i];
+    if (c < 0x80)
+        return c;
+    if (c < 0x800)
+        return 0xc0 | (c >> 6);
+    if (is_hi_surrogate(c) && i + 1 < p->len &&
+        is_lo_surrogate(p->u.str16[i + 1]))
+        return 0xf0 | (from_surrogate(c, p->u.str16[i + 1]) >> 18);
+    return 0xe0 | (c >> 12);
+}
+
+/* A number with a fraction, an exponent or more than nine digits:
+   characters [start, end) are its validated ASCII text. 8-bit text is
+   converted in place: js_atod() stops at the first character that cannot
+   continue the number, and the scanner has consumed every one that could
+   (an 8-bit JSString is also NUL-terminated). Only 16-bit text is
+   narrowed, into a stack buffer or, past 63 characters, one allocation of
+   the number's own length freed at once. */
+static no_inline int json_direct_atod(JSParseState *s, uint32_t start,
+                                      uint32_t end, double *pd)
+{
+    const JSString *p = s->json_src;
+    JSATODTempMem atod_mem;
+    char tmp[64], *buf = tmp;
+    uint32_t i, n = end - start;
+
+    if (!p->is_wide_char) {
+        *pd = js_atod((const char *)p->u.str8 + start, NULL, 10, 0, &atod_mem);
+        return 0;
+    }
+    if (n >= sizeof(tmp)) {
+        buf = js_malloc(s->ctx, n + 1);
+        if (!buf)
+            return -1;
+    }
+    for(i = 0; i < n; i++)
+        buf[i] = p->u.str16[start + i];
+    buf[n] = '\0';
+    *pd = js_atod(buf, NULL, 10, 0, &atod_mem);
+    if (buf != tmp)
+        js_free(s->ctx, buf);
+    return 0;
+}
+
+/* '*pi' is the opening quote */
+static int json_direct_string(JSParseState *s, uint32_t *pi)
+{
+    JSContext *ctx = s->ctx;
+    JSString *p = s->json_src;
+    const int wide = p->is_wide_char;
+    uint32_t len = p->len, i, j, start, c;
+    int k, h;
+    StringBuffer b_s, *b = &b_s;
+    JSValue val;
+
+    start = *pi + 1;
+    j = json_direct_scan_plain(p, start);
+    if (unlikely(j >= len)) {
+        js_parse_error(s, "Unexpected end of JSON input");
+        return -1;
+    }
+    if (JSON_DIRECT_CH(j) == '"') {
+        val = js_sub_string(ctx, p, start, j);
+        if (JS_IsException(val))
+            return -1;
+        i = j + 1;
+        goto done;
+    }
+    /* An escape: size the buffer once, for the decoded length up to the
+       closing quote and 16-bit only if a character or a \u escape needs
+       it, so a long string is neither grown by reallocation with both
+       copies live nor given the raw length (six characters per \u
+       escape). The width comes from the whole string, the plain prefix
+       before the first escape included, so a 16-bit string is never
+       widened from a narrow buffer. A malformed escape is reported by the
+       loop below; the buffer then still grows as usual. */
+    {
+        uint32_t wide_out = 0, n = 0;
+        i = start;
+        while (i < len) {
+            c = JSON_DIRECT_CH(i);
+            if (c == '"' || c < 0x20)
+                break;
+            n++;
+            if (c == '\\') {
+                if (i + 5 < len && JSON_DIRECT_CH(i + 1) == 'u') {
+                    uint32_t u = 0;
+                    for(k = 2; k < 6; k++) {
+                        h = from_hex(JSON_DIRECT_CH(i + k));
+                        if (h < 0)
+                            break;
+                        u = (u << 4) | h;
+                    }
+                    if (k == 6) {
+                        if (u > 0xff)
+                            wide_out = 1;
+                        i += 6;
+                        continue;
+                    }
+                }
+                i += 2;
+                continue;
+            }
+            if (c > 0xff)
+                wide_out = 1;
+            i++;
+        }
+        if (string_buffer_init2(ctx, b, n, wide_out))
+            goto fail;
+    }
+    i = start;
+    for(;;) {
+        /* [i, j) is plain content */
+        if (string_buffer_concat(b, p, i, j))
+            goto fail;
+        i = j;
+        if (i >= len)
+            goto end_of_input;
+        c = JSON_DIRECT_CH(i);
+        i++;
+        if (c == '"')
+            break;
+        if (c < 0x20) {
+            js_parse_error_pos(s, JSON_DIRECT_PTR(i - 1),
+                               "Bad control character in string literal");
+            goto fail;
+        }
+        /* a backslash */
+        c = JSON_DIRECT_PEEK(i);
+        i++;
+        switch(c) {
+        case 'b':   c = '\b'; break;
+        case 'f':   c = '\f'; break;
+        case 'n':   c = '\n'; break;
+        case 'r':   c = '\r'; break;
+        case 't':   c = '\t'; break;
+        case '\\':  break;
+        case '/':   break;
+        case '"':   break;
+        case 'u':
+            c = 0;
+            for(k = 0; k < 4; k++) {
+                h = from_hex(JSON_DIRECT_PEEK(i));
+                i++;
+                if (h < 0) {
+                    js_parse_error_pos(s, JSON_DIRECT_PTR(i - 1),
+                                       "Bad Unicode escape");
+                    goto fail;
+                }
+                c = (c << 4) | h;
+            }
+            break;
+        default:
+            if (i > len)
+                goto end_of_input;
+            js_parse_error_pos(s, JSON_DIRECT_PTR(i - 1),
+                               "Bad escaped character");
+            goto fail;
+        }
+        if (string_buffer_putc16(b, c))
+            goto fail;
+        j = json_direct_scan_plain(p, i);
+    }
+    val = string_buffer_end(b);
+    if (JS_IsException(val))
+        return -1;
+ done:
+    s->token.val = TOK_STRING;
+    s->token.u.str.sep = '"';
+    s->token.u.str.str = val;
+    *pi = i;
+    return 0;
+ end_of_input:
+    js_parse_error(s, "Unexpected end of JSON input");
+ fail:
+    string_buffer_free(b);
+    return -1;
+}
+
+/* '*pi' is a '-' or a digit */
+static int json_direct_number(JSParseState *s, uint32_t *pi)
+{
+    JSString *p = s->json_src;
+    const int wide = p->is_wide_char;
+    uint32_t len = p->len, i, k, start, int_start, v, c;
+    BOOL is_int = TRUE;
+    double d;
+
+    i = start = *pi;
+    c = JSON_DIRECT_CH(i);
+    if (c == '-') {
+        i++;
+        c = JSON_DIRECT_PEEK(i);
+    }
+    if (!is_digit(c))
+        return js_parse_error_pos(s, JSON_DIRECT_PTR(i), "Unexpected token '%c'",
+                                  json_direct_utf8_lead(p, i));
+    if (c == '0' && is_digit(JSON_DIRECT_PEEK(i + 1)))
+        return js_parse_error_pos(s, JSON_DIRECT_PTR(i), "Unexpected number");
+    int_start = i;
+    i = json_direct_skip_digits(p, i);
+    c = JSON_DIRECT_PEEK(i);
+    if (c == '.') {
+        is_int = FALSE;
+        i++;
+        if (!is_digit(JSON_DIRECT_PEEK(i)))
+            return js_parse_error_pos(s, JSON_DIRECT_PTR(i),
+                                      "Unterminated fractional number");
+        i = json_direct_skip_digits(p, i);
+        c = JSON_DIRECT_PEEK(i);
+    }
+    if (c == 'e' || c == 'E') {
+        is_int = FALSE;
+        i++;
+        c = JSON_DIRECT_PEEK(i);
+        if (c == '+' || c == '-')
+            i++;
+        if (!is_digit(JSON_DIRECT_PEEK(i)))
+            return js_parse_error_pos(s, JSON_DIRECT_PTR(i),
+                                      "Exponent part is missing a number");
+        i = json_direct_skip_digits(p, i);
+    }
+    if (is_int && i - int_start <= 9) {
+        /* Exactly what js_atod() and JS_NewFloat64() give, without the
+           double conversions (software floating point on the PSP). */
+        v = 0;
+        for(k = int_start; k < i; k++)
+            v = v * 10 + (JSON_DIRECT_CH(k) - '0');
+        if (int_start == start)
+            s->token.u.num.val = JS_NewInt32(s->ctx, v);
+        else if (v != 0)
+            s->token.u.num.val = JS_NewInt32(s->ctx, -(int32_t)v);
+        else
+            s->token.u.num.val = __JS_NewFloat64(s->ctx, -0.0);
+    } else {
+        if (json_direct_atod(s, start, i, &d))
+            return -1;
+        s->token.u.num.val = JS_NewFloat64(s->ctx, d);
+    }
+    s->token.val = TOK_NUMBER;
+    *pi = i;
+    return 0;
+}
+
+/* json_next_token() has checked the stack and freed the token; inlined
+   there, since a call per token cost 2-3% of a parse in PPSSPP */
+static force_inline int json_next_token_direct(JSParseState *s)
+{
+    JSString *p = s->json_src;
+    const int wide = p->is_wide_char;
+    uint32_t len = p->len, i, start, n, c;
+    JSAtom atom;
+
+    s->last_ptr = s->buf_ptr;
+    i = json_direct_skip_space(p, (uint32_t)(s->buf_ptr - s->buf_start) >> wide);
+    s->token.ptr = JSON_DIRECT_PTR(i);
+    if (i >= len) {
+        s->token.val = TOK_EOF;
+        goto done;
+    }
+    c = JSON_DIRECT_CH(i);
+    switch(c) {
+    case '\"':
+        if (json_direct_string(s, &i))
+            goto fail;
+        break;
+    case 'a': case 'b': case 'c': case 'd':
+    case 'e': case 'f': case 'g': case 'h':
+    case 'i': case 'j': case 'k': case 'l':
+    case 'm': case 'n': case 'o': case 'p':
+    case 'q': case 'r': case 's': case 't':
+    case 'u': case 'v': case 'w': case 'x':
+    case 'y': case 'z':
+    case 'A': case 'B': case 'C': case 'D':
+    case 'E': case 'F': case 'G': case 'H':
+    case 'I': case 'J': case 'K': case 'L':
+    case 'M': case 'N': case 'O': case 'P':
+    case 'Q': case 'R': case 'S': case 'T':
+    case 'U': case 'V': case 'W': case 'X':
+    case 'Y': case 'Z':
+    case '_':
+    case '$':
+        /* Only true, false and null are values; any other identifier is
+           reported from its text, so it needs no atom. */
+        start = i++;
+        while (i < len && (c = JSON_DIRECT_CH(i)) < 128 &&
+               lre_is_id_continue_byte(c))
+            i++;
+        n = i - start;
+        atom = JS_ATOM_NULL;
+        if (n == 4 && json_direct_is_word(p, start, "true"))
+            atom = JS_ATOM_true;
+        else if (n == 4 && json_direct_is_word(p, start, "null"))
+            atom = JS_ATOM_null;
+        else if (n == 5 && json_direct_is_word(p, start, "false"))
+            atom = JS_ATOM_false;
+        s->token.u.ident.atom = atom;
+        s->token.u.ident.has_escape = FALSE;
+        s->token.u.ident.is_reserved = FALSE;
+        s->token.val = TOK_IDENT;
+        break;
+    case '-':
+    case '0':
+    case '1': case '2': case '3': case '4':
+    case '5': case '6': case '7': case '8':
+    case '9':
+        if (json_direct_number(s, &i))
+            goto fail;
+        break;
+    default:
+        if (c >= 128) {
+            js_parse_error(s, "unexpected character");
+            goto fail;
+        }
+        s->token.val = c;
+        i++;
+        break;
+    }
+ done:
+    s->buf_ptr = JSON_DIRECT_PTR(i);
+    return 0;
+
+ fail:
+    s->token.val = TOK_ERROR;
+    return -1;
+}
+
+#undef JSON_DIRECT_CH
+#undef JSON_DIRECT_PEEK
+#undef JSON_DIRECT_PTR
+
 static __exception int json_next_token(JSParseState *s)
 {
     const uint8_t *p;
@@ -26001,6 +26610,9 @@ static __exception int json_next_token(JSParseState *s)
     }
 
     free_token(s, &s->token);
+
+    if (s->json_src)
+        return json_next_token_direct(s);
 
     p = s->last_ptr = s->buf_ptr;
  redo:
@@ -27643,6 +28255,40 @@ static __exception int js_parse_left_hand_side_expr(JSParseState *s)
     return js_parse_postfix_expr(s, PF_POSTFIX_CALL);
 }
 
+/* Save the toString() text of 'fd', 'len' bytes at 'ptr' in the parse
+   buffer: a copy, or under JS_STRIP_SOURCE a reference to the external text
+   if the buffer has one (see JS_SetExternalSourceHooks()), or nothing. */
+static int js_parse_save_function_source(JSParseState *s, JSFunctionDef *fd,
+                                         const uint8_t *ptr, size_t len)
+{
+    JSContext *ctx = s->ctx;
+    JSFunctionSource *owner = s->external_source;
+
+    js_free_function_source(ctx->rt, fd->source, fd->source_owner);
+    fd->source = NULL;
+    fd->source_owner = NULL;
+    fd->source_external = FALSE;
+    fd->source_len = 0;
+    if (!fd->strip_source) {
+        fd->source_len = len;
+        fd->source_start = ptr - fd->get_line_col_cache->buf_start;
+        fd->source = js_strndup(ctx, (const char *)ptr, len);
+        if (!fd->source)
+            return -1;
+    } else if (owner && !fd->strip_debug && owner->ref_count != UINT32_MAX &&
+               fd->get_line_col_cache->buf_start == s->buf_start) {
+        uint32_t offset = s->external_base + (uint32_t)(ptr - s->buf_start);
+        if (offset <= owner->length && len <= owner->length - offset) {
+            owner->ref_count++;
+            fd->source_owner = owner;
+            fd->source_external = TRUE;
+            fd->source_len = len;
+            fd->source_start = offset;
+        }
+    }
+    return 0;
+}
+
 static __exception int js_parse_class_default_ctor(JSParseState *s,
                                                    BOOL has_super,
                                                    JSFunctionDef **pfd)
@@ -28203,13 +28849,9 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
         put_u32(fd->byte_code.buf + ctor_cpool_offset, ctor_fd->parent_cpool_idx);
 
     /* store the class source code in the constructor. */
-    if (!fd->strip_source) {
-        js_free(ctx, ctor_fd->source);
-        ctor_fd->source_len = s->buf_ptr - class_start_ptr;
-        ctor_fd->source_start = class_start_ptr - ctor_fd->get_line_col_cache->buf_start;
-        ctor_fd->source = js_strndup(ctx, (const char *)class_start_ptr,
-                                     ctor_fd->source_len);
-        if (!ctor_fd->source)
+    if (!fd->strip_source || s->external_source) {
+        if (js_parse_save_function_source(s, ctor_fd, class_start_ptr,
+                                          s->buf_ptr - class_start_ptr))
             goto fail;
     }
 
@@ -35246,7 +35888,7 @@ static __maybe_unused void js_dump_function_bytecode(JSContext *ctx, JSFunctionB
                    NULL, b->var_count,
                    b->closure_var, b->closure_var_count,
                    b->cpool, b->cpool_count,
-                   b->has_debug ? b->debug.source : NULL,
+                   js_function_heap_source(b),
                    NULL, b);
 #if defined(DUMP_BYTECODE) && (DUMP_BYTECODE & 32)
     if (b->has_debug)
@@ -38644,6 +39286,8 @@ static JSFunctionSource *js_adopt_function_source(JSContext *ctx, char **source,
     if (!owner)
         return NULL;
     owner->ref_count = 1;
+    owner->external_id = 0;
+    owner->lazy_readers = 0;
     owner->length = length;
     owner->bytes = *source;
     owner->string = NULL;
@@ -38821,7 +39465,8 @@ static BOOL js_lazy_function_eligible(JSFunctionDef *parent, JSFunctionDef *fd)
         return FALSE;
     /* Without Function.prototype.toString() text the stub keeps a copy of
        its own; do not trade bytecode for more text (comments, whitespace) */
-    if (fd->strip_source && fd->lazy_span_len > code_size)
+    if (fd->strip_source && !fd->source_external &&
+        fd->lazy_span_len > code_size)
         return FALSE;
     return js_lazy_function_scope_is_static(parent, fd->parent_scope_level);
 }
@@ -38880,7 +39525,13 @@ static JSValue js_create_lazy_function(JSContext *ctx, JSFunctionDef *fd)
     lz->is_module = fd->lazy_is_module;
     lz->parent_static_init = fd->lazy_parent_static_init;
     lz->strip_source = fd->strip_source;
-    if (fd->strip_source || !fd->source ||
+    if (fd->source_external) {
+        /* the body is read from the external text when it compiles, and
+           nested functions refer to it too */
+        lz->external_source = 1;
+        lz->external_offset = fd->external_base + fd->lazy_span_start;
+        lz->source_len = fd->lazy_span_len;
+    } else if (fd->strip_source || !fd->source ||
         (uint32_t)fd->source_len != fd->lazy_span_len) {
         /* Function.prototype.toString() has no text; keep a private copy
            until the body compiles */
@@ -38934,7 +39585,15 @@ static JSValue js_create_lazy_function(JSContext *ctx, JSFunctionDef *fd)
     fd->filename = JS_ATOM_NULL;
     b->debug.pc2line_buf = pc2line.buf;
     b->debug.pc2line_len = pc2line.size;
-    if (!fd->strip_source) {
+    if (fd->source_external) {
+        b->source_external = 1;
+        b->debug.source_offset = fd->source_start;
+        b->debug.source_len = fd->source_len;
+        b->debug.source_owner = fd->source_owner;
+        fd->source_owner = NULL;
+        fd->source_external = FALSE;
+        js_external_source_require(ctx->rt, b->debug.source_owner, 1);
+    } else if (!fd->strip_source) {
         b->debug.source = fd->source;
         b->debug.source_len = fd->source_len;
         b->debug.source_owner = fd->source_owner;
@@ -39189,7 +39848,12 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
         if (!b->debug.pc2line_buf)
             b->debug.pc2line_buf = fd->pc2line.buf;
         b->debug.pc2line_len = fd->pc2line.size;
-        b->debug.source = fd->source;
+        if (fd->source_external) {
+            b->source_external = 1;
+            b->debug.source_offset = fd->source_start;
+        } else {
+            b->debug.source = fd->source;
+        }
         b->debug.source_len = fd->source_len;
         b->debug.source_owner = fd->source_owner;
     }
@@ -39283,10 +39947,13 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
         JS_FreeContext(b->realm);
 
     JS_FreeAtomRT(rt, b->func_name);
+    if (js_lazy_reads_external(b))
+        js_external_source_require(rt, b->debug.source_owner, -1);
     if (b->has_debug) {
         JS_FreeAtomRT(rt, b->debug.filename);
         js_free_rt(rt, b->debug.pc2line_buf);
-        js_free_function_source(rt, b->debug.source, b->debug.source_owner);
+        js_free_function_source(rt, js_function_heap_source(b),
+                                b->debug.source_owner);
     }
 
     if (b->is_lazy) {
@@ -42796,8 +43463,9 @@ static no_inline int js_preparse_function_body(JSParseState *s,
        depends on the size of its bytecode, which includes the bytecode of
        the functions nested in it: while inside a function that may be kept
        lazy, parse them too, or skipping them would make it smaller. (The
-       function a first-call compile is compiling is never kept lazy.) */
-    if (fd->strip_source) {
+       function a first-call compile is compiling is never kept lazy.)
+       Tilefinch: not with external text, which the stub reads instead. */
+    if (fd->strip_source && !(s->external_source && !fd->strip_debug)) {
         for (parent = fd->parent; parent->parent && !parent->parent->is_lazy_env;
              parent = parent->parent) {
             if (parent->lazy_ok)
@@ -42839,7 +43507,8 @@ static no_inline int js_preparse_function_body(JSParseState *s,
         /* what js_lazy_function_eligible() requires of the parsed body */
         span = close + 1 - func_start;
         if (span < threshold || span > JS_STRING_LEN_MAX ||
-            (fd->strip_source && span > fd->byte_code.size + pp->code_bytes))
+            (fd->strip_source && !(s->external_source && !fd->strip_debug) &&
+             span > fd->byte_code.size + pp->code_bytes))
             ret = PP_BAIL;
     }
     if (ret == PP_DONE) {
@@ -43044,6 +43713,7 @@ static __exception int js_parse_function_decl2(JSParseState *s,
     fd->lazy_parent_static_init = parent_static_init;
     fd->lazy_is_module = s->is_module;
     fd->lazy_span_start = ptr - s->buf_start;
+    fd->external_base = s->external_base;
     if (lazy_entry) {
         /* the text is the lazy function's own; do not copy it again */
         fd->strip_source = (lazy_entry != 0);
@@ -43323,16 +43993,11 @@ static __exception int js_parse_function_decl2(JSParseState *s,
                 emit_op(s, OP_return);
 
             fd->lazy_span_len = s->last_ptr - ptr;
-            if (!fd->strip_source) {
-                /* save the function source code */
-                /* the end of the function source code is after the last
-                   token of the function source stored into s->last_ptr */
-                fd->source_len = s->last_ptr - ptr;
-                fd->source_start = ptr - fd->get_line_col_cache->buf_start;
-                fd->source = js_strndup(ctx, (const char *)ptr, fd->source_len);
-                if (!fd->source)
-                    goto fail;
-            }
+            /* save the function source code */
+            /* the end of the function source code is after the last
+               token of the function source stored into s->last_ptr */
+            if (js_parse_save_function_source(s, fd, ptr, s->last_ptr - ptr))
+                goto fail;
             goto done;
         }
     }
@@ -43357,14 +44022,9 @@ static __exception int js_parse_function_decl2(JSParseState *s,
             goto fail;
     }
     fd->lazy_span_len = s->buf_ptr - ptr;
-    if (!fd->strip_source) {
-        /* save the function source code */
-        fd->source_len = s->buf_ptr - ptr;
-        fd->source_start = ptr - fd->get_line_col_cache->buf_start;
-        fd->source = js_strndup(ctx, (const char *)ptr, fd->source_len);
-        if (!fd->source)
-            goto fail;
-    }
+    /* save the function source code */
+    if (js_parse_save_function_source(s, fd, ptr, s->buf_ptr - ptr))
+        goto fail;
 
     if (next_token(s)) {
         /* consume the '}' */
@@ -43646,6 +44306,8 @@ static int js_lazy_function_adopt_body(JSContext *ctx, JSFunctionBytecode *b,
     if (vardefs_size)
         memcpy(body + code_size + cpool_size, nb->vardefs, vardefs_size);
 
+    if (js_lazy_reads_external(b))
+        js_external_source_require(rt, b->debug.source_owner, -1);
     js_free_lazy_function(rt, js_lazy_function_of(b));
     b->is_lazy = 0;
     b->has_lazy_body = 1;
@@ -43665,7 +44327,8 @@ static int js_lazy_function_adopt_body(JSContext *ctx, JSFunctionBytecode *b,
         b->debug.pc2line_buf = nb->debug.pc2line_buf;
         b->debug.pc2line_len = nb->debug.pc2line_len;
         JS_FreeAtomRT(rt, nb->debug.filename);
-        js_free_function_source(rt, nb->debug.source, nb->debug.source_owner);
+        js_free_function_source(rt, js_function_heap_source(nb),
+                                nb->debug.source_owner);
     }
     /* the bytecode atoms, constants and variable names now belong to 'b' */
     for(i = 0; i < nb->closure_var_count; i++)
@@ -43721,6 +44384,10 @@ static int js_lazy_function_compile1(JSContext *caller_ctx, JSFunctionBytecode *
     if (lz->source) {
         text = lz->source;
         text_len = lz->source_len;
+    } else if (b->source_external) {
+        /* read from the external text below */
+        text = NULL;
+        text_len = lz->source_len;
     } else {
         /* adopt the text before sharing it with the nested functions:
            adoption may move it */
@@ -43731,7 +44398,8 @@ static int js_lazy_function_compile1(JSContext *caller_ctx, JSFunctionBytecode *
         text = b->debug.source;
         text_len = b->debug.source_len;
     }
-    if (!text || lz->param_offset > text_len || !b->has_debug ||
+    if ((!text && !js_lazy_reads_external(b)) ||
+        lz->param_offset > text_len || !b->has_debug ||
         !b->debug.pc2line_buf) {
         JS_ThrowInternalError(ctx, "lazy function has no source");
         goto fail;
@@ -43754,7 +44422,16 @@ static int js_lazy_function_compile1(JSContext *caller_ctx, JSFunctionBytecode *
     buf = js_malloc(ctx, (size_t)text_len + 1);
     if (!buf)
         goto fail;
-    memcpy(buf, text, text_len);
+    if (text) {
+        memcpy(buf, text, text_len);
+    } else if (!rt->external_source_read ||
+               rt->external_source_read(rt->external_source_opaque,
+                                        b->debug.source_owner->external_id,
+                                        lz->external_offset, text_len,
+                                        buf) != 0) {
+        JS_ThrowInternalError(ctx, "lazy function has no source");
+        goto fail;
+    }
     buf[text_len] = '\0';
     filename = JS_AtomToCString(ctx, b->debug.filename);
     if (!filename)
@@ -43767,6 +44444,14 @@ static int js_lazy_function_compile1(JSContext *caller_ctx, JSFunctionBytecode *
     js_parse_init(ctx, s, buf, text_len, filename, col_num);
     s->preparse_off = preparse_off;
     parsed = TRUE;
+    if (lz->external_source && b->source_external &&
+        b->debug.source_owner &&
+        b->debug.source_owner->ref_count != UINT32_MAX) {
+        /* nested functions refer to the script's external text */
+        s->external_source = b->debug.source_owner;
+        s->external_source->ref_count++;
+        s->external_base = lz->external_offset;
+    }
     s->get_line_col_cache.line_num = line_num;
     s->is_module = lz->is_module;
     s->allow_html_comments = !s->is_module;
@@ -43863,6 +44548,8 @@ static int js_lazy_function_compile1(JSContext *caller_ctx, JSFunctionBytecode *
     if (parsed) {
         free_token(s, &s->token);
         *pskipped = s->preparse_skipped;
+        if (s->external_source)
+            js_free_function_source(rt, NULL, s->external_source);
     }
     if (env)
         js_free_function_def(ctx, env);
@@ -43990,6 +44677,13 @@ static JSValue __JS_EvalInternalWithColumn(
             js_mode |= JS_MODE_STRICT;
         }
     }
+    /* Tilefinch: the external text this compile's functions refer to under
+       JS_STRIP_SOURCE (see JS_SetExternalSourceHooks()) */
+    s->external_source = js_take_external_source(ctx->rt);
+    if (s->external_source && s->external_source->length != input_len) {
+        js_free_function_source(ctx->rt, NULL, s->external_source);
+        s->external_source = NULL;
+    }
     fd = js_new_function_def(ctx, NULL, TRUE, FALSE, filename,
                              s->buf_start, &s->get_line_col_cache);
     if (!fd)
@@ -44035,6 +44729,9 @@ static JSValue __JS_EvalInternalWithColumn(
             if (m)
                 JS_FreeValue(ctx, JS_MKPTR(JS_TAG_MODULE, m));
             ctx->rt->preparse_suspended++;
+            /* the repeated compile takes over the external text */
+            ctx->rt->external_source_carry = s->external_source;
+            s->external_source = NULL;
             ret_val = __JS_EvalInternalWithColumn(ctx, this_obj, input,
                                                   input_len, filename, flags,
                                                   scope_idx, first_line_column);
@@ -44058,6 +44755,10 @@ static JSValue __JS_EvalInternalWithColumn(
             goto fail1;
         fun_obj = JS_NewModuleValue(ctx, m);
     }
+    if (s->external_source) {
+        js_free_function_source(ctx->rt, NULL, s->external_source);
+        s->external_source = NULL;
+    }
     if (flags & JS_EVAL_FLAG_COMPILE_ONLY) {
         ret_val = fun_obj;
     } else {
@@ -44065,6 +44766,10 @@ static JSValue __JS_EvalInternalWithColumn(
     }
     return ret_val;
  fail1:
+    if (s->external_source) {
+        js_free_function_source(ctx->rt, NULL, s->external_source);
+        s->external_source = NULL;
+    }
     /* XXX: should free all the unresolved dependencies */
     if (m)
         JS_FreeValue(ctx, JS_MKPTR(JS_TAG_MODULE, m));
@@ -45032,11 +45737,18 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
         bc_put_atom(s, b->debug.filename);
         bc_put_leb128(s, b->debug.pc2line_len);
         dbuf_put(&s->dbuf, b->debug.pc2line_buf, b->debug.pc2line_len);
-        if (b->debug.source) {
+        if (b->source_external) {
+            /* Tilefinch: where the text is in the external text (see
+               JS_SetExternalSourceHooks()), not the text */
+            bc_put_leb128(s, b->debug.source_len);
+            bc_put_u8(s, 2);
+            bc_put_leb128(s, b->debug.source_offset);
+        } else if (b->debug.source) {
             bc_put_leb128(s, b->debug.source_len);
             if (b->debug.source_len) {
                 size_t offset = 0;
                 BOOL shared = parent && parent->has_debug
+                    && !parent->source_external
                     && b->debug.source_owner
                     && parent->debug.source_owner == b->debug.source_owner
                     && b->debug.source >= parent->debug.source;
@@ -45066,11 +45778,18 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
         bc_set_flags(&flags, &idx, lz->is_module, 1);
         bc_set_flags(&flags, &idx, lz->parent_static_init, 1);
         bc_set_flags(&flags, &idx, lz->strip_source, 1);
+        bc_set_flags(&flags, &idx, lz->external_source, 1);
         bc_put_u8(s, flags);
         bc_put_leb128(s, lz->param_offset);
         bc_put_leb128(s, lz->nested_threshold);
-        /* the text, unless it is the Function.prototype.toString() text */
+        /* the text, unless it is the Function.prototype.toString() text
+           or read from external text */
         bc_put_leb128(s, lz->source ? lz->source_len : 0);
+        if (lz->external_source) {
+            bc_put_leb128(s, lz->external_offset);
+            /* the length of the text read from there */
+            bc_put_leb128(s, lz->source ? 0 : lz->source_len);
+        }
         if (lz->source)
             dbuf_put(&s->dbuf, (const uint8_t *)lz->source, lz->source_len);
     }
@@ -45556,6 +46275,10 @@ typedef struct BCReaderState {
     BOOL allow_bytecode : 8;
     BOOL is_rom_data : 8;
     BOOL allow_reference : 8;
+    BOOL platform_methods : 8; /* JS_READ_OBJ_PLATFORM_METHODS */
+    /* Tilefinch: the external text functions refer to (see
+       JS_SetExternalSourceHooks()), or NULL; one reference */
+    JSFunctionSource *external_source;
     /* object references */
     JSObject **objects;
     int objects_count;
@@ -45928,6 +46651,18 @@ static int BC_add_object_ref(BCReaderState *s, JSValueConst obj)
     return BC_add_object_ref1(s, JS_VALUE_GET_OBJ(obj));
 }
 
+/* JS_READ_OBJ_PLATFORM_METHODS: a WebIDL operation name (lowerCamelCase). */
+static BOOL js_atom_starts_lowercase(JSContext *ctx, JSAtom atom)
+{
+    JSString *p;
+
+    if (atom == JS_ATOM_NULL || __JS_AtomIsTaggedInt(atom))
+        return FALSE;
+    p = ctx->rt->atom_array[atom];
+    return p->len != 0 && !p->is_wide_char &&
+        p->u.str8[0] >= 'a' && p->u.str8[0] <= 'z';
+}
+
 static JSValue JS_ReadFunctionTag(BCReaderState *s)
 {
     JSContext *ctx = s->ctx;
@@ -45964,6 +46699,10 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
     bc.js_mode = v8;
     if (bc_get_atom(s, &bc.func_name))  //@ atom leak if failure
         goto fail;
+    if (s->platform_methods && bc.has_prototype &&
+        bc.func_kind == JS_FUNC_NORMAL &&
+        js_atom_starts_lowercase(ctx, bc.func_name))
+        bc.has_prototype = 0;
     if (bc_get_leb128_u16(s, &bc.arg_count))
         goto fail;
     if (bc_get_leb128_u16(s, &bc.var_count))
@@ -46119,7 +46858,8 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
                 uint32_t offset;
                 if (bc_get_leb128(s, &offset))
                     goto fail;
-                if (!parent || !parent->has_debug || !parent->debug.source
+                if (!parent || !parent->has_debug || parent->source_external
+                    || !parent->debug.source
                     || offset > (uint32_t)parent->debug.source_len
                     || (uint32_t)b->debug.source_len >
                         (uint32_t)parent->debug.source_len - offset) {
@@ -46164,6 +46904,23 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
                     goto fail;
                 if (bc_get_buf(s, (uint8_t *)b->debug.source, b->debug.source_len))
                     goto fail;
+            } else if (kind == 2) {
+                /* Tilefinch: a span of the external text; without one
+                   named for this read the function has no text */
+                uint32_t offset;
+                JSFunctionSource *owner = s->external_source;
+                if (bc_get_leb128(s, &offset))
+                    goto fail;
+                if (owner && owner->ref_count != UINT32_MAX
+                    && offset <= owner->length
+                    && (uint32_t)b->debug.source_len <= owner->length - offset) {
+                    owner->ref_count++;
+                    b->source_external = 1;
+                    b->debug.source_offset = offset;
+                    b->debug.source_owner = owner;
+                } else {
+                    b->debug.source_len = 0;
+                }
             } else {
                 JS_ThrowSyntaxError(ctx, "invalid function source encoding");
                 goto fail;
@@ -46173,8 +46930,8 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
     }
     if (is_lazy) {
         JSLazyFunction *lz;
-        uint32_t text_len;
-        uint8_t func_type, lazy_flags;
+        uint32_t text_len, external_len;
+        uint8_t func_type, lazy_flags, external;
 
         lz = js_mallocz(ctx, sizeof(*lz));
         if (!lz)
@@ -46194,6 +46951,18 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
         lz->is_module = bc_get_flags(lazy_flags, &idx, 1);
         lz->parent_static_init = bc_get_flags(lazy_flags, &idx, 1);
         lz->strip_source = bc_get_flags(lazy_flags, &idx, 1);
+        /* set once the text it reads is accounted for (below) */
+        external = bc_get_flags(lazy_flags, &idx, 1);
+        external_len = 0;
+        if (external) {
+            if (bc_get_leb128(s, &lz->external_offset) ||
+                bc_get_leb128(s, &external_len))
+                goto fail;
+            /* nested functions can refer to the text only if this
+               function does */
+            if (!b->source_external)
+                external = 0;
+        }
         if (lz->source_len) {
             lz->source = js_malloc(ctx, lz->source_len);
             if (!lz->source)
@@ -46201,11 +46970,25 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
             if (bc_get_buf(s, (uint8_t *)lz->source, lz->source_len))
                 goto fail;
             text_len = lz->source_len;
+        } else if (external_len) {
+            /* read from the external text: without it the function could
+               never compile, so the bytecode does not read back */
+            if (!external ||
+                lz->external_offset > b->debug.source_owner->length ||
+                external_len > b->debug.source_owner->length -
+                    lz->external_offset) {
+                JS_ThrowSyntaxError(ctx, "lazy function without its text");
+                goto fail;
+            }
+            lz->source_len = external_len;
+            text_len = external_len;
+            js_external_source_require(ctx->rt, b->debug.source_owner, 1);
         } else {
             text_len = b->debug.source_len;
         }
+        lz->external_source = external;
         if (func_type > JS_PARSE_FUNC_METHOD ||
-            (lz->source_len == 0 && !b->debug.source) ||
+            (lz->source_len == 0 && !js_function_heap_source(b)) ||
             lz->param_offset > text_len || !b->debug.pc2line_len) {
             JS_ThrowSyntaxError(ctx, "invalid lazy function");
             goto fail;
@@ -46811,15 +47594,19 @@ JSValue JS_ReadObject(JSContext *ctx, const uint8_t *buf, size_t buf_len,
     s->is_rom_data = ((flags & JS_READ_OBJ_ROM_DATA) != 0);
     s->allow_sab = ((flags & JS_READ_OBJ_SAB) != 0);
     s->allow_reference = ((flags & JS_READ_OBJ_REFERENCE) != 0);
+    s->platform_methods = ((flags & JS_READ_OBJ_PLATFORM_METHODS) != 0);
     if (s->allow_bytecode)
         s->first_atom = JS_ATOM_END;
     else
         s->first_atom = 1;
+    s->external_source = js_take_external_source(ctx->rt);
     if (JS_ReadObjectAtoms(s)) {
         obj = JS_EXCEPTION;
     } else {
         obj = JS_ReadObjectRec(s);
     }
+    if (s->external_source)
+        js_free_function_source(ctx->rt, NULL, s->external_source);
     bc_reader_free(s);
     return obj;
 }
@@ -48788,6 +49575,147 @@ static JSValue js_function_source_snapshot(JSContext *ctx, JSFunctionSource *own
     return result;
 }
 
+#ifdef CONFIG_TILEFINCH_HEAP_DETAIL
+/* Heap-detail diagnostic (CONFIG_TILEFINCH_HEAP_DETAIL, host lab only):
+   Function.prototype.toString use, reported by JS_ComputeMemoryDetail. */
+static int64_t jsmd_tostring[4]; /* calls, bytecode, with source, source bytes */
+#endif
+/* Tilefinch: decodes 'length' bytes of external text at 'offset' a window
+   at a time, in the parts js_new_function_source() cuts (about 4 KiB of
+   text each), concatenated. A window ends at least a code point past its
+   part, so each part decodes exactly as in one buffer; a part whose
+   malformed run reaches the window's end is read again with a larger
+   window. */
+static JSValue js_function_external_source_parts(JSContext *ctx,
+                                                 const JSFunctionSource *owner,
+                                                 uint32_t offset,
+                                                 uint32_t length)
+{
+    JSRuntime *rt = ctx->rt;
+    /* a short span needs no more than itself */
+    size_t window = length < 4096u + 64u ? length : 4096u + 64u;
+    uint8_t *buf = NULL;
+    JSValue result = JS_AtomToString(ctx, JS_ATOM_empty_string);
+    uint32_t pos = 0;
+
+    while (pos < length) {
+        size_t n = length - pos < window ? length - pos : window;
+        BOOL last = (pos + n == length);
+        if (!buf) {
+            buf = js_malloc(ctx, window);
+            if (!buf)
+                goto fail;
+        }
+        if (rt->external_source_read(rt->external_source_opaque,
+                                     owner->external_id, offset + pos,
+                                     (uint32_t)n, (char *)buf) != 0) {
+            js_free(ctx, buf);
+            JS_FreeValue(ctx, result);
+            return JS_UNDEFINED;
+        }
+        const uint8_t *start = buf, *p = buf, *end = buf + n;
+        do {
+            size_t room = 4096u - (size_t)(p - start);
+            if (room > (size_t)(end - p)) room = end - p;
+            p += count_ascii(p, room);
+            if (p < end && (size_t)(p - start) < 4096u)
+                (void)js_source_codepoint(&p, end);
+        } while (p < end && (size_t)(p - start) < 4096u);
+        if (!last && p + 4 > end) {
+            /* the part may continue past this window: read it larger */
+            js_free(ctx, buf);
+            buf = NULL;
+            if (window > JS_STRING_LEN_MAX / 2)
+                goto fail;
+            window *= 2;
+            continue;
+        }
+        JSValue part = js_new_function_source_flat(ctx, (const char *)start,
+                                                   p - start);
+        if (JS_IsException(part))
+            goto fail;
+        result = JS_ConcatString(ctx, result, part);
+        if (JS_IsException(result)) {
+            js_free(ctx, buf);
+            return result;
+        }
+        pos += (uint32_t)(p - start);
+    }
+    js_free(ctx, buf);
+    return result;
+ fail:
+    js_free(ctx, buf);
+    JS_FreeValue(ctx, result);
+    return JS_EXCEPTION;
+}
+
+/* Tilefinch: the toString() text of 'b' from the embedder's external
+   text (see JS_SetExternalSourceHooks()), or JS_UNDEFINED if the embedder
+   no longer has it. The text is marked required while this runs, so a
+   collection or a refused allocation cannot have the embedder drop it, and
+   the collection checkpoint runs before anything is allocated (the caller
+   roots the function). Nothing is allocated before the embedder says the
+   text is still there (the 'query' hook), so a dropped text answers
+   "[native code]" even when the heap could not hold the source. ASCII
+   text, nearly all script text, is read straight into the result string.
+   Other text is read a window at a time and decoded in the parts
+   js_new_function_source() makes of heap text, so the result never shares
+   the heap with a copy of the whole text. Without 'query', the whole span
+   is read first to find which applies. */
+static JSValue js_function_external_source(JSContext *ctx,
+                                           const JSFunctionBytecode *b)
+{
+    JSRuntime *rt = ctx->rt;
+    JSFunctionSource *owner = b->debug.source_owner;
+    uint32_t length = b->debug.source_len;
+    JSString *str;
+    JSValue text;
+
+    if (!rt->external_source_read || !owner || !owner->external_id ||
+        length < 2 || length > JS_STRING_LEN_MAX)
+        return JS_UNDEFINED;
+    js_external_source_require(rt, owner, 1);
+    /* the collection checkpoint for either path, before it allocates */
+    js_trigger_gc(rt, sizeof(JSString) + length + 1);
+    if (rt->external_source_query) {
+        int kind = rt->external_source_query(rt->external_source_opaque,
+                                             owner->external_id,
+                                             b->debug.source_offset, length);
+        if (kind < 0) {
+            js_external_source_require(rt, owner, -1);
+            return JS_UNDEFINED;
+        }
+        if (kind == 0) {
+            text = js_function_external_source_parts(
+                ctx, owner, b->debug.source_offset, length);
+            js_external_source_require(rt, owner, -1);
+            return text;
+        }
+    }
+    str = js_alloc_string(ctx, length, 0);
+    if (!str) {
+        js_external_source_require(rt, owner, -1);
+        return JS_EXCEPTION;
+    }
+    if (rt->external_source_read(rt->external_source_opaque,
+                                 owner->external_id, b->debug.source_offset,
+                                 length, (char *)str->u.str8) != 0) {
+        js_external_source_require(rt, owner, -1);
+        js_free_string(rt, str);
+        return JS_UNDEFINED;
+    }
+    if (count_ascii(str->u.str8, length) == length) {
+        js_external_source_require(rt, owner, -1);
+        str->u.str8[length] = '\0';
+        return JS_MKPTR(JS_TAG_STRING, str);
+    }
+    js_free_string(rt, str);
+    text = js_function_external_source_parts(ctx, owner, b->debug.source_offset,
+                                             length);
+    js_external_source_require(rt, owner, -1);
+    return text;
+}
+
 static JSValue js_function_toString(JSContext *ctx, JSValueConst this_val,
                                     int argc, JSValueConst *argv)
 {
@@ -48798,9 +49726,24 @@ static JSValue js_function_toString(JSContext *ctx, JSValueConst this_val,
         return JS_EXCEPTION;
 
     p = JS_VALUE_GET_OBJ(this_val);
+#ifdef CONFIG_TILEFINCH_HEAP_DETAIL
+    jsmd_tostring[0]++;
+    if (js_class_has_bytecode(p->class_id)) {
+        JSFunctionBytecode *tb = p->u.func.function_bytecode;
+        jsmd_tostring[1]++;
+        if (tb->has_debug && (tb->source_external || tb->debug.source)) {
+            jsmd_tostring[2]++;
+            jsmd_tostring[3] += tb->debug.source_len;
+        }
+    }
+#endif
     if (js_class_has_bytecode(p->class_id)) {
         JSFunctionBytecode *b = p->u.func.function_bytecode;
-        if (b->has_debug && b->debug.source) {
+        if (b->has_debug && b->source_external) {
+            JSValue text = js_function_external_source(ctx, b);
+            if (!JS_IsUndefined(text))
+                return text;
+        } else if (b->has_debug && b->debug.source) {
             if (!b->debug.source_owner && b->debug.source_len >= 1024)
                 b->debug.source_owner = js_adopt_function_source(ctx,
                     &b->debug.source, b->debug.source_len);
@@ -57094,6 +58037,16 @@ static void json_parse_record_init_primitive(JSContext *ctx, JSONParseRecord *pr
     pr->u.primitive.source_len = source_len;
 }
 
+/* The current token's source span, in characters of the input string */
+static void json_parse_record_init_token(JSParseState *s, JSONParseRecord *pr,
+                                         JSValueConst val)
+{
+    int shift = s->json_src ? s->json_src->is_wide_char : 0;
+    json_parse_record_init_primitive(s->ctx, pr, val,
+                                     (s->token.ptr - s->buf_start) >> shift,
+                                     (s->buf_ptr - s->token.ptr) >> shift);
+}
+
 static int json_parse_record_resize_hash(JSContext *ctx, JSONParseRecordObject *po, uint32_t new_hash_size)
 {
     uint32_t i, h, *new_hash_table;
@@ -57194,6 +58147,23 @@ static void json_free_parse_record(JSContext *ctx, JSONParseRecord *pr)
     }
     JS_FreeValue(ctx, pr->value);
     pr->value = JS_UNDEFINED; /* fail safe */
+}
+
+/* "unexpected token" for a 16-bit input read in place: the token is one
+   ASCII character or an ASCII identifier (json_next_token_direct()), and
+   the message holds at most 255 bytes. Kept out of the recursive
+   json_parse_value() frame. */
+static no_inline void json_direct_unexpected_token(JSParseState *s)
+{
+    const uint16_t *p = (const uint16_t *)s->token.ptr;
+    char buf[256];
+    size_t i, n = (s->buf_ptr - s->token.ptr) >> 1;
+
+    if (n > sizeof(buf))
+        n = sizeof(buf);
+    for(i = 0; i < n; i++)
+        buf[i] = p[i];
+    js_parse_error(s, "unexpected token: '%.*s'", (int)n, buf);
 }
 
 /* 'pr' can be NULL */
@@ -57321,9 +58291,7 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr)
     case TOK_STRING:
         val = JS_DupValue(ctx, s->token.u.str.str);
         if (pr) {
-            json_parse_record_init_primitive(ctx, pr, val, 
-                                             s->token.ptr - s->buf_start,
-                                             s->buf_ptr - s->token.ptr);
+            json_parse_record_init_token(s, pr, val);
         }
         if (json_next_token(s))
             goto fail;
@@ -57331,9 +58299,7 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr)
     case TOK_NUMBER:
         val = s->token.u.num.val;
         if (pr) {
-            json_parse_record_init_primitive(ctx, pr, val, 
-                                             s->token.ptr - s->buf_start,
-                                             s->buf_ptr - s->token.ptr);
+            json_parse_record_init_token(s, pr, val);
         }
         if (json_next_token(s))
             goto fail;
@@ -57343,16 +58309,12 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr)
             s->token.u.ident.atom == JS_ATOM_true) {
             val = JS_NewBool(ctx, s->token.u.ident.atom == JS_ATOM_true);
             if (pr) {
-                json_parse_record_init_primitive(ctx, pr, val, 
-                                                 s->token.ptr - s->buf_start,
-                                                 s->buf_ptr - s->token.ptr);
+                json_parse_record_init_token(s, pr, val);
             }
         } else if (s->token.u.ident.atom == JS_ATOM_null) {
             val = JS_NULL;
             if (pr) {
-                json_parse_record_init_primitive(ctx, pr, val, 
-                                                 s->token.ptr - s->buf_start,
-                                                 s->buf_ptr - s->token.ptr);
+                json_parse_record_init_token(s, pr, val);
             }
         } else if (s->token.u.ident.atom == JS_ATOM_NaN && s->ext_json) {
             /* Note: json5 identifier handling is ambiguous e.g. is 
@@ -57370,6 +58332,8 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr)
     def_token:
         if (s->token.val == TOK_EOF) {
             js_parse_error(s, "Unexpected end of JSON input");
+        } else if (s->json_src && s->json_src->is_wide_char) {
+            json_direct_unexpected_token(s);
         } else {
             js_parse_error(s, "unexpected token: '%.*s'",
                            (int)(s->buf_ptr - s->token.ptr), s->token.ptr);
@@ -57383,14 +58347,11 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr)
     return JS_EXCEPTION;
 }
 
-JSValue JS_ParseJSON3(JSContext *ctx, const char *buf, size_t buf_len,
-                      const char *filename, int flags, JSONParseRecord *pr)
+static no_inline JSValue json_parse_text(JSParseState *s, JSONParseRecord *pr)
 {
-    JSParseState s1, *s = &s1;
+    JSContext *ctx = s->ctx;
     JSValue val = JS_UNDEFINED;
 
-    js_parse_init(ctx, s, buf, buf_len, filename, 0);
-    s->ext_json = ((flags & JS_PARSE_JSON_EXT) != 0);
     if (json_next_token(s))
         goto fail;
     val = json_parse_value(s, pr);
@@ -57409,6 +58370,31 @@ JSValue JS_ParseJSON3(JSContext *ctx, const char *buf, size_t buf_len,
     return JS_EXCEPTION;
 }
 
+/* not inlined into JS_ParseJSON() and JS_ParseJSON2() (code size) */
+no_inline JSValue JS_ParseJSON3(JSContext *ctx, const char *buf, size_t buf_len,
+                                const char *filename, int flags,
+                                JSONParseRecord *pr)
+{
+    JSParseState s1, *s = &s1;
+
+    js_parse_init(ctx, s, buf, buf_len, filename, 0);
+    s->ext_json = ((flags & JS_PARSE_JSON_EXT) != 0);
+    return json_parse_text(s, pr);
+}
+
+/* Tilefinch: JSON.parse() of a flat string, read in place (see
+   json_next_token_direct()). The caller keeps 'p' alive. */
+static JSValue json_parse_string_direct(JSContext *ctx, JSString *p,
+                                        JSONParseRecord *pr)
+{
+    JSParseState s1, *s = &s1;
+
+    js_parse_init(ctx, s, (const char *)p->u.str8,
+                  (size_t)p->len << p->is_wide_char, "<input>", 0);
+    s->json_src = p;
+    return json_parse_text(s, pr);
+}
+
 JSValue JS_ParseJSON2(JSContext *ctx, const char *buf, size_t buf_len,
                       const char *filename, int flags)
 {
@@ -57424,7 +58410,7 @@ JSValue JS_ParseJSON(JSContext *ctx, const char *buf, size_t buf_len,
 /* if pr != NULL, then pr->value = holder by construction */
 static JSValue internalize_json_property(JSContext *ctx, JSValueConst holder,
                                          JSAtom name, JSValueConst reviver,
-                                         const char *text_str, JSONParseRecord *pr)
+                                         JSString *text, JSONParseRecord *pr)
 {
     JSValue val, new_el, name_val, res, context;
     JSValueConst args[3];
@@ -57483,7 +58469,7 @@ static JSValue internalize_json_property(JSContext *ctx, JSValueConst holder,
             } else {
                 prop = JS_DupAtom(ctx, atoms[i].atom);
             }
-            new_el = internalize_json_property(ctx, val, prop, reviver, text_str, pr);
+            new_el = internalize_json_property(ctx, val, prop, reviver, text, pr);
             if (JS_IsException(new_el)) {
                 JS_FreeAtom(ctx, prop);
                 goto fail;
@@ -57499,8 +58485,9 @@ static JSValue internalize_json_property(JSContext *ctx, JSValueConst holder,
         }
     } else {
         if (pr) {
-            new_el = JS_NewStringLen(ctx, text_str + pr->u.primitive.source_pos,
-                                     pr->u.primitive.source_len);
+            new_el = js_sub_string(ctx, text, pr->u.primitive.source_pos,
+                                   pr->u.primitive.source_pos +
+                                   pr->u.primitive.source_len);
             if (JS_IsException(new_el))
                 goto fail;
             if (JS_DefinePropertyValue(ctx, context, JS_ATOM_source, new_el, JS_PROP_C_W_E) < 0)
@@ -57530,13 +58517,14 @@ static JSValue internalize_json_property(JSContext *ctx, JSValueConst holder,
 static JSValue js_json_parse(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv)
 {
-    JSValue obj;
-    const char *str;
-    size_t len;
-    
-    str = JS_ToCStringLen(ctx, &len, argv[0]);
-    if (!str)
+    JSValue obj, text;
+    JSString *str;
+
+    /* Tilefinch: parse the string itself, not a UTF-8 copy of it */
+    text = JS_ToString(ctx, argv[0]);
+    if (JS_IsException(text))
         return JS_EXCEPTION;
+    str = JS_VALUE_GET_STRING(text);
     if (argc > 1 && JS_IsFunction(ctx, argv[1])) {
         JSONParseRecord pr_s, *pr = &pr_s, *pr1;
         JSValue root;
@@ -57553,7 +58541,7 @@ static JSValue js_json_parse(JSContext *ctx, JSValueConst this_val,
         if (!pr1)
             goto fail1;
 
-        obj = JS_ParseJSON3(ctx, str, len, "<input>", 0, pr1);
+        obj = json_parse_string_direct(ctx, str, pr1);
         if (JS_IsException(obj))
             goto fail1;
         
@@ -57571,12 +58559,12 @@ static JSValue js_json_parse(JSContext *ctx, JSValueConst this_val,
         json_free_parse_record(ctx, pr);
         JS_FreeValue(ctx, root);
     } else {
-        obj = JS_ParseJSON3(ctx, str, len, "<input>", 0, NULL);
+        obj = json_parse_string_direct(ctx, str, NULL);
     }
-    JS_FreeCString(ctx, str);
+    JS_FreeValue(ctx, text);
     return obj;
  fail:
-    JS_FreeCString(ctx, str);
+    JS_FreeValue(ctx, text);
     return JS_EXCEPTION;
 }
 
@@ -69340,3 +70328,403 @@ int JS_ProfileForEachBytecode(JSRuntime *rt, JSProfileBytecodeFunc *cb,
     return TRUE;
 #endif
 }
+
+#ifdef CONFIG_TILEFINCH_HEAP_DETAIL
+/* Heap-detail diagnostic (CONFIG_TILEFINCH_HEAP_DETAIL: host builds only,
+   never compiled for the PSP): read-only heap composition walk. Allocation-free (static tables), so it
+   may run at a safe point right after an allocation was refused. Exact
+   allocation sizes come from the arena block headers
+   (js_malloc_usable_size_rt); strings reached from several values are
+   split by reference count, as in JS_ComputeMemoryUsage. */
+#define JSMD_FILES 2048
+#define JSMD_OWNERS 65536
+#define JSMD_CLASSES 1024
+enum { JSMD_F_FUNCS, JSMD_F_BC, JSMD_F_LAZY, JSMD_F_LAZY_BYTES, JSMD_F_PC2LINE,
+       JSMD_F_SRC_OWN, JSMD_F_SRC_SHARED, JSMD_F_CLOSURES, JSMD_F_CLOSURE_BYTES,
+       JSMD_F_BODY, JSMD_F_LAZY_SPAN_SHARED, JSMD_F_COMPILED_SHARED,
+       JSMD_F_EXTERNAL,
+       JSMD_F_COUNT };
+static JSAtom jsmd_file_atom[JSMD_FILES + 1];
+static int64_t jsmd_file[JSMD_FILES + 1][JSMD_F_COUNT];
+static const void *jsmd_owner[JSMD_OWNERS];
+static int64_t jsmd_class[JSMD_CLASSES][4];
+static double jsmd_str[5][2];
+#define JSMD_PROTOS 16384
+static JSObject *jsmd_proto[JSMD_PROTOS];
+static int64_t jsmd_proto_stat[JSMD_PROTOS][3];
+
+static void jsmd_proto_add(JSObject *proto, int64_t bytes, int64_t props)
+{
+    uintptr_t h = ((uintptr_t)proto >> 4) % JSMD_PROTOS;
+    for (int n = 0; n < JSMD_PROTOS; n++, h = (h + 1) % JSMD_PROTOS) {
+        if (jsmd_proto[h] == proto && jsmd_proto_stat[h][0]) break;
+        if (jsmd_proto_stat[h][0] == 0) { jsmd_proto[h] = proto; break; }
+    }
+    jsmd_proto_stat[h][0]++;
+    jsmd_proto_stat[h][1] += bytes;
+    jsmd_proto_stat[h][2] += props;
+}
+
+/* Name of the objects whose prototype is `proto`: its own constructor's
+   function name; no allocation. */
+static const char *jsmd_proto_name(JSRuntime *rt, JSObject *proto,
+                                   char *buf, int size)
+{
+    JSProperty *pr;
+    JSShapeProperty *prs;
+    if (!proto) return "<null-proto>";
+    prs = find_own_property(&pr, proto, JS_ATOM_constructor);
+    if (prs && !(prs->flags & JS_PROP_TMASK) &&
+        JS_VALUE_GET_TAG(pr->u.value) == JS_TAG_OBJECT) {
+        JSObject *c = JS_VALUE_GET_OBJ(pr->u.value);
+        if (c->class_id == JS_CLASS_BYTECODE_FUNCTION && c->u.func.function_bytecode
+            && c->u.func.function_bytecode->func_name != JS_ATOM_NULL)
+            return JS_AtomGetStrRT(rt, buf, size,
+                                   c->u.func.function_bytecode->func_name);
+        prs = find_own_property(&pr, c, JS_ATOM_name);
+        if (prs && !(prs->flags & JS_PROP_TMASK) &&
+            JS_VALUE_GET_TAG(pr->u.value) == JS_TAG_STRING) {
+            JSString *str = JS_VALUE_GET_STRING(pr->u.value);
+            int n = 0;
+            for (; n < (int)str->len && n < size - 1; n++)
+                buf[n] = str->is_wide_char ? (char)(str->u.str16[n] & 0x7f)
+                                           : (char)str->u.str8[n];
+            buf[n] = 0;
+            if (n) return buf;
+        }
+        snprintf(buf, size, "<ctor-class-%d>", c->class_id);
+        return buf;
+    }
+    snprintf(buf, size, "<proto-class-%d>", proto->class_id);
+    return buf;
+}
+
+static size_t jsmd_size(JSRuntime *rt, const void *ptr)
+{
+    return ptr ? js_malloc_usable_size_rt(rt, ptr) : 0;
+}
+
+static int jsmd_file_slot(JSAtom atom)
+{
+    uint32_t h = (atom * 2654435761u) % JSMD_FILES;
+    for (int n = 0; n < JSMD_FILES; n++, h = (h + 1) % JSMD_FILES) {
+        if (jsmd_file_atom[h] == atom) return h;
+        if (jsmd_file_atom[h] == 0) { jsmd_file_atom[h] = atom; return h; }
+    }
+    return JSMD_FILES;
+}
+
+/* TRUE the first time an owner is seen in this walk. */
+static BOOL jsmd_owner_first(const void *owner)
+{
+    uintptr_t h = ((uintptr_t)owner >> 4) % JSMD_OWNERS;
+    for (int n = 0; n < JSMD_OWNERS; n++, h = (h + 1) % JSMD_OWNERS) {
+        if (jsmd_owner[h] == owner) return FALSE;
+        if (jsmd_owner[h] == NULL) { jsmd_owner[h] = owner; return TRUE; }
+    }
+    return FALSE;
+}
+
+static void jsmd_value(JSRuntime *rt, JSValueConst v)
+{
+    if (JS_VALUE_GET_TAG(v) != JS_TAG_STRING) return;
+    JSString *str = JS_VALUE_GET_STRING(v);
+    if (str->atom_type) return;
+    double rc = js_rc(str)->ref_count;
+    if (rc < 1) rc = 1;
+    size_t bytes = jsmd_size(rt, str);
+    int band = bytes < 64 ? 0 : bytes < 1024 ? 1 : bytes < 16384 ? 2
+        : bytes < 262144 ? 3 : 4;
+    jsmd_str[band][0] += 1 / rc;
+    jsmd_str[band][1] += bytes / rc;
+}
+
+void JS_ComputeMemoryDetail(JSRuntime *rt, JSMemoryDetailRow *row, void *opaque)
+{
+    struct list_head *el;
+    char name[ATOM_GET_STR_BUF_SIZE * 4];
+    int64_t v[12];
+    int i;
+    int64_t gc_count[8] = {0}, gc_bytes[8] = {0};
+
+    memset(jsmd_file_atom, 0, sizeof(jsmd_file_atom));
+    memset(jsmd_file, 0, sizeof(jsmd_file));
+    memset(jsmd_owner, 0, sizeof(jsmd_owner));
+    memset(jsmd_class, 0, sizeof(jsmd_class));
+    memset(jsmd_str, 0, sizeof(jsmd_str));
+    memset(jsmd_proto, 0, sizeof(jsmd_proto));
+    memset(jsmd_proto_stat, 0, sizeof(jsmd_proto_stat));
+
+    /* allocator: arenas vs large blocks */
+    {
+        int64_t arenas = 0, arena_alloc = 0, cap = 0, used = 0;
+        for (i = 0; i < JS_MALLOC_BLOCK_SIZE_COUNT; ++i) {
+            list_for_each(el, &rt->malloc_ctx.arena_list[i]) {
+                JSMallocArena *ar = list_entry(el, JSMallocArena, link);
+                arenas++;
+                arena_alloc += sizeof(JSMallocArena) +
+                    (int64_t)ar->n_blocks * js_malloc_block_sizes[i];
+                cap += (int64_t)ar->n_blocks * js_malloc_block_sizes[i];
+                used += (int64_t)ar->n_used_blocks * js_malloc_block_sizes[i];
+            }
+        }
+        v[0] = rt->malloc_ctx.malloc_state.malloc_size;
+        v[1] = rt->malloc_ctx.malloc_state.malloc_limit;
+        v[2] = arenas; v[3] = arena_alloc; v[4] = cap; v[5] = used;
+        v[6] = v[0] - arena_alloc; /* large blocks */
+        v[7] = rt->malloc_ctx.malloc_state.malloc_count;
+        v[8] = rt->gc_phase;
+        row(opaque, "alloc", "-", v, 9);
+    }
+
+    list_for_each(el, &rt->gc_obj_list) {
+        JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
+        int type = js_rc(gp)->gc_obj_type;
+        if (type < 8) { gc_count[type]++; gc_bytes[type] += jsmd_size(rt, gp); }
+        if (type == JS_GC_OBJ_TYPE_FUNCTION_BYTECODE) {
+            JSFunctionBytecode *b = (JSFunctionBytecode *)gp;
+            int f = jsmd_file_slot(b->has_debug ? b->debug.filename : JS_ATOM_NULL);
+            int64_t *fs = jsmd_file[f];
+            fs[JSMD_F_FUNCS]++;
+            fs[JSMD_F_BC] += jsmd_size(rt, b);
+            for (i = 0; i < b->cpool_count; i++) jsmd_value(rt, b->cpool[i]);
+            if (b->is_lazy) {
+                JSLazyFunction *lz = js_lazy_function_of(b);
+                fs[JSMD_F_LAZY]++;
+                fs[JSMD_F_LAZY_BYTES] += jsmd_size(rt, b->byte_code_buf);
+                if (lz->source) fs[JSMD_F_SRC_OWN] += jsmd_size(rt, lz->source);
+            } else if (b->has_lazy_body) {
+                fs[JSMD_F_BODY] += jsmd_size(rt, b->byte_code_buf);
+            }
+            if (b->has_debug) {
+                if (b->debug.pc2line_buf)
+                    fs[JSMD_F_PC2LINE] += jsmd_size(rt, b->debug.pc2line_buf);
+                if (b->source_external) {
+                    JSFunctionSource *owner = b->debug.source_owner;
+                    fs[JSMD_F_EXTERNAL]++;
+                    if (jsmd_owner_first(owner))
+                        fs[JSMD_F_SRC_SHARED] += jsmd_size(rt, owner);
+                } else if (b->debug.source) {
+                    JSFunctionSource *owner = b->debug.source_owner;
+                    if (owner) {
+                        if (b->is_lazy && !js_lazy_function_of(b)->source)
+                            fs[JSMD_F_LAZY_SPAN_SHARED] += b->debug.source_len;
+                        else if (!b->is_lazy)
+                            fs[JSMD_F_COMPILED_SHARED]++;
+                        if (jsmd_owner_first(owner))
+                            fs[JSMD_F_SRC_SHARED] += jsmd_size(rt, owner) +
+                                (owner->string ? jsmd_size(rt, owner->string) : 0);
+                    } else {
+                        fs[JSMD_F_SRC_OWN] += jsmd_size(rt, b->debug.source);
+                    }
+                }
+            }
+            continue;
+        }
+        if (type == JS_GC_OBJ_TYPE_VAR_REF) {
+            JSVarRef *vr = (JSVarRef *)gp;
+            if (vr->is_detached) jsmd_value(rt, vr->value);
+            continue;
+        }
+        if (type != JS_GC_OBJ_TYPE_JS_OBJECT) continue;
+        JSObject *p = (JSObject *)gp;
+        JSShape *sh = p->shape;
+        int cid = p->class_id < JSMD_CLASSES ? p->class_id : 0;
+        int64_t obj = jsmd_size(rt, p), prop = 0, payload = 0;
+        if (p->prop && !p->shared_closure_metadata) {
+            JSShapeProperty *prs = get_shape_prop(sh);
+            prop = jsmd_size(rt, p->prop);
+            for (i = 0; i < sh->prop_count; i++, prs++) {
+                if (prs->atom != JS_ATOM_NULL && !(prs->flags & JS_PROP_TMASK))
+                    jsmd_value(rt, p->prop[i].u.value);
+            }
+        }
+        switch (p->class_id) {
+        case JS_CLASS_ARRAY:
+        case JS_CLASS_ARGUMENTS:
+            if (p->fast_array && p->u.array.u.values) {
+                payload += jsmd_size(rt, p->u.array.u.values);
+#ifdef CONFIG_TILEFINCH_COMPACT_CHAR_ARRAY
+                if (!p->compact_char_array && !p->compact_byte_array &&
+                    !p->compact_signed_byte_array && !p->compact_short_array)
+#endif
+                    for (i = 0; i < (int)p->u.array.count; i++)
+                        jsmd_value(rt, p->u.array.u.values[i]);
+            }
+            break;
+        case JS_CLASS_BYTECODE_FUNCTION:
+        case JS_CLASS_GENERATOR_FUNCTION:
+        case JS_CLASS_ASYNC_FUNCTION:
+        case JS_CLASS_ASYNC_GENERATOR_FUNCTION: {
+            JSFunctionBytecode *b = p->u.func.function_bytecode;
+            if (p->u.func.var_refs && !JS_FUNC_INLINE_REF(p))
+                payload += jsmd_size(rt, p->u.func.var_refs);
+            if (b) {
+                int f = jsmd_file_slot(b->has_debug ? b->debug.filename : JS_ATOM_NULL);
+                jsmd_file[f][JSMD_F_CLOSURES]++;
+                jsmd_file[f][JSMD_F_CLOSURE_BYTES] += obj + prop + payload;
+            }
+            break;
+        }
+        case JS_CLASS_BOUND_FUNCTION:
+            if (p->u.bound_function) {
+                payload += jsmd_size(rt, p->u.bound_function);
+                for (i = 0; i < p->u.bound_function->argc; i++)
+                    jsmd_value(rt, p->u.bound_function->argv[i]);
+            }
+            break;
+        case JS_CLASS_C_FUNCTION_DATA:
+            if (p->u.c_function_data_record) {
+                JSCFunctionDataRecord *fd = p->u.c_function_data_record;
+                payload += jsmd_size(rt, fd);
+                for (i = 0; i < fd->data_len; i++) jsmd_value(rt, fd->data[i]);
+            }
+            break;
+        case JS_CLASS_ARRAY_BUFFER:
+        case JS_CLASS_SHARED_ARRAY_BUFFER: {
+            JSArrayBuffer *abuf = p->u.array_buffer;
+            if (abuf) {
+                payload += jsmd_size(rt, abuf);
+                if (abuf->data) {
+                    if (abuf->free_func == js_array_buffer_free)
+                        payload += jsmd_size(rt, abuf->data);
+                    else
+                        jsmd_class[cid][3] += abuf->byte_length; /* external */
+                }
+            }
+            break;
+        }
+        case JS_CLASS_UINT8C_ARRAY: case JS_CLASS_INT8_ARRAY:
+        case JS_CLASS_UINT8_ARRAY: case JS_CLASS_INT16_ARRAY:
+        case JS_CLASS_UINT16_ARRAY: case JS_CLASS_INT32_ARRAY:
+        case JS_CLASS_UINT32_ARRAY: case JS_CLASS_BIG_INT64_ARRAY:
+        case JS_CLASS_BIG_UINT64_ARRAY: case JS_CLASS_FLOAT16_ARRAY:
+        case JS_CLASS_FLOAT32_ARRAY: case JS_CLASS_FLOAT64_ARRAY:
+        case JS_CLASS_DATAVIEW:
+            payload += jsmd_size(rt, p->u.typed_array);
+            break;
+        case JS_CLASS_MAP: case JS_CLASS_SET:
+        case JS_CLASS_WEAKMAP: case JS_CLASS_WEAKSET: {
+            JSMapState *s = p->u.map_state;
+            if (s) {
+                struct list_head *rl;
+                payload += jsmd_size(rt, s) + jsmd_size(rt, s->hash_table);
+                list_for_each(rl, &s->records) {
+                    JSMapRecord *mr = list_entry(rl, JSMapRecord, link);
+                    payload += jsmd_size(rt, mr);
+                    if (!mr->empty) {
+                        jsmd_value(rt, mr->key);
+                        jsmd_value(rt, mr->value);
+                    }
+                }
+            }
+            break;
+        }
+        case JS_CLASS_PROMISE:
+            if (p->u.promise_data) {
+                payload += jsmd_size(rt, p->u.promise_data);
+                jsmd_value(rt, p->u.promise_data->promise_result);
+            }
+            break;
+        case JS_CLASS_NUMBER: case JS_CLASS_STRING: case JS_CLASS_BOOLEAN:
+        case JS_CLASS_SYMBOL: case JS_CLASS_DATE: case JS_CLASS_BIG_INT:
+            jsmd_value(rt, p->u.object_data);
+            break;
+        default:
+            break;
+        }
+        jsmd_proto_add(sh->proto, obj + prop + payload, sh->prop_count);
+        jsmd_class[cid][0]++;
+        jsmd_class[cid][1] += obj;
+        jsmd_class[cid][2] += prop;
+        jsmd_class[cid][3] += payload;
+    }
+
+    {
+        static const char *gc_names[8] = { "object", "bytecode", "shape",
+            "var_ref", "async_function", "context", "module", "other" };
+        for (i = 0; i < 8; i++) {
+            if (!gc_count[i]) continue;
+            v[0] = gc_count[i]; v[1] = gc_bytes[i];
+            row(opaque, "gc", gc_names[i], v, 2);
+        }
+    }
+    for (i = 0; i < JSMD_CLASSES && i < rt->class_count; i++) {
+        if (!jsmd_class[i][0]) continue;
+        const char *cn = JS_AtomGetStrRT(rt, name, sizeof(name),
+                                         rt->class_array[i].class_name);
+        v[0] = i; v[1] = jsmd_class[i][0]; v[2] = jsmd_class[i][1];
+        v[3] = jsmd_class[i][2]; v[4] = jsmd_class[i][3];
+        row(opaque, "class", cn, v, 5);
+    }
+    for (i = 0; i <= JSMD_FILES; i++) {
+        if (!jsmd_file[i][JSMD_F_FUNCS] && !jsmd_file[i][JSMD_F_CLOSURES]) continue;
+        const char *fn = jsmd_file_atom[i] == JS_ATOM_NULL ? "<nofile>"
+            : JS_AtomGetStrRT(rt, name, sizeof(name), jsmd_file_atom[i]);
+        row(opaque, "file", fn, jsmd_file[i], JSMD_F_COUNT);
+    }
+    for (int top = 0; top < 80; top++) {
+        int best = -1;
+        for (i = 0; i < JSMD_PROTOS; i++)
+            if (jsmd_proto_stat[i][0] > 0 &&
+                (best < 0 || jsmd_proto_stat[i][1] > jsmd_proto_stat[best][1]))
+                best = i;
+        if (best < 0) break;
+        v[0] = jsmd_proto_stat[best][0]; v[1] = jsmd_proto_stat[best][1];
+        v[2] = jsmd_proto_stat[best][2];
+        v[3] = jsmd_proto[best] ? jsmd_proto[best]->class_id : -1;
+        row(opaque, "proto", jsmd_proto_name(rt, jsmd_proto[best], name,
+                                             sizeof(name)), v, 4);
+        jsmd_proto_stat[best][0] = -1;
+    }
+    {
+        static const char *bands[5] = { "<64", "<1K", "<16K", "<256K", ">=256K" };
+        for (i = 0; i < 5; i++) {
+            v[0] = (int64_t)jsmd_str[i][0]; v[1] = (int64_t)jsmd_str[i][1];
+            row(opaque, "strings", bands[i], v, 2);
+        }
+    }
+    {
+        int64_t n = 0, bytes = 0, big = 0;
+        for (i = 0; i < (int)rt->atom_size; i++) {
+            JSAtomStruct *ap = rt->atom_array[i];
+            if (atom_is_free(ap)) continue;
+            n++;
+            size_t sz = jsmd_size(rt, ap);
+            bytes += sz;
+            if (sz >= 1024) big += sz;
+        }
+        v[0] = n; v[1] = bytes;
+        v[2] = sizeof(rt->atom_array[0]) * rt->atom_size +
+            sizeof(rt->atom_hash[0]) * rt->atom_hash_size;
+        v[3] = big;
+        row(opaque, "atoms", "-", v, 4);
+    }
+    {
+        int64_t n = 0, bytes = 0;
+        for (i = 0; i < rt->shape_hash_size; i++) {
+            JSShape *sh;
+            for (sh = rt->shape_hash[i]; sh; sh = sh->shape_hash_next) {
+                n++;
+                bytes += get_shape_size(sh->prop_hash_mask + 1, sh->prop_size);
+            }
+        }
+        v[0] = n; v[1] = bytes;
+        v[2] = sizeof(rt->shape_hash[0]) * rt->shape_hash_size;
+        row(opaque, "shapes-hashed", "-", v, 3);
+    }
+    v[0] = jsmd_tostring[0]; v[1] = jsmd_tostring[1];
+    v[2] = jsmd_tostring[2]; v[3] = jsmd_tostring[3];
+    row(opaque, "tostring", "-", v, 4);
+    {
+        int64_t n = 0, bytes = 0;
+        list_for_each(el, &rt->job_list) {
+            JSJobEntry *e = list_entry(el, JSJobEntry, link);
+            n++;
+            bytes += jsmd_size(rt, e);
+        }
+        v[0] = n; v[1] = bytes;
+        row(opaque, "jobs", "-", v, 2);
+    }
+}
+#endif

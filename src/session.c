@@ -3128,6 +3128,46 @@ size_t browser_session_cache_reclaim(BrowserSession *session,
     return reclaimed;
 }
 
+static bool cache_entry_is_script_body(const BrowserSession *session,
+                                       const BrowserCacheEntry *entry)
+{
+    return entry->data != NULL && entry->body != NULL
+        && entry->body->references
+               == 1u + browser_session_lazy_bundle_pending_holds(
+                           session, entry->body)
+        && entry->classic_script_bytecode == NULL
+        && entry->module_request_fragment == NULL
+        && entry->resource_grant_valid
+        && entry->resource_grant.destination == TILEFINCH_DESTINATION_SCRIPT;
+}
+
+size_t browser_session_cache_release_script_bodies(BrowserSession *session,
+                                                   size_t target_bytes)
+{
+    if (session == NULL || session->budget == NULL || target_bytes == 0)
+        return 0;
+    size_t before = budget_remaining(session->budget);
+    size_t reclaimed = 0;
+    while (reclaimed < target_bytes) {
+        BrowserCacheEntry *victim = NULL;
+        for (size_t i = 0; i < BROWSER_CACHE_ENTRIES; i++) {
+            BrowserCacheEntry *candidate = &session->cache[i];
+            if (cache_entry_is_script_body(session, candidate)
+                && (victim == NULL || candidate->stamp < victim->stamp))
+                victim = candidate;
+        }
+        if (victim == NULL) break;
+        browser_session_lazy_bundle_pending_release_body(session,
+                                                         victim->body);
+        cache_remove(session, victim);
+        session->cache_evictions++;
+        session->cache_script_body_releases++;
+        size_t after = budget_remaining(session->budget);
+        reclaimed = after > before ? after - before : 0;
+    }
+    return reclaimed;
+}
+
 bool browser_session_cache_reserve_working_set(
     BrowserSession *session, size_t required_bytes)
 {

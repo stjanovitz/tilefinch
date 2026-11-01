@@ -480,9 +480,14 @@ static bool looks_absolute(const char *reference)
 bool tilefinch_url_resolve(const char *base, const char *reference,
                         char *output, size_t output_size)
 {
+    if (reference == NULL || output == NULL || output_size == 0) return false;
+    /* An absolute reference ignores the base entirely (URL Standard), so an
+       opaque base such as blob: or about:blank, which cannot be a base, must
+       not reject it. Only relative references need a parsable base. */
+    if (looks_absolute(reference))
+        return tilefinch_url_normalize(reference, output, output_size);
     TilefinchUrl base_url;
-    if (base == NULL || reference == NULL || output == NULL || output_size == 0
-        || !tilefinch_url_parse(base, &base_url)) return false;
+    if (base == NULL || !tilefinch_url_parse(base, &base_url)) return false;
     if (reference[0] == '\0') {
         /* A relative URL with an empty input inherits path and query, but not
            the base fragment. Keeping the fragment here would make href=""
@@ -496,8 +501,6 @@ bool tilefinch_url_resolve(const char *base, const char *reference,
         inherited[base_without_fragment] = '\0';
         return tilefinch_url_normalize(inherited, output, output_size);
     }
-    if (looks_absolute(reference))
-        return tilefinch_url_normalize(reference, output, output_size);
     char assembled[TILEFINCH_URL_SERIALIZED_LIMIT];
     size_t used = 0;
     assembled[0] = '\0';

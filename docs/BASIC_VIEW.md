@@ -158,6 +158,11 @@ initialization even though navigation links survived. That covers:
 - scripts that fail after the page was shown: a page is examined at commit,
   and once more when a later runtime turn fails or its realm is retired
   after a script failure;
+- a script that runs out of JavaScript memory after the page was shown while
+  its realm stays alive (the page caught or reported the "out of memory"
+  error): the page is examined once more if it is then blank or has no usable
+  action. A page that keeps its content and links after such an error is left
+  alone;
 - script loading refused under memory pressure or a realm stopped at its
   memory limit. This uses current-page allocator/admission facts, not a site's
   name or author-thrown error text, and does not carry over to the next page;

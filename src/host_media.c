@@ -22,8 +22,12 @@
 
 #include "tilefinch/document.h"
 #include "tilefinch/fetch.h"
+#include "tilefinch/media_failure_message.h"
+#include "tilefinch/media_hls.h"
+#include "tilefinch/media_http.h"
 #include "tilefinch/resources.h"
 #include "tilefinch/url.h"
+#include "tilefinch/user_agent.h"
 #include "tilefinch/youtube_resolver.h"
 #include "host_media_timing.h"
 
@@ -86,6 +90,7 @@ struct HostMediaPlayer {
     bool playing;
     bool ended;
     bool surface_adopted;
+    bool live;
     bool native_player;
     bool audio_output_active;
     bool audio_clock_initialized;
@@ -122,6 +127,106 @@ static void media_error(char *error, size_t error_size,
     va_start(arguments, format);
     vsnprintf(error, error_size, format, arguments);
     va_end(arguments);
+}
+
+/* The PSP page-media probe's shape (psp_media_open.c): the first bytes by
+   Range (MEDIA_HTTP_PROBE_RANGE_BYTES), or a small whole body from a
+   server that ignores it. */
+#define HOST_MEDIA_PROBE_BYTES (32u * 1024u)
+
+/*
+ * What a network media address answers decides its route, as on the PSP:
+ * FFmpeg is told HLS or MP4 instead of guessing, and an address that says
+ * there is nothing to play (404/410, an error page, a playlist with no
+ * entry) fails with MEDIA_STREAM_UNAVAILABLE. A transport failure or an
+ * answer that says nothing leaves FFmpeg to probe, as before.
+ */
+static MediaResponseKind host_media_probe_response(
+    Budget *budget, const char *url, char *error, size_t error_size)
+{
+    char range[64];
+    if (!media_http_build_probe_range_header(range, sizeof(range)))
+        return MEDIA_RESPONSE_UNKNOWN;
+    FetchRequest request = {
+        .allow_http_errors = true,
+        .accept = "video/mp4,application/vnd.apple.mpegurl,video/*;q=0.9,"
+                  "*/*;q=0.5",
+        .user_agent = TILEFINCH_BROWSER_USER_AGENT,
+        .extra_headers = range,
+        .redirect_same_origin_only = false
+    };
+    FetchResult *result = fetch_result_create(budget);
+    if (result == NULL) return MEDIA_RESPONSE_UNKNOWN;
+    bool fetched = fetch_request_cancelable(
+        budget, url, &request, HOST_MEDIA_PROBE_BYTES, 15000,
+        NULL, NULL, result);
+    MediaResponseKind kind = fetched
+        ? media_response_kind(
+              result->status_code, result->content_type,
+              (const unsigned char *) result->data, result->length)
+        : MEDIA_RESPONSE_UNKNOWN;
+    if (kind == MEDIA_RESPONSE_UNAVAILABLE) {
+        media_error(error, error_size,
+                    "network media: " MEDIA_STREAM_UNAVAILABLE " (HTTP %ld)",
+                    result->status_code);
+    } else if (kind == MEDIA_RESPONSE_HLS && result->status_code == 200
+               && result->length != 0) {
+        /* The whole playlist came: one with no variant or segment (an
+           ended or not yet started live stream) has nothing to play. */
+        char parse_error[160] = {0};
+        MediaHlsPlaylist *playlist = media_hls_playlist_parse(
+            budget, url, (const unsigned char *) result->data,
+            result->length, parse_error, sizeof(parse_error));
+        if (playlist == NULL
+            && strstr(parse_error, "HLS playlist is empty") != NULL) {
+            media_error(error, error_size, "network media: %s (%s)",
+                        MEDIA_STREAM_UNAVAILABLE, parse_error);
+            kind = MEDIA_RESPONSE_UNAVAILABLE;
+        }
+        media_hls_playlist_destroy(playlist);
+    }
+    printf("host-media-probe http=%ld content-type=\"%s\" bytes=%zu "
+           "route=%s\n", result->status_code, result->content_type,
+           result->length,
+           kind == MEDIA_RESPONSE_HLS ? "hls"
+               : kind == MEDIA_RESPONSE_MP4 ? "mp4"
+               : kind == MEDIA_RESPONSE_UNAVAILABLE ? "unavailable"
+               : "unknown");
+    fetch_result_free(result);
+    return kind;
+}
+
+/*
+ * The video stream to play. An HLS master opens as one stream per variant;
+ * pick the PSP's choice (psp_media_hls.c): the smallest variant at or above
+ * 240 lines that fits the lab bound, else the largest that fits. A single
+ * video stream keeps FFmpeg's own choice and bound check.
+ */
+static int media_pick_video_stream(AVFormatContext *format,
+                                   int maximum_width, int maximum_height,
+                                   const AVCodec **codec)
+{
+    int chosen = -1;
+    unsigned videos = 0;
+    for (unsigned i = 0; i < format->nb_streams; i++) {
+        const AVCodecParameters *candidate = format->streams[i]->codecpar;
+        if (candidate->codec_type != AVMEDIA_TYPE_VIDEO) continue;
+        videos++;
+        if (candidate->width <= 0 || candidate->height <= 0
+            || candidate->width > maximum_width
+            || candidate->height > maximum_height
+            || avcodec_find_decoder(candidate->codec_id) == NULL) continue;
+        if (chosen < 0) { chosen = (int) i; continue; }
+        int height = candidate->height;
+        int best = format->streams[chosen]->codecpar->height;
+        if (best < 240 ? height > best : height >= 240 && height < best)
+            chosen = (int) i;
+    }
+    if (videos <= 1 || chosen < 0)
+        return av_find_best_stream(
+            format, AVMEDIA_TYPE_VIDEO, -1, -1, codec, 0);
+    *codec = avcodec_find_decoder(format->streams[chosen]->codecpar->codec_id);
+    return chosen;
 }
 
 static bool media_node_name_is(lxb_dom_node_t *node, const char *wanted)
@@ -398,6 +503,33 @@ static bool media_initialize_audio(HostMediaPlayer *player,
     int stream_index = av_find_best_stream(
         player->format, AVMEDIA_TYPE_AUDIO, -1, player->stream_index,
         &codec, 0);
+    /* An HLS master can pair one video rendition with several audio groups
+       (YouTube lists HE-AAC before AAC-LC). Take the AAC-LC one, as the
+       PSP's selection does by CODECS: its decoder cannot play HE-AAC. */
+    for (unsigned p = 0; stream_index >= 0 && p < player->format->nb_programs;
+         p++) {
+        const AVCodecParameters *chosen =
+            player->format->streams[stream_index]->codecpar;
+        if (chosen->codec_id != AV_CODEC_ID_AAC
+            || chosen->profile == AV_PROFILE_AAC_LOW) break;
+        const AVProgram *program = player->format->programs[p];
+        bool carries_video = false;
+        for (unsigned i = 0; i < program->nb_stream_indexes; i++)
+            carries_video |= (int) program->stream_index[i]
+                == player->stream_index;
+        for (unsigned i = 0; carries_video && i < program->nb_stream_indexes;
+             i++) {
+            const AVCodecParameters *audio = player->format->streams[
+                program->stream_index[i]]->codecpar;
+            if (audio->codec_type == AVMEDIA_TYPE_AUDIO
+                && audio->codec_id == AV_CODEC_ID_AAC
+                && audio->profile == AV_PROFILE_AAC_LOW) {
+                stream_index = (int) program->stream_index[i];
+                codec = avcodec_find_decoder(audio->codec_id);
+                break;
+            }
+        }
+    }
     if (stream_index < 0 || codec == NULL) return true;
     AVStream *stream = player->format->streams[stream_index];
     player->audio_decoder = avcodec_alloc_context3(codec);
@@ -802,6 +934,7 @@ HostMediaPlayer *host_media_create(Budget *budget, BrowserSession *session,
         network_input = true;
         youtube_input = true;
         player->resolved_itag = youtube.itag;
+        player->live = youtube.live_hls;
         player->resolver_bytes = youtube.watch_bytes + youtube.player_bytes;
         snprintf(player->source_kind, sizeof(player->source_kind), "youtube");
         snprintf(player->title, sizeof(player->title), "%s", youtube.title);
@@ -847,11 +980,36 @@ HostMediaPlayer *host_media_create(Budget *budget, BrowserSession *session,
             youtube_input ? "0" : "3", 0);
         av_dict_set(&options, "rw_timeout", "15000000", 0);
     }
+    const AVInputFormat *input_format = NULL;
+    MediaResponseKind response = MEDIA_RESPONSE_UNKNOWN;
+    if (network_input && !youtube_input) {
+        response = host_media_probe_response(
+            budget, input, error, error_size);
+        if (response == MEDIA_RESPONSE_UNAVAILABLE) {
+            av_dict_free(&options);
+            host_media_destroy(player);
+            return NULL;
+        }
+        if (error != NULL && error_size != 0) error[0] = '\0';
+        if (response == MEDIA_RESPONSE_HLS)
+            input_format = av_find_input_format("hls");
+        else if (response == MEDIA_RESPONSE_MP4)
+            input_format = av_find_input_format("mp4");
+    }
     int open_status = avformat_open_input(
-        &player->format, input, NULL, &options);
+        &player->format, input, input_format, &options);
     av_dict_free(&options);
     if (open_status < 0) {
-        media_error(error, error_size, "could not open MP4 media");
+        if (network_input && (open_status == AVERROR_HTTP_NOT_FOUND))
+            media_error(error, error_size,
+                        "network media: " MEDIA_STREAM_UNAVAILABLE
+                        " (HTTP 404)");
+        else
+            media_error(error, error_size, "could not open %s media",
+                        response == MEDIA_RESPONSE_HLS ? "HLS"
+                            : network_input
+                                  && response != MEDIA_RESPONSE_MP4
+                            ? "network" : "MP4");
         host_media_destroy(player);
         return NULL;
     }
@@ -875,8 +1033,8 @@ HostMediaPlayer *host_media_create(Budget *budget, BrowserSession *session,
         return NULL;
     }
     const AVCodec *codec = NULL;
-    int stream_index = av_find_best_stream(
-        player->format, AVMEDIA_TYPE_VIDEO, -1, -1, &codec, 0);
+    int stream_index = media_pick_video_stream(
+        player->format, maximum_width, maximum_height, &codec);
     if (stream_index < 0 || codec == NULL) {
         media_error(error, error_size, "MP4 has no decodable video stream");
         host_media_destroy(player);
@@ -945,6 +1103,13 @@ HostMediaPlayer *host_media_create(Budget *budget, BrowserSession *session,
             player, enable_audio_output, error, error_size)) {
         host_media_destroy(player);
         return NULL;
+    }
+    /* Streams nobody reads are not demuxed: an HLS master's other
+       variants then stop reloading their playlists. */
+    for (unsigned i = 0; i < player->format->nb_streams; i++) {
+        if ((int) i != player->stream_index
+            && (int) i != player->audio_stream_index)
+            player->format->streams[i]->discard = AVDISCARD_ALL;
     }
     int decoded_buffer_bytes = av_image_get_buffer_size(
         player->decoder->pix_fmt, source_width, source_height, 1);
@@ -1419,6 +1584,7 @@ bool host_media_get_stats(const HostMediaPlayer *player,
     snprintf(stats->audio_codec, sizeof(stats->audio_codec), "%s",
              player->audio_codec);
     snprintf(stats->title, sizeof(stats->title), "%s", player->title);
+    stats->live = player->live;
     return true;
 }
 

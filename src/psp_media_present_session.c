@@ -114,6 +114,7 @@ void psp_media_present_texture_for(
     texture->pixels = frame == NULL ? NULL : frame->pixels;
     texture->stride_pixels = frame == NULL ? 0 : frame->stride_pixels;
     texture->staged = false;
+    texture->rgb565 = false;
     /* Which memory the engine is about to sample, for the pump that feeds
        during the draw: its own copy, or the decoder's surface. */
     if (media != NULL) media->present_texture_staged = false;

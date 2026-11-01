@@ -488,6 +488,252 @@ static bool trace_parse_security_metadata(
     return true;
 }
 
+/* ---- Media replay: byte ranges ------------------------------------------
+   Response-keyed replay answers a media Range request (a replay-lane
+   request, or a page request with a video/audio destination: the page-media
+   probe and range reader) from a stored body
+   that holds the requested bytes: a recorded 200 (the whole resource) or a
+   recorded 206 whose Content-Range covers the first requested byte. The
+   served response is a 206 for exactly the requested window (clamped to the
+   resource length, as a server clamps it), with Content-Range and
+   Content-Length rewritten; a window that starts outside every stored span
+   is not served. A recorded 206 that holds the complete resource answers a
+   request without Range as the 200 the server would have sent. */
+typedef struct {
+    bool present;
+    /* bytes=-N: the last `first` bytes. */
+    bool suffix;
+    uint64_t first;
+    /* Inclusive; UINT64_MAX for an open-ended bytes=N-. */
+    uint64_t last;
+} TraceReplayRange;
+
+typedef struct {
+    uint64_t start;
+    /* Exclusive. */
+    uint64_t end;
+    /* Complete resource length; zero when the server sent `*`. */
+    uint64_t total;
+} TraceReplaySpan;
+
+static bool trace_parse_u64_prefix(const char **at, const char *end,
+                                   uint64_t *value)
+{
+    const char *cursor = *at;
+    uint64_t parsed = 0;
+    if (cursor >= end || *cursor < '0' || *cursor > '9') return false;
+    while (cursor < end && *cursor >= '0' && *cursor <= '9') {
+        unsigned digit = (unsigned) (*cursor - '0');
+        if (parsed > (UINT64_MAX - digit) / 10u) return false;
+        parsed = parsed * 10u + digit;
+        cursor++;
+    }
+    *at = cursor;
+    *value = parsed;
+    return true;
+}
+
+/* The request's single `Range: bytes=` window, if it carries one. Multiple
+   ranges and other units are not media requests this replay answers. */
+static void trace_request_range(const FetchRequest *request,
+                                TraceReplayRange *range)
+{
+    *range = (TraceReplayRange) {0};
+    const char *at = request == NULL ? NULL : request->extra_headers;
+    while (at != NULL && *at != '\0') {
+        const char *end = at + strcspn(at, "\r\n");
+        if (end - at > 6 && strncasecmp(at, "range:", 6) == 0) {
+            const char *value = at + 6;
+            while (value < end && (*value == ' ' || *value == '\t')) value++;
+            if (end - value <= 6 || strncasecmp(value, "bytes=", 6) != 0)
+                return;
+            value += 6;
+            TraceReplayRange parsed = {.present = true, .last = UINT64_MAX};
+            if (*value == '-') {
+                value++;
+                parsed.suffix = true;
+                if (!trace_parse_u64_prefix(&value, end, &parsed.first)
+                    || parsed.first == 0) return;
+            } else {
+                if (!trace_parse_u64_prefix(&value, end, &parsed.first)
+                    || value >= end || *value++ != '-') return;
+                if (value < end
+                    && !trace_parse_u64_prefix(&value, end, &parsed.last))
+                    return;
+                if (parsed.last < parsed.first) return;
+            }
+            while (value < end && (*value == ' ' || *value == '\t')) value++;
+            if (value == end) *range = parsed;
+            return;
+        }
+        at = end;
+        while (*at == '\r' || *at == '\n') at++;
+    }
+}
+
+/* `bytes S-E/T` (T may be `*`) for a stored body of `length` bytes. */
+static bool trace_content_range_span(const char *text, uint64_t length,
+                                     TraceReplaySpan *span)
+{
+    const char *end = text + strlen(text);
+    while (*text == ' ' || *text == '\t') text++;
+    if (strncasecmp(text, "bytes", 5) != 0) return false;
+    text += 5;
+    while (*text == ' ' || *text == '\t') text++;
+    uint64_t first = 0, last = 0, total = 0;
+    if (!trace_parse_u64_prefix(&text, end, &first) || *text++ != '-'
+        || !trace_parse_u64_prefix(&text, end, &last) || *text++ != '/'
+        || last < first || last - first + 1u != length) return false;
+    if (*text == '*') {
+        text++;
+    } else if (!trace_parse_u64_prefix(&text, end, &total) || total <= last) {
+        return false;
+    }
+    while (*text == ' ' || *text == '\t') text++;
+    if (*text != '\0') return false;
+    *span = (TraceReplaySpan) {
+        .start = first, .end = last + 1u, .total = total
+    };
+    return true;
+}
+
+static bool trace_status_span(long status, const char *content_range,
+                              uint64_t length, TraceReplaySpan *span)
+{
+    if (status == 200) {
+        *span = (TraceReplaySpan) {
+            .start = 0, .end = length, .total = length
+        };
+        return true;
+    }
+    return status == 206 && content_range != NULL
+        && trace_content_range_span(content_range, length, span);
+}
+
+/* The window of SPAN that answers RANGE, inclusive. False when the first
+   requested byte is not stored. */
+static bool trace_range_window(const TraceReplayRange *range,
+                               const TraceReplaySpan *span,
+                               uint64_t *first, uint64_t *last)
+{
+    uint64_t start = range->first, stop = range->last;
+    if (range->suffix) {
+        if (span->total == 0) return false;
+        start = range->first >= span->total ? 0 : span->total - range->first;
+        stop = span->total - 1u;
+    }
+    if (span->total != 0 && stop >= span->total) stop = span->total - 1u;
+    if (start < span->start || start >= span->end || stop < start)
+        return false;
+    if (stop >= span->end) stop = span->end - 1u;
+    *first = start;
+    *last = stop;
+    return true;
+}
+
+/* Replace the body-framing fields of a served header snapshot: the body is
+   now LENGTH decoded bytes (the capture stored curl's decoded body), with
+   CONTENT_RANGE when it is a partial response. */
+static void trace_replay_reframe_headers(FetchResult *result,
+                                         uint64_t length,
+                                         const char *content_range)
+{
+    char *headers = result->response_headers;
+    size_t used = 0;
+    for (size_t at = 0; at < result->response_headers_length;) {
+        char *line = headers + at;
+        size_t line_length = strcspn(line, "\n");
+        size_t next = at + line_length
+            + (at + line_length < result->response_headers_length ? 1u : 0u);
+        bool drop =
+            (line_length >= 14 && strncasecmp(line, "content-range:", 14) == 0)
+            || (line_length >= 15
+                && strncasecmp(line, "content-length:", 15) == 0)
+            || (line_length >= 17
+                && strncasecmp(line, "content-encoding:", 17) == 0)
+            || (line_length >= 18
+                && strncasecmp(line, "transfer-encoding:", 18) == 0);
+        if (!drop && line_length != 0) {
+            memmove(headers + used, line, line_length);
+            used += line_length;
+            headers[used++] = '\n';
+        }
+        at = next;
+    }
+    size_t capacity = sizeof(result->response_headers);
+    int written = snprintf(headers + used, capacity - used,
+                           "content-length: %llu\n",
+                           (unsigned long long) length);
+    if (written > 0 && (size_t) written < capacity - used)
+        used += (size_t) written;
+    if (content_range != NULL) {
+        written = snprintf(headers + used, capacity - used,
+                           "content-range: %s\n", content_range);
+        if (written > 0 && (size_t) written < capacity - used)
+            used += (size_t) written;
+    }
+    headers[used < capacity ? used : capacity - 1u] = '\0';
+    result->response_headers_length = used < capacity ? used : capacity - 1u;
+}
+
+static bool trace_replay_media_request(const FetchRequest *request);
+
+/* Decides the window of a matched successful record to serve. *offset and
+   *length select the stored bytes; false (with result->error set) when the
+   request asks for bytes the record does not hold. */
+static bool trace_replay_media_window(const FetchRequest *request,
+                                      FetchResult *result,
+                                      size_t recorded_length,
+                                      size_t sequence,
+                                      uint64_t *offset, size_t *length)
+{
+    *offset = 0;
+    *length = recorded_length;
+    /* Other requests keep the recorded answer: a recorded 200 to a resumed
+       download is a server that ignores Range. */
+    if (!fetch_trace.replay_response_keyed
+        || !trace_replay_media_request(request)) return true;
+    TraceReplayRange range;
+    trace_request_range(request, &range);
+    char content_range[128] = {0};
+    (void) fetch_response_header_value(result, "content-range",
+                                       content_range, sizeof(content_range));
+    TraceReplaySpan span;
+    bool spanned = trace_status_span(result->status_code, content_range,
+                                     recorded_length, &span);
+    if (!range.present) {
+        /* A stored 206 that holds the whole resource answers as a 200. */
+        if (spanned && result->status_code == 206 && span.start == 0
+            && span.total == recorded_length) {
+            result->status_code = 200;
+            trace_replay_reframe_headers(result, recorded_length, NULL);
+        }
+        return true;
+    }
+    uint64_t first = 0, last = 0;
+    if (!spanned || !trace_range_window(&range, &span, &first, &last)) {
+        snprintf(result->error, sizeof(result->error),
+                 "HTTP replay record %zu does not hold the requested range",
+                 sequence);
+        return false;
+    }
+    char served_range[128];
+    if (span.total != 0) {
+        snprintf(served_range, sizeof(served_range), "bytes %llu-%llu/%llu",
+                 (unsigned long long) first, (unsigned long long) last,
+                 (unsigned long long) span.total);
+    } else {
+        snprintf(served_range, sizeof(served_range), "bytes %llu-%llu/*",
+                 (unsigned long long) first, (unsigned long long) last);
+    }
+    result->status_code = 206;
+    trace_replay_reframe_headers(result, last - first + 1u, served_range);
+    *offset = first - span.start;
+    *length = (size_t) (last - first + 1u);
+    fetch_trace.replay_range_slice_count++;
+    return true;
+}
+
 static bool trace_replay_ignore_request_body(void)
 {
 #if defined(TILEFINCH_NO_TRACE) && !defined(TILEFINCH_PSP_VALIDATION_LOG)
@@ -1613,12 +1859,21 @@ static bool trace_replay_response_with_scratch(
         snprintf(result->effective_url, sizeof(result->effective_url), "%s",
                  url);
     }
+    /* A media Range request is answered from the stored window that holds
+       it (response-keyed replay only). */
+    uint64_t serve_offset = 0;
+    size_t serve_length = recorded_length;
+    if (recorded_success
+        && !trace_replay_media_window(request, result, recorded_length,
+                                      sequence, &serve_offset,
+                                      &serve_length)) return false;
+    bool sliced = serve_offset != 0 || serve_length != recorded_length;
     /* A streaming consumer may intentionally stop inside a larger, complete
        captured response. Verify that entire capture below, then enforce the
        request byte ceiling while delivering slices, as live transport does. */
     bool bounded_stream = recorded_success && writer != NULL
         && writer->defer_replay_body && writer->stream != NULL;
-    if (recorded_length > maximum_bytes && !bounded_stream) {
+    if (serve_length > maximum_bytes && !bounded_stream) {
         result->response_limit_exceeded = true;
         snprintf(result->error, sizeof(result->error),
                  "HTTP replay record %zu exceeds request quota", sequence);
@@ -1646,7 +1901,10 @@ static bool trace_replay_response_with_scratch(
     if (writer != NULL) {
         writer->replay_body_hash = trace_body_hash("", 0);
         writer->replay_expected_body_hash = recorded_response_hash;
-        writer->replay_body_hash_required = trace_version >= 6;
+        /* A window of the body cannot be checked against the whole body's
+           hash; its file length is checked instead. */
+        writer->replay_body_hash_required = trace_version >= 6 && !sliced;
+        writer->replay_body_sliced = sliced;
     }
     uint64_t body_started_ns = tilefinch_platform_monotonic_time_ns();
     FILE *body = fopen(scratch->body_path, "rb");
@@ -1656,7 +1914,32 @@ static bool trace_replay_response_with_scratch(
                  "HTTP replay body %zu is missing", sequence);
         return false;
     }
-    if (trace_version >= 6) {
+    if (sliced) {
+        /* Hashing a whole stored movie for every window would read it once
+           per request over host0; its length is the integrity check. */
+        long stored = fseek(body, 0, SEEK_END) == 0 ? ftell(body) : -1L;
+        if (stored < 0 || (uint64_t) stored != recorded_length
+            || fseek(body, (long) serve_offset, SEEK_SET) != 0) {
+            (void) fclose(body);
+            snprintf(result->error, sizeof(result->error),
+                     "HTTP replay body %zu is corrupt", sequence);
+            return false;
+        }
+        recorded_length = serve_length;
+    } else if (trace_version >= 6 && writer != NULL
+               && writer->defer_replay_body
+               && writer->replay_verify_on_delivery) {
+        /* The caller checks the hash chunk by chunk (writer fields above);
+           a stored file of another length is corrupt now. */
+        long stored = fseek(body, 0, SEEK_END) == 0 ? ftell(body) : -1L;
+        if (stored < 0 || (uint64_t) stored != recorded_length
+            || fseek(body, 0, SEEK_SET) != 0) {
+            (void) fclose(body);
+            snprintf(result->error, sizeof(result->error),
+                     "HTTP replay body %zu is corrupt", sequence);
+            return false;
+        }
+    } else if (trace_version >= 6) {
         uint64_t body_hash = 0;
         /* One large read per 32 KiB, not per 4 KiB: over host0 each read is
            a USB round trip. */
@@ -1686,7 +1969,7 @@ static bool trace_replay_response_with_scratch(
         *rejected = body_ok;
         return false;
     }
-    TraceReplayRekey *rekey = trace_replay_rekey_build(
+    TraceReplayRekey *rekey = sliced ? NULL : trace_replay_rekey_build(
         budget, sequence, scratch, url, request, recorded_request_length,
         recorded_request_hash, has_request_hash, result, body,
         recorded_length);
@@ -1824,7 +2107,7 @@ static bool trace_replay_response_with_scratch(
             }
         }
         if (body_ok) {
-            body_ok = fgetc(body) == EOF && !ferror(body)
+            body_ok = (sliced || fgetc(body) == EOF) && !ferror(body)
                 && (!writer->replay_body_hash_required
                     || writer->replay_body_hash
                          == writer->replay_expected_body_hash);
@@ -1850,9 +2133,9 @@ static bool trace_replay_response_with_scratch(
     size_t read = fread(result->data, 1, recorded_length, body);
     TRACE_REPLAY_IO_READ(read_started_ns, read);
     bool body_ok = read == recorded_length
-                   && fgetc(body) == EOF && !ferror(body)
+                   && (sliced || fgetc(body) == EOF) && !ferror(body)
                    && fclose(body) == 0;
-    if (body_ok && trace_version >= 6) {
+    if (body_ok && trace_version >= 6 && !sliced) {
         body_ok = trace_body_hash(result->data, recorded_length)
                   == recorded_response_hash;
     }
@@ -1986,81 +2269,6 @@ static uint64_t trace_response_key_hash(
     return hash;
 }
 
-#ifndef TILEFINCH_NO_FETCH_TRACE
-static bool trace_record_request_key_hash(
-    size_t sequence, TraceReplayScratch *scratch, uint64_t *hash)
-{
-    if (scratch == NULL || hash == NULL
-        || !trace_path(scratch->meta_path, sizeof(scratch->meta_path),
-                       sequence, "meta")) return false;
-    uint64_t meta_started_ns = tilefinch_platform_monotonic_time_ns();
-    FILE *meta = fopen(scratch->meta_path, "rb");
-    if (meta == NULL) return false;
-    char method[16] = {0};
-    unsigned trace_version = 0;
-    FetchCacheMode cache_mode = FETCH_CACHE_DEFAULT;
-    bool version_seen = false, cache_mode_seen = false;
-    bool extra_shape_seen = false;
-    bool method_seen = false, url_seen = false, parse_ok = true;
-    unsigned checkpoint_lines = 0;
-    while (fgets(scratch->line, sizeof(scratch->line), meta) != NULL) {
-        trace_replay_prepare_checkpoint(&checkpoint_lines);
-        size_t length = strlen(scratch->line);
-        while (length != 0
-               && (scratch->line[length - 1] == '\n'
-                   || scratch->line[length - 1] == '\r')) {
-            scratch->line[--length] = '\0';
-        }
-        char *equals = strchr(scratch->line, '=');
-        if (equals == NULL) continue;
-        *equals++ = '\0';
-        if (strcmp(scratch->line, "psp-http-trace") == 0) {
-            size_t parsed = 0;
-            bool field_ok = !version_seen
-                && trace_parse_size_value(equals, &parsed)
-                && parsed >= 1 && parsed <= 13;
-            if (field_ok) trace_version = (unsigned) parsed;
-            version_seen = true;
-            parse_ok = parse_ok && field_ok;
-        } else if (strcmp(scratch->line, "method") == 0) {
-            bool field_ok = !method_seen
-                && strlen(equals) < sizeof(method);
-            if (field_ok) snprintf(method, sizeof(method), "%s", equals);
-            method_seen = true;
-            parse_ok = parse_ok && field_ok;
-        } else if (strcmp(scratch->line, "url") == 0) {
-            bool field_ok = !url_seen
-                && strlen(equals) < sizeof(scratch->request_key);
-            if (field_ok) {
-                snprintf(scratch->request_key,
-                         sizeof(scratch->request_key), "%s", equals);
-            }
-            url_seen = true;
-            parse_ok = parse_ok && field_ok;
-        } else if (strcmp(
-                       scratch->line,
-                       "request-extra-header-shape") == 0) {
-            bool field_ok = !extra_shape_seen;
-            if (field_ok) {
-                cache_mode_seen = trace_cache_mode_from_header_shape(
-                    equals, &cache_mode);
-            }
-            extra_shape_seen = true;
-            parse_ok = parse_ok && field_ok;
-        }
-    }
-    if (ferror(meta) || fclose(meta) != 0) parse_ok = false;
-    TRACE_REPLAY_IO_OPEN(meta_started_ns);
-    parse_ok = parse_ok && version_seen && method_seen && url_seen
-        && (trace_version < 13 || cache_mode_seen);
-    if (parse_ok) {
-        *hash = trace_response_key_hash(method, scratch->request_key,
-                                        cache_mode);
-    }
-    scratch->request_key[0] = '\0';
-    return parse_ok;
-}
-#endif
 
 /* Route ranking reads the fields needed to choose a record and rejects the
    impossible successful/failure-state combination before assigning a rank.
@@ -2132,6 +2340,344 @@ static bool trace_response_key_descriptor(
     return valid;
 }
 
+/* ---- Media replay: record selection --------------------------------------
+   A media request (a video/audio destination, or any request of the replay
+   transport lane in trace_media_lane.inc) reads stream records
+   as reusable data rather than as an ordered conversation: a player re-reads
+   a playlist, re-requests windows after a seek and retries a segment, and a
+   recording may hold the same URL twice (the page's own XHR of a playlist and
+   the recorder's copy). Among successful records for the request key it takes
+   the latest whose stored span holds the first requested byte, then the
+   latest at all; it never claims a record away. Failing records answer only
+   when no successful one exists, as for other requests.
+
+   With no record for the exact URL, two aliases are tried, in order:
+   - the recorded effective URL (the request follows a redirect the recording
+     followed, e.g. the single-hop lane after its synthesized redirect);
+   - the same origin and path with a different query, provided every such
+     successful record is for one recorded URL. Stream CDNs sign segment and
+     playlist URLs with per-session query tokens; a page replay normally
+     reproduces the signed URL (its JSON is replayed), and this catches the
+     rest. Path tokens are not aliased, and a query `range=` (a URL-encoded
+     window) never is: a different window must not alias another's bytes. */
+static uint64_t trace_media_path_hash(const char *method, const char *url,
+                                      FetchCacheMode cache_mode)
+{
+    uint64_t hash = UINT64_C(1469598103934665603) ^ UINT64_C(0x6d);
+    hash = trace_hash_bytes(hash, method, strlen(method));
+    hash = trace_hash_bytes(hash, "\n", 1);
+    hash = trace_hash_bytes(hash, url, strcspn(url, "?#"));
+    hash ^= (unsigned) cache_mode;
+    hash *= UINT64_C(1099511628211);
+    return hash;
+}
+
+static bool trace_media_query_alias_allowed(const char *url)
+{
+    const char *query = strchr(url, '?');
+    if (query == NULL) return false;
+    for (const char *at = query; at != NULL; at = strchr(at + 1, '&')) {
+        if (strncasecmp(at + 1, "range=", 6) == 0) return false;
+    }
+    return true;
+}
+
+static bool trace_replay_media_request(const FetchRequest *request)
+{
+    if (fetch_trace.replay_media_lane_call) return true;
+    const char *destination = request == NULL ? NULL : request->sec_fetch_dest;
+    return destination != NULL
+        && (strcasecmp(destination, "video") == 0
+            || strcasecmp(destination, "audio") == 0);
+}
+
+/* One metadata pass for every route-index field. Keys and descriptors keep
+   the exact validity rules of trace_record_request_key_hash() and
+   trace_response_key_descriptor(). */
+static bool trace_record_index_entry(size_t sequence,
+                                     TraceReplayScratch *scratch,
+                                     TraceReplayRouteIndexEntry *entry)
+{
+    *entry = (TraceReplayRouteIndexEntry) {0};
+    if (!trace_path(scratch->meta_path, sizeof(scratch->meta_path),
+                    sequence, "meta")) return false;
+    uint64_t meta_started_ns = tilefinch_platform_monotonic_time_ns();
+    FILE *meta = fopen(scratch->meta_path, "rb");
+    if (meta == NULL) return false;
+    char method[16] = {0};
+    char content_range[128] = {0};
+    unsigned trace_version = 0;
+    FetchCacheMode cache_mode = FETCH_CACHE_DEFAULT;
+    bool version_seen = false, cache_mode_seen = false;
+    bool extra_shape_seen = false, method_seen = false, url_seen = false;
+    bool key_ok = true;
+    bool success = false, success_seen = false, status_seen = false;
+    bool external_cancel = false, external_cancel_seen = false;
+    bool timeout = false, timeout_seen = false, descriptor_ok = true;
+    size_t status = 0, length = 0;
+    bool length_seen = false;
+    scratch->request_key[0] = '\0';
+    scratch->recorded_url[0] = '\0';
+    unsigned checkpoint_lines = 0;
+    while (fgets(scratch->line, sizeof(scratch->line), meta) != NULL) {
+        trace_replay_prepare_checkpoint(&checkpoint_lines);
+        size_t line_length = strlen(scratch->line);
+        while (line_length != 0
+               && (scratch->line[line_length - 1] == '\n'
+                   || scratch->line[line_length - 1] == '\r')) {
+            scratch->line[--line_length] = '\0';
+        }
+        char *equals = strchr(scratch->line, '=');
+        if (equals == NULL) continue;
+        *equals++ = '\0';
+        const char *name = scratch->line;
+        if (strcmp(name, "psp-http-trace") == 0) {
+            size_t parsed = 0;
+            bool field_ok = !version_seen
+                && trace_parse_size_value(equals, &parsed)
+                && parsed >= 1 && parsed <= 13;
+            if (field_ok) trace_version = (unsigned) parsed;
+            version_seen = true;
+            key_ok = key_ok && field_ok;
+        } else if (strcmp(name, "method") == 0) {
+            bool field_ok = !method_seen && strlen(equals) < sizeof(method);
+            if (field_ok) snprintf(method, sizeof(method), "%s", equals);
+            method_seen = true;
+            key_ok = key_ok && field_ok;
+        } else if (strcmp(name, "url") == 0) {
+            bool field_ok = !url_seen
+                && strlen(equals) < sizeof(scratch->request_key);
+            if (field_ok) {
+                snprintf(scratch->request_key, sizeof(scratch->request_key),
+                         "%s", equals);
+            }
+            url_seen = true;
+            key_ok = key_ok && field_ok;
+        } else if (strcmp(name, "request-extra-header-shape") == 0) {
+            bool field_ok = !extra_shape_seen;
+            if (field_ok) {
+                cache_mode_seen = trace_cache_mode_from_header_shape(
+                    equals, &cache_mode);
+            }
+            extra_shape_seen = true;
+            key_ok = key_ok && field_ok;
+        } else if (strcmp(name, "success") == 0) {
+            int parsed = 0;
+            descriptor_ok = descriptor_ok && !success_seen
+                && trace_parse_bool_value(equals, &parsed);
+            success = parsed != 0;
+            success_seen = true;
+        } else if (strcmp(name, "status") == 0) {
+            descriptor_ok = descriptor_ok && !status_seen
+                && trace_parse_size_value(equals, &status)
+                && status <= (size_t) LONG_MAX
+                && (status == 0 || (status >= 100 && status <= 599));
+            status_seen = true;
+        } else if (strcmp(name, "external-cancel") == 0) {
+            int parsed = 0;
+            descriptor_ok = descriptor_ok && !external_cancel_seen
+                && trace_parse_bool_value(equals, &parsed);
+            external_cancel = parsed != 0;
+            external_cancel_seen = true;
+        } else if (strcmp(name, "transport-timeout") == 0) {
+            int parsed = 0;
+            descriptor_ok = descriptor_ok && !timeout_seen
+                && trace_parse_bool_value(equals, &parsed);
+            timeout = parsed != 0;
+            timeout_seen = true;
+        } else if (strcmp(name, "length") == 0) {
+            length_seen = trace_parse_size_value(equals, &length);
+        } else if (strcmp(name, "effective-url") == 0) {
+            if (strlen(equals) < sizeof(scratch->recorded_url)) {
+                snprintf(scratch->recorded_url, sizeof(scratch->recorded_url),
+                         "%s", equals);
+            }
+        } else if (strncmp(name, "response-header-", 16) == 0
+                   && strncasecmp(equals, "content-range:", 14) == 0) {
+            const char *value = equals + 14;
+            while (*value == ' ' || *value == '\t') value++;
+            snprintf(content_range, sizeof(content_range), "%s", value);
+        }
+    }
+    bool meta_ok = !ferror(meta);
+    if (fclose(meta) != 0) meta_ok = false;
+    TRACE_REPLAY_IO_OPEN(meta_started_ns);
+    entry->key_valid = meta_ok && key_ok && version_seen && method_seen
+        && url_seen && (trace_version < 13 || cache_mode_seen);
+    if (!entry->key_valid) return true;
+    entry->key_hash = trace_response_key_hash(
+        method, scratch->request_key, cache_mode);
+    entry->path_hash = trace_media_path_hash(
+        method, scratch->request_key, cache_mode);
+    entry->descriptor_valid = descriptor_ok && success_seen && status_seen
+        && !(success && (status == 0 || external_cancel || timeout));
+    if (entry->descriptor_valid) {
+        entry->rank = success && status != 0 ? 2 : (status != 0 ? 1 : 0);
+    }
+    if (scratch->recorded_url[0] != '\0'
+        && tilefinch_url_request_key(scratch->recorded_url,
+                                     scratch->logical_url,
+                                     sizeof(scratch->logical_url))) {
+        entry->effective_hash = trace_response_key_hash(
+            method, scratch->logical_url, cache_mode);
+    }
+    TraceReplaySpan span;
+    if (entry->rank == 2 && length_seen
+        && trace_status_span((long) status,
+                             content_range[0] == '\0' ? NULL : content_range,
+                             length, &span)
+        && span.end <= UINT32_MAX) {
+        entry->span_valid = true;
+        entry->span_start = (uint32_t) span.start;
+        entry->span_end = (uint32_t) span.end;
+    }
+    scratch->request_key[0] = '\0';
+    scratch->recorded_url[0] = '\0';
+    return true;
+}
+
+/* How many requested bytes ENTRY's stored span holds from the first
+   requested one (zero when it does not hold that byte). A request without
+   Range asks for the whole body. A suffix window needs the resource
+   length, which only the serving path knows: any span may answer it. */
+static uint64_t trace_media_entry_coverage(
+    const TraceReplayRouteIndexEntry *entry, const TraceReplayRange *range)
+{
+    if (entry->rank != 2 || !entry->span_valid) return 0;
+    if (range->present && range->suffix) return 1;
+    uint64_t first = range->present ? range->first : 0;
+    uint64_t stop = range->present && range->last != UINT64_MAX
+        ? range->last + 1u : UINT64_MAX;
+    if (first < entry->span_start || first >= entry->span_end) return 0;
+    if (stop > entry->span_end) stop = entry->span_end;
+    return stop - first;
+}
+
+typedef struct {
+    size_t sequence;
+    bool found;
+    /* Served under its recorded URL: an effective-URL or query alias. */
+    bool alias;
+} TraceMediaSelection;
+
+typedef struct {
+    size_t sequence;
+    int rank;
+    uint64_t coverage;
+} TraceMediaCandidate;
+
+/* Higher rank, then more of the requested bytes, then the later record. */
+static void trace_media_candidate_offer(TraceMediaCandidate *best,
+                                        size_t sequence, int rank,
+                                        uint64_t coverage)
+{
+    if (best->sequence == SIZE_MAX || rank > best->rank
+        || (rank == best->rank && coverage >= best->coverage)) {
+        *best = (TraceMediaCandidate) {
+            .sequence = sequence, .rank = rank, .coverage = coverage
+        };
+    }
+}
+
+static bool trace_media_key_select(
+    const char *method, const char *url, const FetchRequest *request,
+    FetchCacheMode cache_mode, TraceReplayScratch *scratch,
+    FetchResult *result, TraceMediaSelection *selection)
+{
+    *selection = (TraceMediaSelection) {.sequence = SIZE_MAX};
+    TraceReplayRange range;
+    trace_request_range(request, &range);
+    bool indexed = fetch_trace.replay_route_index != NULL
+        && fetch_trace.replay_route_index_count
+           == fetch_trace.replay_record_count;
+    uint64_t key = trace_response_key_hash(method, url, cache_mode);
+    uint64_t path = trace_media_path_hash(method, url, cache_mode);
+    bool query_alias = trace_media_query_alias_allowed(url);
+    TraceMediaCandidate exact = {.sequence = SIZE_MAX, .rank = -1};
+    TraceMediaCandidate effective = exact, alias = exact;
+    uint64_t alias_key = 0;
+    bool alias_ambiguous = false;
+    for (size_t sequence = 0;
+         sequence < fetch_trace.replay_record_count; sequence++) {
+        TraceReplayRouteIndexEntry local;
+        const TraceReplayRouteIndexEntry *entry = indexed
+            ? &fetch_trace.replay_route_index[sequence] : &local;
+        if (!indexed && !trace_record_index_entry(sequence, scratch, &local))
+            local.key_valid = false;
+        if (!entry->key_valid
+            || (entry->key_hash == key && !entry->descriptor_valid)) {
+            fetch_trace.replay_invalid_route_request_count++;
+            snprintf(result->error, sizeof(result->error),
+                     "HTTP response-keyed replay record %zu metadata is corrupt",
+                     sequence);
+            return false;
+        }
+        if (!entry->descriptor_valid) continue;
+        uint64_t coverage = trace_media_entry_coverage(entry, &range);
+        if (entry->key_hash == key) {
+            trace_media_candidate_offer(&exact, sequence, entry->rank,
+                                        coverage);
+        } else if (coverage == 0) {
+            continue;
+        } else if (entry->effective_hash == key) {
+            trace_media_candidate_offer(&effective, sequence, 2, coverage);
+        } else if (query_alias && entry->path_hash == path) {
+            if (alias.sequence != SIZE_MAX && entry->key_hash != alias_key)
+                alias_ambiguous = true;
+            alias_key = entry->key_hash;
+            trace_media_candidate_offer(&alias, sequence, 2, coverage);
+        }
+    }
+    if (exact.sequence != SIZE_MAX) {
+        selection->sequence = exact.sequence;
+    } else if (effective.sequence != SIZE_MAX) {
+        selection->sequence = effective.sequence;
+        selection->alias = true;
+    } else if (alias.sequence != SIZE_MAX && !alias_ambiguous) {
+        selection->sequence = alias.sequence;
+        selection->alias = true;
+    } else {
+        if (alias_ambiguous) {
+            trace_replay_decision(
+                "HTTP media replay ambiguous query alias url=%.420s", url);
+        }
+        return true;
+    }
+    selection->found = true;
+    return true;
+}
+
+/* The recorded request URL and logical URL of SEQUENCE, for serving an
+   aliased media record under its own identity. */
+static bool trace_record_request_urls(size_t sequence,
+                                      TraceReplayScratch *scratch,
+                                      char *url, char *logical_url,
+                                      size_t capacity)
+{
+    url[0] = '\0';
+    logical_url[0] = '\0';
+    if (!trace_path(scratch->meta_path, sizeof(scratch->meta_path),
+                    sequence, "meta")) return false;
+    uint64_t meta_started_ns = tilefinch_platform_monotonic_time_ns();
+    FILE *meta = fopen(scratch->meta_path, "rb");
+    if (meta == NULL) return false;
+    unsigned checkpoint_lines = 0;
+    while (fgets(scratch->line, sizeof(scratch->line), meta) != NULL) {
+        trace_replay_prepare_checkpoint(&checkpoint_lines);
+        scratch->line[strcspn(scratch->line, "\r\n")] = '\0';
+        if (strncmp(scratch->line, "url=", 4) == 0)
+            snprintf(url, capacity, "%s", scratch->line + 4);
+        else if (strncmp(scratch->line, "logical-request-url=", 20) == 0)
+            snprintf(logical_url, capacity, "%s", scratch->line + 20);
+    }
+    bool ok = !ferror(meta);
+    if (fclose(meta) != 0) ok = false;
+    TRACE_REPLAY_IO_OPEN(meta_started_ns);
+    /* Both buffers have `capacity` bytes and url already fits. */
+    if (logical_url[0] == '\0') memcpy(logical_url, url, strlen(url) + 1u);
+    return ok && url[0] != '\0';
+}
+
 #ifndef TILEFINCH_NO_FETCH_TRACE
 static void trace_response_key_index_build(void)
 {
@@ -2158,18 +2704,8 @@ static void trace_response_key_index_build(void)
     }
 #endif
     for (size_t sequence = 0; sequence < count; sequence++) {
-        TraceResponseKeyDescriptor descriptor;
-        uint64_t key_hash = 0;
-        index[sequence].key_valid = trace_record_request_key_hash(
-            sequence, scratch, &key_hash);
-        if (!index[sequence].key_valid) continue;
-        index[sequence].key_hash = key_hash;
-        index[sequence].descriptor_valid = trace_response_key_descriptor(
-            sequence, scratch, &descriptor);
-        if (!index[sequence].descriptor_valid) continue;
-        index[sequence].rank =
-            descriptor.success && descriptor.status != 0 ? 2
-          : (descriptor.status != 0 ? 1 : 0);
+        if (!trace_record_index_entry(sequence, scratch, &index[sequence]))
+            index[sequence] = (TraceReplayRouteIndexEntry) {0};
     }
 #if !defined(__PSP__)
     free(scratch);
@@ -2339,7 +2875,73 @@ static bool trace_replay_response(Budget *budget, const char *method,
     fetch_trace.replay_request_count++;
     bool ok = false, found = false, terminal_accounted = false;
     size_t matched_sequence = SIZE_MAX;
-    if (fetch_trace.replay_response_keyed) {
+    if (fetch_trace.replay_response_keyed
+        && trace_replay_media_request(request)) {
+        TraceMediaSelection media;
+        fetch_trace.replay_media_served_alias = false;
+        if (!trace_media_key_select(
+                method, canonical_url, request,
+                request == NULL ? FETCH_CACHE_DEFAULT : request->cache_mode,
+                scratch, result, &media)) {
+            terminal_accounted = true;
+        } else if (media.found) {
+            size_t sequence = media.sequence;
+            char *alias_urls = !media.alias ? NULL : budget_malloc(
+                budget, 2u * TILEFINCH_URL_SERIALIZED_LIMIT);
+            const char *served_url = canonical_url;
+            const char *served_logical_url = normalized_logical_url;
+            TraceReplayRecordStatus status = TRACE_REPLAY_RECORD_INVALID;
+            bool rejected = false;
+            if (media.alias
+                && (alias_urls == NULL
+                    || !trace_record_request_urls(
+                           sequence, scratch, alias_urls,
+                           alias_urls + TILEFINCH_URL_SERIALIZED_LIMIT,
+                           TILEFINCH_URL_SERIALIZED_LIMIT))) {
+                ok = false;
+            } else {
+                if (media.alias) {
+                    served_url = alias_urls;
+                    served_logical_url =
+                        alias_urls + TILEFINCH_URL_SERIALIZED_LIMIT;
+                }
+                ok = trace_replay_response_with_scratch(
+                    budget, method, served_url, served_logical_url,
+                    request, effective_user_agent, diagnostic_mobile_safari,
+                    maximum_bytes, result, scratch, writer, sequence, false,
+                    &status, &rejected);
+            }
+            terminal_accounted = true;
+            if (status == TRACE_REPLAY_RECORD_MATCHED && (ok || rejected)) {
+                trace_replay_claim_record(sequence);
+                fetch_trace.replay_matched_request_count++;
+                fetch_trace.replay_reusable_claim_count++;
+                if (media.alias) {
+                    /* The aliased record answers this request as asked. */
+                    fetch_trace.replay_media_alias_count++;
+                    fetch_trace.replay_media_served_alias = true;
+                    snprintf(result->effective_url,
+                             sizeof(result->effective_url), "%s",
+                             canonical_url);
+                }
+                if (rejected) fetch_trace.replay_rejected_request_count++;
+                found = true;
+                matched_sequence = sequence;
+            } else {
+                ok = false;
+                fetch_trace.replay_invalid_route_request_count++;
+                if (result->error[0] == '\0') {
+                    snprintf(result->error, sizeof(result->error),
+                             "HTTP media replay record %zu could not be "
+                             "served", sequence);
+                }
+                trace_replay_decision(
+                    "HTTP media replay invalid record=%zu url=%.300s "
+                    "error=%.120s", sequence, canonical_url, result->error);
+            }
+            budget_free(budget, alias_urls);
+        }
+    } else if (fetch_trace.replay_response_keyed) {
         TraceResponseKeySelection selection;
         bool selected = trace_response_key_select(
             method, canonical_url, request,

@@ -1865,7 +1865,8 @@ static bool audio_slots_initialize(ScriptRuntime *host)
     if (okay) {
         JSValue code = JS_ReadObject(ctx, browser_bootstrap_game_audio_slots_bytecode.data,
                                      browser_bootstrap_game_audio_slots_bytecode.bytecode_length,
-                                     JS_READ_OBJ_BYTECODE | JS_READ_OBJ_ROM_DATA);
+                                     JS_READ_OBJ_BYTECODE | JS_READ_OBJ_ROM_DATA |
+                                         JS_READ_OBJ_PLATFORM_METHODS);
         factory = JS_IsException(code) ? code : JS_EvalFunction(ctx, code);
         okay = !JS_IsException(factory) && JS_IsFunction(ctx, factory);
     }

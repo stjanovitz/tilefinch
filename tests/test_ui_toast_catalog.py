@@ -81,7 +81,7 @@ SOURCES = ("src/psp_app/*.c", "src/psp_script_main.c", "src/psp_ui.c",
            "src/psp_media_open.c", "src/psp_media_seek.c",
            "src/psp_update_session.c", "src/update_client.c",
            "src/update_installer.c", "src/psp_ui_language_repair.c",
-           "src/psp_ui_settings.c")
+           "src/psp_ui_settings.c", "src/media_failure_message.c")
 
 # Functions whose returned literals the caller shows as a toast.
 STATUS_RETURNS = ("psp_offline_store_route_cancel_status",
@@ -90,7 +90,10 @@ STATUS_RETURNS = ("psp_offline_store_route_cancel_status",
                   "glyph_begin_check",
                   # The acknowledgement shown before an action is dispatched
                   # (psp_present_action_ack).
-                  "psp_ui_action_acknowledgement")
+                  "psp_ui_action_acknowledgement",
+                  # The failed-video panel's headline and details line for
+                  # a failure psp_media_raise_error recognises.
+                  "media_failure_headline", "media_failure_detail_text")
 
 # An installer job's message: a font-pack install started from the page's
 # language-pack offer shows it as a toast when the install fails or is
@@ -484,6 +487,20 @@ class UiToastCatalogTests(unittest.TestCase):
                     "STABLE CHANNEL - SIGNED", "STARTING VIDEO",
                     "VIDEO DECODER NEEDS APP RESTART", "Restarting decoder",
                     "NETWORK NOT READY FOR FONT PACK"):
+            self.assertIn(key, toasts)
+        # The failed-video panel's headline and details for a video the
+        # PSP cannot play (media_failure_message.c).
+        for key in ("OPTIONAL VIDEO DECODER NEEDED",
+                    "Install it for low res. See README",
+                    "VIDEO DECODER COULDN'T START", "Not enough memory",
+                    "Files missing. See README",
+                    "PSP CAN'T PLAY THIS VIDEO FORMAT",
+                    "Uses a B-frame pyramid", "Uses over 3 reference frames",
+                    "PSP decoder refused its pictures",
+                    "High profile, over 432x240", "Unsupported H.264 profile",
+                    "Picture size too large", "No supported codec",
+                    "VIDEO SOURCE COULD NOT OPEN",
+                    "STREAM OFFLINE OR NOT AVAILABLE"):
             self.assertIn(key, toasts)
         # A plain on/off setting's confirmations, from its descriptor.
         for key in ("URL HISTORY ON", "URL HISTORY OFF", "ROTATE HINT AUTO",

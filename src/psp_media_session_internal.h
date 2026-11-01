@@ -49,6 +49,10 @@ uint64_t psp_media_recovery_position_us(
     const PspMediaSession *media);
 void psp_media_remember_retry_state(
     PspMediaSession *media, bool resume_playing);
+void psp_media_request_user_retry(PspMediaSession *media);
+void psp_media_request_track_reopen(PspMediaSession *media);
+void psp_media_clear_resolved_stream(PspMediaSession *media);
+bool psp_media_prepare_open_network(PspMediaSession *media, bool begin);
 void psp_media_job_failed(
     PspMediaSession *media, const char *operation, const char *error);
 void psp_media_report_failure_snapshot(
@@ -61,6 +65,10 @@ bool psp_media_retry_transport(
 bool psp_media_retry_delivery_failure(
     PspMediaSession *media, const char *operation, const char *error,
     bool delivery_candidate_rejected);
+/* Opens the page's next video rendition when error says the current one
+   cannot work on this device (media_candidate_refused). */
+bool psp_media_retry_page_candidate(
+    PspMediaSession *media, const char *error);
 bool psp_media_retry_240p(
     PspMediaSession *media, const char *operation, const char *error,
     bool delivery_candidate_rejected);
@@ -88,6 +96,26 @@ void psp_media_buffering_update(
     uint64_t now_us);
 void psp_media_present_release_claimed_surface(PspMediaSession *media);
 void psp_media_present_emit_after_release(PspMediaSession *media);
+
+/* Shared with the host scrub regression: preview admission must synchronize
+   the retained decoder as well as the UI's bounded target marker. */
+static inline void psp_media_begin_preview(
+    PspMediaSession *media, uint64_t target_us, bool resume_playing)
+{
+    if (psp_media_scrub_begin(&media->scrub, resume_playing))
+        media->job_restore_us = media->clock_us;
+    /* Submission blocking alone leaves already-queued audio running while
+       the UI clock is frozen. Cancel restores scrub.was_playing; committing
+       a seek keeps the backend paused until its normal completion. */
+    if (media->playback != NULL)
+        media_playback_set_playing(media->playback, false);
+    if (!media->machine.preview_active) {
+        psp_media_session_dispatch_event(media, (PspMediaEvent) {
+            .type = PSP_MEDIA_EVENT_PREVIEW_STARTED
+        }, "preview-started");
+    }
+    psp_ui_media_set_seek_preview(&media->ui, target_us);
+}
 
 /* Validation/reporting is deliberately separate from lifecycle authority.
    These functions sample an already-owned session and never mutate playback

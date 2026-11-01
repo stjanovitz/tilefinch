@@ -15,6 +15,10 @@ _Noreturn void psp_boot_module_exec_fallback(const char *path);
 /* Present only in the relocatable browser; the static diagnostic EBOOT has
    no module receipt. Reports after the browser has opened its usual log. */
 void psp_boot_module_report(void) __attribute__((weak));
+/* The launcher handoff, before newlib starts (psp_heap_reserve.c). It may
+   drop the handoff's own last argument from argv and *argc. */
+void psp_boot_module_before_libc(int *argc, char **argv)
+    __attribute__((weak));
 #endif
 
 #endif

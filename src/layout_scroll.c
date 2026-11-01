@@ -503,27 +503,67 @@ bool layout_scroll_node_settle(LayoutDocument *layout, lxb_dom_node_t *node)
         || old_y != container_box->scroll_y;
 }
 
-bool layout_scroll_node_reveal(LayoutDocument *layout,
-                               lxb_dom_node_t *node)
+/* A box whose scroll offset can move its content: it clips an axis that
+   overflows. layout_scroll_node clamps every other box to zero. */
+static bool scroll_box_scrollable(const LayoutNodeBox *box)
+{
+    return (box->clips_x && !box->clip_only_x
+            && box->content_width > box->client_width)
+        || (box->clips_y && !box->clip_only_y
+            && box->content_height > box->client_height);
+}
+
+/* How many ancestors above a positioned box lie below its containing block.
+   Paint leaves those clips (and so their scroll offsets) to the escaping
+   content (layout_positioned_command_escapes_clip). */
+static unsigned scroll_escape_span(const LayoutNodeBox *box)
+{
+    if (box == NULL || box->positioned_ancestor_distance == 0) return 0;
+    if (box->positioned_ancestor_distance == UINT8_MAX) return UINT_MAX;
+    return box->positioned_ancestor_distance - 1u;
+}
+
+enum { SCROLL_ANCESTOR_LIMIT = 256 };
+
+bool layout_scroll_rect_reveal(LayoutDocument *layout, lxb_dom_node_t *node,
+                               int x, int y, int width, int height)
 {
     if (layout == NULL || node == NULL) return false;
     const LayoutNodeBox *target = layout_box_for_node(layout, node);
-    if (target == NULL) return false;
+    unsigned skip = scroll_escape_span(target);
     bool changed = false;
-    /* Inner containers must move first. The retained boxes are authored
-       geometry, while scroll_x/y is a presentation offset, so the same
-       target coordinates remain valid as each ancestor is adjusted. */
-    for (lxb_dom_node_t *at = node->parent; at != NULL; at = at->parent) {
+    /* Inner containers move first, as scrollIntoView({block:"nearest"})
+       does. The rect is authored geometry while scroll_x/y is a
+       presentation offset, so each outer container sees the target where
+       the containers inside it (already adjusted) now present it. */
+    int inner_dx = 0, inner_dy = 0;
+    unsigned steps = 0;
+    for (lxb_dom_node_t *at = node->parent;
+         at != NULL && steps < SCROLL_ANCESTOR_LIMIT;
+         at = at->parent, steps++) {
         size_t box_index = scroll_box_index(layout, at);
-        int container_index = box_index == SIZE_MAX ? -1
-            : scroll_container_index_for_box(layout, box_index);
-        if (container_index < 0) continue;
+        LayoutNodeBox *box = box_index == SIZE_MAX
+            ? NULL : &layout->node_boxes[box_index];
+        bool escaped = skip != 0;
+        if (escaped) skip--;
+        unsigned span = scroll_escape_span(box);
+        if (span > skip) skip = span;
+        if (escaped || box == NULL) continue;
+        int container_index =
+            scroll_container_index_for_box(layout, box_index);
+        if (container_index < 0) {
+            /* Past the bounded container table: still presents the target
+               where its own offset puts it. */
+            inner_dx -= box->scroll_x;
+            inner_dy -= box->scroll_y;
+            continue;
+        }
         LayoutScrollContainer *container =
             &layout->scroll_containers[container_index];
-        LayoutNodeBox *box = &layout->node_boxes[box_index];
         int margin_top = 0, margin_right = 0;
         int margin_bottom = 0, margin_left = 0;
-        for (size_t i = 0; i < layout->scroll_snap_candidate_count; i++) {
+        for (size_t i = 0; target != NULL
+                 && i < layout->scroll_snap_candidate_count; i++) {
             const LayoutScrollSnapCandidate *candidate =
                 &layout->scroll_snap_candidates[i];
             if (candidate->container_index == (uint16_t) container_index
@@ -536,35 +576,176 @@ bool layout_scroll_node_reveal(LayoutDocument *layout,
                 break;
             }
         }
-        int x = box->scroll_x, y = box->scroll_y;
-        int target_left = target->x - box->x - margin_left;
-        int target_right = target->x - box->x + target->width + margin_right;
-        int target_top = target->y - box->y - margin_top;
-        int target_bottom =
-            target->y - box->y + target->height + margin_bottom;
-        int visible_left = x + container->padding_left;
-        int visible_right = x + box->client_width
+        int sx = box->scroll_x, sy = box->scroll_y;
+        int left = x + inner_dx - box->x;
+        int top = y + inner_dy - box->y;
+        int target_left = left - margin_left;
+        int target_right = left + width + margin_right;
+        int target_top = top - margin_top;
+        int target_bottom = top + height + margin_bottom;
+        int visible_left = sx + container->padding_left;
+        int visible_right = sx + box->client_width
             - container->padding_right;
-        int visible_top = y + container->padding_top;
-        int visible_bottom = y + box->client_height
+        int visible_top = sy + container->padding_top;
+        int visible_bottom = sy + box->client_height
             - container->padding_bottom;
         if (target_left < visible_left) {
-            x = target_left - container->padding_left;
+            sx = target_left - container->padding_left;
         } else if (target_right > visible_right) {
-            x = target_right - box->client_width
+            sx = target_right - box->client_width
                 + container->padding_right;
         }
         if (target_top < visible_top) {
-            y = target_top - container->padding_top;
+            sy = target_top - container->padding_top;
         } else if (target_bottom > visible_bottom) {
-            y = target_bottom - box->client_height
+            sy = target_bottom - box->client_height
                 + container->padding_bottom;
         }
         int old_x = box->scroll_x, old_y = box->scroll_y;
-        (void) layout_scroll_node(layout, box->node, x, y);
+        (void) layout_scroll_node(layout, box->node, sx, sy);
         changed |= box->scroll_x != old_x || box->scroll_y != old_y;
+        inner_dx -= box->scroll_x;
+        inner_dy -= box->scroll_y;
     }
     return changed;
+}
+
+bool layout_scroll_node_reveal(LayoutDocument *layout,
+                               lxb_dom_node_t *node)
+{
+    if (layout == NULL || node == NULL) return false;
+    const LayoutNodeBox *target = layout_box_for_node(layout, node);
+    if (target == NULL) return false;
+    return layout_scroll_rect_reveal(layout, node, target->x, target->y,
+                                     target->width, target->height);
+}
+
+void layout_scroll_placement_prepare(const LayoutDocument *layout,
+                                     LayoutScrollPlacementIndex *index)
+{
+    if (index == NULL) return;
+    memset(index, 0, sizeof(*index));
+    if (layout == NULL) return;
+    index->layout = layout;
+    index->node_box_count = layout->node_box_count;
+    index->complete = true;
+    for (size_t i = 0; i < layout->node_box_count; i++) {
+        const LayoutNodeBox *box = &layout->node_boxes[i];
+        if (box->node == NULL || !scroll_box_scrollable(box)) continue;
+        if (index->count == LAYOUT_SCROLL_PLACEMENT_INDEX_LIMIT) {
+            index->complete = false;
+            return;
+        }
+        index->containers[index->count++] = box->node;
+    }
+}
+
+enum { SCROLL_PLACEMENT_CLIP_LIMIT = 16 };
+
+static bool scroll_placement_walk(const LayoutDocument *layout,
+                                  const lxb_dom_node_t *node,
+                                  bool overflow_clips,
+                                  LayoutScrollPlacement *placement)
+{
+    struct {
+        const LayoutNodeBox *box;
+        int dx, dy; /* offsets through this container */
+    } applied[SCROLL_PLACEMENT_CLIP_LIMIT];
+    size_t applied_count = 0;
+    bool enclosed = false;
+    int dx = 0, dy = 0;
+    unsigned skip = scroll_escape_span(layout_box_for_node(layout, node));
+    unsigned steps = 0;
+    for (const lxb_dom_node_t *at = node->parent;
+         at != NULL && steps < SCROLL_ANCESTOR_LIMIT;
+         at = at->parent, steps++) {
+        const LayoutNodeBox *box = layout_box_for_node(layout, at);
+        bool escaped = skip != 0;
+        if (escaped) skip--;
+        unsigned span = scroll_escape_span(box);
+        if (span > skip) skip = span;
+        if (escaped || box == NULL) continue;
+        /* Only a scrollable box carries an offset (layout_scroll_node
+           clamps the rest to zero), so overflow clips add clips only. */
+        if (overflow_clips ? !box->clips_x && !box->clips_y
+                           : !scroll_box_scrollable(box)) continue;
+        enclosed = true;
+        dx -= box->scroll_x;
+        dy -= box->scroll_y;
+        if (applied_count < SCROLL_PLACEMENT_CLIP_LIMIT) {
+            applied[applied_count].box = box;
+            applied[applied_count].dx = dx;
+            applied[applied_count].dy = dy;
+            applied_count++;
+        }
+    }
+    placement->dx = dx;
+    placement->dy = dy;
+    for (size_t i = 0; i < applied_count; i++) {
+        const LayoutNodeBox *box = applied[i].box;
+        /* A container moves with the containers outside it: everything
+           accumulated after its own offset. */
+        int left, top, right, bottom;
+        layout_node_box_clip_rect(
+            box, box->x + (dx - applied[i].dx), box->y + (dy - applied[i].dy),
+            &left, &top, &right, &bottom);
+        if (box->clips_x) {
+            placement->clipped_x = true;
+            if (left > placement->clip_left) placement->clip_left = left;
+            if (right < placement->clip_right) placement->clip_right = right;
+        }
+        if (box->clips_y) {
+            placement->clipped_y = true;
+            if (top > placement->clip_top) placement->clip_top = top;
+            if (bottom < placement->clip_bottom)
+                placement->clip_bottom = bottom;
+        }
+    }
+    return enclosed;
+}
+
+bool layout_node_scroll_placement(const LayoutDocument *layout,
+                                  const LayoutScrollPlacementIndex *index,
+                                  const lxb_dom_node_t *node,
+                                  LayoutScrollPlacement *placement)
+{
+    if (placement == NULL) return false;
+    *placement = (LayoutScrollPlacement) {
+        .clip_left = INT_MIN / 2, .clip_top = INT_MIN / 2,
+        .clip_right = INT_MAX / 2, .clip_bottom = INT_MAX / 2
+    };
+    if (layout == NULL || node == NULL) return false;
+    if (index != NULL && index->layout == layout && index->complete
+        && index->node_box_count == layout->node_box_count) {
+        /* Most regions lie in no scroll container: prove that with
+           pointer comparisons before any box lookup. */
+        bool enclosed = false;
+        unsigned steps = 0;
+        for (const lxb_dom_node_t *at = node->parent;
+             at != NULL && !enclosed && steps < SCROLL_ANCESTOR_LIMIT;
+             at = at->parent, steps++) {
+            for (size_t i = 0; i < index->count; i++) {
+                if (index->containers[i] != at) continue;
+                enclosed = true;
+                break;
+            }
+        }
+        if (!enclosed) return false;
+    }
+    return scroll_placement_walk(layout, node, false, placement);
+}
+
+bool layout_node_overflow_placement(const LayoutDocument *layout,
+                                    const lxb_dom_node_t *node,
+                                    LayoutScrollPlacement *placement)
+{
+    if (placement == NULL) return false;
+    *placement = (LayoutScrollPlacement) {
+        .clip_left = INT_MIN / 2, .clip_top = INT_MIN / 2,
+        .clip_right = INT_MAX / 2, .clip_bottom = INT_MAX / 2
+    };
+    if (layout == NULL || node == NULL) return false;
+    return scroll_placement_walk(layout, node, true, placement);
 }
 
 LayoutCursor layout_cursor_for_node(const Stylesheet *stylesheet,

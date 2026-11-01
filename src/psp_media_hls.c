@@ -4,9 +4,11 @@
 #include <string.h>
 
 #include "tilefinch/fetch.h"
+#include "tilefinch/media_worker_request.h"
 #include "tilefinch/navigation.h"
 #include "tilefinch/user_agent.h"
 #include "tilefinch/url.h"
+#include "tilefinch/psp_log.h"
 
 #include "psp_media_hls_policy.h"
 #include "psp_hls_gzip.h"
@@ -18,11 +20,18 @@
 #define PSP_HLS_PLAYLIST_WIRE_CHUNK_BYTES MEDIA_HLS_TRANSPORT_CHUNK_BYTES
 
 typedef struct {
+    /* Stable for the logical request; the HLS core and the playlist pump
+       hold it. Each hop of a page request is a new worker request. */
+    uint64_t handle;
+    /* The current hop's worker request; zero while a followed redirect
+       waits for a worker descriptor. */
     uint64_t background_id;
     size_t consumed;
+    size_t maximum_bytes;
+    size_t publication_bytes;
     bool headers_admitted;
     bool raw_gzip;
-    char url[NAVIGATION_URL_LIMIT];
+    MediaWorkerHop hop;
 } PspHlsRequest;
 
 typedef enum {
@@ -34,8 +43,17 @@ typedef enum {
 struct PspMediaHlsContext {
     Budget *budget;
     BrowserSession *session;
+    void *memory_context;
+    bool (*make_room)(void *, size_t, unsigned *);
+    unsigned memory_stage;
     TilefinchRequestMode mode;
     TilefinchCredentialsMode credentials;
+    /* The page's CSP (NULL when it sent none or for provider streams). */
+    const TilefinchContentSecurityPolicy *content_security_policy;
+    /* Page media follows redirects across origins one admitted hop at a
+       time; provider streams keep the worker's fixed-origin rule. */
+    bool page_redirects;
+    uint64_t next_handle;
     char document_url[NAVIGATION_URL_LIMIT];
     char playlist_url[PSP_HLS_SOURCE_LIMIT][NAVIGATION_URL_LIMIT];
     unsigned char *playlist_chunk;
@@ -59,6 +77,11 @@ struct PspMediaHlsContext {
     PspHlsPlaylistEncoding playlist_encoding;
     PspHlsRequest requests[PSP_HLS_REQUEST_LIMIT];
     bool failed;
+    /* Variants that declare no AVC profile keep the software bound. */
+    PspMediaHlsSelectionBound selection_bound;
+    /* The chosen variant exceeds the software bound on an undeclared
+       profile; its SPS decides. */
+    bool selection_unverified;
     char error[192];
 };
 
@@ -107,21 +130,87 @@ static void psp_hls_destroy_playlist_stream(PspMediaHlsContext *context)
 }
 
 static PspHlsRequest *psp_hls_request(
-    PspMediaHlsContext *context, uint64_t id)
+    PspMediaHlsContext *context, uint64_t handle)
 {
-    if (context == NULL || id == 0) return NULL;
+    if (context == NULL || handle == 0) return NULL;
     for (size_t i = 0; i < PSP_HLS_REQUEST_LIMIT; i++)
-        if (context->requests[i].background_id == id)
+        if (context->requests[i].handle == handle)
             return &context->requests[i];
     return NULL;
 }
 
-static bool psp_hls_redirect_url_supported(const char *value)
+static MediaWorkerAuthority psp_hls_authority(
+    const PspMediaHlsContext *context)
 {
-    TilefinchUrl url;
-    return tilefinch_url_parse(value, &url)
-        && (url.scheme == TILEFINCH_URL_SCHEME_HTTP
-            || url.scheme == TILEFINCH_URL_SCHEME_HTTPS);
+    return (MediaWorkerAuthority) {
+        .session = context->session,
+        .document_url = context->document_url,
+        .mode = context->mode,
+        .credentials = context->credentials,
+        .content_security_policy = context->content_security_policy,
+        .page_redirects = context->page_redirects
+    };
+}
+
+typedef enum {
+    PSP_HLS_ISSUE_STARTED = 0,
+    /* Worker backpressure: nothing failed, ask again on a later pump. */
+    PSP_HLS_ISSUE_DEFERRED,
+    PSP_HLS_ISSUE_FAILED
+} PspHlsIssueStatus;
+
+/* Issues the worker request for the request's current hop. */
+static PspHlsIssueStatus psp_hls_issue(
+    PspMediaHlsContext *context, PspHlsRequest *request,
+    char *error, size_t error_size)
+{
+    FetchPreparedPageRequest *prepared = budget_malloc_category(
+        context->budget, BUDGET_CATEGORY_NAVIGATION, sizeof(*prepared));
+    if (prepared == NULL) {
+        snprintf(error, error_size, "%s", "HLS request budget refused");
+        return PSP_HLS_ISSUE_FAILED;
+    }
+    FetchRequest transport = {
+        .allow_http_errors = true,
+        .accept = "application/vnd.apple.mpegurl,video/mp2t,video/*;q=0.9,*/*;q=0.5",
+        /* A long live DVR playlist can expand far beyond one publication
+           quantum. Let the browser-owned playlist pump inflate gzip in
+           bounded slices; libcurl must never retain a decoded tail while its
+           worker is paused. Segments call this with raw_gzip=false. */
+        .raw_gzip_encoding = request->raw_gzip,
+        .user_agent = TILEFINCH_BROWSER_USER_AGENT,
+        .connect_timeout_ms = PSP_HLS_CONNECT_TIMEOUT_MS
+    };
+    MediaWorkerAuthority authority = psp_hls_authority(context);
+    FetchRequest stream_request;
+    bool prepared_ok = media_worker_request_prepare(
+        &authority, &request->hop, &transport, prepared, &stream_request);
+    FetchBackgroundEnqueueStatus enqueue_status =
+        FETCH_BACKGROUND_ENQUEUE_UNAVAILABLE;
+    /* A page hop returns its redirect unfollowed so the browser thread can
+       admit the next target (psp_hls_admit_headers). */
+    uint64_t id = !prepared_ok ? 0 : context->page_redirects
+        ? fetch_background_transport_enqueue_media_hop_stream_sized_diagnosed(
+              request->hop.url, &stream_request, request->maximum_bytes,
+              PSP_HLS_TIMEOUT_MS, request->publication_bytes,
+              &enqueue_status)
+        : fetch_background_transport_enqueue_media_stream_sized_diagnosed(
+              request->hop.url, &stream_request, request->maximum_bytes,
+              PSP_HLS_TIMEOUT_MS, request->publication_bytes,
+              &enqueue_status);
+    budget_free(context->budget, prepared);
+    request->background_id = id;
+    request->consumed = 0;
+    request->headers_admitted = false;
+    if (id != 0) return PSP_HLS_ISSUE_STARTED;
+    if (prepared_ok
+        && (enqueue_status == FETCH_BACKGROUND_ENQUEUE_SATURATED
+            || enqueue_status == FETCH_BACKGROUND_ENQUEUE_ADMISSION_CLOSED))
+        return PSP_HLS_ISSUE_DEFERRED;
+    snprintf(error, error_size, "%s",
+             !prepared_ok ? "HLS request authority refused"
+                          : "HLS transport cannot admit request");
+    return PSP_HLS_ISSUE_FAILED;
 }
 
 static uint64_t psp_hls_start_sized(
@@ -134,86 +223,54 @@ static uint64_t psp_hls_start_sized(
         || maximum_bytes > MEDIA_HLS_MAXIMUM_SEGMENT_BYTES) return 0;
     size_t slot = PSP_HLS_REQUEST_LIMIT;
     for (size_t i = 0; i < PSP_HLS_REQUEST_LIMIT; i++)
-        if (context->requests[i].background_id == 0) { slot = i; break; }
+        if (context->requests[i].handle == 0) { slot = i; break; }
     if (slot == PSP_HLS_REQUEST_LIMIT) return 0;
-
-    FetchPreparedPageRequest *prepared = budget_malloc_category(
-        context->budget, BUDGET_CATEGORY_NAVIGATION, sizeof(*prepared));
-    if (prepared == NULL) {
-        snprintf(error, error_size, "%s", "HLS request budget refused");
-        return 0;
-    }
-    TilefinchRequestContext authority = {
-        .target_url = url,
-        .initiator_url = context->document_url,
-        .top_level_url = context->document_url,
-        .method = "GET",
-        .mode = context->mode,
-        .credentials = context->credentials,
-        .destination = TILEFINCH_DESTINATION_MEDIA
-    };
-    FetchRequest transport = {
-        .allow_http_errors = true,
-        .accept = "application/vnd.apple.mpegurl,video/mp2t,video/*;q=0.9,*/*;q=0.5",
-        /* A long live DVR playlist can expand far beyond one publication
-           quantum. Let the browser-owned playlist pump inflate gzip in
-           bounded slices; libcurl must never retain a decoded tail while its
-           worker is paused. Segments call this with raw_gzip=false. */
-        .raw_gzip_encoding = raw_gzip,
-        .user_agent = TILEFINCH_BROWSER_USER_AGENT,
-        .connect_timeout_ms = 3000,
-        .redirect_same_origin_only = true
-    };
-    FetchRequestValidationError validation_error;
-    bool prepared_ok = fetch_prepare_page_request_context(
-        &authority, context->document_url, NULL, context->session, NULL,
-        context->session == NULL ? NULL : context->session->content_blocker,
-        &transport, prepared, &validation_error);
-    const FetchRequest *authorized = prepared_ok
-        ? fetch_prepared_page_request(prepared) : NULL;
-    FetchRequest stream_request = authorized == NULL
-        ? (FetchRequest) {0} : *authorized;
-    /* The prepared request owns the page authority and cookie snapshot. The
-       streaming worker additionally requires a redirect validator because
-       it has no BrowserSession on its thread. Same-origin remains the hard
-       redirect boundary; this callback admits only syntactically valid HTTP
-       targets before that origin comparison is applied. */
-    stream_request.redirect_url_validator =
-        psp_hls_redirect_url_supported;
-    stream_request.redirect_same_origin_only = true;
-    stream_request.page_context = NULL;
-    stream_request.content_security_policy = NULL;
-    stream_request.content_blocker = NULL;
-    stream_request.cookie_session = NULL;
-    stream_request.cookie_context = NULL;
-    stream_request.prepared_page_version = 0;
-    const FetchRequest *request = authorized == NULL
-        ? NULL : &stream_request;
-    FetchBackgroundEnqueueStatus enqueue_status =
-        FETCH_BACKGROUND_ENQUEUE_UNAVAILABLE;
-    uint64_t id = request == NULL ? 0
-        : fetch_background_transport_enqueue_media_stream_sized_diagnosed(
-              url, request, maximum_bytes, PSP_HLS_TIMEOUT_MS,
-              publication_bytes, &enqueue_status);
-    budget_free(context->budget, prepared);
-    if (id == 0) {
-        if (request == NULL
-            || (enqueue_status != FETCH_BACKGROUND_ENQUEUE_SATURATED
-                && enqueue_status
-                    != FETCH_BACKGROUND_ENQUEUE_ADMISSION_CLOSED)) {
-            snprintf(error, error_size, "%s",
-                     request == NULL ? "HLS request authority refused"
-                                     : "HLS transport cannot admit request");
-        }
-        return 0;
-    }
-    context->requests[slot] = (PspHlsRequest) {
-        .background_id = id,
+    PspHlsRequest *request = &context->requests[slot];
+    *request = (PspHlsRequest) {
+        .maximum_bytes = maximum_bytes,
+        .publication_bytes = publication_bytes,
         .raw_gzip = raw_gzip
     };
-    snprintf(context->requests[slot].url,
-             sizeof(context->requests[slot].url), "%s", url);
-    return id;
+    if (!media_worker_hop_init(&request->hop, url)) {
+        *request = (PspHlsRequest) {0};
+        snprintf(error, error_size, "%s", "HLS request URL exceeds bound");
+        return 0;
+    }
+    /* Playlists, variants and segments are admitted under the page's policy
+       here, on the browser thread; the worker sees only the flat request. */
+    MediaWorkerAuthority authority = psp_hls_authority(context);
+    FetchPreparedPageRequest *scratch = !context->page_redirects ? NULL
+        : budget_malloc_category(
+              context->budget, BUDGET_CATEGORY_NAVIGATION, sizeof(*scratch));
+    MediaWorkerHopAdmission admission = media_worker_hop_admit(
+        &authority, &request->hop, scratch);
+    budget_free(context->budget, scratch);
+    if (admission != MEDIA_WORKER_HOP_ADMITTED) {
+        *request = (PspHlsRequest) {0};
+        snprintf(error, error_size, "%s",
+                 admission == MEDIA_WORKER_HOP_REFUSED
+                     ? "HLS request refused by page policy"
+                     : "HLS request budget refused");
+        return 0;
+    }
+    if (psp_hls_issue(context, request, error, error_size)
+            != PSP_HLS_ISSUE_STARTED) {
+        *request = (PspHlsRequest) {0};
+        return 0;
+    }
+    if (++context->next_handle == 0) context->next_handle = 1;
+    request->handle = context->next_handle;
+    return request->handle;
+}
+
+static void psp_hls_request_cancel(PspHlsRequest *request,
+                                   const char *reason)
+{
+    if (request == NULL) return;
+    if (request->background_id != 0)
+        (void) fetch_background_transport_cancel(
+            request->background_id, reason);
+    *request = (PspHlsRequest) {0};
 }
 
 static uint64_t psp_hls_start(void *opaque, const char *url,
@@ -225,23 +282,76 @@ static uint64_t psp_hls_start(void *opaque, const char *url,
         false, error, error_size);
 }
 
-static bool psp_hls_admit_headers(PspMediaHlsContext *context,
-                                  PspHlsRequest *request,
-                                  char *error, size_t error_size)
+typedef enum {
+    PSP_HLS_HEADERS_PENDING = 0,
+    PSP_HLS_HEADERS_ADMITTED,
+    /* A redirect was admitted and its next hop issued (or deferred). */
+    PSP_HLS_HEADERS_REDIRECTED,
+    PSP_HLS_HEADERS_REFUSED
+} PspHlsHeadersStatus;
+
+/* Follows an admitted redirect: the old hop is cancelled before its body is
+   read, and a redirected playlist resolves its URIs against the new URL. */
+static PspHlsHeadersStatus psp_hls_follow_redirect(
+    PspMediaHlsContext *context, PspHlsRequest *request,
+    char *error, size_t error_size)
+{
+    (void) fetch_background_transport_cancel(
+        request->background_id, "HLS redirect followed");
+    request->background_id = 0;
+    if (request->handle == context->playlist_request_id
+        && context->playlist_stream != NULL
+        && !media_hls_playlist_stream_rebase(
+               context->playlist_stream, request->hop.url)) {
+        snprintf(error, error_size, "%s",
+                 "HLS playlist redirect could not be rebased");
+        return PSP_HLS_HEADERS_REFUSED;
+    }
+    return psp_hls_issue(context, request, error, error_size)
+            == PSP_HLS_ISSUE_FAILED
+        ? PSP_HLS_HEADERS_REFUSED : PSP_HLS_HEADERS_REDIRECTED;
+}
+
+static PspHlsHeadersStatus psp_hls_admit_headers(
+    PspMediaHlsContext *context, PspHlsRequest *request,
+    char *error, size_t error_size)
 {
     FetchResult *metadata = fetch_result_create(context->budget);
     if (metadata == NULL) {
         snprintf(error, error_size, "%s", "HLS response metadata budget");
-        return false;
+        return PSP_HLS_HEADERS_REFUSED;
     }
     bool available = fetch_background_transport_take_headers(
         request->background_id, metadata);
     if (!available) {
         fetch_result_free(metadata);
-        return false;
+        return PSP_HLS_HEADERS_PENDING;
+    }
+    if (context->page_redirects && metadata->status_code >= 300
+        && metadata->status_code < 400) {
+        MediaWorkerAuthority authority = psp_hls_authority(context);
+        FetchPreparedPageRequest *scratch = budget_malloc_category(
+            context->budget, BUDGET_CATEGORY_NAVIGATION, sizeof(*scratch));
+        MediaWorkerRedirectStatus redirect = media_worker_redirect(
+            &authority, &request->hop, metadata, scratch);
+        budget_free(context->budget, scratch);
+        if (redirect != MEDIA_WORKER_RESPONSE) {
+            long status = metadata->status_code;
+            fetch_result_free(metadata);
+            if (redirect == MEDIA_WORKER_REDIRECT_FOLLOW)
+                return psp_hls_follow_redirect(
+                    context, request, error, error_size);
+            if (redirect == MEDIA_WORKER_REDIRECT_NO_MEMORY)
+                snprintf(error, error_size, "%s",
+                         "HLS redirect budget refused");
+            else
+                snprintf(error, error_size,
+                         "HLS redirect refused (HTTP %ld)", status);
+            return PSP_HLS_HEADERS_REFUSED;
+        }
     }
     TilefinchRequestContext authority = {
-        .target_url = request->url,
+        .target_url = request->hop.url,
         .initiator_url = context->document_url,
         .top_level_url = context->document_url,
         .method = "GET",
@@ -263,7 +373,7 @@ static bool psp_hls_admit_headers(PspMediaHlsContext *context,
                  metadata->status_code);
     fetch_result_free(metadata);
     request->headers_admitted = admitted;
-    return admitted;
+    return admitted ? PSP_HLS_HEADERS_ADMITTED : PSP_HLS_HEADERS_REFUSED;
 }
 
 static MediaHlsTransportPollResult psp_hls_poll(
@@ -278,27 +388,48 @@ static MediaHlsTransportPollResult psp_hls_poll(
         snprintf(error, error_size, "%s", "HLS request disappeared");
         return MEDIA_HLS_TRANSPORT_ERROR;
     }
+    if (request->background_id == 0) {
+        /* A followed redirect found the worker queue full. */
+        PspHlsIssueStatus issued = psp_hls_issue(
+            context, request, error, error_size);
+        if (issued == PSP_HLS_ISSUE_FAILED) {
+            context->last_transport_retryable = false;
+            *request = (PspHlsRequest) {0};
+            return MEDIA_HLS_TRANSPORT_ERROR;
+        }
+        return MEDIA_HLS_TRANSPORT_WAIT;
+    }
     FetchBackgroundProgress progress = {0};
-    if (!fetch_background_transport_progress(handle, &progress)) {
-        context->last_transport_retryable = false;
+    if (!fetch_background_transport_progress(
+            request->background_id, &progress)) {
+        /* Network quiescence retires generation-bearing worker IDs. Retry
+           the entire playlist (or rebuild the failed segment's pipeline),
+           never append a restarted response to already-consumed bytes. */
+        context->last_transport_retryable = true;
+        context->last_transport_code = 0;
         *request = (PspHlsRequest) {0};
         snprintf(error, error_size, "%s", "HLS worker lost request");
         return MEDIA_HLS_TRANSPORT_ERROR;
     }
     if (!request->headers_admitted) {
-        if (!psp_hls_admit_headers(context, request, error, error_size)) {
-            if (error != NULL && error[0] != '\0') {
-                context->last_transport_retryable = false;
-                (void) fetch_background_transport_cancel(
-                    handle, "HLS response authority refused");
-                *request = (PspHlsRequest) {0};
-                return MEDIA_HLS_TRANSPORT_ERROR;
-            }
-            return MEDIA_HLS_TRANSPORT_WAIT;
+        PspHlsHeadersStatus headers = psp_hls_admit_headers(
+            context, request, error, error_size);
+        if (headers == PSP_HLS_HEADERS_REFUSED) {
+            context->last_transport_retryable = false;
+            psp_hls_request_cancel(request, "HLS response authority refused");
+            return MEDIA_HLS_TRANSPORT_ERROR;
         }
+        /* A hop that failed before any status line (resolver or connect
+           timeout, refused connection) completes without ever publishing
+           headers. Its terminal result is the answer; waiting for headers
+           would hold the open until the phase timeout and skip the retry. */
+        if (headers == PSP_HLS_HEADERS_PENDING && !progress.complete)
+            return MEDIA_HLS_TRANSPORT_WAIT;
+        if (headers == PSP_HLS_HEADERS_REDIRECTED)
+            return MEDIA_HLS_TRANSPORT_WAIT;
     }
     if (fetch_background_transport_take_chunk(
-            handle, destination, capacity, length)) {
+            request->background_id, destination, capacity, length)) {
         request->consumed += *length;
         return MEDIA_HLS_TRANSPORT_CHUNK;
     }
@@ -311,7 +442,13 @@ static MediaHlsTransportPollResult psp_hls_poll(
         return MEDIA_HLS_TRANSPORT_ERROR;
     }
     bool success = fetch_background_transport_take_fetch_result_consumed(
-        handle, context->budget, result, request->consumed);
+        request->background_id, context->budget, result, request->consumed);
+    /* Only a response whose headers passed admission may deliver a body. */
+    if (!request->headers_admitted && success) {
+        success = false;
+        snprintf(result->error, sizeof(result->error), "%s",
+                 "response completed without admitted headers");
+    }
     context->last_transport_code = result->transport_code;
     context->last_transport_retryable = !success
         && (result->transport_code != 0 || result->timed_out
@@ -319,7 +456,7 @@ static MediaHlsTransportPollResult psp_hls_poll(
                 && result->received_body_bytes != request->consumed));
     if (success) {
         TilefinchRequestContext cookie_context = {
-            .target_url = request->url,
+            .target_url = request->hop.url,
             .initiator_url = context->document_url,
             .top_level_url = context->document_url,
             .method = "GET",
@@ -366,8 +503,8 @@ static MediaHlsTransportPollResult psp_hls_playlist_decode_fail(
         snprintf(error, error_size, "%s", message);
     else
         snprintf(error, error_size, "%s (%d)", message, detail);
-    (void) fetch_background_transport_cancel(handle, message);
-    if (request != NULL) *request = (PspHlsRequest) {0};
+    if (request == NULL) request = psp_hls_request(context, handle);
+    psp_hls_request_cancel(request, message);
     return MEDIA_HLS_TRANSPORT_ERROR;
 }
 
@@ -484,17 +621,17 @@ static MediaHlsTransportPollResult psp_hls_poll_playlist(
 static void psp_hls_cancel(void *opaque, uint64_t handle)
 {
     PspMediaHlsContext *context = opaque;
-    PspHlsRequest *request = psp_hls_request(context, handle);
-    if (request == NULL) return;
-    (void) fetch_background_transport_cancel(handle, "HLS route closed");
-    *request = (PspHlsRequest) {0};
+    psp_hls_request_cancel(
+        psp_hls_request(context, handle), "HLS route closed");
 }
 
 PspMediaHlsContext *psp_media_hls_create(
     Budget *budget, BrowserSession *session,
     const char *playlist_url, const char *document_url,
     TilefinchRequestMode mode, TilefinchCredentialsMode credentials,
-    char *error, size_t error_size)
+    PspMediaHlsSelectionBound selection_bound,
+    const TilefinchContentSecurityPolicy *content_security_policy,
+    bool page_redirects, char *error, size_t error_size)
 {
     if (budget == NULL || session == NULL || playlist_url == NULL
         || document_url == NULL || !fetch_background_transport_available()) {
@@ -519,6 +656,9 @@ PspMediaHlsContext *psp_media_hls_create(
     context->session = session;
     context->mode = mode;
     context->credentials = credentials;
+    context->selection_bound = selection_bound;
+    context->content_security_policy = content_security_policy;
+    context->page_redirects = page_redirects;
     context->playlist_chunk = chunk;
     context->playlist_wire_chunk = wire_chunk;
     context->source_count = 1u;
@@ -528,6 +668,15 @@ PspMediaHlsContext *psp_media_hls_create(
     snprintf(context->document_url, sizeof(context->document_url), "%s",
              document_url);
     return context;
+}
+
+void psp_media_hls_set_memory_recovery(
+    PspMediaHlsContext *context, void *opaque,
+    bool (*make_room)(void *, size_t, unsigned *))
+{
+    if (context == NULL) return;
+    context->memory_context = opaque;
+    context->make_room = make_room;
 }
 
 PspMediaHlsOpenStatus psp_media_hls_pump(
@@ -594,7 +743,7 @@ PspMediaHlsOpenStatus psp_media_hls_pump(
     }
     size_t length = 0;
     MediaHlsTransportPollResult result = psp_hls_poll_playlist(
-        context, request->background_id,
+        context, request->handle,
         context->playlist_chunk, PSP_HLS_PLAYLIST_CHUNK_BYTES,
         &length, error, error_size);
     if (result == MEDIA_HLS_TRANSPORT_CHUNK) {
@@ -642,26 +791,49 @@ PspMediaHlsOpenStatus psp_media_hls_pump(
     if (media_hls_playlist_kind(playlist) == MEDIA_HLS_PLAYLIST_MASTER) {
         char selected_video[NAVIGATION_URL_LIMIT];
         char selected_audio[NAVIGATION_URL_LIMIT];
+        /* High profile goes to the software decoder (432x240); Baseline and
+           Main go to the firmware decoder, up to its geometry. A variant
+           without a declared profile is tried at the firmware bound first;
+           the open path checks its SPS and reselects at the software bound
+           when it turns out to be High. */
+        MediaHlsDecoderLimits limits = {
+            .software_width = 432u,
+            .software_height = 240u,
+            .target_height = 240u,
+            .admit_undeclared_firmware =
+                context->selection_bound == PSP_MEDIA_HLS_BOUND_FIRMWARE,
+            .firmware_refused =
+                context->selection_bound == PSP_MEDIA_HLS_BOUND_SOFTWARE
+        };
+        MediaHlsSelection selection = {0};
         bool selected_ok = context->opening_source == 0u
-            && media_hls_playlist_select_streams(
-                playlist, 432u, 240u, 240u,
+            && media_hls_playlist_select_decodable_streams(
+                playlist, &limits,
                 selected_video, sizeof(selected_video),
-                selected_audio, sizeof(selected_audio));
+                selected_audio, sizeof(selected_audio), &selection);
         if (!selected_ok) {
-            char compatible_video[NAVIGATION_URL_LIMIT];
-            bool has_video = context->opening_source == 0u
-                && media_hls_playlist_select_variant(
-                    playlist, 432u, 240u, 240u,
-                    compatible_video, sizeof(compatible_video));
             media_hls_playlist_destroy(playlist);
             return psp_hls_open_fail(
                 context, context->opening_source != 0u
                     ? "nested HLS audio master is unsupported"
-                    : has_video
+                    : selection.video_selected
                         ? "HLS master is missing its selected audio rendition"
-                        : "HLS master has no compatible 240p AVC rendition",
+                        : "HLS master has no compatible AVC rendition",
                 error, error_size);
         }
+        context->selection_unverified = selection.unverified;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        /* Page-video device pass: the variant the decoder-aware selection
+           chose. A second record after a reselect carries software-only=1. */
+        psp_log_printf("tilefinch-page-media: event=hls-variant video=%ux%u "
+               "unverified=%d software-only=%d page=%d separate-audio=%d "
+               "url=\"%.200s\"\n",
+               (unsigned) selection.width, (unsigned) selection.height,
+               selection.unverified ? 1 : 0,
+               context->selection_bound != PSP_MEDIA_HLS_BOUND_FIRMWARE ? 1 : 0,
+               context->page_redirects ? 1 : 0,
+               selected_audio[0] != '\0' ? 1 : 0, selected_video);
+#endif
         media_hls_playlist_destroy(playlist);
         if (++context->master_depth > PSP_HLS_MASTER_DEPTH_LIMIT) {
             return psp_hls_open_fail(
@@ -691,9 +863,25 @@ PspMediaHlsOpenStatus psp_media_hls_pump(
         .cancel = psp_hls_cancel
     };
     size_t source_index = context->opening_source;
-    context->source[source_index] = media_hls_source_create_track(
-        context->budget, playlist, &transport,
-        context->track_selection[source_index], error, error_size);
+    for (;;) {
+        context->source[source_index] = media_hls_source_create_track(
+            context->budget, playlist, &transport,
+            context->track_selection[source_index], error, error_size);
+        if (context->source[source_index] != NULL
+            || context->make_room == NULL || context->memory_stage >= 2u
+            || error == NULL
+            || strcmp(error, "HLS source exceeds memory budget") != 0)
+            break;
+        /* The factory has freed its partial buffers and still leaves the
+           playlist with us. Use the same two recovery stages as decoder
+           opening, including native-heap fragmentation (needed=0), before
+           retrying. No refetch, limit increase, or change to page authority. */
+        unsigned stage = context->memory_stage;
+        if (!context->make_room(context->memory_context, 0,
+                                &context->memory_stage)
+            || context->memory_stage <= stage)
+            break;
+    }
     if (context->source[source_index] == NULL) {
         media_hls_playlist_destroy(playlist);
         return psp_hls_open_fail(
@@ -855,9 +1043,11 @@ bool psp_media_hls_stats(
             ? SIZE_MAX : stats->playlist_bytes_received + current;
     }
     stats->ended = true;
+    stats->holding = context->source_count != 0;
     for (size_t i = 0; i < context->source_count; i++) {
         if (context->source[i] == NULL) {
             stats->ended = false;
+            stats->holding = false;
             continue;
         }
         MediaHlsStats one = {0};
@@ -883,17 +1073,23 @@ bool psp_media_hls_stats(
             stats->buffered_until_us = one.buffered_until_us;
         stats->live = stats->live || one.live;
         stats->ended = stats->ended && one.ended;
+        stats->holding = stats->holding && (one.holding || one.ended);
     }
     if (context->playlist_request_id != 0) stats->active_requests++;
     return true;
+}
+
+bool psp_media_hls_selection_unverified(const PspMediaHlsContext *context)
+{
+    return context != NULL && context->selection_unverified;
 }
 
 void psp_media_hls_destroy(PspMediaHlsContext *context)
 {
     if (context == NULL) return;
     for (size_t i = 0; i < PSP_HLS_REQUEST_LIMIT; i++)
-        if (context->requests[i].background_id != 0)
-            psp_hls_cancel(context, context->requests[i].background_id);
+        if (context->requests[i].handle != 0)
+            psp_hls_cancel(context, context->requests[i].handle);
     for (size_t i = 0; i < PSP_HLS_SOURCE_LIMIT; i++)
         media_hls_source_destroy(context->source[i]);
     psp_hls_destroy_playlist_stream(context);

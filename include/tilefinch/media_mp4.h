@@ -189,6 +189,139 @@ MediaH264DecoderRoute media_h264_annexb_decoder_route(
     const unsigned char *config, size_t length, uint8_t *profile_idc);
 MediaH264DecoderRoute media_h264_codec_string_decoder_route(
     const char *mime, uint8_t *profile_idc);
+/*
+ * The reference structure an SPS declares. bitstream_restriction says the
+ * VUI carried max_num_reorder_frames and max_dec_frame_buffering; without it
+ * both read as zero and only max_num_ref_frames is known.
+ */
+typedef struct {
+    uint8_t max_num_ref_frames;
+    bool bitstream_restriction;
+    uint8_t max_num_reorder_frames;
+    uint8_t max_dec_frame_buffering;
+} MediaH264SpsReferences;
+bool media_h264_sps_references(
+    const unsigned char *sps, size_t length,
+    MediaH264SpsReferences *references);
+/*
+ * The most decoded pictures any SPS asks a decoder to hold:
+ * max(max_num_ref_frames, max_dec_frame_buffering when the VUI declares
+ * it), over every SPS found. KNOWN when at least one SPS was read and none
+ * was unreadable; UNREADABLE when some SPS used syntax this parser cannot
+ * follow (`*frames` then covers only the readable ones); ABSENT without an
+ * SPS. The config form reads an avcC record or, with `annex_b`, Annex-B
+ * parameter sets; the sample form reads one access unit, Annex-B when
+ * `nal_length_size` is 0, otherwise length-prefixed NAL units.
+ */
+/* The entropy coding the stream's picture parameter sets declare
+   (entropy_coding_mode_flag): the optional software decoder reads CABAC
+   only, so a CAVLC stream (every Baseline one) cannot go to it. */
+typedef enum {
+    MEDIA_H264_ENTROPY_UNKNOWN = 0,
+    MEDIA_H264_ENTROPY_CABAC,
+    MEDIA_H264_ENTROPY_CAVLC
+} MediaH264Entropy;
+MediaH264Entropy media_h264_config_entropy(
+    const unsigned char *config, size_t length, bool annex_b);
+/* Whether the optional software decoder can take the stream's coding:
+   progressive (frame_mbs_only), 4:2:0, 8-bit. CABAC and CAVLC both are.
+   UNKNOWN when the SPS cannot be read (the decoder then judges it). */
+typedef enum {
+    MEDIA_H264_SOFTWARE_CODING_UNKNOWN = 0,
+    MEDIA_H264_SOFTWARE_CODING_SUPPORTED,
+    MEDIA_H264_SOFTWARE_CODING_UNSUPPORTED
+} MediaH264SoftwareCoding;
+MediaH264SoftwareCoding media_h264_config_software_coding(
+    const unsigned char *config, size_t length, bool annex_b);
+/* True when the stream's SPS rules out picture reordering: Baseline, or a
+   VUI declaring max_num_reorder_frames 0. Output order is then decode
+   order. False when unknown. */
+bool media_h264_config_reorder_free(
+    const unsigned char *config, size_t length, bool annex_b);
+typedef enum {
+    MEDIA_H264_SPS_FRAMES_ABSENT = 0,
+    MEDIA_H264_SPS_FRAMES_KNOWN,
+    MEDIA_H264_SPS_FRAMES_UNREADABLE
+} MediaH264SpsFramesStatus;
+MediaH264SpsFramesStatus media_h264_config_sps_frames(
+    const unsigned char *config, size_t length, bool annex_b,
+    unsigned *frames);
+MediaH264SpsFramesStatus media_h264_sample_sps_frames(
+    const unsigned char *payload, size_t length,
+    unsigned nal_length_size, unsigned *frames);
+/*
+ * Reference structures the PSP firmware AVC decoder refuses (PSP-3000,
+ * sceMpegAvcDecode 0x80628002, 640x360 Main 3.0 on the wide program):
+ *
+ * - more than three reference frames: the first access unit is refused;
+ * - a B-frame pyramid -- B pictures kept as references, which an encoder
+ *   declares as max_num_reorder_frames > 1 -- decodes its opening pictures
+ *   and then has every later reference picture refused.
+ *
+ * Two non-reference B-frames with three references (reorder 1) play. An SPS
+ * whose VUI omits bitstream_restriction cannot show a pyramid; firmware stays
+ * the judge of such a stream, as it is of syntax this parser cannot follow.
+ */
+#define MEDIA_H264_PSP_FIRMWARE_MAXIMUM_REFERENCES 3u
+#define MEDIA_H264_PSP_FIRMWARE_MAXIMUM_REORDER 1u
+typedef enum {
+    MEDIA_H264_FIRMWARE_REFERENCES_SUPPORTED = 0,
+    MEDIA_H264_FIRMWARE_REFERENCES_PYRAMID,
+    MEDIA_H264_FIRMWARE_REFERENCES_TOO_MANY
+} MediaH264FirmwareReferences;
+MediaH264FirmwareReferences media_h264_psp_firmware_references(
+    const MediaH264SpsReferences *references);
+MediaH264FirmwareReferences media_h264_avcc_firmware_references(
+    const unsigned char *config, size_t length);
+MediaH264FirmwareReferences media_h264_annexb_firmware_references(
+    const unsigned char *config, size_t length);
+/*
+ * Whether `verdict` may refuse a stream before firmware has seen it, rather
+ * than only route it to the software decoder.
+ *
+ * More than three references is refused on the first access unit (and that
+ * refusal latches the wide program off), so it is always conclusive. A
+ * pyramid is read from the declared max_num_reorder_frames: x264 declares 2
+ * exactly when b-pyramid is on, and those streams are device-confirmed
+ * refused, but there is no device evidence about a stream that declares
+ * more reorder than it uses, which firmware may well play. Page media with
+ * a declared pyramid is refused, so the page's next rendition is tried;
+ * provider and offline streams keep firmware as the judge when the
+ * software decoder cannot take them, and a real pyramid is then caught by
+ * its opening refusals (psp_media_avc_opening_refused).
+ *
+ * The signal that would separate the two -- a B slice with nal_ref_idc != 0
+ * in the first GOP -- needs sample payload the open path has not fetched
+ * when it routes, so it is not used here.
+ */
+bool media_h264_firmware_references_conclusive(
+    MediaH264FirmwareReferences verdict, bool page_media);
+/* Every decoder refusal of a stream's coding starts with this text, which is
+   what media_candidate_refused recognises. */
+#define MEDIA_H264_UNSUPPORTED_STREAM "unsupported H.264 stream"
+#define MEDIA_H264_SOFTWARE_CODING_REFUSAL \
+    MEDIA_H264_UNSUPPORTED_STREAM \
+    " (the optional decoder plays progressive 8-bit 4:2:0 only)"
+#define MEDIA_H264_FIRST_PICTURE_REFUSAL \
+    MEDIA_H264_UNSUPPORTED_STREAM " (firmware refused its first picture)"
+#define MEDIA_H264_OPENING_REFUSAL \
+    MEDIA_H264_UNSUPPORTED_STREAM " (firmware refused its opening pictures)"
+/* The open error for a refused verdict ("unsupported H.264 stream (...)"),
+   or NULL when the firmware decoder admits the stream. */
+const char *media_h264_firmware_references_refusal(
+    MediaH264FirmwareReferences verdict);
+/*
+ * Whether the first SPS's level_idc is one the firmware decoder admits
+ * (psp_video_avc_level_supported: up to Level 3.0). An unreadable config
+ * answers true; the route and geometry checks judge it. A Baseline/Main
+ * stream above the range needs the software decoder or another rendition,
+ * and the open path reports MEDIA_H264_FIRMWARE_LEVEL_REFUSAL for it.
+ */
+bool media_h264_avcc_firmware_level_supported(
+    const unsigned char *config, size_t length);
+bool media_h264_annexb_firmware_level_supported(
+    const unsigned char *config, size_t length);
+#define MEDIA_H264_FIRMWARE_LEVEL_REFUSAL "PSP AVC profile/level unsupported"
 /* Bounded firmware display geometries. Tall 240p-class pictures use the
    existing large decode pool, not an enlarged or uncharged allocation. */
 bool media_h264_psp_dimensions_supported(unsigned width, unsigned height);
@@ -270,6 +403,20 @@ bool media_mp4_would_block(const MediaMp4Demux *demux);
  */
 bool media_mp4_sample_resident(const MediaMp4Demux *demux,
                                const MediaMp4Sample *sample);
+/*
+ * Out-of-order access to one track, for MediaPlayback's muxed audio lane.
+ * peek describes the next sample of the first track of `kind` that
+ * media_mp4_next_sample has not returned, only when its payload is resident;
+ * it changes nothing. take reads exactly that sample without waiting and
+ * advances only its track, so next_sample never returns it; on false nothing
+ * moved and the would-block record is untouched.
+ */
+bool media_mp4_peek_track_sample(const MediaMp4Demux *demux,
+                                 MediaMp4TrackKind kind,
+                                 MediaMp4Sample *sample);
+bool media_mp4_take_track_sample(MediaMp4Demux *demux,
+                                 const MediaMp4Sample *sample,
+                                 void *destination, size_t capacity);
 /* Same read, but may block (bounded by the range's own wait budget) to fetch
    the window rather than answering would-block. Used only to warm a
    connection during an open, never on the playing path. */

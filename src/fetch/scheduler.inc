@@ -234,6 +234,18 @@ bool fetch_scheduler_domain_metrics(
     return true;
 }
 
+void fetch_scheduler_domain_set_held(FetchSchedulerDomain *domain,
+                                     bool held)
+{
+    if (domain != NULL) domain->held = held;
+}
+
+bool fetch_scheduler_held(const FetchScheduler *scheduler)
+{
+    return scheduler != NULL && scheduler->domain != NULL
+        && scheduler->domain->held;
+}
+
 static void fetch_scheduler_set_error(FetchScheduler *scheduler,
                                       const char *message)
 {
@@ -403,6 +415,15 @@ bool fetch_scheduler_enable_background_transport(
     return true;
 }
 
+bool fetch_scheduler_set_background_media_hops(
+    FetchScheduler *scheduler, size_t publication_bytes)
+{
+    if (scheduler == NULL || scheduler->pending != 0
+        || scheduler->reserved_bytes != 0) return false;
+    scheduler->background_media_publication_bytes = publication_bytes;
+    return true;
+}
+
 static bool scheduled_fetch_prepare_failure(
     ScheduledFetch *item, const char *stage, CURLcode code)
 {
@@ -506,8 +527,12 @@ static bool scheduled_background_start_hop_with(ScheduledFetch *item,
         return false;
     }
     item->background_request_id =
-        fetch_background_transport_enqueue_hop_stream(
-            item->hop->url, &shape, item->reserved_bytes, remaining_ms);
+        item->background_media_publication_bytes != 0
+        ? fetch_background_transport_enqueue_media_hop_stream_sized_diagnosed(
+              item->hop->url, &shape, item->reserved_bytes, remaining_ms,
+              item->background_media_publication_bytes, NULL)
+        : fetch_background_transport_enqueue_hop_stream(
+              item->hop->url, &shape, item->reserved_bytes, remaining_ms);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     if (item->background_request_id != 0)
         scheduled_timeline(NULL, item, "submit");
@@ -893,6 +918,10 @@ static uint64_t fetch_scheduler_enqueue_internal(
         fetch_diagnostic_mobile_safari();
     if (scheduler == NULL) return 0;
     fetch_scheduler_set_error(scheduler, "");
+    if (fetch_scheduler_held(scheduler)) {
+        fetch_scheduler_set_error(scheduler, "page network held");
+        return 0;
+    }
     if (url == NULL || maximum_bytes == 0 || maximum_bytes == SIZE_MAX
         || timeout_ms <= 0) {
         fetch_scheduler_set_error(scheduler, "invalid request limits");
@@ -1007,6 +1036,8 @@ static uint64_t fetch_scheduler_enqueue_internal(
     item->reserved_bytes = maximum_bytes;
     item->background_allowed =
         scheduler->background_transport_enabled;
+    item->background_media_publication_bytes =
+        scheduler->background_media_publication_bytes;
     scheduler->reserved_bytes += maximum_bytes;
     item->result.budget = scheduler->budget;
     if (stream != NULL) {
@@ -1218,6 +1249,9 @@ uint64_t fetch_scheduler_enqueue_stream(
 bool fetch_scheduler_enqueue_would_block(
     const FetchScheduler *scheduler, size_t maximum_bytes)
 {
+    /* A held domain is backpressure that only its owner's release ends;
+       deferring callers keep their requests queued until then. */
+    if (fetch_scheduler_held(scheduler)) return true;
     if (scheduler == NULL || scheduler->domain == NULL
         || maximum_bytes == 0 || maximum_bytes == SIZE_MAX
         || maximum_bytes > scheduler->maximum_reserved_bytes) {
@@ -1988,7 +2022,8 @@ size_t fetch_scheduler_pump_bounded(
                 completed++;
             } else if (item->replay_offset == item->replay_length) {
                 bool intact = item->replay_file != NULL
-                    && fgetc(item->replay_file) == EOF
+                    && (item->writer.replay_body_sliced
+                        || fgetc(item->replay_file) == EOF)
                     && !ferror(item->replay_file);
                 bool close_ok = item->replay_file != NULL
                     && fclose(item->replay_file) == 0;

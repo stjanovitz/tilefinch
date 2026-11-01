@@ -58,9 +58,15 @@ static uint64_t psp_media_network_ahead_us(const PspMediaSession *media)
 {
     if (media == NULL || media->offline_source) return UINT64_MAX;
     MediaHlsStats hls = {0};
-    if (psp_media_hls_stats(media->hls, &hls))
+    if (psp_media_hls_stats(media->hls, &hls)) {
+        /* A source holding a full queue for the player is not short of
+           network data; the player's own bounded queues cap how far ahead
+           it can buffer, which can be less than the buffering target (a
+           frozen clock then never resumes). */
+        if (hls.holding) return UINT64_MAX;
         return hls.buffered_until_us > media->clock_us
             ? hls.buffered_until_us - media->clock_us : 0;
+    }
     uint64_t duration_us = psp_media_duration_us(media);
     if (media->audio_only)
         return media_http_range_buffered_ahead_us(

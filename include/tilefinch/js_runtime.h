@@ -129,6 +129,13 @@ typedef struct {
     size_t external_script_bytecode_deferred_dropped;
     size_t external_script_bytecode_pending_hits;
     unsigned long long external_script_bytecode_idle_store_us;
+    /* Whole classic script bodies the realm took back when it needed room
+       to grow (js_rt_heap_growth_hook): response cache entries released and
+       their bytes, and bodies of running scripts released, with theirs. */
+    size_t script_body_cache_releases;
+    size_t script_body_cache_released_bytes;
+    size_t script_body_sources_released;
+    size_t script_body_sources_released_bytes;
     /* ES module bytecode (BrowserScriptBytecodeTable). Hits restored a
        module instead of compiling it; misses compiled one the cache could
        have served; restored/stored bytes are serialized bytecode. */
@@ -1239,6 +1246,14 @@ void script_runtime_relocate_document_storage(ScriptRuntime *runtime,
 bool script_runtime_replace_document_body(
     ScriptRuntime *runtime, PocDocument *document,
     const char *markup, size_t length);
+/* The same for any element of the runtime's document: native recovery that
+   replaces author children (static shell fallbacks) must not free nodes a
+   wrapper still names, or the bridge frees them a second time when that
+   wrapper dies. Matches DocumentInnerHtmlReplaceCallback with the runtime
+   as `opaque`. */
+bool script_runtime_replace_element_inner_html(
+    ScriptRuntime *runtime, PocDocument *document, lxb_dom_node_t *element,
+    const char *markup, size_t length);
 typedef enum {
     SCRIPT_RUNTIME_COLLECT_FIRST_GC = 0,
     SCRIPT_RUNTIME_COLLECT_SECOND_GC,
@@ -1285,6 +1300,17 @@ void script_runtime_enable_heap_growth(ScriptRuntime *runtime,
    exhaustion decisions use this; "collect first" triggers keep using
    script_runtime_heap_remaining so a realm collects before it grows. */
 size_t script_runtime_heap_available(const ScriptRuntime *runtime);
+/* The same, as if script text kept outside the heap (the function-source
+   store, docs/ARCHITECTURE.md) were still in it: what admission and
+   loading-pressure decisions use, so moving text out of the heap leaves
+   which scripts a page admits as it was, and the room it frees goes to
+   the scripts the page already runs. */
+size_t script_runtime_heap_admission_available(const ScriptRuntime *runtime);
+/* Whether a script error's text is what QuickJS leaves when an allocation
+   was refused: "InternalError: out of memory", or "null" when even that
+   error object could not be allocated (JS_ThrowOutOfMemory). A page can
+   throw either itself, so callers believe it only after a heap rejection. */
+bool script_error_reports_out_of_memory(const char *error);
 /* Deferred classic bytecode stores (js_module_loader.c). One idle turn:
    serializes the oldest queued compile into the session's classic table;
    returns whether a queued store was handled. Only between scripts, from
@@ -1302,6 +1328,33 @@ void script_runtime_drop_pending_bytecode(ScriptRuntime *runtime,
 void script_runtime_flush_pending_bytecode(ScriptRuntime *runtime,
                                            size_t source_budget);
 size_t script_runtime_pending_bytecode_count(const ScriptRuntime *runtime);
+/*
+ * Whole classic script bodies give way when the page realm needs room to
+ * grow (js_rt_heap_growth_hook), before growth is refused: first the
+ * bodies the response cache alone holds, then the body of the script that
+ * is running, which was compiled before it started (QuickJS keeps its own
+ * copies of whatever text it still needs). They are only source the page
+ * has compiled; each costs at most a revisit a refetch, and the compiled
+ * bytecode is kept apart, by source digest.
+ */
+typedef void (*ScriptSourceReleaseFn)(void *opaque);
+/* Offers the next external classic evaluation a way to release its source
+   while it runs. The callback must only free (it runs inside an
+   allocation). The offering caller must withdraw it after the evaluation
+   returns; withdraw reports whether the source was released (the caller's
+   pointer to it is then dangling). */
+void script_runtime_offer_source_release(ScriptRuntime *runtime,
+                                         ScriptSourceReleaseFn release,
+                                         void *opaque);
+bool script_runtime_source_released(const ScriptRuntime *runtime);
+bool script_runtime_withdraw_source_release(ScriptRuntime *runtime);
+
+/* A safe point between tasks: queued stores give their compiles' function
+   trees back to the page once idle work could no longer store them (less
+   heap available than the store would need), and all of them once the
+   realm has been refused heap growth. Returns how many it dropped. */
+size_t script_runtime_release_pending_bytecode_for_heap(
+    ScriptRuntime *runtime, bool growth_refused);
 
 /*
  * Heavy pages (include/tilefinch/script_admission.h). The realm weighs the
@@ -1964,6 +2017,11 @@ bool script_runtime_consume_navigation(ScriptRuntime *runtime, char *url,
                                        size_t url_size, bool *replace,
                                        bool *user_activated);
 bool script_runtime_has_pending_navigation(const ScriptRuntime *runtime);
+/* The browser follows the hyperlink the current activation pressed, as the
+   uncancelled click's default action. The popunder guard then refuses a
+   popunder without following the link itself, and withdraws a follow it
+   already requested, so the link loads once (docs/SECURITY_MODEL.md). */
+void script_runtime_note_link_default(ScriptRuntime *runtime);
 bool script_runtime_consume_media_request(ScriptRuntime *runtime,
                                           ScriptMediaRequest *request);
 bool script_runtime_has_pending_media_request(const ScriptRuntime *runtime);
@@ -2058,6 +2116,10 @@ typedef void (*ScriptNodeRetirementCallback)(void *opaque,
 void script_runtime_set_node_retirement_callback(
     ScriptRuntime *runtime, ScriptNodeRetirementCallback callback,
     void *opaque);
+/* Updates only an already-set retirement callback's opaque after an
+   embedding owner move (as script_runtime_relocate_messaging_opaque()). */
+void script_runtime_relocate_node_retirement_opaque(ScriptRuntime *runtime,
+                                                    void *opaque);
 /* Updates the host-backed page viewport without compiling source or walking
    element scroll containers.  A changed position queues one coalesced window
    and visualViewport scroll notification for the next runtime tick. */
@@ -2066,6 +2128,12 @@ bool script_runtime_set_page_scroll(ScriptRuntime *runtime, int scroll_y);
    destroyed. Promise/event delivery remains on the next ordinary tick. */
 size_t script_runtime_cancel_network(
     ScriptRuntime *runtime, const char *reason);
+/* Returns every in-flight dynamic <script> request to its queue: the
+   transport is cancelled (its worker slot freed) but the element neither
+   loads nor fires error; it starts again, in order, when its scheduler
+   admits requests again. Run before script_runtime_cancel_network, which
+   would otherwise settle those requests as failures. */
+size_t script_runtime_requeue_dynamic_scripts(ScriptRuntime *runtime);
 void script_runtime_destroy(ScriptRuntime *runtime);
 
 bool scripts_run_document(PocDocument *document, Budget *budget,

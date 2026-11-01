@@ -1031,6 +1031,12 @@ bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
             - runtime->gc_advance_collections_begin;
     runtime->gc_advance_collections_begin = runtime->heap_collections;
     runtime->gc_task_starved = 0;
+    (void) script_runtime_release_pending_bytecode_for_heap(
+        runtime,
+        runtime->heap_growth_refusals != runtime->gc_advance_refusals);
+    js_rt_source_store_safe_point(
+        runtime,
+        runtime->heap_growth_refusals != runtime->gc_advance_refusals);
     runtime->gc_advance_refusals = runtime->heap_growth_refusals;
     runtime_apply_gc_slack(runtime);
     runtime_apply_deterministic_gc(runtime);

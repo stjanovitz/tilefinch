@@ -422,6 +422,32 @@ static bool navigation_retry_mutation_layout_under_pressure(
     return true;
 }
 
+/* The replacement still did not fit after the invalid incumbent was
+   released. As a full rebuild does on the same refusal, stop the page's
+   realms (the existing "JavaScript stopped at its memory limit" state) and
+   lay the current DOM out once more as a static page with their memory
+   returned. The incumbent borrowed the pre-mutation DOM and is never
+   republished; it is released here if the retry above left it. */
+static bool navigation_rebuild_static_after_layout_refusal(
+    NavigationSession *session, LayoutDocument *next, bool *released)
+{
+    layout_destroy(next);
+    memset(next, 0, sizeof(*next));
+    if (!*released) {
+        layout_destroy(&session->page.layout);
+        *released = true;
+    }
+    /* Cached computed styles borrow the old cascade and may hold detached
+       nodes the realm kept alive; rebuild them against the static cascade. */
+    layout_reuse_cache_destroy(session->page.layout_reuse);
+    session->page.layout_reuse = NULL;
+    if (!navigation_retire_exhausted_script_realms(session, true))
+        return false;
+    session->performance.mutation_layout_script_retirements++;
+    return navigation_build_layout(session, next, session->fonts,
+                                   session->images);
+}
+
 /* Pending targets the ordinary image loader must leave alone. A target that
    already holds a committed resource is the batch currently being published:
    a rebuild that drops the image table must reload it like every eager image,
@@ -1349,13 +1375,31 @@ bool navigation_relayout(NavigationSession *session)
 #endif
     StyleWebFonts *retained_fonts = NULL;
     bool ok = false;
+    bool was_loaded = session != NULL && session->page.loaded;
+    size_t failures_before = was_loaded ? session->budget->failure_count : 0;
+    size_t injections_before =
+        was_loaded ? session->budget->injected_failure_count : 0;
+    ImageLayoutBoxes image_boxes;
+    navigation_lend_image_boxes(session, &image_boxes);
     for (unsigned attempt = 0; attempt < 2u; attempt++) {
         bool restart = false;
         ok = navigation_relayout_body(session, &retained_fonts, &restart);
         if (!restart) break;
+        /* The restart rebuilt the DOM it describes. */
+        navigation_return_image_boxes(session, &image_boxes);
     }
+    navigation_return_image_boxes(session, &image_boxes);
     if (retained_fonts != NULL)
         stylesheet_release_web_fonts(session->budget, retained_fonts);
+    /* A refused update that retired the page says why when memory refused
+       it: the frontend otherwise has only "page update failed". Synthetic
+       faults keep that generic report. */
+    if (!ok && was_loaded && !session->page.loaded
+        && !session->layout_build_cancelled
+        && session->budget->failure_count - failures_before
+               > session->budget->injected_failure_count - injections_before)
+        snprintf(session->last_error, sizeof(session->last_error), "%s",
+                 NAVIGATION_PAGE_OUT_OF_MEMORY_ERROR);
 #ifndef TILEFINCH_NO_TRACE
     if (census) {
         const NavigationPerformance *after = &session->performance;
@@ -1619,7 +1663,7 @@ static TILEFINCH_OUT_OF_LINE bool navigation_relayout_incremental(
     size_t failures_before = session->budget->failure_count;
     size_t injected_failures_before = session->budget->injected_failure_count;
     int incumbent_height = session->page.layout.height;
-    bool incumbent_released = false;
+    bool incumbent_released = false, realm_retired = false;
 #if !defined(__PSP__)
     bool injected_refusal =
         navigation_test_consume_same_document_relayout_refusal();
@@ -1696,6 +1740,14 @@ static TILEFINCH_OUT_OF_LINE bool navigation_relayout_incremental(
         && session->budget->injected_failure_count == injected_failures_before) {
         built = navigation_retry_mutation_layout_under_pressure(
             session, &next, &incumbent_released);
+        if (!built && !session->layout_build_cancelled
+            && session->page.runtime != NULL
+            && session->budget->injected_failure_count
+                   == injected_failures_before) {
+            built = navigation_rebuild_static_after_layout_refusal(
+                session, &next, &incumbent_released);
+            realm_retired = session->page.runtime == NULL;
+        }
     }
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     uint64_t relayout_built = navigation_now_us();
@@ -1795,7 +1847,9 @@ static TILEFINCH_OUT_OF_LINE bool navigation_relayout_incremental(
         &pass->images_before, &pass->images_after,
         events_done - events_started);
 #endif
-    if (plan->mutation_driven && session->external_resources_enabled) {
+    /* A retired realm may have owned detached nodes the journal names. */
+    if (plan->mutation_driven && session->external_resources_enabled
+        && !realm_retired) {
         for (size_t i = 0; i < mutations->count; i++) {
             const ScriptMutationRecord *record = &mutations->records[i];
             if ((record->kind != SCRIPT_MUTATION_CHILD_LIST
@@ -1820,6 +1874,26 @@ static TILEFINCH_OUT_OF_LINE bool navigation_relayout_incremental(
     return true;
 }
 
+/* A full rebuild step (stylesheet, external CSS, user CSS, web fonts) that a
+   genuine allocator refusal stopped since the pass began: stop the page's
+   realms, as a refused image rebuild below does, and restart the rebuild
+   once with their memory returned. The old display list is already gone,
+   so the alternative is retiring the page. Cancellation, policy errors and
+   injected faults keep the ordinary fail-closed path. */
+static bool navigation_full_rebuild_restart_without_scripts(
+    NavigationSession *session, size_t failures_before,
+    size_t injections_before, bool *restart_after_retirement)
+{
+    if (session->layout_build_cancelled || session->page.runtime == NULL
+        || session->budget->failure_count == failures_before
+        || session->budget->injected_failure_count != injections_before
+        || !navigation_retire_exhausted_script_realms_mode(
+               session, true, false)) return false;
+    session->style_rebuild_required = true;
+    *restart_after_retirement = true;
+    return true;
+}
+
 /* The full rebuild: stylesheet, external CSS and its events, user CSS,
    the image table, web fonts and layout are all rebuilt from the DOM, and
    the old display list is destroyed first. Rare next to the incremental
@@ -1840,6 +1914,8 @@ static TILEFINCH_OUT_OF_LINE bool navigation_relayout_full(
     /* Rebuildable owner caches must not consume the workspace for required
        style/layout. Do this only on the already-expensive full path, never
        for ordinary focus, scrolling or canvas updates. */
+    size_t pass_failures = session->budget->failure_count;
+    size_t pass_injections = session->budget->injected_failure_count;
     size_t rebuild_reserve = session->budget->limit / 8u;
     if (rebuild_reserve > 4u*1024u*1024u) rebuild_reserve = 4u*1024u*1024u;
     if (session->reclaim_optional != NULL
@@ -1861,6 +1937,20 @@ static TILEFINCH_OUT_OF_LINE bool navigation_relayout_full(
     fonts_external_loader_cancel(
         &session->page.external_font_loader,
         session->page.resource_scheduler, &session->page.external_fonts);
+    /* Source the document URL from the committed page, not the history
+       entry: a resource-driven rebuild must re-request external CSS even
+       when the page was loaded without recording history (or history was
+       trimmed).  Without this, the rebuilt stylesheet silently loses every
+       external sheet and collapses to the document's inline styles. */
+    const char *rebuild_url = session->page.document_url[0] != '\0'
+        ? session->page.document_url
+        : (entry != NULL ? entry->url : NULL);
+    /* Only the image rebuild below reads the old boxes; any other rebuild
+       frees them with the layout, before the new one is built. */
+    if (session->external_resources_enabled && rebuild_url != NULL)
+        navigation_keep_image_boxes(session);
+    else
+        navigation_drop_image_boxes(session);
     layout_destroy(&session->page.layout);
     /* Keep only the independently owned font registry, not the old rules or
        layout. The wrapper releases it on every success/refusal path. */
@@ -1875,17 +1965,12 @@ static TILEFINCH_OUT_OF_LINE bool navigation_relayout_full(
     stylesheet_destroy(&session->page.stylesheet);
     FULL_RELAYOUT_STEP();
     if (!navigation_build_stylesheet(session)) {
+        if (navigation_full_rebuild_restart_without_scripts(
+                session, pass_failures, pass_injections,
+                restart_after_retirement)) return false;
         session->page.loaded = false;
         return navigation_relayout_failed(session, true);
     }
-    /* Source the document URL from the committed page, not the history
-       entry: a resource-driven rebuild must re-request external CSS even
-       when the page was loaded without recording history (or history was
-       trimmed).  Without this, the rebuilt stylesheet silently loses every
-       external sheet and collapses to the document's inline styles. */
-    const char *rebuild_url = session->page.document_url[0] != '\0'
-        ? session->page.document_url
-        : (entry != NULL ? entry->url : NULL);
     bool user_css_added = false;
     if (session->external_resources_enabled && rebuild_url != NULL) {
         if (!navigation_document_resource_base(
@@ -1920,6 +2005,10 @@ static TILEFINCH_OUT_OF_LINE bool navigation_relayout_full(
                 session->browser_session,
                 &session->page.stylesheet_resources,
                 &session->page.external_stylesheets)) {
+            session->page.images.retarget = counters.retarget;
+            if (navigation_full_rebuild_restart_without_scripts(
+                    session, pass_failures, pass_injections,
+                    restart_after_retirement)) return false;
             session->page.loaded = false;
             return navigation_relayout_failed(session, true);
         }
@@ -1942,6 +2031,10 @@ static TILEFINCH_OUT_OF_LINE bool navigation_relayout_full(
             && !stylesheet_add_user_css(&session->page.stylesheet,
                                         session->user_css,
                                         session->user_css_length)) {
+            session->page.images.retarget = counters.retarget;
+            if (navigation_full_rebuild_restart_without_scripts(
+                    session, pass_failures, pass_injections,
+                    restart_after_retirement)) return false;
             session->page.loaded = false;
             return navigation_relayout_failed(session, true);
         }
@@ -1992,6 +2085,8 @@ static TILEFINCH_OUT_OF_LINE bool navigation_relayout_full(
                 return false;
             }
         }
+        /* The kept boxes are not needed by the layout build. */
+        navigation_drop_image_boxes(session);
         if (!images_loaded) {
             snprintf(session->last_error, sizeof(session->last_error),
                      "could not rebuild page image resources");
@@ -2006,6 +2101,9 @@ static TILEFINCH_OUT_OF_LINE bool navigation_relayout_full(
         && !stylesheet_add_user_css(&session->page.stylesheet,
                                     session->user_css,
                                     session->user_css_length)) {
+        if (navigation_full_rebuild_restart_without_scripts(
+                session, pass_failures, pass_injections,
+                restart_after_retirement)) return false;
         session->page.loaded = false;
         return navigation_relayout_failed(session, true);
     }
@@ -2014,6 +2112,9 @@ static TILEFINCH_OUT_OF_LINE bool navigation_relayout_full(
             *retained_fonts, session->maximum_font_face_backend_bytes);
     if (session->web_fonts_enabled && rebuild_url != NULL
         && !navigation_load_web_fonts(session, rebuild_url)) {
+        if (navigation_full_rebuild_restart_without_scripts(
+                session, pass_failures, pass_injections,
+                restart_after_retirement)) return false;
         session->page.loaded = false;
         return navigation_relayout_failed(session, true);
     }

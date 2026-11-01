@@ -10,9 +10,11 @@
 #include "tilefinch/browser_profile.h"
 #include "tilefinch/budget.h"
 #include "tilefinch/cancellation.h"
+#include "tilefinch/content_security_policy.h"
 #include "tilefinch/font.h"
 #include "tilefinch/install_paths.h"
 #include "tilefinch/media_backend.h"
+#include "tilefinch/media_candidates.h"
 #include "tilefinch/media_file.h"
 #include "tilefinch/media_http.h"
 #include "tilefinch/media_mp4.h"
@@ -51,6 +53,12 @@ typedef struct {
     char audio_path[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 40u];
 } PspMediaOfflineSource;
 
+typedef enum {
+    PSP_MEDIA_NETWORK_READY = 0,
+    PSP_MEDIA_NETWORK_WAIT,
+    PSP_MEDIA_NETWORK_FAILED
+} PspMediaNetworkStatus;
+
 typedef struct {
     void *context;
     void *profile_context;
@@ -65,6 +73,17 @@ typedef struct {
         void *context, const char *stage, const char *detail,
         const char *url, long http_status, int native_result);
     const TilefinchInstallPaths *install_paths;
+    /* Optional: when allocation refuses a software-decoder or HLS source
+       open, take the page's next memory step (browser_engine_make_media_room)
+       and say
+       whether one was taken, so the open is tried again. `*stage` starts
+       at 0 for each open. */
+    void *memory_context;
+    bool (*make_room)(void *context, size_t needed_bytes, unsigned *stage);
+    /* Pumped association admission after the old pipeline has retired.
+       begin publishes one demand; later calls only sample its outcome. */
+    void *network_context;
+    PspMediaNetworkStatus (*prepare_network)(void *context, bool begin);
 } PspMediaSessionPlatform;
 
 typedef struct {
@@ -139,11 +158,14 @@ typedef struct {
     /* A prepared picture awaiting its audio deadline still owns its source
        claim. Retry publication before retiring/replacing that picture. */
     bool presentation_deferred;
+    /* One routine HLS delivery visit owed after this frame's presentation. */
+    bool hls_delivery_deferred;
     PspMediaStartupPreroll startup;
     bool have_frame;
     /* Physical open service has been requested but has not entered its first
        pump phase. Lifecycle authority lives in machine.state. */
     bool open_service_pending;
+    bool open_network_pending;
     bool system_suspended;
     bool system_resume_playing;
     bool suspended_for_internal_view;
@@ -256,6 +278,17 @@ typedef struct {
        selects the existing audio-only demux/backend path. */
     bool page_audio;
     bool page_hls;
+    /* Narrowed after a selected HLS variant proved unusable on the firmware
+       decoder -- an undeclared profile that is High, or a coding firmware
+       refuses -- so the master is selected again at the software bound. */
+    PspMediaHlsSelectionBound hls_selection_bound;
+    /* The page's further renditions, packed by media_candidates, tried in
+       order when the current one is refused for its geometry or profile or
+       its request returns 4xx. Budget-owned; NULL when there are none. */
+    char *page_candidates;
+    size_t page_candidates_length;
+    size_t page_candidates_cursor;
+    bool page_candidate_advancing;
     TilefinchRequestMode page_media_mode;
     TilefinchCredentialsMode page_media_credentials;
     int64_t page_media_node_handle;
@@ -266,6 +299,12 @@ typedef struct {
     uint64_t page_media_probe_request;
     uint64_t page_media_report_us;
     char page_document_url[NAVIGATION_URL_LIMIT];
+    /* The opening document's enforced CSP. Playback may outlive the page
+       wrapper, and every redirect hop of a page media request is checked
+       against media-src, so the session keeps one budget-owned copy. It is
+       allocated only for a page that sent a policy, overwritten in place
+       by the next page open, and released at shutdown. */
+    TilefinchContentSecurityPolicy *page_content_security_policy;
     /* One line per opened stream: the clock re-anchors on every later frame
        once a decoder is behind, and a per-frame line would be the log. */
     bool clock_resync_logged;
@@ -389,6 +428,12 @@ typedef struct {
        count is the real presented frame-period; its reciprocal is the rate. */
     uint64_t advance_playing_settled_total_us;
     size_t advance_playing_settled_periods;
+    /* What the open rendition's earlier codec backends decoded and refused
+       (a >=30 s rewind, a suspend or a track change reopens the backend and
+       restarts its counters); zero at each new rendition. Keeps "refused
+       its opening pictures" a property of the rendition. */
+    size_t rendition_prior_pictures;
+    size_t rendition_prior_refusals;
     size_t accumulated_decoded_video_frames;
     size_t accumulated_dropped_video_frames;
     size_t accumulated_discarded_seek_video_frames;
@@ -430,6 +475,9 @@ typedef struct {
     bool job_preview;
     bool job_resume_playing;
     uint8_t job_prime_ready_mask;
+    /* This seek's prime already fell back to its keyframe
+       (psp_media_seek_prime_fallback). */
+    bool job_prime_fell_back;
     /*
      * Always-on lifecycle authority. Validation builds retain a read-only
      * projection of displaced flags and owned resources so a device run can
@@ -544,20 +592,40 @@ bool psp_media_open_page_source(
     PspMediaSession *media, const char *source_url,
     const char *document_url, uint64_t generation,
     int64_t node_handle, TilefinchRequestMode mode,
-    TilefinchCredentialsMode credentials, bool autoplay,
-    bool reload_source);
+    TilefinchCredentialsMode credentials,
+    const TilefinchContentSecurityPolicy *content_security_policy,
+    bool autoplay, bool reload_source);
 bool psp_media_open_page_audio(
     PspMediaSession *media, const char *source_url,
     const char *document_url, uint64_t generation,
     int64_t node_handle, TilefinchRequestMode mode,
-    TilefinchCredentialsMode credentials, bool autoplay,
-    bool reload_source);
+    TilefinchCredentialsMode credentials,
+    const TilefinchContentSecurityPolicy *content_security_policy,
+    bool autoplay, bool reload_source);
 bool psp_media_open_page_hls(
     PspMediaSession *media, const char *source_url,
     const char *document_url, uint64_t generation,
     int64_t node_handle, TilefinchRequestMode mode,
-    TilefinchCredentialsMode credentials, bool autoplay,
-    bool reload_source);
+    TilefinchCredentialsMode credentials,
+    const TilefinchContentSecurityPolicy *content_security_policy,
+    bool autoplay, bool reload_source);
+/* The page CSP that page media requests carry, or NULL when the opening
+   document sent none. */
+const TilefinchContentSecurityPolicy *psp_media_page_content_security_policy(
+    const PspMediaSession *media);
+/* Opens a page's video candidates: url first, then, when the native route
+   refuses it (see media_candidate_refused), each packed alternate in turn.
+   A candidate that cannot start at all is skipped at once. Every candidate
+   carries the opening document's CSP. */
+bool psp_media_open_page_candidates(
+    PspMediaSession *media, const char *url, MediaDiscoveryKind kind,
+    const char *alternates, size_t alternates_length,
+    const char *document_url, uint64_t generation, int64_t node_handle,
+    TilefinchRequestMode mode, TilefinchCredentialsMode credentials,
+    const TilefinchContentSecurityPolicy *content_security_policy);
+/* Opens the page's next remaining candidate; false when none is left. */
+bool psp_media_open_next_page_candidate(PspMediaSession *media);
+void psp_media_page_candidates_release(PspMediaSession *media);
 bool psp_media_request_seek(
     PspMediaSession *media, uint64_t target_us, bool preview);
 void psp_media_cancel_decode(PspMediaSession *media);
@@ -583,6 +651,8 @@ bool psp_media_advance(
    Ends startup preroll at that boundary, not one loop later. Never call for
    a loading surface, a refused publication, or a supervisor's old-frame copy. */
 void psp_media_presented(PspMediaSession *media);
+/* Retire a routine transport visit after visible video/input feedback. */
+void psp_media_service_after_present(PspMediaSession *media);
 
 /*
  * Feed the decoder while the caller is blocked on something that touches no

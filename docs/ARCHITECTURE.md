@@ -480,6 +480,21 @@ kinds, and none adds a mutator:
 | same-origin nested frame | 16 contexts per parent runtime | a QuickJS context sharing the parent's heap and `Budget` | direct object access, as the platform requires |
 | dedicated Web Worker | 4 contexts per page runtime | its own context and global; structured clone across the boundary | messages queued as platform tasks |
 | loaded child document (`<iframe>` navigation) | 4 per page | its own `ScriptRuntime`, document, and image set | a generation-tagged, sequence-numbered message queue pumped by the owner |
+| shared worker | none: `SharedWorker` is a constructor shell that creates no realm | — | — (construction throws `NotSupportedError`) |
+
+`SharedWorker` exists so feature detection sees a current browser, and every
+construction throws a `NotSupportedError` `DOMException` before allocating
+anything. Some sites read a missing `window.SharedWorker` as "old browser":
+one measured search page then loads about 2.2 MB of legacy and polyfill bundles
+instead of its 0.87 MB modern bundle. The shell allows its results to render
+within the existing page budget. Sites that really use shared workers catch the
+throw and take their fallback, as they do in browsers without it. The shell
+is defined eagerly in `compat.js` rather than behind the lazy Worker group,
+because that group costs 130-530 KiB of heap on pages that only probe the
+constructor; the eager class costs no measurable resident heap. A real
+per-page shared worker on the dedicated-worker machinery was prototyped and
+not adopted. Like the platform, the interface is exposed to windows only:
+dedicated worker globals do not resolve it.
 
 A Web Worker is concurrency in the page's programming model, not in the
 engine: `postMessage` crosses a structured-clone boundary into another
@@ -753,6 +768,72 @@ runtime `SyntaxError`, is checked token for token against the census corpora
 and by `tests/test_script_lazy.c`, and a plan that does not cover the whole
 registration takes the eager path. `TILEFINCH_LAZY_WEBPACK_PREFLIGHT=1`
 restores the up-front check for A/B measurement.
+
+### Function source outside the heap
+
+QuickJS keeps every function's source text for
+`Function.prototype.toString()`, and a lazily compiled function compiles
+from it on its first call. For a classic script that is about one copy of
+the whole script in the realm heap (a mean of 3.7 MB, a fifth of the heap,
+on the video pages that run out of JavaScript memory), plus a copy of each
+nested function's text while it compiles. A classic page script (inline or
+external) of at least 8 KiB therefore compiles with `JS_STRIP_SOURCE`, and
+its text goes to the realm's function-source store
+(`src/js_source_store.c`) in the page Budget, counted as JavaScript memory.
+Each function records only where its text is
+(`JS_SetExternalSourceHooks`, `third_party/quickjs/README.md`):
+`toString()` returns exactly what it returned before, a lazily compiled
+function reads its body from the store on its first call, and stacks keep
+file:line:col (the line tables stay). Modules are unchanged (a module of 8
+KiB or more keeps no text at all), and so are lazy-webpack factories, whose
+text that tier already keeps, eval, `Function` and worker scripts.
+
+The store holds each script as 16 KiB blocks. While the page has room a
+block is a plain copy, so loading a page costs a copy rather than an
+encode. Once plain text passes a quarter of the room left above the
+realm's growth reserve, the oldest plain blocks are compressed (an
+LZ4-compatible block codec shared with the lazy-webpack tier,
+`src/script_text_lz.c`), and a read decodes only the start of the block it
+needs, keeping that block for the next read. When the realm's growth would
+otherwise be refused, cached script bodies give way first, then the store
+compresses what is still plain, then drops whole scripts that no uncompiled
+lazy function needs, least recently read first. A script's text is dropped
+only then, so the store is never why a page runs out of memory;
+`toString()` of a function whose text was dropped answers with the
+`[native code]` form, as a stripped module's does. Text an uncompiled lazy
+function needs is never dropped, nor text a compile or a bytecode restore
+in progress holds a lease on. A block that does not compress is kept plain
+and not tried again. `toString()` first asks the store whether the text
+is still there and whether the blocks it spans are ASCII (each block is
+classified once, when compressed or on the first such question, so adding
+a script stays a plain copy). Dropped text answers `[native code]` without
+allocating anything for the text. ASCII text is read straight into the
+result string and other text is decoded a window at a time, so it needs
+about the result's size, as the in-heap text did.
+
+Script admission (the compile floor, the loader's pressure gate and the
+heavy-page memory estimate) subtracts the stored text from the room it
+sees, as if the text were still in the heap: a page admits the scripts it
+admitted before, and the room the store frees goes to the scripts it
+already runs. At the wall, a lazily compiled function that cannot compile
+fails its call uncatchably and stays uncompiled. Inside a promise reaction
+that still becomes a rejection, so the microtask checkpoint ends at that
+job and the rest of the queue runs on a later turn, after growth and
+collection have had a chance, instead of every waiting reaction retrying
+the same refused compile at once. Page code that catches the
+out-of-memory error at the limit and tries again is stopped as out of
+memory once one entry into JavaScript has had 256 allocations refused,
+instead of spinning until the execution deadline.
+
+The classic bytecode cache stores offsets, not text. A restore names the
+script text (it is at hand: the cache key is its digest) and the store
+copies it only if restored functions refer to it, before the script runs,
+so the loader may release the body while it runs. Bytecode whose lazy
+functions would have no text does not restore and the script compiles from
+source instead. `TILEFINCH_JS_SOURCE_STORE` (lab builds) selects the
+other policies for A/B measurement, `tilefinch-js-bench --only
+source_store,tostring` measures the copy, encode, compile and `toString()`
+costs, and the census prints a `census source-store` line per realm.
 
 ### WebAssembly
 

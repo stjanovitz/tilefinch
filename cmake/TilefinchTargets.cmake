@@ -13,6 +13,15 @@ target_compile_definitions(psp-browser-lab PRIVATE
 add_executable(psp-browser-interactive-lab src/interactive_main.c)
 target_link_libraries(psp-browser-interactive-lab PRIVATE tilefinch_core)
 if(NOT PSP)
+    # record-page-media / check-page-media: page video through the PSP's own
+    # HLS and range path (src/media_replay_check.c), recorded into or
+    # replayed from an HTTP trace.
+    target_sources(psp-browser-interactive-lab PRIVATE
+        src/media_replay_check.c src/psp_media_hls.c src/psp_hls_gzip.c)
+    target_include_directories(psp-browser-interactive-lab PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(psp-browser-interactive-lab PRIVATE
+        TILEFINCH_HAVE_MEDIA_REPLAY_CHECK=1)
     add_executable(psp-browser-media-probe tools/media_mp4_probe.c)
     target_link_libraries(psp-browser-media-probe PRIVATE tilefinch_core)
     add_executable(tilefinch-youtube-resolver-probe
@@ -416,6 +425,7 @@ if(PSP)
         # controller interaction, and PSP-native chrome.
         add_executable(psp-browser-script
             src/psp_script_main.c
+            src/psp_heap_reserve.c
             src/psp_app/psp_app_actions.c
             src/psp_app/psp_app_boot.c
             src/psp_app/psp_app_activation.c
@@ -439,6 +449,7 @@ if(PSP)
             src/psp_log.c
             src/psp_media_buffering.c
             src/psp_media_open.c
+            src/psp_media_retry.c
             src/psp_media_hls.c
             src/psp_hls_gzip.c
             src/psp_media_present_session.c
@@ -534,6 +545,11 @@ if(PSP)
         if(TILEFINCH_PSP_ENABLE_SWDEC_COMPONENT)
             add_dependencies(psp-browser-script tilefinch-swdec-bundle)
         endif()
+        # Boot sizes the newlib heap around an installed decoder add-on
+        # before libc starts (src/psp_heap_reserve.c). The relocatable
+        # browser below wraps the same function for the same object.
+        target_link_options(psp-browser-script PRIVATE
+            "LINKER:--wrap=__libcglue_init")
         # Older build trees staged the optional PRXs beside EBOOT.PBP. Remove
         # those stale outputs on every browser link: current builds emit only
         # the separate components/swdec add-on bundle.
@@ -584,17 +600,16 @@ if(PSP)
             target_sources(psp-browser-script PRIVATE
                 src/psp_input_script.c
                 src/psp_app/psp_app_input_script.c
+                src/psp_input_page_media.c
                 src/psp_app/psp_app_validation_qualify.c
                 src/psp_app/psp_app_validation_cadence.c
                 src/psp_app/psp_app_validation_loop.c
                 src/psp_app/psp_app_validation_present.c
-                src/psp_webgl_ge_probe.c
                 src/js_bench.c
                 src/psp_media_fixture.c
                 src/psp_media_range_probe.c
                 src/psp_raster_fixture.c
                 "${_tilefinch_media_fixture_blob}")
-            target_link_libraries(psp-browser-script PRIVATE pspgum)
             set_property(TARGET psp-browser-script APPEND PROPERTY
                 LINK_DEPENDS
                 "${TILEFINCH_MEDIA_FIXTURE_240}"
@@ -691,9 +706,11 @@ if(PSP)
             # last recorded 5,029,216 bytes (2026-10-04).
             set(TILEFINCH_PSP_TEXT_LIMIT 5500000)
         else()
-            # Ordinary: 5,114,112 bytes, user-approved 2026-10-15 (200 KiB
-            # headroom); last measured 5,025,356 bytes (2026-10-21, 8c0487d6).
-            set(TILEFINCH_PSP_TEXT_LIMIT 5114112)
+            # Ordinary: 5,216,512 bytes, user-approved 2026-10-28 (+100 KiB
+            # so the QuickJS PGO build fits: 5,129,680 bytes with PGO and
+            # 5,087,376 without at 27b7f9ab). Previous limit 5,114,112
+            # (2026-10-15).
+            set(TILEFINCH_PSP_TEXT_LIMIT 5216512)
         endif()
         # Local size experiments only (an engine built at -O2 under PPSSPP,
         # for instance): a build directory that sets this is over the
@@ -1009,13 +1026,6 @@ if(PSP)
             target_link_libraries(psp-browser-script-dev-prx PRIVATE
                 m pspdisplay pspge pspctrl pspgu pspdmac psppower
                 pspaudiocodec pspaudio psputility)
-            if(TILEFINCH_PSP_VALIDATION_LOG)
-                # Validation objects include the native WebGL GE probe. The
-                # relocatable PSPLink link reuses those exact objects, so it
-                # must carry the same GUM dependency as the validation EBOOT.
-                target_link_libraries(psp-browser-script-dev-prx PRIVATE
-                    pspgum)
-            endif()
             if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.31")
                 set_property(TARGET psp-browser-script-dev-prx PROPERTY
                     LINK_LIBRARIES_STRATEGY REORDER_MINIMALLY)

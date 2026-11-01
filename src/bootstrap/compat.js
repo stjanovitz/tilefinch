@@ -169,6 +169,9 @@
     Object.defineProperties(HTMLLinkElement.prototype, {
       as: reflectString("as"),
       integrity: reflectString("integrity"),
+      /* The deferred-CSS idiom assigns link.media = "all" from onload; an
+         expando left the media attribute, and the sheet, disabled. */
+      media: reflectString("media"),
       referrerPolicy: reflectString("referrerPolicy"),
       relList: {
         configurable: true,
@@ -593,6 +596,8 @@
           ? CustomEvent
           : name === "ErrorEvent"
             ? ErrorEvent
+          : name === "StorageEvent"
+            ? StorageEvent
           : name === "CompositionEvent"
             ? CompositionEvent
           : name.toLowerCase() === "textevent"
@@ -866,6 +871,91 @@
       value: errorEventConstructor,
     },
   });
+  /* Events that carry only their init dictionary. Tilefinch is one tab
+     and never fires cross-document `storage` events, but pages construct
+     them (Firebase's localStorage polling builds StorageEvents); same-
+     document navigation fires the other two. `fields` maps each attribute
+     to its default and its conversion. PageTransitionEvent,
+     PromiseRejectionEvent and BeforeUnloadEvent are left out: nothing
+     fires them, and the three cost an 8 KiB step of resident bootstrap. */
+  const initEventStates = new WeakMap(),
+    initEventState = (event) => {
+      const state = initEventStates.get(event);
+      if (!state) throw new TypeError("Illegal invocation");
+      return state;
+    },
+    initEventStore = (event, init, fields) => {
+      const state = {};
+      for (const name in fields) {
+        const value = init == null ? undefined : init[name];
+        state[name] = value === undefined
+          ? fields[name][0]
+          : fields[name][1](value);
+      }
+      initEventStates.set(event, state);
+      return state;
+    },
+    defineInitEvent = (Interface, fields) => {
+      const descriptors = { [Symbol.toStringTag]: {
+        configurable: true,
+        value: Interface.name,
+      } };
+      for (const name in fields)
+        descriptors[name] = Object.getOwnPropertyDescriptor({
+          get [name]() { return initEventState(this)[name]; },
+        }, name);
+      Object.defineProperties(Interface.prototype, descriptors);
+      Object.defineProperty(globalThis, Interface.name, {
+        configurable: true,
+        writable: true,
+        value: Interface,
+      });
+    },
+    anyValue = (value) => value,
+    nullableString = (value) => value === null ? null : String(value),
+    storageEventFields = {
+      key: [null, nullableString],
+      oldValue: [null, nullableString],
+      newValue: [null, nullableString],
+      url: ["", String],
+      storageArea: [null, (value) => {
+        if (value !== null && !(value instanceof Storage))
+          throw new TypeError("storageArea is not a Storage");
+        return value;
+      }],
+    };
+  defineInitEvent(class StorageEvent extends Event {
+    constructor(type, init = undefined) {
+      super(type, init ?? {});
+      initEventStore(this, init, storageEventFields);
+    }
+    initStorageEvent(type, bubbles = false, cancelable = false, key = null,
+      oldValue = null, newValue = null, url = "", storageArea = null) {
+      if (arguments.length < 1)
+        throw new TypeError("StorageEvent type is required");
+      if (this.__dispatching) return;
+      this.initEvent(type, bubbles, cancelable);
+      initEventStore(this, { key, oldValue, newValue, url, storageArea },
+        storageEventFields);
+    }
+  }, storageEventFields);
+  const hashChangeEventFields = { oldURL: ["", String], newURL: ["", String] };
+  defineInitEvent(class HashChangeEvent extends Event {
+    constructor(type, init = undefined) {
+      super(type, init ?? {});
+      initEventStore(this, init, hashChangeEventFields);
+    }
+  }, hashChangeEventFields);
+  const popStateEventFields = {
+    state: [null, anyValue],
+    hasUAVisualTransition: [false, Boolean],
+  };
+  defineInitEvent(class PopStateEvent extends Event {
+    constructor(type, init = undefined) {
+      super(type, init ?? {});
+      initEventStore(this, init, popStateEventFields);
+    }
+  }, popStateEventFields);
   const messageEventStates = new WeakMap(),
     messageEventStateGet = messageEventStates.get.bind(messageEventStates),
     messageEventStateSet = messageEventStates.set.bind(messageEventStates),
@@ -3680,6 +3770,7 @@
       rejected: 0,
       rejectedBytes: 0,
       launchFailed: 0,
+      poolDeferred: 0,
       localBlobReads: 0,
       localBlobFailures: 0,
       currentCount: 0,
@@ -3757,16 +3848,25 @@
       entry.state = "launching";
       try {
         const nativeId = Number(entry.start());
-        if (nativeId === 0) {
+        if (nativeId === 0 || nativeId === -1) {
           /* Native policy has already admitted this immutable request.  Zero
-             means the shared page scheduler is temporarily full.  Put the
-             same entry back at the head so neither a later mutation nor a
-             later request can overtake it, then retry from a future timer
-             turn instead of spinning the single browser thread. */
+             means the shared page scheduler is temporarily full; -1 means
+             this realm's own requests fill its fetch pool or native request
+             table.  Put the same entry back at the head so neither a later
+             mutation nor a later request can overtake it.  A shared
+             scheduler frees capacity without telling this realm, so retry
+             from a future timer turn instead of spinning the single browser
+             thread.  This realm's own completions and cancellations already
+             pump the queue, so a full pool keeps only a slow fallback
+             timer: polling it every 10 ms re-ran the whole native admission
+             path hundreds of times while one long-lived request stayed
+             open. */
           entry.state = "waiting";
           waitingNetwork.unshift(entry);
           networkQueueStats.waiting++;
-          entry.nativeId = setTimeout(pumpNetworkQueue, 10);
+          if (nativeId === -1) networkQueueStats.poolDeferred++;
+          entry.nativeId = setTimeout(
+            pumpNetworkQueue, nativeId === -1 ? 250 : 10);
           break;
         }
         if (!Number.isSafeInteger(nativeId) || nativeId < 0)
@@ -4361,9 +4461,14 @@
   globalThis.__tilefinchFetchWorkerScriptSync = (
     url, mode = "cors", credentials = "same-origin",
   ) => {
-    const raw = __tilefinchFetchSync(
-      "GET", String(url), undefined, "", "", mode, credentials, 2,
-      undefined, "about:client", "");
+    /* A transport or policy failure is the script's NetworkError, as an
+       HTTP error status is. */
+    let raw = null;
+    try {
+      raw = __tilefinchFetchSync(
+        "GET", String(url), undefined, "", "", mode, credentials, 2,
+        undefined, "about:client", "");
+    } catch (_) {}
     if (!raw || Number(raw.status) < 200 || Number(raw.status) >= 300)
       throw new DOMException("Worker script could not be loaded", "NetworkError");
     if (typeof raw.body === "string") return raw.body;
@@ -5942,6 +6047,26 @@
       markXhrNative(descriptor?.set);
     }
   }
+  /* SharedWorker is a shell: present for feature detection, refusing every
+     construction. Sites that test `window.SharedWorker` to tell a modern
+     browser from an old one take their modern path instead of loading
+     larger legacy and polyfill bundles, and real use takes
+     its try/catch fallback. It is eager on purpose: routing it through the
+     lazy Worker group would charge that module to pages that only probe. */
+  globalThis.SharedWorker = class SharedWorker extends EventTarget {
+    /* Refuses before super(), so a refused construction allocates no
+       EventTarget. The parameter gives the constructor length 1. */
+    constructor(scriptURL) {
+      if (arguments.length < 1)
+        throw new TypeError(
+          "Failed to construct 'SharedWorker': 1 argument required");
+      throw new DOMException(
+        "SharedWorker is not supported", "NotSupportedError");
+    }
+  };
+  Object.defineProperty(globalThis.SharedWorker.prototype, Symbol.toStringTag,
+    { configurable: true, value: "SharedWorker" });
+  markXhrNative(globalThis.SharedWorker);
   if (globalThis.__tilefinchRootCensus)
     Object.defineProperty(globalThis.__tilefinchRootCensus, "pendingNetwork", {
       get: () => pendingNetwork.size,

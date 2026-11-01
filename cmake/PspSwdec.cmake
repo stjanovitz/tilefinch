@@ -13,7 +13,18 @@ if(NOT TILEFINCH_SWDEC_SOURCE_DIR)
 endif()
 
 set(_swdec_ffmpeg_source "${TILEFINCH_SWDEC_SOURCE_DIR}/ffmpeg")
-set(_swdec_ffmpeg_libraries "${TILEFINCH_SWDEC_SOURCE_DIR}/libs/asm22")
+# A validation tree's component carries the decoder's diagnostics: logging,
+# the per-access-unit stage report (swdec_me.c, SWDEC_STAGE_DIAG), fault
+# injection and the measurement hooks, linked against the FFmpeg build that
+# has them (libs/asm22-diag). Any other tree builds the release component,
+# with none of it, against libs/asm22. See src/swdec/swdec_diag.h.
+if(TILEFINCH_PSP_VALIDATION_LOG)
+    set(_swdec_diagnostics 1)
+    set(_swdec_ffmpeg_libraries "${TILEFINCH_SWDEC_SOURCE_DIR}/libs/asm22-diag")
+else()
+    set(_swdec_diagnostics 0)
+    set(_swdec_ffmpeg_libraries "${TILEFINCH_SWDEC_SOURCE_DIR}/libs/asm22")
+endif()
 foreach(_swdec_required IN ITEMS
         "${_swdec_ffmpeg_source}/libavcodec/avcodec.h"
         "${_swdec_ffmpeg_libraries}/libavcodec.a"
@@ -63,6 +74,28 @@ add_custom_command(
 add_custom_target(tilefinch-swdec-meload
     DEPENDS "${_swdec_meload_build}/swdec-meload.prx")
 
+set(_swdec_component_sources
+    "${_swdec_source}/swdec_component_psp.c"
+    "${_swdec_source}/swdec.c"
+    "${_swdec_source}/swdec.h"
+    "${_swdec_source}/swdec_bounds.h"
+    "${_swdec_source}/swdec_diag.h"
+    "${_swdec_source}/swdec_csc_mask.h"
+    "${_swdec_source}/swdec_csc.c"
+    "${_swdec_source}/swdec_csc.h"
+    "${_swdec_source}/swdec_arena.c"
+    "${_swdec_source}/swdec_arena.h"
+    "${_swdec_source}/swdec_me.c"
+    "${_swdec_source}/swdec_me.h"
+    "${_swdec_source}/swdec_recon_diag.c"
+    "${_swdec_source}/swdec_recon_diag.h"
+    "${_swdec_source}/swdec_chroma_replay.c"
+    "${_swdec_source}/swdec_chroma_replay.h"
+    "${_swdec_source}/swdec_meload.S"
+    "${_swdec_source}/Makefile.psp"
+    "${_swdec_source}/exports.exp"
+)
+
 add_custom_command(
     OUTPUT "${_swdec_build}/tilefinch-swdec.prx"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${_swdec_build}"
@@ -72,20 +105,11 @@ add_custom_command(
         "TILEFINCH_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
         "FFMPEG_SOURCE_DIR=${_swdec_ffmpeg_source}"
         "FFMPEG_LIBRARY_DIR=${_swdec_ffmpeg_libraries}"
+        "SWDEC_DIAGNOSTICS=${_swdec_diagnostics}"
     WORKING_DIRECTORY "${_swdec_build}"
     DEPENDS
         tilefinch-swdec-meload
-        "${_swdec_source}/swdec_component_psp.c"
-        "${_swdec_source}/swdec.c"
-        "${_swdec_source}/swdec.h"
-        "${_swdec_source}/swdec_bounds.h"
-        "${_swdec_source}/swdec_csc_mask.h"
-        "${_swdec_source}/swdec_arena.c"
-        "${_swdec_source}/swdec_arena.h"
-        "${_swdec_source}/swdec_me.c"
-        "${_swdec_source}/swdec_me.h"
-        "${_swdec_source}/swdec_meload.S"
-        "${_swdec_source}/Makefile.psp"
+        ${_swdec_component_sources}
         "${_swdec_ffmpeg_libraries}/libavcodec.a"
         "${_swdec_ffmpeg_libraries}/libavutil.a"
     COMMENT "Building the optional swdec High-profile decoder component"
@@ -113,10 +137,63 @@ add_custom_command(
         "${_swdec_bundle}/component-info.txt"
     DEPENDS tilefinch-swdec-component
         "${_swdec_build}/component-info.txt"
+        "${_swdec_build}/tilefinch-swdec.prx"
+        "${_swdec_meload_build}/swdec-meload.prx"
     COMMENT "Staging the user-installed software-decoder add-on"
     VERBATIM)
 add_custom_target(tilefinch-swdec-bundle
     DEPENDS "${_swdec_bundle}/component-info.txt")
+
+# Validation trees also build the release component (no diagnostics,
+# libs/asm22) beside the diagnostic one, as tilefinch-swdec-addon-release:
+# performance acceptance runs use it with the validation browser, whose
+# steady-window lines need nothing from the component, and profiling runs
+# use the diagnostic add-on. Same sources, same ABI marker.
+if(TILEFINCH_PSP_VALIDATION_LOG)
+    set(_swdec_release_build "${CMAKE_CURRENT_BINARY_DIR}/swdec-component-release")
+    set(_swdec_release_bundle "${CMAKE_CURRENT_BINARY_DIR}/tilefinch-swdec-addon-release")
+    set(_swdec_release_libraries "${TILEFINCH_SWDEC_SOURCE_DIR}/libs/asm22")
+    file(MAKE_DIRECTORY "${_swdec_release_build}")
+    add_custom_command(
+        OUTPUT "${_swdec_release_build}/tilefinch-swdec.prx"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${_swdec_release_build}"
+        COMMAND ${TILEFINCH_SWDEC_MAKE_EXECUTABLE}
+            -f "${_swdec_source}/Makefile.psp"
+            "SWDEC_SOURCE_DIR=${_swdec_source}"
+            "TILEFINCH_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+            "FFMPEG_SOURCE_DIR=${_swdec_ffmpeg_source}"
+            "FFMPEG_LIBRARY_DIR=${_swdec_release_libraries}"
+            "SWDEC_DIAGNOSTICS=0"
+        WORKING_DIRECTORY "${_swdec_release_build}"
+        DEPENDS
+            tilefinch-swdec-meload
+            ${_swdec_component_sources}
+            "${_swdec_release_libraries}/libavcodec.a"
+            "${_swdec_release_libraries}/libavutil.a"
+        COMMENT "Building the release swdec component for acceptance runs"
+        VERBATIM)
+    add_custom_command(
+        OUTPUT "${_swdec_release_bundle}/component-info.txt"
+        COMMAND ${CMAKE_COMMAND} -E rm -rf "${_swdec_release_bundle}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${_swdec_release_bundle}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${_swdec_release_build}/tilefinch-swdec.prx"
+            "${_swdec_release_bundle}/tilefinch-swdec.prx"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${_swdec_meload_build}/swdec-meload.prx"
+            "${_swdec_release_bundle}/swdec-meload.prx"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${_swdec_build}/component-info.txt"
+            "${_swdec_release_bundle}/component-info.txt"
+        DEPENDS
+            "${_swdec_release_build}/tilefinch-swdec.prx"
+            "${_swdec_build}/component-info.txt"
+            "${_swdec_meload_build}/swdec-meload.prx"
+        COMMENT "Staging the release software-decoder add-on for acceptance runs"
+        VERBATIM)
+    add_custom_target(tilefinch-swdec-release-bundle
+        DEPENDS "${_swdec_release_bundle}/component-info.txt")
+endif()
 
 # This is intentionally an ordinary EBOOT rather than a PSPLink-only PRX.
 # It exercises the same user-EBOOT -> user PRX -> kernel-helper boundary as

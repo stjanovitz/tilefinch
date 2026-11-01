@@ -442,12 +442,13 @@ globalThis.__tilefinchInstallWorker = (
       Object.defineProperties(WorkerXMLHttpRequest.prototype,{
         open:{configurable:true,writable:true,value:function(method,url,
             async=true){
-          const text=String(url),
-            absolute=/^[A-Za-z][A-Za-z0-9+.-]*:/.test(text);
-          if(workerURL.startsWith('blob:')&&!absolute)
-            throw new DOMException('Invalid URL','SyntaxError');
-          return Base.prototype.open.call(this,method,
-            absolute?new URL(text).href:new URL(text,workerURL).href,async);
+          /* Absolute input ignores the worker's base; relative input
+             against a blob: worker URL is invalid. */
+          const text=String(url);
+          let href;
+          try{href=new URL(text,workerURL).href}
+          catch(_){throw new DOMException('Invalid URL','SyntaxError')}
+          return Base.prototype.open.call(this,method,href,async);
         }},
         responseType:{configurable:true,
           get(){return responseType.get.call(this)},
@@ -1588,23 +1589,8 @@ globalThis.__tilefinchInstallWorker = (
             /* A Worker has its own API base URL.  In particular a relative
                URL cannot be resolved against a blob: worker URL; it must not
                silently inherit the owning document's base URL. */
-            if (!(input instanceof OwnerRequest)) {
-              const text = trustedString(input),
-                absolute = /^[A-Za-z][A-Za-z0-9+.-]*:/.test(text);
-              if (
-                workerURL.startsWith("blob:") &&
-                !absolute
-              )
-                throw new TypeError("Invalid URL");
-              /* An absolute input does not depend on the worker's base. The
-                 URL parser used by the PSP intentionally cannot resolve a
-                 relative reference against blob:, so passing that base even
-                 for an absolute network URL incorrectly rejected every
-                 fetch from a blob Worker. */
-              input = absolute
-                ? new URL(text).href
-                : new URL(text, workerURL).href;
-            }
+            if (!(input instanceof OwnerRequest))
+              input = new URL(trustedString(input), workerURL).href;
             super(input, init);
           }
         };
@@ -2374,9 +2360,16 @@ globalThis.__tilefinchInstallWorker = (
         if (urls.length > 8)
           throw new RangeError("worker importScripts quota exceeded");
         for (const value of urls) {
-          const importedReference = trustedString(value),
-            importedURL = new URL(importedReference, workerURL).href,
-            importedBlob = blobForURL(importedURL);
+          /* Absolute URLs ignore the worker's base, so a blob: Worker can
+             import network scripts; a relative one against blob: fails. */
+          const importedReference = trustedString(value);
+          let importedURL;
+          try {
+            importedURL = new URL(importedReference, workerURL).href;
+          } catch (_) {
+            throw new DOMException("Invalid script URL", "SyntaxError");
+          }
+          const importedBlob = blobForURL(importedURL);
           if (!importedBlob && !/^https?:/.test(importedURL))
             throw new DOMException(
               "Worker script could not be loaded", "NetworkError");
@@ -2391,10 +2384,7 @@ globalThis.__tilefinchInstallWorker = (
       scope.__tilefinchWorkerBlobText = blobTextForWorker;
       scope.__tilefinchOwnerWorkerPrototype = globalThis.Worker.prototype;
       scope.__tilefinchCreateNestedWorker = (url, options) => {
-        const text = trustedString(url),
-          absolute = /^[A-Za-z][A-Za-z0-9+.-]*:/.test(text),
-          nestedURL = absolute ? new URL(text).href
-            : new URL(text, workerURL).href,
+        const nestedURL = new URL(trustedString(url), workerURL).href,
           child = new globalThis.Worker(nestedURL, options);
         state.children.add(child);
         return child;

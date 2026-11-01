@@ -153,6 +153,9 @@ def lab_command(lab, site, run_dir, network_args, reload_count,
             "--output", os.path.join(run_dir, "frames", "final.ppm")]
     if reload_count:
         args += ["--reload", str(reload_count)]
+    # Per-page lab arguments from the page's corpus meta.json
+    # ("replay_lab_args"), such as a tighter --limit-mb for a canary entry.
+    args += site.get("lab_args", [])
     # Experiment knobs (for example --classic-bytecode-cache-kb 2048).
     args += os.environ.get("CENSUS_LAB_ARGS", "").split()
     return args + network_args
@@ -254,7 +257,8 @@ def capture(args):
 
 def trace_complete(trace):
     try:
-        return "capture-complete=yes" in open(os.path.join(trace, "trace.meta")).read()
+        with open(os.path.join(trace, "trace.meta")) as f:
+            return "capture-complete=yes" in f.read()
     except OSError:
         return False
 
@@ -269,6 +273,11 @@ def replay(args):
 
     def one(site):
         trace = os.path.join(corpus, site["name"], "capture")
+        meta_path = os.path.join(corpus, site["name"], "meta.json")
+        if os.path.exists(meta_path):
+            with open(meta_path) as f:
+                lab_args = json.load(f).get("replay_lab_args", [])
+            site = dict(site, lab_args=[str(a) for a in lab_args])
         reps = []
         for rep in range(args.repeat):
             run_dir = os.path.join(out, site["name"] + ("" if rep == 0 else ".r%d" % (rep + 1)))
@@ -349,7 +358,8 @@ def merge_repeats(reps):
 def page_cost(corpus, site):
     """Previous capture wall time, to start the slowest pages first."""
     try:
-        return json.load(open(os.path.join(corpus, site["name"], "meta.json")))["wall_s"]
+        with open(os.path.join(corpus, site["name"], "meta.json")) as f:
+            return json.load(f)["wall_s"]
     except (OSError, ValueError, KeyError):
         return 0
 

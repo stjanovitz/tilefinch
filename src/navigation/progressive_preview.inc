@@ -504,6 +504,8 @@ static void navigation_stream_try_pre_eof_preview(
                     stream, document, fingerprint))
                 NAVIGATION_PREVIEW_REFUSE(stream, &decision, "continue");
         } else {
+            if (navigation_stream_style_prepare_for_preview(stream))
+                NAVIGATION_PREVIEW_SKIP(stream, "style-preparing");
             stream->pre_eof_preview_style_refresh_attempted = true;
             session->performance.streaming_preview_style_refresh_attempts++;
             const size_t refresh_estimate = 1u * 1024u * 1024u;

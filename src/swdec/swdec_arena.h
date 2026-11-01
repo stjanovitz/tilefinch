@@ -33,8 +33,10 @@ void swdec_arena_route_aux(int on);
 size_t swdec_arena_aux_peak(void);
 void *swdec_arena_aux_base(void);
 size_t swdec_arena_aux_bytes(void);
-void swdec_arena_debug(int which, unsigned out[4]);
+#if defined(SWDEC_DIAGNOSTICS) && SWDEC_DIAGNOSTICS
+void swdec_arena_debug(int which, unsigned out[4]);   /* diagnostics only */
 extern unsigned swdec_arena_aux_routed_cpu;
+#endif
 size_t swdec_arena_peak(void);
 size_t swdec_arena_in_use(void);
 

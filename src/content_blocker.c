@@ -48,6 +48,8 @@ struct ContentBlocker {
     size_t requests_considered;
     size_t requests_blocked;
     bool truncated;
+    /* The open player page's site, or empty (see player_page_hosts). */
+    char player_site[CONTENT_BLOCKER_HOST_LIMIT];
 };
 
 typedef struct {
@@ -76,6 +78,48 @@ static const char *const basic_hosts[] = {
     "serving-sys.com", "sharethrough.com", "smartadserver.com",
     "smaato.net", "taboola.com", "teads.tv", "triplelift.com",
     "yieldmo.com", "zedo.com"
+};
+
+/* A player page (the page a site declares as its video's player, opened
+   only to play that video: the embed hop) also refuses third-party hosts
+   that are not needed to play it: more ad and ad-verification hosts,
+   analytics, tag managers, session replay and error reporting, social
+   pixels, consent managers, captcha/bot SDKs, payments and support chat.
+   It applies to requests that page initiates, on top of BASIC or CUSTOM,
+   and never to any other page. */
+static const char *const player_page_hosts[] = {
+    "googletagservices.com", "imasdk.googleapis.com", "adsafeprotected.com",
+    "doubleverify.com", "flashtalking.com", "springserve.com",
+    "spotxchange.com", "fwmrm.net", "aniview.com", "primis.tech",
+    "adlightning.com", "confiant-integrations.net", "yahoo.com", "3lift.com",
+    "sonobi.com", "gumgum.com", "kargo.com", "sovrn.com", "nativo.com",
+    "ads-twitter.com", "adsymptotic.com", "google-analytics.com",
+    "googletagmanager.com", "analytics.google.com", "segment.io",
+    "segment.com", "mixpanel.com", "amplitude.com", "heap.io",
+    "heapanalytics.com", "hotjar.com", "fullstory.com", "clarity.ms",
+    "newrelic.com", "nr-data.net", "datadoghq.com",
+    "datadoghq-browser-agent.com", "browser-intake-datadoghq.com",
+    "sentry.io", "sentry-cdn.com", "bugsnag.com", "chartbeat.com",
+    "chartbeat.net", "scorecardresearch.com", "parsely.com", "parse.ly",
+    "omtrdc.net", "adobedtm.com", "tiqcdn.com", "branch.io", "braze.com",
+    "appsflyer.com", "optimizely.com", "imrworldwide.com", "conviva.com",
+    "litix.io", "npaw.com", "youboranqs01.com", "jwpltx.com", "permutive.com",
+    "permutive.app", "cxense.com", "piano.io", "tinypass.com",
+    "bounceexchange.com", "bouncex.net", "krxd.net", "bluekai.com",
+    "everesttech.net", "agkn.com", "mparticle.com", "mc.yandex.ru",
+    "top-fwz1.mail.ru", "hm.baidu.com", "cnzz.com", "umeng.com",
+    "connect.facebook.net", "analytics.tiktok.com", "tiktokw.us",
+    "sc-static.net", "snapchat.com", "bat.bing.com", "snap.licdn.com",
+    "ads.linkedin.com", "ct.pinterest.com", "redditstatic.com", "quora.com",
+    "onetrust.com", "cookielaw.org", "cookiebot.com", "didomi.io",
+    "privacy-mgmt.com", "trustarc.com", "consensu.org", "usercentrics.eu",
+    "sourcepoint.com", "hcaptcha.com", "arkoselabs.com", "funcaptcha.com",
+    "px-cdn.net", "px-cloud.net", "perimeterx.net", "stripe.com",
+    "stripe.network", "paypal.com", "paypalobjects.com",
+    "braintreegateway.com", "adyen.com", "recurly.com", "chargebee.com",
+    "intercom.io", "intercomcdn.com", "zdassets.com", "zendesk.com",
+    "drift.com", "livechatinc.com", "crisp.chat", "hs-scripts.com",
+    "hs-analytics.net", "hubspot.com", "onesignal.com", "pushwoosh.com"
 };
 
 /* Match a class-token prefix at the beginning of the attribute or after any
@@ -618,7 +662,20 @@ bool content_blocker_would_block(
     if (blocker_site_allowed(blocker, initiator_site)) return false;
     bool third_party = strcmp(request_site, initiator_site) != 0;
     bool blocked = false, allowed = false;
-    if (blocker->mode == CONTENT_BLOCKER_BASIC) {
+    if (third_party && blocker->player_site[0] != '\0'
+        && strcmp(initiator_site, blocker->player_site) == 0) {
+        for (size_t i = 0; !blocked
+             && i < sizeof(player_page_hosts) / sizeof(player_page_hosts[0]);
+             i++)
+            blocked = blocker_host_suffix(host, player_page_hosts[i]);
+    }
+    if (blocked) {
+        /* A CUSTOM allow rule still wins below. */
+        if (blocker->mode == CONTENT_BLOCKER_CUSTOM)
+            (void) blocker_custom_host_decision(
+                blocker, host, blocker_destination_type(destination),
+                third_party, &allowed, &blocked);
+    } else if (blocker->mode == CONTENT_BLOCKER_BASIC) {
         if (third_party) {
             for (size_t i = 0;
                  i < sizeof(basic_hosts) / sizeof(basic_hosts[0]); i++) {
@@ -685,6 +742,25 @@ bool content_blocker_should_block(
         blocker, request_url, initiator_url, destination, fetch_mode);
     if (decision) blocker->requests_blocked++;
     return decision;
+}
+
+void content_blocker_set_player_page(ContentBlocker *blocker,
+                                     const char *page_url)
+{
+    if (blocker == NULL) return;
+    if (page_url == NULL
+        || !content_blocker_site_from_url(page_url, blocker->player_site))
+        blocker->player_site[0] = '\0';
+}
+
+bool content_blocker_player_page(const ContentBlocker *blocker,
+                                 const char *document_url)
+{
+    char site[CONTENT_BLOCKER_HOST_LIMIT];
+    return blocker != NULL && blocker->player_site[0] != '\0'
+        && document_url != NULL
+        && content_blocker_site_from_url(document_url, site)
+        && strcmp(site, blocker->player_site) == 0;
 }
 
 bool content_blocker_metrics(const ContentBlocker *blocker,

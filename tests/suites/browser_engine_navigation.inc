@@ -452,6 +452,93 @@ static bool bounded_focus_engine_focused(BrowserEngine *engine,
         lxb_dom_interface_element(node), marker, sizeof(marker) - 1u);
 }
 
+/* A scroll press that cannot move the page (a page shorter than the
+   screen, or one already at its edge) succeeds but reports no change, so the
+   frontend owes no frame; a press that moves reports a change and the next
+   frame shows it. */
+static int test_scroll_noop_reports_unchanged(void)
+{
+    puts("test: a scroll press at the page's edge owes no frame");
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 16u * MIB;
+    config.tile_capacity = 24;
+    config.resources.enabled = false;
+    config.javascript.enabled = false;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error,
+                                                  sizeof(error));
+    static const char short_page[] =
+        "<!doctype html><meta name=viewport content='width=device-width'>"
+        "<body style='margin:0'><p>Nothing to scroll</p>";
+    CHECK(engine != NULL
+          && browser_engine_commit_html(engine, "https://noop.test/",
+                                        short_page, strlen(short_page), true)
+          && browser_engine_render_frame(engine, NULL));
+    const NavigationSession *navigation = browser_engine_navigation(engine);
+    const TileCache *render = browser_engine_render_metrics_view(engine);
+    size_t pixels = 0;
+    uint64_t shown = frame_checksum(
+        browser_engine_framebuffer(engine, &pixels), pixels);
+    size_t frames = render->frames_rendered;
+    uint64_t shell = browser_engine_render_shell_serial(engine);
+    static const struct { BrowserScrollRequest request; int amount; }
+        presses[] = {
+            {BROWSER_SCROLL_PAGE, 1}, {BROWSER_SCROLL_PAGE, -1},
+            {BROWSER_SCROLL_BY, 40}, {BROWSER_SCROLL_BY, -40},
+            {BROWSER_SCROLL_EDGE, 1}, {BROWSER_SCROLL_EDGE, 0}
+        };
+    for (size_t at = 0; at < sizeof(presses) / sizeof(presses[0]); at++) {
+        bool changed = true;
+        CHECK(browser_engine_scroll(engine, presses[at].request,
+                                    presses[at].amount, &changed)
+              && !changed
+              && navigation_current(navigation)->scroll_y == 0);
+    }
+    /* No damage either: nothing rendered, the frame is the one shown. */
+    CHECK(render->frames_rendered == frames
+          && browser_engine_render_shell_serial(engine) == shell
+          && !browser_engine_render_frame_pending(engine)
+          && frame_checksum(browser_engine_framebuffer(engine, &pixels),
+                            pixels) == shown);
+    /* The per-kind calls keep reporting success. */
+    CHECK(browser_engine_scroll_page(engine, 1));
+
+    static char long_page[16384];
+    size_t used = (size_t) snprintf(long_page, sizeof(long_page),
+        "<!doctype html><meta name=viewport content='width=device-width'>"
+        "<style>body{margin:0}p{margin:0;height:20px}</style>");
+    for (unsigned i = 0; i < 100; i++)
+        used += (size_t) snprintf(long_page + used, sizeof(long_page) - used,
+                                  "<p>Line %u</p>", i);
+    CHECK(used < sizeof(long_page)
+          && browser_engine_commit_html(engine, "https://noop.test/long",
+                                        long_page, used, true)
+          && browser_engine_render_frame(engine, NULL));
+    shown = frame_checksum(browser_engine_framebuffer(engine, &pixels),
+                           pixels);
+    bool changed = false;
+    CHECK(browser_engine_scroll(engine, BROWSER_SCROLL_PAGE, 1, &changed)
+          && changed && navigation_current(navigation)->scroll_y > 0
+          && browser_engine_render_frame(engine, NULL)
+          && frame_checksum(browser_engine_framebuffer(engine, &pixels),
+                            pixels) != shown);
+    CHECK(browser_engine_scroll(engine, BROWSER_SCROLL_EDGE, 1, &changed)
+          && changed && browser_engine_render_frame(engine, NULL));
+    int bottom = navigation_current(navigation)->scroll_y;
+    frames = render->frames_rendered;
+    CHECK(browser_engine_scroll(engine, BROWSER_SCROLL_PAGE, 1, &changed)
+          && !changed && navigation_current(navigation)->scroll_y == bottom
+          && render->frames_rendered == frames
+          && !browser_engine_render_frame_pending(engine));
+    CHECK(browser_engine_scroll(engine, BROWSER_SCROLL_BY, -20, &changed)
+          && changed && navigation_current(navigation)->scroll_y < bottom);
+    browser_engine_destroy(engine);
+    return 0;
+}
+
 static int test_bounded_focus_frontend_settles(void)
 {
     puts("test: frontend input settles a bounded focus layout unless "

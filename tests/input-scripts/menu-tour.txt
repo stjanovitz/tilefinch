@@ -35,10 +35,17 @@ tap cross
 wait 20
 mark page
 
-# Ordinary page interaction remains contextual.
+# Ordinary page interaction remains contextual. Run with --data-dir
+# tests/fixtures/ppsspp-menu-tour-data (the home-menu journey does), the
+# screenshot list is a little taller than the screen: page-down reaches the
+# end, a second page-down is a no-op there, page-up returns to the top and a
+# second page-up is a no-op. Without the seed all four are no-ops; the
+# receiver trace is the same either way.
 tap down
 tap right
 tap rtrigger
+tap rtrigger
+tap ltrigger
 tap ltrigger
 wait 8
 mark scrolled

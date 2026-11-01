@@ -8,6 +8,7 @@ FormData	platform.js
 Headers	compat.js
 Request	compat.js
 Response	compat.js
+SharedWorker	compat.js
 TrustedHTML	compat.js
 TrustedScript	compat.js
 TrustedScriptURL	compat.js

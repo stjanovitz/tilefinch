@@ -265,6 +265,14 @@ bool navigation_advance_runtime(NavigationSession *session,
                     session, session->page.runtime)) return false;
             if (script_runtime_consume_relayout(session->page.runtime)
                 && !navigation_relayout(session)) return false;
+            /* A relayout refused for memory may have kept the page as
+               static with every realm stopped: an idle tick, as above. */
+            if (session->page.runtime == NULL) {
+                session->performance.runtime_us += navigation_record_slice(
+                    session, NAVIGATION_SLICE_RUNTIME, runtime_started,
+                    callback_budget);
+                return true;
+            }
         }
     }
     bool advanced = script_runtime_advance(
@@ -407,11 +415,27 @@ bool navigation_advance_runtime(NavigationSession *session,
                  session->page.script_result.error);
         return false;
     }
+    /* Frame setup that ran the page realm out of heap retired it, and the
+       page continues without scripts as after any other script OOM. */
+    if (session->page.runtime == NULL) {
+        session->performance.runtime_us += navigation_record_slice(
+            session, NAVIGATION_SLICE_RUNTIME, runtime_started,
+            callback_budget);
+        return true;
+    }
     if (!navigation_progress_frames(session)) {
         snprintf(session->last_error, sizeof(session->last_error),
                  "dynamic frame completion failed: %.430s",
                  session->page.script_result.error);
         return false;
+    }
+    /* So may frame completion (the parent realm recording a loaded or
+       failed frame, or the frame's load/error listener). */
+    if (session->page.runtime == NULL) {
+        session->performance.runtime_us += navigation_record_slice(
+            session, NAVIGATION_SLICE_RUNTIME, runtime_started,
+            callback_budget);
+        return true;
     }
     if (NAVIGATION_TRACES_FRAME_CAPABILITIES(session)
         && session->page.frame_count != 0) {

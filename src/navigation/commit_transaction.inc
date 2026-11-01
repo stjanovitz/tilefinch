@@ -23,6 +23,25 @@ static bool navigation_replace_server_body_with_runtime(
         opaque, document, markup, length);
 }
 
+static bool navigation_replace_author_children_with_runtime(
+    void *opaque, PocDocument *document, lxb_dom_node_t *element,
+    const char *markup, size_t length)
+{
+    return script_runtime_replace_element_inner_html(
+        opaque, document, element, markup, length);
+}
+
+/* Static shell fallbacks run after the page's script failed, but its realm
+   (and every wrapper it holds) is still alive. */
+static bool navigation_install_static_shell_fallback(NavigationSession *session)
+{
+    ScriptRuntime *runtime = session->page.runtime;
+    return document_install_static_shell_fallback(
+        &session->page.document,
+        runtime == NULL ? NULL : navigation_replace_author_children_with_runtime,
+        runtime);
+}
+
 static bool navigation_restore_server_body_if_degraded(
     NavigationSession *session, const DocumentBodySnapshot *snapshot)
 {
@@ -698,6 +717,22 @@ decline:
     return false;
 }
 
+/* Decode what the page's image walk left for its first layout
+   (images_retarget_decode_awaiting) before `layout` is painted. */
+static void navigation_decode_awaiting_images(
+    NavigationSession *session, const ImageResources *images,
+    const LayoutDocument *layout)
+{
+    if (images != &session->page.images) return;
+    uint64_t started = navigation_now_us();
+    if (images_retarget_decode_awaiting(&session->page.images, layout,
+                                        session->browser_session) == 0)
+        return;
+    uint64_t elapsed = navigation_now_us() - started;
+    session->performance.image_resource_us += elapsed;
+    session->performance.resource_us += elapsed;
+}
+
 static bool navigation_try_progressive_preview(
     NavigationSession *session, NavigationDocumentStream *streaming,
     const NavigationPage *previous_page, bool has_deferred_visuals,
@@ -803,6 +838,7 @@ static bool navigation_try_progressive_preview(
        safe style and measurement work into the authoritative build below. */
     session->performance.partial_layouts++;
     const LayoutDocument *paint_layout = &preview;
+    navigation_decode_awaiting_images(session, images, paint_layout);
     uint64_t paint_started = navigation_now_us();
     bool painted = session->progressive_paint(
         session->progressive_paint_opaque, session, paint_layout);
@@ -945,8 +981,7 @@ static bool navigation_finish_authoritative_layout(
         && !session->page.stylesheet.static_custom_element_fallback) {
         stylesheet_enable_static_custom_element_fallback(
             &session->page.stylesheet);
-        (void) document_install_static_shell_fallback(
-            &session->page.document);
+        (void) navigation_install_static_shell_fallback(session);
         LayoutDocument recovered = {0};
         uint64_t recovery_started = navigation_now_us();
         if (navigation_build_layout(session, &recovered, fonts, images)
@@ -969,6 +1004,8 @@ static bool navigation_finish_authoritative_layout(
         session->performance.first_layout_us =
             navigation_now_us() - session->navigation_started_us;
     }
+    navigation_decode_awaiting_images(session, images,
+                                      &session->page.layout);
     navigation_paint_authoritative_layout(
         session, streaming, previous_page, progressive_preview_candidate,
         &session->page.layout);
@@ -1577,6 +1614,10 @@ static TILEFINCH_OUT_OF_LINE bool commit_scripts(NavigationSession *session,
                 session, &session->page.document));
     if (runtime_required) {
         size_t runtime_failure_count = session->budget->failure_count;
+        /* A document parsed whole (not streamed): keep its declarations
+           before its scripts run. */
+        if (txn->streaming == NULL)
+            media_declared_video_keep_parsed(&session->page.document);
         if (session->page.runtime == NULL) {
             session->page.runtime = navigation_create_runtime(
                 session, &session->page.document, txn->url,
@@ -1931,8 +1972,7 @@ static TILEFINCH_OUT_OF_LINE bool commit_final_style(NavigationSession *session,
     if (static_script_fallback) {
         stylesheet_enable_static_custom_element_fallback(
             &session->page.stylesheet);
-        (void) document_install_static_shell_fallback(
-            &session->page.document);
+        (void) navigation_install_static_shell_fallback(session);
     }
     /* A full Reader style census is optional and expensive on an ordinary
        healthy commit. Defer it until an explicit Reader request unless this
@@ -2152,8 +2192,10 @@ static TILEFINCH_OUT_OF_LINE bool commit_images(NavigationSession *session,
         phase_started = navigation_now_us();
         size_t loaded_before = session->page.images.stats.loaded;
         bool image_pipeline_refused = false;
-        if (image_priority_count != 0
-            && !images_load_external_priority_targets(
+        ImageLayoutBoxes image_scale;
+        navigation_lend_image_scale(session, &image_scale);
+        bool priority_loaded = image_priority_count == 0
+            || images_load_external_priority_targets(
                 &session->page.document, &session->page.stylesheet,
                 &session->page.images, image_priority_targets,
                 image_priority_count, session->budget,
@@ -2164,7 +2206,9 @@ static TILEFINCH_OUT_OF_LINE bool commit_images(NavigationSession *session,
                 session->maximum_decoded_image_bytes,
                 session->resource_timeout_ms,
                 session->page.resource_scheduler,
-                session->browser_session)) {
+                session->browser_session);
+        navigation_return_image_boxes(session, &image_scale);
+        if (!priority_loaded) {
             if (session->page.images.stats.load_cancelled) {
                 snprintf(session->last_error, sizeof(session->last_error),
                          "visible image priority pipeline cancelled");
@@ -2228,19 +2272,26 @@ static TILEFINCH_OUT_OF_LINE bool commit_images(NavigationSession *session,
             }
             navigation_ensure_layout_reuse(session);
             session->page.image_continuation_pending = defer_mutable_document_images;
-            if (!images_load_external_reusing_layout_styles_deferred(
-                    &session->page.document, &session->page.stylesheet,
-                    &session->page.images, session->budget,
-                    session->page.resource_base_url, txn->url,
-                    session->page.referrer_policy,
-                    session->maximum_images, session->maximum_image_bytes,
-                    session->maximum_image_file_bytes,
-                    session->maximum_decoded_image_bytes,
-                    session->resource_timeout_ms,
-                    session->page.resource_scheduler,
-                    session->browser_session, session->page.layout_reuse,
-                    txn->fonts, session->viewport.css_width,
-                    defer_mutable_document_images)) {
+            /* No layout of this page exists yet; the one built next
+               decodes what this walk leaves for it before it is painted. */
+            ImageLayoutBoxes awaiting_layout;
+            navigation_lend_image_scale(session, &awaiting_layout);
+            awaiting_layout.decode_after_layout = true;
+            bool walked = images_load_external_reusing_layout_styles_deferred(
+                &session->page.document, &session->page.stylesheet,
+                &session->page.images, session->budget,
+                session->page.resource_base_url, txn->url,
+                session->page.referrer_policy,
+                session->maximum_images, session->maximum_image_bytes,
+                session->maximum_image_file_bytes,
+                session->maximum_decoded_image_bytes,
+                session->resource_timeout_ms,
+                session->page.resource_scheduler,
+                session->browser_session, session->page.layout_reuse,
+                txn->fonts, session->viewport.css_width,
+                defer_mutable_document_images);
+            navigation_return_image_boxes(session, &awaiting_layout);
+            if (!walked) {
                 if (session->page.images.stats.load_cancelled) {
                     snprintf(session->last_error,
                              sizeof(session->last_error),

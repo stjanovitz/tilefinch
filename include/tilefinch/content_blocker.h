@@ -81,6 +81,17 @@ bool content_blocker_would_block(
     const char *initiator_url, const char *destination,
     const char *fetch_mode);
 
+/* The embed hop's player page (browser_engine.h): while set, requests its
+   site initiates also refuse a built-in, generic list of third-party hosts
+   that are not needed to play a video (ads, analytics, consent, captcha
+   SDKs, payments, chat). OFF still blocks nothing, the per-site allowlist
+   still exempts the page, and CUSTOM allow rules still win. NULL clears. */
+void content_blocker_set_player_page(ContentBlocker *blocker,
+                                     const char *page_url);
+/* Whether document_url belongs to the player page's site. */
+bool content_blocker_player_page(const ContentBlocker *blocker,
+                                 const char *document_url);
+
 #define CONTENT_BLOCKER_INLINE_BYTES_LIMIT (512u * 1024u)
 /* Allocation-free, conservative whole-bundle matching. Never matches modules,
    external scripts or snippets merely mentioning a tracker property. */

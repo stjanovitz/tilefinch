@@ -281,6 +281,70 @@ static ImageResource *retarget_owner(ImageResources *images, size_t first,
     return owner;
 }
 
+size_t images_retarget_decode_awaiting(ImageResources *images,
+                                       const LayoutDocument *layout,
+                                       BrowserSession *session)
+{
+    if (images == NULL || layout == NULL || images->count == 0
+        || images->budget == NULL) return 0;
+    bool awaiting = false;
+    for (size_t i = 0; i < images->count && !awaiting; i++)
+        awaiting = (images->items[i].retarget_flags
+                    & IMAGE_RETARGET_AWAITING_LAYOUT) != 0;
+    if (!awaiting) return 0;
+    RetargetNeed *needs = budget_calloc_category(
+        images->budget, BUDGET_CATEGORY_RESOURCE, images->count,
+        sizeof(*needs));
+    if (needs == NULL) return 0;
+    size_t decoded = 0;
+    bool scanned = retarget_scan(images, layout, needs);
+    for (size_t i = 0; scanned && i < images->count; i++) {
+        ImageResource *item = &images->items[i];
+        if ((item->retarget_flags & IMAGE_RETARGET_AWAITING_LAYOUT) == 0)
+            continue;
+        const void *identity = retarget_identity(item);
+        RetargetNeed need = needs[i];
+        for (size_t j = i + 1; j < images->count; j++) {
+            if (retarget_identity(&images->items[j]) != identity) continue;
+            const RetargetNeed *other = &needs[j];
+            need.painted |= other->painted;
+            need.fixed |= other->fixed;
+            if (other->width > need.width) need.width = other->width;
+            if (other->height > need.height) need.height = other->height;
+        }
+        /* Unpainted (a preview's prefix, a provisional commit), it stays
+           released for a later layout or display retarget step. */
+        if (identity == NULL || !need.painted) continue;
+        for (size_t j = i; j < images->count; j++) {
+            if (retarget_identity(&images->items[j]) == identity)
+                images->items[j].retarget_flags &=
+                    (uint8_t) ~IMAGE_RETARGET_AWAITING_LAYOUT;
+        }
+        bool eligible = false;
+        ImageResource *owner = retarget_owner(images, 0, identity, &eligible);
+        if (!eligible || owner->pixels != NULL) continue;
+        int full_width = owner->full_width > 0
+            ? owner->full_width : owner->width;
+        int full_height = owner->full_height > 0
+            ? owner->full_height : owner->height;
+        int width = full_width, height = full_height;
+        if (!need.fixed && need.width > 0 && need.height > 0
+            && need.width < full_width && need.height < full_height) {
+            width = need.width;
+            height = need.height;
+        }
+        /* At its full size it is as an eager decode would have left it. */
+        (void) retarget_restore(
+            images, owner, identity, width, height,
+            width < full_width ? IMAGE_RETARGET_SHRUNK : 0, session,
+            &images->retarget.grows);
+        if (owner->pixels != NULL) decoded++;
+    }
+    budget_free(images->budget, needs);
+    if (decoded != 0) images_retarget_plan_discard(images);
+    return decoded;
+}
+
 size_t images_reclaim_rebuildable_rasters(ImageResources *images,
                                          BrowserSession *session,
                                          size_t needed_bytes)

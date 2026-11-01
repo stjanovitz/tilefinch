@@ -79,6 +79,12 @@ typedef struct {
        can execute the action as an ordinary navigation. */
     bool prefer_native_media;
     bool prefer_download;
+    /* A navigation to the player page the page declares for its video,
+       made when Play found nothing playable on the page itself: the
+       engine loads it as a fresh top-level page and plays the first
+       stream that page's own requests name (browser_engine.h, embed hop).
+       A frontend without the hop executes it as an ordinary navigation. */
+    bool embed_hop;
     /* True for authored page audio or a high-confidence structured audio
        preview. The platform route uses the same player lifecycle, controls,
        clock, and seek machinery as video, but opens only the AAC/MP4 track. */
@@ -86,6 +92,8 @@ typedef struct {
     char url[NAVIGATION_URL_LIMIT];
     char method[8];
     char content_type[64];
+    /* A media action carries the page's further renditions here instead
+       of a form body (body_length bytes, media_candidates format). */
     char body[4096];
     size_t body_length;
     /* Set instead of body when the request body does not fit it (a script
@@ -231,8 +239,17 @@ bool controller_rebind_focus(BrowserController *controller);
    firing DOM focus events or counting a user focus move. */
 bool controller_focused_link_region(
     const BrowserController *controller, const LinkRegion **link);
+/* The focused element's rect where the reader sees it, in document
+   coordinates: moved by the scroll containers around it, and pinned to the
+   viewport when it is viewport-fixed. */
 bool controller_focused_rect(const BrowserController *controller,
                              int *x, int *y, int *width, int *height);
+/* The overflow clips around the focused element (those it does not escape
+   as positioned content), in controller_focused_rect's coordinates. Only
+   the axes reported in clipped_x/clipped_y are bounded. */
+bool controller_focused_clip(const BrowserController *controller,
+                             int *left, int *top, int *right, int *bottom,
+                             bool *clipped_x, bool *clipped_y);
 /*
  * Returns the live authored focus outline only when focus can be represented
  * as a compositor overlay without changing any retained layout/paint field.
@@ -254,6 +271,12 @@ size_t controller_select_history(lxb_dom_node_t *select, char *state,
 /* User-activated playback for a page-level explicit declaration. This is the
    same resolution/CSP/probe-bound action as a src-less <video>, but carries
    no author media-node handle. */
+/* The embed hop's media action: the current page's remembered own stream
+   references (media_json_own_candidate), best first, resolved and checked
+   against its CSP media-src as any page video is. False when there is
+   none yet. */
+bool controller_build_embed_media_action(
+    BrowserController *controller, ControllerAction *action);
 bool controller_build_document_media_action(
     BrowserController *controller, ControllerAction *action);
 /* Build the HTML form default action. Set dispatch_submit_event only for a

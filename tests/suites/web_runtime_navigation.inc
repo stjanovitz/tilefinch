@@ -2563,6 +2563,62 @@
         CHECK(budget.current == 0);
     }
     {
+        puts("test: linear focus passes a link whose URL exceeds the limit");
+        /* The link URL does not fit the controller's URL buffers. It must
+           neither stop sequential traversal nor be followed truncated. */
+        static char page[4096 + NAVIGATION_URL_LIMIT];
+        char long_href[3001];
+        memset(long_href, 'q', sizeof(long_href) - 1);
+        memcpy(long_href, "/long?", 6);
+        long_href[sizeof(long_href) - 1] = '\0';
+        int written = snprintf(page, sizeof(page),
+            "<!doctype html><body><a id=first href=/first>First</a> "
+            "<a id=second href=/second>Second</a> "
+            "<a id=long href=\"%s\">Long</a> "
+            "<a id=after href=/after>After</a> "
+            "<a id=last href=/last>Last</a><script>"
+            "globalThis.longClicks=0;document.getElementById('long')"
+            ".addEventListener('click',()=>longClicks++);</script>",
+            long_href);
+        CHECK(written > 0 && (size_t) written < sizeof(page));
+        static NavigationSession session;
+        CHECK(navigation_init(&session, &budget, 2));
+        navigation_enable_scripts(&session, 4 * MIB, 1000);
+        uint64_t generation = navigation_begin(&session);
+        CHECK(navigation_commit_html(&session, generation,
+            "https://focus.test/long-url", page, strlen(page), 480,
+            NULL, NULL, true));
+        BrowserController controller;
+        CHECK(controller_init(&controller, &session));
+        lxb_dom_node_t *root =
+            lxb_dom_interface_node(session.page.document.html);
+        lxb_dom_node_t *long_link = find_id(root, "long");
+        lxb_dom_node_t *last = find_id(root, "last");
+        bool reached_long = false, reached_last = false;
+        for (int i = 0; i < 5 && !reached_last; i++) {
+            CHECK(controller_focus_next(&controller));
+            lxb_dom_node_t *focused = controller_focused_node(&controller);
+            reached_long |= focused == long_link;
+            reached_last |= focused == last;
+        }
+        CHECK(reached_long && reached_last);
+        /* Focus the long link again: activation runs the page's click
+           handler, but the over-limit URL is never handed out as a
+           (truncated) navigation target. */
+        CHECK(controller_focus_previous(&controller)
+              && controller_focus_previous(&controller)
+              && controller_focused_node(&controller) == long_link);
+        ControllerAction action;
+        CHECK(controller_activate(&controller, &action));
+        CHECK(action.type == CONTROLLER_ACTION_NONE && action.url[0] == '\0');
+        ScriptResult clicks = {0};
+        CHECK(script_runtime_evaluate_diagnostic(session.page.runtime,
+            "pocSummary=String(longClicks)", "<long-url-clicks>", &clicks)
+            && strcmp(clicks.summary, "1") == 0);
+        navigation_destroy(&session);
+        CHECK(budget.current == 0);
+    }
+    {
         puts("test: inert subtrees paint without native focus or hit targets");
         static const char page[] =
             "<!doctype html><body><nav id=drawer inert>"

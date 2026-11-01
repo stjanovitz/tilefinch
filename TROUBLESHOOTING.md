@@ -79,6 +79,20 @@ shown on the player, rather than started and then dropped. Not every stream
 format is supported, so a video can still fail because of its codec or audio
 track.
 
+When a page offers several versions of a video, the player tries each one
+and then names the reason the last one could not play:
+
+- `OPTIONAL VIDEO DECODER NEEDED`: the video would play at low resolution
+  through the optional software decoder, which is not installed. See
+  [Optional H.264 High decoder](README.md#optional-h264-high-decoder).
+- `VIDEO DECODER COULDN'T START`: the decoder is installed but could not
+  start. The second line says why: not enough memory, missing files, a
+  rebuild needed, or a firmware code.
+- `PSP CAN'T PLAY THIS VIDEO FORMAT`: neither decoder can play this video
+  and the page offered no version that fits. The second line names the
+  cause, such as a B-frame pyramid, more than 3 reference frames, or a
+  High-profile picture larger than 432x240.
+
 If the decoder has to be shut down during playback, the player says
 `VIDEO DECODER NEEDS APP RESTART` and stops offering Retry: only relaunching
 Tilefinch brings the decoder back, so Retry would just fail again.

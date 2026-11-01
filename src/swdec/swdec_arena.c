@@ -1,4 +1,5 @@
 #include "swdec_arena.h"
+#include "swdec_diag.h"
 
 #include <stdint.h>
 #include <string.h>
@@ -51,7 +52,9 @@ static arena_state *by_sp(void)
     int probe; sp = (uintptr_t) &probe;
 #endif
     if (route_aux || (sp >= lo && sp < hi)) {
+#if SWDEC_DIAG_ENABLED
         swdec_arena_aux_routed_cpu++;      /* counted on both cores; the CPU share dominates when misrouting */
+#endif
         return &ar[1];
     }
     return &ar[0];
@@ -146,6 +149,7 @@ static block *owner(arena_state *s, void *pointer)
     return NULL;
 }
 
+#if SWDEC_DIAG_ENABLED
 /* diagnostics */
 unsigned swdec_arena_aux_routed_cpu;   /* allocations routed to aux via the route flag or sp range */
 void swdec_arena_debug(int which, unsigned out[4])
@@ -159,6 +163,7 @@ void swdec_arena_debug(int which, unsigned out[4])
     }
     out[0] = n; out[1] = (unsigned) largest; out[2] = (unsigned) s->in_use; out[3] = (unsigned) (uintptr_t) s->free_head;
 }
+#endif
 
 void *swdec_malloc(size_t bytes)
 {

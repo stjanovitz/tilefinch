@@ -5,6 +5,7 @@
 #include "tilefinch/browser_engine.h"
 #include "tilefinch/document.h"
 #include "tilefinch/js_runtime.h"
+#include "tilefinch/script_admission.h"
 #include "tilefinch/session.h"
 #include "tilefinch/url.h"
 #include "tilefinch/viewport.h"
@@ -47,8 +48,9 @@ static bool fixture_close(ClassicFixture *fixture)
 
 /* A classic script of about `minimum` bytes of functions large enough to
    be compiled lazily (as most of a real site's are; their bytecode keeps
-   their text, so it is about the size of the source), and a summary naming
-   `tag`. Caller frees. */
+   their text, so it is about the size of the source: main() keeps script
+   text in the heap, see there), and a summary naming `tag`. Caller
+   frees. */
 static char *make_script(const char *tag, size_t minimum)
 {
     size_t capacity = minimum + 256u;
@@ -512,6 +514,105 @@ static int test_store_waits_for_idle(void)
     return 0;
 }
 
+/* A queued store pins its compile's whole function tree in the realm heap
+   until idle work stores it, and a busy page may give idle work no turn.
+   Once the page's own data leaves less heap available than the store would
+   need, the next safe point (a task boundary or a collection) gives the
+   tree back instead of holding it until the page runs out of memory. A
+   page with room keeps its queued store. */
+static int test_queued_store_yields_to_page_heap(void)
+{
+    ClassicFixture fixture;
+    CHECK(fixture_open(&fixture));
+    static const char url[] = "https://site.test/app.js";
+    char *source = make_script("app", 192u * KIB);
+    CHECK(source != NULL);
+    ScriptResult result;
+    memset(&result, 0, sizeof(result));
+    ScriptRuntime *runtime = script_runtime_create_configured(
+        &fixture.document, &fixture.budget, 8u * MIB, 8000, page_url,
+        &fixture.options, &result);
+    CHECK(runtime != NULL);
+    CHECK(script_runtime_evaluate_external_classic_cached(
+              runtime, fixture.script, source, strlen(source), url, url,
+              false, &result)
+          && ran(&result, "app")
+          && script_runtime_pending_bytecode_count(runtime) == 1);
+    /* Plenty of room: a task boundary keeps the store. */
+    CHECK(script_runtime_advance(runtime, 0u, 4u, &result)
+          && script_runtime_pending_bytecode_count(runtime) == 1);
+    /* What the idle store itself checks (pending_bytecode_heap_reserve). */
+    size_t reserve = script_admission_work_reserve(
+        strlen(source), SCRIPT_ADMISSION_STORE_HEAP_MULTIPLIER, SIZE_MAX);
+    CHECK(script_runtime_evaluate_diagnostic(
+        runtime, "globalThis.keep=[];", "about:fill", &result));
+    for (unsigned chunk = 0; chunk < 2048u
+         && script_runtime_heap_available(runtime) >= reserve; chunk++) {
+        CHECK(script_runtime_evaluate_diagnostic(
+            runtime, "keep.push(new Array(4096).fill(1));", "about:fill",
+            &result));
+    }
+    CHECK(script_runtime_heap_available(runtime) < reserve);
+    CHECK(script_runtime_advance(runtime, 0u, 4u, &result)
+          && script_runtime_pending_bytecode_count(runtime) == 0
+          && result.external_script_bytecode_deferred_dropped == 1
+          && result.external_script_bytecode_cache_stores == 0);
+    script_runtime_destroy(runtime);
+    free(source);
+    CHECK(fixture_close(&fixture));
+    return 0;
+}
+
+/* A refusal the page caught is answered at the next safe point, as the
+   advance boundary answers it: once. Collections after the refusal has been
+   accounted keep queued stores, so the bytecode cache recovers when the
+   page has heap again. */
+static int test_queued_store_survives_an_old_refusal(void)
+{
+    ClassicFixture fixture;
+    CHECK(fixture_open(&fixture));
+    static const char url[] = "https://site.test/after.js";
+    char *source = make_script("after", 192u * KIB);
+    CHECK(source != NULL);
+    ScriptResult result;
+    memset(&result, 0, sizeof(result));
+    ScriptRuntime *runtime = script_runtime_create_configured(
+        &fixture.document, &fixture.budget, 8u * MIB, 8000, page_url,
+        &fixture.options, &result);
+    CHECK(runtime != NULL);
+    /* One growth step, then filling the heap is refused. */
+    script_runtime_enable_heap_growth(runtime, 8u * MIB + 512u * KIB, 0);
+    CHECK(script_runtime_evaluate_diagnostic(
+        runtime,
+        "try{var keep=[];for(;;)keep.push(new Array(4096).fill(1));}"
+        "catch(e){}keep=null;",
+        "about:fill", &result));
+    ScriptHeapGrowth growth;
+    script_runtime_heap_growth(runtime, &growth);
+    CHECK(growth.refusals != 0);
+    CHECK(script_runtime_advance(runtime, 0u, 4u, &result));
+    (void) script_runtime_collect_and_trim(runtime);
+    CHECK(script_runtime_evaluate_external_classic_cached(
+              runtime, fixture.script, source, strlen(source), url, url,
+              false, &result)
+          && ran(&result, "after")
+          && script_runtime_pending_bytecode_count(runtime) == 1);
+    /* A collection with heap to spare keeps the store... */
+    size_t collections = growth.collections;
+    (void) script_runtime_collect_and_trim(runtime);
+    script_runtime_heap_growth(runtime, &growth);
+    CHECK(growth.collections > collections
+          && script_runtime_pending_bytecode_count(runtime) == 1);
+    /* ...for idle work to store. */
+    CHECK(script_runtime_store_pending_bytecode(runtime, &result)
+          && result.external_script_bytecode_cache_stores == 1
+          && script_runtime_pending_bytecode_count(runtime) == 0);
+    script_runtime_destroy(runtime);
+    free(source);
+    CHECK(fixture_close(&fixture));
+    return 0;
+}
+
 /* Segment ordinals are distinct records of one URL; the session API alone,
    without a realm. */
 static int test_segment_ordinals_are_records(void)
@@ -639,8 +740,400 @@ static int test_pressure_clear_and_teardown(void)
     return 0;
 }
 
+
+/* ---- whole script bodies near the page's memory reserve ---- */
+
+static const TilefinchRequestContext *script_context(const char *url)
+{
+    static TilefinchRequestContext context;
+    context = (TilefinchRequestContext) {
+        .target_url = url, .initiator_url = page_url,
+        .top_level_url = page_url, .method = "GET",
+        .mode = TILEFINCH_REQUEST_MODE_NO_CORS,
+        .credentials = TILEFINCH_CREDENTIALS_INCLUDE,
+        .destination = TILEFINCH_DESTINATION_SCRIPT
+    };
+    return &context;
+}
+
+/* A response body of `length` bytes as the loader stores it: a shared body
+   of exactly the response, which the cache entry then holds. Returns the
+   body with the caller's reference (release it to leave the cache the sole
+   holder), or NULL. A `destination` other than SCRIPT stores it as that
+   kind of resource. */
+static BrowserSharedBody *put_shared_body(BrowserSession *session,
+                                          const char *url, size_t length,
+                                          TilefinchRequestDestination destination)
+{
+    char *data = budget_malloc(session->budget, length + 1u);
+    if (data == NULL) return NULL;
+    memset(data, ';', length);
+    data[length] = '\0';
+    BrowserSharedBody *body = browser_shared_body_take(
+        session->budget, (unsigned char *) data, length);
+    if (body == NULL) {
+        budget_free(session->budget, data);
+        return NULL;
+    }
+    TilefinchRequestContext context = *script_context(url);
+    context.destination = destination;
+    TilefinchResourceGrant grant = {
+        .destination = destination, .mode = context.mode,
+        .credentials = context.credentials,
+        .final_same_origin = true, .mime_validated = true
+    };
+    bool stored = destination == TILEFINCH_DESTINATION_SCRIPT
+        ? browser_session_cache_put_http_shared_classic_script(
+              session, url, body, "\"v1\"", NULL, "text/javascript",
+              "public,max-age=3600", NULL, 1, &context, &grant)
+        : browser_session_cache_put_http_shared_resource(
+              session, url, body, "\"v1\"", NULL, "text/css",
+              "public,max-age=3600", NULL, 1, &context, &grant);
+    if (!stored) {
+        browser_shared_body_release(body);
+        return NULL;
+    }
+    return body;
+}
+
+static bool cached_script(BrowserSession *session, const char *url)
+{
+    const BrowserCacheEntry *entry = NULL;
+    return browser_session_cache_match_classic_script(
+               session, url, script_context(url), 1, &entry)
+           != BROWSER_CACHE_MISS;
+}
+
+/* Only classic script bodies the cache alone holds go, least recently used
+   first, as much as asked: never one a load still leases, a stylesheet, or
+   a response stored without a shared body. */
+static int test_cache_releases_sole_script_bodies(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    BrowserSession session;
+    CHECK(browser_session_init(&session, &budget, 2u * MIB));
+    static const char a[] = "https://site.test/a.js";
+    static const char b[] = "https://site.test/b.js";
+    static const char c[] = "https://site.test/c.js";
+    static const char css[] = "https://site.test/site.css";
+    static const char plain[] = "https://site.test/plain.js";
+    BrowserSharedBody *body = put_shared_body(
+        &session, a, 200u * KIB, TILEFINCH_DESTINATION_SCRIPT);
+    CHECK(body != NULL);
+    browser_shared_body_release(body);
+    BrowserSharedBody *leased = put_shared_body(
+        &session, b, 200u * KIB, TILEFINCH_DESTINATION_SCRIPT);
+    CHECK(leased != NULL);
+    body = put_shared_body(&session, c, 100u * KIB,
+                           TILEFINCH_DESTINATION_SCRIPT);
+    CHECK(body != NULL);
+    browser_shared_body_release(body);
+    body = put_shared_body(&session, css, 300u * KIB,
+                           TILEFINCH_DESTINATION_STYLE);
+    CHECK(body != NULL);
+    browser_shared_body_release(body);
+    CHECK(browser_session_cache_put_http(
+        &session, plain, (const unsigned char *) "var p=1;", 8, "\"v1\"",
+        NULL, "text/javascript", "public,max-age=3600", NULL, 1));
+
+    /* One byte asked: the oldest sole body (a), all of it. */
+    size_t before = budget_remaining(&budget);
+    size_t freed = browser_session_cache_release_script_bodies(&session, 1);
+    CHECK(freed >= 200u * KIB && budget_remaining(&budget) - before == freed
+          && session.cache_script_body_releases == 1
+          && !cached_script(&session, a) && cached_script(&session, b)
+          && cached_script(&session, c));
+    /* Everything: c goes; the leased b, the stylesheet and the plain
+       response stay. */
+    freed = browser_session_cache_release_script_bodies(&session, SIZE_MAX);
+    CHECK(freed >= 100u * KIB && session.cache_script_body_releases == 2
+          && !cached_script(&session, c) && cached_script(&session, b));
+    const unsigned char *data = NULL;
+    size_t length = 0;
+    CHECK(browser_session_cache_get(&session, plain, &data, &length)
+          && length == 8);
+    const BrowserCacheEntry *entry = NULL;
+    TilefinchRequestContext style = *script_context(css);
+    style.destination = TILEFINCH_DESTINATION_STYLE;
+    CHECK(browser_session_cache_match_resource(
+              &session, css, &style, 1, &entry) != BROWSER_CACHE_MISS);
+    /* Once the load lets go of b, b can go too. */
+    browser_shared_body_release(leased);
+    freed = browser_session_cache_release_script_bodies(&session, SIZE_MAX);
+    CHECK(freed >= 200u * KIB && !cached_script(&session, b)
+          && session.cache_script_body_releases == 3);
+    browser_session_destroy(&session);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
+/* A realm whose page Budget is down to its reserve plus `spare`: the rest
+   is held by a ballast allocation (returned; free it). Heap growth as the
+   page lifecycle enables it, up to `ceiling`, with a `reserve` growth
+   reserve. */
+static void *leave_spare(ClassicFixture *fixture, ScriptRuntime *runtime,
+                         size_t ceiling, size_t reserve, size_t spare)
+{
+    script_runtime_enable_heap_growth(runtime, ceiling, reserve);
+    ScriptHeapGrowth growth;
+    script_runtime_heap_growth(runtime, &growth);
+    size_t live = script_runtime_heap_used(runtime);
+    size_t granted = growth.limit > live ? growth.limit - live : 0;
+    size_t keep = reserve + granted + spare;
+    size_t remaining = budget_remaining(&fixture->budget);
+    if (remaining <= keep) return NULL;
+    return budget_malloc(&fixture->budget, remaining - keep);
+}
+
+/* Fills the realm until it is refused, then lets the garbage go; returns
+   the number of 4096-element arrays it held. */
+static long fill_realm(ScriptRuntime *runtime, ScriptResult *result)
+{
+    if (!script_runtime_evaluate_diagnostic(
+            runtime,
+            "var keep=[];try{for(;;)keep.push(new Array(4096).fill(1.5));}"
+            "catch(e){}globalThis.pocSummary=String(keep.length);"
+            "keep=null;",
+            "about:fill", result)) return -1;
+    return atol(result->summary);
+}
+
+/* The realm short of room to grow takes back the response cache's own
+   script bodies first, exactly as much as it can then use; with room to
+   spare it leaves them alone. */
+static int test_growth_takes_back_cached_script_bodies(void)
+{
+    long held[2] = {0, 0};
+    for (int with_body = 0; with_body < 2; with_body++) {
+        ClassicFixture fixture;
+        CHECK(fixture_open(&fixture));
+        CHECK(browser_session_cache_set_maximum_bytes(
+            &fixture.session, 4u * MIB));
+        static const char url[] = "https://site.test/big.js";
+        static const char css[] = "https://site.test/big.css";
+        ScriptResult result;
+        memset(&result, 0, sizeof(result));
+        ScriptRuntime *runtime = script_runtime_create_configured(
+            &fixture.document, &fixture.budget, 4u * MIB, 8000, page_url,
+            &fixture.options, &result);
+        CHECK(runtime != NULL);
+        /* The stylesheet is not a script body: it stays either way. */
+        BrowserSharedBody *body = put_shared_body(
+            &fixture.session, css, 256u * KIB, TILEFINCH_DESTINATION_STYLE);
+        CHECK(body != NULL);
+        browser_shared_body_release(body);
+        /* The control run keeps a load's lease on the same body: a body
+           someone still reads never goes. */
+        BrowserSharedBody *script = put_shared_body(
+            &fixture.session, url, 1536u * KIB,
+            TILEFINCH_DESTINATION_SCRIPT);
+        CHECK(script != NULL);
+        if (with_body) {
+            browser_shared_body_release(script);
+            script = NULL;
+        }
+        void *ballast = leave_spare(&fixture, runtime, 40u * MIB, 2u * MIB,
+                                    1u * MIB);
+        CHECK(ballast != NULL);
+        /* Room to spare: a small task leaves the cache alone. */
+        CHECK(script_runtime_evaluate_diagnostic(
+            runtime, "globalThis.small=new Array(1000).fill(0).length;",
+            "about:small", &result));
+        CHECK(result.script_body_cache_releases == 0);
+        held[with_body] = fill_realm(runtime, &result);
+        CHECK(held[with_body] > 0);
+        if (with_body) {
+            CHECK(result.script_body_cache_releases == 1
+                  && result.script_body_cache_released_bytes
+                         >= 1536u * KIB
+                  && !cached_script(&fixture.session, url));
+        } else {
+            CHECK(result.script_body_cache_releases == 0
+                  && cached_script(&fixture.session, url));
+            browser_shared_body_release(script);
+        }
+        const BrowserCacheEntry *entry = NULL;
+        TilefinchRequestContext style = *script_context(css);
+        style.destination = TILEFINCH_DESTINATION_STYLE;
+        CHECK(browser_session_cache_match_resource(
+                  &fixture.session, css, &style, 1, &entry)
+              != BROWSER_CACHE_MISS);
+        script_runtime_destroy(runtime);
+        budget_free(&fixture.budget, ballast);
+        CHECK(fixture_close(&fixture));
+    }
+    /* The released 1.5 MiB bought the realm at least 1 MiB more of arrays
+       (64 KiB each on a 64-bit host). */
+    CHECK(held[1] >= held[0] + 16);
+    return 0;
+}
+
+
+/* The owner of a running script's body, as the script loader is. */
+typedef struct {
+    Budget *budget;
+    char *body;
+    unsigned releases;
+} TestSourceOwner;
+
+static void test_source_release(void *opaque)
+{
+    TestSourceOwner *owner = opaque;
+    budget_free(owner->budget, owner->body);
+    owner->body = NULL;
+    owner->releases++;
+}
+
+/* A classic script padded with a comment to `minimum` bytes, naming `tag`,
+   that, run, fills its realm with up to globalThis.fillArrays arrays (none
+   when unset) or until refused, and then lets the garbage go: the same
+   bytes, and so the same bytecode record, under pressure or not. */
+static char *make_filling_script(const char *tag, size_t minimum)
+{
+    char *functions = make_script(tag, 32u * KIB);
+    if (functions == NULL) return NULL;
+    static const char fill[] =
+        "var keep=[];try{for(var n=0;n<(globalThis.fillArrays||0);n++)"
+        "keep.push(new Array(4096).fill(1.5));}catch(e){}keep=null;\n/*";
+    size_t base = strlen(functions);
+    size_t length = base + sizeof(fill) - 1u + 2u;
+    if (length < minimum) length = minimum;
+    char *source = malloc(length + 1u);
+    if (source == NULL) {
+        free(functions);
+        return NULL;
+    }
+    memcpy(source, fill, sizeof(fill) - 1u);
+    size_t at = sizeof(fill) - 1u;
+    memset(source + at, ' ', length - base - at - 2u);
+    at = length - base - 2u;
+    memcpy(source + at, "*/", 2u);
+    memcpy(source + at + 2u, functions, base);
+    source[length] = '\0';
+    free(functions);
+    return source;
+}
+
+/* One visit in a realm that grows to `ceiling`, its page down to its
+   reserve plus `spare`: the external classic script `source` is evaluated
+   from a body its owner offers to release (after `prelude`, when given),
+   then idle work runs. */
+static bool visit_pressed(ClassicFixture *fixture, const char *url,
+                          const char *source, const char *prelude,
+                          size_t ceiling, size_t spare,
+                          TestSourceOwner *owner, bool *released,
+                          ScriptResult *result)
+{
+    memset(result, 0, sizeof(*result));
+    ScriptRuntime *runtime = script_runtime_create_configured(
+        &fixture->document, &fixture->budget, 4u * MIB, 8000, page_url,
+        &fixture->options, result);
+    if (runtime == NULL) return false;
+    size_t length = strlen(source);
+    *owner = (TestSourceOwner) {
+        .budget = &fixture->budget,
+        .body = budget_malloc(&fixture->budget, length + 1u)
+    };
+    void *ballast = NULL;
+    bool ok = owner->body != NULL
+        && (prelude == NULL || script_runtime_evaluate_diagnostic(
+                runtime, prelude, "about:prelude", result));
+    if (ok) {
+        memcpy(owner->body, source, length + 1u);
+        ballast = leave_spare(fixture, runtime, ceiling, 2u * MIB, spare);
+        ok = ballast != NULL;
+    }
+    if (ok) {
+        script_runtime_offer_source_release(runtime, test_source_release,
+                                            owner);
+        ok = script_runtime_evaluate_external_classic_cached(
+            runtime, fixture->script, owner->body, length, url, url, false,
+            result);
+        *released = script_runtime_withdraw_source_release(runtime);
+        /* Withdrawn: a later evaluation is offered nothing. */
+        ok = ok && !script_runtime_source_released(runtime);
+        (void) script_runtime_collect_and_trim(runtime);
+        run_idle_stores(runtime, result);
+    }
+    script_runtime_destroy(runtime);
+    budget_free(&fixture->budget, ballast);
+    budget_free(&fixture->budget, owner->body);
+    owner->body = NULL;
+    return ok;
+}
+
+/* A running script's body goes when its realm runs short, and only then;
+   the script runs to completion either way. A store that happened serves
+   the revisit, pressed or not; one the pressure dropped costs the revisit
+   a compile, nothing else. */
+static int test_running_script_body_and_revisits(void)
+{
+    ClassicFixture fixture;
+    CHECK(fixture_open(&fixture));
+    static const char url[] = "https://site.test/filling.js";
+    static const char press[] = "globalThis.fillArrays=1e9;";
+    char *source = make_filling_script("fill", 640u * KIB);
+    CHECK(source != NULL);
+    size_t length = strlen(source);
+    TestSourceOwner owner;
+    bool released = true;
+    ScriptResult result;
+    /* No pressure: kept, compiled and stored. */
+    CHECK(visit_pressed(&fixture, url, source, NULL, 40u * MIB, 16u * MIB,
+                        &owner, &released, &result)
+          && ran(&result, "fill") && !released && owner.releases == 0
+          && result.script_body_sources_released == 0
+          && result.external_script_bytecode_cache_misses == 1
+          && result.external_script_bytecode_cache_stores == 1);
+    /* Stopped by the realm's ceiling with room in the page: kept, and the
+       store serves this visit. */
+    CHECK(visit_pressed(&fixture, url, source, press, 8u * MIB, 16u * MIB,
+                        &owner, &released, &result)
+          && ran(&result, "fill") && !released && owner.releases == 0
+          && result.external_script_bytecode_cache_hits == 1);
+    /* Short of room in the page: the body goes while the script runs, and
+       the stored bytecode still serves it. */
+    CHECK(visit_pressed(&fixture, url, source, press, 40u * MIB, 512u * KIB,
+                        &owner, &released, &result)
+          && ran(&result, "fill") && released && owner.releases == 1
+          && result.script_body_sources_released == 1
+          && result.script_body_sources_released_bytes == length
+          && result.external_script_bytecode_cache_hits == 1
+          && result.external_script_bytecode_cache_misses == 0);
+    /* With no stored bytecode, the pressed visit compiles, the body goes,
+       and the write it queued is dropped with the page short of heap... */
+    browser_session_cache_clear(&fixture.session);
+    CHECK(visit_pressed(&fixture, url, source, press, 40u * MIB, 512u * KIB,
+                        &owner, &released, &result)
+          && ran(&result, "fill") && released && owner.releases == 1
+          && result.external_script_bytecode_cache_misses == 1
+          && result.external_script_bytecode_cache_stores == 0
+          && result.external_script_bytecode_deferred_dropped == 1);
+    /* ...which costs the revisit a compile (and it stores)... */
+    CHECK(visit_pressed(&fixture, url, source, NULL, 40u * MIB, 16u * MIB,
+                        &owner, &released, &result)
+          && ran(&result, "fill") && !released
+          && result.external_script_bytecode_cache_misses == 1
+          && result.external_script_bytecode_cache_stores == 1);
+    /* ...and nothing else. */
+    CHECK(visit_pressed(&fixture, url, source, NULL, 40u * MIB, 16u * MIB,
+                        &owner, &released, &result)
+          && ran(&result, "fill")
+          && result.external_script_bytecode_cache_hits == 1);
+    free(source);
+    CHECK(fixture_close(&fixture));
+    return 0;
+}
+
 int main(void)
 {
+    /* These ceilings are sized for bytecode that carries its script's text.
+       A script of 8 KiB or more now keeps its text outside the heap
+       (evaluation.inc, "Function source outside the heap") and its bytecode
+       is about 0.4 of the source; test_function_source_store.c covers the
+       table with that. */
+    setenv("TILEFINCH_JS_SOURCE_STORE", "keep", 1);
     CHECK(test_revisit_hits_after_response_eviction() == 0);
     puts("classic bytecode survives response eviction: PASS");
     CHECK(test_keying_and_no_store() == 0);
@@ -653,9 +1146,19 @@ int main(void)
     puts("classic bytecode ceilings and entry size: PASS");
     CHECK(test_store_waits_for_idle() == 0);
     puts("classic bytecode stores at idle: PASS");
+    CHECK(test_queued_store_yields_to_page_heap() == 0);
+    puts("classic bytecode queued store yields to the page heap: PASS");
+    CHECK(test_queued_store_survives_an_old_refusal() == 0);
+    puts("classic bytecode queued store survives an old refusal: PASS");
     CHECK(test_segment_ordinals_are_records() == 0);
     puts("classic bytecode segment records: PASS");
     CHECK(test_pressure_clear_and_teardown() == 0);
     puts("classic bytecode pressure, clear and teardown: PASS");
+    CHECK(test_cache_releases_sole_script_bodies() == 0);
+    puts("cached script bodies released, sole ones only: PASS");
+    CHECK(test_growth_takes_back_cached_script_bodies() == 0);
+    puts("realm growth takes back cached script bodies: PASS");
+    CHECK(test_running_script_body_and_revisits() == 0);
+    puts("running script body released; revisits recompile or hit: PASS");
     return 0;
 }

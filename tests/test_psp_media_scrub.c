@@ -1,6 +1,13 @@
 #include "tilefinch/psp_media_scrub.h"
 
+#define media_playback_set_playing test_backend_set_playing
+#define psp_media_session_dispatch_event test_preview_dispatch
+#include "../src/psp_media_session_internal.h"
+#undef media_playback_set_playing
+#undef psp_media_session_dispatch_event
+
 #include <stdio.h>
+#include <string.h>
 
 #define CHECK(condition) do {                                              \
     if (!(condition)) {                                                    \
@@ -10,8 +17,62 @@
     }                                                                      \
 } while (0)
 
+static bool backend_playing;
+static unsigned backend_updates, preview_events;
+
+void test_backend_set_playing(MediaPlayback *playback, bool playing)
+{
+    if (playback != NULL) {
+        backend_playing = playing;
+        backend_updates++;
+    }
+}
+
+void test_preview_dispatch(PspMediaSession *media, PspMediaEvent event,
+                          const char *checkpoint)
+{
+    (void) checkpoint;
+    if (event.type == PSP_MEDIA_EVENT_PREVIEW_STARTED) {
+        media->machine.preview_active = true;
+        media->ui.playing = false;
+        preview_events++;
+    }
+}
+
+static int test_preview_pauses_retained_backend(void)
+{
+    static PspMediaSession media;
+    int backend_token;
+    for (unsigned playing = 0; playing < 2; playing++) {
+        memset(&media, 0, sizeof(media));
+        media.playback = (MediaPlayback *) &backend_token;
+        media.clock_us = 5000000u;
+        media.ui.visible = true;
+        media.ui.duration_us = 60000000u;
+        media.ui.playing = backend_playing = playing != 0;
+        backend_updates = preview_events = 0;
+        psp_media_begin_preview(&media, 15000000u, playing != 0);
+        CHECK(!backend_playing && backend_updates == 1u);
+        CHECK(!media.ui.playing && preview_events == 1u);
+        CHECK(media.scrub.was_playing == (playing != 0));
+        CHECK(media.job_restore_us == 5000000u);
+        CHECK(media.ui.seek_preview_time_us == 15000000u);
+        media.clock_us = 6000000u;
+        psp_media_begin_preview(&media, 25000000u, false);
+        CHECK(!backend_playing && preview_events == 1u);
+        CHECK(media.scrub.was_playing == (playing != 0));
+        CHECK(media.job_restore_us == 5000000u);
+        CHECK(media.ui.seek_preview_time_us == 25000000u);
+        media.playback = NULL;
+        psp_media_begin_preview(&media, 30000000u, false);
+        CHECK(media.ui.seek_preview_time_us == 30000000u);
+    }
+    return 0;
+}
+
 int main(void)
 {
+    CHECK(test_preview_pauses_retained_backend() == 0);
     /* A scrub starts once and keeps the playing state it began from. */
     PspMediaScrub scrub = {0};
     CHECK(!psp_media_scrub_active(&scrub));

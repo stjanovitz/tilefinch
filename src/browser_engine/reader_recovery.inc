@@ -396,15 +396,25 @@ static bool browser_engine_has_script_degradation(
         || result->interrupted || heap_rejected;
 }
 
-static bool browser_engine_recovery_wall_settled(
-    const BrowserEngine *engine)
+static bool browser_engine_recovery_elapsed(
+    const BrowserEngine *engine, uint64_t interval_us)
 {
+#if !defined(__PSP__)
+    if (browser_engine_test_recovery_elapsed_us != 0u)
+        return engine != NULL
+            && browser_engine_test_recovery_elapsed_us >= interval_us;
+#endif
     if (engine == NULL || engine->navigation.page.committed_us == 0u)
         return false;
     uint64_t now_us = browser_engine_recovery_now_us();
     return now_us >= engine->navigation.page.committed_us
-        && now_us - engine->navigation.page.committed_us
-               >= BROWSER_RECOVERY_SETTLE_US;
+        && now_us - engine->navigation.page.committed_us >= interval_us;
+}
+
+static bool browser_engine_recovery_wall_settled(
+    const BrowserEngine *engine)
+{
+    return browser_engine_recovery_elapsed(engine, BROWSER_RECOVERY_SETTLE_US);
 }
 
 static bool browser_engine_media_node_name_is(
@@ -455,9 +465,60 @@ static bool browser_engine_media_set_attribute(
                (const lxb_char_t *) value, strlen(value)) != NULL;
 }
 
+/* A media reference page media can open: not empty and not a blob:
+   (Media Source or Blob object) URL, which only the page's own script
+   player could feed. */
+static bool browser_engine_media_reference_openable(
+    const char *reference, size_t length)
+{
+    while (length != 0u && isspace((unsigned char) reference[0])) {
+        reference++;
+        length--;
+    }
+    return length != 0u
+        && !(length >= 5u && strncasecmp(reference, "blob:", 5u) == 0);
+}
+
+/* Whether an author media element offers something page media can open:
+   its src, or a <source> child's (bounded like activation's child scan).
+   A player that never attached a source, or attached only a Media Source,
+   offers nothing. */
+bool browser_engine_author_media_openable(lxb_dom_node_t *media)
+{
+    size_t length = 0u;
+    const char *source = document_attribute(media, "src", &length);
+    if (source != NULL && length != 0u)
+        return browser_engine_media_reference_openable(source, length);
+    size_t children = 0u;
+    for (lxb_dom_node_t *child = media->first_child;
+         child != NULL && children < 16u; child = child->next) {
+        if (child->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
+        children++;
+        if (!browser_engine_media_node_name_is(child, "source")) continue;
+        source = document_attribute(child, "src", &length);
+        if (source != NULL
+            && browser_engine_media_reference_openable(source, length))
+            return true;
+    }
+    return false;
+}
+
+/* One bounded walk: author media that covers the declared video (the page
+   offers its own, so no card), else, on a stopped page, the laid-out image
+   showing the declared thumbnail (the card wraps it), else NULL (a
+   synthetic card at body top).
+   Author video or audio page media can open covers it on any page. A
+   laid-out author video with nothing to open (no source, or only blob:)
+   covers it only on a stopped page (degraded, no author work pending):
+   activating it builds the declared stream (controller_build_media_action),
+   and no live player is left to intercept that activation. On a page
+   still running, even a degraded one, the author's live player
+   takes the activation and calls a play() with nothing to open, so the
+   card is offered; and a live page's own nodes are never wrapped, since
+   its framework may later move or remove them by their old parent. */
 static lxb_dom_node_t *browser_engine_find_declared_media_anchor(
     BrowserEngine *engine, const MediaDeclaredVideo *declared,
-    bool *author_video)
+    bool stopped, bool *author_video)
 {
     if (author_video != NULL) *author_video = false;
     if (engine == NULL || declared == NULL) return NULL;
@@ -466,7 +527,7 @@ static lxb_dom_node_t *browser_engine_find_declared_media_anchor(
         : lxb_dom_interface_node(document->html);
     if (root == NULL) return NULL;
     char declared_thumbnail[NAVIGATION_URL_LIMIT];
-    bool have_thumbnail = declared->thumbnail_url[0] != '\0'
+    bool have_thumbnail = stopped && declared->thumbnail_url[0] != '\0'
         && fetch_resolve_url(
                engine->navigation.page.resource_base_url,
                declared->thumbnail_url, declared_thumbnail,
@@ -477,7 +538,17 @@ static lxb_dom_node_t *browser_engine_find_declared_media_anchor(
          node != NULL && nodes++ < 16384u;
          node = browser_engine_media_walk_next(root, node)) {
         if (node->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
-        if (browser_engine_media_node_name_is(node, "video")) {
+        if (browser_engine_media_node_name_is(node, "video")
+            || browser_engine_media_node_name_is(node, "audio")) {
+            if (document_is_declared_video_card(document, node)) continue;
+            bool covers = browser_engine_author_media_openable(node);
+            if (!covers && stopped
+                && browser_engine_media_node_name_is(node, "video")) {
+                const LayoutNodeBox *box = layout_box_for_node(
+                    &engine->navigation.page.layout, node);
+                covers = box != NULL && box->width > 0 && box->height > 0;
+            }
+            if (!covers) continue;
             if (author_video != NULL) *author_video = true;
             return node;
         }
@@ -590,9 +661,12 @@ static bool browser_engine_commit_media_card(
 BrowserDeclaredMediaCard browser_engine_prepare_declared_media_card(
     BrowserEngine *engine)
 {
-    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
-        || !engine->navigation_ready || !engine->navigation.page.loaded)
+    if (engine == NULL) return BROWSER_DECLARED_MEDIA_CARD_NONE;
+    if (engine->state != BROWSER_ENGINE_ACTIVE
+        || !engine->navigation_ready || !engine->navigation.page.loaded) {
+        engine->declared_media_reason = "not-loaded";
         return BROWSER_DECLARED_MEDIA_CARD_NONE;
+    }
     if (engine->declared_media_card_generation
             == engine->navigation.generation
         && engine->navigation.page.document.declared_video_card_node
@@ -617,7 +691,13 @@ BrowserDeclaredMediaCard browser_engine_prepare_declared_media_card(
                 == BROWSER_DECLARED_MEDIA_CARD_UNAVAILABLE)) {
         return engine->declared_media_outcome;
     }
-    if (!browser_engine_has_script_degradation(&engine->navigation)) {
+    /* A healthy page is considered too, but only when its parser kept a
+       declaration (media_declared_video_keep_parsed/_closed: cheap evidence
+       already paid for). Every other healthy page returns here without a
+       walk, a deferral or an allocation. */
+    bool degraded = browser_engine_has_script_degradation(&engine->navigation);
+    if (!degraded && document->declared_video_cache == NULL) {
+        engine->declared_media_reason = "no-declaration";
         engine->declared_media_recovery_generation = 0u;
         return BROWSER_DECLARED_MEDIA_CARD_NONE;
     }
@@ -631,8 +711,11 @@ BrowserDeclaredMediaCard browser_engine_prepare_declared_media_card(
             engine->declared_media_recovery_first_runtime_tick = runtime_tick;
             /* Basic and media-card recovery inspect the same unsettled page.
                Let the first observer seed both clocks so an undeclared page
-               does not pay two consecutive settle windows. */
-            if (engine->basic_view_recovery_generation != generation) {
+               does not pay two consecutive settle windows. A healthy page
+               has no Basic recovery to seed: if it degrades later, that
+               recovery's window starts then. */
+            if (degraded
+                && engine->basic_view_recovery_generation != generation) {
                 engine->basic_view_recovery_generation = generation;
                 engine->basic_view_recovery_first_runtime_tick = runtime_tick;
             }
@@ -641,7 +724,12 @@ BrowserDeclaredMediaCard browser_engine_prepare_declared_media_card(
             engine->declared_media_recovery_first_runtime_tick;
         size_t settled_ticks = runtime_tick >= first_tick
             ? runtime_tick - first_tick : BROWSER_BLANK_READER_SETTLE_TICKS;
-        if (settled_ticks < BROWSER_BLANK_READER_SETTLE_TICKS)
+        /* A page that never goes quiet (timers, polling, a fetch that never
+           ends) still gets its answer: the tick window is capped by
+           BROWSER_MEDIA_CARD_SETTLE_CAP_US of wall time since commit. */
+        if (settled_ticks < BROWSER_BLANK_READER_SETTLE_TICKS
+            && !browser_engine_recovery_elapsed(
+                   engine, BROWSER_MEDIA_CARD_SETTLE_CAP_US))
             return BROWSER_DECLARED_MEDIA_CARD_DEFERRED;
     }
     if (!browser_engine_recovery_wall_settled(engine))
@@ -651,9 +739,21 @@ BrowserDeclaredMediaCard browser_engine_prepare_declared_media_card(
        the settle window this function is called once per dirty frame, so
        even a cached first scan would be wasted work on a page whose author
        runtime may still recover. */
-    const MediaDeclaredVideo *declared = media_declared_video_cached(
+    /* A page that declares only its player page gets the card too: Play
+       opens that page to play from (the embed hop). */
+    const MediaDeclaredVideo *declared = media_declared_video_or_embed_cached(
         &engine->navigation.page.document);
+    /* Degradation alone does not mean the page stopped: a page whose
+       bundle loaded but some of whose chunks failed (dynamic_scripts_failed)
+       still runs its application, timers and player. Only a degraded page
+       with no pending author work left is treated as stopped: its laid-out
+       author video may stand in for the card (activation reaches the
+       native fallback) and its thumbnail image may be wrapped. A page
+       still running is treated like a healthy one. */
+    bool stopped = degraded && !script_runtime_has_pending_author_work(
+        engine->navigation.page.runtime);
     if (declared == NULL) {
+        engine->declared_media_reason = "no-declaration";
         engine->declared_media_outcome_generation =
             engine->navigation.generation;
         engine->declared_media_outcome_content_generation =
@@ -663,8 +763,9 @@ BrowserDeclaredMediaCard browser_engine_prepare_declared_media_card(
     }
     bool author_video = false;
     lxb_dom_node_t *anchor = browser_engine_find_declared_media_anchor(
-        engine, declared, &author_video);
+        engine, declared, stopped, &author_video);
     if (author_video) {
+        engine->declared_media_reason = "author-media";
         engine->declared_media_outcome_generation =
             engine->navigation.generation;
         engine->declared_media_outcome_content_generation =
@@ -675,6 +776,7 @@ BrowserDeclaredMediaCard browser_engine_prepare_declared_media_card(
 
     lxb_dom_node_t *body = document_body_node(document);
     if (body == NULL) {
+        engine->declared_media_reason = "no-body";
         engine->declared_media_outcome_generation =
             engine->navigation.generation;
         engine->declared_media_outcome_content_generation =
@@ -714,6 +816,8 @@ BrowserDeclaredMediaCard browser_engine_prepare_declared_media_card(
                 "box-sizing:border-box;margin:8px 0;border:2px solid #547696;"
                 "border-radius:8px;background:#162431")
             && (declared->thumbnail_url[0] == '\0'
+                || (!stopped && budget_remaining(document->budget)
+                                     < BROWSER_MEDIA_CARD_POSTER_HEADROOM)
                 || browser_engine_media_set_attribute(
                        card, "poster", declared->thumbnail_url));
         if (okay) okay = body->first_child == NULL
@@ -739,9 +843,29 @@ BrowserDeclaredMediaCard browser_engine_prepare_declared_media_card(
     if (!okay || !browser_engine_commit_media_card(engine, card, anchor)) {
         /* Allocation, mutation-journal and shell preparation refusals are
            transient.  Only a document-derived absence (such as no body)
-           may latch UNAVAILABLE for this content generation. */
+           may latch UNAVAILABLE for this content generation. A page still
+           loaded is asked again a bounded number of times, each after
+           another settle window: the frontend stops asking once it hears
+           UNAVAILABLE. */
+        engine->declared_media_reason = "refused";
+        if (engine->navigation.page.loaded) {
+            const uint64_t generation = engine->navigation.generation;
+            if (engine->declared_media_refusal_generation != generation) {
+                engine->declared_media_refusal_generation = generation;
+                engine->declared_media_refusals = 0u;
+            }
+            if (engine->declared_media_refusals
+                    < BROWSER_MEDIA_CARD_REFUSAL_RETRIES) {
+                engine->declared_media_refusals++;
+                engine->declared_media_recovery_generation = generation;
+                engine->declared_media_recovery_first_runtime_tick =
+                    engine->navigation.page.script_result.runtime_ticks;
+                return BROWSER_DECLARED_MEDIA_CARD_DEFERRED;
+            }
+        }
         return BROWSER_DECLARED_MEDIA_CARD_UNAVAILABLE;
     }
+    engine->declared_media_reason = "installed";
     engine->declared_media_card = card;
     engine->declared_media_card_generation = engine->navigation.generation;
     engine->declared_media_outcome_generation = engine->navigation.generation;
@@ -853,6 +977,24 @@ static bool browser_engine_has_visible_action_target(
     return false;
 }
 
+bool browser_engine_page_memory_recovery_due(const BrowserEngine *engine)
+{
+    /* A page being replaced is not recovered: a navigation away from it
+       (the embed hop retires its realm on purpose) is already pending, and
+       a recovery sheet raised now would cover the page that commits. */
+    if (browser_engine_navigation_pending(engine)) return false;
+    if (browser_engine_page_script_memory_failed(engine)) return true;
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        || !engine->navigation_ready || !engine->navigation.page.loaded
+        || engine->navigation.page.runtime == NULL
+        || script_runtime_heap_rejections(engine->navigation.page.runtime)
+               == 0u) return false;
+    /* The same "little content" predicate the Basic offer itself applies
+       to a degraded page whose scripts were not stopped for memory. */
+    return browser_engine_page_is_visually_blank(engine)
+        || !browser_engine_has_visible_action_target(engine);
+}
+
 BrowserBasicViewRecovery browser_engine_prepare_basic_view_recovery(
     BrowserEngine *engine, ReaderDocumentAnalysis *analysis)
 {
@@ -863,6 +1005,7 @@ BrowserBasicViewRecovery browser_engine_prepare_basic_view_recovery(
                    != 0u);
     if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
         || !engine->navigation_ready
+        || browser_engine_navigation_pending(engine)
         || !browser_engine_has_script_degradation(&engine->navigation)
         || (!memory_limited && !browser_engine_page_is_visually_blank(engine)
             && browser_engine_has_visible_action_target(engine))) {
@@ -952,4 +1095,138 @@ bool browser_engine_reader_analysis(
         || !engine->navigation.page.reader_analysis.prepared) return false;
     *analysis = engine->navigation.page.reader_analysis;
     return true;
+}
+
+const char *browser_engine_declared_media_card_reason(
+    const BrowserEngine *engine)
+{
+    return engine == NULL || engine->declared_media_reason == NULL
+        ? "none" : engine->declared_media_reason;
+}
+
+static bool browser_engine_media_descends(lxb_dom_node_t *node,
+                                          lxb_dom_node_t *scope)
+{
+    size_t depth = 0u;
+    for (; node != NULL && depth++ < 64u; node = node->parent)
+        if (node == scope) return true;
+    return false;
+}
+
+/* The first focus target with area (controls, then links) that is `scope`
+   itself (`exact`) or lies inside it. */
+static lxb_dom_node_t *browser_engine_media_focus_inside(
+    const LayoutDocument *layout, lxb_dom_node_t *scope, bool exact)
+{
+    for (size_t i = 0; i < layout->control_count; i++) {
+        const ControlRegion *region = &layout->controls[i];
+        if (region->node == NULL || region->width <= 0 || region->height <= 0)
+            continue;
+        if (exact ? region->node == scope
+                  : browser_engine_media_descends(region->node, scope))
+            return region->node;
+    }
+    if (exact) return NULL;
+    for (size_t i = 0; i < layout->link_count; i++) {
+        const LinkRegion *region = &layout->links[i];
+        if (region->node == NULL || region->width <= 0 || region->height <= 0)
+            continue;
+        if (browser_engine_media_descends(region->node, scope))
+            return region->node;
+    }
+    return NULL;
+}
+
+/* `media` itself when it is a focus target, else the first focus target of
+   its nearest enclosing element that has one (its player's control). */
+static lxb_dom_node_t *browser_engine_media_focus_for(
+    const LayoutDocument *layout, lxb_dom_node_t *media, bool *player)
+{
+    *player = false;
+    lxb_dom_node_t *own = browser_engine_media_focus_inside(
+        layout, media, true);
+    if (own != NULL) return own;
+    size_t depth = 0u;
+    for (lxb_dom_node_t *scope = media->parent;
+         scope != NULL && scope->type == LXB_DOM_NODE_TYPE_ELEMENT
+         && depth++ < 64u;
+         scope = scope->parent) {
+        if (browser_engine_media_node_name_is(scope, "body")
+            || browser_engine_media_node_name_is(scope, "html")) break;
+        lxb_dom_node_t *inside = browser_engine_media_focus_inside(
+            layout, scope, false);
+        if (inside != NULL) {
+            *player = true;
+            return inside;
+        }
+    }
+    return NULL;
+}
+
+BrowserPageMediaTarget browser_engine_page_media_target(
+    BrowserEngine *engine, lxb_dom_node_t **focus_target)
+{
+    if (focus_target != NULL) *focus_target = NULL;
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        || !engine->navigation_ready || !engine->navigation.page.loaded)
+        return BROWSER_PAGE_MEDIA_NONE;
+    const PocDocument *document = &engine->navigation.page.document;
+    const LayoutDocument *layout = &engine->navigation.page.layout;
+    lxb_dom_node_t *target = document->declared_video_card_node == NULL
+        ? NULL : browser_engine_media_focus_inside(
+                     layout, document->declared_video_card_node, true);
+    if (target != NULL) {
+        if (focus_target != NULL) *focus_target = target;
+        return BROWSER_PAGE_MEDIA_CARD;
+    }
+    /* The card gate's order: the first author media in document order
+       that page media can open, else the first author media at all. */
+    lxb_dom_node_t *root = document->html == NULL ? NULL
+        : lxb_dom_interface_node(document->html);
+    lxb_dom_node_t *openable = NULL, *element = NULL;
+    size_t nodes = 0u;
+    for (lxb_dom_node_t *node = root;
+         node != NULL && openable == NULL && nodes++ < 16384u;
+         node = browser_engine_media_walk_next(root, node)) {
+        if (node->type != LXB_DOM_NODE_TYPE_ELEMENT
+            || document_is_declared_video_card(document, node)
+            || (!browser_engine_media_node_name_is(node, "video")
+                && !browser_engine_media_node_name_is(node, "audio")))
+            continue;
+        if (browser_engine_author_media_openable(node)) openable = node;
+        else if (element == NULL) element = node;
+    }
+    lxb_dom_node_t *media = openable != NULL ? openable : element;
+    bool player = false;
+    target = media == NULL ? NULL
+        : browser_engine_media_focus_for(layout, media, &player);
+    if (target == NULL) return BROWSER_PAGE_MEDIA_NONE;
+    if (focus_target != NULL) *focus_target = target;
+    if (openable != NULL)
+        return player ? BROWSER_PAGE_MEDIA_AUTHOR_PLAYER
+                      : BROWSER_PAGE_MEDIA_AUTHOR;
+    return player ? BROWSER_PAGE_MEDIA_ELEMENT_PLAYER
+                  : BROWSER_PAGE_MEDIA_ELEMENT;
+}
+
+bool browser_engine_focus_on_page_media(BrowserEngine *engine)
+{
+    if (engine == NULL || !engine->controller_ready
+        || (engine->controller.focus_kind != CONTROLLER_FOCUS_CONTROL
+            && engine->controller.focus_kind != CONTROLLER_FOCUS_LINK))
+        return false;
+    lxb_dom_node_t *focused = engine->controller.focus_node;
+    if (focused == NULL) return false;
+    /* An author media element builds the native media action itself
+       (controller_build_media_action), whatever Play's first choice is. */
+    if (engine->controller.focus_kind == CONTROLLER_FOCUS_CONTROL
+        && (document_is_declared_video_card(
+                &engine->navigation.page.document, focused)
+            || browser_engine_media_node_name_is(focused, "video")
+            || browser_engine_media_node_name_is(focused, "audio")))
+        return true;
+    lxb_dom_node_t *target = NULL;
+    return browser_engine_page_media_target(engine, &target)
+               != BROWSER_PAGE_MEDIA_NONE
+        && target == focused;
 }

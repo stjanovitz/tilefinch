@@ -57,8 +57,18 @@ typedef enum {
     PSP_INPUT_SCRIPT_STEP_UNTIL,
     /* A press due after delay_ms of wall time; late sampling retains its
        original due time so response measurements include the polling gap. */
-    PSP_INPUT_SCRIPT_STEP_TIMED_PRESS
+    PSP_INPUT_SCRIPT_STEP_TIMED_PRESS,
+    /* One idle frame on which the host performs a named page action (see
+       PspInputScriptPageAction). */
+    PSP_INPUT_SCRIPT_STEP_PAGE_ACTION
 } PspInputScriptStepKind;
+
+typedef enum {
+    PSP_INPUT_SCRIPT_PAGE_ACTION_NONE = 0,
+    /* focus-page-media: focus what Play would act on (declared media card,
+       playable author media, other author media). */
+    PSP_INPUT_SCRIPT_PAGE_ACTION_FOCUS_MEDIA
+} PspInputScriptPageAction;
 
 typedef struct {
     uint8_t kind;
@@ -70,6 +80,7 @@ typedef struct {
     uint16_t delay_ms;
     uint8_t analog_x;
     uint8_t analog_y;
+    uint8_t page_action;
     char mark[PSP_INPUT_SCRIPT_MARK_CAPACITY];
 } PspInputScriptStep;
 
@@ -102,6 +113,8 @@ typedef struct {
     uint64_t pressed_us;
     /* Borrowed from the current step for exactly the frame it fires on. */
     const char *mark;
+    /* Likewise the current page-action step's action. */
+    uint8_t page_action;
 } PspInputScript;
 
 typedef void (*PspInputScriptWarning)(
@@ -166,6 +179,9 @@ bool psp_input_script_eof_pending(const PspInputScript *script);
 
 /* Non-NULL only on the frame a `mark` step fires. */
 const char *psp_input_script_mark(const PspInputScript *script);
+/* Non-NONE only on the frame a page-action step fires. */
+PspInputScriptPageAction psp_input_script_page_action(
+    const PspInputScript *script);
 
 /* Stable short names for the log and the host trace. Kept here rather than in
    psp_ui.c so the shipping EBOOT never links the string tables. */

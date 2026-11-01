@@ -426,8 +426,17 @@ bool psp_present_internal(
 bool psp_media_menu_feedback_pending(void);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
 void psp_focus_feedback_begin(BrowserEngine *engine, int action, uint64_t started_us);
+/* Validation: a page-up/down press the engine carried out. A moving one
+   starts its tilefinch-scroll-feedback record; one that changed nothing
+   (the page's edge) reports noop=1 at once, timed to the report. */
+void psp_scroll_feedback_press(BrowserEngine *engine, int action,
+    uint64_t started_us, bool changed, const PspUiState *ui);
 /* Validation: report the last focus move's settled frame (tilefinch-focus-frame). */
 void psp_focus_frame_settle(const BrowserEngine *engine);
+/* Validation: once per loop iteration before its wait; on the first quiet
+   iteration (no page work, input or load) after a present, hashes the frame
+   a pending settled record will report. */
+void psp_focus_frame_idle(const BrowserEngine *engine, bool quiet);
 void psp_media_menu_feedback_input(const PspUiMediaState *media,
     bool was_open, unsigned old_tab, uint32_t started_us);
 void psp_load_experience_report(const char *scope, BrowserEngine *engine,
@@ -1337,6 +1346,7 @@ void psp_app_route_controller_action(
 void psp_app_dispatch_activation(
     PspApp *app, PspAppFrameState *frame, bool enter_only,
     const uint16_t *engine_frame);
+void psp_app_embed_hop_tick(PspApp *app, PspAppFrameState *frame);
 
 /* src/psp_app/psp_app_actions.c */
 void psp_app_dispatch_action(
@@ -1431,6 +1441,8 @@ void psp_input_script_observe(
     const PspUiIntent *intent, const PspUiState *ui);
 void psp_input_script_observe_page(
     const PspEngineViews *views, const BrowserEngine *engine);
+/* Performs the page action (focus-page-media) of a step firing now. */
+void psp_input_script_page_actions(BrowserEngine *engine);
 void psp_input_script_observe_media(
     const PspUiMediaIntent *intent, const PspUiMediaState *media);
 void psp_input_script_observe_gamepad(

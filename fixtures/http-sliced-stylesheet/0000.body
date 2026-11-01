@@ -1,0 +1,1 @@
+<!doctype html><title>Sliced stylesheet</title><link rel="stylesheet" href="/sheet.css"><script>globalThis.pocSummary='root:'+getComputedStyle(document.documentElement).color</script><body><p class="tail">sliced tail</p><script>globalThis.pocSummary+=' tail:'+getComputedStyle(document.querySelector('.tail')).color</script></body>

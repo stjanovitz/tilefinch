@@ -446,6 +446,9 @@ static const LabCommand lab_commands[] = {
     {"focus-id", LAB_INPUT | LAB_PRIVATE, "focus-id ID"},
     {"focus-url", LAB_INPUT, "focus-url URL"},
     {"link-urls", 0u, "link-urls"},
+    {"page-media-url", 0u, "page-media-url"},
+    {"page-stream-records", 0u, "page-stream-records"},
+    {"basic-recovery", 0u, "basic-recovery"},
     {"body-contains", 0u, "body-contains TEXT"},
     {"history-controls", 0u, "history-controls"},
     {"control-value", 0u, "control-value ID"},
@@ -478,6 +481,10 @@ static const LabCommand lab_commands[] = {
     {"media-close", 0u, NULL},
     {"media-run", 0u, NULL},
     {"play-page-media", 0u, NULL},
+    {"check-page-media", 0u,
+        "check-page-media [focused] [SECONDS] [seek=SECONDS]|"
+        "record-page-media [focused] [SECONDS [MAX-MB]]"},
+    {"record-page-media", 0u, NULL},
     {"reader-on", LAB_INPUT, "reader-on|reader-off"},
     {"reader-off", LAB_INPUT, NULL},
     {"basic-on", LAB_INPUT, "basic-on"},
@@ -1009,6 +1016,313 @@ typedef struct {
     VisualEvidenceFrames *visual_frames;
 } LabCommandContext;
 
+/* The embed hop as the PSP frontend drives it (psp_app_embed_hop_tick):
+   Play's player-page navigation, then one poll per pump turn. The lab
+   reports the time from Play to the stream address and opens the host
+   player at once. */
+static uint64_t lab_embed_hop_started_us;
+/* The PSP frontend's toast (psp_app_embed_hop_tick). */
+#define EMBED_HOP_NOTHING_PLAYABLE "NO PLAYABLE VIDEO FOUND"
+#define EMBED_HOP_UNAVAILABLE "STREAM OFFLINE OR NOT AVAILABLE"
+
+/* Page media through the PSP's own fetch and demux path
+   (src/media_replay_check.c) instead of the host player:
+   check-page-media under --replay-http-response-keyed proves a recording
+   holds every request the device will make; record-page-media under
+   --capture-http records exactly those requests, bounded by seconds of
+   video and a byte ceiling. Either one follows an embed hop first. */
+typedef enum {
+    LAB_PAGE_MEDIA_PLAY = 0,
+    LAB_PAGE_MEDIA_CHECK,
+    LAB_PAGE_MEDIA_RECORD
+} LabPageMediaMode;
+
+static struct {
+    LabPageMediaMode mode;
+    unsigned seconds;
+    unsigned maximum_mib;
+    /* check only: after reading to `seconds`, seek an HLS stream here
+       (UINT64_MAX: no seek). */
+    uint64_t seek_us;
+    /* Media bytes recorded so far across the candidates one record walks;
+       MAX-MB bounds their sum. */
+    uint64_t recorded_bytes;
+} lab_page_media;
+
+#ifdef TILEFINCH_HAVE_MEDIA_REPLAY_CHECK
+static const char *lab_page_media_decoder_name(MediaReplayDecoder decoder)
+{
+    return decoder == MEDIA_REPLAY_DECODER_FIRMWARE ? "firmware"
+        : decoder == MEDIA_REPLAY_DECODER_SOFTWARE ? "software"
+        : decoder == MEDIA_REPLAY_DECODER_REFUSED ? "refused" : "unknown";
+}
+
+/* One candidate through the check (and, for HLS, its software-bound
+   rendition). True when the PSP would play it; *refused says the PSP would
+   move on to the page's next candidate (media_candidate_refused, or a
+   decoder refusal of the delivered stream). *unknown (recording only): a
+   recorded progressive file whose decoder verdict could not be taken, so
+   the walk records the next candidate too. */
+static bool lab_page_media_check_one(const LabCommandContext *context,
+                                     const char *url, unsigned ordinal,
+                                     size_t total, bool *refused,
+                                     bool *unknown)
+{
+    *unknown = false;
+    NavigationSession *navigation = context->navigation;
+    const char *document_url = navigation->page.document_url;
+    bool recording = lab_page_media.mode == LAB_PAGE_MEDIA_RECORD;
+    /* The page's budget, as on the device (the shared transport also
+       requires it). */
+    Budget *check_budget = context->budget;
+    uint64_t started_us = tilefinch_platform_monotonic_time_us();
+    MediaReplayCheckReport report;
+    uint64_t limit_bytes =
+        (uint64_t) lab_page_media.maximum_mib * 1024u * 1024u;
+    if (recording) {
+        /* A walk records each refused candidate the device also fetches;
+           every one draws on the same ceiling. */
+        if (lab_page_media.recorded_bytes >= limit_bytes) {
+            printf("loop-page-media-check status=failed mode=record "
+                   "candidate=%u/%zu error=\"media byte ceiling reached\"\n",
+                   ordinal, total);
+            *refused = false;
+            return false;
+        }
+        limit_bytes -= lab_page_media.recorded_bytes;
+        (void) fetch_trace_media_capture(true, limit_bytes);
+    }
+    bool seeking = !recording && lab_page_media.seek_us != UINT64_MAX;
+    bool ok = seeking
+        ? media_replay_check_seek(
+              check_budget, navigation->browser_session, url, document_url,
+              PSP_MEDIA_HLS_BOUND_FIRMWARE,
+              (uint64_t) lab_page_media.seconds * UINT64_C(1000000),
+              lab_page_media.seek_us, &report)
+        : media_replay_check(
+              check_budget, navigation->browser_session, url, document_url,
+              PSP_MEDIA_HLS_BOUND_FIRMWARE,
+              (uint64_t) lab_page_media.seconds * UINT64_C(1000000),
+              recording ? limit_bytes : 0, &report);
+    /* A device that finds the firmware refusing the selected variant
+       reselects at the software bound: hold that rendition too, when the
+       master has one. Either bound playing is enough: the firmware variant
+       plays first and the software one is only a fallback. */
+    MediaReplayCheckReport software = {0};
+    bool software_ran = report.hls;
+    bool software_ok = software_ran && (seeking
+        ? media_replay_check_seek(
+              check_budget, navigation->browser_session, url, document_url,
+              PSP_MEDIA_HLS_BOUND_SOFTWARE,
+              (uint64_t) lab_page_media.seconds * UINT64_C(1000000),
+              lab_page_media.seek_us, &software)
+        : media_replay_check(
+              check_budget, navigation->browser_session, url, document_url,
+              PSP_MEDIA_HLS_BOUND_SOFTWARE,
+              (uint64_t) lab_page_media.seconds * UINT64_C(1000000),
+              recording ? limit_bytes : 0, &software));
+    bool firmware_plays = ok && report.decoder != MEDIA_REPLAY_DECODER_REFUSED;
+    bool software_plays = software_ok
+        && software.decoder != MEDIA_REPLAY_DECODER_REFUSED;
+    bool playable = firmware_plays || software_plays;
+    /* A refused progressive file has no smaller form. */
+    bool decoder_refused = !playable
+        && (report.decoder == MEDIA_REPLAY_DECODER_REFUSED
+            || (software_ok
+                && software.decoder == MEDIA_REPLAY_DECODER_REFUSED));
+    *refused = decoder_refused
+        || (!playable && media_candidate_refused(report.error));
+    *unknown = recording && playable && !report.hls
+        && report.decoder == MEDIA_REPLAY_DECODER_UNKNOWN;
+    uint64_t captured = recording ? fetch_trace_media_captured_bytes() : 0;
+    /* HLS is captured through the lane; a progressive file is one Range
+       response outside it. */
+    if (recording)
+        lab_page_media.recorded_bytes +=
+            captured + (report.hls ? 0u : report.payload_bytes);
+    printf("loop-page-media-check status=%s mode=%s ms=%llu hls=%d "
+           "opened=%d ended=%d video=%.2fs samples=%u/%u segments=%zu "
+           "size=%ux%u length=%llu payload=%llu captured=%llu "
+           "software-bound=%s software-video=%.2fs candidate=%u/%zu "
+           "decoder=%s profile=%u level=%u url=\"%.200s\" "
+           "error=\"%s%s%s%s%s\"\n",
+           playable ? "ok" : "failed",
+           recording ? "record" : "check",
+           (unsigned long long)
+               ((tilefinch_platform_monotonic_time_us() - started_us) / 1000u),
+           report.hls ? 1 : 0, report.opened ? 1 : 0, report.ended ? 1 : 0,
+           (double) report.video_until_us / 1e6, report.video_samples,
+           report.audio_samples, report.hls_segments, report.width,
+           report.height, (unsigned long long) report.content_length,
+           (unsigned long long) report.payload_bytes,
+           (unsigned long long) captured,
+           !software_ran ? "n/a" : software_plays ? "ok" : "failed",
+           (double) software.video_until_us / 1e6, ordinal, total,
+           lab_page_media_decoder_name(report.decoder), report.profile_idc,
+           report.level_idc, url, report.error,
+           software.error[0] == '\0' ? "" : " software: ", software.error,
+           report.decoder_refusal[0] == '\0' ? "" : " decoder: ",
+           report.decoder_refusal);
+    if (report.seek_ran || software.seek_ran)
+        printf("loop-page-media-seek status=%s duration=%.2fs "
+               "target=%.2fs landed=%.2fs video=%.2fs audio=%.2fs "
+               "audio-dropped=%u software-landed=%.2fs "
+               "software-video=%.2fs software-audio=%.2fs\n",
+               report.seek_ok && (!software_ran || software.seek_ok)
+                   ? "ok" : "failed",
+               (double) report.duration_us / 1e6,
+               (double) lab_page_media.seek_us / 1e6,
+               (double) report.seek_actual_us / 1e6,
+               (double) report.seek_video_us / 1e6,
+               (double) report.seek_audio_us / 1e6,
+               report.seek_audio_dropped,
+               (double) software.seek_actual_us / 1e6,
+               (double) software.seek_video_us / 1e6,
+               (double) software.seek_audio_us / 1e6);
+    return playable;
+}
+#endif
+
+/* The page's candidates in the PSP's order (psp_media_open_page_candidates
+   and psp_media_retry_page_candidate): the action's URL, then each packed
+   alternate while the previous one was refused. */
+static bool lab_page_media_route(const LabCommandContext *context,
+                                 const char *url, const char *alternates,
+                                 size_t alternates_length)
+{
+    LabPageMediaMode mode = lab_page_media.mode;
+#ifdef TILEFINCH_HAVE_MEDIA_REPLAY_CHECK
+    bool recording = mode == LAB_PAGE_MEDIA_RECORD;
+    if (recording
+        && !fetch_trace_media_capture(
+               true, (uint64_t) lab_page_media.maximum_mib * 1024u * 1024u)) {
+        lab_page_media.mode = LAB_PAGE_MEDIA_PLAY;
+        printf("loop-page-media-check status=failed mode=record "
+               "error=\"record-page-media needs --capture-http\"\n");
+        (void) fetch_trace_media_capture(false, 0);
+        return false;
+    }
+    if (alternates == NULL
+        || alternates_length > MEDIA_CANDIDATE_PACKED_CAPACITY)
+        alternates_length = 0;
+    size_t total = 1u + media_candidates_count(alternates, alternates_length);
+    lab_page_media.recorded_bytes = 0;
+    size_t cursor = 0;
+    unsigned ordinal = 1, chosen = 0;
+    bool refused = false, unknown = false;
+    if (lab_page_media_check_one(context, url, ordinal, total, &refused,
+                                 &unknown)) chosen = ordinal;
+    /* Recording also goes past a chosen file whose verdict it could not
+       take: the device may refuse it, and then plays the next candidate. */
+    for (const char *next; ((chosen == 0 && refused) || unknown)
+                           && (next = media_candidates_next(
+                                   alternates, alternates_length, &cursor,
+                                   NULL)) != NULL;) {
+        ordinal++;
+        printf("loop-page-media-check candidate action=next ordinal=%u%s\n",
+               ordinal, chosen != 0 ? " reason=unknown-verdict" : "");
+        bool played = lab_page_media_check_one(context, next, ordinal, total,
+                                               &refused, &unknown);
+        if (played && chosen == 0) chosen = ordinal;
+    }
+    bool ok = chosen != 0;
+    if (ok) {
+        printf("loop-page-media-check chosen=%u of=%zu\n", chosen, total);
+    } else {
+        printf("loop-page-media-check chosen=none of=%zu exhausted=%d\n",
+               total, refused && ordinal == total ? 1 : 0);
+    }
+    if (recording) (void) fetch_trace_media_capture(false, 0);
+    lab_page_media.mode = LAB_PAGE_MEDIA_PLAY;
+    print_http_replay_ledger();
+    return ok;
+#else
+    lab_page_media.mode = LAB_PAGE_MEDIA_PLAY;
+    (void) context;
+    (void) url;
+    (void) alternates;
+    (void) alternates_length;
+    printf("loop-page-media-check status=failed mode=%s "
+           "error=\"not built into this lab\"\n",
+           mode == LAB_PAGE_MEDIA_RECORD ? "record" : "check");
+    return false;
+#endif
+}
+
+static bool lab_embed_hop_begin(const LabCommandContext *context,
+                                ControllerAction *action)
+{
+    lab_embed_hop_started_us = tilefinch_platform_monotonic_time_us();
+    printf("loop-embed-hop status=started url=\"%s\"\n", action->url);
+    return browser_engine_execute_action(
+        context->engine, action, 4 * MIB, 30000);
+}
+
+static bool lab_embed_hop_step(const LabCommandContext *context,
+                               const char *user_css)
+{
+    BrowserEngine *engine = context->engine;
+    if (!browser_engine_embed_hop_active(engine)) return true;
+    ControllerAction *action = &context->scratch->action;
+    BrowserEmbedHopStatus status = browser_engine_embed_hop_poll(
+        engine, action);
+    uint64_t elapsed_ms = (tilefinch_platform_monotonic_time_us()
+                           - lab_embed_hop_started_us) / 1000u;
+    if (status == BROWSER_EMBED_HOP_READY) {
+        printf("loop-embed-hop status=ready ms=%llu current=%zu peak=%zu "
+               "kind=%d url=\"%.200s\"\n", (unsigned long long) elapsed_ms,
+               context->budget->current, context->budget->peak,
+               (int) action->media_kind, action->url);
+        size_t cursor = 0;
+        MediaDiscoveryKind kind = MEDIA_DISCOVERY_NONE;
+        for (const char *next; (next = media_candidates_next(
+                 action->body, action->body_length, &cursor, &kind))
+                 != NULL;)
+            printf("loop-embed-hop candidate kind=%d url=\"%.200s\"\n",
+                   (int) kind, next);
+        if (lab_page_media.mode != LAB_PAGE_MEDIA_PLAY) {
+            /* Stay on the player page: going Back would load (and record)
+               the original page a second time. */
+            bool routed = lab_page_media_route(
+                context, action->url, action->body, action->body_length);
+            (void) browser_engine_embed_hop_take_return(engine);
+            return routed;
+        }
+        char media_error[256] = {0};
+        interactive_media_destroy(context->media);
+        bool opened = context->media != NULL && interactive_media_open(
+            context->media, context->budget, context->navigation,
+            action->url, true, media_error, sizeof(media_error));
+#ifdef TILEFINCH_HAVE_HOST_MEDIA
+        if (opened) host_media_set_playing(context->media->player, true);
+#endif
+        printf("loop-embed-hop status=%s error=\"%s\"\n",
+               opened ? "opened" : "open-failed", media_error);
+        /* An offline stream ends the hop as the timeout does. */
+        if (!opened && browser_engine_embed_hop_take_unavailable(
+                           engine, media_error)) {
+            printf("loop-embed-hop status=unavailable message=\"%s\"\n",
+                   EMBED_HOP_UNAVAILABLE);
+            interactive_media_destroy(context->media);
+            return loop_history(engine, context->navigation,
+                                context->controller, false, user_css);
+        }
+    } else if (status == BROWSER_EMBED_HOP_TIMED_OUT) {
+        printf("loop-embed-hop status=timed-out ms=%llu peak=%zu "
+               "message=\"%s\"\n", (unsigned long long) elapsed_ms,
+               context->budget->peak, EMBED_HOP_NOTHING_PLAYABLE);
+        return loop_history(engine, context->navigation,
+                            context->controller, false, user_css);
+    } else if (status == BROWSER_EMBED_HOP_PLAYING
+               && (context->media == NULL || !context->media->ui.visible)
+               && browser_engine_embed_hop_take_return(engine)) {
+        printf("loop-embed-hop status=returned\n");
+        return loop_history(engine, context->navigation,
+                            context->controller, false, user_css);
+    }
+    return true;
+}
+
 /* Media commands: the page's media element and the interactive player. False when LINE is not one of them
    (or lacks its required argument), so the loop's ladder goes on. */
 static bool lab_cmd_media(const LabCommandContext *context,
@@ -1027,11 +1341,57 @@ static bool lab_cmd_media(const LabCommandContext *context,
     bool capture_frames = context->capture_frames;
     bool pace_real_time = context->pace_real_time;
     VisualEvidenceFrames *visual_frames = context->visual_frames;
-    if (strcmp(line, "play-page-media") == 0) {
+    bool route = strcmp(line, "check-page-media") == 0
+        || strcmp(line, "record-page-media") == 0;
+    if (route || strcmp(line, "play-page-media") == 0) {
+        lab_page_media.mode = !route ? LAB_PAGE_MEDIA_PLAY
+            : line[0] == 'c' ? LAB_PAGE_MEDIA_CHECK : LAB_PAGE_MEDIA_RECORD;
+        lab_page_media.seconds = 60u;
+        lab_page_media.maximum_mib = 30u;
+        lab_page_media.seek_us = UINT64_MAX;
+        const char *seek = route && argument != NULL
+            ? strstr(argument, "seek=") : NULL;
+        if (seek != NULL) {
+            lab_page_media.seek_us =
+                strtoull(seek + 5, NULL, 10) * UINT64_C(1000000);
+            /* The plain arguments end where seek= begins. */
+            if (seek == argument) argument = NULL;
+        }
+        /* "focused": the action Cross builds on the focused element (the
+           declared media card, an author video), not the page's. */
+        bool focused = route && argument != NULL
+            && strncmp(argument, "focused", 7u) == 0
+            && (argument[7] == '\0' || argument[7] == ' ');
+        if (focused) argument += 7;
+        if (route && argument != NULL && argument[0] != '\0') {
+            char *end = NULL;
+            unsigned long seconds = strtoul(argument, &end, 10);
+            if (seconds != 0 && seconds <= 3600u)
+                lab_page_media.seconds = (unsigned) seconds;
+            unsigned long mib = end == NULL ? 0 : strtoul(end, NULL, 10);
+            if (mib != 0 && mib <= 1024u)
+                lab_page_media.maximum_mib = (unsigned) mib;
+        }
         memset(&scratch->action, 0, sizeof(scratch->action));
-        *ok = controller_build_document_media_action(
-            controller, &scratch->action);
-        if (*ok) {
+        *ok = focused
+            ? browser_engine_activate(context->engine, &scratch->action)
+              && (scratch->action.type == CONTROLLER_ACTION_MEDIA
+                  || scratch->action.embed_hop)
+            : controller_build_document_media_action(
+                  controller, &scratch->action);
+        if (focused)
+            printf("loop-page-media-focused found=%s url=\"%s\"%s\n",
+                   *ok ? "yes" : "no", *ok ? scratch->action.url : "",
+                   *ok && scratch->action.embed_hop ? " hop=yes" : "");
+        if (*ok && scratch->action.embed_hop) {
+            *ok = lab_embed_hop_begin(context, &scratch->action);
+        } else if (*ok && route) {
+            *ok = lab_page_media_route(
+                context, scratch->action.url, scratch->action.body,
+                scratch->action.body_length);
+            *changed = false;
+            return true;
+        } else if (*ok) {
             char media_error[256] = {0};
             interactive_media_destroy(media);
             *ok = media != NULL && interactive_media_open(
@@ -1162,7 +1522,54 @@ static bool lab_cmd_inspect(const LabCommandContext *context,
     InteractiveCommandScratch *scratch = context->scratch;
     (void) reset_cache;
     (void) frame_number;
-    if (strcmp(line, "link-urls") == 0) {
+    if (strcmp(line, "page-media-url") == 0) {
+        /* The URL Play page media would open (the page's video element, its
+           declared video or a discovered candidate), without opening it. */
+        memset(&scratch->action, 0, sizeof(scratch->action));
+        bool found = controller_build_document_media_action(
+            context->controller, &scratch->action);
+        printf("loop-page-media found=%s url=\"%s\"%s\n",
+               found ? "yes" : "no", found ? scratch->action.url : "",
+               found && scratch->action.embed_hop ? " hop=yes" : "");
+        *changed = false;
+    } else if (strcmp(line, "page-stream-records") == 0) {
+        /* The stream references remembered from the page's JSON/playlist
+           responses, and the own ones the embed hop would play. */
+        const PocDocument *document = &navigation->page.document;
+        size_t records = 0;
+        for (size_t i = 0;
+             i < sizeof(document->media_json_responses)
+                     / sizeof(document->media_json_responses[0]); i++)
+            records += document->media_json_responses[i] != NULL;
+        char own[NAVIGATION_URL_LIMIT];
+        MediaDiscoveryKind kind = MEDIA_DISCOVERY_NONE;
+        for (size_t ordinal = 0; media_json_own_candidate(
+                 document, ordinal, own, sizeof(own), &kind); ordinal++)
+            printf("loop-stream-own ordinal=%zu kind=%d url=\"%.160s\"\n",
+                   ordinal, (int) kind, own);
+        printf("loop-stream-records count=%zu generation=%u\n", records,
+               (unsigned) media_json_response_generation(document));
+        *changed = false;
+    } else if (strcmp(line, "basic-recovery") == 0) {
+        /* The automatic Basic view fallback's two questions, as the PSP
+           frontend asks them after a page turn: is the page due for another
+           look (psp_basic_fallback_recheck), and does it qualify now. The
+           engine prepares the hidden tree but nothing is presented. */
+        ReaderDocumentAnalysis analysis = {0};
+        bool due = browser_engine_page_memory_recovery_due(context->engine);
+        BrowserBasicViewRecovery recovery =
+            browser_engine_prepare_basic_view_recovery(
+                context->engine, &analysis);
+        static const char *const names[] = {
+            "none", "available", "unavailable", "deferred"
+        };
+        printf("loop-basic-recovery memory-due=%s recovery=%s "
+               "anchors=%u nodes=%u\n", due ? "yes" : "no",
+               (unsigned) recovery < 4u ? names[recovery] : "?",
+               (unsigned) analysis.mapped_anchors,
+               (unsigned) analysis.extracted_nodes);
+        *changed = false;
+    } else if (strcmp(line, "link-urls") == 0) {
         const NavigationEntry *entry = navigation_current(navigation);
         const char *base = entry == NULL
             ? navigation->page.document_url : entry->url;
@@ -1259,6 +1666,52 @@ static bool lab_cmd_inspect(const LabCommandContext *context,
     } else {
         return false;
     }
+    return true;
+}
+
+/* The PSP frontend asks for the declared media card at each commit, again
+   after every runtime turn while the answer is deferred, and once more when
+   the page's memory recovery falls due (psp_apply_reader_after_navigation,
+   psp_basic_fallback_recheck). tick and pump ask the same, so lab frames
+   and census runs show the card the device shows. True when one was
+   installed. */
+static struct {
+    uint64_t generation;
+    bool pending;
+    bool memory_rechecked;
+    bool installed;
+} lab_media_card;
+
+static bool lab_media_card_step(BrowserEngine *engine)
+{
+    if (!browser_engine_page_loaded(engine)) return false;
+    uint64_t generation = browser_engine_page_generation(engine);
+    if (generation != lab_media_card.generation) {
+        lab_media_card.generation = generation;
+        lab_media_card.pending = true;
+        lab_media_card.memory_rechecked = false;
+        lab_media_card.installed = false;
+    }
+    if (!lab_media_card.pending && !lab_media_card.memory_rechecked
+        && !lab_media_card.installed
+        && browser_engine_page_memory_recovery_due(engine)) {
+        lab_media_card.memory_rechecked = true;
+        lab_media_card.pending = true;
+    }
+    if (!lab_media_card.pending) return false;
+    BrowserDeclaredMediaCard card =
+        browser_engine_prepare_declared_media_card(engine);
+    if (card == BROWSER_DECLARED_MEDIA_CARD_DEFERRED) return false;
+    lab_media_card.pending = false;
+    if (card != BROWSER_DECLARED_MEDIA_CARD_INSTALLED) {
+        printf("loop-media-card outcome=%d reason=%s generation=%llu\n",
+               (int) card, browser_engine_declared_media_card_reason(engine),
+               (unsigned long long) generation);
+        return false;
+    }
+    lab_media_card.installed = true;
+    printf("loop-media-card installed generation=%llu\n",
+           (unsigned long long) generation);
     return true;
 }
 
@@ -1747,7 +2200,10 @@ static bool run_command_loop(FILE *commands, bool interactive,
                 if (full_turn) {
                     bool quiet = false;
                     ok = loop_drain_turn(engine, navigation, media, cache,
-                                         milliseconds, &quiet);
+                                         milliseconds, &quiet)
+                        && lab_embed_hop_step(&command, user_css);
+                    if (ok && lab_media_card_step(engine))
+                        reset_cache = true;
                     continue;
                 }
                 ok = browser_engine_advance_runtime(
@@ -1758,6 +2214,7 @@ static bool run_command_loop(FILE *commands, bool interactive,
                         media, navigation, cache, milliseconds,
                         &media_changed);
                 }
+                if (ok && lab_media_card_step(engine)) reset_cache = true;
             }
         } else if (strcmp(line, "idle") == 0) {
             /* One page-idle turn at a time, so a script can place the
@@ -1935,7 +2392,8 @@ static bool run_command_loop(FILE *commands, bool interactive,
                 && media != NULL && media->ui.visible;
             if (handled) {
                 ok = interactive_media_button(
-                    media, navigation, cache, PSP_UI_BUTTON_CANCEL);
+                    media, navigation, cache, PSP_UI_BUTTON_CANCEL)
+                    && lab_embed_hop_step(&command, user_css);
             }
             if (!handled) {
                 ok = requested && loop_history(
@@ -1963,6 +2421,22 @@ static bool run_command_loop(FILE *commands, bool interactive,
                   && browser_engine_activate(engine, &scratch->action);
             if (!media_activation && ok
                 && scratch->action.type == CONTROLLER_ACTION_MEDIA) {
+                /* The native route's candidates, in the order it tries
+                   them. The host player opens only the first. */
+                printf("media-candidate order=0 kind=%d url=\"%s\"\n",
+                       (int) scratch->action.media_kind,
+                       scratch->action.url);
+                size_t candidate_cursor = 0;
+                MediaDiscoveryKind candidate_kind = MEDIA_DISCOVERY_NONE;
+                unsigned candidate_order = 0;
+                for (const char *candidate;
+                     (candidate = media_candidates_next(
+                          scratch->action.body, scratch->action.body_length,
+                          &candidate_cursor, &candidate_kind)) != NULL;) {
+                    printf("media-candidate order=%u kind=%d url=\"%s\"\n",
+                           ++candidate_order, (int) candidate_kind,
+                           candidate);
+                }
                 char media_error[256] = {0};
                 interactive_media_destroy(media);
                 ok = media != NULL && interactive_media_open(
@@ -1975,6 +2449,10 @@ static bool run_command_loop(FILE *commands, bool interactive,
                 if (!ok && media_error[0] != '\0')
                     fprintf(stderr, "page video open failed: %s\n",
                             media_error);
+                reset_cache = ok;
+            } else if (!media_activation && ok
+                && scratch->action.embed_hop) {
+                ok = lab_embed_hop_begin(&command, &scratch->action);
                 reset_cache = ok;
             } else if (!media_activation && ok
                 && (scratch->action.type == CONTROLLER_ACTION_NAVIGATE

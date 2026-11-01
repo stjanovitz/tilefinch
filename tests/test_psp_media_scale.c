@@ -137,6 +137,10 @@ static bool test_matches_reference(void)
     CHECK(compare_geometry(PSP_MEDIA_SCALE_RGB565, 426, 240, 480, 270, 0));
     CHECK(compare_geometry(PSP_MEDIA_SCALE_RGB565, 480, 272, 480, 272, 0));
     CHECK(compare_geometry(PSP_MEDIA_SCALE_RGB565, 320, 240, 363, 272, 58));
+    /* The 565 rows pair their stores too: an odd left edge must fall back,
+       and an odd width must finish with one single store. */
+    CHECK(compare_geometry(PSP_MEDIA_SCALE_RGB565, 320, 240, 362, 272, 59));
+    CHECK(compare_geometry(PSP_MEDIA_SCALE_RGB565, 426, 240, 479, 269, 0));
     /* Degenerate but legal: one pixel wide, and a source narrower than its
        stride by the full macroblock padding. */
     CHECK(compare_geometry(PSP_MEDIA_SCALE_RGBA8888, 1, 1, 480, 272, 0));

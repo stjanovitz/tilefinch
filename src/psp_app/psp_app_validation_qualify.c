@@ -17,7 +17,6 @@
 #include "tilefinch/psp_media_fixture.h"
 #include "tilefinch/psp_media_range_probe.h"
 #include "tilefinch/psp_raster_fixture.h"
-#include "psp_webgl_ge_probe.h"
 #include "psp_boot_timing.h"
 #include "tilefinch/game_audio.h"
 
@@ -54,105 +53,6 @@ static TILEFINCH_COLD_PATH void psp_run_js_bench(const char *argv0,
     psp_log_printf("tilefinch-js-bench: outcome=%s\n",
                    failed == 0 ? "complete" : "failed");
     psp_log_checkpoint("js-bench-complete");
-}
-
-static TILEFINCH_COLD_PATH int psp_run_webgl_ge_qualification(
-    BrowserEngine *engine, Budget *budget,
-    PspClockWorker *clock_worker, bool clock_worker_started,
-    const char *exit_to)
-{
-    psp_present_boot_surface(
-        PSP_UI_STARTUP_HOMEPAGE, "TESTING WEBGL GE COST", 720);
-    PspWebglGeProbeReport report;
-    uint16_t *page = psp_display_back_buffer(&psp_display);
-    size_t frame_pixels = 0;
-    uint16_t *frame = browser_engine_framebuffer(engine, &frame_pixels);
-    bool passed = psp_webgl_ge_probe_run(
-        page, frame, frame_pixels, &report);
-    if (passed) passed = psp_display_publish(&psp_display);
-    printf(
-        "tilefinch-webgl-ge-probe: memory color=%zu depth=%zu "
-        "texture-cache=%zu context-inits=%u syncs=%u\n",
-        report.color_bytes, report.depth_bytes, report.texture_cache_bytes,
-        report.context_initializations, report.synchronizations);
-    for (unsigned at = 0; at < PSP_WEBGL_GE_PROBE_SCENE_COUNT; at++) {
-        const PspWebglGeProbeScene *scene = &report.scenes[at];
-        if (scene->name == NULL || scene->frames == 0) continue;
-        printf(
-            "tilefinch-webgl-ge-probe: scene=%s frames=%u draws=%u "
-            "vertices=%u upload-bytes=%zu prepare-avg=%lluus "
-            "emit-avg=%lluus wait-avg=%lluus total-avg=%lluus "
-            "total-max=%lluus list-avg=%zu list-max=%zu "
-            "checksum=0x%08x outcome=%s\n",
-            scene->name, scene->frames, scene->draw_calls_per_frame,
-            scene->vertices_per_frame, scene->upload_bytes_per_frame,
-            (unsigned long long) (scene->prepare_us / scene->frames),
-            (unsigned long long) (scene->emit_us / scene->frames),
-            (unsigned long long) (scene->wait_us / scene->frames),
-            (unsigned long long) (scene->total_us / scene->frames),
-            (unsigned long long) scene->maximum_frame_us,
-            scene->list_bytes / scene->frames,
-            scene->maximum_list_bytes, (unsigned) scene->checksum,
-            scene->passed ? "pass" : "fail");
-    }
-    const PspWebglGeConversionProbe *conversion = &report.conversion;
-    printf(
-        "tilefinch-webgl-ge-probe: conversion=320x180-to-480x272 "
-        "frames=%u cpu-convert-avg=%lluus cpu-convert-max=%lluus "
-        "cpu-copy-avg=%lluus cpu-copy-max=%lluus "
-        "ge-submit-avg=%lluus ge-wait-avg=%lluus "
-        "ge-total-avg=%lluus ge-total-max=%lluus "
-        "pixels=%zu mismatches=%zu cpu=0x%08x ge=0x%08x "
-        "pixel-exact=%s available=%s\n",
-        conversion->frames,
-        (unsigned long long) (conversion->frames == 0 ? 0
-            : conversion->cpu_convert_us / conversion->frames),
-        (unsigned long long) conversion->cpu_convert_max_us,
-        (unsigned long long) (conversion->frames == 0 ? 0
-            : conversion->cpu_copy_us / conversion->frames),
-        (unsigned long long) conversion->cpu_copy_max_us,
-        (unsigned long long) (conversion->frames == 0 ? 0
-            : conversion->ge_submit_us / conversion->frames),
-        (unsigned long long) (conversion->frames == 0 ? 0
-            : conversion->ge_wait_us / conversion->frames),
-        (unsigned long long) (conversion->frames == 0 ? 0
-            : conversion->ge_total_us / conversion->frames),
-        (unsigned long long) conversion->ge_total_max_us,
-        conversion->compared_pixels, conversion->mismatched_pixels,
-        (unsigned) conversion->cpu_checksum,
-        (unsigned) conversion->ge_checksum,
-        conversion->pixel_exact ? "yes" : "no",
-        conversion->available ? "yes" : "no");
-    for (unsigned variant = 0; variant < conversion->strip_variants;
-         variant++) {
-        printf(
-            "tilefinch-webgl-ge-probe: strip-texels=%u frames=%u "
-            "ge-wait-avg=%lluus ge-total-avg=%lluus ge-total-max=%lluus "
-            "mismatches=%zu\n",
-            conversion->strip_texels[variant], conversion->frames,
-            (unsigned long long) (conversion->frames == 0 ? 0
-                : conversion->strip_wait_us[variant] / conversion->frames),
-            (unsigned long long) (conversion->frames == 0 ? 0
-                : conversion->strip_total_us[variant] / conversion->frames),
-            (unsigned long long) conversion->strip_total_max_us[variant],
-            conversion->strip_mismatches[variant]);
-    }
-    printf("tilefinch-webgl-ge-probe: dcache-wbinv-all=%lluus\n",
-           (unsigned long long) conversion->dcache_all_us);
-    printf("tilefinch-webgl-ge-probe: event=%s detail=\"%s\"\n",
-           passed ? "pass" : "fail", report.detail);
-    psp_report_budget_counters(budget, "webgl-ge-probe-exit");
-    browser_engine_destroy(engine);
-    if (clock_worker_started)
-        (void) psp_clock_worker_shutdown(clock_worker);
-    printf("tilefinch-validation: outcome=%s qualification=%s\n",
-           passed ? "clean-exit" : "qualification-failed",
-           passed ? "webgl-ge-pass" : "webgl-ge-fail");
-    psp_log_checkpoint("webgl-ge-probe-complete");
-    psp_log_finish(
-        passed ? "webgl-ge-probe-pass" : "webgl-ge-probe-fail");
-    psp_exit_console(exit_to);
-    return passed ? 0 : 1;
 }
 
 static TILEFINCH_COLD_PATH int psp_run_ge_present_qualification(
@@ -492,7 +392,7 @@ static TILEFINCH_COLD_PATH int psp_run_raster_qualification(
 
 /* The qualification modes that need only the engine. The order is boot's:
    the media fixture, the GE presenter probe, the JavaScript benchmark (which
-   returns to boot), the WebGL GE probe and the CSC order probe. */
+   returns to boot) and the CSC order probe. */
 bool psp_validation_engine_qualifications(
     PspBrowserResources *browser, PspProcessResources *process,
     const char *argv0, int *exit_code)
@@ -553,12 +453,6 @@ bool psp_validation_engine_qualifications(
     }
     if (process->config.validation_js_bench != 0)
         psp_run_js_bench(argv0, &process->config);
-    if (process->config.validation_webgl_ge_probe != 0) {
-        *exit_code = psp_run_webgl_ge_qualification(
-            browser->engine, browser->budget, &process->clock_worker,
-            process->clock_live, process->config.exit_to);
-        return true;
-    }
     if (process->config.validation_csc_order_probe != 0) {
         *exit_code = psp_run_csc_order_qualification(
             browser->engine, browser->budget, &process->clock_worker, process->clock_live,

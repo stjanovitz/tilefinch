@@ -204,6 +204,10 @@ typedef struct {
    semantic identity without adding synchronization to the PSP hot path. */
 static uint64_t stylesheet_generation_sequence;
 
+/* Group-rule nesting at which a sliced parse can stop: the structure walk
+   parses style rules only to depth 8 and never stops deeper than that. */
+#define STYLE_CSS_RESUME_DEPTH 9u
+
 typedef struct {
     const char *declarations;
     size_t declaration_length;
@@ -222,6 +226,17 @@ typedef struct {
     size_t font_fixup_capacity;
     StyleParsedIrBuilder *parsed_ir;
     bool discover_font_faces;
+    /* Sliced parsing (stylesheet_sliced_parse_*): when slice_deadline_us is
+       nonzero the structure walk may stop at a rule boundary once the clock
+       passes it, recording where each enclosing group rule resumes. */
+    uint64_t slice_deadline_us;
+    size_t slice_items;
+    unsigned unsplittable_depth;
+    bool suspended;
+    bool resuming;
+    unsigned resume_levels;
+    size_t resume_at[STYLE_CSS_RESUME_DEPTH];
+    size_t resume_close[STYLE_CSS_RESUME_DEPTH];
 } StyleCssParseContext;
 
 /* Defined by queries_selectors.inc. Declaration retention is included first,
@@ -2425,6 +2440,178 @@ bool stylesheet_add_css_from_context(
     return stylesheet_add_css_from_context_internal(
         sheet, css, length, source_base_url, source_referrer_policy, source,
         NULL);
+}
+
+struct StyleCssSlicedParse {
+    Stylesheet *sheet;
+    const char *css;
+    size_t length;
+    char *base;
+    char policy[STYLE_WEB_FONT_REFERRER_POLICY_CAPACITY];
+    StyleSourceOptions source;
+    StyleResolveScratch scratch;
+    unsigned origin;
+    StyleCssParseContext parse;
+    bool own_batch;
+    bool started;
+    bool finished;
+    bool failed;
+};
+
+/* Installs the source's parse policy, origin and resolve scratch for one
+   slice, as stylesheet_run_parse_transaction does for a whole parse, and
+   hands the enclosing values back in the out parameters. */
+static void stylesheet_sliced_parse_enter(
+    StyleCssSlicedParse *sliced, StyleSourceOptions *enclosing_source,
+    StyleResolveScratch *enclosing_scratch, unsigned *enclosing_origin)
+{
+    Stylesheet *sheet = sliced->sheet;
+    *enclosing_source = sheet->source;
+    *enclosing_scratch = *sheet->resolve_scratch;
+    *enclosing_origin = sheet->current_origin;
+    sheet->source = sliced->source;
+    *sheet->resolve_scratch = sliced->scratch;
+    sheet->current_origin = sliced->origin;
+}
+
+static void stylesheet_sliced_parse_leave(
+    StyleCssSlicedParse *sliced, const StyleSourceOptions *enclosing_source,
+    const StyleResolveScratch *enclosing_scratch, unsigned enclosing_origin)
+{
+    Stylesheet *sheet = sliced->sheet;
+    sliced->scratch = *sheet->resolve_scratch;
+    sheet->source = *enclosing_source;
+    *sheet->resolve_scratch = *enclosing_scratch;
+    sheet->current_origin = enclosing_origin;
+}
+
+StyleCssSlicedParse *stylesheet_sliced_parse_begin(
+    Stylesheet *sheet, const char *css, size_t length,
+    const char *source_base_url, const char *source_referrer_policy,
+    const StyleSourceOptions *source)
+{
+    if (sheet == NULL || sheet->budget == NULL
+        || (css == NULL && length != 0)) return NULL;
+    StyleCssSlicedParse *sliced = budget_calloc(
+        sheet->budget, 1u, sizeof(*sliced));
+    if (sliced == NULL) return NULL;
+    if (source_base_url != NULL && length >= 3u
+        && memcmp(css, "\xef\xbb\xbf", 3u) == 0) {
+        css += 3;
+        length -= 3u;
+    }
+    if (source_base_url != NULL) {
+        size_t base_length = strlen(source_base_url);
+        sliced->base = budget_malloc(sheet->budget, base_length + 1u);
+        if (sliced->base == NULL
+            || !web_font_referrer_policy_normalize(
+                   source_referrer_policy, sliced->policy)) {
+            budget_free(sheet->budget, sliced->base);
+            budget_free(sheet->budget, sliced);
+            return NULL;
+        }
+        memcpy(sliced->base, source_base_url, base_length + 1u);
+    }
+    sliced->sheet = sheet;
+    sliced->css = css;
+    sliced->length = length;
+    if (source != NULL) sliced->source = *source;
+    sliced->scratch = *sheet->resolve_scratch;
+    sliced->scratch.current_image_source_base = sliced->base;
+    sliced->scratch.current_image_source_referrer_policy =
+        sliced->base != NULL ? sliced->policy : NULL;
+    sliced->scratch.current_image_source_slot = 0;
+    sliced->origin = sheet->current_origin;
+    sliced->parse = (StyleCssParseContext) {
+        .sheet = sheet, .discover_font_faces = true
+    };
+    return sliced;
+}
+
+StyleCssSliceResult stylesheet_sliced_parse_step(
+    StyleCssSlicedParse *sliced, uint64_t deadline_us)
+{
+    if (sliced == NULL || sliced->failed) return STYLE_CSS_SLICE_FAILED;
+    if (sliced->finished) return STYLE_CSS_SLICE_DONE;
+    Stylesheet *sheet = sliced->sheet;
+    if (!sliced->started) {
+        if (sliced->length == 0) {
+            sliced->finished = true;
+            return STYLE_CSS_SLICE_DONE;
+        }
+        /* The batch defers rule ordering and index rebuilds to the end of
+           the source, as one whole parse inside the loader's batch would.
+           The sheet resolves no style until the parse finishes. */
+        if (!sheet->rule_batch_active) {
+            if (!stylesheet_begin_rule_batch(sheet)) {
+                sliced->failed = true;
+                return STYLE_CSS_SLICE_FAILED;
+            }
+            sliced->own_batch = true;
+        }
+        sheet->build_generation = stylesheet_next_generation();
+        sliced->started = true;
+        TILEFINCH_WORK_ADD(css_bytes, sliced->length);
+    }
+    StyleSourceOptions enclosing_source;
+    StyleResolveScratch enclosing_scratch;
+    unsigned enclosing_origin = 0;
+    stylesheet_sliced_parse_enter(sliced, &enclosing_source,
+                                  &enclosing_scratch, &enclosing_origin);
+    StyleCssParseContext *parse = &sliced->parse;
+    parse->resuming = parse->suspended;
+    parse->suspended = false;
+    parse->slice_items = 0;
+    parse->slice_deadline_us = deadline_us != 0 ? deadline_us : 1u;
+    bool parsed = parse_css_range(parse, sliced->css, 0, sliced->length);
+    parse->slice_deadline_us = 0;
+    /* A resume that could not descend its recorded path would skip rules. */
+    if (parse->resuming) parsed = false;
+    bool more = parsed && parse->suspended;
+    if (parsed && !more) {
+        parsed = style_css_parse_context_finish(parse);
+        if (parsed) sheet->rule_batch_dirty = true;
+    }
+    stylesheet_sliced_parse_leave(sliced, &enclosing_source,
+                                  &enclosing_scratch, enclosing_origin);
+    if (!parsed) {
+        sliced->failed = true;
+        return STYLE_CSS_SLICE_FAILED;
+    }
+    if (more) return STYLE_CSS_SLICE_MORE;
+    sliced->finished = true;
+    if (sliced->own_batch) {
+        sliced->own_batch = false;
+        if (!stylesheet_end_rule_batch(sheet)) {
+            sliced->failed = true;
+            return STYLE_CSS_SLICE_FAILED;
+        }
+    }
+    sheet->build_generation = stylesheet_next_generation();
+    return STYLE_CSS_SLICE_DONE;
+}
+
+size_t stylesheet_sliced_parse_progress(const StyleCssSlicedParse *sliced)
+{
+    if (sliced == NULL) return 0;
+    if (sliced->finished) return sliced->length;
+    const StyleCssParseContext *parse = &sliced->parse;
+    unsigned level = parse->resume_levels - 1u;
+    return level < STYLE_CSS_RESUME_DEPTH ? parse->resume_at[level] : 0;
+}
+
+void stylesheet_sliced_parse_release(StyleCssSlicedParse *sliced)
+{
+    if (sliced == NULL) return;
+    Stylesheet *sheet = sliced->sheet;
+    if (!sliced->finished) {
+        /* Abandoned midway: the rules parsed so far stay, as after a
+           rejected suffix, and the caller discards or rebuilds the sheet. */
+        style_css_parse_context_dispose(&sliced->parse);
+        if (sliced->own_batch) (void) stylesheet_end_rule_batch(sheet);
+    }
+    budget_free(sheet->budget, sliced->base);
+    budget_free(sheet->budget, sliced);
 }
 
 static void style_parsed_ir_builder_finish(

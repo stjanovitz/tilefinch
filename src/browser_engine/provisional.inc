@@ -65,35 +65,30 @@ static TileCache *browser_engine_provisional_front(BrowserEngine *engine)
     return front;
 }
 
-/* Keep a focus indicator inside the padding boxes of the ancestors that
-   clip its control (overflow hidden/clip), as the control itself is.
-   chatgpt.com's composer textarea overflows its rounded form, which clips
-   it; the indicator ran past the pill to the screen edge. A control clipped
+/* Keep a focus indicator inside the overflow clips around its element, as
+   the element itself is painted: a composer textarea that overflows the
+   rounded form clipping it must not draw its indicator past the form. The
+   clips are where the reader sees them, after the scroll containers around
+   them scrolled and with any viewport-fixed pinning. An element clipped
    away entirely keeps its unclipped indicator so focus is never invisible. */
 static void browser_engine_clip_focus_rect(
-    const LayoutDocument *layout, const lxb_dom_node_t *node,
+    const BrowserController *controller,
     int *x, int *y, int *width, int *height)
 {
-    if (layout == NULL || node == NULL) return;
+    int clip_left = 0, clip_top = 0, clip_right = 0, clip_bottom = 0;
+    bool clips_x = false, clips_y = false;
+    if (!controller_focused_clip(controller, &clip_left, &clip_top,
+                                 &clip_right, &clip_bottom,
+                                 &clips_x, &clips_y)) return;
     int left = *x, top = *y;
     int right = *x + *width, bottom = *y + *height;
-    size_t steps = 0;
-    for (const lxb_dom_node_t *at = node->parent;
-         at != NULL && steps < 256u; at = at->parent, steps++) {
-        const LayoutNodeBox *box = layout_box_for_node(layout, at);
-        if (box == NULL || (!box->clips_x && !box->clips_y)) continue;
-        if (box->clips_x) {
-            int clip_left = box->x + box->clip_inset_left;
-            int clip_right = clip_left + box->client_width;
-            if (left < clip_left) left = clip_left;
-            if (right > clip_right) right = clip_right;
-        }
-        if (box->clips_y) {
-            int clip_top = box->y + box->clip_inset_top;
-            int clip_bottom = clip_top + box->client_height;
-            if (top < clip_top) top = clip_top;
-            if (bottom > clip_bottom) bottom = clip_bottom;
-        }
+    if (clips_x) {
+        if (left < clip_left) left = clip_left;
+        if (right > clip_right) right = clip_right;
+    }
+    if (clips_y) {
+        if (top < clip_top) top = clip_top;
+        if (bottom > clip_bottom) bottom = clip_bottom;
     }
     if (right <= left || bottom <= top) return;
     *x = left;
@@ -110,9 +105,8 @@ bool browser_engine_focus_indicator_rect(const BrowserEngine *engine,
         || height == NULL
         || !controller_focused_rect(&engine->controller, x, y,
                                     width, height)) return false;
-    browser_engine_clip_focus_rect(
-        &engine->navigation.page.layout,
-        controller_focused_node(&engine->controller), x, y, width, height);
+    browser_engine_clip_focus_rect(&engine->controller,
+                                   x, y, width, height);
     return true;
 }
 

@@ -347,6 +347,49 @@ bool media_http_parse_content_range(
     size_t body_length, uint64_t *complete_length);
 
 /*
+ * The page-media probe: what an address with no HLS sign answers decides
+ * its route. It asks for this many first bytes by Range, enough to see a
+ * playlist's #EXTM3U (after a BOM or blank lines) or an MP4's first box
+ * type, so a playlist served as text/plain or octet-stream by a server
+ * that honours Range is still recognized. A server that ignores Range
+ * answers 200; the caller caps that body.
+ */
+#define MEDIA_HTTP_PROBE_RANGE_BYTES 1024u
+bool media_http_build_probe_range_header(char *output, size_t output_size);
+/* The probe reads at most this much: a 206 answers its range, and a server
+   that ignores Range for a small playlist or an error page still shows
+   what it is. */
+#define MEDIA_HTTP_PROBE_SNIFF_BYTES (32u * 1024u)
+/* Starts the probe on the worker transport: a private single-request
+   scheduler whose byte reservation covers the whole sniff window (one
+   sized below it refuses every probe). Returns the request id and the
+   scheduler (the caller pumps, takes and destroys it), or 0 with
+   *scheduler NULL. */
+uint64_t media_http_probe_enqueue_background(
+    Budget *budget, const char *url, const FetchRequest *request,
+    long timeout_ms, FetchScheduler **scheduler);
+
+typedef enum {
+    /* No byte-range authority, or nothing usable came back. */
+    MEDIA_HTTP_PROBE_REFUSED = 0,
+    /* A 206 the range source can read; *complete_length is the size. */
+    MEDIA_HTTP_PROBE_RANGE,
+    /* A playlist: open the address as HLS. */
+    MEDIA_HTTP_PROBE_HLS,
+    /* 404/410 or an error page: nothing to play. */
+    MEDIA_HTTP_PROBE_UNAVAILABLE
+} MediaHttpProbeRoute;
+
+/* Routes a completed probe response. A playlist routes to HLS only when
+   hls_allowed. Set-Cookie headers of a response routed to HLS or to the
+   range source are kept in session under context, as for any page media
+   response, so a cookie-gated stream's next request carries them. */
+MediaHttpProbeRoute media_http_probe_route(
+    BrowserSession *session, const TilefinchRequestContext *context,
+    bool hls_allowed, const FetchResult *result, bool fetched,
+    uint64_t *complete_length);
+
+/*
  * A single-window, bounded HTTP range source. The cache is deliberately
  * constant-size: MP4 metadata and samples are read on demand without ever
  * retaining the complete movie in the page budget.
@@ -428,6 +471,47 @@ void media_http_range_set_wait_budget_us(
 void media_http_range_clear_wait_budget(MediaHttpRange *range);
 bool media_http_range_stats(const MediaHttpRange *range,
                             MediaHttpRangeStats *stats);
+/*
+ * Which lane a range's windows take.
+ *
+ * A page range (one created with page_request_context) carries the page's
+ * authority, which must be applied on every request and every redirect hop:
+ * per-hop cookies and Set-Cookie, Referer, the CSP snapshot, the content
+ * blocker, mixed content, the private-network check and redirect target
+ * admission. Only FetchScheduler's browser-thread hop walk does all of that,
+ * so a page range always runs on its own scheduler; when the PSP transport
+ * worker exists, that scheduler executes each single hop on the worker
+ * (media descriptor priority), so neither DNS/TLS nor the body ever run on
+ * the browser thread. A provider range (no page authority, a fixed-origin
+ * signed URL and a URL validator) keeps the worker's own fixed/stream media
+ * path. Hosts without the worker, and trace replay, use a plain scheduler.
+ */
+typedef enum {
+    MEDIA_HTTP_RANGE_ROUTE_TRANSPORT = 0,
+    MEDIA_HTTP_RANGE_ROUTE_SCHEDULER,
+    MEDIA_HTTP_RANGE_ROUTE_PAGE_SCHEDULER_WORKER_HOPS,
+    MEDIA_HTTP_RANGE_ROUTE_WORKER
+} MediaHttpRangeRoute;
+MediaHttpRangeRoute media_http_range_route_select(
+    bool substituted_transport, bool page_authority, bool worker_available);
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+/* The route a range took and its name: host tests and the PSP validation
+   log only. */
+MediaHttpRangeRoute media_http_range_route(const MediaHttpRange *range);
+const char *media_http_range_route_name(MediaHttpRangeRoute route);
+#endif
+/* The window error for a worker enqueue refusal: a request shape the worker
+   cannot carry, a worker that is not running, and a full queue read
+   differently. (A full queue or a closed admission is normally deferred and
+   retried rather than reported.) */
+const char *media_http_background_refusal_reason(
+    FetchBackgroundEnqueueStatus status);
+#if !defined(__PSP__)
+/* Host seam: the worker is stubbed on host, so a test forces the
+   availability the route decision sees (1 available, 0 not, -1 the real
+   answer). Affects ranges created afterwards only. */
+void media_http_test_force_background_available(int available);
+#endif
 /* Conservative duration represented by unread bytes in the installed cache,
    its bounded contiguous successor windows, and a complete sequential result
    waiting in the scheduler. This average-bitrate estimate is for buffering

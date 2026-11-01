@@ -41,6 +41,7 @@ for _, languages in CATALOGS:
 CATALOGS.append((10, list(latest_languages.values())))
 CATALOGS.append((11, list(latest_languages.values())))
 CATALOGS.append((12, list(latest_languages.values())))
+CATALOGS.append((13, list(latest_languages.values())))
 ACTIVE_VERSION = CATALOGS[-1][0]
 # Keys a version drops because the browser no longer looks them up. Every
 # other key of the previous version must remain, so a newly added locale
@@ -57,14 +58,16 @@ RETIRED_KEYS = {12: {
     "Select the thumbnail to retry playback. The player provides play, "
     "pause, seek, time, and exit controls.",
     "Settings > Video > Audio & subtitles", "Signed in on this device.",
-    "Text entry", "Update channel"}}
+    "Text entry", "Update channel"},
+    13: {"Channel videos", "Recent public uploads from this channel."}}
 # The signed glyph-pack revision whose pre-shaped clusters cover a catalog
 # version's labels: (glyphs, first catalog version) -> sequence. A catalog
 # that adds shaped labels needs a rebuilt pack and a new entry here.
 MINIMUM_GLYPH_SEQUENCES = {
     ("DEVANAGARI", 1): 2, ("DEVANAGARI", 5): 3, ("DEVANAGARI", 7): 4,
     ("DEVANAGARI", 10): 5, ("DEVANAGARI", 11): 6, ("DEVANAGARI", 12): 7,
-    ("BENGALI_ASSAMESE", 11): 2, ("BENGALI_ASSAMESE", 12): 3}
+    ("BENGALI_ASSAMESE", 11): 2, ("BENGALI_ASSAMESE", 12): 3,
+    ("DEVANAGARI", 13): 8, ("BENGALI_ASSAMESE", 13): 4}
 
 
 def minimum_glyph_sequence(glyphs, version):

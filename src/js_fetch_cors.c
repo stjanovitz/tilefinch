@@ -8,6 +8,7 @@
 #include "tilefinch/script_admission.h"
 #include "tilefinch/script_split.h"
 #include "tilefinch/content_blocker.h"
+#include "tilefinch/media_discovery.h"
 #include "tilefinch/multiplayer.h"
 #include "tilefinch/platform.h"
 #include "tilefinch/url.h"
@@ -24,6 +25,19 @@
 /* Connect budget for optional dynamic script requests (see the request
    literal in the dynamic task fetch). */
 #define JS_DYNAMIC_SCRIPT_CONNECT_TIMEOUT_MS 8000L
+
+void js_rt_remember_media_json(DomBridge *bridge, const FetchResult *fetched,
+                               TilefinchRequestDestination destination)
+{
+    if (destination == TILEFINCH_DESTINATION_FETCH && !bridge->opaque_origin
+        && bridge->host != NULL
+        && bridge->host->document_scope == SCRIPT_DOCUMENT_SCOPE_TOP_LEVEL)
+        media_json_response_remember(
+            bridge->document, bridge->document_url, fetched->effective_url,
+            fetched->status_code, fetched->data, fetched->length,
+            bridge->session != NULL && content_blocker_player_page(
+                bridge->session->content_blocker, bridge->document_url));
+}
 
 #if !defined(TILEFINCH_NO_TRACE) || defined(TILEFINCH_PSP_VALIDATION_LOG)
 static void copy_response_header_value(const FetchResult *fetched,
@@ -194,6 +208,14 @@ static size_t js_fetch_response_limit(const DomBridge *bridge)
         }
     }
     return limit;
+}
+/* What one in-flight fetch() holds of the realm's fetch pool: its response
+   bound, but never more than the share that keeps
+   SCRIPT_RUNTIME_FETCH_POOL_MINIMUM_REQUESTS of them admissible together. */
+static size_t js_fetch_pool_charge(size_t pool, size_t bound)
+{
+    size_t share = pool / SCRIPT_RUNTIME_FETCH_POOL_MINIMUM_REQUESTS;
+    return share != 0 && bound > share ? share : bound;
 }
 #define JS_FETCH_MAXIMUM_HEADERS (8u * 1024u)
 #define JS_FETCH_OPAQUE_MAXIMUM_BYTES (64u * 1024u)
@@ -1180,6 +1202,7 @@ static JSValue js_fetch_sync(JSContext *context, JSValueConst this_value,
     }
     if (bridge->result != NULL) js_rt_record_network_response(bridge->result,
                                                        fetched);
+    js_rt_remember_media_json(bridge, fetched, policy.context.destination);
     js_rt_script_store_response_cookies(
         bridge, fetched,
         fetched->effective_url[0] == '\0' ? url : fetched->effective_url,
@@ -1498,18 +1521,31 @@ static JSValue js_fetch_async_setup(JSContext *context, int argc,
        requests stay as concurrent as before. */
     bool fetch_pool_deferred = false;
     if (valid && bridge->fetch_scheduler != NULL) {
-        size_t reserved = 0;
-        for (size_t i = 0; i < bridge->async_fetch_count; i++) {
-            size_t bound = bridge->async_fetches[i].response_bound;
-            reserved = bound > SIZE_MAX - reserved ? SIZE_MAX
-                                                   : reserved + bound;
-        }
         size_t pool = bridge->maximum_script_bytes
                 < SCRIPT_RUNTIME_FETCH_POOL_BYTES
             ? bridge->maximum_script_bytes : SCRIPT_RUNTIME_FETCH_POOL_BYTES;
+        /* The pool bounds concurrency, not memory (each response is still
+           capped by response_limit and staged through the Budget).  A
+           response bound above the pool's share used to fill it alone, so
+           every later fetch() waited for the one in flight; one long-lived
+           request (a streamed RPC, a long poll) then starved the realm's
+           whole FIFO for as long as it stayed open. */
+        size_t reserved = 0;
+        for (size_t i = 0; i < bridge->async_fetch_count; i++) {
+            size_t charge = js_fetch_pool_charge(
+                pool, bridge->async_fetches[i].response_bound);
+            reserved = charge > SIZE_MAX - reserved ? SIZE_MAX
+                                                    : reserved + charge;
+        }
+        size_t charge = js_fetch_pool_charge(pool, response_limit);
         fetch_pool_deferred = reserved != 0
-            && (response_limit > pool || reserved > pool - response_limit);
+            && (charge > pool || reserved > pool - charge);
     }
+    /* A held page domain (the native player owns the screen) admits
+       nothing until it is released: wait on the slow fallback timer below
+       rather than re-running admission every 10 ms for the whole video. */
+    if (valid && fetch_scheduler_held(bridge->fetch_scheduler))
+        fetch_pool_deferred = true;
     uint64_t id = valid && !fetch_pool_deferred
             && bridge->fetch_scheduler != NULL
         ? fetch_scheduler_enqueue(
@@ -1519,9 +1555,14 @@ static JSValue js_fetch_async_setup(JSContext *context, int argc,
     /* The JavaScript layer already owns a bounded FIFO in front of this
        scheduler.  A full shared page domain is therefore backpressure, not a
        failed Fetch: return the reserved zero sentinel so it can retain the
-       logical request and retry after another native completion.  All policy,
-       URL and request-shape failures continue to throw below. */
-    bool scheduler_deferred = slot_deferred || fetch_pool_deferred
+       logical request and retry from a timer turn (other realms, images and
+       media free shared capacity without telling this one).  A full native
+       table or fetch pool belongs to this realm alone and is freed only by
+       one of its own requests completing or being cancelled, both of which
+       pump the FIFO: return -1 so it waits for that instead of polling.  All
+       policy, URL and request-shape failures continue to throw below. */
+    bool realm_deferred = slot_deferred || fetch_pool_deferred;
+    bool scheduler_deferred = realm_deferred
         || (id == 0 && valid
         && fetch_scheduler_enqueue_would_block(
                bridge->fetch_scheduler, response_limit));
@@ -1536,8 +1577,13 @@ static JSValue js_fetch_async_setup(JSContext *context, int argc,
                 (unsigned long long) id, (int) method_length, method,
                 (int) request_mode, (int) credentials, body_length,
                 id != 0 ? "admitted"
+                    : slot_deferred ? "deferred-slots"
+                    : fetch_pool_deferred ? "deferred-pool"
                     : scheduler_deferred ? "deferred" : "refused",
-                id != 0 || !valid || bridge->fetch_scheduler == NULL ? ""
+                /* Only an attempted enqueue owns the scheduler's last
+                   error; a realm deferral never reached it. */
+                id != 0 || !valid || realm_deferred
+                        || bridge->fetch_scheduler == NULL ? ""
                     : fetch_scheduler_last_error(bridge->fetch_scheduler),
                 url[0] == '\0' ? "<invalid>" : url);
     }
@@ -1551,7 +1597,8 @@ static JSValue js_fetch_async_setup(JSContext *context, int argc,
     }
     if (id == 0) {
         budget_free(bridge->budget, integrity_copy);
-        if (scheduler_deferred) return JS_NewInt32(context, 0);
+        if (scheduler_deferred)
+            return JS_NewInt32(context, realm_deferred ? -1 : 0);
         if (integrity_copy_failed) {
             return JS_ThrowRangeError(
                 context, "integrity metadata exceeded memory budget");
@@ -2574,6 +2621,45 @@ static void dynamic_task_cancel_request(DomBridge *bridge,
     task->request_id = 0;
 }
 
+/* The page's network was taken (script_runtime_requeue_dynamic_scripts):
+   cancel each in-flight dynamic script request without settling its task.
+   The element neither loads nor errors; it waits as on a slow network and
+   starts again, in its original order, once admission resumes. Everything
+   the start derived from the request or a cache entry is undone so the
+   restart re-derives it. */
+size_t js_rt_dynamic_requeue_fetching(DomBridge *bridge)
+{
+    if (bridge == NULL) return 0;
+    size_t requeued = 0;
+    for (size_t i = 0; i < SCRIPT_DYNAMIC_TASK_LIMIT; i++) {
+        ScriptDynamicTask *task = &bridge->dynamic_scripts[i];
+        if (!task->active || task->state != SCRIPT_DYNAMIC_FETCHING
+            || task->request_id == 0) continue;
+        dynamic_task_cancel_request(bridge, task);
+        js_rt_bridge_script_quota_abort(bridge, &task->quota_reservation);
+        browser_shared_body_release(task->stale_body);
+        task->stale_body = NULL;
+        task->stale_module_validated = false;
+        task->stale_resource_grant_valid = false;
+        budget_free(bridge->budget, task->response_url);
+        task->response_url = NULL;
+        budget_free(bridge->budget, task->resource_timing_content_type);
+        task->resource_timing_content_type = NULL;
+        task->resource_timing.content_type = NULL;
+        if (task->module)
+            task->effective_referrer_policy = task->incoming_referrer_policy;
+        if (bridge->result != NULL) {
+            if (bridge->result->dynamic_scripts_started != 0)
+                bridge->result->dynamic_scripts_started--;
+            if (bridge->result->network_requests != 0)
+                bridge->result->network_requests--;
+        }
+        task->state = SCRIPT_DYNAMIC_QUEUED;
+        requeued++;
+    }
+    return requeued;
+}
+
 void js_rt_dynamic_task_clear(DomBridge *bridge, ScriptDynamicTask *task,
                         bool cancelled, bool cancel_request)
 {
@@ -2787,6 +2873,13 @@ bool js_rt_dynamic_start_task(ScriptRuntime *runtime,
        here let a few pending requests, or one that stalled, exhaust the
        realm's source quota and defer every later dynamic script. */
     bool fresh_hit = cache_status == BROWSER_CACHE_FRESH && cached != NULL;
+    /* A held page domain admits no request until it is released; wait
+       before the response bound below reclaims memory for one. */
+    if (!fresh_hit
+        && fetch_scheduler_held(script_runtime_fetch_scheduler(runtime))) {
+        if (deferred != NULL) *deferred = true;
+        return true;
+    }
     ScriptQuotaReserveResult quota_status = fresh_hit
         ? js_rt_bridge_script_quota_reserve_known(
               bridge, SCRIPT_QUOTA_PRECOUNTED_EXECUTABLE,
@@ -3452,6 +3545,40 @@ static void dynamic_source_lease_release(void *opaque)
     browser_shared_body_release((BrowserSharedBody *) opaque);
 }
 
+typedef struct {
+    ScriptDynamicTask *task;
+    BrowserSharedBody *body;
+    uint64_t sequence;
+} DynamicSourceOwner;
+
+static void dynamic_task_source_release(void *opaque)
+{
+    DynamicSourceOwner *owner = opaque;
+    if (owner->task->sequence != owner->sequence
+        || owner->task->source_body != owner->body) return;
+    browser_shared_body_release(owner->body);
+    owner->task->source_body = NULL;
+}
+
+/* A dynamic classic script's body may go while it runs
+   (script_runtime_offer_source_release). */
+static bool dynamic_evaluate_classic_releasing(
+    ScriptRuntime *runtime, ScriptDynamicTask *task, lxb_dom_node_t *node,
+    const char *source, const char *source_url)
+{
+    DynamicSourceOwner owner = {
+        .task = task, .body = task->source_body, .sequence = task->sequence
+    };
+    if (owner.body != NULL)
+        script_runtime_offer_source_release(
+            runtime, dynamic_task_source_release, &owner);
+    bool evaluated = js_rt_evaluate_external_classic_dynamic(
+        runtime, node, source, task->source_length, source_url,
+        task->response_no_store);
+    (void) script_runtime_withdraw_source_release(runtime);
+    return evaluated;
+}
+
 static bool dynamic_runtime_failure_is_fatal(const ScriptRuntime *runtime,
                                              size_t failures_before)
 {
@@ -3735,10 +3862,9 @@ bool js_rt_dynamic_execute_ready(ScriptRuntime *runtime,
                                   selected->effective_referrer_policy),
                               selected->credentials,
                               selected->response_no_store, NULL)
-                        : js_rt_evaluate_external_classic_dynamic(
-                              runtime, selected_node, source,
-                              selected->source_length, source_url,
-                              selected->response_no_store);
+                        : dynamic_evaluate_classic_releasing(
+                              runtime, selected, selected_node, source,
+                              source_url);
                     fatal = !evaluated
                         && dynamic_runtime_failure_is_fatal(
                                runtime, failures_before);

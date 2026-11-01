@@ -922,11 +922,31 @@ static bool parse_css_range_nested(StyleCssParseContext *context,
             length = end - 3;
         }
     }
+    /* A sliced parse resumes by descending the recorded group rules again:
+       each level starts at its recorded item, and an enclosing group rule
+       reuses its recorded closing brace rather than scanning to it. */
+    bool resume_item = false;
+    if (context->resuming && depth < context->resume_levels) {
+        begin = context->resume_at[depth];
+        if (depth + 1u == context->resume_levels) context->resuming = false;
+        else resume_item = true;
+    }
     size_t parsed_rules = 0;
     for (size_t at = begin; at < length;) {
         if ((parsed_rules++ & 15u) == 0
             && !tilefinch_platform_cooperate(
                 "stylesheet-parse", at)) return false;
+        if (context->slice_deadline_us != 0 && !resume_item
+            && context->slice_items != 0 && parse_style_rules
+            && context->unsplittable_depth == 0
+            && tilefinch_platform_monotonic_time_us()
+                   >= context->slice_deadline_us) {
+            context->suspended = true;
+            context->resume_levels = depth + 1u;
+            context->resume_at[depth] = at;
+            return true;
+        }
+        if (!resume_item) context->slice_items++;
         at = skip_css_space_and_comments(css, length, at);
         if (at >= length) break;
         size_t prelude = at;
@@ -985,7 +1005,9 @@ static bool parse_css_range_nested(StyleCssParseContext *context,
             at = brace + 1;
             continue;
         }
-        size_t close = find_matching_brace(css, brace, length);
+        size_t close = resume_item ? context->resume_close[depth]
+                                   : find_matching_brace(css, brace, length);
+        resume_item = false;
         /* CSS Syntax closes an open block at EOF.  Minified production
            sheets use this recovery in practice (notably a final @layer
            utilities block); dropping the whole block leaves raw SVG and
@@ -1026,6 +1048,11 @@ static bool parse_css_range_nested(StyleCssParseContext *context,
                 && !parse_css_range_nested(
                        context, css, brace + 1, close,
                        depth + 1, font_faces_allowed)) return false;
+            if (context->suspended) {
+                context->resume_at[depth] = prelude;
+                context->resume_close[depth] = close;
+                return true;
+            }
         } else if (css_header_rule(header, header_length, "@supports",
                                    &condition, &condition_length)) {
             bool supported = supports_matches(
@@ -1037,6 +1064,11 @@ static bool parse_css_range_nested(StyleCssParseContext *context,
                 && !parse_css_range_nested(
                        context, css, brace + 1, close,
                        depth + 1, font_faces_allowed)) return false;
+            if (context->suspended) {
+                context->resume_at[depth] = prelude;
+                context->resume_close[depth] = close;
+                return true;
+            }
         } else if (css_header_rule(header, header_length, "@container",
                                    &condition, &condition_length)) {
             if (!parse_style_rules) {
@@ -1056,8 +1088,12 @@ static bool parse_css_range_nested(StyleCssParseContext *context,
                      context, condition, condition_length);
             if (query != 0) {
                 sheet->current_container_query = query;
+                /* Registering the query again on resume would add a
+                   second scope: a container block is parsed whole. */
+                context->unsplittable_depth++;
                 bool parsed = parse_css_range_nested(
                     context, css, brace + 1, close, depth + 1, false);
+                context->unsplittable_depth--;
                 sheet->current_container_query = previous_query;
                 style_parsed_ir_builder_container(context, NULL, 0);
                 if (!parsed) return false;
@@ -1075,11 +1111,24 @@ static bool parse_css_range_nested(StyleCssParseContext *context,
             unsigned previous_layer = sheet->current_layer;
             sheet->current_layer = register_layer(
                 sheet, condition, condition_length);
+            /* A named layer resolves to the same layer when a sliced parse
+               enters it again; an anonymous one would be a new layer. */
+            const char *layer_name = condition;
+            size_t layer_name_length = condition_length;
+            trim(&layer_name, &layer_name_length);
+            bool anonymous = layer_name_length == 0;
+            if (anonymous) context->unsplittable_depth++;
             bool parsed = parse_css_range_nested(
                 context, css, brace + 1, close, depth + 1,
                 font_faces_allowed);
+            if (anonymous) context->unsplittable_depth--;
             sheet->current_layer = previous_layer;
             if (!parsed) return false;
+            if (context->suspended) {
+                context->resume_at[depth] = prelude;
+                context->resume_close[depth] = close;
+                return true;
+            }
         } else if (parse_style_rules
                    && header_length != 0 && header[0] != '@') {
             if (!parse_nested_style_block(

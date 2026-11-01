@@ -860,9 +860,14 @@ static inline ComputedStyle layout_style_for_pseudo(
 }
 #endif
 
-void layout_note_unresolved_external_visual(
+/* Records the target (or finds its earlier record); NULL when the layout
+   keeps no record of it. */
+ImagePriorityTarget *layout_note_unresolved_external_visual(
     LayoutContext *context, lxb_dom_node_t *node, const char *source,
     uint8_t kind, PseudoElement pseudo);
+/* Gives each recorded single-layer element background its border box (CSS
+   pixels) once the layout's boxes are final. */
+void layout_size_background_visuals(LayoutDocument *layout);
 
 /* The first stop records the traversal prefix (LayoutDocument
    preview_cut_*): everything recorded before it is laid out exactly as the

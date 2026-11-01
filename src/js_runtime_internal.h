@@ -162,6 +162,10 @@ JSValue js_dom_parse_color(JSContext *context,
 #define SCRIPT_DYNAMIC_INFLIGHT_REQUESTS 4u
 /* The share of that pool fetch() responses may hold at once. */
 #define SCRIPT_RUNTIME_FETCH_POOL_BYTES (2u * 1024u * 1024u)
+/* fetch() requests that always fit that share at once, however large one
+   response's bound is: each in-flight request is charged at most
+   1/SCRIPT_RUNTIME_FETCH_POOL_MINIMUM_REQUESTS of the pool. */
+#define SCRIPT_RUNTIME_FETCH_POOL_MINIMUM_REQUESTS 2u
 /* Keep a useful bounded script unit admissible when retained page state
    consumes the presentation reserve. A 64 KiB floor truncated ordinary
    late dependencies even with several MiB free. This is a response ceiling,
@@ -197,7 +201,20 @@ typedef struct {
     ScriptResult *result;
     uint64_t slice_started_ns;
     size_t slice_work_units;
+    /* The realm's pool and its refusal count when this entry began: an
+       entry the pool keeps refusing is out of memory (interrupt_handler). */
+    const BudgetQuickJSPool *pool;
+    size_t pool_rejections_started;
+    bool memory_exhausted;
 } Watchdog;
+
+/* Refused heap requests within one entry into JavaScript after which the
+   entry stops as out of memory. Page code that catches the out-of-memory
+   error and tries again at the realm's limit otherwise spins until the
+   execution deadline (136 million refusals in 60 s in one replay). An entry that
+   recovers from a few refusals (a smaller retry, a cache dropped) stays
+   far below it. */
+#define SCRIPT_ENTRY_REFUSAL_LIMIT 256u
 
 /* The base table size every runtime allocates at creation; a policy may let
    it grow to DOM_BRIDGE_NODE_LIMIT_MAX (see DomBridge.node_capacity). */
@@ -703,6 +720,19 @@ typedef struct DomBridge {
     bool user_activation_active;
     bool user_activation_has_been_active;
     uint64_t user_activation_expires_ms;
+    /* Popunder guard (docs/SECURITY_MODEL.md): a new window this document
+       asked for during a user activation (Tilefinch opens none), kept while
+       that activation is transient, and the hyperlink the activation
+       targeted, resolved before the page's listeners could rewrite it.
+       activation_link_default: the browser follows that hyperlink itself
+       (the click was not cancelled), so the guard does not. The pending
+       navigation_url is the guard's own follow while
+       navigation_follows_link. */
+    uint64_t new_window_expires_ms;
+    uint64_t new_window_site;
+    char *activation_link_url;
+    bool activation_link_default;
+    bool navigation_follows_link;
     bool scroll_requested;
     int scroll_y;
     LayoutDocument *layout;
@@ -911,6 +941,16 @@ void js_rt_geometry_opacity_write_end(DomBridge *bridge);
    before one is admitted ahead of due tasks. */
 #define SCRIPT_CLEANUP_STARVATION_ADVANCES 4u
 
+/* The body of the external classic script running now, which
+   js_rt_heap_growth_hook may release (release is then cleared and
+   `released` set). */
+typedef struct {
+    ScriptSourceReleaseFn release;
+    void *opaque;
+    size_t length;
+    bool released;
+} ScriptRunningSource;
+
 struct ScriptRuntime {
     Budget *budget;
     PocDocument *document;
@@ -969,6 +1009,15 @@ struct ScriptRuntime {
     /* Full JS_ComputeMemoryUsage walks paid on this realm. Decisions read
        the allocator-maintained count; only diagnostics take a census. */
     size_t heap_censuses;
+#if defined(CONFIG_TILEFINCH_HEAP_DETAIL) && !defined(TILEFINCH_NO_TRACE)
+    /* TILEFINCH_TRACE_JS_HEAP_DETAIL heap census state (host lab only). */
+    size_t jsmem_rejections_seen;
+    size_t jsmem_next_high_water;
+    unsigned jsmem_sequence;
+    unsigned jsmem_oom_censuses;
+    const char *jsmem_compile_name;
+    size_t jsmem_compile_bytes;
+#endif
     /* Memory-pressure growth (script_runtime_enable_heap_growth): the
        configured limit is a floor; the realm grows while the page Budget
        keeps its work reserve free, and gives growth back once collection
@@ -1096,6 +1145,19 @@ struct ScriptRuntime {
     struct ScriptBytecodePending *bytecode_pending;
     size_t bytecode_pending_count;
     size_t bytecode_pending_bytes;
+    /* A store is serializing the oldest entry: collections must not
+       release queued stores (script_runtime_gc_hook). */
+    bool bytecode_pending_busy;
+    /* The owner of the external classic script about to be evaluated can
+       let go of its whole body once it is compiled
+       (script_runtime_offer_source_release). Taken (and cleared) by the
+       evaluator, so a nested evaluation never sees it; armed as the
+       running script's while that script runs (innermost run only), where
+       js_rt_heap_growth_hook may call it. */
+    ScriptSourceReleaseFn source_release;
+    void *source_release_opaque;
+    bool source_released;
+    ScriptRunningSource running_source;
     /* At most one source completion per tracked image; weak identities are
        checked before touching DOM across author tasks. Allocated on demand. */
     struct ScriptImageLoadState *image_load_states;
@@ -1163,6 +1225,9 @@ struct ScriptRuntime {
     struct ScriptLazyRuntimeBundle *lazy_webpack_bundles;
     uint32_t next_lazy_webpack_bundle_id;
     bool lazy_factory_recovery_pending;
+    /* Text of classic scripts compiled without toString() text in the
+       heap (js_source_store.h; created by the first such compile). */
+    struct ScriptSourceStore *source_store;
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     ScriptRuntimeTimingMetrics timing_metrics;
 #endif
@@ -1254,6 +1319,14 @@ void js_rt_runtime_update_frame_result(ScriptRuntime *runtime,
 uint64_t js_rt_monotonic_time_ns(void);
 /* JS_ComputeMemoryUsage walks every live object; diagnostics only. */
 void js_rt_heap_census(ScriptRuntime *runtime, JSMemoryUsage *usage);
+#if defined(CONFIG_TILEFINCH_HEAP_DETAIL) && !defined(TILEFINCH_NO_TRACE)
+/* Heap composition census (host lab only); `safe` says the
+   caller is at a point where a forced collection is allowed. */
+void js_rt_jsmem_census_check(ScriptRuntime *runtime, const char *where,
+                              bool safe);
+void js_rt_jsmem_census(ScriptRuntime *runtime, const char *reason, bool gc);
+bool js_rt_jsmem_enabled(void);
+#endif
 /* HTML deliberately leaves the transient-activation duration to the user
    agent. Five seconds matches the interoperability window used by major
    engines while keeping privileged actions tightly bounded on the PSP. */
@@ -1348,6 +1421,26 @@ JSValue js_rt_compile_source_type(JSContext *context, const char *source,
 bool js_rt_admit_cached_compile_source(
     JSContext *context, size_t length, const char *name,
     ScriptCompileSourceKind source_kind, ScriptResult *result);
+/* Function source outside the heap (evaluation.inc, "Function source
+   outside the heap"): bytecode restored from the classic cache refers to
+   its script's text by offset. Call begin before JS_ReadObject() with the
+   script text (NULL if not at hand: functions that need it then do not
+   restore) and end after it with what begin returned and the same text. A
+   false end means the restored functions cannot read their text (the
+   Budget refused the copy): discard the restored value as a failed
+   restore. */
+uint32_t js_rt_source_store_begin_restore(ScriptRuntime *runtime,
+                                          const char *source, size_t length);
+bool js_rt_source_store_end_restore(ScriptRuntime *runtime,
+                                    uint32_t source_id, const char *source);
+/* Gives up about `needed` bytes of retained function source (compressing,
+   then dropping text no uncompiled function needs); allocates only Budget
+   memory, never the QuickJS heap; returns the bytes released. */
+size_t js_rt_source_store_relieve(ScriptRuntime *runtime, size_t needed);
+/* A safe point (advance boundary): compresses retained function source the
+   page's room no longer allows plain, all of it when `refused` (the realm
+   was refused growth since the last one). */
+void js_rt_source_store_safe_point(ScriptRuntime *runtime, bool refused);
 bool js_rt_evaluate_compiled_source(
     JSContext *context, JSValue compiled, const char *name,
     size_t source_length, ScriptResult *result);
@@ -1453,6 +1546,7 @@ bool js_rt_install_natives(JSContext *context, JSValue target,
     js_rt_install_natives((context), (target), (table), \
                           sizeof(table) / sizeof((table)[0]))
 char *js_rt_dynamic_copy_text(Budget *budget, const char *text);
+size_t js_rt_dynamic_requeue_fetching(DomBridge *bridge);
 void js_rt_dynamic_task_clear(DomBridge *bridge, ScriptDynamicTask *task,
                               bool cancelled, bool cancel_request);
 
@@ -1504,6 +1598,11 @@ static inline void js_rt_record_network_response(ScriptResult *result,
 bool js_rt_script_set_response_body(JSContext *context, JSValue response,
                                     const FetchResult *fetched,
                                     bool prefer_text);
+/* Offers a fetch/XHR response the page can read (same-origin, or
+   cross-origin and CORS-readable; never opaque) to media discovery
+   (media_json_response_remember): top-level documents only. */
+void js_rt_remember_media_json(DomBridge *bridge, const FetchResult *fetched,
+                               TilefinchRequestDestination destination);
 void js_rt_script_store_response_cookies(
     DomBridge *bridge, const FetchResult *fetched, const char *fallback_url,
     TilefinchRequestMode mode, TilefinchCredentialsMode credentials,

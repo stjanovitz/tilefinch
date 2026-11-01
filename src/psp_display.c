@@ -88,6 +88,15 @@ bool psp_display_video_active(const PspDisplay *display)
         && display->surface == PSP_DISPLAY_SURFACE_RGBA8888;
 }
 
+bool psp_display_take_pacing_credit(const PspDisplay *display, bool playing,
+                                   unsigned *previous)
+{
+    unsigned completed = display->presents - display->rejections;
+    bool credit = playing && completed != *previous;
+    *previous = completed;
+    return credit;
+}
+
 uint16_t *psp_display_back_buffer(const PspDisplay *display)
 {
     if (display == NULL || psp_display_video_active(display)) return NULL;

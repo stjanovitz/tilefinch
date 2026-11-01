@@ -56,6 +56,14 @@ ImageRetargetOutcome images_retarget_display_step(
 void images_retarget_plan_rebase(ImageResources *images, size_t generation);
 void images_retarget_plan_discard(ImageResources *images);
 
+/* Before `layout` is first painted: decode each surface a load left
+   encoded for it (IMAGE_RETARGET_AWAITING_LAYOUT) at the size `layout`
+   paints it, never above its decoded size. Unpainted ones stay released
+   for a later step. Returns how many were decoded. */
+size_t images_retarget_decode_awaiting(ImageResources *images,
+                                       const LayoutDocument *layout,
+                                       BrowserSession *session);
+
 /* At an owner rebuild boundary, release only unpinned, reproducible pixels.
    Encoded bytes, intrinsic dimensions and aliases remain valid; painting or
    a later retarget step can restore them. Never call during a paint. */

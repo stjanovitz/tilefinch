@@ -579,6 +579,35 @@ lab builds and compiled out by `PSP_BROWSER_DISABLE_TRACE`. Frame payloads can
 contain transient tokens, so keep their logs out of Git and redact them before
 sharing.
 
+### JavaScript heap composition
+
+Host builds compile a read-only heap walk, `JS_ComputeMemoryDetail`
+(`CONFIG_TILEFINCH_HEAP_DETAIL`, set for every non-PSP build in
+`cmake/TilefinchDependencies.cmake`; no PSP image compiles it, shipping or
+validation). `TILEFINCH_TRACE_JS_HEAP_DETAIL=1` prints a census of a realm at
+the first safe point after its allocator refuses a request (an interrupt poll
+or the escaping exception), at every 4 MiB high-water step
+(`TILEFINCH_TRACE_JS_HEAP_DETAIL_STEP_KB`) and with each memory report:
+allocator arenas vs large blocks, every class with its property arrays and
+payload, each script file's bytecode, lazy stubs, line tables, retained
+source text (own copies and shared spans separately) and closures,
+instances per prototype, strings by size band, atoms, shapes, pending jobs
+and `Function.prototype.toString` calls, plus the Budget categories and the
+refused request. `=gc` also collects after an OOM census and censuses again,
+which answers "would a GC have freed enough". Summarise a run directory
+(one subdirectory per page with `lab.log`/`lab.err`):
+
+```sh
+TILEFINCH_TRACE_JS_HEAP_DETAIL=1 ./build-preset-release/psp-browser-interactive-lab \
+  --url URL --psp-profile realistic --replay-http-response-keyed TRACE ... 2> run/page/lab.err
+python3 tools/jsmem_report.py run          # composition table, MB
+FILES=1 python3 tools/jsmem_report.py run  # plus top scripts and prototypes
+```
+
+Sizes are host (64-bit) allocations: pointer-heavy rows (objects, shapes,
+closures, bytecode headers) are larger than on the PSP; text rows (source,
+strings, atoms) are the same.
+
 ## Dependencies
 
 The first configure downloads pinned archives and verifies their hashes:
@@ -1418,7 +1447,9 @@ Real microphone recognition still requires a physical PSP.
 
 ### Optional PSP software decoder
 
-H.264 High-profile playback uses a replaceable, user-built PRX so the official
+H.264 High-profile playback, and Baseline/Main streams the firmware refuses
+(more than three reference frames, B-frame pyramids; CABAC or CAVLC,
+progressive 8-bit 4:2:0 only), uses a replaceable, user-built PRX so the official
 EBOOT and release archives remain independent of FFmpeg decoder binaries.
 Baseline/Main MP4 and MPEG-TS HLS with AAC-LC use the PSP firmware backend,
 including compatible active YouTube live streams and premieres.
@@ -1448,13 +1479,232 @@ The target writes a three-file add-on directory at
 it does not need to be replaced with a custom EBOOT. Signed app updates leave
 the shared component directory untouched.
 
+The decoder PRX (about 1.9 MiB once loaded) lives in user-partition memory
+outside the browser's heap. At startup, before the C library claims the
+heap, the browser looks for `components/swdec/tilefinch-swdec.prx`: when it
+is there, the browser leaves 4 MiB of the partition outside its heap instead
+of 2 MiB, so the decoder can load beside the PSP's own firmware modules
+(`src/psp_heap_reserve.c`). Without the add-on nothing changes, so a browser
+that never uses it gives up no heap; with it, the heap is 2 MiB smaller.
+Install or remove the add-on with the browser closed. The validation boot
+line reports the choice as `heap-threshold=4096KB swdec-reserve=1`.
+
 `component-info.txt` records the loader ABI. Every browser update manifest
 also carries the ABI it expects. The update UI warns **Decoder rebuild
 needed** when an installed add-on differs; rebuild the bundle with the new
 source and replace all three files together. No rebuild is needed merely
 because the Tilefinch version changes.
-The player reserves the component's resident memory before loading it and
-keeps all stream buffering in RAM.
+Loading the component charges the page's memory budget nothing (its code
+is outside the heap, above). A software-decoded stream's open charges its
+working set: the decoder's picture arena, sized for the reference pictures
+the stream's SPS declares (at least 4, at most 16, and 16 when the SPS
+cannot be read; a later SPS that declares more ends playback with a
+reference-frame message rather than overrunning the arena), the 25-slot
+picture ring and the audio arena -- about 10 MB for a 416x234 stream with
+5 reference frames, plus a 512 KiB playback packet. When the page holds
+that much, it gives memory back one step at a time and the open is tried
+after each: first optional memory (staged fonts, a collected script heap,
+caches, resident tiles), then the page's scripts, as when a script runs out
+of memory. The page keeps its DOM and position, and when the player closes
+it says **PAGE SCRIPTS STOPPED: NOT ENOUGH MEMORY**. All stream buffering
+stays in RAM.
+
+`tools/swdec-bench/crc-gate.sh` checks the decoder bit for bit against host
+FFmpeg under PPSSPP (CAVLC and CABAC clips with five reference frames at
+416x234 and 426x240, a 16-reference High clip at 432x240, and clips with 4x4
+partitions, several slices per picture and weighted prediction; every clip
+is decoded four times: as is, with chroma predicted by the parser as on the
+Media Engine, with the parser stopping part-way through rows so
+reconstruction predicts their rest, and that again with the decoder closed
+mid-stream and reopened twice, after 37 and 61 access units, as a seek's
+reset and a cancel do), and that
+each clip's decoder-arena peak fits the arena the player sizes for it;
+CTest runs it as `tilefinch-swdec-crc-tests` when
+configured with `-DTILEFINCH_SWDEC_CRC_GATE=ON` and
+`-DTILEFINCH_SWDEC_CRC_SOURCE_DIR=` a prepared workspace. Prepare a fresh
+workspace whenever the committed FFmpeg patch changes.
+
+The diagnostic FFmpeg build (`libs/asm22-diag`) also keeps the motion
+compensation kernels as they were before the shared-pass hv family
+(`swdec_mc_reference`) and can keep every macroblock on FFmpeg's generic
+reconstruction path as the `CONFIG_SMALL` build had it (`swdec_mb_generic`),
+and can emulate the fixed 21x21 edge regions, carry whole-cache jobs, run
+chroma MC one plane per call and make the no-op prefetch calls as before
+(`swdec_edge_full`, `swdec_job_full`, `swdec_chroma_split`,
+`swdec_prefetch_calls`), for same-binary A/B runs: a bench `decode` line
+takes `mc=ref`, `mb=generic`, `edge=full`, `job=full`, `chroma=split` and
+`prefetch=calls`, and on the device a validation browser passes
+`validation_swdec_reference=` from `boot.cfg` (a mask: 1 old kernels, 2
+generic path, 4 full edge regions, 8 full jobs, 16 split chroma, 32 prefetch
+calls, 64 chroma prediction in reconstruction rather than on the Media
+Engine, 128 the chroma qualification replay) to the validation add-on in a
+longer start block
+(same component ABI; the browser logs `tilefinch-swdec: validation flags`). A validation add-on also logs
+`swdec-recon-cpu:` and `swdec-recon-kernels:` when a stream closes: where the
+decode thread's time goes per output picture, with the kernels of one
+macroblock in eight timed by the system clock (wall time, so read the
+kernel buckets as shares), and `swdec-recon-qpel:`, the luma
+motion-compensation calls by block size and quarter-sample position. The
+release libraries have none of this.
+
+Browser-only mask bits select the old block audio clock (256), old
+presentation scheduling (512), or a nine-picture usable reservoir (1024).
+Use 1536 versus 1024 for a capacity-matched presentation comparison. The
+limit is applied after ordinary allocation and recovery; unused allocated
+slots remain owned until teardown. Reject a run unless its window identity
+reports exactly nine usable slots and matching memory-bank placement, and
+keep the memory ceilings unchanged. `allocated` reports physical ownership.
+
+With mask bit 128 a validation add-on also runs the chroma-on-the-Media-
+Engine qualification replay (`src/swdec/swdec_chroma_replay.c`): one macroblock row in four is
+recorded as the chroma prediction operations reconstruction performed, then
+replayed through the main core's kernels and through private scalar kernels
+on the Media Engine (from its idle hook), and both are compared with the
+decoder's own prediction. `swdec-chroma-replay:` reports rows, mismatched
+macroblocks and the per-row cost on each side; on the bench (no Media
+Engine) the scalar kernels run on the main core.
+
+With the Media Engine parsing, it also predicts each inter macroblock's
+chroma (both lists, averaging, explicit and implicit weights, edge
+extension) with scalar kernels while it waits for the main core: for a free
+row buffer (going back to parsing as soon as one is free) and while draining
+a slice. It works through the published rows macroblock by macroblock,
+writes each prediction into the macroblock's job through the uncached alias
+and publishes how many of the row are done. Reconstruction, at an inter
+macroblock, copies a done prediction before adding the residual and skips
+its own chroma motion compensation; otherwise it claims the rest of the row
+and predicts as before, waiting (bounded) only for a macroblock the Media
+Engine is part-way through. Without the Media Engine reconstruction predicts
+as before. A validation add-on logs `swdec-chroma-me:` when a stream closes:
+inter macroblocks predicted by the Media Engine and by the main core, the
+macroblocks waited for and the wait loop's iterations, and the rows the main
+core claimed the rest of. The replay records only rows whose chroma
+reconstruction predicts, so run it as 192 (bits 64 and 128).
+
+The browser draws the software decoder's 16-bit (PSP 5650) pictures with the
+graphics engine straight into the 16-bit page buffer, in 64-texel column
+slices, and collects the draw just before the buffer is latched rather than
+straight after the submit; the slot stays borrowed until then. Frames with
+visible chrome, slots above 0x0A000000, geometry without quads, and Sharp keep
+the software scaler. A validation browser takes `validation_swdec_present=`
+from `boot.cfg` for same-binary A/B runs (0 this path, 1 the software scaler,
+2 one sprite per quad, 3 synced straight after the submit) and logs
+`tilefinch-swdec-present:` every 100 pictures: engine and fallback counts,
+submit and residual wait time, displayed rate, and the CPU used by the
+presenting thread and the decode worker over the same window.
+
+A component built in a validation tree (`TILEFINCH_PSP_VALIDATION_LOG=ON`)
+also reports, when each stream closes, where its decoding time went:
+`swdec-stages:` gives the decoding thread's totals in microseconds (decode
+wall and run time, the Media Engine slice, sleeps waiting for parsed rows, the
+row stages, the frame tail, colour conversion), and `swdec-stages-me:` the
+Media Engine's CP0 Count ticks by exclusive phase (each tick belongs to the
+one phase the ME is in, so the shares add up to its running time; 64-bit
+totals), with each share next to the sampler's in brackets and how many
+agree within the sampler's interval (`clock=none` when the boot probe saw
+Count stand still; `probe=` gives its three attempts). `swdec-stages-occupancy:` needs no ME clock: the ME
+publishes its phase (idle, parse, deblock, wait, csc, audio, drain, off) and
+a kernel alarm on the main CPU samples it at random 0.5-2.5 ms intervals,
+reporting each share with its 95 % interval, the sample count and the
+alarm handler's own time. `swdec-stages-wait:` follows the decoding
+thread's waits for parsed rows: how often a wake found a new row, how long
+after the Media Engine published that row the thread ran again (ME Count
+put on the CPU clock by a ping before each slice), and how often other
+threads and interrupts preempted it. `swdec-stages-threads:` gives, for
+every eighth access unit, each thread's mean run time during the decode
+with a 95 % interval, the samples it left out because a thread clock could
+not be read, and what no thread accounts for. A shipping tree's component
+has none of this.
+
+`tilefinch-swdec-realtime:` counts `displayed` pictures once each:
+`repeats` are presents of a picture already shown (redraws), and fps-x10
+is computed from distinct pictures only. boot.cfg `validation_playback_ab`
+(validation builds) is a bit mask for playback A/B runs: 1 decodes at fixed
+full quality (no reduced decoding), so runs compare identical work; 2 keeps
+refreshing the page chrome state every frame while a player covers the
+page, as before that was deferred; 4 lets the picture ring fill with slots
+above 0x0A000000 (which the Media Engine and the graphics engine cannot
+read, so the main CPU converts and scales those pictures), as before the
+ring stopped at the low blocks; 8 makes the reduced quality rungs drop
+non-reference pictures (one in two or one in four) as before, instead of
+only skipping their deblocking; 16 restores the old software-video pacing
+and one-frame-ahead non-reference discard rule. Compare 17 against 1 for
+a same-binary, full-quality pacing comparison. `event=working-set-placed`
+gives `ring-high=high/placed/slots`.
+
+Software-decoder performance is scored on a steady-playback window fixed
+in advance (`src/swdec/swdec_window.h`): it opens on the first unique
+picture published 5 s after the first one and closes on the first
+published 30 s after it opened, so startup is reported apart and no window
+is picked after the fact. A picture counts once, when its buffer is
+published. A validation browser prints, for the last window of a video:
+`tilefinch-swdec-window-id:` (geometry, picture slots placed and above
+0x0A000000, slot size, quality switches, free budget and Media Engine
+pool), `tilefinch-swdec-window:` (unique pictures, redraws, the interval
+between them as median/p95/max in milliseconds, intervals held over 1.5
+frame periods, the three longest with the picture time that ended each,
+the audio clock's advance, buffering, seeks; `complete=0` when playback
+stopped first) and `tilefinch-swdec-window-work:` (access units submitted,
+pictures decoded and displayed, drops by reason, reduced-quality decodes,
+main, decode-worker and audio thread CPU, the worker's decode and
+conversion wall time, its idle gaps between jobs, audio blocks, underruns,
+output errors and gaps). All are differences over the window; nothing
+there is derived. With the diagnostic add-on the component also reports
+its stage figures for the same window between `swdec-window: when=start`
+and `when=end` lines (its close report then covers only what followed).
+
+A validation tree builds two add-ons: `tilefinch-swdec-addon`
+(diagnostics, for profiling) and `tilefinch-swdec-addon-release` (target
+`tilefinch-swdec-release-bundle`, no diagnostics, for acceptance runs).
+`tools/swdec-bench/window-pairs.sh` runs alternating baseline/candidate
+pairs of one recorded page through a device run wrapper with one add-on,
+records the binaries and lanes, and `window-pairs.py` scores the last
+window record of each log: fps from unique published pictures over the
+window's own span, frame-interval figures and holds, CPU per decoded
+picture and per second, the worker CPU the stage report leaves
+unexplained, where each lost picture went, and the acceptance checks
+(complete window, no reduced decodes, seeks, buffering, underruns or output
+errors, audio clock at normal speed). Lane medians are shown beside the
+runs, never sums or ratios across runs.
+
+Drops are disjoint. Units dropped before dispatch (late, skipped to a
+keyframe, queue full) never count as submitted; every submitted picture
+that was not displayed has exactly one reason (dropped late by the worker,
+no picture from the decoder, conversion refused, superseded by the
+presenter, still ready at the close), and the remainder is the work in
+flight at the window edges. A remainder beyond four pictures, or a negative
+reason, is an accounting error.
+
+Scoring is strict by default, for acceptance: a run counts only with all
+three window records, a closed window, passing checks, a closed ledger, a
+zero wrapper status, the binaries unchanged after the run and a log newer
+than the run start (`NAME-runs.txt` records each run). Invalid runs are
+listed with their reasons and left out of the medians, and the script exits
+nonzero when any run is invalid, when no run is valid, or when either lane
+has fewer valid runs than the pairs asked for.
+`BASE_ADDON_DIR` and `CAND_ADDON_DIR` install a different add-on bundle
+before each lane's runs, so two add-on builds can be compared on one
+browser binary: the identity file records both lanes' sha1s, and each run
+must have run on the shared browser and its own lane's add-on.
+`LOOSE=1` (`--loose`) scores whatever left a record, for profiling;
+`ALLOW_REDUCED=1` (`--allow-reduced`) accepts reduced decodes for
+adaptive-mode comparisons.
+
+That split is one switch, `SWDEC_DIAGNOSTICS` (`src/swdec/swdec_diag.h`).
+The preparation script builds the FFmpeg libraries twice: `libs/asm22`
+without diagnostics and `libs/asm22-diag` with them (the per-stage clock,
+the stage marks, the experimental and no-op deblocking kernels and their
+test hooks). A validation tree builds its component with
+`SWDEC_DIAGNOSTICS=1` against `libs/asm22-diag`, which adds the component's
+logging, Media Engine liveness and stack reports, fault injection, CPU audio
+cross-checks and the stage report; any other tree builds the release
+component against `libs/asm22` with none of it. The finer flags
+(`SWDEC_STAGE_DIAG`, `SWDEC_ME_DIAG`, `SWDEC_ME_DIAG2`, `SWDEC_SPIN_DIAG`,
+`SWDEC_ME_OFF`, `SWDEC_POISON`, and in FFmpeg `SWDEC_STAGE_TIMING` and
+`SWDEC_PIPE_VALIDATE`) fail the build without it, and a component linked
+against the other variant's libraries fails to link. The preparation script
+only accepts a pristine or exactly patched tree, so prepare a fresh output
+directory whenever the committed patch changes.
 
 ### PSP transport dependencies
 

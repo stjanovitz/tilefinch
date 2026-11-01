@@ -32,7 +32,9 @@ typedef enum {
     PSP_NETWORK_STACK_PARTIAL,
     PSP_NETWORK_STACK_FULL,
     /* Full stack retained because a consumer may still be executing in it. */
-    PSP_NETWORK_STACK_RETAINED_WEDGED
+    PSP_NETWORK_STACK_RETAINED_WEDGED,
+    /* Utility modules resident, but no initialized services or connections. */
+    PSP_NETWORK_STACK_MODULES_ONLY
 } PspNetworkStackState;
 
 typedef enum {

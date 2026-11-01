@@ -82,6 +82,27 @@ int main(void)
     printf("footprint: realm=%u resident-after-bootstrap=%zu (%zu KiB)\n",
            FOOTPRINT_REALM_BYTES, resident, resident / KIB);
 
+    /* SharedWorker is an eager refusing shell. Probing it must not activate
+       the Worker module (130-530 KiB on real pages) and may retain only
+       the probe's own small change. */
+    {
+        ScriptResult shared_result;
+        memset(&shared_result, 0, sizeof(shared_result));
+        CHECK(script_runtime_evaluate_diagnostic(
+            runtime,
+            "globalThis.pocSummary=typeof SharedWorker+':'+!window.SharedWorker",
+            "<footprint-shared-worker>", &shared_result));
+        size_t after_shared = used_bytes(runtime);
+        size_t delta = after_shared > resident ? after_shared - resident : 0u;
+        printf("footprint: SharedWorker probe retained=%zu (%zu KiB) "
+               "lazy-loads=%zu summary=%s\n",
+               delta, delta / KIB, shared_result.bootstrap_lazy_module_loads,
+               shared_result.summary);
+        CHECK(strcmp(shared_result.summary, "function:false") == 0);
+        CHECK(shared_result.bootstrap_lazy_module_loads == 0);
+        CHECK(delta <= 4u * KIB);
+    }
+
     static const LazyProbe probes[] = {
         {"streams", "typeof ReadableStream"},
         {"indexeddb", "typeof IDBFactory"},
@@ -93,7 +114,7 @@ int main(void)
         {"intl", "typeof Intl.NumberFormat"},
         {"traversal", "typeof document.createTreeWalker"},
     };
-    size_t before = resident;
+    size_t before = used_bytes(runtime);
     for (size_t i = 0; i < sizeof(probes) / sizeof(probes[0]); i++) {
         char source[256];
         snprintf(source, sizeof(source),

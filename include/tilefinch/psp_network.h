@@ -133,6 +133,8 @@ typedef struct {
     uint64_t started_us;
     uint64_t leave_started_us;
     bool leave_timed_out;
+    /* Recovery may restart services without unloading their owned PRXs. */
+    bool retain_modules;
 } PspNetworkShutdownOperation;
 
 typedef enum {
@@ -150,6 +152,8 @@ typedef struct {
     int native_result;
 } PspNetworkRejoinOperation;
 
+/* Pass zero-initialized state on first use. Retired, resident module ownership
+   survives a subsequent begin; all connection/service state is reset. */
 bool psp_network_begin(PspNetwork *network, int profile_index);
 /* Stop a firmware name lookup that has outlived its hard bound
    (PSP_NETWORK_DNS_HARD_DEADLINE_MS). Cheap when nothing is resolving; the

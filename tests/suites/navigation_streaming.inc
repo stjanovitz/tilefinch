@@ -171,6 +171,114 @@ static bool test_parser_head_cssom_preserves_initialization(void)
     return ok && clean;
 }
 
+/* The streamed server markup declares its video in the head; a body
+   script (as client hydration does) empties the head before any lookup.
+   The declaration kept when the parser closed the head still answers,
+   through a same-URL replaceState, until a fragment navigation changes
+   the URL (pushState is covered by tilefinch-media-dom-tests). */
+static bool test_streamed_declarations_survive_head_wipe(void)
+{
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 2);
+    char error[256] = {0};
+    bool replay = ready && fetch_trace_replay_begin(
+        TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-declarations-head-wipe",
+        error, sizeof(error));
+    if (replay) {
+        navigation_enable_scripts(&navigation, 4 * MIB, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 4, 32 * 1024, 16 * 1024, 1000);
+        navigation_set_stream_delivery(&navigation, 64, 0, 0, 0, 0, 0);
+    }
+    uint64_t generation = replay ? navigation_begin(&navigation) : 0;
+    bool loaded = replay && navigation_load_url(
+        &navigation, generation, "https://decl.test/news/video",
+        4096, 1000, 480, NULL, NULL, true);
+    PocDocument *document = &navigation.page.document;
+    const MediaDeclaredVideo *declared =
+        loaded ? media_declared_video_cached(document) : NULL;
+    bool kept = loaded && navigation.page.runtime != NULL
+        && strcmp(navigation.page.script_result.summary, "wiped:1:0") == 0
+        && declared != NULL
+        && strcmp(declared->media_url,
+                  "https://cdn.decl.test/own/abs/index.m3u8") == 0
+        && strcmp(declared->embed_url,
+                  "https://players.decl.test/embed/4410023351") == 0
+        && strcmp(declared->title, "Own story") == 0;
+    ScriptResult result = {0};
+    bool same_url = kept && script_runtime_evaluate_diagnostic(
+        navigation.page.runtime,
+        "history.replaceState({n:1},'',location.href);"
+        "document.body.appendChild(document.createElement('p'));"
+        "globalThis.pocSummary='same'", "<same-url>", &result)
+        && media_declared_video_cached(document) != NULL;
+    bool moved = same_url
+        && navigation_commit_same_document_url(
+               &navigation, "https://decl.test/news/video#comments")
+        && media_declared_video_cached(document) == NULL
+        && media_declared_video_or_embed_cached(document) == NULL;
+    bool ok = kept && same_url && moved;
+    if (!ok) fprintf(stderr,
+        "streamed declarations loaded=%d kept=%d same=%d moved=%d "
+        "summary=\"%s\" error=\"%s\"\n", loaded, kept, same_url, moved,
+        navigation.page.script_result.summary, navigation.last_error);
+    if (replay) fetch_trace_end();
+    if (ready) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+/* The head declares nothing; the VideoObject arrives in a later body chunk
+   and a later body script removes it, as hydration does. The declaration
+   is kept when its data script closes, before that script can run. */
+static bool test_streamed_body_declaration_survives_removal(void)
+{
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 2);
+    char error[256] = {0};
+    bool replay = ready && fetch_trace_replay_begin(
+        TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-declarations-body-removed",
+        error, sizeof(error));
+    if (replay) {
+        navigation_enable_scripts(&navigation, 4 * MIB, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 4, 32 * 1024, 16 * 1024, 1000);
+        navigation_set_stream_delivery(&navigation, 64, 0, 0, 0, 0, 0);
+    }
+    uint64_t generation = replay ? navigation_begin(&navigation) : 0;
+    bool loaded = replay && navigation_load_url(
+        &navigation, generation, "https://decl.test/news/body",
+        4096, 1000, 480, NULL, NULL, true);
+    const MediaDeclaredVideo *declared =
+        loaded ? media_declared_video_cached(&navigation.page.document)
+               : NULL;
+    bool ok = loaded && navigation.page.runtime != NULL
+        && strcmp(navigation.page.script_result.summary, "removed:0") == 0
+        && declared != NULL
+        && strcmp(declared->media_url,
+                  "https://cdn.decl.test/own/body/index.m3u8") == 0;
+    if (!ok) fprintf(stderr,
+        "streamed body declaration loaded=%d declared=%d summary=\"%s\" "
+        "error=\"%s\"\n", loaded, declared != NULL,
+        navigation.page.script_result.summary, navigation.last_error);
+    if (replay) fetch_trace_end();
+    if (ready) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
 static bool test_response_headers_precede_parser_script_and_viewport(void)
 {
     Budget budget;

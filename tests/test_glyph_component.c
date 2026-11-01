@@ -551,20 +551,26 @@ static bool test_release_artifacts(void)
                 || verified.manifest.release_sequence == 4u
                 || verified.manifest.release_sequence == 5u
                 || verified.manifest.release_sequence == 6u
-                || verified.manifest.release_sequence == 7u);
+                || verified.manifest.release_sequence == 7u
+                || verified.manifest.release_sequence == 8u);
         bool revised_bengali = pack == TILEFINCH_GLYPH_PACK_BENGALI_ASSAMESE
             && (verified.manifest.release_sequence == 2u
-                || verified.manifest.release_sequence == 3u);
+                || verified.manifest.release_sequence == 3u
+                || verified.manifest.release_sequence == 4u);
         CHECK(revised_hindi || revised_bengali
               || verified.manifest.release_sequence == 1u);
         CHECK(strcmp(verified.manifest.tag,
                      pack == TILEFINCH_GLYPH_PACK_BENGALI_ASSAMESE
-                        ? (verified.manifest.release_sequence == 3u
+                        ? (verified.manifest.release_sequence == 4u
+                            ? "components-v8"
+                            : verified.manifest.release_sequence == 3u
                             ? "components-v7"
                             : revised_bengali ? "components-v6"
                                            : "glyph-bengali-assamese-v1")
                         : revised_hindi
-                        ? (verified.manifest.release_sequence == 7u
+                        ? (verified.manifest.release_sequence == 8u
+                            ? "components-v8"
+                            : verified.manifest.release_sequence == 7u
                             ? "components-v7"
                             : verified.manifest.release_sequence == 6u
                             ? "components-v6"

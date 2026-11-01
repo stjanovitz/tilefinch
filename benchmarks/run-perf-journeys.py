@@ -208,11 +208,21 @@ def extract_metrics(log):
             if presses:
                 metrics["load.%s.unmoved_presses" % scope] = (
                     int(presses.group(2)) - int(presses.group(1)))
-    visible, complete = [], []
+    # A press at the page's edge draws nothing and is answered at once
+    # (noop=1). Its sub-millisecond time would dilute the percentiles of
+    # presses that move the page, so it is kept apart: a no-op that starts
+    # drawing again loses noop=1 and lands in the percentiles anyway, and a
+    # slow no-op shows in scroll.noop_max_ms.
+    visible, complete, noop = [], [], []
     for line in log.splitlines():
         if line.startswith("tilefinch-scroll-feedback:"):
+            if re.search(r"\bnoop=1\b", line):
+                noop.append(field(line, "elapsed") / 1000.0)
+                continue
             visible.append(field(line, "first-visible") / 1000.0)
             complete.append(field(line, "elapsed") / 1000.0)
+    if noop:
+        metrics["scroll.noop_max_ms"] = round(max(noop), 1)
     if visible:
         for label, values in (("first_visible", visible),
                               ("complete", complete)):

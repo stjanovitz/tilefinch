@@ -38,8 +38,10 @@ PspBasicFallbackDecision psp_basic_fallback_decide(
     BrowserBasicFallbackMode mode, BrowserBasicViewRecovery recovery);
 
 /* After a page runtime turn: whether a committed page whose scripts have
-   failed (the turn failed, memory admission failed, or the realm retired) should be
-   re-examined for the fallback. Pages are otherwise examined only at
+   failed (the turn failed, memory admission failed, the realm retired, or a
+   live realm was refused memory and the page shows little:
+   browser_engine_page_memory_recovery_due) should be re-examined for the
+   fallback. Pages are otherwise examined only at
    commit; this happens at most once per navigation (failure_examined). */
 bool psp_basic_fallback_recheck(BrowserBasicFallbackMode mode,
                                 bool extracted_view_active,
@@ -61,5 +63,13 @@ uint8_t psp_basic_fallback_failure_actions(BrowserBasicFallbackMode mode,
    offers no recovery at all). */
 bool psp_basic_fallback_navigation_reloadable(long http_status,
                                               bool internal_url);
+
+/* Whether the page the browser opened at boot gets the post-navigation
+   examination every later navigation gets at commit (declared media card,
+   blank-page recovery, automatic Reader): a loaded web page, not native
+   Home or another internal page. The boot load commits outside the
+   interactive loop, so without this it is asked only by a later recheck. */
+bool psp_basic_fallback_boot_page_examined(bool loaded, bool native_home,
+                                           bool internal_url);
 
 #endif

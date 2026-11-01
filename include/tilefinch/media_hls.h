@@ -28,6 +28,9 @@ MediaHlsPlaylist *media_hls_playlist_parse(
     const unsigned char *bytes, size_t length,
     char *error, size_t error_size);
 MediaHlsPlaylistKind media_hls_playlist_kind(const MediaHlsPlaylist *playlist);
+#if !defined(__PSP__)
+/* Host tests only; the PSP selects through
+   media_hls_playlist_select_decodable_streams. */
 /* Select the least costly compatible variant, preferring the smallest one at
    or above target_height. Unknown geometry is only a last-resort candidate. */
 bool media_hls_playlist_select_variant(
@@ -42,7 +45,49 @@ bool media_hls_playlist_select_streams(
     unsigned maximum_height, unsigned target_height,
     char *video_url, size_t video_url_size,
     char *audio_url, size_t audio_url_size);
+#endif
+/* Decoder-aware master selection. Every variant fits within
+   software_width x software_height (the software decoder's bound, which is
+   what High profile needs). A variant whose CODECS name avc1 Baseline or
+   Main is also admitted up to the firmware decoder's geometry, as is one
+   that names no AVC profile when admit_undeclared_firmware is set; the
+   caller must then check the first segment's SPS (`unverified`). Among
+   admitted variants the smallest at or above target_height wins. */
+typedef struct {
+    unsigned software_width;
+    unsigned software_height;
+    unsigned target_height;
+    bool admit_undeclared_firmware;
+    /* The firmware decoder refused a selected variant's H.264 coding (a
+       B-frame pyramid, say): every variant must now fit the software bound,
+       whatever profile it declares. */
+    bool firmware_refused;
+} MediaHlsDecoderLimits;
+
+typedef struct {
+    /* A compatible video variant was chosen (its audio may still be
+       missing when the call fails). */
+    bool video_selected;
+    /* The chosen variant exceeds the software bound without declaring a
+       Baseline/Main profile. */
+    bool unverified;
+    unsigned width;
+    unsigned height;
+} MediaHlsSelection;
+
+bool media_hls_playlist_select_decodable_streams(
+    const MediaHlsPlaylist *playlist, const MediaHlsDecoderLimits *limits,
+    char *video_url, size_t video_url_size,
+    char *audio_url, size_t audio_url_size,
+    MediaHlsSelection *selection);
 size_t media_hls_playlist_segment_count(const MediaHlsPlaylist *playlist);
+#if !defined(__PSP__)
+/* Host tools only (the stream recorder): the absolute URL and duration of a
+   MEDIA playlist's segment INDEX. */
+bool media_hls_playlist_segment(const MediaHlsPlaylist *playlist,
+                                size_t index, char *url, size_t url_size,
+                                uint32_t *duration_ms);
+#endif
 uint64_t media_hls_playlist_duration_us(const MediaHlsPlaylist *playlist);
 bool media_hls_playlist_is_live(const MediaHlsPlaylist *playlist);
 void media_hls_playlist_destroy(MediaHlsPlaylist *playlist);
@@ -53,6 +98,10 @@ void media_hls_playlist_destroy(MediaHlsPlaylist *playlist);
 MediaHlsPlaylistStream *media_hls_playlist_stream_create(
     Budget *budget, const char *playlist_url,
     char *error, size_t error_size);
+/* A playlist delivered through a redirect resolves its relative URIs
+   against the URL that answered. Only before the first byte is fed. */
+bool media_hls_playlist_stream_rebase(
+    MediaHlsPlaylistStream *stream, const char *playlist_url);
 bool media_hls_playlist_stream_feed(
     MediaHlsPlaylistStream *stream,
     const unsigned char *bytes, size_t length,
@@ -116,6 +165,9 @@ typedef struct {
     uint64_t buffered_until_us;
     bool live;
     bool ended;
+    /* The sample queue is full enough that delivery waits for the consumer:
+       more waiting cannot buffer further ahead until samples are taken. */
+    bool holding;
 } MediaHlsStats;
 
 /* Takes ownership of a MEDIA playlist on success only. */
@@ -128,9 +180,10 @@ MediaHlsSource *media_hls_source_create_track(
     char *error, size_t error_size);
 MediaHlsPrimeStatus media_hls_source_prime(
     MediaHlsSource *source, char *error, size_t error_size);
-/* One bounded delivery step. The PSP frontend calls this once per frame so
-   segment and live-playlist traffic can progress while decoded samples remain
-   queued; sample reads retain the same call as a starvation fallback. */
+/* One bounded delivery visit (up to a few KiB of segment bytes, stopping
+   early when the transport waits or the sample queue is half full). The PSP
+   frontend calls this once per frame so segment and live-playlist traffic can
+   progress while decoded samples remain queued. */
 void media_hls_source_pump(MediaHlsSource *source, uint64_t now_us);
 bool media_hls_source_wants_playlist_refresh(
     const MediaHlsSource *source, uint64_t now_us);

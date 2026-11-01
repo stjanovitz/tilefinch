@@ -311,6 +311,52 @@ static int test_job_heap_rejection_is_fatal(void)
     return 0;
 }
 
+/* Page code that catches the out-of-memory error at the realm's limit and
+   tries again stops after SCRIPT_ENTRY_REFUSAL_LIMIT refusals as
+   out of memory, not after the execution deadline as a timeout; an entry
+   that recovers from a few refusals runs on. */
+static int test_refusal_loop_stops_as_out_of_memory(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    static const char html[] = "<!doctype html><body>Ready</body>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_with_session(
+        &document, &budget, 5u * MIB, 20000,
+        "https://refusal-loop.test/", NULL, &result);
+    CHECK(runtime != NULL);
+    size_t live = budget_quickjs_pool_js_malloc_current(runtime->quickjs_pool);
+    JS_SetMemoryLimit(runtime->runtime, live + 256u * 1024u);
+    /* a few refusals, then a smaller request that fits: runs to the end */
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "var got = 0; for (var i = 0; i < 8; i++) {"
+        "  try { new ArrayBuffer(4 << 20) } catch (e) {} }"
+        "got = new ArrayBuffer(1024).byteLength;"
+        "globalThis.pocSummary = 'recovered ' + got", "<few>", &result)
+          && strcmp(result.summary, "recovered 1024") == 0
+          && !result.interrupted);
+    uint64_t started = js_rt_monotonic_time_ns();
+    memset(&result, 0, sizeof(result));
+    bool ok = script_runtime_evaluate_diagnostic(runtime,
+        "for (;;) { try { new ArrayBuffer(4 << 20) } catch (e) {} }",
+        "<loop>", &result);
+    uint64_t elapsed_ms = (js_rt_monotonic_time_ns() - started) / 1000000u;
+    if (ok || strstr(result.error, "out of memory") == NULL
+        || result.interrupted || elapsed_ms > 5000u)
+        fprintf(stderr, "refusal loop: ok=%d interrupted=%d %llu ms "
+                "error=%.80s\n", ok, result.interrupted,
+                (unsigned long long) elapsed_ms, result.error);
+    CHECK(!ok && strstr(result.error, "out of memory") != NULL
+          && !result.interrupted && elapsed_ms <= 5000u);
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 /* After parsing, an attribute or inline-style write changes no document
    statistic but the attribute totals, so the next advance must not pay a
    whole-document refresh; a structural mutation still does. */
@@ -6150,6 +6196,45 @@ static int test_buffered_xhr_event_stack(void)
     for (unsigned tick = 0; tick < 16 && strcmp(result.summary, "LARGE-XHR-OK"); tick++)
         CHECK(script_runtime_advance(runtime, 0, 64, &result));
     CHECK(!strcmp(result.summary, "LARGE-XHR-OK"));
+    /* A realm-full fetch pool (-1) is freed only by this realm's own
+       completion or cancellation, both of which pump the queue: the head
+       waits for that, not for 10 ms timer turns (a replay re-ran native
+       admission 905 times while one streamed request stayed open), and
+       keeps only a slow fallback timer. A shared-scheduler deferral (0)
+       still retries from the next 10 ms turn. */
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "(async()=>{let calls=0,free=false,shared=false;"
+        "globalThis.__tilefinchFetchAsync=()=>{calls++;"
+        "return free?3100:shared?0:-1;};"
+        "const stats=__tilefinchNetworkQueueStats,"
+        "deferredBefore=stats.poolDeferred;"
+        "const body=fetch('/pool').then(r=>r.text());"
+        "for(let i=0;i<20;i++)__tilefinchPumpTimers(10,16);"
+        "const waited=calls===1&&stats.waiting===1"
+        "&&stats.poolDeferred===deferredBefore+1;"
+        "free=true;__tilefinchDeliverNetwork(9999,true,{});"
+        "await Promise.resolve();const woke=calls===2&&stats.active===1;"
+        "__tilefinchDeliverNetwork(3100,true,{status:200,url:'',"
+        "contentType:'text/plain',body:'pool'});const text=await body;"
+        "free=false;shared=true;calls=0;"
+        "const sharedBody=fetch('/shared').then(r=>r.text());"
+        "for(let i=0;i<5;i++)__tilefinchPumpTimers(10,16);"
+        "const polled=calls===6;free=true;__tilefinchPumpTimers(10,16);"
+        "__tilefinchDeliverNetwork(3100,true,{status:200,url:'',"
+        "contentType:'text/plain',body:'shared'});"
+        "const sharedText=await sharedBody;"
+        "pocSummary=waited&&woke&&text==='pool'&&polled"
+        "&&sharedText==='shared'&&stats.waiting===0&&stats.active===0"
+        "?'POOL-WAIT-OK':'POOL-WAIT-BAD:'+[waited,woke,text,polled,"
+        "sharedText,calls].join();})().catch(error=>pocSummary="
+        "'POOL-WAIT-ERROR:'+error);",
+        "<pool-deferral-wait>", &result));
+    for (unsigned tick = 0; tick < 16
+         && strncmp(result.summary, "POOL-WAIT-", 10); tick++)
+        CHECK(script_runtime_advance(runtime, 0, 64, &result));
+    if (strcmp(result.summary, "POOL-WAIT-OK") != 0)
+        fprintf(stderr, "pool deferral wait: %s\n", result.summary);
+    CHECK(!strcmp(result.summary, "POOL-WAIT-OK"));
     script_runtime_destroy(runtime);
     document_destroy(&document);
     CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
@@ -6198,7 +6283,7 @@ static int test_network_queue_replay(void)
         "(async()=>{const real=globalThis.__tilefinchFetchAsync;"
         "globalThis.starts=[];globalThis.__tilefinchFetchAsync="
         "function(...args){const id=real.apply(this,args);"
-        "if(Number(id)!==0)starts.push(String(args[1]));return id;};"
+        "if(Number(id)>0)starts.push(String(args[1]));return id;};"
         "const order=[],requests=[];for(let i=0;i<8;i++)requests.push("
         "fetch('/q/'+i).then(r=>r.text()).then(text=>order.push(text),"
         "error=>order.push('error:'+error.message)));"
@@ -7064,6 +7149,81 @@ static int test_wrapper_sweep_batched_notices(void)
         "const p=document.querySelectorAll('p');"
         "pocSummary=String(finalized>=200&&p.length===200&&p[7]===p[7]"
         "&&p[7]===document.body.children[7])", "true", &result));
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+static bool replace_children_through_runtime(
+    void *opaque, PocDocument *document, lxb_dom_node_t *element,
+    const char *markup, size_t length)
+{
+    return script_runtime_replace_element_inner_html(
+        opaque, document, element, markup, length);
+}
+
+/* A static shell fallback runs after a page's script failed, while its
+   realm still holds wrappers into the loading shell it replaces. Freeing
+   those children natively left the wrapper naming a dead node; when the
+   wrapper died the bridge freed it again, Lexbor's allocator then handed
+   one address to two elements, and Basic view's fragment insertion
+   appended a node to itself and walked that cycle forever. */
+static int test_static_shell_fallback_keeps_wrapped_children(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    static const char html[] =
+        "<!doctype html><title>Account</title>"
+        "<meta name=description content='Connect with friends and share "
+        "updates from this service.'><body><main id=shell>Account Loading..."
+        "<span id=spinner>...</span></main></body>";
+    PocDocument document;
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create(
+        &document, &budget, 8u * MIB, 1500, "https://shell.test/", &result);
+    CHECK(runtime != NULL);
+    CHECK(handle_table_eval(runtime,
+        "globalThis.held=document.getElementById('spinner');"
+        "pocSummary='HELD'", "HELD", &result));
+    CHECK(document_install_static_shell_fallback(
+        &document, replace_children_through_runtime, runtime));
+    const char *body = document_body_text(&document);
+    CHECK(body != NULL && strstr(body, "published summary") != NULL
+          && strstr(body, "Account Loading") == NULL);
+    /* The replaced shell is detached, not freed: the wrapper still reads
+       it and its parent chain. */
+    CHECK(handle_table_eval(runtime,
+        "pocSummary=[held.isConnected,held.textContent,"
+        "held.parentNode&&held.parentNode.id].join()",
+        "false,...,shell", &result));
+    CHECK(handle_table_eval(runtime,
+        "globalThis.held=null;pocSummary='DROPPED'", "DROPPED", &result));
+    JS_RunGC(runtime->runtime);
+    JS_RunGC(runtime->runtime);
+    runtime->bridge.node_wrapper_sweep_remaining = runtime->bridge.node_count;
+    for (size_t turn = 0; turn < 64u
+         && runtime->bridge.node_wrapper_sweep_remaining != 0; turn++)
+        js_rt_bridge_sweep_node_wrappers(&runtime->bridge);
+    CHECK(runtime->bridge.node_wrapper_sweep_remaining == 0);
+    /* Each element address was released once: fresh elements of the same
+       size are all distinct. */
+    lxb_dom_node_t *fresh[32] = {0};
+    bool distinct = true;
+    for (size_t i = 0; i < sizeof(fresh) / sizeof(fresh[0]); i++) {
+        lxb_dom_element_t *element = lxb_dom_document_create_element(
+            &document.html->dom_document, (const lxb_char_t *) "main", 4u,
+            NULL);
+        CHECK(element != NULL);
+        fresh[i] = lxb_dom_interface_node(element);
+        for (size_t j = 0; j < i; j++)
+            if (fresh[j] == fresh[i]) distinct = false;
+    }
+    for (size_t i = 0; i < sizeof(fresh) / sizeof(fresh[0]); i++)
+        lxb_dom_node_destroy_deep(fresh[i]);
+    CHECK(distinct);
     script_runtime_destroy(runtime);
     document_destroy(&document);
     CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
@@ -7998,6 +8158,8 @@ int main(int argc, char **argv)
         return test_transition_snapshot_shared_ancestors();
     if (argc == 2 && strcmp(argv[1], "--wrapper-sweep-only") == 0)
         return test_wrapper_sweep_batched_notices();
+    if (argc == 2 && strcmp(argv[1], "--static-shell-fallback-only") == 0)
+        return test_static_shell_fallback_keeps_wrapped_children();
     if (argc == 2 && strcmp(argv[1], "--image-preloads-only") == 0) {
         CHECK(test_detached_image_preloads() == 0);
         CHECK(test_detached_image_preload_drawn_while_loading() == 0);
@@ -8024,6 +8186,7 @@ int main(int argc, char **argv)
     CHECK(test_base64_failure_leaves_no_diagnostic() == 0);
     CHECK(test_transition_snapshot_shared_ancestors() == 0);
     CHECK(test_wrapper_sweep_batched_notices() == 0);
+    CHECK(test_static_shell_fallback_keeps_wrapped_children() == 0);
     CHECK(test_coalesced_attribute_tokens() == 0);
     if (argc == 2 && strcmp(argv[1], "--detached-move-only") == 0)
         return test_detached_move_is_a_removal();
@@ -8093,6 +8256,7 @@ int main(int argc, char **argv)
     CHECK(test_watchdog_elapsed_cooperation() == 0);
     CHECK(test_reduced_dom_event_counter() == 0);
     CHECK(test_job_heap_rejection_is_fatal() == 0);
+    CHECK(test_refusal_loop_stops_as_out_of_memory() == 0);
     CHECK(test_inline_tracker_policy() == 0);
     CHECK(test_attribute_mutation_skips_document_refresh() == 0);
     CHECK(test_get_element_by_id_tracks_id_changes() == 0);

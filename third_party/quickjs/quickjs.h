@@ -480,6 +480,17 @@ typedef struct JSMemoryUsage {
 
 void JS_ComputeMemoryUsage(JSRuntime *rt, JSMemoryUsage *s);
 void JS_DumpMemoryUsage(FILE *fp, const JSMemoryUsage *s, JSRuntime *rt);
+#ifdef CONFIG_TILEFINCH_HEAP_DETAIL
+/* Heap-detail diagnostic (CONFIG_TILEFINCH_HEAP_DETAIL, host builds only):
+   read-only, allocation-free heap composition walk; one row per kind/name
+   with kind-specific values (see docs/DIAGNOSTIC_SWITCHES.md,
+   TILEFINCH_TRACE_JS_HEAP_DETAIL). */
+typedef void JSMemoryDetailRow(void *opaque, const char *kind,
+                               const char *name, const int64_t *values,
+                               int count);
+void JS_ComputeMemoryDetail(JSRuntime *rt, JSMemoryDetailRow *row,
+                            void *opaque);
+#endif
 
 /* atom support */
 #define JS_ATOM_NULL 0
@@ -998,6 +1009,49 @@ void JS_SetCanBlock(JSRuntime *rt, JS_BOOL can_block);
 void JS_SetStripInfo(JSRuntime *rt, int flags);
 int JS_GetStripInfo(JSRuntime *rt);
 
+/* External function source (Tilefinch). A script compiled with
+   JS_STRIP_SOURCE keeps no Function.prototype.toString() text in the heap.
+   If the embedder keeps the script's text elsewhere, it names it with a
+   non-zero id: JS_SetExternalSourceId(rt, id, length) before the JS_Eval()
+   (or JS_ReadObject() of bytecode written from such a compile) that the
+   text belongs to. That call consumes the id. Each function compiled from
+   the text then records only its offset and length in it, and toString()
+   asks the 'read' hook for the bytes. A hook that cannot supply them (the
+   embedder dropped the text) returns -1, and toString() answers with the
+   "[native code]" form, as for a stripped function. Once consumed, the
+   engine calls 'release' exactly once, when no function refers to the text
+   any more (immediately if none was compiled from it). A function compiled
+   lazily (JS_SetLazyFunctionThreshold()) from such a text keeps no copy of
+   its own: its first call reads the text through 'read' too, so while any
+   such function is uncompiled the text is required. 'pin' (if not NULL) is
+   called with 1 when a text becomes required and 0 when it no longer is; a
+   'read' of a required text that fails makes that call throw an
+   InternalError. Bytecode with such functions (JS_WriteObject()) reads back
+   only with its text named (JS_SetExternalSourceId()). An id that no
+   JS_Eval()/JS_ReadObject() consumed stays pending; setting 0 clears it and
+   returns the pending id. */
+typedef int JSExternalSourceReadFunc(void *opaque, uint32_t source_id,
+                                     uint32_t offset, uint32_t length,
+                                     char *dest);
+typedef void JSExternalSourceReleaseFunc(void *opaque, uint32_t source_id);
+typedef void JSExternalSourcePinFunc(void *opaque, uint32_t source_id,
+                                     int required);
+void JS_SetExternalSourceHooks(JSRuntime *rt, JSExternalSourceReadFunc *read,
+                               JSExternalSourceReleaseFunc *release,
+                               JSExternalSourcePinFunc *pin, void *opaque);
+uint32_t JS_SetExternalSourceId(JSRuntime *rt, uint32_t source_id,
+                                uint32_t length);
+/* Optional (Tilefinch): what toString() can expect from 'read' before it
+   allocates anything. Returns -1 if the span is no longer available, 1 if
+   it is available and all ASCII (read straight into the result string),
+   0 if available and possibly not ASCII (decoded a window at a time). The
+   text is required (see 'pin') while toString() asks and reads. Without
+   it, toString() reads the whole span first to find out. */
+typedef int JSExternalSourceQueryFunc(void *opaque, uint32_t source_id,
+                                      uint32_t offset, uint32_t length);
+void JS_SetExternalSourceQuery(JSRuntime *rt,
+                               JSExternalSourceQueryFunc *query);
+
 /* Lazy function compilation (Tilefinch). While the threshold is non-zero,
    scripts and modules compile each inner function whose source text is at
    least that many bytes long without keeping its bytecode: its captured
@@ -1214,6 +1268,11 @@ uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValueConst obj,
 #define JS_READ_OBJ_ROM_DATA  (1 << 1) /* avoid duplicating 'buf' data */
 #define JS_READ_OBJ_SAB       (1 << 2) /* allow SharedArrayBuffer */
 #define JS_READ_OBJ_REFERENCE (1 << 3) /* allow object references */
+/* Tilefinch: the bytecode is the embedder's platform code. Its plain
+   `function`s whose names begin with a lowercase ASCII letter are read as
+   methods (no `prototype` property, not constructors), as native WebIDL
+   operations are; classes, generators and other functions are unchanged. */
+#define JS_READ_OBJ_PLATFORM_METHODS (1 << 4)
 JSValue JS_ReadObject(JSContext *ctx, const uint8_t *buf, size_t buf_len,
                       int flags);
 /* instantiate and evaluate a bytecode function. Only used when

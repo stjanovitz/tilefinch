@@ -2945,31 +2945,94 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
              ? style->padding.top : 0);
     bool clips_x = style->overflow_x_scroll;
     bool clips_y = style->overflow_y_scroll || coordinate_contained;
+    bool clip_only_x = style->overflow_x_clip_only;
+    bool clip_only_y = style->overflow_y_clip_only;
     int clip_radius = paint_plan.border_radius_code;
     unsigned clip_path_type = computed_style_clip_path_type(style);
+    bool clip_path_empty = false;
+    StyleOverflowClipBox clip_path_box = STYLE_OVERFLOW_CLIP_BORDER_BOX;
     if (clip_path_type != STYLE_CLIP_PATH_NONE) {
+        bool overflow_clips = clips_x || clips_y;
+        bool overflow_scrolls = (clips_x && !clip_only_x)
+            || (clips_y && !clip_only_y);
+        int overflow_clip_inset_right =
+            overflow_clip_box == STYLE_OVERFLOW_CLIP_BORDER_BOX ? 0
+            : style->border.right
+              + (overflow_clip_box == STYLE_OVERFLOW_CLIP_CONTENT_BOX
+                 ? style->padding.right : 0);
+        int overflow_clip_inset_bottom =
+            overflow_clip_box == STYLE_OVERFLOW_CLIP_BORDER_BOX ? 0
+            : style->border.bottom
+              + (overflow_clip_box == STYLE_OVERFLOW_CLIP_CONTENT_BOX
+                 ? style->padding.bottom : 0);
+        /* A clip-path never makes a scroll container: an axis clipped only
+           by the path stays at scroll offset zero. */
+        if (!clips_x) clip_only_x = true;
+        if (!clips_y) clip_only_y = true;
         clips_x = true;
         clips_y = true;
         unsigned clip_path_inset = computed_style_clip_path_inset(style);
-        int inset = (style->clip_path_state
-                     & STYLE_CLIP_PATH_INSET_PERCENT) != 0
-            ? ((outer_width < border_height ? outer_width : border_height)
-               * (int) clip_path_inset / 100)
+        bool percent = (style->clip_path_state
+                        & STYLE_CLIP_PATH_INSET_PERCENT) != 0;
+        unsigned used_percent = clip_path_inset < 50u ? clip_path_inset : 50u;
+        int inset_x = percent
+            ? (int) ((int64_t) outer_width * used_percent / 100)
             : (int) clip_path_inset;
-        if (clip_path_type == STYLE_CLIP_PATH_CIRCLE) inset = 0;
-        if (inset > overflow_clip_inset_left) {
-            overflow_clip_inset_left = inset;
+        int inset_y = percent
+            ? (int) ((int64_t) border_height * used_percent / 100)
+            : (int) clip_path_inset;
+        if (clip_path_type == STYLE_CLIP_PATH_CIRCLE) {
+            inset_x = inset_y = 0;
+        } else {
+            /* Test the authored percentage before pixel rounding: half of
+               an odd one-pixel box still leaves no visible area. */
+            clip_path_empty = percent ? clip_path_inset >= 50u
+                : inset_x >= outer_width - inset_x
+                    || inset_y >= border_height - inset_y;
         }
-        if (inset > overflow_clip_inset_top) {
-            overflow_clip_inset_top = inset;
-        }
-        int path_width = outer_width - 2 * inset;
-        int path_height = border_height - 2 * inset;
+        int path_width = outer_width - 2 * inset_x;
+        int path_height = border_height - 2 * inset_y;
         int path_radius = clip_path_type == STYLE_CLIP_PATH_CIRCLE
             ? (path_width < path_height ? path_width : path_height) / 2
             : (int) computed_style_clip_path_radius(style);
+        /* The clip-path reference box is the border box. One clip region
+           serves the box, so it is exact when the box's own overflow edge,
+           if any, is that border box too. */
+        bool path_exact = !overflow_clips
+            || (overflow_clip_inset_left == 0 && overflow_clip_inset_right == 0
+                && overflow_clip_inset_top == 0
+                && overflow_clip_inset_bottom == 0);
+        if (path_exact) {
+            overflow_clip_inset_left = inset_x;
+            overflow_clip_inset_top = inset_y;
+            if (!overflow_clips) clip_radius = 0;
+        } else if (inset_x <= overflow_clip_inset_left
+                   && inset_x <= overflow_clip_inset_right
+                   && inset_y <= overflow_clip_inset_top
+                   && inset_y <= overflow_clip_inset_bottom) {
+            /* The path encloses the overflow clip edge, which therefore
+               bounds the descendants alone, asymmetric borders included. */
+            clip_path_box = overflow_clip_box;
+        } else {
+            /* Approximate the intersection symmetrically. */
+            clip_path_box = STYLE_OVERFLOW_CLIP_CONTENT_BOX;
+            if (inset_x > overflow_clip_inset_left) {
+                overflow_clip_inset_left = inset_x;
+            }
+            if (inset_y > overflow_clip_inset_top) {
+                overflow_clip_inset_top = inset_y;
+            }
+        }
         if (path_radius > style_border_radius_maximum(clip_radius)) {
             clip_radius = path_radius;
+        }
+        /* Unlike overflow, a clip-path applies to the element's own
+           background, border, outline and native control ink as well. That
+           paint shares the clip only when the region is the path itself and
+           no scroll offset can move it; an empty path hides everything. */
+        if (clip_path_empty || (path_exact && !overflow_scrolls)) {
+            scroll_command_start = node_command_start;
+            scroll_command_end = context->layout->count;
         }
     }
     if (context->positioned_height_job_count != 0
@@ -2983,8 +3046,7 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
                       clips_x, clips_y,
                       clip_radius, style->overflow_clip_margin,
                       overflow_clip_inset_left, overflow_clip_inset_top,
-                      style->overflow_x_clip_only,
-                      style->overflow_y_clip_only,
+                      clip_only_x, clip_only_y,
                       positioned_ancestor_distance,
                       positioned_ancestor_distance == 0,
                       node_command_start, context->layout->count,
@@ -3013,7 +3075,13 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
     if (clip_path_type != STYLE_CLIP_PATH_NONE) {
         LayoutNodeBox *clip_box = layout_box_for_node_mutable(
             context->layout, node);
-        if (clip_box != NULL) clip_box->clip_path_clip = 1;
+        if (clip_box != NULL) {
+            clip_box->clip_path_clip = 1;
+            layout_node_box_set_clip_geometry(clip_box,
+                layout_node_box_clip_radius(clip_box), 0,
+                clip_path_empty ? (StyleOverflowClipBox) LAYOUT_NODE_CLIP_EMPTY
+                                : clip_path_box);
+        }
         /* clip-path is not a containing block for fixed descendants, but it
            still clips them (CSS Masking 5.1). A viewport-fixed descendant
            therefore shows only where this box's clip region is on screen,

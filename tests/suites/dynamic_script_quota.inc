@@ -896,6 +896,75 @@ cleanup:
     return ok;
 }
 
+/* A streamed RPC fetch() stayed open for minutes while the
+   consent manager's next fetch() sat at the head of the realm's FIFO, and
+   the IVS player's worker script behind it. With a per-response bound above
+   half the realm's 2 MiB fetch pool (the PSP app's 4 MiB), one open request
+   filled the pool alone, and the head of the FIFO re-ran native admission
+   from a 10 ms timer for as long as it stayed open (905 trace lines for one
+   request). A long-lived request must leave room for the ones after it, and
+   a full pool waits for a completion rather than polling. */
+static bool test_open_fetch_does_not_starve_later_fetches(Budget *budget)
+{
+    const char *test_name = "an open fetch() does not starve later ones";
+    static const char empty_page[] =
+        "<!doctype html><head></head><body></body>";
+    static const char start_fetches[] =
+        "globalThis.fetchEvents=[];"
+        "const report=()=>{globalThis.pocSummary='fetch:'"
+        "+fetchEvents.join(',');};"
+        "fetch('/stream').then(r=>r.text()).then(()=>{"
+        "fetchEvents.push('stream');report();});"
+        "for(const name of ['a','b','c'])fetch('/'+name).then(r=>r.text())"
+        ".then(text=>{fetchEvents.push(text);report();},"
+        "error=>{fetchEvents.push('error:'+name);report();});"
+        "globalThis.pocSummary='fetch:pending';";
+    ScriptReplayRecord records[4] = {
+        {.url = "https://open-fetch.test/stream", .source = "stream",
+         .delay_pumps = 400, .fetch = true},
+        {.url = "https://open-fetch.test/a", .source = "a", .fetch = true},
+        {.url = "https://open-fetch.test/b", .source = "b", .fetch = true},
+        {.url = "https://open-fetch.test/c", .source = "c", .fetch = true}
+    };
+    char directory[128] = {0}, error[256] = {0};
+    BrowserSession browser = {0};
+    NavigationSession navigation = {0};
+    bool fixture_ready = false, replaying = false;
+    bool browser_ready = false, navigation_ready = false, ok = true;
+
+    REQUIRE(write_replay_fixture(directory, records, 4));
+    fixture_ready = true;
+    REQUIRE(fetch_trace_replay_begin(directory, error, sizeof(error)));
+    replaying = true;
+    REQUIRE(browser_session_init(&browser, budget, 1u * MIB));
+    browser_ready = true;
+    /* A 4 MiB file bound gives every fetch() a 4 MiB response bound,
+       twice the 2 MiB fetch pool. */
+    REQUIRE(start_custom_runtime_page(
+        &navigation, budget, &browser, "https://open-fetch.test/",
+        empty_page, 8, 16u * MIB, 4u * MIB));
+    navigation_ready = true;
+    REQUIRE(evaluate(&navigation, start_fetches, "<open-fetch>"));
+    size_t advances = 0;
+    /* All three finish while the stream is still open. */
+    REQUIRE(advance_until(&navigation, "fetch:a,b,c", 48, &advances));
+    REQUIRE(navigation.page.script_result.async_network_completed == 3u);
+    REQUIRE(navigation.page.script_result.network_failures == 0u);
+    REQUIRE(advance_until(&navigation, "fetch:a,b,c,stream", 800, &advances));
+
+cleanup:
+    if (navigation_ready) navigation_destroy(&navigation);
+    if (browser_ready) browser_session_destroy(&browser);
+    if (replaying) fetch_trace_end();
+    if (fixture_ready) remove_replay_fixture(directory, 4);
+    if (budget->current != 0) {
+        fprintf(stderr, "%s leaked %zu owned bytes\n", test_name,
+                budget->current);
+        ok = false;
+    }
+    return ok;
+}
+
 /* A script admitted on the planned (median) compile working set whose
    compile needs far more is stopped by the realm's heap limit and refused
    like a script that never fit: an error event on its element, no realm
@@ -1861,6 +1930,130 @@ static bool run_static_dynamic_shared_quota_case(
 cleanup:
     if (navigation_ready) navigation_destroy(&navigation);
     if (browser_ready) browser_session_destroy(&browser);
+    if (budget->current != 0) {
+        fprintf(stderr, "%s leaked %zu owned bytes\n", test_name,
+                budget->current);
+        ok = false;
+    }
+    return ok;
+}
+
+/* A selected video takes the page's network (navigation_hold_network_work;
+   the PSP app holds it while the player is up). On a slow network a page
+   had four code-split chunks in flight when Play was pressed; they kept
+   their worker slots and failed a minute later. A held page requeues an
+   in-flight dynamic script (its slot is freed and it neither loads nor
+   errors), keeps fetch() issued meanwhile queued, and leaves schedulers
+   outside its domain (the player's) alone. Release resumes both, in order,
+   so the page continues as if the network had been slow. */
+static bool test_media_hold_requeues_page_network(Budget *budget)
+{
+    const char *test_name = "a media hold requeues page network work";
+    static const char empty_page[] =
+        "<!doctype html><head></head><body></body>";
+    static const char start_chunk[] =
+        "globalThis.events=[];"
+        "const report=()=>{globalThis.pocSummary='hold:'+events.join(',');};"
+        "const chunk=document.createElement('script');chunk.src='/chunk.js';"
+        "chunk.addEventListener('load',()=>{events.push('load');report();});"
+        "chunk.addEventListener('error',()=>{events.push('error');report();});"
+        "document.head.appendChild(chunk);"
+        "globalThis.startFetch=()=>fetch('/data').then(r=>r.text()).then("
+        "text=>{events.push(text);report();},"
+        "()=>{events.push('fetch-error');report();});"
+        "globalThis.pocSummary='hold:pending';";
+    static const char chunk_source[] = "events.push('ran');";
+    ScriptReplayRecord records[4] = {
+        {.url = "https://media-hold.test/chunk.js", .source = chunk_source,
+         .delay_pumps = 100000},
+        {.url = "https://media-hold.test/chunk.js", .source = chunk_source},
+        {.url = "https://media.test/video.m3u8", .source = "#EXTM3U\n"},
+        {.url = "https://media-hold.test/data", .source = "data",
+         .fetch = true}
+    };
+    char directory[128] = {0}, error[256] = {0};
+    BrowserSession browser = {0};
+    NavigationSession navigation = {0};
+    FetchScheduler *player = NULL;
+    FetchResult *fetched = NULL;
+    bool fixture_ready = false, replaying = false;
+    bool browser_ready = false, navigation_ready = false, ok = true;
+
+    REQUIRE(write_replay_fixture(directory, records, 4));
+    fixture_ready = true;
+    REQUIRE(fetch_trace_replay_begin(directory, error, sizeof(error)));
+    replaying = true;
+    REQUIRE(browser_session_init(&browser, budget, 1u * MIB));
+    browser_ready = true;
+    REQUIRE(start_custom_runtime_page(
+        &navigation, budget, &browser, "https://media-hold.test/",
+        empty_page, 8, 4u * MIB, 1u * MIB));
+    navigation_ready = true;
+    REQUIRE(evaluate(&navigation, start_chunk, "<media-hold>"));
+    FetchScheduler *realm =
+        script_runtime_fetch_scheduler(navigation.page.runtime);
+    REQUIRE(realm != NULL && navigation.page.fetch_domain != NULL);
+    for (size_t step = 0; step < 16 && fetch_scheduler_pending(realm) == 0;
+         step++) {
+        REQUIRE(navigation_advance_runtime(&navigation, 1, 1));
+    }
+    FetchSchedulerDomainMetrics domain = {0};
+    REQUIRE(fetch_scheduler_pending(realm) == 1u
+            && fetch_scheduler_domain_metrics(
+                   navigation.page.fetch_domain, &domain)
+            && domain.active_slots == 1u);
+
+    REQUIRE(navigation_hold_network_work(&navigation, "video selected")
+            == 1u);
+    REQUIRE(fetch_scheduler_pending(realm) == 0u
+            && fetch_scheduler_domain_metrics(
+                   navigation.page.fetch_domain, &domain)
+            && domain.active_slots == 0u
+            && fetch_scheduler_held(realm)
+            && navigation.page.script_result.dynamic_scripts_cancelled == 0u);
+
+    /* The player's scheduler is outside the page domain. */
+    player = fetch_scheduler_create(budget, 1, 64u * 1024u);
+    FetchRequest request = {
+        .method = "GET", .allow_http_errors = true,
+        .send_low_client_hints = true
+    };
+    uint64_t media = player == NULL ? 0 : fetch_scheduler_enqueue(
+        player, records[2].url, &request, 64u * 1024u, 5000);
+    REQUIRE(media != 0);
+    fetched = fetch_result_create(budget);
+    REQUIRE(fetched != NULL);
+    bool success = false, taken = false;
+    for (size_t step = 0; step < 8 && !taken; step++) {
+        (void) fetch_scheduler_pump(player, 1, 0);
+        taken = fetch_scheduler_take(player, media, &success, fetched);
+    }
+    REQUIRE(taken && success && fetched->status_code == 200);
+
+    /* The page keeps running; a fetch() it issues waits with the chunk. */
+    REQUIRE(evaluate(&navigation, "startFetch();", "<media-hold-fetch>"));
+    for (size_t step = 0; step < 600; step++)
+        REQUIRE(navigation_advance_runtime(&navigation, 1, 1));
+    REQUIRE(strcmp(navigation.page.script_result.summary, "hold:pending") == 0
+            && fetch_scheduler_pending(realm) == 0u
+            && fetch_scheduler_domain_metrics(
+                   navigation.page.fetch_domain, &domain)
+            && domain.active_slots == 0u
+            && navigation.page.script_result.network_failures == 0u);
+
+    fetch_scheduler_domain_set_held(navigation.page.fetch_domain, false);
+    size_t advances = 0;
+    REQUIRE(advance_until(&navigation, "hold:ran,load,data", 800, &advances));
+    REQUIRE(navigation.page.script_result.network_failures == 0u
+            && navigation.page.script_result.dynamic_scripts_cancelled == 0u);
+
+cleanup:
+    fetch_result_free(fetched);
+    fetch_scheduler_destroy(player);
+    if (navigation_ready) navigation_destroy(&navigation);
+    if (browser_ready) browser_session_destroy(&browser);
+    if (replaying) fetch_trace_end();
+    if (fixture_ready) remove_replay_fixture(directory, 4);
     if (budget->current != 0) {
         fprintf(stderr, "%s leaked %zu owned bytes\n", test_name,
                 budget->current);

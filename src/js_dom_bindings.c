@@ -3359,16 +3359,26 @@ static bool bridge_replace_inner_html(
     return valid;
 }
 
+bool script_runtime_replace_element_inner_html(
+    ScriptRuntime *runtime, PocDocument *document, lxb_dom_node_t *element,
+    const char *markup, size_t length)
+{
+    if (runtime == NULL || document == NULL || element == NULL
+        || runtime->document != document
+        || runtime->bridge.document != document
+        || document->html == NULL
+        || element->owner_document != &document->html->dom_document)
+        return false;
+    return bridge_replace_inner_html(
+        &runtime->bridge, element, markup, length, false, NULL, 0);
+}
+
 bool script_runtime_replace_document_body(
     ScriptRuntime *runtime, PocDocument *document,
     const char *markup, size_t length)
 {
-    if (runtime == NULL || document == NULL
-        || runtime->document != document
-        || runtime->bridge.document != document) return false;
-    lxb_dom_node_t *body = document_body_node(document);
-    return bridge_replace_inner_html(
-        &runtime->bridge, body, markup, length, false, NULL, 0);
+    return script_runtime_replace_element_inner_html(
+        runtime, document, document_body_node(document), markup, length);
 }
 
 JSValue js_dom_set_inner_html(JSContext *context,

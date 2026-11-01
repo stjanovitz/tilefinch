@@ -190,18 +190,3 @@ static bool lite_html_chapters(YoutubeLiteHtml *html, const YoutubeLiteWatch *wa
     }
     return ok && lite_html_text(html, "</details>");
 }
-
-static void lite_chapters_parse(YoutubeLiteWatch *watch, const char *data, size_t length)
-{
-    if (data == NULL) return;
-    size_t offset = 0;
-    for (unsigned steps = 0; offset < length && steps < 4096
-        && watch->chapter_count < YOUTUBE_LITE_MAXIMUM_CHAPTERS; steps++) {
-        size_t window = length - offset;
-        if (window > 48u * 1024u) window = 48u * 1024u;
-        YoutubeLiteSpan scope = {data + offset, data + offset + window};
-        const char *after = lite_chapter_next(watch, &scope);
-        offset = after ? (size_t) (after - data)
-            : window == length - offset ? length : offset + 16u * 1024u;
-    }
-}

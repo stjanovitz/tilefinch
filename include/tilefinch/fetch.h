@@ -436,6 +436,38 @@ const TilefinchRequestContext *fetch_prepared_page_request_context(
 bool fetch_request_security_allows_target(
     const FetchRequest *request, const char *target_url);
 
+/*
+ * One redirect hop for a page-originated request (a prepared page request)
+ * whose hops run outside FetchScheduler, such as the PSP media worker streams
+ * that do not follow redirects themselves. `response` is the redirect's
+ * header snapshot and `current_url` the URL that produced it. The Location
+ * target is resolved, HSTS-upgraded and admitted under exactly the per-hop
+ * rules the scheduler applies (mixed content, CSP for the request's
+ * destination, captive portal, blocked origins, content blocker), and
+ * written to `next`. `block_private_network` reports whether the next hop
+ * must refuse private-network peers. The caller bounds the hop count, and
+ * builds the next hop's request (cookie, Referer) through the page request
+ * boundary for `next`; nothing from the previous hop is forwarded. Only
+ * body-less GET requests may use this.
+ */
+bool fetch_page_redirect_next(
+    const FetchRequest *page_request, const char *current_url,
+    const FetchResult *response, char *next, size_t next_size,
+    bool *block_private_network);
+
+/*
+ * The first hop of the same kind of page request: `target` (the prepared
+ * request's own target) is HSTS-upgraded, passive mixed content is
+ * auto-upgraded, and the result is admitted under the gate
+ * fetch_page_redirect_next applies to every later hop. On success `target`
+ * is rewritten in place to the admitted URL and `block_private_network`
+ * reports whether the hop must refuse private-network peers, computed as
+ * the scheduler computes it for an enqueued request.
+ */
+bool fetch_page_request_first_hop(
+    const FetchRequest *page_request, char *target, size_t target_size,
+    bool *block_private_network);
+
 /* Applies the transport/replay request-injection boundary without allocating.
    A NULL request is the canonical default GET request. */
 bool fetch_request_validate(
@@ -732,6 +764,13 @@ uint64_t fetch_background_transport_enqueue_hop_stream(
 bool fetch_background_transport_hop_supported(
     const char *url, const FetchRequest *request,
     size_t maximum_bytes, long timeout_ms);
+/* The same single hop with the foreground-media slot priority and a chosen
+   publication quantum: a 3xx is returned to the caller unfollowed, whose
+   browser-thread policy (fetch_page_redirect_next) decides the next hop. */
+uint64_t fetch_background_transport_enqueue_media_hop_stream_sized_diagnosed(
+    const char *url, const FetchRequest *request,
+    size_t maximum_bytes, long timeout_ms, size_t publication_bytes,
+    FetchBackgroundEnqueueStatus *status);
 bool fetch_background_transport_progress(
     uint64_t request_id, FetchBackgroundProgress *progress);
 bool fetch_background_transport_metrics(
@@ -1151,6 +1190,14 @@ bool fetch_scheduler_domain_metrics(
 FetchScheduler *fetch_scheduler_create_in_domain(
     FetchSchedulerDomain *domain, size_t maximum_concurrent,
     size_t maximum_reserved_bytes);
+/* A held domain admits no new request on any of its schedulers: enqueue
+   refuses ("page network held") and fetch_scheduler_enqueue_would_block
+   reports backpressure, so callers that defer on it keep their requests
+   queued until the hold is released. Requests already admitted are not
+   touched; the holder cancels or requeues those itself. */
+void fetch_scheduler_domain_set_held(FetchSchedulerDomain *domain,
+                                     bool held);
+bool fetch_scheduler_held(const FetchScheduler *scheduler);
 /* Page-resource views may be empty. Retain their bounded scheduling state
    now, but acquire curl/worker state only for the first accepted request.
    A refused transport setup leaves the view reusable for a later retry. */
@@ -1162,6 +1209,13 @@ FetchScheduler *fetch_scheduler_create_deferred_in_domain(
    first without silently reducing the wider page-resource concurrency. */
 bool fetch_scheduler_enable_background_transport(
     FetchScheduler *scheduler, bool enabled);
+/* Page media ranges: issue this scheduler's worker hops with the
+   foreground-media descriptor priority (the two descriptors reserved while a
+   player route is active) and the given publication quantum, so a busy page
+   cannot starve its own selected video. The browser-thread hop policy is
+   unchanged. Zero restores ordinary page hops. Only while idle. */
+bool fetch_scheduler_set_background_media_hops(
+    FetchScheduler *scheduler, size_t publication_bytes);
 uint64_t fetch_scheduler_enqueue(FetchScheduler *scheduler, const char *url,
                                  const FetchRequest *request,
                                  size_t maximum_bytes, long timeout_ms);
@@ -1297,6 +1351,14 @@ typedef struct {
     size_t occurrence_claim_count;
     size_t reusable_claim_count;
     size_t occurrence_exhausted_count;
+    /* Media replay: requests the background-transport replay lane took and
+       served, Range requests answered by a window of a stored body, and
+       media requests served through an effective-URL or query alias. Media
+       records are reusable (reusable_claim_count). */
+    size_t media_lane_request_count;
+    size_t media_lane_served_count;
+    size_t range_slice_count;
+    size_t media_alias_count;
 } FetchTraceReplayStats;
 /* Read-only lab diagnostics for an active replay. claimed_record_count counts
    unique record IDs, while reusable_claim_count can resolve one claimed ID
@@ -1313,6 +1375,16 @@ size_t fetch_trace_replay_served_count(void);
 void fetch_trace_replay_io(uint64_t *opens, uint64_t *reads,
                            uint64_t *bytes, uint64_t *us);
 
+#if !defined(__PSP__)
+/* Host recording (the lab's record-page-media): while an HTTP capture is
+   active, let page media fetch through the background-transport API, each
+   request performed synchronously through the captured fetch path, so the
+   capture holds exactly the media requests a device replay will make. A
+   nonzero byte_limit bounds the captured media bytes. False when enabling
+   without an active capture. */
+bool fetch_trace_media_capture(bool enabled, uint64_t byte_limit);
+uint64_t fetch_trace_media_captured_bytes(void);
+#endif
 /* True while a hermetic HTTP replay is active.  Consumers may treat
    stale cache entries as authoritative: revalidating against a trace
    whose records are already claimed can only fail, and replay time is

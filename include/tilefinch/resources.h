@@ -272,6 +272,10 @@ typedef struct ImageResource {
        refresh commit verifies the lender is still present, hands ownership
        over when the lender retires, and clears the bit. */
     bool borrows_previous;
+    /* The pixels were handed in by a producer outside the loader (a video
+       decoder or a frame snapshot), which keeps writing to them. A priority
+       load rolling back its own suffix keeps such an entry. */
+    bool adopted_surface;
     /* Display retargeting (src/image_retarget.c) once layout knows the
        painted size: the decoded size before the first retarget (zero until
        then; the surface never grows past it) and IMAGE_RETARGET_* state. */
@@ -296,6 +300,10 @@ typedef struct ImageResource {
    symbol or an inline <svg> serialization): decoding rasterizes them at the
    resource's width x height, which may be above its first raster's size. */
 #define IMAGE_RETARGET_VECTOR UINT8_C(32)
+/* With DROPPED: a load left it encoded for the layout that follows, which
+   decodes it at its painted size before that layout is painted
+   (images_retarget_decode_awaiting). */
+#define IMAGE_RETARGET_AWAITING_LAYOUT UINT8_C(64)
 
 typedef enum {
     IMAGE_CANVAS_COMMIT_REFUSED = 0,
@@ -437,7 +445,15 @@ typedef struct {
     size_t failure_capacity;
     uint32_t failure_serial;
     bool priority_staged;
+    /* Lent for one pass of loading (images_set_layout_boxes): element boxes
+       from the page's last layout, so a CSS background raster is decoded at
+       the size that layout paints it rather than at its source size. NULL
+       when no layout is known. */
+    struct ImageLayoutBoxes *layout_boxes;
 } ImageResources;
+
+/* A layout's element boxes lent to image loading (tilefinch/layout.h). */
+typedef struct ImageLayoutBoxes ImageLayoutBoxes;
 
 /* Alias insertion can outgrow the bounded resource table after a layout has
    retained pointers into it. Keep the previous table alive until that layout
@@ -468,7 +484,9 @@ typedef struct {
        Zero denotes the existing immutable/static-layout contract. */
     long weak_handle;
     /* Authoritative visual-pixel box from a bounded layout. Zero means the
-       loader must retain its ordinary viewport/source policy. */
+       loader must retain its ordinary viewport/source policy. For a
+       single-layer element background (background_sized) it is instead the
+       element's border box in CSS pixels, the area its tile is sized in. */
     uint16_t display_width;
     uint16_t display_height;
     uint8_t kind;
@@ -478,10 +496,18 @@ typedef struct {
        structure's existing alignment tail on both PSP and host builds. */
     uint8_t retry_count;
     uint8_t retry_delay;
+    /* A single-layer element background as the recording layout sizes it:
+       its background-size and fit (layout_background_raster_size), so the
+       loader decodes one painted tile rather than a viewport-wide copy. */
+    uint16_t background_size_width;
+    uint16_t background_size_height;
+    uint8_t background_size_flags;
+    uint8_t background_fit;
+    bool background_sized;
 } ImagePriorityTarget;
 
 _Static_assert(
-    sizeof(ImagePriorityTarget) == 2u * sizeof(void *) + sizeof(long) + 8u,
+    sizeof(ImagePriorityTarget) == 2u * sizeof(void *) + sizeof(long) + 16u,
     "deferred image targets retain one bounded native weak identity");
 
 typedef enum {
@@ -572,6 +598,58 @@ bool stylesheets_load_external_tracked_with_context(
     long timeout_ms, FetchScheduler *scheduler, BrowserSession *session,
     StylesheetDocumentResources *resources,
     ExternalStylesheetStats *stats);
+/* A sliced stylesheet pass: with `deferral` (minimum_bytes nonzero) the
+   loaders below parse no external sheet of at least minimum_bytes (and
+   below the large-source policy size) in place. They fetch, account and
+   record it as usual, start a StyleCssSlicedParse for it, and stop the
+   pass right after it, so later sources keep their cascade order. The
+   caller steps the parse to completion, then appends the remaining
+   sources (from the node after `element`) with the suffix loader. Links
+   are fetched one at a time in such a pass; it is meant for sheets whose
+   responses have already settled. Adopted sheets are never processed in a
+   pass that stopped. A pass that stops leaves its rule batch open; the
+   deferred parse and later sliced suffix passes continue in it, and the
+   caller ends it (stylesheet_end_rule_batch) once the sheet is complete. */
+typedef struct {
+    size_t minimum_bytes;
+    StyleCssSlicedParse *parse;
+    BrowserSharedBody *body;
+    unsigned char *copy;
+    Budget *budget;
+    Stylesheet *sheet;
+    /* The <link> whose sheet is being parsed. */
+    lxb_dom_node_t *element;
+    size_t rules_before;
+    size_t variables_before;
+} StylesheetParseDeferral;
+bool stylesheets_load_external_sliced(
+    const PocDocument *document, Stylesheet *sheet, Budget *budget,
+    const char *base_url, const char *document_url,
+    const char *document_referrer_policy, size_t maximum_count,
+    size_t maximum_total_bytes, size_t maximum_single_bytes,
+    long timeout_ms, FetchScheduler *scheduler, BrowserSession *session,
+    StylesheetDocumentResources *resources,
+    ExternalStylesheetStats *stats, StylesheetParseDeferral *deferral);
+/* The suffix loader of a sliced pass. `consumed` receives how many of
+   `nodes` were processed: all of them, or through the one whose parse was
+   deferred. */
+bool stylesheets_append_ordered_suffix_sliced(
+    Stylesheet *sheet, Budget *budget, lxb_dom_node_t *const *nodes,
+    size_t node_count, const char *base_url, const char *document_url,
+    const char *document_referrer_policy,
+    const TilefinchContentSecurityPolicy *content_security_policy,
+    size_t maximum_count,
+    size_t maximum_total_bytes, size_t maximum_single_bytes,
+    long timeout_ms, FetchScheduler *scheduler, BrowserSession *session,
+    StylesheetDocumentResources *resources,
+    ExternalStylesheetStats *stats, StylesheetParseDeferral *deferral,
+    size_t *consumed);
+/* Steps a deferred parse; DONE adds its rules to `stats`. */
+StyleCssSliceResult stylesheet_parse_deferral_step(
+    StylesheetParseDeferral *deferral, uint64_t deadline_us,
+    ExternalStylesheetStats *stats);
+/* Ends any deferred parse (finished or not) and frees its source. */
+void stylesheet_parse_deferral_release(StylesheetParseDeferral *deferral);
 /* Extends an already ordered author sheet with a newly parsed source-order
    suffix. Unlike the full loader this never resets prefix rules; links,
    inline blocks, and @imports still share the ordinary bounded fetch and
@@ -995,5 +1073,10 @@ unsigned char *image_resource_decode(const ImageResource *image,
                                      Budget *budget);
 void image_resource_free_decoded(Budget *budget, unsigned char *pixels);
 void images_destroy(ImageResources *images);
+/* Lend `boxes` (or NULL) to the next load calls on `images`; the caller
+   clears it again before freeing the boxes. A rebuild hands it on to its
+   replacement table. */
+void images_set_layout_boxes(ImageResources *images,
+                             struct ImageLayoutBoxes *boxes);
 
 #endif

@@ -16,3 +16,10 @@ int youtube_lite_test_feed_authentication(const char *json, size_t length)
         || !lite_json_member(&root, "responseContext", &context)) return 0;
     return lite_feed_authentication(&context);
 }
+
+bool youtube_lite_test_build_signed_in(Budget *budget, const char *url,
+    const char *source, size_t length, YoutubeLiteDocument *document)
+{
+    return lite_build_document_with_comments_decoded(budget, url, source,
+        length, NULL, 0, document, NULL, 0, NULL, 0, true);
+}

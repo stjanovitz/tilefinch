@@ -57,6 +57,23 @@ real completion detection, real admission checks.
             throughput floor; it must complete without a reconnect.
   stall-window  permanently stalls one demanded logical window while other
             offsets remain healthy, proving terminal failure and fresh scope.
+  fragment206  the fragmented movie answered as 206 partials, the shape a
+            page video's standard Range requests receive.
+  xredirect/MODE  a page video URL that answers 302 with the same object on
+            another origin (localhost instead of 127.0.0.1, same port), the
+            way page media commonly redirects to a CDN.
+  xredirect-host/HOST/MODE  the same redirect to a named loopback host
+            (a *.localhost name, which the resolver maps to loopback).
+  xredirect-ftp, xredirect-credentials  redirects to a disallowed scheme and
+            to a URL carrying credentials; neither target may be requested.
+  refused-sink  the target of every redirect a policy must refuse (CSP,
+            content blocker, credentials). Any request to it fails the run.
+  probe/KIND  an extensionless address honouring Range that answers an HLS
+            playlist as text/plain, octet-stream, or (gated) octet-stream
+            with a Set-Cookie its next request must carry.
+  xredirect-loop/N  302s back and forth between the two origins forever. The
+            longest chain requested is recorded and checked after the run:
+            the source follows the eight-hop limit and stops.
 """
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from subprocess import run
@@ -308,10 +325,99 @@ class RangeHandler(BaseHTTPRequestHandler):
             else:
                 time.sleep(0.01)
 
+    def _probe(self, parts):
+        """An extensionless page-media address that honours Range, the way
+        a CDN does, and answers an HLS playlist with no HLS type."""
+        kind = parts[0] if parts else ""
+        types = {"text": "text/plain", "octet": "application/octet-stream",
+                 "gated": "application/octet-stream"}
+        if kind not in types:
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        cookie = self.headers.get("Cookie", "")
+        body = PROBE_PLAYLIST
+        span = self.headers.get("Range", "")
+        set_cookie = None
+        if kind == "gated":
+            # The playlist is admitted once, with a cookie; every later
+            # request (the HLS reopen) must carry that cookie.
+            if span.startswith("bytes="):
+                set_cookie = "probe-gate=open; Path=/probe"
+            elif "probe-gate=open" not in cookie:
+                self.send_response(403)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+        if span.startswith("bytes="):
+            first, _, last = span[len("bytes="):].partition("-")
+            first = int(first)
+            last = min(int(last), len(body) - 1)
+            payload = body[first:last + 1]
+            self.send_response(206)
+            self.send_header("Content-Range", "bytes %d-%d/%d" % (
+                first, last, len(body)))
+        else:
+            payload = body
+            self.send_response(200)
+        self.send_header("Content-Type", types[kind])
+        if set_cookie is not None:
+            self.send_header("Set-Cookie", set_cookie)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _cross_origin_redirect(self, mode, parts):
+        port = self.server.server_address[1]
+        if mode == "xredirect" and len(parts) >= 2:
+            location = (f"http://localhost:{port}/"
+                        + "/".join(parts[1:]))
+        elif mode == "xredirect-host" and len(parts) >= 3:
+            location = (f"http://{parts[1]}:{port}/"
+                        + "/".join(parts[2:]))
+        elif mode == "xredirect-ftp":
+            location = f"ftp://localhost:{port}/partial206/media.mp4"
+        elif mode == "xredirect-credentials":
+            location = (f"http://user:secret@localhost:{port}"
+                        "/refused-sink/media.mp4")
+        elif mode == "xredirect-loop" and len(parts) >= 2:
+            hop = int(parts[1])
+            with CROSS_REDIRECT_LOCK:
+                CROSS_REDIRECT_LONGEST[0] = max(
+                    CROSS_REDIRECT_LONGEST[0], hop)
+            host = self.headers.get("Host", "")
+            other = "localhost" if host.startswith("127.0.0.1") else (
+                "127.0.0.1")
+            location = f"http://{other}:{port}/xredirect-loop/{hop + 1}"
+        else:
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_GET(self):
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
-        mode = parsed.path.strip("/").split("/")[0]
+        parts = parsed.path.strip("/").split("/")
+        mode = parts[0]
+        if mode.startswith("xredirect"):
+            self._cross_origin_redirect(mode, parts)
+            return
+        if mode == "probe":
+            self._probe(parts[1:])
+            return
+        if mode == "refused-sink":
+            with CROSS_REDIRECT_LOCK:
+                REFUSED_SINK_REQUESTS[0] += 1
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if mode.startswith("cadence") and CADENCE_BODY is not None:
             body = CADENCE_BODY
         else:
@@ -363,7 +469,7 @@ class RangeHandler(BaseHTTPRequestHandler):
             # it proves readahead overlaps request setup rather than assuming
             # keep-alive always works.
             time.sleep(0.5)
-        if mode in ("partial206", "audio206", "bad206"):
+        if mode in ("partial206", "audio206", "bad206", "fragment206"):
             self.send_response(206)
             self.send_header(
                 "Content-Range", "bytes %d-%d/%d" % (
@@ -433,6 +539,18 @@ class RangeHandler(BaseHTTPRequestHandler):
             self.wfile.write(payload)
 
 
+# A small live playlist: smaller than the probe's range, as most are.
+PROBE_PLAYLIST = (b"#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:4\n"
+                  b"#EXT-X-MEDIA-SEQUENCE:7\n#EXTINF:4.0,\nsegment/7.ts\n")
+
+CROSS_REDIRECT_LOCK = Lock()
+CROSS_REDIRECT_LONGEST = [-1]
+# Every refused redirect target points here; nothing may ever arrive.
+REFUSED_SINK_REQUESTS = [0]
+# The eight-hop redirect limit: the chain's ninth request is never sent.
+CROSS_REDIRECT_HOP_LIMIT = 8
+
+
 class QuietServer(ThreadingHTTPServer):
     daemon_threads = True
 
@@ -498,7 +616,18 @@ def main():
         if completed.returncode != 0:
             print(f"media range test executable exited "
                   f"{completed.returncode}", file=sys.stderr)
-        return completed.returncode
+            return completed.returncode
+        if (CADENCE_BODY is None
+                and CROSS_REDIRECT_LONGEST[0] != CROSS_REDIRECT_HOP_LIMIT):
+            print("cross-origin redirect loop reached hop "
+                  f"{CROSS_REDIRECT_LONGEST[0]}, expected exactly "
+                  f"{CROSS_REDIRECT_HOP_LIMIT}", file=sys.stderr)
+            return 1
+        if REFUSED_SINK_REQUESTS[0] != 0:
+            print(f"{REFUSED_SINK_REQUESTS[0]} request(s) reached a refused "
+                  "redirect target", file=sys.stderr)
+            return 1
+        return 0
     finally:
         server.shutdown()
         server.server_close()

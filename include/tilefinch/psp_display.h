@@ -251,6 +251,12 @@ bool psp_display_video_begin(PspDisplay *display);
 bool psp_display_video_end(PspDisplay *display);
 bool psp_display_video_active(const PspDisplay *display);
 
+/* Observe every owner turn, including page/paused turns. A successful latch
+   supplies one pacing credit to an active player regardless of pixel format;
+   refused publications and already-consumed credits never bypass its wait. */
+bool psp_display_take_pacing_credit(const PspDisplay *display, bool playing,
+                                   unsigned *previous);
+
 /* Changes whenever video mode claims the EDRAM layout which aliases page
    WebGL's retained texture cache.  Cache users compare this generation before
    trusting metadata retained across routes. */

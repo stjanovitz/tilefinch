@@ -18,11 +18,12 @@ static PspNetworkStackState psp_network_lifecycle_stack(
     if (network->core_initialized && network->inet_initialized
         && network->resolver_initialized && network->apctl_initialized)
         return PSP_NETWORK_STACK_FULL;
-    if (network->common_loaded || network->inet_loaded
-        || network->core_initialized || network->inet_initialized
+    if (network->core_initialized || network->inet_initialized
         || network->resolver_initialized || network->apctl_initialized
         || network->connect_started)
         return PSP_NETWORK_STACK_PARTIAL;
+    if (network->common_loaded || network->inet_loaded)
+        return PSP_NETWORK_STACK_MODULES_ONLY;
     return PSP_NETWORK_STACK_NONE;
 }
 
@@ -359,9 +360,10 @@ void psp_network_lifecycle_report(PspNetworkLifecycle *lifecycle)
 bool psp_network_lifecycle_started(const PspNetworkLifecycle *lifecycle)
 {
     if (lifecycle == NULL) return false;
-    return lifecycle->machine.state != PSP_NETWORK_SUPERVISOR_OFF
+    return lifecycle->machine.stack == PSP_NETWORK_STACK_MODULES_ONLY
+        || (lifecycle->machine.state != PSP_NETWORK_SUPERVISOR_OFF
         && lifecycle->machine.state != PSP_NETWORK_SUPERVISOR_OFFLINE
-        && lifecycle->machine.state != PSP_NETWORK_SUPERVISOR_SUSPENDED_OFF;
+        && lifecycle->machine.state != PSP_NETWORK_SUPERVISOR_SUSPENDED_OFF);
 }
 
 bool psp_network_lifecycle_ready(const PspNetworkLifecycle *lifecycle)
@@ -925,6 +927,13 @@ static bool psp_network_lifecycle_pump_stopping(
         }
     }
     PspNetworkShutdownPhase previous_phase = lifecycle->shutdown.phase;
+    /* Reconnect needs fresh services, not fresh PRX mappings. Reloading the
+       utility modules with a live page/decoder heap can be refused by real
+       firmware. Preserve their ownership until ordinary shutdown instead.
+       Re-read the target before each unit so Cancel/exit still fully unloads. */
+    lifecycle->shutdown.retain_modules = lifecycle->machine.stopping_target
+        == PSP_NETWORK_STOP_TARGET_RESTART
+        || lifecycle->machine.stopping_target == PSP_NETWORK_STOP_TARGET_OFFLINE;
     bool complete = psp_network_shutdown_pump(
         network, &lifecycle->shutdown);
     if (previous_phase == PSP_NETWORK_SHUTDOWN_LEAVING
@@ -1012,6 +1021,7 @@ static bool psp_ensure_network_for_navigation_prepared(
     if (psp_network_lifecycle_ready(lifecycle)
         && network->status == PSP_NETWORK_READY) return true;
     if (psp_network_lifecycle_started(lifecycle)
+        && lifecycle->machine.stack != PSP_NETWORK_STACK_MODULES_ONLY
         && !psp_network_status_active(network->status)
         && !psp_network_lifecycle_needs_demand_recovery(lifecycle)) {
         if (!psp_shutdown_network_logged(network)) return false;

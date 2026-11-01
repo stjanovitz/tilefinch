@@ -27,6 +27,10 @@
 #include "tilefinch/fetch.h"
 #include "tilefinch/font.h"
 #include "tilefinch/host_media.h"
+#include "tilefinch/media_candidates.h"
+#ifdef TILEFINCH_HAVE_MEDIA_REPLAY_CHECK
+#include "tilefinch/media_replay_check.h"
+#endif
 #include "tilefinch/navigation.h"
 #include "tilefinch/platform.h"
 #include "tilefinch/psp_ui.h"
@@ -2513,7 +2517,9 @@ int main(int argc, char **argv)
            "signatures=%016llx/%016llx "
            "compiled-fingerprints=%016llx/%016llx "
            "fingerprint-us=%llu viewport-rebuilds=%zu "
-           "sheet-bounded-out=%u adopted-sources=%u\n",
+           "sheet-bounded-out=%u adopted-sources=%u "
+           "prepared=%zu/%zu prepare-pumps=%zu prepare-max-us=%llu "
+           "prepare-us=%llu\n",
            navigation.performance.blocking_stylesheet_builds,
            navigation.performance.blocking_stylesheet_reuses,
            navigation.performance.blocking_stylesheet_adoptions,
@@ -2554,7 +2560,14 @@ int main(int argc, char **argv)
               compiled-stylesheet cache, or past the style-source limit) is
               the SC-1 (f3b7438c) focus-gate condition. */
            navigation.page.stylesheet.style_sources_bounded_out ? 1u : 0u,
-           (unsigned) navigation.page.stylesheet.scopes.adopted_source_count);
+           (unsigned) navigation.page.stylesheet.scopes.adopted_source_count,
+           navigation.performance.blocking_stylesheet_prepared,
+           navigation.performance.blocking_stylesheet_prepare_abandoned,
+           navigation.performance.blocking_stylesheet_prepare_pumps,
+           (unsigned long long)
+             navigation.performance.blocking_stylesheet_prepare_max_step_us,
+           (unsigned long long)
+             navigation.performance.blocking_stylesheet_prepare_us);
     uint64_t parser_native_us =
         navigation.performance.parser_feed_us
             >= navigation.performance.parser_callback_us
@@ -2979,6 +2992,13 @@ int main(int argc, char **argv)
                js->external_script_bytecode_deferred_dropped,
                js->external_script_bytecode_pending_hits,
                js->external_script_bytecode_idle_store_us);
+        printf("javascript-script-bodies cache-releases=%zu "
+               "cache-released-bytes=%zu "
+               "sources-released=%zu sources-released-bytes=%zu\n",
+               js->script_body_cache_releases,
+               js->script_body_cache_released_bytes,
+               js->script_body_sources_released,
+               js->script_body_sources_released_bytes);
         printf("javascript-module-bytecode hits=%zu misses=%zu stores=%zu "
                "admission-skips=%zu restore-failures=%zu restored-bytes=%zu "
                "stored-bytes=%zu restore-us=%llu cache-bytes=%zu "

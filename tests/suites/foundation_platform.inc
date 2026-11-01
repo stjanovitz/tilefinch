@@ -1171,6 +1171,8 @@ static int test_youtube_portrait_renditions(void)
     return 0;
 }
 
+#include "youtube_channel_pages.inc"
+
 static int test_youtube_lite_lockup_cards(void)
 {
     /* Synthetic provider data, not a retained third-party response. A card
@@ -1225,6 +1227,160 @@ static int test_youtube_lite_lockup_cards(void)
     CHECK(strstr(document.html, "NOTVIDEO001") == NULL);
     CHECK(strstr(document.html, "WRONG000001") == NULL);
     CHECK(strstr(document.html, "NESTED00001") == NULL);
+    youtube_lite_document_destroy(&document);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
+/* Synthetic provider data. A live card shows the provider's LIVE label in
+   place of a length and keeps its "watching" count; a scheduled card shows
+   its own label and "Scheduled for" text and opens its page instead of the
+   player. Each provider shape is covered: the time-status overlay, the
+   desktop LIVE NOW badge, the lockup's live badge, and upcomingEventData
+   without an overlay. */
+static int test_youtube_lite_broadcast_cards(void)
+{
+    static const char source[] =
+        "<script>var ytInitialData = '{\"contents\":["
+        "{\"videoWithContextRenderer\":{\"videoId\":\"LIVENOW0001\","
+        "\"headline\":{\"runs\":[{\"text\":\"Newsroom\"}]},"
+        "\"shortViewCountText\":{\"runs\":[{\"text\":\"10K\"},"
+        "{\"text\":\" watching\"}]},"
+        "\"thumbnailOverlays\":[{\"thumbnailOverlayTimeStatusRenderer\":{"
+        "\"text\":{\"runs\":[{\"text\":\"EN DIRECT\"}]},\"style\":\"LIVE\"}}]}},"
+        "{\"compactVideoRenderer\":{\"videoId\":\"UPCOMING001\","
+        "\"title\":{\"runs\":[{\"text\":\"Launch\"}]},"
+        "\"shortViewCountText\":{\"runs\":[{\"text\":\"17\"},"
+        "{\"text\":\" waiting\"}]},"
+        "\"upcomingEventData\":{\"startTime\":\"1793269800\","
+        "\"upcomingEventText\":{\"runs\":[{\"text\":\"Scheduled for \"},"
+        "{\"text\":\"10/29/26, 10:30 AM\"}]}},"
+        "\"thumbnailOverlays\":[{\"thumbnailOverlayTimeStatusRenderer\":{"
+        "\"text\":{\"runs\":[{\"text\":\"Upcoming\"}]},\"style\":\"UPCOMING\"}}]}},"
+        "{\"videoRenderer\":{\"videoId\":\"LIVEBADGE01\","
+        "\"title\":{\"simpleText\":\"Desktop live\"},"
+        "\"badges\":[{\"metadataBadgeRenderer\":{\"style\":\"BADGE_STYLE_TYPE_NEW\","
+        "\"label\":\"New\"}},{\"metadataBadgeRenderer\":{"
+        "\"style\":\"BADGE_STYLE_TYPE_LIVE_NOW\",\"label\":\"LIVE\"}}]}},"
+        "{\"lockupViewModel\":{\"contentId\":\"LOCKLIVE001\","
+        "\"contentType\":\"LOCKUP_CONTENT_TYPE_VIDEO\","
+        "\"contentImage\":{\"thumbnailViewModel\":{\"overlays\":["
+        "{\"thumbnailBottomOverlayViewModel\":{\"badges\":["
+        "{\"thumbnailBadgeViewModel\":{\"text\":\"LIVE\","
+        "\"badgeStyle\":\"THUMBNAIL_OVERLAY_BADGE_STYLE_LIVE\"}}]}}]}},"
+        "\"metadata\":{\"lockupMetadataViewModel\":{"
+        "\"title\":{\"content\":\"Marble run\"}}}}},"
+        "{\"videoWithContextRenderer\":{\"videoId\":\"SCHEDULED01\","
+        "\"headline\":{\"runs\":[{\"text\":\"Premiere\"}]},"
+        "\"upcomingEventData\":{\"startTime\":\"1793269800\"}}},"
+        "{\"videoWithContextRenderer\":{\"videoId\":\"ORDINARY001\","
+        "\"headline\":{\"runs\":[{\"text\":\"Ordinary\"}]},"
+        "\"lengthText\":{\"runs\":[{\"text\":\"4:12\"}]},"
+        "\"shortViewCountText\":{\"runs\":[{\"text\":\"20K views\"}]},"
+        "\"thumbnailOverlays\":[{\"thumbnailOverlayTimeStatusRenderer\":{"
+        "\"text\":{\"runs\":[{\"text\":\"4:12\"}]},\"style\":\"DEFAULT\"}}]}}"
+        "]}';</script>";
+    Budget budget;
+    budget_init(&budget, 2 * MIB);
+    YoutubeLiteDocument document = {0};
+    char error[256] = {0};
+    CHECK(youtube_lite_build_document(
+        &budget, "https://www.youtube.com/results?search_query=fixture",
+        source, sizeof(source) - 1u, &document, error, sizeof(error)));
+    CHECK(document.result_count == 6u);
+    const char *html = document.html;
+    /* The card of one video ID: its row up to the next row. */
+    #define BROADCAST_CARD(id) strstr(html, "watch?v=" id "\"")
+    const char *live = BROADCAST_CARD("LIVENOW0001");
+    const char *upcoming = BROADCAST_CARD("UPCOMING001");
+    const char *badge = BROADCAST_CARD("LIVEBADGE01");
+    const char *lockup = BROADCAST_CARD("LOCKLIVE001");
+    const char *scheduled = BROADCAST_CARD("SCHEDULED01");
+    const char *ordinary = BROADCAST_CARD("ORDINARY001");
+    #undef BROADCAST_CARD
+    CHECK(live != NULL && upcoming != NULL && badge != NULL
+          && lockup != NULL && scheduled != NULL && ordinary != NULL);
+    CHECK(live < upcoming && upcoming < badge && badge < lockup
+          && lockup < scheduled && scheduled < ordinary);
+    const char *live_label = strstr(
+        live, "<span class=\"duration live\">EN DIRECT</span>");
+    CHECK(live_label != NULL && live_label < upcoming);
+    const char *watching = strstr(live, "10K watching");
+    CHECK(watching != NULL && watching < upcoming);
+    const char *waiting = strstr(upcoming, "17 waiting");
+    CHECK(waiting != NULL && waiting < badge);
+    const char *upcoming_label = strstr(
+        upcoming, "<span class=duration>Upcoming</span>");
+    CHECK(upcoming_label != NULL && upcoming_label < badge);
+    const char *when = strstr(upcoming, "Scheduled for 10/29/26, 10:30 AM");
+    CHECK(when != NULL && when < badge);
+    const char *badge_label = strstr(
+        badge, "<span class=\"duration live\">LIVE</span>");
+    CHECK(badge_label != NULL && badge_label < lockup);
+    const char *lockup_label = strstr(
+        lockup, "<span class=\"duration live\">LIVE</span>");
+    CHECK(lockup_label != NULL && lockup_label < scheduled);
+    CHECK(strstr(html, "<span class=duration>4:12</span>") != NULL);
+    CHECK(strstr(html, "duration live\">4:12") == NULL);
+    /* Every card but the two scheduled ones opens the player. */
+    CHECK(strstr(html, "data-tilefinch-provider-media href=\""
+                       "https://www.youtube.com/watch?v=LIVENOW0001") != NULL);
+    CHECK(strstr(html, "data-tilefinch-provider-media href=\""
+                       "https://www.youtube.com/watch?v=LOCKLIVE001") != NULL);
+    CHECK(strstr(html, "data-tilefinch-provider-media href=\""
+                       "https://www.youtube.com/watch?v=ORDINARY001") != NULL);
+    CHECK(strstr(html, "<a class=card href=\""
+                       "https://www.youtube.com/watch?v=UPCOMING001") != NULL);
+    CHECK(strstr(html, "<a class=card href=\""
+                       "https://www.youtube.com/watch?v=SCHEDULED01") != NULL);
+    youtube_lite_document_destroy(&document);
+    /* A live broadcast's watch page reports a length of 0; it shows none. */
+    static const char live_watch[] =
+        "<script>var ytInitialPlayerResponse = {"
+        "\"videoDetails\":{\"videoId\":\"LIVENOW0001\","
+        "\"title\":\"Newsroom\",\"author\":\"Fixture channel\","
+        "\"lengthSeconds\":\"0\",\"isLive\":true,"
+        "\"isLiveContent\":true}};</script>";
+    CHECK(youtube_lite_build_document(
+        &budget, "https://www.youtube.com/watch?v=LIVENOW0001",
+        live_watch, sizeof(live_watch) - 1u, &document,
+        error, sizeof(error)));
+    CHECK(strstr(document.html, "Newsroom") != NULL
+          && strstr(document.html, "0:00") == NULL);
+    youtube_lite_document_destroy(&document);
+    /* Up next suggestions go through the same classifier and badge. */
+    static const char up_next[] =
+        "<script>var ytInitialData='{\"contents\":["
+        "{\"compactVideoRenderer\":{\"videoId\":\"NEXTLIVE001\","
+        "\"title\":{\"simpleText\":\"Next live\"},"
+        "\"thumbnailOverlays\":[{\"thumbnailOverlayTimeStatusRenderer\":{"
+        "\"text\":{\"runs\":[{\"text\":\"LIVE\"}]},\"style\":\"LIVE\"}}]}},"
+        "{\"lockupViewModel\":{\"contentId\":\"NEXTLOCK001\","
+        "\"contentType\":\"LOCKUP_CONTENT_TYPE_VIDEO\","
+        "\"contentImage\":{\"thumbnailViewModel\":{\"overlays\":["
+        "{\"thumbnailBottomOverlayViewModel\":{\"badges\":["
+        "{\"thumbnailBadgeViewModel\":{\"text\":\"LIVE\","
+        "\"badgeStyle\":\"THUMBNAIL_OVERLAY_BADGE_STYLE_LIVE\"}}]}}]}},"
+        "\"metadata\":{\"lockupMetadataViewModel\":{"
+        "\"title\":{\"content\":\"Next lockup\"}}}}}"
+        "]}';</script>"
+        "<script>var ytInitialPlayerResponse={\"videoDetails\":{"
+        "\"videoId\":\"TFTEST00001\",\"title\":\"Watch fixture\","
+        "\"lengthSeconds\":\"200\"}};</script>";
+    CHECK(youtube_lite_build_document(
+        &budget,
+        "https://www.youtube.com/watch?v=TFTEST00001&tilefinch_view=details",
+        up_next, sizeof(up_next) - 1u, &document, error, sizeof(error)));
+    const char *next_heading = strstr(document.html, "<h2>Up next</h2>");
+    const char *next_live = strstr(document.html, "watch?v=NEXTLIVE001\"");
+    const char *next_lockup = strstr(document.html, "watch?v=NEXTLOCK001\"");
+    CHECK(next_heading != NULL && next_live != NULL && next_lockup != NULL
+          && next_heading < next_live && next_live < next_lockup);
+    const char *next_badge = strstr(
+        next_live, "<span class=\"duration live\">LIVE</span>");
+    CHECK(next_badge != NULL && next_badge < next_lockup);
+    CHECK(strstr(next_lockup, "<span class=\"duration live\">LIVE</span>")
+          != NULL);
     youtube_lite_document_destroy(&document);
     CHECK(budget.current == 0);
     return 0;
@@ -1572,7 +1728,7 @@ static bool test_youtube_lite_document_builder(Budget *layout_budget)
     }
     bool channel_ok =
         document.route == YOUTUBE_LITE_ROUTE_CHANNEL
-        && strstr(document.html, "Channel videos") != NULL
+        && strstr(document.html, "<nav class=channel-tabs>") != NULL
         && strstr(document.html, "PSP &amp; Guide") != NULL;
     youtube_lite_document_destroy(&document);
     if (!channel_ok || budget.current != 0) return false;
@@ -1733,10 +1889,14 @@ static int test_foundation(void)
     puts("test: bounded YouTube lightweight page builder");
     CHECK(test_youtube_lite_document_builder(&budget));
     CHECK(test_youtube_lite_lockup_cards() == 0);
+    puts("test: YouTube channel pages");
+    CHECK(test_youtube_lite_channel_pages() == 0);
     CHECK(test_youtube_portrait_renditions() == 0);
     puts("test: YouTube adapter commit parses cooperatively");
     CHECK(test_youtube_lite_commit_cooperates(&budget));
     CHECK(budget.current == 0);
+    puts("test: YouTube live and scheduled broadcast cards");
+    CHECK(test_youtube_lite_broadcast_cards() == 0);
 
     puts("test: incremental HTML parser boundary equivalence");
     CHECK(test_incremental_parser_boundaries(&budget));
@@ -2894,12 +3054,12 @@ static int test_foundation(void)
     PocDocument shell_document = {0};
     CHECK(document_parse(&shell_document, &budget, shell_page,
                          sizeof(shell_page) - 1u, 17)
-          && document_install_static_shell_fallback(&shell_document));
+          && document_install_static_shell_fallback(&shell_document, NULL, NULL));
     const char *shell_body = document_body_text(&shell_document);
     CHECK(shell_body != NULL
           && strstr(shell_body, "Connect with friends") != NULL
           && strstr(shell_body, "published summary") != NULL
-          && !document_install_static_shell_fallback(&shell_document));
+          && !document_install_static_shell_fallback(&shell_document, NULL, NULL));
     document_destroy(&shell_document);
 
     puts("test: failed script shells expose bounded authored noscript fallback");
@@ -2917,8 +3077,7 @@ static int test_foundation(void)
                                  &noscript_shell_document));
     const char *noscript_raw = document_body_text(&noscript_shell_document);
     CHECK(noscript_raw != NULL && strstr(noscript_raw, "<h1>") != NULL
-          && document_install_static_shell_fallback(
-                 &noscript_shell_document));
+          && document_install_static_shell_fallback(&noscript_shell_document, NULL, NULL));
     const char *noscript_fallback = document_body_text(
         &noscript_shell_document);
     CHECK(noscript_fallback != NULL
@@ -2937,7 +3096,7 @@ static int test_foundation(void)
     PocDocument empty_shell_document = {0};
     CHECK(document_parse(&empty_shell_document, &budget, empty_shell_page,
                          sizeof(empty_shell_page) - 1u, 17)
-          && document_install_static_shell_fallback(&empty_shell_document));
+          && document_install_static_shell_fallback(&empty_shell_document, NULL, NULL));
     const char *empty_shell_body = document_body_text(&empty_shell_document);
     lxb_dom_node_t *empty_shell_root = lxb_dom_interface_node(
         empty_shell_document.html);
@@ -2954,7 +3113,7 @@ static int test_foundation(void)
           && empty_shell_src_length == strlen("https://assets.test/preview.png")
           && memcmp(empty_shell_src, "https://assets.test/preview.png",
                     empty_shell_src_length) == 0
-          && !document_install_static_shell_fallback(&empty_shell_document));
+          && !document_install_static_shell_fallback(&empty_shell_document, NULL, NULL));
     document_destroy(&empty_shell_document);
 
     static const char short_content_page[] =
@@ -2965,8 +3124,7 @@ static int test_foundation(void)
     CHECK(document_parse(&short_content_document, &budget,
                          short_content_page,
                          sizeof(short_content_page) - 1u, 17)
-          && !document_install_static_shell_fallback(
-                 &short_content_document));
+          && !document_install_static_shell_fallback(&short_content_document, NULL, NULL));
     document_destroy(&short_content_document);
 
     puts("test: empty mobile hydration slots retain authored navigation");
@@ -2980,16 +3138,14 @@ static int test_foundation(void)
     CHECK(document_parse(&static_navigation_document, &budget,
                          static_navigation_page,
                          sizeof(static_navigation_page) - 1u, 19)
-          && document_install_static_shell_fallback(
-                 &static_navigation_document));
+          && document_install_static_shell_fallback(&static_navigation_document, NULL, NULL));
     const char *static_navigation_body =
         document_body_text(&static_navigation_document);
     CHECK(static_navigation_body != NULL
           && strstr(static_navigation_body, "Features") != NULL
           && strstr(static_navigation_body, "Privacy") != NULL
           && strstr(static_navigation_body, "Download") != NULL
-          && !document_install_static_shell_fallback(
-                 &static_navigation_document));
+          && !document_install_static_shell_fallback(&static_navigation_document, NULL, NULL));
     document_destroy(&static_navigation_document);
 
     puts("test: shed app shells recover a bounded authored top bar");
@@ -3005,8 +3161,7 @@ static int test_foundation(void)
     CHECK(document_parse(&recovered_header_document, &budget,
                          recovered_header_page,
                          sizeof(recovered_header_page) - 1u, 19)
-          && document_install_static_shell_fallback(
-                 &recovered_header_document));
+          && document_install_static_shell_fallback(&recovered_header_document, NULL, NULL));
     const char *recovered_header_body = document_body_text(
         &recovered_header_document);
     lxb_dom_node_t *recovered_header_body_node = document_body_node(
@@ -3021,8 +3176,7 @@ static int test_foundation(void)
           && strstr(recovered_header_body, "Home") != NULL
           && strstr(recovered_header_body, "Search") != NULL
           && strstr(recovered_header_body, "Library") != NULL
-          && !document_install_static_shell_fallback(
-                 &recovered_header_document));
+          && !document_install_static_shell_fallback(&recovered_header_document, NULL, NULL));
     document_destroy(&recovered_header_document);
 
     static const char recovered_tab_bar_page[] =
@@ -3038,8 +3192,7 @@ static int test_foundation(void)
     CHECK(document_parse(&recovered_tab_bar_document, &budget,
                          recovered_tab_bar_page,
                          sizeof(recovered_tab_bar_page) - 1u, 19)
-          && document_install_static_shell_fallback(
-                 &recovered_tab_bar_document));
+          && document_install_static_shell_fallback(&recovered_tab_bar_document, NULL, NULL));
     const char *recovered_tab_bar_body = document_body_text(
         &recovered_tab_bar_document);
     CHECK(recovered_tab_bar_body != NULL
@@ -3057,8 +3210,7 @@ static int test_foundation(void)
     CHECK(document_parse(&ordinary_navigation_document, &budget,
                          ordinary_navigation_page,
                          sizeof(ordinary_navigation_page) - 1u, 19)
-          && !document_install_static_shell_fallback(
-                 &ordinary_navigation_document));
+          && !document_install_static_shell_fallback(&ordinary_navigation_document, NULL, NULL));
     document_destroy(&ordinary_navigation_document);
 
     puts("test: cooperative layout work boundaries and cancellation");

@@ -163,8 +163,6 @@ typedef struct {
      * picture is ever produced and the presenter is never called.
      */
     long validation_ge_present_probe;
-    /* Run the validation-only WebGL-to-GE workload probe and exit. */
-    long validation_webgl_ge_probe;
     /* Run the JavaScript engine micro-benchmark (src/js_bench.c) before
        the first frame, at this iteration scale (0 = one iteration per
        kernel), then continue booting normally. `js_bench_dir` names an
@@ -186,6 +184,39 @@ typedef struct {
     /* Invasive full-surface hashes around every scanout latch. Off unless a
        flicker investigation explicitly opts in. */
     long validation_latch_probe;
+    /* Software-decoded audio: scan every played block for its peak level
+       (silent blocks, loudness per second). Exactly 0 or 1, default 0 so
+       timing runs leave the audio thread's work as shipped. */
+    long validation_swdec_audio_scan;
+    /* Software decoder, validation components only: a mask of reference
+       paths the add-on keeps beside its current ones, for same-binary
+       device A/B runs (TILEFINCH_SWDEC_VALIDATION_*: 1 = motion
+       compensation before the shared-pass versions, 2 = every macroblock
+       on the generic reconstruction path, 4 = fixed edge-emulation
+       regions, 8 = whole-cache jobs, 16 = one chroma plane per call,
+       32 = no-op prefetch calls, 64 = chroma prediction in reconstruction
+       instead of the Media Engine, 128 = the chroma qualification replay).
+       Browser-only bits: 256 = legacy block audio clock, 512 = legacy
+       presentation scheduling, 1024 = at most nine picture slots for
+       capacity-matched comparisons. 0..2047, default 0 (shipping). */
+    long validation_swdec_reference;
+    /* Playback A/B, validation builds only (a bit mask): 1 decodes
+       software video at fixed full quality (no adaptive reduced decoding),
+       so runs compare identical work; 2 keeps refreshing the page chrome
+       state every frame while a player covers the page (the behaviour
+       before it was deferred); 4 lets the software picture ring take slots
+       above 0x0A000000 once the low blocks run out (main-CPU conversion
+       and scaling for those, as before); 8 makes the reduced quality
+       rungs drop non-reference pictures as before, instead of only
+       skipping their deblocking; 16 retains the old software-video pacing
+       and one-frame-ahead non-reference discard rule. 0..31, default 0. */
+    long validation_playback_ab;
+    /* How the browser presents software-decoded 16-bit pictures, for
+       same-binary device A/B runs: 0 the graphics engine, sliced and
+       collected just before the latch (shipping); 1 the software scaler;
+       2 the engine with one sprite per quad; 3 the engine synced straight
+       after the submit (the reverted placement). 0..3, default 0. */
+    long validation_swdec_present;
     /*
      * Resolve `url`, open both bounded range sources, and read samples far
      * enough to cross fragment boundaries -- with no decoder behind them.

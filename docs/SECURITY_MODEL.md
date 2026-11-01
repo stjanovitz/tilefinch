@@ -613,6 +613,33 @@ objects expose only the small messaging/lifecycle surface rather than falling
 through to page globals. Tilefinch does not create auxiliary browsing contexts:
 `window.open()` returns `null` and every top/child `opener` is immutable `null`.
 
+Because there is no second window, the "popunder" pattern would otherwise
+replace the page the user asked for: a page answers a press by opening the
+content in a new window and sending its own (opener) document to another site,
+usually an ad server, often after a short timer. A desktop browser shows the
+new window in front and the opener's navigation behind it; on Tilefinch's
+single view only the opener's navigation would be visible. When the top-level
+document asks `window.open()` for an HTTP(S) document during a user
+activation, then for as long as that activation stays transient (5 seconds,
+until the next press) a script navigation of the document (`location`
+assignment, `assign()` or `replace()`) is refused when its site (scheme and
+registrable domain) is none of the document's, the requested window's, and
+the site of the hyperlink the user pressed. That hyperlink is the nearest
+HTML `<a>` or `<area>` with an `href` among the pressed element and its first
+63 ancestors (none past that), and its destination is the link's own `href`,
+resolved before the page's listeners ran, so a rewrite during the click cannot
+redirect it. When the press was on such a hyperlink, the link loads once: if
+the page did not cancel the click, the browser follows it as the click's
+default action and the refused navigation is simply dropped; if the page
+cancelled the click, Tilefinch follows the link in place of the refused
+navigation. Otherwise the page stays. Same-site navigations (including a first-party redirect path), a
+fallback to the popup's own site when no window opened, a blank window the
+page meant to fill itself, form submissions, the browser's own handling of
+the pressed element, frames, and navigations without a preceding
+`window.open()` are unaffected. The content blocker does not see this case:
+its lists apply to subresources, and top-level document navigations are never
+blocked by host.
+
 This is intentionally not complete CSP. Meta-delivered policies,
 `Content-Security-Policy-Report-Only`, reporting, `strict-dynamic`, CSP
 `sandbox`, Trusted Types, the element/attribute directive

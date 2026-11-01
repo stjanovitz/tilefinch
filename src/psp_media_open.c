@@ -65,6 +65,7 @@ void psp_media_publish_track_catalog(PspMediaSession *media)
 #include <string.h>
 
 #include "media_backend_psp_policy.h"
+#include "tilefinch/media_failure_message.h"
 #include "tilefinch/platform.h"
 #include "tilefinch/psp_log.h"
 #include "tilefinch/user_agent.h"
@@ -80,7 +81,9 @@ _Static_assert(YOUTUBE_TRACK_LIMIT <= PSP_UI_MEDIA_TRACK_LIMIT,
 typedef enum {
     PSP_PAGE_MEDIA_PROBE_PENDING = 0,
     PSP_PAGE_MEDIA_PROBE_READY,
-    PSP_PAGE_MEDIA_PROBE_FAILED
+    PSP_PAGE_MEDIA_PROBE_FAILED,
+    /* The address answered with an HLS playlist: open it as one. */
+    PSP_PAGE_MEDIA_PROBE_HLS
 } PspPageMediaProbeStatus;
 
 static PspPageMediaProbeStatus psp_media_page_probe_finish(
@@ -88,7 +91,6 @@ static PspPageMediaProbeStatus psp_media_page_probe_finish(
     bool fetched, char *error, size_t error_size)
 {
     if (media == NULL || result == NULL) return PSP_PAGE_MEDIA_PROBE_FAILED;
-    char content_range[128] = {0};
     uint64_t complete_length = 0;
     TilefinchRequestContext context = {
         .target_url = media->source,
@@ -99,19 +101,31 @@ static PspPageMediaProbeStatus psp_media_page_probe_finish(
         .credentials = media->page_media_credentials,
         .destination = TILEFINCH_DESTINATION_MEDIA
     };
-    TilefinchResourceGrant grant;
-    TilefinchResourceDeniedReason denied;
-    bool admitted = fetched && result->status_code == 206
-        && result->length == 1u
-        && fetch_response_header_value(
-               result, "content-range", content_range,
-               sizeof(content_range))
-        && media_http_parse_content_range(
-               content_range, 0, 0, result->length, &complete_length)
-        && fetch_resource_grant_create(
-               result, &context,
-               media->page_media_mode == TILEFINCH_REQUEST_MODE_CORS,
-               true, false, &grant, &denied);
+    /* Routed here because the address had no HLS sign; what it answers
+       decides. An offline stream's address answers 404 or an error body. */
+    MediaHttpProbeRoute route = media_http_probe_route(
+        media->session, &context, !media->page_audio, result, fetched,
+        &complete_length);
+    if (route == MEDIA_HTTP_PROBE_HLS) return PSP_PAGE_MEDIA_PROBE_HLS;
+    if (route == MEDIA_HTTP_PROBE_UNAVAILABLE) {
+        snprintf(error, error_size,
+                 "page %s: " MEDIA_STREAM_UNAVAILABLE " (HTTP %ld)",
+                 media->page_audio ? "audio" : "video",
+                 result->status_code);
+        return PSP_PAGE_MEDIA_PROBE_FAILED;
+    }
+    bool admitted = route == MEDIA_HTTP_PROBE_RANGE;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    /* Page-media device check: the probe's own outcome, before the range
+       source exists, so a later range refusal is not mistaken for it. */
+    printf("tilefinch-page-media: event=probe outcome=%s fetched=%d "
+           "http=%ld length=%llu redirected=%d kind=%s error=\"%.120s\"\n",
+           admitted ? "ready" : "failed", fetched ? 1 : 0,
+           result->status_code, (unsigned long long) complete_length,
+           result->effective_url[0] != '\0'
+               && strcmp(result->effective_url, media->source) != 0,
+           media->page_audio ? "audio" : "video", result->error);
+#endif
     if (!admitted) {
         snprintf(error, error_size,
                  "page %s range probe failed (HTTP %ld): %.150s",
@@ -122,13 +136,7 @@ static PspPageMediaProbeStatus psp_media_page_probe_finish(
                      : result->error);
         return PSP_PAGE_MEDIA_PROBE_FAILED;
     }
-    for (size_t at = 0; at < result->set_cookie_count; at++) {
-        context.target_url = fetch_set_cookie_url(
-            result, at, result->effective_url);
-        (void) browser_session_cookie_set_http_context(
-            media->session, &context, result->set_cookies[at]);
-    }
-    memset(&media->stream, 0, sizeof(media->stream));
+    psp_media_clear_resolved_stream(media);
     snprintf(media->stream.title, sizeof(media->stream.title), "%s",
              media->page_audio ? "Page audio" : "Page video");
     const char *effective_url = result->effective_url[0] == '\0'
@@ -224,14 +232,19 @@ static PspPageMediaProbeStatus psp_media_page_probe(
             : "video/mp4,video/*;q=0.9,*/*;q=0.5",
         .user_agent = TILEFINCH_BROWSER_USER_AGENT,
         .connect_timeout_ms = PSP_MEDIA_CONNECT_TIMEOUT_MS,
-        .redirect_same_origin_only = true
+        /* A page's media URL commonly redirects to a CDN on another origin.
+           The scheduler re-applies this request's page authority (CSP,
+           content blocker, mixed content, PNA, per-hop cookies and
+           Referer) to every hop, as for any page subresource. */
+        .redirect_same_origin_only = false
     };
     FetchRequestValidationError validation_error;
-    bool ready = media_http_build_range_header(
-            0, 0, range_header, sizeof(range_header));
+    bool ready = media_http_build_probe_range_header(
+        range_header, sizeof(range_header));
     transport.extra_headers = range_header;
     ready = ready && fetch_prepare_page_request_context(
-        &context, media->page_document_url, NULL, media->session, NULL,
+        &context, media->page_document_url, NULL, media->session,
+        psp_media_page_content_security_policy(media),
         media->session == NULL ? NULL : media->session->content_blocker,
         &transport, prepared, &validation_error);
     const FetchRequest *request = ready
@@ -243,20 +256,12 @@ static PspPageMediaProbeStatus psp_media_page_probe(
         return PSP_PAGE_MEDIA_PROBE_FAILED;
     }
     if (fetch_background_transport_available()) {
-        media->page_media_probe_scheduler = fetch_scheduler_create(
-            media->budget, 1u, 1u);
-        bool background_ready = media->page_media_probe_scheduler != NULL
-            && fetch_scheduler_enable_background_transport(
-                   media->page_media_probe_scheduler, true);
-        media->page_media_probe_request = background_ready
-            ? fetch_scheduler_enqueue(
-                  media->page_media_probe_scheduler, media->source,
-                  request, 1u, 15000)
-            : 0;
+        media->page_media_probe_request =
+            media_http_probe_enqueue_background(
+                media->budget, media->source, request, 15000,
+                &media->page_media_probe_scheduler);
         budget_free(media->budget, prepared);
         if (media->page_media_probe_request == 0) {
-            fetch_scheduler_destroy(media->page_media_probe_scheduler);
-            media->page_media_probe_scheduler = NULL;
             snprintf(error, error_size, "page %s transport unavailable",
                      media->page_audio ? "audio" : "video");
             return PSP_PAGE_MEDIA_PROBE_FAILED;
@@ -265,7 +270,8 @@ static PspPageMediaProbeStatus psp_media_page_probe(
     }
     FetchResult *result = fetch_result_create(media->budget);
     bool fetched = result != NULL && fetch_request_cancelable(
-        media->budget, media->source, request, 1u, 15000,
+        media->budget, media->source, request,
+        MEDIA_HTTP_PROBE_SNIFF_BYTES, 15000,
         psp_media_cancel_callback, media, result);
     budget_free(media->budget, prepared);
     if (result == NULL) {
@@ -338,6 +344,27 @@ static void psp_media_apply_decoder_hint(PspMediaSession *media)
         media->decoder_profile_idc = profile;
 }
 
+/*
+ * Attach the software decoder for a stream that needs it. When the stream
+ * needs it only because the firmware decoder refuses its coding, a missing
+ * or failed component leaves that refusal as the reason, so the page's next
+ * rendition is still tried (media_candidate_refused); the component's own
+ * message follows it.
+ */
+static bool psp_media_prepare_software_route(
+    PspMediaSession *media, const char *firmware_refusal,
+    char *error, size_t error_size)
+{
+    if (psp_swdec_component_prepare(&media->swdec, error, error_size))
+        return true;
+    if (firmware_refusal != NULL && error != NULL && error_size != 0) {
+        char component[128];
+        snprintf(component, sizeof(component), "%s", error);
+        snprintf(error, error_size, "%s; %s", firmware_refusal, component);
+    }
+    return false;
+}
+
 static bool psp_media_apply_demux_decoder_route(
     PspMediaSession *media, char *error, size_t error_size)
 {
@@ -363,7 +390,32 @@ static bool psp_media_apply_demux_decoder_route(
         return false;
     }
     media->decoder_profile_idc = profile;
+    /* A Baseline/Main stream whose SPS declares a coding the firmware
+       decoder refuses needs the software decoder, as High does. Where that
+       declaration is only a hint (media_h264_firmware_references_conclusive)
+       and the software decoder cannot take the stream, firmware judges it. */
+    MediaH264FirmwareReferences verdict =
+        route == MEDIA_H264_DECODER_ROUTE_PSP_FIRMWARE
+            ? media_h264_avcc_firmware_references(
+                  video.codec_config, video.codec_config_length)
+            : MEDIA_H264_FIRMWARE_REFERENCES_SUPPORTED;
+    const char *firmware_refusal =
+        media_h264_firmware_references_refusal(verdict);
+    bool firmware_may_judge = firmware_refusal != NULL
+        && !media_h264_firmware_references_conclusive(
+               verdict, media->page_source)
+        && !psp_swdec_component_owns_me(&media->swdec);
+    /* A level above the firmware range is refused at backend open, after
+       a Media Engine boot: send a small picture to the software decoder,
+       and let anything larger fail now so the page's next rendition is
+       tried. */
+    if (firmware_refusal == NULL
+        && route == MEDIA_H264_DECODER_ROUTE_PSP_FIRMWARE
+        && !media_h264_avcc_firmware_level_supported(
+               video.codec_config, video.codec_config_length))
+        firmware_refusal = MEDIA_H264_FIRMWARE_LEVEL_REFUSAL;
     bool swdec_required = route == MEDIA_H264_DECODER_ROUTE_HIGH_EXTENSION
+        || firmware_refusal != NULL
         || psp_swdec_component_owns_me(&media->swdec);
     if (swdec_required) {
         uint16_t width = 0, height = 0;
@@ -372,18 +424,46 @@ static bool psp_media_apply_demux_decoder_route(
                 video.codec_config, video.codec_config_length,
                 &width, &height, &nal_length)
             || width == 0 || height == 0 || width > 432u || height > 240u) {
-            snprintf(error, error_size,
-                     "software H.264 is limited to 432x240");
+            if (firmware_may_judge) {
+                media->use_swdec = false;
+                return true;
+            }
+            snprintf(error, error_size, "%s",
+                     firmware_refusal != NULL
+                         ? firmware_refusal
+                         : "software H.264 is limited to 432x240");
             return false;
         }
         (void) nal_length;
+        /* The software decoder plays progressive 8-bit 4:2:0 only
+           (CABAC or CAVLC); handing it anything else decodes nothing. */
+        if (media_h264_config_software_coding(
+                video.codec_config, video.codec_config_length, false)
+            == MEDIA_H264_SOFTWARE_CODING_UNSUPPORTED) {
+            if (firmware_may_judge) {
+                media->use_swdec = false;
+                return true;
+            }
+            snprintf(error, error_size, "%s",
+                     firmware_refusal != NULL
+                         ? firmware_refusal
+                         : MEDIA_H264_SOFTWARE_CODING_REFUSAL);
+            return false;
+        }
         media->use_swdec = true;
     } else {
         media->use_swdec = false;
     }
     if (media->use_swdec
-        && !psp_swdec_component_prepare(
-            &media->swdec, error, error_size)) return false;
+        && !psp_media_prepare_software_route(
+            media, firmware_refusal, error, error_size)) {
+        /* A failed attach that kept the Media Engine leaves no firmware
+           route to fall back to. */
+        if (!firmware_may_judge
+            || psp_swdec_component_owns_me(&media->swdec)) return false;
+        media->use_swdec = false;
+        if (error != NULL && error_size != 0) error[0] = '\0';
+    }
     return true;
 }
 
@@ -414,10 +494,20 @@ bool psp_media_resolved_stream_reusable(const PspMediaSession *media)
              >= PSP_MEDIA_REUSED_URL_MINIMUM_LIFETIME_SECONDS;
 }
 
-static bool psp_media_create_playback(PspMediaSession *media,
-                                      uint64_t audio_start_us,
-                                      char *error, size_t error_size)
+static bool psp_media_create_playback_once(PspMediaSession *media,
+                                           uint64_t audio_start_us,
+                                           char *error, size_t error_size)
 {
+    /* Claim the existing packet allowance before the decoder's picture
+       ring and smaller buffers fragment the native heap. Ownership moves
+       to MediaPlayback only when its constructor succeeds. */
+    unsigned char *packet = budget_malloc_category(
+        media->budget, BUDGET_CATEGORY_RESOURCE,
+        PSP_MEDIA_MAXIMUM_PACKET_BYTES);
+    if (packet == NULL) {
+        snprintf(error, error_size, "%s", "media packet exceeds budget");
+        return false;
+    }
     MediaBackend backend = {0};
     const MediaSampleSource *hls_audio =
         media->hls_audio_source.opaque == NULL
@@ -449,6 +539,7 @@ static bool psp_media_create_playback(PspMediaSession *media,
             media->budget, media->demux, media->audio_demux,
             &backend, error, error_size);
     if (!backend_ready) {
+        budget_free(media->budget, packet);
         return false;
     }
     /*
@@ -462,7 +553,8 @@ static bool psp_media_create_playback(PspMediaSession *media,
             ? backend.preferred_decode_lead_us : PSP_MEDIA_DECODE_LEAD_US,
         .audio_start_us = audio_start_us,
         .maximum_packet_bytes = PSP_MEDIA_MAXIMUM_PACKET_BYTES,
-        .preallocate_maximum_packet_bytes = true
+        .preallocate_maximum_packet_bytes = true,
+        .reserved_packet = packet
     };
     media->playback = media->hls != NULL
         ? media_playback_create_sources(
@@ -481,9 +573,55 @@ static bool psp_media_create_playback(PspMediaSession *media,
             &backend, &options, error, error_size);
     if (media->playback == NULL) {
         backend.destroy(backend.opaque);
+        budget_free(media->budget, packet);
         return false;
     }
     return true;
+}
+
+/*
+ * A software-decoder open needs about 15 MB of the page's Budget at once
+ * (decoder arena, picture ring, audio arena). Both decoders also reserve a
+ * playback packet. When the page holds the needed memory, the
+ * page gives memory back one step at a time, least destructive first, and
+ * the open is tried again after each (browser_engine_make_media_room).
+ */
+static bool psp_media_create_playback(PspMediaSession *media,
+                                      uint64_t audio_start_us,
+                                      char *error, size_t error_size)
+{
+    unsigned room_stage = 0;
+    for (;;) {
+        if (psp_media_create_playback_once(
+                media, audio_start_us, error, error_size))
+            return true;
+        if (media->platform.make_room == NULL || room_stage >= 2u
+            || error == NULL || strstr(error, "exceeds budget") == NULL)
+            return false;
+        size_t working = media->use_swdec
+            ? media_psp_swdec_backend_last_working_set() : 0;
+        /* The playback record and its preallocated packet come after. */
+        size_t playback = PSP_MEDIA_MAXIMUM_PACKET_BYTES + 512u * KIB;
+        size_t needed = working == 0 ? 0
+            : working > SIZE_MAX - playback ? SIZE_MAX : working + playback;
+        /* The Budget can hold the bytes while the heap has no block for
+           one of them (the ring slots take the low blocks first, then the
+           playback packet finds none): free memory anyway, by stage. */
+        if (needed != 0 && budget_remaining(media->budget) >= needed)
+            needed = 0;
+        unsigned previous_stage = room_stage;
+        if (!media->platform.make_room(
+                media->platform.memory_context, needed, &room_stage)
+            || room_stage <= previous_stage)
+            return false;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        printf("tilefinch-media: playback-room stage=%u needed=%u "
+               "remaining=%u after=\"%s\"\n",
+               room_stage, (unsigned) needed,
+               (unsigned) budget_remaining(media->budget), error);
+#endif
+        error[0] = '\0';
+    }
 }
 
 static bool psp_media_create_audio_http_range(
@@ -503,6 +641,8 @@ static bool psp_media_create_audio_http_range(
             ? media->page_document_url : media->source,
         .standard_range_header = media->page_audio,
         .audio_only = true,
+        .content_security_policy = media->page_audio
+            ? psp_media_page_content_security_policy(media) : NULL,
         .page_request_context = media->page_audio
             ? &(TilefinchRequestContext) {
                 .target_url = media->stream.audio_url,
@@ -977,6 +1117,22 @@ bool psp_media_retry_240p(
     return true;
 }
 
+bool psp_media_retry_page_candidate(
+    PspMediaSession *media, const char *error)
+{
+    if (media == NULL || media->page_candidates == NULL
+        || !media->page_source || media->page_audio
+        || psp_media_cancel_requested(media)
+        || media_psp_backend_quarantined()
+        || !media_candidate_refused(error)) return false;
+    char log_error[161];
+    psp_youtube_log_text(error, log_error, sizeof(log_error));
+    bool opened = psp_media_open_next_page_candidate(media);
+    printf("tilefinch-media: page-candidate action=%s reason=\"%s\"\n",
+           opened ? "next" : "exhausted", log_error);
+    return opened;
+}
+
 bool psp_media_retry_delivery_failure(
     PspMediaSession *media, const char *operation, const char *error,
     bool delivery_candidate_rejected)
@@ -1326,7 +1482,7 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
         if (!reuse_resolved_stream) {
             budget_free(media->budget, media->caption_catalog);
             media->caption_catalog = NULL;
-            memset(&media->stream, 0, sizeof(media->stream));
+            psp_media_clear_resolved_stream(media);
         }
         media->job_phase = PSP_MEDIA_JOB_OPEN_RESOLVE;
         media->job_started_us =
@@ -1335,12 +1491,15 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
         media->job_maximum_unit_us = 0;
         media->job_units = 0;
         media->open_report_next_us = media->job_started_us;
+        if (!psp_media_prepare_open_network(media, true)) return true;
     }
     if (media->job_phase < PSP_MEDIA_JOB_OPEN_RESOLVE
         || media->job_phase > PSP_MEDIA_JOB_OPEN_PLAYBACK) return false;
     /* Before the unit, not after it: a phase that is already over must not be
        given one more blocking read to spend. */
     if (psp_media_open_retire_if_over(media)) return true;
+    if (media->open_network_pending
+        && !psp_media_prepare_open_network(media, false)) return true;
     uint64_t unit_started =
         psp_media_internal_now_us(media);
     if (unit_started >= media->open_report_next_us) {
@@ -1408,7 +1567,13 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
                                   : media->page_media_mode,
                     provider_live ? TILEFINCH_CREDENTIALS_INCLUDE
                                   : media->page_media_credentials,
-                    error, sizeof(error));
+                    media->hls_selection_bound,
+                    provider_live
+                        ? NULL : psp_media_page_content_security_policy(media),
+                    !provider_live, error, sizeof(error));
+                psp_media_hls_set_memory_recovery(
+                    media->hls, media->platform.memory_context,
+                    media->platform.make_room);
             }
             if (media->hls == NULL) {
                 ok = false;
@@ -1451,7 +1616,7 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
                            error);
                     if (ok) {
                         if (!provider_live) {
-                            memset(&media->stream, 0, sizeof(media->stream));
+                            psp_media_clear_resolved_stream(media);
                             snprintf(media->stream.title,
                                      sizeof(media->stream.title), "%s",
                                      "Page video");
@@ -1467,15 +1632,121 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
                             ok = false;
                             break;
                         }
-                        media->decoder_profile_idc = profile;
-                        media->use_swdec =
+                        /* A Baseline/Main variant whose SPS declares a
+                           coding the firmware decoder refuses needs the
+                           software decoder, as High does. */
+                        MediaH264FirmwareReferences verdict =
+                            route == MEDIA_H264_DECODER_ROUTE_PSP_FIRMWARE
+                                ? media_h264_annexb_firmware_references(
+                                      video.codec_config,
+                                      video.codec_config_length)
+                                : MEDIA_H264_FIRMWARE_REFERENCES_SUPPORTED;
+                        const char *firmware_refusal =
+                            media_h264_firmware_references_refusal(verdict);
+                        /* A declared pyramid outside page media is a
+                           routing hint: with no smaller variant for the
+                           software decoder, firmware judges it. */
+                        bool firmware_may_judge = firmware_refusal != NULL
+                            && !media_h264_firmware_references_conclusive(
+                                   verdict, media->page_source)
+                            && !psp_swdec_component_owns_me(&media->swdec);
+                        /* As for MP4: a level the firmware refuses needs
+                           the software decoder or another variant;
+                           firmware cannot judge it. */
+                        if (firmware_refusal == NULL
+                            && route == MEDIA_H264_DECODER_ROUTE_PSP_FIRMWARE
+                            && !media_h264_annexb_firmware_level_supported(
+                                   video.codec_config,
+                                   video.codec_config_length))
+                            firmware_refusal =
+                                MEDIA_H264_FIRMWARE_LEVEL_REFUSAL;
+                        bool software_route =
                             route == MEDIA_H264_DECODER_ROUTE_HIGH_EXTENSION
+                            || firmware_refusal != NULL;
+                        if (software_route
+                            && !psp_swdec_dimensions_supported(
+                                   video.width, video.height)) {
+                            /* Choose again at the software bound, once per
+                               cause: a variant without a declared profile
+                               whose SPS says High, or any variant whose
+                               coding firmware refuses. */
+                            PspMediaHlsSelectionBound narrowed =
+                                firmware_refusal != NULL
+                                    ? PSP_MEDIA_HLS_BOUND_SOFTWARE
+                                    : PSP_MEDIA_HLS_BOUND_UNDECLARED_SOFTWARE;
+                            if (media->hls_selection_bound < narrowed
+                                && (firmware_refusal != NULL
+                                    || psp_media_hls_selection_unverified(
+                                           media->hls))) {
+                                printf("tilefinch-media-hls: event=reselect "
+                                       "reason=%s video=%ux%u\n",
+                                       firmware_refusal != NULL
+                                           ? "firmware-refused"
+                                           : "high-profile",
+                                       (unsigned) video.width,
+                                       (unsigned) video.height);
+                                psp_media_hls_destroy(media->hls);
+                                media->hls = NULL;
+                                media->hls_source = (MediaSampleSource) {0};
+                                media->hls_audio_source =
+                                    (MediaSampleSource) {0};
+                                media->hls_selection_bound = narrowed;
+                                /* A second selection pass; the open's total
+                                   bound still applies. */
+                                media->job_phase_started_us =
+                                    psp_media_internal_now_us(media);
+                                ok = true;
+                                break;
+                            }
+                            if (firmware_may_judge) {
+                                software_route = false;
+                            } else {
+                                snprintf(error, sizeof(error), "%s",
+                                         firmware_refusal != NULL
+                                             ? firmware_refusal
+                                             : "software H.264 is limited "
+                                               "to 432x240");
+                                ok = false;
+                                break;
+                            }
+                        }
+                        /* As for MP4: only progressive 8-bit 4:2:0 can
+                           go to the software decoder. */
+                        if (software_route
+                            && media_h264_config_software_coding(
+                                   video.codec_config,
+                                   video.codec_config_length, true)
+                               == MEDIA_H264_SOFTWARE_CODING_UNSUPPORTED) {
+                            if (firmware_may_judge) {
+                                software_route = false;
+                            } else {
+                                printf("tilefinch-media-hls: event=refused "
+                                       "reason=coding video=%ux%u\n",
+                                       (unsigned) video.width,
+                                       (unsigned) video.height);
+                                snprintf(error, sizeof(error), "%s",
+                                         firmware_refusal != NULL
+                                             ? firmware_refusal
+                                             : MEDIA_H264_SOFTWARE_CODING_REFUSAL);
+                                ok = false;
+                                break;
+                            }
+                        }
+                        media->decoder_profile_idc = profile;
+                        media->use_swdec = software_route
                             || psp_swdec_component_owns_me(&media->swdec);
                         if (media->use_swdec
-                            && !psp_swdec_component_prepare(
-                                &media->swdec, error, sizeof(error))) {
-                            ok = false;
-                            break;
+                            && !psp_media_prepare_software_route(
+                                media, firmware_refusal,
+                                error, sizeof(error))) {
+                            if (!firmware_may_judge
+                                || psp_swdec_component_owns_me(
+                                       &media->swdec)) {
+                                ok = false;
+                                break;
+                            }
+                            media->use_swdec = false;
+                            error[0] = '\0';
                         }
                         const unsigned char *sps = NULL, *pps = NULL;
                         size_t sps_length = 0, pps_length = 0;
@@ -1515,9 +1786,19 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
                 ok = true;
                 break;
             }
+            if (status == PSP_PAGE_MEDIA_PROBE_HLS) {
+                /* The next pump opens it on the HLS branch above. */
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+                printf("tilefinch-page-media: event=probe-routed-hls "
+                       "url=\"%.200s\"\n", media->source);
+#endif
+                media->page_hls = true;
+                ok = true;
+                break;
+            }
             ok = status == PSP_PAGE_MEDIA_PROBE_READY;
         } else if (offline_route) {
-            memset(&media->stream, 0, sizeof(media->stream));
+            psp_media_clear_resolved_stream(media);
             PspMediaOfflineSource source = {0};
             ok = media->platform.resolve_offline(
                 media->platform.context, media->source, &source);
@@ -1537,7 +1818,7 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
                          "offline video is unavailable");
             }
         } else if (fetch_background_transport_available()) {
-            memset(&media->stream, 0, sizeof(media->stream));
+            psp_media_clear_resolved_stream(media);
             if (media->resolver_job == NULL) {
                 media->resolver_job = youtube_resolve_job_begin(
                     media->budget, media->session, media->source,
@@ -1595,7 +1876,7 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
                 media->resolver_job = NULL;
             }
         } else {
-            memset(&media->stream, 0, sizeof(media->stream));
+            psp_media_clear_resolved_stream(media);
             ok = youtube_resolve_progressive_mp4_cancelable_with_preferences(
                 media->budget, media->session, media->source,
                 (int) media->requested_quality, 30000,
@@ -1618,7 +1899,11 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
                 media->stream.media_url, media->source,
                 TILEFINCH_REQUEST_MODE_NO_CORS,
                 TILEFINCH_CREDENTIALS_INCLUDE,
+                media->hls_selection_bound, NULL, false,
                 error, sizeof(error));
+            psp_media_hls_set_memory_recovery(
+                media->hls, media->platform.memory_context,
+                media->platform.make_room);
             if (media->hls == NULL) {
                 ok = false;
             } else {
@@ -1739,6 +2024,8 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
             .referer = media->page_source
                 ? media->page_document_url : media->source,
             .standard_range_header = media->page_source,
+            .content_security_policy = media->page_source
+                ? psp_media_page_content_security_policy(media) : NULL,
             .page_request_context = media->page_source
                 ? &(TilefinchRequestContext) {
                     .target_url = media->stream.media_url,
@@ -1760,6 +2047,19 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
             media->stream.content_length, &range_options,
             error, sizeof(error));
         ok = media->range != NULL;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        /* Page-media device check: the lane the range source chose. */
+        if (media->page_source) {
+            printf("tilefinch-page-media: event=range created=%d "
+                   "route=%s length=%llu error=\"%.120s\"\n",
+                   ok ? 1 : 0,
+                   !ok ? "none"
+                   : media_http_range_route_name(
+                         media_http_range_route(media->range)),
+                   (unsigned long long) media->stream.content_length,
+                   ok ? "" : error);
+        }
+#endif
         if (ok) {
             media->video_lookahead_limit = 1u;
             media->video_lookahead_next_sample_us = 0;
@@ -2122,18 +2422,26 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
         if (psp_media_cancel_requested(media)) {
             snprintf(error, sizeof(error), "%s", "VIDEO OPEN STOPPED");
         }
-        const char *failure =
-            error[0] == '\0' ? "media open failed" : error;
+        /* A rendition reopened mid-play (a >=30 s rewind, a suspend) has
+           shown pictures already: a refusal now is not its coding. */
+        const char *failure = error[0] == '\0' ? "media open failed"
+            : media_candidate_failure_after_pictures(
+                  error, media->rendition_prior_pictures);
         bool delivery_candidate_rejected =
             phase_before == PSP_MEDIA_JOB_OPEN_VIDEO_PRIME
             || video_stats.failures != 0 || audio_stats.failures != 0;
-        bool fallback = false;
+        /* A page that offers further renditions tries the next one when
+           this one cannot work here at all. Refreshing the same URL cannot
+           change its picture size, profile or a 4xx answer. */
+        bool fallback = psp_media_retry_page_candidate(media, failure);
         /* Candidate one is the requested 360p stream, candidate two is a
            fresh URL at the same quality, and candidate three is newly
            resolved at 240p. Resolution is deliberately changed only after a
            second candidate proves the problem is delivery, not one bad URL. */
-        fallback = psp_media_retry_delivery_failure(
-            media, "open", failure, delivery_candidate_rejected);
+        if (!fallback) {
+            fallback = psp_media_retry_delivery_failure(
+                media, "open", failure, delivery_candidate_rejected);
+        }
         /* Decoder-module preparation is independent of the selected video
            resolution.  Advertising a 240p retry here only repeats the same
            module failure and leaves the user waiting for a fallback which

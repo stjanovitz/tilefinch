@@ -25,7 +25,6 @@ startup_test=0
 media_fixture_test=0
 raster_fixture_test=0
 ge_present_probe=0
-webgl_ge_probe=0
 csc_order_probe=0
 media_range_probe=0
 launcher=0
@@ -66,7 +65,7 @@ fi
 
 usage() {
     printf '%s\n' \
-        "usage: scripts/run-ppsspp-network.sh [--build] [--launcher] [--update-e2e HTTPS_URL] [--url URL] [--local-fixture] [--timeout SECONDS] [--cancel-after-ms MILLISECONDS] [--preview-scroll] [--capture-frames] [--max-provisional-ms MILLISECONDS] [--play-media] [--media-stability-test] [--media-fixture-test] [--raster-fixture-test] [--ge-present-probe] [--webgl-ge-probe] [--csc-order-probe] [--media-range-probe] [--power-test] [--startup-test]" \
+        "usage: scripts/run-ppsspp-network.sh [--build] [--launcher] [--update-e2e HTTPS_URL] [--url URL] [--local-fixture] [--timeout SECONDS] [--cancel-after-ms MILLISECONDS] [--preview-scroll] [--capture-frames] [--max-provisional-ms MILLISECONDS] [--play-media] [--media-stability-test] [--media-fixture-test] [--raster-fixture-test] [--ge-present-probe] [--csc-order-probe] [--media-range-probe] [--power-test] [--startup-test]" \
         "" \
         "Runs the live PSP EBOOT in an isolated PPSSPP home with WLAN enabled." \
         "--local-fixture permits an explicit HTTP 127.0.0.1/localhost URL; ordinary network smokes remain HTTPS-only." \
@@ -84,7 +83,6 @@ usage() {
         "--media-fixture-test runs deterministic embedded 240p/360p decoder qualification." \
         "--raster-fixture-test checks the PSP page/font raster and saves its atlas." \
         "--ge-present-probe draws synthetic video frames through the graphics engine and checks the pixels." \
-        "--webgl-ge-probe measures representative WebGL-style GE workloads in page mode." \
         "--csc-order-probe sweeps the firmware colour-conversion mode words over one decoded picture (hardware only)." \
         "--media-range-probe opens both bounded range sources and reads across fragment boundaries with no decoder (needs the network)." \
         "Results are copied beneath the selected PSP build directory."
@@ -167,12 +165,6 @@ while [ "$#" -gt 0 ]; do
             ge_present_probe=1
             url=https://tilefinch.local/home
             expect_network=ge-present
-            shift
-            ;;
-        --webgl-ge-probe)
-            webgl_ge_probe=1
-            url=https://tilefinch.local/home
-            expect_network=webgl-ge
             shift
             ;;
         --csc-order-probe)
@@ -264,7 +256,6 @@ case "$url" in
         if [ "$media_fixture_test" -eq 0 ] \
             && [ "$raster_fixture_test" -eq 0 ] \
             && [ "$ge_present_probe" -eq 0 ] \
-            && [ "$webgl_ge_probe" -eq 0 ] \
             && [ "$csc_order_probe" -eq 0 ] \
             && [ "$update_e2e" -eq 0 ]; then
             expect_network=warmup
@@ -390,7 +381,7 @@ esac
 # pixels it drew. It is also several times slower to boot, while never
 # touching the network, so its default wait is longer than the network
 # default. An explicit --timeout still wins.
-if { [ "$ge_present_probe" -eq 1 ] || [ "$webgl_ge_probe" -eq 1 ]; } \
+if [ "$ge_present_probe" -eq 1 ] \
     && [ "$timeout_explicit" -eq 0 ] \
     && [ "$timeout_seconds" -lt 120 ]; then
     timeout_seconds=120
@@ -399,28 +390,16 @@ fi
     || { [ "$raster_fixture_test" -eq 0 ] && [ "$media_fixture_test" -eq 0 ] \
          && [ "$play_media" -eq 0 ] && [ "$media_stability_test" -eq 0 ] \
          && [ "$power_test" -eq 0 ] && [ "$cancel_after_ms" -eq 0 ] \
-         && [ "$csc_order_probe" -eq 0 ] \
-         && [ "$webgl_ge_probe" -eq 0 ]; } || {
+         && [ "$csc_order_probe" -eq 0 ]; } || {
     printf '%s\n' \
         "--ge-present-probe cannot be combined with another probe" >&2
-    exit 2
-}
-[ "$webgl_ge_probe" -eq 0 ] \
-    || { [ "$raster_fixture_test" -eq 0 ] && [ "$media_fixture_test" -eq 0 ] \
-         && [ "$play_media" -eq 0 ] && [ "$media_stability_test" -eq 0 ] \
-         && [ "$power_test" -eq 0 ] && [ "$cancel_after_ms" -eq 0 ] \
-         && [ "$csc_order_probe" -eq 0 ] && [ "$media_range_probe" -eq 0 ] \
-         && [ "$ge_present_probe" -eq 0 ]; } || {
-    printf '%s\n' \
-        "--webgl-ge-probe cannot be combined with another probe" >&2
     exit 2
 }
 [ "$csc_order_probe" -eq 0 ] \
     || { [ "$raster_fixture_test" -eq 0 ] && [ "$media_fixture_test" -eq 0 ] \
          && [ "$play_media" -eq 0 ] && [ "$media_stability_test" -eq 0 ] \
          && [ "$power_test" -eq 0 ] && [ "$cancel_after_ms" -eq 0 ] \
-         && [ "$media_range_probe" -eq 0 ] \
-         && [ "$webgl_ge_probe" -eq 0 ]; } || {
+         && [ "$media_range_probe" -eq 0 ]; } || {
     printf '%s\n' \
         "--csc-order-probe cannot be combined with another probe" >&2
     exit 2
@@ -429,8 +408,7 @@ fi
     || { [ "$raster_fixture_test" -eq 0 ] && [ "$media_fixture_test" -eq 0 ] \
          && [ "$play_media" -eq 0 ] && [ "$media_stability_test" -eq 0 ] \
          && [ "$power_test" -eq 0 ] && [ "$cancel_after_ms" -eq 0 ] \
-         && [ "$ge_present_probe" -eq 0 ] \
-         && [ "$webgl_ge_probe" -eq 0 ]; } || {
+         && [ "$ge_present_probe" -eq 0 ]; } || {
     printf '%s\n' \
         "--media-range-probe cannot be combined with another probe" >&2
     exit 2
@@ -696,7 +674,6 @@ fi
         "validation_media_fixture_auto=$media_fixture_test" \
         "validation_raster_fixture_auto=$raster_fixture_test" \
         "validation_ge_present_probe=$ge_present_probe" \
-        "validation_webgl_ge_probe=$webgl_ge_probe" \
         "validation_csc_order_probe=$csc_order_probe" \
         "validation_media_range_probe=$media_range_probe" \
         "validation_power_test_auto=$power_test" \
@@ -735,10 +712,8 @@ if [ "$ge_present_probe" -eq 1 ] || [ "$local_fixture" -eq 1 ]; then
     # software renderer makes the copied pixels observable to PSP code.
     software_rendering=True
 fi
-if [ "$webgl_ge_probe" -eq 1 ] || [ "$local_fixture" -eq 1 ]; then
-    # The census consumes PSP-side timers and list sizes; it does not compare
-    # host-rendered pixels. Local browser fixtures likewise need predictable
-    # startup. Vulkan avoids a macOS OpenGL initialization stall that can
+if [ "$local_fixture" -eq 1 ]; then
+    # Local browser fixtures need predictable startup. Vulkan avoids a macOS OpenGL initialization stall that can
     # otherwise consume most of the isolated run's timeout before PSP code
     # starts.
     graphics_backend="3 (VULKAN)"
@@ -1011,13 +986,6 @@ elif [ "$expect_network" = ge-present ]; then
             'FAIL: the fullscreen-video display surface was not entered and left cleanly.' >&2
         exit 1
     fi
-elif [ "$expect_network" = webgl-ge ]; then
-    if ! grep -q 'tilefinch-webgl-ge-probe: event=pass' "$validation"; then
-        grep 'tilefinch-webgl-ge-probe:' "$validation" || true
-        printf 'PSP WebGL GE cost probe failed; see %s\n' \
-            "$validation" >&2
-        exit 1
-    fi
 elif [ "$expect_network" = raster ]; then
     if ! grep -q 'tilefinch-raster-fixture: event=psp-pass' \
             "$validation"; then
@@ -1164,14 +1132,6 @@ if [ "$cancel_after_ms" -eq 0 ]; then
         # enumerates was actually run.
         if ! grep -q 'tilefinch-media-present-probe: case=' "$validation"; then
             printf 'Present probe reported no cases; see %s\n' \
-                "$validation" >&2
-            exit 1
-        fi
-    elif [ "$webgl_ge_probe" -eq 1 ]; then
-        # This isolated cost census also exits before navigation. Its scene
-        # and terminal assertions were checked above.
-        if ! grep -q 'tilefinch-webgl-ge-probe: scene=' "$validation"; then
-            printf 'WebGL GE probe reported no scenes; see %s\n' \
                 "$validation" >&2
             exit 1
         fi
@@ -1405,8 +1365,6 @@ elif [ "$expect_network" = ge-present ]; then
     # as a separate `if` the assignment was immediately overwritten by the
     # chain's `else`, which greps for a warmup line this mode never prints.
     network_summary='tilefinch-network: not used by the present probe'
-elif [ "$expect_network" = webgl-ge ]; then
-    network_summary='tilefinch-network: not used by the WebGL GE probe'
 elif [ "$expect_network" = raster ]; then
     network_summary='tilefinch-network: not used by embedded raster fixture'
 elif [ "$expect_network" = fixture ]; then
@@ -1435,9 +1393,6 @@ elif [ "$ge_present_probe" -eq 1 ]; then
     # `else` below, which greps for a page-load line this mode never prints.
     load_summary=$(
         grep 'tilefinch-media-present-probe: event=' "$validation" | tail -1)
-elif [ "$webgl_ge_probe" -eq 1 ]; then
-    load_summary=$(
-        grep 'tilefinch-webgl-ge-probe: event=' "$validation" | tail -1)
 elif [ "$raster_fixture_test" -eq 1 ]; then
     load_summary=$(grep 'tilefinch-raster-fixture: event=' "$validation" | tail -1)
 elif [ "$media_fixture_test" -eq 1 ]; then
@@ -1460,11 +1415,6 @@ fi
 if [ "$ge_present_probe" -eq 1 ]; then
     printf 'PASS: graphics-engine video presentation (%ss)\n' "$elapsed"
     grep 'tilefinch-media-present-probe: case=' "$validation" || true
-    exit 0
-fi
-if [ "$webgl_ge_probe" -eq 1 ]; then
-    printf 'PASS: WebGL-style graphics-engine cost probe (%ss)\n' "$elapsed"
-    grep 'tilefinch-webgl-ge-probe: scene=' "$validation" || true
     exit 0
 fi
 if [ "$media_range_probe" -eq 1 ]; then

@@ -71,6 +71,7 @@ home-menu	scroll.complete_p95_ms	16.7	5.0
 home-menu	scroll.first_visible_max_ms	16.7	5.0
 home-menu	scroll.first_visible_p50_ms	16.7	5.0
 home-menu	scroll.first_visible_p95_ms	16.7	5.0
+home-menu	scroll.noop_max_ms	0.4	5.0
 home-menu	ui.compose_avg_us	18131	1813.1
 home-menu	ui.compose_max_us	35444	5316.6
 home-menu	ui.over_33ms	1	1.0

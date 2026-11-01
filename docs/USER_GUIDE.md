@@ -161,9 +161,14 @@ appear automatically. Feed responses are kept only in memory.
 
 In the signed-in header, **Account** opens a small local panel for feed
 navigation and switching accounts; select Account again to close it.
-The panel also opens **Watch Later** and **Playlists**. Video details offer
+The panel also opens **Watch Later**, **History** and **Playlists**. History
+lists recently watched videos with their resume positions, a page at a time
+with **Load more**; signed out, it points to **Sign in**. Video details offer
 Watch Later add/remove actions, **Save to playlist**, and channel
-**Subscribe/Unsubscribe** controls. Playlist pages load a bounded set of
+**Subscribe/Unsubscribe** controls. The channel name, first in the action row
+below the video, opens the channel. **Up next** lists up to 12 suggestions
+from the video's page, without ads, Shorts shelves or mixes; a suggested
+playlist appears as a playlist card. Playlist pages load a bounded set of
 entries at a time with **Load more**; editable lists also offer **Remove**.
 Choose **Play all** to start at the beginning, or select a video thumbnail to
 play from that entry, keeping the playlist order (including repeated videos).

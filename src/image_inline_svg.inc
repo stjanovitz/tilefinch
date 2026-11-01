@@ -635,6 +635,14 @@ static bool inline_svg_apply_default_viewport(
         snprintf(height, sizeof(height), "%d", style->height);
         numeric_height = (float) style->height;
     }
+    /* An attribute the rasterizer cannot resolve ("1em", "100%") gives way
+       to its computed length. Left in place, NanoSVG read it as 0 and fell
+       back to the viewBox: a 1em icon with a 0 0 256 256 viewBox became a
+       256 KiB raster for a 16 px box. */
+    if (!width_missing && authored_width <= 0.0f && numeric_width > 0.0f)
+        width_missing = true;
+    if (!height_missing && authored_height <= 0.0f && numeric_height > 0.0f)
+        height_missing = true;
     /* Uniform resizing may retain the authored raster for display
        retargeting. A changed viewport ratio must instead be applied before
        viewBox mapping: stretching its old pixels distorts the artwork.

@@ -5001,20 +5001,90 @@ bool psp_ui_intent_predispatch_is_complete(const PspUiIntent *intent)
  * surfaces' hint line. The filled per-button chips (each in its own colour)
  * went with the cold era -- four saturated pills on a 21px bar were the
  * loudest thing on screen and none of the colours meant anything.
+ *
+ * Spacing is measured from the chrome face, never from fixed columns: a
+ * word sits closer to its own glyph than to the next pair's glyph, or
+ * "Open O Back" reads as "Open O" + "Back". `x` is the glyph's left edge;
+ * the return value is the label's end.
  */
-static void draw_button_legend(uint16_t *pixels, int width, int height,
-                               int stride, int x, int y, const char *button,
-                               const char *label, uint16_t accent,
-                               uint16_t text)
+enum {
+    UI_LEGEND_INNER_GAP = PSP_THEME_SPACE_S,
+    UI_LEGEND_PAIR_GAP = PSP_THEME_SPACE_XL
+};
+
+static int button_legend_width(const char *button, const char *label,
+                               int scale)
 {
-    (void) text;
+    int label_width = chrome_text_width_bytes(label, strlen(label), scale,
+                                              false);
+    return chrome_text_width_bytes(button, strlen(button), scale, false)
+        + (label_width > 0 ? UI_LEGEND_INNER_GAP + label_width : 0);
+}
+
+static int draw_button_legend(uint16_t *pixels, int width, int height,
+                              int stride, int x, int y, const char *button,
+                              const char *label, uint16_t accent, int scale)
+{
     int button_end = draw_text(pixels, width, height, stride,
-                               x + 3, y + 3, button, 8, accent, 1);
-    /* Without the chip the glyph and its word need the gap the chip's
-       padding used to provide, or "START Search" reads as one word. */
-    draw_text(pixels, width, height, stride,
-              button_end + 3 + PSP_THEME_SPACE_M, y + 3,
-              label, 12, PSP_THEME_TEXT_MUTED, 1);
+                               x, y, button, 8, accent, scale);
+    if (label[0] == '\0') return button_end;
+    return draw_text(pixels, width, height, stride,
+                     button_end + UI_LEGEND_INNER_GAP, y,
+                     label, 16, PSP_THEME_TEXT_MUTED, scale);
+}
+
+/* One pair of a legend row, in display order. Lower `keep` drops first
+   when the measured row is wider than its space. */
+typedef struct {
+    const char *button;
+    const char *label;
+    uint8_t keep;
+} UiLegendPair;
+
+enum { UI_LEGEND_PAIR_LIMIT = 8 };
+
+/* Which pairs of `pairs` fit between left and right at this scale. */
+static void legend_row_fit(const UiLegendPair *pairs, size_t count,
+                           int space, int scale, bool *shown)
+{
+    int total = 0;
+    size_t visible = 0;
+    for (size_t at = 0; at < count; at++) {
+        shown[at] = true;
+        total += button_legend_width(pairs[at].button, pairs[at].label,
+                                     scale);
+        visible++;
+    }
+    if (visible > 1) total += (int) (visible - 1) * UI_LEGEND_PAIR_GAP;
+    while (visible > 0 && total > space) {
+        size_t drop = count;
+        for (size_t at = 0; at < count; at++)
+            if (shown[at] && (drop == count
+                              || pairs[at].keep < pairs[drop].keep))
+                drop = at;
+        shown[drop] = false;
+        total -= button_legend_width(pairs[drop].button, pairs[drop].label,
+                                     scale);
+        if (--visible > 0) total -= UI_LEGEND_PAIR_GAP;
+    }
+}
+
+static void draw_legend_row(uint16_t *pixels, int width, int height,
+                            int stride, int left, int right, int y,
+                            const UiLegendPair *pairs, size_t count,
+                            uint16_t accent, int scale)
+{
+    bool shown[UI_LEGEND_PAIR_LIMIT];
+    if (count > UI_LEGEND_PAIR_LIMIT) count = UI_LEGEND_PAIR_LIMIT;
+    legend_row_fit(pairs, count, right - left, scale, shown);
+    int x = left;
+    for (size_t at = 0; at < count; at++) {
+        if (!shown[at]) continue;
+        x = draw_button_legend(pixels, width, height, stride, x, y,
+                               pairs[at].button, pairs[at].label, accent,
+                               scale)
+            + UI_LEGEND_PAIR_GAP;
+    }
 }
 
 static void draw_focus(const PspUiState *ui, uint16_t *pixels, int width,
@@ -5267,62 +5337,66 @@ static void draw_bottom_bar(const PspUiState *ui, uint16_t *pixels, int width,
         char label[180];
         snprintf(label, sizeof(label), "%s: %s",
                  tilefinch_ui_text("WI-FI SIGN-IN"), domain);
+        int cancel_x = width - 7
+            - button_legend_width("O", "Cancel", scale);
         draw_text_with_font(
             pixels, width, height, stride, 7, top + (scale == 2 ? 7 : 6),
-            label, 48, width - 92, accent, scale == 2 ? 2 : 1,
-            NULL, true);
-        draw_button_legend(
-            pixels, width, height, stride, width - 83, top + 4,
-            "O", "Cancel", accent, text);
+            label, 48, cancel_x - UI_LEGEND_PAIR_GAP, accent,
+            scale == 2 ? 2 : 1, NULL, true);
+        draw_button_legend(pixels, width, height, stride, cancel_x,
+                           top + 7, "O", "Cancel", accent, scale);
         return;
     }
     if (ui->screen == PSP_UI_SCREEN_PAGE && ui->focus_label_valid
         && ui->focus_label[0] != '\0' && !ui->focus_editable) {
-        draw_button_legend(pixels, width, height, stride, 7,
-                           top + 4, "X", "", accent, text);
-        draw_fitted_ui_text(pixels, width, height, stride, 25,
-            top + (scale == 2 ? 7 : 6), tilefinch_ui_display_name(ui->focus_label), width - 92,
-            PSP_THEME_TEXT_MUTED, scale, false);
-        draw_button_legend(pixels, width, height, stride, width - 83,
-                           top + 4, "O", "Back", accent, text);
+        int back_x = width - 7 - button_legend_width("O", "Back", scale);
+        int name_x = draw_button_legend(pixels, width, height, stride, 10,
+                                        top + 7, "X", "", accent, scale)
+            + UI_LEGEND_INNER_GAP;
+        draw_fitted_ui_text(pixels, width, height, stride, name_x,
+            top + (scale == 2 ? 7 : 6),
+            tilefinch_ui_display_name(ui->focus_label),
+            back_x - UI_LEGEND_PAIR_GAP, PSP_THEME_TEXT_MUTED, scale, false);
+        draw_button_legend(pixels, width, height, stride, back_x,
+                           top + 7, "O", "Back", accent, scale);
         return;
     }
-    if (scale == 2) {
-        draw_text(pixels, width, height, stride, 7, top + 7,
-                  ui->focus_editable
-                      ? "X Edit O Back □ Reload Start Enter"
-                      : "X Open O Back □ Reload Start Search",
-                  38,
-                  PSP_THEME_TEXT_MUTED, 2);
-        return;
+    const UiLegendPair pairs[] = {
+        {"X", ui->focus_editable ? "Edit" : "Open", 4u},
+        {"O", "Back", 3u},
+        {"TRI", "Bar", 0u},
+        {"START", ui->focus_editable ? "Enter" : "Search", 2u},
+        {"\xe2\x96\xa1", "Reload", 1u}
+    };
+    /* Scale 2 gives the legend the whole row; scale 1 keeps the scroll
+       position, and the blocked-request count a pair gap before it, on
+       the right. */
+    int legend_right = width - 7;
+    if (scale == 1) {
+        int percent = ui->maximum_scroll_y <= 0 ? 100
+            : ui->scroll_y * 100 / ui->maximum_scroll_y;
+        char progress[16];
+        snprintf(progress, sizeof(progress), "%d%%", percent);
+        draw_text(pixels, width, height, stride, width - 34, top + 7,
+                  progress, 5, PSP_THEME_TEXT_MUTED, 1);
+        legend_right = width - 34 - UI_LEGEND_PAIR_GAP;
+        if (ui->page_requests_blocked != 0) {
+            char blocked[12];
+            if (ui->page_requests_blocked > 999u)
+                snprintf(blocked, sizeof(blocked), "B999+");
+            else
+                snprintf(blocked, sizeof(blocked), "B%u",
+                         (unsigned) ui->page_requests_blocked);
+            draw_text_right_aligned(pixels, width, height, stride,
+                                    legend_right, top + 7, blocked, 6,
+                                    accent, 1, false);
+            legend_right -= chrome_text_width_bytes(
+                blocked, strlen(blocked), 1, false) + UI_LEGEND_PAIR_GAP;
+        }
     }
-    draw_button_legend(pixels, width, height, stride, 7, top + 4,
-                       "X", "Open", accent, text);
-    draw_button_legend(pixels, width, height, stride, 58, top + 4,
-                       "O", "Back", accent, text);
-    draw_button_legend(pixels, width, height, stride, 109, top + 4,
-                       "TRI", "Bar", accent, text);
-    draw_button_legend(pixels, width, height, stride, 166, top + 4,
-                       "START", ui->focus_editable ? "Enter" : "Search",
-                       accent, text);
-    draw_button_legend(pixels, width, height, stride, 253, top + 4,
-                       "□", "Reload", accent, text);
-    int percent = ui->maximum_scroll_y <= 0 ? 100
-        : ui->scroll_y * 100 / ui->maximum_scroll_y;
-    char progress[16];
-    snprintf(progress, sizeof(progress), "%d%%", percent);
-    draw_text(pixels, width, height, stride, width - 34, top + 7,
-              progress, 5, PSP_THEME_TEXT_MUTED, 1);
-    if (ui->page_requests_blocked != 0) {
-        char blocked[12];
-        if (ui->page_requests_blocked > 999u)
-            snprintf(blocked, sizeof(blocked), "B999+");
-        else
-            snprintf(blocked, sizeof(blocked), "B%u",
-                     (unsigned) ui->page_requests_blocked);
-        draw_text(pixels, width, height, stride, width - 78, top + 7,
-                  blocked, 6, accent, 1);
-    }
+    draw_legend_row(pixels, width, height, stride, 10, legend_right,
+                    top + 7, pairs, sizeof(pairs) / sizeof(pairs[0]),
+                    accent, scale);
 }
 
 /*
@@ -9998,7 +10072,9 @@ static TILEFINCH_OUT_OF_LINE unsigned media_menu_count(const PspUiMediaState *me
 {
     const PspUiMediaPresentation *p = media->presentation;
     return tab == PSP_UI_MEDIA_TAB_AUDIO ? p->audio_track_count
-        : tab == PSP_UI_MEDIA_TAB_SUBTITLES ? (unsigned) p->subtitle_track_count + 1u
+        : tab == PSP_UI_MEDIA_TAB_SUBTITLES
+            ? media->resolving && p->subtitle_track_count == 0 ? 0u
+                : (unsigned) p->subtitle_track_count + 1u
         : tab == PSP_UI_MEDIA_TAB_QUEUE ? media_queue_ended(media) ? 2u + (p->queue_position != 0)
             : p->queue_active && (p->queue_failed || p->queue_count > 1u)
                 ? (unsigned) (p->queue_count > 6u ? 6u : p->queue_count) + PSP_UI_MEDIA_QUEUE_CONTROL_ROWS : 0u
@@ -11767,11 +11843,22 @@ void psp_ui_media_composite_layers(
             media->failed ? rgb565(248, 160, 160) : text,
             2, false);
         if (reason != NULL) {
-            draw_text_with_font(
-                pixels, width, height, stride,
-                message.x + 18, message.y + 36,
-                reason, 34, message.x + message.width - 18,
-                muted, 2, NULL, false);
+            /* A catalog details line (psp_media_raise_error's cause) is
+               translated and fitted like the headline; engine text keeps
+               its bounded English row. */
+            const char *details = tilefinch_ui_text(reason);
+            if (details != reason)
+                draw_fitted_ui_text(
+                    pixels, width, height, stride,
+                    message.x + 18, message.y + 36,
+                    details, message.x + message.width - 18,
+                    muted, 2, false);
+            else
+                draw_text_with_font(
+                    pixels, width, height, stride,
+                    message.x + 18, message.y + 36,
+                    reason, 34, message.x + message.width - 18,
+                    muted, 2, NULL, false);
         }
         if (media->resolving) {
             int track_x = message.x + 18;

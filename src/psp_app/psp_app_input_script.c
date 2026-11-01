@@ -11,6 +11,7 @@
 #include "psp_app_internal.h"
 
 #include "tilefinch/pixel_math.h"
+#include "tilefinch/psp_input_page_media.h"
 #include "tilefinch/psp_input_script.h"
 #include "tilefinch/script_loader.h"
 #include "tilefinch/script_split.h"
@@ -200,8 +201,11 @@ typedef struct {
 } PspSubtitleBurstFrame;
 
 static PspSubtitleBurstFrame psp_subtitle_burst[PSP_SUBTITLE_BURST_LIMIT];
-static PspSubtitleBurstFrame psp_subtitle_previous;
-static PspSubtitleBurstFrame psp_subtitle_current_scratch;
+/* The preceding publish and the one being sampled; they trade places after
+   each sample instead of copying 20 KiB. */
+static PspSubtitleBurstFrame psp_subtitle_frames[2];
+static PspSubtitleBurstFrame *psp_subtitle_previous = &psp_subtitle_frames[0];
+static PspSubtitleBurstFrame *psp_subtitle_current = &psp_subtitle_frames[1];
 static size_t psp_subtitle_burst_count;
 static unsigned psp_subtitle_burst_remaining;
 static bool psp_subtitle_previous_valid;
@@ -358,7 +362,8 @@ bool psp_input_script_running(void)
 unsigned psp_input_script_step_now(const char **kind)
 {
     static const char *const names[] = {
-        "wait", "hold", "press", "mark", "stick", "end", "until", "timed-press"
+        "wait", "hold", "press", "mark", "stick", "end", "until", "timed-press",
+        "page-action"
     };
     const PspInputScript *script = &psp_input_script;
     unsigned index = script->step;
@@ -1188,7 +1193,24 @@ void psp_input_script_capture_media_present(
         || psp_subtitle_burst_count == PSP_SUBTITLE_BURST_LIMIT)
         return;
 
-    PspSubtitleBurstFrame *current = &psp_subtitle_current_scratch;
+    /* Counted to the end of this function (s-subtitle, inside s-probe). */
+    MEDIA_SWDEC_CPU_BEGIN(MEDIA_SWDEC_CPU_SUBTITLE);
+    /* A publish's pixels are kept only if it can enter a burst: inside one,
+       as its first frame (a captioned publish), or as its second (any
+       publish after a captioned one). An uncaptioned publish outside all
+       three leaves only "no caption" as the preceding publish, so the strip
+       is not read. Before the first caption this is every publish. */
+    const char *subtitle = media->presentation != NULL
+        ? media->presentation->subtitle_text : "";
+    if (subtitle[0] == '\0' && psp_subtitle_burst_remaining == 0
+        && !(psp_subtitle_previous_valid
+             && psp_subtitle_previous->subtitle[0] != '\0')) {
+        psp_subtitle_previous->subtitle[0] = '\0';
+        psp_subtitle_previous_valid = true;
+        MEDIA_SWDEC_CPU_END(MEDIA_SWDEC_CPU_SUBTITLE);
+        return;
+    }
+    PspSubtitleBurstFrame *current = psp_subtitle_current;
     psp_subtitle_burst_sample(
         current, media, pixels_565, pixels_8888, stride_pixels,
         video_surface, buffer_index, skipped, supervisor, frame,
@@ -1198,10 +1220,10 @@ void psp_input_script_capture_media_present(
         if (nonempty) psp_subtitle_seen_nonempty = true;
     } else if (psp_subtitle_burst_remaining == 0
                && psp_subtitle_previous_valid
-               && psp_subtitle_previous.subtitle[0] != '\0'
+               && psp_subtitle_previous->subtitle[0] != '\0'
                && current->subtitle_hash
-                      != psp_subtitle_previous.subtitle_hash) {
-        psp_subtitle_burst[0] = psp_subtitle_previous;
+                      != psp_subtitle_previous->subtitle_hash) {
+        psp_subtitle_burst[0] = *psp_subtitle_previous;
         psp_subtitle_burst[1] = *current;
         psp_subtitle_burst_count = 2u;
         psp_subtitle_burst_remaining = PSP_SUBTITLE_BURST_LIMIT - 2u;
@@ -1209,10 +1231,12 @@ void psp_input_script_capture_media_present(
         psp_subtitle_burst[psp_subtitle_burst_count++] = *current;
         psp_subtitle_burst_remaining--;
     }
-    if (psp_subtitle_burst_remaining == 0
-        && psp_subtitle_burst_count != 0) return;
-    psp_subtitle_previous = *current;
-    psp_subtitle_previous_valid = true;
+    if (psp_subtitle_burst_remaining != 0 || psp_subtitle_burst_count == 0) {
+        psp_subtitle_current = psp_subtitle_previous;
+        psp_subtitle_previous = current;
+        psp_subtitle_previous_valid = true;
+    }
+    MEDIA_SWDEC_CPU_END(MEDIA_SWDEC_CPU_SUBTITLE);
 }
 
 static bool psp_subtitle_burst_path(
@@ -1443,4 +1467,14 @@ void psp_input_script_summary(void)
                (unsigned) psp_subtitle_burst_count,
                metadata_written ? 1 : 0);
     }
+}
+
+void psp_input_script_page_actions(BrowserEngine *engine)
+{
+    if (psp_input_script_page_action(&psp_input_script)
+        != PSP_INPUT_SCRIPT_PAGE_ACTION_FOCUS_MEDIA) return;
+    BrowserPageMediaTarget target = psp_input_focus_page_media(engine);
+    printf("tilefinch-input-script: step=%u action=focus-page-media "
+           "target=%s\n", (unsigned) psp_input_script.step,
+           psp_input_page_media_target_name(target));
 }

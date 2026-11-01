@@ -2,9 +2,11 @@
 
 #include "tilefinch/fetch.h"
 #include "tilefinch/file_download.h"
+#include "tilefinch/media_candidates.h"
 #include "tilefinch/media_discovery.h"
 #include "tilefinch/platform.h"
 #include "tilefinch/url.h"
+#include "tilefinch_compiler.h"
 
 #include <ctype.h>
 #include <limits.h>
@@ -434,35 +436,76 @@ static bool media_type_supported(lxb_dom_node_t *node, bool audio_only)
     return next == ';' || isspace(next);
 }
 
-static const char *media_source_reference(
-    BrowserController *controller, lxb_dom_node_t *media, size_t *length,
-    bool audio_only)
+/* The quality a <source> declares through the attributes players commonly
+   use for rendition menus, or 0. */
+static unsigned media_source_quality(lxb_dom_node_t *source)
 {
-    const char *source = document_attribute(media, "src", length);
-    if (source != NULL && *length != 0) return source;
+    static const char *const hints[] = {
+        "size", "res", "data-res", "data-quality", "label", "height"
+    };
+    for (size_t i = 0; i < sizeof(hints) / sizeof(hints[0]); i++) {
+        size_t length = 0;
+        const char *value = document_attribute(source, hints[i], &length);
+        unsigned quality = value == NULL ? 0
+            : media_candidate_quality_label(value, length);
+        if (quality != 0) return quality;
+    }
+    return 0;
+}
+
+#define MEDIA_SOURCE_SCAN_LIMIT 16u
+
+/* The element's own media references in the order to try them: its src
+   attribute alone when present, otherwise the supported <source> children
+   whose media query matches, ranked by the discovery quality policy (a
+   stable sort, so sources without hints keep document order). Returns the
+   number of nodes written; each carries the reference in its src. */
+static size_t media_source_references(
+    BrowserController *controller, lxb_dom_node_t *media,
+    bool audio_only, lxb_dom_node_t **ranked)
+{
+    size_t length = 0;
+    const char *source = document_attribute(media, "src", &length);
+    if (source != NULL && length != 0) {
+        ranked[0] = media;
+        return 1u;
+    }
+    unsigned quality[MEDIA_SOURCE_SCAN_LIMIT];
+    size_t count = 0;
     unsigned child_elements = 0;
     for (lxb_dom_node_t *child = media == NULL ? NULL : media->first_child;
          child != NULL; child = child->next) {
         if (child->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
-        if (child_elements++ >= 16u) break;
-        if (!node_name_is(child, "source")) continue;
         /* Match the bootstrap's limit. A hostile element may contain the
            document's full node allowance; activation must remain a small,
            deterministic input operation rather than a second DOM walk. */
+        if (child_elements++ >= MEDIA_SOURCE_SCAN_LIMIT) break;
+        if (!node_name_is(child, "source")) continue;
         if (!media_type_supported(child, audio_only)) {
             continue;
         }
         size_t media_length = 0;
-        const char *media = document_attribute(
+        const char *media_query = document_attribute(
             child, "media", &media_length);
-        if (media != NULL && media_length != 0
+        if (media_query != NULL && media_length != 0
             && !stylesheet_media_matches(
                    &controller->navigation->page.stylesheet,
-                   media, media_length)) continue;
-        source = document_attribute(child, "src", length);
-        if (source != NULL && *length != 0) return source;
+                   media_query, media_length)) continue;
+        source = document_attribute(child, "src", &length);
+        if (source == NULL || length == 0) continue;
+        /* Audio has no renditions to rank: document order. */
+        unsigned value = audio_only ? 0 : media_source_quality(child);
+        size_t at = count++;
+        while (at > 0
+               && media_discovery_quality_preferred(value, quality[at - 1u])) {
+            ranked[at] = ranked[at - 1u];
+            quality[at] = quality[at - 1u];
+            at--;
+        }
+        ranked[at] = child;
+        quality[at] = value;
     }
-    return NULL;
+    return count;
 }
 
 static void media_credentials_policy(
@@ -484,6 +527,159 @@ static void media_credentials_policy(
         : TILEFINCH_CREDENTIALS_SAME_ORIGIN;
 }
 
+/* ControllerAction already owns a bounded body scratch area; media
+   actions never carry a form body. Its first half holds the reference being
+   resolved, and its second half collects the further renditions, which move
+   to the start of body (body_length bytes, media_candidates format) before
+   the action is returned. This keeps a second 2 KiB frame off the
+   activation hot path on Allegrex. */
+#define MEDIA_ACTION_SCRATCH (sizeof(((ControllerAction *) 0)->body) / 2u)
+
+_Static_assert(sizeof(((ControllerAction *) 0)->body) - MEDIA_ACTION_SCRATCH
+                   >= MEDIA_CANDIDATE_PACKED_CAPACITY
+               && MEDIA_ACTION_SCRATCH >= NAVIGATION_URL_LIMIT,
+               "media action scratch must hold a reference and the renditions");
+
+typedef struct {
+    ControllerAction *action;
+    const char *base;
+    const TilefinchContentSecurityPolicy *policy;
+    char *packed;
+    size_t packed_length;
+    bool found;
+} MediaCandidateBuild;
+
+/* Resolves one reference (already NUL-terminated in the action's scratch)
+   and makes it the first candidate, or appends it to the further ones. A
+   WebM first candidate gives way to the next playable one: the native route
+   cannot play it, but a page offering only WebM still reports why. */
+static void media_candidate_add(
+    MediaCandidateBuild *build, size_t length, MediaDiscoveryKind kind)
+{
+    ControllerAction *action = build->action;
+    if (length == 0 || length >= NAVIGATION_URL_LIMIT) return;
+    char *entry = build->packed + build->packed_length;
+    size_t room = MEDIA_CANDIDATE_PACKED_CAPACITY - build->packed_length;
+    char *url = build->found ? entry + 1 : action->url;
+    size_t url_capacity = !build->found ? sizeof(action->url)
+        : room > 2u ? room - 1u : 0;
+    if (url_capacity == 0) return;
+    if (!fetch_resolve_url(build->base, action->body, url, url_capacity)
+        || !tilefinch_csp_allows_request(
+               build->policy, TILEFINCH_DESTINATION_MEDIA, url)) {
+        url[0] = '\0';
+        return;
+    }
+    if (kind == MEDIA_DISCOVERY_NONE)
+        kind = media_discovery_reference_kind(url, strlen(url));
+    if (!build->found) {
+        action->media_kind = kind;
+        build->found = true;
+    } else if (action->media_kind == MEDIA_DISCOVERY_WEBM) {
+        if (kind != MEDIA_DISCOVERY_WEBM) {
+            memcpy(action->url, url, strlen(url) + 1u);
+            action->media_kind = kind;
+        }
+    } else {
+        entry[0] = (char) ('0' + kind);
+        (void) media_candidates_commit(
+            build->packed, MEDIA_CANDIDATE_PACKED_CAPACITY,
+            &build->packed_length, action->url);
+    }
+}
+
+static void media_candidate_add_reference(
+    MediaCandidateBuild *build, const char *reference, size_t length,
+    MediaDiscoveryKind kind)
+{
+    if (reference == NULL || length == 0 || length >= MEDIA_ACTION_SCRATCH)
+        return;
+    memmove(build->action->body, reference, length);
+    build->action->body[length] = '\0';
+    media_candidate_add(build, length, kind);
+}
+
+/* The page's discovered candidate, then its best HLS reference when the
+   winner is a direct MP4: a stream can offer a rendition the file lacks.
+   Kept out of line so its second URL buffer lives only for the scan. */
+static TILEFINCH_OUT_OF_LINE void media_candidate_add_discovered(
+    MediaCandidateBuild *build, const PocDocument *document,
+    lxb_dom_node_t *media)
+{
+    char streaming[NAVIGATION_URL_LIMIT];
+    MediaDiscoveryResult discovery = {0};
+    if (!media_discover_document_candidates(
+            document, build->base, media, build->action->body,
+            MEDIA_ACTION_SCRATCH, streaming, sizeof(streaming),
+            &discovery)) return;
+    media_candidate_add(build, strlen(build->action->body), discovery.kind);
+    media_candidate_add_reference(
+        build, streaming, strlen(streaming), MEDIA_DISCOVERY_HLS);
+}
+
+/* Nothing on the page plays, but it declares a player page: Play opens
+   that page (an http(s) document other than this one) to play from. */
+static TILEFINCH_OUT_OF_LINE bool controller_build_embed_hop_action(
+    BrowserController *controller, const char *base, ControllerAction *action)
+{
+    const MediaDeclaredVideo *declared = media_declared_video_or_embed_cached(
+        &controller->navigation->page.document);
+    if (declared == NULL || declared->embed_url[0] == '\0'
+        || !fetch_resolve_url(base, declared->embed_url, action->url,
+                              sizeof(action->url))
+        || (strncasecmp(action->url, "https://", 8u) != 0
+            && strncasecmp(action->url, "http://", 7u) != 0)
+        || strcmp(action->url, base) == 0
+        || navigation_url_is_same_document(
+               controller->navigation, action->url)) {
+        action->url[0] = '\0';
+        return false;
+    }
+    snprintf(action->method, sizeof(action->method), "%s", "GET");
+    action->content_type[0] = '\0';
+    action->navigation_source = CONTROLLER_NAVIGATION_USER;
+    action->media_kind = MEDIA_DISCOVERY_NONE;
+    action->embed_hop = true;
+    action->type = CONTROLLER_ACTION_NAVIGATE;
+    return true;
+}
+
+bool controller_build_embed_media_action(
+    BrowserController *controller, ControllerAction *action)
+{
+    if (controller == NULL || controller->navigation == NULL
+        || action == NULL) return false;
+    const NavigationEntry *current = navigation_current(
+        controller->navigation);
+    if (current == NULL) return false;
+    memset(action, 0, sizeof(*action));
+    MediaCandidateBuild build = {
+        .action = action,
+        .base = current->url,
+        .policy = &controller->navigation->page.document
+                       .content_security_policy,
+        .packed = action->body + MEDIA_ACTION_SCRATCH
+    };
+    const PocDocument *document = &controller->navigation->page.document;
+    MediaDiscoveryKind kind = MEDIA_DISCOVERY_NONE;
+    for (size_t ordinal = 0; media_json_own_candidate(
+             document, ordinal, action->body, MEDIA_ACTION_SCRATCH, &kind);
+         ordinal++)
+        media_candidate_add(&build, strlen(action->body), kind);
+    if (!build.found) {
+        controller_action_clear_body(action);
+        action->url[0] = '\0';
+        return false;
+    }
+    action->media_mode = TILEFINCH_REQUEST_MODE_NO_CORS;
+    action->media_credentials = TILEFINCH_CREDENTIALS_INCLUDE;
+    controller_action_clear_body(action);
+    memmove(action->body, build.packed, build.packed_length);
+    action->body_length = build.packed_length;
+    action->type = CONTROLLER_ACTION_MEDIA;
+    return true;
+}
+
 static bool controller_build_media_action(
     BrowserController *controller, lxb_dom_node_t *media,
     ControllerAction *action)
@@ -492,56 +688,57 @@ static bool controller_build_media_action(
     bool audio_only = media != NULL && node_name_is(media, "audio");
     if (media != NULL && !audio_only && !node_name_is(media, "video"))
         return false;
-    size_t source_length = 0;
-    const char *source = media == NULL ? NULL : media_source_reference(
-        controller, media, &source_length, audio_only);
-    bool discovered = false;
-    MediaDiscoveryKind discovered_kind = MEDIA_DISCOVERY_NONE;
-    if (!audio_only && (source == NULL || source_length == 0)) {
-        const MediaDeclaredVideo *declared = media_declared_video_cached(
-            &controller->navigation->page.document);
-        if (declared != NULL) {
-            source_length = strlen(declared->media_url);
-            if (source_length == 0u || source_length >= sizeof(action->body))
-                return false;
-            memcpy(action->body, declared->media_url, source_length + 1u);
-            discovered_kind = declared->kind;
-        } else {
-            MediaDiscoveryResult discovery = {0};
-            if (!media_discover_document_candidate(
-                    &controller->navigation->page.document,
-                    action->body, sizeof(action->body), &discovery)) {
-                return false;
-            }
-            source_length = strlen(action->body);
-            discovered_kind = discovery.kind;
-        }
-        source = action->body;
-        discovered = true;
-    }
-    if (source_length == 0 || source_length >= NAVIGATION_URL_LIMIT) {
-        return false;
-    }
-    /* ControllerAction already owns a bounded body scratch area. Reuse its
-       first half while resolving instead of adding a 2 KiB frame to the
-       activation hot path on Allegrex. Media actions never carry a form
-       body, and the scratch is cleared before returning. */
-    if (!discovered) {
-        memcpy(action->body, source, source_length);
-        action->body[source_length] = '\0';
-    }
     const NavigationEntry *current = navigation_current(
         controller->navigation);
     const char *base = current == NULL ? NULL : current->url;
-    if (base == NULL || !fetch_resolve_url(
-            base, action->body, action->url, sizeof(action->url))) return false;
-    if (!discovered) {
-        discovered_kind = media_discovery_reference_kind(
-            action->url, strlen(action->url));
+    if (base == NULL) return false;
+    MediaCandidateBuild build = {
+        .action = action,
+        .base = base,
+        .policy = &controller->navigation->page.document
+                       .content_security_policy,
+        .packed = action->body + MEDIA_ACTION_SCRATCH
+    };
+    action->url[0] = '\0';
+    action->media_kind = MEDIA_DISCOVERY_NONE;
+    /* Candidates in order: the element's own references, then (for video)
+       the page's declared VideoObject/og:video URL and the discovered
+       candidate. Audio keeps its first source and nothing else. */
+    lxb_dom_node_t *ranked[MEDIA_SOURCE_SCAN_LIMIT];
+    size_t sources = media == NULL ? 0
+        : media_source_references(controller, media, audio_only, ranked);
+    for (size_t i = 0; i < sources && !(audio_only && build.found); i++) {
+        size_t length = 0;
+        const char *reference = document_attribute(
+            ranked[i], "src", &length);
+        media_candidate_add_reference(
+            &build, reference, length, MEDIA_DISCOVERY_NONE);
     }
-    if (!tilefinch_csp_allows_request(
-            &controller->navigation->page.document.content_security_policy,
-            TILEFINCH_DESTINATION_MEDIA, action->url)) return false;
+    if (!audio_only) {
+        const PocDocument *document = &controller->navigation->page.document;
+        const MediaDeclaredVideo *declared =
+            media_declared_video_cached(document);
+        /* A declaration only by og:type=video falls back on the page-load
+           markup scan, which knows nothing of the activated element; the
+           discovered candidate below repeats that scan with it. */
+        if (declared != NULL
+            && (declared->structured || declared->og_video)) {
+            media_candidate_add_reference(
+                &build, declared->media_url, strlen(declared->media_url),
+                declared->kind);
+        }
+        /* The declared URL may itself be the discovered candidate; the
+           list never repeats a URL. Skip the scan once the list is full. */
+        if (!build.found || media_candidates_count(
+                build.packed, build.packed_length)
+                < MEDIA_CANDIDATE_ALTERNATE_LIMIT)
+            media_candidate_add_discovered(&build, document, media);
+    }
+    if (!build.found) {
+        controller_action_clear_body(action);
+        return !audio_only && controller_build_embed_hop_action(
+            controller, base, action);
+    }
     action->media_mode = TILEFINCH_REQUEST_MODE_NO_CORS;
     action->media_credentials = TILEFINCH_CREDENTIALS_INCLUDE;
     if (media != NULL) {
@@ -556,8 +753,9 @@ static bool controller_build_media_action(
     action->media_node_handle = runtime == NULL || media == NULL ? 0
         : script_runtime_node_handle(runtime, media);
     action->media_audio_only = audio_only;
-    action->media_kind = discovered_kind;
     controller_action_clear_body(action);
+    memmove(action->body, build.packed, build.packed_length);
+    action->body_length = build.packed_length;
     action->type = CONTROLLER_ACTION_MEDIA;
     return true;
 }
@@ -1202,15 +1400,20 @@ static bool retain_link_focus(BrowserController *controller, size_t index)
     const LayoutDocument *layout = &controller->navigation->page.layout;
     if (index >= layout->link_count) return false;
     const LinkRegion *link = &layout->links[index];
-    if (link->url_length == 0
-        || link->url_length >= sizeof(controller->focus_link_url)) {
-        return false;
-    }
+    if (link->url_length == 0) return false;
     controller->focus_kind = CONTROLLER_FOCUS_LINK;
     controller->focus_index = index;
-    memcpy(controller->focus_link_url, link->url, link->url_length);
-    controller->focus_link_url[link->url_length] = '\0';
-    controller->focus_link_url_length = link->url_length;
+    /* A URL too long for the identity buffer keeps focus on the node alone.
+       Refusing focus here stopped linear traversal dead at such a link;
+       controller_activate refuses to follow it instead. */
+    if (link->url_length >= sizeof(controller->focus_link_url)) {
+        clear_link_focus_identity(controller);
+        if (link->node == NULL) return false;
+    } else {
+        memcpy(controller->focus_link_url, link->url, link->url_length);
+        controller->focus_link_url[link->url_length] = '\0';
+        controller->focus_link_url_length = link->url_length;
+    }
     retain_focus_node(controller, link->node);
     return true;
 }
@@ -1522,6 +1725,42 @@ static lxb_dom_node_t *flat_focus_node(const LayoutDocument *layout,
     return flat < layout->control_count ? layout->controls[flat].node : NULL;
 }
 
+static bool focus_region_rect(const BrowserController *controller,
+                              const LayoutScrollPlacementIndex *scrolls,
+                              bool control, size_t index,
+                              bool require_area,
+                              int *x, int *y, int *width, int *height);
+
+/* The engine's declared media card, when it is laid out on the current
+   screen: the first forward stop from no focus. Sequential order puts
+   links before controls, so without this the first d-pad press lands on
+   link 0 and the card (a control at body top) needs a second, spatial
+   move. Off-screen cards keep ordinary order so the press never scrolls
+   the reader away. */
+static bool controller_visible_media_card(
+    const BrowserController *controller, size_t *flat)
+{
+    const PocDocument *document = &controller->navigation->page.document;
+    if (document->declared_video_card_node == NULL
+        && document->reader_declared_video_card_node == NULL) return false;
+    const LayoutDocument *layout = &controller->navigation->page.layout;
+    const NavigationEntry *entry = navigation_current(controller->navigation);
+    int scroll_y = entry == NULL ? 0 : entry->scroll_y;
+    for (size_t index = 0; index < layout->control_count; index++) {
+        if (!controller_is_declared_media_card(
+                controller, layout->controls[index].node)) continue;
+        int x = 0, y = 0, width = 0, height = 0;
+        if (focus_region_rect(controller, NULL, true, index, true,
+                              &x, &y, &width, &height)
+            && y < scroll_y + controller->viewport_height
+            && y + height > scroll_y) {
+            *flat = layout->link_count + index;
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool controller_focus_relative(BrowserController *controller,
                                       bool forward)
 {
@@ -1529,6 +1768,10 @@ static bool controller_focus_relative(BrowserController *controller,
     if (count == 0) return false;
     bool had_focus = controller->focus_kind == CONTROLLER_FOCUS_LINK
         || controller->focus_kind == CONTROLLER_FOCUS_CONTROL;
+    size_t card = 0u;
+    if (!had_focus && forward
+        && controller_visible_media_card(controller, &card))
+        return select_flat_focus(controller, card);
     bool resolved = !had_focus || resolve_focus_node(
         controller, retained_focus_node(controller));
     lxb_dom_node_t *current = had_focus
@@ -1622,7 +1865,13 @@ bool controller_focus_previous(BrowserController *controller)
     return controller_focus_relative(controller, false);
 }
 
+/* A link or control region where the reader sees it: moved by the scroll
+   containers around it (as paint moves it) and, for viewport-fixed
+   content, pinned to the viewport at the current document scroll. The
+   result is in document coordinates. `scrolls` may be NULL, or prepared
+   once for a pass over many regions. */
 static bool focus_region_rect(const BrowserController *controller,
+                              const LayoutScrollPlacementIndex *scrolls,
                               bool control, size_t index,
                               bool require_area,
                               int *x, int *y, int *width, int *height)
@@ -1630,18 +1879,26 @@ static bool focus_region_rect(const BrowserController *controller,
     if (controller == NULL || controller->navigation == NULL) return false;
     const LayoutDocument *layout = &controller->navigation->page.layout;
     int rx, ry, rw, rh;
+    lxb_dom_node_t *node;
     if (control) {
         if (index >= layout->control_count) return false;
         const ControlRegion *region = &layout->controls[index];
         rx = region->x; ry = region->y;
         rw = region->width; rh = region->height;
+        node = region->node;
     } else {
         if (index >= layout->link_count) return false;
         const LinkRegion *region = &layout->links[index];
         rx = region->x; ry = region->y;
         rw = region->width; rh = region->height;
+        node = region->node;
     }
     if (require_area && (rw <= 0 || rh <= 0)) return false;
+    LayoutScrollPlacement placement;
+    if (layout_node_scroll_placement(layout, scrolls, node, &placement)) {
+        rx = controller_add_coordinate(rx, placement.dx);
+        ry = controller_add_coordinate(ry, placement.dy);
+    }
     const NavigationEntry *entry =
         navigation_current(controller->navigation);
     int scroll_y = entry == NULL ? 0 : entry->scroll_y;
@@ -1737,6 +1994,8 @@ bool controller_focus_direction(BrowserController *controller,
     }
 
     const LayoutDocument *layout = &controller->navigation->page.layout;
+    LayoutScrollPlacementIndex scrolls;
+    layout_scroll_placement_prepare(layout, &scrolls);
     lxb_dom_node_t *from_node = retained_focus_node(controller);
     bool found = false;
     bool best_in_beam = false;
@@ -1752,8 +2011,8 @@ bool controller_focus_direction(BrowserController *controller,
                                            : layout->links[index].node;
             if (node == NULL || node == from_node) continue;
             int x = 0, y = 0, width = 0, height = 0;
-            if (!focus_region_rect(controller, control, index, true,
-                                   &x, &y, &width, &height)) continue;
+            if (!focus_region_rect(controller, &scrolls, control, index,
+                                   true, &x, &y, &width, &height)) continue;
             int64_t score = 0;
             bool in_beam = false;
             if (!focus_candidate_score(
@@ -1810,7 +2069,7 @@ static bool focus_flat_reveal_within(const BrowserController *controller,
     bool control = flat >= layout->link_count;
     size_t index = control ? flat - layout->link_count : flat;
     int y = 0, height = 0;
-    return focus_region_rect(controller, control, index, false,
+    return focus_region_rect(controller, NULL, control, index, false,
                              NULL, &y, NULL, &height)
         && (int64_t) y + height + controller->viewport_height
                <= region_end;
@@ -1894,6 +2153,8 @@ bool controller_focus_move_within(const BrowserController *controller,
             controller, direction == CONTROLLER_FOCUS_DOWN
                 || direction == CONTROLLER_FOCUS_RIGHT, region_end);
     if ((int64_t) from_y + from_height >= region_end) return false;
+    LayoutScrollPlacementIndex scrolls;
+    layout_scroll_placement_prepare(layout, &scrolls);
     lxb_dom_node_t *from_node = retained_focus_node(controller);
     bool found = false, best_in_beam = false;
     size_t best_flat = 0;
@@ -1907,8 +2168,8 @@ bool controller_focus_move_within(const BrowserController *controller,
                                            : layout->links[index].node;
             if (node == NULL || node == from_node) continue;
             int x = 0, y = 0, width = 0, height = 0;
-            if (!focus_region_rect(controller, control, index, true,
-                                   &x, &y, &width, &height)) continue;
+            if (!focus_region_rect(controller, &scrolls, control, index,
+                                   true, &x, &y, &width, &height)) continue;
             size_t flat = control ? layout->link_count + index : index;
             /* An entry laid out past the cut may sit elsewhere in the
                complete layout: it must lie where nothing could prefer it. */
@@ -1963,9 +2224,91 @@ typedef struct {
     int y;
     int width;
     int height;
+    /* The scroll containers' offset included in x/y. */
+    int scroll_dx;
+    int scroll_dy;
     int client_x;
     int client_y;
 } ControllerHit;
+
+/* How far scroll containers can move any geometry: placement subtracts a
+   subset of the scroll offsets, so it lies between the negated sum of the
+   positive offsets and the negated sum of the negative ones (offsets are
+   clamped non-negative, so the latter is zero in practice). */
+typedef struct {
+    int64_t up_x, up_y;
+    int64_t down_x, down_y;
+} ControllerScrollReach;
+
+static void controller_scroll_reach_add(ControllerScrollReach *reach,
+                                        const LayoutNodeBox *box)
+{
+    if (box == NULL) return;
+    if (box->scroll_x > 0) reach->up_x += box->scroll_x;
+    else reach->down_x -= box->scroll_x;
+    if (box->scroll_y > 0) reach->up_y += box->scroll_y;
+    else reach->down_y -= box->scroll_y;
+}
+
+static ControllerScrollReach controller_scroll_reach(
+    const LayoutDocument *layout, const LayoutScrollPlacementIndex *scrolls)
+{
+    ControllerScrollReach reach = {0, 0, 0, 0};
+    /* A complete index lists every box that can hold an offset. */
+    if (scrolls->complete) {
+        for (size_t i = 0; i < scrolls->count; i++) {
+            controller_scroll_reach_add(
+                &reach, layout_box_for_node(layout, scrolls->containers[i]));
+        }
+        return reach;
+    }
+    for (size_t i = 0; i < layout->node_box_count; i++) {
+        controller_scroll_reach_add(&reach, &layout->node_boxes[i]);
+    }
+    return reach;
+}
+
+/* Whether document point (x, y) lands on geometry laid out for node at
+   (rx, ry), shifted by shift_y for viewport-fixed content. The scroll
+   containers around node move the geometry, and hide whatever of it they
+   have scrolled out of their scrollports; on a hit, rx and ry are updated
+   to where the reader sees it. */
+static bool controller_region_hit(const LayoutDocument *layout,
+                                  const LayoutScrollPlacementIndex *scrolls,
+                                  ControllerScrollReach reach,
+                                  const lxb_dom_node_t *node,
+                                  int *rx, int *ry, int width, int height,
+                                  int shift_y, int x, int y,
+                                  int *scroll_dx, int *scroll_dy)
+{
+    int left = *rx, top = controller_add_coordinate(*ry, shift_y);
+    LayoutScrollPlacement placement;
+    *scroll_dx = *scroll_dy = 0;
+    /* Reject what no placement within the reach could bring under the
+       point before the ancestor walk. */
+    if ((int64_t) x >= (int64_t) left + width + reach.down_x
+        || (int64_t) y >= (int64_t) top + height + reach.down_y
+        || (int64_t) x < (int64_t) left - reach.up_x
+        || (int64_t) y < (int64_t) top - reach.up_y) return false;
+    if (layout_node_scroll_placement(layout, scrolls, node, &placement)) {
+        int clip_y = y - shift_y;
+        if ((placement.clipped_x
+             && (x < placement.clip_left || x >= placement.clip_right))
+            || (placement.clipped_y
+                && (clip_y < placement.clip_top
+                    || clip_y >= placement.clip_bottom))) return false;
+        left = controller_add_coordinate(left, placement.dx);
+        top = controller_add_coordinate(top, placement.dy);
+        *scroll_dx = placement.dx;
+        *scroll_dy = placement.dy;
+    }
+    if ((int64_t) x < left || (int64_t) x >= (int64_t) left + width
+        || (int64_t) y < top || (int64_t) y >= (int64_t) top + height)
+        return false;
+    *rx = left;
+    *ry = top;
+    return true;
+}
 
 static bool controller_hit_test(BrowserController *controller,
                                 int device_x, int device_y,
@@ -1982,21 +2325,27 @@ static bool controller_hit_test(BrowserController *controller,
     memset(hit, 0, sizeof(*hit));
     hit->client_x = x;
     hit->client_y = client_y;
+    LayoutScrollPlacementIndex scrolls;
+    layout_scroll_placement_prepare(layout, &scrolls);
+    ControllerScrollReach reach = controller_scroll_reach(layout, &scrolls);
     /* Later-painted overlapping regions are hit first. */
     for (size_t i = layout->control_count; i-- > 0;) {
         const ControlRegion *region = &layout->controls[i];
-        int region_y = region->y;
-        int fixed_dy = 0;
+        int region_x = region->x, region_y = region->y;
+        int fixed_dy = 0, shift_y = 0;
         if (fixed_region_offset(layout, true, i, controller->viewport_height,
                                 scroll_y, &fixed_dy)) {
-            region_y += fixed_dy + scroll_y;
+            shift_y = fixed_dy + scroll_y;
         }
-        if (x < region->x || x >= region->x + region->width
-            || y < region_y || y >= region_y + region->height) continue;
+        if (!controller_region_hit(layout, &scrolls, reach, region->node,
+                                   &region_x, &region_y, region->width,
+                                   region->height, shift_y, x, y,
+                                   &hit->scroll_dx, &hit->scroll_dy))
+            continue;
         hit->kind = CONTROLLER_FOCUS_CONTROL;
         hit->index = i;
         hit->node = region->node;
-        hit->x = region->x;
+        hit->x = region_x;
         hit->y = region_y;
         hit->width = region->width;
         hit->height = region->height;
@@ -2004,18 +2353,21 @@ static bool controller_hit_test(BrowserController *controller,
     }
     for (size_t i = layout->link_count; i-- > 0;) {
         const LinkRegion *region = &layout->links[i];
-        int region_y = region->y;
-        int fixed_dy = 0;
+        int region_x = region->x, region_y = region->y;
+        int fixed_dy = 0, shift_y = 0;
         if (fixed_region_offset(layout, false, i, controller->viewport_height,
                                 scroll_y, &fixed_dy)) {
-            region_y += fixed_dy + scroll_y;
+            shift_y = fixed_dy + scroll_y;
         }
-        if (x < region->x || x >= region->x + region->width
-            || y < region_y || y >= region_y + region->height) continue;
+        if (!controller_region_hit(layout, &scrolls, reach, region->node,
+                                   &region_x, &region_y, region->width,
+                                   region->height, shift_y, x, y,
+                                   &hit->scroll_dx, &hit->scroll_dy))
+            continue;
         hit->kind = CONTROLLER_FOCUS_LINK;
         hit->index = i;
         hit->node = region->node;
-        hit->x = region->x;
+        hit->x = region_x;
         hit->y = region_y;
         hit->width = region->width;
         hit->height = region->height;
@@ -2024,17 +2376,23 @@ static bool controller_hit_test(BrowserController *controller,
     /* The earliest retained containing box is the deepest painted element. */
     for (size_t at = 0; at < layout->node_box_count; at++) {
         const LayoutNodeBox *box = &layout->node_boxes[at];
-        if (box->node == NULL || box->width <= 0 || box->height <= 0
-            || x < box->x || x >= box->x + box->width
-            || y < box->y || y >= box->y + box->height) continue;
+        if (box->node == NULL || box->width <= 0 || box->height <= 0)
+            continue;
+        int box_x = box->x, box_y = box->y;
+        if (!controller_region_hit(layout, &scrolls, reach, box->node,
+                                   &box_x, &box_y, box->width, box->height,
+                                   0, x, y,
+                                   &hit->scroll_dx, &hit->scroll_dy))
+            continue;
         hit->kind = CONTROLLER_FOCUS_POINTER;
         hit->node = box->node;
-        hit->x = box->x;
-        hit->y = box->y;
+        hit->x = box_x;
+        hit->y = box_y;
         hit->width = box->width;
         hit->height = box->height;
         return true;
     }
+    hit->scroll_dx = hit->scroll_dy = 0;
     return false;
 }
 
@@ -2054,8 +2412,10 @@ static bool controller_select_hit(BrowserController *controller,
         controller->pointer_node =
             hit->kind == CONTROLLER_FOCUS_POINTER ? hit->node : NULL;
         if (controller->pointer_node != NULL) {
-            controller->pointer_x = hit->x;
-            controller->pointer_y = hit->y;
+            /* Laid-out geometry: controller_focused_rect presents it
+               through the scroll containers as they are when asked. */
+            controller->pointer_x = hit->x - hit->scroll_dx;
+            controller->pointer_y = hit->y - hit->scroll_dy;
             controller->pointer_width = hit->width;
             controller->pointer_height = hit->height;
         }
@@ -3112,21 +3472,33 @@ bool controller_focused_link_region(
     return true;
 }
 
-bool controller_focused_rect(const BrowserController *controller,
-                             int *x, int *y, int *width, int *height)
+/* The focused element's rect where the reader sees it, and the shift
+   (scroll containers plus any viewport-fixed pinning) from its laid-out
+   geometry to there. */
+static bool focused_rect_shifted(const BrowserController *controller,
+                                 int *x, int *y, int *width, int *height,
+                                 int *shift_x, int *shift_y)
 {
     if (controller == NULL || controller->navigation == NULL) return false;
     int rx, ry, rw, rh;
+    int sx = 0, sy = 0;
     bool control_focus = false;
     size_t region_index = 0;
     bool region = current_focus_region(
         controller, &control_focus, &region_index);
     if (region) {
         if (!focus_region_rect(
-                controller, control_focus, region_index, false,
+                controller, NULL, control_focus, region_index, false,
                                &rx, &ry, &rw, &rh)) return false;
         const LayoutDocument *layout =
             &controller->navigation->page.layout;
+        if (control_focus) {
+            sx = rx - layout->controls[region_index].x;
+            sy = ry - layout->controls[region_index].y;
+        } else {
+            sx = rx - layout->links[region_index].x;
+            sy = ry - layout->links[region_index].y;
+        }
         if (control_focus) {
             const ControlRegion *control = &layout->controls[region_index];
             const LayoutNodeBox *box = layout_box_for_node(
@@ -3139,15 +3511,13 @@ bool controller_focused_rect(const BrowserController *controller,
              * :focus outline made compact game menus look as though their
              * buttons had oversized custom chrome.  Preserve the generous
              * hit target while painting and exposing focus geometry from the
-             * visual box.  Fixed controls carry a viewport-relative delta in
+             * visual box.  Fixed and scrolled controls carry a delta from
              * focus_region_rect(), which must follow the replacement box.
              */
             if (control->type != CONTROL_RESIZE && box != NULL
                 && box->width > 0 && box->height > 0) {
-                int fixed_delta_x = rx - control->x;
-                int fixed_delta_y = ry - control->y;
-                rx = controller_add_coordinate(box->x, fixed_delta_x);
-                ry = controller_add_coordinate(box->y, fixed_delta_y);
+                rx = controller_add_coordinate(box->x, sx);
+                ry = controller_add_coordinate(box->y, sy);
                 rw = box->width;
                 rh = box->height;
             }
@@ -3189,30 +3559,42 @@ bool controller_focused_rect(const BrowserController *controller,
                     }
                 }
                 block_box_region = contains_fragments;
-                if (block_box_region
-                    && !focus_region_rect(
-                           controller, false, block_box_index, false,
-                           &rx, &ry, &rw, &rh)) return false;
+                if (block_box_region) {
+                    if (!focus_region_rect(
+                            controller, NULL, false, block_box_index, false,
+                            &rx, &ry, &rw, &rh)) return false;
+                    sx = rx - link->x;
+                    sy = ry - link->y;
+                }
             }
             if (block_box_region) goto resolved;
-            int dy = ry - layout->links[region_index].y;
             int right = rx + rw, bottom = ry + rh;
             for (size_t i = 0; node != NULL && i < layout->link_count; i++) {
                 const LinkRegion *link = &layout->links[i];
                 if (link->node != node) continue;
-                int y = link->y + dy;
-                if (link->x < rx) rx = link->x;
-                if (y < ry) ry = y;
-                if (link->x + link->width > right)
-                    right = link->x + link->width;
-                if (y + link->height > bottom) bottom = y + link->height;
+                int part_x = link->x + sx;
+                int part_y = link->y + sy;
+                if (part_x < rx) rx = part_x;
+                if (part_y < ry) ry = part_y;
+                if (part_x + link->width > right)
+                    right = part_x + link->width;
+                if (part_y + link->height > bottom)
+                    bottom = part_y + link->height;
             }
             rw = right - rx;
             rh = bottom - ry;
         }
     } else if (controller->focus_kind == CONTROLLER_FOCUS_POINTER
                && controller->pointer_node != NULL) {
-        rx = controller->pointer_x; ry = controller->pointer_y;
+        LayoutScrollPlacement placement;
+        if (layout_node_scroll_placement(
+                &controller->navigation->page.layout, NULL,
+                controller->pointer_node, &placement)) {
+            sx = placement.dx;
+            sy = placement.dy;
+        }
+        rx = controller_add_coordinate(controller->pointer_x, sx);
+        ry = controller_add_coordinate(controller->pointer_y, sy);
         rw = controller->pointer_width; rh = controller->pointer_height;
     } else {
         return false;
@@ -3222,6 +3604,42 @@ resolved:
     if (y != NULL) *y = ry;
     if (width != NULL) *width = rw;
     if (height != NULL) *height = rh;
+    if (shift_x != NULL) *shift_x = sx;
+    if (shift_y != NULL) *shift_y = sy;
+    return true;
+}
+
+bool controller_focused_rect(const BrowserController *controller,
+                             int *x, int *y, int *width, int *height)
+{
+    return focused_rect_shifted(controller, x, y, width, height,
+                                NULL, NULL);
+}
+
+bool controller_focused_clip(const BrowserController *controller,
+                             int *left, int *top, int *right, int *bottom,
+                             bool *clipped_x, bool *clipped_y)
+{
+    if (left == NULL || top == NULL || right == NULL || bottom == NULL
+        || clipped_x == NULL || clipped_y == NULL) return false;
+    *clipped_x = *clipped_y = false;
+    int shift_x = 0, shift_y = 0;
+    if (!focused_rect_shifted(controller, NULL, NULL, NULL, NULL,
+                              &shift_x, &shift_y)) return false;
+    const LayoutDocument *layout = &controller->navigation->page.layout;
+    LayoutScrollPlacement placement;
+    if (!layout_node_overflow_placement(
+            layout, controller_focused_node(controller), &placement))
+        return true;
+    /* The clips sit in the scrolled document space the focus geometry
+       reaches before any viewport-fixed pinning; pin them alike. */
+    int pin_x = shift_x - placement.dx, pin_y = shift_y - placement.dy;
+    *clipped_x = placement.clipped_x;
+    *clipped_y = placement.clipped_y;
+    *left = controller_add_coordinate(placement.clip_left, pin_x);
+    *right = controller_add_coordinate(placement.clip_right, pin_x);
+    *top = controller_add_coordinate(placement.clip_top, pin_y);
+    *bottom = controller_add_coordinate(placement.clip_bottom, pin_y);
     return true;
 }
 
@@ -3278,10 +3696,14 @@ bool controller_activate(BrowserController *controller,
         const char *resolution_base = navigation->page.resource_base_url[0]
             != '\0' ? navigation->page.resource_base_url
                      : (current == NULL ? NULL : current->url);
-        bool resolved = current != NULL
+        /* An over-limit URL cannot be represented as a navigation target;
+           copying a prefix would follow a different address. The click
+           still reaches page handlers below. */
+        bool oversized = link->url_length >= sizeof(action->url);
+        bool resolved = !oversized && current != NULL
             && fetch_resolve_url(resolution_base, link->url, action->url,
                                  sizeof(action->url));
-        if (!resolved) {
+        if (!resolved && !oversized) {
             size_t length = link->url_length;
             if (length >= sizeof(action->url)) length = sizeof(action->url) - 1;
             memcpy(action->url, link->url, length);
@@ -3293,6 +3715,7 @@ bool controller_activate(BrowserController *controller,
         action->type = javascript_reference
             ? CONTROLLER_ACTION_CONTROL : CONTROLLER_ACTION_NAVIGATE;
         if (javascript_reference) action->url[0] = '\0';
+        else if (oversized) action->type = CONTROLLER_ACTION_NONE;
         action->prefer_native_media = has_attribute(
             node, "data-tilefinch-provider-media");
         action->prefer_download = !javascript_reference
@@ -3310,6 +3733,8 @@ bool controller_activate(BrowserController *controller,
                        == CONTROLLER_ACTIVATION_RUNTIME_FAILED) {
             action->type = CONTROLLER_ACTION_NONE;
             action->url[0] = '\0';
+        } else if (action->type == CONTROLLER_ACTION_NAVIGATE) {
+            script_runtime_note_link_default(navigation->page.runtime);
         }
         /* javascript: URLs are executable navigation defaults, not request
            targets. Tilefinch has no policy-admitted JavaScript-URL evaluator;
@@ -3352,9 +3777,17 @@ bool controller_activate(BrowserController *controller,
             .event_handlers_invoked;
         action->type = CONTROLLER_ACTION_CONTROL;
         controller->activations++;
+        /* A focused media element is Play on that element: the page still
+           sees the click, but the native player opens its media whether the
+           page's handler cancels it or fails (a page player whose own
+           play() has nothing the PSP can open would otherwise leave Cross
+           doing nothing). */
+        bool media_element = node_name_is(node, "video")
+            || node_name_is(node, "audio");
         action->activation_outcome =
             controller_dispatch_activation(controller, node);
-        if (action->activation_outcome == CONTROLLER_ACTIVATION_CANCELLED) {
+        if (action->activation_outcome == CONTROLLER_ACTIVATION_CANCELLED
+            && !media_element) {
             action->type = CONTROLLER_ACTION_NONE;
             return true;
         }
@@ -3369,6 +3802,9 @@ bool controller_activate(BrowserController *controller,
             action->type = CONTROLLER_ACTION_NONE;
             return true;
         }
+        if (media_element
+            && (node_name_is(node, "video") || node_name_is(node, "audio")))
+            return controller_build_media_action(controller, node, action);
         if (action->activation_outcome
                 == CONTROLLER_ACTIVATION_RUNTIME_UNAVAILABLE
             || action->activation_outcome
@@ -3749,9 +4185,19 @@ bool controller_reveal_focus(BrowserController *controller)
 {
     if (controller == NULL || controller->navigation == NULL
         || controller->viewport_height <= 0) return false;
-    bool nested_changed = layout_scroll_node_reveal(
-        &controller->navigation->page.layout,
-        retained_focus_node(controller));
+    LayoutDocument *layout = &controller->navigation->page.layout;
+    lxb_dom_node_t *node = retained_focus_node(controller);
+    /* Scroll containers first, innermost outward, then the document only
+       if the focus is still outside the viewport, as
+       scrollIntoView({block:"nearest"}) does. The containers take the
+       focus's laid-out geometry, before their own offsets. */
+    int lx = 0, ly = 0, lw = 0, lh = 0, shift_x = 0, shift_y = 0;
+    bool nested_changed = node != NULL
+        && focused_rect_shifted(controller, &lx, &ly, &lw, &lh,
+                                &shift_x, &shift_y)
+        ? layout_scroll_rect_reveal(layout, node, lx - shift_x,
+                                    ly - shift_y, lw, lh)
+        : layout_scroll_node_reveal(layout, node);
     int y = 0, height = 0;
     if (!controller_focused_rect(controller, NULL, &y, NULL, &height)) {
         return nested_changed;
@@ -3759,6 +4205,15 @@ bool controller_reveal_focus(BrowserController *controller)
     const NavigationEntry *entry = navigation_current(controller->navigation);
     if (entry == NULL) return false;
     int scroll_y = entry->scroll_y;
+    /* Scrolling the document never moves viewport-fixed content: a focus
+       pinned near the viewport edge must not scroll the page. */
+    bool control = false;
+    size_t index = 0;
+    int fixed_dy = 0;
+    if (current_focus_region(controller, &control, &index)
+        && fixed_region_offset(layout, control, index,
+                               controller->viewport_height, scroll_y,
+                               &fixed_dy)) return true;
     int visible_top = scroll_y + controller->focus_margin;
     int visible_bottom = scroll_y + controller->viewport_height
                          - controller->focus_margin;

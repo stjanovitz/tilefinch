@@ -2031,6 +2031,7 @@ void psp_vprobe_present_begin(PspVprobePresent *probe)
 {
     probe->presents_before = psp_display.presents;
     probe->started_us = (uint64_t) sceKernelGetSystemTimeWide();
+    media_swdec_cpu_begin(MEDIA_SWDEC_CPU_ENTRY);
 }
 
 void psp_vprobe_present_end(
@@ -2039,6 +2040,7 @@ void psp_vprobe_present_end(
 {
     uint64_t canvas_present_finished_us =
         (uint64_t) sceKernelGetSystemTimeWide();
+    media_swdec_cpu_begin(MEDIA_SWDEC_CPU_PROBE);
     psp_canvas_cadence_observe_present(
         render_visual_state, probe->presents_before,
         probe->started_us,
@@ -2058,6 +2060,7 @@ void psp_vprobe_present_end(
                published ? 1 : 0, psp_display.presents,
                (unsigned long long) counters.layout_text_fingerprint);
     }
+    media_swdec_cpu_end(MEDIA_SWDEC_CPU_PROBE);
 }
 
 /* Brackets one render-job slice of a canvas frame. */

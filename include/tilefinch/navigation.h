@@ -158,6 +158,10 @@ typedef struct {
    whether it was cancelled, and the Budget's refusals during it and its use
    and limit at the time. */
 #define NAVIGATION_LAYOUT_FAILED_ERROR "layout construction failed"
+/* last_error when a runtime update was refused for memory and the page had
+   to be retired: its layout or style could not be rebuilt even with the
+   page's scripts stopped. */
+#define NAVIGATION_PAGE_OUT_OF_MEMORY_ERROR "page ran out of memory"
 typedef struct {
     unsigned phase;
     bool cancelled;
@@ -577,6 +581,15 @@ typedef struct {
     size_t bounded_focus_input_settles;
     size_t resource_fingerprint_scans;
     size_t blocking_stylesheet_builds;
+    /* Stylesheets prepared across parser pumps before a parser-blocking
+       script's end tag (navigation/style_prepare.inc): preparations
+       completed and abandoned, the pumps they took, their longest step,
+       and their total time. */
+    size_t blocking_stylesheet_prepared;
+    size_t blocking_stylesheet_prepare_abandoned;
+    size_t blocking_stylesheet_prepare_pumps;
+    uint64_t blocking_stylesheet_prepare_max_step_us;
+    uint64_t blocking_stylesheet_prepare_us;
     size_t blocking_stylesheet_reuses;
     size_t blocking_stylesheet_adoptions;
     size_t blocking_stylesheet_final_reuses;
@@ -612,6 +625,9 @@ typedef struct {
     size_t mutation_fast_relayouts;
     size_t mutation_layout_pressure_retries;
     size_t mutation_layout_pressure_recoveries;
+    /* Mutation relayouts that still did not fit after the pressure retry
+       and were laid out again with the page's realms stopped for memory. */
+    size_t mutation_layout_script_retirements;
     size_t mutation_resource_rebuilds;
     /* Inserted <style> elements appended to the page sheet in place instead
        of rebuilding it, and attempts that had to fall back. */
@@ -1073,6 +1089,19 @@ struct NavigationSession {
     bool prepare_reader_candidates;
     uint64_t navigation_started_us;
     NavigationReplacementMode replacement_mode;
+    /* The next load replaces the incumbent page under the low-memory mode
+       whatever replacement_mode says (consumed when that load begins). The
+       embed hop sets it after retiring the incumbent's script realm, so the
+       player page never has to fit beside the page it leaves. */
+    bool replacement_low_memory_next;
+    /* The next load is a page opened only to play its video (the embed
+       hop): its parser-blocking JavaScript -- the player itself, often one
+       inline bundle of a megabyte -- gets
+       NAVIGATION_PARSER_SCRIPT_STAGE_PLAYER_MAX_US instead of the ordinary
+       stage limit. Consumed when that load begins, which sets
+       parser_script_stage_extended for the load's lifetime. */
+    bool parser_script_stage_extended_next;
+    bool parser_script_stage_extended;
     NavigationReplacementFreezeCallback replacement_freeze;
     NavigationReplacementOutcomeCallback replacement_outcome;
     void *replacement_hook_opaque;
@@ -1522,6 +1551,11 @@ bool navigation_test_configure_frame_messaging(
     NavigationSession *session, NavigationFrame *frame);
 bool navigation_test_install_frame_capability_trace(
     NavigationFrame *frame);
+/* Completes a discovered frame with a synthetic text/html response through
+   the runtime pump's completion step. */
+bool navigation_test_complete_frame(NavigationSession *session,
+                                    NavigationFrame *frame, long status_code,
+                                    const char *html, size_t length);
 #endif
 /* Pump exactly one deferred document-image continuation unit without also
    advancing webfonts, scripts, or other idle work. Frontends may use this
@@ -1558,6 +1592,13 @@ bool navigation_prioritize_deferred_image(
 /* Close page and frame transport handles before the platform network stack
    is rebuilt. Completed cancellations are consumed by their normal owners. */
 size_t navigation_cancel_network_work(
+    NavigationSession *session, const char *reason);
+/* Stop the page's optional network work and keep it stopped: in-flight
+   dynamic <script> requests of the page and its frames go back to their
+   queues (script_runtime_requeue_dynamic_scripts), the rest is cancelled as
+   navigation_cancel_network_work does, and the page's fetch domain is held
+   (fetch_scheduler_domain_set_held) until its owner releases it. */
+size_t navigation_hold_network_work(
     NavigationSession *session, const char *reason);
 /* Budget reclaim: frees the retained run measurements of the page's layout
    reuse cache and of `load`'s streaming preview cache (either may be NULL),

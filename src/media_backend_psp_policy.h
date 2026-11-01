@@ -246,6 +246,46 @@ static inline unsigned psp_media_codec_poll_delay_us(
    throttle. */
 #define PSP_MEDIA_FULLSCREEN_POLL_YIELD_US 2000u
 /*
+ * How the browser loop waits before its next turn while fullscreen video
+ * plays.
+ *
+ * A turn that published a picture has already waited for the scanout latch,
+ * so the next turn starts at once. Otherwise the firmware decoder path polls
+ * with the short yield above. Software-decoded video waits for the next
+ * vblank instead: its decode worker runs below the browser, so every 2 ms
+ * poll turn (about 1.5 ms of browser work each on a PSP-3000, roughly 5,000
+ * turns in a 27 s clip) was taken from the decoder. Nothing a turn reads
+ * changes faster than that: the controller is sampled once per vblank
+ * (sampling cycle 0), a picture can only reach the panel at a vblank, and
+ * with two jobs queued the decode worker does not wait for the browser
+ * between access units. One turn per display refresh still samples every
+ * frame's due window (at least a whole refresh wide) and every button edge
+ * the turn after the vblank that latched it.
+ */
+typedef enum {
+    PSP_MEDIA_LOOP_WAIT_NONE = 0,
+    PSP_MEDIA_LOOP_WAIT_POLL,
+    PSP_MEDIA_LOOP_WAIT_VBLANK
+} PspMediaLoopWait;
+
+static inline PspMediaLoopWait psp_media_fullscreen_loop_wait(
+    bool software_video, bool presented_since_last_turn)
+{
+    if (presented_since_last_turn) return PSP_MEDIA_LOOP_WAIT_NONE;
+    return software_video ? PSP_MEDIA_LOOP_WAIT_VBLANK
+                          : PSP_MEDIA_LOOP_WAIT_POLL;
+}
+
+/* This is only a wake-up hint: taking/publishing the next picture still
+ * checks its own duration and the current audio clock. Do not spend an
+ * extra browser turn on a future picture at the decoder worker's expense. */
+static inline bool psp_media_ready_followup_due(
+    uint64_t pts_us, uint64_t previous_duration_us, uint64_t clock_us)
+{
+    return pts_us <= clock_us
+        || pts_us - clock_us <= previous_duration_us / 2u;
+}
+/*
  * What an advance may afford, decided by where in the frame it runs.
  *
  * Two properties differ between the once-per-frame advance and the advances
@@ -592,6 +632,45 @@ static inline bool psp_media_avc_refusal_survivable(
         && window < PSP_MEDIA_AVC_REFUSAL_WINDOW_LIMIT;
 }
 
+/*
+ * Whether firmware refused this stream from its opening pictures, which says
+ * its coding is one the decoder does not take (a B-frame pyramid whose SPS
+ * did not declare it) rather than that a packet was damaged. The B-pyramid
+ * device bisect decoded 11 pictures and refused 16 access units -- every
+ * reference picture after the opening ones -- before the decoder stalled. A
+ * stream that has played a couple of seconds, or that refused a stray unit
+ * among many pictures, is not this.
+ */
+#define PSP_MEDIA_AVC_OPENING_PICTURES 60u
+#define PSP_MEDIA_AVC_OPENING_REFUSALS 3u
+
+static inline bool psp_media_avc_opening_refused(
+    size_t decoded_pictures, size_t refused_units)
+{
+    return decoded_pictures < PSP_MEDIA_AVC_OPENING_PICTURES
+        && refused_units >= PSP_MEDIA_AVC_OPENING_REFUSALS
+        && refused_units >= decoded_pictures;
+}
+
+/*
+ * The same judgement over everything one rendition has decoded. A >=30 s
+ * rewind, a suspend or a track change reopens the whole codec backend, and
+ * the new backend's counters start from zero; `prior_*` are what the
+ * rendition's earlier backends decoded and refused. A refusal right after
+ * such a reopen is then a mid-play failure for the ordinary recovery, not a
+ * coding this rendition never had a chance to show.
+ */
+static inline bool psp_media_avc_rendition_opening_refused(
+    size_t prior_pictures, size_t prior_refused,
+    size_t decoded_pictures, size_t refused_units)
+{
+    size_t pictures = decoded_pictures > SIZE_MAX - prior_pictures
+        ? SIZE_MAX : prior_pictures + decoded_pictures;
+    size_t refused = refused_units > SIZE_MAX - prior_refused
+        ? SIZE_MAX : prior_refused + refused_units;
+    return psp_media_avc_opening_refused(pictures, refused);
+}
+
 /* A refusal invalidates the current dependent-frame chain. Recovery asks the
    demuxer for the next actual random-access sample, so this policy gate only
    has to establish that some stream duration remains. The demuxer—not a
@@ -770,7 +849,6 @@ static inline bool psp_media_audio_pending_should_wait(
 #define PSP_MEDIA_MPEG_DECODE_WIDTH 512u
 #define PSP_MEDIA_AVC_PROFILE_BASELINE 0x42u
 #define PSP_MEDIA_AVC_PROFILE_MAIN 0x4du
-#define PSP_MEDIA_AVC_MAXIMUM_LEVEL 30u
 /*
  * Decoded output surfaces the pipeline owns.
  *
@@ -1352,6 +1430,35 @@ static inline uint64_t psp_media_presentation_clock_step_us(
     return advanced;
 }
 
+/* Feeding/collecting a decoder can span the moment a retained picture
+   becomes due. Refresh only steady playback, never a frozen seek/preview
+   or startup clock, and never move an existing clock backwards. */
+static inline uint64_t psp_media_take_clock_refresh(uint64_t previous,
+    bool playing, bool frozen, bool audio_valid, uint64_t audio)
+{
+    return playing && !frozen && audio_valid && audio > previous
+        ? audio : previous;
+}
+
+/* A decoder job completing without a due picture does not change the
+   visible video. Redrawing that same picture consumes a scanout interval
+   which can delay the successor. Loading/paused/end panels retain their
+   updates; new pictures, controls and subtitles have separate dirty paths. */
+static inline bool psp_media_decode_pending_visual_change(bool was_pending,
+    bool pending, bool have_frame, bool playing, bool ended)
+{
+    return was_pending != pending && (!have_frame || !playing || ended);
+}
+
+/* Routine HLS delivery can open/finish a segment. Do it after scanout, not
+   between a picture's deadline and its selection. Urgent recovery and byte
+   range sources keep their existing pre-decode service. */
+static inline bool psp_media_hls_delivery_after_present(bool hls,
+    bool software, bool have_frame, bool playing, bool busy, bool buffering)
+{
+    return hls && software && have_frame && playing && !busy && !buffering;
+}
+
 static inline bool psp_media_video_should_drop_late(
     uint64_t clock_us,
     const PspMediaSurfaceSlot *current,
@@ -1805,6 +1912,34 @@ static inline PspMediaFirstFrameVerdict psp_media_first_frame_verdict(
         : PSP_MEDIA_FIRST_FRAME_DECODER_STALLED;
 }
 
+/* A committed seek of software-decoded video lands on the keyframe (see
+   psp_media_seek.c); previews and their restores, audio-only playback and
+   the firmware decoder seek exactly. */
+static inline bool psp_media_seek_lands_on_keyframe(
+    bool software_decoder, bool audio_only, bool exact_still)
+{
+    return software_decoder && !audio_only && !exact_still;
+}
+
+/*
+ * A committed seek whose prime failed for a reason no retry addresses (the
+ * target lies too far past the keyframe for the bounded scan, or the
+ * stream cannot place a sample there) resumes from the keyframe the demuxer
+ * already holds, once, rather than leaving playback stopped and silent. True,
+ * with the position to resume from, when that fallback is still available:
+ * not yet taken for this seek, and the keyframe is strictly before the
+ * target (a prime that fails AT the keyframe is a real failure).
+ */
+static inline bool psp_media_seek_prime_fallback(
+    bool already_fell_back, uint64_t target_us, uint64_t keyframe_us,
+    uint64_t *resume_us)
+{
+    if (already_fell_back || resume_us == NULL || keyframe_us >= target_us)
+        return false;
+    *resume_us = keyframe_us;
+    return true;
+}
+
 static inline PspMediaAudioResetAction psp_media_audio_reset_action(
     bool output_in_flight, uint32_t elapsed_us)
 {
@@ -1908,7 +2043,7 @@ static inline bool psp_media_decoder_policy(
     bool wide_program_enabled, PspMediaDecoderPolicy *policy)
 {
     if (policy == NULL || width == 0 || height == 0
-        || level == 0 || level > PSP_MEDIA_AVC_MAXIMUM_LEVEL)
+        || !psp_video_avc_level_supported(level))
         return false;
     bool wide = psp_media_wide_program_required(width, height);
     if (wide && !wide_program_enabled) return false;
@@ -1922,12 +2057,15 @@ static inline bool psp_media_decoder_policy(
         policy->me_boot_type = PSP_MEDIA_DEFAULT_ME_BOOT_TYPE;
         return true;
     }
-    /* A tall 240p Baseline picture has the same admitted surface size as
-       its Main counterpart, but needs the large-picture program because
-       its height exceeds the screen. Do not broaden wide landscape admission
-       or the geometry ceiling: those remain independently guarded. */
+    /* A tall Baseline picture (portrait 240p-class, up to 272x480) has the
+       same admitted surface size as its Main counterpart, but needs the
+       large-picture program because its height exceeds the screen. That is
+       every Baseline height the wide test flags while the width stays within
+       272 -- a 202x360 portrait rendition as much as 240x426. Do not broaden
+       wide landscape admission or the geometry ceiling: those remain
+       independently guarded. */
     if (profile == PSP_MEDIA_AVC_PROFILE_BASELINE
-        && width <= 272u && height > 360u
+        && width <= 272u && height > 272u
         && psp_video_dimensions_supported(width, height)) {
         policy->mpeg_mode = 5;
         policy->me_boot_type = 1;

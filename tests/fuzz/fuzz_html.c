@@ -62,7 +62,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         }
         parsed = parsed && document_parser_finish(&parser, &document);
         if (!parsed) document_parser_abort(&parser);
-        if (parsed) (void) document_install_static_shell_fallback(&document);
+        if (parsed) (void) document_install_static_shell_fallback(&document, NULL, NULL);
     } else {
         parsed = document_parse(&document, &budget, html, length, chunk);
     }

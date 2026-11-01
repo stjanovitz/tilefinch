@@ -6,9 +6,11 @@
 
 #include "tilefinch/budget.h"
 #include "tilefinch/fetch.h"
+#include "tilefinch/media_hls.h"
 #include "tilefinch/media_http.h"
 #include "tilefinch/platform.h"
 #include "tilefinch/session.h"
+#include "tilefinch/user_agent.h"
 #include "tilefinch/youtube_resolver.h"
 
 static bool download(Budget *budget, BrowserSession *session,
@@ -204,6 +206,387 @@ static bool probe_remote_demux(
     return traversed;
 }
 
+/*
+ * --hls-live SECONDS: open a live stream's HLS master as the PSP does
+ * (psp_media_hls.c's decoder-aware selection), then run the shared live
+ * source for SECONDS of wall time against a real-time playback clock. A
+ * blocking fetch stands in for the PSP worker transport. Reports the chosen
+ * variant, its SPS route, playlist reloads, skipped segments and every
+ * stall where the clock passed the newest delivered sample.
+ */
+#define PROBE_HLS_SLOTS 4u
+typedef struct {
+    uint64_t handle;
+    unsigned char *data;
+    size_t length, offset;
+} ProbeHlsSlot;
+typedef struct {
+    Budget *budget;
+    ProbeHlsSlot slots[PROBE_HLS_SLOTS];
+    uint64_t next_handle;
+    size_t fetches;
+} ProbeHlsTransport;
+
+static unsigned char *probe_fetch(Budget *budget, const char *url,
+                                  size_t maximum_bytes, size_t *length,
+                                  char *error, size_t error_size)
+{
+    FetchRequest request = {
+        .accept = "*/*",
+        .user_agent = TILEFINCH_BROWSER_USER_AGENT,
+        .redirect_same_origin_only = false
+    };
+    FetchResult *result = fetch_result_create(budget);
+    unsigned char *copy = NULL;
+    if (result != NULL && fetch_request_cancelable(
+            budget, url, &request, maximum_bytes, 15000, NULL, NULL, result)
+        && result->status_code == 200 && result->length != 0) {
+        copy = budget_malloc_category(
+            budget, BUDGET_CATEGORY_RESOURCE, result->length);
+        if (copy != NULL) {
+            memcpy(copy, result->data, result->length);
+            *length = result->length;
+        }
+    } else {
+        snprintf(error, error_size, "fetch failed (HTTP %ld)",
+                 result == NULL ? 0L : result->status_code);
+    }
+    fetch_result_free(result);
+    return copy;
+}
+
+static uint64_t probe_hls_start(void *opaque, const char *url,
+                                size_t maximum_bytes, char *error,
+                                size_t error_size)
+{
+    ProbeHlsTransport *transport = opaque;
+    for (size_t i = 0; i < PROBE_HLS_SLOTS; i++) {
+        ProbeHlsSlot *slot = &transport->slots[i];
+        if (slot->handle != 0) continue;
+        slot->data = probe_fetch(transport->budget, url, maximum_bytes,
+                                 &slot->length, error, error_size);
+        if (slot->data == NULL) return 0;
+        slot->offset = 0;
+        slot->handle = ++transport->next_handle;
+        transport->fetches++;
+        return slot->handle;
+    }
+    return 0;
+}
+
+static ProbeHlsSlot *probe_hls_slot(ProbeHlsTransport *transport,
+                                    uint64_t handle)
+{
+    for (size_t i = 0; i < PROBE_HLS_SLOTS; i++)
+        if (transport->slots[i].handle == handle)
+            return &transport->slots[i];
+    return NULL;
+}
+
+static void probe_hls_cancel(void *opaque, uint64_t handle)
+{
+    ProbeHlsTransport *transport = opaque;
+    ProbeHlsSlot *slot = probe_hls_slot(transport, handle);
+    if (slot == NULL) return;
+    budget_free(transport->budget, slot->data);
+    memset(slot, 0, sizeof(*slot));
+}
+
+static MediaHlsTransportPollResult probe_hls_poll(
+    void *opaque, uint64_t handle, unsigned char *destination,
+    size_t capacity, size_t *length, char *error, size_t error_size)
+{
+    ProbeHlsTransport *transport = opaque;
+    ProbeHlsSlot *slot = probe_hls_slot(transport, handle);
+    *length = 0;
+    if (slot == NULL) {
+        snprintf(error, error_size, "unknown transport handle");
+        return MEDIA_HLS_TRANSPORT_ERROR;
+    }
+    if (slot->offset == slot->length) {
+        probe_hls_cancel(opaque, handle);
+        return MEDIA_HLS_TRANSPORT_COMPLETE;
+    }
+    size_t take = slot->length - slot->offset;
+    if (take > capacity) take = capacity;
+    memcpy(destination, slot->data + slot->offset, take);
+    slot->offset += take;
+    *length = take;
+    return MEDIA_HLS_TRANSPORT_CHUNK;
+}
+
+static MediaHlsPlaylist *probe_hls_playlist(Budget *budget, const char *url,
+                                            char *error, size_t error_size)
+{
+    size_t length = 0;
+    unsigned char *bytes = probe_fetch(
+        budget, url, MEDIA_HLS_MAXIMUM_PLAYLIST_DOWNLOAD_BYTES, &length,
+        error, error_size);
+    if (bytes == NULL) return NULL;
+    /* The PSP's incremental capture: an oversized live media playlist keeps
+       only its newest bounded window. */
+    MediaHlsPlaylistStream *stream = media_hls_playlist_stream_create(
+        budget, url, error, error_size);
+    MediaHlsPlaylist *playlist = NULL;
+    bool fed = stream != NULL;
+    for (size_t at = 0; fed && at < length;
+         at += MEDIA_HLS_TRANSPORT_CHUNK_BYTES) {
+        size_t take = length - at < MEDIA_HLS_TRANSPORT_CHUNK_BYTES
+            ? length - at : MEDIA_HLS_TRANSPORT_CHUNK_BYTES;
+        fed = media_hls_playlist_stream_feed(
+            stream, bytes + at, take, error, error_size);
+    }
+    if (fed) playlist = media_hls_playlist_stream_finish(
+        stream, error, error_size);
+    media_hls_playlist_stream_destroy(stream);
+    budget_free(budget, bytes);
+    return playlist;
+}
+
+static bool probe_live_hls(Budget *budget, const char *master_url,
+                           unsigned seconds)
+{
+    char error[256] = {0};
+    MediaHlsPlaylist *master = probe_hls_playlist(
+        budget, master_url, error, sizeof(error));
+    if (master == NULL) {
+        fprintf(stderr, "hls master failed: %s\n", error);
+        return false;
+    }
+    static char urls[2][4096];
+    urls[0][0] = urls[1][0] = '\0';
+    MediaHlsPlaylist *media[2] = {NULL, NULL};
+    size_t count = 1;
+    if (media_hls_playlist_kind(master) == MEDIA_HLS_PLAYLIST_MASTER) {
+        MediaHlsDecoderLimits limits = {
+            .software_width = 432u, .software_height = 240u,
+            .target_height = 240u, .admit_undeclared_firmware = true
+        };
+        MediaHlsSelection selection = {0};
+        bool selected = media_hls_playlist_select_decodable_streams(
+            master, &limits, urls[0], sizeof(urls[0]),
+            urls[1], sizeof(urls[1]), &selection);
+        media_hls_playlist_destroy(master);
+        if (!selected) {
+            fprintf(stderr, "hls-variant=NONE video-selected=%d\n",
+                    selection.video_selected ? 1 : 0);
+            return false;
+        }
+        count = urls[1][0] != '\0' ? 2u : 1u;
+        printf("hls-variant geometry=%ux%u unverified=%d separate-audio=%d\n",
+               selection.width, selection.height,
+               selection.unverified ? 1 : 0, count == 2u ? 1 : 0);
+        for (size_t i = 0; i < count; i++)
+            printf("hls-%s-url=%s\n", i == 0 ? "video" : "audio", urls[i]);
+        for (size_t i = 0; i < count; i++) {
+            media[i] = probe_hls_playlist(budget, urls[i], error,
+                                          sizeof(error));
+            if (media[i] == NULL) {
+                fprintf(stderr, "hls media playlist failed: %s\n", error);
+                media_hls_playlist_destroy(media[0]);
+                return false;
+            }
+        }
+    } else {
+        snprintf(urls[0], sizeof(urls[0]), "%s", master_url);
+        media[0] = master;
+    }
+    printf("hls-playlist live=%d segments=%zu\n",
+           media_hls_playlist_is_live(media[0]) ? 1 : 0,
+           media_hls_playlist_segment_count(media[0]));
+    ProbeHlsTransport transport = {.budget = budget};
+    MediaHlsTransport ops = {
+        .opaque = &transport, .start = probe_hls_start,
+        .poll = probe_hls_poll, .cancel = probe_hls_cancel
+    };
+    MediaHlsSource *sources[2] = {NULL, NULL};
+    bool ok = true;
+    for (size_t i = 0; ok && i < count; i++) {
+        sources[i] = media_hls_source_create_track(
+            budget, media[i], &ops,
+            count == 1u ? MEDIA_HLS_TRACK_MIXED
+                : i == 0 ? MEDIA_HLS_TRACK_VIDEO : MEDIA_HLS_TRACK_AUDIO,
+            error, sizeof(error));
+        if (sources[i] == NULL) {
+            media_hls_playlist_destroy(media[i]);
+            fprintf(stderr, "hls source create failed: %s\n", error);
+            ok = false;
+        }
+    }
+    uint64_t started = tilefinch_platform_monotonic_time_us();
+    for (size_t i = 0; ok && i < count; i++) {
+        MediaHlsPrimeStatus status = MEDIA_HLS_PRIME_PENDING;
+        while (status == MEDIA_HLS_PRIME_PENDING
+               && tilefinch_platform_monotonic_time_us() - started
+                      < UINT64_C(30000000)) {
+            status = media_hls_source_prime(sources[i], error, sizeof(error));
+            if (status == MEDIA_HLS_PRIME_PENDING) {
+                media_hls_source_pump(
+                    sources[i], tilefinch_platform_monotonic_time_us());
+                usleep(1000);
+            }
+        }
+        if (status != MEDIA_HLS_PRIME_READY) {
+            fprintf(stderr, "hls prime failed: %s\n", error);
+            ok = false;
+        }
+    }
+    MediaSampleSource samples[2];
+    for (size_t i = 0; ok && i < count; i++)
+        ok = media_hls_source_sample_source(sources[i], &samples[i]);
+    printf("hls-prime=%s ms=%llu\n", ok ? "PASS" : "FAIL",
+           (unsigned long long) ((tilefinch_platform_monotonic_time_us()
+                                  - started) / 1000u));
+    unsigned char *packet = ok
+        ? budget_malloc_category(budget, BUDGET_CATEGORY_RESOURCE,
+                                 MEDIA_HLS_MAXIMUM_SEGMENT_BYTES) : NULL;
+    ok = ok && packet != NULL;
+    size_t video = 0, audio = 0, refreshes = 0, refresh_failures = 0;
+    size_t stalls = 0;
+    uint64_t stall_us = 0, longest_stall_us = 0, stall_began = 0;
+    bool sps_checked = false;
+    int64_t first_pts_us = INT64_MIN, last_pts_us = INT64_MIN;
+    uint64_t clock_origin = 0;
+    MediaMp4Sample pending[2];
+    bool have[2] = {false, false};
+    uint64_t deadline = tilefinch_platform_monotonic_time_us()
+        + (uint64_t) seconds * UINT64_C(1000000);
+    uint64_t next_report = tilefinch_platform_monotonic_time_us()
+        + UINT64_C(5000000);
+    while (ok && tilefinch_platform_monotonic_time_us() < deadline) {
+        uint64_t now = tilefinch_platform_monotonic_time_us();
+        for (size_t i = 0; i < count; i++) {
+            if (media_hls_source_wants_playlist_refresh(sources[i], now)) {
+                MediaHlsPlaylist *next = probe_hls_playlist(
+                    budget, urls[i], error, sizeof(error));
+                if (next == NULL) {
+                    refresh_failures++;
+                    media_hls_source_note_playlist_refresh_failure(
+                        sources[i], now);
+                } else if (!media_hls_source_update_playlist(
+                               sources[i], next, now,
+                               error, sizeof(error))) {
+                    refresh_failures++;
+                } else {
+                    refreshes++;
+                }
+            }
+            media_hls_source_pump(sources[i], now);
+            if (media_hls_source_failed(sources[i])) {
+                char detail[256] = {0};
+                (void) samples[i].ops->last_error(
+                    samples[i].opaque, detail, sizeof(detail));
+                fprintf(stderr, "hls source %zu failed: %s\n", i, detail);
+                ok = false;
+            }
+        }
+        bool starved = false;
+        for (size_t i = 0; ok && i < count; i++) {
+            for (unsigned taken = 0; taken < 64u; taken++) {
+                if (!have[i]) {
+                    if (!samples[i].ops->next_sample(
+                            samples[i].opaque, &pending[i])) {
+                        starved = starved || (clock_origin != 0
+                            && samples[i].ops->would_block(samples[i].opaque));
+                        break;
+                    }
+                    have[i] = true;
+                }
+                int64_t pts_us = pending[i].timescale == 0 ? 0
+                    : (int64_t) ((double) pending[i].pts * 1000000.0
+                                 / pending[i].timescale);
+                if (first_pts_us == INT64_MIN) {
+                    first_pts_us = pts_us;
+                    clock_origin = now;
+                }
+                /* A real-time clock from the first sample: take what is due. */
+                if (pts_us - first_pts_us
+                        > (int64_t) (now - clock_origin) + 500000) break;
+                if (!samples[i].ops->read_sample(
+                        samples[i].opaque, &pending[i], packet,
+                        MEDIA_HLS_MAXIMUM_SEGMENT_BYTES)) {
+                    if (samples[i].ops->would_block(samples[i].opaque)) break;
+                    fprintf(stderr, "hls read failed\n");
+                    ok = false;
+                    break;
+                }
+                have[i] = false;
+                if (pending[i].kind == MEDIA_MP4_TRACK_VIDEO) {
+                    video++;
+                    if (pts_us > last_pts_us) last_pts_us = pts_us;
+                    if (!sps_checked && pending[i].keyframe) {
+                        uint8_t profile = 0;
+                        MediaH264DecoderRoute route =
+                            media_h264_annexb_decoder_route(
+                                packet, pending[i].size, &profile);
+                        MediaH264FirmwareReferences references =
+                            media_h264_annexb_firmware_references(
+                                packet, pending[i].size);
+                        printf("hls-sps profile=%u route=%s references=%s\n",
+                               profile,
+                               route == MEDIA_H264_DECODER_ROUTE_PSP_FIRMWARE
+                                   ? "firmware"
+                               : route == MEDIA_H264_DECODER_ROUTE_HIGH_EXTENSION
+                                   ? "software" : "unsupported",
+                               references
+                                   == MEDIA_H264_FIRMWARE_REFERENCES_SUPPORTED
+                                   ? "ok"
+                               : references
+                                   == MEDIA_H264_FIRMWARE_REFERENCES_PYRAMID
+                                   ? "pyramid" : "too-many");
+                        sps_checked = true;
+                    }
+                } else if (pending[i].kind == MEDIA_MP4_TRACK_AUDIO) {
+                    audio++;
+                }
+            }
+        }
+        if (starved && stall_began == 0) stall_began = now;
+        if (!starved && stall_began != 0) {
+            uint64_t stalled = now - stall_began;
+            if (stalled >= UINT64_C(250000)) {
+                stalls++;
+                stall_us += stalled;
+                if (stalled > longest_stall_us) longest_stall_us = stalled;
+            }
+            stall_began = 0;
+        }
+        if (now >= next_report) {
+            MediaHlsStats stats = {0};
+            media_hls_source_stats(sources[0], &stats);
+            printf("hls-progress t=%llus video=%zu audio=%zu "
+                   "media-s=%.1f refreshes=%zu/%zu skipped=%zu "
+                   "buffered-us=%llu fetches=%zu\n",
+                   (unsigned long long) ((now - started) / 1000000u),
+                   video, audio,
+                   last_pts_us == INT64_MIN ? 0.0
+                       : (double) (last_pts_us - first_pts_us) / 1e6,
+                   refreshes, refresh_failures, stats.skipped_live_segments,
+                   (unsigned long long) stats.buffered_until_us,
+                   transport.fetches);
+            next_report = now + UINT64_C(5000000);
+        }
+        usleep(5000);
+    }
+    uint64_t wall_us = clock_origin == 0 ? 0
+        : tilefinch_platform_monotonic_time_us() - clock_origin;
+    double media_s = last_pts_us == INT64_MIN ? 0.0
+        : (double) (last_pts_us - first_pts_us) / 1e6;
+    printf("hls-live=%s video=%zu audio=%zu media-s=%.1f wall-s=%.1f "
+           "refreshes=%zu refresh-failures=%zu stalls=%zu stall-ms=%llu "
+           "longest-stall-ms=%llu\n",
+           ok && video != 0 ? "PASS" : "FAIL", video, audio, media_s,
+           (double) wall_us / 1e6, refreshes, refresh_failures, stalls,
+           (unsigned long long) (stall_us / 1000u),
+           (unsigned long long) (longest_stall_us / 1000u));
+    budget_free(budget, packet);
+    for (size_t i = 0; i < count; i++)
+        media_hls_source_destroy(sources[i]);
+    for (size_t i = 0; i < PROBE_HLS_SLOTS; i++)
+        probe_hls_cancel(&transport, transport.slots[i].handle);
+    return ok && video != 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc != 2 && argc != 3 && argc != 4 && argc != 5) {
@@ -211,10 +594,11 @@ int main(int argc, char **argv)
             stderr,
             "usage: %s WATCH_URL [MAXIMUM_HEIGHT "
             "[--range-check | --demux-open | --demux-full | "
-            "VIDEO_OUTPUT AUDIO_OUTPUT]]\n",
+            "--hls-live SECONDS | VIDEO_OUTPUT AUDIO_OUTPUT]]\n",
             argv[0]);
         return 2;
     }
+    bool live_probe = argc == 5 && strcmp(argv[3], "--hls-live") == 0;
     if (argc == 4
         && strcmp(argv[3], "--range-check") != 0
         && strcmp(argv[3], "--demux-open") != 0
@@ -253,6 +637,7 @@ int main(int argc, char **argv)
         browser_session_destroy(&session);
         return 1;
     }
+    printf("live-hls=%d\n", stream.live_hls ? 1 : 0);
     printf(
         "video-id=%s title=%s split=%s video-itag=%d geometry=%dx%d "
         "video-bytes=%" PRIu64 " audio-itag=%d audio-bytes=%" PRIu64
@@ -318,7 +703,15 @@ int main(int argc, char **argv)
                 stream.audio_content_length, "audio", traverse);
         }
     }
-    if (argc == 5) {
+    if (live_probe) {
+        if (!stream.live_hls) {
+            fprintf(stderr, "stream is not a live HLS stream\n");
+            downloaded = false;
+        } else {
+            downloaded = probe_live_hls(
+                &budget, stream.media_url, (unsigned) atoi(argv[4]));
+        }
+    } else if (argc == 5) {
         downloaded = download(
             &budget, &session, argv[1], stream.media_url,
             stream.content_length, argv[3]);

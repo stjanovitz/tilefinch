@@ -6906,6 +6906,7 @@ static int test_tiny_budget_rejection(void)
 #include "suites/web_runtime_render.inc"
 #include "suites/web_runtime_navigation.inc"
 #include "suites/web_runtime_forms.inc"
+#include "suites/web_runtime_scroller_focus.inc"
 
 typedef int (*TilefinchTestSuiteFunction)(void);
 
@@ -6935,6 +6936,11 @@ static const TilefinchTestSuite tilefinch_test_suites[] = {
         "web-runtime",
         "images, DOM, JavaScript, controls, events, frames, and resources",
         test_web_runtime
+    },
+    {
+        "scroller-focus",
+        "focus geometry, reveal and hit testing inside scroll containers",
+        test_scroller_focus
     }
 };
 

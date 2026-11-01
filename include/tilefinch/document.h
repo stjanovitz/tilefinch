@@ -214,6 +214,17 @@ typedef struct {
     uint32_t declared_video_discovery_count;
     bool declared_video_cache_scanned;
     bool declared_video_cache_found;
+    /* media_declared_video_keep_parsed ran for this document. */
+    bool declared_video_kept_checked;
+    /* Scans media_declared_video_keep_closed has taken (it is capped). */
+    uint8_t declared_video_keep_scans;
+    /* The best stream references in the last JSON/playlist responses the
+       page's own scripts fetched (media_json_response_remember): an
+       optional, page-lifetime memo of short records, freed first when the
+       Budget needs room. */
+    struct MediaJsonResponse *media_json_responses[8];
+    uint8_t media_json_response_next;
+    uint32_t media_json_response_generation;
     /* Native recovery controls are identified by provenance, never by their
        public diagnostic attributes. Author markup may use the same attribute
        spelling without acquiring browser-chrome activation semantics. */
@@ -258,6 +269,11 @@ static inline bool document_node_is_tag(const lxb_dom_node_t *node,
     return node != NULL && node->type == LXB_DOM_NODE_TYPE_ELEMENT
         && node->local_name == tag;
 }
+
+/* Replaces `element`'s children with parsed `markup`, as innerHTML does. */
+typedef bool (*DocumentInnerHtmlReplaceCallback)(
+    void *opaque, PocDocument *document, lxb_dom_node_t *element,
+    const char *markup, size_t length);
 
 typedef bool (*DocumentBodySnapshotReplaceCallback)(
     void *opaque, PocDocument *document,
@@ -333,6 +349,9 @@ bool document_parser_set_scripting(DocumentParser *parser, bool enabled);
 bool document_parser_set_inert_script_policy(
     DocumentParser *parser, bool discard, size_t maximum_json_bytes,
     size_t maximum_inline_script_bytes);
+/* The HTML <script> element whose text the tokenizer is reading (its end
+   tag not yet fed), or NULL. */
+lxb_dom_node_t *document_parser_open_script(const DocumentParser *parser);
 bool document_parser_script_was_truncated(
     const DocumentParser *parser, const lxb_dom_node_t *script);
 /* Preserve the active HTML tree-builder model while discarding only future
@@ -597,8 +616,16 @@ bool document_refresh(PocDocument *document);
 /* When a bounded script pass cannot start authored client-side UI, preserve
    useful static content: materialize a server-authored header navigation or
    replace a loading-only metadata-rich body with a small summary. Returns
-   true only when it changed the connected document. */
-bool document_install_static_shell_fallback(PocDocument *document);
+   true only when it changed the connected document.
+   Each replacement of author children goes through `replace` when given:
+   a live script realm can still hold wrappers into those children, and only
+   its bridge may decide when they die (see
+   script_runtime_replace_element_inner_html). Without `replace` the old
+   children are destroyed at once, which is correct only when no realm can
+   reference them. */
+bool document_install_static_shell_fallback(
+    PocDocument *document, DocumentInnerHtmlReplaceCallback replace,
+    void *replace_opaque);
 void document_note_connected_mutation(PocDocument *document);
 /* A connected attribute value changed (setAttribute, removeAttribute, an
    inline style write). No count, text or title statistic can change, so
@@ -610,7 +637,9 @@ void document_note_attribute_mutation(PocDocument *document,
 void document_refresh_attribute_totals(PocDocument *document);
 /* Lexbor's document-owned fragment parser is not reentrant with an active
    streaming parse.  This wrapper preserves the streaming parser while
-   applying a synchronous element innerHTML mutation. */
+   applying a synchronous element innerHTML mutation. It destroys the old
+   children outright, so it is only for elements no script realm can have
+   wrapped (fresh native elements, or documents without a realm). */
 bool document_set_element_inner_html(PocDocument *document,
                                      lxb_dom_node_t *element,
                                      const char *html, size_t length);

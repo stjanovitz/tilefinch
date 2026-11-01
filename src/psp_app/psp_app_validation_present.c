@@ -14,6 +14,7 @@
 #include "tilefinch/psp_load_experience.h"
 
 #include "tilefinch/psp_input_cadence.h"
+#include "../psp_thread_contract.h"
 typedef struct {
     uint64_t compose_total_us;
     uint64_t compose_max_us;
@@ -547,9 +548,31 @@ static struct {
 static uint32_t psp_focus_frame_moves;
 static bool psp_focus_frame_settle_pending;
 
+/*
+ * Hashing reads the whole uncached VRAM buffer and the engine framebuffer:
+ * about 80 ms at 111 MHz. The settled record is owed just before the next
+ * press, but must not be paid inside that press's latency window (it put
+ * 82 ms into every scroll-feedback line after a focus move). So the hashes
+ * of the last presented frame are taken on the first quiet loop iteration
+ * after it (a whole iteration without a present, with no queued page input,
+ * page work, load or activation), before that iteration's vblank wait, and
+ * the settled report prints them.
+ * A present clears them; a press that arrives before a quiet iteration
+ * hashes at dispatch, and psp_focus_feedback_begin then excludes that cost
+ * from the press's timing.
+ */
+static struct {
+    bool valid;
+    uint64_t screen, page, outside, band, engine, engine_outside;
+    uint64_t hash_us;
+} psp_focus_frame_hashes;
+static unsigned psp_focus_frame_quiet_iterations;
+
 static void psp_focus_frame_note_present(
     const uint16_t *frame, const PspUiState *ui, const uint16_t *vram)
 {
+    psp_focus_frame_hashes.valid = false;
+    psp_focus_frame_quiet_iterations = 0;
     if (ui == NULL || vram == NULL || ui->screen != PSP_UI_SCREEN_PAGE) {
         psp_focus_frame_last.valid = false;
         return;
@@ -574,13 +597,9 @@ static void psp_focus_frame_note_present(
     psp_focus_frame_last.presents++;
 }
 
-static void psp_focus_frame_report(const BrowserEngine *engine, const char *phase)
+/* Hash the last presented frame (psp_focus_frame_last must be valid). */
+static void psp_focus_frame_hash(const BrowserEngine *engine)
 {
-    if (!psp_focus_frame_last.valid || engine == NULL) {
-        printf("tilefinch-focus-frame: move=%u phase=%s valid=0\n",
-               (unsigned) psp_focus_frame_moves, phase);
-        return;
-    }
     uint64_t started_us = sceKernelGetSystemTimeWide();
     const uint16_t *vram = (const uint16_t *)
         ((uintptr_t) psp_focus_frame_last.vram | (uintptr_t) 0x40000000u);
@@ -626,6 +645,24 @@ static void psp_focus_frame_report(const BrowserEngine *engine, const char *phas
             }
         }
     }
+    psp_focus_frame_hashes.screen = screen;
+    psp_focus_frame_hashes.page = page;
+    psp_focus_frame_hashes.outside = outside;
+    psp_focus_frame_hashes.band = band;
+    psp_focus_frame_hashes.engine = engine_hash;
+    psp_focus_frame_hashes.engine_outside = engine_outside;
+    psp_focus_frame_hashes.hash_us = sceKernelGetSystemTimeWide() - started_us;
+    psp_focus_frame_hashes.valid = true;
+}
+
+static void psp_focus_frame_report(const BrowserEngine *engine, const char *phase)
+{
+    if (!psp_focus_frame_last.valid || engine == NULL) {
+        printf("tilefinch-focus-frame: move=%u phase=%s valid=0\n",
+               (unsigned) psp_focus_frame_moves, phase);
+        return;
+    }
+    if (!psp_focus_frame_hashes.valid) psp_focus_frame_hash(engine);
     /* Facade queries only: the copied view and the validation counters. */
     static BrowserViewSnapshot view_state;
     bool authored = browser_engine_view_snapshot(engine, &view_state)
@@ -640,15 +677,17 @@ static void psp_focus_frame_report(const BrowserEngine *engine, const char *phas
            "engine-outside=%016llx overlay=%u:%d:%u:%u:%u scroll=%d/%d "
            "hash-us=%llu\n",
            (unsigned) psp_focus_frame_moves, phase,
-           (unsigned long long) screen, (unsigned long long) page,
-           (unsigned long long) outside, (unsigned long long) band,
-           (unsigned long long) engine_hash,
+           (unsigned long long) psp_focus_frame_hashes.screen,
+           (unsigned long long) psp_focus_frame_hashes.page,
+           (unsigned long long) psp_focus_frame_hashes.outside,
+           (unsigned long long) psp_focus_frame_hashes.band,
+           (unsigned long long) psp_focus_frame_hashes.engine,
            psp_focus_frame_last.has_focus ? 1u : 0u, authored ? 1u : 0u,
            psp_focus_frame_last.focus_x, psp_focus_frame_last.focus_y,
            psp_focus_frame_last.focus_width, psp_focus_frame_last.focus_height,
            psp_focus_frame_last.opaque_top, psp_focus_frame_last.opaque_bottom,
            relayouts, (unsigned) psp_focus_frame_last.presents,
-           (unsigned long long) engine_outside,
+           (unsigned long long) psp_focus_frame_hashes.engine_outside,
            psp_focus_frame_last.loading ? 1u : 0u,
            psp_focus_frame_last.progress,
            psp_focus_frame_last.busy ? 1u : 0u,
@@ -656,22 +695,49 @@ static void psp_focus_frame_report(const BrowserEngine *engine, const char *phas
            psp_focus_frame_last.cursor ? 1u : 0u,
            psp_focus_frame_last.scroll_y,
            psp_focus_frame_last.maximum_scroll_y,
-           (unsigned long long) (sceKernelGetSystemTimeWide() - started_us));
+           (unsigned long long) psp_focus_frame_hashes.hash_us);
     psp_focus_frame_last.presents = 0;
 }
 
+/* Once per loop iteration, before its vblank wait: on the first quiet
+   iteration after a present, hash the frame a pending settled record will
+   report, so the next press does not pay for it. Not while the page has
+   work or is loading: that would delay it. */
+void psp_focus_frame_idle(const BrowserEngine *engine, bool quiet)
+{
+    if (!psp_focus_frame_settle_pending || !psp_focus_frame_last.valid
+        || psp_focus_frame_hashes.valid || engine == NULL) return;
+    if (!quiet) {
+        psp_focus_frame_quiet_iterations = 0;
+        return;
+    }
+    /* The iteration that presented is not quiet; the one after it is. */
+    if (psp_focus_frame_quiet_iterations++ == 0) return;
+    psp_focus_frame_hash(engine);
+}
+
 /* The settled frame of the previous focus move, if one is pending: called
-   before the next press is dispatched and at every input-script mark. */
+   before the next press is dispatched and at every input-script mark.
+   Returns the hashing time it spent (zero when the idle pass had hashed). */
+static uint64_t psp_focus_frame_settle_timed(const BrowserEngine *engine)
+{
+    if (!psp_focus_frame_settle_pending) return 0;
+    psp_focus_frame_settle_pending = false;
+    uint64_t started_us = sceKernelGetSystemTimeWide();
+    psp_focus_frame_report(engine, "settled");
+    return sceKernelGetSystemTimeWide() - started_us;
+}
+
 void psp_focus_frame_settle(const BrowserEngine *engine)
 {
-    if (!psp_focus_frame_settle_pending) return;
-    psp_focus_frame_settle_pending = false;
-    psp_focus_frame_report(engine, "settled");
+    (void) psp_focus_frame_settle_timed(engine);
 }
 
 void psp_focus_feedback_begin(BrowserEngine *engine, int action, uint64_t started_us)
 {
-    psp_focus_frame_settle(engine);
+    /* Validation bookkeeping is not part of the press: shift its start
+       past whatever the settled record cost here. */
+    started_us += psp_focus_frame_settle_timed(engine);
     if (engine != NULL && !psp_focus_feedback_page_action(action)) {
         psp_focus_frame_moves++;
         psp_focus_frame_settle_pending = true;
@@ -710,6 +776,25 @@ void psp_focus_feedback_begin(BrowserEngine *engine, int action, uint64_t starte
     psp_focus_feedback.rendered_frames = render->frames_rendered;
     psp_focus_feedback.shell_serial = browser_engine_render_shell_serial(engine);
     psp_focus_feedback.action = action;
+}
+
+void psp_scroll_feedback_press(BrowserEngine *engine, int action,
+    uint64_t started_us, bool changed, const PspUiState *ui)
+{
+    if (changed) {
+        psp_focus_feedback_begin(engine, action, started_us);
+        return;
+    }
+    /* Nothing to present: the press is answered now. A record still in
+       flight for an earlier press keeps running; it is not superseded. */
+    uint64_t elapsed_us = sceKernelGetSystemTimeWide() - started_us;
+    printf("tilefinch-scroll-feedback: action=%d elapsed=%lluus "
+           "first-visible=%lluus y=%d/%d noop=1\n",
+           action, (unsigned long long) elapsed_us,
+           (unsigned long long) elapsed_us,
+           ui != NULL ? ui->scroll_y : 0,
+           ui != NULL ? ui->maximum_scroll_y : 0);
+    psp_focus_frame_settle(engine);
 }
 
 static void psp_focus_feedback_published(const uint16_t *frame, const PspUiState *ui)
@@ -993,6 +1078,7 @@ void psp_vprobe_phase_begin(PspVprobePhase *phase)
     };
     phase->base_cpu_before_valid = psp_present_cpu_measurement
         && psp_present_thread_cpu(&phase->base_cpu_before);
+    media_swdec_cpu_begin(MEDIA_SWDEC_CPU_COMPOSE);
 }
 
 void psp_vprobe_phase_base_bytes(PspVprobePhase *phase, uint32_t base_bytes)
@@ -1022,12 +1108,70 @@ void psp_vprobe_phase_ui_composited(PspVprobePhase *phase)
 void psp_vprobe_phase_composed(PspVprobePhase *phase, bool native_surface)
 {
     phase->composite_finished_us = (uint64_t) sceKernelGetSystemTimeWide();
+    media_swdec_cpu_begin(MEDIA_SWDEC_CPU_SUBMIT);
     psp_cadence_composed(phase->presentation_started_us, native_surface);
     phase->published_index = psp_display.back_buffer;
     (void) psp_display_validation_timing_snapshot(&phase->display_timing_before);
     if (psp_present_pre_publish_hook != NULL) {
         uint32_t next = psp_present_last_timing.sequence + 1u;
         psp_present_pre_publish_hook(next == 0u ? 1u : next);
+    }
+}
+
+/*
+ * Player-present probe: what each published player frame actually showed.
+ * In-memory counters, one line every 100 player presents, so a device run
+ * shows black or missing video without a frame dump. "stage" is the black
+ * player stage drawn when no decoded frame is held; "black" samples nine
+ * points of the video area in the published buffer; "back" counts a frame
+ * older than the one before it; "refused" is a slot the presenter could no
+ * longer borrow.
+ */
+static struct {
+    uint32_t presents, video, stage, black, back, refused, buffering, repeats;
+    uint64_t last_identity;
+} psp_present_probe;
+
+void psp_vprobe_present_borrow_refused(void)
+{
+    psp_present_probe.refused++;
+}
+
+static void psp_present_probe_note(bool media_replaces_page,
+                                   const uint16_t *vram)
+{
+    if (psp_active_media == NULL) return;
+    psp_present_probe.presents++;
+    if (psp_active_media->ui.buffering) psp_present_probe.buffering++;
+    if (!media_replaces_page) {
+        psp_present_probe.stage++;
+    } else {
+        psp_present_probe.video++;
+        uint64_t identity = psp_active_media->frame.identity;
+        if (identity == psp_present_probe.last_identity)
+            psp_present_probe.repeats++;
+        else if (identity < psp_present_probe.last_identity)
+            psp_present_probe.back++;
+        psp_present_probe.last_identity = identity;
+        if (vram != NULL) {
+            static const unsigned rows[3] = {60u, 136u, 212u};
+            static const unsigned cols[3] = {80u, 240u, 400u};
+            unsigned lit = 0;
+            for (unsigned r = 0; r < 3u; r++)
+                for (unsigned c = 0; c < 3u; c++)
+                    if (vram[(size_t) rows[r] * PSP_VRAM_STRIDE + cols[c]]
+                        != 0u) lit++;
+            if (lit == 0) psp_present_probe.black++;
+        }
+    }
+    if (psp_present_probe.presents % 100u == 0) {
+        printf("tilefinch-media-present-probe: presents=%u video=%u "
+               "stage=%u black=%u repeats=%u back=%u refused=%u "
+               "buffering=%u\n",
+               psp_present_probe.presents, psp_present_probe.video,
+               psp_present_probe.stage, psp_present_probe.black,
+               psp_present_probe.repeats, psp_present_probe.back,
+               psp_present_probe.refused, psp_present_probe.buffering);
     }
 }
 
@@ -1048,6 +1192,7 @@ void psp_vprobe_phase_published(
     unsigned published_index = phase->published_index;
     PspDisplayBackendTiming display_timing_before = phase->display_timing_before;
     uint64_t published_us = (uint64_t) sceKernelGetSystemTimeWide();
+    media_swdec_cpu_begin(MEDIA_SWDEC_CPU_PROBE);
     PspDisplayBackendTiming display_timing_after = {0};
     (void) psp_display_validation_timing_snapshot(&display_timing_after);
     uint32_t sequence = psp_present_last_timing.sequence + 1u;
@@ -1093,6 +1238,8 @@ void psp_vprobe_phase_published(
     if (published && !media_visible)
         psp_focus_frame_note_present(frame, ui, vram);
     if (published && !media_visible) psp_focus_feedback_published(frame, ui);
+    if (published && media_visible) psp_present_probe_note(
+        media_replaces_page, vram);
     if (published && media_visible) {
         psp_input_script_capture_media_present(
             &psp_active_media->ui, vram, NULL, PSP_VRAM_STRIDE,
@@ -1101,6 +1248,7 @@ void psp_vprobe_phase_published(
             false, media_replaces_page ? &psp_active_media->frame : NULL,
             psp_media_present_records, PSP_DISPLAY_PAGE_BUFFER_COUNT);
     }
+    media_swdec_cpu_begin(MEDIA_SWDEC_CPU_PRESENTED);
 }
 
 void psp_vprobe_fonts_begin(PspVprobeFonts *probe)
@@ -1203,6 +1351,113 @@ void psp_media_present_report(
                : (psp_display_in_edram(&psp_display, texture->pixels)
                       ? "edram" : "main"),
            (unsigned) passthrough_drawn, (unsigned) passthrough_source);
+}
+
+/*
+ * Software-decoder presentation A/B: where each 16-bit picture went, the
+ * engine's submit and residual wait, and the CPU the presenting (this) thread
+ * and the decode worker ("TilefinchSwdec") used over the same window. One line
+ * per 100 pictures; the window restarts with each playback.
+ */
+int psp_vprobe_swdec_mode;
+static struct {
+    const void *playback;
+    SceUID worker;
+    uint32_t paths[PSP_VPROBE_SWDEC_PATHS], drawing, failures, wait_max_us;
+    uint64_t submit_us, wait_us, started_us, present_cpu_us, decode_cpu_us;
+} psp_swdec_present;
+
+static uint64_t psp_swdec_thread_cpu_us(SceUID thread)
+{
+    SceKernelThreadRunStatus status = {.size = sizeof(status)};
+    if (thread < 0 || sceKernelReferThreadRunStatus(thread, &status) < 0)
+        return 0;
+    return ((uint64_t) status.runClocks.hi << 32) | status.runClocks.low;
+}
+
+static SceUID psp_swdec_worker_thread(void)
+{
+    SceUID ids[64];
+    int count = 0;
+    if (sceKernelGetThreadmanIdList(SCE_KERNEL_TMID_Thread, ids, 64, &count)
+        < 0) return -1;
+    for (int at = 0; at < count && at < 64; at++) {
+        SceKernelThreadInfo info;
+        if (psp_thread_snapshot(ids[at], &info) >= 0
+            && strcmp(info.name, "TilefinchSwdec") == 0) return ids[at];
+    }
+    return -1;
+}
+
+void psp_vprobe_swdec_present(
+    unsigned path, const PspMediaPresentGeCost *cost)
+{
+    const void *playback =
+        psp_active_media == NULL ? NULL : psp_active_media->playback;
+    if (playback != psp_swdec_present.playback) {
+        memset(&psp_swdec_present, 0, sizeof(psp_swdec_present));
+        psp_swdec_present.playback = playback;
+        psp_swdec_present.worker = psp_swdec_worker_thread();
+        psp_swdec_present.started_us = sceKernelGetSystemTimeWide();
+        psp_swdec_present.present_cpu_us =
+            psp_swdec_thread_cpu_us(sceKernelGetThreadId());
+        psp_swdec_present.decode_cpu_us =
+            psp_swdec_thread_cpu_us(psp_swdec_present.worker);
+    }
+    if (path >= PSP_VPROBE_SWDEC_PATHS) return;
+    psp_swdec_present.paths[path]++;
+    if (cost != NULL) psp_swdec_present.submit_us += cost->submit_us;
+    uint32_t frames = 0;
+    for (unsigned at = 0; at < PSP_VPROBE_SWDEC_PATHS; at++)
+        frames += psp_swdec_present.paths[at];
+    if (frames % 100u != 0) return;
+    uint64_t wall_us =
+        sceKernelGetSystemTimeWide() - psp_swdec_present.started_us;
+    const uint32_t *paths = psp_swdec_present.paths;
+    printf("tilefinch-swdec-present: mode=%d frames=%u ge=%u off=%u "
+           "chrome=%u address=%u geometry=%u refused=%u submit=%lluus "
+           "drawing-at-finish=%u wait=%lluus wait-max=%uus failures=%u "
+           "wall=%lluus fps-x10=%llu present-cpu=%lluus decode-cpu=%lluus\n",
+           psp_vprobe_swdec_mode, (unsigned) frames,
+           (unsigned) paths[PSP_VPROBE_SWDEC_GE],
+           (unsigned) paths[PSP_VPROBE_SWDEC_OFF],
+           (unsigned) paths[PSP_VPROBE_SWDEC_CHROME],
+           (unsigned) paths[PSP_VPROBE_SWDEC_ADDRESS],
+           (unsigned) paths[PSP_VPROBE_SWDEC_GEOMETRY],
+           (unsigned) paths[PSP_VPROBE_SWDEC_REFUSED],
+           (unsigned long long) psp_swdec_present.submit_us,
+           (unsigned) psp_swdec_present.drawing,
+           (unsigned long long) psp_swdec_present.wait_us,
+           (unsigned) psp_swdec_present.wait_max_us,
+           (unsigned) psp_swdec_present.failures,
+           (unsigned long long) wall_us,
+           wall_us == 0 ? 0ull
+               : (unsigned long long) ((uint64_t) frames * 10000000u
+                                       / wall_us),
+           (unsigned long long) (psp_swdec_thread_cpu_us(
+               sceKernelGetThreadId()) - psp_swdec_present.present_cpu_us),
+           (unsigned long long) (psp_swdec_thread_cpu_us(
+               psp_swdec_present.worker) - psp_swdec_present.decode_cpu_us));
+}
+
+void psp_vprobe_swdec_finish(
+    bool drawing, const PspMediaPresentGeCost *cost, bool drawn)
+{
+    if (drawing) psp_swdec_present.drawing++;
+    if (!drawn) psp_swdec_present.failures++;
+    psp_swdec_present.wait_us += cost->wait_us;
+    if (cost->wait_us > psp_swdec_present.wait_max_us)
+        psp_swdec_present.wait_max_us = (uint32_t) cost->wait_us;
+    /* The media job line's ge-sync/ge-wait, which the submit could not
+       know yet. */
+    PspMediaSession *media = psp_active_media;
+    if (media == NULL) return;
+    media->present_ge_sync_total_us += cost->sync_us;
+    if (cost->sync_us > media->present_ge_sync_max_us)
+        media->present_ge_sync_max_us = cost->sync_us;
+    media->present_ge_wait_total_us += cost->wait_us;
+    if (cost->wait_us > media->present_ge_wait_max_us)
+        media->present_ge_wait_max_us = cost->wait_us;
 }
 
 /* psp_media_present_account's cost totals for the media job report and

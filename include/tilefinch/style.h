@@ -2637,6 +2637,30 @@ bool stylesheet_add_css_from_context(
     Stylesheet *sheet, const char *css, size_t length,
     const char *source_base_url, const char *source_referrer_policy,
     const StyleSourceOptions *source);
+/* One CSS source parsed into `sheet` in bounded slices, so a large sheet
+   need not monopolize the caller. Each step parses until `deadline_us`
+   (tilefinch_platform_monotonic_time_us) passes, stopping only at a rule
+   boundary outside container queries and anonymous layers, and always
+   making progress. Once DONE the rules are exactly those
+   stylesheet_add_css_from_context adds for the same source. `css` must stay
+   valid, and nothing else may parse into or resolve style from `sheet`,
+   until the parse is released. A parse released before DONE leaves the
+   rules parsed so far; the caller discards or rebuilds the sheet. */
+typedef struct StyleCssSlicedParse StyleCssSlicedParse;
+typedef enum {
+    STYLE_CSS_SLICE_FAILED = 0,
+    STYLE_CSS_SLICE_MORE,
+    STYLE_CSS_SLICE_DONE
+} StyleCssSliceResult;
+StyleCssSlicedParse *stylesheet_sliced_parse_begin(
+    Stylesheet *sheet, const char *css, size_t length,
+    const char *source_base_url, const char *source_referrer_policy,
+    const StyleSourceOptions *source);
+StyleCssSliceResult stylesheet_sliced_parse_step(
+    StyleCssSlicedParse *parse, uint64_t deadline_us);
+/* Consumed source position, not pump attempts: safe for stall watchdogs. */
+size_t stylesheet_sliced_parse_progress(const StyleCssSlicedParse *parse);
+void stylesheet_sliced_parse_release(StyleCssSlicedParse *parse);
 /* Parses CSS normally while optionally retaining a bounded, pointer-free
    structural IR for the final selector/declaration operations. The IR is
    viewport-specific and is deliberately unavailable for constructs whose

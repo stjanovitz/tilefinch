@@ -30,7 +30,12 @@ else
     echo "Building without device-trained PGO; decoding may be slower" >&2
 fi
 ffmpeg="$output/ffmpeg"
+# Two builds of the same tree. libs/asm22 is the release input: no
+# measurement hooks, test hooks or experimental kernels. libs/asm22-diag adds
+# them (SWDEC_DIAGNOSTICS, with the per-stage clock) for validation trees and
+# the bench; cmake/PspSwdec.cmake picks one by TILEFINCH_PSP_VALIDATION_LOG.
 libraries="$output/libs/asm22"
+diagnostic_libraries="$output/libs/asm22-diag"
 patch="$root/third_party/patches/ffmpeg-n8.1.2-swdec.patch"
 export PATH="$PSPDEV/bin:$PATH"
 pspsdk=$(psp-config --pspsdk-path)
@@ -55,29 +60,38 @@ else
 fi
 
 cd "$ffmpeg"
-./configure \
-    --enable-cross-compile --cross-prefix=psp- --arch=mips --cpu=generic \
-    --target-os=none --disable-everything --disable-programs --disable-doc \
-    --disable-avdevice --disable-avformat --disable-swscale \
-    --disable-swresample --disable-avfilter --disable-network \
-    --disable-pthreads --disable-w32threads --disable-os2threads \
-    --disable-asm --disable-inline-asm --disable-mipsdsp \
-    --disable-mipsdspr2 --disable-msa --disable-mmi --disable-debug \
-    --enable-decoder=h264 --enable-decoder=aac_fixed --enable-parser=h264 \
-    --disable-hwaccels --disable-iconv --disable-zlib --disable-bzlib \
-    --disable-lzma --disable-securetransport --disable-audiotoolbox \
-    --disable-videotoolbox --disable-coreimage --disable-appkit \
-    --disable-avfoundation --disable-metal --disable-vulkan --disable-xlib \
-    --disable-sdl2 --malloc-prefix=swdec_ --enable-small \
-    --extra-cflags="-G0 -Os -D_DEFAULT_SOURCE -DPSP -I$pspsdk/include \
-        -DSWDEC_LF_STRENGTH_C=1 -DSWDEC_PSP_LF_CHROMA=1 \
-        -DSWDEC_STAGE_TIMING=1 -DSWDEC_FRAME_ONLY=1 \
-        -DSWDEC_PSP_ASM=1 -Wno-error=incompatible-pointer-types \
-        $pgo_flags" \
-    --optflags=-O2
-make -j"${TILEFINCH_BUILD_JOBS:-8}" \
-    libavcodec/libavcodec.a libavutil/libavutil.a
-mkdir -p "$libraries"
-cp libavcodec/libavcodec.a libavutil/libavutil.a config.h "$libraries/"
+build_variant() {
+    destination=$1
+    variant_flags=$2
+    ./configure \
+        --enable-cross-compile --cross-prefix=psp- --arch=mips --cpu=generic \
+        --target-os=none --disable-everything --disable-programs --disable-doc \
+        --disable-avdevice --disable-avformat --disable-swscale \
+        --disable-swresample --disable-avfilter --disable-network \
+        --disable-pthreads --disable-w32threads --disable-os2threads \
+        --disable-asm --disable-inline-asm --disable-mipsdsp \
+        --disable-mipsdspr2 --disable-msa --disable-mmi --disable-debug \
+        --enable-decoder=h264 --enable-decoder=aac_fixed --enable-parser=h264 \
+        --disable-hwaccels --disable-iconv --disable-zlib --disable-bzlib \
+        --disable-lzma --disable-securetransport --disable-audiotoolbox \
+        --disable-videotoolbox --disable-coreimage --disable-appkit \
+        --disable-avfoundation --disable-metal --disable-vulkan --disable-xlib \
+        --disable-sdl2 --malloc-prefix=swdec_ --enable-small \
+        --extra-cflags="-G0 -Os -D_DEFAULT_SOURCE -DPSP -I$pspsdk/include \
+            -DSWDEC_LF_STRENGTH_C=1 -DSWDEC_PSP_LF_CHROMA=1 \
+            -DSWDEC_FRAME_ONLY=1 \
+            -DSWDEC_PSP_ASM=1 -Wno-error=incompatible-pointer-types \
+            $variant_flags $pgo_flags" \
+        --optflags=-O2
+    # The variants differ only in flags, which make does not track.
+    make clean
+    make -j"${TILEFINCH_BUILD_JOBS:-8}" \
+        libavcodec/libavcodec.a libavutil/libavutil.a
+    mkdir -p "$destination"
+    cp libavcodec/libavcodec.a libavutil/libavutil.a config.h "$destination/"
+}
+build_variant "$diagnostic_libraries" \
+    "-DSWDEC_DIAGNOSTICS=1 -DSWDEC_STAGE_TIMING=1"
+build_variant "$libraries" ""
 
 echo "Prepared Tilefinch FFmpeg input at $output"

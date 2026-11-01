@@ -349,6 +349,17 @@ static void script_runtime_gc_hook(void *opaque, int begin)
         owner->gc_live_before = owner->quickjs_pool == NULL ? 0
             : budget_quickjs_pool_js_malloc_current(owner->quickjs_pool);
     }
+    /* A collection is the realm's safe point inside a long task: QuickJS
+       frees unreachable objects here, so releasing the queued stores' own
+       references is the same kind of work, and pacing counts what it frees
+       as this collection's (it is measured from gc_live_before). Without it
+       a page that grows its heap within one task holds them until it is
+       refused memory. A refusal counts until the advance boundary accounts
+       it, as there, so one caught out-of-memory does not empty the queue
+       for the rest of the realm's life. */
+    if (begin && owner->bytecode_pending_count != 0)
+        (void) script_runtime_release_pending_bytecode_for_heap(
+            owner, owner->heap_growth_refusals != owner->gc_advance_refusals);
 #if !defined(TILEFINCH_NO_TRACE) || defined(TILEFINCH_PSP_VALIDATION_LOG)
     if (begin) {
         owner->gc_begin_ns = js_rt_monotonic_time_ns();
@@ -1322,6 +1333,11 @@ static int interrupt_handler(JSRuntime *runtime, void *opaque)
     if (profiled != NULL && sampled_ns > now_ns)
         profiled->profile->profiler_us += (sampled_ns - now_ns) / 1000u;
 #endif
+#if defined(CONFIG_TILEFINCH_HEAP_DETAIL) && !defined(TILEFINCH_NO_TRACE)
+    js_rt_jsmem_census_check((ScriptRuntime *) (void *)
+        ((char *) watchdog - offsetof(ScriptRuntime, watchdog)), "poll",
+        true);
+#endif
     unsigned split = script_split_enter(SCRIPT_SPLIT_HOST);
     int verdict = interrupt_handler_service(runtime, watchdog, now_ns, now);
     script_split_leave(split);
@@ -1393,6 +1409,19 @@ static int interrupt_handler_service(JSRuntime *runtime, Watchdog *watchdog,
         } while (watchdog->next_profile_ms <= now);
     }
 #endif
+    if (watchdog->pool != NULL
+        && budget_quickjs_pool_rejection_count(watchdog->pool)
+               - watchdog->pool_rejections_started
+           >= SCRIPT_ENTRY_REFUSAL_LIMIT) {
+        /* Out of memory, not out of time: the error and the realm's
+           retirement say so (js_rt_record_exception). */
+        watchdog->interrupted = true;
+        watchdog->memory_exhausted = true;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        watchdog_log_interrupt(watchdog, "refusals", now);
+#endif
+        return 1;
+    }
     if (now >= watchdog->deadline_ms) {
         watchdog->interrupted = true;
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
@@ -1515,6 +1544,13 @@ static void runtime_report_heap_failure(ScriptRuntime *runtime)
 
 void js_rt_record_exception(JSContext *context, ScriptResult *result)
 {
+#if defined(CONFIG_TILEFINCH_HEAP_DETAIL) && !defined(TILEFINCH_NO_TRACE)
+    {
+        DomBridge *jsmem_bridge = JS_GetContextOpaque(context);
+        if (jsmem_bridge != NULL)
+            js_rt_jsmem_census_check(jsmem_bridge->host, "exception", true);
+    }
+#endif
     JSValue exception = JS_GetException(context);
     const char *message = js_rt_exception_to_cstring(context, exception);
     if (message != NULL) {
@@ -1539,6 +1575,21 @@ void js_rt_record_exception(JSContext *context, ScriptResult *result)
         JS_FreeCString(context, stack);
     }
     JS_FreeValue(context, stack_value);
+    DomBridge *exhausted_bridge = JS_GetContextOpaque(context);
+    static const char interrupted[] = "InternalError: interrupted";
+    if (exhausted_bridge != NULL && exhausted_bridge->host != NULL
+        && exhausted_bridge->host->watchdog.memory_exhausted
+        && strncmp(result->error, interrupted, sizeof(interrupted) - 1)
+               == 0) {
+        /* The entry was stopped for refused allocations, not for time
+           (interrupt_handler): report it as the out-of-memory it is, so
+           the exhausted-realm check and the page's summary say memory. */
+        char rest[sizeof(result->error)];
+        snprintf(rest, sizeof(rest), "%s",
+                 result->error + sizeof(interrupted) - 1);
+        snprintf(result->error, sizeof(result->error),
+                 "InternalError: out of memory%s", rest);
+    }
 #ifndef TILEFINCH_NO_TRACE
     if (tilefinch_trace_census()) census_print_error("census-exception",
                                                      result->error);
@@ -1958,14 +2009,14 @@ static bool js_rt_compile_source_admitted(
         && compile_kind_is_page(source_kind)
         && length >= SCRIPT_ADMISSION_FLOOR_MINIMUM_UNIT_BYTES) {
         size_t floor_bytes = script_admission_compile_floor(length);
-        size_t available = script_runtime_heap_available(owner);
+        size_t available = script_runtime_heap_admission_available(owner);
         /* Collect before refusing only when enough has been allocated
            since the last collection for it to free something
            (js_rt_gc_due): a page refusing one large unit after another
            would otherwise mark its whole heap for each. */
         if (floor_bytes > available && js_rt_gc_due(owner)) {
             JS_RunGC(owner->runtime);
-            available = script_runtime_heap_available(owner);
+            available = script_runtime_heap_admission_available(owner);
         }
         if (floor_bytes > available) {
             if (result != NULL) {
@@ -2089,6 +2140,340 @@ bool js_rt_evaluate_compiled_source(
         JS_GetRuntime(context), name, source_length, true);
     return true;
 }
+
+/*
+ * Function source outside the heap.
+ *
+ * QuickJS keeps each function's source text for
+ * Function.prototype.toString(). For a classic script that is close to one
+ * copy of the whole script in the realm heap (a mean of 3.7 MB, a fifth of
+ * the heap, on the video sites that run out of JavaScript memory), plus a
+ * copy of every nested function's text while it compiles. A classic script
+ * of at least SCRIPT_SOURCE_STORE_MINIMUM_BYTES (inline or external; not
+ * modules, which drop the text outright, see js_module_loader.c, nor
+ * lazy-webpack factories, whose text that tier already keeps) therefore
+ * compiles with JS_STRIP_SOURCE, and its text goes to the realm's
+ * function-source store (js_source_store.h) in the page Budget instead.
+ * Its functions record where their text is (JS_SetExternalSourceHooks()),
+ * so toString() returns exactly what the unstripped engine returned, and
+ * file:line:col in stacks is unchanged (the line tables stay).
+ *
+ * The store copies the text when the script compiles and compresses it
+ * (script_text_lz.h) only once plain text exceeds a quarter of the room
+ * the page has left above the realm's growth reserve, so a page with room
+ * pays a copy, not an encode, on its load path. That is checked at every
+ * such compile and at each advance boundary
+ * (js_rt_source_store_safe_point()); after the realm was refused growth,
+ * everything is compressed there. When the realm's growth would be refused
+ * (after cached script bodies give way), the store compresses what is
+ * still plain, then drops whole scripts that no uncompiled lazy function
+ * needs, least recently read first (js_rt_source_store_relieve() from
+ * js_rt_heap_growth_hook()); plain text never costs the realm a growth
+ * step.
+ * toString() of a function whose text was dropped answers with the
+ * "[native code]" form, as a stripped module's does. A lazily compiled
+ * function reads its body from the store on its first call, so text such a
+ * function still needs is never dropped. Bytecode the classic cache
+ * restores refers to the text by offset: a revisit names the script text
+ * (js_rt_source_store_begin_restore()), copied only if restored functions
+ * refer to it; bytecode restored without its text (an installed app's
+ * offline copy) whose lazy functions need it does not restore, and the
+ * script compiles from source.
+ */
+#if defined(PSP_BROWSER_BELLARD_QUICKJS)
+#define SCRIPT_SOURCE_STORE_MINIMUM_BYTES (8u * 1024u)
+
+typedef enum {
+    SCRIPT_SOURCE_POLICY_KEEP = 0, /* text in the heap (no store) */
+    SCRIPT_SOURCE_POLICY_STRIP,    /* lab only: no text at all */
+    SCRIPT_SOURCE_POLICY_STORE
+} ScriptSourcePolicy;
+
+typedef struct {
+    ScriptSourcePolicy policy;
+    ScriptSourceStoreCompression compression;
+    size_t minimum_bytes;
+} ScriptSourceStoreConfig;
+
+/* TILEFINCH_JS_SOURCE_STORE (lab builds only) selects keep, strip, plain,
+   lz or pressure (the default); TILEFINCH_JS_SOURCE_STORE_MIN_KB the
+   threshold. */
+static const ScriptSourceStoreConfig *script_source_store_config(void)
+{
+    static ScriptSourceStoreConfig config = {
+        SCRIPT_SOURCE_POLICY_STORE,
+        SCRIPT_SOURCE_STORE_COMPRESS_UNDER_PRESSURE,
+        SCRIPT_SOURCE_STORE_MINIMUM_BYTES
+    };
+#if TILEFINCH_LAB_ENVIRONMENT
+    static bool resolved = false;
+    if (!resolved) {
+        resolved = true;
+        const char *mode = tilefinch_lab_getenv("TILEFINCH_JS_SOURCE_STORE");
+        if (mode != NULL) {
+            if (strcmp(mode, "keep") == 0) {
+                config.policy = SCRIPT_SOURCE_POLICY_KEEP;
+            } else if (strcmp(mode, "strip") == 0) {
+                config.policy = SCRIPT_SOURCE_POLICY_STRIP;
+            } else if (strcmp(mode, "plain") == 0) {
+                config.compression = SCRIPT_SOURCE_STORE_COMPRESS_NEVER;
+            } else if (strcmp(mode, "lz") == 0) {
+                config.compression = SCRIPT_SOURCE_STORE_COMPRESS_EAGER;
+            }
+        }
+        const char *kb =
+            tilefinch_lab_getenv("TILEFINCH_JS_SOURCE_STORE_MIN_KB");
+        if (kb != NULL && kb[0] != '\0')
+            config.minimum_bytes = (size_t) strtoul(kb, NULL, 10) * 1024u;
+    }
+#endif
+    return &config;
+}
+
+static int js_rt_source_store_read(void *opaque, uint32_t source_id,
+                                   uint32_t offset, uint32_t length,
+                                   char *dest)
+{
+    ScriptRuntime *runtime = opaque;
+    return script_source_store_read(runtime->source_store, source_id, offset,
+                                    length, dest);
+}
+
+static int js_rt_source_store_query(void *opaque, uint32_t source_id,
+                                    uint32_t offset, uint32_t length)
+{
+    ScriptRuntime *runtime = opaque;
+    return script_source_store_query(runtime->source_store, source_id, offset,
+                                     length);
+}
+
+static void js_rt_source_store_release(void *opaque, uint32_t source_id)
+{
+    ScriptRuntime *runtime = opaque;
+    script_source_store_release(runtime->source_store, source_id);
+}
+
+static void js_rt_source_store_pin(void *opaque, uint32_t source_id,
+                                   int required)
+{
+    ScriptRuntime *runtime = opaque;
+    script_source_store_require(runtime->source_store, source_id,
+                                required != 0);
+}
+
+/* The page room a realm can still grow into: free Budget above its growth
+   reserve. */
+static size_t js_rt_source_store_room(const ScriptRuntime *runtime)
+{
+    size_t free_bytes = budget_remaining(runtime->budget);
+    size_t reserve = runtime->heap_growth_enabled
+        ? runtime->heap_growth_reserve : 0;
+    return free_bytes > reserve ? free_bytes - reserve : 0;
+}
+
+/* The realm's store, created (and the engine hooks installed) on first
+   use; NULL if it cannot be. */
+static ScriptSourceStore *js_rt_source_store(ScriptRuntime *runtime)
+{
+    const ScriptSourceStoreConfig *config = script_source_store_config();
+    if (runtime == NULL || runtime->runtime == NULL) return NULL;
+    if (runtime->source_store == NULL) {
+        runtime->source_store = script_source_store_create(
+            runtime->budget, config->compression);
+        if (runtime->source_store == NULL) return NULL;
+        JS_SetExternalSourceHooks(runtime->runtime, js_rt_source_store_read,
+                                  js_rt_source_store_release,
+                                  js_rt_source_store_pin, runtime);
+        JS_SetExternalSourceQuery(runtime->runtime, js_rt_source_store_query);
+    }
+    return runtime->source_store;
+}
+
+/* Adds `source` to the realm's store; returns its id, or 0 (the text
+   stays in the heap). */
+static uint32_t js_rt_source_store_add(ScriptRuntime *runtime,
+                                       const char *source, size_t length)
+{
+    ScriptSourceStore *store = js_rt_source_store(runtime);
+    if (store == NULL || source == NULL || length > UINT32_MAX / 2u)
+        return 0;
+    uint32_t source_id = script_source_store_add(store, source, length);
+    if (source_id != 0)
+        script_source_store_balance(store,
+                                    js_rt_source_store_room(runtime) / 4u);
+    return source_id;
+}
+
+size_t js_rt_source_store_relieve(ScriptRuntime *runtime, size_t needed)
+{
+    return runtime == NULL ? 0
+        : script_source_store_relieve(runtime->source_store, needed);
+}
+
+void js_rt_source_store_safe_point(ScriptRuntime *runtime, bool refused)
+{
+    if (runtime == NULL || runtime->source_store == NULL) return;
+    script_source_store_balance(runtime->source_store,
+        refused ? 0 : js_rt_source_store_room(runtime) / 4u);
+}
+
+/* The restore reserves an id without copying: a miss, a compile still
+   queued in this realm, or bytecode without stored functions copies
+   nothing. The text is copied after JS_ReadObject() only if functions it
+   restored refer to it (the entry is then still there). */
+uint32_t js_rt_source_store_begin_restore(ScriptRuntime *runtime,
+                                          const char *source, size_t length)
+{
+    const ScriptSourceStoreConfig *config = script_source_store_config();
+    if (source == NULL || config->policy != SCRIPT_SOURCE_POLICY_STORE
+        || length < config->minimum_bytes || length > UINT32_MAX / 2u)
+        return 0;
+    ScriptSourceStore *store = js_rt_source_store(runtime);
+    uint32_t source_id = script_source_store_reserve(store, length);
+    if (source_id != 0) {
+        /* held until end: nothing may drop it while the read runs */
+        (void) script_source_store_lease(store, source_id, true);
+        (void) JS_SetExternalSourceId(runtime->runtime, source_id,
+                                      (uint32_t) length);
+    }
+    return source_id;
+}
+
+bool js_rt_source_store_end_restore(ScriptRuntime *runtime,
+                                    uint32_t source_id, const char *source)
+{
+    if (runtime == NULL || source_id == 0) return true;
+    ScriptSourceStore *store = runtime->source_store;
+    uint32_t pending = JS_SetExternalSourceId(runtime->runtime, 0, 0);
+    if (pending != 0) {
+        /* not consumed: no JS_ReadObject() ran */
+        (void) script_source_store_lease(store, source_id, false);
+        script_source_store_release(store, pending);
+        return true;
+    }
+    ScriptSourceStoreStats before;
+    script_source_store_stats(store, &before);
+    bool filled = script_source_store_fill(store, source_id, source);
+    (void) script_source_store_lease(store, source_id, false);
+    if (filled) {
+        script_source_store_balance(store,
+                                    js_rt_source_store_room(runtime) / 4u);
+        return true;
+    }
+    /* Released (nothing restored refers to it): fine. Refused by the
+       Budget: the restored functions could not read their text. */
+    ScriptSourceStoreStats after;
+    script_source_store_stats(store, &after);
+    return after.refused == before.refused;
+}
+
+/* Compile setup for one page compile: strips the text of an eligible
+   classic script and names its stored copy, leased until compile end so
+   nothing drops it before functions refer to it. Returns the strip flags
+   to restore, or -1 if nothing was changed; *source_id gets the stored
+   copy's id, or 0. */
+static int js_rt_source_store_compile_begin(
+    ScriptRuntime *runtime, JSRuntime *js_runtime, const char *source,
+    size_t length, ScriptCompileSourceKind source_kind, uint32_t *source_id_out)
+{
+    *source_id_out = 0;
+    const ScriptSourceStoreConfig *config = script_source_store_config();
+    if (config->policy == SCRIPT_SOURCE_POLICY_KEEP
+        || (source_kind != SCRIPT_COMPILE_SOURCE_INLINE
+            && source_kind != SCRIPT_COMPILE_SOURCE_EXTERNAL)
+        || length < config->minimum_bytes) return -1;
+    uint32_t source_id = 0;
+    if (config->policy == SCRIPT_SOURCE_POLICY_STORE) {
+        source_id = js_rt_source_store_add(runtime, source, length);
+        if (source_id == 0) return -1;
+        (void) script_source_store_lease(runtime->source_store, source_id,
+                                         true);
+        *source_id_out = source_id;
+    }
+    int previous = JS_GetStripInfo(js_runtime);
+    JS_SetStripInfo(js_runtime, previous | JS_STRIP_SOURCE);
+    if (source_id != 0)
+        (void) JS_SetExternalSourceId(js_runtime, source_id,
+                                      (uint32_t) length);
+    return previous;
+}
+
+static void js_rt_source_store_compile_end(ScriptRuntime *runtime,
+                                           JSRuntime *js_runtime,
+                                           int previous_strip,
+                                           uint32_t source_id)
+{
+    if (previous_strip < 0) return;
+    JS_SetStripInfo(js_runtime, previous_strip);
+    uint32_t pending = JS_SetExternalSourceId(js_runtime, 0, 0);
+    if (runtime == NULL) return;
+    if (source_id != 0)
+        (void) script_source_store_lease(runtime->source_store, source_id,
+                                         false);
+    if (pending != 0)
+        script_source_store_release(runtime->source_store, pending);
+}
+
+#ifndef TILEFINCH_NO_TRACE
+/* Census line (TILEFINCH_TRACE_CENSUS) for the store of a realm being
+   destroyed. */
+static void js_rt_source_store_census(const ScriptRuntime *runtime)
+{
+    if (runtime->source_store == NULL || !tilefinch_trace_census()) return;
+    ScriptSourceStoreStats stats;
+    script_source_store_stats(runtime->source_store, &stats);
+    printf("census source-store added=%llu added-bytes=%llu refused=%llu "
+           "entries=%zu text=%zu held=%zu plain=%zu peak-held=%zu "
+           "compressed-blocks=%llu compressed-in=%llu compressed-out=%llu "
+           "compress-us=%llu reads=%llu read-bytes=%llu read-failures=%llu "
+           "decodes=%llu decode-us=%llu read-us=%llu evicted=%llu "
+           "evicted-bytes=%llu released=%llu\n",
+           (unsigned long long) stats.added,
+           (unsigned long long) stats.added_bytes,
+           (unsigned long long) stats.refused, stats.entries,
+           stats.text_bytes, stats.held_bytes, stats.plain_bytes,
+           stats.peak_held_bytes,
+           (unsigned long long) stats.compressed_blocks,
+           (unsigned long long) stats.compressed_in_bytes,
+           (unsigned long long) stats.compressed_out_bytes,
+           (unsigned long long) (stats.compress_ns / 1000u),
+           (unsigned long long) stats.reads,
+           (unsigned long long) stats.read_bytes,
+           (unsigned long long) stats.read_failures,
+           (unsigned long long) stats.block_decodes,
+           (unsigned long long) (stats.decode_ns / 1000u),
+           (unsigned long long) (stats.read_ns / 1000u),
+           (unsigned long long) stats.evicted,
+           (unsigned long long) stats.evicted_text_bytes,
+           (unsigned long long) stats.released);
+}
+#endif
+#else
+uint32_t js_rt_source_store_begin_restore(ScriptRuntime *runtime,
+                                          const char *source, size_t length)
+{
+    (void) runtime; (void) source; (void) length;
+    return 0;
+}
+
+bool js_rt_source_store_end_restore(ScriptRuntime *runtime,
+                                    uint32_t source_id, const char *source)
+{
+    (void) runtime; (void) source_id; (void) source;
+    return true;
+}
+
+size_t js_rt_source_store_relieve(ScriptRuntime *runtime, size_t needed)
+{
+    (void) runtime; (void) needed;
+    return 0;
+}
+
+void js_rt_source_store_safe_point(ScriptRuntime *runtime, bool refused)
+{
+    (void) runtime; (void) refused;
+}
+#endif
 
 #if defined(PSP_BROWSER_BELLARD_QUICKJS)
 /*
@@ -2222,9 +2607,35 @@ JSValue js_rt_compile_source_type(JSContext *context, const char *source,
     size_t heap_rejections_before =
         profile_owner == NULL || profile_owner->quickjs_pool == NULL ? 0
         : budget_quickjs_pool_rejection_count(profile_owner->quickjs_pool);
+#if defined(CONFIG_TILEFINCH_HEAP_DETAIL) && !defined(TILEFINCH_NO_TRACE)
+    const char *jsmem_previous_name = profile_owner == NULL ? NULL
+        : profile_owner->jsmem_compile_name;
+    size_t jsmem_previous_bytes = profile_owner == NULL ? 0
+        : profile_owner->jsmem_compile_bytes;
+    if (profile_owner != NULL) {
+        profile_owner->jsmem_compile_name = name == NULL ? "<script>" : name;
+        profile_owner->jsmem_compile_bytes = length;
+    }
+#endif
+#if defined(PSP_BROWSER_BELLARD_QUICKJS)
+    uint32_t stored_source = 0;
+    int previous_strip = js_rt_source_store_compile_begin(
+        profile_owner, js_runtime, source, length, source_kind,
+        &stored_source);
+#endif
     JSValue value = JS_Eval(
         context, source, length, name == NULL ? "<script>" : name,
         evaluation_type | JS_EVAL_FLAG_COMPILE_ONLY);
+#if defined(PSP_BROWSER_BELLARD_QUICKJS)
+    js_rt_source_store_compile_end(profile_owner, js_runtime, previous_strip,
+                                   stored_source);
+#endif
+#if defined(CONFIG_TILEFINCH_HEAP_DETAIL) && !defined(TILEFINCH_NO_TRACE)
+    if (profile_owner != NULL) {
+        profile_owner->jsmem_compile_name = jsmem_previous_name;
+        profile_owner->jsmem_compile_bytes = jsmem_previous_bytes;
+    }
+#endif
     script_profile_leave(profile_owner);
     script_split_leave(compile_split);
     work_ledger_leave(compile_ledger);
@@ -2719,7 +3130,7 @@ static bool evaluate_script_node(JSContext *context, lxb_dom_node_t *node,
             size_t before = budget_remaining(bridge->budget);
             (void) script_runtime_collect_and_trim(bridge->host);
             size_t after = budget_remaining(bridge->budget);
-            remaining = script_runtime_heap_available(bridge->host);
+            remaining = script_runtime_heap_admission_available(bridge->host);
             size_t reclaimed = after > before ? after - before : 0;
             if (remaining < required) {
                 budget_record_pressure(

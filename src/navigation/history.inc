@@ -227,6 +227,8 @@ bool navigation_commit_same_document_url(NavigationSession *session,
        turn a fragment link into a network request or dead control; URL
        reflection/hashchange is advisory after the native commit. */
     if (!history_push(session, url, session->page.document.title)) return false;
+    /* Another URL of this document: forget the kept declarations. */
+    media_declared_video_cache_destroy(&session->page.document);
     if (session->page.runtime != NULL) {
         (void) script_runtime_commit_same_document(
             session->page.runtime, url, old_url,
@@ -266,6 +268,7 @@ bool navigation_restore_same_document_url(NavigationSession *session,
     char next_base[NAVIGATION_URL_LIMIT];
     if (!navigation_document_resource_base(
             &session->page.document, url, next_base)) return false;
+    media_declared_video_cache_destroy(&session->page.document);
     if (session->page.runtime != NULL) {
         (void) script_runtime_restore_same_document(
             session->page.runtime, url, old_url,

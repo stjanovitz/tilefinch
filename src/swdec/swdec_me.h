@@ -1,11 +1,14 @@
 #ifndef SWDEC_ME_H
 #define SWDEC_ME_H
 #include <stddef.h>
+#include "swdec_diag.h"
 /* PSP only: parse on the Media Engine (see swdec_me.c). */
 int  swdec_me_attach_path(
     const char *helper_path,
     void (*log)(const char *fmt, ...));
-int  swdec_me_attach(void (*log)(const char *fmt, ...));
+#if SWDEC_DIAG_ENABLED
+int  swdec_me_attach(void (*log)(const char *fmt, ...));   /* helper from host0 */
+#endif
 void swdec_me_detach(void);
 int  swdec_me_restore(void);
 int  swdec_me_recover(void);   /* re-boot the ME + hooks after a failure (resident runner) */
@@ -15,17 +18,21 @@ int swdec_me_audio_setup(void *arena_unused);
 int swdec_me_audio_submit(const void *adts, unsigned len);
 int swdec_me_audio_poll(unsigned upto, unsigned *crc, unsigned *samples);
 unsigned swdec_me_audio_done(void);
+#if SWDEC_DIAG_ENABLED
 unsigned swdec_me_audio_us(void);
 unsigned swdec_me_audio_errors(void);
 int swdec_me_audio_cpu_decode(const void *adts, unsigned len, unsigned *crc);
+#endif
 int swdec_me_audio_reset(unsigned timeout_us);
 int swdec_me_audio_shutdown(unsigned timeout_us);
 /* playback: interleaved S16 stereo PCM for decoded frame `idx` (1024 samples/ch),
    valid once swdec_me_audio_done() > idx and until idx+32 frames were submitted */
 const short *swdec_me_audio_pcm(unsigned idx);
+#if SWDEC_DIAG_ENABLED
 /* fault-injection test support */
 void swdec_me_poison_arm(void);   /* next audio service on the ME faults deliberately */
 void swdec_me_mark_dead(void);    /* force the recover path when the watchdog didn't run */
+#endif
 /* CSC on the ME: RGB565 conversion of each row batch right after it is
    deblocked (rows are ME-cache-hot). Assign a destination before each AU;
    close at AU end (the CPU converts whatever the ME did not reach). */
@@ -39,6 +46,41 @@ int swdec_me_csc_picture(int slot, void *dst_rgb565, int stride_pixels,
                          int width, int height);
 void swdec_me_csc_off(void);
 int  swdec_me_csc_close(void);                          /* 1 = slot holds a frame */
+#if SWDEC_DIAG_ENABLED
 unsigned swdec_me_csc_stats(unsigned *cpu_batches);     /* returns ME batches */
 void swdec_me_csc_stats_reset(void);
+#endif
+/* Stage record (component builds with SWDEC_STAGE_DIAG; compiled out
+   otherwise): reset at open, bracket each decode, picture conversion and
+   conversion close on the decoding thread (kind), report through the
+   attach logger at close. */
+enum {
+    SWDEC_ME_STAGE_DECODE = 0,
+    SWDEC_ME_STAGE_CSC_PICTURE = 1,
+    SWDEC_ME_STAGE_CSC_CLOSE = 2
+};
+#ifdef SWDEC_STAGE_DIAG
+void swdec_me_stage_reset(void);
+void swdec_me_stage_au_begin(unsigned *wall, unsigned *run);
+void swdec_me_stage_au_end(int kind, unsigned wall, unsigned run);
+void swdec_me_stage_report(void);
+/* every eighth decode: other threads' run time around it (end = 0 before,
+   1 after) */
+void swdec_me_stage_decode_census(int end);
+/* Attach the caller's opaque AU token to the bounded slow-wait samples. */
+void swdec_me_stage_decode_trace(uint64_t pts);
+#else
+static inline void swdec_me_stage_decode_trace(uint64_t pts) { (void) pts; }
+static inline void swdec_me_stage_decode_census(int end) { (void) end; }
+static inline void swdec_me_stage_reset(void) { }
+static inline void swdec_me_stage_au_begin(unsigned *wall, unsigned *run)
+{
+    *wall = *run = 0;
+}
+static inline void swdec_me_stage_au_end(int kind, unsigned wall, unsigned run)
+{
+    (void) kind; (void) wall; (void) run;
+}
+static inline void swdec_me_stage_report(void) { }
+#endif
 #endif

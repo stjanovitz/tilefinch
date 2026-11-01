@@ -390,11 +390,19 @@ typedef struct {
     uint64_t replay_body_hash;
     uint64_t replay_expected_body_hash;
     bool replay_body_hash_required;
+    /* The deferred body's caller hashes it as it reads it (the media replay
+       lane), so the open checks only the stored length: hashing the whole
+       body first read every segment twice over host0, on the browser
+       thread, at every segment boundary. */
+    bool replay_verify_on_delivery;
     /* The deferred body is a recorded response that stopped at its byte
        cap: the scheduler delivers the recorded prefix and then completes
        the request as the live transport did, a quota failure that still
        holds the bytes received. */
     bool replay_limit_truncated;
+    /* The deferred body is a byte window of a larger stored body (a Range
+       request answered from it): it ends before the file does. */
+    bool replay_body_sliced;
     /* Deferred replay body rewrite, owned by the scheduler item. */
     TraceReplayRekey *replay_rekey;
 } WriteContext;
@@ -1389,14 +1397,22 @@ typedef enum {
 
 typedef struct {
     uint64_t key_hash;
+    /* Media replay keys (trace_replay.inc): the recorded effective URL and
+       the query-less origin+path, both hashed with the method and cache
+       mode like key_hash, and the byte span the stored body holds. */
+    uint64_t effective_hash;
+    uint64_t path_hash;
+    uint32_t span_start;
+    uint32_t span_end;
     signed char rank;
     bool key_valid;
     bool descriptor_valid;
+    bool span_valid;
 } TraceReplayRouteIndexEntry;
 
 #if defined(__PSP__) && defined(TILEFINCH_PSP_VALIDATION_LOG)
 /* Device replay is validation instrumentation. Its route index is fixed
-   storage (8 KiB), never a heap or page-Budget allocation; without it every
+   storage (20 KiB), never a heap or page-Budget allocation; without it every
    request reopened every record's metadata over host0 (~180 opens each). */
 static TraceReplayRouteIndexEntry
     trace_replay_static_route_index[FETCH_TRACE_ROUTE_INDEX_LIMIT];
@@ -1470,6 +1486,14 @@ static struct {
     size_t replay_occurrence_claim_count;
     size_t replay_reusable_claim_count;
     size_t replay_occurrence_exhausted_count;
+    /* Media replay (trace_replay.inc, trace_media_lane.inc). */
+    bool replay_media_lane_call;
+    /* The last media request was served through an alias record. */
+    bool replay_media_served_alias;
+    size_t replay_media_lane_request_count;
+    size_t replay_media_lane_served_count;
+    size_t replay_range_slice_count;
+    size_t replay_media_alias_count;
     uint64_t replay_claimed[FETCH_TRACE_CLAIM_WORDS];
     TraceCookieProvenanceEntry cookie_provenance[
         FETCH_TRACE_COOKIE_PROVENANCE_LIMIT];
@@ -1478,7 +1502,7 @@ static struct {
     /* Response-keyed replay is a lab boundary.  Keep its route accelerator
        proportional to small/medium opened corpora instead of reserving the
        4096-record ceiling in every PSP process.  The accelerator is capped
-       at 512 records (about 8 KiB); larger corpora retain the allocation-free
+       at 512 records (about 20 KiB); larger corpora retain the allocation-free
        bounded scan. Selected records are still reparsed by the authoritative
        replay parser. */
     TraceReplayRouteIndexEntry *replay_route_index;
@@ -1519,6 +1543,11 @@ static void *curl_malloc_hook(size_t size)
 #include "fetch/response_stream.inc"
 #include "fetch/transport.inc"
 #include "fetch/scheduler.inc"
+#ifdef TILEFINCH_NO_FETCH_TRACE
+#define FETCH_REPLAY_LANE_ROUTE(condition, call) do {} while (0)
+#else
+#include "fetch/trace_media_lane.inc"
+#endif
 #include "fetch/background_transport.inc"
 #include "fetch/preconnect.inc"
 #include "fetch/result.inc"

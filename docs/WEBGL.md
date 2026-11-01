@@ -346,10 +346,9 @@ filtered, rounded, multiply-blended, or ambiguously ordered canvases refuse
 this path and use the normal retained-tile renderer.
 
 The host rasterizer exercises pixels, clipping, depth, culling, blending,
-texture wrapping, and line closure. A PSP-target GE probe separately measures
-representative cube, sprite, draw-pressure, CPU-vertex, and texture-upload
-scenes, and PPSSPP's software renderer is used when an end-to-end browser
-fixture must read GE pixels back into the page renderer.
+texture wrapping, and line closure. PPSSPP's software renderer is used when
+an end-to-end browser fixture must read GE pixels back into the page
+renderer.
 
 ## Preflight checklist
 

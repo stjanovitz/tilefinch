@@ -81,3 +81,13 @@ static void trace_capture_invalidate(const char *reason, size_t sequence)
     (void) reason;
     (void) sequence;
 }
+
+#if !defined(__PSP__)
+bool fetch_trace_media_capture(bool enabled, uint64_t byte_limit)
+{
+    (void) byte_limit;
+    return !enabled;
+}
+
+uint64_t fetch_trace_media_captured_bytes(void) { return 0; }
+#endif

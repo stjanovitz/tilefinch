@@ -307,7 +307,7 @@
       throw new TypeError("Illegal constructor");
     }
   }
-  const noEventTiming = function () {
+  const noEventTiming = () => {
     throw new TypeError("Illegal invocation");
   };
   for (const name of [

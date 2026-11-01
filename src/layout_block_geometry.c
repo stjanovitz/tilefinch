@@ -154,6 +154,82 @@ void layout_background_tile_size(unsigned flags, int width, int height,
     *tile_height = resolved_height < 1 ? 1 : resolved_height;
 }
 
+/* Ceiling of value * numerator / denominator in 64 bits, saturating. */
+static int layout_raster_scaled(int64_t value, int64_t numerator,
+                                int64_t denominator)
+{
+    if (value <= 0 || numerator <= 0 || denominator <= 0) return 0;
+    int64_t result = (value * numerator + denominator - 1) / denominator;
+    return result > INT32_MAX ? INT32_MAX : (int) result;
+}
+
+bool layout_background_raster_size(
+    uint8_t fit, uint8_t size_flags, int size_width, int size_height,
+    int area_width, int area_height, int scale_numerator,
+    int scale_denominator, int source_width, int source_height,
+    int *width, int *height)
+{
+    if (width == NULL || height == NULL || area_width <= 0
+        || area_height <= 0 || scale_numerator <= 0
+        || scale_denominator <= 0 || source_width <= 0
+        || source_height <= 0) return false;
+    /* One tile in CSS pixels, as layout_block_decoration sizes it. */
+    int tile_width = 0, tile_height = 0;
+    bool stretch = false;
+    if ((size_flags & STYLE_BACKGROUND_SIZE_EXPLICIT) != 0) {
+        ImageResource natural = {
+            .source_width = source_width, .source_height = source_height,
+            .width = source_width, .height = source_height
+        };
+        layout_background_tile_size(size_flags, size_width, size_height,
+                                    area_width, area_height, &natural,
+                                    &tile_width, &tile_height);
+        stretch = true;
+    } else if (fit == LAYOUT_IMAGE_FIT_COVER
+               || fit == LAYOUT_IMAGE_FIT_CONTAIN) {
+        /* The larger (cover) or smaller (contain) of the two axis ratios. */
+        bool width_rules = (int64_t) area_width * source_height
+            >= (int64_t) area_height * source_width;
+        if (fit == LAYOUT_IMAGE_FIT_CONTAIN) width_rules = !width_rules;
+        if (width_rules) {
+            tile_width = area_width;
+            tile_height = layout_raster_scaled(
+                area_width, source_height, source_width);
+        } else {
+            tile_height = area_height;
+            tile_width = layout_raster_scaled(
+                area_height, source_width, source_height);
+        }
+    } else if (fit == LAYOUT_IMAGE_FIT_STRETCH) {
+        /* background-size: auto paints the natural size. */
+        tile_width = source_width;
+        tile_height = source_height;
+    } else {
+        return false;
+    }
+    int device_width = layout_raster_scaled(
+        tile_width, scale_numerator, scale_denominator);
+    int device_height = layout_raster_scaled(
+        tile_height, scale_numerator, scale_denominator);
+    if (device_width <= 0 || device_height <= 0) return false;
+    if (stretch) {
+        /* An explicit size may stretch the tile; keep the source aspect and
+           cover the tile so neither axis is enlarged at paint. */
+        bool width_rules = (int64_t) device_width * source_height
+            >= (int64_t) device_height * source_width;
+        if (width_rules) {
+            device_height = layout_raster_scaled(
+                device_width, source_height, source_width);
+        } else {
+            device_width = layout_raster_scaled(
+                device_height, source_width, source_height);
+        }
+    }
+    *width = device_width;
+    *height = device_height;
+    return true;
+}
+
 void layout_block_size_paint_image_command(
     DrawCommand *command, const StylePaintLayer *layer,
     const ImageResource *image, int area_width, int area_height)

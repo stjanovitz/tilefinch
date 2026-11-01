@@ -7,6 +7,13 @@ set(TILEFINCH_DEVICE_COST_BUILD_DIR
     "${CMAKE_CURRENT_SOURCE_DIR}/build-preset-psp-validation" CACHE PATH
     "PSP build directory (TILEFINCH_PSP_VALIDATION_LOG=ON) the device-cost gate boots")
 
+# The swdec bit-exactness gate builds the decoder bench and runs it under
+# PPSSPP: opt-in like the device-cost gate, registered either way.
+option(TILEFINCH_SWDEC_CRC_GATE
+    "Enable the PPSSPP swdec CAVLC/CABAC bit-exactness test in CTest" OFF)
+set(TILEFINCH_SWDEC_CRC_SOURCE_DIR "" CACHE PATH
+    "Prepared swdec workspace (scripts/prepare-swdec-ffmpeg.sh) the swdec CRC gate builds against")
+
 if(PSP_BROWSER_BUILD_TESTS)
     enable_testing()
     # Register the dependency at the same site that creates each test binary.
@@ -172,7 +179,19 @@ if(PSP_BROWSER_BUILD_TESTS)
                         $<TARGET_FILE:psp-browser-interactive-lab>)
                 set_tests_properties(tilefinch-host-player-cleanup-tests PROPERTIES
                     LABELS "tilefinch;unit;media;lifecycle" TIMEOUT 40)
+                add_test(NAME tilefinch-host-media-routing-tests
+                    COMMAND ${Python3_EXECUTABLE}
+                        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_host_media_routing.py
+                        $<TARGET_FILE:psp-browser-interactive-lab>)
+                set_tests_properties(tilefinch-host-media-routing-tests PROPERTIES
+                    LABELS "tilefinch;unit;media;network" TIMEOUT 120)
             endif()
+            add_test(NAME tilefinch-record-page-media-tests
+                COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_record_page_media.py
+                    $<TARGET_FILE:psp-browser-interactive-lab>)
+            set_tests_properties(tilefinch-record-page-media-tests PROPERTIES
+                LABELS "tilefinch;unit;media;network;trace" TIMEOUT 240)
             add_test(NAME tilefinch-interactive-until-tests
                 COMMAND ${Python3_EXECUTABLE}
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_interactive_until.py
@@ -473,11 +492,62 @@ if(PSP_BROWSER_BUILD_TESTS)
         COMMAND tilefinch-swdec-bounds-tests)
     set_tests_properties(tilefinch-swdec-bounds-tests PROPERTIES
         LABELS "tilefinch;unit;media;security" TIMEOUT 10)
+    tilefinch_add_test_binary(tilefinch-swdec-fmp4-sizing-tests
+        tests/test_swdec_fmp4_sizing.c)
+    target_link_libraries(tilefinch-swdec-fmp4-sizing-tests PRIVATE
+        tilefinch_core)
+    target_include_directories(tilefinch-swdec-fmp4-sizing-tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/swdec)
+    add_test(NAME tilefinch-swdec-fmp4-sizing-tests
+        COMMAND tilefinch-swdec-fmp4-sizing-tests)
+    set_tests_properties(tilefinch-swdec-fmp4-sizing-tests PROPERTIES
+        LABELS "tilefinch;unit;media" TIMEOUT 10)
+    tilefinch_add_test_binary(tilefinch-media-seek-prime-tests
+        tests/test_media_seek_prime.c)
+    target_link_libraries(tilefinch-media-seek-prime-tests PRIVATE
+        tilefinch_core)
+    add_test(NAME tilefinch-media-seek-prime-tests
+        COMMAND tilefinch-media-seek-prime-tests)
+    set_tests_properties(tilefinch-media-seek-prime-tests PROPERTIES
+        LABELS "tilefinch;unit;media" TIMEOUT 30)
+    tilefinch_add_test_binary(tilefinch-swdec-sync-tests
+        tests/test_swdec_sync.c src/swdec/swdec_csc.c)
+    target_include_directories(tilefinch-swdec-sync-tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/swdec)
+    target_link_libraries(tilefinch-swdec-sync-tests PRIVATE Threads::Threads)
+    add_test(NAME tilefinch-swdec-sync-tests
+        COMMAND tilefinch-swdec-sync-tests)
+    set_tests_properties(tilefinch-swdec-sync-tests PROPERTIES
+        LABELS "tilefinch;unit;media" TIMEOUT 30)
+    tilefinch_add_test_binary(tilefinch-media-candidates-tests
+        tests/test_media_candidates.c)
+    target_link_libraries(tilefinch-media-candidates-tests PRIVATE
+        tilefinch_core)
+    add_test(NAME tilefinch-media-candidates-tests
+        COMMAND tilefinch-media-candidates-tests)
+    set_tests_properties(tilefinch-media-candidates-tests PROPERTIES
+        LABELS "tilefinch;unit;media" TIMEOUT 10)
+    tilefinch_add_test_binary(tilefinch-media-failure-message-tests
+        tests/test_media_failure_message.c)
+    target_link_libraries(tilefinch-media-failure-message-tests PRIVATE
+        tilefinch_core)
+    add_test(NAME tilefinch-media-failure-message-tests
+        COMMAND tilefinch-media-failure-message-tests)
+    set_tests_properties(tilefinch-media-failure-message-tests PROPERTIES
+        LABELS "tilefinch;unit;media;ui" TIMEOUT 10)
     tilefinch_add_test_binary(tilefinch-media-hls-tests tests/test_media_hls.c)
     target_link_libraries(tilefinch-media-hls-tests PRIVATE tilefinch_core)
     add_test(NAME tilefinch-media-hls-tests COMMAND tilefinch-media-hls-tests)
     set_tests_properties(tilefinch-media-hls-tests PROPERTIES
         LABELS "tilefinch;unit;media;network;parser" TIMEOUT 30)
+    tilefinch_add_test_binary(tilefinch-media-worker-request-tests
+        tests/test_media_worker_request.c)
+    target_link_libraries(tilefinch-media-worker-request-tests PRIVATE
+        tilefinch_core)
+    add_test(NAME tilefinch-media-worker-request-tests
+        COMMAND tilefinch-media-worker-request-tests)
+    set_tests_properties(tilefinch-media-worker-request-tests PROPERTIES
+        LABELS "tilefinch;unit;media;network;security" TIMEOUT 30)
     tilefinch_add_test_binary(tilefinch-psp-hls-gzip-tests
         tests/test_psp_hls_gzip.c src/psp_hls_gzip.c)
     target_include_directories(tilefinch-psp-hls-gzip-tests PRIVATE
@@ -488,6 +558,33 @@ if(PSP_BROWSER_BUILD_TESTS)
         COMMAND tilefinch-psp-hls-gzip-tests)
     set_tests_properties(tilefinch-psp-hls-gzip-tests PROPERTIES
         LABELS "tilefinch;unit;media;network;compression" TIMEOUT 30)
+    # Includes src/psp_media_hls.c with the worker entry points scripted.
+    tilefinch_add_test_binary(tilefinch-psp-media-hls-transport-tests
+        tests/test_psp_media_hls_transport.c src/psp_hls_gzip.c)
+    target_include_directories(tilefinch-psp-media-hls-transport-tests
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(tilefinch-psp-media-hls-transport-tests PRIVATE
+        tilefinch_core ZLIB::ZLIB)
+    add_test(NAME tilefinch-psp-media-hls-transport-tests
+        COMMAND tilefinch-psp-media-hls-transport-tests)
+    set_tests_properties(tilefinch-psp-media-hls-transport-tests PROPERTIES
+        LABELS "tilefinch;unit;media;network" TIMEOUT 30)
+    # A recorded HLS stream and MP4 replayed through the PSP media path
+    # (psp_media_hls.c over the background-transport replay lane, the probe
+    # and the range source) with no network.
+    tilefinch_add_test_binary(tilefinch-trace-media-replay-tests
+        tests/test_trace_media_replay.c src/media_replay_check.c
+        src/psp_media_hls.c src/psp_hls_gzip.c)
+    target_include_directories(tilefinch-trace-media-replay-tests
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(tilefinch-trace-media-replay-tests PRIVATE
+        tilefinch_core ZLIB::ZLIB)
+    add_test(NAME tilefinch-trace-media-replay-tests
+        COMMAND tilefinch-trace-media-replay-tests
+            ${CMAKE_CURRENT_BINARY_DIR}/trace-media-replay-fixture
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/psp-media/baseline-320x240.mp4)
+    set_tests_properties(tilefinch-trace-media-replay-tests PROPERTIES
+        LABELS "tilefinch;unit;media;network;trace" TIMEOUT 60)
     tilefinch_add_test_binary(tilefinch-reader-mode-tests tests/test_reader_mode.c)
     target_link_libraries(tilefinch-reader-mode-tests PRIVATE tilefinch_core)
     add_test(NAME tilefinch-reader-mode-tests COMMAND tilefinch-reader-mode-tests)
@@ -541,6 +638,7 @@ if(PSP_BROWSER_BUILD_TESTS)
     # would otherwise make every large test run twice.
     tilefinch_add_unit_suite(tilefinch-foundation-tests foundation)
     tilefinch_add_unit_suite(tilefinch-web-runtime-tests web-runtime)
+    tilefinch_add_unit_suite(tilefinch-scroller-focus-tests scroller-focus)
     add_test(NAME tilefinch-layout-tests COMMAND tilefinch-layout-tests)
     set_tests_properties(tilefinch-layout-tests PROPERTIES
         LABELS "tilefinch;unit"
@@ -710,6 +808,8 @@ if(PSP_BROWSER_BUILD_TESTS)
     set_tests_properties(tilefinch-youtube-login-journey PROPERTIES LABELS "tilefinch;journey;youtube" TIMEOUT 60)
     add_test(NAME tilefinch-youtube-navigation-journey COMMAND tilefinch-browser-engine-tests --youtube-navigation-journey)
     set_tests_properties(tilefinch-youtube-navigation-journey PROPERTIES LABELS "tilefinch;journey;youtube" TIMEOUT 60)
+    add_test(NAME tilefinch-youtube-page-data-tests COMMAND tilefinch-browser-engine-tests --youtube-page-data-only)
+    set_tests_properties(tilefinch-youtube-page-data-tests PROPERTIES LABELS "tilefinch;unit;youtube" TIMEOUT 60)
 
     # Cross-boot TLS session store (docs/engineering/PSP_TRANSPORT.md).
     # Pure data plus file I/O; does
@@ -789,6 +889,7 @@ if(PSP_BROWSER_BUILD_TESTS)
     tilefinch_add_test_binary(tilefinch-browser-engine-tests
         tests/test_browser_engine.c
         src/screenshot_png.c
+        src/psp_input_page_media.c
         tests/test_browser_engine_journeys.c
         tests/test_browser_engine_interruptions.c
         tests/test_browser_engine_cleanups.c
@@ -892,6 +993,14 @@ if(PSP_BROWSER_BUILD_TESTS)
     set_tests_properties(tilefinch-offline-library-tests PROPERTIES
         LABELS "tilefinch;unit;storage;psp"
         TIMEOUT 10)
+
+    tilefinch_add_test_binary(tilefinch-popunder-guard-tests
+        tests/test_popunder_guard.c)
+    target_link_libraries(tilefinch-popunder-guard-tests PRIVATE tilefinch_core)
+    add_test(NAME tilefinch-popunder-guard-tests
+        COMMAND tilefinch-popunder-guard-tests)
+    set_tests_properties(tilefinch-popunder-guard-tests PROPERTIES
+        LABELS "tilefinch;unit;navigation;security" TIMEOUT 30)
 
     tilefinch_add_test_binary(tilefinch-file-download-tests
         tests/test_file_download.c src/psp_offline_store.c)
@@ -1355,6 +1464,16 @@ if(PSP_BROWSER_BUILD_TESTS)
         LABELS "tilefinch;unit;javascript;memory"
         TIMEOUT 30)
 
+    tilefinch_add_test_binary(tilefinch-function-source-store-tests
+        tests/test_function_source_store.c)
+    target_link_libraries(tilefinch-function-source-store-tests
+        PRIVATE tilefinch_core)
+    add_test(NAME tilefinch-function-source-store-tests
+        COMMAND tilefinch-function-source-store-tests)
+    set_tests_properties(tilefinch-function-source-store-tests PROPERTIES
+        LABELS "tilefinch;unit;javascript;memory"
+        TIMEOUT 60)
+
     tilefinch_add_test_binary(tilefinch-classic-bytecode-tests
         tests/test_classic_bytecode.c)
     target_link_libraries(tilefinch-classic-bytecode-tests PRIVATE tilefinch_core)
@@ -1623,6 +1742,16 @@ if(PSP_BROWSER_BUILD_TESTS)
             LABELS "tilefinch;unit;javascript;memory;sanitizer"
             TIMEOUT 60)
 
+        tilefinch_add_test_binary(tilefinch-quickjs-json-parse-tests
+            tests/test_quickjs_json_parse.c)
+        target_link_libraries(tilefinch-quickjs-json-parse-tests
+            PRIVATE tilefinch_core)
+        add_test(NAME tilefinch-quickjs-json-parse-tests
+            COMMAND tilefinch-quickjs-json-parse-tests)
+        set_tests_properties(tilefinch-quickjs-json-parse-tests PROPERTIES
+            LABELS "tilefinch;unit;javascript;allocator;sanitizer"
+            TIMEOUT 120)
+
         tilefinch_add_test_binary(tilefinch-quickjs-native-call-tests
             tests/test_quickjs_native_calls.c)
         target_link_libraries(tilefinch-quickjs-native-call-tests
@@ -1637,6 +1766,15 @@ if(PSP_BROWSER_BUILD_TESTS)
             tests/test_quickjs_lazy_functions.c)
         target_link_libraries(tilefinch-quickjs-lazy-function-tests
             PRIVATE tilefinch_core)
+        tilefinch_add_test_binary(tilefinch-quickjs-external-source-tests
+            tests/test_quickjs_external_source.c)
+        target_link_libraries(tilefinch-quickjs-external-source-tests
+            PRIVATE tilefinch_core)
+        add_test(NAME tilefinch-quickjs-external-source-tests
+            COMMAND tilefinch-quickjs-external-source-tests)
+        set_tests_properties(tilefinch-quickjs-external-source-tests PROPERTIES
+            LABELS "tilefinch;unit;javascript;memory"
+            TIMEOUT 60)
         # One iteration per kernel: proves every kernel compiles and runs
         # on this engine build, so a PSP bench run cannot fail on a kernel
         # the host never exercised.
@@ -1707,6 +1845,14 @@ if(PSP_BROWSER_BUILD_TESTS)
         COMMAND tilefinch-fetch-background-ownership-tests)
     set_tests_properties(tilefinch-fetch-background-ownership-tests PROPERTIES
         LABELS "tilefinch;unit;network;media;psp;concurrency;sanitizer"
+        TIMEOUT 30)
+
+    tilefinch_add_test_binary(tilefinch-fetch-background-chunk-tests
+        tests/test_fetch_background_chunk.c)
+    add_test(NAME tilefinch-fetch-background-chunk-tests
+        COMMAND tilefinch-fetch-background-chunk-tests)
+    set_tests_properties(tilefinch-fetch-background-chunk-tests PROPERTIES
+        LABELS "tilefinch;unit;network;media;psp;sanitizer"
         TIMEOUT 30)
 
     tilefinch_add_test_binary(tilefinch-psp-media-ownership-tests
@@ -1898,12 +2044,21 @@ if(PSP_BROWSER_BUILD_TESTS)
         PROPERTIES LABELS "tilefinch;unit;psp;state" TIMEOUT 10)
 
     # The media session's scrub and pending-target machines
+    tilefinch_add_test_binary(tilefinch-psp-media-retry-tests
+        tests/test_psp_media_retry.c src/psp_media_retry.c)
+    target_link_libraries(tilefinch-psp-media-retry-tests
+        PRIVATE tilefinch_core tilefinch_psp_ui)
+    add_test(NAME tilefinch-psp-media-retry-tests
+        COMMAND tilefinch-psp-media-retry-tests)
+    set_tests_properties(tilefinch-psp-media-retry-tests PROPERTIES
+        LABELS "tilefinch;unit;psp;state" TIMEOUT 10)
+
     # (psp_media_scrub.h): what the user asked of the timeline across
     # pipeline rebuilds.
     tilefinch_add_test_binary(tilefinch-psp-media-scrub-tests
         tests/test_psp_media_scrub.c)
     target_link_libraries(tilefinch-psp-media-scrub-tests
-        PRIVATE tilefinch_core)
+        PRIVATE tilefinch_core tilefinch_psp_ui)
     add_test(NAME tilefinch-psp-media-scrub-tests
         COMMAND tilefinch-psp-media-scrub-tests)
     set_tests_properties(tilefinch-psp-media-scrub-tests PROPERTIES
@@ -1971,6 +2126,14 @@ if(PSP_BROWSER_BUILD_TESTS)
         LABELS "tilefinch;unit;network;psp;state"
         TIMEOUT 30)
 
+    tilefinch_add_test_binary(tilefinch-psp-network-restart-tests
+        tests/test_psp_network_restart.c)
+    target_link_libraries(tilefinch-psp-network-restart-tests PRIVATE tilefinch_core)
+    add_test(NAME tilefinch-psp-network-restart-tests
+        COMMAND tilefinch-psp-network-restart-tests)
+    set_tests_properties(tilefinch-psp-network-restart-tests PROPERTIES
+        LABELS "tilefinch;unit;network;psp;state" TIMEOUT 30)
+
     tilefinch_add_test_binary(tilefinch-captive-portal-tests
         tests/test_captive_portal.c)
     target_link_libraries(tilefinch-captive-portal-tests PRIVATE tilefinch_core)
@@ -1998,6 +2161,11 @@ if(PSP_BROWSER_BUILD_TESTS)
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_allocator_pgo_tool.py)
         set_tests_properties(tilefinch-allocator-pgo-tool-tests PROPERTIES
             LABELS "tilefinch;unit;javascript;tooling" TIMEOUT 15)
+        add_test(NAME tilefinch-swdec-bench-script-tests
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_swdec_bench_scripts.py)
+        set_tests_properties(tilefinch-swdec-bench-script-tests PROPERTIES
+            LABELS "tilefinch;unit;swdec;tooling" TIMEOUT 60)
         add_test(NAME tilefinch-quickjs-pgo-training-tests
             COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_quickjs_pgo_training.py)
@@ -2130,6 +2298,23 @@ if(PSP_BROWSER_BUILD_TESTS)
             set_tests_properties(tilefinch-device-cost-tests PROPERTIES
                 DISABLED TRUE)
         endif()
+        # CAVLC and CABAC clips at 416x234 and 426x240 decoded by the PSP
+        # build under PPSSPP, frame CRCs against host FFmpeg:
+        #   cmake --preset release -DTILEFINCH_SWDEC_CRC_GATE=ON \
+        #       -DTILEFINCH_SWDEC_CRC_SOURCE_DIR=/path/to/prepared
+        #   PSPDEV=... PPSSPP=... ctest --test-dir build-preset-release -L swdec
+        add_test(NAME tilefinch-swdec-crc-tests
+            COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/swdec-bench/crc-gate.sh
+                "${TILEFINCH_SWDEC_CRC_SOURCE_DIR}"
+                ${CMAKE_CURRENT_BINARY_DIR}/swdec-crc-gate)
+        set_tests_properties(tilefinch-swdec-crc-tests PROPERTIES
+            LABELS "tilefinch;acceptance;psp;swdec"
+            SKIP_RETURN_CODE 77
+            TIMEOUT 2400)
+        if(NOT TILEFINCH_SWDEC_CRC_GATE)
+            set_tests_properties(tilefinch-swdec-crc-tests PROPERTIES
+                DISABLED TRUE)
+        endif()
         add_test(NAME tilefinch-trace-replay-server-tests
             COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_trace_replay_server.py)
@@ -2180,7 +2365,8 @@ if(PSP_BROWSER_BUILD_TESTS)
         add_test(NAME tilefinch-native-capture-tests
             COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_native_capture.py
-                --lab $<TARGET_FILE:psp-browser-interactive-lab>)
+                --lab $<TARGET_FILE:psp-browser-interactive-lab>
+                --host-media $<TARGET_EXISTS:PkgConfig::TILEFINCH_FFMPEG>)
         set_tests_properties(tilefinch-native-capture-tests PROPERTIES
             LABELS "tilefinch;unit;acceptance;tooling;visual"
             TIMEOUT 30)

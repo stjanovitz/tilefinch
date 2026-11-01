@@ -404,6 +404,14 @@ const char *psp_media_present_mode_name(PspMediaPresentMode mode)
     return "unknown";
 }
 
+bool psp_media_present_video_surface_wanted(
+    bool video_owns_screen, bool ge_smooth_requested, bool engine_ready,
+    bool picture_rgba8888)
+{
+    return video_owns_screen && ge_smooth_requested && engine_ready
+        && picture_rgba8888;
+}
+
 bool psp_media_present_skip_allowed(
     const PspMediaPresentRecord *record, uint64_t identity,
     uint64_t generation, const PspMediaPresentRect *video,

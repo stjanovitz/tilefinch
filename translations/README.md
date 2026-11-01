@@ -146,7 +146,10 @@ player's headline, the Update screen's status, notes and button (with its
 download and install messages), the font-pack offer's confirmation box, and
 the static tables and section headings of the Site data & storage screens.
 The failed-video panel, the Help details, both Site data & storage
-screens and Site information are translated too. On Site information the
+screens and Site information are translated too. When a video cannot play
+on the PSP, the panel's headline and its details line (the optional
+decoder is needed or could not start, or the format is unsupported and
+why) are catalog lines; a firmware code or HTTP status stays as is. On Site information the
 site name, the TLS version and a server's certificate issuer stay as sent;
 "RAM" and "KB" are the same in every language. A button shows its glyph beside a shared word
 ("X" and the catalog's "Retry") rather than a key of its own, and the Retry
@@ -157,11 +160,11 @@ at a time, and a trailing progress count (" 45%") is kept after the
 translated text, so composed notices are whole catalog lines: a pack's name
 above its state, a message above its Settings path. V12 retires the keys
 listed in `RETIRED_KEYS` of the generator. Its hashed format drops the 19 KB
-of English keys every file used to repeat (Bengali, the longest, is 59,823
-of the 65,535 bytes, with 1,030 rows). The runtime accepts 2,048 rows and
+of English keys every file used to repeat (Bengali, the longest, is 60,685
+of the 65,535 bytes, with 1,043 rows). The runtime accepts 2,048 rows and
 sizes a loaded catalog to the rows it has, so the byte cap binds first; a
 new key should still reuse an existing word where one fits. Arabic's shaped
-display copy has 16-bit offsets too and is 53,661 of its 65,535 bytes. V12 requires
+display copy has 16-bit offsets too and is 54,421 of its 65,535 bytes. V12 requires
 Devanagari revision 7 and Bengali-Assamese revision 3, rebuilt from the v12
 `hi.sequences` and `bengali-assamese.sequences`; publish those packs and the
 v12 `.tful` files before shipping an app that pins v12.

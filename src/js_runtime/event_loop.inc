@@ -47,6 +47,10 @@ void js_rt_runtime_arm_watchdog(ScriptRuntime *runtime)
 #endif
     runtime->watchdog.polls = 0;
     runtime->watchdog.interrupted = false;
+    runtime->watchdog.memory_exhausted = false;
+    runtime->watchdog.pool = runtime->quickjs_pool;
+    runtime->watchdog.pool_rejections_started =
+        budget_quickjs_pool_rejection_count(runtime->quickjs_pool);
     runtime->watchdog.slice_started_ns = js_rt_monotonic_time_ns();
     runtime->watchdog.slice_work_units = 0;
     script_profile_enter(runtime);
@@ -77,6 +81,19 @@ void script_runtime_limit_execution_for_us(ScriptRuntime *runtime,
 void script_runtime_clear_execution_limit(ScriptRuntime *runtime)
 {
     if (runtime != NULL) runtime->execution_deadline_cap_ms = 0u;
+}
+
+static uint64_t runtime_lazy_memory_failures(const ScriptRuntime *runtime)
+{
+#if defined(PSP_BROWSER_BELLARD_QUICKJS)
+    JSLazyFunctionStats stats;
+    if (runtime == NULL || runtime->runtime == NULL) return 0;
+    JS_GetLazyFunctionStats(runtime->runtime, &stats);
+    return stats.memory_failures;
+#else
+    (void) runtime;
+    return 0;
+#endif
 }
 
 static bool runtime_job_exception_is_fatal(const ScriptRuntime *runtime,
@@ -203,6 +220,8 @@ static bool runtime_run_jobs_checkpoint(ScriptRuntime *runtime)
             size_t failures_before = runtime->budget->failure_count;
             size_t heap_rejections_before =
                 script_runtime_heap_rejections(runtime);
+            uint64_t lazy_memory_failures_before =
+                runtime_lazy_memory_failures(runtime);
             BudgetAllocationOwner previous_owner =
                 document_allocation_owner_enter(runtime->document);
             uint64_t continuation_started_ns = trace_steps
@@ -245,6 +264,8 @@ static bool runtime_run_jobs_checkpoint(ScriptRuntime *runtime)
                    it, then keep the realm usable for later tasks. */
                 runtime_record_author_job_exception(runtime);
                 work++;
+                if (runtime_lazy_memory_failures(runtime)
+                        != lazy_memory_failures_before) break;
                 continue;
             }
             JS_FreeValue(runtime->context, value);
@@ -257,6 +278,11 @@ static bool runtime_run_jobs_checkpoint(ScriptRuntime *runtime)
                     / UINT64_C(1000);
             }
             work++;
+            /* A Promise executor or a catch inside the continuation can turn
+               the refused compile into a rejection and return normally; the
+               queue behind it would retry the same compile (see below). */
+            if (runtime_lazy_memory_failures(runtime)
+                    != lazy_memory_failures_before) break;
             continue;
         }
         /* Short promise jobs may never hit the VM instruction interrupt.
@@ -269,6 +295,8 @@ static bool runtime_run_jobs_checkpoint(ScriptRuntime *runtime)
         size_t failures_before = runtime->budget->failure_count;
         size_t heap_rejections_before =
             script_runtime_heap_rejections(runtime);
+        uint64_t lazy_memory_failures_before =
+            runtime_lazy_memory_failures(runtime);
         BudgetAllocationOwner previous_owner =
             document_allocation_owner_enter(runtime->document);
 #ifdef TILEFINCH_SCRIPT_SPLIT
@@ -341,6 +369,16 @@ static bool runtime_run_jobs_checkpoint(ScriptRuntime *runtime)
             runtime_record_author_job_exception(runtime);
         }
         work++;
+        /* A function that could not compile for lack of memory stays
+           uncompiled and threw uncatchably; inside a promise reaction that
+           still becomes a rejection, and the reactions queued behind it
+           call the same function and fail the same way: one refusal at the
+           wall became 30-40 out-of-memory rejections in a replay. End the
+           checkpoint here, as at the 64-job bound: the rest of the queue
+           runs next turn, after the host's growth and collection have had
+           their chance, instead of retrying at the same wall now. */
+        if (runtime_lazy_memory_failures(runtime)
+                != lazy_memory_failures_before) break;
     }
     if (runtime->heap_collections - gc_collections_before
             > runtime->gc_checkpoint_collections_max)
@@ -958,6 +996,10 @@ void script_runtime_report_memory(ScriptRuntime *runtime, FILE *output)
     if (runtime == NULL || runtime->runtime == NULL || output == NULL) return;
     /* Force a full collection first so the report reads the retained
        floor, not whatever garbage the last slice left behind. */
+#if defined(CONFIG_TILEFINCH_HEAP_DETAIL) && !defined(TILEFINCH_NO_TRACE)
+    if (js_rt_jsmem_enabled())
+        js_rt_jsmem_census(runtime, "report", false);
+#endif
     JS_RunGC(runtime->runtime);
     JSMemoryUsage usage;
     js_rt_heap_census(runtime, &usage);
@@ -1518,6 +1560,12 @@ size_t script_runtime_cancel_network(
         + js_rt_multiplayer_abort(&runtime->bridge);
 }
 
+size_t script_runtime_requeue_dynamic_scripts(ScriptRuntime *runtime)
+{
+    return runtime == NULL ? 0
+        : js_rt_dynamic_requeue_fetching(&runtime->bridge);
+}
+
 static bool runtime_pump_network(ScriptRuntime *runtime,
                                  size_t completion_budget,
                                  unsigned wait_ms,
@@ -1659,6 +1707,9 @@ static bool runtime_pump_network(ScriptRuntime *runtime,
                 runtime, fetched->length);
             if (bridge->result != NULL) js_rt_record_network_response(
                 bridge->result, fetched);
+            if (!fetched->opaque_redirect && !opaque_response)
+                js_rt_remember_media_json(
+                    bridge, fetched, async_fetch.destination);
             js_rt_script_store_response_cookies(
                 bridge, fetched, fetched->effective_url,
                 async_fetch.mode, async_fetch.credentials,

@@ -283,6 +283,29 @@ static bool test_stepper(void)
     psp_input_script_satisfy_condition(&script);
     CHECK(!script.condition_met);
 
+    /* focus-page-media: one idle frame carrying its page action, which the
+       host reads on exactly that frame; -page waits for a painted page. */
+    CHECK(psp_input_script_parse(
+        &script, "wait 1\nfocus-page-media-page\ntap cross\nend\n", "inline",
+        record_warning, NULL));
+    CHECK(script.steps[1].kind == PSP_INPUT_SCRIPT_STEP_PAGE_ACTION
+          && script.steps[1].ticks == 1u
+          && script.steps[1].advance_when_painted);
+    CHECK(psp_input_script_advance(&script, &input, 0, true)
+          && psp_input_script_page_action(&script)
+                 == PSP_INPUT_SCRIPT_PAGE_ACTION_NONE);
+    CHECK(psp_input_script_advance(&script, &input, 0, true)
+          && input.held == 0
+          && psp_input_script_page_action(&script)
+                 == PSP_INPUT_SCRIPT_PAGE_ACTION_FOCUS_MEDIA
+          && psp_input_script_mark(&script) == NULL);
+    CHECK(psp_input_script_advance(&script, &input, 0, true)
+          && input.pressed == PSP_UI_BUTTON_CONFIRM
+          && psp_input_script_page_action(&script)
+                 == PSP_INPUT_SCRIPT_PAGE_ACTION_NONE);
+    CHECK(!psp_input_script_parse(
+        &script, "focus-page-media now\n", "inline", record_warning, NULL));
+
     CHECK(psp_input_script_parse(
         &script, "wait 10\nend\n", "inline", record_warning, NULL));
     psp_input_script_interrupt(&script);

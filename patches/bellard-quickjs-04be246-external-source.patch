@@ -1,0 +1,989 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -431,6 +431,16 @@
+     JSSharedArrayBufferFunctions sab_funcs;
+     /* see JS_SetStripInfo() */
+     uint8_t strip_flags;
++    /* see JS_SetExternalSourceHooks() */
++    JSExternalSourceReadFunc *external_source_read;
++    JSExternalSourceReleaseFunc *external_source_release;
++    JSExternalSourcePinFunc *external_source_pin;
++    JSExternalSourceQueryFunc *external_source_query;
++    void *external_source_opaque;
++    uint32_t external_source_pending_id; /* 0: none */
++    /* the record a compile repeated without preparsing takes over */
++    struct JSFunctionSource *external_source_carry;
++    uint32_t external_source_pending_length;
+     /* see JS_SetLazyFunctionThreshold() */
+     uint32_t lazy_function_threshold;
+     /* see JS_SetLazyFunctionPreparse() */
+@@ -795,10 +805,32 @@
+    bytecode reference: retaining a child must not retain its parent/realm. */
+ typedef struct JSFunctionSource {
+     uint32_t ref_count;
++    /* Tilefinch: non-zero for text kept by the embedder (see
++       JS_SetExternalSourceHooks()); bytes and string are then NULL and
++       length is the length of the whole text */
++    uint32_t external_id;
++    /* uncompiled lazy functions that read the external text */
++    uint32_t lazy_readers;
+     size_t length;
+     char *bytes;
+     JSString *string;
+ } JSFunctionSource;
++
++/* Tilefinch: one more (delta 1) or one fewer (-1) uncompiled lazy function
++   reads external text 'owner' (see JS_SetExternalSourceHooks()) */
++static void js_external_source_require(JSRuntime *rt, JSFunctionSource *owner,
++                                       int delta)
++{
++    if (delta > 0) {
++        if (owner->lazy_readers++ == 0 && rt->external_source_pin)
++            rt->external_source_pin(rt->external_source_opaque,
++                                    owner->external_id, 1);
++    } else if (owner->lazy_readers > 0) {
++        if (--owner->lazy_readers == 0 && rt->external_source_pin)
++            rt->external_source_pin(rt->external_source_opaque,
++                                    owner->external_id, 0);
++    }
++}
+ 
+ static void js_free_function_source(JSRuntime *rt, char *source,
+                                     JSFunctionSource *owner)
+@@ -806,12 +838,52 @@
+     if (!owner) {
+         js_free_rt(rt, source);
+     } else if (--owner->ref_count == 0) {
+-        if (owner->string)
++        if (owner->external_id) {
++            if (rt->external_source_release)
++                rt->external_source_release(rt->external_source_opaque,
++                                            owner->external_id);
++        } else if (owner->string)
+             JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_STRING, owner->string));
+         else
+             js_free_rt(rt, owner->bytes);
+         js_free_rt(rt, owner);
++    }
++}
++
++/* Tilefinch: the record for external text 'id' (see
++   JS_SetExternalSourceHooks()), with one reference, or NULL (and the id
++   released) if it cannot be allocated */
++static JSFunctionSource *js_new_external_source(JSRuntime *rt, uint32_t id,
++                                                uint32_t length)
++{
++    JSFunctionSource *owner = js_malloc_rt(rt, sizeof(*owner));
++    if (!owner) {
++        if (rt->external_source_release)
++            rt->external_source_release(rt->external_source_opaque, id);
++        return NULL;
++    }
++    owner->ref_count = 1;
++    owner->external_id = id;
++    owner->lazy_readers = 0;
++    owner->length = length;
++    owner->bytes = NULL;
++    owner->string = NULL;
++    return owner;
++}
++
++/* Takes the pending external text id, if any (see JS_SetExternalSourceId()) */
++static JSFunctionSource *js_take_external_source(JSRuntime *rt)
++{
++    uint32_t id = rt->external_source_pending_id;
++    JSFunctionSource *carried = rt->external_source_carry;
++    if (carried) {
++        rt->external_source_carry = NULL;
++        return carried;
+     }
++    if (!id)
++        return NULL;
++    rt->external_source_pending_id = 0;
++    return js_new_external_source(rt, id, rt->external_source_pending_length);
+ }
+ 
+ /* A function compiled lazily (see JS_SetLazyFunctionThreshold()) has this
+@@ -826,12 +898,17 @@
+     uint32_t source_len;
+     uint32_t param_offset; /* first token of the parameter list, from the text start */
+     uint32_t nested_threshold; /* JS_SetLazyFunctionThreshold() for inner functions */
++    /* Tilefinch: with external text (JSFunctionBytecode.source_external),
++       where the text the body compiles from starts in it; if 'source' is
++       NULL, it is read from there (source_len bytes) */
++    uint32_t external_offset;
+     uint8_t func_type; /* JSParseFunctionEnum */
+     uint8_t parent_js_mode;
+     uint8_t parent_func_kind;
+     uint8_t is_module : 1;
+     uint8_t parent_static_init : 1;
+     uint8_t strip_source : 1; /* inner functions are compiled without toString() text */
++    uint8_t external_source : 1; /* external_offset is valid */
+ } JSLazyFunction;
+ 
+ typedef struct JSFunctionBytecode {
+@@ -857,7 +934,11 @@
+        byte_code_buf starts an allocation of its own that also holds the
+        constant pool and variable definitions */
+     uint8_t has_lazy_body : 1;
+-    /* XXX: 8 bits available */
++    /* Tilefinch: the toString() text is external (see
++       JS_SetExternalSourceHooks()): debug.source_owner is its record and
++       debug.source_offset, not debug.source, says where the text starts */
++    uint8_t source_external : 1;
++    /* XXX: 7 bits available */
+     uint8_t *byte_code_buf; /* (self pointer) */
+     int byte_code_len;
+     JSAtom func_name;
+@@ -886,11 +967,20 @@
+         int source_len; 
+         int pc2line_len;
+         uint8_t *pc2line_buf;
+-        char *source;
++        union {
++            char *source; /* !source_external */
++            uint32_t source_offset; /* source_external */
++        };
+         JSFunctionSource *source_owner;
+     } debug;
+ } JSFunctionBytecode;
+ 
++/* The function's own toString() text in the heap, or NULL */
++static inline char *js_function_heap_source(const JSFunctionBytecode *b)
++{
++    return b->has_debug && !b->source_external ? b->debug.source : NULL;
++}
++
+ /* While a lazily compiled function has no body (is_lazy), its empty
+    bytecode (byte_code_len, cpool_count, arg_count and var_count are 0)
+    leaves byte_code_buf free to hold its JSLazyFunction, so that functions
+@@ -900,6 +990,14 @@
+     return b->is_lazy ? (JSLazyFunction *)b->byte_code_buf : NULL;
+ }
+ 
++/* Tilefinch: TRUE if the uncompiled lazy function 'b' reads the text it
++   compiles from external text (see JS_SetExternalSourceHooks()) */
++static inline BOOL js_lazy_reads_external(const JSFunctionBytecode *b)
++{
++    const JSLazyFunction *lz = js_lazy_function_of(b);
++    return lz && lz->external_source && !lz->source && b->source_external;
++}
++
+ typedef struct JSBoundFunction {
+     JSValue func_obj;
+     JSValue this_val;
+@@ -2714,8 +2812,33 @@
+ void JS_SetStripInfo(JSRuntime *rt, int flags)
+ {
+     rt->strip_flags = flags;
++}
++
++void JS_SetExternalSourceHooks(JSRuntime *rt, JSExternalSourceReadFunc *read,
++                               JSExternalSourceReleaseFunc *release,
++                               JSExternalSourcePinFunc *pin, void *opaque)
++{
++    rt->external_source_read = read;
++    rt->external_source_release = release;
++    rt->external_source_pin = pin;
++    rt->external_source_opaque = opaque;
+ }
+ 
++void JS_SetExternalSourceQuery(JSRuntime *rt,
++                               JSExternalSourceQueryFunc *query)
++{
++    rt->external_source_query = query;
++}
++
++uint32_t JS_SetExternalSourceId(JSRuntime *rt, uint32_t source_id,
++                                uint32_t length)
++{
++    uint32_t pending = rt->external_source_pending_id;
++    rt->external_source_pending_id = source_id;
++    rt->external_source_pending_length = source_id ? length : 0;
++    return pending;
++}
++
+ int JS_GetStripInfo(JSRuntime *rt)
+ {
+     return rt->strip_flags;
+@@ -8021,8 +8144,13 @@
+     }
+     if (b->has_debug) {
+         js_func_size += sizeof(*b) - offsetof(JSFunctionBytecode, debug);
+-        if (b->debug.source) {
++        if (b->source_external) {
++            /* only the record: the text is not in the heap */
+             JSFunctionSource *owner = b->debug.source_owner;
++            hp->memory_used_count += 1.0 / owner->ref_count;
++            hp->js_func_size += (double)sizeof(*owner) / owner->ref_count;
++        } else if (b->debug.source) {
++            JSFunctionSource *owner = b->debug.source_owner;
+             if (owner) {
+                 hp->memory_used_count += 2.0 / owner->ref_count;
+                 hp->js_func_size += (double)(sizeof(*owner) + owner->length + 1)
+@@ -24453,6 +24581,12 @@
+     int source_len;
+     uint32_t source_start; /* exact copied span in get_line_col_cache->buf_start */
+     JSFunctionSource *source_owner;
++    /* Tilefinch: the text is external (JSParseState.external_source):
++       source is NULL, source_owner is its record and source_start is the
++       offset of the text in it */
++    unsigned int source_external : 1;
++    /* with external text, the offset of the parse buffer in it */
++    uint32_t external_base;
+ 
+     JSModuleDef *module; /* != NULL when parsing a module */
+     BOOL has_await; /* TRUE if await is used (used in module eval) */
+@@ -24531,6 +24665,12 @@
+     /* Tilefinch: JSRuntime.tf_out_of_memory_throws when the parse began
+        (see js_parse_error_v()) */
+     uint32_t out_of_memory_throws;
++    /* Tilefinch: the external text this buffer is part of, starting at
++       external_base (see JS_SetExternalSourceHooks()), or NULL. Functions
++       compiled under JS_STRIP_SOURCE refer to it instead of copying their
++       text. One reference is held for the parse. */
++    JSFunctionSource *external_source;
++    uint32_t external_base;
+ } JSParseState;
+ 
+ typedef struct JSOpCode {
+@@ -28110,6 +28250,40 @@
+ static __exception int js_parse_left_hand_side_expr(JSParseState *s)
+ {
+     return js_parse_postfix_expr(s, PF_POSTFIX_CALL);
++}
++
++/* Save the toString() text of 'fd', 'len' bytes at 'ptr' in the parse
++   buffer: a copy, or under JS_STRIP_SOURCE a reference to the external text
++   if the buffer has one (see JS_SetExternalSourceHooks()), or nothing. */
++static int js_parse_save_function_source(JSParseState *s, JSFunctionDef *fd,
++                                         const uint8_t *ptr, size_t len)
++{
++    JSContext *ctx = s->ctx;
++    JSFunctionSource *owner = s->external_source;
++
++    js_free_function_source(ctx->rt, fd->source, fd->source_owner);
++    fd->source = NULL;
++    fd->source_owner = NULL;
++    fd->source_external = FALSE;
++    fd->source_len = 0;
++    if (!fd->strip_source) {
++        fd->source_len = len;
++        fd->source_start = ptr - fd->get_line_col_cache->buf_start;
++        fd->source = js_strndup(ctx, (const char *)ptr, len);
++        if (!fd->source)
++            return -1;
++    } else if (owner && !fd->strip_debug && owner->ref_count != UINT32_MAX &&
++               fd->get_line_col_cache->buf_start == s->buf_start) {
++        uint32_t offset = s->external_base + (uint32_t)(ptr - s->buf_start);
++        if (offset <= owner->length && len <= owner->length - offset) {
++            owner->ref_count++;
++            fd->source_owner = owner;
++            fd->source_external = TRUE;
++            fd->source_len = len;
++            fd->source_start = offset;
++        }
++    }
++    return 0;
+ }
+ 
+ static __exception int js_parse_class_default_ctor(JSParseState *s,
+@@ -28672,13 +28846,9 @@
+         put_u32(fd->byte_code.buf + ctor_cpool_offset, ctor_fd->parent_cpool_idx);
+ 
+     /* store the class source code in the constructor. */
+-    if (!fd->strip_source) {
+-        js_free(ctx, ctor_fd->source);
+-        ctor_fd->source_len = s->buf_ptr - class_start_ptr;
+-        ctor_fd->source_start = class_start_ptr - ctor_fd->get_line_col_cache->buf_start;
+-        ctor_fd->source = js_strndup(ctx, (const char *)class_start_ptr,
+-                                     ctor_fd->source_len);
+-        if (!ctor_fd->source)
++    if (!fd->strip_source || s->external_source) {
++        if (js_parse_save_function_source(s, ctor_fd, class_start_ptr,
++                                          s->buf_ptr - class_start_ptr))
+             goto fail;
+     }
+ 
+@@ -35715,7 +35885,7 @@
+                    NULL, b->var_count,
+                    b->closure_var, b->closure_var_count,
+                    b->cpool, b->cpool_count,
+-                   b->has_debug ? b->debug.source : NULL,
++                   js_function_heap_source(b),
+                    NULL, b);
+ #if defined(DUMP_BYTECODE) && (DUMP_BYTECODE & 32)
+     if (b->has_debug)
+@@ -39113,6 +39283,8 @@
+     if (!owner)
+         return NULL;
+     owner->ref_count = 1;
++    owner->external_id = 0;
++    owner->lazy_readers = 0;
+     owner->length = length;
+     owner->bytes = *source;
+     owner->string = NULL;
+@@ -39290,7 +39462,8 @@
+         return FALSE;
+     /* Without Function.prototype.toString() text the stub keeps a copy of
+        its own; do not trade bytecode for more text (comments, whitespace) */
+-    if (fd->strip_source && fd->lazy_span_len > code_size)
++    if (fd->strip_source && !fd->source_external &&
++        fd->lazy_span_len > code_size)
+         return FALSE;
+     return js_lazy_function_scope_is_static(parent, fd->parent_scope_level);
+ }
+@@ -39349,7 +39522,13 @@
+     lz->is_module = fd->lazy_is_module;
+     lz->parent_static_init = fd->lazy_parent_static_init;
+     lz->strip_source = fd->strip_source;
+-    if (fd->strip_source || !fd->source ||
++    if (fd->source_external) {
++        /* the body is read from the external text when it compiles, and
++           nested functions refer to it too */
++        lz->external_source = 1;
++        lz->external_offset = fd->external_base + fd->lazy_span_start;
++        lz->source_len = fd->lazy_span_len;
++    } else if (fd->strip_source || !fd->source ||
+         (uint32_t)fd->source_len != fd->lazy_span_len) {
+         /* Function.prototype.toString() has no text; keep a private copy
+            until the body compiles */
+@@ -39403,7 +39582,15 @@
+     fd->filename = JS_ATOM_NULL;
+     b->debug.pc2line_buf = pc2line.buf;
+     b->debug.pc2line_len = pc2line.size;
+-    if (!fd->strip_source) {
++    if (fd->source_external) {
++        b->source_external = 1;
++        b->debug.source_offset = fd->source_start;
++        b->debug.source_len = fd->source_len;
++        b->debug.source_owner = fd->source_owner;
++        fd->source_owner = NULL;
++        fd->source_external = FALSE;
++        js_external_source_require(ctx->rt, b->debug.source_owner, 1);
++    } else if (!fd->strip_source) {
+         b->debug.source = fd->source;
+         b->debug.source_len = fd->source_len;
+         b->debug.source_owner = fd->source_owner;
+@@ -39658,7 +39845,12 @@
+         if (!b->debug.pc2line_buf)
+             b->debug.pc2line_buf = fd->pc2line.buf;
+         b->debug.pc2line_len = fd->pc2line.size;
+-        b->debug.source = fd->source;
++        if (fd->source_external) {
++            b->source_external = 1;
++            b->debug.source_offset = fd->source_start;
++        } else {
++            b->debug.source = fd->source;
++        }
+         b->debug.source_len = fd->source_len;
+         b->debug.source_owner = fd->source_owner;
+     }
+@@ -39752,10 +39944,13 @@
+         JS_FreeContext(b->realm);
+ 
+     JS_FreeAtomRT(rt, b->func_name);
++    if (js_lazy_reads_external(b))
++        js_external_source_require(rt, b->debug.source_owner, -1);
+     if (b->has_debug) {
+         JS_FreeAtomRT(rt, b->debug.filename);
+         js_free_rt(rt, b->debug.pc2line_buf);
+-        js_free_function_source(rt, b->debug.source, b->debug.source_owner);
++        js_free_function_source(rt, js_function_heap_source(b),
++                                b->debug.source_owner);
+     }
+ 
+     if (b->is_lazy) {
+@@ -43265,8 +43460,9 @@
+        depends on the size of its bytecode, which includes the bytecode of
+        the functions nested in it: while inside a function that may be kept
+        lazy, parse them too, or skipping them would make it smaller. (The
+-       function a first-call compile is compiling is never kept lazy.) */
+-    if (fd->strip_source) {
++       function a first-call compile is compiling is never kept lazy.)
++       Tilefinch: not with external text, which the stub reads instead. */
++    if (fd->strip_source && !(s->external_source && !fd->strip_debug)) {
+         for (parent = fd->parent; parent->parent && !parent->parent->is_lazy_env;
+              parent = parent->parent) {
+             if (parent->lazy_ok)
+@@ -43308,7 +43504,8 @@
+         /* what js_lazy_function_eligible() requires of the parsed body */
+         span = close + 1 - func_start;
+         if (span < threshold || span > JS_STRING_LEN_MAX ||
+-            (fd->strip_source && span > fd->byte_code.size + pp->code_bytes))
++            (fd->strip_source && !(s->external_source && !fd->strip_debug) &&
++             span > fd->byte_code.size + pp->code_bytes))
+             ret = PP_BAIL;
+     }
+     if (ret == PP_DONE) {
+@@ -43513,6 +43710,7 @@
+     fd->lazy_parent_static_init = parent_static_init;
+     fd->lazy_is_module = s->is_module;
+     fd->lazy_span_start = ptr - s->buf_start;
++    fd->external_base = s->external_base;
+     if (lazy_entry) {
+         /* the text is the lazy function's own; do not copy it again */
+         fd->strip_source = (lazy_entry != 0);
+@@ -43792,16 +43990,11 @@
+                 emit_op(s, OP_return);
+ 
+             fd->lazy_span_len = s->last_ptr - ptr;
+-            if (!fd->strip_source) {
+-                /* save the function source code */
+-                /* the end of the function source code is after the last
+-                   token of the function source stored into s->last_ptr */
+-                fd->source_len = s->last_ptr - ptr;
+-                fd->source_start = ptr - fd->get_line_col_cache->buf_start;
+-                fd->source = js_strndup(ctx, (const char *)ptr, fd->source_len);
+-                if (!fd->source)
+-                    goto fail;
+-            }
++            /* save the function source code */
++            /* the end of the function source code is after the last
++               token of the function source stored into s->last_ptr */
++            if (js_parse_save_function_source(s, fd, ptr, s->last_ptr - ptr))
++                goto fail;
+             goto done;
+         }
+     }
+@@ -43826,14 +44019,9 @@
+             goto fail;
+     }
+     fd->lazy_span_len = s->buf_ptr - ptr;
+-    if (!fd->strip_source) {
+-        /* save the function source code */
+-        fd->source_len = s->buf_ptr - ptr;
+-        fd->source_start = ptr - fd->get_line_col_cache->buf_start;
+-        fd->source = js_strndup(ctx, (const char *)ptr, fd->source_len);
+-        if (!fd->source)
+-            goto fail;
+-    }
++    /* save the function source code */
++    if (js_parse_save_function_source(s, fd, ptr, s->buf_ptr - ptr))
++        goto fail;
+ 
+     if (next_token(s)) {
+         /* consume the '}' */
+@@ -44115,6 +44303,8 @@
+     if (vardefs_size)
+         memcpy(body + code_size + cpool_size, nb->vardefs, vardefs_size);
+ 
++    if (js_lazy_reads_external(b))
++        js_external_source_require(rt, b->debug.source_owner, -1);
+     js_free_lazy_function(rt, js_lazy_function_of(b));
+     b->is_lazy = 0;
+     b->has_lazy_body = 1;
+@@ -44134,7 +44324,8 @@
+         b->debug.pc2line_buf = nb->debug.pc2line_buf;
+         b->debug.pc2line_len = nb->debug.pc2line_len;
+         JS_FreeAtomRT(rt, nb->debug.filename);
+-        js_free_function_source(rt, nb->debug.source, nb->debug.source_owner);
++        js_free_function_source(rt, js_function_heap_source(nb),
++                                nb->debug.source_owner);
+     }
+     /* the bytecode atoms, constants and variable names now belong to 'b' */
+     for(i = 0; i < nb->closure_var_count; i++)
+@@ -44190,6 +44381,10 @@
+     if (lz->source) {
+         text = lz->source;
+         text_len = lz->source_len;
++    } else if (b->source_external) {
++        /* read from the external text below */
++        text = NULL;
++        text_len = lz->source_len;
+     } else {
+         /* adopt the text before sharing it with the nested functions:
+            adoption may move it */
+@@ -44200,7 +44395,8 @@
+         text = b->debug.source;
+         text_len = b->debug.source_len;
+     }
+-    if (!text || lz->param_offset > text_len || !b->has_debug ||
++    if ((!text && !js_lazy_reads_external(b)) ||
++        lz->param_offset > text_len || !b->has_debug ||
+         !b->debug.pc2line_buf) {
+         JS_ThrowInternalError(ctx, "lazy function has no source");
+         goto fail;
+@@ -44223,7 +44419,16 @@
+     buf = js_malloc(ctx, (size_t)text_len + 1);
+     if (!buf)
+         goto fail;
+-    memcpy(buf, text, text_len);
++    if (text) {
++        memcpy(buf, text, text_len);
++    } else if (!rt->external_source_read ||
++               rt->external_source_read(rt->external_source_opaque,
++                                        b->debug.source_owner->external_id,
++                                        lz->external_offset, text_len,
++                                        buf) != 0) {
++        JS_ThrowInternalError(ctx, "lazy function has no source");
++        goto fail;
++    }
+     buf[text_len] = '\0';
+     filename = JS_AtomToCString(ctx, b->debug.filename);
+     if (!filename)
+@@ -44236,6 +44441,14 @@
+     js_parse_init(ctx, s, buf, text_len, filename, col_num);
+     s->preparse_off = preparse_off;
+     parsed = TRUE;
++    if (lz->external_source && b->source_external &&
++        b->debug.source_owner &&
++        b->debug.source_owner->ref_count != UINT32_MAX) {
++        /* nested functions refer to the script's external text */
++        s->external_source = b->debug.source_owner;
++        s->external_source->ref_count++;
++        s->external_base = lz->external_offset;
++    }
+     s->get_line_col_cache.line_num = line_num;
+     s->is_module = lz->is_module;
+     s->allow_html_comments = !s->is_module;
+@@ -44332,6 +44545,8 @@
+     if (parsed) {
+         free_token(s, &s->token);
+         *pskipped = s->preparse_skipped;
++        if (s->external_source)
++            js_free_function_source(rt, NULL, s->external_source);
+     }
+     if (env)
+         js_free_function_def(ctx, env);
+@@ -44458,6 +44673,13 @@
+                 return JS_EXCEPTION;
+             js_mode |= JS_MODE_STRICT;
+         }
++    }
++    /* Tilefinch: the external text this compile's functions refer to under
++       JS_STRIP_SOURCE (see JS_SetExternalSourceHooks()) */
++    s->external_source = js_take_external_source(ctx->rt);
++    if (s->external_source && s->external_source->length != input_len) {
++        js_free_function_source(ctx->rt, NULL, s->external_source);
++        s->external_source = NULL;
+     }
+     fd = js_new_function_def(ctx, NULL, TRUE, FALSE, filename,
+                              s->buf_start, &s->get_line_col_cache);
+@@ -44504,6 +44726,9 @@
+             if (m)
+                 JS_FreeValue(ctx, JS_MKPTR(JS_TAG_MODULE, m));
+             ctx->rt->preparse_suspended++;
++            /* the repeated compile takes over the external text */
++            ctx->rt->external_source_carry = s->external_source;
++            s->external_source = NULL;
+             ret_val = __JS_EvalInternalWithColumn(ctx, this_obj, input,
+                                                   input_len, filename, flags,
+                                                   scope_idx, first_line_column);
+@@ -44527,6 +44752,10 @@
+             goto fail1;
+         fun_obj = JS_NewModuleValue(ctx, m);
+     }
++    if (s->external_source) {
++        js_free_function_source(ctx->rt, NULL, s->external_source);
++        s->external_source = NULL;
++    }
+     if (flags & JS_EVAL_FLAG_COMPILE_ONLY) {
+         ret_val = fun_obj;
+     } else {
+@@ -44534,6 +44763,10 @@
+     }
+     return ret_val;
+  fail1:
++    if (s->external_source) {
++        js_free_function_source(ctx->rt, NULL, s->external_source);
++        s->external_source = NULL;
++    }
+     /* XXX: should free all the unresolved dependencies */
+     if (m)
+         JS_FreeValue(ctx, JS_MKPTR(JS_TAG_MODULE, m));
+@@ -45501,11 +45734,18 @@
+         bc_put_atom(s, b->debug.filename);
+         bc_put_leb128(s, b->debug.pc2line_len);
+         dbuf_put(&s->dbuf, b->debug.pc2line_buf, b->debug.pc2line_len);
+-        if (b->debug.source) {
++        if (b->source_external) {
++            /* Tilefinch: where the text is in the external text (see
++               JS_SetExternalSourceHooks()), not the text */
+             bc_put_leb128(s, b->debug.source_len);
++            bc_put_u8(s, 2);
++            bc_put_leb128(s, b->debug.source_offset);
++        } else if (b->debug.source) {
++            bc_put_leb128(s, b->debug.source_len);
+             if (b->debug.source_len) {
+                 size_t offset = 0;
+                 BOOL shared = parent && parent->has_debug
++                    && !parent->source_external
+                     && b->debug.source_owner
+                     && parent->debug.source_owner == b->debug.source_owner
+                     && b->debug.source >= parent->debug.source;
+@@ -45535,11 +45775,18 @@
+         bc_set_flags(&flags, &idx, lz->is_module, 1);
+         bc_set_flags(&flags, &idx, lz->parent_static_init, 1);
+         bc_set_flags(&flags, &idx, lz->strip_source, 1);
++        bc_set_flags(&flags, &idx, lz->external_source, 1);
+         bc_put_u8(s, flags);
+         bc_put_leb128(s, lz->param_offset);
+         bc_put_leb128(s, lz->nested_threshold);
+-        /* the text, unless it is the Function.prototype.toString() text */
++        /* the text, unless it is the Function.prototype.toString() text
++           or read from external text */
+         bc_put_leb128(s, lz->source ? lz->source_len : 0);
++        if (lz->external_source) {
++            bc_put_leb128(s, lz->external_offset);
++            /* the length of the text read from there */
++            bc_put_leb128(s, lz->source ? 0 : lz->source_len);
++        }
+         if (lz->source)
+             dbuf_put(&s->dbuf, (const uint8_t *)lz->source, lz->source_len);
+     }
+@@ -46026,6 +46273,9 @@
+     BOOL is_rom_data : 8;
+     BOOL allow_reference : 8;
+     BOOL platform_methods : 8; /* JS_READ_OBJ_PLATFORM_METHODS */
++    /* Tilefinch: the external text functions refer to (see
++       JS_SetExternalSourceHooks()), or NULL; one reference */
++    JSFunctionSource *external_source;
+     /* object references */
+     JSObject **objects;
+     int objects_count;
+@@ -46605,7 +46855,8 @@
+                 uint32_t offset;
+                 if (bc_get_leb128(s, &offset))
+                     goto fail;
+-                if (!parent || !parent->has_debug || !parent->debug.source
++                if (!parent || !parent->has_debug || parent->source_external
++                    || !parent->debug.source
+                     || offset > (uint32_t)parent->debug.source_len
+                     || (uint32_t)b->debug.source_len >
+                         (uint32_t)parent->debug.source_len - offset) {
+@@ -46650,6 +46901,23 @@
+                     goto fail;
+                 if (bc_get_buf(s, (uint8_t *)b->debug.source, b->debug.source_len))
+                     goto fail;
++            } else if (kind == 2) {
++                /* Tilefinch: a span of the external text; without one
++                   named for this read the function has no text */
++                uint32_t offset;
++                JSFunctionSource *owner = s->external_source;
++                if (bc_get_leb128(s, &offset))
++                    goto fail;
++                if (owner && owner->ref_count != UINT32_MAX
++                    && offset <= owner->length
++                    && (uint32_t)b->debug.source_len <= owner->length - offset) {
++                    owner->ref_count++;
++                    b->source_external = 1;
++                    b->debug.source_offset = offset;
++                    b->debug.source_owner = owner;
++                } else {
++                    b->debug.source_len = 0;
++                }
+             } else {
+                 JS_ThrowSyntaxError(ctx, "invalid function source encoding");
+                 goto fail;
+@@ -46659,8 +46927,8 @@
+     }
+     if (is_lazy) {
+         JSLazyFunction *lz;
+-        uint32_t text_len;
+-        uint8_t func_type, lazy_flags;
++        uint32_t text_len, external_len;
++        uint8_t func_type, lazy_flags, external;
+ 
+         lz = js_mallocz(ctx, sizeof(*lz));
+         if (!lz)
+@@ -46680,6 +46948,18 @@
+         lz->is_module = bc_get_flags(lazy_flags, &idx, 1);
+         lz->parent_static_init = bc_get_flags(lazy_flags, &idx, 1);
+         lz->strip_source = bc_get_flags(lazy_flags, &idx, 1);
++        /* set once the text it reads is accounted for (below) */
++        external = bc_get_flags(lazy_flags, &idx, 1);
++        external_len = 0;
++        if (external) {
++            if (bc_get_leb128(s, &lz->external_offset) ||
++                bc_get_leb128(s, &external_len))
++                goto fail;
++            /* nested functions can refer to the text only if this
++               function does */
++            if (!b->source_external)
++                external = 0;
++        }
+         if (lz->source_len) {
+             lz->source = js_malloc(ctx, lz->source_len);
+             if (!lz->source)
+@@ -46687,11 +46967,25 @@
+             if (bc_get_buf(s, (uint8_t *)lz->source, lz->source_len))
+                 goto fail;
+             text_len = lz->source_len;
++        } else if (external_len) {
++            /* read from the external text: without it the function could
++               never compile, so the bytecode does not read back */
++            if (!external ||
++                lz->external_offset > b->debug.source_owner->length ||
++                external_len > b->debug.source_owner->length -
++                    lz->external_offset) {
++                JS_ThrowSyntaxError(ctx, "lazy function without its text");
++                goto fail;
++            }
++            lz->source_len = external_len;
++            text_len = external_len;
++            js_external_source_require(ctx->rt, b->debug.source_owner, 1);
+         } else {
+             text_len = b->debug.source_len;
+         }
++        lz->external_source = external;
+         if (func_type > JS_PARSE_FUNC_METHOD ||
+-            (lz->source_len == 0 && !b->debug.source) ||
++            (lz->source_len == 0 && !js_function_heap_source(b)) ||
+             lz->param_offset > text_len || !b->debug.pc2line_len) {
+             JS_ThrowSyntaxError(ctx, "invalid lazy function");
+             goto fail;
+@@ -47302,11 +47596,14 @@
+         s->first_atom = JS_ATOM_END;
+     else
+         s->first_atom = 1;
++    s->external_source = js_take_external_source(ctx->rt);
+     if (JS_ReadObjectAtoms(s)) {
+         obj = JS_EXCEPTION;
+     } else {
+         obj = JS_ReadObjectRec(s);
+     }
++    if (s->external_source)
++        js_free_function_source(ctx->rt, NULL, s->external_source);
+     bc_reader_free(s);
+     return obj;
+ }
+@@ -49280,6 +49577,142 @@
+    Function.prototype.toString use, reported by JS_ComputeMemoryDetail. */
+ static int64_t jsmd_tostring[4]; /* calls, bytecode, with source, source bytes */
+ #endif
++/* Tilefinch: decodes 'length' bytes of external text at 'offset' a window
++   at a time, in the parts js_new_function_source() cuts (about 4 KiB of
++   text each), concatenated. A window ends at least a code point past its
++   part, so each part decodes exactly as in one buffer; a part whose
++   malformed run reaches the window's end is read again with a larger
++   window. */
++static JSValue js_function_external_source_parts(JSContext *ctx,
++                                                 const JSFunctionSource *owner,
++                                                 uint32_t offset,
++                                                 uint32_t length)
++{
++    JSRuntime *rt = ctx->rt;
++    /* a short span needs no more than itself */
++    size_t window = length < 4096u + 64u ? length : 4096u + 64u;
++    uint8_t *buf = NULL;
++    JSValue result = JS_AtomToString(ctx, JS_ATOM_empty_string);
++    uint32_t pos = 0;
++
++    while (pos < length) {
++        size_t n = length - pos < window ? length - pos : window;
++        BOOL last = (pos + n == length);
++        if (!buf) {
++            buf = js_malloc(ctx, window);
++            if (!buf)
++                goto fail;
++        }
++        if (rt->external_source_read(rt->external_source_opaque,
++                                     owner->external_id, offset + pos,
++                                     (uint32_t)n, (char *)buf) != 0) {
++            js_free(ctx, buf);
++            JS_FreeValue(ctx, result);
++            return JS_UNDEFINED;
++        }
++        const uint8_t *start = buf, *p = buf, *end = buf + n;
++        do {
++            size_t room = 4096u - (size_t)(p - start);
++            if (room > (size_t)(end - p)) room = end - p;
++            p += count_ascii(p, room);
++            if (p < end && (size_t)(p - start) < 4096u)
++                (void)js_source_codepoint(&p, end);
++        } while (p < end && (size_t)(p - start) < 4096u);
++        if (!last && p + 4 > end) {
++            /* the part may continue past this window: read it larger */
++            js_free(ctx, buf);
++            buf = NULL;
++            if (window > JS_STRING_LEN_MAX / 2)
++                goto fail;
++            window *= 2;
++            continue;
++        }
++        JSValue part = js_new_function_source_flat(ctx, (const char *)start,
++                                                   p - start);
++        if (JS_IsException(part))
++            goto fail;
++        result = JS_ConcatString(ctx, result, part);
++        if (JS_IsException(result)) {
++            js_free(ctx, buf);
++            return result;
++        }
++        pos += (uint32_t)(p - start);
++    }
++    js_free(ctx, buf);
++    return result;
++ fail:
++    js_free(ctx, buf);
++    JS_FreeValue(ctx, result);
++    return JS_EXCEPTION;
++}
++
++/* Tilefinch: the toString() text of 'b' from the embedder's external
++   text (see JS_SetExternalSourceHooks()), or JS_UNDEFINED if the embedder
++   no longer has it. The text is marked required while this runs, so a
++   collection or a refused allocation cannot have the embedder drop it, and
++   the collection checkpoint runs before anything is allocated (the caller
++   roots the function). Nothing is allocated before the embedder says the
++   text is still there (the 'query' hook), so a dropped text answers
++   "[native code]" even when the heap could not hold the source. ASCII
++   text, nearly all script text, is read straight into the result string.
++   Other text is read a window at a time and decoded in the parts
++   js_new_function_source() makes of heap text, so the result never shares
++   the heap with a copy of the whole text. Without 'query', the whole span
++   is read first to find which applies. */
++static JSValue js_function_external_source(JSContext *ctx,
++                                           const JSFunctionBytecode *b)
++{
++    JSRuntime *rt = ctx->rt;
++    JSFunctionSource *owner = b->debug.source_owner;
++    uint32_t length = b->debug.source_len;
++    JSString *str;
++    JSValue text;
++
++    if (!rt->external_source_read || !owner || !owner->external_id ||
++        length < 2 || length > JS_STRING_LEN_MAX)
++        return JS_UNDEFINED;
++    js_external_source_require(rt, owner, 1);
++    /* the collection checkpoint for either path, before it allocates */
++    js_trigger_gc(rt, sizeof(JSString) + length + 1);
++    if (rt->external_source_query) {
++        int kind = rt->external_source_query(rt->external_source_opaque,
++                                             owner->external_id,
++                                             b->debug.source_offset, length);
++        if (kind < 0) {
++            js_external_source_require(rt, owner, -1);
++            return JS_UNDEFINED;
++        }
++        if (kind == 0) {
++            text = js_function_external_source_parts(
++                ctx, owner, b->debug.source_offset, length);
++            js_external_source_require(rt, owner, -1);
++            return text;
++        }
++    }
++    str = js_alloc_string(ctx, length, 0);
++    if (!str) {
++        js_external_source_require(rt, owner, -1);
++        return JS_EXCEPTION;
++    }
++    if (rt->external_source_read(rt->external_source_opaque,
++                                 owner->external_id, b->debug.source_offset,
++                                 length, (char *)str->u.str8) != 0) {
++        js_external_source_require(rt, owner, -1);
++        js_free_string(rt, str);
++        return JS_UNDEFINED;
++    }
++    if (count_ascii(str->u.str8, length) == length) {
++        js_external_source_require(rt, owner, -1);
++        str->u.str8[length] = '\0';
++        return JS_MKPTR(JS_TAG_STRING, str);
++    }
++    js_free_string(rt, str);
++    text = js_function_external_source_parts(ctx, owner, b->debug.source_offset,
++                                             length);
++    js_external_source_require(rt, owner, -1);
++    return text;
++}
++
+ static JSValue js_function_toString(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv)
+ {
+@@ -49295,7 +49728,7 @@
+     if (js_class_has_bytecode(p->class_id)) {
+         JSFunctionBytecode *tb = p->u.func.function_bytecode;
+         jsmd_tostring[1]++;
+-        if (tb->has_debug && tb->debug.source) {
++        if (tb->has_debug && (tb->source_external || tb->debug.source)) {
+             jsmd_tostring[2]++;
+             jsmd_tostring[3] += tb->debug.source_len;
+         }
+@@ -49303,7 +49736,11 @@
+ #endif
+     if (js_class_has_bytecode(p->class_id)) {
+         JSFunctionBytecode *b = p->u.func.function_bytecode;
+-        if (b->has_debug && b->debug.source) {
++        if (b->has_debug && b->source_external) {
++            JSValue text = js_function_external_source(ctx, b);
++            if (!JS_IsUndefined(text))
++                return text;
++        } else if (b->has_debug && b->debug.source) {
+             if (!b->debug.source_owner && b->debug.source_len >= 1024)
+                 b->debug.source_owner = js_adopt_function_source(ctx,
+                     &b->debug.source, b->debug.source_len);
+@@ -69902,6 +70339,7 @@
+ enum { JSMD_F_FUNCS, JSMD_F_BC, JSMD_F_LAZY, JSMD_F_LAZY_BYTES, JSMD_F_PC2LINE,
+        JSMD_F_SRC_OWN, JSMD_F_SRC_SHARED, JSMD_F_CLOSURES, JSMD_F_CLOSURE_BYTES,
+        JSMD_F_BODY, JSMD_F_LAZY_SPAN_SHARED, JSMD_F_COMPILED_SHARED,
++       JSMD_F_EXTERNAL,
+        JSMD_F_COUNT };
+ static JSAtom jsmd_file_atom[JSMD_FILES + 1];
+ static int64_t jsmd_file[JSMD_FILES + 1][JSMD_F_COUNT];
+@@ -70058,7 +70496,12 @@
+             if (b->has_debug) {
+                 if (b->debug.pc2line_buf)
+                     fs[JSMD_F_PC2LINE] += jsmd_size(rt, b->debug.pc2line_buf);
+-                if (b->debug.source) {
++                if (b->source_external) {
++                    JSFunctionSource *owner = b->debug.source_owner;
++                    fs[JSMD_F_EXTERNAL]++;
++                    if (jsmd_owner_first(owner))
++                        fs[JSMD_F_SRC_SHARED] += jsmd_size(rt, owner);
++                } else if (b->debug.source) {
+                     JSFunctionSource *owner = b->debug.source_owner;
+                     if (owner) {
+                         if (b->is_lazy && !js_lazy_function_of(b)->source)
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1009,6 +1009,49 @@
+ void JS_SetStripInfo(JSRuntime *rt, int flags);
+ int JS_GetStripInfo(JSRuntime *rt);
+ 
++/* External function source (Tilefinch). A script compiled with
++   JS_STRIP_SOURCE keeps no Function.prototype.toString() text in the heap.
++   If the embedder keeps the script's text elsewhere, it names it with a
++   non-zero id: JS_SetExternalSourceId(rt, id, length) before the JS_Eval()
++   (or JS_ReadObject() of bytecode written from such a compile) that the
++   text belongs to. That call consumes the id. Each function compiled from
++   the text then records only its offset and length in it, and toString()
++   asks the 'read' hook for the bytes. A hook that cannot supply them (the
++   embedder dropped the text) returns -1, and toString() answers with the
++   "[native code]" form, as for a stripped function. Once consumed, the
++   engine calls 'release' exactly once, when no function refers to the text
++   any more (immediately if none was compiled from it). A function compiled
++   lazily (JS_SetLazyFunctionThreshold()) from such a text keeps no copy of
++   its own: its first call reads the text through 'read' too, so while any
++   such function is uncompiled the text is required. 'pin' (if not NULL) is
++   called with 1 when a text becomes required and 0 when it no longer is; a
++   'read' of a required text that fails makes that call throw an
++   InternalError. Bytecode with such functions (JS_WriteObject()) reads back
++   only with its text named (JS_SetExternalSourceId()). An id that no
++   JS_Eval()/JS_ReadObject() consumed stays pending; setting 0 clears it and
++   returns the pending id. */
++typedef int JSExternalSourceReadFunc(void *opaque, uint32_t source_id,
++                                     uint32_t offset, uint32_t length,
++                                     char *dest);
++typedef void JSExternalSourceReleaseFunc(void *opaque, uint32_t source_id);
++typedef void JSExternalSourcePinFunc(void *opaque, uint32_t source_id,
++                                     int required);
++void JS_SetExternalSourceHooks(JSRuntime *rt, JSExternalSourceReadFunc *read,
++                               JSExternalSourceReleaseFunc *release,
++                               JSExternalSourcePinFunc *pin, void *opaque);
++uint32_t JS_SetExternalSourceId(JSRuntime *rt, uint32_t source_id,
++                                uint32_t length);
++/* Optional (Tilefinch): what toString() can expect from 'read' before it
++   allocates anything. Returns -1 if the span is no longer available, 1 if
++   it is available and all ASCII (read straight into the result string),
++   0 if available and possibly not ASCII (decoded a window at a time). The
++   text is required (see 'pin') while toString() asks and reads. Without
++   it, toString() reads the whole span first to find out. */
++typedef int JSExternalSourceQueryFunc(void *opaque, uint32_t source_id,
++                                      uint32_t offset, uint32_t length);
++void JS_SetExternalSourceQuery(JSRuntime *rt,
++                               JSExternalSourceQueryFunc *query);
++
+ /* Lazy function compilation (Tilefinch). While the threshold is non-zero,
+    scripts and modules compile each inner function whose source text is at
+    least that many bytes long without keeping its bytecode: its captured

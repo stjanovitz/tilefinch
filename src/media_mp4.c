@@ -2589,6 +2589,44 @@ bool media_mp4_next_sample(MediaMp4Demux *demux, MediaMp4Sample *sample)
     }
 }
 
+bool media_mp4_peek_track_sample(const MediaMp4Demux *demux,
+                                 MediaMp4TrackKind kind,
+                                 MediaMp4Sample *sample)
+{
+    if (demux == NULL || sample == NULL) return false;
+    for (size_t i = 0; i < demux->track_count; i++) {
+        if (demux->tracks[i].info.kind != kind) continue;
+        MediaMp4Sample candidate;
+        if (!mp4_track_peek(&demux->tracks[i], i, &candidate)
+            || !media_mp4_sample_resident(demux, &candidate)) return false;
+        *sample = candidate;
+        return true;
+    }
+    return false;
+}
+
+bool media_mp4_take_track_sample(MediaMp4Demux *demux,
+                                 const MediaMp4Sample *sample,
+                                 void *destination, size_t capacity)
+{
+    if (demux == NULL || sample == NULL || destination == NULL
+        || sample->track_index >= demux->track_count) return false;
+    Mp4Track *track = &demux->tracks[sample->track_index];
+    MediaMp4Sample current;
+    if (!mp4_track_peek(track, sample->track_index, &current)
+        || current.offset != sample->offset || current.size != sample->size
+        || current.size > capacity
+        || !media_mp4_sample_resident(demux, &current)) return false;
+    /* The ordinary head's would-block record is not this read's to change. */
+    bool would_block = demux->runtime_would_block;
+    MediaRangeReadStatus status = mp4_reader_read(
+        demux, current.offset, destination, current.size, false);
+    demux->runtime_would_block = would_block;
+    if (status != MEDIA_RANGE_READ_COMPLETE) return false;
+    mp4_track_advance(track);
+    return true;
+}
+
 static bool media_mp4_read_sample_bounded(MediaMp4Demux *demux,
                            const MediaMp4Sample *sample,
                            void *destination, size_t capacity,
@@ -3076,12 +3114,101 @@ static bool media_h264_skip_scaling(MediaH264Bits *bits, unsigned count)
     return true;
 }
 
-bool media_h264_sps_dimensions(
+/* hrd_parameters(): read only to reach the VUI fields that follow it. */
+static bool media_h264_skip_hrd(MediaH264Bits *bits)
+{
+    uint32_t count = 0, ignored = 0;
+    if (!media_h264_ue(bits, &count) || count > 31u
+        || !media_h264_bits(bits, 8u, &ignored)) return false;
+    for (uint32_t i = 0; i <= count; i++) {
+        if (!media_h264_ue(bits, &ignored)
+            || !media_h264_ue(bits, &ignored)
+            || !media_h264_bit(bits, &ignored)) return false;
+    }
+    return media_h264_bits(bits, 20u, &ignored);
+}
+
+/* vui_parameters() up to and including bitstream_restriction. */
+static bool media_h264_parse_vui(
+    MediaH264Bits *bits, MediaH264SpsReferences *references)
+{
+    uint32_t flag = 0, value = 0;
+    if (!media_h264_bit(bits, &flag)) return false;
+    if (flag) {
+        if (!media_h264_bits(bits, 8u, &value)) return false;
+        if (value == 255u && !media_h264_bits(bits, 32u, &value))
+            return false;
+    }
+    if (!media_h264_bit(bits, &flag)) return false;
+    if (flag && !media_h264_bit(bits, &value)) return false;
+    if (!media_h264_bit(bits, &flag)) return false;
+    if (flag) {
+        uint32_t colour = 0;
+        if (!media_h264_bits(bits, 4u, &value)
+            || !media_h264_bit(bits, &colour)) return false;
+        if (colour && !media_h264_bits(bits, 24u, &value)) return false;
+    }
+    if (!media_h264_bit(bits, &flag)) return false;
+    if (flag && (!media_h264_ue(bits, &value)
+                 || !media_h264_ue(bits, &value))) return false;
+    if (!media_h264_bit(bits, &flag)) return false;
+    if (flag && (!media_h264_bits(bits, 32u, &value)
+                 || !media_h264_bits(bits, 32u, &value)
+                 || !media_h264_bit(bits, &value))) return false;
+    uint32_t nal_hrd = 0, vcl_hrd = 0;
+    if (!media_h264_bit(bits, &nal_hrd)
+        || (nal_hrd && !media_h264_skip_hrd(bits))
+        || !media_h264_bit(bits, &vcl_hrd)
+        || (vcl_hrd && !media_h264_skip_hrd(bits))) return false;
+    if ((nal_hrd || vcl_hrd) && !media_h264_bit(bits, &value)) return false;
+    if (!media_h264_bit(bits, &value)) return false;
+    if (!media_h264_bit(bits, &flag)) return false;
+    if (!flag) return true;
+    uint32_t reorder = 0, buffering = 0;
+    if (!media_h264_bit(bits, &value)
+        || !media_h264_ue(bits, &value) || !media_h264_ue(bits, &value)
+        || !media_h264_ue(bits, &value) || !media_h264_ue(bits, &value)
+        || !media_h264_ue(bits, &reorder)
+        || !media_h264_ue(bits, &buffering)
+        || reorder > 16u || buffering > 16u) return false;
+    references->bitstream_restriction = true;
+    references->max_num_reorder_frames = (uint8_t) reorder;
+    references->max_dec_frame_buffering = (uint8_t) buffering;
+    return true;
+}
+
+/* One bounded walk over an SPS. Geometry is always produced; the VUI is
+   read only when references is non-NULL, so the geometry contract does not
+   depend on syntax after the cropping window. */
+typedef struct {
+    uint32_t chroma_format_idc;
+    uint32_t bit_depth_luma;
+    uint32_t bit_depth_chroma;
+    bool frame_mbs_only;
+} MediaH264SpsFormat;
+
+static bool media_h264_sps_parse_format(
     const unsigned char *sps, size_t length,
-    uint16_t *width, uint16_t *height)
+    uint16_t *width, uint16_t *height,
+    MediaH264SpsReferences *references, MediaH264SpsFormat *format);
+
+static bool media_h264_sps_parse(
+    const unsigned char *sps, size_t length,
+    uint16_t *width, uint16_t *height,
+    MediaH264SpsReferences *references)
+{
+    return media_h264_sps_parse_format(
+        sps, length, width, height, references, NULL);
+}
+
+static bool media_h264_sps_parse_format(
+    const unsigned char *sps, size_t length,
+    uint16_t *width, uint16_t *height,
+    MediaH264SpsReferences *references, MediaH264SpsFormat *format)
 {
     if (width != NULL) *width = 0;
     if (height != NULL) *height = 0;
+    if (references != NULL) *references = (MediaH264SpsReferences) {0};
     if (sps == NULL || width == NULL || height == NULL
         || length < 4u || length > MEDIA_H264_MAXIMUM_SPS_BYTES
         || (sps[0] & 0x80u) != 0
@@ -3113,10 +3240,15 @@ bool media_h264_sps_dimensions(
             if (!media_h264_bit(&bits, &ignored)) return false;
             separate_colour_plane = ignored != 0;
         }
-        if (!media_h264_ue(&bits, &ignored)
-            || !media_h264_ue(&bits, &ignored)
+        uint32_t depth_luma = 0, depth_chroma = 0;
+        if (!media_h264_ue(&bits, &depth_luma)
+            || !media_h264_ue(&bits, &depth_chroma)
             || !media_h264_bit(&bits, &ignored)
             || !media_h264_bit(&bits, &ignored)) return false;
+        if (format != NULL) {
+            format->bit_depth_luma = depth_luma + 8u;
+            format->bit_depth_chroma = depth_chroma + 8u;
+        }
         if (ignored != 0) {
             unsigned lists = chroma == 3u ? 12u : 8u;
             for (unsigned i = 0; i < lists; i++) {
@@ -3146,11 +3278,18 @@ bool media_h264_sps_dimensions(
         return false;
     }
     uint32_t width_mbs = 0, height_map = 0, frame_only = 0;
-    if (!media_h264_ue(&bits, &ignored)
+    uint32_t reference_frames = 0;
+    if (!media_h264_ue(&bits, &reference_frames)
         || !media_h264_bit(&bits, &ignored)
         || !media_h264_ue(&bits, &width_mbs)
         || !media_h264_ue(&bits, &height_map)
         || !media_h264_bit(&bits, &frame_only)) return false;
+    if (format != NULL) {
+        format->chroma_format_idc = chroma;
+        if (format->bit_depth_luma == 0) format->bit_depth_luma = 8u;
+        if (format->bit_depth_chroma == 0) format->bit_depth_chroma = 8u;
+        format->frame_mbs_only = frame_only != 0;
+    }
     if (!frame_only && !media_h264_bit(&bits, &ignored)) return false;
     if (!media_h264_bit(&bits, &ignored)) return false;
     uint32_t crop = 0, left = 0, right = 0, top = 0, bottom = 0;
@@ -3174,7 +3313,68 @@ bool media_h264_sps_dimensions(
         || coded_height - crop_height > UINT16_MAX) return false;
     *width = (uint16_t) (coded_width - crop_width);
     *height = (uint16_t) (coded_height - crop_height);
-    return *width != 0 && *height != 0;
+    if (*width == 0 || *height == 0) return false;
+    if (references == NULL) return true;
+    if (reference_frames > 16u) return false;
+    references->max_num_ref_frames = (uint8_t) reference_frames;
+    uint32_t vui = 0;
+    if (!media_h264_bit(&bits, &vui)) return false;
+    return !vui || media_h264_parse_vui(&bits, references);
+}
+
+bool media_h264_sps_dimensions(
+    const unsigned char *sps, size_t length,
+    uint16_t *width, uint16_t *height)
+{
+    return media_h264_sps_parse(sps, length, width, height, NULL);
+}
+
+bool media_h264_sps_references(
+    const unsigned char *sps, size_t length,
+    MediaH264SpsReferences *references)
+{
+    uint16_t width = 0, height = 0;
+    if (references == NULL) return false;
+    if (media_h264_sps_parse(sps, length, &width, &height, references))
+        return true;
+    *references = (MediaH264SpsReferences) {0};
+    return false;
+}
+
+MediaH264FirmwareReferences media_h264_psp_firmware_references(
+    const MediaH264SpsReferences *references)
+{
+    if (references == NULL) return MEDIA_H264_FIRMWARE_REFERENCES_SUPPORTED;
+    if (references->bitstream_restriction
+        && references->max_num_reorder_frames
+               > MEDIA_H264_PSP_FIRMWARE_MAXIMUM_REORDER)
+        return MEDIA_H264_FIRMWARE_REFERENCES_PYRAMID;
+    if (references->max_num_ref_frames
+            > MEDIA_H264_PSP_FIRMWARE_MAXIMUM_REFERENCES)
+        return MEDIA_H264_FIRMWARE_REFERENCES_TOO_MANY;
+    return MEDIA_H264_FIRMWARE_REFERENCES_SUPPORTED;
+}
+
+bool media_h264_firmware_references_conclusive(
+    MediaH264FirmwareReferences verdict, bool page_media)
+{
+    return verdict == MEDIA_H264_FIRMWARE_REFERENCES_TOO_MANY
+        || (verdict == MEDIA_H264_FIRMWARE_REFERENCES_PYRAMID && page_media);
+}
+
+const char *media_h264_firmware_references_refusal(
+    MediaH264FirmwareReferences verdict)
+{
+    switch (verdict) {
+    case MEDIA_H264_FIRMWARE_REFERENCES_PYRAMID:
+        return MEDIA_H264_UNSUPPORTED_STREAM " (B-frame pyramid)";
+    case MEDIA_H264_FIRMWARE_REFERENCES_TOO_MANY:
+        return MEDIA_H264_UNSUPPORTED_STREAM
+            " (more than 3 reference frames)";
+    case MEDIA_H264_FIRMWARE_REFERENCES_SUPPORTED:
+    default:
+        return NULL;
+    }
 }
 
 bool media_h264_avcc_dimensions(
@@ -3396,6 +3596,286 @@ MediaH264DecoderRoute media_h264_annexb_decoder_route(
         || profile == 135u)
         return MEDIA_H264_DECODER_ROUTE_HIGH_EXTENSION;
     return MEDIA_H264_DECODER_ROUTE_UNSUPPORTED;
+}
+
+bool media_h264_avcc_firmware_level_supported(
+    const unsigned char *config, size_t length)
+{
+    /* A config this cannot read is judged by the route and geometry
+       checks, not here. */
+    if (config == NULL || length < 12u || config[0] != 1u
+        || (config[5] & 31u) == 0u) return true;
+    size_t sps_length = ((size_t) config[6] << 8u) | config[7];
+    if (sps_length < 4u || sps_length > length - 8u) return true;
+    return psp_video_avc_level_supported(config[11]);
+}
+
+bool media_h264_annexb_firmware_level_supported(
+    const unsigned char *config, size_t length)
+{
+    const unsigned char *sps = NULL, *pps = NULL;
+    size_t sps_length = 0, pps_length = 0;
+    if (!media_h264_annexb_parameter_sets(
+            config, length, &sps, &sps_length, &pps, &pps_length)
+        || sps_length < 4u) return true;
+    return psp_video_avc_level_supported(sps[3]);
+}
+
+static MediaH264FirmwareReferences media_h264_sps_firmware_references(
+    const unsigned char *sps, size_t length)
+{
+    MediaH264SpsReferences references;
+    /* Syntax this parser cannot follow is not evidence of an unsupported
+       reference structure; firmware remains the judge of such a stream. */
+    if (!media_h264_sps_references(sps, length, &references))
+        return MEDIA_H264_FIRMWARE_REFERENCES_SUPPORTED;
+    return media_h264_psp_firmware_references(&references);
+}
+
+MediaH264FirmwareReferences media_h264_avcc_firmware_references(
+    const unsigned char *config, size_t length)
+{
+    if (config == NULL || length < 7u || config[0] != 1u)
+        return MEDIA_H264_FIRMWARE_REFERENCES_SUPPORTED;
+    unsigned count = config[5] & 31u;
+    size_t cursor = 6u;
+    for (unsigned i = 0; i < count; i++) {
+        if (length - cursor < 2u) break;
+        size_t item = ((size_t) config[cursor] << 8u) | config[cursor + 1u];
+        cursor += 2u;
+        if (item > length - cursor) break;
+        MediaH264FirmwareReferences verdict =
+            media_h264_sps_firmware_references(config + cursor, item);
+        if (verdict != MEDIA_H264_FIRMWARE_REFERENCES_SUPPORTED)
+            return verdict;
+        cursor += item;
+    }
+    return MEDIA_H264_FIRMWARE_REFERENCES_SUPPORTED;
+}
+
+MediaH264FirmwareReferences media_h264_annexb_firmware_references(
+    const unsigned char *config, size_t length)
+{
+    const unsigned char *sps = NULL, *pps = NULL;
+    size_t sps_length = 0, pps_length = 0;
+    if (!media_h264_annexb_parameter_sets(
+            config, length, &sps, &sps_length, &pps, &pps_length))
+        return MEDIA_H264_FIRMWARE_REFERENCES_SUPPORTED;
+    (void) pps;
+    (void) pps_length;
+    return media_h264_sps_firmware_references(sps, sps_length);
+}
+
+static void media_h264_sps_frames_note(
+    const unsigned char *nal, size_t length,
+    MediaH264SpsFramesStatus *status, unsigned *frames)
+{
+    if (length == 0 || (nal[0] & 0x1fu) != 7u) return;
+    MediaH264SpsReferences references;
+    if (!media_h264_sps_references(nal, length, &references)) {
+        *status = MEDIA_H264_SPS_FRAMES_UNREADABLE;
+        return;
+    }
+    unsigned held = references.max_num_ref_frames;
+    if (references.bitstream_restriction
+        && references.max_dec_frame_buffering > held)
+        held = references.max_dec_frame_buffering;
+    if (held > *frames) *frames = held;
+    if (*status == MEDIA_H264_SPS_FRAMES_ABSENT)
+        *status = MEDIA_H264_SPS_FRAMES_KNOWN;
+}
+
+MediaH264SpsFramesStatus media_h264_sample_sps_frames(
+    const unsigned char *payload, size_t length,
+    unsigned nal_length_size, unsigned *frames)
+{
+    MediaH264SpsFramesStatus status = MEDIA_H264_SPS_FRAMES_ABSENT;
+    unsigned held = 0;
+    if (frames != NULL) *frames = 0;
+    if (payload == NULL || frames == NULL || nal_length_size > 4u)
+        return status;
+    if (nal_length_size == 0) {
+        size_t prefix = 0;
+        size_t start = media_h264_annexb_start(payload, length, 0, &prefix);
+        while (start != SIZE_MAX) {
+            size_t nal = start + prefix;
+            if (nal >= length) break;
+            size_t next_prefix = 0;
+            size_t next = media_h264_annexb_start(
+                payload, length, nal + 1u, &next_prefix);
+            size_t end = next == SIZE_MAX ? length : next;
+            while (end > nal && payload[end - 1u] == 0) end--;
+            if (end > nal)
+                media_h264_sps_frames_note(
+                    payload + nal, end - nal, &status, &held);
+            start = next;
+            prefix = next_prefix;
+        }
+    } else {
+        size_t cursor = 0;
+        while (length - cursor >= nal_length_size) {
+            size_t item = 0;
+            for (unsigned i = 0; i < nal_length_size; i++)
+                item = (item << 8u) | payload[cursor + i];
+            cursor += nal_length_size;
+            if (item == 0 || item > length - cursor) break;
+            media_h264_sps_frames_note(
+                payload + cursor, item, &status, &held);
+            cursor += item;
+        }
+    }
+    *frames = held;
+    return status;
+}
+
+static MediaH264SoftwareCoding media_h264_sps_software_coding(
+    const unsigned char *sps, size_t length)
+{
+    uint16_t width = 0, height = 0;
+    MediaH264SpsFormat format = {0};
+    if (!media_h264_sps_parse_format(sps, length, &width, &height, NULL,
+                                     &format)
+        && format.chroma_format_idc == 0)
+        return MEDIA_H264_SOFTWARE_CODING_UNKNOWN;
+    return format.frame_mbs_only && format.chroma_format_idc == 1u
+            && format.bit_depth_luma == 8u && format.bit_depth_chroma == 8u
+        ? MEDIA_H264_SOFTWARE_CODING_SUPPORTED
+        : MEDIA_H264_SOFTWARE_CODING_UNSUPPORTED;
+}
+
+bool media_h264_config_reorder_free(
+    const unsigned char *config, size_t length, bool annex_b)
+{
+    const unsigned char *sps = NULL;
+    size_t sps_length = 0;
+    if (config == NULL) return false;
+    if (annex_b) {
+        const unsigned char *pps = NULL;
+        size_t pps_length = 0;
+        if (!media_h264_annexb_parameter_sets(
+                config, length, &sps, &sps_length, &pps, &pps_length))
+            return false;
+    } else {
+        if (length < 8u || config[0] != 1u || (config[5] & 31u) == 0)
+            return false;
+        sps_length = ((size_t) config[6] << 8u) | config[7];
+        if (sps_length > length - 8u) return false;
+        sps = config + 8u;
+    }
+    if (sps_length < 2u) return false;
+    /* Baseline has no B slices. */
+    if (sps[1] == 66u) return true;
+    MediaH264SpsReferences references;
+    return media_h264_sps_references(sps, sps_length, &references)
+        && references.bitstream_restriction
+        && references.max_num_reorder_frames == 0;
+}
+
+MediaH264SoftwareCoding media_h264_config_software_coding(
+    const unsigned char *config, size_t length, bool annex_b)
+{
+    if (config == NULL) return MEDIA_H264_SOFTWARE_CODING_UNKNOWN;
+    if (annex_b) {
+        const unsigned char *sps = NULL, *pps = NULL;
+        size_t sps_length = 0, pps_length = 0;
+        if (!media_h264_annexb_parameter_sets(
+                config, length, &sps, &sps_length, &pps, &pps_length))
+            return MEDIA_H264_SOFTWARE_CODING_UNKNOWN;
+        return media_h264_sps_software_coding(sps, sps_length);
+    }
+    if (length < 8u || config[0] != 1u || (config[5] & 31u) == 0)
+        return MEDIA_H264_SOFTWARE_CODING_UNKNOWN;
+    size_t sps_length = ((size_t) config[6] << 8u) | config[7];
+    if (sps_length > length - 8u) return MEDIA_H264_SOFTWARE_CODING_UNKNOWN;
+    return media_h264_sps_software_coding(config + 8u, sps_length);
+}
+
+static MediaH264Entropy media_h264_pps_entropy(
+    const unsigned char *pps, size_t length)
+{
+    if (pps == NULL || length < 2u || (pps[0] & 0x1fu) != 8u)
+        return MEDIA_H264_ENTROPY_UNKNOWN;
+    MediaH264Bits bits = {0};
+    unsigned zeros = 0;
+    /* pps_id, sps_id and the flag fit in the first few bytes. */
+    for (size_t i = 1; i < length && bits.length < 16u; i++) {
+        if (zeros >= 2u && pps[i] == 3u) {
+            zeros = 0;
+            continue;
+        }
+        bits.data[bits.length++] = pps[i];
+        zeros = pps[i] == 0 ? zeros + 1u : 0u;
+    }
+    uint32_t ignored = 0, cabac = 0;
+    if (!media_h264_ue(&bits, &ignored) || !media_h264_ue(&bits, &ignored)
+        || !media_h264_bit(&bits, &cabac))
+        return MEDIA_H264_ENTROPY_UNKNOWN;
+    return cabac ? MEDIA_H264_ENTROPY_CABAC : MEDIA_H264_ENTROPY_CAVLC;
+}
+
+MediaH264Entropy media_h264_config_entropy(
+    const unsigned char *config, size_t length, bool annex_b)
+{
+    if (config == NULL) return MEDIA_H264_ENTROPY_UNKNOWN;
+    if (annex_b) {
+        const unsigned char *sps = NULL, *pps = NULL;
+        size_t sps_length = 0, pps_length = 0;
+        if (!media_h264_annexb_parameter_sets(
+                config, length, &sps, &sps_length, &pps, &pps_length))
+            return MEDIA_H264_ENTROPY_UNKNOWN;
+        return media_h264_pps_entropy(pps, pps_length);
+    }
+    if (length < 7u || config[0] != 1u) return MEDIA_H264_ENTROPY_UNKNOWN;
+    size_t cursor = 6u;
+    unsigned count = config[5] & 31u;
+    for (unsigned i = 0; i < count; i++) {
+        if (length - cursor < 2u) return MEDIA_H264_ENTROPY_UNKNOWN;
+        size_t item = ((size_t) config[cursor] << 8u) | config[cursor + 1u];
+        cursor += 2u;
+        if (item > length - cursor) return MEDIA_H264_ENTROPY_UNKNOWN;
+        cursor += item;
+    }
+    if (cursor >= length) return MEDIA_H264_ENTROPY_UNKNOWN;
+    unsigned pps_count = config[cursor++];
+    MediaH264Entropy result = MEDIA_H264_ENTROPY_UNKNOWN;
+    for (unsigned i = 0; i < pps_count; i++) {
+        if (length - cursor < 2u) break;
+        size_t item = ((size_t) config[cursor] << 8u) | config[cursor + 1u];
+        cursor += 2u;
+        if (item > length - cursor) break;
+        MediaH264Entropy entropy =
+            media_h264_pps_entropy(config + cursor, item);
+        /* Any CAVLC picture parameter set makes the stream CAVLC. */
+        if (entropy == MEDIA_H264_ENTROPY_CAVLC) return entropy;
+        if (entropy == MEDIA_H264_ENTROPY_CABAC) result = entropy;
+        cursor += item;
+    }
+    return result;
+}
+
+MediaH264SpsFramesStatus media_h264_config_sps_frames(
+    const unsigned char *config, size_t length, bool annex_b,
+    unsigned *frames)
+{
+    MediaH264SpsFramesStatus status = MEDIA_H264_SPS_FRAMES_ABSENT;
+    unsigned held = 0;
+    if (frames != NULL) *frames = 0;
+    if (config == NULL || frames == NULL) return status;
+    if (annex_b)
+        return media_h264_sample_sps_frames(config, length, 0, frames);
+    if (length < 7u || config[0] != 1u) return status;
+    unsigned count = config[5] & 31u;
+    size_t cursor = 6u;
+    for (unsigned i = 0; i < count; i++) {
+        if (length - cursor < 2u) break;
+        size_t item = ((size_t) config[cursor] << 8u) | config[cursor + 1u];
+        cursor += 2u;
+        if (item == 0 || item > length - cursor) break;
+        media_h264_sps_frames_note(config + cursor, item, &status, &held);
+        cursor += item;
+    }
+    *frames = held;
+    return status;
 }
 
 bool media_h264_annexb_to_avcc_in_place(

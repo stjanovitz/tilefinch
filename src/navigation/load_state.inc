@@ -443,14 +443,9 @@ static bool navigation_load_body(void *opaque, const unsigned char *data,
         tail = load->staged_body_capacity;
     }
     if (needed > tail) {
-        size_t capacity = load->staged_body_capacity == 0
-            ? 4096 : load->staged_body_capacity;
-        while (capacity < needed && capacity <= load->maximum_bytes / 2u) {
-            capacity *= 2u;
-        }
-        if (capacity < needed || capacity > load->maximum_bytes) {
-            capacity = needed;
-        }
+        size_t capacity = navigation_staging_capacity(
+            load->staged_body_capacity, needed, load->maximum_bytes);
+        if (capacity == 0) return false;
         unsigned char *grown = budget_realloc(
             load->session->budget, load->staged_body, capacity);
         if (grown == NULL) return false;
@@ -502,6 +497,9 @@ static NavigationParserCheckpointOutcome navigation_load_process_staged_body(
     size_t length = load->staged_body_length < maximum_bytes
         ? load->staged_body_length : maximum_bytes;
     uint64_t started = navigation_now_us();
+    navigation_stream_style_prepare_gate(
+        load->document_stream, load->staged_body + load->staged_body_offset,
+        &length, load->staged_body_length, started + maximum_time_us);
     NavigationParserCheckpointOutcome outcome =
         NAVIGATION_PARSER_CHECKPOINT_OK;
     bool ok = true;
@@ -974,8 +972,14 @@ static NavigationLoad *navigation_load_begin_common(
     load->record_history = record_history;
     load->replace_history = navigation_take_history_replace(
         session, generation, url, record_history);
+    bool low_memory_once = session->replacement_low_memory_next;
+    session->replacement_low_memory_next = false;
+    session->parser_script_stage_extended =
+        session->parser_script_stage_extended_next;
+    session->parser_script_stage_extended_next = false;
     bool low_memory_requested =
-        session->replacement_mode == NAVIGATION_REPLACEMENT_LOW_MEMORY
+        (session->replacement_mode == NAVIGATION_REPLACEMENT_LOW_MEMORY
+         || low_memory_once)
         && page_has_owned_state(&session->page);
     /* Keep the demonstrated complex-runtime safety boundary without forcing
        a small progressively-enhanced document onto the overlapping path. A
@@ -991,8 +995,11 @@ static NavigationLoad *navigation_load_begin_common(
         && session->script_bytes <= 128u * 1024u
         && incumbent_result->dynamic_scripts_completed <= 4
         && incumbent_result->dynamic_script_bytes <= 128u * 1024u;
+    /* An incumbent whose realms are already retired has no runtime left
+       to drain, which is what the bound above protects. */
     load->low_memory_replacement = low_memory_requested
-        && (!external_script_incumbent || bounded_external_script_incumbent);
+        && (!external_script_incumbent || bounded_external_script_incumbent
+            || (low_memory_once && session->page.runtime == NULL));
     if (low_memory_requested && !load->low_memory_replacement) {
         session->performance.low_memory_transactional_fallbacks++;
     }
@@ -1186,7 +1193,8 @@ bool navigation_load_parser_script_time(const NavigationLoad *load,
         used = running > UINT64_MAX - used ? UINT64_MAX : used + running;
     }
     if (used_us != NULL) *used_us = used;
-    if (limit_us != NULL) *limit_us = navigation_parser_script_stage_time_limit_us();
+    if (limit_us != NULL)
+        *limit_us = navigation_parser_script_stage_time_limit_us(load->session);
     return true;
 }
 
@@ -1437,6 +1445,10 @@ static bool navigation_load_finalize_parse(NavigationLoad *load)
        transactional EOF boundary; blocking resources are resolved by the
        candidate pipeline with their normal priority and failure rules. */
     uint64_t metadata_started = navigation_now_us();
+    /* A document whose parser never reported its head closed keeps its
+       declarations at end of input, before deferred scripts run. */
+    if (!stream->optional_work_shed && stream->parser != NULL)
+        media_declared_video_keep_parsed(&stream->parser->document);
     NavigationParserCheckpointOutcome metadata =
         navigation_stream_metadata_checkpoint(stream);
     if (metadata == NAVIGATION_PARSER_CHECKPOINT_HARD_FAILURE) {
@@ -1769,7 +1781,13 @@ static void navigation_page_relocate_runtime_storage(
                                   &session->page.images);
         script_runtime_relocate_messaging_opaque(session->page.runtime,
                                                  session);
-        /* The retirement observer also retains the session address. */
+        /* The retirement observer also retains the session address. It
+           was bound while the page had a layout reuse cache; one dropped
+           since (under memory pressure) leaves the observer bound to the
+           freed candidate, which binding (it requires the cache) would not
+           repair. */
+        script_runtime_relocate_node_retirement_opaque(session->page.runtime,
+                                                       session);
         navigation_bind_node_retirement(session);
     }
     for (size_t i = 0; i < session->page.frame_count; i++) {
@@ -2013,6 +2031,12 @@ bool navigation_load_metrics(const NavigationLoad *load,
     metrics->progress_units = metrics->body_bytes
         + metrics->stream.downloaded_bytes + metrics->finalize_slices
         + metrics->finalize_work_units;
+    /* A blocking sheet deliberately pauses HTML delivery while its CSS is
+       consumed in slices. Count actual source advancement, not preparation
+       polls, so slow parsing progresses without keeping a stuck fetch alive. */
+    if (load->document_stream != NULL)
+        metrics->progress_units += stylesheet_sliced_parse_progress(
+            load->document_stream->style_prepare.deferral.parse);
     if (load->candidate_session != NULL
         && load->candidate_session->page.runtime != NULL) {
         ScriptRuntimeTelemetry telemetry;

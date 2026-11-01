@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "tilefinch/fetch.h"
+#include "tilefinch/media_failure_message.h"
 #include "tilefinch/platform.h"
 #include "tilefinch/user_agent.h"
 #include "tilefinch_compiler.h"
@@ -84,6 +85,8 @@ struct MediaHttpRange {
        process worker. Host replay and substituted transports retain their
        existing deterministic paths. */
     bool use_background_transport;
+    /* A page range's own scheduler executes each hop on the worker. */
+    bool scheduler_worker_hops;
     bool aggressive_readahead;
     /*
      * The window being fetched. Its bytes live in the scheduler's own bounded
@@ -258,6 +261,78 @@ bool media_http_build_range_header(
     return written >= 0 && (size_t) written < output_size;
 }
 
+uint64_t media_http_probe_enqueue_background(
+    Budget *budget, const char *url, const FetchRequest *request,
+    long timeout_ms, FetchScheduler **scheduler)
+{
+    if (scheduler == NULL) return 0;
+    *scheduler = fetch_scheduler_create(
+        budget, 1u, MEDIA_HTTP_PROBE_SNIFF_BYTES);
+    uint64_t id = *scheduler != NULL
+            && fetch_scheduler_enable_background_transport(*scheduler, true)
+        ? fetch_scheduler_enqueue(*scheduler, url, request,
+                                  MEDIA_HTTP_PROBE_SNIFF_BYTES, timeout_ms)
+        : 0;
+    if (id == 0) {
+        fetch_scheduler_destroy(*scheduler);
+        *scheduler = NULL;
+    }
+    return id;
+}
+
+bool media_http_build_probe_range_header(char *output, size_t output_size)
+{
+    return media_http_build_range_header(
+        0, MEDIA_HTTP_PROBE_RANGE_BYTES - 1u, output, output_size);
+}
+
+MediaHttpProbeRoute media_http_probe_route(
+    BrowserSession *session, const TilefinchRequestContext *context,
+    bool hls_allowed, const FetchResult *result, bool fetched,
+    uint64_t *complete_length)
+{
+    if (complete_length != NULL) *complete_length = 0;
+    if (context == NULL || result == NULL || complete_length == NULL
+        || !fetched) return MEDIA_HTTP_PROBE_REFUSED;
+    MediaResponseKind kind = media_response_kind(
+        result->status_code, result->content_type,
+        (const unsigned char *) result->data, result->length);
+    if (kind == MEDIA_RESPONSE_UNAVAILABLE)
+        return MEDIA_HTTP_PROBE_UNAVAILABLE;
+    MediaHttpProbeRoute route = MEDIA_HTTP_PROBE_REFUSED;
+    char content_range[128];
+    TilefinchResourceGrant grant;
+    TilefinchResourceDeniedReason denied;
+    if (kind == MEDIA_RESPONSE_HLS && hls_allowed) {
+        route = MEDIA_HTTP_PROBE_HLS;
+    } else if (result->status_code == 206 && result->length != 0u
+        && fetch_response_header_value(
+               result, "content-range", content_range,
+               sizeof(content_range))
+        && media_http_parse_content_range(
+               content_range, 0, MEDIA_HTTP_PROBE_RANGE_BYTES - 1u,
+               result->length, complete_length)
+        && fetch_resource_grant_create(
+               result, context,
+               context->mode == TILEFINCH_REQUEST_MODE_CORS,
+               true, false, &grant, &denied)) {
+        route = MEDIA_HTTP_PROBE_RANGE;
+    }
+    if (route == MEDIA_HTTP_PROBE_REFUSED) {
+        *complete_length = 0;
+        return route;
+    }
+    TilefinchRequestContext cookie_context = *context;
+    for (size_t at = 0; session != NULL && at < result->set_cookie_count;
+         at++) {
+        cookie_context.target_url = fetch_set_cookie_url(
+            result, at, result->effective_url);
+        (void) browser_session_cookie_set_http_context(
+            session, &cookie_context, result->set_cookies[at]);
+    }
+    return route;
+}
+
 /* One request shape for both the blocking and the issue/poll paths, so a
    header, a timeout or the redirect validator can only be set in one place. */
 static bool range_prepare_request(
@@ -323,7 +398,13 @@ static bool range_prepare_request(
         range->window_tracker.reconnects != 0u;
     request->tls12_session_resumption = range->tls12_session_resumption;
     request->redirect_url_validator = range->url_validator;
-    request->redirect_same_origin_only = true;
+    /* A page's media URL commonly answers with a redirect to a CDN on
+       another origin. A prepared page request carries the page's own
+       authority (CSP, content blocker, cookie and referrer policy, mixed
+       content, PNA), which the scheduler applies again to every hop, so it
+       may cross origins exactly as any other page subresource does. Native
+       provider ranges have no page authority and keep the fixed origin. */
+    request->redirect_same_origin_only = authorized == NULL;
     return true;
 }
 
@@ -403,6 +484,24 @@ static bool range_admit_response(
  * straight-line fill in range_fill_window() below and never answers
  * WOULD_BLOCK.
  */
+#if !defined(__PSP__)
+static int range_forced_background_available = -1;
+
+void media_http_test_force_background_available(int available)
+{
+    range_forced_background_available = available < 0 ? -1 : available != 0;
+}
+#endif
+
+static bool range_background_available(void)
+{
+#if !defined(__PSP__)
+    if (range_forced_background_available >= 0)
+        return range_forced_background_available != 0;
+#endif
+    return fetch_background_transport_available();
+}
+
 static bool range_uses_scheduler(const MediaHttpRange *range)
 {
     return range->transport == NULL && !range->use_background_transport;
@@ -427,7 +526,24 @@ static bool range_scheduler_ready(MediaHttpRange *range)
        fill so a session that never opens a video pays nothing. */
     range->scheduler = fetch_scheduler_create(
         range->budget, 1u, range->cache_capacity);
-    return range->scheduler != NULL;
+    if (range->scheduler == NULL) return false;
+    /* A page range on the PSP: the hop policy stays on the browser thread
+       and each hop's DNS/TLS/body runs on the worker, exactly as the page
+       probe does. Refuse rather than fall back to browser-thread curl when
+       the worker cannot take this scheduler (its handoff buffer is
+       budget-owned); the window fails and is retried like any other. The
+       host (no worker) keeps the plain scheduler. */
+    if (range->scheduler_worker_hops
+        && fetch_background_transport_available()
+        && (!fetch_scheduler_enable_background_transport(
+                range->scheduler, true)
+            || !fetch_scheduler_set_background_media_hops(
+                   range->scheduler, range->stream_publication_bytes))) {
+        fetch_scheduler_destroy(range->scheduler);
+        range->scheduler = NULL;
+        return false;
+    }
+    return true;
 }
 
 static void range_fill_abandon(MediaHttpRange *range, const char *reason)
@@ -781,7 +897,12 @@ static RangeFillIssueStatus range_fill_issue(
         .opaque = range,
         .chunk_bytes = range->stream_publication_bytes
     };
-    bool stream_shape_supported = !stream
+    /* The provider contract: a window the scheduler accepts on host must
+       also be representable by the device worker's own stream path. A page
+       range never uses that path (its scheduler checks each hop's shape
+       itself), so it is not held to it; its prepared page context alone
+       would refuse every streamed successor. */
+    bool stream_shape_supported = !stream || range->prepared_request != NULL
         || fetch_background_transport_stream_shape_supported(
                range->range_url, &request, range->cache_capacity,
                range->timeout_ms, false);
@@ -825,13 +946,18 @@ static RangeFillIssueStatus range_fill_issue(
             return RANGE_FILL_DEFERRED;
         }
         range->fill_admission_deferred = false;
+        const char *reason = !stream_shape_supported
+            ? media_http_background_refusal_reason(
+                  FETCH_BACKGROUND_ENQUEUE_UNSUPPORTED)
+            : range_uses_background(range)
+            ? media_http_background_refusal_reason(background_status)
+            : fetch_scheduler_last_error(range->scheduler);
         snprintf(range->last_error, sizeof(range->last_error),
                  "range %llu-%llu was not admitted: %.140s",
                  (unsigned long long) aligned,
                  (unsigned long long) (aligned + wanted - 1u),
-                 range_uses_background(range)
-                     ? "background transport queue full or unavailable"
-                     : fetch_scheduler_last_error(range->scheduler));
+                 reason == NULL || reason[0] == '\0'
+                     ? "scheduler refused the request" : reason);
         return RANGE_FILL_FAILED;
     }
     range->fill_admission_deferred = false;
@@ -2043,8 +2169,12 @@ MediaHttpRange *media_http_range_create(
     range->cancel = options == NULL ? NULL : options->cancel;
     range->cancel_opaque = options == NULL
         ? NULL : options->cancel_opaque;
-    range->use_background_transport = range->transport == NULL
-        && fetch_background_transport_available();
+    MediaHttpRangeRoute route = media_http_range_route_select(
+        range->transport != NULL, range->prepared_request != NULL,
+        range_background_available());
+    range->use_background_transport = route == MEDIA_HTTP_RANGE_ROUTE_WORKER;
+    range->scheduler_worker_hops =
+        route == MEDIA_HTTP_RANGE_ROUTE_PAGE_SCHEDULER_WORKER_HOPS;
     range->stats.connection_id = -1;
     range->stats.retained_bytes =
         sizeof(*range) + url_length + range_url_capacity
@@ -2276,6 +2406,59 @@ void media_http_range_clear_wait_budget(MediaHttpRange *range)
     if (range == NULL) return;
     range->wait_budget_armed = false;
     range->wait_deadline_us = 0;
+}
+
+MediaHttpRangeRoute media_http_range_route_select(
+    bool substituted_transport, bool page_authority, bool worker_available)
+{
+    if (substituted_transport) return MEDIA_HTTP_RANGE_ROUTE_TRANSPORT;
+    if (!worker_available) return MEDIA_HTTP_RANGE_ROUTE_SCHEDULER;
+    return page_authority
+        ? MEDIA_HTTP_RANGE_ROUTE_PAGE_SCHEDULER_WORKER_HOPS
+        : MEDIA_HTTP_RANGE_ROUTE_WORKER;
+}
+
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+MediaHttpRangeRoute media_http_range_route(const MediaHttpRange *range)
+{
+    if (range == NULL || range->transport != NULL)
+        return MEDIA_HTTP_RANGE_ROUTE_TRANSPORT;
+    if (range->use_background_transport) return MEDIA_HTTP_RANGE_ROUTE_WORKER;
+    return range->scheduler_worker_hops
+        ? MEDIA_HTTP_RANGE_ROUTE_PAGE_SCHEDULER_WORKER_HOPS
+        : MEDIA_HTTP_RANGE_ROUTE_SCHEDULER;
+}
+
+const char *media_http_range_route_name(MediaHttpRangeRoute route)
+{
+    switch (route) {
+    case MEDIA_HTTP_RANGE_ROUTE_TRANSPORT: return "transport";
+    case MEDIA_HTTP_RANGE_ROUTE_SCHEDULER: return "scheduler";
+    case MEDIA_HTTP_RANGE_ROUTE_PAGE_SCHEDULER_WORKER_HOPS:
+        return "page-scheduler-worker-hops";
+    case MEDIA_HTTP_RANGE_ROUTE_WORKER: return "background-worker";
+    }
+    return "unknown";
+}
+#endif
+
+const char *media_http_background_refusal_reason(
+    FetchBackgroundEnqueueStatus status)
+{
+    switch (status) {
+    case FETCH_BACKGROUND_ENQUEUE_UNSUPPORTED:
+        return "transport worker refused this request shape";
+    case FETCH_BACKGROUND_ENQUEUE_SATURATED:
+        return "transport worker queue full";
+    case FETCH_BACKGROUND_ENQUEUE_ADMISSION_CLOSED:
+        return "transport worker admission closed";
+    case FETCH_BACKGROUND_ENQUEUE_MEMORY:
+        return "transport worker buffers refused by the budget";
+    case FETCH_BACKGROUND_ENQUEUE_UNAVAILABLE:
+    case FETCH_BACKGROUND_ENQUEUE_ADMITTED:
+        break;
+    }
+    return "transport worker unavailable";
 }
 
 bool media_http_range_stats(const MediaHttpRange *range,

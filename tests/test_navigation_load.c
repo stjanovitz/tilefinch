@@ -2,6 +2,7 @@
 #include "tilefinch/fetch.h"
 #include "tilefinch/image_retarget.h"
 #include "tilefinch/layout.h"
+#include "tilefinch/media_discovery.h"
 #include "tilefinch/navigation.h"
 #include "tilefinch/platform.h"
 #include "tilefinch/render.h"
@@ -10,7 +11,9 @@
 #include "tilefinch/user_agent.h"
 #include "../src/image_decode_internal.h"
 #include "../src/image_svg_decode_internal.h"
+#include "../src/js_runtime_internal.h"
 #include "../src/layout_internal.h"
+#include "../src/navigation_staging_policy.h"
 #include "../src/tilefinch_test_faults.h"
 #include "tilefinch_test_clocks.h"
 
@@ -1006,6 +1009,9 @@ static bool test_optional_image_layout_refusal_retains_page(void)
 typedef struct {
     NavigationSession *navigation;
     bool cancel_retry;
+    /* Refuse the static rebuild too: clamp the ceiling once the realm is
+       retired, so the page must be retired after all. */
+    bool refuse_static;
     bool retry_checkpoint;
     bool unsafe;
 } PressureRetryProbe;
@@ -1016,17 +1022,31 @@ static bool pressure_retry_checkpoint(void *context, const char *phase,
     (void) phase;
     (void) work;
     PressureRetryProbe *probe = context;
-    if (probe->navigation->performance.mutation_layout_pressure_retries != 0) {
+    NavigationSession *navigation = probe->navigation;
+    if (navigation->performance.mutation_layout_pressure_retries != 0) {
         probe->retry_checkpoint = true;
-        probe->unsafe |= probe->navigation->committed_layout_servable
-            || probe->navigation->page.layout.commands != NULL;
+        probe->unsafe |= navigation->committed_layout_servable
+            || navigation->page.layout.commands != NULL;
         if (probe->cancel_retry) return false;
     }
+    if (probe->refuse_static
+        && navigation->performance.mutation_layout_script_retirements != 0)
+        navigation->budget->limit = navigation->budget->current;
     return true;
 }
 
-static bool test_mutation_layout_pressure_case(bool recover, bool cancel_retry)
+typedef enum {
+    PRESSURE_RECOVERS,     /* the retry without the incumbent fits */
+    PRESSURE_STATIC,       /* only a static rebuild, scripts stopped, fits */
+    PRESSURE_RETIRES,      /* not even that fits: the page is retired */
+    PRESSURE_CANCELLED     /* the retry is cancelled */
+} PressureOutcome;
+
+static bool test_mutation_layout_pressure_case(PressureOutcome outcome)
 {
+    bool recover = outcome == PRESSURE_RECOVERS
+        || outcome == PRESSURE_CANCELLED;
+    bool cancel_retry = outcome == PRESSURE_CANCELLED;
     char html[32768];
     size_t length = (size_t) snprintf(html, sizeof(html),
         "<!doctype html><style>p{margin:0;height:24px}"
@@ -1072,7 +1092,8 @@ static bool test_mutation_layout_pressure_case(bool recover, bool cancel_retry)
         navigation.page.layout_reuse = NULL;
         budget.limit = budget.current + (recover ? 320 * 1024u : 0);
     }
-    PressureRetryProbe probe = { &navigation, cancel_retry, false, false };
+    PressureRetryProbe probe = { &navigation, cancel_retry,
+                                 outcome == PRESSURE_RETIRES, false, false };
     TilefinchPlatformServices services = {
         .context = &probe, .cooperate = pressure_retry_checkpoint };
     tilefinch_platform_set_services(&services);
@@ -1080,25 +1101,63 @@ static bool test_mutation_layout_pressure_case(bool recover, bool cancel_retry)
     tilefinch_platform_set_services(NULL);
     const LayoutNodeBox *box = rebuilt
         ? layout_box_for_node(&navigation.page.layout, scroll) : NULL;
-    bool ok = recover && !cancel_retry
-        ? rebuilt && navigation.page.loaded && box != NULL
-        && box->scroll_y == 20
-        && navigation.performance.mutation_layout_pressure_retries == 1
-        && navigation.performance.mutation_layout_pressure_recoveries == 1
-        && navigation.relayout_damage_valid
-        : !rebuilt && !navigation.page.loaded && navigation.page.runtime == NULL
+    const NavigationPerformance *counters = &navigation.performance;
+    bool ok = false;
+    switch (outcome) {
+    case PRESSURE_RECOVERS:
+        ok = rebuilt && navigation.page.loaded && box != NULL
+            && box->scroll_y == 20
+            && navigation.page.runtime != NULL
+            && counters->mutation_layout_pressure_retries == 1
+            && counters->mutation_layout_pressure_recoveries == 1
+            && counters->mutation_layout_script_retirements == 0
+            && navigation.relayout_damage_valid;
+        break;
+    case PRESSURE_STATIC:
+        /* The page stays, readable and laid out from the mutated DOM, with
+           its scripts stopped at their memory limit. */
+        ok = rebuilt && navigation.page.loaded
+            && navigation.page.runtime == NULL
+            && navigation.page.layout.commands != NULL
+            && navigation.page.layout.count != 0
+            && navigation.page.script_memory_limited
+            && strcmp(navigation.page.script_result.summary,
+                      "JavaScript stopped at its memory limit") == 0
+            && navigation.last_error[0] == '\0'
+            && counters->mutation_layout_pressure_retries == 1
+            && counters->mutation_layout_pressure_recoveries == 0
+            && counters->mutation_layout_script_retirements == 1
+            && navigation.relayout_damage_valid
+            && navigation_advance_runtime(&navigation, 16, 4);
+        break;
+    case PRESSURE_RETIRES:
+    case PRESSURE_CANCELLED:
+        ok = !rebuilt && !navigation.page.loaded
+            && navigation.page.runtime == NULL
             && navigation.page.document.html == NULL
             && navigation.page.layout.commands == NULL
-            && navigation.performance.mutation_layout_pressure_retries == 1
-            && navigation.performance.mutation_layout_pressure_recoveries == 0;
+            && counters->mutation_layout_pressure_retries == 1
+            && counters->mutation_layout_pressure_recoveries == 0
+            && counters->mutation_layout_script_retirements
+                   == (outcome == PRESSURE_RETIRES ? 1u : 0u)
+            /* Memory is named; a cancelled build is not a memory failure. */
+            && (strcmp(navigation.last_error,
+                       NAVIGATION_PAGE_OUT_OF_MEMORY_ERROR) == 0)
+                   == (outcome == PRESSURE_RETIRES);
+        break;
+    }
     ok = ok && !probe.unsafe && (!cancel_retry
         || (probe.retry_checkpoint && navigation.layout_build_cancelled));
     if (!ok) fprintf(stderr,
-        "replacement-pressure loaded=%d mutated=%d rebuilt=%d retries=%zu "
-        "recoveries=%zu scroll=%d current=%zu limit=%zu\n", loaded, mutated,
-        rebuilt, navigation.performance.mutation_layout_pressure_retries,
-        navigation.performance.mutation_layout_pressure_recoveries,
-        box == NULL ? -1 : box->scroll_y, budget.current, budget.limit);
+        "replacement-pressure outcome=%d loaded=%d mutated=%d rebuilt=%d "
+        "retries=%zu recoveries=%zu retirements=%zu runtime=%d scroll=%d "
+        "current=%zu limit=%zu error=\"%s\"\n", (int) outcome, loaded,
+        mutated, rebuilt, counters->mutation_layout_pressure_retries,
+        counters->mutation_layout_pressure_recoveries,
+        counters->mutation_layout_script_retirements,
+        navigation.page.runtime != NULL,
+        box == NULL ? -1 : box->scroll_y, budget.current, budget.limit,
+        navigation.last_error);
     budget.limit = original_limit;
     if (installed) navigation_destroy(&navigation);
     bool clean = budget.current == 0 && budget_categories_reconcile(&budget);
@@ -1108,9 +1167,92 @@ static bool test_mutation_layout_pressure_case(bool recover, bool cancel_retry)
 
 static bool test_mutation_layout_pressure_releases_invalid_incumbent(void)
 {
-    return test_mutation_layout_pressure_case(true, false)
-        && test_mutation_layout_pressure_case(false, false)
-        && test_mutation_layout_pressure_case(true, true);
+    return test_mutation_layout_pressure_case(PRESSURE_RECOVERS)
+        && test_mutation_layout_pressure_case(PRESSURE_STATIC)
+        && test_mutation_layout_pressure_case(PRESSURE_RETIRES)
+        && test_mutation_layout_pressure_case(PRESSURE_CANCELLED);
+}
+
+/* A full rebuild (the sheet itself is rebuilt) refused for memory before
+   any layout exists: the old display list is already gone. A realm holding
+   most of the page's memory is stopped and the rebuild restarts once as a
+   static page; when even that is refused the page is retired, naming
+   memory as the reason. No synthetic fault is used. */
+static bool test_full_rebuild_style_pressure_case(bool static_fits)
+{
+    static const char html[] =
+        "<!doctype html><style>p{margin:0;color:#123}</style><body>"
+        "<h1>Survivor heading</h1><p id=target>Static text survives.</p>"
+        "<script>globalThis.hold=[];for(let i=0;i<64;i++)"
+        "globalThis.hold.push(new Array(4096).fill(i))</script></body>";
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 4);
+    if (ready) {
+        navigation_enable_scripts(&navigation, 4 * MIB, 1000);
+        navigation_enable_document_scripts(&navigation, 4, 64 * 1024,
+                                            32 * 1024, 1000);
+        navigation.relayout_preview_threshold_us = UINT64_MAX;
+    }
+    bool loaded = ready && navigation_commit_html(&navigation,
+        navigation_begin(&navigation), "https://full-pressure.test/page",
+        html, sizeof(html) - 1u, 480, NULL, NULL, true);
+    size_t heap = loaded && navigation.page.runtime != NULL
+        ? script_runtime_heap_used(navigation.page.runtime) : 0;
+    ScriptResult result = {0};
+    bool mutated = heap >= 1 * MIB && script_runtime_evaluate_diagnostic(
+        navigation.page.runtime,
+        "document.getElementById('target').textContent='Mutated text'",
+        "<full-pressure>", &result);
+    size_t original_limit = budget.limit;
+    size_t failures_before = budget.failure_count;
+    if (mutated) {
+        navigation.style_rebuild_required = true;
+        layout_reuse_cache_destroy(navigation.page.layout_reuse);
+        navigation.page.layout_reuse = NULL;
+        /* Below what the page holds without its old layout and sheet, but
+           (static_fits) above it once the realm's heap is returned. */
+        budget.limit = static_fits ? budget.current - 256u * 1024u : 1u;
+    }
+    bool rebuilt = mutated && navigation_relayout(&navigation);
+    bool refused = budget.failure_count > failures_before
+        && budget.injected_failure_count == 0;
+    bool ok = static_fits
+        ? rebuilt && refused && navigation.page.loaded
+            && navigation.page.runtime == NULL
+            && navigation.page.script_memory_limited
+            && strcmp(navigation.page.script_result.summary,
+                      "JavaScript stopped at its memory limit") == 0
+            && navigation.page.layout.count != 0
+            && !navigation.style_rebuild_required
+            && navigation.performance.full_relayouts != 0
+            && navigation.last_error[0] == '\0'
+        : mutated && !rebuilt && refused && !navigation.page.loaded
+            && navigation.page.runtime == NULL
+            && navigation.page.layout.commands == NULL
+            && strcmp(navigation.last_error,
+                      NAVIGATION_PAGE_OUT_OF_MEMORY_ERROR) == 0;
+    if (!ok) fprintf(stderr,
+        "full-rebuild-pressure static=%d loaded=%d heap=%zu mutated=%d "
+        "rebuilt=%d refused=%d page=%d runtime=%d limited=%d commands=%zu "
+        "current=%zu limit=%zu error=\"%s\"\n", static_fits, loaded, heap,
+        mutated, rebuilt, refused, navigation.page.loaded,
+        navigation.page.runtime != NULL, navigation.page.script_memory_limited,
+        navigation.page.layout.count, budget.current, budget.limit,
+        navigation.last_error);
+    budget.limit = original_limit;
+    if (installed) navigation_destroy(&navigation);
+    bool clean = budget.current == 0 && budget_categories_reconcile(&budget);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+static bool test_full_rebuild_style_pressure_stops_scripts(void)
+{
+    return test_full_rebuild_style_pressure_case(true)
+        && test_full_rebuild_style_pressure_case(false);
 }
 
 typedef struct {
@@ -3961,6 +4103,109 @@ static bool test_parser_script_stage_clock(void)
     return ok && clean;
 }
 
+/* A page opened only to play its video (the embed hop) gets twice the
+   parser-stage JavaScript allowance: a player bundle that needs about the
+   ordinary limit on a PSP must not lose all its JavaScript by a few
+   hundred milliseconds. Each of the fixture's two scripts is attributed
+   300 ms against a 250 ms test limit: an ordinary load stops before the
+   second, the extended one runs it. The flag lasts one load. */
+static bool parser_script_stage_extended_run(bool extended,
+                                             bool *second_ran,
+                                             uint64_t *limit_us)
+{
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    BrowserSession browser = {0};
+    NavigationSession navigation = {0};
+    bool browser_ready = installed
+        && browser_session_init(&browser, &budget, 64 * 1024);
+    bool ready = browser_ready && navigation_init(&navigation, &budget, 2)
+        && parser_script_stage_clock_replay_begin();
+    if (ready) {
+        navigation_attach_browser_session(&navigation, &browser);
+        navigation_enable_scripts(&navigation, 4 * MIB, 1500);
+        navigation_enable_document_scripts(
+            &navigation, 8, 64 * 1024u, 64 * 1024u, 1500);
+        navigation.parser_script_stage_extended_next = extended;
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    NavigationLoad *load = ready ? navigation_load_begin_url(
+        &navigation, generation,
+        "https://script-stage-clock.test/document", 64 * 1024, 1500, 480,
+        NULL, NULL, true) : NULL;
+    uint64_t used = 0;
+    *limit_us = 0;
+    bool consumed = load != NULL
+        && !navigation.parser_script_stage_extended_next
+        && navigation_load_parser_script_time(load, &used, limit_us);
+    /* Keep the accounting deterministic, but leave enough real execution
+       time for the fixture's busy loop under sanitizers. A 25 ms deadline
+       could interrupt the first script before the injected time is charged. */
+    navigation_test_set_parser_script_stage_time_limit_us(250000u);
+    navigation_test_set_parser_script_stage_elapsed_us(300000u);
+    NavigationLoadQuota quota = {
+        .fetch = {
+            .maximum_body_callbacks = 1,
+            .maximum_body_bytes = 64 * 1024,
+            .maximum_time_us = 100000
+        },
+        .maximum_parser_body_bytes = 64 * 1024,
+        .maximum_parser_time_us = 100000
+    };
+    for (size_t i = 0; load != NULL && i < 256; i++) {
+        if (navigation_load_status(load) != NAVIGATION_LOAD_PENDING) break;
+        (void) navigation_load_pump(load, &quota);
+    }
+    bool loaded = load != NULL && finish_bounded(load, &quota);
+    navigation_test_set_parser_script_stage_time_limit_us(0u);
+    navigation_test_set_parser_script_stage_elapsed_us(0u);
+    lxb_dom_node_t *body = loaded
+        ? document_body_node(&navigation.page.document) : NULL;
+    size_t first_length = 0, second_length = 0;
+    const char *first = body == NULL ? NULL : document_attribute(
+        body, "data-first", &first_length);
+    const char *second = body == NULL ? NULL : document_attribute(
+        body, "data-second", &second_length);
+    *second_ran = second != NULL && second_length == 3u;
+    bool ok = consumed && loaded && first != NULL && first_length == 3u;
+    if (!ok)
+        fprintf(stderr, "stage extended=%d consumed=%d loaded=%d first=%d\n",
+                extended ? 1 : 0, consumed ? 1 : 0, loaded ? 1 : 0,
+                first != NULL ? 1 : 0);
+    if (load != NULL) navigation_load_destroy(load);
+    /* The next load is ordinary again. */
+    ok = ok && !navigation.parser_script_stage_extended_next;
+    if (ready) fetch_trace_end();
+    if (installed) navigation_destroy(&navigation);
+    if (browser_ready) browser_session_destroy(&browser);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+static bool test_parser_script_stage_extended_for_player_page(void)
+{
+    bool ordinary_second = true, extended_second = false;
+    uint64_t ordinary_limit = 0, extended_limit = 0;
+    bool ok = parser_script_stage_extended_run(
+                  false, &ordinary_second, &ordinary_limit)
+        && parser_script_stage_extended_run(
+               true, &extended_second, &extended_limit);
+    ok = ok && !ordinary_second && extended_second
+        && ordinary_limit == UINT64_C(20000000)
+        && extended_limit == UINT64_C(40000000);
+    if (!ok)
+        fprintf(stderr, "stage extended ordinary=%d/%llu extended=%d/%llu\n",
+                ordinary_second ? 1 : 0,
+                (unsigned long long) ordinary_limit,
+                extended_second ? 1 : 0,
+                (unsigned long long) extended_limit);
+    return ok;
+}
+
 static bool test_body_attribute_is(lxb_dom_node_t *body, const char *name,
                                    const char *expected)
 {
@@ -4660,6 +4905,174 @@ static uint32_t layout_text_color(const LayoutDocument *layout,
     return UINT32_MAX;
 }
 
+/* A parser-blocking script after a large external stylesheet. Its sheet
+   is prepared across parser pumps, each bounded by the parser's time quota,
+   instead of inside the one pump that feeds the script's end tag; the
+   sheet is parsed in slices. The script and the committed page must see
+   exactly the cascade the in-checkpoint build gives (the A/B switch). */
+typedef struct {
+    bool ok;
+    char summary[128];
+    uint32_t tail_color;
+    size_t rules;
+    size_t prepared;
+    size_t abandoned;
+    size_t prepare_pumps;
+    size_t style_progress_advances;
+    size_t pumps;
+} SlicedStylesheetRun;
+
+static SlicedStylesheetRun run_sliced_stylesheet_fixture(
+    bool prepare, const char *fixture, const char *url, const char *text)
+{
+    SlicedStylesheetRun run = {0};
+    if (!prepare) (void) setenv("TILEFINCH_DISABLE_STYLESHEET_PREPARE", "1", 1);
+    Budget budget;
+    budget_init(&budget, 32 * MIB);
+    bool lexbor_installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    char error[256] = {0};
+    bool ready = lexbor_installed
+        && navigation_init(&navigation, &budget, 4)
+        && fetch_trace_replay_begin(
+               fixture, error, sizeof(error));
+    if (ready) {
+        navigation_enable_scripts(&navigation, 3 * MIB, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 4, 32 * 1024, 16 * 1024, 1000);
+        navigation_enable_external_resources(
+            &navigation, 2, 256 * 1024, 128 * 1024,
+            2, 32 * 1024, 16 * 1024, 64 * 1024, 1000);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    NavigationLoad *load = ready ? navigation_load_begin_url(
+        &navigation, generation, url, 4096, 1000, 480, NULL, NULL, true)
+        : NULL;
+    /* A one-microsecond parser quota: every preparation pump takes one
+       step, and a sliced parse one rule. */
+    NavigationLoadQuota quota = {
+        .fetch = {
+            .maximum_body_callbacks = 1,
+            .maximum_body_bytes = 512,
+            .maximum_time_us = 1
+        },
+        .maximum_parser_body_bytes = 512,
+        .maximum_parser_time_us = 1
+    };
+    for (size_t i = 0; load != NULL && i < 100000; i++) {
+        if (navigation_load_status(load) != NAVIGATION_LOAD_PENDING) break;
+        NavigationLoadMetrics before = {0}, after = {0};
+        (void) navigation_load_metrics(load, &before);
+        size_t prepared_before =
+            navigation.performance.blocking_stylesheet_prepare_pumps;
+        (void) navigation_load_pump(load, &quota);
+        (void) navigation_load_metrics(load, &after);
+        if (navigation.performance.blocking_stylesheet_prepare_pumps
+                != prepared_before
+            && after.body_bytes == before.body_bytes
+            && after.stream.downloaded_bytes == before.stream.downloaded_bytes
+            && after.progress_units != before.progress_units)
+            run.style_progress_advances++;
+        run.pumps++;
+    }
+    bool loaded = load != NULL && finish_bounded(load, &quota);
+    run.ok = loaded && navigation.page.loaded;
+    snprintf(run.summary, sizeof(run.summary), "%s",
+             navigation.page.script_result.summary);
+    run.tail_color = loaded
+        ? layout_text_color(&navigation.page.layout, text)
+        : UINT32_MAX;
+    run.rules = navigation.page.stylesheet.count;
+    run.prepared = navigation.performance.blocking_stylesheet_prepared;
+    run.abandoned =
+        navigation.performance.blocking_stylesheet_prepare_abandoned;
+    run.prepare_pumps =
+        navigation.performance.blocking_stylesheet_prepare_pumps;
+    navigation_load_destroy(load);
+    if (ready) fetch_trace_end();
+    if (lexbor_installed) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (lexbor_installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    run.ok = run.ok && clean;
+    (void) unsetenv("TILEFINCH_DISABLE_STYLESHEET_PREPARE");
+    return run;
+}
+
+static SlicedStylesheetRun run_sliced_stylesheet_load(bool prepare)
+{
+    return run_sliced_stylesheet_fixture(
+        prepare, TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-sliced-stylesheet",
+        "https://sliced-sheet.test/document", "tail");
+}
+
+/* Two external sheets set the same property on the same element; the
+   first is large enough to be parsed in slices. The second must still win
+   (document order), for the parser-blocking script after both and for the
+   committed page, exactly as with the in-checkpoint build. */
+static bool test_sliced_stylesheet_keeps_document_order(void)
+{
+    static const char fixture[] =
+        TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-sliced-stylesheet-order";
+    static const char url[] = "https://sliced-order.test/document";
+    SlicedStylesheetRun sliced =
+        run_sliced_stylesheet_fixture(true, fixture, url, "probe");
+    SlicedStylesheetRun whole =
+        run_sliced_stylesheet_fixture(false, fixture, url, "probe");
+    bool ok = sliced.ok && whole.ok
+        && strcmp(sliced.summary, "probe:rgb(34, 34, 34)") == 0
+        && strcmp(whole.summary, sliced.summary) == 0
+        && sliced.tail_color == 0x222222u
+        && whole.tail_color == 0x222222u
+        && sliced.rules == whole.rules
+        && sliced.prepared >= 1 && sliced.abandoned == 0
+        && sliced.prepare_pumps > 100;
+    if (!ok) {
+        fprintf(stderr,
+                "sliced-order ok=%d/%d summary=\"%s\"/\"%s\" "
+                "color=%06x/%06x rules=%zu/%zu prepared=%zu abandoned=%zu "
+                "prepare-pumps=%zu\n",
+                sliced.ok, whole.ok, sliced.summary, whole.summary,
+                (unsigned) sliced.tail_color, (unsigned) whole.tail_color,
+                sliced.rules, whole.rules, sliced.prepared, sliced.abandoned,
+                sliced.prepare_pumps);
+    }
+    return ok;
+}
+
+static bool test_parser_blocking_stylesheet_prepared_in_slices(void)
+{
+    SlicedStylesheetRun sliced = run_sliced_stylesheet_load(true);
+    SlicedStylesheetRun whole = run_sliced_stylesheet_load(false);
+    bool ok = sliced.ok && whole.ok
+        && strcmp(sliced.summary, whole.summary) == 0
+        && strcmp(sliced.summary,
+                  "root:rgb(64, 80, 96) tail:rgb(16, 32, 48)") == 0
+        && sliced.tail_color == whole.tail_color
+        && sliced.tail_color == 0x102030u
+        && sliced.rules == whole.rules
+        && sliced.prepared >= 1 && sliced.abandoned == 0
+        /* The 53 KB sheet took many bounded pumps, not one. */
+        && sliced.prepare_pumps > 100
+        /* Consumed CSS must keep the stall watchdog alive even while the
+           HTML stream is deliberately paused at its style checkpoint. */
+        && sliced.style_progress_advances > 100
+        && whole.prepared == 0 && whole.prepare_pumps == 0;
+    if (!ok) {
+        fprintf(stderr,
+                "sliced-stylesheet ok=%d/%d summary=\"%s\"/\"%s\" "
+                "tail=%06x/%06x rules=%zu/%zu prepared=%zu/%zu "
+                "abandoned=%zu prepare-pumps=%zu/%zu pumps=%zu/%zu\n",
+                sliced.ok, whole.ok, sliced.summary, whole.summary,
+                (unsigned) sliced.tail_color, (unsigned) whole.tail_color,
+                sliced.rules, whole.rules, sliced.prepared, whole.prepared,
+                sliced.abandoned, sliced.prepare_pumps, whole.prepare_pumps,
+                sliced.pumps, whole.pumps);
+    }
+    return ok;
+}
+
 /* A parser-blocking script before the first stylesheet compiles the
    streaming sheet against the legacy layout width; a <meta name=viewport>
    parsed later moves the viewport to the device width.  The committed
@@ -5191,6 +5604,83 @@ static bool test_parser_scripts_see_requested_fragment(void)
     if (installed) ok = budget_uninstall_lexbor(&budget) && ok;
     if (directory[0]) remove_referrer_navigation_replay(directory);
     return ok;
+}
+
+/* The exhausted-realm check (page_lifecycle.inc) believes an error's text
+   only after a heap rejection; the text it accepts is QuickJS's
+   out-of-memory error, or the null exception QuickJS leaves when it cannot
+   allocate even that error. Other text, including
+   text that merely contains "null", is an ordinary author failure. */
+static bool test_null_exception_reads_as_out_of_memory(void)
+{
+    return script_error_reports_out_of_memory("InternalError: out of memory")
+        && script_error_reports_out_of_memory("null")
+        && !script_error_reports_out_of_memory("")
+        && !script_error_reports_out_of_memory(NULL)
+        && !script_error_reports_out_of_memory("nullish")
+        && !script_error_reports_out_of_memory(
+               "TypeError: cannot read property 'x' of null")
+        && !script_error_reports_out_of_memory("TypeError: Failed to fetch");
+}
+
+/* After a promoted candidate session is moved, the realm's node-retirement
+   observer must point at the new session: relocation updates an observer
+   that is bound and leaves an unbound one unbound (load_state.inc; a stale
+   observer read the freed candidate when the layout reuse cache it was
+   bound beside had been dropped under memory pressure). */
+static void count_retirement(void *opaque, const lxb_dom_node_t *root)
+{
+    (void) root;
+    (*(int *) opaque)++;
+}
+
+static bool test_node_retirement_observer_relocates(void)
+{
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 4);
+    if (ready) {
+        navigation_enable_scripts(&navigation, 4 * MIB, 1000);
+        navigation_enable_document_scripts(&navigation, 4, 64 * 1024,
+                                            32 * 1024, 1000);
+    }
+    static const char html[] = "<body><div id=gone><p>a</p></div>"
+        "<script>globalThis.ready=1</script></body>";
+    bool loaded = ready && navigation_commit_html(&navigation,
+        navigation_begin(&navigation), "https://retire.test/", html,
+        sizeof(html) - 1u, 480, NULL, NULL, true);
+    ScriptRuntime *runtime = loaded ? navigation.page.runtime : NULL;
+    int stale = 0, moved = 0;
+    bool ok = runtime != NULL;
+    if (ok) {
+        /* unbound: relocation binds nothing */
+        script_runtime_set_node_retirement_callback(runtime, NULL, NULL);
+        script_runtime_relocate_node_retirement_opaque(runtime, &moved);
+        ok = runtime->bridge.node_retirement == NULL
+            && runtime->bridge.node_retirement_opaque == NULL;
+        script_runtime_set_node_retirement_callback(runtime, count_retirement,
+                                                    &stale);
+        script_runtime_relocate_node_retirement_opaque(runtime, &moved);
+        ScriptResult result = {0};
+        ok = ok && script_runtime_evaluate_diagnostic(runtime,
+            "document.getElementById('gone').remove()", "remove", &result);
+        for (unsigned tick = 0; ok && tick < 8 && moved == 0; tick++) {
+            ScriptResult advance = {0};
+            (void) script_runtime_evaluate_diagnostic(runtime,
+                "void 0", "tick", &advance);
+            (void) script_runtime_advance(runtime, 16, 4, &advance);
+        }
+        ok = ok && moved >= 1 && stale == 0;
+        if (!ok) fprintf(stderr, "retirement observer: moved=%d stale=%d\n",
+                         moved, stale);
+        script_runtime_set_node_retirement_callback(runtime, NULL, NULL);
+    }
+    if (installed) navigation_destroy(&navigation);
+    bool clean = budget.current == 0 && budget_categories_reconcile(&budget);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
 }
 
 static bool test_runtime_navigation_releases_large_incumbent(void)

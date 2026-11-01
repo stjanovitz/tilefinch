@@ -153,6 +153,10 @@ int main(void)
     CHECK(test_decisions_per_setting() == 0);
     CHECK(test_post_commit_failure_recheck() == 0);
     CHECK(test_recovery_choices() == 0);
+    CHECK(psp_basic_fallback_boot_page_examined(true, false, false)
+          && !psp_basic_fallback_boot_page_examined(false, false, false)
+          && !psp_basic_fallback_boot_page_examined(true, true, false)
+          && !psp_basic_fallback_boot_page_examined(true, false, true));
     puts("psp-basic-fallback-tests: ok");
     return EXIT_SUCCESS;
 }

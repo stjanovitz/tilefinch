@@ -26,8 +26,9 @@
 /* Runs `script` as the only classic script of a fresh document whose body
    starts with `body` and returns whether globalThis.pocSummary equalled
    `expected`. */
-static bool run_probe_after(const char *label, const char *body,
-                            const char *script, const char *expected)
+static bool run_probe_at(const char *label, const char *url,
+                         const char *body, const char *script,
+                         const char *expected)
 {
     static char page[64 * 1024];
     int written = snprintf(page, sizeof(page),
@@ -49,8 +50,7 @@ static bool run_probe_after(const char *label, const char *body,
     }
     ScriptResult result;
     bool ran = scripts_run_document_at(&document, &budget, 8u * MIB, 3000,
-                                       "https://conformance.test/start",
-                                       &result);
+                                       url, &result);
     bool ok = ran && result.success
         && strcmp(result.summary, expected) == 0;
     if (!ok) {
@@ -63,6 +63,13 @@ static bool run_probe_after(const char *label, const char *body,
         ok = false;
     }
     return ok;
+}
+
+static bool run_probe_after(const char *label, const char *body,
+                            const char *script, const char *expected)
+{
+    return run_probe_at(label, "https://conformance.test/start", body,
+                        script, expected);
 }
 
 static bool run_probe(const char *label, const char *script,
@@ -1152,6 +1159,115 @@ static const char text_decoder_probe[] =
     "globalThis.pocSummary=failures.length?'FAIL '+failures.join(' | ')"
     ":'TEXT-DECODER-OK';";
 
+/* An absolute URL ignores its base, so an opaque base (blob:, data:,
+   about:blank) cannot reject it; relative input against one fails. */
+static const char url_opaque_base_probe[] =
+    "const failures=[],t=(name,f)=>{try{if(!f())failures.push(name)}"
+    "catch(e){failures.push(name+':'+e)}};"
+    "const throws=(i,b)=>{try{new URL(i,b)}catch(e){return e instanceof TypeError}"
+    "return false};"
+    "t('blob',()=>new URL('https://example.com/a.js',"
+    "'blob:https://example.com/uuid').href==='https://example.com/a.js');"
+    "t('data',()=>new URL('https://example.com/b?x#y','data:text/plain,hi')"
+    ".href==='https://example.com/b?x#y');"
+    "t('about',()=>new URL('http://example.com/c','about:blank').href"
+    "==='http://example.com/c');"
+    "t('blob relative',()=>throws('a.js','blob:https://example.com/uuid'));"
+    "t('blob rooted',()=>throws('/a.js','blob:https://example.com/uuid'));"
+    "t('about relative',()=>throws('a.js','about:blank'));"
+    "t('data relative',()=>throws('?q','data:text/plain,hi'));"
+    "t('invalid base',()=>throws('https://example.com/','nope'));"
+    "t('canParse',()=>URL.canParse('https://example.com/',"
+    "'blob:https://example.com/u')&&!URL.canParse('x','blob:https://example.com/u'));"
+    "t('relative',()=>new URL('../d','https://example.com/a/b/c').href"
+    "==='https://example.com/a/d');"
+    "t('hierarchical base',()=>new URL('a/../b?q','x:/').pathname==='/b');"
+    "globalThis.pocSummary=failures.length?'FAIL '+failures.join(' | ')"
+    ":'URL-OPAQUE-BASE-OK';";
+
+/* A document whose own URL is not a network URL (a fixture file path, as
+   psp-browser-lab --fixture runs) still resolves relative input against its
+   fallback base, through location.href and document.baseURI too, while an
+   opaque base passed by script rejects it. */
+static const char url_document_base_probe[] =
+    "const failures=[],t=(name,f)=>{try{if(!f())failures.push(name)}"
+    "catch(e){failures.push(name+':'+e)}};"
+    "t('implicit',()=>new URL('a/../b.js').pathname.endsWith('/b.js'));"
+    "t('location',()=>/^https?:/.test(location.href)"
+    "&&new URL('c.js',location.href).pathname.endsWith('/c.js'));"
+    "t('baseURI',()=>new URL('d.js',document.baseURI).pathname.endsWith('/d.js'));"
+    "t('explicit opaque',()=>{try{new URL('a.js','about:blank')}catch(e){"
+    "return e instanceof TypeError}return false});"
+    "t('absolute',()=>new URL('https://example.com/x','about:blank').href"
+    "==='https://example.com/x');"
+    "globalThis.pocSummary=failures.length?'FAIL '+failures.join(' | ')"
+    ":'URL-DOCUMENT-BASE-OK';";
+
+/* TextDecoder decodes UTF-16LE and UTF-16BE by every Encoding Standard
+   label, with BOM handling, fatal mode and streamed partial units. */
+static const char text_decoder_utf16_probe[] =
+    "const failures=[],t=(name,f)=>{try{if(!f())failures.push(name)}"
+    "catch(e){failures.push(name+':'+e)}};"
+    "const bytes=a=>new Uint8Array(a),"
+    "d=(l,a,o)=>new TextDecoder(l,o).decode(bytes(a)),"
+    "fatal=(l,a)=>{try{d(l,a,{fatal:true})}catch(e){return e instanceof TypeError}"
+    "return false},emoji='\\ud83d\\ude00';"
+    "t('le',()=>d('utf-16le',[0x41,0,0x3d,0xd8,0,0xde,0xe9,0])==='A'+emoji+'\\u00e9');"
+    "t('be',()=>d('utf-16be',[0,0x41,0xd8,0x3d,0xde,0,0x4e,0x2d])==='A'+emoji+'\\u4e2d');"
+    "t('le bom',()=>d('utf-16le',[0xff,0xfe,0x41,0])==='A');"
+    "t('be bom',()=>d('utf-16be',[0xfe,0xff,0,0x41])==='A');"
+    "t('ignoreBOM',()=>{const x=new TextDecoder('utf-16le',{ignoreBOM:true});"
+    "return x.ignoreBOM&&x.decode(bytes([0xff,0xfe,0x41,0]))==='\\ufeffA'});"
+    "t('other bom kept',()=>d('utf-16le',[0xfe,0xff,0x41,0])==='\\ufffeA');"
+    "t('bom per decode',()=>{const x=new TextDecoder('utf-16be');"
+    "return x.decode(bytes([0xfe,0xff,0,0x41]))==='A'"
+    "&&x.decode(bytes([0xfe,0xff,0,0x42]))==='B'});"
+    "t('lone',()=>d('utf-16le',[0,0xd8,0x41,0])==='\\ufffdA'"
+    "&&d('utf-16le',[0,0xdc,0x41,0])==='\\ufffdA'"
+    "&&d('utf-16be',[0xd8,0])==='\\ufffd'&&d('utf-16le',[0x41,0,0x42])==='A\\ufffd');"
+    "t('fatal lone',()=>fatal('utf-16le',[0,0xd8,0x41,0])"
+    "&&fatal('utf-16be',[0xdc,0,0,0x41])&&fatal('utf-16le',[0x3d,0xd8]));"
+    "t('fatal odd',()=>fatal('utf-16le',[0x41,0,0x42]));"
+    "t('fatal ok',()=>d('utf-16be',[0xd8,0x3d,0xde,0,0xff,0xfd],{fatal:true})"
+    "===emoji+'\\ufffd');"
+    "t('stream odd',()=>{const x=new TextDecoder('utf-16le');"
+    "return x.decode(bytes([0x41]),{stream:true})===''"
+    "&&x.decode(bytes([0,0x42]),{stream:true})==='A'&&x.decode(bytes([0]))==='B'});"
+    "t('stream pair',()=>{const x=new TextDecoder('utf-16be',{fatal:true});"
+    "return x.decode(bytes([0xd8,0x3d]),{stream:true})===''"
+    "&&x.decode(bytes([0xde,0]))===emoji});"
+    "t('stream pair odd',()=>{const x=new TextDecoder('utf-16le');"
+    "return x.decode(bytes([0x3d]),{stream:true})===''"
+    "&&x.decode(bytes([0xd8,0]),{stream:true})===''"
+    "&&x.decode(bytes([0xde]),{stream:true})===emoji&&x.decode()===''});"
+    "t('stream bom',()=>{const x=new TextDecoder('utf-16le');"
+    "return x.decode(bytes([0xff]),{stream:true})===''"
+    "&&x.decode(bytes([0xfe,0x41,0]),{stream:true})==='A'"
+    "&&x.decode(bytes([0xff,0xfe]))==='\\ufeff'"
+    "&&x.decode(bytes([0xff,0xfe,0x42,0]))==='B'});"
+    "t('stream flush',()=>{const x=new TextDecoder('utf-16le');"
+    "x.decode(bytes([0x3d,0xd8]),{stream:true});return x.decode()==='\\ufffd'});"
+    "t('stream fatal flush',()=>{const x=new TextDecoder('utf-16le',{fatal:true});"
+    "x.decode(bytes([0x41]),{stream:true});try{x.decode()}catch(e){"
+    "return e instanceof TypeError&&x.decode(bytes([0x42,0]))==='B'}return false});"
+    "t('labels',()=>[['utf-16','utf-16le'],[' UTF-16LE ','utf-16le'],"
+    "['unicode','utf-16le'],['ucs-2','utf-16le'],['csunicode','utf-16le'],"
+    "['iso-10646-ucs-2','utf-16le'],['unicodefeff','utf-16le'],"
+    "['utf-16be','utf-16be'],['unicodefffe','utf-16be']]"
+    ".every(([l,n])=>new TextDecoder(l).encoding===n));"
+    "t('views',()=>{const b=new Uint8Array([9,0x41,0,0x42,0]);"
+    "return new TextDecoder('utf-16le').decode(b.subarray(1))==='AB'"
+    "&&new TextDecoder('utf-16le').decode(new DataView(b.buffer,1,2))==='A'"
+    "&&new TextDecoder('utf-16le').decode(b.buffer.slice(1))==='AB'});"
+    "t('large',()=>{const n=300000,a=new Uint8Array(n*2);"
+    "for(let i=0;i<n;i++)a[2*i]=0x61+i%26;"
+    "const s=new TextDecoder('utf-16le').decode(a);"
+    "return s.length===n&&s.charCodeAt(n-1)===0x61+(n-1)%26});"
+    "t('encoder',()=>new TextEncoder().encoding==='utf-8');"
+    "t('bridge deleted',()=>!('__tilefinchDecodeBytes' in globalThis));"
+    "globalThis.pocSummary=failures.length?'FAIL '+failures.join(' | ')"
+    ":'TEXT-DECODER-UTF16-OK';";
+
 static int test_census_api_gaps(void)
 {
     puts("test: census API gaps (interfaces, members, URL, open, platform)");
@@ -1190,7 +1306,301 @@ static int test_census_api_gaps(void)
         failed++;
     if (!run_probe("text-decoder", text_decoder_probe, "TEXT-DECODER-OK"))
         failed++;
+    if (!run_probe("text-decoder-utf16", text_decoder_utf16_probe,
+                   "TEXT-DECODER-UTF16-OK"))
+        failed++;
+    if (!run_probe("url-opaque-base", url_opaque_base_probe,
+                   "URL-OPAQUE-BASE-OK"))
+        failed++;
+    if (!run_probe_at("url-fixture-document-base", "fixtures/demo.html",
+                      "<p id=p>text</p>", url_document_base_probe,
+                      "URL-DOCUMENT-BASE-OK"))
+        failed++;
     CHECK(failed == 0);
+    return 0;
+}
+
+/* Inline event handler attributes run with the element, its form owner
+   (form-associated elements only) and the document on the scope chain,
+   ahead of the global object, and `this` is the element. */
+static const char handler_scope_body[] =
+    "<link id=lazy rel=stylesheet media=none href='data:text/css,'"
+    " onload=\"if(media!='all')media='all'\">"
+    "<form id=f name=signup action='/go'><input name=user value=ada>"
+    "<input id=pw name=pass value=x onclick=\"globalThis.formSeen="
+    "[user.value,pass===this,elements.length,elements[0]===user,name].join()\">"
+    "</form>"
+    "<p id=doc onclick=\"globalThis.docSeen=[URL===document.URL,"
+    "typeof cookie,typeof getElementById,id,title].join()\">doc</p>"
+    "<p id=self onclick=\"globalThis.selfSeen=this===event.currentTarget"
+    "&&this.id==='self'&&id==='self'\">self</p>"
+    "<p id=glob onclick=\"globalThis.globSeen=[typeof JSON,"
+    "typeof handlerScopeMarker,typeof window,Math.max(1,2)].join()\">g</p>"
+    "<p id=shadow onclick=\"var title='local';globalThis.shadowSeen="
+    "title+','+document.title\">s</p>"
+    "<p id=strict onclick=\"'use strict';globalThis.strictSeen="
+    "(function(){return this})()===undefined&&id==='strict'\">st</p>"
+    "<p id=cancel onclick=\"return false\">c</p>";
+static const char handler_scope_probe[] =
+    "const failures=[],click=id=>document.getElementById(id)"
+    ".dispatchEvent(new MouseEvent('click',{cancelable:true}));"
+    "globalThis.handlerScopeMarker=1;"
+    "const lazy=document.getElementById('lazy');"
+    "lazy.dispatchEvent(new Event('load'));"
+    "if(lazy.media!=='all'||lazy.getAttribute('media')!=='all')"
+    "failures.push('lazy-css:'+lazy.media);"
+    "click('pw');"
+    "if(globalThis.formSeen!=='ada,true,2,true,pass')"
+    "failures.push('form:'+globalThis.formSeen);"
+    "click('doc');"
+    "if(globalThis.docSeen!=='true,string,function,doc,')"
+    "failures.push('document:'+globalThis.docSeen);"
+    "click('self');if(globalThis.selfSeen!==true)failures.push('this');"
+    "click('glob');"
+    "if(globalThis.globSeen!=='object,number,object,2')"
+    "failures.push('global:'+globalThis.globSeen);"
+    "click('shadow');if(globalThis.shadowSeen!=='local,probe')"
+    "failures.push('shadow:'+globalThis.shadowSeen);"
+    "click('strict');if(globalThis.strictSeen!==true)"
+    "failures.push('strict:'+globalThis.strictSeen);"
+    "if(click('cancel')!==false)failures.push('return-false');"
+    "if('user' in globalThis||'media' in globalThis)failures.push('leak');"
+    "globalThis.pocSummary=failures.length?'FAIL '+failures.join(' | ')"
+    ":'HANDLER-SCOPE-OK';";
+
+static int test_inline_handler_scope(void)
+{
+    puts("test: inline event handlers see element, form and document scopes");
+    CHECK(run_probe_after("handler-scope", handler_scope_body,
+                          handler_scope_probe, "HANDLER-SCOPE-OK"));
+    return 0;
+}
+
+/* Form-only members live on HTMLFormElement alone, so a control's inline
+   handler reads its form's `action`; DOM's [Unscopable] lists keep a bare
+   `remove()` in a handler from reaching element.remove(). */
+static const char handler_members_body[] =
+    "<form id=f action='/submit' target=out><input id=act onclick=\""
+    "globalThis.actionSeen=action;globalThis.targetSeen=target\"></form>"
+    "<a id=link href='/x' target=frame>x</a>"
+    "<p id=rm onclick=\"globalThis.removeTried=1;remove()\">rm</p>"
+    "<p id=app onclick=\"globalThis.appendSeen=typeof append\">app</p>";
+static const char handler_members_probe[] =
+    "const failures=[],click=id=>document.getElementById(id)"
+    ".dispatchEvent(new MouseEvent('click',{cancelable:true}));"
+    "const form=document.getElementById('f'),"
+    "div=document.createElement('div');"
+    "for(const name of['action','target','method','enctype','noValidate',"
+    "'elements','submit','requestSubmit','reset'])"
+    "{if(name in div)failures.push('div-has-'+name);"
+    "if(!(name in form))failures.push('form-lacks-'+name);}"
+    "if('action' in document.getElementById('act'))failures.push('input-action');"
+    "if(!/\\/submit$/.test(form.action))failures.push('form.action:'+form.action);"
+    "if(form.target!=='out')failures.push('form.target:'+form.target);"
+    "if(document.getElementById('link').target!=='frame')failures.push('a.target');"
+    "for(const tag of['area','base'])"
+    "if(!('target' in document.createElement(tag)))failures.push(tag+'.target');"
+    "click('act');"
+    "if(globalThis.actionSeen!==form.action)"
+    "failures.push('handler-action:'+globalThis.actionSeen);"
+    "if(globalThis.targetSeen!=='out')"
+    "failures.push('handler-target:'+globalThis.targetSeen);"
+    "click('rm');"
+    "if(globalThis.removeTried!==1||!document.getElementById('rm'))"
+    "failures.push('bare-remove-removed');"
+    "globalThis.remove=()=>{globalThis.globalRemove=1};"
+    "click('rm');delete globalThis.remove;"
+    "if(globalThis.globalRemove!==1||!document.getElementById('rm'))"
+    "failures.push('bare-remove-global');"
+    "click('app');if(globalThis.appendSeen!=='undefined')"
+    "failures.push('bare-append:'+globalThis.appendSeen);"
+    "const lists=[[Element,'after append before prepend remove replaceChildren"
+    " replaceWith slot'],[CharacterData,'after before remove replaceWith'],"
+    "[DocumentType,'after before remove replaceWith'],"
+    "[Document,'append prepend replaceChildren'],"
+    "[DocumentFragment,'append prepend replaceChildren']];"
+    "for(const[type,names]of lists){"
+    "const d=Object.getOwnPropertyDescriptor(type.prototype,Symbol.unscopables),"
+    "u=d&&d.value;"
+    "if(!u||d.writable||d.enumerable||!d.configurable"
+    "||Object.getPrototypeOf(u)!==null"
+    "||Object.keys(u).sort().join(' ')!==names)"
+    "failures.push('unscopables:'+type.name);}"
+    "if(Element.prototype[Symbol.unscopables].remove!==true)"
+    "failures.push('unscopables-remove');"
+    "globalThis.pocSummary=failures.length?'FAIL '+failures.join(' | ')"
+    ":'HANDLER-MEMBERS-OK';";
+
+static int test_handler_form_members_and_unscopables(void)
+{
+    puts("test: form-only members and DOM unscopables in handler scopes");
+    CHECK(run_probe_after("handler-members", handler_members_body,
+                          handler_members_probe, "HANDLER-MEMBERS-OK"));
+    return 0;
+}
+
+/* ---- Platform methods present as natives ----
+   Bootstrap functions print as natives (their bytecode carries no source),
+   and the bootstrap's lowerCamelCase `function`s are read as methods (no
+   own `prototype`, not constructors; JS_READ_OBJ_PLATFORM_METHODS). Members
+   that live on the per-tag native layer are also published on their
+   interface prototypes, where pages capture them. Author functions keep
+   their source text and constructors. */
+
+static const char platform_method_probe[] =
+    "const failures=[],expect=(name,ok)=>{if(!ok)failures.push(name)};"
+    "const toSource=Function.prototype.toString,has=(o,k)=>Object.prototype.has"
+    "OwnProperty.call(o,k);"
+    "const native=(fn,name)=>toSource.call(fn)==='function '+name+'() {\\n    ["
+    "native code]\\n}';"
+    "const constructs=(fn)=>{try{Reflect.construct(String,[],fn);return true}ca"
+    "tch(e){return false}};"
+    "const rows=[[EventTarget.prototype,'addEventListener',2],[EventTarget.prot"
+    "otype,'dispatchEvent',1],"
+    "[Node.prototype,'appendChild',1],[Node.prototype,'insertBefore',2],[Node.p"
+    "rototype,'contains',1],"
+    "[Node.prototype,'removeChild',1],[Node.prototype,'replaceChild',2],[Node.p"
+    "rototype,'cloneNode',0],"
+    "[Element.prototype,'querySelector',1],[Element.prototype,'closest',1],[Ele"
+    "ment.prototype,'matches',1],"
+    "[Element.prototype,'setAttribute',2],[Element.prototype,'getBoundingClient"
+    "Rect',0],"
+    "[Element.prototype,'replaceWith',0],[Element.prototype,'remove',0],[HTMLEl"
+    "ement.prototype,'click',0],"
+    "[HTMLElement.prototype,'focus',0],[Document.prototype,'querySelectorAll',1"
+    "],"
+    "[Document.prototype,'importNode',1],[Document.prototype,'elementFromPoint'"
+    ",2],"
+    "[DOMTokenList.prototype,'add',0],[DOMTokenList.prototype,'contains',1],[DO"
+    "MTokenList.prototype,'remove',0],"
+    "[DOMTokenList.prototype,'toggle',1],[HTMLInputElement.prototype,'checkVali"
+    "dity',0],"
+    "[HTMLInputElement.prototype,'setCustomValidity',1],[HTMLMediaElement.proto"
+    "type,'play',0],"
+    "[Response.prototype,'json',0],[XMLHttpRequest.prototype,'open',2],[Navigat"
+    "or.prototype,'sendBeacon',1],"
+    "[window,'reportError',1],[Object,'getOwnPropertyNames',1],[Reflect,'ownKey"
+    "s',1],"
+    "[Function.prototype,'toString',0]];"
+    "for(const [holder,key,length] of rows){const d=Object.getOwnPropertyDescri"
+    "ptor(holder,key),fn=d&&d.value,label=(holder.constructor&&holder.construct"
+    "or.name||'')+'.'+key;"
+    "if(typeof fn!=='function'){failures.push(label+':missing');continue}"
+    "const problems=[];"
+    "if(fn.name!==key)problems.push('name='+fn.name);"
+    "if(fn.length!==length)problems.push('length='+fn.length);"
+    "if(!native(fn,key))problems.push('source');"
+    "if(has(fn,'prototype'))problems.push('prototype');"
+    "if(constructs(fn))problems.push('constructor');"
+    "if(!d.writable||!d.configurable)problems.push('flags');"
+    "if(problems.length)failures.push(label+':'+problems.join(','));}"
+    "for(const [holder,key] of [[Node.prototype,'textContent'],[Node.prototype,"
+    "'parentNode'],[Element.prototype,'innerHTML'],"
+    "[Element.prototype,'childElementCount'],[HTMLIFrameElement.prototype,'cont"
+    "entWindow'],[HTMLIFrameElement.prototype,'src'],"
+    "[HTMLScriptElement.prototype,'src'],[HTMLAnchorElement.prototype,'href'],["
+    "HTMLImageElement.prototype,'src'],"
+    "[Event.prototype,'type'],[StorageEvent.prototype,'key'],[DOMTokenList.prot"
+    "otype,'length']]){"
+    "const d=Object.getOwnPropertyDescriptor(holder,key);"
+    "if(!d||typeof d.get!=='function'){failures.push(key+':no getter');continue"
+    "}"
+    "if(!native(d.get,'get '+key)||d.get.name!=='get '+key)failures.push(key+':"
+    "getter '+JSON.stringify(toSource.call(d.get).slice(0,24)));"
+    "if(has(d.get,'prototype')||constructs(d.get))failures.push(key+':getter pr"
+    "ototype');"
+    "if(!d.configurable||!d.enumerable)failures.push(key+':getter flags');}"
+    "const div=document.createElement('div');div.innerHTML='<b>x</b>';"
+    "const text=Object.getOwnPropertyDescriptor(Node.prototype,'textContent').g"
+    "et.call(div);"
+    "expect('captured textContent',text==='x');"
+    "expect('captured innerHTML',Object.getOwnPropertyDescriptor(Element.protot"
+    "ype,'innerHTML').get.call(div)==='<b>x</b>');"
+    "expect('childElementCount',div.childElementCount===1&&document.childElemen"
+    "tCount===1);"
+    "div.removeChild(div.firstChild);expect('childElementCount after remove',di"
+    "v.childElementCount===0);"
+    "const toStringSelf=Function.prototype.toString;"
+    "expect('toString self',native(toStringSelf,'toString')&&toStringSelf.call("
+    "toStringSelf)===toSource.call(toStringSelf)&&!has(toStringSelf,'prototype'"
+    ")&&!constructs(toStringSelf));"
+    "function authorHelper(a,b){return a+b}"
+    "const authorArrow=(x)=>x*2;"
+    "expect('author source',toSource.call(authorHelper)==='function authorHelpe"
+    "r(a,b){return a+b}'&&String(authorArrow)==='(x)=>x*2');"
+    "expect('author prototype',has(authorHelper,'prototype')&&constructs(author"
+    "Helper));"
+    "const lowerCtor=new Function('this.v=1');expect('author Function',new lowe"
+    "rCtor().v===1);"
+    "globalThis.pocSummary=failures.length?failures.length+' FAIL '+failures.jo"
+    "in(' | '):'PLATFORM-METHODS-OK';";
+
+static int test_platform_methods_present_as_native(void)
+{
+    puts("test: platform methods are native-shaped; author functions keep source");
+    CHECK(run_probe("platform-methods", platform_method_probe,
+                    "PLATFORM-METHODS-OK"));
+    return 0;
+}
+
+/* ---- Init-dictionary events and DOMTokenList ----
+   Storage polling constructs StorageEvents; capability probes also walk
+   window.DOMTokenList.prototype.add. */
+
+static const char init_event_probe[] =
+    "const failures=[],expect=(name,ok)=>{if(!ok)failures.push(name)};"
+    "const throwsType=(f)=>{try{f();return false}catch(e){return e instanceof T"
+    "ypeError}};"
+    "const e=new StorageEvent('storage',{key:'k',oldValue:null,newValue:'v',url"
+    ":'https://a.test/',storageArea:localStorage,bubbles:true});"
+    "expect('storage fields',e.type==='storage'&&e.key==='k'&&e.oldValue===null"
+    "&&e.newValue==='v'&&e.url==='https://a.test/'&&e.storageArea===localStorag"
+    "e&&e.bubbles===true);"
+    "expect('storage defaults',(()=>{const d=new StorageEvent('storage');return"
+    " d.key===null&&d.oldValue===null&&d.newValue===null&&d.url===''&&d.storage"
+    "Area===null&&d.bubbles===false})());"
+    "expect('storage strings',new StorageEvent('x',{key:5,newValue:undefined})."
+    "key==='5'&&new StorageEvent('x',{newValue:undefined}).newValue===null);"
+    "expect('storage area type',throwsType(()=>new StorageEvent('x',{storageAre"
+    "a:{}})));"
+    "expect('storage proto',e instanceof Event&&Object.prototype.toString.call("
+    "e)==='[object StorageEvent]'&&StorageEvent.name==='StorageEvent'&&StorageE"
+    "vent.length===1&&!Object.keys(window).includes('StorageEvent'));"
+    "const i=document.createEvent('StorageEvent');i.initStorageEvent('storage',"
+    "true,false,'a','b','c','https://b.test/',sessionStorage);"
+    "expect('initStorageEvent',i instanceof StorageEvent&&i.type==='storage'&&i"
+    ".bubbles&&!i.cancelable&&i.key==='a'&&i.oldValue==='b'&&i.newValue==='c'&&"
+    "i.url==='https://b.test/'&&i.storageArea===sessionStorage&&StorageEvent.pr"
+    "ototype.initStorageEvent.length===1);"
+    "expect('key getter',throwsType(()=>Object.getOwnPropertyDescriptor(Storage"
+    "Event.prototype,'key').get.call({})));"
+    "const h=new HashChangeEvent('hashchange',{oldURL:'a',newURL:'b'});expect('"
+    "hashchange',h.oldURL==='a'&&h.newURL==='b'&&new HashChangeEvent('x').oldUR"
+    "L==='');"
+    "const s={};const p=new PopStateEvent('popstate',{state:s});expect('popstat"
+    "e',p.state===s&&new PopStateEvent('x').state===null&&p.hasUAVisualTransiti"
+    "on===false);"
+    "const list=document.getElementById('p').classList;"
+    "expect('DOMTokenList',list instanceof DOMTokenList&&Object.prototype.toStr"
+    "ing.call(list)==='[object DOMTokenList]'&&Object.keys(list).length===0&&DO"
+    "MTokenList.prototype[Symbol.iterator]===DOMTokenList.prototype.values&&thr"
+    "owsType(()=>new DOMTokenList()));"
+    "list.add('a','b');list.toggle('a');expect('DOMTokenList ops',list.value==="
+    "'b'&&list.length===1&&list[0]==='b'&&list.contains('b')&&[...list].join()="
+    "=='b');"
+    "expect('DOMTokenList walk',['add','contains','remove'].every((k)=>typeof w"
+    "indow.DOMTokenList.prototype[k]==='function'));"
+    "const frame=document.createElement('iframe');frame.sandbox.add('allow-scri"
+    "pts','allow-forms');frame.sandbox.toggle('allow-forms');"
+    "expect('sandbox list',frame.getAttribute('sandbox')==='allow-scripts'&&fra"
+    "me.sandbox instanceof DOMTokenList&&frame.sandbox.length===1);"
+    "globalThis.pocSummary=failures.length?failures.length+' FAIL '+failures.jo"
+    "in(' | '):'INIT-EVENTS-OK';";
+
+static int test_init_events_and_token_list(void)
+{
+    puts("test: StorageEvent, HashChangeEvent, PopStateEvent, DOMTokenList");
+    CHECK(run_probe("init-events", init_event_probe, "INIT-EVENTS-OK"));
     return 0;
 }
 
@@ -1204,6 +1614,10 @@ int main(void)
     failures += test_location_navigation_timing();
     failures += test_child_navigables();
     failures += test_census_api_gaps();
+    failures += test_inline_handler_scope();
+    failures += test_handler_form_members_and_unscopables();
+    failures += test_platform_methods_present_as_native();
+    failures += test_init_events_and_token_list();
     if (failures != 0) return 1;
     puts("web conformance tests passed");
     return 0;

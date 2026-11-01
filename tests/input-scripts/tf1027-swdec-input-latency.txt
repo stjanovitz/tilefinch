@@ -1,0 +1,36 @@
+# Button sampling latency during software-decoded playback (device check
+# for the vblank-paced loop). Same neutral page and clip as
+# tf1027-video-cadence.txt: Down/Up land on the video, Cross opens the 45 s
+# 426x240 High clip. After 10 s of playback, twelve Up presses one second
+# apart toggle the player controls (no seek, no pause), then Circle closes
+# the player at about 27 s.
+#
+# Each timed press prints tilefinch-input-request with wait-us: the time
+# from the press's due time to the loop turn that sampled it. A physical
+# button is only sampled at a vblank (sampling cycle 0), so the device bound
+# for a real press is one refresh (16.7 ms) plus the turn's own work.
+# tilefinch-input-script-edge follows on the same turn. Compare wait-us
+# median/max between builds; the teardown records (tilefinch-swdec-*) also
+# print, but the shown controls cost some browser time, so take fps from
+# the unmodified cadence script, not from this one.
+wait-page 90
+tap down
+tap up
+mark-page before-play
+tap cross
+tap-after-live 10000 up
+tap-after-live 1000 up
+tap-after-live 1000 up
+tap-after-live 1000 up
+tap-after-live 1000 up
+tap-after-live 1000 up
+tap-after-live 1000 up
+tap-after-live 1000 up
+tap-after-live 1000 up
+tap-after-live 1000 up
+tap-after-live 1000 up
+tap-after-live 1000 up
+tap-after-live 5000 circle
+wait-live 120
+mark-live after-close
+end

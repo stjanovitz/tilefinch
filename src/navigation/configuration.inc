@@ -566,6 +566,43 @@ typedef enum {
     NAVIGATION_PRELOAD_SCAN_DISABLED    /* <base> or an unreadable tag */
 } NavigationPreloadScanState;
 
+/* Stylesheet preparation for a parser-blocking script, done across parser
+   pumps before the script's end tag is fed (style_prepare.inc). */
+typedef enum {
+    NAVIGATION_STYLE_PREPARE_IDLE = 0,
+    NAVIGATION_STYLE_PREPARE_RUNTIME,
+    NAVIGATION_STYLE_PREPARE_SETTLE,
+    NAVIGATION_STYLE_PREPARE_BUILD,
+    NAVIGATION_STYLE_PREPARE_PARSE,
+    NAVIGATION_STYLE_PREPARE_APPEND,
+    NAVIGATION_STYLE_PREPARE_FINISH
+} NavigationStylePreparePhase;
+
+typedef struct {
+    NavigationStylePreparePhase phase;
+    StylesheetParseDeferral deferral;
+    uint64_t fingerprint;
+    /* The document's stylesheet inputs; those from next_input on are not
+       yet in the sheet. */
+    NavigationStylesheetInput *inputs;
+    size_t input_count;
+    size_t next_input;
+    size_t rules_before;
+    /* The script being prepared for, and the last one whose preparation
+       was abandoned (its checkpoint then builds as before). */
+    lxb_dom_node_t *script;
+    lxb_dom_node_t *declined;
+    /* The parser pump runs preparations (navigation_load_process_staged_body
+       calls the gate); a preview may then start one instead of building. */
+    bool gated;
+    bool preview_declined;
+    bool continuation;
+    bool from_cache;
+    /* A sheet prepared for the next checkpoint, which counts it as that
+       checkpoint's build rather than a reuse. */
+    bool fresh;
+} NavigationStylePrepare;
+
 /* A painted streaming preview kept so the reader can scroll it while the
    document streams. Its text is copied out of the DOM (the parser
    reallocates a text node at the parse frontier as characters arrive), and
@@ -683,4 +720,5 @@ typedef struct {
     /* Two slots: a new preview is built and painted at its final address
        while the live one stays scrollable. At most one is live. */
     NavigationRetainedPreview previews[2];
+    NavigationStylePrepare style_prepare;
 } NavigationDocumentStream;

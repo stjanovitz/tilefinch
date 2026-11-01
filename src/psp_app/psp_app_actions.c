@@ -607,28 +607,35 @@ void psp_app_dispatch_action(
             if (!psp_request_provisional_scroll(
                     app->browser->engine, &app->process->presentation.ui,
                     direction, true)) {
-                bool scrolled = browser_engine_scroll_page(
-                    app->browser->engine, direction);
+                /* At the page's edge nothing moves: no redraw. */
+                bool changed = false;
+                bool scrolled = browser_engine_scroll(
+                    app->browser->engine, BROWSER_SCROLL_PAGE, direction,
+                    &changed);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
                 if (scrolled)
-                    psp_focus_feedback_begin(
+                    psp_scroll_feedback_press(
                         app->browser->engine, (int) intent->action,
                         frame->replayed_press_us != 0
                             ? frame->replayed_press_us
-                            : frame->ui_sample_us);
+                            : frame->ui_sample_us,
+                        changed, &app->process->presentation.ui);
+#else
+                (void) scrolled;
 #endif
-                frame->page_dirty = scrolled || frame->page_dirty;
+                frame->page_dirty = changed || frame->page_dirty;
             }
             return;
         }
         case PSP_UI_ACTION_SCROLL_TOP:
-            frame->page_dirty = browser_engine_scroll_to_edge(
-                app->browser->engine, false) || frame->page_dirty;
+        case PSP_UI_ACTION_SCROLL_BOTTOM: {
+            bool changed = false;
+            (void) browser_engine_scroll(
+                app->browser->engine, BROWSER_SCROLL_EDGE,
+                intent->action == PSP_UI_ACTION_SCROLL_BOTTOM, &changed);
+            frame->page_dirty = changed || frame->page_dirty;
             return;
-        case PSP_UI_ACTION_SCROLL_BOTTOM:
-            frame->page_dirty = browser_engine_scroll_to_edge(
-                app->browser->engine, true) || frame->page_dirty;
-            return;
+        }
         case PSP_UI_ACTION_FIND_PREVIOUS:
         case PSP_UI_ACTION_FIND_NEXT:
         case PSP_UI_ACTION_FIND_CLOSE:
@@ -1694,7 +1701,19 @@ static void psp_app_dispatch_heavy_action(
         case PSP_UI_ACTION_HEAVY_RUN_SESSION:
         case PSP_UI_ACTION_HEAVY_RUN_ALWAYS:
         case PSP_UI_ACTION_HEAVY_CANCEL:
+            psp_app_heavy_action(app, frame, intent);
+            frame->page_dirty = true;
+            break;
         case PSP_UI_ACTION_HEAVY_STOP_SCRIPTS:
+            /* The page-scripts notice answers Cross while it shows, but a
+               reader whose focus is on page media (the declared card, an
+               author video or audio element, or the player control Play
+               acts on) is pressing Play: the notice is gone, the media
+               activates. */
+            if (browser_engine_focus_on_page_media(engine)) {
+                psp_app_dispatch_activation(app, frame, false, engine_frame);
+                break;
+            }
             psp_app_heavy_action(app, frame, intent);
             frame->page_dirty = true;
             break;
