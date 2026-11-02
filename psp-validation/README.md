@@ -1,4 +1,10 @@
-# Unified PSP browser hardware validation
+# Legacy standalone hardware-validation EBOOT
+
+Legacy: no CMake target, script, or test builds or uses this directory; it
+predates the browser and is kept for reference. It is unrelated to a
+*validation build* of the browser (a PSP build configured with
+`TILEFINCH_PSP_VALIDATION_LOG=ON`, normally in `build-preset-psp-validation`;
+see [Development](../docs/DEVELOPMENT.md#presets-and-build-trees)).
 
 This is one diagnostic EBOOT, not the browser engine. Copy it once and run it once. It automatically executes the hardware-sensitive checks the desktop lab cannot answer and writes one versioned `validation.txt` log.
 
@@ -10,7 +16,7 @@ The v3 run is fixed at the selected 333 MHz operating target and includes:
 - A deliberate 48-block, 11.25 MiB fragmentation pattern followed by largest-block recovery measurement.
 - 4-, 8-, 12-, and 16-entry RGB565 tile-cache suites, each sampled three times.
 - Deterministic top/middle checksums after eviction and backward scrolling.
-- A ChatGPT-shaped rounded composer and fixed-overlay test at three scroll offsets, with pixel samples, invariant checksums, and separate base/overlay timings.
+- A chat-composer-shaped rounded input and fixed-overlay test at three scroll offsets, with pixel samples, invariant checksums, and separate base/overlay timings.
 - A checked 256 KiB Memory Stick write/read/delete round trip.
 - A synthetic `validation.ppm` framebuffer export for optional corruption inspection.
 

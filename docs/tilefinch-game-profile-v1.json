@@ -13,7 +13,7 @@
   },
   "memory_profiles": {
     "shipping": {
-      "page_budget_bytes": 25165824,
+      "page_budget_bytes": 33554432,
       "javascript_heap_bytes": 5242880
     },
     "strict": {
@@ -253,8 +253,14 @@
       ]
     },
     "storage": {
-      "local_and_session_entries": 64,
-      "local_and_session_value_bytes": 16384
+      "site_initial_allowance_bytes": 32768,
+      "site_memory_allowance_bytes_maximum": 524288,
+      "memory_allowance_bytes_total": 1048576,
+      "memory_stick_site_bytes": 4194304,
+      "value_bytes_maximum": 1048576,
+      "site_items": 256,
+      "opfs_file_bytes": 65536,
+      "opfs_memory_stick_file_bytes": 524288
     },
     "offline_installation": {
       "manifest_bytes": 65536,

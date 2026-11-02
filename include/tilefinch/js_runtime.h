@@ -865,7 +865,7 @@ bool script_runtime_webgl_validation_history(ScriptRuntime *runtime, bool restor
 /* Validation diagnostics: what the page's event loop could run now, read
    from native state without entering script. The frame loop samples it
    before it sleeps, so a wait can be told apart from a wait with work due
-   (docs/engineering/INPUT_SCRIPT_HARNESS.md, "Where a frame's time goes").
+   (docs/engineering/VALIDATION_RECORDS.md, "Where a frame's time goes").
    Host builds and PSP validation builds only. */
 typedef struct {
     size_t timers;             /* timers, frames, messages, platform tasks */

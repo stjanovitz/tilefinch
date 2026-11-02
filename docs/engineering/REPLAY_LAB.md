@@ -101,21 +101,19 @@ player does (the video source picks the segment holding the target, a
 separate audio rendition follows to that landing) and prints
 `loop-page-media-seek` with the stream's duration, the landing, the first
 video and audio times there and the audio units playback would drop; the
-landing's segments must be in the recording. On a retained qualification
-recording, seeks to 7, 9, 20 and 33 s land at 6.00, 7.80, 19.80 and
-31.80 s with sound 10-30 ms after the picture and nothing dropped.
+landing's segments must be in the recording.
 `tilefinch-trace-media-replay-tests` covers both lanes and the seek with a
 generated stream.
 
 ### Volatile client identifiers
 
 Some pages mint a fresh identifier into every request and the server echoes
-it into its response. chatgpt.com's send posts to
-`conversation/updates?operationId=<uuid>` with pending message ids in the
-form body, and its streamed answer names the operation and targets the
-pending message element by those ids; the page discards frames for another
-operation. A recorded send therefore never matches a new run, and even a
-matched response is ignored.
+it into its response. A chat page's send, for example, can post to an
+endpoint whose query carries a new operation UUID, with pending message ids
+in the form body; its streamed answer names the operation and targets the
+pending message element by those ids, and the page discards frames for
+another operation. A recorded send therefore never matches a new run, and
+even a matched response is ignored.
 
 Two lab/validation-only opt-ins cover this, both off by default:
 
@@ -137,6 +135,36 @@ Two lab/validation-only opt-ins cover this, both off by default:
   a longer hex run, conflicting pairs and more than 512 occurrences are
   served as recorded. Each rewrite logs
   `HTTP replay volatile-uuid record=N pairs=P occurrences=O`.
+
+On the PSP validation build the same opt-ins are `boot.cfg` keys, used with
+`trace=` and `trace_keyed=1`. The boot log confirms each with
+`tilefinch-trace-replay: ignore-request-body=1` or
+`tilefinch-trace-replay: volatile-uuids=1`; each rewritten record logs an
+`HTTP replay volatile-uuid` engine line, and route decisions (`unmatched`,
+`exhausted`, `invalid`) go to the engine log too. Shipping builds ignore them.
+
+### Device profiler and replay keys
+
+These validation-only `boot.cfg` keys pair with replayed device runs
+([PSPLink device development](PSPLINK_DEV_LOOP.md)); shipping builds ignore
+them.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `validation_js_profile` | 1 | JavaScript sampler and call wrappers; `0` turns both off |
+| `validation_js_outlier_us` | 0 | emit one `tilefinch-promise-job` split for each job at least this long |
+| `trace_ignore_request_body` | 0 | match recorded POSTs without their bodies |
+| `trace_volatile_uuids` | 0 | pair minted UUIDs with the recorded ones, as above |
+
+To measure the profiler's own cost, run the same input script and replay
+twice in one binary, with `validation_js_profile=1` and then `0`. The second
+run's boot log must report
+`tilefinch-js-profiler: requested=0 enabled=0 set-status=0`. Keep every other
+setting identical, compare the completed run's output as well as its timing,
+and use several runs per mode. For attribution afterwards, set
+`validation_js_profile=1` and `validation_js_outlier_us=500000`; keep the
+outlier split off during the on/off comparison, because it adds per-job
+accounting.
 
 ### Captures must outlast the responses they hold
 

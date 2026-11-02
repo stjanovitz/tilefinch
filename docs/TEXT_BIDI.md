@@ -1,9 +1,14 @@
 # Bidirectional page text
 
+This page is for contributors and web developers who need to know how
+Tilefinch handles right-to-left and complex-script text; PSP owners will
+find the language packs themselves in the
+[user guide](USER_GUIDE.md#other-languages-and-language-packs).
+
 Tilefinch lays out mixed left-to-right and right-to-left page content without
-rewriting DOM strings. Ordinary English and other LTR-only paragraphs retain
-the existing text path; a parser census and stylesheet summary keep them out
-of bidi analysis entirely.
+rewriting DOM strings. Ordinary English and other LTR-only paragraphs use the
+plain text path; a parser census and stylesheet summary keep them out of bidi
+analysis entirely.
 
 This contract covers page content. Arabic browser labels reuse the same
 shaping and visual-order helpers once at translation load; they do not rewrite
@@ -13,13 +18,13 @@ complex-script shaping beyond the Arabic family are not part of this contract.
 ## Pipeline
 
 An inline formatting context enters the bidi path only when visible text,
-`dir`, `direction`, or `unicode-bidi` can affect ordering. The bounded path is:
+`dir`, `direction`, or `unicode-bidi` can affect ordering. The path is:
 
 1. Flatten the inline paragraph into UTF-32 analysis units while recording
    source spans and representing atomic inline boxes with U+FFFC. The source
    DOM and UTF-8 remain in logical order.
-2. Resolve paragraph levels with SheenBidi 3.0.0, a proven C implementation of
-   Unicode Bidirectional Algorithm rules. Embeddings, overrides, isolates,
+2. Resolve paragraph levels with SheenBidi 3.0.0, a C implementation of the
+   Unicode Bidirectional Algorithm. Embeddings, overrides, isolates,
    neutrals, paired punctuation, numbers, directional controls, `dir=auto`,
    and `unicode-bidi: plaintext` therefore share the same UAX #9 engine.
 3. Apply the narrow Arabic-family shaper to Arabic, Persian, and Urdu joining
@@ -61,42 +66,71 @@ Paragraph analysis uses one page-budget allocation and a reusable aligned
 scratch arena; it never allocates per codepoint. Temporary paragraph state is
 released when its block flow completes. Only sparse visual glyph mappings
 needed by the retained layout survive. Allocation refusal and hostile control
-nesting do not reactivate the historical reverse-codepoint painter.
+nesting fall back to logical order, never to reversing codepoints.
 
-The current path deliberately omits text shadows for bidi-shaped commands.
+Text shadows are omitted for bidi-shaped commands.
 That cosmetic degradation avoids duplicating shaped sidecars and never changes
 text, links, or hit geometry.
 
 ## Glyph components
 
 Arabic and Hebrew are optional signed language packs, alongside Japanese,
-Chinese, Korean, Cyrillic, Extended Latin and Devanagari. The default embedded Latin and
+Simplified Chinese, Traditional Chinese, Korean, Cyrillic, Extended Latin,
+Devanagari (Hindi) and Bengali–Assamese. The default embedded Latin and
 fallback glyphs remain available through missing, damaged, interrupted, or
 removed components. Selecting a language keeps that pack attached; the parser
 may lazily attach at most two other installed language packs when the page
-actually uses their scripts. Color emoji remains independent, and the runtime
-still admits no more than four packs total.
+actually uses their scripts. Color emoji is independent, and no more than
+four packs are attached at once.
 
 The Arabic pack includes U+0600–U+08FF base/mark coverage and the contextual
 presentation forms emitted by the shaper. The Hebrew pack includes Hebrew
 letters, marks, and presentation forms. Both use the existing TFGF/TFGM signed
 component format and cause no pack enumeration or payload read at boot.
 
-Devanagari uses a bounded pre-shaped cluster inventory generated offline with
+Devanagari uses a fixed pre-shaped cluster inventory generated offline with
 HarfBuzz/FreeType, consumed by longest-sequence matching in the existing pack
 format. It covers current Hindi interface labels and common syllables, not
-every possible Indic shaping sequence. No runtime shaping stack is linked.
-The Bengali-Assamese development pack uses the same bounded sequence mechanism,
-including Assamese ra/wa, shared Indic punctuation and complete interface
-clusters. Both interface languages share a pack but retain separate catalog
-IDs. This does not claim arbitrary runtime Bengali or Assamese shaping; the
-fixed inventory's scalar fallback still applies outside its coverage. Existing
-Hindi inventories and published component versions remain unchanged.
-Downscaled monochrome pack cells average their source footprint at glyph
-creation so small vowel marks and thin strokes are not dropped by a nearest
-sample; retained painting still uses the same cached glyph bitmap.
+every possible Indic shaping sequence. No runtime shaping stack is linked. The
+Bengali–Assamese pack uses the same sequence mechanism, including Assamese
+ra/wa, shared Indic punctuation and complete interface clusters. Both
+interface languages share a pack but retain separate catalog IDs. This does
+not claim arbitrary runtime Bengali or Assamese shaping; the fixed inventory's
+scalar fallback applies outside its coverage. Downscaled monochrome pack cells
+average their source footprint at glyph creation so small vowel marks and thin
+strokes are not dropped by a nearest sample; retained painting still uses the
+same cached glyph bitmap.
 
 ### In-page install offer
+
+When a page uses a script that no installed pack covers, Tilefinch offers the
+matching pack in a notice above the bottom bar. It never downloads on one
+press: Cross opens a confirmation that shows the pack's verified download
+size, and a second Cross installs it exactly as the menu does. The
+[user guide](USER_GUIDE.md#other-languages-and-language-packs) describes the
+notice, its buttons and its settings. The offer also appears over Reader mode
+and Basic view, which draw with the same faces. When an install finishes, the
+page is laid out again in place, because text measured against blank cells
+has the wrong widths.
+
+## Qualification
+
+The focused host tests combine UAX #9-derived mixed-direction cases with
+Arabic, Persian, Urdu, Hebrew, URLs, punctuation, digits, join controls,
+over-depth controls, maximum admitted paragraphs, run-limit refusal, nested
+HTML/CSS direction boundaries, wrapping, inline links and controls, hit tests,
+visual caret stepping, logical selection/copying, and find geometry.
+Signed-component proof opens the actual release packs and requires authored
+pixels for Arabic presentation forms and Hebrew letters.
+
+Performance qualification compares the same English encyclopedia-article
+capture and a provider-results-shaped LTR fixture before and after a change.
+Both must stay within normal timing variance and report zero admitted bidi
+paragraphs. An RTL fixture records paragraph count, fallbacks, bidi
+microseconds, and peak transient budget use. The PSP build separately gates
+executable text and hot symbols.
+
+## Engineering notes: the install offer
 
 The parser's existing visible-text statistics pass also keeps a census for
 each script: a saturating count and the page's own codepoints at the 1st,
@@ -104,9 +138,7 @@ each script: a saturating count and the page's own codepoints at the 1st,
 meaningful use at 32 or more codepoints that are also at least one per 20
 visible-text bytes, so a stray word or a long article's language-picker list
 does not qualify. This adds one count per classified non-ASCII codepoint and
-no DOM walk; the scan no longer stops early on the rare page that already
-showed all seven script families and bidi text, because the count needs the
-whole text.
+no DOM walk; the scan runs over the whole text, because the count needs it.
 
 On a settled page with no other notice, the PSP app asks
 `tilefinch_glyph_offer_poll()` once per page identity (URL plus census). It
@@ -121,49 +153,28 @@ Extended Latin pack that Vietnamese (Latin Extended Additional) needs, and
 CJK is not offered at all while the embedded fallback draws it. A site is
 offered at most once per session (16 hashed sites, oldest forgotten).
 
-The offer takes only X and Triangle, once armed (0.6 s); Circle stays Back
-and closes it. X opens a confirmation overlay
+The offer takes only Cross and Triangle, once armed (0.6 s); Circle stays
+Back and closes it. Cross opens a confirmation overlay
 (`PSP_UI_SCREEN_GLYPH_OFFER`) and asks the session for the size:
 `psp_glyph_component_session_prepare_size_check()` selects the pack's
 update-client operation without the menu's auto-install, the app starts the
 client's signed-metadata check over the network exactly as the menu does,
-and the check stops at AVAILABLE. The confirmation shows **Checking
-size...**, then the pack's name with the verified manifest's
-`package_size` (**Cyrillic (1.0 MB)**) above **Install this font pack?**,
-or the check's own failure message, all in the interface language. Only a
-second X there raises the menu's `glyph_component_primary_requested`, so
-the download, signature verification, free-space preflight and Memory Stick
-promotion are unchanged and one press can never download. Triangle sets the
-pack's bit in the profile's "Don't ask again" mask; **Settings > Appearance
-> Language & emoji > Offer language packs** (Ask/Off) and **Reset declined
-offers** control both. The offer also runs over Reader mode and Basic view,
-which draw with the same faces.
+and the check stops at AVAILABLE. The confirmation shows the verified
+manifest's `package_size`, or the check's own failure message, in the
+interface language. Only a second Cross there raises the menu's
+`glyph_component_primary_requested`, so the download, signature
+verification, free-space preflight and Memory Stick promotion are the
+menu's own. Triangle sets the pack's bit in the profile's "Don't ask again"
+mask; **Menu → Settings → Appearance → Language & emoji → Offer language
+packs** (Ask/Off) and **Reset declined offers** control both.
 
 Every completed install, from the menu or the offer, sets the session's
 `reattach_pending`. `psp_glyph_component_session_reattach()` then restores
 the selected language and emoji packs that the install detached and attaches
 installed packs for the page's scripts through the lazy path (the offered
-pack's scripts for an offer install), and the app relayouts the page in
-place through the user-stylesheet rebuild that page text size uses, because
-advances measured against blank cells are wrong. If the relayout cannot run
-the notice asks for a reload; if the installed pack is not one the page or
-the selection uses, **Font pack ready after restart** still applies.
-Scripted and replay runs (`trace` not `none`) and builds without live
-networking never show the offer.
-
-## Qualification
-
-The focused host tests combine UAX #9-derived mixed-direction cases with
-Arabic, Persian, Urdu, Hebrew, URLs, punctuation, digits, join controls,
-over-depth controls, maximum admitted paragraphs, run-limit refusal, nested
-HTML/CSS direction boundaries, wrapping, inline links and controls, hit tests,
-visual caret stepping, logical selection/copying, and find geometry.
-Signed-component proof opens the actual release packs and requires authored
-pixels for Arabic presentation forms and Hebrew letters.
-
-Performance qualification compares the same English Wikipedia capture and a
-provider-results-shaped LTR fixture before and after. Both must stay within
-normal timing variance and report zero admitted bidi paragraphs. An RTL
-fixture records paragraph count, fallbacks, bidi microseconds, and peak
-transient budget use. The PSP build separately gates executable text and hot
-symbols.
+pack's scripts for an offer install), and the app lays the page out again in
+place through the user-stylesheet rebuild that page text size uses. If that
+relayout cannot run, the notice asks for a reload; if the installed pack is
+not one the page or the selection uses, **Font pack ready after restart**
+applies. Scripted and replay runs (`trace` not `none`) and builds without
+live networking never show the offer.

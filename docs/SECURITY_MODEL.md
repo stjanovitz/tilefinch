@@ -1,8 +1,8 @@
 # URL, request, and cookie security model
 
-This is the current bounded policy for the engine laboratory. It is designed to
-fail closed where the project lacks the data or algorithms needed for a full
-browser decision. It is not a claim of WHATWG URL, Fetch, cookie, CSP, or
+This is the bounded URL, request, and cookie policy of the Tilefinch browser,
+for contributors and security reviewers. It fails closed where Tilefinch lacks
+the data or algorithms needed for a full browser decision. It is not a claim of WHATWG URL, Fetch, cookie, CSP, or
 browser-security conformance.
 
 ## Security defaults and compatibility controls
@@ -272,8 +272,8 @@ licenses, and deterministic refresh command are recorded in
 `third_party/public_suffix/README.md`; updating it is security maintenance,
 not an acceptance-site compatibility tweak.
 
-The host transport exposes at most `FETCH_RESPONSE_COOKIE_CAPACITY` (currently
-32) `Set-Cookie` fields in one bounded redirect transaction, and each
+The host transport exposes at most `FETCH_RESPONSE_COOKIE_CAPACITY` (32)
+`Set-Cookie` fields in one bounded redirect transaction, and each
 serialized field must fit its 4,095-byte storage ceiling. Cookie values and
 their response-URL attributions are allocated from the shared budget only when
 received; `FetchResult` retains only the fixed pointer inventory, avoiding a
@@ -658,7 +658,7 @@ four commands per layout. Exceeding that aggregate limit removes the cosmetic
 blur from the layout so it cannot disable the retained fixed-layer cache and
 repeat unbounded raster work every frame.
 
-## Explicitly incomplete areas
+## Reader mode is not a security boundary
 
 Reader mode is not a sanitizer or a content-security boundary. It hides page
 regions with user-origin CSS only; hidden nodes remain in the DOM, their
@@ -667,6 +667,8 @@ again. Its bounded content-shape classification and DOM markers are
 presentation hints, never evidence that advertising, tracking, or hostile
 content was removed. Network blocking is a separate pre-transport policy
 described in `CONTENT_BLOCKING.md`.
+
+## Site information and per-site controls
 
 The unified **Page tools → Site information** screen reports the committed
 page's copied TLS version/issuer snapshot, bounded cookie/storage usage for
@@ -679,6 +681,8 @@ JavaScript, blocker, Reader, third-party-cookie, and mixed-content exceptions.
 Both destructive actions require confirmation. Inspection and deletion remain
 available even when global site-data admission is disabled.
 
+## Offline snapshots and downloads
+
 Offline Reader snapshots cross a separate persistence boundary: only escaped
 body text, a bounded title, and the source URL are serialized. Live DOM
 objects, scripts, forms, cookies, and event state never enter the snapshot.
@@ -688,30 +692,22 @@ stored with their resource grants or module provenance. On reopen, the page
 keeps its original origin and each response must re-enter the matching typed
 cache; disk storage never converts it into a generic URL-authorized response.
 No cookie jar, local storage, Service Worker, or cross-origin body is included.
-YouTube downloads accept direct media URLs only after the existing provider
-host policy validates them; internal enqueue and management routes are also
+Provider downloads accept direct media URLs only after the provider's host
+policy validates them; internal enqueue and management routes are also
 source-page gated by the PSP frontend. The offline index and payloads are
 untrusted Memory Stick input on the next run and are size-checked before use.
 See [OFFLINE_LIBRARY.md](OFFLINE_LIBRARY.md).
 
-The engine does not yet provide a complete WHATWG URL parser, complete
-Fetch/CORS/CSP or mixed-content policy, all-resource cache partitioning,
-certificate UI, permissions, nested browsing-context sandboxing, or origin
-process isolation. The implemented CSP, SRI, and frame-policy subset is defined
-above. Script, stylesheet, and image cache partitioning and typed response
-grants are also defined above; neither should be inferred for other resource
-classes.
-Unsupported directives must not be inferred from the presence of that subset.
+## TLS transport and trust store
 
-The default PSP release cross-builds hash-pinned curl 8.22.0 and Mbed TLS
-3.6.7 LTS; HTTP/2 builds additionally pin nghttp2 1.69.0. Runtime startup
-checks that linked provenance and fails closed on drift. Tilefinch still
-narrows curl to HTTP(S), disables automatic redirects and curl cookie state,
-applies peer and host verification on every easy handle, and runs curl/nghttp2
-allocations inside a fixed one-MiB budget pool. The SDK's older transport
-remains only as an explicit, non-release `LEGACY` escape hatch. Source,
-offline-build, and measured-size details are in
-`docs/engineering/PSP_TRANSPORT.md`.
+The default PSP release cross-builds hash-pinned curl 8.22.0 and Mbed TLS 3.6.7
+LTS; HTTP/2 builds additionally pin nghttp2 1.69.0. Runtime startup checks that
+linked provenance and fails closed on drift. Tilefinch narrows curl to HTTP(S),
+disables automatic redirects and curl cookie state, applies peer and host
+verification on every easy handle, and runs curl/nghttp2 allocations inside a
+fixed one-MiB budget pool. The SDK's older transport remains only as an
+explicit, non-release `LEGACY` escape hatch. Source, offline-build, and
+measured-size details are in `docs/engineering/PSP_TRANSPORT.md`.
 
 The PSP trust store is a small, reviewed set of public roots rather than the
 firmware's certificate database. It includes current GTS R1-R4 and the
@@ -729,9 +725,7 @@ digest is computed during the bundle's existing first-use read; diagnostics do
 not reopen the Memory Stick file. This distinguishes an outdated staged bundle
 from an alternate public chain or a certificate injected by the local network.
 
-Security-sensitive behavior should keep failing closed as these pieces are
-added; acceptance-site compatibility is not permission to weaken these
-generic rules.
+## Optional signed components
 
 Optional voice and glyph data are not trusted because they came from the
 project's asset repository. Voice (`TFVMv1`/TFVP format 2) and glyph
@@ -746,3 +740,18 @@ script; the offer's wording comes from the compiled-in pack catalog, never
 from the page, the size it asks about comes from the verified signed
 manifest, and installing takes two separate presses of X and then the
 signed glyph-component path.
+
+## Explicitly incomplete areas
+
+The engine does not provide a complete WHATWG URL parser, complete
+Fetch/CORS/CSP or mixed-content policy, all-resource cache partitioning,
+certificate UI, permissions, nested browsing-context sandboxing, or origin
+process isolation. The implemented CSP, SRI, and frame-policy subset is defined
+above. Script, stylesheet, and image cache partitioning and typed response
+grants are also defined above; neither should be inferred for other resource
+classes.
+Unsupported directives must not be inferred from the presence of that subset.
+
+Security-sensitive behavior keeps failing closed as any of these pieces is
+added; acceptance-site compatibility is not permission to weaken these
+generic rules.

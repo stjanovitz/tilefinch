@@ -482,7 +482,7 @@ static int psp_loop_work_append(char *line, size_t capacity, int used,
    script/native/layout/sleep microseconds (the phase's remainder is
    bookkeeping); the runnable state sampled before the frame's wait; and
    the frame's runtime advances broken down. Field reference:
-   docs/engineering/INPUT_SCRIPT_HARNESS.md, "Where a frame's time goes". */
+   docs/engineering/VALIDATION_RECORDS.md, "Where a frame's time goes". */
 static void psp_loop_work_print(void)
 {
     char line[1024];

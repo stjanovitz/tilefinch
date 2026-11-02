@@ -127,9 +127,9 @@ and `focus_after_hashes` (the `frame-hash` render after each move and after
 the idle turns), both keyed by label (`focus-1`, ..., `focus-final`).
 `--focus-hashes final` skips the per-move `frame-hash` renders, which add
 1-2% to `focus_ms`; compare focus timings only between runs of one mode.
-These replaced the positional `focus_frames` list, which `compare.py` still
-reads. Move hashes come from the lab's `frame-fnv1a` field (2026-10-26),
-the same FNV-1a as `frame-hash`, so a base lab built before then has none.
+`compare.py` also reads the older positional `focus_frames` list. Move
+hashes come from the lab's `frame-fnv1a` field, the same FNV-1a as
+`frame-hash`; a base lab without that field reports none.
 
 ## Capturing (live network)
 
@@ -156,11 +156,9 @@ python3 tools/site-census/compare.py ../census/runs/base/census.jsonl \
 ```
 
 `replay.sh OUT -j N news reference` replays a subset by name or tag. Replays
-run in parallel (default: cores - 4, leaving the efficiency cores alone) and
-print their wall time: the whole corpus takes about 60 s on an M-series Mac
-(three repeats per page; one page sits in the 60 s script watchdog), the
-probe pass about 70 s and the revisit pass about 30 s. For a branch that
-changes Basic view or script admission, compare the `--probe` passes too.
+run in parallel (default: CPU count minus 4) and print their wall time. For a
+branch that changes Basic view or script admission, compare the `--probe`
+passes too.
 
 A page's corpus `meta.json` may carry `"replay_lab_args"`, a list of extra
 lab arguments for that page only. A private canary capture can use
@@ -183,14 +181,8 @@ with `--pages` every metric that moved by more than `--threshold` percent.
 Replays are offline and seeded; memory, decoded images, retained layout,
 Reader extraction and the deterministic work vector (`W` rows) repeat
 exactly or within 1% between runs of one build. Timings are host wall time
-and move with machine load. Measured on the October 2026 corpus (55 pages,
-6 jobs, repeat 3), two runs of the same lab:
-
-- quiet machine: corpus totals within 1% (relayout, first paint, loaded, JS
-  compile and execute); per-page p90 absolute change 3-7%.
-- typical (other agents building on the same Mac): totals within 2-11%,
-  per-page median 2-3%, p90 13-26%.
-- busy: totals up to 12% apart, per-page p90 up to 29%.
+and move with machine load: on a busy machine, corpus totals and per-page
+deltas between two runs of the same lab can differ by tens of percent.
 
 The first of the three repeats of a page is usually the slowest (cold
 caches), which is why the minimum is taken. Basic view statistics are zero

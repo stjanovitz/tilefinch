@@ -1,11 +1,17 @@
 # libFuzzer targets
 
 Coverage-guided fuzzers for the parsers that see untrusted network input.
-They complement `tests/test_hostile_parsers.c`, a deterministic
-random-mutation harness. It is not part of the default test suite: it is
-built and run only under the opt-in `hostile` preset
+Neither they nor the deterministic random-mutation harness they complement,
+`tests/test_hostile_parsers.c`, is part of the default test suite. The
+fuzzers build in their own tree with `build.sh` (below). The hostile harness
+builds and runs only under the opt-in `hostile` preset
 (`cmake --preset hostile`, then `ctest --preset hostile`, or `ctest -L fuzz`
 in that tree).
+
+Long fuzz campaigns, corpus runs and minimization run on cloud runners, not
+on a developer's machine. Locally, build the targets and reproduce single
+saved inputs; the `run.sh` example below documents the tool a runner
+invokes.
 
 | Target | Harness | What it covers |
 | --- | --- | --- |

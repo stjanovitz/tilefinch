@@ -1,8 +1,8 @@
-# Site survey tooling (2026-10)
+# Site survey tooling
 
-Scripts used for the October 2026 survey of Reddit (old, www, m), weather.gov,
-weather.com, AP News and Reuters. Captured pages are private third-party data:
-they live under `scratch/survey/NAME/` (git-ignored) and are never committed.
+Scripts for surveying a set of sites on the host lab, PPSSPP and Chromium.
+Captured pages are private third-party data: they live under
+`scratch/survey/NAME/` (git-ignored) and are never committed.
 
 | Script | Purpose |
 | --- | --- |
@@ -14,17 +14,3 @@ they live under `scratch/survey/NAME/` (git-ignored) and are never committed.
 | `sheet.py OUT L R left,right ...` | Side-by-side sheet (Tilefinch left, Chrome right) without Pillow. |
 
 Set `NODE_PATH` to a `node_modules` containing Playwright for the Chrome tools.
-
-## Caveats found while building it
-
-- The lab's `--psp-profile realistic` used not to be the PSP app's policy
-  (24 MiB and 32 scripts against 32 MiB and 256), so on script-heavy pages
-  (weather.com: 162 scripts, most of them tiny Next.js inline chunks) the lab
-  skipped the app bundle the PSP loads. The profile now is the app's own
-  configuration (`BROWSER_PSP_APP_*`), so `lab.sh` needs no limit flags.
-- The host transport is not the PSP transport. Cloudflare challenged the lab
-  (and headless Chrome) on apnews.com but served the PSP; DataDome returned
-  401 to headless Chrome on reuters.com. Capture blocked sites through
-  PPSSPP before concluding a site blocks Tilefinch.
-- `benchmarks/capture-reference.js` refuses live captures with collapsed
-  redirects, so the survey compares against live Chrome by inspection.

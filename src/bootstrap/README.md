@@ -1,7 +1,7 @@
 # JavaScript bootstrap sources
 
-These JavaScript files are the authored sources for the browser runtime
-bootstrap. Edit them directly; do not hand-edit `../generated/js_bootstrap.c` or
+For contributors: these JavaScript files are the authored sources for the
+browser runtime bootstrap. Edit them directly; do not hand-edit `../generated/js_bootstrap.c` or
 `../generated/js_bootstrap_bytecode.c`.
 
 `sources.def` is the shared manifest for source filenames, exported C symbols,
@@ -22,23 +22,57 @@ the device's executable and memory image.
 Generated QuickJS bytecode is stored uncompressed in read-only C arrays and
 deserialized directly with QuickJS's ROM-data mode. The arrays outlive each
 runtime, so this avoids a per-realm inflate buffer and permits QuickJS to
-reference the serialized data in place. The bytecode omits its duplicate
-source text. In host builds, the filesystem-free fallback is embedded
-separately in `../generated/js_bootstrap.c`; PSP section garbage collection drops those
-unreferenced arrays. QuickJS line tables remain present so bootstrap exceptions
-can still report useful source locations.
+reference the serialized data in place. The bytecode omits its source text,
+line tables, and local-variable names, because QuickJS would copy them out of
+ROM into every realm's heap on restore. Bootstrap exceptions still name the
+module and function; for line numbers, run the host with
+`TILEFINCH_DISABLE_BOOTSTRAP_BYTECODE=1`, which compiles the embedded source
+with full debug information. Setting `TILEFINCH_BOOTSTRAP_KEEP_LINES=1` while
+regenerating keeps the line tables for a profiling build; never commit that
+output. In host builds, the filesystem-free fallback is embedded separately in
+`../generated/js_bootstrap.c`; PSP section garbage collection drops those
+unreferenced arrays.
 
-From an existing host build directory, regenerate both files with:
+## Regenerating
+
+This README is the home of the regeneration rule. After editing any
+`src/bootstrap/*.js` file or `sources.def`, regenerate **both** generated C
+files and the manifest from a host build tree:
 
 ```sh
 cmake --build build-preset-release --target regenerate_tilefinch_bootstrap
 ```
 
-Normal test builds run `tilefinch-bootstrap-generated-check`, which regenerates
-temporary copies and fails if either checked-in artifact is stale. The
-generator also records the exact source length and FNV-1a hash beside every
-bytecode program, so runtime bytecode admission is tied to the authored source
-bytes.
+That target rewrites `../generated/js_bootstrap.c` and
+`../generated/js_bootstrap_bytecode.c` and derives `generated.sha256` from the
+exact authored and generated tree. Never edit `generated.sha256` by hand, and
+commit the three files with the source change.
+
+The generator embeds a compacted copy of each source (indentation, trailing
+whitespace, and comments removed; newlines kept) and refuses to emit unless
+the compacted text compiles to the same bytecode as the authored file. It
+records that compacted text's length and FNV-1a hash beside every bytecode
+program, so runtime bytecode admission is tied to the embedded source bytes.
+
+Host and PSP builds both make `tilefinch_core` depend on
+`check_tilefinch_bootstrap_generated`, so a stale artifact fails the next core
+build either way. They check different things:
+
+| Build | Check |
+|---|---|
+| host | the generator's `--check` mode compares the bytecode, and the manifest is verified |
+| PSP | the manifest only: the cross toolchain cannot run the host QuickJS generator |
+
+A hand-edited manifest would pass the PSP check; the host check exists to
+catch it. The host build hashes the complete source and artifact set on every
+invocation, and reuses a successful bytecode comparison only while the
+manifest contents, the generator executable, and the verification
+implementation are unchanged, so C-only edits do not recompile JavaScript.
+Never replace this content identity with timestamp-only stamps. The
+`tilefinch-bootstrap-generated-check` CTest always regenerates temporary
+copies and compares them, without the memo.
+
+## Module boundaries
 
 The current files intentionally retain the bootstrap's established logical
 boundaries. Moving APIs between modules or changing runtime order should be a

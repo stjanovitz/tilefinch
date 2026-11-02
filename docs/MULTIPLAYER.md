@@ -1,10 +1,11 @@
 # Direct multiplayer for offline games
 
-Tilefinch gives installed offline games one bounded, direct peer channel. Its
-surface is shaped like an `RTCDataChannel`, allowing the same game protocol to
-use Tilefinch's direct UDP transport on PSP and a small WebRTC adapter in an
-ordinary browser. The transports do not cross-connect: PSP players play other
-PSP players, and web players play other web players.
+For game developers. Tilefinch gives installed offline games one bounded,
+direct peer channel. Its surface is shaped like an `RTCDataChannel`, allowing
+the same game protocol to use Tilefinch's direct UDP transport on PSP and a
+small WebRTC adapter in an ordinary browser. The transports do not
+cross-connect: PSP players play other PSP players, and web players play other
+web players.
 
 The feature needs no Tilefinch account, companion application, or game
 service. It works automatically on the same Wi-Fi and can often connect over
@@ -82,11 +83,13 @@ Tilefinch-specific setup events are `status`, `invitecode`, `discovered`, and
 This is an unordered, zero-retransmit datagram channel. A host-authoritative
 game should send small input records repeatedly, publish replaceable snapshots,
 ignore stale sequence numbers, and keep menus usable if packets disappear.
-Treadline sends 12-byte input records at 20 Hz and snapshots of at most 320
-bytes at 15 Hz. Its version-2 snapshot header repeats the authoritative arena
-seed and a layout checksum for reconnect and late join, plus a 16-bit active
-barrier mask so destroyed cover cannot reappear on a client. An incompatible
-packet version is refused rather than partially applied.
+Treadline's guest sends 12-byte input records at 20 Hz and its host sends
+snapshots of at most 320 bytes at 15 Hz. Every packet carries a kind byte and
+the protocol version; each snapshot header repeats the authoritative arena seed
+and a layout checksum for reconnect and late join, plus a 16-bit active barrier
+mask so destroyed cover cannot reappear on a client. A packet with another
+protocol version ends the session rather than being partially applied (see
+[the Treadline wire format](../examples/treadline-arena/README.md#online-wire-format)).
 
 ## Bounds and lifecycle
 

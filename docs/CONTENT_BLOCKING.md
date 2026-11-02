@@ -1,14 +1,16 @@
 # Content blocking
 
-Tilefinch provides bounded request blocking and conservative cosmetic hiding
-as performance and comfort features. **Basic blocking and cosmetic hiding are
-on by default**, and each can be changed independently under **Settings →
-Privacy & security**.
+This page is the reference for PSP owners who want to know exactly what
+Tilefinch blocks, and for anyone preparing a custom list. Tilefinch provides
+request blocking and conservative cosmetic hiding as performance and comfort
+features. **Basic blocking and cosmetic hiding are on by default**, and each
+can be changed independently under **Menu → Settings → Privacy & security**.
 
 Tilefinch also hides common cookie-consent overlays by default. This is a
 separate comfort policy: it stays active when request blocking is Off, never
-clicks an acceptance button, and never creates a consent cookie. **Page tools
-→ Site information → Permissions & controls → Cookie notices** switches
+clicks an acceptance button, and never creates a consent cookie. **Menu →
+Page tools → Site information → Permissions & controls → Cookie notices**
+switches
 between **Hide** and **Show** for the current registrable site, and at most 16
 Show exceptions are kept.
 
@@ -22,20 +24,17 @@ Show exceptions are kept.
   changing the active mode if the file cannot be read or validated.
 
 **Permissions & controls → Content blocking** bypasses blocking for the
-current registrable site. Allowing `en.wikipedia.org`, for example, records
-`wikipedia.org`, so the choice also covers the mobile hostname. The active set
-holds at most **32** sites (about 4 KiB at worst), and request matching never
-reads the Memory Stick. Saved exceptions are deliberately activated only after
-Tilefinch has shown its first stable chrome frame, so a growing profile cannot
-hold the screen black during boot.
+current registrable site. Allowing `en.example.org`, for example, records
+`example.org`, so the choice also covers `m.example.org`. The set holds at
+most **32** sites, and request matching never reads the Memory Stick.
 
 An optional `data/adblock-allow.txt` can list more bare hostnames or HTTP(S)
 URLs, one per line; blank lines and lines starting with `!` or `#` are
-ignored. **Settings → Privacy & security → Load allowlist** reads and merges
-that file only when you ask. The import is limited to 32 KiB and 511 bytes per
-line, deduplicates registrable sites, and stops safely when the 32-site set is
-full. Imported entries join the next transactional profile save, so the file
-is a source to import from, not storage consulted at request time.
+ignored. **Menu → Settings → Privacy & security → Load allowlist** reads and
+merges that file only when you ask. The import is limited to 32 KiB and 511
+bytes per line, merges duplicate sites, and stops safely when the 32-site set
+is full. Imported entries are saved with your settings, so the file is a
+source to import from, not something read at request time.
 
 Changing a site exception reloads the current page at once, so network work
 already under way agrees with the new policy. Cosmetic hiding also changes at
@@ -62,7 +61,7 @@ lijit.com                 mathtag.com                media.net
 moatads.com               openx.net                  outbrain.com
 pubmatic.com              quantserve.com             rlcdn.com
 rubiconproject.com        serving-sys.com            sharethrough.com
-smartadserver.com         smaato.net                  taboola.com
+smartadserver.com         smaato.net                 taboola.com
 teads.tv                  triplelift.com             yieldmo.com
 zedo.com
 ```
@@ -70,14 +69,9 @@ zedo.com
 Top-level navigation is never blocked, and a matching site exception bypasses
 both Basic/Custom request rules and cosmetic hiding.
 
-Basic and Custom also refuse narrowly identified inline telemetry bundles.
-Rules require a site boundary, an exact first-statement trigger and all reviewed
-bundle markers; mentioning a tracker name is insufficient. Matching scans at
-most 512 KiB without an allocation. Off and site exceptions bypass these rules.
-The original script text is retained in the DOM, while execution is skipped
-before its first effect. Reference captures use the same rule definitions and
-record the blocking separately; unrelated script errors and crypto refusals
-remain failures.
+Basic and Custom also skip a few narrowly identified inline telemetry
+scripts, unless blocking is Off or the site is an exception. See
+[Engineering notes](#engineering-notes).
 
 ## Built-in cosmetic hiding
 
@@ -97,27 +91,20 @@ ins.adsbygoogle
 It also hides class tokens beginning with `ad-slot-` or `ad-banner-`, at any
 position in a whitespace-separated class list. The families deliberately
 include a hyphen boundary; arbitrary `ad-*` names, embedded substrings, and
-`data-ad*` attribute prefixes are not hidden. This uses a fixed set of CSS
-selectors in the normal style pass, without another DOM traversal or script.
-The complete prefix unions compile to bounded native scans. The first two
-bytes reject unrelated tokens before a full prefix comparison. Byte loads
-keep unaligned class spans safe on PSP, with no per-element allocation,
-extra DOM walk, or added cache.
-
-The stylesheet is shared verbatim with offline visual-reference capture via
-`src/cosmetic_blocker_css.inc`. The explicit ad-placement attribute namespace
-is hidden; ordinary content slots and similar substrings remain visible.
-The matched container is removed from flow, including its own reserved
-height and margins; unmatched ancestors' spacing is left intact.
+`data-ad*` attribute prefixes are not hidden. The explicit ad-placement
+attribute namespace is hidden; ordinary content slots and similar substrings
+remain visible. The matched container is removed from flow, including its
+own reserved height and margins; the spacing of its unmatched ancestors is
+left intact.
 
 It is composed in source order with global font scaling and Reader mode, so
 turning on either of those does not discard it. It is on by default, and
-**Settings → Privacy & security → Hide page ads** turns off only this
+**Menu → Settings → Privacy & security → Hide page ads** turns off only this
 stylesheet, leaving network blocking active.
 
 ## Cookie notices
 
-The built-in cookie-notice sheet recognizes bounded, established roots used by
+The built-in cookie-notice sheet recognizes the established roots used by
 OneTrust, Cookiebot, Didomi, Quantcast, TrustArc, Cookie Law Info, Osano-style
 Cookie Consent, Complianz, Funding Choices, and Sourcepoint, plus a small set
 of explicit `cookie-banner`, `cookie-consent`, and `cookie-notice` markers. It
@@ -153,7 +140,7 @@ resource modifiers are `script`, `image`, `stylesheet`/`css`, `font`,
 opens and range requests). `important` is accepted;
 hostname matching is always ASCII case-insensitive. Rules qualified with
 `other`, `ping`, or `websocket` are counted as ignored because those
-transports do not currently enter this policy seam; retaining them as active
+transports do not pass through this policy; keeping them as active
 would advertise protection they cannot provide.
 
 Custom-list cosmetic filters, regular expressions, path filters, scriptlets,
@@ -162,37 +149,22 @@ ignored.
 Tilefinch never approximates unsupported syntax into a broader block. An
 exception matching the request wins over a matching block rule.
 
-The file is limited to 512 KiB, 4,096 retained rules, a 128 KiB hostname
-pool, and 2,047 bytes per physical line. The open-addressed index and all
-strings use the shared session budget; a missing, oversized, truncated, or
-unreadable file leaves the previous configuration active. These bounds mean a
+The file is limited to 512 KiB, 4,096 retained rules, a 128 KiB hostname pool,
+and 2,047 bytes per physical line. A missing, oversized, truncated, or
+unreadable file leaves the previous configuration active. These limits mean a
 full desktop filter bundle may need to be reduced to its supported network
-rules before copying it to the PSP. When Custom is selected, the status message
-reports both retained and ignored rule counts so unsupported input is visible
-instead of silently appearing active. The browser neither downloads nor
-updates personal lists itself. The compiled Basic list can change only as part
-of an ordinary signed Tilefinch application release. Upstream lists remain
-under their own licenses; Tilefinch does not redistribute them.
+rules before copying it to the PSP. When Custom is selected, the status
+message reports both retained and ignored rule counts so unsupported input is
+visible instead of silently appearing active. The browser neither downloads
+nor updates personal lists itself. The compiled Basic list can change only as
+part of an ordinary signed Tilefinch application release. Upstream lists
+remain under their own licenses; Tilefinch does not redistribute them.
 
-A maximum-size active custom index retains about 176 KiB. Transactional
-Custom-to-Custom replacement can briefly hold the old and candidate indexes
-together, so its policy-data peak is about 352 KiB; allocation refusal simply
-keeps the previous list.
+If memory runs out while a new list loads, the previous list stays active.
 
 The [uBlock filter assets](https://ublockorigin.github.io/uAssets/) and
 [EasyList repository](https://github.com/easylist/easylist) are useful sources
 when preparing a personal list.
-
-The host lab exposes the same policy for deterministic testing:
-
-```sh
-./build-preset-release/psp-browser-interactive-lab \
-  --fixture fixtures/demo.html --content-blocker basic
-
-./build-preset-release/psp-browser-interactive-lab \
-  --fixture fixtures/demo.html --content-blocker custom \
-  --content-blocker-list /path/to/adblock.txt
-```
 
 ## What blocking saves
 
@@ -202,3 +174,38 @@ downstream cost of that request. The actual page-load improvement depends on
 which third-party resources a site uses. Cosmetic hiding does not alter the
 DOM or prevent a request by itself. Content blocking is not a privacy or
 malware-protection boundary.
+
+## Engineering notes
+
+- **Inline telemetry rules.** Basic and Custom refuse narrowly identified
+  inline telemetry bundles. Rules require a site boundary, an exact
+  first-statement trigger and all reviewed bundle markers; mentioning a
+  tracker name is not enough. Matching scans at most 512 KiB without an
+  allocation. The original script text stays in the DOM, while execution is
+  skipped before its first effect. Reference captures use the same rule
+  definitions and record the blocking separately; unrelated script errors
+  and crypto refusals remain failures.
+- **Cosmetic hiding.** The rules are a fixed set of CSS selectors applied in
+  the normal style pass, without another DOM traversal or script. The prefix
+  families compile to native scans: the first two bytes reject unrelated
+  tokens before a full prefix comparison, and byte loads keep unaligned
+  class spans safe on the PSP, with no per-element allocation or added cache.
+  The stylesheet is shared verbatim with offline visual-reference capture
+  through `src/cosmetic_blocker_css.inc`.
+- **Custom lists.** The open-addressed rule index and all its strings are
+  charged to the shared session budget. Replacing one custom list with
+  another briefly holds both indexes, and an allocation refusal keeps the
+  previous list.
+- **Saved exceptions** are activated only after the first stable chrome
+  frame, so a growing profile cannot hold the screen black during boot.
+- **Host lab.** The desktop lab exposes the same policy for deterministic
+  testing:
+
+  ```sh
+  ./build-preset-release/psp-browser-interactive-lab \
+    --fixture fixtures/demo.html --content-blocker basic
+
+  ./build-preset-release/psp-browser-interactive-lab \
+    --fixture fixtures/demo.html --content-blocker custom \
+    --content-blocker-list /path/to/adblock.txt
+  ```

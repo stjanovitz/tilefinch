@@ -1,12 +1,12 @@
 # Secure in-app updates
 
-Tilefinch can download and install a new browser release over Wi-Fi without
-removing the Memory Stick. Open **Settings → Updates → Version and update**
-to check manually. Tilefinch shows the available version
-and release note before downloading, and it never installs or restarts without
-confirmation. Its optional background check only looks for signed release
-metadata while Wi-Fi is already connected; it never downloads the update
-package by itself.
+For contributors and release engineers. Tilefinch can download and install a
+new browser release over Wi-Fi without removing the Memory Stick. Open
+**Settings → Updates → Version and update** to check manually. Tilefinch shows
+the available version and release note before downloading, and it never
+installs or restarts without confirmation. Its optional background check only
+looks for signed release metadata while Wi-Fi is already connected; it never
+downloads the update package by itself.
 
 Stable also offers **Square → Previous versions** on this page. The bounded
 list is queried from GitHub only when this screen is opened, retained in RAM,
@@ -23,67 +23,25 @@ outside both browser slots.
 
 ### Startup compatibility
 
-Browser slots remain ordinary `EBOOT.PBP` packages with the 64 MB memory-mode
-metadata and the existing protocol-1 file list. Older installed launchers can
-therefore continue receiving the same signed updates; a separate legacy feed
-is not required. The in-app updater never overwrites the stable root launcher.
-Getting a newer launcher's startup improvements requires copying the root
-`EBOOT.PBP` from a verified install archive once, preserving both slots and
-`data/`. Updating only the browser does not silently upgrade the launcher.
+Browser slots are ordinary `EBOOT.PBP` packages with the 64 MB memory-mode
+metadata and the protocol-1 file list, so older installed launchers receive
+the same signed updates without a separate legacy feed. The in-app updater
+never overwrites the root launcher: getting a newer launcher's startup
+improvements means copying the root `EBOOT.PBP` from a verified install
+archive once, preserving both slots and `data/`.
 
-A newer launcher can start the packaged relocatable browser without a second
-firmware restart. Fresh-install archives also include a content-addressed
-`slot-a/startup-<sha256>.prx`, paired at build time with a small identity marker
-in the PBP's auxiliary data. The matching launcher checks the marker, sizes,
-and module headers and loads this installed executable directly, without a
-first-boot extraction or full comparison. Like the root launcher and initial
-EBOOT, this is trusted executable content from the manually installed archive,
-not a new signature authority. The marker prevents accidental build mixing;
-it is not a per-boot content-integrity check. This shortcut is used only before
-a valid update journal exists, for default slot A, never for recovery or trials.
-Missing, mismatched, or safely refused bundled modules retain normal startup.
-A returned bundled-module start failure removes that optional copy before
-ordinary startup, avoiding repeated failed attempts on subsequent boots.
-
-The signed update file list and launcher protocol remain unchanged. Newer
-browser updaters prepare the derived module after slot promotion, before
-reporting ready to restart, using bounded copy/read-back steps and their
-existing I/O buffer. They save the reuse receipt against the final slot path.
-Failure or interruption loses only this optimization; the pending signed
-trial, per-file verification, health period and rollback remain authoritative.
-Older updaters still install exactly the same EBOOT and assets; their next
-launcher boot prepares the module as before. The stable root launcher is never
-silently replaced, and older launchers continue to use ordinary PBP startup.
-
-For journalled slots the launcher derives `data/startup-module.prx` from `DATA.PSP` and
-compares every cached byte against the selected package when creating or
-adopting the copy. A bounded reuse receipt binds the verified copy to the
-selected slot path and both files' sizes and modification/change metadata.
-Normal boots with matching metadata do not reread or hash either executable.
-The cache is not a signed authority or an alternative update slot. Missing,
-static legacy, malformed, read-only, full-card, and failed module-start cases
-retain ordinary package startup. Pre-held L and recovery bypass this cache.
-Signed installation, trial-health, anti-rollback, and candidate per-file
-verification remain unchanged. The receipt is not authenticated: post-check
-corruption or modification preserving metadata is deliberately not detected
-at every boot. A resulting failed launch may require pre-held L recovery.
-
-The cache costs at most 16 MiB on card, plus one equally bounded temporary
-while replacing it, plus a receipt smaller than 1 KiB. A successful reuse
-makes no cache writes; missing/mismatched receipts cause full comparison,
-and detectable changes cause rebuilding and read-back before use. An interrupted temporary
-is never executed. Deleting these derived files is safe; startup recreates
-them if possible or uses the authoritative package. Removing only the receipt
-forces full verification on the next ordinary launch. Slot switches change
-the receipt identity; explicit update downloads remove the copy and receipt.
-Manual replacement preserving size and timestamps can evade this hint;
-delete the derived cache/receipt when installing such a replacement.
-The first start after an older updater changes the browser, or after optional
-preparation fails, can take longer while this copy is prepared; subsequent
-starts reuse it. Older launchers do not prepare it.
-An explicitly approved app download first removes the derived cache so its
-disk usage cannot prevent the ordinary update free-space check from succeeding.
-Background version checks do not remove it.
+A matching launcher can start the browser without a second firmware restart,
+from a build-paired `startup-<sha256>.prx` in a fresh install's slot A or from
+the derived `data/startup-module.prx` cache that it or the updater prepares
+from the selected slot. Neither file is a signature authority or an
+alternative update slot: they are trusted executable copies whose identity
+markers and reuse receipt prevent accidental mixing, not per-boot integrity
+checks. Missing, mismatched or refused copies, pre-held L, and recovery all
+use ordinary package startup, and signed installation, trial health,
+anti-rollback and per-file verification are unchanged. Deleting the copies is
+safe. Their size bounds, receipts and reclaim rules are in
+[Memory Stick storage](STORAGE.md#data--settings-and-session) and its
+[slots section](STORAGE.md#dataupdate-and-the-slots--signed-updates).
 
 Stable is the default channel. Stable and Beta accept only releases authorized
 by Tilefinch's embedded public key; the private signing key is never shipped to
@@ -149,9 +107,8 @@ not tell the two apart from the metadata. This does not admit unsigned code
 or remotely selected downgrades -- signatures and the ordinary sequence and
 equivocation checks are unchanged -- and it does not touch Developer, whose
 payload is unsigned by construction and reachable only through the two local
-opt-ins above. Closing it means adding a channel field to the signed manifest, which
-is a release-cut format change and needs its own design pass; it is
-deliberately not attempted here.
+opt-ins above. Closing it needs a channel field in the signed manifest, a
+release-cut format change.
 
 ## Security objective
 
@@ -187,15 +144,17 @@ restart into it.
 The page begins with:
 
 ```text
-CURRENT       0.4.0 (42)
+CURRENT       0.1.44 (46)
 CHECK FOR UPDATE
 ```
 
-No request happens until `CHECK FOR UPDATE` is activated. A valid newer
-release changes the page to:
+The number in parentheses is the signed release sequence, a monotonic integer
+that release tooling assigns separately from the version (see
+[Signed metadata](#signed-metadata)). No request happens until
+`CHECK FOR UPDATE` is activated. A valid newer release changes the page to:
 
 ```text
-AVAILABLE     0.4.1 (43)
+AVAILABLE     0.1.45 (47)
 DOWNLOAD      15.8 MB
 SIGNED NOTES  Safer, faster updates.
 DOWNLOAD UPDATE
@@ -331,44 +290,13 @@ The first updater-capable release needs a one-time manual installation. A
 currently running, single root EBOOT cannot replace itself while preserving a
 launchable file through every possible power loss.
 
-```text
-PSP/GAME/TILEFINCH/
-  EBOOT.PBP                  stable launcher and trust root
-  data/                      user-owned, shared mutable state
-    profile.cfg
-    boot-overrides.cfg
-    recovery.cfg
-    http-cache.bin
-    local-storage.bin
-    update-state.0
-    update-state.1
-    update/
-      package.part
-  components/                 optional data, outside browser slots
-    voice-en-us/
-    glyph-ja/
-    glyph-zh-hans/
-    glyph-zh-hant/
-    glyph-ko/
-    glyph-emoji-color/
-    glyph-cyrillic/
-    glyph-latin-extended/
-    glyph-arabic/
-    glyph-hebrew/
-    glyph-devanagari/
-      active/
-      previous/
-  slot-a/
-    EBOOT.PBP
-    slot.tfum
-    fonts/
-    roots.pem
-    boot-defaults.cfg
-    tilefinch-wasm.prx
-    tilefinch-voice.prx
-  slot-b/
-    ...
-```
+The installation is a frozen root `EBOOT.PBP` (the stable launcher and trust
+root), two browser slots `slot-a/` and `slot-b/`, the shared mutable `data/`
+directory, and optional signed `components/` outside both slots. Each slot
+holds the browser `EBOOT.PBP`, its signed `slot.tfum`, and the allowlisted
+assets of the [release package](#release-package). The file-by-file map, with
+size bounds and replacement disciplines, is in
+[Memory Stick storage](STORAGE.md#layout-map).
 
 The launcher chooses a slot and starts it through the CFW
 `sctrlKernelLoadExecVSHMs2()` Memory Stick handoff. The ordinary user-mode
@@ -392,34 +320,29 @@ initial manual installation there is no previous slot yet, so L is
 acknowledged but continues into slot A; a previous version exists only after
 the first successful A/B update.
 
-The browser must split its current sibling-path policy:
+A slotted browser splits its paths (`src/install_paths.c`):
 
-- immutable program resources remain relative to the slot EBOOT;
-- signed boot defaults remain relative to the slot EBOOT;
+- immutable program resources and the signed boot defaults are relative to
+  the slot EBOOT;
 - user boot overrides, profile, cache, storage, recovery, and updater state use
   the shared installation `data/` directory.
 
 Signed defaults and mutable overrides are separate files. An update may replace
 `slot-*/boot-defaults.cfg`, while `data/boot-overrides.cfg` survives and wins
-for user-selectable values such as the Wi-Fi profile and home URL. The path
-split migrates an existing `boot-live.cfg` into shared overrides without
-silently resetting those values.
+for user-selectable values such as the Wi-Fi profile and home URL. An existing
+`boot-live.cfg` beside the root launcher is migrated into the shared overrides
+without resetting those values.
 
-The browser derives its slot and installation root from its own `argv[0]`,
-using the sibling-path logic it already needs for resources. Launcher-provided
-slot and data-directory arguments are advisory and must agree with that
-derived identity; missing or malformed arguments cannot prevent a trial from
-recording health.
+The browser derives its slot and installation root from its own `argv[0]`.
+Launcher-provided slot and data-directory arguments are advisory and must
+agree with that derived identity; missing or malformed arguments cannot
+prevent a trial from recording health. Changing slots therefore never appears
+to erase user state. Each slot carries its own copy of the immutable assets.
 
-Without this split, changing slots would appear to erase user state. The
-installer duplicates immutable assets between slots.
-Content-addressed sharing can come later, after rollback and garbage
-collection are proven.
-
-This design assumes the custom firmware already required to run Tilefinch can
-hand off between homebrew EBOOTs through the calls above. Device validation
-must cover the supported CFW set. If a firmware refuses that handoff, its safe
-fallback is a documented manual-copy update, not a weaker in-place installer.
+Tilefinch requires custom firmware that can hand off between homebrew EBOOTs
+through the calls above, and device validation covers the supported CFW set.
+On a firmware that refuses that handoff, the safe fallback is a manual-copy
+update, not a weaker in-place installer.
 
 ## Cryptographic trust
 
@@ -428,15 +351,17 @@ PSP image already links the required mbed TLS 3.6.7 P-256, ECDSA verification,
 and streaming SHA-256 routines for HTTPS, so the updater does not need a
 second cryptographic library.
 
-Production should use a TUF-inspired split:
+Trust follows a TUF-inspired split:
 
-- a 2-of-3 offline root role authorizes root and release keys;
-- preferably a 2-of-3 offline release role signs update manifests;
+- an offline root role authorizes root and release keys;
+- an offline release role signs update manifests;
 - each distinct key counts at most once toward a threshold.
 
-A 1-of-1 offline release key is a simpler operational starting point, but its
-compromise can authorize a malicious release until a newer root revokes it.
-No private key belongs in the repository, an EBOOT, a GitHub account, or a
+The shipped root v1 uses a 1-of-1 root and a 1-of-1 release role (see
+[Root v1 provenance](#root-v1-provenance)). A compromise of the single release
+key can authorize a malicious release until a newer root revokes it. A 2-of-3
+root and release role is a future option that needs no change to the device
+verifier or the formats. No private key belongs in the repository, an EBOOT, a GitHub account, or a
 GitHub Actions secret. CI may produce unsigned artifacts; offline release
 signing occurs only after their hashes are independently checked.
 
@@ -609,8 +534,7 @@ format can turn that denial of service into availability.
 
 ## Release package
 
-The first format should be an uncompressed sequential `TFUP` package rather
-than ZIP or TAR:
+A release is an uncompressed sequential `TFUP` package rather than ZIP or TAR:
 
 - at most 32 MiB and 64 files;
 - fixed bounded table followed by concatenated payloads;
@@ -629,7 +553,7 @@ download fails before promotion. A standalone installer without that retained
 proof—or a download that could not retain a well-formed table under its RAM
 bound—falls back to the complete package verification pass. Per-file digests
 also give the launcher a bounded way to revalidate a pending slot. Compression
-can be considered later only with independent compressed and expanded limits.
+would need independent compressed and expanded limits.
 
 Voice recognition is a separate signed component, not a second browser
 bundle. Its `TFVMv1` envelope uses the
@@ -669,7 +593,7 @@ third, non-interchangeable authority: `TFGMv1` envelopes sign the
 `tilefinch:glyph-component-manifest:v1` domain and authorize only raw bounded
 `TFGFv1` packages (format 3). Fixed asset names identify Japanese, Simplified
 Chinese, Traditional Chinese, Korean, Cyrillic, Extended Latin, and color
-emoji, plus Arabic, Hebrew and Devanagari page-text packs. Each pack has its own monotonic
+emoji, plus Arabic, Hebrew, Devanagari and Bengali-Assamese page-text packs. Each pack has its own monotonic
 sequence and component ID; the installer
 verifies the signed size and digest, parses the complete bounded index, writes
 `READY` last, and then promotes `candidate.tmp → active` while retaining one
@@ -764,9 +688,8 @@ callbacks per frame, but keeps the existing 2 ms pump budget. A response length
 is useful defense-in-depth, but only the signed exact size and digest authorize
 the package.
 
-An interrupted first implementation simply restarts the download. A future
-Range resume must re-hash the existing prefix and require an exact `206
-Content-Range`; it cannot trust saved hash state blindly.
+An interrupted download starts again from the beginning; saved hash state is
+never trusted.
 
 A PSP must not contain a personal access token. In-app distribution therefore
 requires public release assets: the GitHub owner and repository they are
@@ -877,7 +800,7 @@ can still be supplied explicitly:
 ```sh
 cmake --preset psp \
   -DTILEFINCH_UPDATE_ROOT_V1=/path/to/alternate-root-v1.tfur \
-  -DTILEFINCH_RELEASE_SEQUENCE=43 \
+  -DTILEFINCH_RELEASE_SEQUENCE=47 \
   -DTILEFINCH_UPDATE_REPOSITORY_OWNER=public-owner \
   -DTILEFINCH_UPDATE_REPOSITORY_NAME=tilefinch-releases
 cmake --build build-preset-psp --target tilefinch-psp-install-tree
@@ -894,8 +817,8 @@ The offline producer is intentionally multi-step:
 python3 tools/tilefinch_update_tool.py pack \
   --directory release-slot --output tilefinch-psp.tfup
 python3 tools/tilefinch_update_tool.py manifest \
-  --package tilefinch-psp.tfup --root-version 1 --sequence 43 \
-  --expires 2000000000 --version 0.4.1 --tag v0.4.1 \
+  --package tilefinch-psp.tfup --root-version 1 --sequence 47 \
+  --expires 2000000000 --version 0.1.45 --tag v0.1.45 \
   --asset tilefinch-psp.tfup --decoder-abi 3 \
   --notes release-notes.txt \
   --output manifest.tfum-body

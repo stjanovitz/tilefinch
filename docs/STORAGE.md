@@ -1,10 +1,10 @@
 # Memory Stick storage
 
-What Tilefinch writes to the Memory Stick, how large each file can get, what
-reclaims it, and what happens to it on a power cut. The stick is FAT with no
-journal and roughly 1 MB/s writes, so every writer here is explicit about its
-replacement discipline. User-facing guidance ("where your data lives", what is
-safe to delete) is in the root
+For contributors. What Tilefinch writes to the Memory Stick, how large each
+file can get, what reclaims it, and what happens to it on a power cut. The
+stick is FAT with no journal and roughly 1 MB/s writes, so every writer here is
+explicit about its replacement discipline. User-facing guidance ("where your
+data lives", what is safe to delete) is in the root
 [TROUBLESHOOTING](../TROUBLESHOOTING.md#where-your-data-lives); this page is
 the engineering contract behind it.
 
@@ -61,22 +61,14 @@ smaller. "Writer" names the owning source file.
 
 ### `data/` — settings and session
 
-Fresh-install slot A includes one build-paired `startup-<sha256>.prx` (at most
-16 MiB). It is an installed executable, not page data; only the matching
-launcher's journal-free default boot uses it. Updates do not ship additional
-wire-package files and never depend on this first-install shortcut.
-An approved app download reclaims matching bundled duplicates in both slots;
-the slot PBPs and unrelated files remain untouched. A bundled module whose
-startup returns a failure is also removed so the next boot does not retry it.
-
-The launcher or a newer updater may also keep `startup-module.prx` (at most 16 MiB) and an
-equally bounded `startup-module.tmp` during replacement. These are derived
+The launcher or the updater may keep `startup-module.prx` (at most 16 MiB)
+and an equally bounded `startup-module.tmp` during replacement. These are derived
 executable cache files, not user data. Creation/adoption compares all bytes
 with the selected slot's packaged module, then writes `startup-module.prx.receipt`
 (less than 1 KiB). Subsequent boots trust matching slot/path and file metadata
 without rescanning either executable. This intentionally does not detect
-same-metadata corruption; pre-held L recovery bypasses the cache. Cache hits write nothing. Failed
-preparation uses the ordinary package, and recovery bypasses the cache.
+same-metadata corruption; pre-held L recovery bypasses the cache. Cache hits
+write nothing, and failed preparation uses the ordinary package.
 All three files may be deleted safely; none is restored as an update authority.
 An explicitly requested app download reclaims them before checking free space;
 background version checks leave them alone.
@@ -118,9 +110,9 @@ scripts** tier below is the only other on-card bytecode.
 
 Both are charged to the page Budget as `SESSION` memory, at most 128 entries
 each, and the table itself is allocated on the first store. An entry outlives
-the HTTP response it was compiled from: the response cache (640 KiB on the PSP,
-shared with images and stylesheets) used to carry classic bytecode and lost
-nearly all of it before a revisit. A lookup hashes the fetched bytes and
+the HTTP response it was compiled from, which the smaller response cache
+(shared with images and stylesheets) would evict before a revisit. A lookup
+hashes the fetched bytes and
 reuses bytecode only for byte-identical source; bytecode is never used to
 satisfy a request. Before the page Budget refuses an allocation, the engine's
 reclaim hook evicts least-recently-used entries from the fuller table, and the
@@ -219,33 +211,11 @@ for development and then takes precedence over the menu.
   blocks site data, and no-store responses, `data:`/`blob:` scripts and
   opaque-origin documents never reach the tables it writes from.
 
-8 MB holds the compiled scripts of about 30 median script pages of the
-2026-10 site census (146 KiB of source each, about 1.5 times that in
-bytecode) or five of its heaviest (1.45 MiB of source at the 90th
-percentile), against 12-18 MB for all 55 pages. Writing it is a few seconds
-of idle Memory Stick time spread over many pages. The cache avoids recompiling
-unchanged assets after a restart; the benefit depends on the page and cache hits.
+Writing the tier is idle Memory Stick time spread over many pages. It avoids
+recompiling unchanged scripts after a restart; the benefit depends on the page
+and its cache hits.
 
 ### Site storage
-
-#### Saved YouTube login (opt-in)
-
-The native provider offers to save a newly verified login. The default is
-**Ask**, with **Not now** selected. **Always** is an explicit remembered
-choice; **Never** removes the saved file and suppresses future prompts.
-`data/youtube-login.bin` contains only secure, unpartitioned YouTube-domain
-cookies, never a password or Google-domain cookies. It is bounded to 64 KiB
-and the session cookie-entry limit, checksummed, and replaced through a
-temporary file. There is no backup copy. The checksum detects corruption;
-it does not encrypt or authenticate the file. Anyone holding the card may
-be able to use the saved session.
-
-Restoration is transactional at boot; invalid, expired, or budget-refused
-data cannot overwrite a live cookie jar. Failed saving leaves the current
-session working. Ordinary refreshes and exit do not write this file.
-Sign out, clearing cookies, clearing YouTube's site data, selecting Never,
-or disabling Cookies & storage removes it. Preference changes use the
-existing profile-saving path independently of the credential file.
 
 `localStorage`, `sessionStorage`, and the origin-private file system
 (`navigator.storage.getDirectory()`) share one store in the browser session,
@@ -259,11 +229,11 @@ in RAM:
   64 KiB.
 - A site that cannot grow gets `QuotaExceededError` for that write, and the
   browser offers the Memory Stick once: the prompt names the site, how much
-  it has stored and needs, the 4 MB Memory Stick limit, and the free space.
+  it has stored and needs, the 4 MiB Memory Stick limit, and the free space.
   **X** keeps the site on the stick for this session, **Triangle** always,
   **O** keeps it in RAM for the rest of the session. The page may need a
   reload to retry what failed.
-- On the Memory Stick a site may store 4 MB (1 MB per value, 512 KiB per OPFS
+- On the Memory Stick a site may store 4 MiB (1 MiB per value, 512 KiB per OPFS
   file). Only its keys and file offsets stay in RAM; values are read when
   the page asks. A this-session file is deleted at exit. An always-kept
   site is loaded on its first use each boot, without its `sessionStorage`.
@@ -289,6 +259,27 @@ captive-portal session gets an empty RAM-only store of its own, and the
 **Save RAM storage at exit** snapshot never includes a site on the Memory
 Stick. That snapshot is off by default, so without a per-site choice nothing
 a page stores reaches the Memory Stick.
+
+#### Saved video login (opt-in)
+
+The native video provider offers to save a newly verified login. The default
+is **Ask**, with **Not now** selected. **Always** is an explicit remembered
+choice; **Never** removes the saved file and suppresses future prompts.
+`data/youtube-login.bin` contains only the provider's secure, unpartitioned
+cookies, never a password or the sign-in service's cookies. It is bounded to
+64 KiB and the session cookie-entry limit, checksummed, and replaced through a
+temporary file. There is no backup copy. The checksum detects corruption; it
+does not encrypt or authenticate the file. Anyone holding the card may be able
+to use the saved session.
+
+Restoration is transactional at boot; invalid, expired, or budget-refused
+data cannot overwrite a live cookie jar. Failed saving leaves the current
+session working. Ordinary refreshes and exit do not write this file.
+Sign out, clearing cookies, clearing the provider's site data, selecting
+Never, or disabling Cookies & storage removes it. Preference changes use the
+existing profile-saving path independently of the credential file.
+
+### Exit saves and other `data/` files
 
 Each discipline can briefly hold up to three generations of a file
 (`.tmp` + `.bak` + primary) while a save is in flight; budget accordingly for
@@ -360,6 +351,14 @@ recreated with defaults.
 | `slot-a/`, `slot-b/` | `update_installer.c` | ≈ package size each (packages store files uncompressed; offsets must sum to the package size) | the non-active slot is replaced by the next update | staged as `slot-X.tmp` (per-file SHA-256 + sync, then `slot.tfum`, `slot.tfut`, `READY` markers, device sync), promoted by directory rename with `.old` fallback |
 | `slot-X.tmp/`, `slot-X.old/` | `update_installer.c` | ≈ package size, transient | removed by the next install attempt (bounded sweep: ≤ 256 entries, depth ≤ 8) | n/a |
 
+Fresh-install slot A also includes one build-paired `startup-<sha256>.prx` (at
+most 16 MiB). It is an installed executable, not page data; only the matching
+launcher's journal-free default boot uses it. Updates do not ship it and never
+depend on this first-install shortcut. An approved app download reclaims
+matching bundled duplicates in both slots; the slot PBPs and unrelated files
+are left untouched. A bundled module whose startup returns a failure is also
+removed so the next boot does not retry it.
+
 Space checks are pre-flight, honest, and use the device-string query:
 
 - **Before downloading** a package: `2 × package_size + 4 MB` free, else
@@ -385,8 +384,8 @@ Optional components are siblings of the browser slots so A/B browser updates
 neither duplicate nor delete them. Voice uses `components/voice-en-us/`;
 glyph packs use `components/glyph-ja/`, `glyph-zh-hans/`, `glyph-zh-hant/`,
 `glyph-ko/`, `glyph-emoji-color/`, `glyph-cyrillic/`,
-`glyph-latin-extended/`, `glyph-arabic/`, `glyph-hebrew/`, and
-`glyph-devanagari/`. A user-built
+`glyph-latin-extended/`, `glyph-arabic/`, `glyph-hebrew/`,
+`glyph-devanagari/`, and `glyph-bengali-assamese/`. A user-built
 video decoder uses `components/swdec/`
 and contains exactly `tilefinch-swdec.prx`, `swdec-meload.prx`, and the small
 `component-info.txt` ABI record. Tilefinch never writes or updates those
@@ -464,8 +463,7 @@ promotion are reclaimed lazily. Files it does not recognize are never touched.
 | `tilefinch-<date>-<tick>.png` | `screenshot_png.c` | ≈ 385 KB each (480×272, uncompressed PNG) | **nothing** — manual deletion over USB only | tmp + rename (names are unique, so no replacement window) |
 | `tilefinch-<...>.png.tmp` | `screenshot_png.c` | ≈ 385 KB, transient | removed when its capture finishes or is cancelled; orphans swept when the directory is opened for the next capture | n/a |
 
-There is still no count cap and the in-browser list shows at most 32
-entries, so older captures keep consuming space silently. Two things are
+There is no count cap and the in-browser list shows at most 32 entries, so older captures keep consuming space silently. Two things are
 bounded: a capture interrupted by a crash strands a `.png.tmp`, and the next
 capture sweeps those (bounded walk of ≤ 128 directory entries; only names
 this writer could have produced are removed); and each capture pre-flights

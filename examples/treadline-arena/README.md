@@ -240,8 +240,8 @@ contact, contact shadows under blocks, and a backdrop that leans in from the
 floor's edge up into a lit sky band. Changing **Light** (or a campaign
 theater's tint) takes effect at once. Sparks cool from white-hot through
 orange to smoke, and a destroyed tank leaves a scorch mark once its sparks
-have burned out. Earlier versions offered a Classic look as a setting; saves
-that still carry it load normally and the setting is ignored (see
+have burned out. There is one look; a save that carries the retired Classic
+look setting loads normally and the setting is ignored (see
 [Arena look](#arena-look)).
 
 ## The Line (campaign)
@@ -440,7 +440,7 @@ waits rather than grinding against the wall.
 
 Crates leave oil or ice when destroyed; explosive crates can trigger nearby
 crates. Mud slows travel, while oil and ice preserve momentum. Hazards are
-currently single-player/local-duel features, not multiplayer snapshot state.
+single-player and local-duel features, not multiplayer snapshot state.
 
 ## Replays, medals, and lighting
 
@@ -465,7 +465,7 @@ edge-mounted objective arrow. A mast marks the objective in the arena: Team
 Control's transmitter, the convoy, or the nearest foe (a mission's own
 targets where it has them). The mast keeps its target until that target is
 gone or another stays clearly nearer (within 80% of the distance) for half
-a second, so two foes at about the same distance no longer swap it back and
+a second, so two foes at about the same distance do not swap it back and
 forth. **Settings > Camera & Display > Objective arrow** is Auto by default:
 the HUD arrow shows only where the objective is not a foe that comes to
 you, namely Team Control (the transmitter), Convoy Escort (the convoy while
@@ -507,109 +507,62 @@ network-policy, and lifecycle contract.
 
 ## Engineering details
 
-Treadline Arena is both a game and a qualification example for Tilefinch's
-bounded WebGL game profile. Its steady gameplay frame uses one cached static
-arena draw, one compact instanced box draw, and one retained HUD draw. Tanks,
-shells, pickups, particles, shadows, and decals share fixed pools; optional
-effects are dropped before critical actors when the 64-instance visual budget
-is full. Gameplay avoids per-frame collection pressure and does not allocate
-new entity pools as difficulty increases.
-
-The renderer retains immutable geometry and updates bounded transform and tint
-streams. HUD text and indicators share one quantized draw stream, so changing a
-score or meter does not rebuild HTML or add a new steady-state draw. The title,
-setup, pause, and multiplayer surfaces remain ordinary accessible HTML.
-
-The 30fps target remains a physical-device qualification requirement, not a
-guarantee from host tests. Device runs on a PSP-3000 in October 2026
-(validation build, installed package) are close:
-the bot-driven long soak missed 1-2 of about 1,340 two-vblank deadlines and
-the Onslaught soak 0-1, and an Onslaught boss wave with real input and audio
-missed 3 of 2,176 (readiness p95 28.2 ms). The late frame that remains in the
-long soak is the synchronous arena change; the others are combat frames that
-stack a sound start (0.84 ms), a particle burst and a decal. Whenever no menu
-or toast covers it, the full-viewport canvas is published by the GE in about
-0.7 ms instead of about 5 ms of CPU conversion and copy. Music's cost on the
-device is not yet measured in a soak.
-
-The menus are tuned for Tilefinch's canvas overlay. The page registers no
-focus-event listener (focus notes poll `document.activeElement`), focus
-styles are outlines, menu text helpers skip writes that would not change the
-text, and Range Fault and drill notes wait for focus to rest 150 ms of wall
-time. On a PSP-3000 a focus move is one 51 ms loop and a note write
-114-117 ms. Opening Quick Match from the title is one 300 ms loop; after
-Deploy the first frame without the menu arrives in about 0.5 s and steady
-gameplay starts about 0.58 s after the press (about 180 ms of that first
-turn is `music.js` building its segments); generated arenas are built in bounded slices behind the
-FORGING ARENA screen.
-
-Detailed AI and movement clocks are opt-in qualification work; use a matched
-run with those clocks disabled when measuring displayed gameplay cadence.
-Explicitly enable killcam history in input qualifications that measure normal
-gameplay; the qualification override is covered by the host feature gate.
-Bots share bounded goal/revision-keyed route fields, with actor-specific
-waypoints and fresh visibility checks; a field search reads one sentinel
-array per neighbour, and waypoint candidates are sight-tested best first.
-Pocket checks flood row bit masks; breach plans are bounded 256-cell
-searches made only when a route is exhausted, at most twice a second. Contact distances use multiplication
-instead of software exponentiation on the PSP.
-Fixed-position barriers and crates use bounded candidate grids followed by exact
-collision checks; destruction still takes effect immediately. Qualification
-also separates cannon, secondary, gadget and command action costs.
-Onslaught's four AI parameter tables are interpolated once per wave, not once
-per actor query. These optimizations preserve collision outcomes, simulation
-cadence, and random-number consumption; deterministic league comparisons check
-that the resulting matches remain unchanged.
-Audio attribution splits envelope setup into cancellation, reset, attack and
-release. The bounded envelope microprobe runs after gameplay measurement;
-its deliberate burst must not be counted as a gameplay-frame maximum.
-HUD rebuilding yields under load but makes bounded progress, retaining its
-previous complete mesh until the replacement is ready.
-Measurement and video runs can choose the aim guide per run with
-`aim=off|sight|full` in the page URL, and hide shell tracers with
-`tracers=off`; neither changes saved settings.
-
-Onslaught generation runs only at a mode transition. It uses a separate
-xorshift state, fixed typed-array scratch grids, a bounded flood-fill queue, and
-at most 20 attempts. Placement is integer-only on half-world-unit cells. The
-gameplay random stream is untouched, and a failed search falls back to an
-authored arena.
-
-Multiplayer protocol v4 carries a generated arena's accepted seed, 16-bit
-layout checksum, and 16-bit active-barrier mask in every host snapshot. A fresh
-client rebuilds that fixed layout once without running the host's validator.
-Checksum mismatch falls back to an authored arena and displays a warning rather
-than silently desynchronizing. Any generator or motif-table change requires a
-multiplayer protocol bump.
-
-All control schemes translate into the same fixed online command: one bit for
-each tread, one reverse bit, and the existing aim vector. Arcade's nub is an
-intent control rather than an analog throttle, so the schemes interoperate.
-Version 4 interprets the existing fire bit as held state for charge/release.
-Version 5 widens the input flags to 16 bits in the same 12-byte record: bits
-8 and 9 make a tread negative (pivot) and bit 10 is a lunge edge, retained
-until a packet is sent like the other one-shot actions. A peer whose packets
-carry another version is disconnected with "The other player runs a different
-Treadline version." instead of silently desynchronizing. Analog throttle needs
-a future protocol bump.
-
-The host sends fixed 12-byte input records at 20 Hz and bounded replaceable
-snapshots of at most 320 bytes at 15 Hz. Rendering is independent of packet
-arrival, stale sequence numbers are ignored, and reconnect or late join obtains
-the complete arena identity from the first accepted snapshot.
+Treadline Arena is also the reference package for the
+[Tilefinch Game Profile](../../docs/GAME_PROFILE.md): its retained renderer,
+in-canvas HUD, focus-safe menus, pooled effects and bot AI follow that page's
+performance recipes, and [Treadline qualification](QUALIFICATION.md) covers its
+host and physical-PSP qualification. This section describes only what is
+specific to the game.
 
 Preferences are stored locally, but unfinished matches are not serialized.
 Reloading returns to a deterministic title state. Backgrounding and resuming
 uses one collision-safe capped step instead of replaying accumulated frames.
 
+Onslaught generation runs only at a mode transition. It uses a separate
+xorshift state, fixed typed-array scratch grids, a bounded flood-fill queue,
+and at most 20 attempts. Placement is integer-only on half-world-unit cells.
+The gameplay random stream is untouched, and a failed search falls back to an
+authored arena.
+
+Measurement and video runs can choose the aim guide per run with
+`aim=off|sight|full` in the page URL, and hide shell tracers with
+`tracers=off`; neither changes saved settings.
+
+### Online wire format
+
+Online play uses protocol version 5. Every packet starts with a kind byte
+(1 for input, 2 for a snapshot) and the protocol version; a peer whose packets
+carry another version is disconnected with "The other player runs a different
+Treadline version." instead of silently desynchronizing.
+
+- **Input (guest to host, 20 Hz).** A fixed 12-byte record: a sequence
+  number, 16 bits of input flags and the aim vector. The flags are one bit
+  per tread, reverse, fire (held, for charge/release), secondary, gadget and
+  ultimate, a negative bit per tread for pivots, and a lunge edge that is kept
+  until a packet is sent, like the other one-shot actions. Every control
+  scheme translates into these flags; Arcade's nub is an intent control
+  rather than an analog throttle, so the schemes interoperate.
+- **Snapshot (host to guest, 15 Hz).** A replaceable packet of at most
+  320 bytes: a 32-byte header, six tanks and up to 16 shells. The header
+  carries a generated arena's accepted seed, 16-bit layout checksum and
+  16-bit active-barrier mask, so a fresh or reconnecting client rebuilds the
+  layout once without running the host's validator. A checksum mismatch
+  falls back to an authored arena and shows **ARENA VERSION MISMATCH**.
+
+Rendering is independent of packet arrival, stale sequence numbers are
+ignored, and a late join obtains the complete arena identity from the first
+accepted snapshot. A change to the arena generator, its motif tables, the
+input record (analog throttle, for example) or the snapshot layout needs a
+new protocol version.
+
 ### Package and script limits
 
 The HTML, CSS, JavaScript, icon, and manifest are same-origin and
-self-contained. The package holds seven deferred scripts, about 685 KiB of
-JavaScript, and all seven are precompiled within Tilefinch's eight-script,
-1 MiB budget. `game.js` is about 400 KiB of the 512 KiB Game Profile
-per-script limit (the bot AI lives in `bots.js`, 72 KiB). The PSP app's
-default `boot.cfg` `file_kb` (4096) admits it, and a game staged by
+self-contained. The package holds seven deferred scripts, all precompiled
+within Tilefinch's eight-script, 1 MiB budget, and `game.js`, the largest,
+stays within the 512 KiB Game Profile per-script limit (the bot AI lives in
+`bots.js`). The PSP app's default `boot.cfg` `file_kb` (4096) admits it, and a
+game staged by
 `scripts/stage-psp-game.sh` gets `file_kb=512`; a value below `game.js`'s
 size skips it, and the menu then says the game could not load its files
 (Deploy reads **Unavailable**).
@@ -626,26 +579,25 @@ multiplayer API, so a PSP never fetches it and the package leaves it out.
 The package's file list is [`package-files.txt`](package-files.txt), which
 every packaging command, script and test in this repository reads. A
 qualification package (for a `?qualification=` URL) also carries
-`qualification.js`, the harness tooling (67 KiB) that the page fetches only
+`qualification.js`, the harness tooling that the page fetches only
 for those URLs, as its eighth script.
 
 ### Arena look
 
 The arena's look is baked into vertices the game already uploads, so it
 adds no draw. Light (and a campaign theater's tint) is one live uniform, so
-it never rebuilds geometry or the retained frame. Saves that still carry the
-retired Classic look keep it under `lk`; they load normally and the value is
-ignored.
+it never rebuilds geometry or the retained frame. A save carrying the
+retired Classic look under `lk` loads normally and the value is ignored.
 
 ### Aim guide and tracer drawing
 
 Guide lines and tracers are optional geometry: each leg is one thin ribbon,
 so Sight draws three boxes (like the reticle it replaced), Full at most five,
 and the tracer one or two; each set is admitted whole or dropped when a
-crowded frame has no room. Every extra box costs about 0.2 ms a frame on a
-PSP, which is why the legs are not dashed. They are visual only; no
+crowded frame has no room. Every extra box costs frame time on a PSP, which
+is why the legs are not dashed. They are visual only; no
 simulation, bot, control or replay state reads them. Replays record the
-guide level from replay version 14.
+guide level.
 
 ### Campaign internals
 
@@ -667,13 +619,13 @@ damage hooks while the range runs and lends it the menu. The range borrows
 the generated-arena slot with the slot's fixed shape (eight walls, two
 ramps), so it adds no geometry upload, texture or draw call; targets are the
 existing bot tanks with their AI switched off (`tank.inert`) and no cannon.
-`game.js` gained the inert flag, reads of `practice.on` and the Range's aim
-guide level (`practice.aimLevel`), and four bridge entries.
+`game.js` reads the inert flag, `practice.on` and the Range's aim guide level
+(`practice.aimLevel`), and exposes four bridge entries.
 
 Best times and totals are saved in the campaign save under `pr` with their
 own version. The range never records because live class, gadget and target
 switches are not replay inputs, so recording them would need a new replay
-format; REPLAY_VERSION is unchanged.
+format.
 
 ### Music engine
 
@@ -685,10 +637,9 @@ voice while an effect sounds. Each bar is one prebuilt gain curve per voice
 (plus a pitch curve when the bar changes pitch) of at most 64 samples. It is
 scheduled at most half a second ahead, after the previous curve has
 finished. A frame costs a few comparisons, and the intensity state is
-evaluated five times a second. Choosing a new program is not cheap: when a
-Quick Match Survival run moves to its next arena, the new arena's program is
-built at once (about 0.2 ms on the host; on the PSP, Deploy's whole music
-build measured about 180 ms). Music only reads game state. It is off in the
+evaluated five times a second. Building a program is not cheap: Deploy builds
+it before the match, and when a Quick Match Survival run moves to its next
+arena the new arena's program is built at once. Music only reads game state. It is off in the
 bot league and campaign sweep, and timing qualification URLs leave it out
 unless they add `music=on`. `node scripts/render-treadline-music-previews.js
 RENDERER OUT_DIR` renders listening previews through the real mixer with
@@ -715,13 +666,12 @@ contacts, wall-wasted shots, stuck time, front/rear damage, and objective time.
 Compare difficulty groups under the same harness, not asserted win-rate
 targets. Conformance checks that repeating a seed is identical.
 
-New pools are allocated once: eight hazards, four crates, six 256-cell
-navigation fields, 8,192 input steps, and a 48-frame packed killcam ring. Replay
-and killcam storage together use about 0.9MiB. No steady-state draw is added;
-the 64-instance and 4,096 translated-vertex ceilings still apply. Optional
-hazards/effects are omitted before tanks and shells when the stream fills.
-Physical-PSP timing and manual control feel need qualification after this
-expansion; host correctness tests are not a device frame-time guarantee.
+Pools are allocated once: eight hazards, four crates, six 256-cell navigation
+fields, 8,192 input steps, and a 48-frame packed killcam ring. They add no
+steady-state draw, and the 64-instance and 4,096 translated-vertex ceilings
+apply. Optional hazards and effects are omitted before tanks and shells when
+the stream fills. Host correctness tests are not a device frame-time
+guarantee.
 
 ### Testing tools
 
@@ -753,7 +703,7 @@ On PPSSPP or a PSP, the qualification URL switches `qualification=long-soak`
 (an automated bot-driven match), `mode=control|convoy|onslaught`, `seed=N`
 and `music=on` select a measured workload, and
 `tests/input-scripts/treadline-*.txt` drive the scripted device runs; see
-[Canvas and WebGL game qualification](../../docs/DEVELOPMENT.md#canvas-and-webgl-game-qualification).
+[Treadline qualification](QUALIFICATION.md).
 
 For the wider compatibility and performance contract, see
 [Tilefinch Game Profile](../../docs/GAME_PROFILE.md) and

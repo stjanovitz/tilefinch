@@ -8,8 +8,8 @@ parses HTML and CSS, runs JavaScript, lays out modern mobile sites, rasterizes
 them into tiles, and plays video through the PSP's Media Engine or a bounded
 two-core software decoder.
 
-It aims at the web as it is rather than a curated subset. A page such as
-chatgpt.com loads more than a hundred JavaScript modules, hydrates a
+It aims at the web as it is rather than a curated subset. A modern chat
+application loads more than a hundred JavaScript modules, hydrates a
 client-side application, and streams its answer into the document. On the PSP
 all of that (the DOM, the JavaScript heap, styles, layout, and screen tiles)
 has to fit inside a 32 MiB envelope it shares with voice recognition, next to
@@ -125,13 +125,13 @@ represented by reservations against the same ceiling. Process-lifetime state
 that no page can own, such as the CA bundle and the cross-navigation TLS
 session store, is bounded separately and counted in the device reserve.
 
-Page JavaScript is layered: QuickJS carves every object of up to 504 bytes
+Page JavaScript is layered. QuickJS carves every object of up to 504 bytes
 (objects, shapes, property arrays, strings, closures, var refs) from its own
 4 KiB arenas, whose 8-byte block header is also the reference count and GC
-tag, and the QuickJS pool (`budget_quickjs_pool_*`) charges only
-those arenas and the engine's larger blocks to the Budget as
-`BUDGET_CATEGORY_JAVASCRIPT`, so a per-object allocator change belongs in the
-engine's arena code, not in the pool.
+tag. The QuickJS pool (`budget_quickjs_pool_*`) charges only those arenas and
+the engine's larger blocks to the Budget as `BUDGET_CATEGORY_JAVASCRIPT`. A
+per-object allocator change therefore belongs in the engine's arena code, not
+in the pool.
 
 A refused allocation is a normal result. Parser checkpoints, candidate pages,
 layout jobs, cache insertion, and script admission all have rollback or
@@ -228,13 +228,6 @@ surface over it (retry, Reader retry, and only the context actions that can
 help); Return simply shows the incumbent again, and no action publishes half
 a candidate with stale controller or render state.
 
-The experimental compressed-section mode was the one exception to this rule.
-It cut a large page into LZ-compressed sections of about 512 elements, kept
-one section as live DOM, and paged between them, so replacing a section could
-retire its DOM first. It was never enabled on the PSP and was retired on
-2026-10-25; commit `c05276c8` is the last tree that has it (its lab flags are
-in that tree's `docs/engineering/LAB_USAGE.md`).
-
 ### 4. Work is budgeted in time as well as bytes
 
 Parsing, selector matching, scripting, layout, resource decoding, tile
@@ -275,7 +268,7 @@ reason, the pump pairs that can still claim one resource in a frame, so a new
 pump, a dropped yield, or a new resource claim fails until the author decides
 the overlap. The table's comments and `include/tilefinch/frame_pumps.h` record
 each decision; what a run reports is described with the
-[`site-restore` scenario](engineering/INPUT_SCRIPT_HARNESS.md).
+[`site-restore` scenario](engineering/INPUT_SCENARIOS.md#site-restore).
 
 #### Resumable jobs
 
@@ -335,13 +328,14 @@ logic, rollback, bounds, and visual output. PPSSPP proves the Allegrex build
 and many PSP ABI paths. Only hardware proves cache coherency, module
 availability, WLAN timing, Media Engine behavior, Memory Stick semantics, and
 real input latency. [Device qualification](engineering/DEVICE_QUALIFICATION.md)
-assigns each claim to the environment able to prove it, and
-[Development](DEVELOPMENT.md#evidence-gates) lists what each gate (unit and
-fault-injection tests, the frame-pump proof, owner checks, WPT, replay, the
-fidelity scoreboard, build ratchets, the deterministic work record, PPSSPP,
-offline device replay, and the physical PSP) proves. Performance claims come
-from the device, and release builds compile logging, HTTP capture, and replay
-out.
+assigns each claim to the environment able to prove it, and the
+[evidence gates](DEVELOPMENT.md#evidence-gates) say what each gate proves and
+how performance is judged.
+
+A *validation build* in these documents is a PSP build configured with
+`TILEFINCH_PSP_VALIDATION_LOG=ON` (the `build-preset-psp-validation` tree);
+the legacy `psp-validation/` EBOOT is unrelated
+([presets and build trees](DEVELOPMENT.md#presets-and-build-trees)).
 
 ## Navigation and first paint
 
@@ -453,27 +447,19 @@ with no per-navigation inflate buffer or duplicate copy. Features are split
 into modules that activate lazily within fixed bounds: core DOM and event
 semantics are available immediately, and larger facilities install when a
 page first reaches their surface (the `Intl` polyfill, for example, on first
-access to `Intl`). A generated manifest proves that the authored sources and
-the committed bytecode agree.
-
-- **Compacted source.** The generator embeds a compacted copy of every
-  bootstrap source (indentation, trailing whitespace, and comments removed;
-  newlines kept) and refuses to emit unless its bytecode is identical to the
-  authored file's, so the bootstrap source ceiling measures code rather than
-  prose. It is separate from the ceiling for authored page scripts.
-- **Stripped bytecode.** The committed bytecode carries no source, line
-  tables, or local-variable names, because QuickJS would copy them out of ROM
-  into every realm's heap on restore. Bootstrap exceptions still name the
-  module and function, and `TILEFINCH_DISABLE_BOOTSTRAP_BYTECODE=1` compiles
-  the embedded source with full debug information when needed.
-- **Attributed growth.** `TILEFINCH_TRACE_JS_STARTUP=1` prints the heap each
-  module's evaluation retained, by QuickJS category, so growth is attributed
-  before the footprint guard test trips.
+access to `Intl`). The committed bytecode is stripped of source text, line
+tables, and local-variable names, which QuickJS would otherwise copy into
+every realm's heap, and a generated manifest proves it matches the authored
+sources ([regenerating the bootstrap](../src/bootstrap/README.md#regenerating)).
+`TILEFINCH_TRACE_JS_STARTUP=1` prints the heap each module's evaluation
+retained, by QuickJS category, so growth is attributed before the footprint
+guard test trips.
 
 ### Realms, workers, and frames
 
-Every script realm a page owns runs on the browser thread. There are three
-kinds, and none adds a mutator:
+Every script realm a page owns runs on the browser thread. A page can own
+three kinds of realm, and none adds a mutator; the fourth row is the
+`SharedWorker` shell, which creates no realm:
 
 | Realm | Bound | Isolation | Communicates by |
 |---|---|---|---|
@@ -484,17 +470,12 @@ kinds, and none adds a mutator:
 
 `SharedWorker` exists so feature detection sees a current browser, and every
 construction throws a `NotSupportedError` `DOMException` before allocating
-anything. Some sites read a missing `window.SharedWorker` as "old browser":
-one measured search page then loads about 2.2 MB of legacy and polyfill bundles
-instead of its 0.87 MB modern bundle. The shell allows its results to render
-within the existing page budget. Sites that really use shared workers catch the
-throw and take their fallback, as they do in browsers without it. The shell
-is defined eagerly in `compat.js` rather than behind the lazy Worker group,
-because that group costs 130-530 KiB of heap on pages that only probe the
-constructor; the eager class costs no measurable resident heap. A real
-per-page shared worker on the dedicated-worker machinery was prototyped and
-not adopted. Like the platform, the interface is exposed to windows only:
-dedicated worker globals do not resolve it.
+anything. Some sites read a missing `window.SharedWorker` as an old browser
+and load much larger legacy bundles; sites that really use shared workers
+catch the throw and take their fallback, as in browsers without it. The shell
+is defined eagerly in `compat.js`, not behind the lazy Worker group, so a page
+that only probes the constructor does not pay for that group. Like the
+platform, the interface is exposed to windows only.
 
 A Web Worker is concurrency in the page's programming model, not in the
 engine: `postMessage` crosses a structured-clone boundary into another
@@ -661,7 +642,7 @@ binding.
 **Build.** The PSP image is optimized for size, except QuickJS, which is built
 at `-O2` because the larger engine is faster on the device despite the
 instruction cache. Release builds add profile-guided optimization trained
-under PPSSPP on a recorded chatgpt.com session
+under PPSSPP on a recorded chat-application session
 (`scripts/train-quickjs-pgo.sh`). The profile is fingerprinted on the
 engine's sources, headers, compiler, and flags, configure refuses a stale one
 (which would make the engine larger and slower than none), and
@@ -772,68 +753,52 @@ restores the up-front check for A/B measurement.
 ### Function source outside the heap
 
 QuickJS keeps every function's source text for
-`Function.prototype.toString()`, and a lazily compiled function compiles
-from it on its first call. For a classic script that is about one copy of
-the whole script in the realm heap (a mean of 3.7 MB, a fifth of the heap,
-on the video pages that run out of JavaScript memory), plus a copy of each
-nested function's text while it compiles. A classic page script (inline or
-external) of at least 8 KiB therefore compiles with `JS_STRIP_SOURCE`, and
-its text goes to the realm's function-source store
-(`src/js_source_store.c`) in the page Budget, counted as JavaScript memory.
-Each function records only where its text is
-(`JS_SetExternalSourceHooks`, `third_party/quickjs/README.md`):
-`toString()` returns exactly what it returned before, a lazily compiled
-function reads its body from the store on its first call, and stacks keep
-file:line:col (the line tables stay). Modules are unchanged (a module of 8
-KiB or more keeps no text at all), and so are lazy-webpack factories, whose
-text that tier already keeps, eval, `Function` and worker scripts.
+`Function.prototype.toString()`, and a lazily compiled function compiles from
+it on its first call; for a large classic script that is a second copy of the
+script in the realm heap. A classic page script (inline or external) of at
+least 8 KiB therefore compiles with `JS_STRIP_SOURCE`, and its text goes to
+the realm's function-source store (`src/js_source_store.c`) in the page
+Budget, counted as JavaScript memory. Each function records only where its
+text is (`JS_SetExternalSourceHooks`, `third_party/quickjs/README.md`).
+`toString()` returns what it returned before, a lazy function reads its body
+from the store on its first call, and stacks keep file:line:col. Modules
+(which keep no text at 8 KiB or more), lazy-webpack factories, eval,
+`Function`, and worker scripts are unchanged.
 
-The store holds each script as 16 KiB blocks. While the page has room a
-block is a plain copy, so loading a page costs a copy rather than an
-encode. Once plain text passes a quarter of the room left above the
-realm's growth reserve, the oldest plain blocks are compressed (an
-LZ4-compatible block codec shared with the lazy-webpack tier,
-`src/script_text_lz.c`), and a read decodes only the start of the block it
-needs, keeping that block for the next read. When the realm's growth would
-otherwise be refused, cached script bodies give way first, then the store
-compresses what is still plain, then drops whole scripts that no uncompiled
-lazy function needs, least recently read first. A script's text is dropped
-only then, so the store is never why a page runs out of memory;
-`toString()` of a function whose text was dropped answers with the
-`[native code]` form, as a stripped module's does. Text an uncompiled lazy
-function needs is never dropped, nor text a compile or a bytecode restore
-in progress holds a lease on. A block that does not compress is kept plain
-and not tried again. `toString()` first asks the store whether the text
-is still there and whether the blocks it spans are ASCII (each block is
-classified once, when compressed or on the first such question, so adding
-a script stays a plain copy). Dropped text answers `[native code]` without
-allocating anything for the text. ASCII text is read straight into the
-result string and other text is decoded a window at a time, so it needs
-about the result's size, as the in-heap text did.
+The key rules:
 
-Script admission (the compile floor, the loader's pressure gate and the
-heavy-page memory estimate) subtracts the stored text from the room it
-sees, as if the text were still in the heap: a page admits the scripts it
-admitted before, and the room the store frees goes to the scripts it
-already runs. At the wall, a lazily compiled function that cannot compile
-fails its call uncatchably and stays uncompiled. Inside a promise reaction
-that still becomes a rejection, so the microtask checkpoint ends at that
-job and the rest of the queue runs on a later turn, after growth and
-collection have had a chance, instead of every waiting reaction retrying
-the same refused compile at once. Page code that catches the
-out-of-memory error at the limit and tries again is stopped as out of
-memory once one entry into JavaScript has had 256 allocations refused,
-instead of spinning until the execution deadline.
+- **Plain first, compressed under pressure.** The store holds 16 KiB blocks,
+  plain while the page has room. Once plain text passes a quarter of the room
+  above the realm's growth reserve, the oldest blocks are compressed with the
+  LZ4-compatible codec shared with the lazy-webpack tier
+  (`src/script_text_lz.c`); a read decodes only the start of the block it
+  needs and keeps it for the next read. A block that does not compress stays
+  plain.
+- **Never the reason a page runs out of memory.** When growth would be
+  refused, cached script bodies give way first, then plain text is
+  compressed, then whole scripts that no uncompiled lazy function needs are
+  dropped, least recently read first. Text an uncompiled lazy function needs,
+  or a compile or bytecode restore holds a lease on, is never dropped.
+  `toString()` of a function whose text was dropped returns the
+  `[native code]` form without allocating.
+- **Admission sees the text as if it were in the heap.** The compile floor,
+  the loader's pressure gate, and the heavy-page estimate subtract the stored
+  text from their room, so a page admits the same scripts and the freed room
+  goes to the scripts it already runs.
+- **A failed lazy compile is bounded.** A lazily compiled function that cannot
+  compile at the wall fails its call uncatchably and stays uncompiled; inside
+  a promise reaction the checkpoint ends at that job and the rest of the queue
+  runs on a later turn. Code that catches the out-of-memory error and retries
+  is stopped once one entry into JavaScript has had 256 allocations refused.
+- **The bytecode cache stores offsets, not text.** A restore names the script
+  text (its digest is the cache key) and the store copies it only if restored
+  functions refer to it, before the script runs. Bytecode whose lazy functions
+  would have no text does not restore; the script compiles from source.
 
-The classic bytecode cache stores offsets, not text. A restore names the
-script text (it is at hand: the cache key is its digest) and the store
-copies it only if restored functions refer to it, before the script runs,
-so the loader may release the body while it runs. Bytecode whose lazy
-functions would have no text does not restore and the script compiles from
-source instead. `TILEFINCH_JS_SOURCE_STORE` (lab builds) selects the
-other policies for A/B measurement, `tilefinch-js-bench --only
-source_store,tostring` measures the copy, encode, compile and `toString()`
-costs, and the census prints a `census source-store` line per realm.
+`TILEFINCH_JS_SOURCE_STORE` (lab builds) selects other policies for A/B
+measurement, `tilefinch-js-bench --only source_store,tostring` measures the
+copy, encode, compile, and `toString()` costs, and the census prints a
+`census source-store` line per realm.
 
 ### WebAssembly
 
@@ -924,7 +889,7 @@ per-frame browser and media compositors stay small enough for the Allegrex
 instruction cache; the ELF build ratchets those hot symbols separately from
 total `.text`. Fullscreen video keeps the decoder's 8888 scanout and composes
 the player's overlay only inside bounded rectangles
-([YouTube and media lab](engineering/YOUTUBE_VIDEO_LAB.md#psp-decode-and-presentation)).
+([Media pipeline](engineering/MEDIA_PIPELINE.md#psp-decode-and-presentation)).
 
 Images are decoded without forced-dark color inversion. Dark mode transforms
 authored foreground and background colors at paint boundaries, while
@@ -1077,7 +1042,7 @@ The native YouTube provider keeps a few generated pages and parsed watch
 facts in short-lived, optional session caches keyed by URL, presentation, and
 cookie authority. Reclaim and every clear action drop them, raw responses are
 never kept, and jobs copy facts rather than borrowing an entry across a pump
-([YouTube and media lab](engineering/YOUTUBE_VIDEO_LAB.md#provider-caches)).
+([Media pipeline](engineering/MEDIA_PIPELINE.md#provider-caches)).
 
 [PSP transport](engineering/PSP_TRANSPORT.md) and the
 [security model](SECURITY_MODEL.md) define the exact protocol and policy
@@ -1151,7 +1116,7 @@ attempted present as success.
 The control contract is in
 [PSP media session](engineering/PSP_MEDIA_SESSION_STATE.md); sources, decoder
 choice, the software decoder, page-data discovery, and the host and device
-seams are in the [YouTube and media lab](engineering/YOUTUBE_VIDEO_LAB.md).
+seams are in the [Media pipeline](engineering/MEDIA_PIPELINE.md).
 
 ## PSP frontend ownership
 
@@ -1239,42 +1204,15 @@ recovery rules.
 
 The main ownership boundaries are deliberately visible:
 
-- `src/browser_engine.c`: public engine lifetime and facade, with feature
-  regions in `src/browser_engine/`, each included where it sits in the facade:
-  - `provisional.inc`: provisional preview painting and capture;
-  - `history_focus.inc`: history focus and form-control restore,
-    same-document history actions, autofocus;
-  - `provisional_input.inc`: provisional preview viewport, scroll, focus,
-    activation;
-  - `find.inc`: find in page and text anchors;
-  - `reader_recovery.inc`: Reader and Basic views, blank-page recovery,
-    declared media card;
-  - `youtube.inc`: YouTube provider state machines, native controls and
-    idle pumps (state in `BrowserEngineYoutube`);
-- `src/navigation.c` and `src/navigation/`: candidate loads and commit. The
-  owner includes each file once, in this order:
-  - `page_lifecycle.inc`: timing slices, stylesheet and layout builds,
-    script realm creation and retirement, resource fingerprint, damage;
-  - `frames.inc`: child frames, cross-frame messaging, frame presentation;
-  - `declarative_refresh.inc`: `<meta http-equiv="refresh">` and `Refresh`;
-  - `configuration.inc`: session setup, hooks and policy setters;
-  - `document_stream.inc`: the streaming parse and speculative preloads;
-  - `stylesheet_checkpoint.inc`: render-blocking stylesheet checkpoints;
-  - `stream_runtime.inc`: stream staging teardown and the streaming realm;
-  - `parser_script_checkpoint.inc`: parser-blocking scripts and refusals;
-  - `commit_transaction.inc`: candidate adoption (`navigation_commit_document`);
-  - `progressive_preview.inc`: progressive and retained previews;
-  - `commit_html.inc`: whole-document commit entry points;
-  - `load_state.inc`: the load job, response handling and retries;
-  - `history.inc`: history, same-document URLs, fragments, scroll;
-  - `mutation_classify.inc`: script mutation journal classification;
-  - `style_sources.inc`: incremental style-source append;
-  - `layout_reuse.inc`: layout reuse cache around a relayout;
-  - `relayout.inc`: relayout, layout completion, user CSS transaction;
-  - `deferred_images.inc`: retarget, web-font fallback, deferred images,
-    background resources;
-  - `runtime_advance.inc`: blank-page recovery and the runtime advance;
-  - `events.inc`: event dispatch and frame activation;
+- `src/browser_engine.c` and `src/browser_engine/`: public engine lifetime
+  and facade; the directory's `.inc` regions hold feature areas (provisional
+  previews, history and focus restore, find, Reader and Basic recovery, the
+  YouTube provider, the embed hop), each included where it sits in the
+  facade;
+- `src/navigation.c` and `src/navigation/`: candidate loads and commit; the
+  owner includes each `.inc` once, in pipeline order, from page lifecycle and
+  frames through streaming parse, stylesheet and script checkpoints, commit,
+  history, relayout, deferred images, and event dispatch;
 - `src/style*.c`, `src/layout*.c`, `src/render.c`, `src/render/`: the visual
   pipeline;
 - `src/js_runtime.c`, `src/js_*`, `src/bootstrap/`: JavaScript and Web APIs;
@@ -1293,10 +1231,11 @@ The main ownership boundaries are deliberately visible:
 - `src/generated/`: generated bootstrap and font artifacts, never edited by
   hand.
 
-Private implementation seams use `.inc` files included exactly once by their
-owning translation unit. This keeps tightly coupled hot code reviewable
-without turning internal state into a public API or perturbing PSP code
-generation.
+Other owners split the same way (`src/js_runtime/`, `src/fetch/`,
+`src/render/`, `src/style_properties/`, `src/style_sheet/`, and
+`tests/suites/`); each owner's include list is its map. The rules for these
+private `.inc` seams are in
+[Development](DEVELOPMENT.md#source-and-target-boundaries).
 
 For implementation work, continue with [Development](DEVELOPMENT.md), the
 [security model](SECURITY_MODEL.md), and the focused subsystem contracts in

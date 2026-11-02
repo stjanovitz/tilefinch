@@ -1,10 +1,11 @@
 # WebGL on Tilefinch
 
-Tilefinch provides a bounded WebGL 1 path for small games, charts, and custom
-controls. It translates a practical fixed-function-compatible subset to the
-PSP graphics engine (GE); it is not a general GLSL interpreter. A scene that
-fits the profile below can remain responsive on a 333 MHz PSP, while an
-unrestricted desktop WebGL application usually cannot.
+For web and game developers. Tilefinch provides a bounded WebGL 1 path for
+small games, charts, and custom controls. It translates a practical
+fixed-function-compatible subset to the PSP graphics engine (GE); it is not a
+general GLSL interpreter. A scene that fits the profile below can remain
+responsive on a 333 MHz PSP, while an unrestricted desktop WebGL application
+usually cannot.
 
 This is the detailed WebGL guide. The broader, versioned contract for Canvas,
 input, audio, storage, lifecycle, offline packaging, and qualification is
@@ -179,10 +180,12 @@ programs. One native submission contains at most 64 draws and 4,096 effective
 vertices (base vertices multiplied by instance count),
 and exactly 32 distinct payload sources: the maximum 24 buffers plus eight
 textures. Draw state is copied into fixed per-context records, so a queued
-matrix or viewport never aliases later JavaScript state. A temporarily
-detached page may retain an additional ordered 64-record submission until its
-rendering bridge returns, so the fixed command pool contains 128 records while
-each native submission remains capped at 64. Buffer storage is capped at
+matrix or viewport never aliases later JavaScript state. An ordinary command
+is packed into the submission as it is queued and returns its pool record at
+once; only a deferred ordered tail (commands queued behind a submission the
+rendering bridge has not accepted yet, such as a temporarily detached page's)
+keeps object snapshots. The fixed command pool therefore holds 65 records,
+one more than a submission's 64 draws. Buffer storage is capped at
 512 KiB and retained texture pixels at 416 KiB. Exceeding a true bound fails
 soft; it never grants an unbounded page allocation.
 
@@ -221,13 +224,9 @@ with the CPU kernel. The RAM frame is produced only when something reads it
 other frame, and any refused or failed GE submission, keeps the exact CPU
 conversion and copy.
 
-On a PSP-3000 in October 2026 the GE scale averaged about 0.7 ms against
-roughly 5 ms of CPU conversion and copy, and Treadline's long soak missed
-0.5% of two-vblank deadlines instead of 4.1%. Pixel verification over more
-than 250 million published pixels found no mismatch. Authors benefit most
-from a 320×180 opaque canvas with the HUD drawn inside it: a DOM HUD, menu
-or toast over the canvas keeps those frames on the CPU path. These component
-measurements do not guarantee the same deadline results for other games.
+The GE scale costs a fraction of the CPU conversion and copy, so authors
+benefit most from a 320×180 opaque canvas with the HUD drawn inside it: a DOM
+HUD, menu or toast over the canvas keeps those frames on the CPU path.
 
 ## Run a single bounded game loop
 
@@ -244,7 +243,7 @@ storage are released deterministically. Calling `preventDefault()` on the loss
 event requests one bounded restoration of the same context object; restoration
 starts with default GL state, invalidates every old resource object, and
 dispatches `webglcontextrestored`. Without cancellation the loss is terminal
-and no longer occupies one of the realm's two slots. In either case, keep
+and frees one of the realm's two slots. In either case, keep
 compact CPU-side scene state so buffers and textures can be rebuilt.
 
 ```js
@@ -288,13 +287,13 @@ tight loop.
 The repository's [Prism Break 3D](../examples/prism-break-3d/) example shows
 the intended WebGL, Gamepad, Fullscreen, Page Visibility, Web Audio, and
 offline-app patterns together. [Treadline Arena](../examples/treadline-arena/)
-adds fixed-step third-person movement, a camera-following world, bounded entity
+adds capped-step third-person movement, a camera-following world, bounded entity
 pools, one-bounce projectiles, swapped barrier meshes, three objective modes,
 three tank classes, directional armor, class secondaries, an opt-in Command
 meter, five gadgets, role-based bots, camera obstruction handling, persistent
 setup preferences, keyboard fallback, and one compact input record per actor
-suitable for future network transport. The focused qualification lane is
-described in [Development](DEVELOPMENT.md#canvas-and-webgl-game-qualification).
+suitable for network transport. The focused qualification lane is described in
+[Treadline qualification](../examples/treadline-arena/QUALIFICATION.md).
 
 ## How the PSP path is built
 

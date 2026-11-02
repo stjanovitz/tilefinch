@@ -1,116 +1,94 @@
 # Reader mode
 
-Reader's extracted presentation neutralizes author sizing, text metrics and
-generated decorations, while preserving semantic headings, inline emphasis,
-code, links and image sizing hints. This prevents application styles from
-introducing oversized gaps or overlapping labels into the reading surface.
+Reader mode shows an easier-to-read copy of the page you are on: the main
+article, listing or video with the surrounding navigation, sidebars and site
+styling removed, set in Tilefinch's own type at full screen width. This page
+is the reference for PSP owners who want to know exactly how Reader decides
+what to show, and for contributors; the
+[user guide](USER_GUIDE.md#reader-mode) covers everyday use.
 
-Reader mode is a bounded native presentation of an ordinary HTTP(S) page. It
-keeps the parsed author document, its resources, and its history entry, adds
-one extracted semantic tree beside them, and styles that tree with user-origin
-CSS through the existing `BrowserEngine` seam. Once the Reader view is shown,
-Tilefinch retires the page's author JavaScript realms, so later scripts cannot
-rewrite or intercept it. Turning Reader mode off restores the retained author
-layout without fetching anything again, but script state does not resume;
-reload the page to run its JavaScript again.
+Reader keeps the page you loaded, its resources and its history entry, and
+builds the simplified copy beside it. Once the Reader view is shown,
+Tilefinch stops the page's JavaScript, so later scripts cannot rewrite or
+intercept it. Turning Reader mode off restores the original layout without
+fetching anything again, but the page's scripts do not resume; reload the
+page to run its JavaScript again.
 
-The transform is driven by the document's shape, not a list of hostnames. The
-first time it is used on a loaded page, a bounded DOM pass classifies the page
+Reader's presentation resets the site's sizing, text metrics and generated
+decorations, while keeping headings, inline emphasis, code, links and image
+size hints. This keeps a site's application styles from adding oversized gaps
+or overlapping labels to the reading view.
+
+## How a page is classified
+
+Reader decides by the document's shape, not by a list of sites. The first
+time it is used on a loaded page, one pass over the DOM classifies the page
 as one of four forms:
 
-- **Article:** one text-dense, low-link-density subtree dominates the page.
-- **Listing:** at least eight repeated, evidenced media entries share a list
-  container. A matching link alone is insufficient; each entry also needs a
-  thumbnail or nearby duration/view metadata.
+- **Article:** one text-dense subtree with few links dominates the page.
+- **Listing:** at least eight repeated media entries share a list
+  container. A matching link alone is not enough; each entry also needs a
+  thumbnail or nearby duration or view-count metadata.
 - **Media:** the document has a visible, playable `<video>` or `<audio>`
-  element, or a high-confidence discovered candidate next to its primary
-  title. Schema.org and `og:type` media hints alone do not make a page Media,
-  because promotional metadata would misclassify ordinary landing pages. Those
-  hints do veto a high-confidence Listing, however, so a script-injected
-  player with a related-items rail degrades to Article or Raw instead of
-  hiding its description as a listing. The internal page-kind name is still
-  `watch`, for stylesheet and telemetry compatibility.
-- **Raw:** no safe semantic shape was found. Reader mode is unavailable and
-  the author presentation remains unchanged.
+  element, or a high-confidence discovered video next to its main title.
+  Schema.org and `og:type` media hints alone do not make a page Media,
+  because promotional metadata would misclassify ordinary landing pages.
+  Those hints do rule out a Listing, so a page whose player is added by
+  script, next to a rail of related videos, becomes an Article or Raw rather
+  than hiding its description as a listing.
+- **Raw:** no safe shape was found. Reader mode is unavailable and the page
+  is shown unchanged.
 
 A substantial authored article takes precedence over a containing page
 wrapper whose extra prose comes from recommendations. Within that article,
 Reader puts its heading, author link and opening prose before lead media,
-retaining each source node once and preserving the rest of the article in
-source order. Content beyond an extraction bound is never presented as
-complete: manual views show the shortening notice, while automatic admission
-still requires a complete extraction.
+keeping each source node once and the rest of the article in source order.
+Content beyond Reader's limits is never presented as complete: a view you
+open yourself shows a shortening notice, and Auto Reader engages only when
+the whole article fits.
 
 Reader recognizes both `<main>` and `role="main"` content landmarks. A
-heading immediately before the selected prose subtree in its enclosing main
-landmark is retained as the reading title. Small linked-logo mastheads do not
-displace the content, even when nested inside that landmark; Basic view keeps
-those links in a collapsed navigation section.
+heading immediately before the selected prose in its main landmark is kept as
+the reading title. Small linked-logo mastheads do not displace the content,
+even when nested inside that landmark; Basic view keeps those links in a
+collapsed navigation section.
 
-When a matching source layout is available, extracted images retain its useful
-inline size rather than enlarging small header graphics. Reader continues to
-recover illustrations alongside prose from hidden, failed hydration shells.
-
-The pass keeps a scratch record for at most 8,192 elements, visits at most
-65,536 nodes (text nodes need no record, and an encyclopedia article has
-about one per element), tracks at most 128 levels of nesting, and keeps at
-most 64 listing entries. Its scratch table is charged to the page budget and
-released straight away. Paragraphs, like text, count only outside hidden and
-excluded regions (navigation, headers, footers, asides and forms).
+When the page's own layout is available, extracted images keep its useful
+inline size rather than enlarging small header graphics. Reader also
+recovers illustrations alongside prose from pages whose scripts failed to
+reveal them.
 
 Collapsed sections count as content. A region the author hid with the
 `hidden` attribute until it is opened, either `hidden=until-found` or a
 region named by the `aria-controls` of an `aria-expanded="false"` control just
-before it (the WAI-ARIA disclosure pattern, which mobile Wikipedia uses for
-every section after the lead), is extracted like visible content. Reader and
-Basic view retire the page's scripts, so the control could never open it
+before it (the WAI-ARIA disclosure pattern, which some encyclopedia sites use
+for every section after the lead), is extracted like visible content. Reader
+and Basic view stop the page's scripts, so the control could never open it
 there. Content hidden any other way stays out.
 
-The extracted tree shares [Basic view's emitted bounds](BASIC_VIEW.md#bounds-and-transactions):
-at least 512 nodes and 256 KiB of markup, and up to 8,192 nodes and 1 MiB
-when the page has the memory to show them. Reader walks at most 32,768 nodes
-of its article or listing root. The classification and the DOM
-markers it produces are cached with the loaded page, so scrolling and
-repainting do not repeat the work. Marker installation is journaled: an
-allocation failure, a collision with an internal marker, or a bound refusal
-removes every marker the attempt added and leaves the author DOM unchanged.
-Promoting lazy image sources recognizes only the conventional one-pixel
-placeholders and stays subject to the ordinary image count, byte,
-authorization, and offscreen-deferral limits.
+## Turning it on
 
 Reader mode is manual by default:
 
 - **Menu → Page tools → Reader mode** turns it on for the current page;
-- **Page tools → Site information → Permissions & controls → Always Reader**
-  is a bounded per-site preference;
-- **Settings → Appearance → Auto Reader** is an explicit global opt-in that
+- **Menu → Page tools → Site information → Permissions & controls → Always
+  Reader** turns it on for every page of one site;
+- **Menu → Settings → Appearance → Auto Reader** is a global opt-in that
   engages only when the classifier reports a high-confidence article,
   listing, or media page. It is checked once, when a page finishes loading,
-  and switches the page to Reader straight away (it does not ask first).
+  and switches the page to Reader straight away without asking.
 
-Auto Reader decides page by page:
+Auto Reader decides page by page, and its Reader does not carry over to the
+next link the way Reader you turned on yourself does; the
+[user guide](USER_GUIDE.md#reader-mode) describes how that feels in use. The
+blank-page Reader fallback counts as a choice you made, so its Reader carries
+over too.
 
-- When it switches a page to Reader, a short note says so: "Reader view
-  (Auto Reader)" and "Select, Page tools, Reader mode: full page". It clears
-  by itself like other status notes. Circle stays Back, as on any page.
-- Reader that Auto Reader turned on belongs to that page. Following a link
-  leaves it, and the destination gets its own check: a front page reached
-  from an automatically shown article appears as it is.
-- Reader you turn on yourself (Page tools, Always Reader, or the recovery
-  sheet's Reader choice) stays on as you follow links, as before. Turning an
-  automatic Reader off and on again in Page tools makes it yours.
-- Back and Forward leave Reader and check the page again, as history
-  entries do not record which view they were shown in. A page Auto Reader
-  showed in Reader is shown in Reader again; one you switched yourself is
-  not.
-- The blank-page Reader fallback is not Auto Reader: like a choice you
-  make, its Reader carries over to the next link.
-
-High confidence needs the whole page: if the classifier walk or the
-extraction reached a bound, Auto Reader leaves the page alone, because the
-unseen rest could change the page's kind and a shortened Reader view would
-hide the rest of the article. An article is high-confidence only when its
-extracted root looks like one clear article:
+High confidence needs the whole page: if the classifier or the extraction
+reached a limit, Auto Reader leaves the page alone, because the unseen rest
+could change the page's kind and a shortened Reader view would hide the rest
+of the article. An article is high-confidence only when its extracted root
+looks like one clear article:
 
 - it has a page title (an `h1`), or the root is an authored `<article>` with
   a heading;
@@ -122,54 +100,40 @@ extracted root looks like one clear article:
   mostly a link to another page. A heading's link to its own fragment, as
   on documentation pages, is not a headline link.
 
-On the October 2026 census of 55 popular pages, the BBC and Guardian
-articles and an MDN reference page qualify, and no front page, product page,
-store, forecast or application page does. Long articles that previously
-exceeded the 4,096-node extraction ceiling can now qualify when the unchanged
-memory-admission rule permits their full tree. An entry made of lists rather
-than paragraphs stays manual.
+An article made of lists rather than paragraphs stays manual.
+
+## Font and size
 
 **Reader font** is a saved Sans or Serif choice. While Reader mode is active,
 the normal page text-size control adjusts Reader text. **Remember size** is
 off by default; when it is on, the profile records only the size for the
-page's registrable site, in a 16-entry move-to-front table, so sibling hosts
-such as `en.wikipedia.org` and `m.wikipedia.org` share one value. Turning the
-option off clears the table. Opening, closing, or navigating in Reader mode
-never marks the profile dirty, so the default behavior adds no Memory Stick
-writes.
+page's registrable site, so sibling hosts such as `en.example.org` and
+`m.example.org` share one value. Turning the option off clears the saved
+sizes. Opening, closing, or navigating in Reader mode never writes the
+profile, so the default behavior adds no Memory Stick writes.
 
-Limits are deliberate:
+## Limits
 
-- generated Reader CSS is capped at 8 KiB and is transactionally copied by
-  BrowserEngine;
-- site scale values are restricted to 80, 100, 125, and 150 percent;
-- at most 16 registrable sites are retained, with the least-recently changed
-  entry evicted;
-- built-in `tilefinch.local` pages do not admit Reader mode;
-- following a page link while Reader you turned on is active carries the
-  bounded base Reader sheet into the destination, prepares its content-shape markers after
-  parsing, and performs one authoritative Reader layout. The loading chrome
-  says `LOADING READER PAGE` while the candidate is pending;
-- cancellation or failure restores the incumbent page's Reader adapter and
-  scale, while address-bar, tab, internal-page, and explicit history
-  navigations continue to leave Reader mode before admitting their target.
+- The classifier keeps a scratch record for at most 8,192 elements, visits
+  at most 65,536 nodes, follows at most 128 levels of nesting, and keeps at
+  most 64 listing entries. Paragraphs, like text, count only outside hidden
+  and excluded regions (navigation, headers, footers, asides and forms).
+- Reader walks at most 32,768 nodes of its article or listing root.
+- The extracted copy shares
+  [Basic view's limits](BASIC_VIEW.md#limits): at least 512
+  nodes and 256 KiB of markup, and up to 8,192 nodes and 1 MiB when the page
+  has the memory to show them.
+- Remembered sizes are 80, 100, 125, or 150 percent, for at most 16 sites;
+  the least recently changed site is forgotten first.
+- Built-in `tilefinch.local` pages do not offer Reader mode.
+- Lazy images are promoted only from the conventional one-pixel
+  placeholders, and stay subject to the ordinary image count, size,
+  permission, and offscreen-deferral limits.
 
-Reader mode is not a sanitizer, content blocker, or separate browsing realm.
-Switching views reuses the current page's retained stylesheet responses,
-including their redirect and referrer provenance. It does not depend on those
-responses still being present in the optional HTTP cache. The presentation
-transaction shares response bytes while keeping its own ledger, so a refused
-rebuild leaves the previous view intact.
-
-The retained author DOM remains page-owned, while the connected extracted tree
-has exact native provenance and the current page's author realms are retired
-after presentation succeeds. The host renderer's `--reader-profile` options
-are older, deterministic CSS fixtures for engineering comparisons; they are
-not the device product's content-shape classifier.
-
-**Page tools → Save article** is deliberately separate from this live
-presentation. It serializes a bounded, text-only Reader document instead of
-keeping the page's realm or DOM; see [Offline library](OFFLINE_LIBRARY.md).
+Reader mode is not a sanitizer, content blocker, or separate browsing
+context. **Menu → Page tools → Save article** is separate from this live view:
+it saves a text-only Reader copy instead of keeping the page; see
+[Offline library](OFFLINE_LIBRARY.md).
 
 ## How this differs from Basic view
 
@@ -177,10 +141,41 @@ Reader mode is for pages that work: it keeps only the main article, listing
 or media, and Auto Reader is an opt-in that engages on high-confidence pages
 even when nothing failed. [Basic view](BASIC_VIEW.md) is for pages that do
 not work: it keeps nearly all of the page's real content, including
-navigation links, tables and bounded GET and search forms, and its automatic
+navigation links, tables and simple GET and search forms, and its automatic
 fallback (on by default) engages only when scripts failed and left the page
-blank, hidden or unusable. Both retire the page's scripts until a reload, and
-they share one extracted-tree slot: a page has one or the other, Basic is
-tried first on failure, and neither replaces the authored DOM.
+blank, hidden or unusable. Both stop the page's scripts until a reload, and a
+page has one or the other: Basic is tried first on failure, and neither
+replaces the page's own DOM.
 [Reader mode vs Basic view](USER_GUIDE.md#reader-mode-vs-basic-view)
 compares them side by side.
+
+## Engineering notes
+
+- Reader styles the extracted tree with user-origin CSS through the
+  `BrowserEngine` presentation seam. The generated Reader CSS is capped at
+  8 KiB and copied by `BrowserEngine` in one step, so a refused rebuild
+  leaves the previous view intact. The retained author DOM stays page-owned,
+  and the page's author realms are retired only after presentation succeeds.
+- The classification and the DOM markers it produces are cached with the
+  loaded page, so scrolling and repainting do not repeat the work. Marker
+  installation is journaled: an allocation failure, a collision with an
+  internal marker, or a limit refusal removes every marker the attempt added
+  and leaves the author DOM unchanged. The classifier's scratch table is
+  charged to the page budget and released straight away.
+- The internal page-kind name for Media is `watch`.
+- Switching views reuses the current page's retained stylesheet responses,
+  including their redirect and referrer provenance; it does not depend on
+  the optional HTTP cache still holding them. The presentation shares
+  response bytes while keeping its own budget ledger.
+- Following a page link while Reader you turned on is active carries the
+  base Reader sheet into the destination, prepares its content-shape markers
+  after parsing, and performs one Reader layout; the loading chrome says
+  `LOADING READER PAGE` meanwhile. Cancellation or failure restores the
+  previous page's Reader adapter and scale, while address-bar, tab,
+  internal-page, and explicit history navigations leave Reader mode before
+  loading their target.
+- Back and Forward leave Reader and classify the page again, because history
+  entries do not record which view they were shown in.
+- The host renderer's `--reader-profile` options are deterministic CSS
+  fixtures for engineering comparisons, not the device's content-shape
+  classifier.

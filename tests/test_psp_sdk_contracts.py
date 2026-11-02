@@ -31,6 +31,20 @@ _COMMENT_TOKENS = re.compile(
     re.DOTALL)
 
 
+def header_integer(source: str, name: str):
+    """The value of `#define name <integer expression>`, such as
+    `(32u * 1024u)` or `9u`."""
+    match = re.search(r"^#define %s[ \t]+(.+)$" % re.escape(name), source,
+                      re.MULTILINE)
+    if match is None:
+        raise AssertionError("missing #define %s" % name)
+    expression = re.sub(r"(\d+)[uUlL]+\b", r"\1", match.group(1).strip())
+    if not re.fullmatch(r"[\d\s()*+]+", expression):
+        raise AssertionError("#define %s is not a plain integer expression: %s"
+                             % (name, expression))
+    return eval(expression, {"__builtins__": {}})
+
+
 def without_comments(source: str):
     return _COMMENT_TOKENS.sub(
         lambda match: "" if match.group(0)[0] == "/" else match.group(0),
@@ -1790,14 +1804,20 @@ int main(void) {
         self.assertEqual(profile["version"], 1)
         self.assertEqual(profile["authority"], "docs/GAME_PROFILE.md")
 
+        engine_header = (ROOT / "include/tilefinch/browser_engine.h").read_text(
+            encoding="utf-8")
+        mib = 1024 * 1024
         self.assertEqual(profile["memory_profiles"], {
             "shipping": {
-                "page_budget_bytes": 24 * 1024 * 1024,
-                "javascript_heap_bytes": 5 * 1024 * 1024,
+                "page_budget_bytes": header_integer(
+                    engine_header, "BROWSER_PSP_APP_MEMORY_LIMIT_MB") * mib,
+                "javascript_heap_bytes": header_integer(
+                    engine_header, "BROWSER_PSP_APP_SCRIPT_HEAP_MB") * mib,
             },
             "strict": {
-                "page_budget_bytes": 16 * 1024 * 1024,
-                "javascript_heap_bytes": 4 * 1024 * 1024,
+                "page_budget_bytes": header_integer(
+                    engine_header, "BROWSER_PSP_STRICT_CONTENT_LIMIT"),
+                "javascript_heap_bytes": 4 * mib,
             },
         })
         self.assertEqual(profile["limits"]["canvas_2d"], {
@@ -1884,8 +1904,6 @@ int main(void) {
         self.assertEqual(
             profile["apis"]["animation_frame"]
             ["psp_page_clock_maximum_advance_per_loop_us"], 16000)
-        engine_header = (ROOT / "include/tilefinch/browser_engine.h").read_text(
-            encoding="utf-8")
         for token in (
             "#define BROWSER_PSP_STRICT_INSTALLED_APP_HEAP "
             "(6u * 1024u * 1024u)",
@@ -2020,6 +2038,24 @@ int main(void) {
             manifest)
         session = (ROOT / "include/tilefinch/session.h").read_text(
             encoding="utf-8")
+        self.assertEqual(profile["limits"]["storage"], {
+            name: header_integer(session, define) for name, define in (
+                ("site_initial_allowance_bytes",
+                 "BROWSER_SITE_STORAGE_INITIAL_BYTES"),
+                ("site_memory_allowance_bytes_maximum",
+                 "BROWSER_SITE_STORAGE_MEMORY_SITE_BYTES"),
+                ("memory_allowance_bytes_total",
+                 "BROWSER_SITE_STORAGE_MEMORY_TOTAL_BYTES"),
+                ("memory_stick_site_bytes",
+                 "BROWSER_SITE_STORAGE_STICK_SITE_BYTES"),
+                ("value_bytes_maximum",
+                 "BROWSER_SITE_STORAGE_STICK_VALUE_BYTES"),
+                ("site_items", "BROWSER_SITE_STORAGE_SITE_ITEMS"),
+                ("opfs_file_bytes", "BROWSER_OPFS_FILE_BYTE_LIMIT"),
+                ("opfs_memory_stick_file_bytes",
+                 "BROWSER_OPFS_STICK_FILE_BYTE_LIMIT"),
+            )
+        })
         self.assertIn(
             "#define BROWSER_SITE_STORAGE_INITIAL_BYTES (32u * 1024u)",
             session)

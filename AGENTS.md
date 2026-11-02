@@ -17,43 +17,43 @@ cmake --build build-preset-release -j8
 ctest --test-dir build-preset-release -j8 --output-on-failure
 ```
 
-Test registration can vary with optional host tooling. All enabled tests must
-pass; `tilefinch-device-cost-tests` is deliberately registered but disabled by
-default. The localhost
-redirect test may report `Skipped` in a sandbox that forbids loopback sockets;
-the update-root proof can likewise skip when its external prerequisite is not
-available, and the `tilefinch-treadline-*` Node tests report `Skipped` when
-`node` was not found at configure time. A skip is not a passing substitute for running either gate in an
-ordinary host environment.
+All enabled tests must pass. Registration varies with optional host tooling,
+and only these may legitimately not run:
 
-Fuzz reproducers and private investigation tests live under the ignored
-`.private-investigations/tests/`, never as inline public test inputs. Public
-clones use the default `TILEFINCH_ENABLE_PRIVATE_TESTS=OFF`; maintainers with
-local private suites enable them with `cmake --preset release
--DTILEFINCH_ENABLE_PRIVATE_TESTS=ON` before the full gate. An enabled but missing
-private suite must fail configuration, not silently skip coverage. See
-[Optional private tests](docs/DEVELOPMENT.md#optional-private-tests) for registration
-and the public-only gate.
+- `tilefinch-device-cost-tests` is registered but disabled by default;
+- `tilefinch-swdec-crc-tests` is disabled unless configured with
+  `-DTILEFINCH_SWDEC_CRC_GATE=ON` and a prepared
+  `TILEFINCH_SWDEC_CRC_SOURCE_DIR`;
+- the localhost redirect test reports `Skipped` in a sandbox that forbids
+  loopback sockets;
+- the update-root proof skips when its external prerequisite is absent;
+- the `tilefinch-treadline-*` Node tests report `Skipped` when `node` was not
+  found at configure time;
+- `tilefinch-fidelity-floor-tests` skips when the ignored `fidelity/` corpus
+  is absent.
 
-For a faster edit loop, configure rather than trusting a previously-created
-development tree:
+A skip is not a pass: run the gate in an ordinary host environment before
+claiming it.
 
-```sh
-cmake --preset dev
-cmake --build --preset dev
-ctest --preset dev
-```
+Private investigation tests and fuzz reproducers live under the ignored
+`.private-investigations/tests/`, never as inline public test inputs; see
+[Optional private tests](docs/DEVELOPMENT.md#optional-private-tests).
+Maintainers with local suites enable them with
+`-DTILEFINCH_ENABLE_PRIVATE_TESTS=ON` before the full gate.
 
-The development preset omits release-only gates such as
-`tilefinch-fidelity-floor-tests`. `./scripts/dev.sh` is the faster targeted
-loop (`dev.sh unit <filter>` for aggregate unit filters); see
-[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md). Test counts legitimately differ
-between configurations, so compare a tree against itself, not against another
-tree.
+The edit loop is `./scripts/dev.sh` (`dev.sh unit <filter>` for aggregate
+unit filters, `dev.sh test` for the registered suite in its `build-dev`
+tree); it reconfigures its tree when CMake inputs change. The `dev` CMake
+preset (`build-preset-dev`) is not the edit loop: an existing tree goes stale
+and its CTest can run stale binaries, so use it only after a fresh
+`cmake --preset dev`. Compare test counts only within one tree; they
+legitimately differ between configurations.
 
-Sanitizers (`cmake --preset sanitize`) and the hostile-input parser harness
-(`cmake --preset hostile`) are explicit gates, not part of the edit loop.
-Details are in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
+Sanitizers (`sanitize`), the hostile-input parser harness (`hostile`),
+link-time optimization (`release-lto`), and hermetic PSP replay
+(`psp-replay`) are explicit presets, not part of the edit loop.
+[Presets and build trees](docs/DEVELOPMENT.md#presets-and-build-trees) lists
+every preset and tree.
 
 ## The PSP cross-build is a separate gate
 
@@ -106,31 +106,11 @@ paths: validation must not mistake the fixture for the browser.
 
 ## Regenerating the JavaScript bootstrap
 
-`src/bootstrap/*.js` is compiled into two committed C files. If you edit any
-of those `.js` sources you must regenerate **both** artifacts and the manifest:
-
-```sh
-cmake --build build-preset-release --target regenerate_tilefinch_bootstrap
-```
-
-That target rewrites `src/generated/js_bootstrap.c` and `src/generated/js_bootstrap_bytecode.c`
-and derives `src/bootstrap/generated.sha256` from the exact authored and
-generated tree. Never edit `generated.sha256` by hand.
-
-Both host and PSP builds make `tilefinch_core` depend on
-`check_tilefinch_bootstrap_generated`, so a stale artifact fails the *next* core
-build either way. The difference is what each can check: a host build checks
-bytecode through the generator's `--check` mode (with content-keyed reuse as
-described below) *and* verifies the manifest, while the
-PSP build cannot run a host QuickJS generator through the cross toolchain and
-therefore verifies the manifest only. A hand-edited manifest would pass the
-PSP gate and is exactly what the host gate exists to catch.
-
-The host build hashes the complete source/artifact set on every invocation.
-It may reuse a successful bytecode comparison only when the manifest contents,
-generator executable, and verification implementation are unchanged. The
-`tilefinch-bootstrap-generated-check` CTest remains an unconditional regeneration
-and comparison. Never replace this content identity with timestamp-only stamps.
+After editing `src/bootstrap/*.js`, run
+`cmake --build build-preset-release --target regenerate_tilefinch_bootstrap`
+and commit both generated C files and `src/bootstrap/generated.sha256` with
+the change; never edit the manifest by hand. The rule and its checks are in
+[src/bootstrap/README.md](src/bootstrap/README.md#regenerating).
 
 ## The fidelity scoreboard and its floors
 
@@ -154,8 +134,8 @@ baseline. It skips cleanly when the git-ignored `fidelity/` corpus is absent.
 
 **The hard rule: a regression is never re-baselined away.** A floor moves only
 when the engine is genuinely more faithful, in the same commit as the
-improvement that earned it, with the reasoning recorded in
-`docs/FIDELITY.md`. Lowering a floor to make a red gate green is not an option
+improvement that earned it, with the reasoning in that commit's
+message and the CHANGELOG. Lowering a floor to make a red gate green is not an option
 even when the number looks small.
 
 All committed fidelity rows are expected to pass. Exact floors live only in
@@ -164,7 +144,8 @@ All committed fidelity rows are expected to pass. Exact floors live only in
 ## PSP engineering constraints
 
 The engine runs inside a 16 MiB (`strict`) or 32 MiB (`realistic`, the PSP
-app's own, shared with voice) ceiling on a 32-bit in-order MIPS core with no virtual memory. In engine code:
+app's own, shared with voice) ceiling on a 32-bit in-order MIPS core with no
+virtual memory. In engine code:
 
 - **Allocate through the `Budget` allocator** (`include/tilefinch/budget.h`).
   Every byte the page owns — DOM, JavaScript heap, styles, resources, layout,
@@ -200,35 +181,36 @@ welcome.
 
 These rules keep verification evidence trustworthy:
 
-- Before a memory experiment, maintainers read the private local ledger at
-  `.private-investigations/MEMORY_EXPERIMENTS.md`. Public clones do not include
-  it; ask a maintainer for relevant prior outcomes before repeating an experiment.
-  Do not retry
-  a rejected approach without its stated premise changing; record the new
-  evidence and update the outcome, including rejected experiments.
+- **Read the private ledgers before an experiment.** Maintainers keep measured
+  results and memory experiments in the ignored
+  `.private-investigations/MEMORY_EXPERIMENTS.md`; public clones do not
+  include it, so ask a maintainer for prior outcomes. Do not retry a rejected
+  approach unless its stated premise changed, and record the new evidence and
+  outcome, including rejections. Public docs keep no measured figures.
+- **Judge performance on the device, with one binary.** Follow the
+  [evidence gates](docs/DEVELOPMENT.md#evidence-gates): a runtime switch over
+  alternating runs, never two builds.
 - **`cmake --build ... | tail -1` hides whether anything recompiled.** A
-  truncated build log looks identical whether the compiler ran or the tree was
-  already up to date, so it can "prove" a fix that was never built. Read enough
-  of the output to see the compile and link steps.
+  truncated log looks the same whether the compiler ran or the tree was up to
+  date. Read enough output to see the compile and link steps.
 - **To compare against another commit, check out sources and rebuild fully.**
-  Use `git checkout <sha> -- src/ include/` followed by a complete rebuild.
-  Do **not** use `git stash`: it moves unrelated files, is easy to leave
-  half-applied, and has silently poisoned comparisons here before.
-- **Confirm a new regression test actually fails against the pre-fix code.** A
-  test that passes both before and after proves nothing. Build the old sources,
-  watch the test fail, then restore the fix and watch it pass.
-- Beware shared dependency source trees: a patch applied in one build tree can
-  reach binaries built from another. If a result is surprising, reconfigure a
-  clean tree before believing it.
+  Use `git checkout <sha> -- src/ include/` and a complete rebuild. Do **not**
+  use `git stash`: it moves unrelated files, is easy to leave half-applied,
+  and has silently poisoned comparisons here before.
+- **Confirm a new regression test fails against the pre-fix code.** Build the
+  old sources, watch the test fail, then restore the fix and watch it pass.
+- **Distrust a surprising result from a shared tree.** A patch applied in one
+  build tree can reach binaries built from another; reconfigure a clean tree
+  before believing it.
 - **Check what the firmware returned, not that the call was made.** PSP
-  syscalls report failure in their result. A counter that records an attempt
-  rather than a successful outcome can certify a broken build.
+  syscalls report failure in their result; a counter that records attempts
+  can certify a broken build.
 - **The emulator is more permissive than the hardware.** PPSSPP accepts VRAM
   aliases and argument combinations a PSP-3000 does not, so a green emulator
-  run is necessary and not sufficient. When device behaviour disagrees with a
-  green validation run, read the emulator's own HLE log before theorising about
-  engine internals — `scripts/run-ppsspp-network.sh` honours a `PPSSPP=` env
-  var, so pointing it at a wrapper that adds `-d` gets a full syscall trace in
+  run is necessary, not sufficient. When the device disagrees with a green
+  run, read the emulator's HLE log before theorising about engine internals:
+  `scripts/run-ppsspp-network.sh` honours a `PPSSPP=` variable, so a wrapper
+  that adds `-d` gets a full syscall trace in
   `build-preset-psp/ppsspp-network-latest/ppsspp.log`.
 
 ## Commits

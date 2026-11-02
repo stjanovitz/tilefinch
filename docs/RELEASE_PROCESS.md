@@ -89,12 +89,12 @@ Remove or replace public documentation links to private logs before publishing,
 while retaining the logs in the private backup for future development. This
 requirement does not authorize rewriting already-published history.
 
-Native-tier investigations may publish summaries of findings, measurement
-limits and conditions for revisiting rejected approaches. Keep the full
-performance and memory ledgers, detailed journals, local evidence paths and internal branch
-references in the private archive and the ignored local investigation directory.
-Preserve both local ledgers explicitly in the private backup; ignored files are
-not included by an ordinary Git push.
+Public investigation pages may summarize findings, measurement limits, and
+conditions for revisiting rejected approaches; the ledgers themselves, local
+evidence paths, and internal branch references stay private
+([AGENTS.md](../AGENTS.md#verification-discipline)). Ignored files are not
+included by an ordinary Git push, so copy both local ledgers into the private
+backup explicitly.
 
 An explicitly approved public-history cleanup must use an isolated mirror,
 preserve all original refs in the private archive, and verify every rewritten
@@ -119,7 +119,7 @@ The version in `CMakeLists.txt` (`project(psp_browser_tilefinch VERSION …)`)
 must be bumped and committed in the same way; the script cross-checks it
 against the version argument.
 
-## Step 1b — train the JavaScript engine profile
+## Step 2 — train the JavaScript engine profile
 
 Release builds of the JavaScript engine use profile feedback (PGO); daily
 development builds do not. The profile is valid only for the exact engine
@@ -142,18 +142,14 @@ a device. Disable the validation-only execution census while training: its
 engine hooks are absent from shipping builds and would produce an incompatible
 profile. Leave the optional voice component out of this training-only image;
 the replay does not exercise it, and the shipping package still builds it.
-The isolated training profile explicitly selects Run for heavy
-pages and waits out the transient Stop shortcut before opening the composer;
-it does not change the shipping Ask default, timing journeys or user settings.
-Pass the directory to the cut script with `--quickjs-pgo
+The training journey's own settings do not change shipping defaults or user
+settings. Pass the directory to the cut script with `--quickjs-pgo
 build-pgo-profile`; configure refuses a profile whose fingerprint does not
 match the engine being built, because a stale profile makes the engine
 larger and slower than none. `--no-quickjs-pgo` builds without it, as a
-deliberate choice. Measured on a PSP-3000 on
-2026-09-29: first usable input on chatgpt.com 39.4 -> 37.4 s, first answer
-about 98 -> 93.5 s.
+deliberate choice.
 
-## Step 2 — run the cut script
+## Step 3 — run the cut script
 
 ```sh
 export PSPDEV=/path/to/pspdev
@@ -180,16 +176,9 @@ The script stops at the first failure. In order it:
 3. Cross-checks the version against `CMakeLists.txt` and `CHANGELOG.md`.
 4. Runs the host release gate: `cmake --preset release`, full build, and
    the complete ctest suite in `build-preset-release`.
-5. Re-runs the fidelity floor ratchet on its own and requires it to have
-   *actually executed*. In the suite above that test is registered only
-   when `CMAKE_BUILD_TYPE` is `Release` and carries `SKIP_RETURN_CODE 77`,
-   so a tree missing its captures — or configured any other way — reports
-   green without the ratchet ever running, and a dev flow that never
-   builds Release never sees it at all. This step reads the CTest output
-   back and fails the cut on a skip marker, on "No tests were found", and
-   on anything red; CTest counts a skip as a pass in its own summary, so
-   the marker is the only honest signal. Nothing about the gate's dev-lane
-   behaviour changes: it is still Release-only and still skippable there.
+5. Re-runs the fidelity floor ratchet on its own and fails the cut on a
+   skip marker, "No tests were found", or anything red, because CTest
+   counts that Release-only, skippable test's skip as a pass.
 6. Deletes `build-preset-psp` and configures the PSP release from scratch
    with the given release sequence (and trust root, when provided), explicitly
    forcing the optional decoder component off so no stale object or cache
@@ -218,7 +207,7 @@ That artifact has its own sequence and release ceremony in the public
 `tilefinch-models` asset repository; it is never added to the browser zip or
 TFUP.
 
-## Step 3 — offline signing, tag, and GitHub release
+## Step 4 — offline signing, tag, and GitHub release
 
 These remain manual because they require the offline release key or GitHub
 credentials, which the build environment must never hold:
@@ -272,10 +261,10 @@ python3 tools/tilefinch_update_tool.py envelope --component \
   --output tilefinch-voice-en-us-v1.tfvm
 ```
 
-GitHub release assets are suitable: the current package is about 9.1 MB, well
-below GitHub's asset limit. The `tilefinch-models` release repository
+GitHub release assets are suitable: the package is well below GitHub's asset
+limit. The `tilefinch-models` release repository
 must be public because the PSP client deliberately stores no GitHub token and
-sends no credentials. The source repository may remain private.
+sends no credentials.
 
 Before signing, inspect the staged component and require all three license
 payloads: `LICENSES/ALPHA_CEPHEI_LICENSE.txt`,
@@ -317,7 +306,8 @@ python3 tools/tilefinch_update_tool.py envelope --glyph-component \
 ```
 
 Repeat with the fixed names for `zh-hans`, `zh-hant`, `ko`, `emoji-color`,
-`cyrillic`, `latin-extended`, `arabic`, `hebrew`, and `devanagari`. For Hindi,
+`cyrillic`, `latin-extended`, `arabic`, `hebrew`, `devanagari`, and
+`bengali-assamese`. For Hindi,
 use the models producer's explicit offline shaping path and the exact browser
 revision's active `translations/ui/vN/hi.sequences`; require all interface clusters
 to resolve and inspect real menu captures before signing. The newest models release

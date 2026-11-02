@@ -11,12 +11,16 @@ must name the environment which produced it.
 
 Use `PASS`, `PARTIAL`, and `UNTESTED` according to that table. A PPSSPP media
 run is necessarily `PARTIAL` because the emulator does not implement the
-firmware decode path Tilefinch uses.
+firmware decode path Tilefinch uses, nor the Media Engine takeover the
+optional software decoder performs.
 
 ## Why the tiers remain separate
 
-- Host video uses a substitute backend; the PSP uses `sceMpeg*`,
-  `sceAudiocodec`, DMA, and GE presentation.
+- Host video uses a substitute backend. The PSP firmware path uses
+  `sceMpeg*`, `sceAudiocodec`, DMA, and GE presentation; the optional software
+  path takes over the Media Engine with a user-built decoder PRX and publishes
+  RGB565 pictures through the same player
+  ([route selection](MEDIA_PIPELINE.md#route-selection)).
 - PPSSPP accepts some module, pointer, cache, and timing combinations which
   physical firmware rejects.
 - A settled screenshot cannot reveal flicker, stale chrome, input latency,
@@ -79,6 +83,8 @@ The complete write-frequency and recovery contract is in
 `validation_media_fixture_auto=1` runs deterministic Baseline 320×240 and Main
 640×360 AVC/AAC-LC files through the shipping demux and PSP backend, including
 seek, profile change, teardown, and replay. Host tests open the same bytes.
+Both fixtures take the firmware path; the software decoder has no embedded
+fixture and is qualified on hardware with a user-built component.
 
 ```sh
 scripts/run-ppsspp-network.sh --media-fixture-test
@@ -180,6 +186,10 @@ Device-sensitive changes select from this matrix:
 - media open, startup preroll, playback, buffering, forward/backward seek,
   close/reopen, decoder refusal recovery, and teardown;
 - 240p and 360p video, 23.976/24 fps and 30 fps sources;
+- software decoder: High-profile and firmware-refused Baseline/Main playback,
+  takeover persistence (later streams stay on the software route), the
+  432×240 admission refusal after takeover, and suspend/resume detach and
+  reattach of the Media Engine;
 - voice component admission before and after a media lifetime;
 - heavy page plus video near the configured memory boundary;
 - signed update trial, health confirmation, rollback, and launcher recovery;

@@ -7,22 +7,28 @@ which fails when a switch is read that this file does not list or listed
 here but no longer read. Add a row when adding a switch.
 
 "Device" says whether the read survives into a shipping PSP build
-(`TILEFINCH_NO_TRACE` without `TILEFINCH_PSP_VALIDATION_LOG`):
-*lab binary* means every read is in a host lab executable the PSP browser
-EBOOT does not compile (`src/interactive_main.c`, `src/interactive/`,
-`src/trace_acquire_main.c` and the like; the test derives the EBOOT's files
-from its CMake source lists and checks this class both ways);
-*host* means it is compiled out of PSP builds; *host / PSP validation* means it is
-compiled out of shipping builds but kept in PSP validation builds (a read
-through `tilefinch_lab_getenv`, which the test checks is never marked
-*always*); *always* means a shipping build reads it too. The PSP starts with
-an empty environment, and in a shipping build the app's
-`psp_apply_engine_env_knobs` exports only four switches, marked
-*always, set by the PSP app*:
-`TILEFINCH_JS_BOOT_WINDOW_KB`, `TILEFINCH_JS_GC_GROWTH_PCT`,
-`TILEFINCH_JS_LAZY_FUNCTIONS` and `TILEFINCH_JS_ARRAY_CAP_KB`. Every other
-*always* read finds its switch unset on the device, so its default applies,
-but the code and its strings ship.
+(`TILEFINCH_NO_TRACE` without `TILEFINCH_PSP_VALIDATION_LOG`). The test
+rejects any value other than these:
+
+- *lab binary*: every read is in a host lab executable the PSP browser EBOOT
+  does not compile (`src/interactive_main.c`, `src/interactive/`,
+  `src/trace_acquire_main.c` and the like; the test derives the EBOOT's files
+  from its CMake source lists and checks this class both ways).
+- *host*: compiled out of every PSP build.
+- *host / PSP validation*: compiled out of shipping builds but kept in host
+  and PSP validation builds (for example a read through
+  `tilefinch_lab_getenv`, which the test checks is never marked *always*).
+- *PSP validation only*: read only by a PSP validation build; host and
+  shipping builds compile it out.
+- *always*: a shipping build reads it too.
+- *always, set by the PSP app*: a shipping read whose value the app exports.
+  The PSP starts with an empty environment, and in a shipping build the app's
+  `psp_apply_engine_env_knobs` exports only four switches:
+  `TILEFINCH_JS_BOOT_WINDOW_KB`, `TILEFINCH_JS_GC_GROWTH_PCT`,
+  `TILEFINCH_JS_LAZY_FUNCTIONS` and `TILEFINCH_JS_ARRAY_CAP_KB`.
+
+Every other *always* read finds its switch unset on the device, so its
+default applies, but the code and its strings ship.
 
 ## Trace
 
@@ -45,7 +51,7 @@ but the code and its strings ship.
 | `TILEFINCH_TRACE_FLEX_CLASS` | 1 | `src/layout.c` | host | Class name whose flex layout is traced. |
 | `TILEFINCH_TRACE_FLEX_TRANSLATE` | 1 | `src/layout.c` | host | Flex translation tracing. |
 | `TILEFINCH_TRACE_FRAME_CONTROLS` | 1 | `src/diagnostic_trace.h` | host | Frame control activation phases. |
-| `TILEFINCH_TRACE_FRAME_MESSAGES` | 4 | `src/diagnostic_trace.h` | host | Cross-frame message queue events. |
+| `TILEFINCH_TRACE_FRAME_MESSAGES` | 4 | `src/diagnostic_trace.h` | host | Cross-frame message queue events, plus one `frame-message-json` record per posted frame `postMessage`; a numeric value from 256 to 65,536 sets the record's character bound (default 2,048). Payloads can contain transient tokens: keep these logs out of Git and redact them before sharing. |
 | `TILEFINCH_TRACE_FRAME_MESSAGE_DROPS` | 2 | `src/navigation/frames.inc` | host | Only dropped/rejected cross-frame messages. |
 | `TILEFINCH_TRACE_GEOMETRY` | 1 | `src/js_runtime/host_primitives.inc` | host | Layout box geometry lookups from script. |
 | `TILEFINCH_TRACE_IMAGES` | 1 | `src/diagnostic_trace.h` | host | Image resource events. |
@@ -81,7 +87,7 @@ but the code and its strings ship.
 | `TILEFINCH_TRACE_JS_PROFILE` | 1 | `src/js_runtime/evaluation.inc` | host | Interrupt-time sampling profile of page script (self time by line, inclusive by function, both with the function's definition line `fn=` so anonymous functions stay apart; promise-job time by call site with its outermost frames and inclusive/self tables; per-function call counts in `PSP_BROWSER_JS_CALL_COUNTS=ON` builds); the lab's `profile [LABEL]` command prints and clears it. `tools/js_profile_report.py LABEL RUN...` joins runs per bootstrap function (use `TILEFINCH_DISABLE_BOOTSTRAP_BYTECODE=1` for bootstrap lines). On by default in PSP validation builds, reported at each input-script mark. While it runs, the `tilefinch-work` record also counts `js.native_calls` and the top `js.native.<name>` natives. |
 | `TILEFINCH_JS_OPCODE_HISTOGRAM` | 1 | `src/work_vector.c` | host / PSP validation | After every `tilefinch-work` record, the page realm's cumulative per-opcode dispatch counts as `tilefinch-opcodes: label=L op=NAME count=N` lines, most frequent first (op-count engines, `PSP_BROWSER_JS_OP_COUNTS=ON`; other builds print nothing). Subtract consecutive labels for a window's opcode mix. |
 | `TILEFINCH_JS_POOL_HISTOGRAM` | 1 | `src/work_vector.c` | host / PSP validation | After every `tilefinch-work` record, the page realm's QuickJS pool traffic per class as `tilefinch-js-pool: label=L class=C allocs=N fresh=N live=N live-requested=N live-capacity=N cached=N` (cumulative blocks handed out and fresh Budget allocations; `class=0` is the direct class), then one line with reserved and `js-malloc` totals and peaks. Classes 16-512 carry no traffic: QuickJS carves small objects from its own 4 KiB arenas, which reach the pool as the 4096 class. |
-| `TILEFINCH_VALIDATION_JS_PROFILE` | 2 | `src/js_runtime/evaluation.inc` | PSP validation | Set internally from `boot.cfg`'s `validation_js_profile` (default `1`); `0` disables the JS sampler and call wrappers for a same-binary device comparison. Confirm the `tilefinch-js-profiler` line reports `enabled=0 set-status=0` before trusting a profiler-off timing. |
+| `TILEFINCH_VALIDATION_JS_PROFILE` | 2 | `src/js_runtime/evaluation.inc` | PSP validation only | Set internally from `boot.cfg`'s `validation_js_profile` (default `1`); `0` disables the JS sampler and call wrappers for a same-binary device comparison. Confirm the `tilefinch-js-profiler` line reports `enabled=0 set-status=0` before trusting a profiler-off timing. |
 | `TILEFINCH_SCRIPT_SPLIT` | 1 | `src/js_runtime/runtime_creation.inc` | host / PSP validation | The script split (`include/tilefinch/script_split.h`) is on by default in host and PSP validation builds. `0` turns it off; `1` keeps the timed bridge kinds but skips the per-poll frame sample (no page/bootstrap/native attribution). For measuring the split's own cost in one binary. On PSP validation builds, `boot.cfg`'s `validation_script_split=0\|1\|2` (default `2`) sets it, and a `tilefinch-script-split: mode=` line confirms a non-default mode. |
 | `TILEFINCH_JS_PROFILE_RANKS` | 1 | `src/js_runtime/evaluation.inc` | host | Rows per profile table (up to 1024 on the host, 256 on the PSP) for a deeper look at a flat profile; PSP builds print 12. |
 | `TILEFINCH_JS_PROFILE_OUTLIER_US` | 1 | `src/js_runtime/evaluation.inc` | host / PSP validation | With the profiler on, prints `tilefinch-js-outlier` (stack with definition locations, phase, site, promise-job identity and last timed native) for sample intervals at least this long. Matching `tilefinch-promise-job` records separate sampled, native, GC, cooperation and profiler time, with lazy-compilation counts/bytes; unframed time is part of sampled time. Intervals over 250 ms are reported as unassigned `long-gap-us`, not charged to a sampled frame. Root samples explicitly mark depth truncation. `tools/promise_job_report.py` joins records without double-counting nested work. Opt-in only; low thresholds can produce large private logs and increase profiling overhead. On PSP validation, `boot.cfg`'s `validation_js_outlier_us` sets it. |
@@ -184,7 +190,7 @@ but the code and its strings ship.
 |---|---|---|---|---|
 | `TILEFINCH_BUDGET_TRAP_SEQ` | 1 | `src/budget.c` | host | Abort at the Budget allocation with this sequence number, to catch a leak or overrun at its source. |
 | `TILEFINCH_JS_POOL_FAIL_OVER_KB` | 1 | `src/budget.c` | host | Fail QuickJS pool requests at or above this size, in KiB. |
-| `TILEFINCH_JS_TRAP_ALLOC_SIZE` | 2 | `src/budget.c` | host/validation | Dump the stack once on a QuickJS allocation at or above this size, to find the caller; compiled out of trace-free releases. |
+| `TILEFINCH_JS_TRAP_ALLOC_SIZE` | 2 | `src/budget.c` | host / PSP validation | Dump the stack once on a QuickJS allocation at or above this size, to find the caller; compiled out of trace-free releases. |
 | `TILEFINCH_TEST_BOOTSTRAP_BYTECODE_UNAVAILABLE` | 1 | `src/js_runtime/runtime_creation.inc` | host | Pretend bytecode restore failed so the source fallback path runs. |
 
 ## Lab
@@ -193,13 +199,13 @@ but the code and its strings ship.
 |---|---|---|---|---|
 | `TILEFINCH_DIAGNOSTIC_MOBILE_SAFARI` | 2 | `src/fetch.c` | host / PSP validation | Present a mobile Safari identity (viewport, UA hints) to a page for behaviour comparison. The transport and the realm read it under the same gate, so requests and `navigator` agree. |
 | `TILEFINCH_ENABLE_IDLE_GLYPH_WARM` | 1 | `src/render.c` | host / PSP validation | Enable idle-time glyph cache warming (off by default). |
-| `TILEFINCH_EXPERIMENTAL_BACKGROUND_IMAGES` | 1 | `src/navigation/commit_transaction.inc` | host | Enable the experimental background-image loading path after paint. Not exercised by the mutable image queue; see review notes. |
+| `TILEFINCH_EXPERIMENTAL_BACKGROUND_IMAGES` | 1 | `src/navigation/commit_transaction.inc` | host | Enable the experimental background-image loading path after paint. Not exercised by the mutable image queue. |
 | `TILEFINCH_FORCE_REBUILDS` | 1 | `src/interactive_main.c` | lab binary | Force this many extra style rebuilds in the interactive lab. |
 | `TILEFINCH_HIBERNATE_RESUME_DIR` | 1 | `src/interactive_main.c` | lab binary | Directory for the forked hibernate/resume spike in the interactive lab. |
 | `TILEFINCH_HIBERNATE_SPIKE_TICK` | 1 | `src/interactive_main.c` | lab binary | Tick at which the interactive lab forks the hibernate/resume spike. |
 | `TILEFINCH_LAB_PARSER_CHUNK_BYTES` | 1 | `src/navigation/load_state.inc` | host | Parser delivery size (256 B .. 1 MiB) for a load without a frontend quota, such as the synchronous lab load; `2048` reproduces the PSP's per-pump deliveries so per-feed work is counted as the device pays it. |
 | `TILEFINCH_VERIFY_CONTAINER_QUERY_LOG` | 1 | `src/layout.c` | host | After a one-pass container-query layout is verified, rebuild it anyway and print `container-query-log-check same|MISMATCH` comparing the two (commands, height, node boxes). |
 | `TILEFINCH_PROBE_EVAL_FILE` | 1 | `src/interactive_main.c` | lab binary | Script file evaluated in the page context after the interactive lab tick loop. |
-| `TILEFINCH_EXECUTION_CENSUS` | 1 | `src/script_census.c` | host + PSP validation | 1: independent owner-CPU opcode/native census; 2: bounded function/job/path attribution. Off by default; shipping PSP omits instrumentation. Compare sampler-off runs; reference-count builds are count-only. |
+| `TILEFINCH_EXECUTION_CENSUS` | 1 | `src/script_census.c` | host / PSP validation | 1: independent owner-CPU opcode/native census; 2: bounded function/job/path attribution. Off by default; shipping PSP omits instrumentation. Compare sampler-off runs; reference-count builds are count-only. |
 | `TILEFINCH_DISABLE_GEOMETRY_LAYOUT_ADOPTION` | 1 | `src/js_runtime/dispatch_state.inc` | host / PSP validation | Keep the duplicate presentation build for same-binary layout reuse comparisons. |
 | `TILEFINCH_DISABLE_LAYOUT_RASTER_RETENTION` | 1 | `src/render.c` | host / PSP validation | Clear image and font raster caches on layout replacement for same-binary comparisons. |

@@ -12,8 +12,8 @@ bundle itself carries the PocketSphinx license that its linked decoder
 requires.
 
 The optional Japanese, Chinese, Korean, Cyrillic, Extended Latin, Arabic,
-Hebrew, Devanagari (Hindi), and color-emoji packs are likewise not part of the download. They are
-generated from Noto fonts, carry the complete SIL Open Font License notice
+Hebrew, Devanagari (Hindi), Bengali-Assamese, and color-emoji packs are
+likewise not part of the download. They are generated from Noto fonts, carry the complete SIL Open Font License notice
 and a digest of the source font, and are fetched only when you ask for one.
 Tilefinch does not read the PSP's proprietary firmware fonts.
 

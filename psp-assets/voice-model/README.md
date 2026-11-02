@@ -1,10 +1,11 @@
 # Offline voice model
 
-These are the validated `extra-wide` and `search` (small) English search
-tiers. They share one PocketSphinx US English acoustic model (`en-us/`) and
-provide bounded 7,763-entry and 1,463-entry search language models. They are intentionally a search/dictation convenience, not
-open-vocabulary speech recognition: words outside the selected dictionary
-cannot be returned.
+For contributors packaging the optional voice component. These are the
+validated `extra-wide` and `search` (small) English search tiers. They share
+one PocketSphinx US English acoustic model (`en-us/`) and provide bounded
+7,763-entry and 1,463-entry search language models. They are a search and
+dictation convenience, not open-vocabulary speech recognition: words outside
+the selected dictionary cannot be returned.
 
 The acoustic model is approximately 6.3 MiB on storage. Tilefinch compiles a
 small exact dictionary-to-context sidecar for each vocabulary; CMake checks
@@ -24,18 +25,13 @@ The package carries the Alpha Cephei model license and the complete CMUdict
 license and provenance notice under `LICENSES/`; the packaging target fails
 if any required payload or license file is absent.
 
-In the standalone PPSSPP lab the extra-wide decoder reached 6.80 MiB of live
-heap and a 6.91 MiB allocator arena. The small tier measured 4.88 MiB for both
-live heap and allocator arena. The strict 192-row reservations round these to
-8 MiB and 6 MiB respectively; larger row sets add their exact storage and
-still require a separate 2 MiB selection margin. A 33-fixture host gate
-produced identical final hypotheses and scores against the
-general-representation oracle. The strict memory profile trades CPU and
-Memory Stick traffic for RAM; physical PSP latency still needs calibration.
+Each tier's decoder reservation is admitted only with a separate selection
+margin of free heap. A host fixture gate requires the compact table layouts to
+produce the same final hypotheses and scores as the general representation.
 Tilefinch uses the complete 384-row acoustic table by default (**Voice
 memory: Full** on the Experimental screen). Setting **Voice memory** to
-Adaptive permits 256- and 192-row fallbacks under measured pressure. It
-chooses the largest extra-wide
+Adaptive permits 256- and 192-row fallbacks under memory pressure, trading
+CPU and Memory Stick traffic for RAM. It chooses the largest extra-wide
 configuration that fits current total and contiguous heap before considering
 the small tier, loads only one decoder lazily, and evicts the resident decoder
 before page navigation or at a memory-pressure low-water mark.

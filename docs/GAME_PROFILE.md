@@ -1,10 +1,11 @@
 # Tilefinch Game Profile v1
 
-The Tilefinch Game Profile is the authoring contract for small web games that
-should run predictably on a Sony PSP. It is not a browser mode and does not
-grant a page extra memory or APIs. It names the standards subset Tilefinch can
-reliably provide, the hard ceilings enforced by the browser, and the patterns
-that preserve input latency on a 333 MHz, 32-bit machine.
+For web game developers. The Tilefinch Game Profile is the authoring contract
+for small web games that should run predictably on a Sony PSP. It is not a
+browser mode and does not grant a page extra memory or APIs. It names the
+standards subset Tilefinch can reliably provide, the hard ceilings enforced by
+the browser, and the patterns that preserve input latency on a 333 MHz, 32-bit
+machine.
 
 The machine-readable companion is
 [`tilefinch-game-profile-v1.json`](tilefinch-game-profile-v1.json). Its integer
@@ -81,17 +82,17 @@ The included [Prism Break 3D](../examples/prism-break-3d/) example is the
 small-scene starting point. [Treadline Arena](../examples/treadline-arena/)
 shows the upper end of the intended profile: retained arena geometry, a fixed
 64-instance stream, an in-canvas HUD, pooled audio, installed-offline startup,
-and a measured physical-device soak.
+and a physical-device soak.
 
 ## Target and budgets
 
 The target display is 480×272. The shipping PSP memory profile gives the whole
-page 32 MiB, shared with voice recognition, and QuickJS 5 MiB; the engineering pressure profile lowers those
-ceilings to 16 MiB and 4 MiB. DOM, script, styles, decoded images, Canvas,
-WebGL resources, layout, render data, and session state share the page budget.
-Reaching one subsystem's local limit does not imply that the remaining page
-budget is available, and a budget refusal is a normal result a game must
-survive.
+page 32 MiB, shared with voice recognition, and QuickJS 5 MiB; the engineering
+pressure profile lowers those ceilings to 16 MiB and 4 MiB. DOM, script,
+styles, decoded images, Canvas, WebGL resources, layout, render data, and
+session state share the page budget. Reaching one subsystem's local limit does
+not imply that the remaining page budget is available, and a budget refusal is
+a normal result a game must survive.
 
 ### Installed-app heap
 
@@ -110,35 +111,22 @@ collection paces with room above the live graph from the first frame.
 QuickJS charges its arenas and large blocks to the page Budget's JavaScript
 category; Budget categories attribute memory and are not sub-limits, so the
 floor is enforced by QuickJS's own limit while every byte still counts
-against the one page Budget. With that Budget held at its growth reserve,
-the launched Treadline realm, about 5.6 MiB in use after its soak, can
-still allocate about 3.3 MiB more (up to its floor, charged to the
-JavaScript category) and is refused past it; at the ordinary floor the same
-allocation is refused. `tilefinch-offline-app-launch-tests` sizes that probe
-from what the game leaves and separately requires at least 2.5 MiB of the
-floor to stay free, so the game cannot quietly grow into it.
+against the one page Budget. `tilefinch-offline-app-launch-tests` holds the
+Budget at its growth reserve and checks that the launched Treadline realm can
+still allocate up to its floor, is refused past it, and is refused the same
+allocation at the ordinary floor.
 
-The default comes from Treadline's qualification soak opened through the
-offline route on the host (64-bit pointers, a 24 MiB embedder-default budget,
-1,800 frames): the QuickJS heap peaked at 5.09 MB (5.95 MB of arenas in the
-Budget) and everything else at 5.60 MB (layout 2.11, resources 1.92, render
-1.03, session 0.67 with script sources left on the Memory Stick, DOM 0.35),
-11.52 MB for the whole page. At the ordinary 5 MiB floor the realm grew to
-7.5 MiB for collection headroom. A 1 MiB game's restored code takes about
-1.1 MB more heap than Treadline's. At 9 MiB the steady worst case is about
-5.6 MB + 9 MiB of heap with arena overhead (~10.9 MB), 16.5 MB, and about
-20.7 MB while the 4 MiB startup window is open,
-leaving more than the eighth of the 32 MiB envelope the page reserve keeps. The strict
-6 MiB floor gives a steady worst case of about 13 MB of its 16 MiB, again
-above that profile's eighth. The PSP-1000
-(32 MB) is unsupported; every supported model (PSP-2000, PSP-3000, PSP Go,
-PSP-E1000) runs the same 64 MB memory mode and page Budget.
+The 9 MiB floor leaves the page reserve's eighth of the 32 MiB envelope free
+for a game of Treadline's size while the startup window is open, and the
+strict 6 MiB floor does the same within 16 MiB. The PSP-1000 (32 MB) is
+unsupported; every supported model (PSP-2000, PSP-3000, PSP Go, PSP-E1000)
+runs the same 64 MB memory mode and page Budget.
 
 Keep each classic game script at or below the 512 KiB Game Profile admission
 ceiling; the strict pressure profile retains its 256 KiB per-script limit.
 On the PSP it is the `boot.cfg` key `file_kb`, which
 `scripts/stage-psp-game.sh` sets to 512 for a staged game. Ordinary web pages
-no longer have a fixed per-script limit: the app's default `file_kb` is 4096,
+have no fixed per-script limit: the app's default `file_kb` is 4096,
 a sanity ceiling, and a page script is admitted by the memory its compile
 needs (docs/engineering/PSP_ENVELOPE.md). A game should still stay within
 512 KiB per script: that is what the profile promises a device can compile
@@ -146,17 +134,14 @@ next to a running game's heap. A
 `file_kb` below a game's largest script quietly skips that script: its
 element receives an `error` event and the player sees nothing. Listen for
 script `error` and show a message rather than waiting forever on a loading
-screen, as Treadline does; its `game.js` is about 400 KiB of its 512 KiB.
+screen, as Treadline does.
 Installed apps may precompile at most eight classic scripts and 1 MiB of
 admitted source in aggregate; the source remains packaged as the
 engine-version-independent fallback. Splitting code can improve maintenance,
 but it does not expand the aggregate JavaScript heap or installation budget.
-The restored code itself occupies the script heap: measured on the 64-bit
-host (the PSP's 32-bit pointers make it somewhat smaller), Treadline's ~690 KB
-of source restores to roughly 0.79 MB of QuickJS heap before the game
-allocates anything, and 1 MiB of dense synthetic code to roughly 1.8 MB, so a
-1 MiB game should be designed around the remaining heap, not the package
-limit.
+The restored code itself occupies the script heap, roughly as much as its
+source or more for dense code, before the game allocates anything; design a
+large game around the heap that remains, not the package limit.
 
 For animation, treat 16.67 ms as the aspirational 60 Hz frame time and 33.33 ms
 as the maximum steady 30 Hz frame time. Device qualification separately counts
@@ -166,9 +151,9 @@ the browser may skip an animation callback rather than queue a backlog.
 Page time is not wall time. On the PSP the page clock that drives
 `requestAnimationFrame()` timestamps, `setTimeout()` and `setInterval()`
 follows the wall clock but advances by at most one 16 ms tick per browser
-loop, and never catches up. A long loop therefore slows page time: a menu
-frame over a live canvas took about 50 ms on a PSP-3000 in October 2026, so
-0.15 s of page time lasted about half a second. Gameplay can accept that
+loop, and never catches up. A long loop therefore slows page time: with
+menu frames over a live canvas three times longer than a tick, 0.15 s of page
+time lasts about half a second. Gameplay can accept that
 (a stall slows the game rather than replaying it), but UI rests, debounces
 and key repeat should read `performance.now()` once per frame while they wait.
 
@@ -387,8 +372,11 @@ rejection as "silent until the next Play", not as a reason to retry.
 
 Each origin's `localStorage`, `sessionStorage`, and OPFS share a RAM allowance
 that starts at 32 KiB and grows to at most 512 KiB while the device has memory
-to spare. A write past it throws `QuotaExceededError`; the user may then move
-the site to the Memory Stick (up to 4 MB), after which a retry succeeds.
+to spare; keys and values both count, a site holds at most 256 items, and an
+OPFS file in RAM is at most 64 KiB. A write past the allowance throws
+`QuotaExceededError`; the user may then move the site to the Memory Stick
+(4 MiB per site, 1 MiB per value, 512 KiB per OPFS file), after which a retry
+succeeds.
 Persistent storage is the user's choice, not an author guarantee; games must
 tolerate a fresh store and a failed write. Use compact strings for settings,
 unlocked levels, and scores. Do not serialize per-frame state, and batch
@@ -578,127 +566,94 @@ must remain reachable.
   change AI reaction timing. This does not replace fresh tank or projectile
   collision queries.
 
-These are measured constraints rather than stylistic preferences. The earlier
-Treadline Arena physical-PSP qualification, before the Daily/replay/boss and
-expanded-AI additions, sustained 8,701 displayed gameplay
-pipelines across a 5.5-minute repeated-action soak. Median/p95/worst pipeline
-times were 33.221/33.247/33.280 ms, with no pipeline above 34 ms. Native WebGL
-averaged 2.998 ms (3.650 ms p95, 3.874 ms maximum), canvas conversion averaged
-about 3.9 ms, and the JavaScript callback averaged 11.474 ms with a 17.861 ms
-maximum. Peak page ownership remained at the 9.88 MiB load-time high-water
-mark, no allocation was refused, and post-warm-up retained growth was 45.6 KiB;
-about 4.1 KiB of that was the bounded draw-template state. Authors should
-repeat the measurement for their own scene rather than assume these timings.
-The expanded game requires fresh hardware qualification; this historical
-result is not a performance claim for its new modes. Later component runs on
-a PSP-3000 (validation build, October 2026) are encouraging but
-are not that qualification: an Onslaught boss wave with real input and audio
-missed 3 of 2,176 two-vblank deadlines (readiness p95 28.2 ms, maximum
-33.7 ms), and the long soak 20 of 2,046 (with the Enhanced lighting, now
-Treadline's only look).
-
-The sections below collect what building Treadline taught about the PSP.
-Figures are dated physical PSP-3000 measurements. Several of
-the browser paths involved are still being optimized, so treat them as the
-current cost model rather than promises.
+These recipes come from measuring Treadline Arena on a physical PSP, not
+from style. Authors should measure their own scene rather than assume another
+game's timings; measured results are kept in the maintainer's private
+performance ledger.
 
 ### Clocks and attribution
 
-`performance.now()` costs 65-70 µs per call on the PSP (`Date.now()` 73 µs,
-an ordinary JavaScript call about 2 µs, a soft-float add, multiply or compare
-0.5-1.0 µs). A frame instrumented with phase timers ran about 10 ms slower,
-so phase clocks cannot attribute a 33 ms frame's tail. Keep phase timers out
-of shipping frames; spend a clock read only where a decision depends on it,
-as Treadline does twice per frame to decide whether to defer optional HUD
-work. Count events per frame (shots, hits, particles, route
+A `performance.now()` or `Date.now()` call costs far more on the PSP than an
+ordinary JavaScript call or a soft-float operation, so phase timers inside a
+frame distort the frame they measure and cannot attribute its tail. Keep phase
+timers out of shipping frames and spend a clock read only where a decision
+depends on it, as Treadline does twice per frame to decide whether to defer
+optional HUD work. Count events per frame (shots, hits, particles, route
 searches) and join them to the browser's own frame record instead, or time
-one isolated operation many times outside gameplay. Reading
-`AudioContext.currentTime` costs about 0.1 ms; read it once per scheduling
-decision.
+one isolated operation many times outside gameplay. Read
+`AudioContext.currentTime` once per scheduling decision.
 
 ### WebGL cost model
 
-- **Publication.** An eligible canvas is published by the GE by default: one
-  opaque WebGL canvas filling the viewport at the 2:3 scale (a 320×180
-  backing shown at 480×270) with nothing composited above it — no HTML
-  overlay, fixed or sticky element, scroll thumb, or focus outline. The GE
-  scales it into the back buffer in about 0.7 ms instead of the CPU's ~5 ms of
-  conversion and copy, pixel-exact. On Treadline's long soak this cut missed
-  deadlines from 4.1% to 0.5%. A DOM HUD, menu or toast keeps that frame on
-  the CPU compositor, so draw per-frame layers in the canvas and accept the
-  CPU path only while a menu is open.
-- **Instances.** Native WebGL work on a 64-instance boss wave is about
-  2.1 ms per frame, the largest part (0.9 ms) colouring instance vertices.
-  Instances of one draw whose tints are bit-identical share one coloured
-  copy, so a small quantized tint palette is cheaper than per-instance colour
-  variation; unchanged retained geometry drawn without instance colours is
-  read by the GE in place. The JavaScript side is real too: writing eight changing matrix
-  words and four tint words for 64 instances into `Float32Array`s took about
-  1.2 ms. Write constant matrix words once, skip actors that did not move, and
-  prefer fewer, larger draws.
-- **Effects.** Measured per event: one sound start 0.84 ms, a six-particle
-  burst 0.54 ms plus about 0.05 ms per live particle per frame, a decal
-  0.14 ms. A hit frame stacks several of these, which is where the remaining
-  late frames sit. Give optional effects a per-frame budget and drop them
-  before actors, shells or input.
+- **Publication.** An eligible canvas is published by the GE: one opaque
+  WebGL canvas filling the viewport at the 2:3 scale (a 320×180 backing shown
+  at 480×270) with nothing composited above it — no HTML overlay, fixed or
+  sticky element, scroll thumb, or focus outline. The GE scales it into the
+  back buffer, pixel-exact, instead of the CPU converting and copying it. A
+  DOM HUD, menu or toast keeps that frame on the CPU compositor, so draw
+  per-frame layers in the canvas and accept the CPU path only while a menu is
+  open.
+- **Instances.** Colouring instance vertices is the largest part of native
+  instanced work. Instances of one draw whose tints are bit-identical share
+  one coloured copy, so a small quantized tint palette is cheaper than
+  per-instance colour variation; unchanged retained geometry drawn without
+  instance colours is read by the GE in place. Writing changing matrix and
+  tint words into `Float32Array`s costs real script time too: write constant
+  matrix words once, skip actors that did not move, and prefer fewer, larger
+  draws.
+- **Effects.** A sound start, a particle burst and a decal each cost a
+  measurable share of a frame, and a hit frame stacks several of them. Give
+  optional effects a per-frame budget and drop them before actors, shells or
+  input.
 
 ### Allocation and strings
 
 QuickJS frees acyclic garbage by reference counting as soon as it is dropped,
 but a cycle collection walks the whole live heap and can cost more than a
-whole frame on the PSP. Treadline's measured gameplay frames allocate zero
-JavaScript bytes: pools, typed arrays and retained closures are created at
-startup and reused. Tilefinch's QuickJS appends `s += piece` in place when
-`s` is a function-local variable; the same append to an object property,
-closure variable or global copies the whole string every time, which turns
-string building quadratic. Build strings in a local and assign once, and do
-not build them per frame at all.
+whole frame on the PSP. Gameplay frames should allocate zero JavaScript bytes:
+create pools, typed arrays and retained closures at startup and reuse them.
+Tilefinch's QuickJS appends `s += piece` in place when `s` is a
+function-local variable; the same append to an object property, closure
+variable or global copies the whole string every time, which turns string
+building quadratic. Build strings in a local and assign once, and do not build
+them per frame at all.
 
 ### Menus over a live canvas
 
 HTML menus over a running WebGL canvas are retained as an overlay and blended
-over every canvas frame. Measured on Treadline's menus (2026-10-04 and
-2026-10-05):
+over every canvas frame.
 
 - **No focus-event listeners.** Any `focus`, `blur`, `focusin` or `focusout`
   listener on the page, even one on `window`, makes every D-pad focus move
-  dispatch all four events through script: 26-28 ms of script plus 3.6 ms of
-  natives per move. With none, focus moves take the native path. Poll
-  `document.activeElement` from the menu's frame loop when a screen must react
-  to focus. Treadline's menu-layout gate fails when the page observes focus
-  events.
+  dispatch all four events through script. With none, focus moves take the
+  native path. Poll `document.activeElement` from the menu's frame loop when a
+  screen must react to focus. Treadline's menu-layout gate fails when the page
+  observes focus events.
 - **Paint-only focus styles.** Style focus with `:focus`/`:focus-visible`
   CSS. An outline, a uniform border colour or a single zero-offset unblurred
   inset ring changes paint only: no relayout, and only the damaged rectangle
-  of the overlay is repainted. A Treadline focus move is one 51 ms loop
-  (press to first visible about 70 ms); a border-colour focus in a centred
-  dialog over an animated canvas, 60 ms. Background, text colour, opacity,
-  filter, transform or larger shadow changes take a relayout.
-  `left: 50%; top: 50%; transform: translate(-50%, -50%)` centring stays on the
-  paint-only path; a scaled, rotated, filtered or translucent ancestor does
-  not.
+  of the overlay is repainted. Background, text colour, opacity, filter,
+  transform or larger shadow changes take a relayout.
+  `left: 50%; top: 50%; transform: translate(-50%, -50%)` centring stays on
+  the paint-only path; a scaled, rotated, filtered or translucent ancestor
+  does not.
 - **Text changes.** A visible text change repaints only its damage but still
-  costs a relayout: a Range Faults note write is a 114-117 ms loop, of which
-  the relayout is 35-40 ms. Skip writes whose text is unchanged (they still
-  relayout) and write a focus note once focus has rested 150 ms of wall time,
-  not on every step of a held D-pad.
-- **Screen switches.** A switch that changes the panel's box rebuilds the
-  whole overlay in one loop: 241-318 ms of raster for Treadline's panel, a
-  large share of it the 18 px glow shadow. Keep panel geometry stable between
-  screens where you can, and keep large blurred shadows off panels that
-  change size.
+  costs a relayout. Skip writes whose text is unchanged (they still relayout)
+  and write a focus note once focus has rested 150 ms of wall time, not on
+  every step of a held D-pad.
+- **Screen switches.** A switch that changes the panel's box rebuilds and
+  rasterizes the whole overlay in one loop, and a large blurred shadow is a
+  large share of that raster. Keep panel geometry stable between screens where
+  you can, and keep large blurred shadows off panels that change size.
 
 ### Starting a match
 
-Keep the Play/Deploy press light. On a PSP-3000 Treadline's first frame
-without the menu arrives about 0.5 s after Deploy and steady 33 ms frames
-begin about 0.58 s after it. Most of that first loop is the game's own click
-turn, and about 180 ms of the turn is `music.js` building its segments: work
-of exactly the kind that belongs before the press. Generated arenas are built in bounded
-slices across frames behind a progress screen rather than inside the press.
-Do one-time work such as level generation, geometry upload and pool warm-up
-while the menu is idle or in such slices, start audio and Page controls from
-the press itself, and avoid DOM changes in the same handler.
+Keep the Play/Deploy press light: the first frame without the menu waits for
+the game's own click handler. Do one-time work such as level generation,
+music or effect preparation, geometry upload and pool warm-up while the menu
+is idle, or in bounded slices across frames behind a progress screen, as
+Treadline builds its generated arenas. Start audio and Page controls from the
+press itself, and avoid DOM changes in the same handler.
 
 ## Offline packaging
 
@@ -819,7 +774,7 @@ Recommended compatibility statement for a game README:
 > the tested release, package digest, memory high-water mark, and frame tail.
 
 The focused host lane and device procedure are in
-[Development](DEVELOPMENT.md#canvas-and-webgl-game-qualification). The
+[Treadline qualification](../examples/treadline-arena/QUALIFICATION.md). The
 repository's [Prism Break 3D](../examples/prism-break-3d/) and
 [Treadline Arena](../examples/treadline-arena/) examples are the reference
 packages.

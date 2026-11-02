@@ -1,10 +1,14 @@
-# YouTube and media lab
+# Media pipeline
+
+This page covers the media path from source to screen: the YouTube provider
+adapter, the range and HLS sources, the portable demuxer, both PSP decoders
+(firmware and optional software) and how a stream chooses between them, the
+native player, and the tests and logs that qualify each seam.
 
 Tilefinch treats YouTube as a bounded site adapter, not as a special case in
 the HTML, CSS, layout, or paint engines. The adapter turns public mobile
 YouTube responses into a small script-free document, and the native player
-turns a supported watch URL into ordinary MP4 range sources. This document
-defines those seams and the tests that qualify them.
+turns a supported watch URL into ordinary MP4 range sources.
 
 ## End-to-end shape
 
@@ -34,9 +38,12 @@ Page `<video>` and saved media are deliberately unaffected by it.
 
 ## Provider document
 
-Public home, search, channel, and supported watch routes use the registered
-site-adapter boundary. Account, Shorts, Studio, and unsupported routes remain
-ordinary browser navigations.
+Home, search, channel, playlist, history, and watch routes use the registered
+site-adapter boundary (`youtube_lite_route()`). A Shorts link opens as an
+ordinary watch page. Any other path on a YouTube host opens the native home
+route, so the full YouTube application never runs. Account controls are
+drawn by the native provider; signing in uses Google's account page, which
+then hands back to the provider.
 
 The adapter reads mobile-page data without evaluating it, extracts a bounded
 set of renderer records, releases the source buffers, and commits generated
@@ -114,9 +121,10 @@ than fabricating attestation state.
 Only unciphered HTTPS media URLs are admitted. The resolver prefers a
 progressive AVC/AAC MP4 within the configured height, then separate AVC MP4
 and AAC MP4 streams. Active live delivery selects the bounded AVC MPEG-TS HLS
-variant at or below 240p. Baseline/Main plus AAC-LC uses the standard PSP
-firmware backend; High profile uses the optional software-decoder component
-described in the public build instructions. Live playback begins three
+variant at or below 240p. Baseline/Main plus AAC-LC normally uses the PSP
+firmware backend; High profile, and Baseline/Main streams the firmware would
+refuse, use the optional software decoder (see
+[Route selection](#route-selection)). Live playback begins three
 segments behind the advertised edge for radio-loss tolerance and has no seek
 operation because its zero and duration move with the playlist. The shipping
 preference for finite video is 360p; users can select the
@@ -207,12 +215,42 @@ segment.
 
 ## PSP decode and presentation
 
-The PSP backend uses the firmware AVC raw-NAL bridge and AAC-LC decoder. The
-codec worker owns a single job stream, while two decoded-surface slots allow
-the Media Engine to convert the next picture after the prior picture has been
-staged.
+Two decoders feed one native player. The media-session state machine owns
+opening, priming, playing, paused, buffering, seeking, recovery, and quiescing
+for both; see [PSP media session state](PSP_MEDIA_SESSION_STATE.md). It is the
+only authority that may decide when a pipeline can be replaced or destroyed.
 
-Each surface follows an explicit ownership protocol:
+### Route selection
+
+The stream's first SPS decides the backend before any decoder is built
+(`psp_media_apply_demux_decoder_route` in `src/psp_media_open.c`). The
+software decoder is required when any of these holds:
+
+- the stream is High profile;
+- the firmware would refuse a Baseline or Main stream: more than three
+  reference frames, a declared B-frame pyramid (`max_num_reorder_frames`
+  above 1), or a level above 3.0;
+- the software decoder already owns the Media Engine.
+
+Every other Baseline/Main stream within PSP bounds goes to the firmware
+path. The software route admits only progressive 8-bit 4:2:0 pictures of at
+most 432×240. When a firmware refusal is only a hint (a declared pyramid in
+provider or offline media) and the software route cannot take the stream,
+firmware stays the judge; a declared pyramid in page media is refused so the
+page's next rendition is tried. Any other stream that neither route can take
+fails admission with the refusal text. In-band parameter-set changes are
+rejected unless they preserve the admitted configuration. WebM and
+unsupported HLS forms fail as unsupported formats rather than being
+misreported as decoder failures.
+
+### Firmware path
+
+The firmware backend uses the AVC raw-NAL bridge and the AAC-LC decoder. The
+codec worker converts each access unit to its bounded length-prefixed input
+and owns a single job stream, while two decoded-surface slots allow the Media
+Engine to convert the next picture after the prior picture has been staged.
+
+Each firmware surface follows an explicit ownership protocol:
 
 ```text
 FREE -> ME_WRITING -> READY -> READING -> FREE
@@ -222,20 +260,18 @@ Slots carry session epochs and picture identities. Codec and DMA completions
 carry the same tuple; stale completions after seek, reset, quarantine, or
 teardown are discarded. A slot never returns to `FREE` until its real reader
 has completed; a timed-out reader quarantines its surface rather than
-returning memory to a writer. Video is staged in EDRAM and scaled by the GE. Pixel signatures and canary rows make silent substitution and
-short writes visible in validation builds.
+returning memory to a writer. Video is staged in EDRAM and scaled by the GE.
+Pixel signatures and canary rows make silent substitution and short writes
+visible in validation builds.
 
-The 240p path uses a 512-pixel CSC stride. The 360p path keeps firmware decode
-at its admitted geometry and uses the wide CSC/presentation path to produce a
-480x270 display image. Both paths use the same player and ownership model.
+The firmware 240p path uses a 512-pixel CSC stride. The 360p path keeps
+firmware decode at its admitted geometry and uses the wide CSC/presentation
+path to produce a 480x270 display image.
 
-The media-session state machine owns opening, priming, playing, paused,
-buffering, seeking, recovery, and quiescing. See
-[PSP media session state](PSP_MEDIA_SESSION_STATE.md). It is the only
-authority that may decide when a pipeline can be replaced or destroyed.
+### Firmware-path presentation
 
-Fullscreen video keeps the decoder's 8888 scanout rather than narrowing the
-whole picture to the page renderer's RGB565 format. The native player projects
+On the firmware path, fullscreen video keeps the decoder's 8888 scanout rather than narrowing the whole picture to the page
+renderer's RGB565 format. The native player projects
 its overlay into at most 16 clipped, disjoint rectangles. Opaque title and
 control bars start from cleared RGB565 scratch and so never import the moving
 picture; only translucent badges, previews, and panels import their bounded
@@ -244,25 +280,15 @@ only inside those rectangles, and every pixel outside them is the decoder's
 original output, byte for byte. Fixed player shapes use precomputed coverage
 from the same bounded antialiasing sampler as the generic path.
 
-### Choosing a decoder
+### Software path
 
-The actual Annex-B SPS decides the backend before any decoder is built.
-Baseline and Main streams within PSP bounds go to the firmware bridge (unless
-the software decoder has already taken over, below), converted on the codec
-worker to its bounded length-prefixed input; in-band parameter-set changes
-are rejected unless they preserve the firmware configuration exactly.
-Compatible High-profile streams use the optional software decoder. WebM and
-unsupported HLS forms fail as unsupported formats rather than being
-misreported as firmware failures.
-
-### Optional software decoder
-
-H.264 High at up to 432×240 can use a replaceable, user-built software-decoder
-PRX. Official releases contain the loader but no custom H.264 or AAC decoder
-binary. The component lives outside the A/B slots, carries a small ABI record,
-and survives ordinary app updates; if it is missing or incompatible, this
-route fails with an actionable player message while firmware-compatible video
-keeps working. Building and installing it is described in
+H.264 High, and firmware-refused Baseline/Main streams, at up to 432×240 use
+a replaceable, user-built software-decoder PRX. Official releases contain the
+loader but no custom H.264 or AAC decoder binary. The component lives outside
+the A/B slots, carries a small ABI record, and survives ordinary app updates;
+if it is missing or incompatible, this route fails with an actionable player
+message while firmware-compatible video keeps working. Building and installing
+it is described in
 [Development](../DEVELOPMENT.md#optional-psp-software-decoder).
 
 The decoder keeps FFmpeg's allocations inside one admitted arena, runs CABAC,
@@ -271,9 +297,9 @@ rows on the CPU, and publishes into a 25-slot generation-tagged ring. The
 display clock slips forward instead of racing when a frame is more than 8 ms
 late, quality rungs depend only on ring occupancy, and audio may not run more
 than 80 ms ahead of the displayed picture. Once this path owns the Media
-Engine, every later AVC or AAC route stays on it until suspend or process
-exit. Suspend detaches and restores the firmware's ME state before the power
-transition, and resume reattaches before the next software decode.
+Engine, every later AVC or AAC route stays on it until the browser exits.
+Suspend detaches the component and restores the firmware's ME state before
+the power transition; resume reattaches it before the next software decode.
 
 Every buffer shared with the Media Engine sits on an isolated 64-byte cache
 line with tail padding, so range cache maintenance cannot touch Budget
@@ -286,8 +312,8 @@ decoder independently bounds the pictures it returns, and color conversion
 receives the exact byte capacity of its destination slot. AAC output is
 admitted only when its channel count fits the component's fixed two-plane
 ABI. After a software takeover, later Baseline and Main streams must also fit
-the software route's 432×240 bound; larger streams fail admission instead of
-reaching an incompatible backend.
+the 432×240 bound; larger streams fail admission instead of reaching an
+incompatible backend.
 
 ## Buffering and player behavior
 
@@ -355,7 +381,8 @@ The optional FFmpeg/SDL lab supplies a watchable host backend without becoming
 a device oracle:
 
 ```sh
-cmake -S . -B build-media-lab -DPSP_BROWSER_BUILD_HOST_MEDIA_LAB=ON
+cmake --preset release -B build-media-lab \
+  -DTILEFINCH_ALLOW_BUILD_DIR=ON -DPSP_BROWSER_BUILD_HOST_MEDIA_LAB=ON
 cmake --build build-media-lab --target psp-browser-interactive-lab -j8
 benchmarks/run-youtube-video-lab.sh \
   build-media-lab /path/to/input.mp4 /tmp/tilefinch-playback.mp4
@@ -372,7 +399,7 @@ fixtures. `validation_media_fixture_auto=1` exercises the real demux and PSP
 backend without a network dependency. The fixtures can be regenerated only
 with `tools/generate_psp_media_fixtures.sh`.
 
-PPSSPP does not emulate the raw-NAL Media Engine path completely. It can
+PPSSPP does not emulate the firmware raw-NAL Media Engine path completely. It can
 qualify demux, audio, clocks, transport, UI, and lifecycle behavior, but an
 AV-module/raw-NAL stop is `PARTIAL`, not a video-decode pass. Physical PSP
 qualification must cover:
@@ -382,11 +409,99 @@ qualification must cover:
 - seek, close, reopen, and destroy/recreate;
 - no ownership, signature, canary, DMA, or quarantine faults;
 - real range-window progress over Wi-Fi;
-- sustained playback at the source cadence.
+- sustained playback at the source cadence;
+- on the software path: a High-profile stream and a firmware-refused
+  Baseline/Main stream both play through the software decoder;
+- after a software takeover of the Media Engine, a later firmware-compatible
+  stream stays on the software route, and one larger than 432×240 is refused
+  at admission with the player's refusal message;
+- suspend and resume during software playback: the component detaches and
+  restores the firmware ME state, then reattaches before the next decode;
+- a rewind of at least 30 seconds on each route reopens the backend and
+  resumes at the target.
 
 Use the zero-Memory-Stick PSPLink workflow in
 [PSPLink device development](PSPLINK_DEV_LOOP.md) so instrumentation does not
 perturb playback with storage I/O.
+
+## Reading a soak log
+
+Soak runs use the PSPLink loop and the boot keys in
+[PSPLink device development](PSPLINK_DEV_LOOP.md#boot-overridescfg-reference-soak-shape).
+Software-decoder diagnostics are in
+[SWDEC_DIAGNOSTICS.md](SWDEC_DIAGNOSTICS.md).
+
+
+- Lifecycle: `tilefinch-media-stability: event=started / event=seek /
+  event=complete` (the 120s summary) or `event=failed reason=...`;
+  `tilefinch-validation: outcome=` at exit. During playback, health and A/V
+  skew are sampled into bounded RAM counters every 250ms without writing to
+  host0. This is intentional: a USB-host write can pause the browser thread
+  and manufacture the cadence hitch being measured.
+- Stability verdicts: `pipeline-skips` are late, catch-up, prerequisite, or
+  terminal pictures discarded before a presentation claim. `display-drops`
+  are claimed identities that did not reach scanout, with `quiesce-drops` as
+  the intentional-close subset. `max-av-skew` includes startup and seek
+  discontinuities; `steady-max-av-skew` includes only samples after two
+  uninterrupted seconds in `Playing`, and `steady-skew-samples` proves that
+  bucket was actually observed.
+- Cadence + pipeline: `tilefinch-media-feed:`,
+  `tilefinch-media-transport:`, `tilefinch-media-present:`, and
+  `tilefinch-media-video-cadence:` lines are emitted once at teardown; their
+  fields are cumulative over the complete run. `tilefinch-video-scanout:` is
+  the bounded histogram of wall intervals between distinct decoded pictures
+  that actually reached scanout; repeated chrome-only presentation of one
+  picture is excluded. The records are separate so every one fits the PSP
+  logger's bounded line buffer. Per-picture ring traces:
+  `tilefinch-media-picture:` only in builds configured with
+  `TILEFINCH_PSP_MEDIA_PICTURE_TRACE=ON`.
+- Occupancy: `tilefinch-media-slots:` and `tilefinch-media-worker:`, printed
+  from the same teardown snapshot with the same `phase=` word, so the lines
+  read together.
+  These are **durations**, where the cadence line is counts: per-slot dwell in
+  FREE/ME_WRITING/READY/READING, `no-free` vs `free-idle` (a writable slot
+  with nothing being written — the direct measure of the worker not running
+  ahead), the batch fill, the CSC itself, which frame phase each conversion
+  landed in, and the worker's dispatch/prologue/firmware/collect ladder
+  either side of the one shared job slot. Read the guide in the comment above
+  `psp_media_report_slots` in `src/psp_media_telemetry.c` before drawing a
+  conclusion from any single field.
+- Never-taken paths, which should read zero: `dma-quarantine=` and
+  `surface-quarantines=` on the `tilefinch-media-present:` line, plus
+  `tilefinch-media-present: event=dma-quarantine*`. A quarantine without a
+  matching late completion is a staging transfer that never came back, and
+  the session ends on it deliberately.
+- Firmware events: `tilefinch-media-decoder: event=...` records setup,
+  refusals, recoveries, and failures. Steady job timing is aggregated in
+  `tilefinch-media-worker:` rather than logged per job; watchdog failures name
+  the exact stalled stage.
+- The backend stats reader refuses while a codec job runs — a sample line
+  showing `decoded=0 audio-packets=0` mid-playback is that artifact, not a
+  stall.
+
+### Transport scheduling attribution
+
+The transport worker normally runs one priority step above the browser so its
+bounded service and 10 ms poll cannot be starved. Connection setup is a
+different workload: DNS, TCP, and TLS can remain inside one
+`curl_multi_perform` call long enough to delay input and media collection.
+Until response headers arrive, the worker therefore runs below the browser;
+steady body transfer restores the ordinary higher priority.
+
+Validation builds report setup and steady perform distributions as
+`tilefinch-background-transport-worker*`. Read those beside the browser frame,
+presentation, codec-collection, and input-latency histograms. The intended
+signature is:
+
+- setup calls may be long but do not create matching browser-thread stalls;
+- steady body performs remain bounded closely enough to feed range windows;
+- network work does not starve codec collection or input dispatch;
+- a lifecycle run can quiesce, destroy, revalidate, reopen, and resume without
+  transport, ownership, signature, or quarantine faults.
+
+Run both an instrumented PRX and an uninstrumented release PRX when changing
+this priority policy. The latter proves that validation logging is not shaping
+the cadence being measured.
 
 ## Provider contingency
 

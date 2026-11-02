@@ -4,7 +4,7 @@
 #
 # Produces tfexec.prx beside this file. Copy it (or serve it over host0) and
 # run `ld host0:/tfexec.prx` from pspsh to start the installed browser; see
-# docs/engineering/INPUT_SCRIPT_HARNESS.md, "PSPLink live loop".
+# docs/engineering/PSPLINK_DEV_LOOP.md.
 #
 # Deliberately the SDK's own build.mak rather than a CMake target: this links
 # no engine code, and keeping it on the stock BUILD_PRX=1 recipe is what makes

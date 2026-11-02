@@ -24,8 +24,8 @@
 #define BROWSER_PSP_STRICT_CONTENT_LIMIT (16u * 1024u * 1024u)
 #define BROWSER_PSP_MINIMUM_NON_PAGE_RESERVE (8u * 1024u * 1024u)
 /* The strict profile's installed-app QuickJS heap floor (the app's is
-   BROWSER_PSP_APP_INSTALLED_APP_HEAP_MB; see docs/GAME_PROFILE.md, "Target
-   and budgets", for the measurement behind them). */
+   BROWSER_PSP_APP_INSTALLED_APP_HEAP_MB; see docs/GAME_PROFILE.md,
+   "Installed-app heap"). */
 #define BROWSER_PSP_STRICT_INSTALLED_APP_HEAP (6u * 1024u * 1024u)
 /* Default module bytecode ceilings (BrowserConfig.module_bytecode_cache_limit).
    See .private-investigations/MEMORY_EXPERIMENTS.md for the measurement. */

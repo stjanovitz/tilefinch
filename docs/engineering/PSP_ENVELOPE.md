@@ -32,22 +32,19 @@ keeps a 3 MiB presentation reserve. A script may be up to 4 MiB
 (`BROWSER_PSP_APP_SCRIPT_TOTAL_MB`); both are sanity ceilings for hostile
 input. A compile that needs more than planned is stopped by the heap limit
 and refused alone. The admission contract is in
-`include/tilefinch/script_admission.h`; detailed experiment measurements are
-maintained in the private memory ledger.
+`include/tilefinch/script_admission.h`. Experiment measurements are kept in a
+private maintainer ledger outside the repository.
 
 Tiles are 128x128 RGB565 (32 KiB). A 480x272 screen touches twelve to
 sixteen; the first eight are reserved when a page's render shell is built.
 The remaining slots hold the visible remainder and two rows of
 paint-ahead below (or above) the screen: they are allocated on first use
 only while the page keeps 2 MiB of budget headroom, and optional-memory
-reclaim frees them first. On the PlayStation Portable article on a PSP-3000
-this raised the page's budget peak by about 200 KiB and cut Page Down to a
-complete frame from p50 117 ms to 83 ms.
+reclaim frees them first.
 
 Beneath the profiles, PSPSDK's grow-to-largest heap takes what is left after
-2 MiB is held back. After the executable, stacks, modules, and system
-reserves, physical validation measures about 43 MiB allocatable through
-newlib (PPSSPP reports 47 MiB). That process heap does not decide what a page
+2 MiB is held back; what remains after the executable, stacks, modules, and
+system reserves is the process heap. That heap does not decide what a page
 may use; the profile ceiling does.
 
 Both reserve at least 8 MiB outside the page budget for process control,
@@ -187,15 +184,12 @@ its ordering against the first navigation.
 
 ### Boot timeline
 
-PPSSPP ordinary-launcher validation measured browser-main to HOME at
-362.6 ms and interactive-ready at 396.3 ms once the synthetic clock probe
-(about 319.6 ms) was removed and splash presentation waits were shortened.
-This does not establish physical PSP release boot time:
-validation logging and asset diagnostics remain, and emulator storage is not
-a Memory Stick. The validation-only `tilefinch-boot-input` line separately
-records the first actual controller sample and its delay from interactive
-loop entry (30.2 ms without an input script). Input-script
-file loading adds harness overhead and must not be treated as shipping work.
+The validation-only `tilefinch-boot-input` line records the first actual
+controller sample and its delay from interactive loop entry. Emulator boot
+times do not establish physical PSP release boot time: validation logging and
+asset diagnostics remain, and emulator storage is not a Memory Stick.
+Input-script file loading adds harness overhead and must not be treated as
+shipping work.
 
 ## 32-bit hot-path discipline
 
@@ -242,124 +236,31 @@ reconfiguring an existing build directory: CMake preserves cached choices.
 Disabling it keeps the shared transport and its security gates, but trace
 entry points refuse without accessing files or changing session state.
 
-An isolated MinSizeRel comparison against `5b9ed80f` (same Allegrex
-toolchain, networking and feature settings; no PGO change) measured:
-
-| Ordinary browser ELF | Capture/replay present | Capture/replay absent |
-|---|---:|---:|
-| `.text` | 4,677,268 B | 4,635,220 B |
-| `.rodata` | 2,115,336 B | 2,109,832 B |
-| `.bss` | 775,028 B | 771,956 B |
-
-The 42,048-byte code saving comes from removing unreachable lab machinery,
-not changing live-request behavior, compiler optimization, TLS policy, or
-page APIs. The host suite retains the capture/replay implementation and
-also compiles a trace-disabled transport regression. That regression must
-refuse all trace activation and leave an empty test directory untouched.
-
 Ordinary trace-free builds also omit the dormant QuickJS stack sampler and
-its interrupt-path checks. Validation keeps them. This reduced the same
-ordinary ELF by a further 3,504 bytes, to 4,631,716 bytes of `.text`;
-`.rodata` and `.bss` were unchanged. The post-link hot-symbol gate now
-requires disabled sampler and HTTP capture/replay implementations to be
-absent, including GCC-cloned variants, instead of relying only on the
-global size ceiling.
+its interrupt-path checks; validation keeps them. The post-link hot-symbol
+gate requires the disabled sampler and HTTP capture/replay implementations to
+be absent, including GCC-cloned variants, instead of relying only on the
+global size ceiling. The host suite retains the capture/replay implementation
+and also compiles a trace-disabled transport regression, which must refuse
+all trace activation and leave an empty test directory untouched.
 
-Rejected size experiment: replacing the four-float inline-SVG viewBox scan
-with `strtof` and routing integer-only core/NanoSVG scans to newlib
-`siscanf` added 36 bytes, rather than removing the floating scanner. The
-SDK's `__getTlsStructFromThread` still calls `sscanf`; timezone parsing
-independently keeps `siscanf`. Both scanner engines therefore remained.
-The experiment was reverted. Do not retry these source changes alone
-unless that SDK dependency changes; do not replace thread/TLS glue or
-interpose libc solely to claim the expected scanner saving.
+FreeType's WOFF1 decoder shares the browser's zlib instead of a private
+inflater, with its Budget-backed allocation callbacks installed on the zlib
+stream. The post-link gate rejects a local `inflate`, `inflateInit2_`, or
+`inflate_table` implementation in the vendored-font build.
 
-The next isolated size pass shares the browser's already-required zlib with
-FreeType's WOFF1 decoder instead of retaining a private inflater. FreeType
-continues installing its Budget-backed allocation callbacks on the zlib
-stream. Its sfnt/TrueType/smooth module set and font admission limits are
-unchanged. This removed 9,764 B of `.text` and 3,616 B of `.rodata` from the
-ordinary PSP EBOOT. The post-link gate rejects a local `inflate`,
-`inflateInit2_`, or `inflate_table` implementation in the vendored-font build;
-the regression gate fails on the preceding ELF and passes on the shared build.
+Ordinary builds compile out the media-response/playlist diagnostics, the
+bootstrap census branch, and the allocation-trap stack callback; validation
+and host builds retain them. The allocation trap is not a release feature.
 
-Compressed-WOFF coverage now compares glyph pixels and metrics against the
-raw sfnt and uncompressed WOFF, checks truncation, and sweeps injected Budget
-allocation failures through the inflater. An optimized arm64 host experiment
-(seven runs of 1,000 compressed-font loads plus glyph rasterization, after
-20 warm-up loads) measured median 442.292 us with the private inflater and
-223.167 us with shared zlib, with identical glyph hashes, 169,716 B peak
-Budget ownership, and zero retained bytes. This is a host cost comparison,
-not a measured PSP speedup; physical font-load timing remains unqualified.
-
-Compile-time removal of leftover media-response/playlist diagnostics, the
-bootstrap census branch, and the allocation-trap stack callback saved a
-further 1,164 B of code and 480 B of read-only data. Ordinary allocation
-statistics and runtime/watchdog behavior remain intact; validation and host
-builds retain the diagnostics. The allocation trap is not a release feature.
-
-| Ordinary release | Before this pass (`d1098c43`) | After |
-|---|---:|---:|
-| `.text` | 4,631,716 B | 4,620,788 B |
-| `.rodata` | 2,109,832 B | 2,105,736 B |
-| `.bss` | 771,956 B | 771,956 B |
-| EBOOT.PBP | 6,770,543 B | 6,755,503 B |
-
-Named ordinary and validation PSP targets and post-link gates passed; the
-validation ELF retains the sampler, replay, resolver-log, and allocation-trap
-symbols. The optimized host
-build succeeded and the full enabled suite ran; two local-server tests
-(`tilefinch-local-update-server-tests` and
-`tilefinch-fetch-stream-scheduler-tests`) cannot pass in this sandbox because
-loopback bind is refused with EPERM. The other tests passed or recorded their
-normal prerequisite skips. Run the two blocked tests in an ordinary host
-environment before integration; the sandbox result is not a full green gate.
-
-An isolated duplicate-code pass starting at `c69f19d6` shares the structured
-audio/video DOM script walk without changing their separate capacities,
-candidate order, malformed/truncated diagnostics, or allocation-free scan.
-Ordinary PSP `.text` fell 360 B (4,620,788 to 4,620,428 B); EBOOT fell 368 B.
-Seven alternating optimized-host runs over 120 mixed data scripts measured
-49.367 / 49.537 us median per audio+video scan before/after (0.34%, below a
-material difference); candidates, counters, and Budget ownership matched.
-Physical PSP timing is not qualified. The media tests pin asymmetric candidate
-limits, overflow, strict versus assignment-script diagnostics, text truncation,
-invalid-input clearing, and zero teardown ownership.
-
-The same pass consolidates four settings reload tails, keeping the security
-setting's conditional cancellation and each caller's distinct success/failure
-messages. It removes another 428 B of ordinary PSP code and 416 B of EBOOT
-(now 4,620,000 B `.text`, 6,754,719 B EBOOT). A host-compiled fake PSP boundary
-executes the production helper across 48 combinations and checks navigation,
-cancel, clock, timestamp, and status outcomes; two additional cases preserve
-the policy-action frame snapshot versus the security action's live frame field.
-Seven alternating million-call host batches after warm-up measured
-45.464 / 45.801 ns median before/after (0.74%, 0.337 ns). This cold menu path
-adds no per-frame work or syscalls; physical PSP menu timing is unqualified.
-
-Extracting the two identical inline border-paint blocks removes another 160 B
-of ordinary PSP code/EBOOT (4,619,840 B `.text`, 6,754,559 B EBOOT). The helper
-preserves top/bottom/left/right command order, corner overlaps, coordinates,
-alpha, and first-refusal propagation without scratch allocation. A 360-item
-bordered input/image/textarea fixture produces the same 2,040-command hash and
-2,895,624 B Budget peak. Two sets of 15 same-process alternating library
-comparisons were noisy; the second measured 1,097.670 / 1,079.495 us median
-layout time before/after. No host slowdown was observed, but this is not a
-speedup or physical PSP performance claim. Tests pin translucent border
-commands for both paths and sweep 48 allocation-refusal points with ownership
-returning to baseline. The parity tests also pass against the original code;
-these are behavior-preserving extractions, not fixes for a rendering defect.
-
-The final optimized host build succeeds. Of 183 enabled tests, 177 pass and
-four record prerequisite skips; the same two loopback-server tests remain
-blocked by sandbox socket refusal. A navigation stage-deadline test failed in
-one busy parallel run, then passed against both baseline and updated libraries
-alone and passed in the final full parallel run. Named ordinary PSP targets
-and text/hot-function ratchets pass; no new hardware timing claim is made.
+Do not retry routing the inline-SVG viewBox and NanoSVG integer scans through
+`strtof`/`siscanf` to drop the floating scanner: the SDK's
+`__getTlsStructFromThread` still calls `sscanf`, so both scanner engines stay.
 
 The PSP link gate reads the final ELF with PSP binutils:
 
-- total `.text` has separate ordinary and validation limits;
+- total `.text` has separate ordinary and validation limits, set in
+  `cmake/TilefinchTargets.cmake` and checked by `cmake/CheckPspTextSize.cmake`;
 - `.rodata` is reported rather than charged to the `.text` limit;
 - `main` is a cold-growth tripwire;
 - the interactive frame is measured as what each kind of frame runs through:

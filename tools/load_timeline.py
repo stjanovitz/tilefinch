@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Explain where wall time goes between page-load milestones in PSP
 validation logs (device or PPSSPP): boot -> interactive-ready -> first usable
-input -> send -> first answer. See docs/engineering/INPUT_SCRIPT_HARNESS.md,
+input -> send -> first answer. See docs/engineering/VALIDATION_RECORDS.md,
 "Load milestone timeline".
 
   load_timeline.py RUN [RUN ...]           a report per run (+ milestone table)

@@ -18,74 +18,37 @@ provenance against the versions compiled into Tilefinch.
 
 ### Client-only footprint
 
-The owned PSP stack disables Mbed TLS's server role, and curl's proxy, AWS
-SigV4, MIME/form API, terminal progress meter and option-name reflection API.
-Mbed TLS debug formatters and its unused feature-name table are also omitted;
-numeric version reporting and certificate diagnostics remain available.
-It retains TLS 1.2/1.3
-clients, certificate verification, HTTP/2, WebSockets, and transfer callbacks
-used for cancellation and the browser's progress UI. Tilefinch serializes its
-own request bodies. Private-network socket/prerequisite checks remain active;
-only the unavailable proxy setter is omitted in this configuration.
+The owned PSP stack is client-only. What it compiles out, and why each removal
+is safe:
+
+| Removed | Why |
+| --- | --- |
+| Mbed TLS server role | the browser is only a TLS client |
+| Mbed TLS debug formatters and feature-name table | numeric version reporting and certificate diagnostics remain |
+| RIPEMD-160, SHA-3, NIST key wrap, DES, PKCS#5/#7/#12, CRL parsing, persistent PSA key storage, DTLS, CFB/OFB/XTS cipher modes | reached only through generic dispatch tables |
+| TLS 1.2 static-PSK key exchanges | never offered without a configured PSK |
+| RSA key generation (`GENPRIME`), deterministic ECDSA and HMAC_DRBG, CMAC, non-PKCS#7 cipher paddings | no client path uses them |
+| `PK_WRITE` | only curl's public-key pinning used it |
+| `FS_IO` | the CA bundle is loaded from memory |
+| curl proxy, AWS SigV4, MIME/form API, terminal progress meter, option-name reflection | Tilefinch serializes its own request bodies and configures no proxy; private-network socket/prerequisite checks stay active |
+| curl HTTP authentication | the browser never holds a credential, and `tilefinch_url_parse` rejects URLs with userinfo |
+| curl date parser | only `TIMECONDITION`, `FILETIME`, cookies, HSTS, alt-svc and the unread `CURLINFO_RETRY_AFTER` used it |
+| curl local-address binding | no client path binds a local address |
+| curl verbose strings (`CURL_DISABLE_VERBOSE_STRINGS`) | the browser never sets `CURLOPT_VERBOSE` or a debug callback; the PSP curl patch keeps the `curl_*_strerror()` tables under `TILEFINCH_CURL_KEEP_STRERROR`, and `failf()` messages are unaffected |
+| curl client certificate and private-key loaders (`TILEFINCH_CURL_NO_CLIENT_CERT`), cipher-list parser (`TILEFINCH_CURL_NO_CIPHER_LIST`) | setting either option fails as not built in; the ClientHello still offers the default `mbedtls_ssl_list_ciphersuites()` |
+
+It retains TLS 1.2/1.3 clients, certificate verification, HTTP/2, WebSockets,
+and the transfer callbacks used for cancellation and the browser's progress
+UI. These removals are wire-neutral: the ClientHello, the offered groups,
+signature algorithms and cipher suites, certificate verification and the
+serialized-session header are unchanged by them.
 
 The same `MBEDTLS_USER_CONFIG_FILE` reaches the TLS library, curl and native
 consumers because role switches can change public structure layouts. Both
-external projects track that header as a configure dependency.
-
-Ordinary EBOOT measurements when this footprint landed (actual `.text`,
-unchanged 4,480,000-byte ceiling): original 4,482,252 bytes; client-only TLS 4,446,228;
-unused curl subsystems removed 4,380,568. These are linked measurements, not
-archive-size estimates. Speech extraction is a separate runtime-component
-change, described in the development guide.
-
-After speech extraction, removing those unused debug/reflection facilities
-reduced ordinary `.text` from 4,127,224 to 4,091,068 bytes and `.rodata` from
-1,932,060 to 1,904,756 bytes (including the small counter-index layout fix).
-Both ordinary and validation named cross-build targets and all 149 enabled
-host tests passed. These are linked ELF measurements, not estimates of
-archive members that may already have been discarded by the linker.
-
-A later wire-neutral trim (2026-10-05) removed Mbed TLS modules that only
-generic dispatch tables reached: RIPEMD-160, SHA-3, NIST key wrap, DES,
-PKCS#5/#7/#12, CRL parsing, persistent PSA key storage, DTLS, the TLS 1.2
-static-PSK key exchanges (never offered without a configured PSK) and the
-CFB/OFB/XTS cipher modes. The ClientHello, the offered groups, signature
-algorithms and cipher suites, and the serialized-session header are
-unchanged. Ordinary `.text` fell from 4,759,308 to 4,716,056 bytes and
-`.rodata` from 2,146,444 to 2,136,380 bytes.
-
-curl is built with `CURL_DISABLE_VERBOSE_STRINGS`: the browser never sets
-`CURLOPT_VERBOSE` or a debug callback, so `infof()` and the `CURL_TRC_*`
-trace text could never be emitted. Upstream ties the `curl_*_strerror()`
-message tables to the same switch; the PSP curl patch keeps them under
-`TILEFINCH_CURL_KEEP_STRERROR`, so error pages and logs read exactly as
-before, and `failf()` messages in the error buffer are unaffected. This
-removed 52,808 bytes of `.text` and 21,296 bytes of `.rodata`. Changing
-`patches/curl-8.22.0-psp.patch` now re-extracts the curl archive in an
-existing build tree, because ExternalProject reruns a patch step only when
-its command line changes.
-
-A second wire-neutral trim (2026-10-06) removed transport code that no
-client path reaches. curl is built without HTTP authentication (the browser
-never holds a credential and `tilefinch_url_parse` rejects URLs with
-userinfo), without its date parser (only `TIMECONDITION`, `FILETIME`,
-cookies, HSTS, alt-svc and the unread `CURLINFO_RETRY_AFTER` used it) and
-without local-address binding. The PSP curl patch compiles out the client
-certificate and private-key loaders (`TILEFINCH_CURL_NO_CLIENT_CERT`) and
-the cipher-list parser (`TILEFINCH_CURL_NO_CIPHER_LIST`; the default
-`mbedtls_ssl_list_ciphersuites()` is still what the ClientHello offers);
-setting either option now fails as not built in. Mbed TLS drops RSA key
-generation (`GENPRIME`), deterministic ECDSA and HMAC_DRBG, CMAC, the
-non-PKCS#7 cipher paddings, `PK_WRITE` (only curl's public-key pinning used
-it) and `FS_IO` (the CA bundle is loaded from memory). The ClientHello,
-certificate verification and the serialized-session header are unchanged.
-Ordinary `.text` fell by 31,484 bytes (4,664,536 to 4,633,052).
-
-Post-change PPSSPP qualification passed a small public HTTPS page (HTTP 200,
-verified TLS, page load and clean teardown). The live Wikipedia article run
-received HTTPS data but exceeded its timeout in CSS selector matching; it is
-not counted as a passing page qualification or attributed to DNS. Physical
-PSP networking/media checks remain separate release gates.
+external projects track that header as a configure dependency. Changing
+`patches/curl-8.22.0-psp.patch` re-extracts the curl archive in an existing
+build tree, because ExternalProject reruns a patch step only when its command
+line changes.
 
 The shipping `psp` preset selects the owned stack with HTTP/2 enabled:
 
@@ -175,104 +138,32 @@ The `net-select` primitive measures the SDK's underlying `sceNetInetSelect`;
 its final diagnostic argument is the requested timeout in microseconds
 (zero is exactly zero, -1 means no timeout), not a socket descriptor.
 
-Physical-PSP measurements reproduced the reported long wall calls:
+### Worker stall decisions
 
-| Call | Elapsed | Worker CPU | Relevant evidence |
-| --- | ---: | ---: | --- |
-| Pre-fix diagnostic run | 15,582 ms | 1.18 ms | No DNS/connect/select; recv 26 us, send 377 us |
-| Repeat with wait probes | 8,895 ms | 2,066 ms | Priority 0x21; release=0; semaphore total 758 us; no delay calls |
-| Narrowed setup-classifier experiment | 8,941 ms | 2,037 ms | Same pattern; TLS connection completion dominated actual CPU work |
+Long `curl_multi_perform`/`curl_multi_poll` wall times on hardware are mostly
+descheduling: firmware network services that run below the browser thread
+need CPU to finish a socket probe, alongside genuine TLS CPU cost. Three
+decisions follow:
 
-Observed nonblocking readbacks succeeded. These initial perform samples do
-**not** support changing socket mode or replacing the multi API: their long
-wall time is largely descheduling, with separate genuine TLS CPU cost. A reused
-request's zero DNS/connect/TLS timers cannot identify what another connection
-did inside the shared multi call.
+- **Do not replace select with poll.** A zero-timeout `sceNetInetPoll` before
+  the select moves the stall into the extra poll; it does not remove it.
+- **Do not raise the two `sceNetInit` service priorities.** Raised priorities
+  were verified on device and the stalls remained; the original priorities
+  are kept. Raising the worker's own priority wholesale would instead let a
+  multi-second TLS CPU burst block browser work.
+- **The owner CPU-donation lease is the retained fix.** At a browser-owner
+  checkpoint, after input and presentation and only without cancellation,
+  the owner sleeps a bounded 2 ms slice at most once per 4 ms when the worker
+  has runnable setup work or holds the poll lease it publishes around its
+  existing poll. Setup eligibility is published before the worker lowers its
+  priority and cleared after restoring it. No extra poll is issued, the
+  checkpoint changes no thread priority, and no request deadline or
+  cancellation rule changes. With no active setup or poll, the checkpoint
+  returns without a clock read or sleep; an idle worker waits on its event
+  flag.
 
-Subsequent poll attribution isolated a second mechanism: a 6,397 ms poll used
-only 318 us of worker CPU and spent 6,396 ms inside select, with two voluntary
-wait releases. Direct firmware-select instrumentation then measured zero-timeout
-calls taking 2,662 and 3,746 ms. A temporary zero-timeout `sceNetInetPoll` before
-the select moved the stall into that extra poll (6,520 ms); it did not fix it.
-The extra call was removed. Do not replace select with poll on this evidence.
-
-Thread dumps showed firmware network service runnable below the browser.
-Raising the two `sceNetInit` service priorities from 42 to 30 was also rejected:
-the priorities were verified on device, but a completed repeat still recorded
-a 3,755 ms poll. Other firmware dependencies remain; adjusting those two
-priorities alone does not resolve the wait. Their original priorities are kept.
-
-Rejected experiment: use `CURLINFO_PRETRANSFER_TIME_T` to stop classifying a
-connected request waiting for headers as setup. Setup-call counts fell, but the
-repeat's worst call was unchanged (8.895 vs 8.941 seconds); the change was removed.
-It does not solve CPU sharing during actual TLS work. Do not retry as a claimed
-stall fix without a fixture isolating header-wait starvation. Raising the worker
-priority wholesale would instead let the roughly two-second TLS CPU burst block
-browser work.
-
-Bounded owner CPU-sharing experiments request a 2 ms sleep with at least 4 ms
-between completed donations, after input/presentation and only without
-cancellation. Setup eligibility is published before lowering worker priority
-and cleared after restoring it. The owner checks whether setup work is runnable
-only at the donation cadence, not at every layout checkpoint. Completed
-setup-only runs reduced worst perform to 1,178–2,309 ms from the 8,895 ms
-baseline. Page loads remained about 34–35 seconds; this is transport progress,
-not a claim of faster navigation. Settled cursor feedback stayed about 7.2 ms
-average / 16.7 ms maximum, 240/240 samples presented and none over 33 ms.
-Requested sleeps can run longer through preemption (observed maximum 7.7 ms).
-
-The retained fix also publishes a lease around the existing worker poll. While
-that lease is active, the owner may donate even if the worker is waiting:
-firmware services below both threads need that CPU window to complete a socket
-probe. No extra poll is issued, no thread priority is changed by the checkpoint,
-and no request deadline or cancellation rule changes. With no active setup/poll,
-the checkpoint returns without a clock read or sleep. The poll lease is used
-only in the existing branch with transport work; an idle worker waits on its
-event flag as before.
-
-Three final physical-PSP runs with the original firmware thread priorities:
-
-| Scenario | Page load | Images loaded | Worst perform | Worst poll | Exit |
-| --- | ---: | ---: | ---: | ---: | --- |
-| Settled cursor, first | 37,110 ms | 17 | 2,688 ms | 88 ms | clean |
-| Settled cursor, repeat | 36,825 ms | 22 | 2,299 ms | 59 ms | clean |
-| Native menu/cursor | 37,242 ms | 17 | 2,671 ms | 127 ms | clean |
-
-The settled tests each presented all 240 cursor samples, average 7.2 ms,
-maximum 16.7 ms, none over 33 ms. The native-menu scenario completed its
-15 action/wait steps and terminal `end`; its 12 cursor samples likewise stayed
-under 16.7 ms. It began after commit with no pending resources, so it does not
-prove interruption during initial resource loading. Across these runs the
-owner donated 3.61–3.74 seconds total; the longest observed individual donation
-including preemption was 13.5 ms. Image completion counts vary, so these live
-loads are not a controlled throughput comparison. Multi-second TLS CPU and
-page style/resource cost remain separate work.
-
-Two earlier diagnostic runs returned to PSPLink before a report completed,
-without user input. Their last persisted record was initial navigation, not
-a recorded HOME request or clean exit; the cause remains unresolved. One used
-the extra poll experiment and one did not, so removing that probe is **not**
-proof of an exit fix. Keep the incomplete logs and do not count either as a
-passing journey. The three final runs above completed, but do not qualify a
-release or the script-enabled dynamic-request case.
-
-All five baseline journeys completed the cursor/menu script and exited. They
-used a script-free article response (`scripts discovered=0`); they reproduce
-shared transport contention but do **not** qualify the dynamic auto-login script
-path. Raw logs belong in private device artifacts, not the public repository.
-
-Baseline gates: 150 host tests passed, external update-root proof skipped, optional
-device-cost test disabled. Ordinary and validation named PSP targets passed;
-ELF `.text` was 4,125,856/4,480,000 and 4,242,608/4,500,000 bytes respectively.
-The ordinary ELF has no probe wrapper symbols. No release or XMB deployment was
-performed for this investigation.
-
-CPU-sharing fix gates: all 150 enabled, available host tests passed (external
-update-root proof skipped, optional device-cost test disabled). Ordinary and
-validation named PSP targets passed at 4,126,324 and 4,243,776 bytes of `.text`,
-respectively, within unchanged ceilings. The new source-contract test failed
-when the owner donation call was removed and passed when restored; bounded
-cadence tests cover inactive work, spacing, clock reversal and integer limits.
+A setup-time reclassification (`CURLINFO_PRETRANSFER_TIME_T`) is not a stall
+fix; do not retry it without a fixture that isolates header-wait starvation.
 
 Handshake acceleration does not weaken certificate, hostname, protocol, or
 cipher validation.
@@ -292,11 +183,10 @@ prediction-resistance reseeds, ECDHE private keys, client randoms — comes from
 mbed TLS's entropy module, so its strong source decides whether a recorded
 session can be decrypted later.
 
-**What was wrong.** The mbed TLS patch originally routed
-`mbedtls_platform_entropy_poll` to libcglue's `getentropy()`, which calls
-`time()`, seeds `sceKernelUtilsMt19937Init` with it and reads MT19937. Its
-output was fully determined by the wall-clock second of the call, so a passive
-observer who knew roughly when a handshake happened could enumerate the seeds.
+**Why not libcglue's `getentropy()`.** It calls `time()`, seeds
+`sceKernelUtilsMt19937Init` with it and reads MT19937. Its output is fully
+determined by the wall-clock second of the call, so a passive observer who
+knew roughly when a handshake happened could enumerate the seeds.
 
 **What the PSP offers user mode.** Nothing better than timing:
 
@@ -392,8 +282,7 @@ curl's global initialization on the browser thread: at least 4 work and 3 sleep 
 (1,216 samples) when every batch earns the maximum, which should take tens of
 milliseconds, plus one small Memory Stick read and a 48-byte write. After
 release, each mbed TLS entropy poll costs about ten SHA-256 compressions for
-its 128 bytes. Adds about 5 KB of `.text` to the browser and 6 KB to the
-launcher. The actual sample times and estimates are only known from a device
+its 128 bytes. The actual sample times and estimates are only known from a device
 run:
 
 ```text

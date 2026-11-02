@@ -1,236 +1,12 @@
 # Running the desktop labs
 
-This is the complete command-line reference for the two host frontends. Build
-them first with [DEVELOPMENT.md](../DEVELOPMENT.md); the PSP EBOOT is covered
-by [Device qualification](DEVICE_QUALIFICATION.md).
-
-## Private local account input
-
-Use a dedicated disposable test account, never your main account. Do not put
-passwords, verification codes, session cookies, or authenticated URLs in chat,
-command scripts, shell arguments, or captures. For direct host-browser testing:
-
-```sh
-python3 scripts/run-private-interactive-lab.py --url https://example.com/login
-```
-
-Run this yourself in a local interactive terminal after building the release
-host lab. The launcher refuses piped input, discards the child's stdout and
-stderr, removes inherited tracing/cache settings, disables core dumps, automatic
-screenshots, HTTP captures, and persistent bytecode caching, and uses a private
-temporary directory. Its separate native status pipe contains numeric
-page/focus/task information and the parsed top-level origin, never DOM text,
-URL paths, or query parameters. Check that origin before entering a value;
-non-HTTPS credential entry is refused. Cookies and browser
-session data remain in RAM for this process.
-
-Use `view` to explicitly open a temporary 480×272 image, then `focus-id ID`,
-`focus-next`, or `tap X Y` to focus the desired field. Use `secret` to replace
-that field with locally masked input; it preserves spaces and Unicode. Use it
-for account names and verification codes too. `activate` presses the focused
-button; `pump 32 16` advances normal browser turns, including background
-resources and cache maintenance. `tick` deliberately advances runtime/media
-only and is reserved for isolated execution experiments; using it alone for
-a live sign-in can strand optional-resource maintenance and constrain later
-script staging. Ordinary `type`, script
-evaluation, and diagnostic commands are unavailable. `quit` tears down the
-browser and deletes the temporary files. An abrupt OS/process failure may
-leave that directory behind; delete it manually in that case.
-
-For the dedicated Google test account, use `signin` in this console, or add
-`--signin` when launching with `--url https://accounts.google.com/ServiceLogin`.
-On macOS it opens native, masked account/password dialogs. The local driver
-finds unambiguous rendered username/password fields, checks the exact accounts
-HTTPS origin before filling, submits each step once, and advances page work.
-It pauses on a missing password step, changed origin, or refused action; it
-does not solve verification prompts or claim authentication succeeded. The
-requested sign-in opens a temporary PNG page view locally after completion or
-pause; `view` refreshes that snapshot. Keep the process open to retain its
-RAM-only browser session. No account values are passed as shell arguments or
-saved as credential files.
-
-### Keep credentials through browser restarts
-
-For repeated host sign-in debugging, start the RAM-only keeper yourself:
-
-```sh
-python3 scripts/run-private-signin-session.py
-```
-
-Enter the dedicated account once in the local masked dialogs. The helper
-starts the same private browser and attempts the sign-in flow. It never opens
-a preview automatically; use `view` explicitly. Starting it authorizes separately
-requested attempts until stopped, not an automatic retry loop. Optional
-`--confirm-first-attempt` and `--confirm-each-attempt` enable local confirmation;
-`--password-attempt-limit 0` removes the conservative three-attempt cap.
-Its printed control socket is in an owner-only temporary
-directory outside the repository. A test driver can use that socket without
-receiving credentials or accessing page screenshots:
-
-```sh
-python3 scripts/run-private-signin-session.py \
-  --control /private/tmp/tf-auth-EXAMPLE/control.sock --action status
-```
-
-Replace the example path with the one printed by the keeper. Only `status`,
-`attempt`, `restart`, `advance`, `view`, `view-below`, `view-above`, `inspect`,
-`youtube-home`, `youtube-subscriptions`, and `stop` are accepted. Status
-contains a fixed phase name, numeric page/focus/task information, and the
-origin, never form values, cookies, DOM text, URL paths, or error strings.
-Actions run serially; status remains available while browser work is running.
-The keeper's preparation, field waits and response waits use `pump`, matching
-the browser's sliced resource/runtime schedule rather than runtime-only ticks.
-An `aria-invalid` response on the entered account field stops the flow with
-`username_rejected`, without sending the password. Its associated feedback is
-scrolled into the local preview; message text is not returned over the socket.
-`view` opens an image on the user's computer; it does not return its contents
-over the control channel. No network listener is opened.
-
-For a YouTube session, start with `--service youtube`. This follows YouTube's
-ordinary sign-in entry into the accounts page; credentials are still filled
-only on the exact accounts HTTPS origin. After sign-in, `youtube-home` and
-`youtube-subscriptions` open the lightweight provider UI in that same browser
-session: complete ordinary service-entry navigation once, then use bounded
-bootstrap metadata and the browse API. Once navigation has reached YouTube,
-feed checks do not repeat sign-in or reload its heavyweight page. The provider
-builds bounded script-free cards and loads feeds cooperatively in idle turns.
-Request signatures are derived natively from the same session's
-policy-eligible cookies and are never included in diagnostics.
-If memory pressure discarded the sign-in continuation's scripts while its
-incumbent was resident, the first feed action can reload that static page
-through at most two explicit normal reloads per browser process. Advance
-normal browser turns, then request
-the feed check again. This never submits a password or bypasses verification.
-No cookies/tokens are exported, no arbitrary
-URL or request headers are accepted through the socket, and no preview opens.
-`inspect` includes numeric provider state and row counts. Raw personal titles,
-payloads and screenshots stay local and must not be exported as diagnostics.
-An authenticated feed is published only after the API confirms signed-in
-status; an empty account can legitimately publish an empty feed. These host
-checks do not qualify the PSP sign-in journey.
-The targeted synthetic UI gate is
-`build-preset-release/tilefinch-browser-engine-tests --youtube-home-only`;
-it covers background loading, held publication, refresh, subscriptions and
-transactional allocation refusal without an account or external requests.
-The host-only private navigation command reuses normal authority/cookie policy
-and does not add a history entry or persist the session. Changing a running
-keeper's available actions requires restarting it; opaque credentials and
-cookies must never be migrated to a replacement process.
-
-Views now capture the rendered page vertically (up to 4,352 pixels), not just
-the first handheld screen. The diagnostic visual copy removes text belonging
-to input, textarea and editable controls before painting or writing files;
-live field values and focus are unchanged. Matching retained field values in
-other text commands are also removed. Raw DOM, attributes, scripts, cookies,
-and response bodies are not exported. This is a diagnostic for the dedicated
-test account, not a guarantee against an arbitrary page deliberately reflecting
-credentials through images or fragmented text.
-
-With the user's permission, `inspect` produces `redacted.png` and
-`redacted.ppm.txt` beside the socket for a developer to inspect. Only those
-redacted artifacts may be shared; do not inspect an older `view.png` or a raw
-browser dump. Wait for `busy=false` and `inspection_ready=true` before reading
-them. Files remain owner-only, outside the repository, and are removed when
-the keeper exits. The text report states the captured and complete page
-heights; oversized pages are explicitly bounded rather than called complete.
-The text report also includes fixed runtime counters and exception categories
-(such as `type` or `none`), never exception messages or stacks. This distinguishes
-script admission failures and pending requests without exposing author data.
-An opt-in promise-outcome histogram keeps only fixed exception categories,
-including rejections later handled by the page. It records no reason text or
-stack and does not change normal rejection handling.
-Response byte/text lengths, timer and pending-work counts, and allocator
-refusals help distinguish an incomplete delivery from a stalled continuation;
-response contents are never included.
-Dynamic-script fetch failures are partitioned into response-size, transport
-(including HTTP errors), shared-memory, authority/MIME, and source-admission
-counts. These describe receiving a script, not later author evaluation errors;
-they expose no request or response text.
-The private console also opts into a 32-entry RAM-only XHR history: numeric
-send sequence, status, byte/text lengths, response phase, getter-read counts,
-and event counts. Overflow is reported explicitly. Phases are 1 (sent),
-2 (headers), 3 (loading), 4 (done), 5 (loadend complete), 6 (failure), and
-7 (abort). No URL, body, headers, handler identity or field value is retained
-by this history. Ordinary browsing does not allocate it. Scheduler flags
-separate future timers from runnable promise jobs/checkpoint continuations
-and a pending navigation; a successful HTTP status alone is not sign-in success.
-Navigation boundary counters distinguish accepted, refused and consumed host
-requests without recording their targets or metadata. They share the private
-observer's opt-in lifetime and do not allocate in ordinary browsing.
-The redacted snapshot also reports numeric navigation HTTP/transport status,
-TLS/timeout/error-present flags and commit count. Browser-owned failure prefixes
-map to fixed construction-phase categories; unknown errors map to `other`.
-Neither error text nor author exceptions are exported.
-The private test also counts calls and failures through an opt-in `JSON.parse`
-observer, including caught failures. It retains no parser input, result or
-exception text. This observer preserves arguments, receivers, revivers, values
-and exceptions, but changes function identity; aliases cached by the page before
-enablement are not covered. Treat its counts as diagnostic evidence, not a
-complete parser census or a claim that a particular response was accepted.
-With separate user approval, a maintainer may supply an owner-only (0600),
-non-symlink `outcome-classifier.js` in the helper's disposable working directory
-before restarting the browser. It is a trusted local function expression, at
-most 16 KiB, receiving `(value, originalParse, event)`: event 0 observes a parse,
-event 1 observes a promise rejection (with no original parser). For event 1,
-only a bounded numeric stage ID 0–12 is reported, never exception contents.
-Snapshot sampling uses events 2 and 3 for entered/failed stage masks; only
-13-bit integer masks are accepted. Keep these diagnostic counters independent
-of live inputs and clear them at the specific public-code boundary being probed.
-Keep account-specific
-filters in private investigation storage. Only numeric categories 0–12 are
-reported: unrecognized, rejected, verification required, redirect, credential
-transition, protocol error, challenge update, then credential-handoff
-navigation, form POST, native account, close, prerequisite, and other.
-These classify the declared next action, not its completion. Invalid returns and filter
-exceptions become unrecognized; filter exceptions never replace the page's
-parse result or escape into diagnostics. Values and response contents are not
-retained by the native recorder. This observes only parses through the wrapper,
-and a credential transition is not proof that authentication completed.
-The keeper's `--outcome-classifier /private/path/filter.js` option safely copies
-that explicitly requested owner-only filter into a new session before starting
-the browser, avoiding a separate installation/restart. No filter is selected
-by default, and the file must contain diagnostic code, never account inputs.
-Button submission uses normal controller focus and activation, including blur
-notifications, not a selector-only click. Invalid password feedback is revealed
-locally without another submission.
-
-`restart` discards browser cookies and images, not retained account input.
-Use `attempt` afterward. The keeper conservatively counts a possible password
-submission before filling the password field, including failed/uncertain
-delivery. Starting the keeper locally authorizes requested attempts until it
-stops; no additional approval dialogs or image previews appear by default.
-Use `view` to open a preview, or `--confirm-each-attempt` to opt into a local
-confirmation dialog (Cancel by default) for every attempt. At most three
-possible password submissions are allowed per keeper session by default.
-For explicitly authorized extended debugging, `--password-attempt-limit 0`
-removes that lifetime cap. It does not retry automatically: after the initial
-startup attempt, each attempt remains a separate control action. Credentials
-stay in RAM until Ctrl-C or `stop`; uncapped mode does not export or migrate
-them. Repeated failures can trigger account lockouts, so inspect the result
-and change the tested implementation before retrying an unchanged failure.
-A browser failure does not request the credentials again.
-For a single explicitly approved diagnostic attempt, start a fresh keeper with
-`--password-attempt-limit 1 --confirm-first-attempt`. The first attempt then
-requires the same local confirmation, and restarting the browser cannot permit
-a second password submission. These startup options cannot change a running
-keeper's allowance or transfer its retained credentials.
-Verification and unexpected pages remain under user control. Ctrl-C or `stop`
-terminates the browser, clears the retained bytearrays, and deletes the local
-temporary directory. The keeper itself must stay running to avoid re-entry.
-
-The owner-only socket is not a security boundary against other processes
-running as the same OS user. Do not share it publicly. This helper never
-transfers cookies from another browser, and browser restarts do not retain an
-authenticated session. Credentials remain available only to the local helper
-and the intended website during its ordinary sign-in flow.
-
-This is not a hardened credential vault: the experimental browser and the
-intended website necessarily hold submitted values in memory. Python does not
-guarantee erasure of string copies; OS swap, privileged inspection, and image
-viewer caches are outside the launcher's protection. Explicit views can contain
-account details. After testing, sign out or revoke the test session from the
-account's security settings. This path does not transfer another browser's
-session or bypass an identity provider's checks.
+This is the command-line reference for the two host frontends,
+`psp-browser-lab` (static renderer) and `psp-browser-interactive-lab`
+(persistent runtime). Build them first with
+[DEVELOPMENT.md](../DEVELOPMENT.md); the PSP EBOOT is covered by
+[Device qualification](DEVICE_QUALIFICATION.md). Signing the lab into a test
+account is covered by [Private account lab](PRIVATE_ACCOUNT_LAB.md); replay
+and reference capture by [Replay and reference lab](REPLAY_LAB.md).
 
 ## Static renderer (`psp-browser-lab`)
 
@@ -248,9 +24,9 @@ Use `--skip-js` to measure HTML/CSS/layout/rendering independently when a real p
 
 `--challenge-diagnostic` is an explicitly diagnostic navigation policy. It retains an HTTP error page, records `cf-mitigated`, `Accept-CH`, `Critical-CH`, and server headers, runs only the page's initially present inline scripts, and reports external script URLs inserted into the DOM. It does not claim the error page is the requested site and does not fabricate or submit a challenge result.
 
-The interactive lab's closing summary reports `bot-wall detected=yes site=... vendor=... status=...` when the committed top-level document is a bot-protection wall: a refusal status (403, 405, 429 or 503, or AWS WAF's 202) with a vendor signature in its headers or title (DataDome, Cloudflare challenge, Imperva, AWS WAF, Kasada, HUMAN, Akamai's block page), or a refusal-status page that paints nothing after its script was refused. The PSP chrome raises the same two-line notice ("<site> blocked Tilefinch / Bot protection: this site may not work") instead of leaving a silent blank page. Detection is generic, reads only the response and the committed page, and never attempts the challenge.
+The interactive lab's closing summary reports `bot-wall detected=yes site=... vendor=... status=...` when the committed top-level document is a bot-protection wall: a refusal status (403, 405, 429 or 503, or one vendor's 202) with a known vendor signature in its headers or title (the table is in `src/bot_wall.c`), or a refusal-status page that paints nothing after its script was refused. The PSP chrome raises the same two-line notice ("<site> blocked Tilefinch / Bot protection: this site may not work") instead of leaving a silent blank page. Detection is generic, reads only the response and the committed page, and never attempts the challenge.
 
-The interactive lab can make a legitimate managed-challenge attempt with `--url ... --fetch-scripts`. It retains secure/HttpOnly response cookies, retries a safe GET once when `Critical-CH` requests truthful PSP client hints, and sends only the named high-entropy hints to the origin that requested them. A cross-origin retry redirect suppresses those hints for the rest of that redirect chain while truthful low-entropy hints continue normally. The lab loads scripts inserted by the bootstrap under normal quotas and reports challenge/network/clearance state without cookie values. It never copies clearance from another browser. The ordinary compatibility User-Agent carries iPhone/WebKit/Safari routing tokens so large sites choose their bounded mobile document, while also naming `PlayStation Portable` and `Tilefinch`; `navigator.platform` and low-entropy Client Hints remain explicitly PSP/Tilefinch rather than claiming the capabilities of Safari or Chrome. Google is the one per-site exception (`src/site_identity.c`): with the compatibility User-Agent it serves an XHTML-MP "Update your browser" page, so Google searches open a local compatibility page. Its "Try Google anyway" button opts the session in until the browser restarts; Google top-level documents then use the honest `Mozilla/5.0 (PlayStation Portable) Tilefinch/0.1` for their navigation, every request they make, and `navigator.userAgent`, and a 429, `/sorry/`, XHTML-MP, or failed search clears the opt-in and returns to the compatibility page. The opt-in marker on that button's URL is stripped before any request is built.
+The interactive lab can make a legitimate managed-challenge attempt with `--url ... --fetch-scripts`. It retains secure/HttpOnly response cookies, retries a safe GET once when `Critical-CH` requests truthful PSP client hints, and sends only the named high-entropy hints to the origin that requested them. A cross-origin retry redirect suppresses those hints for the rest of that redirect chain while truthful low-entropy hints continue normally. The lab loads scripts inserted by the bootstrap under normal quotas and reports challenge/network/clearance state without cookie values. It never copies clearance from another browser. The lab sends the same User-Agent and per-site identity exceptions as the PSP (`src/site_identity.c`).
 
 ### Managed challenges as a standards qualification
 
@@ -259,88 +35,12 @@ fixture whose changing program or answer belongs in Tilefinch. Diagnostic runs
 may record API lookups, task failures, network shape, cookie names, and the
 eventual clearance state; they must not patch the challenge, synthesize its
 payload, import clearance from another browser, or add a site-specific client.
+Fix what such a run exposes from the standards contract and a focused test,
+never by matching the challenge program.
 
 The probes and command scripts used for these observations are kept together,
 with what each one reports, in
 [`tests/fixtures/challenge-lab/`](../../tests/fixtures/challenge-lab/README.md).
-
-The current qualification establishes these boundaries:
-
-- Browser/API comparison found and fixed a real same-origin iframe difference:
-  a parent may read and call the child `Window.eval` when the frame has
-  `sandbox="allow-same-origin"` without `allow-scripts`. The sandbox suppresses
-  child-owned script execution; it does not hide that same-origin Window
-  property. The managed program now completes without JavaScript or callback
-  errors, posts its verification response with HTTP 200, receives a Secure,
-  HttpOnly `cf_clearance` cookie, and automatically navigates again with that
-  cookie present.
-- The edge nevertheless returns another managed challenge. In that
-  qualification, five consecutive challenge documents—including the
-  second managed challenge—completed their verification requests without a
-  JavaScript or callback error, while the Secure/HttpOnly clearance cookie was
-  retained and resent. Each follow-up still received a fresh challenge rather
-  than the application. This rules out cookie persistence, navigation handoff,
-  and an immediate ECMAScript exception as the remaining cause; it does not
-  prove which server-side risk signal or custom-engine policy declined the
-  session.
-- A later re-observation found the edge escalating Tilefinch to
-  Turnstile's interactive checkbox (the widget posts `interactiveBegin`;
-  the parent's "Verification successful. Waiting for chatgpt.com to
-  respond" is template text shown while it waits for a person). Tilefinch
-  could not show that checkbox: three generic bugs hid it (width/height
-  hints mapped onto a `<div height="10 em">`, a shrink-wrapped grid that
-  ignored its implicit columns, and iframe snapshots painted at
-  display/frame scale and never re-taken after a resize). With those
-  fixed, the published force-interactive test sitekey renders like
-  Chromium and a click inside the frame completes it. Completing the real
-  checkbox is a human step: the lab must not click it, and whether the
-  edge then serves the application remains unobserved.
-- Chromium controlled through the browser lab reaches the ordinary ChatGPT
-  application without being assigned this challenge, so it cannot provide an
-  instruction-by-instruction control run. It remains useful for focused Web API
-  comparisons, which is how the iframe `eval`, Window/HTMLDocument branding,
-  XHR inheritance, Streams surface, and built-in reflection differences were
-  isolated.
-- The challenge has a roughly 9.1 MiB transient QuickJS peak but settles near
-  6.1 MiB. Under the exact PSP script quotas, a 5 MiB steady heap plus the
-  existing Budget-charged 4 MiB boot window completes verification within a
-  roughly 24.9 MiB total page peak. The window is an allocation ceiling rather
-  than a reservation and is returned after a bounded post-boot collection or
-  realm teardown. Physical-device timing and memory remain a separate gate.
-- Removing `Worker` selects the page's unsupported-browser branch, so the
-  constructor and lifecycle still need to be standards-shaped. Tilefinch now
-  runs bounded Blob workers in separate QuickJS realms, with isolated
-  ECMAScript intrinsics and globals, a dedicated `WorkerGlobalScope`, truthful
-  navigator/location views, bounded structured-clone mailboxes, asynchronous
-  startup and delivery, and deterministic cancellation of timers, fetches, and
-  the realm on termination or navigation. The implementation remains a
-  first-use bootstrap so ordinary pages do not compile worker machinery.
-  One observed probe constructs a Blob worker and immediately terminates it
-  before the queued startup task. Its tiny `"you" === "bot"` body is
-  consequently never evaluated and is not a verdict delivered to Tilefinch.
-  Later challenge generations do run workers; a missing-capability trace over
-  those runs reported no property absent from Tilefinch's supported Worker
-  surface. Add Worker APIs from their standards contracts and focused tests,
-  not by guessing from obfuscated challenge generations.
-- A differential QuickJS test isolated a separate standards defect exposed by
-  the managed program: shrinking a sparse array could skip indexed properties
-  when property deletion compacted its shape. Compact-character arrays changed
-  which stale indices survived, explaining a pre-fix challenge callback
-  `TypeError`, but disabling that optimization did not make array shrinking
-  correct. The engine now restarts its bounded deletion scan after shape
-  compaction and the minimized sparse-array sequence is a regression test.
-- A normal HTTP fixture loads Cloudflare's public Turnstile API, invokes its
-  named global `onload` callback, and exposes `render`, `execute`, `getResponse`,
-  `remove`, and `reset` as functions. The verification POST also completes with
-  HTTP 200. External-script loading and Turnstile's loader callback are therefore
-  not the missing step.
-- The failure-adjacent API trace constructs `MutationObserver`,
-  `PerformanceObserver`, `Blob`, and `Worker`; calls the crypto, history, and
-  performance surfaces; inspects `ReadableStream.prototype` and
-  `navigator.cookieEnabled`; and reads `navigator.gpu`. It never calls a WebGPU
-  method. The last access is therefore a fingerprint observation, not evidence
-  that this challenge requires WebGPU execution. Do not manufacture a GPU
-  object or expose WebGPU until Tilefinch has an honest bounded implementation.
 
 `--trace-page` reports three complementary views: `first=` is the bounded
 first-use order with routine intrinsic noise removed, `tail=` preserves the
@@ -348,35 +48,15 @@ operations immediately before the first callback failure, and `types=` records
 coarse return shapes without serializing page objects. The trace freezes at the
 first failure so later recovery work cannot overwrite the causal window.
 
-The current Worker profile deliberately admits classic retained-Blob workers.
-It provides the bounded subset above plus timers, `fetch`, URL/Blob, encoding,
-streams, crypto, performance, Trusted Types, and classic `importScripts`, all
-under the document's immutable origin/CSP/network policy. Module workers remain
-a separate later milestone; they must not be claimed until module fetch,
-credentials, dependency graphs, and cancellation are implemented within fixed
-PSP bounds.
-
-Qualification for that milestone is generic: curated Worker/Blob Web Platform
-Tests for realm and prototype isolation, constructor/error ordering, immediate
-URL revocation, task-versus-microtask ordering, messaging, termination, CSP,
-network cancellation, quota recovery, and navigation teardown; reflected
-built-in names/descriptors for the APIs the runtime exposes; and a synthetic
-server proof that any legitimately issued Secure/HttpOnly clearance-style
-cookie survives the response and accompanies the following navigation. Only
-after those pass should the production challenge be observed again. Success is
-not promised: Cloudflare documents custom engines and embedded browsers as
-having limited support, so a standards-correct Tilefinch may still be declined
-by server policy.
-
 Live document loads use the same hard allocation budget as parsing and rendering:
 
 ```sh
 ./build-preset-release/psp-browser-lab \
-  --url https://en.wikipedia.org/wiki/PlayStation_Portable \
-  --output-dir frames/wikipedia \
+  --url https://example.test/article \
+  --output-dir frames/article \
   --limit-mb 13 \
   --max-download-kb 4096 \
-  --dump-links frames/wikipedia-links.tsv
+  --dump-links frames/article-links.tsv
 ```
 
 `--reader-profile none` is the default, so ordinary browsing uses author CSS
@@ -398,13 +78,44 @@ has committed. It cannot be combined with `--user-css` or
 `--hide-cookie-banners`, keeping the capture's presentation source
 unambiguous.
 
-`--fetch-images` separately enables bounded raster/SVG, CSS-background, and CSS-mask loading. Defaults bound the pass to 64 unique attempts, 512 KiB aggregate encoded input, 256 KiB per response, and 512 KiB retained decoded SVG/mask data. Raster files remain compressed and are decoded one at a time through the tile cache; a source decode may use at most four times the output quota, capped at 8 MiB for sub-8-MiB profiles, and is repeatedly halved before painting when its RGBA target exceeds the quota. Larger decompression candidates are skipped before allocation. Responsive `<picture>` and width-descriptor `srcset` select a viewport-sized supported source. Change the limits with `--max-images`, `--max-image-kb`, `--max-image-file-kb`, and `--max-decoded-image-kb`. Duplicate URLs share resources, element and pseudo-element masks and CSS background images use the same quotas, unsupported or failed optional resources do not abort the page, and every retained buffer uses the shared page budget. Background `cover` and `contain` use centered bounded sampling; repetition is supported, and the common two-gradient layered-background form paints in source order. Arbitrary layer counts and independent per-layer URL positioning remain unsupported. External stylesheets may recursively import up to four levels while sharing the same URL-count, byte, timeout, cache, and page-memory limits; conditional imports use the bounded media/supports evaluators. Quoted and single-`attr(name)` pseudo-element content is decoded locally under a 64-string/63-byte-per-string cap; live attribute values reuse bounded DOM bytes. When external resources are enabled and FreeType 2.14.3 or newer is available, page fonts are limited to eight attempts, 256 KiB aggregate encoded input, 96 KiB per response, eight regular/bold family identities (the eight-attempt and encoded-byte budgets remain unchanged), two ordered sources per face, and 256 KiB of backend allocation per face. Unsupported WOFF2, collections, CFF outlines, inline data URLs, failed CORS requests, and quota misses fall back without aborting the page. The interactive lab has a separate quota-controlled external-script pipeline.
+### Images
+
+`--fetch-images` separately enables raster/SVG, CSS-background, and CSS-mask
+loading. Defaults limit the pass to 64 unique attempts, 512 KiB aggregate
+encoded input, 256 KiB per response, and 512 KiB retained decoded SVG/mask
+data. Raster files remain compressed and are decoded one at a time through
+the tile cache; a source decode may use at most four times the output quota,
+capped at 8 MiB for sub-8-MiB profiles, and is repeatedly halved before
+painting when its RGBA target exceeds the quota. Larger decompression
+candidates are skipped before allocation.
+
+Responsive `<picture>` and width-descriptor `srcset` select a viewport-sized
+supported source. Change the limits with `--max-images`, `--max-image-kb`,
+`--max-image-file-kb`, and `--max-decoded-image-kb`. Duplicate URLs share
+resources; element and pseudo-element masks and CSS background images use
+the same quotas. Unsupported or failed optional resources do not abort the
+page, and every retained buffer uses the shared page budget. Background
+`cover` and `contain` use centered sampling; repetition is supported, and
+the common two-gradient layered-background form paints in source order.
+Arbitrary layer counts and independent per-layer URL positioning remain
+unsupported.
+
+### Stylesheets and generated content
+
+External stylesheets may recursively import up to four levels while sharing
+the same URL-count, byte, timeout, cache, and page-memory limits; conditional
+imports use the media/supports evaluators. Quoted and single-`attr(name)`
+pseudo-element content is decoded locally under a 64-string/63-byte-per-string
+cap; live attribute values reuse the DOM's bytes. The static renderer uses
+its configured local fonts; use the [interactive lab](#page-fonts) to
+exercise page-provided fonts and its separate quota-controlled
+external-script pipeline.
 
 A bounded mobile-CSS run is:
 
 ```sh
 ./build-preset-release/psp-browser-lab \
-  --url https://en.wikipedia.org/wiki/PlayStation_Portable \
+  --url https://example.test/article \
   --reader-profile auto \
   --fetch-css \
   --fetch-images \
@@ -414,7 +125,7 @@ A bounded mobile-CSS run is:
   --limit-mb 16 \
   --skip-js \
   --scroll-all \
-  --output-dir frames/wikipedia-mobile
+  --output-dir frames/article-mobile
 ```
 
 `--scroll-all` walks from top to bottom in half-viewport increments, writes `scroll-manifest.tsv`, rejects blank frames, and verifies that the top frame is identical after tile eviction. It saves top/middle/bottom PPMs; repeatable `--save-scroll Y` options add semantic checkpoints. `--viewport-width` and `--viewport-height` select the device render surface within guarded ranges; page viewport metadata selects the CSS layout viewport. `--no-render` runs fetch/parse/style/layout/link analysis while retaining the framebuffer reservation but writing no images.
@@ -430,8 +141,7 @@ composition share that CSS coordinate space. The renderer creates a bounded
 device-scaled visual clone only when the layout and device viewports differ.
 Viewport resolution and CSS/device conversion are owned by one immutable
 `ViewportContext` value that is passed to style, layout, JavaScript,
-navigation, controller input, and rendering. The older scalar viewport entry
-points remain as compatibility wrappers. Replacing a scaled tile-cache layout
+navigation, controller input, and rendering. Replacing a scaled tile-cache layout
 is transactional: if its visual clone or required overlay allocation fails,
 the previously renderable layout and tiles remain active and the caller gets a
 failure result.
@@ -452,6 +162,31 @@ A page that sets `globalThis.pocSummary` has it printed as
 command and reference numbers in its header. It is a before/after comparison
 tool, not a gate.
 
+### Page fonts
+
+The interactive lab's resource pipeline loads page-provided TrueType, WOFF,
+and WOFF2 fonts, with variable-font weight and optical-size selection and
+OpenType pair kerning. The default build uses the pinned FreeType;
+`-DPSP_BROWSER_SYSTEM_FREETYPE=ON` selects a system copy, which must meet the
+configured version floor and drops WOFF2, and
+`-DPSP_BROWSER_ENABLE_WEB_FONTS=OFF` removes page fonts from the build.
+
+`BrowserConfig` defaults allow eight attempts, 256 KiB aggregate encoded
+input, 128 KiB per response, and 256 KiB retained backend allocation per face.
+The realistic PSP profile lets a single response use the same shared 256 KiB
+encoded allowance; strict mode keeps the 128 KiB per-response limit. There
+are at most eight family identities, six weight faces per family, and two
+ordered source alternatives per face; those capacities do not increase the
+attempt or byte allowances. Inline `data:` fonts use the same admission
+limits and CSP checks. Unsupported or malformed fonts, failed permission
+checks, and quota refusals keep fallback text available rather than aborting
+the page.
+
+The lab defaults to Smart font policy; `--web-font-mode on|smart|off` selects
+the policy and `--no-web-fonts` disables only author fonts, not the built-in
+faces. See [Web fonts](HOST_TEST_MODES.md#web-fonts) for same-binary comparison
+switches, memory accounting, and focused tests.
+
 ### Work vector (`tilefinch-work`)
 
 Host wall time does not transfer to the PSP's 333 MHz in-order MIPS core, so
@@ -468,7 +203,7 @@ tilefinch-work: label=<mark> js.work_units=163959 js.polls=17 ... fetch.replay_s
   `profile [LABEL]`, and once as `label=final` in the closing summary.
 - PSP validation builds print it at every input-script mark (label = mark
   name), under PPSSPP and on the device
-  ([INPUT_SCRIPT_HARNESS.md](INPUT_SCRIPT_HARNESS.md)). Shipping PSP builds
+  ([Input script reference](INPUT_SCRIPT_REFERENCE.md#reading-the-trace)). Shipping PSP builds
   compile the record and its tallies out.
 
 Every value is a plain integer count, or `n/a` for a counter the build does
@@ -520,15 +255,14 @@ What is and is not deterministic:
 - Identical execution gives an identical record. `tests/test_work_vector_determinism.py`
   (`tilefinch-work-vector-determinism-tests`) runs a local fixture journey
   and a `--deterministic-replay-seed` HTTP replay twice each and requires
-  identical vectors; 24 concurrent runs under load also matched.
+  identical vectors.
 - `style.cache_hits`/`style.cache_misses` are keyed by node address, so their
   split can move by one when allocation interleaving differs; compare
   `style.resolutions` and pass `--ignore style.cache_` to `--check-equal`.
   An extra miss can be one more full resolution, so `style.rule_queries`
   moves in the same direction by at most the miss difference, and
-  `style.rule_candidates`/`style.selector_*` move with it (about one run in
-  300 when each run's fixture sits in a fresh temporary directory). The
-  determinism test checks those against the miss difference.
+  `style.rule_candidates`/`style.selector_*` move with it. The determinism
+  test checks those against the miss difference.
 - Page script that reads the clock can change behaviour between runs; use
   `--deterministic-replay-seed` (seeded clock and random) for such pages.
   Without it, `js.float64_boxes` can differ by a few (a timestamp that
@@ -536,8 +270,7 @@ What is and is not deterministic:
 - `--psp-profile strict|realistic` time-slices each advance (16 ms of host
   time), so a slower or faster build (an op-count build, a code change)
   splits tasks across turns differently and a busy page's vector moves by a
-  few percent even with a seed (chatgpt.com's send window: up to ~10% in
-  `js.work_units`). For A/B across builds, omit `--psp-profile` (the lab
+  few percent even with a seed. For A/B across builds, omit `--psp-profile` (the lab
   execution profile has no slice) and pass the explicit memory limits; two
   builds with identical page behaviour then print identical `js.*` fields.
 - Turning the profiler on changes `js.allocs`/`js.alloc_bytes` and a few
@@ -589,13 +322,17 @@ by `tilefinch-opcodes: label=L op=NAME count=N` lines (cumulative, most
 frequent first); subtract consecutive labels for a window's opcode mix.
 
 **Engine micro-benchmark.** `tilefinch-js-bench` (host) and boot.cfg
-`validation_js_bench=N` (PSP validation build; see the input-script
-harness) run the same synthetic kernels, collection, and compile of a trace's
+`validation_js_bench=N` (PSP validation build; see
+[Validation records](VALIDATION_RECORDS.md#engine-micro-benchmark-before-boot)) run the same synthetic kernels, collection, and compile of a trace's
 JavaScript records, each timed on the platform clock with the engine's work
 counters, and print `tilefinch-js-bench:` lines. `tools/js_bench_compare.py
-host=A ppsspp=B device=C` joins reports into ratio tables: a PPSSPP column
-over the host is the instruction-count ratio, a device column over PPSSPP the
-effective CPI. The host tool's `--only a,b`, `--scale N`, `--repeat R` and
+host=A ppsspp=B device=C` joins reports into ratio tables of elapsed time.
+They are not instruction counts or cycles per instruction: each host runs
+different machine code, and PPSSPP does not model the PSP's caches. Use them
+to find kernels that cost disproportionately more on one platform, with the
+same source, iteration counts, allocator and instrumentation settings on
+every side and repeated runs kept; they do not predict a whole-page device
+speedup. The host tool's `--only a,b`, `--scale N`, `--repeat R` and
 `--trace DIR` select kernels, iterations, best-of repeats and the trace.
 
 `psp-browser-interactive-lab` exercises the persistent layers together. It retains JavaScript and session state, can advance the bounded timer clock, load quota-controlled same-origin scripts, repeat navigation to exercise HTTP validators and the script cache, drive controller focus/edit/activation, follow GET/POST form actions, and render the resulting page:
@@ -776,7 +513,7 @@ accelerated session advances 30 minutes of logical browser time and enforces a
 five-minute wall-clock ceiling:
 
 ```sh
-./benchmarks/run-platform-session.sh build-dev /tmp/platform-session
+./benchmarks/run-platform-session.sh build-preset-release /tmp/platform-session
 ```
 
 This deliberately is not a CTest, development-test, or port-readiness member;
@@ -784,8 +521,8 @@ run it only when explicitly qualifying the simulator. The deterministic fault
 recovery and selected neutral Web-platform checks are separate and fast:
 
 ```sh
-./benchmarks/run-failure-recovery.sh build-dev /tmp/failure-recovery
-./benchmarks/run-web-platform-correctness.sh build-dev /tmp/web-platform
+./benchmarks/run-failure-recovery.sh build-preset-release /tmp/failure-recovery
+./benchmarks/run-web-platform-correctness.sh build-preset-release /tmp/web-platform
 ```
 
 The fault run proves timeout, TLS, truncated-response, cancellation, and
@@ -793,33 +530,8 @@ allocator recovery in one process against a loopback fixture. The selected
 manifest is intentionally described as a small engine regression suite, not
 as an upstream WPT conformance claim.
 
-A separate opt-in lane runs a pinned, sparse 89-file subset of the actual
-upstream Web Platform Tests side by side with those local regressions:
-
-```sh
-./benchmarks/prepare-upstream-wpt.sh /tmp/tilefinch-wpt
-./benchmarks/run-web-platform-side-by-side.sh \
-  build-dev /tmp/tilefinch-wpt /tmp/tilefinch-web-platform
-```
-
-Its Acid-style report card executes 68 upstream `testharness.js` pages and
-pixel-compares 21 upstream reftest pairs, grouped into 24 HTML/CSS feature
-panels. Upstream failures are compatibility measurements rather than routine
-CTest failures; adapter/harness errors still fail the command. See
-[WPT.md](../WPT.md) for the pinned revision, selection rationale,
-baseline, strict mode, and current harness boundary.
-
-A separate 65-page exploratory lane measures DOM tree APIs, event dispatch,
-mutation observers, CSSOM View geometry, and focus/form interaction:
-
-```sh
-./benchmarks/run-upstream-wpt-dom-interaction.sh \
-  build-dev /tmp/tilefinch-wpt /tmp/tilefinch-wpt-dom-interaction
-```
-
-It uses the same pinned checkout and static adapter, remains outside CTest,
-and is not expected to be green while its newly exposed compatibility work is
-being assessed.
+The upstream Web Platform Tests lanes, which run beside these local
+regressions, are described in [WPT.md](../WPT.md).
 
 The retained large-page corpus exercises incremental navigation, progressive
 paint, and clean pressure rejection without making live requests:
@@ -835,8 +547,7 @@ See [STREAMING_NAVIGATION.md](STREAMING_NAVIGATION.md) for the stream
 contract, script/resource lifecycle, differential and fault coverage, memory
 comparison, corpus results, and PSP integration boundaries.
 
-The completed 16/24 MiB ownership, pressure, compact-layout, cooperative-work,
-acceptance, and large-document qualification is documented in
+Memory profiles, ownership and pressure behavior are in
 [PSP_ENVELOPE.md](PSP_ENVELOPE.md).
 
 For offline compatibility analysis, `psp-browser-interactive-lab --fixture PAGE --probe-script SCRIPT` evaluates an in-memory instrumented copy of a locally captured external script against the retained page runtime at the isolated `https://fixture.test/` origin. It traces missing global/document/element/API properties, swallowed XHR errors and unhandled Promise rejections, and prints a token-safe bounded DOM outline. It never modifies the saved script or sends a page-specific verification/application transaction.
@@ -855,9 +566,8 @@ python3 fixtures/server.py
 ```
 
 `--trace-frames` adds an isolated missing-property trace to the challenge frame;
-it is diagnostic and is not used for the final truthful attempt. The current
+it is diagnostic and is not used for the final truthful attempt. A passing
 uninstrumented run loads the official API and frame, completes the normal
-challenge, receives Cloudflare's documented dummy token, submits the form, and
-gets `TURNSTILE PASS ERRORS none` from Siteverify using the documented test
-secret. See [DEVICE_QUALIFICATION.md](DEVICE_QUALIFICATION.md) for what this
-host-side proof can and cannot establish.
+challenge, receives the documented dummy token, submits the form, and gets
+`TURNSTILE PASS ERRORS none` from Siteverify using the documented test
+secret.

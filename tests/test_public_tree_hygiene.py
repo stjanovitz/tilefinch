@@ -19,8 +19,10 @@ IGNORE_RULES = {
     "/docs/engineering/MEMORY_EXPERIMENTS.md",
     "/docs/engineering/RELEASE_*_CHECKS.md",
 }
+# Public pages that summarize private investigations (the engineering index's
+# "Parked directions"); they must not point into private paths.
 PUBLIC_SUMMARIES = (
-    "docs/engineering/NATIVE_TIER_INVESTIGATION.md",
+    "docs/engineering/README.md",
 )
 # The private ledgers live only in maintainers' ignored
 # .private-investigations/ directory. Public files may name them only by that

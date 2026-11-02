@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Record Treadline's standard scenarios in PPSSPP and assemble one review folder.
 
-The milestone visual review (docs/DEVELOPMENT.md, "Treadline visual QA"):
-for each scenario and clock it packages the game with the scenario's URL,
-records a PPSSPP run (scripts/run-ppsspp-input-script.sh --record-video),
-runs scripts/analyze-game-video.py, and builds an overview contact sheet (one
+The milestone visual review (examples/treadline-arena/QUALIFICATION.md,
+"Milestone review"): for each scenario and clock it packages the game with
+the scenario's URL, records a PPSSPP run
+(scripts/run-ppsspp-input-script.sh --record-video), runs
+scripts/analyze-game-video.py, and builds an overview contact sheet (one
 frame every two seconds). It also runs the reference-screenshot check
 (scripts/check-treadline-references.py) and writes index.html and index.md
 at the top of the folder: per scenario, the event summary, the overview

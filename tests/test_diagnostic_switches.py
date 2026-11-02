@@ -18,6 +18,15 @@ ROOT = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path(__file__).reso
 DOC = ROOT / "docs" / "DIAGNOSTIC_SWITCHES.md"
 SOURCE_DIRS = ("src", "third_party/quickjs")
 LAB_BINARY = "lab binary"
+# The Device column's vocabulary, defined at the top of the document.
+DEVICE_VALUES = (
+    LAB_BINARY,
+    "host",
+    "host / PSP validation",
+    "PSP validation only",
+    "always",
+    "always, set by the PSP app",
+)
 TRACE_HEADER = "src/diagnostic_trace.h"
 # The EBOOT is psp-browser-script plus every target it links, transitively.
 # Conditional source additions and links count too, so the set
@@ -242,6 +251,10 @@ def main():
                   "builds compile out; its Device column cannot be 'always'")
             return 1
         device = columns[4].strip()
+        if device not in DEVICE_VALUES:
+            print(f"{name} has Device column '{device}'; use one of: "
+                  + ", ".join(f"'{value}'" for value in DEVICE_VALUES))
+            return 1
         if name in lab_binary and device != LAB_BINARY:
             print(f"{name} is read only in lab executables the PSP EBOOT does not "
                   f"compile ({', '.join(sorted(set(sites[name])))}); its Device "

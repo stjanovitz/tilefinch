@@ -1,7 +1,8 @@
 # Troubleshooting
 
-Fixes for the problems PSP owners actually run into, roughly in the order
-they meet them.
+This page is for PSP owners: fixes for the problems people actually run
+into, roughly in the order they meet them. **Menu → …** paths start from the
+menu that Select opens in Tilefinch; other paths are in the PSP's own XMB.
 
 ## Wi-Fi won't connect
 
@@ -12,72 +13,71 @@ network up in the PSP's own **Settings → Network Settings** first, and make
 sure its connection test passes there before suspecting the browser.
 
 Tilefinch connects through a saved PSP connection profile, the first one by
-default. To use another, choose it in **Settings → Device & storage → Wi-Fi
-profile**. You can also set `network_profile=<N>` (the 1-based position of
-the saved connection) in `PSP/GAME/TILEFINCH/data/boot-overrides.cfg`; create
-the file if it does not exist, with one `key=value` per line.
+default. To use another, choose it in **Menu → Settings → Device & storage →
+Wi-Fi profile**. You can also set `network_profile=<N>` (the 1-based position
+of the saved connection) in `PSP/GAME/TILEFINCH/data/boot-overrides.cfg`;
+create the file if it does not exist, with one `key=value` per line.
 
-For a failure you want to share, turn on **Settings → Device & storage →
-Wi-Fi diagnostics**, retry the connection, then open **Help & diagnostics →
-Diagnostic QR**. The verbose connection report stays in RAM: ordinary
-connections do not write a diagnostic file. It includes connection phases,
-firmware error codes, profile number and basic configuration flags, but no
-network name, password, IP address or MAC address. Turning the option Off or
-exiting clears it.
+For a failure you want to share, turn on **Menu → Settings → Device & storage
+→ Wi-Fi diagnostics**, retry the connection, then open **Menu → Help &
+diagnostics → Diagnostic QR**. The verbose connection report stays in RAM:
+ordinary connections do not write a diagnostic file. It includes connection
+phases, firmware error codes, profile number and basic configuration flags,
+but no network name, password, IP address or MAC address. Turning the option
+Off or exiting clears it.
 
 ## A secure page says its certificate failed
 
-Check the PSP's date and time under **Settings → Date & Time Settings**, then
-retry. HTTPS certificates are valid only for a stated date range, so a PSP
-whose clock has reset to an old date can make a valid site look untrusted.
+Check the PSP's date and time in the XMB under **Settings → Date & Time
+Settings**, then retry. HTTPS certificates are valid only for a stated date
+range, so a PSP whose clock has reset to an old date can make a valid site
+look untrusted.
 
-**“The certificate validity starts in the future”**, **“certificate is not
-yet valid”**, or **“Certificate not yet valid”** means the certificate's start
-date is later than the date Tilefinch is using. The usual cause is an old or
-incorrect PSP clock, not a Wi-Fi password problem. Exit to the PSP's XMB and
-open **Settings → Date & Time Settings**. Check the **year**, month, day, time,
-and time zone against the current date and local time, then reopen Tilefinch
-and retry. A clock that is ahead can instead cause a certificate-expired error.
+**Certificate not yet valid**, shown with **Make sure date/time in XMB
+Settings is correct**, means the certificate's start date is later than the
+date Tilefinch is using. The usual cause is an old or incorrect PSP clock,
+not a Wi-Fi password problem. Exit to the PSP's XMB and open **Settings →
+Date & Time Settings**. Check the **year**, month, day, time, and time zone
+against the current date and local time, then reopen Tilefinch and retry. A
+clock that is ahead can instead cause a certificate-expired error.
 
-Tilefinch now shows **Certificate not yet valid** with **Make sure date/time
-in XMB Settings is correct**, rather than only the TLS library's error sentence.
 **PSP clock unavailable** means the clock could not be read or converted to a
-supported date; check it in XMB too. Older builds may show only the original
-Mbed TLS error.
+supported date; check it in the XMB too.
 
 Tilefinch never bypasses certificate checks and never sets the clock from an
 unauthenticated network source. If the clock is right and the error persists,
-open **Help & diagnostics → Diagnostic QR** and share every QR page; the
-report includes the exact clock value and the original certificate error.
+open **Menu → Help & diagnostics → Diagnostic QR** and share every QR page;
+the report includes the exact clock value and the original certificate error.
 A site's certificate can also genuinely be dated in the future; if your
 clock is correct, do not keep changing it just to make the page load.
 
 ## A page won't finish loading
 
-This is by design. Tilefinch gives every page a fixed memory budget out of
-the PSP's 64 MB, and a page that outgrows it degrades instead of crashing.
-Its scripts may stop ("JavaScript stopped at its memory limit") while the page
-stays readable and scrollable, or the navigation fails and you keep the page
-you were on. Very heavy pages, such as endless feeds or huge articles with
+The PSP has 64 MB of memory, and Tilefinch gives every page a fixed share of
+it. A page that outgrows its share degrades instead of crashing: its scripts
+may stop ("JavaScript stopped at its memory limit") while the page stays
+readable and scrollable, or the navigation fails and you keep the page you
+were on. Very heavy pages, such as endless feeds or huge articles with
 hundreds of images, are the usual cause. Reader-friendly and mobile pages
-work best.
+work best. [Heavy pages](docs/USER_GUIDE.md#heavy-pages) and
+[When a page will not load](docs/USER_GUIDE.md#when-a-page-will-not-load)
+in the user guide explain what Tilefinch offers in each case.
 
 ## YouTube stopped working
 
 YouTube changes its side regularly, which eventually breaks the built-in
-provider. Check **Settings → Updates → Version and update**: provider fixes
-ship as signed updates. If no update is available yet, one is probably on its
-way.
+provider. Check **Menu → Settings → Updates → Version and update**: provider
+fixes ship as signed updates. If no update is available yet, one is probably
+on its way.
 
 ## A video won't play
 
 Video is decoded by the PSP's Media Engine with the firmware's own decoder.
-Two YouTube renditions are qualified on real hardware: 360p (the default,
-scaled to the screen) and 240p, chosen under **Settings → Video → YouTube**.
-A source outside the qualified profiles is refused up front, with the reason
-shown on the player, rather than started and then dropped. Not every stream
-format is supported, so a video can still fail because of its codec or audio
-track.
+YouTube plays at 360p (the default, scaled to the screen) or 240p, chosen
+under **Menu → Settings → Video → YouTube**. A video the PSP cannot play is
+refused before it starts, with the reason shown on the player. Not every
+stream format is supported, so a video can still fail because of its codec or
+audio track.
 
 When a page offers several versions of a video, the player tries each one
 and then names the reason the last one could not play:
@@ -93,19 +93,24 @@ and then names the reason the last one could not play:
   cause, such as a B-frame pyramid, more than 3 reference frames, or a
   High-profile picture larger than 432x240.
 
+- `STREAM OFFLINE OR NOT AVAILABLE`: a live channel is not streaming right
+  now, or the stream's address no longer exists or has ended. Try again when
+  the channel is live.
+
 If the decoder has to be shut down during playback, the player says
 `VIDEO DECODER NEEDS APP RESTART` and stops offering Retry: only relaunching
 Tilefinch brings the decoder back, so Retry would just fail again.
 
 ## Sending a diagnostic report without removing the Memory Stick
 
-After an error, open **Help & diagnostics → Diagnostic QR** and press **X**.
-Tilefinch compresses the diagnostic log it has already written and shows it
-as one or more QR pages.
+After an error, open **Menu → Help & diagnostics → Diagnostic QR** and press
+Cross. Tilefinch compresses the diagnostic log it has already written and
+shows it as one or more QR pages.
 
 - Take a clear, straight-on photo of every page, with the page count and
   report ID visible, and share the photos with your report.
-- Use the D-pad Left/Right or L/R to change pages; Circle goes back.
+- Use the D-pad Left/Right or L/R to change pages, and Up/Down to change
+  report parts when there is more than one; Circle goes back.
 
 Building the report changes no log files and writes no QR file to the Memory
 Stick. If there is no diagnostic log yet, the screen says so.
@@ -120,27 +125,27 @@ insecure images and media are tried once over HTTPS and blocked if that
 fails. Old sites that still depend on plain-HTTP resources can look broken
 as a result.
 
-The fixes are per site, under **Page tools → Site information → Permissions
-& controls**:
+The fixes are per site, under **Menu → Page tools → Site information →
+Permissions & controls**:
 
 - **Mixed HTTP (session)** allows HTTP resources on the current site. It lasts
-  only until you exit Tilefinch, **deliberately**: a workaround for one old
-  site should not become a lasting HTTPS downgrade. If a site needs it on
-  every visit, that is the site's problem, and one press is the
-  accommodation.
+  only until you exit Tilefinch, so a workaround for one old site does not
+  quietly weaken HTTPS for good. A site that needs it on every visit needs
+  one press each time.
 - **Third-party cookies** allows the legacy unpartitioned cookies some sites
   need. This choice is saved, for up to 16 sites.
 
-Also by design, a page from the internet cannot reach devices on your home
+A page from the internet also cannot reach devices on your home
 network (your router's admin page, a NAS, a printer). Typing a local address
 into the address bar yourself still works.
 
 ## A site misbehaves because of its scripts
 
 If one site's JavaScript makes it slow or broken, you don't have to turn
-scripts off everywhere. **Page tools → Site information → Permissions &
-controls → JavaScript** turns scripts off (or back on) for just that site,
-while **Settings → Browsing & input → JavaScript** remains the global switch.
+scripts off everywhere. **Menu → Page tools → Site information →
+Permissions & controls → JavaScript** turns scripts off (or back on) for just
+that site, while **Menu → Settings → Browsing & input → JavaScript** remains
+the global switch.
 
 If a large site stays empty with a script error, check the `file_kb=` line
 of your `boot.cfg` (or `data/boot-overrides.cfg`). It is the largest single
@@ -149,66 +154,71 @@ shipped `file_kb=512`, which refuses the app bundles of many sites; this
 version replaces exactly that old default once, the first time it starts,
 and adds a `#file_kb-migrated-from=512` line so it never does so again. A
 value you chose yourself, including 512 set after that line, is never
-changed. A boot.cfg managed by `scripts/stage-psp-game.sh` keeps its 512
-KiB Game Profile ceiling.
+changed.
 
 ## A site misbehaves after it updates
 
-With **Keep compiled scripts** on, Tilefinch reuses scripts it compiled on
-an earlier visit, but only for exactly the same script text, so an updated
-site normally just compiles its new scripts. If a site still misbehaves
-after an update (or after a Tilefinch update), clear the compiled-script
-cache: **Settings → Device & storage → Site data & storage → Clear compiled
+With **Keep compiled scripts** on, Tilefinch reuses scripts it compiled on an
+earlier visit, but only for exactly the same script text, so an updated site
+normally just compiles its new scripts. If a site still misbehaves after an
+update (or after a Tilefinch update), clear the compiled-script cache: **Menu
+→ Settings → Device & storage → Site data & storage → Clear compiled
 scripts**, or turn **Keep compiled scripts** off, which removes its files.
 **Clear data for this site** on the site's **Site information** removes only
 that site's. Deleting the `data/script-cache/` folder over USB does the same.
 
+## YouTube sign-in does nothing
+
+If signing in ends on a Google page instead of returning to YouTube, choose
+**Menu → Page tools → Continue to YouTube**. Tilefinch counts you as signed
+in only once YouTube itself confirms the login; until then it does not offer
+to save it, and it never sends your password again by itself.
+
+If sign-in still appears to do nothing, turn on **Menu → Settings → Device &
+storage → YouTube sign-in diagnostics**, then try signing in again. Open
+**Menu → Help & diagnostics → Diagnostic QR** to share the report. While the
+option is on, that QR contains only the sign-in report, not your browsing,
+Wi-Fi or error logs.
+
+The option is off each time Tilefinch starts. Its report holds only counts
+and numeric status codes, stays in RAM, and is cleared when you turn the
+option off. It never includes usernames, passwords, cookies, tokens,
+addresses, page content, or error text.
+
 ## A site forgets your settings, saved games, or logins
-
-If YouTube sign-in appears to do nothing, enable **Settings → Device &
-storage → YouTube sign-in diagnostics**, then try signing in again.
-Open **Help & diagnostics → Diagnostic QR** to share the report. While this
-option is on, that QR contains only the dedicated sign-in report—not browsing,
-Wi-Fi, crash, or validation logs.
-
-The option defaults off each launch. It keeps bounded counts and fixed status
-codes in RAM, writes no diagnostic file, and clears the report when disabled.
-It never includes usernames, passwords, cookie values or hashes, tokens,
-URLs, request/response headers, response bodies, or error-message text.
-YouTube must confirm the native account request before Tilefinch offers to save
-the login. A session cookie or successful account-page load alone is not that
-confirmation. Recovery never automatically resubmits a password.
 
 Tilefinch keeps what sites store (`localStorage`, `sessionStorage`, and site
 files) in RAM, and by default writes none of it to the Memory Stick. Unless
 you choose otherwise, a site starts fresh each time you start Tilefinch.
-Cookies are never saved, so logins always end at exit. To keep a site's data:
+Cookies are kept in RAM, so logins end at exit. The one exception is a
+YouTube login you choose to save under **Menu → Settings → Video → Save
+YouTube login**. To keep a site's data:
 
-- **Memory Stick for that site.** Open the site, then **Page tools → Site
-  information → Permissions & controls → Site storage → Memory Stick**. Its
-  data is then kept across restarts, up to 4 MB. You can do the same without
-  visiting it from **Settings → Device & storage → Site data & storage**, if
-  the site is listed there.
+- **Memory Stick for that site.** Open the site, then **Menu → Page tools →
+  Site information → Permissions & controls → Site storage → Memory Stick**.
+  Its data is then kept across restarts, up to 4 MB. You can do the same
+  without visiting it from **Menu → Settings → Device & storage → Site data &
+  storage**, if the site is listed there.
 - **When Tilefinch asks.** A site that runs out of room in RAM brings up an
-  offer: **Triangle** keeps its data on the Memory Stick for good, **X** only
+  offer: Triangle keeps its data on the Memory Stick for good, Cross only
   for this session. If you said no, the offer returns the next time you start
   Tilefinch. **Offer Memory Stick** in Site data & storage must be **Ask**.
-- **Every site's RAM storage at exit.** **Settings → Device & storage → Site
-  data & storage → Save RAM storage at exit** writes all sites' `localStorage`
-  to `data/local-storage.bin` when you exit normally (not after a crash or a
-  power cut), up to 5 MB. It is off by default.
+- **Every site's RAM storage at exit.** **Menu → Settings → Device & storage →
+  Site data & storage → Save RAM storage at exit** writes all sites'
+  `localStorage` to `data/local-storage.bin` when you exit normally (not after
+  a crash or a power cut), up to 5 MB. It is off by default.
 
-If a site still loses data, check that **Settings → Privacy & security →
-Cookies & storage** is **Allow**: with it on Block, sites cannot store
+If a site still loses data, check that **Menu → Settings → Privacy & security
+→ Cookies & storage** is **Allow**: with it on Block, sites cannot store
 anything.
 
 ## Voice search doesn't work well
 
 That's expected: it is experimental, slow, and often inaccurate. It is off by
-default under **Settings → Advanced & experimental → Experimental**. Once it is
-on, press Square on a focused text field to speak, X to stop, and Circle to
-cancel. Recognition runs entirely on the PSP, and nothing you say leaves it.
-Password and payment fields never accept voice input.
+default under **Menu → Settings → Advanced & experimental → Experimental**.
+Once it is on, press Square on a focused text field to speak, Cross to stop,
+and Circle to cancel. Recognition runs entirely on the PSP, and nothing you
+say leaves it. Password and payment fields never accept voice input.
 
 ## The browser won't start after an update
 
@@ -229,16 +239,20 @@ Everything you own is in `PSP/GAME/TILEFINCH/data/`:
 | `profile.cfg` | All settings, bookmarks, history, and YouTube resume points |
 | `boot-overrides.cfg` | Your boot settings (`url`, `network_profile`, ...) |
 | `recovery.cfg` | The last page and scroll position |
+| `tabs-session.bin` | Your open tabs, with **Restore page** on |
+| `tab-hibernation.bin` | A hibernated tab, with **Hibernate tab** on |
+| `youtube-login.bin` | A YouTube login you chose to save |
+| `tls-sessions.bin` | Short-lived TLS tickets for faster reconnection (**TLS ticket saving**) |
 | `http-cache.bin` | Optional disk cache (off by default) |
 | `local-storage.bin` | Optional snapshot of in-memory local storage (off by default) |
 | `site-storage/` | Storage for sites you allowed on the Memory Stick |
 | `script-cache/` | Compiled scripts, with **Keep compiled scripts** on (off by default; at most 8 MB) |
 | `update-state.0` / `.1` | The update journal; leave these alone |
 | `update/` | Staged update downloads |
-| `offline/` | Saved articles and downloaded videos |
+| `offline/` | Saved articles, offline apps, and downloaded files and videos |
 | `screenshots/` | PNG captures; delete them over USB when space runs low |
 
-Cookies are kept in RAM only and are gone when the PSP powers off. The
+Other cookies are kept in RAM only and are gone when the PSP powers off. The
 `slot-a/` and `slot-b/` directories are the program itself.
 [docs/STORAGE.md](docs/STORAGE.md) is the full engineering map: every file,
 its size limit, and how much free space each feature needs.
@@ -247,11 +261,13 @@ its size limit, and how much free space each feature needs.
 
 Delete `data/profile.cfg` to reset every setting, bookmark, and history
 entry. For a completely fresh start, also delete `recovery.cfg`,
-`http-cache.bin`, `local-storage.bin`, the `site-storage/` and
-`script-cache/` folders, and `boot-overrides.cfg`. All of them
-are recreated with defaults. Some of these files keep one previous generation
-beside them as a crash-safety copy (`profile.cfg.bak`, `http-cache.bin.bak`,
-`local-storage.bin.bak`); delete the `.bak` file too, or the browser restores
+`tabs-session.bin`, `tab-hibernation.bin`, `http-cache.bin`,
+`local-storage.bin`, `youtube-login.bin`, `tls-sessions.bin`, the
+`site-storage/` and `script-cache/` folders, and `boot-overrides.cfg`. All of
+them are recreated with defaults. Some of these files keep one previous
+generation beside them as a crash-safety copy (`profile.cfg.bak`,
+`tabs-session.bin.bak`, `http-cache.bin.bak`, `local-storage.bin.bak`,
+`tls-sessions.bin.bak`); delete the `.bak` file too, or the browser restores
 from it.
 
 Two things **not** to delete:
@@ -261,6 +277,6 @@ Two things **not** to delete:
 - Anything under `slot-a/` or `slot-b/`: that is the browser and its trust
   data, and deleting `roots.pem` breaks all HTTPS.
 
-Site data can also be cleared inside the browser, under **Settings → Device &
-storage → Site data & storage**: one site at a time from its list, or cache,
-cookies, and storage for every site at once.
+Site data can also be cleared inside the browser, under **Menu → Settings →
+Device & storage → Site data & storage**: one site at a time from its list, or
+cache, cookies, and storage for every site at once.

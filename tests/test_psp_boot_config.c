@@ -363,6 +363,30 @@ static int test_defaults_match_shared_app_profile(void)
     return 0;
 }
 
+/* Check the applied policy, not the spelling of its assignments. Strict
+   mode must reset a previously selected shipping heap as well as a fresh
+   embedder configuration. */
+static int test_script_heap_profiles(void)
+{
+    const size_t mib = 1024u * 1024u;
+    BrowserDeviceProfile device;
+    browser_device_profile_psp3000(&device);
+    BrowserConfig config;
+    browser_config_init(&config, &device);
+    CHECK(config.javascript.heap_limit == 4u * mib);
+    CHECK(browser_config_apply_psp_memory_profile(
+        &config, BROWSER_PSP_MEMORY_STRICT));
+    CHECK(config.javascript.heap_limit == 4u * mib);
+    CHECK(browser_config_apply_psp_memory_profile(
+        &config, BROWSER_PSP_MEMORY_REALISTIC));
+    CHECK(config.javascript.heap_limit
+          == (size_t) BROWSER_PSP_APP_SCRIPT_HEAP_MB * mib);
+    CHECK(browser_config_apply_psp_memory_profile(
+        &config, BROWSER_PSP_MEMORY_STRICT));
+    CHECK(config.javascript.heap_limit == 4u * mib);
+    return 0;
+}
+
 int main(void)
 {
     char timing_argument[PSP_BOOT_TIMING_ARGUMENT_BYTES + 1u];
@@ -399,6 +423,7 @@ int main(void)
     CHECK(!psp_boot_timing_decode(timing_argument, 0, &decoded));
     CHECK(!psp_boot_timing_decode(timing_argument, 300u, &decoded));
     CHECK(test_defaults_match_shared_app_profile() == 0);
+    CHECK(test_script_heap_profiles() == 0);
     CHECK(test_game_audio_reference_selector() == 0);
     CHECK(test_app_heap_key() == 0);
     CHECK(test_retired_decoder_spellings_boot() == 0);

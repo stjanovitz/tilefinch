@@ -48,8 +48,11 @@ probe before the progressive demux; page audio selects its AAC track and the
 existing audio-only backend without allocating a video surface. HLS parses
 large rolling playlists incrementally, retains only a bounded live-edge
 window, and uses at most one video and one audio MPEG-TS sample source.
-Baseline/Main plus AAC-LC routes through the PSP firmware backend; High routes
-through the optional decoder. Rolling live HLS periodically replaces its
+Baseline/Main plus AAC-LC normally routes through the PSP firmware backend.
+High profile, Baseline/Main streams the firmware would refuse, and every
+stream after the optional software decoder has taken the Media Engine route
+through that decoder ([route selection](MEDIA_PIPELINE.md#route-selection)).
+Rolling live HLS periodically replaces its
 playlist window and keeps a continuous local timestamp origin; it exposes
 Play/Pause and Close but not seek. All routes then use the same clock and state
 transitions. No page-media bytes are written to the Memory Stick.
@@ -377,8 +380,11 @@ The following rules keep telemetry from certifying the wrong pixels:
 - recovery wall time and media-time reposition are measured separately;
 - release builds compile the transition trace and validation formatter out.
 
-A rewind of at least 30 seconds replaces the codec backend through the normal
-quiesce/open services. Scrub movement is UI-only: it changes the highlighted
+A committed rewind of at least 30 seconds in a video stream (not audio-only
+playback) replaces the codec backend through the normal
+quiesce/open services, on either decoder route (`psp_media_seek_reopens_backend`
+does not depend on the route). On the software route the reopened stream
+returns to the software decoder, which still owns the Media Engine. Scrub movement is UI-only: it changes the highlighted
 target without resetting firmware or superseding HTTP ranges. Committing a
 smaller seek performs one bounded reset, then cooperatively proves that both
 the video and audio source heads are resident before entering `Priming`.

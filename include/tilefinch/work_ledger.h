@@ -14,7 +14,7 @@
    script forces is layout, and script a relayout dispatches is script.
    Time accrues to the innermost open kind. The PSP frame loop snapshots
    the totals at its phase boundaries and prints one tilefinch-loop-work
-   record per frame (docs/engineering/INPUT_SCRIPT_HARNESS.md, "Where a
+   record per frame (docs/engineering/VALIDATION_RECORDS.md, "Where a
    frame's time goes"); tools/load_timeline.py splits the runtime and input
    phases with it.
 

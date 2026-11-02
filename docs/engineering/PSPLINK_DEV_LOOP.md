@@ -37,7 +37,7 @@ It first performs a bounded probe. If the host bridge is absent, it starts
 `usbhostfs_pc` detached, records its PID, served root, and log in one shared
 temporary state directory, and waits a bounded 12 seconds for PSPLink. Keeping
 the ownership record independent of `host0:` is important: changing from an
-SDK tree to a validation build now restarts the one recorded bridge instead of
+SDK tree to a validation build restarts the one recorded bridge instead of
 starting a competing server or falsely reporting the old root as the new one.
 It never kills an unknown bridge or spins indefinitely. If a bridge was started
 outside this wrapper, stop it once and rerun `psplink-shell.sh ready` so the
@@ -88,7 +88,7 @@ replace a running bridge. A bridge loss under a live app invalidates host-I/O
 continuity; do not hide it with automatic replacement or reuse a partial
 report as a pass. Preserve the host crash report separately from device logs.
 
-`usbhostfs_pc` binds a local host socket. Sandboxed agent shells may deny that
+`usbhostfs_pc` binds a local host socket. Sandboxed shells may deny that
 operation even while the PSP visibly has PSPLink open. The wrapper detects the
 specific `bind: Operation not permitted` failure, terminates the unusable host
 process, and asks for host-socket permission; rerun the same command with that
@@ -107,8 +107,8 @@ not escape it (error 0x80010002). To land a pulled file elsewhere, pull to
 
 **Do not issue stock `scrshot`/`ss` while media is active.** PSPLink v3.2.1
 uses partition 4 (`0x88300000`) for its bitmap scratch buffer, overlapping
-Media Engine firmware. This caused delayed AVC/AAC watchdog timeouts in
-otherwise healthy playback tests. The wrapper now requests `scrshot-user`,
+Media Engine firmware, which causes delayed AVC/AAC watchdog timeouts in
+otherwise healthy playback. The wrapper requests `scrshot-user`,
 which fails closed on old device builds. Build/install the
 [media-safe HOME-exit PSPLink](../../tools/psplink-home-exit/README.md) before
 using it. Until then, use Tilefinch's own input-script captures, not raw
@@ -131,33 +131,8 @@ alive until those checks and any clock restoration are complete.
 
 ## One cycle
 
-### Same-binary JavaScript-profiler comparison
-
-The validation EBOOT enables the JavaScript sampler and call wrappers by
-default. To measure their cost without changing code or binaries, run the same
-input script and page twice with `validation_js_profile=1` and then
-`validation_js_profile=0` in `boot.cfg`. The boot log must report
-`tilefinch-js-profiler: requested=0 enabled=0 set-status=0` for the second
-run. Keep all other settings and the replay input identical, compare the
-completed run's output as well as its timing, and use multiple runs per mode.
-This setting is validation-only; shipping builds ignore it.
-For attribution after the comparison, set `validation_js_profile=1` and
-`validation_js_outlier_us=500000`. The validation log then emits one
-`tilefinch-promise-job` split for each job taking at least 500 ms. Keep this
-off during the profiler-on/off overhead comparison; it adds per-job accounting.
-`trace_ignore_request_body=1` (with `trace=` and `trace_keyed=1`) replays
-recorded POSTs without matching their bodies, as the host lab's
-`TILEFINCH_REPLAY_IGNORE_REQUEST_BODY` does; pages such as chatgpt.com mint
-fresh tokens into them, so their recorded sends otherwise never match. The
-boot log prints `tilefinch-trace-replay: ignore-request-body=1`.
-`trace_volatile_uuids=1` does what the host lab's
-`TILEFINCH_REPLAY_VOLATILE_UUIDS` does: a UUID the page minted into a request
-URL matches the recorded one, and the served response carries the live
-request's UUIDs (chatgpt.com's streamed answer is keyed to its per-send
-`operationId` and pending message ids). The boot log prints
-`tilefinch-trace-replay: volatile-uuids=1`, and each rewritten record logs an
-`HTTP replay volatile-uuid` engine line. Route decisions (`unmatched`,
-`exhausted`, `invalid`) go to the engine log too. Validation builds only.
+The JavaScript-profiler and replay boot keys used with this loop are in
+[Replay and reference lab](REPLAY_LAB.md#device-profiler-and-replay-keys).
 
 ### Preferred zero-Memory-Stick cycle
 
@@ -303,7 +278,7 @@ and written, rejects and evictions.
 
 Modal text entry advances the input script outside the browser's frame loop.
 If its submit/cancel sequence misses, it can consume the remaining steps while
-the keyboard is still open. Validation now cancels that modal and reports
+the keyboard is still open. Validation cancels that modal and reports
 `event=keyboard-input-exhausted` with a `stalled` outcome, then uses normal
 cleanup. Completion in a cooperative receiver likewise reaches the main-loop
 report path. A physical-input handoff still leaves control with the user.
@@ -375,16 +350,14 @@ It is unnecessary wear and timing noise for media iteration.
    `tfexec.prx` loop is reserved for validation EBOOTs whose checked
    `exit_to=` handoff returns directly to PSPLink; never use it with a
    shipping build that exits to the XMB.
-5. **Wait**: a full 120s stability soak ≈ 35s boot/open + 120s + exit ≈ 165s.
-   Sleep ~150s, then run the bounded probe every 15s until PSPLink answers
-   (the app's `exit_to` config returns to PSPLink automatically on any clean
-   exit, including harness-declared failures).
+5. **Wait**: a stability soak takes its configured duration plus boot, open
+   and exit. Wait at least that long, then run the bounded probe every 15 s
+   until PSPLink answers; the app's `exit_to` config returns to PSPLink on any
+   clean exit, including harness-declared failures.
 6. **Pull the log**:
    `pspsh -e "cp ms0:/PSP/GAME/TILEFINCH/DATA/tilefinch-validation.txt host0:/run-<name>.txt"`
-   then `mv build-preset-psp-validation/run-<name>.txt device-runs/` —
-   **immediately**. Files left in `build-*` are deleted by rebuilds; two soak
-   logs were lost that way. `device-runs/` (repo root, untracked) is the
-   archive.
+   then move `build-preset-psp-validation/run-<name>.txt` out of the build
+   tree **immediately**: rebuilds delete files left in `build-*`.
 7. **AU dump hygiene** (only when `validation_media_au_dump=1`): the dump is
    buffered and written once to `host0:/tilefinch-au-dump.bin`. It has no
    `ms0:` fallback, so even this failure diagnostic performs zero Memory Stick
@@ -439,28 +412,42 @@ layout.
 
 ## boot-overrides.cfg reference (soak shape)
 
-```
+A media soak's `boot-overrides.cfg` sets the start URL, the exit path and the
+soak harness:
+
+```ini
 url=https://m.youtube.com/watch?v=<id>
-interactive_validation_ticks=12000        # dead-man exit cap
-exit_to=ms0:/PSP/GAME/PSPLINK/EBOOT.PBP   # return to PSPLink on exit
-validation_media_play=1                   # auto-press play at open-settle
-validation_media_stability_auto=1         # the 2-minute soak harness (2 seeks)
-validation_media_stability_seconds=120    # explicit 10..900s; long gates opt in
-validation_media_seek_permille=667        # soak seek target; 0 disables seeks
-validation_media_lifecycle_auto=0         # 1 injects logical quiesce/recover at 30s
-validation_media_reset_mode=2             # 0 in-place / 1 recreate / 2 no-touch
-validation_media_refusal_reset=1          # reposition-recovery on AU refusals
-validation_media_au_dump=0                # per-AU dump (256KiB cap, truncate/run)
-validation_latch_probe=0                  # invasive full-frame flicker hashes; opt in only
-validation_swdec_audio_scan=0             # 1 scans every software-decoded audio block for peaks
-validation_swdec_reference=0              # mask: 1 old MC, 2 generic MB, 4 full edge, 8 full jobs, 16 split chroma, 32 prefetch, 64 chroma on CPU, 128 replay, 256 old audio clock, 512 old presentation scheduling, 1024 cap picture slots at nine
-validation_playback_ab=0                  # mask: 1 swdec fixed full quality (no reduced decodes), 2 per-frame chrome sync under the player, 4 picture ring may use high (main-CPU) slots, 8 reduced rungs drop non-reference pictures (old ladder), 16 old software pacing and one-frame-ahead discard rule
-validation_swdec_present=0                # swdec pictures: 0 GE async (shipping), 1 CPU scaler, 2 GE unsliced, 3 GE synced at once
+interactive_validation_ticks=12000
+exit_to=ms0:/PSP/GAME/PSPLINK/EBOOT.PBP
+validation_media_play=1
+validation_media_stability_auto=1
+validation_media_stability_seconds=120
+validation_media_seek_permille=667
+validation_media_reset_mode=2
+validation_media_refusal_reset=1
 ```
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `interactive_validation_ticks` | 0 | dead-man exit cap, in frames |
+| `exit_to` | none | executable to return to on exit (here, PSPLink) |
+| `validation_media_play` | 0 | `1` presses Play once the open settles |
+| `validation_media_stability_auto` | 0 | `1` runs the soak harness (two seeks) |
+| `validation_media_stability_seconds` | 120 | soak length, 10 to 900 s; long gates opt in |
+| `validation_media_seek_permille` | 667 | soak seek target as a fraction of duration; `0` disables seeks |
+| `validation_media_lifecycle_auto` | 0 | `1` injects a logical quiesce/recover 30 s in (below) |
+| `validation_media_reset_mode` | 0 | firmware reset on refusal: `0` in place, `1` recreate, `2` no touch |
+| `validation_media_refusal_reset` | 0 | `1` enables reposition recovery on access-unit refusals |
+| `validation_media_au_dump` | 0 | `1` dumps every access unit (256 KiB cap, truncated per run) |
+| `validation_latch_probe` | 0 | `1` hashes full frames for flicker; invasive, opt in only |
+| `validation_swdec_audio_scan` | 0 | `1` scans every software-decoded audio block for peaks |
+| `validation_swdec_reference` | 0 | software-decoder reference-path mask ([SWDEC_DIAGNOSTICS.md](SWDEC_DIAGNOSTICS.md)) |
+| `validation_playback_ab` | 0 | playback A/B mask ([SWDEC_DIAGNOSTICS.md](SWDEC_DIAGNOSTICS.md)) |
+| `validation_swdec_present` | 0 | software-decoder presentation: `0` GE async (shipping), `1` CPU scaler, `2` GE unsliced, `3` GE synced at once |
 
 An `input_script=` key arms the scripted-input harness instead; note its
 stall detector treats media playback as not-ready — do not use plain `wait`
-around video (see INPUT_SCRIPT_HARNESS.md).
+around video (see [Input script reference](INPUT_SCRIPT_REFERENCE.md)).
 Use `mark-live` and `tap-live circle` as well: a readiness-gated marker or
 close action can strand the harness while the player is legitimately busy.
 Archive the selected URL from `tilefinch-input-focus-target`; live search
@@ -495,8 +482,8 @@ Two additional validation modes isolate device boundaries:
 The scripted scenarios `youtube-watch-live.txt` and
 `youtube-results-live.txt` drive sustained playback and result activation.
 They intentionally have no device golden because CDN and wireless behavior
-are external inputs. See [Input script harness](INPUT_SCRIPT_HARNESS.md) for
-the script language and deterministic frontend golden.
+are external inputs. See [Input script reference](INPUT_SCRIPT_REFERENCE.md)
+for the script language and deterministic frontend golden.
 
 ### Memory headroom
 
@@ -510,79 +497,6 @@ the user partition should retain the expanded PSP-3000 heap apart from the PRX
 image itself. If it does not, check `pluser`, remove user modules from
 `modload.ini`, or lower that validation run's `limit=`; do not change the
 shipping heap declaration to accommodate a developer environment.
-
-## Reading a soak log
-
-- Lifecycle: `tilefinch-media-stability: event=started / event=seek /
-  event=complete` (the 120s summary) or `event=failed reason=...`;
-  `tilefinch-validation: outcome=` at exit. During playback, health and A/V
-  skew are sampled into bounded RAM counters every 250ms without writing to
-  host0. This is intentional: a USB-host write can pause the browser thread
-  and manufacture the cadence hitch being measured.
-- Stability verdicts: `pipeline-skips` are late, catch-up, prerequisite, or
-  terminal pictures discarded before a presentation claim. `display-drops`
-  are claimed identities that did not reach scanout, with `quiesce-drops` as
-  the intentional-close subset. `max-av-skew` includes startup and seek
-  discontinuities; `steady-max-av-skew` includes only samples after two
-  uninterrupted seconds in `Playing`, and `steady-skew-samples` proves that
-  bucket was actually observed.
-- Cadence + pipeline: `tilefinch-media-feed:`,
-  `tilefinch-media-transport:`, `tilefinch-media-present:`, and
-  `tilefinch-media-video-cadence:` lines are emitted once at teardown; their
-  fields are cumulative over the complete run. `tilefinch-video-scanout:` is
-  the bounded histogram of wall intervals between distinct decoded pictures
-  that actually reached scanout; repeated chrome-only presentation of one
-  picture is excluded. The records are separate so every one fits the PSP
-  logger's bounded line buffer. Per-picture ring traces:
-  `tilefinch-media-picture:` only in builds configured with
-  `TILEFINCH_PSP_MEDIA_PICTURE_TRACE=ON`.
-- Occupancy: `tilefinch-media-slots:` and `tilefinch-media-worker:`, printed
-  from the same teardown snapshot with the same `phase=` word, so the lines
-  read together.
-  These are **durations**, where the cadence line is counts: per-slot dwell in
-  FREE/ME_WRITING/READY/READING, `no-free` vs `free-idle` (a writable slot
-  with nothing being written — the direct measure of the worker not running
-  ahead), the batch fill, the CSC itself, which frame phase each conversion
-  landed in, and the worker's dispatch/prologue/firmware/collect ladder
-  either side of the one shared job slot. Read the guide in the comment above
-  `psp_media_report_slots` in `src/psp_media_telemetry.c` before drawing a
-  conclusion from any single field.
-- Never-taken paths, which should read zero: `dma-quarantine=` and
-  `surface-quarantines=` on the `tilefinch-media-present:` line, plus
-  `tilefinch-media-present: event=dma-quarantine*`. A quarantine without a
-  matching late completion is a staging transfer that never came back, and
-  the session ends on it deliberately.
-- Firmware events: `tilefinch-media-decoder: event=...` records setup,
-  refusals, recoveries, and failures. Steady job timing is aggregated in
-  `tilefinch-media-worker:` rather than logged per job; watchdog failures name
-  the exact stalled stage.
-- The backend stats reader refuses while a codec job runs — a sample line
-  showing `decoded=0 audio-packets=0` mid-playback is that artifact, not a
-  stall.
-
-### Transport scheduling attribution
-
-The transport worker normally runs one priority step above the browser so its
-bounded service and 10 ms poll cannot be starved. Connection setup is a
-different workload: DNS, TCP, and TLS can remain inside one
-`curl_multi_perform` call long enough to delay input and media collection.
-Until response headers arrive, the worker therefore runs below the browser;
-steady body transfer restores the ordinary higher priority.
-
-Validation builds report setup and steady perform distributions as
-`tilefinch-background-transport-worker*`. Read those beside the browser frame,
-presentation, codec-collection, and input-latency histograms. The intended
-signature is:
-
-- setup calls may be long but do not create matching browser-thread stalls;
-- steady body performs remain bounded closely enough to feed range windows;
-- network work does not starve codec collection or input dispatch;
-- a lifecycle run can quiesce, destroy, revalidate, reopen, and resume without
-  transport, ownership, signature, or quarantine faults.
-
-Run both an instrumented PRX and an uninstrumented release PRX when changing
-this priority policy. The latter proves that validation logging is not shaping
-the cadence being measured.
 
 ## Failure modes and remediation
 
@@ -607,11 +521,10 @@ the cadence being measured.
   failure logs `FailedGraphicsBackends=OPENGL`). Zero PSP instructions run
   in that state, so a timeout is environmental, not a build verdict: retry
   up to twice on a quiet host, then defer to the device soak, which is the
-  stronger gate. Durable fix if it keeps costing time: the headless PPSSPP
-  binary (tooling backlog).
-- **CDN velocity limiting**: after many runs in a day against one video,
-  googlevideo 403s range requests (even on freshly resolved URLs) or serves
-  at a trickle. Rotate test video IDs, space runs, treat late-run range
+  stronger gate.
+- **Media CDN velocity limiting**: after many runs in a day against one
+  video, the media CDN answers range requests with 403 (even on freshly
+  resolved URLs) or serves at a trickle. Rotate test video IDs, space runs, treat late-run range
   failures on a worn video as environmental.
 - **`(eval):1: ... not found` in zsh**: `=WORD` and `--include=*.c` style
   arguments hit zsh globbing — quote them.

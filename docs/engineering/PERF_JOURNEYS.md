@@ -31,7 +31,7 @@ build-preset-release/tilefinch-browser-engine-tests --text-memory-only
 
 ## Recorded performance journeys
 
-A performance journey is one [scripted-input scenario](INPUT_SCRIPT_HARNESS.md)
+A performance journey is one [scripted-input scenario](INPUT_SCRIPT_REFERENCE.md)
 measured under PPSSPP with every page served from a recorded HTTP trace. The
 emulated PSP runs at a fixed 111 MHz and the trace replaces the network, so a
 journey's load, scroll and layout timings depend on the build rather than on
@@ -40,11 +40,8 @@ host scheduling or network timing. That makes them usable as ratchets, the way
 
 These are emulator measurements: they predict device behaviour but do not
 replace it. At the fixed 111 MHz, PPSSPP is slower than a PSP-3000 on CPU-bound
-phases. On the Wikipedia article, device times were about 0.56x the journey
-numbers for page loads, 0.9x for layout completion, and 0.55x for frame
-composition. Press latencies measured alike on both. (At PPSSPP's normal clock
-the emulator is instead faster than the device.) Keep detailed device results
-in private investigation records.
+phases; at PPSSPP's normal clock it is faster. A journey ratchet is a
+regression gate, not a device timing.
 
 ## Running
 
@@ -87,10 +84,10 @@ are kept in `build-preset-psp-validation/perf-journeys-latest/<journey>/`.
 
 `--ratchet` lowers every baseline this run beat by more than its tolerance
 and never raises one. A regression is fixed. If a slower number is the right
-trade, raise that row by hand in the same commit, and record the reason in the
-performance ledger. This is the same rule the fidelity floors follow.
+trade, raise that row by hand in the same commit, and give the reason in the
+commit message. This is the same rule the fidelity floors follow.
 `--record` rewrites the baselines of the journeys it ran. Use it for a new
-journey, or for a deliberate reset recorded in the ledger.
+journey, or for a deliberate reset explained in its commit message.
 
 Tolerances are set when a baseline is recorded. Load and layout times repeat
 exactly under trace replay, so they get 2-5%. Frame composition and latency
@@ -127,14 +124,13 @@ replays a journey trace with `trace_keyed=1`: responses are matched by method
 and URL (as the lab's `--replay-http-response-keyed` does), not in strict
 capture order, because a page's image and stylesheet requests race.
 
-The `wikipedia-article` trace is a lab capture of the Main Page, a search, and
-the PlayStation Portable article (955 KB), with its stylesheets.
+The `wikipedia-article` trace is a lab capture of a main page, a search, and
+one long article, with their stylesheets.
 
 The `youtube-bbb` trace is a PSP capture of the `youtube-bbb` scenario. It has
 14 records:
-- the provider's results for "big buck bunny" (the official Blender short,
-  `aqz-KE-bpKQ`, is first);
-- that watch page (672 KB of provider source);
+- the provider's results for the scenario's query;
+- the first result's watch page;
 - eleven thumbnails;
 - a second copy of the results page, because the live session re-fetched the
   list after Circle.
@@ -192,5 +188,5 @@ scripts/run-psplink-offline-youtube.sh       # PSPLink loop; host0 only
 A live-network variant of the same flow is
 `tests/input-scripts/youtube-seek-rewind-play.txt` (and
 `youtube-subtitles-seek-play.txt` for the caption menu). Run either through
-the device loop with `url=https://m.youtube.com/watch?v=Qtl8lJwbd4g`, which has
-English captions and six dubbed audio tracks.
+the device loop with `url=` set to a provider watch URL for a video that has
+captions and several audio tracks.

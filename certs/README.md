@@ -55,9 +55,8 @@ checked by fingerprint. Qualification uses Mbed TLS 3.6.x with this file as
 its only trust store. System curl is not an acceptable substitute on macOS:
 its SecureTransport backend can consult the operating system's roots and hide
 an anchor missing from the PSP bundle. The PSP Mbed TLS backend has also
-verified the alternate Google chain
-`WR2 -> GTS Root R1 -> GlobalSign Root CA R1` served to the mobile YouTube
-endpoint. The legacy R1 anchor is retained specifically for old TLS chain
+verified the alternate chain `WR2 -> GTS Root R1 -> GlobalSign Root CA R1`.
+The legacy R1 anchor is retained specifically for old TLS chain
 builders and must be reviewed or replaced before its 2028 expiry.
 
 The current GTS R2-R4 roots and GlobalSign R4 compatibility anchor are the
@@ -66,8 +65,8 @@ is intentionally not retained: that compatibility root expired in 2021, so
 adding it would spend bundle space without making a currently valid chain
 acceptable.
 
-The USERTrust ECC anchor verifies Sectigo's E46 chain, including the chain
-currently served by GitHub. Its DER certificate is published by Sectigo at
+The USERTrust ECC anchor verifies Sectigo's E46 chain, including the one the
+signed-update host serves. Its DER certificate is published by Sectigo at
 `crt.sectigo.com/USERTrustECCCertificationAuthority.crt`; the retained
 SHA-256 fingerprint is
 `4F:F4:60:D5:4B:9C:86:DA:BF:BC:FC:57:12:E0:40:0D:2B:ED:3F:BC:4D:4F:BD:AA:86:E0:6A:DC:D2:A9:AD:7A`.
@@ -88,46 +87,12 @@ the acceptance-site TLS probe. Adding roots is a security decision as well as
 a compatibility decision, so keep this file curated instead of silently
 copying the host's full store into the PSP package.
 
-The 0.1.16 refresh adds two self-signed anchors after the native-Mbed-TLS
-census exposed missing trust: QuoVadis Root CA 2 G3 and DigiCert TLS RSA4096
-Root G5. Both match the current Mozilla bundle and their authoritative
-[QuoVadis](https://knowledge.digicert.com/quovadis/download-roots-crl) and
-[DigiCert](https://knowledge.digicert.com/general-information/digicert-trusted-root-authority-certificates)
-repository downloads. Their SHA-256 fingerprints are pinned in the test above.
-The G5 anchor avoids an unnecessary legacy cross-chain; no weak-hash policy,
-hostname verification, leaf trust, or intermediate trust is relaxed. Existing
-compatibility roots were checked against the current public bundle and the
-GTS, Microsoft, and GlobalSign repositories; their bytes remain unchanged.
-
-The 0.1.17 refresh revalidated all 25 retained anchors without changing their
-bytes. GTS still publishes the retained legacy R1 as
-[`oldr1.pem`](https://i.pki.goog/oldr1.pem). The native-Mbed-TLS census verified
-334 of 426 tested origins, with 84 unreachable service/apex hosts, eight apex
-hostname mismatches, and no certificate-policy or missing-trust failures.
-
-The 0.1.29 refresh again leaves the 25 retained anchors unchanged. Twenty-one
-match the current Mozilla bundle; the four compatibility variants match the
-CA repositories listed above (GTS R1/R2, GlobalSign R1, and Microsoft TLS RSA
-G2). The native-Mbed-TLS census verified 329 of 426 origins, with 88
-unreachable service/apex hosts, nine apex hostname mismatches, and no
-certificate-policy or missing-trust failures. Neither verification policy
-nor the set of trusted anchors was relaxed.
-
-The 0.1.31 refresh adds the self-signed SSL.com TLS RSA Root CA 2022 after
-the live census found a chain that needs it. Its DER SHA-256 is
-`8faf7d2e2cb4709bb8e0b33666bf75a5dd45b5de480f8ea8d4bfe6bebc17f2ed`,
-matching both [SSL.com's official repository](https://www.ssl.com/repository/)
-and the current Mozilla bundle. The fingerprint is pinned by the bundle test;
-no leaf/intermediate trust or certificate-verification policy is relaxed.
-
-The 0.1.40 refresh adds the self-signed Starfield Services Root Certificate
-Authority G2 after native-Mbed-TLS chain checks found missing trust. Its DER
-SHA-256 is
-`568d6905a2c88708a4b3025190edcfedb1974a606a13c6e5290fcb2ae63edab5`,
-matching [Amazon's official repository](https://www.amazontrust.com/repository/)
-and the current Mozilla bundle. It is distinct from Starfield Root G2.
-The complete signed certificate is preserved and its fingerprint is pinned;
-peer, hostname, expiry, and signature verification remain unchanged.
+Last full revalidation of every retained anchor against the authoritative CA
+repositories and the Mozilla bundle: v0.1.29. Each anchor added since
+(SSL.com TLS RSA Root CA 2022 and Starfield Services Root Certificate
+Authority - G2) was checked against its CA's repository and the Mozilla bundle
+when it was added, and `tests/test_ca_bundle.py` pins its fingerprint. The
+[CHANGELOG](../CHANGELOG.md) records each release's bundle changes.
 
 After the PSP dependency build has unpacked Mbed TLS, build its native client
 and run the live qualification against a current top-300 list, the
@@ -135,17 +100,19 @@ signed-update hosts, and any locally available resource traces. The ranking is
 downloaded for the qualification and is not committed:
 
 ```sh
+work="$TMPDIR/tilefinch-ca-audit"
+mkdir -p "$work"
 cmake \
   -S build-preset-psp/psp-transport/mbedtls/src/tilefinch_psp_mbedtls \
-  -B /tmp/tilefinch-mbedtls-host \
+  -B "$work/mbedtls-host" \
   -DENABLE_TESTING=OFF -DENABLE_PROGRAMS=ON \
   -DUSE_SHARED_MBEDTLS_LIBRARY=OFF -DCMAKE_BUILD_TYPE=Release
-cmake --build /tmp/tilefinch-mbedtls-host --target ssl_client2 -j8
-curl -fsSL https://tranco-list.eu/top-1m.csv.zip -o /tmp/tranco-top-1m.zip
-unzip -p /tmp/tranco-top-1m.zip | sed -n '1,300p' > /tmp/tranco-top-300.csv
+cmake --build "$work/mbedtls-host" --target ssl_client2 -j8
+curl -fsSL https://tranco-list.eu/top-1m.csv.zip -o "$work/tranco-top-1m.zip"
+unzip -p "$work/tranco-top-1m.zip" | sed -n '1,300p' > "$work/tranco-top-300.csv"
 scripts/audit-site-tls.py \
-  --mbedtls-client /tmp/tilefinch-mbedtls-host/programs/ssl/ssl_client2 \
-  --top-sites /tmp/tranco-top-300.csv --limit 300 \
+  --mbedtls-client "$work/mbedtls-host/programs/ssl/ssl_client2" \
+  --top-sites "$work/tranco-top-300.csv" --limit 300 \
   --trace-root fidelity/captures --trace-root fidelity/candidates
 ```
 

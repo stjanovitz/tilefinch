@@ -1,8 +1,10 @@
 # Chrome themes
 
-**Settings → Appearance → Theme** controls Tilefinch's own chrome: native
-Home, menus, Collections, diagnostics, and the native media player. It is
-separate from **Night mode**, which affects web-page colors.
+This page is for PSP owners who want to change Tilefinch's colors, and for
+anyone making a theme file. **Menu → Settings → Appearance → Theme** controls
+Tilefinch's own chrome: native Home, menus, the Library, diagnostics, and the
+native media player. It is separate from **Night mode**, which affects
+web-page colors.
 
 Midnight is the default dark-blue theme. Cobalt, Slate, and the original warm
 Ember palette remain built in, and Daylight provides complementary light
@@ -23,7 +25,7 @@ you are reading this on GitHub, download the HTML file and open it locally to
 use the interactive controls.
 
 Copy `.tfth` files into Tilefinch's shared `data/themes/` directory. Open
-**Settings → Appearance → Theme**, press **X**, and choose one from the bounded
+**Menu → Settings → Appearance → Theme**, press Cross, and choose one from the
 list. The first-install archive includes Forest and Violet as examples; files
 downloaded from other people use the same format and can be copied alongside
 them.
@@ -33,14 +35,13 @@ directory entries, and lists at most 12 valid themes in alphabetical order.
 The selected basename is saved in the profile. Later boots read only that one
 file; an ordinary Midnight boot neither scans the directory nor opens a theme
 file. A missing or invalid selected file falls back to Midnight without
-blocking native Home. The former single-file `data/theme.tfth` location is
-still accepted for profiles that selected Custom before the theme library was
-introduced.
+blocking native Home. A Custom theme selection that names no file in
+`data/themes/` reads the single file `data/theme.tfth` instead.
 
 The format is line-oriented UTF-8/ASCII. The header and numeric `format`
 version are mandatory; version 1 is the current schema. A newer Tilefinch can
-therefore reject a future incompatible theme cleanly instead of guessing. Every
-color is `#RRGGBB`. Omitted fields inherit Midnight, which makes a small
+therefore reject a future incompatible theme cleanly instead of guessing.
+Every color is `#RRGGBB`. Omitted fields inherit Midnight, which makes a small
 accent-only theme valid. The designer snaps every color to the exact RGB565
 value the PSP will display; hand-authored 24-bit colors are accepted and
 reduced once when loaded.
@@ -67,8 +68,7 @@ chooser derives a label from the filename. The available color fields are:
 | Accent | `accent`, `accent_high`, `on_accent` |
 | Semantic | `ok`, `warn` |
 
-Parsing of each candidate is bounded to 2 KiB, 24 lines, and 95 bytes per line,
-uses no page-proportional allocation, and commits the palette only after the
-complete file validates. Unknown versions or fields, duplicate names or fields,
-malformed colors, and over-limit input reject the new palette rather than
-partially applying it.
+A theme file may be at most 2 KiB, 24 lines, and 95 bytes per line. Tilefinch
+applies it only after the whole file checks out: unknown versions or fields,
+duplicate names or fields, malformed colors, and over-limit input reject the
+new palette rather than partly applying it.

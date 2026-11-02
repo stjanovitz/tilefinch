@@ -1,7 +1,7 @@
 /*
  * Scripted controller source: parser, stepper, and the name tables the log
  * and the host trace share. See include/tilefinch/psp_input_script.h for the
- * design contract and docs/engineering/INPUT_SCRIPT_HARNESS.md for the format.
+ * design contract and docs/engineering/INPUT_SCRIPT_REFERENCE.md for the format.
  *
  * Deliberately free of PSP SDK dependencies: the host replay test and the
  * validation EBOOT run this exact object, so a script that passes on the host

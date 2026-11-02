@@ -7,6 +7,9 @@ running on the handheld itself.*
 **[Download the latest release](https://github.com/stjanovitz/tilefinch/releases/latest)**
 · [What's new](CHANGELOG.md) · [Install guide](#install)
 
+This page is for PSP owners. If you want to evaluate or work on the engine,
+skip to [How it works](#how-it-works).
+
 | Wikipedia | 360p video playback |
 |---|---|
 | ![The Wikipedia PlayStation Portable article reflowed in Tilefinch Reader mode](docs/wikipedia-reader-mode.png) | ![Host-rendered preview of Tilefinch's native player overlay over Sprite Fright, with chapter markers and playback controls](docs/sprite-fright-player.png) |
@@ -30,45 +33,19 @@ coding agents are capable of. A web browser tests all three.
 
 | Feature | Support |
 |---|---|
-| **Web browsing** | Real HTTPS pages with JavaScript, bounded WebAssembly and WebSockets, cookies, images, mobile layout, and TrueType text. No proxy or companion computer is involved. |
+| **Web browsing** | Real HTTPS pages with JavaScript, WebAssembly and WebSockets, cookies, images, mobile layout, and TrueType text. No proxy or companion computer is involved. |
 | **Native media** | YouTube (through its lightweight provider) and compatible HTML `<video>`/`<audio>` elements open in one native player. Official builds use the PSP's firmware decoder for 240p/360p Baseline/Main MP4 and 240p HLS with AAC-LC, including YouTube live streams and premieres. Seeking, buffering status, preferred audio and subtitle languages, track selection, resumable downloads, and audio-only playback are built in. An optional, separately built decoder adds 240p H.264 High, and 240p Baseline/Main streams the firmware refuses (more than 3 reference frames, B-frame pyramids). |
 | **Tabs and navigation** | Five tabs, bookmarks, history, address and search suggestions, find in page, optional session restore, and optional one-tab hibernation. |
 | **Ad blocking** | Conservative request blocking and cosmetic hiding are on by default. Custom uBlock/EasyList-style rules and per-site exceptions are supported. |
 | **Cookie notices** | Common consent banners are hidden without clicking Accept or creating consent cookies; individual sites can be exempted. |
 | **Reader, Basic view and offline** | Reader mode reflows articles; Basic view rescues pages whose scripts fail, keeping their links, tables and simple search forms. Save articles, and install small manifest-backed web apps for offline use with their icon and the same-origin resources already loaded, then update, reinstall, or remove them. |
 | **Text entry** | The PSP system keyboard or the faster Danzeff radial keyboard, with completion from local bookmarks and history. |
-| **Games** | Bounded Canvas 2D and WebGL 1 for charts and modest games, with `ImageBitmap` asset preparation, user-started PCM game audio, page fullscreen, and the standard Gamepad API mapped to the PSP's controls. The included [Treadline Arena](examples/treadline-arena/) is a 3D WebGL tank game with a campaign, bot battles, a Practice Range and adaptive music. |
-| **Appearance** | Automatic or forced page dark mode, dark and light browser chrome, downloadable color themes, page text scaling, On/Smart/Off website fonts, translated browser menus, bounded mixed right-to-left and left-to-right layout with Arabic-family shaping, and optional Japanese, Simplified and Traditional Chinese, Korean, Cyrillic, Extended Latin, Arabic, Hebrew, Devanagari (Hindi), Bengali–Assamese, and color-emoji glyph packs. |
-| **Native PSP interface** | An immediate home screen, Collections, clock, battery and Wi-Fi status, contextual controls, PNG screenshots, and diagnostics shown as photographable QR codes. |
+| **Games** | Canvas 2D and a WebGL 1 subset for charts and modest games, with `ImageBitmap` asset preparation, user-started PCM game audio, page fullscreen, and the standard Gamepad API mapped to the PSP's controls. The included [Treadline Arena](examples/treadline-arena/) is a 3D WebGL tank game with a campaign, bot battles, a Practice Range and adaptive music. |
+| **Appearance** | Automatic or forced page dark mode, dark and light browser chrome, downloadable color themes, page text scaling, On/Smart/Off website fonts, translated browser menus, mixed right-to-left and left-to-right layout with Arabic-family shaping, and optional Japanese, Simplified and Traditional Chinese, Korean, Cyrillic, Extended Latin, Arabic, Hebrew, Devanagari (Hindi), Bengali–Assamese, and color-emoji glyph packs. |
+| **Native PSP interface** | An immediate home screen, the Library, clock, battery and Wi-Fi status, contextual controls, PNG screenshots, and diagnostics shown as photographable QR codes. |
 | **Optional XMB redirect** | With ARK-4, Sony's Internet Browser icon can launch Tilefinch; holding L opens the original browser instead. |
 | **Updates** | Signed in-app updates with A/B slots, a trial boot, automatic rollback, explicit approval, and an optional picker for signed earlier versions. |
 | **Experimental voice search** | An optional downloadable model and on-demand speech engine. Off by default; currently slow and inaccurate. |
-
-### At a glance
-
-| | |
-|---|---|
-| **Hardware target** | PSP-3000: 333 MHz MIPS, 64 MiB RAM (about 43 MiB of measured heap, with pages and voice sharing a 32 MiB envelope), 480×272 display using RGB565 surfaces for pages and chrome and 32-bit scanout for fullscreen video |
-| **Execution model** | Networking, HTML, CSS, JavaScript, layout, and rendering all run on the PSP |
-| **Browser engine** | Lexbor HTML parser, Tilefinch's own style, layout, and rendering, QuickJS runtime |
-| **Presentation** | Incremental retained display list with a bounded RGB565 tile cache |
-| **Networking** | HTTPS with certificate and hostname verification, cookies, redirects, caching, and an isolated Wi-Fi sign-in flow for captive portals |
-| **License** | MIT, with separately licensed third-party components |
-
-### Engineering highlights
-
-| Area | What makes it interesting |
-|---|---|
-| **A browser, not a port** | The style, layout, paint, policy, media, and native interface layers are original C11. Lexbor, QuickJS, curl, Mbed TLS, nghttp2, and FreeType are vendored and hash-pinned ([notices](THIRD_PARTY_NOTICES.md)). It is enough of a browser that chatgpt.com's logged-out chat, with over a hundred JavaScript modules, client-side hydration, and a streamed answer, has run end to end on a PSP-3000, helped by a validating preparser, scoped style invalidation, and a profile-optimized JavaScript engine ([architecture](docs/ARCHITECTURE.md#quickjs-is-vendored-and-changed-in-place)). |
-| **One strict memory ledger** | DOM, JavaScript, CSS, resources, layout, and tiles share one 32 MiB page budget with voice recognition. Every table and loop is bounded, and a refused allocation is a tested, recoverable path rather than an exception. |
-| **Useful pixels before the download ends** | Streaming HTML and CSS, preload discovery, resumable layout, priority for visible resources, lazily loaded bootstrap modules, and bounded caches of compiled styles and scripts all aim at first paint on a 333 MHz in-order core. |
-| **Deterministic rendering** | Host and PSP share the same layout and rasterizer, down to ordered RGB565 dithering. Fidelity floors measured against Chrome references may only move upward ([fidelity workflow](docs/FIDELITY.md)). |
-| **Firmware video acceleration** | A raw-NAL bridge and a bounded H.264 recovery-point rewriter feed the PSP's Media Engine, and two guarded decode surfaces overlap color conversion with presentation ([media state machine](docs/engineering/PSP_MEDIA_SESSION_STATE.md)). |
-| **Optional two-core video** | A user-built add-on decodes 240p H.264 High, Main and Baseline (CABAC or CAVLC) by giving entropy decoding, deblocking, audio, and color conversion to the Media Engine while the CPU reconstructs rows. Official binaries deliberately leave it out. |
-| **360p on a 480×272 screen** | 640×360 frames pass through EDRAM as two guarded strips, and the GE scales them bilinearly with no per-pixel CPU pass ([device envelope](docs/engineering/PSP_ENVELOPE.md)). |
-| **Explicit lifecycle ownership** | Media and networking use pure reducers, epoch-tokened services, consumer leases, pumped teardown, and quarantine, so memory is never freed beneath live firmware or worker activity ([architecture](docs/ARCHITECTURE.md)). |
-| **Security without pretending to sandbox** | HTTPS-first navigation, CORS, CSP, SRI, private-network protection, partition-aware resource authority, cookie controls, and signed A/B updates are enforced within a documented shared-process model ([security model](docs/SECURITY_MODEL.md)). |
-| **Hardware-aware gates** | The optimized host suite is backed by sanitizer, hostile-input, WPT, fidelity, and PSP cross-build gates, plus ratchets on executable size and hot-function size ([engineering guide](AGENTS.md)). |
 
 ## What you need
 
@@ -81,8 +58,8 @@ coding agents are capable of. A web browser tests all three.
   - **PSP-E1000 (Street)**: has the memory but no Wi-Fi, so only the offline
     library would work. Not a sensible target.
 - About 20 MB free on the Memory Stick for everyday browsing and updates.
-  - Optional glyph packs take about 1 MB each; the color-emoji pack takes
-    about 5 MB. Besides the selected language pack, Tilefinch can attach
+  - Optional glyph packs take up to about 1 MB each; the color-emoji pack
+    takes about 5 MB. Besides the selected language pack, Tilefinch can attach
     up to two other installed packs when a page uses their scripts. A page
     that needs a pack you have not installed offers it in a notice you can
     ignore; installing from that notice first shows the signed download
@@ -107,7 +84,7 @@ coding agents are capable of. A web browser tests all three.
    **Game → Memory Stick**.
 4. If you have not already, save a Wi-Fi connection in the PSP's Network
    Settings. Tilefinch uses connection profile 1 unless you choose another
-   in **Settings → Device & storage**.
+   in **Menu → Settings → Device & storage**.
 
 The `.tfum` and `.tfup` files on the release page are for Tilefinch's signed
 in-app updater, not for manual installation. Optional language, emoji, and
@@ -177,7 +154,7 @@ instructions rather than reporting a generic video failure.
 |---|---|
 | D-pad | Move focus between links and controls (hold to repeat) |
 | Analog stick | Move the page cursor; hold it against the top or bottom edge to scroll (Settings can switch to direct scrolling) |
-| X | Activate the focused item, or click under the cursor |
+| Cross | Activate the focused item, or click under the cursor |
 | Circle | Back, or cancel the current load |
 | Square | Reload (starts voice input on a text field when Experimental Voice is on) |
 | Triangle | Show or hide the browser chrome |
@@ -193,11 +170,12 @@ Type a URL in the address bar to go there, or anything else to search.
 
 The [user guide](docs/USER_GUIDE.md) covers everyday use in detail:
 
-- **Typing** with the PSP keyboard or the faster Danzeff layout, with
-  completion from your bookmarks and history.
+- **Tabs, bookmarks, history**, and **typing** with the PSP keyboard or the
+  faster Danzeff layout, with completion from your bookmarks and history.
 - **Find in page** from **Menu → Page tools**.
-- **Reader mode**, **Basic view** for pages whose scripts fail, and the
-  **offline library** of saved articles and video downloads.
+- **Reader mode**, **Basic view** for pages whose scripts fail, and
+  **saving and downloads**: saved articles, offline apps, files and videos.
+- **YouTube**: search, channels, playlists, sign-in, and the native player.
 - **Games and page controls**: handing the buttons to a page's Gamepad API,
   fullscreen, game audio, and direct multiplayer.
 - **Screenshots**, what Tilefinch offers **when a page will not load**, and
@@ -206,48 +184,31 @@ The [user guide](docs/USER_GUIDE.md) covers everyday use in detail:
 
 ## Language support
 
-### Browser menus
+- **Browser menus** can be shown in Spanish, French, German, Japanese,
+  Russian, Ukrainian, Simplified Chinese, Korean, Hindi, Arabic, Portuguese,
+  Bengali or Assamese as well as English. Translations download on request
+  from **Menu → Settings → Appearance → Language & emoji → Interface
+  language**. They change Tilefinch's menus, not the text of websites, games
+  or subtitles.
+- **Page text** in Latin script works out of the box, with compact
+  fallbacks for some Chinese, Japanese, Korean and emoji characters. Signed
+  glyph packs add Japanese, Simplified Chinese, Traditional Chinese, Korean,
+  Cyrillic, Extended Latin, Arabic, Hebrew, Devanagari (Hindi) and
+  Bengali–Assamese text, plus color emoji. Arabic and Hebrew get
+  right-to-left layout. A page that needs a missing pack offers to install
+  it while you browse.
 
-Open **Settings → Appearance → Language & emoji → Interface language**.
-Choose with Left/Right, press X to install, then restart Tilefinch to apply.
-English is built in; downloadable translations are available for Spanish,
-French, German, Japanese, Russian, Ukrainian, Simplified Chinese, Korean,
-Hindi, Arabic, Portuguese, Bengali and Assamese. Choosing a language also downloads its required
-glyph pack if it is not already installed. Menus, controls and status notices are
-translated; advanced messages not yet translated remain in English, and English
-stays available if a download fails.
-
-This changes Tilefinch's menus—not the text of websites, games, or subtitles.
-Preferred video, audio and subtitle languages are separate settings.
-
-### Page text and emoji
-
-The built-in fonts cover Latin text, with compact fallbacks for some Chinese,
-Japanese, Korean and emoji characters. **Settings → Appearance → Language &
-emoji** offers additional page-text packs: Japanese, Simplified Chinese,
-Traditional Chinese, Korean, Cyrillic (including Russian and Ukrainian),
-Extended Latin, Arabic, Hebrew, Devanagari (Hindi) and Bengali–Assamese, plus a
-color emoji pack.
-A page using a missing pack can also offer to install it while you browse.
-
-Confirm the pack download; it takes effect without a restart. Square removes
-an installed pack. Packs add glyph coverage; they do not translate page text.
-Arabic and Hebrew have right-to-left layout support. Hindi covers common
-syllables and interface clusters; unusual conjuncts may still use fallback
-cells.
-
-Translations and signed packs are hosted in
-[tilefinch-models](https://github.com/stjanovitz/tilefinch-models), which lists
-the available downloads. Tilefinch verifies them before installation and keeps
-installed downloads on the Memory Stick for offline use. See the
+Translations and packs come from
+[tilefinch-models](https://github.com/stjanovitz/tilefinch-models) and are
+verified before installation. The
 [language-pack guide](docs/USER_GUIDE.md#other-languages-and-language-packs)
-for installation, removal and missing-text notices.
+covers installing, removing and the missing-text notice.
 
 ## Updating
 
-Check for updates from **Settings → Updates**. An optional background check
-looks for new release information at most once a week and can be turned off;
-Tilefinch never downloads or installs an update unless you ask.
+Check for updates from **Menu → Settings → Updates**. An optional background
+check looks for new release information at most once a week and can be turned
+off; Tilefinch never downloads or installs an update unless you ask.
 
 - Stable and Beta releases are cryptographically signed and verified before
   installation. The Developer channel, which you must select explicitly, is
@@ -269,22 +230,24 @@ have the details.
   language (the PSP's language by default) so results and audio tracks can be
   localized.
 - Everything the browser keeps stays on the PSP. Cookies live only in memory
-  and are gone at power-off; history (off by default), the cache, saved pages
-  and videos, screenshots, and settings are on your Memory Stick.
-  **Settings → Device & storage → Site data & storage** lists the sites
-  holding data and clears one of them, or HTTP caches, cookies, local
-  storage, and session storage for every site.
+  and are gone at power-off, except a YouTube login you choose to save under
+  **Menu → Settings → Video → Save YouTube login**. History (off by default),
+  the cache, saved pages and videos, screenshots, and settings are on your
+  Memory Stick. **Menu → Settings → Device & storage → Site data & storage**
+  lists the sites holding data and clears one of them, or HTTP caches,
+  cookies, local storage, and session storage for every site.
 - Site storage (`localStorage`, `sessionStorage`, and the origin-private file
   system) lives in RAM and is not written to the Memory Stick unless you
   choose. When a site outgrows RAM, Tilefinch asks before keeping that site's
-  data on the Memory Stick, for this session or always, and shows how much
-  it needs. **Permissions & controls → Site storage** sets the choice per
-  site, and Site data & storage sets it for any listed site.
-- To reconnect faster, Tilefinch normally keeps the short-lived TLS
-  resumption tickets that servers issue, in `data/tls-sessions.bin`. They act
-  as credentials, so they stay on your Memory Stick, are sent only back to
-  the site that issued them, and are erased by **Site data & storage → Clear
-  HTTP caches**. **Settings → Privacy & security → TLS ticket saving** stops
+  data on the Memory Stick, for this session or always, and shows how much it
+  needs. **Menu → Page tools → Site information → Permissions & controls →
+  Site storage** sets the choice per site, and Site data & storage sets it for
+  any listed site.
+- To reconnect faster, Tilefinch normally keeps the short-lived TLS resumption
+  tickets that servers issue, in `data/tls-sessions.bin`. They act as
+  credentials, so they stay on your Memory Stick, are sent only back to the
+  site that issued them, and are erased by **Site data & storage → Clear HTTP
+  caches**. **Menu → Settings → Privacy & security → TLS ticket saving** stops
   keeping them between boots without disabling connection reuse within a
   session.
 - The background update check contacts the GitHub releases API at most once
@@ -292,13 +255,13 @@ have the details.
   beyond an ordinary HTTPS request, and can be turned off. Downloads you
   request—including updates, language packs and interface translations—also
   contact their published download hosts.
-- **Help & diagnostics → Check Wi-Fi sign-in** makes one cookie-free HTTP
-  request to `connectivitycheck.gstatic.com`, only when you ask for it or
+- **Menu → Help & diagnostics → Check Wi-Fi sign-in** makes one cookie-free
+  HTTP request to `connectivitycheck.gstatic.com`, only when you ask for it or
   accept a sign-in suggestion. A detected sign-in page opens with temporary
   cookies and storage that are deleted when it closes.
-- On the start page, resting on the built-in YouTube tile for about a third
-  of a second opens a connection to YouTube in the background, so the site
-  is ready when you press X. This happens only for that built-in tile, never
+- On the start page, resting on the built-in YouTube tile for about a third of
+  a second opens a connection to YouTube in the background, so the site is
+  ready when you press Cross. This happens only for that built-in tile, never
   for a bookmark or an address a page supplied. It sends one bodyless request
   with no cookies, credentials, or referrer and fetches no content until you
   open the site. At most one such connection exists, and it closes as soon as
@@ -315,30 +278,28 @@ defaults, compatibility controls, threat model, and known isolation limits.
 - Many sites render imperfectly and some heavy sites do not load at all;
   Tilefinch does not yet implement every web standard or API. A page that
   exceeds the memory budget degrades or stops loading instead of crashing.
-- Heavy JavaScript applications are slow on a 333 MHz CPU. On a PSP-3000,
-  chatgpt.com takes about 40 seconds before you can type, and a short reply
-  takes about as long again after you send (measured from a recorded
-  session; live network time adds to both).
+- Heavy JavaScript applications are slow on a 333 MHz CPU. A large chat
+  application can take most of a minute before you can type, and a reply
+  takes a similar time to arrive.
 - YouTube support depends on YouTube not changing; it breaks occasionally
   and updates fix it. Tilefinch does not generate YouTube Proof-of-Origin
   (PO) tokens, so videos that require one may stay unavailable even when
   browsing and search work.
 - Voice search is experimental: slow, often wrong, and English only.
-- Tabs keep a bounded record of each page's history, URL, focus, and scroll
-  position rather than five complete pages, so switching tabs reloads the
-  page through the shared cache. The switcher keeps one 60×34 preview per tab
-  (about 20 KiB in total), taken from a frame that was already rendered.
-  Optional **Hibernate tab**, off by default, moves one inactive tab's
-  snapshot (not its page memory) to the Memory Stick and marks it `[Z]`.
+- Tabs remember each page's history, address, focus, and scroll position
+  rather than keeping five complete pages in memory, so switching tabs
+  reloads the page (from the cache where possible). Optional **Hibernate
+  tab**, off by default, moves one inactive tab's record to the Memory Stick
+  and marks it `[Z]`.
 - Sites behind Cloudflare managed challenges do not work.
-- WebGL is a bounded subset of the PSP's GE for conventional vertex-color and
-  textured shaders, not a complete programmable GPU. Complex shaders,
+- WebGL covers conventional vertex-color and textured shaders on the PSP's
+  graphics chip, not a complete programmable GPU. Complex shaders,
   transparent drawing buffers, offscreen framebuffers, and large scenes fail
-  softly instead of consuming unbounded memory or frame time.
+  softly instead of exhausting memory or frame time.
 - There is no desktop-grade process sandbox and no complete CSP. Tilefinch
-  enforces a bounded subset of response-header CSP, resource, and framing
-  policy, Subresource Integrity for scripts and stylesheets, and restrictive
-  iframe sandbox and origin boundaries (see
+  enforces a subset of response-header CSP, resource, and framing policy,
+  Subresource Integrity for scripts and stylesheets, and restrictive iframe
+  sandbox and origin boundaries (see
   [the security model](docs/SECURITY_MODEL.md)), but it does not isolate
   origins in separate processes. Do not use it for sensitive accounts or
   transactions.
@@ -349,15 +310,18 @@ If something misbehaves, start with [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 A useful bug report includes:
 
 - the PSP model and custom firmware (for example "PSP-3000, ARK-4");
-- the Tilefinch version from **Help & diagnostics → Version & system**;
+- the Tilefinch version from **Menu → Help & diagnostics → Version & system**;
 - the site or URL, and what you pressed;
-- after a crash, `PSP/GAME/TILEFINCH/data/tilefinch-crash.txt` from the
-  Memory Stick (a 512-byte file of zeros means no crash was recorded).
+- after a failure, `PSP/GAME/TILEFINCH/data/tilefinch-last-error.txt` from
+  the Memory Stick. Tilefinch writes it only when **Menu → Settings → Device &
+  storage → Save error reports** is On (it is Off by default), and once after
+  a failed start.
 
-Without easy Memory Stick access, **Help & diagnostics → Diagnostic QR** shows
-the same bounded logs as QR pages you can photograph. For suspected security
-problems, [SECURITY.md](SECURITY.md) explains what the project protects and
-how to report.
+Without easy Memory Stick access, **Menu → Help & diagnostics → Diagnostic
+QR** shows that error report, and the Wi-Fi report when **Wi-Fi diagnostics**
+is on, as QR pages you can photograph. For suspected security problems,
+[SECURITY.md](SECURITY.md) explains what the project protects and how to
+report.
 
 ## Building from source
 
@@ -368,14 +332,40 @@ changes.
 
 ## How it works
 
-One engine runs everywhere. Parsing, styling, layout, scripting, and
-tile-based rendering are bounded and charged to a memory budget, and are
-designed so that a refused allocation, a malformed page, or a cancellation is
-a normal event rather than a crash.
+One engine runs on the PSP and in the desktop lab. Parsing, styling, layout,
+scripting, and tile-based drawing all have fixed limits and share one memory
+budget, so running out of memory, a malformed page, or a cancelled load is
+an ordinary event rather than a crash.
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) has the system diagrams, memory
-contracts, and lifecycle boundaries, and [docs/README.md](docs/README.md)
+rules, and lifecycle boundaries, and [docs/README.md](docs/README.md)
 maps all of the documentation, including the engineering manuals in
 [docs/engineering/](docs/engineering/README.md).
+
+### At a glance
+
+| | |
+|---|---|
+| **Hardware target** | PSP-3000: 333 MHz MIPS CPU and 64 MiB of RAM, of which pages and voice recognition share 32 MiB; a 480×272 screen, with 16-bit color for pages and menus and 32-bit color for fullscreen video |
+| **Execution model** | Networking, HTML, CSS, JavaScript, layout, and drawing all run on the PSP |
+| **Browser engine** | The Lexbor HTML parser, the QuickJS JavaScript engine, and Tilefinch's own style, layout, and drawing code |
+| **Drawing** | Pages are kept as a list of drawing commands and painted into a cache of screen tiles, so only the parts that change are redrawn |
+| **Networking** | HTTPS with certificate and hostname checks, cookies, redirects, caching, and a separate window for Wi-Fi hotspot sign-in pages |
+| **License** | MIT, with separately licensed third-party components |
+
+### Engineering highlights
+
+| Area | What makes it interesting |
+|---|---|
+| **A browser, not a port** | Style, layout, painting, security policy, media, and the PSP interface are Tilefinch's own C11 code. Lexbor, QuickJS, curl, Mbed TLS, nghttp2, and FreeType are included at pinned, hash-checked versions ([notices](THIRD_PARTY_NOTICES.md)). That is enough to run ChatGPT's logged-out chat, with over a hundred JavaScript modules and a streamed answer, on a PSP-3000, helped by a script preparser, targeted style updates, and a JavaScript engine tuned with profile-guided optimization ([architecture](docs/ARCHITECTURE.md#quickjs-is-vendored-and-changed-in-place)). |
+| **One memory budget** | The DOM, JavaScript, CSS, downloads, layout, and screen tiles share one 32 MiB page budget with voice recognition. Every table and loop has a fixed limit, and a refused allocation is a tested path the page recovers from. |
+| **Useful pixels before the download ends** | HTML and CSS are processed as they stream in, visible resources load first, layout can pause and resume, startup scripts load only when needed, and compiled styles and scripts are cached, all so a 333 MHz CPU paints something early. |
+| **Deterministic rendering** | The desktop lab and the PSP share the same layout and drawing code, down to the 16-bit color dithering. Visual-fidelity scores measured against Chrome may only go up ([fidelity workflow](docs/FIDELITY.md)). |
+| **Firmware video acceleration** | Tilefinch feeds H.264 directly to the PSP's Media Engine, repairing streams that would otherwise stall it, and converts one picture's colors while the previous one is on screen ([media state machine](docs/engineering/PSP_MEDIA_SESSION_STATE.md)). |
+| **Optional two-core video** | A separately built add-on decodes 240p H.264 High, Main and Baseline by sharing the work between the Media Engine and the main CPU. Official binaries leave it out. |
+| **360p on a 480×272 screen** | 640×360 frames pass through video memory in two strips, and the PSP's graphics chip scales them with no per-pixel work on the CPU ([device envelope](docs/engineering/PSP_ENVELOPE.md)). |
+| **Explicit lifecycle ownership** | Media and networking are written as explicit state machines that tear down step by step, so memory is never freed while the firmware or a background worker can still use it ([architecture](docs/ARCHITECTURE.md)). |
+| **Security without pretending to sandbox** | HTTPS-first navigation, CORS, CSP, Subresource Integrity, protection for devices on your local network, cookie controls, and signed A/B updates, all within a documented single-process model ([security model](docs/SECURITY_MODEL.md)). |
+| **Hardware-aware gates** | Changes must pass the optimized desktop test suite, backed by sanitizer, hostile-input, Web Platform Test, fidelity, and PSP cross-build checks, plus limits on executable and hot-function size ([engineering guide](AGENTS.md)). |
 
 **Evaluating the engineering?** Read in this order:
 
@@ -387,7 +377,7 @@ maps all of the documentation, including the engineering manuals in
    [networking](docs/engineering/PSP_NETWORK_SUPERVISOR.md).
 4. The [device qualification strategy](docs/engineering/DEVICE_QUALIFICATION.md):
    which claims the host, the emulator, and the hardware can each prove.
-5. [RELEASE_PROCESS](docs/RELEASE_PROCESS.md): gates, ratchets, and the
+5. [RELEASE_PROCESS](docs/RELEASE_PROCESS.md): gates, size limits, and the
    offline signing ceremony.
 
 ## Contributing
@@ -398,5 +388,6 @@ describes the build and test expectations.
 
 ## License and independence
 
-See [licensing, attribution, and independence](docs/LICENSING.md) for the project
-license, third-party notices, screenshot credits, and trademark information.
+See [licensing, attribution, and independence](docs/LICENSING.md) for the
+project license, third-party notices, screenshot credits, and trademark
+information.

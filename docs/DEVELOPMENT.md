@@ -1,20 +1,16 @@
 # Development and test workflow
 
-The short edit loop and the qualification loop are deliberately separate. Use
-`scripts/dev.sh` for the fastest targeted rebuild, or the checked-in CMake
-presets when reproducible configure, build, and test directories are more
-useful. This page covers how to build, test, and qualify a change. Measured
-results and detailed performance investigations are maintained privately.
-Maintainers read the private local memory and performance ledgers before
-repeating an experiment. These are preserved in the private development archive;
-public contributors can request the relevant prior outcomes from a maintainer.
+For contributors: how to build, test, and qualify a change. Measured results
+are kept in maintainers' private ledgers, not here; see
+[AGENTS.md](../AGENTS.md#verification-discipline) before repeating an
+experiment.
 
 ## Quick start
 
 The desktop lab builds and tests the same engine on your computer, at PSP
 screen sizes and memory profiles. The first configure downloads hash-pinned
-dependencies. Host builds also need
-libcurl development headers (with a TLS-capable libcurl) and zlib.
+dependencies. Host builds also need libcurl development headers (with a
+TLS-capable libcurl) and zlib.
 
 ```sh
 cmake --preset release
@@ -25,7 +21,11 @@ ctest --test-dir build-preset-release -j8 --output-on-failure
 Running the built frontends is documented in
 [LAB_USAGE.md](engineering/LAB_USAGE.md).
 
-## Fast edit loop
+## Edit loop
+
+`scripts/dev.sh` is the edit loop. It builds only the binary a command needs
+and reconfigures its tree whenever `CMakeLists.txt`, `cmake/`, `patches/`, or
+the script itself changes:
 
 ```sh
 ./scripts/dev.sh                 # interactive lab only
@@ -38,51 +38,145 @@ Running the built frontends is documented in
 ./scripts/dev.sh test-release    # optimized local test gate
 ./scripts/dev.sh verify          # optimized tests plus three network/replay gates
 ./scripts/dev.sh sanitize        # separate ASan/UBSan tree and tests
+./scripts/dev.sh psp             # the named-target PSP cross-build
 ```
 
-The helper selects the pinned Bellard QuickJS configuration the presets use,
-detects the host's job count, disables the unrelated JavaScriptCore spike, and
-builds only the binary a command needs.
-
-- The default `build-dev` tree is `Debug` with `-O0 -g0`, for short compile
-  latency. Optimized commands use `build-release`, and live-site,
-  performance, and final validation belong there. The release and sanitizer
-  trees reuse dependency sources from `build-dev` instead of downloading them
-  again.
+- Its default tree, `build-dev`, is `Debug` with `-O0 -g0` for short compile
+  latency. Optimized commands use `build-release`; live-site, performance,
+  and final validation belong there. The release and sanitizer trees reuse
+  dependency sources from `build-dev` instead of downloading them again.
+- `build-dev` is not the `dev` CMake preset's `build-preset-dev`. "The dev
+  tree" in these docs always means `build-dev`.
 - `unit` builds only `tilefinch_core` and the aggregate `tilefinch-tests`
-  executable before running the requested filter; it is the shortest loop for
-  subsystem edits. `test` deliberately builds every executable-backed
-  registered CTest, plus the frontends that script-backed tests use, so a
-  clean tree never reports `Not Run` while the default build stays small.
-- Debug, Release, and sanitizer helper trees all use the vendored Bellard
-  QuickJS, so `test-release`, `verify`, and the pre-cross-build readiness
-  workflow qualify the same VM behavior the PSP build ships. Release,
-  sanitizer, network/replay, and long-session qualification remain explicit
-  gates rather than part of every edit.
+  before running the filter; it is the shortest loop for subsystem edits.
+  `test` builds every executable-backed registered test plus the frontends
+  that script-backed tests use, so a clean tree never reports `Not Run`.
+- Every helper tree uses the vendored Bellard QuickJS, so `test-release`,
+  `verify`, and the readiness workflow qualify the VM the PSP build ships.
 - Override the trees or job count with `PSP_BROWSER_BUILD_DIR`,
   `PSP_BROWSER_RELEASE_BUILD_DIR`, `PSP_BROWSER_SANITIZE_BUILD_DIR`, and
   `PSP_BROWSER_JOBS`; set `PSP_BROWSER_DEP_SOURCE_BUILD` when dependency
-  sources live in another build tree. CMake uses `ccache` or `sccache`
-  automatically when one is installed.
+  sources live in another tree. CMake uses `ccache` or `sccache` when one is
+  installed.
 
-Test executables are created through `tilefinch_add_test_binary` in
-`cmake/TilefinchTests.cmake`; that helper also registers their build dependency.
-Do not add a bare `add_executable` there, which could leave `dev.sh test` running
-a stale executable. Release tests using C `assert` must undefine `NDEBUG` before
+Release, sanitizer, network/replay, and long-session qualification stay
+explicit gates rather than part of every edit.
+
+## Presets and build trees
+
+| Configure preset | Directory | Type | Purpose |
+|---|---|---|---|
+| `release` | `build-preset-release` | Release | the canonical host gate and the tree every example uses |
+| `release-lto` | `build-preset-release-lto` | Release + LTO | optimized host build with link-time optimization |
+| `sanitize` | `build-preset-sanitize` | Debug, ASan + UBSan | sanitizer gate |
+| `hostile` | `build-preset-hostile` | as `sanitize` | the hostile-input parser harness only |
+| `dev` | `build-preset-dev` | RelWithDebInfo | not the edit loop: needs a fresh `cmake --preset dev` before use, because an existing tree goes stale and its CTest can run stale binaries |
+| `psp` | `build-preset-psp` | MinSizeRel | the shipping PSP cross-build |
+| `psp-http1` | `build-preset-psp-http1` | as `psp` | current stack with HTTP/1.1 only, for comparison |
+| `psp-hardened` | `build-preset-psp-hardening` | as `psp` | compiler-hardening candidate |
+| `psp-legacy-transport` | `build-preset-psp-legacy-transport` | as `psp` | non-release SDK-transport escape hatch |
+| `psp-replay` | `build-preset-psp-replay` | as `psp` | hermetic replay: a curl stub replaces the network stack |
+
+| Other tree | Made by | Purpose |
+|---|---|---|
+| `build-dev`, `build-release`, `build-dev-sanitize` | `scripts/dev.sh` | the edit loop |
+| `build-preset-psp-validation` | `cmake --preset psp -B ... -DTILEFINCH_PSP_VALIDATION_LOG=ON` | the PSP validation build every PPSSPP, PSPLink and device script runs ([below](#psp-validation-tree)) |
+
+All presets use the pinned Bellard QuickJS, disable the unrelated
+JavaScriptCore spike, and use a compiler cache when available; the host
+presets build the tests. `release`, `sanitize`, and `hostile` have matching
+build and test presets; the PSP build presets build `psp-browser-script`.
+
+**Validation** has one meaning in these docs: a *validation build* is a PSP
+build configured with `TILEFINCH_PSP_VALIDATION_LOG=ON`, normally the
+`build-preset-psp-validation` tree. It logs bounded reports, honours the
+`validation_*` keys in `boot.cfg`, and raises the `.text` ratchet to its
+validation limit; never ship it. The legacy `psp-validation/` directory is an
+unrelated standalone diagnostic EBOOT that nothing builds.
+
+Configuring into a directory inside the source tree that `CMakePresets.json`
+does not name fails on a fresh configure. `CMakeLists.txt` allowlists the few
+non-preset trees that scripts default to; `-DTILEFINCH_ALLOW_BUILD_DIR=ON`
+admits a deliberate experiment, and such a tree should be deleted afterwards.
+Check dependency-source and download-cache references before pruning any
+tree: another tree's cache may point at its sources.
+
+A Release configure does not select the PSP runtime policy: pass
+`--psp-profile` to a frontend when that behavior is under test. For
+shipping-shaped memory runs also pass `--psp-fonts` to the interactive lab,
+which loads the packaged Latin faces instead of the larger desktop fallbacks;
+the `runtime-fonts` receipt records the mode and bytes. Keep full-font
+visual-oracle runs separate.
+
+### Measuring build time
+
+Measure the complete targeted build command, not individual compiler
+invocations, in a disposable worktree nothing else is editing or building:
+
+```sh
+python3 benchmarks/measure-incremental-build.py \
+  --build build-preset-release --output /path/to/build-timings --reconfigure
+```
+
+The benchmark touches source mtimes and restores them, requires compile
+evidence for edit samples, and keeps full logs. A no-change configure must
+leave the vendored QuickJS sources' contents and mtimes unchanged
+(`--reconfigure` asserts this); otherwise every consumer of `quickjs.h`
+rebuilds. A compiler cache speeds repeated identical compiles and branch
+switches, not a genuinely new edit.
+
+## Test suite
+
+### Suites and filters
+
+The aggregate `tilefinch-tests` executable has two registered filters; the
+layout suite is its own executable beside the layout translation units:
+
+```sh
+./build-preset-release/tilefinch-tests --list
+./build-preset-release/tilefinch-tests --filter foundation
+./build-preset-release/tilefinch-tests --filter web-runtime
+./build-preset-release/tilefinch-layout-tests
+```
+
+`core` is an alias for foundation and web-runtime (`scripts/dev.sh unit core`
+also runs the layout executable). CTest exposes the same suites as
+`tilefinch-foundation-tests`, `tilefinch-web-runtime-tests`, and
+`tilefinch-layout-tests`, plus focused executables for URL and session
+security, fetch streaming, the engine facade, JavaScript responsiveness,
+pumpable navigation, and loopback redirects:
+
+```sh
+ctest --test-dir build-preset-release -R 'tilefinch-(url|session-security)-tests' \
+  --output-on-failure
+ctest --test-dir build-preset-release -L security --output-on-failure
+```
+
+Use the narrowest filter while editing, then run the Release and sanitizer
+gates and the aggregate executable before treating a change as ready. The
+single-behavior modes of the test executables are listed in
+[Host test modes](engineering/HOST_TEST_MODES.md).
+
+Host tools and tests load one shared `tilefinch_core` image, so an engine
+edit rebuilds that image without relinking every test; the build dependency
+still completes the image before any test starts. PSP configurations link a
+static core. The Release fidelity gate reserves four CTest processor slots and
+renders its scenarios concurrently, keeping scoreboard rows in manifest order.
+
+### Adding a test binary
+
+Create test executables with `tilefinch_add_test_binary` in
+`cmake/TilefinchTests.cmake`, which also registers their build dependency. A
+bare `add_executable` there could leave `dev.sh test` running a stale
+executable. Release tests that use C `assert` must undefine `NDEBUG` before
 including `<assert.h>`.
-
-For the standalone macOS allocator/JavaScriptCore PGO comparison, run
-`scripts/benchmark_allocator_pgo.sh [CMake options...]`. It creates both
-experimental build trees and profile data in a fresh temporary directory
-outside the checkout, and removes that directory on success or failure. This
-is an optional research tool, not part of the release PGO workflow.
 
 ### Optional private tests
 
-The default configure, build, and CTest suite need only the public source tree.
-Local reproducing inputs and investigation tests belong in the ignored
-`.private-investigations/tests/` directory (and the private backup), not public
-fixtures or inline public test cases. To include a local suite:
+The default configure, build, and CTest suite need only the public tree.
+Reproducing inputs and investigation tests belong in the ignored
+`.private-investigations/tests/` directory, not in public fixtures or inline
+public test cases. To include a local suite:
 
 ```sh
 cmake --preset release -DTILEFINCH_ENABLE_PRIVATE_TESTS=ON
@@ -90,587 +184,74 @@ cmake --build build-preset-release --target tilefinch-test-binaries -j8
 ctest --test-dir build-preset-release -L private --output-on-failure
 ```
 
-`TILEFINCH_PRIVATE_TESTS_DIR` can point at another local directory containing
-`CMakeLists.txt`. Register its executables with `tilefinch_add_test_binary` and
-its tests with `tilefinch_add_private_test(name COMMAND ... LABELS ... TIMEOUT
-...)`; these receive the `private` label and join the ordinary build-before-test
-gate. Full CTest runs include them when enabled. An explicitly enabled suite
-whose source directory is missing fails configuration, rather than silently
-losing coverage. Disable it with `-DTILEFINCH_ENABLE_PRIVATE_TESTS=OFF`; public
-tests can also be selected with `ctest --test-dir build-preset-release -LE private`.
-Do not make public tests or shipping targets depend on private files.
+`TILEFINCH_PRIVATE_TESTS_DIR` can point at another directory containing
+`CMakeLists.txt`. Register its executables with `tilefinch_add_test_binary`
+and its tests with `tilefinch_add_private_test(name COMMAND ... LABELS ...
+TIMEOUT ...)`; they get the `private` label and join the build-before-test
+gate, and full CTest runs include them. An enabled suite whose directory is
+missing fails configuration. Select only public tests with
+`ctest --test-dir build-preset-release -LE private`. Public tests and shipping
+targets never depend on private files.
 
-Standalone C measurement probes must inherit the target's public compile
-definitions and include paths, preferably through a CMake target linked to
-`tilefinch_core`. For example, `TILEFINCH_OWNER_CHECKS` changes the `Budget`
-structure layout: linking a hand-compiled probe without it against an
-owner-checked library is an ABI mismatch, not a valid pixel or memory oracle.
-When a standalone probe disagrees with CTest, verify its compile flags against
-the build's compile commands before changing an expected result.
-
-Diagnostic flags in `src/diagnostic_trace.h` are sampled once per translation
-unit on the owner thread; set them before launching the host process. They are
-constant false in `TILEFINCH_NO_TRACE` builds. Refresh diagnostic source paths
-and counts with `python3 tests/test_diagnostic_switches.py . --refresh-sites`;
-the registry test verifies those paths without fragile source line numbers.
-
-### Narrow host test modes
-
-These run one behavior in isolation; they do not replace the complete suite.
-
-- `build-preset-release/tilefinch-tests --filter web-runtime` includes focus
-  dependency checks for boolean selectors and retained values, plus exact
-  cached-paint/full-flow comparisons for translated pseudo decorations and
-  simple focus shadows. Geometry, complex effects and spatial-band changes
-  must retain full-layout fallback.
-- `build-preset-release/tilefinch-browser-engine-tests --youtube-account-actions-only`
-  checks provider-supplied watched progress, exact resume links and deduplicated
-  recent-history cards (including optional failure), plus
-  explicit Like/Unlike confirmation, refusal, cancellation and control provenance
-  using synthetic responses. It does not mutate a live account.
-- `build-preset-release/tilefinch-navigation-load-tests --replacement-pressure-only`
-  checks bounded replacement-layout recovery, cancellation after release,
-  retained scrolling and deferred author viewport reflection.
-- `build-preset-release/tilefinch-navigation-load-tests --paint-damage-only`
-  checks narrow retained damage across inserted/removed focus decorations and
-  changes to image fit and text tracking. Clipping, order, and effect changes
-  retain the conservative repaint path.
-- `build-preset-release/tilefinch-browser-engine-tests --native-text-sync-only`
-  checks native text synchronization without duplicate relayout.
-- `build-preset-release/tilefinch-browser-engine-tests --fixed-images-only`
-  checks fixed-image publication, retained scaled paint commands, exact pixels
-  against full flow, and clean teardown. `--fixed-image-repaint-only` checks
-  repaint notification and focus continuity across image completion.
-- `build-preset-release/tilefinch-browser-engine-tests --image-admission-only`
-  checks input deferral before/between optional requests, exact final pixels,
-  preserved retry counts, and teardown of paused or partially admitted jobs.
-- `build-preset-release/tilefinch-browser-engine-tests --font-focus-policy-only`
-  checks prompt Smart font-pressure relief, exact sibling-focus cache reuse,
-  and safe static recovery after a real required-layout allocation refusal.
-  An optional `1`, `2`, or `3` selects one of those checks respectively.
-- `build-preset-release/tilefinch-layout-tests --visual-regression N` selects
-  one reduced visual regression: 1 compact percentage controls, 2 generated
-  intrinsic spacing, 3 placeholder styling, 4 table-header defaults,
-  5 inline badge geometry, 6 generated mask sizing, or 7 rounded border sides.
-- `build-preset-release/tilefinch-layout-tests --auto-grid-align-only`
-  checks center/end alignment after content-sized grid rows finish sizing.
-- `build-preset-release/tilefinch-layout-tests --fractional-tracking-only`
-  checks signed fractional tracking across inline boundaries and wrapping.
-- `build-preset-release/tilefinch-layout-tests --inline-boundaries-only`
-  checks intrinsic spacing after generated glyphs, joined no-wrap fragments,
-  valid whitespace/punctuation breaks, per-line ellipsis and marker refusal.
-  `--nowrap-boundary-only` selects the latter checks without icon sizing.
-- `build-preset-release/tilefinch-layout-tests --generated-padding-only`
-  checks that generated glyphs stay inside their inline owner's padding.
-  `--page-font-leading-only` checks downloaded-face line metrics without
-  changing fallback leading; `--positioned-percentage-only` checks percentage
-  heights and vertical insets against an auto-height containing block.
-- `build-preset-release/tilefinch-layout-tests --nested-flex-baseline-only`
-  checks first-item baseline propagation through an inline-block wrapper.
-- `build-preset-release/tilefinch-layout-tests --css-replacement-image-only`
-  checks ordinary-element `content:url()` sizing, painting, and replacement
-  of the original subtree through the budgeted image loader.
-- `build-preset-release/tilefinch-layout-tests --unknown-media-dimensions-only`
-  checks independent default video/frame dimensions without inventing an
-  intrinsic aspect ratio, while retaining canvas and authored ratios.
-- `build-preset-release/tilefinch-layout-tests --button-content-centering-only`
-  checks vertical centering of definite-height flow buttons without moving
-  positioned decorations or overriding flex/intrinsic-height alignment.
-- `build-preset-release/tilefinch-layout-tests --oversized-style-cache-only`
-  checks scan-resistant retention at the style-cache ceiling and exact output
-  after invalidation; it does not increase the cache's byte or entry limits.
-- `build-preset-release/tilefinch-layout-tests --container-cache-only`
-  compares cached container-query probe/final passes with an uncached reference,
-  including conditional pseudo-elements and unchanged element styles.
-- `build-preset-release/tilefinch-browser-engine-tests --computed-style-layout-only`
-  checks that paint-style reads use the current cascade without forcing layout,
-  while geometry and changed stylesheets still synchronize.
-- `build-preset-release/tilefinch-browser-engine-tests --opacity-geometry-only`
-  checks paint-only opacity geometry reuse, selector/generated-content
-  invalidation, mixed writes, and repaint safety. Geometry reports distinguish actual
-  `snapshot-builds` from `snapshot-hits`; `synchronous-layouts` counts flush
-  requests and must not be interpreted as full rebuilds.
-- `build-preset-release/tilefinch-browser-engine-tests --font-staging-only`
-  checks optional-face publication, input cancellation, rollback and retry.
-- `psp-browser-interactive-lab --no-web-fonts` disables only page font loading
-  for same-binary comparisons. Built-in fonts, images, styles and script
-  settings remain unchanged; compare first-paint/commit timings, final memory,
-  and font usage rather than treating every downloaded face as a visible gain.
-  Post-run `web-font-usage` lists encoded and backend payload bytes plus text
-  commands selecting each face. Selection is not proof of visible pixel gain;
-  backend bytes exclude encoded storage and Budget bookkeeping. The binding
-  check confirms the displayed layout uses the current sheet's font set.
-  Shared faces report their storage only once (`shared=1` on later aliases).
-  `tilefinch-web-font-tests --font-perf-only` checks style retention, deferred
-  face activation, shared-face lifetimes and exact cached advances.
-  `tilefinch-web-font-tests --variations-only` checks authored two-axis
-  fixtures, weight/optical metrics, bounded instance reuse, dead-table removal,
-  and allocation refusals during opening, coordinate changes and glyph loads.
-  `tilefinch-web-font-tests --opentype-kerning-only` checks bounded horizontal
-  GPOS pairs/classes and extension tables across TTF, WOFF and WOFF2, script
-  selection, shared-font lifetime, cache sizing, malformed tables and Budget
-  refusals. The page-font path borrows FreeType's immutable decoded tables;
-  it does not copy GPOS or expand class matrices. Default-language `kern`
-  plans support Latin, Greek and Cyrillic (falling back to DFLT when absent).
-  Contextual, mark-filtered, placement and variation positioning remain outside
-  this pair-advance API and keep the legacy kerning fallback.
-  The same suite checks reuse across equivalent script plans and pixel sizes,
-  independent rounding for multiple lookups, and a 256-byte immutable ASCII
-  glyph-index cache (including missing glyphs and shared-face lifetime).
-  `--web-font-mode on|smart|off` exercises the persisted menu policy (the lab
-  defaults to Smart); use explicit `on` for font-completion comparisons.
-  Smart reserves one eighth of the page budget, bounded to 512 KiB–3 MiB,
-  plus the capped incoming font working set before starting another load.
-  Pressure fallback latches per page and runs at a clean idle checkpoint,
-  never from an active JavaScript allocation hook. Refused or interrupted
-  fallback restores faces and the incumbent layout. Allocation refusal
-  stops automatic retries; input interruption retries at a later idle turn.
-- `build-preset-release/tilefinch-browser-engine-tests --font-staging-replay TRACE URL`
-  profiles staged font publication on a captured page: elapsed time, largest
-  cooperative gap and its ending phase, checkpoints, and style-cache work.
-  Parent-key misses and eviction counts distinguish inheritance changes from
-  capacity churn. The font-usage line counts old text commands whose selected
-  face changes, not affected layout subtrees or pixels.
-  The ASCII-segment count records reused scan results. Top/middle/bottom
-  raster checksums run after the timed publication, for output comparisons.
-  This explicitly prepares the baseline fonts before loading, as the PSP
-  frontend does. It uses response-keyed replay to tolerate capture-era request
-  metadata; it is a performance probe, not a request-policy conformance test.
-- `build-preset-release/tilefinch-browser-engine-tests --navigation-staging-replay TRACE URL`
-  exercises incremental navigation with the PSP's 2 KiB parser slices, staged
-  fonts, external stylesheets and document JavaScript enabled, then profiles
-  font publication. Use this path for initial-load investigations: the smaller
-  font-only probe above does not enable external resource loading. Set
-  `TILEFINCH_TRACE_LAYOUT_PROFILE=1` for phase attribution. Compare raster
-  checksums as well as elapsed time and cooperative work counts; a completed
-  input script on an error page is not a successful navigation.
-  `TILEFINCH_TRACE_IMAGE_PROFILE=1` also splits the initial image traversal
-  into element styles, pseudo styles, and final transport drain. Validation
-  PSP builds log these phases automatically.
-  For deeper device attribution, explicitly configure the validation preset
-  with `-DTILEFINCH_PROFILE_LAYOUT_FLOW=ON`, rebuild its named target, and
-  read `tilefinch-layout-phase-flow`. Turn the profiling option back OFF and rebuild after the probe.
-- `build-preset-release/tilefinch-browser-engine-tests --font-interrupt-replay TRACE URL DELAY_US`
-  schedules an interruption at `DELAY_US` microseconds after optional font
-  publication starts. Reports request-to-cooperative-acknowledgement,
-  acknowledgement-to-idle-return (rollback drain), and their total. Asserts
-  that cancellation keeps the loaded fallback page, font bytes and relayout
-  count unchanged. It then moves focus and finishes bounded raster slices,
-  composites the interactive host lab's native focus outline, and requires
-  different pixels. `font-input-feedback` reports request-to-framebuffer time,
-  including rollback and rendering, not physical sampling or scanout latency.
-  Choose a delay shorter than the measured
-  publication; the probe fails if publication finishes without interruption.
-- `--navigation-interrupt-replay TRACE URL DELAY_US` uses the same feedback
-  check after incremental navigation with external stylesheets and scripts.
-  Prefer this over the smaller font-only probe for realistic page costs.
-  `navigation-responsiveness` distinguishes the longest pump from the longest
-  cooperative gap inside it, naming both ends of the gap. A long pump can
-  still service native controls; it does not make arbitrary DOM edits safe
-  while the layout transaction owns its scratch state.
-- `--native-navigation-replay TRACE URL [RUNS]` profiles the default
-  JavaScript-Off path with a 24 MiB Budget, bounded resources and staged
-  baseline fonts. `--native-navigation-strict-replay` uses 16 MiB. `RUNS`
-  defaults to one and is bounded to 30; multiple runs in one process support
-  host sampling without changing the navigation machinery. Each run checks
-  successful navigation, three rendered viewports, and zero teardown ownership.
-  Request-begin time is reported separately from processing checkpoint gaps:
-  captured-body verification and host curl/proxy initialization are not device
-  parser/layout stalls. Preview absence under pressure is recorded as
-  `available=0`, not a zero-latency paint. `first-frame-us` includes the first
-  committed render; the subsequent 128 idle pumps measure currently eligible
-  optional work, not an assertion that every delayed resource has settled.
-- `--pointer-search-only` checks pointer down/up, committed click, native text
-  replacement, implicit form submission, sliced navigation and a rendered
-  result link using a hostname-neutral fixture. `--search-journey-replay TRACE URL`
-  applies that journey to a captured Wikipedia homepage and the query `psp`.
-  Its admission settings mirror the installed PSP configuration; the
-  qualification runner also supplies the 4 MiB temporary startup window.
-  Wikipedia may legitimately redirect an exact query to a disambiguation page;
-  the check requires its actionable article link, not a particular results CSS
-  class. Capture actual device behavior before diagnosing a host-only pass as
-  a fix for an unobserved device failure.
-- `tilefinch-style-index-tests --attribute-names-only` checks the per-sheet
-  set of selector attribute names behind data-* style reuse (prefix lookup,
-  escaped/namespaced opacity, rebuilds, bounds); `--attribute-bench-only`
-  prints its build and query cost on a 5,000-rule sheet;
-- `tilefinch-style-index-tests --transition-candidates-only` compares
-  conservative transition-selector rejection with the full matcher in the
-  same sheet, including class changes and escaped/functional selectors;
-- `tilefinch-js-responsiveness-tests --motion-cache-only` checks bounded motion
-  parsing across owner turns, focus/promise progress, class-only cache reuse,
-  stylesheet/CSSOM invalidation, complete animation publication and teardown.
-- `tilefinch-js-responsiveness-tests --xhr-buffered-events-only` runs the
-  synthetic network queue and buffered XHR upload/response ordering in a fresh
-  realm, including listener-free states and final `loadend` delivery. Run this
-  under the sanitizer preset to guard against recursive dispatcher stack growth.
-- `tilefinch-js-responsiveness-tests --cssom-noop-only` checks that identical
-  CSSOM writes avoid mutation/layout invalidation while changed values,
-  newly authorized styles and ordinary DOM attribute writes still publish;
-- the retained-cache review modes:
-  `tilefinch-style-index-tests --retained-handoff-only`,
-  `--retained-nested-only`, `--retained-focus-only`, and
-  `--quoted-punctuation-only`, plus
-  `tilefinch-js-responsiveness-tests --coalesced-tokens-only`;
-- `tilefinch-js-responsiveness-tests --css-name-only` checks canonical CSS
-  property-name fast paths, coercion, custom-property case and camel-case
-  fallback, including resistance to author changes to RegExp.prototype.exec;
-- `tilefinch-js-responsiveness-tests --html-tag-case-only` checks
-  case-insensitive HTML tag queries and compound selectors while retaining
-  case-sensitive SVG names and class tokens;
-- `tilefinch-js-responsiveness-tests --finalizers-only` queues 330 cyclic
-  finalization records alongside an eight-reaction promise chain. The chain
-  must finish in one 64-job checkpoint without running cleanup callbacks.
-  Cleanups run afterward as low-priority engine tasks (at most 16 per advance,
-  within the existing task budget), with a promise checkpoint after each.
-  The fixture also checks eventual cleanup and teardown with undrained work.
-  `TILEFINCH_TRACE_RUNTIME_STEPS` reports `runtime-cleanup` task counts and
-  elapsed time separately from `runtime-checkpoint`; the existing JS outlier
-  profiler can attribute slow callbacks. Cleanup is not startup work and must
-  not delay resource admission or page recovery. The pre-fix fixture completed
-  only one reaction while 63 cleanup callbacks consumed the checkpoint.
-- `tilefinch-browser-engine-tests --cleanup-drain-only` drives a page through
-  `browser_engine_advance_runtime` at the PSP frame loop's two-task budget.
-  Hosts advance every frame whether or not author work is pending, so an idle
-  page drains its queued wrapper cleanups (and their DOM handle slots) without
-  cleanup counting as author work. A page whose due tasks take every slot
-  (two 16 ms intervals) previously ran no cleanup at all; after four starved
-  turns one cleanup is now admitted ahead of that turn's tasks, so such a page
-  gives up at most one task slot in five turns.
-- `build-preset-release/tilefinch-script-lazy-tests path/to/script.js [...]`
-  inspects the supplied script files instead of running the default fixtures.
-- `build-preset-release/tilefinch-quickjs-oom-tests N` runs the allocation
-  failure boundary after `N` successful allocations (not a byte budget).
-- `build-preset-release/tilefinch-quickjs-oom-tests --context-refusal-only`
-  refuses each allocation during raw and full QuickJS context creation, once
-  and persistently, then checks that the runtime releases every allocation.
-- `build-preset-release/tilefinch-memory-pressure-tests` sweeps initialization
-  limits, HTML-fragment parser failures, and every Budget allocation boundary
-  in ten browser operations: navigation, dynamic DOM mutation, Reader and
-  Basic preparation, CSS changes, rendering, history, container-query layout,
-  deferred image loading, and JS-driven DOM/query growth. Each case must
-  recover with a fresh navigation and release all owned bytes at teardown.
-  Pass a scenario number (`0` through `9`) to run one operation, or a scenario
-  and allocation index to reproduce one refusal. The sweep verifies these
-  boundaries; it cannot prove that every possible page and device failure is
-  crash-free.
-- When measuring the sweep, count distinct allocation sites actually refused,
-  not allocation attempts or lines merely executed by ordinary tests. Those
-  are different coverage measures; the private experiment ledger records the
-  latest source-site census and its limits.
-- For repeatable callsite measurement, configure a **disposable host** Clang
-  build with `-fprofile-instr-generate -fcoverage-mapping` and
-  `-DTILEFINCH_BUDGET_CALLSITE_TRACE=ON`. Run named tests with
-  `LLVM_PROFILE_FILE` set to a per-process `%p.profraw` path, capturing their
-  stderr; merge the raw files with `llvm-profdata merge -sparse`. Then run
-  `python3 scripts/budget-callsite-report.py --binary <build>/libtilefinch_core.dylib
-  --profile <merged.profdata> --fault-log <test.log> --llvm-cov <llvm-cov>`.
-  The report inventories every direct first-party Budget malloc/calloc/realloc
-  expression compiled into that host core and distinguishes ordinary source
-  reach from an *actual injected refusal*. A partial test run must be labelled
-  partial. The probe is forbidden in PSP builds and off by default; neither
-  site logs nor profiles belong in the public repository.
-  Its `coverage_targets` separately track resource, JS-module, media, and
-  storage source families. A targeted pressure campaign should include
-  `tilefinch-stylesheet-resource-tests`,
-  `tilefinch-image-decode-scaled-tests`, `tilefinch-module-bytecode-tests`,
-  `tilefinch-media-mp4-tests`, `tilefinch-media-http-range-tests`,
-  `tilefinch-offline-app-limits-tests`, and
-  `tilefinch-session-site-storage-tests`. Pass
-  `--require-target-refusal resource` (and likewise for the other three
-  names) to reject a campaign that never refuses an allocation in that area.
-  This is a source-site coverage target, not proof of full path coverage;
-  report each target's reached and refused counts alongside the tests run.
-- `build-preset-release/tilefinch-image-decode-scaled-tests --only allocation-refusals`
-  refuses each PNG, JPEG, and WebP decoder allocation in turn, then requires
-  the same image to decode with byte-identical pixels on retry and no retained
-  Budget ownership.
-
-Total relayout time is not input latency. Check cooperative gaps separately:
-the native UI can update the retained frame without entering the DOM at these
-checkpoints. Native computed-style inheritance participates in the existing
-task watchdog rather than hiding a whole ancestor chain between VM polls.
-Layout likewise keeps its four-node quota for cheap work but cooperates at
-the next node boundary after eight milliseconds. A single node can still
-overrun that interval; this is a safe-point rule, not a hard frame deadline.
-Do not infer physical-PSP responsiveness from host elapsed times alone.
-
-The interactive host lab accepts `--stylesheet-count N` for diagnostic
-captures, bounded to 1 through 32. Omitting it preserves the selected profile's
-defaults (24 sheets at the lab's default 24 MiB limit). This changes only the
-count allowance, not byte, file, time, or Budget admission. A higher-count host
-capture is not evidence that the page fits the production PSP profile.
-
-## CMake presets
+### Sanitizers, ThreadSanitizer, and the hostile harness
 
 ```sh
-cmake --preset dev
-cmake --build --preset dev
-ctest --preset dev
-
-cmake --preset release
-cmake --build --preset release
-ctest --preset release
-
 cmake --preset sanitize
 cmake --build --preset sanitize
 ./scripts/run-sanitizer-tests.sh
-```
 
-The presets create `build-preset-dev`, `build-preset-release`, and
-`build-preset-sanitize`. `dev` uses `RelWithDebInfo`; `release` is an optimized
-host build; `sanitize` enables
-AddressSanitizer and UndefinedBehaviorSanitizer with frame pointers. It keeps
-the QuickJS objects at `-O1`: unoptimized, instrumented interpreter frames can
-otherwise consume about 100 KiB per JavaScript call and exhaust the unchanged
-stack guard on small, finite component trees. Both sanitizers remain enabled;
-no stack/heap limits or shipping optimization settings change. The
-`tilefinch-js-responsiveness-tests --component-stack-only` regression checks
-nested component connection and stylesheet adoption, then verifies that truly
-unbounded recursion still reaches the recoverable stack guard. The preset keeps
-the FFmpeg media backend in the gate but disables SDL audio output, avoiding
-SDL's Cocoa/LaunchServices bootstrap in dozens of parallel command-line tests.
-A Release
-configure does not silently select the PSP runtime policy: invoke a frontend
-with `--psp-profile` when that behavior is the subject of a lab run. For
-shipping-shaped memory qualification, also pass `--psp-fonts` to the
-interactive lab: it uses the packaged Latin sans/serif faces instead of the
-larger desktop fallback files. The `runtime-fonts` receipt records the mode
-and loaded bytes. Keep full-font visual-oracle runs separate; neither switch
-changes a heap limit or silently replaces the other qualification lane. All
-presets use the pinned Bellard QuickJS configuration, enable tests, disable the
-unrelated JavaScriptCore spike, and use a compiler cache when available.
-
-Host tools and tests load one shared `tilefinch_core` image. Consequently an
-engine implementation edit rebuilds that image without relinking every test
-executable; the logical build dependency still guarantees that the new image
-is complete before any test starts. PSP configurations continue to link a
-static core and retain the same `.text` and hot-symbol ratchets. The Release
-fidelity gate reserves four CTest processor slots and renders its independent
-scenarios concurrently, while keeping scoreboard rows in manifest order.
-
-On macOS, `scripts/run-sanitizer-tests.sh` runs the suite in parallel with
-symbolization disabled, then reruns only failed tests serially with normal
-symbols while preserving the failed status. This keeps the green path parallel
-and prevents several tests exposing the same defect from overwhelming
-CoreSymbolication/LaunchServices and hiding the first useful report. Override
-the default two workers on macOS (eight elsewhere) with
-`TILEFINCH_SANITIZER_JOBS`.
-
-ThreadSanitizer cannot share a binary with AddressSanitizer, so it has no
-preset. Instead the ordinary host trees (`release`, `dev`) build one
-TSan-instrumented test, `tilefinch-psp-media-ownership-tsan-tests` (label
-`tsan`), whenever the compiler links `-fsanitize=thread` and no other
-sanitizer is in `CMAKE_C_FLAGS`. It is the PSP media slot hand-off stress
-from `tilefinch-psp-media-ownership-tests`, and it fails on the first race
-report (`TSAN_OPTIONS=halt_on_error=1`), so it runs in the normal gate.
-
-The hostile-input parser harness is opt-in:
-
-```sh
 cmake --preset hostile
 cmake --build --preset hostile
 ctest --preset hostile
 ```
 
-It runs under the sanitizer configuration and is not a replacement for a
-general-purpose fuzzer. Its build preset requests only the hostile-parser
-harness; the matching test preset runs only that test.
+`sanitize` enables AddressSanitizer and UndefinedBehaviorSanitizer with frame
+pointers. It builds QuickJS at `-O1`, because unoptimized instrumented
+interpreter frames can exhaust the unchanged stack guard on small, finite
+component trees; no stack or heap limit changes. It keeps the FFmpeg media
+backend but disables SDL audio output, avoiding SDL's Cocoa/LaunchServices
+bootstrap in many parallel tests.
 
-## Bootstrap artifacts
+On macOS, `scripts/run-sanitizer-tests.sh` runs the suite in parallel with
+symbolization off, then reruns only failed tests serially with symbols while
+keeping the failed status. Override its workers (two on macOS, eight
+elsewhere) with `TILEFINCH_SANITIZER_JOBS`.
 
-Host builds make `tilefinch_core` depend on
-`check_tilefinch_bootstrap_generated`. Editing `src/bootstrap/*.js` therefore
-fails the next core build if the checked-in source or bytecode image is stale.
-Regenerate both deterministic artifacts explicitly with:
+ThreadSanitizer cannot share a binary with AddressSanitizer, so it has no
+preset. The ordinary host trees build one TSan test,
+`tilefinch-psp-media-ownership-tsan-tests` (label `tsan`), whenever the
+compiler links `-fsanitize=thread` and no other sanitizer is in
+`CMAKE_C_FLAGS`. It is the PSP media slot hand-off stress and fails on the
+first race report, so it runs in the normal gate.
 
-```sh
-cmake --build build-preset-release --target regenerate_tilefinch_bootstrap
-```
+The hostile-input parser harness runs under the sanitizer configuration; its
+build preset builds only the harness and its test preset runs only that test.
+It does not replace a coverage-guided fuzzer ([fuzzing](../tests/fuzz/README.md)).
 
-That target regenerates both embedded C files and derives
-`src/bootstrap/generated.sha256` from the exact authored/generated tree.
-Do not edit the manifest by hand. Host checks verify the same manifest that
-PSP-only builds consume.
+### Media timing gates
 
-Host builds hash the complete bootstrap source/artifact set every time, but
-memoize a successful regeneration comparison by the manifest contents,
-generator executable, and verification implementation. Unchanged C-only edits
-therefore avoid recompiling JavaScript just to compare identical artifacts.
-The explicit `tilefinch-bootstrap-generated-check` CTest always regenerates
-and compares; it does not consume the memo.
-
-The PSP cross-build consumes those checked-in artifacts and does not run a
-host QuickJS generator through the PSP toolchain.
-
-## QuickJS configuration
-
-QuickJS is vendored in `third_party/quickjs` with the repository's changes
-already applied, and its two engine files are fingerprint-pinned at configure
-time. Engine edits go directly into that tree and update the pins in
-`cmake/TilefinchDependencies.cmake`; `third_party/quickjs/README.md` lists the
-carried changes and the update procedure. The old experimental VM patch is
-history only. Every configure, raw or preset, selects the vendored Bellard
-QuickJS; `-DPSP_BROWSER_USE_BELLARD_QUICKJS=OFF` builds against pinned
-QuickJS-NG instead. Use a separate raw CMake tree for an upstream, unpatched
-Bellard comparison.
-
-The portable Bellard configuration enables one source-neutral interpreter
-shortcut by default: a two-instruction function that only returns one captured
-value can return that value without constructing an otherwise unobservable
-interpreter frame. It adds no fields or caches to QuickJS objects. Configure a
-fresh comparison tree with
-`-DPSP_BROWSER_QUICKJS_CAPTURE_GETTER_FASTPATH=OFF` when an exact upstream
-dispatch control is needed; the control is built from a copy of the vendored
-engine in the binary directory with that layer reversed, checked against a
-pinned fingerprint, and the vendored tree itself is never modified.
-
-### Interpreter timing controls
-
-Setting `validation_execution_census=0` stops the sampler, but does not
-remove the census checks compiled into the validation interpreter. For a
-physical-PSP timing control, configure the same validation tree with
-`-DPSP_BROWSER_EXECUTION_CENSUS=OFF`, rebuild the named PSP targets and the
-PSPLink PRX, and keep the boot configuration, input script and response
-capture unchanged. Compare completed replies and final pixels, not just a
-successful launch. Restore the option to `ON` before collecting family
-attribution. Host builds retain the hooks regardless of this PSP-only
-control; ordinary shipping PSP builds never compile them in.
-
-Keep the runner and binary unchanged until PSPLink reports `Load/Start`.
-The runner prints the PRX's SHA-256 before loading and rejects a changed
-artifact afterward; save that output with the validation log. Never edit
-the shell runner while it is waiting for a report: shells can read its
-remaining commands lazily. Rebuild the next variant only after the previous
-one is resident, and save each completed log and frame before another run.
-
-### Property-fault and frame-message diagnostics
-
-The portable Bellard baseline has an opt-in lab-only property-read diagnostic.
-It is compiled out of ordinary builds and adds no fields to their QuickJS
-objects. Like the other lab variants it is applied to a binary-directory
-copy of the vendored engine (the build directory below is not a preset, so
-it needs the explicit allowance):
+The one-hour media cadence check advances a virtual clock in a tight loop. It
+is an occasional policy check, neither registered with CTest nor built by
+default:
 
 ```sh
-cmake -S . -B build-property-trace -DCMAKE_BUILD_TYPE=Debug \
-  -DPSP_BROWSER_JS_PROPERTY_FAULT_TRACE=ON \
-  -DTILEFINCH_ALLOW_BUILD_DIR=ON
-cmake --build build-property-trace -j8
-TILEFINCH_TRACE_JS_PROPERTY_FAULTS=32 \
-  ./build-property-trace/psp-browser-interactive-lab ...
+cmake --build build-preset-release --target tilefinch-occasional-media-timing
 ```
 
-The numeric environment value is bounded to 1--128 faults. Each record gives
-the source position, function, bytecode position/opcode, base and key types,
-property preview, arguments, locals, and nearby bytecode. The diagnostic is
-for reducing a failure to the first invalid value; it must not be used to
-rewrite third-party source or manufacture browser capabilities.
-Set the value to `absent` to suppress reads of missing properties and record
-only failed JavaScript `in` checks. This keeps feature-detection traces useful
-when ordinary optional-property reads would otherwise consume the record cap.
-Set it to `fault` to record only accesses whose base is `null` or `undefined`;
-this isolates the operation that throws after long-running third-party code
-without spending the bounded record budget on ordinary feature detection.
-
-`TILEFINCH_TRACE_FRAME_MESSAGES=2048` independently records bounded frame
-`postMessage` JSON (256--65,536 characters). It is available in trace-enabled
-lab builds and compiled out by `PSP_BROWSER_DISABLE_TRACE`. Frame payloads can
-contain transient tokens, so keep their logs out of Git and redact them before
-sharing.
-
-### JavaScript heap composition
-
-Host builds compile a read-only heap walk, `JS_ComputeMemoryDetail`
-(`CONFIG_TILEFINCH_HEAP_DETAIL`, set for every non-PSP build in
-`cmake/TilefinchDependencies.cmake`; no PSP image compiles it, shipping or
-validation). `TILEFINCH_TRACE_JS_HEAP_DETAIL=1` prints a census of a realm at
-the first safe point after its allocator refuses a request (an interrupt poll
-or the escaping exception), at every 4 MiB high-water step
-(`TILEFINCH_TRACE_JS_HEAP_DETAIL_STEP_KB`) and with each memory report:
-allocator arenas vs large blocks, every class with its property arrays and
-payload, each script file's bytecode, lazy stubs, line tables, retained
-source text (own copies and shared spans separately) and closures,
-instances per prototype, strings by size band, atoms, shapes, pending jobs
-and `Function.prototype.toString` calls, plus the Budget categories and the
-refused request. `=gc` also collects after an OOM census and censuses again,
-which answers "would a GC have freed enough". Summarise a run directory
-(one subdirectory per page with `lab.log`/`lab.err`):
+The real-time media resilience gate generates a temporary video-only
+fragmented MP4 and serves it through deterministic local fault profiles:
+healthy bursts, per-request setup delay, truncated responses, slow trickles,
+asymmetric audio/video supply, a 30-second outage with recovery, buffering
+hysteresis, and the PSP's publication quantum. No third-party media or network
+service is involved:
 
 ```sh
-TILEFINCH_TRACE_JS_HEAP_DETAIL=1 ./build-preset-release/psp-browser-interactive-lab \
-  --url URL --psp-profile realistic --replay-http-response-keyed TRACE ... 2> run/page/lab.err
-python3 tools/jsmem_report.py run          # composition table, MB
-FILES=1 python3 tools/jsmem_report.py run  # plus top scripts and prototypes
+./scripts/run-media-resilience-gate.sh build-preset-release
 ```
 
-Sizes are host (64-bit) allocations: pointer-heavy rows (objects, shapes,
-closures, bytecode headers) are larger than on the PSP; text rows (source,
-strings, atoms) are the same.
-
-## Dependencies
-
-The first configure downloads pinned archives and verifies their hashes:
-Lexbor, stb, NanoSVG, DejaVu fonts and libwebp for every build; FreeType and
-brotli while `PSP_BROWSER_ENABLE_WEB_FONTS` is on (the default); WAMR for PSP
-builds and for host builds with `PSP_BROWSER_ENABLE_HOST_WEBASSEMBLY` (the
-default; `PSP_BROWSER_WAMR_SOURCE_DIR` supplies a local tree);
-QuickJS-NG only when `PSP_BROWSER_USE_BELLARD_QUICKJS` is off (the vendored
-Bellard QuickJS in `third_party/quickjs` is the default); and, for the `psp`
-presets, PocketSphinx 5.1.1 for the voice component. The PSP transport
-archives (curl, Mbed TLS, nghttp2) are not fetched by CMake; see
-[PSP transport dependencies](#psp-transport-dependencies). `PSP_BROWSER_VENDOR_DIR` can supply the
-prepared dependencies supported by its documented layout; individual selected
-FetchContent sources can also be supplied with
-`FETCHCONTENT_SOURCE_DIR_<NAME>`. Treat a checksum mismatch as a dependency or
-configuration failure; do not bypass it to make a build proceed. To use
-existing dependency checkouts:
-
-```sh
-cmake --preset release \
-  -DPSP_BROWSER_VENDOR_DIR=/path/to/vendor
-```
-
-For an offline configure, populate each tree's `_deps/*-src` from an earlier
-configure and pass `-DFETCHCONTENT_FULLY_DISCONNECTED=ON`. A fresh `psp` tree
-without a populated `_deps/pocketsphinx-src` can instead point
-`-DPSP_BROWSER_POCKETSPHINX_SOURCE_DIR=/path/to/pocketsphinx-5.1.1` at an
-unpacked source tree (the configure applies Tilefinch's patches to it in
-place), or leave voice out with `-DPSP_BROWSER_ENABLE_PSP_VOICE=OFF`.
-
-## Build directories
-
-Configuring into a directory inside the source tree that `CMakePresets.json`
-does not name fails on a fresh configure. Existing trees are unaffected, and
-`-DTILEFINCH_ALLOW_BUILD_DIR=ON` admits a deliberate experiment; delete such
-a tree when the experiment is done. A few non-preset trees are allowlisted
-because scripts default to them or other trees reference them:
-`build-preset-psp-validation`, `build-psp-update-proof`,
-`build-preset-psp-update-e2e`, the `scripts/dev.sh` trees (`build-dev`,
-`build-release`, `build-dev-sanitize`), the lab scripts' `build-bellard-*`
-defaults, and `build-challenge-compression` (it hosts the fetched WAMR
-source every current tree's cache points at; relocate that source before
-pruning it). Also preserve `build-challenge-compression-bellard`:
-it contains the cached pristine QuickJS tarball used by the current workspace.
-Check dependency-source and download-cache references before pruning any
-experimental tree; a non-preset name alone does not prove it is disposable.
-
-## Measuring build time
-
-For a disposable, exclusively owned worktree, measure the complete targeted
-build rather than individual compiler commands:
-
-```sh
-python3 benchmarks/measure-incremental-build.py \
-  --build build-preset-release --output /tmp/tilefinch-build-timings \
-  --reconfigure
-```
-
-The benchmark temporarily touches source mtimes, restores them afterward,
-requires actual compile evidence for edit samples, and keeps full logs. Do not
-run it against a worktree another process is editing or building. See
-[the build-speed experiment](engineering/BUILD_SPEED_EXPERIMENT.md)
-for measured results and remaining costs.
+It stays outside CTest because it preserves wall-clock cadence. It does not
+replace a hardware playback soak: host curl cannot reproduce PSP WLAN,
+firmware decoder, DMA, or thread-priority timing.
 
 ## Evidence gates
 
@@ -690,509 +271,89 @@ each claim to an environment):
 | PSP cross-build ratchets | 32-bit ABI, actual `.text`, `.rodata`, stack and hot-symbol size |
 | work record (`tilefinch-work`) | deterministic operation counts, identical on host, PPSSPP and device, for comparing changes without timing noise |
 | PPSSPP | packaged EBOOT, Allegrex execution, deterministic scripted flows |
-| offline device replay | a recorded journey (for example a chatgpt.com load and send) replayed on the PSP from `host0:`, with responses released on a fixed clock so a faster build cannot fake a faster network |
+| offline device replay | a recorded journey replayed on the PSP from `host0:`, with responses released on a fixed clock so a faster build cannot fake a faster network |
 | physical PSP | firmware, caches, WLAN, Memory Stick, latency, media and lifecycle truth |
 
-Performance claims come from the device. Any relink moves single code paths by
-up to about 40% and a whole journey by about a second (16 KiB instruction
-cache, code placement), so small engine changes are judged with one binary and
-a runtime switch over alternating runs, and ideas that did not pay off on the
-hardware are recorded as rejected in private investigation records.
+Performance claims come from the device. Any relink moves code placement in
+the PSP's small instruction cache and with it single paths and whole
+journeys, so a small engine change is judged with **one binary and a runtime
+switch over alternating runs**, never two builds. Ideas that do not pay off on
+the hardware are recorded as rejected in the private ledgers; this page keeps
+no measured figures.
 
-Release builds compile logging out, along with HTTP capture and replay (about
-42 KB of code). Validation builds aggregate counters in RAM and normally
-publish one bounded report through PSPLink, avoiding Memory Stick traffic
-during a run; per-event flushing is reserved for localizing crashes.
+Release builds compile out logging and HTTP capture and replay. Validation
+builds aggregate counters in RAM and normally publish one bounded report
+through PSPLink, avoiding Memory Stick traffic during a run; per-event
+flushing is reserved for localizing crashes.
 
-## Focused suites
+## PSP cross-build
 
-The aggregate `tilefinch-tests` executable is available for an explicit
-whole-program qualification run. Its test program has two
-registered filters, and the layout suite lives in its own executable next to
-the layout translation units it exercises:
-
-```sh
-./build-preset-dev/tilefinch-tests --list
-./build-preset-dev/tilefinch-tests --filter foundation
-./build-preset-dev/tilefinch-tests --filter web-runtime
-./build-preset-dev/tilefinch-layout-tests
-```
-
-`core` is an alias for foundation and web-runtime (`scripts/dev.sh unit core`
-also runs the layout executable). CTest exposes the same suites as
-`tilefinch-foundation-tests`, `tilefinch-web-runtime-tests`, and
-`tilefinch-layout-tests`, plus focused executables for
-URL/security, session security, fetch streaming, the engine facade, JavaScript
-responsiveness, pumpable navigation, and supported loopback redirect behavior.
-For example:
+The PSP build is a separate gate, never run by CTest
+([AGENTS.md](../AGENTS.md#the-psp-cross-build-is-a-separate-gate) lists what
+only it enforces). Build named targets only:
 
 ```sh
-ctest --test-dir build-preset-dev -R 'tilefinch-(url|session-security)-tests' \
-  --output-on-failure
-ctest --test-dir build-preset-dev -R tilefinch-navigation-load-tests \
-  --output-on-failure
-ctest --test-dir build-preset-dev -L security --output-on-failure
+PSPDEV=/path/to/pspdev cmake --preset psp
+cmake --build build-preset-psp \
+  --target tilefinch_core psp-browser-fixture psp-browser-script
 ```
 
-Use the narrowest relevant filter while editing, then run all registered
-Release and sanitizer gates plus the aggregate executable before treating a
-change as ready. Network/replay
-acceptance scripts and the long platform simulator are separate qualification
-tools; they should not be hidden in every local build or unit-test invocation.
+### PSP transport dependencies
 
-The one-hour media cadence check advances a virtual clock in a tight loop and
-usually finishes in under 10 ms, but it is still an occasional policy check.
-It is neither registered with CTest nor included in a default build target:
+The live-network PSP build consumes project-owned, hash-pinned curl, Mbed
+TLS, and optional nghttp2 archives. Populate the ignored offline cache once
+before configuring a fresh PSP tree:
 
 ```sh
-cmake --build build-preset-release \
-  --target tilefinch-occasional-media-timing
+./scripts/fetch-psp-transport-deps.sh
 ```
 
-Media delivery also has an explicit real-time resilience gate. It generates a
-temporary, video-only fragmented MP4 and serves it through deterministic local
-fault profiles; no third-party media or network service is required. The
-profiles cover healthy burst delivery, per-request setup delay, truncated
-responses, slow trickles, asymmetric audio/video supply, a persistent
-30-second path outage followed by recovery, buffering hysteresis, and the
-PSP's publication quantum:
+[PSP transport](engineering/PSP_TRANSPORT.md) covers provenance, the
+`psp-http1` comparison build, and the `psp-legacy-transport` escape hatch.
+
+### PSP validation tree
+
+`build-preset-psp-validation` is the `psp` preset configured into its own
+allowlisted directory with validation logging. The PPSSPP input-script,
+device-cost, and latency scripts run it:
 
 ```sh
-./scripts/run-media-resilience-gate.sh build-preset-release
+export PSPDEV=/path/to/pspdev
+cmake --preset psp -B build-preset-psp-validation \
+  -DTILEFINCH_PSP_VALIDATION_LOG=ON
+cmake --build build-preset-psp-validation --target psp-browser-script
 ```
 
-This is intentionally outside CTest because it preserves wall-clock delivery
-cadence and the longest profile takes tens of seconds. It complements rather
-than replaces a hardware playback soak: host curl cannot reproduce PSP WLAN,
-firmware decoder, DMA, or thread-priority timing.
+Like every `psp` configure it needs the transport cache and, because
+`PSP_BROWSER_ENABLE_PSP_VOICE` defaults on, PocketSphinx. In a sandboxed or
+offline tree add `-DPSP_BROWSER_ENABLE_PSP_VOICE=OFF` (the EBOOT then has no
+voice component) or pass
+`-DPSP_BROWSER_POCKETSPHINX_SOURCE_DIR=/path/to/pocketsphinx-5.1.1`; see
+[Dependencies](#dependencies).
 
-## Qualification lanes
+The validation interpreter compiles in execution-census checks. Setting
+`validation_execution_census=0` stops the sampler but not the checks; for a
+device timing control, configure the same tree with
+`-DPSP_BROWSER_EXECUTION_CENSUS=OFF`, rebuild the named targets and the
+PSPLink PRX, keep the boot configuration, input script, and capture
+unchanged, and compare completed replies and final pixels. Restore `ON`
+before collecting family attribution. Shipping PSP builds never compile the
+hooks.
 
-### Host browsing responsiveness
+Keep the runner and binary unchanged until PSPLink reports `Load/Start`: the
+runner prints the PRX's SHA-256 before loading and rejects a changed artifact
+afterward, so save that output with the log. Never edit the shell runner while
+it waits, because shells can read its remaining commands lazily. Build the
+next variant only after the previous one is resident. The device loop is in
+[PSPLink device development](engineering/PSPLINK_DEV_LOOP.md).
 
-```sh
-python3 benchmarks/run-host-browsing-responsiveness.py \
-  --wikipedia-home-trace /private/path/to/home-capture \
-  --wikipedia-article-trace /private/path/to/article-capture \
-  --search-trace /private/path/to/home-search-capture
-```
+### Running under PPSSPP
 
-The runner builds the optimized host first, then runs font rollback/retry,
-visible focus and held scrolling, disclosure expansion, deferred images,
-provider navigation, pointer search, native UI/supervisor, and media
-presentation/state regressions. These are composable host checks, not a
-single end-to-end hardware playback claim. It never builds for PSP, launches
-an emulator, plays audio, or contacts a live site. Captures are optional;
-without them the synthetic gates still run. Keep capture bodies and raw
-journey logs outside public source control. Output defaults to the ignored
-build tree and includes raw logs, raster checksums, and `summary.json`.
-
-The script-free journey submits a native search form, selects a result,
-opens and expands an article, scrolls, and restores both results and the form
-through Back. It checks the selected URL and zero owned memory at shutdown.
-It runs at both 16 and 24 MiB, repeats Back/Forward restoration, keeps focus
-and rendering usable while a delayed navigation times out or is cancelled, and
-checks that a deferred image timeout neither strands later images nor retires
-the page.
-Replacing an in-flight request uses the frontend's cancel-then-begin ownership
-sequence; further pumps must retain the replacement generation, destination
-and usable disclosure controls without a stale error.
-The provider journey renders with the ordinary eight-tile cache after down/up
-input, verifies both Play destinations through repeated selections and a shell
-replacement, and stops at the native-player handoff (no audio or decoder).
-`--script-free-journey-only` on `tilefinch-browser-engine-tests` runs the first
-journey and the inherited-focus-style cache/invalidation regression directly.
-
-Optional captured home/article runs also measure JavaScript-Off focus and
-scrolling through the interactive lab, separately from the scripted stress
-lane (`--skip-scripted-captures` selects only this default-policy capture lane).
-`summary.json` reports median/p95/maximum dispatch and paint time per
-command; `focus-outline-us` isolates authored outline style resolution, not
-outline rasterization. Do not combine page loading or deferred-resource drain
-time with these input-to-pixel samples. Timing is observational; the committed
-gates assert bounded completion, cache reuse, correct destinations and pixels
-rather than machine-dependent microsecond thresholds.
-
-To cover delayed script initialization rather than stopping at the first
-optional font publication, also supply `--startup-trace /private/path/to/capture`
-and `--startup-url https://example.test/article`. This runs 1,800 logical 16 ms
-runtime/idle turns (28.8 seconds of timer time, configurable with
-`--startup-ticks 2..4096`) with installed-app admission (5 MiB base JavaScript heap plus the existing
-4 MiB boot window), checks focus rendering before and after settling, and
-requires completed dynamic scripts without uncaught errors. It reports caught
-heap refusals separately: an allocation refusal is not itself evidence of an
-uncaught initialization failure. The last dynamic-script completion time is
-measured from navigation commit, not from the initial request; it does not
-prove future timers cannot start additional work beyond that window. A
-240-turn wall-clock-only replay, which can finish before delayed
-initialization timers become due, remains available by invoking
-`tilefinch-browser-engine-tests --navigation-settle-replay TRACE URL` directly;
-append the bounded turn count to select logical-clock replay. Do not compare
-the two as equivalent amounts of initialization work.
-
-Focused synthetic checks are available as
-`tilefinch-js-responsiveness-tests --external-compile-pressure-only` and
-`--task-time-slice-only`. The dynamic-script suite additionally pins tail
-continuation admission after the script has consumed its initial reserve.
-
-`TILEFINCH_TRACE_PROVIDER=1` reports provider transform slices and timing in
-host builds. `tilefinch-browser-engine-tests --provider-navigation-only`
-runs the provider navigation/cancellation regressions in isolation, including
-under sanitizers; it does not replace the full suite.
-
-`tilefinch-browser-engine-tests --youtube-login-journey` covers synthetic
-Google form entry, cancellation, synchronous and asynchronous redirects into
-the native YouTube provider, and verified-login notifications across refreshes
-and account changes. The CTest journey also runs recommendation, subscription,
-Like/Unlike confirmation and sign-out checks. `tilefinch-youtube-login-tests`
-checks consent choices, bounded cookie persistence, corruption and allocation
-refusal rollback, removal, and host symlink safety. These fixtures contain no
-real credentials or authenticated captures. No full YouTube HTML or script is
-executed, including when a sign-in response redirects there.
-
-That lane also reports `watch-reuse` cold/warm Description and Comments loads,
-request/body-byte counts, build steps and peak extra Budget ownership. It uses
-synthetic replay data, not live-network timing. Tests compare cached and fresh
-HTML byte-for-byte and cover actual link activation/scroll targets, cookie and
-language changes, expiry, clear/reclaim, another video, cancellation, allocation
-refusal and a failed-token retry. A 768 KiB fixture pins Description to zero
-downloads and seven build steps after a normal watch load; an uncached expansion
-still takes sixty build steps. Keep the initial watch build at its existing
-114-step ceiling in that fixture: reuse must not add a blocking preflight.
-
-### Canvas and WebGL game qualification
-
-The public [WebGL authoring guide](WEBGL.md) defines the bounded PSP profile
-that this lane qualifies and the patterns page authors should use.
-
-The focused game-compatibility lane exercises a bounded Canvas paddle/ball
-loop, indexed WebGL, point/line/triangle depth parity, uniform snapshots,
-packed-wire boundary refusal, page-visibility suspension, Gamepad sampling,
-drawing-buffer limits, pixel readback, object deletion, and invalid
-buffer/index ranges. It also runs the complete installable
-`examples/prism-break-3d/` game through deterministic physics, collision,
-level-transition, multiball, power-up, particle, and dynamic-mesh scenarios.
-The same lane runs `examples/treadline-arena/` through its PSP-realistic
-startup, offline manifest, fixed-step tread movement, charge/release firing, pause, ricocheting
-shells, destructible barrier swaps, three armor/speed classes, class-specific
-secondary weapons, directional armor, the opt-in Command meter, all five
-gadgets, Survival, Team Control, Convoy Escort, objective-aware bot movement,
-saved setup preferences, bounded entity pools, and teardown ownership.
-The Treadline feature fixture also covers Daily Arena, Billiards, bosses,
-hazards, local artillery handoff, paints/palettes, wall refusal/leading/routes,
-replay checksums and deterministic results, and killcam return-to-play.
-These fixtures run once per CTest pass, in
-`tilefinch-treadline-feature-budget-tests`: a fresh 7MiB JS realm that
-requires zero allocator refusals and zero owned bytes after teardown. The
-default conformance test loads the game but does not repeat them.
-
-The binary's `--treadline-features` mode runs the Game Profile
-script-admission check, replay import, and the Treadline feature fixtures
-(features, nearest goal, occupancy, render cache, campaign, campaign HUD,
-controls, practice, placement, planning, breach, camera, look, smoke, layers).
-The layers fixture measures every overlapping pair of parallel box faces in
-16-bit depth steps at the real camera (and flat tops against the static grid
-and contact-shadow layers) and checks that a decal dropped for instance room
-stays dropped. An optional
-second argument chooses a source-root-relative game script for pre-fix checks;
-normal CTest always loads the current packaged game. `--treadline-league N`
-runs 1..1000 headless seeded matches; an optional following source-root-relative
-game-script path permits exact before/after comparisons without changing the
-packaged game. The
-`scripts/run-treadline-bot-league.py` wrapper summarizes the JSONL results.
-
-For scheduling research, `--treadline-host-profile [game-script]` runs six
-fixed-seed/arena cases of 1,200 frames at 30Hz. A test-only lexical probe counts
-strategy refreshes, bank plans, wall rays and bot updates, and the host measures
-simulation plus instance preparation with an external monotonic clock. It does
-not render, wait for vblank, exercise the active audio graph or predict PSP
-milliseconds. `scripts/profile-treadline-host.py --candidate <game-script>` runs
-three alternating pairs, requires deterministic work counts, and reports tail
-timing and clustering separately. Timing uses `--treadline-host-timing` without
-the per-ray/planner counters; separate work runs check their determinism and
-fairness. Initial/reset warmup is excluded explicitly;
-raw maximum timing remains reported. Pair this screening tool with feature and
-bot-league checks, then use physical-device timing only for surviving changes.
-Alternate research sources and the normal packaged-game gate share the
-Game Profile's 512 KiB per-script shipping ceiling. The 7 MiB feature realm
-and aggregate source, page, and offline-package limits are unchanged.
-
-```sh
-cmake --build build-preset-release \
-  --target tilefinch-canvas-webgl-conformance-tests
-ctest --test-dir build-preset-release \
-  -R '^tilefinch-canvas-webgl-conformance-tests$' --output-on-failure
-```
-
-The ordinary lane stays short. A bounded 600-frame allocation soak is opt-in:
-
-```sh
-TILEFINCH_WEBGL_SOAK_FRAMES=600 \
-  build-preset-release/tilefinch-canvas-webgl-conformance-tests
-```
-
-It reports the QuickJS heap before, after, and at its high-water mark together
-with the number of charged allocations. The retained heap must remain within
-256 KiB of its pre-soak value after collection.
-
-The synthetic pages live under
-`tests/fixtures/canvas-webgl-games/`. They are suitable for the host lab and
-the isolated PPSSPP localhost harness; they contain no captured third-party
-game code. PPSSPP proves lifecycle, rendering, and cleanup behavior, but its
-software-renderer timing is not a substitute for the real-PSP performance
-qualification.
-
-Physical-device WebGL cadence runs use
-`tests/input-scripts/webgl-game-cadence.txt` with Prism's explicit
-`?qualification=ordinary`, `?qualification=heavy`, and
-`?qualification=profile` URLs. The first mark resets validation-only counters
-after warm-up. The profile mode also splits the example's JavaScript cost into
-update, geometry construction, upload, command setup, and HUD work. The
-terminal report separates author callback time from synchronous native WebGL
-time and records canvas-presentation median, p95, maximum, and 60/30 Hz
-deadline counts. These probes are absent from shipping builds and do not expose
-a higher-resolution clock to arbitrary page JavaScript.
-
-**Treadline's harness API lives in `qualification.js`.** The game ships
-without it: `__treadlineDebug` (the fixtures', companions' and sweeps'
-API), the phase-clock profile behind `__tilefinchStartInputProfile` with its
-`TREADLINE-JS-PHASES` report, the soak's action cycle and the long-soak
-driver are all in `examples/treadline-arena/qualification.js`, and ordinary
-play never loads it. The modules' own harness surfaces come through it too:
-`__treadlineDebug.campaign` (the menu, the save, missions and `bridge()`,
-the game bindings the campaign attached with), `.practice` and `.controls`.
-The modules hand them over at attach only when the game was started for
-qualification or a harness, so ordinary play neither builds nor exposes
-them. Each harness loads it explicitly:
-
-- **A qualification URL** (any `?qualification=...`) makes the page fetch it
-  after `game.js`. An installed game must carry it, so build qualification
-  packages from every entry of `examples/treadline-arena/package-files.txt`
-  (`awk '!/^#/ && NF { print $1 }'`); ordinary packages leave it out. In Tilefinch the
-  fetched script attaches within a frame or two of boot, before any
-  companion mark reads `__treadlineDebug`.
-- **A harness that evaluates the scripts itself** sets
-  `globalThis.__treadlineEnableDebug = true` before `game.js` and evaluates
-  `qualification.js` right after it, as
-  `tests/test_canvas_webgl_conformance.c` does for the fixtures, the bot
-  league and the campaign and invariant sweeps. The game then does not fetch
-  it.
-- **The lab-driven gates** use qualification URLs that change nothing they
-  measure: the menu-layout check `?qualification=layout`, the reference
-  screenshots `?qualification=references` and `treadline-visual-play`
-  `?qualification=visual` (its companion turns the killcam back on, which
-  qualification runs otherwise keep off).
-
-Treadline Arena also provides `?qualification=long-soak`. It keeps the player
-alive, drives the player with the game's bounded target/avoidance planner,
-aims and fires through the ordinary cooldown and projectile paths, cycles
-arenas, and repeats collisions, particles, smoke, and destruction. The run
-therefore proves real movement and combat instead of tracing a blind route
-that can park against scenery or settling into an idle title or victory
-screen. Use
-`tests/input-scripts/treadline-long-soak.txt`. The page opens on Quick Match
-with Deploy focused; once the runtime is ready the script presses Cross, a
-trusted Deploy that claims Page controls, so the match runs full screen as real
-play does, with no browser chrome composited over the canvas (the long soak
-keeps its audio-free workload). Its companion
-`treadline-long-soak.mark.js` runs the game's 180-frame JavaScript phase-clock
-profile and returns its report before the window, after the five-second
-PAGE CONTROLS ON toast, and switches the clocks off for the window: clocks and
-report are attribution work, not gameplay. The measured window is 1,350 game
-frames (about 45 seconds at 30 Hz; under Page controls each script frame is
-one game frame), bracketed by `mark-page` marks so the measurement reset falls
-between frames. The PPSSPP harness requires chrome hidden and clocks off at
-the window's start and a delivered profile report. The validation writer
-persists one marked frame per run, so archive a gameplay frame at the first
-mark and use the final active-game summary plus near-zero HTML-overlay time to
-prove that the run did not fall back to a title panel. Use a second paired run
-or a PSPLink screenshot when a visual end-frame comparison is required.
-Validation retains percentile samples for the first 1,024 presented pipelines
-and separately counts every over-34-ms pipeline and the global worst pipeline
-from `webgl-measure-start` to `webgl-measure-end` (the end mark's own frame
-and later frames are not counted); use the latter two values to judge the long
-tail. Compare
-the pre-interaction and controlled budget/category reports as well as the
-QuickJS retained heap so a smooth run cannot hide gradual growth.
-
-The long soak intentionally calls the game's bounded combat planner directly;
-it is a simulation/render stress test, not an input-routing test. Before a
-release, also run `tests/input-scripts/treadline-offline-controls.txt` from
-native Home with the current Treadline package installed as Saved row one
-(the device fixture keeps Prism Break in row zero).
-That scenario opens **Library → Saved**, launches the sealed offline resource
-pack, activates Deploy, exits and re-enters Page controls with Start+Select,
-then drives nub, face, shoulder, gadget, and command inputs. Its terminal
-`tilefinch-input-gamepad:` line is the receiver proof: connected, button, and
-analog frame counts must all be nonzero, the connection count must cover the
-automatic entry and manual re-entry, and `buttons` must include the exercised
-standard Gamepad slots. Use its canvas cadence report to assess manual-input
-action frames. A direct qualification URL cannot substitute for this run.
-
-Automated `treadline-*` scenarios mute PPSSPP's host output in the disposable
-run configuration. Emulated audio remains enabled so mixer and audio-syscall
-work is still exercised. Do not change the game's audio preferences or the
-user's normal emulator/system volume to silence a background test.
-
-### Treadline visual QA: camera track and recorded gameplay
-
-Two tools look at what the player sees rather than at simulation state.
-
-**Camera track in the invariant sweep.** `python3 scripts/run-treadline-invariants.py`
-composes the camera after every 1/30 s step, the way a device frame does after
-its update (`__treadlineDebug.presentCamera`), and feeds the pure detector in
-`tests/fixtures/treadline-camera-motion.js`: distance, pitch (eye height 5.7,
-target .28), yaw, and the eye and look target relative to the player. Per
-1.5 s window it flags oscillation (distance, pitch or yaw reversing three
-times over), re-retraction (snapping in, easing out and snapping in again),
-jumps no authored motion makes (yaw beyond the follow rate, a look target
-leaping without a retraction, an expansion faster than its ease), sustained
-jerk, and shake that never settles. Arena changes, the killcam, respawns,
-Duel turns and camera-mode switches are hard cuts; a single retraction, the
-follow turn and hit shake stay below the limits. Bot cases alternate the
-fixed and follow cameras. The runner prints a `camera motion:` summary line;
-`-v` lists every flagged case with a distance excerpt. A flagged case fails
-the sweep like any other violation. To look at one case's camera frame by frame, a
-`--treadline-probe` script can set `globalThis.__treadlineCameraTrace =
-{case, from, to, rows: []}` before beginning that case.
-`tests/test_treadline_camera_motion.js` (CTest
-`tilefinch-treadline-camera-motion-tests`) drives the detector with synthetic
-series.
-
-**Recorded PPSSPP gameplay.** `scripts/run-ppsspp-input-script.sh
---record-video DIR` turns on PPSSPP's frame dump for that run only: a lossless
-FFV1 AVI at native 480x272 in `DIR/VIDEO`, the mixed audio in `DIR/AUDIO`,
-and the validation log, copied out of the isolated HOME before it is deleted.
-Host audio goes to SDL's dummy driver, so the run stays silent without
-muting the dump. Without the flag nothing changes. A Treadline long soak:
-
-```sh
-build-preset-release/tilefinch-offline-library-fixture --web-app OUT \
-  'https://game.test/index.html?qualification=long-soak&seed=12345' \
-  examples/treadline-arena \
-  $(awk '!/^#/ && NF { print $1 }' examples/treadline-arena/package-files.txt)
-  # add &mode=onslaught to the URL for Onslaught
-scripts/run-ppsspp-input-script.sh --script treadline-long-soak \
-  --url 'https://tilefinch.local/offline/app?id=1' --offline-library OUT \
-  --script-file-kb 512 --measure --record-video recording
-python3 scripts/analyze-game-video.py recording --out analysis
-```
-
-The file list is the game's canonical package list,
-`examples/treadline-arena/package-files.txt`; this `awk` takes every entry,
-including `qualification.js`, which a `?qualification=` page fetches (see the
-file's header for an ordinary package). `OUT` must not exist yet. Do not
-point `TMPDIR` under `~/Documents`
-(LaunchServices then refuses the launch). The long soak alternates the fixed
-and follow cameras every 900 game frames. PPSSPP writes one AVI frame per
-presented frame; the file's 59.94 fps label is nominal. The analyzer takes
-the true rate from frames / audio duration (`--fps` overrides): about 58 fps
-at PPSSPP's normal clock, about 31 fps (device-like 1/30 s steps) with
-`TILEFINCH_PPSSPP_CPU_MHZ=111`.
-
-The analyzer uses ffmpeg and the standard library, plus
-`build-preset-release/tilefinch-video-motion` (`tools/video_motion.c`), which
-estimates a zoom about the screen centre and a shift per frame (`--no-camera`
-skips it). It reports camera oscillation, pumping, jerk and single jumps;
-single-frame transients (a band such as browser chrome, or a large area,
-shown for one frame); brightness flashes and HUD-text dropouts (the HUD bands
-are `--hud-top`/`--hud-bottom`); popping; black, blank and noise frames;
-frozen runs; the tile checkerboard; and partially drawn frames. Single jumps
-(a cut, a deliberate retraction or a glitch: the video alone cannot tell) and
-frozen runs (pause screens freeze on purpose) are listed for review but not
-counted as problems. `report.txt` gives times and frame numbers, `frames.tsv`
-the per-frame measures, `events.json` the events, and each event gets an mp4
-clip at the true rate and a 4x3 contact sheet of twelve consecutive frames
-starting five before its peak. `--skip SECONDS` ignores boot and menus. A
-32 s recording (1,900 frames) takes about 45 s to analyze. CTest
-`tilefinch-game-video-analyzer-tests` runs it on synthetic ffmpeg clips.
-
-**Blinks.** The flicker, transient and popping checks look for large areas
-(they let hit flashes and smoke through), so the analyzer also runs
-`build-preset-release/tilefinch-video-blink` (`tools/video_blink.c`, about
-4 s per recording) on the full-resolution colour frames: a region that
-changes for one to four frames and then returns exactly to what it was
-(on-off-on or off-on-off) while its surroundings stay put and the camera is
-still. Each blink is a `blink hud` (bright pixels in a HUD band), a
-`blink object` (scenery, a tank, an effect or a HUD indicator in the scene
-area) or `shimmer line` (a thin or sparse run: sub-pixel lines such as the
-floor grid and wall tops dropping in and out of the rasterization as the
-camera moves; info only, compare counts between reviews). The report gives
-each blink's box in native pixels, its length and whether it appears or
-vanishes, and writes `NNN-...-zoom.png`, eight frames cropped around it and
-enlarged. Intended blinks exist: the enemy hit flash (white, 0.12 s), the
-8 Hz fire-windup pulse, muzzle and bounce flashes, sparks, the pickup bob at
-a screen edge. `--no-blink` skips the check.
-
-PPSSPP's hardware renderer does not show what the browser's CPU draws over
-a GE-written frame (chrome, toasts such as PAGE CONTROLS ON), so menus and
-overlays are missing from ordinary recordings. Set
-`TILEFINCH_PPSSPP_SOFTWARE_RENDERER=1` for the input-script runner to
-record with the software renderer (slower) when overlays matter.
-
-**Reference screenshots.** `scripts/check-treadline-references.py` renders
-Treadline's key scenes in the interactive lab and compares them pixel for
-pixel with `tests/visual/treadline/*.png`: the title, every main menu
-screen, the Controls pages, the Practice Range panel, pause, the HUD in
-play and the opening view of each authored arena: the `*-first-frame` scenes
-render after two ticks, because the first tick runs the arena change. The lab is byte-deterministic (fixed 16 ms ticks, a pinned save
-with remarks off, `?daily=20261001`), and menu scenes reuse
-`check-treadline-menu-layout.py`'s `SCREENS` visits. CTest
-`tilefinch-treadline-reference-tests` (label `visual`, about 10 s) runs it.
-On a mismatch it fails and writes the current render and
-`<scene>-diff.png` (reference, render, changed pixels in magenta) into
-`build-preset-release/treadline-references/`. When, and only when, the
-change is intended, approve it after looking at the diffs:
-
-```sh
-python3 scripts/check-treadline-references.py --update-references [--only SCENE,...]
-```
-
-and commit the new PNGs with the change that caused them. `--list` names
-the scenes. Any branch that restyles Treadline's text, HUD, menus or
-palette must re-approve the references in the same change.
-
-**Milestone review.** Before merging any Treadline change to visuals, the
-camera, rendering, the HUD or menus (and at each milestone), record the
-standard scenario set and read the review folder:
-
-```sh
-scripts/visual-review.py --build-dir build-preset-psp-validation --out review
-# or: cmake --build build-preset-release --target treadline-visual-review
-#     (EBOOT from TILEFINCH_VISUAL_REVIEW_PSP_BUILD, folder
-#      build-preset-release/treadline-visual-review)
-```
-
-It packages the game from the checkout (so an older validation EBOOT still
-reviews the current JavaScript), records each scenario in PPSSPP at the
-device-like 111 MHz clock (`--clock normal|both` for PPSSPP's own),
-analyzes it, builds an overview sheet (one frame every 2 s), runs the
-reference check, and writes `index.html` and `index.md`: a summary table,
-then per run the overview and every event with its sheet, zoom and clip,
-then a review checklist. The standard set is the Quick Match long soak
-(seed 12345), Onslaught seeds 2 and 7, campaign mission 1-1 and the
-Practice Range; `--scenarios` adds `onslaught-12345` and `mission-3-4`.
-Missions and the range use `tests/input-scripts/treadline-visual-play.txt`:
-real pad input after a trusted Deploy, the scene chosen by the package URL
-(`?visual=mission&mission=N`, `?visual=range`). `--software` adds a
-software-renderer run of each; `--keep-video` keeps the 60-80 MB lossless
-recordings. The standard set takes about 10 minutes (each run about 1 min
-to record at 111 MHz plus 45 s to analyze). It needs PPSSPP, so it is a
-build target and never part of the default CTest gate; `--strict` makes
-analyzer problems or reference changes fail it.
-
-Review checklist (also in each index): decide for every event whether it is
-an intended effect, a known issue or a new problem; look at every overview
-sheet for things no detector names; compare 111 MHz with normal-clock runs
-(a problem only at 111 MHz is a frame-budget effect: deferred HUD work,
-dropped optional geometry); and approve reference changes only when the
-diff is the intended one.
-
-### Scripted input on PPSSPP
-
-To test post-load input during JavaScript (not merely input during raster or
-network work), serve `tests/fixtures` on loopback and run the freshly rebuilt
-validation EBOOT:
+On macOS every automated PPSSPP run goes through LaunchServices
+([AGENTS.md](../AGENTS.md#the-psp-cross-build-is-a-separate-gate)). The
+input-script runner, its options, and scenario criteria are in the
+[input script reference](engineering/INPUT_SCRIPT_REFERENCE.md). Scenarios
+that need local pages serve `tests/fixtures` on loopback:
 
 ```sh
 python3 -m http.server 8779 --bind 127.0.0.1 --directory tests/fixtures
@@ -1201,260 +362,144 @@ scripts/run-ppsspp-input-script.sh --script runtime-input-live --runs 2 \
   --url http://127.0.0.1:8779/cooperative-runtime-input.html
 ```
 
-The harness retains raw traces and compares an ordered semantic trace for this
-asynchronous scenario. It requires `scope=page-runtime` queue and successful
-presentation evidence; a raster-only busy press cannot pass. Read `max-gap`
-and `runtime-cooperation: unserviced` alongside `max-ack`: the latter starts
-when input is sampled, not when a physical button was first pressed. This test
-does not certify sub-frame focus movement or physical-device latency.
+Live-page scenarios and what each must show:
 
-`runtime-cancel-live` uses the same fixture to verify Circle acknowledgement
-and safe runtime cancellation. `wikipedia-navigation-live`, with
-`--url https://en.wikipedia.org/wiki/Main_Page`, instead tests actual focus
-and navigation-menu activation. Its `-page` commands wait for the committed
-page's paint, but deliberately do **not** wait for background resources.
-Ordinary commands retain the stricter idle gate; `-live` commands may advance
-inside a cooperative checkpoint, whereas `-page` commands never do. This does
-not make the initial provisional navigation preview into an interactive DOM.
-Record foreground/idle separation, focus-tail timings, and lifecycle coverage
-with raw journey logs outside the repository; rerun live scenarios when page
-structure changes instead of treating investigation captures as fixtures.
-The focused host `tilefinch-browser-engine-tests --deferred-startup-only`
-checks link/section interaction while ordinary images are pending, source and
-subtree replacement between pumps, and cancellation/teardown ownership.
-Inspect all three captured frames as well as the visible/distinct focus gates
-and pending-task evidence. `tilefinch-focus-feedback` measures an accepted
-focus publication from the frame's input sample, including a repaint that
-finishes in later render slices. It requires a newer completed engine frame,
-the same navigation generation, and a successful display publication. A
-superseded input is reported as incomplete, not a zero-latency sample. A later marked screenshot
-includes intervening runtime and frame scheduling and is not that latency.
-
-Focus dispatch also exposes a `page-focus-feedback` presentation checkpoint
-before author focus handlers can mutate the document. The PSP can show an
-onscreen target's native ring over the incumbent framebuffer there; offscreen
-targets still use the ordinary reveal and bounded raster path. This is early
-visual acknowledgement, not completed author styling. Focus actions use the
-same owner-thread supervision as activation so cursor, Triangle, and Select
-remain serviced at subsequent safe points. The host
-`tilefinch-browser-engine-tests --background-interruption-only` checks that
-feedback precedes the handler, the handler runs once, and native menus remain
-usable. It also covers optional image-relayout refusal and shell retirement.
-
-`youtube-results-focus-live`, with a normal provider results URL, sends five
-Down presses starting at the first committed paint, before thumbnails finish.
-Inspect `result-next`, `result-below-fold`, and `results-filled`: the selected
-card and scroll position must change before images arrive and remain stable
-afterward. The receiver golden pins input delivery, **not** visual correctness.
-For authored outlines, `visible=0` in the native focus probe means the native
-fallback outline is hidden; inspect the composed CSS outline in the capture.
-Input completion updates retained damage, not framebuffer pixels. The PSP
-focus path must complete bounded frame preparation and refresh its views
-before publishing and clearing dirty state. Cached tiles do not consume
-raster-work slots, but still obey the slice deadline and viewport bound.
-
-If an isolated background PPSSPP launch hangs before PSP boot on macOS, sample
-the process before blaming the EBOOT. PPSSPP 1.20.4's OpenGL path can block in
-`Cocoa_GL_SwapWindow` while the window is occluded. The safe launcher accepts
-`--graphics=vulkan`; the input-script runner exposes the same choice with
-`TILEFINCH_PPSSPP_GRAPHICS=vulkan` (default `opengl`). The runner sets both
-the command-line option and append-config `GraphicsBackend` consistently
-(OpenGL 0, Vulkan 3); the environment variable alone does not prove Vulkan ran.
-Verify Vulkan initialization in PPSSPP's own log, plus a fresh `Booted` line
-and current validation output. Keep the actual host graphics backend identical
-for A/B captures, without foregrounding the window.
-This is an emulator-window workaround, not a PSP rendering change.
-
-With the same loopback fixture server, `section-disclosure-live` and
-`--url http://127.0.0.1:8779/cooperative-disclosure.html` exercise opening and
-closing 200 paragraphs while timers remain pending. Inspect `before`,
-`expanded`, and `collapsed` captures and `tilefinch-control-activation` timings.
-This isolates disclosure layout from a live site's stylesheet and network;
-it is not a substitute for the actual article section test:
+| Scenario | Start URL | Inspect |
+|---|---|---|
+| `section-disclosure-live` | `http://127.0.0.1:8779/cooperative-disclosure.html` | `before`, `expanded`, `collapsed` captures and `tilefinch-control-activation` while 200 paragraphs open and close with timers pending |
+| `wikipedia-article-section-live` | an article with a `#History` fragment | native pointer target `id=History`; the last `section-*` capture shows History prose, not just a focus box; at normal emulator speed, activation at most 1.25 s, flow layout at most 750 ms, and no resource-rebuilding relayout |
+| `youtube-results-focus-live` | a provider results page | `result-next`, `result-below-fold`, `results-filled`: the selected card and scroll move before thumbnails arrive and stay put afterward |
+| `youtube-detail-poster-live` | a watch page | `poster-ready`: the play card holds the downloaded poster after idle work; compare `tilefinch-adapter-commit` resource time apart from transport time (no video plays) |
 
 ```sh
-PPSSPP=/absolute/path/to/PPSSPPSDL scripts/run-ppsspp-input-script.sh \
-  --script wikipedia-article-section-live \
+scripts/run-ppsspp-input-script.sh --script wikipedia-article-section-live \
   --url 'https://en.wikipedia.org/wiki/PlayStation_Portable#History' --runs 2
 ```
 
-This uses 15 R-trigger page-down presses, nub movement and Cross on the
-History heading, then one more page-down to capture the revealed prose,
-while background work may still be pending. The runner requires native
-pointer-target `id=History`, not just successful input delivery. Inspect the
-three `section-*` captures: the last must show History prose, not merely a
-focus box. Live site layout changes can invalidate the cursor route; update
-it only after inspecting the page. `tilefinch-control-activation` measures
-the receiver; `tilefinch-control-layout` reports its final layout phases and
-cumulative full/fast relayout counts. A zero phase counter can mean that
-instrumentation is unavailable, not that the work was free.
-At normal emulator speed this scenario requires activation at most 1.25 s,
-flow layout at most 750 ms, and no resource-rebuilding relayout. The optional
-host-only `TILEFINCH_DISABLE_ANCESTOR_CACHE=1` switch disables layout-scoped
-selector caches for timing comparisons; it is not a shipping preference.
+A receiver golden proves input delivery and script completion, not visual
+correctness, so read the captures. Live layouts change: update a cursor
+route only after inspecting the page, and keep raw journey logs outside the
+repository. A zero layout-phase counter can mean instrumentation is
+unavailable, not that the work was free. The host-only
+`TILEFINCH_DISABLE_ANCESTOR_CACHE=1` disables layout-scoped selector caches
+for timing comparisons.
 
-For the provider detail page, use `--script youtube-detail-poster-live` with
-a current YouTube watch URL. Inspect `poster-ready`: the reserved play card
-must contain the downloaded poster after idle work, not just a play glyph.
-The receiver golden proves script completion, not image content. Compare
-`tilefinch-adapter-commit` resource time separately from variable transport
-time. No video is played by this scenario.
+`tilefinch-focus-feedback` measures an accepted focus publication from the
+frame's input sample, including a repaint that finishes in later render
+slices; it requires a newer completed frame, the same navigation generation,
+and a successful display publication, and reports a superseded input as
+incomplete. A later marked screenshot includes runtime and frame scheduling
+and is not that latency.
 
-For a deterministic PPSSPP pressure bracket, set
-`TILEFINCH_PPSSPP_CPU_MHZ=166` or `111` when invoking
-`scripts/run-ppsspp-input-script.sh`. The harness writes PPSSPP 1.20's
-canonical `[CPU] CPUSpeed` setting and defaults to `0` (normal emulation).
-`TREADLINE_CPU_MHZ` remains a compatibility alias for older local runners.
-Always inspect the isolated run's generated `ppsspp.ini` before trusting a
-new clock experiment: the obsolete `LockedCPUSpeed` spelling is silently
-ignored by current PPSSPP builds.
+`TILEFINCH_PPSSPP_CPU_MHZ=166` or `111` gives a deterministic pressure
+bracket (the default `0` is normal emulation); the runner writes PPSSPP's
+`[CPU] CPUSpeed` setting, so check the run's generated `ppsspp.ini` before
+trusting a new clock experiment.
 
-### Staging games on a PSP without stale assets
+If a background PPSSPP launch hangs before PSP boot on macOS, check PPSSPP's
+own log for a fresh `Booted` line before blaming the EBOOT, and retry with
+`TILEFINCH_PPSSPP_GRAPHICS=vulkan` (default `opengl`); the OpenGL path can
+block while the window is occluded. The runner sets both the command-line
+option and `GraphicsBackend` in the appended configuration, so confirm Vulkan
+initialization in PPSSPP's log rather than trusting the variable. Keep the
+backend identical across A/B captures. This is an emulator-window workaround,
+not a PSP rendering change.
 
-An example directory is the only authored source of its game. A PSP test can
-nevertheless involve two other copies: a temporary HTTP staging tree and an
-installed, integrity-protected offline snapshot. Rebuilding Tilefinch,
-regenerating its JavaScript bootstrap, or loading a new browser PRX does not
-update either copy. In particular, changing only an `index.html` query does
-not invalidate separately cached JavaScript, CSS, or images.
+### Canvas and WebGL game qualification
 
-Run the focused host lane above first. For a direct network-backed device run,
-use the content-addressed staging helper. It hashes the complete authored tree,
-copies it to an immutable directory, verifies an existing directory before
-reuse, and writes the exact digest-bearing document URL to the validation
-`boot.cfg`. Because the digest is part of the directory, every subresource gets
-a fresh URL when any authored byte changes:
+The [WebGL authoring guide](WEBGL.md) defines the PSP profile this lane
+qualifies. The lane exercises a Canvas paddle/ball loop, indexed WebGL,
+point/line/triangle depth parity, uniform snapshots, packed-wire boundary
+refusal, page-visibility suspension, Gamepad sampling, drawing-buffer limits,
+pixel readback, object deletion, and invalid buffer/index ranges. It runs the
+installable `examples/prism-break-3d/` game through physics, collision, level
+transition, multiball, power-up, particle, and dynamic-mesh scenarios, and
+`examples/treadline-arena/` through the fixtures described in
+[Treadline Arena qualification](../examples/treadline-arena/QUALIFICATION.md),
+which also covers its harness API, long soak, visual QA, and staging a game on
+a PSP.
 
 ```sh
-scripts/stage-psp-game.sh \
-  --source examples/treadline-arena \
-  --stage-root /tmp/tilefinch-game-stage \
-  --base-url http://HOST_LAN_IP:8770 \
-  --boot-config build-preset-psp-validation/boot.cfg \
-  --name treadline \
-  --query 'qualification=long-soak&profile=ordinary-cadence'
-python3 -m http.server 8770 --bind HOST_LAN_IP \
-  --directory /tmp/tilefinch-game-stage
+cmake --build build-preset-release \
+  --target tilefinch-canvas-webgl-conformance-tests
+ctest --test-dir build-preset-release \
+  -R '^tilefinch-canvas-webgl-conformance-tests$' --output-on-failure
 ```
 
-The helper prints the full tree digest and final URL. Preserve that output with
-the device log: it is the revision identity for the run. It also selects the
-Game Profile's bounded 512 KiB per-script envelope in the validation boot
-configuration, so a direct device run and an installed offline game admit the
-same authored package. Never edit a staged
-directory. If its contents no longer match the marker, the helper refuses it
-instead of silently testing a mixed revision. It also records a managed binding
-beside `boot.cfg`; `scripts/psplink-device.sh` rehashes and restages the current
-source automatically before every subsequent memory or slot load. Pointing
-`boot.cfg` at another URL disables that binding without rewriting the new task.
-Leave `input_script=` empty for a manual run, exit any resident Tilefinch
-instance normally with HOME, and then use `scripts/psplink-device.sh memory`.
-Do not force-unload a live browser module.
-
-Use the same helper for Prism Break, Treadline Arena, and every other packaged
-game. Do not stage with an ordinary `cp`, reuse a stable game directory, or
-claim a revision from the EBOOT alone. An end capture showing a title, pause,
-Deploy, or completion panel invalidates a gameplay soak even if the WebGL
-counters look healthy; it measured the overlay, not sustained gameplay.
-
-Prove the loaded revision instead of relying on the screen alone:
-
-- the HTTP server must record PSP requests for `index.html`, `game.css`, and
-  `game.js` from the device address;
-- the requested directory digest must match the helper's `stage-digest` output;
-- `tilefinch-validation.txt` must report one discovered and loaded game script,
-  no JavaScript error, and an interactive-ready page;
-- capture a PSPLink screenshot before input, then press Play and verify the
-  Page-controls notice and Start+Select exit;
-- when measuring cadence, use the committed input script and its explicit
-  qualification URL rather than the manual staging configuration.
-
-An installed copy in **Library → Saved** is a sealed snapshot. Source or
-staging changes do not mutate it. Open the current network-backed page, choose
-**Page tools → Install offline app**, confirm that the preview says Update or
-Reinstall and lists the expected resources, and complete that operation before
-testing the library entry. An integrity error means the stored document and
-resource pack no longer agree; never repair it by replacing individual files.
-Uninstall and reinstall the whole snapshot. Finally, verify offline launch with
-the network unavailable—the launch itself must not associate Wi-Fi.
-
-## PSP components
-
-### Optional ARK-4 XMB redirect
-
-The XMB redirect is a small kernel PRX with no dependency on the browser
-engine. Build it explicitly with the PSP toolchain:
+A bounded 600-frame allocation soak is opt-in:
 
 ```sh
-PSPDEV=/path/to/pspdev cmake --preset psp
+TILEFINCH_WEBGL_SOAK_FRAMES=600 \
+  build-preset-release/tilefinch-canvas-webgl-conformance-tests
+```
+
+It reports the QuickJS heap before, after, and at its high-water mark with
+the number of charged allocations; the retained heap must stay within 256 KiB
+of its pre-soak value after collection.
+
+The synthetic pages in `tests/fixtures/canvas-webgl-games/` contain no
+third-party game code and run in the host lab and the isolated PPSSPP
+localhost harness. PPSSPP proves lifecycle, rendering, and cleanup, but its
+software timing does not replace device qualification.
+
+Device WebGL cadence runs use `tests/input-scripts/webgl-game-cadence.txt`
+with Prism's `?qualification=ordinary`, `?qualification=heavy`, and
+`?qualification=profile` URLs. The first mark resets validation-only counters
+after warm-up. The profile mode splits the example's JavaScript cost into
+update, geometry, upload, command setup, and HUD work. The terminal report
+separates author callback time from native WebGL time and records
+canvas-presentation median, p95, maximum, and 60/30 Hz deadline counts. These
+probes are absent from shipping builds and expose no finer clock to pages.
+
+#### Treadline visual QA: camera track and recorded gameplay
+
+The camera-track sweep, recorded PPSSPP gameplay, reference screenshots, and
+milestone review are in
+[Treadline Arena qualification](../examples/treadline-arena/QUALIFICATION.md#treadline-visual-qa-camera-track-and-recorded-gameplay).
+
+### Optional PSP components
+
+**ARK-4 XMB redirect.** A small kernel PRX with no engine dependency:
+
+```sh
 cmake --build build-preset-psp --target tilefinch-xmb-redirect
 ```
 
-The result is
-`build-preset-psp/xmb-redirect/tilefinch_xmb.prx`. The release install-tree
-target stages the same file under `TILEFINCH/OPTIONAL/`; it is never placed in
-an A/B application slot or an in-app update package. Its module-start hook is
-name-based (`htmlviewer_plugin_module`) rather than firmware-offset-based,
-chains the previously registered ARK handler, and signals an already-waiting
-worker rather than allocating inside ARK's pre-start callback. The worker
-requires an XMB confirmation press, honors the L-trigger bypass, and waits a
-bounded interval for Sony's module start to finish before LoadExec. Incidental
-HTML-viewer loads during XMB startup, a missing launcher, controller-read
-failure, worker setup failure, or LoadExec failure all leave Sony's browser
-available.
+It writes `build-preset-psp/xmb-redirect/tilefinch_xmb.prx`; the install tree
+stages it under `TILEFINCH/OPTIONAL/`, never in an A/B slot or update
+package. Its hook is name-based (`htmlviewer_plugin_module`), chains the
+previous ARK handler, requires an XMB confirmation press, honours the
+L-trigger bypass, and leaves Sony's browser available on any failure.
 
-### Lazy PSP speech engine
-
-The ordinary `psp` build stages `tilefinch-voice.prx` beside the browser
-EBOOT. PocketSphinx and its model parser are **not** linked into the browser.
-The native loader uses the installed browser slot directory, never a page URL
-or a model-provided path. Enabling the experimental preference reserves the
-existing recognition working set; the PRX is first loaded when voice input is
-actually requested. Its code/data has a separate 768 KiB Budget reservation
-and a checked segment-size limit. There is no second newlib heap: allocations
-are forwarded to the browser heap under the voice reservation. Ordinary engine
-eviction (including navigation/pressure) destroys the engine, then stops/unloads
-the idle component and releases its separate code/data reservation. The next
-voice request reloads it. Disabling voice additionally releases the recognition
-working-set reservation. Failed unloads retain their module identity and charge.
-
-A positively observed killed decoder is different: its heap and libc state may
-be inconsistent. The module owner enters process-lifetime quarantine, clears
-the callable API, and refuses both reuse and stop/unload. Keep both reservations
-charged, including through preference changes and shutdown; only process exit
-reclaims that state. Never run PRX `module_stop`/stdio cleanup on this path.
-
-The optional signed voice-model download stays model-only. Browser updates
-and first-install trees carry the matching engine PRX with their A/B slot.
-Do not deploy only EBOOT.PBP when testing this change.
-
-Host loader tests exercise ABI refusal, memory refusal, missing modules,
-repeated use, and stop/unload failures. For actual PSP/PPSSPP module and model
-initialization, build the opt-in named target:
+**Voice engine.** The ordinary `psp` build stages `tilefinch-voice.prx` beside
+the browser EBOOT; PocketSphinx is not linked into the browser. The PRX loads
+from the installed slot directory on the first voice request, under its own
+768 KiB code/data reservation with allocations forwarded to the browser heap,
+and is unloaded with its reservation released when the engine is evicted. A
+decoder observed killed is quarantined for the process lifetime: never run
+its `module_stop` or stdio cleanup. Updates carry the engine PRX with the
+slot, so never deploy only `EBOOT.PBP` when testing it. For real module and
+model initialization under PPSSPP or on a PSP:
 
 ```sh
 cmake --build build-preset-psp --target psp-voice-component-probe -j8
 ```
 
-Stage `voice-probe/EBOOT.PBP`, `tilefinch-voice.prx`, and `voice-model/` together
-in an isolated game directory. Launch through `scripts/launch-ppsspp-safe.sh`
-with an isolated `HOME`; it preserves that HOME through background
-LaunchServices. `voice-probe.txt` records three load/create/cancel/destroy/
-unload cycles, Budget ownership and real newlib heap use. It has no microphone
-or audio output. This catches module-local cwd initialization and newlib
-floating-point-parser freelist leaks that a successful link cannot detect.
-Real microphone recognition still requires a physical PSP.
+Stage `voice-probe/EBOOT.PBP`, `tilefinch-voice.prx`, and `voice-model/`
+together in an isolated game directory and launch through
+`scripts/launch-ppsspp-safe.sh` with an isolated `HOME`. `voice-probe.txt`
+records three load/create/cancel/destroy/unload cycles with Budget ownership
+and newlib heap use. Microphone recognition still needs a physical PSP.
 
 ### Optional PSP software decoder
 
 H.264 High-profile playback, and Baseline/Main streams the firmware refuses
 (more than three reference frames, B-frame pyramids; CABAC or CAVLC,
-progressive 8-bit 4:2:0 only), uses a replaceable, user-built PRX so the official
-EBOOT and release archives remain independent of FFmpeg decoder binaries.
-Baseline/Main MP4 and MPEG-TS HLS with AAC-LC use the PSP firmware backend,
-including compatible active YouTube live streams and premieres.
-Prepare the narrow LGPL n8.1.2 build once, then point an opt-in PSP configure
-at that ignored workspace:
+progressive 8-bit 4:2:0 only), use a replaceable, user-built PRX, so the
+official EBOOT and release archives stay independent of FFmpeg decoder
+binaries. Other Baseline/Main MP4 and MPEG-TS HLS with AAC-LC use the
+firmware backend. Prepare the narrow LGPL FFmpeg build once, then point an
+opt-in PSP configure at that ignored workspace:
 
 ```sh
 PSPDEV=/path/to/pspdev \
@@ -1465,290 +510,48 @@ PSPDEV=/path/to/pspdev cmake --preset psp \
 cmake --build build-preset-psp --target tilefinch-swdec-bundle
 ```
 
-The preparation script checks out the exact upstream tag, applies the
-committed patch, enables only H.264, `aac_fixed`, and the H.264 parser, and
-can optionally consume device-trained profiles by passing their directory as
-the second argument. Without them the component is compatible but may be
-materially slower near the PSP's real-time limit.
+The script checks out the pinned upstream tag, applies the committed patch,
+and enables only H.264, `aac_fixed`, and the H.264 parser. A directory of
+device-trained profiles as its second argument makes the component faster
+near the PSP's real-time limit.
 
-The target writes a three-file add-on directory at
-`build-preset-psp/tilefinch-swdec-addon/`: `tilefinch-swdec.prx`, the resident
-`swdec-meload.prx` helper, and `component-info.txt`. Copy all three into
-`PSP/GAME/TILEFINCH/components/swdec/`; do not put them in `slot-a` or
-`slot-b`. The ordinary browser EBOOT always contains the bounded loader, so
-it does not need to be replaced with a custom EBOOT. Signed app updates leave
-the shared component directory untouched.
+The target writes `build-preset-psp/tilefinch-swdec-addon/`:
+`tilefinch-swdec.prx`, the resident `swdec-meload.prx` helper, and
+`component-info.txt`. Copy all three into
+`PSP/GAME/TILEFINCH/components/swdec/`, not into `slot-a` or `slot-b`. The
+ordinary EBOOT already contains the loader, and signed app updates leave the
+component directory alone. `component-info.txt` records the loader ABI; when
+an update expects a different one, the update UI warns **Decoder rebuild
+needed**, and all three files are replaced together. A version change alone
+needs no rebuild.
 
-The decoder PRX (about 1.9 MiB once loaded) lives in user-partition memory
-outside the browser's heap. At startup, before the C library claims the
-heap, the browser looks for `components/swdec/tilefinch-swdec.prx`: when it
-is there, the browser leaves 4 MiB of the partition outside its heap instead
-of 2 MiB, so the decoder can load beside the PSP's own firmware modules
-(`src/psp_heap_reserve.c`). Without the add-on nothing changes, so a browser
-that never uses it gives up no heap; with it, the heap is 2 MiB smaller.
-Install or remove the add-on with the browser closed. The validation boot
-line reports the choice as `heap-threshold=4096KB swdec-reserve=1`.
+The decoder PRX lives in user-partition memory outside the browser heap. When
+the add-on is installed, the browser leaves 4 MiB of the partition outside its
+heap instead of 2 MiB at startup (`src/psp_heap_reserve.c`), so the heap is
+2 MiB smaller; without it nothing changes. Install or remove the add-on with
+the browser closed. The validation boot line reports
+`heap-threshold=4096KB swdec-reserve=1`.
 
-`component-info.txt` records the loader ABI. Every browser update manifest
-also carries the ABI it expects. The update UI warns **Decoder rebuild
-needed** when an installed add-on differs; rebuild the bundle with the new
-source and replace all three files together. No rebuild is needed merely
-because the Tilefinch version changes.
-Loading the component charges the page's memory budget nothing (its code
-is outside the heap, above). A software-decoded stream's open charges its
-working set: the decoder's picture arena, sized for the reference pictures
-the stream's SPS declares (at least 4, at most 16, and 16 when the SPS
-cannot be read; a later SPS that declares more ends playback with a
-reference-frame message rather than overrunning the arena), the 25-slot
-picture ring and the audio arena -- about 10 MB for a 416x234 stream with
-5 reference frames, plus a 512 KiB playback packet. When the page holds
-that much, it gives memory back one step at a time and the open is tried
-after each: first optional memory (staged fonts, a collected script heap,
-caches, resident tiles), then the page's scripts, as when a script runs out
-of memory. The page keeps its DOM and position, and when the player closes
-it says **PAGE SCRIPTS STOPPED: NOT ENOUGH MEMORY**. All stream buffering
+Loading the component charges the page nothing. A software-decoded stream's
+open charges its working set: the picture arena, sized for the reference
+pictures the stream's SPS declares (at least 4, at most 16, and 16 when the
+SPS cannot be read; a later SPS declaring more ends playback with a
+reference-frame message), the 25-slot picture ring, the audio arena, and a
+512 KiB playback packet. When the page holds too much, it gives memory back a
+step at a time and the open is retried after each: optional memory first
+(staged fonts, a collected script heap, caches, resident tiles), then the
+page's scripts. The page keeps its DOM and position and, when the player
+closes, says **PAGE SCRIPTS STOPPED: NOT ENOUGH MEMORY**. Stream buffering
 stays in RAM.
 
-`tools/swdec-bench/crc-gate.sh` checks the decoder bit for bit against host
-FFmpeg under PPSSPP (CAVLC and CABAC clips with five reference frames at
-416x234 and 426x240, a 16-reference High clip at 432x240, and clips with 4x4
-partitions, several slices per picture and weighted prediction; every clip
-is decoded four times: as is, with chroma predicted by the parser as on the
-Media Engine, with the parser stopping part-way through rows so
-reconstruction predicts their rest, and that again with the decoder closed
-mid-stream and reopened twice, after 37 and 61 access units, as a seek's
-reset and a cancel do), and that
-each clip's decoder-arena peak fits the arena the player sizes for it;
-CTest runs it as `tilefinch-swdec-crc-tests` when
-configured with `-DTILEFINCH_SWDEC_CRC_GATE=ON` and
-`-DTILEFINCH_SWDEC_CRC_SOURCE_DIR=` a prepared workspace. Prepare a fresh
-workspace whenever the committed FFmpeg patch changes.
-
-The diagnostic FFmpeg build (`libs/asm22-diag`) also keeps the motion
-compensation kernels as they were before the shared-pass hv family
-(`swdec_mc_reference`) and can keep every macroblock on FFmpeg's generic
-reconstruction path as the `CONFIG_SMALL` build had it (`swdec_mb_generic`),
-and can emulate the fixed 21x21 edge regions, carry whole-cache jobs, run
-chroma MC one plane per call and make the no-op prefetch calls as before
-(`swdec_edge_full`, `swdec_job_full`, `swdec_chroma_split`,
-`swdec_prefetch_calls`), for same-binary A/B runs: a bench `decode` line
-takes `mc=ref`, `mb=generic`, `edge=full`, `job=full`, `chroma=split` and
-`prefetch=calls`, and on the device a validation browser passes
-`validation_swdec_reference=` from `boot.cfg` (a mask: 1 old kernels, 2
-generic path, 4 full edge regions, 8 full jobs, 16 split chroma, 32 prefetch
-calls, 64 chroma prediction in reconstruction rather than on the Media
-Engine, 128 the chroma qualification replay) to the validation add-on in a
-longer start block
-(same component ABI; the browser logs `tilefinch-swdec: validation flags`). A validation add-on also logs
-`swdec-recon-cpu:` and `swdec-recon-kernels:` when a stream closes: where the
-decode thread's time goes per output picture, with the kernels of one
-macroblock in eight timed by the system clock (wall time, so read the
-kernel buckets as shares), and `swdec-recon-qpel:`, the luma
-motion-compensation calls by block size and quarter-sample position. The
-release libraries have none of this.
-
-Browser-only mask bits select the old block audio clock (256), old
-presentation scheduling (512), or a nine-picture usable reservoir (1024).
-Use 1536 versus 1024 for a capacity-matched presentation comparison. The
-limit is applied after ordinary allocation and recovery; unused allocated
-slots remain owned until teardown. Reject a run unless its window identity
-reports exactly nine usable slots and matching memory-bank placement, and
-keep the memory ceilings unchanged. `allocated` reports physical ownership.
-
-With mask bit 128 a validation add-on also runs the chroma-on-the-Media-
-Engine qualification replay (`src/swdec/swdec_chroma_replay.c`): one macroblock row in four is
-recorded as the chroma prediction operations reconstruction performed, then
-replayed through the main core's kernels and through private scalar kernels
-on the Media Engine (from its idle hook), and both are compared with the
-decoder's own prediction. `swdec-chroma-replay:` reports rows, mismatched
-macroblocks and the per-row cost on each side; on the bench (no Media
-Engine) the scalar kernels run on the main core.
-
-With the Media Engine parsing, it also predicts each inter macroblock's
-chroma (both lists, averaging, explicit and implicit weights, edge
-extension) with scalar kernels while it waits for the main core: for a free
-row buffer (going back to parsing as soon as one is free) and while draining
-a slice. It works through the published rows macroblock by macroblock,
-writes each prediction into the macroblock's job through the uncached alias
-and publishes how many of the row are done. Reconstruction, at an inter
-macroblock, copies a done prediction before adding the residual and skips
-its own chroma motion compensation; otherwise it claims the rest of the row
-and predicts as before, waiting (bounded) only for a macroblock the Media
-Engine is part-way through. Without the Media Engine reconstruction predicts
-as before. A validation add-on logs `swdec-chroma-me:` when a stream closes:
-inter macroblocks predicted by the Media Engine and by the main core, the
-macroblocks waited for and the wait loop's iterations, and the rows the main
-core claimed the rest of. The replay records only rows whose chroma
-reconstruction predicts, so run it as 192 (bits 64 and 128).
-
-The browser draws the software decoder's 16-bit (PSP 5650) pictures with the
-graphics engine straight into the 16-bit page buffer, in 64-texel column
-slices, and collects the draw just before the buffer is latched rather than
-straight after the submit; the slot stays borrowed until then. Frames with
-visible chrome, slots above 0x0A000000, geometry without quads, and Sharp keep
-the software scaler. A validation browser takes `validation_swdec_present=`
-from `boot.cfg` for same-binary A/B runs (0 this path, 1 the software scaler,
-2 one sprite per quad, 3 synced straight after the submit) and logs
-`tilefinch-swdec-present:` every 100 pictures: engine and fallback counts,
-submit and residual wait time, displayed rate, and the CPU used by the
-presenting thread and the decode worker over the same window.
-
-A component built in a validation tree (`TILEFINCH_PSP_VALIDATION_LOG=ON`)
-also reports, when each stream closes, where its decoding time went:
-`swdec-stages:` gives the decoding thread's totals in microseconds (decode
-wall and run time, the Media Engine slice, sleeps waiting for parsed rows, the
-row stages, the frame tail, colour conversion), and `swdec-stages-me:` the
-Media Engine's CP0 Count ticks by exclusive phase (each tick belongs to the
-one phase the ME is in, so the shares add up to its running time; 64-bit
-totals), with each share next to the sampler's in brackets and how many
-agree within the sampler's interval (`clock=none` when the boot probe saw
-Count stand still; `probe=` gives its three attempts). `swdec-stages-occupancy:` needs no ME clock: the ME
-publishes its phase (idle, parse, deblock, wait, csc, audio, drain, off) and
-a kernel alarm on the main CPU samples it at random 0.5-2.5 ms intervals,
-reporting each share with its 95 % interval, the sample count and the
-alarm handler's own time. `swdec-stages-wait:` follows the decoding
-thread's waits for parsed rows: how often a wake found a new row, how long
-after the Media Engine published that row the thread ran again (ME Count
-put on the CPU clock by a ping before each slice), and how often other
-threads and interrupts preempted it. `swdec-stages-threads:` gives, for
-every eighth access unit, each thread's mean run time during the decode
-with a 95 % interval, the samples it left out because a thread clock could
-not be read, and what no thread accounts for. A shipping tree's component
-has none of this.
-
-`tilefinch-swdec-realtime:` counts `displayed` pictures once each:
-`repeats` are presents of a picture already shown (redraws), and fps-x10
-is computed from distinct pictures only. boot.cfg `validation_playback_ab`
-(validation builds) is a bit mask for playback A/B runs: 1 decodes at fixed
-full quality (no reduced decoding), so runs compare identical work; 2 keeps
-refreshing the page chrome state every frame while a player covers the
-page, as before that was deferred; 4 lets the picture ring fill with slots
-above 0x0A000000 (which the Media Engine and the graphics engine cannot
-read, so the main CPU converts and scales those pictures), as before the
-ring stopped at the low blocks; 8 makes the reduced quality rungs drop
-non-reference pictures (one in two or one in four) as before, instead of
-only skipping their deblocking; 16 restores the old software-video pacing
-and one-frame-ahead non-reference discard rule. Compare 17 against 1 for
-a same-binary, full-quality pacing comparison. `event=working-set-placed`
-gives `ring-high=high/placed/slots`.
-
-Software-decoder performance is scored on a steady-playback window fixed
-in advance (`src/swdec/swdec_window.h`): it opens on the first unique
-picture published 5 s after the first one and closes on the first
-published 30 s after it opened, so startup is reported apart and no window
-is picked after the fact. A picture counts once, when its buffer is
-published. A validation browser prints, for the last window of a video:
-`tilefinch-swdec-window-id:` (geometry, picture slots placed and above
-0x0A000000, slot size, quality switches, free budget and Media Engine
-pool), `tilefinch-swdec-window:` (unique pictures, redraws, the interval
-between them as median/p95/max in milliseconds, intervals held over 1.5
-frame periods, the three longest with the picture time that ended each,
-the audio clock's advance, buffering, seeks; `complete=0` when playback
-stopped first) and `tilefinch-swdec-window-work:` (access units submitted,
-pictures decoded and displayed, drops by reason, reduced-quality decodes,
-main, decode-worker and audio thread CPU, the worker's decode and
-conversion wall time, its idle gaps between jobs, audio blocks, underruns,
-output errors and gaps). All are differences over the window; nothing
-there is derived. With the diagnostic add-on the component also reports
-its stage figures for the same window between `swdec-window: when=start`
-and `when=end` lines (its close report then covers only what followed).
-
-A validation tree builds two add-ons: `tilefinch-swdec-addon`
-(diagnostics, for profiling) and `tilefinch-swdec-addon-release` (target
-`tilefinch-swdec-release-bundle`, no diagnostics, for acceptance runs).
-`tools/swdec-bench/window-pairs.sh` runs alternating baseline/candidate
-pairs of one recorded page through a device run wrapper with one add-on,
-records the binaries and lanes, and `window-pairs.py` scores the last
-window record of each log: fps from unique published pictures over the
-window's own span, frame-interval figures and holds, CPU per decoded
-picture and per second, the worker CPU the stage report leaves
-unexplained, where each lost picture went, and the acceptance checks
-(complete window, no reduced decodes, seeks, buffering, underruns or output
-errors, audio clock at normal speed). Lane medians are shown beside the
-runs, never sums or ratios across runs.
-
-Drops are disjoint. Units dropped before dispatch (late, skipped to a
-keyframe, queue full) never count as submitted; every submitted picture
-that was not displayed has exactly one reason (dropped late by the worker,
-no picture from the decoder, conversion refused, superseded by the
-presenter, still ready at the close), and the remainder is the work in
-flight at the window edges. A remainder beyond four pictures, or a negative
-reason, is an accounting error.
-
-Scoring is strict by default, for acceptance: a run counts only with all
-three window records, a closed window, passing checks, a closed ledger, a
-zero wrapper status, the binaries unchanged after the run and a log newer
-than the run start (`NAME-runs.txt` records each run). Invalid runs are
-listed with their reasons and left out of the medians, and the script exits
-nonzero when any run is invalid, when no run is valid, or when either lane
-has fewer valid runs than the pairs asked for.
-`BASE_ADDON_DIR` and `CAND_ADDON_DIR` install a different add-on bundle
-before each lane's runs, so two add-on builds can be compared on one
-browser binary: the identity file records both lanes' sha1s, and each run
-must have run on the shared browser and its own lane's add-on.
-`LOOSE=1` (`--loose`) scores whatever left a record, for profiling;
-`ALLOW_REDUCED=1` (`--allow-reduced`) accepts reduced decodes for
-adaptive-mode comparisons.
-
-That split is one switch, `SWDEC_DIAGNOSTICS` (`src/swdec/swdec_diag.h`).
-The preparation script builds the FFmpeg libraries twice: `libs/asm22`
-without diagnostics and `libs/asm22-diag` with them (the per-stage clock,
-the stage marks, the experimental and no-op deblocking kernels and their
-test hooks). A validation tree builds its component with
-`SWDEC_DIAGNOSTICS=1` against `libs/asm22-diag`, which adds the component's
-logging, Media Engine liveness and stack reports, fault injection, CPU audio
-cross-checks and the stage report; any other tree builds the release
-component against `libs/asm22` with none of it. The finer flags
-(`SWDEC_STAGE_DIAG`, `SWDEC_ME_DIAG`, `SWDEC_ME_DIAG2`, `SWDEC_SPIN_DIAG`,
-`SWDEC_ME_OFF`, `SWDEC_POISON`, and in FFmpeg `SWDEC_STAGE_TIMING` and
-`SWDEC_PIPE_VALIDATE`) fail the build without it, and a component linked
-against the other variant's libraries fails to link. The preparation script
-only accepts a pristine or exactly patched tree, so prepare a fresh output
-directory whenever the committed patch changes.
-
-### PSP transport dependencies
-
-The live-network PSP build also consumes project-owned, hash-pinned curl,
-Mbed TLS, and optional nghttp2 archives. Populate the ignored offline cache
-once before configuring a fresh PSP tree:
-
-```sh
-./scripts/fetch-psp-transport-deps.sh
-cmake --preset psp
-cmake --build --preset psp
-```
-
-`psp-http1` is the current-stack HTTP/1.1 comparison build;
-`psp-legacy-transport` is an explicit non-release SDK-stack escape hatch.
-See `docs/engineering/PSP_TRANSPORT.md` for provenance and validation.
-
-### PSP validation tree
-
-`build-preset-psp-validation` is not a preset. It is the `psp` preset
-configured into its own allowlisted directory with validation logging, and
-it is what the PPSSPP input-script, device-cost and latency scripts run:
-
-```sh
-export PSPDEV=/path/to/pspdev
-cmake --preset psp -B build-preset-psp-validation \
-  -DTILEFINCH_PSP_VALIDATION_LOG=ON
-cmake --build build-preset-psp-validation --target psp-browser-script
-```
-
-Like every `psp` configure it needs the transport cache above and, because
-`PSP_BROWSER_ENABLE_PSP_VOICE` defaults on, PocketSphinx. In a sandboxed or
-offline tree either add `-DPSP_BROWSER_ENABLE_PSP_VOICE=OFF` (the EBOOT then
-has no voice component) or pass
-`-DPSP_BROWSER_POCKETSPHINX_SOURCE_DIR=/path/to/pocketsphinx-5.1.1`; see
-[Dependencies](#dependencies) for the full list. Validation logging is slow
-and raises the `.text` ratchet to its validation limit; never ship this EBOOT.
+Checking, profiling, and comparing the decoder are in
+[Software-decoder diagnostics](engineering/SWDEC_DIAGNOSTICS.md).
 
 ### PSP compiler-hardening candidate
 
-The real GCC 15.2.0/newlib PSP toolchain supports both
-`-fstack-protector-strong` and `_FORTIFY_SOURCE=2`. The candidate preset keeps
-those flags separate from the shipping preset until their device cost is
-qualified:
+The PSP toolchain supports `-fstack-protector-strong` and
+`_FORTIFY_SOURCE=2`. The candidate preset keeps them out of the shipping
+preset until their device cost is qualified:
 
 ```sh
 cmake --preset psp-hardened
@@ -1756,79 +559,155 @@ cmake --build build-preset-psp-hardening \
   --target tilefinch_core psp-browser-fixture psp-browser-script
 ```
 
-The cross-build measurement used the same source revision and MinSizeRel
-configuration for every row:
+Its build enforces the same `.text` and hot-function ratchets as `psp`.
+Newlib initializes one process-wide fixed stack guard, so this is corruption
+detection and exploit friction, not a randomized canary. Do not enable it in
+the `psp` preset from build evidence alone: promotion requires a real PSP
+boot, navigation, and media smoke, a before/after input and frame-cadence
+comparison, and the normal named-target cross-build.
 
-| PSP C hardening | `.text` | Delta from baseline | `.rodata` |
-| --- | ---: | ---: | ---: |
-| none | 3,648,612 B | — | 1,840,932 B |
-| fortify level 2 | 3,649,688 B | +1,076 B (+0.03%) | 1,841,204 B |
-| stack protector strong | 3,729,684 B | +81,072 B (+2.22%) | 1,841,188 B |
-| combined candidate | 3,730,744 B | +82,132 B (+2.25%) | 1,841,252 B |
+## Dependencies and QuickJS
 
-The combined image has roughly 2,012 protected return sites and remains below
-the ordinary `.text` ratchet. The hot-function size ratchets
-also pass. Newlib initializes one process-wide fixed stack guard
-rather than a random per-process guard, so this is useful corruption detection
-and exploit friction, not a desktop-grade randomized canary.
+### Dependencies
 
-Do not turn the candidate on in the `psp` preset from build evidence alone.
-Promotion requires a real PSP boot/navigation/media smoke, a before/after
-input and frame-cadence comparison, and the normal named-target cross-build.
-This avoids charging every protected call on the 333 MHz CPU without measuring
-the effect. The `psp-hardened` preset exists so that device comparison is
-reproducible rather than dependent on hand-edited C flags.
+The first configure downloads pinned archives and verifies their hashes:
+
+| Dependency | Fetched for |
+|---|---|
+| Lexbor, stb, NanoSVG, DejaVu fonts, libwebp | every build |
+| FreeType, brotli | `PSP_BROWSER_ENABLE_WEB_FONTS` (default on) |
+| WAMR | PSP builds, and host builds with `PSP_BROWSER_ENABLE_HOST_WEBASSEMBLY` (default on); `PSP_BROWSER_WAMR_SOURCE_DIR` supplies a local tree |
+| QuickJS-NG | only with `PSP_BROWSER_USE_BELLARD_QUICKJS=OFF` |
+| PocketSphinx 5.1.1 | the `psp` presets, for the voice component |
+
+The vendored Bellard QuickJS in `third_party/quickjs` is the default engine.
+The PSP transport archives are not fetched by CMake; see
+[PSP transport dependencies](#psp-transport-dependencies).
+`PSP_BROWSER_VENDOR_DIR` can supply prepared dependencies in its documented
+layout, and individual FetchContent sources can be supplied with
+`FETCHCONTENT_SOURCE_DIR_<NAME>`. A checksum mismatch is a dependency or
+configuration failure; never bypass it.
+
+```sh
+cmake --preset release -DPSP_BROWSER_VENDOR_DIR=/path/to/vendor
+```
+
+For an offline configure, populate each tree's `_deps/*-src` from an earlier
+configure and pass `-DFETCHCONTENT_FULLY_DISCONNECTED=ON`. A fresh `psp` tree
+without `_deps/pocketsphinx-src` can point
+`-DPSP_BROWSER_POCKETSPHINX_SOURCE_DIR=/path/to/pocketsphinx-5.1.1` at an
+unpacked source tree (the configure patches it in place), or leave voice out
+with `-DPSP_BROWSER_ENABLE_PSP_VOICE=OFF`.
+
+### QuickJS configuration
+
+QuickJS is vendored in `third_party/quickjs` with the repository's changes
+applied, and its two engine files are fingerprint-pinned at configure time.
+Engine edits go into that tree and update the pins in
+`cmake/TilefinchDependencies.cmake`; `third_party/quickjs/README.md` lists the
+carried changes and the update procedure. Every configure selects the
+vendored engine; `-DPSP_BROWSER_USE_BELLARD_QUICKJS=OFF` builds against
+pinned QuickJS-NG instead. Use a separate raw CMake tree for an unpatched
+upstream comparison.
+
+The portable configuration enables one source-neutral interpreter shortcut:
+a two-instruction function that only returns one captured value returns it
+without constructing an unobservable frame. For an exact upstream dispatch
+control, configure a fresh tree with
+`-DPSP_BROWSER_QUICKJS_CAPTURE_GETTER_FASTPATH=OFF`; that control is built
+from a binary-directory copy of the engine with the layer reversed and checked
+against a pinned fingerprint, and the vendored tree is never modified.
+
+The JavaScript bootstrap is generated from `src/bootstrap/*.js`; after
+editing it, regenerate as described in
+[the bootstrap README](../src/bootstrap/README.md#regenerating).
+
+### Property-fault diagnostic
+
+An opt-in, lab-only property-read diagnostic is applied, like the other lab
+variants, to a binary-directory copy of the engine; ordinary builds compile
+it out. The tree below is not a preset, so it needs the explicit allowance:
+
+```sh
+cmake -S . -B build-property-trace -DCMAKE_BUILD_TYPE=Debug \
+  -DPSP_BROWSER_JS_PROPERTY_FAULT_TRACE=ON -DTILEFINCH_ALLOW_BUILD_DIR=ON
+cmake --build build-property-trace -j8
+TILEFINCH_TRACE_JS_PROPERTY_FAULTS=32 \
+  ./build-property-trace/psp-browser-interactive-lab ...
+```
+
+The value is 1–128 records. Each gives the source position, function,
+bytecode position and opcode, base and key types, property preview,
+arguments, locals, and nearby bytecode. `absent` records only failed
+JavaScript `in` checks; `fault` records only accesses whose base is `null` or
+`undefined`, isolating the operation that throws. Use it to reduce a failure
+to the first invalid value, never to rewrite third-party source or invent
+browser capabilities.
+
+### JavaScript heap composition
+
+Host builds compile a read-only heap walk, `JS_ComputeMemoryDetail`
+(`CONFIG_TILEFINCH_HEAP_DETAIL`, set for every non-PSP build in
+`cmake/TilefinchDependencies.cmake`; no PSP image compiles it).
+`TILEFINCH_TRACE_JS_HEAP_DETAIL=1` prints a census of a realm at the first
+safe point after its allocator refuses a request, at every 4 MiB high-water
+step (`TILEFINCH_TRACE_JS_HEAP_DETAIL_STEP_KB`), and with each memory report.
+It covers allocator arenas and large blocks, every class with its property
+arrays and payload, each script's bytecode, lazy stubs, line tables and
+retained source, closures, instances per prototype, strings by size band,
+atoms, shapes, pending jobs, `Function.prototype.toString` calls, the Budget
+categories, and the refused request. `=gc` also collects after an OOM census
+and censuses again, answering whether a collection would have freed enough.
+Summarise a run directory (one subdirectory per page with `lab.log` and
+`lab.err`):
+
+```sh
+TILEFINCH_TRACE_JS_HEAP_DETAIL=1 ./build-preset-release/psp-browser-interactive-lab \
+  --url URL --psp-profile realistic --replay-http-response-keyed TRACE ... 2> run/page/lab.err
+python3 tools/jsmem_report.py run          # composition table, MB
+FILES=1 python3 tools/jsmem_report.py run  # plus top scripts and prototypes
+```
+
+Sizes are 64-bit host allocations: pointer-heavy rows (objects, shapes,
+closures, bytecode headers) are larger than on the PSP; text rows (source,
+strings, atoms) are the same.
 
 ## Source and target boundaries
 
-`include/tilefinch/` contains the exposed Tilefinch contracts. Most subsystem
-headers have a same-named implementation in `src/`; `budget_quickjs.h` is an
-intentionally header-only shared adapter. New
-frontend code should prefer `browser_engine.h`; direct subsystem headers remain
-available primarily for tests and the compatibility seams described in
-`ARCHITECTURE.md`.
+`include/tilefinch/` holds the exposed contracts. Most subsystem headers have
+a same-named implementation in `src/`; `budget_quickjs.h` is a header-only
+shared adapter. New frontend code should prefer `browser_engine.h`; direct
+subsystem headers remain mainly for tests and the compatibility seams in
+[ARCHITECTURE.md](ARCHITECTURE.md).
 
-`tilefinch_core` contains engine/subsystem implementations only. The entry points
-`main.c`, `interactive_main.c`, and `failure_recovery_main.c` are separate
-frontend or diagnostic targets. They and the host-portable `psp_ui.c` support
-module are included in the generated portability-source manifest. Keep
-`TILEFINCH_CORE_SOURCES` in `cmake/TilefinchCore.cmake` as the canonical core
-inventory so normal linking and portability auditing do not silently diverge.
-The root `CMakeLists.txt` establishes project-wide policy and includes focused
-modules for dependencies, core sources, product targets, and tests. PSP
-SDK-only entry points are checked by the cross-build rather than the host
-compile audit.
+`tilefinch_core` contains engine and subsystem implementations only. The
+entry points `main.c`, `interactive_main.c`, and `failure_recovery_main.c` are
+separate frontend or diagnostic targets; they and the host-portable
+`psp_ui.c` are in the generated portability-source manifest.
+`TILEFINCH_CORE_SOURCES` in `cmake/TilefinchCore.cmake` is the canonical core
+inventory, so linking and portability auditing cannot diverge. The root
+`CMakeLists.txt` sets project-wide policy and includes focused modules for
+dependencies, core sources, product targets, and tests. PSP SDK-only entry
+points are checked by the cross-build, not the host compile audit.
 
-Large, tightly coupled owners may be divided into private implementation seams
-under `src/<owner>/`. These `.inc` files are included exactly once by the
-same-named `.c` owner, in dependency order; they are not standalone translation
-units and must not be added to `TILEFINCH_CORE_SOURCES`. This keeps private state
-and PSP code generation unchanged while making policy, transport, lifecycle,
-and transaction responsibilities reviewable in isolation. Aggregate test
-executables use the same pattern under `tests/suites/` so allocator and
-process-lifetime semantics remain unchanged.
-
-The current high-level maps are visible directly in their owner files:
-`src/js_runtime.c` orders bridge state, host primitives, evaluation, dynamic
-scripts, document state, event-loop work, result snapshots, runtime creation,
-document evaluation, runtime advancement, dispatch, and teardown;
-`src/style_properties.c` orders visual basics, typography, box model, layout,
-positioning/visual effects, and property dispatch. The redirect, navigation,
-and dynamic-script test owners similarly include scenario-family units from
-`tests/suites/`. Start in the owner file and open only the relevant unit.
+Large, tightly coupled owners may be split into private `.inc` seams under
+`src/<owner>/`. Each is included exactly once by its same-named `.c` owner, in
+dependency order. They are not translation units and must not be added to
+`TILEFINCH_CORE_SOURCES`. This keeps private state and PSP code generation
+unchanged while making responsibilities reviewable in isolation. The owner
+file's include list is the map: start there and open only the relevant unit.
+Aggregate test executables use the same pattern under `tests/suites/`.
 
 ## Test fault injection and diagnostic switches
 
 Host tests inject failures through one struct, `TilefinchTestFaults` in
-`src/tilefinch_test_faults.h` (`tilefinch_test_faults()` returns it): refuse
-the next wasm alias buffer, worker realm, document refresh, stream
-scheduler, static-fallback layout, same-document relayout, or background
-font relayout or render-shell initialization once; expire the wasm task at the
-Nth checkpoint; inject a parser-checkpoint fault. Production code reads a field where the real
-failure would surface; the struct does not exist in device builds. Add a
-field there rather than a new static in an engine file.
+`src/tilefinch_test_faults.h` (`tilefinch_test_faults()` returns it).
+Production code reads a field where the real failure would surface, and the
+struct does not exist in device builds. Add a field there rather than a new
+static in an engine file.
 
 Every `TILEFINCH_*` environment variable the engine reads is listed in
-`docs/DIAGNOSTIC_SWITCHES.md`, and `tests/test_diagnostic_switches.py` fails
-when a `getenv` appears in `src/` without a row, or a row outlives its
-`getenv`. The table also says whether each read survives a device build.
+[Diagnostic switches](DIAGNOSTIC_SWITCHES.md), with whether each read survives
+a device build. `tests/test_diagnostic_switches.py` fails when a `getenv`
+appears without a row or a row outlives its `getenv`; refresh site paths and
+counts with `python3 tests/test_diagnostic_switches.py . --refresh-sites`.

@@ -1,10 +1,10 @@
 # Security
 
-Tilefinch runs on a mid-2000s handheld with no OS sandbox, no protected
-storage, and homebrew custom firmware. This page states plainly what the
-project's security machinery protects, what it does not, and how to report a
-problem. The engineering detail is in
-[docs/SECURE_UPDATES.md](docs/SECURE_UPDATES.md) and
+This page is for PSP owners and security researchers. Tilefinch runs on a
+mid-2000s handheld with no OS sandbox, no protected storage, and homebrew
+custom firmware. This page states plainly what the project's security
+machinery protects, what it does not, and how to report a problem. The
+engineering detail is in [docs/SECURE_UPDATES.md](docs/SECURE_UPDATES.md) and
 [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md).
 
 ## What is protected
@@ -17,7 +17,7 @@ problem. The engineering detail is in
   itself.
 - **Developer updates are an explicit exception.** A Developer channel that
   you configure locally and select accepts unsigned contributor code. It still
-  verifies bounded package and file integrity and keeps A/B trial rollback,
+  verifies package and file integrity and keeps A/B trial rollback,
   but it does not authenticate the publisher, so the configured endpoint must
   be trusted.
 - **A bad update cannot brick the browser.** Updates install into the inactive
@@ -26,26 +26,23 @@ problem. The engineering detail is in
   Interruption, cancellation, power loss, or a full Memory Stick leaves the
   previous browser launchable.
 - **Browsing fails closed.** HTTPS connections verify certificates and
-  hostnames, and cookies, redirects, and cached data follow
-  [the security model](docs/SECURITY_MODEL.md). In particular:
-  - every page request is built by one request-authority builder from one
-    immutable origin and policy context, rather than from Cookie, CORS, and
-    Fetch Metadata fields each caller assembles;
-  - security response headers are classified once, from the complete wire
-    fields, as present, valid, malformed, duplicate, or truncated, and
-    malformed, duplicate, truncated, or oversized security input is rejected
-    rather than partly trusted;
-  - the bounded subset of response-header CSP and frame-embedding policy is
-    enforced before resources are fetched or child documents are created;
-  - script, stylesheet, and image responses carry typed authorization grants,
-    enforce their MIME and Cross-Origin-Resource-Policy rules, and are
-    cache-partitioned by top-level site and requesting principal;
-  - you can allow mixed content for one site as a compatibility measure, but
-    that grant exists only in memory for the running session and is not
-    restored after a restart.
+  hostnames. In particular:
+  - every request's cookies, CORS mode and origin headers come from one
+    place, so no part of the browser can assemble them inconsistently;
+  - a security header that is malformed, repeated, cut short or oversized is
+    rejected rather than partly trusted;
+  - the supported part of a page's Content Security Policy and framing rules
+    is applied before resources are fetched or frames are created;
+  - scripts, stylesheets and images must have the right type and
+    cross-origin permission, and are cached separately for each site that
+    uses them;
+  - allowing mixed content for one site lasts only until you exit Tilefinch.
+
+  [The security model](docs/SECURITY_MODEL.md) describes each of these
+  rules in detail.
 - **Web pages cannot reach the local network.** Top-level navigation is
-  HTTPS-first and never silently downgrades to HTTP, and a bounded in-memory
-  HSTS table remembers verified HTTPS policy for the session. Pages loaded
+  HTTPS-first and never silently downgrades to HTTP, and an in-memory HSTS
+  table remembers verified HTTPS policy for the session. Pages loaded
   from the internet cannot send requests to loopback, link-local, or
   private-network addresses (including carrier-grade NAT and IPv4-mapped IPv6
   forms), so a malicious page cannot probe a router's admin interface or
@@ -60,17 +57,16 @@ problem. The engineering detail is in
 - **The trust root itself.** Everything chains from the public keys embedded
   in the stable launcher. The launcher does not update itself in-app; a
   launcher flaw or exhausted key threshold requires a manual reinstall.
-- **Desktop-browser guarantees the engine does not yet make.** There is no
-  complete CSP, CORS-complete fetch policy, all-resource cache partitioning,
-  certificate UI, permissions system, or process isolation. Scripts,
-  stylesheets, and images are cache-partitioned, but do not assume that for
-  every cache consumer. Do not use Tilefinch for sensitive accounts or
-  transactions.
+- **Desktop-browser guarantees the engine does not yet make.** Tilefinch has
+  no process isolation and no complete CSP, as the README's
+  [Known limits](README.md#known-limits) say. It also has no complete CORS
+  fetch policy, no certificate viewer, no permissions system, and no cache
+  partitioning beyond scripts, stylesheets and images.
 
 ## How updates verify
 
 Release metadata and packages are signed with P-256 ECDSA over SHA-256 and
-verified against a bounded key chain rooted in the launcher's embedded keys.
+verified against a key chain rooted in the launcher's embedded keys.
 Before the new slot may boot, the updater checks the signed manifest, the
 exact package size and hash, and every extracted file. Verification rejects
 expired metadata and older release sequences, so a replayed old release

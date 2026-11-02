@@ -1,10 +1,10 @@
 # Bounded WebAssembly profile
 
-Tilefinch implements the standard JavaScript WebAssembly API for small,
-self-contained modules. The PSP loads the interpreter only when a page first
-accesses `WebAssembly`, so ordinary browsing and boot do not pay its code or
-initialization cost. The component is installed and updated as part of the
-same signed Tilefinch slot as the browser.
+For web developers. Tilefinch implements the standard JavaScript WebAssembly
+API for small, self-contained modules. The PSP loads the interpreter only when
+a page first accesses `WebAssembly`, so ordinary browsing and boot do not pay
+its code or initialization cost. The component is installed and updated as part
+of the same signed Tilefinch slot as the browser.
 
 This is a bounded compatibility profile, not an alternate module format.
 Modules use the WebAssembly binary format, ordinary `application/wasm`
@@ -92,7 +92,7 @@ up by name and re-reading its types. The interpreter's contract is that a
 module's byte buffer is writable and referenced until unload, so every load
 works on a private copy rather than sharing bytes between instances or
 borrowing a JavaScript `ArrayBuffer`; an instantiated module releases that
-copy as soon as the interpreter confirms it no longer references it (the
+copy as soon as the interpreter confirms it has stopped referencing it (the
 fast interpreter pre-decodes function bodies and the loader clones data
 segments), so a live instance does not hold its binary for its lifetime.
 Exported memory is aliased, not copied:
@@ -131,17 +131,16 @@ native owner alive, and detach/finalization release each alias exactly once.
 The host task watchdog is shared across instances and calls, rather than
 granting a new wall-clock allowance to each export. Instantiation, imports,
 and export entry/return check that shared deadline. The interpreter's finite
-instruction ceiling still bounds individual native calls.
+instruction ceiling bounds individual native calls.
 
 ## Deliberate omissions
 
 The PSP profile does not provide WASI, Emscripten libc shims, JIT or AOT
 execution, threads/shared memory, relaxed SIMD, reference types,
-garbage-collected WebAssembly, memory64, or multiple memories. It currently
-links native modules through JavaScript **function** imports. JavaScript-created
-Memory, Table, and Global objects follow their bounded standalone API, but
-importing those objects into a native module and exposing a module's native
-Table are not yet supported.
+garbage-collected WebAssembly, memory64, or multiple memories. Native modules
+link through JavaScript **function** imports only. JavaScript-created Memory,
+Table, and Global objects follow their bounded standalone API, but a native
+module cannot import those objects and does not expose its native Table.
 
 Sites should feature-detect proposals and optional import kinds in the usual
 way. A rejected unsupported module must not retire the JavaScript realm or

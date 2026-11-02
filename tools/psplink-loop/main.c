@@ -17,7 +17,7 @@
  *
  *     PSPDEV=/path/to/pspdev PATH=$PSPDEV/bin:$PATH make -C tools/psplink-loop
  *
- * See docs/engineering/INPUT_SCRIPT_HARNESS.md, "PSPLink live loop".
+ * See docs/engineering/PSPLINK_DEV_LOOP.md.
  */
 #include <pspsdk.h>
 #include <pspkernel.h>

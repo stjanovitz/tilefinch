@@ -9,8 +9,8 @@ outside the repository:
 
 ```sh
 ./benchmarks/run-candidate-interactive-acceptance.sh \
-  build-root-dev \
-  ../tilefinch-corpora/acceptance-candidates-qualified-CAPTURE_DATE \
+  build-preset-release \
+  /path/to/corpora/acceptance-candidates-qualified-CAPTURE_DATE \
   /tmp/tilefinch-candidate-interactive
 ```
 
@@ -41,10 +41,11 @@ content. Neither is a pixel-similarity assertion. Visual reference review
 remains a separate qualification step because a hard pixel hash would reject
 harmless font and rasterization improvements.
 
-The hydration fields are deliberately generic counters. For example, the
-Mastodon row requires loaded modules, DOM mutation, a completed API operation,
-and rejects its `please enable JavaScript` fallback text. These expectations are
-manifest data; the runner and engine contain no Mastodon branch. Omitted
+The hydration fields are deliberately generic counters. For example, a row
+for a script-hydrated timeline can require loaded modules, DOM mutation and a
+completed API operation, and reject the page's "enable JavaScript" fallback
+text. These expectations are manifest data; the runner and engine contain no
+per-site branch. Omitted
 hydration columns use zero/disabled defaults, while the checked-in candidate
 manifest requires positive evidence for every required dynamic site.
 
@@ -98,10 +99,8 @@ PPM use the standard-library implementation. JPEG needs Pillow, ImageMagick,
 macOS `sips`, or ffmpeg; the selected decoder is printed in the result.
 
 `REPLAY_ROOT` must contain one subdirectory per `replay_dir` in the manifest.
-The current development captures are scattered across several local roots; the
-suite intentionally treats those as missing until the final qualified captures
-are consolidated under one caller-supplied root. It never copies a corpus into
-the repository.
+A missing subdirectory is a missing corpus, not a skipped row. The suite never
+copies a corpus into the repository.
 
 Google currently has an explicit `external` block policy in the candidate
 manifest. That policy is narrow: the engine must still run and tear down cleanly,
