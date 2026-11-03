@@ -290,6 +290,18 @@ static int test_engine_lifecycle(void)
     CHECK(browser_engine_focus_node(engine, label_layout->links[0].node)
           && browser_engine_view_snapshot(engine, &view)
           && !strcmp(view.focus_label, "Like"));
+    uint32_t first_focus_serial = view.focus_serial;
+    CHECK(first_focus_serial != 0
+          && browser_engine_view_snapshot(engine, &view)
+          && view.focus_serial == first_focus_serial
+          && browser_engine_focus_node(engine, label_layout->controls[0].node)
+          && browser_engine_view_snapshot(engine, &view)
+          && view.focus_label[0] == '\0'
+          && view.focus_serial != first_focus_serial);
+    uint32_t second_focus_serial = view.focus_serial;
+    CHECK(browser_engine_refresh_shell(engine)
+          && browser_engine_view_snapshot(engine, &view)
+          && view.focus_serial == second_focus_serial);
     /* Explicit names only: never infer the action from private form values.
        Read-only snapshots do not dispatch events or cause relayout. */
     CHECK(browser_engine_focus_node(engine, label_layout->controls[1].node)

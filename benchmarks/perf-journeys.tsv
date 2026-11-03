@@ -7,5 +7,5 @@ site-restore	site-restore	-	-	-	tests/fixtures/ppsspp-site-data	-	-
 article-scroll-during-load	scroll-during-load-live	https://en.wikipedia.org/w/index.php?search=PlayStation+Portable&title=Special%3ASearch&go=Go	wikipedia-article	cb64d13e10e7dab00e861ea88689261c6128c2048ac81ad719af123d63455783	-	-	-
 article-page-down-fast	scroll-fast-live	https://en.wikipedia.org/w/index.php?search=PlayStation+Portable&title=Special%3ASearch&go=Go	wikipedia-article	cb64d13e10e7dab00e861ea88689261c6128c2048ac81ad719af123d63455783	-	-	-
 article-drawer	drawer-scroll-during-completion-live	https://en.wikipedia.org/w/index.php?search=PlayStation+Portable&title=Special%3ASearch&go=Go	wikipedia-article	cb64d13e10e7dab00e861ea88689261c6128c2048ac81ad719af123d63455783	-	-	-
-youtube-bbb	youtube-bbb	https://m.youtube.com/results?search_query=big+buck+bunny	youtube-bbb	c6463fcd2f4a5ee3ddd999977591c21550205ad1f6014d520db377d1b63df1ef	-	-	-
+youtube-bbb	youtube-bbb	https://m.youtube.com/results?search_query=big+buck+bunny	youtube-bbb	fafb53c9be7d0b28f3e7e718ee4b7694859b247b316c55ac73242f7358ed26d0	-	-	-
 chatgpt-ask	chatgpt-ask	https://chatgpt.com/	chatgpt-ask-send76	6440c59283ec5516a46d7842fc24362a71a3a1c139c563723a8f1625b991c676	-	trace_ignore_request_body=1;trace_volatile_uuids=1;validation_js_profile=0	333

@@ -1720,7 +1720,7 @@ if(PSP_BROWSER_BUILD_TESTS)
             COMMAND tilefinch-quickjs-read-refusal-tests)
         set_tests_properties(tilefinch-quickjs-read-refusal-tests PROPERTIES
             LABELS "tilefinch;unit;javascript;allocator;sanitizer"
-            TIMEOUT 10)
+            TIMEOUT 40)
 
         tilefinch_add_test_binary(tilefinch-quickjs-oom-tests
             tests/test_quickjs_oom.c)

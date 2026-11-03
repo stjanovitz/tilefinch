@@ -144,6 +144,30 @@ static bool test_focused_action_hint(void)
     return true;
 }
 
+/* The user's own YouTube Sign out ends with a short note over the Home
+   page it lands on; the provider's rejection names YouTube instead. */
+static bool test_signed_out_note(void)
+{
+    enum { W = 480, H = 272 };
+    static uint16_t quiet[W * H], noted[W * H];
+    PspUiState ui;
+    psp_ui_init(&ui);
+    psp_ui_set_page(&ui, "YouTube", "https://www.youtube.com/", true);
+    ui.chrome_visible = false;
+    memset(quiet, 0, sizeof(quiet));
+    psp_ui_composite(&ui, quiet, W, H, W);
+    psp_ui_show_status(&ui, "SIGNED OUT", 180);
+    ui.toast_entry_frames = 0;
+    CHECK(strcmp(ui.status, "SIGNED OUT") == 0 && ui.toast_frames == 180);
+    memset(noted, 0, sizeof(noted));
+    psp_ui_composite(&ui, noted, W, H, W);
+    CHECK(memcmp(quiet, noted, sizeof(quiet)) != 0);
+    char sentence[] = "SIGNED OUT";
+    psp_ui_status_sentence_case(sentence);
+    CHECK(strcmp(sentence, "Signed out") == 0);
+    return true;
+}
+
 static bool test_every_interface_language_fits_the_ui_state(void)
 {
     PspUiState ui;
@@ -1037,10 +1061,26 @@ static bool test_input_mapping_and_menu(void)
     CHECK(ui.options_selection == 20);
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_update(&ui, &input);
-    CHECK(ui.youtube_compact_results
+    CHECK(!ui.youtube_compact_results
           && intent.setting.id
                  == PSP_UI_SETTING_YOUTUBE_COMPACT_RESULTS
-          && intent.setting.value.boolean);
+          && !intent.setting.value.boolean);
+    /* Channel banners is shown right after YouTube results, though its
+       index is the last one; Show by default, X hides banners. */
+    input.pressed = PSP_UI_BUTTON_DOWN;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(ui.options_selection == 51 && ui.youtube_channel_banners);
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(!ui.youtube_channel_banners
+          && intent.setting.id
+                 == PSP_UI_SETTING_YOUTUBE_CHANNEL_BANNERS
+          && !intent.setting.value.boolean);
+    input.pressed = PSP_UI_BUTTON_UP;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(ui.options_selection == 20);
+    input.pressed = PSP_UI_BUTTON_DOWN;
+    intent = psp_ui_update(&ui, &input);
     input.pressed = PSP_UI_BUTTON_DOWN;
     intent = psp_ui_update(&ui, &input);
     CHECK(ui.options_selection == 21);
@@ -7725,7 +7765,8 @@ static void settings_refusing_profile_set(BrowserProfile *profile, bool enabled)
 static bool settings_engine_row_mirror(PspUiSettingId id, const PspUiState *ui)
 {
     return id == PSP_UI_SETTING_YOUTUBE_TOPICS ? ui->youtube_topics
-        : ui->youtube_compact_results;
+        : id == PSP_UI_SETTING_YOUTUBE_CHANNEL_BANNERS
+        ? ui->youtube_channel_banners : ui->youtube_compact_results;
 }
 
 static bool test_bool_setting_failures_keep_one_value(void)
@@ -7736,9 +7777,10 @@ static bool test_bool_setting_failures_keep_one_value(void)
     CHECK(profile != NULL);
     static PspUiState ui;
     static const PspUiSettingId engine_rows[] = {
-        PSP_UI_SETTING_YOUTUBE_TOPICS, PSP_UI_SETTING_YOUTUBE_COMPACT_RESULTS
+        PSP_UI_SETTING_YOUTUBE_TOPICS, PSP_UI_SETTING_YOUTUBE_COMPACT_RESULTS,
+        PSP_UI_SETTING_YOUTUBE_CHANNEL_BANNERS
     };
-    for (size_t row = 0; row < 2u; row++) {
+    for (size_t row = 0; row < 3u; row++) {
         PspUiSettingId id = engine_rows[row];
         const PspBoolSetting *real = psp_bool_setting_find(id);
         CHECK(real != NULL && real->engine_set != NULL && real->ui_set != NULL);
@@ -7874,7 +7916,7 @@ static bool test_web_font_and_night_mode_failures_keep_one_value(void)
 
 /* Boot and Night mode's clock refresh follow the failure policy without a
    toast; a NULL engine is the real setters' refusal, and it reports a new
-   engine's values (Night mode light, compact results off, topics on). */
+   engine's values (Night mode light, compact results on, topics on). */
 static bool test_boot_and_clock_refresh_keep_engine_value(void)
 {
     Budget budget;
@@ -7885,16 +7927,18 @@ static bool test_boot_and_clock_refresh_keep_engine_value(void)
 
     /* Every engine half refuses: the profile and the chrome take the
        engine's values, quietly. Dark contradicts a light engine. */
-    browser_profile_set_youtube_compact_results(profile, true);
+    browser_profile_set_youtube_compact_results(profile, false);
     browser_profile_set_youtube_topics(profile, false);
     browser_profile_set_color_mode(profile, BROWSER_COLOR_MODE_DARK);
     memset(&ui, 0, sizeof(ui));
     psp_app_ui_sync_from_profile(&ui, profile);
     ui.page_dark = true;
-    CHECK(psp_engine_settings_boot(profile, NULL, &ui) == 3u);
-    CHECK(!browser_profile_youtube_compact_results(profile)
+    CHECK(psp_engine_settings_boot(profile, NULL, &ui) == 4u);
+    CHECK(browser_profile_youtube_compact_results(profile)
           && browser_profile_youtube_topics(profile)
-          && !ui.youtube_compact_results && ui.youtube_topics
+          && ui.youtube_compact_results && ui.youtube_topics
+          && browser_profile_youtube_channel_banners(profile)
+          && ui.youtube_channel_banners
           && browser_profile_color_mode(profile) == BROWSER_COLOR_MODE_LIGHT
           && ui.color_mode == BROWSER_COLOR_MODE_LIGHT && !ui.page_dark
           && ui.status[0] == '\0' && ui.toast_frames == 0u);
@@ -7904,7 +7948,7 @@ static bool test_boot_and_clock_refresh_keep_engine_value(void)
     memset(&ui, 0, sizeof(ui));
     psp_app_ui_sync_from_profile(&ui, profile);
     ui.page_dark = true;
-    CHECK(psp_engine_settings_boot(profile, NULL, &ui) == 3u);
+    CHECK(psp_engine_settings_boot(profile, NULL, &ui) == 4u);
     CHECK(browser_profile_color_mode(profile) == BROWSER_COLOR_MODE_AUTO
           && ui.color_mode == BROWSER_COLOR_MODE_AUTO && !ui.page_dark
           && ui.status[0] == '\0');
@@ -7989,12 +8033,199 @@ static bool test_site_javascript_and_basic_fallback_name_value_in_effect(void)
     return true;
 }
 
+/* Square turns captions on and off in one press while a video plays, and
+   picks the track last shown; it stays the menu's and the failure panel's
+   own button there. */
+static bool test_square_toggles_captions(void)
+{
+    PspUiMediaState media;
+    PspUiMediaPresentation presentation;
+    psp_ui_media_init(&media);
+    psp_ui_media_bind_presentation(&media, &presentation);
+    psp_ui_media_set(&media, true, true, false, UINT64_C(5000000),
+                     UINT64_C(60000000), "Caption fixture");
+    PspUiInput square = {
+        .pressed = PSP_UI_BUTTON_RELOAD, .analog_x = 128, .analog_y = 128
+    };
+    /* No captions: Square only shows the controls, as before. */
+    CHECK(psp_ui_media_update(&media, &square).action
+          == PSP_UI_MEDIA_ACTION_NONE);
+    const PspUiMediaTrack captions[] = {{"English (auto)"}, {"Spanish"}};
+    psp_ui_media_set_tracks(&media, NULL, 0u, -1, captions, 2u, -1);
+    /* Off with nothing used yet: the first (preferred) track. */
+    PspUiMediaIntent intent = psp_ui_media_update(&media, &square);
+    CHECK(intent.action == PSP_UI_MEDIA_ACTION_SELECT_SUBTITLE_TRACK
+          && intent.track_index == 0 && intent.visual_changed);
+    /* Spanish showing: Square turns it off and remembers it. */
+    psp_ui_media_set_tracks(&media, NULL, 0u, -1, captions, 2u, 1);
+    intent = psp_ui_media_update(&media, &square);
+    CHECK(intent.action == PSP_UI_MEDIA_ACTION_SELECT_SUBTITLE_TRACK
+          && intent.track_index == UINT8_MAX
+          && strcmp(presentation.last_subtitle_label, "Spanish") == 0);
+    psp_ui_media_set_tracks(&media, NULL, 0u, -1, captions, 2u, -1);
+    intent = psp_ui_media_update(&media, &square);
+    CHECK(intent.action == PSP_UI_MEDIA_ACTION_SELECT_SUBTITLE_TRACK
+          && intent.track_index == 1);
+    /* A track picked in the menu is the one Square brings back. */
+    PspUiInput input = {.analog_x = 128, .analog_y = 128};
+    input.pressed = PSP_UI_BUTTON_TOOLBAR;
+    (void) psp_ui_media_update(&media, &input);
+    CHECK(presentation.track_menu_open
+          && presentation.track_menu_tab == PSP_UI_MEDIA_TAB_SUBTITLES);
+    presentation.track_menu_selection = 1;
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    intent = psp_ui_media_update(&media, &input);
+    CHECK(intent.action == PSP_UI_MEDIA_ACTION_SELECT_SUBTITLE_TRACK
+          && intent.track_index == 0
+          && strcmp(presentation.last_subtitle_label, "English (auto)") == 0);
+    presentation.track_menu_open = false;
+    /* A different video without that track falls back to the first. */
+    const PspUiMediaTrack other[] = {{"French"}, {"German"}};
+    psp_ui_media_set_tracks(&media, NULL, 0u, -1, other, 2u, -1);
+    CHECK(psp_ui_media_update(&media, &square).track_index == 0);
+    /* In a playlist Square is still the caption toggle. */
+    presentation.queue_active = presentation.queue_next = true;
+    CHECK(psp_ui_media_update(&media, &square).action
+          == PSP_UI_MEDIA_ACTION_SELECT_SUBTITLE_TRACK);
+    presentation.queue_active = presentation.queue_next = false;
+    /* Opening and seek preview leave Square alone. */
+    psp_ui_media_set_resolving(&media, "Caption fixture");
+    CHECK(psp_ui_media_update(&media, &square).action
+          == PSP_UI_MEDIA_ACTION_NONE);
+    psp_ui_media_set(&media, true, true, false, UINT64_C(5000000),
+                     UINT64_C(60000000), "Caption fixture");
+    psp_ui_media_set_seek_preview(&media, UINT64_C(20000000));
+    CHECK(psp_ui_media_update(&media, &square).action
+          == PSP_UI_MEDIA_ACTION_NONE);
+    /* The failure panel keeps Square for 240p. */
+    psp_ui_media_set_error(&media, "Fixture failure");
+    media.lower_quality_recovery_available = true;
+    CHECK(psp_ui_media_update(&media, &square).action
+          == PSP_UI_MEDIA_ACTION_LOWER_QUALITY);
+    return true;
+}
+
+/* An open past ten seconds says it is still loading, with one repaint;
+   a retry at 240p says so for the whole of its open. */
+static bool test_slow_open_and_quality_retry_notes(void)
+{
+    PspUiMediaState media;
+    PspUiMediaPresentation presentation;
+    psp_ui_media_init(&media);
+    psp_ui_media_bind_presentation(&media, &presentation);
+    psp_ui_media_set_resolving(&media, "Slow fixture");
+    PspUiInput idle = {.analog_x = 128, .analog_y = 128, .elapsed_ms = 500};
+    unsigned repaints = 0;
+    for (unsigned at = 0; at < 19; at++)
+        repaints += psp_ui_media_update(&media, &idle).visual_changed;
+    CHECK(repaints == 0 && presentation.resolving_elapsed_ms == 9500u);
+    /* Later phases of the same open keep counting. */
+    psp_ui_media_set_resolving(&media, "Slow fixture");
+    psp_ui_media_set_resolving_progress(&media, "Loading...", 920u);
+    for (unsigned at = 0; at < 200; at++)
+        repaints += psp_ui_media_update(&media, &idle).visual_changed;
+    CHECK(repaints == 1 && presentation.resolving_elapsed_ms == UINT16_MAX);
+    /* A fresh open starts again. */
+    psp_ui_media_set(&media, true, true, false, 0, UINT64_C(60000000),
+                     "Slow fixture");
+    psp_ui_media_set_resolving(&media, "Slow fixture");
+    CHECK(presentation.resolving_elapsed_ms == 0);
+
+    psp_ui_media_set_error(&media, "Fixture failure");
+    media.lower_quality_recovery_available = true;
+    PspUiInput square = {
+        .pressed = PSP_UI_BUTTON_RELOAD, .analog_x = 128, .analog_y = 128
+    };
+    CHECK(psp_ui_media_update(&media, &square).action
+          == PSP_UI_MEDIA_ACTION_LOWER_QUALITY);
+    psp_ui_media_set_resolving(&media, "Slow fixture");
+    CHECK(strcmp(media.status, "Retrying at 240p") == 0);
+    psp_ui_media_set_resolving_progress(&media, "Loading...", 300u);
+    CHECK(strcmp(media.status, "Retrying at 240p") == 0);
+    psp_ui_media_set_resolving_progress(&media, "Restarting decoder", 300u);
+    CHECK(strcmp(media.status, "Restarting decoder") == 0);
+    psp_ui_media_set(&media, true, true, false, 0, UINT64_C(60000000),
+                     "Slow fixture");
+    psp_ui_media_set_resolving(&media, "Slow fixture");
+    CHECK(strcmp(media.status, "Loading...") == 0);
+    /* The session's own fallback announces itself the same way. */
+    psp_ui_media_note_lower_quality_retry(&media);
+    CHECK(strcmp(media.status, "Retrying at 240p") == 0);
+    psp_ui_media_set_error(&media, "Fixture failure");
+    CHECK(!presentation.lower_quality_retry);
+    return true;
+}
+
+/* With the bars hidden, D-pad focus reaching another labelled element
+   brings back the bottom bar alone, naming it; the bars' idle timer hides
+   it again. Nothing else about the bars changes. */
+static bool test_focus_change_shows_hint_bar(void)
+{
+    PspUiState ui;
+    psp_ui_init(&ui);
+    psp_ui_set_page(&ui, "Watch", "https://www.youtube.com/watch?v=x", true);
+    unsigned top = 0, bottom = 0;
+    /* Labels arriving while the bars show change nothing about them. */
+    CHECK(psp_ui_set_focus_label(&ui, "Like"));
+    CHECK(!ui.focus_hint_visible);
+    ui.chrome_visible = false;
+    ui.activity_frames = 0;
+    psp_ui_opaque_chrome_rows(&ui, &top, &bottom);
+    CHECK(top == 0 && bottom == 0);
+    /* The same element again is not a focus change. */
+    CHECK(!psp_ui_set_focus_label(&ui, "Like"));
+    CHECK(!ui.focus_hint_visible);
+    CHECK(psp_ui_set_focus_label(&ui, "Save to Watch later"));
+    CHECK(ui.focus_hint_visible && !ui.chrome_visible
+          && ui.activity_frames != 0);
+    psp_ui_opaque_chrome_rows(&ui, &top, &bottom);
+    CHECK(top == 0 && bottom != 0);
+    PspUiInput idle = {.analog_x = 128, .analog_y = 128};
+    bool hidden = false;
+    for (unsigned frame = 0; frame < 400 && !hidden; frame++) {
+        PspUiIntent intent = psp_ui_update(&ui, &idle);
+        hidden = !ui.focus_hint_visible;
+        CHECK(!hidden || intent.visual_changed);
+    }
+    CHECK(hidden && !ui.chrome_visible);
+    /* Same accessible name, different control: show it again. Repeated
+       snapshots of that control must not keep resetting the idle hint. */
+    CHECK(psp_ui_set_focus_target_label(&ui, "Read more", 7, 1));
+    ui.focus_hint_visible = false;
+    CHECK(!psp_ui_set_focus_target_label(&ui, "Read more", 7, 1));
+    CHECK(!ui.focus_hint_visible);
+    CHECK(psp_ui_set_focus_target_label(&ui, "Read more", 7, 2));
+    CHECK(ui.focus_hint_visible);
+    ui.focus_hint_visible = false;
+    CHECK(psp_ui_set_focus_target_label(&ui, "Read more", 8, 2));
+    CHECK(ui.focus_hint_visible);
+    ui.focus_hint_visible = false;
+    psp_ui_opaque_chrome_rows(&ui, &top, &bottom);
+    CHECK(bottom == 0);
+    /* An element with no label, or Triangle, puts the bar away. */
+    CHECK(psp_ui_set_focus_label(&ui, "Share"));
+    CHECK(ui.focus_hint_visible);
+    CHECK(psp_ui_set_focus_label(&ui, ""));
+    CHECK(!ui.focus_hint_visible && !ui.focus_label_valid);
+    CHECK(psp_ui_set_focus_label(&ui, "Download"));
+    PspUiInput triangle = {
+        .pressed = PSP_UI_BUTTON_TOOLBAR, .analog_x = 128, .analog_y = 128
+    };
+    (void) psp_ui_update(&ui, &triangle);
+    CHECK(ui.chrome_visible && !ui.focus_hint_visible);
+    CHECK(psp_ui_state_bytes() <= 1024u);
+    return true;
+}
+
 int main(void)
 {
     if (!test_media_ink_check_follows_glyph_state()) return 1;
     if (!test_media_chrome_warmup_avoids_unused_weight()
         || !test_media_control_ground_exact_colors()) return 1;
     if (!test_queue_square_is_modal()) return 1;
+    if (!test_square_toggles_captions()
+        || !test_slow_open_and_quality_retry_notes()
+        || !test_focus_change_shows_hint_bar()) return 1;
     if (!test_opaque_video_bars_match_scalar()
         || !test_title_reuses_the_opaque_menu_storage()
         || !test_menu_feedback_reuses_only_covered_pixels()) return 1;
@@ -8012,7 +8243,7 @@ int main(void)
     if (!test_player_chapter_timeline_and_menu()
         || !test_media_clockwise_controls_and_pixels()
         || !test_page_activation_activity()
-        || !test_focused_action_hint()
+        || !test_focused_action_hint() || !test_signed_out_note()
         || !test_every_interface_language_fits_the_ui_state()
         || !test_priority_menu_during_page_work()
         || !test_input_mapping_and_menu()

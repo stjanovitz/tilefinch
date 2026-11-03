@@ -9,16 +9,36 @@
     (YOUTUBE_SUBTITLE_TEXT_POOL_LIMIT / YOUTUBE_SUBTITLE_TEXT_BLOCK_BYTES)
 #define YOUTUBE_SUBTITLE_TRANSITION_BRIDGE_MS 1200u
 
+bool youtube_subtitles_retry_extension(YoutubeSubtitleRetry *retry,
+    uint64_t window_end_us, uint64_t monotonic_us)
+{
+    if (retry == NULL) return false;
+    if (retry->window_end_us != window_end_us) {
+        retry->window_end_us = window_end_us;
+        retry->attempts = 0;
+    }
+    if (retry->attempts >= 3u
+        || (retry->attempts != 0
+            && (monotonic_us < retry->attempted_us
+                || monotonic_us - retry->attempted_us < UINT64_C(5000000))))
+        return false;
+    retry->attempted_us = monotonic_us;
+    retry->attempts++;
+    return true;
+}
+
 typedef struct {
     uint32_t start_ms;
     uint32_t end_ms;
-    /* Five high bits select one of 32 blocks; the low 12 are its offset. */
-    uint16_t text_location;
-    uint16_t text_length;
+    uint16_t text_offset;
+    uint8_t text_block;
+    uint8_t text_length;
 } YoutubeSubtitleCue;
 
 struct YoutubeSubtitleDocument {
     Budget *budget;
+    uint64_t minimum_time_us;
+    bool truncated;
     size_t count;
     YoutubeSubtitleCue cues[YOUTUBE_SUBTITLE_CUE_LIMIT];
     char *text_blocks[YOUTUBE_SUBTITLE_TEXT_BLOCK_LIMIT];
@@ -47,15 +67,21 @@ _Static_assert(sizeof(YoutubeSubtitleDocument) < 32u * 1024u,
                "subtitle document exceeded its PSP bound");
 _Static_assert(YOUTUBE_SUBTITLE_TEXT_BLOCK_LIMIT <= UINT8_MAX,
                "subtitle text block index overflow");
+_Static_assert(YOUTUBE_SUBTITLE_TEXT_BLOCK_LIMIT - 1u <= UINT8_MAX
+                   && YOUTUBE_SUBTITLE_TEXT_BLOCK_BYTES - 1u <= UINT16_MAX
+                   && YOUTUBE_SUBTITLE_TEXT_CAPACITY - 1u <= UINT8_MAX,
+               "subtitle cue text location exceeds its fields");
+_Static_assert(sizeof(YoutubeSubtitleCue) == 12u,
+               "subtitle cue outgrew its 12-byte record");
 
 static unsigned subtitle_cue_block(const YoutubeSubtitleCue *cue)
 {
-    return cue == NULL ? 0u : (unsigned) (cue->text_location >> 12);
+    return cue == NULL ? 0u : cue->text_block;
 }
 
 static size_t subtitle_cue_offset(const YoutubeSubtitleCue *cue)
 {
-    return cue == NULL ? 0u : (size_t) (cue->text_location & 0x0fffu);
+    return cue == NULL ? 0u : cue->text_offset;
 }
 
 static bool subtitle_digits(
@@ -255,9 +281,9 @@ static void subtitle_builder_finish_cue(YoutubeSubtitleBuilder *builder)
     cue->start_ms = start_ms;
     cue->end_ms = end_ms;
     unsigned text_block = (unsigned) document->text_block_count - 1u;
-    cue->text_location = (uint16_t) (
-        (text_block << 12) | document->text_block_used);
-    cue->text_length = (uint16_t) length;
+    cue->text_block = (uint8_t) text_block;
+    cue->text_offset = document->text_block_used;
+    cue->text_length = (uint8_t) length;
     char *destination = document->text_blocks[text_block]
         + document->text_block_used;
     memcpy(destination,
@@ -308,6 +334,8 @@ YoutubeSubtitleBuilder *youtube_subtitles_builder_create(
     builder->document->count = 0;
     builder->document->text_block_count = 0u;
     builder->document->text_block_used = 0u;
+    builder->document->minimum_time_us = minimum_time_us;
+    builder->document->truncated = false;
     builder->minimum_time_us = minimum_time_us;
     return builder;
 }
@@ -352,6 +380,7 @@ YoutubeSubtitleDocument *youtube_subtitles_builder_finish(
         subtitle_builder_line(builder, builder->line, builder->line_length);
     subtitle_builder_finish_cue(builder);
     YoutubeSubtitleDocument *document = builder->document;
+    document->truncated = builder->truncated;
     builder->document = NULL;
     Budget *budget = builder->budget;
     budget_free(budget, builder);
@@ -446,4 +475,34 @@ size_t youtube_subtitles_cue_count(
     const YoutubeSubtitleDocument *document)
 {
     return document == NULL ? 0u : document->count;
+}
+
+bool youtube_subtitles_window(const YoutubeSubtitleDocument *document,
+                              YoutubeSubtitleWindow *window)
+{
+    if (document == NULL || window == NULL || document->count == 0)
+        return false;
+    *window = (YoutubeSubtitleWindow) {
+        .start_us = document->minimum_time_us,
+        .end_us = (uint64_t) document->cues[document->count - 1u].end_ms
+            * 1000u,
+        .truncated = document->truncated
+    };
+    return true;
+}
+
+YoutubeSubtitleWindowAction youtube_subtitles_window_action(
+    const YoutubeSubtitleDocument *document, uint64_t time_us,
+    uint64_t lead_us)
+{
+    YoutubeSubtitleWindow window;
+    if (!youtube_subtitles_window(document, &window))
+        return YOUTUBE_SUBTITLE_WINDOW_KEEP;
+    /* The builder discarded every cue that ended before the window start,
+       so a seek back past it has nothing to show from this document. */
+    if (time_us < window.start_us) return YOUTUBE_SUBTITLE_WINDOW_RELOAD;
+    if (window.truncated
+        && (time_us >= window.end_us || window.end_us - time_us <= lead_us))
+        return YOUTUBE_SUBTITLE_WINDOW_EXTEND;
+    return YOUTUBE_SUBTITLE_WINDOW_KEEP;
 }

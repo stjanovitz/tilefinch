@@ -3802,6 +3802,14 @@ int main(void) {
         self.assertIn("media->transport_reresolve_attempts++", fallback)
         self.assertIn(
             "PSP_MEDIA_TRANSPORT_REFRESH_MAXIMUM_ATTEMPTS", fallback)
+        # The automatic fallback says "Retrying at 240p" like the failure
+        # screen's own choice: the note follows the resolving reset, which
+        # would otherwise show the plain "Loading...".
+        note = fallback.index(
+            "psp_ui_media_note_lower_quality_retry(&media->ui);")
+        self.assertLess(fallback.index("psp_ui_media_set_resolving("), note)
+        self.assertLess(note,
+                        fallback.index("psp_ui_media_set_resolving_progress("))
 
         failure = open_source[
             open_source.index("bool delivery_candidate_rejected ="):

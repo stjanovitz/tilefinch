@@ -138,6 +138,7 @@ typedef struct {
     ControllerFocusKind focus_kind;
     size_t focus_index;
     size_t focus_moves;
+    uint32_t focus_serial;
     size_t activations;
     size_t text_edits;
     /* Always present: TILEFINCH_NO_TRACE is private to tilefinch_core, so a

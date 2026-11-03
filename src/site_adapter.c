@@ -69,6 +69,7 @@ static void *youtube_begin(
     return youtube_lite_load_begin_navigation(
         budget, session, url,
         preferences != NULL && preferences->youtube_compact_results,
+        preferences != NULL && preferences->youtube_hide_channel_banners,
         maximum_source_bytes, timeout_ms,
         preferences == NULL ? NULL : preferences->navigation_initiator,
         preferences != NULL && preferences->navigation_user_activated,

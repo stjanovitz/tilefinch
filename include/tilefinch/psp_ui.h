@@ -615,6 +615,7 @@ typedef struct {
     uint8_t toast_kind : 3;
     unsigned youtube_240p : 1;
     unsigned youtube_compact_results : 1;
+    unsigned youtube_channel_banners : 1;
     unsigned youtube_audio_only : 1;
     unsigned subtitle_size : 1;
     unsigned subtitle_background : 1;
@@ -823,6 +824,11 @@ typedef struct {
     uint8_t heavy_pages_mode : 2;
     uint8_t failure_recovery_heavy : 1;
     uint8_t web_font_mode : 2;
+    /* The bottom bar alone, shown while the bars are hidden because D-pad
+       focus reached another element: its label is the only name an
+       icon-only control has. It hides with the bars' own idle timer. The
+       byte's last spare bit. */
+    uint8_t focus_hint_visible : 1;
     /* Uses alignment padding before the cursor coordinates. */
     bool save_playback_positions;
     int cursor_x_milli;
@@ -836,7 +842,11 @@ typedef struct {
     union {
         /* Page-only action hint; other screens own the overlay strings.
            Check focus_label_valid and screen before accessing this member. */
-        char focus_label[64];
+        struct {
+            char focus_label[64];
+            uint64_t focus_navigation_generation;
+            uint32_t focus_target_serial;
+        };
         struct {
             char update_version[16];
             char update_status[64];
@@ -989,6 +999,14 @@ typedef struct {
     bool portrait_crop;
     PspUiMediaTrack audio_tracks[PSP_UI_MEDIA_TRACK_LIMIT];
     PspUiMediaTrack subtitle_tracks[PSP_UI_MEDIA_TRACK_LIMIT];
+    /* The caption track last turned on or off, by label, for Square's
+       one-press toggle; empty picks the first (preferred) track. It lives
+       only as long as the player: no setting keeps it. */
+    char last_subtitle_label[PSP_UI_MEDIA_TRACK_LABEL_CAPACITY];
+    /* Milliseconds since this open began, saturating, for the slow-load
+       note; and whether the open is a retry at 240p. */
+    uint16_t resolving_elapsed_ms;
+    bool lower_quality_retry;
     MediaChapter chapters[MEDIA_CHAPTER_LIMIT];
     char subtitle_text[PSP_UI_MEDIA_SUBTITLE_TEXT_CAPACITY];
     bool queue_active, queue_loading, queue_failed, queue_next, automatic_next;
@@ -1108,6 +1126,15 @@ void psp_ui_boot_entrance_composite(
     uint16_t *pixels, int width, int height, int stride);
 
 void psp_ui_init(PspUiState *ui);
+/* The focused page element's label from the engine snapshot ("" for none).
+   A change to another labelled element while the bars are hidden brings
+   back the bottom bar alone, which hides again with the bars' idle timer;
+   it never repaints the page. Returns whether the label changed. */
+bool psp_ui_set_focus_label(PspUiState *ui, const char *label);
+/* Numeric identity distinguishes different controls with identical labels.
+   Neither identity contains a DOM pointer or private form contents. */
+bool psp_ui_set_focus_target_label(PspUiState *ui, const char *label,
+    uint64_t navigation_generation, uint32_t target_serial);
 /* Presentation-only input during page work. Never emits a page, storage or
    settings action; false leaves ui unchanged for ordinary queued dispatch. */
 bool psp_ui_update_priority(PspUiState *ui, const PspUiInput *input);
@@ -1464,6 +1491,9 @@ void psp_ui_media_set_tracks(
     const PspUiMediaTrack *subtitle_tracks, size_t subtitle_count,
     int selected_subtitle);
 void psp_ui_media_set_subtitle(PspUiMediaState *media, const char *text);
+/* The open in progress, or the next one, retries at 240p: its loading
+   status reads "Retrying at 240p" until it plays or fails. */
+void psp_ui_media_note_lower_quality_retry(PspUiMediaState *media);
 void psp_ui_media_set_chapters(PspUiMediaState *media,
                                const MediaChapter *chapters, size_t count);
 void psp_ui_media_set_subtitle_style(

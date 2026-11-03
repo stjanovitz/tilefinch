@@ -1093,6 +1093,8 @@ bool psp_media_retry_240p(
         &media->ui,
         media->stream.title[0] == '\0'
             ? "YouTube video" : media->stream.title);
+    /* Say so, as the failure screen's own 240p choice does. */
+    psp_ui_media_note_lower_quality_retry(&media->ui);
     psp_ui_media_set_resolving_progress(
         &media->ui, "Loading...", 20u);
     if (preview_pending || commit_pending) {

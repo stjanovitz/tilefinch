@@ -501,7 +501,9 @@ static bool test_player_language(const PspUiState *ui,
                     CHECK((folded || (player_has_text("Audio") && player_has_text("Subtitles")
                         && player_has_text("Chapters")))
                         && player_has_text(lane == 15 ? "Connection timed out"
-                            : lane == 16 ? "Loading..." : "L/R  X SELECT  O BACK"));
+                            : lane == 16 ? "Loading..."
+                            : ui_text_or_legacy("L/R TAB  X SELECT  O BACK",
+                                                "L/R  X SELECT  O BACK")));
                     if (lane >= 19)
                         CHECK(player_has_text("Queue") && player_has_text("X PLAY")
                             && player_has_text("O Back")
@@ -1068,9 +1070,9 @@ static bool test_remaining_screens(PspUiState *ui, TilefinchGlyphProvider *provi
     char retry[TILEFINCH_UI_TRANSLATION_VALUE_BYTES + 4];
     snprintf(retry, sizeof(retry), "X %s", tilefinch_ui_text("Retry"));
     char audio[TILEFINCH_UI_TRANSLATION_VALUE_BYTES + 16], both[600];
-    snprintf(audio, sizeof(audio), "%s %s", english ? "Triangle" : "TRI",
-             tilefinch_ui_text("Audio-only"));
-    const char *lower = english ? "Square 240p" : "\xe2\x96\xa1 240p";
+    /* Named the way the player's other hints name the buttons. */
+    snprintf(audio, sizeof(audio), "TRI %s", tilefinch_ui_text("Audio-only"));
+    const char *lower = "\xe2\x96\xa1 240p";
     snprintf(both, sizeof(both), "%s   %s", audio, lower);
     for (unsigned scale = 1; scale <= 2; scale++) {
         ui->browser_ui_scale = scale;
@@ -1750,8 +1752,9 @@ static bool test_provider_language(const FontSet *fonts, TilefinchGlyphProvider 
         if (lane == 1) {
             const LayoutDocument *layout = &browser_engine_navigation(engine)->page.layout;
             const LayoutNodeBox *account = layout_box_for_node(layout, provider_node(engine, "yt-account-action"));
-            const LayoutNodeBox *signout = layout_box_for_node(layout, provider_node(engine, "yt-signout-action"));
-            CHECK(account && signout && signout->x + signout->width <= WIDTH - 5);
+            CHECK(account && account->x + account->width <= WIDTH - 5);
+            /* Sign out is in the Account panel, never in the header. */
+            CHECK(provider_node(engine, "yt-signout-action") == NULL);
             CHECK(browser_engine_focus_node(engine, provider_node(engine, "yt-account-action")));
             ControllerAction action;
             CHECK(browser_engine_activate(engine, &action) && action.type == CONTROLLER_ACTION_CONTROL);
@@ -1759,9 +1762,30 @@ static bool test_provider_language(const FontSet *fonts, TilefinchGlyphProvider 
             const LayoutNodeBox *panel = layout_box_for_node(&browser_engine_navigation(engine)->page.layout,
                 provider_node(engine, "yt-account-panel"));
             CHECK(panel && panel->y >= 30 && panel->y + panel->height <= HEIGHT);
+            const LayoutNodeBox *signout = layout_box_for_node(&browser_engine_navigation(engine)->page.layout,
+                provider_node(engine, "yt-signout-open"));
+            CHECK(signout && signout->x + signout->width <= WIDTH - 5
+                && signout->y + signout->height <= panel->y + panel->height);
             if (capture_directory) {
                 char path[1024];
                 snprintf(path, sizeof(path), "%s/%s-youtube-account.ppm", capture_directory, language_code);
+                CHECK(browser_engine_render_frame(engine, path));
+            }
+            /* The page that asks before Sign out: both answers on the
+               first screen, Cancel focused. */
+            CHECK(browser_engine_load_url(engine, YOUTUBE_LITE_SIGNOUT_CONFIRM_URL, true));
+            CHECK(provider_paint(engine, provider) && provider_text_fits(engine, fonts));
+            const LayoutDocument *confirm = &browser_engine_navigation(engine)->page.layout;
+            lxb_dom_node_t *cancel = provider_node(engine, "yt-signout-cancel");
+            const LayoutNodeBox *answers[] = {layout_box_for_node(confirm, cancel),
+                layout_box_for_node(confirm, provider_node(engine, "yt-signout-action"))};
+            for (unsigned i = 0; i < 2u; i++)
+                CHECK(answers[i] && answers[i]->x + answers[i]->width <= WIDTH - 5
+                    && answers[i]->y + answers[i]->height <= HEIGHT);
+            CHECK(controller_focused_node(browser_engine_controller(engine)) == cancel);
+            if (capture_directory) {
+                char path[1024];
+                snprintf(path, sizeof(path), "%s/%s-youtube-signout.ppm", capture_directory, language_code);
                 CHECK(browser_engine_render_frame(engine, path));
             }
         }
@@ -2005,6 +2029,20 @@ static bool test_all_languages(void)
                     }
                     CHECK(named);
                 }
+                /* A playlist row joins the action to its title. The action
+                   half still paints in its pre-shaped display form. */
+                CHECK(snprintf(ui.focus_label, sizeof(ui.focus_label), "%s: Episode 1",
+                    tilefinch_ui_logical_text("Play from here")) < (int) sizeof(ui.focus_label));
+                CHECK(paint(&ui, provider));
+                char joined[320];
+                snprintf(joined, sizeof(joined), "%s: Episode 1", tilefinch_ui_text("Play from here"));
+                bool row_named = false;
+                for (size_t r = 0; r < run_count; r++)
+                    row_named |= !strcmp(runs[r].text, joined) && !runs[r].missing_glyph;
+                if (!row_named)
+                    fprintf(stderr, "playlist hint locale=%s scale=%u missing '%s'\n",
+                        language_code, scale, joined);
+                CHECK(row_named);
             }
             ui.focus_label[0] = '\0';
             ui.focus_label_valid = false;
@@ -2240,7 +2278,8 @@ static bool test_menu_metadata_equivalence(void)
         CHECK(ui_option_group_index((UiOptionId)option) == groups[option]);
     CHECK(ui_option_group_index((UiOptionId)-1) == 0);
     CHECK(ui_option_group_index(UI_OPTION_YOUTUBE_SIGNIN_DIAGNOSTICS) == 4);
-    CHECK(ui_option_group_index((UiOptionId)(UI_OPTION_YOUTUBE_SIGNIN_DIAGNOSTICS + 1)) == 0);
+    CHECK(ui_option_group_index(UI_OPTION_YOUTUBE_CHANNEL_BANNERS) == 2);
+    CHECK(ui_option_group_index((UiOptionId)(UI_OPTION_YOUTUBE_CHANNEL_BANNERS + 1)) == 0);
 
     static const unsigned flags[] = {
         PSP_UI_FAILURE_BASIC_VIEW, PSP_UI_FAILURE_RELOAD_BASIC,

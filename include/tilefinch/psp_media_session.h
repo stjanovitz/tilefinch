@@ -113,6 +113,7 @@ typedef struct {
     size_t subtitle_received_bytes;
     size_t subtitle_cue_cursor;
     bool subtitle_request_attempted;
+    YoutubeSubtitleRetry subtitle_extension_retry;
     /* The initial resolver retains URLs only for the six presented tracks.
        A side resolver is a fail-soft fallback for a missing/expired catalog;
        it never owns or replaces the live A/V pipeline. */

@@ -81,7 +81,10 @@ bool youtube_playlist_accept_page(YoutubePlaylistQueue *q, const YoutubePlaylist
     }
     if (q->initialized && p->first != q->first + q->count)
         return playlist_fail(q, "Playlist changed; return and start it again");
-    if (q->relative) {
+    /* Play all can cross display pages containing only unavailable rows.
+       A selected video, however, must still match its original page. */
+    if (q->relative && !(p->count == 0 && p->next_url[0]
+        && q->target == 0 && !q->expected_video[0])) {
         if (q->target >= p->count) return playlist_fail(q, "Selected playlist entry is unavailable");
         if (q->expected_video[0] && strcmp(q->expected_video, p->entries[q->target].video_id))
             return playlist_fail(q, "Playlist changed; return and start it again");

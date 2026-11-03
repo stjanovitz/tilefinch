@@ -2285,7 +2285,10 @@ enum {
     RENDER_IDLE_MAXIMUM_GLYPH_CANDIDATES = 512,
     RENDER_IDLE_MAXIMUM_GLYPH_PREWARMS = 64,
     RENDER_IDLE_MAXIMUM_IMAGE_PIXELS = 8192,
-    RENDER_IDLE_MAXIMUM_ENCODED_IMAGE_BYTES = 32 * 1024
+    RENDER_IDLE_MAXIMUM_ENCODED_IMAGE_BYTES = 32 * 1024,
+    /* One 60 Hz frame period: how long paint-ahead tiles may hold an idle
+       turn (tile_cache_run_idle_work). */
+    RENDER_IDLE_TILE_TURN_US = 16667
 };
 
 static void tile_cache_idle_begin_glyphs(TileCache *cache)
@@ -2853,6 +2856,11 @@ bool tile_cache_run_idle_work(TileCache *cache, uint64_t budget_us,
     bool startup = cache->idle_work.startup;
     size_t units = 0;
     while (cache->idle_work.pending && units < maximum_units) {
+        /* A tile itself is unbreakable. Input queued during it must defer
+           the next unit, without reentering this borrowed render shell. */
+        if (!startup && !render_platform_cooperate(
+                cache, "render-idle-input", units,
+                TILEFINCH_COOPERATE_RENDER_INPUT)) break;
         uint64_t unit_started = render_now_us();
         tile_cache_run_idle_unit(cache);
         uint64_t unit_elapsed = render_now_us() - unit_started;
@@ -2864,7 +2872,17 @@ bool tile_cache_run_idle_work(TileCache *cache, uint64_t budget_us,
             cache->max_idle_unit_us = unit_elapsed;
         }
         units++;
-        if (render_now_us() - started >= budget_us) {
+        /* A paint-ahead tile is one unbreakable unit, longer than the idle
+           budget on the PSP, so that budget alone admits one tile per
+           vblank-paced turn: a settled page's next screen took four turns
+           and a press two turns after settling found it half drawn. Tiles
+           keep a quiet turn up to one frame period; the boundary above
+           yields to queued presses. Later stages keep the caller's budget. */
+        uint64_t turn_us = budget_us;
+        if (!startup && cache->idle_work.stage == RENDER_IDLE_WORK_TILES
+            && turn_us < RENDER_IDLE_TILE_TURN_US)
+            turn_us = RENDER_IDLE_TILE_TURN_US;
+        if (render_now_us() - started >= turn_us) {
             if (cache->idle_work.pending) cache->idle_budget_exhaustions++;
             break;
         }

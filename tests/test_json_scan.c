@@ -106,7 +106,12 @@ static int test_strings(void)
     CHECK(json_scan_string(&json, four, sizeof(four))
           && strcmp(four, "abc") == 0);
     json = cursor("\"abcd\"");
-    CHECK(!json_scan_string(&json, four, sizeof(four)));
+    CHECK(!json_scan_string(&json, four, sizeof(four)) && four[0] == '\0');
+    /* A failed copy never leaves the bytes decoded so far: raw UTF-8 is
+       copied a byte at a time, so they can end inside a sequence. */
+    memset(four, 0, sizeof(four));
+    json = cursor("\"a\xe6\x97\xa5\"");
+    CHECK(!json_scan_string(&json, four, sizeof(four)) && four[0] == '\0');
     bool truncated = false;
     json = cursor("\"ab\xc3\xa9z\" ");
     CHECK(json_scan_string_copy(&json, four, sizeof(four),

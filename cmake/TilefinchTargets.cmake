@@ -702,9 +702,9 @@ if(PSP)
         # PSP .text ratchets; history is in git. Raising either limit
         # needs a re-measurement and a device-cost justification (AGENTS.md).
         if(TILEFINCH_PSP_VALIDATION_LOG)
-            # Validation-only: 5,500,000 bytes, user-approved 2026-10-04;
-            # last recorded 5,029,216 bytes (2026-10-04).
-            set(TILEFINCH_PSP_TEXT_LIMIT 5500000)
+            # Validation-only: 5,510,000 bytes, user-approved 2026-11-02;
+            # last recorded 5,506,040 bytes (2026-11-02).
+            set(TILEFINCH_PSP_TEXT_LIMIT 5510000)
         else()
             # Ordinary: 5,216,512 bytes, user-approved 2026-10-28 (+100 KiB
             # so the QuickJS PGO build fits: 5,129,680 bytes with PGO and

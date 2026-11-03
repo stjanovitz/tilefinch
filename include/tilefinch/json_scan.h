@@ -41,8 +41,8 @@ void json_scan_space(JsonCursor *json);
 /* The string at the cursor (after whitespace), decoded to UTF-8 into
    `output` (NUL-terminated). False when the string is malformed or holds
    \u0000, or does not
-   fit `output_size` without JSON_SCAN_TRUNCATE; the cursor is then
-   unspecified. On success the cursor is past the closing quote and
+   fit `output_size` without JSON_SCAN_TRUNCATE; `output` is then empty
+   and the cursor unspecified. On success the cursor is past the closing quote and
    *truncated (when not NULL) says whether a prefix was kept. */
 bool json_scan_string_copy(JsonCursor *json, char *output, size_t output_size,
                            unsigned flags, bool *truncated);

@@ -1309,6 +1309,8 @@ static lxb_dom_node_t *retained_focus_node(
 static void retain_focus_node(BrowserController *controller,
                               lxb_dom_node_t *node)
 {
+    if (retained_focus_node(controller) != node
+        && ++controller->focus_serial == 0) ++controller->focus_serial;
     controller->focus_node = node;
     ScriptRuntime *runtime = controller->navigation->page.runtime;
     controller->focus_handle = runtime == NULL || node == NULL

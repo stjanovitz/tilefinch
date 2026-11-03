@@ -23,6 +23,8 @@ typedef struct SiteAdapterLoad SiteAdapterLoad;
 
 typedef struct {
     bool youtube_compact_results;
+    /* Zero shows channel banners. */
+    bool youtube_hide_channel_banners;
     const char *navigation_initiator;
     bool navigation_user_activated;
 } SiteAdapterPreferences;

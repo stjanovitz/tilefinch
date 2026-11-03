@@ -55,6 +55,8 @@ STATUS_CALLS = (
     ("language_abort", 1),
     # Labels, hints and second lines the painter translates directly.
     ("tilefinch_ui_text", 0), ("tilefinch_ui_logical_text", 0),
+    # A reworded hint and the earlier wording a catalog may still carry.
+    ("ui_text_or_legacy", 0), ("ui_text_or_legacy", 1),
     # A setting's reloading, saved and reload-failed notices.
     ("psp_app_reload_after_setting", 2), ("psp_app_reload_after_setting", 3),
     ("psp_app_reload_after_setting", 4),
@@ -232,7 +234,10 @@ def literal_values(expression, macros):
         expression = re.sub(r"\b%s\b" % name, value, expression)
     for run in LITERAL_RUN.finditer(expression):
         text = "".join(LITERAL.findall(run.group(0)))
-        yield text.encode("utf-8").decode("unicode_escape")
+        # A C literal is bytes: "\xe2\x96\xa1" and a raw "□" both
+        # spell the key "□".
+        yield (text.encode("utf-8").decode("unicode_escape")
+               .encode("latin-1").decode("utf-8"))
 
 
 def function_body(source, name):
@@ -551,6 +556,11 @@ class UiToastCatalogTests(unittest.TestCase):
         self.assertEqual('f("A B");', join_adjacent_literals('f("A " "B");'))
         self.assertEqual('f("A B");',
                          join_adjacent_literals('f("A "\n    "B");'))
+
+    def test_byte_escapes_spell_utf8_keys(self):
+        source = 'f("\\xe2\\x96\\xa1 CAPTIONS", "□ X")'
+        self.assertEqual(["□ CAPTIONS", "□ X"],
+                         list(literal_values(source, {})))
 
     def test_suffix_rule_matches_the_painter(self):
         self.assertEqual(["SAVING SCREENSHOT"],

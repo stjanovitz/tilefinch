@@ -30,6 +30,16 @@ const char *media_failure_headline(MediaFailureKind kind)
         return "VIDEO SOURCE COULD NOT OPEN";
     case MEDIA_FAILURE_STREAM_UNAVAILABLE:
         return "STREAM OFFLINE OR NOT AVAILABLE";
+    case MEDIA_FAILURE_SIGN_IN_REQUIRED:
+        return "THIS VIDEO NEEDS SIGN-IN";
+    case MEDIA_FAILURE_VIDEO_UNAVAILABLE:
+        return "THIS VIDEO ISN'T AVAILABLE";
+    case MEDIA_FAILURE_NOT_STARTED_YET:
+        return "THIS VIDEO HASN'T STARTED YET";
+    case MEDIA_FAILURE_NETWORK:
+        return "NETWORK PROBLEM";
+    case MEDIA_FAILURE_MEMORY:
+        return "NOT ENOUGH MEMORY FOR VIDEO";
     case MEDIA_FAILURE_OTHER:
     default:
         return NULL;
@@ -61,6 +71,26 @@ const char *media_failure_detail_text(MediaFailureDetail detail)
         return "Picture size too large";
     case MEDIA_FAILURE_DETAIL_CODEC:
         return "No supported codec";
+    case MEDIA_FAILURE_DETAIL_SIGN_IN:
+        return "Sign in on YouTube, then retry";
+    case MEDIA_FAILURE_DETAIL_AGE:
+        return "Age-restricted: sign in first";
+    case MEDIA_FAILURE_DETAIL_PRIVATE:
+        return "It may be private or removed";
+    case MEDIA_FAILURE_DETAIL_REGION:
+        return "Blocked in your region";
+    case MEDIA_FAILURE_DETAIL_REFUSED:
+        return "YouTube refused it. Try later";
+    case MEDIA_FAILURE_DETAIL_TRY_WHEN_LIVE:
+        return "Try again when it starts";
+    case MEDIA_FAILURE_DETAIL_LIVE:
+        return "Unsupported live stream";
+    case MEDIA_FAILURE_DETAIL_CHECK_NETWORK:
+        return "Check Wi-Fi, then press X to retry";
+    case MEDIA_FAILURE_DETAIL_CLOSE_TABS:
+        return "Close other tabs, then retry";
+    case MEDIA_FAILURE_DETAIL_RESTART:
+        return "Retry, or restart Tilefinch";
     case MEDIA_FAILURE_DETAIL_NONE:
     case MEDIA_FAILURE_DETAIL_CODE:
     case MEDIA_FAILURE_DETAIL_HTTP_STATUS:
@@ -222,6 +252,115 @@ MediaResponseKind media_response_kind(
     return MEDIA_RESPONSE_UNKNOWN;
 }
 
+/*
+ * The YouTube resolver's playability verdict: "playability: NAME: STATUS
+ * (reason)" for the last client it asked, or "... client attempts (NAME)"
+ * when the watch page itself gave up after them. NAME is
+ * youtube_playability_name()'s and is kept as the code.
+ */
+static bool failure_playability(
+    const char *failure, MediaFailureKind *kind, MediaFailureDetail *detail,
+    char *code, size_t size)
+{
+    static const struct {
+        const char *name;
+        MediaFailureKind kind;
+        MediaFailureDetail detail;
+    } verdicts[] = {
+        {"login-required", MEDIA_FAILURE_SIGN_IN_REQUIRED,
+         MEDIA_FAILURE_DETAIL_SIGN_IN},
+        {"age-restricted", MEDIA_FAILURE_SIGN_IN_REQUIRED,
+         MEDIA_FAILURE_DETAIL_AGE},
+        {"region-blocked", MEDIA_FAILURE_VIDEO_UNAVAILABLE,
+         MEDIA_FAILURE_DETAIL_REGION},
+        {"unavailable", MEDIA_FAILURE_VIDEO_UNAVAILABLE,
+         MEDIA_FAILURE_DETAIL_PRIVATE},
+        {"client-rejected", MEDIA_FAILURE_VIDEO_UNAVAILABLE,
+         MEDIA_FAILURE_DETAIL_REFUSED},
+        {"upcoming", MEDIA_FAILURE_NOT_STARTED_YET,
+         MEDIA_FAILURE_DETAIL_TRY_WHEN_LIVE},
+        {"live-unsupported", MEDIA_FAILURE_FORMAT_UNSUPPORTED,
+         MEDIA_FAILURE_DETAIL_LIVE}
+    };
+    const char *name = strstr(failure, "playability: ");
+    if (name != NULL) {
+        name += 13;
+    } else if ((name = strstr(failure, "client attempts (")) != NULL) {
+        name += 17;
+    } else {
+        return false;
+    }
+    for (size_t i = 0; i < sizeof(verdicts) / sizeof(verdicts[0]); i++) {
+        size_t length = strlen(verdicts[i].name);
+        if (strncmp(name, verdicts[i].name, length) != 0
+            || (name[length] != ':' && name[length] != ')'
+                && name[length] != '\0')) continue;
+        *kind = verdicts[i].kind;
+        *detail = verdicts[i].detail;
+        snprintf(code, size, "%s", verdicts[i].name);
+        return true;
+    }
+    return false;
+}
+
+/* The firmware media modules' start failures: "AV WP 800200D2
+   (poll-module-worker)". Out-of-memory statuses say so; any other one
+   leaves the player unable to start until a retry or a restart. */
+static bool failure_media_module(
+    const char *failure, MediaFailureKind *kind, MediaFailureDetail *detail,
+    char *code, size_t size)
+{
+    const char *at = failure;
+    while ((at = strstr(at, "AV ")) != NULL) {
+        bool shape = at[3] >= 'A' && at[3] <= 'Z'
+            && at[4] >= 'A' && at[4] <= 'Z' && at[5] == ' ';
+        size_t digits = 0;
+        while (shape && digits < 8u && isxdigit((unsigned char) at[6 + digits]))
+            digits++;
+        if (shape && digits == 8u && !isxdigit((unsigned char) at[14])) {
+            uint32_t status = (uint32_t) strtoul(at + 6, NULL, 16);
+            /* SCE_KERNEL_ERROR_NO_MEMORY, SCE_KERNEL_ERROR_MEMBLOCK_ALLOC_FAILED */
+            bool memory = status == UINT32_C(0x80020190)
+                || status == UINT32_C(0x800200D9);
+            *kind = memory ? MEDIA_FAILURE_MEMORY
+                           : MEDIA_FAILURE_DECODER_NOT_STARTED;
+            *detail = memory ? MEDIA_FAILURE_DETAIL_CLOSE_TABS
+                             : MEDIA_FAILURE_DETAIL_RESTART;
+            snprintf(code, size, "%.14s", at);
+            return true;
+        }
+        at += 3;
+    }
+    return false;
+}
+
+/* The resolver's own request failures. Network trouble names the step that
+   failed; memory trouble is the shared response budget. */
+static bool failure_player_request(
+    const char *failure, MediaFailureKind *kind, MediaFailureDetail *detail,
+    char *code, size_t size)
+{
+    if (strncmp(failure, "player: ", 8u) != 0
+        && strncmp(failure, "watch: ", 7u) != 0) return false;
+    if (strstr(failure, "exceeded shared memory budget") != NULL
+        || strstr(failure, "allocation failed") != NULL) {
+        *kind = MEDIA_FAILURE_MEMORY;
+        *detail = MEDIA_FAILURE_DETAIL_CLOSE_TABS;
+        snprintf(code, size, "%s", "player memory");
+    } else if (strstr(failure, "timed out") != NULL) {
+        *kind = MEDIA_FAILURE_NETWORK;
+        *detail = MEDIA_FAILURE_DETAIL_CHECK_NETWORK;
+        snprintf(code, size, "%s", "timed out");
+    } else if (strstr(failure, "fetch failed") != NULL) {
+        *kind = MEDIA_FAILURE_NETWORK;
+        *detail = MEDIA_FAILURE_DETAIL_CHECK_NETWORK;
+        snprintf(code, size, "%s", "fetch failed");
+    } else {
+        return false;
+    }
+    return true;
+}
+
 /* A stream address with nothing to play now: the open paths' own words
    (MEDIA_STREAM_UNAVAILABLE), an HLS playlist with no entry or that is no
    playlist at all, or an HLS request answered 404 or 410. */
@@ -252,6 +391,10 @@ bool media_failure_message(const char *failure, MediaFailureMessage *message)
         message->kind = MEDIA_FAILURE_DECODER_NOT_STARTED;
     } else if (failure_format(failure, &detail)) {
         message->kind = MEDIA_FAILURE_FORMAT_UNSUPPORTED;
+    } else if (failure_playability(
+                   failure, &message->kind, &detail,
+                   message->code, sizeof(message->code))) {
+        /* The verdict set the kind, its next step and its name. */
     } else if (failure_stream_unavailable(failure)) {
         message->kind = MEDIA_FAILURE_STREAM_UNAVAILABLE;
         detail = failure_http_status(
@@ -261,13 +404,24 @@ bool media_failure_message(const char *failure, MediaFailureMessage *message)
                    failure, message->code, sizeof(message->code))) {
         message->kind = MEDIA_FAILURE_SOURCE_REFUSED;
         detail = MEDIA_FAILURE_DETAIL_HTTP_STATUS;
-    } else {
+    } else if (!failure_media_module(
+                   failure, &message->kind, &detail,
+                   message->code, sizeof(message->code))
+               && !failure_player_request(
+                   failure, &message->kind, &detail,
+                   message->code, sizeof(message->code))) {
         return false;
     }
     message->detail = detail;
     message->headline = media_failure_headline(message->kind);
     const char *text = media_failure_detail_text(detail);
-    message->details = text != NULL ? text
-        : message->code[0] != '\0' ? message->code : "";
+    if (text != NULL && message->code[0] != '\0') {
+        snprintf(message->line, sizeof(message->line), "%s\n%s",
+                 text, message->code);
+        message->details = message->line;
+    } else {
+        message->details = text != NULL ? text
+            : message->code[0] != '\0' ? message->code : "";
+    }
     return true;
 }

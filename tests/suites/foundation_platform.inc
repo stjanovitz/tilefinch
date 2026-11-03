@@ -706,6 +706,118 @@ static bool test_youtube_player_response_parser(void)
         || strstr(error, "has not started yet") == NULL) {
         return false;
     }
+    /* Reasons are matched as phrases: "Management", "Image" and "page"
+       contain "age" but are not age gates, and an ended Premiere is an
+       unavailable video, not one that has not started. */
+    static const struct {
+        const char *json;
+        YoutubePlayability expected;
+    } reasons[] = {
+        {"{\"playabilityStatus\":{\"status\":\"UNPLAYABLE\",\"reason\":"
+         "\"This video is no longer available due to a copyright claim by "
+         "Example Management\"}}", YOUTUBE_PLAYABILITY_CLIENT_REJECTED},
+        {"{\"playabilityStatus\":{\"status\":\"ERROR\",\"reason\":"
+         "\"This video has been removed for violating YouTube's policy "
+         "(Image)\"}}", YOUTUBE_PLAYABILITY_UNAVAILABLE},
+        {"{\"playabilityStatus\":{\"status\":\"UNPLAYABLE\",\"reason\":"
+         "\"This premiere is no longer available\"}}",
+         YOUTUBE_PLAYABILITY_CLIENT_REJECTED},
+        {"{\"playabilityStatus\":{\"status\":\"UNPLAYABLE\",\"reason\":"
+         "\"Watch this upcoming page later\"}}",
+         YOUTUBE_PLAYABILITY_CLIENT_REJECTED},
+        {"{\"playabilityStatus\":{\"status\":\"UNPLAYABLE\",\"reason\":"
+         "\"This video may be inappropriate for some users.\"}}",
+         YOUTUBE_PLAYABILITY_AGE_RESTRICTED},
+        {"{\"playabilityStatus\":{\"status\":\"UNPLAYABLE\",\"reason\":"
+         "\"This video is age-restricted\"}}",
+         YOUTUBE_PLAYABILITY_AGE_RESTRICTED},
+        {"{\"playabilityStatus\":{\"status\":\"AGE_CHECK_REQUIRED\"}}",
+         YOUTUBE_PLAYABILITY_AGE_RESTRICTED},
+        {"{\"playabilityStatus\":{\"status\":\"UNPLAYABLE\",\"reason\":"
+         "\"Premieres in 2 hours\",\"liveStreamability\":{"
+         "\"liveStreamabilityRenderer\":{\"offlineSlate\":{}}}}}",
+         YOUTUBE_PLAYABILITY_UPCOMING_UNSUPPORTED}
+    };
+    for (size_t at = 0; at < sizeof(reasons) / sizeof(reasons[0]); at++) {
+        if (youtube_parse_player_response_diagnostic(
+                reasons[at].json, strlen(reasons[at].json), "reason", 240,
+                &playability, &stream, error, sizeof(error))
+            || playability != reasons[at].expected) {
+            fprintf(stderr, "playability reason %zu: %s\n", at, error);
+            return false;
+        }
+    }
+    /* A signature timestamp at the end of a received watch-page prefix may
+       be cut short; only a terminated number is accepted. */
+    static const char sts_cut[] = "ytcfg.set({\"STS\":2012";
+    static const char sts_whole[] = "ytcfg.set({\"STS\":20125,\"X\":1})";
+    uint64_t sts = 0;
+    if (youtube_resolver_test_watch_unsigned(
+            sts_cut, sizeof(sts_cut) - 1u, "STS", &sts)
+        || !youtube_resolver_test_watch_unsigned(
+               sts_whole, sizeof(sts_whole) - 1u, "STS", &sts)
+        || sts != 20125u) {
+        return false;
+    }
+    /* A directly deliverable stream whose URLs expire too soon reports the
+       expiry, not a need for enriched context. */
+    YoutubeStream direct_stream = {0}, accepted = {0};
+    snprintf(direct_stream.media_url, sizeof(direct_stream.media_url), "%s",
+             "https://rr1.googlevideo.com/videoplayback?expire=1");
+    direct_stream.content_length = 1000u;
+    if (youtube_resolver_test_accept_direct_stream(
+            "IOS", &direct_stream, &accepted, error, sizeof(error))
+        || strcmp(error, "format: media URL expires too soon") != 0) {
+        return false;
+    }
+    direct_stream.content_length = 0;
+    if (youtube_resolver_test_accept_direct_stream(
+            "IOS", &direct_stream, &accepted, error, sizeof(error))
+        || strstr(error, "requires enriched context") == NULL) {
+        return false;
+    }
+    /* Captions come from the timed-text endpoint on the web hosts only. */
+    if (!youtube_caption_url_supported(
+            "https://www.youtube.com/api/timedtext?v=x&lang=en")
+        || !youtube_caption_url_supported(
+               "https://m.youtube.com/api/timedtext?v=x")
+        || youtube_caption_url_supported(
+               "https://accounts.youtube.com/api/timedtext?v=x")
+        || youtube_caption_url_supported(
+               "https://www.youtube.com/signin?next=%2Fapi%2Ftimedtext")
+        || youtube_caption_url_supported(
+               "http://www.youtube.com/api/timedtext?v=x")) {
+        return false;
+    }
+    /* A video that is not live, whose only usable delivery is the HLS
+       manifest, is not a live stream: it must not open as LIVE. */
+    static const char vod_hls_only[] =
+        "{\"playabilityStatus\":{\"status\":\"OK\"},"
+        "\"videoDetails\":{\"isLiveContent\":false},"
+        "\"streamingData\":{\"hlsManifestUrl\":"
+        "\"https://manifest.googlevideo.com/vod.m3u8\","
+        "\"adaptiveFormats\":[{\"itag\":243,\"width\":640,\"height\":360,"
+        "\"contentLength\":\"1000\","
+        "\"mimeType\":\"video/webm; codecs=\\\"vp9\\\"\","
+        "\"url\":\"https://rr1.googlevideo.com/vp9.webm\"}]}}";
+    static const char vod_manifest_only[] =
+        "{\"playabilityStatus\":{\"status\":\"OK\"},"
+        "\"streamingData\":{\"hlsManifestUrl\":"
+        "\"https://manifest.googlevideo.com/vod.m3u8\"}}";
+    memset(&stream, 0, sizeof(stream));
+    if (youtube_parse_player_response_diagnostic(
+            vod_hls_only, strlen(vod_hls_only), "vodhls", 240,
+            &playability, &stream, error, sizeof(error))
+        || stream.live_hls || strncmp(error, "format:", 7) != 0) {
+        return false;
+    }
+    memset(&stream, 0, sizeof(stream));
+    if (youtube_parse_player_response_diagnostic(
+            vod_manifest_only, strlen(vod_manifest_only), "vodhls", 240,
+            &playability, &stream, error, sizeof(error))
+        || stream.live_hls || strncmp(error, "format:", 7) != 0) {
+        return false;
+    }
 
     static const char untrusted[] =
         "{\"playabilityStatus\":{\"status\":\"OK\"},"
@@ -996,6 +1108,132 @@ static bool test_youtube_subtitle_parser(void)
         && late != NULL && strcmp(late, caption_text) == 0;
     youtube_subtitles_destroy(streamed);
     return ok && streaming_budget.current == 0;
+}
+
+/* One generated cue every 1.5 s, like a long auto-caption track. */
+static unsigned char *test_youtube_subtitle_track(unsigned cues,
+                                                  size_t *length)
+{
+    size_t capacity = (size_t) cues * 96u + 16u;
+    unsigned char *source = malloc(capacity);
+    if (source == NULL) return NULL;
+    size_t used = (size_t) snprintf((char *) source, capacity, "WEBVTT\n\n");
+    for (unsigned cue = 0; cue < cues; cue++) {
+        unsigned start = cue * 1500u, end = start + 1400u;
+        int written = snprintf(
+            (char *) source + used, capacity - used,
+            "%02u:%02u:%02u.%03u --> %02u:%02u:%02u.%03u\n"
+            "word%04u spoken caption text of a long talk\n\n",
+            start / 3600000u, start / 60000u % 60u, start / 1000u % 60u,
+            start % 1000u, end / 3600000u, end / 60000u % 60u,
+            end / 1000u % 60u, end % 1000u, cue);
+        if (written <= 0 || (size_t) written >= capacity - used) {
+            free(source);
+            return NULL;
+        }
+        used += (size_t) written;
+    }
+    *length = used;
+    return source;
+}
+
+static bool test_youtube_subtitle_text_at_cue(
+    const YoutubeSubtitleDocument *document, unsigned cue)
+{
+    char expected[48];
+    snprintf(expected, sizeof(expected),
+             "word%04u spoken caption text of a long talk", cue);
+    size_t cursor = 0;
+    const char *text = youtube_subtitles_text_at(
+        document, (uint64_t) cue * 1500000u + 700000u, &cursor);
+    return text != NULL && strcmp(text, expected) == 0;
+}
+
+static bool test_youtube_subtitle_windows(void)
+{
+    YoutubeSubtitleRetry retry = {0};
+    const uint64_t end = UINT64_C(3000000000);
+    if (!youtube_subtitles_retry_extension(&retry, end, 0)
+        || youtube_subtitles_retry_extension(&retry, end, 0)
+        || youtube_subtitles_retry_extension(&retry, end, 4999999)
+        || !youtube_subtitles_retry_extension(&retry, end, 5000000)
+        || !youtube_subtitles_retry_extension(&retry, end, 10000000)
+        || youtube_subtitles_retry_extension(&retry, end, 15000000)
+        || !youtube_subtitles_retry_extension(&retry, end + 1u, 15000000)) return false;
+    retry = (YoutubeSubtitleRetry) {0};
+    if (!youtube_subtitles_retry_extension(&retry, end, UINT64_MAX - 10u)
+        || youtube_subtitles_retry_extension(&retry, end, UINT64_MAX)
+        || youtube_subtitles_retry_extension(&retry, end, 0)) return false;
+    /* About 88 KiB of caption text spans 22 of the 32 text blocks. Cues in
+       blocks 16 and later must not read the text of blocks 0-15. */
+    size_t length = 0;
+    unsigned char *source = test_youtube_subtitle_track(2000u, &length);
+    if (source == NULL) return false;
+    Budget budget;
+    budget_init(&budget, 1024u * 1024u);
+    YoutubeSubtitleDocument *document =
+        youtube_subtitles_parse_vtt(&budget, source, length);
+    bool ok = document != NULL
+        && youtube_subtitles_cue_count(document) == 2000u
+        && test_youtube_subtitle_text_at_cue(document, 5u)
+        && test_youtube_subtitle_text_at_cue(document, 1950u)
+        && test_youtube_subtitle_text_at_cue(document, 1999u);
+    YoutubeSubtitleWindow window;
+    ok = ok && youtube_subtitles_window(document, &window)
+        && window.start_us == 0 && !window.truncated
+        && youtube_subtitles_window_action(
+               document, UINT64_C(3000000000), UINT64_C(60000000))
+               == YOUTUBE_SUBTITLE_WINDOW_KEEP;
+    youtube_subtitles_destroy(document);
+    free(source);
+    if (!ok || budget.current != 0) return false;
+
+    /* 3,000 cues exceed the 2,048-cue bound. The document reports where it
+       stopped, and asks for a later window only near that point. */
+    source = test_youtube_subtitle_track(3000u, &length);
+    if (source == NULL) return false;
+    document = youtube_subtitles_parse_vtt(&budget, source, length);
+    uint64_t last_end_us = UINT64_C(2047) * 1500000u + 1400000u;
+    ok = document != NULL
+        && youtube_subtitles_cue_count(document) == 2048u
+        && youtube_subtitles_window(document, &window)
+        && window.truncated && window.end_us == last_end_us
+        && youtube_subtitles_window_action(
+               document, last_end_us - UINT64_C(61000000),
+               UINT64_C(60000000)) == YOUTUBE_SUBTITLE_WINDOW_KEEP
+        && youtube_subtitles_window_action(
+               document, last_end_us - UINT64_C(59000000),
+               UINT64_C(60000000)) == YOUTUBE_SUBTITLE_WINDOW_EXTEND
+        && youtube_subtitles_window_action(
+               document, last_end_us + UINT64_C(500000000),
+               UINT64_C(60000000)) == YOUTUBE_SUBTITLE_WINDOW_EXTEND;
+    youtube_subtitles_destroy(document);
+    if (!ok || budget.current != 0) {
+        free(source);
+        return false;
+    }
+
+    /* The later window starts at its minimum time and reaches the end of
+       the track. A seek back before that minimum asks for a reload. */
+    YoutubeSubtitleBuilder *builder = youtube_subtitles_builder_create(
+        &budget, UINT64_C(3000000000));
+    ok = builder != NULL
+        && youtube_subtitles_builder_feed(builder, source, length);
+    document = ok ? youtube_subtitles_builder_finish(builder) : NULL;
+    if (!ok) youtube_subtitles_builder_destroy(builder);
+    free(source);
+    ok = document != NULL
+        && youtube_subtitles_window(document, &window)
+        && window.start_us == UINT64_C(3000000000) && !window.truncated
+        && test_youtube_subtitle_text_at_cue(document, 2900u)
+        && youtube_subtitles_window_action(
+               document, UINT64_C(3100000000), UINT64_C(60000000))
+               == YOUTUBE_SUBTITLE_WINDOW_KEEP
+        && youtube_subtitles_window_action(
+               document, UINT64_C(2980000000), UINT64_C(60000000))
+               == YOUTUBE_SUBTITLE_WINDOW_RELOAD;
+    youtube_subtitles_destroy(document);
+    return ok && budget.current == 0;
 }
 
 typedef struct {
@@ -1886,6 +2124,8 @@ static int test_foundation(void)
     CHECK(test_youtube_ranked_track_retention());
     puts("test: bounded YouTube subtitle parser");
     CHECK(test_youtube_subtitle_parser());
+    puts("test: YouTube subtitle text blocks and windows");
+    CHECK(test_youtube_subtitle_windows());
     puts("test: bounded YouTube lightweight page builder");
     CHECK(test_youtube_lite_document_builder(&budget));
     CHECK(test_youtube_lite_lockup_cards() == 0);

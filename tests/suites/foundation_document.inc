@@ -5100,6 +5100,39 @@
                  sizeof(startup_cursor)) != 0);
     tile_cache_cancel_idle_work(&cache);
     puts("test: bounded foreground frame preparation");
+    TileCache input_cache;
+    CHECK(tile_cache_init(&input_cache, &budget, &layout, 16));
+    tile_cache_schedule_prefetch_row(&input_cache, 0, 480);
+    IdleInputProbe idle_input = {0};
+    TilefinchPlatformServices idle_services = {
+        .context = &idle_input, .cooperate_at = test_idle_input_cooperate
+    };
+    size_t idle_units_before = input_cache.idle_units;
+    tilefinch_platform_set_services(&idle_services);
+    (void) tile_cache_run_idle_work(&input_cache, UINT64_MAX / 2u, 16);
+    tilefinch_platform_set_services(NULL);
+    CHECK(idle_input.queued && idle_input.borrowed
+          && idle_input.boundaries == 2u
+          && input_cache.idle_units == idle_units_before + 1u
+          && input_cache.rasterized == 1u
+          && tile_cache_idle_work_pending(&input_cache));
+    RenderIdleWork input_cursor = input_cache.idle_work;
+    idle_input.queued = true;
+    tilefinch_platform_set_services(&idle_services);
+    (void) tile_cache_run_idle_work(&input_cache, UINT64_MAX / 2u, 16);
+    tilefinch_platform_set_services(NULL);
+    CHECK(memcmp(&input_cursor, &input_cache.idle_work, sizeof(input_cursor)) == 0
+          && input_cache.idle_units == idle_units_before + 1u);
+    while (tile_cache_idle_work_pending(&input_cache))
+        (void) tile_cache_run_idle_work(&input_cache, UINT64_MAX / 2u, 16);
+    uint16_t *input_frame = budget_malloc(&budget, 480u * 272u * sizeof(*input_frame));
+    CHECK(input_frame != NULL
+          && tile_cache_set_frame(&input_cache, input_frame, 480u * 272u)
+          && tile_cache_render_frame(&input_cache, 0, 480, 272, NULL)
+          && tile_cache_render_frame(&cache, 0, 480, 272, NULL)
+          && memcmp(input_frame, frame, 480u * 272u * sizeof(*input_frame)) == 0);
+    tile_cache_destroy(&input_cache);
+    budget_free(&budget, input_frame);
     uint16_t *stable_frame = budget_malloc(
         &budget, 480u * 272u * sizeof(*stable_frame));
     CHECK(stable_frame != NULL

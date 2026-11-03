@@ -76,6 +76,8 @@ struct BrowserProfile {
     BrowserSubtitleSize subtitle_size;
     BrowserSubtitleBackground subtitle_background;
     bool youtube_compact_results;
+    /* Stored inverted so a profile without the record shows banners. */
+    bool youtube_channel_banners_hidden;
     bool youtube_audio_only;
     bool resume_offline_downloads;
     bool save_playback_positions;
@@ -357,6 +359,9 @@ BrowserProfile *browser_profile_create(Budget *budget)
     profile->live_cache_kib = BROWSER_PROFILE_TRANSIENT_CACHE_KIB;
     profile->youtube_quality = BROWSER_YOUTUBE_QUALITY_360P;
     profile->youtube_topics = true;
+    /* Compact rows are the default. A saved choice (MEDIA field 5) wins only
+       next to a YTRESULTS record; see the load. */
+    profile->youtube_compact_results = true;
     profile->video_language = BROWSER_VIDEO_LANGUAGE_SYSTEM;
     profile->subtitle_language = BROWSER_SUBTITLE_LANGUAGE_SYSTEM;
     profile->alternate_language = BROWSER_ALTERNATE_LANGUAGE_NONE;
@@ -723,6 +728,16 @@ bool browser_profile_save(const BrowserProfile *profile, const char *path)
                      profile->wifi_diagnostics ? 1u : 0u) > 0;
     }
     if (ok) {
+        /* Append-only; marks MEDIA field 5 as a choice made with Compact as
+           the default, so the load keeps it. */
+        ok = fprintf(file, "YTRESULTS\t1\n") > 0;
+    }
+    if (ok) {
+        /* Append-only; a profile without it shows channel banners. */
+        ok = fprintf(file, "YTBANNER\t%u\n",
+                     profile->youtube_channel_banners_hidden ? 1u : 0u) > 0;
+    }
+    if (ok) {
         /* Append-only; Ask is the safe default for old profiles. */
         ok = fprintf(file, "YTLOGIN\t%u\n", (unsigned) profile->youtube_login_policy) > 0;
     }
@@ -870,6 +885,7 @@ static bool profile_load_internal(
         .analog_cursor_enabled = true,
         .live_cache_kib = BROWSER_PROFILE_TRANSIENT_CACHE_KIB,
         .youtube_quality = BROWSER_YOUTUBE_QUALITY_360P,
+        .youtube_compact_results = true,
         .subtitle_background = BROWSER_SUBTITLE_BACKGROUND_SHADOW,
         .video_startup_buffering = true,
         .content_blocker_mode = CONTENT_BLOCKER_BASIC,
@@ -885,6 +901,7 @@ static bool profile_load_internal(
     bool header = false;
     bool complete = true;
     bool footer_seen = false;
+    bool results_choice_seen = false;
     uint32_t checksum = PROFILE_FNV_OFFSET;
     size_t checksum_length = 0;
     while (fgets(line, sizeof(line), file) != NULL) {
@@ -1114,6 +1131,11 @@ static bool profile_load_internal(
         } else if (strcmp(line, "TABS") == 0) {
             loaded->tab_hibernation_enabled =
                 strtoul(first, NULL, 10) != 0;
+        } else if (strcmp(line, "YTRESULTS") == 0) {
+            results_choice_seen = strcmp(first, "1") == 0;
+        } else if (strcmp(line, "YTBANNER") == 0) {
+            if (strcmp(first, "0") == 0 || strcmp(first, "1") == 0)
+                loaded->youtube_channel_banners_hidden = first[0] == '1';
         } else if (strcmp(line, "WAVE") == 0) {
             loaded->wave_background = strtoul(first, NULL, 10) != 0;
         } else if (strcmp(line, "POLICY") == 0 && second != NULL) {
@@ -1397,6 +1419,10 @@ static bool profile_load_internal(
     bool ok = fclose(file) == 0 && header && complete && footer_seen
         && read_ok;
     if (ok) {
+        /* Builds before Compact became the default always wrote Detailed
+           into MEDIA field 5, so it is a choice only once YTRESULTS says so;
+           without it the profile moves to Compact. */
+        if (!results_choice_seen) loaded->youtube_compact_results = true;
         if (!loaded->save_playback_positions)
             (void) browser_profile_clear_playback_positions(loaded);
         *profile = *loaded;
@@ -1747,7 +1773,12 @@ const char *browser_alternate_language_tag(
 bool browser_profile_youtube_compact_results(
     const BrowserProfile *profile)
 {
-    return profile != NULL && profile->youtube_compact_results;
+    return profile == NULL || profile->youtube_compact_results;
+}
+
+bool browser_profile_youtube_channel_banners(const BrowserProfile *profile)
+{
+    return profile == NULL || !profile->youtube_channel_banners_hidden;
 }
 
 bool browser_profile_youtube_audio_only(const BrowserProfile *profile)
@@ -2330,6 +2361,12 @@ void browser_profile_set_youtube_compact_results(
     BrowserProfile *profile, bool compact)
 {
     if (profile != NULL) profile->youtube_compact_results = compact;
+}
+
+void browser_profile_set_youtube_channel_banners(
+    BrowserProfile *profile, bool shown)
+{
+    if (profile != NULL) profile->youtube_channel_banners_hidden = !shown;
 }
 
 void browser_profile_set_youtube_audio_only(

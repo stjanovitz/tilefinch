@@ -8,6 +8,47 @@ mechanics.
 
 ## Unreleased
 
+## 0.1.45 — 2026-11-02
+
+- Clearer, more compact YouTube pages, with better channel and playlist information, improved account feedback, and updated translations.
+- More reliable playback and captions, clearer player controls and errors, and smoother page navigation.
+
+- Oversized JavaScript closures fail safely instead of overflowing their captured-variable indices, and repeated built-in symbol-key coercions no longer retain references.
+- Play all and playlist pagination advance through pages of unavailable videos without looping or losing their removable rows.
+- Failed caption-window extensions retry with a bounded delay while the current captions remain available.
+- Moving between controls with the same label restores the focus hint, and queued input stops background paint preparation between units.
+- Long YouTube titles and channel names now show as much as fits, cut between characters. Before, a search card whose title was longer than about 255 bytes (85 Japanese, Chinese or Korean characters) said "YouTube video" instead, and long channel names and video-page titles could end in a broken character.
+- Private and deleted videos in a YouTube playlist are shown as dimmed rows with YouTube's own title (such as "[Private video]"), with no picture or player, and are left out of the playlist queue and Play all, which could start on one. On your own playlists they keep their Remove action.
+- More YouTube links open the right page: `http://` video and Shorts links, `/live/` and `/embed/` video links, and links ending in a slash (such as `/shorts/ID/`, `/results/`, `/feed/history/` and `/playlist/`) used to open YouTube Home, and a channel tab link ending in a slash (`/@name/videos/`) opened the channel without selecting that tab.
+- A YouTube search longer than the search box holds (255 bytes) is cut between characters, and the search box, the heading, the request and the next page all use the same text. Before, the cut could fall inside a character and was sent that way.
+- Videos on a YouTube channel's own tabs show their view count and age; when YouTube sent them as a single line, the view count was shown as the channel name and the age was lost.
+- When the next page of YouTube search results, a channel tab or a playlist can't be loaded, the page now says "More results could not load." with a Try again link. Before, the first page was shown again in its place, whose Load more led back to the same failure.
+- Scheduled YouTube streams and premieres show their start date (from YouTube's start time, in UTC) where YouTube's own page fills it in; when no start time is given, the line is left out instead of showing a placeholder.
+- On the YouTube home page, Refresh suggestions sits under the "Suggestions will load in the background" line instead of overlapping the top of the welcome box.
+- A YouTube video page, signed out, shows Sign in only once, in the header; the second Sign in beside the channel name is gone.
+- Empty YouTube pages use plain wording: "No videos found. Try another search.", "No videos found." on a channel tab and "No comments to show." replace messages about a "bounded public response".
+- YouTube captions stay right through long videos. After about 35 to 50 minutes of automatic captions, lines from earlier in the video could show in place of the current one, and on a long video captions could stop for good partway through, or vanish after a rewind to before the point where they were turned on. The player now fetches the next stretch of captions before the current one runs out, and fetches them again after such a rewind.
+- When a YouTube video can't play, the player says why and what to try, in your language: for example THIS VIDEO NEEDS SIGN-IN with "Sign in on YouTube, then retry", THIS VIDEO ISN'T AVAILABLE with "It may be private or removed", NETWORK PROBLEM, or NOT ENOUGH MEMORY FOR VIDEO with "Close other tabs, then retry". The technical code stays as a small line in the panel's corner, for bug reports. Before, the panel showed raw codes such as "AV WP 800200D2" or "playability: login-required".
+- YouTube's reasons for refusing a video are read more carefully: a reason that merely contained words such as "page" or "message" was reported as an age check, and an ended premiere as a stream that had not started yet.
+- A YouTube video that is not live no longer opens as a live stream, with a LIVE label and no seek bar, when YouTube offers it only in a format the PSP can't play plus a streamed version; Tilefinch asks YouTube for another version instead.
+- A YouTube video whose links expire too soon now fails with that reason instead of an unrelated one, caption tracks are downloaded only from YouTube's caption address, and a video no longer fails now and then because a number on its page was read before all of it had arrived.
+- Square turns captions on and off during playback in one press. Turning them on brings back the track that was last showing, or the first one in your subtitle language; a track picked in the menu becomes the one Square brings back.
+- The player's hints name every button they use: the time row ends with LEFT/RIGHT 10S (D-pad seek), Square's CAPTIONS where the video has captions, and O CLOSE; the track menu's footer says L/R switches its tabs; and the YouTube login offer says Select also answers Not now.
+- A video that is still opening after 10 seconds says "Still loading — O to cancel". A switch to 240p, chosen on the failure panel or made by the player on its own, says "Retrying at 240p" until the video plays or fails.
+- Once the bars have hidden themselves, moving focus with the D-pad to another labelled element, such as one of a YouTube video page's action icons, brings back the bottom hint bar naming it until it hides again.
+- Signing out of YouTube also signs out the account used to sign in, so the next Sign in asks which account to use instead of silently signing the same one back in.
+- When YouTube no longer accepts a saved login, Tilefinch removes it and says SIGNED OUT BY YOUTUBE. Before, the dead login was restored on every start.
+- Like and Unlike work on YouTube video pages opened from `/live/` and `/embed/` links; before, they failed without asking YouTube.
+- The new player messages and hints and the new YouTube page messages are translated in all 13 interface languages, in a new version of the interface translations (v14). In Bengali and Assamese, YouTube's Filters and Apply filters stay in English for now.
+- YouTube's Sign out moved from the page header into the Account panel, and it now asks first: "Sign out of YouTube and your Google account on this PSP?", with Cancel selected. After you sign out, Tilefinch says SIGNED OUT; before, one press signed out with no question and no message.
+- Signed out, the YouTube home page is just the header and the search box; the "Watch YouTube on this device" panel shows only while signed in.
+- YouTube search results fit more on the first screen: Filters is one short line under the heading, and result titles are held to two lines.
+- New setting: **Settings → Video → Channel banners** (Show or Hide, Show by default). Hide leaves the banner off YouTube channel pages without downloading it, which saves several hundred KiB of memory and brings the Home, Videos, Shorts and Playlists tabs onto the first screen. Each shelf's See all link now names its shelf.
+- YouTube search results are compact rows by default, including for existing profiles: earlier versions saved Detailed whether or not it was chosen, so this release moves every profile to Compact once. Detailed stays one setting away, and a choice made from now on is kept.
+- On a YouTube playlist, the hint bar names the row you are on ("Play from here: Episode 2: ...") instead of only "Play from here".
+- The focused YouTube search box has the same white ring as the other YouTube controls, and a video's category is listed after its description instead of on the first screen.
+- Correction to 0.1.44: the entry on YouTube channel pages says a signed-out channel page shows only Subscribe. As the later entry in that release says, signed out a channel page shows no Subscribe control; Sign in is in the page header.
+
 ## 0.1.44 — 2026-11-01
 
 - Browse YouTube channels with Home, Videos, Shorts and Playlists tabs, clearer live and upcoming stream labels, and more Up next suggestions.

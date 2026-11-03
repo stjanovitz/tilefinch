@@ -296,7 +296,8 @@ int main(void)
                  == BROWSER_CHROME_THEME_FINCH
           && browser_profile_youtube_quality(profile)
                  == BROWSER_YOUTUBE_QUALITY_360P
-          && !browser_profile_youtube_compact_results(profile)
+          && browser_profile_youtube_compact_results(profile)
+          && browser_profile_youtube_channel_banners(profile)
           && !browser_profile_youtube_audio_only(profile)
           && browser_profile_video_language(profile)
                  == BROWSER_VIDEO_LANGUAGE_SYSTEM
@@ -403,7 +404,8 @@ int main(void)
     browser_profile_set_wave_background(profile, false);
     browser_profile_set_youtube_quality(
         profile, BROWSER_YOUTUBE_QUALITY_240P);
-    browser_profile_set_youtube_compact_results(profile, true);
+    browser_profile_set_youtube_compact_results(profile, false);
+    browser_profile_set_youtube_channel_banners(profile, false);
     browser_profile_set_youtube_audio_only(profile, true);
     browser_profile_set_video_language(
         profile, BROWSER_VIDEO_LANGUAGE_SPANISH);
@@ -674,7 +676,8 @@ int main(void)
           && !browser_profile_wave_background(loaded)
           && browser_profile_youtube_quality(loaded)
                  == BROWSER_YOUTUBE_QUALITY_240P
-          && browser_profile_youtube_compact_results(loaded)
+          && !browser_profile_youtube_compact_results(loaded)
+          && !browser_profile_youtube_channel_banners(loaded)
           && browser_profile_youtube_audio_only(loaded)
           && browser_profile_video_language(loaded)
                  == BROWSER_VIDEO_LANGUAGE_SPANISH
@@ -823,7 +826,9 @@ int main(void)
           && browser_profile_wave_background(legacy_loaded)
           && browser_profile_youtube_quality(legacy_loaded)
                  == BROWSER_YOUTUBE_QUALITY_360P
-          && !browser_profile_youtube_compact_results(legacy_loaded)
+          /* Compact and banners are the defaults without a saved value. */
+          && browser_profile_youtube_compact_results(legacy_loaded)
+          && browser_profile_youtube_channel_banners(legacy_loaded)
           && !browser_profile_youtube_audio_only(legacy_loaded)
           && !browser_profile_save_playback_positions(legacy_loaded)
           && browser_profile_video_language(legacy_loaded)
@@ -931,13 +936,38 @@ int main(void)
           && browser_profile_load(two_field_loaded, path)
           && browser_profile_youtube_quality(two_field_loaded)
                  == BROWSER_YOUTUBE_QUALITY_240P
-          && !browser_profile_youtube_compact_results(two_field_loaded)
+          && browser_profile_youtube_compact_results(two_field_loaded)
           && !browser_profile_youtube_audio_only(two_field_loaded)
           && browser_profile_resume_offline_downloads(two_field_loaded)
           && browser_profile_video_scaling(two_field_loaded)
                  == BROWSER_VIDEO_SCALING_SMOOTH
           && browser_profile_video_startup_buffering(two_field_loaded));
     browser_profile_destroy(two_field_loaded);
+
+    /* MEDIA field 5 = 0 is Detailed, which every build before the Compact
+       default wrote. Without YTRESULTS the profile moves to Compact; with it
+       Detailed is a choice and stays. YTBANNER 1 hides channel banners, 0
+       shows them. */
+    for (unsigned variant = 0; variant < 4u; variant++) {
+        bool hidden = (variant & 1u) != 0;
+        bool chosen = (variant & 2u) != 0;
+        char text[160];
+        snprintf(text, sizeof(text),
+                 "TILEFINCH_PROFILE\t1\nMEDIA\t360\t0\t0\t1\t0\n%sYTBANNER\t%u\n",
+                 chosen ? "YTRESULTS\t1\n" : "", hidden ? 1u : 0u);
+        FILE *saved_media = fopen(path, "wb");
+        CHECK(saved_media != NULL);
+        CHECK(fputs(text, saved_media) >= 0);
+        CHECK(fclose(saved_media) == 0);
+        CHECK(seal_profile(path));
+        BrowserProfile *saved_loaded = browser_profile_create(&budget);
+        CHECK(saved_loaded != NULL
+              && browser_profile_load(saved_loaded, path)
+              && browser_profile_youtube_compact_results(saved_loaded) == !chosen
+              && browser_profile_youtube_channel_banners(saved_loaded) == !hidden);
+        browser_profile_destroy(saved_loaded);
+    }
+
 
     FILE *forward = fopen(path, "wb");
     CHECK(forward != NULL);

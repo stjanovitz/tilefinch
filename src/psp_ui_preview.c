@@ -1,4 +1,5 @@
 #include "tilefinch/psp_ui.h"
+#include "tilefinch/media_failure_message.h"
 #include "tilefinch/psp_reader_policy.h"
 #include "tilefinch/budget.h"
 #include "tilefinch/build_version.h"
@@ -43,9 +44,37 @@ static bool preview_media_mode(const char *mode)
         || strcmp(mode, "media-chapters") == 0
         || strcmp(mode, "media-chapter-menu") == 0
         || strcmp(mode, "media-loading") == 0
+        || strcmp(mode, "media-loading-slow") == 0
+        || strcmp(mode, "media-queue") == 0
+        || strcmp(mode, "media-captions") == 0
         || strcmp(mode, "seek") == 0
-        || strcmp(mode, "media-error") == 0
+        || strncmp(mode, "media-error", 11) == 0
         || strcmp(mode, "media-retry") == 0;
+}
+
+/* The engine text each failure mode reports, raised the way
+   psp_media_raise_error raises it: a recognised failure as its headline and
+   details, anything else as the bare text. */
+static const char *preview_media_failure(const char *mode)
+{
+    if (strcmp(mode, "media-error-signin") == 0)
+        return "playability: login-required: LOGIN_REQUIRED "
+               "(Sign in to confirm you're not a bot)";
+    if (strcmp(mode, "media-error-network") == 0)
+        return "player: fetch failed: connection timed out";
+    if (strcmp(mode, "media-error-memory") == 0)
+        return "AV WC 800200D9 (create-module-worker)";
+    return "AV WP 800200D2 (poll-module-worker)";
+}
+
+static void preview_media_raise(PspUiMediaState *media, const char *failure)
+{
+    MediaFailureMessage friendly;
+    if (media_failure_message(failure, &friendly))
+        psp_ui_media_set_error_reason(
+            media, friendly.headline, friendly.details);
+    else
+        psp_ui_media_set_error(media, failure);
 }
 
 static bool write_ppm(const char *path, const uint16_t *frame)
@@ -758,6 +787,31 @@ int main(int argc, char **argv)
         psp_ui_set_focus(&ui, false, 0, 0, 0, 0);
         psp_reader_mark_engaged(&ui, true);
         ui.toast_entry_frames = 0;
+    } else if (strcmp(mode, "focus-hint") == 0) {
+        /* A watch page after the bar has hidden itself, the moment D-pad
+           focus reaches one of the icon-only actions (pass the page frame
+           as the third argument). An optional fourth argument is another
+           element's label and a fifth its "x,y,width,height". */
+        psp_ui_set_page(&ui, "Fixture video - YouTube",
+                        "https://www.youtube.com/watch?v=TFTEST00001", true);
+        int rect[4] = {188, 248, 40, 24};
+        if (argc > 5)
+            (void) sscanf(argv[5], "%d,%d,%d,%d",
+                          &rect[0], &rect[1], &rect[2], &rect[3]);
+        psp_ui_set_focus(&ui, true, rect[0], rect[1], rect[2], rect[3]);
+        ui.toast_frames = 0;
+        ui.chrome_visible = false;
+        (void) psp_ui_set_focus_label(
+            &ui, argc > 4 ? argv[4] : "Save to Watch later");
+    } else if (strcmp(mode, "page-status") == 0) {
+        /* A YouTube page frame (third argument) under the status note a
+           fourth argument names; an empty one shows the page with none. */
+        psp_ui_set_page(&ui, "YouTube", "https://www.youtube.com/", true);
+        psp_ui_set_focus(&ui, false, 0, 0, 0, 0);
+        ui.toast_frames = 0;
+        if (argc > 4 && argv[4][0] != '\0')
+            psp_ui_show_status(&ui, argv[4], 180);
+        ui.toast_entry_frames = 0;
     } else if (strcmp(mode, "large") == 0) {
         ui.browser_ui_scale = 2;
     } else if (preview_media_mode(mode)) {
@@ -788,7 +842,9 @@ int main(int argc, char **argv)
            to be reviewable as stills. */
         psp_ui_media_set(
             &media, true,
-            strcmp(mode, "media-playing") == 0 || big_buck_bunny, false,
+            strcmp(mode, "media-playing") == 0 || big_buck_bunny
+                || strcmp(mode, "media-queue") == 0
+                || strcmp(mode, "media-captions") == 0, false,
             big_buck_bunny ? UINT64_C(120000000) : UINT64_C(10000000),
             big_buck_bunny ? UINT64_C(596000000) : UINT64_C(18950000),
             big_buck_bunny ? "Big Buck Bunny" : "Fixture video");
@@ -805,15 +861,44 @@ int main(int argc, char **argv)
                 (void) psp_ui_media_update(&media, &input);
             }
         }
-        if (strcmp(mode, "media-loading") == 0) {
+        if (strcmp(mode, "media-captions") == 0) {
+            /* A video with captions, playing with them off. */
+            const PspUiMediaTrack audio[] = {{"English (original)"}};
+            const PspUiMediaTrack captions[] = {
+                {"English (auto)"}, {"Spanish"}
+            };
+            psp_ui_media_set_tracks(&media, audio, 1u, 0, captions, 2u, -1);
+        }
+        if (strcmp(mode, "media-queue") == 0) {
+            /* Playing the second of six playlist entries. */
+            presentation.queue_active = true;
+            presentation.queue_next = true;
+            presentation.queue_count = 6;
+            presentation.queue_position = 1;
+        }
+        if (strcmp(mode, "media-loading") == 0
+            || strcmp(mode, "media-loading-slow") == 0) {
             psp_ui_media_set_resolving(&media, "Fixture video");
             psp_ui_media_set_resolving_progress(
                 &media, "Loading...", 620u);
+            /* Twelve seconds of frames with no button pressed. */
+            for (unsigned at = 0; strcmp(mode, "media-loading-slow") == 0
+                                  && at < 120u; at++) {
+                PspUiInput idle = {
+                    .analog_x = 128, .analog_y = 128, .elapsed_ms = 100
+                };
+                (void) psp_ui_media_update(&media, &idle);
+            }
         } else if (strcmp(mode, "seek") == 0)
             psp_ui_media_set_seek_preview(&media, UINT64_C(15000000));
-        else if (strcmp(mode, "media-error") == 0)
-            psp_ui_media_set_error(&media, "AV WP 800200D2");
-        else if (strcmp(mode, "media-retry") == 0) {
+        else if (strncmp(mode, "media-error", 11) == 0) {
+            preview_media_raise(&media, preview_media_failure(mode));
+            /* A YouTube route offers audio-only and 240p recovery. */
+            media.audio_only_recovery_available =
+                strcmp(mode, "media-error") != 0;
+            media.lower_quality_recovery_available =
+                strcmp(mode, "media-error") != 0;
+        } else if (strcmp(mode, "media-retry") == 0) {
             psp_ui_media_set_resolving(&media, "Fixture video");
             psp_ui_media_set_resolving_progress(
                 &media, "Retrying at 240p", 400u);

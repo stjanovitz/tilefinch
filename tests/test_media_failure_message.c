@@ -154,6 +154,73 @@ static int test_failure_kinds(void)
              " (HLS playlist is empty)",
          MEDIA_FAILURE_STREAM_UNAVAILABLE, MEDIA_FAILURE_DETAIL_NONE,
          "STREAM OFFLINE OR NOT AVAILABLE", ""},
+        /* f: YouTube's playability verdict, by the resolver's name for it,
+           whether from the last client or after the watch page gave up. */
+        {"playability: login-required: LOGIN_REQUIRED (Sign in to confirm "
+             "you're not a bot)",
+         MEDIA_FAILURE_SIGN_IN_REQUIRED, MEDIA_FAILURE_DETAIL_SIGN_IN,
+         "THIS VIDEO NEEDS SIGN-IN",
+         "Sign in on YouTube, then retry\nlogin-required"},
+        {"watch: fetch failed after 3 client attempts: playability: "
+             "age-restricted: LOGIN_REQUIRED (Sign in to confirm your age)",
+         MEDIA_FAILURE_SIGN_IN_REQUIRED, MEDIA_FAILURE_DETAIL_AGE,
+         "THIS VIDEO NEEDS SIGN-IN",
+         "Age-restricted: sign in first\nage-restricted"},
+        {"watch: page omitted bounded player configuration after 4 client "
+             "attempts (login-required)",
+         MEDIA_FAILURE_SIGN_IN_REQUIRED, MEDIA_FAILURE_DETAIL_SIGN_IN,
+         "THIS VIDEO NEEDS SIGN-IN",
+         "Sign in on YouTube, then retry\nlogin-required"},
+        {"playability: unavailable: ERROR (This video is private)",
+         MEDIA_FAILURE_VIDEO_UNAVAILABLE, MEDIA_FAILURE_DETAIL_PRIVATE,
+         "THIS VIDEO ISN'T AVAILABLE",
+         "It may be private or removed\nunavailable"},
+        {"playability: region-blocked: UNPLAYABLE (The uploader has not "
+             "made this video available in your country)",
+         MEDIA_FAILURE_VIDEO_UNAVAILABLE, MEDIA_FAILURE_DETAIL_REGION,
+         "THIS VIDEO ISN'T AVAILABLE",
+         "Blocked in your region\nregion-blocked"},
+        {"playability: client-rejected: UNPLAYABLE",
+         MEDIA_FAILURE_VIDEO_UNAVAILABLE, MEDIA_FAILURE_DETAIL_REFUSED,
+         "THIS VIDEO ISN'T AVAILABLE",
+         "YouTube refused it. Try later\nclient-rejected"},
+        {"playability: upcoming: Premiere or live stream has not started yet",
+         MEDIA_FAILURE_NOT_STARTED_YET, MEDIA_FAILURE_DETAIL_TRY_WHEN_LIVE,
+         "THIS VIDEO HASN'T STARTED YET",
+         "Try again when it starts\nupcoming"},
+        {"playability: live-unsupported: OK",
+         MEDIA_FAILURE_FORMAT_UNSUPPORTED, MEDIA_FAILURE_DETAIL_LIVE,
+         "PSP CAN'T PLAY THIS VIDEO FORMAT",
+         "Unsupported live stream\nlive-unsupported"},
+        /* g: the player request itself. */
+        {"player: fetch failed: connection timed out",
+         MEDIA_FAILURE_NETWORK, MEDIA_FAILURE_DETAIL_CHECK_NETWORK,
+         "NETWORK PROBLEM",
+         "Check Wi-Fi, then press X to retry\ntimed out"},
+        {"player: enriched fetch failed: connection reset",
+         MEDIA_FAILURE_NETWORK, MEDIA_FAILURE_DETAIL_CHECK_NETWORK,
+         "NETWORK PROBLEM",
+         "Check Wi-Fi, then press X to retry\nfetch failed"},
+        {"watch: resolution timed out", MEDIA_FAILURE_NETWORK,
+         MEDIA_FAILURE_DETAIL_CHECK_NETWORK, "NETWORK PROBLEM",
+         "Check Wi-Fi, then press X to retry\ntimed out"},
+        {"player: response exceeded shared memory budget",
+         MEDIA_FAILURE_MEMORY, MEDIA_FAILURE_DETAIL_CLOSE_TABS,
+         "NOT ENOUGH MEMORY FOR VIDEO",
+         "Close other tabs, then retry\nplayer memory"},
+        /* h: the firmware media modules would not start. */
+        {"AV WP 800200D2 (poll-module-worker)",
+         MEDIA_FAILURE_DECODER_NOT_STARTED, MEDIA_FAILURE_DETAIL_RESTART,
+         "VIDEO DECODER COULDN'T START",
+         "Retry, or restart Tilefinch\nAV WP 800200D2"},
+        {"AV WC 800200D9 (create-module-worker)",
+         MEDIA_FAILURE_MEMORY, MEDIA_FAILURE_DETAIL_CLOSE_TABS,
+         "NOT ENOUGH MEMORY FOR VIDEO",
+         "Close other tabs, then retry\nAV WC 800200D9"},
+        {"AV ML 80020190 (load-mpeg-vsh)",
+         MEDIA_FAILURE_MEMORY, MEDIA_FAILURE_DETAIL_CLOSE_TABS,
+         "NOT ENOUGH MEMORY FOR VIDEO",
+         "Close other tabs, then retry\nAV ML 80020190"},
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         MediaFailureMessage message;
@@ -173,6 +240,9 @@ static int test_failure_kinds(void)
         /* The panel keeps the details line only after a one-row headline
            (psp_ui_media_set_error_reason). */
         CHECK(strlen(message.headline) <= 32u);
+        /* Headline, newline and details share the player's 80-byte status
+           (PSP_UI_STATUS_CAPACITY) whole. */
+        CHECK(strlen(message.headline) + 1u + strlen(message.details) < 80u);
     }
     return 0;
 }
@@ -195,6 +265,14 @@ static int test_other_failures_unchanged(void)
         "PSP AV module worker timed out",
         "page audio has no supported AAC track",
         "media open failed",
+        /* Resolver texts with no cause a reader can act on. */
+        "playability: unknown: ERROR",
+        "watch: page omitted bounded player configuration after 4 client "
+            "attempts (unknown)",
+        "player: request exceeded bound",
+        "format: no stream inventory",
+        /* Not a module status. */
+        "AV WP 8002 (poll-module-worker)",
         ""
     };
     for (size_t i = 0; i < sizeof(kept) / sizeof(kept[0]); i++) {

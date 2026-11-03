@@ -332,8 +332,12 @@ const char *browser_subtitle_language_tag(
     const char *audio_language);
 const char *browser_alternate_language_tag(
     BrowserAlternateLanguage language);
+/* Compact by default; a profile that saved Detailed keeps it. */
 bool browser_profile_youtube_compact_results(
     const BrowserProfile *profile);
+/* Channel page banners; shown by default. Hidden, the banner is neither
+   fetched nor decoded. */
+bool browser_profile_youtube_channel_banners(const BrowserProfile *profile);
 /* YouTube-only transport preference. When enabled, the resolver's adaptive
    AAC representation is opened without admitting or fetching its video
    companion. Disabled by default. */
@@ -478,6 +482,8 @@ void browser_profile_set_subtitle_background(
     BrowserProfile *profile, BrowserSubtitleBackground background);
 void browser_profile_set_youtube_compact_results(
     BrowserProfile *profile, bool compact);
+void browser_profile_set_youtube_channel_banners(
+    BrowserProfile *profile, bool shown);
 void browser_profile_set_youtube_audio_only(
     BrowserProfile *profile, bool enabled);
 void browser_profile_set_video_startup_buffering(

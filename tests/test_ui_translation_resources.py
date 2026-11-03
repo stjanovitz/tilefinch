@@ -13,7 +13,7 @@ import generate_ui_translations as generator
 
 
 class ResourceTests(unittest.TestCase):
-    def test_published_v12_resources_remain_immutable(self):
+    def test_published_resources_remain_immutable(self):
         resources = ROOT / "_resource_identity_probe"
         published = {
             "translations/ui/v12/es.tful": "ccebd012a6ee6461359f268879b5074953d47372b81620760520aef962b6b2c3",
@@ -29,6 +29,19 @@ class ResourceTests(unittest.TestCase):
             "translations/ui/v12/pt.tful": "73e1ebd6ee1d83780324df7c425becc3c16aae20592550ec514c13d5ffd8e1d1",
             "translations/ui/v12/bn.tful": "844408ff42aae65bf8ed29cf31ecc8a1bd69c3072976dbdc5a0f143836e5875e",
             "translations/ui/v12/as.tful": "5f8cc75142e272b0690b2df97102b65f854b78ad5bd8874938016e85fbd73595",
+            "translations/ui/v13/es.tful": "ab95ac10a8fec90770ef7a6d1061e3d246b5669277d795896574e68644c28641",
+            "translations/ui/v13/fr.tful": "65ef4c7bc794e04f8061272b2c8054c024f46ccc878de02af238ba71e993fce6",
+            "translations/ui/v13/de.tful": "bd25907a640d28bec46fa1ceffc43cf60003270d189f30a1d9fefa7eb14ccb89",
+            "translations/ui/v13/ja.tful": "64a9d4d14b4ca90ff4599d9eb6d37de9a7c043f6c97170c7c5db34e281577bff",
+            "translations/ui/v13/ru.tful": "658248f6fc15326e3e11a5e3efd367b1fad63b2d47c1c18ad36af2989b4e7dc9",
+            "translations/ui/v13/uk.tful": "ce2d950d89e59fe51ecdf31b25e5432d3e1a3b1add81e5ea6270894fe1975448",
+            "translations/ui/v13/zh-hans.tful": "c9c3f1cddecd4231d5f3eefacbdc23ae0a2d6af0ecf770c05214ffad7fa25423",
+            "translations/ui/v13/ko.tful": "83adef8afc6491e0a4f47a02548089d755fe1a4187e60d934d8a17ed0b8a0448",
+            "translations/ui/v13/hi.tful": "ae358e8033e33b37409abbb6557217e5c4a5665eb38ec09d40b21fbfa33d6036",
+            "translations/ui/v13/ar.tful": "3d38d10c5838e69d10f4df37fb5b9ae03219a3dc10ffcb412031973931afa02d",
+            "translations/ui/v13/pt.tful": "ebb951179c03a034acf7c1aa94920b82c49b9ca8d78fe326042ccc9e17629414",
+            "translations/ui/v13/bn.tful": "e34b3ecf507f8c7374f8e4e14a2184559fdf19332612accb5684c1762f659922",
+            "translations/ui/v13/as.tful": "bf17531deb72b832673386a4e411eef473bf4c829f8ef5e7878e89d42a074072",
         }
         generated = generator.outputs(resources)
         for key, digest in published.items():
@@ -48,13 +61,13 @@ class ResourceTests(unittest.TestCase):
         old_languages = generator.CATALOGS[6][1]
         rows = generator.read_rows(7, old_languages)
         for column, (code, label, glyphs) in enumerate(old_languages, 1):
-            self.assertIn(f'"translations/ui/v13/{code}.tful"', manifest)
-        self.assertIn('"translations/ui/v13/pt.tful"', manifest)
+            self.assertIn(f'"translations/ui/v14/{code}.tful"', manifest)
+        self.assertIn('"translations/ui/v14/pt.tful"', manifest)
         portuguese = generator.read_rows(8, generator.CATALOGS[7][1])
         self.assertGreaterEqual({row[0] for row in portuguese}, {row[0] for row in rows})
         self.assertEqual(dict(portuguese)["Portuguese"], "Português")
-        self.assertIn('"translations/ui/v13/bn.tful"', manifest)
-        self.assertIn('"translations/ui/v13/as.tful"', manifest)
+        self.assertIn('"translations/ui/v14/bn.tful"', manifest)
+        self.assertIn('"translations/ui/v14/as.tful"', manifest)
 
     def test_download_labels_have_translations(self):
         rows = generator.read_rows(generator.ACTIVE_VERSION, generator.CATALOGS[-1][1])
@@ -102,7 +115,7 @@ class ResourceTests(unittest.TestCase):
         keys = {row[0] for row in generator.read_rows(generator.ACTIVE_VERSION, languages)}
         source = "".join((ROOT / name).read_text() for name in (
             "src/youtube_lite.c", "src/youtube_library.inc", "src/youtube_related.inc",
-            "src/youtube_channel.inc"))
+            "src/youtube_channel.inc", "src/youtube_navigation.inc"))
         # Only inspect C literals, not the explanatory template comment.
         tokens = re.findall(r'''"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|/\*[\s\S]*?\*/|//[^\n]*''', source)
         labels = {label for token in tokens if token.startswith('"')
@@ -129,6 +142,16 @@ class ResourceTests(unittest.TestCase):
         hashes = [int.from_bytes(data[len(header) + 2 + 4 * i:][:4], "big") for i in range(2)]
         self.assertEqual(hashes, sorted(generator.key_hash(k) for k in ("Back", "Settings")))
         self.assertNotIn(b"Settings", data)
+
+    def test_non_ascii_keys_hash_their_utf8_bytes(self):
+        # style_fnv1a folds only ASCII letters, and the length byte counts
+        # the key's UTF-8 bytes: "□" alone is three.
+        self.assertEqual(generator.key_hash("□ CAPTIONS"),
+                         generator.key_hash("□ captions"))
+        self.assertNotEqual(generator.key_hash("É"), generator.key_hash("é"))
+        data = generator.hashed_catalog("es", [["□ CAPTIONS", "□ SUBTÍTULOS"]], 1)
+        header = b"TFUI2\tes\n"
+        self.assertEqual(data[len(header) + 6], len("□ CAPTIONS".encode("utf-8")))
 
     def test_active_catalog_has_no_english_keys(self):
         rows = generator.read_rows(generator.ACTIVE_VERSION, generator.CATALOGS[-1][1])

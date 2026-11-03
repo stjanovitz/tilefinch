@@ -42,6 +42,7 @@ CATALOGS.append((10, list(latest_languages.values())))
 CATALOGS.append((11, list(latest_languages.values())))
 CATALOGS.append((12, list(latest_languages.values())))
 CATALOGS.append((13, list(latest_languages.values())))
+CATALOGS.append((14, list(latest_languages.values())))
 ACTIVE_VERSION = CATALOGS[-1][0]
 # Keys a version drops because the browser no longer looks them up. Every
 # other key of the previous version must remain, so a newly added locale
@@ -59,7 +60,14 @@ RETIRED_KEYS = {12: {
     "pause, seek, time, and exit controls.",
     "Settings > Video > Audio & subtitles", "Signed in on this device.",
     "Text entry", "Update channel"},
-    13: {"Channel videos", "Recent public uploads from this channel."}}
+    13: {"Channel videos", "Recent public uploads from this channel."},
+    # The YouTube empty states now read "No videos found." and "No
+    # comments to show."
+    14: {"No playable video results were present in the bounded public "
+         "response. Try another search.",
+         "No public comments were returned within the bounded request.",
+         "No public video entries were present in the bounded channel "
+         "response."}}
 # The signed glyph-pack revision whose pre-shaped clusters cover a catalog
 # version's labels: (glyphs, first catalog version) -> sequence. A catalog
 # that adds shaped labels needs a rebuilt pack and a new entry here.
@@ -75,10 +83,18 @@ def minimum_glyph_sequence(glyphs, version):
                 in MINIMUM_GLYPH_SEQUENCES.items()
                 if script == glyphs and first <= version] or [1])
 
+def folded_key(key):
+    """The key's UTF-8 bytes with only ASCII letters lowered, as
+    style_ascii_lower folds them; other bytes, such as a "\u25a1" button
+    symbol's, stay as they are."""
+    return bytes(byte + 32 if 65 <= byte <= 90 else byte
+                 for byte in key.encode("utf-8"))
+
+
 def key_hash(key):
     """FNV-1a (32-bit) of the ASCII-lowercased key: style_fnv1a with fold."""
     value = 2166136261
-    for byte in key.lower().encode("ascii"):
+    for byte in folded_key(key):
         value = ((value ^ byte) * 16777619) & 0xFFFFFFFF
     return value
 
@@ -93,12 +109,13 @@ def hashed_catalog(code, rows, column):
         collided = sorted(row[0] for row in ordered
                           if hashes.count(key_hash(row[0])) > 1)
         raise ValueError(f"English key hash collision: {collided}")
-    if any(not 0 < len(row[0]) <= KEY_LENGTH_LIMIT for row in ordered):
+    lengths = [len(row[0].encode("utf-8")) for row in ordered]
+    if any(not 0 < length <= KEY_LENGTH_LIMIT for length in lengths):
         raise ValueError("English key too long for its length byte")
     return (f"TFUI2\t{code}\n".encode("ascii")
             + len(ordered).to_bytes(2, "big")
             + b"".join(value.to_bytes(4, "big") for value in hashes)
-            + bytes(len(row[0]) for row in ordered)
+            + bytes(lengths)
             + "".join(f"{row[column]}\n" for row in ordered).encode("utf-8"))
 
 
@@ -110,8 +127,8 @@ def read_rows(version, languages):
     rows = [line.split("\t") for line in lines[1:]]
     if not 0 < len(rows) <= ROW_LIMIT or any(len(r) != len(languages) + 1 for r in rows):
         raise ValueError("invalid row count or columns")
-    rows.sort(key=lambda row: row[0].lower().encode("ascii"))
-    if len({r[0].lower() for r in rows}) != len(rows):
+    rows.sort(key=lambda row: folded_key(row[0]))
+    if len({folded_key(r[0]) for r in rows}) != len(rows):
         raise ValueError("duplicate English key")
     for row in rows:
         for value in row:

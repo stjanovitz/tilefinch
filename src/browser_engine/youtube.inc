@@ -110,6 +110,7 @@ static void browser_engine_bind_youtube_controls(BrowserEngine *engine)
     engine->youtube.like_node = NULL;
     engine->youtube.unlike_node = NULL;
     engine->youtube.signout_node = NULL;
+    engine->youtube.account_header = false;
     engine->youtube.account_node_count = 0;
     engine->youtube.like_node_generation = engine->navigation.generation;
     if (youtube_lite_route(engine->navigation.page.document_url) == YOUTUBE_LITE_ROUTE_NONE)
@@ -120,6 +121,13 @@ static void browser_engine_bind_youtube_controls(BrowserEngine *engine)
     lxb_dom_node_t *node = root;
     for (unsigned visited = 0u; node != NULL && visited < BROWSER_ENGINE_DOM_WALK_LIMIT;
          visited++, node = browser_engine_history_walk_next(root, node)) {
+        if (node->type == LXB_DOM_NODE_TYPE_ELEMENT && node->local_name == LXB_TAG_DETAILS) {
+            size_t length = 0;
+            const char *id = document_attribute(node, "id", &length);
+            if (id != NULL && length == sizeof("yt-account-menu") - 1u
+                && memcmp(id, "yt-account-menu", length) == 0)
+                engine->youtube.account_header = true;
+        }
         if (node->type != LXB_DOM_NODE_TYPE_ELEMENT || node->local_name != LXB_TAG_A) continue;
         size_t action_length = 0;
         const char *account_action = document_attribute(node,
@@ -235,7 +243,21 @@ bool browser_engine_set_youtube_compact_results(
 
 bool browser_engine_youtube_compact_results(const BrowserEngine *engine)
 {
-    return engine != NULL && engine->youtube.compact_results;
+    return engine == NULL || engine->youtube.compact_results;
+}
+
+bool browser_engine_set_youtube_channel_banners(
+    BrowserEngine *engine, bool shown)
+{
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE) return false;
+    engine->youtube.channel_banners = shown;
+    clear_error(engine);
+    return true;
+}
+
+bool browser_engine_youtube_channel_banners(const BrowserEngine *engine)
+{
+    return engine == NULL || engine->youtube.channel_banners;
 }
 
 bool browser_engine_youtube_topics(const BrowserEngine *engine)
@@ -434,8 +456,33 @@ static bool browser_engine_youtube_account_command(BrowserEngine *engine,
     return true;
 }
 
-/* Sign-out clears the provider cookies, then navigates home: the action
-   stays a navigation, retargeted to the YouTube home page. */
+/* The Google account cookies sign-in leaves in the jar: the account session
+   set on google.com (SID, HSID, SSID, APISID, SAPISID, SIDCC and their
+   __Secure-1P/3P forms) and the login and account-chooser cookies of
+   accounts.google.com (LSID, __Host-1P/3PLSID, __Host-GAPS,
+   ACCOUNT_CHOOSER). Search preference and consent cookies are not sign-in
+   state and stay. */
+static bool browser_engine_google_signin_cookie(const char *name)
+{
+    static const char *const names[] = {
+        "SID", "HSID", "SSID", "APISID", "SAPISID", "SIDCC", "LSID",
+        "ACCOUNT_CHOOSER", "__Host-GAPS"
+    };
+    static const char *const prefixes[] = {
+        "__Secure-1P", "__Secure-3P", "__Host-1P", "__Host-3P"
+    };
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+        if (strcmp(name, names[i]) == 0) return true;
+    for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++)
+        if (strncmp(name, prefixes[i], strlen(prefixes[i])) == 0) return true;
+    return false;
+}
+
+/* Sign-out clears the provider cookies and the Google account sign-in that
+   produced them, so the next Sign in asks for the account again, then
+   navigates home: the action stays a navigation, retargeted to the YouTube
+   home page. Its control is only on the page that asks first
+   (YOUTUBE_LITE_SIGNOUT_CONFIRM_URL), reached from the Account panel. */
 static bool browser_engine_youtube_signout_command(BrowserEngine *engine,
                                                    ControllerAction *action)
 {
@@ -444,6 +491,8 @@ static bool browser_engine_youtube_signout_command(BrowserEngine *engine,
         return false;
     browser_engine_clear_youtube_work(engine);
     (void) browser_session_cookie_clear_domain(&engine->session, "https://youtube.com/");
+    (void) browser_session_cookie_clear_named(&engine->session, "https://google.com/",
+                                              browser_engine_google_signin_cookie);
     engine->youtube.login_verified = false;
     engine->youtube.signin_state = YOUTUBE_SIGNIN_IDLE;
     engine->youtube.login_events = BROWSER_YOUTUBE_LOGIN_SIGNED_OUT;
@@ -472,7 +521,7 @@ static bool browser_engine_youtube_rating_command(BrowserEngine *engine,
 #endif
         char id[YOUTUBE_VIDEO_ID_CAPACITY];
         bool signed_in = youtube_lite_session_signed_in(&engine->session);
-        if (signed_in && youtube_watch_url_video_id(engine->navigation.page.document_url, id))
+        if (signed_in && youtube_lite_watch_video_id(engine->navigation.page.document_url, id))
             engine->youtube.like_job = youtube_lite_rating_begin(&engine->budget,
                 &engine->session, id, liked, engine->config.navigation_timeout_ms);
         engine->youtube.like_selected = liked;
@@ -634,7 +683,7 @@ static bool browser_engine_refresh_youtube_header(BrowserEngine *engine, bool *v
     if (!engine->youtube.header_dirty || engine->controller.pointer_down_active
         || engine->youtube.header_attempts >= 2) return false;
     bool signed_in = browser_engine_youtube_login_verified(engine);
-    if ((engine->youtube.signout_node != NULL) == signed_in) {
+    if (engine->youtube.account_header == signed_in) {
         engine->youtube.header_dirty = false; return false;
     }
     engine->youtube.header_attempts++;
@@ -676,6 +725,9 @@ static bool browser_engine_run_youtube_topics(BrowserEngine *engine,
             || (entry != NULL && entry->scroll_y > 0)
             || browser_engine_youtube_result_focused(engine);
     }
+    /* The page that asks before Sign out is not a feed. */
+    if (youtube_lite_signout_confirmation(engine->navigation.page.document_url))
+        return false;
     const char *host = strstr(engine->navigation.page.document_url, "://");
     const char *path = host == NULL ? NULL : strchr(host + 3, '/');
     bool subscriptions = path != NULL && strcspn(path, "?#") == 19u
@@ -734,6 +786,18 @@ static bool browser_engine_run_youtube_topics(BrowserEngine *engine,
             engine->youtube.login_events |= BROWSER_YOUTUBE_LOGIN_FAILED;
             engine->youtube.header_dirty = true;
             engine->youtube.header_attempts = 0;
+        }
+        /* The provider says this jar's account is signed out. A login saved
+           for it holds the same dead cookies (a restored one is never
+           verified first), so report a sign-out and the frontend removes
+           it, once per identity. A sign-in attempt reports its own failure. */
+        if (rejected_identity != 0
+            && rejected_identity != engine->youtube.login_rejected
+            && rejected_identity == youtube_lite_session_login_identity(&engine->session)
+            && !browser_engine_youtube_signin_pending(engine)) {
+            engine->youtube.login_rejected = rejected_identity;
+            engine->youtube.login_events |= BROWSER_YOUTUBE_LOGIN_SIGNED_OUT
+                | BROWSER_YOUTUBE_LOGIN_REJECTED;
         }
         if (authenticated_identity != 0 && authenticated_identity
                 == youtube_lite_session_login_identity(&engine->session)) {

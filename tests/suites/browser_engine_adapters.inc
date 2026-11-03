@@ -6542,8 +6542,9 @@ static int test_youtube_home_topics_are_lazy(void)
             && browser_engine_load_url(engine, "https://www.youtube.com/", true)
             && browser_engine_render_frame(engine, NULL));
         NavigationSession *navigation = browser_engine_navigation(engine);
+        /* Signed out, Home is the header and its search box. */
         CHECK(strstr(document_body_text(&navigation->page.document),
-            "Watch YouTube on this device") != NULL);
+            "Watch YouTube on this device") == NULL);
         CHECK(navigation->page.layout.control_count != 0);
         size_t base_links = navigation->page.layout.link_count;
         CHECK(document_control_value_set(&navigation->page.document,
@@ -6712,8 +6713,12 @@ static int test_settings_boot_and_refresh_with_engine(void)
     CHECK(browser_profile_set_web_font_mode(profile, WEB_FONTS_OFF));
     CHECK(psp_web_font_setting_boot(profile, engine) == PSP_SETTING_APPLIED);
     CHECK(browser_engine_config(engine)->resources.web_font_mode == WEB_FONTS_OFF);
+    /* A new engine shows compact results and channel banners. */
+    CHECK(browser_engine_youtube_compact_results(engine)
+          && browser_engine_youtube_channel_banners(engine));
     browser_profile_set_youtube_compact_results(profile, true);
     browser_profile_set_youtube_topics(profile, false);
+    browser_profile_set_youtube_channel_banners(profile, false);
     browser_profile_set_color_mode(profile, BROWSER_COLOR_MODE_DARK);
     memset(&ui, 0, sizeof(ui));
     psp_app_ui_sync_from_profile(&ui, profile);
@@ -6722,6 +6727,8 @@ static int test_settings_boot_and_refresh_with_engine(void)
     CHECK(browser_engine_forced_dark(engine)
           && browser_engine_youtube_compact_results(engine)
           && !browser_engine_youtube_topics(engine)
+          && !browser_engine_youtube_channel_banners(engine)
+          && !ui.youtube_channel_banners
           && ui.page_dark && ui.status[0] == '\0');
 
     /* The clock refresh: an accepted change repaints. */
@@ -6764,7 +6771,7 @@ static int test_settings_boot_and_refresh_with_engine(void)
     memset(&ui, 0, sizeof(ui));
     psp_app_ui_sync_from_profile(&ui, profile);
     ui.page_dark = false;
-    CHECK(psp_engine_settings_boot(profile, engine, &ui) == 3u);
+    CHECK(psp_engine_settings_boot(profile, engine, &ui) == 4u);
     CHECK(browser_profile_youtube_compact_results(profile)
           && !browser_profile_youtube_topics(profile)
           && ui.youtube_compact_results && !ui.youtube_topics
@@ -6831,7 +6838,8 @@ static bool youtube_header_baselines_match(BrowserEngine *engine)
             baseline=current;count++;break;
         }
     }
-    return count == 4u;
+    /* YouTube, Account and Subscriptions; Sign out is in the panel. */
+    return count == 3u;
 }
 
 static int test_youtube_personalized_home(void)
@@ -6893,7 +6901,8 @@ static int test_youtube_personalized_home(void)
         } else {
             lxb_dom_node_t *root = lxb_dom_interface_node(navigation->page.document.html);
             CHECK(test_reader_find_id(root, "yt-account-panel") != NULL
-                && test_reader_find_id(root, "yt-signout-action") != NULL);
+                && test_reader_find_id(root, "yt-signout-open") != NULL
+                && test_reader_find_id(root, "yt-signout-action") == NULL);
         }
         CHECK(strstr(navigation->page.layout.links[lane == 5 || lane == 7 ? 2u : 1u].url,
             "/feed/subscriptions") != NULL);
@@ -6963,7 +6972,7 @@ static int test_youtube_personalized_home(void)
         }
         CHECK(browser_engine_youtube_feed_state(engine) == (refuse
             ? BROWSER_YOUTUBE_FEED_FAILED : BROWSER_YOUTUBE_FEED_CURRENT));
-        CHECK(navigation->page.layout.link_count == (refuse ? base_links : 10u));
+        CHECK(navigation->page.layout.link_count == (refuse ? base_links : 9u));
         CHECK(youtube_notice_is_single_run(&navigation->page.layout, "yt-feed-status",
             refuse ? "Suggestions unavailable - try Refresh." : "Suggestions up to date."));
         size_t length = 0;
@@ -6976,20 +6985,20 @@ static int test_youtube_personalized_home(void)
         if (lane == 0) {
             CHECK(youtube_header_baselines_match(engine));
             const LayoutDocument *layout = &navigation->page.layout;
-            lxb_dom_node_t *signout_header = test_reader_find_id(
-                lxb_dom_interface_node(navigation->page.document.html), "yt-signout-action");
             lxb_dom_node_t *refresh = test_reader_find_id(
                 lxb_dom_interface_node(navigation->page.document.html), "yt-feed-refresh");
-            CHECK(layout->links[2].node == signout_header);
+            /* The header ends at Subscriptions: Sign out is in the panel. */
             CHECK(strstr(layout->links[1].url, "/feed/subscriptions") != NULL);
+            CHECK(test_reader_find_id(lxb_dom_interface_node(navigation->page.document.html),
+                "yt-signout-action") == NULL);
             CHECK(layout->links[layout->link_count - 1u].node == refresh);
             const LayoutNodeBox *refresh_box = layout_box_for_node(layout, refresh);
-            const LayoutNodeBox *first_box = layout_box_for_node(layout, layout->links[3].node);
+            const LayoutNodeBox *first_box = layout_box_for_node(layout, layout->links[2].node);
             CHECK(refresh_box != NULL && first_box != NULL
                 && refresh_box->x > 300 && refresh_box->y < first_box->y);
-            CHECK(browser_engine_focus_node(engine, layout->links[2].node));
+            CHECK(browser_engine_focus_node(engine, layout->links[1].node));
             CHECK(browser_engine_focus_move(engine, true));
-            CHECK(controller_focused_node(browser_engine_controller(engine)) == layout->links[3].node);
+            CHECK(controller_focused_node(browser_engine_controller(engine)) == layout->links[2].node);
             CHECK(browser_engine_render_frame(engine, NULL));
             CHECK(browser_engine_focus_node(engine, test_reader_find_id(
                 lxb_dom_interface_node(navigation->page.document.html), "yt-account-action")));
@@ -7016,6 +7025,45 @@ static int test_youtube_personalized_home(void)
                 "https://accounts.google.com/", "unrelated=fixture; Secure; HttpOnly; Path=/"));
             CHECK(browser_session_cookie_set_http(browser_engine_session(engine),
                 "https://notyoutube.com/", "unrelated=fixture; Secure; HttpOnly; Path=/"));
+            /* The Google account sign-in goes too, or the next Sign in
+               would reuse it silently; Google preferences stay. */
+            static const char *const google_cookies[] = {
+                "LSID=fixture; Secure; HttpOnly; Path=/",
+                "__Host-GAPS=fixture; Secure; HttpOnly; Path=/",
+                "SID=fixture; Domain=google.com; Secure; Path=/",
+                "__Secure-3PSID=fixture; Domain=google.com; Secure; HttpOnly; Path=/",
+                "NID=fixture; Domain=google.com; Secure; HttpOnly; Path=/"
+            };
+            for (size_t i = 0; i < sizeof(google_cookies) / sizeof(google_cookies[0]); i++)
+                CHECK(browser_session_cookie_set_http(browser_engine_session(engine),
+                    "https://accounts.google.com/", google_cookies[i]));
+            /* The panel's Sign out opens the page that asks first; nothing
+               is cleared, and Home's feed work does not run there. */
+            lxb_dom_node_t *signout_open = test_reader_find_id(
+                lxb_dom_interface_node(navigation->page.document.html), "yt-signout-open");
+            size_t href_length = 0;
+            const char *href = document_attribute(signout_open, "href", &href_length);
+            CHECK(href != NULL && href_length == strlen(YOUTUBE_LITE_SIGNOUT_CONFIRM_URL)
+                && memcmp(href, YOUTUBE_LITE_SIGNOUT_CONFIRM_URL, href_length) == 0);
+            for (unsigned answer = 0; answer < 2u; answer++) {
+                CHECK(browser_engine_load_url(engine, YOUTUBE_LITE_SIGNOUT_CONFIRM_URL, true));
+                CHECK(browser_engine_render_frame(engine, NULL));
+                bool visual = false;
+                (void) browser_engine_run_idle_work(engine, &visual);
+                CHECK(browser_engine_youtube_feed_state(engine) == BROWSER_YOUTUBE_FEED_IDLE);
+                lxb_dom_node_t *cancel = test_reader_find_id(
+                    lxb_dom_interface_node(navigation->page.document.html), "yt-signout-cancel");
+                CHECK(cancel != NULL
+                    && controller_focused_node(browser_engine_controller(engine)) == cancel);
+                if (answer == 1u) break;
+                /* Cancel goes Home and keeps the account. */
+                ControllerAction cancelled;
+                CHECK(browser_engine_activate(engine, &cancelled)
+                    && cancelled.type == CONTROLLER_ACTION_NAVIGATE
+                    && strcmp(cancelled.url, "https://www.youtube.com/") == 0);
+                CHECK(youtube_lite_session_signed_in(browser_engine_session(engine)));
+                CHECK(browser_engine_take_youtube_login_events(engine) == 0u);
+            }
             lxb_dom_node_t *signout = test_reader_find_id(
                 lxb_dom_interface_node(navigation->page.document.html), "yt-signout-action");
             CHECK(signout != NULL && browser_engine_focus_node(engine, signout));
@@ -7028,13 +7076,18 @@ static int test_youtube_personalized_home(void)
             BrowserSiteDataUsage usage;
             CHECK(browser_session_site_data_usage(browser_engine_session(engine),
                 "https://www.youtube.com/", &usage) && usage.cookie_count == 0);
-            CHECK(browser_session_site_data_usage(browser_engine_session(engine),
-                "https://accounts.google.com/", &usage) && usage.cookie_count == 1);
+            char google_header[BROWSER_COOKIE_HEADER_CAPACITY];
+            CHECK(browser_session_cookie_header(browser_engine_session(engine),
+                "https://accounts.google.com/", google_header, sizeof(google_header)));
+            CHECK(strstr(google_header, "unrelated=fixture") != NULL
+                && strstr(google_header, "NID=fixture") != NULL
+                && strstr(google_header, "SID=") == NULL
+                && strstr(google_header, "GAPS=") == NULL);
             CHECK(browser_session_site_data_usage(browser_engine_session(engine),
                 "https://notyoutube.com/", &usage) && usage.cookie_count == 1);
             CHECK(browser_engine_load_url(engine, action.url, true));
             CHECK(test_reader_find_id(lxb_dom_interface_node(navigation->page.document.html),
-                "yt-signout-action") == NULL);
+                "yt-signout-open") == NULL);
         }
         CHECK(browser_engine_shutdown(engine));
         browser_engine_destroy(engine);
@@ -7767,6 +7820,67 @@ static int test_youtube_like_action(void)
         fetch_trace_end();
         remove_google_identity_replay(fixture, 5u);
     }
+    return 0;
+}
+
+/* A /live/ID page is built from watch?v=ID, and Like rates that video:
+   the confirmation is an entity update keyed to TFTEST00001 alone. */
+static int test_youtube_like_canonical_link(void)
+{
+    static const char live_url[] = "https://www.youtube.com/live/TFTEST00001?tilefinch_view=details";
+    static const char watch[] = "<script>var ytInitialData='{}';</script>"
+        "<script>var ytInitialPlayerResponse={\"videoDetails\":{\"videoId\":\"TFTEST00001\","
+        "\"title\":\"Like fixture\",\"lengthSeconds\":\"200\"}};</script>";
+    static const char bootstrap[] = "<script>ytcfg.set({\"INNERTUBE_API_KEY\":\"fixture-key\","
+        "\"INNERTUBE_CONTEXT_CLIENT_VERSION\":\"fixture-version\",\"INNERTUBE_CLIENT_NAME\":\"MWEB\","
+        "\"VISITOR_DATA\":\"fixture-visitor\",\"LOGGED_IN\":true});</script>";
+    /* likeStatusEntity key: protobuf field 2 holding "TFTEST00001". */
+    static const char liked[] = "{\"frameworkUpdates\":{\"entityBatchUpdate\":{\"mutations\":[{"
+        "\"payload\":{\"likeStatusEntity\":{\"key\":\"EgtURlRFU1QwMDAwMQ==\","
+        "\"likeStatus\":\"LIKE\"}}}]}}}";
+    GoogleIdentityRecord records[] = {
+        {.url="https://m.youtube.com/watch?v=TFTEST00001&bpctr=9999999999&has_verified=1", .status=200, .content_type="text/html", .body=watch},
+        {.url="https://m.youtube.com/", .status=200, .content_type="text/html", .body=bootstrap},
+        {.url="https://m.youtube.com/youtubei/v1/like/like?key=fixture-key&prettyPrint=false",
+         .status=200, .content_type="application/json", .body=liked, .method="POST"}
+    };
+    char id[YOUTUBE_VIDEO_ID_CAPACITY];
+    CHECK(youtube_lite_watch_video_id(live_url, id) && strcmp(id, "TFTEST00001") == 0);
+    CHECK(youtube_lite_watch_video_id("https://www.youtube.com/embed/TFTEST00002", id)
+        && strcmp(id, "TFTEST00002") == 0);
+    CHECK(youtube_lite_watch_video_id("http://www.youtube.com/watch?v=TFTEST00003", id)
+        && strcmp(id, "TFTEST00003") == 0);
+    CHECK(!youtube_lite_watch_video_id("https://www.youtube.com/live/", id));
+    char fixture[128], error[256] = {0};
+    CHECK(write_google_identity_replay(fixture, records, 3u));
+    CHECK(fetch_trace_replay_begin(fixture, error, sizeof(error)));
+    BrowserDeviceProfile device;
+    browser_device_profile_psp3000(&device);
+    BrowserConfig config;
+    browser_config_init(&config, &device);
+    config.memory_limit = 16u * MIB;
+    config.resources.web_fonts_enabled = false;
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL);
+    CHECK(browser_session_cookie_set_http(browser_engine_session(engine),
+        "https://m.youtube.com/", "SAPISID=mock-session; Secure; HttpOnly; Path=/"));
+    CHECK(browser_engine_load_url(engine, live_url, true));
+    NavigationSession *nav = browser_engine_navigation(engine);
+    CHECK(browser_engine_render_frame(engine, NULL));
+    lxb_dom_node_t *like = test_reader_find_id(lxb_dom_interface_node(nav->page.document.html), "yt-like-action");
+    CHECK(like != NULL && browser_engine_focus_node(engine, like));
+    ControllerAction action;
+    CHECK(browser_engine_activate(engine, &action) && action.type == CONTROLLER_ACTION_CONTROL);
+    CHECK(browser_engine_youtube_like_state(engine) == BROWSER_YOUTUBE_FEED_LOADING);
+    for (unsigned i = 0; i < 256u && browser_engine_youtube_like_state(engine) == BROWSER_YOUTUBE_FEED_LOADING; i++) {
+        bool changed = false; (void) browser_engine_run_idle_work(engine, &changed);
+    }
+    CHECK(browser_engine_youtube_like_state(engine) == BROWSER_YOUTUBE_FEED_CURRENT);
+    CHECK(browser_engine_youtube_like_selected(engine));
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    fetch_trace_end();
+    remove_google_identity_replay(fixture, 3u);
     return 0;
 }
 

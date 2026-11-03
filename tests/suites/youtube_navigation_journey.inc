@@ -44,7 +44,8 @@ static int test_youtube_provider_layout_states(void)
         const LayoutNodeBox *box = layout_box_for_node(&nav->page.layout, actions);
         CHECK(box && box->width >= 450 && box->y > title->y + title->height);
         CHECK((test_reader_find_id(root, "yt-like-action") != NULL) == (signed_in != 0));
-        CHECK((test_reader_find_id(root, "yt-watch-signin") != NULL) == (signed_in == 0));
+        /* Signed out, the header's Sign in is the page's only one. */
+        CHECK(test_reader_find_id(root, "yt-watch-signin") == NULL);
         lxb_dom_node_t *offline = test_reader_find_id(root, "yt-offline-save");
         const LayoutNodeBox *offline_box = layout_box_for_node(&nav->page.layout, offline);
         CHECK(offline_box && offline_box->width == 40 && offline_box->height == 36);
@@ -62,16 +63,14 @@ static int test_youtube_provider_layout_states(void)
         lxb_char_t *text = lxb_dom_node_text_content(
             lxb_dom_interface_node(nav->page.document.html->body), &text_length);
         CHECK(text && !strstr((const char *)text, "Select the thumbnail to retry"));
-        CHECK(strstr((const char *)text, "Published")
-            && strstr((const char *)text, "Film & Animation"));
+        /* The category closes the details, after the actions and before
+           the comments link, not on the first screen. */
+        const char *published = strstr((const char *)text, "Published");
+        const char *category = strstr((const char *)text, "Category: Film & Animation");
+        const char *comments_link = strstr((const char *)text, "View comments");
+        CHECK(published && category && comments_link
+            && published < category && category < comments_link);
         lxb_dom_document_destroy_text(root->owner_document, text);
-        if (!signed_in) {
-            const LayoutNodeBox *signin_box = layout_box_for_node(&nav->page.layout,
-                test_reader_find_id(root, "yt-watch-signin"));
-            CHECK(signin_box && abs((signin_box->y + signin_box->height / 2)
-                - (offline_box->y + offline_box->height / 2)) <= 1
-                && offline_box->x >= signin_box->x + signin_box->width + 8);
-        }
         if (signed_in) {
             CHECK(youtube_header_baselines_match(engine));
             lxb_dom_node_t *menu = test_reader_find_id(root, "yt-watch-account");
@@ -270,8 +269,9 @@ static int test_youtube_filters_and_chapters(void)
     lxb_dom_node_t *panel = test_reader_find_id(root, "yt-filter-panel");
     CHECK(panel && !lxb_dom_element_has_attribute(lxb_dom_interface_element(panel),
         (const lxb_char_t *) "open", 4u));
-    ComputedStyle panel_style = style_for_node(&nav->page.stylesheet, panel, NULL);
-    CHECK(panel_style.padding.top >= 12 && panel_style.padding.left >= 12);
+    /* Closed, Filters is one padded line under the heading. */
+    ComputedStyle summary_style = style_for_node(&nav->page.stylesheet, panel->first_child, NULL);
+    CHECK(summary_style.padding.top >= 3 && summary_style.padding.left >= 12);
     CHECK(!layout_box_for_node(&nav->page.layout,
         test_reader_find_id(root, "tilefinch_date")));
     ControllerAction action = {0};

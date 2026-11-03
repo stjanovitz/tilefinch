@@ -1395,6 +1395,26 @@ bool browser_session_cookie_clear_domain(BrowserSession *session,
     return true;
 }
 
+size_t browser_session_cookie_clear_named(
+    BrowserSession *session, const char *url,
+    bool (*accept)(const char *name))
+{
+    CookieURL parsed;
+    if (session == NULL || session->budget == NULL || url == NULL
+        || accept == NULL || !parse_cookie_url(url, &parsed)) return 0;
+    BrowserCookieStore store = browser_session_cookie_store(session);
+    size_t cleared = 0;
+    for (size_t i = 0; i < BROWSER_COOKIE_ENTRIES; i++) {
+        BrowserCookieEntry *entry = &session->cookies[i];
+        if (entry->value != NULL && domain_matches(entry->domain, parsed.host)
+            && accept(entry->name)) {
+            clear_cookie_entry(&store, entry);
+            cleared++;
+        }
+    }
+    return cleared;
+}
+
 BrowserCookieOverlay *browser_session_cookie_overlay_create(
     Budget *budget, const BrowserSession *source)
 {

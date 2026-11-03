@@ -236,7 +236,7 @@ static int test_youtube_login_display_failures(void)
         CHECK(done && events == BROWSER_YOUTUBE_LOGIN_VERIFIED
             && browser_engine_youtube_login_verified(engine));
         root = lxb_dom_interface_node(nav->page.document.html);
-        CHECK(test_reader_find_id(root, "yt-account-menu") && test_reader_find_id(root, "yt-signout-action"));
+        CHECK(test_reader_find_id(root, "yt-account-menu") && test_reader_find_id(root, "yt-signout-open"));
         CHECK(browser_engine_youtube_signin_report(engine, report, sizeof(report))
             && strstr(report, "server-verified=1") && strstr(report, "api-authenticated=1")
             && strstr(report, "bootstrap-status=200 api-status=200")
@@ -503,12 +503,57 @@ static int test_youtube_login_rejection_preserves_failures(void)
         }
         CHECK(browser_engine_youtube_feed_state(engine) == BROWSER_YOUTUBE_FEED_FAILED);
         CHECK(browser_engine_youtube_login_identity(engine) == (lane < 2 ? 0 : offered));
-        CHECK(browser_engine_take_youtube_login_events(engine) == (lane < 2 ? BROWSER_YOUTUBE_LOGIN_FAILED : 0));
+        CHECK(browser_engine_take_youtube_login_events(engine) == (lane < 2
+            ? BROWSER_YOUTUBE_LOGIN_FAILED | BROWSER_YOUTUBE_LOGIN_SIGNED_OUT
+                | BROWSER_YOUTUBE_LOGIN_REJECTED : 0));
         root = lxb_dom_interface_node(nav->page.document.html);
-        CHECK((test_reader_find_id(root, "yt-signout-action") != NULL) == (lane >= 2));
+        CHECK((test_reader_find_id(root, "yt-signout-open") != NULL) == (lane >= 2));
         CHECK(browser_engine_shutdown(engine)); browser_engine_destroy(engine); fetch_trace_end();
         remove_google_identity_replay(fixture, 2);
     }
+    return 0;
+}
+
+/* A login restored at boot is never verified before its first feed. When
+   the provider rejects it, the engine reports a sign-out so the frontend
+   removes the saved file instead of restoring dead cookies every boot; a
+   second rejection of the same identity reports nothing new. */
+static int test_youtube_login_restored_rejection(void)
+{
+    static const char bootstrap[] = "<script>ytcfg.set({\"INNERTUBE_API_KEY\":\"fixture-key\","
+        "\"INNERTUBE_CONTEXT_CLIENT_VERSION\":\"fixture-version\",\"INNERTUBE_CLIENT_NAME\":\"MWEB\","
+        "\"VISITOR_DATA\":\"fixture-visitor\",\"LOGGED_IN\":true});</script>";
+    BrowserDeviceProfile device; browser_device_profile_psp3000(&device);
+    BrowserConfig config; browser_config_init(&config, &device);
+    config.memory_limit = 16u * MIB; config.resources.web_fonts_enabled = false;
+    char error[256];
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error)); CHECK(engine);
+    CHECK(browser_session_cookie_set_http(browser_engine_session(engine), "https://m.youtube.com/",
+        "SAPISID=synthetic-restored-session; Secure; Domain=youtube.com; Path=/"));
+    for (unsigned attempt = 0; attempt < 2; attempt++) {
+        GoogleIdentityRecord records[] = {
+            {.url="https://m.youtube.com/", .status=200, .content_type="text/html", .body=bootstrap},
+            {.url="https://m.youtube.com/youtubei/v1/browse?key=fixture-key&prettyPrint=false",
+                .status=200, .method="POST", .content_type="application/json",
+                .body="{\"responseContext\":{\"mainAppWebResponseContext\":{\"loggedOut\":true}}}"}
+        };
+        char fixture[128]; CHECK(write_google_identity_replay(fixture, records, 2)
+            && fetch_trace_replay_begin(fixture, error, sizeof(error)));
+        CHECK(browser_engine_load_url(engine, "https://www.youtube.com/", true)
+            && browser_engine_render_frame(engine, NULL));
+        for (unsigned i = 0; i < 1024; i++) {
+            bool changed = false; (void) browser_engine_run_idle_work(engine, &changed);
+            if (changed) CHECK(browser_engine_render_frame(engine, NULL));
+            if (browser_engine_youtube_feed_state(engine) == BROWSER_YOUTUBE_FEED_FAILED) break;
+        }
+        CHECK(browser_engine_youtube_feed_state(engine) == BROWSER_YOUTUBE_FEED_FAILED);
+        CHECK(browser_engine_take_youtube_login_events(engine)
+            == (attempt == 0 ? BROWSER_YOUTUBE_LOGIN_SIGNED_OUT
+                | BROWSER_YOUTUBE_LOGIN_REJECTED : 0u));
+        fetch_trace_end();
+        remove_google_identity_replay(fixture, 2);
+    }
+    CHECK(browser_engine_shutdown(engine)); browser_engine_destroy(engine);
     return 0;
 }
 
@@ -520,6 +565,7 @@ static int test_youtube_login_journey(void)
     CHECK(test_youtube_login_failure_diagnostics() == 0);
     CHECK(test_youtube_login_late_session_changes() == 0);
     CHECK(test_youtube_login_rejection_preserves_failures() == 0);
+    CHECK(test_youtube_login_restored_rejection() == 0);
     CHECK(youtube_lite_signin_handoff_url("https://www.youtube.com/signin?token=synthetic"));
     CHECK(!youtube_lite_signin_handoff_url("https://notyoutube.com/signin?token=synthetic")
         && !youtube_lite_signin_handoff_url("http://www.youtube.com/signin?token=synthetic")

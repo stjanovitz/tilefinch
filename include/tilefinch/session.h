@@ -855,6 +855,12 @@ void browser_session_cookie_clear(BrowserSession *session);
    intact, and never perform persistent-cache maintenance. */
 bool browser_session_cookie_clear_domain(BrowserSession *session,
                                          const char *url);
+/* Remove only the cookies under this host and its subdomains whose name
+   `accept` admits, returning how many. RAM-only; provider documents and
+   every other cookie stay. */
+size_t browser_session_cookie_clear_named(
+    BrowserSession *session, const char *url,
+    bool (*accept)(const char *name));
 BrowserCookieOverlay *browser_session_cookie_overlay_create(
     Budget *budget, const BrowserSession *source);
 bool browser_cookie_overlay_header_context(

@@ -114,8 +114,11 @@ typedef enum {
    adapters and the topics-publishing flag when preparing a candidate shell. */
 typedef struct {
     bool compact_results;
+    bool channel_banners;
     bool topics;
     uint64_t login_verified;
+    /* Last identity the provider rejected and reported signed out. */
+    uint64_t login_rejected;
     unsigned login_events;
     bool signin_diagnostics;
     unsigned signin_retries;
@@ -154,6 +157,8 @@ typedef struct {
     lxb_dom_node_t *like_node;
     lxb_dom_node_t *unlike_node;
     lxb_dom_node_t *signout_node;
+    /* The committed header is the signed-in one (it has the Account menu). */
+    bool account_header;
     uint64_t like_node_generation;
     YoutubeLiteDocument feed_pending;
     uint64_t feed_pending_identity;
@@ -1571,6 +1576,8 @@ BrowserEngine *browser_engine_create(const BrowserConfig *config,
     engine->config = *config;
     engine->state = BROWSER_ENGINE_ACTIVE;
     engine->youtube.topics = true;
+    engine->youtube.compact_results = true;
+    engine->youtube.channel_banners = true;
     tilefinch_diagnostics_init(
         &engine->diagnostics, config->diagnostics.callback,
         config->diagnostics.opaque, config->diagnostics.minimum_severity);
@@ -1956,6 +1963,7 @@ bool browser_engine_refresh_shell(BrowserEngine *engine)
     }
     lxb_dom_node_t *focused_node = engine->controller_ready
         ? controller_focused_node(&engine->controller) : NULL;
+    uint32_t focus_serial = engine->controller.focus_serial;
     browser_engine_reset_shell(engine);
     if (!controller_init(&engine->controller, &engine->navigation))
         return set_error_code(
@@ -1963,9 +1971,9 @@ bool browser_engine_refresh_shell(BrowserEngine *engine)
             TILEFINCH_DIAGNOSTIC_ALLOCATION_FAILED, "controller-init",
             "controller initialization failed");
     engine->controller_ready = true;
-    if (focused_node != NULL)
-        (void) controller_restore_focus_node(
-            &engine->controller, focused_node);
+    if (focused_node != NULL
+        && controller_restore_focus_node(&engine->controller, focused_node))
+        engine->controller.focus_serial = focus_serial;
     return browser_engine_initialize_render_shell(
         engine, "render-shell-init",
         "render shell initialization failed");
@@ -2597,6 +2605,7 @@ static bool browser_engine_begin_navigation_request(
         char error[256] = {0};
         SiteAdapterPreferences preferences = {
             .youtube_compact_results = engine->youtube.compact_results,
+            .youtube_hide_channel_banners = !engine->youtube.channel_banners,
             .navigation_initiator = engine->navigation.page.loaded
                 ? engine->navigation.page.document_url : NULL,
             .navigation_user_activated = engine->navigation.pending_navigation_user_activated
@@ -3123,7 +3132,8 @@ BrowserNavigationJobStatus browser_engine_pump_navigation(
             navigation_load_destroy(work->load);
             work->load = NULL;
             SiteAdapterPreferences preferences = {
-                .youtube_compact_results = engine->youtube.compact_results
+                .youtube_compact_results = engine->youtube.compact_results,
+                .youtube_hide_channel_banners = !engine->youtube.channel_banners
             };
             work->adapter = site_adapter_load_begin(
                 &engine->budget, &engine->session, "GET", work->url,
@@ -3645,6 +3655,7 @@ static bool browser_engine_do_load_url(BrowserEngine *engine,
         char error[256] = {0};
         SiteAdapterPreferences preferences = {
             .youtube_compact_results = engine->youtube.compact_results,
+            .youtube_hide_channel_banners = !engine->youtube.channel_banners,
             .navigation_initiator = engine->navigation.page.loaded
                 ? engine->navigation.page.document_url : NULL,
             .navigation_user_activated = engine->navigation.pending_navigation_user_activated
@@ -5928,6 +5939,7 @@ bool browser_engine_view_snapshot(
         if (controller_focused_rect(
                 &engine->controller, &x, &y, &width, &height)) {
             snapshot->has_focus = true;
+            snapshot->focus_serial = engine->controller.focus_serial;
             snapshot->focus_x =
                 viewport_css_to_device(&navigation->viewport, x);
             snapshot->focus_y = viewport_css_to_device(

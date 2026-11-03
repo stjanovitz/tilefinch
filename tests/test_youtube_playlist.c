@@ -73,6 +73,42 @@ int main(void)
     youtube_playlist_retry(q); CHECK(youtube_playlist_failed(q)
         && !youtube_playlist_can_retry(q) && !youtube_playlist_loading(q));
     youtube_playlist_destroy(q);
+    /* Unavailable rows fill a display page without consuming queue positions.
+       Each continuation must advance through those rows, including Play all. */
+    char unavailable_source[8192];
+    size_t unavailable_used = (size_t) snprintf(unavailable_source,
+        sizeof(unavailable_source), "<script>var ytInitialData={\"contents\":[");
+    for (unsigned i = 0; i < 26u; i++)
+        unavailable_used += (size_t) snprintf(unavailable_source + unavailable_used,
+            sizeof(unavailable_source) - unavailable_used,
+            "%s{\"playlistVideoRenderer\":{\"videoId\":\"TFTEST%05u\","
+            "\"title\":{\"simpleText\":\"Entry %u\"},\"isPlayable\":%s}}",
+            i ? "," : "", i, i, i < 24u ? "false" : "true");
+    snprintf(unavailable_source + unavailable_used,
+        sizeof(unavailable_source) - unavailable_used, "]};</script>");
+    q = youtube_playlist_begin(&budget, &session, url, 0, true, NULL);
+    CHECK(q);
+    char slice_url[2048]; snprintf(slice_url, sizeof(slice_url), "%s", url);
+    for (unsigned slice = 0; slice < 3u; slice++) {
+        YoutubeLiteDocument unavailable = {0}; char message[128];
+        CHECK(youtube_lite_build_document(&budget, slice_url, unavailable_source,
+            strlen(unavailable_source), &unavailable, message, sizeof(message)));
+        CHECK(unavailable.playlist && unavailable.playlist->first == 0
+            && unavailable.result_count == (slice < 2u ? 12u : 2u)
+            && unavailable.playlist->count == (slice < 2u ? 0u : 2u));
+        CHECK(youtube_playlist_accept_page(q, unavailable.playlist));
+        if (slice < 2u) {
+            CHECK(unavailable.playlist->next_url[0]
+                && strcmp(slice_url, unavailable.playlist->next_url)
+                && youtube_playlist_loading(q)
+                && !youtube_playlist_take_video(q, video, sizeof(video)));
+            snprintf(slice_url, sizeof(slice_url), "%s", unavailable.playlist->next_url);
+        } else CHECK(!unavailable.playlist->next_url[0]
+            && youtube_playlist_take_video(q, video, sizeof(video))
+            && strstr(video, "TFTEST00024"));
+        youtube_lite_document_destroy(&unavailable);
+    }
+    youtube_playlist_destroy(q);
     /* Empty final continuation must remain a visible terminal failure. */
     q = youtube_playlist_begin(&budget, &session, url, 0, false, NULL);
     CHECK(q); make_page(&page, 0, 1, true);
@@ -150,6 +186,20 @@ int main(void)
         "\"rendererContext\":{\"commandContext\":{\"onTap\":{\"innertubeCommand\":{\"watchEndpoint\":{\"videoId\":\"TFTEST00003\",\"playlistId\":\"PLfixture\"}}}}}}},"
         "{\"lockupViewModel\":{\"contentType\":\"LOCKUP_CONTENT_TYPE_VIDEO\",\"contentId\":\"TFTEST00004\","
         "\"menu\":{\"watchEndpoint\":{\"videoId\":\"TFTEST00004\",\"playlistId\":\"PLfixture\"}}}}]}';</script>";
+    /* A title too long for the bar's 63-byte label is cut on a character
+       boundary, not inside "é", and marked. */
+    static const char long_title[] =
+        "<script>var ytInitialData='{\"contents\":[{\"playlistVideoRenderer\":{\"videoId\":\"TFTEST00000\","
+        "\"title\":{\"simpleText\":\"Episode 12: a very long restoration titles \u00e9\u00e9\u00e9\u00e9 that keeps going\"}}}]}';</script>";
+    CHECK(youtube_lite_build_document(&budget, url, long_title, sizeof(long_title) - 1u, &doc, error, sizeof(error)));
+    const char *label = strstr(doc.html, "aria-label=\"Play from here: Episode 12: a very long restoration titles");
+    CHECK(label != NULL);
+    label += strlen("aria-label=\"");
+    const char *label_end = strchr(label, '"');
+    CHECK(label_end != NULL && label_end - label <= 63 && label_end - label > 50
+          && memcmp(label_end - 3, "...", 3) == 0
+          && ((unsigned char) label_end[-4] & 0xc0u) != 0xc0u);
+    youtube_lite_document_destroy(&doc);
     CHECK(youtube_lite_build_document(&budget, url, lockups, sizeof(lockups) - 1u, &doc, error, sizeof(error)));
     CHECK(doc.playlist && doc.playlist->count == 1
         && !strcmp(doc.playlist->entries[0].video_id, "TFTEST00000")
@@ -162,7 +212,8 @@ int main(void)
     CHECK(!strcmp(doc.playlist->entries[10].video_id, doc.playlist->entries[11].video_id));
     CHECK(strstr(doc.html, "Play all") && strstr(doc.html, "Play from here"));
     CHECK(strstr(doc.html, "<h1>Weekend journeys</h1>"));
-    CHECK(strstr(doc.html, "tilefinch_queue=0\" aria-label=\"Play from here\""));
+    /* The hint bar names the row it would play from. */
+    CHECK(strstr(doc.html, "tilefinch_queue=0\" aria-label=\"Play from here: Entry 1\""));
     /* One native play target per card, not a second action row. */
     CHECK(!strstr(doc.html, ">Play from here</a>"));
     CHECK(strstr(doc.playlist->next_url, "tilefinch_offset=12") && !strstr(doc.playlist->next_url, "fixture-next"));

@@ -22,7 +22,9 @@ Upstream fixes carried individually: `c8ef88981b` (`Atomics.store`
 out-of-bounds value release), `817509a87c` (Unicode script-range allocation
 refusal), `79f58c104c` (truncated BigInt limb release), `5febaaa49f`
 (inherited-property write releases its value when lazy initialization is
-refused) and `ef5c6e356c` (signed BigInt decrement on 64-bit limbs).
+refused), `ef5c6e356c` (signed BigInt decrement on 64-bit limbs),
+`e8b69194b3` (bound captured-variable indices and propagate compiler failures),
+and `c530305c0f` (balance symbol coercion when a property key is a built-in atom).
 `tilefinch-quickjs-read-refusal-tests` covers the two read-path fixes.
 
 ## Changes carried

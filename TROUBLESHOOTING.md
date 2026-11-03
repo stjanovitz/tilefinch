@@ -79,23 +79,47 @@ refused before it starts, with the reason shown on the player. Not every
 stream format is supported, so a video can still fail because of its codec or
 audio track.
 
+The player names the reason a video could not play and what to try. Where
+there is one, a short code in the panel's bottom-right corner (such as
+`login-required` or `AV WP 800200D2`) identifies the exact failure for a bug
+report. For YouTube videos:
+
+- `THIS VIDEO NEEDS SIGN-IN`: YouTube plays it only to a signed-in account,
+  or after an age check. Sign in from the YouTube homepage, then press Cross
+  to retry.
+- `THIS VIDEO ISN'T AVAILABLE`: it is private or removed, blocked in your
+  region, or YouTube refused it to this player. The second line says which.
+- `THIS VIDEO HASN'T STARTED YET`: a premiere or live stream that has not
+  begun. Try again once it starts.
+- `NETWORK PROBLEM`: the request to YouTube failed or timed out. Check the
+  Wi-Fi connection, then press Cross to retry.
+- `NOT ENOUGH MEMORY FOR VIDEO`: the PSP could not find memory for the
+  player. Close other tabs, then retry.
+
 When a page offers several versions of a video, the player tries each one
 and then names the reason the last one could not play:
 
 - `OPTIONAL VIDEO DECODER NEEDED`: the video would play at low resolution
   through the optional software decoder, which is not installed. See
   [Optional H.264 High decoder](README.md#optional-h264-high-decoder).
-- `VIDEO DECODER COULDN'T START`: the decoder is installed but could not
-  start. The second line says why: not enough memory, missing files, a
-  rebuild needed, or a firmware code.
+- `VIDEO DECODER COULDN'T START`: the optional decoder is installed but
+  could not start. The second line says why: not enough memory, missing
+  files, a rebuild needed, or a firmware code. The PSP's own video modules
+  failing to start show the same headline with **Retry, or restart
+  Tilefinch**.
 - `PSP CAN'T PLAY THIS VIDEO FORMAT`: neither decoder can play this video
   and the page offered no version that fits. The second line names the
-  cause, such as a B-frame pyramid, more than 3 reference frames, or a
-  High-profile picture larger than 432x240.
+  cause, such as a B-frame pyramid, more than 3 reference frames, a
+  High-profile picture larger than 432x240, or a live stream format the
+  player does not support.
 
 - `STREAM OFFLINE OR NOT AVAILABLE`: a live channel is not streaming right
   now, or the stream's address no longer exists or has ended. Try again when
   the channel is live.
+
+The failure panel also offers Triangle for audio only and Square for 240p
+on YouTube videos where those can help. A video that opens slowly says
+**Still loading** after about ten seconds, and Circle cancels it.
 
 If the decoder has to be shut down during playback, the player says
 `VIDEO DECODER NEEDS APP RESTART` and stops offering Retry: only relaunching

@@ -264,6 +264,7 @@ static bool capture_provisional_present(
 }
 
 #include "suites/youtube_page_data.inc"
+#include "suites/youtube_page_builder.inc"
 #include "suites/browser_engine_lifecycle.inc"
 #include "suites/browser_engine_navigation.inc"
 #include "suites/browser_engine_adapters.inc"
@@ -318,10 +319,12 @@ int main(int argc, char **argv)
         return test_deferred_image_retry_fires_load();
     if (argc == 2 && strcmp(argv[1], "--youtube-page-data-only") == 0)
         return test_youtube_page_data_carriers()
-            || test_youtube_page_data_rejects();
+            || test_youtube_page_data_rejects()
+            || test_youtube_page_builder();
     if (argc == 2 && strcmp(argv[1], "--youtube-login-journey") == 0)
         return test_youtube_login_journey() || test_youtube_personalized_home()
             || test_youtube_rating_status_confirmation() || test_youtube_like_action()
+            || test_youtube_like_canonical_link()
             || test_youtube_library_actions() || test_youtube_library_native_action();
     if (argc == 2 && strcmp(argv[1], "--youtube-navigation-journey") == 0)
         return test_youtube_provider_layout_states() || test_youtube_filters_and_chapters();
@@ -382,6 +385,7 @@ int main(int argc, char **argv)
     if (argc == 2 && strcmp(argv[1], "--youtube-account-actions-only") == 0)
         return test_youtube_resume_metadata() || test_youtube_recent_history()
             || test_youtube_rating_status_confirmation() || test_youtube_like_action()
+            || test_youtube_like_canonical_link()
             || test_youtube_library_actions() || test_youtube_library_native_action();
     if (argc == 2 && strcmp(argv[1], "--computed-style-layout-only") == 0)
         return test_geometry_only_callback_skips_style_only_flow()
@@ -581,6 +585,7 @@ int main(int argc, char **argv)
     CHECK(test_youtube_watch_next_cards() == 0);
     CHECK(test_youtube_history_page() == 0);
     CHECK(test_youtube_like_action() == 0);
+    CHECK(test_youtube_like_canonical_link() == 0);
     CHECK(test_youtube_missing_initial_data_terminates() == 0);
     CHECK(test_google_search_compatibility_adapter() == 0);
     CHECK(test_google_search_identity() == 0);

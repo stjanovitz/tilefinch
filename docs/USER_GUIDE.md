@@ -162,10 +162,14 @@ Some posterless video cards show the linked article's preview image instead
 of a blank box. This does not mean the video format is supported; unsupported
 videos still show the player's normal explanation when opened.
 
-- Cross pauses or resumes. L/R or the analog stick previews a seek, and
-  Cross confirms the new position. Circle cancels a preview or closes
-  playback. In a YouTube playlist, L/R change video instead; see
+- Cross pauses or resumes. D-pad Left/Right previews a seek 10 seconds back
+  or forward, L/R a minute, and the analog stick scrubs; Cross confirms the
+  new position. Circle cancels a preview or closes playback. In a YouTube
+  playlist, L/R change video instead; see
   [Playlists and the queue](#playlists-and-the-queue).
+- Square turns captions on or off while a video with captions plays. It
+  brings back the track you last used, or the first track, which follows
+  your preferred subtitle language.
 - Triangle opens the chapter, audio and subtitle picker when available, with
   Chapters first, followed by Audio and Subtitles. Use L/R to change
   category, Up/Down to choose an entry, and Cross to select it; Circle
@@ -176,6 +180,11 @@ videos still show the player's normal explanation when opened.
 - Streamed (HLS) videos that are not live show their length and seek bar and
   seek like any other video. Live streams show **LIVE** instead and cannot be
   seeked.
+- A video still opening after about ten seconds says **Still loading**;
+  Circle cancels it. If the player falls back to 240p, it says **Retrying at
+  240p**. A video that cannot play says why and what to try, with a short
+  code underneath to quote in a bug report; see
+  [A video won't play](../TROUBLESHOOTING.md#a-video-wont-play).
 
 **Select rotates the picture and player controls** for holding the PSP
 vertically. For landscape 240p video it cycles through portrait fit, a central
@@ -210,14 +219,20 @@ in the native player above.
 ### Home, search and sign-in
 
 The YouTube homepage shows its search box first, without waiting for a feed.
+Signed out, the homepage is just the header and the search box.
 **Menu → Settings → Video → YouTube home topics** (On by default) then loads
 up to eight Explore categories from YouTube; turn it Off to skip that
 request. If topics fail to load, the search box still works. Topic names and
 video details follow the PSP's system language where YouTube supplies them,
 while Tilefinch's own controls use your interface language.
 
-Search results offer a collapsible **Filters** panel for upload date,
-duration and relevance/popularity ordering. Select a row to cycle its
+Search results are listed as compact rows by default. **Menu → Settings →
+Video → YouTube results** switches between **Compact** and **Detailed**
+(larger cards with a description line); the change applies when the page
+is reloaded and is kept from then on.
+
+Search results offer a collapsible **Filters** control, one short line under
+the heading, for upload date, duration and relevance/popularity ordering. Select a row to cycle its
 choices, then **Apply filters**. The collapsed heading summarizes the active
 choices; **Filters: Off** clears them while keeping the search text, and
 **Load more results** keeps them.
@@ -243,15 +258,19 @@ If sign-in still seems to do nothing, see
 [YouTube sign-in does nothing](../TROUBLESHOOTING.md#youtube-sign-in-does-nothing).
 
 In the signed-in header, **Account** opens a small panel for feed navigation,
-switching accounts, **Watch Later**, **History** and **Playlists**; select
-**Account** again to close it. History lists recently watched videos with
+switching accounts, **Watch Later**, **History**, **Playlists** and **Sign
+out**; select **Account** again to close it. History lists recently watched videos with
 their resume positions, a page at a time with **Load more**.
 
-**Sign out**, the last header action, removes this browser's YouTube cookies
-and personalized pages, and any saved YouTube login on the Memory Stick, then
-returns to the search homepage. It does not delete other site data or sign
-the account out on other devices. A separately signed-in Google session is
-left intact, so **Sign in** can use it again.
+**Sign out** first asks whether to sign out of YouTube and your Google
+account on this PSP, with **Cancel** selected; **Cancel** returns to the
+YouTube homepage and Circle to the page you came from. Choosing **Sign out**
+removes this browser's YouTube cookies and personalized pages, and any saved
+YouTube login on the Memory Stick, then returns to the search homepage and
+says **SIGNED OUT**. It also ends the Google account sign-in
+that YouTube's sign-in left in this browser, so the next **Sign in** asks
+for the account again. It does not delete other site data or sign the
+account out on other devices.
 
 ### Videos and channels
 
@@ -260,8 +279,14 @@ with the channel name, which opens the channel, and always includes **Save
 video offline**. Signed in, it also offers the subscription bell, Like,
 Watch Later and **Save to playlist**, and its **Account** menu holds
 **Unsubscribe**, Unlike and **Remove from Watch Later**; signed out, it
-offers **Sign in**. With browser chrome visible, the bottom hint bar names
-the focused icon's action.
+offers **Sign in**. The bottom hint bar names the focused icon's action;
+when the bars have hidden themselves, moving to another icon brings the hint
+bar back until the controls go idle again.
+
+In the player, Cross pauses, D-pad Left/Right seeks 10 seconds, L/R a
+minute, Square turns captions on or off, Triangle opens chapters, audio and
+subtitles, and Circle closes the video. The player's hints list the same
+buttons; see [Native video player](#native-video-player).
 
 When YouTube declares chapters, a collapsible **Chapters** list starts the
 video at the selected timestamp. **Up next** lists up to 12 suggestions,
@@ -269,11 +294,15 @@ without ads, Shorts shelves or mixes; a suggested playlist appears as a
 playlist card.
 
 A channel page shows the channel's banner, picture, name, subscriber count
-and a line of its description. Selecting the description line opens the full
+and a line of its description. **Menu → Settings → Video → Channel banners**
+(**Show** by default) set to **Hide** leaves the banner out: it is not
+downloaded, which saves several hundred KiB of memory and brings the tabs
+onto the first screen. The change applies from the next channel page you
+open. Selecting the description line opens the full
 description with the channel's links, view count and join date; **Back to
 channel** returns. **Home**, **Videos**, **Shorts** and **Playlists** tabs sit
 under the header. Home shows the shelves the channel arranges, each under its
-own heading with **See all** where the shelf has one; Videos lists the latest
+own heading with **See all** where the shelf has one, named after the shelf; Videos lists the latest
 uploads, with **More videos** for the next page.
 
 Signed in, the bell beside the channel name subscribes. On a channel page a
@@ -294,7 +323,8 @@ at the beginning, or select a video to play from that entry, keeping the
 playlist order (including repeated videos).
 
 **While a playlist plays, L/R select the previous and next video** instead
-of seeking; the stick and Left/Right still seek within a video. Triangle
+of seeking; the stick and Left/Right (10 seconds a press) still seek within
+a video, and Circle closes playback. Triangle
 opens **Queue**, which shows the playing video and its playlist position
 above the next five entries, with the next video selected. Square turns
 **Automatic next** on or off (it starts Off). L/R switch to the other player
@@ -321,7 +351,8 @@ storage** to be enabled.
 A saved login is YouTube's session cookies, not your password, stored
 unencrypted in `data/youtube-login.bin`; anyone with the Memory Stick may be
 able to use it. Save only on a Memory Stick you trust. If saving fails, the
-current session keeps working.
+current session keeps working. When YouTube no longer accepts a saved login,
+the browser removes it and says **SIGNED OUT BY YOUTUBE**.
 
 ## Other languages and language packs
 

@@ -37,4 +37,39 @@ const char *youtube_subtitles_text_at(
 size_t youtube_subtitles_cue_count(
     const YoutubeSubtitleDocument *document);
 
+/* The playback time range a document covers. start_us is the builder's
+   minimum_time_us and end_us the end of its last retained cue. truncated
+   means the cue or text-pool bound stopped retention there, so the resource
+   holds later cues that need another window. */
+typedef struct {
+    uint64_t start_us;
+    uint64_t end_us;
+    bool truncated;
+} YoutubeSubtitleWindow;
+bool youtube_subtitles_window(const YoutubeSubtitleDocument *document,
+                              YoutubeSubtitleWindow *window);
+
+typedef enum {
+    YOUTUBE_SUBTITLE_WINDOW_KEEP = 0,
+    /* Playback is before the window: rebuild from the new position. */
+    YOUTUBE_SUBTITLE_WINDOW_RELOAD,
+    /* A truncated window ends within lead_us of playback (or before it):
+       fetch a later window while this one keeps showing. */
+    YOUTUBE_SUBTITLE_WINDOW_EXTEND
+} YoutubeSubtitleWindowAction;
+YoutubeSubtitleWindowAction youtube_subtitles_window_action(
+    const YoutubeSubtitleDocument *document, uint64_t time_us,
+    uint64_t lead_us);
+
+/* Retry a failed extension without discarding the incumbent captions.
+   Three attempts per retained window, separated by five monotonic seconds.
+   Call only with no request in flight; zero-initialize on track/seek reset. */
+typedef struct {
+    uint64_t window_end_us;
+    uint64_t attempted_us;
+    unsigned attempts;
+} YoutubeSubtitleRetry;
+bool youtube_subtitles_retry_extension(YoutubeSubtitleRetry *retry,
+    uint64_t window_end_us, uint64_t monotonic_us);
+
 #endif

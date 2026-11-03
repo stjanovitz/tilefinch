@@ -128,10 +128,11 @@ The `wikipedia-article` trace is a lab capture of a main page, a search, and
 one long article, with their stylesheets.
 
 The `youtube-bbb` trace is a PSP capture of the `youtube-bbb` scenario. It has
-14 records:
+19 records:
 - the provider's results for the scenario's query;
 - the first result's watch page;
-- eleven thumbnails;
+- fourteen result thumbnails, the watch page's large thumbnail and one
+  channel avatar;
 - a second copy of the results page, because the live session re-fetched the
   list after Circle.
 

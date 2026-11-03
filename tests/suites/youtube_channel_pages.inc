@@ -288,13 +288,14 @@ static int test_youtube_lite_channel_pages(void)
     CHECK(strstr(html, "15 waiting &middot; Scheduled for 10/29") != NULL);
     CHECK(youtube_channel_after(html, "watch?v=LIVENOW0001", "<span class=\"duration live\">LIVE</span>") != NULL);
     CHECK(strstr(html, "98 watching") != NULL);
-    /* See all: a channel tab, and a playlist; a shelf's entries are bounded. */
+    /* See all: a channel tab, and a playlist, each named after its shelf;
+       a shelf's entries are bounded. */
     CHECK(youtube_channel_after(html, "watch?v=LIVENOW0001",
-        "<a class=more href=\"https://www.youtube.com/@fixture/videos\">See all</a>") != NULL);
+        "<a class=\"more see-all\" href=\"https://www.youtube.com/@fixture/videos\">See all: Coming up</a>") != NULL);
     CHECK(strstr(html, "watch?v=VIDEO000004") != NULL);
     CHECK(strstr(html, "VIDEO000005") == NULL);
     CHECK(youtube_channel_after(html, "watch?v=VIDEO000004",
-        "<a class=more href=\"https://www.youtube.com/playlist?list=PLfixture01\">See all</a>") != NULL);
+        "<a class=\"more see-all\" href=\"https://www.youtube.com/playlist?list=PLfixture01\">See all: Mission &amp; more</a>") != NULL);
     /* Playlists are playlist cards, never video cards. */
     CHECK(strstr(html, "<a class=card href=\"https://www.youtube.com/playlist?list=PLfixture02\">") != NULL);
     CHECK(youtube_channel_after(html, "list=PLfixture02", "i.ytimg.com/vi/THUMB000001/mqdefault.jpg") != NULL);
@@ -308,6 +309,20 @@ static int test_youtube_lite_channel_pages(void)
     CHECK(strstr(html, "Friends") == NULL && strstr(html, "@other") == NULL);
     CHECK(strstr(html, "tilefinch_token") == NULL);
     CHECK(document.result_count == 9u);
+    youtube_lite_document_destroy(&document);
+    CHECK(budget.current == 0);
+
+    /* Channel banners hidden: the page names no banner image, so none is
+       fetched or decoded; the rest of the header is unchanged. */
+    CHECK(youtube_channel_build("https://www.youtube.com/@fixture?tilefinch_banners=0", home,
+        sizeof(home) - 1u, NULL, 0, false, &budget, &document) == 0);
+    html = document.html;
+    CHECK(strstr(html, "googleusercontent.com/banner") == NULL
+        && strstr(html, "<img class=channel-banner") == NULL
+        && strstr(html, "<h1>Fixture &lt;Channel&gt;</h1>") != NULL
+        && strstr(html, "src=\"https://yt3.googleusercontent.com/avatar=s72\"") != NULL
+        && youtube_channel_after(html, "id=yt-channel-about", "<nav class=channel-tabs>") != NULL
+        && document.result_count == 9u);
     youtube_lite_document_destroy(&document);
     CHECK(budget.current == 0);
 

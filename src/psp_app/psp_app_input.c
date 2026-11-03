@@ -788,12 +788,8 @@ void psp_sync_ui(PspUiState *ui, const BrowserEngine *engine,
     psp_ui_set_scroll(ui, view.scroll_y, view.maximum_scroll_y);
     _Static_assert(sizeof(ui->focus_label) == sizeof(view.focus_label),
                    "focus labels must fit the native snapshot");
-    ui->focus_label_valid = ui->screen == PSP_UI_SCREEN_PAGE
-        && view.focus_label[0] != '\0';
-    if (ui->focus_label_valid) {
-        memcpy(ui->focus_label, view.focus_label, sizeof(ui->focus_label));
-        ui->network_profile_label_valid = false;
-    }
+    (void) psp_ui_set_focus_target_label(ui, view.focus_label,
+        view.navigation_generation, view.focus_serial);
     if (profile != NULL) {
         const BrowserSession *security_session =
             browser_engine_session_view(engine);

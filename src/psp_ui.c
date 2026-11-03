@@ -84,10 +84,12 @@ _Static_assert(TILEFINCH_UI_LANGUAGE_COUNT <= 16,
 #define UI_GLYPH_OPTION_ROWS 7u
 #define UI_GLYPH_OPTION_INTERFACE_LANGUAGE 6u
 #define UI_MEDIA_CONTROLS_MS 3000u
+/* A video still opening after this long says so beside its Cancel. */
+#define UI_MEDIA_SLOW_LOAD_MS 10000u
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
-#define UI_OPTIONS_ITEM_COUNT 53u
+#define UI_OPTIONS_ITEM_COUNT 54u
 #else
-#define UI_OPTIONS_ITEM_COUNT 51u
+#define UI_OPTIONS_ITEM_COUNT 52u
 #endif
 #define UI_SITE_DATA_VISIBLE_LINES 8u
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
@@ -289,7 +291,8 @@ typedef enum {
     UI_OPTION_YOUTUBE_LOGIN,
     UI_OPTION_ROTATE_HINT,
     UI_OPTION_WEB_FONTS,
-    UI_OPTION_YOUTUBE_SIGNIN_DIAGNOSTICS
+    UI_OPTION_YOUTUBE_SIGNIN_DIAGNOSTICS,
+    UI_OPTION_YOUTUBE_CHANNEL_BANNERS
 } UiOptionId;
 
 _Static_assert(BROWSER_VIDEO_LANGUAGE_COUNT <= 16,
@@ -360,13 +363,39 @@ static const UiOptionId ui_option_order[UI_OPTIONS_ITEM_COUNT] = {
     UI_OPTION_YOUTUBE_LOGIN,
     UI_OPTION_ROTATE_HINT,
     UI_OPTION_WEB_FONTS,
-    UI_OPTION_YOUTUBE_SIGNIN_DIAGNOSTICS
+    UI_OPTION_YOUTUBE_SIGNIN_DIAGNOSTICS,
+    /* Last index; shown right after YouTube results (see below). */
+    UI_OPTION_YOUTUBE_CHANNEL_BANNERS
 };
 
 static UiOptionId ui_option_id(size_t selection)
 {
     return ui_option_order[
         selection < UI_OPTIONS_ITEM_COUNT ? selection : 0u];
+}
+
+/* Rows are listed in index order except Channel banners, whose index is the
+   last one (so existing indices stay stable) but which is shown right after
+   YouTube results. Maps a display position to an option index. */
+#define UI_OPTION_RESULTS_INDEX 20u
+#define UI_OPTION_BANNERS_INDEX (UI_OPTIONS_ITEM_COUNT - 1u)
+_Static_assert(UI_OPTION_RESULTS_INDEX + 1u < UI_OPTION_BANNERS_INDEX,
+               "Channel banners follows YouTube results");
+
+static size_t ui_option_at_display(size_t position)
+{
+    if (position <= UI_OPTION_RESULTS_INDEX) return position;
+    if (position == UI_OPTION_RESULTS_INDEX + 1u)
+        return UI_OPTION_BANNERS_INDEX;
+    return position - 1u;
+}
+
+static size_t ui_option_display_position(size_t selection)
+{
+    if (selection <= UI_OPTION_RESULTS_INDEX) return selection;
+    if (selection == UI_OPTION_BANNERS_INDEX)
+        return UI_OPTION_RESULTS_INDEX + 1u;
+    return selection + 1u;
 }
 
 /*
@@ -492,9 +521,11 @@ static const UiOptionDesc ui_option_descs[] = {
         "Smart uses built-in fonts when memory is low", 0},
     [UI_OPTION_YOUTUBE_SIGNIN_DIAGNOSTICS] = {"YouTube sign-in diagnostics",
         "Session-only counts; QR excludes browsing logs", 4},
+    [UI_OPTION_YOUTUBE_CHANNEL_BANNERS] = {"Channel banners",
+        "Hide skips loading each channel's banner image", 2},
 };
 _Static_assert(sizeof(ui_option_descs) / sizeof(ui_option_descs[0])
-                   == (size_t) UI_OPTION_YOUTUBE_SIGNIN_DIAGNOSTICS + 1u,
+                   == (size_t) UI_OPTION_YOUTUBE_CHANNEL_BANNERS + 1u,
                "every UiOptionId needs a UiOptionDesc");
 
 static const UiOptionDesc *ui_option_desc(UiOptionId option)
@@ -532,7 +563,8 @@ size_t psp_ui_menu_option_first_in_group(size_t group)
             if (ui_option_id(at) == UI_OPTION_TEXT_ENTRY) return at;
         }
     }
-    for (size_t at = 0; at < UI_OPTIONS_ITEM_COUNT; at++) {
+    for (size_t position = 0; position < UI_OPTIONS_ITEM_COUNT; position++) {
+        size_t at = ui_option_at_display(position);
         if (ui_option_group_index(ui_option_id(at)) == group) return at;
     }
     return 0u;
@@ -541,11 +573,12 @@ size_t psp_ui_menu_option_first_in_group(size_t group)
 static size_t ui_option_step_in_group(size_t selection, int direction)
 {
     size_t group = ui_option_group_index(ui_option_id(selection));
-    size_t at = selection;
+    size_t position = ui_option_display_position(selection);
     for (size_t visited = 0; visited < UI_OPTIONS_ITEM_COUNT; visited++) {
-        at = direction < 0
-            ? (at == 0 ? UI_OPTIONS_ITEM_COUNT - 1u : at - 1u)
-            : (at + 1u) % UI_OPTIONS_ITEM_COUNT;
+        position = direction < 0
+            ? (position == 0 ? UI_OPTIONS_ITEM_COUNT - 1u : position - 1u)
+            : (position + 1u) % UI_OPTIONS_ITEM_COUNT;
+        size_t at = ui_option_at_display(position);
         if (ui_option_group_index(ui_option_id(at)) == group) return at;
     }
     return selection;
@@ -1889,6 +1922,41 @@ static int draw_fitted_ui_text(
         color, scale, NULL, bold);
 }
 
+/*
+ * A hint reworded after its catalog shipped. The published catalogs are
+ * immutable, so a language that translated the earlier wording keeps that
+ * translation until a catalog carries the new key; English, and a language
+ * that had neither, read the new wording.
+ */
+static const char *ui_text_or_legacy(const char *english, const char *legacy)
+{
+    const char *text = tilefinch_ui_text(english);
+    if (text != english) return text;
+    const char *earlier = tilefinch_ui_text(legacy);
+    return earlier != legacy ? earlier : english;
+}
+
+/*
+ * The hint bar's name for the focused element. A provider label may join a
+ * catalog action to a name it does not translate ("Play from here: Episode
+ * 1"); the action half still needs its pre-shaped display form.
+ */
+static const char *ui_focus_label_display(const char *label, char *buffer,
+                                          size_t capacity)
+{
+    const char *display = tilefinch_ui_display_name(label);
+    const char *separator = strstr(label, ": ");
+    char action[64];
+    if (display != label || separator == NULL || separator == label
+        || (size_t) (separator - label) >= sizeof(action)) return display;
+    memcpy(action, label, (size_t) (separator - label));
+    action[separator - label] = '\0';
+    const char *shaped = tilefinch_ui_display_name(action);
+    if (shaped == action) return label;
+    snprintf(buffer, capacity, "%s%s", shaped, separator);
+    return buffer;
+}
+
 static void draw_ui_label_value(
     uint16_t *pixels, int width, int height, int stride, int left, int right,
     int y, const char *label, const char *value, uint16_t ink,
@@ -1966,6 +2034,61 @@ static int browser_bottom_height(const PspUiState *ui)
     return browser_ui_scale(ui) == 2 ? 29 : UI_BOTTOM_HEIGHT;
 }
 
+static void copy_string(char *destination, size_t capacity,
+                        const char *source);
+
+/* The bottom bar shown alone for a focus change (focus_hint_visible). */
+static bool ui_focus_hint_shown(const PspUiState *ui)
+{
+    return ui != NULL && !ui->chrome_visible && ui->focus_hint_visible
+        && ui->screen == PSP_UI_SCREEN_PAGE && ui->focus_label_valid
+        && !ui->focus_editable && !ui->page_gamepad_capture
+        && !ui->page_fullscreen;
+}
+
+/* Whether the page's bottom bar covers its last rows this frame. */
+static bool ui_bottom_bar_shown(const PspUiState *ui)
+{
+    return (ui->chrome_visible && ui->screen == PSP_UI_SCREEN_PAGE)
+        || ui_focus_hint_shown(ui);
+}
+
+bool psp_ui_set_focus_target_label(PspUiState *ui, const char *label,
+    uint64_t navigation_generation, uint32_t target_serial)
+{
+    if (ui == NULL) return false;
+    bool valid = ui->screen == PSP_UI_SCREEN_PAGE
+        && label != NULL && label[0] != '\0';
+    if (!valid) {
+        bool changed = ui->focus_label_valid;
+        ui->focus_label_valid = false;
+        ui->focus_hint_visible = false;
+        return changed;
+    }
+    bool changed = !ui->focus_label_valid
+        || ui->focus_navigation_generation != navigation_generation
+        || ui->focus_target_serial != target_serial
+        || strncmp(ui->focus_label, label, sizeof(ui->focus_label)) != 0;
+    /* The label shares its storage with the overlays' strings. */
+    ui->network_profile_label_valid = false;
+    ui->focus_label_valid = true;
+    if (!changed) return false;
+    copy_string(ui->focus_label, sizeof(ui->focus_label), label);
+    ui->focus_navigation_generation = navigation_generation;
+    ui->focus_target_serial = target_serial;
+    if (!ui->chrome_visible) {
+        ui->focus_hint_visible = true;
+        if (ui->activity_frames == 0)
+            ui->activity_frames = UI_AUTOHIDE_FRAMES;
+    }
+    return true;
+}
+
+bool psp_ui_set_focus_label(PspUiState *ui, const char *label)
+{
+    return psp_ui_set_focus_target_label(ui, label, 0, 0);
+}
+
 void psp_ui_opaque_chrome_rows(
     const PspUiState *ui, unsigned *top_rows, unsigned *bottom_rows)
 {
@@ -1978,6 +2101,8 @@ void psp_ui_opaque_chrome_rows(
         top = UI_TOP_HEIGHT;
         if (ui->screen == PSP_UI_SCREEN_PAGE)
             bottom = (unsigned) browser_bottom_height(ui);
+    } else if (ui_focus_hint_shown(ui)) {
+        bottom = (unsigned) browser_bottom_height(ui);
     }
     if (top_rows != NULL) *top_rows = top;
     if (bottom_rows != NULL) *bottom_rows = bottom;
@@ -2036,9 +2161,6 @@ static void draw_lock(uint16_t *pixels, int width, int height, int stride,
     put_pixel(pixels, width, height, stride, x + 1, y + 3, color);
     put_pixel(pixels, width, height, stride, x + 6, y + 3, color);
 }
-
-static void copy_string(char *destination, size_t capacity,
-                        const char *source);
 
 static void ui_url_presentation(
     const PspUiState *ui, char *domain, size_t domain_capacity,
@@ -2145,6 +2267,8 @@ void psp_ui_init(PspUiState *ui)
     ui->web_font_mode = WEB_FONTS_SMART;
     ui->analog_cursor_enabled = true;
     ui->youtube_topics = true;
+    ui->youtube_compact_results = true;
+    ui->youtube_channel_banners = true;
     ui->javascript_enabled = 1u;
     ui->site_javascript_enabled = 1u;
     ui->site_data_allowed = 1u;
@@ -2245,6 +2369,7 @@ bool psp_ui_retract_chrome_for_page_fullscreen(PspUiState *ui,
         || !ui->chrome_visible || ui->screen != PSP_UI_SCREEN_PAGE)
         return false;
     ui->chrome_visible = false;
+    ui->focus_hint_visible = false;
     return true;
 }
 
@@ -3753,6 +3878,7 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
         if (ui->activity_frames == 0 && !ui->loading
             && !ui_has_overlay(ui)) {
             ui->chrome_visible = false;
+            ui->focus_hint_visible = false;
             intent.visual_changed = true;
         }
     }
@@ -4528,6 +4654,14 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
                     intent.setting.value.boolean =
                         ui->youtube_compact_results;
                     break;
+                case UI_OPTION_YOUTUBE_CHANNEL_BANNERS:
+                    ui->youtube_channel_banners =
+                        !ui->youtube_channel_banners;
+                    intent.setting.id =
+                        PSP_UI_SETTING_YOUTUBE_CHANNEL_BANNERS;
+                    intent.setting.value.boolean =
+                        ui->youtube_channel_banners;
+                    break;
                 case UI_OPTION_YOUTUBE_TOPICS:
                     ui->youtube_topics = !ui->youtube_topics;
                     intent.setting.id = PSP_UI_SETTING_YOUTUBE_TOPICS;
@@ -4749,6 +4883,7 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
         && !psp_ui_screen_is_native_surface(ui->screen)) {
         ui->cursor_visible = false;
         ui->chrome_visible = !ui->chrome_visible;
+        ui->focus_hint_visible = false;
         ui->screen = PSP_UI_SCREEN_PAGE;
         intent.visual_changed = true;
         return intent;
@@ -5353,9 +5488,10 @@ static void draw_bottom_bar(const PspUiState *ui, uint16_t *pixels, int width,
         int name_x = draw_button_legend(pixels, width, height, stride, 10,
                                         top + 7, "X", "", accent, scale)
             + UI_LEGEND_INNER_GAP;
+        char named[320];
         draw_fitted_ui_text(pixels, width, height, stride, name_x,
             top + (scale == 2 ? 7 : 6),
-            tilefinch_ui_display_name(ui->focus_label),
+            ui_focus_label_display(ui->focus_label, named, sizeof(named)),
             back_x - UI_LEGEND_PAIR_GAP, PSP_THEME_TEXT_MUTED, scale, false);
         draw_button_legend(pixels, width, height, stride, back_x,
                            top + 7, "O", "Back", accent, scale);
@@ -6466,6 +6602,9 @@ static TILEFINCH_OUT_OF_LINE void ui_option_row_presentation(
         case UI_OPTION_YOUTUBE_RESULTS:
             *value = ui->youtube_compact_results ? "Compact" : "Detailed";
             break;
+        case UI_OPTION_YOUTUBE_CHANNEL_BANNERS:
+            *value = ui->youtube_channel_banners ? "Show" : "Hide";
+            break;
         case UI_OPTION_VIDEO_STARTUP_BUFFERING:
             *value = ui->video_startup_buffering ? "Buffered" : "Immediate";
             break;
@@ -6595,7 +6734,8 @@ static TILEFINCH_OUT_OF_LINE void draw_option_items(
     size_t group_items[UI_OPTIONS_ITEM_COUNT];
     size_t group_count = 0;
     size_t selected_row = 0;
-    for (size_t at = 0; at < UI_OPTIONS_ITEM_COUNT; at++) {
+    for (size_t position = 0; position < UI_OPTIONS_ITEM_COUNT; position++) {
+        size_t at = ui_option_at_display(position);
         if (ui_option_group_index(ui_option_id(at)) != group) continue;
         if (at == ui->options_selection) selected_row = group_count;
         group_items[group_count++] = at;
@@ -7521,8 +7661,10 @@ static TILEFINCH_OUT_OF_LINE void draw_youtube_login_offer(
             line, sizeof(line), box.x + box.width - 14, i == 0u || i >= 4u ? text : muted,
             i == 0u || i >= 4u ? 2 : 1, NULL, i == 0u);
     }
-    draw_text(pixels, width, height, stride, box.x + 14, box.y + 203,
-              "Up/Down Choose   X Confirm   O Not now", 44, muted, 1);
+    /* Circle and Select both answer Not now (psp_ui_menu's Select). */
+    draw_fitted_ui_text(pixels, width, height, stride, box.x + 14, box.y + 203,
+        tilefinch_ui_text("Up/Down Choose   X Confirm   O/Select Not now"),
+        box.x + box.width - 14, muted, 1, false);
 }
 
 static TILEFINCH_OUT_OF_LINE void draw_heavy_offer(
@@ -8715,7 +8857,7 @@ static TILEFINCH_OUT_OF_LINE void draw_offer_toast(
     if (box_width > width - 24) box_width = width - 24;
     int line_step = scale == 2 ? 22 : 16;
     int box_height = 3 * line_step + (scale == 2 ? 8 : 6);
-    int reserved_bottom = ui->chrome_visible ? browser_bottom_height(ui) : 0;
+    int reserved_bottom = ui_bottom_bar_shown(ui) ? browser_bottom_height(ui) : 0;
     UiRect box = { (width - box_width) / 2,
                    height - reserved_bottom - box_height - 8,
                    box_width, box_height };
@@ -8968,7 +9110,7 @@ static void draw_toast(const PspUiState *ui, uint16_t *pixels, int width,
     if (box_width < text_width + 12) box_width = text_width + 24;
     if (box_width > width - 24) box_width = width - 24;
     int reserved_bottom = ui->screen == PSP_UI_SCREEN_PAGE
-                           && ui->chrome_visible
+                           && ui_bottom_bar_shown(ui)
         ? browser_bottom_height(ui)
         : (psp_ui_screen_is_native_surface(ui->screen)
                ? UI_SURFACE_HINT_HEIGHT : 0);
@@ -9079,6 +9221,10 @@ static TILEFINCH_OUT_OF_LINE void psp_ui_composite_browser(
         if (ui->screen == PSP_UI_SCREEN_PAGE)
             draw_cached_bottom_bar(
                 ui, pixels, width, height, stride, panel, accent, text);
+    } else if (ui_focus_hint_shown(ui)) {
+        /* The same retained rows the full bars use: no new raster work. */
+        draw_cached_bottom_bar(
+            ui, pixels, width, height, stride, panel, accent, text);
     }
 #if defined(TILEFINCH_PSP_UI_TIMING) && defined(__PSP__)
     timing_chrome_us = (uint64_t) sceKernelGetSystemTimeWide();
@@ -9689,6 +9835,8 @@ void psp_ui_media_set(PspUiMediaState *media, bool visible, bool playing,
     if (media == NULL) return;
     bool became_visible = visible && !media->visible;
     bool duration_changed = duration_us != media->duration_us;
+    if (media->resolving && media->presentation != NULL)
+        media->presentation->lower_quality_retry = false;
     media->visible = visible;
     media->resolving = false;
     media->seek_in_progress = false;
@@ -9721,11 +9869,35 @@ void psp_ui_media_set(PspUiMediaState *media, bool visible, bool playing,
     }
 }
 
+/* The status an open shows: the generic word becomes the 240p retry while
+   one is in progress. */
+static const char *media_resolving_status(const PspUiMediaState *media,
+                                          const char *status)
+{
+    if (media->presentation != NULL && media->presentation->lower_quality_retry
+        && strcmp(status, "Loading...") == 0)
+        return "Retrying at 240p";
+    return status;
+}
+
+void psp_ui_media_note_lower_quality_retry(PspUiMediaState *media)
+{
+    if (media == NULL || media->presentation == NULL) return;
+    media->presentation->lower_quality_retry = true;
+    if (media->resolving)
+        copy_string(media->status, sizeof(media->status),
+                    media_resolving_status(media, media->status));
+}
+
 void psp_ui_media_set_resolving(PspUiMediaState *media, const char *title)
 {
     if (media == NULL) return;
-    if (media->presentation != NULL)
+    if (media->presentation != NULL) {
         media->presentation->track_menu_open = false;
+        /* A fresh open starts the slow-load clock; the open's own later
+           phases and a 240p retry inside it keep counting. */
+        if (!media->resolving) media->presentation->resolving_elapsed_ms = 0;
+    }
     media->visible = true;
     media->controls_visible = true;
     media->resolving = true;
@@ -9751,7 +9923,8 @@ void psp_ui_media_set_resolving(PspUiMediaState *media, const char *title)
     media->controls_remaining_ms = UI_MEDIA_CONTROLS_MS;
     copy_string(media->title, sizeof(media->title),
                 title == NULL || title[0] == '\0' ? "VIDEO" : title);
-    copy_string(media->status, sizeof(media->status), "Loading...");
+    copy_string(media->status, sizeof(media->status),
+                media_resolving_status(media, "Loading..."));
     media->resolving_progress_per_mille = 0;
 }
 
@@ -9762,7 +9935,7 @@ void psp_ui_media_set_resolving_progress(
     if (media == NULL || !media->resolving) return;
     copy_string(media->status, sizeof(media->status),
                 status == NULL || status[0] == '\0'
-                    ? "STARTING VIDEO" : status);
+                    ? "STARTING VIDEO" : media_resolving_status(media, status));
     media->resolving_progress_per_mille =
         progress_per_mille > 1000u ? 1000u : progress_per_mille;
 }
@@ -9814,8 +9987,10 @@ static void media_error_wrap(char *status, size_t capacity)
 void psp_ui_media_set_error(PspUiMediaState *media, const char *message)
 {
     if (media == NULL) return;
-    if (media->presentation != NULL)
+    if (media->presentation != NULL) {
         media->presentation->track_menu_open = false;
+        media->presentation->lower_quality_retry = false;
+    }
     media->visible = true;
     media->controls_visible = true;
     media->resolving = false;
@@ -10102,12 +10277,49 @@ static unsigned media_menu_first(const PspUiMediaPresentation *p)
         ? p->track_menu_selection - PSP_UI_MEDIA_TRACK_LIMIT : 0u;
 }
 
+static bool media_caption_toggle_available(const PspUiMediaState *media);
+
+/* Square: off remembers the track that was showing; on picks it again, or
+   the first track (the resolver ranks the preferred language first). */
+static void media_caption_toggle(PspUiMediaState *media,
+                                 PspUiMediaIntent *intent)
+{
+    PspUiMediaPresentation *presentation = media->presentation;
+    intent->action = PSP_UI_MEDIA_ACTION_SELECT_SUBTITLE_TRACK;
+    int selected = presentation->selected_subtitle_track;
+    if (selected >= 0 && selected < presentation->subtitle_track_count) {
+        copy_string(presentation->last_subtitle_label,
+                    sizeof(presentation->last_subtitle_label),
+                    presentation->subtitle_tracks[selected].label);
+        intent->track_index = UINT8_MAX;
+        return;
+    }
+    intent->track_index = 0;
+    for (uint8_t at = 0; at < presentation->subtitle_track_count; at++) {
+        if (presentation->last_subtitle_label[0] != '\0'
+            && strcmp(presentation->subtitle_tracks[at].label,
+                      presentation->last_subtitle_label) == 0) {
+            intent->track_index = at;
+            break;
+        }
+    }
+}
+
 PspUiMediaIntent psp_ui_media_update(PspUiMediaState *media,
                                      const PspUiInput *input)
 {
     PspUiMediaIntent intent = {0};
     if (media == NULL || input == NULL || !media->visible) return intent;
     PspUiMediaPresentation *presentation = media->presentation;
+    if (presentation != NULL && media->resolving && !media->seek_in_progress) {
+        unsigned before = presentation->resolving_elapsed_ms;
+        unsigned spent = input->elapsed_ms == 0 ? 16u : input->elapsed_ms;
+        unsigned now = spent > UINT16_MAX - before ? UINT16_MAX : before + spent;
+        presentation->resolving_elapsed_ms = (uint16_t) now;
+        /* One repaint when the slow-load note appears; none before or after. */
+        intent.visual_changed = before < UI_MEDIA_SLOW_LOAD_MS
+            && now >= UI_MEDIA_SLOW_LOAD_MS;
+    }
     PspUiInput rotated;
     if (presentation != NULL && presentation->clockwise) {
         rotated = *input;
@@ -10174,6 +10386,10 @@ PspUiMediaIntent psp_ui_media_update(PspUiMediaState *media,
                 intent.track_index = presentation->track_menu_selection == 0
                     ? UINT8_MAX
                     : (uint8_t) (presentation->track_menu_selection - 1u);
+                if (intent.track_index != UINT8_MAX)
+                    copy_string(presentation->last_subtitle_label,
+                        sizeof(presentation->last_subtitle_label),
+                        presentation->subtitle_tracks[intent.track_index].label);
             } else if (presentation->track_menu_tab == PSP_UI_MEDIA_TAB_QUEUE) {
                 unsigned at = presentation->track_menu_selection;
                 if (media_queue_ended(media)) {
@@ -10261,6 +10477,9 @@ PspUiMediaIntent psp_ui_media_update(PspUiMediaState *media,
             intent.action = PSP_UI_MEDIA_ACTION_PREVIOUS;
         else if ((pressed & PSP_UI_BUTTON_PAGE_DOWN) && presentation->queue_next)
             intent.action = PSP_UI_MEDIA_ACTION_NEXT;
+    } else if ((pressed & PSP_UI_BUTTON_RELOAD)
+               && media_caption_toggle_available(media)) {
+        media_caption_toggle(media, &intent);
     } else if (pressed & PSP_UI_BUTTON_CANCEL) {
         if (media->seek_preview_active) {
             psp_ui_media_cancel_seek_preview(media);
@@ -10275,8 +10494,10 @@ PspUiMediaIntent psp_ui_media_update(PspUiMediaState *media,
             intent.action = PSP_UI_MEDIA_ACTION_AUDIO_ONLY;
         else if (!media->retry_unavailable
                  && (pressed & PSP_UI_BUTTON_RELOAD) != 0
-                 && media->lower_quality_recovery_available)
+                 && media->lower_quality_recovery_available) {
             intent.action = PSP_UI_MEDIA_ACTION_LOWER_QUALITY;
+            psp_ui_media_note_lower_quality_retry(media);
+        }
         else if ((pressed & PSP_UI_BUTTON_CONFIRM) != 0
             && !media->retry_unavailable)
             intent.action = PSP_UI_MEDIA_ACTION_RETRY;
@@ -10437,6 +10658,16 @@ static bool media_rotation_hint(const PspUiMediaState *media)
     return media->presentation != NULL && media->presentation->rotation_available
         && (media->presentation->rotation_hint_always
             || media->presentation->rotation_suggested || media->presentation->clockwise);
+}
+
+/* Square turns captions on or off in one press while a video plays: the
+   track menu is closed, nothing failed, and the video has captions. */
+static bool media_caption_toggle_available(const PspUiMediaState *media)
+{
+    return media->presentation != NULL && !media->failed
+        && !media->resolving && !media->seek_preview_active
+        && !media->presentation->track_menu_open
+        && media->presentation->subtitle_track_count != 0;
 }
 
 static int media_control_offset(const PspUiMediaState *media)
@@ -11198,6 +11429,42 @@ static void draw_media_control_bar_ground(
               blend565(PSP_THEME_HINT_BAR, PSP_THEME_CHROME_BAR, 6u), 4);
 }
 
+/*
+ * The buttons the main legend has no room for, small and right-aligned on
+ * the time row: the D-pad's 10-second seek, Square's captions and Circle.
+ * The bar keeps its height; `left` is where the time text ends.
+ */
+static void draw_media_secondary_hint(
+    const PspUiMediaState *media, uint16_t *pixels,
+    int width, int height, int stride, int left, int right, int y,
+    uint16_t muted)
+{
+    /* Named from the video, not from the moment's enabled state, so a seek
+       that rebuilds the decoder hands back exactly the bar it showed. */
+    const char *parts[3];
+    size_t count = 0;
+    if (media->duration_us != 0 && !media->live)
+        parts[count++] = tilefinch_ui_text("LEFT/RIGHT 10S");
+    if (media->presentation != NULL
+        && media->presentation->subtitle_track_count != 0)
+        parts[count++] = tilefinch_ui_text("\xe2\x96\xa1 CAPTIONS");
+    if (!media->seek_preview_active)
+        parts[count++] = tilefinch_ui_text("O CLOSE");
+    char legend[256];
+    size_t used = 0;
+    legend[0] = '\0';
+    for (size_t at = 0; at < count && used < sizeof(legend); at++)
+        used += (size_t) snprintf(legend + used, sizeof(legend) - used,
+                                  "%s%s", at == 0 ? "" : "   ", parts[at]);
+    if (legend[0] == '\0') return;
+    int legend_width = chrome_text_width_bytes(
+        legend, strlen(legend), 1, false);
+    int x = right - legend_width;
+    if (x < left + UI_LEGEND_PAIR_GAP) x = left + UI_LEGEND_PAIR_GAP;
+    draw_fitted_ui_text(pixels, width, height, stride, x, y + 3, legend,
+                        right, muted, 1, false);
+}
+
 static void draw_media_control_bar(
     const PspUiMediaState *media, uint16_t *pixels,
     int width, int height, int stride)
@@ -11224,8 +11491,12 @@ static void draw_media_control_bar(
         fill_round_rect(pixels, width, height, stride,
                         (UiRect) {right - 5, track_y - 3, 10, 10}, 5,
                         PSP_THEME_ACCENT_EMBER_HI, 4);
-        draw_fitted_ui_text(pixels, width, height, stride, left, height - 53 + offset,
-                  tilefinch_ui_text("LIVE"), right, text, 2, false);
+        int live_end = draw_fitted_ui_text(
+            pixels, width, height, stride, left, height - 53 + offset,
+            tilefinch_ui_text("LIVE"), right, text, 2, false);
+        draw_media_secondary_hint(media, pixels, width, height, stride,
+                                  live_end, right, height - 53 + offset,
+                                  muted);
         draw_fitted_ui_text(pixels, width, height, stride, left, height - 31 + offset,
                   tilefinch_ui_text(tracks_available
                       ? (media->playing
@@ -11286,8 +11557,11 @@ static void draw_media_control_bar(
              media->seek_preview_active ? tilefinch_ui_text("SEEK") : "",
              media->seek_preview_active ? " " : "",
              current, duration);
-    draw_fitted_ui_text(pixels, width, height, stride, left, height - 53 + offset,
-              legend, right, text, 2, false);
+    int time_end = draw_fitted_ui_text(
+        pixels, width, height, stride, left, height - 53 + offset,
+        legend, right, text, 2, false);
+    draw_media_secondary_hint(media, pixels, width, height, stride,
+                              time_end, right, height - 53 + offset, muted);
     draw_fitted_ui_text(pixels, width, height, stride, left, height - 31 + offset,
               tilefinch_ui_text(media->seek_preview_active
                   ? "X GO   O CANCEL"
@@ -11523,7 +11797,9 @@ static inline __attribute__((always_inline)) void draw_media_queue_body(
         draw_media_queue_row(presentation, at, pixels, width, height, stride, box);
     draw_fitted_ui_text(pixels, width, height, stride, box.x + 16,
         box.y + box.height - 29,
-        tilefinch_ui_text(presentation->queue_loading ? "Loading..." : "L/R  X SELECT  O BACK"),
+        presentation->queue_loading ? tilefinch_ui_text("Loading...")
+            : ui_text_or_legacy("L/R TAB  X SELECT  O BACK",
+                                "L/R  X SELECT  O BACK"),
         box.x + box.width - 16, PSP_THEME_TEXT_MUTED, 1, false);
     draw_media_queue_toggle(presentation, pixels, width, height, stride, box);
 }
@@ -11675,8 +11951,10 @@ static void draw_media_track_menu_box(
               box.x + 16, box.y + box.height - 17,
               presentation->track_menu_tab == PSP_UI_MEDIA_TAB_QUEUE && presentation->queue_failed && presentation->queue_error[0]
                 ? presentation->queue_error
-                : tilefinch_ui_text(presentation->track_menu_tab == PSP_UI_MEDIA_TAB_QUEUE && presentation->queue_loading
-                    ? "Loading..." : "L/R  X SELECT  O BACK"),
+                : presentation->track_menu_tab == PSP_UI_MEDIA_TAB_QUEUE && presentation->queue_loading
+                    ? tilefinch_ui_text("Loading...")
+                    : ui_text_or_legacy("L/R TAB  X SELECT  O BACK",
+                                        "L/R  X SELECT  O BACK"),
               box.x + box.width - (presentation->track_menu_tab >= PSP_UI_MEDIA_TAB_CHAPTERS ? 62 : 16),
               PSP_THEME_TEXT_MUTED, 1, false);
     if (presentation->track_menu_tab == PSP_UI_MEDIA_TAB_CHAPTERS || presentation->track_menu_tab == PSP_UI_MEDIA_TAB_QUEUE) {
@@ -11842,12 +12120,25 @@ void psp_ui_media_composite_layers(
             shown, message.x + message.width - 18,
             media->failed ? rgb565(248, 160, 160) : text,
             2, false);
+        /* A details line may carry a short code for bug reports on its
+           own line after the cause ("Check Wi-Fi, then press X to
+           retry\nfetch failed"); the code is drawn small in the panel's
+           bottom-right corner. */
+        char cause[PSP_UI_STATUS_CAPACITY];
+        const char *code = NULL;
+        if (reason != NULL && strchr(reason, '\n') != NULL) {
+            copy_string(cause, sizeof(cause), reason);
+            char *split = strchr(cause, '\n');
+            *split = '\0';
+            code = reason + (split - cause) + 1;
+            reason = cause;
+        }
         if (reason != NULL) {
             /* A catalog details line (psp_media_raise_error's cause) is
                translated and fitted like the headline; engine text keeps
                its bounded English row. */
             const char *details = tilefinch_ui_text(reason);
-            if (details != reason)
+            if (details != reason || code != NULL)
                 draw_fitted_ui_text(
                     pixels, width, height, stride,
                     message.x + 18, message.y + 36,
@@ -11886,7 +12177,12 @@ void psp_ui_media_composite_layers(
                 percent, 5, muted, 1, false);
             if (!media->seek_in_progress)
                 draw_fitted_ui_text(pixels, width, height, stride,
-                    track_x, message.y + 66, tilefinch_ui_text("O Cancel"),
+                    track_x, message.y + 66,
+                    tilefinch_ui_text(media->presentation != NULL
+                        && media->presentation->resolving_elapsed_ms
+                               >= UI_MEDIA_SLOW_LOAD_MS
+                        ? "Still loading \xe2\x80\x94 O to cancel"
+                        : "O Cancel"),
                     message.x + message.width - 18, muted, 1, false);
         } else {
             draw_panel_rule(
@@ -11945,27 +12241,34 @@ void psp_ui_media_composite_layers(
                 back.x + (back.width - back_width) / 2,
                 back.y + (back.height - 18) / 2, back_label,
                 TILEFINCH_UI_TRANSLATION_BYTES, text, 2);
+            /* The code for bug reports, small in the corner; the recovery
+               hint keeps the row to its left. */
+            int hint_right = message.x + message.width - 18;
+            if (code != NULL && code[0] != '\0') {
+                draw_text_right_aligned(
+                    pixels, width, height, stride, hint_right,
+                    message.y + 112, code, 23, PSP_THEME_TEXT_FAINT, 1,
+                    false);
+                hint_right -= chrome_text_width_bytes(
+                    code, strlen(code), 1, false) + UI_LEGEND_PAIR_GAP;
+            }
             if (media->presentation != NULL && media->presentation->queue_active
                 && media->presentation->queue_next && !media->presentation->queue_failed) {
                 draw_fitted_ui_text(pixels, width, height, stride,
                     message.x + 18, message.y + 112,
-                    tilefinch_ui_text("R Skip   Triangle Queue"), message.x + message.width - 18,
-                    muted, 1, false);
+                    ui_text_or_legacy("R Skip   TRI Queue",
+                                      "R Skip   Triangle Queue"),
+                    hint_right, muted, 1, false);
             } else if (!media->retry_unavailable
                 && (media->audio_only_recovery_available
                     || media->lower_quality_recovery_available)) {
-                /* The buttons are named as each language's hints name
-                   them (English words; "TRI" and the square otherwise),
-                   and "Audio-only" is the catalog's shared word. */
-                bool english = tilefinch_ui_translation_bound_language()
-                    == TILEFINCH_UI_LANGUAGE_ENGLISH;
+                /* Named the way every other player hint names the buttons;
+                   "Audio-only" is the catalog's shared word. */
                 char audio[TILEFINCH_UI_TRANSLATION_VALUE_BYTES + 16];
                 char recovery[sizeof(audio) + 24];
-                snprintf(audio, sizeof(audio), "%s %s",
-                         english ? "Triangle" : "TRI",
+                snprintf(audio, sizeof(audio), "TRI %s",
                          tilefinch_ui_text("Audio-only"));
-                const char *lower = english ? "Square 240p"
-                                            : "\xe2\x96\xa1 240p";
+                const char *lower = "\xe2\x96\xa1 240p";
                 if (!media->lower_quality_recovery_available)
                     snprintf(recovery, sizeof(recovery), "%s", audio);
                 else if (!media->audio_only_recovery_available)
@@ -11976,7 +12279,7 @@ void psp_ui_media_composite_layers(
                 draw_fitted_ui_text(
                     pixels, width, height, stride,
                     message.x + 18, message.y + 112, recovery,
-                    message.x + message.width - 18, muted, 1, false);
+                    hint_right, muted, 1, false);
             }
         }
         return;

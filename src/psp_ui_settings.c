@@ -19,6 +19,7 @@ PSP_UI_BOOL_MIRROR(history_enabled)
 PSP_UI_BOOL_MIRROR(color_emoji)
 PSP_UI_BOOL_MIRROR(rotate_hint_always)
 PSP_UI_BOOL_MIRROR(youtube_compact_results)
+PSP_UI_BOOL_MIRROR(youtube_channel_banners)
 PSP_UI_BOOL_MIRROR(youtube_audio_only)
 PSP_UI_BOOL_MIRROR(video_startup_buffering)
 PSP_UI_BOOL_MIRROR(resume_offline_downloads)
@@ -106,6 +107,17 @@ static const PspBoolSetting psp_bool_setting_table[] = {
         .engine_get = browser_engine_youtube_compact_results,
         .on_status = "YOUTUBE RESULTS COMPACT - RELOAD TO APPLY",
         .off_status = "YOUTUBE RESULTS DETAILED - RELOAD TO APPLY",
+        .status_frames = 240
+    },
+    {
+        .id = PSP_UI_SETTING_YOUTUBE_CHANNEL_BANNERS,
+        .profile_get = browser_profile_youtube_channel_banners,
+        .profile_set = browser_profile_set_youtube_channel_banners,
+        .ui_set = psp_ui_mirror_youtube_channel_banners,
+        .engine_set = browser_engine_set_youtube_channel_banners,
+        .engine_get = browser_engine_youtube_channel_banners,
+        .on_status = "CHANNEL BANNERS SHOWN - RELOAD TO APPLY",
+        .off_status = "CHANNEL BANNERS HIDDEN - RELOAD TO APPLY",
         .status_frames = 240
     },
     {

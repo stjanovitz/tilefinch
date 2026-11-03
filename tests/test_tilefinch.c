@@ -6577,6 +6577,29 @@ static bool test_constructed_sheet_lifetime(Budget *budget)
     return ok && budget->current == baseline;
 }
 
+typedef struct {
+    unsigned boundaries;
+    bool queued;
+    bool borrowed;
+} IdleInputProbe;
+
+static bool test_idle_input_cooperate(void *context, const char *phase,
+                                      size_t units, unsigned boundary)
+{
+    IdleInputProbe *probe = context;
+    (void) phase; (void) units;
+    if (boundary & TILEFINCH_COOPERATE_RENDER_INPUT) {
+        probe->boundaries++;
+        probe->borrowed |= (boundary & TILEFINCH_COOPERATE_RENDER_SHELL_BORROWED) != 0;
+        bool proceed = !probe->queued;
+        /* Model a press just after the first poll. The admitted tile may
+           finish, but the next safe boundary must leave its cursor alone. */
+        probe->queued = true;
+        return proceed;
+    }
+    return true;
+}
+
 static bool test_layout_cooperate(void *context, const char *phase,
                                   size_t completed_work_units)
 {
@@ -6677,6 +6700,23 @@ static int test_tile_paint_ahead(void)
     }
     CHECK(cache.misses == misses && cache.rasterized == rasterized
           && !tile_cache_prefetch_satisfied(&cache));
+    tile_cache_destroy(&cache);
+    /* A paint-ahead tile outlasts the PSP's idle budget, so that budget
+       alone would stop each turn after one tile; a press right after a page
+       settled (a list restored from history) then found the next screen
+       half drawn. Tiles keep a turn for up to one frame period instead. */
+    CHECK(tile_cache_init(&cache, &budget, &layout, 24)
+          && tile_cache_set_frame(&cache, frame, 480u * 272u)
+          && tile_cache_render_frame(&cache, 395, 480, 272, NULL));
+    tile_cache_schedule_prefetch_row(&cache, 395 + 272 + 127, 480);
+    size_t turn_rasterized = cache.rasterized;
+    (void) tile_cache_run_idle_work(&cache, 1u, 64u);
+    if (cache.rasterized - turn_rasterized < 2u) {
+        fprintf(stderr, "paint-ahead turn rasterized=%zu units=%zu\n",
+                cache.rasterized - turn_rasterized, cache.idle_units);
+    }
+    CHECK(cache.idle_slices == 1u
+          && cache.rasterized - turn_rasterized >= 2u);
     tile_cache_destroy(&cache);
     budget_free(&budget, frame);
     CHECK(budget.current == 0);

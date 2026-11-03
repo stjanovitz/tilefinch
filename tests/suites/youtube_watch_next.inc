@@ -91,7 +91,7 @@ static int test_youtube_watch_next_cards(void)
     CHECK(strstr(html, "<div class=watch-action-row><a id=yt-watch-channel class=channel-link "
         "href=\"https://www.youtube.com/@fixture.handle\">"
         "<img class=channel-avatar src=\"https://yt3.ggpht.com/fixture-avatar=s48\" "
-        "width=24 height=24 alt=\"\">Fixture &lt;Channel&gt;</a><a id=yt-watch-signin")
+        "width=24 height=24 alt=\"\">Fixture &lt;Channel&gt;</a><a id=yt-offline-save")
         && !strstr(html, "<p class=watch-meta>Fixture")
         && !strstr(html, "@second") && !strstr(html, "Owner title"));
 
@@ -126,7 +126,7 @@ static int test_youtube_watch_next_cards(void)
     CHECK(browser_engine_focus_direction(engine, CONTROLLER_FOCUS_DOWN)
         && WATCH_NEXT_FOCUSED() == channel);
     CHECK(browser_engine_focus_direction(engine, CONTROLLER_FOCUS_RIGHT)
-        && WATCH_NEXT_FOCUSED() == test_reader_find_id(root, "yt-watch-signin"));
+        && WATCH_NEXT_FOCUSED() == test_reader_find_id(root, "yt-offline-save"));
     const LayoutNodeBox *link_box = layout_box_for_node(&nav->page.layout, channel);
     const LayoutNodeBox *row_box = layout_box_for_node(&nav->page.layout, actions);
     CHECK(link_box && row_box && link_box->height == 36 && link_box->width <= 140

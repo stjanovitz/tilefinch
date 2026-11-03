@@ -274,4 +274,13 @@ bool youtube_parse_player_response_with_preferences(
     int maximum_height, const YoutubeTrackPreferences *preferences,
     YoutubeStream *stream, char *error, size_t error_size);
 
+/* Host-only test entry points into the shipping resolver checks. The first
+   reads an unsigned watch-page value (STS) from a received prefix; the
+   second admits one direct player response for a named client profile. */
+bool youtube_resolver_test_watch_unsigned(const char *html, size_t length,
+                                          const char *key, uint64_t *output);
+bool youtube_resolver_test_accept_direct_stream(
+    const char *client_name, const YoutubeStream *resolved,
+    YoutubeStream *stream, char *error, size_t error_size);
+
 #endif

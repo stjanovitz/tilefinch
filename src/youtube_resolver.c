@@ -853,17 +853,21 @@ static bool youtube_ascii_contains(const char *text, const char *wanted)
     return false;
 }
 
+/* Caption tracks are served by the timed-text endpoint on the YouTube web
+   hosts. Any other youtube.com subdomain (accounts.youtube.com among them)
+   is not a caption source, for the track list or a redirect. */
 bool youtube_caption_url_supported(const char *value)
 {
+    static const char path[] = "/api/timedtext";
     TilefinchUrl url;
-    if (value == NULL || !tilefinch_url_parse(value, &url)
-        || url.scheme != TILEFINCH_URL_SCHEME_HTTPS || url.port != 443
-        || url.ipv6_literal || url.host_length < strlen("youtube.com"))
-        return false;
-    const char *host = url.value + url.host_offset;
-    const char *suffix = host + url.host_length - strlen("youtube.com");
-    return strncasecmp(suffix, "youtube.com", strlen("youtube.com")) == 0
-        && (suffix == host || suffix[-1] == '.');
+    return value != NULL && tilefinch_url_parse(value, &url)
+        && url.scheme == TILEFINCH_URL_SCHEME_HTTPS && url.port == 443
+        && !url.ipv6_literal && !url.has_fragment
+        && (youtube_host_is(&url, "www.youtube.com")
+            || youtube_host_is(&url, "m.youtube.com")
+            || youtube_host_is(&url, "youtube.com"))
+        && url.path_length == sizeof(path) - 1u
+        && memcmp(url.value + url.path_offset, path, sizeof(path) - 1u) == 0;
 }
 
 static void youtube_caption_label(
@@ -1238,17 +1242,31 @@ static bool youtube_parse_player_response_diagnostic_with_scratch(
         }
         YoutubePlayability classified =
             YOUTUBE_PLAYABILITY_CLIENT_REJECTED;
-        if (youtube_ascii_contains(reason, "age")
-            || youtube_ascii_contains(reason, "confirm your age")) {
+        /* The reason is display text, so only whole phrases classify it
+           ("age" alone matched "Management" and "page"). The age phrases
+           are the gate texts YouTube sends: "Sign in to confirm your age",
+           the embedded "may be inappropriate for some users" and
+           "age-restricted"; the two statuses are its age-check states. An
+           upcoming event is classified from structure only: an ended
+           Premiere's reason also names "premiere". */
+        bool upcoming = strcmp(status, "LIVE_STREAM_OFFLINE") == 0
+            || youtube_find_key(
+                   playability_json, playability_length, "offlineSlate",
+                   &value);
+        if (youtube_ascii_contains(reason, "confirm your age")
+            || youtube_ascii_contains(reason, "age-restricted")
+            || youtube_ascii_contains(reason, "age restricted")
+            || youtube_ascii_contains(
+                   reason, "inappropriate for some users")
+            || strcmp(status, "AGE_CHECK_REQUIRED") == 0
+            || strcmp(status, "AGE_VERIFICATION_REQUIRED") == 0) {
             classified = YOUTUBE_PLAYABILITY_AGE_RESTRICTED;
         } else if (youtube_ascii_contains(reason, "country")
                    || youtube_ascii_contains(reason, "region")) {
             classified = YOUTUBE_PLAYABILITY_REGION_BLOCKED;
         } else if (strcmp(status, "LOGIN_REQUIRED") == 0) {
             classified = YOUTUBE_PLAYABILITY_LOGIN_REQUIRED;
-        } else if (strcmp(status, "LIVE_STREAM_OFFLINE") == 0
-                   || youtube_ascii_contains(reason, "premiere")
-                   || youtube_ascii_contains(reason, "upcoming")) {
+        } else if (upcoming) {
             classified = YOUTUBE_PLAYABILITY_UPCOMING_UNSUPPORTED;
         } else if (youtube_ascii_contains(reason, "unavailable")
                    || youtube_ascii_contains(reason, "private")
@@ -1305,9 +1323,12 @@ static bool youtube_parse_player_response_diagnostic_with_scratch(
     YoutubeJson hls_value = value;
     /* Some client profiles omit videoDetails.isLive but expose the active
        contract through liveStreamability. LIVE_STREAM_OFFLINE was rejected
-       above, so an upcoming event cannot be mistaken for a playable feed. */
+       above, and an offline slate marks a stream that has not started, so
+       an upcoming event cannot be mistaken for a playable feed. */
     bool active_live = youtube_find_key(
-        playability_json, playability_length, "liveStreamability", &value);
+            playability_json, playability_length, "liveStreamability", &value)
+        && !youtube_find_key(
+            playability_json, playability_length, "offlineSlate", &value);
     if (have_details
         && youtube_find_key(details_json, details_length, "isLive", &value)) {
         (void) json_boolean_value(&value, &active_live);
@@ -1346,11 +1367,13 @@ static bool youtube_parse_player_response_diagnostic_with_scratch(
             return false;
         }
     }
+    /* Only an active live stream opens its HLS manifest. The player's
+       provider HLS path is the rolling live source (no timeline, no seeking)
+       and an HLS rendition has no content length for the unattested
+       delivery cap, so a video that is not live and offers nothing but
+       HLS here is a format failure; the client ladder tries the next
+       profile. */
     if (!have_progressive && !have_adaptive) {
-        if (have_hls_manifest) {
-            return youtube_use_live_hls(
-                hls_value, parsed, stream, error, error_size);
-        }
         youtube_error(error, error_size, "format: no stream inventory");
         return false;
     }
@@ -1366,10 +1389,6 @@ static bool youtube_parse_player_response_diagnostic_with_scratch(
         memset(selected_audio, 0, sizeof(*selected_audio));
     }
     if (selected->url[0] == '\0') {
-        if (have_hls_manifest) {
-            return youtube_use_live_hls(
-                hls_value, parsed, stream, error, error_size);
-        }
         youtube_error(
             error, error_size,
             "format: no unciphered AVC video and AAC audio within %dp",
@@ -1635,12 +1654,21 @@ static bool youtube_watch_string(const char *html, size_t length,
         && json_scan_string(&value, output, output_size);
 }
 
+/* The watch page arrives in chunks, so a number at the end of the received
+   prefix may be cut short ("STS":2012 of 20125). Only a number followed by
+   its JSON terminator is complete. */
 static bool youtube_watch_unsigned(const char *html, size_t length,
                                    const char *key, uint64_t *output)
 {
     YoutubeJson value;
-    return youtube_find_key(html, length, key, &value)
-        && json_unsigned_value(&value, output);
+    uint64_t number = 0;
+    if (!youtube_find_key(html, length, key, &value)
+        || !json_unsigned_value(&value, &number)) return false;
+    json_scan_space(&value);
+    if (value.at >= value.end || *value.at == '\0'
+        || strchr(",}]", *value.at) == NULL) return false;
+    *output = number;
+    return true;
 }
 
 static bool youtube_json_escape(char *output, size_t output_size,
@@ -1914,6 +1942,27 @@ static bool youtube_finish_resolved_stream(
     resolved->watch_status = watch_status;
     *stream = *resolved;
     return true;
+}
+
+/* A direct (unenriched) player response becomes the stream only when its
+   client may deliver it directly and its URLs outlive the expiry margin.
+   The error names whichever check failed: an admitted stream whose URLs
+   expire too soon must not report that it needs enrichment. */
+static bool youtube_accept_direct_stream(
+    YoutubeStream *resolved, const YoutubeClientProfile *profile,
+    unsigned attempts, size_t player_bytes, long player_status,
+    YoutubeStream *stream, char *error, size_t error_size)
+{
+    if (!youtube_direct_delivery_admitted(profile->name, resolved)) {
+        youtube_error(
+            error, error_size,
+            "player: %s direct delivery requires enriched context",
+            profile->name);
+        return false;
+    }
+    return youtube_finish_resolved_stream(
+        resolved, profile, attempts, player_bytes, player_status, 0, 0,
+        stream, error, error_size);
 }
 
 typedef enum {
@@ -2487,22 +2536,14 @@ YoutubeResolveJobStatus youtube_resolve_job_pump(YoutubeResolveJob *job)
             }
             const YoutubeClientProfile *profile =
                 &youtube_client_profiles[job->client_index];
-            if (parsed && youtube_direct_delivery_admitted(
-                    profile->name, &resolved)
-                && youtube_finish_resolved_stream(
+            if (parsed && youtube_accept_direct_stream(
                     &resolved, profile, job->attempts,
                     job->total_player_bytes, job->response.status_code,
-                    0, 0, &job->stream,
+                    &job->stream,
                     job->last_error, sizeof(job->last_error))) {
                 job->phase = YOUTUBE_RESOLVE_PHASE_COMPLETE;
                 fetch_result_destroy(&job->response);
                 break;
-            }
-            if (parsed) {
-                youtube_error(
-                    job->last_error, sizeof(job->last_error),
-                    "player: %s direct delivery requires enriched context",
-                    profile->name);
             }
             terminal = youtube_playability_is_globally_terminal(classified);
         } else {
@@ -2945,20 +2986,12 @@ bool youtube_resolve_progressive_mp4_cancelable_with_preferences(
                     actionable_error, sizeof(actionable_error),
                     "%s", last_error);
             }
-            if (parsed && youtube_direct_delivery_admitted(
-                    youtube_client_profiles[i].name, resolved)
-                && youtube_finish_resolved_stream(
+            if (parsed && youtube_accept_direct_stream(
                     resolved, &youtube_client_profiles[i], attempts,
-                    total_player_bytes, response->status_code, 0, 0,
+                    total_player_bytes, response->status_code,
                     stream, last_error, sizeof(last_error))) {
                 youtube_resolve_synchronous_scratch_free(budget, scratch);
                 return true;
-            }
-            if (parsed) {
-                youtube_error(
-                    last_error, sizeof(last_error),
-                    "player: %s direct delivery requires enriched context",
-                    youtube_client_profiles[i].name);
             }
             if (youtube_playability_is_globally_terminal(classified)) {
                 youtube_error(error, error_size, "%s", last_error);
@@ -3157,3 +3190,7 @@ bool youtube_resolve_progressive_mp4(
         budget, session, watch_url, maximum_height, timeout_ms,
         NULL, NULL, stream, error, error_size);
 }
+
+#ifndef __PSP__
+#include "youtube_resolver_test_hooks.inc"
+#endif

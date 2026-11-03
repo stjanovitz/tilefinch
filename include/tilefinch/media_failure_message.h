@@ -7,10 +7,13 @@
 /*
  * The user-facing words for a video that could not play. The open and decode
  * paths report engine text ("unsupported H.264 stream (B-frame pyramid);
- * OPTIONAL VIDEO DECODER NOT INSTALLED - SEE README"); the failed-video
- * panel shows a short catalog headline for the kinds below instead, with
- * the cause on its details line. Engine text this does not recognise keeps
- * its existing presentation.
+ * OPTIONAL VIDEO DECODER NOT INSTALLED - SEE README"), and the YouTube
+ * resolver reports its own ("playability: login-required: ...", "player:
+ * fetch failed: ..."); the failed-video panel shows a short catalog headline
+ * for the kinds below instead, with the cause or what to do on its details
+ * line and, where the engine text carried one, a short code for bug reports
+ * under it. Engine text this does not recognise keeps its existing
+ * presentation.
  *
  * The panel is raised once, after page-candidate fallback has run out, so
  * the failure classified is the last candidate's.
@@ -32,7 +35,19 @@ typedef enum {
        or 410, a playlist with no variant or segment (an empty or ended
        live playlist), or an error body where media was expected. An
        offline live channel's address answers this way. */
-    MEDIA_FAILURE_STREAM_UNAVAILABLE
+    MEDIA_FAILURE_STREAM_UNAVAILABLE,
+    /* YouTube will not play it without a signed-in account: sign-in or an
+       age check. */
+    MEDIA_FAILURE_SIGN_IN_REQUIRED,
+    /* YouTube will not play it here at all: private, removed, blocked in
+       this region, or refused to this player. */
+    MEDIA_FAILURE_VIDEO_UNAVAILABLE,
+    /* A Premiere or live stream that has not started. */
+    MEDIA_FAILURE_NOT_STARTED_YET,
+    /* The player request did not complete: fetch failed or timed out. */
+    MEDIA_FAILURE_NETWORK,
+    /* The PSP ran out of memory for the player or its response. */
+    MEDIA_FAILURE_MEMORY
 } MediaFailureKind;
 
 typedef enum {
@@ -49,18 +64,33 @@ typedef enum {
     MEDIA_FAILURE_DETAIL_PROFILE,
     MEDIA_FAILURE_DETAIL_TOO_LARGE,
     MEDIA_FAILURE_DETAIL_CODEC,
-    MEDIA_FAILURE_DETAIL_HTTP_STATUS
+    MEDIA_FAILURE_DETAIL_HTTP_STATUS,
+    /* What to do next, for the resolver's and the player's own failures. */
+    MEDIA_FAILURE_DETAIL_SIGN_IN,
+    MEDIA_FAILURE_DETAIL_AGE,
+    MEDIA_FAILURE_DETAIL_PRIVATE,
+    MEDIA_FAILURE_DETAIL_REGION,
+    MEDIA_FAILURE_DETAIL_REFUSED,
+    MEDIA_FAILURE_DETAIL_TRY_WHEN_LIVE,
+    MEDIA_FAILURE_DETAIL_LIVE,
+    MEDIA_FAILURE_DETAIL_CHECK_NETWORK,
+    MEDIA_FAILURE_DETAIL_CLOSE_TABS,
+    MEDIA_FAILURE_DETAIL_RESTART
 } MediaFailureDetail;
 
 typedef struct {
     MediaFailureKind kind;
     MediaFailureDetail detail;
     /* Catalog keys; NULL headline for MEDIA_FAILURE_OTHER. `details` is a
-       catalog key, this message's own `code` ("0x800200D9", "HTTP 403"), or
-       "" when there is nothing to add. */
+       catalog key, this message's own `code` ("0x800200D9", "HTTP 403"),
+       the key and the code on two lines in `line` ("Check Wi-Fi, then
+       press X to retry\nfetch failed"), or "" when there is nothing to
+       add. The panel translates the key and shows the code as a small
+       line for bug reports. */
     const char *headline;
     const char *details;
-    char code[16];
+    char code[24];
+    char line[72];
 } MediaFailureMessage;
 
 /* Engine text an open path reports for MEDIA_FAILURE_STREAM_UNAVAILABLE

@@ -29,6 +29,9 @@
     YOUTUBE_LITE_SIGNIN_CONTINUE
 #define YOUTUBE_LITE_ACCOUNT_CHOOSER_URL \
     "https://accounts.google.com/AccountChooser?" YOUTUBE_LITE_SIGNIN_CONTINUE
+/* The native page that asks before Sign out: a local Home page, built with
+   no request, whose Sign out control is the only one bound to the command. */
+#define YOUTUBE_LITE_SIGNOUT_CONFIRM_URL "https://www.youtube.com/?tilefinch_signout=1"
 
 /* Same-document fragments of the provider's native controls. The page
    generator links its controls to them, and BrowserEngine handles an
@@ -159,9 +162,16 @@ typedef struct {
  * account actions never require executing the full service page.
  */
 YoutubeLiteRoute youtube_lite_route(const char *url);
+/* The video a watch link names, read from the link's canonical form, so
+   /live/ID, /embed/ID and http links name the same video as watch?v=ID. */
+bool youtube_lite_watch_video_id(const char *url,
+                                 char output[YOUTUBE_VIDEO_ID_CAPACITY]);
 bool youtube_lite_navigation_requires_network(const char *url);
 /* Only the service's HTTPS session handoff, never an executable feed page. */
 bool youtube_lite_signin_handoff_url(const char *url);
+/* The local page that asks before Sign out (YOUTUBE_LITE_SIGNOUT_CONFIRM_URL).
+   Home's background feed and topic work never run on it. */
+bool youtube_lite_signout_confirmation(const char *url);
 
 /*
  * Converts the bounded data embedded in an ordinary mobile YouTube response
@@ -208,6 +218,7 @@ YoutubeLiteLoadJob *youtube_lite_load_begin_configured(
     char *error, size_t error_size);
 YoutubeLiteLoadJob *youtube_lite_load_begin_navigation(
     Budget *, BrowserSession *, const char *url, bool compact_results,
+    bool hide_channel_banners,
     size_t maximum_source_bytes, long timeout_ms, const char *initiator,
     bool user_activated, char *error, size_t error_size);
 YoutubeLiteLoadStatus youtube_lite_load_pump(

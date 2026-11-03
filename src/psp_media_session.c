@@ -61,6 +61,11 @@
    At one unit a frame a twenty-minute caption file (a few hundred KiB) took
    minutes of admitted frames to arrive. */
 #define PSP_MEDIA_SUBTITLE_UNITS_PER_FRAME 8u
+/* A caption document truncated at its cue/text bound asks for the next
+   window this long before its last cue ends. The resource is fetched from
+   its start each time, at most one request in flight, and the current
+   window keeps showing until the new one is parsed. */
+#define PSP_MEDIA_SUBTITLE_EXTEND_LEAD_US UINT64_C(60000000)
 #define PSP_MEDIA_PUMP_MAXIMUM_UNITS 8u
 /*
  * The presentation clock is the browser's own elapsed time, and nothing ever
@@ -1111,6 +1116,7 @@ void psp_media_pipeline_destroy(PspMediaSession *media)
     media->subtitle_received_bytes = 0;
     media->subtitle_cue_cursor = 0;
     media->subtitle_request_attempted = false;
+    media->subtitle_extension_retry = (YoutubeSubtitleRetry) {0};
     psp_ui_media_set_subtitle(&media->ui, NULL);
     if (media->page_media_probe_request != 0) {
         if (media->page_media_probe_scheduler != NULL) {
@@ -2367,6 +2373,7 @@ static void psp_media_reset_subtitle_document(PspMediaSession *media,
     media->subtitle_received_bytes = 0;
     media->subtitle_request_attempted = false;
     media->subtitle_cue_cursor = 0;
+    media->subtitle_extension_retry = (YoutubeSubtitleRetry) {0};
     psp_ui_media_set_subtitle(&media->ui, NULL);
 }
 
@@ -2707,16 +2714,29 @@ psp_media_subtitle_finish_request(PspMediaSession *media)
     media->subtitle_request_id = 0;
     bool taken = fetch_background_transport_take_media_result_consumed(
         request, &result, media->subtitle_received_bytes);
+    YoutubeSubtitleDocument *document = NULL;
     if (taken && result.status_code >= 200 && result.status_code < 300
         && media->subtitle_builder != NULL) {
-        media->subtitles = youtube_subtitles_builder_finish(
-            media->subtitle_builder);
+        document = youtube_subtitles_builder_finish(media->subtitle_builder);
         media->subtitle_builder = NULL;
     } else {
         youtube_subtitles_builder_destroy(media->subtitle_builder);
         media->subtitle_builder = NULL;
     }
-    if (media->subtitles != NULL) {
+    /* A later window replaces the one still showing only when it reaches
+       further; one that does not (a smaller budget, say) is dropped. */
+    YoutubeSubtitleWindow current, later;
+    if (document != NULL && media->subtitles != NULL
+        && youtube_subtitles_window(media->subtitles, &current)
+        && (!youtube_subtitles_window(document, &later)
+            || later.end_us <= current.end_us)) {
+        youtube_subtitles_destroy(document);
+        document = NULL;
+    }
+    if (document != NULL) {
+        youtube_subtitles_destroy(media->subtitles);
+        media->subtitles = document;
+        media->subtitle_cue_cursor = 0;
         printf("tilefinch-subtitles: loaded cues=%zu bytes=%zu\n",
                youtube_subtitles_cue_count(media->subtitles),
                media->subtitle_received_bytes);
@@ -2726,14 +2746,44 @@ psp_media_subtitle_finish_request(PspMediaSession *media)
                result.error);
     }
     media->subtitle_received_bytes = 0;
-    return media->subtitles != NULL;
+    return document != NULL;
+}
+
+/* Keep the retained caption window around the playback clock: a seek back
+   before its minimum rebuilds it from the new position, and a truncated
+   window asks for the next one as playback nears its last cue. */
+static void psp_media_subtitle_follow_clock(PspMediaSession *media)
+{
+    if (media == NULL || media->subtitles == NULL
+        || media->subtitle_request_id != 0) return;
+    YoutubeSubtitleWindow window;
+    switch (youtube_subtitles_window_action(
+                media->subtitles, media->clock_us,
+                PSP_MEDIA_SUBTITLE_EXTEND_LEAD_US)) {
+    case YOUTUBE_SUBTITLE_WINDOW_RELOAD:
+        psp_media_reset_subtitle_document(media, "subtitle window rewound");
+        break;
+    case YOUTUBE_SUBTITLE_WINDOW_EXTEND:
+        if (youtube_subtitles_window(media->subtitles, &window)
+            && youtube_subtitles_retry_extension(&media->subtitle_extension_retry,
+                window.end_us, psp_media_now_us(media))) {
+            media->subtitle_request_attempted = false;
+        }
+        break;
+    case YOUTUBE_SUBTITLE_WINDOW_KEEP:
+    default:
+        break;
+    }
 }
 
 static bool psp_media_subtitle_load_pump(PspMediaSession *media)
 {
     if (media == NULL || media->track_preferences.caption_track_id[0] == '\0')
         return false;
-    if (media->subtitles != NULL) return false;
+    /* A retained document is complete unless its window asked for a later
+       one (psp_media_subtitle_follow_clock). */
+    if (media->subtitles != NULL && media->subtitle_request_id == 0
+        && media->subtitle_request_attempted) return false;
     if (media->caption_resolution_pending) {
         /* The six visible menu tracks normally have URLs in the retained
            catalog. A missing catalog is the memory-pressure/expired-route
@@ -2791,7 +2841,7 @@ static bool psp_media_subtitle_load_pump(PspMediaSession *media)
         media->caption_resolution_pending = false;
     }
     if (media->stream.caption_url[0] == '\0') return false;
-    if (media->subtitles == NULL && media->subtitle_request_id == 0
+    if (media->subtitle_request_id == 0
         && !media->subtitle_request_attempted) {
         /* Captions are optional. They never occupy the two descriptors
            reserved for media delivery, and do not begin until the selected
@@ -2828,6 +2878,10 @@ static bool psp_media_subtitle_load_pump(PspMediaSession *media)
         if (media->subtitle_request_id == 0) {
             youtube_subtitles_builder_destroy(media->subtitle_builder);
             media->subtitle_builder = NULL;
+            /* Extensions back off without dropping the current window.
+               Initial loading may still wait for a free transport slot. */
+            if (media->subtitles != NULL)
+                media->subtitle_request_attempted = true;
             return false;
         }
         media->subtitle_received_bytes = 0;
@@ -2868,9 +2922,9 @@ static bool psp_media_subtitle_load_pump(PspMediaSession *media)
                 media->subtitle_request_id, &progress)) return false;
         if (!progress.complete || progress.available_body_bytes != 0)
             return false;
-        (void) psp_media_subtitle_finish_request(media);
+        return psp_media_subtitle_finish_request(media);
     }
-    return media->subtitles != NULL;
+    return false;
 }
 
 static bool psp_media_subtitle_frame_budget_left(
@@ -4221,6 +4275,7 @@ bool psp_media_advance(
                        media, advance_started_us)) break;
         }
     }
+    psp_media_subtitle_follow_clock(media);
     changed = psp_media_subtitle_update_display(media) || changed;
     if (ended && media->last_resume_saved_us != UINT64_MAX) {
         psp_media_record_resume(media, true);

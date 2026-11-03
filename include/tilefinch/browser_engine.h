@@ -957,9 +957,14 @@ bool browser_engine_set_youtube_compact_results(
     BrowserEngine *engine, bool compact);
 /* Optional provider discovery runs after the local search page's first paint. */
 bool browser_engine_set_youtube_topics(BrowserEngine *engine, bool enabled);
-/* The two YouTube preferences in effect. A missing engine reports a new
+/* The YouTube preferences in effect. A missing engine reports a new
    engine's values. */
 bool browser_engine_youtube_compact_results(const BrowserEngine *engine);
+/* Shown by default; hidden, a channel page names no banner image, so none is
+   fetched or decoded. Applies to the next channel page load. */
+bool browser_engine_set_youtube_channel_banners(
+    BrowserEngine *engine, bool shown);
+bool browser_engine_youtube_channel_banners(const BrowserEngine *engine);
 bool browser_engine_youtube_topics(const BrowserEngine *engine);
 typedef enum {
     BROWSER_YOUTUBE_FEED_IDLE = 0,
@@ -1081,6 +1086,7 @@ typedef struct {
     bool focus_has_authored_outline;
     /* Explicit accessible name/title, never form contents or a DOM pointer. */
     char focus_label[64];
+    uint32_t focus_serial;
     bool loading;
     int scroll_y;
     int maximum_scroll_y;
@@ -1361,9 +1367,13 @@ enum {
     BROWSER_YOUTUBE_LOGIN_SIGNED_OUT = 2u,
     BROWSER_YOUTUBE_LOGIN_FAILED = 4u,
     BROWSER_YOUTUBE_LOGIN_RECOVERING = 8u,
-    BROWSER_YOUTUBE_LOGIN_STARTED = 16u
+    BROWSER_YOUTUBE_LOGIN_STARTED = 16u,
+    BROWSER_YOUTUBE_LOGIN_REJECTED = 32u
 };
-/* Native receipt after personalized API authentication, not DOM markers. */
+/* Native receipt after personalized API authentication, not DOM markers.
+   SIGNED_OUT also reports the provider rejecting the jar's account outside a
+   sign-in attempt, with REJECTED: either way a saved login for it must go,
+   and REJECTED says the user did not ask for it. */
 unsigned browser_engine_take_youtube_login_events(BrowserEngine *engine);
 bool browser_engine_youtube_login_verified(const BrowserEngine *);
 /* Native consent binding only. Never export or log this opaque identity. */

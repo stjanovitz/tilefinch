@@ -40,7 +40,10 @@ sixteen; the first eight are reserved when a page's render shell is built.
 The remaining slots hold the visible remainder and two rows of
 paint-ahead below (or above) the screen: they are allocated on first use
 only while the page keeps 2 MiB of budget headroom, and optional-memory
-reclaim frees them first.
+reclaim frees them first. Paint-ahead runs in idle turns. One tile takes
+longer than the 500 µs idle budget on the PSP, so tiles may hold a turn for
+up to one frame period (16.7 ms). A press during that turn is still served at
+the raster's cooperation checkpoints.
 
 Beneath the profiles, PSPSDK's grow-to-largest heap takes what is left after
 2 MiB is held back; what remains after the executable, stacks, modules, and

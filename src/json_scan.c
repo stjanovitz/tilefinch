@@ -84,8 +84,9 @@ static size_t json_scan_utf8_prefix(const char *text, size_t length)
     return length - start < expected ? start : length;
 }
 
-bool json_scan_string_copy(JsonCursor *json, char *output, size_t output_size,
-                           unsigned flags, bool *truncated)
+static bool json_scan_string_decode(JsonCursor *json, char *output,
+                                    size_t output_size, unsigned flags,
+                                    bool *truncated)
 {
     json_scan_space(json);
     if (output == NULL || output_size == 0 || json->at >= json->end
@@ -141,6 +142,18 @@ bool json_scan_string_copy(JsonCursor *json, char *output, size_t output_size,
         memcpy(output + used, bytes, count);
         used += count;
     }
+    return false;
+}
+
+/* A failed copy leaves an empty string, never the bytes decoded before the
+   failure: a caller that ignores the result must not show a prefix cut
+   inside a UTF-8 sequence. */
+bool json_scan_string_copy(JsonCursor *json, char *output, size_t output_size,
+                           unsigned flags, bool *truncated)
+{
+    if (json_scan_string_decode(json, output, output_size, flags, truncated))
+        return true;
+    if (output != NULL && output_size != 0) output[0] = '\0';
     return false;
 }
 

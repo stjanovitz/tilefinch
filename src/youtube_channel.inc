@@ -5,7 +5,10 @@
  * a next-page link. Entries are written to the page as the bounded walk
  * finds them, so no entry table is kept. The header (name, subscriber line,
  * avatar, banner) is read first from the page's header and metadata objects,
- * which follow the contents in the response. The header's description line
+ * which follow the contents in the response. With channel banners hidden
+ * (the Channel banners setting, or tilefinch_banners=0) the banner is not
+ * read and the page names no banner image, so none is fetched or decoded.
+ * The header's description line
  * opens the full-description view (tilefinch_view=description), read from
  * the About panel continuation the page header names, or else from the page.
  */
@@ -30,8 +33,10 @@ static const char *lite_channel_path(const char *url, size_t *base,
     if (url == NULL || !tilefinch_url_parse(url, &parsed)
         || parsed.path_length < 2u) return NULL;
     const char *path = parsed.value + parsed.path_offset;
-    const char *end = path + parsed.path_length;
-    const char *at = memchr(path + 1, '/', parsed.path_length - 1u);
+    /* "/@name/videos/" selects the same tab as "/@name/videos". */
+    size_t length = lite_path_length(&parsed);
+    const char *end = path + length;
+    const char *at = memchr(path + 1, '/', length - 1u);
     if (path[1] != '@' && at != NULL) at = memchr(at + 1, '/', (size_t) (end - at - 1));
     if (at == NULL) at = end;
     *base = (size_t) (at - path);
@@ -149,7 +154,7 @@ static void lite_channel_header_parse(YoutubeLiteBuildWork *work, size_t found)
         memcpy(channel->about_token, token, strlen(token) + 1u);
     if (lite_json_key(&header, "avatar", NULL, &value))
         lite_channel_image(&value, 48u, channel->avatar);
-    if (lite_json_key(&header, "banner", NULL, &value))
+    if (work->channel_banners && lite_json_key(&header, "banner", NULL, &value))
         lite_channel_image(&value, 480u, channel->banner);
     if (lite_json_key(&header, "subscribed", NULL, &value)
         || lite_json_key(&header, "isSubscribed", NULL, &value)) {
@@ -329,10 +334,15 @@ static bool lite_channel_close_shelf(YoutubeLiteBuildWork *work)
     YoutubeLiteChannel *channel = &work->channel;
     bool open = channel->shelf_open;
     channel->in_shelf = channel->shelf_open = false;
+    /* Each "See all" names its shelf; one line, clipped to the width. */
     return !open || ((channel->shelf_url[0] == '\0'
-            || (lite_html_text(&work->html, "<a class=more href=\"")
+            || (lite_html_text(&work->html, "<a class=\"more see-all\" href=\"")
                 && lite_html_escape(&work->html, channel->shelf_url)
-                && lite_html_ui_markup(&work->html, "\">{{See all}}</a>")))
+                && lite_html_ui_markup(&work->html, "\">{{See all}}")
+                && (channel->shelf_title[0] == '\0'
+                    || (lite_html_text(&work->html, ": ")
+                        && lite_html_escape(&work->html, channel->shelf_title)))
+                && lite_html_text(&work->html, "</a>")))
         && lite_html_text(&work->html, "</section>"));
 }
 
@@ -469,7 +479,7 @@ static bool lite_build_channel_items_pump(YoutubeLiteBuildWork *work)
     if (home) work->next_continuation[0] = '\0';
     return lite_channel_close_shelf(work)
         && (work->video_count != 0 || lite_html_ui_markup(&work->html,
-            "<p class=empty>{{No public video entries were present in the bounded channel response.}}</p>"));
+            "<p class=empty>{{No videos found.}}</p>"));
 }
 
 /* The channel's base URL (its Home tab), escaped for an attribute. */
