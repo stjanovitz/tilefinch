@@ -151,7 +151,8 @@ static void psp_network_finish_stopping(
     PspNetworkTarget desired = decision->next.target;
     PspNetworkFailureKind failure = decision->next.failure;
     psp_network_clear_children(&decision->next);
-    decision->next.stack = PSP_NETWORK_STACK_NONE;
+    decision->next.stack = remaining == PSP_NETWORK_STACK_MODULES_ONLY
+        ? remaining : PSP_NETWORK_STACK_NONE;
     decision->next.admission_open = false;
     decision->next.retained_lease_count = 0;
     switch (target) {
@@ -160,8 +161,6 @@ static void psp_network_finish_stopping(
         decision->next.failure = PSP_NETWORK_FAILURE_NONE;
         break;
     case PSP_NETWORK_STOP_TARGET_OFFLINE:
-        if (remaining == PSP_NETWORK_STACK_MODULES_ONLY)
-            decision->next.stack = remaining;
         decision->next.state = PSP_NETWORK_SUPERVISOR_OFFLINE;
         decision->next.failure = failure == PSP_NETWORK_FAILURE_NONE
             ? PSP_NETWORK_FAILURE_START : failure;
@@ -170,8 +169,6 @@ static void psp_network_finish_stopping(
         decision->next.state = PSP_NETWORK_SUPERVISOR_SUSPENDED_OFF;
         break;
     case PSP_NETWORK_STOP_TARGET_RESTART:
-        if (remaining == PSP_NETWORK_STACK_MODULES_ONLY)
-            decision->next.stack = remaining;
         decision->next.target = desired;
         psp_network_enter_starting(decision);
         break;
@@ -220,9 +217,12 @@ static void psp_network_apply_target(
     PspNetworkTarget target)
 {
     decision->next.target = target;
-    /* Offline may retain code modules, never live services. Off and suspend
-       still have to run the ownership-aware unload before reporting done. */
-    if (decision->next.state == PSP_NETWORK_SUPERVISOR_OFFLINE
+    /* A refused unload can leave code modules after services are off. A
+       later off/suspend request retries that owner, not a fictitious empty
+       stack. Ready can instead reuse the retained modules while starting. */
+    if ((decision->next.state == PSP_NETWORK_SUPERVISOR_OFFLINE
+         || decision->next.state == PSP_NETWORK_SUPERVISOR_OFF
+         || decision->next.state == PSP_NETWORK_SUPERVISOR_SUSPENDED_OFF)
         && decision->next.stack == PSP_NETWORK_STACK_MODULES_ONLY
         && target.kind != PSP_NETWORK_TARGET_READY) {
         psp_network_enter_stopping(decision,
@@ -504,8 +504,6 @@ uint32_t psp_network_supervisor_violations(
     switch (machine->state) {
     case PSP_NETWORK_SUPERVISOR_OFF:
     case PSP_NETWORK_SUPERVISOR_SUSPENDED_OFF:
-        stack_ok = machine->stack == PSP_NETWORK_STACK_NONE;
-        break;
     case PSP_NETWORK_SUPERVISOR_OFFLINE:
         stack_ok = machine->stack == PSP_NETWORK_STACK_NONE
             || machine->stack == PSP_NETWORK_STACK_MODULES_ONLY;

@@ -284,10 +284,32 @@ static void glyph_offer_answer(PspApp *app,
     }
 }
 
-/* Any completed install, from the menu or the offer, detached every runtime
-   pack. Put back the selected language and emoji, attach installed packs
+/* A retired install or removal detached every runtime pack. Put back the
+   selected language and emoji, attach installed packs
    for the page, and relayout in place: text measured against blank cells
    needs new advances, not only a repaint. */
+static bool glyph_restore_runtime(PspApp *app,
+                                  PspGlyphComponentSession *session,
+                                  PspUiState *ui, uint16_t scripts)
+{
+    BrowserEngine *engine = app->browser->engine;
+    if (!psp_glyph_component_session_reattach(
+            session, app->browser->budget, &app->process->install_paths,
+            browser_profile_glyph_language(app->browser->profile),
+            psp_ui_language_glyphs(app->browser->profile),
+            browser_profile_color_emoji(app->browser->profile), scripts,
+            engine)) return false;
+    char entry_buffer[NAVIGATION_URL_LIMIT];
+    const char *entry_url = psp_app_current_url(
+        engine, entry_buffer, sizeof(entry_buffer));
+    bool relaid = entry_url != NULL && psp_set_presentation_css(
+        engine, ui, app->browser->profile,
+        ui->reader_mode || ui->basic_mode, entry_url,
+        ui->page_font_percent, true);
+    if (relaid) (void) psp_engine_views_refresh(app->views, engine);
+    return relaid;
+}
+
 static void glyph_install_finish(PspApp *app,
                                  PspGlyphComponentSession *session,
                                  PspUiState *ui)
@@ -297,28 +319,20 @@ static void glyph_install_finish(PspApp *app,
     BrowserEngine *engine = app->browser->engine;
     bool from_offer = session->offer_install_pending
         && session->offer_install_pack == pack;
+    bool activated = session->installer == NULL;
     uint16_t scripts = browser_engine_glyph_script_mask(engine);
-    if (from_offer && spec != NULL) scripts = spec->page_scripts;
-    (void) psp_glyph_component_session_reattach(
-        session, app->browser->budget, &app->process->install_paths,
-        browser_profile_glyph_language(app->browser->profile),
-        psp_ui_language_glyphs(app->browser->profile),
-        browser_profile_color_emoji(app->browser->profile), scripts,
-        engine);
+    if (from_offer && activated && spec != NULL) scripts = spec->page_scripts;
+    bool relaid = glyph_restore_runtime(app, session, ui, scripts);
+    bool attached = spec != NULL
+        && (session->attached_mask & (1u << (unsigned) pack)) != 0;
+    /* A failed/cancelled installer remains for its own error/retry UI. Pack
+       restoration still refreshes metrics, but cannot report install success. */
+    if (!activated) return;
     if (from_offer) session->offer_install_pending = false;
     char status[PSP_UI_STATUS_CAPACITY];
-    if (spec == NULL
-        || (session->attached_mask & (1u << (unsigned) pack)) == 0) {
+    if (!attached) {
         snprintf(status, sizeof(status), "%s", "FONT PACK READY AFTER RESTART");
     } else {
-        char entry_buffer[NAVIGATION_URL_LIMIT];
-        const char *entry_url = psp_app_current_url(
-            app->browser->engine, entry_buffer, sizeof(entry_buffer));
-        bool relaid = entry_url != NULL && psp_set_presentation_css(
-            engine, ui, app->browser->profile,
-            ui->reader_mode || ui->basic_mode, entry_url,
-            ui->page_font_percent, true);
-        if (relaid) (void) psp_engine_views_refresh(app->views, engine);
         snprintf(status, sizeof(status), "%s\n%s", spec->label,
                  psp_glyph_component_installed_status(pack, relaid));
     }
@@ -452,8 +466,6 @@ bool psp_glyph_component_handle_frame(
             psp_ui_show_status(ui, "SELECT ENGLISH UI AND RESTART BEFORE REMOVING THIS PACK", 240);
             return true;
         }
-        bool requested_attached =
-            (session->attached_mask & (1u << (unsigned) requested)) != 0;
         bool selection_changed = false;
         BrowserGlyphLanguage previous_language =
             browser_profile_glyph_language(app->browser->profile);
@@ -491,14 +503,10 @@ bool psp_glyph_component_handle_frame(
             && psp_glyph_component_session_remove(
                 session, &app->process->install_paths, requested,
                 app->browser->engine);
-        if (removed && requested_attached) {
-            (void) psp_glyph_component_session_attach_selected(
-                session, app->browser->budget,
-                &app->process->install_paths,
-                browser_profile_glyph_language(app->browser->profile),
-                psp_ui_language_glyphs(app->browser->profile),
-                browser_profile_color_emoji(app->browser->profile));
-        }
+        if (preference_saved)
+            (void) glyph_restore_runtime(
+                app, session, ui,
+                browser_engine_glyph_script_mask(app->browser->engine));
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
         printf("tilefinch-glyph-component: remove pack=%u result=%s "
                "selection=%u\n",

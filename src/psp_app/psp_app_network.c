@@ -3,9 +3,11 @@
  * compile it away and link an empty object.
  */
 #include "psp_app_internal.h"
+#include "../psp_multiplayer.h"
 #include "tilefinch/psp_entropy.h"
 
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
+#include "../psp_network_workers.inc"
 static PspNetworkLifecycle *psp_bound_network_lifecycle;
 static bool psp_network_lifecycle_pump_stopping(
     PspNetworkLifecycle *lifecycle, PspNetwork *network,
@@ -247,8 +249,8 @@ void psp_network_lifecycle_suspend(
                operation becomes an explicit retained-stack lease wedge and
                is reaped after resume. */
             fetch_preconnect_cancel("suspend");
-            fetch_background_transport_request_quiesce();
-            bool drained = fetch_background_transport_is_quiesced();
+            psp_network_workers_request_quiesce();
+            bool drained = psp_network_workers_is_quiesced();
             psp_network_lifecycle_dispatch(
                 lifecycle, network,
                 (PspNetworkSupervisorEvent) {
@@ -271,7 +273,7 @@ void psp_network_lifecycle_resume_result(
             == PSP_NETWORK_SUPERVISOR_SUSPENDED_RETAINED
         && lifecycle->machine.stack
             == PSP_NETWORK_STACK_RETAINED_WEDGED
-        && fetch_background_transport_is_quiesced()) {
+        && psp_network_workers_is_quiesced()) {
         psp_network_lifecycle_dispatch(
             lifecycle, network,
             (PspNetworkSupervisorEvent) {
@@ -877,12 +879,12 @@ static bool psp_network_lifecycle_pump_stopping(
             == PSP_NETWORK_STOP_LEASE_WEDGED) {
         if (!lifecycle->quiesce_requested) {
             fetch_preconnect_cancel("network-shutdown");
-            fetch_background_transport_request_quiesce();
+            psp_network_workers_request_quiesce();
             lifecycle->quiesce_requested = true;
             lifecycle->drain_deadline_us =
                 now_us + UINT64_C(4000000);
         }
-        if (fetch_background_transport_is_quiesced()) {
+        if (psp_network_workers_is_quiesced()) {
             psp_network_lifecycle_dispatch(
                 lifecycle, network,
                 (PspNetworkSupervisorEvent) {
@@ -980,7 +982,9 @@ bool psp_shutdown_network_logged(PspNetwork *network)
             }, PSP_NETWORK_SUPERVISOR_STOPPING, "legacy-off");
     }
     if (psp_bound_network_lifecycle == NULL) {
-        if (!fetch_background_transport_quiesce(4000u)) return false;
+        psp_network_workers_request_quiesce();
+        if (!fetch_background_transport_quiesce(4000u)
+            || !psp_multiplayer_network_quiesced()) return false;
         PspNetworkShutdownReport report;
         psp_network_shutdown(network, &report);
         psp_network_shutdown_report_log(&report);

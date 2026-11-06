@@ -214,6 +214,16 @@ static bool psp_write_failure_report_data(
         (unsigned long long) diagnostics->network_maximum_pump_us,
         diagnostics->network_maximum_pump_phase,
         url == NULL ? "" : url, detail == NULL ? "" : detail) > 0;
+    /* The decoder is already destroyed when its failed-open report arrives.
+       Its bounded numeric snapshot preserves the original refusal, not the
+       misleading free-memory reading after teardown. No file is opened when
+       report saving is Off, and no media bytes or addresses are recorded. */
+    if (okay && detail != NULL
+        && strstr(detail, "PSP aligned codec allocation failed") != NULL) {
+        char allocation[512];
+        if (media_psp_backend_allocation_failure_report(allocation, sizeof(allocation)))
+            okay = fputs(allocation, file) >= 0;
+    }
     okay = fclose(file) == 0 && okay;
     if (!okay) {
         (void) remove(temporary);
@@ -617,6 +627,7 @@ static TILEFINCH_OUT_OF_LINE bool psp_site_data_restore_pump(
     const PspStoragePaths *storage, size_t maximum_bytes)
 {
     if (restore == NULL || session == NULL || storage == NULL
+        || browser_session_captive_portal_active(session)
         || restore->phase == PSP_SITE_DATA_RESTORE_DISABLED
         || restore->phase == PSP_SITE_DATA_RESTORE_DONE) return false;
     const char *path = restore->phase
@@ -5341,7 +5352,8 @@ static TILEFINCH_COLD_PATH PspShutdownReport psp_browser_close(
 #endif
         .interactive = interactive
     };
-    psp_captive_portal_destroy(&portal_cleanup_app);
+    bool capture_exit_document = psp_captive_portal_destroy(&portal_cleanup_app)
+        && psp_tabs_document_visible(&process->presentation.ui);
 
     screenshot_png_cancel(&interactive->screenshot.writer);
     budget_free(browser->budget, interactive->screenshot.pixels);
@@ -5434,7 +5446,7 @@ static TILEFINCH_COLD_PATH PspShutdownReport psp_browser_close(
 
     cleanup_operation =
         psp_log_operation_begin("profile-cleanup");
-    if (browser->tabs != NULL)
+    if (capture_exit_document && browser->tabs != NULL)
         (void) browser_tabs_capture_active(browser->tabs, engine_views->navigation);
     bool tab_session_saved =
         !browser_profile_restore_last_page(browser->profile)
@@ -5442,8 +5454,9 @@ static TILEFINCH_COLD_PATH PspShutdownReport psp_browser_close(
         || browser_tabs_save_session(
             browser->tabs, process->storage.tab_session,
             process->storage.tab_hibernation);
-    (void) psp_recovery_record_current(
-        browser->profile, process->storage.recovery, browser->engine);
+    if (capture_exit_document)
+        (void) psp_recovery_record_current(
+            browser->profile, process->storage.recovery, browser->engine);
     if (media_resume_changed)
         psp_profile_store_mark_dirty(
             &browser->profile_store,
@@ -5478,10 +5491,24 @@ static TILEFINCH_COLD_PATH PspShutdownReport psp_browser_close(
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     psp_focus_feedback_begin(NULL, 0, 0);
 #endif
+#ifdef TILEFINCH_PSP_LIVE_NETWORK
+    /* Multiplayer storage is charged to the engine Budget. Request its
+       bounded retirement before destroying that owner; a failed join keeps
+       its storage and network lease quarantined until process exit. */
+    bool multiplayer_stopped = psp_multiplayer_shutdown(&portal_cleanup_app);
+#endif
     browser_engine_destroy(browser->engine);
     browser->engine = NULL;
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
-    psp_multiplayer_shutdown(&portal_cleanup_app);
+    /* Realm destruction may have completed the last cancellation. Observe
+       actual retirement before deciding which physical owners remain. */
+    if (!multiplayer_stopped && psp_multiplayer_network_quiesced())
+        multiplayer_stopped = psp_multiplayer_shutdown(&portal_cleanup_app);
+    if (!multiplayer_stopped) {
+        shutdown_report.retained |= PSP_SHUTDOWN_RETAIN_MULTIPLAYER
+            | PSP_SHUTDOWN_RETAIN_NETWORK_STACK;
+        printf("tilefinch-multiplayer: shutdown=retained action=retain-network-stack\n");
+    }
     /* Engine teardown releases the last authoritative schedulers and
        exports their newest TLS sessions into the in-memory generation.
        Flush only after that state is complete. */
@@ -5489,7 +5516,13 @@ static TILEFINCH_COLD_PATH PspShutdownReport psp_browser_close(
         printf("tilefinch-tls-session: cleanup save failed\n");
 #endif
     psp_log_operation_end(
-        cleanup_operation, "engine-cleanup", "ok");
+        cleanup_operation, "engine-cleanup",
+#ifdef TILEFINCH_PSP_LIVE_NETWORK
+        multiplayer_stopped ? "ok" : "retained-owner"
+#else
+        "ok"
+#endif
+    );
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
     /* The engine owns schedulers which can still hold transport request
        IDs. Terminate the shared worker only after those owners have been
@@ -5519,7 +5552,7 @@ static TILEFINCH_COLD_PATH PspShutdownReport psp_browser_close(
        sessions were never persisted across launches. Save them now. */
     if (background_transport_stopped && !fetch_tls_session_store_flush())
         printf("tilefinch-tls-session: exit save failed\n");
-    if (background_transport_stopped
+    if (background_transport_stopped && multiplayer_stopped
         && psp_network_lifecycle_started(network_lifecycle)) {
         cleanup_operation =
             psp_log_operation_begin("network-cleanup");
@@ -5535,14 +5568,14 @@ static TILEFINCH_COLD_PATH PspShutdownReport psp_browser_close(
         psp_log_operation_end(
             cleanup_operation, "network-cleanup",
             network_stopped ? "ok" : "retained-stack");
-    } else if (!background_transport_stopped
+    } else if ((!background_transport_stopped || !multiplayer_stopped)
                && psp_network_lifecycle_started(network_lifecycle)) {
-        printf("tilefinch-network-shutdown: skipped=transport-worker "
+        printf("tilefinch-network-shutdown: skipped=retained-worker "
                "action=retain-stack\n");
     }
     psp_network_lifecycle_report(network_lifecycle);
 #endif
-    if (process->clock_live) {
+    if (psp_clock_worker_owns_resources(&process->clock_worker)) {
         PspClockWorkerSnapshot power_snapshot;
         psp_clock_worker_snapshot(&process->clock_worker, &power_snapshot);
         bool stopped = psp_clock_worker_shutdown(&process->clock_worker);
@@ -5556,7 +5589,9 @@ static TILEFINCH_COLD_PATH PspShutdownReport psp_browser_close(
             (unsigned long long) interactive_result->power_idle_ms,
             (unsigned long long) interactive_result->power_transition_ms,
             stopped ? 1 : 0);
-        process->clock_live = false;
+        process->clock_live = !stopped;
+        if (!stopped)
+            shutdown_report.retained |= PSP_SHUTDOWN_RETAIN_CLOCK;
     }
     psp_log_set_phase(PSP_LOG_PHASE_CLEANUP);
     printf(

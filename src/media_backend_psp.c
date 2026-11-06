@@ -6,6 +6,7 @@
 #include "tilefinch/psp_threads.h"
 
 #include <malloc.h>
+#include <errno.h>
 #include <pspaudio.h>
 #include <pspaudiocodec.h>
 #include <pspkernel.h>
@@ -22,6 +23,7 @@
 
 #include "media_backend_psp_policy.h"
 #include "media_backend_psp_pool.h"
+#include "media_backend_psp_allocation.h"
 #include "media_h264_psp_compat.h"
 #include "psp_thread_contract.h"
 #include "psp_media_ownership.h"
@@ -611,6 +613,7 @@ typedef struct {
  */
 static PspMediaPool psp_media_pool;
 static size_t psp_media_heap_capacity_lower_bound;
+static PspMediaAllocationFailure psp_media_allocation_failure;
 
 /*
  * Real firmware historically requires a 64-byte-aligned address AND length
@@ -1442,7 +1445,15 @@ static void *psp_media_alloc_shared(size_t bytes, size_t alignment)
      * heap fallback has to match it.
      */
     size_t rounded = (bytes + 63u) & ~(size_t) 63u;
-    return memalign(alignment > 64u ? alignment : 64u, rounded);
+    size_t actual_alignment = alignment > 64u ? alignment : 64u;
+    errno = 0;
+    block = memalign(actual_alignment, rounded);
+    if (block == NULL && psp_media_allocation_failure.request_bytes == 0) {
+        psp_media_allocation_failure.request_bytes = rounded;
+        psp_media_allocation_failure.request_alignment = actual_alignment;
+        psp_media_allocation_failure.allocation_errno = errno;
+    }
+    return block;
 }
 
 static void *psp_media_alloc64(size_t bytes)
@@ -1654,6 +1665,11 @@ void media_psp_backend_reserve_pool(void)
 size_t media_psp_backend_heap_capacity_lower_bound(void)
 {
     return psp_media_heap_capacity_lower_bound;
+}
+
+bool media_psp_backend_allocation_failure_report(char *output, size_t size)
+{
+    return psp_media_allocation_format(&psp_media_allocation_failure, output, size);
 }
 
 void media_psp_backend_system_suspend(void)
@@ -7779,6 +7795,7 @@ static bool psp_media_backend_create_track_info(
     const MediaMp4TrackInfo *audio_track, bool require_audio,
     MediaBackend *backend_out, char *error, size_t error_size)
 {
+    memset(&psp_media_allocation_failure, 0, sizeof(psp_media_allocation_failure));
     if (error != NULL && error_size != 0) error[0] = '\0';
     if (budget == NULL || backend_out == NULL
         || (video_track == NULL && audio_track == NULL)) {
@@ -8336,20 +8353,43 @@ static bool psp_media_backend_create_track_info(
         psp_media_commit_log();
         (void) shared;
     }
-    if ((backend->have_video
-         && (backend->mpeg_memory == NULL || backend->video_au == NULL
-             || backend->video_parameter_sets == NULL
-             || backend->ddr_memory == NULL
-             || backend->surfaces[0] == NULL
-             || backend->surfaces[1] == NULL))
-        || backend->packet_staging == NULL
-        || (backend->have_audio
-            && (backend->audio_codec == NULL
-                || backend->audio_pcm == NULL
-                || backend->audio_queue == NULL
-                || backend->audio_staging == NULL
-                || backend->audio_pending == NULL))
-        ) {
+    const void *const allocated[PSP_MEDIA_ALLOC_COUNT] = {
+        [PSP_MEDIA_ALLOC_MPEG] = backend->mpeg_memory,
+        [PSP_MEDIA_ALLOC_DDR] = backend->ddr_memory,
+        [PSP_MEDIA_ALLOC_SURFACE0] = backend->surfaces[0],
+        [PSP_MEDIA_ALLOC_SURFACE1] = backend->surfaces[1],
+        [PSP_MEDIA_ALLOC_PACKET] = backend->packet_staging,
+        [PSP_MEDIA_ALLOC_AU] = backend->video_au,
+        [PSP_MEDIA_ALLOC_SETS] = backend->video_parameter_sets,
+        [PSP_MEDIA_ALLOC_AUDIO_CODEC] = backend->audio_codec,
+        [PSP_MEDIA_ALLOC_PCM] = backend->audio_pcm,
+        [PSP_MEDIA_ALLOC_QUEUE] = backend->audio_queue,
+        [PSP_MEDIA_ALLOC_AUDIO_STAGING] = backend->audio_staging,
+        [PSP_MEDIA_ALLOC_AUDIO_PENDING] = backend->audio_pending
+    };
+    unsigned missing = psp_media_allocation_missing(
+        backend->have_video, backend->have_audio, allocated);
+    if (missing != 0) {
+        struct mallinfo heap = mallinfo();
+        psp_media_allocation_failure.missing_mask = missing;
+        psp_media_allocation_failure.heap_lower_bound = psp_media_heap_capacity_lower_bound;
+        psp_media_allocation_failure.heap_arena = heap.arena;
+        psp_media_allocation_failure.heap_free = heap.fordblks;
+        psp_media_allocation_failure.heap_top = heap.keepcost;
+        psp_media_allocation_failure.pool_bytes = psp_media_pool.bytes;
+        psp_media_allocation_failure.pool_used = psp_media_pool.cursor;
+        psp_media_allocation_failure.pool_flags =
+            (psp_media_pool.base == NULL ? PSP_MEDIA_ALLOC_POOL_ABSENT : 0u)
+            | (psp_media_pool_claimed ? PSP_MEDIA_ALLOC_POOL_CLAIMED : 0u)
+            | (psp_media_pool.poisoned ? PSP_MEDIA_ALLOC_POOL_POISONED : 0u)
+            | (psp_media_me_invisible((uintptr_t) psp_media_pool.base)
+                   ? PSP_MEDIA_ALLOC_POOL_HIGH : 0u);
+        psp_media_allocation_failure.budget_remaining = budget_remaining(budget);
+        psp_media_allocation_failure.width = backend->decoded_width;
+        psp_media_allocation_failure.height = backend->decoded_height;
+        psp_media_allocation_failure.devkit = sceKernelDevkitVersion();
+        psp_media_allocation_failure.system_free = sceKernelTotalFreeMemSize();
+        psp_media_allocation_failure.system_largest = sceKernelMaxFreeMemSize();
         psp_media_log(
             "tilefinch-media-decoder: event=allocation-failure "
             "mpeg=%d/%dB au=%d/64B sets=%d/%zuB packet=%d/%zuB "

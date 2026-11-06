@@ -1290,8 +1290,18 @@ static bool test_phase_aware_install_faults(void)
     return true;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--session-remove-error-only") == 0)
+        return !test_glyph_session_remove_retirement(true);
+    if (argc == 2 && strcmp(argv[1], "--session-remove-success-only") == 0)
+        return !test_glyph_session_remove_retirement(false);
+    if (argc == 2 && strcmp(argv[1], "--session-isolation-only") == 0)
+        return !test_glyph_session_install_retirement(0u);
+    if (argc == 2 && strcmp(argv[1], "--session-cancel-only") == 0)
+        return !test_glyph_session_install_retirement(1u);
+    if (argc == 2 && strcmp(argv[1], "--session-error-only") == 0)
+        return !test_glyph_session_install_retirement(2u);
     /* Before any test installs an optional provider: the offer checks
        the embedded faces alone. */
     if (!test_glyph_offer_detection()) return 1;
@@ -1299,6 +1309,10 @@ int main(void)
     if (!test_glyph_offer_session_memory()) return 1;
     if (!test_glyph_offer_decline_persists()) return 1;
     if (!test_glyph_session_install_reattaches()) return 1;
+    if (!test_glyph_session_remove_retirement(true)
+        || !test_glyph_session_remove_retirement(false)) return 1;
+    for (unsigned mode = 0; mode < 3u; mode++)
+        if (!test_glyph_session_install_retirement(mode)) return 1;
     if (!test_glyph_session_installed_status()) return 1;
     if (!test_pack_catalog()) return 1;
     if (!test_authored_sample_packed_pixels()) return 1;

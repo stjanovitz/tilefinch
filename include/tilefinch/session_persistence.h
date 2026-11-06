@@ -74,6 +74,10 @@ BrowserSessionPersistenceStatus browser_session_persistence_load(
  * begin() may open the primary file and allocate the small loader/staging
  * records, but does not read payload bytes. A corrupt or missing primary is
  * retried from the rotated backup within later pump calls.
+ * New loads are refused during captive sign-in. An already pending load
+ * pauses without reading/publishing while that temporary partition is active,
+ * and resumes into the ordinary session after sign-in closes. Terminal load
+ * results remain terminal even if a portal subsequently opens.
  */
 BrowserSessionPersistenceLoad *browser_session_persistence_load_begin(
     BrowserSession *session, const char *path,

@@ -909,8 +909,72 @@ static int test_storage_load_budget_refusal_preserves_target(void)
     return 0;
 }
 
+static int test_restore_pauses_across_portal_partition(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * 1024u * 1024u);
+    BrowserSession source, target;
+    CHECK(browser_session_init(&source, &budget, 1024u)
+          && browser_session_init(&target, &budget, 1024u));
+    CHECK(browser_session_persistence_remove(persistence_path)
+          == BROWSER_SESSION_PERSISTENCE_OK);
+    CHECK(browser_session_storage_set(&source, "https://ordinary.example/", true,
+                                     "ordinary", "saved", 5u));
+    CHECK(browser_session_storage_set(&target, "https://ordinary.example/", true,
+                                     "incumbent", "kept", 4u));
+    BrowserSessionPersistenceLimits limits;
+    browser_session_persistence_limits_default(&limits);
+    CHECK(browser_session_persistence_save(&source, persistence_path,
+        BROWSER_SESSION_PERSIST_LOCAL_STORAGE, &limits) == BROWSER_SESSION_PERSISTENCE_OK);
+    BrowserSessionPersistenceLoad *load = browser_session_persistence_load_begin(
+        &target, persistence_path, BROWSER_SESSION_PERSIST_LOCAL_STORAGE, &limits);
+    CHECK(load != NULL);
+    BrowserSessionPersistenceStatus status;
+    CHECK(browser_session_persistence_load_pump(load, 1u, &status)
+          == BROWSER_SESSION_PERSISTENCE_LOAD_PENDING);
+    CHECK(browser_session_captive_portal_begin(&target, "http://portal.example/sign-in"));
+    for (unsigned pump = 0; pump < 4u; pump++) {
+        CHECK(browser_session_persistence_load_pump(load, 65536u, &status)
+              == BROWSER_SESSION_PERSISTENCE_LOAD_PENDING
+              && status == BROWSER_SESSION_PERSISTENCE_OK);
+        CHECK(!browser_session_storage_get(&target, "https://ordinary.example/", true,
+                                          "ordinary", NULL, NULL));
+    }
+    CHECK(browser_session_persistence_load_begin(&target, persistence_path,
+        BROWSER_SESSION_PERSIST_LOCAL_STORAGE, &limits) == NULL);
+    CHECK(browser_session_persistence_load(&target, persistence_path,
+        BROWSER_SESSION_PERSIST_LOCAL_STORAGE, &limits)
+        == BROWSER_SESSION_PERSISTENCE_INVALID_ARGUMENT);
+    browser_session_captive_portal_end(&target);
+    CHECK(browser_session_storage_get(&target, "https://ordinary.example/", true,
+                                     "incumbent", NULL, NULL));
+    CHECK(pump_load(load, 16u, NULL) == BROWSER_SESSION_PERSISTENCE_OK);
+    CHECK(browser_session_captive_portal_begin(&target, "http://portal.example/sign-in"));
+    CHECK(browser_session_persistence_load_pump(load, 16u, &status)
+          == BROWSER_SESSION_PERSISTENCE_LOAD_COMPLETE
+          && status == BROWSER_SESSION_PERSISTENCE_OK);
+    browser_session_persistence_load_destroy(load);
+    browser_session_captive_portal_end(&target);
+    CHECK(browser_session_storage_get(&target, "https://ordinary.example/", true,
+                                     "ordinary", NULL, NULL));
+    load = browser_session_persistence_load_begin(&target, persistence_path,
+        BROWSER_SESSION_PERSIST_LOCAL_STORAGE, &limits);
+    CHECK(load != NULL && browser_session_captive_portal_begin(
+        &target, "http://portal.example/sign-in"));
+    browser_session_persistence_load_destroy(load);
+    browser_session_captive_portal_end(&target);
+    CHECK(browser_session_storage_get(&target, "https://ordinary.example/", true,
+                                     "ordinary", NULL, NULL));
+    browser_session_destroy(&target);
+    browser_session_destroy(&source);
+    CHECK(browser_session_persistence_remove(persistence_path)
+          == BROWSER_SESSION_PERSISTENCE_OK && budget.current == 0);
+    return 0;
+}
+
 int main(void)
 {
+    CHECK(test_restore_pauses_across_portal_partition() == 0);
     (void) browser_session_persistence_remove(persistence_path);
     CHECK(test_replace_file_on_fat() == 0);
     CHECK(test_round_trip_and_clear() == 0);

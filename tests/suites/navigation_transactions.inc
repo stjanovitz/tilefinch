@@ -302,13 +302,13 @@ static bool test_late_script_oom_reveals_staged_page_shell(void)
         fprintf(stderr,
                 "late OOM ready=%d committed=%d initial=%zu staged=%d "
                 "retired=%d runtime=%p fallback=%d commands=%zu "
-                "summary=\"%s\" error=\"%s\"\n",
+                "summary=\"%s\" error=\"%s\" refusal=\"%s\"\n",
                 ready, committed, initial_commands, staged, retired,
                 (void *) navigation.page.runtime,
                 navigation.page.stylesheet.static_custom_element_fallback,
                 navigation.page.layout.count,
                 navigation.page.script_result.summary,
-                navigation.page.script_result.error);
+                navigation.page.script_result.error, navigation.last_error);
     }
     if (ready) navigation_destroy(&navigation);
     bool clean = budget.current == 0
@@ -1147,7 +1147,7 @@ static bool frame_completion_oom_commit(NavigationSession *navigation,
 static const char frame_completion_child_html[] =
     "<!doctype html><body><p>Child document</p></body>";
 
-static bool test_frame_completion_window_state_oom_keeps_page(void)
+static bool frame_completion_window_state_failure_keeps_page(unsigned failure)
 {
     /* The parent realm runs out of heap while it records the completed
        frame: the WindowProxy lookup the bootstrap makes in that step is
@@ -1164,18 +1164,30 @@ static bool test_frame_completion_window_state_oom_keeps_page(void)
         "const frameWindow=globalThis.__tilefinchFrameWindow;"
         "globalThis.__tilefinchFrameWindow=h=>{exhaust();"
         "return [frameWindow(h)][0]};";
+    static const char recover_arm[] =
+        "const frameWindow=globalThis.__tilefinchFrameWindow;let failed=false;"
+        "globalThis.__tilefinchFrameWindow=h=>{if(!failed){failed=true;"
+        "exhaust();globalThis.hoard=null;throw null}return frameWindow(h)};";
+    static const char author_arm[] =
+        "const frameWindow=globalThis.__tilefinchFrameWindow;let failed=false;"
+        "globalThis.__tilefinchFrameWindow=h=>{if(!failed){failed=true;"
+        "throw null}return frameWindow(h)};";
     Budget budget;
     bool lexbor_installed = false;
     NavigationSession navigation = {0};
     bool ready = frame_oom_session_init(&budget, &navigation,
                                         &lexbor_installed);
     bool committed = ready && frame_completion_oom_commit(
-        &navigation, html, sizeof(html) - 1u, arm);
+        &navigation, html, sizeof(html) - 1u,
+        failure == 2u ? author_arm : failure == 1u ? recover_arm : arm);
     bool completed = committed && navigation_test_complete_frame(
         &navigation, &navigation.page.frames[0], 200,
         frame_completion_child_html,
         sizeof(frame_completion_child_html) - 1u);
-    bool degraded = completed && frame_oom_page_degraded(&navigation);
+    bool degraded = completed && (failure == 2u
+        ? navigation.page.runtime != NULL && !navigation.page.script_memory_limited
+            && frame_oom_layout_has_text(&navigation, "Survivor")
+        : frame_oom_page_degraded(&navigation));
     bool dropped = completed && navigation.page.frame_count == 1u
         && navigation.frames_failed == 2u
         && navigation.frames_loaded == 0u
@@ -1188,6 +1200,21 @@ static bool test_frame_completion_window_state_oom_keeps_page(void)
     bool clean = frame_oom_session_clean(&budget, &navigation, ready,
                                          lexbor_installed);
     return ok && clean;
+}
+
+static bool test_frame_completion_window_state_oom_keeps_page(void)
+{
+    return frame_completion_window_state_failure_keeps_page(0u);
+}
+
+static bool test_frame_completion_oom_cleanup_cannot_erase_failure(void)
+{
+    return frame_completion_window_state_failure_keeps_page(1u);
+}
+
+static bool test_frame_completion_author_error_keeps_realm(void)
+{
+    return frame_completion_window_state_failure_keeps_page(2u);
 }
 
 static bool test_frame_load_event_oom_retires_realm(void)

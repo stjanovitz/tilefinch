@@ -8,7 +8,7 @@ void psp_lifecycle_init(PspLifecycle *lifecycle)
     memset(lifecycle, 0, sizeof(*lifecycle));
     atomic_init(&lifecycle->suspend_epoch, 0);
     atomic_init(&lifecycle->resume_epoch, 0);
-    atomic_init(&lifecycle->presentation_allowed, true);
+    atomic_init(&lifecycle->presentation_epoch, 0);
     lifecycle->state = PSP_LIFECYCLE_RUNNING;
 }
 
@@ -16,12 +16,9 @@ void psp_lifecycle_notify_suspend(PspLifecycle *lifecycle)
 {
     if (lifecycle == NULL) return;
     /*
-     * Disable callback-thread scanout before publishing the epoch. The main
-     * thread may already be frozen, but the loading supervisor must not race
-     * display rearm when callbacks resume first.
+     * Publishing a new epoch also revokes scanout. An older recovery may
+     * finish concurrently, but it can authorize only its own handled epoch.
      */
-    atomic_store_explicit(
-        &lifecycle->presentation_allowed, false, memory_order_release);
     (void) atomic_fetch_add_explicit(
         &lifecycle->suspend_epoch, 1u, memory_order_acq_rel);
 }
@@ -79,14 +76,20 @@ void psp_lifecycle_complete_recovery(PspLifecycle *lifecycle)
         || lifecycle->state != PSP_LIFECYCLE_RECOVERING) return;
     lifecycle->state = PSP_LIFECYCLE_RUNNING;
     atomic_store_explicit(
-        &lifecycle->presentation_allowed, true, memory_order_release);
+        &lifecycle->presentation_epoch, lifecycle->handled_suspend_epoch,
+        memory_order_release);
 }
 
 bool psp_lifecycle_presentation_allowed(const PspLifecycle *lifecycle)
 {
-    return lifecycle != NULL
-        && atomic_load_explicit(
-            &lifecycle->presentation_allowed, memory_order_acquire);
+    if (lifecycle == NULL) return false;
+    /* Sequence the permission read before the revocation read. A newer
+       suspend must not be paired with an older notice snapshot. */
+    unsigned presented_epoch = atomic_load_explicit(
+        &lifecycle->presentation_epoch, memory_order_acquire);
+    unsigned suspend_epoch = atomic_load_explicit(
+        &lifecycle->suspend_epoch, memory_order_acquire);
+    return presented_epoch == suspend_epoch;
 }
 
 PspLifecycleState psp_lifecycle_state(const PspLifecycle *lifecycle)

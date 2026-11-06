@@ -23,6 +23,8 @@ and maintainers. Tilefinch's documentation has three layers:
   navigation that commits only when it succeeds, work limits, rendering,
   transport, lifecycle machines, media, frontend, storage, updates, and
   validation.
+- Detailed state-machine audit notes and investigation evidence are maintained
+  privately; current lifecycle contracts remain in the architecture reference.
 - [Development](DEVELOPMENT.md): fast edit loop, presets, focused tests,
   generated-source workflow, source/target boundaries, and dependency
   acquisition.

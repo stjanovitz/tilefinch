@@ -4,6 +4,7 @@
 #include "tilefinch/multiplayer_protocol.h"
 #include "tilefinch/platform.h"
 #include "tilefinch/psp_threads.h"
+#include "psp_thread_contract.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -71,6 +72,7 @@ typedef struct {
     Budget *budget;
     BudgetReservation stack_reservation;
     SceUID thread;
+    bool thread_needs_join;
     atomic_uint command_read;
     atomic_uint command_write;
     atomic_uint event_read;
@@ -122,9 +124,12 @@ typedef struct {
     PspMultiplayerSession *session;
     uint32_t next_id;
     bool network_requested;
+    bool cancel_pending;
 } PspMultiplayerContext;
 
 static PspMultiplayerContext psp_multiplayer;
+static atomic_bool multiplayer_network_stop;
+static atomic_bool multiplayer_network_owned;
 
 static uint16_t multiplayer_read_u16(const unsigned char *bytes)
 {
@@ -337,7 +342,7 @@ static bool multiplayer_stun_response(
     return false;
 }
 
-static void multiplayer_emit_peer(PspMultiplayerSession *session,
+static bool multiplayer_emit_peer(PspMultiplayerSession *session,
                                   TilefinchMultiplayerEventKind kind,
                                   const struct sockaddr_in *source,
                                   uint32_t peer, const char *name,
@@ -352,8 +357,10 @@ static void multiplayer_emit_peer(PspMultiplayerSession *session,
     (void) tilefinch_multiplayer_invite_encode(
         ntohl(source->sin_addr.s_addr), ntohs(source->sin_port),
         event.invite_code, sizeof(event.invite_code));
-    (void) multiplayer_push_event(session, &event, NULL);
+    return multiplayer_push_event(session, &event, NULL);
 }
+
+#include "psp_multiplayer_peer.inc"
 
 static void multiplayer_mark_open(PspMultiplayerSession *session)
 {
@@ -411,20 +418,7 @@ static void multiplayer_receive(PspMultiplayerSession *session,
     if (kind == TILEFINCH_MULTIPLAYER_PACKET_HELLO
         && session->request.mode == TILEFINCH_MULTIPLAYER_MODE_HOST
         && !session->opened) {
-        if (session->candidate_state == PSP_MULTIPLAYER_CANDIDATE_NONE
-            || sender != session->candidate_nonce
-            || !multiplayer_same_endpoint(source, &session->candidate)) {
-            session->candidate = *source;
-            session->candidate_nonce = sender;
-            size_t copy = payload_length < TILEFINCH_MULTIPLAYER_PEER_NAME_LIMIT
-                ? payload_length : TILEFINCH_MULTIPLAYER_PEER_NAME_LIMIT;
-            memcpy(session->candidate_name, payload, copy);
-            session->candidate_name[copy] = '\0';
-            multiplayer_emit_peer(
-                session, TILEFINCH_MULTIPLAYER_EVENT_PEER_REQUEST,
-                source, sender, session->candidate_name, "incoming");
-            session->candidate_state = PSP_MULTIPLAYER_CANDIDATE_REPORTED;
-        }
+        multiplayer_consider_candidate(session, source, sender, payload, payload_length);
         return;
     }
     if (kind == TILEFINCH_MULTIPLAYER_PACKET_APPROVE
@@ -446,11 +440,7 @@ static void multiplayer_receive(PspMultiplayerSession *session,
     }
     if (kind == TILEFINCH_MULTIPLAYER_PACKET_CONFIRM
         && session->request.mode == TILEFINCH_MULTIPLAYER_MODE_HOST
-        && session->candidate_state == PSP_MULTIPLAYER_CANDIDATE_ACCEPTED
-        && session->remote_valid
-        && multiplayer_same_endpoint(source, &session->remote)
-        && sender == session->remote_nonce
-        && receiver == session->local_nonce && cookie == session->cookie) {
+        && multiplayer_candidate_confirms(session, source, sender, receiver, cookie)) {
         multiplayer_mark_open(session);
         (void) multiplayer_send_packet(
             session, &session->remote, TILEFINCH_MULTIPLAYER_PACKET_OPEN,
@@ -504,24 +494,8 @@ static void multiplayer_apply_command(PspMultiplayerSession *session,
                 &session->stop_requested, 1, memory_order_release);
         }
     } else if (command->kind == PSP_MULTIPLAYER_COMMAND_ACCEPT) {
-        if (session->candidate_state != PSP_MULTIPLAYER_CANDIDATE_NONE
-            && command->peer_identity == session->candidate_nonce) {
-            if (!command->accepted) {
-                session->candidate_state = PSP_MULTIPLAYER_CANDIDATE_NONE;
-            } else {
-                uint32_t cookie = session->cookie_secret
-                    ^ session->local_nonce ^ session->candidate_nonce
-                    ^ ntohl(session->candidate.sin_addr.s_addr)
-                    ^ (uint32_t) ntohs(session->candidate.sin_port);
-                session->cookie = cookie == 0 ? 1u : cookie;
-                session->remote = session->candidate;
-                session->remote_valid = true;
-                session->remote_nonce = session->candidate_nonce;
-                session->candidate_state =
-                    PSP_MULTIPLAYER_CANDIDATE_ACCEPTED;
-                session->last_handshake_us = 0;
-            }
-        }
+        multiplayer_apply_peer_approval(
+            session, command->peer_identity, command->accepted);
     } else if (command->kind == PSP_MULTIPLAYER_COMMAND_REMOTE_CODE) {
         struct sockaddr_in endpoint;
         if (multiplayer_decode_endpoint(command->code, &endpoint)) {
@@ -552,19 +526,7 @@ static void multiplayer_apply_command(PspMultiplayerSession *session,
     }
 }
 
-static void multiplayer_service_commands(PspMultiplayerSession *session)
-{
-    unsigned read = atomic_load_explicit(
-        &session->command_read, memory_order_relaxed);
-    unsigned write = atomic_load_explicit(
-        &session->command_write, memory_order_acquire);
-    for (unsigned count = 0; read != write && count < 4u; count++, read++)
-        multiplayer_apply_command(
-            session,
-            &session->commands[read % PSP_MULTIPLAYER_COMMAND_STORAGE]);
-    atomic_store_explicit(
-        &session->command_read, read, memory_order_release);
-}
+#include "psp_multiplayer_commands.inc"
 
 static void multiplayer_periodic(PspMultiplayerSession *session,
                                  uint64_t now_us)
@@ -686,7 +648,9 @@ static int multiplayer_worker(SceSize arguments, void *argument)
         session->remote_valid = multiplayer_decode_endpoint(
             session->request.invite_code, &session->remote);
     while (!atomic_load_explicit(
-               &session->stop_requested, memory_order_acquire)) {
+               &session->stop_requested, memory_order_acquire)
+           && !atomic_load_explicit(
+               &multiplayer_network_stop, memory_order_acquire)) {
         multiplayer_service_commands(session);
         struct SceNetInetPollfd descriptor = {
             .fd = session->socket,
@@ -733,21 +697,6 @@ done:
     return 0;
 }
 
-static bool multiplayer_enqueue(PspMultiplayerSession *session,
-                                const PspMultiplayerCommand *command)
-{
-    if (session == NULL || command == NULL) return false;
-    unsigned write = atomic_load_explicit(
-        &session->command_write, memory_order_relaxed);
-    unsigned read = atomic_load_explicit(
-        &session->command_read, memory_order_acquire);
-    if (write - read >= PSP_MULTIPLAYER_COMMAND_STORAGE) return false;
-    session->commands[write % PSP_MULTIPLAYER_COMMAND_STORAGE] = *command;
-    atomic_store_explicit(
-        &session->command_write, write + 1u, memory_order_release);
-    return true;
-}
-
 static uint64_t multiplayer_backend_open(
     void *opaque, Budget *budget, const TilefinchMultiplayerRequest *request)
 {
@@ -792,6 +741,9 @@ static uint64_t multiplayer_backend_open(
     session->id = context->next_id;
     context->session = session;
     context->network_requested = true;
+    /* A fresh queued request owns no network worker yet. It can wait for
+       cold network startup without holding a previous shutdown's drain. */
+    atomic_store_explicit(&multiplayer_network_stop, false, memory_order_release);
     psp_network_lifecycle_request(
         context->network_lifecycle, PSP_NETWORK_REQUEST_MULTIPLAYER, true,
         (int) context->process->config.network_profile, context->network,
@@ -799,7 +751,6 @@ static uint64_t multiplayer_backend_open(
     multiplayer_status(session, "connecting Wi-Fi");
     return session->id;
 }
-
 static bool multiplayer_backend_send(
     void *opaque, uint64_t id, const unsigned char *data,
     size_t length, bool binary)
@@ -858,63 +809,7 @@ static bool multiplayer_backend_close(
     return multiplayer_enqueue(context->session, &command);
 }
 
-static void multiplayer_release(PspMultiplayerContext *context)
-{
-    PspMultiplayerSession *session = context == NULL ? NULL : context->session;
-    if (session == NULL) return;
-    if (session->thread >= 0) {
-        (void) sceKernelWaitThreadEnd(session->thread, NULL);
-        (void) sceKernelDeleteThread(session->thread);
-        session->thread = -1;
-    }
-    psp_network_lifecycle_request(
-        context->network_lifecycle, PSP_NETWORK_REQUEST_MULTIPLAYER,
-        false, (int) context->process->config.network_profile,
-        context->network, PSP_NETWORK_SUPERVISOR_STATE_COUNT,
-        "multiplayer-close");
-    Budget *budget = session->budget;
-    budget_reservation_release(&session->stack_reservation);
-    context->session = NULL;
-    context->network_requested = false;
-    budget_free(budget, session);
-}
-
-static bool multiplayer_backend_cancel(void *opaque, uint64_t id)
-{
-    PspMultiplayerContext *context = opaque;
-    if (context == NULL || context->session == NULL
-        || context->session->id != id) return false;
-    atomic_store_explicit(
-        &context->session->stop_requested, 1, memory_order_release);
-    multiplayer_release(context);
-    return true;
-}
-
-static bool multiplayer_backend_take(
-    void *opaque, uint64_t id, unsigned char *data, size_t capacity,
-    TilefinchMultiplayerEvent *event)
-{
-    PspMultiplayerContext *context = opaque;
-    PspMultiplayerSession *session =
-        context == NULL ? NULL : context->session;
-    if (session == NULL || session->id != id || event == NULL) return false;
-    unsigned read = atomic_load_explicit(
-        &session->event_read, memory_order_relaxed);
-    unsigned write = atomic_load_explicit(
-        &session->event_write, memory_order_acquire);
-    if (read == write) return false;
-    PspMultiplayerQueuedEvent *queued =
-        &session->events[read % PSP_MULTIPLAYER_EVENT_STORAGE];
-    if (queued->event.length > capacity
-        || (queued->event.length != 0 && data == NULL)) return false;
-    *event = queued->event;
-    if (event->length != 0) memcpy(data, queued->data, event->length);
-    atomic_store_explicit(
-        &session->event_read, read + 1u, memory_order_release);
-    if (event->kind == TILEFINCH_MULTIPLAYER_EVENT_CLOSE)
-        multiplayer_release(context);
-    return true;
-}
+#include "psp_multiplayer_lifecycle.inc"
 
 bool psp_multiplayer_bind(
     PspProcessResources *process, PspBrowserResources *browser,
@@ -937,55 +832,4 @@ bool psp_multiplayer_bind(
         .take_event = multiplayer_backend_take
     };
     return tilefinch_multiplayer_install_backend(&backend, &psp_multiplayer);
-}
-
-void psp_multiplayer_pump(PspApp *app)
-{
-    PspMultiplayerSession *session = psp_multiplayer.session;
-    if (app == NULL || app->process != psp_multiplayer.process
-        || app->network != psp_multiplayer.network || session == NULL
-        || session->thread >= 0) return;
-    if (!psp_network_lifecycle_ready(app->network_lifecycle)
-        || app->network->status != PSP_NETWORK_READY) {
-        uint64_t now_us = tilefinch_platform_monotonic_time_us();
-        if (!session->close_queued
-            && now_us - session->created_us > UINT64_C(30000000)) {
-            multiplayer_close_event(
-                session, 1006u, false, "network connection timed out");
-            atomic_store_explicit(
-                &session->worker_done, 1, memory_order_release);
-        }
-        return;
-    }
-    session->thread = sceKernelCreateThread(
-        "tilefinch_multiplayer", multiplayer_worker,
-        TILEFINCH_PSP_THREAD_PRIORITY_TRANSPORT_SETUP,
-        PSP_MULTIPLAYER_THREAD_STACK, PSP_THREAD_ATTR_USER, NULL);
-    PspMultiplayerSession *argument = session;
-    if (session->thread < 0
-        || sceKernelStartThread(
-               session->thread, sizeof(argument), &argument) < 0) {
-        if (session->thread >= 0) {
-            (void) sceKernelDeleteThread(session->thread);
-            session->thread = -1;
-        }
-        multiplayer_close_event(session, 1006u, false, "worker unavailable");
-        atomic_store_explicit(&session->worker_done, 1, memory_order_release);
-    }
-}
-
-void psp_multiplayer_shutdown(PspApp *app)
-{
-    if (app == NULL || app->process != psp_multiplayer.process) return;
-    if (psp_multiplayer.session != NULL) {
-        atomic_store_explicit(
-            &psp_multiplayer.session->stop_requested, 1,
-            memory_order_release);
-        multiplayer_release(&psp_multiplayer);
-    }
-    (void) tilefinch_multiplayer_install_backend(NULL, NULL);
-    psp_multiplayer.process = NULL;
-    psp_multiplayer.browser = NULL;
-    psp_multiplayer.network = NULL;
-    psp_multiplayer.network_lifecycle = NULL;
 }

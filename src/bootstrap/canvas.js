@@ -3057,7 +3057,7 @@
     }
     if (!state.originClean)
       throw new DOMException("Canvas is not origin-clean", "SecurityError");
-    setTimeout(() => {
+    __tilefinchRealmGlobal.__tilefinchScheduleTask(() => {
       if (
         state.width === 0 ||
         state.height === 0 ||

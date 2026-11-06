@@ -21,6 +21,24 @@ typedef enum {
     TILEFINCH_CAPTIVE_PROBE_FAILED
 } TilefinchCaptiveProbeResult;
 
+typedef enum {
+    PSP_CAPTIVE_PORTAL_PROBING = 0,
+    PSP_CAPTIVE_PORTAL_OPENING,
+    PSP_CAPTIVE_PORTAL_ACTIVE,
+    PSP_CAPTIVE_PORTAL_VERIFYING,
+    PSP_CAPTIVE_PORTAL_RETURN_PENDING,
+    PSP_CAPTIVE_PORTAL_RETURNING
+} PspCaptivePortalPhase;
+
+typedef struct BrowserTabs BrowserTabs;
+
+/* Retire the ephemeral tab at exit. The result says whether the live
+   document still belongs to the ordinary active tab and may be captured
+   into session/recovery state. Shared with the PSP shutdown path. */
+bool tilefinch_captive_portal_restore_tabs(
+    BrowserTabs *tabs, PspCaptivePortalPhase phase,
+    size_t portal_tab, size_t previous_tab);
+
 typedef struct {
     long status_code;
     const char *content_type;

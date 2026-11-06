@@ -92,7 +92,7 @@
     speak(utterance) {
       if (!(utterance instanceof SpeechSynthesisUtterance))
         throw new TypeError("SpeechSynthesisUtterance required");
-      setTimeout(
+      __tilefinchRealmGlobal.__tilefinchScheduleTask(
         () =>
           utterance.dispatchEvent(
             new SpeechSynthesisErrorEvent("error", {

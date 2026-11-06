@@ -7,6 +7,7 @@
       Blob.prototype,
       "type",
     ).get,
+    tilefinchBlobSize = Object.getOwnPropertyDescriptor(Blob.prototype, "size").get,
     trustedFunctionApply = Function.call.bind(Function.prototype.apply),
     /* Host and validation realms only (see hardening.js). */
     testProbes = !!globalThis.__tilefinchTestProbes,
@@ -1069,13 +1070,14 @@
       this.reason = String(options.reason || "");
     }
   };
+  const fileReaderDispatch = EventTarget.prototype.dispatchEvent;
+  let fileReaderState;
   globalThis.FileReader = class FileReader extends EventTarget {
+    #state;
+    static { fileReaderState = reader => reader.#state; }
     constructor() {
       super();
-      this.readyState = 0;
-      this.result = null;
-      this.error = null;
-      this._task = 0;
+      this.#state = { readyState: 0, result: null, error: null, task: 0, generation: 0 };
       for (const name of [
         "onloadstart",
         "onprogress",
@@ -1086,7 +1088,10 @@
       ])
         this[name] = null;
     }
-    _emit(type, loaded = 0, total = 0) {
+    get readyState() { return this.#state.readyState; }
+    get result() { return this.#state.result; }
+    get error() { return this.#state.error; }
+    #emit(type, loaded = 0, total = 0) {
       const event = __tilefinchTrustedEvent(
         new ProgressEvent(type, {
           lengthComputable: true,
@@ -1094,54 +1099,86 @@
           total,
         }),
       );
-      this.dispatchEvent(event);
-      const handler = this["on" + type];
-      if (typeof handler === "function")
-        globalThis.__tilefinchRunTask(
-          "file-reader:" + String(type),
-          handler,
-          this,
-          [event],
-        );
+      trustedFunctionApply(fileReaderDispatch, this, [event]);
+      try {
+        const handler = this["on" + type];
+        if (typeof handler === "function")
+          globalThis.__tilefinchRunTask("file-reader:" + type, handler, this, [event]);
+      } catch (error) {
+        globalThis.__tilefinchReportUncaught(error, "file-reader:" + type);
+      }
     }
-    _read(blob, convert) {
-      if (!(blob instanceof Blob))
-        throw new TypeError("FileReader input must be a Blob");
-      if (this.readyState === 1)
+    #read(blob, convert) {
+      const state = this.#state,
+        total = trustedFunctionApply(tilefinchBlobSize, blob, []);
+      if (state.readyState === 1)
         throw new DOMException("A read is already active", "InvalidStateError");
-      this.readyState = 1;
-      this.result = null;
-      this.error = null;
-      this._emit("loadstart", 0, blob.size);
-      this._task = setTimeout(() => {
-        if (this.readyState !== 1) return;
-        try {
-          this.result = convert(tilefinchBlobBytes(blob));
-          this.readyState = 2;
-          this._task = 0;
-          this._emit("progress", blob.size, blob.size);
-          this._emit("load", blob.size, blob.size);
-          this._emit("loadend", blob.size, blob.size);
-        } catch (error) {
-          this.error = error;
-          this.result = null;
-          this.readyState = 2;
-          this._task = 0;
-          this._emit("error", 0, blob.size);
-          this._emit("loadend", 0, blob.size);
+      const generation = state.generation + 1,
+        current = () => state.generation === generation && state.readyState === 1,
+        fail = error => {
+          if (!current()) return;
+          if (state.task) __tilefinchRealmGlobal.__tilefinchCancelTimer(state.task);
+          state.task = 0;
+          state.error = error;
+          state.result = null;
+          state.readyState = 2;
+          this.#emit("error", 0, total);
+          if (state.generation === generation && state.readyState !== 1)
+            this.#emit("loadend", 0, total);
+        };
+      let phase = 0;
+      const step = () => {
+        if (!current()) return;
+        state.task = 0;
+        if (phase < 2) {
+          const type = phase++ === 0 ? "loadstart" : "progress";
+          /* Keep one continuation admitted before invoking author code.
+             Separate tasks allow its promise jobs to abort before progress
+             or completion, without retaining a second task queue. */
+          state.task = __tilefinchRealmGlobal.__tilefinchScheduleTask(step);
+          try {
+            this.#emit(type, type === "loadstart" ? 0 : total, total);
+            if (current() && !state.task) fail(new DOMException(
+              "File read task quota exceeded", "QuotaExceededError"));
+          } catch (error) {
+            if (!current()) throw error;
+            fail(error);
+          }
+          return;
         }
-      }, 0);
+        try {
+          const result = convert(tilefinchBlobBytes(blob));
+          if (!current()) return;
+          state.result = result;
+          state.readyState = 2;
+          this.#emit("load", total, total);
+        } catch (error) {
+          if (!current()) throw error;
+          fail(error);
+          return;
+        }
+        if (state.generation === generation && state.readyState !== 1)
+          this.#emit("loadend", total, total);
+      };
+      const task = __tilefinchRealmGlobal.__tilefinchScheduleTask(step);
+      /* A refused reservation must leave EMPTY/DONE usable for a retry,
+         rather than publishing a LOADING state with no task to finish it. */
+      if (!task) throw new DOMException("File read task quota exceeded", "QuotaExceededError");
+      state.generation = generation;
+      state.task = task;
+      state.readyState = 1;
+      state.result = state.error = null;
     }
     readAsArrayBuffer(blob) {
-      this._read(blob, (bytes) => bytes.slice().buffer);
+      this.#read(blob, (bytes) => bytes.slice().buffer);
     }
     readAsText(blob, encoding = "utf-8") {
-      this._read(blob, (bytes) =>
+      this.#read(blob, (bytes) =>
         new TextDecoder(String(encoding || "utf-8")).decode(bytes),
       );
     }
     readAsDataURL(blob) {
-      this._read(blob, (bytes) => {
+      this.#read(blob, (bytes) => {
         let binary = "";
         for (let at = 0; at < bytes.length; at += 4096)
           binary += String.fromCharCode(...bytes.slice(at, at + 4096));
@@ -1154,17 +1191,19 @@
       });
     }
     abort() {
-      if (this.readyState !== 1) {
-        this.result = null;
+      const state = this.#state;
+      if (state.readyState !== 1) {
+        state.result = null;
         return;
       }
-      clearTimeout(this._task);
-      this._task = 0;
-      this.readyState = 2;
-      this.result = null;
-      this.error = new DOMException("The read was aborted", "AbortError");
-      this._emit("abort");
-      this._emit("loadend");
+      const generation = ++state.generation;
+      __tilefinchRealmGlobal.__tilefinchCancelTimer(state.task);
+      state.task = 0;
+      state.readyState = 2;
+      state.result = null;
+      this.#emit("abort");
+      if (state.generation === generation && state.readyState !== 1)
+        this.#emit("loadend");
     }
   };
   for (const [name, value] of Object.entries({
@@ -1182,12 +1221,14 @@
     enumerable: false,
     writable: false,
     value(reader) {
-      if (!(reader instanceof FileReader)) return false;
-      if (reader._task) __tilefinchCancelTimer(reader._task);
-      reader._task = 0;
-      reader.readyState = FileReader.DONE;
-      reader.result = null;
-      reader.error = new DOMException("Worker is terminated", "AbortError");
+      let state;
+      try { state = fileReaderState(reader); } catch (_) { return false; }
+      ++state.generation;
+      if (state.task) __tilefinchCancelTimer(state.task);
+      state.task = 0;
+      state.readyState = 2;
+      state.result = null;
+      state.error = new DOMException("Worker is terminated", "AbortError");
       return true;
     },
   });
@@ -1253,7 +1294,7 @@
     focusFixupPending = true;
     const schedule =
       globalThis.__tilefinchScheduleRenderFixup ||
-      ((callback) => requestAnimationFrame(callback));
+      ((callback) => __tilefinchRealmGlobal.__tilefinchScheduleFrame(callback));
     schedule(() => {
       focusFixupPending = false;
       const current = globalThis.__tilefinchActiveElement;
@@ -2793,7 +2834,7 @@
         throw new RangeError("Invalid abort timeout");
       milliseconds = Math.min(0xffffffff, Math.trunc(milliseconds));
       const signal = new AbortSignal(abortSignalToken);
-      setTimeout(
+      __tilefinchRealmGlobal.__tilefinchScheduleTask(
         () =>
           abortSignal(signal,
             new DOMException("The operation timed out", "TimeoutError"),
@@ -3844,7 +3885,7 @@
       const entry = waitingNetwork.shift();
       if (!entry || entry.state !== "waiting") continue;
       networkQueueStats.waiting = Math.max(0, networkQueueStats.waiting - 1);
-      if (entry.nativeId) clearTimeout(entry.nativeId);
+      if (entry.nativeId) __tilefinchRealmGlobal.__tilefinchCancelTimer(entry.nativeId);
       entry.state = "launching";
       try {
         const nativeId = Number(entry.start());
@@ -3865,7 +3906,7 @@
           waitingNetwork.unshift(entry);
           networkQueueStats.waiting++;
           if (nativeId === -1) networkQueueStats.poolDeferred++;
-          entry.nativeId = setTimeout(
+          entry.nativeId = __tilefinchRealmGlobal.__tilefinchScheduleTask(
             pumpNetworkQueue, nativeId === -1 ? 250 : 10);
           break;
         }
@@ -4529,7 +4570,37 @@
   });
   {
     const eventSources = new Map(),
-      eventSourceLimit = 2;
+      eventSourceLimit = 2,
+      eventSourceDispatch = EventTarget.prototype.dispatchEvent;
+    let deferredSources = null;
+    const scheduleSourceReconnect = (source) => {
+      if (source._closed || source._nativeId || source._reconnectTask) return true;
+      source._reconnectTask = __tilefinchRealmGlobal.__tilefinchScheduleTask(() => {
+        source._reconnectTask = 0;
+        source._connect();
+      }, Math.max(0, source._reconnectAt - __tilefinchRealmGlobal.__tilefinchSchedulerTime()));
+      return !!source._reconnectTask;
+    };
+    const deferSourceReconnect = (source) => {
+      if (!deferredSources) {
+        deferredSources = new Set();
+        __tilefinchTimerCapacity[5] = () => {
+          let remaining = 128;
+          for (const pending of deferredSources) {
+            if (!remaining--) break;
+            if (scheduleSourceReconnect(pending)) deferredSources.delete(pending);
+          }
+          if (deferredSources.size) __tilefinchTimerCapacity[4] |= 16;
+        };
+      }
+      /* Retain bounded owners, not another unbounded task queue. */
+      if (deferredSources.size >= 128 && !deferredSources.has(source)) {
+        source.close();
+        return;
+      }
+      deferredSources.add(source);
+      __tilefinchTimerCapacity[4] |= 16;
+    };
     class EventSource extends EventTarget {
       constructor(url, options = {}) {
         super();
@@ -4550,32 +4621,51 @@
         this._closed = false;
         this._lastEventId = "";
         this._retry = 3000;
-        this._decoder = new TextDecoder();
+        this._decoder = null;
         this._text = "";
         this._data = [];
         this._dataBytes = 0;
         this._eventType = "";
+        this._idBuffer = "";
+        this._skipLF = false;
         this._reconnectTask = 0;
+        this._reconnectAt = 0;
         this._connect();
       }
       _emit(event) {
-        this.dispatchEvent(event);
-        const handler = this["on" + event.type];
-        if (typeof handler === "function")
-          globalThis.__tilefinchRunTask(
-            "event-source:" + String(event.type),
-            handler,
-            this,
-            [event],
-          );
+        trustedFunctionApply(eventSourceDispatch, this, [event]);
+        try {
+          const handler = this["on" + event.type];
+          if (typeof handler === "function")
+            globalThis.__tilefinchRunTask(
+              "event-source:" + String(event.type), handler, this, [event],
+            );
+        } catch (error) {
+          globalThis.__tilefinchReportUncaught(error, "event-source:" + event.type);
+        }
+      }
+      _resetParser() {
+        this._decoder = null;
+        this._text = "";
+        this._data = [];
+        this._dataBytes = 0;
+        this._eventType = "";
+        this._idBuffer = "";
+        this._skipLF = false;
       }
       _connect() {
-        if (this._closed) return;
+        if (this._closed || this._nativeId) return;
+        deferredSources?.delete(this);
+        const task = this._reconnectTask;
+        this._reconnectTask = 0;
+        __tilefinchRealmGlobal.__tilefinchCancelTimer(task);
+        this._resetParser();
         if (eventSources.size >= eventSourceLimit) {
           this._failAndReconnect();
           return;
         }
         try {
+          this._decoder = new TextDecoder();
           const id = Number(
             __tilefinchEventSourceStart(
               this.url,
@@ -4592,18 +4682,21 @@
       }
       _line(line) {
         if (line === "") {
-          if (this._data.length) {
-            const event = new MessageEvent(this._eventType || "message", {
-              data: this._data.join("\n"),
+          this._lastEventId = this._idBuffer;
+          const data = this._data, type = this._eventType;
+          /* Consume the event before author code can throw or reenter. */
+          this._data = [];
+          this._dataBytes = 0;
+          this._eventType = "";
+          if (data.length) {
+            const event = new MessageEvent(type || "message", {
+              data: data.join("\n"),
               origin: new URL(this.url).origin,
               lastEventId: this._lastEventId,
               source: null,
             });
             this._emit(event);
           }
-          this._data = [];
-          this._dataBytes = 0;
-          this._eventType = "";
           return;
         }
         if (line.startsWith(":")) return;
@@ -4628,15 +4721,20 @@
         }
         else if (field === "event") this._eventType = value;
         else if (field === "id" && !value.includes("\0"))
-          this._lastEventId = value;
+          this._idBuffer = value;
         else if (field === "retry" && /^\d+$/.test(value))
           this._retry = Math.min(30000, Math.max(250, Number(value)));
       }
       _chunk(bytes) {
-        this._text +=
+        let text =
           bytes instanceof ArrayBuffer
             ? this._decoder.decode(new Uint8Array(bytes), { stream: true })
             : String(bytes);
+        if (this._skipLF && text.length) {
+          if (text[0] === "\n") text = text.slice(1);
+          this._skipLF = false;
+        }
+        this._text += text;
         for (;;) {
           let newline = -1;
           for (let index = 0; index < this._text.length; index++) {
@@ -4652,11 +4750,8 @@
             }
             return;
           }
-          if (
-            this._text[newline] === "\r" &&
-            newline + 1 === this._text.length
-          )
-            return;
+          this._skipLF = this._text[newline] === "\r" &&
+            newline + 1 === this._text.length;
           const line = this._text.slice(0, newline),
             consumed =
               this._text[newline] === "\r" &&
@@ -4670,16 +4765,21 @@
       }
       _failAndReconnect() {
         if (this._closed) return;
+        this._resetParser();
         this.readyState = EventSource.CONNECTING;
+        this._reconnectAt = __tilefinchRealmGlobal.__tilefinchSchedulerTime() + this._retry;
+        if (!scheduleSourceReconnect(this)) deferSourceReconnect(this);
         this._emit(new Event("error"));
-        clearTimeout(this._reconnectTask);
-        this._reconnectTask = setTimeout(() => this._connect(), this._retry);
       }
       close() {
         if (this._closed) return;
         this._closed = true;
         this.readyState = EventSource.CLOSED;
-        clearTimeout(this._reconnectTask);
+        deferredSources?.delete(this);
+        const task = this._reconnectTask;
+        this._reconnectTask = 0;
+        this._resetParser();
+        __tilefinchRealmGlobal.__tilefinchCancelTimer(task);
         if (this._nativeId) {
           eventSources.delete(this._nativeId);
           __tilefinchEventSourceClose(this._nativeId);
@@ -4721,7 +4821,8 @@
     const webSockets = new Map(),
       webSocketLimit = 2,
       webSocketByteLimit = 64 * 1024,
-      webSocketQueueLimit = 16;
+      webSocketQueueLimit = 16,
+      webSocketDispatch = EventTarget.prototype.dispatchEvent;
     class WebSocket extends EventTarget {
       constructor(url, protocols = []) {
         super();
@@ -4796,7 +4897,11 @@
           } catch (_) {}
         }
         if (this._nativeId > 0) webSockets.set(this._nativeId, this);
-        else setTimeout(() => this._fail("duplex transport unavailable"), 0);
+        else if (!__tilefinchRealmGlobal.__tilefinchScheduleTask(
+          () => this._fail("duplex transport unavailable"), 0)) {
+          this.readyState = WebSocket.CLOSED;
+          throw new DOMException("WebSocket task queue is full", "QuotaExceededError");
+        }
       }
       get binaryType() {
         return this._binaryType;
@@ -4807,15 +4912,16 @@
           this._binaryType = value;
       }
       _emit(event) {
-        this.dispatchEvent(event);
-        const handler = this["on" + event.type];
-        if (typeof handler === "function")
-          globalThis.__tilefinchRunTask(
-            "websocket:" + String(event.type),
-            handler,
-            this,
-            [event],
-          );
+        trustedFunctionApply(webSocketDispatch, this, [event]);
+        try {
+          const handler = this["on" + event.type];
+          if (typeof handler === "function")
+            globalThis.__tilefinchRunTask(
+              "websocket:" + String(event.type), handler, this, [event],
+            );
+        } catch (error) {
+          globalThis.__tilefinchReportUncaught(error, "websocket:" + event.type);
+        }
       }
       _finish(code, reason, wasClean, withError) {
         if (this.readyState === WebSocket.CLOSED) return;
@@ -4886,6 +4992,7 @@
       }
       close(code, reason = "") {
         const numericCode = code === undefined ? 1000 : Number(code);
+        reason = String(reason);
         if (
           code !== undefined &&
           (!Number.isInteger(numericCode) ||
@@ -4893,12 +5000,12 @@
               (numericCode < 3000 || numericCode > 4999)))
         )
           throw new DOMException("Invalid WebSocket close code", "InvalidAccessError");
-        if (new TextEncoder().encode(String(reason)).length > 123)
+        if (new TextEncoder().encode(reason).length > 123)
           throw new DOMException("WebSocket close reason is too long", "SyntaxError");
         if (this.readyState === WebSocket.CLOSED ||
             this.readyState === WebSocket.CLOSING) return;
         this.readyState = WebSocket.CLOSING;
-        this._closeRequest = { code: numericCode, reason: String(reason) };
+        this._closeRequest = { code: numericCode, reason };
         this._pump();
       }
     }
@@ -4953,6 +5060,7 @@
         socket._emit(new Event("open"));
         socket._pump();
       } else if (kind === "text" || kind === "binary") {
+        if (socket.readyState !== WebSocket.OPEN) return false;
         const buffer = payload instanceof ArrayBuffer
           ? payload : new Uint8Array(payload).buffer;
         let data;
@@ -4998,7 +5106,8 @@
     const channels = new Map(),
       messageLimit = 512,
       queueLimit = 8,
-      bufferedLimit = messageLimit * queueLimit;
+      bufferedLimit = messageLimit * queueLimit,
+      multiplayerDispatch = EventTarget.prototype.dispatchEvent;
     const multiplayerEvent = (type, fields = {}) => {
       const event = new Event(type);
       for (const [name, value] of Object.entries(fields))
@@ -5043,28 +5152,39 @@
           this._nativeId = 0;
         }
         if (this._nativeId > 0) channels.set(this._nativeId, this);
-        else setTimeout(() => this._fail("multiplayer unavailable"), 0);
+        else if (!__tilefinchRealmGlobal.__tilefinchScheduleTask(
+          () => this._fail("multiplayer unavailable"), 0)) {
+          this.readyState = "closed";
+          throw new DOMException("Multiplayer task queue is full", "QuotaExceededError");
+        }
       }
       _emit(event) {
-        this.dispatchEvent(event);
-        const handler = this["on" + event.type];
-        if (typeof handler === "function")
-          globalThis.__tilefinchRunTask(
-            "multiplayer:" + String(event.type), handler, this, [event],
-          );
+        trustedFunctionApply(multiplayerDispatch, this, [event]);
+        try {
+          const handler = this["on" + event.type];
+          if (typeof handler === "function")
+            globalThis.__tilefinchRunTask(
+              "multiplayer:" + String(event.type), handler, this, [event],
+            );
+        } catch (error) {
+          globalThis.__tilefinchReportUncaught(error, "multiplayer:" + event.type);
+        }
       }
       _fail(detail) {
         if (this.readyState === "closed") return;
-        this._emit(multiplayerEvent("error", { detail: String(detail || "") }));
-        this._finish(1006, String(detail || ""), false);
+        this._finish(1006, String(detail || ""), false, true);
       }
-      _finish(code, reason, clean) {
+      _finish(code, reason, clean, withError = false) {
         if (this.readyState === "closed") return;
         if (this._nativeId) channels.delete(this._nativeId);
         this._nativeId = 0;
         this.readyState = "closed";
         this._queue.length = 0;
+        this._sending = false;
+        this._closeRequest = null;
         this.bufferedAmount = 0;
+        if (withError)
+          this._emit(multiplayerEvent("error", { detail: String(reason || "") }));
         this._emit(new CloseEvent("close", {
           code: Number(code) || 0,
           reason: String(reason || ""),
@@ -5169,6 +5289,7 @@
         channel._emit(new Event("open"));
         channel._pump();
       } else if (kind === "binary" || kind === "text") {
+        if (channel.readyState !== "open") return false;
         const buffer = payload instanceof ArrayBuffer
           ? payload : new Uint8Array(payload).buffer;
         const data = kind === "text"
@@ -5297,6 +5418,18 @@
     if (!state) throw new TypeError("Illegal invocation");
     state[name] = value;
   };
+  const xhrResetResponse = (xhr) => {
+    const state = xhrPrivateState(xhr);
+    state.responseText = "";
+    state.responseHeaders = new Headers();
+    state.responseBytes = 0;
+    state.responseLengthComputable = false;
+    xhrSetPublic(xhr, "status", 0);
+    xhrSetPublic(xhr, "statusText", "");
+    xhrSetPublic(xhr, "response", null);
+    xhrSetPublic(xhr, "responseURL", "");
+    xhrSetPublic(xhr, "responseXML", null);
+  };
   class TilefinchXMLHttpRequest extends XMLHttpRequestEventTarget {
     #privateState;
     static {
@@ -5375,7 +5508,7 @@
           new DOMException("Request reopened", "AbortError"),
           false,
         );
-      if (state.timeoutId) clearTimeout(state.timeoutId);
+      if (state.timeoutId) __tilefinchRealmGlobal.__tilefinchCancelTimer(state.timeoutId);
       state.timeoutId = 0;
       state.generation += 1;
       state.method = String(method).toUpperCase();
@@ -5431,7 +5564,7 @@
       const state = xhrPrivateState(this);
       if (state.done || state.generation !== generation) return false;
       state.done = true;
-      if (state.timeoutId) clearTimeout(state.timeoutId);
+      if (state.timeoutId) __tilefinchRealmGlobal.__tilefinchCancelTimer(state.timeoutId);
       state.timeoutId = 0;
       state.requestId = 0;
       const loaded = state.responseBytes,
@@ -5550,7 +5683,7 @@
       yield [this, "readystatechange", 0, 0, false];
       if (state.done || state.generation !== generation) return;
       state.done = true;
-      if (state.timeoutId) clearTimeout(state.timeoutId);
+      if (state.timeoutId) __tilefinchRealmGlobal.__tilefinchCancelTimer(state.timeoutId);
       state.timeoutId = 0;
       state.requestId = 0;
       yield [this, "load", byteLength, byteLength, true];
@@ -5562,15 +5695,14 @@
     _fail(error, type = "error", generation) {
       const state = xhrPrivateState(this);
       if (state.done || state.generation !== generation) return;
-      if (!xhrUploadFinish(this, type, generation)) return;
       if (testProbes)
         globalThis.__tilefinchXHRLastError = String(
           (error && error.stack) || error || type,
         );
-      xhrSetPublic(this, "status", 0);
-      xhrSetPublic(this, "response", null);
-      state.responseText = "";
+      state.sent = false;
+      xhrResetResponse(this);
       if (!xhrState(this, 4, generation)) return;
+      if (!xhrUploadFinish(this, type, generation)) return;
       xhrFinish(this, type, generation);
     }
     send(body = null) {
@@ -5667,7 +5799,7 @@
                handler recurse in one JavaScript turn when the bounded queue
                is full, unlike the browser networking model and without an
                opportunity for completed requests to release pressure. */
-            setTimeout(() => xhrFail(this, error, "error", generation), 0);
+            __tilefinchRealmGlobal.__tilefinchScheduleTask(() => xhrFail(this, error, "error", generation), 0);
             return;
           }
           if (state.generation !== generation || state.done) {
@@ -5681,19 +5813,15 @@
           }
           state.requestId = pendingNetwork.has(id) ? Number(id) : 0;
           if (!state.done && timeout > 0)
-            state.timeoutId = setTimeout(() => {
+            state.timeoutId = __tilefinchRealmGlobal.__tilefinchScheduleTask(() => {
               if (state.done || state.generation !== generation) return;
               cancelNetwork(
                 state.requestId,
                 new DOMException("The operation timed out", "TimeoutError"),
                 false,
               );
-              xhrSetPublic(this, "status", 0);
-              xhrSetPublic(this, "readyState", 4);
-              xhrEmit(this, "readystatechange");
-              if (state.generation !== generation || state.done) return;
-              if (!xhrUploadFinish(this, "timeout", generation)) return;
-              xhrFinish(this, "timeout", generation);
+              xhrFail(this, new DOMException(
+                "The operation timed out", "TimeoutError"), "timeout", generation);
             }, timeout);
         } else {
           const raw = __tilefinchFetchSync(
@@ -5713,11 +5841,12 @@
     }
     abort() {
       const state = xhrPrivateState(this);
-      if (state.done) return;
+      const readyState = this.readyState;
+      if (readyState === 0 || (readyState === 1 && !state.sent)) return;
       xhrDiagnosticAdd(state, 4, 7, true);
       state.generation += 1;
       const generation = state.generation;
-      if (state.timeoutId) clearTimeout(state.timeoutId);
+      if (state.timeoutId) __tilefinchRealmGlobal.__tilefinchCancelTimer(state.timeoutId);
       state.timeoutId = 0;
       if (state.requestId)
         cancelNetwork(
@@ -5725,10 +5854,21 @@
           new DOMException("This operation was aborted", "AbortError"),
           false,
         );
-      xhrSetPublic(this, "status", 0);
-      xhrSetPublic(this, "readyState", 0);
+      state.sent = false;
+      xhrResetResponse(this);
+      /* DONE abort is a silent reset. Active abort reports DONE throughout
+         its error events, then resets only if no handler reopened the XHR. */
+      if (readyState === 4) {
+        state.done = true;
+        state.requestId = 0;
+        xhrSetPublic(this, "readyState", 0);
+        return;
+      }
+      if (!xhrState(this, 4, generation)) return;
       if (!xhrUploadFinish(this, "abort", generation)) return;
       xhrFinish(this, "abort", generation);
+      if (state.generation === generation && this.readyState === 4)
+        xhrSetPublic(this, "readyState", 0);
     }
     getResponseHeader(name) {
       return this.readyState < 2
@@ -5978,7 +6118,7 @@
       const state = xhrPrivateState(xhr);
       if (!state) return false;
       state.generation += 1;
-      if (state.timeoutId) clearTimeout(state.timeoutId);
+      if (state.timeoutId) __tilefinchRealmGlobal.__tilefinchCancelTimer(state.timeoutId);
       state.timeoutId = 0;
       if (state.requestId)
         cancelNetwork(
@@ -6220,7 +6360,7 @@ storage-access window-management ";
          remain promise rejections. Keep successful completion bounded by the
          scheduler's existing timer quota. */
       return new Promise((resolve, reject) => {
-        const task = setTimeout(
+        const task = __tilefinchRealmGlobal.__tilefinchScheduleTask(
           () => resolve(new PermissionStatus(platformStatusToken, name)), 0);
         if (task === 0)
           reject(new DOMException(

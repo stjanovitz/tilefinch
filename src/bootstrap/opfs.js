@@ -38,6 +38,13 @@
     if (!id) reject(new DOMException(
       "Storage task quota exceeded", "QuotaExceededError"));
   }),
+    writerTask = (stream, operation) => trustedPromiseThen(
+      task(operation), undefined, (error) => {
+        /* A failed sink is terminal, including refusal to enqueue its task.
+           Discard staging and retire this writer's lock before reporting it. */
+        releaseWriter(writerStates.get(stream));
+        throw error;
+      }),
     errorFor = (status) => {
       if (status === STATUS_UNAVAILABLE)
         return new DOMException("Storage is unavailable", "SecurityError");
@@ -376,10 +383,10 @@
       let stream = null;
       super({
         write(chunk) {
-          return task(() => writerWrite(writerState(stream), chunk));
+          return writerTask(stream, () => writerWrite(writerState(stream), chunk));
         },
         close() {
-          return task(() => {
+          return writerTask(stream, () => {
             const state = writerState(stream);
             try {
               checked(command(

@@ -1,4 +1,5 @@
 #include "tilefinch/ui_language.h"
+#include "tilefinch/ui_language_download.h"
 #include "tilefinch/offline_library.h"
 #include "tilefinch/file_download.h"
 #include "../src/tilefinch_test_faults.h"
@@ -55,6 +56,41 @@ static bool present(const char *directory, const char *name)
     struct stat information;
     snprintf(path, sizeof(path), "%s/%s", directory, name);
     return lstat(path, &information) == 0;
+}
+
+static int catalog_download_admission(void)
+{
+    char url[256];
+    FetchRequest request = {0};
+    CHECK(!tilefinch_ui_language_request(0, url, sizeof(url), &request));
+    CHECK(!tilefinch_ui_language_request(TILEFINCH_UI_LANGUAGE_COUNT, url,
+                                        sizeof(url), &request));
+    CHECK(!tilefinch_ui_language_request(1, url, 4, &request));
+    CHECK(!tilefinch_ui_language_request(1, NULL, sizeof(url), &request));
+    CHECK(!tilefinch_ui_language_request(1, url, sizeof(url), NULL));
+    for (unsigned language = 1; language < TILEFINCH_UI_LANGUAGE_COUNT; language++) {
+        CHECK(tilefinch_ui_language_request(language, url, sizeof(url), &request));
+        CHECK(fetch_request_validate(&request, NULL));
+        CHECK(request.redirect_url_validator != NULL
+              && request.redirect_url_validator(url));
+        CHECK(!strcmp(request.method, "GET")
+              && request.credentials == FETCH_CREDENTIALS_OMIT
+              && request.page_redirect_mode == FETCH_PAGE_REDIRECT_ERROR
+              && request.cookie == NULL && request.cookie_session == NULL
+              && request.body == NULL && request.body_length == 0
+              && request.extra_headers == NULL);
+        CHECK(!request.redirect_url_validator(NULL));
+        CHECK(!request.redirect_url_validator("https://translations.test/catalog.tful"));
+        char changed[320];
+        snprintf(changed, sizeof(changed), "%s?extra=1", url);
+        CHECK(!request.redirect_url_validator(changed));
+        snprintf(changed, sizeof(changed), "%s/extra", url);
+        CHECK(!request.redirect_url_validator(changed));
+        snprintf(changed, sizeof(changed), "%s", url);
+        changed[4] = 'x';
+        CHECK(!request.redirect_url_validator(changed));
+    }
+    return 0;
 }
 
 /* A verified install removes that language's older catalog versions and
@@ -136,6 +172,7 @@ static int install_prunes_older_versions(Budget *budget)
 
 int main(void)
 {
+    CHECK(catalog_download_admission() == 0);
     Budget budget;
     budget_init(&budget, 1024u * 1024u);
     static unsigned char bytes[TILEFINCH_UI_TRANSLATION_BYTES + 1];

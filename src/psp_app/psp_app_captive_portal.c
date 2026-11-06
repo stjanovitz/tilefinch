@@ -7,15 +7,6 @@
 #define PSP_CAPTIVE_PORTAL_PROBE_TIMEOUT_MS 8000L
 #define PSP_CAPTIVE_PORTAL_SESSION_LIMIT_US UINT64_C(300000000)
 
-typedef enum {
-    PSP_CAPTIVE_PORTAL_PROBING = 0,
-    PSP_CAPTIVE_PORTAL_OPENING,
-    PSP_CAPTIVE_PORTAL_ACTIVE,
-    PSP_CAPTIVE_PORTAL_VERIFYING,
-    PSP_CAPTIVE_PORTAL_RETURN_PENDING,
-    PSP_CAPTIVE_PORTAL_RETURNING
-} PspCaptivePortalPhase;
-
 struct PspCaptivePortal {
     PspCaptivePortalPhase phase;
     uint64_t request_id;
@@ -330,6 +321,12 @@ static bool portal_begin_return_navigation(
         (void) browser_tabs_select(tabs, portal->previous_tab);
         memset(&app->interactive->tab_transition, 0,
                sizeof(app->interactive->tab_transition));
+        /* The closing placeholder is not the restored tab's document.
+           Keep its retained snapshot authoritative until it can be opened. */
+        psp_show_native_home(app);
+        psp_ui_show_status(&app->process->presentation.ui,
+                           "TAB COULD NOT OPEN", 180);
+        frame->page_dirty = true;
         portal_release(app);
         return false;
     }
@@ -511,6 +508,8 @@ void psp_captive_portal_navigation_settled(
                     app->browser->tabs, portal->portal_tab);
             (void) browser_tabs_select(
                 app->browser->tabs, portal->previous_tab);
+            psp_show_native_home(app);
+            frame->page_dirty = true;
         }
         portal_release(app);
         return;
@@ -560,23 +559,23 @@ bool psp_captive_portal_cancel(PspApp *app, PspAppFrameState *frame)
     return false;
 }
 
-void psp_captive_portal_destroy(PspApp *app)
+bool psp_captive_portal_destroy(PspApp *app)
 {
-    if (app == NULL || app->interactive == NULL) return;
+    if (app == NULL || app->interactive == NULL) return true;
     PspCaptivePortal *portal = app->interactive->captive_portal;
+    bool capture_document = portal == NULL
+        || portal->phase == PSP_CAPTIVE_PORTAL_PROBING;
     if (app->browser != NULL && app->browser->session != NULL)
         browser_session_captive_portal_end(app->browser->session);
     if (portal != NULL && app->browser != NULL
         && app->browser->tabs != NULL) {
-        if (portal->portal_tab < browser_tabs_count(app->browser->tabs))
-            (void) browser_tabs_remove(
-                app->browser->tabs, portal->portal_tab);
-        if (portal->previous_tab < browser_tabs_count(app->browser->tabs))
-            (void) browser_tabs_select(
-                app->browser->tabs, portal->previous_tab);
+        capture_document = tilefinch_captive_portal_restore_tabs(
+            app->browser->tabs, portal->phase,
+            portal->portal_tab, portal->previous_tab);
         memset(&app->interactive->tab_transition, 0,
                sizeof(app->interactive->tab_transition));
     }
     app->process->presentation.ui.captive_portal_active = false;
     portal_release(app);
+    return capture_document;
 }

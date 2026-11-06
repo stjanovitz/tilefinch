@@ -148,6 +148,7 @@ target_include_directories(tilefinch_boot_handoff PUBLIC include)
 target_link_libraries(tilefinch_core PRIVATE tilefinch_boot_handoff)
 
 add_library(tilefinch_psp_app_support STATIC
+    src/psp_tabs.c
     src/psp_boot_config.c
     src/psp_boot_order.c
     src/psp_lifecycle.c

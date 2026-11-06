@@ -67,10 +67,37 @@ static bool test_repeated_cycle_and_suspend_priority(void)
     return true;
 }
 
+static bool test_stale_recovery_cannot_reopen_presentation(void)
+{
+    PspLifecycle lifecycle;
+    psp_lifecycle_init(&lifecycle);
+    for (unsigned cycle = 0; cycle < 3; cycle++) {
+        psp_lifecycle_notify_suspend(&lifecycle);
+        psp_lifecycle_notify_resume(&lifecycle);
+        CHECK(psp_lifecycle_poll(&lifecycle) == PSP_LIFECYCLE_ACTION_QUIESCE);
+        psp_lifecycle_complete_quiesce(&lifecycle);
+        CHECK(psp_lifecycle_poll(&lifecycle) == PSP_LIFECYCLE_ACTION_RECOVER);
+        /* Firmware callback interrupts the main thread's recovery effects. */
+        psp_lifecycle_notify_suspend(&lifecycle);
+        psp_lifecycle_complete_recovery(&lifecycle);
+        CHECK(!psp_lifecycle_presentation_allowed(&lifecycle));
+        CHECK(psp_lifecycle_poll(&lifecycle) == PSP_LIFECYCLE_ACTION_QUIESCE);
+        psp_lifecycle_complete_quiesce(&lifecycle);
+        CHECK(psp_lifecycle_poll(&lifecycle) == PSP_LIFECYCLE_ACTION_NONE);
+        psp_lifecycle_notify_resume(&lifecycle);
+        CHECK(psp_lifecycle_poll(&lifecycle) == PSP_LIFECYCLE_ACTION_RECOVER);
+        CHECK(!psp_lifecycle_presentation_allowed(&lifecycle));
+        psp_lifecycle_complete_recovery(&lifecycle);
+        CHECK(psp_lifecycle_presentation_allowed(&lifecycle));
+    }
+    return true;
+}
+
 int main(void)
 {
     if (!test_ordered_coalesced_suspend_resume()
-        || !test_repeated_cycle_and_suspend_priority()) return 1;
+        || !test_repeated_cycle_and_suspend_priority()
+        || !test_stale_recovery_cannot_reopen_presentation()) return 1;
     puts("psp-lifecycle-tests: ok");
     return 0;
 }

@@ -535,6 +535,12 @@ if(PSP_BROWSER_BUILD_TESTS)
         COMMAND tilefinch-media-failure-message-tests)
     set_tests_properties(tilefinch-media-failure-message-tests PROPERTIES
         LABELS "tilefinch;unit;media;ui" TIMEOUT 10)
+    tilefinch_add_test_binary(tilefinch-media-open-memory-tests
+        tests/test_media_open_memory.c)
+    target_link_libraries(tilefinch-media-open-memory-tests PRIVATE tilefinch_core)
+    add_test(NAME tilefinch-media-open-memory-tests COMMAND tilefinch-media-open-memory-tests)
+    set_tests_properties(tilefinch-media-open-memory-tests PROPERTIES
+        LABELS "tilefinch;unit;media;memory;state" TIMEOUT 10)
     tilefinch_add_test_binary(tilefinch-media-hls-tests tests/test_media_hls.c)
     target_link_libraries(tilefinch-media-hls-tests PRIVATE tilefinch_core)
     add_test(NAME tilefinch-media-hls-tests COMMAND tilefinch-media-hls-tests)
@@ -1254,6 +1260,12 @@ if(PSP_BROWSER_BUILD_TESTS)
         LABELS "tilefinch;unit;psp;input"
         TIMEOUT 30)
 
+    tilefinch_add_test_binary(tilefinch-psp-tabs-tests tests/test_psp_tabs.c)
+    target_link_libraries(tilefinch-psp-tabs-tests PRIVATE tilefinch_psp_app_support)
+    add_test(NAME tilefinch-psp-tabs-tests COMMAND tilefinch-psp-tabs-tests)
+    set_tests_properties(tilefinch-psp-tabs-tests PROPERTIES
+        LABELS "tilefinch;unit;psp;state;navigation" TIMEOUT 30)
+
     tilefinch_add_test_binary(tilefinch-psp-profile-store-tests
         tests/test_psp_profile_store.c)
     target_link_libraries(tilefinch-psp-profile-store-tests
@@ -1445,6 +1457,12 @@ if(PSP_BROWSER_BUILD_TESTS)
     set_tests_properties(tilefinch-game-audio-selection-tests PROPERTIES
         LABELS "tilefinch;unit;javascript;audio"
         TIMEOUT 30)
+
+    tilefinch_add_test_binary(tilefinch-async-lifecycle-tests tests/test_async_lifecycle.c)
+    target_link_libraries(tilefinch-async-lifecycle-tests PRIVATE tilefinch_core)
+    add_test(NAME tilefinch-async-lifecycle-tests COMMAND tilefinch-async-lifecycle-tests)
+    set_tests_properties(tilefinch-async-lifecycle-tests PROPERTIES
+        LABELS "tilefinch;unit;state;javascript" TIMEOUT 30)
 
     tilefinch_add_test_binary(tilefinch-web-conformance-tests
         tests/test_web_conformance.c)
@@ -2132,6 +2150,30 @@ if(PSP_BROWSER_BUILD_TESTS)
     add_test(NAME tilefinch-psp-network-restart-tests
         COMMAND tilefinch-psp-network-restart-tests)
     set_tests_properties(tilefinch-psp-network-restart-tests PROPERTIES
+        LABELS "tilefinch;unit;network;psp;state" TIMEOUT 30)
+
+    tilefinch_add_test_binary(tilefinch-psp-multiplayer-lifecycle-tests
+        tests/test_psp_multiplayer_lifecycle.c)
+    target_link_libraries(tilefinch-psp-multiplayer-lifecycle-tests PRIVATE tilefinch_core)
+    add_test(NAME tilefinch-psp-multiplayer-lifecycle-tests
+        COMMAND tilefinch-psp-multiplayer-lifecycle-tests)
+    set_tests_properties(tilefinch-psp-multiplayer-lifecycle-tests PROPERTIES
+        LABELS "tilefinch;unit;network;psp;state" TIMEOUT 30)
+
+    tilefinch_add_test_binary(tilefinch-psp-clock-worker-lifecycle-tests
+        tests/test_psp_clock_worker_lifecycle.c)
+    target_include_directories(tilefinch-psp-clock-worker-lifecycle-tests PRIVATE include)
+    add_test(NAME tilefinch-psp-clock-worker-lifecycle-tests
+        COMMAND tilefinch-psp-clock-worker-lifecycle-tests)
+    set_tests_properties(tilefinch-psp-clock-worker-lifecycle-tests PROPERTIES
+        LABELS "tilefinch;unit;power;psp;state" TIMEOUT 10)
+
+    tilefinch_add_test_binary(tilefinch-psp-multiplayer-protocol-state-tests
+        tests/test_psp_multiplayer_protocol_state.c)
+    target_link_libraries(tilefinch-psp-multiplayer-protocol-state-tests PRIVATE tilefinch_core)
+    add_test(NAME tilefinch-psp-multiplayer-protocol-state-tests
+        COMMAND tilefinch-psp-multiplayer-protocol-state-tests)
+    set_tests_properties(tilefinch-psp-multiplayer-protocol-state-tests PROPERTIES
         LABELS "tilefinch;unit;network;psp;state" TIMEOUT 30)
 
     tilefinch_add_test_binary(tilefinch-captive-portal-tests

@@ -79,6 +79,7 @@
 #include "tilefinch/psp_profile_store.h"
 #include "tilefinch/psp_text_input.h"
 #include "tilefinch/psp_ui.h"
+#include "tilefinch/psp_tabs.h"
 #include "tilefinch/psp_ui_settings.h"
 #include "tilefinch/psp_basic_fallback.h"
 #include "tilefinch/psp_reader_policy.h"
@@ -736,22 +737,6 @@ void psp_sync_ui(PspUiState *ui, const BrowserEngine *engine,
                  const BrowserProfile *profile);
 
 /* src/psp_app/psp_app_surfaces.c -- tab strip */
-typedef struct {
-    bool pending;
-    bool added_target;
-    bool hibernate_previous_after_success;
-    size_t previous_index;
-    size_t target_index;
-    size_t close_after_success;
-} PspTabTransition;
-
-typedef enum {
-    PSP_TAB_REQUEST_REFUSED = 0,
-    PSP_TAB_REQUEST_HIBERNATION_FAILED,
-    PSP_TAB_REQUEST_COMPLETE,
-    PSP_TAB_REQUEST_LOAD
-} PspTabRequestResult;
-
 void psp_tabs_sync_ui(
     PspUiState *ui, const BrowserTabs *tabs, PspUiTabsView *view);
 void psp_tabs_capture_thumbnail(
@@ -759,20 +744,6 @@ void psp_tabs_capture_thumbnail(
     int width, int height, int stride);
 void psp_tabs_remove_thumbnail(PspUiTabsView *view, size_t index);
 void psp_tabs_invalidate_thumbnail(PspUiTabsView *view, size_t index);
-PspTabRequestResult psp_tabs_request(
-    BrowserTabs *tabs, const NavigationSession *navigation,
-    bool capture_current_document,
-    PspUiAction action, size_t requested_index, const char *homepage_url,
-    const char *hibernation_path, PspTabTransition *transition,
-    char destination[NAVIGATION_URL_LIMIT]);
-bool psp_tabs_finish(
-    BrowserTabs *tabs, BrowserEngine *engine,
-    PspTabTransition *transition, bool succeeded,
-    bool hibernation_enabled, const char *hibernation_path);
-bool psp_tabs_finish_native_home(
-    BrowserTabs *tabs, PspTabTransition *transition,
-    bool hibernation_enabled, const char *hibernation_path);
-
 /* src/psp_app/psp_app_surfaces.c -- HOME and COLLECTIONS */
 #define PSP_HOME_ROW_LIMIT \
     (PSP_UI_HOME_TILE_LIMIT + PSP_UI_HOME_CONTINUE_LIMIT)
@@ -957,7 +928,8 @@ void psp_youtube_preresolve_note_taken(PspYoutubePreresolve *preresolve);
 
 /* Process-lifetime storage and physical ownership facts. This record does not
    decide lifecycle transitions: media/network machines remain authoritative,
-   while `clock_live` only records whether teardown owes a worker join. */
+   while `clock_live` records an admitted clock service (or retained exit
+   cleanup). The worker's handle query also covers failed initialization. */
 typedef struct {
     TilefinchInstallPaths install_paths;
     PspBootConfig config;
@@ -1030,7 +1002,9 @@ enum {
     PSP_SHUTDOWN_RETAIN_MEDIA_BACKEND = 1u << 0,
     PSP_SHUTDOWN_RETAIN_MEDIA_DMA = 1u << 1,
     PSP_SHUTDOWN_RETAIN_TRANSPORT = 1u << 2,
-    PSP_SHUTDOWN_RETAIN_NETWORK_STACK = 1u << 3
+    PSP_SHUTDOWN_RETAIN_NETWORK_STACK = 1u << 3,
+    PSP_SHUTDOWN_RETAIN_MULTIPLAYER = 1u << 4,
+    PSP_SHUTDOWN_RETAIN_CLOCK = 1u << 5
 };
 
 typedef struct {
@@ -1280,7 +1254,9 @@ bool psp_app_background_handle_frame(
 void psp_captive_portal_navigation_settled(
     PspApp *app, PspAppFrameState *frame, bool succeeded, bool cancelled);
 bool psp_captive_portal_cancel(PspApp *app, PspAppFrameState *frame);
-void psp_captive_portal_destroy(PspApp *app);
+/* Whether shutdown may capture the live document into ordinary tab/recovery
+   state after retiring an ephemeral sign-in page. */
+bool psp_captive_portal_destroy(PspApp *app);
 bool psp_captive_portal_active(const PspInteractiveState *interactive);
 
 /* src/psp_app/psp_app_youtube.c */

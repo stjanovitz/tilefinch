@@ -448,6 +448,9 @@
     constructor(sink = {}) {
       this._sink = sink || {};
       this._state = "writable";
+      this._storedError = undefined;
+      this._abortPromise = null;
+      this._closeStarted = false;
       this._queuedCount = 0;
       this._queuedBytes = 0;
       this._chain = Promise.resolve();
@@ -461,14 +464,26 @@
       this._closeReject = closeReject;
       try {
         if (typeof this._sink.start === "function")
-          this._chain = Promise.resolve(this._sink.start(this));
+          this._chain = Promise.resolve(this._sink.start(this)).then(
+            undefined, (reason) => this._fail(reason),
+          );
       } catch (reason) {
+        this._fail(reason);
+      }
+    }
+    _fail(reason) {
+      if (this._state === "writable" || this._state === "closing") {
+        this._storedError = reason;
         this._state = "errored";
-        this._chain = Promise.reject(reason);
-        closeReject(reason);
+        this._closeReject(reason);
+      } else if (this._state === "erroring" && this._closeStarted) {
+        this._state = "errored";
+        this._closeReject(this._storedError);
       }
     }
     _write(value) {
+      if (this._state === "errored" || this._state === "erroring")
+        return Promise.reject(this._storedError);
       if (this._state !== "writable")
         return Promise.reject(new TypeError("stream is not writable"));
       const bytes = chunkBytes(value);
@@ -481,11 +496,13 @@
         return Promise.reject(new RangeError("write queue limit exceeded"));
       this._queuedCount++;
       this._queuedBytes += bytes;
-      const operation = this._chain.then(() =>
-        typeof this._sink.write === "function"
+      const operation = this._chain.then(() => {
+        if (this._state === "errored" || this._state === "erroring")
+          throw this._storedError;
+        return typeof this._sink.write === "function"
           ? this._sink.write(value, this)
-          : undefined,
-      );
+          : undefined;
+      });
       this._chain = operation.then(
         () => {
           this._queuedCount--;
@@ -494,48 +511,60 @@
         (reason) => {
           this._queuedCount--;
           this._queuedBytes -= bytes;
-          this._state = "errored";
-          this._closeReject(reason);
-          throw reason;
+          this._fail(reason);
         },
       );
       return operation;
     }
     _close() {
+      if (this._state === "errored" || this._state === "erroring")
+        return Promise.reject(this._storedError);
       if (this._state !== "writable")
         return Promise.reject(new TypeError("stream is not writable"));
       this._state = "closing";
-      const operation = this._chain.then(() =>
-        typeof this._sink.close === "function"
+      const operation = this._chain.then(() => {
+        if (this._state === "errored" || this._state === "erroring")
+          throw this._storedError;
+        this._closeStarted = true;
+        return typeof this._sink.close === "function"
           ? this._sink.close()
-          : undefined,
-      );
+          : undefined;
+      });
       this._chain = operation.then(
         () => {
           this._state = "closed";
+          this._storedError = undefined;
           this._closeResolve();
         },
         (reason) => {
-          this._state = "errored";
-          this._closeReject(reason);
-          throw reason;
+          this._closeFailure = reason;
+          this._fail(reason);
         },
       );
       return operation;
     }
     _abort(reason) {
-      if (this._state === "closed") return Promise.resolve();
-      this._state = "errored";
-      this._closeReject(reason);
-      try {
-        return Promise.resolve(
-          typeof this._sink.abort === "function"
-            ? this._sink.abort(reason)
-            : undefined,
-        );
-      } catch (error) {
-        return Promise.reject(error);
-      }
+      if (this._state === "closed" || this._state === "errored")
+        return Promise.resolve();
+      if (this._state === "erroring") return this._abortPromise;
+      this._state = "erroring";
+      this._storedError = reason;
+      /* The chain owns accepted operations until they retire. Queued work
+         checks erroring before entering the sink; an in-flight close wins
+         over abort, but an in-flight write must finish before sink cleanup. */
+      this._abortPromise = this._chain.then(() => {
+        if (this._state === "closed") return;
+        if (this._closeStarted) throw this._closeFailure;
+        this._state = "errored";
+        return typeof this._sink.abort === "function"
+          ? this._sink.abort(reason) : undefined;
+      }).then(() => {
+        if (this._state !== "closed") this._closeReject(this._storedError);
+      }, (error) => {
+        this._closeReject(this._storedError);
+        throw error;
+      });
+      return this._abortPromise;
     }
     getWriter() {
       return new WritableStreamDefaultWriter(this);

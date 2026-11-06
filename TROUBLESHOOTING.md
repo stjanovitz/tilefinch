@@ -125,6 +125,24 @@ If the decoder has to be shut down during playback, the player says
 `VIDEO DECODER NEEDS APP RESTART` and stops offering Retry: only relaunching
 Tilefinch brings the decoder back, so Retry would just fail again.
 
+`PSP aligned codec allocation failed` means a firmware working buffer could
+not be allocated before decoding began, not that the video format was
+rejected. The player first tries its existing bounded page-memory recovery;
+if the failure remains, try a fresh Tilefinch launch with one tab. In a bug
+report include the exact PSP model, Tilefinch version, complete firmware
+version, launch method, and whether the firmware's extra-memory option is
+disabled. A small total-free figure alone cannot diagnose this failure:
+alignment and the C heap's layout matter too.
+
+For allocation details enable **Menu → Settings → Device & storage → Save
+error reports**, reproduce the failure, then export **Help & diagnostics →
+Diagnostic QR**. You can also share `data/tilefinch-last-error.txt` from the
+Tilefinch installation. Its numeric decoder section is described in
+[Diagnostic QR reports](docs/DIAGNOSTIC_QR.md#decoder-allocation-report).
+General reports may include the page URL and error text; review them before
+posting and never include saved-login or cookie files. Turn report saving
+off afterward if you do not want later failures written to the Memory Stick.
+
 ## Sending a diagnostic report without removing the Memory Stick
 
 After an error, open **Menu → Help & diagnostics → Diagnostic QR** and press

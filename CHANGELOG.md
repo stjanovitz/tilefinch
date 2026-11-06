@@ -8,6 +8,36 @@ mechanics.
 
 ## Unreleased
 
+## 0.1.46 — 2026-11-06
+
+- Reliability updates and clearer error reports when opted-in.
+
+- The validation clock worker retains refused startup/shutdown cleanup, rejects requests after stopping begins, and cannot overwrite an unfinished worker during restart.
+- Firmware-video allocation failures now use the existing bounded page-memory recovery and clearer memory guidance, with buffer-level numeric details in opt-in error reports.
+- Keep presentation blocked when a new suspend interrupts an older recovery.
+- Repeating Save for an active video preserves its current download instead of restarting resolution beneath its pending transfer.
+- Aborting a request now resets its response and reports the correct event states without erasing a replacement request started by a handler.
+- IndexedDB upgrades wait for closing connections' accepted transactions, resume when a blocked handler closes the last connection, and reject an already-closed upgraded connection instead of reporting success.
+- Terminating a worker also aborts its unfinished database writes after it has requested connection close.
+- Exiting Wi-Fi sign-in preserves ordinary tabs and their saved page, and background site-data restoration waits for the ordinary session to return.
+- Network shutdown retains ownership of modules that refuse to unload so later teardown or restart can handle them correctly.
+- Failed returns from Wi-Fi sign-in preserve the saved tab behind Home, and selecting that tab reopens its page instead of doing nothing.
+- Stream cancellation now waits for active sink work, rejects queued writes, and avoids duplicate cleanup; failed private-file writes release their locks without changing the saved file.
+- Messages and page observers recover when a full timer table frees up, rather than leaving initialization or layout updates permanently stalled.
+- Worker messages reserve delivery before transferring ownership, so temporary task pressure reports a retryable refusal instead of silently losing detached data.
+- Clearing page timers no longer cancels browser deliveries, animation callbacks of another kind, or another worker's timers; reentrant delay conversion also respects the existing task bound.
+- Failed or cancelled language-pack installs restore the surviving glyph packs, while active installs prevent page hints from reopening a generation being replaced.
+- Closing game audio freezes its clock without rewinding, and retained sources from a closed context cannot start in a replacement mixer.
+- Interface translation downloads now supply the native transport's required pinned-resource policy instead of failing before admission.
+- File reads remain retryable under task pressure, honor cancellation between phases, and keep old completion events or handler exceptions from corrupting a replacement read.
+- Streamed events discard incomplete data between connections, recover deferred retries, and keep handler failures or Close from corrupting later delivery.
+- Removing a font pack restores surviving interface and page fonts even when the filesystem refuses the removal.
+- Failed frame setup keeps its memory-failure evidence through cleanup, so the surviving page remains readable with an orderly script shutdown.
+- WebSocket failures reliably finish their Close notification, discard late messages after closing begins, and permit replacement connections from Close handlers without losing native ownership.
+- Native network events reject incomplete values after allocation refusal instead of entering callbacks with invalid data, and multiplayer channels retain reliable failure and reconnection ownership.
+- Multiplayer cancellation and shutdown retain worker memory and networking until retirement succeeds, preserve pending Close events, and prevent timed-out startup from restarting later.
+- Multiplayer approval keeps the selected peer stable through handshakes and retries, while bounded command queues preserve capacity for sending and closing under routine command pressure.
+
 ## 0.1.45 — 2026-11-02
 
 - Clearer, more compact YouTube pages, with better channel and playlist information, improved account feedback, and updated translations.

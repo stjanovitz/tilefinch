@@ -36,8 +36,7 @@ globalThis.__tilefinchInstallWorker = (
       globalThis.__tilefinchSetCryptoBufferNormalizer,
     normalizeTimerDelay = globalThis.__tilefinchNormalizeTimerDelay,
     scheduleTask = globalThis.__tilefinchScheduleTask,
-    scheduleTimeout = globalThis.__tilefinchScheduleTimeout,
-    scheduleInterval = globalThis.__tilefinchScheduleInterval,
+    scheduleOwnedTimer = globalThis.__tilefinchScheduleOwnedTimer,
     cancelTimer = globalThis.__tilefinchCancelTimer,
     createWorkerPerformance = globalThis.__tilefinchCreateWorkerPerformance,
     createTrustedTypesRealm =
@@ -85,8 +84,7 @@ globalThis.__tilefinchInstallWorker = (
     typeof setCryptoBufferNormalizer !== "function" ||
     typeof normalizeTimerDelay !== "function" ||
     typeof scheduleTask !== "function" ||
-    typeof scheduleTimeout !== "function" ||
-    typeof scheduleInterval !== "function" ||
+    typeof scheduleOwnedTimer !== "function" ||
     typeof cancelTimer !== "function" ||
     typeof createWorkerPerformance !== "function" ||
     typeof createTrustedTypesRealm !== "function" ||
@@ -640,7 +638,11 @@ globalThis.__tilefinchInstallWorker = (
           });
         }
       }
-      const pending=new Map(),reported=[];
+      const pending=new Map(),reported=[],
+        scheduleRejection=root.__tilefinchScheduleWorkerTask,
+        cancelRejection=root.__tilefinchCancelWorkerTask;
+      delete root.__tilefinchScheduleWorkerTask;
+      delete root.__tilefinchCancelWorkerTask;
       Object.defineProperty(root,'PromiseRejectionEvent',{
         configurable:true,writable:true,value:PromiseRejectionEvent});
       Object.defineProperty(root,'__tilefinchQueuePromiseRejection',{
@@ -655,9 +657,9 @@ globalThis.__tilefinchInstallWorker = (
               if(at>=0)reported.splice(at,1);
             }
             if(record.reported)
-              root.setTimeout(()=>root.dispatchEvent(
+              scheduleRejection(()=>root.dispatchEvent(
                 new PromiseRejectionEvent('rejectionhandled',{promise,reason})),0);
-            else root.clearTimeout(record.timer);
+            else cancelRejection(record.timer);
             return;
           }
           if(record)return;
@@ -668,7 +670,7 @@ globalThis.__tilefinchInstallWorker = (
           if(pending.size>=16)return;
           record={reported:false,timer:0};
           pending.set(promise,record);
-          record.timer=root.setTimeout(()=>{
+          record.timer=scheduleRejection(()=>{
             if(pending.get(promise)!==record)return;
             record.reported=true;
             reported.push(promise);
@@ -902,6 +904,7 @@ globalThis.__tilefinchInstallWorker = (
       "mark", "measure", "resource",
     ]),
     workerPerformanceObserverStates = createPrivateWeakMap(),
+    deferredWorkerPerformanceObservers = new Set(),
     workerPerformanceEntryLimit = 128,
     workerPerformanceObserverLimit = 16,
     workerPerformanceObserverRecordLimit = 64,
@@ -1048,6 +1051,10 @@ globalThis.__tilefinchInstallWorker = (
       });
       return value;
     };
+  if (!__tilefinchTimerCapacity[2]) __tilefinchTimerCapacity[2] = () => {
+    for (const observerState of deferredWorkerPerformanceObservers)
+      observerState.schedule();
+  };
   Object.defineProperty(WorkerPerformance.prototype, Symbol.toStringTag, {
     configurable: true,
     value: "Performance",
@@ -1300,20 +1307,14 @@ globalThis.__tilefinchInstallWorker = (
       scope.WorkerNavigator = WorkerNavigator;
       scope.WorkerLocation = WorkerLocation;
       scope.postMessage = function (value) {
+        if (!state.active) return;
         if (arguments.length > 1) workerProgress.outboundTransferArguments++;
         traceWorkerMessage("worker-to-owner", value);
-        const transferOrOptions = arguments[1],
-          transfer = transferOrOptions &&
-              typeof transferOrOptions === "object" &&
-              !Array.isArray(transferOrOptions) &&
-              "transfer" in transferOrOptions
-            ? transferOrOptions.transfer : transferOrOptions,
-          ports = [],
-          copied = cloneWorkerValue(
-            value, workerCloneIntrinsics.owner, transfer, ports);
-        workerProgress.outboundQueued++;
-        workerProgress.lastId = state.id;
-        state.outboundPending = (state.outboundPending || 0) + 1;
+        const ports = [];
+        let copied;
+        /* Reserve delivery before serialization can detach buffers/ports or
+           invoke a getter that fills the wheel. Nothing runs before this
+           worker task returns; cloning failure cancels the reservation. */
         const queued = scheduleTask(() => {
           let deliveryFinished = false;
           const finishDelivery = (delivered) => {
@@ -1344,11 +1345,29 @@ globalThis.__tilefinchInstallWorker = (
           }
         });
         if (!queued) {
-          state.outboundPending--;
           workerProgress.outboundDropped++;
           workerProgress.outboundDroppedQueue++;
-          finishWorkerClose(state);
+          throw new DOMException(
+            "Worker message task quota exceeded", "QuotaExceededError");
         }
+        state.outboundPending = (state.outboundPending || 0) + 1;
+        try {
+          const transferOrOptions = arguments[1],
+            transfer = transferOrOptions &&
+                typeof transferOrOptions === "object" &&
+                !Array.isArray(transferOrOptions) &&
+                "transfer" in transferOrOptions
+              ? transferOrOptions.transfer : transferOrOptions;
+          copied = cloneWorkerValue(
+            value, workerCloneIntrinsics.owner, transfer, ports);
+        } catch (error) {
+          cancelTimer(queued);
+          state.outboundPending--;
+          finishWorkerClose(state);
+          throw error;
+        }
+        workerProgress.outboundQueued++;
+        workerProgress.lastId = state.id;
       };
       scope.addEventListener = function (type, callback, options = false) {
         return EventTarget.prototype.addEventListener.call(
@@ -1401,6 +1420,7 @@ globalThis.__tilefinchInstallWorker = (
       }
       scope.crypto = createWorkerCrypto();
       scope.performance = createDedicatedWorkerPerformance();
+      state.performanceObservers = workerPerformanceStates.get(scope.performance).observers;
       scope.Performance = WorkerPerformance;
       /* Navigation and paint entries belong to Window, not a dedicated
          worker. Keep both the entry buffer and observers local to this
@@ -1419,24 +1439,31 @@ globalThis.__tilefinchInstallWorker = (
               schedule() {
                 if (observerState.pending || !observerState.records.length)
                   return;
-                observerState.pending = true;
-                scope.setTimeout(() => {
-                  observerState.pending = false;
-                  if (!state.active || state.closing ||
-                      !observerState.records.length) return;
-                  const records = observerState.records.splice(0),
-                    dropped = observerState.dropped;
-                  observerState.dropped = 0;
-                  try {
-                    observerState.callback(
-                      new PerformanceObserverEntryListCtor(records),
-                      observer,
-                      { droppedEntriesCount: dropped },
-                    );
-                  } catch (error) {
-                    reportWorkerError(owner, error, workerURL);
+                try {
+                  observerState.pending = !!scheduleWorkerTimer(() => {
+                    observerState.pending = false;
+                    if (!state.active || state.closing ||
+                        !observerState.records.length) return;
+                    const records = observerState.records.splice(0),
+                      dropped = observerState.dropped;
+                    observerState.dropped = 0;
+                    try {
+                      observerState.callback(
+                        new PerformanceObserverEntryListCtor(records),
+                        observer,
+                        { droppedEntriesCount: dropped },
+                      );
+                    } catch (error) {
+                      reportWorkerError(owner, error, workerURL);
+                    }
+                  }, 0, false, [], true);
+                } finally {
+                  if (observerState.pending) deferredWorkerPerformanceObservers.delete(observerState);
+                  else {
+                    deferredWorkerPerformanceObservers.add(observerState);
+                    __tilefinchTimerCapacity[4] |= 1 << 2;
                   }
-                }, 0);
+                }
               },
             };
           workerPerformanceObserverStates.set(this, observerState);
@@ -1479,6 +1506,7 @@ globalThis.__tilefinchInstallWorker = (
             performanceState = workerPerformanceStates.get(scope.performance);
           if (!observerState || !performanceState)
             throw new TypeError("Illegal invocation");
+          deferredWorkerPerformanceObservers.delete(observerState);
           observerState.types.clear();
           observerState.records.length = 0;
           observerState.pending = false;
@@ -1507,7 +1535,7 @@ globalThis.__tilefinchInstallWorker = (
         markNative(descriptor?.value);
       }
       scope.crossOriginIsolated = false;
-      const scheduleWorkerTimer = (callback, delay, repeat, args) => {
+      const scheduleWorkerTimer = (callback, delay, repeat, args, internal = false) => {
           if (typeof callback !== "function") {
             const source = trustedString(callback);
             callback = () => runWorkerNative(
@@ -1534,9 +1562,8 @@ globalThis.__tilefinchInstallWorker = (
             }
           };
           const normalizedDelay = normalizeTimerDelay(delay);
-          id = repeat
-            ? scheduleInterval(invoke, normalizedDelay)
-            : scheduleTimeout(invoke, normalizedDelay);
+          id = internal ? scheduleTask(invoke, normalizedDelay)
+            : scheduleOwnedTimer(state.timers, invoke, normalizedDelay, repeat);
           if (id) {
             state.timers.add(id);
             workerProgress.pendingTimers++;
@@ -1551,13 +1578,13 @@ globalThis.__tilefinchInstallWorker = (
           }
           return id;
         },
-        clearWorkerTimer = (id) => {
+        clearWorkerTimer = (id, internal = false) => {
           const timerId = Number(id);
           /* HTML timers are isolated by global object.  The worker uses the
              owner's scheduler underneath, so never forward an identifier
              until this worker has proved it owns that timer. */
-          if (state.timers.has(timerId)) {
-            cancelTimer(timerId);
+          if (state.timers.has(timerId)
+              && cancelTimer(timerId, internal ? 0 : state.timers)) {
             state.timers.delete(timerId);
             workerProgress.pendingTimers--;
             if (traceWorkerLifecycle)
@@ -1577,6 +1604,9 @@ globalThis.__tilefinchInstallWorker = (
       scope.setInterval = setInterval;
       scope.clearTimeout = clearTimeout;
       scope.clearInterval = clearInterval;
+      scope.__tilefinchScheduleWorkerTask = (callback, delay = 0) =>
+        scheduleWorkerTimer(callback, delay, false, [], true);
+      scope.__tilefinchCancelWorkerTask = (id) => clearWorkerTimer(id, true);
       scope.TextEncoder = TextEncoder;
       scope.TextDecoder = TextDecoder;
       scope.Blob = Blob;
@@ -2439,6 +2469,8 @@ globalThis.__tilefinchInstallWorker = (
       delete scope.__tilefinchWorkerScriptURL;
       delete scope.__tilefinchImportScripts;
       delete scope.__tilefinchWorkerType;
+      delete scope.__tilefinchScheduleWorkerTask;
+      delete scope.__tilefinchCancelWorkerTask;
       delete scope.__tilefinchWorkerBlobBytes;
       delete scope.__tilefinchWorkerBlobText;
       delete scope.__tilefinchOwnerWorkerPrototype;
@@ -2582,17 +2614,8 @@ globalThis.__tilefinchInstallWorker = (
       if (!state.active) return;
       if (arguments.length > 1) workerProgress.inboundTransferArguments++;
       traceWorkerMessage("owner-to-worker", value);
-      const transferOrOptions = arguments[1],
-        transfer = transferOrOptions &&
-            typeof transferOrOptions === "object" &&
-            !Array.isArray(transferOrOptions) &&
-            "transfer" in transferOrOptions
-          ? transferOrOptions.transfer : transferOrOptions,
-        ports = [],
-        copied = cloneWorkerValue(
-          value, state.cloneIntrinsics, transfer, ports);
-      workerProgress.inboundQueued++;
-      workerProgress.lastId = state.id;
+      const ports = [];
+      let copied;
       const queued = scheduleTask(() => {
         if (!state.active || state.closing) {
           workerProgress.inboundDropped++;
@@ -2623,7 +2646,25 @@ globalThis.__tilefinchInstallWorker = (
           throw error;
         }
       });
-      if (!queued) workerProgress.inboundDropped++;
+      if (!queued) {
+        workerProgress.inboundDropped++;
+        throw new DOMException(
+          "Worker message task quota exceeded", "QuotaExceededError");
+      }
+      try {
+        const transferOrOptions = arguments[1],
+          transfer = transferOrOptions &&
+              typeof transferOrOptions === "object" &&
+              !Array.isArray(transferOrOptions) &&
+              "transfer" in transferOrOptions
+            ? transferOrOptions.transfer : transferOrOptions;
+        copied = cloneWorkerValue(value, state.cloneIntrinsics, transfer, ports);
+      } catch (error) {
+        cancelTimer(queued);
+        throw error;
+      }
+      workerProgress.inboundQueued++;
+      workerProgress.lastId = state.id;
     }
     terminate() {
       const state = workerStates.get(this);
@@ -2647,6 +2688,14 @@ globalThis.__tilefinchInstallWorker = (
         at: workerProgressClock.now(),
       });
     state.active = false;
+    for (const observer of state.performanceObservers || []) {
+      const observerState = workerPerformanceObserverStates.get(observer);
+      if (!observerState) continue;
+      deferredWorkerPerformanceObservers.delete(observerState);
+      observerState.pending = false;
+      observerState.records.length = 0;
+    }
+    state.performanceObservers?.clear();
     activeWorkers--;
     workerProgress.terminations++;
     workerProgress.lastId = state.id;

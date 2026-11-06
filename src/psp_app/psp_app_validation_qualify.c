@@ -20,6 +20,14 @@
 #include "psp_boot_timing.h"
 #include "tilefinch/game_audio.h"
 
+static TILEFINCH_COLD_PATH bool psp_validation_clock_shutdown(PspClockWorker *worker)
+{
+    bool stopped = psp_clock_worker_shutdown(worker);
+    if (!stopped)
+        printf("tilefinch-power-cleanup: stopped=0 retained=1\n");
+    return stopped;
+}
+
 static TILEFINCH_COLD_PATH void psp_js_bench_emit(void *opaque,
                                                   const char *line)
 {
@@ -57,7 +65,7 @@ static TILEFINCH_COLD_PATH void psp_run_js_bench(const char *argv0,
 
 static TILEFINCH_COLD_PATH int psp_run_ge_present_qualification(
     BrowserEngine *engine, Budget *budget,
-    PspClockWorker *clock_worker, bool clock_worker_started,
+    PspClockWorker *clock_worker,
     const char *exit_to)
 {
     /*
@@ -160,8 +168,7 @@ static TILEFINCH_COLD_PATH int psp_run_ge_present_qualification(
     budget_free(budget, probe_scratch);
     psp_report_budget_counters(budget, "ge-present-probe-exit");
     browser_engine_destroy(engine);
-    if (clock_worker_started)
-        (void) psp_clock_worker_shutdown(clock_worker);
+    (void) psp_validation_clock_shutdown(clock_worker);
     printf("tilefinch-validation: outcome=%s qualification=%s\n",
            probe_passed ? "clean-exit" : "qualification-failed",
            probe_passed ? "ge-present-pass" : "ge-present-fail");
@@ -175,7 +182,7 @@ static TILEFINCH_COLD_PATH int psp_run_ge_present_qualification(
 
 static TILEFINCH_COLD_PATH int psp_run_csc_order_qualification(
     BrowserEngine *engine, Budget *budget,
-    PspClockWorker *clock_worker, bool clock_worker_started,
+    PspClockWorker *clock_worker,
     const char *exit_to)
 {
     /*
@@ -214,8 +221,7 @@ static TILEFINCH_COLD_PATH int psp_run_csc_order_qualification(
         (unsigned) report.last_native_error);
     psp_report_budget_counters(budget, "csc-order-probe-exit");
     browser_engine_destroy(engine);
-    if (clock_worker_started)
-        (void) psp_clock_worker_shutdown(clock_worker);
+    (void) psp_validation_clock_shutdown(clock_worker);
     printf("tilefinch-validation: outcome=%s qualification=%s\n",
            probe_passed || emulator_untested
                ? "clean-exit" : "qualification-failed",
@@ -233,7 +239,7 @@ static TILEFINCH_COLD_PATH int psp_run_csc_order_qualification(
 
 static TILEFINCH_COLD_PATH int psp_run_media_range_qualification(
     BrowserEngine *engine, const PspBootConfig *config,
-    PspClockWorker *clock_worker, bool clock_worker_started)
+    PspClockWorker *clock_worker)
 {
     /*
      * The transport half of a playback session with nothing behind it.
@@ -266,8 +272,7 @@ static TILEFINCH_COLD_PATH int psp_run_media_range_qualification(
         report.split ? 1 : 0, report.video.fragment_boundaries,
         report.audio.fragment_boundaries, probe_error);
     psp_report_budget_counters(budget, "media-range-probe-exit");
-    if (clock_worker_started)
-        (void) psp_clock_worker_shutdown(clock_worker);
+    (void) psp_validation_clock_shutdown(clock_worker);
     printf("tilefinch-validation: outcome=%s qualification=%s\n",
            passed ? "clean-exit" : "qualification-failed",
            passed ? "media-range-pass" : "media-range-fail");
@@ -281,7 +286,7 @@ static TILEFINCH_COLD_PATH int psp_run_media_range_qualification(
 static TILEFINCH_COLD_PATH int psp_run_raster_qualification(
     BrowserEngine *engine, Budget *budget, const char *argv0,
     PspGlyphComponentSession *glyph_component,
-    PspClockWorker *clock_worker, bool clock_worker_started,
+    PspClockWorker *clock_worker,
     const char *exit_to)
 {
     psp_present_boot_surface(
@@ -377,8 +382,7 @@ static TILEFINCH_COLD_PATH int psp_run_raster_qualification(
     psp_report_budget_counters(budget, "raster-fixture-exit");
     psp_glyph_component_session_destroy(glyph_component);
     browser_engine_destroy(engine);
-    if (clock_worker_started)
-        (void) psp_clock_worker_shutdown(clock_worker);
+    (void) psp_validation_clock_shutdown(clock_worker);
     printf(
         "tilefinch-validation: outcome=%s qualification=%s\n",
         passed ? "clean-exit" : "qualification-failed",
@@ -425,10 +429,7 @@ bool psp_validation_engine_qualifications(
         psp_report_budget_counters(browser->budget, "media-fixture-exit");
         browser_engine_destroy(browser->engine);
         browser->engine = NULL;
-        if (process->clock_live) {
-            (void) psp_clock_worker_shutdown(&process->clock_worker);
-            process->clock_live = false;
-        }
+        process->clock_live = !psp_validation_clock_shutdown(&process->clock_worker);
         printf(
             "tilefinch-validation: outcome=%s qualification=%s\n",
             fixture_passed || emulator_untested
@@ -447,7 +448,7 @@ bool psp_validation_engine_qualifications(
     }
     if (process->config.validation_ge_present_probe != 0) {
         *exit_code = psp_run_ge_present_qualification(
-            browser->engine, browser->budget, &process->clock_worker, process->clock_live,
+            browser->engine, browser->budget, &process->clock_worker,
             process->config.exit_to);
         return true;
     }
@@ -455,7 +456,7 @@ bool psp_validation_engine_qualifications(
         psp_run_js_bench(argv0, &process->config);
     if (process->config.validation_csc_order_probe != 0) {
         *exit_code = psp_run_csc_order_qualification(
-            browser->engine, browser->budget, &process->clock_worker, process->clock_live,
+            browser->engine, browser->budget, &process->clock_worker,
             process->config.exit_to);
         return true;
     }
@@ -479,7 +480,7 @@ bool psp_validation_raster_qualification(
     *exit_code = psp_run_raster_qualification(
         browser->engine, browser->budget, argv0,
         browser->glyph_component_session,
-        &process->clock_worker, process->clock_live,
+        &process->clock_worker,
         process->config.exit_to);
     return true;
 }
@@ -493,8 +494,7 @@ bool psp_validation_network_qualification(
 {
     if (process->config.validation_media_range_probe == 0) return false;
     *exit_code = psp_run_media_range_qualification(
-        browser->engine, &process->config, &process->clock_worker,
-        process->clock_live);
+        browser->engine, &process->config, &process->clock_worker);
     return true;
 }
 

@@ -6,6 +6,11 @@ int main(int argc, char **argv)
         return 1;                                                            \
     }                                                                        \
 } while (0)
+    if (argc == 2 && strcmp(argv[1], "--frame-oom-cleanup-only") == 0) {
+        RUN_TEST(test_frame_completion_oom_cleanup_cannot_erase_failure);
+        RUN_TEST(test_frame_completion_author_error_keeps_realm);
+        return 0;
+    }
     if (argc == 2 && strcmp(argv[1], "--sliced-stylesheet-only") == 0)
         return test_parser_blocking_stylesheet_prepared_in_slices()
             && test_sliced_stylesheet_keeps_document_order() ? 0 : 1;
@@ -226,6 +231,8 @@ int main(int argc, char **argv)
     RUN_TEST(test_frame_error_event_oom_commits_top_document);
     RUN_TEST(test_frame_messaging_refusal_keeps_page_and_realm);
     RUN_TEST(test_frame_completion_window_state_oom_keeps_page);
+    RUN_TEST(test_frame_completion_oom_cleanup_cannot_erase_failure);
+    RUN_TEST(test_frame_completion_author_error_keeps_realm);
     RUN_TEST(test_frame_load_event_oom_retires_realm);
     RUN_TEST(test_frame_completion_error_event_oom_retires_realm);
     RUN_TEST(test_frame_event_static_relayout_keeps_page);

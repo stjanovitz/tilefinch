@@ -873,6 +873,7 @@ BrowserSessionPersistenceLoad *browser_session_persistence_load_begin(
     BrowserSessionPersistenceLimits limits;
     char backup[PERSIST_PATH_BYTES];
     if (session == NULL || session->budget == NULL
+        || browser_session_captive_portal_active(session)
         || mask == 0 || (mask & ~BROWSER_SESSION_PERSIST_ALL) != 0
         || !effective_limits(requested_limits, &limits)
         || !make_path(path, ".bak", backup)) return NULL;
@@ -919,6 +920,16 @@ BrowserSessionPersistenceLoadProgress browser_session_persistence_load_pump(
         *reported_status = BROWSER_SESSION_PERSISTENCE_INVALID_ARGUMENT;
     if (load == NULL || maximum_bytes == 0)
         return BROWSER_SESSION_PERSISTENCE_LOAD_FAILED;
+    /* An incremental restore belongs to the ordinary session partition.
+       Portal entry can occur between pumps; keep staging private and do no
+       I/O until the ordinary tables have been restored on portal exit. */
+    if (load->phase != ASYNC_LOAD_FINISHED
+        && load->status == BROWSER_SESSION_PERSISTENCE_OK
+        && browser_session_captive_portal_active(load->target)) {
+        if (reported_status != NULL)
+            *reported_status = BROWSER_SESSION_PERSISTENCE_OK;
+        return BROWSER_SESSION_PERSISTENCE_LOAD_PENDING;
+    }
     size_t budget = maximum_bytes;
     unsigned transitions = 0;
     while (load->phase != ASYNC_LOAD_FINISHED
@@ -1196,6 +1207,7 @@ BrowserSessionPersistenceStatus browser_session_persistence_load(
     BrowserSessionPersistenceLimits limits;
     char backup[PERSIST_PATH_BYTES];
     if (session == NULL || session->budget == NULL
+        || browser_session_captive_portal_active(session)
         || mask == 0 || (mask & ~BROWSER_SESSION_PERSIST_ALL) != 0
         || !effective_limits(requested_limits, &limits)
         || !make_path(path, ".bak", backup)) {

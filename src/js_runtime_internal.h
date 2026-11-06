@@ -1572,7 +1572,14 @@ bool js_rt_event_sources_deliver(ScriptRuntime *runtime,
                                  size_t completion_budget,
                                  size_t *author_tasks);
 void js_rt_websockets_destroy(DomBridge *bridge);
+/* Shared owner-thread entry for fully constructed native network events. */
+bool js_rt_network_call_global(ScriptRuntime *runtime, const char *name,
+                              int argc, JSValueConst *argv);
 size_t js_rt_websockets_abort(DomBridge *bridge);
+/* Owner-thread delivery of an already-taken transport event. Message bytes
+   are in bridge.websocket_event_scratch and copied before author callbacks. */
+bool js_rt_websocket_deliver_event(
+    ScriptRuntime *runtime, size_t slot, const FetchWebSocketEvent *event);
 bool js_rt_websockets_deliver(ScriptRuntime *runtime,
                               size_t completion_budget,
                               size_t *author_tasks);

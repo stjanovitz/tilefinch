@@ -103,13 +103,20 @@ static bool ensure_provider(PspGlyphComponentSession *session)
     return true;
 }
 
+static bool installer_owns_runtime(const PspGlyphComponentSession *session)
+{
+    return session->installer != NULL
+        && session->install_snapshot.phase < TILEFINCH_UPDATE_INSTALL_COMPLETE;
+}
+
 bool psp_glyph_component_session_attach_selected(
     PspGlyphComponentSession *session, Budget *budget,
     const TilefinchInstallPaths *paths, BrowserGlyphLanguage language,
     BrowserGlyphLanguage interface_language, bool color_emoji)
 {
     if (session == NULL || budget == NULL || paths == NULL
-        || !paths->slotted || session->provider != NULL) return false;
+        || !paths->slotted || session->provider != NULL
+        || installer_owns_runtime(session)) return false;
     session->budget = budget;
     TilefinchGlyphPack regional = TILEFINCH_GLYPH_PACK_JAPANESE;
     TilefinchGlyphPack interface = TILEFINCH_GLYPH_PACK_JAPANESE;
@@ -147,6 +154,7 @@ bool psp_glyph_component_session_attach_hinted(
     BrowserEngine *engine)
 {
     if (session == NULL || paths == NULL || !paths->slotted
+        || installer_owns_runtime(session)
         || script_mask == 0
         || (script_mask & (uint16_t) ~session->lazy_processed_script_mask) == 0
         || session->lazy_attached_count
@@ -350,7 +358,8 @@ bool psp_glyph_component_session_reattach(
     BrowserGlyphLanguage interface_language, bool color_emoji,
     uint16_t script_mask, BrowserEngine *engine)
 {
-    if (session == NULL || !session->reattach_pending) return false;
+    if (session == NULL || !session->reattach_pending
+        || installer_owns_runtime(session)) return false;
     session->reattach_pending = false;
     uint16_t before = session->attached_mask;
     if (session->provider == NULL)
@@ -495,7 +504,6 @@ PspGlyphComponentPrimaryResult psp_glyph_component_session_primary(
             (void) tilefinch_update_client_begin_download(session->client);
             break;
         case TILEFINCH_UPDATE_CLIENT_DOWNLOADED: {
-            deactivate_runtime(session, engine);
             size_t envelope_length = 0;
             const uint8_t *envelope = tilefinch_update_client_envelope(
                 session->client, &envelope_length);
@@ -511,6 +519,11 @@ PspGlyphComponentPrimaryResult psp_glyph_component_session_primary(
                     .install_root = paths->install_root,
                     .pack = session->operation_pack
                 });
+            if (session->installer != NULL) {
+                (void) tilefinch_glyph_component_install_snapshot(
+                    session->installer, &session->install_snapshot);
+                deactivate_runtime(session, engine);
+            }
             break;
         }
         default:
@@ -541,6 +554,7 @@ bool psp_glyph_component_session_pump_operation(
 {
     if (session == NULL) return false;
     if (session->installer != NULL) {
+        bool was_installing = installer_owns_runtime(session);
         (void) tilefinch_glyph_component_install_pump(
             session->installer, GLYPH_COMPONENT_IO_UNIT);
         (void) tilefinch_glyph_component_install_snapshot(
@@ -553,6 +567,12 @@ bool psp_glyph_component_session_pump_operation(
                    && tilefinch_glyph_component_install_activated(
                           session->installer)) {
             finish_activated_install(session, paths);
+        } else if (was_installing
+                   && !installer_owns_runtime(session)) {
+            /* Failed/cancelled staging did not replace the incumbent, but
+               it detached all packs too. Restore once after mutation ends,
+               retaining the terminal installer/error for UI and retry. */
+            session->reattach_pending = true;
         }
         return true;
     }
@@ -598,13 +618,16 @@ bool psp_glyph_component_session_remove(
     if (session == NULL || !psp_glyph_component_session_installed(
             session, pack) || psp_glyph_component_session_active(session))
         return false;
-    if ((session->attached_mask & pack_bit(pack)) != 0)
+    if ((session->attached_mask & pack_bit(pack)) != 0) {
         deactivate_runtime(session, engine);
-    bool removed = tilefinch_glyph_component_remove(paths, pack);
-    if (removed) {
-        clear_operation(session);
-        psp_glyph_component_session_probe(session, paths);
+        /* Removal detaches every pack, including the interface language.
+           Restore survivors after either outcome, not only after success. */
+        session->reattach_pending = true;
     }
+    bool removed = tilefinch_glyph_component_remove(paths, pack);
+    if (removed) clear_operation(session);
+    /* A failed write can still have changed the durable markers. */
+    psp_glyph_component_session_probe(session, paths);
     return removed;
 }
 

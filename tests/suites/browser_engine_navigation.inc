@@ -690,9 +690,11 @@ static int test_bounded_focus_pending_mutations_settle(void)
     char error[256] = {0};
     BrowserEngine *engine = browser_engine_create(&config, error,
                                                   sizeof(error));
-    CHECK(engine != NULL
-          && browser_engine_commit_html(engine, "https://bounded.test/",
-                                        page, used, true));
+    bool loaded = engine != NULL
+        && browser_engine_commit_html(engine, "https://bounded.test/", page, used, true);
+    if (!loaded) fprintf(stderr, "bounded pending: initial commit refused (%s)\n",
+        engine == NULL ? error : browser_engine_last_error(engine));
+    CHECK(loaded);
     NavigationSession *navigation = browser_engine_navigation(engine);
     CHECK(navigation->page.runtime != NULL);
 

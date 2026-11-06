@@ -586,43 +586,7 @@ static bool psp_media_create_playback_once(PspMediaSession *media,
  * page gives memory back one step at a time, least destructive first, and
  * the open is tried again after each (browser_engine_make_media_room).
  */
-static bool psp_media_create_playback(PspMediaSession *media,
-                                      uint64_t audio_start_us,
-                                      char *error, size_t error_size)
-{
-    unsigned room_stage = 0;
-    for (;;) {
-        if (psp_media_create_playback_once(
-                media, audio_start_us, error, error_size))
-            return true;
-        if (media->platform.make_room == NULL || room_stage >= 2u
-            || error == NULL || strstr(error, "exceeds budget") == NULL)
-            return false;
-        size_t working = media->use_swdec
-            ? media_psp_swdec_backend_last_working_set() : 0;
-        /* The playback record and its preallocated packet come after. */
-        size_t playback = PSP_MEDIA_MAXIMUM_PACKET_BYTES + 512u * KIB;
-        size_t needed = working == 0 ? 0
-            : working > SIZE_MAX - playback ? SIZE_MAX : working + playback;
-        /* The Budget can hold the bytes while the heap has no block for
-           one of them (the ring slots take the low blocks first, then the
-           playback packet finds none): free memory anyway, by stage. */
-        if (needed != 0 && budget_remaining(media->budget) >= needed)
-            needed = 0;
-        unsigned previous_stage = room_stage;
-        if (!media->platform.make_room(
-                media->platform.memory_context, needed, &room_stage)
-            || room_stage <= previous_stage)
-            return false;
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
-        printf("tilefinch-media: playback-room stage=%u needed=%u "
-               "remaining=%u after=\"%s\"\n",
-               room_stage, (unsigned) needed,
-               (unsigned) budget_remaining(media->budget), error);
-#endif
-        error[0] = '\0';
-    }
-}
+#include "psp_media_open_memory.inc"
 
 static bool psp_media_create_audio_http_range(
     PspMediaSession *media, char *error, size_t error_size)

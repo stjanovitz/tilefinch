@@ -5073,7 +5073,7 @@ int main(void) {
         self.assertNotIn("media->decoder_profile_idc = 100u", hls)
         playback = opened[
             opened.index("static bool psp_media_create_playback_once("):
-            opened.index("static bool psp_media_create_playback(")]
+            opened.index('#include "psp_media_open_memory.inc"')]
         self.assertIn("media_psp_backend_create_sources(", playback)
         self.assertIn("media_psp_swdec_backend_create_sources(", playback)
         self.assertIn("media_playback_create_sources(", playback)
@@ -5445,7 +5445,7 @@ int main(void) {
                           network.index("bool psp_connect_network(")):
             network.index("bool psp_ensure_network_for_navigation(")]
         self.assertLess(
-            shutdown.index("fetch_background_transport_request_quiesce("),
+            shutdown.index("psp_network_workers_request_quiesce("),
             shutdown.index("psp_network_shutdown_begin("))
         main = without_comments(
             (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
@@ -5458,7 +5458,7 @@ int main(void) {
         self.assertLess(transport_shutdown, network_shutdown)
         self.assertRegex(
             cleanup,
-            r"background_transport_stopped\s*&&\s*"
+            r"background_transport_stopped\s*&&\s*multiplayer_stopped\s*&&\s*"
             r"psp_network_lifecycle_started")
 
     def test_youtube_provider_moves_only_transport_to_worker(self):

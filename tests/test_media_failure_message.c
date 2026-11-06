@@ -351,6 +351,20 @@ static int test_response_kinds(void)
 
 int main(void)
 {
+    MediaFailureMessage allocation;
+    CHECK(media_failure_message("PSP aligned codec allocation failed", &allocation));
+    CHECK(allocation.kind == MEDIA_FAILURE_MEMORY
+        && allocation.detail == MEDIA_FAILURE_DETAIL_CLOSE_TABS);
+    CHECK(media_failure_message("PSP 240p codec working set exceeded page budget", &allocation));
+    CHECK(allocation.kind == MEDIA_FAILURE_MEMORY);
+    CHECK(media_failure_message("PSP backend state exceeded page budget", &allocation));
+    CHECK(allocation.kind == MEDIA_FAILURE_MEMORY);
+    CHECK(media_failure_message("PSP audio working set exceeded page budget", &allocation));
+    CHECK(allocation.kind == MEDIA_FAILURE_MEMORY);
+    CHECK(!media_failure_playback_memory(NULL));
+    CHECK(!media_failure_playback_memory("PSP AVC SPS geometry unsupported"));
+    CHECK(!media_failure_playback_memory("PSP codec teardown was quarantined; restart Tilefinch"));
+    CHECK(!media_failure_playback_memory("player: fetch failed: timed out"));
     if (test_response_kinds() != 0) return 1;
     if (test_failure_kinds() != 0) return 1;
     if (test_other_failures_unchanged() != 0) return 1;

@@ -775,9 +775,13 @@ static JSValue audio_slot_context_action(JSContext *ctx, JSValueConst self, int 
                                  "InvalidStateError");
         }
     } else if (op == 2 && !o->closed) {
+        double elapsed = audio_slot_clock_time(ctx, o);
         double v[] = {2};
-        bool published = o->engine_epoch != screen->epoch || audio_slot_emit(ctx, 2, 1, v, NULL, 0);
+        bool published = !JS_HasException(ctx)
+            && (o->engine_epoch != screen->epoch
+                || audio_slot_emit(ctx, 2, 1, v, NULL, 0));
         if (published && !JS_HasException(ctx)) {
+            o->elapsed = elapsed;
             o->closed = true;
             o->running = false;
             audio_slot_drop_active(ctx, o);

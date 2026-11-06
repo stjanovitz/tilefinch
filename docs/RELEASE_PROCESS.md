@@ -81,7 +81,8 @@ Before the next public squash/push, preserve the complete development history
 in the private backup. Keep raw browsing journeys and per-release development
 or maintenance journals in the private work area, not under `docs/engineering/`
 in the public tree. In particular, public commits must not contain
-`BROWSING_JOURNEYS.md`, `PERFORMANCE_LEDGER.md`, `MEMORY_EXPERIMENTS.md` or any
+`BROWSING_JOURNEYS.md`, `PERFORMANCE_LEDGER.md`, `MEMORY_EXPERIMENTS.md`,
+`STATE_MACHINES.md` or any
 `RELEASE_*_CHECKS.md` file. The ignore rules
 prevent ordinary staging, and the cut script rejects a prospective release if
 one was force-added.
@@ -94,7 +95,7 @@ conditions for revisiting rejected approaches; the ledgers themselves, local
 evidence paths, and internal branch references stay private
 ([AGENTS.md](../AGENTS.md#verification-discipline)). Ignored files are not
 included by an ordinary Git push, so copy both local ledgers into the private
-backup explicitly.
+backup explicitly, along with the private state-machine audit when present.
 
 An explicitly approved public-history cleanup must use an isolated mirror,
 preserve all original refs in the private archive, and verify every rewritten

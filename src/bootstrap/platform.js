@@ -5984,7 +5984,7 @@
             return;
           }
           if (++polls >= 300) { failed(); return; }
-          setTimeout(poll, 100);
+          __tilefinchRealmGlobal.__tilefinchScheduleTask(poll, 100);
         };
         image.addEventListener("load", loaded, { once: true });
         image.addEventListener("error", failed, { once: true });
@@ -9440,25 +9440,28 @@
     ]),
     schedulePerformanceObserver = (observer, state) => {
       if (state.pending || state.records.length === 0) return;
-      state.pending = true;
-      __tilefinchRealmGlobal.__tilefinchScheduleTask(() => {
-        state.pending = false;
-        if (!performanceObservers.has(observer) || state.records.length === 0)
-          return;
-        const records = state.records.splice(0),
-          entries = new PerformanceObserverEntryList(records);
-        try {
-          state.callback(entries, observer, {
-            droppedEntriesCount: state.dropped,
-          });
-        } catch (error) {
-          __tilefinchRealmGlobal.__tilefinchReportUncaught?.(
-            error,
-            "PerformanceObserver",
-          );
-        }
-        state.dropped = 0;
-      });
+      try {
+        state.pending = !!__tilefinchRealmGlobal.__tilefinchScheduleTask(() => {
+          state.pending = false;
+          if (!performanceObservers.has(observer) || state.records.length === 0)
+            return;
+          const records = state.records.splice(0),
+            entries = new PerformanceObserverEntryList(records);
+          try {
+            state.callback(entries, observer, {
+              droppedEntriesCount: state.dropped,
+            });
+          } catch (error) {
+            __tilefinchRealmGlobal.__tilefinchReportUncaught?.(
+              error,
+              "PerformanceObserver",
+            );
+          }
+          state.dropped = 0;
+        });
+      } finally {
+        if (!state.pending) __tilefinchTimerCapacity[4] |= 1 << 0;
+      }
     },
     notifyPerformanceObservers = (entry) => {
       for (const observer of performanceObservers) {
@@ -9952,6 +9955,10 @@
         for (const type of types) state.types.add(type);
       } else state.types = types;
       performanceObservers.add(this);
+      if (!__tilefinchTimerCapacity[0]) __tilefinchTimerCapacity[0] = () => {
+        for (const observer of performanceObservers)
+          schedulePerformanceObserver(observer, performanceObserverState.get(observer));
+      };
       if (hasType && options.buffered && types.has(requested[0])) {
         for (const entry of performanceEntries) {
           if (entry.entryType !== requested[0]) continue;

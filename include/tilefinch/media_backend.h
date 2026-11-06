@@ -1033,6 +1033,10 @@ void media_psp_me_pool_unclaim(void *block);
 /* Lower bound established by the bounded early-boot admission probe. This is
    diagnostic only: callers must not use it for allocation decisions. */
 size_t media_psp_backend_heap_capacity_lower_bound(void);
+/* Last firmware-backend open's allocation refusal, retained across cleanup.
+   Numeric-only diagnostics; does not probe, allocate or write a file. Cleared
+   by the next backend open. A 512-byte output fits every PSP record. */
+bool media_psp_backend_allocation_failure_report(char *output, size_t size);
 MediaPspPrepareResult media_psp_backend_prepare_pump(
     char *error, size_t error_size);
 bool media_psp_backend_create(

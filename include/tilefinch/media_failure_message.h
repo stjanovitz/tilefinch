@@ -121,6 +121,9 @@ MediaResponseKind media_response_kind(
 /* Classify an engine failure. Returns false (kind OTHER) when the text is
    not one of the kinds above. */
 bool media_failure_message(const char *failure, MediaFailureMessage *message);
+/* Only the open path's known allocation refusals, not network or format
+   failures. Shared by bounded memory rescue and the terminal explanation. */
+bool media_failure_playback_memory(const char *failure);
 /* The panel headline key of a kind, or NULL for MEDIA_FAILURE_OTHER. */
 const char *media_failure_headline(MediaFailureKind kind);
 /* The details-line key of a detail, or NULL for one that carries a code or

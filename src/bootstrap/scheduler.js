@@ -102,6 +102,25 @@
   const EMPTY_TIMER_ARGS = Object.freeze([]);
   const timerPool = [];
   let retryMessageDrains = () => {};
+  /* Browser-owned groups retain their own bounded pending state. A
+     refused timer is not a queued task: retry only when a slot is retired,
+     without creating another queue or enlarging the timer table. */
+  let retryingCapacity = false;
+  const retryTimerCapacity = () => {
+    if (retryingCapacity) return;
+    retryingCapacity = true;
+    try {
+      retryMessageDrains();
+      const ready = __tilefinchTimerCapacity[4];
+      __tilefinchTimerCapacity[4] = 0;
+      for (let slot = 0; slot < 5; slot++)
+        if ((ready & (1 << slot)) && __tilefinchTimerCapacity[slot === 4 ? 5 : slot]) try {
+          __tilefinchTimerCapacity[slot === 4 ? 5 : slot]();
+        } catch (error) {
+          __tilefinchReportUncaught(error, "deferred browser task");
+        }
+    } finally { retryingCapacity = false; }
+  };
   /* HTML timer delays use Web IDL `long` conversion before negative values
      are clamped. JavaScript's ToInt32 operator is the same modulo-2^32,
      truncate-toward-zero conversion and evaluates an author coercion once. */
@@ -122,18 +141,22 @@
       get: () => timers.length,
     });
   function schedule(callback, delay, repeat, args, kind = "timeout",
-                    reserved = false) {
+                    reserved = false, owner = 0) {
     if (typeof callback !== "function" ||
         timers.length >= (reserved ? reservedLimit : limit)) return 0;
     const id = nextId++;
     const timerAlgorithm = kind === "timeout" || kind === "interval",
-      parentNesting = timerAlgorithm && activeTimer?.timerAlgorithm
+      parentNesting = timerAlgorithm && activeTimer?.nesting > 0
         ? activeTimer.nesting : 0,
       nesting = timerAlgorithm ? parentNesting + 1 : 0,
-      requestedSpan = normalizeTimerDelay(delay),
+      requestedSpan = timerAlgorithm ? normalizeTimerDelay(delay)
+        : Math.max(0, Math.min(0xffffffff, Number(delay) || 0)),
       span = timerAlgorithm && parentNesting > 5
         ? Math.max(4, requestedSpan) : requestedSpan,
       registeredAt = currentSchedulerTime();
+    /* Delay coercion can run author code that fills the table. Recheck after
+       it returns rather than publishing a record beyond the bounded wheel. */
+    if (timers.length >= (reserved ? reservedLimit : limit)) return 0;
     const timer = timerPool.pop();
     if (timer) {
       timer.id = id;
@@ -143,14 +166,14 @@
       timer.repeat = repeat;
       timer.args = args;
       timer.kind = kind;
-      timer.timerAlgorithm = timerAlgorithm;
+      timer.owner = owner;
       timer.nesting = nesting;
       timer.requestedSpan = requestedSpan;
       insertTimer(timer);
     } else {
       insertTimer({
         id, callback, due: registeredAt + span, span, repeat, args, kind,
-        timerAlgorithm, nesting, requestedSpan,
+        owner, nesting, requestedSpan,
       });
     }
     return id;
@@ -158,23 +181,33 @@
   function releaseTimer(timer) {
     timer.callback = null;
     timer.args = EMPTY_TIMER_ARGS;
+    timer.owner = 0;
     if (timerPool.length < limit) timerPool.push(timer);
   }
-  function clear(id) {
+  /* 0 is private teardown; 1/2 identify Window timers/frames. A Worker's
+     existing timer set is its opaque author-timer owner token. Nesting > 0
+     already identifies HTML timer algorithms, so ownership replaces the old
+     redundant boolean rather than growing every pooled timer record. */
+  function clear(id, owner = 0) {
     const numericId = Number(id);
-    if (activeTimer && activeTimer.id === numericId) {
+    if (activeTimer && activeTimer.id === numericId
+        && (!owner || activeTimer.owner === owner)) {
       activeCancelAttempts++;
       if (activeTimer.repeat) {
         activeTimer.repeat = false;
         activeCancelHits++;
       }
-      return;
+      return true;
     }
-    const at = timers.findIndex((timer) => timer.id === numericId);
+    const at = timers.findIndex((timer) => timer.id === numericId
+        && (!owner || timer.owner === owner));
     if (at >= 0) {
       releaseTimer(timers.splice(at, 1)[0]);
       publishTimers();
+      retryTimerCapacity();
+      return true;
     }
+    return false;
   }
   const timerPriority = (timer) =>
     timer.kind === "animation-frame"
@@ -232,8 +265,13 @@
      redirected through author code. */
   __tilefinchRealmGlobal.__tilefinchScheduleTimeout = scheduleTimeout;
   __tilefinchRealmGlobal.__tilefinchScheduleInterval = scheduleInterval;
-  __tilefinchRealmGlobal.__tilefinchScheduleTask = (callback) =>
-    schedule(callback, 0, false, EMPTY_TIMER_ARGS, "platform-task");
+  __tilefinchRealmGlobal.__tilefinchScheduleTask = (callback, delay = 0) =>
+    schedule(callback, delay, false, EMPTY_TIMER_ARGS, "platform-task");
+  __tilefinchRealmGlobal.__tilefinchScheduleOwnedTimer =
+    (owner, callback, delay, repeat) => schedule(
+      callback, delay, repeat, EMPTY_TIMER_ARGS, repeat ? "interval" : "timeout", false, owner);
+  __tilefinchRealmGlobal.__tilefinchScheduleFrame = (callback) =>
+    schedule(callback, 16, false, EMPTY_TIMER_ARGS, "animation-frame");
   __tilefinchRealmGlobal.__tilefinchCancelTimer = clear;
   __tilefinchRealmGlobal.__tilefinchSchedulerTime = currentSchedulerTime;
   __tilefinchRealmGlobal.__tilefinchScheduleReservedTask = (callback, delay) =>
@@ -244,19 +282,19 @@
      match WebIDL (the optional timeout/handle arguments do not count), as
      page scripts and fingerprinting probes read both. */
   const setTimeout = (handler, timeout = 0, ...args) =>
-      schedule(handler, timeout, false, args, "timeout"),
+      schedule(handler, timeout, false, args, "timeout", false, 1),
     setInterval = (handler, timeout = 0, ...args) =>
-      schedule(handler, timeout, true, args, "interval"),
-    clearTimeout = (id = 0) => clear(id),
-    clearInterval = (id = 0) => clear(id),
+      schedule(handler, timeout, true, args, "interval", false, 1),
+    clearTimeout = (id = 0) => { clear(id, 1); },
+    clearInterval = (id = 0) => { clear(id, 1); },
     requestAnimationFrame = (callback) => {
       if (typeof callback !== "function")
         throw new TypeError("callback must be a function");
       /* The dispatcher invokes animation-frame callbacks with exactly one
          timestamp argument, so the author callback needs no adapter. */
-      return schedule(callback, 16, false, EMPTY_TIMER_ARGS, "animation-frame");
+      return schedule(callback, 16, false, EMPTY_TIMER_ARGS, "animation-frame", false, 2);
     },
-    cancelAnimationFrame = (handle) => clear(handle);
+    cancelAnimationFrame = (handle) => { clear(handle, 2); };
   __tilefinchRealmGlobal.setTimeout = setTimeout;
   __tilefinchRealmGlobal.setInterval = setInterval;
   __tilefinchRealmGlobal.clearTimeout = clearTimeout;
@@ -753,9 +791,9 @@
             start + (top - start) * progress,
           );
         apply(accepted, true, true);
-        if (frame < 12) requestAnimationFrame(step);
+        if (frame < 12) __tilefinchRealmGlobal.__tilefinchScheduleFrame(step);
       };
-      requestAnimationFrame(step);
+      __tilefinchRealmGlobal.__tilefinchScheduleFrame(step);
     };
     const scroll = (...args) => __tilefinchRealmGlobal.scrollTo(...args),
       scrollBy = (xOrOptions = undefined, y = undefined) => {
@@ -813,7 +851,7 @@
            Their task nesting therefore rises just like a timeout chain, and
            the same timeout/interval counter applies to combinations of both.
            Browser-internal timers never participate in this counter. */
-        if (timer.timerAlgorithm) {
+        if (timer.nesting > 0) {
           const parentNesting = timer.nesting;
           timer.nesting = parentNesting + 1;
           timer.span = parentNesting > 5
@@ -822,7 +860,7 @@
         timer.due = currentSchedulerTime() + timer.span;
         insertTimer(timer);
       } else releaseTimer(timer);
-      retryMessageDrains();
+      retryTimerCapacity();
     }
     return ran;
   };

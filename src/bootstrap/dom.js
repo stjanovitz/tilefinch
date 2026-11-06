@@ -2,8 +2,14 @@
    to every DOM/platform method. The public globalThis property stays writable;
    this binding is neither a property nor a privileged host capability. */
 const __tilefinchRealmGlobal = this;
+/* Fixed browser groups: Window performance, resize, Worker performance,
+   intersection, EventSource (slot 5); slot 4 is their deferred-work bitmask.
+   Register on first use
+   so unused observers do not add eager closures to small startup heaps. */
+const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
 (() => {
   const scriptForceAsync = __tilefinchRealmGlobal.__tilefinchScriptForceAsync,
+    observerMicrotask = __tilefinchRealmGlobal.__tilefinchEnqueueMicrotask,
     scriptAsyncAssigned = __tilefinchRealmGlobal.__tilefinchScriptAsyncAssigned,
     elementNonce = __tilefinchRealmGlobal.__tilefinchElementNonce,
     prepareDynamicSubtree = __tilefinchRealmGlobal.__tilefinchPrepareDynamicSubtree,
@@ -258,7 +264,7 @@ const __tilefinchRealmGlobal = this;
       return;
     }
     pendingElementScrolls = new Set([node]);
-    setTimeout(() => {
+    __tilefinchRealmGlobal.__tilefinchScheduleTask(() => {
       const pending = pendingElementScrolls;
       pendingElementScrolls = null;
       for (const target of pending) target.dispatchEvent(new Event("scroll"));
@@ -6478,13 +6484,13 @@ const __tilefinchRealmGlobal = this;
           state.lastLeft = this.scrollLeft;
           state.lastTop = this.scrollTop;
           if (state.frame < 12) {
-            requestAnimationFrame(step);
+            __tilefinchRealmGlobal.__tilefinchScheduleFrame(step);
           } else {
             smoothElementScrolls.delete(this);
             resolve();
           }
         };
-        requestAnimationFrame(step);
+        __tilefinchRealmGlobal.__tilefinchScheduleFrame(step);
       });
     },
     appendChild(child) {
@@ -7486,7 +7492,7 @@ const __tilefinchRealmGlobal = this;
         return state;
       };
     let resizeTargets = 0;
-    let resizeRecheckPending = false,
+    let resizeRecheckPending = false, resizeRecheckRefused = false,
       resizeDeliveryActive = false;
     class ResizeObserverSize {
       constructor(inlineSize, blockSize) {
@@ -7718,14 +7724,19 @@ const __tilefinchRealmGlobal = this;
         }
       },
       scheduleResizeRecheck = () => {
-        if (!observers.size) return false;
+        if (!observers.size) { resizeRecheckRefused = false; return false; }
         if (resizeDeliveryActive) return true;
         if (resizeRecheckPending) return true;
-        resizeRecheckPending = true;
         const schedule =
-          __tilefinchRealmGlobal.__tilefinchScheduleRenderObserver || queueMicrotask;
-        schedule(deliverResizeObservations);
-        return true;
+          __tilefinchRealmGlobal.__tilefinchScheduleRenderObserver || observerMicrotask;
+        resizeRecheckRefused = true;
+        try {
+          resizeRecheckPending = schedule(deliverResizeObservations) !== 0;
+          resizeRecheckRefused = !resizeRecheckPending;
+        } finally {
+          if (resizeRecheckRefused) __tilefinchTimerCapacity[4] |= 1 << 1;
+        }
+        return resizeRecheckPending;
       };
     __tilefinchRealmGlobal.__tilefinchResizeRecheck = scheduleResizeRecheck;
     __tilefinchRealmGlobal.ResizeObserverSize = ResizeObserverSize;
@@ -7774,6 +7785,9 @@ const __tilefinchRealmGlobal = this;
           throw error;
         }
         if (added) resizeTargets++;
+        if (!__tilefinchTimerCapacity[1]) __tilefinchTimerCapacity[1] = () => {
+          if (resizeRecheckRefused) scheduleResizeRecheck();
+        };
         scheduleResizeRecheck();
       }
       unobserve(target) {
@@ -7951,7 +7965,7 @@ const __tilefinchRealmGlobal = this;
     const scheduleDelivery = (observer) => {
       if (observer.pending || !observer.records.length) return;
       observer.pending = true;
-      queueMicrotask(() => {
+      observerMicrotask(() => {
         observer.pending = false;
         const entries = observer.takeRecords();
         if (!entries.length) return;
@@ -8014,29 +8028,40 @@ const __tilefinchRealmGlobal = this;
         !continuationQueued &&
         (freshAt < fresh.length || pass || passRequested)
       ) {
-        continuationQueued = true;
-        (__tilefinchRealmGlobal.__tilefinchScheduleRenderObserver || queueMicrotask)(
-          () => {
-            continuationQueued = false;
-            step();
-          },
-        );
+        queueContinuation();
       }
     };
+    let updateRetrySchedule = null, continuationRefused = false;
+    let continueStep, updateStep;
+    const queueContinuation = () => {
+        continueStep ||= () => { continuationQueued = false; step(); };
+        continuationRefused = true;
+        try {
+          continuationQueued = (
+            __tilefinchRealmGlobal.__tilefinchScheduleRenderObserver || observerMicrotask
+          )(continueStep) !== 0;
+          continuationRefused = !continuationQueued;
+        } finally {
+          if (continuationRefused) __tilefinchTimerCapacity[4] |= 1 << 3;
+        }
+      };
     const queueUpdate = (schedule) => {
       if (updateQueued) return;
-      updateQueued = true;
-      schedule(() => {
-        updateQueued = false;
-        step();
-      });
+      updateStep ||= () => { updateQueued = false; step(); };
+      updateRetrySchedule = schedule;
+      try {
+        updateQueued = schedule(updateStep) !== 0;
+        if (updateQueued) updateRetrySchedule = null;
+      } finally {
+        if (updateRetrySchedule) __tilefinchTimerCapacity[4] |= 1 << 3;
+      }
     };
     /* The update microtask is queued even with nothing observed, as the
        recheck always has been; recovery policies read a layout commit's
        pending checkpoint as the page still settling. */
     const requestPass = () => {
       if (active.size) passRequested = true;
-      queueUpdate(queueMicrotask);
+      queueUpdate(observerMicrotask);
     };
     __tilefinchRealmGlobal.__tilefinchIntersectionRecheck = () => {
       requestPass();
@@ -8077,6 +8102,10 @@ const __tilefinchRealmGlobal = this;
         if (!(target instanceof Element))
           throw new TypeError("Element required");
         hookScroll();
+        if (!__tilefinchTimerCapacity[3]) __tilefinchTimerCapacity[3] = () => {
+          if (updateRetrySchedule) queueUpdate(updateRetrySchedule);
+          if (continuationRefused) queueContinuation();
+        };
         if (this.targets.has(target)) return;
         if (registrations >= REGISTRATION_LIMIT)
           throw new RangeError("IntersectionObserver target limit reached");
@@ -8105,8 +8134,8 @@ const __tilefinchRealmGlobal = this;
          */
         queueUpdate(
           __tilefinchRealmGlobal.__tilefinchResizeRecheck?.() === true
-            ? __tilefinchRealmGlobal.__tilefinchScheduleRenderFixup || queueMicrotask
-            : queueMicrotask,
+            ? __tilefinchRealmGlobal.__tilefinchScheduleRenderFixup || observerMicrotask
+            : observerMicrotask,
         );
       }
       unobserve(target) {

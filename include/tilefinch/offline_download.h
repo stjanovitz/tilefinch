@@ -97,6 +97,7 @@ void offline_download_manager_set_cancel(
     void *opaque);
 void offline_download_manager_set_maximum_height(
     OfflineDownloadManager *manager, int maximum_height);
+/* Starting the incumbent id is idempotent; a different active id is refused. */
 bool offline_download_manager_start(
     OfflineDownloadManager *manager, uint32_t id);
 /* Starts the oldest queued item. Paused/failed items require an explicit

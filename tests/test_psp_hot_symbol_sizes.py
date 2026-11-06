@@ -56,6 +56,16 @@ ACCESS = ROOT / "cmake/CheckPspFrontendEngineAccess.cmake"
 # comment, a string or a validation-only unit stays uncounted; headers and
 # local aliases count.
 FIXTURE = {
+    "src/psp_tabs.c": r"""
+static int shared(const BrowserEngine *engine)
+{
+    const NavigationSession *nav = browser_engine_navigation_view(engine);
+    return nav->page.loaded;
+}
+""",
+    "include/tilefinch/psp_tabs.h": r"""
+int shared_declaration(const NavigationSession *navigation);
+""",
     "src/psp_script_main.c": r"""
 /* browser_engine_navigation(engine) and views->navigation->page in a
    comment, NavigationSession *old; navigation_current(x) */
@@ -97,6 +107,10 @@ class FrontendEngineAccessTests(unittest.TestCase):
         root = pathlib.Path(directory)
         (root / "src").mkdir()
         shutil.copy(ROOT / "src/psp_script_main.c", root / "src")
+        shutil.copy(ROOT / "src/psp_tabs.c", root / "src")
+        (root / "include/tilefinch").mkdir(parents=True)
+        shutil.copy(ROOT / "include/tilefinch/psp_tabs.h",
+                    root / "include/tilefinch")
         shutil.copytree(ROOT / "src/psp_app", root / "src/psp_app")
         return root
 
@@ -111,7 +125,7 @@ class FrontendEngineAccessTests(unittest.TestCase):
                 (root / name).parent.mkdir(parents=True, exist_ok=True)
                 (root / name).write_text(text)
             result = self.run_access(
-                root, "-DTILEFINCH_FRONTEND_ACCESS_EXPECT=2;3;1;2")
+                root, "-DTILEFINCH_FRONTEND_ACCESS_EXPECT=3;3;1;4")
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_a_read_through_a_new_alias_fails(self):

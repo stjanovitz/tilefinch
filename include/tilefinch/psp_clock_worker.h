@@ -17,6 +17,8 @@ typedef struct {
     atomic_uint last_transition_us;
     atomic_uint maximum_transition_us;
     bool started;
+    bool initialized;
+    bool joined;
 } PspClockWorker;
 
 typedef struct {
@@ -29,7 +31,10 @@ typedef struct {
     uint32_t maximum_transition_us;
 } PspClockWorkerSnapshot;
 
+/* Owner-thread operations. Storage is initially zeroed and must outlive all
+   retained firmware handles, including a failed start's cleanup. */
 bool psp_clock_worker_start(PspClockWorker *worker);
+bool psp_clock_worker_owns_resources(const PspClockWorker *worker);
 bool psp_clock_worker_request(
     PspClockWorker *worker, bool idle, uint64_t *request_us);
 bool psp_clock_worker_wait_applied(

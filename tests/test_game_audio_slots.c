@@ -410,11 +410,95 @@ static void run_oscillator_lane(bool native, OscillatorResult *result)
     end_case(&test);
 }
 
-int main(void)
+static void run_context_construction_lane(bool native)
+{
+    AudioCase test;
+    begin_case(&test, native);
+    evaluate(&test,
+        "(()=>{let refused=0;for(const C of [BaseAudioContext,class extends BaseAudioContext{}])"
+        "try{new C()}catch(e){if(e instanceof TypeError)refused++}"
+        "pocSummary=refused===2?'ABSTRACT':'EXTRA-CONTEXT'})()", "ABSTRACT");
+    evaluate(&test,
+        "globalThis.contextChild=class extends AudioContext{};"
+        "globalThis.contextInstance=new contextChild;let refused=false;"
+        "try{new AudioContext}catch(e){refused=e.name==='QuotaExceededError'}"
+        "pocSummary=refused&&contextInstance instanceof contextChild&&"
+        "contextInstance.state==='suspended'?'ONE-CONTEXT':'BAD-CONSTRUCTION'", "ONE-CONTEXT");
+    evaluate(&test, "contextInstance.close().then(()=>pocSummary='CLOSED')", "CLOSED");
+    end_case(&test);
+}
+
+static void run_context_clock_lane(bool native)
+{
+    AudioCase test;
+    begin_case(&test, native);
+    evaluate(&test,
+        "globalThis.clockTest={context:new AudioContext,changes:0};"
+        "clockTest.context.onstatechange=()=>clockTest.changes++;"
+        "document.getElementById('start').onclick=()=>clockTest.context.resume().then("
+        "()=>pocSummary='RUNNING');pocSummary='READY'", "READY");
+    activate(&test, "RUNNING");
+    CHECK(script_runtime_advance(test.runtime, 70, 4, &test.result));
+    evaluate(&test,
+        "clockTest.before=clockTest.context.currentTime;clockTest.context.close().then(()=>{"
+        "clockTest.frozen=clockTest.context.currentTime;pocSummary=clockTest.before>0&&"
+        "clockTest.frozen>=clockTest.before&&clockTest.context.state==='closed'"
+        "?'CLOCK-CLOSED':'CLOCK-REWOUND'})", "CLOCK-CLOSED");
+    CHECK(script_runtime_advance(test.runtime, 70, 4, &test.result));
+    evaluate(&test,
+        "Promise.all([clockTest.context.close(),clockTest.context.resume().then(()=>false,"
+        "e=>e.name==='InvalidStateError'),clockTest.context.suspend().then(()=>false,"
+        "e=>e.name==='InvalidStateError')]).then(results=>{pocSummary=results[1]&&results[2]&&"
+        "clockTest.changes===2&&clockTest.context.currentTime===clockTest.frozen"
+        "?'TERMINAL':'BAD-TERMINAL'})", "TERMINAL");
+    CHECK(test.runtime->game_audio == NULL);
+    end_case(&test);
+}
+
+static void run_closed_source_lane(bool native)
+{
+    AudioCase test;
+    begin_case(&test, native);
+    evaluate(&test,
+        "globalThis.closedTest={old:new AudioContext};"
+        "closedTest.source=closedTest.old.createOscillator();"
+        "closedTest.old.close().then(()=>{closedTest.context=new AudioContext;"
+        "document.getElementById('start').onclick=()=>closedTest.context.resume().then("
+        "()=>pocSummary='RUNNING');pocSummary='READY'})", "READY");
+    activate(&test, "RUNNING");
+    evaluate(&test,
+        "let refused=false;try{closedTest.source.start()}catch(e){"
+        "refused=e.name==='InvalidStateError'}closedTest.old.close().then(()=>{"
+        "pocSummary=refused&&closedTest.context.state==='running'"
+        "?'SOURCE-RETIRED':'STALE-SOURCE-STARTED'})", "SOURCE-RETIRED");
+    check_backend(&test, 0);
+    int16_t pcm[16];
+    memset(pcm, 0x55, sizeof(pcm));
+    CHECK(tilefinch_game_audio_mix(test.runtime->game_audio, pcm, 8));
+    for (size_t at = 0; at < 16u; at++) CHECK(pcm[at] == 0);
+    end_case(&test);
+}
+
+int main(int argc, char **argv)
 {
     AudioResult reference, native;
     OscillatorResult reference_oscillators, native_oscillators;
     script_runtime_configure_deterministic_replay(true, 17);
+    if (argc == 2) {
+        if (!strcmp(argv[1], "--constructors-reference"))
+            run_context_construction_lane(false);
+        else if (!strcmp(argv[1], "--clock-reference")) run_context_clock_lane(false);
+        else if (!strcmp(argv[1], "--clock-native")) run_context_clock_lane(true);
+        else if (!strcmp(argv[1], "--closed-source-reference")) run_closed_source_lane(false);
+        else return 2;
+        return 0;
+    }
+    run_context_construction_lane(false);
+    run_context_construction_lane(true);
+    run_context_clock_lane(false);
+    run_context_clock_lane(true);
+    run_closed_source_lane(false);
+    run_closed_source_lane(true);
     run_lane(false, &reference);
     run_lane(true, &native);
     run_oscillator_lane(false, &reference_oscillators);

@@ -237,6 +237,39 @@ static bool test_javascript_binary_responses(Budget *budget, unsigned port)
         fprintf(stderr, "XHR loading summary: %s\n", result.summary);
     CHECK(strcmp(result.summary, "xhr-loading-ok") == 0);
 
+    static const char xhr_abort_terminal_probe[] =
+        "(()=>{globalThis.pocSummary='pending';const checks=[],url="
+        "URL.createObjectURL(new Blob(['old-response'],{type:'text/plain'}));"
+        "const x=new XMLHttpRequest;x.open('GET',url,false);x.send();"
+        "checks.push(x.readyState===4,x.status===200,x.responseText==='old-response');"
+        "let terminalEvents=0;for(const n of ['readystatechange','abort','loadend'])"
+        "x.addEventListener(n,()=>terminalEvents++);x.abort();checks.push("
+        "x.readyState===0,x.status===0,x.responseURL==='',x.responseText==='',"
+        "x.getAllResponseHeaders()==='',terminalEvents===0);"
+        "const idle=new XMLHttpRequest;idle.open('GET',url);idle.abort();"
+        "checks.push(idle.readyState===1);"
+        "const active=new XMLHttpRequest,order=[];active.open('GET',url);"
+        "active.onreadystatechange=()=>order.push('state'+active.readyState);"
+        "active.onabort=()=>order.push('abort'+active.readyState);"
+        "active.onloadend=()=>order.push('end'+active.readyState);"
+        "active.onloadstart=()=>{active.abort();order.push('return'+active.readyState)};"
+        "active.send();checks.push(order.join(',')==='state4,abort4,end4,return0',"
+        "active.status===0,active.responseURL==='');"
+        "const reused=new XMLHttpRequest;let aborts=0,loads=0;"
+        "reused.onloadstart=()=>{if(!aborts)reused.abort()};"
+        "reused.onabort=()=>{aborts++;reused.open('GET',url);reused.send()};"
+        "reused.onload=()=>loads++;reused.onloadend=()=>{checks.push("
+        "aborts===1,loads===1,reused.status===200,reused.responseText==='old-response');"
+        "URL.revokeObjectURL(url);globalThis.pocSummary=checks.every(Boolean)?"
+        "'xhr-abort-terminal-ok':'xhr-abort-terminal-failed:'+checks.join(',')};"
+        "reused.open('GET',url);reused.send()})()";
+    CHECK(script_runtime_evaluate_diagnostic(runtime, xhr_abort_terminal_probe,
+                                            "<xhr-abort-terminal>", &result));
+    CHECK(pump_script_network(runtime, &result));
+    if (strcmp(result.summary, "xhr-abort-terminal-ok") != 0)
+        fprintf(stderr, "XHR abort terminal summary: %s\n", result.summary);
+    CHECK(strcmp(result.summary, "xhr-abort-terminal-ok") == 0);
+
     /* A promise run during progress can abort or reopen before DONE. The
        old synchronous response loop incorrectly fired the stale load first. */
     static const char xhr_checkpoint_cancel_probe[] =

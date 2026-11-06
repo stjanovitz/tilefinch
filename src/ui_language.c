@@ -1,4 +1,5 @@
 #include "tilefinch/ui_language.h"
+#include "tilefinch/ui_language_download.h"
 #include "tilefinch/sha256.h"
 #include "tilefinch/text_bidi.h"
 #include "tilefinch/platform.h"
@@ -148,6 +149,32 @@ bool tilefinch_ui_language_url(unsigned language, char *url, size_t capacity)
         "/" TILEFINCH_GLYPH_COMPONENT_REPOSITORY_NAME "/main/%s",
         spec->resource_key);
     return n > 0 && (size_t)n < capacity;
+}
+
+static bool translation_download_url_allowed(const char *url)
+{
+    if (url == NULL) return false;
+    char expected[256];
+    /* Only the build's pinned immutable resource keys, not an arbitrary
+       repository URL or a redirected host. Catalog SHA verification still
+       decides whether the selected language may be installed. */
+    for (unsigned language = 1; language < TILEFINCH_UI_LANGUAGE_COUNT; language++)
+        if (tilefinch_ui_language_url(language, expected, sizeof(expected))
+            && strcmp(url, expected) == 0) return true;
+    return false;
+}
+
+bool tilefinch_ui_language_request(
+    unsigned language, char *url, size_t capacity, FetchRequest *request)
+{
+    if (request == NULL || !tilefinch_ui_language_url(language, url, capacity))
+        return false;
+    *request = (FetchRequest) {
+        .method = "GET", .credentials = FETCH_CREDENTIALS_OMIT,
+        .page_redirect_mode = FETCH_PAGE_REDIRECT_ERROR,
+        .redirect_url_validator = translation_download_url_allowed
+    };
+    return true;
 }
 
 static TilefinchUiTranslation *translation_parse(

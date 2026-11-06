@@ -99,23 +99,26 @@ def key_hash(key):
     return value
 
 
-def hashed_catalog(code, rows, column):
-    """A TFUI2 catalog: its header line, the big-endian row count, the
-    rows' key hashes in increasing order, each key's byte length, then each
-    value ending in a line feed."""
-    ordered = sorted(rows, key=lambda row: key_hash(row[0]))
-    hashes = [key_hash(row[0]) for row in ordered]
+def prepare_key_table(rows):
+    """Prepare one catalog's language-independent key order and wire bytes."""
+    keyed = sorted((key_hash(row[0]), row) for row in rows)
+    hashes = [value for value, _ in keyed]
+    ordered = [row for _, row in keyed]
     if len(set(hashes)) != len(hashes):
-        collided = sorted(row[0] for row in ordered
-                          if hashes.count(key_hash(row[0])) > 1)
+        collided = sorted(row[0] for value, row in keyed if hashes.count(value) > 1)
         raise ValueError(f"English key hash collision: {collided}")
     lengths = [len(row[0].encode("utf-8")) for row in ordered]
     if any(not 0 < length <= KEY_LENGTH_LIMIT for length in lengths):
         raise ValueError("English key too long for its length byte")
-    return (f"TFUI2\t{code}\n".encode("ascii")
-            + len(ordered).to_bytes(2, "big")
+    return (ordered, len(ordered).to_bytes(2, "big")
             + b"".join(value.to_bytes(4, "big") for value in hashes)
-            + bytes(lengths)
+            + bytes(lengths))
+
+
+def hashed_catalog(code, rows, column, *, prepared=None):
+    """TFUI2 header, shared key table, and language-specific line values."""
+    ordered, keys = prepare_key_table(rows) if prepared is None else prepared
+    return (f"TFUI2\t{code}\n".encode("ascii") + keys
             + "".join(f"{row[column]}\n" for row in ordered).encode("utf-8"))
 
 
@@ -149,6 +152,7 @@ def outputs(resource_dir=None):
     active = {}
     for version, languages in CATALOGS:
         rows = read_rows(version, languages)
+        prepared = prepare_key_table(rows) if version >= HASHED_VERSION else None
         keys = {r[0].lower() for r in rows}
         retired = {key.lower() for key in RETIRED_KEYS.get(version, ())}
         if retired & keys:
@@ -162,7 +166,7 @@ def outputs(resource_dir=None):
             result[ROOT / f"translations/ui/v{version}/bengali-assamese.sequences"] = \
                 indic_sequences(labels, "bn")
         for column, (code, label, glyphs) in enumerate(languages, 1):
-            data = hashed_catalog(code, rows, column) \
+            data = hashed_catalog(code, rows, column, prepared=prepared) \
                 if version >= HASHED_VERSION else (f"TFUI1\t{code}\n" + "".join(
                     f"{r[0]}\t{r[column]}\n" for r in rows)).encode("utf-8")
             if len(data) > (BYTE_LIMIT if version >= 12 else 32768):

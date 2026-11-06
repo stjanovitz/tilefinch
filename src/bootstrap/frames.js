@@ -484,7 +484,7 @@ globalThis.__tilefinchInstallFrames = (support) => {
       normalizedTarget !== String(location.origin)
     )
       return;
-    setTimeout(
+    __tilefinchRealmGlobal.__tilefinchScheduleTask(
       () =>
         __tilefinchReceiveMessage(
           wire,

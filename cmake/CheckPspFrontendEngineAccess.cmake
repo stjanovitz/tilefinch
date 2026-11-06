@@ -23,7 +23,8 @@
 # declarations or the engine implementation.
 #
 # What is counted (2026-10-26, review TB-5): the shipping frontend, that is
-# src/psp_script_main.c and src/psp_app/*.c and *.h, without the units only
+# src/psp_script_main.c, the shared psp_tabs controller and its header,
+# and src/psp_app/*.c and *.h, without the units only
 # validation builds compile (TILEFINCH_PSP_VALIDATION_LOG in
 # TilefinchTargets.cmake), so moving a shipping read into a probe is not a
 # migration. Comments, string and character literals are stripped first.
@@ -51,6 +52,8 @@ set(frontend_validation_only_sources
 
 file(GLOB frontend_engine_candidates
     "${TILEFINCH_SOURCE_DIR}/src/psp_script_main.c"
+    "${TILEFINCH_SOURCE_DIR}/src/psp_tabs.c"
+    "${TILEFINCH_SOURCE_DIR}/include/tilefinch/psp_tabs.h"
     "${TILEFINCH_SOURCE_DIR}/src/psp_app/*.c"
     "${TILEFINCH_SOURCE_DIR}/src/psp_app/*.h")
 set(frontend_engine_sources)

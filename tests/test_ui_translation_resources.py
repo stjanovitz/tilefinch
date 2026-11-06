@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
@@ -13,6 +14,16 @@ import generate_ui_translations as generator
 
 
 class ResourceTests(unittest.TestCase):
+    def test_key_table_prepared_once_per_catalog(self):
+        rows = [["Back", "Volver", "Retour"], ["Save", "Guardar", "Enregistrer"]]
+        languages = (("es", "Spanish", "EMBEDDED"), ("fr", "French", "EMBEDDED"))
+        with mock.patch.object(generator, "CATALOGS", ((14, languages),)), \
+                mock.patch.object(generator, "read_rows", return_value=rows), \
+                mock.patch.object(generator, "key_hash", wraps=generator.key_hash) as hashed:
+            output = generator.outputs(ROOT / "_resource_identity_probe")
+        self.assertEqual(hashed.call_count, len(rows))
+        self.assertEqual(sum(path.suffix == ".tful" for path in output), len(languages))
+
     def test_published_resources_remain_immutable(self):
         resources = ROOT / "_resource_identity_probe"
         published = {

@@ -236,10 +236,14 @@ bool offline_download_manager_start(
     if (manager == NULL || manager->budget == NULL
         || manager->session == NULL || manager->library == NULL
         || !offline_library_load(manager->library)) return false;
+    /* Repeated Save resolves to the same library id. It acknowledges the
+       incumbent transfer, never resets its phase beneath an active request. */
+    if (manager->active_id != 0)
+        return id != 0 && manager->active_id == id;
     OfflineLibraryItem *item = offline_library_find_mutable(
         manager->library, id);
     if (item != NULL && item->type == OFFLINE_ITEM_FILE) {
-        if (manager->active_id != 0 || item->state == OFFLINE_ITEM_READY) return false;
+        if (item->state == OFFLINE_ITEM_READY) return false;
         /* The two formats share one transfer lane, not two retained network
            schedulers. Give an idle video lane back before admitting a file. */
         if (manager->scheduler != NULL) {
@@ -265,7 +269,6 @@ bool offline_download_manager_start(
     }
     if (item == NULL || item->type != OFFLINE_ITEM_YOUTUBE
         || item->state == OFFLINE_ITEM_READY) return false;
-    if (manager->active_id != 0 && manager->active_id != id) return false;
     if (manager->scheduler == NULL) {
         manager->scheduler = fetch_scheduler_create(
             manager->budget, 1, OFFLINE_DOWNLOAD_CHUNK_BYTES);

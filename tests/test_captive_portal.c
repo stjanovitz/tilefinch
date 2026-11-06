@@ -1,4 +1,5 @@
 #include "tilefinch/captive_portal.h"
+#include "tilefinch/browser_tabs.h"
 #include "tilefinch/content_security_policy.h"
 #include "tilefinch/fetch.h"
 #include "tilefinch/session.h"
@@ -15,8 +16,54 @@
     } \
 } while (0)
 
+static int test_portal_exit_preserves_ordinary_tabs(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * 1024u * 1024u);
+    CHECK(budget_install_lexbor(&budget));
+    NavigationSession navigation;
+    CHECK(navigation_init(&navigation, &budget, 8));
+    static const char html[] = "<!doctype html><title>Ordinary</title><p>Saved</p>";
+    CHECK(navigation_commit_html(&navigation, navigation_begin(&navigation),
+        "https://ordinary.example/first", html, sizeof(html) - 1u,
+        480, NULL, NULL, true));
+    BrowserTabs *tabs = browser_tabs_create(&budget, &navigation);
+    CHECK(tabs != NULL);
+    size_t second;
+    CHECK(browser_tabs_add(tabs, "https://ordinary.example/second", "Second", &second));
+    CHECK(browser_tabs_select(tabs, second));
+    /* The initial probe owns no tab; its zero-initialized indices cannot
+       authorize removal of tab zero or selection of a different tab. */
+    CHECK(tilefinch_captive_portal_restore_tabs(tabs,
+        PSP_CAPTIVE_PORTAL_PROBING, 0, 0));
+    CHECK(browser_tabs_count(tabs) == 2 && browser_tabs_active_index(tabs) == second);
+    CHECK(!strcmp(browser_tabs_tab(tabs, 0)->history[0].url,
+                  "https://ordinary.example/first"));
+    for (PspCaptivePortalPhase phase = PSP_CAPTIVE_PORTAL_OPENING;
+         phase <= PSP_CAPTIVE_PORTAL_RETURNING; phase++) {
+        size_t portal;
+        CHECK(browser_tabs_add(tabs, "http://portal.example/sign-in", "Temporary", &portal));
+        CHECK(navigation_commit_html(&navigation, navigation_begin(&navigation),
+            "http://portal.example/sign-in", html, sizeof(html) - 1u,
+            480, NULL, NULL, true));
+        /* This is the same capture gate used by controlled exit: the live
+           document still belongs to the retired ephemeral tab. */
+        bool capture = tilefinch_captive_portal_restore_tabs(tabs, phase, portal, second);
+        if (capture) CHECK(browser_tabs_capture_active(tabs, &navigation));
+        CHECK(!capture && browser_tabs_count(tabs) == 2
+              && browser_tabs_active_index(tabs) == second);
+        CHECK(!strcmp(browser_tabs_active(tabs)->history[0].url,
+                      "https://ordinary.example/second"));
+    }
+    browser_tabs_destroy(tabs);
+    navigation_destroy(&navigation);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 int main(void)
 {
+    CHECK(test_portal_exit_preserves_ordinary_tabs() == 0);
     TilefinchCaptiveProbeResponse response = {
         .status_code = 204, .transport_succeeded = true
     };

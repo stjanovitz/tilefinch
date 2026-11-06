@@ -167,6 +167,8 @@
     when = Number(when);
     if (!Number.isFinite(when) || when < 0) throw new TypeError(
       "Audio time must be a finite nonnegative number");
+    if (stateFor(context).closed) throw new DOMException(
+      "AudioContext is closed", "InvalidStateError");
     /* currentTime never decreases, so a time at or before the last value it
        returned is due now: the delay is exactly zero without another clock
        read. An envelope scheduled "now" otherwise samples the clock three
@@ -349,9 +351,11 @@
     }
   }
 
+  const contextToken = {};
   class BaseAudioContext extends EventTarget {
-    constructor() {
+    constructor(token) {
       super();
+      if (token !== contextToken) throw new TypeError("Illegal constructor");
       contextStates.set(this, { state: "suspended", closed: false,
         nodeCount: 0, runningStarted: 0, elapsed: 0, lastTime: 0,
         mixGraphRevision: 0 });
@@ -471,9 +475,13 @@
     close() {
       const state = stateFor(this);
       if (state.closed) return Promise.resolve();
+      const elapsed = state.elapsed + (state.state === "running"
+        ? (performance.now() - state.runningStarted) / 1000 : 0);
       nativeCommand(CLOSE);
+      for (const source of sourcesByVoice.values()) source._voice = 0;
       sourcesByVoice.clear();
       state.mixGraphRevision++;
+      state.elapsed = state.lastTime = elapsed;
       state.closed = true;
       state.state = "closed";
       if (activeContext === this) activeContext = null;
@@ -484,7 +492,7 @@
 
   class AudioContext extends BaseAudioContext {
     constructor() {
-      super();
+      super(contextToken);
       if (activeContext !== null) throw new DOMException(
         "Only one game AudioContext is available", "QuotaExceededError");
       activeContext = this;

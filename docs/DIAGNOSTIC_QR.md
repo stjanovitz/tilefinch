@@ -94,6 +94,49 @@ files. File names are logical basenames, not Memory Stick paths. Every segment
 has its own checksum; the decoder emits a file only after all of its segments
 are present, contiguous, non-overlapping, and verified.
 
+## Decoder allocation report
+
+If **Save error reports** is On, a failed aligned firmware-codec allocation
+adds a `media-allocation-v1` section to the ordinary last-error file and its
+Diagnostic QR export. Enable the setting before reproducing the failure.
+The section is a bounded numeric snapshot taken before failed-open cleanup:
+
+- `missing` identifies buffers that were required but not allocated.
+- `request`, `alignment` and `errno` describe the first refused heap fallback.
+  Zero `errno` means the allocator supplied no error code, not that it succeeded.
+- Heap `lower-bound` is the early boot probe's conservative result, not the
+  heap's maximum. `arena`, `free` and `top` are allocator observations, not a
+  promise that a new aligned block will fit. The top chunk is not necessarily
+  the largest free chunk.
+- Pool `bytes`, `used` and `flags` distinguish an absent pool (bit 0), a pool
+  claimed by the optional decoder (bit 1), quarantine (bit 2), and a pool
+  outside the Media Engine's addressable region (bit 3).
+- `devkit`, picture `size`, remaining page `budget`, and system free/largest
+  blocks help separate firmware layout, page pressure and allocator refusal.
+  System free memory is a different pool from the C heap and must not be
+  interpreted as the amount `memalign` could use.
+
+| Missing-mask bit | Buffer |
+|---|---|
+| 0 | MPEG workspace |
+| 1 | Media Engine DDR arena |
+| 2, 3 | Output surfaces 0, 1 |
+| 4 | Compressed-packet staging |
+| 5 | Video access-unit control |
+| 6 | SPS/PPS parameter sets |
+| 7 | Audio codec control |
+| 8 | Audio PCM |
+| 9 | Audio output queue |
+| 10 | Compressed-audio staging |
+| 11 | Pending compressed audio |
+
+No new memory probe, per-frame tracing or file write occurs for this section.
+The extra fields contain no addresses, media contents, URLs or credentials.
+The surrounding general error report can include the failing page URL and
+error text; review those before posting publicly. Never attach saved-login,
+cookie or session files. The separate sign-in-only report below intentionally
+excludes general error logs.
+
 ## YouTube sign-in report
 
 **Menu → Settings → Device & storage → YouTube sign-in diagnostics** is a

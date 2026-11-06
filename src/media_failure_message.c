@@ -375,6 +375,15 @@ static bool failure_stream_unavailable(const char *failure)
             || strstr(failure, "(HTTP 410)") != NULL);
 }
 
+bool media_failure_playback_memory(const char *failure)
+{
+    return failure != NULL
+        && (strstr(failure, "exceeds budget") != NULL
+            || (strncmp(failure, "PSP ", 4u) == 0
+                && strstr(failure, "exceeded page budget") != NULL)
+            || strcmp(failure, "PSP aligned codec allocation failed") == 0);
+}
+
 bool media_failure_message(const char *failure, MediaFailureMessage *message)
 {
     if (message == NULL) return false;
@@ -389,6 +398,10 @@ bool media_failure_message(const char *failure, MediaFailureMessage *message)
     } else if (failure_decoder_start(
                    failure, &detail, message->code, sizeof(message->code))) {
         message->kind = MEDIA_FAILURE_DECODER_NOT_STARTED;
+    } else if (media_failure_playback_memory(failure)) {
+        message->kind = MEDIA_FAILURE_MEMORY;
+        detail = MEDIA_FAILURE_DETAIL_CLOSE_TABS;
+        snprintf(message->code, sizeof(message->code), "%s", "codec memory");
     } else if (failure_format(failure, &detail)) {
         message->kind = MEDIA_FAILURE_FORMAT_UNSUPPORTED;
     } else if (failure_playability(

@@ -1069,6 +1069,7 @@
         if (state.writeLocks.get(name) === this) state.writeLocks.delete(name);
       }
       this._lockedStores = [];
+      finishIDBClose(this.db);
       queueMicrotask(() => runTransactionQueue(state));
     }
   }
@@ -1536,6 +1537,21 @@
     resume();
   };
 
+  const finishIDBClose = (database) => {
+    if (!database._closed) return;
+    const state = database._state;
+    if (state.upgrading && state.upgrading.db === database) return;
+    for (const transaction of state.activeTransactions)
+      if (transaction.db === database) return;
+    for (const transaction of state.transactionQueue)
+      if (transaction.db === database && transaction._state !== "finished")
+        return;
+    /* close() refuses new work immediately, but accepted transactions keep
+       the connection blocking an upgrade until their ownership is retired. */
+    state.connections.delete(database);
+    resumeBlockedDatabaseOpen(state);
+  };
+
   class IDBDatabase extends TilefinchIDBEventTarget {
     constructor(state) {
       super();
@@ -1627,8 +1643,7 @@
     close() {
       if (this._closed) return;
       this._closed = true;
-      this._state.connections.delete(this);
-      resumeBlockedDatabaseOpen(this._state);
+      finishIDBClose(this);
     }
   }
   const forceCloseIDBDatabase = (database) => {
@@ -1704,15 +1719,12 @@
           }
           if (requested > state.version && state.connections.size) {
             for (const existing of [...state.connections])
-              existing._dispatch("versionchange", {
-                oldVersion: state.version,
-                newVersion: requested,
-              });
+              if (!existing._closed)
+                existing._dispatch("versionchange", {
+                  oldVersion: state.version,
+                  newVersion: requested,
+                });
             if (state.connections.size) {
-              request._dispatch("blocked", {
-                oldVersion: state.version,
-                newVersion: requested,
-              });
               state.blockedOpen = () => {
                 if (!scheduleDatabaseTask(performOpen)) {
                   failIDBRequest(request, fail(
@@ -1722,6 +1734,11 @@
                   finishOpen(false);
                 }
               };
+              /* A blocked listener may close the final connection inline. */
+              request._dispatch("blocked", {
+                oldVersion: state.version,
+                newVersion: requested,
+              });
               return;
             }
           }
@@ -1749,7 +1766,13 @@
               connection.version = requested;
               connection._upgradeTransaction = null;
               setIDBRequestTransaction(request, null);
-              succeedIDBRequest(request, connection, true);
+              if (connection._closed) {
+                resetIDBRequest(request);
+                failIDBRequest(request,
+                  fail("Database connection was closed", "AbortError"));
+              } else {
+                succeedIDBRequest(request, connection, true);
+              }
               finishOpen(false);
             });
             transaction.addEventListener("abort", () => {
@@ -1853,7 +1876,8 @@
     enumerable: false,
     writable: false,
     value(database) {
-      if (!(database instanceof IDBDatabase) || database._closed) return false;
+      if (!(database instanceof IDBDatabase)
+          || !database._state.connections.has(database)) return false;
       const state = database._state,
         cancellation = fail("Worker is terminated", "AbortError");
       if (state.upgrading && state.upgrading.db === database)

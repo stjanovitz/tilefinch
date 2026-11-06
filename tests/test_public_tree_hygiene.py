@@ -8,11 +8,13 @@ import sys
 
 
 PRIVATE_EXACT_PATHS = {
+    "docs/STATE_MACHINES.md",
     "docs/engineering/BROWSING_JOURNEYS.md",
     "docs/engineering/PERFORMANCE_LEDGER.md",
     "docs/engineering/MEMORY_EXPERIMENTS.md",
 }
 IGNORE_RULES = {
+    "/docs/STATE_MACHINES.md",
     "/.private-investigations/",
     "/docs/engineering/BROWSING_JOURNEYS.md",
     "/docs/engineering/PERFORMANCE_LEDGER.md",
@@ -29,7 +31,7 @@ PUBLIC_SUMMARIES = (
 # path, so no comment or link points at a document a clone cannot contain.
 PRIVATE_LEDGER_NAME = re.compile(
     r"(?<!\.private-investigations/)"
-    r"\b(?:BROWSING_JOURNEYS|PERFORMANCE_LEDGER|MEMORY_EXPERIMENTS)\b"
+    r"\b(?:BROWSING_JOURNEYS|PERFORMANCE_LEDGER|MEMORY_EXPERIMENTS|STATE_MACHINES)\b"
 )
 # Files that must spell the old public names: the ignore rules, the release
 # rule that forbids them, and this test.
@@ -47,7 +49,7 @@ PRIVATE_REFERENCE = re.compile(
 def tracked_paths(root: Path) -> list[str]:
     result = subprocess.run(
         ["git", "-C", str(root), "ls-files", "-z", "--", "docs/engineering",
-         ".private-investigations"],
+         ".private-investigations", *sorted(PRIVATE_EXACT_PATHS)],
         check=True,
         capture_output=True,
     )
@@ -85,7 +87,8 @@ def private_ledger_references(root: Path) -> list[str]:
             continue
         if "PERFORMANCE_LEDGER" not in text \
                 and "MEMORY_EXPERIMENTS" not in text \
-                and "BROWSING_JOURNEYS" not in text:
+                and "BROWSING_JOURNEYS" not in text \
+                and "STATE_MACHINES" not in text:
             continue
         for number, line in enumerate(text.splitlines(), 1):
             if PRIVATE_LEDGER_NAME.search(line):
@@ -121,6 +124,8 @@ def main() -> int:
             for path in (root / ".private-investigations").rglob("*")
             if path.is_file()
         )
+        tracked.extend(path for path in PRIVATE_EXACT_PATHS
+                       if (root / path).is_file())
     rejected = []
     for path in tracked:
         private = (

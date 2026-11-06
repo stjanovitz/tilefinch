@@ -396,7 +396,7 @@
     /* Only a broken reservation refuses; the next request retries. */
     effectFramePending = !!(typeof reserved === "function"
       ? reserved(runEffectFrame)
-      : requestAnimationFrame(runEffectFrame));
+      : __tilefinchRealmGlobal.__tilefinchScheduleFrame(runEffectFrame));
   };
   /* The frame visits the effects that were active when it began. Transition
      events run author handlers in the middle of it, and one may cancel or

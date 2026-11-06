@@ -6,6 +6,7 @@
 #include "tilefinch/budget.h"
 #include "tilefinch/document.h"
 #include "tilefinch/js_runtime.h"
+#include "tilefinch/session.h"
 
 #include <stdbool.h>
 #include <stdio.h>
@@ -1604,9 +1605,104 @@ static int test_init_events_and_token_list(void)
     return 0;
 }
 
-int main(void)
+static int test_writable_terminal_handoffs(void)
+{
+    puts("test: writable stream abort, queued work, and in-flight close handoffs");
+    static const char probe[] =
+        "(async()=>{const failures=[],expect=(name,ok)=>{if(!ok){failures.push(name);"
+        "globalThis.pocSummary='FAIL '+failures.join(' | ')}};const "
+        "out=p=>p.then(()=>true,e=>e),defer=()=>{let resolve,reject;const promise="
+        "new Promise((a,b)=>{resolve=a;reject=b});return {promise,resolve,reject}};"
+        "{const start=defer(),reason={},calls=[],s=new WritableStream({start(){"
+        "return start.promise},write(){calls.push('write')},close(){calls.push('close')},"
+        "abort(r){calls.push(r===reason?'abort':'wrong')}}),w=s.getWriter(),closed="
+        "out(w.closed),write=out(w.write('queued')),close=out(w.close()),a=w.abort(reason),"
+        "b=w.abort({});expect('same abort promise',a===b);expect('wait for start',"
+        "calls.length===0);start.resolve();expect('abort queued write',await write===reason);"
+        "expect('abort queued close',await close===reason);expect('abort completion',"
+        "await out(a)===true&&await closed===reason);await w.abort({});expect('single abort',"
+        "calls.join()==='abort');expect('stored abort error',await out(w.write('late'))===reason)}"
+        "{const started=defer(),finish=defer(),calls=[],reason={},s=new WritableStream({"
+        "write(v){calls.push(v);started.resolve();return finish.promise.then(()=>calls.push('end'))},"
+        "abort(){calls.push('abort')}}),w=s.getWriter(),closed=out(w.closed),first="
+        "out(w.write('first')),second=out(w.write('second')),close=out(w.close());await "
+        "started.promise;const a=w.abort(reason);expect('wait for in-flight write',"
+        "calls.join()==='first');finish.resolve();expect('in-flight write completes',"
+        "await first===true);expect('queued work rejected',await second===reason&&"
+        "await close===reason);await a;expect('serialized abort',calls.join()==='first,end,abort'"
+        "&&await closed===reason)}"
+        "for(const fail of [false,true]){const started=defer(),finish=defer(),reason={},"
+        "closeError={},calls=[],s=new WritableStream({close(){started.resolve();return "
+        "finish.promise},abort(){calls.push('abort')}}),w=s.getWriter(),closed=out(w.closed),"
+        "close=out(w.close());await started.promise;const abort=out(w.abort(reason));"
+        "if(fail)finish.reject(closeError);else finish.resolve();expect('in-flight close result',"
+        "await close===(fail?closeError:true));expect('in-flight close abort result',"
+        "await abort===(fail?closeError:true));expect('in-flight close terminal result',"
+        "await closed===(fail?reason:true));expect('no abort during close',calls.length===0)}"
+        "{const start=defer(),reason={},s=new WritableStream({start(){return start.promise}}),"
+        "w=s.getWriter(),closed=out(w.closed),write=out(w.write('x')),close=out(w.close());"
+        "start.reject(reason);expect('start rejection',await write===reason&&await close===reason"
+        "&&await closed===reason);expect('terminal abort is no-op',await out(w.abort({}))===true);"
+        "expect('stored start error',await out(w.write('late'))===reason)}"
+        "{const reason={},sinkError={},s=new WritableStream({abort(){throw sinkError}}),"
+        "w=s.getWriter(),closed=out(w.closed);expect('abort rejection',await out(w.abort(reason))"
+        "===sinkError&&await closed===reason)}"
+        "{const root=await navigator.storage.getDirectory(),file=await root.getFileHandle("
+        "'task-refusal.txt',{create:true});for(const close of [false,true]){const stream="
+        "await file.createWritable(),owner=stream.getWriter(),closed=out(owner.closed),ids=[];"
+        "for(let i=0;i<256;i++){const id=setTimeout(()=>{},60000);if(!id)break;ids.push(id)}"
+        "expect('bounded timer fixture',ids.length>0&&ids.length<256);const error=await out("
+        "close?owner.close():owner.write('discard'));for(const id of ids)clearTimeout(id);"
+        "expect('writer task refuses safely',error.name==='QuotaExceededError'&&await closed"
+        "===error);const retry=await file.createWritable();await retry.abort();expect('refused "
+        "writer preserves file',(await file.getFile()).size===0)}}"
+        "{const root=await navigator.storage.getDirectory(),file=await root.getFileHandle("
+        "'handoff.txt',{create:true}),initial=await file.createWritable();await initial.write("
+        "'keep');await initial.close();const failed=await file.createWritable({keepExistingData:"
+        "true}),owner=failed.getWriter(),closed=out(owner.closed);"
+        "await owner.write('discard');const error=await out(owner.write("
+        "{type:'write'}));expect('file write rejects',error instanceof TypeError);await closed;"
+        "const next=await file.createWritable({keepExistingData:true});await owner.abort();"
+        "const locked=await out(file.createWritable());expect('old abort preserves new lock',"
+        "locked.name==='NoModificationAllowedError');await next.abort();expect('failed file "
+        "write rolls back',await(await file.getFile()).text()==='keep')}"
+        "globalThis.pocSummary=failures.length?'FAIL '+failures.join(' | '):'WRITABLE-OK'"
+        "})().catch(e=>globalThis.pocSummary='UNEXPECTED '+String(e));";
+    static const char page[] = "<!doctype html><title>Stream lifecycle</title>";
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    CHECK(document_parse(&document, &budget, page, sizeof(page) - 1u, 17));
+    BrowserSession session;
+    CHECK(browser_session_init(&session, &budget, 64u * 1024u));
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_deferred(
+        &document, &budget, 8u * MIB, 3000,
+        "https://conformance.test/streams", &session, &result);
+    CHECK(runtime != NULL);
+    bool ran = script_runtime_evaluate_diagnostic(
+        runtime, probe, "<writable-handoffs>", &result);
+    /* The cases intentionally exceed one bounded microtask checkpoint.
+       Continue the real owner loop rather than weakening its job limit. */
+    for (unsigned turn = 0; ran && turn < 64u
+         && strcmp(result.summary, "WRITABLE-OK") != 0; turn++)
+        ran = script_runtime_advance(runtime, 1u, 8u, &result);
+    bool ok = ran && result.success && !strcmp(result.summary, "WRITABLE-OK");
+    if (!ok) fprintf(stderr, "writable handoffs: ran=%d summary=%s error=%s\n",
+                     ran, result.summary, result.error);
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    browser_session_destroy(&session);
+    CHECK(ok && budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+int main(int argc, char **argv)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
+    if (argc == 2 && !strcmp(argv[1], "--writable-only"))
+        return test_writable_terminal_handoffs();
     int failures = 0;
     failures += test_time_zone_agreement();
     failures += test_function_shapes();
@@ -1618,6 +1714,7 @@ int main(void)
     failures += test_handler_form_members_and_unscopables();
     failures += test_platform_methods_present_as_native();
     failures += test_init_events_and_token_list();
+    failures += test_writable_terminal_handoffs();
     if (failures != 0) return 1;
     puts("web conformance tests passed");
     return 0;

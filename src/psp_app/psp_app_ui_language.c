@@ -1,4 +1,5 @@
 #include "psp_app_internal.h"
+#include "tilefinch/ui_language_download.h"
 
 /* The glyphs the interface language needs, attached beside (never instead
    of) the page glyph selection. */
@@ -149,16 +150,15 @@ bool psp_ui_language_handle_frame(PspApp *app, const PspUiIntent *intent, uint64
             return language_font_ready(app, now_us);
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
         char url[256];
+        FetchRequest request;
         if (strcmp(app->process->config.trace, "none") == 0
             && app->process->install_paths.slotted
-            && tilefinch_ui_language_url(language, url, sizeof(url))
+            && tilefinch_ui_language_request(language, url, sizeof(url), &request)
             && psp_ensure_network_for_navigation(app->network, app->network_lifecycle,
                 (int)app->process->config.network_profile, "GET", url, false,
                 app->views->frame, ui)) {
             browser->ui_language_download = budget_malloc(browser->budget, TILEFINCH_UI_TRANSLATION_BYTES);
             if (browser->ui_language_download) {
-                FetchRequest request = {.method="GET", .credentials=FETCH_CREDENTIALS_OMIT,
-                    .page_redirect_mode=FETCH_PAGE_REDIRECT_ERROR};
                 browser->ui_language_request = fetch_background_transport_enqueue(url, &request,
                     TILEFINCH_UI_TRANSLATION_BYTES, 20000);
             }

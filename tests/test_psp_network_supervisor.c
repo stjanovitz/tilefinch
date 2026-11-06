@@ -365,6 +365,55 @@ static bool test_offline_module_ownership(void)
     return true;
 }
 
+static bool test_off_and_suspend_retain_refused_module_ownership(void)
+{
+    PspNetworkSnapshot resident = snapshot_for(PSP_NETWORK_STACK_MODULES_ONLY, 0);
+    for (unsigned kind = PSP_NETWORK_TARGET_OFF; kind <= PSP_NETWORK_TARGET_SUSPEND; kind++) {
+        if (kind == PSP_NETWORK_TARGET_READY) continue;
+        PspNetworkSupervisor machine = psp_network_supervisor_initial();
+        CHECK(apply(&machine, snapshot_for(PSP_NETWORK_STACK_NONE, 0),
+            (PspNetworkSupervisorEvent) {.type = PSP_NETWORK_EVENT_TARGET_CHANGED,
+             .target = target(PSP_NETWORK_TARGET_READY,
+                 PSP_NETWORK_TARGET_CAUSE_NAVIGATION, 1)}));
+        CHECK(apply(&machine, resident, (PspNetworkSupervisorEvent) {
+            .type = PSP_NETWORK_EVENT_TARGET_CHANGED,
+            .target = target((PspNetworkTargetKind) kind,
+                PSP_NETWORK_TARGET_CAUSE_SUSPEND, 0)}));
+        CHECK(apply(&machine, resident, (PspNetworkSupervisorEvent) {
+            .type = PSP_NETWORK_EVENT_ADMISSION_STOPPED}));
+        CHECK(apply(&machine, resident, (PspNetworkSupervisorEvent) {
+            .type = PSP_NETWORK_EVENT_APCTL_DISCONNECTED}));
+        /* The real shutdown ladder returns this snapshot after a utility
+           module refuses unload. Services are gone; code ownership is not. */
+        CHECK(apply(&machine, resident, (PspNetworkSupervisorEvent) {
+            .type = PSP_NETWORK_EVENT_UNWOUND}));
+        CHECK(machine.state == (kind == PSP_NETWORK_TARGET_OFF
+                  ? PSP_NETWORK_SUPERVISOR_OFF : PSP_NETWORK_SUPERVISOR_SUSPENDED_OFF)
+              && machine.stack == PSP_NETWORK_STACK_MODULES_ONLY
+              && !machine.admission_open);
+        PspNetworkSupervisor retained = machine;
+        CHECK(apply(&machine, resident, (PspNetworkSupervisorEvent) {
+            .type = PSP_NETWORK_EVENT_TARGET_CHANGED,
+            .target = target(PSP_NETWORK_TARGET_OFF, PSP_NETWORK_TARGET_CAUSE_SHUTDOWN, 0)}));
+        CHECK(machine.state == PSP_NETWORK_SUPERVISOR_STOPPING);
+        CHECK(apply(&machine, resident, (PspNetworkSupervisorEvent) {
+            .type = PSP_NETWORK_EVENT_ADMISSION_STOPPED}));
+        CHECK(apply(&machine, resident, (PspNetworkSupervisorEvent) {
+            .type = PSP_NETWORK_EVENT_APCTL_DISCONNECTED}));
+        CHECK(apply(&machine, snapshot_for(PSP_NETWORK_STACK_NONE, 0),
+            (PspNetworkSupervisorEvent) {.type = PSP_NETWORK_EVENT_UNWOUND}));
+        CHECK(machine.state == PSP_NETWORK_SUPERVISOR_OFF
+              && machine.stack == PSP_NETWORK_STACK_NONE);
+        CHECK(apply(&retained, resident, (PspNetworkSupervisorEvent) {
+            .type = PSP_NETWORK_EVENT_TARGET_CHANGED,
+            .target = target(PSP_NETWORK_TARGET_READY, PSP_NETWORK_TARGET_CAUSE_NAVIGATION, 1)}));
+        CHECK(retained.state == PSP_NETWORK_SUPERVISOR_STARTING
+              && retained.stack == PSP_NETWORK_STACK_MODULES_ONLY
+              && !retained.admission_open);
+    }
+    return true;
+}
+
 static PspNetworkSupervisor canonical_machine(
     PspNetworkSupervisorState state)
 {
@@ -444,6 +493,7 @@ static bool test_demand_scaled_pump_policy(void)
 
 int main(void)
 {
+    if (!test_off_and_suspend_retain_refused_module_ownership()) return 1;
     PspNetwork report = {0};
     char text[4096];
     psp_network_diagnostics_enable(false);

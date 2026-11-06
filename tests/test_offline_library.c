@@ -101,6 +101,10 @@ int main(void)
     OfflineDownloadManager download;
     offline_download_manager_init(&download, &budget, &session, &library);
     CHECK(offline_download_manager_start(&download, video_id));
+    CHECK(offline_download_manager_start(&download, video_id)
+          && download.phase == OFFLINE_DOWNLOAD_RESOLVE);
+    CHECK(!offline_download_manager_start(&download, article_id)
+          && download.active_id == video_id);
     snprintf(stream.media_url, sizeof(stream.media_url),
              "https://r1---sn-test.googlevideo.com/videoplayback?clen=17");
     snprintf(stream.audio_url, sizeof(stream.audio_url),
@@ -110,6 +114,22 @@ int main(void)
               TILEFINCH_TEST_SOURCE_DIR "/fixtures/offline-download",
               trace_error, sizeof(trace_error))
           && offline_download_manager_adopt_resolved(&download, &stream));
+    /* Saving an already downloading video reuses its library id. Repeating
+       that action must not rewind the active lane into resolution. */
+    CHECK(offline_download_manager_pump(&download));
+    FILE *active_output = download.output;
+    uint64_t active_request = download.request_id;
+    CHECK(download.phase == OFFLINE_DOWNLOAD_VIDEO && active_request != 0);
+    uint32_t repeated_id = 0;
+    CHECK(offline_library_enqueue_youtube(
+              &library, "https://www.youtube.com/watch?v=TFTEST00001",
+              "Fixture video", &repeated_id, error, sizeof(error))
+          && repeated_id == video_id && library.count == 2);
+    CHECK(offline_download_manager_start(&download, repeated_id));
+    CHECK(download.phase == OFFLINE_DOWNLOAD_VIDEO
+          && download.output == active_output
+          && download.request_id == active_request
+          && download.part_total == stream.content_length);
     OfflineDownloadSnapshot snapshot = {0};
     CHECK(offline_download_manager_snapshot(
               &download, video_id, &snapshot)

@@ -1,8 +1,28 @@
 #include "tilefinch/captive_portal.h"
+#include "tilefinch/browser_tabs.h"
 
 #include <ctype.h>
 #include <string.h>
 #include <strings.h>
+
+bool tilefinch_captive_portal_restore_tabs(
+    BrowserTabs *tabs, PspCaptivePortalPhase phase,
+    size_t portal_tab, size_t previous_tab)
+{
+    /* Probing has not created or selected an ephemeral tab. Its indices
+       are not owners, even though a zero index names an ordinary tab. */
+    if (phase == PSP_CAPTIVE_PORTAL_PROBING) return true;
+    if (phase < PSP_CAPTIVE_PORTAL_OPENING
+        || phase > PSP_CAPTIVE_PORTAL_RETURNING) return false;
+    if (portal_tab < browser_tabs_count(tabs))
+        (void) browser_tabs_remove(tabs, portal_tab);
+    if (previous_tab < browser_tabs_count(tabs))
+        (void) browser_tabs_select(tabs, previous_tab);
+    /* The retained ordinary snapshot was captured before portal entry.
+       The live document may still be the portal or its closing placeholder,
+       so neither session capture nor recovery may replace that snapshot. */
+    return false;
+}
 
 static bool content_type_html(const char *value)
 {

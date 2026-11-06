@@ -40,7 +40,7 @@ typedef struct {
     bool offer_install_pending;
     /* The offer's confirmation is waiting for the signed size. */
     bool offer_size_pending;
-    /* An install completed and detached the runtime packs; see
+    /* An install or removal retired after detaching the runtime packs; see
        psp_glyph_component_session_reattach(). */
     bool reattach_pending;
 } PspGlyphComponentSession;
@@ -108,11 +108,12 @@ bool psp_glyph_component_session_pump_operation(
     const TilefinchInstallPaths *paths, BrowserEngine *engine);
 bool psp_glyph_component_session_active(
     const PspGlyphComponentSession *session);
-/* After a completed install (menu or in-page offer): put back the selected
+/* After a retired install (menu or in-page offer) or removal: put back the selected
    language and emoji packs the install detached, then attach installed
    packs for script_mask (the page's scripts) through the lazy path, so the
-   page can redraw without a restart. False when no install completed since
-   the last call. */
+   page can redraw without a restart. Failure/cancellation restores the
+   incumbent without erasing the install error. False while mutation is
+   active or when no restoration is pending. */
 bool psp_glyph_component_session_reattach(
     PspGlyphComponentSession *session, Budget *budget,
     const TilefinchInstallPaths *paths, BrowserGlyphLanguage language,

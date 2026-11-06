@@ -18,15 +18,16 @@ typedef enum {
 } PspLifecycleAction;
 
 /*
- * The two notice counters and presentation gate are callback-thread state.
- * Everything else is owned by the main browser thread. A counter rather than
+ * Notice and presentation epochs are atomic cross-thread state. Everything
+ * else is owned by the main browser thread. A counter rather than
  * a boolean keeps a second suspend cycle from disappearing while the first is
  * being recovered.
  */
 typedef struct {
     atomic_uint suspend_epoch;
     atomic_uint resume_epoch;
-    atomic_bool presentation_allowed;
+    /* Epoch whose recovery completed; a newer suspend immediately blocks it. */
+    atomic_uint presentation_epoch;
     unsigned handled_suspend_epoch;
     unsigned handled_resume_epoch;
     unsigned quiesce_count;

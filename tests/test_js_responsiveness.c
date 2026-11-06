@@ -8020,8 +8020,94 @@ static int test_large_blob_worker(void)
     return 0;
 }
 
+static int test_indexeddb_close_pending_upgrade(void)
+{
+    Budget budget; budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = host_state_runtime(&budget, &document, &result);
+    CHECK(runtime != NULL);
+    static const char probe[] =
+        "(async()=>{const request=r=>new Promise((ok,no)=>{r.onsuccess=()=>"
+        "ok(r.result);r.onerror=()=>no(r.error)}),name='close-pending-upgrade',"
+        "first=indexedDB.open(name,1);first.onupgradeneeded=()=>first.result."
+        "createObjectStore('items');const db=await request(first),events=[];"
+        "db.onversionchange=()=>events.push('unexpected-versionchange');"
+        "const tx=db.transaction('items','readwrite');"
+        "tx.oncomplete=()=>events.push('complete');"
+        "tx.objectStore('items').put('saved',1);db.close();let refused=false;"
+        "try{db.transaction('items')}catch(e){refused=e.name==='InvalidStateError'}"
+        "const second=indexedDB.open(name,2);second.onblocked=()=>events.push('blocked');"
+        "second.onupgradeneeded=()=>events.push('upgrade');"
+        "const next=await request(second),read=next.transaction('items'),"
+        "value=await request(read.objectStore('items').get(1));"
+        "await new Promise(ok=>read.oncomplete=ok);next.close();"
+        "await request(indexedDB.deleteDatabase(name));"
+        "if(!refused||value!=='saved'||events.join(',')!=='blocked,complete,upgrade')"
+        "throw Error('active:'+events.join(','));"
+        "for(const abort of [false,true]){const start=indexedDB.open(name,1);"
+        "start.onupgradeneeded=()=>start.result.createObjectStore('items');"
+        "const owner=await request(start),order=[],first=owner.transaction('items','readwrite'),"
+        "put=first.objectStore('items').put('first',1),queued=owner.transaction('items','readwrite');"
+        "queued.objectStore('items').put('queued',2);"
+        "first.oncomplete=()=>order.push('complete');first.onabort=()=>order.push('abort');"
+        "if(abort)put.onsuccess=()=>first.abort();queued.oncomplete=()=>order.push('queued');"
+        "owner.close();owner.close();const upgrade=indexedDB.open(name,2);"
+        "upgrade.onblocked=()=>order.push('blocked');upgrade.onupgradeneeded=()=>order.push('upgrade');"
+        "const reopened=await request(upgrade),read=reopened.transaction('items'),"
+        "all=await request(read.objectStore('items').getAll());"
+        "await new Promise(ok=>read.oncomplete=ok);reopened.close();"
+        "await request(indexedDB.deleteDatabase(name));"
+        "if(order.length!==4||order.slice(0,2).sort().join(',')!=="
+        "(abort?'abort,blocked':'blocked,complete')||order.slice(2).join(',')!=='queued,upgrade'"
+        "||all.join(',')!==(abort?'queued':'first,queued'))throw Error('queue:'+order.join(','))}"
+        "const retained=indexedDB.open(name,1);retained.onupgradeneeded=()=>"
+        "retained.result.createObjectStore('items');const held=await request(retained),"
+        "blocked=indexedDB.open(name,2);let notified=0;"
+        "blocked.onblocked=()=>{notified++;held.close()};"
+        "const released=await request(blocked);released.close();"
+        "await request(indexedDB.deleteDatabase(name));"
+        "const closing=indexedDB.open(name,1);closing.onupgradeneeded=()=>{"
+        "closing.result.createObjectStore('items');closing.result.close()};"
+        "let closedError=false;try{await request(closing)}catch(e){closedError=e.name==='AbortError'}"
+        "if(!closedError)throw Error('closed-upgrade-success');"
+        "const final=await request(indexedDB.open(name,1));"
+        "if(!final.objectStoreNames.contains('items'))throw Error('lost-upgrade');"
+        "final.close();await request(indexedDB.deleteDatabase(name));"
+        "const workerName='close-pending-worker',source=URL.createObjectURL(new Blob(["
+        "`const r=indexedDB.open('close-pending-worker',1);r.onupgradeneeded=()=>"
+        "r.result.createObjectStore('items');r.onsuccess=()=>{const db=r.result,"
+        "tx=db.transaction('items','readwrite');tx.objectStore('items').put('stale',1);"
+        "db.close();postMessage('closing')}`])),worker=new Worker(source);"
+        "await new Promise((ok,no)=>{worker.onmessage=ok;worker.onerror=no});"
+        "worker.terminate();URL.revokeObjectURL(source);"
+        "const afterWorker=await request(indexedDB.open(workerName,1)),"
+        "workerRead=afterWorker.transaction('items'),"
+        "stale=await request(workerRead.objectStore('items').get(1));"
+        "await new Promise(ok=>workerRead.oncomplete=ok);afterWorker.close();"
+        "await request(indexedDB.deleteDatabase(workerName));"
+        "if(stale!==undefined)throw Error('terminated-worker-commit');"
+        "pocSummary=notified===1?'IDB-CLOSE-OK':'IDB-CLOSE-FAILED:blocked-handler'"
+        "})().catch(e=>"
+        "pocSummary='IDB-CLOSE-ERROR:'+e.name+':'+e.message)";
+    CHECK(script_runtime_evaluate_diagnostic(runtime, probe, "<idb-close-pending>", &result));
+    for (unsigned tick = 0; tick < 32 && strncmp(result.summary, "IDB-CLOSE-", 10); tick++)
+        CHECK(script_runtime_advance(runtime, 0, 1024, &result));
+    if (strcmp(result.summary, "IDB-CLOSE-OK"))
+        fprintf(stderr, "IDB close pending: %s %s\n", result.summary, result.error);
+    CHECK(!strcmp(result.summary, "IDB-CLOSE-OK"));
+    CHECK(result.indexed_db_records == 0 && result.indexed_db_bytes == 0);
+    script_runtime_destroy(runtime); document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--idb-close-only") == 0)
+        return test_indexeddb_close_pending_upgrade();
+    CHECK(test_indexeddb_close_pending_upgrade() == 0);
     if (argc == 2 && strcmp(argv[1], "--profile-abandon-only") == 0)
         return test_refused_context_frees_profile();
     if (argc == 2 && strcmp(argv[1], "--component-stack-only") == 0)

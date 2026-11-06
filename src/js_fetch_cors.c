@@ -1851,10 +1851,19 @@ void js_rt_event_sources_destroy(DomBridge *bridge)
     }
 }
 
-static bool script_call_global(ScriptRuntime *runtime, const char *name,
-                               int argc, JSValueConst *argv)
+bool js_rt_network_call_global(ScriptRuntime *runtime, const char *name,
+                              int argc, JSValueConst *argv)
 {
+    /* Current deliveries have at most nine arguments. A refused JS value is
+       an exception sentinel, never an argument author code may observe. */
+    if (runtime == NULL || name == NULL || argc < 0 || argc > 9
+        || (argc != 0 && argv == NULL)) return false;
     JSContext *context = runtime->context;
+    for (int i = 0; i < argc; i++) {
+        if (!JS_IsException(argv[i])) continue;
+        js_rt_record_exception(context, &runtime->result);
+        return false;
+    }
     JSValue global = JS_GetGlobalObject(context);
     if (JS_IsException(global)) {
         js_rt_record_exception(context, &runtime->result);
@@ -1908,7 +1917,7 @@ bool js_rt_event_sources_deliver(ScriptRuntime *runtime,
                     : JS_NewStringLen(runtime->context, text, text_length),
                 JS_NewString(runtime->context, source->response_origin)
             };
-            bool delivered = script_call_global(
+            bool delivered = js_rt_network_call_global(
                 runtime, "__tilefinchDeliverEventSource", 4,
                 arguments);
             for (size_t value = 0; value < 4; value++) {
@@ -1947,7 +1956,7 @@ bool js_rt_event_sources_deliver(ScriptRuntime *runtime,
             JS_NewString(runtime->context, success ? "" : error),
             JS_NewString(runtime->context, source->response_origin)
         };
-        bool delivered = script_call_global(
+        bool delivered = js_rt_network_call_global(
             runtime, "__tilefinchDeliverEventSource", 4, arguments);
         for (size_t value = 0; value < 4; value++) {
             JS_FreeValue(runtime->context, arguments[value]);
@@ -2139,6 +2148,68 @@ size_t js_rt_websockets_abort(DomBridge *bridge)
     return aborted;
 }
 
+bool js_rt_websocket_deliver_event(
+    ScriptRuntime *runtime, size_t slot, const FetchWebSocketEvent *event)
+{
+    if (runtime == NULL || event == NULL || slot >= SCRIPT_WEBSOCKET_LIMIT)
+        return false;
+    DomBridge *bridge = &runtime->bridge;
+    ScriptWebSocket *socket = &bridge->websockets[slot];
+    if (!socket->active || bridge->websocket_event_scratch == NULL
+        || event->length > FETCH_WEBSOCKET_MESSAGE_LIMIT)
+        return false;
+    const char *kind = "close";
+    if (event->kind == FETCH_WEBSOCKET_EVENT_OPEN) kind = "open";
+    else if (event->kind == FETCH_WEBSOCKET_EVENT_MESSAGE_TEXT) kind = "text";
+    else if (event->kind == FETCH_WEBSOCKET_EVENT_MESSAGE_BINARY) kind = "binary";
+    else if (event->kind == FETCH_WEBSOCKET_EVENT_DRAIN) kind = "drain";
+    JSValue payload = JS_UNDEFINED;
+    if (event->kind == FETCH_WEBSOCKET_EVENT_MESSAGE_TEXT
+        || event->kind == FETCH_WEBSOCKET_EVENT_MESSAGE_BINARY) {
+        payload = JS_NewArrayBufferCopy(
+            runtime->context, bridge->websocket_event_scratch, event->length);
+    } else if (event->kind == FETCH_WEBSOCKET_EVENT_DRAIN) {
+        payload = JS_NewInt64(runtime->context, (int64_t) event->sent_bytes);
+    }
+    if (JS_IsException(payload)) {
+        (void) fetch_background_websocket_cancel(socket->id);
+        *socket = (ScriptWebSocket) {0};
+        if (bridge->websocket_count != 0) bridge->websocket_count--;
+        return false;
+    }
+    JSValue arguments[6] = {
+        JS_NewInt64(runtime->context, (int64_t) socket->id),
+        JS_NewString(runtime->context, kind),
+        payload,
+        event->kind == FETCH_WEBSOCKET_EVENT_OPEN
+            ? JS_NewString(runtime->context, event->protocol)
+            : JS_NewStringLen(runtime->context, event->reason, event->reason_length),
+        JS_NewInt32(runtime->context, (int32_t) event->close_code),
+        JS_NewBool(runtime->context, event->was_clean)
+    };
+    if (event->kind == FETCH_WEBSOCKET_EVENT_CLOSE) {
+        /* The transport already retired this ID. Release its bridge quota
+           before onclose can open a replacement; never clear this slot again
+           after author code may have reused it. Keep scratch until that code
+           has finished, since the replacement may share it. */
+        *socket = (ScriptWebSocket) {0};
+        if (bridge->websocket_count != 0) bridge->websocket_count--;
+        if (bridge->result != NULL) {
+            bridge->result->async_network_completed++;
+            if (!event->was_clean) bridge->result->network_failures++;
+        }
+    }
+    bool delivered = js_rt_network_call_global(
+        runtime, "__tilefinchDeliverWebSocket", 6, arguments);
+    for (size_t value = 0; value < 6; value++)
+        JS_FreeValue(runtime->context, arguments[value]);
+    if (bridge->websocket_count == 0) {
+        budget_free(bridge->budget, bridge->websocket_event_scratch);
+        bridge->websocket_event_scratch = NULL;
+    }
+    return delivered;
+}
+
 bool js_rt_websockets_deliver(ScriptRuntime *runtime,
                               size_t completion_budget,
                               size_t *author_tasks)
@@ -2153,60 +2224,9 @@ bool js_rt_websockets_deliver(ScriptRuntime *runtime,
         if (!fetch_background_websocket_take_event(
                 socket->id, bridge->websocket_event_scratch,
                 FETCH_WEBSOCKET_MESSAGE_LIMIT, &event)) continue;
-        const char *kind = "close";
-        if (event.kind == FETCH_WEBSOCKET_EVENT_OPEN) kind = "open";
-        else if (event.kind == FETCH_WEBSOCKET_EVENT_MESSAGE_TEXT)
-            kind = "text";
-        else if (event.kind == FETCH_WEBSOCKET_EVENT_MESSAGE_BINARY)
-            kind = "binary";
-        else if (event.kind == FETCH_WEBSOCKET_EVENT_DRAIN) kind = "drain";
-        JSValue payload = JS_UNDEFINED;
-        if (event.kind == FETCH_WEBSOCKET_EVENT_MESSAGE_TEXT
-            || event.kind == FETCH_WEBSOCKET_EVENT_MESSAGE_BINARY) {
-            payload = JS_NewArrayBufferCopy(
-                runtime->context, bridge->websocket_event_scratch,
-                event.length);
-        } else if (event.kind == FETCH_WEBSOCKET_EVENT_DRAIN) {
-            payload = JS_NewInt64(
-                runtime->context, (int64_t) event.sent_bytes);
-        }
-        if (JS_IsException(payload)) {
-            (void) fetch_background_websocket_cancel(socket->id);
-            *socket = (ScriptWebSocket) {0};
-            if (bridge->websocket_count != 0) bridge->websocket_count--;
-            return false;
-        }
-        JSValue arguments[6] = {
-            JS_NewInt64(runtime->context, (int64_t) socket->id),
-            JS_NewString(runtime->context, kind),
-            payload,
-            event.kind == FETCH_WEBSOCKET_EVENT_OPEN
-                ? JS_NewString(runtime->context, event.protocol)
-                : JS_NewStringLen(runtime->context, event.reason,
-                                  event.reason_length),
-            JS_NewInt32(runtime->context, (int32_t) event.close_code),
-            JS_NewBool(runtime->context, event.was_clean)
-        };
-        bool delivered = script_call_global(
-            runtime, "__tilefinchDeliverWebSocket", 6, arguments);
-        for (size_t value = 0; value < 6; value++)
-            JS_FreeValue(runtime->context, arguments[value]);
-        if (event.kind == FETCH_WEBSOCKET_EVENT_CLOSE) {
-            *socket = (ScriptWebSocket) {0};
-            if (bridge->websocket_count != 0) bridge->websocket_count--;
-            if (bridge->websocket_count == 0) {
-                budget_free(
-                    bridge->budget, bridge->websocket_event_scratch);
-                bridge->websocket_event_scratch = NULL;
-            }
-            if (bridge->result != NULL) {
-                bridge->result->async_network_completed++;
-                if (!event.was_clean) bridge->result->network_failures++;
-            }
-        }
-        if (!delivered) return false;
-        if (author_tasks != NULL) (*author_tasks)++;
-        return true;
+        bool delivered = js_rt_websocket_deliver_event(runtime, i, &event);
+        if (delivered && author_tasks != NULL) (*author_tasks)++;
+        return delivered;
     }
     return true;
 }
@@ -2445,18 +2465,22 @@ bool js_rt_multiplayer_deliver(ScriptRuntime *runtime,
         JS_NewString(runtime->context, event.invite_code),
         JS_NewString(runtime->context, event.peer_name)
     };
-    bool delivered = script_call_global(
-        runtime, "__tilefinchDeliverMultiplayer", 9, arguments);
-    for (size_t at = 0; at < 9u; at++)
-        JS_FreeValue(runtime->context, arguments[at]);
     if (event.kind == TILEFINCH_MULTIPLAYER_EVENT_CLOSE) {
+        /* take_event has released registry ownership. Let a close handler
+           acquire its successor, and never erase that new record afterward. */
         bridge->multiplayer = (ScriptMultiplayer) {0};
-        budget_free(bridge->budget, bridge->multiplayer_event_scratch);
-        bridge->multiplayer_event_scratch = NULL;
         if (bridge->result != NULL) {
             bridge->result->async_network_completed++;
             if (!event.clean) bridge->result->network_failures++;
         }
+    }
+    bool delivered = js_rt_network_call_global(
+        runtime, "__tilefinchDeliverMultiplayer", 9, arguments);
+    for (size_t at = 0; at < 9u; at++)
+        JS_FreeValue(runtime->context, arguments[at]);
+    if (!bridge->multiplayer.active) {
+        budget_free(bridge->budget, bridge->multiplayer_event_scratch);
+        bridge->multiplayer_event_scratch = NULL;
     }
     if (!delivered) return false;
     if (author_tasks != NULL) (*author_tasks)++;
@@ -3898,8 +3922,10 @@ static const JsRtNative fetch_cors_natives[] = {
       js_fetch_async, 16, JS_RT_NATIVE_TEST_OVERRIDABLE },
     { "__tilefinchCancelNetwork",
       js_fetch_cancel, 2, JS_RT_NATIVE_TEST_OVERRIDABLE },
-    { "__tilefinchEventSourceStart", js_event_source_start, 3, 0 },
-    { "__tilefinchEventSourceClose", js_event_source_close, 1, 0 },
+    { "__tilefinchEventSourceStart",
+      js_event_source_start, 3, JS_RT_NATIVE_TEST_OVERRIDABLE },
+    { "__tilefinchEventSourceClose",
+      js_event_source_close, 1, JS_RT_NATIVE_TEST_OVERRIDABLE },
     { "__tilefinchWebSocketStart",
       js_websocket_start, 2, JS_RT_NATIVE_TEST_OVERRIDABLE },
     { "__tilefinchWebSocketSend",
