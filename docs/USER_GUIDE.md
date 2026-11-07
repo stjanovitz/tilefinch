@@ -2,7 +2,7 @@
 
 This guide is for PSP owners. It covers everyday use beyond the basics in the
 [README](../README.md): tabs, bookmarks and history, typing, finding text,
-Reader mode and Basic view, saving and downloads, video and YouTube, language
+text size and page zoom, Reader mode and Basic view, saving and downloads, video and YouTube, language
 packs, games and page controls, screenshots, what happens when a page will
 not load, faster revisits, and the per-site controls. The button map is in
 the README's [Controls](../README.md#controls) table.
@@ -53,6 +53,30 @@ have turned history on.
 D-pad Up/Down then move between highlighted matches (hold to repeat), L/R
 scroll the page, Cross or Start edits the term, and Circle closes Find.
 Find highlights at most 256 matches.
+
+## Text size and page zoom
+
+Two rows in **Menu → Settings → Appearance** fit more of a page on the
+screen. Press Left or Right on a row to change it.
+
+- **Web pages** sets the size of page text: 60%, 70%, 80%, 100% (the
+  default), 125% or 150%. Smaller text fits more words on each line. A page
+  that sets its text in exact pixel sizes keeps those sizes, and very small
+  text stops shrinking at a minimum size. Latin text stays readable at 60%;
+  Japanese, Chinese and Korean text and the language-pack scripts are
+  clearer at 80% or more.
+- **Page zoom** draws the whole page smaller or larger: 50%, 67%, 75%, 80%,
+  90%, 100% (the default), 110%, 125% or 150%. At 75% a phone-sized page is
+  laid out as if the screen were wider, so more of it fits, with smaller text
+  and pictures; above 100% it is drawn larger. A page made for a desktop
+  screen is already shrunk to fit, so zooming out leaves it as it is until
+  50%, and zooming in keeps it fitting the screen width.
+
+The open page follows a Page zoom change a moment after you stop pressing,
+and every page you open afterwards uses it. If there is not enough memory,
+the page keeps its zoom and the status line shows **PAGE ZOOM UNAVAILABLE**.
+Reader mode and Basic view are not zoomed; there the text-size row, named
+**Extracted text**, sizes their text.
 
 ## Website fonts
 

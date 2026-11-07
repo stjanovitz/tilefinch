@@ -41,6 +41,7 @@ bool viewport_context_resolve(ViewportContext *viewport,
                                   device_height)) return false;
     viewport->declared = mobile.declared;
     viewport->device_width_declared = mobile.device_width;
+    viewport->fixed_width_declared = mobile.fixed_width;
     viewport->scale_numerator = mobile.scale_numerator;
     viewport->scale_denominator = mobile.scale_denominator;
     return true;
@@ -96,4 +97,62 @@ int viewport_max_scroll_css(const ViewportContext *viewport,
 {
     if (viewport == NULL || content_height <= viewport->css_height) return 0;
     return content_height - viewport->css_height;
+}
+
+const unsigned viewport_page_zoom_steps[VIEWPORT_PAGE_ZOOM_STEP_COUNT] = {
+    50u, 67u, 75u, 80u, 90u, 100u, 110u, 125u, 150u
+};
+
+bool viewport_page_zoom_valid(unsigned percent)
+{
+    for (size_t i = 0; i < VIEWPORT_PAGE_ZOOM_STEP_COUNT; i++)
+        if (viewport_page_zoom_steps[i] == percent) return true;
+    return false;
+}
+
+unsigned viewport_page_zoom_step(unsigned percent, int direction)
+{
+    size_t index = 0;
+    while (index < VIEWPORT_PAGE_ZOOM_STEP_COUNT
+           && viewport_page_zoom_steps[index] != percent) index++;
+    if (index == VIEWPORT_PAGE_ZOOM_STEP_COUNT) {
+        index = 0;
+        while (viewport_page_zoom_steps[index] != VIEWPORT_PAGE_ZOOM_DEFAULT)
+            index++;
+    }
+    if (direction < 0)
+        index = index == 0 ? VIEWPORT_PAGE_ZOOM_STEP_COUNT - 1u : index - 1u;
+    else if (direction > 0)
+        index = index + 1u == VIEWPORT_PAGE_ZOOM_STEP_COUNT ? 0u : index + 1u;
+    return viewport_page_zoom_steps[index];
+}
+
+bool viewport_apply_page_zoom(ViewportContext *viewport, unsigned percent)
+{
+    if (viewport == NULL || !viewport_page_zoom_valid(percent)
+        || viewport->device_width <= 0 || viewport->device_height <= 0
+        || viewport->css_width <= 0) return false;
+    if (percent == VIEWPORT_PAGE_ZOOM_DEFAULT) return true;
+    int device_width = viewport->device_width;
+    /* Rounded to the nearest pixel; the steps keep this at most twice the
+       device width, no wider than the legacy desktop viewport. */
+    int zoomed = (int) (((uint64_t) device_width * 100u + percent / 2u)
+                        / percent);
+    int width = viewport->css_width;
+    int next = width;
+    if (percent < VIEWPORT_PAGE_ZOOM_DEFAULT) {
+        if (zoomed > width) next = zoomed;
+    } else if (width == device_width && !viewport->fixed_width_declared) {
+        next = zoomed;
+    }
+    if (next == width) return true;
+    uint64_t css_height = ((uint64_t) viewport->device_height
+                           * (uint64_t) next + (uint64_t) device_width - 1u)
+                          / (uint64_t) device_width;
+    if (css_height == 0 || css_height > INT32_MAX) return false;
+    viewport->css_width = next;
+    viewport->css_height = (int) css_height;
+    viewport->scale_numerator = device_width;
+    viewport->scale_denominator = next;
+    return true;
 }

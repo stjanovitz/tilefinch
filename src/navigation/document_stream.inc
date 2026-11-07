@@ -607,17 +607,36 @@ static bool navigation_scan_document_referrer_policy(
     return document_referrer_policy(document, policy, policy, 128);
 }
 
-static void navigation_apply_declared_viewport(
-    NavigationSession *session, int device_width, int device_height)
+static unsigned navigation_page_zoom(const NavigationSession *session)
 {
-    if (session == NULL || session->declared_css_width <= 0
-        || session->declared_css_height <= 0) return;
-    ViewportContext declared;
-    if (viewport_context_init(&declared, session->declared_css_width,
-                              session->declared_css_height,
-                              device_width, device_height)) {
-        session->viewport = declared;
+    return session == NULL || session->page_zoom_percent == 0u
+        ? VIEWPORT_PAGE_ZOOM_DEFAULT : session->page_zoom_percent;
+}
+
+/* The page's layout viewport: its own metadata (or the 980px legacy width),
+   then the user's page zoom. A declared viewport (the fidelity oracle's
+   emulated CSS viewport) replaces both; the device frame keeps its size. */
+static bool navigation_resolve_page_viewport(
+    const NavigationSession *session, const PocDocument *document,
+    int device_width, int device_height, unsigned zoom_percent,
+    ViewportContext *viewport)
+{
+    ViewportContext resolved;
+    if (!viewport_context_resolve(&resolved, document, device_width,
+                                  device_height, 980)) return false;
+    if (session->declared_css_width > 0
+        && session->declared_css_height > 0) {
+        ViewportContext declared;
+        if (viewport_context_init(&declared, session->declared_css_width,
+                                  session->declared_css_height,
+                                  device_width, device_height)) {
+            resolved = declared;
+        }
+    } else if (!viewport_apply_page_zoom(&resolved, zoom_percent)) {
+        return false;
     }
+    *viewport = resolved;
+    return true;
 }
 
 static bool navigation_stream_scan_metadata_node(
@@ -679,9 +698,11 @@ static bool navigation_stream_scan_metadata(NavigationDocumentStream *stream)
                            sizeof(stream->resource_base_url))
         || !navigation_stream_scan_metadata_node(
             stream, lxb_dom_interface_node(stream->parser->document.html))
-        || !viewport_context_resolve(
-            &stream->session->viewport, &stream->parser->document,
-            stream->viewport_width, 272, 980)) {
+        || !navigation_resolve_page_viewport(
+            stream->session, &stream->parser->document,
+            stream->viewport_width, 272,
+            navigation_page_zoom(stream->session),
+            &stream->session->viewport)) {
         if (stream->session->last_error[0] == '\0') {
             snprintf(stream->session->last_error,
                      sizeof(stream->session->last_error),
@@ -689,8 +710,6 @@ static bool navigation_stream_scan_metadata(NavigationDocumentStream *stream)
         }
         return false;
     }
-    navigation_apply_declared_viewport(stream->session,
-                                       stream->viewport_width, 272);
     /* Parser-blocking scripts execute from the streaming runtime before the
        final page commit.  Give that runtime the same resolved/declared
        layout viewport that style and layout will use; otherwise innerWidth,

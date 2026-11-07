@@ -666,7 +666,8 @@ bool site_adapter_reader_css(
         || adapter_capacity == 0
         || (font != SITE_ADAPTER_READER_FONT_SANS
             && font != SITE_ADAPTER_READER_FONT_SERIF)
-        || (font_percent != 80u && font_percent != 100u
+        || (font_percent != 60u && font_percent != 70u
+            && font_percent != 80u && font_percent != 100u
             && font_percent != 125u && font_percent != 150u)) {
         return false;
     }

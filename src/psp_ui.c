@@ -16,6 +16,7 @@
 #include "tilefinch/ui_language.h"
 #include "tilefinch/offline_library.h"
 #include "tilefinch/update_history.h"
+#include "tilefinch/viewport.h"
 #include "psp_boot_mark.h"
 #include "psp_ui_menu.h"
 #include "psp_ui_theme.h"
@@ -87,9 +88,9 @@ _Static_assert(TILEFINCH_UI_LANGUAGE_COUNT <= 16,
 /* A video still opening after this long says so beside its Cancel. */
 #define UI_MEDIA_SLOW_LOAD_MS 10000u
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
-#define UI_OPTIONS_ITEM_COUNT 54u
+#define UI_OPTIONS_ITEM_COUNT 55u
 #else
-#define UI_OPTIONS_ITEM_COUNT 52u
+#define UI_OPTIONS_ITEM_COUNT 53u
 #endif
 #define UI_SITE_DATA_VISIBLE_LINES 8u
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
@@ -292,7 +293,8 @@ typedef enum {
     UI_OPTION_ROTATE_HINT,
     UI_OPTION_WEB_FONTS,
     UI_OPTION_YOUTUBE_SIGNIN_DIAGNOSTICS,
-    UI_OPTION_YOUTUBE_CHANNEL_BANNERS
+    UI_OPTION_YOUTUBE_CHANNEL_BANNERS,
+    UI_OPTION_PAGE_ZOOM
 } UiOptionId;
 
 _Static_assert(BROWSER_VIDEO_LANGUAGE_COUNT <= 16,
@@ -364,8 +366,10 @@ static const UiOptionId ui_option_order[UI_OPTIONS_ITEM_COUNT] = {
     UI_OPTION_ROTATE_HINT,
     UI_OPTION_WEB_FONTS,
     UI_OPTION_YOUTUBE_SIGNIN_DIAGNOSTICS,
-    /* Last index; shown right after YouTube results (see below). */
-    UI_OPTION_YOUTUBE_CHANNEL_BANNERS
+    /* Shown right after YouTube results (see below). */
+    UI_OPTION_YOUTUBE_CHANNEL_BANNERS,
+    /* Last index; shown right after the page text size (see below). */
+    UI_OPTION_PAGE_ZOOM
 };
 
 static UiOptionId ui_option_id(size_t selection)
@@ -374,28 +378,36 @@ static UiOptionId ui_option_id(size_t selection)
         selection < UI_OPTIONS_ITEM_COUNT ? selection : 0u];
 }
 
-/* Rows are listed in index order except Channel banners, whose index is the
-   last one (so existing indices stay stable) but which is shown right after
-   YouTube results. Maps a display position to an option index. */
+/* Rows are listed in index order except the two appended last (so existing
+   indices stay stable): Page zoom, shown right after the page text size,
+   and Channel banners, shown right after YouTube results. Maps a display
+   position to an option index and back. */
+#define UI_OPTION_FONT_INDEX 1u
 #define UI_OPTION_RESULTS_INDEX 20u
-#define UI_OPTION_BANNERS_INDEX (UI_OPTIONS_ITEM_COUNT - 1u)
-_Static_assert(UI_OPTION_RESULTS_INDEX + 1u < UI_OPTION_BANNERS_INDEX,
-               "Channel banners follows YouTube results");
+#define UI_OPTION_ZOOM_INDEX (UI_OPTIONS_ITEM_COUNT - 1u)
+#define UI_OPTION_BANNERS_INDEX (UI_OPTIONS_ITEM_COUNT - 2u)
+_Static_assert(UI_OPTION_FONT_INDEX < UI_OPTION_RESULTS_INDEX
+               && UI_OPTION_RESULTS_INDEX + 1u < UI_OPTION_BANNERS_INDEX,
+               "Page zoom and Channel banners move up the list");
 
 static size_t ui_option_at_display(size_t position)
 {
-    if (position <= UI_OPTION_RESULTS_INDEX) return position;
-    if (position == UI_OPTION_RESULTS_INDEX + 1u)
+    if (position <= UI_OPTION_FONT_INDEX) return position;
+    if (position == UI_OPTION_FONT_INDEX + 1u) return UI_OPTION_ZOOM_INDEX;
+    if (position <= UI_OPTION_RESULTS_INDEX + 1u) return position - 1u;
+    if (position == UI_OPTION_RESULTS_INDEX + 2u)
         return UI_OPTION_BANNERS_INDEX;
-    return position - 1u;
+    return position - 2u;
 }
 
 static size_t ui_option_display_position(size_t selection)
 {
-    if (selection <= UI_OPTION_RESULTS_INDEX) return selection;
+    if (selection <= UI_OPTION_FONT_INDEX) return selection;
+    if (selection == UI_OPTION_ZOOM_INDEX) return UI_OPTION_FONT_INDEX + 1u;
+    if (selection <= UI_OPTION_RESULTS_INDEX) return selection + 1u;
     if (selection == UI_OPTION_BANNERS_INDEX)
-        return UI_OPTION_RESULTS_INDEX + 1u;
-    return selection + 1u;
+        return UI_OPTION_RESULTS_INDEX + 2u;
+    return selection + 2u;
 }
 
 /*
@@ -417,6 +429,8 @@ static const UiOptionDesc ui_option_descs[] = {
         "Changes browser controls, not page text", 0},
     [UI_OPTION_PAGE_FONT_PERCENT] = {NULL,
         "Larger page text means more scrolling", 0},
+    [UI_OPTION_PAGE_ZOOM] = {"Page zoom",
+        "Smaller zoom fits more of the page", 0},
     [UI_OPTION_READER_FONT] = {"Reader font",
         "Typeface used by Reader mode", 0},
     [UI_OPTION_REMEMBER_READER_SCALE] = {"Remember size",
@@ -525,7 +539,7 @@ static const UiOptionDesc ui_option_descs[] = {
         "Hide skips loading each channel's banner image", 2},
 };
 _Static_assert(sizeof(ui_option_descs) / sizeof(ui_option_descs[0])
-                   == (size_t) UI_OPTION_YOUTUBE_CHANNEL_BANNERS + 1u,
+                   == (size_t) UI_OPTION_PAGE_ZOOM + 1u,
                "every UiOptionId needs a UiOptionDesc");
 
 static const UiOptionDesc *ui_option_desc(UiOptionId option)
@@ -2264,6 +2278,7 @@ void psp_ui_init(PspUiState *ui)
     ui->activity_frames = UI_AUTOHIDE_FRAMES;
     ui->browser_ui_scale = 1;
     ui->page_font_percent = 100;
+    ui->page_zoom_percent = VIEWPORT_PAGE_ZOOM_DEFAULT;
     ui->web_font_mode = WEB_FONTS_SMART;
     ui->analog_cursor_enabled = true;
     ui->youtube_topics = true;
@@ -4447,13 +4462,15 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
                         ui->browser_ui_scale;
                     break;
                 case UI_OPTION_PAGE_FONT_PERCENT: {
-                    static const unsigned sizes[] = {80, 100, 125, 150};
-                    int selected = 1;
-                    for (size_t i = 0;
-                         i < sizeof(sizes) / sizeof(sizes[0]); i++)
-                        if (sizes[i] == ui->page_font_percent)
-                            selected = (int) i;
-                    int count = (int) (sizeof(sizes) / sizeof(sizes[0]));
+                    const unsigned *sizes = browser_page_font_steps;
+                    int count = (int) BROWSER_PAGE_FONT_STEP_COUNT;
+                    int selected = -1;
+                    for (int i = 0; i < count; i++)
+                        if (sizes[i] == ui->page_font_percent) selected = i;
+                    if (selected < 0) {
+                        for (int i = 0; i < count; i++)
+                            if (sizes[i] == 100u) selected = i;
+                    }
                     selected = (selected + count + direction) % count;
                     ui->page_font_percent = sizes[selected];
                     intent.setting.id = PSP_UI_SETTING_PAGE_FONT_PERCENT;
@@ -4461,6 +4478,13 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
                         ui->page_font_percent;
                     break;
                 }
+                case UI_OPTION_PAGE_ZOOM:
+                    ui->page_zoom_percent = viewport_page_zoom_step(
+                        ui->page_zoom_percent, direction);
+                    intent.setting.id = PSP_UI_SETTING_PAGE_ZOOM;
+                    intent.setting.value.unsigned_value =
+                        ui->page_zoom_percent;
+                    break;
                 case UI_OPTION_READER_FONT:
                     ui->reader_font_serif = !ui->reader_font_serif;
                     intent.setting.id = PSP_UI_SETTING_READER_FONT;
@@ -6510,6 +6534,11 @@ static TILEFINCH_OUT_OF_LINE void ui_option_row_presentation(
             *label = (ui->reader_mode || ui->basic_mode)
                 ? "Extracted text" : "Web pages";
             snprintf(formatted, formatted_size, "%u%%", ui->page_font_percent);
+            *value = formatted;
+            break;
+        case UI_OPTION_PAGE_ZOOM:
+            snprintf(formatted, formatted_size, "%u%%",
+                     ui->page_zoom_percent);
             *value = formatted;
             break;
         case UI_OPTION_READER_FONT:

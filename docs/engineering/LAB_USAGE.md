@@ -133,18 +133,9 @@ A bounded mobile-CSS run is:
 `--psp-profile strict` selects a 16 MiB content ceiling, 4 MiB JavaScript ceiling, 1 MiB cumulative script-source allowance, and eight tiles. `--psp-profile realistic` is the PSP application's own configuration, taken from the `BROWSER_PSP_APP_*` constants that `src/psp_boot_config.c` and the PSP app use (`browser_config_apply_psp_app_defaults()`): a 32 MiB page envelope, a 5 MiB JavaScript heap with the app's 4 MiB boot window, GC growth and array-cap engine knobs (an explicit environment value wins), 256 scripts, memory-based script admission with a 16 MiB source ceiling and 4 MiB per file, a 60-second script timeout, an 8 MiB document cap, four history entries, a 640 KiB session cache, 24 tiles, and the app's stylesheet and image limits. A lab replay therefore admits what the device admits without explicit limit flags. The VM value is a ceiling rather than an up-front reservation. The public `BrowserEngine` profile additionally records an 8 MiB minimum non-page reserve for UI, stacks, TLS/backend state, sockets, libc metadata, and fragmentation; that reserve is deliberately unavailable to page content. `browser_config_apply_psp_memory_profile()` applies the same strict or realistic policy to embedders (realistic there is `browser_config_apply_psp_app_defaults()` too). Both profiles enable generic allocation-pressure adaptation: as owned memory approaches guarded stage reserves, the loader may skip JavaScript, reduce stylesheet and image quotas, or retain four rather than eight tiles. Each decision is logged, depends only on remaining budget, and can be selected or disabled explicitly with `--adaptive-resources` or `--no-adaptive-resources`. Explicit `--limit-mb`, `--js-limit-mb`, or `--tile-count` values override the selected profile. `--navigation-stress N` repeatedly replaces a page through the bounded navigation owner and fails if teardown does not return to the pre-stress allocation level. `--resource-stage-ms` bounds each complete external CSS or image phase (100–60000 ms); requests inside the phase remain four-way concurrent and preserve document order when applied. CSS telemetry reports batches, the usable first batch, deadline cancellation, and total elapsed time.
 
 Mobile viewport telemetry distinguishes `width=device-width`, numeric widths,
-and the standards-compatible 980 px legacy layout viewport for pages without a
-declaration. Root horizontal overflow is retained and covered by a neutral
-fixture. CSS media queries and viewport units, JavaScript viewport globals,
-root CSSOM geometry, scrolling, hit testing, fixed/sticky overlays, and tile
-composition share that CSS coordinate space. The renderer creates a bounded
-device-scaled visual clone only when the layout and device viewports differ.
-Viewport resolution and CSS/device conversion are owned by one immutable
-`ViewportContext` value that is passed to style, layout, JavaScript,
-navigation, controller input, and rendering. Replacing a scaled tile-cache layout
-is transactional: if its visual clone or required overlay allocation fails,
-the previously renderable layout and tiles remain active and the caller gets a
-failure result.
+and the 980 px legacy layout viewport for pages without a declaration;
+[Viewport and page zoom](VIEWPORT.md) describes how the layout viewport is
+resolved and shared.
 
 ## Interactive runtime lab (`psp-browser-interactive-lab`)
 
@@ -435,7 +426,10 @@ alive while commands are read from a file or standard input:
 Commands include accelerated `up`/`down`, `page-up`/`page-down`, `top`,
 `bottom`, focus movement, screen-coordinate `tap`, `activate`, text editing,
 selector clicks, timer ticks, direct navigation, reload, back/forward, status,
-and frame rendering. `reader-on`/`reader-off` and `basic-on` switch to the
+and frame rendering. `page-zoom PERCENT` relays the page out at a Page zoom
+step in place, the way the PSP setting does, and prints a `loop-page-zoom`
+line with the result, CSS width and scale; `--page-zoom PERCENT` loads the
+first page at that zoom. `reader-on`/`reader-off` and `basic-on` switch to the
 extracted views the way Page tools does (`basic-on` prints a `loop-basic` line
 with the visited and emitted nodes, truncation and preparation time). The
 `census` command prints the site-census report of the live page: the

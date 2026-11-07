@@ -1203,6 +1203,20 @@ bool browser_engine_set_user_css(
     BrowserEngine *engine, const char *css, size_t length);
 bool browser_engine_apply_user_css(
     BrowserEngine *engine, const char *css, size_t length);
+/* Page zoom (a viewport_page_zoom_steps percentage; see
+   viewport_apply_page_zoom). The set form takes effect at the next
+   navigation; the apply form also re-lays the current page out with `css`
+   as its user sheet, in one transaction with the render shell, and leaves
+   the page, its zoom and its sheet unchanged when anything is refused. */
+bool browser_engine_set_page_zoom(BrowserEngine *engine, unsigned percent);
+/* Apply just zoom to the current sheet. An unchanged viewport is a no-op,
+   even when percent is already selected; presentation rebuilds remain
+   available separately for font/resource changes. */
+bool browser_engine_apply_page_zoom(BrowserEngine *engine, unsigned percent);
+unsigned browser_engine_page_zoom(const BrowserEngine *engine);
+bool browser_engine_apply_presentation(
+    BrowserEngine *engine, const char *css, size_t length,
+    unsigned zoom_percent);
 #if !defined(__PSP__)
 /* Deterministic host seam for proving that CSS adoption and render-shell
    publication roll back as one transaction. */

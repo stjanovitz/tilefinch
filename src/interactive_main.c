@@ -397,6 +397,7 @@ int main(int argc, char **argv)
     int requested_scroll_y = 0;
     bool scroll_y_requested = false, scroll_bottom = false;
     int viewport_css_width = 0, viewport_css_height = 0;
+    unsigned page_zoom = VIEWPORT_PAGE_ZOOM_DEFAULT;
     const char *blocked_origin_hosts[64];
     size_t blocked_origin_count = 0;
     bool post_click_from_top = false;
@@ -631,6 +632,13 @@ int main(int argc, char **argv)
         }
         else if (strcmp(argv[i], "--viewport-css-height") == 0) {
             viewport_css_height = (int) strtol(argv[++i], NULL, 10);
+        }
+        else if (strcmp(argv[i], "--page-zoom") == 0) {
+            page_zoom = (unsigned) strtoul(argv[++i], NULL, 10);
+            if (!viewport_page_zoom_valid(page_zoom)) {
+                fprintf(stderr, "--page-zoom takes a Page zoom step\n");
+                return 2;
+            }
         }
         else if (strcmp(argv[i], "--visual-state-marker") == 0) {
             visual_state_marker = argv[++i];
@@ -1276,6 +1284,7 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
+    if (!browser_engine_set_page_zoom(engine, page_zoom)) goto cleanup;
     navigation_enable_frame_capability_trace(&navigation, trace_frames);
     navigation_enable_page_capability_trace(&navigation, trace_page);
     navigation_enable_diagnostic_frame_safari(

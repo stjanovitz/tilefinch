@@ -264,6 +264,7 @@ int main(void)
     CHECK(profile != NULL);
     CHECK(browser_profile_ui_scale(profile) == 1
           && browser_profile_page_font_percent(profile) == 100
+          && browser_profile_page_zoom_percent(profile) == 100
           && !browser_profile_history_enabled(profile)
           && !browser_profile_restore_last_page(profile)
           && !browser_profile_tab_hibernation_enabled(profile)
@@ -352,6 +353,9 @@ int main(void)
         profile, "https://off.test/", "off"));
     browser_profile_set_ui_scale(profile, 2);
     browser_profile_set_page_font_percent(profile, 125);
+    browser_profile_set_page_zoom_percent(profile, 66);
+    CHECK(browser_profile_page_zoom_percent(profile) == 100);
+    browser_profile_set_page_zoom_percent(profile, 75);
     browser_profile_set_history_enabled(profile, true);
     CHECK(!browser_profile_save_playback_positions(profile));
     CHECK(!browser_profile_record_resume(
@@ -639,12 +643,14 @@ int main(void)
              (long) getpid());
     CHECK(browser_profile_save(profile, path));
     CHECK(!file_contains(path, "STATS\t")
-          && file_contains(path, "DIAG\t1\n"));
+          && file_contains(path, "DIAG\t1\n")
+          && file_contains(path, "PAGEZOOM\t75\n"));
     BrowserProfile *loaded = browser_profile_create(&budget);
     CHECK(loaded != NULL && browser_profile_load(loaded, path));
     CHECK(browser_profile_save_playback_positions(loaded));
     CHECK(browser_profile_ui_scale(loaded) == 2
           && browser_profile_page_font_percent(loaded) == 125
+          && browser_profile_page_zoom_percent(loaded) == 75
           && browser_profile_history_enabled(loaded)
           && browser_profile_restore_last_page(loaded)
           && browser_profile_tab_hibernation_enabled(loaded)
@@ -966,6 +972,49 @@ int main(void)
               && browser_profile_youtube_compact_results(saved_loaded) == !chosen
               && browser_profile_youtube_channel_banners(saved_loaded) == !hidden);
         browser_profile_destroy(saved_loaded);
+    }
+
+    /* PAGEZOOM is its own record: a profile without one (every build
+       before Page zoom) reads 100, and a value that is not a step, or is
+       not a whole number, is ignored. */
+    static const struct { const char *record; unsigned percent; } zooms[] = {
+        {"", 100}, {"PAGEZOOM\t50\n", 50}, {"PAGEZOOM\t150\n", 150},
+        {"PAGEZOOM\t66\n", 100}, {"PAGEZOOM\t75x\n", 100},
+        {"PAGEZOOM\t\n", 100}, {"PAGEZOOM\t4294967371\n", 100},
+    };
+    for (size_t i = 0; i < sizeof(zooms) / sizeof(zooms[0]); i++) {
+        FILE *zoomed = fopen(path, "wb");
+        CHECK(zoomed != NULL);
+        CHECK(fprintf(zoomed, "TILEFINCH_PROFILE\t1\nUI\t1\t70\t0\n%s",
+                      zooms[i].record) > 0);
+        CHECK(fclose(zoomed) == 0);
+        CHECK(seal_profile(path));
+        BrowserProfile *zoom_loaded = browser_profile_create(&budget);
+        CHECK(zoom_loaded != NULL
+              && browser_profile_load(zoom_loaded, path)
+              && browser_profile_page_zoom_percent(zoom_loaded)
+                     == zooms[i].percent
+              && browser_profile_page_font_percent(zoom_loaded) == 70);
+        browser_profile_destroy(zoom_loaded);
+    }
+    /* The smaller text sizes save and load like the others; 50 is not a
+       step. */
+    static const unsigned fonts[] = {60, 70};
+    for (size_t i = 0; i < sizeof(fonts) / sizeof(fonts[0]); i++) {
+        BrowserProfile *small = browser_profile_create(&budget);
+        CHECK(small != NULL);
+        browser_profile_set_page_font_percent(small, 50);
+        CHECK(browser_profile_page_font_percent(small) == 100);
+        browser_profile_set_page_font_percent(small, fonts[i]);
+        browser_profile_set_page_zoom_percent(small, 110);
+        CHECK(browser_profile_save(small, path));
+        browser_profile_destroy(small);
+        BrowserProfile *small_loaded = browser_profile_create(&budget);
+        CHECK(small_loaded != NULL
+              && browser_profile_load(small_loaded, path)
+              && browser_profile_page_font_percent(small_loaded) == fonts[i]
+              && browser_profile_page_zoom_percent(small_loaded) == 110);
+        browser_profile_destroy(small_loaded);
     }
 
 

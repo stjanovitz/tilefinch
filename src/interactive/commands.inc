@@ -485,6 +485,7 @@ static const LabCommand lab_commands[] = {
         "check-page-media [focused] [SECONDS] [seek=SECONDS]|"
         "record-page-media [focused] [SECONDS [MAX-MB]]"},
     {"record-page-media", 0u, NULL},
+    {"page-zoom", LAB_INPUT, "page-zoom PERCENT"},
     {"reader-on", LAB_INPUT, "reader-on|reader-off"},
     {"reader-off", LAB_INPUT, NULL},
     {"basic-on", LAB_INPUT, "basic-on"},
@@ -2283,6 +2284,19 @@ static bool run_command_loop(FILE *commands, bool interactive,
                                        maximum, settle_ms);
         } else if (lab_cmd_media(&command, line, argument, &changed,
                                    &reset_cache, &ok, &frame_number)) {
+        } else if (strcmp(line, "page-zoom") == 0 && argument != NULL) {
+            /* Settings -> Appearance -> Page zoom on the open page: the
+               same transaction the PSP app runs, keeping the user sheet. */
+            unsigned percent = (unsigned) strtoul(argument, NULL, 10);
+            ok = browser_engine_apply_presentation(
+                engine, navigation->user_css, navigation->user_css_length,
+                percent);
+            printf("loop-page-zoom percent=%u applied=%s css-width=%d "
+                   "scale=%d/%d\n", percent, ok ? "yes" : "no",
+                   navigation->viewport.css_width,
+                   navigation->viewport.scale_numerator,
+                   navigation->viewport.scale_denominator);
+            reset_cache = ok;
         } else if (strcmp(line, "reader-on") == 0
                    || strcmp(line, "reader-off") == 0) {
             bool enable = strcmp(line, "reader-on") == 0;

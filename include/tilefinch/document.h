@@ -282,6 +282,7 @@ typedef bool (*DocumentBodySnapshotReplaceCallback)(
 typedef struct {
     bool declared;
     bool device_width;
+    bool fixed_width;
     int layout_width;
     int scale_numerator;
     int scale_denominator;

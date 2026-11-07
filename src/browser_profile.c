@@ -3,6 +3,7 @@
 #include "tilefinch/glyph_component_store.h"
 #include "tilefinch/ui_language.h"
 #include "tilefinch/url.h"
+#include "tilefinch/viewport.h"
 
 #include <ctype.h>
 #include <limits.h>
@@ -33,6 +34,7 @@ struct BrowserProfile {
     Budget *budget;
     unsigned ui_scale;
     unsigned page_font_percent;
+    unsigned page_zoom_percent;
     bool history_enabled;
     bool restore_last_page;
     bool tab_hibernation_enabled;
@@ -152,10 +154,20 @@ typedef struct {
     size_t capacity;
 } ProfileHtml;
 
+const unsigned browser_page_font_steps[BROWSER_PAGE_FONT_STEP_COUNT] = {
+    60u, 70u, 80u, 100u, 125u, 150u
+};
+
+bool browser_profile_page_font_percent_valid(unsigned percent)
+{
+    for (size_t i = 0; i < BROWSER_PAGE_FONT_STEP_COUNT; i++)
+        if (browser_page_font_steps[i] == percent) return true;
+    return false;
+}
+
 static bool profile_valid_percent(unsigned percent)
 {
-    return percent == 80u || percent == 100u
-        || percent == 125u || percent == 150u;
+    return browser_profile_page_font_percent_valid(percent);
 }
 
 static bool profile_valid_cache_mb(unsigned megabytes)
@@ -350,6 +362,7 @@ BrowserProfile *browser_profile_create(Budget *budget)
     profile->budget = budget;
     profile->ui_scale = 1;
     profile->page_font_percent = 100;
+    profile->page_zoom_percent = VIEWPORT_PAGE_ZOOM_DEFAULT;
     profile->web_font_mode = WEB_FONTS_SMART;
     /* The default search path must return useful server-rendered results on
        the PSP. Google remains an explicit persisted choice, but no longer
@@ -738,6 +751,10 @@ bool browser_profile_save(const BrowserProfile *profile, const char *path)
                      profile->youtube_channel_banners_hidden ? 1u : 0u) > 0;
     }
     if (ok) {
+        /* Append-only; a profile without it reads as 100%. */
+        ok = fprintf(file, "PAGEZOOM\t%u\n", profile->page_zoom_percent) > 0;
+    }
+    if (ok) {
         /* Append-only; Ask is the safe default for old profiles. */
         ok = fprintf(file, "YTLOGIN\t%u\n", (unsigned) profile->youtube_login_policy) > 0;
     }
@@ -881,6 +898,7 @@ static bool profile_load_internal(
         .budget = profile->budget,
         .ui_scale = 1,
         .page_font_percent = 100,
+        .page_zoom_percent = VIEWPORT_PAGE_ZOOM_DEFAULT,
         .search_engine = BROWSER_SEARCH_DUCKDUCKGO,
         .analog_cursor_enabled = true,
         .live_cache_kib = BROWSER_PROFILE_TRANSIENT_CACHE_KIB,
@@ -1136,6 +1154,12 @@ static bool profile_load_internal(
         } else if (strcmp(line, "YTBANNER") == 0) {
             if (strcmp(first, "0") == 0 || strcmp(first, "1") == 0)
                 loaded->youtube_channel_banners_hidden = first[0] == '1';
+        } else if (strcmp(line, "PAGEZOOM") == 0) {
+            char *end = NULL;
+            unsigned long zoom = strtoul(first, &end, 10);
+            if (end != first && *end == '\0' && zoom <= UINT_MAX
+                && viewport_page_zoom_valid((unsigned) zoom))
+                loaded->page_zoom_percent = (unsigned) zoom;
         } else if (strcmp(line, "WAVE") == 0) {
             loaded->wave_background = strtoul(first, NULL, 10) != 0;
         } else if (strcmp(line, "POLICY") == 0 && second != NULL) {
@@ -1981,6 +2005,19 @@ void browser_profile_set_page_font_percent(
 {
     if (profile != NULL && profile_valid_percent(percent))
         profile->page_font_percent = percent;
+}
+
+unsigned browser_profile_page_zoom_percent(const BrowserProfile *profile)
+{
+    return profile == NULL ? VIEWPORT_PAGE_ZOOM_DEFAULT
+                           : profile->page_zoom_percent;
+}
+
+void browser_profile_set_page_zoom_percent(
+    BrowserProfile *profile, unsigned percent)
+{
+    if (profile != NULL && viewport_page_zoom_valid(percent))
+        profile->page_zoom_percent = percent;
 }
 
 void browser_profile_set_history_enabled(

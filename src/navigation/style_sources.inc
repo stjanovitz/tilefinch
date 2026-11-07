@@ -172,7 +172,8 @@ static bool navigation_settle_style_preloads(
    for keep the full rebuild. */
 static NavigationUserCssTransaction *navigation_apply_presentation_css_begin(
     NavigationSession *session, const char *css, size_t length,
-    bool allow_author_fallback);
+    bool allow_author_fallback, const ViewportContext *viewport,
+    unsigned zoom_percent);
 
 static bool navigation_style_append_refused(const char *reason)
 {

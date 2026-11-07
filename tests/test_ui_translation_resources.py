@@ -53,6 +53,19 @@ class ResourceTests(unittest.TestCase):
             "translations/ui/v13/pt.tful": "ebb951179c03a034acf7c1aa94920b82c49b9ca8d78fe326042ccc9e17629414",
             "translations/ui/v13/bn.tful": "e34b3ecf507f8c7374f8e4e14a2184559fdf19332612accb5684c1762f659922",
             "translations/ui/v13/as.tful": "bf17531deb72b832673386a4e411eef473bf4c829f8ef5e7878e89d42a074072",
+            "translations/ui/v14/es.tful": "19da47ea39a7a777d112b4aaf54ecb83a7b4cc24214aac173c93acfe24aab5ec",
+            "translations/ui/v14/fr.tful": "9a2939fa86aacbae306e8368b50c126ee357b7a24d592665f4af1350e0d7b941",
+            "translations/ui/v14/de.tful": "f0da61f4fdad2fd686605c24d29ac88289c372850d714e1016fb97ee87cc5462",
+            "translations/ui/v14/ja.tful": "6d782ea35f187a3b7ee0e8317eddf38bf9857091ae96b36629e8acdf7f8aca3a",
+            "translations/ui/v14/ru.tful": "5083ee2485fe80759ed0dd7d48455b33cb392f9ed6ad1dee2bea0f7aba8851f1",
+            "translations/ui/v14/uk.tful": "fbe2d1f9d4ccbc884fd3ccb1760c4208482cb9eb99336a125e7d46f679ff5ee0",
+            "translations/ui/v14/zh-hans.tful": "d24d6aaf6e73cb2b5366a01d5eed5f91fe20cafdcb63a8eb25221bbda0c07681",
+            "translations/ui/v14/ko.tful": "fa9367e14473207bae1e0d16e151bdb5a4d751205d57925e37e1a41e65429d9f",
+            "translations/ui/v14/hi.tful": "8b7a52de5dfddd7d9e8e1479e4bba8728fd42b62c8e3a56bb81ab3a6a16c0694",
+            "translations/ui/v14/ar.tful": "067a1912ada538cfd288a356457ec94402c76606fc94bab18e162b6f283255dc",
+            "translations/ui/v14/pt.tful": "010d2a63272fda0c08a44fe409c2996915a46f7950acf2af7c7e70ce3e966397",
+            "translations/ui/v14/bn.tful": "894e231ac2713c1c684602e4724457a6f5ca07d4bb994a32baec4d5c452b566a",
+            "translations/ui/v14/as.tful": "18ff37c5fa1fd221a138fa2e37ea9416dbbe4aeb9f177a45ccb80ca236cfdf12",
         }
         generated = generator.outputs(resources)
         for key, digest in published.items():
@@ -72,13 +85,13 @@ class ResourceTests(unittest.TestCase):
         old_languages = generator.CATALOGS[6][1]
         rows = generator.read_rows(7, old_languages)
         for column, (code, label, glyphs) in enumerate(old_languages, 1):
-            self.assertIn(f'"translations/ui/v14/{code}.tful"', manifest)
-        self.assertIn('"translations/ui/v14/pt.tful"', manifest)
+            self.assertIn(f'"translations/ui/v15/{code}.tful"', manifest)
+        self.assertIn('"translations/ui/v15/pt.tful"', manifest)
         portuguese = generator.read_rows(8, generator.CATALOGS[7][1])
         self.assertGreaterEqual({row[0] for row in portuguese}, {row[0] for row in rows})
         self.assertEqual(dict(portuguese)["Portuguese"], "Português")
-        self.assertIn('"translations/ui/v14/bn.tful"', manifest)
-        self.assertIn('"translations/ui/v14/as.tful"', manifest)
+        self.assertIn('"translations/ui/v15/bn.tful"', manifest)
+        self.assertIn('"translations/ui/v15/as.tful"', manifest)
 
     def test_download_labels_have_translations(self):
         rows = generator.read_rows(generator.ACTIVE_VERSION, generator.CATALOGS[-1][1])

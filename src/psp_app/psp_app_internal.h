@@ -210,6 +210,11 @@ bool psp_request_omnibox(
     char *destination, size_t destination_capacity);
 
 /* src/psp_app/psp_app_page.c */
+/* Installs the page's user sheet (Reader/Basic or the page text size, plus
+   the content-blocker sheets) and its page zoom: ui->page_zoom_percent for
+   ordinary pages, 100% for Reader and Basic view (`reader_mode`), which
+   have their own text size. `relayout` applies both to the open page in
+   one transaction; otherwise they take effect at the next navigation. */
 bool psp_set_presentation_css(
     BrowserEngine *engine, const PspUiState *ui,
     const BrowserProfile *profile, bool reader_mode,
@@ -1089,6 +1094,10 @@ typedef struct {
        without page JavaScript and is presented in Basic view. */
     bool basic_reload_pending;
     char basic_reload_url[NAVIGATION_URL_LIMIT];
+    /* Settings -> Appearance -> Page zoom re-lays the page out once the
+       choice has rested for PSP_PAGE_ZOOM_SETTLE_US, not on every press. */
+    bool page_zoom_pending;
+    uint64_t page_zoom_changed_us;
     /* The navigation generation already re-examined for the Basic fallback
        after its scripts failed post-commit, and the one already prompted
        (Ask), so neither repeats for one page. */
@@ -1243,6 +1252,10 @@ typedef struct {
        iteration's page callbacks (and so its second composition). */
     bool defer_runtime;
 } PspAppFrameState;
+
+/* Applies a Page zoom change once it has settled (psp_app_settings.c);
+   called every frame, it does nothing while no change is waiting. */
+void psp_app_page_zoom_settle(PspApp *app, PspAppFrameState *frame);
 
 /* src/psp_app/psp_app_captive_portal.c. One user-triggered probe and one
    ephemeral sign-in tab; no background connectivity polling. */

@@ -30,12 +30,12 @@ translation.
 
 ## Editing and publishing
 
-The current catalog version is **v14**. All thirteen downloadable languages
+The current catalog version is **v15**. All thirteen downloadable languages
 use it, and `src/generated/ui_languages.inc` pins each language's file name,
 SHA-256 and the signed glyph-pack revision its shaped labels need (Devanagari
 revision 8 for Hindi, Bengali–Assamese revision 4 for Bengali and Assamese).
 
-Edit the active catalog's `translations/ui/v14/source.tsv`, then run
+Edit the active catalog's `translations/ui/v15/source.tsv`, then run
 `python3 tools/generate_ui_translations.py`.
 Commit the authored sources, generated Hindi and Bengali–Assamese sequences
 and `src/generated/ui_languages.inc` here, not the `.tful` downloads. Each

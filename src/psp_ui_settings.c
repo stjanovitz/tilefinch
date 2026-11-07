@@ -371,6 +371,7 @@ void psp_app_ui_sync_from_profile(
     }
     ui->browser_ui_scale = browser_profile_ui_scale(profile);
     ui->page_font_percent = browser_profile_page_font_percent(profile);
+    ui->page_zoom_percent = browser_profile_page_zoom_percent(profile);
     ui->reader_font_serif =
         browser_profile_reader_font(profile) == BROWSER_READER_FONT_SERIF;
     ui->remember_reader_site_scale =

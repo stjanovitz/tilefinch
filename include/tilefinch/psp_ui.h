@@ -794,7 +794,10 @@ typedef struct {
         const ZipInstallPreview *zip_install_preview;
     };
     unsigned browser_ui_scale;
-    unsigned page_font_percent;
+    /* Page text size and Page zoom (both at most 150%) share one word so
+       the state stays within its 1 KiB bound. */
+    unsigned page_font_percent : 16;
+    unsigned page_zoom_percent : 16;
     int progress_per_mille;
     uint32_t page_requests_blocked;
     /* Presentation saturates; the persisted profile keeps the 64-bit count. */

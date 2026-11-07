@@ -1184,6 +1184,13 @@ struct ScriptRuntime {
        dispatch, viewport updates and document lifecycle never look them up
        through the mutable Window object. */
     JSValue host_global;
+    JSValue host_visual_viewport;
+    JSValue host_window_dispatch;
+    JSValue host_viewport_dispatch;
+    JSValue host_event_constructor;
+    JSValue host_trusted_event;
+    /* First resize only: do not charge every tiny realm for this code. */
+    JSValue viewport_resize_dispatch;
     JSValue host_callbacks[SCRIPT_HOST_CALLBACK_COUNT];
 #ifdef JS_RT_XHR_DIAGNOSTICS
     ScriptXHRDiagnostics *xhr_diagnostics;
@@ -1216,6 +1223,10 @@ struct ScriptRuntime {
     bool page_visibility_queue[2];
     uint8_t page_visibility_queue_head;
     uint8_t page_visibility_queue_count;
+    /* 0 idle, 1 Window, 2 VisualViewport. Each stage waits for the previous
+       native delivery's complete microtask/continuation checkpoint. */
+    uint8_t viewport_resize_phase;
+    bool diagnostic_mobile_safari;
     /* Consecutive advances which ended with FinalizationRegistry cleanup
        queued but admitted none because due tasks took every slot. */
     uint8_t cleanup_starved_advances;

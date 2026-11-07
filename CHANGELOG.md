@@ -8,6 +8,11 @@ mechanics.
 
 ## Unreleased
 
+## 0.1.47 — 2026-11-07
+
+- Fixed opening links whose addresses end in a slash.
+- Added Page zoom (50%–150%) and smaller web-page text sizes in Settings.
+
 ## 0.1.46 — 2026-11-06
 
 - Reliability updates and clearer error reports when opted-in.

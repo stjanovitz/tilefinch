@@ -114,6 +114,12 @@ static bool filenames(void)
     CHECK(!file_download_filename_valid("CON"));
     CHECK(file_download_url_candidate(URL));
     CHECK(!file_download_url_candidate("https://downloads.example.test/release"));
+    /* A path without a file name is a page, not download.bin. */
+    CHECK(!file_download_url_candidate("https://downloads.example.test/"));
+    CHECK(!file_download_url_candidate("https://downloads.example.test/settings/"));
+    CHECK(!file_download_url_candidate("https://downloads.example.test/forum/?page=2"));
+    CHECK(!file_download_url_candidate("https://downloads.example.test/.bin"));
+    CHECK(file_download_url_candidate("https://downloads.example.test/firmware.bin?x=1"));
     CHECK(file_download_filename("https://downloads.example.test/a%2fb.zip", NULL, name)
         && !strcmp(name, "b.zip"));
     return true;
@@ -453,6 +459,54 @@ static bool confirmation(const char *directory, const char *corpus)
     return true;
 }
 
+/* Pressing X on a link: only a file-like address, or a same-origin link
+   marked download, asks first. A folder-style address such as /settings/
+   is a page, though its saved name would fall back to download.bin. */
+static bool link_activation(void)
+{
+    BrowserConfig config; browser_config_init(&config, NULL);
+    config.javascript.enabled = false; config.resources.enabled = false;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL);
+    static const char page[] = "<!doctype html><title>Links</title>"
+        "<a href='/settings/'>Settings</a> <a href='/'>Home</a> "
+        "<a href='/forum/?page=2'>Forum</a> <a href='/about'>About</a> "
+        "<a href='" URL "'>Archive</a> <a href='/get/' download>Saved</a> "
+        "<a href='https://other.example.test/get/' download>Elsewhere</a>";
+    CHECK(browser_engine_commit_html(engine, "https://downloads.example.test/",
+                                     page, sizeof(page) - 1, true));
+    static const struct { const char *url; bool download; } links[] = {
+        {"https://downloads.example.test/settings/", false},
+        {"https://downloads.example.test/", false},
+        {"https://downloads.example.test/forum/?page=2", false},
+        {"https://downloads.example.test/about", false},
+        {URL, true},
+        {"https://downloads.example.test/get/", true},
+        {"https://other.example.test/get/", false}
+    };
+    BrowserController *controller = browser_engine_controller(engine);
+    for (size_t i = 0; i < sizeof(links) / sizeof(links[0]); i++) {
+        CHECK(controller_focus_next(controller));
+        ControllerAction action;
+        CHECK(controller_activate(controller, &action));
+        if (action.type != CONTROLLER_ACTION_NAVIGATE
+            || strcmp(action.url, links[i].url)
+            || action.prefer_download != links[i].download)
+            fprintf(stderr, "link %zu: type=%d url=%s download=%d\n", i,
+                    (int) action.type, action.url, (int) action.prefer_download);
+        CHECK(action.type == CONTROLLER_ACTION_NAVIGATE
+              && !strcmp(action.url, links[i].url)
+              && action.prefer_download == links[i].download);
+    }
+    /* The download link's saved name is the legitimate fallback. */
+    char name[FILE_DOWNLOAD_FILENAME_LIMIT];
+    CHECK(file_download_filename(links[5].url, NULL, name)
+          && !strcmp(name, "download.bin"));
+    browser_engine_destroy(engine);
+    return true;
+}
+
 static bool extensionless_navigation(const char *corpus)
 {
     BrowserConfig config; browser_config_init(&config, NULL);
@@ -486,6 +540,18 @@ static bool extensionless_navigation(const char *corpus)
     CHECK(!browser_engine_load_url_with_limits(engine, trace_url, 1048576, 1000, true));
     CHECK(browser_engine_take_download_offer(engine, url, sizeof(url), name, sizeof(name)));
     CHECK(!strcmp(url, trace_url));
+    /* A nameless attachment at a folder-style address is still a file; it
+       is offered under the download.bin fallback. */
+    fetch_trace_end();
+    trace_url = "https://downloads.example.test/files/";
+    CHECK(trace(corpus, 42, 0, 200, "\"one\"", "content-disposition: attachment", true));
+    CHECK(browser_engine_begin_navigation_url(engine, trace_url, 1048576, 1000, true));
+    status = BROWSER_NAVIGATION_JOB_PENDING;
+    for (unsigned i = 0; i < 1000 && status == BROWSER_NAVIGATION_JOB_PENDING; i++)
+        status = browser_engine_pump_navigation(engine, NULL);
+    CHECK(status == BROWSER_NAVIGATION_JOB_CANCELLED);
+    CHECK(browser_engine_take_download_offer(engine, url, sizeof(url), name, sizeof(name)));
+    CHECK(!strcmp(url, trace_url) && !strcmp(name, "download.bin"));
     fetch_trace_end(); trace_url = URL; browser_engine_destroy(engine);
     return true;
 }
@@ -659,7 +725,7 @@ int main(int argc, char **argv)
         ? live_source_journey(directory, argv[2], argv[3], argv[4])
         : argc == 1 && filenames() && transfers(directory, corpus)
             && restart_speed(directory, corpus) && confirmation(directory, corpus)
-            && extensionless_navigation(corpus);
+            && link_activation() && extensionless_navigation(corpus);
     fetch_trace_end(); clean(directory); clean(corpus);
     return okay ? 0 : 1;
 }

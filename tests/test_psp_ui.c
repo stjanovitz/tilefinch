@@ -679,6 +679,40 @@ static bool test_input_mapping_and_menu(void)
     CHECK(intent.setting.id == PSP_UI_SETTING_PAGE_FONT_PERCENT
           && intent.setting.value.unsigned_value == 125
           && ui.page_font_percent == 125);
+    /* Text size steps through the smaller sizes and wraps at both ends. */
+    static const unsigned font_left[] = {100, 80, 70, 60, 150, 125};
+    for (size_t i = 0; i < sizeof(font_left) / sizeof(font_left[0]); i++) {
+        input.pressed = PSP_UI_BUTTON_LEFT;
+        intent = psp_ui_update(&ui, &input);
+        CHECK(intent.setting.id == PSP_UI_SETTING_PAGE_FONT_PERCENT
+              && ui.page_font_percent == font_left[i]);
+    }
+    /* Page zoom is shown right after the text size, though its index is
+       the last one. It cycles through the zoom steps from 100%. */
+    input.pressed = PSP_UI_BUTTON_DOWN;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(ui.options_selection == 52 && ui.page_zoom_percent == 100);
+    static const unsigned zoom_right[] = {110, 125, 150, 50, 67};
+    for (size_t i = 0; i < sizeof(zoom_right) / sizeof(zoom_right[0]); i++) {
+        input.pressed = PSP_UI_BUTTON_RIGHT;
+        intent = psp_ui_update(&ui, &input);
+        CHECK(intent.setting.id == PSP_UI_SETTING_PAGE_ZOOM
+              && intent.setting.value.unsigned_value == zoom_right[i]
+              && ui.page_zoom_percent == zoom_right[i]
+              && intent.visual_changed);
+    }
+    input.pressed = PSP_UI_BUTTON_LEFT;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(ui.page_zoom_percent == 50);
+    input.pressed = PSP_UI_BUTTON_LEFT;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(ui.page_zoom_percent == 150);
+    input.pressed = PSP_UI_BUTTON_UP;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(ui.options_selection == 1);
+    input.pressed = PSP_UI_BUTTON_DOWN;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(ui.options_selection == 52);
     input.pressed = PSP_UI_BUTTON_DOWN;
     intent = psp_ui_update(&ui, &input);
     CHECK(ui.options_selection == 2);
@@ -7668,6 +7702,7 @@ static bool test_settings_table_and_profile_sync(void)
 
     browser_profile_set_ui_scale(profile, 125u);
     browser_profile_set_page_font_percent(profile, 130u);
+    browser_profile_set_page_zoom_percent(profile, 75u);
     browser_profile_set_reader_font(profile, BROWSER_READER_FONT_SERIF);
     browser_profile_set_remember_reader_site_scale(profile, true);
     CHECK(browser_profile_set_basic_fallback_mode(
@@ -7703,6 +7738,7 @@ static bool test_settings_table_and_profile_sync(void)
     psp_app_ui_sync_from_profile(&ui, profile);
     CHECK(ui.browser_ui_scale == browser_profile_ui_scale(profile)
           && ui.page_font_percent == browser_profile_page_font_percent(profile)
+          && ui.page_zoom_percent == 75u
           && ui.reader_font_serif && ui.remember_reader_site_scale
           && ui.basic_fallback_mode == BROWSER_BASIC_FALLBACK_OFF
           && ui.web_font_mode == WEB_FONTS_OFF

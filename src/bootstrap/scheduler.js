@@ -642,7 +642,6 @@
   __tilefinchRealmGlobal.requestIdleCallback = requestIdleCallback;
   __tilefinchRealmGlobal.cancelIdleCallback = cancelIdleCallback;
   {
-    const listeners = new Map();
     const viewport = {
       width: innerWidth,
       height: innerHeight,
@@ -655,33 +654,9 @@
         : Number(__tilefinchRealmGlobal.__tilefinchViewportScale) || 1,
       onresize: null,
       onscroll: null,
-      addEventListener(type, callback) {
-        if (typeof callback !== "function") return;
-        const key = String(type);
-        if (!listeners.has(key)) listeners.set(key, []);
-        const list = listeners.get(key);
-        if (!list.includes(callback)) list.push(callback);
-      },
-      removeEventListener(type, callback) {
-        const list = listeners.get(String(type));
-        if (!list) return;
-        const at = list.indexOf(callback);
-        if (at >= 0) list.splice(at, 1);
-      },
       dispatchEvent(event) {
-        event.target = viewport;
         const type = String(event.type);
-        for (const callback of [...(listeners.get(type) || [])])
-          try {
-            __tilefinchRealmGlobal.__tilefinchRunTask(
-              "visual-viewport:" + type,
-              callback,
-              viewport,
-              [event],
-            );
-          } catch (error) {
-            __tilefinchReportUncaught(error, "visualViewport " + type);
-          }
+        EventTarget.prototype.dispatchEvent.call(viewport, event);
         const handler = viewport["on" + type];
         if (typeof handler === "function")
           try {
@@ -697,6 +672,7 @@
         return !event.defaultPrevented;
       },
     };
+    Object.setPrototypeOf(viewport, EventTarget.prototype);
     __tilefinchRealmGlobal.visualViewport = viewport;
   }
   {

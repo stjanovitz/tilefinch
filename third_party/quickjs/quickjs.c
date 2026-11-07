@@ -11484,15 +11484,15 @@ static int expand_fast_array(JSContext *ctx, JSObject *p, uint32_t new_len)
 }
 
 /* Preconditions: 'p' must be of class JS_CLASS_ARRAY, p->fast_array =
-   TRUE and p->extensible = TRUE */
+   TRUE, p->extensible = TRUE and p->u.array.count < INT32_MAX. */
 static inline int add_fast_array_element(JSContext *ctx, JSObject *p,
                                          JSValue val, int flags)
 {
     uint32_t new_len, array_len;
     uint8_t byte;
     uint16_t short_value;
+    BOOL update_length = FALSE;
     /* extend the array by one */
-    /* XXX: convert to slow array if new_len > 2^31-1 elements */
     new_len = p->u.array.count + 1;
     /* update the length if necessary. We assume that if the length is
        not an integer, then if it >= 2^31.  */
@@ -11503,7 +11503,7 @@ static inline int add_fast_array_element(JSContext *ctx, JSObject *p,
                 JS_FreeValue(ctx, val);
                 return JS_ThrowTypeErrorReadOnly(ctx, flags, JS_ATOM_length);
             }
-            p->prop[0].u.value = JS_NewInt32(ctx, new_len);
+            update_length = TRUE;
         }
     }
     if ((p->compact_char_array || p->u.array.count == 0) &&
@@ -11521,7 +11521,7 @@ static inline int add_fast_array_element(JSContext *ctx, JSObject *p,
         compact_array_string(p)->len = new_len;
         compact_array_bytes(p)[new_len] = '\0';
         JS_FreeValue(ctx, val);
-        return TRUE;
+        goto done;
     }
     if ((p->compact_byte_array || p->u.array.count == 0) &&
         js_value_is_uint8(val, &byte)) {
@@ -11538,7 +11538,7 @@ static inline int add_fast_array_element(JSContext *ctx, JSObject *p,
         compact_array_string(p)->len = new_len;
         compact_array_bytes(p)[new_len] = '\0';
         JS_FreeValue(ctx, val);
-        return TRUE;
+        goto done;
     }
     if ((p->compact_signed_byte_array || p->u.array.count == 0) &&
         js_value_is_int8(val, &byte)) {
@@ -11555,7 +11555,7 @@ static inline int add_fast_array_element(JSContext *ctx, JSObject *p,
         compact_array_string(p)->len = new_len;
         compact_array_bytes(p)[new_len] = '\0';
         JS_FreeValue(ctx, val);
-        return TRUE;
+        goto done;
     }
     if ((p->compact_byte_array || p->compact_signed_byte_array ||
          p->compact_short_array) &&
@@ -11574,7 +11574,7 @@ static inline int add_fast_array_element(JSContext *ctx, JSObject *p,
         p->u.array.count = new_len;
         compact_array_string(p)->len = new_len;
         JS_FreeValue(ctx, val);
-        return TRUE;
+        goto done;
     }
     if (is_compact_array(p) &&
         convert_compact_array_to_values(ctx, p)) {
@@ -11589,7 +11589,8 @@ static inline int add_fast_array_element(JSContext *ctx, JSObject *p,
             ctx, p, 1, &appended, new_len, capacity_checkpoint);
         if (repacked != 0) {
             JS_FreeValue(ctx, val);
-            return repacked < 0 ? -1 : TRUE;
+            if (repacked < 0) return -1;
+            goto done;
         }
     }
     if (unlikely(new_len > p->u.array.u1.size)) {
@@ -11600,6 +11601,11 @@ static inline int add_fast_array_element(JSContext *ctx, JSObject *p,
     }
     p->u.array.u.values[new_len - 1] = val;
     p->u.array.count = new_len;
+ done:
+    /* Allocation or representation conversion may refuse. Publish length
+       only after the element and its backing have both committed. */
+    if (update_length)
+        p->prop[0].u.value = JS_NewInt32(ctx, new_len);
     return TRUE;
 }
 
@@ -11909,6 +11915,8 @@ int JS_SetPropertyInternal(JSContext *ctx, JSValueConst obj,
                 __JS_AtomIsTaggedInt(prop)) {
                 uint32_t idx = __JS_AtomToUInt32(prop);
                 if (idx == p->u.array.count) {
+                    if (idx == INT32_MAX)
+                        goto generic_create_prop;
                     /* fast case */
                     return add_fast_array_element(ctx, p, val, flags);
                 } else {
@@ -12001,6 +12009,7 @@ static int JS_SetPropertyValue(JSContext *ctx, JSValueConst this_obj,
             if (unlikely(idx >= (uint32_t)p->u.array.count)) {
                 /* fast path to add an element to the array */
                 if (unlikely(idx != (uint32_t)p->u.array.count ||
+                             idx == INT32_MAX ||
                              !p->fast_array ||
                              !can_extend_fast_array(p))) {
                     goto slow_path;
@@ -12193,6 +12202,8 @@ static int JS_CreateProperty(JSContext *ctx, JSObject *p,
                     if (idx == p->u.array.count) {
                         if (!p->extensible)
                             goto not_extensible;
+                        if (idx == INT32_MAX)
+                            goto convert_to_array;
                         if (flags & (JS_PROP_HAS_GET | JS_PROP_HAS_SET))
                             goto convert_to_array;
                         prop_flags = get_prop_flags(flags, 0);
@@ -12730,13 +12741,21 @@ static int JS_DefineAutoInitProperty(JSContext *ctx, JSValueConst this_obj,
     return TRUE;
 }
 
+/* Borrowed-value form: the caller retains ownership on either outcome. */
+static int JS_DefinePropertyValueC(JSContext *ctx, JSValueConst this_obj,
+                                  JSAtom prop, JSValueConst val, int flags)
+{
+    return JS_DefineProperty(ctx, this_obj, prop, val, JS_UNDEFINED, JS_UNDEFINED,
+                            flags | JS_PROP_HAS_VALUE | JS_PROP_HAS_CONFIGURABLE |
+                            JS_PROP_HAS_WRITABLE | JS_PROP_HAS_ENUMERABLE);
+}
+
 /* shortcut to add or redefine a new property value */
 int JS_DefinePropertyValue(JSContext *ctx, JSValueConst this_obj,
                            JSAtom prop, JSValue val, int flags)
 {
     int ret;
-    ret = JS_DefineProperty(ctx, this_obj, prop, val, JS_UNDEFINED, JS_UNDEFINED,
-                            flags | JS_PROP_HAS_VALUE | JS_PROP_HAS_CONFIGURABLE | JS_PROP_HAS_WRITABLE | JS_PROP_HAS_ENUMERABLE);
+    ret = JS_DefinePropertyValueC(ctx, this_obj, prop, val, flags);
     JS_FreeValue(ctx, val);
     return ret;
 }
@@ -18905,7 +18924,7 @@ static int js_append_element(JSContext *ctx, JSValueConst target,
         JSObject *p = JS_VALUE_GET_OBJ(target);
         if (likely(p->class_id == JS_CLASS_ARRAY && p->fast_array &&
                    p->extensible && pos == p->u.array.count &&
-                   pos <= JS_ATOM_MAX_INT))
+                   pos < JS_ATOM_MAX_INT))
             return add_fast_array_element(ctx, p, val, flags);
     }
     return JS_DefinePropertyValueUint32(ctx, target, pos, val, JS_PROP_C_W_E);
@@ -59966,6 +59985,7 @@ static int js_proxy_get_own_property_names(JSContext *ctx,
 {
     JSProxyData *s;
     JSValue method, prop_array, val;
+    int64_t len64;
     uint32_t len, i, len2;
     JSPropertyEnum *tab, *tab2;
     JSAtom atom;
@@ -59987,8 +60007,16 @@ static int js_proxy_get_own_property_names(JSContext *ctx,
     len = 0;
     tab2 = NULL;
     len2 = 0;
-    if (js_get_length32(ctx, &len, prop_array))
+    if (js_get_length64(ctx, &len64, prop_array))
         goto fail;
+    /* Keep the target's 32-bit allocation ceiling on host builds too.
+       A small array-like trap result may claim an enormous length without
+       owning that storage; multiplication must never wrap before Budget. */
+    if (len64 > INT32_MAX || (uint64_t)len64 > UINT32_MAX / sizeof(tab[0])) {
+        JS_ThrowOutOfMemory(ctx);
+        goto fail;
+    }
+    len = len64;
     if (len > 0) {
         tab = js_mallocz(ctx, sizeof(tab[0]) * len);
         if (!tab)
@@ -62575,27 +62603,20 @@ static JSValue js_promise_withResolvers(JSContext *ctx,
     obj = JS_NewObject(ctx);
     if (JS_IsException(obj))
         goto exception;
-    if (JS_DefinePropertyValue(ctx, obj, JS_ATOM_promise, result_promise,
+    if (JS_DefinePropertyValueC(ctx, obj, JS_ATOM_promise, result_promise,
+                               JS_PROP_C_W_E) < 0 ||
+        JS_DefinePropertyValueC(ctx, obj, JS_ATOM_resolve, resolving_funcs[0],
+                               JS_PROP_C_W_E) < 0 ||
+        JS_DefinePropertyValueC(ctx, obj, JS_ATOM_reject, resolving_funcs[1],
                                JS_PROP_C_W_E) < 0) {
-        goto exception;
+    exception:
+        JS_FreeValue(ctx, obj);
+        obj = JS_EXCEPTION;
     }
-    result_promise = JS_UNDEFINED;
-    if (JS_DefinePropertyValue(ctx, obj, JS_ATOM_resolve, resolving_funcs[0],
-                               JS_PROP_C_W_E) < 0) {
-        goto exception;
-    }
-    resolving_funcs[0] = JS_UNDEFINED;
-    if (JS_DefinePropertyValue(ctx, obj, JS_ATOM_reject, resolving_funcs[1],
-                               JS_PROP_C_W_E) < 0) {
-        goto exception;
-    }
-    return obj;
-exception:
     JS_FreeValue(ctx, resolving_funcs[0]);
     JS_FreeValue(ctx, resolving_funcs[1]);
     JS_FreeValue(ctx, result_promise);
-    JS_FreeValue(ctx, obj);
-    return JS_EXCEPTION;
+    return obj;
 }
 
 static JSValue js_promise_try(JSContext *ctx, JSValueConst this_val,

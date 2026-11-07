@@ -123,6 +123,18 @@ void script_runtime_destroy(ScriptRuntime *runtime)
         }
         JS_FreeValue(runtime->context, runtime->host_global);
         runtime->host_global = JS_UNDEFINED;
+        JS_FreeValue(runtime->context, runtime->host_visual_viewport);
+        runtime->host_visual_viewport = JS_UNDEFINED;
+        JS_FreeValue(runtime->context, runtime->host_window_dispatch);
+        runtime->host_window_dispatch = JS_UNDEFINED;
+        JS_FreeValue(runtime->context, runtime->host_viewport_dispatch);
+        runtime->host_viewport_dispatch = JS_UNDEFINED;
+        JS_FreeValue(runtime->context, runtime->host_event_constructor);
+        runtime->host_event_constructor = JS_UNDEFINED;
+        JS_FreeValue(runtime->context, runtime->host_trusted_event);
+        runtime->host_trusted_event = JS_UNDEFINED;
+        JS_FreeValue(runtime->context, runtime->viewport_resize_dispatch);
+        runtime->viewport_resize_dispatch = JS_UNDEFINED;
 #ifdef JS_RT_XHR_DIAGNOSTICS
         JS_FreeValue(runtime->context, runtime->private_outcome_classifier);
         runtime->private_outcome_classifier = JS_UNDEFINED;

@@ -882,6 +882,11 @@ void js_rt_geometry_opacity_write_end(DomBridge *bridge)
     runtime->geometry_paint_stale = true;
 }
 
+void script_runtime_notify_viewport_changed(ScriptRuntime *runtime)
+{
+    if (runtime != NULL) runtime->viewport_resize_phase = 1u;
+}
+
 void script_runtime_set_viewport(ScriptRuntime *runtime, int css_width,
                                  int css_height, int device_width,
                                  int device_height)
@@ -914,6 +919,18 @@ void script_runtime_set_viewport(ScriptRuntime *runtime, int css_width,
                              JS_NewInt32(runtime->context, css_width));
     (void) JS_SetPropertyStr(runtime->context, global, "innerHeight",
                              JS_NewInt32(runtime->context, css_height));
+    /* Keep the captured object, not an author replacement of Window's
+       visualViewport. No author event is delivered until commit. */
+    if (JS_IsObject(runtime->host_visual_viewport)) {
+        (void) JS_SetPropertyStr(runtime->context, runtime->host_visual_viewport,
+                                 "width", JS_NewInt32(runtime->context, css_width));
+        (void) JS_SetPropertyStr(runtime->context, runtime->host_visual_viewport,
+                                 "height", JS_NewInt32(runtime->context, css_height));
+        (void) JS_SetPropertyStr(runtime->context, runtime->host_visual_viewport,
+                                 "scale", JS_NewFloat64(runtime->context,
+                                     runtime->diagnostic_mobile_safari ? 1.0
+                                         : (double) device_width / (double) css_width));
+    }
     JS_FreeValue(runtime->context, global);
 }
 

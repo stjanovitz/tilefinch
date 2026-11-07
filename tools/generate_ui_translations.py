@@ -43,6 +43,7 @@ CATALOGS.append((11, list(latest_languages.values())))
 CATALOGS.append((12, list(latest_languages.values())))
 CATALOGS.append((13, list(latest_languages.values())))
 CATALOGS.append((14, list(latest_languages.values())))
+CATALOGS.append((15, list(latest_languages.values())))
 ACTIVE_VERSION = CATALOGS[-1][0]
 # Keys a version drops because the browser no longer looks them up. Every
 # other key of the previous version must remain, so a newly added locale

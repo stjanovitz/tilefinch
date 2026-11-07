@@ -569,6 +569,93 @@ static void psp_setting_page_font_percent(
     }
 }
 
+/* A Left/Right press shows the new Page zoom at once; the page follows
+   when the choice rests this long, so stepping through several values
+   costs one relayout. */
+#define PSP_PAGE_ZOOM_SETTLE_US UINT64_C(400000)
+
+static void psp_setting_page_zoom(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    unsigned percent = intent->setting.value.unsigned_value;
+    if (!viewport_page_zoom_valid(percent)) return;
+    app->process->presentation.ui.page_zoom_percent = percent;
+    app->interactive->page_zoom_pending = true;
+    app->interactive->page_zoom_changed_us = frame->ui_sample_us;
+    char status[48];
+    snprintf(status, sizeof(status), "%s %u%%", "PAGE ZOOM", percent);
+    psp_ui_show_status(&app->process->presentation.ui, status, 180);
+}
+
+void psp_app_page_zoom_settle(PspApp *app, PspAppFrameState *frame)
+{
+    PspInteractiveState *interactive = app->interactive;
+    if (!interactive->page_zoom_pending
+        || frame->ui_sample_us - interactive->page_zoom_changed_us
+               < PSP_PAGE_ZOOM_SETTLE_US) return;
+    BrowserEngine *engine = app->browser->engine;
+    BrowserProfile *profile = app->browser->profile;
+    PspUiState *ui = &app->process->presentation.ui;
+    bool extracted = ui->reader_mode || ui->basic_mode;
+    unsigned percent = ui->page_zoom_percent;
+    /* A navigation in flight resolves its page at the stored zoom; the
+       page it commits is checked again on a later frame. */
+    if (browser_engine_navigation_pending(engine)) {
+        (void) browser_engine_set_page_zoom(
+            engine, extracted ? VIEWPORT_PAGE_ZOOM_DEFAULT : percent);
+        return;
+    }
+    interactive->page_zoom_pending = false;
+    bool applied;
+    if (extracted) {
+        /* Reader and Basic view lay out at 100%; leaving them applies the
+           stored zoom with the page's own sheet. */
+        applied = true;
+    } else if (!browser_engine_page_loaded(engine)) {
+        applied = browser_engine_set_page_zoom(
+            engine, extracted ? VIEWPORT_PAGE_ZOOM_DEFAULT : percent);
+    } else {
+        uint64_t shell = browser_engine_render_shell_serial(engine);
+        /* A delayed apply is still potentially expensive. Keep native input
+           and cancellation serviced over the immutable incumbent frame. */
+        bool scope = !psp_navigation_cooperate_active();
+        bool owner_scope = scope && !ui->page_gamepad_capture;
+        if (owner_scope)
+            psp_runtime_cooperate_begin(ui, app->views->frame,
+                                        &interactive->toolbar_input);
+        else if (scope)
+            psp_work_cooperate_begin(ui, app->views->frame,
+                true, true, false, "STOPPING PAGE UPDATE...", "page-zoom",
+                engine, NULL);
+        applied = browser_engine_apply_page_zoom(engine, percent);
+        if (owner_scope) {
+            uint32_t observed = 0;
+            if (psp_runtime_cooperate_end(&observed))
+                interactive->previous_buttons = psp_ui_buttons(observed);
+        } else if (scope)
+            psp_navigation_cooperate_end_adopting_buttons(
+                "page-zoom", &interactive->previous_buttons);
+        if (applied && browser_engine_render_shell_serial(engine) != shell) {
+            (void) psp_engine_views_refresh(app->views, engine);
+            frame->page_dirty = true;
+        }
+    }
+    if (applied) {
+        if (browser_profile_page_zoom_percent(profile) != percent) {
+            browser_profile_set_page_zoom_percent(profile, percent);
+            psp_profile_store_mark_dirty(
+                &app->browser->profile_store, frame->ui_sample_us);
+        }
+        return;
+    }
+    /* Refused (usually for memory): the transaction left the page, its
+       zoom and its sheet as they were. Show the zoom it still has. */
+    printf("tilefinch-page-zoom: percent=%u refused error=\"%s\"\n",
+           percent, browser_engine_last_error(engine));
+    ui->page_zoom_percent = browser_profile_page_zoom_percent(profile);
+    psp_ui_show_status(ui, "PAGE ZOOM UNAVAILABLE", 240);
+}
+
 static void psp_setting_reader_font(
     PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
 {
@@ -1693,6 +1780,9 @@ void psp_app_apply_setting(
         break;
     case PSP_UI_SETTING_PAGE_FONT_PERCENT:
         psp_setting_page_font_percent(app, frame, intent);
+        break;
+    case PSP_UI_SETTING_PAGE_ZOOM:
+        psp_setting_page_zoom(app, frame, intent);
         break;
     case PSP_UI_SETTING_READER_FONT:
         psp_setting_reader_font(app, frame, intent);

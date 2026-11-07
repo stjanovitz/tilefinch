@@ -68,6 +68,8 @@ Lab tools with their own pages:
   reconciler and lease-based teardown.
 - [PSP_TRANSPORT.md](PSP_TRANSPORT.md): owned curl/Mbed TLS/nghttp2
   transport, worker boundary, entropy and TLS reuse.
+- [VIEWPORT.md](VIEWPORT.md): meta viewport resolution, CSS/device
+  conversion, and how Page zoom composes with a page's own viewport.
 
 ## Parked directions
 

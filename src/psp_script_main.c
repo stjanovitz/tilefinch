@@ -3476,6 +3476,7 @@ static TILEFINCH_HOT_BOUNDARY void psp_loop_frame(PspLoop *loop)
         render_visual_state = psp_loop_render_job(loop, &frame);
     if (browser_profile_restore_last_page(browser->profile))
         psp_loop_track_recovery(loop);
+    psp_app_page_zoom_settle(app, &frame);
     bool profile_flush_attempted = false;
     if (!psp_profile_store_flush_due(
             &browser->profile_store, frame.ui_sample_us, UINT64_C(750000),

@@ -4492,6 +4492,7 @@ bool document_mobile_viewport(const PocDocument *document, int device_width,
             continue;
         }
         viewport->layout_width = (int) parsed;
+        viewport->fixed_width = true;
         viewport->scale_numerator = device_width;
         viewport->scale_denominator = (int) parsed;
         return true;

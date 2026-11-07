@@ -600,9 +600,14 @@ static bool navigation_load_initialize_document_stream(
     snprintf(stream->initiator_referrer_policy,
              sizeof(stream->initiator_referrer_policy), "%s",
              load->session->page.referrer_policy);
+    /* Until the head's metadata resolves the page's own viewport, assume
+       it follows the device width at the user's zoom. */
     if (!viewport_context_init(
             &stream->viewport, load->viewport_width, 272,
-            load->viewport_width, 272)) return false;
+            load->viewport_width, 272)
+        || !viewport_apply_page_zoom(
+            &stream->viewport, navigation_page_zoom(load->session)))
+        return false;
     /* A transactional candidate joins the incumbent page's domain, so their
        independent scheduler views cannot multiply the per-session bound.
        Initial and post-retirement loads establish a fresh page domain. */

@@ -964,6 +964,13 @@ if(PSP_BROWSER_BUILD_TESTS)
         LABELS "tilefinch;unit;storage;psp"
         TIMEOUT 10)
 
+    tilefinch_add_test_binary(tilefinch-page-zoom-tests tests/test_page_zoom.c)
+    target_link_libraries(tilefinch-page-zoom-tests PRIVATE tilefinch_core)
+    add_test(NAME tilefinch-page-zoom-tests COMMAND tilefinch-page-zoom-tests)
+    set_tests_properties(tilefinch-page-zoom-tests PROPERTIES
+        LABELS "tilefinch;unit;layout;navigation;psp"
+        TIMEOUT 60)
+
     tilefinch_add_test_binary(tilefinch-page-find-tests tests/test_page_find.c)
     target_link_libraries(tilefinch-page-find-tests PRIVATE tilefinch_core)
     add_test(NAME tilefinch-page-find-tests COMMAND tilefinch-page-find-tests)

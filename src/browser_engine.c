@@ -6206,8 +6206,9 @@ bool browser_engine_set_user_css(
     return navigation_set_user_css(&engine->navigation, css, length);
 }
 
-bool browser_engine_apply_user_css(
-    BrowserEngine *engine, const char *css, size_t length)
+static bool browser_engine_apply_presentation_transaction(
+    BrowserEngine *engine, const char *css, size_t length, bool zoom,
+    unsigned zoom_percent)
 {
     if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
         || !engine->navigation_ready || (css == NULL && length != 0)
@@ -6219,8 +6220,10 @@ bool browser_engine_apply_user_css(
     NavigationSession *navigation = &engine->navigation;
     lxb_dom_node_t *focused_node = engine->controller_ready
         ? controller_focused_node(&engine->controller) : NULL;
-    NavigationUserCssTransaction *transaction =
-        navigation_apply_user_css_begin(navigation, css, length);
+    NavigationUserCssTransaction *transaction = zoom
+        ? navigation_apply_presentation_begin(
+              navigation, css, length, zoom_percent)
+        : navigation_apply_user_css_begin(navigation, css, length);
     if (transaction == NULL) return false;
 
     /* Build the replacement controller/tile cache while the incumbent shell
@@ -6241,6 +6244,61 @@ bool browser_engine_apply_user_css(
     navigation_apply_user_css_commit(navigation, transaction);
     clear_error(engine);
     return true;
+}
+
+bool browser_engine_apply_user_css(
+    BrowserEngine *engine, const char *css, size_t length)
+{
+    return browser_engine_apply_presentation_transaction(
+        engine, css, length, false, 0u);
+}
+
+bool browser_engine_set_page_zoom(BrowserEngine *engine, unsigned percent)
+{
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        || !engine->navigation_ready) return false;
+    return navigation_set_page_zoom(&engine->navigation, percent);
+}
+
+unsigned browser_engine_page_zoom(const BrowserEngine *engine)
+{
+    return engine == NULL || !engine->navigation_ready
+            || engine->navigation.page_zoom_percent == 0u
+        ? VIEWPORT_PAGE_ZOOM_DEFAULT : engine->navigation.page_zoom_percent;
+}
+
+bool browser_engine_apply_page_zoom(BrowserEngine *engine, unsigned percent)
+{
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        || !engine->navigation_ready
+        || browser_engine_navigation_pending(engine)) return false;
+    NavigationSession *navigation = &engine->navigation;
+    if (navigation_presentation_unchanged(
+            navigation, navigation->user_css, navigation->user_css_length,
+            percent))
+        return navigation_set_page_zoom(navigation, percent);
+    return browser_engine_apply_presentation(
+        engine, navigation->user_css, navigation->user_css_length, percent);
+}
+
+bool browser_engine_apply_presentation(
+    BrowserEngine *engine, const char *css, size_t length,
+    unsigned zoom_percent)
+{
+    if (!viewport_page_zoom_valid(zoom_percent)) return false;
+    /* A zoom change that leaves the page's viewport and sheet as they are
+       (a desktop-width page zoomed out) is only remembered. The same zoom
+       always relays out: callers use that to pick up other changes, such
+       as a newly installed glyph pack. */
+    if (engine != NULL && engine->state == BROWSER_ENGINE_ACTIVE
+        && engine->navigation_ready
+        && !browser_engine_navigation_pending(engine)
+        && zoom_percent != browser_engine_page_zoom(engine)
+        && navigation_presentation_unchanged(&engine->navigation, css,
+                                             length, zoom_percent))
+        return navigation_set_page_zoom(&engine->navigation, zoom_percent);
+    return browser_engine_apply_presentation_transaction(
+        engine, css, length, true, zoom_percent);
 }
 
 #include "browser_engine/reader_recovery.inc"

@@ -105,7 +105,8 @@ An article made of lists rather than paragraphs stays manual.
 ## Font and size
 
 **Reader font** is a saved Sans or Serif choice. While Reader mode is active,
-the normal page text-size control adjusts Reader text. **Remember size** is
+the normal page text-size control adjusts Reader text. Reader mode lays out
+at 100% whatever the Page zoom setting. **Remember size** is
 off by default; when it is on, the profile records only the size for the
 page's registrable site, so sibling hosts such as `en.example.org` and
 `m.example.org` share one value. Turning the option off clears the saved

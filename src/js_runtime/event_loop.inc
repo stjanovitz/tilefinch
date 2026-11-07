@@ -472,7 +472,8 @@ bool script_runtime_has_pending_author_work(ScriptRuntime *runtime)
             || runtime->pending_network_tasks != 0u
             || runtime->bridge.async_fetch_count != 0u
             || script_runtime_has_pending_startup_scripts(runtime)
-            || runtime->page_visibility_queue_count != 0u);
+            || runtime->page_visibility_queue_count != 0u
+            || runtime->viewport_resize_phase != 0u);
 }
 
 
@@ -615,6 +616,43 @@ static bool runtime_call_host(ScriptRuntime *runtime,
     js_lazy_webpack_recover_failure(runtime);
     document_allocation_owner_leave(runtime->document, previous_owner);
     return true;
+}
+
+static bool runtime_call_captured(ScriptRuntime *runtime,
+                                  JSValueConst function,
+                                  const char *diagnostic_name,
+                                  int argc, JSValueConst *argv,
+                                  JSValue *returned);
+
+static bool runtime_dispatch_viewport_resize(ScriptRuntime *runtime, bool visual)
+{
+    if (JS_IsUndefined(runtime->viewport_resize_dispatch)) {
+        /* Private, first-use code: eager bootstrap closures tip the small
+           parser realms over their unchanged heap limit. Captured objects
+           and dispatchers cannot be replaced by author globals. */
+        static const char source[] =
+            "(function(visual,vp,dispatch,dispatchVp,EventCtor,trusted){"
+            "const event=trusted(new EventCtor('resize'));"
+            "if(!visual){dispatch(event);return;}"
+            "dispatchVp(vp,event,null,null,()=>{"
+            "const handler=vp.onresize;if(typeof handler!=='function')return;"
+            "try{__tilefinchRunTask('visual-viewport-handler:resize',handler,vp,[event]);}"
+            "catch(error){__tilefinchReportUncaught(error,'visualViewport resize');}"
+            "});"
+            "})";
+        JSValue function = JS_Eval(runtime->context, source, sizeof(source) - 1u,
+                                   "<viewport-resize>", JS_EVAL_TYPE_GLOBAL);
+        if (JS_IsException(function)) {
+            js_rt_record_exception(runtime->context, &runtime->result);
+            return false;
+        }
+        runtime->viewport_resize_dispatch = function;
+    }
+    JSValue arguments[] = {JS_NewBool(runtime->context, visual), runtime->host_visual_viewport,
+        runtime->host_window_dispatch, runtime->host_viewport_dispatch,
+        runtime->host_event_constructor, runtime->host_trusted_event};
+    return runtime_call_captured(runtime, runtime->viewport_resize_dispatch,
+        "viewport resize", 6, arguments, NULL);
 }
 
 static bool gamepad_state_equal(const TilefinchGamepadState *left,

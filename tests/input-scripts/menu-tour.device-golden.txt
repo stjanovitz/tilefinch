@@ -32,7 +32,7 @@ tilefinch-input-script: mark=reader-site step=58 screen=site-controls
 tilefinch-input-script: mark=appearance step=65 screen=option-items
 tilefinch-input-script: step=65 action=none setting=browser-ui-scale screen=option-items list=0 tab=0
 tilefinch-input-script: step=67 action=none setting=page-font-percent screen=option-items list=0 tab=0
-tilefinch-input-script: step=69 action=none setting=reader-font screen=option-items list=0 tab=0
+tilefinch-input-script: step=69 action=none setting=page-zoom screen=option-items list=0 tab=0
 tilefinch-input-script: mark=appearance-done step=74 screen=menu
 tilefinch-input-script: mark=help step=78 screen=help
 tilefinch-input-script: step=82 action=home setting=none screen=home list=0 tab=0
@@ -57,5 +57,5 @@ tilefinch-input-script: covered action=collection-activate count=1
 tilefinch-input-script: covered action=exit count=1
 tilefinch-input-script: covered setting=browser-ui-scale count=1
 tilefinch-input-script: covered setting=page-font-percent count=1
-tilefinch-input-script: covered setting=reader-font count=1
+tilefinch-input-script: covered setting=page-zoom count=1
 tilefinch-input-script: outcome=exit-action steps=92/96 frames=396 held-frames=81 actions=16 settings=3

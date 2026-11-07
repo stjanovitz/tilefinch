@@ -115,8 +115,16 @@ static bool psp_input_gamepad_was_connected;
 /* Coverage tally. Indexed by enum value; both spaces are small and closed,
    and the summary prints only the entries a run actually reached. */
 #define PSP_INPUT_SCRIPT_ACTION_SLOTS ((unsigned) PSP_UI_ACTION_EXIT + 1u)
+/* Every setting the .def lists, including ones appended after the gamepad
+   mapping (which this bound used to stop at, so later rows went uncounted). */
+enum {
+#define PSP_UI_SETTING(id, script_name) PSP_INPUT_SCRIPT_SETTING_SLOT_##id,
+#include "tilefinch/psp_ui_settings.def"
+#undef PSP_UI_SETTING
+    PSP_INPUT_SCRIPT_SETTING_SLOT_COUNT
+};
 #define PSP_INPUT_SCRIPT_SETTING_SLOTS \
-    ((unsigned) PSP_UI_SETTING_GAMEPAD_FACE_MAPPING + 1u)
+    ((unsigned) PSP_INPUT_SCRIPT_SETTING_SLOT_COUNT)
 static uint16_t psp_input_script_action_hits[PSP_INPUT_SCRIPT_ACTION_SLOTS];
 static uint16_t psp_input_script_setting_hits[PSP_INPUT_SCRIPT_SETTING_SLOTS];
 

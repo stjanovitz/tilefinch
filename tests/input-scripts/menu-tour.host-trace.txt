@@ -31,12 +31,12 @@ mark reader-site screen=site-controls
 mark appearance screen=option-items
 step=66 action=none setting=browser-ui-scale screen=option-items menu=4 option=0 group=0 tab=0
 step=68 action=none setting=page-font-percent screen=option-items menu=4 option=1 group=0 tab=0
-step=70 action=none setting=reader-font screen=option-items menu=4 option=2 group=0 tab=0
+step=70 action=none setting=page-zoom screen=option-items menu=4 option=52 group=0 tab=0
 mark appearance-done screen=menu
 mark help screen=help
-step=83 action=home setting=none screen=home menu=0 option=2 group=0 tab=0
+step=83 action=home setting=none screen=home menu=0 option=52 group=0 tab=0
 mark home screen=home
 mark home-moved screen=home
-step=92 action=exit setting=none screen=home menu=6 option=2 group=0 tab=0
+step=92 action=exit setting=none screen=home menu=6 option=52 group=0 tab=0
 mark exiting screen=home
 outcome complete frames=402 steps=95/96

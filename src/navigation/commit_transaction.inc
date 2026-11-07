@@ -1329,14 +1329,13 @@ static TILEFINCH_OUT_OF_LINE bool commit_setup(NavigationSession *session,
         session->page.resource_scheduler = txn->streaming->scheduler;
         txn->streaming->scheduler_transferred = true;
     }
-    if (!viewport_context_resolve(&session->viewport,
-                                  &session->page.document,
-                                  txn->viewport_width, 272, 980)) {
+    if (!navigation_resolve_page_viewport(
+            session, &session->page.document, txn->viewport_width, 272,
+            navigation_page_zoom(session), &session->viewport)) {
         snprintf(session->last_error, sizeof(session->last_error),
                  "mobile viewport resolution failed");
         return false;
     }
-    navigation_apply_declared_viewport(session, txn->viewport_width, 272);
     if (session->page.runtime != NULL) {
         script_runtime_set_viewport(
             session->page.runtime, session->viewport.css_width,

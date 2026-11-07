@@ -247,6 +247,13 @@ bool browser_profile_save(const BrowserProfile *profile, const char *path);
 
 unsigned browser_profile_ui_scale(const BrowserProfile *profile);
 unsigned browser_profile_page_font_percent(const BrowserProfile *profile);
+/* Settings -> Appearance -> Web pages text sizes, smallest first. */
+#define BROWSER_PAGE_FONT_STEP_COUNT 6u
+extern const unsigned browser_page_font_steps[BROWSER_PAGE_FONT_STEP_COUNT];
+bool browser_profile_page_font_percent_valid(unsigned percent);
+/* Settings -> Appearance -> Page zoom: a viewport_page_zoom_steps value,
+   100 for a profile without a PAGEZOOM record. */
+unsigned browser_profile_page_zoom_percent(const BrowserProfile *profile);
 bool browser_profile_history_enabled(const BrowserProfile *profile);
 bool browser_profile_restore_last_page(const BrowserProfile *profile);
 bool browser_profile_tab_hibernation_enabled(const BrowserProfile *profile);
@@ -407,6 +414,8 @@ bool browser_profile_update_check_due(
     const BrowserProfile *profile, uint64_t now_unix_seconds);
 void browser_profile_set_ui_scale(BrowserProfile *profile, unsigned scale);
 void browser_profile_set_page_font_percent(
+    BrowserProfile *profile, unsigned percent);
+void browser_profile_set_page_zoom_percent(
     BrowserProfile *profile, unsigned percent);
 void browser_profile_set_history_enabled(
     BrowserProfile *profile, bool enabled);

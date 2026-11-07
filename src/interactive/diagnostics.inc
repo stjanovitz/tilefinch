@@ -27,7 +27,7 @@ static void usage(const char *program)
             "[--script-heap-mb N] [--script-total-mb N] "
             "[--script-file-kb N] [--script-count N] "
             "[--visual-state-marker TEXT] [--visual-evidence] "
-            "[--viewport-css-width N] [--viewport-css-height N] "
+            "[--viewport-css-width N] [--viewport-css-height N] [--page-zoom N] "
             "[--block-origin HOST]... "
             "[--content-blocker off|basic|custom] "
             "[--content-blocker-list FILE] "

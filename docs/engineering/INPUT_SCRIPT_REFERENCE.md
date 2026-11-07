@@ -384,7 +384,7 @@ the principal surfaces, and exit through the menu.
 
 Covered action receivers include focus and page movement, reload, Reader mode,
 tab creation/switching, collections, back, bookmark, home, and exit. The tour
-also covers UI scale, page font scale, Reader font and site scale, color mode,
+also covers UI scale, page font scale, page zoom, Reader site scale, color mode,
 chrome theme, and video scaling.
 
 Text-entry modals, live navigation, site data, screenshots, and seeded

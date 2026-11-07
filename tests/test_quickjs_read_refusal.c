@@ -188,6 +188,213 @@ static int captured_reference_limit(void)
     return okay ? 0 : 1;
 }
 
+static int promise_publication_refusal(void)
+{
+    unsigned refusals = 0, successes = 0;
+    for (unsigned nth = 1; nth <= 64; nth++) {
+        Budget budget;
+        budget_init(&budget, 4u * 1024u * 1024u);
+        BudgetQuickJSPool *pool = budget_quickjs_pool_create(&budget);
+        JSRuntime *rt = pool ? JS_NewRuntime2(budget_quickjs_pool_allocator(), pool) : NULL;
+        JSContext *ctx = rt ? JS_NewContext(rt) : NULL;
+        if (!ctx) return 1;
+        JSValue global = JS_GetGlobalObject(ctx);
+        JSValue ctor = JS_GetPropertyStr(ctx, global, "Promise");
+        JSValue factory = JS_GetPropertyStr(ctx, ctor, "withResolvers");
+        JSValue warm = JS_Call(ctx, factory, ctor, 0, NULL);
+        bool okay = !JS_IsException(warm);
+        JS_FreeValue(ctx, warm);
+        JS_RunGC(rt);
+        JS_TestRefuseAllocation(nth);
+        JSValue record = JS_Call(ctx, factory, ctor, 0, NULL);
+        JS_TestRefuseAllocation(0);
+        if (JS_IsException(record)) {
+            refusals++;
+            JS_FreeValue(ctx, JS_GetException(ctx));
+        } else {
+            successes++;
+            JSValue promise = JS_GetPropertyStr(ctx, record, "promise");
+            JSValue resolve = JS_GetPropertyStr(ctx, record, "resolve");
+            JSValue reject = JS_GetPropertyStr(ctx, record, "reject");
+            okay = okay && JS_IsObject(promise) && JS_IsFunction(ctx, resolve)
+                && JS_IsFunction(ctx, reject) && !JS_HasException(ctx);
+            JS_FreeValue(ctx, record);
+            record = JS_UNDEFINED;
+            JS_RunGC(rt);
+            JSValue answer = JS_NewInt32(ctx, 42);
+            JSValue called = JS_Call(ctx, nth & 1u ? resolve : reject,
+                                      JS_UNDEFINED, 1, &answer);
+            JSValue settled = JS_PromiseResult(ctx, promise);
+            int32_t number = 0;
+            okay = okay && !JS_IsException(called)
+                && JS_PromiseState(ctx, promise)
+                    == (nth & 1u ? JS_PROMISE_FULFILLED : JS_PROMISE_REJECTED)
+                && JS_ToInt32(ctx, &number, settled) == 0 && number == 42;
+            JS_FreeValue(ctx, settled);
+            JS_FreeValue(ctx, called);
+            JS_FreeValue(ctx, reject);
+            JS_FreeValue(ctx, resolve);
+            JS_FreeValue(ctx, promise);
+        }
+        JS_FreeValue(ctx, record);
+        JS_FreeValue(ctx, factory);
+        JS_FreeValue(ctx, ctor);
+        JS_FreeValue(ctx, global);
+        JS_FreeContext(ctx);
+        JS_FreeRuntime(rt);
+        okay = budget_quickjs_pool_destroy(pool) && budget.current == 0 && okay;
+        if (!okay) {
+            fprintf(stderr, "promise publication refusal failed at allocation %u\n", nth);
+            return 1;
+        }
+    }
+    if (!refusals || !successes) return 1;
+    puts("Promise publication ownership under refusal: PASS");
+    return 0;
+}
+
+static int append_publication_refusal(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * 1024u * 1024u);
+    BudgetQuickJSPool *pool = budget_quickjs_pool_create(&budget);
+    JSRuntime *rt = pool ? JS_NewRuntime2(budget_quickjs_pool_allocator(), pool) : NULL;
+    JSContext *ctx = rt ? JS_NewContext(rt) : NULL;
+    if (!ctx) return 1;
+    const char *initial[] = {"'a'", "128", "-1", "1000", "1.5", "128", "128"};
+    const char *appended[] = {"'b'", "129", "-2", "1001", "2.5", "1000", "2.5"};
+    bool okay = true;
+    unsigned failures[7] = {0};
+    for (unsigned kind = 0; okay && kind < 7; kind++) {
+        JSValue seed = JS_Eval(ctx, initial[kind], strlen(initial[kind]), "<append-seed>", 0);
+        JSValue value = JS_Eval(ctx, appended[kind], strlen(appended[kind]), "<append-value>", 0);
+        uint32_t samples = kind == 3 ? 160u : 48u;
+        for (uint32_t sample = 0; okay && sample < samples; sample++) {
+            /* Short backing is selected by the bounded repacker once the
+               initial ordinary numeric array reaches its checkpoint. The
+               range also crosses growth when compact storage is disabled. */
+            uint32_t length = kind == 3 ? 385u + sample : sample;
+            for (unsigned nth = 1; okay && nth <= 5; nth++) {
+                JSValue array = JS_NewArray(ctx);
+                for (uint32_t i = 0; okay && i < length; i++)
+                    okay = JS_SetPropertyUint32(ctx, array, i, JS_DupValue(ctx, seed)) >= 0;
+                JS_TestRefuseAllocation(nth);
+                int result = JS_SetPropertyUint32(ctx, array, length, JS_DupValue(ctx, value));
+                JS_TestRefuseAllocation(0);
+                if (result < 0) {
+                    failures[kind]++;
+                    JS_FreeValue(ctx, JS_GetException(ctx));
+                }
+                JSValue size = JS_GetPropertyStr(ctx, array, "length");
+                uint32_t actual = 0;
+                okay = okay && JS_ToUint32(ctx, &actual, size) == 0
+                    && actual == length + (result >= 0);
+                JS_FreeValue(ctx, size);
+                if (result >= 0) {
+                    JSValue last = JS_GetPropertyUint32(ctx, array, length);
+                    const char *got = JS_ToCString(ctx, last), *want = JS_ToCString(ctx, value);
+                    okay = okay && got && want && strcmp(got, want) == 0;
+                    JS_FreeCString(ctx, got);
+                    JS_FreeCString(ctx, want);
+                    JS_FreeValue(ctx, last);
+                }
+                if (length) {
+                    JSValue last = JS_GetPropertyUint32(ctx, array, length - 1u);
+                    const char *got = JS_ToCString(ctx, last), *want = JS_ToCString(ctx, seed);
+                    okay = okay && got && want && strcmp(got, want) == 0;
+                    JS_FreeCString(ctx, got);
+                    JS_FreeCString(ctx, want);
+                    JS_FreeValue(ctx, last);
+                }
+                JS_FreeValue(ctx, array);
+                if (!okay) fprintf(stderr, "append publication failed kind=%u length=%u allocation=%u\n", kind, length, nth);
+            }
+        }
+        okay = okay && failures[kind] != 0;
+        JS_FreeValue(ctx, value);
+        JS_FreeValue(ctx, seed);
+        JS_RunGC(rt);
+    }
+    const char control[] = "(()=>{const a=[1];Object.defineProperty(a,'length',{writable:false});"
+        "try{a.push(2);return false}catch(e){return a.length===1&&a[0]===1}})()";
+    JSValue result = JS_Eval(ctx, control, sizeof(control) - 1u, "<append-control>", 0);
+    okay = okay && JS_ToBool(ctx, result) == 1;
+    JS_FreeValue(ctx, result);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+    okay = budget_quickjs_pool_destroy(pool) && budget.current == 0 && okay;
+    if (okay) puts("Array append publication under refusal: PASS");
+    return okay ? 0 : 1;
+}
+
+typedef struct { BudgetQuickJSPool *pool; unsigned oversized; } GuardAllocator;
+static void *guard_malloc(JSMallocState *s, size_t size)
+{
+    GuardAllocator *guard = s->opaque;
+    if (size > UINT32_MAX) { guard->oversized++; return NULL; }
+    JSMallocState inner = *s;
+    inner.opaque = guard->pool;
+    void *result = budget_quickjs_pool_allocator()->js_malloc(&inner, size);
+    *s = inner; s->opaque = guard;
+    return result;
+}
+static void guard_free(JSMallocState *s, void *ptr)
+{
+    GuardAllocator *guard = s->opaque;
+    JSMallocState inner = *s;
+    inner.opaque = guard->pool;
+    budget_quickjs_pool_allocator()->js_free(&inner, ptr);
+    *s = inner; s->opaque = guard;
+}
+static void *guard_realloc(JSMallocState *s, void *ptr, size_t size)
+{
+    GuardAllocator *guard = s->opaque;
+    if (size > UINT32_MAX) { guard->oversized++; return NULL; }
+    JSMallocState inner = *s;
+    inner.opaque = guard->pool;
+    void *result = budget_quickjs_pool_allocator()->js_realloc(&inner, ptr, size);
+    *s = inner; s->opaque = guard;
+    return result;
+}
+static int ownkeys_allocation_bounds(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * 1024u * 1024u);
+    GuardAllocator guard = {budget_quickjs_pool_create(&budget), 0};
+    JSMallocFunctions allocator = {guard_malloc, guard_free, guard_realloc,
+        budget_quickjs_pool_allocator()->js_malloc_usable_size};
+    JSRuntime *rt = guard.pool ? JS_NewRuntime2(&allocator, &guard) : NULL;
+    JSContext *ctx = rt ? JS_NewContext(rt) : NULL;
+    if (!ctx) return 1;
+    const uint64_t lengths[] = {UINT32_MAX / sizeof(JSPropertyEnum) + UINT64_C(1),
+                               INT32_MAX, UINT64_C(4294967297)};
+    bool okay = true;
+    for (unsigned i = 0; okay && i < sizeof(lengths) / sizeof(lengths[0]); i++) {
+        char source[384];
+        snprintf(source, sizeof(source), "(()=>{let reads=0;const x=new Proxy({},"
+            "{ownKeys(){return {length:%.0f,get 0(){reads++;return 'a'}}}});"
+            "try{Reflect.ownKeys(x);return false}catch(e){return reads===0&&"
+            "e instanceof InternalError&&e.message==='out of memory'}})()", (double) lengths[i]);
+        JSValue result = JS_Eval(ctx, source, strlen(source), "<ownkeys-bounds>", 0);
+        okay = JS_ToBool(ctx, result) == 1 && guard.oversized == 0;
+        JS_FreeValue(ctx, result);
+        if (!okay) fprintf(stderr, "ownKeys allocation guard failed at case %u\n", i);
+    }
+    const char control[] = "(()=>{let reads=0;const x=new Proxy({}, {ownKeys(){return {"
+        "get length(){reads++;return 2},0:'a',1:'b'}}});"
+        "if(Reflect.ownKeys(x).join(',')!=='a,b'||reads!==1)return false;"
+        "const sentinel={};try{Reflect.ownKeys(new Proxy({}, {ownKeys(){return {"
+        "get length(){throw sentinel}}}}));return false}catch(e){return e===sentinel}})()";
+    JSValue result = JS_Eval(ctx, control, sizeof(control) - 1u, "<ownkeys-control>", 0);
+    okay = okay && JS_ToBool(ctx, result) == 1;
+    JS_FreeValue(ctx, result);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+    okay = budget_quickjs_pool_destroy(guard.pool) && budget.current == 0 && okay;
+    if (okay) puts("Proxy ownKeys portable allocation bounds: PASS");
+    return okay ? 0 : 1;
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2 && strcmp(argv[1], "--bigint-only") == 0)
@@ -198,6 +405,14 @@ int main(int argc, char **argv)
         return symbol_key_ownership();
     if (argc == 2 && strcmp(argv[1], "--capture-only") == 0)
         return captured_reference_limit();
+    if (argc == 2 && strcmp(argv[1], "--promise-only") == 0)
+        return promise_publication_refusal();
+    if (argc == 2 && strcmp(argv[1], "--append-only") == 0)
+        return append_publication_refusal();
+    if (argc == 2 && strcmp(argv[1], "--ownkeys-only") == 0)
+        return ownkeys_allocation_bounds();
     return unicode_refusal() || bigint_truncation()
-        || symbol_key_ownership() || captured_reference_limit();
+        || symbol_key_ownership() || captured_reference_limit()
+        || promise_publication_refusal() || append_publication_refusal()
+        || ownkeys_allocation_bounds();
 }

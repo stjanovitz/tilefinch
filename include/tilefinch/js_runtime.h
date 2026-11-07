@@ -2057,6 +2057,9 @@ void script_runtime_set_layout_region(ScriptRuntime *runtime, int region_end);
 void script_runtime_set_viewport(ScriptRuntime *runtime, int css_width,
                                  int css_height, int device_width,
                                  int device_height);
+/* Queue one coalesced resize task after a viewport transaction commits.
+   Geometry reads update synchronously in set_viewport, including rollback. */
+void script_runtime_notify_viewport_changed(ScriptRuntime *runtime);
 void script_runtime_set_images(ScriptRuntime *runtime,
                                ImageResources *images);
 /* Pause detached image work before replacing its borrowed stylesheet or

@@ -829,6 +829,9 @@ struct NavigationSession {
        meta-derived resolution; the device frame keeps its size. */
     int declared_css_width;
     int declared_css_height;
+    /* The user's page zoom (viewport_apply_page_zoom) for pages resolved
+       from here on; zero means 100. A declared viewport ignores it. */
+    unsigned page_zoom_percent;
     const FontSet *fonts;
     const ImageResources *images;
     bool external_resources_enabled;
@@ -1245,6 +1248,9 @@ void navigation_enable_web_fonts(
     size_t maximum_face_backend_bytes, long timeout_ms);
 bool navigation_set_user_css(NavigationSession *session, const char *css,
                              size_t length);
+/* The page zoom for pages resolved from now on; the current page keeps its
+   viewport until navigation_apply_presentation_begin. */
+bool navigation_set_page_zoom(NavigationSession *session, unsigned percent);
 void navigation_set_reader_candidate_mode(NavigationSession *session,
                                           bool enabled);
 /* Rebuilds user presentation CSS into staged stylesheet/layout values and
@@ -1253,6 +1259,19 @@ void navigation_set_reader_candidate_mode(NavigationSession *session,
    render shell, allowing allocation-free rollback across that boundary. */
 NavigationUserCssTransaction *navigation_apply_user_css_begin(
     NavigationSession *session, const char *css, size_t length);
+/* The same transaction, also applying page zoom: the page's viewport is
+   resolved again from its metadata at `zoom_percent` (a
+   viewport_page_zoom_steps value) and replaced when it differs. Commit and
+   rollback are navigation_apply_user_css_commit/_rollback. */
+NavigationUserCssTransaction *navigation_apply_presentation_begin(
+    NavigationSession *session, const char *css, size_t length,
+    unsigned zoom_percent);
+/* True when the loaded page already has this user sheet and `zoom_percent`
+   resolves to its current viewport (a desktop page at most zoom-out steps),
+   so a change to that zoom needs only navigation_set_page_zoom. */
+bool navigation_presentation_unchanged(const NavigationSession *session,
+                                       const char *css, size_t length,
+                                       unsigned zoom_percent);
 void navigation_apply_user_css_commit(
     NavigationSession *session, NavigationUserCssTransaction *transaction);
 bool navigation_apply_user_css_rollback(

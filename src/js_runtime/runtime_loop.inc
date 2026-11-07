@@ -1137,6 +1137,17 @@ bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
         microtask_elapsed_ns += js_rt_monotonic_time_ns() - phase_started;
     }
     size_t remaining = callback_budget;
+    for (unsigned stage = 0; stage < 2u && ok && !classic_continuation
+        && !js_rt_runtime_checkpoint_pending(runtime)
+        && runtime->viewport_resize_phase != 0u && remaining != 0
+        && runtime_task_slice_available(runtime, task_slice_started_ns,
+                                        remaining, callback_budget); stage++) {
+        bool visual = runtime->viewport_resize_phase == 2u;
+        runtime->viewport_resize_phase = visual ? 0u : 2u;
+        ok = runtime_dispatch_viewport_resize(runtime, visual);
+        remaining--;
+        if (ok) ok = js_rt_runtime_run_jobs(runtime);
+    }
     if (ok && !classic_continuation
         && !js_rt_runtime_checkpoint_pending(runtime)
         && runtime->page_visibility_queue_count != 0

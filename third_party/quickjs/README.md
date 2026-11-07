@@ -25,6 +25,10 @@ refusal), `79f58c104c` (truncated BigInt limb release), `5febaaa49f`
 refused), `ef5c6e356c` (signed BigInt decrement on 64-bit limbs),
 `e8b69194b3` (bound captured-variable indices and propagate compiler failures),
 and `c530305c0f` (balance symbol coercion when a property key is a built-in atom).
+The allocation-safety layer carries the applicable ownership part of
+`094306131a` (`Promise.withResolvers` cleanup), transactional array appends
+from `b25da59246` adapted to compact storage, and the proxy-key length guard
+from `e25861ca4c` with an additional 32-bit byte-overflow bound.
 `tilefinch-quickjs-read-refusal-tests` covers the two read-path fixes.
 
 ## Changes carried
@@ -111,6 +115,7 @@ pinned baseline fingerprint, which already contains them.
 | `heap-detail` | Host-only `JS_ComputeMemoryDetail` (`CONFIG_TILEFINCH_HEAP_DETAIL`) heap walk for the lab's heap census. | — |
 | `json-direct` | `JSON.parse` tokenizes the string in place instead of a UTF-8 copy, with identical results and errors. | `tilefinch-quickjs-json-parse-tests` |
 | `external-source` | `JS_SetExternalSourceHooks`: a stripped script's functions record offsets into embedder-held text for `toString()` and lazy compiles. | `tilefinch-quickjs-external-source-tests` |
+| `allocation-safety` | Promise result publication retains ownership through refusal; array append publishes length only after storage commits; proxy key tables reject lengths that cannot fit a 32-bit allocation. The noncompact lab variant uses the equivalent `allocation-safety-ordinary` patch. | `tilefinch-quickjs-read-refusal-tests` |
 
 ## Lab variants
 

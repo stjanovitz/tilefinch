@@ -1865,7 +1865,7 @@ static TILEFINCH_OUT_OF_LINE bool navigation_relayout_incremental(
             NavigationUserCssTransaction *transaction =
                 navigation_apply_presentation_css_begin(
                     session, session->user_css, session->user_css_length,
-                    false);
+                    false, NULL, session->page_zoom_percent);
             if (transaction != NULL)
                 navigation_apply_user_css_commit(session, transaction);
             break;
@@ -2649,6 +2649,8 @@ struct NavigationUserCssTransaction {
     ExternalStylesheetStats previous_external;
     LayoutDocument previous_layout;
     LayoutReuseCache *previous_layout_reuse;
+    ViewportContext previous_viewport;
+    unsigned previous_page_zoom_percent;
     size_t previous_incremental_relayouts;
     int previous_scroll;
     int previous_damage_left;
@@ -2677,13 +2679,18 @@ static void navigation_user_css_transaction_release(
     budget_free(session->budget, transaction);
 }
 
+/* `viewport` replaces the page's layout viewport (a page-zoom change) or is
+   NULL to keep it. */
 static NavigationUserCssTransaction *navigation_apply_presentation_css_begin(
     NavigationSession *session, const char *css, size_t length,
-    bool allow_author_fallback)
+    bool allow_author_fallback, const ViewportContext *viewport,
+    unsigned zoom_percent)
 {
     if (session == NULL || session->budget == NULL || !session->page.loaded
         || (css == NULL && length != 0) || length > 128u * 1024u)
         return NULL;
+    const ViewportContext *next_viewport =
+        viewport == NULL ? &session->viewport : viewport;
     /* Scroll anchoring below reads the reader's text anchor out of the
        page's layout: a bounded focus layout is completed first. */
     if (navigation_bounded_focus_region_end(session) != 0
@@ -2717,10 +2724,10 @@ static NavigationUserCssTransaction *navigation_apply_presentation_css_begin(
     if (okay) okay = session->external_resources_enabled
         ? stylesheet_build_context_deferred(
               &next_sheet, session->budget, &session->page.document,
-              &session->viewport)
+              next_viewport)
         : stylesheet_build_context(
               &next_sheet, session->budget, &session->page.document,
-              &session->viewport);
+              next_viewport);
     const char *document_url = session->page.document_url[0] == '\0'
         ? NULL : session->page.document_url;
     if (okay && session->external_resources_enabled) {
@@ -2737,10 +2744,18 @@ static NavigationUserCssTransaction *navigation_apply_presentation_css_begin(
         if (okay && !allow_author_fallback) {
             /* Optional re-sampling must not trade existing author styling
                for a pressure-skipped response in the replacement sheet. */
+            bool media_change = viewport != NULL
+                && (next_external.skipped_media != 0u
+                    || next_external.imports_skipped_conditions != 0u)
+                && next_external.skipped_limit == 0u
+                && next_external.skipped_pressure == 0u
+                && next_external.failed == 0u
+                && !next_external.deadline_exceeded;
             for (size_t i = 0; i < session->page.stylesheet_resources.count; i++) {
                 if (session->page.stylesheet_resources.items[i].rules_applied
                     && (i >= next_resources.count
-                        || !next_resources.items[i].rules_applied)) {
+                        || !next_resources.items[i].rules_applied)
+                    && !media_change) {
                     okay = false;
                     break;
                 }
@@ -2757,7 +2772,7 @@ static NavigationUserCssTransaction *navigation_apply_presentation_css_begin(
             memset(&next_external, 0, sizeof(next_external));
             okay = navigation_build_usable_stylesheet_fallback(
                 &next_sheet, session->budget, &session->page.document,
-                &session->viewport);
+                next_viewport);
             if (okay) session->performance.stylesheet_pressure_fallbacks++;
         }
     }
@@ -2772,7 +2787,7 @@ static NavigationUserCssTransaction *navigation_apply_presentation_css_begin(
         okay = layout_build_context_reuse(
             &next_layout, session->budget, &session->page.document,
             &next_sheet, session->fonts, session->images,
-            &session->viewport, NULL);
+            next_viewport, NULL);
     }
     if (!okay) {
         layout_destroy(&next_layout);
@@ -2789,8 +2804,19 @@ static NavigationUserCssTransaction *navigation_apply_presentation_css_begin(
     int viewport_offset = 0;
     const DrawCommand *anchor = navigation_scroll_text_anchor(
         &session->page.layout, old_scroll, &viewport_offset);
+    /* A zoom change keeps the anchor at the same place on screen: carry
+       its offset and the fallback scroll through device pixels. */
+    int fallback_scroll = old_scroll;
+    if (viewport != NULL) {
+        viewport_offset = viewport_device_to_css(
+            viewport, viewport_css_to_device(&session->viewport,
+                                             viewport_offset));
+        fallback_scroll = viewport_device_to_css(
+            viewport, viewport_css_to_device(&session->viewport,
+                                             old_scroll));
+    }
     int anchored_scroll = navigation_scroll_for_text_anchor(
-        &next_layout, anchor, viewport_offset, old_scroll);
+        &next_layout, anchor, viewport_offset, fallback_scroll);
     int old_height = session->page.layout.height;
     transaction->previous_user_css = session->user_css;
     transaction->previous_user_css_length = session->user_css_length;
@@ -2803,6 +2829,8 @@ static NavigationUserCssTransaction *navigation_apply_presentation_css_begin(
     transaction->previous_external = session->page.external_stylesheets;
     transaction->previous_layout = session->page.layout;
     transaction->previous_layout_reuse = session->page.layout_reuse;
+    transaction->previous_viewport = session->viewport;
+    transaction->previous_page_zoom_percent = session->page_zoom_percent;
     transaction->previous_incremental_relayouts =
         session->incremental_relayouts;
     transaction->previous_scroll = old_scroll;
@@ -2821,6 +2849,15 @@ static NavigationUserCssTransaction *navigation_apply_presentation_css_begin(
     session->page.external_stylesheets = next_external;
     session->user_css = copy;
     session->user_css_length = length;
+    if (viewport != NULL) {
+        session->viewport = *viewport;
+        if (session->page.runtime != NULL)
+            script_runtime_set_viewport(
+                session->page.runtime, viewport->css_width,
+                viewport->css_height, viewport->device_width,
+                viewport->device_height);
+    }
+    session->page_zoom_percent = zoom_percent;
     session->style_rebuild_required = false;
     session->relayout_damage_valid = true;
     session->relayout_damage_left = 0;
@@ -2844,7 +2881,56 @@ static NavigationUserCssTransaction *navigation_apply_presentation_css_begin(
 NavigationUserCssTransaction *navigation_apply_user_css_begin(
     NavigationSession *session, const char *css, size_t length)
 {
-    return navigation_apply_presentation_css_begin(session, css, length, true);
+    return session == NULL ? NULL : navigation_apply_presentation_css_begin(
+        session, css, length, true, NULL, session->page_zoom_percent);
+}
+
+static bool navigation_viewport_scale_equal(const ViewportContext *a,
+                                            const ViewportContext *b)
+{
+    return a->css_width == b->css_width && a->css_height == b->css_height
+        && a->scale_numerator == b->scale_numerator
+        && a->scale_denominator == b->scale_denominator;
+}
+
+NavigationUserCssTransaction *navigation_apply_presentation_begin(
+    NavigationSession *session, const char *css, size_t length,
+    unsigned zoom_percent)
+{
+    if (session == NULL || !viewport_page_zoom_valid(zoom_percent)
+        || !session->page.loaded) return NULL;
+    /* Resolve again rather than trusting the stored zoom: it also names
+       the zoom for the next navigation, which this page may predate. */
+    ViewportContext next;
+    if (!navigation_resolve_page_viewport(
+            session, &session->page.document,
+            session->viewport.device_width, session->viewport.device_height,
+            zoom_percent, &next)) return NULL;
+    bool same = navigation_viewport_scale_equal(&next, &session->viewport);
+    /* Only a changed presentation sheet (Reader/Basic) may intentionally
+       degrade author styling. Zoom alone must keep every applied source. */
+    bool same_css = length == session->user_css_length
+        && (length == 0 || (css != NULL
+            && !memcmp(css, session->user_css, length)));
+    return navigation_apply_presentation_css_begin(
+        session, css, length, !same_css, same ? NULL : &next, zoom_percent);
+}
+
+bool navigation_presentation_unchanged(const NavigationSession *session,
+                                       const char *css, size_t length,
+                                       unsigned zoom_percent)
+{
+    if (session == NULL || !viewport_page_zoom_valid(zoom_percent)
+        || !session->page.loaded || (css == NULL && length != 0)
+        || length != session->user_css_length
+        || (length != 0 && memcmp(css, session->user_css, length) != 0))
+        return false;
+    ViewportContext next;
+    return navigation_resolve_page_viewport(
+               session, &session->page.document,
+               session->viewport.device_width,
+               session->viewport.device_height, zoom_percent, &next)
+        && navigation_viewport_scale_equal(&next, &session->viewport);
 }
 
 void navigation_apply_user_css_commit(
@@ -2852,6 +2938,9 @@ void navigation_apply_user_css_commit(
 {
     if (session == NULL || transaction == NULL || !transaction->active
         || transaction->session != session) return;
+    if (!navigation_viewport_scale_equal(
+            &session->viewport, &transaction->previous_viewport))
+        script_runtime_notify_viewport_changed(session->page.runtime);
     navigation_user_css_transaction_release(session, transaction, true);
 }
 
@@ -2868,6 +2957,16 @@ bool navigation_apply_user_css_rollback(
     budget_free(session->budget, session->user_css);
     session->user_css = transaction->previous_user_css;
     session->user_css_length = transaction->previous_user_css_length;
+    session->page_zoom_percent = transaction->previous_page_zoom_percent;
+    if (memcmp(&session->viewport, &transaction->previous_viewport,
+               sizeof(session->viewport)) != 0) {
+        session->viewport = transaction->previous_viewport;
+        if (session->page.runtime != NULL)
+            script_runtime_set_viewport(
+                session->page.runtime, session->viewport.css_width,
+                session->viewport.css_height, session->viewport.device_width,
+                session->viewport.device_height);
+    }
     session->page.stylesheet = transaction->previous_stylesheet;
     session->page.stylesheet_resources = transaction->previous_resources;
     session->page.external_stylesheets = transaction->previous_external;

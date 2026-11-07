@@ -2334,6 +2334,12 @@ static ScriptRuntime *runtime_create_host(
 #endif
     host->function_to_string = JS_UNDEFINED;
     host->host_global = JS_UNDEFINED;
+    host->host_visual_viewport = JS_UNDEFINED;
+    host->host_window_dispatch = JS_UNDEFINED;
+    host->host_viewport_dispatch = JS_UNDEFINED;
+    host->host_event_constructor = JS_UNDEFINED;
+    host->host_trusted_event = JS_UNDEFINED;
+    host->viewport_resize_dispatch = JS_UNDEFINED;
 #ifdef JS_RT_XHR_DIAGNOSTICS
     host->private_outcome_classifier = JS_UNDEFINED;
     host->xhr_diagnostics_install = JS_UNDEFINED;
@@ -2731,6 +2737,7 @@ static bool runtime_install_globals(ScriptRuntime *host, JSValue global,
     /* Lab knob; the bootstrap reads an absent flag as false. */
     if (setup_ok
         && tilefinch_lab_getenv("TILEFINCH_DIAGNOSTIC_MOBILE_SAFARI") != NULL) {
+        host->diagnostic_mobile_safari = true;
         setup_ok = JS_SetPropertyStr(
             host->context, global, "__tilefinchDiagnosticMobileSafari",
             JS_TRUE) >= 0;
@@ -3044,7 +3051,22 @@ static bool runtime_capture_trusted_hooks(ScriptRuntime *host,
             }
         }
         JS_FreeValue(host->context, navigator);
-        evaluated = runtime_capture_host_callbacks(host, global);
+        host->host_visual_viewport = JS_GetPropertyStr(
+            host->context, global, "visualViewport");
+        host->host_window_dispatch = JS_GetPropertyStr(
+            host->context, global, "__tilefinchDispatchWindowEventCheckpointed");
+        host->host_event_constructor = JS_GetPropertyStr(
+            host->context, global, "Event");
+        host->host_trusted_event = JS_GetPropertyStr(
+            host->context, global, "__tilefinchTrustedEvent");
+        host->host_viewport_dispatch = JS_GetPropertyStr(
+            host->context, global, "__tilefinchDispatchEventTargetCheckpointed");
+        evaluated = !JS_IsException(host->host_visual_viewport)
+            && JS_IsFunction(host->context, host->host_window_dispatch)
+            && JS_IsFunction(host->context, host->host_viewport_dispatch)
+            && JS_IsFunction(host->context, host->host_event_constructor)
+            && JS_IsFunction(host->context, host->host_trusted_event)
+            && runtime_capture_host_callbacks(host, global);
     }
     return evaluated;
 }

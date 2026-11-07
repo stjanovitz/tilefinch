@@ -6676,7 +6676,9 @@
       if (typeof errorObserver === "function")
         try { observed = errorObserver(error, item, list) === true; } catch (_) {}
       if (!observed)
-        __tilefinchReportUncaught(error, "event " + event.type);
+        __tilefinchReportUncaught(error,
+          (target === __tilefinchRealmGlobal.visualViewport
+            ? "visualViewport " : "event ") + event.type);
     } finally {
       event.__passive = false;
     }
@@ -6690,7 +6692,9 @@
           pending.error, pending.item, pending.list) === true;
       } catch (_) {}
     if (!observed)
-      __tilefinchReportUncaught(pending.error, "event " + event.type);
+      __tilefinchReportUncaught(pending.error,
+        (event.target === __tilefinchRealmGlobal.visualViewport
+          ? "visualViewport " : "event ") + event.type);
   };
   __tilefinchRealmGlobal.__tilefinchInvokeListenerList = (
     map,
@@ -6908,12 +6912,25 @@
       event,
       complete = null,
       errorObserver = null,
+      handler = null,
     ) => {
       const value = event;
       __tilefinchRealmGlobal.__tilefinchPrepareEvent(value, target, [target]);
       let finished = false;
       const finish = () => {
         if (finished) return;
+        if (typeof handler === "function") {
+          /* A platform event-handler attribute belongs to this delivery,
+             including its cleanup-after-script microtask checkpoint. */
+          const callback = handler;
+          handler = null;
+          try {
+            callback();
+          } finally {
+            trustedQueueCheckpointContinuation(finish);
+          }
+          return;
+        }
         finished = true;
         __tilefinchRealmGlobal.__tilefinchFinishEventDispatch(value);
         __tilefinchRecordEvent();
@@ -7749,7 +7766,7 @@
         slot.wrapper = null;
       }
     };
-  for (const type of ["message", "messageerror"])
+  for (const type of ["message", "messageerror", "resize"])
     Object.defineProperty(__tilefinchRealmGlobal, "on" + type, {
       configurable: true,
       enumerable: true,

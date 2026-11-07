@@ -69,9 +69,15 @@ bool psp_set_presentation_css(
             return false;
         length += cookie_length;
     }
+    /* Reader and Basic view lay their extracted text out at the page's
+       own viewport and size it with the text-size setting alone. */
+    unsigned zoom = reader_mode || !viewport_page_zoom_valid(
+                        ui->page_zoom_percent)
+        ? VIEWPORT_PAGE_ZOOM_DEFAULT : ui->page_zoom_percent;
     return relayout
-        ? browser_engine_apply_user_css(engine, css, length)
-        : browser_engine_set_user_css(engine, css, length);
+        ? browser_engine_apply_presentation(engine, css, length, zoom)
+        : browser_engine_set_user_css(engine, css, length)
+              && browser_engine_set_page_zoom(engine, zoom);
 }
 
 void psp_leave_reader_for_navigation(

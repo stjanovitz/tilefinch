@@ -247,6 +247,13 @@ bool navigation_set_user_css(NavigationSession *session, const char *css,
     return true;
 }
 
+bool navigation_set_page_zoom(NavigationSession *session, unsigned percent)
+{
+    if (session == NULL || !viewport_page_zoom_valid(percent)) return false;
+    session->page_zoom_percent = percent;
+    return true;
+}
+
 void navigation_set_reader_candidate_mode(NavigationSession *session,
                                           bool enabled)
 {

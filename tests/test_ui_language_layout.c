@@ -2074,6 +2074,16 @@ static bool test_all_languages(void)
                 ui.options_selection = option;
                 CHECK(paint(&ui, provider));
             }
+            /* Appearance with Page zoom, the row after the text size,
+               selected. */
+            ui.options_group_selection = 0;
+            ui.options_selection = UI_OPTION_ZOOM_INDEX;
+            ui.page_zoom_percent = 75;
+            CHECK(ui_option_display_position(ui.options_selection)
+                      == UI_OPTION_FONT_INDEX + 1u
+                  && paint(&ui, provider));
+            CHECK(snapshot(theme ? "appearance-light" : "appearance-dark"));
+            ui.page_zoom_percent = VIEWPORT_PAGE_ZOOM_DEFAULT;
             if (theme == 0) {
                 TilefinchTestFaults *faults = tilefinch_test_faults();
                 faults->chrome_unicode_lookups = faults->chrome_unicode_scans

@@ -119,32 +119,43 @@ static bool disposition_name(const char *header, bool extended,
     return false;
 }
 
+/* The decoded last path segment, empty for a path ending in '/'. */
+static bool url_path_basename(const char *url, char output[1024])
+{
+    TilefinchUrl parsed;
+    if (!tilefinch_url_parse(url, &parsed)) return false;
+    size_t first = parsed.path_offset, end = first + parsed.path_length;
+    for (size_t i = first; i < end; i++) if (url[i] == '/') first = i + 1;
+    size_t size = end - first;
+    if (size >= 1024) return false;
+    memcpy(output, url + first, size);
+    output[size] = '\0';
+    if (!tilefinch_url_percent_decode(output)) output[0] = '\0';
+    return true;
+}
+
 bool file_download_filename(const char *url, const char *disposition,
                             char output[FILE_DOWNLOAD_FILENAME_LIMIT])
 {
     if (output == NULL || !file_download_url_supported(url)) return false;
     char candidate[1024];
     if (!disposition_name(disposition, true, candidate)
-        && !disposition_name(disposition, false, candidate)) {
-        TilefinchUrl parsed;
-        if (!tilefinch_url_parse(url, &parsed)) return false;
-        size_t first = parsed.path_offset, end = first + parsed.path_length;
-        for (size_t i = first; i < end; i++) if (url[i] == '/') first = i + 1;
-        size_t size = end - first;
-        if (size >= sizeof(candidate)) return false;
-        memcpy(candidate, url + first, size);
-        candidate[size] = '\0';
-        if (!tilefinch_url_percent_decode(candidate)) candidate[0] = '\0';
-    }
+        && !disposition_name(disposition, false, candidate)
+        && !url_path_basename(url, candidate)) return false;
     sanitize_filename(candidate, output);
     return true;
 }
 
 bool file_download_url_candidate(const char *url)
 {
-    char name[FILE_DOWNLOAD_FILENAME_LIMIT];
-    if (!file_download_filename(url, NULL, name)) return false;
+    /* Judge the URL's own last segment. The saved-file name falls back to
+       download.bin for a path such as /settings/, and that fallback is not
+       evidence of a file: every such link would offer a download. */
+    char name[1024];
+    if (!file_download_url_supported(url) || !url_path_basename(url, name))
+        return false;
     const char *extension = strrchr(name, '.');
+    if (extension == name) return false; /* ".bin" is no file name */
     static const char *const types[] = {
         ".zip", ".7z", ".rar", ".tar", ".gz", ".bz2", ".xz", ".zst",
         ".pbp", ".prx", ".elf", ".iso", ".cso", ".bin", ".pdf"
