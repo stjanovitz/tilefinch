@@ -37,10 +37,11 @@ typedef struct {
 ContentBlocker *content_blocker_create(Budget *budget);
 void content_blocker_destroy(ContentBlocker *blocker);
 
-/* Switching lists is transactional: a missing, oversized, truncated, or
-   unreadable custom list leaves the active configuration untouched. Syntax
-   outside the documented subset is counted and ignored. OFF and BASIC do
-   not read custom_path. */
+/* Switching lists is transactional: a missing, oversized or unreadable
+   custom list leaves the active configuration untouched. Syntax outside the
+   documented subset and over-long lines are counted and ignored; rules past
+   the rule or hostname limits are counted as ignored and set `truncated`,
+   and the rules that fit are kept. OFF and BASIC do not read custom_path. */
 bool content_blocker_configure(ContentBlocker *blocker,
                                ContentBlockerMode mode,
                                const char *custom_path);
@@ -80,6 +81,27 @@ bool content_blocker_would_block(
     const ContentBlocker *blocker, const char *request_url,
     const char *initiator_url, const char *destination,
     const char *fetch_mode);
+
+/* Callbacks a page waits on from a classic script the blocker refuses
+   (any mode or rule that refuses it), by the script's host. The page's
+   script runtime answers them once per realm (Google tags: once per data
+   layer), as the loaded script would, before the element's error event:
+   - GOOGLE_TAG (Google Tag Manager, gtag.js, Google Optimize): end the
+     Optimize anti-flicker hiding (`dataLayer.hide.end()`) and call the
+     `eventCallback` of GTM pushes and the `event_callback` of gtag events,
+     which link handlers wait on before they navigate;
+   - ADOBE_TARGET (Launch, Target): remove Target's pre-hiding style
+     (`#at-body-style`);
+   - VWO: finish its SmartCode hiding (`_vwo_code.finish()`).
+   Other anti-flicker snippets end on their own timeout, as they do when the
+   script fails to load in other browsers. Returns 0 when the script is not
+   refused or its host needs no answer. */
+#define CONTENT_BLOCKER_SHIM_GOOGLE_TAG 1u
+#define CONTENT_BLOCKER_SHIM_ADOBE_TARGET 2u
+#define CONTENT_BLOCKER_SHIM_VWO 4u
+unsigned content_blocker_refused_script_shims(
+    const ContentBlocker *blocker, const char *script_url,
+    const char *document_url);
 
 /* The embed hop's player page (browser_engine.h): while set, requests its
    site initiates also refuse a built-in, generic list of third-party hosts

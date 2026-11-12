@@ -25,7 +25,9 @@ set(TILEFINCH_CORE_SOURCES
     src/document_backing.c
     ${PSP_BROWSER_TRANSPORT_SOURCE}
     src/fetch_fault.c
+    src/fetch_websocket_frames.c
     src/frame_sandbox.c
+    src/page_dialog.c
     src/font.c
     src/game_audio.c
     src/gamepad.c
@@ -56,6 +58,7 @@ set(TILEFINCH_CORE_SOURCES
     src/layout_bidi.c
     src/media_backend.c
     src/media_hls.c
+    src/media_mp3.c
     src/swdec/swdec_ts.c
     src/media_source.c
     src/media_http.c
@@ -118,6 +121,7 @@ set(TILEFINCH_CORE_SOURCES
     src/session_script_disk.c
     src/session_site_storage.c
     src/site_adapter.c
+    src/selector_syntax.c
     src/site_identity.c
     src/style.c
     src/style_focus.c
@@ -449,4 +453,9 @@ if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(tilefinch_core PRIVATE -Wall -Wextra -Wpedantic -Werror=implicit-function-declaration)
     set_property(SOURCE src/generated/js_bootstrap.c APPEND PROPERTY
         COMPILE_OPTIONS -Wno-overlength-strings)
+    # The YouTube sources compose error text from provider and transport
+    # strings; only a literal may be a format string there.
+    set_property(SOURCE src/youtube_lite.c src/youtube_resolver.c
+        src/youtube_playlist.c APPEND PROPERTY
+        COMPILE_OPTIONS -Werror=format-security -Werror=format-nonliteral)
 endif()

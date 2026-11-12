@@ -1,6 +1,7 @@
 #ifdef __PSP__
 
 #include "tilefinch/media_backend.h"
+#include "tilefinch/media_mp3.h"
 #include "tilefinch/platform.h"
 #include "tilefinch/psp_log.h"
 #include "tilefinch/psp_threads.h"
@@ -72,9 +73,6 @@
  * further.
  */
 #define PSP_MEDIA_CODEC_COLLECT_WAIT_US 1500u
-#define PSP_MEDIA_AUDIO_CHANNEL_DRAIN_WAIT_US 160000u
-#define PSP_MEDIA_AUDIO_CHANNEL_POLL_US 2000u
-#define PSP_MEDIA_AUDIO_SRC_QUEUE_BUSY UINT32_C(0x80268002)
 /* How much of each firmware-owned control structure a post-failure dump
    records. Enough to see whether firmware wrote anything at all, short
    enough that the line stays inside one log record. */
@@ -226,7 +224,7 @@ _Static_assert(
     PSP_MEDIA_AUDIO_ONLY_EXTERNAL_RESERVE
         >= (size_t) PSP_MEDIA_PACKET_STAGING_BYTES
            + (size_t) PSP_MEDIA_AUDIO_CODEC_BYTES
-           + (size_t) PSP_MEDIA_AUDIO_PCM_BYTES
+           + (size_t) PSP_MEDIA_AUDIO_DECODE_BYTES
            + (size_t) PSP_MEDIA_AUDIO_QUEUE_BYTES
            + (size_t) PSP_MEDIA_AUDIO_STAGING_BYTES
            + (size_t) PSP_MEDIA_AUDIO_PENDING_BYTES
@@ -408,6 +406,19 @@ typedef struct {
     uint32_t audio_worker_next_health_us;
     unsigned audio_decode_busy_retries;
     uint32_t audio_decode_busy_started_us;
+    /* PSP_CODEC_AAC, or PSP_CODEC_MP3 for a Layer III track. */
+    int audio_codec_type;
+    /* Layer III frames are 1152 or 576 samples against 1024-sample queue
+       blocks: the samples already written into the unpublished block at
+       audio_queue_write. Always 0 for AAC. */
+    uint32_t audio_carry_samples;
+    /* Layer III frames the decoder refused in a row, and in all. A stream
+       joined mid-broadcast begins with frames whose bit reservoir points
+       into audio that was never received, which the decoder refuses
+       (psp_media_decode_one_audio_au tolerates PSP_MEDIA_MP3_REFUSAL_LIMIT
+       of them in a row). */
+    unsigned audio_mp3_refusals;
+    unsigned audio_mp3_refused_total;
     SceInt32 video_status;
     PspAvcDetail2 *video_detail;
     unsigned video_picture_count;
@@ -441,13 +452,17 @@ typedef struct {
      * only the stamps and edge flags the totals are charged from, and none of
      * them is published.
      *
-     * Ownership follows the slots themselves. A slot transition and a
-     * conversion can happen on the codec worker or on the browser thread, but
-     * never on both at once: a video or drain job owns every slot for its
-     * whole duration, take_frame refuses to claim while one is running, and
-     * an audio job -- the one kind that may run alongside a claim -- touches
-     * no slot at all. So these are plain fields, exactly as the slots they
-     * describe are.
+     * slot_dwell[slot] is charged only by the thread that owns that slot
+     * (psp_media_slot_charge), so it is exact. The pipeline-wide fields below
+     * it are not: since take_frame lost its job gate, the codec worker
+     * (publishing a picture) and the browser thread (take, discard, release,
+     * late drop) both sample them, and the worker, which outranks the
+     * browser, can preempt it mid-update. An interval of the no-free and
+     * free-idle totals or of slot_free_to_au is then occasionally lost or
+     * counted twice. They are telemetry for soak occupancy lines only: no
+     * ownership or admission decision reads them, and a lock shared by two
+     * threads of different priority on one CPU would cost more than the
+     * error it removes. So these are plain fields.
      */
     PspMediaSlotDwell slot_dwell[PSP_MEDIA_SURFACE_SLOTS];
     uint32_t slot_sample_us;
@@ -648,19 +663,29 @@ static int16_t *psp_media_audio_queue_slot(
          + (size_t) slot * PSP_MEDIA_AUDIO_SAMPLES * 2u;
 }
 
-static bool psp_media_audio_release_retryable(int status)
+static int psp_media_audio_channel_release_once(void *context)
 {
-    uint32_t code = (uint32_t) status;
-    return code == (uint32_t) SCE_AUDIO_ERROR_OUTPUT_BUSY
-        || code == PSP_MEDIA_AUDIO_SRC_QUEUE_BUSY;
+    const PspMediaBackend *backend = context;
+    return backend->audio_channel == -2
+        ? sceAudioSRCChRelease()
+        : sceAudioChRelease(backend->audio_channel);
 }
 
-/* A blocking output call can return after queueing its final DMA buffer. On
-   real firmware the immediate channel release may then report busy even
-   though the worker has already stopped. Never free that buffer while the
-   audio service may still own it: give the single admitted 1024-sample block
-   a bounded drain window, and let the caller quarantine state if ownership
-   still cannot be released. */
+static uint32_t psp_media_audio_release_now_us(void)
+{
+    return (uint32_t) sceKernelGetSystemTimeLow();
+}
+
+static int psp_media_audio_release_delay_us(uint32_t us)
+{
+    return sceKernelDelayThread((SceUInt) us);
+}
+
+/* A blocking output call can return after queueing its final DMA buffer;
+   the release may then report busy (see psp_media_audio_release_bounded).
+   Never free that buffer while the audio service may still own it: give the
+   single admitted 1024-sample block a bounded drain window, and let the
+   caller quarantine state if ownership still cannot be released. */
 static bool psp_media_release_audio_channel(
     PspMediaBackend *backend, uint32_t wait_limit_us,
     int *native_status, unsigned *attempts, uint32_t *waited_us)
@@ -675,27 +700,15 @@ static bool psp_media_release_audio_channel(
             *native_status = (int) SCE_AUDIO_ERROR_INVALID_CH;
         return false;
     }
-    uint32_t started = sceKernelGetSystemTimeLow();
-    for (;;) {
-        if (attempts != NULL) (*attempts)++;
-        int status = backend->audio_channel == -2
-            ? sceAudioSRCChRelease()
-            : sceAudioChRelease(backend->audio_channel);
-        if (native_status != NULL) *native_status = status;
-        if (status >= 0
-            || (uint32_t) status == (uint32_t) SCE_AUDIO_ERROR_NOT_RESERVED) {
-            backend->audio_channel = -1;
-            return true;
-        }
-        uint32_t elapsed = sceKernelGetSystemTimeLow() - started;
-        if (waited_us != NULL) *waited_us = elapsed;
-        if (!psp_media_audio_release_retryable(status)
-            || elapsed >= wait_limit_us) return false;
-        uint32_t remaining = wait_limit_us - elapsed;
-        SceUInt delay = remaining < PSP_MEDIA_AUDIO_CHANNEL_POLL_US
-            ? remaining : PSP_MEDIA_AUDIO_CHANNEL_POLL_US;
-        if (delay == 0 || sceKernelDelayThread(delay) < 0) return false;
-    }
+    const PspMediaAudioReleaseOps ops = {
+        psp_media_audio_channel_release_once, backend,
+        psp_media_audio_release_now_us, psp_media_audio_release_delay_us
+    };
+    if (!psp_media_audio_release_bounded(
+            &ops, wait_limit_us, native_status, attempts, waited_us))
+        return false;
+    backend->audio_channel = -1;
+    return true;
 }
 
 static bool psp_media_ensure_packet_staging(
@@ -4152,26 +4165,61 @@ static MediaBackendResult psp_media_decode_one_audio_au(
     unsigned char *staged =
         backend->audio_staging + (size_t) index * PSP_MEDIA_AUDIO_AU_BYTES;
     size_t staged_bytes = backend->audio_staged_bytes[index];
+    bool mp3 = backend->audio_codec_type == PSP_CODEC_MP3;
+    uint32_t frame_samples = PSP_MEDIA_AUDIO_SAMPLES;
+    /* The frame's main_data_begin: how far back into earlier frames its
+       audio data starts (for the refusal log). */
+    unsigned reservoir_bytes = 0;
+    if (mp3) {
+        MediaMp3FrameHeader header;
+        if (staged_bytes < 4u || !media_mp3_parse_header(staged, &header)
+            || header.frame_bytes != staged_bytes
+            || header.sample_rate != backend->audio.sample_rate) {
+            psp_media_error(error, error_size, "%s",
+                            "MP3 frame header changed mid-stream");
+            return MEDIA_BACKEND_ERROR;
+        }
+        frame_samples = header.samples;
+        size_t side = 4u + (header.crc ? 2u : 0u);
+        if (staged_bytes > side + 1u)
+            reservoir_bytes = header.version == MEDIA_MP3_VERSION_1
+                ? ((unsigned) staged[side] << 1) | (staged[side + 1u] >> 7)
+                : staged[side];
+    }
+    /* Wait for the output thread rather than overwrite a queued block; the
+       unit stays staged, exactly as on a BUSY retry. The browser thread's
+       room checks run on older facts, so the invariant is kept here too. */
+    if (!psp_media_audio_unit_fits_queue(
+            (uint32_t) (atomic_load(&backend->audio_queue_write)
+                        - atomic_load(&backend->audio_queue_read)),
+            mp3))
+        return MEDIA_BACKEND_WOULD_BLOCK;
     backend->audio_codec[6] =
         (unsigned long) staged;
     backend->audio_codec[7] =
         (unsigned long) staged_bytes;
     backend->audio_codec[8] = (unsigned long) backend->audio_pcm;
-    backend->audio_codec[9] = PSP_MEDIA_AUDIO_PCM_BYTES;
+    backend->audio_codec[9] = mp3
+        ? frame_samples * 2u * sizeof(int16_t) : PSP_MEDIA_AUDIO_PCM_BYTES;
+    /* The Layer III program reads the frame length from word 10 as well;
+       AAC's word 10 keeps the sample rate Init was given. */
+    if (mp3) backend->audio_codec[10] = (unsigned long) staged_bytes;
     sceKernelDcacheWritebackRange(
         staged, (unsigned) staged_bytes);
     sceKernelDcacheWritebackRange(
         backend->audio_codec,
         psp_media_cache_extent(PSP_MEDIA_AUDIO_CODEC_BYTES));
     sceKernelDcacheWritebackInvalidateRange(
-        backend->audio_pcm, PSP_MEDIA_AUDIO_PCM_BYTES);
+        backend->audio_pcm,
+        psp_media_cache_extent(PSP_MEDIA_AUDIO_DECODE_BYTES));
     psp_media_codec_stage(backend, PSP_MEDIA_CODEC_STAGE_AAC_DECODE);
     /* AAC crosses into the same Media Engine through the same one job slot,
        so it is measured on the same clock as AVC. A video submission refused
        while this call is in flight is refused for the length of this call. */
     uint32_t firmware_entered_us = psp_media_stamp_us();
     int status = sceAudiocodecDecode(
-        backend->audio_codec, PSP_CODEC_AAC);
+        backend->audio_codec, backend->audio_codec_type);
+    bool refused = false;
     psp_media_note_worker_firmware(backend, firmware_entered_us);
     /* The control block is written from both sides: sceAudiocodecDecode's
        main-CPU wrapper updates its own words through the data cache, and the
@@ -4185,7 +4233,8 @@ static MediaBackendResult psp_media_decode_one_audio_au(
        this thread stores into it in between. A pure invalidate discards
        nothing and is the cheapest way to see what the engine wrote. */
     sceKernelDcacheInvalidateRange(
-        backend->audio_pcm, PSP_MEDIA_AUDIO_PCM_BYTES);
+        backend->audio_pcm,
+        psp_media_cache_extent(PSP_MEDIA_AUDIO_DECODE_BYTES));
     if (status < 0) {
         /* The firmware can transiently report BUSY even though all Tilefinch
            calls are serialized through one worker. The current AU remains
@@ -4211,6 +4260,49 @@ static MediaBackendResult psp_media_decode_one_audio_au(
                 backend->audio_staged_count);
             return MEDIA_BACKEND_WOULD_BLOCK;
         }
+        if (mp3 && backend->audio_mp3_refusals
+                       < PSP_MEDIA_MP3_REFUSAL_LIMIT) {
+            /* A refused Layer III frame need not be a broken decoder: the
+               first frames of a live join reference reservoir bytes
+               (main_data_begin) from frames the PSP never received, and a
+               decoder that has since seen those frames decodes the next
+               ones. Drop the frame before audio has started; once it has,
+               play the frame's length of silence so the clock stays on the
+               stream's. A run of refusals past the limit is a real
+               failure. */
+            backend->audio_mp3_refusals++;
+            backend->audio_mp3_refused_total++;
+            psp_media_log(
+                "tilefinch-media-decoder: event=mp3-frame-refused "
+                "status=0x%08X err=0x%08X bytes=%u reservoir=%u run=%u "
+                "total=%u started=%d",
+                (unsigned) status, (unsigned) backend->audio_codec[2],
+                (unsigned) staged_bytes, reservoir_bytes,
+                backend->audio_mp3_refusals,
+                backend->audio_mp3_refused_total,
+                atomic_load_explicit(&backend->audio_origin_initialized,
+                                     memory_order_acquire) ? 1 : 0);
+            backend->audio_decode_busy_retries = 0u;
+            backend->audio_decode_busy_started_us = 0u;
+            if (!atomic_load_explicit(&backend->audio_origin_initialized,
+                                      memory_order_acquire))
+                return MEDIA_BACKEND_ACCEPTED;
+            memset(backend->audio_pcm, 0,
+                   (size_t) frame_samples * 2u * sizeof(int16_t));
+            refused = true;
+            status = 0;
+        }
+    }
+    if (mp3 && !refused && status >= 0
+        && backend->audio_mp3_refusals != 0u) {
+        psp_media_log(
+            "tilefinch-media-decoder: event=mp3-frame-recovered after=%u "
+            "total=%u reservoir=%u",
+            backend->audio_mp3_refusals, backend->audio_mp3_refused_total,
+            reservoir_bytes);
+        backend->audio_mp3_refusals = 0u;
+    }
+    if (status < 0) {
         backend->stats.last_native_error = status;
 #if defined(TILEFINCH_PSP_VALIDATION_LOG)
         /*
@@ -4239,8 +4331,8 @@ static MediaBackendResult psp_media_decode_one_audio_au(
         psp_media_log_failure(
             backend, "sceAudiocodecDecode", status);
         psp_media_error(
-            error, error_size, "AAC decode: 0x%08X",
-            (unsigned) status);
+            error, error_size, "%s decode: 0x%08X",
+            mp3 ? "MP3" : "AAC", (unsigned) status);
         return MEDIA_BACKEND_ERROR;
     }
     if (backend->audio_decode_busy_retries != 0u) {
@@ -4251,7 +4343,7 @@ static MediaBackendResult psp_media_decode_one_audio_au(
         backend->audio_decode_busy_started_us = 0u;
     }
     backend->stats.submitted_audio_packets++;
-    backend->stats.decoded_audio_samples += PSP_MEDIA_AUDIO_SAMPLES;
+    backend->stats.decoded_audio_samples += frame_samples;
     if (!atomic_load_explicit(
             &backend->audio_origin_initialized, memory_order_acquire)) {
         /* This unit's own presentation time, not the job's first: with a
@@ -4262,6 +4354,35 @@ static MediaBackendResult psp_media_decode_one_audio_au(
         atomic_store_explicit(
             &backend->audio_origin_initialized, true, memory_order_release);
     }
+    if (mp3) {
+        /* Re-block: fill the carried block, publish each one that
+           completes, and carry the remainder into the next. */
+        const int16_t *decoded = (const int16_t *) backend->audio_pcm;
+        uint32_t left = frame_samples;
+        bool published = false;
+        while (left != 0u) {
+            unsigned slot =
+                atomic_load(&backend->audio_queue_write)
+                % PSP_MEDIA_AUDIO_QUEUE_SLOTS;
+            int16_t *queued_pcm = psp_media_audio_queue_slot(backend, slot);
+            uint32_t room =
+                PSP_MEDIA_AUDIO_SAMPLES - backend->audio_carry_samples;
+            uint32_t take = left < room ? left : room;
+            memcpy(queued_pcm + (size_t) backend->audio_carry_samples * 2u,
+                   decoded, (size_t) take * 2u * sizeof(int16_t));
+            decoded += (size_t) take * 2u;
+            left -= take;
+            backend->audio_carry_samples += take;
+            if (backend->audio_carry_samples == PSP_MEDIA_AUDIO_SAMPLES) {
+                sceKernelDcacheWritebackRange(
+                    queued_pcm, PSP_MEDIA_AUDIO_PCM_BYTES);
+                atomic_fetch_add(&backend->audio_queue_write, 1u);
+                backend->audio_carry_samples = 0u;
+                published = true;
+            }
+        }
+        if (!published) return MEDIA_BACKEND_ACCEPTED;
+    } else {
     unsigned slot =
         atomic_load(&backend->audio_queue_write)
         % PSP_MEDIA_AUDIO_QUEUE_SLOTS;
@@ -4270,6 +4391,7 @@ static MediaBackendResult psp_media_decode_one_audio_au(
     sceKernelDcacheWritebackRange(
         queued_pcm, PSP_MEDIA_AUDIO_PCM_BYTES);
     atomic_fetch_add(&backend->audio_queue_write, 1u);
+    }
     psp_media_codec_stage(backend, PSP_MEDIA_CODEC_STAGE_AUDIO_SIGNAL);
     status = sceKernelSetEventFlag(
         backend->audio_event, PSP_MEDIA_AUDIO_EVENT_READY);
@@ -4499,7 +4621,8 @@ static int psp_media_reset_audio_program(PspMediaBackend *backend)
         backend->audio_codec,
         psp_media_cache_extent(PSP_MEDIA_AUDIO_CODEC_BYTES));
     psp_media_codec_stage(backend, PSP_MEDIA_CODEC_STAGE_AAC_INIT);
-    int status = sceAudiocodecInit(backend->audio_codec, PSP_CODEC_AAC);
+    int status = sceAudiocodecInit(
+        backend->audio_codec, backend->audio_codec_type);
     if (status >= 0) {
         /* This firmware wrapper writes the control block through the CPU
            cache. Publish those writes before the worker hands ownership back. */
@@ -5344,13 +5467,15 @@ static MediaBackendResult psp_media_enqueue_pending_audio(
     return MEDIA_BACKEND_ACCEPTED;
 }
 
-static void psp_media_promote_pending_audio(PspMediaBackend *backend)
+static void psp_media_promote_pending_audio(
+    PspMediaBackend *backend, unsigned limit)
 {
     if (backend == NULL || backend->audio_staged_count != 0u
         || backend->audio_pending == NULL) return;
     unsigned count = psp_media_audio_pending_count(backend);
     unsigned promote = count < PSP_MEDIA_AUDIO_BATCH_MAXIMUM
         ? count : PSP_MEDIA_AUDIO_BATCH_MAXIMUM;
+    if (promote > limit) promote = limit;
     for (unsigned at = 0; at < promote; at++) {
         unsigned slot = backend->audio_pending_read
             % PSP_MEDIA_AUDIO_PENDING_SLOTS;
@@ -5515,13 +5640,14 @@ static MediaBackendResult psp_media_queue_staged_audio(
 static void psp_media_flush_staged_audio(PspMediaBackend *backend)
 {
     if (backend == NULL || backend->admissions_closed) return;
+    bool mp3 = backend->audio_codec_type == PSP_CODEC_MP3;
+    unsigned queue_depth = (unsigned) (
+        atomic_load_explicit(
+            &backend->audio_queue_write, memory_order_acquire)
+        - atomic_load_explicit(
+            &backend->audio_queue_read, memory_order_acquire));
     if (backend->audio_staged_count == 0u) {
         unsigned pending = psp_media_audio_pending_count(backend);
-        unsigned queue_depth = (unsigned) (
-            atomic_load_explicit(
-                &backend->audio_queue_write, memory_order_acquire)
-            - atomic_load_explicit(
-                &backend->audio_queue_read, memory_order_acquire));
         uint32_t age_us = psp_media_stamp_us()
             - backend->audio_pending_since_us;
         if (psp_media_audio_pending_should_wait(
@@ -5532,12 +5658,25 @@ static void psp_media_flush_staged_audio(PspMediaBackend *backend)
             backend->stats.audio_pending_holds++;
             return;
         }
+        /* Promote only what the PCM queue can take; the rest stays pending
+           for a later pump (MB-04). A Layer III frame can publish two
+           blocks. */
+        unsigned promote = psp_media_audio_flush_promote_count(
+            pending, queue_depth, mp3 ? 2u : 1u);
+        if (pending != 0u && promote == 0u) {
+            backend->stats.audio_batch_blocked_queue++;
+            return;
+        }
         if (pending == 1u
             && age_us >= PSP_MEDIA_AUDIO_PENDING_HOLD_US)
             backend->stats.audio_pending_timeouts++;
-        psp_media_promote_pending_audio(backend);
+        psp_media_promote_pending_audio(backend, promote);
     }
     if (backend->audio_staged_index >= backend->audio_staged_count) return;
+    /* A unit the worker would refuse for want of PCM-queue room is not
+       dispatched: while paused or buffering nothing drains the queue, and
+       the job would come back refused on every frame (MB-08). */
+    if (!psp_media_audio_unit_fits_queue(queue_depth, mp3)) return;
     char error[128] = {0};
     backend->stats.audio_batch_flushes++;
     (void) psp_media_queue_staged_audio(backend, error, sizeof(error));
@@ -5892,14 +6031,18 @@ static MediaBackendResult psp_media_submit(
             backend->stats.audio_batch_deferrals++;
             return MEDIA_BACKEND_ACCEPTED;
         }
-        if (queue_depth + PSP_MEDIA_AUDIO_BATCH_MAXIMUM
+        /* A Layer III frame can publish two blocks. */
+        unsigned blocks_per_unit =
+            backend->audio_codec_type == PSP_CODEC_MP3 ? 2u : 1u;
+        if (queue_depth + PSP_MEDIA_AUDIO_BATCH_MAXIMUM * blocks_per_unit
             > PSP_MEDIA_AUDIO_QUEUE_SLOTS) {
             backend->stats.audio_batch_blocked_queue++;
             return MEDIA_BACKEND_ACCEPTED;
         }
         if (backend->audio_staged_count != 0u)
             return MEDIA_BACKEND_ACCEPTED;
-        psp_media_promote_pending_audio(backend);
+        psp_media_promote_pending_audio(
+            backend, PSP_MEDIA_AUDIO_BATCH_MAXIMUM);
         MediaBackendResult queued = psp_media_queue_staged_audio(
             backend, error, error_size);
         /* The ring already owns the access unit. A temporarily busy native
@@ -6343,6 +6486,8 @@ static bool psp_media_reset(void *opaque, char *error, size_t error_size)
        decoded it, and a post-seek job must never carry a pre-seek unit. */
     backend->audio_staged_count = 0u;
     backend->audio_staged_index = 0u;
+    /* A partly filled Layer III block belongs to the stream being left. */
+    backend->audio_carry_samples = 0u;
     /* A hard BUSY verdict ends the current retry incident. Reset/recovery
        discards that staged AU, so a later, unrelated firmware BUSY must get
        its own bounded allowance rather than inheriting the exhausted count. */
@@ -6426,7 +6571,7 @@ static bool psp_media_reset(void *opaque, char *error, size_t error_size)
     bool needs_worker = !no_touch
         && (backend->have_video || backend->have_audio);
     if (backend->have_audio)
-        memset(backend->audio_pcm, 0, PSP_MEDIA_AUDIO_PCM_BYTES);
+        memset(backend->audio_pcm, 0, PSP_MEDIA_AUDIO_DECODE_BYTES);
     if (needs_worker && !worker_ready) {
         native_stage = rebuild_requested
             ? (refusal_rebuild
@@ -7870,11 +8015,16 @@ static bool psp_media_backend_create_track_info(
         backend->video_annexb =
             video_track->packet_format == MEDIA_PACKET_FORMAT_H264_ANNEX_B;
     }
+    backend->audio_codec_type = PSP_CODEC_AAC;
     if (audio_track != NULL
         && audio_track->kind == MEDIA_MP4_TRACK_AUDIO
-        && audio_track->codec == MEDIA_MP4_FOURCC('m','p','4','a')) {
+        && (audio_track->codec == MEDIA_MP4_FOURCC('m','p','4','a')
+            || (audio_track->codec == MEDIA_MP3_FOURCC
+                && video_track == NULL))) {
         backend->audio = *audio_track;
         backend->have_audio = true;
+        if (audio_track->codec == MEDIA_MP3_FOURCC)
+            backend->audio_codec_type = PSP_CODEC_MP3;
     }
     if ((!backend->have_video && !backend->have_audio)
         || (backend->have_video
@@ -7915,7 +8065,12 @@ static bool psp_media_backend_create_track_info(
         psp_media_destroy(backend);
         return false;
     }
-    if (backend->have_audio && backend->audio.channels != 2) {
+    bool mp3_audio = backend->have_audio
+        && backend->audio_codec_type == PSP_CODEC_MP3;
+    /* Layer III output is always interleaved stereo, mono streams
+       included, so both channel counts reach the same queue. */
+    if (backend->have_audio && backend->audio.channels != 2
+        && !(mp3_audio && backend->audio.channels == 1)) {
         psp_media_error(error, error_size,
                         "PSP AAC output requires stereo");
         psp_media_destroy(backend);
@@ -7923,7 +8078,16 @@ static bool psp_media_backend_create_track_info(
     }
     MediaAacStreamInfo aac_info = {0};
     bool aac_info_ok = !backend->have_audio;
-    if (backend->have_audio
+    if (mp3_audio) {
+        /* The admission below checks the output side; the frame side is
+           the source's own header lock. */
+        aac_info = (MediaAacStreamInfo) {
+            .sample_rate = backend->audio.sample_rate,
+            .channels = 2u,
+            .samples_per_frame = PSP_MEDIA_AUDIO_SAMPLES
+        };
+        aac_info_ok = true;
+    } else if (backend->have_audio
         && backend->audio.packet_format == MEDIA_PACKET_FORMAT_AAC_ADTS) {
         aac_info = (MediaAacStreamInfo) {
             .sample_rate = backend->audio.sample_rate,
@@ -7946,7 +8110,8 @@ static bool psp_media_backend_create_track_info(
     }
     if (backend->have_audio
         && !psp_media_audio_stream_admitted(
-            backend->audio.sample_rate, backend->audio.channels,
+            backend->audio.sample_rate,
+            mp3_audio ? (uint16_t) 2u : backend->audio.channels,
             aac_info.sample_rate, aac_info.channels,
             aac_info.samples_per_frame)) {
         psp_media_error(
@@ -8283,7 +8448,7 @@ static bool psp_media_backend_create_track_info(
     if (backend->have_audio) {
         backend->audio_codec =
             psp_media_alloc64(PSP_MEDIA_AUDIO_CODEC_BYTES);
-        backend->audio_pcm = psp_media_alloc64(PSP_MEDIA_AUDIO_PCM_BYTES);
+        backend->audio_pcm = psp_media_alloc64(PSP_MEDIA_AUDIO_DECODE_BYTES);
         backend->audio_queue =
             psp_media_alloc64(PSP_MEDIA_AUDIO_QUEUE_BYTES);
         /* Firmware DMAs the compressed unit out of here, so it takes the same
@@ -8410,7 +8575,7 @@ static bool psp_media_backend_create_track_info(
                     && backend->audio_pending != NULL) ? 1 : 0,
             backend->have_audio
                 ? (size_t) PSP_MEDIA_AUDIO_CODEC_BYTES
-                    + PSP_MEDIA_AUDIO_PCM_BYTES
+                    + PSP_MEDIA_AUDIO_DECODE_BYTES
                     + PSP_MEDIA_AUDIO_QUEUE_BYTES
                 : 0,
             backend->ddr_memory != NULL ? 1 : 0,
@@ -8458,7 +8623,7 @@ static bool psp_media_backend_create_track_info(
             psp_media_cache_extent(PSP_MEDIA_AUDIO_CODEC_BYTES));
         native_stage = "sceAudiocodecCheckNeedMem";
         status = sceAudiocodecCheckNeedMem(
-            backend->audio_codec, PSP_CODEC_AAC);
+            backend->audio_codec, backend->audio_codec_type);
         /*
          * CheckNeedMem is a main-CPU firmware call, not a Media Engine one:
          * its whole effect is a store of the needed size into control word 4,
@@ -8506,13 +8671,17 @@ static bool psp_media_backend_create_track_info(
         psp_media_commit_log();
         if (status < 0) goto native_failure;
         backend->audio_edram = true;
-        backend->audio_codec[10] = backend->audio.sample_rate;
+        /* AAC's Init reads the sample rate from word 10; the Layer III
+           program, as PMPlayer drives it, starts from a zeroed word and
+           takes each frame's length there at decode time. */
+        if (backend->audio_codec_type == PSP_CODEC_AAC)
+            backend->audio_codec[10] = backend->audio.sample_rate;
         sceKernelDcacheWritebackInvalidateRange(
             backend->audio_codec,
             psp_media_cache_extent(PSP_MEDIA_AUDIO_CODEC_BYTES));
         native_stage = "sceAudiocodecInit";
         status = sceAudiocodecInit(
-            backend->audio_codec, PSP_CODEC_AAC);
+            backend->audio_codec, backend->audio_codec_type);
         if (status < 0) goto native_failure;
         /* sceAudiocodecInit rewrites the block's firmware-owned header from
            the main CPU before it ever reaches the engine. Write those lines
@@ -8726,7 +8895,8 @@ static void psp_media_collect_source_tracks(
             *video = info;
             *have_video = true;
         } else if (!*have_audio && info.kind == MEDIA_MP4_TRACK_AUDIO
-                   && info.codec == MEDIA_MP4_FOURCC('m','p','4','a')) {
+                   && (info.codec == MEDIA_MP4_FOURCC('m','p','4','a')
+                       || info.codec == MEDIA_MP3_FOURCC)) {
             *audio = info;
             *have_audio = true;
         }

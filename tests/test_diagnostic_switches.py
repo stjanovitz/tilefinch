@@ -10,6 +10,7 @@ the CMake source lists of psp-browser-script, tilefinch_core and the PSP
 libraries the EBOOT links, plus the vendored QuickJS, and everything they
 include. src/diagnostic_trace.h counts as outside the EBOOT: its reads sit
 under TILEFINCH_NO_TRACE, which every PSP build defines."""
+import functools
 import re
 import sys
 from pathlib import Path
@@ -17,6 +18,9 @@ from pathlib import Path
 ROOT = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path(__file__).resolve().parents[1]
 DOC = ROOT / "docs" / "DIAGNOSTIC_SWITCHES.md"
 SOURCE_DIRS = ("src", "third_party/quickjs")
+# Regenerated tables and the embedded bootstrap (9 MB, a third of the scan)
+# read no switch and include only headers the EBOOT reaches anyway.
+GENERATED_DIR = "src/generated"
 LAB_BINARY = "lab binary"
 # The Device column's vocabulary, defined at the top of the document.
 DEVICE_VALUES = (
@@ -43,11 +47,17 @@ INCLUDE = re.compile(r'^\s*#\s*include\s+"([^"]+)"', re.MULTILINE)
 PATTERN = re.compile(r'(tilefinch_lab_)?getenv\("(TILEFINCH_[A-Z0-9_]+)"\)')
 
 
+def generated(path):
+    return path.resolve().relative_to(ROOT).as_posix().startswith(
+        GENERATED_DIR + "/")
+
+
 def source_files():
     paths = []
     for directory in SOURCE_DIRS:
         paths.extend(path for path in (ROOT / directory).rglob("*")
-                     if path.suffix in (".c", ".h", ".inc"))
+                     if path.suffix in (".c", ".h", ".inc")
+                     and not generated(path))
     return sorted(paths)
 
 
@@ -64,6 +74,7 @@ def cmake_block(text, start):
     raise ValueError("unbalanced CMake command")
 
 
+@functools.cache
 def eboot_files():
     """Repository-relative source files compiled into the PSP browser EBOOT,
     with every quoted include they reach."""
@@ -117,6 +128,8 @@ def eboot_files():
         if name in seen:
             continue
         seen.add(name)
+        if generated(path):
+            continue
         text = path.read_text(encoding="utf-8", errors="replace")
         for include in INCLUDE.findall(text):
             for base in (path.parent, ROOT / "src", ROOT / "include",
@@ -125,7 +138,7 @@ def eboot_files():
                 if candidate.is_file():
                     pending.append(candidate)
                     break
-    return seen
+    return frozenset(seen)
 
 
 def lab_binary_switches():
@@ -141,8 +154,10 @@ def lab_binary_switches():
     return result
 
 
+@functools.cache
 def switch_reads():
-    """Map each switch to its (path, through tilefinch_lab_getenv) reads."""
+    """Map each switch to its (path, through tilefinch_lab_getenv) reads.
+    Scanned once per run: every check below reads the same sources."""
     reads = {}
     for path in source_files():
         text = path.read_text(encoding="utf-8", errors="replace")

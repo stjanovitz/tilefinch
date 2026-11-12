@@ -24,14 +24,23 @@
  *
  * Credit is deliberately pessimistic. Each batch of timing samples is
  * charged the worst of several predictors (most-common value, repeat at lags
- * 1..PSP_ENTROPY_LAG_MAX, and a linear-trend guess), using the 99% upper
- * confidence bound on the predictor's hit rate in the style of NIST SP
- * 800-90B. The resulting per-sample min-entropy is capped at one bit and
+ * 1..min(PSP_ENTROPY_LAG_MAX, count / PSP_ENTROPY_LAG_DIVISOR), and a
+ * linear-trend guess), using the 99% upper confidence bound on the
+ * predictor's hit rate in the style of NIST SP 800-90B. The resulting per-sample min-entropy is capped at one bit and
  * then divided by PSP_ENTROPY_SAFETY_DIVISOR, because timing samples are not
  * independent and a predictor that we did not think of could do better. A
  * deterministic clock (PPSSPP's emulated one advances with executed
  * instructions) yields constant or cyclic samples and earns little or no
  * credit.
+ *
+ * The lags reach far because a beat between two clocks is a rotation and a
+ * sample is the indicator of one arc of the phase circle: for any step there
+ * is a lag q <= N whose q steps land within 1/(N+1) of a whole tick, so at
+ * that lag samples repeat at least 1 - 2/(N+1) of the time. With N = 64 (a
+ * 256-sample work batch) or 16 (a 64-sample sleep batch) the confidence
+ * bound rounds that to certainty for every beat frequency; eight lags let a
+ * period-9 beat through. Each lag keeps at least three quarters of the batch
+ * as trials.
  *
  * Every byte offered is hashed into the pool whether or not it is credited;
  * the persisted seed file and boot context are mixed in but never credited,
@@ -44,7 +53,11 @@
    bound, small enough to estimate in place with an insertion sort. */
 #define PSP_ENTROPY_MIN_BATCH 32u
 #define PSP_ENTROPY_MAX_BATCH 256u
-#define PSP_ENTROPY_LAG_MAX 8u
+/* Repeat-at-lag runs for lags 1..min(LAG_MAX, count / LAG_DIVISOR). */
+#define PSP_ENTROPY_LAG_MAX 64u
+#define PSP_ENTROPY_LAG_DIVISOR 4u
+_Static_assert(PSP_ENTROPY_MIN_BATCH / PSP_ENTROPY_LAG_DIVISOR >= 8u,
+               "never fewer lags than the first estimator");
 /* Per-sample estimate ceiling (thousandths of a bit) before the divisor. */
 #define PSP_ENTROPY_SAMPLE_CAP_MILLIBITS 1000u
 #define PSP_ENTROPY_SAFETY_DIVISOR 4u

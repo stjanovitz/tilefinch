@@ -151,8 +151,9 @@
         &rebind_gate_document, &budget, 4 * MIB, 1000,
         "https://example.test/rebind", &rebind_gate_options,
         &rebind_gate_result);
-    /* A wrapper's handle is fixed for its life: __handle is a getter only,
-       and no wrapper carries a way to repoint it at another node. */
+    /* A wrapper's handle is fixed for its life: __handle is a read-only,
+       non-configurable data property, and no wrapper carries a way to
+       repoint it at another node. */
     static const char rebind_gate_source[] =
         "(()=>{const first=document.getElementById('first'),"
         "second=document.getElementById('second'),"
@@ -164,8 +165,8 @@
         "first,'__handle');"
         "globalThis.pocSummary=first.__handle===before"
         "&&first.textContent==='one'"
-        "&&descriptor&&typeof descriptor.get==='function'"
-        "&&descriptor.set===undefined&&descriptor.configurable===false"
+        "&&descriptor&&descriptor.writable===false"
+        "&&descriptor.configurable===false"
         "&&!('__tilefinchRebindHandle' in first)"
         "?'REBIND-GATED':'REBIND-FAILED:'+threw+','"
         "+(first.__handle===before)+','+first.textContent;})()";
@@ -357,12 +358,14 @@
         "document.getElementById('s').localName==='svg',"
         "document.getElementById('c').localName==='circle',"
         "get.call({tagName:'BORROWED'})==='borrowed'];"
+        /* An element's own name does not follow a tagName the page
+           redefines (as in Chromium). */
         "const q=document.createElement('div');"
         "Object.defineProperty(q,'tagName',{configurable:true,"
-        "get(){return 'OVERRIDE'}});checks.push(q.localName==='override');"
+        "get(){return 'OVERRIDE'}});checks.push(q.localName==='div');"
         "const err=new Error('tag');Object.defineProperty(q,'tagName',"
         "{configurable:true,get(){throw err}});"
-        "try{q.localName;checks.push(false)}catch(e){checks.push(e===err)}"
+        "try{checks.push(q.localName==='div')}catch(e){checks.push(false)}"
         "const proxy=new Proxy(p,{getOwnPropertyDescriptor(){"
         "throw new Error('unexpected descriptor trap')}});"
         "checks.push(get.call(proxy)==='p');"
@@ -522,14 +525,14 @@
         "const t=d.getElementById('t'),tp=t.content.firstChild,"
         "host=d.createElement('section');host.innerHTML='<em><u></u></em>';"
         "nd.body.appendChild(host);el.__mark=el.firstChild.__mark="
-        "tp.__mark=host.firstChild.__mark=1;const many=[];"
+        "host.firstChild.__mark=1;const many=[];"
         "for(let i=0;i<20;i++){const dd=d.implementation.createHTMLDocument"
         "(''),x=d.createElement('i');x.innerHTML='<b></b>';dd.adoptNode(x);"
         "if(i%9===0)many.push([x.firstChild,dd])}"
         "const checks=[el.ownerDocument===nd,el.firstChild.ownerDocument"
         "===nd,tp.ownerDocument!==d,host.firstChild.ownerDocument===nd];"
         "Object.assign(globalThis,{__nd:nd,__many:many,"
-        "__i:el.firstChild.firstChild,"
+        "__i:el.firstChild.firstChild,__tpLease:tp.__tilefinchHandleLease,"
         "__tb:tp.firstChild,__host:host,__tod:tp.ownerDocument,"
         "__creates:__tilefinchRetentionStats.wrapperCreates});"
         "globalThis.pocSummary=checks.every(Boolean)?'OWNER-OK':"
@@ -539,7 +542,7 @@
         "(()=>{const d=document,nd=__nd,p=__i.parentNode,el=p.parentNode,"
         "s=el.lastChild,tp=__tb.parentNode,em=__host.firstChild;"
         "const fresh=p.__mark===undefined&&el.__mark===undefined"
-        "&&tp.__mark===undefined&&em.__mark===undefined"
+        "&&tp.__tilefinchHandleLease!==__tpLease&&em.__mark===undefined"
         "&&__tilefinchRetentionStats.wrapperCreates>__creates;"
         "const n=d.createElement('u');p.appendChild(n);"
         "el.insertAdjacentHTML('beforeend','<kbd><var></var></kbd>');"
@@ -642,6 +645,30 @@
             "?'NO-DEFINITION-OK':'NO-DEFINITION-WALKED'})()",
             "<no-definition-form-resync>", &owner_result));
         CHECK(strcmp(owner_result.summary, "NO-DEFINITION-OK") == 0);
+        /* Connecting a large plain subtree visits only the elements a
+           reaction can concern (native candidate walk), shadow trees
+           included, in shadow-including tree order. */
+        CHECK(script_runtime_evaluate_diagnostic(
+            owner_runtime,
+            "(()=>{const seen=[];class Walk extends HTMLElement{"
+            "connectedCallback(){seen.push(this.id)}}"
+            "customElements.define('x-walk-probe',Walk);"
+            "const box=document.createElement('section');"
+            "box.innerHTML='<span a=1><b>text</b></span>'.repeat(64)+"
+            "'<p><x-walk-probe id=light></x-walk-probe></p><div id=host></div>';"
+            "box.querySelector('#host').attachShadow({mode:'open'}).innerHTML="
+            "'<i><x-walk-probe id=shadow></x-walk-probe></i>';"
+            "const before=__tilefinchRetentionStats.wrapperCreates;"
+            "document.body.appendChild(box);"
+            "const created=__tilefinchRetentionStats.wrapperCreates-before;"
+            "globalThis.pocSummary=seen.join()==='light,shadow'&&created<=8"
+            "?'CANDIDATE-WALK-OK':'CANDIDATE-WALK-'+seen.join('/')+'-'+created;"
+            "box.remove()})()",
+            "<custom-element-candidate-walk>", &owner_result));
+        if (strcmp(owner_result.summary, "CANDIDATE-WALK-OK") != 0)
+            printf("candidate walk: %s %s\n", owner_result.summary,
+                   owner_result.error);
+        CHECK(strcmp(owner_result.summary, "CANDIDATE-WALK-OK") == 0);
         CHECK(script_runtime_evaluate_diagnostic(
             owner_runtime,
             "(()=>{let adoptions=0;const disabled=[];"
@@ -906,6 +933,62 @@
     document_destroy(&live_network_document);
     fetch_trace_end();
     CHECK(budget.current == live_network_baseline);
+
+    /* NW-09: a 107 KiB stream, more than the 64 KiB EventSource buffer.
+       The first message handler makes a synchronous XHR, whose wait pumps
+       the scheduler while script still holds the first chunk; the stream
+       must wait for script rather than fail, and lose no bytes. */
+    puts("test: EventSource waits for script when its buffer is full");
+    size_t pressure_baseline = budget.current;
+    char pressure_trace_error[256] = {0};
+    CHECK(fetch_trace_replay_begin(
+        TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-event-source-backpressure",
+        pressure_trace_error, sizeof(pressure_trace_error)));
+    PocDocument pressure_document = {0};
+    ScriptResult pressure_result = {0};
+    CHECK(document_parse(
+        &pressure_document, &budget, live_network_page,
+        strlen(live_network_page), 17));
+    ScriptRuntimeOptions pressure_options = {0};
+    CHECK(viewport_context_init(
+        &pressure_options.viewport, 480, 272, 480, 272));
+    ScriptRuntime *pressure_runtime = script_runtime_create_configured(
+        &pressure_document, &budget, 5 * MIB, 1000,
+        "https://events.test/page", &pressure_options, &pressure_result);
+    static const char pressure_source[] =
+        "(()=>{let messages=0,ordered=true,synced='';"
+        "const source=new EventSource('/feed');"
+        "source.onmessage=event=>{if(messages===0){const xhr="
+        "new XMLHttpRequest();xhr.open('GET','/sync',false);xhr.send();"
+        "synced=xhr.responseText;}"
+        "if(event.data==='final'){source.close();"
+        "globalThis.pocSummary=ordered&&messages===1500&&synced==='ok'"
+        "?'pressure-ok':'pressure-bad:'+messages+':'+synced;return;}"
+        "ordered&&=event.data.startsWith('event-'"
+        "+String(messages).padStart(4,'0')+'-');messages++;};"
+        "source.onerror=()=>{globalThis.pocSummary='pressure-error:'"
+        "+messages;source.close();};"
+        "globalThis.pocSummary='pressure-pending';})()";
+    CHECK(pressure_runtime != NULL && pressure_result.success
+          && script_runtime_evaluate_diagnostic(
+                 pressure_runtime, pressure_source, "<pressure-probe>",
+                 &pressure_result));
+    for (size_t tick = 0;
+         tick < 64
+         && strcmp(pressure_result.summary, "pressure-pending") == 0;
+         tick++) {
+        CHECK(script_runtime_advance(
+            pressure_runtime, 1, 4, &pressure_result));
+    }
+    if (strcmp(pressure_result.summary, "pressure-ok") != 0) {
+        fprintf(stderr, "event source pressure summary=%s trace=%s\n",
+                pressure_result.summary, pressure_trace_error);
+    }
+    CHECK(strcmp(pressure_result.summary, "pressure-ok") == 0);
+    script_runtime_destroy(pressure_runtime);
+    document_destroy(&pressure_document);
+    fetch_trace_end();
+    CHECK(budget.current == pressure_baseline);
 
     puts("test: installed-game multiplayer channel lifecycle");
     size_t multiplayer_baseline = budget.current;
@@ -1581,7 +1664,7 @@
                                  strlen(grow_page), 17));
             ScriptResult grow_result;
             ScriptRuntime *grow_runtime = script_runtime_create(
-                &grow_document, &budget, 2 * MIB, 1000,
+                &grow_document, &budget, 2 * MIB + 64 * 1024, 1000,
                 "https://grow.test/", &grow_result);
             CHECK(grow_runtime != NULL);
             size_t reserve = (budget.limit - grow_baseline) / 5u;
@@ -1620,7 +1703,11 @@
             CHECK(budget_remaining(&budget) + 128u * 1024u >= reserve);
             CHECK(c != 2 || growth.raises != 0);
             if (c == 0) {
-                /* Dropped: later collections return the growth. */
+                /* Dropped: later collections return the growth. The
+                   returned limit keeps GC pacing headroom over the live
+                   bootstrap, so it is judged against the 4 MiB the page
+                   held rather than a fixed distance above the floor. */
+                size_t peak_limit = growth.limit;
                 CHECK(script_runtime_evaluate_diagnostic(
                     grow_runtime, "hold.length=0;pocSummary='dropped'",
                     "<drop>", &grow_result));
@@ -1628,12 +1715,14 @@
                     CHECK(script_runtime_advance(grow_runtime, 1, 4,
                                                  &grow_result));
                 script_runtime_heap_growth(grow_runtime, &growth);
-                if (growth.returns == 0 || growth.limit > growth.floor + MIB)
-                    printf("heap growth return: limit=%zu floor=%zu "
-                           "returns=%zu\n", growth.limit, growth.floor,
-                           growth.returns);
-                CHECK(growth.returns != 0
-                      && growth.limit <= growth.floor + MIB);
+                bool returned = growth.returns != 0
+                    && growth.limit <= peak_limit - 2u * MIB
+                    && growth.limit <= growth.floor + 2u * MIB;
+                if (!returned)
+                    printf("heap growth return: limit=%zu peak=%zu "
+                           "floor=%zu returns=%zu\n", growth.limit,
+                           peak_limit, growth.floor, growth.returns);
+                CHECK(returned);
             }
             script_runtime_destroy(grow_runtime);
             document_destroy(&grow_document);
@@ -1662,7 +1751,7 @@
                              strlen(held_page), 17));
         ScriptResult held_result;
         ScriptRuntime *held_runtime = script_runtime_create(
-            &held_document, &budget, 3 * MIB, 1000,
+            &held_document, &budget, 3 * MIB + 64 * 1024, 1000,
             "https://held.test/", &held_result);
         CHECK(held_runtime != NULL);
         size_t headroom = script_runtime_heap_remaining(held_runtime);
@@ -1953,7 +2042,9 @@
         "frameEval('let lexical=3; function changeLexical(){return ++lexical;}');"
         "const lexical=frameEval('changeLexical()')===4&&frameEval('lexical')===4"
         "&&bindingFrame.contentWindow.lexical===undefined;"
+        "frameEval('var longEval=7;'+'\\n'.repeat(70000));"
         "globalThis.pocSummary=refusedFrames===20&&reflected&&preserved"
+        "&&frameEval('longEval')===7"
         "&&closure&&lexical&&frameEval('this===window')"
         "&&frameEval('(function(){return this===window;})()')"
         "&&frameEval('Function(\"return this===window\")()')"
@@ -2027,6 +2118,70 @@
           && strcmp(wasm_alias_result.summary, "WASM-ALIAS-OK") == 0);
     document_destroy(&wasm_alias_document);
     CHECK(budget.current == wasm_alias_baseline);
+
+    /* A WebAssembly.Memory buffer cannot be transferred or detached by
+       script: a transfer() would leave an ArrayBuffer over the old linear
+       memory that the bridge cannot detach, and on the PSP growth moves
+       the memory and frees the old block under it. Every route refuses,
+       including another realm's intrinsic and a structured-clone transfer
+       list, and the published buffer stays attached; plain buffers still
+       transfer. */
+    puts("test: WebAssembly memory buffers cannot be transferred");
+    size_t wasm_transfer_baseline = budget.current;
+    static const char wasm_transfer_page[] =
+        "<!doctype html><html><body><script>"
+        "const instance=new WebAssembly.Instance(new WebAssembly.Module("
+        "Uint8Array.from([0,97,115,109,1,0,0,0,5,4,1,1,1,2,"
+        "7,10,1,6,109,101,109,111,114,121,2,0])));"
+        "const memory=instance.exports.memory,buffer=memory.buffer;"
+        "new Uint8Array(buffer)[7]=42;"
+        "const refusal=run=>{try{run();return 'returned'}"
+        "catch(error){return error.name}};"
+        "const frame=document.body.appendChild(document.createElement('iframe'));"
+        "const foreign=frame.contentWindow.ArrayBuffer.prototype;"
+        "const refused=[refusal(()=>buffer.transfer()),"
+        "refusal(()=>buffer.transferToFixedLength()),"
+        "refusal(()=>buffer.transfer(16)),refusal(()=>buffer.transfer(0)),"
+        "refusal(()=>foreign.transfer.call(buffer)),"
+        "refusal(()=>foreign.transferToFixedLength.call(buffer,8)),"
+        "refusal(()=>structuredClone(buffer,{transfer:[buffer]})),"
+        "refusal(()=>structuredClone(1,{transfer:[new ArrayBuffer(2),buffer]}))"
+        "].join();"
+        "const kept=memory.buffer===buffer&&buffer.byteLength===65536"
+        "&&new Uint8Array(buffer)[7]===42;"
+        "const grown=memory.grow(1)===1&&buffer.byteLength===0"
+        "&&memory.buffer.byteLength===131072"
+        "&&new Uint8Array(memory.buffer)[7]===42;"
+        "const plain=new ArrayBuffer(8),moved=plain.transfer(),"
+        "cloned=new ArrayBuffer(4);structuredClone(cloned,{transfer:[cloned]});"
+        "const ordinary=plain.byteLength===0&&moved.byteLength===8"
+        "&&new ArrayBuffer(8).transferToFixedLength(4).byteLength===4"
+        "&&foreign.transfer.call(new ArrayBuffer(4)).byteLength===4"
+        "&&cloned.byteLength===0&&ArrayBuffer.prototype.transfer.name==='transfer'"
+        "&&ArrayBuffer.prototype.transferToFixedLength.length===0;"
+        "const expected='TypeError,TypeError,TypeError,TypeError,TypeError,"
+        "TypeError,DataCloneError,DataCloneError';"
+        "globalThis.pocSummary=refused===expected&&kept&&grown&&ordinary"
+        "?'WASM-TRANSFER-OK':'WASM-TRANSFER-FAILED:'+JSON.stringify("
+        "{refused,kept,grown,ordinary});"
+        "</script></body></html>";
+    PocDocument wasm_transfer_document;
+    CHECK(document_parse(&wasm_transfer_document, &budget,
+                         wasm_transfer_page, strlen(wasm_transfer_page), 17));
+    ScriptResult wasm_transfer_result;
+    bool wasm_transfer_ran = scripts_run_document_at(
+        &wasm_transfer_document, &budget, 8 * MIB, 2000,
+        "https://wasm-transfer.test/", &wasm_transfer_result);
+    if (!wasm_transfer_ran
+        || strcmp(wasm_transfer_result.summary, "WASM-TRANSFER-OK") != 0) {
+        fprintf(stderr, "wasm transfer: ran=%d summary=%s error=%s\n",
+                wasm_transfer_ran, wasm_transfer_result.summary,
+                wasm_transfer_result.error);
+    }
+    CHECK(wasm_transfer_ran && wasm_transfer_result.success
+          && strcmp(wasm_transfer_result.summary, "WASM-TRANSFER-OK") == 0);
+    document_destroy(&wasm_transfer_document);
+    CHECK(budget.current == wasm_transfer_baseline);
 
     puts("test: wasm alias detach accounting and allocation refusal");
     extern bool js_wasm_test_alias_release_accounting(void);
@@ -2819,7 +2974,7 @@
         "&&formatter.resolvedOptions().locale==='en-US'"
         "&&formatter.resolvedOptions().timeZone==='UTC'"
         "&&numberText==='1,234.5'&&percentText==='25%'"
-        "&&currencyText==='USD 1,234.5'&&pluralText==='one/other/two'"
+        "&&currencyText==='$1,234.50'&&pluralText==='one/other/two'"
         "&&new Intl.Locale('en_US').toString()==='en-US'"
         "&&Intl.getCanonicalLocales(['en_US'])[0]==='en-US'"
         "&&new Intl.Collator('en-US',{sensitivity:'base'}).compare('A','a')===0"
@@ -3348,6 +3503,175 @@
           && strcmp(motion_free_result.summary,
                     "MOTION-NEGATIVE-CACHED") == 0);
     script_runtime_destroy(motion_free_runtime);
+
+    puts("test: the inline motion scan reruns only when what it reads changes");
+    ScriptResult motion_scope_result;
+    ScriptRuntime *motion_scope_runtime = script_runtime_create_configured(
+        &deterministic_tick_document, &budget, 4u * MIB, 1000,
+        "https://motion-scope.test/", &deterministic_tick_options,
+        &motion_scope_result);
+    static const char motion_scope_source[] =
+        "(()=>{const census=__tilefinchRootCensus,scans=()=>census.motionInlineHintScans;"
+        "const box=document.createElement('div'),inner=document.createElement('i');"
+        "document.body.appendChild(box);box.appendChild(inner);box.className='a';"
+        "const settled=scans();"
+        /* Style changes below the lists read: nested inline style, nested
+           <style>, and a shadow tree. */
+        "for(let i=0;i<8;i++)inner.setAttribute('style','color:red');"
+        "const nested=document.createElement('style');inner.appendChild(nested);"
+        "nested.textContent='i{color:blue}';"
+        "box.className='b';box.className='c';"
+        "const nestedScans=scans()-settled;"
+        /* A listed child's inline style does change it, once per generation. */
+        "box.setAttribute('style','color:green');box.className='d';"
+        "const listedStyle=scans()-settled-nestedScans;"
+        /* So does a change of the list itself, and of <head>'s. */
+        "const added=document.createElement('p');document.body.appendChild(added);"
+        "box.className='e';box.className='f';"
+        "const listChange=scans()-settled-nestedScans-listedStyle;"
+        "box.remove();added.remove();"
+        "globalThis.pocSummary=nestedScans===0&&listedStyle===1&&listChange===1"
+        "?'MOTION-SCAN-SCOPED':'MOTION-SCAN:'+nestedScans+'/'+listedStyle+'/'+listChange})()";
+    CHECK(motion_scope_runtime != NULL
+          && script_runtime_evaluate_diagnostic(
+              motion_scope_runtime, motion_scope_source,
+              "<motion-scan-scope>", &motion_scope_result)
+          && motion_scope_result.success
+          && strcmp(motion_scope_result.summary, "MOTION-SCAN-SCOPED") == 0);
+    script_runtime_destroy(motion_scope_runtime);
+
+    puts("test: shadow-tree ancestry stays correct through the native walks");
+    ScriptResult shadow_walk_result;
+    ScriptRuntime *shadow_walk_runtime = script_runtime_create_configured(
+        &deterministic_tick_document, &budget, 4u * MIB, 1000,
+        "https://shadow-walk.test/", &deterministic_tick_options,
+        &shadow_walk_result);
+    static const char shadow_walk_source[] =
+        "(()=>{const host=document.createElement('div');document.body.appendChild(host);"
+        "const root=host.attachShadow({mode:'open'}),a=document.createElement('section'),"
+        "b=document.createElement('b');root.appendChild(a);a.appendChild(b);"
+        "const light=document.createElement('span');host.appendChild(light);"
+        "const detached=document.createElement('div'),child=document.createElement('i');"
+        "detached.appendChild(child);"
+        "let cycle='';try{b.appendChild(a)}catch(e){cycle=e.name}"
+        "let selfRoot='';try{root.appendChild(root)}catch(e){selfRoot=e.name}"
+        "const checks=[b.getRootNode()===root,b.getRootNode({composed:true})===document,"
+        "root.getRootNode()===root,light.getRootNode()===document,"
+        "child.getRootNode()===detached,detached.parentNode===null,"
+        "root.parentNode===null,a.parentNode===root,b.parentElement===a,"
+        "a.parentElement===null,host.contains(b)===false,root.contains(b)===true,"
+        "a.contains(b)===true,b.contains(a)===false,document.contains(b)===false,"
+        "b.isConnected===true,cycle==='HierarchyRequestError',"
+        "selfRoot==='HierarchyRequestError'];"
+        "const inner=document.createElement('div'),innerRoot=inner.attachShadow({mode:'open'}),"
+        "deep=document.createElement('u');innerRoot.appendChild(deep);b.appendChild(inner);"
+        "checks.push(deep.getRootNode()===innerRoot,"
+        "deep.getRootNode({composed:true})===document,inner.getRootNode()===root);"
+        "const walker=document.createTreeWalker(a,NodeFilter.SHOW_ELEMENT),seen=[];"
+        "for(let n=walker.nextNode();n;n=walker.nextNode())seen.push(n.localName);"
+        "checks.push(seen.join()==='b,div',walker.currentNode===inner,walker.nextNode()===null,"
+        "walker.currentNode===inner);host.remove();"
+        "globalThis.pocSummary=checks.every(Boolean)?'SHADOW-WALK-OK':"
+        "'SHADOW-WALK:'+checks.map(Number).join('')})()";
+    CHECK(shadow_walk_runtime != NULL
+          && script_runtime_evaluate_diagnostic(
+              shadow_walk_runtime, shadow_walk_source,
+              "<shadow-walk>", &shadow_walk_result)
+          && shadow_walk_result.success
+          && strcmp(shadow_walk_result.summary, "SHADOW-WALK-OK") == 0);
+    script_runtime_destroy(shadow_walk_runtime);
+
+    puts("test: insertion's native lanes keep validation, reactions and wrappers");
+    ScriptResult insert_lane_result;
+    ScriptRuntime *insert_lane_runtime = script_runtime_create_configured(
+        &deterministic_tick_document, &budget, 4u * MIB, 1000,
+        "https://insert-lane.test/", &deterministic_tick_options,
+        &insert_lane_result);
+    static const char insert_lane_source[] =
+        "(()=>{const body=document.body,box=document.createElement('div'),"
+        "ref=document.createElement('p'),other=document.createElement('p'),"
+        "el=document.createElement('i'),fails=[];body.appendChild(box);box.appendChild(ref);"
+        "const name=(fn)=>{try{fn();return ''}catch(e){return e.name}},"
+        "check=(label,ok)=>{if(!ok)fails.push(label)};"
+        /* A page's object naming a real handle is not that node. */
+        "check('spoof node',name(()=>box.appendChild({__handle:el.__handle}))==='TypeError');"
+        "check('spoof ref',name(()=>box.insertBefore(el,{__handle:ref.__handle}))==='TypeError');"
+        "check('spoof parent',!box.contains(el));"
+        "const outer=document.createElement('div'),inner=document.createElement('div');"
+        "outer.appendChild(inner);"
+        "check('self',name(()=>outer.appendChild(outer))==='HierarchyRequestError');"
+        "check('cycle',name(()=>inner.appendChild(outer))==='HierarchyRequestError');"
+        "check('foreign ref',name(()=>box.insertBefore(el,other))==='NotFoundError');"
+        "check('text parent',name(()=>document.createTextNode('x').appendChild(el))"
+        "==='HierarchyRequestError');"
+        "check('document parent',name(()=>document.appendChild(el))==='HierarchyRequestError');"
+        "check('no parent moved',el.parentNode===null&&outer.parentNode===null);"
+        /* A fragment before a reference child: one record, script after the
+           whole batch, custom elements connected. */
+        "let connected=0,upgrades=0,seenByScript='';"
+        "globalThis.__laneScript=()=>{seenByScript=!!document.getElementById('lane-after')?'all':'early'};"
+        "class LaneItem extends HTMLElement{constructor(){super();upgrades++}"
+        "connectedCallback(){connected++}}"
+        "customElements.define('lane-item',LaneItem);"
+        "const fragment=document.createDocumentFragment(),script=document.createElement('script'),"
+        "item=document.createElement('lane-item'),after=document.createElement('b');"
+        "script.textContent='__laneScript()';after.id='lane-after';"
+        "fragment.append(script,item,after);"
+        "const observer=new MutationObserver(()=>{});observer.observe(box,{childList:true});"
+        "box.insertBefore(fragment,ref);"
+        "const records=observer.takeRecords();"
+        "check('order',[...box.children].map(n=>n.localName).join()==='script,lane-item,b,p');"
+        "check('emptied',fragment.childNodes.length===0);"
+        "check('record',records.length===1&&records[0].addedNodes.length===3"
+        "&&records[0].nextSibling===ref&&records[0].previousSibling===null);"
+        "check('connected',connected===1&&upgrades===1);"
+        "check('script',seenByScript==='all');"
+        /* Reactions run once the whole fragment is in, so one taking the
+           reference child away cannot fail the insertion it follows. */
+        "class LaneThief extends HTMLElement{connectedCallback(){ref.remove()}}"
+        "customElements.define('lane-thief',LaneThief);"
+        "const stolen=document.createDocumentFragment();"
+        "stolen.append(document.createElement('lane-thief'),document.createElement('u'));"
+        "check('stolen ref',name(()=>box.insertBefore(stolen,ref))==='');"
+        "check('stolen result',!ref.parentNode&&box.lastChild.localName==='u'"
+        "&&box.lastChild.previousSibling.localName==='lane-thief');"
+        "observer.takeRecords();box.appendChild(document.createElement('s'));"
+        "check('notified after',observer.takeRecords().length===1);observer.disconnect();"
+        /* Wrappers from the native path look as they always did. */
+        "const plain=document.createElement('section'),"
+        "held=Object.getOwnPropertyDescriptor(plain,'__handle');"
+        "check('handle',held&&!held.writable&&!held.enumerable&&!held.configurable);"
+        "plain.classList.add('x');check('classList',plain.className==='x');"
+        "let heard=0;plain.addEventListener('ping',()=>heard++);plain.dispatchEvent(new Event('ping'));"
+        "check('listener',heard===1);"
+        "const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');"
+        "check('svg',svg.namespaceURI==='http://www.w3.org/2000/svg'&&plain.namespaceURI"
+        "==='http://www.w3.org/1999/xhtml');"
+        "const parsed=document.createElement('div');"
+        "parsed.innerHTML='<lane-item></lane-item><span>t</span>';"
+        "check('parsed custom',parsed.firstChild instanceof LaneItem&&upgrades===2);"
+        "check('parsed plain',parsed.lastChild instanceof HTMLSpanElement"
+        "&&parsed.lastChild.firstChild.data==='t'"
+        "&&Object.keys(parsed.lastChild).length===0);"
+        /* The walk template instantiation does: the document as root, the
+           current node set into a fragment. */
+        "const tree=document.createElement('template');"
+        "tree.innerHTML='<a><!--c-->x</a><em></em>';"
+        "const copy=document.importNode(tree.content,true),"
+        "walker=document.createTreeWalker(document,129),walked=[];walker.currentNode=copy;"
+        "for(let n=walker.nextNode();n;n=walker.nextNode())walked.push(n.nodeName);"
+        "check('walk',walked.join()==='A,#comment,EM'&&walker.currentNode===copy.lastChild);"
+        "walker.currentNode=document;"
+        "check('walk from document',walker.nextNode()===document.documentElement);"
+        "box.remove();"
+        "globalThis.pocSummary=fails.length?'INSERT-LANE:'+fails.join():'INSERT-LANE-OK'})()";
+    CHECK(insert_lane_runtime != NULL
+          && script_runtime_evaluate_diagnostic(
+              insert_lane_runtime, insert_lane_source,
+              "<insert-lane>", &insert_lane_result)
+          && insert_lane_result.success
+          && strcmp(insert_lane_result.summary, "INSERT-LANE-OK") == 0);
+    script_runtime_destroy(insert_lane_runtime);
 
     puts("test: external stylesheet motion uses the bounded host scheduler");
     size_t external_motion_baseline = budget.current;

@@ -132,6 +132,13 @@ bool tilefinch_csp_allows_base_uri(
     const TilefinchContentSecurityPolicy *policy, const char *target_url);
 bool tilefinch_csp_allows_form_action(
     const TilefinchContentSecurityPolicy *policy, const char *target_url);
+/* connect-src for a WebSocket. `request_url` is the socket's request URL,
+   its http(s) spelling (ws as http, wss as https, after any HSTS upgrade),
+   and sources match it as the ws(s) URL it stands for: `wss://host` and
+   `ws:` name sockets. */
+bool tilefinch_csp_allows_websocket(
+    const TilefinchContentSecurityPolicy *policy, const char *request_url,
+    uint8_t grant);
 bool tilefinch_csp_allows_worker(
     const TilefinchContentSecurityPolicy *policy, const char *target_url);
 /* Dynamic compilation (eval/Function and their aliases) is allowed only

@@ -133,6 +133,27 @@ void psp_update_session_refresh_ui(
        Options re-query the firmware for its label every frame). */
     if (update == NULL || ui == NULL
         || ui->screen != PSP_UI_SCREEN_UPDATE) return;
+    if (update->trial_retry_requested) {
+        psp_ui_set_update(
+            ui, TILEFINCH_VERSION_STRING, "READY TO RESTART", "", -1,
+            "RESTART TO UPDATE", true, false);
+        return;
+    }
+    if (psp_update_session_trial_declined(update)) {
+        if (update->client != NULL)
+            (void) tilefinch_update_client_snapshot(
+                update->client, &update->client_snapshot);
+        /* A background check that is still running keeps its own display;
+           the choice appears when it ends. */
+        if (!psp_update_session_active(update)) {
+            psp_ui_set_update(
+                ui, TILEFINCH_VERSION_STRING,
+                "UPDATE DID NOT FINISH STARTING", "", -1, "TRY AGAIN", true,
+                false);
+            psp_ui_set_update_discard(ui, true);
+            return;
+        }
+    }
     if (!update->available) {
         psp_ui_set_update(
             ui, TILEFINCH_VERSION_STRING,
@@ -193,6 +214,12 @@ void psp_update_session_refresh_ui(
                          ? "BETA CHANNEL - SIGNED"
                          : "STABLE CHANNEL - SIGNED");
         }
+    }
+    if (snapshot->phase == TILEFINCH_UPDATE_CLIENT_DOWNLOADED
+        && update->install_refused) {
+        /* Restarting without L boots the journal's active slot, from which
+           the other slot can be replaced. */
+        snprintf(status, sizeof(status), "%s", "RESTART TO UPDATE");
     }
     if (snapshot->phase == TILEFINCH_UPDATE_CLIENT_AVAILABLE) {
         uint64_t tenths_mib =
@@ -307,12 +334,15 @@ bool psp_update_session_initialize(
         (unsigned long long) available, update_dir);
     /* Read the journal before the trust root so that the part-file sweep
        below runs even on a build with no configured release root. */
-    if (!tilefinch_update_journal_load(
-            paths->data_dir, &update->state, NULL)) {
+    snprintf(update->data_dir, sizeof(update->data_dir), "%s",
+             paths->data_dir);
+    update->running_slot = psp_update_session_current_slot(paths);
+    update->state_from_journal = tilefinch_update_journal_load(
+        paths->data_dir, &update->state, NULL);
+    if (!update->state_from_journal) {
         memset(&update->state, 0, sizeof(update->state));
         update->state.generation = 1;
-        update->state.active_slot =
-            psp_update_session_current_slot(paths);
+        update->state.active_slot = update->running_slot;
         update->state.installed_sequence = TILEFINCH_RELEASE_SEQUENCE;
     }
     if (update->state.trial == TILEFINCH_UPDATE_TRIAL_NONE) {
@@ -474,6 +504,84 @@ void psp_update_session_pump(
     psp_update_session_refresh_ui(update, ui);
 }
 
+/* The browser has another journal writer (the trial-health confirmation),
+   so the copy read at initialization goes stale. False when a journal that
+   was readable no longer is. */
+static bool psp_update_session_reload_state(PspUpdateSession *update)
+{
+    TilefinchUpdateState fresh;
+    if (!tilefinch_update_journal_load(update->data_dir, &fresh, NULL))
+        return !update->state_from_journal;
+    update->state_from_journal = true;
+    uint8_t known[TILEFINCH_UPDATE_STATE_BYTES];
+    uint8_t loaded[TILEFINCH_UPDATE_STATE_BYTES];
+    if (tilefinch_update_state_encode(&update->state, known)
+            == TILEFINCH_UPDATE_OK
+        && tilefinch_update_state_encode(&fresh, loaded)
+            == TILEFINCH_UPDATE_OK
+        && memcmp(known, loaded, sizeof(known)) == 0)
+        return true;
+    update->state = fresh;
+    (void) tilefinch_update_client_set_installed(
+        update->client, fresh.installed_sequence, fresh.installed_sha256,
+        fresh.installed_sequence != 0,
+        psp_update_hash_is_nonzero(fresh.installed_sha256));
+    return true;
+}
+
+TilefinchUpdateSlot psp_update_session_install_target(
+    PspUpdateSession *update)
+{
+    if (update == NULL || !update->initialized
+        || !psp_update_session_reload_state(update))
+        return TILEFINCH_UPDATE_SLOT_NONE;
+    TilefinchUpdateSlot target =
+        update->state.active_slot == TILEFINCH_UPDATE_SLOT_A
+        ? TILEFINCH_UPDATE_SLOT_B : TILEFINCH_UPDATE_SLOT_A;
+    /* Running from the other slot than the journal's active one means safe
+       start chose the previous build, or a trial has not been confirmed:
+       the only replaceable slot is the one this process runs from. */
+    if (update->running_slot != TILEFINCH_UPDATE_SLOT_NONE
+        && target == update->running_slot)
+        return TILEFINCH_UPDATE_SLOT_NONE;
+    return target;
+}
+
+bool psp_update_session_trial_declined(const PspUpdateSession *update)
+{
+    return update != NULL && update->initialized
+        && update->state_from_journal && update->installer == NULL
+        && update->state.trial == TILEFINCH_UPDATE_TRIAL_STARTED
+        && update->state.pending_slot != TILEFINCH_UPDATE_SLOT_NONE
+        && update->running_slot != TILEFINCH_UPDATE_SLOT_NONE
+        && update->running_slot != update->state.pending_slot;
+}
+
+bool psp_update_session_resolve_trial(
+    PspUpdateSession *update, bool retry)
+{
+    if (update == NULL || !update->initialized
+        || psp_update_session_active(update)
+        || !psp_update_session_reload_state(update)
+        || !psp_update_session_trial_declined(update)) return false;
+    TilefinchUpdateState next = update->state;
+    if (!(retry ? tilefinch_update_state_retry_trial(&next)
+                : tilefinch_update_state_discard_trial(&next))
+        || !tilefinch_update_journal_store(
+               update->data_dir, &next, NULL, NULL))
+        return false;
+    update->state = next;
+    update->trial_retry_requested = retry;
+    /* The marker names the STARTED record just replaced, so a cut before
+       this removal leaves it unmatched; this only tidies the card. */
+    tilefinch_update_decline_clear(update->data_dir);
+    psp_update_session_log(
+        "tilefinch-update-trial: %s generation=%llu\n",
+        retry ? "retry" : "discard",
+        (unsigned long long) next.generation);
+    return true;
+}
+
 static bool psp_update_session_begin_install(
     PspUpdateSession *update, const TilefinchInstallPaths *paths)
 {
@@ -490,9 +598,19 @@ static bool psp_update_session_begin_install(
         "tilefinch-update-install: verification=%s table-bytes=%zu\n",
         have_download_proof ? "download-proof" : "standalone-reread",
         have_download_proof ? download_proof.table_length : 0u);
-    TilefinchUpdateSlot inactive =
-        update->state.active_slot == TILEFINCH_UPDATE_SLOT_A
-        ? TILEFINCH_UPDATE_SLOT_B : TILEFINCH_UPDATE_SLOT_A;
+    TilefinchUpdateSlot inactive = psp_update_session_install_target(update);
+    /* The reload can also re-judge the download against a new floor. */
+    (void) tilefinch_update_client_snapshot(
+        update->client, &update->client_snapshot);
+    if (update->client_snapshot.phase != TILEFINCH_UPDATE_CLIENT_DOWNLOADED)
+        return false;
+    update->install_refused = inactive == TILEFINCH_UPDATE_SLOT_NONE;
+    if (update->install_refused) {
+        psp_update_session_log(
+            "tilefinch-update-install: refused running=%d active=%d\n",
+            (int) update->running_slot, (int) update->state.active_slot);
+        return false;
+    }
     TilefinchUpdateInstallOptions options = {
         .package_path = update->package_path,
         .envelope = envelope,
@@ -502,6 +620,7 @@ static bool psp_update_session_begin_install(
         .install_root = paths->install_root,
         .data_dir = paths->data_dir,
         .inactive_slot = inactive,
+        .running_slot = update->running_slot,
         .current_state = update->state,
         .trust = update->channel == BROWSER_UPDATE_CHANNEL_DEVELOPER
             ? TILEFINCH_UPDATE_TRUST_DEVELOPER_UNSIGNED
@@ -551,8 +670,10 @@ bool psp_update_session_initialized(const PspUpdateSession *session)
 PspUpdatePrimaryResult psp_update_session_primary(
     PspUpdateSession *session, const TilefinchInstallPaths *paths)
 {
-    if (session == NULL || !session->available)
-        return PSP_UPDATE_PRIMARY_NONE;
+    if (session == NULL) return PSP_UPDATE_PRIMARY_NONE;
+    if (session->trial_retry_requested)
+        return PSP_UPDATE_PRIMARY_RESTART_REQUIRED;
+    if (!session->available) return PSP_UPDATE_PRIMARY_NONE;
     if (session->installer != NULL) {
         (void) tilefinch_update_install_snapshot(
             session->installer, &session->install_snapshot);
@@ -589,6 +710,16 @@ PspUpdatePrimaryResult psp_update_session_primary(
                         (void)psp_boot_prepackaged_discard(directory);
                 }
             }
+            if (paths != NULL && paths->slotted) {
+                /* A failed install's slot-X.tmp/.old would otherwise count
+                   against the download's free-space check, and only the
+                   install step after that download removed them. */
+                TilefinchUpdateSlot target =
+                    psp_update_session_install_target(session);
+                if (target != TILEFINCH_UPDATE_SLOT_NONE)
+                    (void) tilefinch_update_install_clear_staging(
+                        paths->install_root, target);
+            }
             (void) tilefinch_update_client_begin_download(session->client);
             break;
         case TILEFINCH_UPDATE_CLIENT_DOWNLOADED:
@@ -606,9 +737,13 @@ bool psp_update_session_begin_check(
     PspUpdateSession *session, uint64_t wall_time_seconds,
     bool wall_time_valid)
 {
-    return session != NULL && session->client != NULL
-        && tilefinch_update_client_begin_check(
-            session->client, wall_time_seconds, wall_time_valid);
+    if (session == NULL || session->client == NULL) return false;
+    /* A check judged against the journal read at initialization would offer
+       the build that has since passed its trial as new. */
+    (void) psp_update_session_reload_state(session);
+    session->install_refused = false;
+    return tilefinch_update_client_begin_check(
+        session->client, wall_time_seconds, wall_time_valid);
 }
 
 bool psp_update_session_begin_history(

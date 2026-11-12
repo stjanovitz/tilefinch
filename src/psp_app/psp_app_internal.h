@@ -273,7 +273,8 @@ BrowserSessionPersistenceLimits psp_site_data_limits(
 bool psp_site_data_load(
     BrowserSession *session, const char *path,
     BrowserSessionPersistenceMask mask,
-    const BrowserSessionPersistenceLimits *limits);
+    const BrowserSessionPersistenceLimits *limits,
+    BrowserSessionPersistenceStatus *status_out);
 bool psp_site_data_save(
     const BrowserSession *session, const char *path,
     BrowserSessionPersistenceMask mask,
@@ -332,6 +333,16 @@ typedef struct {
        yielded a rollback-safe font transaction. */
     bool input_yield;
     PspUiMediaState supervisor_media_ui;
+    /* The copy's presentation once a press changed it (the track menu,
+       Auto next, the caption toggle's memory): the copy borrows the
+       owner's presentation and never writes it (AU-05), so a press that
+       would moves it here. Every press the copy takes is queued in
+       media_presses, and the owner applies them (its loop takes no edges
+       of its own meanwhile) at the next refresh or at the scope's end.
+       media_owner is the state they apply to. */
+    PspUiMediaPresentation supervisor_presentation;
+    PspUiMediaPressQueue media_presses;
+    PspUiMediaState *media_owner;
     BrowserEngine *engine;
     const uint16_t *frame;
     uint64_t last_present_us;
@@ -407,11 +418,18 @@ typedef struct {
     uint8_t pending_page_input_count;
     bool page_input_yield_boundary;
     uint8_t pending_page_input_dropped;
-    /* Latest media command accepted by the callback-thread supervisor while
-       the browser thread is inside one bounded decoder/range service. The
-       supervisor owns this tuple until cooperate_end fences presentation;
-       the browser thread then takes it as an ordinary input event. */
-    PspUiMediaIntent pending_media_intent;
+    /* The media actions the owner derived from media_presses, newest of
+       each kind (psp_ui_media_press_queue_settle): the timeline action is
+       handed over at each refresh, the other (a command) when
+       cooperate_end fences presentation, where it wins over a timeline
+       action still waiting; the browser thread then takes it as an
+       ordinary input event. Apart, a later timeline press cannot replace
+       a waiting command. */
+    PspUiMediaMailbox pending_media;
+    /* The load preview's reading hint as last projected into
+       supervisor_ui (psp_navigation_preview_hint_refresh), and when. */
+    bool supervisor_reading_hint;
+    uint64_t supervisor_reading_hint_us;
     TilefinchCancellation cancellation;
 } PspNavigationCooperate;
 
@@ -474,7 +492,7 @@ void psp_work_cooperate_begin(
     PspUiState *ui, const uint16_t *frame,
     bool periodic_present, bool acknowledge_non_cancel_busy,
     bool log_session, const char *cancel_status, const char *phase,
-    BrowserEngine *engine, const PspUiMediaState *media_ui);
+    BrowserEngine *engine, PspUiMediaState *media_ui);
 void psp_navigation_cooperate_begin(
     PspUiState *ui, const uint16_t *frame, BrowserEngine *engine);
 void psp_runtime_cooperate_begin(PspUiState *ui, const uint16_t *frame,
@@ -484,21 +502,44 @@ bool psp_runtime_cooperate_end(uint32_t *observed_buttons);
    provisional page's layout, page presses scroll that page instead of
    cancelling the completion (browser_engine_completion_scroll_page). */
 void psp_runtime_cooperate_serve_page_scroll(BrowserEngine *engine);
-/* Refreshes the supervisor's player snapshot during a media scope. A
-   timeline press (scrub, commit, cancel, play/pause) the supervisor holds is
-   moved to *timeline_intent for the browser thread; true when one was. */
-bool psp_work_cooperate_refresh_media(const PspUiMediaState *media_ui,
+void psp_runtime_cooperate_preview_page_presses(BrowserEngine *engine);
+/* Refreshes the supervisor's player snapshot during a media scope, after
+   applying to media_ui the presses its copy took privately. A timeline
+   press (scrub, commit, cancel, play/pause) the supervisor holds is moved
+   to *timeline_intent for the browser thread; true when one was. */
+bool psp_work_cooperate_refresh_media(PspUiMediaState *media_ui,
                                       PspUiMediaIntent *timeline_intent);
 /* The page toast a media open raises; the scope's end retires it. */
 #define PSP_MEDIA_OPEN_STATUS "OPENING VIDEO  O CANCEL"
 void psp_work_cooperate_begin_media_open(
     PspUiState *ui, const uint16_t *engine_frame,
-    const PspUiMediaState *media_ui);
+    PspUiMediaState *media_ui);
 void psp_navigation_cooperate_end(const char *scope);
 bool psp_navigation_cooperate_take_media_intent(
     PspUiMediaIntent *intent);
 bool psp_navigation_cooperate_take_page_input(uint32_t *pressed,
                                               uint64_t *pressed_us);
+/* Browser thread: append a press to the completed page-input FIFO the loop
+   replays (as though the supervisor had held it); false when full. */
+bool psp_navigation_cooperate_queue_page_input(uint32_t pressed);
+/* The supervisor's presentation fence (cooperate->presenting). Held, the
+   callback-thread supervisor neither presents nor samples the pad. Returns
+   whether it was taken: false when no scope is active and this thread does
+   not already hold it. A thread that holds it may acquire it again (a
+   modal inside a modal); each true acquire is released once. */
+bool psp_presentation_fence_acquire(void);
+void psp_presentation_fence_release(bool held);
+/* Whether the calling thread holds the fence (acquires nest on it). */
+bool psp_presentation_fence_held_here(void);
+/* PspOfflineStore.release_view: the supervisor's UI copy forgets a preview
+   about to be freed. A scope begun over its sheet (the navigation pump
+   starting again while it is up) would otherwise draw freed memory once the
+   sheet is answered. */
+void psp_work_cooperate_release_view(const void *view);
+/* What a supervisor present repaints under its chrome. */
+const uint16_t *psp_supervisor_page_frame(
+    const PspNavigationCooperate *cooperate);
+
 bool psp_navigation_cooperate_page_input_pending(void);
 /* Browser loop, each frame of a supervised load: publish liveness and the
    page-screen state, and take the presses forwarded to it. */
@@ -517,6 +558,11 @@ uint32_t psp_navigation_observed_buttons(void);
 /* page: delta is a direction and moves one page; otherwise CSS pixels. */
 bool psp_request_provisional_scroll(
     BrowserEngine *engine, PspUiState *ui, int delta, bool page);
+/* Browser thread, while `engine` loads: show or retire the load preview's
+   reading hint in `ui` (the loop's own) and, under the presentation fence,
+   in the supervisor's copy, from the engine's provisional viewport. */
+void psp_navigation_preview_hint_refresh(BrowserEngine *engine,
+                                         PspUiState *ui);
 void psp_background_ui_tick(void);
 const char *psp_user_visible_error(
     const char *detail, long tls_verify_result,
@@ -673,6 +719,10 @@ typedef enum {
 
 void psp_text_input_present(
     void *user, const uint16_t *frame, const PspUiState *ui);
+/* PspTextInputService modal hooks; USER is the PspInteractiveState whose
+   navigation watchdog pauses while the keyboard is open. */
+bool psp_text_input_modal_begin(void *user);
+void psp_text_input_modal_end(void *user, bool begun);
 void psp_find_view_update(PspUiFindView *view,
                           const BrowserFindSnapshot *snapshot);
 void psp_find_sync(BrowserEngine *engine, PspUiState *ui,
@@ -1037,6 +1087,10 @@ typedef struct {
     /* Navigation may discard an uncommitted cache restore. Until a later boot
        reads that snapshot, exit must not rotate it behind an empty live cache. */
     bool cache_restore_cancelled_unread;
+    /* The localStorage snapshot could not be read (I/O error, memory or
+       limit refusal, or the load could not start). The live store is then
+       not what the card holds, so exit must not rotate it over the file. */
+    bool storage_restore_unread;
 } PspSiteDataRestore;
 
 typedef struct PspCaptivePortal PspCaptivePortal;
@@ -1162,13 +1216,27 @@ typedef struct {
     PspScreenshotJob screenshot;
 } PspInteractiveState;
 
+/* window.alert/confirm/prompt (psp_app_page_dialog.c). Bind the owners the
+   modal draws on and reads; they live for the process. */
+void psp_page_dialog_bind(PspUiState *ui, PspEngineViews *views,
+                          PspTextInputService *text_input,
+                          PspInteractiveState *interactive,
+                          Budget *budget, const char *argv0);
+/* The platform page_dialog service (tilefinch/platform.h). */
+bool psp_page_dialog_show(void *context,
+                          const TilefinchPageDialogRequest *request,
+                          TilefinchPageDialogResponse *response);
+/* Microseconds page dialogs have been open in all; a load loop pauses its
+   watchdog by the growth (psp_navigation_watchdog_pause). */
+uint64_t psp_page_dialog_open_us(void);
+
 /* src/psp_app/psp_app_input.c. Callback-thread media input crosses one
    generation-bearing supervisor fence, then returns to the ordinary browser-
    thread receiver through these helpers. */
 /* During a media-open scope: refresh the supervisor's player snapshot and
    take any timeline press it holds as this loop's deferred intent. */
 void psp_app_refresh_supervisor_media(
-    PspInteractiveState *interactive, const PspUiMediaState *media_ui);
+    PspInteractiveState *interactive, PspUiMediaState *media_ui);
 void psp_app_capture_supervisor_media_intent(
     PspInteractiveState *interactive);
 bool psp_app_dispatch_deferred_media_intent(
@@ -1540,5 +1608,15 @@ const char *psp_glyph_component_request_pack(PspApp *app, TilefinchGlyphPack pac
 
 bool psp_glyph_component_handle_frame(
     PspApp *app, const PspUiIntent *intent, uint64_t now_us);
+/* A page dialog's text can use a script the page's own text does not, and
+   the main loop, which reads pack glyphs, is blocked while it is open. Each
+   call attaches at most one pack for the dialog's text and reads one unit of
+   pending glyph data; true means the dialog should be drawn again. The
+   engine is told on the next main-loop frame, not from inside page script. */
+bool psp_glyph_component_dialog_glyphs(
+    PspApp *app, const char *message, const char *value);
+/* The app the page dialog uses for glyphs while the interactive loop runs;
+   NULL outside it. */
+void psp_page_dialog_set_app(PspApp *app);
 
 #endif /* TILEFINCH_PSP_APP_INTERNAL_H */

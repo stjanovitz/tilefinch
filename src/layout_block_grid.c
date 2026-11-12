@@ -742,7 +742,11 @@ bool layout_block_grid_section(LayoutContext *context,
             if (flow_columns > columns) columns = flow_columns;
         }
         if (columns > GRID_TRACK_LIMIT) columns = GRID_TRACK_LIMIT;
-        if (adaptive_columns && (size_t) columns > grid_children) {
+        /* Repetitions past the in-flow items are dropped. With none, the
+           repetitions stay: positioned items still name their lines, and
+           the column count stays positive for the justify-content shares. */
+        if (adaptive_columns && grid_children != 0
+            && (size_t) columns > grid_children) {
             columns = (int) grid_children;
         }
         int available =
@@ -871,6 +875,9 @@ bool layout_block_grid_section(LayoutContext *context,
             return false;
         }
         GridPlacementState measured_placement = placement_template;
+        /* Every placement pass replays the same sequence, so the rows this
+           one reaches are the rows layout below must size. */
+        int measured_rows = placement_rows;
         FlexItemIterator *measurement =
             &scratch->traversal.flex.iterator;
         FlatItem *measured_item = &scratch->traversal.flex.item;
@@ -884,6 +891,10 @@ bool layout_block_grid_section(LayoutContext *context,
             (void) grid_place_item(
                 &measured_placement, &measured_item->style,
                 &item_placement);
+            if (item_placement.row + item_placement.row_span
+                > measured_rows) {
+                measured_rows = item_placement.row + item_placement.row_span;
+            }
             int item_start = item_placement.column;
             int item_span = item_placement.column_span;
             if (!measured_item->anonymous_text
@@ -1222,7 +1233,31 @@ bool layout_block_grid_section(LayoutContext *context,
         layout_record_grid_columns(context->layout, node, track_widths,
                                    (unsigned) columns,
                                    (unsigned) grid_column_origin);
-        int row_track_heights[GRID_PLACEMENT_ROW_LIMIT] = {0};
+        /* Grids of up to 64 rows size them on the stack. A longer one (a
+           feed or card list) gets one Budget-charged table for its row
+           sizes and positions; if that is refused, placement keeps to the
+           64-row window and later items share its last cell as before. */
+        int row_track_stack[GRID_PLACEMENT_ROW_LIMIT] = {0};
+        int row_start_stack[GRID_PLACEMENT_ROW_LIMIT];
+        int row_extent_stack[GRID_PLACEMENT_ROW_LIMIT];
+        int *row_track_heights = row_track_stack;
+        int *row_starts = row_start_stack;
+        int *row_extents = row_extent_stack;
+        int row_capacity = GRID_PLACEMENT_ROW_LIMIT;
+        int *row_tables = NULL;
+        if (measured_rows > GRID_PLACEMENT_ROW_LIMIT) {
+            row_tables = budget_calloc(context->layout->budget,
+                                       (size_t) measured_rows * 3u,
+                                       sizeof(*row_tables));
+            if (row_tables != NULL) {
+                row_capacity = measured_rows;
+                row_track_heights = row_tables;
+                row_starts = row_tables + measured_rows;
+                row_extents = row_starts + measured_rows;
+            } else {
+                placement_template.row_limit = GRID_PLACEMENT_ROW_LIMIT;
+            }
+        }
         unsigned explicit_rows = (unsigned) explicit_grid_rows;
         int uniform_row_height = 0;
         if (!inherited_grid_rows && explicit_rows != 0) {
@@ -1460,9 +1495,7 @@ bool layout_block_grid_section(LayoutContext *context,
                 grid_row_gap += share;
             }
         }
-        int row_starts[GRID_PLACEMENT_ROW_LIMIT];
-        int row_extents[GRID_PLACEMENT_ROW_LIMIT];
-        for (int row = 0; row < GRID_PLACEMENT_ROW_LIMIT; row++) {
+        for (int row = 0; row < row_capacity; row++) {
             row_starts[row] = -1;
             row_extents[row] = -1;
         }
@@ -1513,14 +1546,18 @@ bool layout_block_grid_section(LayoutContext *context,
                    header is the sole, absolutely positioned child of a
                    rows-only grid; it was laid out in a 0px placeholder
                    column and collapsed to its own padding. */
+                /* Only the tracks layout built exist: track_columns is
+                   the implicit count before the GRID_TRACK_LIMIT clamp. */
+                int area_columns = track_columns < columns
+                    ? track_columns : columns;
                 if (column_start > 0
                     && column_start != COMPUTED_GRID_LINE_LAST
-                    && column_start <= track_columns) {
+                    && column_start <= area_columns) {
                     int first = column_start - 1;
                     int last = column_end > column_start
                                && column_end != COMPUTED_GRID_LINE_LAST
                         ? column_end - 1 : first + 1;
-                    if (last > track_columns) last = track_columns;
+                    if (last > area_columns) last = area_columns;
                     area_x = track_starts[first];
                     area_width = 0;
                     for (int column = first; column < last; column++) {
@@ -1561,6 +1598,7 @@ bool layout_block_grid_section(LayoutContext *context,
                         &positioned_item->parent_style,
                         area_x, area_y, area_width, area_height, false,
                         &grid_area, &positioned_bottom)) {
+                    budget_free(context->layout->budget, row_tables);
                     flex_order_plan_destroy(grid_order);
                     return false;
                 }
@@ -1613,6 +1651,11 @@ bool layout_block_grid_section(LayoutContext *context,
                 item_placement.row = 0;
                 repeated_columns++;
             }
+            if (item_placement.row + item_placement.row_span
+                > row_capacity) {
+                item_placement.row = (uint16_t) (
+                    row_capacity - item_placement.row_span);
+            }
             int grid_row = item_placement.row;
             /* Auto-placement adds rows past placement_rows as items
                arrive. Each takes its grid-auto-rows size, cycling through
@@ -1623,7 +1666,7 @@ bool layout_block_grid_section(LayoutContext *context,
                 for (int row = initialized_rows > placement_rows
                                    ? initialized_rows : placement_rows;
                      row < grid_row + item_placement.row_span
-                     && row < GRID_PLACEMENT_ROW_LIMIT; row++) {
+                     && row < row_capacity; row++) {
                     row_track_heights[row] = grid_implicit_fixed_row_height(
                         style, second_implicit_row,
                         row - grid_row_origin - explicit_grid_rows);
@@ -1677,6 +1720,7 @@ bool layout_block_grid_section(LayoutContext *context,
                                            row_top, assigned_cell_width,
                                            &child_bottom)) {
                     grid_laid_items_release(context, &laid);
+                    budget_free(context->layout->budget, row_tables);
                     flex_order_plan_destroy(grid_order);
                     return false;
                 }
@@ -1732,7 +1776,7 @@ bool layout_block_grid_section(LayoutContext *context,
                      offset < item_placement.row_span; offset++) {
                     int row = grid_row + offset;
                     bool collapsed_flex_track = false;
-                    if (row < GRID_PLACEMENT_ROW_LIMIT
+                    if (row < row_capacity
                         && row_track_heights[row] == 0) {
                         int explicit_row = row - grid_row_origin;
                         uint8_t row_type = GRID_TRACK_AUTO;
@@ -1760,7 +1804,7 @@ bool layout_block_grid_section(LayoutContext *context,
                         collapsed_flex_track = row_type == GRID_TRACK_FLEX
                                                && row_value == 0;
                     }
-                    if (row >= GRID_PLACEMENT_ROW_LIMIT
+                    if (row >= row_capacity
                         || (row_track_heights[row] <= 0
                             && !collapsed_flex_track)) {
                         definite_cell_height = false;
@@ -1794,6 +1838,7 @@ bool layout_block_grid_section(LayoutContext *context,
                                 assigned_cell_width,
                                 local_minimums, local_maximums)) {
                             grid_laid_items_release(context, &laid);
+                            budget_free(context->layout->budget, row_tables);
                             flex_order_plan_destroy(grid_order);
                             return false;
                         }
@@ -1978,6 +2023,7 @@ bool layout_block_grid_section(LayoutContext *context,
                 context->assigned_grid_tracks = saved_assigned_tracks;
                 if (!child_ok) {
                     grid_laid_items_release(context, &laid);
+                    budget_free(context->layout->budget, row_tables);
                     flex_order_plan_destroy(grid_order);
                     return false;
                 }
@@ -2238,6 +2284,7 @@ bool layout_block_grid_section(LayoutContext *context,
             }
         }
         line->y = grid_bottom;
+        budget_free(context->layout->budget, row_tables);
         flex_order_plan_destroy(grid_order);
         line_cursor_set(line, line->start_x);
         line->line_height = 0;

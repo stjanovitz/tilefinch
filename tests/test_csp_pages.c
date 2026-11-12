@@ -723,6 +723,106 @@ static const PageCase integrity_mismatch_case = {
     .expected = "10000",
 };
 
+/* Subresource Integrity for script-inserted scripts (NW-02), with
+   'strict-dynamic' admitting every one by URL so SRI alone decides: a
+   matching body runs; a mismatched classic or module body, a cross-origin
+   no-CORS request with integrity, and a fresh cache hit with the wrong
+   integrity do not run and fire error; crossorigin makes a classic script
+   a CORS request whose verified body runs. */
+#define GOOD_DIGEST "sha256-+l0kaPhyoxZAQ5pIvvZMYhSGIck8E9whs9rxBf/V/VQ="
+#define X_DIGEST "sha256-fHJJEyzIBDpxfkWuSQAuwJ8zrKb+eLNNhzo0Flk4SfA="
+#define X2_DIGEST "sha256-4Djvmj3/KCgkHe1xiDP9BBBgf7xted6PwbI863wRNBk="
+static const PageRecord dynamic_sri_resources[] = {
+    SCRIPT("https://csp.test/good.js", "globalThis.g1='yes';"),
+    SCRIPT("https://csp.test/bad.js", "globalThis.b1='yes';"),
+    SCRIPT("https://csp.test/badm.js", "globalThis.b2='yes';"),
+    SCRIPT("https://cdn.test/x.js", "globalThis.x1='yes';"),
+    {.url = "https://cdn.test/x2.js", .content_type = "text/javascript",
+     .body = "globalThis.x2='yes';",
+     .header = "access-control-allow-origin: *"},
+    {.url = "https://csp.test/cached.js", .content_type = "text/javascript",
+     .body = "globalThis.c1=(globalThis.c1||0)+1;",
+     .header = "cache-control: max-age=600"},
+};
+
+/* Four refusals, and the cross-origin no-CORS one never reaches the
+   network. */
+static bool dynamic_sri_counted(NavigationSession *navigation)
+{
+    FetchTraceReplayStats stats = {0};
+    bool counted = navigation->page.script_result
+            .dynamic_scripts_integrity_rejected == 4u
+        && fetch_trace_replay_stats(&stats) && stats.request_count == 6u;
+    if (!counted)
+        fprintf(stderr, "dynamic SRI refusals=%zu requests=%zu\n",
+                navigation->page.script_result
+                    .dynamic_scripts_integrity_rejected,
+                stats.request_count);
+    return counted;
+}
+
+static const PageCase dynamic_sri_case = {
+    .name = "SRI on script-inserted scripts",
+    .policy = "script-src 'nonce-N1' 'strict-dynamic'",
+    .html =
+        "<!doctype html><head></head><body><script nonce='N1'>"
+        "globalThis.errs=[];"
+        "function add(src,integrity,type,cors){"
+        "var s=document.createElement('script');s.src=src;"
+        "if(integrity)s.setAttribute('integrity',integrity);"
+        "if(type)s.setAttribute('type',type);"
+        "if(cors)s.setAttribute('crossorigin','anonymous');"
+        "s.onerror=function(){globalThis.errs.push(src)};"
+        "document.head.append(s);return s;}"
+        "add('https://csp.test/good.js','" GOOD_DIGEST "');"
+        "add('https://csp.test/bad.js','" GOOD_DIGEST "');"
+        "add('https://csp.test/badm.js','" GOOD_DIGEST "','module');"
+        "add('https://cdn.test/x.js','" X_DIGEST "');"
+        "add('https://cdn.test/x2.js','" X2_DIGEST "',null,true);"
+        "add('https://csp.test/cached.js').onload=function(){"
+        "add('https://csp.test/cached.js','" GOOD_DIGEST "');};"
+        "</script></body>",
+    .resources = dynamic_sri_resources,
+    .resource_count = sizeof(dynamic_sri_resources)
+        / sizeof(dynamic_sri_resources[0]),
+    .probe = "globalThis.pocSummary=[globalThis.g1,globalThis.b1,"
+        "globalThis.b2,globalThis.x1,globalThis.x2]"
+        ".map(v=>v?'1':'0').join('')+':'+(globalThis.c1||0)+':'"
+        "+globalThis.errs.length",
+    .expected = "10001:1:4",
+    .check = dynamic_sri_counted,
+};
+
+/* The CSP integrity grant admits a script-inserted script only on bytes
+   SRI then verifies: a same-origin URL no host source lists runs when its
+   body has the listed digest, and another URL claiming the same digest
+   with different bytes does not. */
+#define Y_DIGEST "sha256-TBC04toWrDLa8W6lvG8EGref/nnBt8kz+pAhCOSQNuc="
+static const PageRecord dynamic_grant_resources[] = {
+    SCRIPT("https://csp.test/y.js", "globalThis.y1='yes';"),
+    SCRIPT("https://csp.test/w.js", "globalThis.w1='yes';"),
+    SCRIPT("https://anywhere.test/z.js", "globalThis.z1='yes';"),
+};
+
+static const PageCase dynamic_grant_case = {
+    .name = "CSP integrity grant on script-inserted scripts",
+    .policy = "script-src 'nonce-N1' '" Y_DIGEST "'",
+    .html =
+        "<!doctype html><head></head><body><script nonce='N1'>"
+        "globalThis.errs=0;"
+        "for(const src of['https://csp.test/y.js','https://csp.test/w.js',"
+        "'https://anywhere.test/z.js']){"
+        "var s=document.createElement('script');s.src=src;"
+        "s.setAttribute('integrity','" Y_DIGEST "');"
+        "s.onerror=function(){globalThis.errs++};document.head.append(s);}"
+        "</script></body>",
+    .resources = dynamic_grant_resources,
+    .resource_count = 3,
+    .probe = "globalThis.pocSummary=[globalThis.y1,globalThis.w1,"
+        "globalThis.z1].map(v=>v?'1':'0').join('')+':'+globalThis.errs",
+    .expected = "100:2",
+};
+
 /* Range.createContextualFragment scripts are script-inserted: under
    'strict-dynamic' one a trusted script inserts loads without a nonce, an
    inline one still needs its nonce, and an untrusted script never gets to
@@ -810,7 +910,8 @@ int main(void)
         &style_case, &preload_case, &modulepreload_case, &long_data_case, &inline_sha2_case,
         &dangling_case, &clone_case, &exhaust_case, &module_nonce_case,
         &module_integrity_case, &gadget_case, &integrity_mismatch_case,
-        &fragment_case, &oversized_style_case,
+        &fragment_case, &oversized_style_case, &dynamic_sri_case,
+        &dynamic_grant_case,
     };
     size_t failures = 0;
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {

@@ -17,6 +17,12 @@ typedef void (*PspTextInputPresent)(
     void *user, const uint16_t *frame, const PspUiState *ui);
 typedef size_t (*PspTextInputVoicePrepare)(void *user);
 typedef bool (*PspTextInputCancelRequested)(void *user);
+/* Bracket one text entry, which runs its own pad and present loop: begin
+   before the first sample, end after the screen is handed back, with what
+   begin returned. The app fences the loading-UI supervisor out between
+   them, so the keyboard alone owns the screen and pad. */
+typedef bool (*PspTextInputModalBegin)(void *user);
+typedef void (*PspTextInputModalEnd)(void *user, bool begun);
 
 typedef struct {
     const char *description;
@@ -36,6 +42,9 @@ typedef struct {
     void *voice_prepare_user;
     PspTextInputCancelRequested cancel_requested;
     void *cancel_user;
+    PspTextInputModalBegin modal_begin;
+    PspTextInputModalEnd modal_end;
+    void *modal_user;
     const BrowserProfile *profile;
     bool danzeff_enabled;
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
@@ -64,6 +73,9 @@ void psp_text_input_set_adaptive_voice_memory(
 void psp_text_input_set_cancel_requested(
     PspTextInputService *service,
     PspTextInputCancelRequested cancel_requested, void *cancel_user);
+void psp_text_input_set_modal(
+    PspTextInputService *service, PspTextInputModalBegin begin,
+    PspTextInputModalEnd end, void *user);
 void psp_text_input_set_profile(
     PspTextInputService *service, const BrowserProfile *profile);
 void psp_text_input_set_danzeff_enabled(

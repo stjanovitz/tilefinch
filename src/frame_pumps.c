@@ -7,6 +7,13 @@ bool frame_paint_progress_due(uint64_t now, uint64_t last,
         && (last == 0 || now < last || now - last >= UINT64_C(32000)));
 }
 
+bool frame_navigation_slice_continue(size_t units_before, size_t units_after,
+                                     uint64_t started, uint64_t now)
+{
+    return units_after != units_before && now >= started
+        && now - started < FRAME_NAVIGATION_SLICE_US;
+}
+
 #define PUMP(id) FRAME_PUMP_BIT(FRAME_PUMP_##id)
 
 /* Optional page work never competes with the surfaces the user is looking

@@ -142,6 +142,10 @@ bool screenshot_png_begin(
         screenshot_fail(writer, "could not create screenshot file");
         return false;
     }
+    /* Before any write, as setvbuf requires. A refusal keeps the default
+       buffer: slower, still correct. */
+    (void) setvbuf(writer->file, writer->io_buffer, _IOFBF,
+                   sizeof(writer->io_buffer));
     static const unsigned char signature[8] = {
         137, 80, 78, 71, 13, 10, 26, 10
     };

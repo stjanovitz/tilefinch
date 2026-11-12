@@ -95,7 +95,8 @@ static void site_storage_label(const char *origin, char *out,
 {
     const char *shown = strncmp(origin, "https://", 8) == 0
         ? origin + 8 : origin;
-    snprintf(out, capacity, "%s", shown);
+    /* A long origin keeps its end, where its registrable domain is. */
+    psp_ui_host_label(shown, out, capacity);
 }
 
 static void site_storage_fill(PspApp *app)

@@ -33,4 +33,21 @@ static inline size_t tilefinch_utf8_encode(unsigned codepoint,
     return 4;
 }
 
+/* The longest prefix of text[0..length) that does not end inside a character,
+   for cutting bounded text: a cut character would draw as a missing glyph. */
+static inline size_t tilefinch_utf8_complete_prefix(const char *text,
+                                                    size_t length)
+{
+    if (length == 0) return 0;
+    size_t start = length - 1u;
+    while (start > 0
+           && ((unsigned char) text[start] & 0xc0u) == 0x80u) start--;
+    unsigned char lead = (unsigned char) text[start];
+    size_t expected = lead < 0x80u ? 1u
+        : ((lead & 0xe0u) == 0xc0u ? 2u
+        : ((lead & 0xf0u) == 0xe0u ? 3u
+        : ((lead & 0xf8u) == 0xf0u ? 4u : 1u)));
+    return length - start < expected ? start : length;
+}
+
 #endif

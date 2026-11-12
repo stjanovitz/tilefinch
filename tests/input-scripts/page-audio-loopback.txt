@@ -1,0 +1,17 @@
+# Page audio from a loopback station (a page with one <audio>, started with
+# --url http://127.0.0.1:PORT/...): focus it, play it, listen for about
+# twenty seconds, then close the player. A measurement scenario: the log
+# carries the MP3 open, the decode counters and any failure.
+wait-live 1200
+wait-page 300
+mark-page loaded
+focus-page-media
+tap cross
+until-live 1350
+mark-live playing
+wait-live 1200
+mark-live listened
+tap-live circle
+wait-live 150
+mark closed
+end

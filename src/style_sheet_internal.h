@@ -103,6 +103,14 @@ enum {
 #define STYLE_VARIABLE_RESOLVING_LIMIT 4u
 #define STYLE_VARIABLE_SUBSTITUTION_LIMIT 256u
 
+/* An element's retained-property gate mask: the OR of the gate slots of
+   its tag, id, classes and attribute names (Stylesheet.retained_gate). */
+typedef struct {
+    const lxb_dom_node_t *node;
+    uint64_t mask;
+    uint32_t generation;
+} StyleRetainedGate;
+
 struct StyleResolveScratch {
     /* Class-token scopes in progress: class-token sets (on the Stylesheet)
        are valid only while this is non-zero. */
@@ -116,6 +124,9 @@ struct StyleResolveScratch {
        consulted by var()/em/rem reparsing. */
     lxb_dom_node_t *resolution_node;
     PseudoElement resolution_pseudo;
+    /* The element whose retained-property gate mask is current (see
+       style_retained_gate_begin), or NULL, and the gate build it is for. */
+    StyleRetainedGate retained_gate;
     /* Custom-property declarations whose var() references are being
        resolved (innermost last). A nested lookup of one of them is a
        reference cycle; see variable_resolve_at_declaration. */
@@ -175,6 +186,11 @@ struct StyleResolveScratch {
     const lxb_dom_node_t *adopted_scope_node;
     uint32_t adopted_scope_tokens_scope;
     uint64_t adopted_scope_mask;
+    /* Likewise whether the parent last asked about hosts a shadow tree:
+       siblings ask in turn, and the answer scans the parent's children. */
+    const lxb_dom_node_t *shadow_parent_node;
+    uint32_t shadow_parent_tokens_scope;
+    bool shadow_parent_is_host;
 };
 
 #define STYLE_DEFERRED_FONT_RELATIVE UINT16_C(1)
@@ -189,11 +205,25 @@ struct StyleResolveScratch {
    an absolute font basis (declaration_absolute_font_basis) cannot find one.
    Set only where proven; absent means scan. */
 #define STYLE_DEFERRED_NO_FONT_SIZE UINT16_C(64)
+/* `all:unset` and `all:initial`, like `all:inherit`: the baseline becomes
+   every property's initial value, inherited ones (unset) taken from the
+   parent. */
+#define STYLE_DECLARATION_ALL_UNSET UINT16_C(128)
+#define STYLE_DECLARATION_ALL_INITIAL UINT16_C(256)
+#define STYLE_DECLARATION_ALL_MASK \
+    (STYLE_DECLARATION_ALL_INHERIT | STYLE_DECLARATION_ALL_UNSET \
+     | STYLE_DECLARATION_ALL_INITIAL)
 _Static_assert((STYLE_DEFERRED_NO_FONT_SIZE
                 & (STYLE_DEFERRED_FONT_RELATIVE
                    | STYLE_DEFERRED_NON_FONT_RELATIVE
                    | STYLE_DEFERRED_LOGICAL | STYLE_DEFERRED_DYNAMIC
-                   | STYLE_DEFERRED_CH | STYLE_DECLARATION_ALL_INHERIT))
+                   | STYLE_DEFERRED_CH | STYLE_DECLARATION_ALL_MASK))
+                   == 0
+               && ((STYLE_DECLARATION_ALL_UNSET | STYLE_DECLARATION_ALL_INITIAL)
+                   & (STYLE_DEFERRED_FONT_RELATIVE
+                      | STYLE_DEFERRED_NON_FONT_RELATIVE
+                      | STYLE_DEFERRED_LOGICAL | STYLE_DEFERRED_DYNAMIC
+                      | STYLE_DEFERRED_CH | STYLE_DECLARATION_ALL_INHERIT))
                    == 0, "deferred declaration flags must not overlap");
 
 /* A declaration's values encode as (first word, word count) byte pairs,
@@ -317,5 +347,15 @@ void style_compat_post_cascade(const Stylesheet *sheet,
                                lxb_dom_node_t *node,
                                const ComputedStyle *parent,
                                ComputedStyle *style);
+
+/* style_sheet.c: bracket a run of style_retained_property_value lookups
+   on one element in which the DOM does not change. Lookups for that
+   element skip the properties its keys rule out; others are unaffected.
+   End restores the state begin returned, so brackets nest. */
+#define STYLE_RETAINED_GATE_SLOTS 1024u
+StyleRetainedGate style_retained_gate_begin(const Stylesheet *sheet,
+                                            lxb_dom_node_t *node);
+void style_retained_gate_end(const Stylesheet *sheet,
+                             StyleRetainedGate previous);
 
 #endif /* TILEFINCH_STYLE_SHEET_INTERNAL_H */

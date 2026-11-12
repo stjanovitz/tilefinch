@@ -7,6 +7,7 @@
 #include <strings.h>
 #include <unistd.h>
 #include "tilefinch/glyph_component.h"
+#include "tilefinch/glyph_component_store.h"
 #include "tilefinch/browser_engine.h"
 #include "tilefinch/youtube_lite.h"
 
@@ -34,7 +35,13 @@ static char *keys[TILEFINCH_UI_TRANSLATION_ROWS], *values[TILEFINCH_UI_TRANSLATI
 static size_t key_count, checked_frames, checked_labels;
 static const char *language_code;
 static const char *capture_directory;
-static const char *real_hindi_pack, *real_arabic_pack, *real_bengali_pack;
+/* Real packs from the command line, "<component id>=<path>", ahead of the
+   synthetic fallbacks in a provider that holds four. */
+typedef struct {
+    const char *id, *path;
+} RealPack;
+static RealPack real_packs[TILEFINCH_GLYPH_COMPONENT_PACK_LIMIT - 1u];
+static size_t real_pack_count;
 #include "ui_navigation_keys.inc"
 static size_t checked_navigation_labels;
 
@@ -345,7 +352,7 @@ static bool paint_failed_media(PspUiState *ui, TilefinchGlyphProvider *provider)
             if (read) continue;
             CHECK(validate_frame(ui));
             UiRect back = media_failed_back_rect(
-                media_failed_panel_rect(WIDTH, HEIGHT), media.retry_unavailable);
+                media_failed_panel_rect(&media, WIDTH, HEIGHT), media.retry_unavailable);
             bool found = false, headline = false;
             for (size_t at = 0; at < run_count; at++) {
                 if (!strcmp(runs[at].text, tilefinch_ui_text("PLAYLIST COULD NOT LOAD")))
@@ -656,6 +663,173 @@ static bool test_download_language(PspUiState *ui, TilefinchGlyphProvider *provi
     return true;
 }
 
+/* A page's alert/confirm/prompt: every hint whole in every language and
+   theme, the page's own text wrapped inside the box, and a long host cut
+   from the left. */
+static bool test_page_dialog_language(PspUiState *ui, TilefinchGlyphProvider *provider)
+{
+    static const char *const messages[] = {
+        "Are you sure you want to leave this page? Changes you made may not be saved.",
+        "Line one\nLine two\n\nAfter a blank line, a much longer paragraph that has to wrap "
+        "across several rows of the dialog before it runs out of room and ends with an "
+        "ellipsis because there is more text than the dialog can show at once.\nmore\nmore",
+        "Unbreakable:" "ABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    };
+    static const char *const hosts[] = {
+        "shop.example.test",
+        "accounts.a-very-long-subdomain-name.payments-example-service.test:8443",
+        ""
+    };
+    for (unsigned kind = PAGE_DIALOG_ALERT; kind <= PAGE_DIALOG_PROMPT; kind++) {
+        for (unsigned offer = 0; offer < 2; offer++) {
+            PspUiPageDialogView view = {
+                .kind = (PageDialogKind) kind, .offer_suppress = offer != 0,
+                .host = hosts[(kind + offer) % 3], .message = messages[(kind + offer) % 3],
+                .value = kind == PAGE_DIALOG_PROMPT ? "Ada Lovelace" : NULL
+            };
+            psp_ui_show_page_dialog(ui, &view);
+            CHECK(ui->screen == PSP_UI_SCREEN_PAGE_DIALOG && ui->overlay_animation_frames == 0);
+            CHECK(paint(ui, provider));
+            CHECK(player_has_text("Page message"));
+            CHECK(player_has_text(kind == PAGE_DIALOG_ALERT ? "X OK"
+                : kind == PAGE_DIALOG_PROMPT ? "X Edit   START OK   O Cancel" : "X OK   O Cancel"));
+            CHECK(player_has_text("Triangle Leave page"));
+            if (offer) CHECK(player_has_text("Square Don't let this page show dialogs"));
+            /* Page text stays inside the dialog box and never under a hint. */
+            int hint_top = HEIGHT;
+            for (size_t r = 0; r < run_count; r++)
+                if (!strcmp(runs[r].text, tilefinch_ui_text("Triangle Leave page")))
+                    hint_top = runs[r].top;
+            CHECK(hint_top < HEIGHT);
+            for (size_t r = 0; r < run_count; r++) {
+                if (catalog_text(runs[r].text)) continue;
+                CHECK(runs[r].left >= 32 && runs[r].right <= WIDTH - 32
+                      && runs[r].top >= UI_TOP_HEIGHT && runs[r].bottom <= hint_top);
+            }
+            if (view.host[0] != '\0') {
+                bool host_shown = false;
+                for (size_t r = 0; r < run_count; r++) {
+                    size_t length = strlen(runs[r].text);
+                    /* The registrable end of the host is always shown. */
+                    if (length >= 5 && strcmp(runs[r].text + length - 5, ".test") == 0)
+                        host_shown = true;
+                    if (strstr(view.host, ":8443") && strstr(runs[r].text, ":8443"))
+                        host_shown = true;
+                }
+                CHECK(host_shown);
+            }
+            static const char *const names[] = {
+                "page-dialog-alert", "page-dialog-confirm", "page-dialog-prompt"
+            };
+            if (offer) CHECK(snapshot(names[kind]));
+        }
+    }
+    {
+        /* Page text in a right-to-left script reads in visual order and
+           starts at the box's right side; plain text keeps its own bytes. */
+        static Budget dialog_budget;
+        budget_init(&dialog_budget, 256u * 1024u);
+        static char shown[PSP_UI_PAGE_DIALOG_SHOWN_MESSAGE_BYTES];
+        static char value[PSP_UI_PAGE_DIALOG_SHOWN_VALUE_BYTES];
+        PspUiPageDialogView view = {
+            .kind = PAGE_DIALOG_PROMPT, .host = "shop.example.test",
+            .message = "\xd7\x90\xd7\x91 \xd7\x92\xd7\x93\nabc",
+            .value = "\xd7\x90\xd7\x91"
+        };
+        psp_ui_page_dialog_prepare(&dialog_budget, &view, shown, value);
+        CHECK(view.right_to_left && view.message == shown);
+        CHECK(strcmp(shown, "\xd7\x93\xd7\x92 \xd7\x91\xd7\x90\nabc") == 0);
+        CHECK(view.value == value && strcmp(value, "\xd7\x91\xd7\x90") == 0);
+        psp_ui_show_page_dialog(ui, &view);
+        CHECK(paint(ui, provider));
+        bool aligned = false;
+        for (size_t r = 0; r < run_count; r++)
+            if (strcmp(runs[r].text, "abc") == 0)
+                aligned = runs[r].left > WIDTH / 2;
+        CHECK(aligned);
+        PspUiPageDialogView lam = {
+            .kind = PAGE_DIALOG_ALERT, .host = "",
+            .message = "\xd9\x84\xd8\xa7"
+        };
+        psp_ui_page_dialog_prepare(&dialog_budget, &lam, shown, value);
+        CHECK(lam.right_to_left && strcmp(shown, "\xef\xbb\xbb") == 0);
+        {
+            /* A right-to-left row that fits ends at the box's right edge and
+               keeps its last glyphs, the start of the sentence; a narrow
+               first letter (yod) used to be cut for the painter's ellipsis. */
+            PspUiPageDialogView yod = {
+                .kind = PAGE_DIALOG_ALERT, .host = "tilefinch.test",
+                .message = "\xd7\x99\xd7\x95\xd7\x9d \xd7\x98\xd7\x95\xd7\x91"
+            };
+            psp_ui_page_dialog_prepare(&dialog_budget, &yod, shown, value);
+            CHECK(yod.right_to_left && yod.message == shown);
+            psp_ui_show_page_dialog(ui, &yod);
+            CHECK(paint(ui, provider));
+            bool whole = false;
+            for (size_t r = 0; r < run_count; r++)
+                if (strcmp(runs[r].text, shown) == 0)
+                    whole = !runs[r].truncated && runs[r].left > WIDTH / 2;
+            CHECK(whole);
+        }
+        {
+            /* F12: rows the prepare step already cut to the box are drawn
+               whole, whatever the first paragraph's direction; the painter's
+               own ellipsis reserve used to cut a later right-to-left
+               paragraph's rows again, at their start. */
+            static char message[600];
+            snprintf(message, sizeof(message), "abc\n");
+            for (int letter = 0; letter < 90; letter++)
+                strcat(message, letter % 2 ? "\xd7\x91" : "\xd7\x90");
+            PspUiPageDialogView later = {
+                .kind = PAGE_DIALOG_ALERT, .host = "tilefinch.test",
+                .message = message
+            };
+            psp_ui_page_dialog_prepare(&dialog_budget, &later, shown, value);
+            CHECK(!later.right_to_left && later.message == shown);
+            psp_ui_show_page_dialog(ui, &later);
+            CHECK(paint(ui, provider));
+            size_t rows = 0;
+            for (size_t r = 0; r < run_count; r++) {
+                if (strstr(runs[r].text, "\xd7\x90") == NULL) continue;
+                rows++;
+                if (runs[r].truncated)
+                    fprintf(stderr, "cut again: '%s'\n", runs[r].text);
+                CHECK(!runs[r].truncated);
+            }
+            CHECK(rows >= 2u);
+            /* The prompt's answer, cut to its field, likewise. */
+            static char answer[300];
+            answer[0] = '\0';
+            for (int letter = 0; letter < 80; letter++)
+                strcat(answer, letter % 2 ? "\xd7\x92" : "\xd7\x93");
+            PspUiPageDialogView asked = {
+                .kind = PAGE_DIALOG_PROMPT, .host = "tilefinch.test",
+                .message = "abc", .value = answer
+            };
+            psp_ui_page_dialog_prepare(&dialog_budget, &asked, shown, value);
+            CHECK(asked.value == value && !strncmp(value, "...", 3));
+            psp_ui_show_page_dialog(ui, &asked);
+            CHECK(paint(ui, provider));
+            bool answered = false;
+            for (size_t r = 0; r < run_count; r++) {
+                if (strcmp(runs[r].text, value) != 0) continue;
+                answered = true;
+                CHECK(!runs[r].truncated);
+            }
+            CHECK(answered);
+        }
+        PspUiPageDialogView plain = {
+            .kind = PAGE_DIALOG_ALERT, .host = "", .message = "Plain text\nmore"
+        };
+        const char *original = plain.message;
+        psp_ui_page_dialog_prepare(&dialog_budget, &plain, shown, value);
+        CHECK(!plain.right_to_left && plain.message == original);
+    }
+    psp_ui_clear_page_dialog(ui);
+    CHECK(ui->screen == PSP_UI_SCREEN_PAGE && ui->page_dialog == NULL);
+    return true;
+}
+
 /* Every status toast stores an English key and is translated at paint time.
    The longest translations (Bengali, Hindi, Assamese, then French and
    Portuguese) must arrive whole at both chrome scales: wrapped at a space
@@ -773,6 +947,132 @@ static bool paint_media(PspUiMediaState *media, TilefinchGlyphProvider *provider
     CHECK(false);
 }
 
+/* A run whose text contains NEEDLE. */
+static bool run_contains(const char *needle)
+{
+    for (size_t at = 0; at < run_count; at++)
+        if (strstr(runs[at].text, needle) != NULL) return true;
+    return false;
+}
+
+/* A drawn, unclipped run ends with SUFFIX: a host's end is on screen. */
+static bool run_ends_with(const char *suffix)
+{
+    size_t length = strlen(suffix);
+    for (size_t at = 0; at < run_count; at++) {
+        size_t text = strlen(runs[at].text);
+        if (text >= length && !runs[at].truncated
+            && !strcmp(runs[at].text + text - length, suffix)) return true;
+    }
+    return false;
+}
+
+/* Audio-only media's listening view in every state: a live station playing,
+   paused, reconnecting and buffering, a seekable file, the open and the
+   failure. Every catalog label arrives whole and unclipped beside long
+   station text; a live stream never shows a "0:00 / 0:00" timeline. */
+static bool test_audio_player_language(const PspUiState *ui,
+                                       TilefinchGlyphProvider *provider,
+                                       const char *theme_name)
+{
+    psp_ui_theme_select(ui->chrome_theme);
+    static PspUiMediaPresentation presentation;
+    PspUiMediaState media;
+    psp_ui_media_init(&media);
+    psp_ui_media_bind_presentation(&media, &presentation);
+    static const char *const names[] = {
+        "live", "paused", "reconnecting", "buffering", "file", "opening",
+        "failed"
+    };
+    for (unsigned lane = 0; lane < 7; lane++) {
+        bool live = lane <= 3;
+        psp_ui_media_set(&media, true, lane != 1, false,
+                         UINT64_C(754000000),
+                         lane == 4 ? UINT64_C(3215000000) : 0,
+                         "Radio Manele Romania - a station name long enough "
+                         "to need shortening in the title bar");
+        media.live = live;
+        psp_ui_media_set_audio(
+            &media, true,
+            "Manele, Romanian pop and dance hits around the clock, all day",
+            "a-very-long-stream-host-name.radio.example.net:8888",
+            lane != 4, lane == 2);
+        if (lane == 3) psp_ui_media_set_buffering(&media, true, 0);
+        if (lane == 5) {
+            psp_ui_media_set_resolving(&media, "Radio Manele Romania");
+            psp_ui_media_set_resolving_progress(&media, "Loading...", 400u);
+        }
+        if (lane == 6)
+            psp_ui_media_set_error_reason(&media, "AUDIO DIDN'T START",
+                                          "DECODER STALLED AT 0 PACKETS");
+        CHECK(media.audio_only && media.controls_visible);
+        CHECK(paint_media(&media, provider));
+        CHECK(validate_frame(ui));
+        if (lane <= 4) {
+            static const char *const states[] = {
+                "Playing", "Playback paused", "Reconnecting...",
+                "Buffering...", "Playing"
+            };
+            CHECK(shown_whole(tilefinch_ui_text(states[lane])));
+            CHECK(shown_whole(tilefinch_ui_text("Not encrypted")) == (lane != 4));
+            /* A long host gives way at its start; its end is drawn. */
+            CHECK(run_ends_with("example.net:8888"));
+        }
+        if (lane == 0) {
+            /* A host and description that fit arrive whole. */
+            psp_ui_media_set_audio(&media, true, "Dance", "141.94.96.97:8888",
+                                   true, false);
+            CHECK(paint_media(&media, provider));
+            CHECK(validate_frame(ui));
+            CHECK(shown_whole("141.94.96.97:8888") && shown_whole("Dance"));
+            psp_ui_media_set_audio(
+                &media, true,
+                "Manele, Romanian pop and dance hits around the clock, all day",
+                "a-very-long-stream-host-name.radio.example.net:8888",
+                true, false);
+            CHECK(paint_media(&media, provider));
+        }
+        if (live) {
+            CHECK(shown_whole(tilefinch_ui_text("LIVE")));
+            CHECK(shown_whole("12:34"));
+            CHECK(!run_contains(" / "));
+            CHECK(shown_whole(tilefinch_ui_text(
+                lane == 1 ? "X PLAY" : "X PAUSE")));
+        } else if (lane == 4) {
+            CHECK(shown_whole("12:34 / 53:35"));
+            CHECK(shown_whole(tilefinch_ui_text("STICK/L/R SEEK  X PAUSE")));
+        } else if (lane == 5) {
+            CHECK(shown_whole(tilefinch_ui_text("Opening audio")));
+            psp_ui_media_set_resolving_progress(&media, "RESTARTING VIDEO",
+                                                400u);
+            CHECK(paint_media(&media, provider));
+            CHECK(validate_frame(ui));
+            CHECK(shown_whole(tilefinch_ui_text("RESTARTING AUDIO")));
+        } else {
+            CHECK(player_has_text("AUDIO DIDN'T START"));
+            static const char *const failures[] = {
+                "AUDIO DECODER COULDN'T START", "AUDIO SOURCE COULD NOT OPEN",
+                "NOT ENOUGH MEMORY FOR AUDIO"
+            };
+            for (size_t at = 0; at < sizeof(failures) / sizeof(failures[0]);
+                 at++) {
+                psp_ui_media_set_error_reason(&media, failures[at],
+                                              "AV ML 80010002");
+                CHECK(paint_media(&media, provider));
+                CHECK(validate_frame(ui));
+                CHECK(player_has_text(failures[at]));
+            }
+            psp_ui_media_set_error_reason(&media, "AUDIO DIDN'T START",
+                                          "DECODER STALLED AT 0 PACKETS");
+            CHECK(paint_media(&media, provider));
+        }
+        char name[64];
+        snprintf(name, sizeof(name), "audio-%s-%s", names[lane], theme_name);
+        CHECK(snapshot(name));
+    }
+    return true;
+}
+
 /* The Update screen, the video player's headlines and the font-pack
    offer's confirmation box show catalog text from state: every status,
    button and headline arrives translated and whole at both chrome scales. */
@@ -804,6 +1104,7 @@ static bool test_state_text(PspUiState *ui, TilefinchGlyphProvider *provider)
         "PLAYLIST VIDEO COULD NOT OPEN", "VIDEO DECODER NEEDS APP RESTART",
         "VIDEO DECODER MADE NO PROGRESS", "VIDEO DECODER RESET FAILED",
         "VIDEO ENDED AFTER DECODER RECOVERY", "VIDEO FIRST FRAME TIMED OUT",
+        "AUDIO DIDN'T START",
         "VIDEO SEEK TIMED OUT", "VIDEO STAGING TRANSFER DID NOT COMPLETE",
         "VIDEO START CANCELLED", "VIDEO UNAVAILABLE", "VIDEO COULD NOT RESTART",
         "SEEK FRAME UNAVAILABLE", "SEEK SOURCE COULD NOT PRIME",
@@ -844,6 +1145,14 @@ static bool test_state_text(PspUiState *ui, TilefinchGlyphProvider *provider)
                 : ui->update_channel == BROWSER_UPDATE_CHANNEL_STABLE
                     ? "Square Versions   O Back" : "O Back")));
         }
+        /* IS-10: the choice for a trial that did not finish starting. */
+        psp_ui_set_update(ui, "0.1.30", "UPDATE DID NOT FINISH STARTING",
+                          "", -1, "TRY AGAIN", true, false);
+        psp_ui_set_update_discard(ui, true);
+        CHECK(paint(ui, provider));
+        CHECK(shown_whole(tilefinch_ui_text("UPDATE DID NOT FINISH STARTING"))
+              && shown_whole(tilefinch_ui_text("TRY AGAIN"))
+              && shown_whole(tilefinch_ui_text("Square Discard   O Back")));
     }
     ui->update_channel = BROWSER_UPDATE_CHANNEL_STABLE;
     ui->browser_ui_scale = 1;
@@ -871,8 +1180,12 @@ static bool test_state_text(PspUiState *ui, TilefinchGlyphProvider *provider)
         {"PSP CAN'T PLAY THIS VIDEO FORMAT", "Unsupported H.264 profile"},
         {"PSP CAN'T PLAY THIS VIDEO FORMAT", "Picture size too large"},
         {"PSP CAN'T PLAY THIS VIDEO FORMAT", "No supported codec"},
+        {"PSP CAN'T PLAY THIS VIDEO FORMAT", "Video playlist too long"},
         {"VIDEO SOURCE COULD NOT OPEN", "HTTP 403"},
         {"STREAM OFFLINE OR NOT AVAILABLE", "HTTP 404"},
+        {"PLAY UNENCRYPTED AUDIO?", "This station is not encrypted"},
+        {"UNENCRYPTED AUDIO BLOCKED", "Change it in Site information"},
+        {"PSP CAN'T PLAY THIS AUDIO", "MP3 0x807F00FD"},
     };
     for (size_t at = 0; at < sizeof(failures) / sizeof(failures[0]); at++) {
         media = (PspUiMediaState) {.visible = true, .controls_visible = true};
@@ -1084,8 +1397,8 @@ static bool test_remaining_screens(PspUiState *ui, TilefinchGlyphProvider *provi
             media.audio_only_recovery_available = recovery != 1;
             media.lower_quality_recovery_available = recovery != 0;
             CHECK(paint_media(&media, provider) && validate_frame(ui));
-            UiRect panel = media_failed_panel_rect(WIDTH, HEIGHT);
-            UiRect chip = media_failed_retry_rect(panel);
+            UiRect panel = media_failed_panel_rect(&media, WIDTH, HEIGHT);
+            UiRect chip = media_failed_retry_rect(&media, panel);
             UiRect back = media_failed_back_rect(panel, false);
             CHECK(panel.x >= 16 && panel.x + panel.width <= WIDTH - 16
                   && chip.x + chip.width + 8 <= back.x);
@@ -1108,6 +1421,37 @@ static bool test_remaining_screens(PspUiState *ui, TilefinchGlyphProvider *provi
         CHECK(paint_media(&media, provider) && validate_frame(ui));
         CHECK(shown_whole(tilefinch_ui_text("Restart Tilefinch to use video"))
               && !has_whole_run(retry));
+
+        /* The unencrypted-audio question: its Retry says "Play anyway",
+           fits its chip and still answers through the Retry action. */
+        char play[TILEFINCH_UI_TRANSLATION_VALUE_BYTES + 4];
+        snprintf(play, sizeof(play), "X %s", tilefinch_ui_text("Play anyway"));
+        psp_ui_media_set_error_reason(&media, "PLAY UNENCRYPTED AUDIO?",
+                                      "This station is not encrypted");
+        media.insecure_audio_offer = true;
+        CHECK(paint_media(&media, provider) && validate_frame(ui));
+        {
+            UiRect panel = media_failed_panel_rect(&media, WIDTH, HEIGHT);
+            UiRect chip = media_failed_retry_rect(&media, panel);
+            UiRect back = media_failed_back_rect(panel, false);
+            CHECK(panel.x >= 16 && panel.x + panel.width <= WIDTH - 16
+                  && chip.x + chip.width + 8 <= back.x);
+            CHECK(shown_whole(play) && run_inside(play, chip)
+                  && !has_whole_run(retry)
+                  && run_inside(tilefinch_ui_text("O Back"), back));
+            CHECK(psp_ui_media_activate_at(&media, chip.x + 2,
+                      chip.y + chip.height / 2, WIDTH, HEIGHT).action
+                  == PSP_UI_MEDIA_ACTION_RETRY);
+        }
+        /* A remembered no offers no Retry and no restart advice. */
+        psp_ui_media_set_error_reason(&media, "UNENCRYPTED AUDIO BLOCKED",
+                                      "Change it in Site information");
+        CHECK(!media.insecure_audio_offer);
+        media.retry_unavailable = media.insecure_audio_blocked = true;
+        CHECK(paint_media(&media, provider) && validate_frame(ui));
+        CHECK(!has_whole_run(play) && !has_whole_run(retry)
+              && !has_whole_run(tilefinch_ui_text(
+                     "Restart Tilefinch to use video")));
 
         /* Help: the last error, version and licence details. */
         static const struct { unsigned item; const char *lines[3]; } help[] = {
@@ -1464,6 +1808,299 @@ static bool test_page_legend_row(void)
     return true;
 }
 
+/* A page's title in the chrome reads in display order wherever it is shown,
+   and a long right-to-left one loses its end, which is at the left. */
+static bool page_text_run(const char *text)
+{
+    for (size_t i = 0; i < run_count; i++)
+        if (!strcmp(runs[i].text, text)) return true;
+    return false;
+}
+
+static bool test_page_text_display_order(void)
+{
+    const char *logical = "\xd7\x90\xd7\x91 \xd7\x92\xd7\x93";
+    const char *visual = "\xd7\x93\xd7\x92 \xd7\x91\xd7\x90";
+    /* The cut's bidi scratch is charged to the owner's Budget (F11) and
+       returned before the draw ends. */
+    static Budget text_budget;
+    budget_init(&text_budget, 256u * 1024u);
+    psp_ui_set_text_budget(&text_budget);
+    PspUiState ui;
+    psp_ui_init(&ui);
+    ui.browser_ui_scale = 1;
+    ui.overlay_animation_frames = 0;
+    PspUiTabsView tabs = {.count = 2};
+    snprintf(tabs.titles[0], sizeof(tabs.titles[0]), "%s", logical);
+    snprintf(tabs.titles[1], sizeof(tabs.titles[1]), "Plain title");
+    ui.tabs = &tabs;
+    ui.screen = PSP_UI_SCREEN_TABS;
+    run_count = 0; run_overflow = false;
+    psp_ui_composite(&ui, storage + 16, WIDTH, HEIGHT, STRIDE);
+    CHECK(page_text_run(visual) && !page_text_run(logical));
+    CHECK(page_text_run("Plain title"));
+    ui.tabs = NULL;
+
+    PspUiHomeView home = {.tile_count = 1, .continue_count = 1,
+                          .engine_ready = true};
+    snprintf(home.tiles[0].label, sizeof(home.tiles[0].label), "%s", logical);
+    snprintf(home.continues[0].label, sizeof(home.continues[0].label), "%s",
+             logical);
+    ui.home = &home;
+    ui.screen = PSP_UI_SCREEN_HOME;
+    run_count = 0; run_overflow = false;
+    psp_ui_composite(&ui, storage + 16, WIDTH, HEIGHT, STRIDE);
+    size_t shown = 0;
+    for (size_t i = 0; i < run_count; i++) {
+        CHECK(strcmp(runs[i].text, logical) != 0);
+        shown += !strcmp(runs[i].text, visual);
+    }
+    CHECK(shown == 2u);
+    ui.home = NULL;
+
+    /* With no path, the address field's second line is the title. */
+    psp_ui_set_page(&ui, logical, "https://example.test", true);
+    run_count = 0; run_overflow = false;
+    draw_top_bar(&ui, storage, WIDTH, HEIGHT, STRIDE, 0, 0, 0, 0);
+    CHECK(page_text_run(visual) && !page_text_run(logical));
+
+    char longer[160] = "";
+    for (int word = 0; word < 8; word++) strcat(longer, "\xd7\x90\xd7\x91\xd7\x92 ");
+    strcat(longer, "\xd7\x93\xd7\x94");
+    run_count = 0; run_overflow = false;
+    draw_page_text(storage, WIDTH, HEIGHT, STRIDE, 10, 10, longer, 64, 70,
+                   0xffff, 1, NULL, false);
+    CHECK(run_count == 1 && !runs[0].truncated);
+    CHECK(!strncmp(runs[0].text, "...", 3));
+    /* The start of the title, its first letters, is kept at the right. */
+    const char *end = runs[0].text + strlen(runs[0].text);
+    CHECK(strlen(runs[0].text) > 6 && !strcmp(end - 6, "\xd7\x92\xd7\x91\xd7\x90"));
+    CHECK(text_budget.peak > 0 && text_budget.current == 0);
+
+    /* F12: the player's title, already cut to the bar with its dots on the
+       left, is drawn whole: the painter's own ellipsis reserve used to cut
+       its right end, the title's first letters, a second time. */
+    PspUiMediaPresentation presentation = {0};
+    PspUiMediaState media = {.visible = true, .controls_visible = true,
+                             .presentation = &presentation};
+    char long_title[400] = "";
+    for (int letter = 0; letter < 120; letter++)
+        strcat(long_title, letter % 2 ? "\xd7\x91" : "\xd7\x90");
+    const char *title = psp_ui_media_shown_title(&media, &text_budget,
+                                                 long_title);
+    CHECK(title != long_title && !strncmp(title, "...", 3));
+    snprintf(media.title, sizeof(media.title), "%s", title);
+    run_count = 0; run_overflow = false;
+    psp_ui_media_composite(&media, storage + 16, WIDTH, HEIGHT, STRIDE);
+    bool drawn = false;
+    for (size_t i = 0; i < run_count; i++) {
+        if (strcmp(runs[i].text, title) != 0) continue;
+        drawn = true;
+        CHECK(!runs[i].truncated);
+    }
+    CHECK(drawn && text_budget.current == 0);
+    return !run_overflow;
+}
+
+/* UI-1: a host that does not fit gives way at its start. The end of a
+   host names its owner, so a lookalike such as
+   accounts.google.com.<padding>.evil.example must show "...evil.example"
+   and never the Google-looking start, on every surface that names the
+   page's site. */
+#define UI_LOOKALIKE_PAD "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+static const char ui_lookalike_host[] =
+    "accounts.google.com." UI_LOOKALIKE_PAD ".evil.example";
+/* Fits the chrome's 48-byte site fields but none of their rows. */
+static const char ui_lookalike_short[] =
+    "accounts.google.com.aaaaaaaaaaaaa.evil.example";
+
+static bool host_end_shown(const char *what)
+{
+    bool end = false, start = false;
+    for (size_t at = 0; at < run_count; at++) {
+        const char *text = runs[at].text;
+        size_t length = strlen(text);
+        if (strstr(text, "google") != NULL) start = true;
+        if (length >= 12 && !strcmp(text + length - 12, "evil.example")
+            && strstr(text, "...") != NULL && !runs[at].truncated
+            && runs[at].right <= WIDTH)
+            end = true;
+    }
+    if (!end || start || run_overflow) {
+        fprintf(stderr, "%s: host end %s, lookalike start %s\n", what,
+                end ? "shown" : "missing", start ? "shown" : "hidden");
+        for (size_t at = 0; at < run_count; at++)
+            fprintf(stderr, "  '%s'%s\n", runs[at].text,
+                    runs[at].truncated ? " truncated" : "");
+        return false;
+    }
+    return true;
+}
+
+static bool test_long_host_keeps_its_end(void)
+{
+    char url[256];
+    snprintf(url, sizeof(url), "https://%s/signin?continue=1",
+             ui_lookalike_host);
+    for (unsigned scale = 1; scale <= 2; scale++) {
+        static PspUiState ui;
+        psp_ui_init(&ui);
+        ui.browser_ui_scale = scale;
+        ui.overlay_animation_frames = 0;
+        psp_ui_set_page(&ui, "Sign in", url, true);
+        char what[64];
+
+        run_count = 0; run_overflow = false;
+        draw_top_bar(&ui, storage, WIDTH, HEIGHT, STRIDE, 0, 0, 0, 0);
+        snprintf(what, sizeof(what), "address bar scale=%u", scale);
+        CHECK(host_end_shown(what));
+
+        ui.captive_portal_active = true;
+        run_count = 0; run_overflow = false;
+        draw_bottom_bar(&ui, storage, WIDTH, HEIGHT, STRIDE, 0, 0, 0);
+        snprintf(what, sizeof(what), "Wi-Fi sign-in bar scale=%u", scale);
+        CHECK(host_end_shown(what));
+        ui.captive_portal_active = false;
+
+        run_count = 0; run_overflow = false;
+        draw_page_information(&ui, storage, WIDTH, HEIGHT, STRIDE, 0, 0, 0);
+        CHECK(host_end_shown("site information"));
+
+        run_count = 0; run_overflow = false;
+        draw_site_controls(&ui, storage, WIDTH, HEIGHT, STRIDE, 0, 0, 0);
+        CHECK(host_end_shown("permissions & controls"));
+
+        PspUiPageDialogView dialog = {
+            .kind = PAGE_DIALOG_ALERT, .host = ui_lookalike_host,
+            .message = "Your session expired."
+        };
+        psp_ui_show_page_dialog(&ui, &dialog);
+        ui.overlay_animation_frames = 0;
+        run_count = 0; run_overflow = false;
+        draw_page_dialog(&ui, storage, WIDTH, HEIGHT, STRIDE, 0, 0);
+        CHECK(host_end_shown("page dialog"));
+        ui.page_dialog = NULL;
+
+        PspUiFileDownloadPreview download = {.name = "invoice.pdf"};
+        snprintf(download.origin, sizeof(download.origin), "https://%s",
+                 ui_lookalike_host);
+        ui.file_download_preview = &download;
+        run_count = 0; run_overflow = false;
+        draw_file_download(&ui, storage, WIDTH, HEIGHT, STRIDE, 0, 0, 0);
+        CHECK(host_end_shown("file download"));
+        ui.file_download_preview = NULL;
+
+        char origin[256];
+        snprintf(origin, sizeof(origin), "https://%s", ui_lookalike_host);
+        psp_ui_show_storage_offer(&ui, origin, 1024, 2048, 4096, false, 0);
+        ui.overlay_animation_frames = 0;
+        run_count = 0; run_overflow = false;
+        draw_storage_offer(&ui, storage, WIDTH, HEIGHT, STRIDE, 0, 0);
+        CHECK(host_end_shown("storage offer"));
+
+        psp_ui_show_heavy_offer(&ui, ui_lookalike_host, 4096, 1000);
+        ui.overlay_animation_frames = 0;
+        run_count = 0; run_overflow = false;
+        draw_heavy_offer(&ui, storage, WIDTH, HEIGHT, STRIDE, 0, 0);
+        CHECK(host_end_shown("large app offer"));
+
+        /* Fields filled by the frontend hold at most 47 bytes. */
+        PspUiTabsView tabs = {.count = 1};
+        snprintf(tabs.titles[0], sizeof(tabs.titles[0]), "Sign in");
+        snprintf(tabs.domains[0], sizeof(tabs.domains[0]), "%s",
+                 ui_lookalike_short);
+        CHECK(!strcmp(tabs.domains[0], ui_lookalike_short));
+        ui.tabs = &tabs;
+        run_count = 0; run_overflow = false;
+        draw_tabs(&ui, storage, WIDTH, HEIGHT, STRIDE, 0, 0, 0, 0);
+        bool tab_end = false;
+        for (size_t at = 0; at < run_count; at++) {
+            const char *text = runs[at].text;
+            size_t length = strlen(text);
+            CHECK(strncmp(text, "accounts.google.com.", 20) != 0
+                  || !strcmp(text, ui_lookalike_short));
+            tab_end |= length >= 12 && !runs[at].truncated
+                && !strcmp(text + length - 12, "evil.example");
+        }
+        CHECK(tab_end);
+        ui.tabs = NULL;
+
+        static PspUiSiteStorageView sites;
+        memset(&sites, 0, sizeof(sites));
+        sites.count = 1;
+        snprintf(sites.rows[0].origin, sizeof(sites.rows[0].origin), "%s",
+                 ui_lookalike_short);
+        snprintf(sites.rows[0].detail, sizeof(sites.rows[0].detail),
+                 "12 KB  RAM");
+        ui.screen = PSP_UI_SCREEN_DATA_OPTIONS;
+        psp_ui_set_site_storage(&ui, &sites);
+        ui.data_options_selection = 0;
+        run_count = 0; run_overflow = false;
+        draw_site_data(&ui, storage, WIDTH, HEIGHT, STRIDE, 0, 0, 0);
+        CHECK(host_end_shown("site data & storage"));
+        ui.screen = PSP_UI_SCREEN_STORAGE_SITE;
+        run_count = 0; run_overflow = false;
+        draw_storage_site(&ui, storage, WIDTH, HEIGHT, STRIDE, 0, 0, 0);
+        CHECK(host_end_shown("site storage"));
+        ui.site_storage = NULL;
+    }
+
+    /* Saved addresses: the omnibox's suggestions and the Collections rows,
+       titled and untitled. A host that fits keeps its whole name and only
+       the path gives way. */
+    static const char short_host_url[] =
+        "https://evil.example/" UI_LOOKALIKE_PAD UI_LOOKALIKE_PAD;
+    for (unsigned titled = 0; titled < 2; titled++) {
+        static PspUiState ui;
+        psp_ui_init(&ui);
+        ui.overlay_animation_frames = 0;
+        BrowserProfileSuggestion suggestion = {
+            .url = url, .title = titled ? "Sign in" : NULL};
+        PspUiTextEntryView entry = {
+            .description = "SEARCH OR ADDRESS", .text = "evil",
+            .suggestions = &suggestion, .cursor = 4,
+            .suggestion_count = 1, .suggestion_selection = 0};
+        psp_ui_set_text_entry(&ui, &entry);
+        run_count = 0; run_overflow = false;
+        draw_text_entry(&ui, storage, WIDTH, HEIGHT, STRIDE, 0, 0, 0, 0);
+        CHECK(host_end_shown(titled ? "titled suggestion"
+                                    : "untitled suggestion"));
+        suggestion.url = short_host_url;
+        run_count = 0; run_overflow = false;
+        draw_text_entry(&ui, storage, WIDTH, HEIGHT, STRIDE, 0, 0, 0, 0);
+        bool path_cut = false;
+        for (size_t at = 0; at < run_count; at++)
+            path_cut |= !strncmp(runs[at].text, "https://evil.example/aaa",
+                                 24u) && runs[at].truncated;
+        CHECK(path_cut && !run_overflow);
+        psp_ui_clear_text_entry(&ui);
+
+        static PspUiCollectionsView view;
+        memset(&view, 0, sizeof(view));
+        view.section = PSP_UI_COLLECTION_HISTORY;
+        view.count = 2;
+        view.rows[0].title = titled ? "Sign in" : url;
+        view.rows[0].detail = url;
+        view.rows[1].title = "Example";
+        view.rows[1].detail = short_host_url;
+        psp_ui_show_collections(&ui, PSP_UI_COLLECTION_HISTORY);
+        ui.overlay_animation_frames = 0;
+        psp_ui_set_collections(&ui, &view);
+        run_count = 0; run_overflow = false;
+        draw_collections(&ui, storage, WIDTH, HEIGHT, STRIDE,
+                         ui_surface_accent(BROWSER_CHROME_THEME_FINCH));
+        CHECK(host_end_shown(titled ? "titled history row"
+                                    : "untitled history row"));
+        path_cut = false;
+        for (size_t at = 0; at < run_count; at++)
+            path_cut |= !strncmp(runs[at].text, "https://evil.example/aaa",
+                                 24u) && runs[at].truncated;
+        CHECK(path_cut);
+        ui.collections = NULL;
+    }
+    return true;
+}
+
 static bool test_square_button_symbol(void)
 {
     for (int scale = 1; scale <= 2; scale++) {
@@ -1523,6 +2160,50 @@ static lxb_dom_node_t *provider_node(BrowserEngine *engine, const char *id)
     return NULL;
 }
 
+/* The width layout gives this text: right-to-left letters take the form the
+   shaper picks, whose advance differs from the isolated letter's, and a letter
+   a ligature absorbs takes none. */
+static int shaped_text_width_fixed(Budget *budget, const FontFace *face, FontFamily family,
+                                   const char *text, size_t length, int size_fixed, bool bold)
+{
+    if (!text_bidi_maybe_needed(text, length))
+        return font_text_width_for_family_at_size_fixed(
+            face, family, text, length, size_fixed, false, bold);
+    TextBidiStatus status;
+    TextBidiParagraph *paragraph = text_bidi_paragraph_create(
+        budget, text, length, TEXT_BIDI_BASE_AUTO_LTR, &status);
+    if (!paragraph) return -1;
+    const TextBidiUnit *units = text_bidi_paragraph_units(paragraph);
+    int width = 0;
+    for (size_t at = 0; at < text_bidi_paragraph_count(paragraph); at++) {
+        unsigned char encoded[4];
+        size_t bytes = tilefinch_utf8_encode(units[at].shaped_codepoint, encoded);
+        width += font_text_width_for_family_at_size_fixed(
+            face, family, (const char *)encoded, bytes, size_fixed, false, bold);
+    }
+    text_bidi_paragraph_destroy(paragraph);
+    return width;
+}
+
+/* A right-to-left letter still in its logical form. A notice that the catalog
+   has already shaped into display order holds presentation forms instead, and
+   paints as it stands. */
+static bool text_has_logical_rtl_letter(const char *text, size_t length)
+{
+    for (size_t at = 0; at < length;) {
+        unsigned codepoint = 0;
+        size_t used = font_utf8_next(text + at, length - at, &codepoint);
+        if (!used) return false;
+        if ((codepoint >= 0x0590u && codepoint <= 0x05ffu)
+            || (codepoint >= 0x0620u && codepoint <= 0x064au)
+            || (codepoint >= 0x066eu && codepoint <= 0x06d3u)
+            || (codepoint >= 0x0750u && codepoint <= 0x077fu)
+            || (codepoint >= 0x08a0u && codepoint <= 0x08ffu)) return true;
+        at += used;
+    }
+    return false;
+}
+
 static bool provider_text_fits(BrowserEngine *engine, const FontSet *fonts)
 {
     const LayoutDocument *layout = &browser_engine_navigation(engine)->page.layout;
@@ -1535,14 +2216,21 @@ static bool provider_text_fits(BrowserEngine *engine, const FontSet *fonts)
         CHECK(command->x >= 0 && command->x + command->width <= WIDTH);
         bool bold = draw_uses_bold_face(command);
         const FontFace *face = draw_command_face(layout, command);
-        int width = (font_text_width_for_family_at_size_fixed(face,
+        int width = (shaped_text_width_fixed(browser_engine_budget(engine), face,
             font_context_metric_family(layout->web_fonts, draw_command_font_family(command), face), command->text,
-            command->text_length, draw_command_text_font_size_fixed(command), false,
+            command->text_length, draw_command_text_font_size_fixed(command),
             bold) + 63) / 64;
+        CHECK(width > 0);
         if (width > command->width + 2)
             fprintf(stderr, "text width=%d available=%d text=%.*s\n", width,
                 command->width, (int)command->text_length, command->text);
         CHECK(width <= command->width + 2);
+        if (text_has_logical_rtl_letter(command->text, command->text_length)
+            && !layout_bidi_command_for_index(layout, at))
+            fprintf(stderr, "right-to-left text painted in logical order: %.*s\n",
+                (int)command->text_length, command->text);
+        CHECK(!text_has_logical_rtl_letter(command->text, command->text_length)
+            || layout_bidi_command_for_index(layout, at));
     }
     (void) fonts;
     return true;
@@ -1584,6 +2272,28 @@ static bool test_bidi_glyph_raster(const FontSet *fonts, Budget *budget)
     layout.commands = reference;
     layout.count = layout.capacity = 3;
     layout.bidi_command_count = 0;
+    CHECK(tile_cache_init(&cache, budget, &layout, 4)
+        && tile_cache_set_frame(&cache, expected, W * H)
+        && tile_cache_render_frame(&cache, 0, W, H, NULL));
+    tile_cache_destroy(&cache);
+    CHECK(memcmp(actual, expected, sizeof(actual)) == 0);
+    /* The shadow pass paints moved copies of the command; they must keep the
+       visual order, as must the fixed and sticky passes that copy it too. */
+    draw_command_set_text_shadow_blur(&command, 2);
+    for (size_t at = 0; at < 3; at++)
+        draw_command_set_text_shadow_blur(&reference[at], 2);
+    layout.commands = &command;
+    layout.count = layout.capacity = 1;
+    layout.bidi_command_count = 1;
+    memset(actual, 0, sizeof(actual));
+    CHECK(tile_cache_init(&cache, budget, &layout, 4)
+        && tile_cache_set_frame(&cache, actual, W * H)
+        && tile_cache_render_frame(&cache, 0, W, H, NULL));
+    tile_cache_destroy(&cache);
+    layout.commands = reference;
+    layout.count = layout.capacity = 3;
+    layout.bidi_command_count = 0;
+    memset(expected, 0, sizeof(expected));
     CHECK(tile_cache_init(&cache, budget, &layout, 4)
         && tile_cache_set_frame(&cache, expected, W * H)
         && tile_cache_render_frame(&cache, 0, W, H, NULL));
@@ -1715,6 +2425,29 @@ static bool test_provider_language(const FontSet *fonts, TilefinchGlyphProvider 
         CHECK(placeholder && length == strlen(translated)
             && !memcmp(placeholder, translated, length));
         CHECK(provider_text_fits(engine, fonts));
+        size_t query_length = 0;
+        (void) document_attribute(search, "value", &query_length);
+        if (!strcmp(language_code, "ar") && !query_length) {
+            /* Read from the right: the box's edge, the Arabic words, YouTube. */
+            const LayoutDocument *searched = &browser_engine_navigation(engine)->page.layout;
+            const LayoutNodeBox *box = layout_box_for_node(searched, search);
+            size_t found = searched->count;
+            for (size_t at = 0; found == searched->count && at < searched->count; at++)
+                if (searched->commands[at].type == DRAW_TEXT && searched->commands[at].text == placeholder)
+                    found = at;
+            CHECK(box && found < searched->count);
+            const DrawCommand *text = &searched->commands[found];
+            const LayoutBidiCommand *bidi = layout_bidi_command_for_index(searched, found);
+            CHECK(bidi && bidi->glyph_count > 8);
+            const LayoutBidiGlyph *glyphs = &searched->bidi_glyphs[bidi->glyph_start];
+            CHECK(glyphs[0].codepoint == 'Y' && glyphs[6].codepoint == 'e');
+            for (size_t at = 1; at < bidi->glyph_count; at++)
+                CHECK(glyphs[at - 1].x_fixed <= glyphs[at].x_fixed);
+            CHECK(glyphs[bidi->glyph_count - 1].codepoint == 0x0627u
+                || glyphs[bidi->glyph_count - 1].codepoint == 0xfe8du);
+            CHECK(text->x + text->width > box->x + box->width / 2
+                && text->x + text->width <= box->x + box->width);
+        }
         /* Background/border insertions must not attach a neighboring RTL
            label's glyph map to the unlocalized brand. */
         const LayoutDocument *painted = &browser_engine_navigation(engine)->page.layout;
@@ -1797,40 +2530,84 @@ static bool test_provider_language(const FontSet *fonts, TilefinchGlyphProvider 
     return true;
 }
 
-static bool test_real_bengali_coverage(Budget *budget, const FontSet *fonts)
+static const char *real_pack_path(const char *id)
 {
-    if (!real_bengali_pack) return true;
-    /* This provider is deliberately not installed. Built-in face coverage
-       must not consult the synthetic all-language metric fallback. */
-    TilefinchGlyphProvider *proof = tilefinch_glyph_provider_create(budget);
-    CHECK(proof && tilefinch_glyph_provider_attach(proof, real_bengali_pack, "glyph-bengali-assamese"));
-    for (unsigned locale = TILEFINCH_UI_LANGUAGE_BENGALI;
-         locale <= TILEFINCH_UI_LANGUAGE_ASSAMESE; locale++) {
-        TilefinchUiTranslation *translation;
-        CHECK(load_catalog(budget, locale, &translation));
-        for (size_t row = 0; row < key_count; row++) {
-            const char *text = values[row];
-            size_t bytes = strlen(text);
-            for (size_t at = 0; at < bytes;) {
-                unsigned cp;
-                size_t used = font_utf8_next(text + at, bytes - at, &cp);
-                CHECK(used);
-                /* Square is native controller geometry, separately tested;
-                   it intentionally is not in the staged Latin subset. */
-                if (cp >= 128 && cp != 0x25a1u
-                    && !font_face_has_codepoint(font_set_face(fonts, FONT_SANS), cp)) {
-                    uint32_t key;
-                    if (!tilefinch_glyph_provider_match(proof, text + at, bytes - at, &used, &key, NULL)) {
-                        fprintf(stderr, "real pack missing locale=%u U+%04X\n", locale, cp);
-                        return false;
-                    }
-                }
-                at += used;
+    for (size_t at = 0; at < real_pack_count; at++)
+        if (!strcmp(real_packs[at].id, id)) return real_packs[at].path;
+    return NULL;
+}
+
+/* Every glyph of a row must come from the built-in face or the language's own
+   pack. Right-to-left rows are asked for the forms the shaper picks. */
+static bool real_pack_covers_row(TilefinchGlyphProvider *proof, const FontSet *fonts,
+                                 Budget *budget, const char *code, const char *text)
+{
+    const FontFace *face = font_set_face(fonts, FONT_SANS);
+    size_t bytes = strlen(text);
+    if (text_bidi_maybe_needed(text, bytes)) {
+        TextBidiStatus status;
+        TextBidiParagraph *paragraph = text_bidi_paragraph_create(
+            budget, text, bytes, TEXT_BIDI_BASE_AUTO_LTR, &status);
+        CHECK(paragraph);
+        const TextBidiUnit *units = text_bidi_paragraph_units(paragraph);
+        bool covered = true;
+        for (size_t at = 0; at < text_bidi_paragraph_count(paragraph); at++) {
+            unsigned cp = units[at].shaped_codepoint;
+            if (cp < 128 || cp == 0x25a1u || font_codepoint_default_ignorable(cp)
+                || font_face_has_codepoint(face, cp)) continue;
+            unsigned char encoded[4];
+            size_t length = tilefinch_utf8_encode(cp, encoded), used;
+            uint32_t key;
+            if (!tilefinch_glyph_provider_match(proof, (const char *)encoded, length,
+                                                &used, &key, NULL)) {
+                fprintf(stderr, "real pack missing locale=%s U+%04X in %s\n", code, cp, text);
+                covered = false;
             }
         }
-        tilefinch_ui_translation_destroy(translation);
+        text_bidi_paragraph_destroy(paragraph);
+        return covered;
     }
-    tilefinch_glyph_provider_destroy(proof);
+    for (size_t at = 0; at < bytes;) {
+        unsigned cp;
+        size_t used = font_utf8_next(text + at, bytes - at, &cp);
+        CHECK(used);
+        /* Square is native controller geometry, separately tested;
+           it intentionally is not in the staged Latin subset. */
+        if (cp >= 128 && cp != 0x25a1u && !font_codepoint_default_ignorable(cp)
+            && !font_face_has_codepoint(face, cp)) {
+            uint32_t key;
+            if (!tilefinch_glyph_provider_match(proof, text + at, bytes - at, &used, &key, NULL)) {
+                fprintf(stderr, "real pack missing locale=%s U+%04X in %s\n", code, cp, text);
+                return false;
+            }
+        }
+        at += used;
+    }
+    return true;
+}
+
+static bool test_real_pack_coverage(Budget *budget, const FontSet *fonts)
+{
+    for (unsigned language = 1; language < TILEFINCH_UI_LANGUAGE_COUNT; language++) {
+        const TilefinchUiLanguageSpec *spec = tilefinch_ui_language_spec(language);
+        TilefinchGlyphPack pack;
+        if (!tilefinch_glyph_pack_for_language(spec->glyphs, &pack)) continue;
+        const char *id = tilefinch_glyph_pack_spec(pack)->id;
+        const char *path = real_pack_path(id);
+        if (!path) continue;
+        /* This provider is deliberately not installed. Built-in face coverage
+           must not consult the synthetic all-language metric fallback. */
+        TilefinchGlyphProvider *proof = tilefinch_glyph_provider_create(budget);
+        CHECK(proof && tilefinch_glyph_provider_attach(proof, path, id));
+        TilefinchUiTranslation *translation;
+        CHECK(load_catalog(budget, language, &translation));
+        bool covered = true;
+        for (size_t row = 0; row < key_count; row++)
+            covered &= real_pack_covers_row(proof, fonts, budget, spec->code, values[row]);
+        tilefinch_ui_translation_destroy(translation);
+        tilefinch_glyph_provider_destroy(proof);
+        CHECK(covered);
+    }
     return true;
 }
 
@@ -1910,22 +2687,207 @@ static bool test_chrome_cache_follows_packs(void)
     return true;
 }
 
+/* U+0915 alone: a hollow 16x16 cell with the descent of the deepest real pack. */
+static bool make_low_baseline_pack(char path[64], const char *id, unsigned baseline)
+{
+    enum { PAGES = 80 + TILEFINCH_GLYPH_COMPONENT_PAGE_COUNT * 2,
+           PAYLOAD = PAGES + 36, NOTICE = 1, BYTES = PAYLOAD + 32 + NOTICE };
+    unsigned char bytes[BYTES] = {0};
+    memcpy(bytes, "TFGFv1\0\0", 8);
+    put16(bytes + 8, 1);
+    bytes[10] = 1; bytes[11] = 16; bytes[12] = 16; bytes[13] = 64;
+    bytes[14] = (unsigned char)strlen(id); bytes[15] = (unsigned char)baseline;
+    memcpy(bytes + 44, id, strlen(id));
+    put32(bytes + 16, 1); put16(bytes + 20, 1);
+    put32(bytes + 24, 80); put32(bytes + 28, PAGES);
+    put32(bytes + 32, PAYLOAD); put32(bytes + 36, PAYLOAD);
+    put32(bytes + 40, BYTES); put32(bytes + 72, NOTICE);
+    memset(bytes + 80, 0xff, TILEFINCH_GLYPH_COMPONENT_PAGE_COUNT * 2);
+    put16(bytes + 80 + 0x09 * 2, 0);
+    bytes[PAGES + 4 + 0x15 / 8] = 1u << (0x15 & 7u);
+    for (unsigned y = 0; y < 16; y++) {
+        bytes[PAYLOAD + y * 2] = y == 0 || y == 15 ? 255 : 128;
+        bytes[PAYLOAD + y * 2 + 1] = y == 0 || y == 15 ? 255 : 1;
+    }
+    bytes[BYTES - 1] = 15u << 4;
+    snprintf(path, 64, "/tmp/tilefinch-ui-low-XXXXXX");
+    int fd = mkstemp(path);
+    CHECK(fd >= 0);
+    FILE *file = fdopen(fd, "wb");
+    CHECK(file && fwrite(bytes, 1, BYTES, file) == BYTES && fclose(file) == 0);
+    return true;
+}
+
+/* Hashes narrow the search, but never establish the identity of a title. */
+static bool test_page_text_cache_collision(void)
+{
+    const char *first = "אב c82b207b1aff19a7";
+    const char *second = "אב 6a370ca42ae12b2f";
+    char shown_first[256], shown_second[256], expected[256];
+    memset(ui_page_text_rows, 0, sizeof(ui_page_text_rows));
+    snprintf(shown_first, sizeof(shown_first), "%s",
+        ui_page_text_visual(first, 160, 1, NULL, false));
+    snprintf(shown_second, sizeof(shown_second), "%s",
+        ui_page_text_visual(second, 160, 1, NULL, false));
+    Budget scratch;
+    budget_init(&scratch, 65536);
+    CHECK(psp_ui_visual_text(&scratch, second, 160, 1, NULL, 1,
+                             expected, sizeof(expected), NULL));
+    CHECK(strcmp(shown_first, expected) != 0);
+    CHECK(strcmp(shown_second, expected) == 0 && scratch.current == 0);
+    return true;
+}
+
+/* A pending pack uses fallback advances. Retrying after its payload arrives
+   must measure again even though no pack was attached or replaced. */
+static bool test_page_text_cache_pending(void)
+{
+    char pack[64];
+    CHECK(make_low_baseline_pack(pack, "glyph-ui-low-test", 11));
+    Budget budget;
+    budget_init(&budget, 8u * 1024u * 1024u);
+    FontSet fonts;
+    CHECK(font_set_load(&fonts, &budget,
+        TILEFINCH_TEST_ROOT "/fonts/DejaVuSans-Latin.ttf",
+        TILEFINCH_TEST_ROOT "/fonts/DejaVuSerif-Latin.ttf",
+        TILEFINCH_TEST_ROOT "/fonts/DejaVuSans-Oblique-Latin.ttf",
+        TILEFINCH_TEST_ROOT "/fonts/DejaVuSans-Bold-Latin.ttf",
+        TILEFINCH_TEST_ROOT "/fonts/DejaVuSerif-Bold-Latin.ttf",
+        TILEFINCH_TEST_ROOT "/fonts/TilefinchSans-Regular.ttf",
+        TILEFINCH_TEST_ROOT "/fonts/TilefinchSans-Bold.ttf", 2u * 1024u * 1024u));
+    psp_ui_set_chrome_fonts(font_set_face(&fonts, FONT_SANS),
+        font_set_face_variant(&fonts, FONT_SANS, false, true), 1);
+    TilefinchGlyphProvider *provider = tilefinch_glyph_provider_create(&budget);
+    CHECK(provider && font_optional_glyph_provider_install(provider));
+    CHECK(tilefinch_glyph_provider_attach(provider, pack, "glyph-ui-low-test"));
+    const char *title = "אבकककककककककककककककककक";
+    char pending[256], cached[256], expected[256];
+    memset(ui_page_text_rows, 0, sizeof(ui_page_text_rows));
+    uint64_t generation = font_optional_glyph_generation();
+    snprintf(pending, sizeof(pending), "%s",
+        ui_page_text_visual(title, 100, 1, NULL, false));
+    CHECK(settled_chrome_glyph(provider, 0x0915) != NULL);
+    CHECK(generation == font_optional_glyph_generation());
+    snprintf(cached, sizeof(cached), "%s",
+        ui_page_text_visual(title, 100, 1, NULL, false));
+    Budget scratch;
+    budget_init(&scratch, 65536);
+    CHECK(psp_ui_visual_text(&scratch, title, 100, 1, NULL, 1,
+                             expected, sizeof(expected), NULL));
+    CHECK(strcmp(pending, expected) != 0);
+    CHECK(strcmp(cached, expected) == 0 && scratch.current == 0);
+    /* Once settled, repeated frames retain their measured row. */
+    const char *warm = ui_page_text_visual(title, 100, 1, NULL, false);
+    uint32_t state = chrome_glyph_state_generation;
+    CHECK(warm == ui_page_text_visual(title, 100, 1, NULL, false));
+    CHECK(state == chrome_glyph_state_generation);
+    CHECK(font_optional_glyph_provider_uninstall(provider));
+    tilefinch_glyph_provider_destroy(provider);
+    psp_ui_clear_chrome_font();
+    font_set_destroy(&fonts);
+    CHECK(unlink(pack) == 0 && budget.current == 0);
+    return true;
+}
+
+/* Paints one run once its pack page has arrived. */
+static bool draw_settled_run(TilefinchGlyphProvider *provider, int y, const char *text, int scale)
+{
+    for (unsigned pass = 0; pass < 64; pass++) {
+        memset(storage, 0, sizeof(storage));
+        run_count = 0; run_overflow = false;
+        draw_text(storage, WIDTH, HEIGHT, STRIDE, 24, y, text, 64, 0xffff, scale);
+        bool changed = false;
+        size_t read = 0;
+        CHECK(tilefinch_glyph_provider_pump(provider, 65536, &changed, &read));
+        if (!read) return run_count == 1;
+    }
+    return false;
+}
+
+static bool row_has_ink(int y, int left, int right)
+{
+    for (int x = left; x < right; x++)
+        if (storage[y * STRIDE + x]) return true;
+    return false;
+}
+
+/* A pack cell keeps its descent, which reaches below the rows laid out for the
+   built-in face. Rows at the screen's edge must rise instead of losing it. */
+static bool test_bottom_row_keeps_pack_descent(void)
+{
+    char pack[64];
+    CHECK(make_low_baseline_pack(pack, "glyph-ui-low-test", 11));
+    Budget budget;
+    budget_init(&budget, 8u * 1024u * 1024u);
+    FontSet fonts;
+    CHECK(font_set_load(&fonts, &budget,
+        TILEFINCH_TEST_ROOT "/fonts/DejaVuSans-Latin.ttf",
+        TILEFINCH_TEST_ROOT "/fonts/DejaVuSerif-Latin.ttf",
+        TILEFINCH_TEST_ROOT "/fonts/DejaVuSans-Oblique-Latin.ttf",
+        TILEFINCH_TEST_ROOT "/fonts/DejaVuSans-Bold-Latin.ttf",
+        TILEFINCH_TEST_ROOT "/fonts/DejaVuSerif-Bold-Latin.ttf",
+        TILEFINCH_TEST_ROOT "/fonts/TilefinchSans-Regular.ttf",
+        TILEFINCH_TEST_ROOT "/fonts/TilefinchSans-Bold.ttf", 2u * 1024u * 1024u));
+    TilefinchGlyphProvider *provider = tilefinch_glyph_provider_create(&budget);
+    CHECK(provider && tilefinch_glyph_provider_attach(provider, pack, "glyph-ui-low-test")
+        && font_optional_glyph_provider_install(provider));
+    psp_ui_set_chrome_fonts(font_set_face(&fonts, FONT_SANS),
+        font_set_face_variant(&fonts, FONT_SANS, false, true), 1);
+    static const struct { int y, scale; } edge[] = {{257, 2}, {259, 1}, {271, 2}, {271, 1}};
+    for (size_t at = 0; at < sizeof(edge) / sizeof(edge[0]); at++) {
+        CHECK(draw_settled_run(provider, edge[at].y, "X \xe0\xa4\x95", edge[at].scale));
+        CHECK(!runs[0].missing_glyph && runs[0].bottom <= HEIGHT);
+        /* The cell's last row is solid, so it proves the descent was painted. */
+        CHECK(runs[0].bottom == HEIGHT && row_has_ink(HEIGHT - 1, runs[0].right - 8, runs[0].right));
+    }
+    /* The settings heading stays above the hint row under it. */
+    for (unsigned pass = 0; pass < 64; pass++) {
+        run_count = 0; run_overflow = false;
+        draw_ui_settings_heading(storage, WIDTH, HEIGHT, STRIDE,
+            (UiRect) {58, 10, WIDTH - 116, 252}, "\xe0\xa4\x95", 0xffff, 0xffff);
+        bool changed = false;
+        size_t read = 0;
+        CHECK(tilefinch_glyph_provider_pump(provider, 65536, &changed, &read));
+        if (!read) break;
+    }
+    CHECK(run_count == 3);
+    for (size_t at = 0; at < run_count; at++) CHECK(runs[at].bottom <= 10 + 31);
+    /* Away from the edge a run stays exactly where it was asked to be. */
+    CHECK(draw_settled_run(provider, 100, "X \xe0\xa4\x95", 2));
+    CHECK(runs[0].bottom == 100 + 13 + 5);
+    /* The built-in face never moves: same ink at the edge as mid-screen. */
+    uint16_t expected[20][120];
+    CHECK(draw_settled_run(provider, 100, "X Page", 2));
+    int bottom = runs[0].bottom - 100;
+    for (int row = 0; row < 20; row++)
+        memcpy(expected[row], &storage[(100 + row) * STRIDE], sizeof(expected[row]));
+    int edge_y = HEIGHT - bottom;
+    CHECK(draw_settled_run(provider, edge_y, "X Page", 2));
+    CHECK(runs[0].bottom == HEIGHT);
+    for (int row = 0; row < 20 && edge_y + row < HEIGHT; row++)
+        CHECK(!memcmp(expected[row], &storage[(edge_y + row) * STRIDE], sizeof(expected[row])));
+    CHECK(font_optional_glyph_provider_uninstall(provider));
+    tilefinch_glyph_provider_destroy(provider);
+    psp_ui_clear_chrome_font();
+    font_set_destroy(&fonts);
+    CHECK(unlink(pack) == 0 && budget.current == 0);
+    return true;
+}
+
 static bool test_all_languages(void)
 {
     char path[64], bengali_path[64] = {0};
     CHECK(make_metric_pack(path, false));
+    const char *real_bengali_pack = real_pack_path("glyph-bengali-assamese");
     if (!real_bengali_pack) CHECK(make_metric_pack(bengali_path, true));
     Budget budget;
     budget_init(&budget, 8u * 1024u * 1024u);
     TilefinchGlyphProvider *provider = tilefinch_glyph_provider_create(&budget);
     CHECK(provider);
-    if (real_hindi_pack)
-        CHECK(tilefinch_glyph_provider_attach(provider, real_hindi_pack, "glyph-devanagari"));
-    if (real_arabic_pack)
-        CHECK(tilefinch_glyph_provider_attach(provider, real_arabic_pack, "glyph-arabic"));
-    CHECK(tilefinch_glyph_provider_attach(provider,
-        real_bengali_pack ? real_bengali_pack : bengali_path,
-        real_bengali_pack ? "glyph-bengali-assamese" : "glyph-ui-bn-test"));
+    for (size_t at = 0; at < real_pack_count; at++)
+        CHECK(tilefinch_glyph_provider_attach(provider, real_packs[at].path, real_packs[at].id));
+    if (!real_bengali_pack)
+        CHECK(tilefinch_glyph_provider_attach(provider, bengali_path, "glyph-ui-bn-test"));
     CHECK(tilefinch_glyph_provider_attach(provider, path, "glyph-ui-test")
         && font_optional_glyph_provider_install(provider));
     unsigned cluster_key = 0;
@@ -1946,7 +2908,7 @@ static bool test_all_languages(void)
         TILEFINCH_TEST_ROOT "/fonts/TilefinchSans-Regular.ttf",
         TILEFINCH_TEST_ROOT "/fonts/TilefinchSans-Bold.ttf", 2u * 1024u * 1024u));
     CHECK(font_optional_glyph_provider_uninstall(provider));
-    CHECK(test_real_bengali_coverage(&budget, &fonts));
+    CHECK(test_real_pack_coverage(&budget, &fonts));
     CHECK(font_optional_glyph_provider_install(provider));
     psp_ui_set_chrome_fonts(font_set_face(&fonts, FONT_SANS),
         font_set_face_variant(&fonts, FONT_SANS, false, true), 1);
@@ -1989,7 +2951,10 @@ static bool test_all_languages(void)
             ui.chrome_theme = theme ? BROWSER_CHROME_THEME_LIGHT : BROWSER_CHROME_THEME_FINCH;
             ui.ui_language = language;
             CHECK(test_player_language(&ui, provider));
+            CHECK(test_audio_player_language(
+                &ui, provider, theme ? "light" : "dark"));
             CHECK(test_download_language(&ui, provider));
+            CHECK(test_page_dialog_language(&ui, provider));
             if (theme == 0) CHECK(test_status_toasts(&ui, provider));
             if (theme == 0) CHECK(test_composed_toasts(&ui, provider));
             if (theme == 0) CHECK(test_state_text(&ui, provider));
@@ -2391,11 +3356,25 @@ static bool test_opaque_panel_row_copy(void)
 
 int main(int argc, char **argv)
 {
+    if (argc == 2 && !strcmp(argv[1], "--page-text-collision-only"))
+        return test_page_text_cache_collision() ? 0 : 1;
+    if (argc == 2 && !strcmp(argv[1], "--page-text-pending-only"))
+        return test_page_text_cache_pending() ? 0 : 1;
     if (argc > 1) capture_directory = argv[1];
-    if (argc > 2 && argv[2][0]) real_hindi_pack = argv[2];
-    if (argc > 3 && argv[3][0]) real_arabic_pack = argv[3];
-    if (argc > 4 && argv[4][0]) real_bengali_pack = argv[4];
+    for (int at = 2; at < argc; at++) {
+        char *path = strchr(argv[at], '=');
+        if (!path || real_pack_count == sizeof(real_packs) / sizeof(real_packs[0])) {
+            fprintf(stderr, "bad real pack argument: %s\n", argv[at]);
+            return 2;
+        }
+        *path = '\0';
+        real_packs[real_pack_count++] = (RealPack) {argv[at], path + 1};
+    }
     return test_opaque_panel_row_copy() && test_menu_metadata_equivalence()
-        && test_square_button_symbol() && test_chrome_cache_follows_packs()
+        && test_square_button_symbol() && test_page_text_display_order()
+        && test_long_host_keeps_its_end()
+        && test_page_text_cache_collision() && test_page_text_cache_pending()
+        && test_chrome_cache_follows_packs()
+        && test_bottom_row_keeps_pack_descent()
         && test_all_languages() ? 0 : 1;
 }

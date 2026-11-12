@@ -3106,7 +3106,10 @@ static bool media_h264_skip_scaling(MediaH264Bits *bits, unsigned count)
     for (unsigned i = 0; i < count; i++) {
         if (next != 0) {
             int32_t delta = 0;
-            if (!media_h264_se(bits, &delta)) return false;
+            /* delta_scale is -128..127; a larger one is no SPS, and the
+               add below would overflow int. */
+            if (!media_h264_se(bits, &delta) || delta < -128 || delta > 127)
+                return false;
             next = (last + delta + 256) & 255;
         }
         if (next != 0) last = next;
@@ -3940,39 +3943,81 @@ bool media_h264_annexb_to_avcc_in_place(
     return write == length + growth;
 }
 
-bool media_h264_annexb_sample_is_admitted(
+/* The profiles the decoder routes admit at open (see
+   media_h264_annexb_decoder_route). */
+static bool media_h264_profile_routed(uint8_t profile)
+{
+    return profile == 66u || profile == 77u || profile == 100u
+        || profile == 110u || profile == 122u || profile == 244u
+        || profile == 44u || profile == 83u || profile == 86u
+        || profile == 118u || profile == 128u || profile == 138u
+        || profile == 139u || profile == 134u || profile == 135u;
+}
+
+static MediaH264SampleVerdict media_h264_annexb_sample_verdict(
     const unsigned char *payload, size_t length,
-    uint16_t width, uint16_t height)
+    uint16_t width, uint16_t height, bool software_coding)
 {
     if (payload == NULL || length == 0 || width == 0 || height == 0)
-        return false;
+        return MEDIA_H264_SAMPLE_REFUSED;
     size_t prefix = 0;
     size_t start = media_h264_annexb_start(
         payload, length, 0, &prefix);
-    if (start == SIZE_MAX) return false;
+    if (start == SIZE_MAX) return MEDIA_H264_SAMPLE_REFUSED;
     bool saw_nal = false;
+    bool coding_supported = true;
     while (start != SIZE_MAX) {
         size_t nal = start + prefix;
-        if (nal >= length) return false;
+        if (nal >= length) return MEDIA_H264_SAMPLE_REFUSED;
         size_t next_prefix = 0;
         size_t next = media_h264_annexb_start(
             payload, length, nal + 1u, &next_prefix);
         size_t nal_end = next == SIZE_MAX ? length : next;
         if (nal_end <= nal || (payload[nal] & 0x80u) != 0
-            || (payload[nal] & 0x1fu) == 0u) return false;
+            || (payload[nal] & 0x1fu) == 0u)
+            return MEDIA_H264_SAMPLE_REFUSED;
         if ((payload[nal] & 0x1fu) == 7u) {
             uint16_t sample_width = 0, sample_height = 0;
             if (!media_h264_sps_dimensions(
                     payload + nal, nal_end - nal,
                     &sample_width, &sample_height)
                 || sample_width != width || sample_height != height)
-                return false;
+                return MEDIA_H264_SAMPLE_REFUSED;
+            /* The open-time rule, for every SPS the stream carries: a
+               readable SPS (the dimensions above parsed) with any other
+               profile or coding is a switch the decoder was never
+               qualified for. */
+            if (software_coding
+                && (!media_h264_profile_routed(payload[nal + 1u])
+                    || media_h264_sps_software_coding(
+                           payload + nal, nal_end - nal)
+                       != MEDIA_H264_SOFTWARE_CODING_SUPPORTED))
+                coding_supported = false;
         }
         saw_nal = true;
         start = next;
         prefix = next_prefix;
     }
-    return saw_nal;
+    if (!saw_nal) return MEDIA_H264_SAMPLE_REFUSED;
+    return coding_supported
+        ? MEDIA_H264_SAMPLE_ADMITTED : MEDIA_H264_SAMPLE_CODING_UNSUPPORTED;
+}
+
+bool media_h264_annexb_sample_is_admitted(
+    const unsigned char *payload, size_t length,
+    uint16_t width, uint16_t height)
+{
+    return media_h264_annexb_sample_verdict(
+               payload, length, width, height, false)
+        == MEDIA_H264_SAMPLE_ADMITTED;
+}
+
+MediaH264SampleVerdict media_h264_annexb_software_sample_verdict(
+    const unsigned char *payload, size_t length,
+    uint16_t width, uint16_t height)
+{
+    return media_h264_annexb_sample_verdict(
+        payload, length, width, height, true);
 }
 
 bool media_h264_annexb_sample_matches_config(

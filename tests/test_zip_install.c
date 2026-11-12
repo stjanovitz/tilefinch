@@ -3,6 +3,8 @@
 #include "tilefinch/platform.h"
 #include "tilefinch/psp_offline_store.h"
 
+#include "supervisor_view_probe.h"
+
 #include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -187,7 +189,19 @@ static bool native_journey(const char *root, const char *archive, const char *ga
                  "https://tilefinch.local/offline/homebrew?page=2"));
     CHECK(psp_offline_store_handle_url(&store, engine, NULL, url, NULL, true) == PSP_OFFLINE_ROUTE_ZIP_PREVIEW);
     CHECK(store.zip_install && !strcmp(zip_install_preview(store.zip_install)->name, "Test"));
+    /* The sheet is up while a load is pending, and the navigation pump
+       begins the supervisor again over it. Cancel frees the preview: the
+       supervisor's copy must let go of it first. */
+    PspUiState live; psp_ui_init(&live);
+    const ZipInstallPreview *sheet = zip_install_preview(store.zip_install);
+    psp_ui_show_zip_install(&live, sheet);
+    view_probe_begin(&store, &live);
+    CHECK(view_probe.copy.screen == PSP_UI_SCREEN_ZIP_INSTALL);
     psp_offline_store_discard_zip(&store); CHECK(!store.zip_install);
+    CHECK(view_probe_present(sheet) && view_probe.releases == 1u
+          && view_probe.dropped == 1u
+          && view_probe.copy.screen == PSP_UI_SCREEN_PAGE);
+    view_probe_end(&store);
     CHECK(psp_offline_store_handle_url(&store, engine, NULL, url, NULL, true) == PSP_OFFLINE_ROUTE_ZIP_PREVIEW);
     TilefinchPlatformServices services = {.cooperate = cancel_install_checkpoint,
         .monotonic_time_us = frozen_clock};

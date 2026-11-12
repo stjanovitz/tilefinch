@@ -738,7 +738,13 @@ GeneratedPseudoFlow generated_pseudo_flow(
     }
     int content_height = style_content_height(context->sheet, &style, width,
                                               containing_height);
-    if (content_height <= 0 && style.line_height != STYLE_LINE_HEIGHT_ZERO
+    /* Only an auto height grows to its line: the bold-width reservation
+       idiom (content: attr(...); height: 0; overflow: hidden) takes no
+       room. */
+    bool definite_height = style.has_height
+        && (!style.height_percent || containing_height > 0);
+    if (content_height <= 0 && !definite_height
+        && style.line_height != STYLE_LINE_HEIGHT_ZERO
         && generated_text_forms_line(&style)) {
         const FontFace *face = font_context_face_at_weight(
             context->fonts, context->web_fonts, style.font_family,
@@ -1833,6 +1839,15 @@ bool layout_add_link(LayoutDocument *layout, const DrawCommand *command,
         if (links == NULL) return false;
         layout->links = links;
         layout->link_capacity = capacity;
+        if (layout_run_bounds_grow(layout->budget,
+                                   &layout->link_command_bounds, capacity)) {
+            for (size_t i = 0; i < layout->link_count; i++)
+                if ((links[i].url_length
+                     & LAYOUT_LINK_TRANSIENT_COMMAND) != 0)
+                    layout_run_bounds_raise(
+                        &layout->link_command_bounds, i,
+                        (uint32_t) (-(int64_t) links[i].z_index - 1));
+        }
     }
     int transient_command = command->z_index;
     uint32_t retained_url_length = (uint32_t) url_length;
@@ -1844,6 +1859,9 @@ bool layout_add_link(LayoutDocument *layout, const DrawCommand *command,
          */
         transient_command = -(int) (command_index + 1u);
         retained_url_length |= LAYOUT_LINK_TRANSIENT_COMMAND;
+        layout_run_bounds_raise(&layout->link_command_bounds,
+                                layout->link_count,
+                                (uint32_t) command_index);
     }
     layout->links[layout->link_count++] = (LinkRegion) {
         .url = url, .node = node, .x = command->x, .y = command->y,
@@ -2610,14 +2628,15 @@ void layout_flush_line(LineState *line)
                  i < line->layout->count; i++) {
                 DrawCommand *command = &line->layout->commands[i];
                 if (command->type == DRAW_TEXT) {
+                    int old_x_fixed = draw_command_text_x_fixed(command);
                     int mirrored = layout_fixed_add(
                         start_fixed,
                         layout_fixed_subtract(
                             layout_fixed_subtract(
-                                content_right_fixed,
-                                draw_command_text_x_fixed(command)),
+                                content_right_fixed, old_x_fixed),
                             layout_fixed_from_integer(command->width)));
                     draw_command_set_text_x_fixed(command, mirrored);
+                    layout_bidi_rebase_command(line->layout, i, old_x_fixed);
                 } else {
                     command->x = layout_add_coordinate(
                         line->start_x,
@@ -5108,8 +5127,10 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
                 /* The line moves the whole control to its baseline. */
                 .radius = line->atomics != NULL ? LAYOUT_TEXT_BASELINE_ALIGNED : 0
             };
+            size_t text_start = context->layout->count;
             if (layout_control_text_style(context, node, &style, placeholder_value, &text)
                 && layout_add_command(context->layout, text) == NULL) return false;
+            layout_bidi_control_text(context, node, &style, text_start);
         }
         if (!authored_decoration && !layout_inline_paint_borders(
                 context->layout, &style, outer_x, outer_y,
@@ -5696,15 +5717,16 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
              i < context->layout->count; i++) {
             DrawCommand *command = &context->layout->commands[i];
             if (command->type == DRAW_TEXT) {
+                int old_x_fixed = draw_command_text_x_fixed(command);
                 draw_command_set_text_x_fixed(
                     command,
                     layout_fixed_add(
                         left_fixed,
                         layout_fixed_subtract(
-                            layout_fixed_subtract(
-                                right_fixed,
-                                draw_command_text_x_fixed(command)),
+                            layout_fixed_subtract(right_fixed, old_x_fixed),
                             layout_fixed_from_integer(command->width))));
+                layout_bidi_rebase_command(
+                    context->layout, i, old_x_fixed);
             } else {
                 command->x = layout_add_coordinate(
                     control_x,

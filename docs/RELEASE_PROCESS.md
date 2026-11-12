@@ -291,9 +291,10 @@ directory. Translation sources, generation and layout tests remain
 in the browser repository. This data publication does not require a browser
 binary release.
 
-Build each pack with that repository's `tools/build_glyph_pack.py`, then use
-the exact main-repository revision being released to create its manifest and
-envelope:
+Build each pack with that repository's `tools/build_glyph_pack.py`, using the
+metric form ([Glyph components](TEXT_BIDI.md#glyph-components)) for an alphabet
+rather than fitted cells, then use the exact main-repository revision being
+released to create its manifest and envelope:
 
 ```sh
 python3 tools/tilefinch_update_tool.py manifest --glyph-component \
@@ -387,6 +388,31 @@ requests, and has deterministic `drop-package-once`, `truncate-package`, and
 `corrupt-metadata` modes for fault work. Its TLS/range/allowlist/fault
 contracts are covered by `tilefinch-local-update-server-tests`; destructive
 installer power-loss sweeps remain in the pure host updater tests.
+
+## Recorded update route on a PSP
+
+A PSP whose Wi-Fi does not work can still run the shipping update session,
+client, signature and hash checks, installer and journal: the browser runs
+from `host0:` in PSPLink memory mode and replays the signed metadata and
+package from a response-keyed trace. `scripts/make-update-replay.py` writes
+that trace from a TFUM and TFUP, plus `update-route.cfg`, which names a
+separate test install on the Memory Stick (never `ms0:/PSP/GAME/TILEFINCH`;
+format in `src/psp_update_route.h`). Only the update session uses that
+install's paths; the rest of the run stays on `host0:`. The boot file sets
+`trace=`, `trace_keyed=1`, `validation_update_auto=1` and
+`validation_update_url=` to the trace's metadata URL. The run logs
+`tilefinch-update-route:` lines: the journal before and after, each client and
+installer stage, and the install's files. With `journal_only=1` in the
+sidecar it only reports the journal and files and writes nothing on the
+stick. The trial, health confirmation, L-held safe start and recovery then
+run from the XMB, through the test install's own launcher.
+
+Keys, builds and signatures are throwaway, as in the PPSSPP qualification:
+both the installed build and the candidate embed a throwaway root with
+`TILEFINCH_UPDATE_ROOT_V1`, so nothing here can touch the release keys and a
+package signed for the route installs only into an install built for it.
+`tests/test_update_replay_route.py` runs the trace maker, replay, client and
+installer on the host against a temporary A/B install.
 
 ## Optional device investigations
 

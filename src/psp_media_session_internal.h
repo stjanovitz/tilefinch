@@ -53,6 +53,9 @@ void psp_media_request_user_retry(PspMediaSession *media);
 void psp_media_request_track_reopen(PspMediaSession *media);
 void psp_media_clear_resolved_stream(PspMediaSession *media);
 bool psp_media_prepare_open_network(PspMediaSession *media, bool begin);
+/* Marks the failed-open panel as the unencrypted-audio question or its
+   remembered no (SECURITY_MODEL.md, "Unencrypted audio"). */
+void psp_media_present_insecure_audio(PspMediaSession *media);
 void psp_media_job_failed(
     PspMediaSession *media, const char *operation, const char *error);
 void psp_media_report_failure_snapshot(
@@ -86,6 +89,11 @@ bool psp_media_request_seek_with_resume(
     bool resume_playing);
 void psp_media_interrupt_decode(PspMediaSession *media);
 bool psp_media_machine_wants_playing(const PspMediaSession *media);
+/* The title an open or recovery shows: `video_title` for video; audio-only
+   media keeps the name of what it plays ("Opening audio" before it has
+   one). */
+const char *psp_media_resolving_title(const PspMediaSession *media,
+                                      const char *video_title);
 void psp_media_session_dispatch_event(
     PspMediaSession *media, PspMediaEvent event, const char *checkpoint);
 void psp_media_buffering_end(PspMediaSession *media, uint64_t now_us);
@@ -99,6 +107,13 @@ void psp_media_present_emit_after_release(PspMediaSession *media);
 
 /* Shared with the host scrub regression: preview admission must synchronize
    the retained decoder as well as the UI's bounded target marker. */
+/* What the title bar shows for the stream's title. */
+static inline const char *psp_media_shown_title(PspMediaSession *media)
+{
+    return psp_ui_media_shown_title(&media->ui, media->budget,
+                                    media->stream.title);
+}
+
 static inline void psp_media_begin_preview(
     PspMediaSession *media, uint64_t target_us, bool resume_playing)
 {

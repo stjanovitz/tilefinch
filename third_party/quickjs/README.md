@@ -24,7 +24,10 @@ refusal), `79f58c104c` (truncated BigInt limb release), `5febaaa49f`
 (inherited-property write releases its value when lazy initialization is
 refused), `ef5c6e356c` (signed BigInt decrement on 64-bit limbs),
 `e8b69194b3` (bound captured-variable indices and propagate compiler failures),
-and `c530305c0f` (balance symbol coercion when a property key is a built-in atom).
+`c530305c0f` (balance symbol coercion when a property key is a built-in atom),
+and `813636e7af` (retire external ArrayBuffer cleanup ownership after detach
+or transfer). Transfers also preserve borrowed buffers with a NULL callback;
+`tilefinch-quickjs-array-buffer-owner-tests` covers release order and refusal.
 The allocation-safety layer carries the applicable ownership part of
 `094306131a` (`Promise.withResolvers` cleanup), transactional array appends
 from `b25da59246` adapted to compact storage, and the proxy-key length guard
@@ -82,7 +85,8 @@ pinned baseline fingerprint, which already contains them.
 | `gc-hook` | baseline | `JS_SetGCHook` brackets every collection except the final one. | — |
 | `gc-pacing-hook` | baseline | `JS_SetGCPacingHook`, `JS_GetGCThreshold` and `JS_GetGCCause` let the embedder choose where collection re-arms. | — |
 | `lazy-compile-hook` | baseline | `JS_SetLazyCompileHook` brackets every first-call compile of a lazy body. | — |
-| `weakref-deref` | baseline | `JS_WeakRefDeref` reads a WeakRef's target from C. | — |
+| `weak-targets` | baseline | `JS_NewWeakTarget`, `JS_WeakTargetDeref` and `JS_FreeWeakTarget`: a weak reference the embedder stores without a WeakRef object (the DOM handle table). | `tilefinch-js-responsiveness-tests` |
+| `weak-target-state` | baseline | `JS_WeakTargetCarriesState`: whether another weak holder or an own property outside the embedder's list makes a weak target's death visible to script, without allocating (the DOM handle table's collection hold). | `tilefinch-js-responsiveness-tests --stateful-wrappers-only` |
 | `work-counters` | baseline | `JS_GetWorkCounters`: interrupt budget, collections and lazy-compile totals; opt-in builds add entry and opcode counts. | `tilefinch-quickjs-native-call-tests` |
 | `opcode-histogram` | baseline | `JS_GetOpcodeCounts` in a `CONFIG_TILEFINCH_OP_COUNTS` engine; the default build returns none. | — |
 | `execution-census` | baseline | `CONFIG_TILEFINCH_EXECUTION_CENSUS` (host and validation builds) tags opcodes, helpers and natives for a sampling thread; ordinary PSP builds omit it. | — |

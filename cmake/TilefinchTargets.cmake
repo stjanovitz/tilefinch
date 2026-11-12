@@ -173,6 +173,10 @@ if(PSP AND TILEFINCH_PSP_VALIDATION_LOG)
     target_compile_definitions(tilefinch_psp_ui PRIVATE
         TILEFINCH_PSP_POWER_TEST_MENU=1
         TILEFINCH_PSP_UI_TIMING=1)
+    # The glyph session's lazy-attach and lazy-miss lines; without this the
+    # device log cannot tell a missing pack from an attach never attempted.
+    target_compile_definitions(tilefinch_psp_app_support PRIVATE
+        TILEFINCH_PSP_VALIDATION_LOG=1)
 endif()
 if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(tilefinch_psp_ui PRIVATE
@@ -437,6 +441,7 @@ if(PSP)
             src/psp_app/psp_app_heavy.c
             src/psp_app/psp_app_network.c
             src/psp_app/psp_app_page.c
+            src/psp_app/psp_app_page_dialog.c
             src/psp_app/psp_app_runtime.c
             src/psp_canvas_ge.c
             src/psp_app/psp_app_surfaces.c
@@ -463,7 +468,8 @@ if(PSP)
             src/psp_text_input.c
             src/psp_atomic_shims.c)
         if(TILEFINCH_PSP_VALIDATION_LOG AND NOT PSP_BROWSER_CURL_STUB)
-            target_sources(psp-browser-script PRIVATE src/psp_update_e2e.c)
+            target_sources(psp-browser-script PRIVATE
+                src/psp_update_e2e.c src/psp_update_route.c)
             target_sources(psp-browser-script PRIVATE src/psp_transport_probe.c)
             set(_transport_probe_link_options)
             foreach(_symbol curl_multi_perform curl_multi_poll curlx_nonblock gethostbyname connect select recv send
@@ -606,6 +612,9 @@ if(PSP)
                 src/psp_app/psp_app_validation_cadence.c
                 src/psp_app/psp_app_validation_loop.c
                 src/psp_app/psp_app_validation_present.c
+                src/psp_app/psp_app_validation_glyph.c
+                src/psp_app/psp_app_validation_entropy.c
+                src/psp_entropy_capture.c
                 src/js_bench.c
                 src/psp_media_fixture.c
                 src/psp_media_range_probe.c
@@ -703,15 +712,18 @@ if(PSP)
         # PSP .text ratchets; history is in git. Raising either limit
         # needs a re-measurement and a device-cost justification (AGENTS.md).
         if(TILEFINCH_PSP_VALIDATION_LOG)
-            # Validation-only: 5,520,000 bytes, user-approved 2026-11-07;
-            # last recorded 5,513,384 bytes (2026-11-07).
-            set(TILEFINCH_PSP_TEXT_LIMIT 5520000)
+            # Validation-only: 5,900,000 bytes, user-approved 2026-11-08 so
+            # the merged branches can still be tested on a PSP; validation
+            # logging adds about 370 KB to the shipping build, and this branch
+            # measured 5,544,952 bytes. Previously 5,556,000 (2026-11-07).
+            set(TILEFINCH_PSP_TEXT_LIMIT 5900000)
         else()
-            # Ordinary: 5,216,512 bytes, user-approved 2026-10-28 (+100 KiB
-            # so the QuickJS PGO build fits: 5,129,680 bytes with PGO and
-            # 5,087,376 without at 27b7f9ab). Previous limit 5,114,112
-            # (2026-10-15).
-            set(TILEFINCH_PSP_TEXT_LIMIT 5216512)
+            # Ordinary: 5,500,000 bytes, user-approved 2026-11-08 so the
+            # page-audio, dialog, image and language-pack branches and their
+            # PGO build fit together; a no-PGO build of the image branch
+            # measured 5,174,232 bytes, and its PGO difference was recorded
+            # as +42,304. Previous limit 5,216,512 (2026-10-28).
+            set(TILEFINCH_PSP_TEXT_LIMIT 5500000)
         endif()
         # Local size experiments only (an engine built at -O2 under PPSSPP,
         # for instance): a build directory that sets this is over the
@@ -778,7 +790,11 @@ if(PSP)
                 # the separately-ratcheted resident loop. Its limit is a
                 # growth tripwire, not an I-cache claim. Validation retains
                 # extra room for its boot qualifications and log setup.
-                -DPSP_MAIN_LIMIT=$<IF:$<BOOL:${TILEFINCH_PSP_VALIDATION_LOG}>,11264,6144>
+                # Validation 11,392 (2026-11-07, was 11,264): main keeps the
+                # process on a ~136 KiB stack frame, and the audio listening
+                # view's session text moved later fields' stack offsets: main
+                # grew 28 bytes to 11,292 with no boot work added.
+                -DPSP_MAIN_LIMIT=$<IF:$<BOOL:${TILEFINCH_PSP_VALIDATION_LOG}>,11392,6144>
                 -DPSP_VALIDATION_LOG=$<BOOL:${TILEFINCH_PSP_VALIDATION_LOG}>
                 -DPSP_NO_SCRIPT_SAMPLER=$<AND:$<BOOL:${PSP_BROWSER_DISABLE_TRACE}>,$<NOT:$<BOOL:${TILEFINCH_PSP_VALIDATION_LOG}>>>
                 -DPSP_NO_FETCH_TRACE=$<NOT:$<BOOL:${PSP_BROWSER_ENABLE_FETCH_TRACE}>>
@@ -1066,7 +1082,7 @@ if(PSP)
                 COMMAND ${CMAKE_COMMAND}
                     -DPSP_NM=${CMAKE_NM}
                     -DPSP_ELF=$<TARGET_FILE:psp-browser-script-dev-prx>
-                    -DPSP_MAIN_LIMIT=$<IF:$<BOOL:${TILEFINCH_PSP_VALIDATION_LOG}>,11264,6144>
+                    -DPSP_MAIN_LIMIT=$<IF:$<BOOL:${TILEFINCH_PSP_VALIDATION_LOG}>,11392,6144>
                     -DPSP_VALIDATION_LOG=$<BOOL:${TILEFINCH_PSP_VALIDATION_LOG}>
                     -DPSP_NO_SCRIPT_SAMPLER=$<AND:$<BOOL:${PSP_BROWSER_DISABLE_TRACE}>,$<NOT:$<BOOL:${TILEFINCH_PSP_VALIDATION_LOG}>>>
                     -DPSP_NO_FETCH_TRACE=$<NOT:$<BOOL:${PSP_BROWSER_ENABLE_FETCH_TRACE}>>

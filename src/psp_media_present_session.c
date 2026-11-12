@@ -356,6 +356,7 @@ void psp_media_present_texture_finish(PspMediaSession *media)
          * owed a release when the transfer is finally observed to finish.
          */
         media->present_stage_identity = 0;
+        media->dma_quarantine_owned = true;
         if (media->frame.slot >= 0) {
             media_playback_quarantine_video_slot(
                 media->playback, (unsigned) media->frame.slot);
@@ -509,12 +510,13 @@ void psp_media_present_texture_release(PspMediaSession *media)
  * slot READING at that generation, so the release is the same one the join
  * would have made had it landed, merely late.
  *
- * The second way out has no safe continuation. A controller that has not
- * finished a quarter-megabyte transfer in two seconds is not going to, and
- * every frame spent waiting is a frame with one slot fewer and a picture on
- * the panel that cannot be replaced. End the session through the same surface
- * every other unrecoverable media failure uses, and let the retry ladder
- * rebuild the whole stack -- worker included.
+ * The second way out has no safe continuation for the session that posted
+ * the copy. A controller that has not finished a quarter-megabyte transfer in
+ * two seconds is not going to, and every frame spent waiting is a frame with
+ * one slot fewer and a picture on the panel that cannot be replaced. End that
+ * session, once, through the same surface every other unrecoverable media
+ * failure uses. The presenter then keeps only the staging buffer refused, so
+ * Retry and later sessions play, drawing unstaged, instead of failing again.
  *
  * Returns true when it ended the session, which ends the caller's frame.
  */

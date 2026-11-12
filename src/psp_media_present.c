@@ -503,6 +503,45 @@ size_t psp_media_present_stage_bytes(int texture_width, int rows)
     return (size_t) texture_width * (size_t) rows * 4u;
 }
 
+PspMediaDmaQuarantineStep psp_media_present_dma_quarantine_step(
+    PspMediaDmaQuarantineState *state, bool completion_seen,
+    uint32_t held_us, uint32_t deadline_us)
+{
+    if (state == NULL) return PSP_MEDIA_DMA_QUARANTINE_STEP_IDLE;
+    switch (*state) {
+    case PSP_MEDIA_DMA_QUARANTINE_LIVE:
+        if (completion_seen) {
+            *state = PSP_MEDIA_DMA_QUARANTINE_CLEAR;
+            return PSP_MEDIA_DMA_QUARANTINE_STEP_COMPLETED;
+        }
+        if (held_us < deadline_us) return PSP_MEDIA_DMA_QUARANTINE_STEP_WAITING;
+        /* Once: an expiry that stayed LIVE re-raised the failure panel on
+           every later frame of every later session (MB-02). */
+        *state = PSP_MEDIA_DMA_QUARANTINE_ABANDONED;
+        return PSP_MEDIA_DMA_QUARANTINE_STEP_EXPIRED;
+    case PSP_MEDIA_DMA_QUARANTINE_ABANDONED:
+        /* Seen to end at last: the staging buffer is safe again. Its slot
+           was given up at expiry, so nothing is owed. */
+        if (completion_seen) *state = PSP_MEDIA_DMA_QUARANTINE_CLEAR;
+        return PSP_MEDIA_DMA_QUARANTINE_STEP_IDLE;
+    case PSP_MEDIA_DMA_QUARANTINE_CLEAR:
+    default:
+        return PSP_MEDIA_DMA_QUARANTINE_STEP_IDLE;
+    }
+}
+
+bool psp_media_present_dma_quarantine_refuses_slot(
+    PspMediaDmaQuarantineState state)
+{
+    return state == PSP_MEDIA_DMA_QUARANTINE_LIVE;
+}
+
+bool psp_media_present_dma_quarantine_refuses_staging(
+    PspMediaDmaQuarantineState state)
+{
+    return state != PSP_MEDIA_DMA_QUARANTINE_CLEAR;
+}
+
 bool psp_media_present_stage_fits(
     const PspMediaPresentPlan *plan, int source_height, size_t capacity)
 {

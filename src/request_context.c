@@ -24,6 +24,7 @@ static bool request_destination_valid(TilefinchRequestDestination destination)
         case TILEFINCH_DESTINATION_FONT:
         case TILEFINCH_DESTINATION_MEDIA:
         case TILEFINCH_DESTINATION_WORKER:
+        case TILEFINCH_DESTINATION_AUDIO:
             return true;
     }
     return false;
@@ -120,12 +121,26 @@ bool tilefinch_request_context_analyze(
             && tilefinch_url_site_key(
                    context->target_url, target_site, sizeof(target_site))
             && strcmp(top_site, target_site) == 0;
+        /* A cross-site document under this top level (a frame) has a null
+           site for cookies: its requests to the top-level site are
+           cross-site for SameSite, whatever the top level is. Top-level
+           navigations keep their own rule. */
+        facts->cookie_same_site = facts->same_site;
+        if (facts->cookie_same_site && !context->top_level_navigation
+            && context->initiator_url != NULL
+            && top_url != context->initiator_url) {
+            char initiator_site[TILEFINCH_ORIGIN_SERIALIZED_LIMIT];
+            facts->cookie_same_site = tilefinch_url_site_key(
+                    context->initiator_url, initiator_site,
+                    sizeof(initiator_site))
+                && strcmp(initiator_site, top_site) == 0;
+        }
     }
     facts->sends_credentials =
         context->credentials != TILEFINCH_CREDENTIALS_OMIT
         && (context->credentials == TILEFINCH_CREDENTIALS_INCLUDE
             || context->initiator_url == NULL || facts->same_origin);
-    facts->allows_lax_cookie = facts->same_site
+    facts->allows_lax_cookie = facts->cookie_same_site
         || (context->top_level_navigation && facts->safe_method);
     facts->site = context->initiator_url == NULL
         ? TILEFINCH_REQUEST_SITE_NONE
@@ -222,6 +237,7 @@ const char *tilefinch_request_fetch_destination(
         case TILEFINCH_DESTINATION_FETCH: return "empty";
         case TILEFINCH_DESTINATION_FONT: return "font";
         case TILEFINCH_DESTINATION_MEDIA: return "video";
+        case TILEFINCH_DESTINATION_AUDIO: return "audio";
         case TILEFINCH_DESTINATION_WORKER: return "worker";
         case TILEFINCH_DESTINATION_OTHER: return "empty";
     }

@@ -243,9 +243,9 @@ console.log(JSON.stringify({engine:check(engine.Intl.NumberFormat),replay:check(
         self.assertEqual(value['engine'],value['replay'])
         self.assertEqual([r['parts'] for r in value['engine'][:4]],value['decimal'])
         self.assertEqual(value['engine'][4]['parts'],[
-            {'type':'integer','value':'12'},{'type':'decimal','value':'.'},
-            {'type':'fraction','value':'5'},{'type':'percentSign','value':'%'}])
-        self.assertEqual(value['engine'][5]['parts'][0],{'type':'currency','value':'USD'})
+            {'type':'integer','value':'13'},{'type':'percentSign','value':'%'}])
+        self.assertEqual(value['engine'][5]['parts'][:2],[
+            {'type':'minusSign','value':'-'},{'type':'currency','value':'$'}])
         self.assertEqual(value['engine'][6]['parts'],[{'type':'nan','value':'NaN'}])
         for row in value['engine']:
             self.assertEqual(row['joined'],row['formatted'])
@@ -1767,7 +1767,7 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(state["time"], "10 PM")
         self.assertEqual(
             (state["number"], state["percent"], state["currency"]),
-            ("1,234.5", "25%", "USD 1,234.5"),
+            ("1,234.5", "25%", "$1,234.50"),
         )
         self.assertEqual(state["plurals"], ["one", "other", "two"])
         self.assertEqual(state["locale"], "en-US")

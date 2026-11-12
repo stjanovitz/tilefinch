@@ -33,6 +33,10 @@ typedef enum {
 
 typedef struct TextBidiParagraph TextBidiParagraph;
 
+/* shaped_codepoint of a unit whose letter a ligature has absorbed: a word
+   joiner, which every text path already draws as nothing at zero width. */
+#define TEXT_BIDI_NO_GLYPH 0x2060u
+
 typedef struct {
     uint32_t codepoint;
     uint32_t shaped_codepoint;
@@ -62,5 +66,14 @@ const TextBidiUnit *text_bidi_paragraph_units(
 bool text_bidi_line_visual_order(
     TextBidiParagraph *paragraph, size_t line_start, size_t line_count,
     uint16_t *visual_to_logical, size_t capacity, size_t *run_count);
+
+/* Appends a line to output at *used, as UTF-8 in display order and shaped, for
+   a painter that draws left to right and cannot shape. A line feed and a letter
+   absorbed by a ligature write nothing. At most TEXT_BIDI_LINE_UNIT_LIMIT units;
+   false if the line is longer or does not fit, with the terminator not written. */
+#define TEXT_BIDI_LINE_UNIT_LIMIT 256u
+bool text_bidi_line_append_utf8(
+    TextBidiParagraph *paragraph, size_t line_start, size_t line_count,
+    char *output, size_t capacity, size_t *used);
 
 #endif

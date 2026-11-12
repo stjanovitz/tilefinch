@@ -131,4 +131,18 @@ bool frame_pumps_policy_valid(const char **defect);
 bool frame_paint_progress_due(uint64_t now, uint64_t last,
                               bool scrolled, bool progressed);
 
+/* A navigation arrives and is processed in small ready units (a 16 KiB
+   body delivery, a 2 ms parser or finalize quota, a provider's scan, decode
+   or emit step), and one unit per loop frame left most of each display
+   interval idle. A frame therefore pumps a navigation again while its last
+   pump made progress (its counter went from `units_before` to a different
+   `units_after`) and the slice the frame began at `started` has time left.
+   The slice stays under one display interval, so the frame still reaches
+   its vblank wait and the lower-priority I/O threads keep the rest of it; a
+   pump that only waited ends the slice at once. A clock that went
+   backwards ends it too. */
+#define FRAME_NAVIGATION_SLICE_US UINT64_C(12000)
+bool frame_navigation_slice_continue(size_t units_before, size_t units_after,
+                                     uint64_t started, uint64_t now);
+
 #endif

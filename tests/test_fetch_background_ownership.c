@@ -154,10 +154,10 @@ static void test_redirect_cookie_overflow_policy(void)
 
 static uint64_t model_claim(
     ModelSlot slots[FETCH_BACKGROUND_REQUEST_LIMIT],
-    bool foreground, bool priority_active)
+    FetchBackgroundLane lane, bool priority_active)
 {
     unsigned limit = fetch_background_admission_slot_limit(
-        foreground, priority_active);
+        lane, priority_active);
     for (unsigned at = 0; at < limit; at++) {
         if (slots[at].state != MODEL_FREE) continue;
         slots[at].generation = fetch_background_generation_next(
@@ -171,10 +171,10 @@ static uint64_t model_claim(
 }
 
 static uint64_t model_claim_owned(
-    ModelSlot slots[FETCH_BACKGROUND_REQUEST_LIMIT], bool foreground,
+    ModelSlot slots[FETCH_BACKGROUND_REQUEST_LIMIT], FetchBackgroundLane lane,
     bool priority_active, ModelOwner owner, uint32_t route_generation)
 {
-    uint64_t id = model_claim(slots, foreground, priority_active);
+    uint64_t id = model_claim(slots, lane, priority_active);
     if (id == 0) return 0;
     unsigned at = fetch_background_request_id_slot(id);
     slots[at].owner = (uint8_t) owner;
@@ -238,14 +238,14 @@ static size_t model_retire_cancelled(
 }
 
 static uint64_t model_claim_eventually(
-    ModelSlot slots[FETCH_BACKGROUND_REQUEST_LIMIT], bool foreground,
+    ModelSlot slots[FETCH_BACKGROUND_REQUEST_LIMIT], FetchBackgroundLane lane,
     bool priority_active, ModelOwner owner, uint32_t route_generation)
 {
     for (unsigned acknowledgement = 0;
          acknowledgement <= FETCH_BACKGROUND_REQUEST_LIMIT;
          acknowledgement++) {
         uint64_t id = model_claim_owned(
-            slots, foreground, priority_active, owner, route_generation);
+            slots, lane, priority_active, owner, route_generation);
         if (id != 0) return id;
         for (unsigned at = 0; at < FETCH_BACKGROUND_REQUEST_LIMIT; at++) {
             if (slots[at].state != MODEL_RUNNING
@@ -262,14 +262,14 @@ static void test_running_cancellation_releases_admission_on_worker_turn(void)
     ModelSlot slots[FETCH_BACKGROUND_REQUEST_LIMIT] = {{0}};
     uint64_t ids[FETCH_BACKGROUND_REQUEST_LIMIT] = {0};
     for (unsigned at = 0; at < FETCH_BACKGROUND_REQUEST_LIMIT; at++) {
-        ids[at] = model_claim(slots, true, false);
+        ids[at] = model_claim(slots, FETCH_BACKGROUND_LANE_BLOCKING, false);
         CHECK(ids[at] != 0);
         slots[at].state = MODEL_RUNNING;
     }
     model_cancel_all(slots);
-    CHECK(model_claim(slots, true, false) == 0);
+    CHECK(model_claim(slots, FETCH_BACKGROUND_LANE_BLOCKING, false) == 0);
     CHECK(model_retire_cancelled(slots) == FETCH_BACKGROUND_REQUEST_LIMIT);
-    CHECK(model_claim(slots, true, false) != 0);
+    CHECK(model_claim(slots, FETCH_BACKGROUND_LANE_MEDIA, false) != 0);
 }
 
 static uint32_t random_next(uint32_t *state)
@@ -283,28 +283,32 @@ static void test_reserved_eventual_admission(void)
     ModelSlot slots[FETCH_BACKGROUND_REQUEST_LIMIT] = {{0}};
     uint64_t normal[FETCH_BACKGROUND_REQUEST_LIMIT] = {0};
     unsigned normal_limit = FETCH_BACKGROUND_REQUEST_LIMIT
+        - FETCH_BACKGROUND_BLOCKING_RESERVED_SLOTS
         - FETCH_BACKGROUND_MEDIA_RESERVED_SLOTS;
     for (unsigned at = 0; at < normal_limit; at++) {
-        normal[at] = model_claim(slots, false, true);
+        normal[at] = model_claim(slots, FETCH_BACKGROUND_LANE_ORDINARY, true);
         CHECK(normal[at] != 0);
     }
-    CHECK(model_claim(slots, false, true) == 0);
-    uint64_t foreground_a = model_claim(slots, true, true);
-    uint64_t foreground_b = model_claim(slots, true, true);
+    CHECK(model_claim(slots, FETCH_BACKGROUND_LANE_ORDINARY, true) == 0);
+    uint64_t foreground_a = model_claim(slots, FETCH_BACKGROUND_LANE_MEDIA, true);
+    uint64_t foreground_b = model_claim(slots, FETCH_BACKGROUND_LANE_MEDIA, true);
     CHECK(foreground_a != 0 && foreground_b != 0);
     CHECK(fetch_background_request_id_slot(foreground_a) >= normal_limit);
     CHECK(fetch_background_request_id_slot(foreground_b) >= normal_limit);
     for (unsigned at = 0; at < normal_limit; at++) model_cancel(slots, normal[at]);
     model_cancel(slots, foreground_a);
     model_cancel(slots, foreground_b);
-    CHECK(model_claim(slots, true, true) != 0);
+    CHECK(model_claim(slots, FETCH_BACKGROUND_LANE_MEDIA, true) != 0);
 }
 
 static void test_priority_release_restores_page_capacity(void)
 {
     ModelSlot slots[FETCH_BACKGROUND_REQUEST_LIMIT] = {{0}};
     unsigned reduced_limit = FETCH_BACKGROUND_REQUEST_LIMIT
+        - FETCH_BACKGROUND_BLOCKING_RESERVED_SLOTS
         - FETCH_BACKGROUND_MEDIA_RESERVED_SLOTS;
+    unsigned page_limit = FETCH_BACKGROUND_REQUEST_LIMIT
+        - FETCH_BACKGROUND_BLOCKING_RESERVED_SLOTS;
 
     /* Repeated player open/close cycles must not progressively reduce the
        page lane. `priority_active=false` models the session releasing its
@@ -312,20 +316,20 @@ static void test_priority_release_restores_page_capacity(void)
     for (unsigned cycle = 0; cycle < 4096u; cycle++) {
         uint64_t requests[FETCH_BACKGROUND_REQUEST_LIMIT] = {0};
         for (unsigned at = 0; at < reduced_limit; at++) {
-            requests[at] = model_claim(slots, false, true);
+            requests[at] = model_claim(slots, FETCH_BACKGROUND_LANE_ORDINARY, true);
             CHECK(requests[at] != 0);
         }
-        CHECK(model_claim(slots, false, true) == 0);
+        CHECK(model_claim(slots, FETCH_BACKGROUND_LANE_ORDINARY, true) == 0);
 
         for (unsigned at = 0; at < reduced_limit; at++)
             model_cancel(slots, requests[at]);
 
-        for (unsigned at = 0; at < FETCH_BACKGROUND_REQUEST_LIMIT; at++) {
-            requests[at] = model_claim(slots, false, false);
+        for (unsigned at = 0; at < page_limit; at++) {
+            requests[at] = model_claim(slots, FETCH_BACKGROUND_LANE_ORDINARY, false);
             CHECK(requests[at] != 0);
         }
-        CHECK(model_claim(slots, false, false) == 0);
-        for (unsigned at = 0; at < FETCH_BACKGROUND_REQUEST_LIMIT; at++)
+        CHECK(model_claim(slots, FETCH_BACKGROUND_LANE_ORDINARY, false) == 0);
+        for (unsigned at = 0; at < page_limit; at++)
             model_cancel(slots, requests[at]);
     }
 }
@@ -334,13 +338,13 @@ static void test_generation_wrap_and_late_completion(void)
 {
     ModelSlot slots[FETCH_BACKGROUND_REQUEST_LIMIT] = {{0}};
     slots[0].generation = UINT32_MAX;
-    uint64_t first = model_claim(slots, true, true);
+    uint64_t first = model_claim(slots, FETCH_BACKGROUND_LANE_MEDIA, true);
     CHECK(fetch_background_request_id_generation(first) == 1u);
     slots[0].state = MODEL_RUNNING;
     model_cancel(slots, first);
     model_complete(slots, first);
     CHECK(slots[0].state == MODEL_FREE);
-    uint64_t replacement = model_claim(slots, true, true);
+    uint64_t replacement = model_claim(slots, FETCH_BACKGROUND_LANE_MEDIA, true);
     CHECK(replacement != 0 && replacement != first);
     slots[0].state = MODEL_RUNNING;
     model_complete(slots, first);
@@ -361,15 +365,20 @@ static void test_randomized_interleavings(void)
         switch (choice % 7u) {
         case 0:
         case 1: {
-            bool foreground = (choice & 0x10000u) != 0;
-            bool priority = (choice & 0x20000u) != 0;
-            uint64_t id = model_claim(slots, foreground, priority);
+            FetchBackgroundLane lane = (FetchBackgroundLane)
+                ((choice >> 16) % 3u);
+            bool priority = (choice & 0x40000u) != 0;
+            uint64_t id = model_claim(slots, lane, priority);
             if (id != 0) {
                 history[history_at++ % 128u] = id;
-                if (priority && !foreground) {
+                unsigned page_limit = FETCH_BACKGROUND_REQUEST_LIMIT
+                    - FETCH_BACKGROUND_BLOCKING_RESERVED_SLOTS;
+                if (lane != FETCH_BACKGROUND_LANE_BLOCKING) {
+                    CHECK(fetch_background_request_id_slot(id) < page_limit);
+                }
+                if (priority && lane == FETCH_BACKGROUND_LANE_ORDINARY) {
                     CHECK(fetch_background_request_id_slot(id)
-                          < FETCH_BACKGROUND_REQUEST_LIMIT
-                                - FETCH_BACKGROUND_MEDIA_RESERVED_SLOTS);
+                          < page_limit - FETCH_BACKGROUND_MEDIA_RESERVED_SLOTS);
                 }
             }
             break;
@@ -420,7 +429,7 @@ static void test_randomized_interleavings(void)
         if (slots[at].state == MODEL_COMPLETE) slots[at].state = MODEL_FREE;
         CHECK(slots[at].state == MODEL_FREE);
     }
-    CHECK(model_claim(slots, true, true) != 0);
+    CHECK(model_claim(slots, FETCH_BACKGROUND_LANE_MEDIA, true) != 0);
 }
 
 static void test_randomized_route_churn(void)
@@ -451,7 +460,7 @@ static void test_randomized_route_churn(void)
                restore foreground admission; queued descriptors were already
                released synchronously by cancel_all. */
             uint64_t document = model_claim_eventually(
-                slots, true, media_priority, MODEL_OWNER_DOCUMENT,
+                slots, FETCH_BACKGROUND_LANE_MEDIA, media_priority, MODEL_OWNER_DOCUMENT,
                 route_generation);
             CHECK(document != 0);
             if (document != 0) {
@@ -465,18 +474,19 @@ static void test_randomized_route_churn(void)
                 for (unsigned range = 0;
                      range < FETCH_BACKGROUND_MEDIA_RESERVED_SLOTS; range++) {
                     uint64_t id = model_claim_eventually(
-                        slots, true, true, MODEL_OWNER_MEDIA_RANGE,
+                        slots, FETCH_BACKGROUND_LANE_MEDIA, true, MODEL_OWNER_MEDIA_RANGE,
                         route_generation);
                     CHECK(id != 0);
                     if (id != 0) history[history_at++ % ROUTE_HISTORY] = id;
                 }
             } else if (action == 0u) {
                 unsigned normal_limit = FETCH_BACKGROUND_REQUEST_LIMIT
+                    - FETCH_BACKGROUND_BLOCKING_RESERVED_SLOTS
                     - FETCH_BACKGROUND_MEDIA_RESERVED_SLOTS;
                 for (unsigned thumbnail = 0;
                      thumbnail < normal_limit; thumbnail++) {
                     uint64_t id = model_claim_owned(
-                        slots, false, false, MODEL_OWNER_THUMBNAIL,
+                        slots, FETCH_BACKGROUND_LANE_ORDINARY, false, MODEL_OWNER_THUMBNAIL,
                         route_generation);
                     if (id == 0) break;
                     history[history_at++ % ROUTE_HISTORY] = id;
@@ -534,7 +544,60 @@ static void test_randomized_route_churn(void)
         if (slots[at].state == MODEL_COMPLETE) slots[at].state = MODEL_FREE;
         CHECK(slots[at].state == MODEL_FREE);
     }
-    CHECK(model_claim(slots, true, false) != 0);
+    CHECK(model_claim(slots, FETCH_BACKGROUND_LANE_MEDIA, false) != 0);
+}
+
+/* NW-04 question 1: page and media requests holding every descriptor they
+   may take leave one for a blocking request (sync XHR, module import),
+   whose thread pumps nothing else while it waits. */
+static void test_blocking_lane_reserve(void)
+{
+    for (unsigned priority = 0; priority < 2u; priority++) {
+        ModelSlot slots[FETCH_BACKGROUND_REQUEST_LIMIT] = {{0}};
+        unsigned page_limit = FETCH_BACKGROUND_REQUEST_LIMIT
+            - FETCH_BACKGROUND_BLOCKING_RESERVED_SLOTS;
+        unsigned ordinary_limit = priority != 0u
+            ? page_limit - FETCH_BACKGROUND_MEDIA_RESERVED_SLOTS
+            : page_limit;
+        CHECK(page_limit == 5u);
+        for (unsigned at = 0; at < ordinary_limit; at++) {
+            CHECK(model_claim(slots, FETCH_BACKGROUND_LANE_ORDINARY,
+                              priority != 0u) != 0);
+        }
+        CHECK(model_claim(slots, FETCH_BACKGROUND_LANE_ORDINARY,
+                          priority != 0u) == 0);
+        for (unsigned at = ordinary_limit; at < page_limit; at++) {
+            CHECK(model_claim(slots, FETCH_BACKGROUND_LANE_MEDIA,
+                              priority != 0u) != 0);
+        }
+        CHECK(model_claim(slots, FETCH_BACKGROUND_LANE_MEDIA,
+                          priority != 0u) == 0);
+        uint64_t blocking = model_claim(
+            slots, FETCH_BACKGROUND_LANE_BLOCKING, priority != 0u);
+        CHECK(blocking != 0);
+        CHECK(fetch_background_request_id_slot(blocking) == page_limit);
+        CHECK(model_claim(slots, FETCH_BACKGROUND_LANE_BLOCKING,
+                          priority != 0u) == 0);
+        model_cancel(slots, blocking);
+        CHECK(model_claim(slots, FETCH_BACKGROUND_LANE_ORDINARY,
+                          priority != 0u) == 0);
+        CHECK(model_claim(slots, FETCH_BACKGROUND_LANE_BLOCKING,
+                          priority != 0u) != 0);
+    }
+}
+
+/* NW-04 question 3: a worker that failed to start is retried by a later
+   request, at most once a second. */
+static void test_worker_start_retry_spacing(void)
+{
+    CHECK(fetch_background_start_retry_due(5u, 0u));
+    CHECK(!fetch_background_start_retry_due(1000000u, 1000000u));
+    CHECK(!fetch_background_start_retry_due(
+        1000000u + FETCH_BACKGROUND_START_RETRY_US - 1u, 1000000u));
+    CHECK(fetch_background_start_retry_due(
+        1000000u + FETCH_BACKGROUND_START_RETRY_US, 1000000u));
+    /* A clock that went backwards does not block retries forever. */
+    CHECK(fetch_background_start_retry_due(10u, 1000000u));
 }
 
 static void test_stream_consumer_deadline(void)
@@ -554,6 +617,69 @@ static void test_stream_consumer_deadline(void)
     deadline = UINT64_MAX - 5;
     fetch_background_end_consumer_pause(20, &pause, &deadline, &progress);
     CHECK(deadline == UINT64_MAX && pause == 0);
+}
+
+/* NW-11: worker hops time a transfer as the browser-thread scheduler path
+   does (scheduled_stall_seconds), and a slow stream's bytes do not wait in
+   the worker for its 48 KiB publication target. Times in microseconds. */
+static void test_worker_timing_rules(void)
+{
+    const long stall_default = 6;
+    const uint64_t deadline = UINT64_C(30000000);
+    /* A stream past its headers outlives the request deadline while bytes
+       arrive, and ends only after its stall allowance without one. */
+    CHECK(fetch_background_expiry(FETCH_WORKER_TIMING_STREAM, true, 30,
+              stall_default, UINT64_C(40000000), deadline,
+              UINT64_C(39000000)) == FETCH_BACKGROUND_EXPIRY_NONE);
+    CHECK(fetch_background_expiry(FETCH_WORKER_TIMING_STREAM, true, 30,
+              stall_default, UINT64_C(46000000), deadline,
+              UINT64_C(39000000)) == FETCH_BACKGROUND_EXPIRY_NONE);
+    CHECK(fetch_background_expiry(FETCH_WORKER_TIMING_STREAM, true, 30,
+              stall_default, UINT64_C(69000000), deadline,
+              UINT64_C(39000000)) == FETCH_BACKGROUND_EXPIRY_STALL);
+    /* Before its headers the deadline still bounds it. */
+    CHECK(fetch_background_expiry(FETCH_WORKER_TIMING_STREAM, false, 30,
+              stall_default, deadline, deadline, UINT64_C(29000000))
+          == FETCH_BACKGROUND_EXPIRY_DEADLINE);
+    /* A buffered hop whose body starts 8 s after its headers is not
+       stalled: the browser-thread path gives it no stall abort. */
+    CHECK(fetch_background_expiry(FETCH_WORKER_TIMING_BUFFERED, true, 0,
+              stall_default, UINT64_C(9000000), deadline,
+              UINT64_C(1000000)) == FETCH_BACKGROUND_EXPIRY_NONE);
+    CHECK(fetch_background_expiry(FETCH_WORKER_TIMING_BUFFERED, true, 0,
+              stall_default, deadline, deadline, UINT64_C(29000000))
+          == FETCH_BACKGROUND_EXPIRY_DEADLINE);
+    /* A caller's stall_abort_seconds holds from the start. */
+    CHECK(fetch_background_expiry(FETCH_WORKER_TIMING_BUFFERED, false, 2,
+              stall_default, UINT64_C(3000000), deadline,
+              UINT64_C(1000000)) == FETCH_BACKGROUND_EXPIRY_STALL);
+    /* Other worker users keep the default rule. */
+    CHECK(fetch_background_expiry(FETCH_WORKER_TIMING_DEFAULT, true, 0,
+              stall_default, UINT64_C(7000000), deadline,
+              UINT64_C(1000000)) == FETCH_BACKGROUND_EXPIRY_STALL);
+    CHECK(fetch_background_expiry(FETCH_WORKER_TIMING_DEFAULT, false, 0,
+              stall_default, UINT64_C(7000000), deadline,
+              UINT64_C(1000000)) == FETCH_BACKGROUND_EXPIRY_NONE);
+    CHECK(fetch_background_expiry(FETCH_WORKER_TIMING_DEFAULT, true, 0,
+              stall_default, deadline, deadline, UINT64_C(29999999))
+          == FETCH_BACKGROUND_EXPIRY_DEADLINE);
+    CHECK(fetch_background_expiry(FETCH_WORKER_TIMING_STREAM, true, 30,
+              stall_default, 10, deadline, 20)
+          == FETCH_BACKGROUND_EXPIRY_NONE);
+    /* 100 bytes of a stream are published 50 ms after the last byte, not
+       when 48 KiB have gathered or the transfer ends. */
+    CHECK(!fetch_background_stream_idle_publish_due(100, true, false,
+              UINT64_C(1049999), UINT64_C(1000000)));
+    CHECK(fetch_background_stream_idle_publish_due(100, true, false,
+              UINT64_C(1050000), UINT64_C(1000000)));
+    CHECK(!fetch_background_stream_idle_publish_due(0, true, false,
+              UINT64_C(2000000), UINT64_C(1000000)));
+    CHECK(!fetch_background_stream_idle_publish_due(100, false, false,
+              UINT64_C(2000000), UINT64_C(1000000)));
+    CHECK(!fetch_background_stream_idle_publish_due(100, true, true,
+              UINT64_C(2000000), UINT64_C(1000000)));
+    CHECK(!fetch_background_stream_idle_publish_due(100, true, false,
+              10, 20));
 }
 
 int main(void)
@@ -578,6 +704,9 @@ int main(void)
     CHECK(fetch_background_progress_after_setup(UINT64_MAX - 8,
         UINT64_MAX - 4, UINT64_MAX) == UINT64_MAX - 4);
     test_stream_consumer_deadline();
+    test_worker_start_retry_spacing();
+    test_blocking_lane_reserve();
+    test_worker_timing_rules();
     test_redirect_cookie_overflow_policy();
     test_reserved_eventual_admission();
     test_running_cancellation_releases_admission_on_worker_turn();

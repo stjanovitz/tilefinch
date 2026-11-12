@@ -45,7 +45,12 @@ MP4/M4A or HLS source, applies
 `media-src`, mixed-content, private-network, CORS, cookie, redirect, and content-
 blocking policy, and launches the native player. MP4 uses a one-byte Range
 probe before the progressive demux; page audio selects its AAC track and the
-existing audio-only backend without allocating a video surface. HLS parses
+existing audio-only backend without allocating a video surface. Page audio
+that answers MPEG audio opens instead through the MP3 source on the HLS
+worker path ([MP3 page audio](MEDIA_PIPELINE.md#mp3-page-audio)); a secure
+page's plain-HTTP station that the HTTPS upgrade cannot reach fails the open
+into the one-time unencrypted-audio question, whose Retry is "Play anyway"
+(SECURITY_MODEL.md, "Unencrypted audio"). HLS parses
 large rolling playlists incrementally, retains only a bounded live-edge
 window, and uses at most one video and one audio MPEG-TS sample source.
 Baseline/Main plus AAC-LC normally routes through the PSP firmware backend.
@@ -77,12 +82,12 @@ until process restart. This keeps `Failed`'s pipeline invariant truthful
 without pretending quarantine reclaimed firmware-owned state.
 
 Transport priority follows admitted media work, not the URL in the omnibar.
-`Opening` and a visible online player reserve two of the six background-worker
-descriptors. `Dormant`, hidden internal views, `Failed`, and closed players do
+`Opening` and a visible online player reserve two of the five background-worker
+descriptors page requests share (the sixth is kept for blocking requests). `Dormant`, hidden internal views, `Failed`, and closed players do
 not: a retained decoder receives no feed while hidden, and reopening it
 reacquires the reservation before the next media request. This prevents Back,
 a cancelled candidate navigation, or a failed video open from permanently
-reducing later page and search capacity from six descriptors to four.
+reducing later page and search capacity from five descriptors to three.
 
 No resource-bearing state transitions directly to `Failed` or `Suspended`.
 It first enters `Quiescing`, even when an early open failed before allocation;

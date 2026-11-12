@@ -12,22 +12,6 @@ typedef struct {
     int clip_bottom;
 } CanvasFastFrameCandidate;
 
-static bool canvas_surface_is_opaque(const ImageResource *image)
-{
-    if (image == NULL || !image->is_canvas || image->pixels == NULL
-        || image->width <= 0 || image->height <= 0
-        || (size_t) image->width > SIZE_MAX / (size_t) image->height
-        || (size_t) image->width * (size_t) image->height
-               > SIZE_MAX / 4u) {
-        return false;
-    }
-    size_t pixels = (size_t) image->width * (size_t) image->height;
-    for (size_t i = 0; i < pixels; i++) {
-        if (image->pixels[i * 4u + 3u] != 255u) return false;
-    }
-    return true;
-}
-
 static inline uint32_t canvas_fast_rgb565(uint32_t pixel)
 {
 #if defined(_MIPS_ARCH_ALLEGREX)
@@ -411,8 +395,9 @@ static bool canvas_fast_frame_candidate_impl(
                        >= viewport_width
                 && (int64_t) candidate->command.y + candidate->command.height
                        >= (int64_t) scroll_y + viewport_height))
-        && (candidate->image->canvas_opaque
-            || canvas_surface_is_opaque(candidate->image));
+        /* Exact: kept by every commit (images_commit_canvas_surface), so a
+           frame never rescans the surface's alpha. */
+        && candidate->image->canvas_opaque;
 }
 
 static bool canvas_fast_frame_candidate(

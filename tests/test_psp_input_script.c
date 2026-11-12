@@ -306,6 +306,64 @@ static bool test_stepper(void)
     CHECK(!psp_input_script_parse(
         &script, "focus-page-media now\n", "inline", record_warning, NULL));
 
+    /* answer-question: idle while neither question nor playback shows,
+       then one tap when the question is pending. */
+    CHECK(psp_input_script_parse(
+        &script, "answer-question-live 10 cross\nwait 1\nend\n", "inline",
+        record_warning, NULL));
+    CHECK(script.steps[0].kind == PSP_INPUT_SCRIPT_STEP_ANSWER_QUESTION
+          && script.steps[0].ticks == 10u
+          && script.steps[0].advance_while_busy);
+    CHECK(psp_input_script_advance(&script, &input, 0, false)
+          && input.held == 0
+          && psp_input_script_question_outcome(&script)
+                 == PSP_INPUT_SCRIPT_QUESTION_NONE);
+    psp_input_script_set_media_question(&script, true, false);
+    CHECK(psp_input_script_advance(&script, &input, 0, false)
+          && input.pressed == PSP_UI_BUTTON_CONFIRM
+          && psp_input_script_question_outcome(&script)
+                 == PSP_INPUT_SCRIPT_QUESTION_ANSWERED);
+    CHECK(psp_input_script_advance(&script, &input, input.held, false)
+          && input.held == 0
+          && psp_input_script_question_outcome(&script)
+                 == PSP_INPUT_SCRIPT_QUESTION_NONE);
+    CHECK(script.step_remaining == 0u);
+    /* The question is still on screen for a frame after the press: the
+       step is over, so it is never pressed twice. */
+    CHECK(psp_input_script_advance(&script, &input, 0, true)
+          && input.held == 0 && script.step == 1u);
+
+    /* Already playing (the HTTPS upgrade succeeded): no press. */
+    CHECK(psp_input_script_parse(
+        &script, "answer-question-live 10 cross\ntap circle\nend\n",
+        "inline", record_warning, NULL));
+    psp_input_script_set_media_question(&script, false, true);
+    CHECK(psp_input_script_advance(&script, &input, 0, false)
+          && input.held == 0
+          && psp_input_script_question_outcome(&script)
+                 == PSP_INPUT_SCRIPT_QUESTION_NOT_ASKED);
+    CHECK(psp_input_script_advance(&script, &input, 0, true)
+          && input.pressed == PSP_UI_BUTTON_CANCEL);
+
+    /* Neither within the bound: the last frame ends it unpressed. */
+    CHECK(psp_input_script_parse(
+        &script, "answer-question 3 cross\nend\n", "inline",
+        record_warning, NULL));
+    CHECK(psp_input_script_advance(&script, &input, 0, true)
+          && input.held == 0);
+    CHECK(psp_input_script_advance(&script, &input, 0, true)
+          && input.held == 0);
+    CHECK(psp_input_script_advance(&script, &input, 0, true)
+          && input.held == 0
+          && psp_input_script_question_outcome(&script)
+                 == PSP_INPUT_SCRIPT_QUESTION_TIMED_OUT);
+    CHECK(!psp_input_script_advance(&script, &input, 0, true)
+          && script.reached_end);
+    CHECK(!psp_input_script_parse(
+        &script, "answer-question cross\n", "inline", record_warning, NULL));
+    CHECK(!psp_input_script_parse(
+        &script, "answer-question 1 cross\n", "inline", record_warning, NULL));
+
     CHECK(psp_input_script_parse(
         &script, "wait 10\nend\n", "inline", record_warning, NULL));
     psp_input_script_interrupt(&script);

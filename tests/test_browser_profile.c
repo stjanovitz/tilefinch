@@ -1,6 +1,7 @@
 #include "tilefinch/browser_profile.h"
 
 #include <stdio.h>
+#include <sys/stat.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -59,6 +60,73 @@ static bool seal_profile(const char *path)
                  (unsigned) checksum) > 0;
     if (fclose(file) != 0) ok = false;
     return ok;
+}
+
+/* The save accumulates the END footer while writing (it no longer reads
+   the file back), and reports a fingerprint of the body it wrote that
+   browser_profile_fingerprint reproduces without touching a file. */
+static int test_save_fingerprint(void)
+{
+    Budget budget;
+    budget_init(&budget, 2u * 1024u * 1024u);
+    BrowserProfile *profile = browser_profile_create(&budget);
+    CHECK(profile != NULL);
+    browser_profile_set_history_enabled(profile, true);
+    char url[64];
+    for (unsigned i = 0; i < 120u; i++) {
+        snprintf(url, sizeof(url), "https://example.test/%u?a=b c", i);
+        CHECK(browser_profile_record_history(profile, url, "Title\twith tab"));
+    }
+    CHECK(browser_profile_add_bookmark(
+        profile, "https://example.test/mark", "Mark"));
+    char path[128];
+    snprintf(path, sizeof(path), "/tmp/tilefinch-profile-fingerprint-%ld.cfg",
+             (long) getpid());
+    BrowserProfileFingerprint written, computed;
+    CHECK(browser_profile_save_fingerprinted(profile, path, &written));
+    CHECK(written.length != 0);
+    CHECK(browser_profile_fingerprint(profile, &computed));
+    CHECK(computed.hash == written.hash && computed.length == written.length);
+
+    /* The footer names the body's length and FNV-1a 32 and ends the file. */
+    static unsigned char bytes[64u * 1024u];
+    FILE *file = fopen(path, "rb");
+    CHECK(file != NULL);
+    size_t total = fread(bytes, 1, sizeof(bytes), file);
+    fclose(file);
+    CHECK(total > written.length && total < sizeof(bytes));
+    uint32_t checksum = UINT32_C(2166136261);
+    for (size_t i = 0; i < written.length; i++) {
+        checksum ^= bytes[i];
+        checksum *= UINT32_C(16777619);
+    }
+    char footer[64];
+    int footer_length = snprintf(footer, sizeof(footer), "END\t%zu\t%08X\n",
+                                 written.length, (unsigned) checksum);
+    CHECK(footer_length > 0
+          && total == written.length + (size_t) footer_length
+          && memcmp(bytes + written.length, footer,
+                    (size_t) footer_length) == 0);
+    BrowserProfile *loaded = browser_profile_create(&budget);
+    CHECK(loaded != NULL && browser_profile_load(loaded, path));
+    CHECK(browser_profile_history_count(loaded)
+          == BROWSER_PROFILE_HISTORY_LIMIT);
+
+    /* A durable change changes the fingerprint; undoing it restores it. */
+    browser_profile_set_ui_scale(profile, 2);
+    CHECK(browser_profile_fingerprint(profile, &computed));
+    CHECK(computed.hash != written.hash || computed.length != written.length);
+    browser_profile_set_ui_scale(profile, 1);
+    CHECK(browser_profile_fingerprint(profile, &computed));
+    CHECK(computed.hash == written.hash && computed.length == written.length);
+    char other[160];
+    snprintf(other, sizeof(other), "%s.bak", path);
+    (void) remove(other);
+    CHECK(remove(path) == 0);
+    browser_profile_destroy(loaded);
+    browser_profile_destroy(profile);
+    CHECK(budget.current == 0);
+    return 0;
 }
 
 static int test_javascript_site_defaults(void)
@@ -237,6 +305,7 @@ static int test_site_storage_choices(void)
 
 int main(void)
 {
+    CHECK(test_save_fingerprint() == 0);
     CHECK(test_javascript_site_defaults() == 0);
     CHECK(test_site_storage_choices() == 0);
     CHECK(BROWSER_GLYPH_LANGUAGE_EMBEDDED == 0
@@ -1159,6 +1228,19 @@ int main(void)
           && browser_profile_history_count(recovered) == 100);
     CHECK(!file_present(torn_path));
     browser_profile_destroy(recovered);
+    /* IS-11: a primary that only fails to open (a transient card error) is
+       not damage; the backup carries this load and the primary stays. */
+    CHECK(browser_profile_save(profile, torn_path)
+          && browser_profile_save(profile, torn_path)
+          && file_present(torn_path) && file_present(torn_backup)
+          && chmod(torn_path, 0) == 0);
+    BrowserProfile *transient = browser_profile_create(&budget);
+    bool transient_loaded = transient != NULL
+        && browser_profile_load(transient, torn_path)
+        && browser_profile_bookmark_count(transient) == 2;
+    CHECK(chmod(torn_path, 0600) == 0);
+    CHECK(transient_loaded && file_present(torn_path));
+    browser_profile_destroy(transient);
     /* A syntactically valid prefix without its terminating newline is a torn
        primary too. It must not be accepted with defaulted-away tail records
        while a complete backup is available. */

@@ -4,10 +4,15 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "tilefinch_test_faults.h"
+
 #define GLYPH_FILE_HEADER_BYTES 80u
 #define GLYPH_PAGE_MISSING UINT16_C(0xffff)
 #define GLYPH_CACHE_SLOTS 4u
 #define GLYPH_QUEUE_LIMIT 32u
+/* Consecutive failed block reads after which a pack stops serving glyphs
+   for the session (its text falls back as if the pack were absent). */
+#define GLYPH_PACK_READ_FAILURE_LIMIT 4u
 #define GLYPH_KEY_FLAG UINT32_C(0x80000000)
 #define GLYPH_KEY_PACK_SHIFT 27u
 #define GLYPH_KEY_PACK_MASK UINT32_C(0x18000000)
@@ -35,6 +40,7 @@ typedef struct {
     uint16_t *page_directory;
     GlyphPage *pages;
     GlyphSequence *sequences;
+    uint8_t *glyph_columns;
     uint32_t glyph_count;
     uint32_t payload_offset;
     uint16_t populated_pages;
@@ -43,6 +49,8 @@ typedef struct {
     uint16_t source_height;
     uint16_t block_glyphs;
     uint16_t glyph_stride;
+    uint8_t baseline_rows;
+    uint8_t read_failures;
     TilefinchGlyphComponentKind kind;
     char id[TILEFINCH_GLYPH_COMPONENT_ID_LIMIT + 1u];
 } GlyphPack;
@@ -116,6 +124,7 @@ static void pack_destroy(Budget *budget, GlyphPack *pack)
     budget_free(budget, pack->page_directory);
     budget_free(budget, pack->pages);
     budget_free(budget, pack->sequences);
+    budget_free(budget, pack->glyph_columns);
     memset(pack, 0, sizeof(*pack));
 }
 
@@ -151,6 +160,7 @@ static bool pack_read_index(
     uint16_t schema = read_u16(header + 8);
     unsigned kind = header[10], width = header[11], height = header[12];
     unsigned block_glyphs = header[13], id_length = header[14];
+    unsigned baseline_rows = header[15];
     uint32_t glyph_count = read_u32(header + 16);
     uint16_t pages = read_u16(header + 20);
     uint16_t sequences = read_u16(header + 22);
@@ -184,6 +194,9 @@ static bool pack_read_index(
         || id[id_length] != '\0' || expected_id == NULL
         || strcmp(id, expected_id) != 0
         || notice_length > TILEFINCH_GLYPH_COMPONENT_NOTICE_LIMIT
+        || (baseline_rows != 0
+            && (!mono || baseline_rows >= height
+                || notice_length < glyph_count))
         || !file_length(file, &actual_file_size)
         || actual_file_size != file_size
         || directory_offset != GLYPH_FILE_HEADER_BYTES
@@ -212,17 +225,23 @@ static bool pack_read_index(
         : budget_calloc_category(
               provider->budget, BUDGET_CATEGORY_RESOURCE,
               sequences, sizeof(*sequence_table));
+    uint8_t *columns = baseline_rows == 0 ? NULL
+        : budget_malloc_category(
+              provider->budget, BUDGET_CATEGORY_RESOURCE, glyph_count);
     bool allocated = directory_bytes_raw != NULL && page_bytes_raw != NULL
         && directory != NULL && page_table != NULL
         && (sequences == 0
-            || (sequence_bytes_raw != NULL && sequence_table != NULL));
+            || (sequence_bytes_raw != NULL && sequence_table != NULL))
+        && (baseline_rows == 0 || columns != NULL);
     bool read = allocated
         && read_exact(file, directory_offset, directory_bytes_raw,
                       (size_t) directory_bytes)
         && read_exact(file, pages_offset, page_bytes_raw, (size_t) pages_bytes)
         && (sequences == 0
             || read_exact(file, sequences_offset, sequence_bytes_raw,
-                          (size_t) sequence_bytes));
+                          (size_t) sequence_bytes))
+        && (baseline_rows == 0
+            || read_exact(file, file_size - glyph_count, columns, glyph_count));
     if (!read) {
         budget_free(provider->budget, directory_bytes_raw);
         budget_free(provider->budget, page_bytes_raw);
@@ -230,10 +249,18 @@ static bool pack_read_index(
         budget_free(provider->budget, directory);
         budget_free(provider->budget, page_table);
         budget_free(provider->budget, sequence_table);
+        budget_free(provider->budget, columns);
         fclose(file);
         return false;
     }
-    for (size_t at = 0; at < TILEFINCH_GLYPH_COMPONENT_PAGE_COUNT; at++) {
+    for (uint32_t at = 0; baseline_rows != 0 && at < glyph_count; at++) {
+        if ((columns[at] >> 4u) + 1u + (columns[at] & 15u) > width) {
+            allocated = false;
+            break;
+        }
+    }
+    for (size_t at = 0; allocated && at < TILEFINCH_GLYPH_COMPONENT_PAGE_COUNT;
+         at++) {
         directory[at] = read_u16(directory_bytes_raw + at * 2u);
         if (directory[at] != GLYPH_PAGE_MISSING && directory[at] >= pages) {
             allocated = false;
@@ -294,6 +321,7 @@ static bool pack_read_index(
         budget_free(provider->budget, directory);
         budget_free(provider->budget, page_table);
         budget_free(provider->budget, sequence_table);
+        budget_free(provider->budget, columns);
         fclose(file);
         return false;
     }
@@ -302,6 +330,7 @@ static bool pack_read_index(
         .page_directory = directory,
         .pages = page_table,
         .sequences = sequence_table,
+        .glyph_columns = columns,
         .glyph_count = glyph_count,
         .payload_offset = payload_offset,
         .populated_pages = pages,
@@ -310,6 +339,7 @@ static bool pack_read_index(
         .source_height = (uint16_t) height,
         .block_glyphs = (uint16_t) block_glyphs,
         .glyph_stride = (uint16_t) stride,
+        .baseline_rows = (uint8_t) baseline_rows,
         .kind = (TilefinchGlyphComponentKind) kind
     };
     memcpy(pack->id, id, id_length + 1u);
@@ -355,6 +385,12 @@ static bool pack_lookup(
     return *glyph_index < pack->glyph_count;
 }
 
+static unsigned pack_glyph_width(const GlyphPack *pack, uint32_t glyph)
+{
+    return pack->glyph_columns == NULL ? pack->source_width
+        : (pack->glyph_columns[glyph] >> 4u) + 1u;
+}
+
 static uint32_t make_key(size_t pack, uint32_t glyph)
 {
     return GLYPH_KEY_FLAG | ((uint32_t) pack << GLYPH_KEY_PACK_SHIFT) | glyph;
@@ -385,10 +421,19 @@ bool tilefinch_glyph_provider_has_codepoint(
         if (!pack_lookup(&provider->packs[pack], codepoint, &glyph)) continue;
         if (glyph_key != NULL) *glyph_key = make_key(pack, glyph);
         if (source_width != NULL)
-            *source_width = provider->packs[pack].source_width;
+            *source_width = pack_glyph_width(&provider->packs[pack], glyph);
         return true;
     }
     return false;
+}
+
+bool tilefinch_glyph_provider_key_is_metric(
+    const TilefinchGlyphProvider *provider, uint32_t glyph_key)
+{
+    size_t pack = 0;
+    uint32_t glyph = 0;
+    return decode_key(provider, glyph_key, &pack, &glyph)
+        && provider->packs[pack].baseline_rows != 0;
 }
 
 bool tilefinch_glyph_provider_metrics(
@@ -399,9 +444,8 @@ bool tilefinch_glyph_provider_metrics(
     size_t pack = 0;
     uint32_t glyph = 0;
     if (!decode_key(provider, glyph_key, &pack, &glyph)) return false;
-    (void) glyph;
     const GlyphPack *found = &provider->packs[pack];
-    if (source_width != NULL) *source_width = found->source_width;
+    if (source_width != NULL) *source_width = pack_glyph_width(found, glyph);
     if (source_height != NULL) *source_height = found->source_height;
     if (kind != NULL) *kind = found->kind;
     return true;
@@ -519,6 +563,11 @@ bool tilefinch_glyph_provider_match(
                 || following == 0xff9eu || following == 0xff9fu))
             sequence_candidate = true;
     }
+    /* A capital needs its accent raised, which takes a shaped cell. Only the
+       next byte is read: U+0300-036F start with 0xCC or 0xCD. */
+    if (first >= 'A' && first <= 0x052fu && first_bytes < length
+        && ((unsigned char) text[first_bytes] & 0xfeu) == 0xccu)
+        sequence_candidate = true;
     if (sequence_candidate) {
         for (size_t pack = 0; pack < provider->pack_count; pack++) {
             uint32_t glyph = 0;
@@ -529,7 +578,7 @@ bool tilefinch_glyph_provider_match(
             *used = matched;
             *glyph_key = make_key(pack, glyph);
             if (source_width != NULL)
-                *source_width = provider->packs[pack].source_width;
+                *source_width = pack_glyph_width(&provider->packs[pack], glyph);
             return true;
         }
     }
@@ -551,9 +600,18 @@ static bool queue_block(TilefinchGlyphProvider *provider, GlyphBlockKey key)
             && block_equal(provider->cache[at].key, key)) return true;
     for (size_t at = 0; at < provider->queue_count; at++)
         if (block_equal(provider->queue[at], key)) return true;
-    if (provider->queue_count >= GLYPH_QUEUE_LIMIT) return false;
+    if (provider->queue_count >= GLYPH_QUEUE_LIMIT
+        || provider->packs[key.pack].read_failures
+               >= GLYPH_PACK_READ_FAILURE_LIMIT) return false;
     provider->queue[provider->queue_count++] = key;
     return true;
+}
+
+static void dequeue_head(TilefinchGlyphProvider *provider)
+{
+    memmove(provider->queue, provider->queue + 1u,
+            (provider->queue_count - 1u) * sizeof(provider->queue[0]));
+    provider->queue_count--;
 }
 
 bool tilefinch_glyph_provider_source(
@@ -578,9 +636,12 @@ bool tilefinch_glyph_provider_source(
             || pack->glyph_stride > cache->bytes - offset) return false;
         *source = (TilefinchGlyphSource) {
             .pixels = cache->data + offset,
-            .width = pack->source_width,
+            .width = pack_glyph_width(pack, glyph),
             .height = pack->source_height,
-            .kind = pack->kind
+            .kind = pack->kind,
+            .first_column = pack->glyph_columns == NULL ? 0u
+                : pack->glyph_columns[glyph] & 15u,
+            .baseline_rows = pack->baseline_rows
         };
         return true;
     }
@@ -614,9 +675,11 @@ bool tilefinch_glyph_provider_pump(
     GlyphBlockKey key = provider->queue[0];
     GlyphPack *pack = key.pack < provider->pack_count
         ? &provider->packs[key.pack] : NULL;
-    if (pack == NULL) return false;
-    uint32_t first = key.block * pack->block_glyphs;
-    if (first >= pack->glyph_count) return false;
+    uint32_t first = pack == NULL ? 0u : key.block * pack->block_glyphs;
+    if (pack == NULL || first >= pack->glyph_count) {
+        dequeue_head(provider);
+        return false;
+    }
     uint32_t count = pack->glyph_count - first;
     if (count > pack->block_glyphs) count = pack->block_glyphs;
     size_t bytes = (size_t) count * pack->glyph_stride;
@@ -625,13 +688,28 @@ bool tilefinch_glyph_provider_pump(
     GlyphBlockCache *cache = &provider->cache[slot];
     uint64_t offset = (uint64_t) pack->payload_offset
         + (uint64_t) first * pack->glyph_stride;
-    if (!read_exact(pack->file, offset, cache->data, bytes)) return false;
+    bool read = read_exact(pack->file, offset, cache->data, bytes);
+#ifndef __PSP__
+    if (read && tilefinch_test_faults()->fail_glyph_block_reads != 0) {
+        tilefinch_test_faults()->fail_glyph_block_reads--;
+        read = false;
+    }
+#endif
+    if (!read) {
+        /* The slot's previous block is partly overwritten. Drop it and the
+           failed block, so the next pump serves the rest of the queue
+           instead of retrying the same read every frame; a later paint may
+           queue the block again until the pack keeps failing. */
+        cache->valid = false;
+        if (pack->read_failures < UINT8_MAX) pack->read_failures++;
+        dequeue_head(provider);
+        return false;
+    }
+    pack->read_failures = 0;
     cache->key = key;
     cache->bytes = bytes;
     cache->valid = true;
-    memmove(provider->queue, provider->queue + 1u,
-            (provider->queue_count - 1u) * sizeof(provider->queue[0]));
-    provider->queue_count--;
+    dequeue_head(provider);
     if (changed != NULL) *changed = true;
     if (bytes_read != NULL) *bytes_read = bytes;
     return true;

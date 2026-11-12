@@ -78,20 +78,31 @@ void style_match_subject_prepare(lxb_dom_node_t *node,
     }
 }
 
-/* HTML type selectors use ASCII-insensitive names; foreign-content and XML
-   names remain exact. Keep the common lowercase spelling on the byte path,
-   and apply the same rule to prepared query keys and the full matcher. */
+/* A type selector in an HTML document, as Chromium matches it (measured
+   2026-11-10, Chrome 156): the selector's name is ASCII-lower-cased and an
+   HTML element's local name must equal it, while any other element (SVG's
+   linearGradient, a createElementNS(null, "Foo")) matches ASCII
+   case-insensitively. subject->tag is the tag id's name: lower case for
+   every element but an HTML one createElementNS named with upper case,
+   which has its own tag id (js_dom_create) and so never equals a lower-cased
+   selector. Outside an HTML document names are exact. The same rule serves
+   prepared query keys and the full matcher. */
 bool style_subject_tag_matches(const StyleMatchSubject *subject,
                                const char *wanted, size_t length)
 {
     if (subject->tag == NULL || subject->tag_length != length) return false;
-    if (memcmp(subject->tag, wanted, length) == 0) return true;
     const lxb_dom_node_t *node = subject->node;
-    if (node == NULL || node->ns != LXB_NS_HTML || node->owner_document == NULL
-        || node->owner_document->type != LXB_DOM_DOCUMENT_DTYPE_HTML)
+    bool html_document = node != NULL && node->owner_document != NULL
+        && node->owner_document->type == LXB_DOM_DOCUMENT_DTYPE_HTML;
+    bool html = html_document && node->ns == LXB_NS_HTML;
+    if (memcmp(subject->tag, wanted, length) == 0) {
+        if (!html || subject->tag_id < LXB_TAG__LAST_ENTRY) return true;
+    } else if (!html_document) {
         return false;
+    }
     for (size_t i = 0; i < length; i++) {
-        if (style_ascii_lower((unsigned char) subject->tag[i])
+        unsigned char have = (unsigned char) subject->tag[i];
+        if ((html ? have : style_ascii_lower(have))
             != style_ascii_lower((unsigned char) wanted[i])) return false;
     }
     return true;
@@ -206,38 +217,38 @@ static bool style_node_effectively_disabled(lxb_dom_node_t *node)
     return false;
 }
 
-static void scan_select_options(lxb_dom_node_t *node,
-                                lxb_dom_node_t **first,
-                                lxb_dom_node_t **selected)
+static bool select_option_is_selected(lxb_dom_node_t *option)
 {
-    if (node == NULL) return;
-    lxb_dom_node_t *at = node->first_child;
-    while (at != NULL) {
-        if (style_tag_is(at, "option")) {
-            if (*first == NULL) *first = at;
-            size_t state_length = 0;
-            const char *state = document_attribute(
-                at, "data-tilefinch-option-selected", &state_length);
-            bool is_selected = state != NULL
-                ? state_length == 4 && memcmp(state, "true", 4) == 0
-                : lxb_dom_element_has_attribute(
-                      lxb_dom_interface_element(at),
-                      (const lxb_char_t *) "selected", 8);
-            if (*selected == NULL && is_selected) {
-                *selected = at;
-            }
-        }
-        if (at->first_child != NULL) {
-            at = at->first_child;
-            continue;
-        }
-        while (at != node && at->next == NULL) at = at->parent;
-        if (at == node) break;
-        at = at->next;
-    }
+    size_t state_length = 0;
+    const char *state = document_attribute(
+        option, "data-tilefinch-option-selected", &state_length);
+    return state != NULL
+        ? state_length == 4 && memcmp(state, "true", 4) == 0
+        : lxb_dom_element_has_attribute(
+              lxb_dom_interface_element(option),
+              (const lxb_char_t *) "selected", 8);
 }
 
-bool option_is_displayed_by_default(lxb_dom_node_t *option)
+/* The node before `at` in the pre-order of `root`'s subtree, or NULL at
+   `root` itself. */
+static lxb_dom_node_t *select_previous_in_order(lxb_dom_node_t *root,
+                                                lxb_dom_node_t *at)
+{
+    if (at == root) return NULL;
+    if (at->prev == NULL) return at->parent == root ? NULL : at->parent;
+    at = at->prev;
+    while (at->last_child != NULL) at = at->last_child;
+    return at;
+}
+
+/* A single-choice <select> shows its first selected option, or its first
+   option when none is selected (tree order, optgroups included). Each option
+   asks only about the options before it: the nearest earlier option settles
+   an unselected one, and the nearest earlier selected option a selected
+   one, so a whole list costs about two walks of the select, not one per
+   option. Only the first option, unselected, looks at those after it. */
+bool option_is_displayed_by_default(const Stylesheet *sheet,
+                                    lxb_dom_node_t *option)
 {
     lxb_dom_node_t *select = option == NULL ? NULL : option->parent;
     while (select != NULL && !style_tag_is(select, "select")) {
@@ -249,10 +260,32 @@ bool option_is_displayed_by_default(lxb_dom_node_t *option)
             (const lxb_char_t *) "multiple", 8)) {
         return true;
     }
-    lxb_dom_node_t *first = NULL;
-    lxb_dom_node_t *selected = NULL;
-    scan_select_options(select, &first, &selected);
-    return option == (selected == NULL ? first : selected);
+    (void) sheet;
+    bool selected = select_option_is_selected(option);
+    for (lxb_dom_node_t *at = select_previous_in_order(select, option);
+         at != NULL; at = select_previous_in_order(select, at)) {
+        STYLE_SELECTOR_COUNT(sheet, select_option_visits, 1);
+        if (!style_tag_is(at, "option")) continue;
+        /* An earlier option is shown instead of an unselected one; an
+           earlier selected option instead of a selected one. */
+        if (!selected || select_option_is_selected(at)) return false;
+    }
+    if (selected) return true;
+    /* The first option, unselected: shown unless a later one is selected. */
+    lxb_dom_node_t *at = option;
+    for (;;) {
+        if (at->first_child != NULL) {
+            at = at->first_child;
+        } else {
+            while (at != select && at->next == NULL) at = at->parent;
+            if (at == select) break;
+            at = at->next;
+        }
+        STYLE_SELECTOR_COUNT(sheet, select_option_visits, 1);
+        if (style_tag_is(at, "option") && select_option_is_selected(at))
+            return false;
+    }
+    return true;
 }
 
 /* Skip four ordinary non-space ASCII bytes at once. memcpy keeps unaligned
@@ -1918,6 +1951,21 @@ static bool style_selector_program_matches_at(
     size_t instruction, unsigned depth,
     const StyleMatchSubject *known_subject);
 
+/* The general-sibling memo slot for this program step under `parent`, or
+   NULL outside a layout's selector scope. The caller checks the key. */
+static StyleSiblingRunCacheEntry *style_sibling_run_slot(
+    const Stylesheet *sheet, const StyleRule *rule,
+    const lxb_dom_node_t *parent, size_t instruction, unsigned depth)
+{
+    StyleAncestorBloomCache *cache = sheet->resolve_scratch == NULL
+        ? NULL : sheet->resolve_scratch->ancestor_bloom_cache;
+    if (cache == NULL || parent == NULL) return NULL;
+    uintptr_t key = ((uintptr_t) parent >> 4) ^ ((uintptr_t) rule >> 4)
+        ^ (instruction * 2654435761u) ^ (depth * 97u);
+    key ^= key >> 7;
+    return &cache->sibling_runs[key & (STYLE_SIBLING_RUN_CACHE_CAPACITY - 1u)];
+}
+
 /* A prepared subject for `node` from the scope's subject cache, or `local`
    prepared afresh outside such a scope. */
 static const StyleMatchSubject *style_subject_for_walk(
@@ -2109,8 +2157,27 @@ static bool style_selector_program_matches_uncached(
                 sheet, rule, sibling, instruction, depth + 1u, NULL);
         }
         if (op->opcode == STYLE_SELECTOR_GENERAL_SIBLING) {
+            StyleSiblingRunCacheEntry *run = style_sibling_run_slot(
+                sheet, rule, node->parent, instruction, depth);
+            uint32_t rule_index = (uint32_t) (rule - sheet->rules);
+            /* Read the summary now: matching a sibling below may reuse
+               this slot. */
+            const lxb_dom_node_t *frontier = NULL;
+            bool frontier_matched = false;
+            if (run != NULL && node->parent != NULL
+                && run->parent == node->parent
+                && run->rule_index == rule_index
+                && run->instruction == instruction && run->depth == depth) {
+                frontier = run->frontier;
+                frontier_matched = run->matched;
+            }
+            bool matched = false;
             for (lxb_dom_node_t *sibling = node->prev; sibling != NULL;
                  sibling = sibling->prev) {
+                if (sibling == frontier) {
+                    matched = frontier_matched;
+                    break;
+                }
                 STYLE_SELECTOR_COUNT(sheet, selector_sibling_visits, 1);
                 if (!style_selector_cooperate_visit(sheet, sibling)) {
                     return false;
@@ -2119,10 +2186,21 @@ static bool style_selector_program_matches_uncached(
                     && style_selector_program_matches_at(
                         sheet, rule, sibling, instruction, depth + 1u,
                         NULL)) {
-                    return true;
+                    matched = true;
+                    break;
                 }
             }
-            return false;
+            if (run != NULL && node->parent != NULL && node->prev != NULL
+                && !sheet->selector_cooperate_cancelled
+                && instruction <= UINT16_MAX && depth <= UINT8_MAX) {
+                *run = (StyleSiblingRunCacheEntry) {
+                    .parent = node->parent, .frontier = node->prev,
+                    .rule_index = rule_index,
+                    .instruction = (uint16_t) instruction,
+                    .depth = (uint8_t) depth, .matched = matched
+                };
+            }
+            return matched;
         }
         if (op->opcode == STYLE_SELECTOR_ANCESTOR) {
             for (lxb_dom_node_t *parent = node->parent; parent != NULL;

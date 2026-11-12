@@ -62,14 +62,26 @@ static LayoutReuseStylePayload *layout_reuse_payload(
                              [index % LAYOUT_REUSE_STYLE_PAGE_SIZE];
 }
 
+/* An entry gives up its payload; the last one frees it. */
+static void layout_reuse_release_payload(LayoutReuseCache *cache,
+                                         uint16_t index)
+{
+    LayoutReuseStylePayload *payload = layout_reuse_payload(cache, index);
+    if (--payload->references != 0) return;
+    uint16_t *link = &cache->style_share[
+        payload->hash & (LAYOUT_REUSE_STYLE_SHARE_BUCKETS - 1u)];
+    while (*link != 0 && *link != (uint16_t) (index + 1u))
+        link = &layout_reuse_payload(cache, (uint16_t) (*link - 1u))->next;
+    if (*link != 0) *link = payload->next;
+    payload->next = cache->style_payload_free;
+    cache->style_payload_free = (uint16_t) (index + 1u);
+}
+
 static void layout_reuse_drop_style(LayoutReuseCache *cache,
                                      LayoutReuseStyleEntry *entry)
 {
-    if (entry->node != NULL) {
-        layout_reuse_payload(cache, entry->payload)->next_free =
-            cache->style_payload_free;
-        cache->style_payload_free = (uint16_t) (entry->payload + 1u);
-    }
+    if (entry->node != NULL)
+        layout_reuse_release_payload(cache, entry->payload);
     memset(entry, 0, sizeof(*entry));
 }
 
@@ -80,10 +92,10 @@ static bool layout_reuse_admit_payload(LayoutReuseCache *cache,
     if (cache->style_payload_free != 0) {
         *index = (uint16_t) (cache->style_payload_free - 1u);
         cache->style_payload_free =
-            layout_reuse_payload(cache, *index)->next_free;
+            layout_reuse_payload(cache, *index)->next;
         return true;
     }
-    if (cache->style_payload_count == LAYOUT_REUSE_STYLE_CAPACITY_LIMIT)
+    if (cache->style_payload_count == LAYOUT_REUSE_STYLE_PAYLOAD_LIMIT)
         return false;
     *index = cache->style_payload_count;
     size_t page = *index / LAYOUT_REUSE_STYLE_PAGE_SIZE;
@@ -109,9 +121,42 @@ static bool layout_reuse_admit_payload(LayoutReuseCache *cache,
     return true;
 }
 
+/* A payload holding exactly these values gains a reference; otherwise a new
+   one is admitted. A long bucket only costs a duplicate payload. */
+static bool layout_reuse_share_payload(LayoutReuseCache *cache,
+                                       const ComputedStyle *style,
+                                       uint16_t *index)
+{
+    enum { PROBE_LIMIT = 16 };
+    uint32_t hash = (uint32_t) layout_style_parent_hash(style);
+    uint16_t *head = &cache->style_share[
+        hash & (LAYOUT_REUSE_STYLE_SHARE_BUCKETS - 1u)];
+    unsigned probes = 0;
+    for (uint16_t at = *head; at != 0 && probes < PROBE_LIMIT; probes++) {
+        LayoutReuseStylePayload *payload =
+            layout_reuse_payload(cache, (uint16_t) (at - 1u));
+        if (payload->hash == hash
+            && memcmp(&payload->style, style, sizeof(*style)) == 0) {
+            payload->references++;
+            *index = (uint16_t) (at - 1u);
+            return true;
+        }
+        at = payload->next;
+    }
+    if (!layout_reuse_admit_payload(cache, index)) return false;
+    LayoutReuseStylePayload *payload = layout_reuse_payload(cache, *index);
+    payload->style = *style;
+    payload->hash = hash;
+    payload->references = 1;
+    payload->next = *head;
+    *head = (uint16_t) (*index + 1u);
+    return true;
+}
+
 static void layout_reuse_clear_styles(LayoutReuseCache *cache)
 {
     memset(cache->styles, 0, (cache->style_mask + 1u) * sizeof(*cache->styles));
+    memset(cache->style_share, 0, sizeof(cache->style_share));
     cache->style_payload_count = 0;
     cache->style_payload_free = 0;
     cache->style_payload_refused = false;
@@ -200,10 +245,14 @@ static void layout_reuse_fit_styles(LayoutReuseCache *cache)
     size_t grown = capacity;
     while (grown < LAYOUT_REUSE_STYLE_CAPACITY_LIMIT
            && grown < wanted + wanted / 4u) grown *= 2u;
-    if (grown == capacity
-        || budget_pressure_required(cache->budget,
-                                    grown * sizeof(*cache->styles),
-                                    LAYOUT_REUSE_STYLE_GROWTH_RESERVE_BYTES)) return;
+    /* Less than the walk still keeps more of it, and more than half fills
+       a table's probe windows. */
+    while (grown > capacity
+           && budget_pressure_required(cache->budget,
+                                       grown * sizeof(*cache->styles),
+                                       LAYOUT_REUSE_STYLE_GROWTH_RESERVE_BYTES))
+        grown /= 2u;
+    if (grown == capacity) return;
     LayoutReuseStyleEntry *styles =
         budget_calloc(cache->budget, grown, sizeof(*styles));
     if (styles == NULL) return;
@@ -282,6 +331,7 @@ void layout_reuse_cache_reset(LayoutReuseCache *cache)
     cache->sheet_generation = 0;
     cache->fonts = NULL;
     cache->images = NULL;
+    cache->images_seen_count = 0;
     cache->viewport_width = 0;
     cache->selector_has_has = false;
     cache->state_rule_count = 0;
@@ -314,10 +364,13 @@ void layout_reuse_cache_record_unresolved_visuals(LayoutReuseCache *cache,
     if (cache != NULL) cache->record_unresolved_visuals = record;
 }
 
-void layout_reuse_cache_note_stylesheet_appended(
+static void layout_reuse_drop_styles_within(LayoutReuseCache *cache,
+                                            lxb_dom_node_t *scope);
+
+static void layout_reuse_note_stylesheet_appended(
     LayoutReuseCache *cache, const Stylesheet *sheet, const uint16_t *remap,
     size_t old_count, const uint32_t *appended, size_t appended_count,
-    bool lists_valid)
+    bool lists_valid, bool keep_styles)
 {
     if (cache == NULL) return;
     if (sheet == NULL || cache->sheet != sheet) {
@@ -326,9 +379,11 @@ void layout_reuse_cache_note_stylesheet_appended(
     }
     layout_reuse_cache_flush_invalidations(cache);
     /* Values may change everywhere (a new rule can restyle any element the
-       lists still cover), so only the exact selector answers are kept. */
+       lists still cover), so only the exact selector answers are kept,
+       unless the caller names where the rules can reach (it then drops the
+       styles there, layout_reuse_cache_drop_styles_within). */
     layout_reuse_clear_counters(cache);
-    layout_reuse_clear_styles(cache);
+    if (!keep_styles) layout_reuse_clear_styles(cache);
     layout_reuse_clear_sizing_entries(cache);
     cache->clock = 0;
     if (cache->matches != NULL) {
@@ -368,6 +423,39 @@ void layout_reuse_cache_note_stylesheet_appended(
     }
     cache->sheet_generation = sheet->build_generation;
     cache->stats.stylesheet_appends++;
+}
+
+void layout_reuse_cache_note_stylesheet_appended(
+    LayoutReuseCache *cache, const Stylesheet *sheet, const uint16_t *remap,
+    size_t old_count, const uint32_t *appended, size_t appended_count,
+    bool lists_valid)
+{
+    layout_reuse_note_stylesheet_appended(cache, sheet, remap, old_count,
+                                          appended, appended_count,
+                                          lists_valid, false);
+}
+
+void layout_reuse_cache_note_stylesheet_appended_keeping_styles(
+    LayoutReuseCache *cache, const Stylesheet *sheet, const uint16_t *remap,
+    size_t old_count, const uint32_t *appended, size_t appended_count,
+    bool lists_valid)
+{
+    layout_reuse_note_stylesheet_appended(cache, sheet, remap, old_count,
+                                          appended, appended_count,
+                                          lists_valid, true);
+}
+
+void layout_reuse_cache_drop_styles_within(LayoutReuseCache *cache,
+                                           lxb_dom_node_t *const *roots,
+                                           size_t count)
+{
+    if (cache == NULL) return;
+    if (roots == NULL) {
+        layout_reuse_clear_styles(cache);
+        return;
+    }
+    for (size_t i = 0; i < count; i++)
+        if (roots[i] != NULL) layout_reuse_drop_styles_within(cache, roots[i]);
 }
 
 void layout_reuse_cache_begin_font_publication(LayoutReuseCache *cache)
@@ -429,42 +517,117 @@ static bool layout_reuse_image_has_stable_geometry(
     return atoi(width_value) > 0 && atoi(height_value) > 0;
 }
 
-void layout_reuse_cache_update_images(LayoutReuseCache *cache,
-                                      const ImageResources *images)
+/* What layout reads of an image's geometry (layout_replaced_info). */
+static struct LayoutReuseImageSeen layout_reuse_image_seen(
+    const ImageResource *image)
 {
-    if (cache == NULL || cache->images == images) return;
-    if (images == NULL || images->items == NULL || images->count == 0) {
-        layout_reuse_clear_sizing_entries(cache);
-        cache->images = images;
-        return;
+    return (struct LayoutReuseImageSeen) {
+        .node = image->node,
+        .width = image_resource_intrinsic_width(image),
+        .height = image_resource_intrinsic_height(image),
+        .available = image_resource_available(image)
+            && image->width > 0 && image->height > 0
+    };
+}
+
+static void layout_reuse_images_snapshot(LayoutReuseCache *cache,
+                                         const ImageResources *images)
+{
+    size_t count = images == NULL || images->items == NULL
+        ? 0 : images->count;
+    if (count > IMAGE_TRACKED_NODE_LIMIT) count = IMAGE_TRACKED_NODE_LIMIT;
+    for (size_t i = 0; i < count; i++) {
+        cache->images_seen[i] = layout_reuse_image_seen(&images->items[i]);
     }
+    cache->images_seen_count = count;
+}
+
+/* Drop retained intrinsic widths and table rows whose measurement contains
+   or lies inside `node`. */
+static bool layout_reuse_invalidate_image_node(LayoutReuseCache *cache,
+                                               lxb_dom_node_t *node)
+{
     bool invalidated = false;
     for (size_t i = 0; i < LAYOUT_REUSE_INTRINSIC_CAPACITY; i++) {
         LayoutIntrinsicCacheEntry *entry = &cache->intrinsic[i];
-        for (size_t j = 0; entry->node != NULL && j < images->count; j++) {
-            if (layout_reuse_image_has_stable_geometry(
-                    &images->items[j])) continue;
-            if (layout_reuse_measurement_touches_node(
-                    entry->node, images->items[j].node)) {
-                memset(entry, 0, sizeof(*entry));
-                invalidated = true;
-            }
+        if (entry->node != NULL
+            && layout_reuse_measurement_touches_node(entry->node, node)) {
+            memset(entry, 0, sizeof(*entry));
+            invalidated = true;
         }
     }
     for (size_t i = 0; cache->table_rows != NULL
                        && i < LAYOUT_REUSE_TABLE_ROW_CAPACITY; i++) {
         LayoutReuseTableRowEntry *entry = &cache->table_rows[i];
-        for (size_t j = 0; entry->row != NULL && j < images->count; j++) {
-            if (layout_reuse_image_has_stable_geometry(
-                    &images->items[j])) continue;
-            if (layout_reuse_measurement_touches_node(
-                    entry->row, images->items[j].node)) {
-                memset(entry, 0, sizeof(*entry));
-                invalidated = true;
-            }
+        if (entry->row != NULL
+            && layout_reuse_measurement_touches_node(entry->row, node)) {
+            memset(entry, 0, sizeof(*entry));
+            invalidated = true;
+        }
+    }
+    return invalidated;
+}
+
+/* The same table changed in place: invalidate only around the entries whose
+   geometry differs from what the cache last saw (a load, an arrival). An
+   entry that left the table is not looked at, as when a new table is
+   published. */
+static void layout_reuse_images_changed_in_place(LayoutReuseCache *cache,
+                                                 const ImageResources *images)
+{
+    size_t count = images == NULL || images->items == NULL
+        ? 0 : images->count;
+    if (count == 0) {
+        if (cache->images_seen_count != 0) {
+            layout_reuse_clear_sizing_entries(cache);
+        }
+        cache->images_seen_count = 0;
+        return;
+    }
+    bool invalidated = false;
+    for (size_t i = 0; i < count; i++) {
+        const ImageResource *image = &images->items[i];
+        struct LayoutReuseImageSeen now = layout_reuse_image_seen(image);
+        if (i < cache->images_seen_count) {
+            const struct LayoutReuseImageSeen *seen = &cache->images_seen[i];
+            if (seen->node == now.node && seen->width == now.width
+                && seen->height == now.height
+                && seen->available == now.available) continue;
+        }
+        if (layout_reuse_image_has_stable_geometry(image)) continue;
+        if (layout_reuse_invalidate_image_node(cache, image->node)) {
+            invalidated = true;
+        }
+    }
+    layout_reuse_images_snapshot(cache, images);
+    if (invalidated) cache->stats.scoped_invalidations++;
+}
+
+void layout_reuse_cache_update_images(LayoutReuseCache *cache,
+                                      const ImageResources *images)
+{
+    if (cache == NULL) return;
+    if (cache->images == images) {
+        layout_reuse_images_changed_in_place(cache, images);
+        return;
+    }
+    if (images == NULL || images->items == NULL || images->count == 0) {
+        layout_reuse_clear_sizing_entries(cache);
+        cache->images = images;
+        cache->images_seen_count = 0;
+        return;
+    }
+    bool invalidated = false;
+    for (size_t j = 0; j < images->count; j++) {
+        if (layout_reuse_image_has_stable_geometry(
+                &images->items[j])) continue;
+        if (layout_reuse_invalidate_image_node(cache,
+                                               images->items[j].node)) {
+            invalidated = true;
         }
     }
     cache->images = images;
+    layout_reuse_images_snapshot(cache, images);
     if (invalidated) cache->stats.scoped_invalidations++;
 }
 
@@ -498,6 +661,26 @@ size_t layout_rebind_image_resources(LayoutDocument *layout,
     return rebound;
 }
 
+size_t layout_remap_image_resources(LayoutDocument *layout,
+                                    const uint8_t *remap,
+                                    size_t previous_count,
+                                    const ImageResources *images)
+{
+    if (layout == NULL || remap == NULL || images == NULL
+        || images->items == NULL) return 0;
+    size_t rebound = 0;
+    for (size_t i = 0; i < layout->count; i++) {
+        DrawCommand *command = &layout->commands[i];
+        if (command->type != DRAW_IMAGE || command->image == NULL
+            || command->image < images->items
+            || command->image >= images->items + previous_count) continue;
+        uint8_t next = remap[command->image - images->items];
+        command->image = next == IMAGE_EVICTED ? NULL : &images->items[next];
+        rebound++;
+    }
+    return rebound;
+}
+
 void layout_reuse_cache_rebind_stylesheet(
     LayoutReuseCache *cache, const Stylesheet *previous,
     const Stylesheet *replacement)
@@ -510,21 +693,6 @@ void layout_reuse_cache_rebind_stylesheet(
        current generation here can silently bless stale entries when the
        source sheet was rebuilt between preview and adoption. */
     cache->sheet = replacement;
-}
-
-static void layout_reuse_drop_subtree(LayoutReuseCache *cache,
-                                      lxb_dom_node_t *scope,
-                                      bool include_matches)
-{
-    for (size_t i = 0; i <= cache->style_mask; i++) {
-        LayoutReuseStyleEntry *entry = &cache->styles[i];
-        if (entry->node != NULL
-            && layout_node_is_within(entry->node, scope)) {
-            layout_reuse_drop_style(cache, entry);
-        }
-    }
-    if (include_matches)
-        style_retained_matches_invalidate_within(cache->matches, scope);
 }
 
 /* One element's own cached styles and lists; its descendants re-key off
@@ -541,6 +709,46 @@ static void layout_reuse_drop_element(LayoutReuseCache *cache,
         if (entry->node == node) layout_reuse_drop_style(cache, entry);
     }
     if (include_matches) style_retained_matches_forget_node(cache->matches, node);
+}
+
+/* Every cached style inside `scope`, retired or merely invalid. A journal can
+   name hundreds of small scopes in one relayout, and testing each table entry
+   against each climbs its whole ancestor chain, so probe the subtree's own
+   nodes instead. A subtree too large for that keeps the sweep. */
+static void layout_reuse_drop_styles_within(LayoutReuseCache *cache,
+                                            lxb_dom_node_t *scope)
+{
+    const size_t direct_limit = (cache->style_mask + 1u) / 8u;
+    size_t visited = 0;
+    lxb_dom_node_t *at = scope;
+    while (at != NULL && visited <= direct_limit) {
+        visited++;
+        /* Computed-style reads also retain text and comment nodes. */
+        layout_reuse_drop_element(cache, at, false);
+        if (at->first_child != NULL) {
+            at = at->first_child;
+            continue;
+        }
+        while (at != scope && at->next == NULL) at = at->parent;
+        at = at == scope ? NULL : at->next;
+    }
+    if (at == NULL) return;
+    for (size_t i = 0; i <= cache->style_mask; i++) {
+        LayoutReuseStyleEntry *entry = &cache->styles[i];
+        if (entry->node != NULL
+            && layout_node_is_within(entry->node, scope)) {
+            layout_reuse_drop_style(cache, entry);
+        }
+    }
+}
+
+static void layout_reuse_drop_subtree(LayoutReuseCache *cache,
+                                      lxb_dom_node_t *scope,
+                                      bool include_matches)
+{
+    layout_reuse_drop_styles_within(cache, scope);
+    if (include_matches)
+        style_retained_matches_invalidate_within(cache->matches, scope);
 }
 
 #define LAYOUT_REUSE_SHALLOW_CHILD_LIMIT 512u
@@ -693,9 +901,10 @@ static void layout_reuse_invalidate_child_list(
 {
     /* `appended`: `changed` was inserted after every sibling that existed
        before, and no sibling test can see it from one of those
-       (layout_insertion_reaches_siblings): they keep their styles. */
-    bool elements = !appended && (changed == NULL
-        || changed->type == LXB_DOM_NODE_TYPE_ELEMENT);
+       (layout_insertion_reaches_siblings): they keep their styles. With no
+       structural test in the sheet, every sibling does. */
+    bool elements = !appended && cache->selector_has_structure
+        && (changed == NULL || changed->type == LXB_DOM_NODE_TYPE_ELEMENT);
     if (parent->parent != NULL
         && layout_reuse_empty_reaches_siblings(cache, parent)) {
         layout_reuse_drop_subtree(cache, parent->parent, include_matches);
@@ -1368,13 +1577,7 @@ void layout_reuse_cache_retire_subtree(LayoutReuseCache *cache,
            and pending invalidations still retire below. */
         layout_reuse_drop_element(cache, scope, false);
     } else {
-        for (size_t i = 0; i <= cache->style_mask; i++) {
-            LayoutReuseStyleEntry *entry = &cache->styles[i];
-            if (entry->node != NULL
-                && layout_node_is_within(entry->node, scope)) {
-                layout_reuse_drop_style(cache, entry);
-            }
-        }
+        layout_reuse_drop_styles_within(cache, scope);
     }
     for (size_t i = 0; i < LAYOUT_REUSE_INTRINSIC_CAPACITY; i++) {
         LayoutIntrinsicCacheEntry *entry = &cache->intrinsic[i];
@@ -2432,9 +2635,13 @@ void layout_reuse_cache_prepare(LayoutReuseCache *cache,
         && cache->sheet_generation == sheet_generation
         && cache->fonts == fonts
         && cache->viewport_width == viewport_width) {
-        if (cache->images == images) return;
+        if (cache->images == images) {
+            layout_reuse_images_changed_in_place(cache, images);
+            return;
+        }
         layout_reuse_clear_sizing_entries(cache);
         cache->images = images;
+        layout_reuse_images_snapshot(cache, images);
         return;
     }
     layout_reuse_clear_entries(cache);
@@ -2442,6 +2649,7 @@ void layout_reuse_cache_prepare(LayoutReuseCache *cache,
     cache->sheet_generation = sheet_generation;
     cache->fonts = fonts;
     cache->images = images;
+    layout_reuse_images_snapshot(cache, images);
     cache->viewport_width = viewport_width;
     cache->selector_has_has = false;
     cache->selector_focus_has_sibling = false;
@@ -2543,9 +2751,13 @@ static void layout_reuse_style_put_hashed(LayoutReuseCache *cache,
         cache->stats.style_evictions++;
 #endif
     }
-    uint16_t payload = cache->styles[replacement].payload;
-    if (cache->styles[replacement].node == NULL
-        && !layout_reuse_admit_payload(cache, &payload)) return;
+    /* Taken before the replaced entry lets go, so an unchanged style keeps
+       its payload. Refused, the slot would describe the wrong values. */
+    uint16_t payload = 0;
+    bool shared = layout_reuse_share_payload(cache, style, &payload);
+    if (cache->styles[replacement].node != NULL)
+        layout_reuse_drop_style(cache, &cache->styles[replacement]);
+    if (!shared) return;
     size_t inline_length = 0;
     const char *inline_style = document_attribute(node, "style",
                                                   &inline_length);
@@ -2563,7 +2775,6 @@ static void layout_reuse_style_put_hashed(LayoutReuseCache *cache,
             : stylesheet_inline_custom_property_bits(inline_style,
                                                      inline_length)
     };
-    layout_reuse_payload(cache, payload)->style = *style;
 }
 
 static void layout_resolve_canonical_style(

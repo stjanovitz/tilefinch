@@ -18,6 +18,7 @@
 #include "tilefinch/work_ledger.h"
 #include "tilefinch/script_split.h"
 #include "tilefinch/script_census.h"
+#include "tilefinch/selector_syntax.h"
 #include "tilefinch/text_encoding.h"
 
 #include "js_runtime_internal.h"
@@ -76,6 +77,7 @@ static void image_preloads_destroy(ScriptRuntime *runtime);
 #include "js_runtime/image_preloads.inc"
 #include "js_runtime/result_snapshot.inc"
 #include "js_runtime/legacy_surface.inc"
+#include "js_runtime/page_dialogs.inc"
 #include "js_runtime/runtime_creation.inc"
 #include "js_runtime/document_evaluation.inc"
 #include "js_runtime/runtime_loop.inc"

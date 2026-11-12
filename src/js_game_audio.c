@@ -47,13 +47,13 @@ JSValue js_game_audio_decode(JSContext *context,
             runtime_game_audio(bridge), bytes, length, &info)) return JS_NULL;
     JSValue object = JS_NewObject(context);
     if (JS_IsException(object)) return object;
-    if (JS_SetPropertyStr(context, object, "handle",
+    if (js_rt_define_field(context, object, "handle",
                           JS_NewUint32(context, info.handle)) < 0
-        || JS_SetPropertyStr(context, object, "length",
+        || js_rt_define_field(context, object, "length",
                              JS_NewUint32(context, info.frames)) < 0
-        || JS_SetPropertyStr(context, object, "sampleRate",
+        || js_rt_define_field(context, object, "sampleRate",
                              JS_NewUint32(context, info.sample_rate)) < 0
-        || JS_SetPropertyStr(context, object, "numberOfChannels",
+        || js_rt_define_field(context, object, "numberOfChannels",
                              JS_NewInt32(context, info.channels)) < 0) {
         JS_FreeValue(context, object);
         return JS_EXCEPTION;

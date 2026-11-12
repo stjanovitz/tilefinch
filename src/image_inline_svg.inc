@@ -10,12 +10,33 @@ typedef struct {
     size_t capacity;
 } InlineSvgBuffer;
 
+/* One resolved `href="#id"`. Validation resolves every reference the
+   expansion will follow, so expansion reads these instead of searching a
+   tree that its own copies keep changing. `instance` is the target's copy
+   in the clone being expanded when the target lies inside the <svg>, else
+   the page's own element. */
+typedef struct {
+    const lxb_char_t *id;
+    size_t length;
+    lxb_dom_node_t *target;
+    lxb_dom_node_t *instance;
+} InlineSvgReference;
+
 typedef struct {
     const PocDocument *document;
-    lxb_dom_node_t *lookup_root;
+    /* The page's <svg> being expanded: its own elements win a reference,
+       then the first element of the rest of the page. */
+    lxb_dom_node_t *svg;
     lxb_dom_node_t *symbols[INLINE_SVG_USE_DEPTH_LIMIT];
+    /* At most one per admitted <use>. */
+    InlineSvgReference references[INLINE_SVG_USE_LIMIT];
+    size_t reference_count;
     size_t use_count;
     size_t expanded_nodes;
+    /* Expanding: references resolve to instances and must be ones
+       validation resolved. */
+    bool expanding;
+    size_t *id_visits;
 } InlineSvgUseValidation;
 
 static lxb_status_t inline_svg_receive(const lxb_char_t *data, size_t length,
@@ -313,16 +334,32 @@ static bool image_style_chain_for_node(const Stylesheet *sheet,
     return true;
 }
 
+static const lxb_char_t *inline_svg_node_id(lxb_dom_node_t *node,
+                                            size_t *length)
+{
+    if (node->type != LXB_DOM_NODE_TYPE_ELEMENT) return NULL;
+    lxb_dom_attr_t *attr = lxb_dom_interface_element(node)->attr_id;
+    return attr == NULL ? NULL : lxb_dom_attr_value(attr, length);
+}
+
+/* The first element under `root` (inclusive) whose id is `identifier`,
+   leaving out the subtree at `skip`. Lexbor keeps each element's id
+   attribute, so a visit is a pointer read rather than an attribute
+   lookup by name. */
 static lxb_dom_node_t *inline_svg_find_id(lxb_dom_node_t *root,
+                                          lxb_dom_node_t *skip,
                                           const char *identifier,
-                                          size_t identifier_length)
+                                          size_t identifier_length,
+                                          size_t *visits)
 {
     if (root == NULL || identifier == NULL
         || identifier_length == 0) return NULL;
     for (lxb_dom_node_t *node = root; node != NULL;
-         node = inline_svg_next_node(root, node, false)) {
+         node = inline_svg_next_node(root, node, node == skip)) {
+        if (node == skip) continue;
+        if (visits != NULL) (*visits)++;
         size_t id_length = 0;
-        const char *id = document_attribute(node, "id", &id_length);
+        const lxb_char_t *id = inline_svg_node_id(node, &id_length);
         if (id != NULL && id_length == identifier_length
             && memcmp(id, identifier, identifier_length) == 0) {
             return node;
@@ -344,7 +381,7 @@ static bool inline_svg_reference_target(lxb_dom_node_t *target)
 }
 
 static lxb_dom_node_t *inline_svg_resolve_target(
-    const InlineSvgUseValidation *validation, lxb_dom_node_t *use)
+    InlineSvgUseValidation *validation, lxb_dom_node_t *use)
 {
     size_t href_length = 0;
     const char *href = inline_svg_use_href(use, &href_length);
@@ -353,15 +390,107 @@ static lxb_dom_node_t *inline_svg_resolve_target(
     for (size_t i = 1; i < href_length; i++) {
         if (href[i] == '#' || isspace((unsigned char) href[i])) return NULL;
     }
-    lxb_dom_node_t *target = inline_svg_find_id(
-        validation->lookup_root, href + 1, href_length - 1);
-    if (target == NULL && validation->document != NULL
-        && validation->document->html != NULL) {
-        target = inline_svg_find_id(
-            lxb_dom_interface_node(validation->document->html),
-            href + 1, href_length - 1);
+    const char *identifier = href + 1;
+    size_t identifier_length = href_length - 1;
+    const InlineSvgReference *reference = NULL;
+    for (size_t i = 0; i < validation->reference_count; i++) {
+        const InlineSvgReference *at = &validation->references[i];
+        if (at->length == identifier_length
+            && memcmp(at->id, identifier, identifier_length) == 0) {
+            reference = at;
+            break;
+        }
     }
-    return inline_svg_reference_target(target) ? target : NULL;
+    if (reference == NULL && !validation->expanding
+        && validation->reference_count < INLINE_SVG_USE_LIMIT) {
+        lxb_dom_node_t *target = inline_svg_find_id(
+            validation->svg, NULL, identifier, identifier_length,
+            validation->id_visits);
+        if (target == NULL && validation->document != NULL
+            && validation->document->html != NULL) {
+            target = inline_svg_find_id(
+                lxb_dom_interface_node(validation->document->html),
+                validation->svg, identifier, identifier_length,
+                validation->id_visits);
+        }
+        size_t id_length = 0;
+        const lxb_char_t *id = !inline_svg_reference_target(target) ? NULL
+            : inline_svg_node_id(target, &id_length);
+        if (id == NULL || id_length != identifier_length) return NULL;
+        InlineSvgReference *added =
+            &validation->references[validation->reference_count++];
+        *added = (InlineSvgReference) {
+            .id = id, .length = id_length, .target = target,
+            .instance = target
+        };
+        reference = added;
+    }
+    if (reference == NULL) return NULL;
+    lxb_dom_node_t *target = validation->expanding
+        ? reference->instance : reference->target;
+    /* A <use> inside its own target would copy itself on every round. */
+    for (lxb_dom_node_t *at = use->parent; at != NULL; at = at->parent) {
+        if (at == target) return NULL;
+    }
+    return target;
+}
+
+/* The clone's copy of `target`, a node of the original <svg>. The clone is
+   unexpanded and inline_svg_apply_presentation has checked that both trees
+   match child for child, no deeper than INLINE_SVG_STYLE_DEPTH_LIMIT. */
+static lxb_dom_node_t *inline_svg_clone_counterpart(
+    lxb_dom_node_t *original_root, lxb_dom_node_t *clone_root,
+    lxb_dom_node_t *target)
+{
+    lxb_dom_node_t *chain[INLINE_SVG_STYLE_DEPTH_LIMIT + 1u];
+    size_t depth = 0;
+    for (lxb_dom_node_t *at = target; at != original_root; at = at->parent) {
+        if (at == NULL || depth == INLINE_SVG_STYLE_DEPTH_LIMIT + 1u) {
+            return NULL;
+        }
+        chain[depth++] = at;
+    }
+    lxb_dom_node_t *copy = clone_root;
+    while (depth != 0) {
+        lxb_dom_node_t *wanted = chain[--depth];
+        lxb_dom_node_t *original = wanted->parent->first_child;
+        lxb_dom_node_t *child = copy->first_child;
+        while (original != NULL && child != NULL && original != wanted) {
+            original = original->next;
+            child = child->next;
+        }
+        if (original != wanted || child == NULL) return NULL;
+        copy = child;
+    }
+    return copy;
+}
+
+static bool inline_svg_node_within(lxb_dom_node_t *node,
+                                   lxb_dom_node_t *root)
+{
+    for (lxb_dom_node_t *at = node; at != NULL; at = at->parent) {
+        if (at == root) return true;
+    }
+    return false;
+}
+
+/* Point every reference into the svg at its copy in the clone, so
+   expansion draws the styled copy validation counted. */
+static bool inline_svg_bind_instances(InlineSvgUseValidation *validation,
+                                      lxb_dom_node_t *clone)
+{
+    for (size_t i = 0; i < validation->reference_count; i++) {
+        InlineSvgReference *reference = &validation->references[i];
+        if (!inline_svg_node_within(reference->target, validation->svg)) {
+            continue;
+        }
+        reference->instance = inline_svg_clone_counterpart(
+            validation->svg, clone, reference->target);
+        if (reference->instance == NULL) return false;
+    }
+    validation->expanding = true;
+    validation->expanded_nodes = 0;
+    return true;
 }
 
 static size_t inline_svg_subtree_nodes(lxb_dom_node_t *root, size_t limit)
@@ -498,6 +627,15 @@ static bool inline_svg_expand_one_use(InlineSvgUseValidation *validation,
 {
     lxb_dom_node_t *target = inline_svg_resolve_target(validation, use);
     if (target == NULL || use->parent == NULL) return false;
+    /* Validation's allowance again, now over what is really copied: an
+       instance already holds its own expanded uses, each a group plus,
+       for an element target, the element itself where validation counted
+       only its children. */
+    size_t remaining = INLINE_SVG_EXPANSION_NODE_LIMIT + INLINE_SVG_USE_LIMIT
+                       - validation->expanded_nodes;
+    size_t nodes = inline_svg_subtree_nodes(target, remaining);
+    if (nodes > remaining) return false;
+    validation->expanded_nodes += nodes;
     static const lxb_char_t group_name[] = "g";
     lxb_dom_element_t *group = lxb_dom_document_create_element(
         use->owner_document, group_name, 1, NULL);
@@ -902,7 +1040,8 @@ static bool inline_svg_serialize_expanded(ImageLoadContext *context,
 {
     InlineSvgUseValidation validation = {
         .document = context->document,
-        .lookup_root = lxb_dom_interface_node(context->document->html)
+        .svg = node,
+        .id_visits = &context->images->stats.inline_svg_id_visits
     };
     if (!inline_svg_validate_tree(&validation, node, 0)) return false;
     lxb_dom_node_t *clone = lxb_dom_node_clone(node, true);
@@ -913,8 +1052,8 @@ static bool inline_svg_serialize_expanded(ImageLoadContext *context,
         if (clone != NULL) lxb_dom_node_destroy_deep(clone);
         return false;
     }
-    validation.lookup_root = clone;
-    if (!inline_svg_apply_default_viewport(clone, root_style)
+    if (!inline_svg_bind_instances(&validation, clone)
+        || !inline_svg_apply_default_viewport(clone, root_style)
         || !inline_svg_apply_single_symbol_viewbox(
                &validation, clone, node)) {
         lxb_dom_node_destroy_deep(clone);

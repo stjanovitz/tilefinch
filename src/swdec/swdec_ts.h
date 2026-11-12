@@ -20,7 +20,11 @@ typedef struct {
     swdec_ts_audio_cb audio_cb;
     void *user;
 
-    uint8_t au_buf[SWDEC_TS_MAX_AU];
+    /* Caller-owned video access-unit buffer of au_capacity bytes (at most
+       SWDEC_TS_MAX_AU is ever needed). NULL, 0: video payloads are dropped,
+       for an audio-only use. */
+    uint8_t *au_buf;
+    size_t au_capacity;
     size_t au_len;
     uint64_t au_pts, pes_pts;
     int au_has_slice;
@@ -37,7 +41,11 @@ typedef struct {
     } stats;
 } SwdecTs;
 
-void swdec_ts_init(SwdecTs *ts, swdec_ts_video_cb video_cb, swdec_ts_audio_cb audio_cb, void *user);
+void swdec_ts_init(SwdecTs *ts, uint8_t *au_buf, size_t au_capacity,
+                   swdec_ts_video_cb video_cb, swdec_ts_audio_cb audio_cb, void *user);
+/* Forget all stream state and statistics (as swdec_ts_init), keeping the
+   buffer and callbacks; writes no buffer bytes. */
+void swdec_ts_reset(SwdecTs *ts);
 int swdec_ts_feed(SwdecTs *ts, const uint8_t *data, size_t len);   /* returns undigested tail bytes */
 void swdec_ts_flush(SwdecTs *ts);                                   /* end of stream: emit the last AU */
 

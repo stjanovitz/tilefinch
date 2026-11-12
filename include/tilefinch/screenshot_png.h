@@ -10,6 +10,10 @@
 #define SCREENSHOT_PNG_MAX_HEIGHT 272
 #define SCREENSHOT_PNG_PATH_CAPACITY 768
 #define SCREENSHOT_PNG_ERROR_CAPACITY 80
+/* The file's stdio buffer, held in the writer: a pump of four 480-pixel
+   rows (about 5.8 KiB) reaches the Memory Stick in at most one or two
+   writes instead of about six through the default 1 KiB buffer. */
+#define SCREENSHOT_PNG_IO_BUFFER_BYTES 8192
 
 typedef enum {
     SCREENSHOT_PNG_IDLE = 0,
@@ -23,7 +27,8 @@ typedef enum {
  * Each scanline is one uncompressed DEFLATE block. This costs about 1.3 KiB
  * more than a single stored-block stream at 480x272, while making each pump a
  * natural bounded checkpoint and avoiding a second RGB framebuffer.
- * Zero-initialize the writer before its first use. A pending writer must be
+ * The writer holds its file's stdio buffer, so it must stay in place (not
+ * be copied or freed) while a write is pending. Zero-initialize the writer before its first use. A pending writer must be
  * completed or cancelled before it is reused.
  */
 typedef struct {
@@ -40,6 +45,7 @@ typedef struct {
     char final_path[SCREENSHOT_PNG_PATH_CAPACITY];
     char temporary_path[SCREENSHOT_PNG_PATH_CAPACITY + 5];
     char error[SCREENSHOT_PNG_ERROR_CAPACITY];
+    char io_buffer[SCREENSHOT_PNG_IO_BUFFER_BYTES];
 } ScreenshotPngWriter;
 
 bool screenshot_png_begin(

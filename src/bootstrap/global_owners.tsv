@@ -1,11 +1,17 @@
 # Standards-visible global	authoritative source
+# A source under src/ other than src/bootstrap/ is a native installer: it
+# defines the global itself, and no bootstrap module may.
 AbortController	compat.js
+alert	js_runtime/page_dialogs.inc
 Blob	platform.js
+confirm	js_runtime/page_dialogs.inc
 CSSStyleDeclaration	platform.js
 DOMImplementation	platform.js
 EventSource	compat.js
 FormData	platform.js
 Headers	compat.js
+print	js_runtime/legacy_surface.inc
+prompt	js_runtime/page_dialogs.inc
 Request	compat.js
 Response	compat.js
 SharedWorker	compat.js

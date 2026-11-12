@@ -1,0 +1,18 @@
+# Install the Cyrillic pack through the in-page offer, from recorded release
+# responses (see glyph-pack-install-menu.txt for the setup). The offer appears
+# once the page has settled and the boot notice has gone, takes X after 600 ms
+# and lasts 12 s. The first X opens the confirmation and fetches the signed
+# size; the second installs.
+
+wait 300
+mark-page settled
+wait 120
+tap cross
+wait 300
+mark confirm-sized
+tap cross
+mark install-started
+wait 900
+mark-page page-after
+wait 300
+end

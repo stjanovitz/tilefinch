@@ -1,7 +1,11 @@
 #include "tilefinch/psp_ui.h"
+#include "tilefinch/text_bidi.h"
+#include "tilefinch/utf8_encode.h"
 #include "tilefinch/psp_ui_theme.h"
+#include "tilefinch/public_suffix.h"
 
 #include <ctype.h>
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -205,6 +209,9 @@ static uint32_t chrome_font_epoch = 1u;
    raster's ink check rescans the cache only after one. Glyph slots are
    written on the owner thread only, which is also where that check runs. */
 static uint32_t chrome_glyph_state_generation = 1u;
+/* A measured fallback is provisional while its payload or allocation is
+   pending. Do not retain row widths computed during one of those loads. */
+static uint32_t chrome_glyph_unsettled_generation;
 
 static void chrome_glyph_state_changed(void)
 {
@@ -474,7 +481,7 @@ static const UiOptionDesc ui_option_descs[] = {
     [UI_OPTION_RESUME_DOWNLOADS] = {"Resume saves",
         "Continue queued saves after startup", 2},
     [UI_OPTION_CONTENT_BLOCKER] = {"Content blocker",
-        "Block common ad and tracking requests", 3},
+        "Block ads, tag managers and A/B tests", 3},
     [UI_OPTION_COSMETIC_HIDING] = {"Hide page ads",
         "Hide empty ad spaces in page layout", 3},
     [UI_OPTION_COOKIE_BANNERS] = {"Cookie notices",
@@ -1437,9 +1444,11 @@ static __attribute__((noinline)) uint8_t chrome_glyph_load(
        still pending when the load returns false, not a Budget refusal. */
     if (glyph->provider_pending) {
         font_glyph_destroy(face, glyph);
+        chrome_glyph_unsettled_generation++;
         return UI_CHROME_GLYPH_PENDING;
     }
     if (loaded) return UI_CHROME_GLYPH_LOADED;
+    chrome_glyph_unsettled_generation++;
     unsigned refusals = previous >= UI_CHROME_GLYPH_REFUSED_FIRST
             && previous < UI_CHROME_GLYPH_PENDING
         ? previous - UI_CHROME_GLYPH_REFUSED_FIRST + 1u : 0u;
@@ -1687,7 +1696,7 @@ static size_t utf8_character_count(const char *text, size_t bytes)
     return characters;
 }
 
-/* Indic vowel/conjunct clusters are pre-shaped in optional packs. Measurement
+/* Indic vowel/conjunct clusters and accented capitals are pre-shaped in optional packs. Measurement
    and painting must consume the same longest sequence instead of separating
    its marks into unrelated character cells. Ordinary labels stay unchanged. */
 static size_t ui_text_next_glyph(const char *text, size_t bytes,
@@ -1696,7 +1705,10 @@ static size_t ui_text_next_glyph(const char *text, size_t bytes,
     size_t used = font_utf8_next(text, bytes, codepoint);
     if (characters) *characters = used ? 1u : 0u;
     if (used && ((*codepoint >= 0x0900u && *codepoint <= 0x09ffu)
-        || (*codepoint >= 0xa8e0u && *codepoint <= 0xa8ffu))) {
+        || (*codepoint >= 0xa8e0u && *codepoint <= 0xa8ffu)
+        /* A capital and its accent (U+0300-036F). */
+        || (*codepoint >= 'A' && *codepoint <= 0x052fu && used < bytes
+            && ((unsigned char) text[used] & 0xfeu) == 0xccu))) {
         size_t matched = 0;
         unsigned key;
         if (font_optional_glyph_match_sequence(text, bytes, &matched, &key)) {
@@ -1725,6 +1737,64 @@ static int ui_ellipsis_advance(int scale, bool bold, const FontGlyph **dot)
     return 6 * scale;
 }
 
+/* Steps to the next glyph of a run. A pre-base vowel draws ahead of its
+   cluster and is skipped on arrival. */
+static size_t ui_text_walk_glyph(
+    const char *text, size_t bytes, size_t *byte_at, size_t *prebase_skip,
+    unsigned *codepoint, size_t *consumed)
+{
+    if (*byte_at == *prebase_skip) {
+        *prebase_skip = SIZE_MAX;
+        *byte_at += 3u;
+        if (*byte_at >= bytes) return 0;
+    }
+    size_t vowel = (unsigned char) text[*byte_at] == 0xe0u
+            && *prebase_skip == SIZE_MAX
+        ? font_indic_prebase_vowel(text + *byte_at, bytes - *byte_at) : 0;
+    size_t used = ui_text_next_glyph(
+        text + *byte_at + vowel, bytes - *byte_at - vowel,
+        codepoint, consumed);
+    if (used == 0) return 0;
+    if (vowel != 0) *prebase_skip = *byte_at + vowel;
+    else *byte_at += used;
+    return used;
+}
+
+/* The tallest chrome glyph box, and so the farthest one can reach below its
+   baseline. Only a run this close to the bottom edge is measured. */
+#define UI_TEXT_TALLEST_GLYPH 16
+
+/*
+ * How far a run must rise for every glyph box to stay on the surface. A pack
+ * with baseline metrics keeps its descent in the cell, reaching lower than the
+ * rows laid out for the built-in face. The whole run rises, so it keeps one
+ * baseline and does not depend on which letters it holds. ASCII comes from the
+ * built-in face, whose rows already fit.
+ */
+static TILEFINCH_OUT_OF_LINE int ui_text_bottom_lift(
+    const char *text, size_t bytes, size_t visible,
+    int baseline, int height, int scale, bool bold)
+{
+    size_t scan = 0;
+    while (scan < bytes && (unsigned char) text[scan] < 0x80u) scan++;
+    if (scan == bytes) return 0;
+    int bottom = height;
+    size_t byte_at = 0, prebase_skip = SIZE_MAX;
+    for (size_t at = 0; at < visible && byte_at < bytes;) {
+        unsigned codepoint = 0;
+        size_t consumed = 0;
+        if (ui_text_walk_glyph(text, bytes, &byte_at, &prebase_skip,
+                               &codepoint, &consumed) == 0
+            || consumed > visible - at) break;
+        at += consumed;
+        if (codepoint == 0x25a1u) continue;
+        const FontGlyph *glyph = chrome_font_glyph(codepoint, scale, bold, NULL);
+        if (glyph != NULL && baseline + glyph->y_offset + glyph->height > bottom)
+            bottom = baseline + glyph->y_offset + glyph->height;
+    }
+    return bottom - height;
+}
+
 static int draw_text_with_font(
     uint16_t *pixels, int width, int height, int stride,
     int x, int y, const char *text, size_t maximum_characters,
@@ -1733,6 +1803,18 @@ static int draw_text_with_font(
 {
     if (text == NULL) return x;
     int baseline_offset = scale >= 2 ? 13 : 10;
+    const FontGlyph *dot = NULL;
+    int dot_advance = ui_ellipsis_advance(scale, chrome_bold, &dot);
+    int ellipsis_reserve = 3 * dot_advance;
+    size_t bytes = strlen(text);
+    size_t characters = utf8_character_count(text, bytes);
+    bool ellipsis = characters > maximum_characters;
+    size_t visible = characters < maximum_characters
+        ? characters : maximum_characters;
+    if (ellipsis && visible > 3u) visible -= 3u;
+    if (y > height - baseline_offset - UI_TEXT_TALLEST_GLYPH)
+        y -= ui_text_bottom_lift(text, bytes, visible, y + baseline_offset,
+                                 height, scale, chrome_bold);
     /* A refused/off-owner glyph can share a line with retained font ink.
        Anchor the built-in 5x7 replacement to that same baseline. Before a
        font is bound, keep the boot bitmap's original top-based geometry. */
@@ -1744,25 +1826,15 @@ static int draw_text_with_font(
     int ink_left = x, ink_right = x, ink_top = y, ink_bottom = y;
     bool missing_glyph = false;
 #endif
-    const FontGlyph *dot = NULL;
-    int dot_advance = ui_ellipsis_advance(scale, chrome_bold, &dot);
-    int ellipsis_reserve = 3 * dot_advance;
-    size_t bytes = strlen(text);
-    size_t characters = utf8_character_count(text, bytes);
-    bool ellipsis = characters > maximum_characters;
-    size_t visible = characters < maximum_characters
-        ? characters : maximum_characters;
-    if (ellipsis && visible > 3u) visible -= 3u;
     size_t byte_at = 0;
+    size_t prebase_skip = SIZE_MAX;
     for (size_t at = 0; at < visible && byte_at < bytes;) {
         unsigned codepoint = 0;
         size_t consumed = 0;
-        size_t used = ui_text_next_glyph(
-            text + byte_at, bytes - byte_at, &codepoint, &consumed);
-        if (used == 0) break;
+        if (ui_text_walk_glyph(text, bytes, &byte_at, &prebase_skip,
+                               &codepoint, &consumed) == 0) break;
         if (consumed > visible - at) { ellipsis = true; break; }
         at += consumed;
-        byte_at += used;
         const FontGlyph *glyph = NULL;
         /* Always prefer the retained chrome cache for ASCII and any Unicode
            glyph it can serve. A preferred face is a fallback, not a reason
@@ -1892,6 +1964,38 @@ static int draw_text_bold(
         0x3fffffff, color, scale, NULL, true);
 }
 
+/*
+ * Page-supplied text in the chrome (the title of a page, tab, bookmark or
+ * suggestion) on one row, in display order: right-to-left runs reversed and
+ * shaped, and cut on the side the text ends. Catalog strings are stored
+ * already shaped and must not come here, or they would be reversed twice.
+ * Text that needs no reordering draws exactly as draw_text_with_font would.
+ */
+enum { UI_PAGE_TEXT_BYTES = 256 };
+static const char *ui_page_text_visual(const char *text, int maximum_width,
+                                       int scale, const FontFace *font,
+                                       bool bold);
+
+static int draw_page_text(
+    uint16_t *pixels, int width, int height, int stride,
+    int x, int y, const char *text, size_t maximum_characters,
+    int maximum_x, uint16_t color, int scale, const FontFace *font,
+    bool bold)
+{
+    const char *shown = ui_page_text_visual(text, maximum_x - x, scale, font,
+                                            bold);
+    if (shown == text)
+        return draw_text_with_font(pixels, width, height, stride, x, y, text,
+                                   maximum_characters, maximum_x, color, scale,
+                                   font, bold);
+    /* Already cut to the width, dots included: the painter must not cut it
+       again, which would take the wrong end of a right-to-left row. */
+    return draw_text_with_font(
+        pixels, width, height, stride, x, y, shown, UI_PAGE_TEXT_BYTES,
+        maximum_x + 3 * ui_ellipsis_advance(scale, bold, NULL), color, scale,
+        font, bold);
+}
+
 /* The advance the chrome painter gives one glyph (or opaque cluster key). */
 static int chrome_glyph_advance(unsigned codepoint, int scale, bool bold)
 {
@@ -1995,6 +2099,9 @@ static void draw_ui_settings_heading(
     uint16_t *pixels, int width, int height, int stride, UiRect box,
     const char *category, uint16_t text, uint16_t accent)
 {
+    /* The hint row starts here. A pack's descent must rise above it, which
+       the text path does at the bottom of the surface it is given. */
+    int bottom = box.y + 31 < height ? box.y + 31 : height;
     const char *settings = tilefinch_ui_text("Settings");
     int left = box.x + 16, right = box.x + box.width - 16;
     int scale = 2;
@@ -2007,17 +2114,17 @@ static void draw_ui_settings_heading(
             + 24 > right - left) {
         /* Two compact lines fit above the existing hint/rule. Do not truncate
            the category just because the translated parent title is wider. */
-        draw_fitted_ui_text(pixels, width, height, stride, left,
+        draw_fitted_ui_text(pixels, width, bottom, stride, left,
             box.y + 4, settings, right, text, 1, true);
-        draw_fitted_ui_text(pixels, width, height, stride, left,
+        draw_fitted_ui_text(pixels, width, bottom, stride, left,
             box.y + 18, category, right, accent, 1, true);
         return;
     }
-    int end = draw_fitted_ui_text(pixels, width, height, stride, left,
+    int end = draw_fitted_ui_text(pixels, width, bottom, stride, left,
         box.y + 14, settings, right, text, scale, true);
-    end = draw_fitted_ui_text(pixels, width, height, stride, end + 8,
+    end = draw_fitted_ui_text(pixels, width, bottom, stride, end + 8,
         box.y + 14, ">", right, accent, scale, true);
-    draw_fitted_ui_text(pixels, width, height, stride, end + 8,
+    draw_fitted_ui_text(pixels, width, bottom, stride, end + 8,
         box.y + 14, category, right, accent, scale, true);
 }
 
@@ -2176,18 +2283,202 @@ static void draw_lock(uint16_t *pixels, int width, int height, int stride,
     put_pixel(pixels, width, height, stride, x + 6, y + 3, color);
 }
 
-static void ui_url_presentation(
+/*
+ * A site's host as the chrome shows it. The end of a host names its owner,
+ * so a host that does not fit gives way at its start, never its end:
+ * "...evil.example", not "accounts.google.com.aaaa...". Whole labels go
+ * first, down to the registrable domain (eTLD+1); only a registrable
+ * domain, IP address or single name too long by itself loses characters,
+ * still from the left. Desktop browsers elide the address bar the same way.
+ *
+ * text is a host with an optional ":port", optionally after "scheme://";
+ * the scheme stays when there is room, anything after the host is dropped,
+ * and a leading "..." from an earlier shortening is kept. room is pixels
+ * at scale/bold, or INT_MAX to bound only bytes (no glyph is looked up
+ * then, so producers off the paint path may use it). Returns the shown
+ * width in pixels (0 in byte mode or for an empty host), or -1 when not
+ * even "..." and the last character fit.
+ */
+/* A shown host: wider than any row, so the room, not this, bounds it.
+   The paint path may run on the 8 KiB supervisor stack; keep it small. */
+enum { UI_HOST_SHOWN_BYTES = 160 };
+
+typedef struct {
+    int room;
+    int scale;
+    bool bold;
+    size_t capacity;
+} UiHostFit;
+
+static int ui_host_fit_text(const char *text, const UiHostFit *fit, char *out)
+{
+    if (out == NULL || fit == NULL || fit->capacity == 0) return -1;
+    out[0] = '\0';
+    if (text == NULL) return -1;
+    bool pixels = fit->room != INT_MAX;
+    size_t prefix = 0;
+    const char *separator = strstr(text, "://");
+    if (separator != NULL && (size_t) (separator - text) <= 16u
+        && strcspn(text, ":/?#") == (size_t) (separator - text))
+        prefix = (size_t) (separator - text) + 3u;
+    const char *host = text + prefix;
+    bool elided = strncmp(host, "...", 3u) == 0;
+    if (elided) host += 3;
+    size_t authority = strcspn(host, "/?#");
+    if (authority == 0) return 0;
+    /* The name, without a port, decides what must stay. */
+    size_t name = authority;
+    if (host[0] == '[') {
+        const char *close = memchr(host, ']', authority);
+        if (close != NULL) name = (size_t) (close - host) + 1u;
+    } else {
+        const char *colon = memchr(host, ':', authority);
+        if (colon != NULL) name = (size_t) (colon - host);
+    }
+    /* keep is where the registrable domain starts: the label before the
+       longest public suffix. Suffixes are tried one by one, so a label
+       DNS would refuse (one over 63 bytes) cannot hide the domain after
+       it. An address or a bare suffix has none, and stays whole. */
+    size_t keep = 0;
+    char suffixes[254];
+    if (name > 0 && name < sizeof(suffixes) && host[0] != '[') {
+        memcpy(suffixes, host, name);
+        suffixes[name] = '\0';
+        size_t previous = SIZE_MAX;
+        for (size_t at = 0; at < name;) {
+            bool is_public = false;
+            if (tilefinch_public_suffix_classify(suffixes + at, &is_public)
+                && is_public) {
+                if (previous != SIZE_MAX) keep = previous;
+                break;
+            }
+            const char *dot = memchr(suffixes + at, '.', name - at);
+            if (dot == NULL) break;
+            previous = at;
+            at = (size_t) (dot - suffixes) + 1u;
+        }
+    }
+    /* Only the last capacity bytes can ever be shown. */
+    size_t first = authority > fit->capacity ? authority - fit->capacity : 0;
+    if (first > keep) keep = first;
+    int dots_width = pixels
+        ? chrome_text_width_bytes("...", 3u, fit->scale, fit->bold) : 0;
+    int host_width = pixels
+        ? chrome_text_width_bytes(host + first, authority - first,
+                                  fit->scale, fit->bold) : 0;
+    int prefix_width = pixels && prefix != 0
+        ? chrome_text_width_bytes(text, prefix, fit->scale, fit->bold) : 0;
+    for (int pass = 0; pass < (prefix != 0 ? 2 : 1); pass++) {
+        /* The scheme stays while whole labels can make room; it goes
+           before the registrable domain loses a character. */
+        bool labels_only = pass == 0 && prefix != 0;
+        size_t shown_prefix = pass == 0 ? prefix : 0;
+        int shown_prefix_width = pass == 0 ? prefix_width : 0;
+        int tail_width = host_width;
+        for (size_t start = first; start < authority;) {
+            bool dots = elided || start != 0;
+            /* Whole labels down to the registrable domain, then single
+               characters. */
+            bool boundary = start == 0 || host[start - 1u] == '.';
+            bool candidate = labels_only ? boundary && start <= keep
+                                         : boundary || start > keep;
+            size_t bytes = shown_prefix + (dots ? 3u : 0u)
+                + (authority - start);
+            int shown_width = shown_prefix_width
+                + (dots ? dots_width : 0) + tail_width;
+            if (candidate && bytes < fit->capacity
+                && (!pixels || shown_width <= fit->room)) {
+                memcpy(out, text, shown_prefix);
+                size_t used = shown_prefix;
+                if (dots) {
+                    memcpy(out + used, "...", 3u);
+                    used += 3u;
+                }
+                memcpy(out + used, host + start, authority - start);
+                out[used + authority - start] = '\0';
+                return pixels ? shown_width : 0;
+            }
+            unsigned codepoint = 0;
+            size_t used = ui_text_next_glyph(host + start, authority - start,
+                                             &codepoint, NULL);
+            if (used == 0) break;
+            if (pixels)
+                tail_width -= chrome_glyph_advance(codepoint, fit->scale,
+                                                   fit->bold);
+            start += used;
+        }
+    }
+    return -1;
+}
+
+void psp_ui_host_label(const char *text, char *output, size_t capacity)
+{
+    if (output == NULL || capacity == 0) return;
+    UiHostFit fit = {INT_MAX, 1, false, capacity};
+    if (ui_host_fit_text(text, &fit, output) < 0) output[0] = '\0';
+}
+
+/* Draws a host (see ui_host_fit_text) from x within right. The painter
+   never cuts the fitted text again, so its end is always on screen. */
+static int draw_host_text(
+    uint16_t *pixels, int width, int height, int stride, int x, int y,
+    const char *host, int right, uint16_t color, int scale, bool bold)
+{
+    char shown[UI_HOST_SHOWN_BYTES];
+    UiHostFit fit = {right - x, scale, bold, sizeof(shown)};
+    bool fits = ui_host_fit_text(host, &fit, shown) >= 0;
+    if (!fits) copy_string(shown, sizeof(shown), "...");
+    return draw_text_with_font(
+        pixels, width, height, stride, x, y, shown, sizeof(shown),
+        right + (fits ? 3 * ui_ellipsis_advance(scale, bold, NULL) : 0),
+        color, scale, NULL, bold);
+}
+
+/* Draws a saved page's address from x within right. An http(s) address
+   whose host and the ellipsis fit is cut at its right, in its path; one
+   whose host does not fit is drawn as its host alone (draw_host_text), so
+   the registrable domain is never the part that gives way. Anything else
+   (tilefinch:, data:, a title) is cut at its right as before. */
+static int draw_url_text(
+    uint16_t *pixels, int width, int height, int stride, int x, int y,
+    const char *url, size_t characters, int right, uint16_t color,
+    int scale, bool bold)
+{
+    if (url == NULL) url = "";
+    size_t prefix = strncmp(url, "https://", 8u) == 0 ? 8u
+        : (strncmp(url, "http://", 7u) == 0 ? 7u : 0u);
+    if (prefix != 0) {
+        /* Only pixels bound an address: a character cap could keep a
+           host's start and drop its end. */
+        size_t length = strlen(url);
+        size_t authority = prefix + strcspn(url + prefix, "/?#");
+        int room = right - x;
+        if (chrome_text_width_bytes(url, length, scale, bold) > room
+            && chrome_text_width_bytes(url, authority, scale, bold)
+                       + 3 * ui_ellipsis_advance(scale, bold, NULL) > room)
+            return draw_host_text(pixels, width, height, stride, x, y, url,
+                                  right, color, scale, bold);
+        characters = length;
+    }
+    return draw_text_with_font(pixels, width, height, stride, x, y, url,
+                               characters, right, color, scale, NULL, bold);
+}
+
+/* The address field's two lines. Returns whether domain is the page's
+   host and port, which is drawn with draw_host_text so it keeps its end;
+   otherwise it is the title or Tilefinch's own name. */
+static bool ui_url_presentation(
     const PspUiState *ui, char *domain, size_t domain_capacity,
     char *detail, size_t detail_capacity)
 {
     if (domain == NULL || domain_capacity == 0
-        || detail == NULL || detail_capacity == 0) return;
+        || detail == NULL || detail_capacity == 0) return false;
     domain[0] = '\0';
     detail[0] = '\0';
     const char *url = ui == NULL ? NULL : ui->url;
     if (url == NULL || url[0] == '\0') {
         copy_string(domain, domain_capacity, ui == NULL ? "" : ui->title);
-        return;
+        return false;
     }
     const char *at = url;
     if (strncmp(at, "https://", 8u) == 0) at += 8;
@@ -2200,24 +2491,26 @@ static void ui_url_presentation(
         else
             copy_string(detail, detail_capacity,
                         ui->title[0] == '\0' ? "Page" : ui->title);
-        return;
+        return false;
     }
     const char *end = at;
     while (*end != '\0' && *end != '/' && *end != '?' && *end != '#')
         end++;
-    size_t host_length = (size_t) (end - at);
-    if (host_length >= domain_capacity) host_length = domain_capacity - 1u;
-    memcpy(domain, at, host_length);
-    domain[host_length] = '\0';
+    psp_ui_host_label(at, domain, domain_capacity);
     if (*end != '\0') copy_string(detail, detail_capacity, end);
     else if (ui != NULL && ui->title[0] != '\0')
         copy_string(detail, detail_capacity, ui->title);
+    return domain[0] != '\0';
 }
 
 static void copy_string(char *destination, size_t capacity, const char *source)
 {
     if (destination == NULL || capacity == 0) return;
-    snprintf(destination, capacity, "%s", source == NULL ? "" : source);
+    int written = snprintf(
+        destination, capacity, "%s", source == NULL ? "" : source);
+    if (written >= (int) capacity)
+        destination[tilefinch_utf8_complete_prefix(
+            destination, capacity - 1u)] = '\0';
 }
 
 PspUiToolbarGestureResult psp_ui_toolbar_gesture_update(
@@ -2459,6 +2752,22 @@ void psp_ui_keep_status(PspUiState *ui, const char *status,
     if (ui->toast_frames < duration_frames)
         ui->toast_frames = (uint16_t) (duration_frames > UINT16_MAX
             ? UINT16_MAX : duration_frames);
+}
+
+#define PSP_UI_PREVIEW_HINT "PREVIEW READY  R TO READ"
+
+void psp_ui_set_preview_hint(PspUiState *ui, bool shown)
+{
+    if (ui == NULL) return;
+    if (!shown) {
+        psp_ui_dismiss_status(ui, PSP_UI_PREVIEW_HINT);
+        return;
+    }
+    if (ui->toast_frames != 0
+        && (ui->toast_kind != PSP_UI_TOAST_PLAIN
+            || (strcmp(ui->status, PSP_UI_PREVIEW_HINT) != 0
+                && strncmp(ui->status, "LOADING", 7u) != 0))) return;
+    psp_ui_keep_status(ui, PSP_UI_PREVIEW_HINT, 600);
 }
 
 void psp_ui_keep_progress_status(PspUiState *ui, const char *status,
@@ -2730,6 +3039,12 @@ void psp_ui_set_update(
     ui->update_progress_per_mille = progress_per_mille;
     ui->update_primary_enabled = primary_enabled;
     ui->update_cancel_enabled = cancel_enabled;
+    ui->update_discard_enabled = 0u;
+}
+
+void psp_ui_set_update_discard(PspUiState *ui, bool enabled)
+{
+    if (ui != NULL) ui->update_discard_enabled = enabled ? 1u : 0u;
 }
 
 void psp_ui_set_update_history(
@@ -2891,6 +3206,40 @@ void psp_ui_show_zip_install(PspUiState *ui, const ZipInstallPreview *preview)
     ui->base_screen = PSP_UI_SCREEN_PAGE;
     ui->zip_install_preview = preview;
     ui_open_overlay(ui, PSP_UI_SCREEN_ZIP_INSTALL);
+}
+
+bool psp_ui_release_view(PspUiState *ui, const void *view)
+{
+    if (ui == NULL || view == NULL) return false;
+    bool shown = (ui->screen == PSP_UI_SCREEN_OFFLINE_APP_PREVIEW
+                  && (const void *) ui->offline_app_preview == view)
+        || (ui->screen == PSP_UI_SCREEN_FILE_DOWNLOAD
+            && (const void *) ui->file_download_preview == view)
+        || (ui->screen == PSP_UI_SCREEN_ZIP_INSTALL
+            && (const void *) ui->zip_install_preview == view);
+    if (!shown) return false;
+    /* The recompile offer's base is the Library, whose view this slot held
+       before the offer took it, so only the page is safe to fall back to. */
+    ui->screen = PSP_UI_SCREEN_PAGE;
+    ui->base_screen = (uint8_t) PSP_UI_SCREEN_PAGE;
+    ui->zip_install_preview = NULL;
+    return true;
+}
+
+void psp_ui_show_page_dialog(PspUiState *ui, const PspUiPageDialogView *view)
+{
+    if (ui == NULL || view == NULL) return;
+    ui->page_dialog = view;
+    ui_open_overlay(ui, PSP_UI_SCREEN_PAGE_DIALOG);
+    /* Shown at once: no panel motion, which is the native panels' entrance. */
+    ui->overlay_animation_frames = 0;
+}
+
+void psp_ui_clear_page_dialog(PspUiState *ui)
+{
+    if (ui == NULL) return;
+    ui->page_dialog = NULL;
+    if (ui->screen == PSP_UI_SCREEN_PAGE_DIALOG) ui->screen = PSP_UI_SCREEN_PAGE;
 }
 
 void psp_ui_show_offline_app_preview(
@@ -3076,8 +3425,8 @@ void psp_ui_show_storage_offer(
     uint64_t free_bytes)
 {
     if (ui == NULL || origin == NULL) return;
-    snprintf(ui->storage_offer_origin, sizeof(ui->storage_offer_origin),
-             "%s", origin);
+    psp_ui_host_label(origin, ui->storage_offer_origin,
+                      sizeof(ui->storage_offer_origin));
     ui->storage_offer_current = ui_clamp_u32(current_bytes);
     ui->storage_offer_needed = ui_clamp_u32(needed_bytes);
     ui->storage_offer_limit = ui_clamp_u32(limit_bytes);
@@ -3093,7 +3442,7 @@ void psp_ui_show_heavy_offer(PspUiState *ui, const char *site,
                              size_t script_bytes, uint32_t estimate_ms)
 {
     if (ui == NULL || site == NULL) return;
-    snprintf(ui->heavy_offer_site, sizeof(ui->heavy_offer_site), "%s", site);
+    psp_ui_host_label(site, ui->heavy_offer_site, sizeof(ui->heavy_offer_site));
     ui->heavy_offer_script_bytes = ui_clamp_u32(script_bytes);
     uint32_t seconds = (estimate_ms + 500u) / 1000u;
     ui->heavy_offer_seconds = (uint16_t) (seconds > UINT16_MAX
@@ -3974,6 +4323,10 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
         if (pressed & PSP_UI_BUTTON_CONFIRM) {
             if (ui->update_primary_enabled)
                 intent.update_primary_requested = true;
+            intent.visual_changed = true;
+        } else if ((pressed & PSP_UI_BUTTON_RELOAD)
+                   && ui->update_discard_enabled) {
+            intent.update_discard_requested = true;
             intent.visual_changed = true;
         } else if ((pressed & PSP_UI_BUTTON_RELOAD)
                    && !ui->update_cancel_enabled
@@ -5151,7 +5504,8 @@ bool psp_ui_intent_predispatch_is_complete(const PspUiIntent *intent)
         && !intent->clear_session_storage_requested
         && !intent->clear_compiled_scripts_requested
         && !intent->update_primary_requested
-        && !intent->update_cancel_requested;
+        && !intent->update_cancel_requested
+        && !intent->update_discard_requested;
 }
 
 /*
@@ -5430,14 +5784,18 @@ static void draw_top_bar(const PspUiState *ui, uint16_t *pixels, int width,
                           : (ui->secure ? PSP_THEME_OK
                                         : PSP_THEME_TEXT_MUTED));
     char domain[128], detail[256];
-    ui_url_presentation(
-        ui, domain, sizeof(domain), detail, sizeof(detail));
-    draw_text_with_font(
-        pixels, width, height, stride, 91, scale == 2 ? 8 : 7,
-        domain, scale == 2 ? 32 : 64, address_right - 5,
-        PSP_THEME_TEXT, scale, NULL, true);
+    if (ui_url_presentation(
+            ui, domain, sizeof(domain), detail, sizeof(detail)))
+        draw_host_text(
+            pixels, width, height, stride, 91, scale == 2 ? 8 : 7,
+            domain, address_right - 5, PSP_THEME_TEXT, scale, true);
+    else
+        draw_page_text(
+            pixels, width, height, stride, 91, scale == 2 ? 8 : 7,
+            domain, scale == 2 ? 32 : 64, address_right - 5,
+            PSP_THEME_TEXT, scale, NULL, true);
     if (scale == 1 && detail[0] != '\0')
-        draw_text_with_font(
+        draw_page_text(
             pixels, width, height, stride, 91, 20, detail, 80,
             address_right - 5, PSP_THEME_TEXT_MUTED, 1, NULL, false);
 
@@ -5491,17 +5849,34 @@ static void draw_bottom_bar(const PspUiState *ui, uint16_t *pixels, int width,
     }
     if (ui->captive_portal_active) {
         char domain[128], detail[256];
-        ui_url_presentation(
+        bool host = ui_url_presentation(
             ui, domain, sizeof(domain), detail, sizeof(detail));
-        char label[180];
-        snprintf(label, sizeof(label), "%s: %s",
-                 tilefinch_ui_text("WI-FI SIGN-IN"), domain);
         int cancel_x = width - 7
             - button_legend_width("O", "Cancel", scale);
+        int label_scale = scale == 2 ? 2 : 1;
+        int label_right = cancel_x - UI_LEGEND_PAIR_GAP;
+        char label[256];
+        int used = snprintf(label, sizeof(label), "%s: ",
+                            tilefinch_ui_text("WI-FI SIGN-IN"));
+        bool fits = false;
+        if (used > 0 && (size_t) used < sizeof(label)) {
+            /* The portal's host follows the label and keeps its end. */
+            int label_width = chrome_text_width_bytes(
+                label, (size_t) used, label_scale, true);
+            UiHostFit fit = {label_right - 7 - label_width, label_scale,
+                             true, sizeof(label) - (size_t) used};
+            fits = host && ui_host_fit_text(
+                domain, &fit, label + used) >= 0;
+            if (!host)
+                copy_string(label + used, sizeof(label) - (size_t) used,
+                            domain);
+        }
         draw_text_with_font(
             pixels, width, height, stride, 7, top + (scale == 2 ? 7 : 6),
-            label, 48, cancel_x - UI_LEGEND_PAIR_GAP, accent,
-            scale == 2 ? 2 : 1, NULL, true);
+            label, sizeof(label),
+            label_right + (fits ? 3 * ui_ellipsis_advance(
+                                          label_scale, true, NULL) : 0),
+            accent, label_scale, NULL, true);
         draw_button_legend(pixels, width, height, stride, cancel_x,
                            top + 7, "O", "Cancel", accent, scale);
         return;
@@ -5625,6 +6000,42 @@ static void ui_copy_cached_rows(
     }
 }
 
+/* The cached bars are checked against the live inputs in place: every
+   present with chrome visible asks, and building a ~0.7 KiB key copy to
+   compare would clear and copy that much each time (on the callback
+   thread's small stack too). The strings fit their key fields exactly
+   (same capacities), so copy_string stores them whole and strcmp is the
+   key's equality. Keys are filled before the painter runs, as the inputs
+   it was drawn from. */
+_Static_assert(sizeof(((UiTopBarCacheKey *) 0)->url)
+                   == sizeof(((PspUiState *) 0)->url)
+               && sizeof(((UiTopBarCacheKey *) 0)->title)
+                   == sizeof(((PspUiState *) 0)->title)
+               && sizeof(((UiBottomBarCacheKey *) 0)->url)
+                   == sizeof(((PspUiState *) 0)->url)
+               && sizeof(((UiBottomBarCacheKey *) 0)->focus_label)
+                   == sizeof(((PspUiState *) 0)->focus_label),
+               "chrome cache key strings hold the UI strings whole");
+
+static bool top_bar_cache_current(const PspUiState *ui)
+{
+    const UiTopBarCacheKey *key = &browser_chrome_cache.top_key;
+    return browser_chrome_cache.top_valid
+        && memcmp(&key->palette, psp_ui_theme_active_palette,
+                  sizeof(key->palette)) == 0
+        && memcmp(&key->device, &device_status, sizeof(key->device)) == 0
+        && key->regular_font == chrome_font_cache.faces[0]
+        && key->bold_font == chrome_font_cache.faces[1]
+        && key->font_epoch == chrome_font_epoch
+        && key->scale == (uint8_t) browser_ui_scale(ui)
+        && key->can_go_back == (uint8_t) ui->can_go_back
+        && key->can_go_forward == (uint8_t) ui->can_go_forward
+        && key->secure == (uint8_t) ui->secure
+        && key->loading == (uint8_t) ui->loading
+        && strcmp(key->url, ui->url) == 0
+        && strcmp(key->title, ui->title) == 0;
+}
+
 static void draw_cached_top_bar(
     const PspUiState *ui, uint16_t *pixels, int width, int height, int stride,
     uint16_t panel, uint16_t accent, uint16_t text, uint16_t muted)
@@ -5634,30 +6045,57 @@ static void draw_cached_top_bar(
                      panel, accent, text, muted);
         return;
     }
-    UiTopBarCacheKey key = {0};
-    key.palette = *psp_ui_theme_active_palette;
-    key.device = device_status;
-    key.regular_font = chrome_font_cache.faces[0];
-    key.bold_font = chrome_font_cache.faces[1];
-    key.font_epoch = chrome_font_epoch;
-    key.scale = (uint8_t) browser_ui_scale(ui);
-    key.can_go_back = ui->can_go_back;
-    key.can_go_forward = ui->can_go_forward;
-    key.secure = ui->secure;
-    key.loading = ui->loading;
-    copy_string(key.url, sizeof(key.url), ui->url);
-    copy_string(key.title, sizeof(key.title), ui->title);
-    if (!browser_chrome_cache.top_valid
-        || memcmp(&key, &browser_chrome_cache.top_key, sizeof(key)) != 0) {
+    if (!top_bar_cache_current(ui)) {
+        UiTopBarCacheKey *key = &browser_chrome_cache.top_key;
+        memset(key, 0, sizeof(*key));
+        memcpy(&key->palette, psp_ui_theme_active_palette,
+               sizeof(key->palette));
+        memcpy(&key->device, &device_status, sizeof(key->device));
+        key->regular_font = chrome_font_cache.faces[0];
+        key->bold_font = chrome_font_cache.faces[1];
+        key->font_epoch = chrome_font_epoch;
+        key->scale = (uint8_t) browser_ui_scale(ui);
+        key->can_go_back = ui->can_go_back;
+        key->can_go_forward = ui->can_go_forward;
+        key->secure = ui->secure;
+        key->loading = ui->loading;
+        copy_string(key->url, sizeof(key->url), ui->url);
+        copy_string(key->title, sizeof(key->title), ui->title);
         draw_top_bar(
             ui, browser_chrome_cache.top,
             UI_BROWSER_CHROME_CACHE_WIDTH, UI_TOP_HEIGHT,
             UI_BROWSER_CHROME_CACHE_WIDTH, panel, accent, text, muted);
-        browser_chrome_cache.top_key = key;
         browser_chrome_cache.top_valid = true;
     }
     ui_copy_cached_rows(
         pixels, stride, browser_chrome_cache.top, UI_TOP_HEIGHT);
+}
+
+/* The focus label the bottom bar shows, or "" when it shows none. */
+static const char *bottom_bar_focus_label(const PspUiState *ui)
+{
+    return ui->screen == PSP_UI_SCREEN_PAGE && ui->focus_label_valid
+        ? ui->focus_label : "";
+}
+
+static bool bottom_bar_cache_current(const PspUiState *ui)
+{
+    const UiBottomBarCacheKey *key = &browser_chrome_cache.bottom_key;
+    return browser_chrome_cache.bottom_valid
+        && memcmp(&key->palette, psp_ui_theme_active_palette,
+                  sizeof(key->palette)) == 0
+        && key->regular_font == chrome_font_cache.faces[0]
+        && key->bold_font == chrome_font_cache.faces[1]
+        && key->font_epoch == chrome_font_epoch
+        && key->scroll_y == ui->scroll_y
+        && key->maximum_scroll_y == ui->maximum_scroll_y
+        && key->page_requests_blocked == ui->page_requests_blocked
+        && key->scale == (uint8_t) browser_ui_scale(ui)
+        && key->page_gamepad_capture == (uint8_t) ui->page_gamepad_capture
+        && key->captive_portal_active == (uint8_t) ui->captive_portal_active
+        && key->focus_editable == (uint8_t) ui->focus_editable
+        && strcmp(key->focus_label, bottom_bar_focus_label(ui)) == 0
+        && strcmp(key->url, ui->url) == 0;
 }
 
 static void draw_cached_bottom_bar(
@@ -5672,28 +6110,28 @@ static void draw_cached_bottom_bar(
                         panel, accent, text);
         return;
     }
-    UiBottomBarCacheKey key = {0};
-    key.palette = *psp_ui_theme_active_palette;
-    key.regular_font = chrome_font_cache.faces[0];
-    key.bold_font = chrome_font_cache.faces[1];
-    key.font_epoch = chrome_font_epoch;
-    key.scroll_y = ui->scroll_y;
-    key.maximum_scroll_y = ui->maximum_scroll_y;
-    key.page_requests_blocked = ui->page_requests_blocked;
-    key.scale = (uint8_t) browser_ui_scale(ui);
-    key.page_gamepad_capture = ui->page_gamepad_capture;
-    key.captive_portal_active = ui->captive_portal_active;
-    key.focus_editable = ui->focus_editable;
-    if (ui->screen == PSP_UI_SCREEN_PAGE && ui->focus_label_valid)
-        copy_string(key.focus_label, sizeof(key.focus_label), ui->focus_label);
-    copy_string(key.url, sizeof(key.url), ui->url);
-    if (!browser_chrome_cache.bottom_valid
-        || memcmp(&key, &browser_chrome_cache.bottom_key, sizeof(key)) != 0) {
+    if (!bottom_bar_cache_current(ui)) {
+        UiBottomBarCacheKey *key = &browser_chrome_cache.bottom_key;
+        memset(key, 0, sizeof(*key));
+        memcpy(&key->palette, psp_ui_theme_active_palette,
+               sizeof(key->palette));
+        key->regular_font = chrome_font_cache.faces[0];
+        key->bold_font = chrome_font_cache.faces[1];
+        key->font_epoch = chrome_font_epoch;
+        key->scroll_y = ui->scroll_y;
+        key->maximum_scroll_y = ui->maximum_scroll_y;
+        key->page_requests_blocked = ui->page_requests_blocked;
+        key->scale = (uint8_t) browser_ui_scale(ui);
+        key->page_gamepad_capture = ui->page_gamepad_capture;
+        key->captive_portal_active = ui->captive_portal_active;
+        key->focus_editable = ui->focus_editable;
+        copy_string(key->focus_label, sizeof(key->focus_label),
+                    bottom_bar_focus_label(ui));
+        copy_string(key->url, sizeof(key->url), ui->url);
         draw_bottom_bar(
             ui, browser_chrome_cache.bottom,
             UI_BROWSER_CHROME_CACHE_WIDTH, bottom_height,
             UI_BROWSER_CHROME_CACHE_WIDTH, panel, accent, text);
-        browser_chrome_cache.bottom_key = key;
         browser_chrome_cache.bottom_valid = true;
     }
     ui_copy_cached_rows(
@@ -5772,12 +6210,21 @@ static void draw_routed_list(
     draw_panel_furniture(pixels, width, height, stride, box, 45, 20);
     int title_right = box.x + box.width - 16;
     if (context != NULL && context[0] != '\0') {
-        int context_left = title_right
-            - chrome_text_width_bytes(context, strlen(context), 1, true);
-        if (context_left < box.x + box.width / 2)
-            context_left = box.x + box.width / 2;
-        draw_fitted_ui_text(pixels, width, height, stride, context_left,
-            box.y + 15, context, title_right, accent, 1, true);
+        /* The context is the page's site: right-aligned in the title row's
+           right half, and shortened at its start so its end shows. */
+        char shown[UI_HOST_SHOWN_BYTES];
+        int room = title_right - (box.x + box.width / 2);
+        UiHostFit fit = {room, 1, true, sizeof(shown)};
+        int shown_width = ui_host_fit_text(context, &fit, shown);
+        if (shown_width < 0) {
+            copy_string(shown, sizeof(shown), "...");
+            shown_width = room;
+        }
+        int context_left = title_right - shown_width;
+        draw_text_with_font(pixels, width, height, stride, context_left,
+            box.y + 15, shown, sizeof(shown),
+            title_right + 3 * ui_ellipsis_advance(1, true, NULL), accent, 1,
+            NULL, true);
         title_right = context_left - 10;
     }
     draw_fitted_ui_text(pixels, width, height, stride,
@@ -5855,8 +6302,9 @@ static TILEFINCH_OUT_OF_LINE void draw_site_controls(
     static const char *const labels[UI_SITE_CONTROLS_ITEM_COUNT] = {
         "JavaScript", "Content blocking", "Cookie notices",
         "Always Reader", "Third-party cookies", "Mixed HTTP (session)",
-        "Site storage"
+        "Unencrypted audio", "Site storage"
     };
+    static const char *const audio_answers[3] = {"Ask", "Allow", "Block"};
     char domain[64], detail[64];
     ui_url_presentation(ui, domain, sizeof(domain), detail, sizeof(detail));
     bool blocker_available = ui->content_blocker_mode != CONTENT_BLOCKER_OFF
@@ -5871,6 +6319,7 @@ static TILEFINCH_OUT_OF_LINE void draw_site_controls(
         ui->reader_site_always ? "On" : "Off",
         ui->third_party_cookie_site_allowed ? "Allow" : "Block",
         ui->mixed_content_site_allowed ? "Allow" : "Block",
+        audio_answers[ui->insecure_audio_site_answer % 3u],
         ui_site_storage_states[ui->site_storage_state]
     };
     draw_routed_list(
@@ -5963,8 +6412,8 @@ static TILEFINCH_OUT_OF_LINE void draw_page_information(
                        : (ui->secure ? "Certificate warning" : "Not secure"))),
              ui->site_tls_version);
     ui_site_information_data(ui, data, sizeof(data));
-    draw_text_bold(pixels, width, height, stride,
-                   left, box.y + 49, domain, 38, accent, 2);
+    draw_host_text(pixels, width, height, stride,
+                   left, box.y + 49, domain, right, accent, 2, true);
     draw_fitted_ui_text(pixels, width, height, stride, left, box.y + 72,
         connection, right,
         tls_verified ? PSP_THEME_TEXT_BODY : PSP_THEME_WARN, 1, false);
@@ -6041,7 +6490,7 @@ static void draw_file_download(const PspUiState *ui, uint16_t *pixels,
         tilefinch_ui_text("Save file?"), right, text, 2, true);
     draw_fitted_ui_text(pixels, width, height, stride, left, box.y + 54,
         view->name, right, accent, 2, true);
-    draw_fitted_ui_text(pixels, width, height, stride, left, box.y + 82,
+    draw_host_text(pixels, width, height, stride, left, box.y + 82,
         view->origin, right, muted, 1, false);
     static const char *const notes[] = {
         "Save to the Memory Stick.", "The server may change the filename.",
@@ -6090,6 +6539,171 @@ static void draw_zip_install(const PspUiState *ui, uint16_t *pixels,
                 ? "Saved data inside it will also be deleted." : "Downloaded ZIP files are kept.") : notes[i]), right, muted, 1, false);
     draw_fitted_ui_text(pixels, width, height, stride, left, box.y + box.height - 20,
         tilefinch_ui_text(view->removing ? "X Remove   O Cancel" : "X Install   O Cancel"), right, muted, 1, false);
+}
+
+/*
+ * A page's alert(), confirm() or prompt(). Deliberately not the panel
+ * family: square corners, no shadow, no accent and no hint band, so page
+ * text never wears the look of Tilefinch's own questions. The real address
+ * bar stays above it, and the requesting host is named under a catalog
+ * label rather than built into a sentence. Page text is wrapped here and
+ * cut with an ellipsis; it arrives plain and bounded.
+ */
+enum {
+    UI_PAGE_DIALOG_LINE = 16,
+    UI_PAGE_DIALOG_LINE_BYTES = PAGE_DIALOG_MESSAGE_BYTES
+};
+
+/* One display line from TEXT: the whole words that fit MAXIMUM pixels (a
+   longer word breaks between glyphs). Returns its byte length; *next is
+   where the following line starts. */
+static size_t ui_page_dialog_line(const char *text, size_t length,
+                                  int maximum, int scale, size_t *next)
+{
+    size_t at = 0, space = SIZE_MAX;
+    int used_width = 0;
+    while (at < length) {
+        if (text[at] == '\n') {
+            *next = at + 1u;
+            return at;
+        }
+        unsigned codepoint = 0;
+        size_t used = ui_text_next_glyph(text + at, length - at, &codepoint,
+                                         NULL);
+        if (used == 0 || used > length - at) break;
+        int advance = chrome_glyph_advance(codepoint, scale, false);
+        if (used_width + advance > maximum && at != 0) {
+            if (codepoint == ' ') {
+                *next = at + 1u;
+                return at;
+            }
+            if (space != SIZE_MAX) {
+                *next = space + 1u;
+                return space;
+            }
+            *next = at;
+            return at;
+        }
+        if (codepoint == ' ') space = at;
+        used_width += advance;
+        at += used;
+    }
+    *next = length;
+    return length;
+}
+
+/* The chrome faces have no U+2026; the painter's own ellipsis is three
+   dots, the same three bytes wide in UTF-8, so the swap is in place. */
+static void ui_page_dialog_dots(char *text)
+{
+    for (char *at = text; (at = strstr(at, "\xe2\x80\xa6")) != NULL; at += 3)
+        memcpy(at, "...", 3);
+}
+
+static void ui_page_dialog_outline(uint16_t *pixels, int width, int height,
+                                   int stride, UiRect box, uint16_t color)
+{
+    fill_rect(pixels, width, height, stride,
+              (UiRect) {box.x, box.y, box.width, 1}, color, 4);
+    fill_rect(pixels, width, height, stride,
+              (UiRect) {box.x, box.y + box.height - 1, box.width, 1}, color, 4);
+    fill_rect(pixels, width, height, stride,
+              (UiRect) {box.x, box.y, 1, box.height}, color, 4);
+    fill_rect(pixels, width, height, stride,
+              (UiRect) {box.x + box.width - 1, box.y, 1, box.height}, color, 4);
+}
+
+static TILEFINCH_OUT_OF_LINE void draw_page_dialog(
+    const PspUiState *ui, uint16_t *pixels, int width, int height,
+    int stride, uint16_t text, uint16_t muted)
+{
+    const PspUiPageDialogView *view = ui->page_dialog;
+    if (view == NULL) return;
+    UiRect box = {32, UI_TOP_HEIGHT + 6, width - 64,
+                  height - UI_TOP_HEIGHT - 12};
+    fill_rect(pixels, width, height, stride, box, PSP_THEME_PANEL, 4);
+    ui_page_dialog_outline(pixels, width, height, stride, box, muted);
+    int left = box.x + 12, right = box.x + box.width - 12;
+    int y = box.y + 7;
+    draw_fitted_ui_text(pixels, width, height, stride, left, y,
+        tilefinch_ui_text("Page message"), right, muted, 1, false);
+    y += UI_PAGE_DIALOG_LINE;
+    /* The host keeps its right end, where the registrable name is:
+       "...pay.example.com", never "pay.example.com.attacker...". */
+    if (view->host != NULL && view->host[0] != '\0')
+        draw_host_text(pixels, width, height, stride, left, y, view->host,
+                       right, text, 1, true);
+    y += UI_PAGE_DIALOG_LINE + 2;
+    fill_rect(pixels, width, height, stride,
+              (UiRect) {box.x + 1, y, box.width - 2, 1}, muted, 2);
+    y += 6;
+
+    bool prompt = view->kind == PAGE_DIALOG_PROMPT;
+    int hints = view->offer_suppress ? 3 : 2;
+    int hint_top = box.y + box.height - 6 - hints * UI_PAGE_DIALOG_LINE;
+    int message_bottom = hint_top - 4 - (prompt ? 24 : 0);
+    const char *message = view->message != NULL ? view->message : "";
+    size_t length = strlen(message), at = 0;
+    char line[UI_PAGE_DIALOG_LINE_BYTES + 4];
+    /* Bounded by the box: at most one pass per display row. */
+    while (at < length && y + UI_PAGE_DIALOG_LINE <= message_bottom) {
+        size_t next = at;
+        size_t bytes = ui_page_dialog_line(message + at, length - at,
+                                           right - left, 1, &next);
+        if (bytes > UI_PAGE_DIALOG_LINE_BYTES) bytes = UI_PAGE_DIALOG_LINE_BYTES;
+        memcpy(line, message + at, bytes);
+        line[bytes] = '\0';
+        at += next == 0 ? 1u : next;
+        /* More text than room: the last row says so. */
+        if (y + 2 * UI_PAGE_DIALOG_LINE > message_bottom && at < length)
+            memcpy(line + bytes, "...", 4);
+        ui_page_dialog_dots(line);
+        int row_left = left, row_right = right;
+        int row_width = chrome_text_width_bytes(line, strlen(line), 1, false);
+        /* A row that fits (every row psp_ui_page_dialog_prepare cut, in
+           either direction, whatever the first paragraph's) is drawn whole:
+           without the ellipsis allowance the painter cut its last glyphs,
+           for a right-to-left row the start of the sentence. A right-to-left
+           dialog ends each such row at the box edge. */
+        if (row_width <= right - left) {
+            if (view->right_to_left) row_left = right - row_width;
+            row_right = right + 3 * ui_ellipsis_advance(1, false, NULL);
+        }
+        draw_text_with_font(pixels, width, height, stride, row_left, y, line,
+            sizeof(line), row_right, text, 1, NULL, false);
+        y += UI_PAGE_DIALOG_LINE;
+    }
+    if (prompt) {
+        UiRect field = {left, message_bottom + 2, right - left, 20};
+        fill_rect(pixels, width, height, stride, field, PSP_THEME_SURFACE, 4);
+        ui_page_dialog_outline(pixels, width, height, stride, field, muted);
+        if (view->value != NULL && view->value[0] != '\0') {
+            snprintf(line, sizeof(line), "%s", view->value);
+            ui_page_dialog_dots(line);
+            /* A prepared answer is cut to the field already; one that fits
+               is drawn whole, as the message rows are. */
+            int value_right = field.x + field.width - 5;
+            if (chrome_text_width_bytes(line, strlen(line), 1, false)
+                    <= value_right - (field.x + 5))
+                value_right += 3 * ui_ellipsis_advance(1, false, NULL);
+            draw_text_with_font(pixels, width, height, stride, field.x + 5,
+                field.y + 4, line, PAGE_DIALOG_PROMPT_BYTES,
+                value_right, text, 1, NULL, false);
+        }
+    }
+    const char *primary = view->kind == PAGE_DIALOG_ALERT ? "X OK"
+        : prompt ? "X Edit   START OK   O Cancel" : "X OK   O Cancel";
+    int hint_y = hint_top;
+    draw_fitted_ui_text(pixels, width, height, stride, left, hint_y,
+        tilefinch_ui_text(primary), right, muted, 1, false);
+    hint_y += UI_PAGE_DIALOG_LINE;
+    draw_fitted_ui_text(pixels, width, height, stride, left, hint_y,
+        tilefinch_ui_text("Triangle Leave page"), right, muted, 1, false);
+    hint_y += UI_PAGE_DIALOG_LINE;
+    if (view->offer_suppress)
+        draw_fitted_ui_text(pixels, width, height, stride, left, hint_y,
+            tilefinch_ui_text("Square Don't let this page show dialogs"),
+            right, muted, 1, false);
 }
 
 static TILEFINCH_OUT_OF_LINE void draw_offline_app_preview(
@@ -6404,20 +7018,20 @@ static TILEFINCH_OUT_OF_LINE void draw_tabs(
                     (UiRect) {box.x + 9, y - 2, 3, 30},
                     selected ? PSP_THEME_ON_ACCENT : accent, 4);
             }
-            draw_text_with_font(
+            draw_page_text(
                 pixels, width, height, stride, box.x + 82, y + 3,
                 label, 38, box.x + box.width - 14,
                 selected ? PSP_THEME_ON_ACCENT : PSP_THEME_TEXT, 1, NULL,
                 true);
             const char *domain = ui->tabs == NULL
                 ? "" : ui->tabs->domains[at];
-            draw_text_with_font(
+            draw_host_text(
                 pixels, width, height, stride, box.x + 82, y + 16,
-                domain, 38, box.x + box.width - 14,
+                domain, box.x + box.width - 14,
                 /* Was a dark teal companion to the pre-ember accent; on an
                    ember selection fill it hue-clashed. The selected row now
                    uses the on-accent ink its title uses. */
-                selected ? PSP_THEME_ON_ACCENT : muted, 1, NULL, false);
+                selected ? PSP_THEME_ON_ACCENT : muted, 1, false);
         } else {
             draw_text(
                 pixels, width, height, stride, box.x + 22, y,
@@ -7262,13 +7876,16 @@ static TILEFINCH_OUT_OF_LINE void draw_update(
             ui->update_primary_enabled
                 ? PSP_THEME_ON_ACCENT : PSP_THEME_TEXT_FAINT, 2, false);
     }
-    if (!ui->update_cancel_enabled
-        && ui->update_channel == BROWSER_UPDATE_CHANNEL_STABLE) {
+    if (ui->update_discard_enabled
+        || (!ui->update_cancel_enabled
+            && ui->update_channel == BROWSER_UPDATE_CHANNEL_STABLE)) {
         draw_fitted_ui_text(
             pixels, width, height, stride, box.x + 16,
             box.y + box.height - 15,
-            tilefinch_ui_text("Square Versions   O Back"), right, muted, 1,
-            false);
+            tilefinch_ui_text(ui->update_discard_enabled
+                                  ? "Square Discard   O Back"
+                                  : "Square Versions   O Back"),
+            right, muted, 1, false);
     } else {
         draw_fitted_ui_text(
             pixels, width, height, stride, box.x + 16,
@@ -7508,10 +8125,10 @@ static TILEFINCH_OUT_OF_LINE void draw_site_data(
                 pixels, width, height, stride, right, line_y + 3,
                 detail, TILEFINCH_UI_TRANSLATION_BYTES,
                 selected ? PSP_THEME_ON_ACCENT : muted, 1, false);
-            draw_text_with_font(
+            draw_host_text(
                 pixels, width, height, stride, box.x + 18, line_y,
-                lines[at].label, 40, right - detail_width - 10, color, 2,
-                NULL, false);
+                lines[at].label, right - detail_width - 10, color, 2,
+                false);
             continue;
         }
         if (fixed_row == UI_SITE_DATA_OFFER)
@@ -7581,9 +8198,9 @@ static TILEFINCH_OUT_OF_LINE void draw_storage_site(
     draw_panel_furniture(pixels, width, height, stride, box, 41, 22);
     if (view == NULL || site >= view->count) return;
     const PspUiSiteStorageRow *row = &view->rows[site];
-    draw_text_with_font(pixels, width, height, stride, box.x + 16,
-                        box.y + 14, row->origin, 40, box.x + box.width - 14,
-                        text, 2, NULL, true);
+    draw_host_text(pixels, width, height, stride, box.x + 16,
+                   box.y + 14, row->origin, box.x + box.width - 14,
+                   text, 2, true);
     draw_fitted_ui_text(pixels, width, height, stride, box.x + 18,
                         box.y + 52, row->detail, box.x + box.width - 18,
                         muted, 2, false);
@@ -7709,9 +8326,8 @@ static TILEFINCH_OUT_OF_LINE void draw_heavy_offer(
     char size[16], line[96];
     psp_ui_format_bytes(size, sizeof(size), ui->heavy_offer_script_bytes);
     int right = box.x + box.width - 14;
-    draw_text_with_font(pixels, width, height, stride, box.x + 16,
-                        box.y + 52, ui->heavy_offer_site, 48, right,
-                        text, 2, NULL, false);
+    draw_host_text(pixels, width, height, stride, box.x + 16,
+                   box.y + 52, ui->heavy_offer_site, right, text, 2, false);
     snprintf(line, sizeof(line), "It needs about %s of script.", size);
     draw_text_with_font(pixels, width, height, stride, box.x + 16,
                         box.y + 78, line, 48, right, PSP_THEME_TEXT_BODY,
@@ -7754,9 +8370,9 @@ static TILEFINCH_OUT_OF_LINE void draw_storage_offer(
     psp_ui_format_bytes(needed, sizeof(needed), ui->storage_offer_needed);
     psp_ui_format_bytes(limit, sizeof(limit), ui->storage_offer_limit);
     int right = box.x + box.width - 14;
-    draw_text_with_font(pixels, width, height, stride, box.x + 16,
-                        box.y + 52, ui->storage_offer_origin, 48, right,
-                        text, 2, NULL, false);
+    draw_host_text(pixels, width, height, stride, box.x + 16,
+                   box.y + 52, ui->storage_offer_origin, right, text, 2,
+                   false);
     snprintf(line, sizeof(line), "Stored %s in memory; needs %s.",
              current, needed);
     draw_text_with_font(pixels, width, height, stride, box.x + 16,
@@ -8105,18 +8721,26 @@ static void draw_home_entering(const PspUiState *ui, uint16_t *pixels,
             pixels, width, height, stride, tile, PSP_THEME_RADIUS_CARD,
             selected ? PSP_THEME_SURFACE_FOCUS : PSP_THEME_SURFACE, 4);
         /* No per-tile adornment: the title is the tile. */
-        draw_text_with_font(
+        draw_page_text(
             pixels, width, height, stride,
             tile.x + PSP_THEME_SPACE_M, tile.y + PSP_THEME_SPACE_M + 2,
             ui->home->tiles[at].label, PSP_UI_HOME_LABEL_CAPACITY,
             tile.x + tile.width - PSP_THEME_SPACE_S,
             PSP_THEME_TEXT, 2, NULL, true);
-        draw_text_with_font(
-            pixels, width, height, stride,
-            tile.x + PSP_THEME_SPACE_M, tile.y + 38,
-            ui->home->tiles[at].detail, PSP_UI_HOME_DETAIL_CAPACITY,
-            tile.x + tile.width - PSP_THEME_SPACE_S,
-            PSP_THEME_TEXT_MUTED, 1, NULL, false);
+        if (ui->home->tiles[at].detail_is_host)
+            draw_host_text(
+                pixels, width, height, stride,
+                tile.x + PSP_THEME_SPACE_M, tile.y + 38,
+                ui->home->tiles[at].detail,
+                tile.x + tile.width - PSP_THEME_SPACE_S,
+                PSP_THEME_TEXT_MUTED, 1, false);
+        else
+            draw_text_with_font(
+                pixels, width, height, stride,
+                tile.x + PSP_THEME_SPACE_M, tile.y + 38,
+                ui->home->tiles[at].detail, PSP_UI_HOME_DETAIL_CAPACITY,
+                tile.x + tile.width - PSP_THEME_SPACE_S,
+                PSP_THEME_TEXT_MUTED, 1, NULL, false);
     }
 
     /* CONTINUE, the status line and the hint are the last things to arrive:
@@ -8150,7 +8774,7 @@ static void draw_home_entering(const PspUiState *ui, uint16_t *pixels,
                 PSP_THEME_FOCUS_STROKE,
                 settling ? accent.accent_high : accent.accent);
         }
-        draw_text_with_font(
+        draw_page_text(
             pixels, width, height, stride,
             row.x + PSP_THEME_SPACE_M, row.y + 4, entry->label,
             PSP_UI_HOME_LABEL_CAPACITY, row.x + row.width - 150,
@@ -8334,22 +8958,34 @@ static TILEFINCH_OUT_OF_LINE void draw_collections(
             content_x += (int) OFFLINE_LIBRARY_APP_ICON_EDGE
                 + PSP_THEME_SPACE_S;
         }
-        draw_text_with_font(
-            pixels, width, height, stride,
-            content_x, box.y + 1, row->title, 64,
-            box.x + box.width - PSP_THEME_SPACE_M - trailing_width,
-            selected ? PSP_THEME_TEXT : PSP_THEME_TEXT_BODY, 2, NULL,
-            selected);
-        draw_text_with_font(
-            pixels, width, height, stride,
-            content_x, box.y + UI_COLLECTIONS_ROW_DETAIL_DY,
-            confirm
-                ? (row->is_web_app ? "PRESS SQUARE AGAIN TO UNINSTALL"
-                                   : tilefinch_ui_text("PRESS SQUARE AGAIN TO DELETE"))
-                : row->detail, 64,
-            box.x + box.width - PSP_THEME_SPACE_M - trailing_width,
-            confirm ? PSP_THEME_WARN : PSP_THEME_TEXT_MUTED, 1, NULL,
-            false);
+        int row_right = box.x + box.width - PSP_THEME_SPACE_M
+            - trailing_width;
+        /* An untitled page's title is its address, which keeps its host;
+           so does the address line under every saved page. */
+        if (row->title != NULL && row->title == row->detail)
+            draw_url_text(
+                pixels, width, height, stride, content_x, box.y + 1,
+                row->title, 64, row_right,
+                selected ? PSP_THEME_TEXT : PSP_THEME_TEXT_BODY, 2,
+                selected);
+        else
+            draw_page_text(
+                pixels, width, height, stride,
+                content_x, box.y + 1, row->title, 64, row_right,
+                selected ? PSP_THEME_TEXT : PSP_THEME_TEXT_BODY, 2, NULL,
+                selected);
+        if (confirm)
+            draw_text_with_font(
+                pixels, width, height, stride,
+                content_x, box.y + UI_COLLECTIONS_ROW_DETAIL_DY,
+                row->is_web_app ? "PRESS SQUARE AGAIN TO UNINSTALL"
+                                : tilefinch_ui_text("PRESS SQUARE AGAIN TO DELETE"),
+                64, row_right, PSP_THEME_WARN, 1, NULL, false);
+        else
+            draw_url_text(
+                pixels, width, height, stride,
+                content_x, box.y + UI_COLLECTIONS_ROW_DETAIL_DY,
+                row->detail, 64, row_right, PSP_THEME_TEXT_MUTED, 1, false);
         if (row->trailing[0] != '\0')
             draw_text_right_aligned(
                 pixels, width, height, stride,
@@ -8626,17 +9262,25 @@ static TILEFINCH_OUT_OF_LINE void draw_text_entry(
             selected ? PSP_THEME_TEXT
                      : (bookmark ? PSP_THEME_ON_ACCENT
                                  : PSP_THEME_TEXT_BODY), 1);
-        draw_text_with_font(
-            pixels, width, height, stride, box.x + 37, row_y,
-            suggestion_text == NULL ? "" : suggestion_text, 39,
-            box.x + 293,
-            selected ? PSP_THEME_ON_ACCENT : PSP_THEME_TEXT_BODY,
-            1, NULL, true);
+        /* An untitled page shows its address, which keeps its host. */
+        if (suggestion != NULL && suggestion_text == suggestion->url)
+            draw_url_text(
+                pixels, width, height, stride, box.x + 37, row_y,
+                suggestion_text, 39, box.x + 293,
+                selected ? PSP_THEME_ON_ACCENT : PSP_THEME_TEXT_BODY,
+                1, true);
+        else
+            draw_page_text(
+                pixels, width, height, stride, box.x + 37, row_y,
+                suggestion_text == NULL ? "" : suggestion_text, 39,
+                box.x + 293,
+                selected ? PSP_THEME_ON_ACCENT : PSP_THEME_TEXT_BODY,
+                1, NULL, true);
         if (selected && suggestion != NULL && suggestion->url != NULL)
-            draw_text_with_font(
+            draw_url_text(
                 pixels, width, height, stride, box.x + 37, row_y + 11,
                 suggestion->url, 39, box.x + 293,
-                PSP_THEME_ON_ACCENT, 1, NULL, false);
+                PSP_THEME_ON_ACCENT, 1, false);
     }
 
     const int keyboard_x = box.x + box.width - 143;
@@ -9316,6 +9960,8 @@ static TILEFINCH_OUT_OF_LINE void psp_ui_composite_browser(
             ui, pixels, width, height, stride, accent, text, muted);
     } else if (ui->screen == PSP_UI_SCREEN_ZIP_INSTALL) {
         draw_zip_install(ui, pixels, width, height, stride, accent, text, muted);
+    } else if (ui->screen == PSP_UI_SCREEN_PAGE_DIALOG) {
+        draw_page_dialog(ui, pixels, width, height, stride, text, muted);
     } else if (ui->screen == PSP_UI_SCREEN_FILE_DOWNLOAD) {
         draw_file_download(ui, pixels, width, height, stride, accent, text, muted);
     } else if (ui->screen == PSP_UI_SCREEN_OFFLINE_APP_PREVIEW) {
@@ -9772,6 +10418,18 @@ void psp_ui_media_bind_presentation(
     presentation->selected_subtitle_track = -1;
 }
 
+bool psp_ui_media_fence_acquire(const PspUiMediaState *media)
+{
+    const PspUiMediaPresentation *p =
+        media == NULL ? NULL : media->presentation;
+    return p != NULL && p->fence.acquire != NULL && p->fence.acquire();
+}
+
+void psp_ui_media_fence_release(const PspUiMediaState *media, bool held)
+{
+    if (held) media->presentation->fence.release(true);
+}
+
 void psp_ui_media_set_title_font(PspUiMediaState *media,
                                  const FontFace *font)
 {
@@ -9796,6 +10454,7 @@ void psp_ui_media_set_tracks(
         audio_count = PSP_UI_MEDIA_TRACK_LIMIT;
     if (subtitle_count > PSP_UI_MEDIA_TRACK_LIMIT)
         subtitle_count = PSP_UI_MEDIA_TRACK_LIMIT;
+    bool held = psp_ui_media_fence_acquire(media);
     memset(presentation->audio_tracks, 0,
            sizeof(presentation->audio_tracks));
     memset(presentation->subtitle_tracks, 0,
@@ -9814,6 +10473,7 @@ void psp_ui_media_set_tracks(
     presentation->selected_subtitle_track = selected_subtitle >= 0
             && (size_t) selected_subtitle < subtitle_count
         ? (int8_t) selected_subtitle : -1;
+    psp_ui_media_fence_release(media, held);
 }
 
 void psp_ui_media_set_chapters(PspUiMediaState *media,
@@ -9821,6 +10481,7 @@ void psp_ui_media_set_chapters(PspUiMediaState *media,
 {
     if (media == NULL || media->presentation == NULL) return;
     PspUiMediaPresentation *p = media->presentation;
+    bool held = psp_ui_media_fence_acquire(media);
     p->chapter_count = 0;
     if (count > MEDIA_CHAPTER_LIMIT) count = MEDIA_CHAPTER_LIMIT;
     for (size_t at = 0; chapters != NULL && at < count; at++) {
@@ -9832,14 +10493,18 @@ void psp_ui_media_set_chapters(PspUiMediaState *media,
         p->chapters[p->chapter_count++] = chapters[at];
     }
     p->track_menu_open = false;
+    psp_ui_media_fence_release(media, held);
 }
 
 void psp_ui_media_set_subtitle(PspUiMediaState *media, const char *text)
 {
     if (media == NULL || media->presentation == NULL) return;
+    bool held = psp_ui_media_fence_acquire(media);
     copy_string(media->presentation->subtitle_text,
                 sizeof(media->presentation->subtitle_text),
                 text == NULL ? "" : text);
+    media->presentation->subtitle_right_to_left = false;
+    psp_ui_media_fence_release(media, held);
 }
 
 void psp_ui_media_set_subtitle_style(
@@ -9909,6 +10574,19 @@ static const char *media_resolving_status(const PspUiMediaState *media,
     return status;
 }
 
+/* The loading panel's words for audio-only media, which has no video to
+   open or restart. Applied when drawn, so a status set before the player
+   knew it was audio-only still reads right. */
+static const char *media_status_text(const PspUiMediaState *media,
+                                     const char *status)
+{
+    if (!media->audio_only || media->seek_in_progress) return status;
+    if (strcmp(status, "Loading...") == 0
+        || strcmp(status, "STARTING VIDEO") == 0) return "Opening audio";
+    if (strcmp(status, "RESTARTING VIDEO") == 0) return "RESTARTING AUDIO";
+    return status;
+}
+
 void psp_ui_media_note_lower_quality_retry(PspUiMediaState *media)
 {
     if (media == NULL || media->presentation == NULL) return;
@@ -9918,11 +10596,12 @@ void psp_ui_media_note_lower_quality_retry(PspUiMediaState *media)
                     media_resolving_status(media, media->status));
 }
 
-void psp_ui_media_set_resolving(PspUiMediaState *media, const char *title)
+static void media_set_resolving(PspUiMediaState *media, const char *title,
+                                bool keep_menu)
 {
     if (media == NULL) return;
     if (media->presentation != NULL) {
-        media->presentation->track_menu_open = false;
+        if (!keep_menu) media->presentation->track_menu_open = false;
         /* A fresh open starts the slow-load clock; the open's own later
            phases and a 240p retry inside it keep counting. */
         if (!media->resolving) media->presentation->resolving_elapsed_ms = 0;
@@ -9955,6 +10634,49 @@ void psp_ui_media_set_resolving(PspUiMediaState *media, const char *title)
     copy_string(media->status, sizeof(media->status),
                 media_resolving_status(media, "Loading..."));
     media->resolving_progress_per_mille = 0;
+}
+
+void psp_ui_media_set_resolving(PspUiMediaState *media, const char *title)
+{
+    media_set_resolving(media, title, false);
+}
+
+void psp_ui_media_continue_resolving(PspUiMediaState *media,
+                                     const char *title)
+{
+    media_set_resolving(media, title, true);
+}
+
+void psp_ui_media_set_audio(PspUiMediaState *media, bool audio_only,
+                            const char *detail, const char *source,
+                            bool unencrypted, bool reconnecting)
+{
+    if (media == NULL) return;
+    media->audio_only = audio_only;
+    media->reconnecting = audio_only && reconnecting;
+    if (audio_only) {
+        /* Nothing to uncover: a listening view keeps its controls. */
+        media->controls_visible = true;
+        media->controls_remaining_ms = UI_MEDIA_CONTROLS_MS;
+    }
+    PspUiMediaPresentation *p = media->presentation;
+    if (p == NULL) return;
+    /* Called every frame: store (under the fence) only what changed. */
+    char shown_detail[sizeof(p->audio_detail)];
+    char shown_source[sizeof(p->audio_source)];
+    copy_string(shown_detail, sizeof(shown_detail),
+                audio_only && detail != NULL ? detail : "");
+    copy_string(shown_source, sizeof(shown_source),
+                audio_only && source != NULL ? source : "");
+    bool plain = audio_only && unencrypted;
+    if (strcmp(p->audio_detail, shown_detail) == 0
+        && strcmp(p->audio_source, shown_source) == 0
+        && p->audio_unencrypted == plain) return;
+    bool held = psp_ui_media_fence_acquire(media);
+    memcpy(p->audio_detail, shown_detail, strlen(shown_detail) + 1u);
+    memcpy(p->audio_source, shown_source, strlen(shown_source) + 1u);
+    p->audio_unencrypted = plain;
+    psp_ui_media_fence_release(media, held);
 }
 
 void psp_ui_media_set_resolving_progress(
@@ -10026,6 +10748,8 @@ void psp_ui_media_set_error(PspUiMediaState *media, const char *message)
     media->seek_in_progress = false;
     media->failed = true;
     media->retry_unavailable = false;
+    media->insecure_audio_offer = false;
+    media->insecure_audio_blocked = false;
     media->audio_only_recovery_available = false;
     media->lower_quality_recovery_available = false;
     media->playing = false;
@@ -10189,7 +10913,7 @@ void psp_ui_media_tick(PspUiMediaState *media, unsigned elapsed_ms)
         visual_elapsed %= UI_MEDIA_BUFFER_VISUAL_INTERVAL_MS;
     }
     media->buffered_visual_elapsed_ms = (uint16_t) visual_elapsed;
-    if (!media->visible || !media->controls_visible
+    if (!media->visible || !media->controls_visible || media->audio_only
         || !media->playing || media->ended || media->resolving
         || media->seek_preview_active
         || (media->presentation != NULL
@@ -10378,7 +11102,7 @@ PspUiMediaIntent psp_ui_media_update(PspUiMediaState *media,
             /* Circle dismisses the modal back to unobscured playback. Keeping
                controls alive here rebuilt two full-width chrome bands on the
                same frame and caused a visible one-frame hitch on hardware. */
-            media->controls_visible = false;
+            media->controls_visible = media->audio_only;
             media->controls_remaining_ms = 0u;
         } else if ((pressed & (PSP_UI_BUTTON_PAGE_UP
                                | PSP_UI_BUTTON_PAGE_DOWN))) {
@@ -10573,6 +11297,87 @@ PspUiMediaIntent psp_ui_media_update(PspUiMediaState *media,
     return intent;
 }
 
+PspUiMediaIntent psp_ui_media_update_detached(
+    PspUiMediaState *media, PspUiMediaPresentation *own,
+    const PspUiInput *input, bool *detached)
+{
+    PspUiMediaPresentation *shared =
+        media == NULL ? NULL : media->presentation;
+    bool already = shared != NULL && shared == own;
+    if (detached != NULL) *detached = already;
+    if (shared == NULL || own == NULL || already)
+        return psp_ui_media_update(media, input);
+    memcpy(own, shared, sizeof(*own));
+    media->presentation = own;
+    PspUiMediaIntent intent = psp_ui_media_update(media, input);
+    /* The slow-load clock alone is not worth keeping a private copy: the
+       owner's own frames advance it. */
+    own->resolving_elapsed_ms = shared->resolving_elapsed_ms;
+    if (memcmp(own, shared, sizeof(*own)) == 0)
+        media->presentation = shared;
+    else if (detached != NULL)
+        *detached = true;
+    return intent;
+}
+
+bool psp_ui_media_press_queue_push(PspUiMediaPressQueue *queue,
+                                   uint32_t pressed)
+{
+    if (queue == NULL || queue->count >= PSP_UI_MEDIA_PRESS_LIMIT)
+        return false;
+    queue->pressed[queue->count++] = pressed;
+    return true;
+}
+
+bool psp_ui_media_timeline_action(PspUiMediaAction action)
+{
+    return action == PSP_UI_MEDIA_ACTION_PREVIEW_SEEK
+        || action == PSP_UI_MEDIA_ACTION_SEEK
+        || action == PSP_UI_MEDIA_ACTION_CANCEL_SEEK_PREVIEW
+        || action == PSP_UI_MEDIA_ACTION_PLAY_PAUSE;
+}
+
+void psp_ui_media_press_queue_settle(PspUiMediaPressQueue *queue,
+                                     PspUiMediaState *owner,
+                                     PspUiMediaMailbox *mailbox)
+{
+    if (queue == NULL || mailbox == NULL) return;
+    PspUiInput input = {.analog_x = 128, .analog_y = 128, .elapsed_ms = 16};
+    for (uint8_t at = 0; at < queue->count && at < PSP_UI_MEDIA_PRESS_LIMIT;
+         at++) {
+        input.pressed = input.held = queue->pressed[at];
+        PspUiMediaIntent intent = psp_ui_media_update(owner, &input);
+        if (intent.action == PSP_UI_MEDIA_ACTION_NONE) continue;
+        if (psp_ui_media_timeline_action(intent.action))
+            mailbox->timeline = intent;
+        else
+            mailbox->command = intent;
+    }
+    queue->count = 0;
+}
+
+bool psp_ui_media_supervisor_press(
+    PspUiMediaState *copy, PspUiMediaPresentation *own,
+    PspUiMediaPressQueue *queue, uint32_t pressed,
+    PspUiMediaIntent *intent)
+{
+    if (intent != NULL) *intent = (PspUiMediaIntent) {0};
+    if (copy == NULL || queue == NULL
+        || queue->count >= PSP_UI_MEDIA_PRESS_LIMIT) return false;
+    /* One frame of the press with the stick centred, as the owner will
+       apply it (psp_ui_media_press_queue_settle). */
+    PspUiInput input = {
+        .pressed = pressed, .held = pressed,
+        .analog_x = 128, .analog_y = 128, .elapsed_ms = 16
+    };
+    bool detached = false;
+    PspUiMediaIntent shown =
+        psp_ui_media_update_detached(copy, own, &input, &detached);
+    (void) psp_ui_media_press_queue_push(queue, pressed);
+    if (intent != NULL) *intent = shown;
+    return true;
+}
+
 bool psp_ui_media_intent_has_predispatch_visual(
     const PspUiMediaIntent *intent)
 {
@@ -10608,24 +11413,28 @@ enum {
     UI_MEDIA_FAILED_CHIP_GAP = 24
 };
 
-static void media_retry_label(char *out, size_t capacity)
+/* The unencrypted-audio question's Retry is its "yes". */
+static void media_retry_label(const PspUiMediaState *media, char *out,
+                              size_t capacity)
 {
-    snprintf(out, capacity, "X %s", tilefinch_ui_text("Retry"));
+    snprintf(out, capacity, "X %s", tilefinch_ui_text(
+        media->insecure_audio_offer ? "Play anyway" : "Retry"));
 }
 
-static int media_failed_retry_width(void)
+static int media_failed_retry_width(const PspUiMediaState *media)
 {
     char label[TILEFINCH_UI_TRANSLATION_VALUE_BYTES + 4];
-    media_retry_label(label, sizeof(label));
+    media_retry_label(media, label, sizeof(label));
     int chip = chrome_text_width_bytes(label, strlen(label), 2, true)
         + 2 * UI_MEDIA_FAILED_CHIP_PADDING;
     return chip > UI_MEDIA_FAILED_CHIP_WIDTH
         ? chip : UI_MEDIA_FAILED_CHIP_WIDTH;
 }
 
-static UiRect media_failed_panel_rect(int width, int height)
+static UiRect media_failed_panel_rect(const PspUiMediaState *media,
+                                      int width, int height)
 {
-    int panel = 2 * UI_MEDIA_FAILED_MARGIN + media_failed_retry_width()
+    int panel = 2 * UI_MEDIA_FAILED_MARGIN + media_failed_retry_width(media)
         + UI_MEDIA_FAILED_CHIP_GAP + UI_MEDIA_FAILED_CHIP_WIDTH;
     if (panel < UI_MEDIA_FAILED_PANEL_WIDTH)
         panel = UI_MEDIA_FAILED_PANEL_WIDTH;
@@ -10633,9 +11442,10 @@ static UiRect media_failed_panel_rect(int width, int height)
     return (UiRect) {width / 2 - panel / 2, height / 2 - 63, panel, 126};
 }
 
-static UiRect media_failed_retry_rect(UiRect message)
+static UiRect media_failed_retry_rect(const PspUiMediaState *media,
+                                      UiRect message)
 {
-    int chip = media_failed_retry_width();
+    int chip = media_failed_retry_width(media);
     int room = message.width - 2 * UI_MEDIA_FAILED_MARGIN
         - UI_MEDIA_FAILED_CHIP_GAP - UI_MEDIA_FAILED_CHIP_WIDTH;
     if (chip > room) chip = room;
@@ -10771,8 +11581,8 @@ PspUiMediaIntent psp_ui_media_activate_at(PspUiMediaState *media,
         return intent;
     }
     if (media->failed) {
-        UiRect message = media_failed_panel_rect(width, height);
-        UiRect retry = media_failed_retry_rect(message);
+        UiRect message = media_failed_panel_rect(media, width, height);
+        UiRect retry = media_failed_retry_rect(media, message);
         UiRect back = media_failed_back_rect(
             message, media->retry_unavailable);
         if (!media->retry_unavailable
@@ -11330,6 +12140,11 @@ static size_t ui_media_overlay_regions(
     const PspUiMediaPresentation *presentation = media->presentation;
     UiMediaRawRegion raw[UI_MEDIA_RAW_REGION_LIMIT];
     size_t raw_count = 0u;
+    if (media->audio_only) {
+        /* The listening view paints every pixel opaquely. */
+        regions[0] = (PspUiOverlayRegion) {0, 0, width, height, false};
+        return 1u;
+    }
     if (!media->controls_visible) {
         if (media->buffering) {
             ui_media_add_raw_region(
@@ -11373,7 +12188,7 @@ static size_t ui_media_overlay_regions(
         width, height, false);
     if (media->resolving || media->failed) {
         UiRect message = media->failed
-            ? media_failed_panel_rect(width, height)
+            ? media_failed_panel_rect(media, width, height)
             : (UiRect) {width / 2 - 152, height / 2 - 41, 304, 82};
         ui_media_add_raw_region(
             raw, &raw_count, message.x, message.y,
@@ -11494,6 +12309,158 @@ static void draw_media_secondary_hint(
                         right, muted, 1, false);
 }
 
+/* A catalog label centred between left and right, compact if it must. */
+static void draw_centered_ui_text(
+    uint16_t *pixels, int width, int height, int stride, int left,
+    int right, int y, const char *text, uint16_t color, int scale)
+{
+    int text_width = chrome_text_width_bytes(text, strlen(text), scale, false);
+    if (scale > 1 && text_width > right - left) {
+        scale = 1;
+        text_width = chrome_text_width_bytes(text, strlen(text), 1, false);
+    }
+    int x = text_width >= right - left
+        ? left : left + (right - left - text_width) / 2;
+    draw_fitted_ui_text(pixels, width, height, stride, x, y, text, right,
+                        color, scale, false);
+}
+
+/* Author or network text (a station description, a host), centred and
+   ellipsized inside its row; drawn with the title's face so it can carry
+   the station's own script. */
+static void draw_centered_author_text(
+    const PspUiMediaState *media, uint16_t *pixels, int width, int height,
+    int stride, int left, int right, int y, const char *text,
+    uint16_t color)
+{
+    if (text == NULL || text[0] == '\0') return;
+    int text_width = chrome_text_width_bytes(text, strlen(text), 1, false);
+    bool fits = text_width <= right - left;
+    int x = fits ? left + (right - left - text_width) / 2 : left;
+    /* The painter reserves room for an ellipsis while text remains; text
+       that fits must not lose its last characters to that reserve. */
+    draw_text_with_font(
+        pixels, width, height, stride, x, y, text,
+        PSP_UI_MEDIA_AUDIO_TEXT_CAPACITY,
+        fits ? x + text_width + 3 * ui_ellipsis_advance(1, false, NULL)
+             : right,
+        color, 1,
+        media->presentation == NULL ? NULL : media->presentation->title_font,
+        false);
+}
+
+/* The listening state under the badge: what the listener hears now. */
+static const char *media_audio_state_key(const PspUiMediaState *media)
+{
+    if (media->reconnecting) return "Reconnecting...";
+    if (media->buffering) return "Buffering...";
+    if (media->ended) return "Finished";
+    return media->playing ? "Playing" : "Playback paused";
+}
+
+/*
+ * Audio-only media's body: no picture, so the space between the title and
+ * control bars becomes a listening card -- the play/pause badge, the state
+ * in words, the station's description and where the audio comes from, with
+ * a marker when it arrives unencrypted. Every row is bounded to the panel
+ * and ellipsized; nothing depends on the listening time.
+ */
+/* Cold beside the video overlay: kept out of the hot compositor. */
+static __attribute__((noinline)) void draw_media_audio_body(
+    const PspUiMediaState *media, uint16_t *pixels,
+    int width, int height, int stride)
+{
+    const PspUiMediaPresentation *p = media->presentation;
+    int top = UI_MEDIA_TITLE_BAR_HEIGHT;
+    int bottom = height - media_control_bar_height(media);
+    int middle = (top + bottom) / 2;
+    int left = 24, right = width - 24;
+    draw_media_play_pause(pixels, width, height, stride, width / 2,
+                          middle - 38, media->playing && !media->ended);
+    draw_centered_ui_text(
+        pixels, width, height, stride, left, right, middle - 8,
+        tilefinch_ui_text(media_audio_state_key(media)),
+        media->reconnecting ? PSP_THEME_WARN : PSP_THEME_TEXT, 2);
+    bool detail = p != NULL && p->audio_detail[0] != '\0';
+    if (detail)
+        draw_centered_author_text(
+            media, pixels, width, height, stride, left, right, middle + 18,
+            p->audio_detail, PSP_THEME_TEXT_MUTED);
+    if (p == NULL || (p->audio_source[0] == '\0' && !p->audio_unencrypted))
+        return;
+    /* The source row: host, then the marker as a small chip. The chip is
+       never shortened; a long host gives way to it. */
+    int y = middle + (detail ? 38 : 18);
+    const char *marker = tilefinch_ui_text("Not encrypted");
+    int chip_width = p->audio_unencrypted
+        ? chrome_text_width_bytes(marker, strlen(marker), 1, false) + 12 : 0;
+    if (chip_width > right - left) chip_width = right - left;
+    int gap = p->audio_source[0] != '\0' && chip_width != 0 ? 8 : 0;
+    /* The host gives way at its start, so its registrable end shows. */
+    int host_room = right - left - chip_width - gap;
+    char host[UI_HOST_SHOWN_BYTES];
+    UiHostFit fit = {host_room, 1, false, sizeof(host)};
+    int host_width = ui_host_fit_text(p->audio_source, &fit, host);
+    bool host_fits = host_width >= 0;
+    if (!host_fits) {
+        copy_string(host, sizeof(host), "...");
+        host_width = host_room;
+    }
+    int x = left + (right - left - host_width - gap - chip_width) / 2;
+    if (p->audio_source[0] != '\0')
+        draw_text_with_font(
+            pixels, width, height, stride, x, y, host, sizeof(host),
+            x + host_width
+                + (host_fits ? 3 * ui_ellipsis_advance(1, false, NULL) : 0),
+            PSP_THEME_TEXT_MUTED, 1, NULL, false);
+    if (chip_width == 0) return;
+    UiRect chip = {x + host_width + gap, y - 2, chip_width, 16};
+    fill_round_rect(pixels, width, height, stride, chip,
+                    PSP_THEME_RADIUS_CHIP, PSP_THEME_SURFACE, 4);
+    draw_fitted_ui_text(pixels, width, height, stride, chip.x + 6, y,
+                        marker, chip.x + chip.width - 6, PSP_THEME_WARN, 1,
+                        false);
+}
+
+/*
+ * Audio without a timeline -- a live station, or a file of unknown length
+ * that cannot seek: no scrubber that would promise seeking. The time row
+ * names LIVE and counts listening time; the hint names only what works.
+ */
+/* Cold beside the video overlay: kept out of the hot compositor. */
+static __attribute__((noinline)) void draw_media_audio_bar(
+    const PspUiMediaState *media, uint16_t *pixels,
+    int width, int height, int stride, bool tracks_available)
+{
+    int offset = media_control_offset(media);
+    int left = 24, right = width - 24, y = height - 53 + offset;
+    int x = left;
+    if (media->live) {
+        const char *live = tilefinch_ui_text("LIVE");
+        int live_width = chrome_text_width_bytes(live, strlen(live), 1, true);
+        UiRect chip = {x, y - 1, live_width + 12, 18};
+        fill_round_rect(pixels, width, height, stride, chip,
+                        PSP_THEME_RADIUS_CHIP, PSP_THEME_ACCENT_EMBER, 4);
+        draw_fitted_ui_text(pixels, width, height, stride, chip.x + 6,
+                            y + 2, live, chip.x + chip.width - 6,
+                            PSP_THEME_ON_ACCENT, 1, true);
+        x = chip.x + chip.width + 10;
+    }
+    char elapsed[24];
+    media_format_time(media->current_time_us, elapsed, sizeof(elapsed));
+    int time_end = draw_fitted_ui_text(
+        pixels, width, height, stride, x, y, elapsed, right,
+        PSP_THEME_TEXT, 2, false);
+    draw_media_secondary_hint(media, pixels, width, height, stride,
+                              time_end, right, y, PSP_THEME_TEXT_MUTED);
+    draw_fitted_ui_text(pixels, width, height, stride, left, height - 31 + offset,
+              tilefinch_ui_text(tracks_available
+                  ? (media->playing ? "X PAUSE  TRI TRACKS"
+                                    : "X PLAY  TRI TRACKS")
+                  : (media->playing ? "X PAUSE" : "X PLAY")),
+              right, PSP_THEME_TEXT_MUTED, width < 360 ? 1 : 2, false);
+}
+
 static void draw_media_control_bar(
     const PspUiMediaState *media, uint16_t *pixels,
     int width, int height, int stride)
@@ -11506,6 +12473,12 @@ static void draw_media_control_bar(
             || media->presentation->subtitle_track_count != 0
             || media_menu_count(media, 2u) != 0 || media->presentation->queue_active);
     draw_media_control_bar_ground(media, pixels, width, height, stride);
+    if (media->audio_only && (media->live || media->duration_us == 0)
+        && !media->seek_preview_active) {
+        draw_media_audio_bar(media, pixels, width, height, stride,
+                             tracks_available);
+        return;
+    }
     int offset = media_control_offset(media);
     int left = 24, right = width - 24, track_y = height - 69 + offset;
     fill_round_rect(pixels, width, height, stride,
@@ -11627,14 +12600,15 @@ static void draw_media_subtitle(
     int maximum_width = box.width - 20;
     while (at < bytes) {
         unsigned codepoint = 0;
-        size_t used = font_utf8_next(text + at, bytes - at, &codepoint);
+        size_t used = ui_text_next_glyph(text + at, bytes - at, &codepoint, NULL);
         if (used == 0) break;
-        bool known_missing = false;
-        const FontGlyph *glyph = chrome_font_glyph(
-            codepoint, scale, false, &known_missing);
-        int advance = glyph != NULL ? glyph->advance : 6 * scale;
-        if (advance < 0) advance = 0;
-        if (codepoint == '\n' || line_width > maximum_width - advance) break;
+        int advance = chrome_glyph_advance(codepoint, scale, false);
+        if (codepoint == '\n') {
+            last_break = at;
+            after_break = at + used;
+            break;
+        }
+        if (line_width > maximum_width - advance) break;
         if (codepoint == ' ' || codepoint == '\t') {
             last_break = at;
             after_break = at + used;
@@ -11683,18 +12657,349 @@ static void draw_media_subtitle(
     }
     for (unsigned line = 0; line < line_count; line++) {
         int y = text_y + (int) line * line_step;
+        int x = box.x + 10;
+        int row_width = chrome_text_width_bytes(
+            lines[line], SIZE_MAX, scale, false);
+        /* A row of right-to-left text starts at the box's right edge. */
+        if (presentation->subtitle_right_to_left && row_width < maximum_width)
+            x += maximum_width - row_width;
+        /* A row that fits needs no room kept for an ellipsis. */
+        int row_limit = box.x + box.width - 10;
+        if (row_width <= maximum_width)
+            row_limit += 3 * ui_ellipsis_advance(scale, false, NULL);
         if (presentation->subtitle_background
                 == BROWSER_SUBTITLE_BACKGROUND_SHADOW) {
             draw_text_with_font(
-                pixels, width, height, stride, box.x + 11, y + 1,
-                lines[line], 96, box.x + box.width - 9,
+                pixels, width, height, stride, x + 1, y + 1,
+                lines[line], 96, row_limit + 1,
                 rgb565(0, 0, 0), scale, NULL, false);
         }
         draw_text_with_font(
-            pixels, width, height, stride, box.x + 10, y,
-            lines[line], 96, box.x + box.width - 10,
+            pixels, width, height, stride, x, y,
+            lines[line], 96, row_limit,
             PSP_THEME_TEXT, scale, NULL, false);
     }
+}
+
+static int ui_visual_advance(unsigned codepoint, int scale,
+                             const FontFace *font, bool bold)
+{
+    if (font_codepoint_default_ignorable(codepoint)) return 0;
+    const FontGlyph *glyph = chrome_font_glyph(codepoint, scale, bold, NULL);
+    if (glyph == NULL && font != NULL)
+        glyph = preferred_face_glyph(font, codepoint, scale);
+    if (glyph == NULL) return chrome_glyph_advance(codepoint, scale, bold);
+    return glyph->advance > 0 ? glyph->advance : 0;
+}
+
+/* Where the row starting at unit `at` ends, and where the next row starts. A
+   row is limited by width and by the bytes its display form takes, as Arabic's
+   presentation forms are longer than the letters they replace, and never
+   leaves a mark or a ligature's absorbed letter for the next row. */
+static size_t ui_visual_row_end(
+    const TextBidiUnit *units, size_t count, size_t at, int maximum_width,
+    int scale, const FontFace *font, bool bold, size_t maximum_bytes,
+    size_t *next)
+{
+    size_t last_break = SIZE_MAX;
+    int line_width = 0;
+    size_t line_bytes = 0;
+    for (size_t cursor = at; cursor < count; cursor++) {
+        uint32_t codepoint = units[cursor].shaped_codepoint;
+        if (codepoint == '\n') {
+            *next = cursor + 1u;
+            return cursor;
+        }
+        unsigned char bytes[4];
+        size_t size = tilefinch_utf8_encode(codepoint, bytes);
+        int advance = ui_visual_advance(codepoint, scale, font, bold);
+        if (cursor != at
+            && (line_width > maximum_width - advance
+                || size > maximum_bytes - line_bytes
+                || cursor - at >= TEXT_BIDI_LINE_UNIT_LIMIT)) {
+            if (last_break != SIZE_MAX) {
+                *next = last_break + 1u;
+                return last_break;
+            }
+            while (cursor > at + 1u && units[cursor].cluster_extender) cursor--;
+            *next = cursor;
+            return cursor;
+        }
+        if (size > maximum_bytes - line_bytes) break;
+        if (codepoint == ' ' || codepoint == '\t') last_break = cursor;
+        line_width += advance;
+        line_bytes += size;
+    }
+    *next = count;
+    return count;
+}
+
+static bool ui_visual_text(Budget *budget, const char *text, int maximum_width,
+                           int scale, const FontFace *font, bool bold,
+                           unsigned rows, char *output, size_t capacity,
+                           bool *right_to_left)
+{
+    if (budget == NULL || text == NULL || output == NULL || capacity < 8u
+        || rows == 0 || !text_bidi_maybe_needed(text, strlen(text)))
+        return false;
+    TextBidiStatus status;
+    TextBidiParagraph *paragraph = text_bidi_paragraph_create(
+        budget, text, strlen(text), TEXT_BIDI_BASE_AUTO_LTR, &status);
+    if (paragraph == NULL) return false;
+    const TextBidiUnit *units = text_bidi_paragraph_units(paragraph);
+    size_t count = text_bidi_paragraph_count(paragraph);
+    int dots = 3 * ui_ellipsis_advance(scale, bold, NULL);
+    bool leftward = (text_bidi_paragraph_level(paragraph) & 1u) != 0;
+    size_t used = 0, at = 0;
+    bool okay = true;
+    /* Three dots and the terminator always have room. */
+    size_t limit = capacity - 4u;
+    for (unsigned row = 0; okay && row < rows && at < count; row++) {
+        bool last = row + 1u == rows;
+        size_t next = count;
+        if (row != 0u) {
+            if (used >= limit) break;
+            output[used++] = '\n';
+        }
+        /* The last row keeps room for its ellipsis, on the side text ends. */
+        size_t end = ui_visual_row_end(
+            units, count, at, last ? maximum_width - dots : maximum_width,
+            scale, font, bold, limit - used, &next);
+        bool cut = last && next < count;
+        if (cut && leftward) {
+            memcpy(output + used, "...", 3u);
+            used += 3u;
+        }
+        okay = end == at
+            || text_bidi_line_append_utf8(
+                paragraph, at, end - at, output, capacity - 4u + (cut ? 3u : 0u),
+                &used);
+        if (cut && !leftward) {
+            memcpy(output + used, "...", 3u);
+            used += 3u;
+        }
+        at = next;
+    }
+    if (okay) {
+        output[used] = '\0';
+        if (right_to_left != NULL) *right_to_left = leftward;
+    }
+    text_bidi_paragraph_destroy(paragraph);
+    return okay;
+}
+
+bool psp_ui_visual_text(Budget *budget, const char *text, int maximum_width,
+                        int scale, const FontFace *font, unsigned rows,
+                        char *output, size_t capacity, bool *right_to_left)
+{
+    return ui_visual_text(budget, text, maximum_width, scale, font, false,
+                          rows, output, capacity, right_to_left);
+}
+
+/*
+ * Rows of page text already put in display order, keyed by everything the cut
+ * depends on. A surface draws the same titles every frame it is up, and HOME,
+ * the busiest, shows ten.
+ */
+enum { UI_PAGE_TEXT_SLOTS = 12 };
+typedef struct {
+    uint32_t hash;
+    int width;
+    int scale;
+    bool bold;
+    bool valid;
+    const FontFace *font;
+    const FontFace *face;
+    uint64_t glyphs;
+    uint32_t font_epoch;
+    char source[UI_PAGE_TEXT_BYTES];
+    char shown[UI_PAGE_TEXT_BYTES];
+} UiPageTextRow;
+static UiPageTextRow ui_page_text_rows[UI_PAGE_TEXT_SLOTS];
+static unsigned ui_page_text_next;
+/* The owner thread's Budget, charged for the bidi scratch of one cut
+   (about 12 KiB plus 20 bytes per code point, returned before the call
+   ends) so it counts against the app ceiling like any other allocation.
+   Unset, page text in chrome draws as stored (logical order). */
+static Budget *ui_page_text_budget;
+
+void psp_ui_set_text_budget(Budget *budget)
+{
+    ui_page_text_budget = budget;
+}
+
+static const char *ui_page_text_visual(const char *text, int maximum_width,
+                                       int scale, const FontFace *font,
+                                       bool bold)
+{
+    if (text == NULL || maximum_width <= 0) return text;
+    size_t length = strlen(text);
+    if (!text_bidi_maybe_needed(text, length)) return text;
+    uint32_t hash = 2166136261u;
+    for (const unsigned char *at = (const unsigned char *) text; *at; at++)
+        hash = (hash ^ *at) * 16777619u;
+    const FontFace *face = chrome_font_cache.faces[bold ? 1u : 0u];
+    uint64_t glyphs = font_optional_glyph_generation();
+    for (unsigned at = 0; at < UI_PAGE_TEXT_SLOTS; at++) {
+        const UiPageTextRow *row = &ui_page_text_rows[at];
+        if (row->valid && row->hash == hash && row->width == maximum_width
+            && row->scale == scale && row->bold == bold && row->font == font
+            && row->face == face && row->glyphs == glyphs
+            && row->font_epoch == chrome_font_epoch
+            && strcmp(row->source, text) == 0)
+            return row->shown;
+    }
+    /* Only the thread that owns the chrome may allocate here, as for a
+       glyph load; another draws the text as stored until the owner has. */
+    if (!chrome_glyph_load_allowed() || ui_page_text_budget == NULL)
+        return text;
+    UiPageTextRow *row = &ui_page_text_rows[ui_page_text_next];
+    ui_page_text_next = (ui_page_text_next + 1u) % UI_PAGE_TEXT_SLOTS;
+    row->valid = false;
+    uint32_t unsettled = chrome_glyph_unsettled_generation;
+    if (!ui_visual_text(ui_page_text_budget, text, maximum_width, scale, font,
+                        bold, 1u, row->shown, sizeof(row->shown), NULL))
+        return text;
+    row->hash = hash;
+    row->width = maximum_width;
+    row->scale = scale;
+    row->bold = bold;
+    row->font = font;
+    row->face = face;
+    row->glyphs = glyphs;
+    row->font_epoch = chrome_font_epoch;
+    /* Longer inputs still draw, but cannot be identified exactly in the
+       fixed source slot. Pending metrics are retried on the next frame. */
+    if (length < sizeof(row->source)
+        && unsettled == chrome_glyph_unsettled_generation) {
+        memcpy(row->source, text, length + 1u);
+        row->valid = true;
+    }
+    return row->shown;
+}
+
+void psp_ui_page_dialog_prepare(
+    Budget *budget, PspUiPageDialogView *view,
+    char message[PSP_UI_PAGE_DIALOG_SHOWN_MESSAGE_BYTES],
+    char value[PSP_UI_PAGE_DIALOG_SHOWN_VALUE_BYTES])
+{
+    /* The dialog box's text width, at the chrome's small scale. */
+    enum { WIDTH = 480 - 64 - 24, FIELD_WIDTH = WIDTH - 10, ROWS = 10 };
+    if (budget == NULL || view == NULL) return;
+    view->right_to_left = false;
+    if (view->value != NULL
+        && psp_ui_visual_text(budget, view->value, FIELD_WIDTH, 1, NULL, 1u,
+                              value, PSP_UI_PAGE_DIALOG_SHOWN_VALUE_BYTES, NULL))
+        view->value = value;
+    const char *source = view->message;
+    if (source == NULL || !text_bidi_maybe_needed(source, strlen(source))) return;
+    size_t used = 0;
+    unsigned rows = 0;
+    bool any = false, right_to_left = false, first = true;
+    char piece[PAGE_DIALOG_MESSAGE_BYTES];
+    char shown[PSP_UI_PAGE_DIALOG_SHOWN_MESSAGE_BYTES];
+    /* A line break the page wrote is a new paragraph. */
+    while (rows < ROWS) {
+        size_t length = strcspn(source, "\n");
+        if (length >= sizeof(piece)) length = sizeof(piece) - 1u;
+        memcpy(piece, source, length);
+        piece[length] = '\0';
+        bool leftward = false;
+        size_t room = PSP_UI_PAGE_DIALOG_SHOWN_MESSAGE_BYTES - used;
+        if (room < 16u) break;
+        if (psp_ui_visual_text(budget, piece, WIDTH, 1, NULL, ROWS - rows,
+                               shown, room - 2u, &leftward)) {
+            any = true;
+        } else {
+            /* Plain text: keep it, and let the painter wrap it. */
+            snprintf(shown, room - 2u, "%s", piece);
+        }
+        if (first) right_to_left = leftward;
+        first = false;
+        size_t added = strlen(shown);
+        memcpy(message + used, shown, added);
+        used += added;
+        for (size_t at = 0; at < added; at++) rows += shown[at] == '\n';
+        rows++;
+        source += length;
+        if (*source != '\n') break;
+        source++;
+        message[used++] = '\n';
+    }
+    message[used] = '\0';
+    if (!any) return;
+    view->message = message;
+    view->right_to_left = right_to_left;
+}
+
+const char *psp_ui_media_shown_title(PspUiMediaState *media, Budget *budget,
+                                     const char *source)
+{
+    if (media == NULL || media->presentation == NULL || source == NULL
+        || !text_bidi_maybe_needed(source, strlen(source))) return source;
+    PspUiMediaPresentation *p = media->presentation;
+    uint32_t hash = 2166136261u;
+    for (const unsigned char *at = (const unsigned char *) source; *at; at++)
+        hash = (hash ^ *at) * 16777619u;
+    uint64_t glyphs = font_optional_glyph_generation();
+    if (p->shown_title[0] != '\0' && p->shown_title_hash == hash
+        && p->shown_title_glyphs == glyphs) return p->shown_title;
+    /* The painter's own bounds: from x=14 to the bar's clock, at scale 2.
+       Shaped aside, then stored under the fence. */
+    char shown[sizeof(p->shown_title)];
+    bool prepared = psp_ui_visual_text(budget, source, 480 - 46 - 14, 2,
+                                       p->title_font, 1u, shown,
+                                       sizeof(shown), NULL);
+    p->shown_title_hash = hash;
+    p->shown_title_glyphs = glyphs;
+    if (prepared || p->shown_title[0] != '\0') {
+        bool held = psp_ui_media_fence_acquire(media);
+        if (prepared) memcpy(p->shown_title, shown, strlen(shown) + 1u);
+        else p->shown_title[0] = '\0';
+        psp_ui_media_fence_release(media, held);
+    }
+    return prepared ? p->shown_title : source;
+}
+
+void psp_ui_media_prepare_row_text(PspUiMediaState *media, Budget *budget,
+                                   char *text, size_t capacity)
+{
+    char shown[128];
+    if (media == NULL || text == NULL || capacity > sizeof(shown)) return;
+    /* The narrowest place a row is drawn: a chapter row, after its time. */
+    int width = (int) PSP_UI_MEDIA_TRACK_MENU_WIDTH - 62 - 58;
+    if (psp_ui_visual_text(
+            budget, text, width, 1,
+            media->presentation == NULL ? NULL : media->presentation->title_font,
+            1u, shown, capacity, NULL))
+        memcpy(text, shown, strlen(shown) + 1u);
+}
+
+void psp_ui_media_set_subtitle_bidi(PspUiMediaState *media, Budget *budget,
+                                    const char *text)
+{
+    if (media == NULL || media->presentation == NULL) return;
+    PspUiMediaPresentation *presentation = media->presentation;
+    /* Shaped aside, then stored under the fence: the cue as it is when it
+       needs no reordering or cannot be prepared. */
+    char rows[PSP_UI_MEDIA_SUBTITLE_TEXT_CAPACITY];
+    int scale = presentation->subtitle_size == BROWSER_SUBTITLE_SIZE_SMALL
+        ? 1 : 2;
+    bool right_to_left = false;
+    bool prepared = psp_ui_visual_text(
+        budget, text, media_subtitle_rect(media, 480, 272).width - 20,
+        scale, NULL, 2u, rows, sizeof(rows), &right_to_left);
+    bool held = psp_ui_media_fence_acquire(media);
+    if (prepared) {
+        memcpy(presentation->subtitle_text, rows, strlen(rows) + 1u);
+        presentation->subtitle_right_to_left = right_to_left;
+    } else {
+        copy_string(presentation->subtitle_text,
+                    sizeof(presentation->subtitle_text),
+                    text == NULL ? "" : text);
+        presentation->subtitle_right_to_left = false;
+    }
+    psp_ui_media_fence_release(media, held);
 }
 
 static TILEFINCH_OUT_OF_LINE void draw_media_queue_row(
@@ -12062,7 +13367,7 @@ void psp_ui_media_composite_supervisor_565(
 bool psp_ui_media_overlay_paints(const PspUiMediaState *media)
 {
     return media != NULL && media->visible
-        && (media->controls_visible || media->buffering
+        && (media->controls_visible || media->audio_only || media->buffering
             || (media->presentation != NULL
                 && media->presentation->subtitle_text[0] != '\0'));
 }
@@ -12074,7 +13379,15 @@ void psp_ui_media_composite_layers(
 {
     if (!psp_ui_media_overlay_paints(media) || pixels == NULL
         || width <= 0 || height <= 0 || stride < width) return;
-    if (!media->controls_visible) {
+    if (media->audio_only) {
+        /* No picture underneath: the listening view owns the whole panel,
+           title and control bars included, behind any panel or menu. */
+        int ground_top = include_title ? 0 : UI_MEDIA_TITLE_BAR_HEIGHT;
+        fill_rect(pixels, width, height, stride,
+                  (UiRect) {0, ground_top, width, height - ground_top},
+                  PSP_THEME_GROUND, 4);
+    }
+    if (!media->controls_visible && !media->audio_only) {
         if (media->buffering)
             draw_media_buffering(
                 pixels, width, height, stride, width / 2, height / 2);
@@ -12100,11 +13413,19 @@ void psp_ui_media_composite_layers(
     if (include_title) {
         fill_rect(pixels, width, height, stride,
                   (UiRect) {0, 0, width, UI_MEDIA_TITLE_BAR_HEIGHT}, bar, 4);
+        /* A title psp_ui_media_shown_title put in display order is already
+           cut to these bounds, dots included: room for the painter's own
+           dots keeps it from cutting the title's start a second time. */
+        const PspUiMediaPresentation *presentation = media->presentation;
+        bool prepared = presentation != NULL
+            && presentation->shown_title[0] != '\0'
+            && strcmp(media->title, presentation->shown_title) == 0;
         draw_text_with_font(
-            pixels, width, height, stride, 14, 12, media->title, 34,
-            width - 46, text, 2,
-            media->presentation == NULL
-                ? NULL : media->presentation->title_font,
+            pixels, width, height, stride, 14, 12, media->title,
+            PSP_UI_MEDIA_TITLE_CAPACITY,
+            width - 46 + (prepared ? 3 * ui_ellipsis_advance(2, false, NULL)
+                                   : 0),
+            text, 2, presentation == NULL ? NULL : presentation->title_font,
             false);
     }
 
@@ -12122,12 +13443,15 @@ void psp_ui_media_composite_layers(
                     media, pixels, width, height, stride);
         }
         UiRect message = media->failed
-            ? media_failed_panel_rect(width, height)
+            ? media_failed_panel_rect(media, width, height)
             : (UiRect) {width / 2 - 152, height / 2 - 41, 304, 82};
         draw_panel_shell(pixels, width, height, stride, message);
         char headline[PSP_UI_STATUS_CAPACITY];
         const char *reason = strchr(media->status, '\n');
-        copy_string(headline, sizeof(headline), media->status);
+        copy_string(headline, sizeof(headline),
+                    media->resolving
+                        ? media_status_text(media, media->status)
+                        : media->status);
         const char *shown = NULL;
         if (reason != NULL) {
             /* A long headline was folded onto the second row when it was
@@ -12223,22 +13547,24 @@ void psp_ui_media_composite_layers(
                 /* Quarantine needs a restart, but an exhausted playlist
                    simply has no request left to retry. Do not suggest an
                    application restart for that terminal queue outcome. */
-                if (media->presentation == NULL || !media->presentation->queue_active
-                    || !media->presentation->queue_terminal)
+                if (!media->insecure_audio_blocked
+                    && (media->presentation == NULL
+                        || !media->presentation->queue_active
+                        || !media->presentation->queue_terminal))
                     draw_fitted_ui_text(
                         pixels, width, height, stride,
                         message.x + 18, message.y + 63,
                         tilefinch_ui_text("Restart Tilefinch to use video"),
                         message.x + message.width - 18, muted, 2, false);
             } else {
-                UiRect retry = media_failed_retry_rect(message);
+                UiRect retry = media_failed_retry_rect(media, message);
                 fill_round_rect(
                     pixels, width, height, stride, retry,
                     PSP_THEME_RADIUS_CHIP, accent, 4);
                 /* The X button, then the shared catalog word. A word too
                    wide for the widest chip drops to compact text. */
                 char label[TILEFINCH_UI_TRANSLATION_VALUE_BYTES + 4];
-                media_retry_label(label, sizeof(label));
+                media_retry_label(media, label, sizeof(label));
                 int inner = retry.width - 2 * UI_MEDIA_FAILED_CHIP_PADDING;
                 int scale = 2;
                 int retry_width = chrome_text_width_bytes(
@@ -12350,6 +13676,11 @@ void psp_ui_media_composite_layers(
                   target, 9, text, 2);
     }
 
+    if (media->audio_only) {
+        draw_media_audio_body(media, pixels, width, height, stride);
+        draw_media_control_bar(media, pixels, width, height, stride);
+        return;
+    }
     int badge_center_y = media_badge_center_y(media, height);
     if (media->buffering)
         draw_media_buffering(

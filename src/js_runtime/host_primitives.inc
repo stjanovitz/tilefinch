@@ -59,6 +59,22 @@ static void clock_increment(uint64_t *value)
     if (*value < UINT64_MAX) (*value)++;
 }
 
+/* DOM "parse a selector" for querySelector(), matches() and closest():
+   true when the argument is a valid selector list (selector_syntax.c). */
+static JSValue js_selector_syntax_valid(JSContext *context,
+                                        JSValueConst this_value,
+                                        int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    if (argc < 1) return JS_FALSE;
+    size_t length = 0;
+    const char *text = JS_ToCStringLen(context, &length, argv[0]);
+    if (text == NULL) return JS_EXCEPTION;
+    bool valid = selector_syntax_valid(text, length);
+    JS_FreeCString(context, text);
+    return JS_NewBool(context, valid);
+}
+
 static JSValue js_css_supports(JSContext *context,
                                JSValueConst this_value,
                                int argc, JSValueConst *argv)
@@ -405,7 +421,7 @@ static JSValue js_script_async_assigned(JSContext *context,
    (handle, value) sets it without touching the content attribute and
    returns false when the element cannot hold a slot, so the caller falls
    back to the attribute. */
-static JSValue js_element_nonce(JSContext *context, JSValueConst this_value,
+JS_RT_GUARDED_NATIVE(static, js_element_nonce)(JSContext *context, JSValueConst this_value,
                                 int argc, JSValueConst *argv)
 {
     (void) this_value;
@@ -663,6 +679,22 @@ static JSValue js_request_media(JSContext *context,
         .mode = TILEFINCH_REQUEST_MODE_NO_CORS,
         .credentials = TILEFINCH_CREDENTIALS_INCLUDE
     };
+    size_t title_length = 0;
+    const char *title = document_attribute(node, "title", &title_length);
+    if (title != NULL) {
+        if (title_length >= sizeof(request.title)) {
+            title_length = sizeof(request.title) - 1u;
+            /* Cut at a character boundary, never inside a UTF-8
+               sequence: back off while the first dropped byte continues
+               one. */
+            while (title_length > 0
+                   && ((unsigned char) title[title_length] & 0xC0u)
+                          == 0x80u)
+                title_length--;
+        }
+        memcpy(request.title, title, title_length);
+        request.title[title_length] = '\0';
+    }
     size_t crossorigin_length = 0;
     const char *crossorigin = document_attribute(
         node, "crossorigin", &crossorigin_length);
@@ -715,6 +747,7 @@ static JSValue js_request_media(JSContext *context,
     bridge->media_mode = request.mode;
     bridge->media_credentials = request.credentials;
     bridge->media_source = source_copy;
+    memcpy(bridge->media_title, request.title, sizeof(bridge->media_title));
     bridge->media_requested = true;
     bridge_pin_node_slot(bridge, slot);
     return JS_TRUE;
@@ -812,6 +845,7 @@ static JSValue js_element_geometry(JSContext *context,
     bool viewport_root = document_root
                          || (node_name != NULL && node_name_length == 4
                              && strncasecmp(node_name, "body", 4) == 0);
+    js_rt_bridge_note_parser_writes_for_layout(bridge);
     bool dirty = bridge != NULL && bridge->relayout_dirty != NULL
         && *bridge->relayout_dirty;
     /* Script never reads a truncated layout (js_rt_bridge_layout): a
@@ -906,7 +940,7 @@ static JSValue js_element_geometry(JSContext *context,
     }
 #define SET_GEOMETRY(name, value) \
     do { \
-        if (JS_SetPropertyStr(context, result, name, \
+        if (js_rt_define_field(context, result, name, \
                               JS_NewInt32(context, value)) < 0) { \
             JS_FreeValue(context, result); \
             return JS_EXCEPTION; \
@@ -975,7 +1009,7 @@ static JSValue js_element_geometry(JSContext *context,
     return result;
 }
 
-static JSValue js_set_element_scroll(JSContext *context,
+JS_RT_GUARDED_NATIVE(static, js_set_element_scroll)(JSContext *context,
                                      JSValueConst this_value,
                                      int argc, JSValueConst *argv)
 {
@@ -1064,6 +1098,16 @@ static bool frame_realm_prepare(JSContext *caller, ScriptRuntime *host,
         return false;
     }
 #endif
+    /* The new ArrayBuffer intrinsics exist now and no author code has run
+       in this realm since they were created. */
+    if (!js_wasm_guard_buffer_transfer(realm)) {
+        host->frame_realms[slot].intrinsic_state = 3;
+#if defined(PSP_BROWSER_BELLARD_QUICKJS)
+        JS_RetireContext(realm);
+#endif
+        JS_Throw(caller, JS_GetException(realm));
+        return false;
+    }
     host->frame_realms[slot].intrinsic_state = 2;
     return true;
 }
@@ -1093,6 +1137,7 @@ static JSValue js_frame_scope(JSContext *context, JSValueConst this_value,
             host->frame_realms[i].context = NULL;
             host->frame_realms[i].global = JS_UNDEFINED;
             host->frame_realms[i].intrinsic_state = 0;
+            host->frame_realms[i].frame_handle = 0;
             return JS_UNDEFINED;
         }
         if (host->frame_realms[i].context != NULL) continue;
@@ -1122,6 +1167,9 @@ static JSValue js_frame_scope(JSContext *context, JSValueConst this_value,
         JSValue global = JS_GetGlobalObject(realm);
         host->frame_realms[i].context = realm;
         host->frame_realms[i].global = JS_DupValue(realm, global);
+        host->frame_realms[i].dynamic_code_allowed =
+            bridge->dynamic_code_allowed;
+        host->frame_realms[i].frame_handle = 0;
 #if !defined(PSP_BROWSER_BELLARD_QUICKJS)
         host->frame_realms[i].intrinsic_state = 2;
 #endif
@@ -1133,13 +1181,25 @@ static JSValue js_frame_scope(JSContext *context, JSValueConst this_value,
         : JS_ThrowRangeError(context, "frame realm quota exceeded");
 }
 
+static bool frame_eval_allowed(const DomBridge *bridge, JSValueConst scope)
+{
+    for (size_t i = 0; i < SCRIPT_FRAME_REALM_LIMIT; i++) {
+        if (bridge->host->frame_realms[i].context != NULL
+            && JS_VALUE_GET_PTR(bridge->host->frame_realms[i].global)
+                   == JS_VALUE_GET_PTR(scope)) {
+            return bridge->host->frame_realms[i].dynamic_code_allowed;
+        }
+    }
+    return bridge->dynamic_code_allowed;
+}
+
 static JSValue js_frame_eval(JSContext *context, JSValueConst this_value,
                              int argc, JSValueConst *argv, int magic,
                              JSValue *function_data)
 {
     (void) this_value; (void) magic;
     DomBridge *bridge = JS_GetContextOpaque(context);
-    if (bridge == NULL || !bridge->dynamic_code_allowed) {
+    if (bridge == NULL || !frame_eval_allowed(bridge, function_data[0])) {
         return JS_ThrowTypeError(
             context,
             "dynamic code compilation disabled by Content Security Policy");
@@ -1157,7 +1217,12 @@ static JSValue js_frame_eval(JSContext *context, JSValueConst this_value,
         return JS_EXCEPTION;
     }
     JS_FreeValue(context, length_value);
-    if (source_length > 64 * 1024) {
+    /* The same per-script admission a page script gets: anti-abuse VMs compile
+       more than 64 KiB here, padded by a random amount. */
+    size_t source_maximum =
+        bridge->execution_policy.maximum_host_compile_source_bytes;
+    if (source_maximum != 0 && source_length > 0
+        && (uint64_t) source_length > source_maximum) {
         JS_FreeValue(context, source);
         return JS_ThrowRangeError(context, "frame eval exceeds bounded size");
     }
@@ -1216,19 +1281,23 @@ static JSValue js_create_frame_eval(JSContext *context,
         return JS_ThrowTypeError(context,
                                  "frame eval requires evaluator and scope");
     }
-#if defined(TILEFINCH_QUICKJS_DYNAMIC_CODE_POLICY)
     DomBridge *bridge = JS_GetContextOpaque(context);
     if (bridge == NULL || bridge->host == NULL)
         return JS_ThrowInternalError(context, "frame runtime unavailable");
+    int64_t frame_handle = 0;
+    if (argc > 2 && JS_ToInt64(context, &frame_handle, argv[2]) < 0)
+        return JS_EXCEPTION;
     for (size_t i = 0; i < SCRIPT_FRAME_REALM_LIMIT; i++) {
         if (bridge->host->frame_realms[i].context != NULL
             && JS_VALUE_GET_PTR(bridge->host->frame_realms[i].global)
                    == JS_VALUE_GET_PTR(argv[0])) {
+#if defined(TILEFINCH_QUICKJS_DYNAMIC_CODE_POLICY)
             JS_SetGlobalThis(bridge->host->frame_realms[i].context, argv[1]);
+#endif
+            bridge->host->frame_realms[i].frame_handle = (long) frame_handle;
             break;
         }
     }
-#endif
     JSValue function_data[2] = { argv[0], argv[1] };
     JSValue function = JS_NewCFunctionData(context, js_frame_eval, 1, 0,
                                            2, function_data);
@@ -1298,10 +1367,10 @@ static JSValue js_storage_estimate(JSContext *context,
     if (quota < used) quota = used;
     JSValue values = JS_NewArray(context);
     if (JS_IsException(values)) return values;
-    if (JS_SetPropertyUint32(
+    if (js_rt_define_index(
             context, values, 0,
             JS_NewInt64(context, (int64_t) used)) < 0
-        || JS_SetPropertyUint32(
+        || js_rt_define_index(
                context, values, 1,
                JS_NewInt64(context, (int64_t) quota)) < 0) {
         JS_FreeValue(context, values);
@@ -1333,13 +1402,13 @@ static JSValue js_heap_memory_snapshot(JSContext *context,
     if (limit < total) limit = total;
     JSValue values = JS_NewArray(context);
     if (JS_IsException(values)) return values;
-    if (JS_SetPropertyUint32(
+    if (js_rt_define_index(
             context, values, 0,
             JS_NewInt64(context, (int64_t) limit)) < 0
-        || JS_SetPropertyUint32(
+        || js_rt_define_index(
                context, values, 1,
                JS_NewInt64(context, (int64_t) total)) < 0
-        || JS_SetPropertyUint32(
+        || js_rt_define_index(
                context, values, 2,
                JS_NewInt64(context, (int64_t) used)) < 0) {
         JS_FreeValue(context, values);
@@ -2055,7 +2124,10 @@ static JSValue js_crypto_random_fill(JSContext *context,
 /* Private structured-clone primitive. JavaScript validates the transferable
    with the captured ArrayBuffer byteLength getter before calling this sink;
    repeat the native class check so a poisoned bootstrap cannot detach an
-   unrelated object. */
+   unrelated object. A WebAssembly.Memory buffer is never detached (its
+   detach key forbids it). With a true second argument nothing is detached:
+   the result says whether the buffer may be, so a transfer list can be
+   refused before any of it commits. */
 static JSValue js_detach_array_buffer(JSContext *context,
                                       JSValueConst this_value,
                                       int argc, JSValueConst *argv)
@@ -2078,6 +2150,13 @@ static JSValue js_detach_array_buffer(JSContext *context,
         }
         JS_FreeValue(context, exception);
     }
+    bool detachable = !js_wasm_buffer_aliases_memory(context, argv[0]);
+    if (argc > 1 && JS_ToBool(context, argv[1]))
+        return JS_NewBool(context, detachable);
+    if (!detachable) {
+        return JS_ThrowTypeError(
+            context, "a WebAssembly.Memory buffer cannot be detached");
+    }
     JS_DetachArrayBuffer(context, argv[0]);
     return JS_UNDEFINED;
 }
@@ -2092,13 +2171,19 @@ static JSValue js_is_proxy(JSContext *context, JSValueConst this_value,
     return JS_NewBool(context, argc > 0 && JS_IsProxy(argv[0]));
 }
 
-static JSValue js_crypto_digest_sha256(JSContext *context,
-                                       JSValueConst this_value,
-                                       int argc, JSValueConst *argv)
+/* digest(source, algorithm): algorithm is a TilefinchWebDigest the
+   bootstrap derived from the normalized WebCrypto name. */
+static JSValue js_crypto_digest(JSContext *context,
+                                JSValueConst this_value,
+                                int argc, JSValueConst *argv)
 {
     (void) this_value;
-    if (argc < 1) {
-        return JS_ThrowTypeError(context, "SHA-256 digest requires a byte view");
+    int32_t algorithm = -1;
+    if (argc < 2 || JS_ToInt32(context, &algorithm, argv[1]) != 0
+        || algorithm < (int32_t) TILEFINCH_WEB_DIGEST_SHA1
+        || algorithm > (int32_t) TILEFINCH_WEB_DIGEST_SHA512) {
+        return JS_ThrowTypeError(context,
+                                 "digest requires a byte view and algorithm");
     }
     size_t length = 0;
     const uint8_t *bytes = NULL;
@@ -2162,18 +2247,19 @@ static JSValue js_crypto_digest_sha256(JSContext *context,
         return JS_ThrowRangeError(context,
                                   "digest input exceeds bounded size");
     }
-    uint8_t digest[TILEFINCH_SHA256_DIGEST_BYTES];
+    uint8_t digest[64];
     const uint8_t *input = length == 0 ? NULL : bytes;
-    bool digested = tilefinch_sha256_digest(input, length, digest);
-    if (!digested) {
-        return JS_ThrowInternalError(context, "SHA-256 digest failed");
+    size_t digest_length = tilefinch_web_digest(
+        (TilefinchWebDigest) algorithm, input, length, digest);
+    if (digest_length == 0) {
+        return JS_ThrowInternalError(context, "digest failed");
     }
     if (bridge != NULL && bridge->result != NULL) {
         js_rt_saturating_add_size(&bridge->result->crypto_digest_calls, 1u);
         js_rt_saturating_add_size(&bridge->result->crypto_digest_bytes,
                                   length);
     }
-    return JS_NewArrayBufferCopy(context, digest, sizeof(digest));
+    return JS_NewArrayBufferCopy(context, digest, digest_length);
 }
 
 #define SCRIPT_COMPRESSION_INPUT_LIMIT (1024u * 1024u)
@@ -2340,15 +2426,20 @@ static JSValue js_opfs_command(JSContext *context, JSValueConst this_value,
         size_t length = 0;
         JSValue owner = JS_UNDEFINED;
         int64_t expected_generation = 0;
-        if (argc < 4 || !js_compression_buffer_source(
-                            context, argv[2], &bytes, &length, &owner)) {
+        if (argc < 4) {
             JS_FreeCString(context, path);
             return JS_ThrowTypeError(context, "OPFS write requires bytes");
         }
+        /* Coerce before borrowing the bytes: a valueOf() could otherwise
+           detach the buffer under the pointer that is written to storage. */
         if (JS_ToInt64(context, &expected_generation, argv[3]) < 0) {
-            JS_FreeValue(context, owner);
             JS_FreeCString(context, path);
             return JS_EXCEPTION;
+        }
+        if (!js_compression_buffer_source(
+                context, argv[2], &bytes, &length, &owner)) {
+            JS_FreeCString(context, path);
+            return JS_ThrowTypeError(context, "OPFS write requires bytes");
         }
         BrowserOpfsResult found = browser_session_opfs_stat(
             bridge->session, bridge->document_url, path, &view);
@@ -2615,8 +2706,65 @@ static JSValue js_compression_run(JSContext *context,
     return result;
 }
 
-static JSValue base64_encode_raw(JSContext *context, const uint8_t *bytes,
-                                 size_t length);
+/* Base64 of `count` bytes from `source`, written to `output`. With
+   `latin1_utf8`, `source` is validated UTF-8 of Latin-1 code units (one
+   byte below 0x80, two bytes otherwise) and each unit is one input byte. */
+static void base64_encode_into(char *output, const unsigned char *source,
+                               size_t count, bool latin1_utf8)
+{
+    static const char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t at = 0, destination = 0;
+#define TILEFINCH_BASE64_NEXT_BYTE()                                       \
+    (latin1_utf8 && source[at] >= 0x80u                                    \
+         ? (at += 2u, (uint32_t) (((source[at - 2u] & 0x03u) << 6)         \
+                                  | (source[at - 1u] & 0x3Fu)))            \
+         : (uint32_t) source[at++])
+    for (size_t remaining = count; remaining != 0;) {
+        uint32_t a = TILEFINCH_BASE64_NEXT_BYTE();
+        bool has_b = remaining > 1u, has_c = remaining > 2u;
+        uint32_t b = has_b ? TILEFINCH_BASE64_NEXT_BYTE() : 0u;
+        uint32_t c = has_c ? TILEFINCH_BASE64_NEXT_BYTE() : 0u;
+        remaining -= has_c ? 3u : has_b ? 2u : 1u;
+        uint32_t value = (a << 16) | (b << 8) | c;
+        output[destination++] = alphabet[(value >> 18) & 63u];
+        output[destination++] = alphabet[(value >> 12) & 63u];
+        output[destination++] = has_b ? alphabet[(value >> 6) & 63u] : '=';
+        output[destination++] = has_c ? alphabet[value & 63u] : '=';
+    }
+#undef TILEFINCH_BASE64_NEXT_BYTE
+}
+
+/* The base64 string of `count` input bytes. No fixed length cap: the
+   result is one string charged to the realm's heap, so the realm's memory
+   limit (and the engine's string length limit) bound it, and a refusal is
+   an ordinary catchable exception. The output is written in place, with
+   no intermediate copy. */
+static JSValue base64_encoded_string(JSContext *context,
+                                     const unsigned char *source,
+                                     size_t count, bool latin1_utf8)
+{
+    if (count > (SIZE_MAX / 4u) * 3u - 2u)
+        return JS_ThrowRangeError(context, "Invalid string length");
+    size_t output_length = ((count + 2u) / 3u) * 4u;
+#if defined(PSP_BROWSER_BELLARD_QUICKJS)
+    uint8_t *output = NULL;
+    JSValue result = JS_NewStringLenLatin1UninitializedPortable(
+        context, output_length, &output);
+    if (JS_IsException(result)) return result;
+    if (output_length != 0)
+        base64_encode_into((char *) output, source, count, latin1_utf8);
+    return result;
+#else
+    char *output = js_malloc(context, output_length + 1u);
+    if (output == NULL) return JS_EXCEPTION;
+    base64_encode_into(output, source, count, latin1_utf8);
+    output[output_length] = '\0';
+    JSValue result = JS_NewStringLen(context, output, output_length);
+    js_free(context, output);
+    return result;
+#endif
+}
 
 static JSValue js_base64_encode_bytes(JSContext *context,
                                       JSValueConst this_value,
@@ -2631,45 +2779,21 @@ static JSValue js_base64_encode_bytes(JSContext *context,
     size_t buffer_length = 0;
     uint8_t *bytes = JS_GetArrayBuffer(context, &buffer_length, buffer);
     if (bytes == NULL || bytes_per_element != 1 || offset > buffer_length
-        || length > buffer_length - offset || length > 256u * 1024u) {
+        || length > buffer_length - offset) {
         JS_FreeValue(context, buffer);
-        return JS_ThrowRangeError(context, "base64 input exceeds bounded size");
+        return JS_ThrowTypeError(context, "byte array required");
     }
-    JSValue result = base64_encode_raw(context, bytes + offset, length);
+    JSValue result = base64_encoded_string(context, bytes + offset, length,
+                                           false);
     JS_FreeValue(context, buffer);
     return result;
 }
 
-static JSValue base64_encode_raw(JSContext *context, const uint8_t *bytes,
-                                 size_t length)
-{
-    static const char alphabet[] =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    size_t output_length = ((length + 2u) / 3u) * 4u;
-    char *output = js_malloc(context, output_length + 1u);
-    if (output == NULL) return JS_EXCEPTION;
-    size_t source = 0, end = length, destination = 0;
-    while (source < end) {
-        uint32_t a = bytes[source++];
-        bool has_b = source < end;
-        uint32_t b = has_b ? bytes[source++] : 0;
-        bool has_c = source < end;
-        uint32_t c = has_c ? bytes[source++] : 0;
-        uint32_t value = (a << 16) | (b << 8) | c;
-        output[destination++] = alphabet[(value >> 18) & 63u];
-        output[destination++] = alphabet[(value >> 12) & 63u];
-        output[destination++] = has_b ? alphabet[(value >> 6) & 63u] : '=';
-        output[destination++] = has_c ? alphabet[value & 63u] : '=';
-    }
-    output[output_length] = '\0';
-    JSValue result = JS_NewStringLen(context, output, output_length);
-    js_free(context, output);
-    return result;
-}
-
-/* btoa's work in one pass: the string's code units as bytes, refused at
-   the first unit above 255 (returned as its index, so script can report
-   it exactly as before), otherwise base64. */
+/* btoa's work: the string's code units as bytes, refused at the first unit
+   above 255 (returned as its index, so script can report it exactly as
+   before), otherwise base64. The engine lends an ASCII string's own bytes,
+   so the only allocation is the result; other strings cost their UTF-8
+   copy, which is read in place. */
 static JSValue js_base64_encode_latin1(JSContext *context,
                                        JSValueConst this_value,
                                        int argc, JSValueConst *argv)
@@ -2679,33 +2803,26 @@ static JSValue js_base64_encode_latin1(JSContext *context,
     size_t utf8_length = 0;
     const char *utf8 = JS_ToCStringLen(context, &utf8_length, argv[0]);
     if (utf8 == NULL) return JS_EXCEPTION;
-    uint8_t *bytes = js_malloc(context, utf8_length + 1u);
-    if (bytes == NULL) {
-        JS_FreeCString(context, utf8);
-        return JS_EXCEPTION;
-    }
-    size_t used = 0;
+    const unsigned char *source = (const unsigned char *) utf8;
+    size_t units = 0;
     int64_t bad = -1;
-    for (size_t at = 0; at < utf8_length;) {
-        unsigned char lead = (unsigned char) utf8[at];
+    for (size_t at = 0; at < utf8_length; units++) {
+        unsigned char lead = source[at];
         if (lead < 0x80u) {
-            bytes[used++] = lead;
             at++;
-        } else if ((lead == 0xC2u || lead == 0xC3u) && at + 1u < utf8_length
-                   && ((unsigned char) utf8[at + 1u] & 0xC0u) == 0x80u) {
-            bytes[used++] = (uint8_t) (((lead & 0x03u) << 6)
-                | ((unsigned char) utf8[at + 1u] & 0x3Fu));
+        } else if ((lead == 0xC2u || lead == 0xC3u)
+                   && utf8_length - at > 1u
+                   && (source[at + 1u] & 0xC0u) == 0x80u) {
             at += 2u;
         } else {
-            /* Code units so far: one per byte written. */
-            bad = (int64_t) used;
+            bad = (int64_t) units;
             break;
         }
     }
-    JS_FreeCString(context, utf8);
     JSValue result = bad >= 0 ? JS_NewInt64(context, bad)
-        : base64_encode_raw(context, bytes, used);
-    js_free(context, bytes);
+        : base64_encoded_string(context, source, units,
+                                units != utf8_length);
+    JS_FreeCString(context, utf8);
     return result;
 }
 
@@ -2725,6 +2842,10 @@ static bool base64_whitespace(unsigned char value)
         || value == '\r' || value == ' ';
 }
 
+/* atob's work. Like the encoders it has no fixed length cap: valid input
+   is ASCII, which the engine lends in place, so the only allocation is the
+   result string (three quarters of the input), charged to and bounded by
+   the realm's heap. */
 static JSValue js_base64_decode_string(JSContext *context,
                                        JSValueConst this_value,
                                        int argc, JSValueConst *argv)
@@ -2734,11 +2855,6 @@ static JSValue js_base64_decode_string(JSContext *context,
     size_t length = 0;
     const char *input = JS_ToCStringLen(context, &length, argv[0]);
     if (input == NULL) return JS_EXCEPTION;
-    if (length > 1024u * 1024u) {
-        JS_FreeCString(context, input);
-        return JS_ThrowRangeError(context,
-                                  "base64 input exceeds bounded size");
-    }
     size_t digit_count = 0, padding = 0;
     bool padding_started = false, valid = true;
     for (size_t i = 0; i < length; i++) {
@@ -3043,7 +3159,7 @@ static JSValue js_compile_inline_event_handler(JSContext *context,
     if (scope_count == 0 || JS_IsException(function)) return function;
     JSValue chain = JS_NewArray(context);
     for (size_t i = 0; i < scope_count && !JS_IsException(chain); i++)
-        if (JS_SetPropertyUint32(context, chain, (uint32_t) i,
+        if (js_rt_define_index(context, chain, (uint32_t) i,
                                  JS_DupValue(context, scopes[i])) < 0) {
             JS_FreeValue(context, chain);
             chain = JS_EXCEPTION;
@@ -3140,8 +3256,11 @@ bool js_rt_install_native(JSContext *context, JSValue target,
     }
     if (flags == 0 && (native->flags & JS_RT_NATIVE_TRANSIENT))
         flags = JS_PROP_CONFIGURABLE;
+    /* Only TRUE counts: lazy modules install their bridges after author
+       code ran, and a page-owned non-configurable name answers FALSE. The
+       module would then capture the page's value as its bridge. */
     return JS_DefinePropertyValueStr(
-               context, target, native->name, value, flags) >= 0;
+               context, target, native->name, value, flags) > 0;
 }
 
 bool js_rt_install_natives(JSContext *context, JSValue target,

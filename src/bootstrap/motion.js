@@ -33,7 +33,7 @@
     applied = new WeakMap(),
     lifecycleStates = new Set();
   let pending = false,
-    observer = null,
+    observing = false,
     lifecycleTimer = 0,
     lifecycleTimerDue = Infinity,
     scans = 0,
@@ -71,6 +71,7 @@
 
   class AnimationEvent extends Event {
     constructor(type, init = {}) {
+      init ??= {};
       super(type, init);
       this.animationName = String(init.animationName || "");
       this.elapsedTime = Math.max(0, Number(init.elapsedTime) || 0);
@@ -449,10 +450,9 @@
         globalThis.__tilefinchReportUncaught?.(error, "CSS animation event");
       }
     },
-    lifecycleNow = () => {
-      const now = Number(performance.now());
-      return Number.isFinite(now) ? Math.max(0, now) : 0;
-    },
+    /* The clock of the timer that delivers these events: asked another one,
+       a timer firing early by it finds nothing due and only arms again. */
+    lifecycleNow = () => globalThis.__tilefinchSchedulerTime(),
     armLifecycleTimer = () => {
       let due = Infinity;
       for (const state of lifecycleStates) {
@@ -467,7 +467,9 @@
       lifecycleTimerDue = due;
       if (!Number.isFinite(due)) return;
       const delay = Math.max(0, Math.ceil(due - lifecycleNow()));
-      lifecycleTimer = globalThis.__tilefinchScheduleTimeout?.(
+      /* A reserved slot: nothing would arm this again if a page that had
+         filled the timer table got it refused. */
+      lifecycleTimer = globalThis.__tilefinchScheduleReservedTask(
         serviceLifecycles,
         delay,
       ) || 0;
@@ -927,30 +929,21 @@
     schedule(advanceScan);
   };
   const beginObserving = () => {
-    if (
-      observer ||
-      !document.documentElement ||
-      !documentHasMotionHint()
-    )
-      return;
-    observer = globalThis.__tilefinchObserveMutations((records) => {
-      for (const record of records)
-        if (
-          record.type !== "attributes" ||
-          record.attributeName === "class"
-        ) {
-          globalThis.__tilefinchMotionRecheck();
-          break;
-        }
-    }, document.documentElement, {
-      subtree: true,
-      childList: true,
-      characterData: true,
-      attributes: true,
-      attributeFilter: ["class", "style", "hidden", "id"],
-    });
+    if (!observing && document.documentElement && documentHasMotionHint())
+      observing = true;
   };
   globalThis.__tilefinchBeginMotionObservation = beginObserving;
+  /* A child-list or text change: one in the document's own tree can add or
+     remove what the scan reads. (Class and style changes recheck wherever
+     they happen.) Asked directly: a mutation observer here made a record of
+     every mutation in the page. */
+  globalThis.__tilefinchMotionTreeChanged = (handle) => {
+    if (!observing || (pending && (!scanIterator || scanRunning))) return;
+    const root = document.documentElement?.__handle;
+    if (root && (root === handle ||
+        globalThis.__tilefinchIsAncestor(root, handle) !== false))
+      globalThis.__tilefinchMotionRecheck();
+  };
 
   /*
    * Stylesheet transitions. Layout does not animate, but a page that waits
@@ -965,6 +958,7 @@
   const TRANSITION_WATCH_LIMIT = 64,
     selectorsTestAttribute = globalThis.__tilefinchSelectorsTestAttribute,
     TRANSITION_DISCOVERY_LIMIT = 128,
+    CHANGED_DISCOVERY_LIMIT = 16,
     /* For `all`: properties pages commonly transition whose computed value
        does not follow layout (a used height changing with content is not a
        transition), plus display, which cancels; display stays first. */
@@ -1111,6 +1105,21 @@
           }
           if (remaining <= 0) break;
         }
+        /* A listener on the document has all of a long page to search, and
+           the walks above can stop before the element that actually changed,
+           which is the likeliest to have started one. */
+        if (transitionDocumentListener)
+          for (let at = 0; at < transitionDirty.length; at += 3) {
+            if (transitionDirty[at + 1] === null) continue;
+            const target = typeof transitionDirty[at] === "object"
+              ? transitionDirty[at]
+              : globalThis.__tilefinchWrap(transitionDirty[at]);
+            if (!(target?.__handle > 0)) continue;
+            discoverTransitionDescendants(target, CHANGED_DISCOVERY_LIMIT);
+            if (!transitionWatched.has(target) &&
+                __tilefinchTransitionSnapshot(target.__handle, null, true))
+              watchTransitionElement(target);
+          }
       }
       transitionDirty.length = 0;
       transitionDirtyAll = false;
@@ -1219,6 +1228,7 @@
   /* target: the changed element or its handle; name: the changed attribute
      (with oldValue), undefined for an inline style write, or null for an
      element that has just been watched. */
+  let transitionDocumentListener = false;
   globalThis.__tilefinchTransitionsDirty = (target, name, oldValue) => {
     if (transitionWatched.size === 0) return;
     if (!target || transitionDirty.length >= TRANSITION_DIRTY_LIMIT * 3)
@@ -1235,8 +1245,16 @@
       transitionWatched.get(target).observesSubtree ||= observesSubtree;
       return;
     }
-    if (transitionWatched.size >= TRANSITION_WATCH_LIMIT)
-      transitionWatched.delete(transitionWatched.keys().next().value);
+    if (transitionWatched.size >= TRANSITION_WATCH_LIMIT) {
+      /* A listener's own element goes last: it finds the others again. */
+      let evicted = transitionWatched.keys().next().value;
+      for (const [element, held] of transitionWatched)
+        if (!held.observesSubtree) {
+          evicted = element;
+          break;
+        }
+      transitionWatched.delete(evicted);
+    }
     const state = {
       names: TRANSITION_SAMPLE,
       values: [],
@@ -1254,6 +1272,15 @@
      the transition and its changed value. Bound discovery independently
      of retained watches, and avoid synchronous layout during the walk. */
   const discoverTransitionDescendants = (root, limit) => {
+    /* A watched node needs nothing more from this walk unless the event
+       alias must reach it, which only script can stamp. */
+    if (!root.__tilefinchWebkitTransitionEnd) {
+      const found = __tilefinchTransitionDiscover(root.__handle, limit);
+      for (let at = 1; at < found.length; at++)
+        watchTransitionElement(globalThis.__tilefinchWrap(found[at]));
+      transitionDiscoveryVisits += found[0];
+      return found[0];
+    }
     let node = root.firstElementChild, visited = 0, ascents = 0;
     while (node && visited < limit && ascents < limit) {
       visited++;
@@ -1276,6 +1303,11 @@
     return visited;
   };
   globalThis.__tilefinchWatchTransitions = (target, type) => {
+    /* The events bubble that far, so the whole document is its subtree. */
+    if (target === document || target === globalThis) {
+      target = document.documentElement;
+      transitionDocumentListener = true;
+    }
     if (!(target instanceof Element) || !(target.__handle > 0)) return;
     const webkit = type === "webkitTransitionEnd",
       state = transitionWatched.get(target),

@@ -739,5 +739,21 @@ class QueryBrowserCaptureTests(unittest.TestCase):
             self.assertFalse(census.complete_state(json.loads((output/'reference-state.json').read_text())))
 
 
+def main_with_skip_status(missing):
+    """Run unittest.main, but exit 77 (CTest SKIP_RETURN_CODE) when every
+    selected test was skipped, so missing coverage shows as Skipped rather
+    than as a pass that ran nothing."""
+    program = unittest.main(exit=False)
+    result = program.result
+    if not result.wasSuccessful():
+        sys.exit(1)
+    skipped_tests = sum(1 for test, _ in result.skipped
+                        if isinstance(test, unittest.TestCase))
+    if result.skipped and result.testsRun == skipped_tests:
+        print(f"SKIP: {missing}")
+        sys.exit(77)
+    sys.exit(0)
+
+
 if __name__ == "__main__":
-    unittest.main()
+    main_with_skip_status("Node/Playwright is unavailable")

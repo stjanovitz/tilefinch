@@ -514,6 +514,11 @@ static void stylesheet_release_fragment_seeds(Stylesheet *sheet)
     sheet->selector_fragment_offset_count = 0;
 }
 
+void stylesheet_drop_selector_fragment_seeds(Stylesheet *sheet)
+{
+    stylesheet_release_fragment_seeds(sheet);
+}
+
 static bool style_fragment_size_add(size_t *total, size_t added)
 {
     if (total == NULL || added > SIZE_MAX - *total) return false;

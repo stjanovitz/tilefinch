@@ -514,35 +514,35 @@ static bool style_deferred_program_scan(
                 || span_case_equal(name, name_length, "font-family")
                 || span_case_equal(name, name_length, "font");
             for (size_t i = 0; i < value_length; i++) {
-                if (i + 4 <= value_length
-                    && memcmp(value + i, "var(", 4) == 0) {
-                    needs_runtime_basis = true;
-                    break;
+                if (value[i] == 'v') {
+                    if (i + 4 <= value_length
+                        && memcmp(value + i, "var(", 4) == 0) {
+                        needs_runtime_basis = true;
+                        break;
+                    }
+                    continue;
                 }
+                /* ASCII case folding: every unit below starts r, e or c,
+                   and most bytes are none of them. */
+                unsigned char first = (unsigned char) value[i] | 0x20u;
+                if (first != 'r' && first != 'e' && first != 'c') continue;
+                unsigned char second = i + 2 <= value_length
+                    ? (unsigned char) value[i + 1] | 0x20u : 0;
+                unsigned char third = i + 3 <= value_length
+                    ? (unsigned char) value[i + 2] | 0x20u : 0;
                 size_t unit_length = 0;
-                if (i + 3 <= value_length
-                    && tolower((unsigned char) value[i]) == 'r'
-                    && tolower((unsigned char) value[i + 1]) == 'e'
-                    && tolower((unsigned char) value[i + 2]) == 'm') {
+                if (first == 'r' && second == 'e' && third == 'm') {
                     unit_length = 3;
-                } else if (i + 2 <= value_length
-                           && tolower((unsigned char) value[i]) == 'e'
-                           && tolower((unsigned char) value[i + 1]) == 'm') {
+                } else if (first == 'e' && second == 'm') {
                     unit_length = 2;
-                } else if (i + 3 <= value_length
-                           && tolower((unsigned char) value[i]) == 'c'
-                           && tolower((unsigned char) value[i + 1]) == 'q'
-                           && (tolower((unsigned char) value[i + 2]) == 'w'
-                               || tolower((unsigned char) value[i + 2]) == 'h'
-                               || tolower((unsigned char) value[i + 2]) == 'i'
-                               || tolower((unsigned char) value[i + 2])
-                                  == 'b')) {
+                } else if (first == 'c' && second == 'q'
+                           && (third == 'w' || third == 'h' || third == 'i'
+                               || third == 'b')) {
                     unit_length = 3;
-                } else if (i + 5 <= value_length
-                           && strncasecmp(value + i, "cqmin", 5) == 0) {
-                    unit_length = 5;
-                } else if (i + 5 <= value_length
-                           && strncasecmp(value + i, "cqmax", 5) == 0) {
+                } else if (first == 'c' && second == 'q'
+                           && i + 5 <= value_length
+                           && (strncasecmp(value + i, "cqmin", 5) == 0
+                               || strncasecmp(value + i, "cqmax", 5) == 0)) {
                     unit_length = 5;
                 }
                 if (unit_length == 0 || i == 0) continue;

@@ -57,6 +57,8 @@ uint32_t tilefinch_frame_sandbox_parse(const char *value, size_t length,
         } else if (token_is(value + start, token_length,
                             "allow-top-navigation-by-user-activation")) {
             flags |= TILEFINCH_SANDBOX_ALLOW_TOP_NAVIGATION_BY_USER;
+        } else if (token_is(value + start, token_length, "allow-modals")) {
+            flags |= TILEFINCH_SANDBOX_ALLOW_MODALS;
         }
     }
     return flags;

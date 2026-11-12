@@ -1490,6 +1490,9 @@ void stylesheet_drop_custom_rule_index(Stylesheet *sheet)
     sheet->custom_rule_index = NULL;
     sheet->custom_rule_index_count = 0;
     sheet->custom_rule_index_bytes = 0;
+    budget_free(sheet->budget, sheet->retained_gate);
+    sheet->retained_gate = NULL;
+    sheet->retained_gate_keyless = 0;
     sheet->custom_rule_index_ready = false;
     sheet->custom_rule_index_attempted = false;
 }
@@ -1578,6 +1581,163 @@ static void stylesheet_suffix_state_finish(Stylesheet *sheet, bool parsed)
     if (parsed && restore_rule_index) stylesheet_prepare_rule_index(sheet);
 }
 
+static uint32_t style_rule_key_hash(SelectorType type, const char *text,
+                                    size_t length);
+
+/* The gate slot hash of an attribute name, ASCII case folded (the matcher
+   lower-cases the selector's name), apart from tag/class/id key hashes. */
+static uint32_t style_retained_gate_attribute_hash(const char *name,
+                                                   size_t length)
+{
+    return style_fnv1a(STYLE_FNV1A_SEED ^ UINT32_C(0x41747472), name, length,
+                       true);
+}
+
+/* The gate slot hash of a key every element the custom rule selects must
+   carry, as the matcher compares it (style_subject_key_matches,
+   attribute_matches): the stored rightmost tag/class/id key, the key the
+   rule index derives for an escaped class or id (utility classes such as
+   .rounded-ss-\[6px\]), or the name of the attribute selector that opens
+   the rightmost compound ([slot=title]). False when the rule has none of
+   these, and for the focus probes' marker attribute, which an element can
+   carry without the DOM having it (style_focus_override_swap). */
+static bool stylesheet_custom_rule_gate_key(const StyleCustomRule *rule,
+                                            uint32_t *hash)
+{
+    if (rule->selector == NULL || rule->selector_length == 0) return false;
+    size_t length = rule->selector_length;
+    if (rule->fast_key_suffix_bytes != UINT8_MAX && rule->fast_key_length != 0
+        && rule->fast_key_suffix_bytes <= length
+        && rule->fast_key_length <= length - rule->fast_key_suffix_bytes) {
+        /* The key retained_rule_fast_matches already requires. */
+        size_t offset = length - rule->fast_key_suffix_bytes
+            - rule->fast_key_length;
+        char marker = offset == 0 ? '\0' : rule->selector[offset - 1u];
+        SelectorType type = marker == '#' ? SELECTOR_ID
+            : marker == '.' ? SELECTOR_CLASS : SELECTOR_TAG;
+        *hash = style_rule_key_hash(type, rule->selector + offset,
+                                    rule->fast_key_length);
+        return true;
+    }
+    StyleRule metadata = {
+        .selector = rule->selector,
+        .selector_length = rule->selector_length
+    };
+    selector_assign_fast_key(&metadata, rule->selector, length);
+    if (metadata.has_fast_key) {
+        /* A key too far from the end to store in the custom rule. */
+        const char *key = style_rule_fast_key(&metadata);
+        if (key == NULL) return false;
+        *hash = style_rule_key_hash((SelectorType) metadata.type, key,
+                                    metadata.fast_key_length);
+        return true;
+    }
+    char scratch[STYLE_SELECTOR_IDENTIFIER_CAPACITY];
+    SelectorType type = SELECTOR_TAG;
+    size_t key_length = 0;
+    const char *key = style_rule_index_derived_key(
+        &metadata, scratch, sizeof(scratch), &type, &key_length);
+    if (key != NULL && key_length != 0) {
+        *hash = style_rule_key_hash(type, key, key_length);
+        return true;
+    }
+    const char *compound = NULL;
+    size_t compound_length = 0;
+    if (!style_rule_matcher_compound(&metadata, &compound, &compound_length)
+        || compound_length < 3 || compound[0] != '[') return false;
+    size_t at = 1;
+    while (at < compound_length && isspace((unsigned char) compound[at]))
+        at++;
+    size_t begin = at;
+    /* Plain ASCII names only: an escape, a namespace or any other byte
+       leaves the rule keyless. */
+    while (at < compound_length
+           && (isalnum((unsigned char) compound[at]) || compound[at] == '-'
+               || compound[at] == '_')) at++;
+    size_t end = at;
+    while (at < compound_length && isspace((unsigned char) compound[at]))
+        at++;
+    if (end == begin || at >= compound_length) return false;
+    char next = compound[at];
+    bool operator_follows = next == ']' || next == '='
+        || ((next == '~' || next == '|' || next == '^' || next == '$'
+             || next == '*')
+            && at + 1 < compound_length && compound[at + 1] == '=');
+    if (!operator_follows
+        || span_case_equal(compound + begin, end - begin, STYLE_FOCUS_MARKER))
+        return false;
+    *hash = style_retained_gate_attribute_hash(compound + begin, end - begin);
+    return true;
+}
+
+StyleRetainedGate style_retained_gate_begin(const Stylesheet *sheet,
+                                            lxb_dom_node_t *node)
+{
+    StyleRetainedGate previous = {0};
+    if (sheet == NULL || sheet->resolve_scratch == NULL) return previous;
+    StyleResolveScratch *scratch = sheet->resolve_scratch;
+    previous = scratch->retained_gate;
+    scratch->retained_gate.node = NULL;
+    if (node == NULL || node->type != LXB_DOM_NODE_TYPE_ELEMENT)
+        return previous;
+    stylesheet_prepare_rule_index((Stylesheet *) sheet);
+    if (!sheet->custom_rule_index_ready || sheet->retained_gate == NULL)
+        return previous;
+    const uint64_t *gate = sheet->retained_gate;
+    const uint32_t slots = STYLE_RETAINED_GATE_SLOTS - 1u;
+    StyleMatchSubject subject = {0};
+    style_match_subject_prepare(node, &subject);
+    uint64_t mask = 0;
+    if (subject.tag != NULL && subject.tag_length != 0)
+        mask |= gate[style_rule_key_hash(SELECTOR_TAG, subject.tag,
+                                         subject.tag_length) & slots];
+    if (subject.id != NULL && subject.id_length != 0)
+        mask |= gate[style_rule_key_hash(SELECTOR_ID, subject.id,
+                                         subject.id_length) & slots];
+    /* Split as class_contains_length splits. */
+    size_t at = 0;
+    while (subject.classes != NULL && at < subject.classes_length) {
+        while (at < subject.classes_length
+               && isspace((unsigned char) subject.classes[at])) at++;
+        size_t begin = at;
+        while (at < subject.classes_length
+               && !isspace((unsigned char) subject.classes[at])) at++;
+        if (at != begin)
+            mask |= gate[style_rule_key_hash(SELECTOR_CLASS,
+                                             subject.classes + begin,
+                                             at - begin) & slots];
+    }
+    for (const lxb_dom_attr_t *attr =
+             lxb_dom_interface_element(node)->first_attr;
+         attr != NULL; attr = attr->next) {
+        size_t name_length = 0;
+        const char *name = (const char *) lxb_dom_attr_qualified_name(
+            (lxb_dom_attr_t *) attr, &name_length);
+        if (name == NULL || name_length == 0) continue;
+        mask |= gate[style_retained_gate_attribute_hash(name, name_length)
+                     & slots];
+        /* A prefixed name (xlink:href) also answers for its local part. */
+        const char *colon = memchr(name, ':', name_length);
+        if (colon != NULL && (size_t) (colon - name) + 1u < name_length)
+            mask |= gate[style_retained_gate_attribute_hash(
+                             colon + 1,
+                             name_length - (size_t) (colon - name) - 1u)
+                         & slots];
+    }
+    scratch->retained_gate = (StyleRetainedGate) {
+        .node = node, .mask = mask,
+        .generation = sheet->retained_gate_generation
+    };
+    return previous;
+}
+
+void style_retained_gate_end(const Stylesheet *sheet,
+                             StyleRetainedGate previous)
+{
+    if (sheet != NULL && sheet->resolve_scratch != NULL)
+        sheet->resolve_scratch->retained_gate = previous;
+}
+
 static void stylesheet_prepare_custom_rule_index(Stylesheet *sheet)
 {
     if (sheet == NULL || sheet->budget == NULL
@@ -1585,24 +1745,42 @@ static void stylesheet_prepare_custom_rule_index(Stylesheet *sheet)
         || sheet->custom_rule_index_attempted) return;
     sheet->custom_rule_index_attempted = true;
     if (sheet->custom_rule_count == 0
-        || sheet->custom_rule_count >= STYLE_CUSTOM_INDEX_SCOPED
+        || sheet->custom_rule_count >= STYLE_CUSTOM_INDEX_KEYED
         || sheet->custom_rule_count
              > SIZE_MAX / sizeof(StyleCustomRuleIndexEntry)) return;
     StyleCustomRuleIndexEntry *entries = budget_malloc(
         sheet->budget, sheet->custom_rule_count * sizeof(*entries));
     if (entries == NULL) return;
+    /* See Stylesheet.retained_gate. Without the table (a refused
+       allocation) every lookup scans as before. */
+    uint64_t *gate = budget_calloc(sheet->budget, STYLE_RETAINED_GATE_SLOTS,
+                                   sizeof(*gate));
+    uint64_t keyless = 0;
     uint64_t shadow_only = sheet->scopes.adopted_scopes_failed
         ? 0 : sheet->scopes.adopted_shadow_only_mask;
     for (size_t i = 0; i < sheet->custom_rule_count; i++) {
+        const StyleCustomRule *rule = &sheet->custom_rules[i];
         /* Retained rules pack declaration order in the low eight bits. */
         bool scoped = shadow_only != 0
-            && (style_adopted_source_bit(
-                    sheet, sheet->custom_rules[i].order >> 8)
+            && (style_adopted_source_bit(sheet, rule->order >> 8)
                 & shadow_only) != 0;
+        uint32_t hash = custom_rule_name_hash(rule->name,
+                                              strlen(rule->name));
+        uint32_t key_hash = 0;
+        bool keyed = gate != NULL
+            && stylesheet_custom_rule_gate_key(rule, &key_hash);
+        if (gate != NULL
+            && !(rule->name[0] == '-' && rule->name[1] == '-')) {
+            uint64_t bit = UINT64_C(1) << (hash & 63u);
+            if (keyed)
+                gate[key_hash & (STYLE_RETAINED_GATE_SLOTS - 1u)] |= bit;
+            else
+                keyless |= bit;
+        }
         entries[i] = (StyleCustomRuleIndexEntry) {
-            .hash = custom_rule_name_hash(sheet->custom_rules[i].name,
-                                          strlen(sheet->custom_rules[i].name)),
+            .hash = hash,
             .index = (uint32_t) i | (scoped ? STYLE_CUSTOM_INDEX_SCOPED : 0)
+                | (keyed ? STYLE_CUSTOM_INDEX_KEYED : 0)
         };
     }
     qsort(entries, sheet->custom_rule_count, sizeof(*entries),
@@ -1611,6 +1789,13 @@ static void stylesheet_prepare_custom_rule_index(Stylesheet *sheet)
     sheet->custom_rule_index_count = sheet->custom_rule_count;
     sheet->custom_rule_index_bytes =
         sheet->custom_rule_count * sizeof(*entries);
+    if (gate != NULL) {
+        sheet->retained_gate = gate;
+        sheet->retained_gate_keyless = keyless;
+        sheet->retained_gate_generation++;
+        sheet->custom_rule_index_bytes +=
+            STYLE_RETAINED_GATE_SLOTS * sizeof(*gate);
+    }
     sheet->custom_rule_index_ready = true;
 }
 
@@ -2079,6 +2264,7 @@ static bool stylesheet_initialize(
     sheet->build_generation = stylesheet_next_generation();
     sheet->viewport_width = viewport_width;
     sheet->viewport_height = viewport_height;
+    sheet->prefers_dark = stylesheet_prefers_dark_color_scheme();
     sheet->current_layer = UINT_MAX;
     memset(sheet->layer_parents, UINT8_MAX, sizeof(sheet->layer_parents));
     stylesheet_read_trace_environment(sheet);
@@ -2795,6 +2981,8 @@ StyleParsedIrApplyResult stylesheet_add_parsed_ir_from_context(
     sheet->build_generation = stylesheet_next_generation();
     if ((header.flags & STYLE_PARSED_IR_HAS_MOTION_KEYFRAMES) != 0) {
         sheet->has_motion_keyframes = true;
+        if (!sheet->parsing_adopted_sheet)
+            sheet->motion_keyframes_outside_adopted = true;
     }
     StyleParsedIrInput input = {ir_data, header.operation_count};
     if (!stylesheet_run_source_transaction(sheet, source, source_base_url,
@@ -2805,11 +2993,15 @@ StyleParsedIrApplyResult stylesheet_add_parsed_ir_from_context(
     return STYLE_PARSED_IR_APPLIED;
 }
 
+static void stylesheet_head_mark_note(Stylesheet *sheet,
+                                      const lxb_dom_node_t *element);
+
 void stylesheet_note_style_source(Stylesheet *sheet,
                                   const lxb_dom_node_t *element)
 {
-    if (sheet == NULL || element == NULL || sheet->style_sources_bounded_out)
-        return;
+    if (sheet == NULL || element == NULL) return;
+    stylesheet_head_mark_note(sheet, element);
+    if (sheet->style_sources_bounded_out) return;
     for (size_t i = 0; i < sheet->style_source_count; i++) {
         if (sheet->style_source_nodes[i] == element) return;
     }
@@ -3439,6 +3631,7 @@ bool stylesheet_append_sources_tracked(
         ? sheet->style_source_first_order[after_source] : tail_start;
     bool shifted = boundary != tail_start && appended_orders != 0;
     if (shifted) {
+        sheet->rewrite_epoch++;
         for (size_t j = 0; j < sheet->count; j++) {
             sheet->rules[j].order = stylesheet_inserted_rule_order(
                 sheet->rules[j].order, tail_start, boundary, appended_orders);
@@ -3507,6 +3700,9 @@ bool stylesheet_append_sources_tracked(
                   stylesheet_compare_revert_order);
         }
         stylesheet_drop_selector_program(sheet);
+        /* The appended sheet's compiled fragment seeded its rules under
+           their tail orders, which now name other rules. */
+        stylesheet_drop_selector_fragment_seeds(sheet);
         stylesheet_drop_rule_index(sheet);
         stylesheet_drop_custom_rule_index(sheet);
         stylesheet_finalize_rule_order(sheet);
@@ -3631,6 +3827,203 @@ bool stylesheet_append_sources_tracked(
     return true;
 }
 
+/* The cascade-order spans of the adopted sources being removed, ascending
+   and disjoint, and what they take out of the order space below a point. */
+typedef struct {
+    unsigned begin[DOCUMENT_ADOPTED_TIER_LIMIT];
+    unsigned end[DOCUMENT_ADOPTED_TIER_LIMIT];
+    unsigned below[DOCUMENT_ADOPTED_TIER_LIMIT];
+    size_t count;
+} StyleRemovedOrders;
+
+/* The order `order` takes once the spans are gone, or UINT_MAX when one of
+   them holds it. */
+static unsigned style_removed_order_map(const StyleRemovedOrders *removed,
+                                        unsigned order)
+{
+    size_t low = 0, high = removed->count;
+    while (low < high) {
+        size_t middle = low + (high - low) / 2u;
+        if (removed->end[middle] <= order) low = middle + 1u;
+        else high = middle;
+    }
+    if (low < removed->count && order >= removed->begin[low]) return UINT_MAX;
+    unsigned taken = low == 0 ? 0
+        : removed->below[low - 1u] + (removed->end[low - 1u]
+                                      - removed->begin[low - 1u]);
+    return order - taken;
+}
+
+/* A packed order (declaration order in the low eight bits): UINT_MAX when
+   removed. Saturated packs are refused before anything moves. */
+static unsigned style_removed_packed_map(const StyleRemovedOrders *removed,
+                                         unsigned packed)
+{
+    unsigned order = style_removed_order_map(removed, packed >> 8);
+    return order == UINT_MAX ? UINT_MAX
+        : (order << 8) | (packed & UINT8_MAX);
+}
+
+bool stylesheet_remove_adopted_sources_tracked(
+    Stylesheet *sheet, const lxb_dom_node_t *const *nodes, size_t count,
+    StylesheetAppendResult *result, bool *affects_discovery)
+{
+    if (result == NULL || affects_discovery == NULL) return false;
+    memset(result, 0, sizeof(*result));
+    *affects_discovery = false;
+    if (sheet == NULL || sheet->budget == NULL || (nodes == NULL && count != 0)
+        || sheet->style_sources_bounded_out || sheet->rule_batch_active)
+        return false;
+    size_t held = sheet->scopes.adopted_source_count;
+    if (count == 0 || held > DOCUMENT_ADOPTED_TIER_LIMIT
+        || held > sheet->style_source_count || count > held
+        || sheet->count > UINT16_MAX
+        || sheet->next_order > (UINT_MAX >> 8)
+        || sheet->scopes.adopted_rule_order_end > sheet->next_order)
+        return false;
+    size_t base = sheet->style_source_count - held;
+    const unsigned *first = &sheet->style_source_first_order[base];
+    bool gone[DOCUMENT_ADOPTED_TIER_LIMIT] = {false};
+    for (size_t i = 0; i < count; i++) {
+        size_t k = 0;
+        while (k < held && sheet->style_source_nodes[base + k] != nodes[i]) k++;
+        if (k == held || gone[k]) return false;
+        gone[k] = true;
+    }
+    /* Each source's rules are the span up to the next source's first
+       order; the last one's ends with the adopted tail. */
+    StyleRemovedOrders removed = {0};
+    unsigned total = 0;
+    for (size_t k = 0; k < held; k++) {
+        unsigned end = k + 1u < held ? first[k + 1u]
+            : sheet->scopes.adopted_rule_order_end;
+        if (first[k] > end) return false;
+        if (!gone[k] || first[k] == end) continue;
+        removed.begin[removed.count] = first[k];
+        removed.end[removed.count] = end;
+        removed.below[removed.count] = total;
+        removed.count++;
+        total += end - first[k];
+    }
+    /* Shadow-tree <style> ranges belong to document sources, which come
+       before the adopted tail; one inside a removed span is not this
+       sheet's layout. */
+    for (size_t j = 0; j < sheet->scopes.shadow_scope_count; j++) {
+        const StyleShadowScope *scope = &sheet->scopes.shadow_scopes[j];
+        if (scope->end > scope->begin
+            && (style_removed_order_map(&removed, scope->begin) == UINT_MAX
+                || style_removed_order_map(&removed, scope->end - 1u)
+                       == UINT_MAX)) return false;
+    }
+    size_t old_count = sheet->count;
+    uint16_t *remap = old_count == 0 ? NULL
+        : budget_malloc(sheet->budget, old_count * sizeof(*remap));
+    if (old_count != 0 && remap == NULL) return false;
+    /* Removed rules that hid an element or gave it an image: what they
+       leave visible may need image discovery, as an appended rule's may. */
+    size_t gone_rules = 0;
+    for (size_t i = 0; i < old_count; i++) {
+        if (sheet->rules[i].order != UINT_MAX
+            && style_removed_order_map(&removed, sheet->rules[i].order)
+                   == UINT_MAX) remap[gone_rules++] = (uint16_t) i;
+    }
+    if (gone_rules != 0) {
+        uint32_t *indices = budget_malloc(sheet->budget,
+                                          gone_rules * sizeof(*indices));
+        for (size_t i = 0; indices != NULL && i < gone_rules; i++)
+            indices[i] = remap[i];
+        *affects_discovery = indices == NULL
+            || stylesheet_rules_affect_discovery(sheet, indices, gone_rules);
+        budget_free(sheet->budget, indices);
+    }
+    /* Removal keeps the relative cascade order of every surviving rule, so
+       the sorted array stays sorted as it is compacted. */
+    size_t kept = 0;
+    for (size_t i = 0; i < old_count; i++) {
+        StyleRule rule = sheet->rules[i];
+        unsigned order = rule.order == UINT_MAX ? UINT_MAX
+            : style_removed_order_map(&removed, rule.order);
+        if (rule.order != UINT_MAX && order == UINT_MAX) {
+            remap[i] = UINT16_MAX;
+            if (rule.important && sheet->important_rule_count != 0)
+                sheet->important_rule_count--;
+            continue;
+        }
+        rule.order = order;
+        remap[i] = (uint16_t) kept;
+        sheet->rules[kept++] = rule;
+    }
+    sheet->count = kept;
+    size_t custom_kept = 0;
+    for (size_t j = 0; j < sheet->custom_rule_count; j++) {
+        unsigned packed = style_removed_packed_map(
+            &removed, sheet->custom_rules[j].order);
+        if (packed == UINT_MAX) continue;
+        StyleCustomRule rule = sheet->custom_rules[j];
+        rule.order = packed;
+        sheet->custom_rules[custom_kept++] = rule;
+    }
+    sheet->custom_rule_count = custom_kept;
+    size_t transition_kept = 0;
+    for (size_t j = 0; j < sheet->transition_rule_count; j++) {
+        unsigned packed = style_removed_packed_map(
+            &removed, sheet->transition_rules[j].order);
+        if (packed == UINT_MAX) continue;
+        StyleTransitionRule rule = sheet->transition_rules[j];
+        rule.order = packed;
+        sheet->transition_rules[transition_kept++] = rule;
+    }
+    sheet->transition_rule_count = transition_kept;
+    size_t revert_kept = 0;
+    for (size_t j = 0; j < sheet->revert_rule_mask_count; j++) {
+        unsigned order = style_removed_order_map(
+            &removed, sheet->revert_rule_masks[j].order);
+        if (order == UINT_MAX) continue;
+        StyleRevertRuleMask mask = sheet->revert_rule_masks[j];
+        mask.order = order;
+        sheet->revert_rule_masks[revert_kept++] = mask;
+    }
+    sheet->revert_rule_mask_count = revert_kept;
+    for (size_t j = 0; j < sheet->scopes.shadow_scope_count; j++) {
+        StyleShadowScope *scope = &sheet->scopes.shadow_scopes[j];
+        if (scope->end <= scope->begin) continue;
+        unsigned last = style_removed_order_map(&removed, scope->end - 1u);
+        scope->begin = style_removed_order_map(&removed, scope->begin);
+        scope->end = last + 1u;
+    }
+    /* The source table loses the removed entries; the survivors' first
+       orders close the gaps. */
+    size_t at = base;
+    for (size_t k = 0; k < held; k++) {
+        if (gone[k]) continue;
+        /* An empty survivor may share its first order with the start of a
+           removed span after it: only spans that end at or below it move
+           it down. */
+        unsigned begin = first[k];
+        unsigned taken = 0;
+        for (size_t r = 0; r < removed.count && removed.end[r] <= begin; r++)
+            taken += removed.end[r] - removed.begin[r];
+        sheet->style_source_nodes[at] = sheet->style_source_nodes[base + k];
+        sheet->style_source_first_order[at] = begin - taken;
+        at++;
+    }
+    sheet->style_source_count = at;
+    sheet->scopes.adopted_source_count = (uint8_t) (held - count);
+    sheet->scopes.adopted_rule_order_end -= total;
+    sheet->next_order -= total;
+    /* Every rule-position and order keyed accelerator rebuilds lazily; the
+       generation tells the order- and count-keyed caches the set moved. */
+    sheet->build_generation = stylesheet_next_generation();
+    stylesheet_drop_selector_program(sheet);
+    stylesheet_drop_selector_fragment_seeds(sheet);
+    stylesheet_drop_rule_index(sheet);
+    stylesheet_drop_custom_rule_index(sheet);
+    stylesheet_finalize_rule_order(sheet);
+    result->old_count = old_count;
+    result->remap = remap;
+    return true;
+}
+
 bool stylesheet_append_style_elements(
     Stylesheet *sheet, lxb_dom_node_t *const *elements, size_t count,
     const TilefinchContentSecurityPolicy *content_security_policy)
@@ -3685,6 +4078,28 @@ static bool stylesheet_parse_adopted_sheet(Stylesheet *sheet,
         sheet, document, node, revision, css, length);
     sheet->parsing_scoped_source = false;
     return parsed_ok;
+}
+
+/* stylesheet_parse_adopted_sheet, recording whether this sheet's own rules
+   set the keyframes summary: removing it later recomputes the summary from
+   the sheets that stay. */
+static bool stylesheet_parse_adopted_sheet_noted(Stylesheet *sheet,
+                                                 const PocDocument *document,
+                                                 lxb_dom_node_t *node,
+                                                 uint32_t revision)
+{
+    bool summary = sheet->has_motion_keyframes;
+    sheet->has_motion_keyframes = false;
+    sheet->parsing_adopted_sheet = true;
+    bool parsed = stylesheet_parse_adopted_sheet(sheet, document, node,
+                                                 revision);
+    sheet->parsing_adopted_sheet = false;
+    bool own = sheet->has_motion_keyframes;
+    sheet->has_motion_keyframes = summary || own;
+    if (parsed)
+        document_constructed_sheet_note_keyframes(document, node, revision,
+                                                  own);
+    return parsed;
 }
 
 static bool stylesheet_parse_adopted_sheet_text(
@@ -3768,8 +4183,8 @@ bool stylesheet_add_adopted_sheet(Stylesheet *sheet,
        one is open). */
     bool own_batch = !sheet->rule_batch_active
         && stylesheet_begin_rule_batch(sheet);
-    bool parsed = stylesheet_parse_adopted_sheet(sheet, document, node,
-                                                 revision);
+    bool parsed = stylesheet_parse_adopted_sheet_noted(sheet, document,
+                                                       node, revision);
     if (own_batch && !stylesheet_end_rule_batch(sheet)) parsed = false;
     if (!parsed) return false;
     if (!known && stylesheet_style_source_known(sheet, node)
@@ -3938,15 +4353,464 @@ uint64_t stylesheet_parse_context_signature(const Stylesheet *sheet)
     return hash;
 }
 
+/* What a head mark cannot cut back: root variables (rewritten in place),
+   @property registrations, layers, @container queries, grid templates,
+   @font-face families, keyframes, scopes and in-place rewrites. */
+static uint64_t stylesheet_head_fixed_signature(const Stylesheet *sheet)
+{
+    uint64_t hash = UINT64_C(1469598103934665603);
+    hash = stylesheet_signature_bytes(
+        hash, &sheet->rewrite_epoch, sizeof(sheet->rewrite_epoch));
+    hash = stylesheet_signature_bytes(
+        hash, &sheet->variable_count, sizeof(sheet->variable_count));
+    for (size_t i = 0; i < sheet->variable_count; i++) {
+        /* A redeclaration stores new arena text. */
+        hash = stylesheet_signature_bytes(
+            hash, &sheet->variables[i].value,
+            sizeof(sheet->variables[i].value));
+    }
+    hash = stylesheet_signature_bytes(
+        hash, &sheet->registered_property_count,
+        sizeof(sheet->registered_property_count));
+    hash = stylesheet_signature_bytes(
+        hash, &sheet->layer_count, sizeof(sheet->layer_count));
+    hash = stylesheet_signature_container_queries(hash, sheet);
+    size_t grid[4] = {
+        sheet->grid_tracks == NULL ? 0 : sheet->grid_tracks->count,
+        sheet->grid_areas == NULL ? 0 : sheet->grid_areas->name_count,
+        sheet->grid_areas == NULL ? 0 : sheet->grid_areas->template_count,
+        sheet->grid_areas == NULL ? 0 : sheet->grid_areas->line_name_count
+    };
+    hash = stylesheet_signature_bytes(hash, grid, sizeof(grid));
+    size_t families = sheet->web_fonts == NULL
+        ? 0 : sheet->web_fonts->family_count;
+    hash = stylesheet_signature_bytes(hash, &families, sizeof(families));
+    for (size_t i = 0; i < families; i++) {
+        const StyleWebFontFamily *family = &sheet->web_fonts->families[i];
+        for (size_t face = 0; face < TILEFINCH_WEB_FONT_WEIGHT_LIMIT;
+             face++) {
+            hash = stylesheet_signature_bytes(
+                hash, &family->faces[face].source_count,
+                sizeof(family->faces[face].source_count));
+        }
+    }
+    size_t motion[3] = {
+        sheet->motion_css_length, sheet->motion_css_rules,
+        sheet->motion_css_keyframes
+    };
+    hash = stylesheet_signature_bytes(hash, motion, sizeof(motion));
+    bool flags[2] = {
+        sheet->has_motion_keyframes, sheet->motion_css_bounded_out
+    };
+    hash = stylesheet_signature_bytes(hash, flags, sizeof(flags));
+    size_t scopes[2] = {
+        sheet->scopes.adopted_source_count,
+        sheet->scopes.shadow_scope_count
+    };
+    return stylesheet_signature_bytes(hash, scopes, sizeof(scopes));
+}
+
+static void stylesheet_head_mark_capture(Stylesheet *sheet)
+{
+    StyleHeadMark *mark = &sheet->head_mark;
+    *mark = (StyleHeadMark) {
+        .state = STYLE_HEAD_MARK_SET,
+        .next_order = sheet->next_order,
+        .modern_typography_mask = sheet->modern_typography_mask,
+        .has_bidi_declarations = sheet->has_bidi_declarations,
+        .has_multicolumn_rules = sheet->has_multicolumn_rules,
+        .has_container_relative_units = sheet->has_container_relative_units,
+        .image_declarations_use_variables =
+            sheet->image_declarations_use_variables,
+        .has_scroll_interaction_rules = sheet->has_scroll_interaction_rules,
+        .has_cursor_rules = sheet->has_cursor_rules,
+        .modern_property_mask = sheet->modern_property_mask,
+        .custom_rule_count = sheet->custom_rule_count,
+        .transition_rule_count = sheet->transition_rule_count,
+        .revert_rule_mask_count = sheet->revert_rule_mask_count,
+        .declaration_count = sheet->declaration_count,
+        .declaration_value_bytes = sheet->declaration_value_bytes,
+        .deferred_bytes = sheet->deferred_bytes,
+        .deferred_instruction_count = sheet->deferred_instruction_count,
+        .math_instruction_count = sheet->math_instruction_count,
+        .math_program_count = sheet->math_program_count,
+        .generated_text_count = sheet->generated_text_count,
+        .generated_text_bytes = sheet->generated_text_bytes,
+        .image_url_count = sheet->image_url_count,
+        .image_url_bytes = sheet->image_url_bytes,
+        .image_source_count = sheet->image_sources == NULL
+            ? 0 : sheet->image_sources->count,
+        .image_source_base_bytes = sheet->image_sources == NULL
+            ? 0 : sheet->image_sources->retained_base_bytes,
+        .counter_operation_set_count = sheet->counter_operation_set_count,
+        .border_color_set_count = sheet->border_color_set_count,
+        .paint_stack_count = sheet->paint_storage == NULL
+            ? 0 : sheet->paint_storage->count,
+        .custom_value_long_bytes = sheet->custom_value_long_bytes,
+        .text_tail = sheet->selector_chunks_tail,
+        .text_tail_used = sheet->selector_chunks_tail == NULL
+            ? 0 : sheet->selector_chunks_tail->used,
+        .selector_bytes = sheet->selector_bytes,
+        .selector_storage_bytes = sheet->selector_storage_bytes,
+        .fixed = stylesheet_head_fixed_signature(sheet)
+    };
+}
+
+void stylesheet_set_head_mark(Stylesheet *sheet)
+{
+    if (sheet != NULL) stylesheet_head_mark_capture(sheet);
+}
+
+static bool style_source_in_head(const lxb_dom_node_t *element)
+{
+    for (const lxb_dom_node_t *node = element->parent; node != NULL;
+         node = node->parent) {
+        if (node->type != LXB_DOM_NODE_TYPE_ELEMENT) return false;
+        if (node->local_name == LXB_TAG_HEAD) return true;
+        if (node->local_name == LXB_TAG_BODY
+            || node->local_name == LXB_TAG_HTML) return false;
+    }
+    return false;
+}
+
+static void stylesheet_head_mark_note(Stylesheet *sheet,
+                                      const lxb_dom_node_t *element)
+{
+    StyleHeadMark *mark = &sheet->head_mark;
+    if (mark->state == STYLE_HEAD_MARK_INVALID) return;
+    bool head = style_source_in_head(element);
+    if (mark->state == STYLE_HEAD_MARK_NONE) {
+        if (!head) stylesheet_head_mark_capture(sheet);
+    } else if (head) {
+        mark->state = STYLE_HEAD_MARK_INVALID;
+    }
+}
+
+/* Whether the mark still describes a prefix of the sheet: nothing it
+   cannot undo moved, every pool only grew, and the custom, transition and
+   revert records (appended in source order) split at its order. */
+static bool stylesheet_head_mark_applies(const Stylesheet *sheet)
+{
+    const StyleHeadMark *mark = &sheet->head_mark;
+    size_t image_sources = sheet->image_sources == NULL
+        ? 0 : sheet->image_sources->count;
+    size_t paint_stacks = sheet->paint_storage == NULL
+        ? 0 : sheet->paint_storage->count;
+    if (mark->fixed != stylesheet_head_fixed_signature(sheet)
+        || mark->next_order > sheet->next_order
+        || mark->custom_rule_count > sheet->custom_rule_count
+        || mark->transition_rule_count > sheet->transition_rule_count
+        || mark->revert_rule_mask_count > sheet->revert_rule_mask_count
+        || mark->declaration_count > sheet->declaration_count
+        || mark->declaration_value_bytes > sheet->declaration_value_bytes
+        || mark->deferred_bytes > sheet->deferred_bytes
+        || mark->deferred_instruction_count
+               > sheet->deferred_instruction_count
+        || mark->math_instruction_count > sheet->math_instruction_count
+        || mark->math_program_count > sheet->math_program_count
+        || mark->generated_text_count > sheet->generated_text_count
+        || mark->generated_text_bytes > sheet->generated_text_bytes
+        || mark->image_url_count > sheet->image_url_count
+        || mark->image_url_bytes > sheet->image_url_bytes
+        || mark->image_source_count > image_sources
+        || mark->counter_operation_set_count
+               > sheet->counter_operation_set_count
+        || mark->border_color_set_count > sheet->border_color_set_count
+        || mark->paint_stack_count > paint_stacks
+        || mark->custom_value_long_bytes > sheet->custom_value_long_bytes
+        || mark->selector_bytes > sheet->selector_bytes) return false;
+    if (mark->text_tail != NULL) {
+        bool found = false;
+        for (const StyleTextChunk *chunk = sheet->selector_chunks;
+             chunk != NULL; chunk = chunk->next) {
+            if (chunk == mark->text_tail) {
+                found = chunk->used >= mark->text_tail_used;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    for (size_t i = 0; i < sheet->custom_rule_count; i++) {
+        bool before = (sheet->custom_rules[i].order >> 8) < mark->next_order;
+        if (before != (i < mark->custom_rule_count)) return false;
+    }
+    for (size_t i = 0; i < sheet->transition_rule_count; i++) {
+        bool before =
+            (sheet->transition_rules[i].order >> 8) < mark->next_order;
+        if (before != (i < mark->transition_rule_count)) return false;
+    }
+    for (size_t i = 0; i < sheet->revert_rule_mask_count; i++) {
+        bool before = sheet->revert_rule_masks[i].order < mark->next_order;
+        if (before != (i < mark->revert_rule_mask_count)) return false;
+    }
+    return true;
+}
+
+static int stylesheet_compare_u16(const void *left, const void *right)
+{
+    uint16_t a = *(const uint16_t *) left, b = *(const uint16_t *) right;
+    return a < b ? -1 : a > b;
+}
+
+/* Keeps the compiled selector program of the rules before `order_end`,
+   packed: a rule's instructions are position-independent and run to the
+   start of the next compiled rule's, so the cut leaves no unreachable
+   instructions behind and the program does not grow across navigations.
+   Returns the kept rules' new offsets (in rule order, to install once the
+   rules are filtered), or NULL with the program dropped (it compiles again
+   on first use). */
+static uint16_t *stylesheet_head_pack_selector_program(
+    Stylesheet *sheet, unsigned order_end, size_t kept)
+{
+    Budget *budget = sheet->budget;
+    size_t count = sheet->count;
+    size_t total = sheet->selector_program_instruction_count;
+    if (!sheet->selector_program_ready || sheet->selector_program == NULL
+        || sheet->selector_program_offsets == NULL || kept == 0
+        || count > UINT16_MAX || total >= UINT16_MAX) {
+        stylesheet_drop_selector_program(sheet);
+        return NULL;
+    }
+    uint16_t *starts = budget_malloc(budget, count * sizeof(*starts));
+    uint16_t *moved = budget_malloc(budget, count * sizeof(*moved));
+    uint16_t *offsets = budget_malloc(budget, kept * sizeof(*offsets));
+    StyleSelectorInstruction *program = NULL;
+    bool packed = starts != NULL && moved != NULL && offsets != NULL;
+    size_t distinct = 0;
+    for (size_t i = 0; packed && i < count; i++) {
+        uint16_t offset = sheet->selector_program_offsets[i];
+        if (offset != UINT16_MAX) starts[distinct++] = offset;
+    }
+    if (packed && distinct > 1)
+        qsort(starts, distinct, sizeof(*starts), stylesheet_compare_u16);
+    size_t unique = 0;
+    for (size_t i = 0; packed && i < distinct; i++) {
+        if (unique == 0 || starts[unique - 1u] != starts[i])
+            starts[unique++] = starts[i];
+    }
+    for (size_t i = 0; packed && i < unique; i++) moved[i] = UINT16_MAX;
+    /* Mark the runs the kept rules use. */
+    size_t live = 0;
+    for (size_t i = 0; packed && i < count; i++) {
+        uint16_t offset = sheet->selector_program_offsets[i];
+        if (sheet->rules[i].order >= order_end || offset == UINT16_MAX)
+            continue;
+        const uint16_t *found = bsearch(&offset, starts, unique,
+            sizeof(*starts), stylesheet_compare_u16);
+        size_t k = (size_t) (found - starts);
+        size_t end = k + 1u < unique ? starts[k + 1u] : total;
+        if (found == NULL || end > total || end <= offset) {
+            packed = false;
+        } else if (moved[k] == UINT16_MAX) {
+            moved[k] = 0;
+            live += end - offset;
+        }
+    }
+    if (packed && live != 0) {
+        program = budget_malloc(budget, live * sizeof(*program));
+        packed = program != NULL;
+    }
+    size_t at = 0;
+    for (size_t k = 0; packed && k < unique; k++) {
+        if (moved[k] == UINT16_MAX) continue;
+        size_t end = k + 1u < unique ? starts[k + 1u] : total;
+        size_t length = end - starts[k];
+        memcpy(program + at, sheet->selector_program + starts[k],
+               length * sizeof(*program));
+        moved[k] = (uint16_t) at;
+        at += length;
+    }
+    size_t compiled = 0, next = 0;
+    for (size_t i = 0; packed && i < count; i++) {
+        if (sheet->rules[i].order >= order_end) continue;
+        uint16_t offset = sheet->selector_program_offsets[i];
+        if (offset == UINT16_MAX) {
+            offsets[next++] = UINT16_MAX;
+            continue;
+        }
+        const uint16_t *found = bsearch(&offset, starts, unique,
+            sizeof(*starts), stylesheet_compare_u16);
+        offsets[next++] = moved[found - starts];
+        compiled++;
+    }
+    budget_free(budget, starts);
+    budget_free(budget, moved);
+    if (!packed || compiled == 0) {
+        budget_free(budget, offsets);
+        budget_free(budget, program);
+        stylesheet_drop_selector_program(sheet);
+        return NULL;
+    }
+    budget_free(budget, sheet->selector_program);
+    budget_free(budget, sheet->selector_program_offsets);
+    sheet->selector_program = program;
+    sheet->selector_program_offsets = NULL;
+    sheet->selector_program_instruction_count = live;
+    sheet->selector_program_rule_count = compiled;
+    sheet->selector_program_bytes =
+        kept * sizeof(*offsets) + live * sizeof(*program);
+    return offsets;
+}
+
+bool stylesheet_truncate_to_head(Stylesheet *sheet, bool body_sources)
+{
+    if (sheet == NULL || sheet->budget == NULL || sheet->rule_batch_active
+        || sheet->selector_append_active
+        || sheet->selector_fragment_program != NULL
+        || sheet->scopes.adopted_source_count != 0
+        || sheet->scopes.shadow_scope_count != 0
+        || sheet->head_mark.state == STYLE_HEAD_MARK_INVALID) return false;
+    /* The user stylesheet is parsed after the document's sources and ends
+       the head part as a body source does (stylesheet_add_user_css), so
+       its rules are cut with the body and the caller adds it again. A user
+       rule inside the head part would be kept and then added twice. */
+    unsigned head_end = sheet->head_mark.state == STYLE_HEAD_MARK_NONE
+        ? sheet->next_order : sheet->head_mark.next_order;
+    for (size_t i = 0; i < sheet->count; i++)
+        if (sheet->rules[i].origin != 0 && sheet->rules[i].order < head_end)
+            return false;
+    for (size_t i = 0; i < sheet->custom_rule_count; i++)
+        if (sheet->custom_rules[i].origin != 0
+            && (sheet->custom_rules[i].order >> 8) < head_end) return false;
+    for (size_t i = 0; i < sheet->transition_rule_count; i++)
+        if (sheet->transition_rules[i].origin != 0
+            && (sheet->transition_rules[i].order >> 8) < head_end)
+            return false;
+    if (sheet->head_mark.state == STYLE_HEAD_MARK_NONE) return !body_sources;
+    if (!stylesheet_head_mark_applies(sheet)) return false;
+    const StyleHeadMark mark = sheet->head_mark;
+    size_t kept = 0;
+    for (size_t i = 0; i < sheet->count; i++)
+        if (sheet->rules[i].order < mark.next_order) kept++;
+    bool rule_index = sheet->rule_index_ready;
+    stylesheet_drop_rule_index(sheet);
+    stylesheet_drop_custom_rule_index(sheet);
+    uint16_t *program_offsets =
+        stylesheet_head_pack_selector_program(sheet, mark.next_order, kept);
+    kept = 0;
+    size_t important = 0;
+    for (size_t i = 0; i < sheet->count; i++) {
+        if (sheet->rules[i].order >= mark.next_order) continue;
+        if (sheet->rules[i].important) important++;
+        sheet->rules[kept++] = sheet->rules[i];
+    }
+    sheet->count = kept;
+    sheet->important_rule_count = important;
+    if (program_offsets != NULL) {
+        sheet->selector_program_offsets = program_offsets;
+        sheet->selector_program_ready = true;
+        sheet->selector_program_attempted = true;
+    }
+    sheet->custom_rule_count = mark.custom_rule_count;
+    sheet->transition_rule_count = mark.transition_rule_count;
+    sheet->revert_rule_mask_count = mark.revert_rule_mask_count;
+    for (size_t i = mark.declaration_count; i < sheet->declaration_count;
+         i++) {
+        budget_free(sheet->budget,
+                    sheet->declarations[i].deferred_declarations);
+    }
+    sheet->declaration_count = mark.declaration_count;
+    sheet->declaration_value_bytes = mark.declaration_value_bytes;
+    sheet->deferred_bytes = mark.deferred_bytes;
+    for (size_t i = 0; i < sheet->declaration_index_slot_count; i++)
+        sheet->declaration_index_slots[i] = UINT32_MAX;
+    for (size_t i = 0; sheet->declaration_index_slots != NULL
+                       && i < sheet->declaration_count; i++) {
+        if (!style_declaration_index_insert(sheet, (uint32_t) i)) break;
+    }
+    sheet->deferred_instruction_count = mark.deferred_instruction_count;
+    sheet->deferred_program_bytes = sheet->deferred_instruction_count
+        * sizeof(*sheet->deferred_instructions);
+    sheet->math_instruction_count = mark.math_instruction_count;
+    sheet->math_program_count = mark.math_program_count;
+    for (size_t i = mark.generated_text_count;
+         i < sheet->generated_text_count; i++) {
+        budget_free(sheet->budget, sheet->generated_texts[i]);
+    }
+    sheet->generated_text_count = mark.generated_text_count;
+    sheet->generated_text_bytes = mark.generated_text_bytes;
+    for (size_t i = mark.image_url_count; i < sheet->image_url_count; i++) {
+        budget_free(sheet->budget,
+                    (unsigned char *) sheet->image_urls[i]
+                        - offsetof(StyleImageReference, reference));
+    }
+    sheet->image_url_count = mark.image_url_count;
+    sheet->image_url_bytes = mark.image_url_bytes;
+    if (sheet->image_sources != NULL) {
+        for (size_t i = mark.image_source_count;
+             i < sheet->image_sources->count; i++) {
+            budget_free(sheet->budget,
+                        sheet->image_sources->items[i].base_url);
+        }
+        sheet->image_sources->count = mark.image_source_count;
+        sheet->image_sources->retained_base_bytes =
+            mark.image_source_base_bytes;
+    }
+    sheet->counter_operation_set_count = mark.counter_operation_set_count;
+    sheet->border_color_set_count = mark.border_color_set_count;
+    if (sheet->paint_storage != NULL)
+        sheet->paint_storage->count = mark.paint_stack_count;
+    sheet->custom_value_long_bytes = mark.custom_value_long_bytes;
+    StyleTextChunk *released = mark.text_tail == NULL
+        ? sheet->selector_chunks : mark.text_tail->next;
+    while (released != NULL) {
+        StyleTextChunk *next = released->next;
+        budget_free(sheet->budget, released);
+        released = next;
+    }
+    if (mark.text_tail == NULL) {
+        sheet->selector_chunks = NULL;
+    } else {
+        mark.text_tail->next = NULL;
+        mark.text_tail->used = mark.text_tail_used;
+    }
+    sheet->selector_chunks_tail = mark.text_tail;
+    sheet->selector_bytes = mark.selector_bytes;
+    sheet->selector_storage_bytes = mark.selector_storage_bytes;
+    sheet->modern_property_mask = mark.modern_property_mask;
+    sheet->modern_typography_mask = mark.modern_typography_mask;
+    sheet->has_bidi_declarations = mark.has_bidi_declarations;
+    sheet->has_multicolumn_rules = mark.has_multicolumn_rules;
+    sheet->has_container_relative_units = mark.has_container_relative_units;
+    sheet->image_declarations_use_variables =
+        mark.image_declarations_use_variables;
+    sheet->has_scroll_interaction_rules = mark.has_scroll_interaction_rules;
+    sheet->has_cursor_rules = mark.has_cursor_rules;
+    /* The memo would skip noting a style attribute's sparse properties in
+       the masks just cut back. */
+    (void) stylesheet_drop_inline_scans(sheet);
+    sheet->next_order = mark.next_order;
+    update_cascade_ranges(sheet);
+    sheet->focus_rule_index_ready = false;
+    sheet->has_rule_index_ready = false;
+    sheet->has_class_hashes_ready = false;
+    sheet->has_attribute_memo_count = 0;
+    sheet->has_attribute_memo_next = 0;
+    sheet->has_plan_ready = false;
+    sheet->pseudo_content_ready = false;
+    sheet->user_css_changes_context = false;
+    sheet->build_generation = stylesheet_next_generation();
+    if (rule_index) stylesheet_prepare_rule_index(sheet);
+    return true;
+}
+
 bool stylesheet_add_user_css(Stylesheet *sheet, const char *css, size_t length)
 {
     if (sheet == NULL || sheet->budget == NULL
         || (css == NULL && length != 0)) return false;
     if (length == 0) return true;
+    /* What follows the document's <head> sources ends their part of the
+       sheet (stylesheet_truncate_to_head). */
+    if (sheet->head_mark.state == STYLE_HEAD_MARK_NONE)
+        stylesheet_head_mark_capture(sheet);
     sheet->build_generation = stylesheet_next_generation();
     StyleCssTextInput input = {css, length};
-    return stylesheet_run_parse_transaction(sheet, NULL, NULL, 1, false,
+    uint64_t context_before = stylesheet_parse_context_signature(sheet);
+    bool parsed = stylesheet_run_parse_transaction(sheet, NULL, NULL, 1, false,
         NULL, stylesheet_parse_text_body, &input);
+    if (parsed && stylesheet_parse_context_signature(sheet) != context_before)
+        sheet->user_css_changes_context = true;
+    return parsed;
 }
 
 /* `name` as a declared property in deferred declaration text: at the
@@ -4252,6 +5116,7 @@ void stylesheet_destroy(Stylesheet *sheet)
         budget_free(sheet->budget, sheet->grid_areas);
         budget_free(sheet->budget, sheet->border_color_sets);
         budget_free(sheet->budget, sheet->custom_rule_index);
+        budget_free(sheet->budget, sheet->retained_gate);
         budget_free(sheet->budget, sheet->svg_raster_tokens);
         budget_free(sheet->budget, sheet->inline_scans);
         budget_free(sheet->budget, sheet->selector_attribute_names);

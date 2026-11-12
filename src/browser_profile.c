@@ -7,6 +7,7 @@
 
 #include <ctype.h>
 #include <limits.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -532,16 +533,23 @@ bool browser_profile_record_history(
     return true;
 }
 
-static bool profile_write_page(FILE *file, char kind,
-                               const BrowserProfilePage *page)
-{
-    char url[BROWSER_PROFILE_URL_LIMIT * 3u];
-    char title[BROWSER_PROFILE_TITLE_LIMIT * 3u];
-    return profile_encode(page->url, url, sizeof(url))
-        && profile_encode(page->title, title, sizeof(title))
-        && fprintf(file, "%c\t%s\t%s\t%u\n", kind, url, title,
-                   (unsigned) page->visits) > 0;
-}
+/* Writes the profile body, accumulating the END footer's FNV-1a 32 and a
+   64-bit fingerprint of exactly the bytes written, so the save never reads
+   the file back. With no file it only fingerprints. */
+typedef struct {
+    FILE *file;
+    uint32_t checksum;
+    uint64_t fingerprint;
+    size_t length;
+    bool ok;
+} ProfileWriter;
+
+#define PROFILE_FINGERPRINT_OFFSET UINT64_C(14695981039346656037)
+#define PROFILE_FINGERPRINT_PRIME UINT64_C(1099511628211)
+/* The longest formatted line: a record key, an encoded host
+   (CONTENT_BLOCKER_HOST_LIMIT * 3) and a few numbers. Page records, whose
+   encoded URL is longer, are written in pieces. */
+#define PROFILE_LINE_LIMIT 512u
 
 static uint32_t profile_checksum_update(
     uint32_t checksum, const unsigned char *data, size_t length)
@@ -553,48 +561,79 @@ static uint32_t profile_checksum_update(
     return checksum;
 }
 
-static bool profile_checksum_file(
-    const char *path, uint32_t *checksum, size_t *length)
+static void profile_writer_init(ProfileWriter *writer, FILE *file)
 {
-    if (path == NULL || checksum == NULL || length == NULL) return false;
-    FILE *file = fopen(path, "rb");
-    if (file == NULL) return false;
-    unsigned char buffer[1024];
-    uint32_t value = PROFILE_FNV_OFFSET;
-    size_t total = 0;
-    bool ok = true;
-    for (;;) {
-        size_t got = fread(buffer, 1, sizeof(buffer), file);
-        if (got != 0) {
-            if (got > PROFILE_FILE_LIMIT - total) {
-                ok = false;
-                break;
-            }
-            value = profile_checksum_update(value, buffer, got);
-            total += got;
-        }
-        if (got != sizeof(buffer)) {
-            if (ferror(file)) ok = false;
-            break;
-        }
+    *writer = (ProfileWriter) {
+        .file = file,
+        .checksum = PROFILE_FNV_OFFSET,
+        .fingerprint = PROFILE_FINGERPRINT_OFFSET,
+        .ok = true
+    };
+}
+
+static bool profile_write_bytes(ProfileWriter *writer, const char *data,
+                                size_t length)
+{
+    if (!writer->ok) return false;
+    if (length > PROFILE_FILE_LIMIT - writer->length
+        || (writer->file != NULL && length != 0
+            && fwrite(data, 1, length, writer->file) != length)) {
+        writer->ok = false;
+        return false;
     }
-    if (fclose(file) != 0) ok = false;
-    if (!ok) return false;
-    *checksum = value;
-    *length = total;
+    const unsigned char *bytes = (const unsigned char *) data;
+    writer->checksum = profile_checksum_update(
+        writer->checksum, bytes, length);
+    for (size_t i = 0; i < length; i++) {
+        writer->fingerprint ^= bytes[i];
+        writer->fingerprint *= PROFILE_FINGERPRINT_PRIME;
+    }
+    writer->length += length;
     return true;
 }
 
-bool browser_profile_save(const BrowserProfile *profile, const char *path)
+static bool profile_write_text(ProfileWriter *writer, const char *text)
 {
-    if (profile == NULL || path == NULL || path[0] == '\0') return false;
-    char temporary[1200], backup[1200];
-    int length = snprintf(temporary, sizeof(temporary), "%s.tmp", path);
-    if (length < 0 || (size_t) length >= sizeof(temporary)) return false;
-    length = snprintf(backup, sizeof(backup), "%s.bak", path);
-    if (length < 0 || (size_t) length >= sizeof(backup)) return false;
-    FILE *file = fopen(temporary, "wb");
-    if (file == NULL) return false;
+    return profile_write_bytes(writer, text, strlen(text));
+}
+
+static bool profile_writef(ProfileWriter *writer, const char *format, ...)
+    __attribute__((format(printf, 2, 3)));
+
+static bool profile_writef(ProfileWriter *writer, const char *format, ...)
+{
+    if (!writer->ok) return false;
+    char line[PROFILE_LINE_LIMIT];
+    va_list arguments;
+    va_start(arguments, format);
+    int length = vsnprintf(line, sizeof(line), format, arguments);
+    va_end(arguments);
+    if (length < 0 || (size_t) length >= sizeof(line)) {
+        writer->ok = false;
+        return false;
+    }
+    return profile_write_bytes(writer, line, (size_t) length);
+}
+
+static bool profile_write_page(ProfileWriter *writer, char kind,
+                               const BrowserProfilePage *page)
+{
+    char url[BROWSER_PROFILE_URL_LIMIT * 3u];
+    char title[BROWSER_PROFILE_TITLE_LIMIT * 3u];
+    char key[3] = {kind, '\t', '\0'};
+    return profile_encode(page->url, url, sizeof(url))
+        && profile_encode(page->title, title, sizeof(title))
+        && profile_write_text(writer, key)
+        && profile_write_text(writer, url)
+        && profile_write_text(writer, "\t")
+        && profile_write_text(writer, title)
+        && profile_writef(writer, "\t%u\n", (unsigned) page->visits);
+}
+
+/* The profile body: everything before the END footer. */
+static bool profile_serialize(ProfileWriter *writer,
+                              const BrowserProfile *profile)
+{
     /*
      * Compatibility contract: record kinds and existing field positions are
      * stable; new scalar fields are appended only. Readers accept missing
@@ -602,8 +641,8 @@ bool browser_profile_save(const BrowserProfile *profile, const char *path)
      * lets an older A/B slot read a profile last written by a newer slot
      * after rollback without rejecting or shifting established settings.
      */
-    bool ok = fprintf(
-        file,
+    bool ok = profile_writef(
+        writer,
         "TILEFINCH_PROFILE\t1\n"
         "UI\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\n",
         profile->ui_scale, profile->page_font_percent,
@@ -615,157 +654,157 @@ bool browser_profile_save(const BrowserProfile *profile, const char *path)
         (unsigned) profile->color_mode,
         profile->custom_homepage_enabled ? 1u : 0u,
         profile->experimental_voice_input ? 1u : 0u,
-        (unsigned) profile->text_entry_mode) > 0;
+        (unsigned) profile->text_entry_mode);
     if (ok) {
-        ok = fprintf(
-            file, "THEME\t%u\n",
-            (unsigned) profile->chrome_theme) > 0;
+        ok = profile_writef(
+            writer, "THEME\t%u\n",
+            (unsigned) profile->chrome_theme);
     }
     if (ok) {
-        ok = fprintf(
-            file, "THEME_FILE\t%s\n", profile->chrome_theme_file) > 0;
+        ok = profile_writef(
+            writer, "THEME_FILE\t%s\n", profile->chrome_theme_file);
     }
     if (ok) {
-        ok = fprintf(
-            file, "DATA\t%u\t%u\t%u\n",
+        ok = profile_writef(
+            writer, "DATA\t%u\t%u\t%u\n",
             profile->persistent_cache_mb,
             profile->persist_local_storage ? 1u : 0u,
-            profile->live_cache_kib) > 0;
+            profile->live_cache_kib);
     }
     if (ok) {
         /* Fields are append-only: old binaries ignore a suffix and newer
            binaries supply defaults for a missing suffix. */
-        ok = fprintf(
-            file, "MEDIA\t%u\t%u\t%u\t%u\t%u\t%u\t%u\n",
+        ok = profile_writef(
+            writer, "MEDIA\t%u\t%u\t%u\t%u\t%u\t%u\t%u\n",
             (unsigned) profile->youtube_quality,
             profile->resume_offline_downloads ? 1u : 0u,
             profile->video_scaling_sharp ? 1u : 0u,
             profile->video_startup_buffering ? 1u : 0u,
             profile->youtube_compact_results ? 1u : 0u,
             profile->youtube_audio_only ? 1u : 0u,
-            profile->rotate_hint_always ? 1u : 0u) > 0;
+            profile->rotate_hint_always ? 1u : 0u);
     }
     if (ok) {
         /* Separate append-only record: older A/B slots ignore it and retain
            their historical system-language behavior. */
-        ok = fprintf(file, "VIDLANG\t%u\t%u\t%u\n",
+        ok = profile_writef(writer, "VIDLANG\t%u\t%u\t%u\n",
                      (unsigned) profile->video_language,
                      (unsigned) profile->subtitle_language,
-                     (unsigned) profile->alternate_language) > 0;
+                     (unsigned) profile->alternate_language);
     }
     if (ok) {
-        ok = fprintf(file, "SUBSTYLE\t%u\t%u\n",
+        ok = profile_writef(writer, "SUBSTYLE\t%u\t%u\n",
                      (unsigned) profile->subtitle_size,
-                     (unsigned) profile->subtitle_background) > 0;
+                     (unsigned) profile->subtitle_background);
     }
     if (ok) {
         /* Independent of browser input: this mapping is consulted only after
            the explicit page-control handoff. */
-        ok = fprintf(file, "GAMEPAD\t%u\n",
-                     (unsigned) profile->gamepad_face_mapping) > 0;
+        ok = profile_writef(writer, "GAMEPAD\t%u\n",
+                     (unsigned) profile->gamepad_face_mapping);
     }
     if (ok) {
-        ok = fprintf(
-            file, "BLOCK\t%u\t%u\n",
+        ok = profile_writef(
+            writer, "BLOCK\t%u\t%u\n",
             (unsigned) profile->content_blocker_mode,
-            profile->content_blocker_cosmetic_hiding ? 1u : 0u) > 0;
+            profile->content_blocker_cosmetic_hiding ? 1u : 0u);
     }
     if (ok) {
-        ok = fprintf(
-            file, "TABS\t%u\n",
-            profile->tab_hibernation_enabled ? 1u : 0u) > 0;
+        ok = profile_writef(
+            writer, "TABS\t%u\n",
+            profile->tab_hibernation_enabled ? 1u : 0u);
     }
     if (ok) {
-        ok = fprintf(
-            file, "UPDCHK\t%u\t%llu\t%llu\n",
+        ok = profile_writef(
+            writer, "UPDCHK\t%u\t%llu\t%llu\n",
             profile->update_check_enabled ? 1u : 0u,
             (unsigned long long) profile->update_check_last_unix,
             (unsigned long long)
-                profile->update_check_available_sequence) > 0;
+                profile->update_check_available_sequence);
     }
     if (ok) {
         /* Append-only: old builds ignore the channel and stay stable. */
-        ok = fprintf(file, "UPDCHAN\t%u\n",
-                     (unsigned) profile->update_channel) > 0;
+        ok = profile_writef(writer, "UPDCHAN\t%u\n",
+                     (unsigned) profile->update_channel);
     }
     if (ok) {
         /* Optional installed components are selected independently of their
            on-disk presence. Missing packs degrade to the embedded fallback. */
-        ok = fprintf(file, "UILANG\t%u\n", (unsigned)profile->ui_language) > 0;
+        ok = profile_writef(writer, "UILANG\t%u\n", (unsigned)profile->ui_language);
     }
     if (ok) {
-        ok = fprintf(file, "GLYPHS\t%u\t%u\n",
+        ok = profile_writef(writer, "GLYPHS\t%u\t%u\n",
                      (unsigned) profile->glyph_language,
-                     profile->color_emoji ? 1u : 0u) > 0;
+                     profile->color_emoji ? 1u : 0u);
     }
     if (ok && (profile->glyph_offer_declined_mask != 0
                || profile->glyph_offers_off)) {
         /* Append-only, written only once an offer was declined or turned
            off: older builds ignore the key and never show the offer. */
-        ok = fprintf(file, "GLYPHASK\t%u\t%u\n",
+        ok = profile_writef(writer, "GLYPHASK\t%u\t%u\n",
                      (unsigned) profile->glyph_offer_declined_mask,
-                     profile->glyph_offers_off ? 1u : 0u) > 0;
+                     profile->glyph_offers_off ? 1u : 0u);
     }
     if (ok) {
         /* Appended after UPDCHK: an older build ignores the unknown key and
            a newer build reading an older file keeps the default. */
-        ok = fprintf(
-            file, "WAVE\t%u\n",
-            profile->wave_background ? 1u : 0u) > 0;
+        ok = profile_writef(
+            writer, "WAVE\t%u\n",
+            profile->wave_background ? 1u : 0u);
     }
     if (ok) {
         /* Independent global page policies. This is a separate append-only
            record so older builds safely ignore it. */
-        ok = fprintf(
-            file, "POLICY\t%u\t%u\n",
+        ok = profile_writef(
+            writer, "POLICY\t%u\t%u\n",
             profile->javascript_enabled ? 1u : 0u,
-            profile->site_data_allowed ? 1u : 0u) > 0;
+            profile->site_data_allowed ? 1u : 0u);
     }
     if (ok) {
         /* Cross-boot transport persistence is independent of page storage.
            Older builds ignore this record and retain the historical default. */
-        ok = fprintf(
-            file, "TLSSESS\t%u\n",
-            profile->tls_session_persistence ? 1u : 0u) > 0;
+        ok = profile_writef(
+            writer, "TLSSESS\t%u\n",
+            profile->tls_session_persistence ? 1u : 0u);
     }
     if (ok) {
         /* Append-only and default-off for profiles written by older slots. */
-        ok = fprintf(
-            file, "DIAG\t%u\n",
-            profile->save_diagnostic_reports ? 1u : 0u) > 0;
+        ok = profile_writef(
+            writer, "DIAG\t%u\n",
+            profile->save_diagnostic_reports ? 1u : 0u);
     }
     if (ok) {
         /* Independent records: discovery defaults on, diagnostics off. */
-        ok = fprintf(file, "DISCOVERY\t%u\nWIFIDIAG\t%u\n",
+        ok = profile_writef(writer, "DISCOVERY\t%u\nWIFIDIAG\t%u\n",
                      profile->youtube_topics ? 1u : 0u,
-                     profile->wifi_diagnostics ? 1u : 0u) > 0;
+                     profile->wifi_diagnostics ? 1u : 0u);
     }
     if (ok) {
         /* Append-only; marks MEDIA field 5 as a choice made with Compact as
            the default, so the load keeps it. */
-        ok = fprintf(file, "YTRESULTS\t1\n") > 0;
+        ok = profile_writef(writer, "YTRESULTS\t1\n");
     }
     if (ok) {
         /* Append-only; a profile without it shows channel banners. */
-        ok = fprintf(file, "YTBANNER\t%u\n",
-                     profile->youtube_channel_banners_hidden ? 1u : 0u) > 0;
+        ok = profile_writef(writer, "YTBANNER\t%u\n",
+                     profile->youtube_channel_banners_hidden ? 1u : 0u);
     }
     if (ok) {
         /* Append-only; a profile without it reads as 100%. */
-        ok = fprintf(file, "PAGEZOOM\t%u\n", profile->page_zoom_percent) > 0;
+        ok = profile_writef(writer, "PAGEZOOM\t%u\n", profile->page_zoom_percent);
     }
     if (ok) {
         /* Append-only; Ask is the safe default for old profiles. */
-        ok = fprintf(file, "YTLOGIN\t%u\n", (unsigned) profile->youtube_login_policy) > 0;
+        ok = profile_writef(writer, "YTLOGIN\t%u\n", (unsigned) profile->youtube_login_policy);
     }
     if (ok) {
         /* Append-only and default-off, like DIAG. */
-        ok = fprintf(file, "SCRIPTCACHE\t%u\n",
-                     profile->keep_compiled_scripts ? 1u : 0u) > 0;
+        ok = profile_writef(writer, "SCRIPTCACHE\t%u\n",
+                     profile->keep_compiled_scripts ? 1u : 0u);
     }
     if (ok) {
-        ok = fprintf(file, "JSDEFAULT\t%u\n",
-                     (unsigned) profile->javascript_default_allow_mask) > 0;
+        ok = profile_writef(writer, "JSDEFAULT\t%u\n",
+                     (unsigned) profile->javascript_default_allow_mask);
     }
     for (size_t i = 0;
          ok && i < profile->javascript_disabled_site_count; i++) {
@@ -773,18 +812,18 @@ bool browser_profile_save(const BrowserProfile *profile, const char *path)
         ok = profile_encode(
                  profile->javascript_disabled_sites[i], encoded,
                  sizeof(encoded))
-            && fprintf(file, "JSD\t%s\n", encoded) > 0;
+            && profile_writef(writer, "JSD\t%s\n", encoded);
     }
     if (ok) {
-        ok = fprintf(file, "STORE\t%u\n",
-                     profile->site_storage_offers ? 1u : 0u) > 0;
+        ok = profile_writef(writer, "STORE\t%u\n",
+                     profile->site_storage_offers ? 1u : 0u);
     }
     for (size_t i = 0; ok && i < profile->storage_site_count; i++) {
         char encoded[CONTENT_BLOCKER_HOST_LIMIT * 3u];
         ok = profile_encode(
                  profile->storage_sites[i].origin, encoded, sizeof(encoded))
-            && fprintf(file, "SS\t%s\t%u\n", encoded,
-                       (unsigned) profile->storage_sites[i].policy) > 0;
+            && profile_writef(writer, "SS\t%s\t%u\n", encoded,
+                       (unsigned) profile->storage_sites[i].policy);
     }
     for (size_t i = 0;
          ok && i < profile->third_party_cookie_allowed_site_count; i++) {
@@ -792,7 +831,7 @@ bool browser_profile_save(const BrowserProfile *profile, const char *path)
         ok = profile_encode(
                  profile->third_party_cookie_allowed_sites[i], encoded,
                  sizeof(encoded))
-            && fprintf(file, "TPC\t%s\n", encoded) > 0;
+            && profile_writef(writer, "TPC\t%s\n", encoded);
     }
     for (size_t i = 0;
          ok && i < profile->cookie_banner_visible_site_count; i++) {
@@ -800,39 +839,39 @@ bool browser_profile_save(const BrowserProfile *profile, const char *path)
         ok = profile_encode(
                  profile->cookie_banner_visible_sites[i], encoded,
                  sizeof(encoded))
-            && fprintf(file, "CBV\t%s\n", encoded) > 0;
+            && profile_writef(writer, "CBV\t%s\n", encoded);
     }
     if (ok) {
         /* The fourth field (Basic view fallback) is newer; older readers
            take the leading digit of "auto\tbasic" for Auto Reader. */
-        ok = fprintf(
-            file, "READER\t%u\t%u\t%u\t%u\n",
+        ok = profile_writef(
+            writer, "READER\t%u\t%u\t%u\t%u\n",
             (unsigned) profile->reader_font,
             profile->remember_reader_site_scale ? 1u : 0u,
             profile->reader_auto_mode ? 1u : 0u,
-            (unsigned) profile->basic_fallback_mode) > 0;
+            (unsigned) profile->basic_fallback_mode);
     }
     if (ok) {
         /* Append-only: older builds ignore WEB_FONTS, HEAVY and HS records. */
-        ok = fprintf(file, "WEB_FONTS\t%u\nHEAVY\t%u\n",
+        ok = profile_writef(writer, "WEB_FONTS\t%u\nHEAVY\t%u\n",
                      (unsigned) profile->web_font_mode,
-                     (unsigned) profile->heavy_pages_mode) > 0;
+                     (unsigned) profile->heavy_pages_mode);
     }
     for (size_t i = 0; ok && i < profile->heavy_site_count; i++) {
         char encoded[CONTENT_BLOCKER_HOST_LIMIT * 3u];
         ok = profile_encode(profile->heavy_sites[i], encoded,
                             sizeof(encoded))
-            && fprintf(file, "HS\t%s\n", encoded) > 0;
+            && profile_writef(writer, "HS\t%s\n", encoded);
     }
     for (size_t i = 0;
          ok && i < profile->reader_site_count; i++) {
         char encoded[CONTENT_BLOCKER_HOST_LIMIT * 3u];
         ok = profile_encode(
                  profile->reader_sites[i].site, encoded, sizeof(encoded))
-            && fprintf(
-                   file, "RS\t%s\t%u\t%u\n", encoded,
+            && profile_writef(
+                   writer, "RS\t%s\t%u\t%u\n", encoded,
                    profile->reader_sites[i].percent,
-                   profile->reader_sites[i].always ? 1u : 0u) > 0;
+                   profile->reader_sites[i].always ? 1u : 0u);
     }
     for (size_t i = 0;
          ok && i < profile->content_blocker_allowed_site_count; i++) {
@@ -840,51 +879,93 @@ bool browser_profile_save(const BrowserProfile *profile, const char *path)
         ok = profile_encode(
                  profile->content_blocker_allowed_sites[i], encoded,
                  sizeof(encoded))
-            && fprintf(file, "A\t%s\n", encoded) > 0;
+            && profile_writef(writer, "A\t%s\n", encoded);
     }
     for (size_t i = 0; ok && i < profile->bookmark_count; i++)
-        ok = profile_write_page(file, 'B', &profile->bookmarks[i]);
+        ok = profile_write_page(writer, 'B', &profile->bookmarks[i]);
     for (size_t i = 0; ok && i < profile->history_count; i++)
-        ok = profile_write_page(file, 'H', &profile->history[i]);
-    if (ok) ok = fprintf(file, "RESUME\t%u\n",
-        profile->save_playback_positions ? 1u : 0u) > 0;
+        ok = profile_write_page(writer, 'H', &profile->history[i]);
+    if (ok) ok = profile_writef(writer, "RESUME\t%u\n",
+        profile->save_playback_positions ? 1u : 0u);
     for (size_t i = 0; ok && profile->save_playback_positions
          && i < profile->resume_count; i++)
-        ok = fprintf(
-            file, "R\t%s\t%llu\t%llu\n", profile->resumes[i].video_id,
+        ok = profile_writef(
+            writer, "R\t%s\t%llu\t%llu\n", profile->resumes[i].video_id,
             (unsigned long long) profile->resumes[i].position_us,
-            (unsigned long long) profile->resumes[i].duration_us) > 0;
+            (unsigned long long) profile->resumes[i].duration_us);
+    return ok && writer->ok;
+}
+
+bool browser_profile_fingerprint(const BrowserProfile *profile,
+                                 BrowserProfileFingerprint *fingerprint)
+{
+    if (fingerprint != NULL) *fingerprint = (BrowserProfileFingerprint) {0};
+    if (profile == NULL || fingerprint == NULL) return false;
+    ProfileWriter writer;
+    profile_writer_init(&writer, NULL);
+    if (!profile_serialize(&writer, profile)) return false;
+    *fingerprint = (BrowserProfileFingerprint) {
+        .hash = writer.fingerprint, .length = writer.length
+    };
+    return true;
+}
+
+bool browser_profile_save_fingerprinted(
+    const BrowserProfile *profile, const char *path,
+    BrowserProfileFingerprint *written)
+{
+    if (written != NULL) *written = (BrowserProfileFingerprint) {0};
+    if (profile == NULL || path == NULL || path[0] == '\0') return false;
+    char temporary[1200], backup[1200];
+    int length = snprintf(temporary, sizeof(temporary), "%s.tmp", path);
+    if (length < 0 || (size_t) length >= sizeof(temporary)) return false;
+    length = snprintf(backup, sizeof(backup), "%s.bak", path);
+    if (length < 0 || (size_t) length >= sizeof(backup)) return false;
+    FILE *file = fopen(temporary, "wb");
+    if (file == NULL) return false;
+    ProfileWriter writer;
+    profile_writer_init(&writer, file);
+    bool ok = profile_serialize(&writer, profile);
+    BrowserProfileFingerprint body = {
+        .hash = writer.fingerprint, .length = writer.length
+    };
+    /* The footer covers the body only; it is written through the same
+       handle, so one create and one sequential write make the file. */
+    if (ok) {
+        char footer[64];
+        int footer_length = snprintf(
+            footer, sizeof(footer), "END\t%zu\t%08X\n", writer.length,
+            (unsigned) writer.checksum);
+        ok = footer_length > 0 && (size_t) footer_length < sizeof(footer)
+            && fwrite(footer, 1, (size_t) footer_length, file)
+                   == (size_t) footer_length;
+    }
     ok = fclose(file) == 0 && ok;
     if (!ok) {
         remove(temporary);
         return false;
     }
-    uint32_t checksum = 0;
-    size_t body_length = 0;
-    if (!profile_checksum_file(temporary, &checksum, &body_length)) {
-        remove(temporary);
-        return false;
+    if (tilefinch_platform_replace_file(temporary, path, backup)) {
+        if (written != NULL) *written = body;
+        return true;
     }
-    file = fopen(temporary, "ab");
-    if (file == NULL) {
-        remove(temporary);
-        return false;
-    }
-    ok = fprintf(file, "END\t%zu\t%08X\n", body_length,
-                 (unsigned) checksum) > 0;
-    if (fclose(file) != 0) ok = false;
-    if (!ok) {
-        remove(temporary);
-        return false;
-    }
-    if (tilefinch_platform_replace_file(temporary, path, backup)) return true;
     remove(temporary);
     return false;
 }
 
-static bool profile_load_internal(
-    BrowserProfile *profile, const char *path, bool load_allowed_sites)
+bool browser_profile_save(const BrowserProfile *profile, const char *path)
 {
+    return browser_profile_save_fingerprinted(profile, path, NULL);
+}
+
+/* *damaged is set only when the file was read to the end (or to the
+   record that broke it) and is not a valid profile; an open, memory or read
+   failure says nothing about its contents. */
+static bool profile_load_internal(
+    BrowserProfile *profile, const char *path, bool load_allowed_sites,
+    bool *damaged)
+{
+    *damaged = false;
     if (profile == NULL || path == NULL || path[0] == '\0') return false;
     FILE *file = fopen(path, "rb");
     if (file == NULL) return false;
@@ -1440,8 +1521,9 @@ static bool profile_load_internal(
         }
     }
     bool read_ok = !ferror(file);
-    bool ok = fclose(file) == 0 && header && complete && footer_seen
-        && read_ok;
+    bool closed = fclose(file) == 0;
+    bool ok = closed && header && complete && footer_seen && read_ok;
+    *damaged = !ok && closed && read_ok;
     if (ok) {
         /* Builds before Compact became the default always wrote Detailed
            into MEDIA field 5, so it is a choice only once YTRESULTS says so;
@@ -1459,18 +1541,23 @@ static bool profile_load_with_backup(
     BrowserProfile *profile, const char *path, bool load_allowed_sites)
 {
     if (profile == NULL || path == NULL || path[0] == '\0') return false;
-    if (profile_load_internal(profile, path, load_allowed_sites)) return true;
+    bool primary_damaged = false, backup_damaged = false;
+    if (profile_load_internal(profile, path, load_allowed_sites,
+                              &primary_damaged)) return true;
     char backup[1200];
     int length = snprintf(backup, sizeof(backup), "%s.bak", path);
     if (length < 0 || (size_t) length >= sizeof(backup)) return false;
-    if (!profile_load_internal(profile, backup, load_allowed_sites))
+    if (!profile_load_internal(profile, backup, load_allowed_sites,
+                               &backup_damaged))
         return false;
     /*
-     * The primary is missing or unreadable and the backup carried the
-     * settings. Drop a primary that exists but does not parse so the next
-     * save's rotation cannot promote it over the recovered generation.
+     * The backup carried the settings. Drop a primary that was read and
+     * does not parse so the next save's rotation cannot promote it over the
+     * recovered generation. One that only failed to open or read (a
+     * transient card error) may be the newer, valid generation: keep it; the
+     * next save rotates it into .bak.
      */
-    (void) remove(path);
+    if (primary_damaged) (void) remove(path);
     return true;
 }
 

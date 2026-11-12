@@ -705,11 +705,17 @@ typedef struct {
        frontend show the stage clock while a long script is still running. */
     uint64_t parser_script_turn_started_us;
     size_t parser_script_stage_work;
+    /* Execution time and source work the scripts that ran inside a
+       write() added (navigation_stream_take_written_share). */
+    uint64_t parser_script_written_us;
+    size_t parser_script_written_work;
     size_t parser_script_consecutive_failures;
     bool head_closed;
     bool body_closed;
     bool blocking_stylesheet_ready;
-    bool blocking_stylesheet_user_context_neutral;
+    /* The user stylesheet the blocking sheet carries
+       (navigation_stylesheet_user_css_hash when it was built or taken). */
+    uint64_t blocking_stylesheet_user_css;
     bool cssom_layout_ready;
     bool blocking_stylesheet_fingerprint_valid;
     bool stylesheet_input_overflow;

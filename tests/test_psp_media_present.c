@@ -770,6 +770,67 @@ static bool test_rgb565_stays_off_the_video_surface(void)
     return true;
 }
 
+/*
+ * MB-02: a staging transfer nobody could join that also misses its deadline
+ * is reported once. Before, the state stayed live, so every later frame of
+ * every later session saw "expired" again and re-raised the failure panel:
+ * Close lasted one frame and Retry failed on its first frame.
+ */
+static bool test_dma_quarantine_expires_once(void)
+{
+    const uint32_t deadline = 2000000u;
+    PspMediaDmaQuarantineState state = PSP_MEDIA_DMA_QUARANTINE_CLEAR;
+    CHECK(psp_media_present_dma_quarantine_step(&state, false, 0, deadline)
+          == PSP_MEDIA_DMA_QUARANTINE_STEP_IDLE);
+    CHECK(!psp_media_present_dma_quarantine_refuses_slot(state)
+          && !psp_media_present_dma_quarantine_refuses_staging(state));
+
+    /* Seen to end inside the deadline: the slot is owed its release once. */
+    state = PSP_MEDIA_DMA_QUARANTINE_LIVE;
+    CHECK(psp_media_present_dma_quarantine_refuses_slot(state)
+          && psp_media_present_dma_quarantine_refuses_staging(state));
+    CHECK(psp_media_present_dma_quarantine_step(
+              &state, false, deadline - 1u, deadline)
+          == PSP_MEDIA_DMA_QUARANTINE_STEP_WAITING);
+    CHECK(psp_media_present_dma_quarantine_step(
+              &state, true, deadline - 1u, deadline)
+          == PSP_MEDIA_DMA_QUARANTINE_STEP_COMPLETED);
+    CHECK(state == PSP_MEDIA_DMA_QUARANTINE_CLEAR);
+    CHECK(psp_media_present_dma_quarantine_step(&state, true, 0, deadline)
+          == PSP_MEDIA_DMA_QUARANTINE_STEP_IDLE);
+
+    /* Never seen to end: expired exactly once, then quiet for any number of
+       later frames, whatever the clock says. */
+    state = PSP_MEDIA_DMA_QUARANTINE_LIVE;
+    CHECK(psp_media_present_dma_quarantine_step(
+              &state, false, deadline, deadline)
+          == PSP_MEDIA_DMA_QUARANTINE_STEP_EXPIRED);
+    for (uint32_t frame = 1; frame <= 120u; frame++) {
+        CHECK(psp_media_present_dma_quarantine_step(
+                  &state, false, deadline + frame * 16667u, deadline)
+              == PSP_MEDIA_DMA_QUARANTINE_STEP_IDLE);
+    }
+    /* Abandoned: the slot is no longer refused (later seeks of the backend
+       pass), the staging buffer still is (nothing stages where the transfer
+       may land). */
+    CHECK(state == PSP_MEDIA_DMA_QUARANTINE_ABANDONED);
+    CHECK(!psp_media_present_dma_quarantine_refuses_slot(state)
+          && psp_media_present_dma_quarantine_refuses_staging(state));
+    /* A late completion gives the staging buffer back, with nothing owed. */
+    CHECK(psp_media_present_dma_quarantine_step(
+              &state, true, deadline * 4u, deadline)
+          == PSP_MEDIA_DMA_QUARANTINE_STEP_IDLE);
+    CHECK(state == PSP_MEDIA_DMA_QUARANTINE_CLEAR
+          && !psp_media_present_dma_quarantine_refuses_staging(state));
+    CHECK(psp_media_present_dma_quarantine_step(NULL, true, 0, deadline)
+          == PSP_MEDIA_DMA_QUARANTINE_STEP_IDLE);
+    /* The host presenter never posts a copy, so it never has one to step. */
+    CHECK(psp_media_present_ge_stage_dma_quarantine_step()
+          == PSP_MEDIA_DMA_QUARANTINE_STEP_IDLE
+          && !psp_media_present_ge_stage_dma_quarantined());
+    return true;
+}
+
 int main(void)
 {
     struct { const char *name; bool (*run)(void); } cases[] = {
@@ -797,7 +858,8 @@ int main(void)
         {"rgb565-stays-off-the-video-surface",
          test_rgb565_stays_off_the_video_surface},
         {"mode-names", test_mode_names},
-        {"host-has-no-graphics-engine", test_host_has_no_graphics_engine}
+        {"host-has-no-graphics-engine", test_host_has_no_graphics_engine},
+        {"dma-quarantine-expires-once", test_dma_quarantine_expires_once}
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         if (!cases[i].run()) {

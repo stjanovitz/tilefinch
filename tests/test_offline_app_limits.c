@@ -18,6 +18,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "offline_library_fence_probe.h"
 #include "script_test_support.h"
 
 #ifndef TILEFINCH_TEST_SOURCE_DIR
@@ -475,6 +476,7 @@ typedef struct {
 static void record_progress(void *context, unsigned done, unsigned total)
 {
     ProgressLog *log = context;
+    if (fence_probe.held) fence_probe.held_across_work++;
     if (log->count < 16u) {
         log->done[log->count] = done;
         log->total[log->count] = total;
@@ -1171,6 +1173,9 @@ static int stale_recompile(const App *app, const char *directory)
     OfflineLibrary library;
     offline_library_init(&library, &budget, directory);
     CHECK(offline_library_load(&library));
+    /* AU-05: a supervised Library screen draws these rows from the callback
+       thread, so every index change below must be made under the fence. */
+    fence_probe_install(&library);
     BrowserSession live;
     CHECK(browser_session_init(&live, &budget, 4u * MIB));
     CHECK(app_stage(app, &live, &budget));
@@ -1180,6 +1185,7 @@ static int stale_recompile(const App *app, const char *directory)
         error, sizeof(error)));
     browser_session_destroy(&live);
     document_destroy(&document);
+    CHECK(fence_probe_clean());
     size_t baseline = budget.current;
     unsigned scripts = 0;
     /* Fresh installs carry the current fingerprint: nothing to do. */
@@ -1293,6 +1299,9 @@ static int stale_recompile(const App *app, const char *directory)
         stale_pack = file_hash(pack_path);
     }
     CHECK(refusals != 0 && degraded != 0);
+    /* Each published recompile replaced the row (a new id in the same slot)
+       only under the fence, and none held it across a compile. */
+    CHECK(fence_probe_clean() && fence_probe.acquires >= 2u + degraded);
     library.progress = NULL;
     /* The new generation replaced the old one in the same slot. */
     CHECK(fresh != id && library.count == 1u

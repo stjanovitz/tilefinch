@@ -2,6 +2,9 @@
    shedding its optional work at the memory limit, and preparing the
    stream's script realm. */
 
+static void navigation_stream_bind_node_retirement(
+    NavigationDocumentStream *stream);
+
 static void navigation_stream_destroy_staging(
     NavigationDocumentStream *stream)
 {
@@ -11,6 +14,8 @@ static void navigation_stream_destroy_staging(
        the stream's borrowed identity must never be dereferenced again. */
     if (stream->runtime != NULL && !stream->runtime_transferred) {
         script_runtime_set_synchronous_layout_callback(
+            stream->runtime, NULL, NULL);
+        script_runtime_set_node_retirement_callback(
             stream->runtime, NULL, NULL);
         script_runtime_set_layout(
             stream->runtime, NULL, stream->viewport.css_height);
@@ -82,10 +87,15 @@ static void navigation_stream_shed_optional_work(
     stream->script_disabled_after_failure = true;
     stream->optional_work_shed = true;
     stream->script_result.success = false;
-    snprintf(stream->script_result.summary,
-             sizeof(stream->script_result.summary), "%s",
-             reason == NULL ? "Optional page work stopped at its memory limit"
-                            : reason);
+    /* A tripped parser-script breaker names why JavaScript stopped (it
+       writes its summary after this, or before when its shed was deferred
+       until a writing script returned). */
+    if (!stream->parser_script_circuit_open)
+        snprintf(stream->script_result.summary,
+                 sizeof(stream->script_result.summary), "%s",
+                 reason == NULL
+                     ? "Optional page work stopped at its memory limit"
+                     : reason);
     if (session != NULL) session->performance.optional_work_sheds++;
 }
 
@@ -172,6 +182,7 @@ static bool navigation_stream_prepare_runtime(NavigationDocumentStream *stream,
         }
         script_runtime_set_synchronous_layout_callback(
             stream->runtime, navigation_stream_flush_cssom_layout, stream);
+        navigation_stream_bind_node_retirement(stream);
     }
     if (stream->runtime == NULL) {
         navigation_stream_shed_optional_work(

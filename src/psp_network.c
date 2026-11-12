@@ -95,20 +95,44 @@ static uint64_t psp_network_now_us(void)
     return (uint64_t) sceKernelGetSystemTimeWide();
 }
 
-/* One resolver scratch buffer, one hostent, one address: gethostbyname is a
-   single-result interface by definition and this browser resolves from the
-   single transport worker only. Static storage keeps a kilobyte off a stack
-   that is also carrying curl, mbed TLS and the caller's frames. The stub
-   resolver adds no shared buffers: its query, reply and socket live on the
-   calling thread's stack (under 800 bytes against the worker's 256 KiB), and
-   only its diagnostic counters below are process-wide. */
+/* One resolver scratch buffer and one working address, used by one lookup
+   at a time: gethostbyname holds psp_dns_lock across the whole lookup.
+   Most lookups come from the transport worker, but a blocking fetch on the
+   browser thread resolves too, and two unserialized lookups overwrote each
+   other's address (then cached for PSP_FETCH_DNS_CACHE_SECONDS) and shared
+   the firmware resolver's scratch. Static storage keeps a kilobyte off a
+   stack that is also carrying curl, mbed TLS and the caller's frames. The
+   stub resolver adds no shared buffers: its query, reply and socket live
+   on the calling thread's stack (under 800 bytes against the worker's
+   256 KiB), and only its diagnostic counters below are process-wide. */
 static unsigned char psp_dns_scratch[PSP_DNS_RESOLVER_BUFFER_BYTES]
     __attribute__((aligned(64)));
 static struct in_addr psp_dns_address;
-static char *psp_dns_address_list[2];
-static char *psp_dns_aliases[1];
-static char psp_dns_canonical_name[256];
-static struct hostent psp_dns_hostent;
+
+/* A waiting lookup gives up after this. It is longer than one lookup can
+   take (the stub's PSP_DNS_STUB_BUDGET_MS, then the firmware's guarded
+   attempt and its one retry), and bounded because psp_network_dns_guard
+   runs on the browser thread: a browser thread waiting here cannot stop a
+   firmware lookup that never returns. */
+#define PSP_DNS_LOCK_WAIT_US 10000000u
+static SceUID psp_dns_lock = -1;
+
+/* gethostbyname's answer stays valid until the same thread's next call
+   (curl copies it as soon as the call returns), so each resolving thread
+   has its own; the least recently used slot goes to a new thread. Written
+   only under psp_dns_lock. */
+#define PSP_DNS_RESULT_SLOTS 4u
+typedef struct {
+    SceUID thread;
+    unsigned last_use;
+    struct in_addr address;
+    char *address_list[2];
+    char *aliases[1];
+    char canonical_name[256];
+    struct hostent hostent;
+} PspDnsResult;
+static PspDnsResult psp_dns_results[PSP_DNS_RESULT_SLOTS];
+static unsigned psp_dns_result_uses;
 
 /* The lookup in flight, published for psp_network_dns_guard on the browser
    thread. The start time is written before the id and the id is withdrawn
@@ -476,24 +500,63 @@ static bool psp_dns_resolve(const char *name)
     return resolved;
 }
 
+static void psp_dns_lock_create(void)
+{
+    if (psp_dns_lock < 0)
+        psp_dns_lock = sceKernelCreateSema("tilefinch-dns", 0, 1, 1, NULL);
+}
+
+static PspDnsResult *psp_dns_result_for(SceUID thread)
+{
+    PspDnsResult *slot = &psp_dns_results[0];
+    for (unsigned i = 0; i < PSP_DNS_RESULT_SLOTS; i++) {
+        PspDnsResult *candidate = &psp_dns_results[i];
+        if (candidate->last_use != 0u && candidate->thread == thread) {
+            slot = candidate;
+            break;
+        }
+        if (candidate->last_use < slot->last_use) slot = candidate;
+    }
+    slot->thread = thread;
+    if (++psp_dns_result_uses == 0u) psp_dns_result_uses = 1u;
+    slot->last_use = psp_dns_result_uses;
+    return slot;
+}
+
 struct hostent *gethostbyname(const char *name)
 {
     if (name == NULL || name[0] == '\0') return NULL;
+    /* Network start creates the lock on the browser thread before any
+       transfer; this covers a process that resolves without it. Should the
+       kernel refuse the semaphore, lookups run unserialized as before. */
+    psp_dns_lock_create();
+    if (psp_dns_lock >= 0) {
+        SceUInt wait_us = PSP_DNS_LOCK_WAIT_US;
+        if (sceKernelWaitSema(psp_dns_lock, 1, &wait_us) < 0) return NULL;
+    }
     memset(&psp_dns_address, 0, sizeof(psp_dns_address));
+    bool resolved = true;
     if (sceNetInetInetAton(name, &psp_dns_address) == 0
-        && !psp_dns_resolve(name)) return NULL;
-    snprintf(psp_dns_canonical_name, sizeof(psp_dns_canonical_name),
-             "%s", name);
-    psp_dns_address_list[0] = (char *) &psp_dns_address;
-    psp_dns_address_list[1] = NULL;
-    psp_dns_aliases[0] = NULL;
-    psp_dns_hostent.h_name = psp_dns_canonical_name;
-    psp_dns_hostent.h_aliases = psp_dns_aliases;
-    psp_dns_hostent.h_addrtype = PSP_DNS_ADDRESS_FAMILY_INET;
-    psp_dns_hostent.h_length = PSP_DNS_ADDRESS_BYTES;
-    psp_dns_hostent.h_addr_list = psp_dns_address_list;
-    psp_dns_hostent.h_addr = psp_dns_address_list[0];
-    return &psp_dns_hostent;
+        && !psp_dns_resolve(name)) resolved = false;
+    struct hostent *answer = NULL;
+    if (resolved) {
+        PspDnsResult *result = psp_dns_result_for(sceKernelGetThreadId());
+        result->address = psp_dns_address;
+        snprintf(result->canonical_name, sizeof(result->canonical_name),
+                 "%s", name);
+        result->address_list[0] = (char *) &result->address;
+        result->address_list[1] = NULL;
+        result->aliases[0] = NULL;
+        result->hostent.h_name = result->canonical_name;
+        result->hostent.h_aliases = result->aliases;
+        result->hostent.h_addrtype = PSP_DNS_ADDRESS_FAMILY_INET;
+        result->hostent.h_length = PSP_DNS_ADDRESS_BYTES;
+        result->hostent.h_addr_list = result->address_list;
+        result->hostent.h_addr = result->address_list[0];
+        answer = &result->hostent;
+    }
+    if (psp_dns_lock >= 0) (void) sceKernelSignalSema(psp_dns_lock, 1);
+    return answer;
 }
 
 static void psp_network_sample_memory(PspNetwork *network)
@@ -691,6 +754,8 @@ static int psp_network_join_step(PspNetwork *network, uint64_t now_us)
 bool psp_network_begin(PspNetwork *network, int profile_index)
 {
     if (network == NULL || profile_index <= 0) return false;
+    /* Before any transfer can resolve, on the browser thread. */
+    psp_dns_lock_create();
     psp_network_reset_ladder(network);
     network->requested_profile_index = profile_index;
     network->diagnostics_enabled = psp_network_diagnostics_enabled();

@@ -1,10 +1,15 @@
 #include "tilefinch/budget.h"
 #include "tilefinch/browser_profile.h"
+#include "tilefinch/document.h"
 #include "tilefinch/font.h"
 #include "tilefinch/glyph_component.h"
+#include "../src/tilefinch_test_faults.h"
 #include "tilefinch/glyph_component_store.h"
+#include "tilefinch/layout.h"
 #include "tilefinch/psp_ui.h"
+#include "tilefinch/render.h"
 #include "tilefinch/sha256.h"
+#include "tilefinch/style.h"
 #include "tilefinch/ui_language.h"
 
 #include <limits.h>
@@ -259,6 +264,17 @@ static bool copy_file(const char *source, const char *destination)
     return ok;
 }
 
+/* Moves a fixture to where a finished download sits; the installer takes it
+   from there. */
+static bool stage_fixture_download(
+    const char *root, TilefinchGlyphPack pack, const char *fixture,
+    char part[TILEFINCH_INSTALL_PATH_LIMIT])
+{
+    return tilefinch_glyph_component_prepare_download(
+               root, pack, part, TILEFINCH_INSTALL_PATH_LIMIT)
+        && copy_file(fixture, part) && remove(fixture) == 0;
+}
+
 static bool test_pack_catalog(void)
 {
     static const TilefinchGlyphPackSpec expected[] = {
@@ -405,13 +421,14 @@ static bool render_authored_sample(TilefinchGlyphProvider *provider,
         if (cursor >= 512u) break;
         size_t drawable = source.width;
         if (cursor + drawable > 512u) drawable = 512u - cursor;
-        /* Mono pack cells are one-bit rows, not width*height byte images. */
-        size_t stride = (source.width + 7u) / 8u;
+        /* Mono pack cells are 16-bit rows, whatever the glyph's own width. */
         for (size_t y = 0; y < source.height; y++) {
-            for (size_t x = 0; x < drawable; x++)
+            for (size_t x = 0; x < drawable; x++) {
+                size_t column = source.first_column + x;
                 canvas[y * 512u + cursor + x] =
-                    source.pixels[y * stride + x / 8u]
-                        & (0x80u >> (x & 7u)) ? 255u : 0u;
+                    source.pixels[y * 2u + column / 8u]
+                        & (0x80u >> (column & 7u)) ? 255u : 0u;
+            }
         }
         cursor += width;
         glyphs++;
@@ -552,23 +569,34 @@ static bool test_release_artifacts(void)
                 || verified.manifest.release_sequence == 5u
                 || verified.manifest.release_sequence == 6u
                 || verified.manifest.release_sequence == 7u
-                || verified.manifest.release_sequence == 8u);
+                || verified.manifest.release_sequence == 8u
+                || verified.manifest.release_sequence == 9u);
         bool revised_bengali = pack == TILEFINCH_GLYPH_PACK_BENGALI_ASSAMESE
             && (verified.manifest.release_sequence == 2u
                 || verified.manifest.release_sequence == 3u
-                || verified.manifest.release_sequence == 4u);
-        CHECK(revised_hindi || revised_bengali
+                || verified.manifest.release_sequence == 4u
+                || verified.manifest.release_sequence == 5u);
+        /* components-v9 rebuilt every pack but color emoji with real metrics. */
+        bool rebuilt_scalar = pack != TILEFINCH_GLYPH_PACK_DEVANAGARI
+            && pack != TILEFINCH_GLYPH_PACK_BENGALI_ASSAMESE
+            && pack != TILEFINCH_GLYPH_PACK_COLOR_EMOJI
+            && verified.manifest.release_sequence == 2u;
+        CHECK(revised_hindi || revised_bengali || rebuilt_scalar
               || verified.manifest.release_sequence == 1u);
         CHECK(strcmp(verified.manifest.tag,
                      pack == TILEFINCH_GLYPH_PACK_BENGALI_ASSAMESE
-                        ? (verified.manifest.release_sequence == 4u
+                        ? (verified.manifest.release_sequence == 5u
+                            ? "components-v9"
+                            : verified.manifest.release_sequence == 4u
                             ? "components-v8"
                             : verified.manifest.release_sequence == 3u
                             ? "components-v7"
                             : revised_bengali ? "components-v6"
                                            : "glyph-bengali-assamese-v1")
                         : revised_hindi
-                        ? (verified.manifest.release_sequence == 8u
+                        ? (verified.manifest.release_sequence == 9u
+                            ? "components-v9"
+                            : verified.manifest.release_sequence == 8u
                             ? "components-v8"
                             : verified.manifest.release_sequence == 7u
                             ? "components-v7"
@@ -580,6 +608,7 @@ static bool test_release_artifacts(void)
                             ? "components-v4"
                             : verified.manifest.release_sequence == 3u
                                 ? "components-v3" : "components-v2")
+                        : rebuilt_scalar ? "components-v9"
                         : "components-v1") == 0);
         CHECK(strcmp(verified.manifest.asset, spec->pack_asset) == 0);
         if (pack == TILEFINCH_GLYPH_PACK_CYRILLIC
@@ -588,7 +617,8 @@ static bool test_release_artifacts(void)
             || pack == TILEFINCH_GLYPH_PACK_HEBREW) {
             CHECK(verified.manifest.root_version == 1u
                   && verified.manifest.expires_unix
-                         == UINT64_C(1818115200));
+                         == (rebuilt_scalar ? UINT64_C(1825632000)
+                                            : UINT64_C(1818115200)));
         }
         uint8_t package_digest[32];
         uint64_t package_size = 0;
@@ -619,7 +649,9 @@ static bool test_release_artifacts(void)
                 CHECK(tilefinch_glyph_provider_match(
                     provider, clusters[row], strlen(clusters[row]),
                     &used, &key, &width));
-                CHECK(used == strlen(clusters[row]) && width == 16u);
+                /* Metric packs advance by the cluster's own width, never past a cell. */
+                CHECK(used == strlen(clusters[row])
+                      && width > 0u && width <= 16u);
             }
         }
         if (samples[pack] != NULL
@@ -633,17 +665,14 @@ static bool test_release_artifacts(void)
         if (stage_root != NULL && stage_root[0] != '\0'
             && (stage_all || pack == staged_pack
                 || pack == TILEFINCH_GLYPH_PACK_COLOR_EMOJI)) {
-            char staged_package[TILEFINCH_GLYPH_COMPONENT_PATH_LIMIT];
-            int staged_written = snprintf(
-                staged_package, sizeof(staged_package), "%s/%s.download",
-                stage_root, spec->id);
-            CHECK(staged_written > 0
-                  && (size_t) staged_written < sizeof(staged_package));
-            CHECK(copy_file(package_path, staged_package));
+            char staged_package[TILEFINCH_INSTALL_PATH_LIMIT];
+            CHECK(tilefinch_glyph_component_prepare_download(
+                      stage_root, pack, staged_package,
+                      sizeof(staged_package))
+                  && copy_file(package_path, staged_package));
             TilefinchGlyphComponentInstall *install =
                 tilefinch_glyph_component_install_create(
                     &budget, &(TilefinchGlyphComponentInstallOptions) {
-                        .package_path = staged_package,
                         .envelope = envelope,
                         .envelope_length = envelope_length,
                         .manifest = &verified.manifest,
@@ -775,6 +804,823 @@ static bool test_script_sequence_matching(void)
         CHECK(budget.current == 0);
         CHECK(unlink(path) == 0);
     }
+    return true;
+}
+
+/* Two Cyrillic cells drawn as vertical one-pixel stems. U+0430 also has ink in
+   column 1, outside the column box its table entry gives it. */
+enum { SCALAR_STEM_FIRST_ROW = 3, SCALAR_STEM_LAST_ROW = 12 };
+
+static bool write_scalar_fixture_second(
+    char path[128], const char *component_id, unsigned baseline_rows,
+    const uint8_t columns[2], size_t notice_bytes, unsigned second_low)
+{
+    static const unsigned narrow_stems[] = {1, 6, 10};
+    static const unsigned wide_stems[] = {3, 6, 10, 13};
+    const size_t pages_offset = HEADER_BYTES + DIRECTORY_BYTES;
+    const size_t payload_offset = pages_offset + PAGE_BYTES;
+    const size_t file_size = payload_offset + GLYPH_BYTES * 2u + notice_bytes;
+    uint8_t *bytes = calloc(file_size, 1);
+    CHECK(bytes != NULL);
+    memcpy(bytes, "TFGFv1\0\0", 8);
+    write_u16(bytes + 8, TILEFINCH_GLYPH_COMPONENT_ABI);
+    bytes[10] = TILEFINCH_GLYPH_COMPONENT_MONO;
+    bytes[11] = 16;
+    bytes[12] = 16;
+    bytes[13] = 2;
+    bytes[14] = (uint8_t) strlen(component_id);
+    bytes[15] = (uint8_t) baseline_rows;
+    write_u32(bytes + 16, 2);
+    write_u16(bytes + 20, 1);
+    write_u32(bytes + 24, HEADER_BYTES);
+    write_u32(bytes + 28, (uint32_t) pages_offset);
+    write_u32(bytes + 32, (uint32_t) payload_offset);
+    write_u32(bytes + 36, (uint32_t) payload_offset);
+    write_u32(bytes + 40, (uint32_t) file_size);
+    memcpy(bytes + 44, component_id, strlen(component_id));
+    write_u32(bytes + 72, (uint32_t) notice_bytes);
+    memset(bytes + HEADER_BYTES, 0xff, DIRECTORY_BYTES);
+    write_u16(bytes + HEADER_BYTES + 4u * 2u, 0);
+    uint8_t *page = bytes + pages_offset;
+    page[4 + 0x30u / 8u] |= (uint8_t) (1u << (0x30u & 7u));
+    page[4 + second_low / 8u] |= (uint8_t) (1u << (second_low & 7u));
+    for (unsigned y = SCALAR_STEM_FIRST_ROW; y <= SCALAR_STEM_LAST_ROW; y++) {
+        uint8_t *narrow = bytes + payload_offset + y * 2u;
+        for (size_t at = 0; at < 3u; at++)
+            narrow[narrow_stems[at] / 8u] |=
+                (uint8_t) (0x80u >> (narrow_stems[at] & 7u));
+        uint8_t *wide = bytes + payload_offset + GLYPH_BYTES + y * 2u;
+        for (size_t at = 0; at < 4u; at++)
+            wide[wide_stems[at] / 8u] |=
+                (uint8_t) (0x80u >> (wide_stems[at] & 7u));
+    }
+    if (columns != NULL)
+        memcpy(bytes + file_size - 2u, columns, 2u);
+    snprintf(path, 128, "/tmp/tilefinch-glyph-component-XXXXXX");
+    int descriptor = mkstemp(path);
+    CHECK(descriptor >= 0);
+    FILE *file = fdopen(descriptor, "wb");
+    CHECK(file != NULL);
+    bool written = fwrite(bytes, 1, file_size, file) == file_size
+        && fclose(file) == 0;
+    free(bytes);
+    return written;
+}
+
+static bool write_scalar_fixture(
+    char path[128], const char *component_id, unsigned baseline_rows,
+    const uint8_t columns[2], size_t notice_bytes)
+{
+    return write_scalar_fixture_second(
+        path, component_id, baseline_rows, columns, notice_bytes, 0x48u);
+}
+
+/* The ink of one mid-height row of U+0448, one total per stem, cut at source
+   columns that lie between its stems. */
+static void stem_weights(const FontGlyph *glyph, unsigned weights[4])
+{
+    static const int cuts[] = {0, 5, 8, 12, 16};
+    const unsigned char *row =
+        glyph->pixels + (size_t) (glyph->height / 2) * (size_t) glyph->width;
+    for (size_t stem = 0; stem < 4u; stem++) {
+        weights[stem] = 0;
+        for (int x = cuts[stem] * glyph->width / 16;
+             x < cuts[stem + 1u] * glyph->width / 16; x++)
+            weights[stem] += row[x];
+    }
+}
+
+static bool settled_scalar_glyph(
+    TilefinchGlyphProvider *provider, const FontFace *face, unsigned codepoint,
+    int pixel_height, bool bold, FontGlyph *glyph)
+{
+    uint32_t key = 0;
+    TilefinchGlyphSource source;
+    CHECK(tilefinch_glyph_provider_has_codepoint(
+        provider, codepoint, &key, NULL));
+    if (!tilefinch_glyph_provider_source(provider, key, &source)) {
+        bool changed = false;
+        CHECK(tilefinch_glyph_provider_pump(
+            provider, GLYPH_BYTES * 2u, &changed, NULL) && changed);
+    }
+    CHECK(font_glyph_load(face, codepoint, pixel_height, bold, glyph));
+    CHECK(!glyph->provider_pending);
+    return true;
+}
+
+/* Published packs are square cells drawn at many sizes. However a stem falls
+   against the output grid, it must keep the same weight, or the letters of a
+   word look like different fonts. */
+static bool test_mono_cell_scaling_keeps_stem_weight(void)
+{
+    char path[128];
+    CHECK(write_scalar_fixture(path, "glyph-cyrillic", 0, NULL, 0));
+    Budget budget;
+    budget_init(&budget, 4u * 1024u * 1024u);
+    TilefinchGlyphProvider *provider =
+        tilefinch_glyph_provider_create(&budget);
+    CHECK(provider != NULL
+          && tilefinch_glyph_provider_attach(provider, path, "glyph-cyrillic")
+          && font_optional_glyph_provider_install(provider));
+    FontSet fonts;
+    CHECK(font_set_load(
+        &fonts, &budget, TILEFINCH_TEST_SANS_FONT, NULL, NULL, NULL, NULL,
+        NULL, NULL, 2u * 1024u * 1024u));
+    const FontFace *face = font_set_face(&fonts, FONT_SANS);
+    CHECK(face != NULL);
+    static const int sizes[] = {12, 13, 20, 24, 28};
+    for (size_t at = 0; at < sizeof(sizes) / sizeof(sizes[0]); at++) {
+        FontGlyph glyph;
+        CHECK(settled_scalar_glyph(
+            provider, face, 0x0448u, sizes[at], false, &glyph));
+        CHECK(glyph.width == sizes[at] && glyph.height == sizes[at]);
+        unsigned weights[4];
+        stem_weights(&glyph, weights);
+        unsigned expected = 255u * (unsigned) sizes[at] / 16u;
+        for (size_t stem = 0; stem < 4u; stem++) {
+            if (weights[stem] + 4u < expected
+                || weights[stem] > expected + 4u) {
+                fprintf(stderr, "size %d stem %zu: weight %u, expected %u\n",
+                        sizes[at], stem, weights[stem], expected);
+                return false;
+            }
+        }
+        font_glyph_destroy(face, &glyph);
+    }
+    /* Synthetic bold widens a stem by a whole pixel, including over the
+       partly covered pixel at its edge. */
+    FontGlyph regular, bold;
+    CHECK(settled_scalar_glyph(provider, face, 0x0448u, 28, false, &regular));
+    CHECK(settled_scalar_glyph(provider, face, 0x0448u, 28, true, &bold));
+    unsigned regular_weights[4], bold_weights[4];
+    stem_weights(&regular, regular_weights);
+    stem_weights(&bold, bold_weights);
+    for (size_t stem = 0; stem < 4u; stem++)
+        CHECK(bold_weights[stem] >= regular_weights[stem] + 250u);
+    font_glyph_destroy(face, &regular);
+    font_glyph_destroy(face, &bold);
+    CHECK(font_optional_glyph_provider_uninstall(provider));
+    tilefinch_glyph_provider_destroy(provider);
+    font_set_destroy(&fonts);
+    CHECK(budget.current == 0);
+    (void) remove(path);
+    return true;
+}
+
+/* A combining mark sits on the letter before it, so the two measure and paint as
+   one letter, in bold too. A pack without column boxes keeps its spacing mark. */
+static bool test_metric_pack_marks_sit_on_the_letter(void)
+{
+    /* U+0430: 5 columns from column 6. U+0483: 4 columns from column 4. */
+    static const uint8_t columns[2] = {(4u << 4) | 6u, (3u << 4) | 4u};
+    static const char marked[] = "\xd0\xb0\xd2\x83";
+    char metric_path[128], legacy_path[128];
+    CHECK(write_scalar_fixture_second(
+        metric_path, "glyph-cyrillic", 13, columns, 32, 0x83u));
+    CHECK(write_scalar_fixture_second(
+        legacy_path, "glyph-cyrillic", 0, NULL, 0, 0x83u));
+    Budget budget;
+    budget_init(&budget, 4u * 1024u * 1024u);
+    FontSet fonts;
+    CHECK(font_set_load(
+        &fonts, &budget, TILEFINCH_TEST_SANS_FONT, NULL, NULL, NULL, NULL,
+        NULL, NULL, 2u * 1024u * 1024u));
+    const FontFace *face = font_set_face(&fonts, FONT_SANS);
+    CHECK(face != NULL);
+    TilefinchGlyphProvider *provider =
+        tilefinch_glyph_provider_create(&budget);
+    CHECK(provider != NULL
+          && tilefinch_glyph_provider_attach(
+              provider, metric_path, "glyph-cyrillic")
+          && font_optional_glyph_provider_install(provider));
+    FontGlyph mark, bold, base;
+    CHECK(settled_scalar_glyph(provider, face, 0x0430u, 16, false, &base));
+    CHECK(settled_scalar_glyph(provider, face, 0x0483u, 16, false, &mark));
+    CHECK(settled_scalar_glyph(provider, face, 0x0483u, 16, true, &bold));
+    CHECK(mark.advance_fixed == 0 && mark.advance == 0);
+    CHECK(mark.width == 4 && mark.x_offset == -4 && mark.y_offset == -13);
+    CHECK(bold.advance_fixed == 0 && bold.width == 5 && bold.x_offset == -5);
+    CHECK(base.advance_fixed == 5 * 64 && base.x_offset == 0);
+    CHECK(font_text_width_at_size_fixed(
+              face, marked, strlen(marked), 16 * 64, false) == 5 * 64);
+    CHECK(font_text_width_for_family_at_size_fixed(
+              face, FONT_SYSTEM_SANS, marked, strlen(marked), 16 * 64,
+              false, true) == 5 * 64);
+    font_glyph_destroy(face, &base);
+    font_glyph_destroy(face, &mark);
+    font_glyph_destroy(face, &bold);
+    CHECK(font_optional_glyph_provider_uninstall(provider));
+    tilefinch_glyph_provider_destroy(provider);
+
+    provider = tilefinch_glyph_provider_create(&budget);
+    CHECK(provider != NULL
+          && tilefinch_glyph_provider_attach(
+              provider, legacy_path, "glyph-cyrillic")
+          && font_optional_glyph_provider_install(provider));
+    CHECK(settled_scalar_glyph(provider, face, 0x0483u, 16, false, &mark));
+    CHECK(mark.advance_fixed == 16 * 64 && mark.x_offset == 0
+          && mark.width == 16);
+    font_glyph_destroy(face, &mark);
+    CHECK(font_optional_glyph_provider_uninstall(provider));
+    tilefinch_glyph_provider_destroy(provider);
+    font_set_destroy(&fonts);
+    CHECK(budget.current == 0);
+    (void) remove(metric_path);
+    (void) remove(legacy_path);
+    return true;
+}
+
+/* One Devanagari pack: U+0915, U+0924, U+093F, U+094D and the shaped clusters
+   U+0915 U+093F and U+0924 U+094D U+0915. Consonants ink low rows, the vowel
+   high ones. */
+static bool write_indic_fixture(char path[128])
+{
+    enum { GLYPHS = 6, NOTICE = 32 };
+    const size_t pages_offset = HEADER_BYTES + DIRECTORY_BYTES;
+    const size_t sequences_offset = pages_offset + PAGE_BYTES;
+    const size_t payload_offset = sequences_offset + SEQUENCE_BYTES * 2u;
+    const size_t file_size = payload_offset + GLYPH_BYTES * GLYPHS + NOTICE;
+    uint8_t *bytes = calloc(file_size, 1);
+    CHECK(bytes != NULL);
+    static const char id[] = "glyph-devanagari";
+    memcpy(bytes, "TFGFv1\0\0", 8);
+    write_u16(bytes + 8, TILEFINCH_GLYPH_COMPONENT_ABI);
+    bytes[10] = TILEFINCH_GLYPH_COMPONENT_MONO;
+    bytes[11] = 16;
+    bytes[12] = 16;
+    bytes[13] = 2;
+    bytes[14] = (uint8_t) strlen(id);
+    bytes[15] = 13;
+    write_u32(bytes + 16, GLYPHS);
+    write_u16(bytes + 20, 1);
+    write_u16(bytes + 22, 2);
+    write_u32(bytes + 24, HEADER_BYTES);
+    write_u32(bytes + 28, (uint32_t) pages_offset);
+    write_u32(bytes + 32, (uint32_t) sequences_offset);
+    write_u32(bytes + 36, (uint32_t) payload_offset);
+    write_u32(bytes + 40, (uint32_t) file_size);
+    memcpy(bytes + 44, id, strlen(id));
+    write_u32(bytes + 72, NOTICE);
+    memset(bytes + HEADER_BYTES, 0xff, DIRECTORY_BYTES);
+    write_u16(bytes + HEADER_BYTES + 9u * 2u, 0);
+    uint8_t *page = bytes + pages_offset;
+    static const unsigned lows[] = {0x15u, 0x24u, 0x3fu, 0x4du};
+    for (size_t at = 0; at < 4u; at++)
+        page[4 + lows[at] / 8u] |= (uint8_t) (1u << (lows[at] & 7u));
+    uint8_t *sequence = bytes + sequences_offset;
+    sequence[0] = 2;
+    write_u32(sequence + 4, 4);
+    write_u32(sequence + 8, 0x0915u);
+    write_u32(sequence + 12, 0x093fu);
+    sequence += SEQUENCE_BYTES;
+    sequence[0] = 3;
+    write_u32(sequence + 4, 5);
+    write_u32(sequence + 8, 0x0924u);
+    write_u32(sequence + 12, 0x094du);
+    write_u32(sequence + 16, 0x0915u);
+    uint8_t *payload = bytes + payload_offset;
+    for (unsigned glyph = 0; glyph < GLYPHS; glyph++) {
+        bool vowel = glyph == 2u;
+        unsigned first = vowel ? 0u : 8u;
+        for (unsigned y = first; y < first + 4u; y++)
+            payload[glyph * GLYPH_BYTES + y * 2u] = vowel ? 0xf0u : 0xfcu;
+    }
+    uint8_t *columns = bytes + file_size - GLYPHS;
+    columns[0] = columns[1] = columns[4] = columns[5] = 5u << 4;
+    columns[2] = 3u << 4;
+    columns[3] = 1u << 4;
+    snprintf(path, 128, "/tmp/tilefinch-glyph-component-XXXXXX");
+    int descriptor = mkstemp(path);
+    CHECK(descriptor >= 0);
+    FILE *file = fdopen(descriptor, "wb");
+    CHECK(file != NULL);
+    bool written = fwrite(bytes, 1, file_size, file) == file_size
+        && fclose(file) == 0;
+    free(bytes);
+    return written;
+}
+
+static bool paint_page_text(Budget *budget, FontSet *fonts, const char *text,
+                            uint16_t frame[64u * 32u])
+{
+    char page[256];
+    int length = snprintf(page, sizeof(page),
+        "<!doctype html><html><body style=\"margin:0;background:#fff;color:#000;"
+        "font:16px sans-serif\">%s</body></html>", text);
+    CHECK(length > 0 && (size_t) length < sizeof(page));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument layout = {0};
+    CHECK(document_parse(&document, budget, page, (size_t) length, 24)
+          && stylesheet_build(&sheet, budget, &document, 64));
+    CHECK(layout_build(&layout, budget, &document, &sheet, fonts, NULL, 64));
+    TileCache cache = {0};
+    CHECK(tile_cache_init(&cache, budget, &layout, 4)
+          && tile_cache_set_frame(&cache, frame, 64u * 32u)
+          && tile_cache_render_frame(&cache, 0, 64, 32, NULL));
+    tile_cache_destroy(&cache);
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    return true;
+}
+
+/* The vowels U+093F and U+09BF, U+09C7, U+09C8 read before the consonants they
+   follow in memory. Without a shaped cluster for them the vowel still has to
+   land in front, at the same total width. */
+static bool test_prebase_vowel_leads_an_unlisted_cluster(void)
+{
+    static const char ti[] = "\xe0\xa4\xa4\xe0\xa4\xbf";
+    static const char ti_in_visual_order[] = "\xe0\xa4\xbf\xe0\xa4\xa4";
+    char path[128];
+    CHECK(write_indic_fixture(path));
+    Budget budget;
+    budget_init(&budget, 8u * 1024u * 1024u);
+    budget_install_lexbor(&budget);
+    FontSet fonts;
+    CHECK(font_set_load(
+        &fonts, &budget, TILEFINCH_TEST_SANS_FONT, NULL, NULL, NULL, NULL,
+        NULL, NULL, 2u * 1024u * 1024u));
+    const FontFace *face = font_set_face(&fonts, FONT_SANS);
+    TilefinchGlyphProvider *provider =
+        tilefinch_glyph_provider_create(&budget);
+    CHECK(provider != NULL
+          && tilefinch_glyph_provider_attach(
+              provider, path, "glyph-devanagari")
+          && font_optional_glyph_provider_install(provider));
+    FontGlyph glyph;
+    static const unsigned settled[] = {0x0924u, 0x093fu};
+    for (size_t at = 0; at < 2u; at++) {
+        CHECK(settled_scalar_glyph(provider, face, settled[at], 16, false, &glyph));
+        font_glyph_destroy(face, &glyph);
+    }
+
+    /* U+0924 + U+093F: nothing covers it. */
+    CHECK(font_indic_prebase_vowel(ti, 6u) == 3u);
+    /* U+0915 + U+093F: the pack's own cluster. */
+    CHECK(font_indic_prebase_vowel("\xe0\xa4\x95\xe0\xa4\xbf", 6u) == 0u);
+    /* U+0924 U+094D U+0924 + U+093F: past both consonants. */
+    CHECK(font_indic_prebase_vowel(
+              "\xe0\xa4\xa4\xe0\xa5\x8d\xe0\xa4\xa4\xe0\xa4\xbf", 12u) == 9u);
+    /* U+0915 U+094D U+0915 + U+093F: the last part draws the vowel itself. */
+    CHECK(font_indic_prebase_vowel(
+              "\xe0\xa4\x95\xe0\xa5\x8d\xe0\xa4\x95\xe0\xa4\xbf", 12u) == 0u);
+    /* U+0924 U+094D U+0915 + U+093F: a cluster that ends on the vowel takes
+       the last consonant away from the sequence that would have drawn it. */
+    CHECK(font_indic_prebase_vowel(
+              "\xe0\xa4\xa4\xe0\xa5\x8d\xe0\xa4\x95\xe0\xa4\xbf", 12u) == 9u);
+    /* Bengali U+0995 + U+09C7. */
+    CHECK(font_indic_prebase_vowel("\xe0\xa6\x95\xe0\xa7\x87", 6u) == 3u);
+    CHECK(font_indic_prebase_vowel("\xe0\xa4\xa4x", 4u) == 0u);
+    CHECK(font_indic_prebase_vowel("\xe0\xa4\xa4\xe0\xa4", 5u) == 0u);
+    CHECK(font_indic_prebase_vowel("abc", 3u) == 0u);
+
+    static uint16_t logical[64u * 32u], visual[64u * 32u];
+    CHECK(paint_page_text(&budget, &fonts, ti, logical));
+    CHECK(paint_page_text(&budget, &fonts, ti_in_visual_order, visual));
+    size_t ink = 0;
+    for (size_t at = 0; at < 64u * 32u; at++) ink += logical[at] != 0xffffu;
+    CHECK(ink != 0);
+    CHECK(memcmp(logical, visual, sizeof(logical)) == 0);
+
+    /* The chrome painter draws the same way. */
+    psp_ui_set_chrome_fonts(face, face, 2u);
+    static uint16_t chrome_logical[480u * 272u], chrome_visual[480u * 272u];
+    static PspUiState ui;
+    psp_ui_init(&ui);
+    psp_ui_show_status(&ui, ti, 240);
+    psp_ui_composite(&ui, chrome_logical, 480, 272, 480);
+    psp_ui_init(&ui);
+    psp_ui_show_status(&ui, ti_in_visual_order, 240);
+    psp_ui_composite(&ui, chrome_visual, 480, 272, 480);
+    CHECK(memcmp(chrome_logical, chrome_visual, sizeof(chrome_logical)) == 0);
+    ink = 0;
+    for (size_t at = 0; at < 480u * 272u; at++) ink += chrome_logical[at] != 0;
+    CHECK(ink != 0);
+    psp_ui_clear_chrome_font();
+
+    CHECK(font_optional_glyph_provider_uninstall(provider));
+    tilefinch_glyph_provider_destroy(provider);
+    font_set_destroy(&fonts);
+    CHECK(budget.current == 0);
+    (void) remove(path);
+    return true;
+}
+
+/* U+0410 and U+0411 as scalars, and U+0410 U+0301 as a shaped cluster whose
+   cell holds exactly what U+0411's does. */
+static bool write_capital_mark_fixture(char path[128])
+{
+    enum { GLYPHS = 3, NOTICE = 32 };
+    const size_t pages_offset = HEADER_BYTES + DIRECTORY_BYTES;
+    const size_t sequences_offset = pages_offset + PAGE_BYTES;
+    const size_t payload_offset = sequences_offset + SEQUENCE_BYTES;
+    const size_t file_size = payload_offset + GLYPH_BYTES * GLYPHS + NOTICE;
+    uint8_t *bytes = calloc(file_size, 1);
+    CHECK(bytes != NULL);
+    static const char id[] = "glyph-cyrillic";
+    memcpy(bytes, "TFGFv1\0\0", 8);
+    write_u16(bytes + 8, TILEFINCH_GLYPH_COMPONENT_ABI);
+    bytes[10] = TILEFINCH_GLYPH_COMPONENT_MONO;
+    bytes[11] = 16;
+    bytes[12] = 16;
+    bytes[13] = 2;
+    bytes[14] = (uint8_t) strlen(id);
+    bytes[15] = 13;
+    write_u32(bytes + 16, GLYPHS);
+    write_u16(bytes + 20, 1);
+    write_u16(bytes + 22, 1);
+    write_u32(bytes + 24, HEADER_BYTES);
+    write_u32(bytes + 28, (uint32_t) pages_offset);
+    write_u32(bytes + 32, (uint32_t) sequences_offset);
+    write_u32(bytes + 36, (uint32_t) payload_offset);
+    write_u32(bytes + 40, (uint32_t) file_size);
+    memcpy(bytes + 44, id, strlen(id));
+    write_u32(bytes + 72, NOTICE);
+    memset(bytes + HEADER_BYTES, 0xff, DIRECTORY_BYTES);
+    write_u16(bytes + HEADER_BYTES + 4u * 2u, 0);
+    uint8_t *page = bytes + pages_offset;
+    page[4 + 0x10u / 8u] |= (uint8_t) (1u << (0x10u & 7u));
+    page[4 + 0x11u / 8u] |= (uint8_t) (1u << (0x11u & 7u));
+    uint8_t *sequence = bytes + sequences_offset;
+    sequence[0] = 2;
+    write_u32(sequence + 4, 2);
+    write_u32(sequence + 8, 0x0410u);
+    write_u32(sequence + 12, 0x0301u);
+    uint8_t *payload = bytes + payload_offset;
+    for (unsigned y = 8; y < 12u; y++)
+        payload[y * 2u] = 0xf0u;
+    for (unsigned y = 0; y < 12u; y++) {
+        payload[GLYPH_BYTES + y * 2u] = 0xfcu;
+        payload[GLYPH_BYTES * 2u + y * 2u] = 0xfcu;
+    }
+    uint8_t *columns = bytes + file_size - GLYPHS;
+    columns[0] = 3u << 4;
+    columns[1] = columns[2] = 5u << 4;
+    snprintf(path, 128, "/tmp/tilefinch-glyph-component-XXXXXX");
+    int descriptor = mkstemp(path);
+    CHECK(descriptor >= 0);
+    FILE *file = fdopen(descriptor, "wb");
+    CHECK(file != NULL);
+    bool written = fwrite(bytes, 1, file_size, file) == file_size
+        && fclose(file) == 0;
+    free(bytes);
+    return written;
+}
+
+/* A zero-width mark sits at the height of a small letter, so an accent on a
+   capital collides with it. A pack can list the pair as a shaped cluster. */
+static bool test_capital_and_accent_reach_a_shaped_cluster(void)
+{
+    static const char marked[] = "\xd0\x90\xcc\x81";
+    static const char same_cell[] = "\xd0\x91";
+    char path[128];
+    CHECK(write_capital_mark_fixture(path));
+    Budget budget;
+    budget_init(&budget, 8u * 1024u * 1024u);
+    budget_install_lexbor(&budget);
+    FontSet fonts;
+    CHECK(font_set_load(
+        &fonts, &budget, TILEFINCH_TEST_SANS_FONT, NULL, NULL, NULL, NULL,
+        NULL, NULL, 2u * 1024u * 1024u));
+    const FontFace *face = font_set_face(&fonts, FONT_SANS);
+    TilefinchGlyphProvider *provider =
+        tilefinch_glyph_provider_create(&budget);
+    CHECK(provider != NULL
+          && tilefinch_glyph_provider_attach(provider, path, "glyph-cyrillic")
+          && font_optional_glyph_provider_install(provider));
+    FontGlyph glyph;
+    CHECK(settled_scalar_glyph(provider, face, 0x0411u, 16, false, &glyph));
+    font_glyph_destroy(face, &glyph);
+    size_t used = 0;
+    unsigned key = 0;
+    CHECK(font_optional_glyph_match_sequence(marked, 4u, &used, &key)
+          && used == 4u);
+    /* The cluster's cell sits in its own block. */
+    TilefinchGlyphSource source;
+    if (!tilefinch_glyph_provider_source(provider, key, &source)) {
+        bool changed = false;
+        CHECK(tilefinch_glyph_provider_pump(
+            provider, GLYPH_BYTES * 2u, &changed, NULL) && changed);
+    }
+    /* Other accents and a capital alone keep the ordinary path. */
+    CHECK(!font_optional_glyph_match_sequence("\xd0\x90\xcc\x80", 4u, &used, &key));
+    CHECK(!font_optional_glyph_match_sequence("\xd0\x90x", 3u, &used, &key));
+    CHECK(font_text_width_at_size_fixed(face, marked, 4u, 16 * 64, false)
+          == font_text_width_at_size_fixed(face, same_cell, 2u, 16 * 64, false));
+
+    static uint16_t page[64u * 32u], cell[64u * 32u];
+    CHECK(paint_page_text(&budget, &fonts, marked, page));
+    CHECK(paint_page_text(&budget, &fonts, same_cell, cell));
+    CHECK(memcmp(page, cell, sizeof(page)) == 0);
+
+    psp_ui_set_chrome_fonts(face, face, 2u);
+    static uint16_t chrome_marked[480u * 272u], chrome_cell[480u * 272u];
+    static PspUiState ui;
+    psp_ui_init(&ui);
+    psp_ui_show_status(&ui, marked, 240);
+    psp_ui_composite(&ui, chrome_marked, 480, 272, 480);
+    psp_ui_init(&ui);
+    /* A toast's box counts characters, so match the count with a space. */
+    psp_ui_show_status(&ui, "\xd0\x91 ", 240);
+    psp_ui_composite(&ui, chrome_cell, 480, 272, 480);
+    CHECK(memcmp(chrome_marked, chrome_cell, sizeof(chrome_cell)) == 0);
+    psp_ui_clear_chrome_font();
+
+    CHECK(font_optional_glyph_provider_uninstall(provider));
+    tilefinch_glyph_provider_destroy(provider);
+    font_set_destroy(&fonts);
+    CHECK(budget.current == 0);
+    (void) remove(path);
+    return true;
+}
+
+/* A pack has one weight. Bold text reaches it through a real bold face, which
+   needs no synthesis for its own glyphs, so the pack glyph has to be emboldened
+   there, and measuring must agree with painting. Nothing else may change. */
+static bool test_bold_face_emboldens_pack_glyphs(void)
+{
+    /* U+0430: 5 columns from column 6. U+0448: 12 columns from column 2. */
+    static const uint8_t columns[2] = {(4u << 4) | 6u, (11u << 4) | 2u};
+    static const char wide[] = "\xd1\x88";
+    static const char word[] = "\xd1\x88\xd0\xb0\xd1\x88";
+    static const char latin[] = "Bold Latin";
+    static const char emoji[] = "\xf0\x9f\x98\x80";
+    char metric_path[128], legacy_path[128], color_path[128];
+    CHECK(write_scalar_fixture(metric_path, "glyph-cyrillic", 13, columns, 32));
+    CHECK(write_scalar_fixture(legacy_path, "glyph-cyrillic", 0, NULL, 0));
+    CHECK(write_color_fixture(color_path));
+    Budget budget;
+    budget_init(&budget, 4u * 1024u * 1024u);
+    FontSet fonts;
+    CHECK(font_set_load(
+        &fonts, &budget, TILEFINCH_TEST_SANS_FONT, NULL, NULL,
+        TILEFINCH_TEST_SANS_BOLD_FONT, NULL, NULL, NULL,
+        4u * 1024u * 1024u));
+    const FontFace *regular = font_set_face_variant(
+        &fonts, FONT_SANS, false, false);
+    const FontFace *heavy = font_set_face_variant(
+        &fonts, FONT_SANS, false, true);
+    CHECK(regular != NULL && heavy != NULL && regular != heavy);
+    const int latin_regular = font_text_width_at_size_fixed(
+        regular, latin, strlen(latin), 16 * 64, false);
+    const int latin_heavy = font_text_width_at_size_fixed(
+        heavy, latin, strlen(latin), 16 * 64, false);
+    FontGlyph latin_before;
+    CHECK(font_glyph_load(heavy, 'H', 16, false, &latin_before));
+
+    TilefinchGlyphProvider *provider =
+        tilefinch_glyph_provider_create(&budget);
+    CHECK(provider != NULL
+          && tilefinch_glyph_provider_attach(
+              provider, metric_path, "glyph-cyrillic")
+          && tilefinch_glyph_provider_attach(
+              provider, color_path, "emoji-color-v1")
+          && font_optional_glyph_provider_install(provider));
+
+    /* The stems at columns 3, 6, 10 and 13 each gain one column. */
+    FontGlyph plain, bold;
+    CHECK(settled_scalar_glyph(provider, regular, 0x0448u, 16, false, &plain));
+    CHECK(settled_scalar_glyph(provider, heavy, 0x0448u, 16, false, &bold));
+    CHECK(plain.width == 12 && bold.width == 13);
+    CHECK(plain.y_offset == -13 && bold.y_offset == -13);
+    const unsigned char *plain_row = plain.pixels + 8u * 12u;
+    const unsigned char *bold_row = bold.pixels + 8u * 13u;
+    unsigned plain_ink = 0, bold_ink = 0;
+    for (int x = 0; x < plain.width; x++) plain_ink += plain_row[x];
+    for (int x = 0; x < bold.width; x++) bold_ink += bold_row[x];
+    CHECK(plain_ink == 4u * 255u && bold_ink == 8u * 255u);
+    CHECK(bold_row[1] == 255u && bold_row[2] == 255u && bold_row[3] == 0);
+
+    /* Measuring agrees with the advance that painting uses, at any size and on
+       both width paths, and a real bold face matches synthetic bold. */
+    CHECK(plain.advance_fixed == 12 * 64 && bold.advance_fixed == 13 * 64);
+    CHECK(font_text_width_at_size_fixed(regular, wide, 2, 16 * 64, false)
+          == 12 * 64);
+    CHECK(font_text_width_at_size_fixed(heavy, wide, 2, 16 * 64, false)
+          == 13 * 64);
+    CHECK(font_text_width_at_size_fixed(regular, wide, 2, 16 * 64, true)
+          == 13 * 64);
+    font_glyph_destroy(regular, &plain);
+    font_glyph_destroy(heavy, &bold);
+    FontGlyph narrow;
+    CHECK(settled_scalar_glyph(provider, heavy, 0x0430u, 28, false, &narrow));
+    CHECK(settled_scalar_glyph(provider, heavy, 0x0448u, 28, false, &bold));
+    const int painted = bold.advance_fixed * 2 + narrow.advance_fixed;
+    const int measured = font_text_width_at_size_fixed(
+        heavy, word, strlen(word), 28 * 64, false);
+    CHECK(measured >= painted - 32 && measured <= painted + 32);
+    static const FontFamily families[] = {FONT_SYSTEM_SANS, FONT_HUMANIST_SANS};
+    for (size_t at = 0; at < sizeof(families) / sizeof(families[0]); at++) {
+        const int family = font_text_width_for_family_at_size_fixed(
+            heavy, families[at], word, strlen(word), 28 * 64, false, true);
+        if (family < painted - 32 || family > painted + 32) {
+            fprintf(stderr, "family %d measures %d, paints %d\n",
+                    (int) families[at], family, painted);
+            return false;
+        }
+    }
+    font_glyph_destroy(heavy, &narrow);
+    font_glyph_destroy(heavy, &bold);
+
+    /* Latin keeps its own faces, and color glyphs have no weight to add. */
+    CHECK(font_text_width_at_size_fixed(
+              regular, latin, strlen(latin), 16 * 64, false) == latin_regular);
+    CHECK(font_text_width_at_size_fixed(
+              heavy, latin, strlen(latin), 16 * 64, false) == latin_heavy);
+    FontGlyph latin_after;
+    CHECK(font_glyph_load(heavy, 'H', 16, false, &latin_after));
+    CHECK(latin_after.width == latin_before.width
+          && latin_after.height == latin_before.height
+          && latin_after.advance_fixed == latin_before.advance_fixed
+          && memcmp(latin_after.pixels, latin_before.pixels,
+                    (size_t) latin_after.width
+                        * (size_t) latin_after.height) == 0);
+    font_glyph_destroy(heavy, &latin_after);
+    FontGlyph color_plain, color_bold;
+    CHECK(settled_scalar_glyph(
+        provider, regular, 0x1f600u, 16, false, &color_plain));
+    CHECK(settled_scalar_glyph(
+        provider, heavy, 0x1f600u, 16, false, &color_bold));
+    CHECK(color_plain.colors != NULL && color_bold.colors != NULL);
+    CHECK(color_plain.width == color_bold.width
+          && color_plain.advance_fixed == color_bold.advance_fixed
+          && memcmp(color_plain.pixels, color_bold.pixels,
+                    (size_t) color_plain.width
+                        * (size_t) color_plain.height) == 0);
+    CHECK(font_text_width_at_size_fixed(heavy, emoji, 4, 16 * 64, false)
+          == color_plain.advance_fixed);
+    font_glyph_destroy(regular, &color_plain);
+    font_glyph_destroy(heavy, &color_bold);
+    CHECK(font_optional_glyph_provider_uninstall(provider));
+    tilefinch_glyph_provider_destroy(provider);
+
+    /* A pack with no metrics keeps its one-em advance and still gets heavier. */
+    provider = tilefinch_glyph_provider_create(&budget);
+    CHECK(provider != NULL
+          && tilefinch_glyph_provider_attach(
+              provider, legacy_path, "glyph-cyrillic")
+          && font_optional_glyph_provider_install(provider));
+    CHECK(settled_scalar_glyph(provider, regular, 0x0448u, 16, false, &plain));
+    CHECK(settled_scalar_glyph(provider, heavy, 0x0448u, 16, false, &bold));
+    CHECK(plain.advance_fixed == 16 * 64
+          && bold.advance_fixed == 16 * 64 + 22);
+    CHECK(font_text_width_at_size_fixed(heavy, wide, 2, 16 * 64, false)
+          == 16 * 64 + 22);
+    CHECK(plain.pixels[8u * (size_t) plain.width + 4u] == 0
+          && bold.pixels[8u * (size_t) bold.width + 4u] == 255u);
+    font_glyph_destroy(regular, &plain);
+    font_glyph_destroy(heavy, &bold);
+    CHECK(font_optional_glyph_provider_uninstall(provider));
+    tilefinch_glyph_provider_destroy(provider);
+    font_glyph_destroy(heavy, &latin_before);
+    font_set_destroy(&fonts);
+    CHECK(budget.current == 0);
+    (void) remove(metric_path);
+    (void) remove(legacy_path);
+    (void) remove(color_path);
+    return true;
+}
+
+static bool utf8_is_whole(const char *text)
+{
+    for (size_t at = 0, bytes = strlen(text); at < bytes;) {
+        unsigned value = 0;
+        size_t used = font_utf8_next(text + at, bytes - at, &value);
+        if (used == 0 || value == 0xfffdu) return false;
+        at += used;
+    }
+    return true;
+}
+
+/* Two-byte letters get half as many characters from a byte bound, and a cut
+   that falls inside one draws as a missing glyph at the end of the line. */
+static bool test_player_text_keeps_whole_letters(void)
+{
+    static PspUiMediaState media;
+    static PspUiMediaPresentation presentation;
+    psp_ui_media_init(&media);
+    psp_ui_media_bind_presentation(&media, &presentation);
+    char text[1024];
+    for (size_t odd = 0; odd < 2u; odd++) {
+        size_t at = 0;
+        if (odd != 0) text[at++] = 'x';
+        while (at + 2u < sizeof(text)) {
+            text[at++] = '\xd1';
+            text[at++] = '\x88';
+        }
+        text[at] = '\0';
+        psp_ui_media_set_subtitle(&media, text);
+        CHECK(utf8_is_whole(presentation.subtitle_text));
+        CHECK(strlen(presentation.subtitle_text)
+              >= PSP_UI_MEDIA_SUBTITLE_TEXT_CAPACITY - 2u);
+    }
+    /* Two rows of about 48 Cyrillic letters survive whole. */
+    CHECK(PSP_UI_MEDIA_SUBTITLE_TEXT_CAPACITY > 96u * 2u);
+
+    char *title = text;
+    memset(title, 'x', 300);
+    title[1] = '\xd1'; title[2] = '\x88';
+    title[300] = '\0';
+    title[PSP_UI_MEDIA_TITLE_CAPACITY - 2] = '\xd1';
+    title[PSP_UI_MEDIA_TITLE_CAPACITY - 1] = '\x88';
+    psp_ui_media_set(&media, true, true, false, 0, 0, title);
+    CHECK(utf8_is_whole(media.title));
+    return true;
+}
+
+/* A scalar script's letters share a baseline and keep their own widths. */
+static bool test_scalar_pack_declares_baseline_and_widths(void)
+{
+    /* U+0430: 5 columns from column 6. U+0448: 12 columns from column 2. */
+    static const uint8_t columns[2] = {(4u << 4) | 6u, (11u << 4) | 2u};
+    char path[128];
+    CHECK(write_scalar_fixture(path, "glyph-cyrillic", 13, columns, 32));
+    Budget budget;
+    budget_init(&budget, 4u * 1024u * 1024u);
+    TilefinchGlyphProvider *provider =
+        tilefinch_glyph_provider_create(&budget);
+    CHECK(provider != NULL
+          && tilefinch_glyph_provider_attach(provider, path, "glyph-cyrillic")
+          && font_optional_glyph_provider_install(provider));
+    FontSet fonts;
+    CHECK(font_set_load(
+        &fonts, &budget, TILEFINCH_TEST_SANS_FONT, NULL, NULL, NULL, NULL,
+        NULL, NULL, 2u * 1024u * 1024u));
+    const FontFace *face = font_set_face(&fonts, FONT_SANS);
+    CHECK(face != NULL);
+
+    uint32_t key = 0;
+    unsigned width = 0, height = 0;
+    CHECK(tilefinch_glyph_provider_has_codepoint(
+        provider, 0x0430u, &key, &width) && width == 5u);
+    CHECK(tilefinch_glyph_provider_metrics(
+        provider, key, &width, &height, NULL) && width == 5u && height == 16u);
+    static const char narrow[] = "\xd0\xb0";
+    static const char wide[] = "\xd1\x88";
+    /* Measuring may not read the file, and nothing has been pumped yet. */
+    CHECK(font_text_width_at_size_fixed(face, narrow, 2, 16 * 64, false)
+          == 5 * 64);
+    CHECK(font_text_width_at_size_fixed(face, wide, 2, 16 * 64, false)
+          == 12 * 64);
+    CHECK(font_text_width_at_size_fixed(face, wide, 2, 28 * 64, false)
+          == 21 * 64);
+
+    FontGlyph glyph;
+    CHECK(settled_scalar_glyph(provider, face, 0x0430u, 16, false, &glyph));
+    CHECK(glyph.width == 5 && glyph.height == 16 && glyph.y_offset == -13
+          && glyph.advance == 5);
+    /* Stems at columns 6 and 10 land at the box's edges. Column 1 is cut. */
+    const unsigned char *row = glyph.pixels + 8u * 5u;
+    CHECK(row[0] == 255u && row[1] == 0 && row[2] == 0 && row[3] == 0
+          && row[4] == 255u);
+    font_glyph_destroy(face, &glyph);
+    CHECK(settled_scalar_glyph(provider, face, 0x0430u, 32, false, &glyph));
+    CHECK(glyph.width == 10 && glyph.height == 32 && glyph.y_offset == -26);
+    font_glyph_destroy(face, &glyph);
+    CHECK(font_optional_glyph_provider_uninstall(provider));
+    tilefinch_glyph_provider_destroy(provider);
+    font_set_destroy(&fonts);
+    (void) remove(path);
+    CHECK(budget.current == 0);
+
+    /* The same bytes under a pack with no declared baseline stay square. */
+    CHECK(write_scalar_fixture(path, "glyph-cyrillic", 0, columns, 32));
+    provider = tilefinch_glyph_provider_create(&budget);
+    CHECK(provider != NULL && tilefinch_glyph_provider_attach(
+        provider, path, "glyph-cyrillic"));
+    CHECK(tilefinch_glyph_provider_has_codepoint(
+        provider, 0x0430u, &key, &width) && width == 16u);
+    tilefinch_glyph_provider_destroy(provider);
+    (void) remove(path);
+
+    /* Malformed declarations are refused and leave nothing allocated. */
+    static const uint8_t past_cell[2] = {(15u << 4) | 1u, 0u};
+    static const struct {
+        unsigned baseline_rows;
+        const uint8_t *columns;
+        size_t notice_bytes;
+    } refused[] = {
+        {16, columns, 32},   /* baseline outside the cell */
+        {13, past_cell, 32}, /* a glyph's box runs past the cell */
+        {13, NULL, 1}        /* no room for one byte per glyph */
+    };
+    for (size_t at = 0; at < sizeof(refused) / sizeof(refused[0]); at++) {
+        CHECK(write_scalar_fixture(
+            path, "glyph-cyrillic", refused[at].baseline_rows,
+            refused[at].columns, refused[at].notice_bytes));
+        provider = tilefinch_glyph_provider_create(&budget);
+        CHECK(provider != NULL);
+        size_t retained = budget.current;
+        if (tilefinch_glyph_provider_attach(provider, path, "glyph-cyrillic")) {
+            fprintf(stderr, "refused case %zu was accepted\n", at);
+            return false;
+        }
+        CHECK(budget.current == retained);
+        tilefinch_glyph_provider_destroy(provider);
+        (void) remove(path);
+    }
+    CHECK(budget.current == 0);
     return true;
 }
 
@@ -929,6 +1775,9 @@ static bool test_bounded_pack_provider(void)
     CHECK(hash_file(path, package_digest, &package_size));
     char root[] = "/tmp/tilefinch-glyph-store-XXXXXX";
     CHECK(mkdtemp(root) != NULL);
+    char staged[TILEFINCH_INSTALL_PATH_LIMIT];
+    CHECK(stage_fixture_download(
+        root, TILEFINCH_GLYPH_PACK_JAPANESE, path, staged));
     TilefinchInstallPaths paths = {.slotted = true};
     snprintf(paths.install_root, sizeof(paths.install_root), "%s", root);
     TilefinchUpdateManifest manifest = {
@@ -945,7 +1794,6 @@ static bool test_bounded_pack_provider(void)
     TilefinchGlyphComponentInstall *install =
         tilefinch_glyph_component_install_create(
             &budget, &(TilefinchGlyphComponentInstallOptions) {
-                .package_path = path,
                 .envelope = envelope,
                 .envelope_length = sizeof(envelope),
                 .manifest = &manifest,
@@ -992,11 +1840,13 @@ static bool install_test_generation(
     bool cancel_early)
 {
     const TilefinchGlyphPackSpec *spec = tilefinch_glyph_pack_spec(pack);
-    char package[128];
-    CHECK(spec != NULL && write_fixture(package, spec->id));
+    char fixture[128];
+    char package[TILEFINCH_INSTALL_PATH_LIMIT];
+    CHECK(spec != NULL && write_fixture(fixture, spec->id));
     uint8_t package_digest[32];
     uint64_t package_size = 0;
-    CHECK(hash_file(package, package_digest, &package_size));
+    CHECK(hash_file(fixture, package_digest, &package_size));
+    CHECK(stage_fixture_download(root, pack, fixture, package));
     TilefinchUpdateManifest manifest = {
         .package_format = TILEFINCH_UPDATE_PACKAGE_GLYPH,
         .package_size = package_size
@@ -1009,7 +1859,6 @@ static bool install_test_generation(
     TilefinchGlyphComponentInstall *install =
         tilefinch_glyph_component_install_create(
             budget, &(TilefinchGlyphComponentInstallOptions) {
-                .package_path = package,
                 .envelope = envelope,
                 .envelope_length = sizeof(envelope),
                 .manifest = &manifest,
@@ -1142,7 +1991,6 @@ static TilefinchGlyphComponentInstall *create_fixture_install(
     static const uint8_t manifest_digest[32] = {0x6d};
     return tilefinch_glyph_component_install_create(
         budget, &(TilefinchGlyphComponentInstallOptions) {
-            .package_path = package,
             .envelope = envelope,
             .envelope_length = sizeof(envelope),
             .manifest = &manifest,
@@ -1208,8 +2056,11 @@ static bool test_phase_aware_install_faults(void)
                   && fclose(file) == 0);
         }
 
-        char package[128];
-        CHECK(write_fixture(package, "glyph-ja"));
+        char fixture[128];
+        char package[TILEFINCH_INSTALL_PATH_LIMIT];
+        CHECK(write_fixture(fixture, "glyph-ja"));
+        CHECK(stage_fixture_download(
+            root, TILEFINCH_GLYPH_PACK_JAPANESE, fixture, package));
         bool pre_activation = !reject_sync && faults[at]
             <= TILEFINCH_GLYPH_INSTALL_FAULT_ACTIVATE_CANDIDATE;
         GlyphInstallFault fault = {
@@ -1236,6 +2087,11 @@ static bool test_phase_aware_install_faults(void)
                       &paths, TILEFINCH_GLYPH_PACK_JAPANESE,
                       resolved, sizeof(resolved))
                   && strcmp(resolved, old_active) == 0);
+            /* The retry stages from this directory: only the package stays. */
+            char ready[TILEFINCH_INSTALL_PATH_LIMIT];
+            snprintf(ready, sizeof(ready),
+                     "%s/components/glyph-ja/candidate.tmp/READY", root);
+            CHECK(access(ready, F_OK) != 0);
             tilefinch_glyph_component_install_destroy(install);
             install = create_fixture_install(
                 &budget, root, package, NULL, NULL);
@@ -1290,6 +2146,46 @@ static bool test_phase_aware_install_faults(void)
     return true;
 }
 
+/* IS-18: a block whose read fails leaves the queue (it used to stay at its
+   head, retried every frame ahead of every other block), and a pack whose
+   reads keep failing stops queueing blocks. */
+static bool test_failed_block_read_is_dropped(void)
+{
+    char path[128];
+    CHECK(write_scalar_fixture(path, "glyph-cyrillic", 0, NULL, 0));
+    Budget budget;
+    budget_init(&budget, 4u * 1024u * 1024u);
+    TilefinchGlyphProvider *provider =
+        tilefinch_glyph_provider_create(&budget);
+    CHECK(provider != NULL
+          && tilefinch_glyph_provider_attach(provider, path, "glyph-cyrillic"));
+    uint32_t key = 0;
+    TilefinchGlyphSource source;
+    CHECK(tilefinch_glyph_provider_has_codepoint(provider, 0x0448u, &key,
+                                                 NULL));
+    /* Every payload read fails as a card read error would. */
+    tilefinch_test_faults()->fail_glyph_block_reads = 8u;
+    for (unsigned attempt = 0; attempt < 4u; attempt++) {
+        CHECK(!tilefinch_glyph_provider_source(provider, key, &source)
+              && tilefinch_glyph_provider_key_pending(provider, key));
+        bool changed = true;
+        CHECK(!tilefinch_glyph_provider_pump(
+                  provider, GLYPH_BYTES * 2u, &changed, NULL)
+              && !changed);
+        CHECK(!tilefinch_glyph_provider_key_pending(provider, key));
+        bool idle = tilefinch_glyph_provider_pump(
+            provider, GLYPH_BYTES * 2u, &changed, NULL);
+        CHECK(idle && !changed);
+    }
+    CHECK(!tilefinch_glyph_provider_source(provider, key, &source)
+          && !tilefinch_glyph_provider_key_pending(provider, key)
+          && tilefinch_test_faults()->fail_glyph_block_reads == 4u);
+    tilefinch_test_faults()->fail_glyph_block_reads = 0;
+    tilefinch_glyph_provider_destroy(provider);
+    CHECK(remove(path) == 0 && budget.current == 0);
+    return true;
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2 && strcmp(argv[1], "--session-remove-error-only") == 0)
@@ -1313,11 +2209,27 @@ int main(int argc, char **argv)
         || !test_glyph_session_remove_retirement(false)) return 1;
     for (unsigned mode = 0; mode < 3u; mode++)
         if (!test_glyph_session_install_retirement(mode)) return 1;
+    for (unsigned mode = 0; mode < 3u; mode++)
+        if (!test_glyph_session_lazy_attach(mode)) {
+            fprintf(stderr, "lazy attach mode %u failed\n", mode);
+            return 1;
+        }
     if (!test_glyph_session_installed_status()) return 1;
+    if (!test_glyph_session_client_failure_reported()) return 1;
+    if (!test_glyph_session_install_refusal_reported()) return 1;
+    if (!test_glyph_session_select_failure_reasons()) return 1;
     if (!test_pack_catalog()) return 1;
     if (!test_authored_sample_packed_pixels()) return 1;
     if (!test_script_sequence_matching()) return 1;
     if (!test_bounded_pack_provider()) return 1;
+    if (!test_mono_cell_scaling_keeps_stem_weight()) return 1;
+    if (!test_failed_block_read_is_dropped()) return 1;
+    if (!test_scalar_pack_declares_baseline_and_widths()) return 1;
+    if (!test_bold_face_emboldens_pack_glyphs()) return 1;
+    if (!test_metric_pack_marks_sit_on_the_letter()) return 1;
+    if (!test_prebase_vowel_leads_an_unlisted_cluster()) return 1;
+    if (!test_capital_and_accent_reach_a_shaped_cluster()) return 1;
+    if (!test_player_text_keeps_whole_letters()) return 1;
     if (!test_new_pack_store_lifecycle()) return 1;
     if (!test_phase_aware_install_faults()) return 1;
     if (!test_release_artifacts()) return 1;

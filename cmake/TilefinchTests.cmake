@@ -22,6 +22,58 @@ if(PSP_BROWSER_BUILD_TESTS)
         add_executable(${target} ${ARGN})
         set_property(GLOBAL APPEND PROPERTY TILEFINCH_TEST_BINARIES ${target})
     endfunction()
+    # A test decided by its output and its exit status together:
+    #   tilefinch_add_output_test(<name> COMMAND <program> <args>...
+    #       EXPECT <pattern>... [REJECT <pattern>...] TIMEOUT <seconds>)
+    # cmake/RunOutputTest.cmake runs the command; it passes only when the
+    # command exits 0, every EXPECT pattern matches and no REJECT pattern
+    # does. The sanitizer and CHECK failure lines are always rejected. Use
+    # this, never CTest's own output patterns: those ignore the exit status.
+    set(TILEFINCH_OUTPUT_TEST_REJECT
+        "AddressSanitizer" "LeakSanitizer" "UndefinedBehaviorSanitizer"
+        "runtime error: " "CHECK failed")
+    function(tilefinch_add_output_test name)
+        cmake_parse_arguments(PARSE_ARGV 1 arg "" "TIMEOUT"
+            "COMMAND;EXPECT;REJECT")
+        if(NOT arg_COMMAND OR NOT arg_EXPECT OR NOT arg_TIMEOUT
+           OR arg_UNPARSED_ARGUMENTS)
+            message(FATAL_ERROR "tilefinch_add_output_test(${name}) needs "
+                "COMMAND, EXPECT and TIMEOUT")
+        endif()
+        list(POP_FRONT arg_COMMAND program)
+        if(TARGET "${program}")
+            set(program "$<TARGET_FILE:${program}>")
+        endif()
+        # The runner stops the command first, so a hang reports the
+        # runner's own failure inside CTest's unchanged timeout.
+        set(command_timeout ${arg_TIMEOUT})
+        if(arg_TIMEOUT GREATER 4)
+            math(EXPR command_timeout "${arg_TIMEOUT} - 2")
+        endif()
+        set(spec "set(TILEFINCH_OUTPUT_TIMEOUT ${command_timeout})\n")
+        string(APPEND spec "set(TILEFINCH_EXPECT")
+        foreach(pattern IN LISTS arg_EXPECT)
+            string(APPEND spec "\n    [==[${pattern}]==]")
+        endforeach()
+        string(APPEND spec ")\nset(TILEFINCH_REJECT")
+        foreach(pattern IN LISTS arg_REJECT TILEFINCH_OUTPUT_TEST_REJECT)
+            string(APPEND spec "\n    [==[${pattern}]==]")
+        endforeach()
+        string(APPEND spec ")\n")
+        set(spec_file "${CMAKE_CURRENT_BINARY_DIR}/output-tests/${name}.cmake")
+        set(written "")
+        if(EXISTS "${spec_file}")
+            file(READ "${spec_file}" written)
+        endif()
+        if(NOT written STREQUAL spec)
+            file(WRITE "${spec_file}" "${spec}")
+        endif()
+        add_test(NAME ${name}
+            COMMAND ${CMAKE_COMMAND} -DTILEFINCH_OUTPUT_SPEC=${spec_file}
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/RunOutputTest.cmake
+                -- ${program} ${arg_COMMAND})
+        set_tests_properties(${name} PROPERTIES TIMEOUT ${arg_TIMEOUT})
+    endfunction()
     find_package(Threads REQUIRED)
     tilefinch_add_test_binary(tilefinch-lexbor-table-tests tests/test_lexbor_tables.c)
     target_link_libraries(tilefinch-lexbor-table-tests PRIVATE lexbor_static)
@@ -71,6 +123,11 @@ if(PSP_BROWSER_BUILD_TESTS)
     add_test(NAME tilefinch-dom-intrinsics-tests COMMAND tilefinch-dom-intrinsics-tests)
     set_tests_properties(tilefinch-dom-intrinsics-tests PROPERTIES
         LABELS "tilefinch;unit;script;dom" TIMEOUT 20)
+    tilefinch_add_test_binary(tilefinch-dom-native-reentry-tests tests/test_dom_native_reentry.c)
+    target_link_libraries(tilefinch-dom-native-reentry-tests PRIVATE tilefinch_core)
+    add_test(NAME tilefinch-dom-native-reentry-tests COMMAND tilefinch-dom-native-reentry-tests)
+    set_tests_properties(tilefinch-dom-native-reentry-tests PROPERTIES
+        LABELS "tilefinch;unit;script;dom" TIMEOUT 30)
     tilefinch_add_test_binary(tilefinch-ui-language-tests tests/test_ui_language.c)
     target_link_libraries(tilefinch-ui-language-tests PRIVATE tilefinch_core)
     target_compile_definitions(tilefinch-ui-language-tests PRIVATE
@@ -103,8 +160,15 @@ if(PSP_BROWSER_BUILD_TESTS)
             TILEFINCH_UI_RESOURCE_ROOT="${TILEFINCH_UI_RESOURCE_ROOT}")
         add_dependencies(tilefinch-ui-language-layout-tests tilefinch-ui-resources)
         add_test(NAME tilefinch-ui-language-layout-tests COMMAND tilefinch-ui-language-layout-tests)
+        # The test paints every chrome screen in every language, which takes
+        # over two minutes under the sanitizers.
+        if(CMAKE_C_FLAGS MATCHES "-fsanitize")
+            set(TILEFINCH_UI_LAYOUT_TEST_TIMEOUT 240)
+        else()
+            set(TILEFINCH_UI_LAYOUT_TEST_TIMEOUT 60)
+        endif()
         set_tests_properties(tilefinch-ui-language-layout-tests PROPERTIES
-            LABELS "tilefinch;unit;ui;visual" TIMEOUT 60)
+            LABELS "tilefinch;unit;ui;visual" TIMEOUT ${TILEFINCH_UI_LAYOUT_TEST_TIMEOUT})
         add_test(NAME tilefinch-ui-translations-generated-check
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/generate_ui_translations.py
                 --check --resource-dir "${TILEFINCH_UI_RESOURCE_ROOT}")
@@ -166,6 +230,16 @@ if(PSP_BROWSER_BUILD_TESTS)
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_load_timeline.py)
         set_tests_properties(tilefinch-load-timeline-tests PROPERTIES
             LABELS "tilefinch;unit;performance;tooling" TIMEOUT 10)
+        add_test(NAME tilefinch-perf-journey-metrics-tests
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_perf_journey_metrics.py)
+        set_tests_properties(tilefinch-perf-journey-metrics-tests PROPERTIES
+            LABELS "tilefinch;unit;performance;tooling" TIMEOUT 10)
+        add_test(NAME tilefinch-census-tools-tests
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_census_tools.py)
+        set_tests_properties(tilefinch-census-tools-tests PROPERTIES
+            LABELS "tilefinch;unit;tooling" TIMEOUT 10)
         add_test(NAME tilefinch-buffered-reply-harness-tests
             COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_buffered_reply_harness.py)
@@ -293,6 +367,19 @@ if(PSP_BROWSER_BUILD_TESTS)
                 ${CMAKE_CURRENT_SOURCE_DIR} PspSdkContractTests)
         set_tests_properties(tilefinch-psp-sdk-contract-tests PROPERTIES
             LABELS "tilefinch;unit;psp;architecture"
+            TIMEOUT 60)
+        # The PSPLink wrapper cases run the real shell wrapper against mock
+        # host tools with wall-clock bounds (a 2 s bridge start, a 5 s
+        # readiness wait). Under a loaded -j8 gate its polls starved past
+        # them, so it is its own test and reserves half the slots instead of
+        # the bounds being raised.
+        add_test(NAME tilefinch-psp-sdk-psplink-wrapper-tests
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_psp_sdk_contracts.py
+                ${CMAKE_CURRENT_SOURCE_DIR} PspLinkWrapperTimingTests)
+        set_tests_properties(tilefinch-psp-sdk-psplink-wrapper-tests PROPERTIES
+            LABELS "tilefinch;unit;psp;tooling"
+            PROCESSORS 4
             TIMEOUT 60)
         # The QuickJS variant case runs nine real CMake configures that copy
         # and patch the vendored engine (about 22 s alone, over 60 s at load
@@ -546,6 +633,13 @@ if(PSP_BROWSER_BUILD_TESTS)
     add_test(NAME tilefinch-media-hls-tests COMMAND tilefinch-media-hls-tests)
     set_tests_properties(tilefinch-media-hls-tests PROPERTIES
         LABELS "tilefinch;unit;media;network;parser" TIMEOUT 30)
+    tilefinch_add_test_binary(tilefinch-media-mp3-tests tests/test_media_mp3.c)
+    target_link_libraries(tilefinch-media-mp3-tests PRIVATE tilefinch_core)
+    target_compile_definitions(tilefinch-media-mp3-tests PRIVATE
+        TILEFINCH_MP3_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/media-mp3")
+    add_test(NAME tilefinch-media-mp3-tests COMMAND tilefinch-media-mp3-tests)
+    set_tests_properties(tilefinch-media-mp3-tests PROPERTIES
+        LABELS "tilefinch;unit;media;network;parser" TIMEOUT 30)
     tilefinch_add_test_binary(tilefinch-media-worker-request-tests
         tests/test_media_worker_request.c)
     target_link_libraries(tilefinch-media-worker-request-tests PRIVATE
@@ -575,6 +669,18 @@ if(PSP_BROWSER_BUILD_TESTS)
         COMMAND tilefinch-psp-media-hls-transport-tests)
     set_tests_properties(tilefinch-psp-media-hls-transport-tests PROPERTIES
         LABELS "tilefinch;unit;media;network" TIMEOUT 30)
+    # Includes src/media_http.c with the background worker scripted, so a
+    # test decides how much of each window has arrived before every read.
+    tilefinch_add_test_binary(tilefinch-media-http-window-tests
+        tests/test_media_http_windows.c)
+    target_include_directories(tilefinch-media-http-window-tests
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(tilefinch-media-http-window-tests PRIVATE
+        tilefinch_core)
+    add_test(NAME tilefinch-media-http-window-tests
+        COMMAND tilefinch-media-http-window-tests)
+    set_tests_properties(tilefinch-media-http-window-tests PROPERTIES
+        LABELS "tilefinch;unit;media;network" TIMEOUT 60)
     # A recorded HLS stream and MP4 replayed through the PSP media path
     # (psp_media_hls.c over the background-transport replay lane, the probe
     # and the range source) with no network.
@@ -696,6 +802,16 @@ if(PSP_BROWSER_BUILD_TESTS)
         LABELS "tilefinch;unit;security;web-platform"
         TIMEOUT 60)
 
+    tilefinch_add_test_binary(tilefinch-document-write-tests
+        tests/test_document_write_scripts.c)
+    target_link_libraries(tilefinch-document-write-tests
+        PRIVATE tilefinch_core)
+    add_test(NAME tilefinch-document-write-tests
+        COMMAND tilefinch-document-write-tests)
+    set_tests_properties(tilefinch-document-write-tests PROPERTIES
+        LABELS "tilefinch;unit;web-platform"
+        TIMEOUT 60)
+
     tilefinch_add_test_binary(tilefinch-resource-integrity-tests
         tests/test_resource_integrity.c)
     target_link_libraries(tilefinch-resource-integrity-tests
@@ -754,6 +870,7 @@ if(PSP_BROWSER_BUILD_TESTS)
     target_compile_definitions(tilefinch-glyph-component-tests PRIVATE
         TILEFINCH_GLYPH_SESSION_TEST_SEAM=1
         TILEFINCH_TEST_SANS_FONT="${PSP_BROWSER_SANS_FONT}"
+        TILEFINCH_TEST_SANS_BOLD_FONT="${PSP_BROWSER_SANS_BOLD_FONT}"
         TILEFINCH_TEST_PSP_SANS_FONT="${PSP_BROWSER_PSP_SANS_FONT}")
     add_test(NAME tilefinch-glyph-component-tests
         COMMAND tilefinch-glyph-component-tests)
@@ -788,12 +905,27 @@ if(PSP_BROWSER_BUILD_TESTS)
         LABELS "tilefinch;unit;security;update;tooling"
         TIMEOUT 30)
     if(NOT PSP)
+        # The recorded update route (scripts/make-update-replay.py): a keyed
+        # trace through replay, the signed client and the installer.
+        tilefinch_add_test_binary(tilefinch-update-replay-probe
+            tests/update_replay_probe.c)
+        target_link_libraries(tilefinch-update-replay-probe
+            PRIVATE tilefinch_core)
+        add_test(NAME tilefinch-update-replay-route-tests
+            COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_update_replay_route.py"
+                    $<TARGET_FILE:tilefinch-update-replay-probe>)
+        set_tests_properties(tilefinch-update-replay-route-tests PROPERTIES
+            LABELS "tilefinch;unit;security;update;tooling"
+            TIMEOUT 60
+            SKIP_RETURN_CODE 77)
         add_test(NAME tilefinch-local-update-server-tests
             COMMAND "${Python3_EXECUTABLE}"
                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_local_update_server.py")
         set_tests_properties(tilefinch-local-update-server-tests PROPERTIES
             LABELS "tilefinch;unit;security;update;tooling;network"
-            TIMEOUT 30)
+            TIMEOUT 30
+            SKIP_RETURN_CODE 77)
     endif()
 
     tilefinch_add_test_binary(tilefinch-session-persistence-tests
@@ -891,6 +1023,18 @@ if(PSP_BROWSER_BUILD_TESTS)
         # parser watchdog time. A counting clock cannot model its independent
         # worker; parallel CPU-heavy fixtures inflate the wall-time ratchet.
         RUN_SERIAL TRUE TIMEOUT 30)
+    # In-place sheet changes equal a whole-sheet rebuild on the fixtures
+    # that drive them (TILEFINCH_TRACE_STYLE_APPEND_VERIFY=1). The verifier
+    # is host trace code, compiled out with PSP_BROWSER_DISABLE_TRACE.
+    if(NOT PSP_BROWSER_DISABLE_TRACE)
+        add_test(NAME tilefinch-style-append-verify-tests
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_style_append_verify.py
+                $<TARGET_FILE:tilefinch-navigation-load-tests>)
+        set_tests_properties(tilefinch-style-append-verify-tests PROPERTIES
+            LABELS "tilefinch;unit;style;navigation"
+            TIMEOUT 60)
+    endif()
 
     tilefinch_add_test_binary(tilefinch-browser-engine-tests
         tests/test_browser_engine.c
@@ -955,6 +1099,17 @@ if(PSP_BROWSER_BUILD_TESTS)
         LABELS "tilefinch;unit;navigation;security;psp"
         TIMEOUT 60)
 
+    tilefinch_add_test_binary(tilefinch-page-dialog-tests
+        tests/test_page_dialogs.c)
+    target_link_libraries(tilefinch-page-dialog-tests PRIVATE
+        tilefinch_core)
+    add_test(NAME tilefinch-page-dialog-tests
+        COMMAND tilefinch-page-dialog-tests
+        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+    set_tests_properties(tilefinch-page-dialog-tests PROPERTIES
+        LABELS "tilefinch;unit;security;web-platform"
+        TIMEOUT 60)
+
     tilefinch_add_test_binary(tilefinch-browser-profile-tests
         tests/test_browser_profile.c)
     target_link_libraries(tilefinch-browser-profile-tests PRIVATE tilefinch_core)
@@ -964,6 +1119,12 @@ if(PSP_BROWSER_BUILD_TESTS)
         LABELS "tilefinch;unit;storage;psp"
         TIMEOUT 10)
 
+    tilefinch_add_test_binary(tilefinch-img-relayout-tests tests/test_img_relayout.c)
+    target_link_libraries(tilefinch-img-relayout-tests PRIVATE tilefinch_core)
+    add_test(NAME tilefinch-img-relayout-tests COMMAND tilefinch-img-relayout-tests)
+    tilefinch_add_test_binary(tilefinch-page-press-preview-tests tests/test_page_press_preview.c)
+    target_link_libraries(tilefinch-page-press-preview-tests PRIVATE tilefinch_core)
+    add_test(NAME tilefinch-page-press-preview-tests COMMAND tilefinch-page-press-preview-tests)
     tilefinch_add_test_binary(tilefinch-page-zoom-tests tests/test_page_zoom.c)
     target_link_libraries(tilefinch-page-zoom-tests PRIVATE tilefinch_core)
     add_test(NAME tilefinch-page-zoom-tests COMMAND tilefinch-page-zoom-tests)
@@ -987,6 +1148,16 @@ if(PSP_BROWSER_BUILD_TESTS)
         LABELS "tilefinch;unit;network;security;psp"
         TIMEOUT 10)
 
+    tilefinch_add_test_binary(tilefinch-content-blocker-page-tests
+        tests/test_content_blocker_pages.c)
+    target_link_libraries(tilefinch-content-blocker-page-tests
+        PRIVATE tilefinch_core)
+    add_test(NAME tilefinch-content-blocker-page-tests
+        COMMAND tilefinch-content-blocker-page-tests)
+    set_tests_properties(tilefinch-content-blocker-page-tests PROPERTIES
+        LABELS "tilefinch;unit;network;web-platform"
+        TIMEOUT 30)
+
     tilefinch_add_test_binary(tilefinch-browser-tabs-tests
         tests/test_browser_tabs.c)
     target_link_libraries(tilefinch-browser-tabs-tests PRIVATE tilefinch_core)
@@ -1007,6 +1178,18 @@ if(PSP_BROWSER_BUILD_TESTS)
         LABELS "tilefinch;unit;storage;psp"
         TIMEOUT 10)
 
+    tilefinch_add_test_binary(tilefinch-offline-download-resolve-tests
+        tests/test_offline_download_resolve.c)
+    target_link_libraries(tilefinch-offline-download-resolve-tests
+        PRIVATE tilefinch_core)
+    target_compile_definitions(tilefinch-offline-download-resolve-tests
+        PRIVATE TILEFINCH_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME tilefinch-offline-download-resolve-tests
+        COMMAND tilefinch-offline-download-resolve-tests)
+    set_tests_properties(tilefinch-offline-download-resolve-tests PROPERTIES
+        LABELS "tilefinch;unit;storage;media;psp"
+        TIMEOUT 20)
+
     tilefinch_add_test_binary(tilefinch-popunder-guard-tests
         tests/test_popunder_guard.c)
     target_link_libraries(tilefinch-popunder-guard-tests PRIVATE tilefinch_core)
@@ -1017,14 +1200,14 @@ if(PSP_BROWSER_BUILD_TESTS)
 
     tilefinch_add_test_binary(tilefinch-file-download-tests
         tests/test_file_download.c src/psp_offline_store.c)
-    target_link_libraries(tilefinch-file-download-tests PRIVATE tilefinch_core)
+    target_link_libraries(tilefinch-file-download-tests PRIVATE tilefinch_psp_ui)
     add_test(NAME tilefinch-file-download-tests COMMAND tilefinch-file-download-tests)
     set_tests_properties(tilefinch-file-download-tests PROPERTIES
         LABELS "tilefinch;unit;storage;psp" TIMEOUT 30)
 
     tilefinch_add_test_binary(tilefinch-zip-install-tests
         tests/test_zip_install.c src/psp_offline_store.c)
-    target_link_libraries(tilefinch-zip-install-tests PRIVATE tilefinch_core)
+    target_link_libraries(tilefinch-zip-install-tests PRIVATE tilefinch_psp_ui)
     add_test(NAME tilefinch-zip-install-tests COMMAND tilefinch-zip-install-tests)
     set_tests_properties(tilefinch-zip-install-tests PROPERTIES
         LABELS "tilefinch;unit;storage;security;psp" TIMEOUT 30)
@@ -1044,7 +1227,7 @@ if(PSP_BROWSER_BUILD_TESTS)
     tilefinch_add_test_binary(tilefinch-offline-app-launch-tests
         tests/test_offline_app_launch.c src/psp_offline_store.c)
     target_link_libraries(tilefinch-offline-app-launch-tests
-        PRIVATE tilefinch_core)
+        PRIVATE tilefinch_psp_ui)
     target_compile_definitions(tilefinch-offline-app-launch-tests PRIVATE
         TILEFINCH_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME tilefinch-offline-app-launch-tests
@@ -1309,6 +1492,20 @@ if(PSP_BROWSER_BUILD_TESTS)
         LABELS "tilefinch;unit;psp;lifecycle"
         TIMEOUT 10)
 
+    # The recorded update route's sidecar (validation-only seam in
+    # src/psp_update_e2e.c): refusals that keep it off the user's install.
+    tilefinch_add_test_binary(tilefinch-psp-update-route-tests
+        tests/test_psp_update_route.c
+        src/psp_update_route.c
+        src/install_paths.c)
+    target_include_directories(tilefinch-psp-update-route-tests
+        PRIVATE include)
+    add_test(NAME tilefinch-psp-update-route-tests
+        COMMAND tilefinch-psp-update-route-tests)
+    set_tests_properties(tilefinch-psp-update-route-tests PROPERTIES
+        LABELS "tilefinch;unit;psp;update"
+        TIMEOUT 10)
+
     tilefinch_add_test_binary(tilefinch-psp-update-session-tests
         tests/test_psp_update_session.c)
     target_link_libraries(tilefinch-psp-update-session-tests
@@ -1480,6 +1677,27 @@ if(PSP_BROWSER_BUILD_TESTS)
         LABELS "tilefinch;unit;javascript;conformance"
         TIMEOUT 30)
 
+    tilefinch_add_test_binary(tilefinch-web-forms-dom-tests
+        tests/test_web_forms_dom.c)
+    target_link_libraries(tilefinch-web-forms-dom-tests PRIVATE tilefinch_core)
+    target_compile_definitions(tilefinch-web-forms-dom-tests PRIVATE
+        TILEFINCH_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME tilefinch-web-forms-dom-tests
+        COMMAND tilefinch-web-forms-dom-tests)
+    set_tests_properties(tilefinch-web-forms-dom-tests PROPERTIES
+        LABELS "tilefinch;unit;javascript;conformance"
+        TIMEOUT 60)
+
+    tilefinch_add_test_binary(tilefinch-web-platform-conformance-tests
+        tests/test_web_platform_conformance.c)
+    target_link_libraries(tilefinch-web-platform-conformance-tests
+        PRIVATE tilefinch_core)
+    add_test(NAME tilefinch-web-platform-conformance-tests
+        COMMAND tilefinch-web-platform-conformance-tests)
+    set_tests_properties(tilefinch-web-platform-conformance-tests PROPERTIES
+        LABELS "tilefinch;unit;javascript;conformance"
+        TIMEOUT 60)
+
     tilefinch_add_test_binary(tilefinch-module-bytecode-tests
         tests/test_module_bytecode.c)
     target_link_libraries(tilefinch-module-bytecode-tests PRIVATE tilefinch_core)
@@ -1616,28 +1834,26 @@ if(PSP_BROWSER_BUILD_TESTS)
         COMMENT "Recording Treadline's standard scenarios in PPSSPP (about 10 minutes)")
     endif()
 
-    add_test(NAME tilefinch-usability-probe-read-only
+    tilefinch_add_output_test(tilefinch-usability-probe-read-only
         COMMAND psp-browser-interactive-lab
             --fixture ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/usability-probe-inert.html
-            --fetch-scripts --ticks 2 --probe-usability --no-loop-capture)
-    set_tests_properties(tilefinch-usability-probe-read-only PROPERTIES
-        PASS_REGULAR_EXPRESSION
-            "usability-probe focus=ready.*activation=not-run.*handlers=0/0 network=0/0"
-        FAIL_REGULAR_EXPRESSION "CLICKED_BY_PROBE;activations=[1-9]"
-        LABELS "tilefinch;unit;acceptance;tooling;javascript"
+            --fetch-scripts --ticks 2 --probe-usability --no-loop-capture
+        EXPECT "usability-probe focus=ready.*activation=not-run.*handlers=0/0 network=0/0"
+        REJECT "CLICKED_BY_PROBE;activations=[1-9]"
         TIMEOUT 10)
+    set_tests_properties(tilefinch-usability-probe-read-only PROPERTIES
+        LABELS "tilefinch;unit;acceptance;tooling;javascript")
 
-    add_test(NAME tilefinch-blank-reader-recurring-recovery
+    tilefinch_add_output_test(tilefinch-blank-reader-recurring-recovery
         COMMAND psp-browser-interactive-lab
             --fixture
                 ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/reader-recovery-recurring.html
             --fetch-scripts --ticks 16 --tick-ms 20 --pace-real-time
-            --no-loop-capture)
-    set_tests_properties(tilefinch-blank-reader-recurring-recovery PROPERTIES
-        PASS_REGULAR_EXPRESSION
-            "(basic|reader)-recovery available=yes.*applied=yes activated=yes"
-        LABELS "tilefinch;unit;acceptance;tooling;javascript;reader;lifecycle"
+            --no-loop-capture
+        EXPECT "(basic|reader)-recovery available=yes.*applied=yes activated=yes"
         TIMEOUT 10)
+    set_tests_properties(tilefinch-blank-reader-recurring-recovery PROPERTIES
+        LABELS "tilefinch;unit;acceptance;tooling;javascript;reader;lifecycle")
 
     add_test(NAME tilefinch-actionable-page-qualification
         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/run-actionable-page-qualification.sh
@@ -1649,76 +1865,71 @@ if(PSP_BROWSER_BUILD_TESTS)
         TIMEOUT 15)
 
     if(PSP_BROWSER_JS_PROPERTY_FAULT_TRACE)
-        add_test(NAME tilefinch-property-miss-trace-tests
+        tilefinch_add_output_test(tilefinch-property-miss-trace-tests
             COMMAND psp-browser-interactive-lab
                 --fixture
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/property_miss_trace.html
                 --no-external-resources
                 --ticks 1
-                --no-loop-capture)
+                --no-loop-capture
+            EXPECT "quickjs-property-miss.*base=object.*property=\\\"optionalStandardFeature\\\""
+            TIMEOUT 10)
         set_tests_properties(tilefinch-property-miss-trace-tests PROPERTIES
             ENVIRONMENT "TILEFINCH_TRACE_JS_PROPERTY_FAULTS=16"
-            PASS_REGULAR_EXPRESSION
-                "quickjs-property-miss.*base=object.*property=\\\"optionalStandardFeature\\\""
-            LABELS "tilefinch;unit;javascript;diagnostic"
-            TIMEOUT 10)
+            LABELS "tilefinch;unit;javascript;diagnostic")
 
-        add_test(NAME tilefinch-property-absent-trace-tests
+        tilefinch_add_output_test(tilefinch-property-absent-trace-tests
             COMMAND psp-browser-interactive-lab
                 --fixture
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/property_miss_trace.html
                 --no-external-resources
                 --ticks 1
-                --no-loop-capture)
+                --no-loop-capture
+            EXPECT "quickjs-property-absent.*base=object.*property=\\\"<string:12:missingViaIn>\\\""
+            TIMEOUT 10)
         set_tests_properties(tilefinch-property-absent-trace-tests PROPERTIES
             ENVIRONMENT "TILEFINCH_TRACE_JS_PROPERTY_FAULTS=absent"
-            PASS_REGULAR_EXPRESSION
-                "quickjs-property-absent.*base=object.*property=\\\"<string:12:missingViaIn>\\\""
-            LABELS "tilefinch;unit;javascript;diagnostic"
-            TIMEOUT 10)
+            LABELS "tilefinch;unit;javascript;diagnostic")
 
-        add_test(NAME tilefinch-property-fault-trace-tests
+        tilefinch_add_output_test(tilefinch-property-fault-trace-tests
             COMMAND psp-browser-interactive-lab
                 --fixture
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/property_fault_trace.html
                 --no-external-resources
                 --ticks 1
-                --no-loop-capture)
+                --no-loop-capture
+            EXPECT "quickjs-property-fault.*base=undefined.*property=\\\"<string:12:computed-key>\\\""
+            TIMEOUT 10)
         set_tests_properties(tilefinch-property-fault-trace-tests PROPERTIES
             ENVIRONMENT "TILEFINCH_TRACE_JS_PROPERTY_FAULTS=16"
-            PASS_REGULAR_EXPRESSION
-                "quickjs-property-fault.*base=undefined.*property=\\\"<string:12:computed-key>\\\""
-            LABELS "tilefinch;unit;javascript;diagnostic"
-            TIMEOUT 10)
+            LABELS "tilefinch;unit;javascript;diagnostic")
 
-        add_test(NAME tilefinch-property-fault-only-trace-tests
+        tilefinch_add_output_test(tilefinch-property-fault-only-trace-tests
             COMMAND psp-browser-interactive-lab
                 --fixture
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/property_fault_trace.html
                 --no-external-resources
                 --ticks 1
-                --no-loop-capture)
+                --no-loop-capture
+            EXPECT "quickjs-property-fault.*base=undefined.*property=\\\"<string:12:computed-key>\\\""
+            REJECT "quickjs-property-miss"
+            TIMEOUT 10)
         set_tests_properties(tilefinch-property-fault-only-trace-tests PROPERTIES
             ENVIRONMENT "TILEFINCH_TRACE_JS_PROPERTY_FAULTS=fault"
-            PASS_REGULAR_EXPRESSION
-                "quickjs-property-fault.*base=undefined.*property=\\\"<string:12:computed-key>\\\""
-            FAIL_REGULAR_EXPRESSION "quickjs-property-miss"
-            LABELS "tilefinch;unit;javascript;diagnostic"
-            TIMEOUT 10)
+            LABELS "tilefinch;unit;javascript;diagnostic")
 
-        add_test(NAME tilefinch-property-write-fault-trace-tests
+        tilefinch_add_output_test(tilefinch-property-write-fault-trace-tests
             COMMAND psp-browser-interactive-lab
                 --fixture
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/property_fault_trace.html
                 --no-external-resources
                 --ticks 1
-                --no-loop-capture)
+                --no-loop-capture
+            EXPECT "quickjs-property-fault.*base=undefined.*property=\\\"<string:12:write-target>\\\""
+            TIMEOUT 10)
         set_tests_properties(tilefinch-property-write-fault-trace-tests PROPERTIES
             ENVIRONMENT "TILEFINCH_TRACE_JS_PROPERTY_FAULTS=16"
-            PASS_REGULAR_EXPRESSION
-                "quickjs-property-fault.*base=undefined.*property=\\\"<string:12:write-target>\\\""
-            LABELS "tilefinch;unit;javascript;diagnostic"
-            TIMEOUT 10)
+            LABELS "tilefinch;unit;javascript;diagnostic")
     endif()
 
     tilefinch_add_test_binary(tilefinch-script-admission-tests
@@ -1737,7 +1948,26 @@ if(PSP_BROWSER_BUILD_TESTS)
         LABELS "tilefinch;unit;javascript;memory"
         TIMEOUT 30)
 
+    if(Python3_Interpreter_FOUND AND CMAKE_C_COMPILER_ID MATCHES "Clang|GNU"
+       AND EXISTS "${tilefinch_freetype_source}/src/truetype/ttgxvar.c")
+        add_test(NAME tilefinch-freetype-variation-frame-tests
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_freetype_variation_frame.py"
+                --source "${tilefinch_freetype_source}/src/truetype/ttgxvar.c"
+                --compiler "${CMAKE_C_COMPILER}")
+        set_tests_properties(tilefinch-freetype-variation-frame-tests PROPERTIES
+            LABELS "tilefinch;unit;font;sanitizer" TIMEOUT 30)
+    endif()
+
     if(PSP_BROWSER_USE_BELLARD_QUICKJS)
+        tilefinch_add_test_binary(tilefinch-quickjs-array-buffer-owner-tests
+            tests/test_quickjs_array_buffer_owner.c)
+        target_link_libraries(tilefinch-quickjs-array-buffer-owner-tests PRIVATE tilefinch_core)
+        add_test(NAME tilefinch-quickjs-array-buffer-owner-tests
+            COMMAND tilefinch-quickjs-array-buffer-owner-tests)
+        set_tests_properties(tilefinch-quickjs-array-buffer-owner-tests PROPERTIES
+            LABELS "tilefinch;unit;javascript;allocator;sanitizer" TIMEOUT 30)
+
         tilefinch_add_test_binary(tilefinch-quickjs-read-refusal-tests
             tests/test_quickjs_read_refusal.c)
         target_link_libraries(tilefinch-quickjs-read-refusal-tests PRIVATE tilefinch_core)
@@ -1879,6 +2109,102 @@ if(PSP_BROWSER_BUILD_TESTS)
     set_tests_properties(tilefinch-fetch-background-chunk-tests PROPERTIES
         LABELS "tilefinch;unit;network;media;psp;sanitizer"
         TIMEOUT 30)
+
+    # The PSP worker's WebSocket lane (src/fetch/background_websocket.inc)
+    # against host builds of the pinned libcurl 8.22.0 and Mbed TLS 3.6.7
+    # and a loopback server. The host transport links the system libcurl,
+    # which may lack WebSocket support, so this test builds the pinned
+    # archives from the offline transport cache
+    # (scripts/fetch-psp-transport-deps.sh); the lane admits "ws,wss", and
+    # curl refuses a wss it cannot serve, hence the TLS library. The test is
+    # not registered when the cache lacks either archive.
+    set(_ws_curl_archive "${TILEFINCH_PSP_TRANSPORT_CACHE}/curl-8.22.0.tar.xz")
+    set(_ws_mbedtls_archive
+        "${TILEFINCH_PSP_TRANSPORT_CACHE}/mbedtls-3.6.7.tar.bz2")
+    if(NOT PSP AND EXISTS "${_ws_curl_archive}"
+       AND EXISTS "${_ws_mbedtls_archive}")
+        include(ExternalProject)
+        set(_ws_curl_prefix "${CMAKE_CURRENT_BINARY_DIR}/host-ws-curl")
+        set(_ws_curl_library
+            "${_ws_curl_prefix}/lib/${CMAKE_STATIC_LIBRARY_PREFIX}curl${CMAKE_STATIC_LIBRARY_SUFFIX}")
+        set(_ws_mbedtls_libraries
+            "${_ws_curl_prefix}/lib/libmbedtls.a"
+            "${_ws_curl_prefix}/lib/libmbedx509.a"
+            "${_ws_curl_prefix}/lib/libmbedcrypto.a")
+        ExternalProject_Add(tilefinch_host_ws_mbedtls
+            URL "${_ws_mbedtls_archive}"
+            URL_HASH SHA256=a7e8bcbec0e6f761b4af24f25677626b35f762f68eef79c08677a363212d11f6
+            DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+            PREFIX "${CMAKE_CURRENT_BINARY_DIR}/host-ws-mbedtls-build"
+            INSTALL_DIR "${_ws_curl_prefix}"
+            CMAKE_ARGS
+                "-DCMAKE_INSTALL_PREFIX=<INSTALL_DIR>"
+                "-DCMAKE_BUILD_TYPE=Release"
+                "-DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}"
+                "-DCMAKE_INSTALL_LIBDIR=lib"
+                -DENABLE_PROGRAMS=OFF -DENABLE_TESTING=OFF
+            BUILD_BYPRODUCTS ${_ws_mbedtls_libraries})
+        ExternalProject_Add(tilefinch_host_ws_curl
+            DEPENDS tilefinch_host_ws_mbedtls
+            URL "${_ws_curl_archive}"
+            URL_HASH SHA256=f7ef3ae8a22e521f289803fe93543eb64c329b58aa73a9e224dfd915a2a5f4f7
+            DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+            PREFIX "${CMAKE_CURRENT_BINARY_DIR}/host-ws-curl-build"
+            INSTALL_DIR "${_ws_curl_prefix}"
+            CMAKE_ARGS
+                "-DCMAKE_INSTALL_PREFIX=<INSTALL_DIR>"
+                "-DCMAKE_BUILD_TYPE=Release"
+                "-DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}"
+                "-DCMAKE_POSITION_INDEPENDENT_CODE=ON"
+                "-DCMAKE_INSTALL_LIBDIR=lib"
+                -DBUILD_SHARED_LIBS=OFF -DBUILD_STATIC_LIBS=ON
+                -DBUILD_CURL_EXE=OFF -DBUILD_TESTING=OFF
+                -DBUILD_LIBCURL_DOCS=OFF -DBUILD_MISC_DOCS=OFF
+                -DENABLE_CURL_MANUAL=OFF -DBUILD_EXAMPLES=OFF
+                -DCURL_ENABLE_SSL=ON -DCURL_USE_MBEDTLS=ON -DCURL_USE_OPENSSL=OFF
+                "-DMBEDTLS_INCLUDE_DIR=<INSTALL_DIR>/include"
+                "-DMBEDTLS_LIBRARY=<INSTALL_DIR>/lib/libmbedtls.a"
+                "-DMBEDX509_LIBRARY=<INSTALL_DIR>/lib/libmbedx509.a"
+                "-DMBEDCRYPTO_LIBRARY=<INSTALL_DIR>/lib/libmbedcrypto.a"
+                -DCURL_DISABLE_WEBSOCKETS=OFF -DHTTP_ONLY=OFF
+                -DCURL_CA_BUNDLE=none -DCURL_CA_PATH=none
+                -DCURL_USE_PKGCONFIG=OFF -DCURL_USE_LIBPSL=OFF
+                -DCURL_USE_LIBSSH2=OFF -DCURL_USE_GSSAPI=OFF
+                -DUSE_NGHTTP2=OFF -DUSE_LIBIDN2=OFF -DUSE_APPLE_IDN=OFF
+                -DCURL_ZLIB=OFF -DCURL_BROTLI=OFF -DCURL_ZSTD=OFF
+                -DCURL_DISABLE_LDAP=ON -DCURL_DISABLE_FTP=ON
+                -DCURL_DISABLE_SMTP=ON -DCURL_DISABLE_IMAP=ON
+                -DCURL_DISABLE_POP3=ON -DCURL_DISABLE_RTSP=ON
+                -DCURL_DISABLE_TELNET=ON -DCURL_DISABLE_TFTP=ON
+                -DCURL_DISABLE_MQTT=ON -DCURL_DISABLE_DICT=ON
+                -DCURL_DISABLE_GOPHER=ON -DCURL_DISABLE_SMB=ON
+                -DCURL_DISABLE_FILE=ON
+            BUILD_BYPRODUCTS "${_ws_curl_library}")
+        tilefinch_add_test_binary(tilefinch-websocket-loopback-tests
+            tests/test_websocket_worker_loopback.c
+            src/fetch_websocket_frames.c)
+        add_dependencies(tilefinch-websocket-loopback-tests
+            tilefinch_host_ws_curl)
+        # The pinned headers must win over any system <curl/curl.h>.
+        target_include_directories(tilefinch-websocket-loopback-tests BEFORE
+            PRIVATE "${_ws_curl_prefix}/include")
+        target_include_directories(tilefinch-websocket-loopback-tests PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        target_compile_definitions(tilefinch-websocket-loopback-tests
+            PRIVATE CURL_STATICLIB _GNU_SOURCE)
+        target_link_libraries(tilefinch-websocket-loopback-tests PRIVATE
+            "${_ws_curl_library}" ${_ws_mbedtls_libraries} Threads::Threads)
+        if(APPLE)
+            target_link_libraries(tilefinch-websocket-loopback-tests PRIVATE
+                "-framework SystemConfiguration" "-framework CoreFoundation"
+                "-framework CoreServices")
+        endif()
+        add_test(NAME tilefinch-websocket-loopback-tests
+            COMMAND tilefinch-websocket-loopback-tests)
+        set_tests_properties(tilefinch-websocket-loopback-tests PROPERTIES
+            LABELS "tilefinch;unit;network;psp" TIMEOUT 60)
+    endif()
 
     tilefinch_add_test_binary(tilefinch-psp-media-ownership-tests
         tests/test_psp_media_ownership.c)
@@ -2056,6 +2382,18 @@ if(PSP_BROWSER_BUILD_TESTS)
         LABELS "tilefinch;unit;psp;state"
         TIMEOUT 10)
 
+    # What a page press ends in, from src/psp_app/psp_app_page_press.inc: a
+    # real engine's refused form and the status it leaves on a real PspUiState.
+    tilefinch_add_test_binary(tilefinch-psp-page-press-tests
+        tests/test_psp_page_press.c)
+    target_link_libraries(tilefinch-psp-page-press-tests
+        PRIVATE tilefinch_psp_ui)
+    add_test(NAME tilefinch-psp-page-press-tests
+        COMMAND tilefinch-psp-page-press-tests)
+    set_tests_properties(tilefinch-psp-page-press-tests PROPERTIES
+        LABELS "tilefinch;unit;psp;ui"
+        TIMEOUT 30)
+
     # The media session's presentation gate
     # (psp_media_presentation_gate.h): startup preroll, seek floor and
     # audio hold.
@@ -2113,6 +2451,61 @@ if(PSP_BROWSER_BUILD_TESTS)
     set_tests_properties(tilefinch-psp-entropy-pool-tests PROPERTIES
         LABELS "tilefinch;unit;psp;network;security"
         TIMEOUT 10)
+
+    if(NOT PSP)
+        # The validation-only raw entropy-sample capture
+        # (src/psp_entropy_capture.h): the TFER encoder and config parser;
+        # src/psp_entropy.c built on the host with its capture hooks over a
+        # modelled clock, read back by tools/entropy_capture_report.py; and
+        # the same file built as shipping, which must carry no capture code.
+        set(_tilefinch_entropy_stubs
+            "${CMAKE_CURRENT_BINARY_DIR}/psp-entropy-host-stubs")
+        file(WRITE "${_tilefinch_entropy_stubs}/pspkernel.h"
+            "#include <stddef.h>\n#include <stdint.h>\n"
+            "typedef int SceUID;\n"
+            "SceUID sceKernelCreateSema(const char *, int, int, int, void *);\n"
+            "int sceKernelWaitSema(SceUID, int, unsigned *);\n"
+            "int sceKernelPollSema(SceUID, int);\n"
+            "int sceKernelSignalSema(SceUID, int);\n"
+            "int64_t sceKernelGetSystemTimeWide(void);\n"
+            "unsigned sceKernelGetSystemTimeLow(void);\n"
+            "int sceKernelDelayThread(unsigned);\n"
+            "int sceKernelGetThreadId(void);\n"
+            "size_t sceKernelTotalFreeMemSize(void);\n"
+            "void sceKernelDcacheWritebackInvalidateRange(const void *, unsigned);\n")
+        foreach(_stub pspsysmem.h pspthreadman.h psputils.h)
+            file(WRITE "${_tilefinch_entropy_stubs}/${_stub}" "")
+        endforeach()
+        tilefinch_add_test_binary(tilefinch-psp-entropy-capture-tests
+            tests/test_psp_entropy_capture.c
+            src/psp_entropy_capture.c)
+        add_test(NAME tilefinch-psp-entropy-capture-tests
+            COMMAND tilefinch-psp-entropy-capture-tests)
+        set_tests_properties(tilefinch-psp-entropy-capture-tests PROPERTIES
+            LABELS "tilefinch;unit;psp;security"
+            TIMEOUT 10)
+        tilefinch_add_test_binary(tilefinch-psp-entropy-capture-driver
+            tests/psp_entropy_capture_driver.c
+            src/psp_entropy_capture.c
+            src/psp_entropy_pool.c
+            src/sha256.c)
+        target_include_directories(tilefinch-psp-entropy-capture-driver
+            BEFORE PRIVATE "${_tilefinch_entropy_stubs}" src include)
+        target_compile_definitions(tilefinch-psp-entropy-capture-driver
+            PRIVATE TILEFINCH_PSP_ENTROPY_CAPTURE=1)
+        add_library(tilefinch-psp-entropy-shipping-probe OBJECT
+            src/psp_entropy.c)
+        target_include_directories(tilefinch-psp-entropy-shipping-probe
+            BEFORE PRIVATE "${_tilefinch_entropy_stubs}" src include)
+        add_test(NAME tilefinch-entropy-capture-report-tests
+            COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_entropy_capture_report.py"
+                    $<TARGET_FILE:tilefinch-psp-entropy-capture-driver>
+                    "$<TARGET_OBJECTS:tilefinch-psp-entropy-shipping-probe>")
+        set_tests_properties(tilefinch-entropy-capture-report-tests PROPERTIES
+            LABELS "tilefinch;unit;psp;security;tooling"
+            TIMEOUT 120)
+    endif()
 
     # Load-time reach and scroll responsiveness, reported by validation
     # builds; pure data shared with the PSP frontend.
@@ -2376,10 +2769,20 @@ if(PSP_BROWSER_BUILD_TESTS)
         set_tests_properties(tilefinch-reference-capture-tests PROPERTIES
             LABELS "tilefinch;unit;acceptance;tooling;network"
             TIMEOUT 10)
+        # The receipt checks need no browser; the browser classes skip
+        # without Node/Playwright and then report Skipped (exit 77), so
+        # they are registered apart.
+        add_test(NAME tilefinch-reference-capture-receipt-tests
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_reference_capture_browser.py
+                CaptureReceiptTests)
+        set_tests_properties(tilefinch-reference-capture-receipt-tests PROPERTIES
+            LABELS "tilefinch;unit;acceptance;tooling"
+            TIMEOUT 30)
         add_test(NAME tilefinch-reference-capture-browser-tests
             COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_reference_capture_browser.py
-                CaptureReceiptTests BrowserCaptureTests)
+                BrowserCaptureTests)
         set_tests_properties(tilefinch-reference-capture-browser-tests PROPERTIES
             LABELS "tilefinch;acceptance;tooling;network;visual"
             TIMEOUT 120)
@@ -2410,7 +2813,9 @@ if(PSP_BROWSER_BUILD_TESTS)
         # load generators beside them and turn contention into false timeouts.
         set_tests_properties(tilefinch-reference-capture-browser-tests
             tilefinch-reference-query-browser-tests tilefinch-reference-scroll-browser-tests
-            tilefinch-reference-worker-browser-tests tilefinch-reference-long-document-browser-tests PROPERTIES RUN_SERIAL TRUE)
+            tilefinch-reference-worker-browser-tests tilefinch-reference-long-document-browser-tests PROPERTIES
+            RUN_SERIAL TRUE
+            SKIP_RETURN_CODE 77)
         add_test(NAME tilefinch-native-capture-tests
             COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_native_capture.py
@@ -2506,6 +2911,22 @@ if(PSP_BROWSER_BUILD_TESTS)
                 LABELS "tilefinch;network;media"
                 SKIP_RETURN_CODE 77
                 TIMEOUT 60)
+
+            # Page audio's probe and MP3 stream against loopback stations:
+            # a ranged file, an endless HTTP/1.0 mount and an ICY server.
+            tilefinch_add_test_binary(tilefinch-media-mp3-stream-tests
+                tests/test_media_mp3_stream.c)
+            list(APPEND TILEFINCH_TEST_BINARY_TARGETS
+                tilefinch-media-mp3-stream-tests)
+            target_link_libraries(tilefinch-media-mp3-stream-tests
+                PRIVATE tilefinch_core)
+            add_test(NAME tilefinch-media-mp3-stream-tests
+                COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_media_mp3_stream_test.py
+                    $<TARGET_FILE:tilefinch-media-mp3-stream-tests>)
+            set_tests_properties(tilefinch-media-mp3-stream-tests PROPERTIES
+                LABELS "tilefinch;network;media"
+                TIMEOUT 120)
         endif()
     endif()
 
@@ -2522,6 +2943,14 @@ if(PSP_BROWSER_BUILD_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_private_interactive_lab.py
             $<TARGET_FILE:psp-browser-interactive-lab>)
     set_tests_properties(tilefinch-private-interactive-tests PROPERTIES
+        LABELS "tilefinch;lab"
+        TIMEOUT 60)
+
+    add_test(NAME tilefinch-lab-image-queue-tests
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_lab_image_queue.py
+            $<TARGET_FILE:psp-browser-interactive-lab>)
+    set_tests_properties(tilefinch-lab-image-queue-tests PROPERTIES
         LABELS "tilefinch;lab"
         TIMEOUT 60)
 
@@ -2558,49 +2987,54 @@ if(PSP_BROWSER_BUILD_TESTS)
     # below, to every test registered between these two snapshots.
     get_property(_tilefinch_tests_before_lab DIRECTORY PROPERTY TESTS)
 
-    add_test(NAME reader-profile-default-none
-        COMMAND psp-browser-lab
-            --fixture ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/demo.html
-            --no-render --limit-mb 24)
-    set_tests_properties(reader-profile-default-none PROPERTIES
-        PASS_REGULAR_EXPRESSION "reader profile=none"
+    add_test(NAME tilefinch-output-test-exit-status-tests
+        COMMAND ${CMAKE_COMMAND}
+            -DTILEFINCH_ROOT=${CMAKE_CURRENT_SOURCE_DIR}
+            -DTILEFINCH_SCRATCH=${CMAKE_CURRENT_BINARY_DIR}/output-test-exit-status
+            -DTILEFINCH_LAB=$<TARGET_FILE:psp-browser-lab>
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_run_output_test.cmake)
+    set_tests_properties(tilefinch-output-test-exit-status-tests PROPERTIES
         TIMEOUT 30)
 
-    add_test(NAME reader-profile-explicit-opt-in
+    tilefinch_add_output_test(reader-profile-default-none
         COMMAND psp-browser-lab
             --fixture ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/demo.html
-            --reader-profile wikipedia --no-render --limit-mb 24)
-    set_tests_properties(reader-profile-explicit-opt-in PROPERTIES
-        PASS_REGULAR_EXPRESSION "reader profile=wikipedia"
+            --no-render --limit-mb 24
+        EXPECT "reader profile=none"
+        TIMEOUT 30)
+
+    tilefinch_add_output_test(reader-profile-explicit-opt-in
+        COMMAND psp-browser-lab
+            --fixture ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/demo.html
+            --reader-profile wikipedia --no-render --limit-mb 24
+        EXPECT "reader profile=wikipedia"
         TIMEOUT 30)
 
     # The lab's realistic profile is the PSP app's own configuration
     # (BROWSER_PSP_APP_* shared with src/psp_boot_config.c).
-    add_test(NAME lab-psp-realistic-profile-matches-app
+    tilefinch_add_output_test(lab-psp-realistic-profile-matches-app
         COMMAND psp-browser-interactive-lab
             --fixture ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/demo.html
             --psp-profile realistic
             --no-loop-capture
-            --output ${CMAKE_CURRENT_BINARY_DIR}/lab-psp-realistic-profile.ppm)
-    set_tests_properties(lab-psp-realistic-profile-matches-app PROPERTIES
-        PASS_REGULAR_EXPRESSION "runtime-profile=realistic limit-mb=32 adaptive=yes history=4 session-cache=655360 tiles=24 navigation=transactional\nruntime-policy scripts=256 source-bytes=16777216 file-bytes=4194304 heap-bytes=5242880 stylesheets=32 css-bytes=3145728 css-file-bytes=786432"
+            --output ${CMAKE_CURRENT_BINARY_DIR}/lab-psp-realistic-profile.ppm
+        EXPECT "runtime-profile=realistic limit-mb=32 adaptive=yes history=4 session-cache=655360 tiles=24 navigation=transactional\nruntime-policy scripts=256 source-bytes=16777216 file-bytes=4194304 heap-bytes=5242880 stylesheets=32 css-bytes=3145728 css-file-bytes=786432"
         TIMEOUT 30)
     # The lab derives script limits through the app's own helper, so a
     # per-file limit above the total is clamped to the total here too.
-    add_test(NAME lab-script-file-limit-clamped-to-total
+    tilefinch_add_output_test(lab-script-file-limit-clamped-to-total
         COMMAND psp-browser-interactive-lab
             --fixture ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/demo.html
             --psp-profile realistic
             --script-total-mb 1 --script-file-kb 2048
             --no-loop-capture
-            --output ${CMAKE_CURRENT_BINARY_DIR}/lab-script-file-limit.ppm)
-    set_tests_properties(lab-script-file-limit-clamped-to-total PROPERTIES
-        PASS_REGULAR_EXPRESSION "runtime-policy scripts=[0-9]+ source-bytes=1048576 file-bytes=1048576 "
+            --output ${CMAKE_CURRENT_BINARY_DIR}/lab-script-file-limit.ppm
+        EXPECT "runtime-policy scripts=[0-9]+ source-bytes=1048576 file-bytes=1048576 "
         TIMEOUT 30)
 
     # A top-level DataDome 403 (sanitized from a news-site capture) must
     # raise the bot-protection notice rather than a silent blank page.
-    add_test(NAME bot-wall-notice-datadome
+    tilefinch_add_output_test(bot-wall-notice-datadome
         COMMAND psp-browser-interactive-lab
             --url https://www.nytimes.com/
             --replay-http-response-keyed
@@ -2608,12 +3042,11 @@ if(PSP_BROWSER_BUILD_TESTS)
             --psp-profile realistic --fetch-scripts
             --commands ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/news-compat/bot-wall-datadome/commands
             --no-loop-capture
-            --output ${CMAKE_CURRENT_BINARY_DIR}/bot-wall-datadome-final.ppm)
-    set_tests_properties(bot-wall-notice-datadome PROPERTIES
-        PASS_REGULAR_EXPRESSION "bot-wall detected=yes site=\"nytimes.com\" vendor=\"DataDome\" status=403 blank-refused-script=no notice=\"nytimes.com blocked Tilefinch[|]Bot protection: this site may not work\""
+            --output ${CMAKE_CURRENT_BINARY_DIR}/bot-wall-datadome-final.ppm
+        EXPECT "bot-wall detected=yes site=\"nytimes.com\" vendor=\"DataDome\" status=403 blank-refused-script=no notice=\"nytimes.com blocked Tilefinch[|]Bot protection: this site may not work\""
         TIMEOUT 30)
 
-    add_test(NAME full-document-script-order-reference
+    tilefinch_add_output_test(full-document-script-order-reference
         COMMAND psp-browser-interactive-lab
             --url https://section-scripts.test/page
             --replay-http ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/http-section-lazy-scripts
@@ -2621,13 +3054,12 @@ if(PSP_BROWSER_BUILD_TESTS)
             --psp-profile strict --fetch-scripts
             --commands ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-lazy-script-reference-commands.txt
             --no-loop-capture
-            --output ${CMAKE_CURRENT_BINARY_DIR}/section-script-reference.ppm)
-    set_tests_properties(full-document-script-order-reference PROPERTIES
-        PASS_REGULAR_EXPRESSION "experimental-node id=\"order-result\" text=\"head>alpha>beta>module:visibility=yes:relations=yes\""
-        FAIL_REGULAR_EXPRESSION "loop command-failed;interactive failure"
+            --output ${CMAKE_CURRENT_BINARY_DIR}/section-script-reference.ppm
+        EXPECT "experimental-node id=\"order-result\" text=\"head>alpha>beta>module:visibility=yes:relations=yes\""
+        REJECT "loop command-failed;interactive failure"
         TIMEOUT 30)
 
-    add_test(NAME full-document-parser-raw-visibility-reference
+    tilefinch_add_output_test(full-document-parser-raw-visibility-reference
         COMMAND psp-browser-interactive-lab
             --url https://section-parser-raw.test/page
             --replay-http ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/http-section-parser-raw
@@ -2635,37 +3067,34 @@ if(PSP_BROWSER_BUILD_TESTS)
             --psp-profile strict --fetch-scripts
             --commands ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-parser-raw-reference-commands.txt
             --no-loop-capture
-            --output ${CMAKE_CURRENT_BINARY_DIR}/section-parser-raw-reference.ppm)
-    set_tests_properties(full-document-parser-raw-visibility-reference PROPERTIES
-        PASS_REGULAR_EXPRESSION "experimental-node id=\"raw-parser-result\" text=\"RAW-PARSER-PASS\""
-        FAIL_REGULAR_EXPRESSION "RAW-PARSER-FAIL;loop command-failed;interactive failure"
+            --output ${CMAKE_CURRENT_BINARY_DIR}/section-parser-raw-reference.ppm
+        EXPECT "experimental-node id=\"raw-parser-result\" text=\"RAW-PARSER-PASS\""
+        REJECT "RAW-PARSER-FAIL;loop command-failed;interactive failure"
         TIMEOUT 30)
 
-    add_test(NAME full-document-raw-relations-reference
+    tilefinch_add_output_test(full-document-raw-relations-reference
         COMMAND psp-browser-interactive-lab
             --fixture ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-raw-relations.html
             --psp-profile strict --ticks 2
             --commands ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-raw-relation-reference-commands.txt
             --no-loop-capture
-            --output ${CMAKE_CURRENT_BINARY_DIR}/section-raw-relations-reference.ppm)
-    set_tests_properties(full-document-raw-relations-reference PROPERTIES
-        PASS_REGULAR_EXPRESSION "experimental-node id=\"raw-result\" text=\"RAW-PASS\""
-        FAIL_REGULAR_EXPRESSION "RAW-FAIL;loop command-failed;interactive failure"
+            --output ${CMAKE_CURRENT_BINARY_DIR}/section-raw-relations-reference.ppm
+        EXPECT "experimental-node id=\"raw-result\" text=\"RAW-PASS\""
+        REJECT "RAW-FAIL;loop command-failed;interactive failure"
         TIMEOUT 30)
 
-    add_test(NAME full-document-remote-geometry-reference
+    tilefinch_add_output_test(full-document-remote-geometry-reference
         COMMAND psp-browser-interactive-lab
             --fixture ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-remote-geometry.html
             --psp-profile strict --ticks 2
             --commands ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-remote-geometry-reference-commands.txt
             --no-loop-capture
-            --output ${CMAKE_CURRENT_BINARY_DIR}/section-remote-geometry-reference.ppm)
-    set_tests_properties(full-document-remote-geometry-reference PROPERTIES
-        PASS_REGULAR_EXPRESSION "experimental-node id=\"geometry-result\" text=\"GEOMETRY-PASS\""
-        FAIL_REGULAR_EXPRESSION "GEOMETRY-FAIL;loop command-failed;interactive failure"
+            --output ${CMAKE_CURRENT_BINARY_DIR}/section-remote-geometry-reference.ppm
+        EXPECT "experimental-node id=\"geometry-result\" text=\"GEOMETRY-PASS\""
+        REJECT "GEOMETRY-FAIL;loop command-failed;interactive failure"
         TIMEOUT 30)
 
-    add_test(NAME full-document-query-order-reference
+    tilefinch_add_output_test(full-document-query-order-reference
         COMMAND psp-browser-interactive-lab
             --url https://section-query-order.test/page
             --replay-http ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/http-section-query-order
@@ -2674,13 +3103,12 @@ if(PSP_BROWSER_BUILD_TESTS)
             --ticks 2
             --commands ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-query-order-reference-commands.txt
             --no-loop-capture
-            --output ${CMAKE_CURRENT_BINARY_DIR}/section-query-order-reference.ppm)
-    set_tests_properties(full-document-query-order-reference PROPERTIES
-        PASS_REGULAR_EXPRESSION "experimental-node id=\"query-order-result\" text=\"ORDER-PASS\""
-        FAIL_REGULAR_EXPRESSION "ORDER-FAIL;loop command-failed"
+            --output ${CMAKE_CURRENT_BINARY_DIR}/section-query-order-reference.ppm
+        EXPECT "experimental-node id=\"query-order-result\" text=\"ORDER-PASS\""
+        REJECT "ORDER-FAIL;loop command-failed"
         TIMEOUT 30)
 
-    add_test(NAME full-document-wide-query-reference
+    tilefinch_add_output_test(full-document-wide-query-reference
         COMMAND psp-browser-interactive-lab
             --url https://section-wide-query.test/page
             --replay-http ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/http-section-wide-query
@@ -2688,13 +3116,12 @@ if(PSP_BROWSER_BUILD_TESTS)
             --psp-profile strict --fetch-scripts
             --commands ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-wide-query-reference-commands.txt
             --no-loop-capture
-            --output ${CMAKE_CURRENT_BINARY_DIR}/section-wide-query-reference.ppm)
-    set_tests_properties(full-document-wide-query-reference PROPERTIES
-        PASS_REGULAR_EXPRESSION "experimental-node id=\"wide-query-result\" text=\"WIDE-QUERY-PASS\""
-        FAIL_REGULAR_EXPRESSION "WIDE-QUERY-FAIL;loop command-failed;interactive failure"
+            --output ${CMAKE_CURRENT_BINARY_DIR}/section-wide-query-reference.ppm
+        EXPECT "experimental-node id=\"wide-query-result\" text=\"WIDE-QUERY-PASS\""
+        REJECT "WIDE-QUERY-FAIL;loop command-failed;interactive failure"
         TIMEOUT 30)
 
-    add_test(NAME full-document-root-mutation-reference
+    tilefinch_add_output_test(full-document-root-mutation-reference
         COMMAND psp-browser-interactive-lab
             --url https://section-root-mutation.test/page
             --replay-http ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/http-section-root-mutation
@@ -2702,13 +3129,12 @@ if(PSP_BROWSER_BUILD_TESTS)
             --psp-profile strict --fetch-scripts
             --commands ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-root-mutation-reference-commands.txt
             --no-loop-capture
-            --output ${CMAKE_CURRENT_BINARY_DIR}/section-root-mutation-reference.ppm)
-    set_tests_properties(full-document-root-mutation-reference PROPERTIES
-        PASS_REGULAR_EXPRESSION "experimental-node id=\"root-result\" text=\"ROOT-MUTATION-PASS\""
-        FAIL_REGULAR_EXPRESSION "ROOT-MUTATION-FAIL;loop command-failed;interactive failure"
+            --output ${CMAKE_CURRENT_BINARY_DIR}/section-root-mutation-reference.ppm
+        EXPECT "experimental-node id=\"root-result\" text=\"ROOT-MUTATION-PASS\""
+        REJECT "ROOT-MUTATION-FAIL;loop command-failed;interactive failure"
         TIMEOUT 30)
 
-    add_test(NAME full-document-root-attributes-reference
+    tilefinch_add_output_test(full-document-root-attributes-reference
         COMMAND psp-browser-interactive-lab
             --url https://section-root-attributes.test/page
             --replay-http ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/http-section-root-attributes
@@ -2716,13 +3142,12 @@ if(PSP_BROWSER_BUILD_TESTS)
             --psp-profile strict --fetch-scripts
             --commands ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-root-attributes-reference-commands.txt
             --no-loop-capture
-            --output ${CMAKE_CURRENT_BINARY_DIR}/section-root-attributes-reference.ppm)
-    set_tests_properties(full-document-root-attributes-reference PROPERTIES
-        PASS_REGULAR_EXPRESSION "experimental-node-attribute id=\"root-html\" name=\"data-root-state\" value=\"html-kept\";experimental-node-attribute id=\"root-head\" name=\"data-root-state\" value=\"head-kept\";experimental-node-attribute id=\"root-body\" name=\"data-root-state\" value=\"body-kept\""
-        FAIL_REGULAR_EXPRESSION "loop command-failed;interactive failure"
+            --output ${CMAKE_CURRENT_BINARY_DIR}/section-root-attributes-reference.ppm
+        EXPECT "experimental-node-attribute id=\"root-html\" name=\"data-root-state\" value=\"html-kept\";experimental-node-attribute id=\"root-head\" name=\"data-root-state\" value=\"head-kept\";experimental-node-attribute id=\"root-body\" name=\"data-root-state\" value=\"body-kept\""
+        REJECT "loop command-failed;interactive failure"
         TIMEOUT 30)
 
-    add_test(NAME full-document-root-text-reference
+    tilefinch_add_output_test(full-document-root-text-reference
         COMMAND psp-browser-interactive-lab
             --url https://section-root-text.test/page
             --replay-http ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/http-section-root-text
@@ -2730,10 +3155,9 @@ if(PSP_BROWSER_BUILD_TESTS)
             --psp-profile strict --fetch-scripts
             --commands ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/section-root-text-commands.txt
             --no-loop-capture
-            --output ${CMAKE_CURRENT_BINARY_DIR}/section-root-text-reference.ppm)
-    set_tests_properties(full-document-root-text-reference PROPERTIES
-        PASS_REGULAR_EXPRESSION "experimental-node id=\"root-text-result\" text=\"ROOT-TEXT-PASS\""
-        FAIL_REGULAR_EXPRESSION "ROOT-TEXT-FAIL;loop command-failed;interactive failure"
+            --output ${CMAKE_CURRENT_BINARY_DIR}/section-root-text-reference.ppm
+        EXPECT "experimental-node id=\"root-text-result\" text=\"ROOT-TEXT-PASS\""
+        REJECT "ROOT-TEXT-FAIL;loop command-failed;interactive failure"
         TIMEOUT 30)
 
     get_property(_tilefinch_lab_scenarios DIRECTORY PROPERTY TESTS)

@@ -252,8 +252,9 @@ static void build_segment(MockTransport *mock, size_t segment, uint64_t pts)
     mock->segment_bytes[segment] = (size_t) (at - mock->segment[segment]);
 }
 
-static void build_video_only_segment(MockTransport *mock, size_t segment,
-                                     uint64_t pts)
+/* PAT, a video-only PMT, an IDR access unit at `pts` and one P picture a
+   frame later. Returns the bytes written (four TS packets). */
+static size_t video_only_ts(unsigned char *out, uint64_t pts)
 {
     static const unsigned char pat[] = {
         0x00,0xb0,0x0d,0,1,0xc1,0,0,0,1,0xe1,0,0,0,0,0
@@ -262,7 +263,7 @@ static void build_video_only_segment(MockTransport *mock, size_t segment,
         0x02,0xb0,0x12,0,1,0xc1,0,0,0xe1,1,0xf0,0,
         0x1b,0xe1,1,0xf0,0,0,0,0,0
     };
-    unsigned char *at = mock->segment[segment];
+    unsigned char *at = out;
     psi_packet(at, 0, pat, sizeof(pat)); at += 188u;
     psi_packet(at, 0x100u, pmt, sizeof(pmt)); at += 188u;
     unsigned char sps[64];
@@ -284,7 +285,14 @@ static void build_video_only_segment(MockTransport *mock, size_t segment,
     bytes = pes(payload, 0xe0u, pts + 3600u,
                 second_au, sizeof(second_au));
     ts_packet(at, 0x101u, true, payload, bytes); at += 188u;
-    mock->segment_bytes[segment] = (size_t) (at - mock->segment[segment]);
+    return (size_t) (at - out);
+}
+
+static void build_video_only_segment(MockTransport *mock, size_t segment,
+                                     uint64_t pts)
+{
+    mock->segment_bytes[segment] =
+        video_only_ts(mock->segment[segment], pts);
 }
 
 /* A video-only segment of one IDR then `count - 1` small P pictures, one
@@ -633,6 +641,46 @@ static int test_small_live_playlist_stream(void)
     media_hls_playlist_destroy(playlist);
     media_hls_playlist_stream_destroy(stream);
     CHECK(budget.current == 0u);
+
+    /* MD-10: a live window of more than 256 entries, in well under the
+       text bound, is compacted to its tail like an oversized one; 256 are
+       kept whole. The playlist bound (2,048) is not the live one. */
+    for (unsigned entries = 256u; entries <= 257u; entries++) {
+        stream = media_hls_playlist_stream_create(
+            &budget, "https://media.invalid/live/list.m3u8",
+            error, sizeof(error));
+        CHECK(stream != NULL);
+        static const char head[] =
+            "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:100\n";
+        CHECK(media_hls_playlist_stream_feed(
+            stream, (const unsigned char *) head, strlen(head),
+            error, sizeof(error)));
+        char line[64];
+        for (unsigned i = 0; i < entries; i++) {
+            int length = snprintf(line, sizeof(line),
+                                  "#EXTINF:2,\n%u.ts\n", i);
+            CHECK(media_hls_playlist_stream_feed(
+                stream, (const unsigned char *) line, (size_t) length,
+                error, sizeof(error)));
+        }
+        CHECK(media_hls_playlist_stream_bytes_seen(stream) < 64u * 1024u);
+        bool compacted = media_hls_playlist_stream_was_compacted(stream);
+        playlist = media_hls_playlist_stream_finish(
+            stream, error, sizeof(error));
+        size_t kept = media_hls_playlist_segment_count(playlist);
+        printf("live window of %u short entries: %s, %zu kept\n", entries,
+               playlist == NULL ? error
+                   : compacted ? "compacted" : "whole", kept);
+        CHECK(playlist != NULL && media_hls_playlist_is_live(playlist));
+        if (entries <= 256u) {
+            CHECK(!compacted && kept == entries);
+        } else {
+            CHECK(compacted && kept == MEDIA_HLS_RETAINED_LIVE_SEGMENTS);
+        }
+        media_hls_playlist_destroy(playlist);
+        media_hls_playlist_stream_destroy(stream);
+        CHECK(budget.current == 0u);
+    }
     return 0;
 }
 
@@ -1130,6 +1178,9 @@ static int test_streaming_source(void)
     CHECK(video_pts[0] == 0u && video_pts[1] == 405000u);
     CHECK(audio_pts[0] == 0u && audio_pts[1] == 405000u);
     uint64_t actual = 0;
+    /* Hold the restarted segment back so the probe below sees a transfer
+       in flight; one prime visit may parse a whole delivered segment. */
+    mock.following_delay_us = 1000000u;
     CHECK(samples.ops->seek_us(samples.opaque, 6000000u, &actual)
           && actual == 4500000u);
     /* Repeated readiness probes at an untouched seek target must not cancel
@@ -1180,6 +1231,647 @@ static int test_video_only_primes_before_segment_completion(void)
           && video.width == 432u && audio.codec == 0u
           && stats.segments_completed == 0u
           && stats.queue_overflows == 0u);
+    media_hls_source_destroy(source);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
+/* Writes a finite playlist of `count` segments of `seconds` each into
+   text; `line_bytes` pads each URI line to that length (0: short names
+   "s<index>.ts"). Returns the length, or 0 when it does not fit. */
+static size_t long_playlist_text(char *text, size_t capacity, unsigned count,
+                                 unsigned seconds, size_t line_bytes)
+{
+    size_t at = (size_t) snprintf(
+        text, capacity, "#EXTM3U\n#EXT-X-TARGETDURATION:%u\n", seconds);
+    for (unsigned i = 0; i < count && at < capacity; i++) {
+        int written;
+        if (line_bytes == 0) {
+            written = snprintf(text + at, capacity - at,
+                               "#EXTINF:%u.000,\ns%u.ts\n", seconds, i);
+        } else {
+            /* A CDN-signed absolute URI: fixed prefix, then a signature
+               padded so the line is line_bytes long. */
+            static const char prefix[] =
+                "https://cdn.invalid/vod/7f3a/seg-";
+            size_t fixed = strlen(prefix) + 5u + strlen(".ts?sig=");
+            if (line_bytes <= fixed) return 0;
+            written = snprintf(text + at, capacity - at,
+                               "#EXTINF:%u.000,\n%s%05u.ts?sig=%0*u\n",
+                               seconds, prefix, i,
+                               (int) (line_bytes - fixed), i);
+        }
+        if (written < 0 || (size_t) written >= capacity - at) return 0;
+        at += (size_t) written;
+    }
+    int written = snprintf(text + at, capacity - at, "#EXT-X-ENDLIST\n");
+    if (written < 0 || (size_t) written >= capacity - at) return 0;
+    return at + (size_t) written;
+}
+
+/* Parses text both whole and through the incremental stream (fed in
+   1,000-byte pieces, as a transport delivers it). Both must agree. */
+static MediaHlsPlaylist *parse_both_ways(Budget *budget, const char *text,
+                                         size_t length, char *error,
+                                         size_t error_size)
+{
+    MediaHlsPlaylist *whole = media_hls_playlist_parse(
+        budget, "https://media.invalid/path/list.m3u8",
+        (const unsigned char *) text, length, error, error_size);
+    char stream_error[160] = {0};
+    MediaHlsPlaylistStream *stream = media_hls_playlist_stream_create(
+        budget, "https://media.invalid/path/list.m3u8",
+        stream_error, sizeof(stream_error));
+    if (stream == NULL) {
+        media_hls_playlist_destroy(whole);
+        return NULL;
+    }
+    bool fed = true;
+    for (size_t at = 0; fed && at < length; at += 1000u) {
+        size_t piece = length - at < 1000u ? length - at : 1000u;
+        fed = media_hls_playlist_stream_feed(
+            stream, (const unsigned char *) text + at, piece,
+            stream_error, sizeof(stream_error));
+    }
+    MediaHlsPlaylist *streamed = fed ? media_hls_playlist_stream_finish(
+        stream, stream_error, sizeof(stream_error)) : NULL;
+    media_hls_playlist_stream_destroy(stream);
+    bool agree = (whole == NULL) == (streamed == NULL)
+        && media_hls_playlist_segment_count(whole)
+               == media_hls_playlist_segment_count(streamed);
+    if (whole == NULL && streamed != NULL) whole = streamed;
+    else media_hls_playlist_destroy(streamed);
+    if (!agree) {
+        fprintf(stderr, "whole and streamed parses disagree: %s / %s\n",
+                error, stream_error);
+        media_hls_playlist_destroy(whole);
+        return NULL;
+    }
+    return whole;
+}
+
+/* MD-10: a finite playlist holds 2,048 segments, about 68 minutes at
+   2-second segments; one more is refused, by both parsers, with the
+   failure text the panel and the candidate list recognise. */
+static int test_finite_playlist_entry_bound(void)
+{
+    static char text[128u * 1024u];
+    for (unsigned count = 2048u; count <= 2049u; count++) {
+        size_t length = long_playlist_text(text, sizeof(text), count, 2u, 0);
+        CHECK(length != 0 && length < 64u * 1024u);
+        Budget budget;
+        budget_init(&budget, 2u * 1024u * 1024u);
+        char error[160] = {0};
+        MediaHlsPlaylist *playlist = parse_both_ways(
+            &budget, text, length, error, sizeof(error));
+        printf("finite playlist of %u segments: %s\n", count,
+               playlist != NULL ? "accepted" : error);
+        if (count == 2048u) {
+            CHECK(playlist != NULL
+                  && media_hls_playlist_segment_count(playlist) == count
+                  && !media_hls_playlist_is_live(playlist)
+                  && media_hls_playlist_duration_us(playlist)
+                         == UINT64_C(4096000000));
+            /* The playlist's record (the segment table and its base URL),
+               apart from the retained text. */
+            printf("2,048-segment playlist: %zu bytes of records, "
+                   "%zu of text\n",
+                   budget.categories[BUDGET_CATEGORY_NAVIGATION].current,
+                   budget.categories[BUDGET_CATEGORY_RESOURCE].current);
+            CHECK(budget.categories[BUDGET_CATEGORY_NAVIGATION].current
+                  < 40u * 1024u);
+            char url[160];
+            uint32_t duration_ms = 0;
+            CHECK(media_hls_playlist_segment(playlist, 2047u, url,
+                                             sizeof(url), &duration_ms)
+                  && strcmp(url, "https://media.invalid/path/s2047.ts") == 0
+                  && duration_ms == 2000u);
+        } else {
+            CHECK(playlist == NULL
+                  && strncmp(error, MEDIA_HLS_PLAYLIST_TOO_LONG,
+                             strlen(MEDIA_HLS_PLAYLIST_TOO_LONG)) == 0
+                  && strstr(error, "over 2048 entries") != NULL);
+            MediaFailureMessage message;
+            CHECK(media_failure_message(error, &message)
+                  && message.kind == MEDIA_FAILURE_FORMAT_UNSUPPORTED);
+        }
+        media_hls_playlist_destroy(playlist);
+        CHECK(budget.current == 0);
+    }
+    /* The table is charged to the Budget: a ceiling that admits the text
+       but not the playlist record refuses cleanly. */
+    size_t length = long_playlist_text(text, sizeof(text), 2048u, 2u, 0);
+    Budget tight;
+    budget_init(&tight, length + 16u * 1024u);
+    char error[160] = {0};
+    CHECK(media_hls_playlist_parse(
+              &tight, "https://media.invalid/path/list.m3u8",
+              (const unsigned char *) text, length,
+              error, sizeof(error)) == NULL
+          && strcmp(error, "HLS playlist exceeds memory budget") == 0
+          && tight.current == 0u);
+    return 0;
+}
+
+/* MD-10: long signed segment URIs (about 300 bytes a line) are accepted
+   up to 128 KiB of playlist text, about 400 segments; past it a finite
+   playlist is refused. */
+static int test_signed_uri_playlist_text_bound(void)
+{
+    static char text[160u * 1024u];
+    unsigned count = 0;
+    size_t length = 0;
+    /* The most 300-byte lines that fit in 128 KiB. */
+    for (unsigned n = 380u; n < 480u; n++) {
+        size_t candidate = long_playlist_text(text, sizeof(text), n, 6u,
+                                              300u);
+        CHECK(candidate != 0);
+        if (candidate > 128u * 1024u) break;
+        count = n;
+        length = candidate;
+    }
+    CHECK(count >= 400u && length > 64u * 1024u);
+    length = long_playlist_text(text, sizeof(text), count, 6u, 300u);
+    Budget budget;
+    budget_init(&budget, 2u * 1024u * 1024u);
+    char error[160] = {0};
+    MediaHlsPlaylist *playlist = parse_both_ways(
+        &budget, text, length, error, sizeof(error));
+    printf("%u signed 300-byte URIs in %zu bytes: %s\n", count, length,
+           playlist != NULL ? "accepted" : error);
+    CHECK(playlist != NULL
+          && media_hls_playlist_segment_count(playlist) == count
+          && !media_hls_playlist_is_live(playlist));
+    char url[512], expected[512];
+    uint32_t duration_ms = 0;
+    CHECK(media_hls_playlist_segment(playlist, count - 1u, url, sizeof(url),
+                                     &duration_ms)
+          && duration_ms == 6000u);
+    snprintf(expected, sizeof(expected),
+             "https://cdn.invalid/vod/7f3a/seg-%05u.ts?sig=%0*u", count - 1u,
+             (int) (300u - strlen("https://cdn.invalid/vod/7f3a/seg-")
+                    - 5u - strlen(".ts?sig=")), count - 1u);
+    CHECK(strlen(url) == 300u && strcmp(url, expected) == 0);
+    media_hls_playlist_destroy(playlist);
+    CHECK(budget.current == 0u);
+
+    /* One more line passes 128 KiB. */
+    length = long_playlist_text(text, sizeof(text), count + 1u, 6u, 300u);
+    CHECK(length > 128u * 1024u);
+    playlist = parse_both_ways(&budget, text, length, error, sizeof(error));
+    printf("%u signed URIs in %zu bytes: %s\n", count + 1u, length,
+           playlist != NULL ? "accepted" : error);
+    CHECK(playlist == NULL);
+    MediaHlsPlaylistStream *stream = media_hls_playlist_stream_create(
+        &budget, "https://media.invalid/path/list.m3u8",
+        error, sizeof(error));
+    CHECK(stream != NULL && media_hls_playlist_stream_feed(
+              stream, (const unsigned char *) text, length,
+              error, sizeof(error)));
+    CHECK(media_hls_playlist_stream_finish(stream, error, sizeof(error))
+              == NULL
+          && strcmp(error, MEDIA_HLS_PLAYLIST_TOO_LONG
+                    " (VOD text over 128 KiB)") == 0);
+    media_hls_playlist_stream_destroy(stream);
+    CHECK(budget.current == 0u);
+
+    /* A live window of the same lines is still compacted once its text
+       passes 64 KiB, well under 256 segments. */
+    length = long_playlist_text(text, sizeof(text), 230u, 6u, 300u);
+    CHECK(length > 64u * 1024u && length < 128u * 1024u);
+    length -= strlen("#EXT-X-ENDLIST\n");
+    stream = media_hls_playlist_stream_create(
+        &budget, "https://media.invalid/path/list.m3u8",
+        error, sizeof(error));
+    CHECK(stream != NULL && media_hls_playlist_stream_feed(
+              stream, (const unsigned char *) text, length,
+              error, sizeof(error))
+          && media_hls_playlist_stream_was_compacted(stream));
+    playlist = media_hls_playlist_stream_finish(stream, error, sizeof(error));
+    CHECK(playlist != NULL && media_hls_playlist_is_live(playlist)
+          && media_hls_playlist_segment_count(playlist)
+                 == MEDIA_HLS_RETAINED_LIVE_SEGMENTS);
+    media_hls_playlist_destroy(playlist);
+    media_hls_playlist_stream_destroy(stream);
+    CHECK(budget.current == 0u);
+    return 0;
+}
+
+static int prime_source(MediaHlsSource *source);
+
+typedef struct {
+    MockTransport mock;
+    /* The first URI asked for since `first_url` was cleared. */
+    char first_url[96];
+} NamedSegmentTransport;
+
+/* Serves segment 0's bytes for every URI and records the first one asked
+   for: the mock's segments carry their own timestamps, and a source
+   places each segment on the timeline from its EXTINF start. */
+static uint64_t named_segment_start(void *opaque, const char *url,
+                                    size_t maximum, char *error,
+                                    size_t error_size)
+{
+    NamedSegmentTransport *rig = opaque;
+    if (rig->first_url[0] == '\0')
+        snprintf(rig->first_url, sizeof(rig->first_url), "%s", url);
+    return mock_start(&rig->mock, "one.ts", maximum, error, error_size);
+}
+
+static MediaHlsTransportPollResult named_segment_poll(
+    void *opaque, uint64_t handle, unsigned char *destination,
+    size_t capacity, size_t *length, char *error, size_t error_size)
+{
+    NamedSegmentTransport *rig = opaque;
+    return mock_poll(&rig->mock, handle, destination, capacity, length,
+                     error, error_size);
+}
+
+static void named_segment_cancel(void *opaque, uint64_t handle)
+{
+    NamedSegmentTransport *rig = opaque;
+    mock_cancel(&rig->mock, handle);
+}
+
+/* Reads samples until one at or after at_or_after90k; returns its dts or
+   UINT64_MAX. */
+static uint64_t first_sample_from(MediaSampleSource *samples,
+                                  uint64_t at_or_after90k)
+{
+    MediaMp4Sample sample;
+    unsigned char payload[512];
+    for (unsigned guard = 0; guard < 256u; guard++) {
+        if (samples->ops->next_sample(samples->opaque, &sample)) {
+            if (!samples->ops->read_sample(samples->opaque, &sample,
+                                           payload, sizeof(payload)))
+                return UINT64_MAX;
+            if (sample.dts >= at_or_after90k) return sample.dts;
+        } else if (!samples->ops->would_block(samples->opaque)) {
+            break;
+        }
+    }
+    return UINT64_MAX;
+}
+
+/* MD-10: a 2,048-segment VOD plays from its start, reports its whole
+   duration, and seeks to its last segment and plays there. */
+static int test_long_playlist_plays_and_seeks(void)
+{
+    puts("test: a 2,048-segment HLS VOD plays and seeks to its end");
+    static char text[128u * 1024u];
+    size_t length = long_playlist_text(text, sizeof(text), 2048u, 2u, 0);
+    CHECK(length != 0);
+    Budget budget;
+    budget_init(&budget, 4u * 1024u * 1024u);
+    char error[160] = {0};
+    MediaHlsPlaylist *playlist = media_hls_playlist_parse(
+        &budget, "https://media.invalid/path/list.m3u8",
+        (const unsigned char *) text, length, error, sizeof(error));
+    CHECK(playlist != NULL);
+    static NamedSegmentTransport rig;
+    memset(&rig, 0, sizeof(rig));
+    build_segment(&rig.mock, 0u, 90000u);
+    MediaHlsTransport transport = {
+        .opaque = &rig, .start = named_segment_start,
+        .poll = named_segment_poll, .cancel = named_segment_cancel
+    };
+    MediaHlsSource *source = media_hls_source_create(
+        &budget, playlist, &transport, error, sizeof(error));
+    CHECK(source != NULL && prime_source(source) == 0);
+    CHECK(strcmp(rig.first_url, "https://media.invalid/path/s0.ts") == 0);
+    MediaMp4TrackInfo video = {0}, audio = {0};
+    CHECK(media_hls_source_stream_info(source, &video, &audio)
+          && video.timescale == 90000u
+          && video.duration == UINT64_C(4096) * 90000u);
+    MediaSampleSource samples;
+    CHECK(media_hls_source_sample_source(source, &samples));
+    CHECK(first_sample_from(&samples, 0u) == 0u);
+
+    /* The last segment starts at 4,094 s. */
+    uint64_t actual = 0;
+    CHECK(samples.ops->seek_us(samples.opaque, UINT64_C(4095000000),
+                               &actual)
+          && actual == UINT64_C(4094000000));
+    rig.first_url[0] = '\0';
+    CHECK(prime_source(source) == 0);
+    CHECK(strcmp(rig.first_url, "https://media.invalid/path/s2047.ts") == 0);
+    uint64_t dts = first_sample_from(&samples, 0u);
+    printf("after the seek: %s, first sample at %llu ticks\n",
+           rig.first_url, (unsigned long long) dts);
+    CHECK(dts == UINT64_C(4094) * 90000u);
+    /* And back into the middle. */
+    CHECK(samples.ops->seek_us(samples.opaque, UINT64_C(2001000000),
+                               &actual)
+          && actual == UINT64_C(2000000000));
+    rig.first_url[0] = '\0';
+    CHECK(prime_source(source) == 0);
+    CHECK(strcmp(rig.first_url, "https://media.invalid/path/s1000.ts") == 0
+          && first_sample_from(&samples, 0u) == UINT64_C(2000) * 90000u);
+    MediaHlsStats stats;
+    media_hls_source_stats(source, &stats);
+    CHECK(stats.queue_overflows == 0u && !stats.live);
+    media_hls_source_destroy(source);
+    CHECK(budget.current == 0u);
+    return 0;
+}
+
+/* MD-09: a 33-bit PTS wrap inside a segment keeps counting forward; a
+   picture shown before the segment's first (B-frame order) still maps to
+   the segment start. */
+static int test_pts_wrap_inside_a_segment(void)
+{
+    static const char media[] =
+        "#EXTM3U\n#EXTINF:4.000,\none.ts\n#EXT-X-ENDLIST\n";
+    Budget budget;
+    budget_init(&budget, 4u * 1024u * 1024u);
+    char error[160] = {0};
+    MediaHlsPlaylist *playlist = media_hls_playlist_parse(
+        &budget, "https://media.invalid/path/list.m3u8",
+        (const unsigned char *) media, strlen(media), error, sizeof(error));
+    CHECK(playlist != NULL);
+    static MockTransport mock;
+    memset(&mock, 0, sizeof(mock));
+    /* IDR at 2^33 - 7200, then pictures at +3600 steps: the third and
+       fourth carry PTS 0 and 3600 after the wrap. */
+    const uint64_t first = (UINT64_C(1) << 33) - 7200u;
+    build_video_run_segment(&mock, 0u, first, 5u);
+    MediaHlsTransport transport = {
+        .opaque = &mock, .start = mock_start,
+        .poll = mock_poll, .cancel = mock_cancel
+    };
+    MediaHlsSource *source = media_hls_source_create(
+        &budget, playlist, &transport, error, sizeof(error));
+    CHECK(source != NULL);
+    MediaHlsPrimeStatus status = MEDIA_HLS_PRIME_PENDING;
+    for (unsigned i = 0; i < 32u && status == MEDIA_HLS_PRIME_PENDING; i++)
+        status = media_hls_source_prime(source, error, sizeof(error));
+    CHECK(status == MEDIA_HLS_PRIME_READY);
+    MediaSampleSource samples;
+    CHECK(media_hls_source_sample_source(source, &samples));
+    MediaMp4Sample sample;
+    unsigned char payload[512];
+    uint64_t times[8];
+    unsigned count = 0;
+    for (unsigned guard = 0; guard < 64u && count < 8u; guard++) {
+        if (samples.ops->next_sample(samples.opaque, &sample)) {
+            CHECK(samples.ops->read_sample(
+                samples.opaque, &sample, payload, sizeof(payload)));
+            if (sample.kind == MEDIA_MP4_TRACK_VIDEO)
+                times[count++] = sample.dts;
+        } else if (!samples.ops->would_block(samples.opaque)) break;
+    }
+    printf("video times across a PTS wrap:");
+    for (unsigned i = 0; i < count; i++)
+        printf(" %llu", (unsigned long long) times[i]);
+    printf("\n");
+    CHECK(count >= 4u);
+    for (unsigned i = 0; i < count; i++)
+        CHECK(times[i] == 3600u * i);
+    media_hls_source_destroy(source);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
+/* MD-07: an audio rendition source does not carry the 512 KiB video
+   access-unit buffer of the TS demuxer. */
+static int test_audio_rendition_source_memory(void)
+{
+    static const char media[] =
+        "#EXTM3U\n#EXTINF:4.000,\none.ts\n#EXT-X-ENDLIST\n";
+    static const MediaHlsTrackSelection selections[] = {
+        MEDIA_HLS_TRACK_AUDIO, MEDIA_HLS_TRACK_VIDEO
+    };
+    size_t charged[2] = {0};
+    for (size_t at = 0; at < 2u; at++) {
+        Budget budget;
+        budget_init(&budget, 4u * 1024u * 1024u);
+        char error[160] = {0};
+        MediaHlsPlaylist *playlist = media_hls_playlist_parse(
+            &budget, "https://media.invalid/path/list.m3u8",
+            (const unsigned char *) media, strlen(media),
+            error, sizeof(error));
+        CHECK(playlist != NULL);
+        size_t before = budget.current;
+        MockTransport mock = {0};
+        MediaHlsTransport transport = {
+            .opaque = &mock, .start = mock_start,
+            .poll = mock_poll, .cancel = mock_cancel
+        };
+        MediaHlsSource *source = media_hls_source_create_track(
+            &budget, playlist, &transport, selections[at],
+            error, sizeof(error));
+        CHECK(source != NULL);
+        charged[at] = budget.current - before;
+        media_hls_source_destroy(source);
+        CHECK(budget.current == 0);
+    }
+    printf("HLS source memory: audio rendition %zu KiB, video %zu KiB\n",
+           charged[0] / 1024u, charged[1] / 1024u);
+    CHECK(charged[0] < 160u * 1024u);
+    CHECK(charged[1] >= 1024u * 1024u);
+    return 0;
+}
+
+/* Writes `count` audio PES packets of twenty 7-byte ADTS frames each. */
+static unsigned char *audio_run_packets(unsigned char *at, uint64_t pts,
+                                        unsigned count)
+{
+    static const unsigned char adts[] = {
+        0xff,0xf1,0x50,0x80,0x00,0xff,0xfc
+    };
+    unsigned char frames[20u * sizeof(adts)];
+    for (size_t i = 0; i < 20u; i++)
+        memcpy(frames + i * sizeof(adts), adts, sizeof(adts));
+    unsigned char payload[184];
+    for (unsigned i = 0; i < count; i++) {
+        size_t bytes = pes(payload, 0xc0u, pts + 20u * 1920u * i,
+                           frames, sizeof(frames));
+        ts_packet(at, 0x102u, true, payload, bytes);
+        at += 188u;
+    }
+    return at;
+}
+
+/* MD-06: a program with AAC and no video, 80 audio frames. */
+static void build_audio_only_ts_segment(MockTransport *mock, size_t segment)
+{
+    static const unsigned char pat[] = {
+        0x00,0xb0,0x0d,0,1,0xc1,0,0,0,1,0xe1,0,0,0,0,0
+    };
+    static const unsigned char pmt[] = {
+        0x02,0xb0,0x12,0,1,0xc1,0,0,0xe1,2,0xf0,0,
+        0x0f,0xe1,2,0xf0,0,0,0,0,0
+    };
+    unsigned char *at = mock->segment[segment];
+    psi_packet(at, 0, pat, sizeof(pat)); at += 188u;
+    psi_packet(at, 0x100u, pmt, sizeof(pmt)); at += 188u;
+    at = audio_run_packets(at, 90000u, 4u);
+    mock->segment_bytes[segment] = (size_t) (at - mock->segment[segment]);
+}
+
+/* MD-06: video and audio, with 80 audio frames before the first SPS. */
+static void build_late_sps_segment(MockTransport *mock, size_t segment)
+{
+    static const unsigned char pat[] = {
+        0x00,0xb0,0x0d,0,1,0xc1,0,0,0,1,0xe1,0,0,0,0,0
+    };
+    static const unsigned char pmt[] = {
+        0x02,0xb0,0x17,0,1,0xc1,0,0,0xe1,1,0xf0,0,
+        0x1b,0xe1,1,0xf0,0,0x0f,0xe1,2,0xf0,0,0,0,0,0
+    };
+    unsigned char *at = mock->segment[segment];
+    psi_packet(at, 0, pat, sizeof(pat)); at += 188u;
+    psi_packet(at, 0x100u, pmt, sizeof(pmt)); at += 188u;
+    at = audio_run_packets(at, 90000u, 4u);
+    unsigned char sps[64];
+    size_t sps_length = make_sps(sps);
+    unsigned char au[128] = {0,0,1};
+    memcpy(au + 3u, sps, sps_length);
+    size_t au_length = 3u + sps_length;
+    static const unsigned char tail[] = {
+        0,0,1,0x68,0xce,0x06,0xe2, 0,0,1,0x65,0x80,0x11
+    };
+    memcpy(au + au_length, tail, sizeof(tail));
+    au_length += sizeof(tail);
+    unsigned char payload[184];
+    size_t bytes = pes(payload, 0xe0u, 90000u + 153600u, au, au_length);
+    ts_packet(at, 0x101u, true, payload, bytes); at += 188u;
+    static const unsigned char second_au[] = {0,0,1,0x41,0x80,0x22};
+    bytes = pes(payload, 0xe0u, 90000u + 153600u + 3600u,
+                second_au, sizeof(second_au));
+    ts_packet(at, 0x101u, true, payload, bytes); at += 188u;
+    mock->segment_bytes[segment] = (size_t) (at - mock->segment[segment]);
+}
+
+/* MD-06: a media playlist opened directly is a mixed source, ready only
+   with video. Audio-only HLS and video with a late first SPS used to fill
+   the 64-sample queue and fail with its bound. */
+static int test_mixed_source_without_early_video(void)
+{
+    static const char media[] =
+        "#EXTM3U\n#EXTINF:4.000,\none.ts\n#EXT-X-ENDLIST\n";
+    for (unsigned variant = 0; variant < 3u; variant++) {
+        Budget budget;
+        budget_init(&budget, 2u * 1024u * 1024u);
+        char error[160] = {0};
+        MediaHlsPlaylist *playlist = media_hls_playlist_parse(
+            &budget, "https://media.invalid/path/list.m3u8",
+            (const unsigned char *) media, strlen(media),
+            error, sizeof(error));
+        CHECK(playlist != NULL);
+        static MockTransport mock;
+        memset(&mock, 0, sizeof(mock));
+        if (variant == 0u) build_audio_only_ts_segment(&mock, 0u);
+        else if (variant == 1u) build_raw_adts_segment(&mock, 0u);
+        else build_late_sps_segment(&mock, 0u);
+        MediaHlsTransport transport = {
+            .opaque = &mock, .start = mock_start,
+            .poll = mock_poll, .cancel = mock_cancel
+        };
+        MediaHlsSource *source = media_hls_source_create(
+            &budget, playlist, &transport, error, sizeof(error));
+        CHECK(source != NULL);
+        MediaHlsPrimeStatus status = MEDIA_HLS_PRIME_PENDING;
+        unsigned calls = 0;
+        while (calls < 64u && status == MEDIA_HLS_PRIME_PENDING) {
+            status = media_hls_source_prime(source, error, sizeof(error));
+            calls++;
+        }
+        MediaHlsStats stats = {0};
+        media_hls_source_stats(source, &stats);
+        static const char *const names[] = {
+            "audio-only TS", "packed audio", "late SPS"
+        };
+        printf("mixed %s: status=%d after %u calls, error=\"%s\", "
+               "preroll audio dropped=%zu\n", names[variant], (int) status,
+               calls, error, stats.preroll_audio_dropped);
+        CHECK(stats.queue_overflows == 0u);
+        if (variant < 2u) {
+            CHECK(status == MEDIA_HLS_PRIME_FAILED
+                  && strstr(error, "has no supported track") != NULL);
+        } else {
+            MediaMp4TrackInfo video = {0}, audio = {0};
+            CHECK(status == MEDIA_HLS_PRIME_READY
+                  && media_hls_source_stream_info(source, &video, &audio)
+                  && video.width == 432u && audio.sample_rate != 0u
+                  && stats.preroll_audio_dropped > 0u);
+        }
+        media_hls_source_destroy(source);
+        CHECK(budget.current == 0);
+    }
+    return 0;
+}
+
+/* A video-only segment whose IDR access unit spans `packets` continuation
+   TS packets after its first one, then one P picture that completes it. */
+static void build_large_keyframe_segment(MockTransport *mock, size_t segment,
+                                         uint64_t pts, unsigned packets)
+{
+    build_video_only_segment(mock, segment, pts);
+    unsigned char *at = mock->segment[segment]
+        + mock->segment_bytes[segment] - 188u;
+    unsigned char payload[184];
+    memset(payload, 0x55, sizeof(payload));
+    for (unsigned i = 0; i < packets; i++) {
+        ts_packet(at, 0x101u, false, payload, 183u);
+        at += 188u;
+    }
+    static const unsigned char picture[] = {0,0,1,0x41,0x80,0x22};
+    size_t bytes = pes(payload, 0xe0u, pts + 3600u, picture, sizeof(picture));
+    ts_packet(at, 0x101u, true, payload, bytes);
+    at += 188u;
+    mock->segment_bytes[segment] = (size_t) (at - mock->segment[segment]);
+}
+
+/* Prime used to parse one transport slice (at most one TS packet) per call,
+   and the open calls it once per main-loop frame: a first keyframe of S
+   bytes took S/184 frames, about 2 s for 20 KB at 60 fps, whatever the
+   network speed. A call now parses until the source is ready, the
+   transport waits, or a bounded slice of bytes arrived. */
+static int test_prime_parses_a_keyframe_in_few_visits(void)
+{
+    Budget budget;
+    budget_init(&budget, 2u * 1024u * 1024u);
+    static const char media[] =
+        "#EXTM3U\n#EXTINF:8.000,\none.ts\n#EXT-X-ENDLIST\n";
+    char error[160] = {0};
+    MediaHlsPlaylist *playlist = media_hls_playlist_parse(
+        &budget, "https://media.invalid/path/list.m3u8",
+        (const unsigned char *) media, strlen(media), error, sizeof(error));
+    CHECK(playlist != NULL);
+    static MockTransport mock;
+    memset(&mock, 0, sizeof(mock));
+    build_large_keyframe_segment(&mock, 0u, 90000u, 35u);
+    CHECK(mock.segment_bytes[0] == 188u * 39u);
+    MediaHlsTransport transport = {
+        .opaque = &mock,
+        .start = mock_start,
+        .poll = mock_poll,
+        .cancel = mock_cancel
+    };
+    MediaHlsSource *source = media_hls_source_create(
+        &budget, playlist, &transport, error, sizeof(error));
+    CHECK(source != NULL);
+    MediaHlsPrimeStatus status = MEDIA_HLS_PRIME_PENDING;
+    unsigned calls = 0;
+    while (calls < 256u && status == MEDIA_HLS_PRIME_PENDING) {
+        status = media_hls_source_prime(source, error, sizeof(error));
+        calls++;
+    }
+    MediaHlsStats stats = {0};
+    media_hls_source_stats(source, &stats);
+    printf("prime of a %zu-byte keyframe segment: %u calls\n",
+           mock.segment_bytes[0], calls);
+    CHECK(status == MEDIA_HLS_PRIME_READY);
+    CHECK(calls <= 2u);
+    CHECK(stats.queue_overflows == 0u && stats.segments_completed == 0u);
+    /* The keyframe and nothing past the picture that completed it. */
+    CHECK(stats.queued_samples == 1u);
+    MediaSampleSource samples;
+    CHECK(media_hls_source_sample_source(source, &samples));
+    MediaMp4Sample sample;
+    CHECK(samples.ops->next_sample(samples.opaque, &sample)
+          && sample.keyframe && sample.size > 35u * 183u);
     media_hls_source_destroy(source);
     CHECK(budget.current == 0);
     return 0;
@@ -2697,7 +3389,10 @@ static int test_vod_duration_and_liveness(void)
     }
     CHECK(media_hls_playlist_stream_finish(
               stream, error, sizeof(error)) == NULL
-          && strstr(error, "VOD") != NULL);
+          && strstr(error, "VOD") != NULL
+          && strncmp(error, MEDIA_HLS_PLAYLIST_TOO_LONG,
+                     strlen(MEDIA_HLS_PLAYLIST_TOO_LONG)) == 0);
+    printf("oversized VOD text: %s\n", error);
     media_hls_playlist_stream_destroy(stream);
     CHECK(budget.current == 0u);
     return 0;
@@ -2981,6 +3676,1187 @@ static int test_vod_seek_lands_on_segments_with_audio_rendition(void)
     return seek_rig_close(&rig);
 }
 
+typedef struct {
+    char first_url[96];
+    unsigned calls;
+} RecordingTransport;
+
+/* Records the first URL a source asks for and refuses every start, so
+   prime stays pending without bytes. */
+static uint64_t recording_start(void *opaque, const char *url,
+                                size_t maximum, char *error,
+                                size_t error_size)
+{
+    RecordingTransport *rig = opaque;
+    (void) maximum; (void) error; (void) error_size;
+    if (rig->calls++ == 0u)
+        snprintf(rig->first_url, sizeof(rig->first_url), "%s", url);
+    return 0;
+}
+
+static MediaHlsTransportPollResult recording_poll(
+    void *opaque, uint64_t handle, unsigned char *destination,
+    size_t capacity, size_t *length, char *error, size_t error_size)
+{
+    (void) opaque; (void) handle; (void) destination; (void) capacity;
+    (void) error; (void) error_size;
+    if (length != NULL) *length = 0;
+    return MEDIA_HLS_TRANSPORT_ERROR;
+}
+
+static void recording_cancel(void *opaque, uint64_t handle)
+{
+    (void) opaque; (void) handle;
+}
+
+static MediaHlsPlaylist *live_rendition_playlist(
+    Budget *budget, const char *name, unsigned first_sequence)
+{
+    char text[1024];
+    int at = snprintf(text, sizeof(text),
+                      "#EXTM3U\n#EXT-X-TARGETDURATION:6\n"
+                      "#EXT-X-MEDIA-SEQUENCE:%u\n", first_sequence);
+    for (unsigned i = 0; i < 10u && at > 0 && (size_t) at < sizeof(text); i++)
+        at += snprintf(text + at, sizeof(text) - (size_t) at,
+                       "#EXTINF:6.000,\n%s%u.ts\n", name, first_sequence + i);
+    char error[160] = {0};
+    return media_hls_playlist_parse(
+        budget, "https://media.invalid/live/rendition.m3u8",
+        (const unsigned char *) text, strlen(text), error, sizeof(error));
+}
+
+/* Renditions number their segments independently: equal sequence numbers
+   need not hold the same content. Before both are primed there is no
+   timestamp to compare, so each live source starts three segments from
+   the end of its own playlist. */
+static int test_live_renditions_start_at_their_own_edges(void)
+{
+    static const struct {
+        unsigned video_first, audio_first;
+        const char *video_url, *audio_url;
+    } cases[] = {
+        {100u, 101u, "https://media.invalid/live/v107.ts",
+         "https://media.invalid/live/a108.ts"},
+        {101u, 100u, "https://media.invalid/live/v108.ts",
+         "https://media.invalid/live/a107.ts"},
+        {100u, 100u, "https://media.invalid/live/v107.ts",
+         "https://media.invalid/live/a107.ts"},
+        {100u, 500u, "https://media.invalid/live/v107.ts",
+         "https://media.invalid/live/a507.ts"},
+    };
+    for (size_t at = 0; at < sizeof(cases) / sizeof(cases[0]); at++) {
+        Budget budget;
+        budget_init(&budget, 4u * 1024u * 1024u);
+        RecordingTransport rig[2] = {{{0}}};
+        MediaHlsTransport video_transport = {
+            .opaque = &rig[0], .start = recording_start,
+            .poll = recording_poll, .cancel = recording_cancel
+        };
+        MediaHlsTransport audio_transport = {
+            .opaque = &rig[1], .start = recording_start,
+            .poll = recording_poll, .cancel = recording_cancel
+        };
+        char error[160] = {0};
+        MediaHlsPlaylist *video_playlist = live_rendition_playlist(
+            &budget, "v", cases[at].video_first);
+        MediaHlsPlaylist *audio_playlist = live_rendition_playlist(
+            &budget, "a", cases[at].audio_first);
+        CHECK(video_playlist != NULL && audio_playlist != NULL);
+        MediaHlsSource *video = media_hls_source_create_track(
+            &budget, video_playlist, &video_transport,
+            MEDIA_HLS_TRACK_VIDEO, error, sizeof(error));
+        MediaHlsSource *audio = media_hls_source_create_track(
+            &budget, audio_playlist, &audio_transport,
+            MEDIA_HLS_TRACK_AUDIO, error, sizeof(error));
+        CHECK(video != NULL && audio != NULL);
+        /* Where 820ec87f called it, before either source has a timestamp:
+           it must change nothing. */
+        CHECK(!media_hls_source_align_live_start(video, audio));
+        CHECK(media_hls_source_prime(video, error, sizeof(error))
+                  == MEDIA_HLS_PRIME_PENDING
+              && media_hls_source_prime(audio, error, sizeof(error))
+                  == MEDIA_HLS_PRIME_PENDING);
+        printf("live renditions %u/%u start at %s and %s\n",
+               cases[at].video_first, cases[at].audio_first,
+               rig[0].first_url, rig[1].first_url);
+        CHECK(strcmp(rig[0].first_url, cases[at].video_url) == 0);
+        CHECK(strcmp(rig[1].first_url, cases[at].audio_url) == 0);
+        CHECK(!media_hls_source_align_live_start(video, audio));
+        media_hls_source_destroy(audio);
+        media_hls_source_destroy(video);
+        CHECK(budget.current == 0);
+    }
+    return 0;
+}
+
+#define TIMED_FRAMES 40u
+#define TIMED_TS_FRAME_TICKS 2090u
+/* What the source counts for one 1024-sample frame at 44.1 kHz. */
+#define TIMED_ADTS_FRAME_TICKS 2089u
+#define TIMED_PTS_MASK ((UINT64_C(1) << 33) - 1u)
+
+/* A live rendition served by timestamp. Segment `n` of a playlist whose
+   first segment is `first_sequence` starts at raw PTS
+   first_pts + (n - first_sequence) * segment_ms * 90 (33-bit). Audio
+   segments carry TIMED_FRAMES 9-byte ADTS frames whose two payload bytes
+   are the segment number's low byte and the frame's index, so a test can
+   tell which content it was handed. */
+typedef struct {
+    bool active;
+    size_t length;
+    size_t offset;
+    unsigned char bytes[188u * (TIMED_FRAMES + 4u)];
+} TimedSlot;
+
+typedef struct {
+    char prefix;
+    bool audio;
+    bool packed;        /* ID3 then ADTS, instead of MPEG-TS */
+    bool priv;          /* packed: the ID3 tag has the timestamp PRIV */
+    unsigned first_sequence;
+    unsigned segment_ms;
+    unsigned count;
+    uint64_t first_pts;
+    /* Numbers from first_sequence + renumber serve the content numbered
+       renumber lower: the playlist was renumbered. */
+    unsigned renumber;
+    /* Content from segment restart_at on (0: none) carries a clock that
+       restarted at restart_pts: the packager restarted. */
+    unsigned restart_at;
+    uint64_t restart_pts;
+    /* Video from segment slow_from on (0: none) has half the pictures,
+       twice as far apart, after an EXT-X-DISCONTINUITY: a new encoder. */
+    unsigned slow_from;
+    unsigned requested[32];
+    unsigned request_count;
+    TimedSlot slot[2];
+    /* Segment reads wait while *clock_us lies in [stall_from_us,
+       stall_to_us): the network stalls (clock_us NULL: never). */
+    const uint64_t *clock_us;
+    uint64_t stall_from_us, stall_to_us;
+} TimedRendition;
+
+/* Where content segment `sequence` starts, on the clock it began on. */
+static uint64_t timed_content(const TimedRendition *rendition,
+                              unsigned sequence)
+{
+    return (rendition->first_pts
+            + (uint64_t) (sequence - rendition->first_sequence)
+                * rendition->segment_ms * 90u) & TIMED_PTS_MASK;
+}
+
+/* The PTS segment `sequence` carries. */
+static uint64_t timed_pts(const TimedRendition *rendition, unsigned sequence)
+{
+    if (rendition->restart_at == 0 || sequence < rendition->restart_at)
+        return timed_content(rendition, sequence);
+    return (rendition->restart_pts
+            + (uint64_t) (sequence - rendition->restart_at)
+                * rendition->segment_ms * 90u) & TIMED_PTS_MASK;
+}
+
+static void timed_adts_frame(unsigned char frame[9], unsigned sequence,
+                             unsigned index)
+{
+    static const unsigned char header[] = {
+        0xff,0xf1,0x50,0x80,0x01,0x3f,0xfc
+    };
+    memcpy(frame, header, sizeof(header));
+    frame[7] = (unsigned char) sequence;
+    frame[8] = (unsigned char) index;
+}
+
+static size_t timed_audio_segment(const TimedRendition *rendition,
+                                  unsigned sequence, unsigned char *out)
+{
+    uint64_t pts = timed_pts(rendition, sequence);
+    unsigned char *at = out;
+    unsigned char frame[9];
+    if (rendition->packed) {
+        static const char owner[] =
+            "com.apple.streaming.transportStreamTimestamp";
+        static const unsigned char tag[] = {'I','D','3',4,0,0,0,0,0,63};
+        static const unsigned char priv[] = {'P','R','I','V',0,0,0,53,0,0};
+        static const unsigned char other[] = {
+            'I','D','3',4,0,0,0,0,0,4,'t','e','s','t'
+        };
+        if (rendition->priv) {
+            memcpy(at, tag, sizeof(tag)); at += sizeof(tag);
+            memcpy(at, priv, sizeof(priv)); at += sizeof(priv);
+            memcpy(at, owner, sizeof(owner)); at += sizeof(owner);
+            for (unsigned i = 0; i < 8u; i++)
+                *at++ = (unsigned char) (pts >> (56u - 8u * i));
+        } else {
+            memcpy(at, other, sizeof(other)); at += sizeof(other);
+        }
+        for (unsigned i = 0; i < TIMED_FRAMES; i++) {
+            timed_adts_frame(at, sequence, i);
+            at += 9u;
+        }
+        return (size_t) (at - out);
+    }
+    static const unsigned char pat[] = {
+        0x00,0xb0,0x0d,0,1,0xc1,0,0,0,1,0xe1,0,0,0,0,0
+    };
+    static const unsigned char pmt[] = {
+        0x02,0xb0,0x12,0,1,0xc1,0,0,0xe1,2,0xf0,0,
+        0x0f,0xe1,2,0xf0,0,0,0,0,0
+    };
+    psi_packet(at, 0, pat, sizeof(pat)); at += 188u;
+    psi_packet(at, 0x100u, pmt, sizeof(pmt)); at += 188u;
+    unsigned char payload[184];
+    for (unsigned i = 0; i < TIMED_FRAMES; i++) {
+        timed_adts_frame(frame, sequence, i);
+        size_t bytes = pes(payload, 0xc0u,
+                           pts + (uint64_t) i * TIMED_TS_FRAME_TICKS,
+                           frame, sizeof(frame));
+        ts_packet(at, 0x102u, true, payload, bytes);
+        at += 188u;
+    }
+    return (size_t) (at - out);
+}
+
+static unsigned timed_video_frames(const TimedRendition *rendition,
+                                   unsigned sequence)
+{
+    return rendition->slow_from != 0 && sequence >= rendition->slow_from
+        ? TIMED_FRAMES / 2u : TIMED_FRAMES;
+}
+
+static uint64_t timed_video_tick(const TimedRendition *rendition,
+                                 unsigned sequence)
+{
+    return (uint64_t) rendition->segment_ms * 90u
+        / timed_video_frames(rendition, sequence);
+}
+
+/* An IDR then TIMED_FRAMES - 1 P pictures spread over the segment, one TS
+   packet each. Each picture's slice data ends with its index and the low
+   byte of the segment's number, so a test can tell what it was handed. */
+static size_t timed_video_segment(const TimedRendition *rendition,
+                                  unsigned sequence, unsigned char *out)
+{
+    static const unsigned char pat[] = {
+        0x00,0xb0,0x0d,0,1,0xc1,0,0,0,1,0xe1,0,0,0,0,0
+    };
+    static const unsigned char pmt[] = {
+        0x02,0xb0,0x12,0,1,0xc1,0,0,0xe1,1,0xf0,0,
+        0x1b,0xe1,1,0xf0,0,0,0,0,0
+    };
+    uint64_t pts = timed_pts(rendition, sequence);
+    unsigned char *at = out;
+    psi_packet(at, 0, pat, sizeof(pat)); at += 188u;
+    psi_packet(at, 0x100u, pmt, sizeof(pmt)); at += 188u;
+    unsigned char au[128] = {0,0,1};
+    size_t length = 3u + make_sps(au + 3u);
+    const unsigned char idr[] = {
+        0,0,1,0x68,0xce,0x06,0xe2, 0,0,1,0x65,0x80,0,
+        (unsigned char) sequence
+    };
+    memcpy(au + length, idr, sizeof(idr));
+    length += sizeof(idr);
+    unsigned char payload[184];
+    for (unsigned i = 0; i < timed_video_frames(rendition, sequence); i++) {
+        const unsigned char picture[] = {
+            0,0,1,0x41,0x80,(unsigned char) i,(unsigned char) sequence
+        };
+        size_t bytes = i == 0
+            ? pes(payload, 0xe0u, pts, au, length)
+            : pes(payload, 0xe0u,
+                  (pts + i * timed_video_tick(rendition, sequence))
+                      & TIMED_PTS_MASK,
+                  picture, sizeof(picture));
+        ts_packet(at, 0x101u, true, payload, bytes);
+        at += 188u;
+    }
+    return (size_t) (at - out);
+}
+
+static uint64_t timed_start(void *opaque, const char *url, size_t maximum,
+                            char *error, size_t error_size)
+{
+    TimedRendition *rendition = opaque;
+    (void) maximum; (void) error; (void) error_size;
+    const char *name = strrchr(url, '/');
+    if (name == NULL || name[1] != rendition->prefix) return 0;
+    unsigned sequence = (unsigned) strtoul(name + 2, NULL, 10);
+    if (rendition->renumber != 0
+        && sequence >= rendition->first_sequence + rendition->renumber)
+        sequence -= rendition->renumber;
+    for (size_t i = 0; i < 2u; i++) {
+        if (rendition->slot[i].active) continue;
+        rendition->slot[i].active = true;
+        rendition->slot[i].offset = 0;
+        rendition->slot[i].length = rendition->audio
+            ? timed_audio_segment(rendition, sequence,
+                                  rendition->slot[i].bytes)
+            : timed_video_segment(rendition, sequence,
+                                  rendition->slot[i].bytes);
+        if (rendition->request_count < 32u)
+            rendition->requested[rendition->request_count] = sequence;
+        rendition->request_count++;
+        return i + 1u;
+    }
+    return 0;
+}
+
+static MediaHlsTransportPollResult timed_poll(
+    void *opaque, uint64_t handle, unsigned char *destination,
+    size_t capacity, size_t *length, char *error, size_t error_size)
+{
+    TimedRendition *rendition = opaque;
+    (void) error; (void) error_size;
+    *length = 0;
+    if (handle == 0 || handle > 2u || !rendition->slot[handle - 1u].active)
+        return MEDIA_HLS_TRANSPORT_ERROR;
+    TimedSlot *slot = &rendition->slot[handle - 1u];
+    if (rendition->clock_us != NULL
+        && *rendition->clock_us >= rendition->stall_from_us
+        && *rendition->clock_us < rendition->stall_to_us)
+        return MEDIA_HLS_TRANSPORT_WAIT;
+    if (slot->offset == slot->length) {
+        slot->active = false;
+        return MEDIA_HLS_TRANSPORT_COMPLETE;
+    }
+    size_t bytes = slot->length - slot->offset;
+    /* Small reads: a packed segment's ID3 tag arrives in two. */
+    if (bytes > 50u) bytes = 50u;
+    if (bytes > capacity) bytes = capacity;
+    memcpy(destination, slot->bytes + slot->offset, bytes);
+    slot->offset += bytes;
+    *length = bytes;
+    return MEDIA_HLS_TRANSPORT_CHUNK;
+}
+
+static void timed_cancel(void *opaque, uint64_t handle)
+{
+    TimedRendition *rendition = opaque;
+    if (handle != 0 && handle <= 2u) rendition->slot[handle - 1u].active = false;
+}
+
+/* The live window of `count` segments from `first`. */
+static MediaHlsPlaylist *timed_window_playlist(
+    Budget *budget, const TimedRendition *rendition, unsigned first,
+    unsigned count)
+{
+    static char text[4096];
+    int at = snprintf(text, sizeof(text),
+                      "#EXTM3U\n#EXT-X-TARGETDURATION:%u\n"
+                      "#EXT-X-MEDIA-SEQUENCE:%u\n",
+                      (rendition->segment_ms + 999u) / 1000u, first);
+    for (unsigned i = 0; i < count && at > 0
+         && (size_t) at < sizeof(text); i++) {
+        if (rendition->slow_from != 0
+            && first + i == rendition->slow_from + rendition->renumber)
+            at += snprintf(text + at, sizeof(text) - (size_t) at,
+                           "#EXT-X-DISCONTINUITY\n");
+        at += snprintf(text + at, sizeof(text) - (size_t) at,
+                       "#EXTINF:%u.%03u,\n%c%u.%s\n",
+                       rendition->segment_ms / 1000u,
+                       rendition->segment_ms % 1000u, rendition->prefix,
+                       first + i, rendition->packed ? "aac" : "ts");
+    }
+    char error[160] = {0};
+    return media_hls_playlist_parse(
+        budget, "https://media.invalid/live/rendition.m3u8",
+        (const unsigned char *) text, strlen(text), error, sizeof(error));
+}
+
+static MediaHlsPlaylist *timed_playlist(Budget *budget,
+                                        const TimedRendition *rendition)
+{
+    return timed_window_playlist(budget, rendition,
+                                 rendition->first_sequence, rendition->count);
+}
+
+/* The open as psp_media_hls drives it: prime the video, then the audio;
+   align; when that moved or emptied the audio, prime it again. The align
+   call before the first prime is where 820ec87f made it. Counts the
+   aligns that asked for another prime. */
+static int timed_open(MediaHlsSource *video, MediaHlsSource *audio,
+                      unsigned *reprimes)
+{
+    char error[160] = {0};
+    (void) media_hls_source_align_live_start(video, audio);
+    size_t priming = 0;
+    *reprimes = 0;
+    for (unsigned guard = 0; guard < 1024u; guard++) {
+        MediaHlsPrimeStatus status = media_hls_source_prime(
+            priming == 0 ? video : audio, error, sizeof(error));
+        CHECK(status != MEDIA_HLS_PRIME_FAILED);
+        if (status == MEDIA_HLS_PRIME_PENDING) continue;
+        if (++priming < 2u) continue;
+        if (!media_hls_source_align_live_start(video, audio)) return 0;
+        (*reprimes)++;
+        CHECK(*reprimes <= 2u);
+        priming = 1;
+    }
+    CHECK(!"the open finished");
+    return 1;
+}
+
+static int64_t timed_signed33(uint64_t ticks)
+{
+    ticks &= TIMED_PTS_MASK;
+    return ticks > (TIMED_PTS_MASK >> 1)
+        ? (int64_t) ticks - (int64_t) (TIMED_PTS_MASK + 1u)
+        : (int64_t) ticks;
+}
+
+/* External P2 finding 1: a demuxed live open lines the audio up with the
+   video by the first timestamps both sources primed, whatever their
+   segment numbers and durations, and keeps the MD-04 race (the audio
+   playlist fetched one segment later) closed. */
+static int test_live_renditions_align_by_timestamp(void)
+{
+    /* Content time 600 s is raw PTS 90,000 * 600 (plus `bias` for the
+       audio, its first frame's offset from the picture). */
+    const uint64_t base = UINT64_C(54000000);
+    const uint64_t wrap_base =
+        ((UINT64_C(1) << 33) + 1000u - 7u * 540000u) & TIMED_PTS_MASK;
+    static const struct {
+        const char *name;
+        unsigned video_first, video_ms, video_count;
+        unsigned audio_first, audio_ms, audio_count;
+        int64_t audio_skew;   /* audio window's first content - video's */
+        int64_t bias;         /* audio segment start - picture start */
+        bool packed, priv, wrap, related;
+        unsigned audio_start, audio_moved;  /* 0: no second fetch */
+        int64_t first_audio;  /* expected dts of the first audio unit */
+    } cases[] = {
+        {"MD-04 race, same numbering", 100, 6000, 10, 101, 6000, 10,
+         540000, 0, false, false, false, true, 108, 107, 0},
+        {"audio numbered one higher", 100, 6000, 10, 101, 6000, 10,
+         0, 0, false, false, false, true, 108, 0, 0},
+        {"audio numbered 1000 higher, and the race", 100, 6000, 10,
+         1101, 6000, 10, 540000, 0, false, false, false, true, 1108, 1107, 0},
+        {"2 s audio against 6 s video", 100, 6000, 10, 100, 2000, 30,
+         0, 0, false, false, false, true, 127, 121, 0},
+        {"6 s audio against 2 s video", 100, 2000, 30, 100, 6000, 10,
+         0, 0, false, false, false, true, 107, 109, 0},
+        {"audio 50 ms before the picture", 100, 6000, 10, 100, 6000, 10,
+         0, -4500, false, false, false, true, 107, 0, 1770},
+        {"audio 30 ms after the picture", 100, 6000, 10, 100, 6000, 10,
+         0, 2700, false, false, false, true, 107, 0, 2700},
+        {"clocks an hour apart", 100, 6000, 10, 100, 6000, 10,
+         0, 324000000, false, false, false, false, 107, 0, 0},
+        {"PTS wrap between audio and picture", 100, 6000, 10, 100, 6000, 10,
+         0, -4500, false, false, true, true, 107, 0, 1770},
+        {"packed audio, ID3 timestamp, renumbered and late", 100, 6000, 10,
+         1101, 6000, 10, 540000, -4500, true, true, false, true,
+         1108, 1107, 3u * TIMED_ADTS_FRAME_TICKS - 4500},
+        {"packed audio without an ID3 timestamp", 100, 6000, 10,
+         100, 6000, 10, 0, -4500, true, false, false, false, 107, 0, 0},
+        /* No timestamp: matched by place on the playlist timeline, the
+           time from each playlist's end (both end at the live edge). */
+        {"packed audio without an ID3 timestamp, 2 s against 6 s video",
+         100, 6000, 10, 100, 2000, 30, 0, 0, true, false, false, true,
+         127, 121, 0},
+        {"packed audio without an ID3 timestamp, 6 s against 2 s video",
+         100, 2000, 30, 100, 6000, 10, 0, 0, true, false, false, true,
+         107, 109, 0},
+    };
+
+    static TimedRendition video_rendition, audio_rendition;
+    for (size_t at = 0; at < sizeof(cases) / sizeof(cases[0]); at++) {
+        Budget budget;
+        budget_init(&budget, 4u * 1024u * 1024u);
+        uint64_t origin = cases[at].wrap ? wrap_base : base;
+        memset(&video_rendition, 0, sizeof(video_rendition));
+        memset(&audio_rendition, 0, sizeof(audio_rendition));
+        video_rendition = (TimedRendition) {
+            .prefix = 'v', .first_sequence = cases[at].video_first,
+            .segment_ms = cases[at].video_ms,
+            .count = cases[at].video_count, .first_pts = origin
+        };
+        audio_rendition = (TimedRendition) {
+            .prefix = 'a', .audio = true, .packed = cases[at].packed,
+            .priv = cases[at].priv,
+            .first_sequence = cases[at].audio_first,
+            .segment_ms = cases[at].audio_ms,
+            .count = cases[at].audio_count,
+            .first_pts = (origin + (uint64_t) cases[at].audio_skew
+                          + (uint64_t) cases[at].bias) & TIMED_PTS_MASK
+        };
+        MediaHlsTransport video_ops = {
+            .opaque = &video_rendition, .start = timed_start,
+            .poll = timed_poll, .cancel = timed_cancel
+        };
+        MediaHlsTransport audio_ops = video_ops;
+        audio_ops.opaque = &audio_rendition;
+        char error[160] = {0};
+        MediaHlsPlaylist *video_playlist =
+            timed_playlist(&budget, &video_rendition);
+        MediaHlsPlaylist *audio_playlist =
+            timed_playlist(&budget, &audio_rendition);
+        CHECK(video_playlist != NULL && audio_playlist != NULL);
+        MediaHlsSource *video = media_hls_source_create_track(
+            &budget, video_playlist, &video_ops, MEDIA_HLS_TRACK_VIDEO,
+            error, sizeof(error));
+        MediaHlsSource *audio = media_hls_source_create_track(
+            &budget, audio_playlist, &audio_ops, MEDIA_HLS_TRACK_AUDIO,
+            error, sizeof(error));
+        CHECK(video != NULL && audio != NULL);
+        unsigned reprimes = 0;
+        CHECK(timed_open(video, audio, &reprimes) == 0);
+        MediaSampleSource video_samples = {0}, audio_samples = {0};
+        CHECK(media_hls_source_sample_source(video, &video_samples)
+              && media_hls_source_sample_source(audio, &audio_samples));
+        /* The player's construction probe still lands: a moved or trimmed
+           audio source has given nothing out yet. */
+        uint64_t landing = 1;
+        CHECK(audio_samples.ops->seek_us(audio_samples.opaque, 0, &landing)
+              && landing == 0
+              && video_samples.ops->seek_us(video_samples.opaque, 0,
+                                            &landing));
+        MediaMp4Sample video_sample = {0}, audio_sample = {0};
+        unsigned char payload[512];
+        CHECK(video_samples.ops->next_sample(video_samples.opaque,
+                                             &video_sample)
+              && video_sample.keyframe
+              && video_samples.ops->read_sample(
+                     video_samples.opaque, &video_sample,
+                     payload, sizeof(payload)));
+        CHECK(audio_samples.ops->next_sample(audio_samples.opaque,
+                                             &audio_sample)
+              && audio_sample.size == 9u
+              && audio_samples.ops->read_sample(
+                     audio_samples.opaque, &audio_sample,
+                     payload, sizeof(payload)));
+        /* Which content the first audio unit holds, as a raw PTS. */
+        unsigned sequence = audio_rendition.first_sequence
+            + ((payload[7] - audio_rendition.first_sequence) & 0xffu);
+        uint64_t audio_raw = timed_pts(&audio_rendition, sequence)
+            + (uint64_t) payload[8] * (cases[at].packed
+                  ? TIMED_ADTS_FRAME_TICKS : TIMED_TS_FRAME_TICKS);
+        uint64_t video_raw =
+            timed_pts(&video_rendition, video_rendition.requested[0]);
+        /* Content apart minus clock apart: what a viewer hears off the
+           picture, in 90 kHz ticks. */
+        int64_t error_ticks = timed_signed33(audio_raw - video_raw)
+            - (int64_t) (audio_sample.dts - video_sample.dts);
+        char moved[16] = "";
+        if (audio_rendition.request_count > 1u)
+            snprintf(moved, sizeof(moved), " then a%u",
+                     audio_rendition.requested[1]);
+        printf("live renditions, %s: video v%u, audio a%u%s "
+               "(%u fetches, %u reprimes); first audio unit %u:%u at "
+               "%lld ticks, %lld ticks off the picture\n",
+               cases[at].name, video_rendition.requested[0],
+               audio_rendition.requested[0], moved,
+               audio_rendition.request_count, reprimes,
+               sequence, (unsigned) payload[8],
+               (long long) audio_sample.dts, (long long) error_ticks);
+        CHECK(video_sample.dts == 0);
+        CHECK(audio_rendition.requested[0] == cases[at].audio_start);
+        if (cases[at].audio_moved != 0) {
+            CHECK(audio_rendition.request_count >= 2u
+                  && audio_rendition.requested[1] == cases[at].audio_moved);
+        } else {
+            CHECK(audio_rendition.request_count == 1u);
+        }
+        CHECK(audio_sample.dts == (uint64_t) cases[at].first_audio);
+        /* Same content, same clock time; but clocks an hour apart keep
+           main's start at zero, and so does audio with no timestamp
+           whose segments are as long as the video's (nothing tells the
+           50 ms apart). */
+        if (cases[at].related) CHECK(error_ticks == 0);
+        CHECK(!media_hls_source_align_live_start(video, audio));
+        media_hls_source_destroy(audio);
+        media_hls_source_destroy(video);
+        CHECK(budget.current == 0);
+    }
+    return 0;
+}
+
+/* What content a taken unit holds, as a raw PTS: the segment from its
+   payload tag (the low byte of its number), then its place in it. */
+static uint64_t timed_unit_raw(const TimedRendition *rendition,
+                               const MediaMp4Sample *sample,
+                               const unsigned char *payload)
+{
+    unsigned tag = rendition->audio ? payload[7] : payload[sample->size - 1u];
+    unsigned sequence = rendition->first_sequence
+        + ((tag - rendition->first_sequence) & 0xffu);
+    uint64_t raw = timed_content(rendition, sequence);
+    if (rendition->audio)
+        return raw + (uint64_t) payload[8] * (rendition->packed
+            ? TIMED_ADTS_FRAME_TICKS : TIMED_TS_FRAME_TICKS);
+    return raw
+        + payload[sample->size - 2u] * timed_video_tick(rendition, sequence);
+}
+
+typedef struct {
+    unsigned taken;
+    unsigned last_sequence;
+    uint64_t last_dts;
+    uint32_t last_duration;
+    /* Units given out at or before the previous one's time. The audio
+       output is the clock and counts what it played, so sound that runs
+       back over itself puts the picture behind for good. */
+    unsigned backwards;
+    /* Content (ticks after the video's first segment) minus clock time.
+       Equal for both tracks when sound and picture are in step. */
+    int64_t offset;
+} TimedTrack;
+
+/* Takes units as the player does: always the earlier of the two heads,
+   and only while both have one. */
+static int timed_take(MediaSampleSource samples[2],
+                      TimedRendition *rendition[2], TimedTrack track[2],
+                      unsigned *taken)
+{
+    *taken = 0;
+    for (unsigned take = 0; take < 64u; take++) {
+        MediaMp4Sample head[2] = {{0}};
+        if (!samples[0].ops->next_sample(samples[0].opaque, &head[0])
+            || !samples[1].ops->next_sample(samples[1].opaque, &head[1]))
+            break;
+        size_t pick = head[1].dts < head[0].dts ? 1u : 0u;
+        unsigned char payload[512];
+        CHECK(head[pick].size <= sizeof(payload)
+              && samples[pick].ops->read_sample(
+                     samples[pick].opaque, &head[pick], payload,
+                     sizeof(payload)));
+        uint64_t raw = timed_unit_raw(rendition[pick], &head[pick], payload);
+        if (track[pick].taken != 0 && head[pick].dts <= track[pick].last_dts)
+            track[pick].backwards++;
+        track[pick].last_dts = head[pick].dts;
+        track[pick].last_duration = head[pick].duration;
+        track[pick].taken++;
+        track[pick].last_sequence = rendition[pick]->audio
+            ? payload[7] : payload[head[pick].size - 1u];
+        track[pick].offset = timed_signed33(raw - rendition[0]->first_pts)
+            - (int64_t) head[pick].dts;
+        (*taken)++;
+    }
+    return 0;
+}
+
+/* Plays both sources as the player does (always the earlier of the two
+   heads, and only while both have one) and hands each rendition
+   `refreshes` live refreshes as it asks for them, the windows of ten
+   segments from window_first[i], then one later each time. With more than
+   one the play runs for a simulated two and a half minutes (20 ms steps),
+   past the 60 s stall limit, whatever is taken. */
+static int timed_play(MediaHlsSource *source[2], TimedRendition *rendition[2],
+                      const unsigned window_first[2], unsigned refreshes,
+                      Budget *budget, TimedTrack track[2])
+{
+    MediaSampleSource samples[2] = {{0}};
+    for (size_t i = 0; i < 2u; i++)
+        CHECK(media_hls_source_sample_source(source[i], &samples[i]));
+    unsigned served[2] = {0, 0};
+    unsigned idle = 0;
+    const unsigned steps = refreshes > 1u ? 7500u : 4000u;
+    const unsigned idle_limit = refreshes > 1u ? steps : 50u;
+    uint64_t now = 1;
+    for (unsigned step = 0; step < steps && idle < idle_limit; step++) {
+        now += 20000u;
+        for (size_t i = 0; i < 2u; i++) {
+            media_hls_source_pump(source[i], now);
+            if (served[i] >= refreshes
+                || !media_hls_source_wants_playlist_refresh(source[i], now))
+                continue;
+            char error[160] = {0};
+            MediaHlsPlaylist *window = timed_window_playlist(
+                budget, rendition[i], window_first[i] + served[i], 10u);
+            CHECK(window != NULL);
+            CHECK(media_hls_source_update_playlist(
+                source[i], window, now, error, sizeof(error)));
+            served[i]++;
+        }
+        idle++;
+        unsigned taken = 0;
+        CHECK(timed_take(samples, rendition, track, &taken) == 0);
+        if (taken != 0) idle = 0;
+        if (media_hls_source_failed(source[0])
+            || media_hls_source_failed(source[1]))
+            printf("source failed at simulated %llu ms\n",
+                   (unsigned long long) (now / 1000u));
+        CHECK(!media_hls_source_failed(source[0])
+              && !media_hls_source_failed(source[1]));
+    }
+    CHECK(served[0] != 0 && served[1] != 0);
+    return 0;
+}
+
+static bool timed_requested(const TimedRendition *rendition,
+                            unsigned first, unsigned last)
+{
+    for (unsigned i = 0; i < rendition->request_count && i < 32u; i++)
+        if (rendition->requested[i] >= first
+            && rendition->requested[i] <= last) return true;
+    return false;
+}
+
+/* Remaining-work item (live HLS): a live source that falls behind its
+   window skips to the window's first segment. Each rendition used to
+   continue its own clock past the skip, so when only one of them skipped,
+   or they skipped by different amounts, sound and picture drifted apart by
+   the difference for the rest of the session. */
+static int test_live_window_skips_keep_renditions_together(void)
+{
+    /* Where content segment 115 starts on the video's original clock. */
+    const uint64_t at115 = UINT64_C(54000000) + 15u * UINT64_C(540000);
+    static const struct {
+        const char *name;
+        bool packed, priv;
+        unsigned video_window, audio_window;
+        unsigned video_renumber;
+        /* The rendition that did not skip must not fetch these: both
+           tracks drop that content, whole segments unfetched. */
+        unsigned unfetched_first, unfetched_last;
+        /* The video's clock restarts at content segment 115 (0: never). */
+        unsigned restart_at;
+        uint64_t restart_pts;
+        /* Sound minus picture: 0, or for a skip nothing measured, the
+           skipped content (the offset from before skips were shared). */
+        int64_t apart;
+    } cases[] = {
+        {"both skip to 115", false, false, 115, 115, 0, 0, 0, 0, 0, 0},
+        {"only the video skips", false, false, 115, 108, 0, 111, 114,
+         0, 0, 0},
+        {"only the audio skips", false, false, 108, 115, 0, 111, 114,
+         0, 0, 0},
+        {"they skip by different amounts", false, false, 115, 112, 0, 0, 0,
+         0, 0, 0},
+        /* The timestamps, not the count of skipped numbers, measure it. */
+        {"only the video skips, renumbered 1000 higher", false, false,
+         115, 108, 1000, 111, 114, 0, 0, 0},
+        /* No usable timestamp: the numbers and EXTINF do. */
+        {"only the video skips, its PTS clock restarts", false, false,
+         115, 108, 0, 111, 114, 115, 900000u, 0},
+        /* Neither measures it: the estimate (about 6000 s) is the numbers
+           jumping, not content, so the audio keeps playing what it has,
+           off by the skipped 42 s. Sharing it dropped all the audio, and
+           the source failed 60 s later. */
+        {"only the video skips, renumbered 1000 higher, PTS clock restarts",
+         false, false, 115, 108, 1000, 0, 0, 115, 900000u, -3780000},
+        /* A restarted clock that lands 1000 s on agrees with no count the
+           playlists can account for. */
+        {"only the video skips, renumbered 1000 higher, PTS 1000 s on",
+         false, false, 115, 108, 1000, 0, 0, 115,
+         at115 + UINT64_C(90000000), -3780000},
+        {"packed audio with PRIV, only the audio skips", true, true,
+         108, 115, 0, 111, 114, 0, 0, 0},
+        {"packed audio without PRIV, both skip", true, false,
+         115, 115, 0, 0, 0, 0, 0, 0},
+        {"packed audio without PRIV, only the video skips", true, false,
+         115, 108, 0, 111, 114, 0, 0, 0},
+        {"packed audio without PRIV, only the audio skips", true, false,
+         108, 115, 0, 111, 114, 0, 0, 0},
+    };
+    static TimedRendition video_rendition, audio_rendition;
+    for (size_t at = 0; at < sizeof(cases) / sizeof(cases[0]); at++) {
+        Budget budget;
+        budget_init(&budget, 4u * 1024u * 1024u);
+        memset(&video_rendition, 0, sizeof(video_rendition));
+        memset(&audio_rendition, 0, sizeof(audio_rendition));
+        video_rendition = (TimedRendition) {
+            .prefix = 'v', .first_sequence = 100u, .segment_ms = 6000u,
+            .count = 10u, .first_pts = UINT64_C(54000000),
+            .renumber = cases[at].video_renumber,
+            .restart_at = cases[at].restart_at,
+            .restart_pts = cases[at].restart_pts
+        };
+        audio_rendition = (TimedRendition) {
+            .prefix = 'a', .audio = true, .packed = cases[at].packed,
+            .priv = cases[at].priv, .first_sequence = 100u,
+            .segment_ms = 6000u, .count = 10u,
+            .first_pts = UINT64_C(54000000)
+        };
+        MediaHlsTransport video_ops = {
+            .opaque = &video_rendition, .start = timed_start,
+            .poll = timed_poll, .cancel = timed_cancel
+        };
+        MediaHlsTransport audio_ops = video_ops;
+        audio_ops.opaque = &audio_rendition;
+        char error[160] = {0};
+        MediaHlsPlaylist *video_playlist =
+            timed_playlist(&budget, &video_rendition);
+        MediaHlsPlaylist *audio_playlist =
+            timed_playlist(&budget, &audio_rendition);
+        CHECK(video_playlist != NULL && audio_playlist != NULL);
+        MediaHlsSource *source[2] = {
+            media_hls_source_create_track(
+                &budget, video_playlist, &video_ops, MEDIA_HLS_TRACK_VIDEO,
+                error, sizeof(error)),
+            media_hls_source_create_track(
+                &budget, audio_playlist, &audio_ops, MEDIA_HLS_TRACK_AUDIO,
+                error, sizeof(error))
+        };
+        CHECK(source[0] != NULL && source[1] != NULL);
+        unsigned reprimes = 0;
+        CHECK(timed_open(source[0], source[1], &reprimes) == 0);
+        TimedRendition *rendition[2] = {&video_rendition, &audio_rendition};
+        const unsigned window[2] = {
+            cases[at].video_window + cases[at].video_renumber,
+            cases[at].audio_window
+        };
+        TimedTrack track[2] = {{0}};
+        CHECK(timed_play(source, rendition, window, 1u, &budget, track)
+              == 0);
+        MediaHlsStats stats[2];
+        media_hls_source_stats(source[0], &stats[0]);
+        media_hls_source_stats(source[1], &stats[1]);
+        int64_t apart = track[1].offset - track[0].offset;
+        printf("live window skip, %s: skipped v%zu a%zu; last v%u a%u "
+               "(%u and %u units, %u sound units back), sound %lld ticks "
+               "off the picture\n",
+               cases[at].name, stats[0].skipped_live_segments,
+               stats[1].skipped_live_segments, track[0].last_sequence,
+               track[1].last_sequence, track[0].taken, track[1].taken,
+               track[1].backwards, (long long) apart);
+        /* Both played past the skip, and in step. */
+        CHECK(track[0].last_sequence >= 115u
+              && track[1].last_sequence >= 115u);
+        CHECK(apart == cases[at].apart && track[1].backwards == 0);
+        if (cases[at].unfetched_first != 0) {
+            const TimedRendition *follower =
+                cases[at].video_window < cases[at].audio_window
+                    ? &video_rendition : &audio_rendition;
+            CHECK(!timed_requested(follower, cases[at].unfetched_first,
+                                   cases[at].unfetched_last));
+        }
+        media_hls_source_destroy(source[1]);
+        media_hls_source_destroy(source[0]);
+        CHECK(budget.current == 0);
+    }
+    return 0;
+}
+
+/* Review finding MS-1: the rendition that did not skip passes the skipped
+   segments unfetched, and when its playlist lags it passes them one
+   refresh at a time, at the playlist's end each time. Those refreshes add
+   a segment but do not move it past where it stood, so the stall limit
+   (60 s at the playlist's end with no progress) ran across the whole
+   pass. Here the audio's playlist is at the live edge and skips 26
+   segments (156 s, measured by its timestamps); the video's playlist lags
+   and adds one segment per refresh (every 3 s), so the video passes for
+   about 75 s before it reaches content to fetch.
+   Review finding MS-3: every pass there ends at the playlist's end, where
+   no next entry can be flagged as a discontinuity, so the first segment
+   fetched after the pass was parsed as if it followed the last one
+   fetched before it. A new encoder starts at 120, inside the pass, with
+   half the frame rate; the picture interval learnt before the pass (the
+   smallest gap seen since the last discontinuity) stayed in force. */
+static int test_live_partner_passes_a_long_skip(void)
+{
+    Budget budget;
+    budget_init(&budget, 4u * 1024u * 1024u);
+    static TimedRendition video_rendition, audio_rendition;
+    memset(&video_rendition, 0, sizeof(video_rendition));
+    memset(&audio_rendition, 0, sizeof(audio_rendition));
+    video_rendition = (TimedRendition) {
+        .prefix = 'v', .first_sequence = 100u, .segment_ms = 6000u,
+        .count = 10u, .first_pts = UINT64_C(54000000), .slow_from = 120u
+    };
+    audio_rendition = (TimedRendition) {
+        .prefix = 'a', .audio = true, .first_sequence = 100u,
+        .segment_ms = 6000u, .count = 10u, .first_pts = UINT64_C(54000000)
+    };
+    MediaHlsTransport video_ops = {
+        .opaque = &video_rendition, .start = timed_start,
+        .poll = timed_poll, .cancel = timed_cancel
+    };
+    MediaHlsTransport audio_ops = video_ops;
+    audio_ops.opaque = &audio_rendition;
+    char error[160] = {0};
+    MediaHlsPlaylist *video_playlist = timed_playlist(&budget, &video_rendition);
+    MediaHlsPlaylist *audio_playlist = timed_playlist(&budget, &audio_rendition);
+    CHECK(video_playlist != NULL && audio_playlist != NULL);
+    MediaHlsSource *source[2] = {
+        media_hls_source_create_track(
+            &budget, video_playlist, &video_ops, MEDIA_HLS_TRACK_VIDEO,
+            error, sizeof(error)),
+        media_hls_source_create_track(
+            &budget, audio_playlist, &audio_ops, MEDIA_HLS_TRACK_AUDIO,
+            error, sizeof(error))
+    };
+    CHECK(source[0] != NULL && source[1] != NULL);
+    unsigned reprimes = 0;
+    CHECK(timed_open(source[0], source[1], &reprimes) == 0);
+    TimedRendition *rendition[2] = {&video_rendition, &audio_rendition};
+    const unsigned window[2] = {101u, 135u};
+    TimedTrack track[2] = {{0}};
+    int played = timed_play(source, rendition, window, 40u, &budget, track);
+    MediaHlsStats stats[2];
+    media_hls_source_stats(source[0], &stats[0]);
+    media_hls_source_stats(source[1], &stats[1]);
+    int64_t apart = track[1].offset - track[0].offset;
+    printf("live long pass: skipped v%zu a%zu; last v%u a%u (%u and %u "
+           "units), sound %lld ticks off the picture; last picture lasts "
+           "%u ticks\n",
+           stats[0].skipped_live_segments, stats[1].skipped_live_segments,
+           track[0].last_sequence, track[1].last_sequence, track[0].taken,
+           track[1].taken, (long long) apart, track[0].last_duration);
+    CHECK(played == 0);
+    CHECK(track[0].last_duration == 6000u * 90u / (TIMED_FRAMES / 2u));
+    CHECK(track[0].last_sequence >= 135u && track[1].last_sequence >= 135u);
+    CHECK(apart == 0 && track[1].backwards == 0);
+    CHECK(!timed_requested(&video_rendition, 111u, 134u));
+    media_hls_source_destroy(source[1]);
+    media_hls_source_destroy(source[0]);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
+/* A live packager on a wall clock: content segment k of a rendition
+   (number first_sequence + k) is published once the clock passes its end,
+   and each playlist lists the newest `window` of them, so every refresh
+   after a segment boundary has slid. */
+static MediaHlsPlaylist *live_clock_playlist(
+    Budget *budget, const TimedRendition *rendition, unsigned window,
+    uint64_t now_us)
+{
+    uint64_t published = now_us / ((uint64_t) rendition->segment_ms * 1000u);
+    unsigned count = published < window ? (unsigned) published : window;
+    return timed_window_playlist(
+        budget, rendition,
+        rendition->first_sequence + (unsigned) (published - count), count);
+}
+
+typedef struct {
+    Budget *budget;
+    uint64_t clock_us;
+    TimedRendition *rendition[2];
+    unsigned window[2];
+    MediaHlsSource *source[2];
+    TimedTrack track[2];
+} LiveClockRig;
+
+/* The open as psp_media_hls does it: both playlists fetched at the
+   rig's clock, video then audio, then primed and aligned. */
+static int live_clock_open(LiveClockRig *rig, TimedRendition *audio)
+{
+    rig->rendition[1] = audio;
+    rig->window[1] = 36000u / audio->segment_ms;
+    char error[160] = {0};
+    MediaHlsTransport ops[2];
+    for (size_t i = 0; i < 2u; i++) {
+        rig->rendition[i]->clock_us = &rig->clock_us;
+        rig->rendition[i]->request_count = 0;
+        ops[i] = (MediaHlsTransport) {
+            .opaque = rig->rendition[i], .start = timed_start,
+            .poll = timed_poll, .cancel = timed_cancel
+        };
+        MediaHlsPlaylist *playlist = live_clock_playlist(
+            rig->budget, rig->rendition[i], rig->window[i], rig->clock_us);
+        CHECK(playlist != NULL);
+        rig->source[i] = media_hls_source_create_track(
+            rig->budget, playlist, &ops[i],
+            i == 0 ? MEDIA_HLS_TRACK_VIDEO : MEDIA_HLS_TRACK_AUDIO,
+            error, sizeof(error));
+        CHECK(rig->source[i] != NULL);
+    }
+    unsigned reprimes = 0;
+    CHECK(timed_open(rig->source[0], rig->source[1], &reprimes) == 0);
+    /* The player's construction probe lands on both. */
+    for (size_t i = 0; i < 2u; i++) {
+        MediaSampleSource samples = {0};
+        uint64_t landing = 1;
+        CHECK(media_hls_source_sample_source(rig->source[i], &samples)
+              && samples.ops->seek_us(samples.opaque, 0, &landing)
+              && landing == 0);
+    }
+    memset(rig->track, 0, sizeof(rig->track));
+    return 0;
+}
+
+/* Plays until the clock reaches until_us in 20 ms steps, each rendition
+   refreshed whenever it asks. */
+static int live_clock_play(LiveClockRig *rig, uint64_t until_us)
+{
+    MediaSampleSource samples[2] = {{0}};
+    for (size_t i = 0; i < 2u; i++)
+        CHECK(media_hls_source_sample_source(rig->source[i], &samples[i]));
+    while (rig->clock_us < until_us) {
+        rig->clock_us += 20000u;
+        for (size_t i = 0; i < 2u; i++) {
+            media_hls_source_pump(rig->source[i], rig->clock_us);
+            if (!media_hls_source_wants_playlist_refresh(rig->source[i],
+                                                         rig->clock_us))
+                continue;
+            char error[160] = {0};
+            MediaHlsPlaylist *window = live_clock_playlist(
+                rig->budget, rig->rendition[i], rig->window[i],
+                rig->clock_us);
+            CHECK(window != NULL);
+            CHECK(media_hls_source_update_playlist(
+                rig->source[i], window, rig->clock_us, error, sizeof(error)));
+        }
+        unsigned taken = 0;
+        CHECK(timed_take(samples, rig->rendition, rig->track, &taken) == 0);
+        for (size_t i = 0; i < 2u; i++) {
+            if (!media_hls_source_failed(rig->source[i])) continue;
+            printf("live clock: source %zu failed at %llu ms\n", i,
+                   (unsigned long long) (rig->clock_us / 1000u));
+            CHECK(!media_hls_source_failed(rig->source[i]));
+        }
+    }
+    return 0;
+}
+
+/* The number of the segment a track's last unit came from. */
+static unsigned live_clock_last(const LiveClockRig *rig, size_t i)
+{
+    unsigned first = rig->rendition[i]->first_sequence;
+    return first + ((rig->track[i].last_sequence - first) & 0xffu);
+}
+
+/* Prints where the pair stands and returns sound minus picture, as
+   test_live_window_skips_keep_renditions_together measures it. */
+static int64_t live_clock_report(const LiveClockRig *rig, const char *phase)
+{
+    MediaHlsStats stats[2];
+    media_hls_source_stats(rig->source[0], &stats[0]);
+    media_hls_source_stats(rig->source[1], &stats[1]);
+    int64_t apart = rig->track[1].offset - rig->track[0].offset;
+    printf("live demuxed pair, %s at %llu ms: skipped v%zu a%zu, refreshes "
+           "v%zu a%zu; last v%u a%u (%u and %u units, %u and %u back), last "
+           "picture %u ticks; sound %lld ticks off the picture\n",
+           phase, (unsigned long long) (rig->clock_us / 1000u),
+           stats[0].skipped_live_segments, stats[1].skipped_live_segments,
+           stats[0].playlist_refreshes, stats[1].playlist_refreshes,
+           live_clock_last(rig, 0), live_clock_last(rig, 1),
+           rig->track[0].taken, rig->track[1].taken,
+           rig->track[0].backwards, rig->track[1].backwards,
+           rig->track[0].last_duration, (long long) apart);
+    return apart;
+}
+
+static size_t live_clock_skipped(const LiveClockRig *rig, size_t i)
+{
+    MediaHlsStats stats;
+    media_hls_source_stats(rig->source[i], &stats);
+    return stats.skipped_live_segments;
+}
+
+static void live_clock_close(LiveClockRig *rig)
+{
+    media_hls_source_destroy(rig->source[1]);
+    media_hls_source_destroy(rig->source[0]);
+    rig->source[0] = rig->source[1] = NULL;
+}
+
+/* Polish T9: a demuxed live pair whose playlists slide on every refresh,
+   played as a session would: open, a network stall that drops both
+   renditions out of their windows by different amounts, a refused seek,
+   and an audio track change (a reopen of both at the then-current
+   windows). The video gets a new encoder at 120 (EXT-X-DISCONTINUITY,
+   a restarted clock, half the frame rate); the first audio rendition is
+   packed audio whose ID3 tag has no PRIV timestamp, numbered on its own
+   and in 2 s segments, so only playlist position places it, and only the
+   numbers and EXTINF measure its skips. The second is TS audio in 4 s
+   segments with timestamps on the video's clocks, numbered 1000 higher,
+   which its timestamps move back a segment at the reopen. Sound and
+   picture must name the same content throughout. */
+static int test_live_demuxed_pair_through_open_skip_track_change_and_seek(void)
+{
+    Budget budget;
+    budget_init(&budget, 4u * 1024u * 1024u);
+    const uint64_t origin = UINT64_C(54000000);
+    const uint64_t restart = UINT64_C(900000);
+    static TimedRendition video, packed, timed;
+    video = (TimedRendition) {
+        .prefix = 'v', .first_sequence = 100u, .segment_ms = 6000u,
+        .first_pts = origin, .slow_from = 120u, .restart_at = 120u,
+        .restart_pts = restart
+    };
+    packed = (TimedRendition) {
+        .prefix = 'a', .audio = true, .packed = true, .priv = false,
+        .first_sequence = 500u, .segment_ms = 2000u, .first_pts = origin
+    };
+    timed = (TimedRendition) {
+        .prefix = 'a', .audio = true, .first_sequence = 1100u,
+        .segment_ms = 4000u, .first_pts = origin, .restart_at = 1130u,
+        .restart_pts = restart
+    };
+    static LiveClockRig rig;
+    memset(&rig, 0, sizeof(rig));
+    rig.budget = &budget;
+    rig.rendition[0] = &video;
+    rig.window[0] = 6u;
+
+    /* Open 66.1 s in: both windows end at content 66 s; the video starts
+       at 108 (48 s), three from its end, and the audio, started at 530,
+       moves back to 524 (48 s) by its distance from the end. */
+    rig.clock_us = UINT64_C(66100000);
+    CHECK(live_clock_open(&rig, &packed) == 0);
+    printf("live demuxed pair, open: video v%u, audio a%u then a%u\n",
+           video.requested[0], packed.requested[0],
+           packed.request_count > 1u ? packed.requested[1] : 0u);
+    CHECK(video.requested[0] == 108u && packed.requested[0] == 530u
+          && packed.request_count > 1u && packed.requested[1] == 524u);
+    CHECK(live_clock_play(&rig, UINT64_C(100000000)) == 0);
+    CHECK(rig.track[0].taken != 0 && rig.track[1].taken != 0);
+    CHECK(live_clock_report(&rig, "playing") == 0);
+    CHECK(live_clock_skipped(&rig, 0) == 0 && live_clock_skipped(&rig, 1) == 0);
+
+    /* The video's network stalls for a minute: its window and, behind the
+       held picture, the audio's slide past both, and each skips when its
+       next refresh lands. The video comes back past the new encoder. */
+    video.stall_from_us = UINT64_C(100000000);
+    video.stall_to_us = UINT64_C(160000000);
+    CHECK(live_clock_play(&rig, UINT64_C(220000000)) == 0);
+    int64_t apart = live_clock_report(&rig, "after the video stall");
+    CHECK(live_clock_skipped(&rig, 0) != 0 && live_clock_skipped(&rig, 1) != 0);
+    /* The video's skip landed on the new encoder: its restarted clock
+       cannot measure the skip, so the numbers and EXTINF do. */
+    CHECK(!timed_requested(&video, 117u, 119u)
+          && timed_requested(&video, 120u, 120u));
+    CHECK(live_clock_last(&rig, 0) >= 130u && live_clock_last(&rig, 1) >= 600u);
+    CHECK(rig.track[0].last_duration == 6000u * 90u / (TIMED_FRAMES / 2u));
+    CHECK(apart == 0
+          && rig.track[0].backwards == 0 && rig.track[1].backwards == 0);
+
+    /* A live window has no timeline: a seek is refused and changes
+       nothing, and the probe's zero no longer lands once units are
+       taken. */
+    for (size_t i = 0; i < 2u; i++) {
+        MediaSampleSource samples = {0};
+        uint64_t landing = 1;
+        CHECK(media_hls_source_sample_source(rig.source[i], &samples));
+        CHECK(!samples.ops->seek_us(samples.opaque, UINT64_C(30000000),
+                                    &landing));
+        CHECK(!samples.ops->seek_after_us(samples.opaque, UINT64_C(30000000),
+                                          &landing));
+        CHECK(!samples.ops->seek_us(samples.opaque, 0, &landing));
+        samples.ops->rewind(samples.opaque);
+    }
+    unsigned taken[2] = {rig.track[0].taken, rig.track[1].taken};
+    CHECK(live_clock_play(&rig, UINT64_C(230000000)) == 0);
+    CHECK(rig.track[0].taken > taken[0] && rig.track[1].taken > taken[1]);
+    CHECK(live_clock_report(&rig, "after a refused seek") == 0
+          && rig.track[0].backwards == 0 && rig.track[1].backwards == 0);
+
+    /* The track menu picks the other audio rendition: the session reopens
+       both at the windows now published (234.1 s, ending at 234 s). */
+    live_clock_close(&rig);
+    CHECK(budget.current == 0);
+    rig.clock_us = UINT64_C(234100000);
+    video.stall_from_us = video.stall_to_us = 0;
+    CHECK(live_clock_open(&rig, &timed) == 0);
+    printf("live demuxed pair, track change: video v%u, audio a%u then "
+           "a%u\n", video.requested[0], timed.requested[0],
+           timed.request_count > 1u ? timed.requested[1] : 0u);
+    CHECK(video.requested[0] == 136u && timed.requested[0] == 1155u
+          && timed.request_count > 1u && timed.requested[1] == 1154u);
+    CHECK(live_clock_play(&rig, UINT64_C(250000000)) == 0);
+    CHECK(rig.track[0].taken != 0 && rig.track[1].taken != 0);
+    CHECK(live_clock_report(&rig, "after the track change") == 0);
+
+    CHECK(live_clock_play(&rig, UINT64_C(270000000)) == 0);
+    CHECK(live_clock_report(&rig, "20 s later") == 0
+          && rig.track[0].backwards == 0 && rig.track[1].backwards == 0);
+    CHECK(live_clock_last(&rig, 0) >= 143u
+          && live_clock_last(&rig, 1) >= 1165u);
+    live_clock_close(&rig);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
 int main(void)
 {
     int delivery_failed = 0;
@@ -3007,6 +4883,19 @@ int main(void)
     if (test_lane_seek_discards_taken_audio() != 0) return 1;
     if (test_video_only_primes_before_segment_completion() != 0) return 1;
     if (test_delivery_visit_ingests_several_packets() != 0) return 1;
+    if (test_prime_parses_a_keyframe_in_few_visits() != 0) return 1;
+    if (test_live_renditions_start_at_their_own_edges() != 0) return 1;
+    if (test_live_renditions_align_by_timestamp() != 0) return 1;
+    if (test_live_window_skips_keep_renditions_together() != 0) return 1;
+    if (test_live_partner_passes_a_long_skip() != 0) return 1;
+    if (test_live_demuxed_pair_through_open_skip_track_change_and_seek()
+        != 0) return 1;
+    if (test_mixed_source_without_early_video() != 0) return 1;
+    if (test_audio_rendition_source_memory() != 0) return 1;
+    if (test_pts_wrap_inside_a_segment() != 0) return 1;
+    if (test_finite_playlist_entry_bound() != 0) return 1;
+    if (test_signed_uri_playlist_text_bound() != 0) return 1;
+    if (test_long_playlist_plays_and_seeks() != 0) return 1;
     if (test_reordered_units_last_one_frame() != 0) return 1;
     if (test_reordered_interval_across_segments() != 0) return 1;
     if (test_demuxed_track_sources_prime_independently() != 0) return 1;

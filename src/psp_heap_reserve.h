@@ -8,5 +8,9 @@
    (psp_heap_reserve.c, tilefinch_psp_heap_threshold_kb). */
 bool psp_heap_reserve_swdec_found(void);
 int psp_heap_reserve_threshold_kb(void);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+/* Logs the newlib heap's size, its arena and its free bytes. */
+void psp_heap_reserve_report(void);
+#endif
 
 #endif

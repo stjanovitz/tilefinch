@@ -19,6 +19,33 @@ extern void __real___libcglue_init(int, char **);
 
 static bool heap_reserve_swdec_found;
 
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+#include <malloc.h>
+#include <pspsysmem.h>
+
+#include "tilefinch/psp_log.h"
+
+/* The largest free partition block just before libc's init. _sbrk sizes the
+   heap from the same call on the init's first allocation (pte_osInit's
+   malloc; the init steps before it only create lightweight mutexes and fill
+   the descriptor table), so the heap is this less the threshold. */
+static size_t heap_reserve_largest_free_before_heap;
+
+void psp_heap_reserve_report(void)
+{
+    size_t heap = tilefinch_psp_newlib_heap_bytes(
+        heap_reserve_largest_free_before_heap,
+        sce_newlib_heap_threshold_kb_size);
+    struct mallinfo arena = mallinfo();
+    /* psp_log_printf, not printf: plain stdout never reaches the
+       validation log. */
+    psp_log_printf("tilefinch-psp-script: heap bytes=%u arena=%u free=%u\n",
+                   (unsigned) heap, (unsigned) arena.arena,
+                   (unsigned) tilefinch_psp_heap_free_bytes(
+                       heap, (size_t) arena.arena, (size_t) arena.fordblks));
+}
+#endif
+
 bool psp_heap_reserve_swdec_found(void)
 {
     return heap_reserve_swdec_found;
@@ -47,5 +74,8 @@ void __wrap___libcglue_init(int argc, char **argv)
                < tilefinch_psp_heap_threshold_kb(true))
         sce_newlib_heap_threshold_kb_size =
             tilefinch_psp_heap_threshold_kb(true);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    heap_reserve_largest_free_before_heap = sceKernelMaxFreeMemSize();
+#endif
     __real___libcglue_init(argc, argv);
 }

@@ -256,9 +256,240 @@ static int test_player_page_list(void)
     return 0;
 }
 
+/* IS-19: one over-long line, or more rules than the matcher keeps, no
+   longer rejects the whole custom list. */
+static int test_long_lines_and_rule_limit(void)
+{
+    char path[128];
+    snprintf(path, sizeof(path), "/tmp/tilefinch-adblock-long-XXXXXX");
+    int descriptor = mkstemp(path);
+    CHECK(descriptor >= 0);
+    FILE *file = fdopen(descriptor, "wb");
+    CHECK(file != NULL);
+    bool ok = fputs("||first.example^\n", file) >= 0;
+    /* A cosmetic rule of 5000 bytes, then one of exactly 2047 bytes plus
+       its newline, then an unterminated short last line further down. */
+    ok = ok && fputs("example.com##", file) >= 0;
+    for (unsigned at = 0; ok && at < 5000u; at++) ok = fputc('a', file) != EOF;
+    ok = ok && fputc('\n', file) != EOF;
+    ok = ok && fputs("example.org##", file) >= 0;
+    for (unsigned at = 13u; ok && at < 2047u; at++) ok = fputc('b', file) != EOF;
+    ok = ok && fputs("\n||second.example^\n", file) >= 0;
+    for (unsigned at = 0; ok && at < CONTENT_BLOCKER_RULE_LIMIT + 10u; at++)
+        ok = fprintf(file, "||h%u.example^\n", at) > 0;
+    ok = ok && fputs("||last.example^", file) >= 0;
+    CHECK(fclose(file) == 0 && ok);
+
+    Budget budget;
+    budget_init(&budget, 2u * 1024u * 1024u);
+    ContentBlocker *blocker = content_blocker_create(&budget);
+    CHECK(blocker != NULL
+          && content_blocker_configure(blocker, CONTENT_BLOCKER_CUSTOM, path));
+    ContentBlockerMetrics metrics;
+    CHECK(content_blocker_metrics(blocker, &metrics)
+          && metrics.rule_count == CONTENT_BLOCKER_RULE_LIMIT
+          && metrics.truncated
+          /* two long lines, 13 rules past the limit */
+          && metrics.ignored_rule_count == 2u + 13u);
+    CHECK(content_blocker_should_block(
+              blocker, "https://first.example/a.js",
+              "https://publisher.example/", "script", "no-cors")
+          && content_blocker_should_block(
+              blocker, "https://second.example/a.js",
+              "https://publisher.example/", "script", "no-cors")
+          && !content_blocker_should_block(
+              blocker, "https://last.example/a.js",
+              "https://publisher.example/", "script", "no-cors"));
+    content_blocker_destroy(blocker);
+    CHECK(unlink(path) == 0 && budget.current == 0);
+    return 0;
+}
+
+/* Basic also refuses the ad-verification and ad-recovery hosts a page
+   loads beside its (already blocked) auctions: nintendolife spent about
+   1 MiB of script memory on them. Third-party requests only, subdomains
+   included; the sites themselves, Off and a site exception are untouched. */
+static int test_basic_ad_verification_hosts(void)
+{
+    Budget budget;
+    budget_init(&budget, 1024u * 1024u);
+    ContentBlocker *blocker = content_blocker_create(&budget);
+    CHECK(blocker != NULL
+          && content_blocker_configure(blocker, CONTENT_BLOCKER_BASIC, NULL));
+    const char *page = "https://www.nintendolife.com/news";
+    const char *const verification[] = {
+        "https://cdn.confiant-integrations.net/x/gpt_and_prebid/config.js",
+        "https://confiant-integrations.net/wrap.js",
+        "https://nintendolife-com.videoplayerhub.btloader.com/tag.js",
+        "https://btloader.com/tag?o=1&upapi=true",
+    };
+    for (size_t i = 0; i < sizeof(verification) / sizeof(verification[0]);
+         i++) {
+        CHECK(content_blocker_would_block(blocker, verification[i], page,
+                                          "script", "no-cors"));
+    }
+    /* Their own pages, and look-alike hosts, are not refused. */
+    CHECK(!content_blocker_would_block(
+              blocker, "https://www.btloader.com/app.js",
+              "https://www.btloader.com/", "script", "no-cors")
+          && !content_blocker_would_block(
+                 blocker, "https://notbtloader.com/tag.js", page, "script",
+                 "no-cors")
+          && !content_blocker_would_block(
+                 blocker, "https://confiant-integrations.net.example/a.js",
+                 page, "script", "no-cors"));
+    const char *const allowed[] = {"nintendolife.com"};
+    CHECK(content_blocker_set_allowed_sites(blocker, allowed, 1u)
+          && !content_blocker_would_block(blocker, verification[1], page,
+                                          "script", "no-cors")
+          && content_blocker_set_allowed_sites(blocker, NULL, 0u));
+    CHECK(content_blocker_configure(blocker, CONTENT_BLOCKER_OFF, NULL)
+          && !content_blocker_would_block(blocker, verification[2], page,
+                                          "script", "no-cors"));
+    content_blocker_destroy(blocker);
+    CHECK(budget.current == 0u);
+    return 0;
+}
+
+/* Basic refuses third-party tag managers and A/B testing clients, leaves
+   paywall and subscription SDKs alone, and says which refused scripts a
+   page may be waiting on. */
+static int test_basic_sdk_hosts(void)
+{
+    Budget budget;
+    budget_init(&budget, 1024u * 1024u);
+    ContentBlocker *blocker = content_blocker_create(&budget);
+    CHECK(blocker != NULL
+          && content_blocker_configure(blocker, CONTENT_BLOCKER_BASIC, NULL));
+    const char *page = "https://www.bbc.com/news";
+    const char *const refused[] = {
+        "https://www.googletagmanager.com/gtag/js?id=AW-1",
+        "https://www.googletagmanager.com/gtm.js?id=GTM-1",
+        "https://assets.adobedtm.com/launch-1.min.js",
+        "https://tags.tiqcdn.com/utag/site/main/prod/utag.js",
+        "https://nexus.ensighten.com/site/Bootstrap.js",
+        "https://cdn.tagcommander.com/1/tc_site.js",
+        "https://cdn.segment.com/analytics.js/v1/key/analytics.min.js",
+        "https://api.segment.io/v1/t",
+        "https://cdn.optimizely.com/public/1/s/bbcx_prod.js",
+        "https://logx.optimizely.com/v1/events",
+        "https://dev.visualwebsiteoptimizer.com/j.php?a=1",
+        "https://try.abtasty.com/1.js",
+        "https://www.googleoptimize.com/optimize.js?id=OPT-1",
+        "https://abc.kameleoon.eu/kameleoon.js",
+        "https://abc.kameleoon.io/engine.js",
+        "https://cdn-4.convertexperiments.com/js/1.js",
+        "https://site.tt.omtrdc.net/rest/v1/delivery",
+    };
+    for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); i++) {
+        if (!content_blocker_would_block(blocker, refused[i], page, "script",
+                                         "no-cors")) {
+            fprintf(stderr, "not refused: %s\n", refused[i]);
+            return 1;
+        }
+    }
+    /* Every destination, as for the ad hosts. */
+    CHECK(content_blocker_would_block(
+              blocker, "https://www.googletagmanager.com/ns.html?id=GTM-1",
+              page, "iframe", "navigate")
+          && content_blocker_would_block(
+                 blocker, "https://api.segment.io/v1/t", page, "", "cors"));
+    /* Paywall and subscription SDKs load under Basic, by any destination:
+       the opt-in level that would refuse them is not offered yet. */
+    const char *const paywall[] = {
+        "https://cdn.tinypass.com/api/tinypass.min.js",
+        "https://cdn.piano.io/api/tinypass.min.js",
+        "https://experience.piano.io/xbuilder/experience/load",
+        "https://assets.poool.fr/audit.min.js",
+        "https://js.pelcro.com/sdk/main.min.js",
+        "https://connector.laterpay.net/1/laterpay.js",
+    };
+    for (size_t i = 0; i < sizeof(paywall) / sizeof(paywall[0]); i++) {
+        if (content_blocker_would_block(blocker, paywall[i], page, "script",
+                                        "no-cors")
+            || content_blocker_refused_script_shims(blocker, paywall[i],
+                                                    page) != 0u) {
+            fprintf(stderr, "paywall SDK refused: %s\n", paywall[i]);
+            return 1;
+        }
+    }
+    CHECK(!content_blocker_would_block(
+              blocker, "https://api.piano.io/api/v3/access", page, "",
+              "cors")
+          && !content_blocker_would_block(
+                 blocker, "https://buy.tinypass.com/checkout/template",
+                 page, "iframe", "navigate"));
+    /* Look-alikes, Adobe's analytics host beside Target's, the vendors' own
+       pages and first-party copies are not refused. */
+    const char *const kept[] = {
+        "https://notoptimizely.com/x.js",
+        "https://optimizely.com.example/x.js",
+        "https://site.sc.omtrdc.net/b/ss/x",
+        "https://segment.io.example/sdk.js",
+        "https://www.google-analytics.com/analytics.js",
+        "https://static.files.bbci.co.uk/core/bundle-vendor-optimizely.js",
+    };
+    for (size_t i = 0; i < sizeof(kept) / sizeof(kept[0]); i++) {
+        if (content_blocker_would_block(blocker, kept[i], page, "script",
+                                        "no-cors")) {
+            fprintf(stderr, "refused: %s\n", kept[i]);
+            return 1;
+        }
+    }
+    CHECK(!content_blocker_would_block(
+              blocker, "https://cdn.optimizely.com/js/web.js",
+              "https://www.optimizely.com/", "script", "no-cors"));
+    ContentBlockerMetrics metrics;
+    CHECK(content_blocker_metrics(blocker, &metrics)
+          && metrics.mode == CONTENT_BLOCKER_BASIC
+          && metrics.rule_count == 36u + 15u);
+
+    /* What a page waits for from a refused script. */
+    CHECK(content_blocker_refused_script_shims(
+              blocker, refused[0], page) == CONTENT_BLOCKER_SHIM_GOOGLE_TAG
+          && content_blocker_refused_script_shims(
+                 blocker, refused[12], page)
+                 == CONTENT_BLOCKER_SHIM_GOOGLE_TAG
+          && content_blocker_refused_script_shims(blocker, refused[2], page)
+                 == CONTENT_BLOCKER_SHIM_ADOBE_TARGET
+          && content_blocker_refused_script_shims(blocker, refused[16], page)
+                 == CONTENT_BLOCKER_SHIM_ADOBE_TARGET
+          && content_blocker_refused_script_shims(blocker, refused[10], page)
+                 == CONTENT_BLOCKER_SHIM_VWO
+          /* Refused, nothing to answer. */
+          && content_blocker_refused_script_shims(blocker, refused[8], page)
+                 == 0u
+          && content_blocker_refused_script_shims(
+                 blocker, "https://securepubads.doubleclick.net/tag.js",
+                 page) == 0u
+          /* Not refused: a first-party container. */
+          && content_blocker_refused_script_shims(
+                 blocker, "https://www.googletagmanager.com/gtm.js",
+                 "https://www.googletagmanager.com/") == 0u);
+    const char *const allowed[] = {"bbc.com"};
+    CHECK(content_blocker_set_allowed_sites(blocker, allowed, 1u)
+          && !content_blocker_would_block(blocker, refused[0], page,
+                                          "script", "no-cors")
+          && content_blocker_refused_script_shims(blocker, refused[0], page)
+                 == 0u
+          && content_blocker_set_allowed_sites(blocker, NULL, 0u));
+    CHECK(content_blocker_configure(blocker, CONTENT_BLOCKER_OFF, NULL));
+    for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); i++)
+        CHECK(!content_blocker_would_block(blocker, refused[i], page,
+                                           "script", "no-cors")
+              && content_blocker_refused_script_shims(
+                     blocker, refused[i], page) == 0u);
+    content_blocker_destroy(blocker);
+    CHECK(budget.current == 0u);
+    return 0;
+}
+
 int main(void)
 {
+    CHECK(test_basic_sdk_hosts() == 0);
+    CHECK(test_basic_ad_verification_hosts() == 0);
     CHECK(test_player_page_list() == 0);
+    CHECK(test_long_lines_and_rule_limit() == 0);
     CHECK(test_prefix_scan_boundaries() == 0);
     CHECK(test_cosmetic_class_families() == 0);
     Budget budget;

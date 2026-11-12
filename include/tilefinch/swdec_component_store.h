@@ -38,6 +38,26 @@ static inline int tilefinch_psp_heap_threshold_kb(bool swdec_installed)
     return swdec_installed ? TILEFINCH_PSP_HEAP_THRESHOLD_SWDEC_KB
                            : TILEFINCH_PSP_HEAP_THRESHOLD_KB;
 }
+/*
+ * The newlib heap's size, as PSPSDK's _sbrk sets it on its first call under
+ * PSP_HEAP_SIZE_KB(-1): the largest free partition block less the threshold
+ * (none when the threshold takes the whole block). Its free bytes are the
+ * part newlib has not yet taken into its arena (it grows the arena lazily)
+ * plus the free chunks inside the arena (mallinfo's arena and fordblks).
+ * The validation boot log reports both (psp_heap_reserve.c).
+ */
+static inline size_t tilefinch_psp_newlib_heap_bytes(
+    size_t largest_free_bytes, int threshold_kb)
+{
+    size_t reserve = threshold_kb > 0 ? (size_t) threshold_kb * 1024u : 0u;
+    return largest_free_bytes > reserve ? largest_free_bytes - reserve : 0u;
+}
+static inline size_t tilefinch_psp_heap_free_bytes(
+    size_t heap_bytes, size_t arena_bytes, size_t arena_free_bytes)
+{
+    return (heap_bytes > arena_bytes ? heap_bytes - arena_bytes : 0u)
+        + arena_free_bytes;
+}
 /* The installed component PRX for the program at `argv0`, as
    tilefinch_swdec_component_path finds it, without allocating or
    formatting: this runs before the C library is initialised. */
@@ -67,6 +87,16 @@ typedef enum {
    table it filled matches this ABI. */
 TilefinchSwdecFailure tilefinch_swdec_component_start_failure(
     int start_result, int module_status, bool api_valid);
+/* Failed loads or starts a process tries before keeping the refusal. */
+#define TILEFINCH_SWDEC_COMPONENT_RUNTIME_ATTEMPTS 3u
+/* Whether a later open may try the component again after `failures`
+   failed loads or starts. Only a firmware refusal (RUNTIME: memory, most
+   often, which a closed page gives back) is retried, and only when the
+   module is no longer loaded: a module the firmware would not unload still
+   owns its memory, and loading another on top of it is never safe. A
+   missing or stale component stays refused. */
+bool tilefinch_swdec_component_retry_allowed(
+    TilefinchSwdecFailure failure, bool module_released, unsigned failures);
 /* The message for a failure, with `native_error` for a runtime one. */
 void tilefinch_swdec_component_failure_message(
     TilefinchSwdecFailure failure, int native_error,

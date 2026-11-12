@@ -190,7 +190,7 @@ static bool bridge_wrapper_slot_live(DomBridge *bridge, size_t slot)
     if ((bridge->node_retention_flags[slot] & BRIDGE_NODE_LIVE_WRAPPER) == 0
         || bridge->wrapper_refs == NULL
         || !JS_IsObject(bridge->wrapper_refs[slot])) return false;
-    JSValue wrapper = JS_WeakRefDeref(bridge->host->context,
+    JSValue wrapper = JS_WeakTargetDeref(bridge->host->context,
                                       bridge->wrapper_refs[slot]);
     bool live = JS_IsObject(wrapper);
     JS_FreeValue(bridge->host->context, wrapper);
@@ -490,11 +490,11 @@ static void bridge_set_event_state(DomBridge *bridge, size_t slot,
     if ((flags & BRIDGE_NODE_EVENT_KEPT) == 0
         || event == BRIDGE_NODE_EVENT_KEPT) return;
     /* The reference js_dom_note_event_state took: the wrapper is alive
-       while it is held, so its WeakRef still answers. */
+       while it is held, so its weak target still answers. */
     JSContext *context = bridge->host == NULL ? NULL : bridge->host->context;
     if (context == NULL || bridge->wrapper_refs == NULL
         || !JS_IsObject(bridge->wrapper_refs[slot])) return;
-    JSValue wrapper = JS_WeakRefDeref(context, bridge->wrapper_refs[slot]);
+    JSValue wrapper = JS_WeakTargetDeref(context, bridge->wrapper_refs[slot]);
     if (!JS_IsObject(wrapper)) return;
     JS_FreeValue(context, wrapper);
     JS_FreeValue(context, wrapper);
@@ -530,7 +530,7 @@ JSValue js_dom_note_event_state(JSContext *context, JSValueConst this_value,
             || bridge->wrapper_refs == NULL
             || !JS_IsObject(bridge->wrapper_refs[slot]))
             return JS_FALSE;
-        JSValue wrapper = JS_WeakRefDeref(context, bridge->wrapper_refs[slot]);
+        JSValue wrapper = JS_WeakTargetDeref(context, bridge->wrapper_refs[slot]);
         if (!JS_IsObject(wrapper)
             || JS_VALUE_GET_PTR(wrapper) != JS_VALUE_GET_PTR(argv[2])) {
             JS_FreeValue(context, wrapper);

@@ -16,6 +16,8 @@ bool psp_app_activate_page(
 {
     BrowserEngine *engine = app->browser->engine;
     ControllerAction *action = &activation->action;
+    action->form_not_sent = false;
+    action->page_scripts_stopped = false;
     bool activated = false;
     bool preview = browser_engine_navigation_pending(engine);
     if (preview) {
@@ -181,12 +183,12 @@ bool psp_app_activate_page(
             if (browser_engine_text_input_info(
                     engine, &focused_after)
                 && focused_after.editable) {
-                bool submit_focused = false;
+                /* No activation follows this keyboard, so it does not
+                   submit (NULL: Done keeps "START ENTER"). */
                 if (psp_replace_focused_text(
                         engine, engine_frame,
                         &app->process->presentation.ui,
-                        &app->process->text_input, false,
-                        &submit_focused)) {
+                        &app->process->text_input, false, NULL)) {
                     frame->page_dirty = true;
                     (void) psp_engine_views_refresh(
                         app->views, engine);
@@ -272,6 +274,14 @@ void psp_app_route_controller_action(
             opened ? SCRIPT_MEDIA_STATE_LOADING
                    : SCRIPT_MEDIA_STATE_ERROR,
             0.0, 0.0);
+        if (opened) {
+            static BrowserHistoryEntryText page_entry;
+            (void) browser_engine_current_entry_text(
+                engine, &page_entry, NULL);
+            psp_media_set_page_media_label(
+                &app->browser->media, action->media_title,
+                page_entry.title);
+        }
         if (!opened) {
             psp_ui_show_status(
                 &app->process->presentation.ui,
@@ -631,34 +641,4 @@ void psp_app_embed_hop_tick(PspApp *app, PspAppFrameState *frame)
     }
 }
 
-__attribute__((noinline))
-void psp_app_dispatch_activation(
-    PspApp *app, PspAppFrameState *frame, bool enter_only,
-    const uint16_t *engine_frame)
-{
-    BrowserEngine *engine = app->browser->engine;
-    PspPageActivation activation;
-    if (!psp_app_activate_page(
-            app, frame, enter_only, engine_frame, &activation)) return;
-    if (activation.activated) {
-        psp_app_route_controller_action(
-            app, frame, engine_frame, &activation.action);
-    } else if (!activation.preview
-               && app->views->controller->activations
-                      == activation.activations_before) {
-        /* Resolution can fail only after the retained target truly
-           leaves the current layout. Do not silently consume Cross:
-           move to a live target and paint its focus in this frame.
-           A failure after a handler began is deliberately excluded
-           so no page-side action is followed by an unrelated move. */
-        bool recovered = browser_engine_restore_autofocus(engine)
-            || browser_engine_focus_move(engine, true);
-        if (recovered) {
-            frame->page_dirty = true;
-        } else {
-            psp_ui_show_status(
-                &app->process->presentation.ui,
-                "PAGE ITEM IS NO LONGER AVAILABLE", 120);
-        }
-    }
-}
+#include "psp_app_page_press.inc"

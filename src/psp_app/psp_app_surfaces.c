@@ -23,13 +23,8 @@ static void psp_tabs_domain(
         snprintf(domain, capacity, "%s", "Tilefinch");
         return;
     }
-    const char *end = at;
-    while (*end != '\0' && *end != '/' && *end != '?' && *end != '#')
-        end++;
-    size_t length = (size_t) (end - at);
-    if (length >= capacity) length = capacity - 1u;
-    memcpy(domain, at, length);
-    domain[length] = '\0';
+    /* A long host keeps its end, where its registrable domain is. */
+    psp_ui_host_label(at, domain, capacity);
 }
 
 void psp_tabs_sync_ui(
@@ -177,6 +172,9 @@ void psp_home_sync_ui(
     const BrowserTabs *tabs, bool engine_ready)
 {
     if (ui == NULL || surface == NULL) return;
+    /* A supervised HOME draws this view from the callback thread; the
+       rebuild reads only memory, so all of it runs under the fence. */
+    bool held = psp_presentation_fence_acquire();
     memset(surface, 0, sizeof(*surface));
     surface->view.engine_ready = engine_ready;
 
@@ -210,6 +208,7 @@ void psp_home_sync_ui(
                      page->title[0] == '\0' ? domain : page->title);
             snprintf(surface->view.tiles[tile].detail,
                      sizeof(surface->view.tiles[tile].detail), "%s", domain);
+            surface->view.tiles[tile].detail_is_host = true;
             psp_home_set_row(surface, tile, PSP_HOME_TARGET_BOOKMARK, at);
             tile++;
         }
@@ -235,6 +234,7 @@ void psp_home_sync_ui(
         snprintf(surface->view.continues[entries].detail,
                  sizeof(surface->view.continues[entries].detail), "%s",
                  domain);
+        surface->view.continues[entries].detail_is_host = true;
         psp_home_set_row(
             surface, PSP_UI_HOME_TILE_LIMIT + entries,
             PSP_HOME_TARGET_TAB, at);
@@ -242,6 +242,7 @@ void psp_home_sync_ui(
     }
     surface->view.continue_count = (uint8_t) entries;
     psp_ui_set_home(ui, &surface->view);
+    psp_presentation_fence_release(held);
 }
 
 /*
@@ -372,6 +373,22 @@ void psp_collections_sync_ui(
     PspUiCollectionSection section)
 {
     if (ui == NULL || surface == NULL) return;
+    /* A supervised Library screen draws this view from the callback thread,
+       so the rebuild runs under the fence. Its only I/O (an icon read, an
+       older build's fingerprint probe) comes first, outside it. */
+    const unsigned char *icons[OFFLINE_LIBRARY_ITEM_LIMIT] = {0};
+    uint32_t stale = 0;
+    for (size_t at = 0; section == PSP_UI_COLLECTION_SAVED
+             && offline_store != NULL && at < offline_store->library.count;
+         at++) {
+        const OfflineLibraryItem *item = &offline_store->library.items[at];
+        if (item->type != OFFLINE_ITEM_WEB_APP) continue;
+        icons[at] = psp_offline_store_app_icon(offline_store, item->id);
+        if (offline_library_app_needs_recompile(
+                &offline_store->library, item->id, NULL))
+            stale |= UINT32_C(1) << at;
+    }
+    bool held = psp_presentation_fence_acquire();
     memset(surface, 0, sizeof(*surface));
     surface->view.section = (uint8_t) section;
     size_t rows = 0;
@@ -395,9 +412,7 @@ void psp_collections_sync_ui(
             surface->view.rows[rows].is_file = item->type == OFFLINE_ITEM_FILE;
             if (item->type == OFFLINE_ITEM_FILE)
                 surface->view.rows[rows].detail = tilefinch_ui_text("Memory Stick file");
-            if (item->type == OFFLINE_ITEM_WEB_APP)
-                surface->view.rows[rows].icon_rgba =
-                    psp_offline_store_app_icon(offline_store, item->id);
+            surface->view.rows[rows].icon_rgba = icons[at];
             surface->view.rows[rows].is_web_app =
                 item->type == OFFLINE_ITEM_WEB_APP;
             if (item->type == OFFLINE_ITEM_WEB_APP) {
@@ -464,11 +479,9 @@ void psp_collections_sync_ui(
                 snprintf(surface->view.rows[rows].trailing,
                          sizeof(surface->view.rows[rows].trailing), "%s",
                          state);
-            } else if (item->type == OFFLINE_ITEM_WEB_APP
-                       && offline_library_app_needs_recompile(
-                              &offline_store->library, item->id, NULL)) {
-                /* Bytecode from an older engine: a cheap index check (or
-                   one header probe for entries from older builds). */
+            } else if (((stale >> at) & 1u) != 0) {
+                /* Bytecode from an older engine: checked before the fence
+                   (an older build's entry needs one header probe). */
                 surface->view.rows[rows].needs_recompile = true;
                 snprintf(surface->view.rows[rows].trailing,
                          sizeof(surface->view.rows[rows].trailing),
@@ -546,6 +559,7 @@ void psp_collections_sync_ui(
     }
     surface->view.count = (uint16_t) rows;
     psp_ui_set_collections(ui, &surface->view);
+    psp_presentation_fence_release(held);
 }
 
 const char *psp_collections_row_url(

@@ -257,6 +257,31 @@ static bool test_psp_network_reinitialization_policy(void)
         }
         if (!psp_navigation_watchdog_expired(
                 &watchdog, PSP_NAVIGATION_CAP_US, ++units)) return false;
+        /* A page dialog's open time is paused out of the stall and the
+           cap: ten minutes on an alert does not cancel the load. */
+        psp_navigation_watchdog_start(&watchdog, 1000u, 0u);
+        psp_navigation_watchdog_pause(&watchdog, 600000000u);
+        if (psp_navigation_watchdog_expired(
+                &watchdog, 1000u + 600000000u + PSP_NAVIGATION_STALL_US - 1u,
+                0u)
+            || !psp_navigation_watchdog_expired(
+                   &watchdog, 1000u + 600000000u + PSP_NAVIGATION_STALL_US,
+                   0u)) return false;
+        psp_navigation_watchdog_start(&watchdog, 1000u, 0u);
+        psp_navigation_watchdog_pause(&watchdog, 600000000u);
+        units = 0u;
+        for (uint64_t t = 1000000u; t < PSP_NAVIGATION_CAP_US;
+             t += 1000000u) {
+            if (psp_navigation_watchdog_expired(
+                    &watchdog, 1000u + 600000000u + t, ++units))
+                return false;
+        }
+        if (!psp_navigation_watchdog_expired(
+                &watchdog, 1000u + 600000000u + PSP_NAVIGATION_CAP_US,
+                ++units)) return false;
+        /* A clock read before the pause began never wraps. */
+        if (psp_navigation_watchdog_expired(&watchdog, 1000u, units))
+            return false;
     }
     /* Wi-Fi join retry. An attempt that dropped back to DISCONNECTED is
        reissued after a one-second pause; a Connect that never started
@@ -734,6 +759,9 @@ static bool test_youtube_player_response_parser(void)
         {"{\"playabilityStatus\":{\"status\":\"AGE_CHECK_REQUIRED\"}}",
          YOUTUBE_PLAYABILITY_AGE_RESTRICTED},
         {"{\"playabilityStatus\":{\"status\":\"UNPLAYABLE\",\"reason\":"
+         "\"This video requires payment to watch\"}}",
+         YOUTUBE_PLAYABILITY_PAYMENT_REQUIRED},
+        {"{\"playabilityStatus\":{\"status\":\"UNPLAYABLE\",\"reason\":"
          "\"Premieres in 2 hours\",\"liveStreamability\":{"
          "\"liveStreamabilityRenderer\":{\"offlineSlate\":{}}}}}",
          YOUTUBE_PLAYABILITY_UPCOMING_UNSUPPORTED}
@@ -746,6 +774,61 @@ static bool test_youtube_player_response_parser(void)
             fprintf(stderr, "playability reason %zu: %s\n", at, error);
             return false;
         }
+    }
+    /* YouTube's movies and shows: the IOS client answers OK with only a
+       FairPlay HLS manifest and drmParams, and web clients list formats
+       whose drmFamilies mark encrypted bytes. Neither is a format gap; an
+       encrypted format is never chosen even with a plain URL, and a clear
+       format next to encrypted ones still plays. */
+    static const char drm_hls_only[] =
+        "{\"playabilityStatus\":{\"status\":\"OK\"},"
+        "\"streamingData\":{\"hlsManifestUrl\":"
+        "\"https://manifest.googlevideo.com/movie.m3u8\","
+        "\"drmParams\":\"ChA2ZDIx\"}}";
+    static const char drm_formats[] =
+        "{\"playabilityStatus\":{\"status\":\"OK\"},"
+        "\"streamingData\":{\"licenseInfos\":[{\"drmFamily\":\"WIDEVINE\"}],"
+        "\"adaptiveFormats\":["
+        "{\"itag\":133,\"width\":426,\"height\":240,\"bitrate\":300,"
+        "\"contentLength\":\"5000\",\"drmFamilies\":[\"WIDEVINE\"],"
+        "\"mimeType\":\"video/mp4; codecs=\\\"avc1.4d4015\\\"\","
+        "\"url\":\"https://rr2.googlevideo.com/locked-240.mp4\"},"
+        "{\"itag\":140,\"bitrate\":129000,\"contentLength\":\"1200\","
+        "\"drmFamilies\":[\"WIDEVINE\"],"
+        "\"mimeType\":\"audio/mp4; codecs=\\\"mp4a.40.2\\\"\","
+        "\"url\":\"https://rr3.googlevideo.com/locked.m4a\"}]}}";
+    static const char drm_beside_clear[] =
+        "{\"playabilityStatus\":{\"status\":\"OK\"},"
+        "\"streamingData\":{\"formats\":["
+        "{\"itag\":22,\"width\":426,\"height\":240,\"bitrate\":900,"
+        "\"contentLength\":\"9000\",\"drmFamilies\":[\"FAIRPLAY\"],"
+        "\"mimeType\":\"video/mp4; codecs=\\\"avc1.42001e, "
+        "mp4a.40.2\\\"\","
+        "\"url\":\"https://rr1.googlevideo.com/locked.mp4\"},"
+        "{\"itag\":18,\"width\":426,\"height\":240,\"bitrate\":500,"
+        "\"contentLength\":\"7000\","
+        "\"mimeType\":\"video/mp4; codecs=\\\"avc1.42001e, "
+        "mp4a.40.2\\\"\","
+        "\"url\":\"https://rr1.googlevideo.com/clear.mp4\"}]}}";
+    const char *const drm_only[] = {drm_hls_only, drm_formats};
+    for (size_t at = 0; at < 2u; at++) {
+        if (youtube_parse_player_response_diagnostic(
+                drm_only[at], strlen(drm_only[at]), "protected", 240,
+                &playability, &stream, error, sizeof(error))
+            || playability != YOUTUBE_PLAYABILITY_DRM_PROTECTED
+            || strstr(error, "playability: drm-protected: ") == NULL
+            || youtube_playability_is_globally_terminal(playability)) {
+            fprintf(stderr, "drm response %zu: %s\n", at, error);
+            return false;
+        }
+    }
+    if (!youtube_parse_player_response_diagnostic(
+            drm_beside_clear, strlen(drm_beside_clear), "mixed", 240,
+            &playability, &stream, error, sizeof(error))
+        || playability != YOUTUBE_PLAYABILITY_OK || stream.itag != 18
+        || strstr(stream.media_url, "clear.mp4") == NULL) {
+        fprintf(stderr, "drm beside clear: %s\n", error);
+        return false;
     }
     /* A signature timestamp at the end of a received watch-page prefix may
        be cut short; only a terminated number is accepted. */
@@ -994,6 +1077,212 @@ static bool test_youtube_player_response_parser(void)
             || strstr(error, "unciphered AVC") != NULL);
 }
 
+static uint64_t test_youtube_clock_skew_seconds;
+
+/* The server issued its URLs at this wall time (2023-11-14). */
+#define TEST_YOUTUBE_ISSUED_UNIX UINT64_C(1700000000)
+
+static uint64_t test_youtube_skewed_wall_time_ns(void *context)
+{
+    (void) context;
+    return (TEST_YOUTUBE_ISSUED_UNIX + test_youtube_clock_skew_seconds)
+        * UINT64_C(1000000000);
+}
+
+static bool test_youtube_accept_issued_stream(
+    uint64_t skew_seconds, const char *lifetime_member, YoutubeStream *stream,
+    char *error, size_t error_size)
+{
+    char response[1024];
+    snprintf(response, sizeof(response),
+        "{\"playabilityStatus\":{\"status\":\"OK\"},"
+        "\"streamingData\":{%s\"formats\":[{\"itag\":18,"
+        "\"width\":320,\"height\":240,\"contentLength\":\"2000\","
+        "\"mimeType\":\"video/mp4; codecs=\\\"avc1.42001e, mp4a.40.2\\\"\","
+        "\"url\":\"https://rr1.googlevideo.com/videoplayback?expire=%llu"
+        "\\u0026id=x\"}]}}",
+        lifetime_member,
+        (unsigned long long) (TEST_YOUTUBE_ISSUED_UNIX + 6u * 3600u));
+    test_youtube_clock_skew_seconds = skew_seconds;
+    TilefinchPlatformServices services = {
+        .wall_time_ns = test_youtube_skewed_wall_time_ns
+    };
+    tilefinch_platform_set_services(&services);
+    static YoutubeStream resolved;
+    bool ok = youtube_parse_player_response(
+            response, strlen(response), "TFTEST00001", 360, &resolved,
+            error, error_size)
+        && youtube_resolver_test_accept_direct_stream(
+            "VISIONOS", &resolved, stream, error, error_size);
+    tilefinch_platform_set_services(NULL);
+    return ok;
+}
+
+/* YT-05: a PSP clock ahead of real time by about a URL's lifetime (a wrong
+   time zone is enough) must not reject freshly issued URLs: the response's
+   own lifetime is counted on the monotonic clock. */
+static bool test_youtube_stream_lifetime_ignores_device_clock(void)
+{
+    static YoutubeStream stream;
+    char error[256] = {0};
+    static const char stated[] = "\"expiresInSeconds\":\"21540\",";
+    uint64_t before = tilefinch_platform_monotonic_time_ns()
+        / UINT64_C(1000000000);
+    for (unsigned hours = 0; hours <= 14u; hours += 7u) {
+        memset(&stream, 0, sizeof(stream));
+        if (!test_youtube_accept_issued_stream(
+                (uint64_t) hours * 3600u, stated, &stream, error,
+                sizeof(error))) {
+            fprintf(stderr, "lifetime, clock +%uh: %s\n", hours, error);
+            return false;
+        }
+        uint64_t after = tilefinch_platform_monotonic_time_ns()
+            / UINT64_C(1000000000);
+        if (stream.lifetime_seconds != 21540u
+            || stream.expires_monotonic_s < before + 21540u
+            || stream.expires_monotonic_s > after + 21540u) return false;
+    }
+    /* A stated lifetime inside the margin is still too short. */
+    if (test_youtube_accept_issued_stream(
+            0, "\"expiresInSeconds\":\"120\",", &stream, error,
+            sizeof(error))
+        || strcmp(error, "format: media URL expires too soon") != 0)
+        return false;
+    /* Without a stated lifetime the URL's expire= is the only clue. */
+    if (!test_youtube_accept_issued_stream(0, "", &stream, error,
+                                           sizeof(error))
+        || test_youtube_accept_issued_stream(7u * 3600u, "", &stream, error,
+                                             sizeof(error)))
+        return false;
+    return true;
+}
+
+/* YT-07: one format whose URL or MIME does not fit, or whose number is not
+   plain, costs only that format; the others still resolve. */
+static bool test_youtube_oversized_format_member(void)
+{
+    static char response[16384];
+    char long_url[YOUTUBE_MEDIA_URL_CAPACITY + 64];
+    int prefix = snprintf(long_url, sizeof(long_url),
+        "https://rr3.googlevideo.com/videoplayback?pad=");
+    memset(long_url + prefix, 'a', sizeof(long_url) - (size_t) prefix - 1u);
+    long_url[sizeof(long_url) - 1u] = '\0';
+    static const char usable[] =
+        "{\"itag\":18,\"width\":320,\"height\":240,"
+        "\"contentLength\":\"2000\","
+        "\"mimeType\":\"video/mp4; codecs=\\\"avc1.42001e, mp4a.40.2\\\"\","
+        "\"url\":\"https://rr2.googlevideo.com/chosen.mp4\"}";
+    const char *odd[3] = {NULL, NULL,
+        "{\"itag\":22,\"width\":352,\"height\":288,"
+        "\"contentLength\":-5,"
+        "\"mimeType\":\"video/mp4; codecs=\\\"avc1.42001e, mp4a.40.2\\\"\","
+        "\"url\":\"https://rr3.googlevideo.com/odd.mp4\"}"};
+    static char long_url_format[YOUTUBE_MEDIA_URL_CAPACITY + 512];
+    snprintf(long_url_format, sizeof(long_url_format),
+        "{\"itag\":22,\"width\":352,\"height\":288,"
+        "\"contentLength\":\"3000\","
+        "\"mimeType\":\"video/mp4; codecs=\\\"avc1.42001e, mp4a.40.2\\\"\","
+        "\"url\":\"%s\"}", long_url);
+    odd[0] = long_url_format;
+    char long_mime[400];
+    memset(long_mime, 'm', sizeof(long_mime) - 1u);
+    long_mime[sizeof(long_mime) - 1u] = '\0';
+    static char long_mime_format[1024];
+    snprintf(long_mime_format, sizeof(long_mime_format),
+        "{\"itag\":22,\"width\":352,\"height\":288,"
+        "\"contentLength\":\"3000\",\"mimeType\":\"video/mp4; %s\","
+        "\"url\":\"https://rr3.googlevideo.com/mime.mp4\"}", long_mime);
+    odd[1] = long_mime_format;
+    for (size_t i = 0; i < 3; i++) {
+        snprintf(response, sizeof(response),
+            "{\"playabilityStatus\":{\"status\":\"OK\"},"
+            "\"streamingData\":{\"formats\":[%s,%s]}}", odd[i], usable);
+        static YoutubeStream stream;
+        char error[256] = {0};
+        if (!youtube_parse_player_response(
+                response, strlen(response), "TFTEST00001", 360, &stream,
+                error, sizeof(error))
+            || stream.itag != 18) {
+            fprintf(stderr, "oversized format %zu: %s\n", i, error);
+            return false;
+        }
+    }
+    /* An inventory that is not a list is still refused. */
+    static const char broken[] =
+        "{\"playabilityStatus\":{\"status\":\"OK\"},"
+        "\"streamingData\":{\"formats\":{\"itag\":18}}}";
+    static YoutubeStream stream;
+    char error[256] = {0};
+    bool refused = !youtube_parse_player_response(
+        broken, sizeof(broken) - 1u, "TFTEST00001", 360, &stream,
+        error, sizeof(error));
+    if (!refused || strcmp(error, "format: malformed YouTube format inventory") != 0)
+        fprintf(stderr, "broken inventory: refused=%d %s\n", refused, error);
+    return refused
+        && strcmp(error, "format: malformed YouTube format inventory") == 0;
+}
+
+/* YT-06: the player request asks for the user's language, so the refusal
+   reason arrives translated. The verdicts that have a structural marker
+   must not depend on the reason's language. */
+static bool test_youtube_playability_structure_outranks_language(void)
+{
+    static const struct {
+        const char *label;
+        const char *json;
+        YoutubePlayability expected;
+    } cases[] = {
+        {"age, English",
+         "{\"playabilityStatus\":{\"status\":\"LOGIN_REQUIRED\","
+         "\"reason\":\"Sign in to confirm your age\","
+         "\"desktopLegacyAgeGateReason\":1}}",
+         YOUTUBE_PLAYABILITY_AGE_RESTRICTED},
+        {"age, French",
+         "{\"playabilityStatus\":{\"status\":\"LOGIN_REQUIRED\","
+         "\"reason\":\"Connectez-vous pour confirmer votre \\u00e2ge\","
+         "\"desktopLegacyAgeGateReason\":1}}",
+         YOUTUBE_PLAYABILITY_AGE_RESTRICTED},
+        {"payment, English",
+         "{\"playabilityStatus\":{\"status\":\"UNPLAYABLE\","
+         "\"reason\":\"This video requires payment to watch\","
+         "\"errorScreen\":{\"playerLegacyDesktopYpcTrailerRenderer\":"
+         "{\"trailerVideoId\":\"abcdefghijk\"}}}}",
+         YOUTUBE_PLAYABILITY_PAYMENT_REQUIRED},
+        {"payment, German",
+         "{\"playabilityStatus\":{\"status\":\"UNPLAYABLE\","
+         "\"reason\":\"F\\u00fcr dieses Video ist eine Zahlung "
+         "erforderlich\","
+         "\"errorScreen\":{\"playerLegacyDesktopYpcTrailerRenderer\":"
+         "{\"trailerVideoId\":\"abcdefghijk\"}}}}",
+         YOUTUBE_PLAYABILITY_PAYMENT_REQUIRED},
+        {"payment trailer, German",
+         "{\"playabilityStatus\":{\"status\":\"UNPLAYABLE\","
+         "\"reason\":\"Zahlung erforderlich\","
+         "\"errorScreen\":{\"ypcTrailerRenderer\":{}}}}",
+         YOUTUBE_PLAYABILITY_PAYMENT_REQUIRED},
+        /* No marker: a translated refusal stays a client refusal. */
+        {"plain refusal, Japanese",
+         "{\"playabilityStatus\":{\"status\":\"UNPLAYABLE\","
+         "\"reason\":\"\\u3053\\u306e\\u52d5\\u753b\"}}",
+         YOUTUBE_PLAYABILITY_CLIENT_REJECTED},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        YoutubeStream stream;
+        char error[256] = {0};
+        YoutubePlayability playability = YOUTUBE_PLAYABILITY_UNKNOWN;
+        bool ok = youtube_parse_player_response_diagnostic(
+            cases[i].json, strlen(cases[i].json), "abcdefghijk", 240,
+            &playability, &stream, error, sizeof(error));
+        if (ok || playability != cases[i].expected) {
+            fprintf(stderr, "playability %s: got %s (%s)\n",
+                    cases[i].label, youtube_playability_name(playability),
+                    error);
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool test_youtube_subtitle_parser(void)
 {
     static const unsigned char vtt[] =
@@ -1108,6 +1397,117 @@ static bool test_youtube_subtitle_parser(void)
         && late != NULL && strcmp(late, caption_text) == 0;
     youtube_subtitles_destroy(streamed);
     return ok && streaming_budget.current == 0;
+}
+
+static const char *test_youtube_subtitle_single(
+    Budget *budget, const char *vtt, YoutubeSubtitleDocument **document)
+{
+    *document = youtube_subtitles_parse_vtt(
+        budget, (const unsigned char *) vtt, strlen(vtt));
+    size_t cursor = 0;
+    return *document == NULL ? NULL
+        : youtube_subtitles_text_at(*document, UINT64_C(2000000), &cursor);
+}
+
+/* YT-04: caption text is kept whole up to the player's caption buffer, cut
+   only on a character boundary, and a long wire line keeps its text. */
+static bool test_youtube_subtitle_text_bounds(void)
+{
+    Budget budget;
+    budget_init(&budget, 512u * 1024u);
+    static const char zhe[] = "\xd0\x96"; /* U+0416, two bytes */
+    char row[256] = {0}, vtt[4096], expected[512];
+    for (int i = 0; i < 42; i++) strcat(row, zhe);
+    /* Two 42-letter Cyrillic rows and a leading ASCII letter: 170 bytes,
+       kept whole. */
+    snprintf(vtt, sizeof(vtt),
+             "WEBVTT\n\n00:00:01.000 --> 00:00:04.000\nA%s\n%s\n\n",
+             row, row);
+    snprintf(expected, sizeof(expected), "A%s %s", row, row);
+    YoutubeSubtitleDocument *document = NULL;
+    const char *text = test_youtube_subtitle_single(&budget, vtt, &document);
+    bool ok = text != NULL && strcmp(text, expected) == 0;
+    youtube_subtitles_destroy(document);
+    /* 301 bytes: cut to 255 at a character boundary ("A" and 127 letters). */
+    char long_row[512] = "A";
+    for (int i = 0; i < 150; i++) strcat(long_row, zhe);
+    snprintf(vtt, sizeof(vtt),
+             "WEBVTT\n\n00:00:01.000 --> 00:00:04.000\n%s\n\n", long_row);
+    text = test_youtube_subtitle_single(&budget, vtt, &document);
+    ok = ok && text != NULL && strlen(text) == 255u
+        && memcmp(text, long_row, 255u) == 0;
+    youtube_subtitles_destroy(document);
+    /* An auto-caption line whose per-word timing tags make it 600 wire
+       bytes keeps all its words; a line of markup alone stays inside the
+       cue. */
+    size_t used = (size_t) snprintf(vtt, sizeof(vtt),
+        "WEBVTT\n\n00:00:01.000 --> 00:00:04.000\n<c></c>\nprevious line\n");
+    for (int i = 0; i < 20; i++)
+        used += (size_t) snprintf(vtt + used, sizeof(vtt) - used,
+            "<00:00:01.%03d><c> word%02d</c>", 100 + i * 10, i);
+    if (used < 550u) return false;
+    snprintf(vtt + used, sizeof(vtt) - used, "\n\n");
+    text = test_youtube_subtitle_single(&budget, vtt, &document);
+    ok = ok && text != NULL && strncmp(text, "previous line  word00", 21) == 0
+        && strstr(text, "word19") != NULL;
+    youtube_subtitles_destroy(document);
+    /* Visible text longer than the line buffer keeps its first bytes. */
+    char wide[1400] = {0};
+    for (int i = 0; i < 300; i++) strcat(wide, zhe);
+    snprintf(vtt, sizeof(vtt),
+             "WEBVTT\n\n00:00:01.000 --> 00:00:04.000\n%s\n\n", wide);
+    text = test_youtube_subtitle_single(&budget, vtt, &document);
+    ok = ok && text != NULL && strlen(text) == 254u
+        && memcmp(text, wide, 254u) == 0;
+    youtube_subtitles_destroy(document);
+    return ok && budget.current == 0;
+}
+
+/* YT-11: after the text pool refuses a cue, no later cue is kept, the
+   window ends at the last cue before the refusal, and the builder reports
+   itself full so the player can stop the transfer. 150-byte cues: 864 fill
+   the 32 text blocks; cue 864 is refused, and the short cue 865 after it
+   must not be kept either. */
+static bool test_youtube_subtitle_truncation_latches(void)
+{
+    size_t capacity = 512u * 1024u, used = 0;
+    char *vtt = malloc(capacity);
+    if (vtt == NULL) return false;
+    used = (size_t) snprintf(vtt, capacity, "WEBVTT\n\n");
+    char text[151];
+    memset(text, 'x', 150);
+    text[150] = '\0';
+    for (unsigned i = 0; i < 867u; i++) {
+        unsigned start = i * 4u, end = start + 2u;
+        used += (size_t) snprintf(vtt + used, capacity - used,
+            "%02u:%02u:%02u.000 --> %02u:%02u:%02u.000\n%s\n\n",
+            start / 3600u, start / 60u % 60u, start % 60u,
+            end / 3600u, end / 60u % 60u, end % 60u,
+            i == 865u ? "ok" : text);
+    }
+    Budget budget;
+    budget_init(&budget, 1024u * 1024u);
+    YoutubeSubtitleBuilder *builder =
+        youtube_subtitles_builder_create(&budget, 0);
+    bool ok = builder != NULL
+        && youtube_subtitles_builder_feed(
+               builder, (const unsigned char *) vtt, used)
+        && youtube_subtitles_builder_full(builder);
+    free(vtt);
+    YoutubeSubtitleDocument *document = ok
+        ? youtube_subtitles_builder_finish(builder) : NULL;
+    if (!ok) youtube_subtitles_builder_destroy(builder);
+    YoutubeSubtitleWindow window = {0};
+    size_t cursor = 0;
+    ok = ok && document != NULL
+        && youtube_subtitles_window(document, &window)
+        && window.truncated
+        && youtube_subtitles_cue_count(document) == 864u
+        && window.end_us == UINT64_C(3454000000)
+        && youtube_subtitles_text_at(
+               document, UINT64_C(3461000000), &cursor) == NULL;
+    youtube_subtitles_destroy(document);
+    return ok && budget.current == 0;
 }
 
 /* One generated cue every 1.5 s, like a long auto-caption track. */
@@ -1624,6 +2024,55 @@ static int test_youtube_lite_broadcast_cards(void)
     return 0;
 }
 
+/* A result title longer than its two lines ends in an ellipsis rather than
+   stopping mid-word, and a title that fits stays exactly as it was. */
+static int test_youtube_lite_long_title_is_marked(Budget *layout_budget)
+{
+    static char source[1024];
+    Budget budget;
+    budget_init(&budget, 2u * 1024u * 1024u);
+    char title[300];
+    size_t used = 0;
+    while (used + 8u < sizeof(title)) {
+        memcpy(title + used, "longish ", 8u);
+        used += 8u;
+    }
+    title[used] = '\0';
+    int length = snprintf(source, sizeof(source),
+        "<!doctype html><script>var ytInitialData = '"
+        "\\x7b\\x22contents\\x22:\\x5b\\x7b\\x22videoRenderer\\x22:\\x7b"
+        "\\x22title\\x22:\\x7b\\x22runs\\x22:\\x5b\\x7b\\x22text\\x22:\\x22%s\\x22\\x7d\\x5d\\x7d,"
+        "\\x22videoId\\x22:\\x22abc_DEF-123\\x22\\x7d\\x7d\\x5d\\x7d';</script>", title);
+    CHECK(length > 0 && (size_t) length < sizeof(source));
+    YoutubeLiteDocument document = {0};
+    char error[128] = {0};
+    CHECK(youtube_lite_build_document(
+        &budget, "https://www.youtube.com/results?search_query=psp",
+        source, (size_t) length, &document, error, sizeof(error)));
+    PocDocument parsed = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument layout = {0};
+    CHECK(document_parse(&parsed, layout_budget, document.html,
+                         document.html_length, 17)
+          && stylesheet_build(&sheet, layout_budget, &parsed, 480)
+          && layout_build(&layout, layout_budget, &parsed, &sheet, NULL, NULL, 480));
+    bool marked = false;
+    for (size_t at = 0; at < layout.count; at++) {
+        const DrawCommand *command = &layout.commands[at];
+        if (command->type != DRAW_TEXT) continue;
+        for (size_t byte = 0; byte + 3u <= command->text_length; byte++)
+            marked = marked
+                || memcmp(command->text + byte, "\xe2\x80\xa6", 3u) == 0;
+    }
+    CHECK(marked);
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&parsed);
+    youtube_lite_document_destroy(&document);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
 static bool test_youtube_lite_document_builder(Budget *layout_budget)
 {
     char video_id[YOUTUBE_VIDEO_ID_CAPACITY] = {0};
@@ -1718,7 +2167,7 @@ static bool test_youtube_lite_document_builder(Budget *layout_budget)
         && strstr(document.html, "id=yt-feed-status") == NULL
         && strstr(
                document.html,
-               "id=yt-search name=search_query type=search "
+               "id=yt-search name=search_query type=search dir=auto "
                "aria-label=\"Search YouTube\" "
                "placeholder=\"Search YouTube\" value=\"\" autofocus")
                != NULL;
@@ -2120,14 +2569,20 @@ static int test_foundation(void)
     CHECK(test_psp_network_reinitialization_policy());
     puts("test: bounded YouTube player response parser");
     CHECK(test_youtube_player_response_parser());
+    CHECK(test_youtube_stream_lifetime_ignores_device_clock());
+    CHECK(test_youtube_oversized_format_member());
+    CHECK(test_youtube_playability_structure_outranks_language());
     puts("test: ranked YouTube audio and subtitle retention");
     CHECK(test_youtube_ranked_track_retention());
     puts("test: bounded YouTube subtitle parser");
     CHECK(test_youtube_subtitle_parser());
+    CHECK(test_youtube_subtitle_text_bounds());
+    CHECK(test_youtube_subtitle_truncation_latches());
     puts("test: YouTube subtitle text blocks and windows");
     CHECK(test_youtube_subtitle_windows());
     puts("test: bounded YouTube lightweight page builder");
     CHECK(test_youtube_lite_document_builder(&budget));
+    CHECK(test_youtube_lite_long_title_is_marked(&budget) == 0);
     CHECK(test_youtube_lite_lockup_cards() == 0);
     puts("test: YouTube channel pages");
     CHECK(test_youtube_lite_channel_pages() == 0);
@@ -2153,6 +2608,7 @@ static int test_foundation(void)
     CHECK(budget.current == 0);
     puts("test: parser releases large-token storage");
     CHECK(test_parser_releases_large_token_storage(&budget));
+    CHECK(test_parser_streaming_inline_admission(&budget));
     CHECK(budget.current == 0);
 
     puts("test: visible text emits bounded glyph-script hints");
@@ -2189,6 +2645,7 @@ static int test_foundation(void)
 
     puts("test: streaming stylesheet checkpoint reuse");
     CHECK(test_streaming_stylesheet_checkpoint_reuse(&budget));
+    CHECK(test_streaming_loader_input_changes_rebuild(&budget));
     CHECK(budget.current == 0);
 
     puts("test: streaming allocation-phase recovery sweep");
@@ -2223,6 +2680,8 @@ static int test_foundation(void)
     CHECK(test_inline_svg_presentation_resource(&budget));
     puts("test: bounded inline SVG symbol/use raster resource");
     CHECK(test_inline_svg_symbol_use_resource(&budget));
+    puts("test: inline SVG use ids resolve once, one rule");
+    CHECK(test_inline_svg_use_ids_resolve_once(&budget));
     CHECK(test_external_svg_symbol_use_resource(&budget));
     CHECK(test_external_svg_sprite_indexed_once(&budget));
     CHECK(test_compact_adopted_sheet_indices(&budget));
@@ -2518,6 +2977,29 @@ static int test_foundation(void)
           && budget.categories[BUDGET_CATEGORY_DOM].active_allocations == 1
           && budget_categories_reconcile(&budget));
     budget_free(&budget, incumbent_dom);
+    CHECK(budget.current == 0 && budget_categories_reconcile(&budget));
+    puts("test: owner charge census isolates allocation windows and categories");
+    previous_owner = budget_allocation_owner_enter(&budget, parser_owner);
+    void *older_owned = budget_malloc_category(&budget, BUDGET_CATEGORY_DOM, 32);
+    uint64_t owner_checkpoint = budget_checkpoint(&budget);
+    size_t charge_before = budget.current;
+    void *aligned_owned = budget_malloc_cacheline_category(
+        &budget, BUDGET_CATEGORY_DOM, 65);
+    size_t aligned_charge = budget.current - charge_before;
+    void *other_category = budget_malloc_category(
+        &budget, BUDGET_CATEGORY_SESSION, 16);
+    budget_allocation_owner_leave(&budget, previous_owner);
+    void *other_owner = budget_malloc_category(&budget, BUDGET_CATEGORY_DOM, 32);
+    CHECK(older_owned != NULL && aligned_owned != NULL
+          && other_category != NULL && other_owner != NULL);
+    CHECK(budget_owner_category_bytes_since(&budget, parser_owner,
+              BUDGET_CATEGORY_DOM, owner_checkpoint) == aligned_charge);
+    budget_free(&budget, aligned_owned);
+    CHECK(budget_owner_category_bytes_since(&budget, parser_owner,
+              BUDGET_CATEGORY_DOM, owner_checkpoint) == 0);
+    budget_free(&budget, other_owner);
+    budget_free(&budget, other_category);
+    budget_free(&budget, older_owned);
     CHECK(budget.current == 0 && budget_categories_reconcile(&budget));
     puts("test: allocation-free pressure telemetry");
     size_t allocation_count_before_pressure = budget.allocation_count;

@@ -570,6 +570,19 @@ static int test_fixed_image_publication(void)
     rebound_images.count = 0;
     CHECK(layout_rebind_image_resources(&rebound_layout, (uintptr_t) previous,
         3, &rebound_images) == 1 && rebound_commands[0].image == NULL);
+    /* A compacted table: entries keep their order, an evicted one has none. */
+    static const uint8_t compacted[3] = {IMAGE_EVICTED, 0, 1};
+    ImageResource compacted_items[3] = {{0}};
+    rebound_commands[0].image = &compacted_items[0];
+    rebound_commands[1].image = &compacted_items[1];
+    rebound_commands[2].image = &compacted_items[2];
+    rebound_images.items = compacted_items;
+    rebound_images.count = 2;
+    CHECK(layout_remap_image_resources(&rebound_layout, compacted, 3,
+                                       &rebound_images) == 3
+        && rebound_commands[0].image == NULL
+        && rebound_commands[1].image == &compacted_items[0]
+        && rebound_commands[2].image == &compacted_items[1]);
     char path[] = "/tmp/tilefinch-fixed-png-XXXXXX";
     int fd = mkstemp(path);
     CHECK(fd >= 0 && close(fd) == 0);
@@ -2127,6 +2140,18 @@ static int test_google_search_compatibility_adapter(void)
                      sizeof("https://lite.duckduckgo.com/lite/?q=") - 1u) == 0
           && strstr(action.url, "PSP") != NULL
           && strstr(action.url, "games") != NULL);
+    /* The keyboard's Done in its query field is Enter (Q7): the form's
+       only text field, sent through its default button. */
+    lxb_dom_node_t *query = actionable_find_id(
+        &navigation->page.document, "compat-query");
+    CHECK(query != NULL && browser_engine_focus_node(engine, query)
+          && browser_engine_replace_text(engine, "psp", 3u)
+          && browser_engine_keyboard_done_submits(engine));
+    action = (ControllerAction) {0};
+    CHECK(browser_engine_activate(engine, &action)
+          && action.type == CONTROLLER_ACTION_FORM_SUBMIT
+          && strcmp(action.url, "https://lite.duckduckgo.com/lite/?q=psp")
+                 == 0);
 
     CHECK(browser_engine_shutdown(engine));
     browser_engine_destroy(engine);
@@ -5747,7 +5772,8 @@ static int test_reader_activation_retires_frame_without_main_runtime(void)
     CHECK(document_parse(
               &frame->document, budget, child, sizeof(child) - 1u, 16u));
     frame->runtime = script_runtime_create_deferred(
-        &frame->document, budget, 2u * MIB, 1000u,
+        &frame->document, budget,
+        test_small_realm_bytes(budget, TEST_SMALL_REALM_MARGIN_BYTES), 1000u,
         "https://frame-retire.example.test/child", NULL,
         &frame->script_result);
     frame->loaded = true;

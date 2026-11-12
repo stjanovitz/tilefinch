@@ -1,0 +1,42 @@
+# Measurement scenario, not golden-gated: wiki-article-revisit with Night
+# mode switched to Dark after the first article (the wiki-revisit-night
+# journey, benchmarks/perf-journeys.tsv). The journey starts at noon, so
+# article A loads light; B and C load dark. C is the first load that can
+# take a cached compiled sheet, and the only one cached by then is A's
+# light sheet (a sheet is stored when its page is left). The compiled-sheet
+# keys carry night mode (b9a0089d), so C must not take it: the journey pins
+# head-cache takes at c-settled to 0 (with the key or its streaming guard
+# removed, C takes A's light <head>). b-frame and c-frame must equal the
+# all-dark wiki-revisit-dark journey's. On this trace that holds even for a
+# light sheet: Wikipedia gates its dark rules on a class its scripts set
+# (skin-theme-clientpref-os), and with JavaScript off only the forced-dark
+# transform applies.
+# Menu rows: Home, Tabs, Page tools, Library, Settings; Appearance is the
+# first Settings category and Night mode its sixth row (Browser UI, Page
+# text size, Page zoom, Reader font, Remember size, Night mode). Night
+# mode cycles Auto, Light, Dark, so Left from Auto is Dark.
+wait-page 120
+wait 300
+mark a-settled
+mark-live a-frame
+tap select
+press 4 down
+tap cross
+tap cross
+press 5 down
+tap left
+wait 4
+mark night-set
+tap select
+wait 30
+tap square
+wait-live 2400
+wait 300
+mark b-settled
+mark-live b-frame
+tap square
+wait-live 2400
+wait 300
+mark c-settled
+mark-live c-frame
+end

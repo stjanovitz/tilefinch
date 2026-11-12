@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 #include "tilefinch/budget.h"
+#include "tilefinch/page_dialog.h"
 
 typedef struct {
     uint32_t buttons;
@@ -106,6 +107,15 @@ typedef struct {
     bool (*cooperate_at)(void *context, const char *phase,
                          size_t completed_work_units, unsigned boundary);
     void (*log_message)(void *context, const char *message);
+    /* Optional: show a page's alert/confirm/prompt and block until the user
+       answers (tilefinch/page_dialog.h). Called on the engine's owner
+       thread from inside the page's script, which stays suspended: the
+       frontend must not reenter the engine, and only presents immutable
+       incumbent pixels. False means no dialog could be shown, and the page
+       gets the default-deny answer. */
+    bool (*page_dialog)(void *context,
+                        const TilefinchPageDialogRequest *request,
+                        TilefinchPageDialogResponse *response);
 } TilefinchPlatformServices;
 
 void tilefinch_platform_set_services(const TilefinchPlatformServices *services);
@@ -138,6 +148,9 @@ bool tilefinch_platform_cooperate_at(const char *phase,
 void tilefinch_platform_render_shell_borrow_begin(void);
 void tilefinch_platform_render_shell_borrow_end(void);
 void tilefinch_platform_log_message(const char *message);
+/* False when no frontend dialog service is installed or it declined. */
+bool tilefinch_platform_page_dialog(const TilefinchPageDialogRequest *request,
+                                    TilefinchPageDialogResponse *response);
 /* Publishes the closed file TEMPORARY under PATH on a filesystem whose
    rename may refuse to replace an existing file (the PSP's FAT).
 
@@ -146,8 +159,9 @@ void tilefinch_platform_log_message(const char *message);
    still whole) and moved back if TEMPORARY cannot be installed, so a
    complete generation exists under PATH or BACKUP at every instant.
    Without BACKUP, an atomic replace is tried first; only when that fails
-   (and TEMPORARY exists) is PATH removed and the rename retried, so a power
-   loss in that window leaves just TEMPORARY.
+   (and TEMPORARY and PATH exist) is PATH moved to PATH.old and the rename
+   retried. A failed retry moves PATH back; a power loss in that window
+   leaves PATH.old (removed by the next replace) and TEMPORARY.
 
    TEMPORARY is never removed: on failure the caller decides whether it is
    discarded or kept for recovery. */

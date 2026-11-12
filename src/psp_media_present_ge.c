@@ -418,9 +418,9 @@ bool psp_media_present_ge_stage_dma(
  * a transfer of a quarter-megabyte between two memories on the same bus that
  * has not completed in two seconds is not slow; it is a controller that will
  * not complete at all. Waiting longer buys nothing and holds the decoded slot
- * and the staging buffer hostage while the panel shows a frozen picture --
- * whereas ending the session says so, and the retry ladder can restart the
- * whole media stack including the worker.
+ * hostage while the panel shows a frozen picture -- whereas ending the session
+ * says so. The staging buffer stays refused past the deadline (ABANDONED)
+ * until the transfer is seen to end, so a retry draws unstaged meanwhile.
  */
 #define PSP_MEDIA_DMA_QUARANTINE_DEADLINE_US 2000000u
 
@@ -432,9 +432,13 @@ static bool psp_media_dma_in_flight; /* interactive thread only */
 static atomic_int psp_media_dma_stop;
 /* Latched by whichever side discovers the worker cannot answer: the worker's
    own wait failing, or a join that timed out. Submit consults it, so one
-   unanswerable copy costs the session the overlap and nothing else -- every
-   caller of submit already performs the copy itself when it refuses. */
+   unanswerable copy costs the overlap and nothing else -- every caller of
+   submit already performs the copy itself when it refuses. A timed-out join's
+   latch is lifted again when its transfer is seen to end, because the worker
+   that sets the done bit is then back in its wait (MB-11); the worker's own
+   exit is permanent. */
 static atomic_int psp_media_dma_dead;
+static atomic_int psp_media_dma_worker_exited;
 static void *psp_media_dma_dst;      /* payload, ordered by the event flags */
 static const void *psp_media_dma_src;
 static SceSize psp_media_dma_bytes;
@@ -461,7 +465,7 @@ static uint32_t psp_media_dma_generation;
  * thread. The DMA worker never touches it -- it does not know it has been
  * abandoned, which is exactly the problem this describes.
  */
-static bool psp_media_dma_quarantine_live;
+static PspMediaDmaQuarantineState psp_media_dma_quarantine_state;
 static int psp_media_dma_quarantine_slot = -1;
 static const void *psp_media_dma_quarantine_dst;
 static uint32_t psp_media_dma_quarantine_since_us;
@@ -493,6 +497,8 @@ static int psp_media_dma_worker_main(SceSize argument_size, void *arguments)
              * bit so a join already waiting on this copy is released rather
              * than left on an event flag nothing will ever raise again.
              */
+            atomic_store_explicit(
+                &psp_media_dma_worker_exited, 1, memory_order_release);
             atomic_store_explicit(
                 &psp_media_dma_dead, 1, memory_order_release);
             atomic_store_explicit(
@@ -636,7 +642,7 @@ PspMediaPresentDmaJoin psp_media_present_ge_stage_dma_join(void)
             &psp_media_dma_dead, 1, memory_order_release);
         atomic_fetch_add_explicit(
             &psp_media_dma_timeouts, 1u, memory_order_relaxed);
-        psp_media_dma_quarantine_live = true;
+        psp_media_dma_quarantine_state = PSP_MEDIA_DMA_QUARANTINE_LIVE;
         psp_media_dma_quarantine_slot = (int) psp_media_dma_slot;
         psp_media_dma_quarantine_dst = psp_media_dma_dst;
         psp_media_dma_quarantine_since_us = sceKernelGetSystemTimeLow();
@@ -654,53 +660,68 @@ PspMediaPresentDmaJoin psp_media_present_ge_stage_dma_join(void)
 
 bool psp_media_present_ge_stage_dma_quarantined(void)
 {
-    return psp_media_dma_quarantine_live;
+    return psp_media_dma_quarantine_state != PSP_MEDIA_DMA_QUARANTINE_CLEAR;
 }
 
 bool psp_media_present_ge_stage_dma_quarantine_holds(int slot)
 {
-    return psp_media_dma_quarantine_live && slot >= 0
-        && slot == psp_media_dma_quarantine_slot;
+    return psp_media_present_dma_quarantine_refuses_slot(
+               psp_media_dma_quarantine_state)
+        && slot >= 0 && slot == psp_media_dma_quarantine_slot;
 }
 
 bool psp_media_present_ge_stage_dma_quarantine_holds_staging(
     const void *destination)
 {
-    return psp_media_dma_quarantine_live && destination != NULL
+    return psp_media_present_dma_quarantine_refuses_staging(
+               psp_media_dma_quarantine_state)
+        && destination != NULL
         && destination == psp_media_dma_quarantine_dst;
 }
 
-bool psp_media_present_ge_stage_dma_quarantine_poll(void)
+PspMediaDmaQuarantineStep psp_media_present_ge_stage_dma_quarantine_step(void)
 {
-    if (!psp_media_dma_quarantine_live) return false;
+    if (psp_media_dma_quarantine_state == PSP_MEDIA_DMA_QUARANTINE_CLEAR)
+        return PSP_MEDIA_DMA_QUARANTINE_STEP_IDLE;
     /* Poll, never wait: this runs on frames that have their own work to do,
        and the whole point of the quarantine is that nothing has to block on a
        transfer nobody can stop. */
     uint32_t bits = 0;
     int poll = sceKernelPollEventFlag(
         psp_media_dma_done, PSP_MEDIA_DMA_WAKE, PSP_EVENT_WAITOR, &bits);
-    if (poll != 0 || (bits & PSP_MEDIA_DMA_WAKE) == 0) return false;
-    (void) sceKernelClearEventFlag(psp_media_dma_done, ~PSP_MEDIA_DMA_WAKE);
+    bool seen = poll == 0 && (bits & PSP_MEDIA_DMA_WAKE) != 0;
     uint32_t held_us =
         sceKernelGetSystemTimeLow() - psp_media_dma_quarantine_since_us;
-    if (held_us > atomic_load_explicit(
-            &psp_media_dma_quarantine_max_us, memory_order_relaxed)) {
-        atomic_store_explicit(
-            &psp_media_dma_quarantine_max_us, held_us, memory_order_relaxed);
+    PspMediaDmaQuarantineStep step = psp_media_present_dma_quarantine_step(
+        &psp_media_dma_quarantine_state, seen, held_us,
+        PSP_MEDIA_DMA_QUARANTINE_DEADLINE_US);
+    if (seen) {
+        (void) sceKernelClearEventFlag(
+            psp_media_dma_done, ~PSP_MEDIA_DMA_WAKE);
+        if (held_us > atomic_load_explicit(
+                &psp_media_dma_quarantine_max_us, memory_order_relaxed)) {
+            atomic_store_explicit(
+                &psp_media_dma_quarantine_max_us, held_us,
+                memory_order_relaxed);
+        }
+        psp_media_dma_quarantine_slot = -1;
+        psp_media_dma_quarantine_dst = NULL;
+        atomic_fetch_add_explicit(
+            &psp_media_dma_late_completions, 1u, memory_order_relaxed);
+        /* No copy was posted since the join gave up (the latch below), so
+           this done bit is the abandoned transfer's and the worker that set
+           it is back in its wait: the overlap can be offered again. Not
+           when the worker itself left its loop -- its parting done bit
+           proves the opposite. */
+        if (!atomic_load_explicit(
+                &psp_media_dma_worker_exited, memory_order_acquire))
+            atomic_store_explicit(
+                &psp_media_dma_dead, 0, memory_order_release);
+    } else if (step == PSP_MEDIA_DMA_QUARANTINE_STEP_EXPIRED) {
+        /* Abandoned: the slot is given up, the staging buffer is not. */
+        psp_media_dma_quarantine_slot = -1;
     }
-    psp_media_dma_quarantine_live = false;
-    psp_media_dma_quarantine_slot = -1;
-    psp_media_dma_quarantine_dst = NULL;
-    atomic_fetch_add_explicit(
-        &psp_media_dma_late_completions, 1u, memory_order_relaxed);
-    return true;
-}
-
-bool psp_media_present_ge_stage_dma_quarantine_expired(void)
-{
-    if (!psp_media_dma_quarantine_live) return false;
-    return sceKernelGetSystemTimeLow() - psp_media_dma_quarantine_since_us
-        >= PSP_MEDIA_DMA_QUARANTINE_DEADLINE_US;
+    return step;
 }
 
 bool psp_media_present_ge_stage_dma_recover(
@@ -1803,14 +1824,9 @@ bool psp_media_present_ge_stage_dma_quarantine_holds_staging(
     return false;
 }
 
-bool psp_media_present_ge_stage_dma_quarantine_poll(void)
+PspMediaDmaQuarantineStep psp_media_present_ge_stage_dma_quarantine_step(void)
 {
-    return false;
-}
-
-bool psp_media_present_ge_stage_dma_quarantine_expired(void)
-{
-    return false;
+    return PSP_MEDIA_DMA_QUARANTINE_STEP_IDLE;
 }
 
 /* Nothing is ever posted here, so there is never a copy to repeat -- and no

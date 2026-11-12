@@ -497,7 +497,7 @@ static bool lite_channel_about_link(YoutubeLiteHtml *html,
     const YoutubeLiteChannel *channel, const char *path, size_t base)
 {
     char line[YOUTUBE_LITE_SNIPPET_LIMIT];
-    size_t length = lite_utf8_complete_prefix(channel->description,
+    size_t length = tilefinch_utf8_complete_prefix(channel->description,
         strnlen(channel->description, sizeof(line) - 1u));
     memcpy(line, channel->description, length);
     line[length] = '\0';

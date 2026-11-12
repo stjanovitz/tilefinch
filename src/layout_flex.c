@@ -478,15 +478,18 @@ bool flat_iterator_next(FlatItemIterator *iterator, FlatItem *item)
     while (iterator->cursor != NULL) {
         lxb_dom_node_t *node = iterator->cursor;
         iterator->cursor = flat_node_after(node, iterator->container);
+        /* Most of a list's nodes are comments and whitespace: settle those
+           before the parent's style, which they never use. */
+        if (node->type == LXB_DOM_NODE_TYPE_TEXT
+            ? !iterator->include_whitespace && !text_has_content(node)
+            : node->type != LXB_DOM_NODE_TYPE_ELEMENT
+              || layout_node_is_hidden_input(node)) continue;
         ComputedStyle parent_style;
         if (!flat_parent_style(iterator->context, iterator->container,
                                &iterator->container_style,
                                document_flat_parent(node),
                                &parent_style)) continue;
         if (node->type == LXB_DOM_NODE_TYPE_TEXT) {
-            if (!iterator->include_whitespace && !text_has_content(node)) {
-                continue;
-            }
             *item = (FlatItem) {
                 .node = node,
                 .parent_style = parent_style,
@@ -497,8 +500,6 @@ bool flat_iterator_next(FlatItemIterator *iterator, FlatItem *item)
             iterator->context->flat_iterator_yields++;
             return true;
         }
-        if (node->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
-        if (layout_node_is_hidden_input(node)) continue;
         ComputedStyle style = layout_style_for_node(
             iterator->context, node, &parent_style);
         if (style.display == DISPLAY_NONE

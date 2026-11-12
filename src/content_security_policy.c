@@ -203,9 +203,21 @@ typedef struct {
        source token: 0 unknown, 1 parsed, 2 failed. */
     uint8_t target_state;
     uint8_t document_state;
+    /* The target is a WebSocket's request URL: its http(s) spelling, as
+       the WebSocket standard's fetch uses, standing for ws(s). */
+    bool socket;
     TilefinchUrl target;
     TilefinchUrl document;
 } UrlMatch;
+
+/* A source expression's scheme-part, and a target's effective scheme. */
+typedef enum {
+    CSP_SCHEME_NONE = 0,
+    CSP_SCHEME_HTTP,
+    CSP_SCHEME_HTTPS,
+    CSP_SCHEME_WS,
+    CSP_SCHEME_WSS
+} CspScheme;
 
 static const TilefinchUrl *url_match_target(UrlMatch *match)
 {
@@ -225,12 +237,39 @@ static const TilefinchUrl *url_match_document(UrlMatch *match)
     return match->document_state == 1 ? &match->document : NULL;
 }
 
-static bool scheme_matches(TilefinchUrlScheme source,
-                           TilefinchUrlScheme target)
+static CspScheme csp_scheme_of_url(TilefinchUrlScheme scheme)
 {
-    return source == target
-        || (source == TILEFINCH_URL_SCHEME_HTTP
-            && target == TILEFINCH_URL_SCHEME_HTTPS);
+    return scheme == TILEFINCH_URL_SCHEME_HTTPS ? CSP_SCHEME_HTTPS
+        : scheme == TILEFINCH_URL_SCHEME_HTTP ? CSP_SCHEME_HTTP
+        : CSP_SCHEME_NONE;
+}
+
+static CspScheme url_match_target_scheme(const UrlMatch *match,
+                                         const TilefinchUrl *target)
+{
+    CspScheme scheme = csp_scheme_of_url(target->scheme);
+    if (!match->socket) return scheme;
+    return scheme == CSP_SCHEME_HTTPS ? CSP_SCHEME_WSS
+        : scheme == CSP_SCHEME_HTTP ? CSP_SCHEME_WS : CSP_SCHEME_NONE;
+}
+
+/* CSP3 "scheme-part match", applied to the request URL a socket's fetch
+   uses (ws as http, wss as https): an http source covers http, https, ws
+   and wss; https covers https and wss; ws covers ws and wss; wss covers
+   wss. A ws/wss source does not cover an http(s) fetch here, which CSP3
+   would allow because it cannot tell a socket's request apart. */
+static bool scheme_matches(CspScheme source, CspScheme target)
+{
+    if (target == CSP_SCHEME_NONE) return false;
+    switch (source) {
+        case CSP_SCHEME_HTTP: return true;
+        case CSP_SCHEME_HTTPS:
+            return target == CSP_SCHEME_HTTPS || target == CSP_SCHEME_WSS;
+        case CSP_SCHEME_WS:
+            return target == CSP_SCHEME_WS || target == CSP_SCHEME_WSS;
+        case CSP_SCHEME_WSS: return target == CSP_SCHEME_WSS;
+        default: return false;
+    }
 }
 
 static bool host_source_matches(const char *token, size_t length,
@@ -241,7 +280,7 @@ static bool host_source_matches(const char *token, size_t length,
     if (parsed_target == NULL) return false;
     const TilefinchUrl target = *parsed_target;
     size_t at = 0;
-    TilefinchUrlScheme source_scheme = TILEFINCH_URL_SCHEME_INVALID;
+    CspScheme source_scheme = CSP_SCHEME_NONE;
     const char *scheme_end = NULL;
     for (size_t i = 0; i + 2 < length; i++) {
         if (token[i] == ':' && token[i + 1] == '/'
@@ -254,16 +293,22 @@ static bool host_source_matches(const char *token, size_t length,
     if (scheme_end != NULL) {
         size_t scheme_length = (size_t) (scheme_end - token);
         if (span_equal_ci(token, scheme_length, "https")) {
-            source_scheme = TILEFINCH_URL_SCHEME_HTTPS;
+            source_scheme = CSP_SCHEME_HTTPS;
         } else if (span_equal_ci(token, scheme_length, "http")) {
-            source_scheme = TILEFINCH_URL_SCHEME_HTTP;
+            source_scheme = CSP_SCHEME_HTTP;
+        } else if (span_equal_ci(token, scheme_length, "wss")) {
+            source_scheme = CSP_SCHEME_WSS;
+        } else if (span_equal_ci(token, scheme_length, "ws")) {
+            source_scheme = CSP_SCHEME_WS;
         } else return false;
     } else {
         const TilefinchUrl *document = url_match_document(match);
         if (document == NULL) return false;
-        source_scheme = document->scheme;
+        source_scheme = csp_scheme_of_url(document->scheme);
     }
-    if (!scheme_matches(source_scheme, target.scheme)) return false;
+    if (!scheme_matches(source_scheme,
+                        url_match_target_scheme(match, &target)))
+        return false;
     size_t authority_end = at;
     while (authority_end < length && token[authority_end] != '/') {
         authority_end++;
@@ -348,7 +393,24 @@ static bool url_token_matches(const char *token, size_t length, void *opaque)
             && (parsed->scheme == TILEFINCH_URL_SCHEME_HTTP
                 || parsed->scheme == TILEFINCH_URL_SCHEME_HTTPS);
     }
+    if ((length == 3 && strncasecmp(token, "ws:", 3) == 0)
+        || (length == 4 && strncasecmp(token, "wss:", 4) == 0)) {
+        const TilefinchUrl *parsed = url_match_target(match);
+        return parsed != NULL && scheme_matches(
+            length == 3 ? CSP_SCHEME_WS : CSP_SCHEME_WSS,
+            url_match_target_scheme(match, parsed));
+    }
     return token[0] != '\'' && host_source_matches(token, length, match);
+}
+
+static bool directive_allows_url(const TilefinchContentSecurityPolicy *csp,
+                                 const TilefinchCspDirectiveValue *value,
+                                 const char *url, bool socket)
+{
+    UrlMatch match = {.csp = csp, .url = url, .socket = socket};
+    size_t count = 0;
+    bool matched = visit_tokens(csp, value, url_token_matches, &match, &count);
+    return count != 0 && matched;
 }
 
 static bool policy_allows_url(const TilefinchContentSecurityPolicy *csp,
@@ -358,11 +420,7 @@ static bool policy_allows_url(const TilefinchContentSecurityPolicy *csp,
 {
     const TilefinchCspDirectiveValue *value = directive_for(
         policy, directive, fallback_default);
-    if (value == NULL) return true;
-    UrlMatch match = {.csp = csp, .url = url};
-    size_t count = 0;
-    bool matched = visit_tokens(csp, value, url_token_matches, &match, &count);
-    return count != 0 && matched;
+    return value == NULL || directive_allows_url(csp, value, url, false);
 }
 
 static bool keyword_token(const char *token, size_t length, void *opaque)
@@ -427,6 +485,7 @@ static bool csp_request_directive(TilefinchRequestDestination destination,
         case TILEFINCH_DESTINATION_FRAME:
             *directive = TILEFINCH_CSP_FRAME_SRC; return true;
         case TILEFINCH_DESTINATION_MEDIA:
+        case TILEFINCH_DESTINATION_AUDIO:
             *directive = TILEFINCH_CSP_MEDIA_SRC; return true;
         case TILEFINCH_DESTINATION_OTHER:
             *directive = TILEFINCH_CSP_OBJECT_SRC; return true;
@@ -488,6 +547,21 @@ bool tilefinch_csp_allows_request(
 {
     return tilefinch_csp_allows_request_granted(
         csp, destination, target_url, 0);
+}
+
+bool tilefinch_csp_allows_websocket(
+    const TilefinchContentSecurityPolicy *csp, const char *request_url,
+    uint8_t grant)
+{
+    if (csp == NULL || !csp->header_present) return true;
+    bool allowed = csp->valid && request_url != NULL;
+    for (size_t i = 0; allowed && i < csp->policy_count; i++) {
+        const TilefinchCspDirectiveValue *value = directive_for(
+            &csp->policies[i], TILEFINCH_CSP_CONNECT_SRC, true);
+        allowed = value == NULL || (grant & (1u << i)) != 0
+            || directive_allows_url(csp, value, request_url, true);
+    }
+    return csp_census("websocket", request_url, allowed);
 }
 
 bool tilefinch_csp_allows_worker(

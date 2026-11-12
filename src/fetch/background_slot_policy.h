@@ -77,6 +77,17 @@ fetch_background_fixed_buffers_ensure(
     return FETCH_BACKGROUND_ENQUEUE_ADMITTED;
 }
 
+/* A worker that failed to start is tried again by the next request that
+   needs it, but at most once a second: each attempt repeats curl's global
+   setup, the CA blob and the thread creation. */
+#define FETCH_BACKGROUND_START_RETRY_US UINT64_C(1000000)
+static inline bool fetch_background_start_retry_due(
+    uint64_t now_us, uint64_t last_failure_us)
+{
+    return last_failure_us == 0 || now_us < last_failure_us
+        || now_us - last_failure_us >= FETCH_BACKGROUND_START_RETRY_US;
+}
+
 /* Setup work and firmware services needed by a socket poll run below the
    browser. Keep at least 4 ms between completed 2 ms checkpoint donations;
    this bounds requested caller latency without elevating a long TLS call. */
@@ -107,6 +118,50 @@ static inline bool fetch_background_deadline_eligible(
     bool transfer_done, bool curl_paused, uint64_t pause_started_us)
 {
     return !transfer_done && !curl_paused && pause_started_us == 0;
+}
+
+typedef enum {
+    FETCH_BACKGROUND_EXPIRY_NONE = 0,
+    FETCH_BACKGROUND_EXPIRY_DEADLINE,
+    FETCH_BACKGROUND_EXPIRY_STALL
+} FetchBackgroundExpiry;
+
+/* Whether a running transfer ends now, by FetchWorkerTiming (fetch.h).
+   `default_stall_seconds` is the default timing's stall once a status line
+   has arrived. */
+static inline FetchBackgroundExpiry fetch_background_expiry(
+    FetchWorkerTiming timing, bool headers_received,
+    long stall_abort_seconds, long default_stall_seconds,
+    uint64_t now_us, uint64_t deadline_us, uint64_t last_progress_us)
+{
+    bool deadline_applies =
+        timing != FETCH_WORKER_TIMING_STREAM || !headers_received;
+    if (deadline_applies && now_us >= deadline_us)
+        return FETCH_BACKGROUND_EXPIRY_DEADLINE;
+    long stall_seconds = stall_abort_seconds;
+    if (timing == FETCH_WORKER_TIMING_DEFAULT && stall_seconds <= 0)
+        stall_seconds = headers_received ? default_stall_seconds : 0;
+    if (stall_seconds <= 0 || now_us < last_progress_us)
+        return FETCH_BACKGROUND_EXPIRY_NONE;
+    uint64_t window_us = (uint64_t) stall_seconds * UINT64_C(1000000);
+    return now_us - last_progress_us >= window_us
+        ? FETCH_BACKGROUND_EXPIRY_STALL : FETCH_BACKGROUND_EXPIRY_NONE;
+}
+
+/* A stream's bytes become visible to the browser when the slot holds its
+   publication target, or once no byte has arrived for this long, so a slow
+   stream (an EventSource, a document whose server flushes its head early)
+   is latency-bounded as well as size-bounded. */
+#define FETCH_BACKGROUND_STREAM_IDLE_PUBLISH_US UINT64_C(50000)
+
+static inline bool fetch_background_stream_idle_publish_due(
+    size_t unpublished_bytes, bool chunk_empty, bool transfer_done,
+    uint64_t now_us, uint64_t last_progress_us)
+{
+    return unpublished_bytes != 0 && chunk_empty && !transfer_done
+        && now_us >= last_progress_us
+        && now_us - last_progress_us
+               >= FETCH_BACKGROUND_STREAM_IDLE_PUBLISH_US;
 }
 
 static inline void fetch_background_end_consumer_pause(
@@ -143,13 +198,37 @@ fetch_background_cookie_capture_policy(
     return FETCH_BACKGROUND_COOKIE_CAPTURED;
 }
 
+/* Which descriptors a request may claim. Claims take the lowest free index
+   below the lane's limit, so the top descriptor is the blocking lane's
+   alone and the two below it are reserved for foreground media while media
+   priority is active:
+     ordinary: 0..4, or 0..2 under media priority;
+     media:    0..4;
+     blocking: 0..5.
+   A blocking request is one the browser thread waits for (a sync XHR, its
+   CORS preflight, a module import). A descriptor frees only when the
+   scheduler that owns its request is pumped, and a blocking wait pumps
+   only its own scheduler, so without the reserve a page's six image or
+   stylesheet hops would hold every descriptor until the blocking request
+   timed out. At most one blocking request runs at a time: the script that
+   made it is suspended until it returns. */
+#define FETCH_BACKGROUND_BLOCKING_RESERVED_SLOTS 1u
+
+typedef enum {
+    FETCH_BACKGROUND_LANE_ORDINARY = 0,
+    FETCH_BACKGROUND_LANE_MEDIA,
+    FETCH_BACKGROUND_LANE_BLOCKING
+} FetchBackgroundLane;
+
 static inline unsigned fetch_background_admission_slot_limit(
-    bool foreground_media, bool media_priority_active)
+    FetchBackgroundLane lane, bool media_priority_active)
 {
-    return media_priority_active && !foreground_media
-        ? FETCH_BACKGROUND_REQUEST_LIMIT
-              - FETCH_BACKGROUND_MEDIA_RESERVED_SLOTS
-        : FETCH_BACKGROUND_REQUEST_LIMIT;
+    if (lane == FETCH_BACKGROUND_LANE_BLOCKING)
+        return FETCH_BACKGROUND_REQUEST_LIMIT;
+    unsigned shared = FETCH_BACKGROUND_REQUEST_LIMIT
+        - FETCH_BACKGROUND_BLOCKING_RESERVED_SLOTS;
+    return media_priority_active && lane == FETCH_BACKGROUND_LANE_ORDINARY
+        ? shared - FETCH_BACKGROUND_MEDIA_RESERVED_SLOTS : shared;
 }
 
 /* A single-hop request deliberately exposes a 3xx response as its final

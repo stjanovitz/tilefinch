@@ -31,18 +31,31 @@ FAT on the PSP does not rename onto an existing file, so "write tmp, rename
 over" alone does not work once a file exists. Three disciplines are in use;
 each file below names the one it uses.
 
-- **tmp + remove + rename** — write `<file>.tmp`, close, `remove(<file>)`,
-  `rename`. On PSP the remove-then-rename branch is the common path, so there
-  is a window (one remove plus one rename) in which a power cut leaves neither
-  the old nor the new file in place; only the completed `.tmp` remains, and
-  loaders do not read it. Files using this discipline are recreated with
-  defaults after such a loss.
+- **tmp + remove + rename** — write `<file>.tmp`, close, try `rename`; when
+  that fails (on PSP, whenever `<file>` exists) move `<file>` to
+  `<file>.old`, rename the tmp into place and remove `<file>.old`. If that
+  second rename fails, `<file>.old` is moved back, so a failed write never
+  costs the previous generation. A power cut between the two renames leaves
+  `<file>.old` and the completed `.tmp`, neither of which loaders read (the
+  next replace removes the `.old`); files using this discipline are
+  recreated with defaults after such a loss.
 - **backup rotation** — write `<file>.tmp`, rotate `<file>` to `<file>.bak`
   (on FAT the rotation removes the older backup first and retries), rename the
   tmp into place, and roll the backup back if that rename fails. A power cut
   at any point leaves at least one complete generation, and the loader falls
   back to `.bak` when the primary is missing or unreadable — a failed checksum
   for the formats that carry one, a failed parse for `profile.cfg`.
+- **newer formats** — a header that says a later release wrote the file
+  (an older version started under **Previous versions**) is not damage. For
+  `library.bin`, `http-cache.bin`, `local-storage.bin` and always-kept site
+  logs the loader does not fall back past such a file, saves refuse to replace
+  or rotate it, and nothing it names is swept; the data is back when the later
+  release runs again. Until then the offline library shows `OFFLINE LIBRARY
+  UNAVAILABLE - UPDATE TILEFINCH`, the cache and local storage start empty and
+  are not saved at exit, and that site cannot use Memory Stick storage. An
+  always-kept log whose header names another origin (two origins whose names
+  hash alike) is kept the same way: it is never truncated, replaced or
+  removed for the colliding site, which cannot keep data on the Memory Stick.
 - **dual-copy journal** — two fixed-size records (`update-state.0`/`.1`) with
   a generation counter; every store writes the older copy via tmp + rename,
   syncs the file and then the device, and the loader selects the valid record
@@ -67,7 +80,9 @@ executable cache files, not user data. Creation/adoption compares all bytes
 with the selected slot's packaged module, then writes `startup-module.prx.receipt`
 (less than 1 KiB). Subsequent boots trust matching slot/path and file metadata
 without rescanning either executable. This intentionally does not detect
-same-metadata corruption; pre-held L recovery bypasses the cache. Cache hits
+same-metadata corruption; pre-held L and the recovery screen bypass the cache
+and remove it (and a fresh install's bundled module), so a damaged copy cannot
+wedge the next ordinary boot, which prepares it again. Cache hits
 write nothing, and failed preparation uses the ordinary package.
 All three files may be deleted safely; none is restored as an update authority.
 An explicitly requested app download reclaims them before checking free space;
@@ -75,7 +90,7 @@ background version checks leave them alone.
 
 | Path | Writer | Size bound | Evicted by | Discipline |
 |---|---|---|---|---|
-| `profile.cfg` (+`.bak`) | `browser_profile.c` | ~0.5 MB per generation (100 history + 32 bookmarks + 16 resume points, every field length-capped); typically a few KB | replaced on every save | backup rotation; the loader falls back to `.bak` when the primary is missing or unparsable |
+| `profile.cfg` (+`.bak`) | `browser_profile.c` | ~0.5 MB per generation (100 history + 32 bookmarks + 16 resume points, every field length-capped); typically a few KB | replaced on every save | backup rotation; the loader falls back to `.bak` when the primary is missing, unreadable or unparsable, and then removes an unparsable primary; one that only failed to open or read is kept and the next save rotates it into `.bak` |
 | `recovery.cfg` | `browser_profile.c` | one checksummed line (≤ ~3.2 KB) | cleared on clean navigation state; ignored if checksum fails | tmp + remove + rename |
 | `tabs-session.bin` (+`.bak`) | `browser_tabs.c` | ≤ ~82 KB per generation (5 tabs × 16 KB payload + headers) | rewritten at exit; removed when "restore last page" is off | backup rotation; restore falls back to `.bak` |
 | `tab-hibernation.bin` | `browser_tabs.c` | ≤ 16 KB + 16 B header | removed on rehydrate, on disabling hibernation, and at clean exit | tmp + remove + rename |
@@ -87,7 +102,7 @@ background version checks leave them alone.
 | `site-storage/p-<hash>` | `session_site_storage.c` | per site, ≤ 4 MB live data; the log is compacted before it passes twice the dead-record threshold plus live data | **Settings → Device & storage → Site data & storage** deletes one; so does the site's **Clear data for this site** | append-only checksummed log; compaction writes `.tmp`, then remove + rename, and a load recovers a lone `.tmp` |
 | `site-storage/s-NN`, `session-files` | `session_site_storage.c` | as above | deleted at exit; after a crash, at the next boot (only when the `session-files` marker exists) | as above |
 | `script-cache/<build>-<hash>.tfsc`, `script-cache/index.tfsi` | `session_script_disk.c` | 8 MB of packs in all (each at most 2 MiB, at most 256), plus an index of at most 9 KB; one `.tmp` pack while a write is in flight | **Keep compiled scripts** off (removes them all), **Clear compiled scripts**, **Clear HTTP caches**, a site's **Clear data for this site** (its packs), least recently used first when full, and the sweep (another build's packs, stray `.tmp`, packs the index does not name) | each pack: written to `.tmp` in idle slices, then remove + rename; index: tmp + remove + rename, and a loader that finds only a complete `index.tfsi.tmp` uses it; a pack or index that fails its CRC-32 is a miss and is removed |
-| `boot-overrides.cfg` | `psp_boot_config.c` | 4 bounded lines | user-managed | tmp + remove + rename |
+| `boot-overrides.cfg` | `psp_boot_config.c` | ≤ 16 KiB for an in-app save to edit it | user-managed; an in-app save changes only the keys it sets | `.tmp`, then replaces the file, the previous generation kept as `.bak` (read at boot when the file is missing, unreadable or rejected); an in-app save that cannot read a file that is there writes nothing and shows "... NOT SAVED" |
 | `tilefinch-last-error.txt` | `psp_script_main.c` | one bounded device-error snapshot (URL ≤ 2047 bytes, detail ≤ 1023 bytes) | disabling **Save error reports** removes it; a newer saved failure replaces it | tmp + remove + rename; ordinary failures write only when opted in, while a fatal startup failure writes once regardless because the diagnostic UI may never become available |
 | `themes/*.tfth` | user-provided (two examples ship with first installs) | ≤ 64 directory entries visited and ≤ 12 valid files retained per chooser scan; each file ≤ 2 KiB, ≤ 24 lines of 95 bytes | user-managed | read-only; the directory is scanned only in the chooser and only the selected file is read at boot |
 | `theme.tfth` | legacy user-provided theme | ≤ 2 KiB, ≤ 24 lines of 95 bytes | user-managed | read-only compatibility path for an older Custom selection |
@@ -253,8 +268,16 @@ site's `sessionStorage` and the OPFS of sites not kept always.
 The Memory Stick files are append-only logs. Each record header carries a
 checksum over the header and key, so the index loads without reading
 values; each value carries its own checksum, checked when read. A torn or
-damaged record ends the load, and the next append overwrites it. Dead
+damaged record ends the load, and the next append overwrites it; a read
+error fails the load and leaves the file as it is. Dead
 records are compacted away at load and before the log grows too large. A
+clear (a page's `localStorage.clear()` or `sessionStorage.clear()`, or
+**Clear local storage**) rewrites the site's log without the cleared values,
+or deletes it when nothing is left, so cleared values do not stay readable on
+the card; **Clear local storage** reports failure when it cannot. A single
+`removeItem` only logs the removal: its old value stays in the log until the
+next compaction. sessionStorage records found in an always-kept log at load
+(written in an earlier session) are compacted away at once. A
 captive-portal session gets an empty RAM-only store of its own, and the
 **Save RAM storage at exit** snapshot never includes a site on the Memory
 Stick. That snapshot is off by default, so without a per-site choice nothing
@@ -301,8 +324,14 @@ storage must finish before the first real navigation proceeds; an unfinished
 cache restore is cancelled when navigation starts, because the cache is an
 optimization and must not overwrite responses produced by the new page. If
 navigation cancels a cache snapshot before it was read, exit keeps that
-on-disk generation instead of rotating an empty live cache over it. Booting directly to a page retains synchronous restoration so author script
-observes the persisted local-storage state from its first instruction. Profile
+on-disk generation instead of rotating an empty live cache over it. Likewise,
+when `local-storage.bin` could not be read (an I/O error, a memory or limit
+refusal, or a load that could not start or finish), exit leaves that file and
+its `.bak` untouched, so localStorage written in that session is not kept and
+the next boot reads the snapshot again; clearing local storage in that session
+retires the snapshot as usual. Booting directly to a page retains synchronous restoration so author script
+observes the persisted local-storage state from its first instruction; a
+snapshot that restore could not read is kept at exit the same way. Profile
 settings and bookmarks live in `profile.cfg` and remain part of the pre-HOME
 load because the native UI needs them.
 
@@ -335,18 +364,33 @@ complete simply leaves the prior generation and the next connection pays a
 full handshake. It holds no browsing content, only the opaque TLS resumption
 tickets, which are cleared with the caches.
 
-`psp_boot_config_write_overrides()` both creates and replaces
-`boot-overrides.cfg`. The compatibility import calls it only when the overrides
-file is absent; the function is also safe as a general rewrite primitive.
-Being tmp + remove + rename, it carries the same brief window as the other
-files in that row: a power cut there loses the overrides, which are then
-recreated with defaults.
+`psp_boot_config_write_overrides()` both creates and edits
+`boot-overrides.cfg` (or `boot.cfg` on an install without slots). A settings
+save (Wi-Fi profile, developer URL) names the keys it sets: their last lines
+are replaced, a missing key is appended, and every other line, comments and
+hand-set keys such as `file_kb=` or `module_cache_dir=` included, is kept as
+it was. The edit starts from the file the loader would read (the file, else
+its `.bak`, else an empty file). A file that is not there, or that is read but
+rejected by the loader (a line over 1,600 bytes, an invalid value), was not
+in effect, so the save moves on to the `.bak` and then to a fresh file. A file
+that is there but cannot be read (any open failure other than "not found",
+which on the PSP is firmware error `0x80010002`, or a read error) may be the
+one in effect: the save writes nothing and the setting shows "... NOT SAVED".
+So does a file too large to edit. The compatibility import calls it only when
+the overrides file did not load at boot; when that file is present but
+unreadable, the import leaves it alone and the imported values stay active
+for that session only (`tilefinch-config: legacy-overrides=active-not-saved`
+in a validation log). The new
+file is written to `.tmp` and replaces the old one, which becomes `.bak`, so a
+complete generation exists at every instant and a power cut costs at most the
+change being saved.
 
 ### `data/update/` and the slots — signed updates
 
 | Path | Writer | Size bound | Evicted by | Discipline |
 |---|---|---|---|---|
 | `data/update-state.0` / `.1` (+`.tmp`) | `update_journal.c` | 174 B each | never (rollback state) | dual-copy journal, file + device sync |
+| `data/update-declined` (+`.tmp`) | `update_journal.c` (launcher recovery screen) | 174 B | removed when the Update page retries or discards the trial; a leftover copy matches no later journal record and is ignored | tmp + remove + rename, no device sync (a lost copy only shows the recovery screen once more); see [Secure updates](SECURE_UPDATES.md) |
 | `data/update/package.part` | `update_client.c` | ≤ 32 MB (manifest-capped) | removed on cancel, on failed verification, and by the install job when it reaches COMPLETE; swept at update-session startup whenever the journal shows no trial in flight; truncated by the next download | single file, verified by size + SHA-256 before use |
 | `slot-a/`, `slot-b/` | `update_installer.c` | ≈ package size each (packages store files uncompressed; offsets must sum to the package size) | the non-active slot is replaced by the next update | staged as `slot-X.tmp` (per-file SHA-256 + sync, then `slot.tfum`, `slot.tfut`, `READY` markers, device sync), promoted by directory rename with `.old` fallback |
 | `slot-X.tmp/`, `slot-X.old/` | `update_installer.c` | ≈ package size, transient | removed by the next install attempt (bounded sweep: ≤ 256 entries, depth ≤ 8) | n/a |
@@ -407,11 +451,18 @@ records script-range hints; if a page needs another installed language pack,
 the app verifies and attaches at most one candidate per frame, with no more
 than two lazy additions and four attached packs total (selected language,
 emoji, and the additions). Page rendering queues cache misses and the app pump
-reads at most one 16 KiB block per call. This runtime path never writes.
-Install/update uses the shared
-`data/update/glyph-component.part`, removes it after completion/cancel/failure,
-and preflights the signed download and candidate space through the PSP-safe
-free-space helper.
+reads at most one 16 KiB block per call. A block whose read fails leaves
+the queue, so the other blocks are still served; after four failed reads in
+a row the pack serves no more glyphs that session and its text falls back as
+if it were not installed. This runtime path never writes.
+Install/update downloads to `candidate.tmp/glyph-component.part` in the pack's
+own directory, creating the directory and emptying `candidate.tmp` only when
+the download begins (selecting a pack, as the offer's size question does,
+writes nothing), and renames it to `pack.tfgf`
+in place, because a staged file never has to move between directories. It
+preflights the signed download and candidate space through the PSP-safe
+free-space helper. A failed download removes the part; a failed staging leaves
+it for a retry until the next attempt or removal empties the directory.
 
 The in-page language-pack offer ([TEXT_BIDI.md](TEXT_BIDI.md#in-page-install-offer))
 adds no storage path. Deciding whether to show it reads nothing for ordinary
@@ -441,6 +492,7 @@ and never persisted.
 | `<id>.video.mp4`, `<id>.audio.mp4` | `offline_download.c` | ≤ 512 MB per stream | user delete | `.part` renamed into place after exact-length ranged download |
 | `<id>.video.part`, `<id>.audio.part` | `offline_download.c` | ≤ stream size | resumed, or reclaimed by the orphan sweep | append-only; size re-validated against the index on load |
 | `<id>-<safe filename>` | `file_download.c` | ≤ 512 MiB each | explicit Delete | published only after a completed, flushed HTTPS stream |
+| `<id>.file.gone` | `offline_library.c` | one filename | removed when Delete finishes, or by the next load's sweep | written and flushed before the index drops the item |
 | `<id>.file.part`, `<id>.file.meta` (+`.tmp`) | `file_download.c` | ≤ 512 MiB body + bounded URL/validator | explicit Delete; orphan metadata/partials swept | matching If-Range and Content-Range required for append; no cookies/passwords |
 | `PSP/GAME/.tilefinch-unpack-<id>/` | `zip_install.c` | ≤ 256 MiB, 512 entries | cancelled/failed attempt cleanup; manual USB cleanup after power loss | created exclusively after native Install confirmation; complete CRC-checked tree renamed once |
 | `PSP/GAME/<app>/` | `zip_install.c` | ≤ 256 MiB installed data, 64 managed installations | confirmed Installed homebrew removal or manual USB cleanup | no overwrite, automatic execution, firmware changes or plugin activation; source ZIP retained |
@@ -455,6 +507,18 @@ web-app install needs its measured package plus 256 KiB. Each
 deletes recognized library-named files whose id is not in the index, so parts
 and articles stranded by a power cut between file publication and index
 promotion are reclaimed lazily. Files it does not recognize are never touched.
+A load that has to correct the index (an interrupted download reset to
+paused, a missing file marked failed, a recovery from `.tmp` or `.bak`) uses
+the corrected index even when it cannot be written, as on a full or
+write-protected card, so saved items still open and can be deleted to free
+space; the next `offline_library_load()` or change writes it. After a
+recovery from `.tmp` or `.bak` that could not be written, that load skips
+the sweep.
+A downloaded file is published under its own name (`<id>-<filename>`),
+which the sweep cannot tell from a file it does not own, so Delete first
+writes the name to `<id>.file.gone` and removes that note once the file is
+gone; the sweep finishes a note left by a power cut (a note without its
+closing newline is torn and only removed). Older versions ignore the note.
 
 ### `data/screenshots/` — captures
 
@@ -506,7 +570,7 @@ degrading when a pre-flight fails.
 | Activity | Minimum free space | Enforced by |
 |---|---|---|
 | Browsing, site data off | ~2 MB (settings, recovery, tab session, all generations) | not enforced; writers fail individually and keep the prior generation |
-| Browsing with disk cache and local storage on | + up to 15 MB per enabled store (3 × 5 MB generations during a save; disk-cache payload further capped at 4 MB) | pre-flight in the exit cleanup (`psp_script_main.c`): one whole new generation per enabled store — the configured cache size (1/2/4 MB) plus 5 MB for local storage — else the save is refused with "MEMORY STICK FULL - SITE DATA NOT SAVED" and the prior generation is kept |
+| Browsing with disk cache and local storage on | + up to 15 MB per enabled store (3 × 5 MB generations during a save; disk-cache payload further capped at 4 MB) | pre-flight in the exit cleanup (`psp_script_main.c`): one new generation per enabled store, sized from what that store would write now (`browser_session_persistence_planned_bytes`) plus 64 KiB for cluster rounding (the configured cache size, or 5 MB for local storage, when a store cannot be sized) — else the save is refused with "MEMORY STICK FULL - SITE DATA NOT SAVED" and the prior generation is kept |
 | Keeping a site's storage on the Memory Stick | up to 4 MB per site, plus a transient second copy while its log is compacted | not pre-flighted; the prompt shows the free space, and a failed append fails that write |
 | Keep compiled scripts | up to 8 MB, plus one pack (at most 2 MiB) in flight | not pre-flighted; a write the card refuses is dropped and that group stays in RAM for the session |
 | Saving an offline article | 1.25 MB (1 MB article + 256 KB reserve) | pre-flight in `offline_library_save_article` |
@@ -526,9 +590,13 @@ degrading when a pre-flight fails.
   was in flight), tab session (falls back to `.bak`), in-flight video `.part`
   progress (re-measured on next load).
 - **The last few writes**: an always-kept site's Memory Stick storage.
-  Appends are buffered rather than flushed one by one, so a cut can lose
-  the newest records; a torn record is dropped at the next load and every
-  record before it survives.
+  Each record is flushed out of the C library's buffer before the write is
+  reported done, so a full card or a write error fails that write and
+  nothing after it; the card's own write caching is not synced, so a cut can
+  still lose the newest records. A torn record is dropped at the next load
+  and every record before it survives. A read error while loading fails the
+  load (the site's storage is unavailable until a later load succeeds)
+  instead of ending the log there.
 - **A cache, rebuilt as you browse**: `script-cache/`. A cut during a pack
   write leaves a `.tmp` the next sweep removes; a cut in the index's
   remove-rename window leaves its complete `.tmp`, which the next start

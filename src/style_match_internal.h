@@ -613,7 +613,8 @@ static inline size_t style_selector_rightmost_compound_start(
 
 /* style_match.c */
 bool style_tag_is(lxb_dom_node_t *node, const char *wanted);
-bool option_is_displayed_by_default(lxb_dom_node_t *option);
+bool option_is_displayed_by_default(const Stylesheet *sheet,
+                                    lxb_dom_node_t *option);
 bool class_contains_length(const char *classes, size_t length,
                            const char *wanted, size_t wanted_length);
 
@@ -640,6 +641,10 @@ void stylesheet_drop_custom_rule_index(Stylesheet *sheet);
 
 /* style_selector_program.c */
 void stylesheet_drop_selector_program(Stylesheet *sheet);
+/* Frees the compiled-fragment seeds not yet consumed by a program build.
+   They are keyed by (cascade order, importance) at seeding time, so any
+   renumbering of rule orders must drop them. */
+void stylesheet_drop_selector_fragment_seeds(Stylesheet *sheet);
 void stylesheet_prepare_selector_program(Stylesheet *sheet);
 
 /* Rule matching shared by the cascade (style_resolve.c), the retained

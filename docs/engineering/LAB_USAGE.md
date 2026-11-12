@@ -482,6 +482,17 @@ revisit's restores are measured. Classic bytecode is stored by page-idle
 work, which the `tick` command does not run: `idle N` runs up to N idle
 turns (stopping at the first that leaves no work) without moving the clock,
 as the PSP loop does while a page is quiet.
+A page with a script runtime (any classic script, with or without
+`--fetch-scripts`) does not load its parser `<img>` elements during the
+commit. They wait in the post-commit image queue, which the PSP loop runs in
+its page-idle and deferred-image slots and the lab runs in `pump` and
+`drain`. `tick` does not run it. `idle N` runs it but does not wait for the
+network, so its images may not have arrived when it returns. A `tick`-only
+run of such a page therefore ends with
+`images=0/0`. The `image-queue` report line gives the targets still queued,
+the queue's batches so far, and whether the queue is still running
+(`pending=no` with targets still queued means they are `loading=lazy` images
+waiting for the viewport). Measure image loading with `pump` or `drain`.
 `--script-cache-dir DIR` (or the older `--module-cache-dir`) adds the
 persistent compiled-script tier, classic scripts and modules: a script
 missing from the RAM tables is restored from the pack in `DIR` that its

@@ -83,10 +83,12 @@ stick COUNT DIRECTION [BUTTONS]
 tap-after-live MILLISECONDS BUTTONS
 mark NAME
 focus-page-media
+answer-question COUNT BUTTONS
 end
 ```
 
-Append `-live` to `wait`, `until`, `tap`, `hold`, `press`, `stick`, or `mark` when
+Append `-live` to `wait`, `until`, `tap`, `hold`, `press`, `stick`, `mark`, or
+`answer-question` when
 that step must continue while the application reports asynchronous work. For
 example, `wait-live 30` advances for 30 sampled frames during a navigation
 or sustained media session. Without the suffix, a step pauses until the
@@ -109,7 +111,7 @@ exercise real form submission rather than injecting a URL.
 Counts are frame-counted, not time-counted; avoid using
 them to qualify shortcuts whose meaning is intentionally millisecond-based.
 
-`until COUNT` and `focus-page-media` are described below.
+`until COUNT`, `focus-page-media` and `answer-question` are described below.
 
 ### Timed presses
 
@@ -202,6 +204,19 @@ accepts the `-page` and `-live` suffixes. Cross then plays through the normal
 user path. Like the rest of the harness it is compiled out of shipping builds
 (`src/psp_input_page_media.c` is a validation-only source).
 
+### Answering the player's question
+
+`answer-question COUNT BUTTONS` waits up to COUNT frames (at least 2) on the
+visible player. If the player asks a question (today only the
+unencrypted-audio "Play anyway"), it presses BUTTONS once as an ordinary tap,
+logs `tilefinch-input-script: step=N action=answer-question
+outcome=answered`, and queues a live capture named `question`. If the media
+is already playing, it ends without a press (`outcome=not-asked`), and if
+neither happens within COUNT frames it ends unpressed (`outcome=timed-out`).
+A station that answers its HTTPS upgrade therefore plays through the same
+script as one that needs the question. Open media is a sustained session, so
+use `answer-question-live` and `-live` for the steps after it.
+
 ### Readiness probes
 
 `until COUNT` idles like `wait COUNT` but ends early once the page is ready:
@@ -246,7 +261,7 @@ automatically the first-answer frame.
 For small-text or emoji inspection, the validation build also honors
 `dump_frame=1` after the interactive scenario finishes. It writes
 `frame-device-final.ppm` from the current 480×272 RGB565 front buffer before
-teardown, preserving full spatial resolution rather than the mark queue's
+teardown (the PPSSPP runner copies it into `run-N/` beside the mark images), preserving full spatial resolution rather than the mark queue's
 240×136 RGB332 samples. This opt-in write happens after the measured sequence;
 use a host0 launch to keep it off the Memory Stick. It does not capture the
 separate RGB8888 video surface and reports `final-frame-dumped=0` when that

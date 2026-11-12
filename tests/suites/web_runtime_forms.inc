@@ -918,7 +918,7 @@
         "<!doctype html><title>Order</title><link rel=stylesheet href=/theme.css integrity='sha256-JYeLaMI2g2JUyAMRFmomzPdWGigJn1ucaCO79KhxyU8='><body><p id=probe>ORDER</p>"
         "<script>globalThis.order=['blocking-1'];globalThis.computedOk=getComputedStyle(document.getElementById('probe')).display==='grid';</script>"
         "<script type=module>globalThis.order.push('module');</script>"
-        "<script>order.push('blocking-2');const dynamic=document.createElement('script');dynamic.textContent=\"order.push('dynamic')\";document.head.appendChild(dynamic);const dynamicExternal=document.createElement('script');dynamicExternal.id='integrity-probe';dynamicExternal.src='/dynamic.js';dynamicExternal.integrity='sha256-COznQ5ZviU9B5EACPJMioIittuLAymlK0EjIp6rJV1g=';dynamicExternal.addEventListener('load',()=>{order.push('dynamic-load');globalThis.pocSummary=order.join(',')+':'+computedOk});document.head.appendChild(dynamicExternal);const dynamicStyle=document.createElement('style');dynamicStyle.textContent='#probe{color:#123456}';document.head.appendChild(dynamicStyle);const dynamicLink=document.createElement('link');dynamicLink.rel='stylesheet';dynamicLink.href='/dynamic.css';dynamicLink.integrity='sha256-W127z64XoV2/VrojvPV5g6AvZ+0tpirAWF2hhaS65ac=';dynamicLink.addEventListener('load',()=>{order.push('dynamic-style-load');globalThis.pocSummary=order.join(',')+':'+computedOk});document.head.appendChild(dynamicLink);const delayedFrame=document.createElement('iframe');setTimeout(()=>document.body.appendChild(delayedFrame),0);document.addEventListener('DOMContentLoaded',()=>globalThis.pocSummary=order.join(',')+':'+computedOk);</script>"
+        "<script>order.push('blocking-2');const dynamic=document.createElement('script');dynamic.textContent=\"order.push('dynamic')\";document.head.appendChild(dynamic);const dynamicExternal=document.createElement('script');dynamicExternal.id='integrity-probe';dynamicExternal.src='/dynamic.js';dynamicExternal.integrity='sha256-je76BYeNXYod08OvLmLDwnDbjXxJIeo2AGjkf/ksgfA=';dynamicExternal.addEventListener('load',()=>{order.push('dynamic-load');globalThis.pocSummary=order.join(',')+':'+computedOk});document.head.appendChild(dynamicExternal);const dynamicStyle=document.createElement('style');dynamicStyle.textContent='#probe{color:#123456}';document.head.appendChild(dynamicStyle);const dynamicLink=document.createElement('link');dynamicLink.rel='stylesheet';dynamicLink.href='/dynamic.css';dynamicLink.integrity='sha256-W127z64XoV2/VrojvPV5g6AvZ+0tpirAWF2hhaS65ac=';dynamicLink.addEventListener('load',()=>{order.push('dynamic-style-load');globalThis.pocSummary=order.join(',')+':'+computedOk});document.head.appendChild(dynamicLink);const delayedFrame=document.createElement('iframe');setTimeout(()=>document.body.appendChild(delayedFrame),0);document.addEventListener('DOMContentLoaded',()=>globalThis.pocSummary=order.join(',')+':'+computedOk);</script>"
         "</body>";
     static const unsigned char ordered_css[] = "#probe{display:grid}";
     static const unsigned char ordered_dynamic_css[] =
@@ -2154,6 +2154,13 @@
     browser_session_destroy(&scale_frame_session);
     CHECK(budget.current == 0);
 
+    puts("test: inline script refused before an impossible compile");
+    CHECK(test_inline_script_refused_before_compile(&budget));
+
+    puts("test: external, module and dynamic scripts refused before an "
+         "impossible compile");
+    CHECK(test_external_scripts_refused_before_compile(&budget));
+
     puts("test: script pressure admission skips before allocator failure");
     static const char pressure_script_page[] =
         "<!doctype html><title>Pressure</title><body><p>READY</p>"
@@ -3086,7 +3093,7 @@
         "const abortController=new AbortController,abortSignal=abortController.signal;let abortSeen=false;abortSignal.addEventListener('abort',()=>abortSeen=true,{once:true});abortController.abort();const recursiveSignal=new AbortController().signal,recursiveCalls=[],onceAbort=()=>{recursiveCalls.push('once');recursiveSignal.dispatchEvent(new Event('abort'))};recursiveSignal.addEventListener('abort',onceAbort,{once:true});recursiveSignal.addEventListener('abort',{handleEvent(){recursiveCalls.push('object')}});recursiveSignal.dispatchEvent(new Event('abort'));const removalSignal=new AbortController().signal,removalCalls=[],removedAbort=()=>removalCalls.push('removed');removalSignal.addEventListener('abort',()=>{removalCalls.push('first');removalSignal.removeEventListener('abort',removedAbort)});removalSignal.addEventListener('abort',removedAbort);removalSignal.dispatchEvent(new Event('abort'));const falsySignal=AbortSignal.any([AbortSignal.abort(0)]),privateController=new AbortController,privateSignal=privateController.signal,fakeSignalTarget=new EventTarget;let falsyThrown='none',badTimeout='',signalConstructor='',borrowedSignal='',borrowedController='',fakeSignalError='',fakeSignalTouched=0;try{falsySignal.throwIfAborted()}catch(error){falsyThrown=error}try{AbortSignal.timeout(-1)}catch(error){badTimeout=error.name}try{new AbortSignal}catch(error){signalConstructor=error.name}try{AbortSignal.prototype.throwIfAborted.call({})}catch(error){borrowedSignal=error.name}try{AbortController.prototype.abort.call({})}catch(error){borrowedController=error.name}try{fakeSignalTarget.addEventListener('fake',()=>{},{signal:{get aborted(){fakeSignalTouched++;return false},addEventListener(){}}})}catch(error){fakeSignalError=error.name}privateController.signal='forged';privateSignal.aborted=true;privateSignal.reason='forged';const abortOk=abortSignal instanceof EventTarget&&abortSignal.aborted&&abortSeen&&abortSignal.reason instanceof DOMException&&abortSignal.reason.name==='AbortError'&&recursiveCalls.join(',')==='once,object,object'&&removalCalls.join(',')==='first'&&falsySignal.aborted&&falsySignal.reason===0&&falsyThrown===0&&badTimeout==='RangeError'&&signalConstructor==='TypeError'&&borrowedSignal==='TypeError'&&borrowedController==='TypeError'&&fakeSignalError==='TypeError'&&fakeSignalTouched===0&&privateController.signal===privateSignal&&!privateSignal.aborted&&privateSignal.reason===undefined&&!Object.prototype.hasOwnProperty.call(privateController,'signal')&&!Object.prototype.hasOwnProperty.call(privateSignal,'aborted');"
         "const headerProbe=new Headers(new Map([['z-last','1'],['a-first','2'],['z-last','3']])),headerOrder=[...headerProbe.keys()].join(','),headerValues=[...headerProbe.values()].join(','),generatedHeaders=new Headers((function*(){yield ['x-one','1'];yield ['x-two','2']})()),tabHeaders=new Headers({'x-tab':'\\talpha\\t beta\\t'});let illegalHeader='',badHeaderPair='';try{Headers.prototype.get.call({},{toString(){return 'a-first'}})}catch(error){illegalHeader=error.name}try{new Headers((function*(){yield ['one']})())}catch(error){badHeaderPair=error.name}const headersOk=!Object.prototype.hasOwnProperty.call(headerProbe,'map')&&headerOrder==='a-first,z-last'&&headerValues==='2,3'&&[...headerProbe][0][0]==='a-first'&&headerProbe.get('Z-LAST')==='3'&&generatedHeaders.get('x-one')==='1'&&generatedHeaders.get('x-two')==='2'&&tabHeaders.get('x-tab')==='alpha\\t beta'&&illegalHeader==='TypeError'&&badHeaderPair==='TypeError';"
         "const template=document.createElement('template');template.innerHTML='<template for=target><b>update</b></template><template data-assistant-presentation-flush></template>';const templateClone=template.cloneNode(true),clonedTarget=templateClone.content.querySelector('template[for=target]'),flushTemplate=template.content.querySelector('template[data-assistant-presentation-flush]'),fragmentProbe=document.createDocumentFragment(),fragmentText=document.createTextNode('fragment');fragmentProbe.appendChild(fragmentText);const fragmentHost=document.createElement('div');fragmentHost.appendChild(fragmentProbe);const equalProbe=document.createElement('p');equalProbe.textContent='equal';const templateOk=template.children.length===0&&template.content.querySelector('template[for=target]')!==null&&template.content.querySelectorAll('template[for],template[data-assistant-presentation-flush]').length===2&&flushTemplate.matches('template[data-assistant-presentation-flush]')&&clonedTarget.content.querySelector('b').textContent==='update'&&equalProbe.isEqualNode(equalProbe.cloneNode(true))&&fragmentProbe.childNodes.length===0&&fragmentHost.textContent==='fragment';"
-        "let detachedCanvasScans=0;const savedQuerySelectorAll=Element.prototype.querySelectorAll;Element.prototype.querySelectorAll=function(...args){detachedCanvasScans++;return savedQuerySelectorAll.apply(this,args);};const parsedDocument=new DOMParser().parseFromString('<p id=parsed>One &amp; <b>two</b></p>','text/html'),xmlDocument=new DOMParser().parseFromString('<x/>','application/xml');Element.prototype.querySelectorAll=savedQuerySelectorAll;const parsedElement=parsedDocument.getElementById('parsed'),domParserBits=[detachedCanvasScans===0,parsedDocument instanceof Document,parsedDocument.nodeType===Node.DOCUMENT_NODE,parsedDocument.defaultView===null,parsedDocument.contentType==='text/html',parsedDocument.documentElement.textContent==='One & two',parsedElement?.querySelector('b').textContent==='two',xmlDocument instanceof Document&&xmlDocument.documentElement?.localName==='x'],domParserOk=domParserBits.every(Boolean);"
+        "let detachedCanvasScans=0;const savedQuerySelectorAll=Element.prototype.querySelectorAll;Element.prototype.querySelectorAll=function(...args){detachedCanvasScans++;return savedQuerySelectorAll.apply(this,args);};const parsedDocument=new DOMParser().parseFromString('<p id=parsed>One &amp; <b>two</b></p>','text/html'),xmlDocument=new DOMParser().parseFromString('<x/>','application/xml');Element.prototype.querySelectorAll=savedQuerySelectorAll;const parsedElement=parsedDocument.getElementById('parsed'),domParserBits=[detachedCanvasScans===0,parsedDocument instanceof Document,parsedDocument.nodeType===Node.DOCUMENT_NODE,parsedDocument.defaultView===null,parsedDocument.contentType==='text/html',parsedDocument.documentElement.textContent==='One & two',parsedElement?.querySelector('b').textContent==='two',xmlDocument instanceof Document&&xmlDocument.documentElement?.localName==='parsererror'],domParserOk=domParserBits.every(Boolean);"
         "const workDocument=document.implementation.createHTMLDocument('');workDocument.documentElement.innerHTML='<style id=\"adopted-style\">#adopted-probe{color:rgb(1,2,3)}</style>';const adoptedStyle=workDocument.getElementById('adopted-style');document.head.appendChild(adoptedStyle);const createdDocumentOk=adoptedStyle instanceof HTMLStyleElement&&adoptedStyle.ownerDocument===document&&adoptedStyle.parentElement===document.head&&adoptedStyle.textContent.includes('#adopted-probe');"
         "const moveA=document.createElement('div'),moveB=document.createElement('div'),moveOne=document.createElement('i'),moveTwo=document.createElement('i'),moveThree=document.createElement('i');moveOne.id='move-one';moveTwo.id='move-two';moveThree.id='move-three';moveA.appendChild(moveOne);moveA.appendChild(moveTwo);moveB.appendChild(moveOne);const crossAppendOk=moveA.firstChild===moveTwo&&moveB.firstChild===moveOne;moveA.insertBefore(moveTwo,moveTwo);moveA.appendChild(moveThree);moveA.appendChild(moveTwo);const reorderOk=moveA.firstChild===moveThree&&moveA.lastChild===moveTwo;const orphanReference=document.createElement('i');let invalidInsertThrew=false;try{moveA.insertBefore(moveOne,orphanReference);}catch(_){invalidInsertThrew=true;}const invalidInsertPreserved=moveOne.parentElement===moveB&&moveA.firstChild===moveThree;moveA.insertBefore(moveOne,moveTwo);const crossInsertOk=moveB.childNodes.length===0&&moveA.childNodes.length===3&&moveA.childNodes[0]===moveThree&&moveA.childNodes[1]===moveOne&&moveA.childNodes[2]===moveTwo;const preinsertOk=crossAppendOk&&reorderOk&&invalidInsertThrew&&invalidInsertPreserved&&crossInsertOk;"
         "const platformOk=streamOk&&streamStateOk&&storageOk&&localStorage.length===1&&capabilitiesOk&&mutationShapeOk&&xhrShapeOk&&cssomNameOk&&encodingOk&&base64Ok&&abortOk&&headersOk&&templateOk&&domParserOk&&createdDocumentOk&&preinsertOk&&positionOk&&nodeListOk&&randomBytes.some(value=>value!==0)&&crypto.randomUUID().length===36&&svg.namespaceURI.includes('svg')&&perfOk&&blobOk&&blobURLUUID&&interfaceOk&&top===window&&parent===window;"
@@ -3159,9 +3166,10 @@
           && mutation_scripts.dom_mutations >= 4
           && mutation_scripts.events_dispatched >= 2
           && mutation_scripts.performance_now_calls >= 1
-          /* Canvas, Worker, DOM traversal and shadow ownership are each
-             admitted on first use by this interface probe. */
-          && mutation_scripts.bootstrap_lazy_module_loads == 4
+          /* Canvas, Worker, DOM traversal, shadow ownership, secondary
+             documents (DOMParser) and form collections (form.elements) are
+             each admitted on first use by this interface probe. */
+          && mutation_scripts.bootstrap_lazy_module_loads == 6
           && mutation_scripts.bootstrap_lazy_module_failures == 0
           && mutated.body_text == NULL
           && strcmp(mutation_scripts.summary,
@@ -4536,6 +4544,55 @@
     CHECK(strcmp(worker_crypto_result.summary, "WORKER-CRYPTO-OK") == 0);
     script_runtime_destroy(worker_crypto_runtime);
     document_destroy(&worker_crypto_document);
+    CHECK(budget.current == 0);
+
+    puts("test: SubtleCrypto digest supports SHA-1, SHA-384 and SHA-512");
+    PocDocument digest_document;
+    CHECK(document_parse(
+        &digest_document, &budget, worker_lifecycle_page,
+        strlen(worker_lifecycle_page), 8));
+    ScriptResult digest_result = {0};
+    ScriptRuntime *digest_runtime = script_runtime_create_deferred(
+        &digest_document, &budget, 4 * MIB, 1000,
+        "https://digest.test/", NULL, &digest_result);
+    /* FIPS 180 "abc" vectors, the empty SHA-1 vector, case-insensitive and
+       object-form names, and an unsupported algorithm. */
+    CHECK(digest_runtime != NULL
+          && script_runtime_evaluate_diagnostic(
+              digest_runtime,
+              "(()=>{pocSummary='pending';const abc=new TextEncoder()"
+              ".encode('abc'),hex=b=>Array.from(new Uint8Array(b),"
+              "v=>v.toString(16).padStart(2,'0')).join('');"
+              "const md5=crypto.subtle.digest('MD5',abc).then(()=>'resolved',"
+              "e=>e.name);Promise.all([crypto.subtle.digest('SHA-1',abc),"
+              "crypto.subtle.digest('sha-1',new Uint8Array()),"
+              "crypto.subtle.digest('SHA-256',abc),"
+              "crypto.subtle.digest({name:'SHA-384'},abc),"
+              "crypto.subtle.digest('Sha-512',abc.buffer),md5])"
+              ".then(r=>{const want=["
+              "'a9993e364706816aba3e25717850c26c9cd0d89d',"
+              "'da39a3ee5e6b4b0d3255bfef95601890afd80709',"
+              "'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad',"
+              "'cb00753f45a35e8bb5a03d699ac65007272c32ab0eded163'+"
+              "'1a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7',"
+              "'ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a'+"
+              "'2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f'];"
+              "const bad=want.findIndex((w,i)=>hex(r[i])!==w);"
+              "pocSummary=bad<0&&r[5]==='NotSupportedError'?'DIGEST-OK':"
+              "'DIGEST-BAD-'+bad+'-'+r[5]},e=>pocSummary='DIGEST-'+e.name+'-'+"
+              "String(e.message))})()",
+              "<subtle-digest-algorithms>", &digest_result));
+    for (size_t digest_turn = 0; digest_turn < 4; digest_turn++) {
+        CHECK(script_runtime_advance(
+            digest_runtime, digest_turn, 4, &digest_result));
+    }
+    if (strcmp(digest_result.summary, "DIGEST-OK") != 0) {
+        fprintf(stderr, "digest summary=%s error=%s\n",
+                digest_result.summary, digest_result.error);
+    }
+    CHECK(strcmp(digest_result.summary, "DIGEST-OK") == 0);
+    script_runtime_destroy(digest_runtime);
+    document_destroy(&digest_document);
     CHECK(budget.current == 0);
 
     puts("test: Worker clock is isolated from the owner performance object");
@@ -6797,7 +6854,8 @@
         strlen(worker_lifecycle_page), 8));
     ScriptResult insecure_context_result = {0};
     ScriptRuntime *insecure_context_runtime = script_runtime_create_deferred(
-        &insecure_context_document, &budget, 2 * MIB, 1000,
+        &insecure_context_document, &budget,
+        test_small_realm_bytes(&budget, TEST_SMALL_REALM_MARGIN_BYTES), 1000,
         "http://insecure-context.test/", NULL, &insecure_context_result);
     CHECK(insecure_context_runtime != NULL
           && script_runtime_evaluate_diagnostic(
@@ -7203,7 +7261,8 @@
        transition, but must not publish the proposed callback opaque. */
     ScriptResult failed_message_result = {0};
     ScriptRuntime *failed_message_runtime = script_runtime_create_deferred(
-        &child_message_document, &budget, 2 * MIB, 1000,
+        &child_message_document, &budget,
+        test_small_realm_bytes(&budget, TEST_SMALL_REALM_MARGIN_BYTES), 1000,
         "https://failed-child.test/", NULL, &failed_message_result);
     MessageOpaqueProbe *failed_message_opaque =
         malloc(sizeof(*failed_message_opaque));

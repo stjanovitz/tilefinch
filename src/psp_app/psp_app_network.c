@@ -775,6 +775,10 @@ static bool psp_connect_network_prepared(PspNetwork *network, int profile_index,
             if (presentation_due) {
                 psp_ui_show_status(ui, status, 120);
                 psp_ui_set_loading(ui, true, -1);
+                /* Under the supervisor the screen shows its own UI copy,
+                   which still says what the scope began with. */
+                if (psp_navigation_cooperate_supervised())
+                    psp_work_cooperate_show_status(NULL, status);
                 if (frame != NULL
                     && !psp_navigation_cooperate_supervised()) {
                     PspUiInput idle = {
@@ -802,6 +806,16 @@ static bool psp_connect_network_prepared(PspNetwork *network, int profile_index,
            Held input and terminal association states never spend a slice. */
         if (!terminal && preparation_app != NULL && pad.Buttons == 0)
             psp_app_prepare_transport(preparation_app, 0u, true);
+        /* No warm-up owner (a direct boot, a resume reconnect, or warm-up
+           already retired): the wait still seeds, one estimator batch per
+           vblank. The step is the warm-up's own: poll-only on the lock,
+           cheap once released or refused, never releases uncredited
+           output. Every deadline here is wall-clock (network->started_us),
+           so a batch delays the next poll but cannot move a timeout. */
+        if (!terminal && pad.Buttons == 0
+            && (preparation_app == NULL
+                || !preparation_app->interactive->transport_prepare_pending))
+            (void) psp_entropy_prepare_step();
         if (terminal) break;
     }
     psp_report_network_result(network);

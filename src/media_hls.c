@@ -26,6 +26,14 @@ _Static_assert(SWDEC_TS_MAX_AU == SWDEC_SAMPLE_MAX_BYTES,
 #define HLS_TS_PARSE_SLICE_BYTES HLS_TS_PACKET_BYTES
 /* Transport bytes one media_hls_source_pump visit may ingest. */
 #define HLS_DELIVERY_VISIT_BYTES (4u * 1024u)
+/* A mixed source that finds no AVC video. "has no supported track" maps to
+   the "No supported codec" failure message. */
+#define HLS_NO_VIDEO_FAILURE \
+    "HLS stream has no supported track (no AVC video; audio-only HLS is " \
+    "not supported)"
+/* Steps one open-time prime call may take; the byte bound is
+   HLS_DELIVERY_VISIT_BYTES, as for a delivery visit. */
+#define HLS_PRIME_VISIT_STEPS 256u
 /* Durations assumed when the stream gives none: one 25 fps video frame and
    one 1024-sample AAC frame at 44.1 kHz. */
 #define HLS_FALLBACK_VIDEO_FRAME_TICKS 3600u
@@ -43,38 +51,83 @@ _Static_assert(SWDEC_TS_MAX_AU == SWDEC_SAMPLE_MAX_BYTES,
 #define HLS_LIVE_REFRESH_MINIMUM_US UINT64_C(1000000)
 #define HLS_LIVE_STALL_LIMIT_US UINT64_C(60000000)
 #define HLS_MASTER_GROUP_BYTES 64u
+/* Variants and audio renditions a master playlist may list. */
+#define HLS_MASTER_ENTRY_LIMIT 256u
 #define HLS_STREAM_LINE_BYTES 4096u
 
-typedef enum {
-    HLS_ENTRY_SEGMENT = 0,
-    HLS_ENTRY_VARIANT,
-    HLS_ENTRY_AUDIO_RENDITION
-} HlsEntryKind;
-
+/* A media playlist's segment. Its URI is the NUL-terminated line at
+   text_offset in the retained text, and its media sequence number is the
+   playlist's first sequence plus its index. */
 typedef struct {
     uint32_t text_offset;
     uint32_t start_ms;
+    uint32_t duration_ms;
+    uint16_t text_length;
+    uint16_t flags;            /* HLS_SEGMENT_* */
+} HlsSegment;
+
+#define HLS_SEGMENT_DISCONTINUITY 0x1u
+
+_Static_assert(sizeof(HlsSegment) == 16u, "HLS segment record is 16 bytes");
+/* text_length holds any line the incremental stream accepts. */
+_Static_assert(HLS_STREAM_LINE_BYTES <= UINT16_MAX,
+               "HLS stream lines fit a segment's text length");
+_Static_assert(MEDIA_HLS_MAXIMUM_PLAYLIST_BYTES <= UINT32_MAX,
+               "HLS text offsets fit 32 bits");
+
+typedef enum {
+    HLS_ENTRY_VARIANT = 0,
+    HLS_ENTRY_AUDIO_RENDITION
+} HlsMasterEntryKind;
+
+/* A master playlist's variant or audio rendition. Its URI is the
+   NUL-terminated text at text_offset; its AUDIO group (a variant's) or
+   GROUP-ID (a rendition's) is the group_length bytes at group_offset, not
+   terminated. */
+typedef struct {
+    uint32_t text_offset;
+    uint32_t group_offset;
+    uint32_t bandwidth;
     uint16_t text_length;
     uint16_t width;
     uint16_t height;
-    uint32_t duration_ms;
-    uint32_t bandwidth;
-    uint64_t sequence;
-    char audio_group[HLS_MASTER_GROUP_BYTES];
-    HlsEntryKind kind;
-    bool codecs_compatible;
+    uint8_t group_length;      /* below HLS_MASTER_GROUP_BYTES */
+    uint8_t kind;              /* HlsMasterEntryKind */
     /* HLS_VARIANT_ROUTE_*: the AVC decoder the variant's CODECS name. */
     uint8_t decoder_route;
-    bool discontinuity;
+    bool codecs_compatible;
     bool default_rendition;
-} HlsEntry;
+} HlsMasterEntry;
+
+/* A compacted live window (its header, then each retained segment's
+   DISCONTINUITY, EXTINF and URI lines) fits the compaction buffer, and a
+   live playlist is compacted before the whole-playlist bound. */
+_Static_assert(256u + MEDIA_HLS_RETAINED_LIVE_SEGMENTS
+                   * (HLS_STREAM_LINE_BYTES + 64u)
+                   <= MEDIA_HLS_LIVE_COMPACT_PLAYLIST_BYTES,
+               "a compacted live window fits its buffer");
+_Static_assert(MEDIA_HLS_LIVE_COMPACT_PLAYLIST_BYTES
+                   <= MEDIA_HLS_MAXIMUM_PLAYLIST_BYTES
+               && MEDIA_HLS_LIVE_COMPACT_SEGMENTS
+                   <= MEDIA_HLS_MAXIMUM_SEGMENTS,
+               "live playlists compact within the playlist bounds");
+_Static_assert(HLS_MASTER_GROUP_BYTES <= UINT8_MAX + 1u,
+               "HLS group lengths fit a byte");
+_Static_assert(HLS_MASTER_ENTRY_LIMIT * sizeof(HlsMasterEntry)
+                   <= MEDIA_HLS_MAXIMUM_SEGMENTS * sizeof(HlsSegment),
+               "master entries share the segment table's storage");
 
 struct MediaHlsPlaylist {
     Budget *budget;
     char *text;
     size_t text_length;
     char base_url[4096];
-    HlsEntry entries[MEDIA_HLS_MAXIMUM_SEGMENTS];
+    /* A playlist is either a media playlist or a master (mixed forms are
+       refused), so the two tables share one block. */
+    union {
+        HlsSegment segments[MEDIA_HLS_MAXIMUM_SEGMENTS];
+        HlsMasterEntry masters[HLS_MASTER_ENTRY_LIMIT];
+    } table;
     size_t entry_count;
     uint64_t duration_us;
     uint64_t media_sequence;
@@ -95,8 +148,8 @@ struct MediaHlsPlaylistStream {
     char playlist_url[4096];
     /* Retained playlist text, grown on demand up to
        MEDIA_HLS_MAXIMUM_PLAYLIST_BYTES: a live playlist refreshed every few
-       seconds is usually a few KiB, so a fixed 64 KiB buffer was mostly
-       idle allocation on each refresh. */
+       seconds is usually a few KiB, so a fixed buffer of the full bound
+       would be mostly idle allocation on each refresh. */
     unsigned char *raw;
     size_t raw_capacity;
     size_t raw_length;
@@ -105,6 +158,7 @@ struct MediaHlsPlaylistStream {
     HlsStreamSegment segments[MEDIA_HLS_RETAINED_LIVE_SEGMENTS];
     size_t segment_head;
     size_t segment_count;
+    size_t segments_seen;
     size_t bytes_seen;
     uint64_t media_sequence;
     uint64_t next_sequence;
@@ -145,6 +199,20 @@ typedef enum {
     HLS_AUDIO_SEGMENT_ADTS
 } HlsAudioSegmentKind;
 
+/* Content a live rendition skipped, [from, to) in shared live time. */
+#define HLS_LIVE_SKIP_SPANS 3u
+typedef struct {
+    uint64_t from90k;
+    uint64_t to90k;
+} HlsSkipSpan;
+
+/* Lining up a live audio rendition with the video, once per open. */
+typedef enum {
+    HLS_LIVE_ALIGN_PENDING = 0,
+    HLS_LIVE_ALIGN_RESEATED,
+    HLS_LIVE_ALIGN_DONE
+} HlsLiveAlign;
+
 struct MediaHlsSource {
     Budget *budget;
     MediaHlsPlaylist *playlist;
@@ -180,10 +248,46 @@ struct MediaHlsSource {
     bool prefetch_refused;
     bool have_sps;
     bool have_pps;
+    bool segment_head_checked;
     bool segment_origin_valid;
+    bool start_origin_valid;
+    uint8_t live_align;           /* HlsLiveAlign */
     uint64_t segment_origin90k;
     uint64_t segment_base90k;
+    /* The raw PTS at local time zero: the first segment origin seen, less
+       that segment's base. Live renditions compare these to line up. */
+    uint64_t start_origin90k;
+    /* Added to an audio rendition's local timestamps to put them on the
+       video's clock; units it would make negative are dropped. */
+    int64_t start_shift90k;
     uint64_t live_timeline90k;
+    /* Window skips on a live clock. Shared live time is a unit's local time
+       before skipped content is taken out (an audio rendition adds its
+       start shift), so both renditions of a demuxed pair name the same
+       content by the same time. skip_spans is what either one skipped and
+       this one has not passed, sorted and disjoint; a queued unit's time
+       is its shared time less every span before it, and a unit inside one
+       is dropped, so a skip removes the same content from both clocks.
+       Spans behind the current segment fold into skip_removed90k. */
+    MediaHlsSource *live_partner;
+    HlsSkipSpan skip_spans[HLS_LIVE_SKIP_SPANS];
+    uint8_t skip_span_count;
+    bool live_started;            /* a unit was queued on this clock */
+    bool skip_pending;            /* a skip awaits its first timestamp */
+    bool skip_origin_valid;
+    bool await_keyframe;          /* video units were dropped */
+    /* A pass reached the playlist's end: the segment the next refresh
+       selects follows unfetched ones, so it is a discontinuity. */
+    bool pass_discontinuity;
+    uint64_t skip_removed90k;
+    uint64_t skip_origin90k;      /* the segment before the skip: origin */
+    uint64_t skip_origin_base90k; /* and base */
+    uint64_t skip_estimate90k;    /* by sequence numbers and EXTINF */
+    /* What the playlists can account for: the skipped segments the current
+       playlist lists plus the replacement's whole window. An estimate past
+       it means the numbers jumped (a renumbered playlist), not content. */
+    uint64_t skip_bound90k;
+    uint64_t live_queued_end90k;  /* shared end of the last queued unit */
     uint64_t next_sequence;
     uint64_t refresh_next_us;
     uint64_t live_edge_since_us;
@@ -549,7 +653,8 @@ MediaHlsPlaylist *media_hls_playlist_parse(
     bool pending_discontinuity = false, pending_duration_valid = false;
     bool pending_codecs_compatible = true;
     uint8_t pending_decoder_route = HLS_VARIANT_ROUTE_UNDECLARED;
-    char pending_audio_group[HLS_MASTER_GROUP_BYTES] = {0};
+    uint32_t pending_group_offset = 0;
+    uint8_t pending_group_length = 0;
     uint32_t pending_duration = 0, pending_bandwidth = 0;
     uint32_t total_duration_ms = 0;
     uint16_t pending_width = 0, pending_height = 0;
@@ -591,16 +696,18 @@ MediaHlsPlaylist *media_hls_playlist_parse(
                 value, &pending_decoder_route);
             char *group = NULL;
             size_t group_length = 0;
-            pending_audio_group[0] = '\0';
+            pending_group_offset = 0;
+            pending_group_length = 0;
             if (hls_attribute_text(value, "AUDIO", &group, &group_length)) {
-                if (group_length >= sizeof(pending_audio_group)) {
+                if (group_length >= HLS_MASTER_GROUP_BYTES) {
                     hls_error(error, error_size,
                               "HLS audio group exceeds its bound");
                     media_hls_playlist_destroy(playlist);
                     return NULL;
                 }
-                memcpy(pending_audio_group, group, group_length);
-                pending_audio_group[group_length] = '\0';
+                /* The retained line keeps the group's bytes. */
+                pending_group_offset = (uint32_t) (group - copy);
+                pending_group_length = (uint8_t) group_length;
             }
             continue;
         }
@@ -612,20 +719,27 @@ MediaHlsPlaylist *media_hls_playlist_parse(
                 || !hls_attribute_text(value, "URI", &uri, &uri_length)
                 || group_length >= HLS_MASTER_GROUP_BYTES
                 || uri_length > UINT16_MAX
-                || playlist->entry_count >= MEDIA_HLS_MAXIMUM_SEGMENTS) {
+                || playlist->entry_count >= HLS_MASTER_ENTRY_LIMIT) {
                 hls_error(error, error_size,
                           "invalid HLS audio rendition");
                 media_hls_playlist_destroy(playlist);
                 return NULL;
             }
-            HlsEntry *entry = &playlist->entries[playlist->entry_count++];
+            if (playlist->kind == MEDIA_HLS_PLAYLIST_MEDIA
+                && playlist->entry_count != 0) {
+                hls_error(error, error_size, "mixed HLS playlist forms");
+                media_hls_playlist_destroy(playlist);
+                return NULL;
+            }
+            HlsMasterEntry *entry =
+                &playlist->table.masters[playlist->entry_count++];
             entry->kind = HLS_ENTRY_AUDIO_RENDITION;
             entry->text_offset = (uint32_t) (uri - copy);
             entry->text_length = (uint16_t) uri_length;
+            entry->group_offset = (uint32_t) (group - copy);
+            entry->group_length = (uint8_t) group_length;
             entry->default_rendition =
                 hls_attribute_is(value, "DEFAULT", "YES");
-            memcpy(entry->audio_group, group, group_length);
-            entry->audio_group[group_length] = '\0';
             /* The URI lives inside this retained mutable line. Terminate it
                so URL resolution cannot consume the following attributes. */
             uri[uri_length] = '\0';
@@ -668,38 +782,54 @@ MediaHlsPlaylist *media_hls_playlist_parse(
             continue;
         }
         if (kind != HLS_LINE_URI) continue;
-        if (line_length > UINT16_MAX
-            || playlist->entry_count >= MEDIA_HLS_MAXIMUM_SEGMENTS) {
-            hls_error(error, error_size, "HLS playlist has too many entries");
+        if (line_length > UINT16_MAX) {
+            hls_error(error, error_size,
+                      "HLS playlist line exceeds its bound");
             media_hls_playlist_destroy(playlist);
             return NULL;
         }
-        HlsEntry *entry = &playlist->entries[playlist->entry_count++];
-        entry->text_offset = (uint32_t) (line - copy);
-        entry->text_length = (uint16_t) line_length;
         if (pending_variant) {
             if (playlist->kind == MEDIA_HLS_PLAYLIST_MEDIA
-                && playlist->entry_count > 1u) {
+                && playlist->entry_count != 0) {
                 hls_error(error, error_size, "mixed HLS playlist forms");
                 media_hls_playlist_destroy(playlist);
                 return NULL;
             }
+            if (playlist->entry_count >= HLS_MASTER_ENTRY_LIMIT) {
+                hls_error(error, error_size,
+                          MEDIA_HLS_PLAYLIST_TOO_LONG " (over %u entries)",
+                          (unsigned) HLS_MASTER_ENTRY_LIMIT);
+                media_hls_playlist_destroy(playlist);
+                return NULL;
+            }
             playlist->kind = MEDIA_HLS_PLAYLIST_MASTER;
+            HlsMasterEntry *entry =
+                &playlist->table.masters[playlist->entry_count++];
+            entry->text_offset = (uint32_t) (line - copy);
+            entry->text_length = (uint16_t) line_length;
             entry->kind = HLS_ENTRY_VARIANT;
             entry->bandwidth = pending_bandwidth;
             entry->width = pending_width;
             entry->height = pending_height;
             entry->codecs_compatible = pending_codecs_compatible;
             entry->decoder_route = pending_decoder_route;
-            snprintf(entry->audio_group, sizeof(entry->audio_group), "%s",
-                     pending_audio_group);
+            entry->group_offset = pending_group_offset;
+            entry->group_length = pending_group_length;
             pending_variant = false;
             pending_codecs_compatible = true;
             pending_decoder_route = HLS_VARIANT_ROUTE_UNDECLARED;
-            pending_audio_group[0] = '\0';
+            pending_group_offset = 0;
+            pending_group_length = 0;
         } else {
             if (playlist->kind == MEDIA_HLS_PLAYLIST_MASTER) {
                 hls_error(error, error_size, "master HLS entry lacks metadata");
+                media_hls_playlist_destroy(playlist);
+                return NULL;
+            }
+            if (playlist->entry_count >= MEDIA_HLS_MAXIMUM_SEGMENTS) {
+                hls_error(error, error_size,
+                          MEDIA_HLS_PLAYLIST_TOO_LONG " (over %u entries)",
+                          (unsigned) MEDIA_HLS_MAXIMUM_SEGMENTS);
                 media_hls_playlist_destroy(playlist);
                 return NULL;
             }
@@ -712,12 +842,14 @@ MediaHlsPlaylist *media_hls_playlist_parse(
                 media_hls_playlist_destroy(playlist);
                 return NULL;
             }
-            playlist->kind = MEDIA_HLS_PLAYLIST_MEDIA;
-            entry->kind = HLS_ENTRY_SEGMENT;
-            entry->sequence = playlist->entry_count - 1u;
-            entry->start_ms = total_duration_ms;
-            entry->duration_ms = pending_duration;
-            entry->discontinuity = pending_discontinuity;
+            HlsSegment *segment =
+                &playlist->table.segments[playlist->entry_count++];
+            segment->text_offset = (uint32_t) (line - copy);
+            segment->text_length = (uint16_t) line_length;
+            segment->start_ms = total_duration_ms;
+            segment->duration_ms = pending_duration;
+            segment->flags = pending_discontinuity
+                ? HLS_SEGMENT_DISCONTINUITY : 0u;
             total_duration_ms += pending_duration;
             playlist->duration_us =
                 (uint64_t) total_duration_ms * UINT64_C(1000);
@@ -737,17 +869,13 @@ MediaHlsPlaylist *media_hls_playlist_parse(
         media_hls_playlist_destroy(playlist);
         return NULL;
     }
-    if (playlist->kind == MEDIA_HLS_PLAYLIST_MEDIA) {
-        for (size_t i = 0; i < playlist->entry_count; i++) {
-            if (i > UINT64_MAX - playlist->media_sequence) {
-                hls_error(error, error_size,
-                          "HLS media sequence exceeds its bound");
-                media_hls_playlist_destroy(playlist);
-                return NULL;
-            }
-            playlist->entries[i].sequence =
-                playlist->media_sequence + (uint64_t) i;
-        }
+    /* Every segment's sequence number (hls_segment_sequence) fits. */
+    if (playlist->kind == MEDIA_HLS_PLAYLIST_MEDIA
+        && (uint64_t) (playlist->entry_count - 1u)
+               > UINT64_MAX - playlist->media_sequence) {
+        hls_error(error, error_size, "HLS media sequence exceeds its bound");
+        media_hls_playlist_destroy(playlist);
+        return NULL;
     }
     return playlist;
 }
@@ -762,7 +890,8 @@ MediaHlsPlaylistKind media_hls_playlist_kind(const MediaHlsPlaylist *playlist)
    geometry when its CODECS name Baseline or Main, or, when the caller will
    verify the first segment's SPS, when they name no profile at all. */
 static bool hls_variant_admitted(
-    const HlsEntry *entry, unsigned maximum_width, unsigned maximum_height,
+    const HlsMasterEntry *entry, unsigned maximum_width,
+    unsigned maximum_height,
     const MediaHlsDecoderLimits *limits)
 {
     if (entry->width == 0 || entry->height == 0
@@ -787,7 +916,7 @@ static size_t hls_playlist_select_variant_index(
     unsigned selected_class = UINT32_MAX;
     uint64_t selected_cost = UINT64_MAX;
     for (size_t i = 0; i < playlist->entry_count; i++) {
-        const HlsEntry *entry = &playlist->entries[i];
+        const HlsMasterEntry *entry = &playlist->table.masters[i];
         if (entry->kind != HLS_ENTRY_VARIANT) continue;
         if (!entry->codecs_compatible) continue;
         if (!hls_variant_admitted(
@@ -830,7 +959,7 @@ bool media_hls_playlist_select_variant(
     if (selected == SIZE_MAX) return false;
     return tilefinch_url_resolve(
         playlist->base_url,
-        playlist->text + playlist->entries[selected].text_offset,
+        playlist->text + playlist->table.masters[selected].text_offset,
         url, url_size);
 }
 #endif
@@ -840,17 +969,20 @@ static bool hls_playlist_select_streams_at(
     char *video_url, size_t video_url_size,
     char *audio_url, size_t audio_url_size)
 {
-    const HlsEntry *entry = &playlist->entries[selected];
+    const HlsMasterEntry *entry = &playlist->table.masters[selected];
     const char *reference = playlist->text + entry->text_offset;
     if (!tilefinch_url_resolve(
             playlist->base_url, reference,
             video_url, video_url_size)) return false;
-    if (entry->audio_group[0] == '\0') return true;
+    if (entry->group_length == 0) return true;
+    const char *group = playlist->text + entry->group_offset;
     size_t selected_audio = SIZE_MAX;
     for (size_t i = 0; i < playlist->entry_count; i++) {
-        const HlsEntry *candidate = &playlist->entries[i];
+        const HlsMasterEntry *candidate = &playlist->table.masters[i];
         if (candidate->kind != HLS_ENTRY_AUDIO_RENDITION
-            || strcmp(candidate->audio_group, entry->audio_group) != 0)
+            || candidate->group_length != entry->group_length
+            || memcmp(playlist->text + candidate->group_offset, group,
+                      entry->group_length) != 0)
             continue;
         if (selected_audio == SIZE_MAX || candidate->default_rendition) {
             selected_audio = i;
@@ -860,7 +992,7 @@ static bool hls_playlist_select_streams_at(
     if (selected_audio == SIZE_MAX) return false;
     return tilefinch_url_resolve(
         playlist->base_url,
-        playlist->text + playlist->entries[selected_audio].text_offset,
+        playlist->text + playlist->table.masters[selected_audio].text_offset,
         audio_url, audio_url_size);
 }
 
@@ -896,7 +1028,7 @@ bool media_hls_playlist_select_decodable_streams(
         playlist, limits->software_width, limits->software_height,
         limits->target_height, limits);
     if (selected == SIZE_MAX) return false;
-    const HlsEntry *entry = &playlist->entries[selected];
+    const HlsMasterEntry *entry = &playlist->table.masters[selected];
     if (selection != NULL) {
         selection->video_selected = true;
         selection->width = entry->width;
@@ -919,7 +1051,7 @@ bool media_hls_playlist_segment(const MediaHlsPlaylist *playlist,
     if (playlist == NULL || playlist->kind != MEDIA_HLS_PLAYLIST_MEDIA
         || index >= playlist->entry_count || url == NULL || url_size == 0)
         return false;
-    const HlsEntry *entry = &playlist->entries[index];
+    const HlsSegment *entry = &playlist->table.segments[index];
     if (duration_ms != NULL) *duration_ms = entry->duration_ms;
     return tilefinch_url_resolve(playlist->base_url,
                                  playlist->text + entry->text_offset,
@@ -1073,6 +1205,7 @@ static bool hls_stream_process_line(MediaHlsPlaylistStream *stream,
     segment->duration_ms = stream->pending_duration_ms;
     segment->discontinuity = stream->pending_discontinuity;
     if (stream->next_sequence != UINT64_MAX) stream->next_sequence++;
+    if (stream->segments_seen != SIZE_MAX) stream->segments_seen++;
     stream->pending_duration = false;
     stream->pending_discontinuity = false;
     return true;
@@ -1165,6 +1298,15 @@ static bool hls_stream_output_append(char *output, size_t capacity,
     return true;
 }
 
+/* Whether what was fed so far is a live window past the live bounds (an
+   ENDLIST still to come would make it a finite playlist instead). */
+static bool hls_stream_live_overflow(const MediaHlsPlaylistStream *stream)
+{
+    return !stream->saw_master && !stream->saw_end_list
+        && (stream->segments_seen > MEDIA_HLS_LIVE_COMPACT_SEGMENTS
+            || stream->raw_length > MEDIA_HLS_LIVE_COMPACT_PLAYLIST_BYTES);
+}
+
 MediaHlsPlaylist *media_hls_playlist_stream_finish(
     MediaHlsPlaylistStream *stream, char *error, size_t error_size)
 {
@@ -1180,7 +1322,11 @@ MediaHlsPlaylist *media_hls_playlist_stream_finish(
         }
         stream->line_length = 0;
     }
-    if (!stream->raw_overflow) {
+    /* A live window past the live bounds is compacted to its tail: it is
+       refetched every half target duration, and only its newest segments
+       are played. A finite playlist is kept whole up to the playlist
+       bounds and refused past them. */
+    if (!stream->raw_overflow && !hls_stream_live_overflow(stream)) {
         return media_hls_playlist_parse(
             stream->budget, stream->playlist_url,
             stream->raw != NULL ? stream->raw : (const unsigned char *) "",
@@ -1188,17 +1334,22 @@ MediaHlsPlaylist *media_hls_playlist_stream_finish(
     }
     if (stream->saw_master || stream->saw_end_list || !stream->saw_media
         || stream->segment_count == 0) {
+        if (stream->saw_end_list && !stream->saw_master) {
+            hls_error(error, error_size,
+                      MEDIA_HLS_PLAYLIST_TOO_LONG " (VOD text over %u KiB)",
+                      (unsigned) (MEDIA_HLS_MAXIMUM_PLAYLIST_BYTES / 1024u));
+            return NULL;
+        }
         hls_error(error, error_size,
                   stream->saw_master
                       ? "malformed HLS master exceeds retained bound"
-                      : stream->saw_end_list
-                          ? "HLS VOD playlist exceeds retained bound"
                       : "oversized HLS media playlist has no segments");
         return NULL;
     }
+    /* Twelve segment lines of at most HLS_STREAM_LINE_BYTES fit. */
     char *normalized = budget_malloc_category(
         stream->budget, BUDGET_CATEGORY_RESOURCE,
-        MEDIA_HLS_MAXIMUM_PLAYLIST_BYTES);
+        MEDIA_HLS_LIVE_COMPACT_PLAYLIST_BYTES);
     if (normalized == NULL) {
         hls_error(error, error_size,
                   "HLS compact playlist exceeds memory budget");
@@ -1208,13 +1359,13 @@ MediaHlsPlaylist *media_hls_playlist_stream_finish(
     size_t first = stream->segment_head;
     uint64_t first_sequence = stream->segments[first].sequence;
     bool ok = hls_stream_output_append(
-        normalized, MEDIA_HLS_MAXIMUM_PLAYLIST_BYTES, &length,
+        normalized, MEDIA_HLS_LIVE_COMPACT_PLAYLIST_BYTES, &length,
         "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:%llu\n",
         (unsigned long long) first_sequence);
     if (ok && !stream->saw_end_list) {
         ok = stream->target_duration_ms != 0
             && hls_stream_output_append(
-                normalized, MEDIA_HLS_MAXIMUM_PLAYLIST_BYTES, &length,
+                normalized, MEDIA_HLS_LIVE_COMPACT_PLAYLIST_BYTES, &length,
                 "#EXT-X-TARGETDURATION:%u\n",
                 stream->target_duration_ms / 1000u);
     }
@@ -1223,16 +1374,16 @@ MediaHlsPlaylist *media_hls_playlist_stream_finish(
             (stream->segment_head + i) % MEDIA_HLS_RETAINED_LIVE_SEGMENTS];
         if (segment->discontinuity)
             ok = hls_stream_output_append(
-                normalized, MEDIA_HLS_MAXIMUM_PLAYLIST_BYTES, &length,
+                normalized, MEDIA_HLS_LIVE_COMPACT_PLAYLIST_BYTES, &length,
                 "#EXT-X-DISCONTINUITY\n");
         if (ok) ok = hls_stream_output_append(
-            normalized, MEDIA_HLS_MAXIMUM_PLAYLIST_BYTES, &length,
+            normalized, MEDIA_HLS_LIVE_COMPACT_PLAYLIST_BYTES, &length,
             "#EXTINF:%u.%03u,\n%s\n",
             segment->duration_ms / 1000u,
             segment->duration_ms % 1000u, segment->url);
     }
     if (ok && stream->saw_end_list) ok = hls_stream_output_append(
-        normalized, MEDIA_HLS_MAXIMUM_PLAYLIST_BYTES, &length,
+        normalized, MEDIA_HLS_LIVE_COMPACT_PLAYLIST_BYTES, &length,
         "#EXT-X-ENDLIST\n");
     MediaHlsPlaylist *playlist = ok ? media_hls_playlist_parse(
         stream->budget, stream->playlist_url,
@@ -1253,7 +1404,8 @@ size_t media_hls_playlist_stream_bytes_seen(
 bool media_hls_playlist_stream_was_compacted(
     const MediaHlsPlaylistStream *stream)
 {
-    return stream != NULL && stream->raw_overflow;
+    return stream != NULL
+        && (stream->raw_overflow || hls_stream_live_overflow(stream));
 }
 
 void media_hls_playlist_stream_destroy(MediaHlsPlaylistStream *stream)
@@ -1468,6 +1620,164 @@ static uint32_t hls_video_duration(MediaHlsSource *source, uint64_t pts90k)
             : HLS_FALLBACK_VIDEO_FRAME_TICKS;
 }
 
+/* PTS runs on a 33-bit clock that wraps every 26.5 hours. Ticks from the
+   segment origin are counted modulo 2^33, so a wrap inside a segment keeps
+   counting forward. A PTS up to 2^32 ticks behind the origin is earlier
+   (a picture shown before the first one decoded) and maps to the segment
+   start, as it always has. */
+#define HLS_PTS_MASK ((UINT64_C(1) << 33) - 1u)
+
+static uint64_t hls_segment_time90k(const MediaHlsSource *source,
+                                    uint64_t pts90k)
+{
+    uint64_t delta = (pts90k - source->segment_origin90k) & HLS_PTS_MASK;
+    return delta > (HLS_PTS_MASK >> 1)
+        ? source->segment_base90k : source->segment_base90k + delta;
+}
+
+static void hls_set_segment_origin(MediaHlsSource *source, uint64_t pts90k)
+{
+    source->segment_origin_valid = true;
+    source->segment_origin90k = pts90k;
+    if (!source->start_origin_valid) {
+        source->start_origin_valid = true;
+        source->start_origin90k =
+            (pts90k - source->segment_base90k) & HLS_PTS_MASK;
+    }
+}
+
+static uint64_t hls_live_shared(const MediaHlsSource *source,
+                                uint64_t time90k)
+{
+    int64_t shift = source->start_shift90k;
+    if (shift < 0 && time90k < (uint64_t) -shift) return 0;
+    return time90k + (uint64_t) shift;
+}
+
+/* Adds [from, to) to the skipped content, joining what it overlaps. A
+   full table joins its last two spans (the content between them is
+   dropped too); renditions consumed in step never hold more than two. */
+static void hls_skip_span_add(MediaHlsSource *source, uint64_t from,
+                              uint64_t to)
+{
+    if (source == NULL || to <= from) return;
+    HlsSkipSpan spans[HLS_LIVE_SKIP_SPANS + 1u];
+    size_t count = 0;
+    bool placed = false;
+    for (size_t i = 0; i < source->skip_span_count; i++) {
+        HlsSkipSpan span = source->skip_spans[i];
+        if (span.to90k >= from && span.from90k <= to) {
+            if (span.from90k < from) from = span.from90k;
+            if (span.to90k > to) to = span.to90k;
+            continue;
+        }
+        if (!placed && to < span.from90k) {
+            spans[count++] = (HlsSkipSpan) {from, to};
+            placed = true;
+        }
+        spans[count++] = span;
+    }
+    if (!placed) spans[count++] = (HlsSkipSpan) {from, to};
+    if (count > HLS_LIVE_SKIP_SPANS) {
+        spans[count - 2u].to90k = spans[count - 1u].to90k;
+        count--;
+    }
+    memcpy(source->skip_spans, spans, count * sizeof(spans[0]));
+    source->skip_span_count = (uint8_t) count;
+}
+
+/* A unit at shared time `time90k` is queued at that time less the content
+   skipped before it. False: it lies in skipped content. */
+static bool hls_live_place(const MediaHlsSource *source, uint64_t *time90k)
+{
+    uint64_t removed = source->skip_removed90k;
+    for (size_t i = 0; i < source->skip_span_count; i++) {
+        const HlsSkipSpan *span = &source->skip_spans[i];
+        if (*time90k < span->from90k) break;
+        if (*time90k < span->to90k) return false;
+        removed += span->to90k - span->from90k;
+    }
+    *time90k = *time90k > removed ? *time90k - removed : 0;
+    return true;
+}
+
+/* Whether the segment starting at live timeline `start90k` lies wholly in
+   content the partner skipped: it is then passed unfetched. */
+static bool hls_live_span_covers(const MediaHlsSource *source,
+                                 uint64_t start90k, uint32_t duration_ms)
+{
+    if (!source->live_session || source->skip_pending) return false;
+    uint64_t from = hls_live_shared(source, start90k);
+    uint64_t to = from + (uint64_t) duration_ms * 90u;
+    for (size_t i = 0; i < source->skip_span_count; i++) {
+        if (source->skip_spans[i].from90k <= from
+            && to <= source->skip_spans[i].to90k) return true;
+    }
+    return false;
+}
+
+/* This source skipped [from, to): both renditions drop that content. The
+   sound is the clock, and what it already queued will play, so a picture
+   skip takes out only the content after that; the picture then holds
+   until the sound reaches it. A skip of unknown length (`shared` false)
+   stays this source's own: its clock still runs on contiguously, and the
+   pair is unlinked for good, since their shared times no longer name the
+   same content. That is the offset before skips were shared, not the
+   partner dropping content nothing measured. */
+static void hls_live_note_skip(MediaHlsSource *source, uint64_t from,
+                               uint64_t to, bool shared)
+{
+    MediaHlsSource *partner = source->live_partner;
+    if (!shared) {
+        if (partner != NULL) partner->live_partner = NULL;
+        source->live_partner = NULL;
+        partner = NULL;
+    }
+    if (partner != NULL && source->track_selection == MEDIA_HLS_TRACK_VIDEO
+        && partner->live_queued_end90k > from)
+        from = partner->live_queued_end90k < to
+            ? partner->live_queued_end90k : to;
+    hls_skip_span_add(source, from, to);
+    hls_skip_span_add(partner, from, to);
+}
+
+/* The first unit after a window skip has arrived: place the new segment
+   by its timestamp. The skipped duration is how far past this segment's
+   EXTINF start the segment before the skip puts its origin, which must
+   roughly agree with the skip's sequence numbers and EXTINF (or, when the
+   numbers jumped past what the playlists list, with those playlists'
+   length; a long stall still matches its own estimate). Without a usable
+   timestamp (packed audio with no ID3 PRIV, or a clock that restarted)
+   it is the estimate, shared only when the playlists account for it: a
+   renumbered playlist's estimate is not content either rendition lost. */
+static void hls_live_resolve_skip(MediaHlsSource *source)
+{
+    source->skip_pending = false;
+    uint64_t start = source->segment_base90k;
+    uint64_t gap = source->skip_estimate90k;
+    bool numbered = gap <= source->skip_bound90k;
+    bool measured = false;
+    if (source->skip_origin_valid && source->segment_origin_valid
+        && start >= source->skip_origin_base90k) {
+        uint64_t raw = (source->segment_origin90k - source->skip_origin90k)
+            & HLS_PTS_MASK;
+        uint64_t lead = start - source->skip_origin_base90k;
+        uint64_t slack = (uint64_t) source->playlist->target_duration_ms * 90u;
+        uint64_t near = numbered ? gap : source->skip_bound90k;
+        if (raw <= (HLS_PTS_MASK >> 1) && raw >= lead) {
+            uint64_t span = raw - lead;
+            uint64_t apart = span > gap ? span - gap : gap - span;
+            measured = span <= near + near + slack
+                || (!numbered && apart <= gap / 8u + slack);
+            if (measured) gap = span;
+        }
+    }
+    source->segment_base90k = start + gap;
+    source->live_timeline90k = start + gap;
+    uint64_t from = hls_live_shared(source, start);
+    hls_live_note_skip(source, from, from + gap, measured || numbered);
+}
+
 static void hls_video_callback(void *opaque, const uint8_t *data,
                                size_t length, uint64_t pts90k)
 {
@@ -1481,15 +1791,11 @@ static void hls_video_callback(void *opaque, const uint8_t *data,
            retained timeline at the first independently decodable unit. */
         return;
     }
-    if (!source->segment_origin_valid && pts90k != SWDEC_TS_NOPTS) {
-        source->segment_origin_valid = true;
-        source->segment_origin90k = pts90k;
-    }
+    if (!source->segment_origin_valid && pts90k != SWDEC_TS_NOPTS)
+        hls_set_segment_origin(source, pts90k);
+    if (source->skip_pending) hls_live_resolve_skip(source);
     if (pts90k != SWDEC_TS_NOPTS && source->segment_origin_valid)
-        pts90k = pts90k >= source->segment_origin90k
-            ? source->segment_base90k
-                + pts90k - source->segment_origin90k
-            : source->segment_base90k;
+        pts90k = hls_segment_time90k(source, pts90k);
     if (pts90k == SWDEC_TS_NOPTS) {
         pts90k = source->last_video_pts90k == 0
             ? source->segment_base90k
@@ -1497,10 +1803,22 @@ static void hls_video_callback(void *opaque, const uint8_t *data,
     }
     uint32_t duration = hls_video_duration(source, pts90k);
     source->last_video_pts90k = pts90k;
-    (void) hls_queue_push(
-        source, MEDIA_MP4_TRACK_VIDEO, MEDIA_PACKET_FORMAT_H264_ANNEX_B,
-        data, length, pts90k, duration, keyframe);
+    /* Pictures in skipped content are dropped; decoding resumes at the
+       next keyframe, so the picture holds until then. */
+    uint64_t at = pts90k;
+    if (!hls_live_place(source, &at)) {
+        source->await_keyframe = true;
+        return;
+    }
+    if (source->await_keyframe && !keyframe) return;
+    source->await_keyframe = false;
+    if (hls_queue_push(
+            source, MEDIA_MP4_TRACK_VIDEO, MEDIA_PACKET_FORMAT_H264_ANNEX_B,
+            data, length, at, duration, keyframe))
+        source->live_started = true;
 }
+
+static void hls_release_head(MediaHlsSource *source);
 
 static void hls_audio_callback(void *opaque, const uint8_t *data,
                                size_t length, uint64_t pts90k)
@@ -1511,6 +1829,29 @@ static void hls_audio_callback(void *opaque, const uint8_t *data,
        genuinely late audio PID cannot be added to that live pipeline; drop
        it rather than consuming the video queue with packets no backend owns. */
     if (source->track_layout_known && !source->audio_info_valid) return;
+    if (source->track_selection == MEDIA_HLS_TRACK_MIXED
+        && !source->video_info_valid) {
+        /* The PMT is parsed whole before any of its streams' payloads, so
+           audio with no video PID means the program has no AVC video. A
+           mixed source is ready only with video; do not queue toward the
+           sample bound waiting for it. */
+        if (source->ts->video_pid < 0) {
+            hls_source_fail(source, "%s", HLS_NO_VIDEO_FAILURE);
+            return;
+        }
+        /* Video whose first SPS comes late: keep the newest audio before
+           it. Nothing is taken before a mixed source has video, so the
+           queue holds only untaken audio here. */
+        while (source->queue_count != 0
+               && (source->queue_count >= HLS_SAMPLE_LIMIT - 16u
+                   || source->queue_used + length
+                        > source->queue_capacity / 2u)) {
+            bool pristine = source->seek_pristine;
+            hls_release_head(source);
+            source->seek_pristine = pristine;
+            source->stats.preroll_audio_dropped++;
+        }
+    }
     MediaAacStreamInfo info = {0};
     bool valid_info = hls_adts_info(data, length, &info);
     if (!source->audio_info_valid && valid_info) {
@@ -1531,15 +1872,11 @@ static void hls_audio_callback(void *opaque, const uint8_t *data,
         ? source->audio_duration90k : valid_info
         ? (uint32_t) info.samples_per_frame * HLS_CLOCK_HZ / info.sample_rate
         : HLS_FALLBACK_AUDIO_FRAME_TICKS;
-    if (!source->segment_origin_valid && pts90k != SWDEC_TS_NOPTS) {
-        source->segment_origin_valid = true;
-        source->segment_origin90k = pts90k;
-    }
+    if (!source->segment_origin_valid && pts90k != SWDEC_TS_NOPTS)
+        hls_set_segment_origin(source, pts90k);
+    if (source->skip_pending) hls_live_resolve_skip(source);
     if (pts90k != SWDEC_TS_NOPTS && source->segment_origin_valid)
-        pts90k = pts90k >= source->segment_origin90k
-            ? source->segment_base90k
-                + pts90k - source->segment_origin90k
-            : source->segment_base90k;
+        pts90k = hls_segment_time90k(source, pts90k);
     if (pts90k == SWDEC_TS_NOPTS) {
         /* Zero is a valid first timestamp, not an uninitialized clock.
            Raw AAC has no per-frame PTS; advance it within each segment. */
@@ -1549,14 +1886,63 @@ static void hls_audio_callback(void *opaque, const uint8_t *data,
     }
     source->last_audio_pts90k = pts90k;
     source->audio_pts_valid = true;
-    (void) hls_queue_push(
-        source, MEDIA_MP4_TRACK_AUDIO, MEDIA_PACKET_FORMAT_AAC_ADTS,
-        data, length, pts90k, duration, false);
+    /* Before the video's first picture: dropped (see align_live_start). */
+    if (source->start_shift90k < 0
+        && pts90k < (uint64_t) -source->start_shift90k) return;
+    uint64_t shared = pts90k + (uint64_t) source->start_shift90k;
+    uint64_t at = shared;
+    if (!hls_live_place(source, &at)) return;
+    if (!hls_queue_push(
+            source, MEDIA_MP4_TRACK_AUDIO, MEDIA_PACKET_FORMAT_AAC_ADTS,
+            data, length, at, duration, false)) return;
+    source->live_started = true;
+    if (shared + duration > source->live_queued_end90k)
+        source->live_queued_end90k = shared + duration;
+}
+
+/* Packed audio starts with an ID3 tag whose PRIV frame, owned by this
+   name, holds the 33-bit timestamp of the first frame as eight big-endian
+   bytes. Returns how many head bytes are the tag, or SIZE_MAX while the
+   tag (up to the retained-tail bound) has not all arrived. */
+static const char hls_id3_timestamp_owner[] =
+    "com.apple.streaming.transportStreamTimestamp";
+
+static size_t hls_adts_segment_head(MediaHlsSource *source, size_t total)
+{
+    const unsigned char *tag = source->transport_chunk;
+    if (memcmp(tag, "ID3", total < 3u ? total : 3u) != 0) return 0;
+    if (total < 10u) return SIZE_MAX;
+    size_t size = 10u + ((size_t) (tag[6] & 0x7fu) << 21u
+                         | (size_t) (tag[7] & 0x7fu) << 14u
+                         | (size_t) (tag[8] & 0x7fu) << 7u
+                         | (size_t) (tag[9] & 0x7fu));
+    if (size > source->transport_tail_capacity)
+        size = source->transport_tail_capacity;
+    if (total < size) return SIZE_MAX;
+    const size_t owner = sizeof(hls_id3_timestamp_owner);
+    for (size_t at = 10u; at + owner + 8u <= size; at++) {
+        if (memcmp(tag + at, hls_id3_timestamp_owner, owner) != 0) continue;
+        const unsigned char *stamp = tag + at + owner;
+        hls_set_segment_origin(
+            source, (uint64_t) (stamp[3] & 1u) << 32u
+                | (uint64_t) stamp[4] << 24u | (uint64_t) stamp[5] << 16u
+                | (uint64_t) stamp[6] << 8u | stamp[7]);
+        break;
+    }
+    return size;
 }
 
 static bool hls_feed_adts_segment(MediaHlsSource *source, size_t total)
 {
     size_t cursor = 0;
+    if (!source->segment_head_checked) {
+        cursor = hls_adts_segment_head(source, total);
+        if (cursor == SIZE_MAX) {
+            source->transport_tail = total;
+            return true;
+        }
+        source->segment_head_checked = true;
+    }
     while (cursor + 7u <= total) {
         MediaAacStreamInfo info = {0};
         const unsigned char *frame = source->transport_chunk + cursor;
@@ -1610,7 +1996,7 @@ static bool hls_start_request(MediaHlsSource *source, size_t request_slot,
 {
     if (segment >= source->playlist->entry_count) return true;
     if (request_slot != 0 && source->prefetch_refused) return false;
-    const HlsEntry *entry = &source->playlist->entries[segment];
+    const HlsSegment *entry = &source->playlist->table.segments[segment];
     char url[4096];
     if (!tilefinch_url_resolve(
             source->playlist->base_url,
@@ -1645,10 +2031,10 @@ static bool hls_start_request(MediaHlsSource *source, size_t request_slot,
 static void hls_prepare_segment(MediaHlsSource *source, size_t segment)
 {
     if (source->prepared_segment == segment) return;
-    if (source->playlist->entries[segment].discontinuity) {
+    if (source->playlist->table.segments[segment].flags
+        & HLS_SEGMENT_DISCONTINUITY) {
         swdec_ts_flush(source->ts);
-        swdec_ts_init(
-            source->ts, hls_video_callback, hls_audio_callback, source);
+        swdec_ts_reset(source->ts);
         source->transport_tail = 0;
         /* Content past a discontinuity may have another frame rate. */
         source->video_frame90k = 0;
@@ -1660,27 +2046,126 @@ static void hls_prepare_segment(MediaHlsSource *source, size_t segment)
     source->recent_video_next = 0;
     if (source->live_session) {
         source->segment_base90k = source->live_timeline90k;
+        /* Every later unit lies past spans that end here. */
+        uint64_t base = hls_live_shared(source, source->segment_base90k);
+        while (source->skip_span_count != 0
+               && source->skip_spans[0].to90k <= base) {
+            source->skip_removed90k += source->skip_spans[0].to90k
+                - source->skip_spans[0].from90k;
+            source->skip_span_count--;
+            memmove(source->skip_spans, source->skip_spans + 1,
+                    source->skip_span_count * sizeof(source->skip_spans[0]));
+        }
     } else {
-        uint32_t start_ms = source->playlist->entries[segment].start_ms;
+        uint32_t start_ms =
+            source->playlist->table.segments[segment].start_ms;
         source->segment_base90k =
             (uint64_t) (start_ms / 1000u) * UINT64_C(90000)
             + (uint32_t) (start_ms % 1000u) * 90u;
     }
     source->segment_origin90k = 0;
     source->segment_origin_valid = false;
+    source->segment_head_checked = false;
     source->audio_pts_valid = false;
     if (source->track_selection == MEDIA_HLS_TRACK_AUDIO)
         source->audio_segment_kind = HLS_AUDIO_SEGMENT_UNKNOWN;
     source->prepared_segment = segment;
 }
 
+/* The parser checked that the last segment's number fits. */
+static uint64_t hls_segment_sequence(const MediaHlsPlaylist *playlist,
+                                     size_t index)
+{
+    return playlist->media_sequence + (uint64_t) index;
+}
+
 static size_t hls_sequence_index(
     const MediaHlsPlaylist *playlist, uint64_t sequence)
 {
-    if (playlist == NULL) return SIZE_MAX;
-    for (size_t i = 0; i < playlist->entry_count; i++)
-        if (playlist->entries[i].sequence >= sequence) return i;
-    return SIZE_MAX;
+    if (playlist == NULL || playlist->entry_count == 0
+        || hls_segment_sequence(playlist, playlist->entry_count - 1u)
+               < sequence) return SIZE_MAX;
+    if (sequence <= playlist->media_sequence) return 0;
+    return (size_t) (sequence - playlist->media_sequence);
+}
+
+/* A live window skip of `skipped` segments, from next_sequence to the
+   replacement's segment. Its length is known once the next segment's first
+   timestamp arrives (hls_live_resolve_skip); until then keep where the
+   segment before it was placed, and estimate the length by EXTINF: the
+   current playlist's for skipped segments it still lists, the
+   replacement's mean for the rest. */
+static void hls_live_begin_skip(MediaHlsSource *source,
+                                const MediaHlsPlaylist *replacement,
+                                uint64_t skipped)
+{
+    const MediaHlsPlaylist *current = source->playlist;
+    uint64_t known_ms = 0, known = 0;
+    for (size_t i = 0; i < current->entry_count; i++) {
+        uint64_t sequence = hls_segment_sequence(current, i);
+        if (sequence < source->next_sequence) continue;
+        if (sequence - source->next_sequence >= skipped) break;
+        known_ms += current->table.segments[i].duration_ms;
+        known++;
+    }
+    uint64_t total_ms = 0;
+    for (size_t i = 0; i < replacement->entry_count; i++)
+        total_ms += replacement->table.segments[i].duration_ms;
+    uint64_t mean_ms = replacement->entry_count == 0 ? 0
+        : total_ms / replacement->entry_count;
+    /* Bound the product: no live gap is anywhere near 2^40 ticks. */
+    const uint64_t limit = UINT64_C(1) << 40;
+    uint64_t rest = skipped - known;
+    uint64_t estimate = mean_ms != 0 && rest > limit / 90u / mean_ms
+        ? limit : (known_ms + rest * mean_ms) * 90u;
+    if (estimate > limit) estimate = limit;
+    uint64_t bound = (known_ms + total_ms) * 90u;
+    if (bound > limit) bound = limit;
+    if (!source->skip_pending) {
+        source->skip_pending = true;
+        source->skip_origin_valid = source->segment_origin_valid;
+        source->skip_origin90k = source->segment_origin90k;
+        source->skip_origin_base90k = source->segment_base90k;
+        source->skip_estimate90k = 0;
+        source->skip_bound90k = 0;
+    }
+    source->skip_estimate90k = estimate > limit - source->skip_estimate90k
+        ? limit : source->skip_estimate90k + estimate;
+    source->skip_bound90k = bound > limit - source->skip_bound90k
+        ? limit : source->skip_bound90k + bound;
+}
+
+/* Passes the current segment unfetched: it lies wholly in content the
+   other rendition skipped. */
+static void hls_live_pass_segment(MediaHlsSource *source)
+{
+    size_t index = source->segment_index;
+    source->live_timeline90k +=
+        (uint64_t) source->playlist->table.segments[index].duration_ms * 90u;
+    uint64_t sequence = hls_segment_sequence(source->playlist, index);
+    source->next_sequence = sequence == UINT64_MAX ? UINT64_MAX : sequence + 1u;
+    if (source->requests[1].handle != 0
+        && source->requests[1].segment <= index + 1u) {
+        source->transport.cancel(source->transport.opaque,
+                                 source->requests[1].handle);
+        source->requests[1] = (HlsRequest) {0};
+    }
+    source->segment_index = index + 1u;
+    /* Passing is progress: the stall limit is for a playlist that stops
+       advancing, and a long pass runs across refreshes that each add one
+       segment the source passes again. */
+    source->live_edge_since_us = 0;
+    if (source->segment_index < source->playlist->entry_count) {
+        source->playlist->table.segments[source->segment_index].flags |=
+            HLS_SEGMENT_DISCONTINUITY;
+    } else {
+        source->pass_discontinuity = true;
+        source->ended = source->playlist->end_list;
+    }
+    if (source->track_selection != MEDIA_HLS_TRACK_AUDIO)
+        source->await_keyframe = true;
+    if (source->stats.skipped_live_segments != SIZE_MAX)
+        source->stats.skipped_live_segments++;
 }
 
 static bool hls_apply_pending_playlist(MediaHlsSource *source)
@@ -1698,16 +2183,23 @@ static bool hls_apply_pending_playlist(MediaHlsSource *source)
         media_hls_playlist_destroy(replacement);
         return false;
     }
-    uint64_t selected_sequence = replacement->entries[selected].sequence;
+    uint64_t selected_sequence = hls_segment_sequence(replacement, selected);
     bool advanced = selected_sequence > source->next_sequence;
     if (advanced) {
-        uint64_t skipped = replacement->entries[selected].sequence
-            - source->next_sequence;
+        uint64_t skipped = selected_sequence - source->next_sequence;
         source->stats.skipped_live_segments =
             skipped > SIZE_MAX - source->stats.skipped_live_segments
                 ? SIZE_MAX
                 : source->stats.skipped_live_segments + (size_t) skipped;
-        replacement->entries[selected].discontinuity = true;
+        replacement->table.segments[selected].flags |=
+            HLS_SEGMENT_DISCONTINUITY;
+        if (source->live_started) hls_live_begin_skip(source, replacement,
+                                                      skipped);
+    }
+    if (source->pass_discontinuity) {
+        replacement->table.segments[selected].flags |=
+            HLS_SEGMENT_DISCONTINUITY;
+        source->pass_discontinuity = false;
     }
     media_hls_playlist_destroy(source->playlist);
     source->playlist = replacement;
@@ -1743,15 +2235,17 @@ static void hls_complete_segment(MediaHlsSource *source)
     source->live_segment_failures = 0;
     source->failed_sequence_valid = false;
     source->live_edge_since_us = 0;
-    const HlsEntry *completed =
-        &source->playlist->entries[source->segment_index];
+    const HlsSegment *completed =
+        &source->playlist->table.segments[source->segment_index];
     if (source->live_session) {
         uint64_t increment = (uint64_t) completed->duration_ms * 90u;
         source->live_timeline90k =
             increment > UINT64_MAX - source->live_timeline90k
                 ? UINT64_MAX : source->live_timeline90k + increment;
-        source->next_sequence = completed->sequence == UINT64_MAX
-            ? UINT64_MAX : completed->sequence + 1u;
+        uint64_t sequence = hls_segment_sequence(
+            source->playlist, source->segment_index);
+        source->next_sequence = sequence == UINT64_MAX
+            ? UINT64_MAX : sequence + 1u;
     }
     source->segment_index++;
     source->prefetch_refused = false;
@@ -1788,15 +2282,29 @@ static bool hls_pump(MediaHlsSource *source, uint64_t now_us)
         return false;
     }
     if (source->requests[0].handle == 0) {
+        while (source->segment_index < source->playlist->entry_count
+               && hls_live_span_covers(
+                      source, source->live_timeline90k,
+                      source->playlist->table.segments[source->segment_index]
+                          .duration_ms))
+            hls_live_pass_segment(source);
+        if (source->segment_index >= source->playlist->entry_count)
+            return true;
         (void) hls_start_request(source, 0u, source->segment_index);
         if (source->requests[0].handle == 0) return false;
     }
+    const HlsSegment *segments = source->playlist->table.segments;
     if (source->request_limit > 1u
         && source->requests[1].handle == 0
         && source->segment_index + 1u < source->playlist->entry_count
         && (!source->live_session
-            || source->segment_index + HLS_LIVE_REFRESH_RUNWAY_SEGMENTS + 1u
-                 < source->playlist->entry_count)) {
+            || (source->segment_index + HLS_LIVE_REFRESH_RUNWAY_SEGMENTS + 1u
+                    < source->playlist->entry_count
+                && !hls_live_span_covers(
+                       source, source->live_timeline90k
+                           + (uint64_t) segments[source->segment_index]
+                               .duration_ms * 90u,
+                       segments[source->segment_index + 1u].duration_ms)))) {
         (void) hls_start_request(source, 1u, source->segment_index + 1u);
     }
     hls_prepare_segment(source, source->segment_index);
@@ -1821,8 +2329,8 @@ static bool hls_pump(MediaHlsSource *source, uint64_t now_us)
         parse_capacity, &length, error, sizeof(error));
     if (result == MEDIA_HLS_TRANSPORT_WAIT) return false;
     if (result == MEDIA_HLS_TRANSPORT_ERROR) {
-        uint64_t failed_sequence = source->playlist->entries[
-            source->segment_index].sequence;
+        uint64_t failed_sequence = hls_segment_sequence(
+            source->playlist, source->segment_index);
         source->requests[0] = (HlsRequest) {0};
         if (source->live_session && source->live_segment_failures < 3u) {
             if (source->requests[1].handle != 0)
@@ -1858,6 +2366,19 @@ static bool hls_pump(MediaHlsSource *source, uint64_t now_us)
             source->audio_segment_kind = total != 0
                     && source->transport_chunk[0] == 0x47u
                 ? HLS_AUDIO_SEGMENT_TS : HLS_AUDIO_SEGMENT_ADTS;
+        }
+        if (source->track_selection == MEDIA_HLS_TRACK_MIXED
+            && !source->segment_head_checked && total >= 3u) {
+            /* Packed audio (ID3 then ADTS) is never TS; the demuxer would
+               find no packets and the open would wait for its watchdog. */
+            const unsigned char *head = source->transport_chunk;
+            source->segment_head_checked = true;
+            if (!source->video_info_valid
+                && ((head[0] == 'I' && head[1] == 'D' && head[2] == '3')
+                    || (head[0] == 0xffu && (head[1] & 0xf6u) == 0xf0u))) {
+                hls_source_fail(source, "%s", HLS_NO_VIDEO_FAILURE);
+                return false;
+            }
         }
         if (source->audio_segment_kind == HLS_AUDIO_SEGMENT_ADTS) {
             if (!hls_feed_adts_segment(source, total)) return false;
@@ -1920,6 +2441,12 @@ MediaHlsSource *media_hls_source_create_track(
         budget, BUDGET_CATEGORY_NAVIGATION, 1, sizeof(*source));
     SwdecTs *ts = budget_malloc_category(
         budget, BUDGET_CATEGORY_RESOURCE, sizeof(*ts));
+    /* An audio rendition never assembles video access units. */
+    size_t video_au_capacity = selection == MEDIA_HLS_TRACK_AUDIO
+        ? 0u : (size_t) SWDEC_TS_MAX_AU;
+    uint8_t *video_au = video_au_capacity == 0 ? NULL
+        : budget_malloc_category(
+              budget, BUDGET_CATEGORY_RESOURCE, video_au_capacity);
     size_t queue_capacity = selection == MEDIA_HLS_TRACK_AUDIO
         ? HLS_QUEUE_AUDIO_BYTES
         : selection == MEDIA_HLS_TRACK_VIDEO
@@ -1931,9 +2458,11 @@ MediaHlsSource *media_hls_source_create_track(
     unsigned char *chunk = budget_malloc_category(
         budget, BUDGET_CATEGORY_RESOURCE,
         MEDIA_HLS_TRANSPORT_CHUNK_BYTES + transport_tail_capacity);
-    if (source == NULL || ts == NULL || queue == NULL || chunk == NULL) {
+    if (source == NULL || ts == NULL || queue == NULL || chunk == NULL
+        || (video_au_capacity != 0 && video_au == NULL)) {
         budget_free(budget, chunk);
         budget_free(budget, queue);
+        budget_free(budget, video_au);
         budget_free(budget, ts);
         budget_free(budget, source);
         hls_error(error, error_size, "HLS source exceeds memory budget");
@@ -1961,10 +2490,11 @@ MediaHlsSource *media_hls_source_create_track(
         source->segment_index = playlist->entry_count > HLS_LIVE_EDGE_SEGMENTS
             ? playlist->entry_count - HLS_LIVE_EDGE_SEGMENTS : 0u;
         source->next_sequence =
-            playlist->entries[source->segment_index].sequence;
+            hls_segment_sequence(playlist, source->segment_index);
         source->seek_pristine = true;
     }
-    swdec_ts_init(ts, hls_video_callback, hls_audio_callback, source);
+    swdec_ts_init(ts, video_au, video_au_capacity,
+                  hls_video_callback, hls_audio_callback, source);
     return source;
 }
 
@@ -1985,6 +2515,127 @@ static bool hls_source_ready(const MediaHlsSource *source)
             && hls_queue_has_kind(source, MEDIA_MP4_TRACK_VIDEO);
 }
 
+static void hls_reset_queue(MediaHlsSource *source);
+
+/* Back to the start of `segment`, as a fresh live start: its first
+   origin becomes local time zero again. */
+static void hls_live_restart(MediaHlsSource *source, size_t segment)
+{
+    hls_cancel_requests(source);
+    hls_reset_queue(source);
+    swdec_ts_reset(source->ts);
+    source->segment_index = segment;
+    source->next_sequence = hls_segment_sequence(source->playlist, segment);
+    source->prepared_segment = SIZE_MAX;
+    source->transport_tail = 0;
+    source->live_timeline90k = 0;
+    source->last_audio_pts90k = 0;
+    source->start_origin_valid = false;
+    source->ended = false;
+    source->live_started = false;
+    source->skip_pending = false;
+    source->skip_span_count = 0;
+    source->skip_removed90k = 0;
+    source->live_queued_end90k = 0;
+    source->await_keyframe = false;
+    source->pass_discontinuity = false;
+}
+
+/* How long before the playlist's end the source's local time zero lies:
+   its current segment's distance from the end plus the local start of
+   that segment. */
+static int64_t hls_live_zero_before_end90k(const MediaHlsSource *source)
+{
+    int64_t before = (int64_t) source->live_timeline90k;
+    for (size_t i = source->segment_index;
+         i < source->playlist->entry_count; i++)
+        before += (int64_t) source->playlist->table.segments[i].duration_ms
+            * 90;
+    return before;
+}
+
+/* Pairs the renditions for window skips, on the audio's shifted time. No
+   skip precedes this: it runs as soon as both have primed, three segments
+   from the live edge. */
+static void hls_live_link(MediaHlsSource *video, MediaHlsSource *audio)
+{
+    video->live_partner = audio;
+    audio->live_partner = video;
+    audio->live_queued_end90k =
+        hls_live_shared(audio, audio->live_queued_end90k);
+}
+
+bool media_hls_source_align_live_start(MediaHlsSource *video,
+                                       MediaHlsSource *audio)
+{
+    if (video == NULL || audio == NULL || !video->live_session
+        || !audio->live_session || audio->live_align == HLS_LIVE_ALIGN_DONE)
+        return false;
+    /* Renditions number their segments independently and were fetched one
+       after the other, but matching content carries matching timestamps.
+       d is how far the audio's first unit lies after the video's first
+       picture, on the 33-bit clock. */
+    int64_t d = 0;
+    if (video->start_origin_valid && audio->start_origin_valid) {
+        uint64_t raw = (audio->start_origin90k - video->start_origin90k)
+            & HLS_PTS_MASK;
+        d = raw > (HLS_PTS_MASK >> 1)
+            ? (int64_t) raw - (int64_t) (HLS_PTS_MASK + 1u) : (int64_t) raw;
+    } else if (hls_source_ready(video) && hls_source_ready(audio)) {
+        /* Primed with no timestamp to compare: packed audio whose ID3 tag
+           lacks the PRIV timestamp RFC 8216 requires. The other evidence
+           the RFC gives is each segment's place on its playlist's
+           timeline; both playlists end at the live edge, so match the
+           two starts by their distance from the end. */
+        d = hls_live_zero_before_end90k(video)
+            - hls_live_zero_before_end90k(audio);
+    } else {
+        return false;
+    }
+    const HlsSegment *segments = audio->playlist->table.segments;
+    size_t count = audio->playlist->entry_count;
+    if (audio->live_align == HLS_LIVE_ALIGN_PENDING
+        && audio->segment_index < count) {
+        /* Whole segments first, from where the audio is now: its live
+           timeline is the local start of its current segment. Back while
+           sound would start more than HLS_AUDIO_FOLLOW_SLACK_US late,
+           forward while a whole segment would play before the picture. */
+        int64_t at = d + (int64_t) audio->live_timeline90k;
+        size_t index = audio->segment_index;
+        const int64_t slack = (int64_t) (HLS_AUDIO_FOLLOW_SLACK_US * 9u / 100u);
+        while (at > slack && index > 0)
+            at -= (int64_t) segments[--index].duration_ms * 90;
+        while (at < 0 && -at >= (int64_t) segments[index].duration_ms * 90
+               && index + 1u < count)
+            at += (int64_t) segments[index++].duration_ms * 90;
+        if (at > slack
+            || (at < 0 && -at >= (int64_t) segments[index].duration_ms * 90)) {
+            /* Not within the audio playlist: unrelated clocks. */
+            audio->live_align = HLS_LIVE_ALIGN_DONE;
+            return false;
+        }
+        if (index != audio->segment_index) {
+            hls_live_restart(audio, index);
+            audio->live_align = HLS_LIVE_ALIGN_RESEATED;
+            return true;
+        }
+    }
+    /* The rest is under a segment: shift the audio onto the video's clock,
+       dropping units that start before its first picture. */
+    audio->live_align = HLS_LIVE_ALIGN_DONE;
+    audio->start_shift90k = d;
+    hls_live_link(video, audio);
+    bool pristine = audio->seek_pristine;
+    while (audio->queue_count != 0 && d < 0
+           && audio->queue[audio->queue_head].raw_pts90k < (uint64_t) -d)
+        hls_release_head(audio);
+    audio->seek_pristine = pristine;
+    for (size_t i = 0; i < audio->queue_count; i++)
+        audio->queue[(audio->queue_head + i) % HLS_SAMPLE_LIMIT].raw_pts90k
+            += (uint64_t) d;
+    return !hls_source_ready(audio);
+}
+
 MediaHlsPrimeStatus media_hls_source_prime(
     MediaHlsSource *source, char *error, size_t error_size)
 {
@@ -2001,7 +2652,18 @@ MediaHlsPrimeStatus media_hls_source_prime(
         source->track_layout_known = true;
         return MEDIA_HLS_PRIME_READY;
     }
-    hls_pump(source, 0);
+    /* The open calls this once per main-loop frame. One step parses one
+       slice (one TS packet), so a first keyframe of S bytes took S/184
+       frames -- about 2 s for 20 KB at 60 fps, whatever the network speed.
+       Take steps until the source is ready, the transport waits, or
+       HLS_DELIVERY_VISIT_BYTES have been parsed; the step bound covers steps
+       that finish a segment without consuming bytes. */
+    size_t start = source->stats.bytes_received;
+    for (unsigned step = 0; step < HLS_PRIME_VISIT_STEPS; step++) {
+        if (!hls_pump(source, 0) || hls_source_ready(source)
+            || source->stats.bytes_received - start
+                   >= HLS_DELIVERY_VISIT_BYTES) break;
+    }
     if (source->failed) {
         hls_error(error, error_size, "%s", source->error);
         return MEDIA_HLS_PRIME_FAILED;
@@ -2295,7 +2957,8 @@ static size_t hls_segment_for_us(const MediaHlsSource *source,
     size_t selected = 0;
     for (size_t i = 0; i < source->playlist->entry_count; i++) {
         uint64_t next = cursor
-            + (uint64_t) source->playlist->entries[i].duration_ms * 1000u;
+            + (uint64_t) source->playlist->table.segments[i].duration_ms
+                * 1000u;
         if (strictly_after ? cursor > target_us : next > target_us) {
             selected = i;
             break;
@@ -2305,8 +2968,8 @@ static size_t hls_segment_for_us(const MediaHlsSource *source,
     }
     if (strictly_after && cursor <= target_us
         && selected + 1u < source->playlist->entry_count) {
-        cursor += (uint64_t) source->playlist->entries[selected].duration_ms
-            * 1000u;
+        cursor += (uint64_t)
+            source->playlist->table.segments[selected].duration_ms * 1000u;
         selected++;
     }
     if (actual_us != NULL) *actual_us = cursor;
@@ -2335,7 +2998,8 @@ static bool hls_seek_common(void *opaque, uint64_t target_us,
        ends just after it, start at the next one: sound then begins up to
        that slack late instead of after a whole extra segment's fetch. */
     uint64_t end_us = landing_us
-        + (uint64_t) source->playlist->entries[segment].duration_ms * 1000u;
+        + (uint64_t) source->playlist->table.segments[segment].duration_ms
+            * 1000u;
     if (source->track_selection == MEDIA_HLS_TRACK_AUDIO && !strictly_after
         && segment + 1u < source->playlist->entry_count
         && end_us > target_us
@@ -2359,7 +3023,8 @@ static bool hls_seek_common(void *opaque, uint64_t target_us,
         size_t last = source->prepared_segment > segment
             ? source->prepared_segment : segment;
         for (size_t i = first + 1u; i <= last; i++) {
-            if (source->playlist->entries[i].discontinuity) {
+            if (source->playlist->table.segments[i].flags
+                & HLS_SEGMENT_DISCONTINUITY) {
                 source->video_frame90k = 0;
                 break;
             }
@@ -2367,8 +3032,7 @@ static bool hls_seek_common(void *opaque, uint64_t target_us,
     }
     hls_cancel_requests(source);
     hls_reset_queue(source);
-    swdec_ts_init(
-        source->ts, hls_video_callback, hls_audio_callback, source);
+    swdec_ts_reset(source->ts);
     source->segment_index = segment;
     source->prepared_segment = SIZE_MAX;
     source->transport_tail = 0;
@@ -2501,12 +3165,15 @@ bool media_hls_source_failed(const MediaHlsSource *source)
 void media_hls_source_destroy(MediaHlsSource *source)
 {
     if (source == NULL) return;
+    if (source->live_partner != NULL)
+        source->live_partner->live_partner = NULL;
     hls_cancel_requests(source);
     Budget *budget = source->budget;
     media_hls_playlist_destroy(source->pending_playlist);
     media_hls_playlist_destroy(source->playlist);
     budget_free(budget, source->transport_chunk);
     budget_free(budget, source->queue_bytes);
+    budget_free(budget, source->ts->au_buf);
     budget_free(budget, source->ts);
     budget_free(budget, source);
 }

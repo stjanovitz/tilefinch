@@ -648,7 +648,7 @@ int main(int argc, char **argv)
         stream.itag, stream.width, stream.height, stream.content_length,
         stream.audio_itag, stream.audio_content_length, stream.duration_ms,
         stream.client_name, stream.client_attempts,
-        stream.watch_bytes, stream.player_bytes, stream.expires_unix);
+        stream.watch_bytes, stream.player_bytes, stream.expires_monotonic_s);
     printf("captions=%u selected=%d\n",
            (unsigned) stream.caption_track_count,
            (int) stream.selected_caption_track);

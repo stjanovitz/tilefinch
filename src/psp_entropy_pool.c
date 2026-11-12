@@ -128,9 +128,12 @@ uint32_t psp_entropy_estimate_millibits(uint32_t *samples, size_t count)
     uint32_t trials = (uint32_t) count;
     uint32_t worst = 0u;
 
-    /* Repeat-at-lag: catches constants, alternation and any short cycle a
-       scheduler tick or cache pattern could impose. */
-    for (uint32_t lag = 1u; lag <= PSP_ENTROPY_LAG_MAX; lag++) {
+    /* Repeat-at-lag: catches constants, alternation, any cycle a scheduler
+       tick or cache pattern could impose, and the near-repeats of a beat
+       between two clocks (see the header). */
+    uint32_t lag_max = trials / PSP_ENTROPY_LAG_DIVISOR;
+    if (lag_max > PSP_ENTROPY_LAG_MAX) lag_max = PSP_ENTROPY_LAG_MAX;
+    for (uint32_t lag = 1u; lag <= lag_max; lag++) {
         uint32_t hits = 0u;
         for (uint32_t index = lag; index < trials; index++) {
             if (samples[index] == samples[index - lag]) hits++;

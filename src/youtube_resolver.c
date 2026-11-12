@@ -1,4 +1,5 @@
 #include "tilefinch/youtube_resolver.h"
+#include "tilefinch/utf8_encode.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -52,6 +53,8 @@
     "Chrome/136.0.0.0 Safari/537.36"
 #define YOUTUBE_RESOLVER_MAXIMUM_CLIENTS 3u
 #define YOUTUBE_EXPIRY_MARGIN_SECONDS 300u
+/* A longer stated lifetime is not believed (current URLs live six hours). */
+#define YOUTUBE_LIFETIME_MAXIMUM_SECONDS (7u * 24u * 3600u)
 /*
  * The ladder is up to five fetches (three client profiles, the watch
  * document, one enriched player request) under a single phase deadline. Each
@@ -144,6 +147,11 @@ typedef struct {
     char url[YOUTUBE_MEDIA_URL_CAPACITY];
     char mime[YOUTUBE_MIME_CAPACITY];
     YoutubeTrack audio_track;
+    /* Carries drmFamilies: its bytes are encrypted, never selectable. */
+    bool drm;
+    /* A member did not fit its bound or was not a plain unsigned number:
+       this format is skipped, the rest of the inventory still counts. */
+    bool unusable;
 } YoutubeFormat;
 
 typedef struct {
@@ -380,12 +388,19 @@ static bool youtube_parse_format(YoutubeJson *json, YoutubeFormat *format)
         char key[64];
         if (!json_scan_member_key(json, key, sizeof(key))) return false;
         uint64_t number = 0;
+        YoutubeJson member = *json;
         if (strcmp(key, "url") == 0) {
-            if (!json_scan_string(json, format->url, sizeof(format->url)))
-                return false;
+            if (!json_scan_string(json, format->url, sizeof(format->url))) {
+                *json = member;
+                if (!json_skip_value(json, 1)) return false;
+                format->unusable = true;
+            }
         } else if (strcmp(key, "mimeType") == 0) {
-            if (!json_scan_string(json, format->mime, sizeof(format->mime)))
-                return false;
+            if (!json_scan_string(json, format->mime, sizeof(format->mime))) {
+                *json = member;
+                if (!json_skip_value(json, 1)) return false;
+                format->unusable = true;
+            }
         } else if (strcmp(key, "itag") == 0
                    || strcmp(key, "width") == 0
                    || strcmp(key, "height") == 0
@@ -393,7 +408,12 @@ static bool youtube_parse_format(YoutubeJson *json, YoutubeFormat *format)
                    || strcmp(key, "audioChannels") == 0
                    || strcmp(key, "contentLength") == 0
                    || strcmp(key, "approxDurationMs") == 0) {
-            if (!json_unsigned_value(json, &number)) return false;
+            if (!json_unsigned_value(json, &number)) {
+                *json = member;
+                if (!json_skip_value(json, 1)) return false;
+                format->unusable = true;
+                number = 0;
+            }
             if (strcmp(key, "itag") == 0 && number <= INT_MAX)
                 format->itag = (int) number;
             else if (strcmp(key, "width") == 0 && number <= INT_MAX)
@@ -412,6 +432,9 @@ static bool youtube_parse_format(YoutubeJson *json, YoutubeFormat *format)
         } else if (strcmp(key, "audioTrack") == 0) {
             if (!youtube_parse_audio_track_value(
                     json, &format->audio_track)) return false;
+        } else if (strcmp(key, "drmFamilies") == 0) {
+            format->drm = true;
+            if (!json_skip_value(json, 1)) return false;
         } else if (!json_skip_value(json, 1)) {
             return false;
         }
@@ -697,7 +720,11 @@ static bool youtube_parse_formats(
     while (json->at < json->end) {
         YoutubeFormat candidate;
         if (!youtube_parse_format(json, &candidate)) return false;
-        if (!adaptive
+        if (candidate.drm) {
+            /* Encrypted: neither a picture nor an audio track choice. */
+        } else if (candidate.unusable) {
+            /* Oversized or odd member: only this format is lost. */
+        } else if (!adaptive
             && youtube_format_supported(&candidate, maximum_height)
             && youtube_video_format_better(&candidate, selected)) {
             *selected = candidate;
@@ -878,7 +905,8 @@ static void youtube_caption_label(
     YoutubeJson text;
     if (youtube_object_span(value, &object, &length)
         && youtube_find_key(object, length, "simpleText", &text)) {
-        (void) json_scan_string(&text, label, YOUTUBE_TRACK_LABEL_CAPACITY);
+        (void) json_scan_string_copy(&text, label, YOUTUBE_TRACK_LABEL_CAPACITY,
+                                     JSON_SCAN_TRUNCATE, NULL);
         return;
     }
     YoutubeJson runs;
@@ -897,10 +925,12 @@ static void youtube_caption_label(
             || !json_skip_value(&after, 1)) return;
         if (youtube_find_key(run, run_length, "text", &text)) {
             char part[YOUTUBE_TRACK_LABEL_CAPACITY];
-            if (json_scan_string(&text, part, sizeof(part))) {
+            if (json_scan_string_copy(&text, part, sizeof(part),
+                                      JSON_SCAN_TRUNCATE, NULL)) {
                 size_t available = YOUTUBE_TRACK_LABEL_CAPACITY - used - 1u;
                 size_t copy = strlen(part);
-                if (copy > available) copy = available;
+                if (copy > available)
+                    copy = tilefinch_utf8_complete_prefix(part, available);
                 memcpy(label + used, part, copy);
                 used += copy;
                 label[used] = '\0';
@@ -1117,6 +1147,8 @@ const char *youtube_playability_name(YoutubePlayability playability)
         return "upcoming";
     case YOUTUBE_PLAYABILITY_UNAVAILABLE: return "unavailable";
     case YOUTUBE_PLAYABILITY_CLIENT_REJECTED: return "client-rejected";
+    case YOUTUBE_PLAYABILITY_DRM_PROTECTED: return "drm-protected";
+    case YOUTUBE_PLAYABILITY_PAYMENT_REQUIRED: return "payment-required";
     case YOUTUBE_PLAYABILITY_UNKNOWN:
     default:
         return "unknown";
@@ -1129,6 +1161,29 @@ bool youtube_playability_is_globally_terminal(
     return playability == YOUTUBE_PLAYABILITY_REGION_BLOCKED
         || playability == YOUTUBE_PLAYABILITY_LIVE_UNSUPPORTED
         || playability == YOUTUBE_PLAYABILITY_UPCOMING_UNSUPPORTED;
+}
+
+/* A verdict that tells the user what is wrong better than a later client's
+   refusal does, so the first one seen is kept for the final error. */
+static bool youtube_playability_actionable(YoutubePlayability playability)
+{
+    return playability == YOUTUBE_PLAYABILITY_AGE_RESTRICTED
+        || playability == YOUTUBE_PLAYABILITY_DRM_PROTECTED
+        || playability == YOUTUBE_PLAYABILITY_PAYMENT_REQUIRED;
+}
+
+/* Whether the kept verdict replaces the final client's. A refusal or an
+   unknown failure says less than either; a protected video also explains
+   a final client whose response held no usable format (verdict OK). */
+static bool youtube_actionable_explains(
+    YoutubePlayability actionable, YoutubePlayability final_verdict)
+{
+    return final_verdict == YOUTUBE_PLAYABILITY_UNKNOWN
+        || final_verdict == YOUTUBE_PLAYABILITY_LOGIN_REQUIRED
+        || final_verdict == YOUTUBE_PLAYABILITY_UNAVAILABLE
+        || final_verdict == YOUTUBE_PLAYABILITY_CLIENT_REJECTED
+        || (final_verdict == YOUTUBE_PLAYABILITY_OK
+            && actionable == YOUTUBE_PLAYABILITY_DRM_PROTECTED);
 }
 
 bool youtube_media_url_supported(const char *url)
@@ -1181,6 +1236,31 @@ static uint64_t youtube_url_expiry(const char *url)
         query = *end == '&' ? end + 1 : end;
     }
     return 0;
+}
+
+/* A response whose inventory names DRM: the IOS client's movies carry
+   drmParams and a FairPlay-only HLS manifest, the web clients' formats
+   carry drmFamilies, and licenseInfos names the license servers. A
+   response without one usable stream and with any of these is a protected
+   video, not a format gap. Not globally terminal: another client may still
+   be offered clear formats (some sessions get DRM on every TV video). */
+static bool youtube_fail_if_drm(
+    const char *streaming_json, size_t streaming_length,
+    YoutubePlayability *playability, char *error, size_t error_size)
+{
+    static const char *const keys[] = {
+        "drmParams", "drmFamilies", "licenseInfos"
+    };
+    YoutubeJson values[3];
+    bool found[3];
+    youtube_find_plain_keys(
+        streaming_json, streaming_length, keys, 3, values, found);
+    if (!found[0] && !found[1] && !found[2]) return false;
+    if (playability != NULL) *playability = YOUTUBE_PLAYABILITY_DRM_PROTECTED;
+    youtube_error(
+        error, error_size,
+        "playability: drm-protected: OK (offers only DRM-protected streams)");
+    return true;
 }
 
 static bool youtube_parse_player_response_diagnostic_with_scratch(
@@ -1253,7 +1333,22 @@ static bool youtube_parse_player_response_diagnostic_with_scratch(
             || youtube_find_key(
                    playability_json, playability_length, "offlineSlate",
                    &value);
-        if (youtube_ascii_contains(reason, "confirm your age")
+        /* The reason arrives in the requested language, so structure is
+           checked as well: an age gate names its legacy gate reason, and
+           a paid title's error screen carries a paid-content (YPC) trailer
+           renderer. Region and private refusals have no such marker and
+           are still read from English phrases. */
+        bool age_gate = youtube_find_key(
+            playability_json, playability_length,
+            "desktopLegacyAgeGateReason", &value);
+        bool paid_content = youtube_find_key(
+                playability_json, playability_length,
+                "playerLegacyDesktopYpcTrailerRenderer", &value)
+            || youtube_find_key(
+                playability_json, playability_length,
+                "ypcTrailerRenderer", &value);
+        if (age_gate
+            || youtube_ascii_contains(reason, "confirm your age")
             || youtube_ascii_contains(reason, "age-restricted")
             || youtube_ascii_contains(reason, "age restricted")
             || youtube_ascii_contains(
@@ -1264,6 +1359,9 @@ static bool youtube_parse_player_response_diagnostic_with_scratch(
         } else if (youtube_ascii_contains(reason, "country")
                    || youtube_ascii_contains(reason, "region")) {
             classified = YOUTUBE_PLAYABILITY_REGION_BLOCKED;
+        } else if (paid_content
+                   || youtube_ascii_contains(reason, "requires payment")) {
+            classified = YOUTUBE_PLAYABILITY_PAYMENT_REQUIRED;
         } else if (strcmp(status, "LOGIN_REQUIRED") == 0) {
             classified = YOUTUBE_PLAYABILITY_LOGIN_REQUIRED;
         } else if (upcoming) {
@@ -1318,6 +1416,13 @@ static bool youtube_parse_player_response_diagnostic_with_scratch(
         youtube_error(error, error_size, "format: no stream inventory");
         return false;
     }
+    /* The URLs' lifetime as the server counts it from this response. */
+    uint64_t lifetime_seconds = 0;
+    if (youtube_find_key(streaming_json, streaming_length,
+                         "expiresInSeconds", &value)
+        && json_unsigned_value(&value, &lifetime_seconds)
+        && lifetime_seconds <= YOUTUBE_LIFETIME_MAXIMUM_SECONDS)
+        parsed->lifetime_seconds = lifetime_seconds;
     bool have_hls_manifest = youtube_find_key(
         streaming_json, streaming_length, "hlsManifestUrl", &value);
     YoutubeJson hls_value = value;
@@ -1374,7 +1479,10 @@ static bool youtube_parse_player_response_diagnostic_with_scratch(
        HLS here is a format failure; the client ladder tries the next
        profile. */
     if (!have_progressive && !have_adaptive) {
-        youtube_error(error, error_size, "format: no stream inventory");
+        if (!youtube_fail_if_drm(
+                streaming_json, streaming_length, playability,
+                error, error_size))
+            youtube_error(error, error_size, "format: no stream inventory");
         return false;
     }
     bool progressive_delivery_is_sized =
@@ -1389,10 +1497,13 @@ static bool youtube_parse_player_response_diagnostic_with_scratch(
         memset(selected_audio, 0, sizeof(*selected_audio));
     }
     if (selected->url[0] == '\0') {
-        youtube_error(
-            error, error_size,
-            "format: no unciphered AVC video and AAC audio within %dp",
-            maximum_height);
+        if (!youtube_fail_if_drm(
+                streaming_json, streaming_length, playability,
+                error, error_size))
+            youtube_error(
+                error, error_size,
+                "format: no unciphered AVC video and AAC audio within %dp",
+                maximum_height);
         return false;
     }
     if (!youtube_media_url_supported(selected->url)
@@ -1917,21 +2028,33 @@ static bool youtube_finish_resolved_stream(
     size_t watch_bytes, long watch_status,
     YoutubeStream *stream, char *error, size_t error_size)
 {
-    uint64_t video_expiry = youtube_url_expiry(resolved->media_url);
-    uint64_t audio_expiry = resolved->split_streams
-        ? youtube_url_expiry(resolved->audio_url) : video_expiry;
-    uint64_t expiry = video_expiry;
-    if (expiry == 0 || (audio_expiry != 0 && audio_expiry < expiry))
-        expiry = audio_expiry;
-    uint64_t now = tilefinch_platform_wall_time_ns()
-                 / UINT64_C(1000000000);
-    if (expiry != 0 && expiry <= now + YOUTUBE_EXPIRY_MARGIN_SECONDS) {
+    /* How long the URLs serve from now. The response states it
+       (expiresInSeconds), so it is counted on the monotonic clock: the
+       URLs' expire= is server time, and comparing it with a PSP clock set
+       ahead (a wrong time zone is enough) rejected every fresh URL. Only a
+       response without a stated lifetime falls back to that comparison. */
+    uint64_t lifetime = resolved->lifetime_seconds;
+    if (lifetime == 0) {
+        uint64_t video_expiry = youtube_url_expiry(resolved->media_url);
+        uint64_t audio_expiry = resolved->split_streams
+            ? youtube_url_expiry(resolved->audio_url) : video_expiry;
+        uint64_t expiry = video_expiry;
+        if (expiry == 0 || (audio_expiry != 0 && audio_expiry < expiry))
+            expiry = audio_expiry;
+        uint64_t wall = tilefinch_platform_wall_time_ns()
+                      / UINT64_C(1000000000);
+        lifetime = expiry == 0 ? 0 : expiry > wall ? expiry - wall : 1u;
+    }
+    if (lifetime != 0 && lifetime <= YOUTUBE_EXPIRY_MARGIN_SECONDS) {
         youtube_error(
             error, error_size,
             "format: media URL expires too soon");
         return false;
     }
-    resolved->expires_unix = expiry;
+    uint64_t now = tilefinch_platform_monotonic_time_ns()
+                 / UINT64_C(1000000000);
+    resolved->expires_monotonic_s = lifetime == 0 ? 0
+        : lifetime > UINT64_MAX - now ? UINT64_MAX : now + lifetime;
     resolved->client_attempts = attempts;
     snprintf(
         resolved->client_name, sizeof(resolved->client_name),
@@ -2021,6 +2144,14 @@ struct YoutubeResolveJob {
     size_t admission_deferrals;
     FetchBackgroundEnqueueStatus last_admission_status;
     YoutubePlayability last_playability;
+    size_t request_builds;
+    size_t watch_scanned_bytes;
+    /* The prepared request belongs to this start phase and client while
+       prepared_ready is set, and carries these cookies. */
+    bool prepared_ready;
+    YoutubeResolvePhase prepared_phase;
+    size_t prepared_client;
+    uint64_t prepared_cookie_fingerprint;
     YoutubePreparedPlayerRequest prepared;
     YoutubeTrackPreferences track_preferences;
     FetchResult response;
@@ -2039,6 +2170,7 @@ struct YoutubeResolveJob {
     char watch_cookies[BROWSER_COOKIE_HEADER_CAPACITY];
     char last_error[256];
     char actionable_error[256];
+    YoutubePlayability actionable_playability;
     char error[256];
 };
 
@@ -2062,6 +2194,9 @@ static const char *youtube_admission_status_name(
     }
 }
 
+static void youtube_resolve_job_fail(
+    YoutubeResolveJob *job, const char *format, ...)
+    __attribute__((format(printf, 2, 3)));
 static void youtube_resolve_job_fail(
     YoutubeResolveJob *job, const char *format, ...)
 {
@@ -2138,6 +2273,7 @@ static YoutubeRequestStartStatus youtube_resolve_job_start_request(
             youtube_admission_status_name(admission));
         return YOUTUBE_REQUEST_START_FAILED;
     }
+    job->prepared_ready = false;
     fetch_result_destroy(&job->response);
     job->response = (FetchResult) {.budget = job->budget};
     job->request_started_ns = tilefinch_platform_monotonic_time_ns();
@@ -2238,13 +2374,44 @@ static void youtube_resolve_job_log_response(
 #endif
 }
 
+static bool youtube_resolve_job_scan_watch(YoutubeResolveJob *job);
+
 static bool youtube_resolve_job_take_watch_prefix(YoutubeResolveJob *job)
 {
     if (job == NULL || job->response.data == NULL
-        || job->response.length == 0) return false;
-    /* Each network chunk used to rescan the whole accumulated prefix for all
-       three keys, making a large watch page cumulative O(n^2). Scan only the
-       new suffix plus enough overlap for the largest admitted value. */
+        || job->response.length == 0
+        || !youtube_resolve_job_scan_watch(job)) return false;
+    job->watch_bytes = job->response.length;
+    job->watch_status = 0;
+#if !defined(TILEFINCH_NO_TRACE) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+    uint64_t now = tilefinch_platform_monotonic_time_ns();
+    uint64_t elapsed_us = now >= job->request_started_ns
+        ? (now - job->request_started_ns) / UINT64_C(1000) : 0;
+    printf("tilefinch-youtube-resolver: phase=watch-prefix ok=1 "
+           "bytes=%zu chunks=%zu pumps=%zu elapsed=%lluus\n",
+           job->response.length, job->request_chunks, job->request_pumps,
+           (unsigned long long) elapsed_us);
+#endif
+    (void) fetch_background_transport_cancel(
+        job->request_id, "watch configuration prefix complete");
+    job->request_id = 0;
+    fetch_result_destroy(&job->response);
+    job->enriched_from_cached_identity = false;
+    job->phase = YOUTUBE_RESOLVE_PHASE_ENRICHED_START;
+    return true;
+}
+
+/* Searches the watch bytes received since the last search for the player
+   configuration keys not yet held; true once all three are held. Each
+   network chunk used to rescan the whole accumulated prefix for all three
+   keys, making a large watch page cumulative O(n^2). Only the new suffix is
+   searched, plus enough overlap for the largest admitted value. */
+static bool youtube_resolve_job_scan_watch(YoutubeResolveJob *job)
+{
+    if (job->watch_have_visitor && job->watch_have_api_key
+        && job->watch_have_signature_timestamp) return true;
+    if (job->response.data == NULL
+        || job->watch_scan_offset >= job->response.length) return false;
     enum { YOUTUBE_WATCH_SCAN_OVERLAP = 2048 };
     size_t start = job->watch_scan_offset;
     if (start > job->response.length) start = job->response.length;
@@ -2252,6 +2419,10 @@ static bool youtube_resolve_job_take_watch_prefix(YoutubeResolveJob *job)
         ? start - YOUTUBE_WATCH_SCAN_OVERLAP : 0;
     const char *window = job->response.data + start;
     size_t window_length = job->response.length - start;
+    size_t missing = (job->watch_have_visitor ? 0u : 1u)
+        + (job->watch_have_api_key ? 0u : 1u)
+        + (job->watch_have_signature_timestamp ? 0u : 1u);
+    job->watch_scanned_bytes += missing * window_length;
     if (!job->watch_have_visitor) {
         char visitor[sizeof(job->visitor)] = {0};
         if (youtube_watch_string(
@@ -2281,26 +2452,8 @@ static bool youtube_resolve_job_take_watch_prefix(YoutubeResolveJob *job)
         }
     }
     job->watch_scan_offset = job->response.length;
-    if (!job->watch_have_visitor || !job->watch_have_api_key
-        || !job->watch_have_signature_timestamp) return false;
-    job->watch_bytes = job->response.length;
-    job->watch_status = 0;
-#if !defined(TILEFINCH_NO_TRACE) || defined(TILEFINCH_PSP_VALIDATION_LOG)
-    uint64_t now = tilefinch_platform_monotonic_time_ns();
-    uint64_t elapsed_us = now >= job->request_started_ns
-        ? (now - job->request_started_ns) / UINT64_C(1000) : 0;
-    printf("tilefinch-youtube-resolver: phase=watch-prefix ok=1 "
-           "bytes=%zu chunks=%zu pumps=%zu elapsed=%lluus\n",
-           job->response.length, job->request_chunks, job->request_pumps,
-           (unsigned long long) elapsed_us);
-#endif
-    (void) fetch_background_transport_cancel(
-        job->request_id, "watch configuration prefix complete");
-    job->request_id = 0;
-    fetch_result_destroy(&job->response);
-    job->enriched_from_cached_identity = false;
-    job->phase = YOUTUBE_RESOLVE_PHASE_ENRICHED_START;
-    return true;
+    return job->watch_have_visitor && job->watch_have_api_key
+        && job->watch_have_signature_timestamp;
 }
 
 static bool youtube_resolve_job_prepare_watch(YoutubeResolveJob *job)
@@ -2441,12 +2594,43 @@ bool youtube_resolve_job_set_track_preferences(
     if (safe.audio_language[0] == '\0')
         snprintf(safe.audio_language, sizeof(safe.audio_language), "%s", "en");
     job->track_preferences = safe;
+    job->prepared_ready = false;
     char cookie[128];
     snprintf(cookie, sizeof(cookie),
              "PREF=hl=%s&tz=UTC; Domain=.youtube.com; Path=/",
              safe.audio_language);
     (void) browser_session_cookie_set(
         job->session, job->canonical_watch, cookie);
+    return true;
+}
+
+/* Builds the player request of the current start phase once. While
+   transport admission defers the start, the same request is offered again
+   unless the cookies it would carry have changed since it was built. */
+static bool youtube_resolve_job_prepare(
+    YoutubeResolveJob *job, const YoutubeClientProfile *profile,
+    const char *api_key, const char *visitor, uint64_t signature_timestamp)
+{
+    uint64_t fingerprint = 0;
+    if (job->prepared_ready && job->prepared_phase == job->phase
+        && job->prepared_client == job->client_index
+        && browser_session_cookie_header_fingerprint_context(
+               job->session, &job->prepared.context, &fingerprint)
+        && fingerprint == job->prepared_cookie_fingerprint) return true;
+    job->prepared_ready = false;
+    job->request_builds++;
+    if (!youtube_prepare_player_request(
+            job->session, profile, job->canonical_watch,
+            job->video_id, api_key, visitor, signature_timestamp,
+            job->track_preferences.audio_language[0] == '\0'
+                ? "en" : job->track_preferences.audio_language,
+            &job->prepared,
+            job->last_error, sizeof(job->last_error))) return false;
+    job->prepared_phase = job->phase;
+    job->prepared_client = job->client_index;
+    job->prepared_ready = browser_session_cookie_header_fingerprint_context(
+        job->session, &job->prepared.context,
+        &job->prepared_cookie_fingerprint);
     return true;
 }
 
@@ -2484,13 +2668,7 @@ YoutubeResolveJobStatus youtube_resolve_job_pump(YoutubeResolveJob *job)
         }
         const YoutubeClientProfile *profile =
             &youtube_client_profiles[job->client_index];
-        if (!youtube_prepare_player_request(
-                job->session, profile, job->canonical_watch,
-                job->video_id, NULL, NULL, 0,
-                job->track_preferences.audio_language[0] == '\0'
-                    ? "en" : job->track_preferences.audio_language,
-                &job->prepared,
-                job->last_error, sizeof(job->last_error))) {
+        if (!youtube_resolve_job_prepare(job, profile, NULL, NULL, 0)) {
             youtube_resolve_job_fail(job, "%s", job->last_error);
             break;
         }
@@ -2528,11 +2706,12 @@ YoutubeResolveJobStatus youtube_resolve_job_pump(YoutubeResolveJob *job)
                 &job->caption_catalog,
                 job->last_error, sizeof(job->last_error));
             job->last_playability = classified;
-            if (classified == YOUTUBE_PLAYABILITY_AGE_RESTRICTED
+            if (youtube_playability_actionable(classified)
                 && job->actionable_error[0] == '\0') {
                 snprintf(job->actionable_error,
                          sizeof(job->actionable_error), "%s",
                          job->last_error);
+                job->actionable_playability = classified;
             }
             const YoutubeClientProfile *profile =
                 &youtube_client_profiles[job->client_index];
@@ -2587,26 +2766,15 @@ YoutubeResolveJobStatus youtube_resolve_job_pump(YoutubeResolveJob *job)
         youtube_accept_response_cookies(
             job->session, &job->watch_context,
             &job->response, job->canonical_watch);
-        if (!youtube_watch_string(
-                job->response.data, job->response.length, "VISITOR_DATA",
-                job->visitor, sizeof(job->visitor))
-            || !youtube_watch_string(
-                job->response.data, job->response.length,
-                "INNERTUBE_API_KEY", job->api_key, sizeof(job->api_key))
-            || !youtube_watch_unsigned(
-                job->response.data, job->response.length, "STS",
-                &job->signature_timestamp)) {
+        /* The prefix scan has searched every chunk taken while waiting;
+           only bytes the completed result added are searched here. A key
+           whose value was unsafe was never held, so it counts as omitted. */
+        if (!youtube_resolve_job_scan_watch(job)) {
             youtube_resolve_job_fail(
                 job, "watch: page omitted bounded player configuration"
                      " after %u client attempts (%s)",
                 job->attempts,
                 youtube_playability_name(job->last_playability));
-            break;
-        }
-        if (!youtube_header_value_safe(job->visitor)
-            || !youtube_api_token_safe(job->api_key, false)) {
-            youtube_resolve_job_fail(
-                job, "watch: player configuration was unsafe");
             break;
         }
         job->watch_bytes = job->response.length;
@@ -2620,14 +2788,9 @@ YoutubeResolveJobStatus youtube_resolve_job_pump(YoutubeResolveJob *job)
             &youtube_client_profiles[
                 sizeof(youtube_client_profiles)
                     / sizeof(youtube_client_profiles[0]) - 1u];
-        if (!youtube_prepare_player_request(
-                job->session, profile, job->canonical_watch,
-                job->video_id, job->api_key, job->visitor,
-                job->signature_timestamp,
-                job->track_preferences.audio_language[0] == '\0'
-                    ? "en" : job->track_preferences.audio_language,
-                &job->prepared,
-                job->last_error, sizeof(job->last_error))) {
+        if (!youtube_resolve_job_prepare(
+                job, profile, job->api_key, job->visitor,
+                job->signature_timestamp)) {
             youtube_resolve_job_fail(job, "%s", job->last_error);
             break;
         }
@@ -2694,10 +2857,8 @@ YoutubeResolveJobStatus youtube_resolve_job_pump(YoutubeResolveJob *job)
                 &job->stream, job->error, sizeof(job->error));
         }
         if (!parsed && job->actionable_error[0] != '\0'
-            && (classified == YOUTUBE_PLAYABILITY_UNKNOWN
-                || classified == YOUTUBE_PLAYABILITY_LOGIN_REQUIRED
-                || classified == YOUTUBE_PLAYABILITY_UNAVAILABLE
-                || classified == YOUTUBE_PLAYABILITY_CLIENT_REJECTED)) {
+            && youtube_actionable_explains(
+                job->actionable_playability, classified)) {
             snprintf(job->error, sizeof(job->error), "%s",
                      job->actionable_error);
         }
@@ -2792,7 +2953,9 @@ bool youtube_resolve_job_metrics(
         .response_bytes = job->response.length,
         .response_status = job->response.status_code,
         .request_active = job->request_id != 0,
-        .cached_identity = job->enriched_from_cached_identity
+        .cached_identity = job->enriched_from_cached_identity,
+        .request_builds = job->request_builds,
+        .watch_scanned_bytes = job->watch_scanned_bytes
     };
     return true;
 }
@@ -2926,6 +3089,7 @@ bool youtube_resolve_progressive_mp4_cancelable_with_preferences(
     size_t total_player_bytes = 0;
     char last_error[256] = {0};
     char actionable_error[256] = {0};
+    YoutubePlayability actionable_playability = YOUTUBE_PLAYABILITY_UNKNOWN;
     YoutubePlayability last_playability = YOUTUBE_PLAYABILITY_UNKNOWN;
     /* FetchResult carries bounded header/cookie arrays large enough to be a
        material PSP stack frame. One budget-owned response is reset and reused
@@ -2980,11 +3144,12 @@ bool youtube_resolve_progressive_mp4_cancelable_with_preferences(
                 &classified, &safe_preferences,
                 resolved, NULL, last_error, sizeof(last_error));
             last_playability = classified;
-            if (classified == YOUTUBE_PLAYABILITY_AGE_RESTRICTED
+            if (youtube_playability_actionable(classified)
                 && actionable_error[0] == '\0') {
                 snprintf(
                     actionable_error, sizeof(actionable_error),
                     "%s", last_error);
+                actionable_playability = classified;
             }
             if (parsed && youtube_accept_direct_stream(
                     resolved, &youtube_client_profiles[i], attempts,
@@ -3160,10 +3325,7 @@ bool youtube_resolve_progressive_mp4_cancelable_with_preferences(
         parsed = false;
     }
     if (!parsed && actionable_error[0] != '\0'
-        && (classified == YOUTUBE_PLAYABILITY_UNKNOWN
-            || classified == YOUTUBE_PLAYABILITY_LOGIN_REQUIRED
-            || classified == YOUTUBE_PLAYABILITY_UNAVAILABLE
-            || classified == YOUTUBE_PLAYABILITY_CLIENT_REJECTED)) {
+        && youtube_actionable_explains(actionable_playability, classified)) {
         youtube_error(error, error_size, "%s", actionable_error);
     }
     youtube_resolve_synchronous_scratch_free(budget, scratch);

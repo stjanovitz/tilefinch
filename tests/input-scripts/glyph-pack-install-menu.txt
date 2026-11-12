@@ -1,0 +1,28 @@
+# Install the Cyrillic pack through the menu, from recorded release responses
+# (scripts/record-glyph-pack-replay.py, a keyed trace, glyph-replay.cfg beside
+# its records). Start on the trace's Cyrillic page: blank boxes before the
+# install, Russian text after it with no reload. Selecting the page language
+# is what points the Language pack row at Cyrillic.
+
+wait 90
+mark-page page-before
+tap select
+press 4 down
+tap cross
+tap cross
+press 7 down
+tap cross
+wait 8
+mark glyph-options
+press 5 right
+wait 4
+press 2 down
+tap cross
+mark install-started
+wait 900
+mark install-ended
+tap select
+wait 90
+mark-page page-after
+wait 300
+end

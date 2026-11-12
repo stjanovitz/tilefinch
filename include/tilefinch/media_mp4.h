@@ -341,6 +341,18 @@ bool media_h264_avcc_sample_is_admitted(
 bool media_h264_annexb_sample_is_admitted(
     const unsigned char *payload, size_t length,
     uint16_t width, uint16_t height);
+/* The software decoder's per-unit rule: the geometry rule above, plus the
+   open-time coding rule (a routed profile, progressive 8-bit 4:2:0, see
+   media_h264_config_software_coding) for every in-band SPS. REFUSED covers
+   malformed units and a geometry change. */
+typedef enum {
+    MEDIA_H264_SAMPLE_ADMITTED = 0,
+    MEDIA_H264_SAMPLE_REFUSED,
+    MEDIA_H264_SAMPLE_CODING_UNSUPPORTED
+} MediaH264SampleVerdict;
+MediaH264SampleVerdict media_h264_annexb_software_sample_verdict(
+    const unsigned char *payload, size_t length,
+    uint16_t width, uint16_t height);
 /* Firmware decoders retain the parameter sets admitted at open. In addition
    to geometry, reject any in-band SPS/PPS which differs from that fixed
    Annex-B configuration. Access units without parameter sets remain valid. */

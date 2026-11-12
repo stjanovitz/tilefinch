@@ -96,7 +96,7 @@ static size_t navigation_mutation_image_refresh_nodes(
                     || strcmp(record->attribute, "style") == 0
                     || strcmp(record->attribute, "color") == 0
                     || strcmp(record->attribute, "hidden") == 0));
-        if (ancestor_style_change
+        if (ancestor_style_change && !record->keeps_images
             && !navigation_collect_image_descendants(
                 record->node, nodes, &count, capacity, &work, cancelled)) {
             if (bounded_out != NULL) *bounded_out = true;
@@ -104,6 +104,186 @@ static size_t navigation_mutation_image_refresh_nodes(
         }
     }
     return count;
+}
+
+#define NAVIGATION_IMAGE_DIRECT_REFRESH_LIMIT 16u
+
+/* Whether this turn wrote one of the attributes that choose `node`'s source. */
+static bool navigation_mutations_rewrote_source(
+    const ScriptMutationJournal *mutations, const lxb_dom_node_t *node)
+{
+    for (size_t i = 0; i < mutations->count; i++) {
+        const ScriptMutationRecord *record = &mutations->records[i];
+        if (record->node != node || record->kind != SCRIPT_MUTATION_ATTRIBUTE)
+            continue;
+        for (size_t a = 0;
+             a < sizeof(resource_fingerprint_attributes)
+                     / sizeof(resource_fingerprint_attributes[0]); a++) {
+            if (strcasecmp(record->attribute,
+                           resource_fingerprint_attributes[a]) == 0)
+                return true;
+        }
+    }
+    return false;
+}
+
+#define NAVIGATION_IMAGE_SCAN_ROOT_LIMIT 64u
+
+/* Adds `node` unless a root already holds it; the ones it holds go. False when
+   it cannot be named here. */
+static bool navigation_image_scan_root_add(
+    lxb_dom_node_t **roots, size_t *count, lxb_dom_node_t *node)
+{
+    size_t depth = 0;
+    bool nested = false, connected = false;
+    for (lxb_dom_node_t *at = node; at != NULL; at = at->parent) {
+        if (at->type == LXB_DOM_NODE_TYPE_DOCUMENT) connected = true;
+        if (at->type == LXB_DOM_NODE_TYPE_ELEMENT
+            && ++depth > IMAGE_SUBTREE_ANCESTOR_LIMIT) return false;
+        for (size_t r = 0; !nested && r < *count; r++)
+            nested = roots[r] == at;
+    }
+    if (nested || !connected) return true;
+    size_t kept = 0;
+    for (size_t r = 0; r < *count; r++) {
+        const lxb_dom_node_t *at = roots[r];
+        while (at != NULL && at != node) at = at->parent;
+        if (at == NULL) roots[kept++] = roots[r];
+    }
+    *count = kept;
+    if (*count == NAVIGATION_IMAGE_SCAN_ROOT_LIMIT) return false;
+    roots[(*count)++] = node;
+    return true;
+}
+
+/* The subtrees that hold everything that asked for additive image discovery:
+   an insertion, or an image-bearing or custom-property declaration on an
+   element. An insertion also moves what selectors see around it: the elements
+   after it (+, ~, :nth-child), the one before it (:last-child), and anything
+   above it through :has(). SIZE_MAX when they cannot be named here; the whole
+   document is then walked. Nested roots are dropped. */
+static size_t navigation_image_scan_roots(
+    const ScriptMutationJournal *mutations, lxb_dom_node_t **roots)
+{
+    size_t count = 0;
+    if (mutations->overflowed || mutations->conservative_resource_scan)
+        return SIZE_MAX;
+    for (size_t i = 0; i < mutations->count; i++) {
+        const ScriptMutationRecord *record = &mutations->records[i];
+        lxb_dom_node_t *node = record->node;
+        if (record->kind == SCRIPT_MUTATION_UNKNOWN) return SIZE_MAX;
+        /* A removal, and a text or comment child, brings no image. */
+        if (node == NULL || (node->type != LXB_DOM_NODE_TYPE_ELEMENT
+                             && node->type != LXB_DOM_NODE_TYPE_DOCUMENT_FRAGMENT))
+            continue;
+        if (!navigation_image_scan_root_add(roots, &count, node))
+            return SIZE_MAX;
+        if (record->kind != SCRIPT_MUTATION_CHILD_LIST) continue;
+        if (record->relational) return SIZE_MAX;
+        lxb_dom_node_t *before = node->prev;
+        while (before != NULL && before->type != LXB_DOM_NODE_TYPE_ELEMENT)
+            before = before->prev;
+        if (before != NULL
+            && !navigation_image_scan_root_add(roots, &count, before))
+            return SIZE_MAX;
+        for (lxb_dom_node_t *after = node->next; after != NULL; after = after->next)
+            if (after->type == LXB_DOM_NODE_TYPE_ELEMENT
+                && !navigation_image_scan_root_add(roots, &count, after))
+                return SIZE_MAX;
+    }
+    return count;
+}
+
+#define NAVIGATION_IMAGE_HOLD_NEAR_MS 250u
+#define NAVIGATION_IMAGE_HOLD_FAR_MS 1000u
+#define NAVIGATION_IMAGE_HOLD_LONGEST_MS 8000u
+
+/* How long a journal may wait for more of its kind: 0 unless every record is
+   an <img> source write on a laid-out element. Any of them could still change
+   its box, which is why it is only waited for and never skipped. */
+static unsigned navigation_image_hold_bound_ms(
+    const NavigationSession *session, const ScriptMutationJournal *mutations)
+{
+    const LayoutDocument *layout = &session->page.layout;
+    const NavigationEntry *entry = navigation_current(session);
+    if (entry == NULL || mutations->count == 0
+        || mutations->count >= NAVIGATION_IMAGE_DIRECT_REFRESH_LIMIT
+        || mutations->overflowed || mutations->resource_rebuild_required
+        || mutations->retirement_unobserved
+        || mutations->image_resource_scan_required
+        || mutations->conservative_resource_scan
+        || mutations->relational_selector_sensitive
+        || session->style_rebuild_required
+        || session->page.layout_provisional) return 0;
+    int viewport = session->viewport.css_height;
+    int64_t near_top = (int64_t) entry->scroll_y - viewport;
+    int64_t near_bottom = (int64_t) entry->scroll_y + 2 * (int64_t) viewport;
+    bool far = true;
+    for (size_t i = 0; i < mutations->count; i++) {
+        const ScriptMutationRecord *record = &mutations->records[i];
+        if (record->kind != SCRIPT_MUTATION_ATTRIBUTE
+            || !document_node_is_tag(record->node, LXB_TAG_IMG)
+            || (strcasecmp(record->attribute, "src") != 0
+                && strcasecmp(record->attribute, "srcset") != 0)) return 0;
+        const LayoutNodeBox *box = layout_box_for_node(layout, record->node);
+        if (box == NULL) return 0;
+        /* A fixed or sticky box's page position says nothing about where it
+           shows; below the viewport it has not reached it either way. */
+        if (box->y < near_bottom) {
+            if (box->y + box->height > near_top) far = false;
+            for (uint32_t c = box->command_start;
+                 far && c < box->command_end && c < layout->count; c++)
+                if ((layout->command_flags[c] & LAYOUT_COMMAND_UNTILED) != 0)
+                    far = false;
+            if (box->command_start >= box->command_end
+                && (layout->fixed_count != 0 || layout->sticky_count != 0))
+                far = false;
+        }
+    }
+    if (!far) return NAVIGATION_IMAGE_HOLD_NEAR_MS;
+    /* Relayouts stay a third of the time at most, on a page where each is
+       slower than the wait a fast one would get. */
+    uint64_t scaled = session->image_hold_relayout_us / 500u;
+    return scaled <= NAVIGATION_IMAGE_HOLD_FAR_MS ? NAVIGATION_IMAGE_HOLD_FAR_MS
+        : scaled >= NAVIGATION_IMAGE_HOLD_LONGEST_MS
+            ? NAVIGATION_IMAGE_HOLD_LONGEST_MS : (unsigned) scaled;
+}
+
+/* A page's failed thumbnails each rewrite one src from their own error event,
+   and each laid the whole page out alone (55 relayouts of about 6.7 s on the
+   device). While more script or resource work is coming, let those gather:
+   briefly near the viewport, longer away from it. Anything else in the journal
+   and any other relayout path ends the wait, and scrolling an image near ends
+   the longer one at the next turn. */
+static TILEFINCH_OUT_OF_LINE bool navigation_hold_image_changes(
+    NavigationSession *session, unsigned elapsed_ms)
+{
+    const ScriptResult *result = &session->page.script_result;
+    unsigned bound_ms = 0;
+    if (script_runtime_has_pending_mutations(session->page.runtime)
+        && (result->pending_tasks > result->root_timers
+            || result->async_network_pending_logical != 0
+            || result->root_pending_network != 0
+            || session->page.image_continuation_pending))
+        bound_ms = navigation_image_hold_bound_ms(
+            session, script_runtime_pending_journal(session->page.runtime));
+    if (bound_ms == 0) {
+        session->image_hold_active = false;
+        return false;
+    }
+    uint64_t now = navigation_now_us();
+    if (!session->image_hold_active) {
+        session->image_hold_active = true;
+        session->image_hold_started_us = now;
+        session->image_hold_clock_ms = 0;
+    }
+    session->image_hold_clock_ms += elapsed_ms;
+    if (session->image_hold_clock_ms >= bound_ms
+        || now - session->image_hold_started_us >= bound_ms * UINT64_C(1000)) {
+        session->image_hold_active = false;
+        return false;
+    }
+    return true;
 }
 
 /* The fingerprint covers resource elements' names and resource attributes
@@ -1356,6 +1536,10 @@ static bool navigation_mutations_keep_committed_layout_servable(
     return true;
 }
 
+#if !defined(TILEFINCH_NO_TRACE) && !defined(__PSP__)
+#include "navigation/style_append_verify.inc"
+#endif
+
 bool navigation_relayout(NavigationSession *session)
 {
     unsigned ledger = work_ledger_enter(WORK_LEDGER_LAYOUT);
@@ -1380,6 +1564,10 @@ bool navigation_relayout(NavigationSession *session)
     size_t injections_before =
         was_loaded ? session->budget->injected_failure_count : 0;
     ImageLayoutBoxes image_boxes;
+#if !defined(TILEFINCH_NO_TRACE) && !defined(__PSP__)
+    size_t verify_appends =
+        session == NULL ? 0 : session->performance.mutation_style_appends;
+#endif
     navigation_lend_image_boxes(session, &image_boxes);
     for (unsigned attempt = 0; attempt < 2u; attempt++) {
         bool restart = false;
@@ -1391,6 +1579,10 @@ bool navigation_relayout(NavigationSession *session)
     navigation_return_image_boxes(session, &image_boxes);
     if (retained_fonts != NULL)
         stylesheet_release_web_fonts(session->budget, retained_fonts);
+#if !defined(TILEFINCH_NO_TRACE) && !defined(__PSP__)
+    if (ok && session->performance.mutation_style_appends != verify_appends)
+        navigation_verify_style_append(session);
+#endif
     /* A refused update that retired the page says why when memory refused
        it: the frontend otherwise has only "page update failed". Synthetic
        faults keep that generic report. */
@@ -1698,7 +1890,8 @@ static TILEFINCH_OUT_OF_LINE bool navigation_relayout_incremental(
        borrowed image storage before ownership can move to presentation. */
     bool geometry_adopted = plan->mutation_driven && !provisional
         && !plan->style_append_tried && !plan->image_rebuild
-        && !plan->image_resource_scan && !plan->image_resource_refresh
+        && !plan->image_resource_scan
+        && (!plan->image_resource_refresh || plan->image_table_unchanged)
         && !mutations->overflowed && !mutations->retirement_unobserved
         && !mutations->resource_rebuild_required
         && script_runtime_take_geometry_layout(session->page.runtime,
@@ -2249,6 +2442,7 @@ static bool navigation_relayout_body(NavigationSession *session,
     bool mutation_driven = session->page.runtime != NULL
         && script_runtime_consume_mutations(session->page.runtime,
                                             &mutations);
+    session->image_hold_active = false;
     if (mutation_driven) {
         for (size_t i = 0; i < mutations.count; i++) {
             if (mutations.records[i].kind == SCRIPT_MUTATION_CANVAS) {
@@ -2279,6 +2473,7 @@ static bool navigation_relayout_body(NavigationSession *session,
             script_runtime_pause_image_preloads(session->page.frames[i].runtime);
     }
     bool appended_images = false, style_append_done = false;
+    NavigationStyleImageScope appended_scope = {.whole_document = true};
 #if NAVIGATION_RELAYOUT_PHASE_LOG
     const NavigationPerformance *counters = &session->performance;
     uint64_t append_before[5] = {
@@ -2298,7 +2493,7 @@ static bool navigation_relayout_body(NavigationSession *session,
 #endif
             && navigation_try_append_style_sources(
                    session, &mutations, mutations.image_rebuild_required,
-                   &appended_images)) {
+                   &appended_images, &appended_scope)) {
             sheet_settled = true;
             style_append_done = true;
         }
@@ -2338,6 +2533,10 @@ static bool navigation_relayout_body(NavigationSession *session,
                                                 &journal_reuse_prepared, local_focus)) {
         session->performance.hidden_relayout_skips++;
         return true;
+    }
+    if (plan.mutation_driven && mutations.image_reveal_possible) {
+        session->page.image_reveal_armed = true;
+        session->page.image_reveal_look = true;
     }
     uint64_t fingerprint = session->resource_fingerprint;
     if (mutations.overflowed) {
@@ -2425,6 +2624,11 @@ static bool navigation_relayout_body(NavigationSession *session,
             : session->page.document_url;
         bool images_loaded = document_url != NULL;
         bool scan_for_additions = plan.image_resource_scan;
+        /* A new sheet's rules can reach any element, unless the sheets
+           that changed are adopted by shadow roots alone: their rules
+           reach only those hosts' subtrees, scanned with the journal's. */
+        bool journal_scan_only = !plan.image_rebuild
+            && (!appended_images || !appended_scope.whole_document);
         if (images_loaded && plan.image_resource_refresh) {
             lxb_dom_node_t *candidates[SCRIPT_MUTATION_JOURNAL_LIMIT];
             lxb_dom_node_t *refresh[SCRIPT_MUTATION_JOURNAL_LIMIT];
@@ -2440,7 +2644,7 @@ static bool navigation_relayout_body(NavigationSession *session,
                 plan.image_rebuild = true;
                 images_loaded = false;
             }
-            size_t refresh_count = 0;
+            size_t refresh_count = 0, missing_count = 0;
             for (size_t i = 0;
                  !refresh_bounded_out && i < candidate_count; i++) {
                 if (images_find_node(
@@ -2464,11 +2668,19 @@ static bool navigation_relayout_body(NavigationSession *session,
                        discovery. Let attach_layout re-rank/re-arm it; do
                        not turn a disclosure input into synchronous fetch. */
                     if (queued) continue;
-                    /* Frameworks commonly connect a lazy <img> before
-                       assigning src. There is no stale surface to retire;
-                       let the deduplicating additive traversal discover it
-                       alongside any CSS image in the new subtree. */
-                    scan_for_additions = true;
+                    /* An image with no entry has no stale surface to retire:
+                       a lazy <img> a framework has just given a src, one an
+                       ancestor's change reveals, or one that failed. A few
+                       are examined by themselves below (a new subtree's CSS
+                       images are image_resource_scan's). One that failed
+                       stays failed until its source changes. */
+                    if (!images_node_failed(
+                            &session->page.images, candidates[i])
+                        || navigation_mutations_rewrote_source(
+                               &mutations, candidates[i])) {
+                        refresh[refresh_count++] = candidates[i];
+                        missing_count++;
+                    }
                 } else {
                     /* Ancestor visibility/color changes need not discard a
                        decoded photograph. Only a direct image mutation can
@@ -2478,6 +2690,21 @@ static bool navigation_relayout_body(NavigationSession *session,
                         direct_image_change = mutations.records[m].node == candidates[i];
                     if (direct_image_change) refresh[refresh_count++] = candidates[i];
                 }
+            }
+            /* Many of them cost as much as the additive traversal, and only it
+               can admit part of what a table near its bound cannot hold. A
+               full table can admit nothing, whichever walks to it. */
+            size_t room = session->page.images.count < IMAGE_TRACKED_NODE_LIMIT
+                ? IMAGE_TRACKED_NODE_LIMIT - session->page.images.count : 0;
+            if (missing_count > NAVIGATION_IMAGE_DIRECT_REFRESH_LIMIT
+                || missing_count > room) {
+                scan_for_additions = scan_for_additions || room != 0;
+                journal_scan_only = false;
+                size_t kept = 0;
+                for (size_t i = 0; i < refresh_count; i++)
+                    if (images_find_node(&session->page.images, refresh[i]) != NULL)
+                        refresh[kept++] = refresh[i];
+                refresh_count = kept;
             }
             if (!refresh_bounded_out) {
                 images_loaded =
@@ -2495,9 +2722,43 @@ static bool navigation_relayout_body(NavigationSession *session,
                     session->page.resource_scheduler,
                     session->browser_session, session->page.layout_reuse,
                     session->fonts, session->viewport.css_width);
+                plan.image_table_unchanged = images_loaded && refresh_count == 0
+                    && !scan_for_additions;
             }
         }
-        if (images_loaded && scan_for_additions) {
+        /* A full table can admit nothing, whichever walks to it. */
+        if (session->page.images.count >= IMAGE_TRACKED_NODE_LIMIT)
+            scan_for_additions = false;
+        lxb_dom_node_t *scan_roots[NAVIGATION_IMAGE_SCAN_ROOT_LIMIT];
+        size_t scan_root_count = images_loaded && scan_for_additions
+            && journal_scan_only
+            ? navigation_image_scan_roots(&mutations, scan_roots) : SIZE_MAX;
+        for (size_t h = 0; appended_images && scan_root_count != SIZE_MAX
+             && h < appended_scope.count; h++) {
+            if (!navigation_image_scan_root_add(scan_roots, &scan_root_count,
+                                                appended_scope.hosts[h]))
+                scan_root_count = SIZE_MAX;
+        }
+        if (appended_images && scan_root_count != SIZE_MAX)
+            session->performance.style_append_scoped_image_scans++;
+        if (scan_root_count != SIZE_MAX) {
+            navigation_ensure_layout_reuse(session);
+            lxb_dom_node_t *deferred[NAVIGATION_VISIBLE_IMAGE_PRIORITY_LIMIT];
+            size_t deferred_count = navigation_live_deferred_nodes(&session->page, deferred);
+            images_loaded = images_load_external_within_subtrees(
+                &session->page.document, &session->page.stylesheet,
+                &session->page.images, scan_roots, scan_root_count,
+                session->budget,
+                session->page.resource_base_url, document_url,
+                session->page.referrer_policy,
+                session->maximum_images, session->maximum_image_bytes,
+                session->maximum_image_file_bytes,
+                session->maximum_decoded_image_bytes,
+                session->resource_timeout_ms,
+                session->page.resource_scheduler,
+                session->browser_session, session->page.layout_reuse,
+                session->fonts, session->viewport.css_width, deferred, deferred_count);
+        } else if (images_loaded && scan_for_additions) {
             navigation_ensure_layout_reuse(session);
             lxb_dom_node_t *deferred[NAVIGATION_VISIBLE_IMAGE_PRIORITY_LIMIT];
             size_t deferred_count = navigation_live_deferred_nodes(&session->page, deferred);

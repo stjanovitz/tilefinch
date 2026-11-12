@@ -342,6 +342,16 @@ static void menu_update_site_controls(
                     ui->mixed_content_site_allowed;
                 break;
             case 6: {
+                /* Ask -> Allow -> Block -> Ask, in BrowserInsecureAudioAnswer
+                   order; held for this session only. */
+                ui->insecure_audio_site_answer =
+                    (ui->insecure_audio_site_answer + 1u) % 3u;
+                intent->setting.id = PSP_UI_SETTING_INSECURE_AUDIO_SITE;
+                intent->setting.value.unsigned_value =
+                    ui->insecure_audio_site_answer;
+                break;
+            }
+            case 7: {
                 /* Ask -> Memory Stick -> RAM only -> Ask; a this-session
                    grant (3) steps to Memory Stick, making it permanent. */
                 static const uint8_t next[4] = {

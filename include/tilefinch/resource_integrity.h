@@ -35,6 +35,22 @@ void tilefinch_sha512_update(TilefinchSha512 *context,
 /* Writes 48 (SHA-384) or 64 bytes. */
 bool tilefinch_sha512_finish(TilefinchSha512 *context, uint8_t output[64]);
 
+/* WebCrypto SubtleCrypto.digest algorithms. SHA-1 is kept only because
+   pages still use it for non-security identifiers (request and session
+   keys); it is never used for integrity checks. */
+typedef enum {
+    TILEFINCH_WEB_DIGEST_SHA1 = 0,
+    TILEFINCH_WEB_DIGEST_SHA256,
+    TILEFINCH_WEB_DIGEST_SHA384,
+    TILEFINCH_WEB_DIGEST_SHA512
+} TilefinchWebDigest;
+
+/* Writes the digest of bytes into output and returns its length (20, 32,
+   48 or 64), or 0 on failure. */
+size_t tilefinch_web_digest(TilefinchWebDigest algorithm,
+                            const uint8_t *bytes, size_t length,
+                            uint8_t output[64]);
+
 /* One recognized token of an `integrity` attribute's metadata (SRI
    "parse metadata"): tokens are separated by ASCII whitespace, options
    after '?' are dropped, and tokens of unknown algorithms are skipped. The

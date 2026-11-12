@@ -29,7 +29,9 @@
 #include "tilefinch/budget.h"
 #include "tilefinch/fetch.h"
 #include "tilefinch/media_replay_check.h"
+#include "tilefinch/platform.h"
 #include "tilefinch/session.h"
+#include "../src/tilefinch_test_faults.h"
 
 static int failures;
 
@@ -278,6 +280,112 @@ static bool add_hashed_record(const char *url, const void *body,
         && write_file(path, meta, (size_t) used);
 }
 
+/* One recorded hop of an updater request, in the shape the hop machine asks
+   for (scripts/record-glyph-pack-replay.py writes the same record). A record
+   is matched on every non-blank request field, so the wrong Accept or
+   User-Agent would not be served. */
+static bool add_hop_record(const char *url, long status, const char *location,
+                           const void *body, size_t length)
+{
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (size_t at = 0; at < length; at++) {
+        hash ^= ((const unsigned char *) body)[at];
+        hash *= UINT64_C(1099511628211);
+    }
+    char path[1200];
+    snprintf(path, sizeof(path), "%s/%04zu.body", trace_dir, record_count);
+    if (!write_file(path, body, length)) return false;
+    char meta[8192];
+    int used = snprintf(meta, sizeof(meta),
+        "psp-http-trace=10\ncookie-values=redacted\nmethod=GET\nurl=%s\n"
+        "logical-request-url=%s\nsuccess=1\nasync-delay-pumps=0\n"
+        "external-cancel=0\ntransport-timeout=0\n"
+        "redirect-origin-tainted=0\nerror=\nrequest-body-length=0\n"
+        "request-body-hash=cbf29ce484222325\nrequest-content-type=\n"
+        "request-cookie-bytes=0\nrequest-has-cf-clearance=0\n"
+        "request-extra-header-bytes=0\nrequest-extra-header-shape=\n"
+        "request-allow-http-errors=0\nrequest-enforce-cors=0\n"
+        "request-redirect-same-origin-only=0\n"
+        "request-cors-cached-response-validated=0\nrequest-if-none-match=\n"
+        "request-if-modified-since=\nrequest-referer=\nrequest-origin=\n"
+        "request-accept=application/octet-stream\n"
+        "request-sec-fetch-dest=\nrequest-sec-fetch-mode=\n"
+        "request-sec-fetch-site=\nrequest-send-client-hints=0\n"
+        "request-client-hint-tokens=\nrequest-client-hint-origin=\n"
+        "request-send-low-client-hints=0\nrequest-sec-fetch-user=0\n"
+        "request-upgrade-insecure=0\nrequest-user-agent=Tilefinch-Updater/1\n"
+        "request-diagnostic-mobile-safari=0\nrequest-credentials=0\n"
+        "request-credential-origin=\nrequest-initiator-url=\n"
+        "request-referrer-source=\nrequest-referrer-policy=\n"
+        "status=%ld\nlength=%zu\nresponse-body-hash=%016llx\n"
+        "effective-url=%s\ncontent-type=application/octet-stream\netag=\n"
+        "last-modified=\ncf-mitigated=\naccept-ch=\ncritical-ch=\n"
+        "server=fixture\ncf-ray=\n"
+        "response-referrer-policy-metadata-valid=1\n"
+        "response-referrer-policy-present=0\nresponse-referrer-policy=\n"
+        "response-security-headers-truncated=0\nset-cookie-count=0\n"
+        "response-header-count=2\n"
+        "response-header-0=content-type: application/octet-stream\n"
+        "response-header-1=%s%s\n",
+        url, url, status, length, (unsigned long long) hash, url,
+        location == NULL ? "x-fixture: 1" : "location: ",
+        location == NULL ? "" : location);
+    snprintf(path, sizeof(path), "%s/%04zu.meta", trace_dir, record_count);
+    record_count++;
+    return used > 0 && (size_t) used < sizeof(meta)
+        && write_file(path, meta, (size_t) used);
+}
+
+#define RELEASE_LATEST \
+    "https://github.com/owner/models/releases/latest/download/pack.tfgm"
+#define RELEASE_TAGGED \
+    "https://github.com/owner/models/releases/download/v8/pack.tfgm"
+#define RELEASE_ASSET \
+    "https://release-assets.githubusercontent.com/asset/1/pack.tfgm?sig=a"
+#define RELEASE_STRAY \
+    "https://github.com/owner/models/releases/latest/download/stray.tfgm"
+#define RELEASE_OUTSIDE "https://media.test/outside.tfgm"
+static const char release_body[] = "the signed bytes";
+
+/* Two release downloads larger than one pump's body quota. */
+#define QUOTA_BYTES 40000u
+#define QUOTA_START_A \
+    "https://github.com/owner/models/releases/download/v8/a.tfgm"
+#define QUOTA_ASSET_A \
+    "https://release-assets.githubusercontent.com/asset/2/a.tfgm?sig=a"
+#define QUOTA_START_B \
+    "https://github.com/owner/models/releases/download/v8/b.tfgm"
+#define QUOTA_ASSET_B \
+    "https://release-assets.githubusercontent.com/asset/3/b.tfgm?sig=b"
+static unsigned char quota_body[QUOTA_BYTES];
+/* A streamed release download for a consumer with a small buffer. */
+#define CAPACITY_START \
+    "https://github.com/owner/models/releases/download/v8/c.tfgm"
+#define CAPACITY_ASSET \
+    "https://release-assets.githubusercontent.com/asset/4/c.tfgm?sig=c"
+static unsigned char capacity_body[QUOTA_BYTES];
+
+static bool build_release_chain(void)
+{
+    memset(quota_body, 'q', sizeof(quota_body));
+    for (size_t i = 0; i < sizeof(capacity_body); i++)
+        capacity_body[i] = (unsigned char) ('a' + (i * 7u + i / 251u) % 26u);
+    return add_hop_record(QUOTA_START_A, 302, QUOTA_ASSET_A, "", 0)
+        && add_hop_record(CAPACITY_START, 302, CAPACITY_ASSET, "", 0)
+        && add_hop_record(CAPACITY_ASSET, 200, NULL, capacity_body,
+                          QUOTA_BYTES)
+        && add_hop_record(QUOTA_ASSET_A, 200, NULL, quota_body, QUOTA_BYTES)
+        && add_hop_record(QUOTA_START_B, 302, QUOTA_ASSET_B, "", 0)
+        && add_hop_record(QUOTA_ASSET_B, 200, NULL, quota_body, QUOTA_BYTES)
+        && add_hop_record(RELEASE_LATEST, 302, RELEASE_TAGGED, "", 0)
+        && add_hop_record(RELEASE_TAGGED, 302, RELEASE_ASSET, "", 0)
+        && add_hop_record(RELEASE_ASSET, 200, NULL, release_body,
+                          sizeof(release_body) - 1u)
+        && add_hop_record(RELEASE_STRAY, 302, RELEASE_OUTSIDE, "", 0)
+        && add_hop_record(RELEASE_OUTSIDE, 200, NULL, release_body,
+                          sizeof(release_body) - 1u);
+}
+
 #define HASHED_BYTES 40000u
 #define HASHED_GOOD CDN "hashed/good.ts"
 #define HASHED_BAD CDN "hashed/bad.ts"
@@ -369,7 +477,7 @@ static bool build_trace(const unsigned char *mp4, size_t mp4_length)
     ok = ok
         && add_record(CLIP, CLIP, 200, "video/mp4", NULL, mp4, mp4_length)
         && add_record(PART, PART, 206, "video/mp4", part_range, mp4, half);
-    return ok && finish_trace();
+    return ok && build_release_chain() && finish_trace();
 }
 
 /* ---- Direct lane requests -------------------------------------------- */
@@ -512,6 +620,450 @@ static size_t decoder_config(unsigned char *out, const unsigned char *sps,
 
 /* The decoder the PSP open path picks for page video, by profile, level
    and picture shape. */
+/* ---- The updater's redirect chain ------------------------------------- */
+static bool release_fetch(Budget *budget, const char *url, FetchResult *result,
+                          bool *success)
+{
+    FetchScheduler *scheduler = fetch_scheduler_create(budget, 1u, 65536u);
+    if (scheduler == NULL
+        || !fetch_scheduler_enable_background_transport(scheduler, true)) {
+        fetch_scheduler_destroy(scheduler);
+        return false;
+    }
+    FetchRequest request = {
+        .method = "GET",
+        .accept = "application/octet-stream",
+        .credentials = FETCH_CREDENTIALS_OMIT,
+        .identity_encoding = true,
+        .redirect_policy = FETCH_REDIRECT_GITHUB_RELEASE,
+        .user_agent = "Tilefinch-Updater/1"
+    };
+    uint64_t id = fetch_scheduler_enqueue(scheduler, url, &request, 4096u,
+                                          30000);
+    bool taken = false;
+    for (unsigned pump = 0; id != 0 && pump < 64u && !taken; pump++) {
+        (void) fetch_scheduler_pump(scheduler, 1u, 0u);
+        taken = fetch_scheduler_take(scheduler, id, success, result);
+    }
+    fetch_scheduler_destroy(scheduler);
+    return taken;
+}
+
+/* A recorded release download runs the hop machine: one recorded response per
+   hop, so the redirects are really followed and really policed. */
+static void test_release_redirect_chain(Budget *budget)
+{
+    FetchTraceReplayStats before, after;
+    CHECK(fetch_trace_replay_stats(&before));
+    FetchResult *result = fetch_result_create(budget);
+    CHECK(result != NULL);
+    if (result == NULL) return;
+    bool success = false;
+    CHECK(release_fetch(budget, RELEASE_LATEST, result, &success));
+    CHECK(success);
+    CHECK(result->status_code == 200);
+    CHECK(result->length == sizeof(release_body) - 1u
+          && memcmp(result->data, release_body, result->length) == 0);
+    CHECK(strcmp(result->effective_url, RELEASE_ASSET) == 0);
+    CHECK(fetch_trace_replay_stats(&after));
+    /* 302, 302, 200: three lane answers, not one whole-response replay. */
+    CHECK(after.media_lane_request_count
+          == before.media_lane_request_count + 3u);
+    CHECK(after.media_lane_served_count
+          == before.media_lane_served_count + 3u);
+    fetch_result_destroy(result);
+
+    /* The recording cannot talk the client off the release hosts, although
+       it holds a response for the forbidden URL. */
+    success = true;
+    before = after;
+    CHECK(release_fetch(budget, RELEASE_STRAY, result, &success));
+    CHECK(!success);
+    CHECK(strstr(result->error, "redirect target") != NULL);
+    CHECK(fetch_trace_replay_stats(&after));
+    CHECK(after.media_lane_request_count
+          == before.media_lane_request_count + 1u);
+    fetch_result_destroy(result);
+    fetch_result_free(result);
+}
+
+static const FetchRequest release_request = {
+    .method = "GET",
+    .accept = "application/octet-stream",
+    .credentials = FETCH_CREDENTIALS_OMIT,
+    .identity_encoding = true,
+    .redirect_policy = FETCH_REDIRECT_GITHUB_RELEASE,
+    .user_agent = "Tilefinch-Updater/1"
+};
+
+/* Enqueues a release download and reports whether its first hop went to
+   the worker (here the replay lane). One that did not is on the host's
+   browser-thread curl path: it is cancelled before any pump, so it never
+   reaches the network. */
+static uint64_t release_enqueue_on_worker(FetchScheduler *scheduler,
+                                          bool *on_worker)
+{
+    FetchTraceReplayStats before, after;
+    CHECK(fetch_trace_replay_stats(&before));
+    uint64_t id = fetch_scheduler_enqueue(scheduler, RELEASE_LATEST,
+                                          &release_request, 4096u, 30000);
+    CHECK(fetch_trace_replay_stats(&after));
+    *on_worker = id != 0 && after.media_lane_request_count
+                                == before.media_lane_request_count + 1u;
+    if (id != 0 && !*on_worker) {
+        (void) fetch_scheduler_cancel(scheduler, id, "test: not on worker");
+        bool ignored = false;
+        FetchResult result = {0};
+        if (fetch_scheduler_take(scheduler, id, &ignored, &result))
+            fetch_result_destroy(&result);
+        return 0;
+    }
+    return id;
+}
+
+static bool release_finish(FetchScheduler *scheduler, uint64_t id)
+{
+    bool success = false, taken = false;
+    FetchResult result = {0};
+    for (unsigned pump = 0; id != 0 && pump < 64u && !taken; pump++) {
+        (void) fetch_scheduler_pump(scheduler, 1u, 0u);
+        taken = fetch_scheduler_take(scheduler, id, &success, &result);
+    }
+    bool whole = taken && success && result.status_code == 200
+        && result.length == sizeof(release_body) - 1u
+        && memcmp(result.data, release_body, result.length) == 0;
+    if (taken) fetch_result_destroy(&result);
+    return whole;
+}
+
+/* NW-04 question 3. A scheduler whose 64 KiB worker chunk was refused
+   once is not demoted for life: the next request attaches again and runs
+   on the worker. Under the PSP rule (fail_worker_refused_hops) a request
+   the worker is unavailable to fails with a named refusal ("worker-chunk",
+   "worker-off") instead of running curl on the browser thread. */
+static void test_worker_attach_is_retried(Budget *budget)
+{
+    TilefinchTestFaults *faults = tilefinch_test_faults();
+    FetchScheduler *scheduler = fetch_scheduler_create(budget, 1u, 65536u);
+    CHECK(scheduler != NULL);
+    if (scheduler == NULL) return;
+    /* The chunk is the attach's only Budget allocation. */
+    budget_inject_failure_after(budget, 0);
+    CHECK(!fetch_scheduler_enable_background_transport(scheduler, true));
+    budget_clear_failure_injection(budget);
+
+    /* The same refusal at the first request fails only that request. */
+    faults->fail_worker_refused_hops = true;
+    budget_inject_failure_after(budget, 0);
+    bool on_worker = false;
+    uint64_t id = fetch_scheduler_enqueue(scheduler, RELEASE_LATEST,
+                                          &release_request, 4096u, 30000);
+    budget_clear_failure_injection(budget);
+    if (id != 0) {
+        fprintf(stderr, "chunk refusal at enqueue admitted request %llu "
+                "(%s)\n", (unsigned long long) id,
+                fetch_scheduler_last_error(scheduler));
+        (void) fetch_scheduler_cancel(scheduler, id, "test cleanup");
+        bool ignored = false;
+        FetchResult result = {0};
+        if (fetch_scheduler_take(scheduler, id, &ignored, &result))
+            fetch_result_destroy(&result);
+    }
+    CHECK(id == 0
+          && strstr(fetch_scheduler_last_error(scheduler),
+                    "worker unavailable (worker-chunk)") != NULL);
+
+    id = release_enqueue_on_worker(scheduler, &on_worker);
+    if (!on_worker)
+        fprintf(stderr, "request after a refused worker chunk ran off the "
+                "worker\n");
+    CHECK(on_worker && release_finish(scheduler, id));
+    fetch_scheduler_destroy(scheduler);
+
+    /* A scheduler that never asked for the worker: refused by name under
+       the PSP rule, the host's browser-thread path otherwise. */
+    scheduler = fetch_scheduler_create(budget, 1u, 65536u);
+    CHECK(scheduler != NULL);
+    if (scheduler == NULL) return;
+    id = fetch_scheduler_enqueue(scheduler, RELEASE_LATEST,
+                                 &release_request, 4096u, 30000);
+    CHECK(id == 0
+          && strstr(fetch_scheduler_last_error(scheduler),
+                    "worker unavailable (worker-off)") != NULL);
+    if (id != 0) {
+        (void) fetch_scheduler_cancel(scheduler, id, "test cleanup");
+        bool ignored = false;
+        FetchResult result = {0};
+        if (fetch_scheduler_take(scheduler, id, &ignored, &result))
+            fetch_result_destroy(&result);
+    }
+    faults->fail_worker_refused_hops = false;
+    id = release_enqueue_on_worker(scheduler, &on_worker);
+    CHECK(!on_worker && id == 0);
+    CHECK(fetch_scheduler_pending(scheduler) == 0);
+    fetch_scheduler_destroy(scheduler);
+}
+
+/* NW-04 question 1. A blocking request (sync XHR, module import) waits on
+   the thread that would pump everything else, so nothing it waits behind
+   frees while it waits. Here a page scheduler's six resource downloads,
+   never pumped, hold six of the domain's seven slots and every descriptor
+   the worker (the replay lane with the PSP worker's six descriptors) gives
+   page requests; the realm's own ordinary request holds the seventh slot
+   and its only one. The blocking request still runs, on the slot past each
+   cap and the descriptor kept for it; without them it waited out its
+   deadline. */
+static void test_blocking_request_beside_page_hops(Budget *budget)
+{
+    enum { PAGE_HOPS = 6 };
+    TilefinchTestFaults *faults = tilefinch_test_faults();
+    faults->replay_lane_worker_descriptors = true;
+    FetchSchedulerDomain *domain = fetch_scheduler_domain_create(
+        budget, PAGE_HOPS + 1u);
+    FetchScheduler *page = fetch_scheduler_create_in_domain(
+        domain, PAGE_HOPS, PAGE_HOPS * 4096u);
+    FetchScheduler *realm = fetch_scheduler_create_in_domain(
+        domain, 1u, 2u * 4096u);
+    fetch_scheduler_domain_release(domain);
+    CHECK(page != NULL && realm != NULL
+          && fetch_scheduler_enable_background_transport(page, true)
+          && fetch_scheduler_enable_background_transport(realm, true));
+    if (page == NULL || realm == NULL) {
+        fetch_scheduler_destroy(page);
+        fetch_scheduler_destroy(realm);
+        faults->replay_lane_worker_descriptors = false;
+        return;
+    }
+    FetchTraceReplayStats before, after;
+    CHECK(fetch_trace_replay_stats(&before));
+    uint64_t hops[PAGE_HOPS] = {0};
+    for (unsigned i = 0; i < PAGE_HOPS; i++) {
+        hops[i] = fetch_scheduler_enqueue(page, RELEASE_LATEST,
+                                          &release_request, 4096u, 30000);
+        CHECK(hops[i] != 0);
+    }
+    uint64_t realm_ordinary = fetch_scheduler_enqueue(
+        realm, RELEASE_LATEST, &release_request, 4096u, 30000);
+    CHECK(realm_ordinary != 0);
+    CHECK(fetch_scheduler_enqueue_would_block(realm, 4096u)
+          || fetch_scheduler_enqueue(realm, RELEASE_LATEST, &release_request,
+                                     4096u, 30000) == 0);
+    CHECK(fetch_trace_replay_stats(&after));
+    size_t started = after.media_lane_request_count
+        - before.media_lane_request_count;
+    fprintf(stderr, "page and realm requests on worker descriptors: %zu of "
+            "%u\n", started, PAGE_HOPS + 1u);
+    CHECK(started == PAGE_HOPS - 1u);
+
+    FetchResult result = {0};
+    uint64_t started_us = tilefinch_platform_monotonic_time_us();
+    bool ok = fetch_scheduler_request_blocking(
+        realm, RELEASE_LATEST, &release_request, 4096u, 3000, &result);
+    uint64_t elapsed_us = tilefinch_platform_monotonic_time_us() - started_us;
+    fprintf(stderr, "blocking request beside %u page hops: %s in %llu us "
+            "(%s)\n", PAGE_HOPS, ok ? "ok" : "failed",
+            (unsigned long long) elapsed_us, result.error);
+    CHECK(ok && result.status_code == 200
+          && result.length == sizeof(release_body) - 1u
+          && memcmp(result.data, release_body, result.length) == 0);
+    fetch_result_destroy(&result);
+    CHECK(elapsed_us < UINT64_C(1000000));
+
+    /* The slots and the descriptor return; the page's requests, the sixth
+       included, finish once their owner pumps again. */
+    for (unsigned i = 0; i < PAGE_HOPS; i++)
+        CHECK(release_finish(page, hops[i]));
+    CHECK(release_finish(realm, realm_ordinary));
+    CHECK(fetch_scheduler_pending(page) == 0
+          && fetch_scheduler_pending(realm) == 0);
+    fetch_scheduler_destroy(page);
+    fetch_scheduler_destroy(realm);
+    faults->replay_lane_worker_descriptors = false;
+}
+
+/* Worker chunks follow the pump's body quota as the browser-thread path
+   does (NW-06): with two downloads in flight and a quota of 16 KiB in one
+   callback, no pump hands more than that to consumers, a pump that used it
+   reports the yield, and both bodies still arrive whole. */
+static void test_worker_chunks_follow_pump_quota(Budget *budget)
+{
+    FetchScheduler *scheduler = fetch_scheduler_create(budget, 2u, 131072u);
+    CHECK(scheduler != NULL
+          && fetch_scheduler_enable_background_transport(scheduler, true));
+    if (scheduler == NULL) return;
+    FetchRequest request = {
+        .method = "GET",
+        .accept = "application/octet-stream",
+        .credentials = FETCH_CREDENTIALS_OMIT,
+        .identity_encoding = true,
+        .redirect_policy = FETCH_REDIRECT_GITHUB_RELEASE,
+        .user_agent = "Tilefinch-Updater/1"
+    };
+    const char *urls[2] = { QUOTA_START_A, QUOTA_START_B };
+    uint64_t ids[2];
+    for (unsigned i = 0; i < 2u; i++)
+        ids[i] = fetch_scheduler_enqueue(scheduler, urls[i], &request,
+                                         65536u, 30000);
+    CHECK(ids[0] != 0 && ids[1] != 0);
+    const FetchPumpQuota quota = {
+        .maximum_body_callbacks = 1u, .maximum_body_bytes = 16u * 1024u
+    };
+    FetchResult *results[2] = {
+        fetch_result_create(budget), fetch_result_create(budget)
+    };
+    bool taken[2] = {false, false}, success[2] = {false, false};
+    size_t most_callbacks = 0, most_bytes = 0, body_pumps = 0;
+    bool unyielded = false;
+    for (unsigned pump = 0; pump < 256u && !(taken[0] && taken[1]);
+         pump++) {
+        FetchPumpMetrics metrics;
+        (void) fetch_scheduler_pump_bounded(scheduler, 2u, 0u, &quota,
+                                            &metrics);
+        if (metrics.body_callbacks > most_callbacks)
+            most_callbacks = metrics.body_callbacks;
+        if (metrics.body_bytes > most_bytes) most_bytes = metrics.body_bytes;
+        if (metrics.body_bytes != 0) body_pumps++;
+        for (unsigned i = 0; i < 2u; i++) {
+            if (!taken[i] && results[i] != NULL)
+                taken[i] = fetch_scheduler_take(scheduler, ids[i],
+                                                &success[i], results[i]);
+        }
+        /* A pump that spent its callback with work left reports it. */
+        if (metrics.body_callbacks >= quota.maximum_body_callbacks
+            && !(taken[0] && taken[1]) && !metrics.quota_yielded)
+            unyielded = true;
+    }
+    if (most_callbacks > 1u || most_bytes > quota.maximum_body_bytes
+        || unyielded)
+        fprintf(stderr, "worker pump quota: callbacks=%zu bytes=%zu "
+                "pumps=%zu unyielded=%d\n", most_callbacks, most_bytes,
+                body_pumps, unyielded);
+    CHECK(most_callbacks == 1u && most_bytes <= quota.maximum_body_bytes
+          && !unyielded);
+    CHECK(body_pumps >= (2u * QUOTA_BYTES) / quota.maximum_body_bytes);
+    for (unsigned i = 0; i < 2u; i++) {
+        CHECK(taken[i] && success[i] && results[i] != NULL
+              && results[i]->length == QUOTA_BYTES
+              && memcmp(results[i]->data, quota_body, QUOTA_BYTES) == 0);
+        if (results[i] != NULL) {
+            fetch_result_destroy(results[i]);
+            fetch_result_free(results[i]);
+        }
+    }
+    fetch_scheduler_destroy(scheduler);
+}
+
+/* A stream consumer that holds at most 4 KiB until the test empties it,
+   and fails a chunk that does not fit, as an EventSource does. */
+typedef struct {
+    unsigned char held[4096];
+    size_t held_length;
+    unsigned char copied[QUOTA_BYTES];
+    size_t copied_length;
+    size_t full_reports;
+    bool overflowed;
+} SmallConsumer;
+
+static bool small_consumer_headers(void *opaque, const FetchResult *metadata)
+{
+    (void) opaque;
+    return metadata != NULL && metadata->status_code == 200;
+}
+
+static bool small_consumer_body(void *opaque, const unsigned char *data,
+                                size_t length)
+{
+    SmallConsumer *consumer = opaque;
+    if (length > sizeof(consumer->held) - consumer->held_length) {
+        consumer->overflowed = true;
+        return false;
+    }
+    memcpy(consumer->held + consumer->held_length, data, length);
+    consumer->held_length += length;
+    return true;
+}
+
+static size_t small_consumer_capacity(void *opaque)
+{
+    SmallConsumer *consumer = opaque;
+    size_t room = sizeof(consumer->held) - consumer->held_length;
+    if (room == 0) consumer->full_reports++;
+    return room;
+}
+
+static void small_consumer_drain(SmallConsumer *consumer)
+{
+    size_t room = sizeof(consumer->copied) - consumer->copied_length;
+    size_t length = consumer->held_length < room
+        ? consumer->held_length : room;
+    memcpy(consumer->copied + consumer->copied_length, consumer->held,
+           length);
+    consumer->copied_length += length;
+    consumer->held_length = 0;
+}
+
+/* A worker stream hands its consumer no more than on_capacity reports and
+   keeps the rest for a later pump (NW-09): the consumer is emptied only
+   every third pump, never overflows, and gets the whole body in order. */
+static void test_worker_stream_waits_for_consumer(Budget *budget)
+{
+    FetchScheduler *scheduler = fetch_scheduler_create(budget, 1u, 131072u);
+    CHECK(scheduler != NULL
+          && fetch_scheduler_enable_background_transport(scheduler, true));
+    if (scheduler == NULL) return;
+    static SmallConsumer consumer;
+    memset(&consumer, 0, sizeof(consumer));
+    FetchStreamOptions stream = {
+        .on_headers = small_consumer_headers,
+        .on_body = small_consumer_body,
+        .on_capacity = small_consumer_capacity,
+        .opaque = &consumer
+    };
+    FetchRequest request = {
+        .method = "GET",
+        .accept = "application/octet-stream",
+        .credentials = FETCH_CREDENTIALS_OMIT,
+        .identity_encoding = true,
+        .redirect_policy = FETCH_REDIRECT_GITHUB_RELEASE,
+        .user_agent = "Tilefinch-Updater/1"
+    };
+    FetchTraceReplayStats before, after;
+    CHECK(fetch_trace_replay_stats(&before));
+    uint64_t id = fetch_scheduler_enqueue_stream(
+        scheduler, CAPACITY_START, &request, 65536u, 30000, &stream);
+    CHECK(id != 0);
+    FetchResult *result = fetch_result_create(budget);
+    bool taken = false, success = false;
+    FetchStreamMetrics metrics;
+    for (unsigned pump = 0; id != 0 && result != NULL && pump < 512u
+         && !taken; pump++) {
+        (void) fetch_scheduler_pump(scheduler, 1u, 0u);
+        if (pump % 3u == 2u) small_consumer_drain(&consumer);
+        taken = fetch_scheduler_take_stream(scheduler, id, &success,
+                                            &metrics, result);
+    }
+    small_consumer_drain(&consumer);
+    CHECK(fetch_trace_replay_stats(&after));
+    if (!taken || !success || consumer.overflowed
+        || consumer.copied_length != QUOTA_BYTES)
+        fprintf(stderr, "worker stream capacity: taken=%d success=%d "
+                "overflowed=%d bytes=%zu full=%zu error=%s\n", taken,
+                success, consumer.overflowed, consumer.copied_length,
+                consumer.full_reports, result == NULL ? "" : result->error);
+    CHECK(taken && success && !consumer.overflowed);
+    CHECK(consumer.full_reports != 0);
+    CHECK(consumer.copied_length == QUOTA_BYTES
+          && memcmp(consumer.copied, capacity_body, QUOTA_BYTES) == 0);
+    /* Both hops went through the worker lane. */
+    CHECK(after.media_lane_served_count
+          == before.media_lane_served_count + 2u);
+    if (result != NULL) {
+        fetch_result_destroy(result);
+        fetch_result_free(result);
+    }
+    fetch_scheduler_destroy(scheduler);
+}
+
 static void test_decoder_verdicts(void)
 {
     /* A device-refused rendition: Constrained Baseline, Level 1.3, three
@@ -677,6 +1229,11 @@ int main(int argc, char **argv)
 
     test_lane_ranges(mp4, mp4_length);
     test_lane_hash_on_delivery(&budget);
+    test_release_redirect_chain(&budget);
+    test_worker_attach_is_retried(&budget);
+    test_blocking_request_beside_page_hops(&budget);
+    test_worker_chunks_follow_pump_quota(&budget);
+    test_worker_stream_waits_for_consumer(&budget);
 
     browser_session_destroy(&session);
     fetch_trace_end();

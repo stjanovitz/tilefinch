@@ -181,8 +181,9 @@ static int test_ancestor_filter_canonical_tokens(void)
 
 /* HTML type selectors match without ASCII case in an HTML document, so the
    rule prefilter, the rule index and the ancestor filter must reach the same
-   answer as the matcher for legacy uppercase author CSS. Foreign elements
-   keep exact names. */
+   answer as the matcher for legacy uppercase author CSS. A foreign element
+   in an HTML document matches without ASCII case too (Chromium 156 gives
+   the svg foreignObject FOREIGNOBJECT's padding). */
 static int uppercase_type_selector_case(bool indexed)
 {
     Budget budget;
@@ -215,7 +216,7 @@ static int uppercase_type_selector_case(bool indexed)
     CHECK(cell_style.color == 0x123456 && cell_style.padding.bottom == 2);
     CHECK(inner_style.padding.top == 7);
     CHECK(bold_style.padding.right == 5);
-    CHECK(foreign_style.padding.left == 0);
+    CHECK(foreign_style.padding.left == 9);
     CHECK(sheet.rule_index_ready == indexed);
     stylesheet_destroy(&sheet);
     document_destroy(&document);
@@ -1565,6 +1566,203 @@ static int test_quoted_declaration_boundaries(void)
     return 0;
 }
 
+/* Elements that resolve to the same values share one payload, a change gives
+   only its own element new values, and the last reference recycles it. */
+static int test_computed_style_shared_payloads(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    enum { NODES = 600 };
+    static char html[NODES * 24];
+    size_t used = 0;
+    for (unsigned i = 0; i < NODES; i++) {
+        int n = snprintf(html + used, sizeof(html) - used,
+                         "<p id=n%u>payload</p>", i);
+        CHECK(n > 0 && (size_t) n < sizeof(html) - used);
+        used += (size_t) n;
+    }
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    CHECK(document_parse(&document, &budget, html, used, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    static const char css[] = "p{color:#123456;width:37px}";
+    CHECK(stylesheet_add_css(&sheet, css, sizeof(css) - 1u));
+    lxb_dom_node_t *nodes[NODES];
+    for (unsigned i = 0; i < NODES; i++) {
+        char id[16];
+        snprintf(id, sizeof(id), "n%u", i);
+        nodes[i] = find_id(lxb_dom_interface_node(document.html), id);
+        CHECK(nodes[i] != NULL);
+    }
+    LayoutReuseCache *reuse = layout_reuse_cache_create(&budget);
+    CHECK(reuse != NULL);
+    layout_reuse_cache_expect_elements(reuse, 3000);
+    layout_reuse_cache_prepare(reuse, &sheet, NULL, NULL, 480);
+    ComputedStyle parent = layout_initial_root_style(), result;
+    for (unsigned i = 0; i < NODES; i++)
+        (void) layout_reuse_cache_resolve_style(reuse, &sheet, NULL, nodes[i],
+                                                &parent, &result);
+    CHECK(reuse->style_payload_count == 1u);
+    for (unsigned i = 0; i < NODES; i++) {
+        CHECK(layout_reuse_cache_resolve_style(reuse, &sheet, NULL, nodes[i],
+                                               &parent, &result));
+        CHECK(result.color == 0x123456 && result.width == 37);
+    }
+    /* New values for one element leave the payload to the others. */
+    lxb_dom_element_t *changed = lxb_dom_interface_element(nodes[3]);
+    CHECK(lxb_dom_element_set_attribute(
+              changed, (const lxb_char_t *) "style", 5u,
+              (const lxb_char_t *) "width:41px", 10u) != NULL);
+    layout_reuse_cache_invalidate_inline_style(reuse, nodes[3], "width", false);
+    CHECK(!layout_reuse_cache_resolve_style(reuse, &sheet, NULL, nodes[3],
+                                            &parent, &result));
+    CHECK(result.width == 41 && reuse->style_payload_count == 2u);
+    CHECK(layout_reuse_cache_resolve_style(reuse, &sheet, NULL, nodes[3],
+                                           &parent, &result));
+    CHECK(result.width == 41);
+    CHECK(layout_reuse_cache_resolve_style(reuse, &sheet, NULL, nodes[4],
+                                           &parent, &result));
+    CHECK(result.width == 37);
+    /* The last reference frees it for the next distinct style. */
+    layout_reuse_cache_invalidate_inline_style(reuse, nodes[3], "width", false);
+    CHECK(reuse->style_payload_free == 2u);
+    CHECK(lxb_dom_element_set_attribute(
+              changed, (const lxb_char_t *) "style", 5u,
+              (const lxb_char_t *) "width:43px", 10u) != NULL);
+    CHECK(!layout_reuse_cache_resolve_style(reuse, &sheet, NULL, nodes[3],
+                                            &parent, &result));
+    CHECK(result.width == 43 && reuse->style_payload_count == 2u
+          && reuse->style_payload_free == 0u);
+    layout_reuse_cache_destroy(reuse);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* A subtree's styles drop by probing its nodes while it is small and by
+   sweeping the table when it is not; both leave the rest of the page alone. */
+static int test_computed_style_subtree_drop(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    static char html[16000];
+    size_t used = 0;
+    int n = snprintf(html, sizeof(html),
+        "<p id=before>a</p><div id=small><section id=inner><b id=deep>a</b>"
+        "</section><i id=sibling>a</i></div><div id=large>");
+    CHECK(n > 0);
+    used = (size_t) n;
+    /* Past an eighth of the table's initial 1024 entries. */
+    enum { LARGE = 200 };
+    for (unsigned i = 0; i < LARGE; i++) {
+        n = snprintf(html + used, sizeof(html) - used,
+                     "<p id=l%u>a</p>", i);
+        CHECK(n > 0 && (size_t) n < sizeof(html) - used);
+        used += (size_t) n;
+    }
+    n = snprintf(html + used, sizeof(html) - used, "</div><p id=after>a</p>");
+    CHECK(n > 0 && (size_t) n < sizeof(html) - used);
+    used += (size_t) n;
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    CHECK(document_parse(&document, &budget, html, used, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    static const char *const names[] = {
+        "before", "small", "inner", "deep", "sibling", "large", "l0", "l199",
+        "after"
+    };
+    enum { NAMES = sizeof(names) / sizeof(names[0]) };
+    lxb_dom_node_t *named[NAMES];
+    for (size_t i = 0; i < NAMES; i++) {
+        named[i] = find_id(root, names[i]);
+        CHECK(named[i] != NULL);
+    }
+    LayoutReuseCache *reuse = layout_reuse_cache_create(&budget);
+    CHECK(reuse != NULL);
+    layout_reuse_cache_prepare(reuse, &sheet, NULL, NULL, 480);
+    ComputedStyle parent = layout_initial_root_style(), result;
+    for (size_t pass = 0; pass < 2; pass++) {
+        for (size_t i = 0; i < NAMES; i++)
+            (void) layout_reuse_cache_resolve_style(
+                reuse, &sheet, NULL, named[i], &parent, &result);
+        /* 0: the small scope; 1: the large one. */
+        lxb_dom_node_t *scope = named[pass == 0 ? 1 : 5];
+        layout_reuse_cache_invalidate_overflow_root(reuse, scope);
+        for (size_t i = 0; i < NAMES; i++) {
+            bool inside = pass == 0 ? i >= 1 && i <= 4 : i >= 5 && i <= 7;
+            CHECK(layout_reuse_cache_resolve_style(
+                      reuse, &sheet, NULL, named[i], &parent, &result)
+                  == !inside);
+        }
+    }
+    layout_reuse_cache_destroy(reuse);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* A page twice the old table's size, restyled by an image pass over part of
+   it and a build over all of it: every walk after the first must still hit,
+   or each relayout resolves the page's styles again. */
+static int test_computed_style_large_page_walks(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    enum { NODES = 8000 };
+    static char html[NODES * 8u + 16u];
+    memcpy(html, "<div id=walked>", 15u);
+    size_t used = 15u;
+    for (unsigned i = 0; i < NODES; i++) {
+        memcpy(html + used, "<p>a</p>", 8u);
+        used += 8u;
+    }
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    CHECK(document_parse(&document, &budget, html, used, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    lxb_dom_node_t *walked = find_id(lxb_dom_interface_node(document.html),
+                                     "walked");
+    CHECK(walked != NULL);
+    LayoutReuseCache *reuse = layout_reuse_cache_create(&budget);
+    CHECK(reuse != NULL);
+    layout_reuse_cache_expect_elements(reuse, NODES);
+    ComputedStyle parent = layout_initial_root_style(), result;
+    size_t full_hits = 0;
+    for (unsigned walk = 0; walk < 6; walk++) {
+        layout_reuse_cache_prepare(reuse, &sheet, NULL, NULL, 480);
+        size_t index = 0;
+        full_hits = 0;
+        for (lxb_dom_node_t *node = walked->first_child; node != NULL;
+             node = node->next, index++) {
+            if ((walk & 1u) == 0u && index % 3u != 0u) continue;
+            if (layout_reuse_cache_resolve_style(reuse, &sheet, NULL, node,
+                                                 &parent, &result)) full_hits++;
+        }
+    }
+    /* The last walk covered every third node, the one before all of them. */
+    layout_reuse_cache_prepare(reuse, &sheet, NULL, NULL, 480);
+    full_hits = 0;
+    for (lxb_dom_node_t *node = walked->first_child; node != NULL;
+         node = node->next) {
+        if (layout_reuse_cache_resolve_style(reuse, &sheet, NULL, node,
+                                             &parent, &result)) full_hits++;
+    }
+    CHECK(full_hits >= NODES / 100u * 99u);
+    /* One rule, one payload page however many elements. */
+    CHECK(reuse->style_payload_count == 1u);
+    layout_reuse_cache_destroy(reuse);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 static int test_computed_style_payload_storage(void)
 {
     Budget budget;
@@ -1574,7 +1772,7 @@ static int test_computed_style_payload_storage(void)
     size_t used = 0;
     for (unsigned i = 0; i < 260; i++) {
         int n = snprintf(html + used, sizeof(html) - used,
-                         "<p id=n%u>payload</p>", i);
+                         "<p id=n%u style=height:%upx>payload</p>", i, i);
         CHECK(n > 0 && (size_t) n < sizeof(html) - used);
         used += (size_t) n;
     }
@@ -1666,6 +1864,8 @@ static int test_computed_style_payload_storage(void)
     /* Capacity remains 4096, but full styles are owned only for the walk. */
     CHECK(stats.retained_bytes < 512u * 1024u);
     ComputedStyle absent = {0};
+    CHECK(layout_reuse_cache_resolve_style(reuse, &sheet, NULL,
+                                          nodes[0], &parent, &result));
     layout_reuse_note_pseudo(reuse, &sheet, nodes[0], PSEUDO_BEFORE,
                              &result, &absent);
     CHECK(layout_reuse_pseudo_absent(reuse, &sheet, nodes[0], PSEUDO_BEFORE,
@@ -1682,6 +1882,8 @@ static int test_computed_style_payload_storage(void)
     CHECK(!layout_reuse_cache_resolve_style(reuse, &sheet, NULL,
                                            nodes[1], &parent, &result));
     layout_reuse_cache_end_font_publication(reuse);
+    CHECK(layout_reuse_cache_resolve_style(reuse, &sheet, NULL,
+                                          nodes[0], &parent, &result));
     CHECK(layout_reuse_pseudo_absent(reuse, &sheet, nodes[0], PSEUDO_BEFORE,
                                      &result));
     static const char changed[] = "p{color:#654321}";
@@ -6238,6 +6440,197 @@ static int test_transition_candidate_rejection(void)
     return 0;
 }
 
+/* document_attribute finds what lexbor's by-name lookup finds, for every shape
+   of stored name, and for an HTML element and a lowercase name it does so
+   without hashing the name into the document's table. */
+static int test_document_attribute_matches_by_name(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    static const char html[] =
+        "<body><div id=d style='a:b' CLASS=up data-Mixed=m empty bare=''></div>"
+        "<svg id=s viewBox='0 0 1 1' style='c:d'></svg><p id=none></p>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    lxb_dom_node_t *div = find_id(root, "d");
+    lxb_dom_node_t *svg = find_id(root, "s");
+    lxb_dom_node_t *none = find_id(root, "none");
+    CHECK(div != NULL && svg != NULL && none != NULL);
+
+    /* A stored name that keeps its case: a raw qualified name beside the
+       lowered local name. */
+    static const char *const stored[] = {"XLink:Href", "CamelCase", "low:er"};
+    lxb_dom_element_t *element = lxb_dom_interface_element(div);
+    for (size_t i = 0; i < sizeof(stored) / sizeof(stored[0]); i++) {
+        lxb_dom_attr_t *attr = lxb_dom_attr_interface_create(
+            div->owner_document);
+        CHECK(attr != NULL);
+        CHECK(lxb_dom_attr_set_name(
+                  attr, (const lxb_char_t *) stored[i], strlen(stored[i]),
+                  false) == LXB_STATUS_OK);
+        CHECK(lxb_dom_attr_set_value(attr, (const lxb_char_t *) "v", 1u)
+              == LXB_STATUS_OK);
+        lxb_dom_element_attr_append(element, attr);
+    }
+
+    static const char *const names[] = {
+        "id", "style", "class", "data-mixed", "empty", "bare", "absent",
+        "tabindex", "viewbox", "viewBox", "STYLE", "Style", "DATA-MIXED", "",
+        "xlink:href", "XLink:Href", "XLINK:HREF", "href", "camelcase",
+        "CamelCase", "low:er", "LOW:ER", "er", "styl", "stylee"
+    };
+    lxb_dom_node_t *const nodes[] = {div, svg, none};
+    for (size_t n = 0; n < sizeof(nodes) / sizeof(nodes[0]); n++) {
+        for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+            size_t got_length = 99u, want_length = 0;
+            const char *got = document_attribute(nodes[n], names[i],
+                                                  &got_length);
+            const lxb_char_t *want = lxb_dom_element_get_attribute(
+                lxb_dom_interface_element(nodes[n]),
+                (const lxb_char_t *) names[i], strlen(names[i]), &want_length);
+            CHECK((const lxb_char_t *) got == want
+                  && got_length == want_length);
+        }
+    }
+
+    size_t lookups = document_test_attribute_table_lookups();
+    CHECK(document_attribute(div, "style", NULL) != NULL);
+    CHECK(document_attribute(div, "absent", NULL) == NULL);
+    CHECK(document_attribute(none, "style", NULL) == NULL);
+    CHECK(document_node_is_inert(div) == false);
+    CHECK(document_test_attribute_table_lookups() == lookups);
+    CHECK(document_attribute(div, "STYLE", NULL) != NULL);
+    CHECK(document_test_attribute_table_lookups() == lookups + 1u);
+
+    document_destroy(&document);
+    CHECK(budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* The marker decides, not the attribute's name: a page's own attribute of that
+   name is no carrier, and the check has no name to look up, which it would
+   otherwise do for every child of every flat-tree step. */
+static int test_shadow_carrier_is_the_marker(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    static const char html[] =
+        "<body><x-host><div id=c a=1 b=2></div></x-host>"
+        "<div id=page data-tilefinch-shadow-root></div><div id=bare></div>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    lxb_dom_node_t *carrier = find_id(root, "c");
+    lxb_dom_node_t *page = find_id(root, "page");
+    lxb_dom_node_t *bare = find_id(root, "bare");
+    CHECK(carrier != NULL && page != NULL && bare != NULL);
+    CHECK(!document_node_is_shadow_carrier(carrier));
+    CHECK(document_mark_shadow_carrier(carrier));
+    CHECK(document_node_is_shadow_carrier(carrier));
+    CHECK(!document_node_is_shadow_carrier(page));
+    CHECK(!document_node_is_shadow_carrier(bare));
+    lxb_dom_attr_t *marked = lxb_dom_element_attr_by_name(
+        lxb_dom_interface_element(carrier),
+        (const lxb_char_t *) "data-tilefinch-shadow-root", 26u);
+    CHECK(marked != NULL);
+    /* Stored under another name: only a by-name check loses it. */
+    lxb_dom_attr_id_t name = marked->node.local_name;
+    marked->node.local_name = LXB_DOM_ATTR_CLASS;
+    CHECK(document_node_is_shadow_carrier(carrier));
+    marked->node.local_name = name;
+    document_destroy(&document);
+    CHECK(budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* A flat-tree walk asks about the parent at every step, so a long list without
+   a carrier is scanned once however long the walk; and the cached answer ends as
+   soon as the host can hold one. */
+static int test_shadow_carrier_scan_memo(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    char html[1024];
+    size_t used = (size_t) snprintf(
+        html, sizeof(html),
+        "<body><x-a><div id=other></div></x-a><div id=c></div><x-host id=h>");
+    for (int i = 0; i < 40; i++) {
+        used += (size_t) snprintf(html + used, sizeof(html) - used,
+                                  i == 20 ? "<i id=mid></i>" : "<i></i>");
+    }
+    used += (size_t) snprintf(html + used, sizeof(html) - used,
+                              "</x-host><p id=pair><i></i><i id=pair-end></i></p>");
+    CHECK(document_parse(&document, &budget, html, used, 17));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    lxb_dom_node_t *other = find_id(root, "other");
+    lxb_dom_node_t *host = find_id(root, "h");
+    lxb_dom_node_t *mid = find_id(root, "mid");
+    lxb_dom_node_t *carrier = find_id(root, "c");
+    CHECK(other != NULL && host != NULL && mid != NULL && carrier != NULL);
+    CHECK(document_mark_shadow_carrier(other));
+
+    CHECK(document_shadow_carrier_of_host(host) == NULL);
+    size_t visits = document_test_shadow_scan_visits();
+    size_t walked = 0;
+    for (lxb_dom_node_t *child = document_flat_first_child(host); child != NULL;
+         child = document_flat_next_sibling(child)) {
+        CHECK(document_flat_parent(child) == host);
+        walked++;
+    }
+    CHECK(walked == 40u && document_test_shadow_scan_visits() == visits);
+
+    /* A plain node in the middle does not end the answer. */
+    lxb_dom_node_t *plain = mid->next;
+    lxb_dom_node_remove(plain);
+    CHECK(lxb_dom_node_insert_before_spec(host, plain, mid)
+          == LXB_DOM_EXCEPTION_OK);
+    CHECK(document_shadow_carrier_of_host(host) == NULL
+          && document_test_shadow_scan_visits() == visits);
+
+    /* A new mark on a child between the host's ends. */
+    lxb_dom_node_remove(carrier);
+    CHECK(lxb_dom_node_insert_before_spec(host, carrier, mid)
+          == LXB_DOM_EXCEPTION_OK);
+    CHECK(document_mark_shadow_carrier(carrier));
+    CHECK(document_shadow_carrier_of_host(host) == carrier);
+
+    /* An insertion at either end. */
+    lxb_dom_node_remove(carrier);
+    CHECK(document_shadow_carrier_of_host(host) == NULL);
+    lxb_dom_node_insert_child(host, carrier);
+    CHECK(document_shadow_carrier_of_host(host) == carrier);
+    lxb_dom_node_remove(carrier);
+    CHECK(document_shadow_carrier_of_host(host) == NULL);
+    CHECK(lxb_dom_node_insert_before_spec(host, carrier, host->first_child)
+          == LXB_DOM_EXCEPTION_OK);
+    CHECK(document_shadow_carrier_of_host(host) == carrier);
+
+    /* A short list is walked as often, and is what most of a document is. */
+    lxb_dom_node_t *pair = find_id(root, "pair");
+    lxb_dom_node_t *pair_end = find_id(root, "pair-end");
+    CHECK(pair != NULL && pair_end != NULL);
+    CHECK(document_shadow_carrier_of_host(pair) == NULL);
+    visits = document_test_shadow_scan_visits();
+    CHECK(document_flat_next_sibling(pair_end) == NULL
+          && document_flat_parent(pair_end) == pair
+          && document_shadow_carrier_of_host(pair) == NULL
+          && document_test_shadow_scan_visits() == visits);
+    lxb_dom_node_remove(carrier);
+    lxb_dom_node_insert_child(pair, carrier);
+    CHECK(document_shadow_carrier_of_host(pair) == carrier);
+    lxb_dom_node_remove(carrier);
+    CHECK(document_shadow_carrier_of_host(pair) == NULL);
+
+    document_destroy(&document);
+    CHECK(budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 static int test_shadow_scope_allocation_refusal(void)
 {
     Budget budget;
@@ -6427,6 +6820,381 @@ static int test_padding_initial_shorthand(void)
     layout_destroy(&layout);
     stylesheet_destroy(&sheet);
     document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* The deferred-declaration scans (declarations_analyze_deferred_resolution
+   at rule compile and the deferred-program compile scan) look for var(,
+   em/rem/ch and the container units in every declaration value. They
+   filter by first byte; this pins what they find: case-folded units,
+   the digit/")" before and identifier byte after a unit, units at the
+   value's edges, and the long-standing ch flag on any "ch" byte pair. */
+static int test_deferred_scan_unit_detection(void)
+{
+    enum {
+        FONT = STYLE_DEFERRED_FONT_RELATIVE,
+        OTHER = STYLE_DEFERRED_NON_FONT_RELATIVE,
+        DYN = STYLE_DEFERRED_DYNAMIC,
+        CH = STYLE_DEFERRED_CH
+    };
+    static const struct {
+        const char *declarations;
+        bool deferred;
+        uint16_t flags;
+        int program; /* deferred-program instructions, -1 for none */
+        bool container;
+    } cases[] = {
+        {"width:2em", true, FONT | OTHER | DYN, 1, false},
+        {"WIDTH:2EM", true, FONT | OTHER | DYN, 1, false},
+        {"font-size:1.5REM", true, FONT | DYN, 1, false},
+        {"margin-left:calc(1px + 2Rem)", true, FONT | OTHER | DYN, 1, false},
+        {"padding-top:calc(4px)em", true, FONT | OTHER | DYN, 1, false},
+        {"width:3ch", true, FONT | OTHER | DYN | CH, 0, false},
+        {"width:3CH", true, FONT | OTHER | DYN | CH, 0, false},
+        {"color:chocolate", false, CH, -1, false},
+        {"color:red;width:1remx", false, 0, -1, false},
+        {"color:red;width:1em-2", false, 0, -1, false},
+        {"color:red;width:1em_", false, 0, -1, false},
+        {"color:red;width:2e", false, 0, -1, false},
+        {"color:red;width:1r", false, 0, -1, false},
+        {"color:red;width:em", false, 0, -1, false},
+        {"width:.5em;color:red", true, FONT | OTHER | DYN, 1, false},
+        {"color:red;height:1em", true, FONT | OTHER | DYN, 1, false},
+        {"width:10cqw", true, OTHER | DYN, 1, true},
+        {"height:10CQH", true, OTHER | DYN, 1, true},
+        {"width:10cqi", true, OTHER | DYN, 1, true},
+        {"height:10cqb", true, OTHER | DYN, 1, true},
+        {"width:10CQMIN", true, OTHER | DYN, 1, true},
+        {"height:10cqmax", true, OTHER | DYN, 1, true},
+        {"color:red;width:10cqx", false, 0, -1, false},
+        {"color:red;width:10cqwx", false, 0, -1, false},
+        {"color:red;width:10cq", false, 0, -1, false},
+        {"width:var(--w)", true, DYN, 1, false},
+        {"color:red;width:var(--w)", true, DYN, 2, false},
+        {"color:red;width:vars(--w)", false, 0, -1, false},
+        {"width:2em;height:10cqh", true, FONT | OTHER | DYN, 2, true},
+    };
+    int failures = 0;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        Budget budget;
+        budget_init(&budget, 8u * MIB);
+        CHECK(budget_install_lexbor(&budget));
+        static const char html[] = "<!doctype html><p id=probe>x</p>";
+        PocDocument document = {0};
+        Stylesheet sheet = {0};
+        CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 23)
+            && stylesheet_build(&sheet, &budget, &document, 480));
+        char css[256];
+        int length = snprintf(css, sizeof(css), ".c{%s}",
+                              cases[i].declarations);
+        CHECK(length > 0 && (size_t) length < sizeof(css)
+            && stylesheet_add_css(&sheet, css, (size_t) length));
+        const StyleRule *rule = find_rule(&sheet, ".c");
+        const StyleDeclaration *declaration =
+            stylesheet_rule_declaration(&sheet, rule);
+        bool deferred = false;
+        uint16_t flags = 0;
+        int program = -1;
+        if (declaration != NULL) {
+            deferred = declaration->deferred_declarations != NULL;
+            flags = declaration->deferred_program_reserved
+                & (FONT | OTHER | DYN | CH);
+            if (declaration->deferred_program_offset != UINT32_MAX)
+                program = (int) declaration->deferred_program_count;
+        }
+        if (declaration == NULL || deferred != cases[i].deferred
+            || flags != cases[i].flags || program != cases[i].program
+            || sheet.has_container_relative_units != cases[i].container) {
+            fprintf(stderr,
+                    "deferred scan case %zu (%s): declaration=%d deferred=%d "
+                    "flags=%u program=%d container=%d\n", i,
+                    cases[i].declarations, (int) (declaration != NULL),
+                    (int) deferred, (unsigned) flags, program,
+                    (int) sheet.has_container_relative_units);
+            failures++;
+        }
+        stylesheet_destroy(&sheet);
+        document_destroy(&document);
+        CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    }
+    return failures == 0 ? 0 : 1;
+}
+
+/* The compiled-sheet cache reuses a retired page's sheet for a document
+   whose <head> sources match, cut back to them (stylesheet_truncate_to_head)
+   before the new document's body <style> blocks append. The cut must leave
+   exactly the sheet the <head> sources alone build, with every rule and
+   intern-pool entry of the old body released, or entries would leak into
+   the next page and the bounded pools would fill across navigations. */
+typedef struct {
+    size_t rules, important, next_order, custom, transitions, reverts;
+    size_t declarations, declaration_bytes, deferred, deferred_bytes;
+    size_t math, math_programs, texts, text_bytes, images, image_bytes;
+    size_t image_sources, counters, border_colors, paints, long_bytes;
+    size_t selector_bytes;
+} HeadReuseShape;
+
+static HeadReuseShape head_reuse_shape(const Stylesheet *sheet)
+{
+    return (HeadReuseShape) {
+        sheet->count, sheet->important_rule_count, sheet->next_order,
+        sheet->custom_rule_count, sheet->transition_rule_count,
+        sheet->revert_rule_mask_count, sheet->declaration_count,
+        sheet->declaration_value_bytes, sheet->deferred_instruction_count,
+        sheet->deferred_bytes, sheet->math_instruction_count,
+        sheet->math_program_count, sheet->generated_text_count,
+        sheet->generated_text_bytes, sheet->image_url_count,
+        sheet->image_url_bytes,
+        sheet->image_sources == NULL ? 0 : sheet->image_sources->count,
+        sheet->counter_operation_set_count, sheet->border_color_set_count,
+        sheet->paint_storage == NULL ? 0 : sheet->paint_storage->count,
+        sheet->custom_value_long_bytes, sheet->selector_bytes
+    };
+}
+
+static bool head_reuse_render(Budget *budget, PocDocument *document,
+                              Stylesheet *sheet, uint16_t *frame,
+                              uint64_t *hash, int *height)
+{
+    LayoutDocument layout = {0};
+    TileCache cache = {0};
+    bool ok = layout_build(&layout, budget, document, sheet, NULL, NULL, 480)
+        && tile_cache_init(&cache, budget, &layout, 8)
+        && tile_cache_set_frame(&cache, frame, 480u * 272u)
+        && tile_cache_render_frame(&cache, 0, 480, 272, NULL);
+    if (ok) {
+        *hash = frame_hash(frame, 480u * 272u);
+        *height = layout.height;
+    }
+    tile_cache_destroy(&cache);
+    layout_destroy(&layout);
+    return ok;
+}
+
+#define HEAD_REUSE_HEAD \
+    "<!doctype html><html><head><style>" \
+    ":root{--accent:#123456}body{margin:0;font-size:16px}" \
+    "h1{color:var(--accent);border-bottom:2px solid #333}" \
+    ".box{background:url(/head.png) no-repeat;padding:4px}" \
+    "p::before{content:\"H\"}div{width:calc(50% - 4px)}" \
+    "</style></head><body>"
+#define HEAD_REUSE_CONTENT \
+    "<h1>Title</h1><p class=box id=box>Text one</p><p id=plain>Two</p>" \
+    "<div class=extra>x</div></body></html>"
+
+/* Builds `body_css` (NULL: no body <style>) after the shared head. */
+static bool head_reuse_document(PocDocument *document, Budget *budget,
+                                const char *body_css)
+{
+    char html[2048];
+    int length = snprintf(html, sizeof(html), "%s%s%s%s%s", HEAD_REUSE_HEAD,
+                          body_css == NULL ? "" : "<style>",
+                          body_css == NULL ? "" : body_css,
+                          body_css == NULL ? "" : "</style>",
+                          HEAD_REUSE_CONTENT);
+    return length > 0 && (size_t) length < sizeof(html)
+        && document_parse(document, budget, html, (size_t) length, 17);
+}
+
+static lxb_dom_node_t *head_reuse_body_style(PocDocument *document)
+{
+    lxb_dom_node_t *body = lxb_dom_interface_node(
+        lxb_html_document_body_element(document->html));
+    for (lxb_dom_node_t *node = body == NULL ? NULL : body->first_child;
+         node != NULL; node = node->next) {
+        if (node->type == LXB_DOM_NODE_TYPE_ELEMENT
+            && node->local_name == LXB_TAG_STYLE) return node;
+    }
+    return NULL;
+}
+
+/* A sheet built from the shared head plus `body_css` must refuse the cut
+   (and stay exactly as it was): the body changed something a mark cannot
+   undo. */
+static int head_reuse_expect_refusal(Budget *budget, const char *body_css)
+{
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    CHECK(head_reuse_document(&document, budget, body_css)
+          && stylesheet_build(&sheet, budget, &document, 480));
+    stylesheet_prepare_for_document_reuse(&sheet);
+    HeadReuseShape before = head_reuse_shape(&sheet);
+    uint64_t generation = sheet.build_generation;
+    bool cut = stylesheet_truncate_to_head(&sheet, true);
+    HeadReuseShape after = head_reuse_shape(&sheet);
+    if (cut) fprintf(stderr, "head reuse accepted body %s\n", body_css);
+    CHECK(!cut && memcmp(&before, &after, sizeof(before)) == 0
+          && sheet.build_generation == generation);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    return 0;
+}
+
+static int test_head_truncation_matches_fresh_build(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    static const char body_a[] =
+        "p{color:#ff0000}.box{border:3px dashed #00ff00}"
+        "p::after{content:\"A-only\";counter-increment:a}"
+        "div.extra{background:url(/a.png);width:calc(25% + 3px)}"
+        "#plain{transition:color 1s}h1{border-color:#aa0000 #00aa00}";
+    static const char body_b[] = ".box{color:#0000ff}p::after{content:\"B\"}";
+    PocDocument head_only = {0}, document_a = {0}, document_b = {0};
+    CHECK(head_reuse_document(&head_only, &budget, NULL)
+          && head_reuse_document(&document_a, &budget, body_a)
+          && head_reuse_document(&document_b, &budget, body_b));
+    lxb_dom_node_t *style_b = head_reuse_body_style(&document_b);
+    CHECK(style_b != NULL);
+    uint16_t *frame = budget_malloc(&budget, 480u * 272u * sizeof(*frame));
+    CHECK(frame != NULL);
+
+    Stylesheet fresh_head = {0}, fresh_b = {0}, reused = {0};
+    CHECK(stylesheet_build(&fresh_head, &budget, &head_only, 480)
+          && stylesheet_build(&fresh_b, &budget, &document_b, 480)
+          && stylesheet_build(&reused, &budget, &document_a, 480));
+    /* A head-only sheet has nothing to cut; it is only refused when the
+       caller says the document had body sources. */
+    CHECK(fresh_head.head_mark.state == STYLE_HEAD_MARK_NONE
+          && reused.head_mark.state == STYLE_HEAD_MARK_SET
+          && stylesheet_truncate_to_head(&fresh_head, false)
+          && !stylesheet_truncate_to_head(&fresh_head, true));
+    HeadReuseShape head_shape = head_reuse_shape(&fresh_head);
+    HeadReuseShape a_shape = head_reuse_shape(&reused);
+    CHECK(a_shape.rules > head_shape.rules
+          && a_shape.texts > head_shape.texts
+          && a_shape.images > head_shape.images
+          && a_shape.math_programs > head_shape.math_programs
+          && a_shape.transitions > head_shape.transitions
+          && a_shape.counters > head_shape.counters);
+
+    /* Page A is laid out and painted (lazy pools fill), then retires. */
+    uint64_t hash = 0;
+    int height = 0;
+    CHECK(head_reuse_render(&budget, &document_a, &reused, frame,
+                            &hash, &height));
+    stylesheet_prepare_for_document_reuse(&reused);
+    uint64_t generation = reused.build_generation;
+    CHECK(stylesheet_truncate_to_head(&reused, true)
+          && reused.build_generation != generation);
+    HeadReuseShape cut_shape = head_reuse_shape(&reused);
+    CHECK(memcmp(&cut_shape, &head_shape, sizeof(head_shape)) == 0);
+
+    /* Page B appends its own body source to the cut sheet. */
+    stylesheet_set_head_mark(&reused);
+    lxb_dom_node_t *elements[] = {style_b};
+    CHECK(stylesheet_append_style_elements(&reused, elements, 1, NULL));
+    HeadReuseShape reused_shape = head_reuse_shape(&reused);
+    HeadReuseShape b_shape = head_reuse_shape(&fresh_b);
+    CHECK(memcmp(&reused_shape, &b_shape, sizeof(b_shape)) == 0);
+    lxb_dom_node_t *root = lxb_dom_interface_node(document_b.html);
+    lxb_dom_node_t *box = find_id(root, "box");
+    lxb_dom_node_t *plain = find_id(root, "plain");
+    CHECK(box != NULL && plain != NULL);
+    ComputedStyle reused_box = style_for_node(&reused, box, NULL);
+    ComputedStyle reused_plain = style_for_node(&reused, plain, NULL);
+    ComputedStyle fresh_box = style_for_node(&fresh_b, box, NULL);
+    ComputedStyle fresh_plain = style_for_node(&fresh_b, plain, NULL);
+    CHECK(reused_box.color == 0x0000ff && reused_plain.color != 0xff0000
+          && reused_plain.color == fresh_plain.color
+          && reused_box.border.top == fresh_box.border.top
+          && reused_box.padding.top == 4);
+    uint64_t fresh_hash = 0, reused_hash = 0;
+    int fresh_height = 0, reused_height = 0;
+    CHECK(head_reuse_render(&budget, &document_b, &fresh_b, frame,
+                            &fresh_hash, &fresh_height)
+          && head_reuse_render(&budget, &document_b, &reused, frame,
+                               &reused_hash, &reused_height)
+          && fresh_hash == reused_hash && fresh_height == reused_height);
+
+    /* The reused sheet carries a fresh mark: it cuts back again for the
+       next page, still to the head-only sheet. */
+    stylesheet_prepare_for_document_reuse(&reused);
+    CHECK(stylesheet_truncate_to_head(&reused, true));
+    cut_shape = head_reuse_shape(&reused);
+    CHECK(memcmp(&cut_shape, &head_shape, sizeof(head_shape)) == 0);
+
+    /* A <head> source parsed after a body source (a late stylesheet) ends
+       the head prefix: no cut. */
+    Stylesheet late = {0};
+    CHECK(stylesheet_build(&late, &budget, &document_a, 480));
+    lxb_dom_node_t *head_style = NULL;
+    lxb_dom_node_t *head = lxb_dom_interface_node(
+        lxb_html_document_head_element(document_a.html));
+    for (lxb_dom_node_t *node = head == NULL ? NULL : head->first_child;
+         node != NULL && head_style == NULL; node = node->next) {
+        if (node->local_name == LXB_TAG_STYLE) head_style = node;
+    }
+    CHECK(head_style != NULL);
+    elements[0] = head_style;
+    CHECK(stylesheet_append_style_elements(&late, elements, 1, NULL)
+          && late.head_mark.state == STYLE_HEAD_MARK_INVALID
+          && !stylesheet_truncate_to_head(&late, true));
+    stylesheet_destroy(&late);
+
+    /* The user stylesheet, which the commit adds after the document's
+       sources, is cut with the body; added again before the next page's
+       body source, it renders as that page's own build with it. */
+    static const char user[] = ".box{letter-spacing:1px}p{color:#010203}"
+        "h1{border-top:1px solid #445566}";
+    Stylesheet user_a = {0}, user_b = {0};
+    CHECK(stylesheet_build(&user_a, &budget, &document_a, 480)
+          && stylesheet_add_user_css(&user_a, user, sizeof(user) - 1u)
+          && stylesheet_build(&user_b, &budget, &document_b, 480)
+          && stylesheet_add_user_css(&user_b, user, sizeof(user) - 1u));
+    stylesheet_prepare_for_document_reuse(&user_a);
+    CHECK(stylesheet_truncate_to_head(&user_a, true));
+    cut_shape = head_reuse_shape(&user_a);
+    CHECK(memcmp(&cut_shape, &head_shape, sizeof(head_shape)) == 0);
+    stylesheet_set_head_mark(&user_a);
+    elements[0] = style_b;
+    CHECK(stylesheet_add_user_css(&user_a, user, sizeof(user) - 1u)
+          && stylesheet_append_style_elements(&user_a, elements, 1, NULL));
+    reused_shape = head_reuse_shape(&user_a);
+    b_shape = head_reuse_shape(&user_b);
+    CHECK(memcmp(&reused_shape, &b_shape, sizeof(b_shape)) == 0);
+    CHECK(head_reuse_render(&budget, &document_b, &user_b, frame,
+                            &fresh_hash, &fresh_height)
+          && head_reuse_render(&budget, &document_b, &user_a, frame,
+                               &reused_hash, &reused_height)
+          && fresh_hash == reused_hash && fresh_height == reused_height);
+    stylesheet_destroy(&user_b);
+    stylesheet_destroy(&user_a);
+
+    /* A user rule inside the head part would be kept by the cut and then
+       added again: refused, the sheet unchanged. */
+    Stylesheet user_head = {0};
+    CHECK(stylesheet_build(&user_head, &budget, &head_only, 480)
+          && stylesheet_add_user_css(&user_head, user, sizeof(user) - 1u));
+    stylesheet_set_head_mark(&user_head);
+    CHECK(stylesheet_append_style_elements(&user_head, elements, 1, NULL));
+    HeadReuseShape user_before = head_reuse_shape(&user_head);
+    CHECK(!stylesheet_truncate_to_head(&user_head, true));
+    HeadReuseShape user_after = head_reuse_shape(&user_head);
+    CHECK(memcmp(&user_before, &user_after, sizeof(user_before)) == 0);
+    stylesheet_destroy(&user_head);
+
+    stylesheet_destroy(&reused);
+    stylesheet_destroy(&fresh_b);
+    stylesheet_destroy(&fresh_head);
+    budget_free(&budget, frame);
+
+    /* Body sources that change what a mark cannot roll back. */
+    CHECK(head_reuse_expect_refusal(&budget, ":root{--accent:#ff0000}") == 0);
+    CHECK(head_reuse_expect_refusal(&budget, "@layer late{p{color:red}}") == 0);
+    CHECK(head_reuse_expect_refusal(
+              &budget, "@keyframes spin{from{opacity:0}to{opacity:1}}") == 0);
+    CHECK(head_reuse_expect_refusal(
+              &budget, "@property --size{syntax:'<length>';inherits:false;"
+              "initial-value:0px}") == 0);
+    CHECK(head_reuse_expect_refusal(
+              &budget, "@font-face{font-family:Late;src:url(/late.woff)}") == 0);
+
+    document_destroy(&document_b);
+    document_destroy(&document_a);
+    document_destroy(&head_only);
     CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
     return 0;
 }
@@ -6940,6 +7708,12 @@ int main(int argc, char **argv)
         return test_variable_background_shorthand();
     CHECK(test_fixed_implicit_column_overflow() == 0);
     CHECK(test_variable_background_shorthand() == 0);
+    if (argc == 2 && strcmp(argv[1], "--deferred-scan-units-only") == 0)
+        return test_deferred_scan_unit_detection();
+    CHECK(test_deferred_scan_unit_detection() == 0);
+    if (argc == 2 && strcmp(argv[1], "--head-truncation-only") == 0)
+        return test_head_truncation_matches_fresh_build();
+    CHECK(test_head_truncation_matches_fresh_build() == 0);
     CHECK(test_legacy_grid_gap_shorthand() == 0);
     CHECK(test_padding_initial_shorthand() == 0);
     CHECK(test_long_math_letter_spacing() == 0);
@@ -7009,6 +7783,12 @@ int main(int argc, char **argv)
         return test_selector_attribute_names();
     if (argc == 2 && strcmp(argv[1], "--shadow-scope-refusal-only") == 0)
         return test_shadow_scope_allocation_refusal();
+    if (argc == 2 && strcmp(argv[1], "--shadow-carrier-scan-only") == 0)
+        return test_shadow_carrier_scan_memo();
+    if (argc == 2 && strcmp(argv[1], "--document-attribute-only") == 0)
+        return test_document_attribute_matches_by_name();
+    if (argc == 2 && strcmp(argv[1], "--shadow-carrier-marker-only") == 0)
+        return test_shadow_carrier_is_the_marker();
     if (argc == 2 && strcmp(argv[1], "--attribute-bench-only") == 0)
         return benchmark_selector_attribute_names();
     if (argc == 2 && strcmp(argv[1], "--escaped-utilities-only") == 0)
@@ -7018,7 +7798,13 @@ int main(int argc, char **argv)
     CHECK(test_transition_candidate_rejection() == 0);
     CHECK(test_selector_attribute_names() == 0);
     CHECK(test_shadow_scope_allocation_refusal() == 0);
+    CHECK(test_shadow_carrier_scan_memo() == 0);
+    CHECK(test_shadow_carrier_is_the_marker() == 0);
+    CHECK(test_document_attribute_matches_by_name() == 0);
     CHECK(test_computed_style_payload_storage() == 0);
+    CHECK(test_computed_style_shared_payloads() == 0);
+    CHECK(test_computed_style_subtree_drop() == 0);
+    CHECK(test_computed_style_large_page_walks() == 0);
     CHECK(test_sparse_selector_metadata() == 0);
     CHECK(test_selector_metadata_refusal() == 0);
     CHECK(benchmark_selector_attribute_names() == 0);

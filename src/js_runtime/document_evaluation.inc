@@ -202,7 +202,8 @@ ScriptInlineDataEvaluation script_runtime_evaluate_inline_data(
     memcpy(copy, source, source_length);
     copy[source_length] = '\0';
 
-    js_rt_runtime_arm_watchdog(runtime);
+    if (!JS_IsStackActive(runtime->runtime))
+        js_rt_runtime_arm_watchdog(runtime);
     if (!script_runtime_refresh_named_properties(runtime)) {
         budget_free(runtime->budget, copy);
         js_rt_runtime_finish_slice_state(runtime);
@@ -271,44 +272,103 @@ bool script_runtime_block_inline_tracker(ScriptRuntime *runtime, lxb_dom_node_t 
         && js_rt_inline_tracker_blocked(&runtime->bridge, node, NULL, 0);
 }
 
-bool script_runtime_evaluate_inline(ScriptRuntime *runtime,
-                                    lxb_dom_node_t *script_node,
-                                    bool module, ScriptResult *result)
+/* The total text length of a script's children (the text an inline
+   script runs), SIZE_MAX on overflow; *text_children, when given, gets the
+   number of children with text. */
+static size_t js_rt_inline_source_length(lxb_dom_node_t *script_node,
+                                         size_t *text_children)
 {
-    if (runtime == NULL || script_node == NULL) return false;
-    js_rt_runtime_arm_watchdog(runtime);
-    if (!script_runtime_refresh_named_properties(runtime)) {
-        js_rt_runtime_update_result(runtime, result);
-        return false;
-    }
-    size_t source_length = 0;
+    size_t total = 0, children = 0;
     for (lxb_dom_node_t *child = script_node->first_child;
          child != NULL; child = child->next) {
         size_t length = 0;
         const char *source = document_text_data(child, &length);
         if (source == NULL || length == 0) continue;
-        if (length > SIZE_MAX - source_length) return false;
-        source_length += length;
+        if (length >= SIZE_MAX - total) return SIZE_MAX;
+        total += length;
+        children++;
     }
+    if (text_children != NULL) *text_children = children;
+    return total;
+}
+
+/* The script's text where the DOM keeps it, when it is one child's
+   NUL-terminated text of `source_length` bytes; NULL otherwise. Lexbor
+   keeps character data terminated (it allocates one byte more). */
+static const char *js_rt_inline_source_in_place(lxb_dom_node_t *script_node,
+                                                size_t source_length)
+{
+    size_t children = 0;
+    if (js_rt_inline_source_length(script_node, &children) != source_length
+        || children != 1u) return NULL;
+    for (lxb_dom_node_t *child = script_node->first_child;
+         child != NULL; child = child->next) {
+        size_t length = 0;
+        const char *source = document_text_data(child, &length);
+        if (source == NULL || length == 0) continue;
+        return length == source_length && source[length] == '\0'
+            ? source : NULL;
+    }
+    return NULL;
+}
+
+/* The script's children's text assembled into one terminated Budget
+   copy, or NULL when the Budget refuses it. */
+static char *js_rt_inline_source_assemble(ScriptRuntime *runtime,
+                                          lxb_dom_node_t *script_node,
+                                          size_t source_length)
+{
+    char *copy = budget_malloc(runtime->budget, source_length + 1);
+    if (copy == NULL) return NULL;
+    size_t copied = 0;
+    for (lxb_dom_node_t *child = script_node->first_child;
+         child != NULL; child = child->next) {
+        size_t length = 0;
+        const char *source = document_text_data(child, &length);
+        if (source == NULL || length == 0) continue;
+        if (length > source_length - copied) break;
+        memcpy(copy + copied, source, length);
+        copied += length;
+    }
+    copy[copied] = '\0';
+    return copy;
+}
+
+bool script_runtime_evaluate_inline(ScriptRuntime *runtime,
+                                    lxb_dom_node_t *script_node,
+                                    bool module, ScriptResult *result)
+{
+    if (runtime == NULL || script_node == NULL) return false;
+    /* A script document.write() runs inside its writer (nested) shares the
+       writer's watchdog deadline; re-arming would let a writing loop run
+       forever. */
+    if (!JS_IsStackActive(runtime->runtime))
+        js_rt_runtime_arm_watchdog(runtime);
+    if (!script_runtime_refresh_named_properties(runtime)) {
+        js_rt_runtime_update_result(runtime, result);
+        return false;
+    }
+    size_t source_length = js_rt_inline_source_length(script_node, NULL);
     if (source_length == SIZE_MAX) return false;
+    /* A script of one text child (every parsed script) compiles from the
+       DOM's own text instead of a copy; several children are assembled
+       into one, before the inline-tracker check that reads them. */
     char *source_copy = NULL;
-    if (source_length != 0) {
-        source_copy = budget_malloc(runtime->budget, source_length + 1);
+    const char *source = NULL;
+    if (source_length != 0
+        && js_rt_inline_source_in_place(script_node, source_length)
+               == NULL) {
+        source_copy = js_rt_inline_source_assemble(runtime, script_node,
+                                                   source_length);
         if (source_copy == NULL) return false;
-        size_t copied = 0;
-        for (lxb_dom_node_t *child = script_node->first_child;
-             child != NULL; child = child->next) {
-            size_t length = 0;
-            const char *source = document_text_data(child, &length);
-            if (source == NULL || length == 0) continue;
-            memcpy(source_copy + copied, source, length);
-            copied += length;
-        }
-        source_copy[copied] = '\0';
     }
-    if (!module && source_copy != NULL
-        && js_rt_inline_tracker_blocked(&runtime->bridge, script_node,
-                                        source_copy, source_length)) {
+    if (!module && source_length != 0
+        && js_rt_inline_tracker_blocked(
+               &runtime->bridge, script_node,
+               source_copy != NULL ? source_copy
+                   : js_rt_inline_source_in_place(script_node,
+                                                  source_length),
+               source_length)) {
         budget_free(runtime->budget, source_copy);
         return true;
     }
@@ -319,6 +379,28 @@ bool script_runtime_evaluate_inline(ScriptRuntime *runtime,
         runtime->context, script_node, module, &previous_current_script,
         &runtime->result);
     bool evaluated = current_script_active;
+    /* The in-place text is taken just before the compile, after the
+       currentScript wrapper exists. Nothing can change or free it before
+       the compile ends: the compile runs no author code (its cooperate
+       callback only presents and polls; author tasks wait for the event
+       loop), its collections do not destroy DOM nodes, and the Budget's
+       reclaim hook frees only caches. QuickJS keeps no pointer into its
+       input once the compile returns (lazy functions hold their own copy or
+       the realm's stored one), so the script may then rewrite or remove its
+       own text. Should the text no longer be one terminated child of the
+       same length, it is assembled after all. */
+    if (evaluated && source_length != 0 && source_copy == NULL) {
+        source = js_rt_inline_source_in_place(script_node, source_length);
+        if (source == NULL) {
+            source_length = js_rt_inline_source_length(script_node, NULL);
+            source_copy = source_length == SIZE_MAX ? NULL
+                : js_rt_inline_source_assemble(runtime, script_node,
+                                               source_length);
+            if (source_copy == NULL && source_length != 0)
+                evaluated = false;
+        }
+    }
+    if (source_copy != NULL) source = source_copy;
     char module_name[2200];
     char module_referrer_policy[BROWSER_MODULE_REFERRER_POLICY_LIMIT] = {0};
     const char *name = "<inline-script>";
@@ -338,7 +420,7 @@ bool script_runtime_evaluate_inline(ScriptRuntime *runtime,
     }
     if (evaluated && source_length != 0) {
         evaluated = js_rt_evaluate_source_type_at(
-            runtime->context, source_copy, source_length, name,
+            runtime->context, source, source_length, name,
             module ? module_base : name,
             module ? module_referrer_policy : NULL,
             module ? runtime->active_module_credentials

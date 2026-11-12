@@ -88,9 +88,14 @@ report. For YouTube videos:
   or after an age check. Sign in from the YouTube homepage, then press Cross
   to retry.
 - `THIS VIDEO ISN'T AVAILABLE`: it is private or removed, blocked in your
-  region, or YouTube refused it to this player. The second line says which.
+  region, a paid title, or YouTube refused it to this player. The second line
+  says which. Paid titles (rentals and purchases) never play here.
 - `THIS VIDEO HASN'T STARTED YET`: a premiere or live stream that has not
   begun. Try again once it starts.
+- `THIS VIDEO IS COPY-PROTECTED`: YouTube offers it only with DRM, as it
+  does for its free-with-ads movies and shows. The PSP has no DRM
+  decryption, so these never play. Full-length films that channels upload
+  as ordinary videos are not protected and play normally.
 - `NETWORK PROBLEM`: the request to YouTube failed or timed out. Check the
   Wi-Fi connection, then press Cross to retry.
 - `NOT ENOUGH MEMORY FOR VIDEO`: the PSP could not find memory for the

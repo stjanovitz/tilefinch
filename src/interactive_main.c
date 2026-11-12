@@ -1,5 +1,6 @@
 #include <ctype.h>
 #include "tilefinch_test_faults.h"
+#include "image_svg_decode_internal.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,6 +27,7 @@
 #include "tilefinch/work_vector.h"
 #include "tilefinch/fetch.h"
 #include "tilefinch/font.h"
+#include "tilefinch/glyph_component.h"
 #include "tilefinch/host_media.h"
 #include "tilefinch/media_candidates.h"
 #ifdef TILEFINCH_HAVE_MEDIA_REPLAY_CHECK
@@ -120,6 +122,62 @@ static HostPlatformSimulator *host_platform_simulator;
 #include "interactive/media.inc"
 #include "interactive/commands.inc"
 
+/* --pending-load: load the start URL as the PSP app does, as a pending
+   navigation job pumped with the app's slice quota (psp_navigation_quota)
+   and painting its load preview, instead of the synchronous load. With
+   --pending-load-page-downs N, the reader pages down N times on the live
+   preview, one press per pump once a complete screen is up. Prints the
+   job's reader-screen times (0 = never) for tools/site-census. */
+static bool interactive_pending_load(BrowserEngine *engine, const char *url,
+                                     size_t maximum_bytes, long timeout_ms,
+                                     unsigned page_downs)
+{
+    BrowserNavigationJobQuota quota = {
+        .load = {
+            .fetch = {
+                .maximum_body_bytes = 16u * KIB,
+                .maximum_body_callbacks = 1,
+                .maximum_time_us = 2000
+            },
+            .maximum_parser_body_bytes = 2u * KIB,
+            .maximum_parser_time_us = 2000,
+            .maximum_finalize_work_units = 2048,
+            .maximum_finalize_time_us = 2000
+        }
+    };
+    if (!browser_engine_begin_navigation_url(
+            engine, url, maximum_bytes, timeout_ms, true)) return false;
+    BrowserNavigationJobStatus status = BROWSER_NAVIGATION_JOB_PENDING;
+    unsigned pressed = 0;
+    size_t pumps = 0;
+    for (; status == BROWSER_NAVIGATION_JOB_PENDING
+           && pumps < (size_t) 50000000u; pumps++) {
+        status = browser_engine_pump_navigation(engine, &quota);
+        BrowserProvisionalViewport preview;
+        if (status == BROWSER_NAVIGATION_JOB_PENDING && pressed < page_downs
+            && browser_engine_provisional_viewport(engine, &preview)
+            && preview.complete
+            && browser_engine_scroll_provisional_page(engine, 1))
+            pressed++;
+        while (browser_engine_provisional_raster_step(engine)) {}
+    }
+    if (status == BROWSER_NAVIGATION_JOB_PENDING)
+        browser_engine_cancel_navigation(engine, "lab pending-load limit");
+    BrowserNavigationJobMetrics job = {0};
+    (void) browser_engine_navigation_job_metrics(engine, &job);
+    printf("pending-load status=%d pumps=%zu elapsed-us=%llu "
+           "first-present-us=%llu first-content-us=%llu first-text-us=%llu "
+           "reading-hint-us=%llu/%llu preview-paints=%zu page-downs=%u/%u\n",
+           (int) job.status, pumps, (unsigned long long) job.elapsed_us,
+           (unsigned long long) job.provisional_first_present_us,
+           (unsigned long long) job.first_content_us,
+           (unsigned long long) job.first_text_us,
+           (unsigned long long) job.reading_hint_shown_us,
+           (unsigned long long) job.reading_hint_cleared_us,
+           job.provisional_paints, pressed, page_downs);
+    return job.status == BROWSER_NAVIGATION_JOB_SUCCEEDED;
+}
+
 static bool interactive_restore_base_user_css(
     BrowserEngine *engine, NavigationSession *navigation,
     bool hide_cookie_banners, const char *user_css)
@@ -140,6 +198,30 @@ static bool interactive_restore_base_user_css(
         && browser_engine_apply_user_css(engine, css, length);
     budget_free(navigation->budget, css);
     return restored;
+}
+
+/* --user-css-before-load: the user sheet (cookie-banner CSS or --user-css)
+   is set before the first load, as the PSP app sets its presentation CSS
+   before each navigation (psp_set_presentation_css), so the page's first
+   sheet is compiled with it and no whole-sheet rebuild follows the load.
+   Without it the lab applies the sheet after the load and rebuilds. */
+static bool interactive_set_user_css_before_load(
+    NavigationSession *navigation, bool hide_cookie_banners,
+    const char *user_css)
+{
+    if (hide_cookie_banners) {
+        char css[CONTENT_BLOCKER_COOKIE_CSS_LIMIT];
+        size_t length = 0u;
+        return content_blocker_cookie_banner_css(css, sizeof(css), &length)
+            && navigation_set_user_css(navigation, css, length);
+    }
+    if (user_css == NULL) return true;
+    size_t length = 0u;
+    char *css = read_file(navigation->budget, user_css, &length);
+    bool set = css != NULL && length <= 128u * KIB
+        && navigation_set_user_css(navigation, css, length);
+    budget_free(navigation->budget, css);
+    return set;
 }
 
 /* Host-only seam in navigation (parser_script_checkpoint.inc). */
@@ -437,11 +519,17 @@ int main(int argc, char **argv)
     bool external_resources = true;
     bool web_fonts_enabled = true;
     bool psp_fonts = false;
+    const char *glyph_pack_path = NULL;
+    const char *glyph_pack_id = NULL;
+    TilefinchGlyphProvider *glyph_provider = NULL;
     WebFontMode web_font_mode = WEB_FONTS_SMART;
     bool forced_dark = false;
     bool progressive_first_paint = true;
+    bool pending_load = false;
+    unsigned pending_load_page_downs = 0;
     uint64_t relayout_preview_us = UINT64_C(150000);
     bool hide_cookie_banners = false;
+    bool user_css_before_load = false;
     bool reader_mode = false;
     bool wpt_test_rendered = false;
     bool low_memory_navigation = false;
@@ -453,6 +541,11 @@ int main(int argc, char **argv)
         if (strcmp(argv[i], "--fetch-scripts") == 0) fetch_scripts = true;
         else if (strcmp(argv[i], "--no-web-fonts") == 0) web_fonts_enabled = false;
         else if (strcmp(argv[i], "--psp-fonts") == 0) psp_fonts = true;
+        else if (strcmp(argv[i], "--glyph-pack") == 0) {
+            if (i + 2 >= argc) { usage(argv[0]); return 2; }
+            glyph_pack_path = argv[++i];
+            glyph_pack_id = argv[++i];
+        }
         else if (strcmp(argv[i], "--web-font-mode") == 0 && i + 1 < argc) {
             const char *mode = argv[++i];
             if (strcmp(mode, "on") == 0) web_font_mode = WEB_FONTS_ON;
@@ -511,6 +604,15 @@ int main(int argc, char **argv)
         else if (strcmp(argv[i], "--no-progressive-first-paint") == 0) {
             progressive_first_paint = false;
         }
+        else if (strcmp(argv[i], "--pending-load") == 0) {
+            pending_load = true;
+        }
+        else if (strcmp(argv[i], "--pending-load-page-downs") == 0
+                 && i + 1 < argc) {
+            pending_load = true;
+            pending_load_page_downs =
+                (unsigned) strtoul(argv[++i], NULL, 10);
+        }
         else if (strcmp(argv[i], "--relayout-preview-us") == 0
                  && i + 1 < argc) {
             relayout_preview_us = strtoull(argv[++i], NULL, 10);
@@ -520,6 +622,9 @@ int main(int argc, char **argv)
         }
         else if (strcmp(argv[i], "--hide-cookie-banners") == 0) {
             hide_cookie_banners = true;
+        }
+        else if (strcmp(argv[i], "--user-css-before-load") == 0) {
+            user_css_before_load = true;
         }
         else if (strcmp(argv[i], "--reader-mode") == 0) {
             reader_mode = true;
@@ -1131,6 +1236,8 @@ int main(int argc, char **argv)
         return 1;
     }
     char engine_error[256] = {0};
+    size_t pending_load_bytes = engine_config->maximum_document_bytes;
+    long pending_load_timeout_ms = engine_config->navigation_timeout_ms;
     BrowserEngine *engine = browser_engine_create(
         engine_config, engine_error, sizeof(engine_error));
     free(engine_config);
@@ -1285,11 +1392,38 @@ int main(int argc, char **argv)
     }
 
     if (!browser_engine_set_page_zoom(engine, page_zoom)) goto cleanup;
+    if (glyph_pack_path != NULL) {
+        /* Host only: draws a local pack without the signed install, so a pack
+           under development can be judged through the real layout and paint. */
+        glyph_provider = tilefinch_glyph_provider_create(budget);
+        if (glyph_provider == NULL
+            || !tilefinch_glyph_provider_attach(
+                   glyph_provider, glyph_pack_path, glyph_pack_id)
+            || !font_optional_glyph_provider_install(glyph_provider)) {
+            fprintf(stderr, "glyph pack setup failed: %s\n", glyph_pack_path);
+            goto cleanup;
+        }
+    }
     navigation_enable_frame_capability_trace(&navigation, trace_frames);
     navigation_enable_page_capability_trace(&navigation, trace_page);
     navigation_enable_diagnostic_frame_safari(
         &navigation, diagnostic_frame_safari);
-    if (url != NULL) {
+    if (user_css_before_load) {
+        if (hide_cookie_banners && user_css != NULL) {
+            fprintf(stderr, "cookie-banner and file user CSS cannot be combined\n");
+            goto cleanup;
+        }
+        if (!interactive_set_user_css_before_load(
+                &navigation, hide_cookie_banners, user_css)) {
+            fprintf(stderr, "interactive user stylesheet before load failed\n");
+            goto cleanup;
+        }
+    }
+    if (url != NULL && pending_load) {
+        if (!interactive_pending_load(
+                engine, url, pending_load_bytes, pending_load_timeout_ms,
+                pending_load_page_downs)) goto cleanup;
+    } else if (url != NULL) {
         if (!browser_engine_load_url(engine, url, true)) goto cleanup;
     } else {
         size_t input_length = 0;
@@ -1824,7 +1958,9 @@ int main(int argc, char **argv)
         fprintf(stderr, "cookie-banner and file user CSS cannot be combined\n");
         goto cleanup;
     }
-    if (hide_cookie_banners) {
+    if (user_css_before_load) {
+        /* Set before the load; the first sheet already holds it. */
+    } else if (hide_cookie_banners) {
         char cookie_css[8192];
         size_t cookie_css_length = 0;
         if (!content_blocker_cookie_banner_css(
@@ -1990,6 +2126,20 @@ int main(int argc, char **argv)
             remaining = 240;
             dump_probe_dom(extracted, 0, &remaining);
         }
+    }
+    /* A paint queues the pack blocks it missed; read them and paint again, as
+       the app's frame loop does, until a paint misses nothing. */
+    for (unsigned pass = 0; glyph_provider != NULL && pass < 256u; pass++) {
+        if (!loop_render(engine, &cache, &navigation, &controller, &media,
+                         NULL, NULL)) goto cleanup;
+        bool read_any = false;
+        bool changed = false;
+        while (tilefinch_glyph_provider_pump(
+                   glyph_provider, 64u * KIB, &changed, NULL) && changed) {
+            read_any = true;
+        }
+        if (!read_any) break;
+        (void) browser_engine_optional_glyph_payloads_ready(engine);
     }
     bool loop_mode = interactive_loop || commands_path != NULL;
     if ((loop_mode
@@ -2250,8 +2400,27 @@ int main(int argc, char **argv)
            navigation.page.images.stats.largest_source_decode_bytes,
            navigation.page.images.stats.largest_target_decode_bytes,
            navigation.page.images.stats.largest_decode_working_bytes);
+    /* A page with a script runtime plans its parser <img> elements for the
+       post-commit queue, which `tick` never runs (`pump` and `drain` do, as
+       the PSP loop does). Report what is still queued so a run that ended
+       with images=0/0 and queued targets is not read as "no images". */
+    size_t deferred_images_queued =
+        navigation.page.deferred_image_targets != NULL
+            && navigation.page.deferred_image_cursor
+                   < navigation.page.deferred_image_count
+        ? navigation.page.deferred_image_count
+              - navigation.page.deferred_image_cursor
+        : 0;
+    printf("image-queue queued=%zu batches=%zu pending=%s\n",
+           deferred_images_queued,
+           navigation.performance.background_image_batches,
+           deferred_images_queued != 0
+               && navigation.page.image_continuation_pending
+               ? "yes" : "no");
     printf("image-retarget scans=%zu shrinks=%zu grows=%zu drops=%zu "
-           "rasters=%zu deferred=%zu released=%zu restored=%zu us=%llu\n",
+           "rasters=%zu deferred=%zu released=%zu restored=%zu us=%llu "
+           "distant-deferred=%zu distant-releases=%zu distant-restores=%zu "
+           "distant-input-restores=%zu svg-parses=%zu\n",
            navigation.page.images.retarget.scans,
            navigation.page.images.retarget.shrinks,
            navigation.page.images.retarget.grows,
@@ -2260,7 +2429,12 @@ int main(int argc, char **argv)
            navigation.page.images.retarget.deferred,
            navigation.page.images.retarget.released_bytes,
            navigation.page.images.retarget.restored_bytes,
-           (unsigned long long) navigation.page.images.retarget.us);
+           (unsigned long long) navigation.page.images.retarget.us,
+           navigation.page.images.retarget.distant_deferred,
+           navigation.page.images.retarget.distant_releases,
+           navigation.page.images.retarget.distant_restores,
+           navigation.page.images.retarget.distant_input_restores,
+           image_svg_parse_count());
     printf("image-network fetch-failures=%zu/%zu/%zu/%zu/%zu/%zu "
            "progress=%zu/%zu/%zu stalled-polls=%zu "
            "no-progress-cancelled=%zu origin-cooldown=%zu/%zu "
@@ -2528,7 +2702,7 @@ int main(int argc, char **argv)
            "fingerprint-us=%llu viewport-rebuilds=%zu "
            "sheet-bounded-out=%u adopted-sources=%u "
            "prepared=%zu/%zu prepare-pumps=%zu prepare-max-us=%llu "
-           "prepare-us=%llu\n",
+           "prepare-us=%llu head-cache=%zu/%zu\n",
            navigation.performance.blocking_stylesheet_builds,
            navigation.performance.blocking_stylesheet_reuses,
            navigation.performance.blocking_stylesheet_adoptions,
@@ -2576,7 +2750,9 @@ int main(int argc, char **argv)
            (unsigned long long)
              navigation.performance.blocking_stylesheet_prepare_max_step_us,
            (unsigned long long)
-             navigation.performance.blocking_stylesheet_prepare_us);
+             navigation.performance.blocking_stylesheet_prepare_us,
+           navigation.performance.compiled_stylesheet_cache_head_hits,
+           navigation.performance.compiled_stylesheet_cache_head_refusals);
     uint64_t parser_native_us =
         navigation.performance.parser_feed_us
             >= navigation.performance.parser_callback_us
@@ -2750,7 +2926,7 @@ int main(int argc, char **argv)
            "subject-cache=%llu/%llu tag-id=%llu "
            "compound-rejects=%llu/%llu "
            "relative=%llu/%llu/%llu visits=%llu max-visits=%llu "
-           "exhausted=%llu\n",
+           "exhausted=%llu retained=%llu/%llu\n",
            (unsigned long long) selector_profile->selector_match_calls,
            (unsigned long long) selector_profile->selector_match_successes,
            (unsigned long long) selector_profile->selector_match_characters,
@@ -2788,7 +2964,9 @@ int main(int argc, char **argv)
            (unsigned long long)
              selector_profile->selector_relative_max_visits,
            (unsigned long long)
-             selector_profile->selector_relative_exhaustions);
+             selector_profile->selector_relative_exhaustions,
+           (unsigned long long) selector_profile->retained_lookup_calls,
+           (unsigned long long) selector_profile->retained_gate_skips);
     printf("frame-attribution-us setup=%llu/%llu tiles=%llu/%llu "
            "overflow=%llu/%llu sticky=%llu/%llu fixed=%llu/%llu "
            "indicator=%llu\n",
@@ -2813,7 +2991,8 @@ int main(int argc, char **argv)
            "mutation-conservative=%zu "
            "journal-overflows=%zu image-rebuilds=%zu semantic-skips=%zu "
            "hidden-skips=%zu "
-           "focus-outline-skips=%zu focus-paint-skips=%zu\n",
+           "focus-outline-skips=%zu focus-paint-skips=%zu "
+           "viewport-looks=%zu viewport-evictions=%zu\n",
            navigation.performance.resource_fingerprint_scans,
            navigation.performance.mutation_fast_relayouts,
            navigation.performance.mutation_resource_rebuilds,
@@ -2824,7 +3003,9 @@ int main(int argc, char **argv)
            navigation.performance.semantic_relayout_skips,
            navigation.performance.hidden_relayout_skips,
            navigation.performance.focus_outline_relayout_skips,
-           navigation.performance.focus_paint_relayout_skips);
+           navigation.performance.focus_paint_relayout_skips,
+           navigation.performance.viewport_image_looks,
+           navigation.performance.viewport_image_evictions);
     LayoutReuseStats reuse_stats = {0};
     if (navigation.page.layout_reuse != NULL) {
         layout_reuse_cache_stats(navigation.page.layout_reuse, &reuse_stats);
@@ -3052,7 +3233,7 @@ int main(int argc, char **argv)
     }
     printf("javascript-dom-handles live=%zu peak=%zu high-water=%zu "
            "reuses=%zu exhaustions=%zu wrapper-releases=%zu "
-           "connected-preserves=%zu stale-releases=%zu capacity=%zu "
+           "connected-preserves=%zu held-wrappers=%zu stale-releases=%zu capacity=%zu "
            "growths=%zu growth-refusals=%zu\n",
            navigation.page.script_result.dom_handle_slots_live,
            navigation.page.script_result.dom_handle_slots_peak,
@@ -3061,6 +3242,7 @@ int main(int argc, char **argv)
            navigation.page.script_result.dom_handle_exhaustions,
            navigation.page.script_result.dom_handle_wrapper_releases,
            navigation.page.script_result.dom_handle_connected_preserves,
+           navigation.page.script_result.dom_handle_wrappers_held_peak,
            navigation.page.script_result.dom_handle_stale_releases,
            navigation.page.script_result.dom_handle_slot_capacity,
            navigation.page.script_result.dom_handle_growths,
@@ -3849,6 +4031,10 @@ cleanup:
     budget_free(budget, frame_probe_source);
     budget_free(budget, input);
     budget_free(budget, application);
+    if (glyph_provider != NULL) {
+        (void) font_optional_glyph_provider_uninstall(glyph_provider);
+        tilefinch_glyph_provider_destroy(glyph_provider);
+    }
     bool engine_clean = browser_engine_shutdown(engine);
     /* Scheduler shutdown finalizes or truthfully records cancellation for
        every captured async request. Publish trace authority only afterward,

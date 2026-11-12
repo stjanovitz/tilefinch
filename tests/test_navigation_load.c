@@ -1,4 +1,5 @@
 #include "tilefinch/budget.h"
+#include "tilefinch/content_blocker.h"
 #include "tilefinch/fetch.h"
 #include "tilefinch/image_retarget.h"
 #include "tilefinch/layout.h"
@@ -7,8 +8,10 @@
 #include "tilefinch/platform.h"
 #include "tilefinch/render.h"
 #include "tilefinch/script_loader.h"
+#include "tilefinch/site_adapter.h"
 #include "tilefinch/style.h"
 #include "tilefinch/user_agent.h"
+#include "tilefinch/work_vector.h"
 #include "../src/image_decode_internal.h"
 #include "../src/image_svg_decode_internal.h"
 #include "../src/js_runtime_internal.h"
@@ -16,6 +19,7 @@
 #include "../src/navigation_staging_policy.h"
 #include "../src/tilefinch_test_faults.h"
 #include "tilefinch_test_clocks.h"
+#include "bootstrap_resident_probe.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -343,14 +347,6 @@ static bool csp_gate_replay_begin(void)
         error, sizeof(error));
 }
 
-static bool frame_policy_replay_begin(void)
-{
-    char error[256] = {0};
-    return fetch_trace_replay_begin(
-        TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-frame-policy",
-        error, sizeof(error));
-}
-
 typedef struct {
     size_t calls;
     size_t rollbacks;
@@ -361,7 +357,18 @@ typedef struct {
     bool painted_image;
     bool script_ran_at_paint;
     bool fail_after_paint;
+    size_t resolved_images;
 } ProgressivePreviewProbe;
+
+static size_t layout_resolved_images(const LayoutDocument *layout)
+{
+    size_t resolved = 0;
+    for (size_t i = 0; i < layout->count; i++) {
+        if (layout->commands[i].type == DRAW_IMAGE
+            && layout->commands[i].image != NULL) resolved++;
+    }
+    return resolved;
+}
 
 static bool capture_progressive_preview(
     void *opaque, NavigationSession *candidate,
@@ -381,6 +388,7 @@ static bool capture_progressive_preview(
     for (size_t i = 0; i < layout->count; i++) {
         if (layout->commands[i].type == DRAW_IMAGE) {
             probe->painted_image = true;
+            if (layout->commands[i].image != NULL) probe->resolved_images++;
         }
     }
     for (size_t i = 0; i < layout->node_box_count; i++) {
@@ -446,7 +454,8 @@ static bool test_progressive_preview_is_bounded_and_transient(void)
         && navigation.performance.progressive_image_priority_nodes == 0
         && navigation.performance.progressive_image_priority_loaded == 0
         && navigation.page.runtime == NULL
-        && probe.boxes < navigation.page.layout.count
+        && probe.resolved_images
+            < layout_resolved_images(&navigation.page.layout)
         && navigation.performance.first_layout_us != 0
         && navigation.performance.first_paint_us != 0
         && navigation.page.loaded
@@ -1572,14 +1581,20 @@ static bool test_visible_lazy_static_image_variant(bool inline_icon)
             2, 32 * 1024, 16 * 1024, 64 * 1024, 1000);
     }
     uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    TilefinchWorkCount passes_before = tilefinch_work_tally.layout_passes;
     bool committed = ready && navigation_commit_static_html(
         &navigation, generation, "https://deferred-images.test/page",
         html, strlen(html), 480, NULL, NULL, true);
+    TilefinchWorkCount layout_passes =
+        tilefinch_work_tally.layout_passes - passes_before;
     FetchTraceReplayStats replay = {0};
+    /* The inline icon is published before the planning layout, so that
+       layout is already final and the commit lays the page out once. */
     bool ok = committed && navigation.page.loaded
         && navigation.page.images.stats.loaded == (inline_icon ? 1u : 0u)
         && navigation.page.deferred_image_count == 1
-        && navigation.performance.static_image_layout_adoptions == (inline_icon ? 0u : 1u)
+        && navigation.performance.static_image_layout_adoptions == 1
+        && layout_passes == 1
         && navigation.page.deferred_image_cursor == 0
         && fetch_trace_replay_stats(&replay) && replay.request_count == 0
         && navigation_background_resources_pending(&navigation);
@@ -1611,9 +1626,13 @@ static bool test_visible_lazy_static_image_variant(bool inline_icon)
     budget_free(&budget, reference_frame);
     if (!ok) {
         fprintf(stderr,
-                "visible-lazy ready=%d committed=%d loaded=%zu "
-                "queue=%zu/%zu pending=%d error=\"%s\"\n",
-                ready, committed, navigation.page.images.stats.loaded,
+                "visible-lazy icon=%d ready=%d committed=%d loaded=%zu "
+                "adoptions=%zu passes=%llu queue=%zu/%zu pending=%d "
+                "error=\"%s\"\n",
+                inline_icon, ready, committed,
+                navigation.page.images.stats.loaded,
+                navigation.performance.static_image_layout_adoptions,
+                (unsigned long long) layout_passes,
                 navigation.page.deferred_image_cursor,
                 navigation.page.deferred_image_count,
                 navigation_background_resources_pending(&navigation),
@@ -1632,6 +1651,75 @@ static bool test_visible_lazy_static_image_waits_until_idle(void)
 {
     return test_visible_lazy_static_image_variant(false)
         && test_visible_lazy_static_image_variant(true);
+}
+
+/* A refusal anywhere in a static commit, including while its inline SVG is
+   published ahead of the planning layout, either fails the commit cleanly or
+   commits a usable page; a refused SVG publication takes the image-pressure
+   fallback (no icon, no second attempt) and never adopts a layout that
+   lacks the icon. */
+static bool test_static_svg_publication_refusal_is_clean(void)
+{
+    static const char html[] =
+        "<!doctype html><title>Icon refusal</title>"
+        "<style>html,body{margin:0}img{display:block;width:24px;height:24px}"
+        "</style><body><h1>Results</h1><a href=/play>"
+        "<img loading=lazy src=/hero.svg>Play this result</a>"
+        "<svg width=20 height=20 viewBox='0 0 20 20'><circle cx=10 cy=10 r=8 fill='#abc'/></svg></body>";
+    size_t fallbacks_committed = 0, committed_runs = 0;
+    bool ok = true;
+    for (size_t attempt = 0; ok && attempt < 1200u; attempt++) {
+        Budget budget;
+        budget_init(&budget, 16 * MIB);
+        bool installed = budget_install_lexbor(&budget);
+        NavigationSession navigation = {0};
+        bool ready = installed && navigation_init(&navigation, &budget, 4)
+            && deferred_document_images_replay_begin();
+        if (ready) {
+            navigation_enable_external_resources(
+                &navigation, 2, 32 * 1024, 16 * 1024,
+                2, 32 * 1024, 16 * 1024, 64 * 1024, 1000);
+        }
+        uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+        if (ready) budget_inject_failure_after(&budget, attempt);
+        bool committed = ready && navigation_commit_static_html(
+            &navigation, generation, "https://deferred-images.test/page",
+            html, strlen(html), 480, NULL, NULL, true);
+        bool injected = budget.injected_failure_count != 0;
+        budget_clear_failure_injection(&budget);
+        if (committed) {
+            committed_runs++;
+            bool icon = false;
+            for (size_t i = 0; i < navigation.page.images.count; i++)
+                icon |= navigation.page.images.items[i].pixels != NULL;
+            if (navigation.performance.image_pressure_fallbacks != 0) {
+                fallbacks_committed++;
+                ok = !icon
+                    && navigation.performance.static_image_layout_adoptions == 0;
+            }
+            ok = ok && navigation.page.loaded
+                && navigation.page.layout.commands != NULL;
+        }
+        if (ready) fetch_trace_end();
+        if (installed) navigation_destroy(&navigation);
+        bool clean = budget.current == 0
+            && budget_active_allocations(&budget, NULL) == 0
+            && budget_categories_reconcile(&budget);
+        if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+        if (!ok || !clean) {
+            fprintf(stderr, "static svg refusal attempt=%zu committed=%d "
+                    "clean=%d fallbacks=%zu\n", attempt, committed, clean,
+                    navigation.performance.image_pressure_fallbacks);
+            ok = false;
+        }
+        if (!injected) break;
+    }
+    if (ok && (fallbacks_committed == 0 || committed_runs == 0)) {
+        fprintf(stderr, "static svg refusal never reached: committed=%zu "
+                "fallbacks=%zu\n", committed_runs, fallbacks_committed);
+        ok = false;
+    }
+    return ok;
 }
 
 static bool test_visible_lazy_pair_overlaps_transport_and_decode(void)
@@ -2704,6 +2792,92 @@ static bool test_streaming_preview_precedes_eof(void)
     bool clean = budget.current == 0
         && budget_active_allocations(&budget, NULL) == 0
         && budget_categories_reconcile(&budget);
+    if (lexbor_installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+/* A parser-blocking script frees nodes the streaming preview already styled.
+   The preview's layout cache becomes the page's at commit, so what the script
+   freed must leave that cache when it happens: nothing else reports it. */
+static bool test_streaming_preview_cache_follows_parser_frees(void)
+{
+    Budget budget;
+    budget_init(&budget, 24 * MIB);
+    bool lexbor_installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    ProgressivePreviewProbe probe = {0};
+    char error[256] = {0};
+    bool ready = lexbor_installed
+        && navigation_init(&navigation, &budget, 4)
+        && navigation_set_progressive_paint_hook(
+               &navigation, capture_progressive_preview, &probe)
+        && fetch_trace_replay_begin(
+               TILEFINCH_TEST_SOURCE_DIR
+               "/fixtures/http-stream-preview-retire", error, sizeof(error));
+    if (ready) {
+        navigation_enable_scripts(&navigation, 4 * MIB, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 4, 32 * 1024, 16 * 1024, 1000);
+        navigation_enable_external_resources(
+            &navigation, 2, 32 * 1024, 16 * 1024,
+            2, 32 * 1024, 16 * 1024, 64 * 1024, 1000);
+        navigation_set_stream_delivery(&navigation, 512, 0, 0, 0, 0, 0);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    NavigationLoad *load = ready ? navigation_load_begin_url(
+        &navigation, generation, "https://stream-retire.test/document",
+        64 * 1024, 1000, 480, NULL, NULL, true) : NULL;
+    NavigationLoadQuota quota = {
+        .fetch = {
+            .maximum_body_callbacks = 1,
+            .maximum_body_bytes = 512,
+            .maximum_time_us = 10000
+        },
+        .maximum_parser_body_bytes = 512,
+        .maximum_parser_time_us = 10000
+    };
+    for (size_t i = 0; load != NULL && i < 256; i++) {
+        if (navigation_load_pump(load, &quota) != NAVIGATION_LOAD_PENDING)
+            break;
+    }
+    /* A sanitizer build takes many slices over this commit. */
+    bool loaded = false;
+    for (size_t i = 0; load != NULL && !loaded && i < 4096; i++) {
+        NavigationLoadStatus status = navigation_load_status(load);
+        if (status != NAVIGATION_LOAD_READY_TO_FINISH
+            && status != NAVIGATION_LOAD_FINALIZING) break;
+        (void) navigation_load_finish(load, &quota);
+        loaded = navigation_load_status(load) == NAVIGATION_LOAD_SUCCEEDED;
+    }
+    LayoutReuseStats stats = {0};
+    if (loaded)
+        layout_reuse_cache_stats(navigation.page.layout_reuse, &stats);
+    bool ok = loaded && probe.calls != 0
+        && navigation.page.layout_reuse != NULL
+        && stats.retired_subtrees != 0;
+    /* This relayout's invalidation reads every entry's node. */
+    ok = ok
+        && script_runtime_evaluate_diagnostic(
+               navigation.page.runtime,
+               "document.body.prepend(document.createElement('i'))",
+               "<stream-retire>",
+               &navigation.page.script_result)
+        && script_runtime_consume_relayout(navigation.page.runtime)
+        && navigation_relayout(&navigation)
+        && navigation_complete_layout_sync(&navigation);
+    if (!ok)
+        fprintf(stderr,
+                "stream-retire status=%d loaded=%d previews=%zu cache=%d "
+                "retired=%zu error=\"%s\" trace=\"%s\"\n",
+                load == NULL ? -1 : (int) navigation_load_status(load),
+                loaded, probe.calls,
+                navigation.page.layout_reuse != NULL, stats.retired_subtrees,
+                navigation.last_error, error);
+    navigation_load_destroy(load);
+    if (ready) fetch_trace_end();
+    if (lexbor_installed) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0;
     if (lexbor_installed) clean = budget_uninstall_lexbor(&budget) && clean;
     return ok && clean;
 }
@@ -4844,6 +5018,190 @@ static bool test_streaming_preview_skips_inert_prefix_layout(void)
     return ok && clean;
 }
 
+typedef struct {
+    size_t paints;
+    bool first_before_load;
+    bool script_ran_at_first;
+    /* Decline every preview, as the PSP compositor does a frame of one
+       colour, and count the attempts. */
+    bool decline;
+    size_t declined;
+} SlotPreviewProbe;
+
+static bool capture_slot_preview(void *opaque, NavigationSession *candidate,
+                                 const LayoutDocument *layout)
+{
+    SlotPreviewProbe *probe = opaque;
+    if (probe == NULL || candidate == NULL) return false;
+    if (layout == NULL) return true;
+    if (probe->decline) {
+        probe->declined++;
+        return false;
+    }
+    if (probe->paints++ == 0) {
+        probe->first_before_load = !candidate->page.loaded;
+        for (size_t i = 0; i < layout->node_box_count; i++) {
+            size_t length = 0;
+            if (document_attribute(layout->node_boxes[i].node,
+                                   "data-script-ran", &length) != NULL)
+                probe->script_ran_at_first = true;
+        }
+    }
+    return layout->count != 0;
+}
+
+/* One document of fixtures/http-preview-slot-screens, streamed 64 bytes at
+   a time. True when it loaded, with *painted telling whether a streamed
+   preview painted before the load finished (and before the deferred
+   script ran). */
+static bool run_slot_preview_case(const char *path, bool decline,
+                                  bool *painted, size_t *declined)
+{
+    *painted = false;
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool lexbor_installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    SlotPreviewProbe probe = {.decline = decline};
+    char error[256] = {0};
+    bool ready = lexbor_installed
+        && navigation_init(&navigation, &budget, 4)
+        && navigation_set_progressive_paint_hook(
+               &navigation, capture_slot_preview, &probe)
+        && fetch_trace_replay_begin_response_keyed(
+               TILEFINCH_TEST_SOURCE_DIR
+                   "/fixtures/http-preview-slot-screens",
+               error, sizeof(error));
+    if (ready) {
+        navigation_enable_scripts(&navigation, 3 * MIB, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 4, 32 * 1024, 16 * 1024, 1000);
+        navigation_enable_external_resources(
+            &navigation, 2, 32 * 1024, 16 * 1024,
+            2, 32 * 1024, 16 * 1024, 64 * 1024, 1000);
+        navigation_set_stream_delivery(&navigation, 64, 0, 0, 0, 0, 0);
+    }
+    char url[128];
+    snprintf(url, sizeof(url), "https://preview-slots.test%s", path);
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    NavigationLoad *load = ready ? navigation_load_begin_url(
+        &navigation, generation, url, 65536, 1000, 480,
+        NULL, NULL, true) : NULL;
+    NavigationLoadQuota quota = {
+        .fetch = {
+            .maximum_body_callbacks = 1,
+            .maximum_body_bytes = 64,
+            .maximum_time_us = 10000
+        },
+        .maximum_parser_body_bytes = 64,
+        .maximum_parser_time_us = 10000
+    };
+    for (size_t i = 0; load != NULL && i < 1024; i++) {
+        if (navigation_load_status(load) != NAVIGATION_LOAD_PENDING) break;
+        (void) navigation_load_pump(load, &quota);
+    }
+    /* The 640-story document takes more finish slices than
+       finish_bounded allows. */
+    for (size_t i = 0; load != NULL && i < 256
+         && navigation_load_status(load) != NAVIGATION_LOAD_SUCCEEDED; i++) {
+        NavigationLoadStatus status = navigation_load_status(load);
+        if (status != NAVIGATION_LOAD_READY_TO_FINISH
+            && status != NAVIGATION_LOAD_FINALIZING) break;
+        (void) navigation_load_finish(load, &quota);
+    }
+    bool loaded = load != NULL
+        && navigation_load_status(load) == NAVIGATION_LOAD_SUCCEEDED
+        && navigation.page.loaded;
+    size_t streamed = navigation.performance.streaming_preview_paints;
+    *painted = streamed != 0 && probe.first_before_load
+        && !probe.script_ran_at_first;
+    if (declined != NULL) *declined = probe.declined;
+    bool script_ran = navigation.page.document.html != NULL
+        && document_attribute(
+               lxb_dom_interface_node(lxb_html_document_body_element(
+                   navigation.page.document.html)),
+               "data-script-ran", &(size_t) {0}) != NULL;
+    bool ok = loaded && (strcmp(path, "/masthead") != 0 || script_ran);
+    if (!ok || getenv("TILEFINCH_TEST_VERBOSE") != NULL) {
+        fprintf(stderr,
+                "slot-preview %s loaded=%d script=%d paints=%zu streamed=%zu "
+                "empty=%zu attempts=%zu first-before-load=%d "
+                "script-at-first=%d declined=%zu error=\"%s\"\n",
+                path, loaded, script_ran, probe.paints, streamed,
+                navigation.performance.streaming_preview_empty_raster_skips,
+                navigation.performance.streaming_preview_attempts,
+                probe.first_before_load, probe.script_ran_at_first,
+                probe.declined, navigation.last_error);
+    }
+    navigation_load_destroy(load);
+    if (ready) fetch_trace_end();
+    if (lexbor_installed) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (lexbor_installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+/* A first screen of image slots above the text paints as a streamed
+   preview, before the deferred script runs (bbc.com/news showed the
+   loading screen until 43 deferred scripts had run). First screens that
+   would be blank until their images arrive, or whose only slot is a
+   tracking pixel, still wait. */
+static bool test_streaming_preview_slot_first_screen(void)
+{
+    static const struct {
+        const char *path;
+        bool paints;
+    } cases[] = {
+        /* Inline-SVG logo in a bordered masthead, a grey band, text below
+           the screen, a deferred script. */
+        { "/masthead", true },
+        /* The same masthead with 640 stories below it. */
+        { "/masthead-long", true },
+        /* Image slots on grey placeholder boxes. */
+        { "/placeholder-grid", true },
+        /* A background image on a coloured block: an undecoded background
+           image lays out no slot, and a fill alone is not content. */
+        { "/colour-hero", false },
+        /* A screen-sized image slot on the bare page background. */
+        { "/hero", false },
+        { "/lazy", false },
+        /* A grid of image slots on the bare page background. */
+        { "/grid", false },
+        /* A background image with no background colour. */
+        { "/background", false },
+        /* The only other paint is visibility:hidden. */
+        { "/hidden-band", false },
+        /* A 1x1 tracking pixel above a grey band. */
+        { "/pixel", false },
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        bool painted = false;
+        if (!run_slot_preview_case(cases[i].path, false, &painted, NULL))
+            return false;
+        if (painted != cases[i].paints) {
+            fprintf(stderr, "slot-preview %s painted=%d, expected %d\n",
+                    cases[i].path, painted, cases[i].paints);
+            return false;
+        }
+    }
+    /* A compositor that declines the slots-only screen (night mode turns
+       the masthead and band one colour) must not get the same screen laid
+       out again at every response chunk: the stream waits for more
+       rendering elements as for an empty preview. */
+    bool painted = false;
+    size_t declined = 0;
+    if (!run_slot_preview_case("/masthead-long", true, &painted, &declined))
+        return false;
+    if (declined == 0 || declined > 8) {
+        fprintf(stderr, "slot-preview /masthead-long declined %zu times, "
+                "expected 1 to 8\n", declined);
+        return false;
+    }
+    return true;
+}
+
 static bool test_streaming_stylesheet_continuation_converges(void)
 {
     StreamingFinalSnapshot continued = {0};
@@ -5666,6 +6024,10 @@ static bool test_node_retirement_observer_relocates(void)
         ScriptResult result = {0};
         ok = ok && script_runtime_evaluate_diagnostic(runtime,
             "document.getElementById('gone').remove()", "remove", &result);
+        /* The removed subtree is retired once its wrappers are collected;
+           collect now rather than wait for incidental garbage to cross
+           the GC threshold. */
+        if (ok) (void) script_runtime_gc_probe_us(runtime);
         for (unsigned tick = 0; ok && tick < 8 && moved == 0; tick++) {
             ScriptResult advance = {0};
             (void) script_runtime_evaluate_diagnostic(runtime,

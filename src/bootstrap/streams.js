@@ -4,13 +4,25 @@
     streamByteLimit = 256 * 1024,
     compressionByteLimit = 1024 * 1024,
     compressionNative = globalThis.__tilefinchCompressionRun,
+    heapSnapshot = globalThis.__tilefinchHeapMemorySnapshot,
     largeStreamEndpoints = new WeakSet(),
     chunkBytes = (value) => {
       if (value instanceof ArrayBuffer) return value.byteLength;
       if (ArrayBuffer.isView(value)) return value.byteLength;
-      if (typeof value === "string")
-        return Math.min(streamByteLimit + 1, value.length * 2);
+      if (typeof value === "string") return value.length * 2;
       return 64;
+    },
+    /* A queue may grow past its high-water mark, as the Streams Standard
+       allows (desiredSize goes negative and pulls stop); the realm's memory
+       is what bounds it. Each further mark's worth of queued bytes checks
+       that the realm would still keep a mark's worth of heap free. */
+    queueFits = (queued, bytes, mark) => {
+      const next = queued + bytes;
+      if (next <= mark || Math.floor(next / mark) === Math.floor(queued / mark))
+        return true;
+      const values = heapSnapshot?.();
+      return values ? values[0] - values[1] - bytes >= mark
+        : next <= mark * 16;
     },
     closeReadableStream = (stream) => {
       const state = readableState(stream);
@@ -27,6 +39,7 @@
       state.error = reason;
       state.queue.length = 0;
       state.queueBytes = 0;
+      state.queueSize = 0;
       while (state.reads.length) state.reads.shift().reject(reason);
       state.closeReject(reason);
     },
@@ -44,7 +57,8 @@
       if (
         state.status !== "readable" ||
         typeof state.source.pull !== "function" ||
-        (!state.reads.length && state.queue.length)
+        (!state.reads.length && state.queue.length &&
+          state.highWaterMark - state.queueSize <= 0)
       )
         return;
       state.pulling = true;
@@ -77,6 +91,7 @@
       if (state.queue.length) {
         const entry = state.queue.shift();
         state.queueBytes -= entry.bytes;
+        state.queueSize = state.queue.length ? state.queueSize - entry.size : 0;
         requestReadableStreamPull(stream);
         return Promise.resolve({ done: false, value: entry.value });
       }
@@ -98,6 +113,7 @@
       if (state.status === "errored") return Promise.reject(state.error);
       state.queue.length = 0;
       state.queueBytes = 0;
+      state.queueSize = 0;
       closeReadableStream(stream);
       try {
         return Promise.resolve(
@@ -145,7 +161,17 @@
     static {
       readableState = (stream) => stream.#state;
     }
-    constructor(source = {}) {
+    constructor(source = {}, strategy = {}) {
+      /* The queuing strategy: by default one chunk, as in the Streams
+         Standard. desiredSize is the mark less the queued size; memory is
+         accounted separately in queueBytes (queueFits). */
+      const mark = strategy?.highWaterMark === undefined ? 1
+          : Number(strategy.highWaterMark),
+        size = strategy?.size;
+      if (Number.isNaN(mark) || mark < 0)
+        throw new RangeError("invalid highWaterMark");
+      if (size !== undefined && typeof size !== "function")
+        throw new TypeError("strategy size must be a function");
       let closeResolve, closeReject;
       const closedPromise = new Promise((resolve, reject) => {
         closeResolve = resolve;
@@ -159,11 +185,13 @@
           controller: null,
           disturbed: false,
           error: null,
+          highWaterMark: mark,
           locked: false,
           pullAgain: false,
           pulling: false,
           queue: [],
           queueBytes: 0,
+          queueSize: 0,
           reads: [],
           source: source || {},
           status: "readable",
@@ -171,9 +199,9 @@
       this.#state = state;
       state.controller = {
         get desiredSize() {
-          const limit = largeStreamEndpoints.has(state.source)
-            ? compressionByteLimit : streamByteLimit;
-          return limit - state.queueBytes;
+          return state.status === "errored" ? null
+            : state.status === "closed" ? 0
+            : state.highWaterMark - state.queueSize;
         },
         enqueue(value) {
           if (state.status !== "readable")
@@ -184,15 +212,27 @@
             read.resolve({ done: false, value });
             return;
           }
-          if (
-            state.queue.length >= streamQueueLimit ||
-            state.queueBytes + bytes >
-              (largeStreamEndpoints.has(state.source)
-                ? compressionByteLimit : streamByteLimit)
-          )
-            throw new RangeError("stream queue limit exceeded");
-          state.queue.push({ value, bytes });
+          let chunkSize = 1;
+          if (size !== undefined) {
+            try {
+              chunkSize = Number(size(value));
+              if (!(chunkSize >= 0) || chunkSize === Infinity)
+                throw new RangeError("invalid chunk size");
+            } catch (reason) {
+              failReadableStream(stream, reason);
+              throw reason;
+            }
+          }
+          if (!queueFits(state.queueBytes, bytes,
+              largeStreamEndpoints.has(state.source)
+                ? compressionByteLimit : streamByteLimit)) {
+            const error = new RangeError("stream queue exceeds available memory");
+            failReadableStream(stream, error);
+            throw error;
+          }
+          state.queue.push({ value, bytes, size: chunkSize });
           state.queueBytes += bytes;
+          state.queueSize += chunkSize;
         },
         close() {
           closeReadableStream(stream);
@@ -451,7 +491,6 @@
       this._storedError = undefined;
       this._abortPromise = null;
       this._closeStarted = false;
-      this._queuedCount = 0;
       this._queuedBytes = 0;
       this._chain = Promise.resolve();
       this.locked = false;
@@ -487,14 +526,11 @@
       if (this._state !== "writable")
         return Promise.reject(new TypeError("stream is not writable"));
       const bytes = chunkBytes(value);
-      if (
-        this._queuedCount >= streamQueueLimit ||
-        this._queuedBytes + bytes >
-          (largeStreamEndpoints.has(this._sink)
-            ? compressionByteLimit : streamByteLimit)
-      )
-        return Promise.reject(new RangeError("write queue limit exceeded"));
-      this._queuedCount++;
+      if (!queueFits(this._queuedBytes, bytes,
+          largeStreamEndpoints.has(this._sink)
+            ? compressionByteLimit : streamByteLimit))
+        return Promise.reject(
+          new RangeError("write queue exceeds available memory"));
       this._queuedBytes += bytes;
       const operation = this._chain.then(() => {
         if (this._state === "errored" || this._state === "erroring")
@@ -505,11 +541,9 @@
       });
       this._chain = operation.then(
         () => {
-          this._queuedCount--;
           this._queuedBytes -= bytes;
         },
         (reason) => {
-          this._queuedCount--;
           this._queuedBytes -= bytes;
           this._fail(reason);
         },
@@ -712,6 +746,7 @@
       }
       state.queue.length = 0;
       state.queueBytes = 0;
+      state.queueSize = 0;
       state.disturbed = true;
       return bytes;
     };

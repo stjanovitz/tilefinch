@@ -37,8 +37,9 @@ from the selected slot. Neither file is a signature authority or an
 alternative update slot: they are trusted executable copies whose identity
 markers and reuse receipt prevent accidental mixing, not per-boot integrity
 checks. Missing, mismatched or refused copies, pre-held L, and recovery all
-use ordinary package startup, and signed installation, trial health,
-anti-rollback and per-file verification are unchanged. Deleting the copies is
+use ordinary package startup; pre-held L and recovery also delete the copies,
+so a copy that loads but never starts the browser stops being used after one
+safe start. Signed installation, trial health, anti-rollback and per-file verification are unchanged. Deleting the copies is
 safe. Their size bounds, receipts and reclaim rules are in
 [Memory Stick storage](STORAGE.md#data--settings-and-session) and its
 [slots section](STORAGE.md#dataupdate-and-the-slots--signed-updates).
@@ -137,9 +138,10 @@ adds no network request, package scan, or release-metadata read to ordinary
 startup beyond the optional, rate-limited background check described under
 [Background update-available check](#background-update-available-check). The
 stable launcher necessarily reads at most two fixed 174-byte state records
-before choosing a slot, and it does not hash the active slot. You choose when
-to check, review a signed release, explicitly download it, and explicitly
-restart into it.
+(and, while a trial has not finished starting, one 174-byte
+`update-declined` copy) before choosing a slot, and it does not hash the
+active slot. You choose when to check, review a signed release, explicitly
+download it, and explicitly restart into it.
 
 The page begins with:
 
@@ -700,8 +702,9 @@ and `TILEFINCH_UPDATE_REPOSITORY_NAME`), and the client sends no credentials.
 
 While slot A is active:
 
-1. Check free space for the manifest-bounded package, extracted slot, and safety margin.
-2. Clear only stale `slot-b.tmp`; never modify A or shared user data.
+1. Clear stale `slot-b.tmp` and `slot-b.old` trees left by a failed install;
+   never modify A or shared user data.
+2. Check free space for the manifest-bounded package, extracted slot, and safety margin.
 3. Stream to `data/update/package.part`, then close and synchronize it.
 4. Verify signed metadata (Stable/Beta) or the explicit unsigned Developer
    envelope. The completed download supplies its exact size/hash proof and
@@ -711,9 +714,23 @@ While slot A is active:
 6. Write `slot.tfum`, the package table, an unsigned `DEVELOPER` marker when
    applicable, and a manifest-hash `READY` marker last.
 7. Synchronize the directory/device.
-8. Replace only the inactive B directory.
-9. Write a pending boot-choice record through the redundant state journal.
-10. Restart through the stable launcher.
+8. If the journal labels B as the previous slot (or as an earlier staged
+   candidate), first write a record that no longer names it.
+9. Replace only the inactive B directory.
+10. Write a pending boot-choice record through the redundant state journal.
+11. Restart through the stable launcher.
+
+The target is chosen from the journal on the Memory Stick when the install
+starts, not from a copy taken earlier in the session: the browser's own
+trial-health confirmation also writes the journal. The target is never the
+slot the browser runs from. After safe start runs the previous slot, or during
+a trial that is not yet confirmed, that is the only other slot, so the Update
+screen shows `RESTART TO UPDATE` and installs nothing. Before it removes
+`slot-b.tmp`/`slot-b.old` and again before its first rename, the installer
+re-reads the journal and stops with the same message unless it is still the
+state the install started from. A check started while the journal has moved
+on is judged against the new installed release, so the build that just passed
+its trial is not offered as new.
 
 Free-space discovery is a hard admission gate. Validation builds report
 `tilefinch-update-storage: boot-probe=...` from the actual PSP filesystem and
@@ -762,9 +779,38 @@ at process entry.
 
 If the next launcher run finds an unconfirmed trial, it returns to the previous
 slot but retains the already staged and verified candidate. Its recovery
-screen offers `TRY UPDATE AGAIN` as well as discarding it; an ordinary power-off
-during a healthy trial therefore does not force another large download.
-Holding L at startup always chooses the previous known-good slot.
+screen offers `TRY UPDATE AGAIN` (X) as well as `DISCARD UPDATE` (Square); an
+ordinary power-off during a healthy trial therefore does not force another
+large download. O, or the screen's ten-second timeout, starts the current
+version and asks once: the launcher writes `data/update-declined`, a copy of
+that `STARTED` journal record, and later boots whose journal is byte-identical
+to it start the active slot the ordinary way (with the faster-startup copy)
+instead of showing the screen again. The candidate stays staged. Settings →
+Updates → Version and update then says `UPDATE DID NOT FINISH STARTING` and
+offers the same two choices: X (`TRY AGAIN`) journals the trial as pending
+again, exactly as the screen's X does, and offers `RESTART TO UPDATE`; Square
+discards it. The page re-reads the journal first and acts only while it still
+holds that trial; it does not offer a check or download until one is chosen.
+The page shows the choice whenever the journal holds a started trial of a slot
+the browser is not running from, so it also resolves the screen of a launcher
+that predates the file and still shows it at every boot.
+
+The file never changes the journal, whose format and reserved bits stay as
+older launchers read them. Any later journal record (a retried trial's new
+`STARTED` record included) differs from the copy, so a leftover file never
+hides another trial's screen; the page removes it after its own journal write,
+and a cut before that removal leaves it unmatched. A cut while it is written
+(temporary file and rename inside `data/`, no device sync) leaves no file, the
+earlier one, or a torn one that does not match, and the next boot asks again.
+Nothing is written when the display could not show the screen.
+
+Holding L at startup chooses the previous known-good slot when there is one.
+A slot that an update has been staged into is no longer one: the installer
+drops that label before it replaces the slot, discarding or rejecting a trial
+drops it too, and the launcher ignores a previous slot that is also the
+pending slot (as journals from older builds can say). Without a known-good
+previous slot, L never starts a pending candidate: it starts the active slot,
+or shows the recovery screen after a trial that did not finish.
 Retry returns through the same verify-and-journal-started path as a first
 trial; it never directly executes a pending slot, so the browser can always
 record health against a `STARTED` trial.
@@ -776,7 +822,9 @@ EBOOT. This is intentional: physical Memory Stick modification is outside the
 threat model, and per-boot verification of a roughly 15 MiB slot would violate
 the no-added-startup-work requirement.
 
-The previous slot is retained until a later update succeeds. The root launcher
+The previous slot is retained until a later update is staged into it. From
+then until that update's trial is confirmed healthy there is no previous
+version; the confirmation makes the formerly active slot the previous one. The root launcher
 does not update itself in-app. A launcher flaw, exhausted root threshold, both
 slots being lost, or an incompatible initial layout requires a manual reinstall.
 

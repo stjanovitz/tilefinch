@@ -16,7 +16,7 @@
 #define YOUTUBE_TRACK_LIMIT 6u
 #define YOUTUBE_TRACK_LANGUAGE_CAPACITY 16
 #define YOUTUBE_TRACK_ID_CAPACITY 32
-#define YOUTUBE_TRACK_LABEL_CAPACITY 48
+#define YOUTUBE_TRACK_LABEL_CAPACITY 64
 #define YOUTUBE_CAPTION_URL_CAPACITY 1024
 
 typedef struct {
@@ -61,7 +61,13 @@ typedef enum {
     YOUTUBE_PLAYABILITY_LIVE_UNSUPPORTED,
     YOUTUBE_PLAYABILITY_UPCOMING_UNSUPPORTED,
     YOUTUBE_PLAYABILITY_UNAVAILABLE,
-    YOUTUBE_PLAYABILITY_CLIENT_REJECTED
+    YOUTUBE_PLAYABILITY_CLIENT_REJECTED,
+    /* Playable only through Widevine or FairPlay (YouTube's movies and
+       shows, free or paid): the response offers no format without DRM. */
+    YOUTUBE_PLAYABILITY_DRM_PROTECTED,
+    /* A rental, purchase or other paid title: YouTube refuses it with "This
+       video requires payment to watch" and offers no formats at all. */
+    YOUTUBE_PLAYABILITY_PAYMENT_REQUIRED
 } YoutubePlayability;
 
 typedef struct {
@@ -85,7 +91,14 @@ typedef struct {
     long player_status;
     size_t watch_bytes;
     size_t player_bytes;
-    uint64_t expires_unix;
+    /* When the media URLs stop serving, in monotonic seconds
+       (tilefinch_platform_monotonic_time_ns() / 1e9); 0 when unknown and
+       UINT64_MAX when they do not expire. Taken from the response's own
+       lifetime (streamingData.expiresInSeconds) counted from when it was
+       resolved, so a device clock set wrong does not reject a fresh URL. */
+    uint64_t expires_monotonic_s;
+    /* streamingData.expiresInSeconds of the response; 0 when absent. */
+    uint64_t lifetime_seconds;
     unsigned client_attempts;
     bool live_hls;
     char client_name[YOUTUBE_CLIENT_NAME_CAPACITY];
@@ -171,6 +184,11 @@ typedef struct {
     long response_status;
     bool request_active;
     bool cached_identity;
+    /* Work counters: player requests built (a start deferred by transport
+       admission reuses its request), and watch-page bytes searched, summed
+       over the configuration keys searched for. */
+    size_t request_builds;
+    size_t watch_scanned_bytes;
 } YoutubeResolveJobMetrics;
 
 typedef struct {

@@ -18,7 +18,9 @@ by default.
 
 Some old sites need exceptions. Mixed-content and third-party-cookie grants
 are explicit, bounded per-site compatibility controls; mixed-content grants
-expire when Tilefinch exits. JavaScript can be disabled globally or for the
+expire when Tilefinch exits. A narrower, one-time question lets a secure
+page's plain-HTTP audio stream play
+([Unencrypted audio](#unencrypted-audio)). JavaScript can be disabled globally or for the
 current site. These controls improve compatibility and recovery but do not
 turn the shared process into a security sandbox. The sections below define the
 precise request, redirect, cookie, CSP, SRI, iframe, cache-provenance, and
@@ -122,11 +124,56 @@ for the running browser session: Tilefinch neither writes grants
 to the Memory Stick nor restores legacy persisted grants after restart. HTTP
 loopback remains potentially trustworthy for local development.
 
+### Unencrypted audio
+
+Internet radio directories commonly serve an HTTPS page whose stations
+stream only over plain HTTP. Such a page's audio request
+(`TILEFINCH_DESTINATION_AUDIO`, used only by the native player's page-audio
+route) is upgraded once like any passive media. When that upgrade fails or
+finds nothing to play, the player asks instead of failing: **PLAY
+UNENCRYPTED AUDIO?** with "This station is not encrypted", **X Play
+anyway** and **O Back**. The question is decided in
+`media_http_insecure_audio_step` and never appears for an HTTPS or
+potentially trustworthy (loopback) address, an HTTP page, or a probe that
+already found audio.
+
+The answer is narrower than **Mixed HTTP (session)** and never sets it:
+
+- It is held per top-level site in a 16-entry session table
+  (`browser_session_set_insecure_audio_site`) and never written to the
+  Memory Stick; Tilefinch asks again after a restart.
+- **Play anyway** lets only that site's audio requests use HTTP. Its
+  images, video, scripts, fetches and every other destination keep the
+  ordinary mixed-content rules, and another site's audio is still upgraded.
+- The same shared check admits the first request and every redirect hop
+  (`fetch_request_mixed_override`), so an HTTP redirect from that site's
+  audio stream is followed only after a yes. Without one, plain HTTP is never
+  sent. The check reads the answer from the hop's security session, which a
+  scheduled request keeps after it drops its own session pointer, so a
+  redirect hop sees the same answer the first hop did.
+- **Back** records a no for the site; a later play shows **UNENCRYPTED AUDIO
+  BLOCKED** without a Retry and does not ask again this session.
+- **Page tools → Site information → Permissions & controls → Unencrypted
+  audio** shows and changes the answer (Ask, Allow, Block), and **Reset
+  permissions** returns it to Ask.
+
+The station's response is still admitted by the page's CSP `media-src`,
+private-network protection, content blocking and cookie policy, and its
+bytes are only ever decoded as MPEG audio in a bounded ring.
+
 Ordinary top-level HTTP navigation is HTTPS-first. Tilefinch upgrades the
 initial request, does not silently retry HTTP after a TLS/network failure, and
 rejects a later HTTPS-to-HTTP redirect without the same explicit compatibility
 grant. Literal private addresses, localhost, single-label LAN names, and
 `.local` names remain available for explicitly entered local navigation. A
+host whose last label is a number is an IPv4 address however it is written
+(`134744072`, `0x08080808`, `8.8.2056`, octal parts), because the resolver
+and libcurl read it that way, so it is classified only by the address it
+denotes: a public one is upgraded and protected like any public site, and a
+numeric host that is no valid address is never treated as local. Such a
+host is serialized as its dotted quad, as the URL Standard does, so origins,
+site keys and cookie scopes are per address (`127.1` is `127.0.0.1`). IPv6
+literals are likewise local only when the address is private. A
 16-entry, least-recently-used HSTS table honors `max-age` and
 `includeSubDomains` from verified HTTPS responses. The table is intentionally
 session-only: it adds no Memory Stick reads or writes and is rebuilt from
@@ -135,7 +182,8 @@ responses after restart.
 Page-originated traffic from a public origin also enables Private Network
 Access protection. Both the socket-open callback and libcurl's pre-transfer
 peer callback reject loopback, IPv4 RFC1918/link-local, carrier-grade NAT
-(100.64/10) and benchmark (198.18/15) address space, IPv6 loopback,
+(100.64/10), benchmark (198.18/15), multicast (224/4) and reserved (240/4,
+including the 255.255.255.255 broadcast) address space, IPv6 loopback,
 unique-local/link-local, unspecified, and mapped-private peers. The check runs
 against every resolved redirect hop and reused connection, so changing DNS
 answers cannot bypass it. Such requests bypass ambient proxies because a
@@ -144,12 +192,30 @@ navigation and pages already identified by a local URL may use that address
 space. This is a fail-closed address-space boundary, not full Fetch PNA
 preflight support.
 
-Decoded images retain the origin of their final authorized response. Drawing
-a cross-origin image, or a canvas that already contains one, permanently
-taints the destination canvas until its dimensions reset the backing surface.
-Creating a pattern from such an image is conservatively treated the same way.
-`getImageData()`, `toDataURL()`, and `toBlob()` then throw `SecurityError`, so
-credentialed no-CORS image pixels cannot become a cross-origin read channel.
+Decoded images retain the origin of their final authorized response.
+Drawing a cross-origin image, a canvas that already contains one, an
+`ImageBitmap` made from either, or painting with a pattern made from any of
+them, permanently taints the destination canvas; as in HTML, resetting its
+dimensions clears the bitmap but not the taint, and creating such a pattern
+taints nothing until it paints. `getImageData()`, `toDataURL()`, `toBlob()`
+and WebGL `texImage2D()` of a tainted canvas or a cross-origin image then
+throw `SecurityError`, so credentialed no-CORS image pixels cannot become a
+cross-origin read channel. The taint and the unclean pixels are native
+state. The moment a canvas is tainted, its pixel store moves out of the
+JavaScript heap into native memory (copied once, charged to the same QuickJS
+heap limit, freed when the canvas is destroyed or the page closes), and the
+canvas bootstrap from then on holds only the element's handle. Every
+drawing operation on it, and every draw of a cross-origin image, tainted
+canvas or unclean `ImageBitmap` (whose pixels live in a native store too),
+runs in a native that names the pixels by handle and writes them into a
+native store only; commits read the store directly. No cross-origin pixel
+ever exists in a JavaScript value, so page script that replaces array,
+typed array, `Map`/`WeakMap`, iterator or `Function.prototype.call`/`apply`
+builtins before the bootstrap runs sees none. The page-callable
+image-source, snapshot and `readPixels` bridges return no pixels for a
+cross-origin image or a tainted canvas. A page can taint at most 64
+canvases; drawing an unclean source into a 65th, or into a canvas whose
+store cannot be allocated, is skipped and leaves that canvas clean.
 The PSP GE texture cache is additionally keyed by a native process-issued
 realm epoch and canvas handle. A fresh realm cannot reuse EDRAM pixels merely
 by repeating page-controlled texture identifiers, generations, or dimensions;
@@ -222,9 +288,12 @@ expiry, `Secure`, `HttpOnly`, `SameSite` Default/Lax/Strict/None,
 cannot set Secure cookies. Script access excludes HttpOnly values. Cookie names
 and serialized fields reject control, non-ASCII, and invalid token bytes.
 
-The jar holds 64 cookies overall and at most 32 for one exact domain;
-insertion evicts the oldest applicable entry so one origin cannot permanently
-deny storage to every other site. Paths through 319 bytes remain inline.
+The jar holds 64 cookies overall, at most 32 for one exact domain, and 16 KiB
+of values; insertion over any of these limits evicts the oldest applicable
+entries so one origin cannot permanently deny storage to every other site.
+Eviction keeps the overwrite rules: script cannot retire an HttpOnly cookie
+and an insecure origin cannot retire a Secure one. A cookie is refused only when
+what those rules let it retire would not make room. Paths through 319 bytes remain inline.
 Exceptional paths through 2,047 bytes use an on-demand session pool capped at
 8 KiB, so accepting a long URL does not enlarge every fixed PSP cookie entry.
 
@@ -245,6 +314,9 @@ bounded 16-site compatibility table, set under **Permissions & controls →
 Third-party cookies** and saved with the profile, may permit ordinary
 third-party cookies for a selected top-level site. Top-level cross-site
 navigation is first-party and continues to use the normal SameSite rules.
+SameSite compares the requesting document as well as the top level with the
+target: a request from a cross-site frame to the top-level site sends that
+site's `SameSite=None` cookies but not its `Lax` or `Strict` ones.
 
 Live fetches do not enable libcurl's cookie engine. When a request supplies a
 browser session and immutable request context, the transport takes a bounded
@@ -267,12 +339,23 @@ public-suffix request host is retained as host-only, as required by RFC 6265;
 
 Site identity is scheme plus registrable domain and deliberately excludes the
 port. IP literals, single-label hosts, and public suffixes without a
-registrable label retain their canonical host. The snapshot source, hash,
+registrable label retain their canonical host. Wherever the chrome names a
+page's site (the address bar, Wi-Fi sign-in bar, Site information,
+Permissions & controls, the tab list, Home, Site data & storage, the storage
+and large-app offers, page dialogs, file downloads and an audio stream's
+source) a host that does not fit gives way at its start with a leading
+"...", by whole labels down to the registrable domain and only then by
+characters, so the end of the host, which names its owner, is always on
+screen. Saved addresses (the address keyboard's bookmark and history
+suggestions and the Collections rows) keep the same rule: when an
+`http(s)` address is too long, its path gives way at its end while the
+whole host and an ellipsis fit, and otherwise the host is shown alone,
+shortened from its start. The snapshot source, hash,
 licenses, and deterministic refresh command are recorded in
 `third_party/public_suffix/README.md`; updating it is security maintenance,
 not an acceptance-site compatibility tweak.
 
-The host transport exposes at most `FETCH_RESPONSE_COOKIE_CAPACITY` (32)
+The host transport exposes at most `FETCH_RESPONSE_COOKIE_CAPACITY` (64)
 `Set-Cookie` fields in one bounded redirect transaction, and each
 serialized field must fit its 4,095-byte storage ceiling. Cookie values and
 their response-URL attributions are allocated from the shared budget only when
@@ -422,6 +505,25 @@ or form could, and read nothing. Redirects to another origin fail closed, and
 since the body is discarded, one larger than 64 KiB is a network error rather
 than a full response reservation.
 
+A cross-origin CORS request that is not CORS-simple sends its `OPTIONS`
+preflight first, through the same request preparation and the realm's fetch
+scheduler, and is sent only if the preflight allows its method, header names,
+origin and credentials mode. An asynchronous `fetch()` or XHR is parked in
+the page's request queue while its preflight is in flight, so the browser
+thread never waits on the network for it; the requests queued behind it
+start meanwhile, and the parked one is resubmitted once one of the realm's
+preflights is decided. A synchronous XHR waits at
+cooperation points, where the frontend keeps drawing and can cancel it.
+It runs on the realm's scheduler, on the request slot and transport
+descriptor kept for blocking requests, and never as a transfer inside the
+script call. While the page's network is held for the native player it fails
+at once; when the realm's response memory is still full after a 2 s wait it
+fails. Each
+realm keeps up to four grants, each for one exact request shape (credentials
+mode, method, origin, sorted header names and URL), for the response's
+`Access-Control-Max-Age`: 5 seconds when absent, at most 10 minutes, and only
+the request that asked when it is 0. A refusal is never reused.
+
 The bounded response-header CSP subset intersects up to four policies and
 supports `default-src`, `script-src`, `style-src`, `img-src`, `media-src`,
 `font-src`, `connect-src`, `frame-src`, `object-src`, `base-uri`, `form-action`, and
@@ -486,8 +588,12 @@ Framed responses are checked before their DOM or JavaScript runtime is created.
 current engine has only bounded direct child frames, so this is not a claim of
 full nested browsing-context isolation.
 
-External classic/module scripts and linked stylesheets enforce bounded
-Subresource Integrity metadata with SHA-256, SHA-384, and SHA-512. The
+External classic/module scripts, parser-inserted or script-inserted, and
+linked stylesheets enforce bounded Subresource Integrity metadata with
+SHA-256, SHA-384, and SHA-512. A script-inserted script keeps the
+`integrity` value it had when it was prepared; SRI and the CSP integrity
+grant both use that value, and a script-inserted classic script with
+`crossorigin` is a CORS request, as a parser-inserted one is. The
 strongest recognized algorithm wins and any matching digest at that strength
 admits the response. Malformed recognized metadata and metadata beyond the
 2,048-byte/32-token limits fail closed. Cross-origin integrity requires an
@@ -561,7 +667,11 @@ covered by this claim.
 Page WebSockets cross the same immutable request-authority boundary before the
 worker sees a URL. CSP `connect-src`, HTTPS-to-plaintext mixed-content policy,
 Private Network Access, cookies, Origin, and TLS verification remain native
-decisions. Redirects are refused. Two sockets, 64 KiB messages, a 64 KiB
+decisions. `connect-src` matches a socket by its scheme pair: `ws://host` and
+`ws:` cover `ws` and `wss`, `wss://host` and `wss:` cover `wss`, an `http`
+source covers both and an `https` source covers `wss`, as CSP3 does for the
+http(s) URL a socket is fetched as. A `ws`/`wss` source never admits an
+ordinary `fetch`. Redirects are refused. Two sockets, 64 KiB messages, a 64 KiB
 outbound queue, and one pending receive event per socket bound both memory and
 producer pressure; oversize input closes the connection instead of growing a
 page-controlled buffer. Detachment discards pending delivery only after the
@@ -595,8 +705,9 @@ the shared JavaScript realm, but it is not process isolation.
 
 An iframe `sandbox` attribute starts from the deny-all state. The bounded token
 parser recognizes `allow-scripts`, `allow-same-origin`, `allow-forms`,
-`allow-popups`, `allow-top-navigation`, and
-`allow-top-navigation-by-user-activation`; over-limit input remains deny-all.
+`allow-popups`, `allow-top-navigation`,
+`allow-top-navigation-by-user-activation`, and `allow-modals`; over-limit
+input remains deny-all.
 Scripts are not given a child runtime without `allow-scripts`, and a frame
 without `allow-same-origin` receives a unique opaque origin exposed as
 `"null"`. Forms, auxiliary windows, and child-driven top navigation are not
@@ -647,6 +758,46 @@ families, and COOP/COEP process isolation are not implemented. The PSP has no
 process sandbox, so CSP reduces page authority inside one engine process; it
 does not contain a memory-safety flaw in the engine.
 
+## Page dialogs
+
+`alert()`, `confirm()` and `prompt()` stop the page's script until the user
+answers, and every refusal below is silent: the page gets the answer a
+browser gives when it cannot show a dialog (`undefined`, `false`, `null`)
+without anything appearing on screen. A dialog is refused when:
+
+- the caller is not the top-level document's realm or a frame realm admitted
+  for it. A child frame is admitted only through a chain of same-origin
+  parents to the top-level document, and a sandboxed one only with
+  `allow-modals` (the token parser above recognizes it). Workers have no
+  such globals;
+- the page is hidden, which covers `visibilitychange`-to-hidden handlers.
+  Tilefinch never runs `unload`, `pagehide` or `beforeunload` handlers;
+- another dialog is open;
+- the user has chosen "Don't let this page show dialogs" (offered from the
+  second dialog) or left the page from one. Both last for the page load and
+  are never stored;
+- three have been shown since the user last activated the page (a click or
+  key press reaching it), or five in the last 30 seconds, activation or not;
+  a loop of dialogs therefore ends after three;
+- the frontend cannot show one now (another screen, HOME, suspend), which
+  does not count against the page.
+
+These limits are per page load, shared by the top-level document and the
+frames admitted for it. The message is plain text in a box titled
+**Page message** with the requesting host (its right end kept when cut).
+The browser's own address bar stays on screen above it. The text is read as
+at most 1024 UTF-16 code units, then copied under the page's memory budget
+into at most 640 bytes and 8 lines. Malformed UTF-8 and lone surrogates
+become U+FFFD. Control characters and bidi embedding, override, isolate,
+mark and invisible-operator characters are removed. Anything cut ends with
+an ellipsis. A `prompt()` default and answer are shown as single lines under
+those same rules and kept to at most 255 bytes of whole characters; the page
+receives them as written, with NUL and malformed text as U+FFFD. Buttons held
+when a dialog opens never answer it, and OK arms
+after half a second; Circle, Triangle and Square act at once. A dialog left
+unanswered for ten minutes is dismissed. Time spent in a dialog is not
+counted against the script watchdog or the navigation watchdog.
+
 ## Native media and visual work bounds
 
 Native media and visual effects retain explicit work and destination bounds.
@@ -677,7 +828,8 @@ that origin, and whether its storage is in RAM or on the Memory Stick. Its
 described above, and **Site storage** opens Site data & storage on this site.
 “Clear data for this site” removes applicable cookies and exact-origin
 local/session storage and OPFS; “Reset permissions” removes the site's
-JavaScript, blocker, Reader, third-party-cookie, and mixed-content exceptions.
+JavaScript, blocker, Reader, third-party-cookie, and mixed-content exceptions
+and its unencrypted-audio answer.
 Both destructive actions require confirmation. Inspection and deletion remain
 available even when global site-data admission is disabled.
 

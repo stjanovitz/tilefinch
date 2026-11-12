@@ -233,7 +233,7 @@ typedef struct {
     TilefinchDiagnosticSource sources[TILEFINCH_DIAGNOSTIC_QR_SOURCE_LIMIT];
     char paths[TILEFINCH_DIAGNOSTIC_QR_SOURCE_LIMIT]
               [TILEFINCH_INSTALL_PATH_LIMIT];
-    char signin_report[1024];
+    char signin_report[2048];
 } PspDiagnosticPathSet;
 
 /* Keep the five long install paths and zlib/QR setup out of the already-large
@@ -624,6 +624,10 @@ void psp_app_dispatch_action(
                 (void) scrolled;
 #endif
                 frame->page_dirty = changed || frame->page_dirty;
+                /* The move before anything else: a runtime turn here can
+                   last many seconds, and the frame it would hold back
+                   defers the next one until it is complete. */
+                frame->defer_runtime = changed || frame->defer_runtime;
             }
             return;
         }
@@ -1554,12 +1558,15 @@ static void psp_app_dispatch_heavy_action(
             bool removed = !local_page
                 && browser_profile_has_bookmark(
                        profile, entry_url);
+            /* Supervised Bookmarks rows borrow these strings (AU-05). */
+            bool held = psp_presentation_fence_acquire();
             bool changed = !local_page
                 && (removed
                         ? browser_profile_remove_bookmark(
                               profile, entry_url)
                         : browser_profile_add_bookmark(
                               profile, entry_url, entry.title));
+            psp_presentation_fence_release(held);
             if (changed)
                 psp_profile_store_mark_dirty(
                     &app->browser->profile_store, frame->ui_sample_us);
@@ -1642,8 +1649,10 @@ static void psp_app_dispatch_heavy_action(
             } else if (section == PSP_UI_COLLECTION_HISTORY) {
                 const char *url = psp_collections_row_url(
                     &app->process->presentation.collections_surface, intent->list_index);
+                bool held = psp_presentation_fence_acquire();
                 removed = url != NULL
                     && browser_profile_forget_history(profile, url);
+                psp_presentation_fence_release(held);
                 if (removed) {
                     psp_profile_store_mark_dirty(
                         &app->browser->profile_store, frame->ui_sample_us);

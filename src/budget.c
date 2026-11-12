@@ -886,6 +886,33 @@ void budget_allocation_owner_leave(Budget *budget,
             ? previous_owner : BUDGET_ALLOCATION_OWNER_NONE;
 }
 
+size_t budget_owner_category_bytes_since(const Budget *budget,
+                                         BudgetAllocationOwner owner,
+                                         BudgetCategory category,
+                                         uint64_t checkpoint)
+{
+    if (budget == NULL || owner == BUDGET_ALLOCATION_OWNER_NONE
+        || owner > BUDGET_ALLOCATION_OWNER_MAX) return 0;
+    category = valid_category(category);
+    size_t bytes = 0;
+    for (const AllocationHeader *header = budget->allocation_head;
+         header != NULL && header->data.sequence > checkpoint;
+         header = header->data.next) {
+        if (header_allocation_owner(header) != owner
+            || header_category(header) != category
+            || header_is_external(header)) continue;
+        size_t charge = sizeof(*header) + header->data.size;
+        if (header_is_cacheline(header)) {
+            size_t padded = (header->data.size + BUDGET_CACHE_LINE_BYTES - 1u)
+                & ~(size_t) (BUDGET_CACHE_LINE_BYTES - 1u);
+            charge = sizeof(void *) + sizeof(*header)
+                + BUDGET_CACHE_LINE_BYTES - 1u + padded;
+        }
+        bytes += charge;
+    }
+    return bytes;
+}
+
 void budget_rollback_owner_category(Budget *budget,
                                     BudgetAllocationOwner owner,
                                     BudgetCategory category)

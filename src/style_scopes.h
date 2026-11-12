@@ -143,6 +143,14 @@ bool style_shadow_scope_admits(const Stylesheet *sheet, unsigned order,
                                const lxb_dom_node_t *node,
                                const StyleMatchSubject *subject);
 
+/* The cascade context (CSS Cascade 5, 6.1) of a rule that matched an
+   element: 0 for the element's own tree, 1 for a ::slotted() rule of its
+   parent's shadow tree, 2 for a :host rule of its own shadow tree. A
+   normal declaration from an outer context beats an inner one whatever
+   their specificity; an important one from an inner context wins. */
+unsigned style_rule_shadow_context(const Stylesheet *sheet,
+                                   const char *selector, size_t length);
+
 /* `subject` (NULL when none is prepared) memoizes the element's scope for
    the rest of its resolution. */
 static inline bool style_adopted_rule_in_scope(const Stylesheet *sheet,

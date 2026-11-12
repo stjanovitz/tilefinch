@@ -908,15 +908,13 @@ static bool style_ua_list_is_nested(lxb_dom_node_t *node)
     return false;
 }
 
-static ComputedStyle default_style(const Stylesheet *sheet,
-                                   lxb_dom_node_t *node,
-                                   const ComputedStyle *parent)
+/* Every property at its initial value, inherited ones taken from `parent`
+   when there is one: an element's style before any user-agent or author
+   rule, and the baseline `all: unset` (with a parent) and `all: initial`
+   (without one) reset to. */
+static ComputedStyle style_initial_inherited(const Stylesheet *sheet,
+                                             const ComputedStyle *parent)
 {
-    size_t node_name_length = 0;
-    const char *node_name = document_element_name(
-        node, &node_name_length);
-#define NODE_TAG_IS(wanted) \
-    style_element_name_is(node_name, node_name_length, (wanted))
     ComputedStyle style = {.display = DISPLAY_INLINE, .color = 0x000000,
                            .color_alpha = 255, .background_alpha = 255,
                            .font_scale = 2, .font_size = 16,
@@ -939,10 +937,6 @@ static ComputedStyle default_style(const Stylesheet *sheet,
                            .align_items = ALIGN_STRETCH,
                            .justify_items = ALIGN_STRETCH,
                            .align_content = JUSTIFY_STRETCH};
-    if (NODE_TAG_IS("input") || NODE_TAG_IS("textarea")
-        || NODE_TAG_IS("select") || NODE_TAG_IS("button")) {
-        style.appearance = APPEARANCE_AUTO;
-    }
     if (parent != NULL) {
         style.color = parent->color;
         style.color_alpha = parent->color_alpha;
@@ -992,6 +986,25 @@ static ComputedStyle default_style(const Stylesheet *sheet,
             | (parent->filter_code
                & (STYLE_WRITING_MODE_MASK | STYLE_DIRECTION_RTL)));
         inherit_text_shadow(sheet, &style, parent);
+    }
+    return style;
+}
+
+static ComputedStyle default_style(const Stylesheet *sheet,
+                                   lxb_dom_node_t *node,
+                                   const ComputedStyle *parent)
+{
+    size_t node_name_length = 0;
+    const char *node_name = document_element_name(
+        node, &node_name_length);
+#define NODE_TAG_IS(wanted) \
+    style_element_name_is(node_name, node_name_length, (wanted))
+    ComputedStyle style = style_initial_inherited(sheet, parent);
+    if (NODE_TAG_IS("input") || NODE_TAG_IS("textarea")
+        || NODE_TAG_IS("select") || NODE_TAG_IS("button")) {
+        style.appearance = APPEARANCE_AUTO;
+    }
+    if (parent != NULL) {
         if (parent->display == DISPLAY_TABLE_ROW_GROUP
             || parent->display == DISPLAY_TABLE_HEADER_GROUP
             || parent->display == DISPLAY_TABLE_FOOTER_GROUP) {
@@ -1010,7 +1023,7 @@ static ComputedStyle default_style(const Stylesheet *sheet,
     if (NODE_TAG_IS("pre")) {
         style.white_space_mode = WHITE_SPACE_PRE;
     }
-    if (NODE_TAG_IS("option") && !option_is_displayed_by_default(node)) {
+    if (NODE_TAG_IS("option") && !option_is_displayed_by_default(sheet, node)) {
         style.display = DISPLAY_NONE;
     }
     if (NODE_TAG_IS("table")) {
@@ -1512,6 +1525,12 @@ static bool style_candidate_ancestor_token_possible(
 static void apply_style_rule(const Stylesheet *sheet, const StyleRule *rule,
                              ComputedStyle *style,
                              const ComputedStyle *parent);
+static void apply_values(Stylesheet *sheet, ComputedStyle *style,
+                         const ComputedStyle *values,
+                         uint64_t mask, uint64_t mask_high,
+                         const ComputedStyle *parent);
+static void apply_inherit_mask(Stylesheet *sheet, ComputedStyle *style,
+                               const ComputedStyle *parent, uint64_t mask);
 
 static uint32_t style_rule_range_lower_bound(const uint32_t *entries,
                                              uint32_t begin, uint32_t end,
@@ -1832,8 +1851,22 @@ typedef struct {
     uint64_t orders[128];
     size_t count;
     bool overflow;
+    /* Set for the dense fallback: apply only the rules of apply_rank. */
+    bool applying;
+    uint8_t apply_rank;
     StyleAdoptedOrderContext adopted;
 } StyleCascadeMatches;
+
+/* A rule's place among encapsulation contexts, applied in ascending order:
+   outer normal declarations come last, so they win, and inner important
+   ones come last. */
+static uint8_t style_rule_context_rank(const Stylesheet *sheet,
+                                       const StyleRule *rule, bool contexts)
+{
+    unsigned context = contexts ? style_rule_shadow_context(
+        sheet, rule->selector, rule->selector_length) : 0;
+    return (uint8_t) (rule->important ? context : 2u - context);
+}
 
 static void style_apply_or_collect(const Stylesheet *sheet,
     const StyleRule *rule, ComputedStyle *style, const ComputedStyle *parent,
@@ -1841,6 +1874,9 @@ static void style_apply_or_collect(const Stylesheet *sheet,
 {
     if (matches == NULL) {
         apply_style_rule(sheet, rule, style, parent);
+    } else if (matches->applying) {
+        if (style_rule_context_rank(sheet, rule, true) == matches->apply_rank)
+            apply_style_rule(sheet, rule, style, parent);
     } else if (matches->count < 128u) {
         size_t at = matches->count++;
         matches->rules[at] = (uint32_t) (rule - sheet->rules);
@@ -2043,52 +2079,48 @@ static bool style_rules_same_priority(const StyleRule *a, const StyleRule *b)
                 && (a->layer >> 8) == (b->layer >> 8)));
 }
 
-static void style_apply_matching_range(const Stylesheet *sheet,
-                                       const ComputedStyle *parent,
-                                       lxb_dom_node_t *node,
-                                       const StyleMatchSubject *subject,
-                                       const StyleRuleIndexPlan *plan,
-                                       PseudoElement pseudo,
-                                       size_t start, size_t end,
-                                       ComputedStyle *style,
-                                       bool trace_position,
-                                       const StyleRetainedMatchEntry *retained_entry,
-                                       bool record)
+/* A shadow host meets its own tree's :host rules, and a host's light
+   child its parent's ::slotted() rules, beside the rules of the tree it
+   lives in; the cascade orders those contexts before specificity. */
+static bool style_node_meets_shadow_contexts(const Stylesheet *sheet,
+                                             const lxb_dom_node_t *node)
 {
-    if (sheet == NULL || !sheet->scopes.adopted_order_varies) {
-        style_apply_matching_ordered_range(sheet, parent, node, subject, plan,
-            pseudo, start, end, style, trace_position, retained_entry, record, NULL);
-        return;
+    if (sheet == NULL || node == NULL
+        || (sheet->scopes.shadow_scope_count == 0
+            && sheet->scopes.adopted_source_count == 0)) return false;
+    if (document_shadow_carrier_of_host(node) != NULL) return true;
+    const lxb_dom_node_t *host = node->parent;
+    if (host == NULL) return false;
+    StyleResolveScratch *scratch = sheet->resolve_scratch;
+    const StyleClassTokenCache *tokens = sheet->class_tokens;
+    bool memo = scratch != NULL && tokens != NULL
+        && scratch->class_tokens_depth != 0;
+    if (memo && scratch->shadow_parent_node == host
+        && scratch->shadow_parent_tokens_scope == tokens->scope)
+        return scratch->shadow_parent_is_host;
+    bool hosts = document_shadow_carrier_of_host(host) != NULL;
+    if (memo) {
+        scratch->shadow_parent_node = host;
+        scratch->shadow_parent_tokens_scope = tokens->scope;
+        scratch->shadow_parent_is_host = hosts;
     }
-    StyleCascadeMatches collected = {0};
-    style_apply_matching_ordered_range(sheet, parent, node, subject, plan,
-        pseudo, start, end, style, trace_position, retained_entry, record,
-        &collected);
-    if (!collected.overflow) {
-        /* Sort only actual matches, preserving the index and retained fast
-           paths. Equal-priority matches use this root's sheet order. */
-        for (size_t i = 1; i < collected.count; i++) {
-            size_t j = i;
-            while (j != 0 && style_rules_same_priority(
-                    &sheet->rules[collected.rules[j]],
-                    &sheet->rules[collected.rules[j - 1u]])
-                && collected.orders[j] < collected.orders[j - 1u]) {
-                uint32_t rule = collected.rules[j];
-                uint64_t order = collected.orders[j];
-                collected.rules[j] = collected.rules[j - 1u];
-                collected.orders[j] = collected.orders[j - 1u];
-                collected.rules[j - 1u] = rule;
-                collected.orders[j - 1u] = order;
-                j--;
-            }
-        }
-        for (size_t i = 0; i < collected.count; i++)
-            apply_style_rule(sheet, &sheet->rules[collected.rules[i]], style, parent);
-        return;
-    }
-    /* An exceptionally dense match set uses bounded source spans instead.
-       The collection pass applied nothing and recorded each match once. */
-    record = false;
+    return hosts;
+}
+
+/* Applies [start, end) in this root's sheet order through bounded source
+   spans inside each equal-priority group. only_rank, when set, limits it to
+   one encapsulation context. */
+static void style_apply_source_spans(const Stylesheet *sheet,
+                                     const ComputedStyle *parent,
+                                     lxb_dom_node_t *node,
+                                     const StyleMatchSubject *subject,
+                                     const StyleRuleIndexPlan *plan,
+                                     PseudoElement pseudo,
+                                     size_t start, size_t end,
+                                     ComputedStyle *style,
+                                     const StyleRetainedMatchEntry *retained_entry,
+                                     StyleCascadeMatches *only_rank)
+{
     while (start < end) {
         const StyleRule *first = &sheet->rules[start];
         size_t stop = start + 1u;
@@ -2122,8 +2154,8 @@ static void style_apply_matching_range(const Stylesheet *sheet,
            no rule has been applied from this group yet. */
         if (overflow) {
             style_apply_matching_ordered_range(sheet, parent, node, subject,
-                plan, pseudo, start, stop, style, trace_position,
-                retained_entry, record, NULL);
+                plan, pseudo, start, stop, style, false,
+                retained_entry, false, only_rank);
             start = stop;
             continue;
         }
@@ -2142,8 +2174,110 @@ static void style_apply_matching_range(const Stylesheet *sheet,
         for (size_t i = 0; i < count; i++)
             style_apply_matching_ordered_range(sheet, parent, node, subject,
                 plan, pseudo, spans[i].begin, spans[i].end, style,
-                trace_position, retained_entry, record, NULL);
+                false, retained_entry, false, only_rank);
         start = stop;
+    }
+}
+
+/* An element's own important declarations belong to the tree it lives in, so
+   they follow that tree's important rules and precede those of an inner
+   context: the element's own :host and its parent's ::slotted() (rank > 0). */
+typedef struct {
+    const ComputedStyle *values;
+    uint64_t mask;
+    uint64_t mask_high;
+    uint64_t inherit;
+} StyleInlineImportant;
+
+static void style_apply_inline_important(const Stylesheet *sheet,
+                                         const StyleInlineImportant *important,
+                                         ComputedStyle *style,
+                                         const ComputedStyle *parent)
+{
+    if (important == NULL) return;
+    apply_values((Stylesheet *) sheet, style, important->values,
+                 important->mask, important->mask_high, parent);
+    apply_inherit_mask((Stylesheet *) sheet, style, parent, important->inherit);
+}
+
+static void style_apply_matching_range(const Stylesheet *sheet,
+                                       const ComputedStyle *parent,
+                                       lxb_dom_node_t *node,
+                                       const StyleMatchSubject *subject,
+                                       const StyleRuleIndexPlan *plan,
+                                       PseudoElement pseudo,
+                                       size_t start, size_t end,
+                                       ComputedStyle *style,
+                                       bool trace_position,
+                                       const StyleRetainedMatchEntry *retained_entry,
+                                       bool record,
+                                       bool contexts,
+                                       const StyleInlineImportant *inline_important)
+{
+    if (sheet == NULL || (!sheet->scopes.adopted_order_varies && !contexts)) {
+        style_apply_matching_ordered_range(sheet, parent, node, subject, plan,
+            pseudo, start, end, style, trace_position, retained_entry, record, NULL);
+        style_apply_inline_important(sheet, inline_important, style, parent);
+        return;
+    }
+    StyleCascadeMatches collected = {0};
+    style_apply_matching_ordered_range(sheet, parent, node, subject, plan,
+        pseudo, start, end, style, trace_position, retained_entry, record,
+        &collected);
+    if (!collected.overflow) {
+        /* Sort only actual matches, preserving the index and retained fast
+           paths: first by context, then equal-priority matches by this
+           root's sheet order. Both passes are stable. */
+        uint8_t rank[128];
+        for (size_t i = 0; i < collected.count; i++) {
+            rank[i] = style_rule_context_rank(
+                sheet, &sheet->rules[collected.rules[i]], contexts);
+        }
+        for (size_t i = 1; i < collected.count; i++) {
+            size_t j = i;
+            while (j != 0 && (rank[j] < rank[j - 1u]
+                || (rank[j] == rank[j - 1u]
+                    && sheet->scopes.adopted_order_varies
+                    && style_rules_same_priority(
+                        &sheet->rules[collected.rules[j]],
+                        &sheet->rules[collected.rules[j - 1u]])
+                    && collected.orders[j] < collected.orders[j - 1u]))) {
+                uint32_t rule = collected.rules[j];
+                uint64_t order = collected.orders[j];
+                uint8_t context = rank[j];
+                collected.rules[j] = collected.rules[j - 1u];
+                collected.orders[j] = collected.orders[j - 1u];
+                rank[j] = rank[j - 1u];
+                collected.rules[j - 1u] = rule;
+                collected.orders[j - 1u] = order;
+                rank[j - 1u] = context;
+                j--;
+            }
+        }
+        for (size_t i = 0; i < collected.count; i++) {
+            if (rank[i] != 0) {
+                style_apply_inline_important(
+                    sheet, inline_important, style, parent);
+                inline_important = NULL;
+            }
+            apply_style_rule(sheet, &sheet->rules[collected.rules[i]], style, parent);
+        }
+        style_apply_inline_important(sheet, inline_important, style, parent);
+        return;
+    }
+    /* An exceptionally dense match set uses bounded source spans instead.
+       The collection pass applied nothing, and traced and recorded each match
+       once. Each context rank gets its own walk over the spans, so the order
+       is the one the sort above gives: at most three selector passes, only
+       for an element that meets shadow contexts. */
+    collected.applying = true;
+    for (uint8_t rank = 0; rank < (contexts ? 3u : 1u); rank++) {
+        collected.apply_rank = rank;
+        style_apply_source_spans(sheet, parent, node, subject, plan, pseudo,
+            start, end, style, retained_entry,
+            contexts ? &collected : NULL);
+        if (rank == 0)
+            style_apply_inline_important(sheet, inline_important, style, parent);
     }
 }
 
@@ -3084,15 +3218,22 @@ static void apply_style_rule(const Stylesheet *sheet, const StyleRule *rule,
          & STYLE_DEFERRED_LOGICAL) != 0) {
         style_record_logical_axes(sheet, style);
     }
-    if ((declaration->deferred_program_reserved
-         & STYLE_DECLARATION_ALL_INHERIT) != 0
-        && parent != NULL) {
+    uint16_t all = declaration->deferred_program_reserved
+        & STYLE_DECLARATION_ALL_MASK;
+    if (all != 0 && (parent != NULL || all != STYLE_DECLARATION_ALL_INHERIT)) {
         /* CSS `all` excludes direction and unicode-bidi. Direction is the
-           only excluded value retained by this compact ComputedStyle. */
+           only excluded value retained by this compact ComputedStyle; the
+           root font size is document state, not a property. */
         uint8_t direction = style->filter_code & STYLE_DIRECTION_RTL;
-        *style = *parent;
+        uint8_t root_font_size = style->root_font_size;
+        uint8_t root_font_size_fraction = style->root_font_size_fraction;
+        *style = all == STYLE_DECLARATION_ALL_INHERIT ? *parent
+            : style_initial_inherited(
+                  sheet, all == STYLE_DECLARATION_ALL_UNSET ? parent : NULL);
         style->filter_code = (uint8_t) (
             (style->filter_code & ~STYLE_DIRECTION_RTL) | direction);
+        style->root_font_size = root_font_size;
+        style->root_font_size_fraction = root_font_size_fraction;
     }
     ComputedStyle declared;
     stylesheet_declaration_values(sheet, declaration, &declared);
@@ -3555,11 +3696,12 @@ static ComputedStyle style_apply_node_cascade_inner(
             sheet, &subject, PSEUDO_NONE, candidate_list,
             STYLE_RULE_INDEX_LIST_CAPACITY);
     }
+    bool shadow_contexts = style_node_meets_shadow_contexts(sheet, node);
     style_apply_matching_range(
         sheet, parent, node, &subject, &index_plan, PSEUDO_NONE,
         sheet->cascade_starts[CASCADE_AUTHOR_NORMAL],
         sheet->cascade_ends[CASCADE_AUTHOR_NORMAL], &style, trace_position,
-        retained, record);
+        retained, record, shadow_contexts, NULL);
     size_t length = 0;
     const char *inline_css = sheet->block_inline_style_attributes
             && !document_style_attribute_cssom_authorized(node)
@@ -3634,25 +3776,22 @@ static ComputedStyle style_apply_node_cascade_inner(
         sheet, parent, node, &subject, &index_plan, PSEUDO_NONE,
         sheet->cascade_starts[CASCADE_USER_NORMAL],
         sheet->cascade_ends[CASCADE_USER_NORMAL], &style, false,
-        retained, record);
+        retained, record, shadow_contexts, NULL);
+    StyleInlineImportant inline_important = {
+        &inline_important_values, inline_important_mask,
+        inline_important_mask_high, inline_important_inherit
+    };
     style_apply_matching_range(
         sheet, parent, node, &subject, &index_plan, PSEUDO_NONE,
         sheet->cascade_starts[CASCADE_AUTHOR_IMPORTANT],
         sheet->cascade_ends[CASCADE_AUTHOR_IMPORTANT], &style, false,
-        retained, record);
-    if (inline_css != NULL) {
-        apply_values((Stylesheet *) sheet, &style,
-                     &inline_important_values,
-                     inline_important_mask, inline_important_mask_high, parent);
-        apply_inherit_mask(
-            (Stylesheet *) sheet, &style, parent,
-            inline_important_inherit);
-    }
+        retained, record, shadow_contexts,
+        inline_css != NULL ? &inline_important : NULL);
     style_apply_matching_range(
         sheet, parent, node, &subject, &index_plan, PSEUDO_NONE,
         sheet->cascade_starts[CASCADE_USER_IMPORTANT],
         sheet->cascade_ends[CASCADE_USER_IMPORTANT], &style, false,
-        retained, record);
+        retained, record, shadow_contexts, NULL);
     if (record) style_retained_commit(sheet, node, PSEUDO_NONE);
     if (sheet->fullscreen_node == node) {
         /* The PSP has no compositor top layer. Apply the bounded equivalent
@@ -3875,8 +4014,12 @@ static ComputedStyle style_for_node_scoped(const Stylesheet *sheet,
         }
     }
     resolve_font_size(&style, parent, root_element);
-    style_apply_modern_properties(
-        sheet, node, parent, &style, root_element);
+    if (sheet != NULL && sheet->modern_property_mask != 0) {
+        StyleRetainedGate gate = style_retained_gate_begin(sheet, node);
+        style_apply_modern_properties(
+            sheet, node, parent, &style, root_element);
+        style_retained_gate_end(sheet, gate);
+    }
     resolve_sizing_em_lengths(&style);
     resolve_overflow_clip_margin(&style);
     resolve_overflow_axes(&style);
@@ -4167,11 +4310,12 @@ static ComputedStyle style_resolve_pseudo(const Stylesheet *sheet, lxb_dom_node_
             STYLE_RULE_INDEX_LIST_CAPACITY);
     }
     bool record = retained == NULL && style_retained_begin(sheet);
+    bool shadow_contexts = style_node_meets_shadow_contexts(sheet, node);
     for (size_t phase = 0; phase < 4; phase++) {
         style_apply_matching_range(
             sheet, parent, node, &subject, &index_plan, pseudo,
-            sheet->cascade_starts[phase],
-            sheet->cascade_ends[phase], &style, false, retained, record);
+            sheet->cascade_starts[phase], sheet->cascade_ends[phase],
+            &style, false, retained, record, shadow_contexts, NULL);
     }
     if (record) style_retained_commit(sheet, node, pseudo);
     resolve_font_size(&style, parent, false);

@@ -681,7 +681,9 @@ static bool intrinsic_wraps_single_atomic(
             }
             continue;
         }
-        if (child->type != LXB_DOM_NODE_TYPE_ELEMENT || found) return false;
+        /* Comments (template part markers) are not boxes. */
+        if (child->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
+        if (found) return false;
         ComputedStyle style = layout_style_for_node(context, child, parent);
         found = style.display == DISPLAY_INLINE_BLOCK
                 || style.display == DISPLAY_INLINE_FLEX

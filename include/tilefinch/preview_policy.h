@@ -41,14 +41,15 @@
 #define PREVIEW_POLICY_EXTENSION_ELEMENTS 32u
 #define PREVIEW_POLICY_EXTENSION_ELEMENTS_LIMIT 4096u
 /* After an empty first-screen attempt (the viewport held only boxes, image
-   slots or nothing), the next one waits for this many more rendering
-   elements, doubled by each further empty attempt, or for the parsed body
-   to double. Re-laying out the same prefix shows the same nothing: a large
-   inline script or JSON blob can add megabytes without a single element,
-   and every attempt is a layout from the top plus the stylesheet
-   fingerprint. An empty attempt that already laid out past the first
-   screen (truncated at its limit) waits for the body to double: what
-   follows flows below the screen. */
+   slots the stream does not count as content, or nothing, or it held image
+   slots above text and the compositor declined it), the next one
+   waits for this many more rendering elements, doubled by each further
+   empty attempt, or for the parsed body to double. Re-laying out the same
+   prefix shows the same nothing: a large inline script or JSON blob can add
+   megabytes without a single element, and every attempt is a layout from
+   the top plus the stylesheet fingerprint. An empty attempt that already
+   laid out past the first screen (truncated at its limit) waits for the
+   body to double: what follows flows below the screen. */
 #define PREVIEW_POLICY_EMPTY_ELEMENTS 32u
 #define PREVIEW_POLICY_EMPTY_ELEMENTS_LIMIT (64u * 1024u)
 /* Admitted checks (past the stream's cheap gates) without new input. */

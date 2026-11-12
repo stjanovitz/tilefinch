@@ -62,6 +62,12 @@ struct YoutubeLiteFeedJob {
     YoutubeLiteLoadStatus status;
     YoutubeLiteIdentity identity;
     YoutubeLiteBootstrapAccount account;
+    /* The API request was signed with the session's cached identity, no
+       bootstrap page was read, and how many API answers have arrived. A
+       first answer that refuses it sends the job back to the bootstrap
+       page once. */
+    bool identity_cached, bootstrap_retried;
+    unsigned api_responses;
     FetchResult response;
     YoutubeLiteBuildWork *build;
     YoutubeLiteDocument document;
@@ -428,13 +434,43 @@ static YoutubeLiteFeedJob *lite_feed_create(Budget *budget,
     return job;
 }
 
+/* Sends the job's first request. An identity the session cached from a
+   signed-in MWEB bootstrap page, bound to the same sign-in and visitor
+   cookies, signs the API request at once; otherwise the bootstrap page is
+   downloaded and read first, as it is on a retry. */
+static bool lite_feed_start(YoutubeLiteFeedJob *job)
+{
+    YoutubeLiteIdentity cached = {0};
+    if (!job->bootstrap_retried
+        && lite_identity_cache_get(job->session, &cached)
+        && cached.signed_in_mweb
+        && (job->action == YOUTUBE_LITE_ACTION_NONE
+            || cached.auth_user_known)) {
+        job->identity = cached;
+        job->account = (YoutubeLiteBootstrapAccount) {
+            .client_name = "MWEB", .login_known = true, .logged_in = true};
+        job->identity_cached = true;
+        if (lite_feed_enqueue(job, true)) {
+            job->phase = LITE_FEED_API;
+            return true;
+        }
+        job->identity_cached = false;
+        job->failure = YOUTUBE_FEED_FAILURE_NONE;
+    }
+    job->identity = (YoutubeLiteIdentity) {
+        .version = YOUTUBE_LITE_IDENTITY_CACHE_VERSION};
+    job->account = (YoutubeLiteBootstrapAccount) {0};
+    job->phase = LITE_FEED_BOOTSTRAP;
+    return lite_feed_enqueue(job, false);
+}
+
 YoutubeLiteFeedJob *youtube_lite_feed_begin(Budget *budget,
     BrowserSession *session, bool subscriptions, bool compact, long timeout_ms)
 {
     YoutubeLiteFeedJob *job = lite_feed_create(budget, session, timeout_ms);
     if (job == NULL) return NULL;
     job->subscriptions = subscriptions; job->compact = compact;
-    if (!lite_feed_enqueue(job, false)) { youtube_lite_feed_destroy(job); return NULL; }
+    if (!lite_feed_start(job)) { youtube_lite_feed_destroy(job); return NULL; }
     return job;
 }
 
@@ -452,7 +488,7 @@ YoutubeLiteFeedJob *youtube_lite_account_action_begin(Budget *budget,
     job->action = action;
     snprintf(job->action_target, sizeof(job->action_target), "%s", target_id);
     if (!channel) snprintf(job->action_video, sizeof(job->action_video), "%s", video_id);
-    if (!lite_feed_enqueue(job, false)) { youtube_lite_feed_destroy(job); return NULL; }
+    if (!lite_feed_start(job)) { youtube_lite_feed_destroy(job); return NULL; }
     return job;
 }
 
@@ -461,11 +497,11 @@ YoutubeLiteFeedJob *youtube_lite_rating_begin(Budget *budget,
 {
     if (budget == NULL || session == NULL || video_id == NULL || !lite_valid_video_id(video_id)
         || !youtube_lite_session_signed_in(session)) return NULL;
-    YoutubeLiteFeedJob *job = youtube_lite_feed_begin(budget, session, false, false, timeout_ms);
-    if (job != NULL) {
-        snprintf(job->like_video_id, sizeof(job->like_video_id), "%s", video_id);
-        job->like_selected = liked;
-    }
+    YoutubeLiteFeedJob *job = lite_feed_create(budget, session, timeout_ms);
+    if (job == NULL) return NULL;
+    snprintf(job->like_video_id, sizeof(job->like_video_id), "%s", video_id);
+    job->like_selected = liked;
+    if (!lite_feed_start(job)) { youtube_lite_feed_destroy(job); return NULL; }
     return job;
 }
 
@@ -910,6 +946,7 @@ static YoutubeLiteLoadStatus lite_feed_identity_pump(YoutubeLiteFeedJob *job)
         && (!job->identity.auth_user_known || !job->account.logged_in)) {
         job->status = YOUTUBE_LITE_LOAD_FAILED; return job->status;
     }
+    (void) lite_identity_cache_put(job->session, &job->identity);
     lite_secure_release(&job->response);
     if (!lite_feed_enqueue(job, true)) job->status = YOUTUBE_LITE_LOAD_FAILED;
     else job->phase = LITE_FEED_API;
@@ -994,10 +1031,9 @@ static YoutubeLiteLoadStatus lite_feed_api_framing_pump(YoutubeLiteFeedJob *job)
     return job->status;
 }
 
-YoutubeLiteLoadStatus youtube_lite_feed_pump(YoutubeLiteFeedJob *job,
-                                            const FetchPumpQuota *quota)
+static YoutubeLiteLoadStatus lite_feed_pump_step(YoutubeLiteFeedJob *job,
+                                                const FetchPumpQuota *quota)
 {
-    if (job == NULL) return YOUTUBE_LITE_LOAD_FAILED;
     if (job->status != YOUTUBE_LITE_LOAD_PENDING) return job->status;
     /* Keep the session binding through optional history and construction,
        not only at the first authenticated response. */
@@ -1098,7 +1134,7 @@ YoutubeLiteLoadStatus youtube_lite_feed_pump(YoutubeLiteFeedJob *job,
     job->http_status = job->response.status_code;
     if (job->phase == LITE_FEED_BOOTSTRAP) job->bootstrap_status = job->http_status;
     else if (job->history_request) job->history_status = job->http_status;
-    else job->api_status = job->http_status;
+    else { job->api_status = job->http_status; job->api_responses++; }
     job->transported = fetched;
     job->same_origin = tilefinch_url_same_origin(job->response.effective_url, "https://m.youtube.com/");
 #ifndef __PSP__
@@ -1152,6 +1188,62 @@ YoutubeLiteLoadStatus youtube_lite_feed_pump(YoutubeLiteFeedJob *job,
         job->phase = LITE_FEED_IDENTITY;
     } else { job->phase = job->history_request
         ? LITE_FEED_HISTORY_FRAMING : LITE_FEED_API_FRAMING; job->cursor = 0; }
+    return job->status;
+}
+
+/* Whether a failure may be the cached identity's fault: its first API
+   answer refused the request or did not confirm it. Transport, time and
+   session failures are not, and nothing was changed on the account yet: an
+   account action's first request only reads, and a rating repeats safely. */
+static bool lite_feed_cached_identity_refused(const YoutubeLiteFeedJob *job)
+{
+    return job->identity_cached && !job->bootstrap_retried
+        && job->api_responses == 1u && !job->api_authenticated
+        && !job->action_submitted
+        && (job->failure == YOUTUBE_FEED_FAILURE_NONE
+            || job->failure == YOUTUBE_FEED_FAILURE_HTTP
+            || job->failure == YOUTUBE_FEED_FAILURE_JSON
+            || job->failure == YOUTUBE_FEED_FAILURE_AUTHENTICATION);
+}
+
+YoutubeLiteLoadStatus youtube_lite_feed_pump(YoutubeLiteFeedJob *job,
+                                            const FetchPumpQuota *quota)
+{
+    if (job == NULL) return YOUTUBE_LITE_LOAD_FAILED;
+    bool pending = job->status == YOUTUBE_LITE_LOAD_PENDING;
+    YoutubeLiteLoadStatus status = lite_feed_pump_step(job, quota);
+    if (pending && status == YOUTUBE_LITE_LOAD_SUCCEEDED
+        && !job->identity_cached && job->account.logged_in
+        && strcmp(job->account.client_name, "MWEB") == 0) {
+        /* A request signed with the identity this job read succeeded. */
+        YoutubeLiteIdentity proven = job->identity;
+        proven.signed_in_mweb = true;
+        (void) lite_identity_cache_put(job->session, &proven);
+        lite_secure_wipe(&proven, sizeof(proven));
+    }
+    if (status != YOUTUBE_LITE_LOAD_FAILED
+        || !lite_feed_cached_identity_refused(job)) return status;
+    /* Read the bootstrap page after all; it also says whether the account
+       is still signed in. Until a request succeeds again, later jobs read
+       it too. */
+    lite_identity_cache_forget_account(job->session);
+    if (job->request != 0) {
+        (void) fetch_scheduler_cancel(job->scheduler, job->request,
+                                      "cached YouTube identity refused");
+        job->request = 0;
+    }
+    lite_secure_release(&job->response);
+    job->cursor = job->json_depth = 0;
+    job->json_string = job->json_escape = job->json_started = false;
+    job->json_done = job->json_error = false;
+    job->context_begin = job->context_end = 0;
+    job->identity_cached = false;
+    job->bootstrap_retried = true;
+    job->api_responses = 0;
+    job->failure = YOUTUBE_FEED_FAILURE_NONE;
+    job->rejected_identity = 0;
+    job->status = YOUTUBE_LITE_LOAD_PENDING;
+    if (!lite_feed_start(job)) job->status = YOUTUBE_LITE_LOAD_FAILED;
     return job->status;
 }
 

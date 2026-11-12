@@ -8,12 +8,23 @@
 #include "tilefinch/budget.h"
 #include "tilefinch/media_source.h"
 
-#define MEDIA_HLS_MAXIMUM_PLAYLIST_BYTES (64u * 1024u)
+/* A playlist kept whole: its text and its entries. A finite playlist past
+   either bound is refused (MEDIA_HLS_PLAYLIST_TOO_LONG). */
+#define MEDIA_HLS_MAXIMUM_PLAYLIST_BYTES (128u * 1024u)
 #define MEDIA_HLS_MAXIMUM_PLAYLIST_DOWNLOAD_BYTES (2u * 1024u * 1024u)
 #define MEDIA_HLS_RETAINED_LIVE_SEGMENTS 12u
-#define MEDIA_HLS_MAXIMUM_SEGMENTS 256u
+#define MEDIA_HLS_MAXIMUM_SEGMENTS 2048u
+/* A live playlist past either of these is compacted to its newest
+   MEDIA_HLS_RETAINED_LIVE_SEGMENTS segments rather than kept whole: it is
+   refetched every half target duration. */
+#define MEDIA_HLS_LIVE_COMPACT_SEGMENTS 256u
+#define MEDIA_HLS_LIVE_COMPACT_PLAYLIST_BYTES (64u * 1024u)
 #define MEDIA_HLS_MAXIMUM_SEGMENT_BYTES (2u * 1024u * 1024u)
 #define MEDIA_HLS_TRANSPORT_CHUNK_BYTES (16u * 1024u)
+/* Failure prefix for a finite playlist past MEDIA_HLS_MAXIMUM_SEGMENTS
+   entries or MEDIA_HLS_MAXIMUM_PLAYLIST_BYTES of text. The failure panel
+   and the candidate list match on it. */
+#define MEDIA_HLS_PLAYLIST_TOO_LONG "HLS playlist is too long"
 
 typedef enum {
     MEDIA_HLS_PLAYLIST_MEDIA = 0,
@@ -154,6 +165,8 @@ typedef struct {
     size_t queued_samples;
     size_t queued_bytes;
     size_t queue_overflows;
+    /* Audio dropped before a mixed stream's first SPS. */
+    size_t preroll_audio_dropped;
     size_t malformed_segments;
     size_t playlist_refreshes;
     size_t playlist_refresh_failures;
@@ -168,6 +181,8 @@ typedef struct {
     /* The sample queue is full enough that delivery waits for the consumer:
        more waiting cannot buffer further ahead until samples are taken. */
     bool holding;
+    /* A live MP3 stream is reconnecting (MediaMp3Stats.reconnecting). */
+    bool reconnecting;
 } MediaHlsStats;
 
 /* Takes ownership of a MEDIA playlist on success only. */
@@ -178,6 +193,22 @@ MediaHlsSource *media_hls_source_create_track(
     Budget *budget, MediaHlsPlaylist *playlist,
     const MediaHlsTransport *transport, MediaHlsTrackSelection selection,
     char *error, size_t error_size);
+/* Live sources for a separate video and audio rendition: put the audio on
+   the video's clock by the first timestamp each primed (MPEG-TS PTS, or a
+   packed-audio segment's ID3 timestamp). With no timestamp on one side
+   (packed audio whose ID3 tag lacks the PRIV timestamp), the two starts
+   are matched by their distance from their playlists' ends instead. Call
+   once both are primed. When the audio starts a segment or more away it
+   moves to the matching segment once and returns true: prime the audio
+   again and call again. A smaller offset is trimmed (audio before the
+   first picture is dropped) or kept as a late start of up to about two AAC
+   frames; true then only when the trim left no audio queued. Returns
+   false, changing nothing, when either source is not live or has not
+   primed, and when the offset lies outside the audio playlist (unrelated
+   clocks). Once lined up, the pair shares live window skips: content
+   either one skips is taken off both clocks. */
+bool media_hls_source_align_live_start(MediaHlsSource *video,
+                                       MediaHlsSource *audio);
 MediaHlsPrimeStatus media_hls_source_prime(
     MediaHlsSource *source, char *error, size_t error_size);
 /* One bounded delivery visit (up to a few KiB of segment bytes, stopping

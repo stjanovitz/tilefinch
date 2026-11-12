@@ -5,6 +5,7 @@
 #include "tilefinch/sha256.h"
 
 #if defined(__PSP__)
+#include <mbedtls/sha1.h>
 #include <mbedtls/sha512.h>
 #else
 #include <openssl/evp.h>
@@ -198,6 +199,38 @@ static bool digest_sha384_or_512(const uint8_t *bytes, size_t length,
     (void) tilefinch_sha512_begin(&context, sha384);
     tilefinch_sha512_update(&context, bytes, length);
     return tilefinch_sha512_finish(&context, output);
+}
+
+static bool digest_sha1(const uint8_t *bytes, size_t length,
+                        uint8_t output[20])
+{
+    static const uint8_t empty = 0;
+    if (bytes == NULL) bytes = &empty;
+#if defined(__PSP__)
+    return mbedtls_sha1(bytes, length, output) == 0;
+#else
+    unsigned produced = 0;
+    return EVP_Digest(bytes, length, output, &produced, EVP_sha1(), NULL) == 1
+        && produced == 20u;
+#endif
+}
+
+size_t tilefinch_web_digest(TilefinchWebDigest algorithm,
+                            const uint8_t *bytes, size_t length,
+                            uint8_t output[64])
+{
+    if (output == NULL || (bytes == NULL && length != 0)) return 0;
+    switch (algorithm) {
+    case TILEFINCH_WEB_DIGEST_SHA1:
+        return digest_sha1(bytes, length, output) ? 20u : 0u;
+    case TILEFINCH_WEB_DIGEST_SHA256:
+        return tilefinch_sha256_digest(bytes, length, output) ? 32u : 0u;
+    case TILEFINCH_WEB_DIGEST_SHA384:
+        return digest_sha384_or_512(bytes, length, true, output) ? 48u : 0u;
+    case TILEFINCH_WEB_DIGEST_SHA512:
+        return digest_sha384_or_512(bytes, length, false, output) ? 64u : 0u;
+    }
+    return 0;
 }
 
 static bool constant_time_equal(const uint8_t *left, const uint8_t *right,

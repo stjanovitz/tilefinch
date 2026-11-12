@@ -3,6 +3,98 @@
 #include <stdio.h>
 #include <string.h>
 
+/* The first estimator's predictor set (repeat at lags 1..8 only), copied
+   from src/psp_entropy_pool.c as it shipped before the lag bound followed
+   the batch size. The monotonicity test holds the shipped estimator to never
+   crediting more than this. */
+static uint64_t legacy_isqrt64(uint64_t value)
+{
+    uint64_t root = 0;
+    uint64_t bit = UINT64_C(1) << 62;
+    while (bit > value) bit >>= 2;
+    while (bit != 0) {
+        if (value >= root + bit) {
+            value -= root + bit;
+            root = (root >> 1) + bit;
+        } else {
+            root >>= 1;
+        }
+        bit >>= 2;
+    }
+    return root;
+}
+
+static uint32_t legacy_upper_bound_q16(uint32_t hits, uint32_t trials)
+{
+    if (trials < 2u || hits >= trials) return 65536u;
+    uint64_t rate = ((uint64_t) hits << 16) / trials;
+    uint64_t variance_q32 = rate * (65536u - rate) / (trials - 1u);
+    uint64_t bound = rate
+        + (legacy_isqrt64(variance_q32) * 2576u + 999u) / 1000u;
+    return bound > 65536u ? 65536u : (uint32_t) bound;
+}
+
+static uint32_t legacy_neg_log2_q16_millibits(uint32_t q)
+{
+    if (q >= 65536u) return 0u;
+    if (q == 0u) q = 1u;
+    uint32_t whole = 0u;
+    while ((q >> (whole + 1u)) != 0u) whole++;
+    uint64_t y = ((uint64_t) q << 16) >> whole;
+    uint32_t fraction = 0u;
+    for (unsigned bit = 0; bit < 16u; bit++) {
+        y = (y * y) >> 16;
+        fraction <<= 1;
+        if (y >= (UINT64_C(2) << 16)) {
+            y >>= 1;
+            fraction |= 1u;
+        }
+    }
+    uint32_t log_q16 = (whole << 16) | fraction;
+    uint32_t negative_q16 = (16u << 16) - log_q16;
+    return (uint32_t) (((uint64_t) negative_q16 * 1000u) >> 16);
+}
+
+static uint32_t legacy_estimate_millibits(uint32_t *samples, size_t count)
+{
+    if (samples == NULL || count < PSP_ENTROPY_MIN_BATCH
+        || count > PSP_ENTROPY_MAX_BATCH) return 0u;
+    uint32_t trials = (uint32_t) count;
+    uint32_t worst = 0u;
+    for (uint32_t lag = 1u; lag <= 8u; lag++) {
+        uint32_t hits = 0u;
+        for (uint32_t index = lag; index < trials; index++) {
+            if (samples[index] == samples[index - lag]) hits++;
+        }
+        uint32_t bound = legacy_upper_bound_q16(hits, trials - lag);
+        if (bound > worst) worst = bound;
+    }
+    uint32_t trend_hits = 0u;
+    for (uint32_t index = 2u; index < trials; index++) {
+        uint32_t guess = 2u * samples[index - 1u] - samples[index - 2u];
+        if (samples[index] == guess) trend_hits++;
+    }
+    uint32_t bound = legacy_upper_bound_q16(trend_hits, trials - 2u);
+    if (bound > worst) worst = bound;
+    for (uint32_t index = 1u; index < trials; index++) {
+        uint32_t value = samples[index];
+        uint32_t cursor = index;
+        while (cursor > 0u && samples[cursor - 1u] > value) {
+            samples[cursor] = samples[cursor - 1u];
+            cursor--;
+        }
+        samples[cursor] = value;
+    }
+    uint32_t longest = 1u, run = 1u;
+    for (uint32_t index = 1u; index < trials; index++) {
+        run = samples[index] == samples[index - 1u] ? run + 1u : 1u;
+        if (run > longest) longest = run;
+    }
+    bound = legacy_upper_bound_q16(longest, trials);
+    if (bound > worst) worst = bound;
+    return legacy_neg_log2_q16_millibits(worst);
+}
+
 #define CHECK(condition) do {                                              \
     if (!(condition)) {                                                    \
         fprintf(stderr, "CHECK failed at %s:%d: %s\n",                    \
@@ -75,6 +167,231 @@ static int test_estimator_credits_unpredictable_batches(void)
 
     /* The order-free predictor runs last and sorts in place (documented). */
     for (size_t i = 1; i < 256; i++) CHECK(samples[i - 1] <= samples[i]);
+    return 0;
+}
+
+/* A zero-jitter two-clock beat: fixed work of `duration` microseconds read
+   on a 1 us clock whose phase against the work advances by `step` each
+   sample. The samples are floor(phase + duration) - floor(phase) with phase
+   in [0, 1), so they are a pure function of the start phase: no entropy.
+   Truncation stands in for floor because every operand is non-negative. */
+static void beat_batch(uint32_t *samples, size_t count, double duration,
+                       double step)
+{
+    double phase = 0.37;
+    for (size_t i = 0; i < count; i++) {
+        samples[i] = (uint32_t) (phase + duration);
+        phase += step;
+        phase -= (double) (uint64_t) phase;
+    }
+}
+
+/* Worst credit over the review's grid: durations 7.05..7.95 us, 1,999 step
+   fractions (37,981 beats). */
+static uint32_t worst_beat_credit(size_t count, uint32_t *nonzero)
+{
+    uint32_t samples[PSP_ENTROPY_MAX_BATCH], worst = 0u;
+    *nonzero = 0u;
+    for (int d = 1; d < 20; d++) {
+        for (int t = 1; t < 2000; t++) {
+            beat_batch(samples, count, 7.0 + d / 20.0,
+                       11.0 + t / 2000.0 + 0.000123);
+            uint32_t bits = psp_entropy_credit_bits(
+                psp_entropy_estimate_millibits(samples, count), count);
+            if (bits != 0u) (*nonzero)++;
+            if (bits > worst) worst = bits;
+        }
+    }
+    return worst;
+}
+
+static int test_estimator_refuses_cyclic_beats(void)
+{
+    /* A zero-jitter beat is fully deterministic, so no case of the grid may
+       earn credit, for work or sleep batches. Lags 1..8 credited up to 15
+       bits per work batch here (a period-9 cycle at 7.2 us, step fraction
+       about 1/9) and 2 per sleep batch, nonzero in 28,884 and 3,598 of the
+       37,981 cases (the 2026-11 entropy review, ENTROPY-REC.md). */
+    uint32_t samples[PSP_ENTROPY_MAX_BATCH], nonzero = 1u;
+    CHECK(worst_beat_credit(256, &nonzero) == 0u);
+    CHECK(nonzero == 0u);
+    nonzero = 1u;
+    CHECK(worst_beat_credit(64, &nonzero) == 0u);
+    CHECK(nonzero == 0u);
+
+    beat_batch(samples, 256, 7.2, 11.111123);
+    CHECK(psp_entropy_estimate_millibits(samples, 256) == 0u);
+    return 0;
+}
+
+/* Cycles of arbitrary values longer than eight samples, which neither the
+   trend nor the most-common-value predictor sees. */
+static int test_estimator_refuses_long_cycles(void)
+{
+    static const uint32_t periods[] = {9u, 17u, 33u, 64u};
+    uint32_t cycle[64], samples[PSP_ENTROPY_MAX_BATCH];
+    uint32_t copy[PSP_ENTROPY_MAX_BATCH];
+    random_state = 29;
+    for (size_t i = 0; i < 64; i++) cycle[i] = next_random() & 0xFFu;
+    for (size_t p = 0; p < sizeof(periods) / sizeof(periods[0]); p++) {
+        for (size_t i = 0; i < 256; i++) samples[i] = cycle[i % periods[p]];
+        memcpy(copy, samples, sizeof(copy));
+        /* The gap the longer lags close: eight lags credited these. */
+        CHECK(psp_entropy_credit_bits(legacy_estimate_millibits(copy, 256),
+                                      256) > 0u);
+        CHECK(psp_entropy_estimate_millibits(samples, 256) == 0u);
+    }
+    /* A sleep batch reaches lag 16. */
+    for (size_t period = 9u; period <= 16u; period++) {
+        for (size_t i = 0; i < 64; i++) samples[i] = cycle[i % period];
+        CHECK(psp_entropy_estimate_millibits(samples, 64) == 0u);
+    }
+    return 0;
+}
+
+/* Approximately normal, mean 0 and deviation 1 (Irwin-Hall, n = 12). */
+static double next_normal(void)
+{
+    double sum = 0.0;
+    for (int i = 0; i < 12; i++) sum += (next_random() + 0.5) / 4294967296.0;
+    return sum - 6.0;
+}
+
+/* Signals with real entropy keep earning: the longer lags must not starve
+   the device's work and sleep sources. */
+static int test_estimator_keeps_crediting_honest_signals(void)
+{
+    uint32_t samples[PSP_ENTROPY_MAX_BATCH], total = 0u;
+
+    /* Independent two-valued work samples, 70/30. */
+    random_state = 31;
+    for (unsigned batch = 0; batch < 200u; batch++) {
+        for (size_t i = 0; i < 256; i++)
+            samples[i] = 7u + (next_random() % 10u >= 7u);
+        total += psp_entropy_credit_bits(
+            psp_entropy_estimate_millibits(samples, 256), 256);
+    }
+    CHECK(total >= 18u * 200u);
+
+    /* A beat whose duration jitters by 0.3 us. */
+    random_state = 37;
+    total = 0u;
+    for (int d = 0; d < 20; d++) {
+        for (int rep = 0; rep < 20; rep++) {
+            double duration = 7.0 + d / 20.0;
+            double phase = (next_random() + 0.5) / 4294967296.0;
+            for (size_t i = 0; i < 256; i++) {
+                samples[i] = (uint32_t) (phase + duration
+                                         + 0.3 * next_normal());
+                phase += 11.6180339887;
+                phase -= (double) (uint64_t) phase;
+            }
+            total += psp_entropy_credit_bits(
+                psp_entropy_estimate_millibits(samples, 256), 256);
+        }
+    }
+    CHECK(total >= 15u * 400u);
+
+    /* Sixteen-valued sleep samples still earn the batch maximum. */
+    random_state = 41;
+    for (unsigned batch = 0; batch < 200u; batch++) {
+        for (size_t i = 0; i < 64; i++)
+            samples[i] = 220u + (next_random() & 15u);
+        CHECK(psp_entropy_credit_bits(
+                  psp_entropy_estimate_millibits(samples, 64), 64) == 16u);
+    }
+    return 0;
+}
+
+/* Adding predictors can only lower an estimate: the shipped estimator never
+   exceeds the eight-lag one, and at the smallest batch, where both stop at
+   lag 8, they agree exactly. */
+static int test_estimator_never_exceeds_eight_lags(void)
+{
+    static const size_t counts[] = {PSP_ENTROPY_MIN_BATCH, 64u, 100u, 256u};
+    uint32_t samples[PSP_ENTROPY_MAX_BATCH], copy[PSP_ENTROPY_MAX_BATCH];
+    random_state = 43;
+    for (unsigned input = 0; input < 4000u; input++) {
+        size_t count = counts[input % 4u];
+        uint32_t kind = (input / 4u) % 5u;
+        uint32_t period = 2u + next_random() % 80u;
+        uint32_t spread = 1u + next_random() % 16u;
+        double phase = 0.25, step = 11.0 + (next_random() % 2000u) / 2000.0;
+        for (size_t i = 0; i < count; i++) {
+            switch (kind) {
+                case 0: /* independent */
+                    samples[i] = next_random() % spread;
+                    break;
+                case 1: /* cyclic */
+                    samples[i] = (uint32_t) (i % period) * 7u % spread;
+                    break;
+                case 2: /* deterministic beat */
+                    samples[i] = (uint32_t) (phase + 7.3);
+                    phase += step;
+                    phase -= (double) (uint64_t) phase;
+                    break;
+                case 3: /* jittered beat */
+                    samples[i] = (uint32_t) (phase + 7.3
+                                             + 0.2 * next_normal());
+                    phase += step;
+                    phase -= (double) (uint64_t) phase;
+                    break;
+                default: /* held values with random jumps */
+                    samples[i] = (i % period == 0u) ? next_random() & 3u
+                                                    : samples[i - 1u];
+                    break;
+            }
+        }
+        memcpy(copy, samples, count * sizeof(samples[0]));
+        uint32_t shipped = psp_entropy_estimate_millibits(samples, count);
+        uint32_t legacy = legacy_estimate_millibits(copy, count);
+        CHECK(shipped <= legacy);
+        if (count == PSP_ENTROPY_MIN_BATCH) CHECK(shipped == legacy);
+    }
+    return 0;
+}
+
+/* Why credit moves with code placement: fixed work whose duration's
+   fractional microsecond is `fraction` (thousandths), plus uniform jitter
+   half a tick wide, read on a 1 us clock. Each sample is one of two
+   integers, and the true per-sample min-entropy depends only on where the
+   duration falls between two ticks. A relink that moves the duration by a
+   fraction of a microsecond moves the yield, and that is expected. */
+static int test_estimator_tracks_tick_quantization(void)
+{
+    static const struct {
+        uint32_t fraction;       /* thousandths of a microsecond */
+        uint32_t true_millibits; /* -log2(most likely value), rounded down */
+    } models[] = {
+        {400u, 0u}, {500u, 0u}, {600u, 321u}, {700u, 736u},
+        {750u, 1000u}, {800u, 736u}, {900u, 321u},
+    };
+    uint32_t samples[PSP_ENTROPY_MAX_BATCH];
+    uint32_t mean_bits[sizeof(models) / sizeof(models[0])];
+    random_state = 23;
+    for (size_t m = 0; m < sizeof(models) / sizeof(models[0]); m++) {
+        uint32_t total = 0u;
+        for (unsigned batch = 0; batch < 64u; batch++) {
+            for (size_t i = 0; i < 256; i++)
+                samples[i] = (7000u + models[m].fraction
+                              + next_random() % 500u) / 1000u;
+            uint32_t millibits = psp_entropy_estimate_millibits(samples, 256);
+            uint32_t bits = psp_entropy_credit_bits(millibits, 256);
+            /* Credit never exceeds the model's true entropy, and neither
+               does the estimate before the safety divisor. */
+            CHECK(bits * 1000u <= 256u * models[m].true_millibits);
+            CHECK(millibits <= models[m].true_millibits);
+            total += bits;
+        }
+        mean_bits[m] = total / 64u;
+    }
+    /* Same jitter, same work: one value only when the duration sits early
+       in its tick, the most credit when the jitter straddles a tick
+       evenly. */
+    CHECK(mean_bits[0] == 0u && mean_bits[1] == 0u);
+    CHECK(mean_bits[4] > mean_bits[3] && mean_bits[3] > mean_bits[2]);
+    CHECK(mean_bits[4] > mean_bits[5] && mean_bits[5] > mean_bits[6]);
+    CHECK(mean_bits[4] >= 2u * mean_bits[2]);
     return 0;
 }
 
@@ -275,6 +592,11 @@ int main(void)
     int (*tests[])(void) = {
         test_estimator_refuses_predictable_batches,
         test_estimator_credits_unpredictable_batches,
+        test_estimator_refuses_cyclic_beats,
+        test_estimator_refuses_long_cycles,
+        test_estimator_keeps_crediting_honest_signals,
+        test_estimator_never_exceeds_eight_lags,
+        test_estimator_tracks_tick_quantization,
         test_estimator_bounds,
         test_credit_is_capped_and_divided,
         test_pool_requires_target_credit,

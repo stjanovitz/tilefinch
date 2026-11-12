@@ -31,7 +31,18 @@ keeps a 3 MiB presentation reserve. A script may be up to 4 MiB
 (`BROWSER_PSP_APP_SCRIPT_FILE_KB`), a page's scripts up to 16 MiB in all
 (`BROWSER_PSP_APP_SCRIPT_TOTAL_MB`); both are sanity ceilings for hostile
 input. A compile that needs more than planned is stopped by the heap limit
-and refused alone. The admission contract is in
+and refused alone. "The heap the realm can still grow to" is the heap a
+compile can really reach: the heap left under its limit and the growth the
+free page Budget can back, which come out of the same free Budget and are
+not added (after the Budget has given an inline compile its copy of the
+text, when it needs one). Inline, external and module scripts, module
+imports and scripts a page inserts are all admitted this way. One that does
+not fit is refused before it compiles: a document script is counted as
+memory pressure (the census tag `script-memory-pressure`), an inserted one
+fails with an `error` event. Once the text the parser has so far of an
+inline script could not be admitted, the rest is dropped as it streams, so
+the element reads as empty and the page carries on without it. The
+admission contract is in
 `include/tilefinch/script_admission.h`. Experiment measurements are kept in a
 private maintainer ledger outside the repository.
 
@@ -216,7 +227,9 @@ PSP-specific fast paths never change results:
   and kerning in hot measurement paths;
 - selector programs that compare interned identifiers and reuse node-local
   attribute facts, and compiled stylesheet fragments reused from bounded RAM
-  caches (never written to the Memory Stick);
+  caches (never written to the Memory Stick), and the previous page's whole
+  compiled sheet reused when the next page, or Back to one, has the same
+  style inputs;
 - preview layout limited to geometry that can affect the viewport;
 - on simple script-free pages, visible images loaded before publication and
   offscreen images pumped from idle work one viewport-ranked request and one

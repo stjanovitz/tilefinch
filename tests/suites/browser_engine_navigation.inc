@@ -552,7 +552,8 @@ static int test_bounded_focus_frontend_settles(void)
     config.resources.enabled = false;
     config.javascript.enabled = true;
     config.javascript.document_scripts_enabled = true;
-    config.javascript.heap_limit = 2u * MIB;
+    config.javascript.heap_limit = test_small_realm_bytes(
+        NULL, TEST_SMALL_REALM_MARGIN_BYTES + 64u * 1024u);
     static char page[16384];
     size_t used = (size_t) snprintf(page, sizeof(page),
         "<!doctype html><meta name=viewport content='width=device-width'>"
@@ -672,7 +673,10 @@ static int test_bounded_focus_pending_mutations_settle(void)
     config.resources.enabled = false;
     config.javascript.enabled = true;
     config.javascript.document_scripts_enabled = true;
-    config.javascript.heap_limit = 2u * MIB;
+    /* The realm size is not what this test exercises. This page's
+       bootstrap (150 ids) ends within about 10 KiB of 2 MiB, so a few KiB
+       of bootstrap growth made the commit fail before any focus work. */
+    config.javascript.heap_limit = 3u * MIB;
     static char page[16384];
     size_t used = (size_t) snprintf(page, sizeof(page),
         "<!doctype html><meta name=viewport content='width=device-width'>"
@@ -1333,6 +1337,192 @@ static int test_preview_waits_out_style_run(void)
     return 0;
 }
 
+/* One load of `url` from `fixture` (response-keyed when `keyed`) through
+   a pending navigation job with the load preview, as the PSP app makes it
+   (64-byte stream delivery so the preview paints before the end).
+   `page_downs` page presses are made on the first complete preview screen;
+   hinted_at_first says whether that screen offered the reading hint,
+   hint_after_press whether it still did right after the presses, before
+   the paged screen is rasterized. */
+typedef struct {
+    BrowserNavigationJobStatus status;
+    BrowserNavigationJobMetrics job;
+    bool previewed;
+    bool hinted_at_first;
+    bool hint_after_press;
+    bool hint_after_load;
+    unsigned pressed;
+} ReaderScreenRun;
+
+static int run_reader_screen_load(const char *fixture, bool keyed,
+                                 const char *url, unsigned page_downs,
+                                 ReaderScreenRun *run)
+{
+    memset(run, 0, sizeof(*run));
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 16u * MIB;
+    config.session_cache_limit = 256u * 1024u;
+    config.maximum_document_bytes = 1u * MIB;
+    config.tile_capacity = 4;
+    config.resources.enabled = true;
+    config.javascript.enabled = false;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(
+        &config, error, sizeof(error));
+    CHECK(engine != NULL);
+    ProvisionalPresentProbe present_probe = {0};
+    TilefinchPlatformServices present_services = {
+        .context = &present_probe,
+        .present_rgb565 = capture_provisional_present
+    };
+    tilefinch_platform_set_services(&present_services);
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    navigation_set_stream_delivery(navigation, 64, 0, 0, 0, 0, 0);
+    BrowserNavigationJobQuota quota = {
+        .load = {
+            .fetch = {
+                .maximum_body_bytes = 64,
+                .maximum_body_callbacks = 1,
+                .maximum_time_us = 10000
+            },
+            .maximum_parser_body_bytes = 64,
+            .maximum_parser_time_us = 10000,
+            .maximum_finalize_work_units = 8,
+            .maximum_finalize_time_us = 1000
+        }
+    };
+    CHECK((keyed
+               ? fetch_trace_replay_begin_response_keyed(
+                     fixture, error, sizeof(error))
+               : fetch_trace_replay_begin(fixture, error, sizeof(error)))
+          && browser_engine_begin_navigation_url(
+                 engine, url, 256u * 1024u, 1000, true));
+    BrowserNavigationJobStatus status = BROWSER_NAVIGATION_JOB_PENDING;
+    for (size_t pumps = 0;
+         pumps < 4096 && status == BROWSER_NAVIGATION_JOB_PENDING;
+         pumps++) {
+        status = browser_engine_pump_navigation(engine, &quota);
+        BrowserProvisionalViewport preview = {0};
+        if (status != BROWSER_NAVIGATION_JOB_PENDING
+            || !browser_engine_provisional_viewport(engine, &preview)
+            || !preview.complete) continue;
+        if (!run->previewed) {
+            run->previewed = true;
+            run->hinted_at_first = preview.reading_hint;
+            while (run->pressed < page_downs
+                   && browser_engine_scroll_provisional_page(engine, 1))
+                run->pressed++;
+            /* Before the paged screen is rasterized: the press itself
+               retires the hint. */
+            (void) browser_engine_provisional_viewport(engine, &preview);
+            run->hint_after_press = preview.reading_hint;
+            while (browser_engine_provisional_raster_step(engine)) {}
+        }
+    }
+    BrowserProvisionalViewport after = {0};
+    run->hint_after_load = browser_engine_provisional_viewport(engine, &after)
+        && after.reading_hint;
+    run->status = status;
+    (void) browser_engine_navigation_job_metrics(engine, &run->job);
+    fetch_trace_end();
+    tilefinch_platform_set_services(NULL);
+    CHECK(browser_engine_shutdown(engine));
+    BrowserEngineMetrics metrics = {0};
+    CHECK(browser_engine_metrics(engine, &metrics)
+          && metrics.budget_current == 0
+          && metrics.budget_active_allocations == 0);
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+static void report_reader_screen_run(const char *label,
+                                    const ReaderScreenRun *run)
+{
+    fprintf(stderr,
+            "reader-screen %s status=%d previewed=%d hint=%d/%d/%d "
+            "pressed=%u first-present=%llu first-content=%llu "
+            "first-text=%llu hint-us=%llu/%llu elapsed=%llu paints=%zu\n",
+            label, (int) run->status, run->previewed, run->hinted_at_first,
+            run->hint_after_press, run->hint_after_load, run->pressed,
+            (unsigned long long) run->job.provisional_first_present_us,
+            (unsigned long long) run->job.first_content_us,
+            (unsigned long long) run->job.first_text_us,
+            (unsigned long long) run->job.reading_hint_shown_us,
+            (unsigned long long) run->job.reading_hint_cleared_us,
+            (unsigned long long) run->job.elapsed_us,
+            run->job.provisional_paints);
+}
+
+/* bbc.com/news's first screen (fixtures/http-preview-slot-screens
+   /masthead): an inline-SVG logo slot that is not rasterized yet over a
+   grey band, the first text at y=309. The preview paints, but the reader's
+   screen holds nothing to read: first-present counts that frame,
+   first-content and first-text must not, and the preview offers the
+   reading hint until a page press, or the load's end, takes it away. */
+static int test_reader_screen_masthead(void)
+{
+    const char *fixture =
+        TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-preview-slot-screens";
+    const char *url = "https://preview-slots.test/masthead";
+    ReaderScreenRun idle, paged;
+    CHECK(run_reader_screen_load(fixture, true, url, 0, &idle) == 0);
+    bool idle_ok = idle.status == BROWSER_NAVIGATION_JOB_SUCCEEDED
+        && idle.previewed && idle.hinted_at_first && !idle.hint_after_load
+        && idle.job.provisional_first_present_us != 0
+        && idle.job.reading_hint_shown_us
+               == idle.job.provisional_first_present_us
+        /* Not cleared before the load ended: nothing on the screen. */
+        && idle.job.reading_hint_cleared_us == idle.job.elapsed_us
+        /* The committed first screen has the logo, never text. */
+        && idle.job.first_content_us == idle.job.elapsed_us
+        && idle.job.first_content_us > idle.job.provisional_first_present_us
+        && idle.job.first_text_us == 0;
+    if (!idle_ok) report_reader_screen_run("idle", &idle);
+    CHECK(idle_ok);
+
+    CHECK(run_reader_screen_load(fixture, true, url, 1, &paged) == 0);
+    bool paged_ok = paged.status == BROWSER_NAVIGATION_JOB_SUCCEEDED
+        && paged.previewed && paged.hinted_at_first && paged.pressed == 1
+        && !paged.hint_after_press && !paged.hint_after_load
+        && paged.job.reading_hint_shown_us != 0
+        && paged.job.reading_hint_cleared_us
+               >= paged.job.reading_hint_shown_us
+        && paged.job.reading_hint_cleared_us < paged.job.elapsed_us
+        /* The paged screen holds the first headline, before the load
+           ends; first-present stays the blank first frame's. */
+        && paged.job.first_text_us != 0
+        && paged.job.first_text_us > paged.job.provisional_first_present_us
+        && paged.job.first_text_us < paged.job.elapsed_us
+        && paged.job.first_content_us == paged.job.first_text_us;
+    if (!paged_ok) report_reader_screen_run("paged", &paged);
+    CHECK(paged_ok);
+    return 0;
+}
+
+/* A first screen with text (fixtures/http-stream-preview): no hint, and
+   the first preview frame is first-present, first-content and first-text
+   alike. */
+static int test_reader_screen_text_first(void)
+{
+    ReaderScreenRun run;
+    CHECK(run_reader_screen_load(
+              TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-stream-preview",
+              false, "https://stream-preview.test/document", 0, &run) == 0);
+    bool ok = run.status == BROWSER_NAVIGATION_JOB_SUCCEEDED
+        && run.previewed && !run.hinted_at_first && !run.hint_after_load
+        && run.job.reading_hint_shown_us == 0
+        && run.job.reading_hint_cleared_us == 0
+        && run.job.provisional_first_present_us != 0
+        && run.job.first_content_us == run.job.provisional_first_present_us
+        && run.job.first_text_us == run.job.provisional_first_present_us;
+    if (!ok) report_reader_screen_run("text", &run);
+    CHECK(ok);
+    return 0;
+}
+
 static int test_scrollable_provisional_navigation(void)
 {
     BrowserDeviceProfile profile;
@@ -1346,7 +1536,8 @@ static int test_scrollable_provisional_navigation(void)
     config.resources.enabled = true;
     config.javascript.enabled = true;
     config.javascript.document_scripts_enabled = true;
-    config.javascript.heap_limit = 2u * MIB;
+    config.javascript.heap_limit =
+        test_small_realm_bytes(NULL, TEST_SMALL_REALM_MARGIN_BYTES);
     config.javascript.maximum_total_bytes = 64u * 1024u;
     config.javascript.maximum_file_bytes = 32u * 1024u;
     char error[256] = {0};

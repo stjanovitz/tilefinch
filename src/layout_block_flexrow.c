@@ -32,6 +32,10 @@ bool layout_block_flexrow_section(LayoutContext *context,
     size_t total_main_auto_margins = 0;
     int total_basis = 0;
     int total_hypothetical_basis = 0;
+    /* The bases with each inflexible item (flex-grow 0) frozen at its
+       hypothetical size, the free space growth distributes (Flexbox
+       9.7 step 3). */
+    int total_grow_frozen_basis = 0;
     int total_grow = 0;
     int anonymous_percentage_width = 0;
     long long total_shrink_weight = 0;
@@ -95,6 +99,10 @@ bool layout_block_flexrow_section(LayoutContext *context,
             total_hypothetical_basis = layout_add_coordinate(
                 total_hypothetical_basis,
                 child_basis < child_minimum ? child_minimum : child_basis);
+            total_grow_frozen_basis = layout_add_coordinate(
+                total_grow_frozen_basis,
+                item->style.flex_grow == 0 && child_basis < child_minimum
+                    ? child_minimum : child_basis);
             total_grow = layout_add_coordinate(
                 total_grow, item->style.flex_grow);
             if (!table_row) {
@@ -132,6 +140,10 @@ bool layout_block_flexrow_section(LayoutContext *context,
                Reserve that space before distributing shrink to its siblings,
                even when the unclamped bases would fit the row. */
             total_basis = total_hypothetical_basis;
+        } else if (!table_row) {
+            /* A zero flex base with a content minimum (flex: 0 1 0%) does
+               not grow, so its siblings share only what it leaves. */
+            total_basis = total_grow_frozen_basis;
         }
         int remaining = layout_subtract_coordinate(
             layout_subtract_coordinate(content_width, total_basis), gaps);

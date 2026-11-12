@@ -17,6 +17,8 @@
 #include "tilefinch/style.h"
 
 #define NAVIGATION_URL_LIMIT 2048
+/* Largest url-encoded form body a navigation may send. */
+#define NAVIGATION_FORM_BODY_LIMIT (64u * 1024u)
 /* A Refresh header value: room for a URL-limit URL plus its delay and
    "; url=". A longer value is ignored (no refresh), as a meta whose URL
    does not fit is. */
@@ -267,6 +269,27 @@ typedef struct {
     bool preload;
 } NavigationStylesheetEventRecord;
 
+typedef enum {
+    NAVIGATION_SCRIPT_STOP_NONE,
+    NAVIGATION_SCRIPT_STOP_MEMORY,
+    NAVIGATION_SCRIPT_STOP_BROWSER,      /* "Stop scripts", heavy-page prompt */
+    NAVIGATION_SCRIPT_STOP_MEDIA_ROOM,
+    NAVIGATION_SCRIPT_STOP_INCUMBENT,    /* Freed for the next page's load */
+    NAVIGATION_SCRIPT_STOP_NOT_CREATED,  /* Never admitted at commit */
+    NAVIGATION_SCRIPT_STOP_OTHER
+} NavigationScriptStopReason;
+
+typedef struct {
+    uint8_t reason;
+    uint8_t refused_reason;
+    uint32_t after_commit_ms;
+    uint32_t heap_limit_kib;
+    uint32_t heap_used_kib;
+    uint32_t heap_refusals;
+    uint32_t refused_kib;
+    uint32_t budget_free_kib;
+} NavigationScriptStop;
+
 typedef struct {
     PocDocument document;
     ReaderDocumentAnalysis reader_analysis;
@@ -310,6 +333,9 @@ typedef struct {
     /* Current-page memory admission/retirement failure. Header links do not
        prove an application initialized after this measured refusal. */
     bool script_memory_limited;
+    /* Why this document lost its realm, with the memory picture at that
+       moment. First cause wins. Numbers only: it feeds a shareable report. */
+    NavigationScriptStop script_stop;
     /* Script-heap rejections already attributed by the realm-retirement
        check, so a later check needs a new rejection, not just text. */
     size_t script_heap_rejections_seen;
@@ -337,9 +363,27 @@ typedef struct {
         size_t images;
         size_t relayouts;
         size_t loads;
+        /* The reader's scroll position (and the layout's scroll_travel,
+           how far its scroll containers had moved) the settled step
+           judged, and whether the table held a large vector raster (or one
+           released for distance) whose state depends on them: moving half
+           a viewport from there, page and containers together, runs the
+           step again. */
+        int reader_top;
+        uint32_t scroll_travel;
+        bool distance_candidates;
         bool settled;
         uint8_t retries;
     } image_retarget;
+    /* Where navigation_prepare_near_vector_images last looked, so presses
+       that barely move do not scan the display list again. */
+    struct {
+        int top;
+        uint32_t scroll_travel;
+        size_t generation;
+        size_t images;
+        bool valid;
+    } vector_input_look;
     ImagePriorityTarget *deferred_image_targets;
     size_t deferred_image_count;
     size_t deferred_image_cursor;
@@ -349,6 +393,40 @@ typedef struct {
     int deferred_image_rank_scroll_y;
     bool deferred_image_rank_valid;
     size_t deferred_image_eligible_end;
+    /* Once an admission bound has refused an image, images in and around the
+       viewport are found again from the laid-out page after each adopted
+       layout and each half-viewport scrolled, and the entries farthest from
+       the reader make way for them (navigation_admit_viewport_images). */
+    bool viewport_images_pending;
+    /* The reader moved: a queue from an earlier position is out of date. */
+    bool viewport_images_moved;
+    /* The same search for a page with bounds to spare, since a whole-document
+       walk no longer follows each change: once after a change that could
+       reveal an image (ScriptMutationJournal.image_reveal_possible), and once
+       the page has had one, each half viewport scrolled, for what that change
+       revealed further away. */
+    bool image_reveal_armed;
+    bool image_reveal_look;
+    bool deferred_images_from_viewport;
+    int viewport_images_scroll_y;
+    /* What the last look saw when every image it found was already waiting
+       in the resting queue. A look from the same layout, position, table and
+       queue finds the same again, so it is not repeated
+       (navigation_viewport_look_repeats). */
+    struct {
+        bool valid;
+        int scroll_y;
+        int css_height;
+        size_t generation;
+        size_t node_boxes;
+        size_t images;
+        size_t attempted;
+        size_t loaded;
+        size_t evictions;
+        const void *queue;
+        size_t queue_count;
+        size_t queue_cursor;
+    } viewport_look_witness;
     bool loaded;
     /* Monotonic successful-commit boundary. Recovery settle windows begin
        here rather than at request start, so a slow fetch cannot consume the
@@ -380,6 +458,13 @@ typedef struct {
     uint64_t compiled_stylesheet_resource_signature;
     uint64_t compiled_stylesheet_build_generation;
     bool compiled_stylesheet_cacheable;
+    /* The sheet's <head> part can serve a later document whose <head>
+       sources have this key (navigation_stream_stylesheet_head_key):
+       recorded with the fingerprint. body_sources: the document also has
+       style sources outside <head>. */
+    bool compiled_stylesheet_head_valid;
+    bool compiled_stylesheet_head_body_sources;
+    uint64_t compiled_stylesheet_head_key;
     /* An in-place relayout of a large page adopted only the screens around
        the scroll position (layout.content_limit_y); idle work completes it
        with navigation_complete_layout. */
@@ -474,10 +559,12 @@ typedef void (*NavigationDeferredImageReadyCallback)(
     void *opaque, NavigationSession *session);
 
 /* The loader appended resources and moved its table. Rebind borrowed visual
-   clones before input can interrupt publication; the old table is not live. */
+   clones before input can interrupt publication; the old table is not live.
+   `remap` is NULL for that growth. Otherwise the table stayed at
+   `previous_base` and lost entries, renumbered as images_evict_farthest says. */
 typedef void (*NavigationImageTableMovedCallback)(
     void *opaque, NavigationSession *session, uintptr_t previous_base,
-    size_t previous_count);
+    size_t previous_count, const uint8_t *remap);
 
 /* Owner-only boundary before a destructive full relayout. Unlike an
    allocator callback, no raster or HTTP response is currently borrowed. */
@@ -606,6 +693,10 @@ typedef struct {
     uint64_t compiled_stylesheet_cache_last_observed_signature;
     uint64_t compiled_stylesheet_cache_last_stored_fingerprint;
     uint64_t compiled_stylesheet_cache_last_observed_fingerprint;
+    /* A later document took the cached sheet's <head> part. Refusals: the
+       head key matched but the sheet could not be cut back to it. */
+    size_t compiled_stylesheet_cache_head_hits;
+    size_t compiled_stylesheet_cache_head_refusals;
     size_t blocking_stylesheet_continuations;
     /* Commit adopted the preview's sheet by appending body <style>s. */
     size_t blocking_stylesheet_commit_continuations;
@@ -633,10 +724,18 @@ typedef struct {
        of rebuilding it, and attempts that had to fall back. */
     size_t mutation_style_appends;
     size_t mutation_style_append_fallbacks;
+    /* Image discovery after an in-place style change that walked only the
+       subtrees of the shadow hosts whose adopted sheets changed (and the
+       journal's own roots) instead of the whole document. */
+    size_t style_append_scoped_image_scans;
     /* Relayouts that re-derived the image table alone, keeping the sheet,
        its external CSS, stylesheet events and web fonts (image-only
        resource changes, or ones the journal could not itemize). */
     size_t mutation_image_rebuilds;
+    /* Tracked images removed for images around the reader. */
+    size_t viewport_image_evictions;
+    /* Times the laid-out page was searched for images around the reader. */
+    size_t viewport_image_looks;
     /* Style append time: the document walk and fingerprint that prove it,
        loading/parsing the new sources, the order bookkeeping around them,
        the layout reuse note, and the image-discovery rule check. */
@@ -786,6 +885,9 @@ typedef struct {
 
 struct NavigationSession {
     Budget *budget;
+    /* The last form submission's body that did not fit the action's inline
+       buffer; see ControllerAction.external_body. */
+    char *form_submission_body;
     NavigationEntry *history;
     size_t history_capacity;
     size_t history_count;
@@ -800,6 +902,11 @@ struct NavigationSession {
     uint64_t compiled_stylesheet_cache_resource_signature;
     size_t compiled_stylesheet_cache_retained_bytes;
     bool compiled_stylesheet_cache_ready;
+    /* The cached sheet's <head> part also serves a document whose <head>
+       sources have this key (stylesheet_truncate_to_head on the take). */
+    bool compiled_stylesheet_cache_head_valid;
+    bool compiled_stylesheet_cache_head_body_sources;
+    uint64_t compiled_stylesheet_cache_head_key;
     uint64_t generation;
     bool cancelled;
     /* The most recent layout build stopped at a cooperate checkpoint rather
@@ -854,6 +961,12 @@ struct NavigationSession {
        needed more work units than this (0 = no limit). */
     size_t maximum_publication_work_units;
     size_t incremental_relayouts;
+    /* A relayout held for image source changes to gather (see
+       navigation_hold_image_changes), and what the last one cost. */
+    bool image_hold_active;
+    uint32_t image_hold_clock_ms;
+    uint64_t image_hold_started_us;
+    uint64_t image_hold_relayout_us;
     NavigationPerformance performance;
     FetchStreamMetrics last_stream;
     FetchStreamOptions stream_delivery;
@@ -1180,6 +1293,8 @@ void navigation_enable_scripts(NavigationSession *session,
    provenance is frozen before the handle table is destroyed, so an exact
    connected Reader or Basic root remains usable without an author VM. */
 void navigation_retire_current_page_scripts(NavigationSession *session);
+void navigation_record_script_stop(NavigationSession *session,
+                                   NavigationScriptStopReason reason);
 /* Before following a replacement, release a large incumbent author realm.
    Its DOM and pixels remain the rollback page, without script. Call only
    after the author task has returned and its navigation was copied out. */
@@ -1355,6 +1470,10 @@ NavigationLoadStatus navigation_load_status(const NavigationLoad *load);
 const char *navigation_load_adapter_redirect(const NavigationLoad *load);
 /* A top-level GET's attachment stops before parsing or publishing its body. */
 const char *navigation_load_download_filename(const NavigationLoad *load);
+bool navigation_load_no_content(const NavigationLoad *load);
+/* A top-level GET answered MPEG audio; its body was not read. The address
+   the native audio player should open, or NULL. */
+const char *navigation_load_media_audio_url(const NavigationLoad *load);
 bool navigation_load_metrics(const NavigationLoad *load,
                              NavigationLoadMetrics *metrics);
 /* With a non-NULL quota, advances exactly one transactional finalization
@@ -1528,6 +1647,9 @@ typedef struct {
     bool image_resource_scan;
     /* Re-rasterize the image nodes the journal names. */
     bool image_resource_refresh;
+    /* The refresh found nothing to replace: the image table is as a forced
+       geometry layout saw it. */
+    bool image_table_unchanged;
     /* A focus-only journal on a page with a script realm: lay out the
        viewport plus two screens and leave the rest to idle completion
        (navigation_relayout_incremental checks the result's region and
@@ -1572,6 +1694,9 @@ bool navigation_test_install_frame_capability_trace(
     NavigationFrame *frame);
 /* Completes a discovered frame with a synthetic text/html response through
    the runtime pump's completion step. */
+bool navigation_test_complete_frame_with_headers(
+    NavigationSession *session, NavigationFrame *frame, long status_code,
+    const char *html, size_t length, const char *response_headers);
 bool navigation_test_complete_frame(NavigationSession *session,
                                     NavigationFrame *frame, long status_code,
                                     const char *html, size_t length);
@@ -1586,6 +1711,15 @@ bool navigation_test_complete_frame(NavigationSession *session,
    did; a change publishes an empty-damage layout generation. */
 bool navigation_image_retarget_pending(const NavigationSession *session);
 bool navigation_run_image_retarget_work(NavigationSession *session);
+/* After input moved the reader and before its frame: rasterize the large
+   SVG rasters released for distance that the frame's tiles can paint (idle
+   retargeting usually has, two viewports ahead), so the frame pays one
+   rasterization per surface instead of one per tile. True when one was. */
+bool navigation_prepare_near_vector_images(NavigationSession *session);
+/* One image unit for the slot after a presentation: the deferred queue's
+   next step, or else the image work of an idle turn (a pending publication,
+   a revealed-visual batch, a due look around the reader), which a page that
+   repaints every frame never otherwise gets. False on a hard failure. */
 bool navigation_run_deferred_image_work(NavigationSession *session);
 /* Current inherited visibility for a live image target, using the bounded
    layout style cache. Weak targets are resolved before inspecting their DOM.

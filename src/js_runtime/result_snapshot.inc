@@ -432,20 +432,20 @@ void script_runtime_preserve_first_error(const ScriptRuntime *runtime,
              runtime->result.error_source_context);
 }
 
-bool script_runtime_take_form_submission_body(ScriptRuntime *runtime,
-                                              Budget *budget,
-                                              size_t maximum_length,
-                                              char **output,
-                                              size_t *length)
+ScriptFormBodyTake script_runtime_take_form_submission_body(
+    ScriptRuntime *runtime, Budget *budget, size_t maximum_length,
+    char **output, size_t *length)
 {
     if (length != NULL) *length = 0;
     if (output != NULL) *output = NULL;
-    if (runtime == NULL || budget == NULL || output == NULL) return false;
+    if (runtime == NULL || budget == NULL || output == NULL)
+        return SCRIPT_FORM_BODY_NONE;
     JSValue global = JS_GetGlobalObject(runtime->context);
     JSValue body = JS_GetPropertyStr(
         runtime->context, global, "__tilefinchSubmittedBody");
-    bool taken = false;
+    ScriptFormBodyTake taken = SCRIPT_FORM_BODY_NONE;
     if (JS_IsString(body)) {
+        taken = SCRIPT_FORM_BODY_REFUSED;
         size_t body_length = 0;
         const char *text = JS_ToCStringLen(
             runtime->context, &body_length, body);
@@ -458,7 +458,7 @@ bool script_runtime_take_form_submission_body(ScriptRuntime *runtime,
             copy[body_length] = '\0';
             *output = copy;
             if (length != NULL) *length = body_length;
-            taken = true;
+            taken = SCRIPT_FORM_BODY_TAKEN;
         }
         if (text != NULL) JS_FreeCString(runtime->context, text);
     }

@@ -169,6 +169,153 @@ bool script_runtime_webgl_cache_admit(
     return true;
 }
 
+static bool webgl_texture_key_equal(const ScriptWebglTextureKey *left,
+                                    const ScriptWebglTextureKey *right)
+{
+    return left->identifier == right->identifier
+        && left->generation == right->generation
+        && left->width == right->width
+        && left->height == right->height
+        && left->bytes == right->bytes;
+}
+
+static size_t webgl_texture_cache_find(const ScriptWebglTextureCache *cache,
+                                       const ScriptWebglTextureKey *key)
+{
+    for (size_t entry = 0; entry < SCRIPT_WEBGL_TEXTURE_CACHE_ENTRY_LIMIT;
+         entry++) {
+        if (cache->entries[entry].valid
+            && webgl_texture_key_equal(&cache->entries[entry].key, key))
+            return entry;
+    }
+    return SIZE_MAX;
+}
+
+/* First gap of `bytes` between the valid entries, which never overlap. */
+static bool webgl_texture_cache_gap(const ScriptWebglTextureCache *cache,
+                                    size_t capacity, size_t bytes,
+                                    size_t *offset)
+{
+    size_t order[SCRIPT_WEBGL_TEXTURE_CACHE_ENTRY_LIMIT];
+    size_t count = 0;
+    for (size_t entry = 0; entry < SCRIPT_WEBGL_TEXTURE_CACHE_ENTRY_LIMIT;
+         entry++) {
+        if (!cache->entries[entry].valid) continue;
+        size_t at = count++;
+        while (at > 0 && cache->entries[order[at - 1u]].offset
+                             > cache->entries[entry].offset) {
+            order[at] = order[at - 1u];
+            at--;
+        }
+        order[at] = entry;
+    }
+    size_t start = 0;
+    for (size_t i = 0; i < count; i++) {
+        const ScriptWebglTextureCacheEntry *entry = &cache->entries[order[i]];
+        if (entry->offset >= start && bytes <= entry->offset - start) {
+            *offset = start;
+            return true;
+        }
+        start = entry->offset + entry->key.bytes;
+    }
+    if (start > capacity || bytes > capacity - start) return false;
+    *offset = start;
+    return true;
+}
+
+bool script_runtime_webgl_texture_cache_place(
+    ScriptWebglTextureCache *cache, size_t capacity,
+    const ScriptWebglTextureKey *textures, size_t count,
+    size_t slots[], bool upload[], bool *reset)
+{
+    if (cache == NULL || reset == NULL
+        || (count != 0u && (textures == NULL || slots == NULL
+                            || upload == NULL))) return false;
+    *reset = false;
+    if (count > SCRIPT_WEBGL_TEXTURE_CACHE_ENTRY_LIMIT) {
+        memset(cache, 0, sizeof(*cache));
+        return false;
+    }
+    /* `last_used == clock` marks this frame's textures; a wrapped clock
+       restarts every age rather than make old entries look current. */
+    if (cache->clock == UINT32_MAX) {
+        cache->clock = 0;
+        for (size_t entry = 0; entry < SCRIPT_WEBGL_TEXTURE_CACHE_ENTRY_LIMIT;
+             entry++) cache->entries[entry].last_used = 0;
+    }
+    uint32_t now = ++cache->clock;
+    for (size_t i = 0; i < count; i++) {
+        upload[i] = false;
+        slots[i] = webgl_texture_cache_find(cache, &textures[i]);
+        if (slots[i] != SIZE_MAX) cache->entries[slots[i]].last_used = now;
+    }
+    bool placed = true;
+    for (size_t i = 0; i < count && placed; i++) {
+        if (slots[i] != SIZE_MAX) continue;
+        /* An identical texture placed earlier in this frame. */
+        slots[i] = webgl_texture_cache_find(cache, &textures[i]);
+        if (slots[i] != SIZE_MAX) continue;
+        placed = false;
+        for (size_t attempt = 0;
+             attempt <= SCRIPT_WEBGL_TEXTURE_CACHE_ENTRY_LIMIT; attempt++) {
+            size_t free_entry = SIZE_MAX, offset = 0;
+            for (size_t entry = 0;
+                 entry < SCRIPT_WEBGL_TEXTURE_CACHE_ENTRY_LIMIT; entry++) {
+                if (!cache->entries[entry].valid) {
+                    free_entry = entry;
+                    break;
+                }
+            }
+            if (free_entry != SIZE_MAX
+                && webgl_texture_cache_gap(cache, capacity,
+                                           textures[i].bytes, &offset)) {
+                cache->entries[free_entry] = (ScriptWebglTextureCacheEntry) {
+                    .key = textures[i], .offset = offset,
+                    .last_used = now, .valid = true
+                };
+                slots[i] = free_entry;
+                upload[i] = true;
+                placed = true;
+                break;
+            }
+            size_t victim = SIZE_MAX;
+            for (size_t entry = 0;
+                 entry < SCRIPT_WEBGL_TEXTURE_CACHE_ENTRY_LIMIT; entry++) {
+                const ScriptWebglTextureCacheEntry *candidate =
+                    &cache->entries[entry];
+                if (!candidate->valid || candidate->last_used == now)
+                    continue;
+                if (victim == SIZE_MAX || candidate->last_used
+                        < cache->entries[victim].last_used) victim = entry;
+            }
+            if (victim == SIZE_MAX) break;
+            cache->entries[victim].valid = false;
+        }
+    }
+    if (placed) return true;
+    /* The frame's own textures leave no gap that fits: repack them all. */
+    *reset = true;
+    memset(cache->entries, 0, sizeof(cache->entries));
+    size_t used = 0;
+    for (size_t i = 0; i < count; i++) {
+        slots[i] = webgl_texture_cache_find(cache, &textures[i]);
+        upload[i] = false;
+        if (slots[i] != SIZE_MAX) continue;
+        if (textures[i].bytes > capacity - used) {
+            memset(cache, 0, sizeof(*cache));
+            return false;
+        }
+        cache->entries[i] = (ScriptWebglTextureCacheEntry) {
+            .key = textures[i], .offset = used, .last_used = now,
+            .valid = true
+        };
+        slots[i] = i;
+        upload[i] = true;
+        used += textures[i].bytes;
+    }
+    return true;
+}
+
 bool script_runtime_webgl_geometry_cache_admit(
     ScriptWebglGeometryCacheState *state,
     uint32_t realm_epoch_high,
@@ -446,9 +593,20 @@ static void webgl_sources_release(JSContext *context,
     for (size_t i = 0; i < count; i++) JS_FreeValue(context, sources[i].buffer);
 }
 
-static WebglJsReadResult webgl_sources_read(
+static void webgl_source_entries_release(JSContext *context,
+                                         JSValue entries[WEBGL_SOURCE_LIMIT],
+                                         size_t count)
+{
+    for (size_t i = 0; i < count; i++) JS_FreeValue(context, entries[i]);
+}
+
+/* Reading the author's source list runs getters and Proxy traps, which can
+   detach any buffer. Collect the entries first, before any raw pointer is
+   resolved; webgl_sources_resolve then reads them without calling back into
+   JavaScript. */
+static WebglJsReadResult webgl_source_entries_collect(
     JSContext *context, JSValueConst value,
-    WebglSource sources[WEBGL_SOURCE_LIMIT], size_t *count)
+    JSValue entries[WEBGL_SOURCE_LIMIT], size_t *count)
 {
     *count = 0;
     JSValue length_value = JS_GetPropertyStr(context, value, "length");
@@ -463,14 +621,25 @@ static WebglJsReadResult webgl_sources_read(
     for (uint32_t i = 0; i < length; i++) {
         JSValue entry = JS_GetPropertyUint32(context, value, i);
         if (JS_IsException(entry)) {
-            webgl_sources_release(context, sources, *count);
+            webgl_source_entries_release(context, entries, *count);
             *count = 0;
             return WEBGL_JS_READ_EXCEPTION;
         }
+        entries[(*count)++] = entry;
+    }
+    return WEBGL_JS_READ_OK;
+}
+
+static WebglJsReadResult webgl_sources_resolve(
+    JSContext *context, JSValue entries[WEBGL_SOURCE_LIMIT],
+    size_t entry_count, WebglSource sources[WEBGL_SOURCE_LIMIT],
+    size_t *count)
+{
+    *count = 0;
+    for (size_t i = 0; i < entry_count; i++) {
         size_t offset = 0, byte_length = 0, bytes_per_element = 0;
         JSValue buffer = JS_GetTypedArrayBuffer(
-            context, entry, &offset, &byte_length, &bytes_per_element);
-        JS_FreeValue(context, entry);
+            context, entries[i], &offset, &byte_length, &bytes_per_element);
         if (JS_IsException(buffer)) {
             webgl_sources_release(context, sources, *count);
             *count = 0;
@@ -1404,20 +1573,25 @@ static bool webgl_raster_clipped_triangle(
                                      state, texture, sources, antialias,
                                      work);
     if (!a->clip_valid || !b->clip_valid || !c->clip_valid) return true;
-    /* Each plane adds at most one vertex to the convex polygon. */
+    /* Each plane adds at most one vertex to the convex polygon in exact
+       arithmetic. Rounding can make the far-plane test of the vertices the
+       near plane created alternate (in, out, in, out), which would emit a
+       sixth vertex, so the row is never written past its end: keeping five
+       of them still leaves a convex polygon. */
     WebglVertex polygon[2][5] = {{*a, *b, *c}};
+    const size_t polygon_limit = sizeof(polygon[0]) / sizeof(polygon[0][0]);
     size_t count = 3u;
     for (int plane = 0; plane < 2; plane++) {
         const WebglVertex *input = polygon[plane];
         WebglVertex *output = polygon[plane ^ 1];
         size_t kept = 0;
-        for (size_t at = 0; at < count; at++) {
+        for (size_t at = 0; at < count && kept < polygon_limit; at++) {
             const WebglVertex *from = &input[at];
             const WebglVertex *to = &input[(at + 1u) % count];
             bool from_inside = webgl_clip_distance(from, plane) >= 0.0f;
             bool to_inside = webgl_clip_distance(to, plane) >= 0.0f;
             if (from_inside) output[kept++] = *from;
-            if (from_inside != to_inside)
+            if (from_inside != to_inside && kept < polygon_limit)
                 webgl_clip_edge(from_inside ? from : to,
                                 from_inside ? to : from, plane,
                                 &output[kept++]);
@@ -1909,15 +2083,33 @@ _Static_assert(sizeof(ScePspFMatrix4) == sizeof(float) * 16u,
 static unsigned int __attribute__((aligned(64)))
     webgl_ge_list[WEBGL_GE_LIST_BYTES / sizeof(unsigned int)];
 
-typedef struct {
-    uint32_t identifier;
-    uint32_t generation;
-    int width;
-    int height;
-    unsigned stride;
-    unsigned padded_height;
-    size_t offset;
-} WebglGeTextureCacheEntry;
+/* Most list bytes one step between two webgl_ge_list_make_room() calls can
+   emit. The largest step is a command's state block with its sceGuClear
+   strip, well under 1 KiB; an instance's dirty matrices and draw, or an
+   antialias instance's history and edge draws, are a few hundred bytes. */
+#define WEBGL_GE_LIST_STEP_BYTES 4096u
+_Static_assert(WEBGL_GE_LIST_STEP_BYTES < WEBGL_GE_LIST_BYTES / 4u,
+               "the step reserve must leave most of the list for draws");
+
+/* Nothing bounds the draws one frame emits (64 commands of 64 instances,
+   each with antialias passes, is valid input), and GU_DIRECT has no
+   overflow check of its own (R-05). Before a step could pass the end,
+   submit what the list holds, wait for it, and continue in a fresh list
+   from the same buffer. GE registers and libgu's state persist across
+   lists, so the frame's output is unchanged; sceGuStart only re-sends the
+   draw buffer, which this frame already set. */
+static void webgl_ge_list_make_room(void)
+{
+    int used = sceGuCheckList();
+    if (used >= 0 && (size_t) used <= WEBGL_GE_LIST_BYTES
+        && WEBGL_GE_LIST_BYTES - (size_t) used >= WEBGL_GE_LIST_STEP_BYTES)
+        return;
+    sceGuFinish();
+    sceGuSync(0, 0);
+    sceGuStart(GU_DIRECT, (void *) ((uintptr_t) webgl_ge_list
+                                    | WEBGL_GE_UNCACHED));
+}
+
 
 static ScriptWebglCacheAdmission webgl_ge_texture_owner;
 static uint32_t webgl_ge_display_content_epoch;
@@ -1962,8 +2154,9 @@ bool script_runtime_webgl_validation_history(ScriptRuntime *runtime, bool restor
     return true;
 }
 #endif
-static WebglGeTextureCacheEntry
-    webgl_ge_texture_cache[WEBGL_TEXTURE_LIMIT];
+_Static_assert(SCRIPT_WEBGL_TEXTURE_CACHE_ENTRY_LIMIT == WEBGL_TEXTURE_LIMIT,
+               "every texture of one frame must have a cache entry");
+static ScriptWebglTextureCache webgl_ge_texture_cache;
 #if defined(TILEFINCH_PSP_VALIDATION_LOG)
 static ScriptWebglNativeMetrics webgl_native_metrics;
 #define WEBGL_NATIVE_TIMING_SAMPLE_LIMIT 1024u
@@ -2429,8 +2622,7 @@ static bool webgl_render_ge(DomBridge *bridge,
         budget_free(budget, scratch); return false;
     }
     if (cache_owner_reset) {
-        memset(webgl_ge_texture_cache, 0,
-               sizeof(webgl_ge_texture_cache));
+        memset(&webgl_ge_texture_cache, 0, sizeof(webgl_ge_texture_cache));
 #if defined(TILEFINCH_PSP_VALIDATION_LOG)
         webgl_native_metrics.texture_cache_owner_resets++;
 #endif
@@ -2440,77 +2632,51 @@ static bool webgl_render_ge(DomBridge *bridge,
     unsigned texture_heights[WEBGL_TEXTURE_LIMIT] = {0};
     size_t texture_capacity =
         PSP_DISPLAY_EDRAM_BYTES - WEBGL_GE_TEXTURE_OFFSET;
-    size_t additional_bytes = 0;
+    ScriptWebglTextureKey texture_keys[WEBGL_TEXTURE_LIMIT];
+    size_t texture_slots[WEBGL_TEXTURE_LIMIT];
+    bool texture_uploads[WEBGL_TEXTURE_LIMIT];
     for (size_t i = 0; i < texture_count; i++) {
-        bool retained = false;
-        for (size_t entry = 0;
-             entry < webgl_ge_texture_owner.cached_entries; entry++) {
-            const WebglGeTextureCacheEntry *candidate =
-                &webgl_ge_texture_cache[entry];
-            if (candidate->identifier == textures[i].identifier
-                && candidate->generation == textures[i].generation
-                && candidate->width == textures[i].width
-                && candidate->height == textures[i].height) {
-                retained = true;
-                break;
-            }
-        }
-        if (retained) continue;
-        size_t bytes = (size_t) webgl_ge_texture_stride(
-                           (unsigned) textures[i].width)
-            * webgl_power_of_two((unsigned) textures[i].height) * 4u;
-        if (bytes > texture_capacity - additional_bytes) {
-            budget_free(budget, scratch); return false;
-        }
-        additional_bytes += bytes;
+        texture_keys[i] = (ScriptWebglTextureKey) {
+            .identifier = textures[i].identifier,
+            .generation = textures[i].generation,
+            .width = textures[i].width,
+            .height = textures[i].height,
+            .bytes = (size_t) webgl_ge_texture_stride(
+                         (unsigned) textures[i].width)
+                * webgl_power_of_two((unsigned) textures[i].height) * 4u
+        };
     }
-    if (additional_bytes > texture_capacity
-                               - webgl_ge_texture_owner.cached_bytes
-        || webgl_ge_texture_owner.cached_entries + texture_count
-               > WEBGL_TEXTURE_LIMIT) {
-        webgl_ge_texture_owner.cached_entries = 0;
-        webgl_ge_texture_owner.cached_bytes = 0;
+    /* Textures a frame keeps using stay resident; only new ones are
+       uploaded, into gaps left by the least recently used (NB-07). */
+    bool texture_repacked = false;
+    if (!script_runtime_webgl_texture_cache_place(
+            &webgl_ge_texture_cache, texture_capacity, texture_keys,
+            texture_count, texture_slots, texture_uploads,
+            &texture_repacked)) {
+        budget_free(budget, scratch); return false;
+    }
 #if defined(TILEFINCH_PSP_VALIDATION_LOG)
-        webgl_native_metrics.texture_cache_capacity_resets++;
+    if (texture_repacked) webgl_native_metrics.texture_cache_capacity_resets++;
+#else
+    (void) texture_repacked;
 #endif
+    webgl_ge_texture_owner.cached_entries = 0;
+    webgl_ge_texture_owner.cached_bytes = 0;
+    for (size_t entry = 0; entry < WEBGL_TEXTURE_LIMIT; entry++) {
+        if (!webgl_ge_texture_cache.entries[entry].valid) continue;
+        webgl_ge_texture_owner.cached_entries++;
+        webgl_ge_texture_owner.cached_bytes +=
+            webgl_ge_texture_cache.entries[entry].key.bytes;
     }
     for (size_t i = 0; i < texture_count; i++) {
         unsigned stride = webgl_ge_texture_stride((unsigned) textures[i].width);
         unsigned padded_height = webgl_power_of_two((unsigned) textures[i].height);
-        size_t bytes = (size_t) stride * padded_height * 4u;
-        size_t cached = webgl_ge_texture_owner.cached_entries;
-        for (size_t entry = 0;
-             entry < webgl_ge_texture_owner.cached_entries; entry++) {
-            const WebglGeTextureCacheEntry *candidate =
-                &webgl_ge_texture_cache[entry];
-            if (candidate->identifier == textures[i].identifier
-                && candidate->generation == textures[i].generation
-                && candidate->width == textures[i].width
-                && candidate->height == textures[i].height) {
-                cached = entry;
-                break;
-            }
-        }
-        if (cached == webgl_ge_texture_owner.cached_entries) {
-            if (webgl_ge_texture_owner.cached_entries >= WEBGL_TEXTURE_LIMIT
-                || bytes > texture_capacity
-                               - webgl_ge_texture_owner.cached_bytes) {
-                budget_free(budget, scratch); return false;
-            }
-            cached = webgl_ge_texture_owner.cached_entries++;
-            WebglGeTextureCacheEntry *entry =
-                &webgl_ge_texture_cache[cached];
-            *entry = (WebglGeTextureCacheEntry) {
-                .identifier = textures[i].identifier,
-                .generation = textures[i].generation,
-                .width = textures[i].width,
-                .height = textures[i].height,
-                .stride = stride,
-                .padded_height = padded_height,
-                .offset = webgl_ge_texture_owner.cached_bytes
-            };
-            uint8_t *destination = (uint8_t *) edram
-                + WEBGL_GE_TEXTURE_OFFSET + entry->offset;
+        const ScriptWebglTextureCacheEntry *entry =
+            &webgl_ge_texture_cache.entries[texture_slots[i]];
+        uint8_t *destination = (uint8_t *) edram
+            + WEBGL_GE_TEXTURE_OFFSET + entry->offset;
+        if (texture_uploads[i]) {
+            size_t bytes = entry->key.bytes;
             /* Padding repeats the edge texel and the last row, so clamped
                sampling at a non-power-of-two edge matches the texture
                instead of fading into zero-filled padding. */
@@ -2530,17 +2696,13 @@ static bool webgl_render_ge(DomBridge *bridge,
                        (size_t) stride * 4u);
             }
             sceKernelDcacheWritebackRange(destination, bytes);
-            webgl_ge_texture_owner.cached_bytes += bytes;
 #if defined(TILEFINCH_PSP_VALIDATION_LOG)
             webgl_native_metrics.texture_upload_bytes += bytes;
 #endif
         }
-        const WebglGeTextureCacheEntry *entry =
-            &webgl_ge_texture_cache[cached];
-        texture_addresses[i] = (uint8_t *) edram
-            + WEBGL_GE_TEXTURE_OFFSET + entry->offset;
-        texture_strides[i] = entry->stride;
-        texture_heights[i] = entry->padded_height;
+        texture_addresses[i] = destination;
+        texture_strides[i] = stride;
+        texture_heights[i] = padded_height;
     }
     sceGuStart(GU_DIRECT, (void *) ((uintptr_t) webgl_ge_list
                                     | WEBGL_GE_UNCACHED));
@@ -2596,6 +2758,7 @@ static bool webgl_render_ge(DomBridge *bridge,
     int loaded_viewport_x = 0, loaded_viewport_y = 0;
     int loaded_viewport_width = 0, loaded_viewport_height = 0;
     for (size_t ci = 0; ci < command_count; ci++) {
+        webgl_ge_list_make_room();
 #if defined(TILEFINCH_PSP_VALIDATION_LOG)
         uint64_t decode_started = (uint64_t) sceKernelGetSystemTimeWide();
         frame_commands++;
@@ -3135,6 +3298,7 @@ static bool webgl_render_ge(DomBridge *bridge,
 #endif
         for (uint32_t instance = 0; instance < draw.instance_count;
              instance++) {
+            webgl_ge_list_make_room();
             ScePspFMatrix4 instance_matrix;
             memcpy(&instance_matrix,
                    instance_matrices + (size_t) instance * 16u,
@@ -3234,6 +3398,7 @@ static bool webgl_render_ge(DomBridge *bridge,
                     }
 #endif
                     if (!needs_antialias) continue;
+                    webgl_ge_list_make_room();
                     ScePspFMatrix4 instance_matrix;
                     memcpy(&instance_matrix,
                            instance_matrices + (size_t) instance * 16u,
@@ -3522,7 +3687,7 @@ void js_webgl_realm_epoch_release(DomBridge *bridge)
                == bridge->webgl_realm_epoch_low) {
         memset(&webgl_ge_texture_owner, 0,
                sizeof(webgl_ge_texture_owner));
-        memset(webgl_ge_texture_cache, 0,
+        memset(&webgl_ge_texture_cache, 0,
                sizeof(webgl_ge_texture_cache));
     }
 #endif
@@ -3734,25 +3899,43 @@ JSValue js_webgl_render(JSContext *context, JSValueConst this_value,
 #if !defined(__PSP__)
     (void) preserve_drawing_buffer;
 #endif
+    /* The source list is the last author-visible read: every raw buffer
+       pointer below is resolved after it and used without calling back into
+       JavaScript, so a getter cannot detach a buffer still in use. */
+    JSValue source_entries[WEBGL_SOURCE_LIMIT];
+    size_t source_entry_count = 0;
+    WebglJsReadResult entries_read = webgl_source_entries_collect(
+        context, argv[4], source_entries, &source_entry_count);
+    if (entries_read != WEBGL_JS_READ_OK) {
+        return entries_read == WEBGL_JS_READ_EXCEPTION
+            ? JS_EXCEPTION : JS_NewInt32(context, 0);
+    }
     const uint8_t *command_values = NULL, *texture_values = NULL;
     size_t command_value_count = 0, texture_value_count = 0;
     JSValue command_buffer = JS_UNDEFINED, texture_buffer = JS_UNDEFINED;
     WebglJsReadResult command_read = webgl_typed_values(
         context, argv[3], sizeof(uint32_t), &command_values,
         &command_value_count, &command_buffer);
-    if (command_read == WEBGL_JS_READ_EXCEPTION) return JS_EXCEPTION;
-    if (command_read != WEBGL_JS_READ_OK) return JS_NewInt32(context, 0);
+    if (command_read != WEBGL_JS_READ_OK) {
+        webgl_source_entries_release(
+            context, source_entries, source_entry_count);
+        return command_read == WEBGL_JS_READ_EXCEPTION
+            ? JS_EXCEPTION : JS_NewInt32(context, 0);
+    }
     size_t command_count = 0;
     if (!webgl_wire_header(
             command_values, command_value_count, WEBGL_COMMAND_WIRE_MAGIC,
             WEBGL_COMMAND_WORDS, WEBGL_COMMAND_LIMIT, &command_count)) {
+        webgl_source_entries_release(
+            context, source_entries, source_entry_count);
         JS_FreeValue(context, command_buffer); return JS_NewInt32(context, 0);
     }
     command_values += WEBGL_WIRE_HEADER_WORDS * sizeof(uint32_t);
     WebglSource sources[WEBGL_SOURCE_LIMIT] = {{0}};
     size_t source_count = 0;
-    WebglJsReadResult source_read = webgl_sources_read(
-        context, argv[4], sources, &source_count);
+    WebglJsReadResult source_read = webgl_sources_resolve(
+        context, source_entries, source_entry_count, sources, &source_count);
+    webgl_source_entries_release(context, source_entries, source_entry_count);
     if (source_read != WEBGL_JS_READ_OK) {
         webgl_sources_release(context, sources, source_count);
         JS_FreeValue(context, command_buffer);
@@ -3867,24 +4050,40 @@ JSValue js_webgl_snapshot(JSContext *context, JSValueConst this_value,
     if (node != NULL) (void) images_materialize_canvas_native_surface(
         bridge->images, node);
 #endif
-    const ImageResource *image = node == NULL ? NULL
+    /* A canvas that drew pixels which are not origin-clean is never read
+       back to script, whatever its context kind. */
+    const ImageResource *image = node == NULL
+            || js_rt_bridge_canvas_tainted(bridge, node) ? NULL
         : images_find_node(bridge->images, node);
     if (!image_resource_available(image) || !image->is_canvas
         || image->pixels == NULL || image->width <= 0 || image->height <= 0)
         return JS_NULL;
-    size_t length = (size_t) image->width * (size_t) image->height * 4u;
-    JSValue result = JS_NewObject(context);
+    /* Read the record before any JavaScript-visible object exists, and
+       define rather than set: an Object.prototype setter would otherwise
+       run page code that can grow the image table under `image`. */
+    int width = image->width, height = image->height;
+    size_t length = (size_t) width * (size_t) height * 4u;
     JSValue pixels = JS_NewArrayBufferCopy(context, image->pixels, length);
-    if (JS_IsException(result) || JS_IsException(pixels)) {
-        JS_FreeValue(context, result); JS_FreeValue(context, pixels);
+    if (JS_IsException(pixels)) return pixels;
+    JSValue result = JS_NewObject(context);
+    if (JS_IsException(result)) {
+        JS_FreeValue(context, pixels);
+        return result;
+    }
+    if (JS_DefinePropertyValueStr(context, result, "width",
+                                  JS_NewInt32(context, width),
+                                  JS_PROP_C_W_E) < 0
+        || JS_DefinePropertyValueStr(context, result, "height",
+                                     JS_NewInt32(context, height),
+                                     JS_PROP_C_W_E) < 0) {
+        JS_FreeValue(context, pixels);
+        JS_FreeValue(context, result);
         return JS_EXCEPTION;
     }
-    if (JS_SetPropertyStr(context, result, "width",
-                          JS_NewInt32(context, image->width)) < 0
-        || JS_SetPropertyStr(context, result, "height",
-                             JS_NewInt32(context, image->height)) < 0
-        || JS_SetPropertyStr(context, result, "pixels", pixels) < 0) {
-        JS_FreeValue(context, result); return JS_EXCEPTION;
+    if (JS_DefinePropertyValueStr(context, result, "pixels", pixels,
+                                  JS_PROP_C_W_E) < 0) {
+        JS_FreeValue(context, result);
+        return JS_EXCEPTION;
     }
     return result;
 }
@@ -3933,7 +4132,8 @@ JSValue js_webgl_read_pixels(JSContext *context, JSValueConst this_value,
     if (node != NULL) (void) images_materialize_canvas_native_surface(
         bridge->images, node);
 #endif
-    const ImageResource *image = node == NULL ? NULL
+    const ImageResource *image = node == NULL
+            || js_rt_bridge_canvas_tainted(bridge, node) ? NULL
         : images_find_node(bridge->images, node);
     if (!image_resource_available(image) || !image->is_canvas
         || image->pixels == NULL || image->width <= 0 || image->height <= 0)

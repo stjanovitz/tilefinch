@@ -25,7 +25,10 @@
 #define budget_calloc(b, n, s) budget_calloc_category((b), BUDGET_CATEGORY_SESSION, (n), (s))
 #define budget_realloc(b, p, s) budget_realloc_category((b), BUDGET_CATEGORY_SESSION, (p), (s))
 
-#define DEFAULT_COOKIE_BYTES (4u * 1024u)
+/* Room for a signed-in Google plus YouTube cookie set (each host carries a
+   dozen or more credential cookies of up to a few hundred bytes), on top of
+   ordinary browsing. Values are allocated only when set. */
+#define DEFAULT_COOKIE_BYTES (16u * 1024u)
 
 static BrowserCacheEntry *cache_find_key(BrowserSession *session,
                                          const char *key);
@@ -238,9 +241,9 @@ bool browser_session_client_hints_peek(
     return false;
 }
 
-bool browser_session_site_adapter_state_put(
+static bool site_adapter_state_store(
     BrowserSession *session, const char *key, const void *data,
-    size_t data_length, uint64_t now_ns)
+    size_t data_length, uint64_t now_ns, uint64_t binding)
 {
     if (session == NULL || session->budget == NULL
         || session->captive_portal_stash != NULL || key == NULL
@@ -254,17 +257,33 @@ bool browser_session_site_adapter_state_put(
     memcpy(replacement.data, data, data_length);
     replacement.length = data_length;
     replacement.stored_at_ns = now_ns;
-    replacement.cookie_fingerprint =
-        session_cookie_fingerprint(session);
+    replacement.cookie_fingerprint = binding;
     replacement.valid = true;
     session->site_adapter_state = replacement;
     return true;
 }
 
-bool browser_session_site_adapter_state_get(
+bool browser_session_site_adapter_state_put(
+    BrowserSession *session, const char *key, const void *data,
+    size_t data_length, uint64_t now_ns)
+{
+    return session != NULL && site_adapter_state_store(
+        session, key, data, data_length, now_ns,
+        session_cookie_fingerprint(session));
+}
+
+bool browser_session_site_adapter_state_put_bound(
+    BrowserSession *session, const char *key, const void *data,
+    size_t data_length, uint64_t now_ns, uint64_t binding)
+{
+    return site_adapter_state_store(
+        session, key, data, data_length, now_ns, binding);
+}
+
+static bool site_adapter_state_load(
     BrowserSession *session, const char *key, void *data,
     size_t data_capacity, size_t *data_length, uint64_t now_ns,
-    uint64_t maximum_age_ns)
+    uint64_t maximum_age_ns, const uint64_t *binding)
 {
     if (data_length != NULL) *data_length = 0;
     if (session == NULL || session->budget == NULL
@@ -277,12 +296,33 @@ bool browser_session_site_adapter_state_get(
     if (!state->valid || strcmp(state->key, key) != 0
         || state->length > data_capacity || expired
         || state->cookie_fingerprint
-               != session_cookie_fingerprint(session)) {
+               != (binding != NULL ? *binding
+                                   : session_cookie_fingerprint(session))) {
         return false;
     }
     memcpy(data, state->data, state->length);
     if (data_length != NULL) *data_length = state->length;
     return true;
+}
+
+bool browser_session_site_adapter_state_get(
+    BrowserSession *session, const char *key, void *data,
+    size_t data_capacity, size_t *data_length, uint64_t now_ns,
+    uint64_t maximum_age_ns)
+{
+    return site_adapter_state_load(session, key, data, data_capacity,
+                                   data_length, now_ns, maximum_age_ns,
+                                   NULL);
+}
+
+bool browser_session_site_adapter_state_get_bound(
+    BrowserSession *session, const char *key, void *data,
+    size_t data_capacity, size_t *data_length, uint64_t now_ns,
+    uint64_t maximum_age_ns, uint64_t binding)
+{
+    return site_adapter_state_load(session, key, data, data_capacity,
+                                   data_length, now_ns, maximum_age_ns,
+                                   &binding);
 }
 
 static void site_adapter_document_cache_remove(
@@ -524,6 +564,60 @@ bool browser_session_mixed_content_site_allowed(
     return session != NULL && session_security_site_list_contains(
         session->mixed_content_allowed_sites,
         session->mixed_content_allowed_site_count, url);
+}
+
+BrowserInsecureAudioAnswer browser_session_insecure_audio_site(
+    const BrowserSession *session, const char *url)
+{
+    char site[BROWSER_ORIGIN_LIMIT];
+    if (session == NULL || !security_site_key(url, site))
+        return BROWSER_INSECURE_AUDIO_UNASKED;
+    for (size_t i = 0; i < session->insecure_audio_site_count; i++)
+        if (strcmp(session->insecure_audio_sites[i], site) == 0)
+            return (BrowserInsecureAudioAnswer)
+                session->insecure_audio_answers[i];
+    return BROWSER_INSECURE_AUDIO_UNASKED;
+}
+
+bool browser_session_set_insecure_audio_site(
+    BrowserSession *session, const char *url,
+    BrowserInsecureAudioAnswer answer)
+{
+    if (session == NULL || (answer != BROWSER_INSECURE_AUDIO_UNASKED
+                            && answer != BROWSER_INSECURE_AUDIO_ALLOWED
+                            && answer != BROWSER_INSECURE_AUDIO_DECLINED))
+        return false;
+    char site[BROWSER_ORIGIN_LIMIT];
+    if (!security_site_key(url, site)) return false;
+    size_t found = session->insecure_audio_site_count;
+    for (size_t i = 0; i < session->insecure_audio_site_count; i++) {
+        if (strcmp(session->insecure_audio_sites[i], site) == 0) {
+            found = i;
+            break;
+        }
+    }
+    if (answer == BROWSER_INSECURE_AUDIO_UNASKED) {
+        if (found == session->insecure_audio_site_count) return true;
+        size_t last = --session->insecure_audio_site_count;
+        if (found != last) {
+            memcpy(session->insecure_audio_sites[found],
+                   session->insecure_audio_sites[last],
+                   sizeof(session->insecure_audio_sites[0]));
+            session->insecure_audio_answers[found] =
+                session->insecure_audio_answers[last];
+        }
+        memset(session->insecure_audio_sites[last], 0,
+               sizeof(session->insecure_audio_sites[0]));
+        session->insecure_audio_answers[last] = 0;
+        return true;
+    }
+    if (found == session->insecure_audio_site_count) {
+        if (found >= BROWSER_SECURITY_SITE_LIMIT) return false;
+        memcpy(session->insecure_audio_sites[found], site, sizeof(site));
+        session->insecure_audio_site_count++;
+    }
+    session->insecure_audio_answers[found] = (uint8_t) answer;
+    return true;
 }
 
 bool browser_session_set_third_party_cookie_site_allowed(

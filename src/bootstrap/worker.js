@@ -10,6 +10,7 @@ globalThis.__tilefinchInstallWorker = (
   creatorOrigin,
   creatorSecureContext,
   creatorURL,
+  trustedEvent,
 ) => {
   /* Worker is intentionally a first-use module. Ordinary pages should not pay
      to compile its message/lifecycle machinery merely because the constructor
@@ -27,7 +28,6 @@ globalThis.__tilefinchInstallWorker = (
     PerformanceEntryCtor = globalThis.PerformanceEntry,
     PerformanceResourceTimingCtor = globalThis.PerformanceResourceTiming,
     PerformanceObserverEntryListCtor = globalThis.PerformanceObserverEntryList,
-    trustedEvent = globalThis.__tilefinchTrustedEvent,
     markNative = globalThis.__tilefinchMarkNativeFunction,
     invokeEventTargetCheckpointed =
       globalThis.__tilefinchInvokeEventTargetCheckpointed,
@@ -630,7 +630,7 @@ globalThis.__tilefinchInstallWorker = (
     }
     {
       class PromiseRejectionEvent extends Event{
-        constructor(type,init={}){
+        constructor(type,init={}){init??={};
           super(type,{cancelable:true});
           Object.defineProperties(this,{
             promise:{enumerable:true,value:init.promise},

@@ -17,9 +17,10 @@ Show exceptions are kept.
 ## Modes
 
 - **Off** performs no request matching and disables cosmetic hiding.
-- **Basic** matches 34 conservative advertising and auction host suffixes,
-  only for third-party subresources. The table is compiled into the browser;
-  it performs no boot-time file I/O.
+- **Basic** matches 51 host suffixes, only for third-party subresources:
+  36 advertising, auction and ad-verification hosts and 15 hosts of tag
+  managers and A/B testing clients. The table is compiled
+  into the browser; it performs no boot-time file I/O.
 - **Custom** reads `data/adblock.txt`. Switching to Custom fails without
   changing the active mode if the file cannot be read or validated.
 
@@ -48,23 +49,65 @@ Tilefinch keeps no blocked URLs or per-site blocking history.
 
 ## Built-in Basic rules
 
-Basic blocks third-party subresources on these 34 dedicated advertising and
-auction host suffixes (including their subdomains):
+Basic blocks third-party subresources on these 36 dedicated advertising,
+auction and ad-verification host suffixes (including their subdomains), and
+on the SDK hosts listed after them:
 
 ```text
-33across.com              adform.net                 adnxs.com
-adsrvr.org                amazon-adsystem.com        bidswitch.net
-casalemedia.com           contextweb.com             criteo.com
-criteo.net                demdex.net                 doubleclick.net
-googleadservices.com      googlesyndication.com      indexww.com
-lijit.com                 mathtag.com                media.net
-moatads.com               openx.net                  outbrain.com
-pubmatic.com              quantserve.com             rlcdn.com
-rubiconproject.com        serving-sys.com            sharethrough.com
-smartadserver.com         smaato.net                 taboola.com
-teads.tv                  triplelift.com             yieldmo.com
-zedo.com
+33across.com               adform.net                 adnxs.com
+adsrvr.org                 amazon-adsystem.com        bidswitch.net
+btloader.com               casalemedia.com            confiant-integrations.net
+contextweb.com             criteo.com                 criteo.net
+demdex.net                 doubleclick.net            googleadservices.com
+googlesyndication.com      indexww.com                lijit.com
+mathtag.com                media.net                  moatads.com
+openx.net                  outbrain.com               pubmatic.com
+quantserve.com             rlcdn.com                  rubiconproject.com
+serving-sys.com            sharethrough.com           smartadserver.com
+smaato.net                 taboola.com                teads.tv
+triplelift.com             yieldmo.com                zedo.com
 ```
+
+Basic also refuses third-party requests to these 15 tag-manager and A/B
+testing host suffixes (including their subdomains):
+
+```text
+Tag managers   googletagmanager.com (Google Tag Manager, gtag.js)
+               adobedtm.com (Adobe Launch)  tiqcdn.com (Tealium iQ)
+               ensighten.com  tagcommander.com (Commanders Act)
+               segment.com  segment.io
+A/B testing    optimizely.com  visualwebsiteoptimizer.com (VWO)
+               abtasty.com  googleoptimize.com  kameleoon.eu  kameleoon.io
+               convertexperiments.com (Convert)  tt.omtrdc.net (Adobe Target)
+```
+
+These scripts are large, run while the page loads and hold script memory for
+the life of the page, and the page is sent without needing them. Each entry is a vendor's own delivery or
+collection host, not a shared CDN. Feature-flag services, recommendation and
+personalisation engines, and analytics-only hosts are not listed, because
+pages read their answers to work or to fill in content.
+
+A page that waits on one of these scripts keeps working when it is refused:
+
+- An anti-flicker snippet that hides the page until Google Optimize or Google
+  Tag Manager answers is ended at once, and the callbacks a page attaches to
+  Google Tag Manager pushes (`eventCallback`) and gtag events
+  (`event_callback`), which some link handlers wait on before they navigate,
+  are called.
+- Adobe Target's pre-hiding style (`#at-body-style`) is removed when Adobe
+  Launch or Target is refused, and VWO's SmartCode hiding is finished.
+- Other snippets (Optimizely, AB Tasty) end on their own timeout, as they do
+  in other browsers when the script fails to load.
+
+The refused script gets its ordinary `error` event. These answers apply
+whichever mode or rule refused the script, Custom included.
+
+Basic does not refuse paywall and subscription SDKs (Piano and its Tinypass
+hosts, Poool, Pelcro, LaterPay), so a metered or subscription page counts
+reads and shows its paywall as the site intends. A Custom list can refuse
+them; the refused script then gets only its `error` event, with no answer.
+A site that needs one of the refused scripts above can be restored with
+**Permissions & controls → Content blocking**; **Off** loads them everywhere.
 
 Top-level navigation is never blocked, and a matching site exception bypasses
 both Basic/Custom request rules and cosmetic hiding.
@@ -149,13 +192,16 @@ ignored.
 Tilefinch never approximates unsupported syntax into a broader block. An
 exception matching the request wins over a matching block rule.
 
-The file is limited to 512 KiB, 4,096 retained rules, a 128 KiB hostname pool,
-and 2,047 bytes per physical line. A missing, oversized, truncated, or
-unreadable file leaves the previous configuration active. These limits mean a
-full desktop filter bundle may need to be reduced to its supported network
-rules before copying it to the PSP. When Custom is selected, the status
-message reports both retained and ignored rule counts so unsupported input is
-visible instead of silently appearing active. The browser neither downloads
+The file is limited to 512 KiB. A missing, oversized or unreadable file
+leaves the previous configuration active. A physical line of 2,047 bytes or
+more is skipped and counted as ignored (no rule this matcher keeps is that
+long). The list keeps its first 4,096 rules within a 128 KiB hostname pool;
+rules past either limit are counted as ignored and the status adds
+`LIST TOO LONG`. These limits mean a full desktop filter bundle may need to
+be reduced to its supported network rules before copying it to the PSP. When
+Custom is selected, the status message reports both retained and ignored rule
+counts so unsupported input is visible instead of silently appearing
+active. The browser neither downloads
 nor updates personal lists itself. The compiled Basic list can change only as
 part of an ordinary signed Tilefinch application release. Upstream lists
 remain under their own licenses; Tilefinch does not redistribute them.
@@ -185,6 +231,15 @@ malware-protection boundary.
   skipped before its first effect. Reference captures use the same rule
   definitions and record the blocking separately; unrelated script errors
   and crypto refusals remain failures.
+- **Refused-script answers.** When a script element gets its `error` event
+  and the blocker refuses its URL, the page realm runs a small private
+  function for that script's kind (Google tag, Adobe Target, VWO) before the
+  event, once per realm and kind; a Google tag is answered once per data
+  layer, since a second container may name its own (`l=`). It is compiled
+  on first use, so pages
+  without such a script pay nothing; page functions it calls are guarded, and
+  the page's callbacks run as ordinary timers. The kinds are keyed by host in
+  `src/content_blocker.c` (`refused_script_shims`).
 - **Cosmetic hiding.** The rules are a fixed set of CSS selectors applied in
   the normal style pass, without another DOM traversal or script. The prefix
   families compile to native scans: the first two bytes reject unrelated

@@ -1148,9 +1148,16 @@ const char *JS_ExecutionCensusName(unsigned zone);
 
 /* True while any JavaScript or native-function frame is active (Tilefinch). */
 int JS_IsStackActive(JSRuntime *rt);
-/* WeakRef.prototype.deref without a call: the target (a new reference) or
-   undefined, also for a non-WeakRef (Tilefinch DOM getters). */
-JSValue JS_WeakRefDeref(JSContext *ctx, JSValueConst weakref);
+/* A weak reference to an object without a WeakRef object (Tilefinch DOM
+   handle table): JS_WeakTargetDeref gives the target (a new reference) or
+   undefined once it died; free each with JS_FreeWeakTarget. */
+JSValue JS_NewWeakTarget(JSContext *ctx, JSValueConst obj);
+JSValue JS_WeakTargetDeref(JSContext *ctx, JSValueConst target);
+void JS_FreeWeakTarget(JSRuntime *rt, JSValue target);
+/* Whether another weak holder or an own non-private property outside `plain`
+   makes the target's death visible to script. Allocates nothing. */
+int JS_WeakTargetCarriesState(JSRuntime *rt, JSValueConst target,
+                              const JSAtom *plain, int plain_count);
 /* Identity of the innermost frame, NULL when none (Tilefinch profiler). */
 const void *JS_GetStackTop(JSRuntime *rt);
 /* Called with begin=1 before and begin=0 after every collection; must not

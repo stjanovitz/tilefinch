@@ -67,6 +67,8 @@ struct LayoutBidiFlow {
     size_t atomic_count;
     size_t scan_nodes;
     bool truncated;
+    /* One control's own text: no line width was measured to hold it to. */
+    bool shaped_width_free;
     char text[TEXT_BIDI_PARAGRAPH_BYTE_LIMIT + 1u];
     LayoutBidiSourceSpan spans[LAYOUT_BIDI_SPAN_LIMIT];
     LayoutBidiFlowCommand commands[LAYOUT_BIDI_FLOW_COMMAND_LIMIT];
@@ -442,6 +444,19 @@ static bool bidi_node_contains_rtl_text(const LayoutContext *context,
                    bidi_compare_nodes) != NULL;
 }
 
+static TextBidiBase bidi_paragraph_base(lxb_dom_node_t *node,
+                                        const ComputedStyle *style)
+{
+    bool rtl = computed_style_direction_rtl(style);
+    size_t dir_length = 0;
+    const char *dir = document_attribute(node, "dir", &dir_length);
+    bool dir_auto = dir != NULL && dir_length == 4u
+        && memcmp(dir, "auto", 4u) == 0;
+    if (dir_auto || style->unicode_bidi == STYLE_UNICODE_BIDI_PLAINTEXT)
+        return rtl ? TEXT_BIDI_BASE_AUTO_RTL : TEXT_BIDI_BASE_AUTO_LTR;
+    return rtl ? TEXT_BIDI_BASE_RTL : TEXT_BIDI_BASE_LTR;
+}
+
 LayoutBidiFlow *layout_bidi_flow_create(LayoutContext *context,
                                          lxb_dom_node_t *node,
                                          const ComputedStyle *style,
@@ -499,19 +514,9 @@ LayoutBidiFlow *layout_bidi_flow_create(LayoutContext *context,
         return NULL;
     }
     TextBidiStatus status = TEXT_BIDI_MALFORMED;
-    TextBidiBase base = computed_style_direction_rtl(style)
-        ? TEXT_BIDI_BASE_RTL : TEXT_BIDI_BASE_LTR;
-    size_t root_dir_length = 0;
-    const char *root_dir = document_attribute(
-        node, "dir", &root_dir_length);
-    bool root_dir_auto = root_dir != NULL && root_dir_length == 4u
-        && memcmp(root_dir, "auto", 4u) == 0;
-    if (root_dir_auto
-        || style->unicode_bidi == STYLE_UNICODE_BIDI_PLAINTEXT)
-        base = computed_style_direction_rtl(style)
-            ? TEXT_BIDI_BASE_AUTO_RTL : TEXT_BIDI_BASE_AUTO_LTR;
     flow->paragraph = text_bidi_paragraph_create(
-        flow->budget, flow->text, flow->byte_count, base, &status);
+        flow->budget, flow->text, flow->byte_count,
+        bidi_paragraph_base(node, style), &status);
     if (flow->paragraph == NULL) {
         budget_free(flow->budget, flow);
         if (status == TEXT_BIDI_LIMIT_EXCEEDED)
@@ -554,6 +559,22 @@ void layout_bidi_flow_destroy(LayoutBidiFlow *flow)
     budget_free(flow->budget, flow);
 }
 
+/* First retained entry whose command is at or after `command_index`. The
+   entries stay sorted by command (bidi_command_insert), so the bulk moves
+   below touch only the commands they move, not the whole document's. */
+static size_t bidi_command_lower_bound(const LayoutDocument *layout,
+                                       size_t command_index)
+{
+    size_t low = 0, high = layout->bidi_command_count;
+    while (low < high) {
+        size_t middle = low + (high - low) / 2u;
+        if (layout->bidi_commands[middle].command_index < command_index)
+            low = middle + 1u;
+        else high = middle;
+    }
+    return low;
+}
+
 void layout_bidi_insert_commands(LayoutContext *context, size_t index,
                                  size_t count)
 {
@@ -561,9 +582,9 @@ void layout_bidi_insert_commands(LayoutContext *context, size_t index,
     /* Decoration insertion moves both resolved glyph maps and the command
        references of containing paragraphs whose line has not flushed yet.
        Admission in layout_insert_commands bounds every adjusted index. */
-    for (size_t i = 0; i < layout->bidi_command_count; i++) {
-        LayoutBidiCommand *command = &layout->bidi_commands[i];
-        if (command->command_index >= index) command->command_index += count;
+    for (size_t i = bidi_command_lower_bound(layout, index);
+         i < layout->bidi_command_count; i++) {
+        layout->bidi_commands[i].command_index += count;
     }
     if (!context->document_bidi_text_present
         && !context->document_bidi_markup_present
@@ -887,10 +908,10 @@ static void bidi_translate_atomic(LayoutDocument *layout,
 {
     if (dx == 0) return;
     int delta_fixed = layout_fixed_from_integer(dx);
-    for (size_t i = 0; i < layout->bidi_command_count; i++) {
+    for (size_t i = bidi_command_lower_bound(layout, atomic->command_start);
+         i < layout->bidi_command_count; i++) {
         const LayoutBidiCommand *mapped = &layout->bidi_commands[i];
-        if (mapped->command_index < atomic->command_start
-            || mapped->command_index >= atomic->command_end) continue;
+        if (mapped->command_index >= atomic->command_end) break;
         for (size_t glyph = 0; glyph < mapped->glyph_count; glyph++) {
             LayoutBidiGlyph *item = &layout->bidi_glyphs[
                 mapped->glyph_start + glyph];
@@ -1010,6 +1031,17 @@ static int bidi_glyph_advance(const LayoutDocument *layout,
     return advance;
 }
 
+/* Capacity for `needed` entries: doubling while small, then fixed steps
+   like the display list, so a long page never holds two large copies. */
+static size_t bidi_grown_capacity(size_t capacity, size_t needed,
+                                  size_t first, size_t limit)
+{
+    if (capacity == 0) capacity = first;
+    while (capacity < needed && capacity < limit)
+        capacity += capacity < 4096u ? capacity : 4096u;
+    return capacity > limit ? limit : capacity;
+}
+
 static bool bidi_reserve(LayoutDocument *layout, size_t commands,
                          size_t glyphs)
 {
@@ -1018,12 +1050,9 @@ static bool bidi_reserve(LayoutDocument *layout, size_t commands,
         return false;
     size_t needed_commands = layout->bidi_command_count + commands;
     if (needed_commands > layout->bidi_command_capacity) {
-        size_t capacity = layout->bidi_command_capacity == 0
-            ? 16u : layout->bidi_command_capacity;
-        while (capacity < needed_commands && capacity < LAYOUT_BIDI_COMMAND_LIMIT)
-            capacity *= 2u;
-        if (capacity > LAYOUT_BIDI_COMMAND_LIMIT)
-            capacity = LAYOUT_BIDI_COMMAND_LIMIT;
+        size_t capacity = bidi_grown_capacity(
+            layout->bidi_command_capacity, needed_commands, 16u,
+            LAYOUT_BIDI_COMMAND_LIMIT);
         LayoutBidiCommand *grown = budget_realloc(
             layout->budget, layout->bidi_commands,
             capacity * sizeof(*grown));
@@ -1033,12 +1062,9 @@ static bool bidi_reserve(LayoutDocument *layout, size_t commands,
     }
     size_t needed_glyphs = layout->bidi_glyph_count + glyphs;
     if (needed_glyphs > layout->bidi_glyph_capacity) {
-        size_t capacity = layout->bidi_glyph_capacity == 0
-            ? 64u : layout->bidi_glyph_capacity;
-        while (capacity < needed_glyphs && capacity < LAYOUT_BIDI_GLYPH_LIMIT)
-            capacity *= 2u;
-        if (capacity > LAYOUT_BIDI_GLYPH_LIMIT)
-            capacity = LAYOUT_BIDI_GLYPH_LIMIT;
+        size_t capacity = bidi_grown_capacity(
+            layout->bidi_glyph_capacity, needed_glyphs, 64u,
+            LAYOUT_BIDI_GLYPH_LIMIT);
         LayoutBidiGlyph *grown = budget_realloc(
             layout->budget, layout->bidi_glyphs,
             capacity * sizeof(*grown));
@@ -1047,6 +1073,23 @@ static bool bidi_reserve(LayoutDocument *layout, size_t commands,
         layout->bidi_glyph_capacity = capacity;
     }
     return true;
+}
+
+/* Lookups bisect these by command. A line's entries usually arrive in order,
+   but one inside an atomic box or a control arrives before the line around it
+   flushes its lower commands. */
+static void bidi_command_insert(LayoutDocument *layout,
+                                LayoutBidiCommand value)
+{
+    size_t at = layout->bidi_command_count;
+    while (at > 0
+           && layout->bidi_commands[at - 1u].command_index
+              > value.command_index) at--;
+    memmove(layout->bidi_commands + at + 1u, layout->bidi_commands + at,
+            (layout->bidi_command_count - at)
+                * sizeof(*layout->bidi_commands));
+    layout->bidi_commands[at] = value;
+    layout->bidi_command_count++;
 }
 
 bool layout_bidi_resolve_line(LineState *line)
@@ -1285,7 +1328,8 @@ bool layout_bidi_resolve_line(LineState *line)
         i += sequence_units - 1u;
     }
     int difference = pen_fixed - old_end;
-    if (difference > 2 * 64 || difference < -2 * 64) {
+    if (!flow->shaped_width_free
+        && (difference > 2 * 64 || difference < -2 * 64)) {
         if (LAYOUT_TRACE(line->layout, LAYOUT_PROFILE)) {
             fprintf(stderr,
                     "layout-bidi-fallback units=%zu difference=%d "
@@ -1351,13 +1395,12 @@ bool layout_bidi_resolve_line(LineState *line)
         command->width = layout_fixed_ceil(maximum)
                          - layout_fixed_floor(minimum);
         command->radius &= ~LAYOUT_TEXT_RTL;
-        line->layout->bidi_commands[line->layout->bidi_command_count++] =
-            (LayoutBidiCommand) {
-                .command_index = (uint32_t) command_index,
-                .glyph_start = (uint32_t) glyph_start,
-                .glyph_count = (uint16_t) count,
-                .level = level
-            };
+        bidi_command_insert(line->layout, (LayoutBidiCommand) {
+            .command_index = (uint32_t) command_index,
+            .glyph_start = (uint32_t) glyph_start,
+            .glyph_count = (uint16_t) count,
+            .level = level
+        });
         for (size_t link = line->link_start;
              link < line->layout->link_count; link++) {
             LinkRegion *region = &line->layout->links[link];
@@ -1377,17 +1420,79 @@ bool layout_bidi_resolve_line(LineState *line)
     return true;
 }
 
+/* A control's value or placeholder is an attribute or edit buffer, so no
+   paragraph flow reaches it: resolve the commands from command_start, its text
+   and any shadows of it, as a line of their own. Like Latin control text it
+   ignores text-align, and sits at the start edge of its own direction. Any
+   failure leaves the text logical, which is what it was before. */
+void layout_bidi_control_text(LayoutContext *context, lxb_dom_node_t *node,
+                              const ComputedStyle *style, size_t command_start)
+{
+    LayoutDocument *layout = context->layout;
+    if (command_start >= layout->count) return;
+    const DrawCommand *text = &layout->commands[layout->count - 1u];
+    if (text->type != DRAW_TEXT
+        || text->text_length > TEXT_BIDI_PARAGRAPH_BYTE_LIMIT
+        || !text_bidi_maybe_needed(text->text, text->text_length)) return;
+    LayoutBidiFlow *flow = budget_calloc(layout->budget, 1, sizeof(*flow));
+    if (flow == NULL) {
+        layout->performance.bidi_line_fallbacks++;
+        return;
+    }
+    flow->budget = layout->budget;
+    flow->context = context;
+    flow->shaped_width_free = true;
+    TextBidiStatus status = TEXT_BIDI_MALFORMED;
+    flow->paragraph = text_bidi_paragraph_create(
+        flow->budget, text->text, text->text_length,
+        bidi_paragraph_base(node, style), &status);
+    size_t units = text_bidi_paragraph_count(flow->paragraph);
+    if (flow->paragraph == NULL || units == 0 || units > UINT16_MAX) {
+        if (status == TEXT_BIDI_LIMIT_EXCEEDED)
+            layout->performance.bidi_limit_degradations++;
+        else if (status != TEXT_BIDI_NOT_NEEDED)
+            layout->performance.bidi_line_fallbacks++;
+        layout_bidi_flow_destroy(flow);
+        return;
+    }
+    layout->performance.bidi_paragraphs++;
+    bool rtl = (text_bidi_paragraph_level(flow->paragraph) & 1u) != 0u;
+    for (size_t at = command_start; at < layout->count; at++) {
+        DrawCommand *command = &layout->commands[at];
+        if (command->type != DRAW_TEXT) continue;
+        int box_x = command->x, box_width = command->width;
+        int logical_advance = bidi_glyph_advance(
+            layout, command, 0, 0, command->text, command->text_length);
+        if (logical_advance <= 0)
+            logical_advance = (int) units * 6 * command->scale * 64;
+        flow->commands[0] = (LayoutBidiFlowCommand) {
+            .command_index = (uint32_t) at,
+            .logical_advance_fixed = logical_advance,
+            .unit_count = (uint16_t) units
+        };
+        flow->command_count = 1;
+        LineState line = {
+            .layout = layout, .bidi_flow = flow, .command_start = at,
+            .link_start = layout->link_count,
+            .start_x = box_x, .x = box_x
+        };
+        if (!layout_bidi_resolve_line(&line)) break;
+        if (rtl) {
+            int old_x_fixed = draw_command_text_x_fixed(command);
+            draw_command_set_text_x_fixed(command, layout_fixed_add(
+                old_x_fixed,
+                layout_fixed_from_integer(box_width - command->width)));
+            layout_bidi_rebase_command(layout, at, old_x_fixed);
+        }
+    }
+    layout_bidi_flow_destroy(flow);
+}
+
 const LayoutBidiCommand *layout_bidi_command_for_index(
     const LayoutDocument *layout, size_t command_index)
 {
     if (layout == NULL) return NULL;
-    size_t low = 0, high = layout->bidi_command_count;
-    while (low < high) {
-        size_t middle = low + (high - low) / 2u;
-        if (layout->bidi_commands[middle].command_index < command_index)
-            low = middle + 1u;
-        else high = middle;
-    }
+    size_t low = bidi_command_lower_bound(layout, command_index);
     return low < layout->bidi_command_count
                && layout->bidi_commands[low].command_index == command_index
         ? &layout->bidi_commands[low] : NULL;
@@ -1482,9 +1587,9 @@ void layout_bidi_translate_commands(LayoutDocument *layout,
 {
     if (layout == NULL || dx == 0) return;
     int delta = layout_fixed_from_integer(dx);
-    for (size_t i = 0; i < layout->bidi_command_count; i++) {
+    for (size_t i = bidi_command_lower_bound(layout, command_start);
+         i < layout->bidi_command_count; i++) {
         const LayoutBidiCommand *command = &layout->bidi_commands[i];
-        if (command->command_index < command_start) continue;
         for (size_t glyph = 0; glyph < command->glyph_count; glyph++) {
             LayoutBidiGlyph *item = &layout->bidi_glyphs[
                 command->glyph_start + glyph];
@@ -1498,9 +1603,9 @@ void layout_bidi_scale_commands(LayoutDocument *layout,
                                 int origin_x_twice, uint16_t scale_q14)
 {
     if (layout == NULL || scale_q14 == 16384u) return;
-    for (size_t i = 0; i < layout->bidi_command_count; i++) {
+    for (size_t i = bidi_command_lower_bound(layout, command_start);
+         i < layout->bidi_command_count; i++) {
         const LayoutBidiCommand *command = &layout->bidi_commands[i];
-        if (command->command_index < command_start) continue;
         for (size_t glyph = 0; glyph < command->glyph_count; glyph++) {
             LayoutBidiGlyph *item = &layout->bidi_glyphs[
                 command->glyph_start + glyph];

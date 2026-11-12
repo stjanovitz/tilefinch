@@ -213,6 +213,141 @@ int main(void)
     psp_update_session_destroy(&developer_session);
     CHECK(budget.current == 0);
 
+    /* IS-01: the install target comes from the journal on the card at the
+       moment of the install, never from the copy read at initialization,
+       and is never the slot this process runs from. */
+    TilefinchInstallPaths running_b = slotted;
+    snprintf(running_b.slot_name, sizeof(running_b.slot_name), "%s", "slot-b");
+    snprintf(running_b.program_dir, sizeof(running_b.program_dir),
+             "%s/slot-b", root);
+    TilefinchUpdateState started = {
+        .generation = 4,
+        .active_slot = TILEFINCH_UPDATE_SLOT_A,
+        .pending_slot = TILEFINCH_UPDATE_SLOT_B,
+        .trial = TILEFINCH_UPDATE_TRIAL_STARTED,
+        .installed_sequence = 42,
+        .candidate_sequence = 43
+    };
+    CHECK(tilefinch_update_journal_store(data, &started, NULL, NULL));
+    PspUpdateSession trial_session = {0};
+    CHECK(psp_update_session_initialize(
+              &trial_session, &budget, &running_b, &developer, &ui));
+    /* Slot B is on its unconfirmed first start: nothing is replaceable. */
+    CHECK(psp_update_session_install_target(&trial_session)
+          == TILEFINCH_UPDATE_SLOT_NONE);
+    /* The browser's health confirmation then commits from its own copy. */
+    TilefinchUpdateState healthy = started;
+    CHECK(tilefinch_update_state_confirm_healthy(&healthy)
+          && tilefinch_update_journal_store(data, &healthy, NULL, NULL));
+    CHECK(psp_update_session_install_target(&trial_session)
+              == TILEFINCH_UPDATE_SLOT_A
+          && trial_session.state.generation == healthy.generation
+          && trial_session.state.active_slot == TILEFINCH_UPDATE_SLOT_B
+          && trial_session.state.installed_sequence == 43);
+    psp_update_session_destroy(&trial_session);
+    /* Safe start runs the previous slot A while the journal's active slot
+       is B: A is the only other slot, and it is the running one. */
+    PspUpdateSession safe_session = {0};
+    CHECK(psp_update_session_initialize(
+              &safe_session, &budget, &slotted, &developer, &ui));
+    CHECK(psp_update_session_install_target(&safe_session)
+          == TILEFINCH_UPDATE_SLOT_NONE);
+    psp_update_session_destroy(&safe_session);
+    CHECK(budget.current == 0);
+
+    /* IS-10: the recovery screen was answered with O or timed out, so the
+       launcher started slot A and recorded the decline. The Update page
+       offers the screen's X (TRY AGAIN) and Square (DISCARD). */
+    TilefinchUpdateState declined = {
+        .generation = 10,
+        .active_slot = TILEFINCH_UPDATE_SLOT_A,
+        .pending_slot = TILEFINCH_UPDATE_SLOT_B,
+        .trial = TILEFINCH_UPDATE_TRIAL_STARTED,
+        .installed_sequence = 42,
+        .candidate_sequence = 43
+    };
+    char marker[640];
+    snprintf(marker, sizeof(marker), "%s/update-declined", data);
+    CHECK(tilefinch_update_journal_store(data, &declined, NULL, NULL)
+          && tilefinch_update_decline_store(data, &declined, NULL, NULL));
+    PspUpdateSession choice = {0};
+    CHECK(psp_update_session_initialize(
+              &choice, &budget, &slotted, &developer, &ui)
+          && psp_update_session_trial_declined(&choice));
+    psp_update_session_refresh_ui(&choice, &ui);
+    CHECK(strcmp(ui.update_status, "UPDATE DID NOT FINISH STARTING") == 0
+          && strcmp(ui.update_primary_label, "TRY AGAIN") == 0
+          && ui.update_primary_enabled && ui.update_discard_enabled
+          && !ui.update_cancel_enabled);
+    /* The journal is re-read: a write it cannot make leaves the choice. */
+    CHECK(chmod(data, 0500) == 0);
+    bool refused = !psp_update_session_resolve_trial(&choice, true);
+    CHECK(chmod(data, 0700) == 0);
+    CHECK(refused && psp_update_session_trial_declined(&choice));
+    CHECK(psp_update_session_resolve_trial(&choice, true));
+    TilefinchUpdateState on_card;
+    struct stat marker_info;
+    CHECK(tilefinch_update_journal_load(data, &on_card, NULL)
+          && on_card.generation == 11
+          && on_card.trial == TILEFINCH_UPDATE_TRIAL_PENDING
+          && on_card.pending_slot == TILEFINCH_UPDATE_SLOT_B
+          && stat(marker, &marker_info) != 0
+          && !psp_update_session_trial_declined(&choice));
+    psp_update_session_refresh_ui(&choice, &ui);
+    CHECK(strcmp(ui.update_status, "READY TO RESTART") == 0
+          && strcmp(ui.update_primary_label, "RESTART TO UPDATE") == 0
+          && ui.update_primary_enabled && !ui.update_discard_enabled
+          && psp_update_session_primary(&choice, &slotted)
+                 == PSP_UPDATE_PRIMARY_RESTART_REQUIRED);
+    psp_update_session_destroy(&choice);
+
+    /* The retried trial failed again and was declined again: DISCARD. */
+    CHECK(tilefinch_update_state_start_trial(&on_card)
+          && tilefinch_update_journal_store(data, &on_card, NULL, NULL));
+    memset(&choice, 0, sizeof(choice));
+    CHECK(psp_update_session_initialize(
+              &choice, &budget, &slotted, &developer, &ui)
+          && psp_update_session_resolve_trial(&choice, false)
+          && tilefinch_update_journal_load(data, &on_card, NULL)
+          && on_card.trial == TILEFINCH_UPDATE_TRIAL_NONE
+          && on_card.pending_slot == TILEFINCH_UPDATE_SLOT_NONE
+          && on_card.active_slot == TILEFINCH_UPDATE_SLOT_A
+          && !psp_update_session_trial_declined(&choice)
+          && !choice.trial_retry_requested);
+    psp_update_session_refresh_ui(&choice, &ui);
+    CHECK(strcmp(ui.update_primary_label, "CHECK NOW") == 0
+          && !ui.update_discard_enabled);
+    psp_update_session_destroy(&choice);
+
+    /* A journal that moved on since the page showed the choice wins. */
+    declined.generation = on_card.generation + 1u;
+    CHECK(tilefinch_update_journal_store(data, &declined, NULL, NULL));
+    memset(&choice, 0, sizeof(choice));
+    CHECK(psp_update_session_initialize(
+              &choice, &budget, &slotted, &developer, &ui)
+          && psp_update_session_trial_declined(&choice));
+    TilefinchUpdateState moved = declined;
+    CHECK(tilefinch_update_state_discard_trial(&moved)
+          && tilefinch_update_journal_store(data, &moved, NULL, NULL));
+    CHECK(!psp_update_session_resolve_trial(&choice, true)
+          && tilefinch_update_journal_load(data, &on_card, NULL)
+          && on_card.generation == moved.generation
+          && on_card.trial == TILEFINCH_UPDATE_TRIAL_NONE);
+    psp_update_session_destroy(&choice);
+
+    /* The trial boot itself (running the pending slot) offers no choice. */
+    declined.generation = moved.generation + 1u;
+    CHECK(tilefinch_update_journal_store(data, &declined, NULL, NULL));
+    memset(&choice, 0, sizeof(choice));
+    CHECK(psp_update_session_initialize(
+              &choice, &budget, &running_b, &developer, &ui)
+          && !psp_update_session_trial_declined(&choice)
+          && !psp_update_session_resolve_trial(&choice, false));
+    psp_update_session_refresh_ui(&choice, &ui);
+    CHECK(!ui.update_discard_enabled);
+    psp_update_session_destroy(&choice);
+    CHECK(budget.current == 0);
+
     remove(part);
     char scratch[640];
     snprintf(scratch, sizeof(scratch), "%s/update", data);
@@ -224,6 +359,9 @@ int main(void)
                  "%s/update-state.%u.tmp", data, copy);
         remove(scratch);
     }
+    remove(marker);
+    snprintf(scratch, sizeof(scratch), "%s/update-declined.tmp", data);
+    remove(scratch);
     CHECK(rmdir(data) == 0);
     CHECK(rmdir(root) == 0);
 

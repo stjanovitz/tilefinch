@@ -169,6 +169,50 @@ static bool test_svg_solid_luminance_mask(void)
     return okay && budget.current == 0;
 }
 
+/* RS-18: a keyword read from `style` ends at its declaration. Each mask
+   holds a black rectangle, so only an alpha mask lets the blue through. */
+static bool test_svg_style_mask_type_keyword(void)
+{
+    static const char markup[] =
+        "<svg width='100' height='20' viewBox='0 0 100 20'>"
+        "<mask id='m0' style='mask-type: alpha;'>"
+        "<rect width='20' height='20' fill='black'/></mask>"
+        "<mask id='m1' style='mask-type:alpha;fill:none'>"
+        "<rect x='20' width='20' height='20' fill='black'/></mask>"
+        "<mask id='m2' style='mask-type: alpha !important'>"
+        "<rect x='40' width='20' height='20' fill='black'/></mask>"
+        "<mask id='m3' style='fill:none; mask-type:alpha'>"
+        "<rect x='60' width='20' height='20' fill='black'/></mask>"
+        "<mask id='m4' style='mask-type: alphabet;'>"
+        "<rect x='80' width='20' height='20' fill='black'/></mask>"
+        "<rect width='20' height='20' fill='blue' mask='url(#m0)'/>"
+        "<rect x='20' width='20' height='20' fill='blue' mask='url(#m1)'/>"
+        "<rect x='40' width='20' height='20' fill='blue' mask='url(#m2)'/>"
+        "<rect x='60' width='20' height='20' fill='blue' mask='url(#m3)'/>"
+        "<rect x='80' width='20' height='20' fill='blue' mask='url(#m4)'/>"
+        "</svg>";
+    Budget budget;
+    budget_init(&budget, 4u * MIB);
+    int width = 0, height = 0;
+    unsigned char *pixels = image_svg_decode(markup, sizeof(markup) - 1,
+        &budget, MIB, &width, &height);
+    bool okay = pixels != NULL && width == 100 && height == 20;
+    for (unsigned column = 0; okay && column < 5; column++) {
+        const unsigned char *pixel =
+            pixels + (10u * 100u + column * 20u + 10u) * 4u;
+        bool alpha = column != 4;
+        if (alpha ? pixel[2] != 255 || pixel[3] != 255 : pixel[3] != 0) {
+            fprintf(stderr, "mask column %u: rgba %u %u %u %u, wanted %s\n",
+                    column, pixel[0], pixel[1], pixel[2], pixel[3],
+                    alpha ? "opaque blue (alpha mask)"
+                          : "transparent (luminance mask)");
+            okay = false;
+        }
+    }
+    budget_free(&budget, pixels);
+    return okay && budget.current == 0;
+}
+
 static size_t svg_test_append(char *buffer, size_t used, size_t capacity,
                               const char *text)
 {
@@ -182,6 +226,164 @@ static const unsigned char *svg_test_pixel(const unsigned char *pixels,
                                            int width, int x, int y)
 {
     return pixels + ((size_t) y * (size_t) width + (size_t) x) * 4u;
+}
+
+/* RS-14: a cooperation hook that allocates from the page Budget during an
+   SVG decode keeps its block, whether the decode succeeds or fails. Its
+   allocation is neither tagged with the decoder's scratch owner nor swept
+   by a rollback after a failed decode. */
+enum { SVG_HOOK_BLOCK = 4096 };
+
+typedef struct {
+    TestCountingClock clock;
+    Budget *budget;
+    unsigned char *block;
+    size_t svg_checkpoints;
+} SvgAllocatingHook;
+
+static uint64_t svg_allocating_hook_clock(void *context)
+{
+    return test_counting_clock_ns(&((SvgAllocatingHook *) context)->clock);
+}
+
+static bool svg_allocating_hook(void *context, const char *phase,
+                                size_t completed_work_units)
+{
+    (void) completed_work_units;
+    SvgAllocatingHook *hook = context;
+    if (strcmp(phase, "svg-decode") != 0) return true;
+    hook->svg_checkpoints++;
+    if (hook->block == NULL) {
+        hook->block = budget_malloc_category(
+            hook->budget, BUDGET_CATEGORY_RESOURCE, SVG_HOOK_BLOCK);
+        if (hook->block != NULL) memset(hook->block, 0x5a, SVG_HOOK_BLOCK);
+    }
+    return true;
+}
+
+static void svg_allocating_hook_install(SvgAllocatingHook *hook,
+                                        Budget *budget)
+{
+    *hook = (SvgAllocatingHook) {
+        .clock = {.now_ns = UINT64_C(1000000000),
+                  .step_ns = UINT64_C(10000000)},
+        .budget = budget
+    };
+    TilefinchPlatformServices services = {
+        .context = hook,
+        .monotonic_time_ns = svg_allocating_hook_clock,
+        .cooperate = svg_allocating_hook
+    };
+    tilefinch_platform_set_services(&services);
+}
+
+/* The block must still be charged and intact; free it if so. */
+static bool svg_allocating_hook_kept(SvgAllocatingHook *hook,
+                                     size_t other_bytes, const char *label)
+{
+    Budget *budget = hook->budget;
+    bool kept = hook->block != NULL
+        && budget->current >= other_bytes + SVG_HOOK_BLOCK;
+    for (size_t i = 0; kept && i < SVG_HOOK_BLOCK; i++)
+        kept = hook->block[i] == 0x5a;
+    if (!kept) {
+        fprintf(stderr, "%s: hook block %s after %zu svg checkpoints, "
+                "budget %zu bytes (want %zu more than %zu)\n", label,
+                hook->block == NULL ? "never allocated" : "reclaimed",
+                hook->svg_checkpoints, budget->current,
+                (size_t) SVG_HOOK_BLOCK, other_bytes);
+        return false;
+    }
+    budget_free(budget, hook->block);
+    hook->block = NULL;
+    return true;
+}
+
+/* Enough shapes to reach the decoder's cooperation checkpoints; a refused
+   one then nests past the parser's depth limit. */
+static size_t svg_test_shapes(char *markup, size_t capacity, bool refused)
+{
+    size_t used = svg_test_append(markup, 0, capacity,
+        "<svg width='32' height='32' viewBox='0 0 32 32'>");
+    for (unsigned i = 0; i < 96; i++)
+        used = svg_test_append(markup, used, capacity,
+            "<path d='M0 0L8 0L8 8L0 8Z' fill='blue'/>");
+    for (unsigned i = 0; refused && i < 160; i++)
+        used = svg_test_append(markup, used, capacity, "<g>");
+    for (unsigned i = 0; refused && i < 160; i++)
+        used = svg_test_append(markup, used, capacity, "</g>");
+    return svg_test_append(markup, used, capacity, "</svg>");
+}
+
+static bool test_svg_decode_keeps_cooperation_allocations(void)
+{
+    char markup[8192];
+    Budget budget;
+    budget_init(&budget, 4u * MIB);
+    SvgAllocatingHook hook;
+    bool okay = true;
+    for (unsigned pass = 0; okay && pass < 2; pass++) {
+        bool sized = pass == 0;
+        size_t length = svg_test_shapes(markup, sizeof(markup), !sized);
+        okay = length < sizeof(markup);
+        svg_allocating_hook_install(&hook, &budget);
+        int width = 0, height = 0;
+        unsigned char *pixels = okay ? image_svg_decode(markup, length,
+            &budget, MIB, &width, &height) : NULL;
+        tilefinch_platform_set_services(NULL);
+        if (okay && (sized ? pixels == NULL : pixels != NULL))
+            fprintf(stderr, "%s svg: decode returned %s (%dx%d)\n",
+                    sized ? "decodable" : "refused",
+                    pixels == NULL ? "nothing" : "pixels", width, height);
+        okay = okay && (sized ? pixels != NULL : pixels == NULL)
+            && svg_allocating_hook_kept(&hook, pixels == NULL ? 0
+                : (size_t) width * (size_t) height * 4u,
+                sized ? "decoded svg" : "refused svg");
+        budget_free(&budget, pixels);
+        if (hook.block != NULL && budget.current >= SVG_HOOK_BLOCK)
+            budget_free(&budget, hook.block);
+    }
+    return okay && budget.current == 0;
+}
+
+/* The same through the image loader, whose failed-decode path rolled the
+   whole Budget back to its checkpoint whenever the totals had moved. */
+static bool test_svg_image_failure_keeps_cooperation_allocations(void)
+{
+    char markup[8192];
+    size_t length = svg_test_shapes(markup, sizeof(markup), true);
+    char html[16384];
+    int written = snprintf(html, sizeof(html),
+        "<!doctype html><body><img width=32 height=32 "
+        "src=\"data:image/svg+xml,%s\"></body>", markup);
+    if (length >= sizeof(markup) || written <= 0
+        || (size_t) written >= sizeof(html)) return false;
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    PocDocument document = {0};
+    Stylesheet stylesheet = {0};
+    ImageResources images = {0};
+    bool okay = installed
+        && document_parse(&document, &budget, html, (size_t) written, 17)
+        && stylesheet_build(&stylesheet, &budget, &document, 480);
+    SvgAllocatingHook hook;
+    svg_allocating_hook_install(&hook, &budget);
+    okay = okay && images_load_external(
+        &document, &stylesheet, &images, &budget,
+        "https://svg-hook.test/", "https://svg-hook.test/", NULL,
+        8, 64 * 1024, 32 * 1024, 128 * 1024, 100000000, NULL, NULL);
+    tilefinch_platform_set_services(NULL);
+    images_destroy(&images);
+    stylesheet_destroy(&stylesheet);
+    document_destroy(&document);
+    okay = okay && svg_allocating_hook_kept(&hook, 0, "image loader");
+    if (hook.block != NULL && budget.current >= SVG_HOOK_BLOCK)
+        budget_free(&budget, hook.block);
+    bool clean = budget.current == 0;
+    if (!clean) fprintf(stderr, "image loader: %zu bytes left\n", budget.current);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return okay && clean;
 }
 
 /* Exported charts carry one clip-path attribute per element and clipped
@@ -916,5 +1118,586 @@ static bool test_svg_retarget_rasterizes_at_painted_size(void)
     if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
     if (!clean) fprintf(stderr, "svg-retarget: %zu bytes after teardown\n",
                         budget.current);
+    return ok && clean;
+}
+
+/* Large SVG backgrounds far below the reader (tilefinch/image_retarget.h):
+   a 400x400 picture (640,000 raster bytes from 200 bytes of markup), one at
+   the top of the page and one 6,400 px down. Left half `fill`, right half
+   blue. */
+#define SVG_DISTANT_ART(fill)                                               \
+    "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' "        \
+    "width='400' height='400' viewBox='0 0 400 400'%3E"                     \
+    "%3Crect width='200' height='400' fill='%23" fill "'/%3E"               \
+    "%3Crect x='200' width='200' height='400' fill='%230000ff'/%3E"         \
+    "%3C/svg%3E"
+#define SVG_DISTANT_FAR_TOP 6400
+#define SVG_DISTANT_BYTES (400u * 400u * 4u)
+
+typedef struct {
+    Budget budget;
+    BrowserSession browser;
+    NavigationSession navigation;
+    bool installed, browser_ready, ready, committed;
+} SvgDistantPage;
+
+static bool svg_distant_open_html(SvgDistantPage *page, const char *html,
+                                  size_t length)
+{
+    memset(page, 0, sizeof(*page));
+    budget_init(&page->budget, 24 * MIB);
+    page->installed = budget_install_lexbor(&page->budget);
+    page->browser_ready = page->installed
+        && browser_session_init(&page->browser, &page->budget, 64 * 1024);
+    page->ready = page->browser_ready
+        && navigation_init(&page->navigation, &page->budget, 4);
+    if (page->ready) {
+        navigation_attach_browser_session(&page->navigation, &page->browser);
+        navigation_enable_scripts(&page->navigation, 4 * MIB, 1000);
+        navigation_enable_external_resources(
+            &page->navigation, 2, 32 * 1024, 16 * 1024,
+            8, 512 * 1024, 256 * 1024, 4 * MIB, 1000);
+    }
+    uint64_t generation = page->ready ? navigation_begin(&page->navigation)
+                                      : 0;
+    page->committed = page->ready && navigation_commit_html(
+        &page->navigation, generation, "https://svg-distant.test/page",
+        html, length, 480, NULL, NULL, true);
+    return page->committed;
+}
+
+static bool svg_distant_open(SvgDistantPage *page)
+{
+    static const char html[] =
+        "<!doctype html><title>Distant SVG</title>"
+        "<meta name=viewport content=\"width=device-width\">"
+        "<style>html,body{margin:0}div{width:400px;height:400px;"
+        "background-repeat:no-repeat;background-size:400px 400px}"
+        "#top{background-image:url(\"" SVG_DISTANT_ART("ff0000") "\")}"
+        "#far{background-image:url(\"" SVG_DISTANT_ART("00ff00") "\")}"
+        "#gap{height:6000px}#tail{height:3000px}</style>"
+        "<div id=top></div><div id=gap></div><div id=far></div>"
+        "<div id=tail></div>";
+    return svg_distant_open_html(page, html, sizeof(html) - 1u);
+}
+
+static bool svg_distant_close(SvgDistantPage *page, const char *name)
+{
+    if (page->ready) navigation_destroy(&page->navigation);
+    if (page->browser_ready) browser_session_destroy(&page->browser);
+    bool clean = page->budget.current == 0
+        && budget_active_allocations(&page->budget, NULL) == 0
+        && budget_categories_reconcile(&page->budget);
+    if (page->installed)
+        clean = budget_uninstall_lexbor(&page->budget) && clean;
+    if (!clean) fprintf(stderr, "%s: %zu bytes after teardown\n", name,
+                        page->budget.current);
+    return clean;
+}
+
+/* The background entry of the element with this id. */
+static const ImageResource *svg_distant_item(SvgDistantPage *page,
+                                             const char *id)
+{
+    lxb_dom_node_t *root =
+        lxb_dom_interface_node(page->navigation.page.document.html);
+    lxb_dom_node_t *node = root == NULL ? NULL : test_find_id(root, id);
+    for (size_t i = 0; node != NULL && i < page->navigation.page.images.count;
+         i++) {
+        const ImageResource *item = &page->navigation.page.images.items[i];
+        if (item->node == node && item->is_background) return item;
+    }
+    return NULL;
+}
+
+/* Held at its first size, and exactly its markup rasterized there. */
+static bool svg_distant_held(Budget *budget, const ImageResource *item)
+{
+    if (item == NULL || item->pixels == NULL || item->width != 400
+        || item->height != 400 || item->encoded == NULL) return false;
+    int width = 400, height = 400;
+    unsigned char *direct = image_svg_decode(
+        item->encoded, item->encoded_length, budget, SVG_DISTANT_BYTES,
+        &width, &height);
+    bool same = direct != NULL && width == 400 && height == 400
+        && memcmp(direct, item->pixels, SVG_DISTANT_BYTES) == 0;
+    budget_free(budget, direct);
+    return same;
+}
+
+static bool svg_distant_released(const ImageResource *item)
+{
+    return item != NULL && item->pixels == NULL && item->encoded != NULL
+        && image_resource_available(item)
+        && (item->retarget_flags & (IMAGE_RETARGET_VECTOR
+                | IMAGE_RETARGET_DROPPED | IMAGE_RETARGET_DISTANT))
+               == (IMAGE_RETARGET_VECTOR | IMAGE_RETARGET_DROPPED
+                   | IMAGE_RETARGET_DISTANT);
+}
+
+/* The page at scroll_y, rendered, shows the far picture's two halves. */
+static bool svg_distant_frame_shows_far(SvgDistantPage *page, int scroll_y,
+                                        size_t *decodes)
+{
+    static uint16_t frame[480 * 272];
+    TileCache cache;
+    if (!tile_cache_init(&cache, &page->budget,
+                         &page->navigation.page.layout, 24)) return false;
+    bool ok = tile_cache_set_frame(&cache, frame, 480 * 272)
+        && tile_cache_render_frame(&cache, scroll_y, 480, 272, NULL);
+    int row = SVG_DISTANT_FAR_TOP - scroll_y + 40;
+    ok = ok && row >= 0 && row < 272
+        && frame[row * 480 + 100] == 0x07e0u
+        && frame[row * 480 + 300] == 0x001fu
+        && frame[row * 480 + 440] == 0xffffu;
+    if (decodes != NULL) *decodes = cache.decoded_image_builds;
+    tile_cache_destroy(&cache);
+    return ok;
+}
+
+/* A large SVG background first painted far below the reader is measured
+   but not rasterized: no surface exists for it until the reader comes
+   within two viewports, while the one at the top is rasterized before the
+   first paint, at the size an eager load gives it. */
+static bool test_far_svg_background_allocates_no_surface_until_approached(
+    void)
+{
+    SvgDistantPage page;
+    bool committed = svg_distant_open(&page);
+    NavigationSession *navigation = &page.navigation;
+    const ImageResource *top = committed ? svg_distant_item(&page, "top")
+                                         : NULL;
+    const ImageResource *far = committed ? svg_distant_item(&page, "far")
+                                         : NULL;
+    bool deferred = svg_distant_held(&page.budget, top)
+        && svg_distant_released(far)
+        && far->width == 400 && far->source_width == 400
+        && far->full_width == 400
+        && navigation->page.images.stats.decoded_bytes == SVG_DISTANT_BYTES;
+    if (!deferred && committed) svg_retarget_report(navigation);
+    /* Idle work at the top leaves it alone. */
+    if (deferred) retarget_pump(navigation);
+    far = deferred ? svg_distant_item(&page, "far") : NULL;
+    bool idle = svg_distant_released(far)
+        && navigation->page.images.stats.decoded_bytes == SVG_DISTANT_BYTES
+        && navigation->page.images.retarget.distant_restores == 0;
+    if (!idle && deferred) svg_retarget_report(navigation);
+    /* 400 px above the picture: inside two viewports (544 px). */
+    bool approached = idle && navigation_set_scroll(
+        navigation, SVG_DISTANT_FAR_TOP - 272 - 400);
+    if (approached) retarget_pump(navigation);
+    far = approached ? svg_distant_item(&page, "far") : NULL;
+    /* The top picture, now more than four viewports up, is released. */
+    approached = svg_distant_held(&page.budget, far)
+        && (far->retarget_flags & IMAGE_RETARGET_DISTANT) == 0
+        && svg_distant_released(svg_distant_item(&page, "top"))
+        && navigation->page.images.retarget.distant_restores == 1
+        && navigation->page.images.stats.decoded_bytes == SVG_DISTANT_BYTES;
+    if (!approached && idle) svg_retarget_report(navigation);
+    bool ok = committed && deferred && idle && approached;
+    if (!ok)
+        fprintf(stderr, "svg-distant-defer committed=%d deferred=%d "
+                "idle=%d approached=%d error=\"%s\"\n", committed, deferred,
+                idle, approached, navigation->last_error);
+    bool clean = svg_distant_close(&page, "svg-distant-defer");
+    return ok && clean;
+}
+
+/* Scrolled to, the far picture paints correctly: after idle work
+   rasterized it ahead of the reader, and when a scroll reaches it before
+   any idle turn (a held D-pad), the input path rasterizes it once before
+   the frame instead of each tile rasterizing it from markup. */
+static bool test_far_svg_background_renders_once_scrolled_to(void)
+{
+    SvgDistantPage page;
+    bool committed = svg_distant_open(&page);
+    NavigationSession *navigation = &page.navigation;
+    if (committed) retarget_pump(navigation);
+    /* Straight onto the picture with no idle turn in between. */
+    bool jumped = committed
+        && svg_distant_released(svg_distant_item(&page, "far"))
+        && navigation_set_scroll(navigation, SVG_DISTANT_FAR_TOP - 100)
+        && navigation_prepare_near_vector_images(navigation);
+    const ImageResource *far = jumped ? svg_distant_item(&page, "far")
+                                      : NULL;
+    size_t decodes = SIZE_MAX;
+    jumped = svg_distant_held(&page.budget, far)
+        && navigation->page.images.retarget.distant_input_restores == 1
+        && svg_distant_frame_shows_far(&page, SVG_DISTANT_FAR_TOP - 100,
+                                       &decodes)
+        && decodes == 0;
+    if (!jumped && committed) svg_retarget_report(navigation);
+    /* A press that barely moves does not look again. */
+    bool repeat = jumped && navigation_set_scroll(
+            navigation, SVG_DISTANT_FAR_TOP - 90)
+        && !navigation_prepare_near_vector_images(navigation)
+        && navigation->page.images.retarget.distant_input_restores == 1;
+    /* Away and back by idle work: rasterized ahead of the reader, so the
+       frame that reaches it decodes nothing. */
+    bool returned = repeat && navigation_set_scroll(navigation, 0);
+    if (returned) retarget_pump(navigation);
+    returned = returned
+        && svg_distant_released(svg_distant_item(&page, "far"))
+        && navigation_set_scroll(navigation, SVG_DISTANT_FAR_TOP - 600);
+    if (returned) retarget_pump(navigation);
+    returned = returned
+        && svg_distant_held(&page.budget, svg_distant_item(&page, "far"))
+        && navigation_set_scroll(navigation, SVG_DISTANT_FAR_TOP - 100)
+        && !navigation_prepare_near_vector_images(navigation)
+        && svg_distant_frame_shows_far(&page, SVG_DISTANT_FAR_TOP - 100,
+                                       &decodes)
+        && decodes == 0
+        && navigation->page.images.retarget.distant_restores == 1;
+    if (!returned && repeat) svg_retarget_report(navigation);
+    bool ok = committed && jumped && repeat && returned;
+    if (!ok)
+        fprintf(stderr, "svg-distant-render committed=%d jumped=%d "
+                "repeat=%d returned=%d decodes=%zu\n", committed, jumped,
+                repeat, returned, decodes);
+    bool clean = svg_distant_close(&page, "svg-distant-render");
+    return ok && clean;
+}
+
+/* Once the reader is four viewports away again, the far picture's surface
+   is released: back at the top, decoded bytes and the resource category
+   are what they were before the reader went down (the top picture alone),
+   and teardown returns every byte. */
+static bool test_far_svg_background_memory_returns_to_zero(void)
+{
+    SvgDistantPage page;
+    bool committed = svg_distant_open(&page);
+    NavigationSession *navigation = &page.navigation;
+    if (committed) retarget_pump(navigation);
+    size_t resource_before = committed
+        ? page.budget.categories[BUDGET_CATEGORY_RESOURCE].current : 0;
+    bool held = committed && navigation_set_scroll(
+        navigation, SVG_DISTANT_FAR_TOP - 100);
+    if (held) retarget_pump(navigation);
+    held = held && svg_distant_held(&page.budget,
+                                    svg_distant_item(&page, "far"))
+        && navigation->page.images.stats.decoded_bytes == SVG_DISTANT_BYTES;
+    /* Three viewports above: still within four, kept. */
+    bool kept = held && navigation_set_scroll(
+        navigation, SVG_DISTANT_FAR_TOP - 272 - 3 * 272);
+    if (kept) retarget_pump(navigation);
+    kept = kept && svg_distant_held(&page.budget,
+                                    svg_distant_item(&page, "far"))
+        && navigation->page.images.retarget.distant_releases == 1;
+    bool released = kept && navigation_set_scroll(navigation, 0);
+    if (released) retarget_pump(navigation);
+    size_t resource_after = released
+        ? page.budget.categories[BUDGET_CATEGORY_RESOURCE].current : 0;
+    released = released
+        && svg_distant_released(svg_distant_item(&page, "far"))
+        && svg_distant_held(&page.budget, svg_distant_item(&page, "top"))
+        && navigation->page.images.retarget.distant_releases == 2
+        && navigation->page.images.stats.decoded_bytes == SVG_DISTANT_BYTES
+        && resource_after == resource_before;
+    if (!released && kept) svg_retarget_report(navigation);
+    bool ok = committed && held && kept && released;
+    if (!ok)
+        fprintf(stderr, "svg-distant-release committed=%d held=%d kept=%d "
+                "released=%d resource %zu->%zu\n", committed, held, kept,
+                released, resource_before, resource_after);
+    bool clean = svg_distant_close(&page, "svg-distant-release");
+    return ok && clean;
+}
+
+/* A large SVG background near the top, which the commit's load leaves for
+   the first layout to rasterize, is parsed once: the load's parse, which
+   measured it, is the one that first raster uses. The far one is parsed
+   once for its size and its parse is not held past that layout. */
+static bool test_near_svg_background_parses_once(void)
+{
+    size_t before = image_svg_parse_count();
+    SvgDistantPage page;
+    bool committed = svg_distant_open(&page);
+    size_t parses = image_svg_parse_count() - before;
+    NavigationSession *navigation = &page.navigation;
+    const ImageResources *images = &navigation->page.images;
+    bool none_held = true;
+    for (size_t i = 0; i < IMAGE_SVG_KEPT_PARSE_LIMIT; i++)
+        none_held = none_held && images->svg_parses[i].parse == NULL;
+    bool once = committed && parses == 2 && none_held
+        && images->svg_parse_bytes == 0
+        && images->retarget.distant_deferred == 2
+        && svg_distant_released(svg_distant_item(&page, "far"))
+        && svg_distant_held(&page.budget, svg_distant_item(&page, "top"));
+    if (!once && committed) svg_retarget_report(navigation);
+    bool ok = committed && once;
+    if (!ok)
+        fprintf(stderr, "svg-near-parse committed=%d once=%d parses=%zu\n",
+                committed, once, parses);
+    bool clean = svg_distant_close(&page, "svg-near-parse");
+    return ok && clean;
+}
+
+static bool svg_kept_defer_always(void *opaque, int width, int height)
+{
+    (void) opaque;
+    return width > 0 && height > 0;
+}
+
+typedef struct {
+    Budget *budget;
+    void *ballast;
+    size_t bytes;
+} SvgParseReclaim;
+
+static size_t svg_parse_reclaim(void *opaque, size_t needed)
+{
+    (void) needed;
+    SvgParseReclaim *reclaim = opaque;
+    if (reclaim->ballast == NULL) return 0;
+    budget_free(reclaim->budget, reclaim->ballast);
+    reclaim->ballast = NULL;
+    return reclaim->bytes;
+}
+
+/* Freeing an unrelated cache during parsing must not discount the parse's
+   retained charge. Test both refusal at the ordinary cache allowance and
+   exact accounting when the same parse does fit. */
+static bool test_svg_kept_parse_counts_its_owner_after_reclaim(void)
+{
+    char markup[16000];
+    size_t length = (size_t) snprintf(markup, sizeof(markup),
+        "<svg xmlns='http://www.w3.org/2000/svg' width='100' height='100'>");
+    for (unsigned i = 0; i < 240; i++) {
+        int wrote = snprintf(markup + length, sizeof(markup) - length,
+            "<rect x='%u' y='%u' width='2' height='2'/>", i % 90, i % 90);
+        if (wrote < 0 || (size_t) wrote >= sizeof(markup) - length)
+            return false;
+        length += (size_t) wrote;
+    }
+    memcpy(markup + length, "</svg>", 7);
+    length += 6;
+    bool ok = true;
+    for (unsigned pass = 0; pass < 2; pass++) {
+        Budget budget;
+        budget_init(&budget, 512u * 1024u);
+        SvgParseReclaim reclaim = { .budget = &budget,
+                                    .bytes = 480u * 1024u };
+        reclaim.ballast = budget_malloc(&budget, reclaim.bytes);
+        bool allocated = reclaim.ballast != NULL;
+        budget_set_reclaim_hook(&budget, svg_parse_reclaim, &reclaim);
+        int width = 0, height = 0;
+        bool limited = true, deferred = false;
+        ImageSvgParse *parse = NULL;
+        size_t allowance = pass == 0 ? IMAGE_SVG_KEPT_PARSE_BYTES
+                                     : 256u * 1024u;
+        unsigned char *pixels = image_svg_decode_deferrable(
+            markup, length, &budget, 40000, &width, &height, NULL, NULL,
+            svg_kept_defer_always, NULL, NULL, NULL, &limited, &deferred,
+            allowance, &parse);
+        bool counted = allocated && pixels == NULL && deferred && !limited
+            && reclaim.ballast == NULL && budget.reclaim_calls != 0
+            && (pass == 0 ? parse == NULL && budget.current == 0
+                : parse != NULL && image_svg_parse_bytes(parse)
+                       == budget.current && budget.current <= allowance);
+        if (!counted) fprintf(stderr,
+            "svg-parse-reclaim pass=%u reported=%zu actual=%zu limit=%zu\n",
+            pass, image_svg_parse_bytes(parse), budget.current, allowance);
+        budget_free(&budget, pixels);
+        image_svg_parse_release(parse);
+        budget_free(&budget, reclaim.ballast);
+        ok = counted && budget.current == 0
+            && budget_active_allocations(&budget, NULL) == 0 && ok;
+    }
+    return ok;
+}
+
+/* A parse kept by a deferred decode rasterizes exactly what a fresh decode
+   of the same markup does, at the size asked for, parsing nothing again;
+   released unused, or failing mid-raster, it returns every byte. */
+static bool test_svg_kept_parse_rasterizes_like_a_fresh_decode(void)
+{
+    static const char markup[] =
+        "<svg xmlns='http://www.w3.org/2000/svg' width='100' height='60' "
+        "viewBox='0 0 100 60'><clipPath id='c'><rect width='50' "
+        "height='60'/></clipPath><rect width='100' height='60' "
+        "fill='#0000ff'/><g clip-path='url(#c)'><circle cx='50' cy='30' "
+        "r='30' fill='#ff0000'/></g></svg>";
+    Budget budget;
+    budget_init(&budget, 4u * MIB);
+    bool ok = true;
+    for (int attempt = 0; ok && attempt < 3; attempt++) {
+        int width = 0, height = 0, sw = 0, sh = 0;
+        bool limited = true, deferred = false;
+        ImageSvgParse *parse = NULL;
+        unsigned char *none = image_svg_decode_deferrable(
+            markup, sizeof(markup) - 1, &budget, MIB, &width, &height,
+            NULL, NULL, svg_kept_defer_always, NULL, &sw, &sh, &limited,
+            &deferred, 64u * 1024u, &parse);
+        ok = none == NULL && deferred && !limited && width == 100
+            && height == 60 && sw == 100 && sh == 60 && parse != NULL
+            && image_svg_parse_bytes(parse) >= sizeof(markup) - 1
+            && image_svg_parse_bytes(parse) <= budget.current
+            && image_svg_parse_matches(parse, markup, sizeof(markup) - 1)
+            && !image_svg_parse_matches(parse, markup, sizeof(markup) - 2);
+        if (!ok) {
+            image_svg_parse_release(parse);
+            break;
+        }
+        if (attempt == 1) {
+            /* Never rasterized: released with the table. */
+            image_svg_parse_release(parse);
+            ok = budget.current == 0;
+            continue;
+        }
+        size_t parses = image_svg_parse_count();
+        int kept_width = 80, kept_height = 48;
+        if (attempt == 2) budget_inject_failure_after(&budget, 1);
+        unsigned char *kept = image_svg_parse_rasterize(
+            parse, (size_t) kept_width * (size_t) kept_height * 4u,
+            &kept_width, &kept_height);
+        budget_clear_failure_injection(&budget);
+        ok = image_svg_parse_count() == parses;
+        if (attempt == 2) {
+            ok = ok && kept == NULL && budget.current == 0;
+            budget_free(&budget, kept);
+            continue;
+        }
+        int fresh_width = 80, fresh_height = 48;
+        unsigned char *fresh = image_svg_decode(
+            markup, sizeof(markup) - 1, &budget, MIB, &fresh_width,
+            &fresh_height);
+        ok = ok && kept != NULL && fresh != NULL && kept_width == 80
+            && kept_height == 48 && fresh_width == 80 && fresh_height == 48
+            && memcmp(kept, fresh, 80u * 48u * 4u) == 0;
+        budget_free(&budget, kept);
+        budget_free(&budget, fresh);
+        ok = ok && budget.current == 0;
+    }
+    if (!ok) fprintf(stderr, "svg-kept-parse mismatch, %zu bytes left\n",
+                     budget.current);
+    return ok && budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0;
+}
+
+/* The same two pictures inside a 272 px scroller at the top of the page:
+   #far lies 6,400 px down the scroller's content, so its document position
+   is far below the reader whatever the scroller shows. */
+static bool svg_scroller_open(SvgDistantPage *page)
+{
+    static const char html[] =
+        "<!doctype html><title>Scrolled SVG</title>"
+        "<meta name=viewport content=\"width=device-width\">"
+        "<style>html,body{margin:0}#scroller{height:272px;"
+        "overflow-y:scroll}.art{width:400px;height:400px;"
+        "background-repeat:no-repeat;background-size:400px 400px}"
+        "#top{background-image:url(\"" SVG_DISTANT_ART("ff0000") "\")}"
+        "#far{background-image:url(\"" SVG_DISTANT_ART("00ff00") "\")}"
+        "#gap{height:6000px}#tail{height:3000px}</style>"
+        "<div id=scroller><div class=art id=top></div><div id=gap></div>"
+        "<div class=art id=far></div></div><div id=tail></div>";
+    return svg_distant_open_html(page, html, sizeof(html) - 1u);
+}
+
+static lxb_dom_node_t *svg_distant_node(SvgDistantPage *page, const char *id)
+{
+    lxb_dom_node_t *root =
+        lxb_dom_interface_node(page->navigation.page.document.html);
+    return root == NULL ? NULL : test_find_id(root, id);
+}
+
+/* The page at scroll 0, rendered, shows a picture whose top is at `row`
+   with left half `left` (RGB565) and right half blue. */
+static bool svg_distant_frame_shows(SvgDistantPage *page, int row,
+                                    uint16_t left, size_t *decodes)
+{
+    static uint16_t frame[480 * 272];
+    TileCache cache;
+    if (!tile_cache_init(&cache, &page->budget,
+                         &page->navigation.page.layout, 24)) return false;
+    bool ok = tile_cache_set_frame(&cache, frame, 480 * 272)
+        && tile_cache_render_frame(&cache, 0, 480, 272, NULL);
+    row += 40;
+    ok = ok && row >= 0 && row < 272
+        && frame[row * 480 + 100] == left
+        && frame[row * 480 + 300] == 0x001fu
+        && frame[row * 480 + 420] == 0xffffu;
+    if (decodes != NULL) *decodes = cache.decoded_image_builds;
+    tile_cache_destroy(&cache);
+    return ok;
+}
+
+/* The distance rule judges a paint where its scroll containers show it:
+   scrolling a scroller at the top of the page onto the picture 6,400 px
+   down its content rasterizes that picture (by idle work, or before the
+   frame when input got there first) and releases the one it scrolled
+   away, although the reader never moved; a load judges the lent boxes the
+   same way. */
+static bool test_svg_background_distance_follows_scroll_containers(void)
+{
+    SvgDistantPage page;
+    bool committed = svg_scroller_open(&page);
+    NavigationSession *navigation = &page.navigation;
+    LayoutDocument *layout = &navigation->page.layout;
+    lxb_dom_node_t *scroller = committed
+        ? svg_distant_node(&page, "scroller") : NULL;
+    if (committed) retarget_pump(navigation);
+    bool opened = scroller != NULL
+        && svg_distant_held(&page.budget, svg_distant_item(&page, "top"))
+        && svg_distant_released(svg_distant_item(&page, "far"));
+    if (!opened && committed) svg_retarget_report(navigation);
+    /* Idle work after the scroller moves onto #far. */
+    bool idle = opened
+        && layout_scroll_node(layout, scroller, 0, SVG_DISTANT_FAR_TOP - 100);
+    if (idle) retarget_pump(navigation);
+    size_t decodes = SIZE_MAX;
+    idle = idle
+        && svg_distant_held(&page.budget, svg_distant_item(&page, "far"))
+        && svg_distant_released(svg_distant_item(&page, "top"))
+        && navigation->page.images.retarget.distant_restores == 1
+        && navigation->page.images.retarget.distant_releases == 1
+        && svg_distant_frame_shows(&page, 100, 0x07e0u, &decodes)
+        && decodes == 0;
+    if (!idle && opened) svg_retarget_report(navigation);
+    /* A load lent these boxes judges #far near and #top far. */
+    ImageLayoutBoxes boxes;
+    bool lent = idle;
+    if (lent) {
+        layout_lend_image_boxes(layout, &boxes);
+        boxes.reader_known = true;
+        boxes.reader_top = 0;
+        boxes.reader_bottom = 272;
+        boxes.reader_near = 2 * 272;
+        lent = !layout_image_box_far(&boxes, svg_distant_node(&page, "far"))
+            && layout_image_box_far(&boxes, svg_distant_node(&page, "top"));
+    }
+    /* Input scrolls back to #top with no idle turn in between: it is
+       rasterized once before the frame, which then decodes nothing. */
+    bool input = lent && layout_scroll_node(layout, scroller, 0, 0)
+        && navigation_prepare_near_vector_images(navigation)
+        && svg_distant_held(&page.budget, svg_distant_item(&page, "top"))
+        && navigation->page.images.retarget.distant_input_restores == 1
+        && svg_distant_frame_shows(&page, 0, 0xf800u, &decodes)
+        && decodes == 0;
+    if (!input && lent) svg_retarget_report(navigation);
+    /* A scroller step of a few pixels does not look again. */
+    bool repeat = input && layout_scroll_node(layout, scroller, 0, 10)
+        && !navigation_prepare_near_vector_images(navigation)
+        && navigation->page.images.retarget.distant_input_restores == 1;
+    /* Boxes kept after their layout is released are judged the same way. */
+    bool taken = repeat
+        && layout_scroll_node(layout, scroller, 0, SVG_DISTANT_FAR_TOP - 100);
+    if (taken) {
+        layout_lend_image_boxes(layout, &boxes);
+        layout_keep_image_boxes(layout, &boxes);
+        boxes.reader_known = true;
+        boxes.reader_top = 0;
+        boxes.reader_bottom = 272;
+        boxes.reader_near = 2 * 272;
+        taken = boxes.layout == NULL && boxes.taken != NULL
+            && !layout_image_box_far(&boxes, svg_distant_node(&page, "far"))
+            && layout_image_box_far(&boxes, svg_distant_node(&page, "top"));
+        layout_release_image_boxes(&boxes);
+    }
+    bool ok = committed && opened && idle && lent && input && repeat && taken;
+    if (!ok)
+        fprintf(stderr, "svg-scroller-distance committed=%d opened=%d "
+                "idle=%d lent=%d input=%d repeat=%d taken=%d decodes=%zu\n",
+                committed, opened, idle, lent, input, repeat, taken, decodes);
+    bool clean = svg_distant_close(&page, "svg-scroller-distance");
     return ok && clean;
 }

@@ -1237,6 +1237,270 @@ int test_declared_var_and_script_form_submission(void)
     return 0;
 }
 
+static BrowserEngine *form_test_engine(bool javascript, const char *page,
+                                        size_t page_length)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 24u * MIB;
+    config.javascript.enabled = javascript;
+    config.javascript.document_scripts_enabled = javascript;
+    config.resources.enabled = false;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    if (engine != NULL && !browser_engine_commit_html(
+            engine, "https://form.test/", page, page_length, true)) {
+        browser_engine_destroy(engine);
+        return NULL;
+    }
+    return engine;
+}
+
+static lxb_dom_node_t *form_test_node(BrowserEngine *engine, const char *id)
+{
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    return test_reader_find_id(
+        lxb_dom_interface_node(navigation->page.document.html), id);
+}
+
+/* A press on Next sends what the page's scripts put in the form: hidden
+   tokens set in a submit listener run to KiB and native control state stops at
+   DOCUMENT_CONTROL_VALUE_LIMIT, so the DOM serializer would post the stale
+   markup value (a sign-in form's "no script ran" default). */
+int test_native_form_submission_sends_script_entries(void)
+{
+    static const char page[] =
+        "<!doctype html><title>Sign in</title>"
+        "<form id=f method=post action='/step' novalidate>"
+        "<input id=who name=identifier>"
+        "<input type=hidden id=t name=token value=noscript>"
+        "<button id=next name=action value=1>Next</button>"
+        "<input type=hidden name=tail value=z></form>"
+        "<script>"
+        "document.addEventListener('submit',function(e){"
+        "document.getElementById('t').value='T'.repeat(5000)+'end'});"
+        "document.getElementById('f').addEventListener('formdata',function(e){"
+        "e.formData.append('observer','obs')});"
+        "</script>";
+    BrowserEngine *engine = form_test_engine(true, page, sizeof(page) - 1u);
+    CHECK(engine != NULL);
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    CHECK(script_runtime_evaluate_diagnostic(navigation->page.runtime,
+        "document.getElementById('who').value='a b'",
+        "<type>", &navigation->page.script_result));
+    ControllerAction action = {0};
+    CHECK(browser_engine_focus_node(engine, form_test_node(engine, "next"))
+        && browser_engine_activate(engine, &action));
+    const char *body = controller_action_body(&action);
+    if (action.type != CONTROLLER_ACTION_FORM_SUBMIT
+        || strstr(body, "TTTend") == NULL)
+        fprintf(stderr, "native entries type=%d length=%zu body=%.120s\n",
+                (int) action.type, action.body_length, body);
+    CHECK(action.type == CONTROLLER_ACTION_FORM_SUBMIT
+        && strcmp(action.url, "https://form.test/step") == 0
+        && strcmp(action.method, "POST") == 0
+        && action.body_length > 5000u && strlen(body) == action.body_length
+        && strncmp(body, "identifier=a+b&token=TTT", 24) == 0
+        /* Tree order, with the button in its place, then formdata. */
+        && strstr(body, "end&action=1&tail=z&observer=obs") != NULL);
+
+    /* Enter in the field submits through the default button the same way. */
+    memset(&action, 0, sizeof(action));
+    CHECK(browser_engine_focus_node(engine, form_test_node(engine, "who"))
+        && browser_engine_activate(engine, &action)
+        && action.type == CONTROLLER_ACTION_FORM_SUBMIT
+        && strstr(controller_action_body(&action),
+                  "TTTend&action=1&tail=z&observer=obs") != NULL);
+    browser_engine_destroy(engine);
+
+    /* A cancelled submit takes no entry list and sends nothing. */
+    static const char cancelled[] =
+        "<!doctype html><form id=f method=post action='/step'>"
+        "<input name=a value=b><button id=next>Next</button></form>"
+        "<script>document.addEventListener('submit',function(e){"
+        "e.preventDefault()});</script>";
+    engine = form_test_engine(true, cancelled, sizeof(cancelled) - 1u);
+    CHECK(engine != NULL);
+    memset(&action, 0, sizeof(action));
+    CHECK(browser_engine_focus_node(engine, form_test_node(engine, "next"))
+        && browser_engine_activate(engine, &action)
+        && action.type != CONTROLLER_ACTION_FORM_SUBMIT
+        && action.activation_outcome == CONTROLLER_ACTIVATION_CANCELLED
+        && action.body_length == 0);
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+/* The inline buffer is storage, not a limit on what a form may send: a
+   script-free form carrying a long value posts it whole, and only a body past
+   the shared limit fails. */
+int test_native_form_submission_large_bodies(void)
+{
+    enum { SMALL = 6000, HUGE = 70000 };
+    static const char head[] =
+        "<!doctype html><title>Large</title><form method=post action='/step'>"
+        "<input type=hidden name=v value='";
+    static const char tail[] =
+        "'><input id=go type=submit name=go value=Go></form>";
+    size_t capacity = sizeof(head) + sizeof(tail) + HUGE;
+    char *page = malloc(capacity);
+    CHECK(page != NULL);
+    for (unsigned round = 0; round < 2; round++) {
+        size_t fill = round == 0 ? SMALL : HUGE;
+        size_t length = (size_t) snprintf(page, capacity, "%s", head);
+        memset(page + length, 'V', fill);
+        length += fill;
+        length += (size_t) snprintf(page + length, capacity - length, "%s", tail);
+        BrowserEngine *engine = form_test_engine(false, page, length);
+        CHECK(engine != NULL);
+        ControllerAction action = {0};
+        CHECK(browser_engine_focus_node(engine, form_test_node(engine, "go")));
+        bool activated = browser_engine_activate(engine, &action);
+        if (round == 0) {
+            const char *body = controller_action_body(&action);
+            if (!activated || strlen(body) != action.body_length)
+                fprintf(stderr, "large form activated=%d length=%zu\n",
+                        activated, action.body_length);
+            CHECK(activated && action.type == CONTROLLER_ACTION_FORM_SUBMIT
+                && action.body_length == 2u + SMALL + sizeof("&go=Go") - 1u
+                && strncmp(body, "v=VVV", 5) == 0
+                && strcmp(body + action.body_length - 6u, "&go=Go") == 0);
+            /* Both ways of running the action put those bytes on the wire:
+               the fixture matches only the exact body's hash. */
+            char error[256] = {0};
+            NavigationSession *navigation = browser_engine_navigation(engine);
+            CHECK(fetch_trace_replay_begin_response_keyed(
+                TILEFINCH_TEST_SOURCE_DIR "/tests/fixtures/http-form-large",
+                error, sizeof(error)));
+            bool executed = browser_engine_execute_action(
+                engine, &action, 65536, 1000);
+            if (!executed)
+                fprintf(stderr, "large form execute: %s\n",
+                        browser_engine_last_error(engine));
+            fetch_trace_end();
+            CHECK(executed && form_test_node(engine, "done") != NULL);
+            browser_engine_destroy(engine);
+            engine = form_test_engine(false, page, length);
+            CHECK(engine != NULL);
+            navigation = browser_engine_navigation(engine);
+            memset(&action, 0, sizeof(action));
+            CHECK(browser_engine_focus_node(engine, form_test_node(engine, "go"))
+                && browser_engine_activate(engine, &action));
+            CHECK(fetch_trace_replay_begin_response_keyed(
+                TILEFINCH_TEST_SOURCE_DIR "/tests/fixtures/http-form-large",
+                error, sizeof(error)));
+            CHECK(browser_engine_begin_navigation_action(
+                      engine, &action, 65536, 1000)
+                && journey_finish_navigation(engine) == 0
+                && navigation->page.loaded
+                && form_test_node(engine, "done") != NULL);
+            fetch_trace_end();
+        } else {
+            CHECK(!activated && action.form_not_sent);
+        }
+        browser_engine_destroy(engine);
+    }
+    free(page);
+    return 0;
+}
+
+/* A submit button's own attributes decide where and how the form goes. */
+int test_form_submitter_overrides(void)
+{
+    static const char page[] =
+        "<!doctype html><form id=f method=post action='/form'>"
+        "<input name=a value=1>"
+        "<button id=other formaction='/other'>O</button>"
+        "<button id=get formaction='/got' formmethod=get>G</button></form>"
+        "<form method=get action='/q'><input name=a value=1>"
+        "<button id=post formmethod=post>P</button></form>";
+    for (unsigned script = 0; script < 2; script++) {
+        BrowserEngine *engine = form_test_engine(
+            script != 0, page, sizeof(page) - 1u);
+        CHECK(engine != NULL);
+        ControllerAction action = {0};
+        CHECK(browser_engine_focus_node(engine, form_test_node(engine, "other"))
+            && browser_engine_activate(engine, &action)
+            && strcmp(action.url, "https://form.test/other") == 0
+            && strcmp(action.method, "POST") == 0);
+        CHECK(browser_engine_focus_node(engine, form_test_node(engine, "get"))
+            && browser_engine_activate(engine, &action)
+            && strcmp(action.url, "https://form.test/got?a=1") == 0
+            && strcmp(action.method, "GET") == 0);
+        CHECK(browser_engine_focus_node(engine, form_test_node(engine, "post"))
+            && browser_engine_activate(engine, &action)
+            && strcmp(action.url, "https://form.test/q") == 0
+            && strcmp(action.method, "POST") == 0
+            && strcmp(controller_action_body(&action), "a=1") == 0);
+        browser_engine_destroy(engine);
+    }
+    return 0;
+}
+
+/* Finishing the native keyboard commits the field: input, then one bubbling
+   change, and none when the text did not change. */
+int test_keyboard_commit_fires_change(void)
+{
+    static const char page[] =
+        "<!doctype html><title>T</title><form><input id=who name=n value=a>"
+        "</form><script>globalThis.seen=[];for(const type of ['input','change'])"
+        "document.addEventListener(type,function(e){"
+        "seen.push(e.type+':'+e.target.value)});</script>";
+    BrowserEngine *engine = form_test_engine(true, page, sizeof(page) - 1u);
+    CHECK(engine != NULL);
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    CHECK(browser_engine_focus_node(engine, form_test_node(engine, "who"))
+        && browser_engine_replace_text(engine, "abc", 3u)
+        && browser_engine_replace_text(engine, "abc", 3u));
+    CHECK(script_runtime_evaluate_diagnostic(navigation->page.runtime,
+        "globalThis.pocSummary=seen.join(',')",
+        "<seen>", &navigation->page.script_result));
+    if (strcmp(navigation->page.script_result.summary,
+               "input:abc,change:abc,input:abc") != 0)
+        fprintf(stderr, "keyboard commit events: %s\n",
+                navigation->page.script_result.summary);
+    CHECK(strcmp(navigation->page.script_result.summary,
+                 "input:abc,change:abc,input:abc") == 0);
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+/* HTTP 204 keeps the current document: the user stays on the page rather than
+   on a blank one, with history as it was. */
+int test_no_content_navigation_stays(void)
+{
+    static const char page[] =
+        "<!doctype html><title>Stays</title><p id=p>Still here</p>";
+    BrowserEngine *engine = form_test_engine(false, page, sizeof(page) - 1u);
+    CHECK(engine != NULL);
+    char error[256] = {0};
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    size_t history = navigation->history_count;
+    CHECK(fetch_trace_replay_begin_response_keyed(
+        TILEFINCH_TEST_SOURCE_DIR "/tests/fixtures/http-no-content",
+        error, sizeof(error)));
+    CHECK(browser_engine_begin_navigation_url(
+        engine, "http://127.0.0.1:8781/no-content", 65536, 1000, true));
+    BrowserNavigationJobStatus status = browser_engine_navigation_status(engine);
+    for (unsigned pump = 0; pump < 256
+         && status == BROWSER_NAVIGATION_JOB_PENDING; pump++)
+        status = browser_engine_pump_navigation(engine, NULL);
+    if (status != BROWSER_NAVIGATION_JOB_CANCELLED)
+        fprintf(stderr, "no content status=%d error=%s\n", (int) status,
+                browser_engine_last_error(engine));
+    CHECK(status == BROWSER_NAVIGATION_JOB_CANCELLED);
+    const NavigationEntry *current = navigation_current(navigation);
+    CHECK(navigation->page.loaded && navigation->history_count == history
+        && current != NULL && strcmp(current->url, "https://form.test/") == 0
+        && form_test_node(engine, "p") != NULL
+        && browser_engine_render_frame(engine, NULL));
+    fetch_trace_end();
+    browser_engine_destroy(engine);
+    return 0;
+}
+
 /* A module's static dependencies are requested in parallel once it
    arrives, and the synchronous graph load consumes those requests instead of
    issuing its own one at a time (chatgpt.com's serialized imports froze the

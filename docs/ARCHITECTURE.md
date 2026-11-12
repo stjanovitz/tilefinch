@@ -193,6 +193,56 @@ page work runs, is the case the check exists for. Its glyph cache is filled
 on the owning thread when faces are bound (every printable ASCII glyph at each
 UI scale in use), a miss on any other thread draws the built-in bitmap for
 that tick, and binding and filling hold the supervisor's presentation fence.
+Every modal loop on the browser thread that samples the pad and presents by
+itself (a page's alert/confirm/prompt, the keyboard for the address bar, Find,
+page fields and the developer URL, a screenshot's capture) holds the same
+fence for its life, so the supervisor neither draws over it nor reads its
+presses.
+
+The supervisor draws a copy of the UI state taken when the scope began, and
+that copy still points at browser-thread data: the HOME, Library and Find
+views, and the Library item and profile strings its rows borrow. Each write
+to that data while a scope may be active holds the same fence for the write
+alone (a view rebuild, a Library replace, rename or removal, a bookmark or
+history edit), and any Memory Stick I/O it needs (an icon read, a
+fingerprint probe, the index save) runs outside it. The library takes the
+fence through its `fence_acquire`/`fence_release` hooks. Appending a Library
+item needs none, since no row points past the count its list was built
+with. The Tabs view needs none either: no scope begins while Tabs is the
+screen, because it pauses page work and frame pumps and an action chosen
+there closes it first.
+
+A preview sheet (an offline-app preview or recompile offer, a file offer, a
+ZIP install) is freed when it is answered, and the copy can still show it: a
+pending load's navigation pump begins its scope again over whatever screen is
+up once another scope (the sheet's own preparation, say) has retired it. The
+offline store calls its `release_view` hook just before freeing a preview,
+and the PSP browser's hook takes the fence and drops the sheet from the copy,
+which then shows the page until the scope ends.
+
+A media open's scope copies the player state the same way, and that copy
+points at the session's presentation: the track and chapter labels, the
+caption row, the queue and the rotation. The session installs the fence as
+that presentation's `fence` (`PspMediaSessionPlatform.fence_acquire`), and
+each writer takes it for the store alone: the `psp_ui_media_set_*` setters
+shape text before taking it and skip it when nothing changed, and the
+session prepares track, chapter and queue rows aside before storing them in
+one step. The supervisor never writes that presentation. A press that would
+change it (the track menu, Auto next, the caption toggle's memory) first
+moves the supervisor's copy onto a private copy of the presentation
+(`psp_ui_media_update_detached`), so the press shows at once and the menu
+it opened takes Circle. Every press the copy takes is queued, whether it
+moved the copy or not (`psp_ui_media_supervisor_press`). The browser thread
+applies the queued presses to its own player state at the next refresh of
+the copy or at the scope's end, derives their actions there, and the
+refreshed copy borrows the presentation again. The actions wait in a
+two-slot mailbox (`psp_ui_media_press_queue_settle`): the newest timeline
+action (preview, seek, play/pause) goes to the session at each refresh, and
+the newest other action (a queue entry, a track, rotation, close) at the
+scope's end, so a timeline press after a command cannot replace it. Because the scope spans
+browser-loop frames, that loop takes no button edges from the pad or the
+latch while it is up (`psp_input_loop_edges`), only the stick and held
+buttons, so one press reaches the player once.
 
 ### 3. Commit complete state, never partial state
 
@@ -233,7 +283,10 @@ a candidate with stale controller or render state.
 Parsing, selector matching, scripting, layout, resource decoding, tile
 rasterization, screenshots, offline saves, and installation all run as
 bounded pumps. The main loop spends a quota, presents progress the user can
-see, and resumes from an owned continuation. Parser-blocking classic scripts
+see, and resumes from an owned continuation. A pending navigation pumps again
+within a frame while each pump makes progress of its own, for at most a 12 ms
+slice (`frame_navigation_slice_continue`); the frame still ends in its vblank
+wait, so the lower-priority I/O threads keep the rest of the interval. Parser-blocking classic scripts
 are the bounded exception: they stay synchronous, with cooperative
 checkpoints, inside the limits described in [Script admission](#script-admission).
 
@@ -569,9 +622,13 @@ WeakMap values must not retain their own keys, because this collector cannot
 reclaim that ephemeron cycle. Attr and NamedNodeMap caches and generic
 EventTarget listener tables therefore live in a private field on their owning
 node or target, so dropping the whole graph permits ordinary cycle
-collection. Nonempty namespace mirrors are the exception: the native DOM
-cannot yet reconstruct all qualified-name and namespace metadata after a
-wrapper is collected, so moving that data needs native-backed persistence.
+collection. Namespace mirrors are the exception. `setAttributeNS`, and
+`setAttribute` on a non-HTML element, record the attribute's namespace,
+prefix and qualified name as written in a WeakMap keyed by the element,
+because the native attribute is written through by qualified name alone and
+keeps no namespace or prefix. Each record names its element, so an element
+with a nonempty mirror keeps its wrapper until the realm ends; storing that
+data natively would remove the cycle.
 
 ### DOM node handles
 
@@ -580,6 +637,9 @@ slot number plus a generation, so a slot can be reused after its node is
 destroyed or its detached wrapper is collected without an old wrapper ever
 naming the new node. A live connected node keeps its slot even without a
 wrapper, because bootstrap state (listeners, observers) is keyed by handle.
+Such a wrapper can die and be remade, unless it carries an expando or is a
+WeakMap key: each collection holds those of connected nodes, so script reaches
+that state through the element. Nothing is held between collections.
 Every runtime allocates 8,192 slots at creation; the realistic profile may
 grow the table once, to 16,352, when every slot is live and no dead wrapper can
 be reclaimed. The growth is Budget-admitted like any page allocation, and a
@@ -686,6 +746,23 @@ rather than by its size ([PSP envelope](engineering/PSP_ENVELOPE.md#memory-profi
   is watchdog telemetry, not an admission oracle; per-file and count limits,
   working-set and presentation-reserve admission, the shared heap, and the
   compile/execution watchdog decide.
+- **Doomed inline scripts are dropped while they stream.** Every script
+  compile (inline, external, module, module import, inserted) is admitted by
+  the heap it can really reach (`script_runtime_heap_reachable`: the free
+  page Budget backs both the current limit and any growth, so they are not
+  added), so one that cannot compile is refused before compiling, not after
+  the compile runs out of memory. For an inline classic script the parser
+  asks the same rule as the text arrives
+  (`script_inline_source_admissible`, through
+  `document_parser_set_inline_script_admit_callback`) and drops the text of a
+  script it can no longer admit, since more text only needs more; the
+  element is then empty and the refusal is reported as pressure.
+- **Inline text is compiled in place.** A script of one text child (every
+  parsed script) compiles from the DOM's own NUL-terminated text, so its
+  compile needs no second copy of the source; nothing can change or free that
+  text before the compile returns, and QuickJS keeps no pointer into it after.
+  A script of several text children (built by DOM calls) is assembled into a
+  copy, which its admission counts.
 - **Data, not code.** Inert JSON script types stay DOM data. A narrow
   classic-script subset (`window`, `globalThis`, `var`, or bare global
   assignments of strict JSON) installs its data without compiling bytecode or
@@ -1021,9 +1098,13 @@ WebSockets reuse the same curl worker, TLS state, cookie authority, and
 `connect-src`, mixed-content, and Private Network Access decisions instead of
 a second network stack. A socket holds one bounded receive message and bounded
 outbound data, a single published receive event provides backpressure, and
-all of it is charged to the page `Budget`. The host build keeps the native
-duplex lane unavailable and tests the JavaScript lifecycle through an
-injectable seam; only the Allegrex build links curl's WS/WSS framing.
+all of it is charged to the page `Budget`. A socket's connect-only curl
+handle stays in the worker's multi until the socket closes, because removing
+it closes the connection. The host build keeps the native duplex lane
+unavailable and tests the JavaScript lifecycle through an injectable seam;
+`tilefinch-websocket-loopback-tests` compiles the worker's WebSocket code
+against a host build of the pinned curl and drives it over loopback, and
+only the Allegrex build ships curl's WS/WSS framing.
 
 Installed offline games have a separate, explicitly user-activated direct
 multiplayer lane, resembling the message portion of `RTCDataChannel`, with

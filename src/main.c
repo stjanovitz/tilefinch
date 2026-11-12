@@ -1497,13 +1497,14 @@ int main(int argc, char **argv)
            scripts.module_bytecode_restore_us);
     printf("javascript-dom-handles live=%zu peak=%zu high-water=%zu "
            "reuses=%zu exhaustions=%zu wrapper-releases=%zu "
-           "connected-preserves=%zu stale-releases=%zu capacity=%zu "
+           "connected-preserves=%zu held-wrappers=%zu stale-releases=%zu capacity=%zu "
            "growths=%zu growth-refusals=%zu\n",
            scripts.dom_handle_slots_live, scripts.dom_handle_slots_peak,
            scripts.dom_handle_slots_high_water,
            scripts.dom_handle_slot_reuses, scripts.dom_handle_exhaustions,
            scripts.dom_handle_wrapper_releases,
            scripts.dom_handle_connected_preserves,
+           scripts.dom_handle_wrappers_held_peak,
            scripts.dom_handle_stale_releases,
            scripts.dom_handle_slot_capacity,
            scripts.dom_handle_growths,

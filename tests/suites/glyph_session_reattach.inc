@@ -7,6 +7,8 @@
 
 #include "tilefinch/psp_glyph_component_session.h"
 
+#include <errno.h>
+
 static bool reattach_fixture_identity(const TilefinchInstallPaths *paths,
                                       TilefinchGlyphPack pack)
 {
@@ -26,13 +28,17 @@ static bool glyph_install_self_check_refused(
    the path a menu download takes once its package is verified. */
 static bool reattach_begin_through_session(
     PspGlyphComponentSession *session, const TilefinchInstallPaths *paths,
-    TilefinchGlyphPack pack, char package[128], bool fail_check)
+    TilefinchGlyphPack pack, char package[TILEFINCH_INSTALL_PATH_LIMIT],
+    bool fail_check)
 {
     const TilefinchGlyphPackSpec *spec = tilefinch_glyph_pack_spec(pack);
-    CHECK(spec != NULL && write_fixture(package, spec->id));
+    char fixture[128];
+    CHECK(spec != NULL && write_fixture(fixture, spec->id));
     uint8_t package_digest[32];
     uint64_t package_size = 0;
-    CHECK(hash_file(package, package_digest, &package_size));
+    CHECK(hash_file(fixture, package_digest, &package_size));
+    CHECK(stage_fixture_download(
+        paths->install_root, pack, fixture, package));
     TilefinchUpdateManifest manifest = {
         .package_format = TILEFINCH_UPDATE_PACKAGE_GLYPH,
         .package_size = package_size
@@ -47,7 +53,6 @@ static bool reattach_begin_through_session(
     CHECK(session->attached_mask == 0 && session->provider == NULL);
     session->installer = tilefinch_glyph_component_install_create(
         session->budget, &(TilefinchGlyphComponentInstallOptions) {
-            .package_path = package,
             .envelope = envelope,
             .envelope_length = sizeof(envelope),
             .manifest = &manifest,
@@ -68,7 +73,7 @@ static bool reattach_install_through_session(
     PspGlyphComponentSession *session, const TilefinchInstallPaths *paths,
     TilefinchGlyphPack pack)
 {
-    char package[128];
+    char package[TILEFINCH_INSTALL_PATH_LIMIT];
     CHECK(reattach_begin_through_session(session, paths, pack, package, false));
     for (size_t pump = 0; pump < 4096u && session->installer != NULL;
          pump++)
@@ -83,6 +88,205 @@ static bool reattach_install_through_session(
         session, TILEFINCH_GLYPH_PACK_COUNT, 1));
     CHECK(!psp_glyph_component_session_installed_at_least(
         session, (TilefinchGlyphPack) -1, 1));
+    return true;
+}
+
+/* Stands in for the transfer a host test has no HTTPS origin for. */
+static TilefinchUpdateClientPhase failure_test_phase;
+static void failure_test_client(TilefinchUpdateClientSnapshot *snapshot)
+{
+    snapshot->phase = failure_test_phase;
+    if (failure_test_phase == TILEFINCH_UPDATE_CLIENT_ERROR)
+        snprintf(snapshot->message, sizeof(snapshot->message), "%s",
+                 "SSL peer certificate was not OK");
+}
+
+static bool failure_test_message_is(PspGlyphComponentSession *session,
+                                    const char *expected)
+{
+    const char *failure = psp_glyph_component_session_take_failure(session);
+    return expected == NULL ? failure == NULL
+        : failure != NULL && strcmp(failure, expected) == 0;
+}
+
+/* The folders a Cyrillic download creates; selecting the pack (the offer's
+   size check) creates none of them. */
+static bool remove_selected_cyrillic_directories(const char *root)
+{
+    static const char *const directories[] = {
+        "components/glyph-cyrillic/candidate.tmp",
+        "components/glyph-cyrillic",
+        "components"
+    };
+    char path[TILEFINCH_INSTALL_PATH_LIMIT];
+    for (size_t at = 0; at < sizeof(directories) / sizeof(directories[0]);
+         at++) {
+        snprintf(path, sizeof(path), "%s/%s", root, directories[at]);
+        CHECK(rmdir(path) == 0 || errno == ENOENT);
+    }
+    return rmdir(root) == 0;
+}
+
+/* A failed check or download says why, whichever route started it, and says
+   so once per failure rather than every frame. */
+static bool test_glyph_session_client_failure_reported(void)
+{
+    char root[] = "/tmp/tilefinch-glyph-failure-XXXXXX";
+    CHECK(mkdtemp(root) != NULL);
+    Budget budget;
+    budget_init(&budget, 8u * 1024u * 1024u);
+    TilefinchInstallPaths paths = {.slotted = true};
+    snprintf(paths.install_root, sizeof(paths.install_root), "%s", root);
+    snprintf(paths.data_dir, sizeof(paths.data_dir), "%s", root);
+    /* Host builds may embed no root; nothing here verifies a signature. */
+    PspGlyphComponentSession session = {.root_ready = true};
+    const TilefinchGlyphPack pack = TILEFINCH_GLYPH_PACK_CYRILLIC;
+    const char *const transport = "SSL peer certificate was not OK";
+    psp_glyph_component_session_test_client = failure_test_client;
+
+    CHECK(psp_glyph_component_session_select_operation(
+        &session, &budget, &paths, pack));
+    CHECK(failure_test_message_is(&session, NULL));
+    failure_test_phase = TILEFINCH_UPDATE_CLIENT_CHECKING;
+    CHECK(psp_glyph_component_session_pump_operation(&session, &paths, NULL));
+    CHECK(failure_test_message_is(&session, NULL));
+
+    failure_test_phase = TILEFINCH_UPDATE_CLIENT_ERROR;
+    CHECK(psp_glyph_component_session_pump_operation(&session, &paths, NULL));
+    CHECK(failure_test_message_is(&session, transport));
+    CHECK(psp_glyph_component_session_pump_operation(&session, &paths, NULL));
+    CHECK(failure_test_message_is(&session, NULL));
+
+    /* X again, and the retry fails with the phase never leaving ERROR. */
+    CHECK(psp_glyph_component_session_primary(&session, &paths, NULL)
+          == PSP_GLYPH_COMPONENT_PRIMARY_CHECK_REQUIRED);
+    CHECK(failure_test_message_is(&session, transport));
+
+    /* A retry that was seen running arms the next failure too. */
+    failure_test_phase = TILEFINCH_UPDATE_CLIENT_CHECKING;
+    CHECK(psp_glyph_component_session_pump_operation(&session, &paths, NULL));
+    CHECK(failure_test_message_is(&session, NULL));
+    failure_test_phase = TILEFINCH_UPDATE_CLIENT_ERROR;
+    CHECK(psp_glyph_component_session_pump_operation(&session, &paths, NULL));
+    CHECK(failure_test_message_is(&session, transport));
+
+    psp_glyph_component_session_destroy(&session);
+    psp_glyph_component_session_test_client = NULL;
+    CHECK(remove_selected_cyrillic_directories(root));
+    CHECK(budget.current == 0);
+    return true;
+}
+
+/* A verified download whose installer cannot start used to end with nothing
+   on screen while every later frame retried the allocations and the open. It
+   now ends the attempt, gives a reason, and X retries it. */
+static bool test_glyph_session_install_refusal_reported(void)
+{
+    char root[] = "/tmp/tilefinch-glyph-refusal-XXXXXX";
+    CHECK(mkdtemp(root) != NULL);
+    Budget budget;
+    budget_init(&budget, 8u * 1024u * 1024u);
+    TilefinchInstallPaths paths = {.slotted = true};
+    snprintf(paths.install_root, sizeof(paths.install_root), "%s", root);
+    snprintf(paths.data_dir, sizeof(paths.data_dir), "%s", root);
+    PspGlyphComponentSession session = {.root_ready = true};
+    psp_glyph_component_session_test_client = failure_test_client;
+    /* This client has no verified envelope, so the installer refuses. */
+    failure_test_phase = TILEFINCH_UPDATE_CLIENT_DOWNLOADED;
+
+    CHECK(psp_glyph_component_session_select_operation(
+        &session, &budget, &paths, TILEFINCH_GLYPH_PACK_CYRILLIC));
+    session.auto_install = true;
+    CHECK(psp_glyph_component_session_pump_operation(&session, &paths, NULL));
+    CHECK(session.installer == NULL && !session.auto_install
+          && session.install_refused);
+    CHECK(!psp_glyph_component_session_active(&session));
+    const char *const refused = "FONT PACK INSTALL COULD NOT START";
+    CHECK(failure_test_message_is(&session, refused));
+    CHECK(psp_glyph_component_session_pump_operation(&session, &paths, NULL));
+    CHECK(failure_test_message_is(&session, NULL));
+
+    CHECK(psp_glyph_component_session_primary(&session, &paths, NULL)
+          == PSP_GLYPH_COMPONENT_PRIMARY_NONE);
+    CHECK(failure_test_message_is(&session, refused));
+
+    /* Reselecting starts over with nothing to report. */
+    CHECK(psp_glyph_component_session_select_operation(
+        &session, &budget, &paths, TILEFINCH_GLYPH_PACK_CYRILLIC));
+    CHECK(!session.install_refused);
+    CHECK(failure_test_message_is(&session, NULL));
+
+    psp_glyph_component_session_destroy(&session);
+    psp_glyph_component_session_test_client = NULL;
+    CHECK(remove_selected_cyrillic_directories(root));
+    CHECK(budget.current == 0);
+    return true;
+}
+
+/* The generic "unavailable" notice hid which of two different problems the
+   user has: memory on a heavy page, or a Memory Stick refusing the folder. */
+static bool test_glyph_session_select_failure_reasons(void)
+{
+    char root[] = "/tmp/tilefinch-glyph-select-XXXXXX";
+    CHECK(mkdtemp(root) != NULL);
+    Budget budget;
+    budget_init(&budget, 8u * 1024u * 1024u);
+    TilefinchInstallPaths paths = {.slotted = true};
+    snprintf(paths.install_root, sizeof(paths.install_root), "%s/blocked", root);
+    snprintf(paths.data_dir, sizeof(paths.data_dir), "%s", root);
+    FILE *blocker = fopen(paths.install_root, "wb");
+    CHECK(blocker != NULL && fclose(blocker) == 0);
+    PspGlyphComponentSession session = {.root_ready = true};
+    const TilefinchGlyphPack pack = TILEFINCH_GLYPH_PACK_CYRILLIC;
+    CHECK(psp_glyph_component_session_select_failure(&session) == NULL);
+    /* IS-13: selecting (what the offer's size check does) writes nothing,
+       so a card that refuses the folder is found when the download
+       begins. */
+    CHECK(psp_glyph_component_session_select_operation(
+        &session, &budget, &paths, pack));
+    psp_glyph_component_session_test_client = failure_test_client;
+    failure_test_phase = TILEFINCH_UPDATE_CLIENT_AVAILABLE;
+    CHECK(psp_glyph_component_session_primary(&session, &paths, NULL)
+          == PSP_GLYPH_COMPONENT_PRIMARY_NONE);
+    psp_glyph_component_session_test_client = NULL;
+    CHECK(session.install_refused && !session.auto_install
+          && failure_test_message_is(
+                 &session, "FONT PACK FOLDER COULD NOT BE CREATED"));
+    const char *reason = NULL;
+
+    Budget tight;
+    budget_init(&tight, 1024u);
+    CHECK(remove(paths.install_root) == 0);
+    snprintf(paths.install_root, sizeof(paths.install_root), "%s", root);
+    CHECK(!psp_glyph_component_session_select_operation(
+        &session, &tight, &paths, pack));
+    reason = psp_glyph_component_session_select_failure(&session);
+    CHECK(reason != NULL
+          && strcmp(reason, "NOT ENOUGH MEMORY FOR FONT PACK") == 0);
+    CHECK(tight.current == 0);
+
+    CHECK(psp_glyph_component_session_select_operation(
+        &session, &budget, &paths, pack));
+    CHECK(psp_glyph_component_session_select_failure(&session) == NULL);
+    char component[TILEFINCH_INSTALL_PATH_LIMIT];
+    snprintf(component, sizeof(component), "%s/components", root);
+    CHECK(access(component, F_OK) != 0);
+
+    /* The download lands in the directory the installer stages in, and
+       nothing goes in the data directory: PPSSPP's rename cannot move a file
+       between directories, and the firmware's has never been shown to. */
+    char expected[TILEFINCH_INSTALL_PATH_LIMIT];
+    snprintf(expected, sizeof(expected),
+             "%s/components/glyph-cyrillic/candidate.tmp/glyph-component.part",
+             root);
+    CHECK(strcmp(session.package_path, expected) == 0);
+    char cleanup[TILEFINCH_INSTALL_PATH_LIMIT];
+    snprintf(cleanup, sizeof(cleanup), "%s/update", root);
+    CHECK(access(cleanup, F_OK) != 0);
+
+    psp_glyph_component_session_destroy(&session);
+    CHECK(remove_selected_cyrillic_directories(root));
+    CHECK(budget.current == 0);
     return true;
 }
 
@@ -284,7 +488,7 @@ static bool test_glyph_session_install_retirement(unsigned mode)
         &session, &budget, &paths, BROWSER_GLYPH_LANGUAGE_CYRILLIC,
         BROWSER_GLYPH_LANGUAGE_EMBEDDED, false));
     CHECK(session.attached_mask == bit && session.provider != NULL);
-    char package[128];
+    char package[TILEFINCH_INSTALL_PATH_LIMIT];
     CHECK(reattach_begin_through_session(
         &session, &paths, pack, package, mode == 2u));
     CHECK(psp_glyph_component_session_active(&session));
@@ -307,6 +511,15 @@ static bool test_glyph_session_install_retirement(unsigned mode)
     CHECK(session.install_snapshot.phase == (mode == 2u
           ? TILEFINCH_UPDATE_INSTALL_ERROR : TILEFINCH_UPDATE_INSTALL_CANCELLED));
     CHECK(session.installer != NULL && session.reattach_pending);
+    /* A failure gives its reason, once; a cancellation the user asked for is
+       not a failure. */
+    const char *reason = psp_glyph_component_session_take_failure(&session);
+    if (mode == 2u)
+        CHECK(reason != NULL
+              && strcmp(reason, "FONT PACK SELF-CHECK FAILED") == 0);
+    else
+        CHECK(reason == NULL);
+    CHECK(psp_glyph_component_session_take_failure(&session) == NULL);
     CHECK(psp_glyph_component_session_reattach(
         &session, &budget, &paths, BROWSER_GLYPH_LANGUAGE_CYRILLIC,
         BROWSER_GLYPH_LANGUAGE_EMBEDDED, false, 0, NULL));
@@ -327,5 +540,70 @@ static bool test_glyph_session_install_retirement(unsigned mode)
     snprintf(cleanup, sizeof(cleanup), "%s/components", root);
     CHECK(rmdir(cleanup) == 0 && rmdir(root) == 0);
     CHECK(budget.current == 0);
+    return true;
+}
+
+/* A page in a script whose pack is installed but not selected attaches that
+   pack while the page is open. Mode 0: another language is selected. Mode 1:
+   no language is selected. Mode 2: boot saw unslotted paths (a PSPLink host0
+   run) and slotted paths arrive later, as the validation replay seam gives
+   them; boot's refusal must not leave the session unable to attach. */
+static bool test_glyph_session_lazy_attach(unsigned mode)
+{
+    char root[] = "/tmp/tilefinch-glyph-lazy-XXXXXX";
+    CHECK(mkdtemp(root) != NULL);
+    Budget budget;
+    budget_init(&budget, 8u * 1024u * 1024u);
+    TilefinchInstallPaths paths = {.slotted = true};
+    snprintf(paths.install_root, sizeof(paths.install_root), "%s", root);
+    TilefinchInstallPaths host0 = paths;
+    host0.slotted = false;
+    psp_glyph_component_session_test_identity = reattach_fixture_identity;
+    static PspGlyphComponentSession session;
+    memset(&session, 0, sizeof(session));
+    const TilefinchGlyphPack packs[2] = {
+        TILEFINCH_GLYPH_PACK_CYRILLIC, TILEFINCH_GLYPH_PACK_HEBREW};
+    const uint16_t cyrillic = 1u << TILEFINCH_GLYPH_PACK_CYRILLIC;
+    const uint16_t hebrew = 1u << TILEFINCH_GLYPH_PACK_HEBREW;
+    for (size_t at = 0; at < 2u; at++)
+        CHECK(install_test_generation(&budget, root, packs[at], false));
+
+    BrowserGlyphLanguage selected = mode == 0u
+        ? BROWSER_GLYPH_LANGUAGE_CYRILLIC : BROWSER_GLYPH_LANGUAGE_EMBEDDED;
+    if (mode == 2u) {
+        CHECK(!psp_glyph_component_session_attach_selected(
+            &session, &budget, &host0, BROWSER_GLYPH_LANGUAGE_CYRILLIC,
+            BROWSER_GLYPH_LANGUAGE_EMBEDDED, false));
+        CHECK(session.attached_mask == 0 && session.provider == NULL);
+    } else {
+        CHECK(psp_glyph_component_session_attach_selected(
+            &session, &budget, &paths, selected,
+            BROWSER_GLYPH_LANGUAGE_EMBEDDED, false));
+        CHECK(session.attached_mask == (mode == 0u ? cyrillic : 0u));
+    }
+
+    CHECK(psp_glyph_component_session_attach_hinted(
+        &session, &paths, DOCUMENT_GLYPH_SCRIPT_HEBREW, NULL));
+    CHECK((session.attached_mask & hebrew) != 0 && session.provider != NULL);
+    CHECK(session.attached_mask
+          == (uint16_t) (hebrew | (mode == 0u ? cyrillic : 0u)));
+    /* Once per script: a second hint for the same page does nothing. */
+    CHECK(!psp_glyph_component_session_attach_hinted(
+        &session, &paths, DOCUMENT_GLYPH_SCRIPT_HEBREW, NULL));
+
+    psp_glyph_component_session_destroy(&session);
+    psp_glyph_component_session_test_identity = NULL;
+    for (size_t at = 0; at < 2u; at++) {
+        const TilefinchGlyphPackSpec *spec = tilefinch_glyph_pack_spec(packs[at]);
+        CHECK(tilefinch_glyph_component_remove(&paths, packs[at]));
+        char cleanup[TILEFINCH_INSTALL_PATH_LIMIT];
+        snprintf(cleanup, sizeof(cleanup), "%s/components/%s/UNINSTALLED", root, spec->id);
+        CHECK(unlink(cleanup) == 0);
+        snprintf(cleanup, sizeof(cleanup), "%s/components/%s", root, spec->id);
+        CHECK(rmdir(cleanup) == 0);
+    }
+    char cleanup[TILEFINCH_INSTALL_PATH_LIMIT];
+    snprintf(cleanup, sizeof(cleanup), "%s/components", root);
+    CHECK(rmdir(cleanup) == 0 && rmdir(root) == 0 && budget.current == 0);
     return true;
 }

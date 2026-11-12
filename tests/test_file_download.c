@@ -3,6 +3,8 @@
 #include "tilefinch/sha256.h"
 #include "tilefinch/platform.h"
 
+#include "supervisor_view_probe.h"
+
 #include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -440,12 +442,26 @@ static bool confirmation(const char *directory, const char *corpus)
     CHECK(psp_offline_store_offer_file(&store, engine, URL));
     CHECK(store.library.count == 0 && !offline_download_manager_active(&store.download, NULL));
     CHECK(psp_offline_store_file_preview(&store) != NULL);
+    /* A supervisor scope begun over the sheet (a pending load's pump) shows
+       it; declining frees the offer, so the copy lets go of it first. */
+    PspUiState live; psp_ui_init(&live);
+    const PspUiFileDownloadPreview *sheet = psp_offline_store_file_preview(&store);
+    psp_ui_show_file_download(&live, sheet);
+    view_probe_begin(&store, &live);
     psp_offline_store_discard_file(&store);
+    CHECK(view_probe_present(sheet) && view_probe.dropped == 1u);
+    view_probe_end(&store);
     CHECK(psp_offline_store_file_preview(&store) == NULL && store.library.count == 0);
     CHECK(!strcmp(navigation_current(browser_engine_navigation(engine))->url, "https://downloads.example.test/"));
     CHECK(psp_offline_store_offer_file(&store, engine, URL));
     CHECK(trace(corpus, 42, 0, 200, "\"one\"", NULL, true));
+    /* Accepting consumes the offer the same way. */
+    sheet = psp_offline_store_file_preview(&store);
+    psp_ui_show_file_download(&live, sheet);
+    view_probe_begin(&store, &live);
     CHECK(psp_offline_store_accept_file(&store) && store.library.count == 1);
+    CHECK(view_probe_present(sheet) && view_probe.dropped == 1u);
+    view_probe_end(&store);
     CHECK(!psp_offline_store_accept_file(&store)); /* Confirmation is consumed. */
     for (unsigned i = 0; i < 100 && offline_download_manager_active(&store.download, NULL); i++)
         (void) psp_offline_store_pump(&store);
@@ -552,6 +568,37 @@ static bool extensionless_navigation(const char *corpus)
     CHECK(status == BROWSER_NAVIGATION_JOB_CANCELLED);
     CHECK(browser_engine_take_download_offer(engine, url, sizeof(url), name, sizeof(name)));
     CHECK(!strcmp(url, trace_url) && !strcmp(name, "download.bin"));
+    fetch_trace_end(); trace_url = URL; browser_engine_destroy(engine);
+    return true;
+}
+
+/* A navigation that answers MPEG audio is handed to the native audio
+   player: no body is parsed, no history entry is made, and it is not a
+   file to save. */
+static bool audio_navigation(const char *corpus)
+{
+    BrowserConfig config; browser_config_init(&config, NULL);
+    config.javascript.enabled = false; config.resources.enabled = false;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL);
+    static const char page[] = "<!doctype html><title>Radio</title><a href='/listen'>Listen</a>";
+    CHECK(browser_engine_commit_html(engine, "https://radio.example.test/", page, sizeof(page)-1, true));
+    size_t history = browser_engine_navigation(engine)->history_count;
+    trace_url = "https://radio.example.test/listen";
+    CHECK(trace(corpus, 4096, 0, 200, "\"one\"", "content-type: audio/mpeg", false));
+    CHECK(browser_engine_begin_navigation_url(engine, trace_url, 1048576, 1000, true));
+    BrowserNavigationJobStatus status = BROWSER_NAVIGATION_JOB_PENDING;
+    for (unsigned i = 0; i < 1000 && status == BROWSER_NAVIGATION_JOB_PENDING; i++)
+        status = browser_engine_pump_navigation(engine, NULL);
+    CHECK(status == BROWSER_NAVIGATION_JOB_CANCELLED);
+    CHECK(browser_engine_navigation(engine)->history_count == history);
+    CHECK(!strcmp(navigation_current(browser_engine_navigation(engine))->url, "https://radio.example.test/"));
+    char url[2048], name[128];
+    CHECK(!browser_engine_take_download_offer(engine, url, sizeof(url), name, sizeof(name)));
+    CHECK(browser_engine_take_media_audio_offer(engine, url, sizeof(url))
+          && !strcmp(url, trace_url));
+    CHECK(!browser_engine_take_media_audio_offer(engine, url, sizeof(url)));
     fetch_trace_end(); trace_url = URL; browser_engine_destroy(engine);
     return true;
 }
@@ -725,7 +772,8 @@ int main(int argc, char **argv)
         ? live_source_journey(directory, argv[2], argv[3], argv[4])
         : argc == 1 && filenames() && transfers(directory, corpus)
             && restart_speed(directory, corpus) && confirmation(directory, corpus)
-            && link_activation() && extensionless_navigation(corpus);
+            && link_activation() && extensionless_navigation(corpus)
+            && audio_navigation(corpus);
     fetch_trace_end(); clean(directory); clean(corpus);
     return okay ? 0 : 1;
 }

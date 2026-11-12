@@ -71,10 +71,15 @@ void psp_media_request_user_retry(PspMediaSession *media)
         media->ui.retry_unavailable = true;
         return;
     }
+    /* The failed open's own play intent. Its pipeline records it as a
+       continuation; an open that failed before it built one -- a resolve or
+       probe failure, or the unencrypted-audio question -- has nothing to
+       record, and its Retry still answers the press that started it. */
+    bool resume_playing = media->ui.playing
+        || media->machine.resume_target == PSP_MEDIA_RESUME_PLAYING;
     if (!psp_media_continuation_reopening(&media->continuation)
         && media->playback != NULL)
-        psp_media_remember_retry_state(media, media->ui.playing
-            || media->machine.resume_target == PSP_MEDIA_RESUME_PLAYING);
+        psp_media_remember_retry_state(media, resume_playing);
     /* Terminal panels historically retained a paused pipeline and could
        leave the controller Playing. RETRY is valid only from Failed. Retire
        any retained/partial owner before opening a new generation, instead
@@ -95,10 +100,12 @@ void psp_media_request_user_retry(PspMediaSession *media)
     media->open_service_pending = true;
     psp_media_session_dispatch_event(media, (PspMediaEvent) {
         .type = PSP_MEDIA_EVENT_OPEN,
-        .autoplay = psp_media_continuation_resume_playing(&media->continuation),
+        .autoplay = psp_media_continuation_reopening(&media->continuation)
+            ? media->continuation.playing : resume_playing,
         .audio_only = media->audio_only
     }, "retry-intent");
-    psp_ui_media_set_resolving(&media->ui, "Opening video");
+    psp_ui_media_set_resolving(
+        &media->ui, psp_media_resolving_title(media, "Opening video"));
 }
 
 bool psp_media_prepare_open_network(PspMediaSession *media, bool begin)

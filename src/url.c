@@ -242,21 +242,54 @@ bool tilefinch_url_potentially_trustworthy(const char *value)
             && ascii_equal_ci(host + length - 9, "localhost", 9))) {
         return true;
     }
-    /* Restrict the development exception to a syntactically valid IANA
-       loopback /8 address, not private networks or names beginning "127.". */
-    return length >= 7 && host[0] == '1' && host[1] == '2'
-        && host[2] == '7' && host[3] == '.'
-        && ipv4_tail_valid(value, url.host_offset,
-                           url.host_offset + url.host_length);
+    /* Restrict the development exception to an address in the IANA
+       loopback /8, not private networks or names beginning "127.". The
+       address is read the way the resolver reads it, so 2130706433 and
+       0x7f.1 count and 127.evil does not. */
+    unsigned char address[4];
+    return tilefinch_host_ipv4(host, length, address)
+            == TILEFINCH_HOST_IPV4_ADDRESS
+        && address[0] == 127u;
+}
+
+/* A host as the URL Standard serializes it: an IPv4 address in
+   dotted-quad form however it is spelled (127.1, 0x7f.0.0.1 and
+   2130706433 are all 127.0.0.1), so origins, site keys and cookie scopes
+   are per address rather than per spelling. Any other host is returned
+   as written; callers compare or lowercase it as before. */
+typedef struct {
+    char storage[16];
+    const char *value;
+    size_t length;
+} UrlHostView;
+
+static void url_host_view(const TilefinchUrl *url, UrlHostView *view)
+{
+    view->value = url->value + url->host_offset;
+    view->length = url->host_length;
+    unsigned char address[4];
+    if (url->ipv6_literal
+        || tilefinch_host_ipv4(view->value, view->length, address)
+               != TILEFINCH_HOST_IPV4_ADDRESS) return;
+    int written = snprintf(view->storage, sizeof(view->storage),
+                           "%u.%u.%u.%u", (unsigned) address[0],
+                           (unsigned) address[1], (unsigned) address[2],
+                           (unsigned) address[3]);
+    if (written <= 0 || (size_t) written >= sizeof(view->storage)) return;
+    view->value = view->storage;
+    view->length = (size_t) written;
 }
 
 static bool same_origin_view(const TilefinchUrl *left, const TilefinchUrl *right)
 {
-    return left->scheme == right->scheme && left->port == right->port
-        && left->host_length == right->host_length
-        && ascii_equal_ci(left->value + left->host_offset,
-                          right->value + right->host_offset,
-                          left->host_length);
+    if (left->scheme != right->scheme || left->port != right->port)
+        return false;
+    UrlHostView left_host, right_host;
+    url_host_view(left, &left_host);
+    url_host_view(right, &right_host);
+    return left_host.length == right_host.length
+        && ascii_equal_ci(left_host.value, right_host.value,
+                          left_host.length);
 }
 
 bool tilefinch_url_same_origin(const char *left, const char *right)
@@ -322,10 +355,13 @@ static bool url_origin_from_parsed(const char *value, const TilefinchUrl *url,
     output[0] = '\0';
     const char *scheme = url->scheme == TILEFINCH_URL_SCHEME_HTTPS
                          ? "https://" : "http://";
+    (void) value;
+    UrlHostView host;
+    url_host_view(url, &host);
     if (!append_bytes(output, output_size, &used, scheme, strlen(scheme),
                       false)
         || !append_bytes(output, output_size, &used,
-                         value + url->host_offset, url->host_length, true)) {
+                         host.value, host.length, true)) {
         return false;
     }
     if (url->port != default_port(url->scheme)) {
@@ -563,12 +599,12 @@ bool tilefinch_url_site_key(const char *value, char *output, size_t output_size)
     if (value == NULL || output == NULL || output_size == 0) return false;
     TilefinchUrl url;
     if (!tilefinch_url_parse(value, &url) || url.host_length > 253) return false;
+    UrlHostView view;
+    url_host_view(&url, &view);
     char host[254];
-    for (size_t i = 0; i < url.host_length; i++) {
-        host[i] = (char) tolower(
-            (unsigned char) value[url.host_offset + i]);
-    }
-    host[url.host_length] = '\0';
+    for (size_t i = 0; i < view.length; i++)
+        host[i] = (char) tolower((unsigned char) view.value[i]);
+    host[view.length] = '\0';
     char registrable[254];
     const char *site_host = tilefinch_registrable_domain(
         host, registrable, sizeof(registrable)) ? registrable : host;
@@ -616,6 +652,92 @@ bool tilefinch_host_within(const char *host, size_t host_length,
     const char *tail = host + host_length - domain_length;
     return strncasecmp(tail, domain, domain_length) == 0
         && (tail == host || tail[-1] == '.');
+}
+
+/* One IPv4 part as the URL Standard's "IPv4 number" parser reads it: 0x/0X
+   is hexadecimal (an empty remainder is 0), a leading 0 is octal, anything
+   else decimal. Values past UINT32_MAX saturate and set *overflow. */
+static bool host_ipv4_part(const char *part, size_t length,
+                           uint32_t *value, bool *overflow)
+{
+    uint32_t radix = 10u;
+    size_t at = 0;
+    if (length >= 2u && part[0] == '0'
+        && (part[1] == 'x' || part[1] == 'X')) {
+        radix = 16u;
+        at = 2u;
+    } else if (length >= 2u && part[0] == '0') {
+        radix = 8u;
+        at = 1u;
+    }
+    uint32_t result = 0;
+    *overflow = false;
+    for (; at < length; at++) {
+        int digit = tilefinch_hex_digit((unsigned char) part[at]);
+        if (digit < 0 || (uint32_t) digit >= radix) return false;
+        if (*overflow) continue;
+        if (result > (UINT32_MAX - (uint32_t) digit) / radix) {
+            *overflow = true;
+            continue;
+        }
+        result = result * radix + (uint32_t) digit;
+    }
+    *value = result;
+    return true;
+}
+
+TilefinchHostIpv4 tilefinch_host_ipv4(const char *host, size_t host_length,
+                                      unsigned char address[4])
+{
+    if (host == NULL || host_length == 0) return TILEFINCH_HOST_IPV4_NAME;
+    size_t end = host_length;
+    /* The URL Standard ignores one trailing empty label ("1.2.3.4."). */
+    if (end > 1u && host[end - 1u] == '.') end--;
+    size_t last = end;
+    while (last > 0 && host[last - 1u] != '.') last--;
+    if (last == end) return TILEFINCH_HOST_IPV4_NAME;
+    bool digits_only = true;
+    for (size_t i = last; i < end; i++) {
+        if (!isdigit((unsigned char) host[i])) digits_only = false;
+    }
+    uint32_t ignored;
+    bool ignored_overflow;
+    if (!digits_only
+        && !(end - last >= 2u && host[last] == '0'
+             && (host[last + 1u] == 'x' || host[last + 1u] == 'X')
+             && host_ipv4_part(host + last, end - last, &ignored,
+                               &ignored_overflow))) {
+        return TILEFINCH_HOST_IPV4_NAME;
+    }
+    uint32_t parts[4];
+    size_t count = 0;
+    size_t at = 0;
+    while (at <= end) {
+        size_t part_end = at;
+        while (part_end < end && host[part_end] != '.') part_end++;
+        bool overflow = false;
+        if (count == 4u || part_end == at
+            || !host_ipv4_part(host + at, part_end - at,
+                               &parts[count], &overflow)
+            || overflow) return TILEFINCH_HOST_IPV4_INVALID;
+        count++;
+        at = part_end + 1u;
+    }
+    uint32_t value = parts[count - 1u];
+    for (size_t i = 0; i + 1u < count; i++) {
+        if (parts[i] > 255u) return TILEFINCH_HOST_IPV4_INVALID;
+        value |= parts[i] << (24u - 8u * (uint32_t) i);
+    }
+    /* The last part fills the remaining 8 * (5 - count) bits. */
+    if (count > 1u && parts[count - 1u] >> (8u * (5u - (uint32_t) count)) != 0)
+        return TILEFINCH_HOST_IPV4_INVALID;
+    if (address != NULL) {
+        address[0] = (unsigned char) (value >> 24);
+        address[1] = (unsigned char) (value >> 16);
+        address[2] = (unsigned char) (value >> 8);
+        address[3] = (unsigned char) value;
+    }
+    return TILEFINCH_HOST_IPV4_ADDRESS;
 }
 
 int tilefinch_hex_digit(unsigned char c)

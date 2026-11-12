@@ -865,9 +865,15 @@ static bool runtime_dispatch_image_load(ScriptRuntime *runtime, bool *dispatched
             state->delivered = true;
             continue;
         }
-        if (node == NULL || !image_resource_available(image)
-            || image->source_hash != state->source_hash
-            || !image_resource_source_current(runtime->bridge.stylesheet, image))
+        /* Made way for another image before its event ran: it still loaded. */
+        int width = 0, height = 0;
+        if (node == NULL
+            || (image_resource_available(image)
+                ? image->source_hash != state->source_hash
+                  || !image_resource_source_current(
+                         runtime->bridge.stylesheet, image)
+                : !js_rt_image_load_remembered(
+                      &runtime->bridge, node, &width, &height)))
             continue;
         state->delivered = true;
         JSValue arguments[2] = {JS_NewInt64(runtime->context, state->handle),

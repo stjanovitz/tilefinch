@@ -21,6 +21,10 @@ import statistics
 METRICS = [
     ("first paint ms", "timing.first_paint_ms", "T"),
     ("loaded ms", "timing.loaded_ms", "T"),
+    # --pending-load runs only.
+    ("first content ms", "timing.first_content_ms", "T"),
+    ("first text ms", "timing.first_text_ms", "T"),
+    ("reading hint ms", "timing.reading_hint_ms", "T"),
     ("longest step ms", "timing.longest_step_ms", "T"),
     ("relayouts", "timing.relayouts", "T"),
     ("relayout ms", "timing.relayout_ms", "T"),

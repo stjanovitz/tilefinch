@@ -462,3 +462,123 @@ cleanup:
     }
     return ok;
 }
+
+/* A live collection's memo never outlives the script run that made it:
+   the parser (and the host) can change the tree between two parser
+   scripts without a script mutation, so the next script reads afresh even
+   when no DOM version moved, while repeated reads inside one run do not. */
+/* An insertion prepares only the scripts it connected (the inserted
+   subtrees, or the parent script whose children changed), and finds them
+   without walking the receiver's existing children. */
+static bool test_insertion_prepares_only_inserted_scripts(Budget *budget)
+{
+    const char *test_name = "insertion prepares only inserted scripts";
+    static const char page[] =
+        "<!doctype html><body><div id=rows></div><script>"
+        "const rows=document.getElementById('rows');"
+        "for(let i=0;i<200;i++)rows.appendChild(document.createElement('p'));"
+        "globalThis.order='';"
+        "const script=(code)=>{const s=document.createElement('script');"
+        "s.textContent=code;return s;};"
+        "const inert=script('order+=\"x\"');inert.type='text/x-template';"
+        "document.body.appendChild(inert);"
+        "for(let i=0;i<200;i++){const row=document.createElement('div');"
+        "row.appendChild(document.createElement('span'));"
+        "document.body.appendChild(row);}"
+        "const fragment=document.createDocumentFragment();"
+        "fragment.appendChild(document.createElement('i'));"
+        "fragment.appendChild(script('order+=\"a\"'));"
+        "fragment.appendChild(script('order+=\"b\"'));"
+        "document.body.appendChild(fragment);"
+        "const empty=document.createElement('script');"
+        "document.body.appendChild(empty);"
+        "empty.appendChild(document.createTextNode('order+=\"c\"'));"
+        "const before=document.createDocumentFragment();"
+        "before.appendChild(script('order+=\"d\"'));"
+        "document.body.insertBefore(before,rows);"
+        "const wrapper=document.createElement('div');"
+        "wrapper.appendChild(script('order+=\"e\"'));"
+        "document.body.insertBefore(wrapper,rows);"
+        "inert.type='';document.body.appendChild(document.createElement('hr'));"
+        "rows.appendChild(document.createElement('p'));"
+        "globalThis.pocSummary='order:'+order;"
+        "</script></body>";
+    BrowserSession browser = {0};
+    NavigationSession navigation = {0};
+    bool browser_ready = false, navigation_ready = false, ok = true;
+
+    REQUIRE(browser_session_init(&browser, budget, 256u * 1024u));
+    browser_ready = true;
+    REQUIRE(start_custom_runtime_page(
+        &navigation, budget, &browser, "https://insert-scope.test/",
+        page, 8, 64u * 1024u, 32u * 1024u));
+    navigation_ready = true;
+    size_t advances = 0;
+    /* The inert script stays unstarted: changing its type and appending
+       an unrelated node does not prepare it ("x" absent). */
+    if (!advance_until(&navigation, "order:abcde", 4, &advances))
+        fprintf(stderr, "%s: summary \"%s\"\n", test_name,
+                navigation.page.script_result.summary);
+    REQUIRE(strcmp(navigation.page.script_result.summary,
+                   "order:abcde") == 0);
+    /* 400 appends beside a pending script walk nothing; each insertion
+       that connects scripts walks its own nodes only. */
+    size_t scanned = navigation.page.script_result.dynamic_script_scan_nodes;
+    if (scanned > 16u)
+        fprintf(stderr, "%s: scanned %zu nodes\n", test_name, scanned);
+    REQUIRE(scanned <= 16u);
+
+cleanup:
+    if (navigation_ready) navigation_destroy(&navigation);
+    if (browser_ready) browser_session_destroy(&browser);
+    if (budget->current != 0) {
+        fprintf(stderr, "%s leaked %zu owned bytes\n", test_name,
+                budget->current);
+        ok = false;
+    }
+    return ok;
+}
+
+static bool test_live_collection_memo_ends_with_script_run(Budget *budget)
+{
+    const char *test_name = "live collection memo ends with the script run";
+    static const char page[] =
+        "<!doctype html><head></head><body><p>one</p><p>two</p><script>"
+        "globalThis.stats=__tilefinchRetentionStats;"
+        "globalThis.paragraphs=document.getElementsByTagName('p');"
+        "globalThis.reads=[stats.liveCollectionReads];"
+        "for(let i=0;i<paragraphs.length;i++)paragraphs[i].textContent;"
+        "reads.push(stats.liveCollectionReads);"
+        "</script><script>"
+        "paragraphs.length;paragraphs[1];reads.push(stats.liveCollectionReads);"
+        "globalThis.pocSummary='reads:'+reads.map(n=>n-reads[0]).join()+"
+        "':'+paragraphs.length;"
+        "</script></body>";
+    BrowserSession browser = {0};
+    NavigationSession navigation = {0};
+    bool browser_ready = false, navigation_ready = false, ok = true;
+
+    REQUIRE(browser_session_init(&browser, budget, 256u * 1024u));
+    browser_ready = true;
+    REQUIRE(start_custom_runtime_page(
+        &navigation, budget, &browser, "https://memo-run.test/",
+        page, 8, 64u * 1024u, 32u * 1024u));
+    navigation_ready = true;
+    size_t advances = 0;
+    if (!advance_until(&navigation, "reads:0,1,2:2", 4,
+                       &advances))
+        fprintf(stderr, "%s: summary \"%s\"\n", test_name,
+                navigation.page.script_result.summary);
+    REQUIRE(strcmp(navigation.page.script_result.summary,
+                   "reads:0,1,2:2") == 0);
+
+cleanup:
+    if (navigation_ready) navigation_destroy(&navigation);
+    if (browser_ready) browser_session_destroy(&browser);
+    if (budget->current != 0) {
+        fprintf(stderr, "%s leaked %zu owned bytes\n", test_name,
+                budget->current);
+        ok = false;
+    }
+    return ok;
+}

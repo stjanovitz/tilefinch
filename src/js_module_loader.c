@@ -966,6 +966,22 @@ static bool runtime_import_map_parse(ScriptRuntime *runtime,
     return okay;
 }
 
+/* Whether a connected import map script came from the document's own
+   parser. Fragment-parsed scripts (innerHTML, insertAdjacentHTML) are
+   "already started" and never register a map, as in browsers; maps are
+   read once, at the first module resolution, and only from parser
+   scripts, so script-inserted and cloned ones (programmatic) never count.
+   A parser script has no element state, or the non-programmatic state
+   evaluate_scripts or a retype gave it. */
+static bool runtime_import_map_parser_inserted(ScriptRuntime *runtime,
+                                               const lxb_dom_node_t *node)
+{
+    const ScriptElementState *state =
+        js_rt_script_element_state_find(&runtime->bridge, node);
+    if (state == NULL) return !runtime->bridge.fragment_script_state_overflow;
+    return !state->programmatic && !state->fragment_parsed;
+}
+
 static void runtime_import_map_prepare(ScriptRuntime *runtime)
 {
     if (runtime->import_map_prepared) return;
@@ -991,6 +1007,7 @@ static void runtime_import_map_prepare(ScriptRuntime *runtime)
             && type_length == 9 && type != NULL && strncasecmp(type, "importmap", 9) == 0
             && !lxb_dom_element_has_attribute(lxb_dom_interface_element(node),
                 (const lxb_char_t *) "src", 3)
+            && runtime_import_map_parser_inserted(runtime, node)
             && tilefinch_csp_allows_inline_script(
                 &runtime->document->content_security_policy, node)) {
             if (++maps > 32) {

@@ -518,15 +518,15 @@ static int test_state_and_streaming_hash(void)
 
     TilefinchUpdateSlot boot_slot = TILEFINCH_UPDATE_SLOT_NONE;
     CHECK(tilefinch_update_boot_decide(
-              &first, true, true, &boot_slot)
+              &first, true, true, false, &boot_slot)
               == TILEFINCH_UPDATE_BOOT_ACTIVE
           && boot_slot == TILEFINCH_UPDATE_SLOT_A);
     CHECK(tilefinch_update_boot_decide(
-              &second, false, false, &boot_slot)
+              &second, false, false, false, &boot_slot)
               == TILEFINCH_UPDATE_BOOT_RECOVERY
           && boot_slot == TILEFINCH_UPDATE_SLOT_A);
     CHECK(tilefinch_update_boot_decide(
-              &second, false, true, &boot_slot)
+              &second, false, true, false, &boot_slot)
               == TILEFINCH_UPDATE_BOOT_START_TRIAL
           && boot_slot == TILEFINCH_UPDATE_SLOT_B
           && tilefinch_update_state_start_trial(&second)
@@ -539,7 +539,7 @@ static int test_state_and_streaming_hash(void)
           && encoded[1][21]
                  == (uint8_t) TILEFINCH_UPDATE_TRIAL_STARTED);
     CHECK(tilefinch_update_boot_decide(
-              &second, false, true, &boot_slot)
+              &second, false, true, false, &boot_slot)
               == TILEFINCH_UPDATE_BOOT_RECOVERY
           && tilefinch_update_state_retry_trial(&second)
           && second.candidate_downgrade
@@ -553,9 +553,75 @@ static int test_state_and_streaming_hash(void)
           && second.installed_sequence == 41
           && second.previous_sequence == 42);
     CHECK(tilefinch_update_boot_decide(
-              &second, true, true, &boot_slot)
+              &second, true, true, false, &boot_slot)
               == TILEFINCH_UPDATE_BOOT_PREVIOUS
           && boot_slot == TILEFINCH_UPDATE_SLOT_A);
+    /* IS-02: after the first confirmed update every later one is staged
+       into the previous slot. Journals from builds that did not clear
+       previous_slot name the candidate as previous; safe start must not
+       boot it, staged, started, or discarded. */
+    TilefinchUpdateState staged_over_previous = {
+        .generation = 9,
+        .active_slot = TILEFINCH_UPDATE_SLOT_B,
+        .previous_slot = TILEFINCH_UPDATE_SLOT_A,
+        .pending_slot = TILEFINCH_UPDATE_SLOT_A,
+        .trial = TILEFINCH_UPDATE_TRIAL_PENDING,
+        .installed_sequence = 47,
+        .previous_sequence = 46,
+        .candidate_sequence = 48
+    };
+    CHECK(!tilefinch_update_state_previous_usable(&staged_over_previous));
+    CHECK(tilefinch_update_boot_decide(
+              &staged_over_previous, true, true, false, &boot_slot)
+              == TILEFINCH_UPDATE_BOOT_ACTIVE
+          && boot_slot == TILEFINCH_UPDATE_SLOT_B);
+    CHECK(tilefinch_update_boot_decide(
+              &staged_over_previous, true, false, false, &boot_slot)
+              == TILEFINCH_UPDATE_BOOT_ACTIVE
+          && boot_slot == TILEFINCH_UPDATE_SLOT_B);
+    /* Without L the verified candidate still starts its trial. */
+    CHECK(tilefinch_update_boot_decide(
+              &staged_over_previous, false, true, false, &boot_slot)
+              == TILEFINCH_UPDATE_BOOT_START_TRIAL
+          && boot_slot == TILEFINCH_UPDATE_SLOT_A);
+    TilefinchUpdateState started_over_previous = staged_over_previous;
+    CHECK(tilefinch_update_state_start_trial(&started_over_previous));
+    CHECK(tilefinch_update_boot_decide(
+              &started_over_previous, true, true, false, &boot_slot)
+              == TILEFINCH_UPDATE_BOOT_RECOVERY
+          && boot_slot == TILEFINCH_UPDATE_SLOT_B);
+    TilefinchUpdateState discarded_over_previous = started_over_previous;
+    CHECK(tilefinch_update_state_discard_trial(&discarded_over_previous)
+          && discarded_over_previous.previous_slot
+                 == TILEFINCH_UPDATE_SLOT_NONE
+          && discarded_over_previous.previous_sequence == 0);
+    CHECK(tilefinch_update_boot_decide(
+              &discarded_over_previous, true, true, false, &boot_slot)
+              == TILEFINCH_UPDATE_BOOT_ACTIVE
+          && boot_slot == TILEFINCH_UPDATE_SLOT_B);
+    /* A discarded trial that did not share the previous slot keeps it. */
+    TilefinchUpdateState keeps_previous = {
+        .generation = 4,
+        .active_slot = TILEFINCH_UPDATE_SLOT_A,
+        .previous_slot = TILEFINCH_UPDATE_SLOT_B,
+        .installed_sequence = 47
+    };
+    CHECK(tilefinch_update_state_previous_usable(&keeps_previous)
+          && tilefinch_update_boot_decide(
+                 &keeps_previous, true, true, false, &boot_slot)
+                 == TILEFINCH_UPDATE_BOOT_PREVIOUS
+          && boot_slot == TILEFINCH_UPDATE_SLOT_B);
+    /* IS-07: safe start and recovery never use the derived startup module. */
+    CHECK(tilefinch_update_boot_allows_fast_start(
+              false, TILEFINCH_UPDATE_BOOT_ACTIVE)
+          && tilefinch_update_boot_allows_fast_start(
+                 false, TILEFINCH_UPDATE_BOOT_START_TRIAL)
+          && !tilefinch_update_boot_allows_fast_start(
+                 true, TILEFINCH_UPDATE_BOOT_ACTIVE)
+          && !tilefinch_update_boot_allows_fast_start(
+                 true, TILEFINCH_UPDATE_BOOT_PREVIOUS)
+          && !tilefinch_update_boot_allows_fast_start(
+                 false, TILEFINCH_UPDATE_BOOT_RECOVERY));
     TilefinchUpdateState developer_trial = {
         .generation = 8,
         .active_slot = TILEFINCH_UPDATE_SLOT_A,
@@ -775,7 +841,7 @@ static int test_journal_rejected_sync(void)
           && journal_selects(directory, &state));
     /* The launcher's START_TRIAL step: store failure means recovery. */
     TilefinchUpdateSlot slot = TILEFINCH_UPDATE_SLOT_NONE;
-    CHECK(tilefinch_update_boot_decide(&state, false, true, &slot)
+    CHECK(tilefinch_update_boot_decide(&state, false, true, false, &slot)
               == TILEFINCH_UPDATE_BOOT_START_TRIAL
           && slot == TILEFINCH_UPDATE_SLOT_B
           && tilefinch_update_state_start_trial(&state)
@@ -800,6 +866,196 @@ static int test_journal_rejected_sync(void)
         remove(path);
     }
     CHECK(rmdir(directory) == 0);
+    return 0;
+}
+
+/* IS-10: one launcher run, as main() and launcher_recover() sequence the
+   shared helpers. choice is what the recovery screen gets: 'x', 's', or 0
+   for O and the timeout. Returns the action; *shown says whether the
+   recovery screen was drawn. */
+static TilefinchUpdateBootAction model_launcher_boot(
+    const char *data, char choice, bool *shown, TilefinchUpdateSlot *slot)
+{
+    TilefinchUpdateState state;
+    *shown = false;
+    if (!tilefinch_update_journal_load(data, &state, NULL))
+        return TILEFINCH_UPDATE_BOOT_RECOVERY;
+    bool retry_declined = state.trial == TILEFINCH_UPDATE_TRIAL_STARTED
+        && tilefinch_update_decline_recorded(data, &state);
+    TilefinchUpdateBootAction action = tilefinch_update_boot_decide(
+        &state, false, true, retry_declined, slot);
+    if (action == TILEFINCH_UPDATE_BOOT_START_TRIAL) {
+        if (!tilefinch_update_state_start_trial(&state)
+            || !tilefinch_update_journal_store(data, &state, NULL, NULL))
+            return TILEFINCH_UPDATE_BOOT_RECOVERY;
+        return action;
+    }
+    if (action != TILEFINCH_UPDATE_BOOT_RECOVERY) return action;
+    *shown = true;
+    if (choice == 'x') {
+        if (tilefinch_update_state_retry_trial(&state))
+            (void) tilefinch_update_journal_store(data, &state, NULL, NULL);
+    } else if (choice == 's') {
+        if (tilefinch_update_state_discard_trial(&state))
+            (void) tilefinch_update_journal_store(data, &state, NULL, NULL);
+    } else {
+        (void) tilefinch_update_decline_store(data, &state, NULL, NULL);
+    }
+    *slot = state.active_slot;
+    return action;
+}
+
+static void remove_journal_files(const char *data)
+{
+    static const char *const names[] = {
+        "update-state.0", "update-state.1", "update-state.0.tmp",
+        "update-state.1.tmp", "update-declined", "update-declined.tmp"
+    };
+    char path[512];
+    for (size_t index = 0; index < sizeof(names) / sizeof(names[0]); index++) {
+        snprintf(path, sizeof(path), "%s/%s", data, names[index]);
+        (void) remove(path);
+    }
+}
+
+static bool seed_started_trial(const char *data, TilefinchUpdateState *state)
+{
+    remove_journal_files(data);
+    *state = (TilefinchUpdateState) {
+        .generation = 1,
+        .active_slot = TILEFINCH_UPDATE_SLOT_A,
+        .installed_sequence = 42
+    };
+    memset(state->installed_sha256, 0x42, 32);
+    if (!tilefinch_update_journal_store(data, state, NULL, NULL)) return false;
+    state->generation++;
+    state->pending_slot = TILEFINCH_UPDATE_SLOT_B;
+    state->trial = TILEFINCH_UPDATE_TRIAL_PENDING;
+    state->candidate_sequence = 43;
+    memset(state->candidate_sha256, 0x43, 32);
+    if (!tilefinch_update_journal_store(data, state, NULL, NULL)) return false;
+    return tilefinch_update_state_start_trial(state)
+        && tilefinch_update_journal_store(data, state, NULL, NULL);
+}
+
+static int test_retry_declined(void)
+{
+    char data[] = "/tmp/tilefinch-update-declined.XXXXXX";
+    CHECK(mkdtemp(data) != NULL);
+    char marker[512];
+    snprintf(marker, sizeof(marker), "%s/update-declined", data);
+    TilefinchUpdateState started;
+    TilefinchUpdateSlot slot = TILEFINCH_UPDATE_SLOT_NONE;
+    bool shown = false;
+
+    /* Two boots with no input: the recovery screen shows once, then the
+       active slot starts normally (with the fast start) and the trial and
+       its staged slot stay in the journal. */
+    CHECK(seed_started_trial(data, &started));
+    CHECK(model_launcher_boot(data, 0, &shown, &slot)
+              == TILEFINCH_UPDATE_BOOT_RECOVERY
+          && shown && slot == TILEFINCH_UPDATE_SLOT_A);
+    for (unsigned boot = 0; boot < 2u; boot++) {
+        TilefinchUpdateBootAction action =
+            model_launcher_boot(data, 0, &shown, &slot);
+        CHECK(action == TILEFINCH_UPDATE_BOOT_ACTIVE && !shown
+              && slot == TILEFINCH_UPDATE_SLOT_A
+              && tilefinch_update_boot_allows_fast_start(false, action));
+    }
+    CHECK(journal_selects(data, &started));
+    /* Safe start still runs the active build (no previous slot yet). */
+    CHECK(tilefinch_update_boot_decide(&started, true, true, true, &slot)
+              == TILEFINCH_UPDATE_BOOT_ACTIVE
+          && slot == TILEFINCH_UPDATE_SLOT_A);
+
+    /* The Update page's TRY AGAIN is the recovery screen's X: the next boot
+       verifies and starts the trial, and when it fails again the screen
+       comes back. The marker is left in place here, as a cut between the
+       journal write and its removal leaves it: it names the old record. */
+    TilefinchUpdateState retried = started;
+    CHECK(tilefinch_update_state_retry_trial(&retried)
+          && tilefinch_update_journal_store(data, &retried, NULL, NULL));
+    CHECK(model_launcher_boot(data, 0, &shown, &slot)
+              == TILEFINCH_UPDATE_BOOT_START_TRIAL
+          && !shown && slot == TILEFINCH_UPDATE_SLOT_B);
+    struct stat info;
+    CHECK(stat(marker, &info) == 0);
+    CHECK(model_launcher_boot(data, 0, &shown, &slot)
+              == TILEFINCH_UPDATE_BOOT_RECOVERY
+          && shown && slot == TILEFINCH_UPDATE_SLOT_A);
+    /* That answer is recorded for the new trial. */
+    CHECK(model_launcher_boot(data, 0, &shown, &slot)
+              == TILEFINCH_UPDATE_BOOT_ACTIVE && !shown);
+
+    /* The Update page's DISCARD is Square: the trial is gone. */
+    TilefinchUpdateState current;
+    CHECK(tilefinch_update_journal_load(data, &current, NULL)
+          && current.trial == TILEFINCH_UPDATE_TRIAL_STARTED
+          && tilefinch_update_state_discard_trial(&current)
+          && tilefinch_update_journal_store(data, &current, NULL, NULL));
+    tilefinch_update_decline_clear(data);
+    CHECK(stat(marker, &info) != 0);
+    CHECK(model_launcher_boot(data, 0, &shown, &slot)
+              == TILEFINCH_UPDATE_BOOT_ACTIVE
+          && !shown && slot == TILEFINCH_UPDATE_SLOT_A);
+    CHECK(!tilefinch_update_decline_store(data, &current, NULL, NULL));
+
+    /* X and Square on the screen itself still work after one decline. */
+    CHECK(seed_started_trial(data, &started));
+    CHECK(model_launcher_boot(data, 'x', &shown, &slot)
+              == TILEFINCH_UPDATE_BOOT_RECOVERY && shown);
+    CHECK(model_launcher_boot(data, 0, &shown, &slot)
+              == TILEFINCH_UPDATE_BOOT_START_TRIAL);
+    CHECK(model_launcher_boot(data, 's', &shown, &slot)
+              == TILEFINCH_UPDATE_BOOT_RECOVERY && shown);
+    CHECK(tilefinch_update_journal_load(data, &current, NULL)
+          && current.trial == TILEFINCH_UPDATE_TRIAL_NONE);
+
+    /* A stale marker never suppresses another trial's screen: one written
+       for an earlier STARTED record (an older generation, another
+       candidate), a torn one, and one with trailing bytes are ignored. */
+    CHECK(seed_started_trial(data, &started));
+    TilefinchUpdateState earlier = started;
+    earlier.generation--;
+    CHECK(tilefinch_update_decline_store(data, &earlier, NULL, NULL)
+          && !tilefinch_update_decline_recorded(data, &started));
+    TilefinchUpdateState other = started;
+    other.candidate_sha256[0] ^= 1;
+    CHECK(tilefinch_update_decline_store(data, &other, NULL, NULL)
+          && !tilefinch_update_decline_recorded(data, &started));
+    CHECK(tilefinch_update_decline_store(data, &started, NULL, NULL)
+          && tilefinch_update_decline_recorded(data, &started));
+    CHECK(truncate(marker, TILEFINCH_UPDATE_STATE_BYTES - 1) == 0
+          && !tilefinch_update_decline_recorded(data, &started));
+    CHECK(tilefinch_update_decline_store(data, &started, NULL, NULL));
+    FILE *file = fopen(marker, "ab");
+    CHECK(file != NULL && fputc(0, file) == 0 && fclose(file) == 0
+          && !tilefinch_update_decline_recorded(data, &started));
+    CHECK(model_launcher_boot(data, 0, &shown, &slot)
+              == TILEFINCH_UPDATE_BOOT_RECOVERY && shown);
+
+    /* Power loss while the decline is written: every cut leaves the
+       journal untouched and the next boot asks again, or (only once the
+       rename landed) starts the active slot. Over an existing marker too. */
+    for (unsigned over_existing = 0; over_existing < 2u; over_existing++) {
+        for (unsigned fail_at = 0; fail_at < 5u; fail_at++) {
+            CHECK(seed_started_trial(data, &started));
+            if (over_existing)
+                CHECK(tilefinch_update_decline_store(
+                    data, &earlier, NULL, NULL));
+            JournalFault fault = {.fail_at = fail_at};
+            bool stored = tilefinch_update_decline_store(
+                data, &started, journal_fault, &fault);
+            CHECK(stored == (fail_at >= 4u));
+            CHECK(journal_selects(data, &started));
+            TilefinchUpdateBootAction action =
+                model_launcher_boot(data, 0, &shown, &slot);
+            CHECK(stored ? action == TILEFINCH_UPDATE_BOOT_ACTIVE && !shown
+                         : action == TILEFINCH_UPDATE_BOOT_RECOVERY && shown);
+        }
+    }
+    remove_journal_files(data);
+    CHECK(rmdir(data) == 0);
     return 0;
 }
 
@@ -874,6 +1130,85 @@ static bool refuse_startup_space(void *context, uint64_t *available)
     (void)available;
     (*(unsigned *)context)++;
     return false;
+}
+
+static bool reset_install_fixture(
+    const char *root, const char *data, const char *package_path,
+    const Bytes *package, const TilefinchUpdateState *state)
+{
+    cleanup_test_slot(root, "slot-b");
+    cleanup_test_slot(root, "slot-b.tmp");
+    cleanup_test_slot(root, "slot-b.old");
+    char path[256];
+    snprintf(path, sizeof(path), "%s/slot-b/DEVELOPER", root);
+    remove(path);
+    snprintf(path, sizeof(path), "%s/slot-b", root);
+    rmdir(path);
+    snprintf(path, sizeof(path), "%s/slot-b.old/DEVELOPER", root);
+    remove(path);
+    snprintf(path, sizeof(path), "%s/slot-b.old", root);
+    rmdir(path);
+    if (!prepare_inactive_test_slot(root)) return false;
+    for (unsigned copy = 0; copy < 2; copy++) {
+        snprintf(path, sizeof(path), "%s/update-state.%u", data, copy);
+        remove(path);
+        snprintf(path, sizeof(path), "%s/update-state.%u.tmp", data, copy);
+        remove(path);
+    }
+    FILE *file = fopen(package_path, "wb");
+    return tilefinch_update_journal_store(data, state, NULL, NULL)
+        && file != NULL
+        && fwrite(package->bytes, 1, package->length, file) == package->length
+        && fclose(file) == 0;
+}
+
+static bool run_install(
+    const TilefinchUpdateInstallOptions *options,
+    TilefinchUpdateInstallSnapshot *snapshot)
+{
+    Budget budget;
+    budget_init(&budget, 1024 * 1024);
+    TilefinchUpdateInstallJob *job =
+        tilefinch_update_install_create(&budget, options);
+    if (job == NULL) return false;
+    memset(snapshot, 0, sizeof(*snapshot));
+    for (size_t pump = 0; pump < 512; pump++) {
+        if (!tilefinch_update_install_pump(job, 4)
+            || !tilefinch_update_install_snapshot(job, snapshot)
+            || snapshot->phase >= TILEFINCH_UPDATE_INSTALL_COMPLETE) break;
+    }
+    tilefinch_update_install_destroy(job);
+    return budget.current == 0;
+}
+
+typedef struct {
+    const char *data;
+    const char *operation;
+    TilefinchUpdateState advanced;
+    bool stored;
+} JournalAdvance;
+
+/* Models the browser's trial-health confirmation committing while the
+   install is extracting: it never fails the operation, it moves the journal. */
+static bool advance_journal_at(void *opaque, const char *operation)
+{
+    JournalAdvance *advance = opaque;
+    if (!advance->stored && strcmp(operation, advance->operation) == 0)
+        advance->stored = tilefinch_update_journal_store(
+            advance->data, &advance->advanced, NULL, NULL);
+    return false;
+}
+
+static bool slot_b_untouched(const char *root)
+{
+    static const uint8_t stale[] = "stale-inactive-slot";
+    char path[256];
+    snprintf(path, sizeof(path), "%s/slot-b/EBOOT.PBP", root);
+    struct stat info;
+    char old[256];
+    snprintf(old, sizeof(old), "%s/slot-b.old", root);
+    return file_matches(path, stale, sizeof(stale) - 1u)
+        && stat(old, &info) != 0;
 }
 
 static int test_installer(void)
@@ -1321,6 +1656,152 @@ static int test_installer(void)
               slot_dir, &slot_options, NULL) != TILEFINCH_UPDATE_OK);
     tilefinch_update_install_destroy(job);
     CHECK(budget.current == 0);
+    /* IS-01: the job was created from a journal copy that is no longer on
+       the card. Here a trial of slot B was confirmed healthy after the copy
+       was taken, so the copy's "inactive" slot B is the running, active
+       build. Nothing may be removed or renamed. */
+    TilefinchUpdateState healthy_b = {
+        .generation = 6,
+        .active_slot = TILEFINCH_UPDATE_SLOT_B,
+        .previous_slot = TILEFINCH_UPDATE_SLOT_A,
+        .installed_sequence = 44,
+        .previous_sequence = 43
+    };
+    TilefinchUpdateState started_b = {
+        .generation = 5,
+        .active_slot = TILEFINCH_UPDATE_SLOT_A,
+        .pending_slot = TILEFINCH_UPDATE_SLOT_B,
+        .trial = TILEFINCH_UPDATE_TRIAL_STARTED,
+        .installed_sequence = 43,
+        .candidate_sequence = 44
+    };
+    CHECK(reset_install_fixture(root, data, package_path, &package, &healthy_b));
+    options.current_state = started_b;
+    options.inactive_slot = TILEFINCH_UPDATE_SLOT_B;
+    options.running_slot = TILEFINCH_UPDATE_SLOT_NONE;
+    TilefinchUpdateInstallSnapshot guard_snapshot;
+    for (unsigned attempt = 0; attempt < 2; attempt++) {
+        /* The second attempt is TRY INSTALL AGAIN. */
+        CHECK(run_install(&options, &guard_snapshot));
+        CHECK(guard_snapshot.phase == TILEFINCH_UPDATE_INSTALL_ERROR
+              && strcmp(guard_snapshot.message, "RESTART TO UPDATE") == 0
+              && slot_b_untouched(root));
+        CHECK(tilefinch_update_journal_load(data, &pending, NULL)
+              && pending.generation == 6
+              && pending.active_slot == TILEFINCH_UPDATE_SLOT_B);
+    }
+    /* Naming the running slot refuses the job outright. */
+    options.running_slot = TILEFINCH_UPDATE_SLOT_B;
+    budget_init(&budget, 1024 * 1024);
+    CHECK(tilefinch_update_install_create(&budget, &options) == NULL
+          && budget.current == 0);
+    options.running_slot = TILEFINCH_UPDATE_SLOT_NONE;
+
+    /* The journal moves while the package is being extracted: the check
+       before the first rename still stops the job. */
+    TilefinchUpdateState idle_a = {
+        .generation = 3,
+        .active_slot = TILEFINCH_UPDATE_SLOT_A,
+        .installed_sequence = 42
+    };
+    CHECK(reset_install_fixture(root, data, package_path, &package, &idle_a));
+    options.current_state = idle_a;
+    JournalAdvance advance = {
+        .data = data, .operation = "before-write-ready",
+        .advanced = idle_a
+    };
+    advance.advanced.generation = 4;
+    advance.advanced.installed_sequence = 43;
+    options.fault = advance_journal_at;
+    options.fault_opaque = &advance;
+    CHECK(run_install(&options, &guard_snapshot));
+    CHECK(advance.stored
+          && guard_snapshot.phase == TILEFINCH_UPDATE_INSTALL_ERROR
+          && strcmp(guard_snapshot.message, "RESTART TO UPDATE") == 0
+          && slot_b_untouched(root));
+    options.fault = NULL;
+    options.fault_opaque = NULL;
+
+    /* IS-15: a failed install can leave a slot-b.old larger than one
+       bounded removal pass. The Update page clears it before the download's
+       free-space check, and the installer finishes removing it in rounds. */
+    CHECK(reset_install_fixture(root, data, package_path, &package, &idle_a));
+    options.current_state = idle_a;
+    char stale_tree[256], stale_file[300];
+    snprintf(stale_tree, sizeof(stale_tree), "%s/slot-b.old", root);
+    CHECK(mkdir(stale_tree, 0700) == 0);
+    for (unsigned index = 0; index < 300u; index++) {
+        snprintf(stale_file, sizeof(stale_file), "%s/f%03u", stale_tree, index);
+        file = fopen(stale_file, "wb");
+        CHECK(file != NULL && fclose(file) == 0);
+    }
+    CHECK(run_install(&options, &guard_snapshot));
+    struct stat stale_info;
+    CHECK(guard_snapshot.phase == TILEFINCH_UPDATE_INSTALL_COMPLETE
+          && stat(stale_tree, &stale_info) != 0);
+    CHECK(reset_install_fixture(root, data, package_path, &package, &idle_a));
+    char stale_temporary[256];
+    snprintf(stale_temporary, sizeof(stale_temporary), "%s/slot-b.tmp", root);
+    CHECK(mkdir(stale_tree, 0700) == 0 && mkdir(stale_temporary, 0700) == 0);
+    for (unsigned index = 0; index < 300u; index++) {
+        snprintf(stale_file, sizeof(stale_file), "%s/f%03u", stale_tree, index);
+        file = fopen(stale_file, "wb");
+        CHECK(file != NULL && fclose(file) == 0);
+    }
+    CHECK(tilefinch_update_install_clear_staging(root, TILEFINCH_UPDATE_SLOT_B)
+          && stat(stale_tree, &stale_info) != 0
+          && stat(stale_temporary, &stale_info) != 0
+          && slot_b_untouched(root));
+
+    /* IS-02: slot B holds the previous known-good build and is the target.
+       After an interruption at any step, the journal labels slot B previous
+       only while it still holds that build, and never names it previous
+       and pending at once. */
+    TilefinchUpdateState previous_b = {
+        .generation = 3,
+        .active_slot = TILEFINCH_UPDATE_SLOT_A,
+        .previous_slot = TILEFINCH_UPDATE_SLOT_B,
+        .installed_sequence = 42,
+        .previous_sequence = 41,
+        .previous_sha256 = {0x41}
+    };
+    options.current_state = previous_b;
+    size_t previous_faults = 0;
+    for (size_t fail_at = 0; fail_at < 256; fail_at++) {
+        CHECK(reset_install_fixture(
+            root, data, package_path, &package, &previous_b));
+        InstallerFault fault = {.fail_at = fail_at};
+        options.fault = installer_fault;
+        options.fault_opaque = &fault;
+        CHECK(run_install(&options, &guard_snapshot));
+        TilefinchUpdateState after;
+        CHECK(tilefinch_update_journal_load(data, &after, NULL));
+        CHECK(after.active_slot == TILEFINCH_UPDATE_SLOT_A);
+        CHECK(after.previous_slot != TILEFINCH_UPDATE_SLOT_B
+              || (after.pending_slot == TILEFINCH_UPDATE_SLOT_NONE
+                  && slot_b_untouched(root)));
+        TilefinchUpdateSlot safe_slot = TILEFINCH_UPDATE_SLOT_NONE;
+        TilefinchUpdateBootAction safe_action = tilefinch_update_boot_decide(
+            &after, true, true, false, &safe_slot);
+        CHECK(safe_slot == TILEFINCH_UPDATE_SLOT_A
+              || (safe_action == TILEFINCH_UPDATE_BOOT_PREVIOUS
+                  && slot_b_untouched(root)));
+        if (!fault.fired) {
+            CHECK(guard_snapshot.phase == TILEFINCH_UPDATE_INSTALL_COMPLETE
+                  && after.pending_slot == TILEFINCH_UPDATE_SLOT_B
+                  && after.trial == TILEFINCH_UPDATE_TRIAL_PENDING
+                  && after.previous_slot == TILEFINCH_UPDATE_SLOT_NONE
+                  && after.previous_sequence == 0);
+            previous_faults = fault.operation;
+            break;
+        }
+    }
+    CHECK(previous_faults >= 12);
+    printf("installer-previous-slot: %zu interrupted operations never "
+           "labelled a replaced slot previous\n", previous_faults);
+    options.fault = NULL;
+    options.fault_opaque = NULL;
+
     EC_KEY_free(release_key);
     EC_KEY_free(root_key);
 
@@ -1390,6 +1871,45 @@ static int test_release_history(void)
     return 0;
 }
 
+/* A refusal by the server, or a Memory Stick that stopped accepting bytes, is
+   not "did not verify": that wording sends a reader looking for a bad file. */
+static int test_download_failure_text(void)
+{
+    char text[96];
+    tilefinch_update_transfer_failure_text(
+        text, sizeof(text), "UPDATE CHECK FAILED", 404, "");
+    CHECK(strcmp(text, "UPDATE CHECK FAILED: HTTP 404") == 0);
+    tilefinch_update_transfer_failure_text(
+        text, sizeof(text), "UPDATE CHECK FAILED", 0, "Timeout was reached");
+    CHECK(strcmp(text, "Timeout was reached") == 0);
+    tilefinch_update_transfer_failure_text(
+        text, sizeof(text), "UPDATE CHECK FAILED", 0, "");
+    CHECK(strcmp(text, "UPDATE CHECK FAILED") == 0);
+    tilefinch_update_transfer_failure_text(
+        text, sizeof(text), "UPDATE CHECK FAILED", 200, "");
+    CHECK(strcmp(text, "UPDATE CHECK FAILED") == 0);
+
+    CHECK(tilefinch_update_download_failure(
+              text, sizeof(text), true, 403, "", false)
+          == TILEFINCH_UPDATE_IO);
+    CHECK(strcmp(text, "DOWNLOAD FAILED: HTTP 403") == 0);
+    CHECK(tilefinch_update_download_failure(
+              text, sizeof(text), false, 0, "Couldn't connect", false)
+          == TILEFINCH_UPDATE_IO);
+    CHECK(strcmp(text, "Couldn't connect") == 0);
+    CHECK(tilefinch_update_download_failure(
+              text, sizeof(text), false, 200,
+              "stream consumer rejected response", true)
+          == TILEFINCH_UPDATE_IO);
+    CHECK(strcmp(text, "UPDATE FILE COULD NOT BE WRITTEN") == 0);
+    /* The server delivered, and the signed digest or size did not match. */
+    CHECK(tilefinch_update_download_failure(
+              text, sizeof(text), true, 200, "", false)
+          == TILEFINCH_UPDATE_PACKAGE_MISMATCH);
+    CHECK(strcmp(text, "DOWNLOADED FILE DID NOT VERIFY") == 0);
+    return 0;
+}
+
 int main(void)
 {
     /*
@@ -1443,6 +1963,7 @@ int main(void)
                  prepared,
                  "https://updates.example.test/dev/update.tfum") == 0);
     puts("test: canonical signed update envelope and low-S twin");
+    CHECK(test_download_failure_text() == 0);
     CHECK(test_envelope() == 0);
     puts("test: bounded TFUP table and path policy");
     CHECK(test_package() == 0);
@@ -1452,6 +1973,8 @@ int main(void)
     CHECK(test_journal_faults() == 0);
     puts("test: a rejected journal sync never contradicts the commit");
     CHECK(test_journal_rejected_sync() == 0);
+    puts("test: a declined trial asks once, then the Update page decides");
+    CHECK(test_retry_declined() == 0);
     puts("test: bounded installer stages and promotes the inactive slot");
     CHECK(test_installer() == 0);
     puts("test: bounded GitHub release history parser");

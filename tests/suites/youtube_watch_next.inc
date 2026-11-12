@@ -91,7 +91,7 @@ static int test_youtube_watch_next_cards(void)
     CHECK(strstr(html, "<div class=watch-action-row><a id=yt-watch-channel class=channel-link "
         "href=\"https://www.youtube.com/@fixture.handle\">"
         "<img class=channel-avatar src=\"https://yt3.ggpht.com/fixture-avatar=s48\" "
-        "width=24 height=24 alt=\"\">Fixture &lt;Channel&gt;</a><a id=yt-offline-save")
+        "width=24 height=24 loading=lazy alt=\"\">Fixture &lt;Channel&gt;</a><a id=yt-offline-save")
         && !strstr(html, "<p class=watch-meta>Fixture")
         && !strstr(html, "@second") && !strstr(html, "Owner title"));
 
@@ -178,6 +178,120 @@ static int test_youtube_watch_next_cards(void)
     CHECK(watch_next_build(many, WATCH_NEXT_CHANNEL, &document) == 0);
     CHECK(document.result_count == YOUTUBE_LITE_MAXIMUM_RESULTS
         && strstr(document.html, "Many 11<") && !strstr(document.html, "Many 12<"));
+    CHECK(watch_next_release(&document) == 0);
+    return 0;
+}
+
+/* An engine configured for page images, committing provider documents
+   the way the adapter path does: a static, browser-authored commit. */
+static BrowserEngine *watch_commit_engine(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 16u * MIB;
+    config.resources.enabled = true;
+    config.resources.web_fonts_enabled = false;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    if (engine == NULL) fprintf(stderr, "watch commit engine: %s\n", error);
+    return engine;
+}
+
+static bool watch_commit_static(BrowserEngine *engine, const char *url,
+                                const YoutubeLiteDocument *document)
+{
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    if (navigation == NULL) return false;
+    uint64_t generation = navigation_begin(navigation);
+    return navigation_commit_static_html(
+        navigation, generation, url, document->html, document->html_length,
+        480, NULL, NULL, true);
+}
+
+/* The owner card of the watch page, with its avatar. */
+static const char watch_commit_related[] = "{\"contents\":[{\"slimOwnerRenderer\":{"
+    "\"thumbnail\":{\"thumbnails\":[{\"url\":\"//yt3.ggpht.com/fixture-avatar=s48\"}]},"
+    "\"navigationEndpoint\":{\"browseEndpoint\":{\"browseId\":\"" WATCH_NEXT_CHANNEL "\","
+    "\"canonicalBaseUrl\":\"/@fixture.handle\"}}}}]}";
+/* A 4x4 PNG. */
+static const char watch_commit_avatar[] =
+    "\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52"
+    "\x00\x00\x00\x04\x00\x00\x00\x04\x08\x02\x00\x00\x00\x26\x93\x09"
+    "\x29\x00\x00\x00\x10\x49\x44\x41\x54\x78\x9c\x63\x38\x63\x6c\x0c"
+    "\x47\x0c\xc4\x71\x00\xfb\x13\x13\x21\x2c\x5d\xcd\x23\x00\x00\x00"
+    "\x00\x49\x45\x4e\x44\xae\x42\x60\x82";
+
+/* perf-1110 R2: the channel avatar was the watch page's only eager visible
+   image, so the commit fetched it (on a live network, from a host the
+   session has no connection to) between its layout passes. It waits in
+   the idle image queue now, like the thumbnails and the poster, and loads
+   from there after the first frame. */
+static int test_youtube_watch_commit_defers_avatar(void)
+{
+    YoutubeLiteDocument document = {0};
+    CHECK(watch_next_build(watch_commit_related, WATCH_NEXT_CHANNEL, &document) == 0
+        && strstr(document.html, "<img class=channel-avatar") != NULL);
+    YoutubeReplayRecord record = {
+        "GET", "https://yt3.ggpht.com/fixture-avatar=s48", "image/png",
+        watch_commit_avatar, sizeof(watch_commit_avatar) - 1u
+    };
+    char directory[128], error[256] = {0};
+    CHECK(write_youtube_records_replay(directory, &record, 1)
+          && fetch_trace_replay_begin_response_keyed(directory, error, sizeof(error)));
+    BrowserEngine *engine = watch_commit_engine();
+    CHECK(engine != NULL && watch_commit_static(engine,
+        "https://www.youtube.com/watch?v=TFTEST00001&tilefinch_view=details", &document));
+    /* navigation_begin zeroed the tallies: this is the commit's count. */
+    TilefinchWorkCount commit_passes = tilefinch_work_tally.layout_passes;
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    /* perf-1110 R3: the action row's inline SVG icons are published before
+       the image-planning layout, so that layout is the page's final one:
+       the commit lays the watch page out once, not twice. */
+    size_t svg_published = 0;
+    for (size_t i = 0; i < navigation->page.images.count; i++) {
+        const ImageResource *image = &navigation->page.images.items[i];
+        svg_published += image->pixels != NULL && image->node != NULL
+            && image->node->type == LXB_DOM_NODE_TYPE_ELEMENT
+            && lxb_dom_element_local_name(lxb_dom_interface_element(image->node), NULL) != NULL
+            && strcmp((const char *) lxb_dom_element_local_name(
+                   lxb_dom_interface_element(image->node), NULL), "svg") == 0;
+    }
+    if (commit_passes != 1 || svg_published == 0
+        || navigation->performance.static_image_layout_adoptions != 1)
+        fprintf(stderr, "watch commit layout passes=%llu svg=%zu adoptions=%zu\n",
+                (unsigned long long) commit_passes, svg_published,
+                navigation->performance.static_image_layout_adoptions);
+    CHECK(commit_passes == 1 && svg_published != 0
+        && navigation->performance.static_image_layout_adoptions == 1);
+    FetchTraceReplayStats replay = {0};
+    CHECK(fetch_trace_replay_stats(&replay));
+    lxb_dom_node_t *channel = test_reader_find_id(
+        lxb_dom_interface_node(navigation->page.document.html), "yt-watch-channel");
+    lxb_dom_node_t *avatar = channel == NULL ? NULL : channel->first_child;
+    CHECK(avatar != NULL && avatar->type == LXB_DOM_NODE_TYPE_ELEMENT);
+    bool avatar_queued = false;
+    for (size_t i = 0; i < navigation->page.deferred_image_count; i++)
+        avatar_queued |= navigation->page.deferred_image_targets[i].node == avatar;
+    if (replay.request_count != 0 || !avatar_queued)
+        fprintf(stderr, "watch commit requests=%zu avatar-queued=%d\n",
+                replay.request_count, avatar_queued);
+    /* No request inside the commit; the avatar waits in the idle queue. */
+    CHECK(replay.request_count == 0 && replay.claimed_record_count == 0
+        && navigation->page.loaded && avatar_queued
+        && images_find_node(&navigation->page.images, avatar) == NULL
+        && navigation_background_resources_pending(navigation));
+    size_t pumps = 0;
+    while (navigation_background_resources_pending(navigation) && pumps++ < 64u)
+        if (!navigation_run_background_resources(navigation)) break;
+    /* The idle queue requests it after the commit. */
+    CHECK(fetch_trace_replay_stats(&replay) && replay.claimed_record_count == 1
+        && !navigation_background_resources_pending(navigation));
+    fetch_trace_end();
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    remove_youtube_records_replay(directory, 1);
     CHECK(watch_next_release(&document) == 0);
     return 0;
 }

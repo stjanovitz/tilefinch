@@ -377,7 +377,9 @@ typedef enum {
     /* A playlist: open the address as HLS. */
     MEDIA_HTTP_PROBE_HLS,
     /* 404/410 or an error page: nothing to play. */
-    MEDIA_HTTP_PROBE_UNAVAILABLE
+    MEDIA_HTTP_PROBE_UNAVAILABLE,
+    /* MPEG audio (media_http_probe_route_audio only). */
+    MEDIA_HTTP_PROBE_MP3
 } MediaHttpProbeRoute;
 
 /* Routes a completed probe response. A playlist routes to HLS only when
@@ -388,6 +390,42 @@ MediaHttpProbeRoute media_http_probe_route(
     BrowserSession *session, const TilefinchRequestContext *context,
     bool hls_allowed, const FetchResult *result, bool fetched,
     uint64_t *complete_length);
+/*
+ * Page audio's probe. An MPEG audio type or body routes to MP3: a 206 with
+ * its whole length and *seekable set, or a 200 whose whole body arrived
+ * with that body's length. A body that overflowed the sniff window answered
+ * a 1 KiB range with something endless (a radio stream) or with a whole
+ * file (a server that ignores Range); unless its status arrived and is not
+ * 2xx, it routes to MP3 with length 0, the stream's own response is
+ * admitted when it opens, and a declared length ends it
+ * (MediaMp3Transport.declared_length). Everything else routes as
+ * media_http_probe_route without HLS.
+ */
+MediaHttpProbeRoute media_http_probe_route_audio(
+    BrowserSession *session, const TilefinchRequestContext *context,
+    const FetchResult *result, bool fetched, uint64_t *complete_length,
+    bool *seekable);
+
+typedef enum {
+    /* Nothing to ask: the failure stands as it is. */
+    MEDIA_INSECURE_AUDIO_NONE = 0,
+    /* Ask once whether this plain-HTTP stream may play. */
+    MEDIA_INSECURE_AUDIO_ASK,
+    /* The user said no for this site this session. */
+    MEDIA_INSECURE_AUDIO_DECLINED
+} MediaInsecureAudioStep;
+
+/*
+ * After page audio's probe refused or found nothing to play: whether that
+ * is a secure page's plain-HTTP address the one HTTPS upgrade could not
+ * reach, and what the user's session answer for the page's site makes of
+ * it (SECURITY_MODEL.md, "Unencrypted audio"). Potentially trustworthy
+ * addresses (loopback) are never upgraded, so never asked about. An
+ * ALLOWED answer already sent the probe as HTTP; its failure stands.
+ */
+MediaInsecureAudioStep media_http_insecure_audio_step(
+    const BrowserSession *session, const char *source_url,
+    const char *document_url, MediaHttpProbeRoute route);
 
 /*
  * A single-window, bounded HTTP range source. The cache is deliberately

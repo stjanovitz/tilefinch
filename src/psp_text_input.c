@@ -92,6 +92,18 @@ static void present(
         service->present(service->present_user, frame, ui);
 }
 
+static bool modal_begin(PspTextInputService *service)
+{
+    return service->modal_begin != NULL
+        && service->modal_begin(service->modal_user);
+}
+
+static void modal_end(PspTextInputService *service, bool begun)
+{
+    if (service->modal_end != NULL)
+        service->modal_end(service->modal_user, begun);
+}
+
 static void show_status(
     PspTextInputService *service, const uint16_t *frame,
     PspUiState *ui, const char *status)
@@ -421,10 +433,12 @@ static bool open_danzeff_keyboard(
                     suggestions[suggestion_selection].url);
             }
             /* R+START is deliberately distinct from START: accepting text
-               must not accidentally submit a form, while the chord gives
-               the PSP a real Enter key without consuming any Danzeff face
-               button. The request gate keeps settings and multiline-like
-               prompts from advertising a semantic they cannot honor. */
+               submits a form only where the caller decides Done is Enter
+               (a form's only text field, psp_replace_focused_text), while
+               the chord gives the PSP a real Enter key without consuming
+               any Danzeff face button. The request gate keeps settings and
+               multiline-like prompts from advertising a semantic they
+               cannot honor. */
             if (submit_requested != NULL)
                 *submit_requested = finish == DANZEFF_INPUT_SUBMIT;
             ui->screen = previous_screen;
@@ -616,6 +630,16 @@ void psp_text_input_init(
 #endif
 }
 
+void psp_text_input_set_modal(
+    PspTextInputService *service, PspTextInputModalBegin begin,
+    PspTextInputModalEnd end, void *user)
+{
+    if (service == NULL) return;
+    service->modal_begin = begin;
+    service->modal_end = end;
+    service->modal_user = user;
+}
+
 void psp_text_input_set_voice_prepare(
     PspTextInputService *service, PspTextInputVoicePrepare prepare,
     void *prepare_user)
@@ -785,6 +809,7 @@ bool psp_text_input_request_with_submit(
     output[0] = '\0';
     if (submit_requested != NULL) *submit_requested = false;
 
+    bool modal = modal_begin(service);
     bool accepted = text_input_collect(
         service, frame, ui, request, output, capacity,
         submit_requested);
@@ -802,6 +827,7 @@ bool psp_text_input_request_with_submit(
      */
     present(service, frame, ui);
     text_input_retire_modal_latch();
+    modal_end(service, modal);
     return accepted;
 }
 
@@ -814,9 +840,11 @@ bool psp_text_input_request_voice(
     psp_log_set_phase(PSP_LOG_PHASE_INPUT);
     psp_log_heartbeat();
     output[0] = '\0';
+    bool modal = modal_begin(service);
     bool accepted = text_input_collect_voice(
         service, frame, ui, request, output, capacity);
     present(service, frame, ui);
+    modal_end(service, modal);
     return accepted;
 }
 

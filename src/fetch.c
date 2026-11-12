@@ -107,6 +107,10 @@ _Static_assert(MBEDTLS_X509_BADCERT_BAD_KEY == TILEFINCH_TLS_VERIFY_BAD_KEY,
 #define budget_realloc(b, p, s) budget_realloc_category((b), BUDGET_CATEGORY_RESOURCE, (p), (s))
 
 #define FETCH_EXTRA_HEADERS_MAX 8192
+/* The longest Content-Type fetch_request_validate() admits. The scheduler's
+   copy and the PSP worker slot hold the same, so a valid request never
+   fails on the worker over its type. */
+#define FETCH_REQUEST_CONTENT_TYPE_MAX 255u
 #define FETCH_EXTRA_HEADER_LINE_MAX 4096
 #define FETCH_TRACE_PATH_CAPACITY 4096
 #define FETCH_REDIRECT_LIMIT 8u
@@ -151,9 +155,14 @@ typedef struct {
     bool blocked;
 } FetchPrivateNetworkGuard;
 
+/* The ranges a public page may not reach: this network (0/8), private
+   (RFC 1918), shared (100.64/10), loopback, link-local, benchmarking
+   (198.18/15), multicast (224/4, where SSDP and mDNS answer from the home
+   network) and reserved (240/4, which includes limited broadcast). */
 static bool fetch_private_ipv4(const unsigned char address[4])
 {
     return address[0] == 0u || address[0] == 10u || address[0] == 127u
+        || address[0] >= 224u
         || (address[0] == 100u && (address[1] & 0xc0u) == 0x40u)
         || (address[0] == 169u && address[1] == 254u)
         || (address[0] == 172u && address[1] >= 16u && address[1] <= 31u)
@@ -775,6 +784,17 @@ static bool fetch_transport_runtime_supported(void)
 #endif
 #endif
     return true;
+}
+
+/* FetchRequest.icy_status_line. libcurl keeps the alias list's pointer for
+   the transfer's life, so it is static; a reused handle is reset to NULL. */
+static bool fetch_configure_icy_status(CURL *easy, bool enabled)
+{
+    static char icy_prefix[] = "ICY";
+    static struct curl_slist icy_alias = {icy_prefix, NULL};
+    return curl_easy_setopt(
+               easy, CURLOPT_HTTP200ALIASES,
+               enabled ? &icy_alias : NULL) == CURLE_OK;
 }
 
 static bool fetch_configure_http_version(CURL *easy)

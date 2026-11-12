@@ -215,7 +215,7 @@ static bool test_retarget_releases_each_cached_pixel_lease(void)
             .commands = commands, .count = painted ? 2 : 0
         };
         bool changed = images_retarget_display_step(
-            &images, &layout, NULL, 1) == IMAGE_RETARGET_CHANGED;
+            &images, &layout, NULL, 1, NULL) == IMAGE_RETARGET_CHANGED;
         bool leases_released = body->references == 1;
         bool surface_matches = true;
         for (size_t i = 0; i < 3; i++) {
@@ -360,7 +360,7 @@ static bool test_display_retarget_follows_painted_size(void)
         && budget.failure_count == failures;
     bool restore_refused = images_retarget_display_step(
         &navigation.page.images, &navigation.page.layout,
-        navigation.browser_session, navigation.incremental_relayouts)
+        navigation.browser_session, navigation.incremental_relayouts, NULL)
         == IMAGE_RETARGET_RETRY;
     budget_clear_failure_injection(&budget);
     budget.limit = old_limit;
@@ -411,4 +411,132 @@ static bool test_display_retarget_follows_painted_size(void)
     if (!clean) fprintf(stderr, "display-retarget: %zu bytes after teardown\n",
                         budget.current);
     return ok && clean;
+}
+
+/* Applies the session's newest generation to a render shell the way the
+   engine's frame does (browser_engine_apply_layout_damage). */
+static bool retarget_apply_generation(NavigationSession *navigation,
+                                      TileCache *cache, size_t *applied)
+{
+    if (*applied == navigation->incremental_relayouts) return true;
+    bool preserve = navigation->incremental_relayouts != 0u
+        && *applied == navigation->incremental_relayouts - 1u
+        && navigation->fixed_paint_relayout_generation
+            == navigation->incremental_relayouts;
+    bool damaged = navigation->relayout_damage_valid;
+    int left = damaged ? navigation->relayout_damage_left : 0;
+    int top = damaged ? navigation->relayout_damage_top : 0;
+    int right = damaged ? navigation->relayout_damage_right : 0;
+    int bottom = damaged ? navigation->relayout_damage_bottom : 0;
+    *applied = navigation->incremental_relayouts;
+    return preserve
+        ? tile_cache_replace_layout_damage_preserving_fixed(
+              cache, &navigation->page.layout, left, top, right, bottom)
+        : tile_cache_replace_layout_damage(
+              cache, &navigation->page.layout, left, top, right, bottom);
+}
+
+/* A retarget step changes surfaces, not pixels: its generation damages no
+   tile and keeps the fixed header's raster, even right after a relayout that
+   damaged the whole page. It once reused that relayout's rectangle, so each
+   retargeted image re-rasterized every visible tile and rebuilt the fixed
+   layer. */
+static bool test_retarget_generation_keeps_tiles_and_fixed_layer(void)
+{
+    char *data_url = retarget_png_data_url(400, 200, 0);
+    char *other_url = retarget_png_data_url(400, 200, 1);
+    size_t html_capacity = data_url == NULL || other_url == NULL ? 0
+        : strlen(data_url) + strlen(other_url) + 512;
+    char *html = html_capacity == 0 ? NULL : malloc(html_capacity);
+    int written = html == NULL ? -1 : snprintf(
+        html, html_capacity,
+        "<!doctype html><title>Retarget damage</title>"
+        "<meta name=viewport content=\"width=device-width\">"
+        "<style>html,body{margin:0}img{display:block;width:96px}"
+        "#bar{position:fixed;top:0;left:0;width:480px;height:24px;"
+        "background:#246;box-shadow:0 2px 6px #000}"
+        "#long{height:2000px}#grow{height:120px}</style>"
+        "<div id=bar>Header</div><p id=text style='margin-top:40px'>Text</p>"
+        "<img id=a src=\"%s\"><img id=b src=\"%s\"><div id=long></div>",
+        data_url, other_url);
+    free(data_url);
+    free(other_url);
+    if (written <= 0 || (size_t) written >= html_capacity) {
+        free(html);
+        return false;
+    }
+    Budget budget;
+    budget_init(&budget, 24 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    static NavigationSession navigation;
+    memset(&navigation, 0, sizeof(navigation));
+    bool ready = installed && navigation_init(&navigation, &budget, 4);
+    if (ready) {
+        navigation_enable_external_resources(
+            &navigation, 2, 32 * 1024, 16 * 1024,
+            4, 512 * 1024, 256 * 1024, 4 * MIB, 1000);
+    }
+    bool committed = ready && navigation_commit_static_html(
+        &navigation, navigation_begin(&navigation),
+        "https://retarget.test/damage", html, (size_t) written, 480,
+        NULL, NULL, true);
+    for (size_t pumps = 0; committed && pumps < 64
+         && navigation_background_resources_pending(&navigation); pumps++)
+        if (!navigation_run_background_resources(&navigation)) break;
+    static uint16_t frame[480 * 272], before[480 * 272];
+    TileCache cache;
+    bool cached = committed
+        && tile_cache_init(&cache, &budget, &navigation.page.layout, 24)
+        && tile_cache_set_frame(&cache, frame, 480 * 272);
+    size_t applied = navigation.incremental_relayouts;
+    /* A relayout that damages most of the screen, applied and painted. */
+    bool relaid = cached && tile_cache_render_frame(&cache, 0, 480, 272, NULL)
+        && retarget_set_id(&navigation, "text", "grow")
+        && navigation_relayout(&navigation)
+        && navigation.relayout_damage_valid
+        && navigation.relayout_damage_bottom > navigation.relayout_damage_top
+        && retarget_apply_generation(&navigation, &cache, &applied)
+        && tile_cache_render_frame(&cache, 0, 480, 272, NULL)
+        && cache.fixed_ready;
+    memcpy(before, frame, sizeof(before));
+    size_t invalidations = cached ? cache.invalidations : 0;
+    size_t rasterized = cached ? cache.rasterized : 0;
+    size_t fixed_builds = cached ? cache.fixed_cache_builds : 0;
+    size_t steps = 0, generations = navigation.incremental_relayouts;
+    bool stale_rect = false;
+    for (; relaid && steps < 64
+         && navigation_image_retarget_pending(&navigation); steps++) {
+        bool changed = navigation_run_image_retarget_work(&navigation);
+        if (changed && navigation.relayout_damage_right
+                > navigation.relayout_damage_left) stale_rect = true;
+        if (!retarget_apply_generation(&navigation, &cache, &applied)
+            || !tile_cache_render_frame(&cache, 0, 480, 272, NULL)) {
+            relaid = false;
+            break;
+        }
+    }
+    const ImageResource *a = relaid ? retarget_image(&navigation, "a") : NULL;
+    bool reduced = a != NULL && a->width == 96
+        && navigation.incremental_relayouts == generations + 2u;
+    bool kept = relaid && !stale_rect
+        && cache.invalidations == invalidations
+        && cache.rasterized == rasterized
+        && cache.fixed_cache_builds == fixed_builds
+        && memcmp(frame, before, sizeof(before)) == 0;
+    if (!relaid || !reduced || !kept)
+        fprintf(stderr, "retarget damage: relaid=%d reduced=%d steps=%zu "
+                "generations +%zu stale=%d invalidations %zu->%zu "
+                "rasterized %zu->%zu fixed builds %zu->%zu same=%d\n",
+                relaid, reduced, steps,
+                navigation.incremental_relayouts - generations, stale_rect,
+                invalidations, cached ? cache.invalidations : 0,
+                rasterized, cached ? cache.rasterized : 0,
+                fixed_builds, cached ? cache.fixed_cache_builds : 0,
+                memcmp(frame, before, sizeof(before)) == 0);
+    if (cached) tile_cache_destroy(&cache);
+    if (installed) navigation_destroy(&navigation);
+    free(html);
+    bool clean = budget.current == 0;
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return relaid && reduced && kept && clean;
 }

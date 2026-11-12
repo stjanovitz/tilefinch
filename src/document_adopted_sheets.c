@@ -34,7 +34,10 @@ typedef struct {
     uint32_t cache_revision;
     /* Parses of the current text so far: the form is kept from the second
        on, so a sheet that is parsed once never pays for a cache. */
-    uint32_t parses;
+    uint16_t parses;
+    /* Whether a parse of the current text declared @keyframes: 0 not yet
+       recorded, 1 no, 2 yes (document_constructed_sheet_note_keyframes). */
+    uint8_t keyframes;
 } DocumentConstructedSheet;
 
 typedef struct {
@@ -48,8 +51,8 @@ typedef struct {
 
 _Static_assert(DOCUMENT_CONSTRUCTED_SHEET_LIMIT <= 256u,
                "adopted sheet indices must fit one byte");
-_Static_assert(DOCUMENT_ADOPTION_ROOT_LIMIT <= 256u,
-               "sorted root indices must fit one byte");
+_Static_assert(DOCUMENT_ADOPTION_ROOT_LIMIT <= 65536u,
+               "sorted root indices must fit 16 bits");
 
 struct DocumentAdoptedSheets {
     DocumentConstructedSheet sheets[DOCUMENT_CONSTRUCTED_SHEET_LIMIT];
@@ -59,7 +62,7 @@ struct DocumentAdoptedSheets {
     size_t list_count, list_capacity;
     /* Indices into `lists` sorted by root address, for the per-node
        carrier lookups mutation classification makes. */
-    uint8_t *by_root;
+    uint16_t *by_root;
     size_t text_bytes;
     /* Bytes of every sheet's cached parsed form. */
     size_t cache_bytes;
@@ -98,17 +101,19 @@ static bool adopted_reserve_list(PocDocument *document,
         : registry->list_capacity * 2u;
     if (capacity > DOCUMENT_ADOPTION_ROOT_LIMIT)
         capacity = DOCUMENT_ADOPTION_ROOT_LIMIT;
-    /* At most 256 entries; the byte index follows the aligned list array. */
+    /* At most DOCUMENT_ADOPTION_ROOT_LIMIT entries; the 16-bit index
+       follows the aligned list array. */
     BudgetAllocationOwner previous = document_allocation_owner_enter(document);
     DocumentAdoptionList *lists = budget_calloc(document->budget, capacity,
-        sizeof(*lists) + sizeof(uint8_t));
+        sizeof(*lists) + sizeof(uint16_t));
     document_allocation_owner_leave(document, previous);
     if (lists == NULL) return false;
-    uint8_t *by_root = (uint8_t *) (lists + capacity);
+    uint16_t *by_root = (uint16_t *) (lists + capacity);
     if (registry->list_count != 0) {
         memcpy(lists, registry->lists,
                registry->list_count * sizeof(*lists));
-        memcpy(by_root, registry->by_root, registry->list_count);
+        memcpy(by_root, registry->by_root,
+               registry->list_count * sizeof(*by_root));
     }
     budget_free(document->budget, registry->lists);
     registry->lists = lists;
@@ -162,9 +167,9 @@ static void adopted_reindex(DocumentAdoptedSheets *registry)
 {
     /* At most DOCUMENT_ADOPTION_ROOT_LIMIT entries: insertion sort. */
     for (size_t i = 0; i < registry->list_count; i++)
-        registry->by_root[i] = (uint8_t) i;
+        registry->by_root[i] = (uint16_t) i;
     for (size_t i = 1; i < registry->list_count; i++) {
-        uint8_t value = registry->by_root[i];
+        uint16_t value = registry->by_root[i];
         uintptr_t key = (uintptr_t) registry->lists[value].root;
         size_t j = i;
         while (j > 0 && (uintptr_t)
@@ -452,6 +457,7 @@ bool document_constructed_sheet_note_text(PocDocument *document,
     entry->text_bytes = text_bytes;
     entry->revision++;
     entry->parses = 0;
+    entry->keyframes = 0;
     /* The parsed form is of the old text. */
     adopted_cache_release(document, registry, entry);
     if (active != NULL) *active = sheet_active(registry, sheet);
@@ -799,8 +805,38 @@ bool document_constructed_sheet_note_parse(const PocDocument *document,
     DocumentConstructedSheet *entry = document == NULL ? NULL
         : adopted_sheet_find(document->adopted_sheets, sheet);
     if (entry == NULL || entry->revision != revision) return false;
-    if (entry->parses != UINT32_MAX) entry->parses++;
+    if (entry->parses != UINT16_MAX) entry->parses++;
     return entry->parses > 1u;
+}
+
+void document_constructed_sheet_note_keyframes(const PocDocument *document,
+                                               const lxb_dom_node_t *sheet,
+                                               uint32_t revision,
+                                               bool keyframes)
+{
+    DocumentConstructedSheet *entry = document == NULL ? NULL
+        : adopted_sheet_find(document->adopted_sheets, sheet);
+    if (entry != NULL && entry->revision == revision)
+        entry->keyframes = keyframes ? 2u : 1u;
+}
+
+int document_constructed_sheet_keyframes(const PocDocument *document,
+                                         const lxb_dom_node_t *sheet)
+{
+    const DocumentConstructedSheet *entry = document == NULL ? NULL
+        : adopted_sheet_find(document->adopted_sheets, sheet);
+    return entry == NULL || entry->keyframes == 0 ? -1
+        : entry->keyframes == 2u;
+}
+
+bool document_constructed_sheet_revision(const PocDocument *document,
+                                         const lxb_dom_node_t *sheet,
+                                         uint32_t *revision)
+{
+    const DocumentConstructedSheet *entry = document == NULL ? NULL
+        : adopted_sheet_find(document->adopted_sheets, sheet);
+    if (entry != NULL && revision != NULL) *revision = entry->revision;
+    return entry != NULL;
 }
 
 size_t document_constructed_sheet_cache_bytes(const PocDocument *document)

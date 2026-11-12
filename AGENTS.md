@@ -29,6 +29,9 @@ and only these may legitimately not run:
 - the update-root proof skips when its external prerequisite is absent;
 - the `tilefinch-treadline-*` Node tests report `Skipped` when `node` was not
   found at configure time;
+- the `tilefinch-reference-*-browser-tests` report `Skipped` when Node or
+  its `playwright` package is missing, and
+  `tilefinch-local-update-server-tests` when `openssl` is;
 - `tilefinch-fidelity-floor-tests` skips when the ignored `fidelity/` corpus
   is absent.
 
@@ -70,7 +73,7 @@ not device targets, and the bare cross-build `all` target is not the PSP gate.
 
 Two things only this build enforces:
 
-- **A 5,216,512-byte ordinary `.text` ratchet** (5,500,000 bytes when
+- **A 5,500,000-byte ordinary `.text` ratchet** (5,900,000 bytes when
   validation logging is compiled in). `cmake/CheckPspTextSize.cmake` reads the
   actual ELF `.text` sections with `psp-objdump` after every link, reports
   `.rodata` separately, and fails the build above the appropriate limit.

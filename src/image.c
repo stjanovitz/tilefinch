@@ -1177,6 +1177,84 @@ bool images_release_canvas(ImageResources *images, Budget *budget,
     return true;
 }
 
+#if !defined(__PSP__)
+static size_t image_canvas_alpha_scan_pixels;
+
+size_t images_test_canvas_alpha_scan_pixels(void)
+{
+    return image_canvas_alpha_scan_pixels;
+}
+#endif
+
+/* True when every alpha byte in the rectangle is 255; otherwise reports
+   the first translucent pixel's index. */
+static bool image_canvas_rect_opaque(const unsigned char *pixels, int width,
+                                     int left, int top, int right,
+                                     int bottom, uint32_t *translucent)
+{
+    for (int y = top; y < bottom; y++) {
+        const unsigned char *row = pixels + ((size_t) y * (size_t) width
+                                             + (size_t) left) * 4u;
+        for (int x = left; x < right; x++, row += 4) {
+            if (row[3] == 255u) continue;
+#if !defined(__PSP__)
+            image_canvas_alpha_scan_pixels += (size_t) (y - top)
+                * (size_t) (right - left) + (size_t) (x - left) + 1u;
+#endif
+            *translucent = (uint32_t) ((size_t) y * (size_t) width
+                                       + (size_t) x);
+            return false;
+        }
+    }
+#if !defined(__PSP__)
+    image_canvas_alpha_scan_pixels += (size_t) (bottom - top)
+        * (size_t) (right - left);
+#endif
+    return true;
+}
+
+/* Keeps canvas_opaque exact after a 2D commit wrote the dirty rectangle,
+   reading no more than that rectangle unless it just covered the only
+   translucent pixel known (NB-08). A fresh surface is zero outside the
+   rectangle. Surfaces are at most 512 KiB, so pixel indices fit 32 bits. */
+static void image_canvas_update_opacity(ImageResource *resource,
+                                        const unsigned char *pixels,
+                                        bool fresh, int left, int top,
+                                        int right, int bottom)
+{
+    int width = resource->width, height = resource->height;
+    bool full = left == 0 && top == 0 && right == width && bottom == height;
+    uint32_t translucent = 0;
+    bool opaque;
+    if (fresh && !full) {
+        /* A rectangle short of the surface misses its top-left or its
+           bottom-right pixel, which is still transparent. */
+        translucent = left > 0 || top > 0 ? 0u
+            : (uint32_t) ((size_t) width * (size_t) height - 1u);
+        opaque = false;
+    } else if (full || resource->canvas_opaque) {
+        opaque = image_canvas_rect_opaque(pixels, width, left, top,
+                                          right, bottom, &translucent);
+    } else {
+        uint32_t known = resource->canvas_translucent_pixel;
+        size_t known_x = known == 0u ? 0u : (known - 1u) % (size_t) width;
+        size_t known_y = known == 0u ? 0u : (known - 1u) / (size_t) width;
+        if (known != 0u && (known_x < (size_t) left
+                            || known_x >= (size_t) right
+                            || known_y < (size_t) top
+                            || known_y >= (size_t) bottom)) {
+            resource->canvas_opaque = false;
+            return;
+        }
+        opaque = image_canvas_rect_opaque(pixels, width, left, top,
+                                          right, bottom, &translucent)
+            && image_canvas_rect_opaque(pixels, width, 0, 0,
+                                        width, height, &translucent);
+    }
+    resource->canvas_opaque = opaque;
+    resource->canvas_translucent_pixel = opaque ? 0u : translucent + 1u;
+}
+
 ImageCanvasCommitResult images_commit_canvas_surface(
     ImageResources *images, Budget *budget, lxb_dom_node_t *node,
     const unsigned char *rgba_pixels, size_t rgba_length,
@@ -1216,7 +1294,9 @@ ImageCanvasCommitResult images_commit_canvas_surface(
     image_canvas_copy_rect(destination, rgba_pixels, width,
                            dirty_left, dirty_top,
                            dirty_right, dirty_bottom);
-    (void) images_set_canvas_opaque(images, node, false);
+    if (resource != NULL) image_canvas_update_opacity(
+        resource, destination, prepared != IMAGE_CANVAS_COMMIT_UPDATED,
+        dirty_left, dirty_top, dirty_right, dirty_bottom);
     return prepared;
 }
 
@@ -1229,6 +1309,7 @@ bool images_set_canvas_opaque(ImageResources *images,
         if (resource->node != node || !resource->is_canvas
             || resource->is_mask || resource->is_background) continue;
         resource->canvas_opaque = opaque;
+        resource->canvas_translucent_pixel = 0;
         return true;
     }
     return false;
@@ -1399,13 +1480,14 @@ bool images_replace_with_decoded_surface(ImageResources *images,
     for (size_t i = 0; i < images->count; i++) {
         ImageResource *alias = &images->items[i];
         if (i == index) continue;
-        if (retired->owns_pixels && alias->pixels == retired->pixels) {
+        if (retired->owns_pixels && !alias->owns_pixels
+            && alias->pixels == retired->pixels) {
             alias->pixel_body = retired->pixel_body;
             alias->owns_pixels = true;
             retired->owns_pixels = false;
             pixels_retained = true;
         }
-        if (retired->owns_encoded
+        if (retired->owns_encoded && !alias->owns_encoded
             && alias->encoded == retired->encoded
             && alias->encoded_body == retired->encoded_body) {
             alias->owns_encoded = true;
@@ -1515,14 +1597,17 @@ static bool image_owns_surface(const ImageResource *item)
 }
 
 /* Moves ownership of a shared surface (pixels and markup) between two
-   entries that show it. */
+   entries that show it. Two entries can each hold a lease on one surface (the
+   decoded cache hands one to each acquisition), so a receiver that already
+   owns takes nothing: `from` keeps what stays and its owner releases it. */
 static void image_move_surface(ImageResource *from, ImageResource *to)
 {
-    if (from->owns_pixels) {
+    if (from->owns_pixels && !to->owns_pixels) {
         from->owns_pixels = false;
         to->owns_pixels = true;
     }
-    if (from->owns_encoded && from->encoded == to->encoded) {
+    if (from->owns_encoded && !to->owns_encoded
+        && from->encoded == to->encoded) {
         from->owns_encoded = false;
         to->owns_encoded = true;
     }
@@ -1747,9 +1832,10 @@ static bool load_inline_svg_source(ImageLoadContext *context, lxb_dom_node_t *no
     image_trace("inline-svg-rasterize", source.data, source.length);
     uint64_t rasterize_started = image_profile_enabled()
         ? image_profile_now_us() : 0;
-    unsigned char *pixels = image_svg_decode(
+    bool limited = false;
+    unsigned char *pixels = image_svg_decode_bounded(
         source.data, source.length, context->budget, raster_limit,
-        &width, &height);
+        &width, &height, NULL, NULL, NULL, NULL, &limited);
     if (rasterize_started != 0) {
         images->stats.inline_svg_rasterize_us +=
             image_profile_now_us() - rasterize_started;
@@ -1761,10 +1847,11 @@ static bool load_inline_svg_source(ImageLoadContext *context, lxb_dom_node_t *no
         budget_free(context->budget, source.data);
         if (context->budget->failure_count != failures_before) return false;
         /* Nothing is retained, so a refused raster never spends the count.
-           Once the count is spent the decoder was held to icon size, and a
-           larger picture is a limit skip rather than an unsupported one. */
+           Only markup no decoder takes is unsupported: a picture past what is
+           left of the decoded quota, or past icon size once the count is
+           spent, is a limit skip, which viewport admission looks for. */
         images->stats.count_exempt++;
-        if (count_exhausted) {
+        if (count_exhausted || limited) {
             images->stats.skipped_limit++;
             image_trace("inline-svg-count-limit", "", 0);
         } else {
@@ -2437,6 +2524,56 @@ static bool image_svg_oversize_target(void *opaque, int source_width,
     return *width > 0 && *height > 0;
 }
 
+/* A large SVG raster painted only as CSS backgrounds is measured now and
+   rasterized later when nothing needs it yet: in a load whose next layout
+   decodes what it leaves (decode_after_layout), once that layout finds a
+   paint of it near the reader (images_retarget_decode_awaiting); in a load
+   whose live boxes put it far below the reader, once display retargeting
+   sees the reader approach (IMAGE_RETARGET_DISTANT). Only markup that is
+   cheap to parse a second time beside the raster it may spare takes part:
+   at least this many raster bytes per markup byte (a parse costs about as
+   much per markup byte as a raster does per 256 raster bytes). */
+#define IMAGE_SVG_DEFER_RASTER_BYTES_PER_MARKUP_BYTE 512u
+
+typedef struct {
+    size_t markup_length;
+    size_t decoded_limit;
+} ImageSvgDeferContext;
+
+/* Whether this load may leave a large SVG background to be rasterized
+   later: the layout that follows decodes what the load leaves for it
+   (*far false), or the live page's boxes put every element that waits for
+   it far from the reader (*far true: display retargeting rasterizes it
+   when the reader approaches). */
+static bool image_svg_background_deferrable(const ImageLoadContext *context,
+                                            const PendingImageFetch *pending,
+                                            bool *far)
+{
+    *far = false;
+    const ImageLayoutBoxes *boxes = context->layout_boxes;
+    if (context->eager_decode_rasters || boxes == NULL
+        || !image_pending_backgrounds_only(pending)) return false;
+    if (boxes->decode_after_layout) return true;
+    if (!boxes->reader_known) return false;
+    for (size_t i = 0; i < pending->target_count; i++) {
+        if (!layout_image_box_far(boxes, pending->targets[i].node))
+            return false;
+    }
+    *far = true;
+    return true;
+}
+
+static bool image_svg_defer_background(void *opaque, int source_width,
+                                       int source_height)
+{
+    const ImageSvgDeferContext *defer = opaque;
+    uint64_t bytes = (uint64_t) source_width * (uint64_t) source_height * 4u;
+    return bytes >= IMAGE_RETARGET_DISTANT_MINIMUM_BYTES
+        && bytes <= defer->decoded_limit
+        && (uint64_t) defer->markup_length
+               <= bytes / IMAGE_SVG_DEFER_RASTER_BYTES_PER_MARKUP_BYTE;
+}
+
 typedef enum {
     IMAGE_DECODED_CACHE_MISS = 0,
     IMAGE_DECODED_CACHE_USED,
@@ -2889,33 +3026,43 @@ static bool finish_image_fetch(ImageLoadContext *context,
                                - images->stats.decoded_bytes;
     unsigned char *pixels = NULL;
     bool svg_limited = false;
+    bool svg_deferred = false, svg_far = false;
+    /* The parse of a large SVG background left for the layout that follows,
+       kept so that layout's raster does not parse it again. */
+    ImageSvgParse *svg_parse = NULL;
     if (is_svg && (!external_use || external_symbol.data != NULL)) {
-        uint64_t svg_checkpoint = budget_checkpoint(context->budget);
-        size_t svg_baseline = context->budget->current;
         ImageSvgOversizeContext oversize = {
             pending, context->viewport_width, decoded_remaining
         };
-        pixels = image_svg_decode_bounded(
+        ImageSvgDeferContext defer = {decode_length, decoded_remaining};
+        bool deferrable = !external_use
+            && image_svg_background_deferrable(context, pending, &svg_far);
+        size_t keep_limit = deferrable && !svg_far
+            ? images_retarget_svg_parse_allowance(images) : 0;
+        pixels = image_svg_decode_deferrable(
             decode_data, decode_length, context->budget, decoded_remaining,
             &width, &height,
             external_use ? NULL : image_svg_oversize_target, &oversize,
-            &svg_source_width, &svg_source_height, &svg_limited);
-        supported = pixels != NULL;
-        /* NanoSVG does not expose a partial parse object when parsing fails.
-           Its scratch is transaction-local, so reclaim that generation when
-           no pixel ownership was returned. */
-        if (pixels == NULL && context->budget->current != svg_baseline) {
-            budget_rollback(context->budget, svg_checkpoint);
-        }
+            deferrable ? image_svg_defer_background : NULL, &defer,
+            &svg_source_width, &svg_source_height, &svg_limited,
+            &svg_deferred, keep_limit, keep_limit != 0 ? &svg_parse : NULL);
+        /* The decoder reclaims its own scratch, including what NanoSVG
+           leaks on malformed input, through its allocation owner. Anything
+           else allocated meanwhile (by a cooperation hook) is not ours. */
+        supported = pixels != NULL || svg_deferred;
     }
     /* A kept raster keeps its markup: the response (usually a lease on the
        HTTP cache's copy), the data: body or the referenced symbol. */
-    bool keep_svg = pixels != NULL
+    bool keep_svg = (pixels != NULL || svg_deferred)
         && ((width != svg_source_width || height != svg_source_height)
             || image_svg_keeps_source(
                 (size_t) width * (size_t) height * 4u, decode_length));
     if (!keep_svg || !external_use)
         budget_free(context->budget, external_symbol.data);
+    if (!keep_svg) {
+        image_svg_parse_release(svg_parse);
+        svg_parse = NULL;
+    }
     /* Memory, the decoded-bytes quota, a declined oversize target, nesting
        past the parser's depth limits and re-entry are limits, like a
        raster's: no failure record and no error event. Only markup no
@@ -2935,6 +3082,7 @@ static bool finish_image_fetch(ImageLoadContext *context,
         image_trace("decode-unsupported", fetched->effective_url,
                     strlen(fetched->effective_url));
         budget_free(context->budget, pixels);
+        image_svg_parse_release(svg_parse);
         if (keep_svg && external_use)
             budget_free(context->budget, external_symbol.data);
         fetch_result_destroy(fetched);
@@ -3015,6 +3163,7 @@ static bool finish_image_fetch(ImageLoadContext *context,
     }
     if (decoded > decoded_limit) {
         images->stats.skipped_limit++;
+        image_svg_parse_release(svg_parse);
         if (keep_svg && external_use)
             budget_free(context->budget, external_symbol.data);
         budget_free(context->budget, pixels);
@@ -3071,6 +3220,19 @@ static bool finish_image_fetch(ImageLoadContext *context,
         }
     }
     if (keep_svg) resource.retarget_flags = IMAGE_RETARGET_VECTOR;
+    if (svg_deferred) {
+        /* Its markup is kept below; the layout that follows rasterizes it
+           at this size when a paint of it is near the reader. */
+        resource.owns_pixels = false;
+        resource.full_width = width;
+        resource.full_height = height;
+        resource.retarget_flags |= IMAGE_RETARGET_DROPPED
+            | (svg_far ? IMAGE_RETARGET_DISTANT
+                       : IMAGE_RETARGET_AWAITING_LAYOUT);
+        images->retarget.distant_deferred++;
+        image_trace("svg-raster-deferred", pending->url,
+                    pending->url == NULL ? 0 : strlen(pending->url));
+    }
     if (keep_svg && external_use) {
         resource.encoded = (unsigned char *) external_symbol.data;
         resource.encoded_length = decode_length;
@@ -3165,6 +3327,7 @@ static bool finish_image_fetch(ImageLoadContext *context,
         }
     }
     if (!image_add(images, resource)) {
+        image_svg_parse_release(svg_parse);
         image_resource_release_owned_pixels(context->budget, &resource);
         if (resource.encoded_body != NULL) {
             browser_shared_body_release(resource.encoded_body);
@@ -3174,11 +3337,13 @@ static bool finish_image_fetch(ImageLoadContext *context,
         fetch_result_destroy(fetched);
         return false;
     }
+    images_retarget_hold_svg_parse(images, resource.encoded, svg_parse);
     images->stats.loaded++;
     if (primary.is_mask) images->stats.masks_loaded++;
     if (primary.is_background) images->stats.backgrounds_loaded++;
     images->stats.encoded_bytes += encoded_length;
-    if (is_svg) images->stats.decoded_bytes += decoded;
+    if (is_svg && resource.pixels != NULL)
+        images->stats.decoded_bytes += decoded;
     if (!is_svg && resource.pixels != NULL) {
         images->stats.decoded_bytes += decoded;
     }
@@ -4456,10 +4621,15 @@ static bool image_process_priority_node(
         context, node, source, source_length, false, false, PSEUDO_NONE);
 }
 
-static bool image_process_refresh_node(
-    ImageLoadContext *context, lxb_dom_node_t *node)
+/* The style `node` inherits, through the same bounded ancestor chain and
+   inheritance root as complete discovery. False past the bound; `*visible`
+   false when a complete traversal would not reach it. */
+static bool image_resolve_inherited_style(
+    ImageLoadContext *context, lxb_dom_node_t *node, ComputedStyle *inherited,
+    bool *has_inherited, bool *visible)
 {
-    enum { MAXIMUM_ANCESTORS = 64 };
+    enum { MAXIMUM_ANCESTORS = IMAGE_SUBTREE_ANCESTOR_LIMIT };
+    *visible = false;
     if (context == NULL || node == NULL) return false;
     lxb_dom_node_t *ancestors[MAXIMUM_ANCESTORS];
     size_t count = 0;
@@ -4522,6 +4692,20 @@ static bool image_process_refresh_node(
            element. Refreshing one exact resource must retain that rule. */
         if (parent.display == DISPLAY_NONE || parent.hidden) return true;
     }
+    *inherited = parent;
+    *has_inherited = has_parent;
+    *visible = true;
+    return true;
+}
+
+static bool image_process_refresh_node(
+    ImageLoadContext *context, lxb_dom_node_t *node)
+{
+    ComputedStyle parent;
+    bool has_parent = false, visible = false;
+    if (!image_resolve_inherited_style(context, node, &parent, &has_parent,
+                                       &visible)) return false;
+    if (!visible) return true;
     ComputedStyle style = {0};
     bool traverse = true;
     return image_process_node(
@@ -4632,11 +4816,14 @@ static bool image_process_priority_target(
     return loaded;
 }
 
+/* `node` and what follows it in document order, or with `subtree_only` just
+   the subtree it roots. */
 static bool walk_images(ImageLoadContext *context, lxb_dom_node_t *node,
-                        const ComputedStyle *parent)
+                        const ComputedStyle *parent, bool subtree_only)
 {
     ImageTraversalEntry *entries = NULL;
     size_t count = 0, capacity = 0, visited = 0;
+    const lxb_dom_node_t *const root = subtree_only ? node : NULL;
     bool ok = image_traversal_push(
         context, &entries, &count, &capacity, node, parent);
     while (ok && count != 0) {
@@ -4662,8 +4849,9 @@ static bool walk_images(ImageLoadContext *context, lxb_dom_node_t *node,
            document order. Each pending branch owns the exact inherited style
            it needs, so no C recursion or fixed stack-sized style array is
            required. */
-        ok = image_traversal_push(
-            context, &entries, &count, &capacity, node->next, node_parent);
+        if (node != root)
+            ok = image_traversal_push(
+                context, &entries, &count, &capacity, node->next, node_parent);
         if (ok && traverse) {
             ok = image_traversal_push(
                 context, &entries, &count, &capacity, node->first_child,
@@ -4717,7 +4905,7 @@ static bool images_load_external_impl(
     ImageResources *images, lxb_dom_node_t *const *priority_nodes,
     size_t priority_node_count, const ImagePriorityTarget *priority_targets,
     size_t priority_target_count, bool full_traversal,
-    bool refresh_complete_nodes, Budget *budget,
+    bool refresh_complete_nodes, bool walk_subtrees, Budget *budget,
     const char *base_url, const char *document_url,
     const char *referrer_policy, size_t maximum_count,
     size_t maximum_total_encoded_bytes,
@@ -4829,7 +5017,7 @@ static bool images_load_external_impl(
         .refresh_retired_count = priority_node_count,
         .deadline_ms = image_now_ms() + (double) timeout_ms,
         .slice_started_us = tilefinch_platform_monotonic_time_us(),
-        .eager_decode_rasters = !full_traversal
+        .eager_decode_rasters = !full_traversal && !walk_subtrees
             && (priority_node_count != 0 || priority_target_count != 0)
     };
     uint64_t traversal_started = image_profile_enabled()
@@ -4840,7 +5028,7 @@ static bool images_load_external_impl(
        Small sheets and one-node priority loads keep the allocation-free path.
        Refusal preserves uncached matching; nested owners keep their cache,
        and cleanup covers cancellation and every early return. */
-    bool cache_styles = (full_traversal
+    bool cache_styles = (full_traversal || walk_subtrees
         || (refresh_complete_nodes && priority_node_count > 1u))
         && stylesheet->count >= 64u;
     ImageStyleCacheScope style_scope
@@ -4889,7 +5077,18 @@ static bool images_load_external_impl(
                 &context, html, &root, &html_style, &html_traverse);
         }
         if (traversed && html_traverse) {
-            traversed = walk_images(&context, body, &html_style);
+            traversed = walk_images(&context, body, &html_style, false);
+        }
+    } else if (walk_subtrees) {
+        for (size_t i = 0; traversed && i < priority_node_count; i++) {
+            ComputedStyle inherited;
+            bool has_inherited = false, visible = false;
+            traversed = image_resolve_inherited_style(
+                &context, priority_nodes[i], &inherited, &has_inherited,
+                &visible);
+            if (traversed && visible)
+                traversed = walk_images(&context, priority_nodes[i],
+                    has_inherited ? &inherited : NULL, true);
         }
     } else {
         for (size_t i = 0; traversed && i < priority_node_count; i++) {
@@ -4977,7 +5176,7 @@ bool images_load_external(const PocDocument *document, Stylesheet *stylesheet,
 {
     bool loaded = images_load_external_impl(
         document, stylesheet, images, NULL, 0, NULL, 0, true, false,
-        budget, base_url, document_url, referrer_policy, maximum_count,
+        false, budget, base_url, document_url, referrer_policy, maximum_count,
         maximum_total_encoded_bytes, maximum_single_encoded_bytes,
         maximum_decoded_bytes, timeout_ms, scheduler, session,
         NULL, NULL, 0, false, NULL, 0, NULL);
@@ -5013,7 +5212,7 @@ bool images_load_external_reusing_layout_styles_deferred(
 {
     bool loaded = images_load_external_impl(
         document, stylesheet, images, NULL, 0, NULL, 0, true, false,
-        budget, base_url, document_url, referrer_policy, maximum_count,
+        false, budget, base_url, document_url, referrer_policy, maximum_count,
         maximum_total_encoded_bytes, maximum_single_encoded_bytes,
         maximum_decoded_bytes, timeout_ms, scheduler, session,
         style_cache, fonts, viewport_width, defer_document_images, NULL, 0, NULL);
@@ -5033,10 +5232,32 @@ bool images_load_external_reusing_layout_styles_excluding(
 {
     bool loaded = images_load_external_impl(
         document, stylesheet, images, NULL, 0, NULL, 0, true, false,
-        budget, base_url, document_url, referrer_policy, maximum_count,
+        false, budget, base_url, document_url, referrer_policy, maximum_count,
         maximum_total_encoded_bytes, maximum_single_encoded_bytes,
         maximum_decoded_bytes, timeout_ms, scheduler, session,
         style_cache, fonts, viewport_width, false, deferred_nodes, deferred_node_count, NULL);
+    if (images != NULL) images->priority_staged = false;
+    return loaded;
+}
+
+bool images_load_external_within_subtrees(
+    const PocDocument *document, Stylesheet *stylesheet,
+    ImageResources *images, lxb_dom_node_t *const *roots, size_t root_count,
+    Budget *budget, const char *base_url, const char *document_url,
+    const char *referrer_policy, size_t maximum_count,
+    size_t maximum_total_encoded_bytes,
+    size_t maximum_single_encoded_bytes, size_t maximum_decoded_bytes,
+    long timeout_ms, FetchScheduler *scheduler, BrowserSession *session,
+    LayoutReuseCache *style_cache, const FontSet *fonts, int viewport_width,
+    lxb_dom_node_t *const *deferred_nodes, size_t deferred_node_count)
+{
+    bool loaded = images_load_external_impl(
+        document, stylesheet, images, roots, root_count, NULL, 0, false, false,
+        true, budget, base_url, document_url, referrer_policy, maximum_count,
+        maximum_total_encoded_bytes, maximum_single_encoded_bytes,
+        maximum_decoded_bytes, timeout_ms, scheduler, session,
+        style_cache, fonts, viewport_width, false, deferred_nodes,
+        deferred_node_count, NULL);
     if (images != NULL) images->priority_staged = false;
     return loaded;
 }
@@ -5169,7 +5390,7 @@ bool images_rebuild_external_reusing_rasters(
     else image_rebuild_release_unlendable(images, false);
     bool loaded = images_load_external_impl(
         document, stylesheet, &replacement, NULL, 0, NULL, 0, true, false,
-        budget, base_url, document_url, referrer_policy, maximum_count,
+        false, budget, base_url, document_url, referrer_policy, maximum_count,
         maximum_total_encoded_bytes, maximum_single_encoded_bytes,
         maximum_decoded_bytes, timeout_ms, scheduler, session,
         style_cache, fonts, viewport_width, false, deferred_nodes,
@@ -5223,7 +5444,7 @@ bool images_load_external_priority_nodes(
     if (nodes == NULL) return false;
     bool loaded = images_load_external_impl(
         document, stylesheet, images, nodes, node_count, NULL, 0,
-        false, false, budget, base_url, document_url, referrer_policy,
+        false, false, false, budget, base_url, document_url, referrer_policy,
         maximum_count,
         maximum_total_encoded_bytes, maximum_single_encoded_bytes,
         maximum_decoded_bytes, timeout_ms, scheduler, session,
@@ -5258,6 +5479,7 @@ static size_t image_refresh_owned_encoded_bytes(
             if (alias != i
                 && !image_node_in_refresh_set(
                     candidate->node, nodes, node_count)
+                && !candidate->owns_encoded
                 && candidate->encoded == item->encoded
                 && candidate->encoded_body == item->encoded_body) {
                 retained_alias = true;
@@ -5290,6 +5512,7 @@ static size_t image_refresh_owned_decoded_bytes(
             if (alias != i
                 && !image_node_in_refresh_set(
                     candidate->node, nodes, node_count)
+                && !candidate->owns_pixels
                 && candidate->pixels == item->pixels) {
                 retained_alias = true;
                 break;
@@ -5352,11 +5575,12 @@ static void image_refresh_transfer_old_ownership(
         if (i == owner_index
             || image_node_in_refresh_set(
                    candidate->node, nodes, node_count)) continue;
-        if (owner->owns_pixels && candidate->pixels == owner->pixels) {
+        if (owner->owns_pixels && !candidate->owns_pixels
+            && candidate->pixels == owner->pixels) {
             candidate->owns_pixels = true;
             owner->owns_pixels = false;
         }
-        if (owner->owns_encoded
+        if (owner->owns_encoded && !candidate->owns_encoded
             && candidate->encoded == owner->encoded
             && candidate->encoded_body == owner->encoded_body) {
             candidate->owns_encoded = true;
@@ -5472,6 +5696,238 @@ void images_discard_nodes(
         ? images->stats.decoded_bytes - retired_decoded : 0u;
 }
 
+bool images_admission_scarce(
+    const ImageResources *images, size_t maximum_count,
+    size_t maximum_total_encoded_bytes, size_t maximum_decoded_bytes)
+{
+    if (images == NULL) return false;
+    const ExternalImageStats *stats = &images->stats;
+    size_t exempt = stats->count_exempt <= stats->attempted
+        ? stats->count_exempt : stats->attempted;
+    return stats->skipped_limit != 0
+        || images->count >= MAX_TRACKED_IMAGE_NODES
+        || stats->attempted - exempt >= maximum_count
+        || stats->encoded_bytes >= maximum_total_encoded_bytes
+        || stats->decoded_bytes >= maximum_decoded_bytes;
+}
+
+bool image_resource_evictable(const ImageResource *image)
+{
+    return image != NULL && !image->is_mask && !image->is_background
+        && !image->is_canvas && !image->adopted_surface
+        && image->canvas_native_surface == NULL
+        && image->pseudo == PSEUDO_NONE && !image->borrows_previous
+        && (image->retarget_flags & IMAGE_RETARGET_PINNED) == 0;
+}
+
+/* The distance of the nearest entry showing this entry's surface; zero when
+   one of them has to keep it. */
+static uint32_t image_surface_distance(
+    const ImageResources *images, size_t index, const uint32_t *distances)
+{
+    const void *identity = image_resource_backing_identity(&images->items[index]);
+    uint32_t nearest = distances[index];
+    for (size_t i = 0; i < images->count; i++) {
+        if (i == index
+            || image_resource_backing_identity(&images->items[i]) != identity)
+            continue;
+        if (!image_resource_evictable(&images->items[i])) return 0;
+        if (distances[i] < nearest) nearest = distances[i];
+    }
+    return nearest;
+}
+
+/* Marks whole surfaces, the farthest first, until both quotas are met. Only
+   the last entry to show a surface frees it, so every entry showing it goes
+   together, and the nearest of them says how far the surface is. What these
+   entries hold that a retained entry shows passes to that entry and frees
+   nothing. Returns the number of entries marked. */
+static size_t images_mark_far_surfaces(
+    const ImageResources *images, const uint32_t *distances,
+    const uint8_t *order, size_t candidates, size_t maximum_total_encoded_bytes,
+    size_t maximum_decoded_bytes, bool *marked)
+{
+    size_t encoded = images->stats.encoded_bytes;
+    size_t decoded = images->stats.decoded_bytes;
+    if (encoded < maximum_total_encoded_bytes
+        && decoded < maximum_decoded_bytes) return 0;
+    uint8_t surfaces[MAX_TRACKED_IMAGE_NODES];
+    uint32_t nearest[MAX_TRACKED_IMAGE_NODES];
+    size_t count = 0;
+    /* Stable insertion, one entry per surface: at most the table's size. */
+    for (size_t c = 0; c < candidates; c++) {
+        size_t index = order[c];
+        const void *identity =
+            image_resource_backing_identity(&images->items[index]);
+        if (identity == NULL) continue;
+        bool seen = false;
+        for (size_t s = 0; s < count && !seen; s++)
+            seen = image_resource_backing_identity(
+                &images->items[surfaces[s]]) == identity;
+        uint32_t distance = seen ? 0
+            : image_surface_distance(images, index, distances);
+        if (distance == 0) continue;
+        size_t at = count++;
+        while (at != 0 && nearest[at - 1u] < distance) {
+            surfaces[at] = surfaces[at - 1u];
+            nearest[at] = nearest[at - 1u];
+            at--;
+        }
+        surfaces[at] = (uint8_t) index;
+        nearest[at] = distance;
+    }
+    size_t removed = 0;
+    for (size_t s = 0; s < count; s++) {
+        if (encoded < maximum_total_encoded_bytes
+            && decoded < maximum_decoded_bytes) break;
+        const void *identity =
+            image_resource_backing_identity(&images->items[surfaces[s]]);
+        size_t pixels = 0, markup = 0, members = 0;
+        for (size_t i = 0; i < images->count; i++) {
+            if (image_resource_backing_identity(&images->items[i]) != identity)
+                continue;
+            marked[i] = true;
+            members++;
+        }
+        for (size_t i = 0; i < images->count; i++) {
+            const ImageResource *item = &images->items[i];
+            if (!marked[i] || image_resource_backing_identity(item) != identity)
+                continue;
+            if (item->owns_pixels && item->pixels != NULL)
+                pixels += (size_t) item->width * (size_t) item->height * 4u;
+            bool held = false;
+            for (size_t at = 0; item->owns_encoded && !held
+                 && at < images->count; at++) {
+                const ImageResource *other = &images->items[at];
+                held = !marked[at] && !other->owns_encoded
+                    && other->encoded == item->encoded
+                    && other->encoded_body == item->encoded_body;
+            }
+            if (item->owns_encoded && !held) markup += item->encoded_length;
+        }
+        if (pixels == 0 && markup == 0) {
+            for (size_t i = 0; i < images->count; i++)
+                if (image_resource_backing_identity(&images->items[i]) == identity)
+                    marked[i] = false;
+            continue;
+        }
+        removed += members;
+        decoded = pixels <= decoded ? decoded - pixels : 0;
+        encoded = markup <= encoded ? encoded - markup : 0;
+    }
+    return removed;
+}
+
+/* Whether showing this entry's surface spends the image count: the same test
+   its admission made, from what the entry retains. */
+static bool image_surface_count_exempt(const ImageResource *item)
+{
+    if (image_refresh_svg_lendable(item))
+        return item->reused_raster_count_exempt
+            || image_svg_first_raster_bytes(item)
+                   <= IMAGE_COUNT_EXEMPT_DECODED_BYTES;
+    size_t length = 0;
+    const char *source = item->node == NULL ? NULL
+        : document_attribute(item->node, "src", &length);
+    return source != NULL && length > 5u && length <= IMAGE_COUNT_EXEMPT_DATA_URL_BYTES
+        && strncasecmp(source, "data:", 5) == 0;
+}
+
+size_t images_evict_farthest(
+    ImageResources *images, const uint32_t *distances, size_t slots,
+    size_t maximum_total_encoded_bytes, size_t maximum_decoded_bytes,
+    uint8_t *remap, bool *released)
+{
+    if (released != NULL) *released = false;
+    if (images == NULL || distances == NULL || remap == NULL
+        || images->count > MAX_TRACKED_IMAGE_NODES) return 0;
+    uint8_t order[MAX_TRACKED_IMAGE_NODES];
+    bool marked[MAX_TRACKED_IMAGE_NODES] = {false};
+    size_t candidates = 0;
+    /* Stable insertion by descending distance: at most the table's size. */
+    for (size_t i = 0; i < images->count; i++) {
+        if (distances[i] == 0 || !image_resource_evictable(&images->items[i]))
+            continue;
+        size_t at = candidates++;
+        while (at != 0 && distances[order[at - 1u]] < distances[i]) {
+            order[at] = order[at - 1u];
+            at--;
+        }
+        order[at] = (uint8_t) i;
+    }
+    ExternalImageStats *stats = &images->stats;
+    size_t removed = images_mark_far_surfaces(
+        images, distances, order, candidates, maximum_total_encoded_bytes,
+        maximum_decoded_bytes, marked);
+    /* A slot costs the same whichever entry gives it up, and an entry that
+       only shares a surface takes nothing away from another position. */
+    slots = removed < slots ? slots - removed : 0;
+    for (unsigned pass = 0; pass < 2u; pass++) {
+        for (size_t c = 0; c < candidates && slots != 0; c++) {
+            size_t at = order[c];
+            if (marked[at]
+                || (pass == 0u && image_owns_surface(&images->items[at])))
+                continue;
+            marked[at] = true;
+            removed++;
+            slots--;
+        }
+    }
+    if (removed == 0) return 0;
+    for (size_t i = 0; i < images->count; i++) {
+        if (!marked[i]) continue;
+        ImageResource *item = &images->items[i];
+        /* What a retained entry shows and does not itself own goes to it. The
+           pixels and the markup can have different holders, and what stays
+           was this entry's own to release. */
+        for (size_t at = 0; at < images->count; at++) {
+            ImageResource *other = &images->items[at];
+            if (at == i || marked[at]) continue;
+            if (item->owns_pixels && !other->owns_pixels
+                && other->pixels == item->pixels) {
+                other->pixel_body = item->pixel_body;
+                other->owns_pixels = true;
+                item->owns_pixels = false;
+            }
+            if (item->owns_encoded && !other->owns_encoded
+                && other->encoded == item->encoded
+                && other->encoded_body == item->encoded_body) {
+                other->owns_encoded = true;
+                item->owns_encoded = false;
+            }
+        }
+        if (!item->owns_pixels && !item->owns_encoded) continue;
+        size_t pixels = item->owns_pixels && item->pixels != NULL
+            ? (size_t) item->width * (size_t) item->height * 4u : 0;
+        size_t markup = item->owns_encoded ? item->encoded_length : 0;
+        if (stats->attempted != 0) {
+            stats->attempted--;
+            if (image_surface_count_exempt(item) && stats->count_exempt != 0)
+                stats->count_exempt--;
+        }
+        stats->decoded_bytes = pixels <= stats->decoded_bytes
+            ? stats->decoded_bytes - pixels : 0;
+        stats->encoded_bytes = markup <= stats->encoded_bytes
+            ? stats->encoded_bytes - markup : 0;
+        if (released != NULL && (pixels != 0 || markup != 0)) *released = true;
+        image_resource_release_owned_pixels(images->budget, item);
+        if (item->owns_encoded) {
+            if (item->encoded_body != NULL)
+                browser_shared_body_release(item->encoded_body);
+            else
+                budget_free(images->budget, item->encoded);
+            item->owns_encoded = false;
+        }
+    }
+    size_t write = 0;
+    for (size_t i = 0; i < images->count; i++) {
+        remap[i] = marked[i] ? IMAGE_EVICTED : (uint8_t) write;
+        if (!marked[i]) images->items[write++] = images->items[i];
+    }
+    images->count = write;
+    return removed;
+}
+
 bool images_refresh_external_nodes_reusing_layout_styles(
     const PocDocument *document, Stylesheet *stylesheet,
     ImageResources *images, lxb_dom_node_t *const *nodes, size_t node_count,
@@ -5519,7 +5975,7 @@ bool images_refresh_external_nodes_reusing_layout_styles(
 #endif
     if (!images_load_external_impl(
             document, stylesheet, &replacement, nodes, node_count, NULL, 0,
-            false, true, budget, base_url, document_url, referrer_policy,
+            false, true, false, budget, base_url, document_url, referrer_policy,
             maximum_count, maximum_total_encoded_bytes,
             maximum_single_encoded_bytes, maximum_decoded_bytes, timeout_ms,
             scheduler, session, style_cache, fonts, viewport_width,
@@ -5640,7 +6096,7 @@ bool images_load_external_priority_targets(
     if (targets == NULL) return false;
     bool loaded = images_load_external_impl(
         document, stylesheet, images, NULL, 0, targets, target_count,
-        false, false, budget, base_url, document_url, referrer_policy,
+        false, false, false, budget, base_url, document_url, referrer_policy,
         maximum_count,
         maximum_total_encoded_bytes, maximum_single_encoded_bytes,
         maximum_decoded_bytes, timeout_ms, scheduler, session,
@@ -5966,6 +6422,15 @@ bool image_resource_source_current(const Stylesheet *sheet,
         && image->source_hash == image_hash_bytes(source, length);
 }
 
+bool images_node_failed(const ImageResources *images,
+                        const lxb_dom_node_t *node)
+{
+    if (images == NULL || node == NULL) return false;
+    for (size_t i = 0; i < images->failure_count; i++)
+        if (images->failures[i].node == node) return true;
+    return false;
+}
+
 const ImageResource *images_find_node(const ImageResources *images,
                                       const lxb_dom_node_t *node)
 {
@@ -6078,6 +6543,7 @@ void images_destroy(ImageResources *images)
     if (images == NULL) return;
     if (images->budget != NULL) {
         images_retarget_plan_discard(images);
+        images_retarget_release_svg_parses(images);
         for (size_t i = 0; i < images->count; i++) {
             image_canvas_native_forget(&images->items[i]);
             image_resource_release_owned_pixels(

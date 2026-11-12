@@ -156,7 +156,8 @@ TILEFINCH_COLD_PATH PspStartupFailure psp_boot_load_config(
                     &process->config, legacy_path, psp_config_warning, NULL)) {
                 overrides_loaded = have_overrides_path
                     && psp_boot_config_write_overrides(
-                        &process->config, overrides_path);
+                        &process->config, overrides_path,
+                        PSP_BOOT_CONFIG_KEYS_OVERRIDES);
                 printf("tilefinch-config: legacy-overrides=%s\n",
                        overrides_loaded ? "migrated" : "active-not-saved");
             }

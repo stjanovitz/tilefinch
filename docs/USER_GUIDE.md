@@ -44,6 +44,13 @@ Keyboard** switches to the faster Danzeff layout. In Danzeff:
 - Start accepts, Select cancels, and the D-pad moves the text cursor or picks
   a matching bookmark or history entry.
 
+On a web page, accepting the text of a form's only text field (a search
+box) also sends the form, as Enter does on a computer; the page can still
+check or stop it. In a form with more text fields, such as a user name and
+a password, accepting only fills in the field: press Start on the focused
+field to send the form (in Danzeff, R+Start accepts and sends at once). A
+multi-line text box is never sent this way.
+
 Address completion stays on the PSP. URL history contributes only when you
 have turned history on.
 
@@ -233,6 +240,31 @@ the page. If nothing playable turns up, Tilefinch says so and goes back.
 
 YouTube Shorts links open in the same player when a compatible stream is
 available.
+
+### Page audio and internet radio
+
+Audio a page plays (`<audio>` elements and scripts) opens in the same player:
+AAC (M4A) and MP3 files, MP3 internet radio streams, and an MP3 link opened
+directly. Audio gets a listening screen instead of an empty picture: the
+station or track name across the top (the station's own name when it sends
+one, otherwise the audio's or the page's title), whether it is playing,
+paused, buffering or reconnecting, the station's genre, and the server the
+audio comes from. A file shows its length and seeks if its server allows it;
+a radio stream shows **LIVE** with how long you have been listening and
+plays until you press Circle or leave the page. Cross pauses and resumes. A
+station that drops reconnects on its own and says **Reconnecting...**
+meanwhile. The player keeps only a few seconds of a stream in memory and
+never saves it to the Memory Stick. AAC radio streams (`audio/aacp`) and Ogg are not
+supported.
+
+Radio directories such as SHOUTcast are secure (HTTPS) pages whose stations
+often stream only over plain HTTP. When a station has no encrypted stream,
+the player asks **PLAY UNENCRYPTED AUDIO?** once for that site. **X Play
+anyway** plays it and lets that site's radio streams use plain HTTP until you
+exit Tilefinch; nothing else on the page loses its protection. **O Back**
+declines, and the site is not asked again until you exit or change it under
+**Permissions & controls → Unencrypted audio**. While such a station plays,
+the listening screen marks it **Not encrypted** beside the server's name.
 
 ## YouTube
 
@@ -440,7 +472,8 @@ Language & emoji**:
 - choose the **Language**, then select **Language pack** and press Cross
   (**X Download pack**). The menu downloads at once, without the size
   question. After any install the selected language and color-emoji packs
-  are attached again straight away, with no restart;
+  are attached again straight away, with no restart. If a download or install
+  fails, a notice gives the reason and the row offers **Try again**;
 - Square removes an installed pack;
 - **Offer language packs** turns the notice off (**Off**) or back on
   (**Ask**, the default);
@@ -503,6 +536,17 @@ A page that keeps refreshing while you do nothing is stopped after five
 refreshes and stays on screen, and the status line shows
 **AUTO-REFRESH STOPPED**; press any button and the next page may refresh
 again.
+
+## Messages from a page
+
+A page can stop and ask you something: an alert, an OK/Cancel question, or a
+line of text to type. It appears in a plain box under **Page message** with
+the site's address, so you can tell it is the page talking and not
+Tilefinch. X answers OK (for a text question, X opens the keyboard and Start
+answers OK), O cancels, and Triangle leaves the page. From a page's second
+message on, Square stops that page showing any more until it is loaded
+again. A page that keeps asking without you clicking or typing on it gets no
+more than three messages, and none while it is in the background.
 
 ## When a page will not load
 
@@ -598,7 +642,10 @@ that cannot change on the current page says why when you press Cross.
   JavaScript** applies to Wikipedia's language subdomains too, and **Reset
   permissions** restores the default. Other sites are unaffected.
 - **Ad blocking.** Basic blocking and conservative cosmetic hiding are on by
-  default. **Menu → Settings → Privacy & security → Content blocker** chooses
+  default. Basic refuses third-party ad hosts and the scripts of tag managers
+  (such as Google Tag Manager) and A/B testing services (such as Optimizely),
+  which are large and slow pages down while they load. Paywall SDKs (such as
+  Piano) load as the site sends them. **Menu → Settings → Privacy & security → Content blocker** chooses
   Off, Basic, or Custom, and **Hide page ads** controls only the cosmetic
   hiding. **Permissions & controls → Content blocking** turns both off for
   the current site. Basic reads no list from the Memory Stick; Custom reads
@@ -610,3 +657,7 @@ that cannot change on the current page says why when you press Cross.
   clicking Accept or writing consent cookies. **Permissions & controls →
   Cookie notices** shows them again for the current site, independently of
   ad blocking.
+- **Unencrypted audio.** **Ask** (the default) asks before a radio station
+  on this secure site plays over plain HTTP; **Allow** and **Block** answer
+  for it. The choice covers only this site's audio and lasts until you exit
+  Tilefinch ([Page audio and internet radio](#page-audio-and-internet-radio)).

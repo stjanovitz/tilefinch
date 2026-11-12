@@ -21,8 +21,10 @@
 #include "tilefinch/runtime_clock.h"
 #include "tilefinch/script_split.h"
 #include "../src/js_runtime_internal.h"
+#include "../src/js_source_store.h"
 #include "../src/tilefinch_test_faults.h"
 #include "tilefinch/budget_quickjs.h"
+#include "bootstrap_resident_probe.h"
 
 #define MIB (1024u * 1024u)
 
@@ -949,6 +951,98 @@ static int test_heap_growth_uses_existing_headroom(void)
     return 0;
 }
 
+/* Function text kept in the source store counts once in the heap a
+   compile can reach, as if it were in the heap (the unstripped realm, which
+   admission follows). Where the heap limit binds, the whole text comes off.
+   Where the free Budget binds, the store's bytes are already out of it:
+   only text the store holds in fewer bytes than the heap would (compressed
+   blocks) comes off again. It used to come off whole there too, so a page
+   that had compiled megabytes of script had its later scripts refused with
+   that much real headroom left. */
+static int test_heap_reachable_counts_stored_text_once(void)
+{
+    Budget budget;
+    budget_init(&budget, 32u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    size_t capacity = 384u * 1024u;
+    char *html = malloc(capacity);
+    CHECK(html != NULL);
+    if (html == NULL) return 1;
+    size_t at = (size_t) snprintf(html, capacity,
+                                  "<!doctype html><body><script>");
+    for (unsigned i = 0; at < 160u * 1024u; i++)
+        at += (size_t) snprintf(
+            html + at, capacity - at,
+            "function stored%u(a,b){var s=a+b;return s*%u+'t%u';}\n",
+            i, i, i);
+    at += (size_t) snprintf(html + at, capacity - at, "</script></body>");
+    PocDocument document;
+    CHECK(document_parse(&document, &budget, html, at, 17));
+    free(html);
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_with_session(
+        &document, &budget, 8u * MIB, 4000,
+        "https://stored-text.test/", NULL, &result);
+    CHECK(runtime != NULL);
+    CHECK(script_runtime_advance(runtime, 16, 4, &result));
+    runtime->boot_window_active = false;
+    lxb_dom_node_t *body = document_body_node(&document);
+    CHECK(body != NULL && body->first_child != NULL);
+    bool evaluated = script_runtime_evaluate_inline(
+        runtime, body->first_child, false, &result);
+    if (!evaluated)
+        fprintf(stderr, "stored text script: error=\"%s\" summary=\"%s\"\n",
+                result.error, result.summary);
+    CHECK(evaluated);
+    ScriptSourceStoreStats stats = {0};
+    script_source_store_stats(runtime->source_store, &stats);
+    CHECK(stats.text_bytes >= 128u * 1024u
+          && stats.held_bytes >= stats.text_bytes);
+    size_t text = stats.text_bytes;
+
+    /* The heap limit binds (no growth): all of the text would be in it. */
+    CHECK(!runtime->heap_growth_enabled);
+    CHECK(script_runtime_heap_obtainable(runtime) > text);
+    CHECK(script_runtime_heap_reachable(runtime, 0)
+          == script_runtime_heap_obtainable(runtime) - text);
+
+    /* The free Budget binds: 2 MiB of growth beyond the headroom under the
+       limit and the growth reserve, far below the ceiling. */
+    script_runtime_enable_heap_growth(
+        runtime, runtime->base_memory_limit + 16u * MIB,
+        4u * MIB);
+    size_t target = script_runtime_heap_remaining(runtime) + 6u * MIB;
+    size_t free_bytes = budget_remaining(&budget);
+    CHECK(free_bytes > target);
+    void *held = budget_malloc(&budget, free_bytes - target);
+    CHECK(held != NULL);
+    size_t obtainable = script_runtime_heap_obtainable(runtime);
+    size_t reachable = script_runtime_heap_reachable(runtime, 0);
+    CHECK(obtainable == budget_remaining(&budget) - 4u * MIB);
+    if (reachable != obtainable)
+        fprintf(stderr, "stored text plain: reachable=%zu obtainable=%zu "
+                "text=%zu held=%zu\n", reachable, obtainable, text,
+                stats.held_bytes);
+    CHECK(reachable == obtainable);
+    /* Compressed, the store holds less than the heap would: the rest is
+       still counted. */
+    script_source_store_balance(runtime->source_store, 0);
+    script_source_store_stats(runtime->source_store, &stats);
+    CHECK(stats.held_bytes < stats.text_bytes);
+    obtainable = script_runtime_heap_obtainable(runtime);
+    reachable = script_runtime_heap_reachable(runtime, 0);
+    if (reachable != obtainable - (stats.text_bytes - stats.held_bytes))
+        fprintf(stderr, "stored text compressed: reachable=%zu "
+                "obtainable=%zu text=%zu held=%zu\n", reachable, obtainable,
+                stats.text_bytes, stats.held_bytes);
+    CHECK(reachable == obtainable - (stats.text_bytes - stats.held_bytes));
+    budget_free(&budget, held);
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 /* Attribute writes are counted always but timed only for the profiler: a
    realm without one reads no clock on this path. */
 static int test_attribute_write_timing_needs_profiler(void)
@@ -988,7 +1082,8 @@ static int test_heap_return_checks_back_off(void)
     CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
     ScriptResult result = {0};
     ScriptRuntime *runtime = script_runtime_create_with_session(
-        &document, &budget, 2u * MIB, 4000,
+        &document, &budget,
+        test_small_realm_bytes(&budget, TEST_SMALL_REALM_MARGIN_BYTES), 4000,
         "https://return-backoff.test/", NULL, &result);
     CHECK(runtime != NULL);
     CHECK(script_runtime_advance(runtime, 16, 4, &result));
@@ -1503,9 +1598,10 @@ static int test_dom_wrapper_receiver_sharing(void)
         "if(wrapperProbe.length!==48||x.get!==y.get||x.set!==y.set||"
         "!x.enumerable||!x.configurable||a.hasAttribute!==b.hasAttribute)"
         "throw Error('unshared receiver-only descriptors');"
-        "const ca=Object.getOwnPropertyDescriptor(a,'classList'),"
-        "cb=Object.getOwnPropertyDescriptor(b,'classList');"
-        "if(ca.get!==cb.get||ca.set!==cb.set)throw Error('unshared classList');"
+        "const ca=Object.getOwnPropertyDescriptor(Element.prototype,'classList');"
+        "if(!ca||Object.prototype.hasOwnProperty.call(a,'classList')||"
+        "Object.prototype.hasOwnProperty.call(b,'classList'))"
+        "throw Error('unshared classList');"
         "if(a.classList.add!==b.classList.add||a.classList.item!==b.classList.item)"
         "throw Error('unshared token-list methods');"
         "a.classList.add.call(b.classList,'borrowed');"
@@ -1561,9 +1657,10 @@ static int test_dom_wrapper_receiver_sharing(void)
     printf("dom-wrapper-cache fresh=48 objects=%lld bytes=%lld\n",
         (long long)(wrapper_after.obj_count - wrapper_before.obj_count),
         (long long)(wrapper_after.malloc_size - wrapper_before.malloc_size));
-    /* Five objects per fresh wrapper with the shared record, versus seven
-       before; leave one object's margin for unrelated receiver metadata. */
-    CHECK(wrapper_after.obj_count - wrapper_before.obj_count <= 6 * 48);
+    /* One object per fresh wrapper: its handle slot holds it weakly, with
+       no WeakRef or cache record (five objects each before). Leave one
+       object's margin for unrelated receiver metadata. */
+    CHECK(wrapper_after.obj_count - wrapper_before.obj_count <= 2 * 48);
     script_runtime_destroy(runtime);
     document_destroy(&document);
     CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
@@ -2094,6 +2191,117 @@ static lxb_dom_node_t *find_element_id(lxb_dom_node_t *node,
     return NULL;
 }
 
+/* An inline script of one text child compiles from the DOM's own text, not
+   a copy: compiling a 1 MiB script raises the Budget peak by about the
+   realm's stored copy of it, not by a second, assembled one. The script
+   may rewrite and remove its own text while it runs: its lazily compiled
+   functions still run and print their source afterwards, once the removed
+   element is freed too, and so do a small script's. A script of several
+   text children is still assembled into one source. */
+static int test_inline_script_compiles_in_place(void)
+{
+    enum { PAD = 1024 * 1024 };
+    static const char open_tag[] = "<!doctype html><body><script id=big>";
+    static const char code_head[] =
+        "function lazyA(){return 'lazy-a:'+(40+2)}"
+        "var lazyB=function(x){return 'lazy-b:'+x};/*";
+    static const char code_tail[] =
+        "*/var s=document.currentScript;s.textContent='rewritten';"
+        "s.remove();globalThis.first=lazyA()+','+lazyB(3)";
+    static const char rest[] =
+        "</script><script id=small>function smallF(){return 'small-f'}"
+        "var me=document.currentScript;me.remove();"
+        "me.textContent='zzzzzzzzzzzzzzzzzzzzzzzz';"
+        "globalThis.smallFirst=smallF()</script>"
+        "<script id=multi>globalThis.multi='a</script></body>";
+    const char *const pieces[] = { open_tag, code_head, NULL, code_tail,
+                                   rest };
+    const size_t sizes[] = { sizeof(open_tag) - 1u, sizeof(code_head) - 1u,
+                             PAD, sizeof(code_tail) - 1u, sizeof(rest) - 1u };
+    size_t length = 0;
+    for (size_t i = 0; i < 5; i++) length += sizes[i];
+    size_t script_bytes = sizes[1] + sizes[2] + sizes[3];
+    char *html = malloc(length);
+    CHECK(html != NULL);
+    for (size_t i = 0, at = 0; i < 5; at += sizes[i++]) {
+        if (pieces[i] == NULL) memset(html + at, 'x', sizes[i]);
+        else memcpy(html + at, pieces[i], sizes[i]);
+    }
+    Budget budget;
+    budget_init(&budget, 32u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    CHECK(document_parse(&document, &budget, html, length, 32));
+    free(html);
+    ScriptResult result = {0};
+    /* Deferred: the document's scripts run only when this test runs them. */
+    ScriptRuntime *runtime = script_runtime_create_deferred(
+        &document, &budget, 8u * MIB, 4000, "https://in-place.test/", NULL,
+        &result);
+    CHECK(runtime != NULL);
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    lxb_dom_node_t *big = find_element_id(root, "big");
+    lxb_dom_node_t *multi = find_element_id(root, "multi");
+    CHECK(big != NULL && multi != NULL && big->first_child != NULL
+          && big->first_child->next == NULL);
+    size_t big_text = 0;
+    CHECK(document_text_data(big->first_child, &big_text) != NULL
+          && big_text == script_bytes);
+    size_t before = budget.current;
+    budget.peak = before;
+    CHECK(script_runtime_evaluate_inline(runtime, big, false, &result));
+    size_t rise = budget.peak - before;
+    if (rise >= big_text + big_text / 2u)
+        fprintf(stderr, "in-place inline compile: peak rise %zu for %zu "
+                "bytes of text\n", rise, big_text);
+    CHECK(rise < big_text + big_text / 2u);
+    /* Free the removed element and its text, then call into them. */
+    CHECK(script_runtime_advance(runtime, 16, 4, &result));
+    (void) script_runtime_collect_and_trim(runtime);
+    CHECK(script_runtime_advance(runtime, 16, 4, &result));
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "globalThis.pocSummary=[globalThis.first,lazyA(),lazyB(4),"
+              "String(lazyA),document.getElementById('big')===null].join()",
+              "<in-place-check>", &result));
+    if (strcmp(result.summary,
+               "lazy-a:42,lazy-b:3,lazy-a:42,lazy-b:4,"
+               "function lazyA(){return 'lazy-a:'+(40+2)},true") != 0)
+        fprintf(stderr, "in-place inline functions: %s\n", result.summary);
+    CHECK(strcmp(result.summary,
+                 "lazy-a:42,lazy-b:3,lazy-a:42,lazy-b:4,"
+                 "function lazyA(){return 'lazy-a:'+(40+2)},true") == 0);
+    /* A small script (below the stored-copy threshold) rewriting its own
+       text keeps working functions too. (It is removed first: a connected
+       script this test runs directly is not marked started, so new text
+       would run it again.) */
+    lxb_dom_node_t *small = find_element_id(root, "small");
+    CHECK(small != NULL
+          && script_runtime_evaluate_inline(runtime, small, false, &result));
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "globalThis.pocSummary=[globalThis.smallFirst,smallF(),"
+              "String(smallF)].join()",
+              "<small-check>", &result)
+          && strcmp(result.summary, "small-f,small-f,"
+                    "function smallF(){return 'small-f'}") == 0);
+    /* Two text children: assembled, so the script sees both. */
+    lxb_dom_text_t *second = lxb_dom_document_create_text_node(
+        multi->owner_document, (const lxb_char_t *) "b'", 2);
+    CHECK(second != NULL);
+    lxb_dom_node_insert_child(multi, lxb_dom_interface_node(second));
+    CHECK(multi->first_child != NULL && multi->first_child->next != NULL);
+    CHECK(script_runtime_evaluate_inline(runtime, multi, false, &result));
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, "globalThis.pocSummary=globalThis.multi",
+              "<multi-check>", &result)
+          && strcmp(result.summary, "ab") == 0);
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 static bool digest_matches_hex(
     const uint8_t digest[TILEFINCH_SHA256_DIGEST_BYTES], const char *hex)
 {
@@ -2124,6 +2332,102 @@ static bool collect_and_drain_finalizers(ScriptRuntime *runtime,
         if (!script_runtime_advance(runtime, 0, 1024, result)) return false;
     }
     return true;
+}
+
+/* What script put on an element's wrapper stays reachable through the element
+   while it is in the document, with no JS reference to the wrapper. A plain
+   node's wrapper still dies, and so does a stateful one once its element left
+   or its weak holder went. */
+static int test_stateful_wrappers_survive_collection(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    char html[4096];
+    int length = snprintf(html, sizeof(html),
+        "<!doctype html><body>"
+        "<div id=expando></div><div id=key></div><div id=member></div>"
+        "<div id=ref></div><div id=sym></div><div id=fiber></div>"
+        "<div id=gone></div><div id=host><span id=inner></span></div>");
+    for (int at = 0; at < 200; at++)
+        length += snprintf(html + length, sizeof(html) - (size_t) length,
+                           "<p></p>");
+    CHECK(document_parse(&document, &budget, html, (size_t) length, 17));
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_with_session(
+        &document, &budget, 8u * MIB, 4000,
+        "https://wrapper-state.test/", NULL, &result);
+    CHECK(runtime != NULL);
+    CHECK(script_runtime_evaluate_diagnostic(
+        runtime,
+        "(()=>{const g=id=>document.getElementById(id);"
+        "globalThis.g=g;"
+        "g('expando').foo={v:1};"
+        "globalThis.map=new WeakMap();map.set(g('key'),{v:2});"
+        "globalThis.set=new WeakSet();set.add(g('member'));"
+        "globalThis.weak=new WeakRef(g('ref'));"
+        "g('sym')[Symbol.for('state')]=3;"
+        "g('fiber').__reactFiber$abc={v:4};"
+        "g('inner').foo=5;"
+        "g('host').appendChild(document.createElementNS('urn:x','p:a'));"
+        "g('host').appendChild(document.createElement('div')).id='made';"
+        "for(const p of document.querySelectorAll('p'))p.tagName;"
+        "const gone=g('gone');gone.foo=6;gone.remove();"
+        "globalThis.goneHandle=gone.__handle;"
+        "globalThis.plain=document.querySelector('p').__tilefinchHandleLease;"
+        "globalThis.keyLease=g('key').__tilefinchHandleLease;"
+        "globalThis.madeLease=g('made').__tilefinchHandleLease;"
+        "globalThis.pocSummary='SET';})()",
+        "<wrapper-state-set>", &result));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(script_runtime_evaluate_diagnostic(
+        runtime,
+        "(()=>{const held=__tilefinchNodeWrapper();const out=[];"
+        "if(g('expando').foo?.v!==1)out.push('expando');"
+        "if(map.get(g('key'))?.v!==2)out.push('key');"
+        "if(!set.has(g('member')))out.push('member');"
+        "if(weak.deref()!==g('ref'))out.push('ref');"
+        "if(g('sym')[Symbol.for('state')]!==3)out.push('sym');"
+        "if(g('fiber').__reactFiber$abc?.v!==4)out.push('fiber');"
+        "if(g('inner').foo!==5)out.push('inner');"
+        "if(g('key').__tilefinchHandleLease!==keyLease)out.push('lease');"
+        "if(__tilefinchNodeWrapper(goneHandle)!==null)out.push('gone');"
+        "if(document.querySelector('p').__tilefinchHandleLease===plain)"
+        "out.push('plain');"
+        "const ns=g('host').lastChild.previousSibling;"
+        "if(ns.namespaceURI!=='urn:x')out.push('namespace='+ns.namespaceURI);"
+        "if(g('made').__tilefinchHandleLease===madeLease)out.push('made');"
+        "if(held>64)out.push('held='+held);"
+        "globalThis.pocSummary=out.length?out.join():'KEPT';})()",
+        "<wrapper-state-kept>", &result));
+    if (strcmp(result.summary, "KEPT") != 0)
+        fprintf(stderr, "stateful wrappers: %s\n", result.summary);
+    CHECK(strcmp(result.summary, "KEPT") == 0);
+    CHECK(result.dom_handle_wrappers_held_peak >= 7
+          && result.dom_handle_wrappers_held_peak <= 16);
+    /* The hold is decided at each collection, not remembered. */
+    CHECK(script_runtime_evaluate_diagnostic(
+        runtime,
+        "(()=>{const e=g('expando');globalThis.left=e.__handle;e.remove();"
+        "globalThis.keyLease=g('key').__tilefinchHandleLease;"
+        "globalThis.map=null;globalThis.pocSummary='DROPPED';})()",
+        "<wrapper-state-drop>", &result));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(script_runtime_evaluate_diagnostic(
+        runtime,
+        "(()=>{const out=[];"
+        "if(__tilefinchNodeWrapper(left)!==null)out.push('left');"
+        "if(g('key').__tilefinchHandleLease===keyLease)out.push('key');"
+        "globalThis.pocSummary=out.length?out.join():'RELEASED';})()",
+        "<wrapper-state-released>", &result));
+    if (strcmp(result.summary, "RELEASED") != 0)
+        fprintf(stderr, "stateful wrappers: %s\n", result.summary);
+    CHECK(strcmp(result.summary, "RELEASED") == 0);
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
 }
 
 static int test_stream_and_xhr_private_state_reclamation(void)
@@ -3925,6 +4229,46 @@ static int test_native_dynamic_code_policy(void)
     CHECK(script_runtime_evaluate_diagnostic(
               runtime, inline_allowed, "<inline-handler-allowed>", &result)
           && strcmp(result.summary, "INLINE-HANDLER-ALLOWED") == 0);
+    /* Frames follow the callee's policy, as Chromium 152 does: the initial
+       about:blank and srcdoc inherit the parent's; a committed document's own
+       decision replaces it in the reused window. No page call can raise it. */
+    static const char strict_frames[] =
+        "(()=>{const attempt=fn=>{try{return fn()}catch(_){return 'blocked'}},"
+        "blank=document.createElement('iframe'),"
+        "local=document.createElement('iframe');"
+        "local.srcdoc='<!doctype html><p>x';document.body.append(blank,local);"
+        "globalThis.reused=blank;"
+        "globalThis.pocSummary=blank.__handle+' '"
+        "+attempt(()=>blank.contentWindow.eval('3'))+' '"
+        "+attempt(()=>new blank.contentWindow.Function('return 3')())+' '"
+        "+attempt(()=>local.contentWindow.eval('3'))})()";
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, strict_frames, "<strict-frames>", &result));
+    long reused_handle = strtol(result.summary, NULL, 10);
+    CHECK(reused_handle > 0
+          && strcmp(strchr(result.summary, ' '),
+                    " blocked blocked blocked") == 0);
+    CHECK(script_runtime_set_frame_window_state(
+        runtime, reused_handle, true, true, false,
+        "https://policy.test/child", true, &result));
+    script_runtime_set_frame_dynamic_code(runtime, reused_handle, true);
+    static const char reused_allowed[] =
+        "(()=>{const w=reused.contentWindow;let own='ran';"
+        "try{eval('1')}catch(_){own='blocked'}"
+        "globalThis.pocSummary=[own,w.eval('3'),new w.Function('return 7')(),"
+        "w.eval('(0,eval)(\"5\")')].join()})()";
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, reused_allowed, "<reused-allowed>", &result)
+          && strcmp(result.summary, "blocked,3,7,5") == 0);
+    script_runtime_set_frame_dynamic_code(runtime, reused_handle, false);
+    static const char reused_blocked[] =
+        "(()=>{const w=reused.contentWindow;let blocked=0;"
+        "for(const compile of[()=>w.eval('3'),()=>new w.Function('return 7')()])"
+        "{try{compile()}catch(_){blocked++}}"
+        "globalThis.pocSummary='REUSED-BLOCKED:'+blocked})()";
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, reused_blocked, "<reused-blocked>", &result)
+          && strcmp(result.summary, "REUSED-BLOCKED:2") == 0);
     script_runtime_destroy(runtime);
 
     options.dynamic_code_disabled = false;
@@ -6235,6 +6579,41 @@ static int test_buffered_xhr_event_stack(void)
     if (strcmp(result.summary, "POOL-WAIT-OK") != 0)
         fprintf(stderr, "pool deferral wait: %s\n", result.summary);
     CHECK(!strcmp(result.summary, "POOL-WAIT-OK"));
+    /* A request waiting for its CORS preflight (-2) is parked: the
+       same-origin request behind it starts in the same turn, and the parked
+       one is not resubmitted (its native admission re-run) until a
+       preflight of the realm is decided (NW-05). */
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "(async()=>{let crossCalls=0,sameCalls=0,decided=false,decisions=7;"
+        "globalThis.__tilefinchCorsPreflightDecisions=()=>decisions;"
+        "globalThis.__tilefinchFetchAsync=(method,url)=>{"
+        "if(String(url).includes('/needs-preflight')){crossCalls++;"
+        "return decided?3301:-2;}sameCalls++;return 3300;};"
+        "const stats=__tilefinchNetworkQueueStats;"
+        "const cross=fetch('/needs-preflight').then(r=>r.text());"
+        "const same=fetch('/same-origin').then(r=>r.text());"
+        "const started=crossCalls===1&&sameCalls===1&&stats.active===1"
+        "&&stats.waiting===1;"
+        "for(let i=0;i<20;i++)__tilefinchPumpTimers(10,16);"
+        "const parked=crossCalls===1&&stats.waiting===1;"
+        "__tilefinchDeliverNetwork(3300,true,{status:200,url:'',"
+        "contentType:'text/plain',body:'same'});const sameText=await same;"
+        "decided=true;decisions=8;__tilefinchPumpTimers(10,16);"
+        "const resumed=crossCalls===2&&stats.active===1&&stats.waiting===0;"
+        "__tilefinchDeliverNetwork(3301,true,{status:200,url:'',"
+        "contentType:'text/plain',body:'cross'});const crossText=await cross;"
+        "pocSummary=started&&parked&&sameText==='same'&&resumed"
+        "&&crossText==='cross'&&stats.active===0"
+        "?'PREFLIGHT-PARK-OK':'PREFLIGHT-PARK-BAD:'+[started,parked,"
+        "sameText,resumed,crossText,crossCalls,sameCalls].join();})()"
+        ".catch(error=>pocSummary='PREFLIGHT-PARK-ERROR:'+error);",
+        "<preflight-park>", &result));
+    for (unsigned tick = 0; tick < 16
+         && strncmp(result.summary, "PREFLIGHT-PARK-", 15); tick++)
+        CHECK(script_runtime_advance(runtime, 0, 64, &result));
+    if (strcmp(result.summary, "PREFLIGHT-PARK-OK") != 0)
+        fprintf(stderr, "preflight park: %s\n", result.summary);
+    CHECK(!strcmp(result.summary, "PREFLIGHT-PARK-OK"));
     script_runtime_destroy(runtime);
     document_destroy(&document);
     CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
@@ -6326,6 +6705,82 @@ static int test_network_queue_replay(void)
     }
     CHECK(ok && strcmp(result.summary, expected) == 0);
 
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    fetch_trace_end();
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* A completion callback may abort another request whose native record sits
+   earlier in the bridge's in-flight table. Three requests are on the wire in
+   order slow (fetch), fast (XHR), later (fetch); fast completes first and
+   its first readystatechange, dispatched inside the native delivery call,
+   aborts slow, which removes slow's record while fast's delivery is still
+   running. Delivery must then retire its own record, not whatever moved
+   into its old index: later still resolves and no native record is left
+   behind. The fetches are cross-origin no-cors so their small opaque
+   response bounds leave the realm's fetch pool room for all three. */
+static int test_network_abort_during_delivery(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    char trace_error[256] = {0};
+    CHECK(fetch_trace_replay_begin(
+        TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-fetch-abort-in-delivery",
+        trace_error, sizeof(trace_error)));
+    static const char html[] = "<!doctype html><body>Abort</body>";
+    PocDocument document;
+    ViewportContext viewport;
+    ScriptExecutionPolicy policy;
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17)
+          && viewport_context_init(&viewport, 480, 272, 480, 272)
+          && script_execution_policy_for_profile(
+              SCRIPT_EXECUTION_PROFILE_LAB, &policy));
+    ScriptRuntimeOptions options = { .viewport = viewport,
+        .execution_policy = policy, .defer_document_scripts = true };
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_configured(
+        &document, &budget, 8u * MIB, 4000, "https://abort.test/",
+        &options, &result);
+    CHECK(runtime != NULL);
+    static const char probe[] =
+        "(()=>{const events=[],controller=new AbortController,"
+        "opaque=(path,signal)=>fetch('https://other.test/'+path,{mode:"
+        "'no-cors',signal}).then(r=>events.push(path+':'+r.type),"
+        "error=>events.push(path+':'+error.name));"
+        "opaque('slow',controller.signal);const fast=new XMLHttpRequest;"
+        "fast.open('GET','/fast');fast.onreadystatechange=()=>{"
+        "if(!controller.signal.aborted)controller.abort()};"
+        "fast.onload=()=>events.push('fast:'+fast.responseText);"
+        "fast.onerror=()=>events.push('fast:error');fast.send();"
+        "opaque('later');"
+        "globalThis.startedOnWire=__tilefinchNetworkQueueStats.active;"
+        "globalThis.abortEvents=events;})()";
+    bool ok = script_runtime_evaluate_diagnostic(
+        runtime, probe, "<network-abort-during-delivery>", &result);
+    size_t started = runtime->bridge.async_fetch_count;
+    static const char summarize[] =
+        "pocSummary=abortEvents.length===3?'ABORT|'+startedOnWire+'|'"
+        "+abortEvents.join():'PENDING:'+abortEvents.join()";
+    for (size_t tick = 0; ok && tick < 64
+         && strncmp(result.summary, "ABORT|", 6) != 0; tick++) {
+        ok = script_runtime_advance(runtime, 4, 64, &result)
+            && script_runtime_evaluate_diagnostic(
+                runtime, summarize, "<abort-summary>", &result);
+    }
+    static const char expected[] =
+        "ABORT|3|slow:AbortError,fast:fast,later:opaque";
+    if (!ok || strcmp(result.summary, expected) != 0
+        || runtime->bridge.async_fetch_count != 0) {
+        fprintf(stderr, "network abort during delivery: ok=%d started=%zu "
+                "summary=%s left=%zu error=%s trace=%s\n", ok, started,
+                result.summary, runtime->bridge.async_fetch_count,
+                result.error, trace_error);
+    }
+    CHECK(ok && started == 3 && strcmp(result.summary, expected) == 0);
+    CHECK(runtime->bridge.async_fetch_count == 0);
     script_runtime_destroy(runtime);
     document_destroy(&document);
     fetch_trace_end();
@@ -6935,6 +7390,48 @@ static int test_base64_failure_leaves_no_diagnostic(void)
         && strstr(result.error, "base64") == NULL;
     if (!threw || !clean) fprintf(stderr, "base64 diagnostic: %s\n", result.error);
     CHECK(threw && clean);
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* atob and btoa have no fixed length cap: a decode the size of Cloudflare's
+   challenge payload (well past the old 1 Mi character cap) and a Latin-1
+   encode past the old 256 Ki cap both round-trip, and an encode whose
+   result cannot fit the realm's heap is an ordinary catchable refusal that
+   leaves the realm usable. */
+static int test_base64_large_payloads(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    static const char html[] = "<!doctype html><body>Base64</body>";
+    PocDocument document;
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create(
+        &document, &budget, 8u * MIB, 4000, "https://base64.test/", &result);
+    CHECK(runtime != NULL);
+    CHECK(handle_table_eval(runtime,
+        "(()=>{const d=atob('QUJD'.repeat(600000));"
+        "pocSummary=d.length===1800000&&d.slice(0,3)==='ABC'"
+        "&&d.slice(-3)==='ABC'?'DECODE-OK':'DECODE-FAILED:'+d.length})()",
+        "DECODE-OK", &result));
+    CHECK(handle_table_eval(runtime,
+        "(()=>{let u='';for(let i=0;i<256;i++)u+=String.fromCharCode(i);"
+        "const b=u.repeat(1200),t=btoa(b),checks=[t.length===409600,"
+        "atob(t)===b,btoa('ABC'.repeat(100000))==='QUJD'.repeat(100000),"
+        "btoa('\\xff\\xfe\\x00')==='//4A',btoa('a')==='YQ==',"
+        "btoa('ab')==='YWI=',btoa('')==='',"
+        "btoa(('\\u0100\\xe9a').slice(1))==='6WE='];"
+        "pocSummary=checks.every(Boolean)?'ENCODE-OK':"
+        "'ENCODE-FAILED:'+checks.join(',')})()",
+        "ENCODE-OK", &result));
+    CHECK(handle_table_eval(runtime,
+        "(()=>{let name='none';try{btoa('A'.repeat(3500000))}"
+        "catch(e){name=e.name}pocSummary=name+'|'+btoa('ok')})()",
+        "InternalError|b2s=", &result));
     script_runtime_destroy(runtime);
     document_destroy(&document);
     CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
@@ -7641,9 +8138,13 @@ static int test_html_tag_query_case(void)
         "check(child.matches('SPAN')&&child.matches(':is(SPAN,.other)'),'matches');"
         "check(!child.matches('SPAN.mixed'),'class case');"
         "check(document.querySelector('rect').id==='vector','SVG exact');"
-        "check(document.querySelector('RECT')===null,'SVG upper');"
-        "check(!document.querySelector('rect').matches('RECT'),"
-        "'SVG matches');pocSummary='HTML-TAG-CASE-OK'})()",
+        /* As in Chromium 156: a type selector matches an SVG element
+           without ASCII case, getElementsByTagName by its exact name. */
+        "check(document.querySelector('RECT').id==='vector','SVG upper');"
+        "check(document.querySelector('rect').matches('RECT'),'SVG matches');"
+        "check(document.getElementsByTagName('RECT').length===0"
+        "&&document.getElementsByTagName('rect').length===1,'SVG tag names');"
+        "pocSummary='HTML-TAG-CASE-OK'})()",
         "<html-tag-query-case>", &result);
     if (!okay) fprintf(stderr, "HTML tag queries: %s\n", result.error);
     CHECK(okay && strcmp(result.summary, "HTML-TAG-CASE-OK") == 0);
@@ -8119,6 +8620,9 @@ int main(int argc, char **argv)
     if (argc == 2 && strcmp(argv[1], "--slotless-mutation-only") == 0)
         return test_slotless_shadow_mutation_queue();
     CHECK(test_slotless_shadow_mutation_queue() == 0);
+    if (argc == 2 && strcmp(argv[1], "--stateful-wrappers-only") == 0)
+        return test_stateful_wrappers_survive_collection();
+    CHECK(test_stateful_wrappers_survive_collection() == 0);
     if (argc == 2 && strcmp(argv[1], "--wrapper-cleanup-only") == 0)
         return test_wrapper_cleanup_backlog();
     CHECK(test_wrapper_cleanup_backlog() == 0);
@@ -8268,8 +8772,10 @@ int main(int argc, char **argv)
     CHECK(test_connected_image_loads_past_128() == 0);
     CHECK(test_connected_image_errors() == 0);
     if (argc == 2 && strcmp(argv[1], "--base64-only") == 0)
-        return test_base64_failure_leaves_no_diagnostic();
+        return test_base64_failure_leaves_no_diagnostic()
+            || test_base64_large_payloads();
     CHECK(test_base64_failure_leaves_no_diagnostic() == 0);
+    CHECK(test_base64_large_payloads() == 0);
     CHECK(test_transition_snapshot_shared_ancestors() == 0);
     CHECK(test_wrapper_sweep_batched_notices() == 0);
     CHECK(test_static_shell_fallback_keeps_wrapped_children() == 0);
@@ -8300,6 +8806,8 @@ int main(int argc, char **argv)
         return test_job_heap_rejection_is_fatal();
     if (argc == 2 && strcmp(argv[1], "--inline-trackers-only") == 0)
         return test_inline_tracker_policy();
+    if (argc == 2 && strcmp(argv[1], "--inline-in-place-only") == 0)
+        return test_inline_script_compiles_in_place();
     if (argc == 2 && strcmp(argv[1], "--host-state-only") == 0)
         return test_host_state_timers_and_scroll(false)
             || test_host_state_timers_and_scroll(true)
@@ -8307,13 +8815,16 @@ int main(int argc, char **argv)
             || test_usv_string_conversion();
     if (argc == 2 && strcmp(argv[1], "--network-queue-only") == 0)
         return test_network_queue_replay();
+    if (argc == 2 && strcmp(argv[1], "--network-abort-delivery-only") == 0)
+        return test_network_abort_during_delivery();
     CHECK(test_external_compile_reclaims_cycles() == 0);
     CHECK(test_gc_pacing_requires_heap_growth() == 0
           && test_gc_pacing_pregrows_growable_heap() == 0
           && test_heap_growth_uses_existing_headroom() == 0
           && test_heap_return_checks_back_off() == 0
           && test_heap_decisions_skip_census() == 0
-          && test_attribute_write_timing_needs_profiler() == 0);
+          && test_attribute_write_timing_needs_profiler() == 0
+          && test_heap_reachable_counts_stored_text_once() == 0);
     CHECK(test_gc_thrash() == 0);
     CHECK(test_dom_wrapper_receiver_sharing() == 0);
     CHECK(test_dom_order_without_sibling_wrappers() == 0);
@@ -8344,6 +8855,7 @@ int main(int argc, char **argv)
     CHECK(test_job_heap_rejection_is_fatal() == 0);
     CHECK(test_refusal_loop_stops_as_out_of_memory() == 0);
     CHECK(test_inline_tracker_policy() == 0);
+    CHECK(test_inline_script_compiles_in_place() == 0);
     CHECK(test_attribute_mutation_skips_document_refresh() == 0);
     CHECK(test_get_element_by_id_tracks_id_changes() == 0);
     CHECK(test_document_domain_setter() == 0);
@@ -8356,6 +8868,7 @@ int main(int argc, char **argv)
     CHECK(test_host_state_timers_and_scroll(true) == 0);
     CHECK(test_host_state_network_and_indexeddb_stats() == 0);
     CHECK(test_network_queue_replay() == 0);
+    CHECK(test_network_abort_during_delivery() == 0);
     CHECK(test_usv_string_conversion() == 0);
     CHECK(test_native_dynamic_code_policy() == 0);
     CHECK(test_user_activation_expiry() == 0);
@@ -9743,7 +10256,7 @@ int main(int argc, char **argv)
         "typedPromise=crypto.subtle.digest('sha-256',framed.subarray(1,4));"
         "viewPromise=crypto.subtle.digest({name:'SHA-256'},"
         "new DataView(framed.buffer,1,3));"
-        "unsupportedPromise=crypto.subtle.digest('SHA-1',whole);"
+        "unsupportedPromise=crypto.subtle.digest('MD5',whole);"
         "typePromise=crypto.subtle.digest('SHA-256','abc');"
         "brandPromise=SubtleCrypto.prototype.digest.call({},'SHA-256',whole);"
         "symbolPromise=crypto.subtle.digest({name:Symbol()},whole);"
@@ -10394,7 +10907,7 @@ int main(int argc, char **argv)
         "&&sourced.currentSrc==='https://example.test/sounds/tone.mp3'"
         "&&called.currentSrc==='https://example.test/sounds/fallback.ogg'"
         "&&video.currentSrc==='https://example.test/movie.mp4'"
-        "&&audio.canPlayType('audio/mpeg')===''&&promise instanceof Promise"
+        "&&audio.canPlayType('audio/mpeg')==='maybe'&&promise instanceof Promise"
         "&&audio.paused&&audio.currentTime===1.5&&audio.volume===.25"
         "&&events.join(',')==='seeking,seeked'"
         "&&audio.readyState===HTMLMediaElement.HAVE_NOTHING"
@@ -10853,16 +11366,19 @@ int main(int argc, char **argv)
         "url=denied(()=>canvas.toDataURL()),blob=denied(()=>canvas.toBlob(()=>{}));"
         "const patterned=document.createElement('canvas'),"
         "patternContext=patterned.getContext('2d');patterned.width=1;"
-        "patterned.height=1;patternContext.createPattern(image,'repeat');"
-        "const pattern=denied(()=>patternContext.getImageData(0,0,1,1));"
+        "patterned.height=1;const crossPattern="
+        "patternContext.createPattern(image,'repeat');"
+        "const created=!denied(()=>patternContext.getImageData(0,0,1,1));"
+        "patternContext.fillStyle=crossPattern;patternContext.fillRect(0,0,1,1);"
+        "const pattern=created&&denied(()=>patternContext.getImageData(0,0,1,1));"
         "const copied=document.createElement('canvas'),copy=copied.getContext('2d');"
         "copied.width=1;copied.height=1;copy.drawImage(canvas,0,0);"
         "const propagated=denied(()=>copy.getImageData(0,0,1,1));"
         "const webglSource=document.createElement('canvas'),webgl2d="
         "webglSource.getContext('2d');webglSource.width=1;webglSource.height=1;"
         "webgl2d.drawImage(image,0,0);globalThis.__taintedWebglSource=webglSource;"
-        "canvas.width=1;const reset=context.getImageData(0,0,1,1).data[3]===0;"
-        "globalThis.pocSummary=pixels&&url&&blob&&pattern&&propagated&&reset"
+        "canvas.width=1;const sticky=denied(()=>context.getImageData(0,0,1,1));"
+        "globalThis.pocSummary=pixels&&url&&blob&&pattern&&propagated&&sticky"
         "?'CANVAS-TAINT-OK':'CANVAS-TAINT-FAILED';})()";
     CHECK(script_runtime_evaluate_diagnostic(
               runtime, canvas_taint_probe, "<canvas-taint-probe>", &result)
@@ -12039,9 +12555,10 @@ int main(int argc, char **argv)
              constructors earlier; IndexedDB is the next deferred standards
              module admitted. */
           /* Cumulative for this runtime: the compatibility probe above also
-             loads the Worker module for its close() check, and the Intl
-             probes load the lazy Intl module. */
-          && result.bootstrap_lazy_module_loads == 8
+             loads the Worker module for its close() check, the Intl probes
+             load the lazy Intl module, and an srcdoc frame's DOMParser
+             document loads the secondary-documents module. */
+          && result.bootstrap_lazy_module_loads == 9
           && result.bootstrap_lazy_module_failures == 0);
 
     static const char indexeddb_generator_probe[] =
@@ -12579,8 +13096,7 @@ int main(int argc, char **argv)
        makes each of them a way for page script to take over the tick. */
     static const char entry_point_hardening_probe[] =
         "(()=>{const lazy=['__tilefinchSubmittedFormHandle',"
-        "'__tilefinchSubmittedSubmitterHandle','__tilefinchFragmentInsertCount',"
-        "'__tilefinchFragmentInsertText',"
+        "'__tilefinchSubmittedSubmitterHandle',"
         "'__tilefinchSelectedControl',"
         "'__tilefinchParentAppendBypass','__tilefinchMutationSuppressed',"
         "'__tilefinchNow'],"
@@ -13044,8 +13560,10 @@ int main(int argc, char **argv)
         "const live=first.cssRules.length===1"
         "&&first.cssRules[0].selectorText==='.constructed-live';"
         "let duplicate=false,ordinary=false,syntax=false;"
-        "try{document.adoptedStyleSheets=[first,first]}catch(error){"
-        "duplicate=error.name==='NotAllowedError'}"
+        /* CSSOM lets a list name a sheet twice. */
+        "document.adoptedStyleSheets=[first,first];"
+        "duplicate=document.adoptedStyleSheets.length===2;"
+        "document.adoptedStyleSheets=[first,second];"
         "try{document.adoptedStyleSheets=[document.createElement('style').sheet]}"
         "catch(error){ordinary=error.name==='NotAllowedError'}"
         /* CSS has no fatal syntax errors: the parser closes a block left
@@ -13090,8 +13608,11 @@ int main(int argc, char **argv)
         "const detachedDoc=document.implementation.createHTMLDocument(''),"
         "detached=detachedDoc.createElement('div'),oldStyle=detached.style;"
         "oldStyle.width='1px';detached.setAttribute('style','height:2px');"
-        "const detachedStyleInvalidated=detached.style!==oldStyle"
-        "&&detached.style.cssText.includes('height');"
+        /* A created document's elements are native: style is the same live
+           declaration ([SameObject]) and reflects the new attribute. */
+        "const detachedStyleInvalidated=detached.style===oldStyle"
+        "&&detached.style.cssText.includes('height')"
+        "&&!detached.style.cssText.includes('width');"
         "author.remove();globalThis.pocSummary=importRemoved&&inserted"
         "&&ordered&&live&&authorListed&&authorRefreshed"
         "&&lazyAuthorTracking&&authorInserted&&authorDeleted&&detachedStyleInvalidated"

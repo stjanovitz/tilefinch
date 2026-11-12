@@ -65,6 +65,10 @@ typedef struct {
     size_t build_slices;
     size_t transform_quota_overruns;
     size_t maximum_transform_slice_bytes;
+    /* Moves whenever a pump receives body bytes, starts or finishes a
+       request, or transforms; unchanged across a pump, that pump only
+       waited. It wraps, so compare it for equality. */
+    size_t progress_units;
     uint64_t network_us;
     uint64_t build_us;
     uint64_t request_wall_us;

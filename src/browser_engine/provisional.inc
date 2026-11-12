@@ -35,6 +35,101 @@ static int browser_engine_provisional_clamp(
     return y < 0 ? 0 : (y > limit ? limit : y);
 }
 
+enum {
+    BROWSER_SCREEN_TEXT = 1u,
+    BROWSER_SCREEN_IMAGE = 2u
+};
+
+/* What the band [top, bottom) of a layout paints in its viewport width:
+   non-space text, a decoded image, both or neither. A command with a zero
+   opacity scale (opacity 0, visibility:hidden) shows nothing. */
+static unsigned browser_engine_band_content(
+    const LayoutDocument *layout, int top, int bottom)
+{
+    unsigned found = 0;
+    int width = layout->viewport.css_width;
+    for (size_t i = 0; i < layout->count
+         && found != (BROWSER_SCREEN_TEXT | BROWSER_SCREEN_IMAGE); i++) {
+        const DrawCommand *command = &layout->commands[i];
+        if (command->width <= 0 || command->height <= 0
+            || command->opacity_scale == 0
+            || (width > 0 && command->x >= width)
+            || (int64_t) command->x + command->width <= 0
+            || command->y >= bottom
+            || (int64_t) command->y + command->height <= top) continue;
+        if (command->type == DRAW_IMAGE) {
+            if (command->image != NULL) found |= BROWSER_SCREEN_IMAGE;
+            continue;
+        }
+        if (command->type != DRAW_TEXT || command->text == NULL
+            || (found & BROWSER_SCREEN_TEXT) != 0) continue;
+        for (uint32_t byte = 0; byte < command->text_length; byte++) {
+            unsigned char character = (unsigned char) command->text[byte];
+            if (character != ' ' && character != '\t' && character != '\n'
+                && character != '\r' && character != '\f') {
+                found |= BROWSER_SCREEN_TEXT;
+                break;
+            }
+        }
+    }
+    return found;
+}
+
+static uint64_t browser_engine_navigation_now(
+    const BrowserEngineNavigationWork *work)
+{
+    uint64_t now_us = tilefinch_platform_monotonic_time_us();
+    uint64_t relative_us = now_us >= work->started_us
+        ? now_us - work->started_us : 0;
+    return relative_us != 0 ? relative_us : 1u;
+}
+
+/* The reading hint ends, at `at_us`; it never shows again for this load. */
+static void browser_engine_end_reading_hint(BrowserEngine *engine,
+                                            uint64_t at_us)
+{
+    BrowserNavigationJobMetrics *metrics = &engine->navigation_work.metrics;
+    if (metrics->reading_hint_shown_us != 0
+        && metrics->reading_hint_cleared_us == 0)
+        metrics->reading_hint_cleared_us = at_us != 0 ? at_us : 1u;
+}
+
+/* A screen the reader can see was presented at `at_us` (0: now): the
+   layout at y, fully rasterized. Records when it first held content and
+   text, and starts or ends the reading hint. `pageable` says a page press
+   can move this preview (a retained layout), so the hint may offer one. */
+static void browser_engine_note_reader_screen(
+    BrowserEngine *engine, const LayoutDocument *layout, int y,
+    int viewport_height, bool pageable, uint64_t at_us)
+{
+    BrowserNavigationJobMetrics *metrics = &engine->navigation_work.metrics;
+    bool hint_open = metrics->reading_hint_shown_us == 0
+        && metrics->first_content_us == 0 && metrics->provisional_scrolls == 0
+        && pageable;
+    bool hint_shown = metrics->reading_hint_shown_us != 0
+        && metrics->reading_hint_cleared_us == 0;
+    if (layout == NULL || viewport_height <= 0
+        || (metrics->first_text_us != 0 && !hint_open && !hint_shown))
+        return;
+    int bottom = y <= INT_MAX - viewport_height
+        ? y + viewport_height : INT_MAX;
+    unsigned screen = browser_engine_band_content(layout, y, bottom);
+    uint64_t now_us = at_us != 0 ? at_us
+        : browser_engine_navigation_now(&engine->navigation_work);
+    if (screen != 0) {
+        if (metrics->first_content_us == 0) metrics->first_content_us = now_us;
+        if ((screen & BROWSER_SCREEN_TEXT) != 0 && metrics->first_text_us == 0)
+            metrics->first_text_us = now_us;
+        browser_engine_end_reading_hint(engine, now_us);
+        return;
+    }
+    if (!hint_open) return;
+    int end = layout->content_limit_y != 0
+        ? layout->content_limit_y : layout->height;
+    if (end > bottom && browser_engine_band_content(layout, bottom, end) != 0)
+        metrics->reading_hint_shown_us = now_us;
+}
+
 /* The front cache is usable only while the stream still offers the layout
    it was built over; re-resolved image pointers invalidate what it derived
    from them (scaled clone, decoded-image cache). */
@@ -192,6 +287,12 @@ static bool browser_engine_compose_provisional(
     (void) tilefinch_platform_present_rgb565(
         engine->provisional_frame, (size_t) width, (size_t) height,
         (size_t) width);
+    if (complete) {
+        browser_engine_note_reader_screen(
+            engine, engine->provisional_layout, y,
+            browser_engine_provisional_viewport_height(
+                engine, engine->provisional_layout), true, 0);
+    }
     return true;
 }
 
@@ -386,6 +487,11 @@ static bool browser_engine_capture_provisional_viewport(
         candidate->performance.streaming_preview_present_us +=
             present_finished_us - present_started_us;
     }
+    browser_engine_note_reader_screen(
+        engine, layout, y,
+        browser_engine_provisional_viewport_height(engine, layout), retains,
+        work->metrics.provisional_first_present_us == relative_us
+            ? relative_us : 0);
     return true;
 }
 

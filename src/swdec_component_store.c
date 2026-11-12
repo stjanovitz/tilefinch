@@ -91,6 +91,13 @@ TilefinchSwdecFailure tilefinch_swdec_component_start_failure(
     return TILEFINCH_SWDEC_FAILURE_NONE;
 }
 
+bool tilefinch_swdec_component_retry_allowed(
+    TilefinchSwdecFailure failure, bool module_released, unsigned failures)
+{
+    return failure == TILEFINCH_SWDEC_FAILURE_RUNTIME && module_released
+        && failures < TILEFINCH_SWDEC_COMPONENT_RUNTIME_ATTEMPTS;
+}
+
 void tilefinch_swdec_component_failure_message(
     TilefinchSwdecFailure failure, int native_error,
     char *output, size_t output_size)

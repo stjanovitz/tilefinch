@@ -1241,11 +1241,22 @@ static void navigation_stream_settle_script_preload(
             && now_us >= stream->preload_deadline_us;
         bool parser_deadline = parser_deadline_us != 0
             && now_us >= parser_deadline_us;
-        if (navigation_deadline || parser_deadline) {
+        /* A preload still waiting for a worker descriptor would only get
+           one once page loads of other schedulers, which nothing pumps
+           while the parser waits, hand theirs back. The parser's own
+           request takes the descriptor kept for blocking requests
+           (script_fetch_awaited), so it goes now instead. */
+        FetchRequestProgress progress = {0};
+        bool no_transport = fetch_scheduler_request_progress(
+                stream->scheduler, target->request_id, &progress)
+            && progress.transport_waiting;
+        if (navigation_deadline || parser_deadline || no_transport) {
             (void) fetch_scheduler_cancel(
                 stream->scheduler, target->request_id,
                 parser_deadline
                     ? "parser script stage deadline exceeded"
+                    : no_transport
+                    ? "parser-blocking script preload has no transport"
                     : "parser-blocking script preload deadline exceeded");
             FetchResult *result =
                 fetch_result_create(stream->session->budget);

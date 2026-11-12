@@ -21,6 +21,8 @@ static NavigationParserCheckpointOutcome navigation_stream_body(
        execution on the session policy. */
     document_parser_set_element_closed_callback(
         stream->parser, navigation_stream_element_closed, stream);
+    document_parser_set_inline_script_admit_callback(
+        stream->parser, navigation_stream_inline_script_admit, stream);
     uint64_t started = navigation_now_us();
     /* Account the bounded feed before entering Lexbor so a close-element
        checkpoint can report the response prefix containing it. The callback
@@ -249,6 +251,10 @@ struct NavigationLoad {
     bool response_cookies_accepted;
     bool adapter_redirect;
     char download_filename[FILE_DOWNLOAD_FILENAME_LIMIT];
+    bool no_content;
+    /* A top-level GET answered MPEG audio: the native player opens
+       effective_url instead of the HTML parser reading an endless body. */
+    bool media_audio;
     bool client_hint_retried;
     bool client_hint_retry_pending;
     bool zero_body_retry_attempted;
@@ -355,6 +361,11 @@ static bool navigation_load_headers(void *opaque,
         load->session->browser_session, &load->request_context, metadata,
         effective);
     load->response_cookies_accepted = true;
+    /* 204 and 205 tell a navigation to leave the current document in place. */
+    if (metadata->status_code == 204 || metadata->status_code == 205) {
+        load->no_content = true;
+        return false;
+    }
     if (!strcasecmp(load->method, "GET")
         && file_download_url_supported(load->requested_url)
         && file_download_url_supported(effective)
@@ -363,6 +374,12 @@ static bool navigation_load_headers(void *opaque,
         bool have = fetch_response_header_value(metadata, "content-disposition", disposition, sizeof(disposition));
         if (file_download_filename(effective, have ? disposition : NULL, load->download_filename))
             return false; /* Refuse body delivery; native confirmation owns any save. */
+    }
+    if (!strcasecmp(load->method, "GET")
+        && metadata->status_code >= 200 && metadata->status_code < 300
+        && media_mp3_content_type(metadata->content_type)) {
+        load->media_audio = true;
+        return false; /* Refuse body delivery; the player opens it. */
     }
     /* A redirect from an ordinary sign-in page must not start parsing the
        full service application before the facade can select its provider. */
@@ -957,7 +974,7 @@ static NavigationLoad *navigation_load_begin_common(
     if (session == NULL || session->budget == NULL || generation == 0
         || generation != session->generation || session->cancelled
         || url == NULL || maximum_bytes == 0 || timeout_ms <= 0
-        || viewport_width <= 0 || body_length > 64u * 1024u
+        || viewport_width <= 0 || body_length > NAVIGATION_FORM_BODY_LIMIT
         || (body == NULL && body_length != 0)) return NULL;
     /* The compiled sheet is an optional RAM acceleration. Do not carry it
        into candidate construction when the page budget has lost its reserve;
@@ -1786,11 +1803,7 @@ static void navigation_page_relocate_runtime_storage(
                                   &session->page.images);
         script_runtime_relocate_messaging_opaque(session->page.runtime,
                                                  session);
-        /* The retirement observer also retains the session address. It
-           was bound while the page had a layout reuse cache; one dropped
-           since (under memory pressure) leaves the observer bound to the
-           freed candidate, which binding (it requires the cache) would not
-           repair. */
+        /* The retirement observer also retains the session address. */
         script_runtime_relocate_node_retirement_opaque(session->page.runtime,
                                                        session);
         navigation_bind_node_retirement(session);
@@ -2209,6 +2222,17 @@ const char *navigation_load_download_filename(const NavigationLoad *load)
 {
     return load != NULL && load->download_filename[0] != '\0'
         ? load->download_filename : NULL;
+}
+
+bool navigation_load_no_content(const NavigationLoad *load)
+{
+    return load != NULL && load->no_content;
+}
+
+const char *navigation_load_media_audio_url(const NavigationLoad *load)
+{
+    return load != NULL && load->media_audio
+        ? load->effective_url : NULL;
 }
 
 bool navigation_load_url(NavigationSession *session, uint64_t generation,

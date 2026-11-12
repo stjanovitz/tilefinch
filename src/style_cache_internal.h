@@ -98,11 +98,26 @@ typedef struct {
     uint8_t depth;
     bool matched;
 } StyleSelectorResultCacheEntry;
+/* A general-sibling (`~`) step of one selector program over one parent's
+   children: whether any element child up to and including `frontier`
+   matches the rest of the program. Style resolves siblings in order, so the
+   next sibling's question costs one step instead of a walk back to the
+   first child. */
+#define STYLE_SIBLING_RUN_CACHE_CAPACITY 16u
+typedef struct {
+    const lxb_dom_node_t *parent;
+    const lxb_dom_node_t *frontier;
+    uint32_t rule_index;
+    uint16_t instruction;
+    uint8_t depth;
+    bool matched;
+} StyleSiblingRunCacheEntry;
 typedef struct StyleAncestorBloomCache {
     struct {
         const lxb_dom_node_t *node;
         uint32_t words[2];
     } entries[STYLE_ANCESTOR_BLOOM_CACHE_CAPACITY];
+    StyleSiblingRunCacheEntry sibling_runs[STYLE_SIBLING_RUN_CACHE_CAPACITY];
     StyleSelectorResultCacheEntry *results;
     StyleMatchedRangeCacheEntry matched_ranges[STYLE_MATCHED_RANGE_CACHE_CAPACITY];
     /* The exact ancestor-token mask of a node and all its ancestors, for

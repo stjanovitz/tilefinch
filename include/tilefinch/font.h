@@ -72,6 +72,9 @@ typedef struct {
     void *implementation;
     FontFaceBackend backend;
     bool loaded;
+    /* One of the application's bold faces. Language packs store one weight, so
+       a pack glyph reached through such a face has to be emboldened. */
+    bool application_bold;
     /* Zero for application faces; declared CSS weight for loaded page faces.
        Reuses tail padding on both host and PSP. */
     uint16_t authored_weight;
@@ -190,6 +193,14 @@ bool font_optional_glyph_match_sequence(
 bool font_optional_glyph_match_sequence_ending_at(
     const char *text, size_t end, size_t *start, unsigned *glyph_key);
 
+/* When TEXT starts a Devanagari or Bengali consonant cluster whose pre-base
+   vowel no pack sequence covers, the byte offset of that vowel, which belongs
+   in front of the cluster; otherwise 0. Reads at most a few characters. */
+size_t font_indic_prebase_vowel(const char *text, size_t length);
+
+/* Whether a codepoint is a combining mark in the scripts language packs cover. */
+bool font_codepoint_combining_mark(unsigned codepoint);
+
 bool font_set_load(FontSet *fonts, Budget *budget,
                    const char *sans_path, const char *serif_path,
                    const char *sans_italic_path, const char *sans_bold_path,
@@ -219,6 +230,8 @@ const FontFace *font_set_face_style(const FontSet *fonts, FontFamily family,
 const FontFace *font_set_face_variant(const FontSet *fonts, FontFamily family,
                                       bool italic, bool bold);
 bool font_set_face_is_bold(const FontSet *fonts, const FontFace *face);
+/* Record which faces of a set are bold. Call after loading or publishing one. */
+void font_set_mark_bold_faces(FontSet *fonts);
 bool font_family_web(unsigned slot, FontFamily fallback, FontFamily *family);
 bool font_family_is_web(FontFamily family);
 unsigned font_family_web_slot(FontFamily family);

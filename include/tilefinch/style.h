@@ -2147,7 +2147,7 @@ typedef struct StyleScopes {
     uint64_t adopted_document_mask;
     uint8_t adopted_document_order[64];
     struct StyleAdoptedScopeRoot *adopted_scope_roots;
-    /* Up to DOCUMENT_ADOPTION_ROOT_LIMIT (256) roots: a byte would wrap
+    /* Up to DOCUMENT_ADOPTION_ROOT_LIMIT (512) roots: a byte would wrap
        a full table to zero (asserted in style_sheet.c). */
     uint16_t adopted_scope_root_count;
     /* A refused scope update must never turn confined rules global. */
@@ -2163,6 +2163,55 @@ typedef struct StyleScopes {
     uint16_t shadow_scope_count;
     uint16_t shadow_scope_capacity;
 } StyleScopes;
+
+/* Stylesheet.head_mark.state. */
+enum {
+    STYLE_HEAD_MARK_NONE,      /* every source so far is inside <head> */
+    STYLE_HEAD_MARK_SET,       /* captured where the first other began */
+    STYLE_HEAD_MARK_INVALID    /* a <head> source followed it */
+};
+
+/* What the sheet held when its first source outside <head> began
+   (stylesheet_note_style_source): the rule order and the length of every
+   append-only pool, so stylesheet_truncate_to_head can hand the next
+   document with the same <head> exactly the sheet a fresh build of that
+   head makes. State that cannot be cut back is covered by `fixed`. */
+typedef struct {
+    unsigned next_order;
+    uint8_t state;
+    uint8_t modern_typography_mask;
+    bool has_bidi_declarations;
+    bool has_multicolumn_rules;
+    bool has_container_relative_units;
+    bool image_declarations_use_variables;
+    bool has_scroll_interaction_rules;
+    bool has_cursor_rules;
+    uint32_t modern_property_mask;
+    size_t custom_rule_count;
+    size_t transition_rule_count;
+    size_t revert_rule_mask_count;
+    size_t declaration_count;
+    size_t declaration_value_bytes;
+    size_t deferred_bytes;
+    size_t deferred_instruction_count;
+    size_t math_instruction_count;
+    size_t math_program_count;
+    size_t generated_text_count;
+    size_t generated_text_bytes;
+    size_t image_url_count;
+    size_t image_url_bytes;
+    size_t image_source_count;
+    size_t image_source_base_bytes;
+    size_t counter_operation_set_count;
+    size_t border_color_set_count;
+    size_t paint_stack_count;
+    size_t custom_value_long_bytes;
+    struct StyleTextChunk *text_tail;
+    size_t text_tail_used;
+    size_t selector_bytes;
+    size_t selector_storage_bytes;
+    uint64_t fixed;
+} StyleHeadMark;
 
 typedef struct {
     Budget *budget;
@@ -2202,6 +2251,10 @@ typedef struct {
     /* Monotonic parse summary used to activate the ROM-backed motion module
        without rescanning the DOM or retaining authored CSS in JavaScript. */
     bool has_motion_keyframes;
+    /* The part of it no adopted (constructed) sheet set: removing adopted
+       sources recomputes the summary from this and the sheets that stay
+       (stylesheet_remove_adopted_sources_tracked's caller). */
+    bool motion_keyframes_outside_adopted;
     /* Bounded animation-only source for the host motion scheduler. Only
        script-readable external responses may contribute: the bootstrap
        runs in the author realm and can pass this text to author methods. */
@@ -2373,6 +2426,14 @@ typedef struct {
     bool selector_cooperate_cancelled;
     int viewport_width;
     int viewport_height;
+    /* The prefers-color-scheme answer (night mode) its media queries were
+       evaluated against; rules appended later must be evaluated the same
+       way. */
+    bool prefers_dark;
+    /* A user sheet changed parse-wide state (layers, variables or bounded
+       pools). Retain this with the sheet across cache moves: author inputs
+       cannot safely be appended after that user sheet. */
+    bool user_css_changes_context;
     /* Borrowed active element for the page Fullscreen API. The runtime owns
        the DOM handle and clears this pointer before that handle can retire;
        style matching uses it for :fullscreen without exposing a spoofable
@@ -2437,6 +2498,17 @@ typedef struct {
     StyleCustomRuleIndexEntry *custom_rule_index;
     size_t custom_rule_index_count;
     size_t custom_rule_index_bytes;
+    /* Which retained standard properties (not custom properties) a rule
+       could give an element, by a key every element the rule selects must
+       carry: slot (key hash) -> one bit per property-name hash. A clear bit
+       in every slot of an element's keys proves that no keyed rule of that
+       property applies; retained_gate_keyless has the bits of properties
+       that some rule without such a key declares. Built and dropped with
+       the custom rule index (STYLE_RETAINED_GATE_SLOTS entries); the
+       generation tells a resolve-scratch mask which build it came from. */
+    uint64_t *retained_gate;
+    uint64_t retained_gate_keyless;
+    uint32_t retained_gate_generation;
     StyleMathInstruction *math_instructions;
     StyleMathProgram *math_programs;
     size_t math_instruction_count;
@@ -2479,6 +2551,9 @@ typedef struct {
     uint64_t selector_pseudo_state_checks;
     uint64_t selector_ancestor_visits;
     uint64_t selector_sibling_visits;
+    /* Nodes a single-choice <select>'s options walked to find the one shown
+       (option_is_displayed_by_default). */
+    uint64_t select_option_visits;
     uint64_t selector_descendant_visits;
     uint64_t selector_relative_queries;
     uint64_t selector_relative_cache_hits;
@@ -2496,6 +2571,11 @@ typedef struct {
        class-token cache, and linear scans outside it. */
     uint64_t selector_class_token_builds;
     uint64_t selector_class_linear_scans;
+    /* style_retained_property_value lookups of standard properties, and
+       those the retained gate answered without matching a keyed rule
+       (trace-enabled builds only). */
+    uint64_t retained_lookup_calls;
+    uint64_t retained_gate_skips;
     /* Lab and test diagnostics: what the cascade dropped or rejected. Only
        trace-enabled builds count them (always zero on the shipping PSP). */
     uint64_t diagnostic_declarations;
@@ -2584,18 +2664,32 @@ typedef struct {
        rebuild. A link whose fetch failed or whose rules were deduplicated
        away may be absent: it contributes no rule. Bounded-out means
        "unknown": every later insertion rebuilds, and until then adopted
-       rules apply by document scope alone (confined ones fail closed). */
-#define STYLE_SOURCE_NODE_LIMIT 48u
+       rules apply by document scope alone (confined ones fail closed).
+       Adopted (constructed) sheets are sources too, and one that does not
+       fit is declined: its rules never apply. The bound therefore leaves
+       room for the whole adopted tier (DOCUMENT_ADOPTED_TIER_LIMIT, one
+       sheet per component class on Lit sites: the Internet Archive's
+       search page adopts 54) beside the document's own sources. Each
+       entry is a pointer and an order, 8 bytes on the PSP. */
+#define STYLE_SOURCE_NODE_LIMIT 96u
     const lxb_dom_node_t *style_source_nodes[STYLE_SOURCE_NODE_LIMIT];
     unsigned style_source_first_order[STYLE_SOURCE_NODE_LIMIT];
     uint8_t style_source_count;
     bool style_sources_bounded_out;
+    /* Bumped whenever rules or declarations already in the sheet are
+       rewritten in place (a source inserted before others renumbers rule
+       orders; @font-face fixups re-encode declarations): a head mark taken
+       earlier then no longer describes a prefix of the sheet. */
+    uint32_t rewrite_epoch;
+    StyleHeadMark head_mark;
     /* Adopted and shadow style scopes (src/style_scopes.h). */
     StyleScopes scopes;
     /* Set while a shadow tree's <style> or a constructed sheet is parsed:
        :host and ::slotted() selectors are kept (rewritten to the matcher's
        :host form) only there; a document sheet's never match. */
     bool parsing_scoped_source;
+    /* Set while a constructed (adopted) sheet is parsed. */
+    bool parsing_adopted_sheet;
 } Stylesheet;
 
 bool stylesheet_build(Stylesheet *sheet, Budget *budget,
@@ -2728,6 +2822,22 @@ typedef bool (*StylesheetSourceAppender)(Stylesheet *sheet, void *opaque);
 bool stylesheet_append_sources_tracked(
     Stylesheet *sheet, StylesheetSourceAppender append, void *opaque,
     size_t after_source, StylesheetAppendResult *result);
+/* Removes held adopted sources (`nodes`, each one of the adopted tail of
+   style_source_nodes) and every rule, custom-property, transition and
+   revert record they parsed, closing the cascade-order gap they leave so
+   the result is the sheet a build without them would order the same way.
+   `remap` translates every prior rule index to its new index, UINT16_MAX
+   for a removed rule; nothing is appended. Sheet-wide parse state the
+   removed text may have contributed (layers, @property, fonts, container
+   queries, :root variables, the keyframes summary) is not undone: callers
+   remove only sources that contributed none of it, or recompute it.
+   `affects_discovery` reports removed rules that could hide an element or
+   give it an image (stylesheet_rules_affect_discovery): what they leave
+   visible needs image discovery. False, with the sheet unchanged, when the
+   sources cannot be removed. */
+bool stylesheet_remove_adopted_sources_tracked(
+    Stylesheet *sheet, const lxb_dom_node_t *const *nodes, size_t count,
+    StylesheetAppendResult *result, bool *affects_discovery);
 /* Parses one adopted constructed sheet (a detached <style> the document's
    adoption registry knows) at the current cascade position, exempt from
    the page's style-src policy as constructed sheets are, and records it as
@@ -2759,6 +2869,26 @@ bool stylesheet_set_appended_adopted_scopes(Stylesheet *sheet,
     const lxb_dom_node_t *const *previous_sources, size_t previous_count,
     const lxb_dom_node_t **changed, size_t capacity, size_t *changed_count,
     bool *global);
+/* stylesheet_set_appended_adopted_scopes after sources were also removed:
+   `removed` (the nodes passed to stylesheet_remove_adopted_sources_tracked)
+   may be missing from the sheet without discarding the tracked diff. */
+bool stylesheet_set_rescoped_adopted_scopes(Stylesheet *sheet,
+    const PocDocument *document,
+    const lxb_dom_node_t *const *previous_sources, size_t previous_count,
+    const lxb_dom_node_t *const *removed, size_t removed_count,
+    const lxb_dom_node_t **changed, size_t capacity, size_t *changed_count,
+    bool *global);
+/* The shadow hosts whose roots adopt held adopted source `source`, from
+   the sheet's scope table as it stands: its rules can match only in those
+   hosts' subtrees (the shadow tree, :host and ::slotted subjects). Writes
+   up to `capacity` distinct hosts to `hosts` and returns their count, or
+   SIZE_MAX when the rules may reach the document tree (the document adopts
+   it, the sheet does not hold it as adopted, the table is not current) or
+   the hosts do not fit. */
+size_t stylesheet_adopted_source_hosts(const Stylesheet *sheet,
+                                       const lxb_dom_node_t *source,
+                                       lxb_dom_node_t **hosts,
+                                       size_t capacity);
 /* Parses the document's whole active adopted tier (inline-only builds; the
    external-resource pipeline admits each sheet itself). */
 bool stylesheet_add_adopted_sheets(Stylesheet *sheet,
@@ -2818,6 +2948,24 @@ void stylesheet_destroy(Stylesheet *sheet);
    sheet is moved into the RAM-only navigation cache. Authored rules and
    indices are retained; no source or compiled data is serialized. */
 void stylesheet_prepare_for_document_reuse(Stylesheet *sheet);
+/* Cuts the sheet back to what it held when its first source outside <head>
+   (or the user stylesheet) began (Stylesheet.head_mark): every rule, custom and transition
+   rule, revert mask and intern-pool entry added since is released, and the
+   derived indices are rebuilt or dropped, so the result is the sheet a
+   fresh build of the <head> sources alone makes (pools that a fresh build
+   fills lazily may hold entries that build has not reached yet). Without a
+   mark the sheet is already head-only, which `body_sources` (the document
+   has style sources outside <head>) contradicts. False, leaving the sheet
+   unchanged, when the mark is invalid, when something the mark cannot
+   undo changed after it (root variables, layers, @property, @container,
+   @font-face, keyframes, grid templates, an in-place rewrite), and for a
+   user-origin rule inside the head part, shadow or adopted scopes, or an
+   open rule batch. */
+bool stylesheet_truncate_to_head(Stylesheet *sheet, bool body_sources);
+/* Records the current state as the head mark: for a sheet that
+   stylesheet_truncate_to_head has just cut back, before a later document's
+   own sources are appended to it. */
+void stylesheet_set_head_mark(Stylesheet *sheet);
 /* Budget reclaim: frees the sheet's style-attribute scan memo and keeps it
    off for the sheet's life (attribute texts are scanned again, as without
    the memo). Frees only, so it is safe inside any allocation. Returns the

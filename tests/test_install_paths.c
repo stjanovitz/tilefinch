@@ -96,6 +96,17 @@ int main(void)
                   NULL, small, sizeof(small)));
         CHECK(tilefinch_psp_heap_threshold_kb(false) == 2048
               && tilefinch_psp_heap_threshold_kb(true) == 4096);
+        /* The boot heap line: _sbrk's size and the free bytes after boot. */
+        const size_t mib = 1024u * 1024u;
+        CHECK(tilefinch_psp_newlib_heap_bytes(26u * mib, 2048) == 24u * mib
+              && tilefinch_psp_newlib_heap_bytes(26u * mib, 4096) == 22u * mib
+              && tilefinch_psp_newlib_heap_bytes(26u * mib, 0) == 26u * mib
+              && tilefinch_psp_newlib_heap_bytes(2u * mib, 2048) == 0u
+              && tilefinch_psp_newlib_heap_bytes(mib, 2048) == 0u);
+        CHECK(tilefinch_psp_heap_free_bytes(24u * mib, 3u * mib, 1000u)
+                  == 21u * mib + 1000u
+              && tilefinch_psp_heap_free_bytes(24u * mib, 25u * mib, 1000u)
+                  == 1000u);
     }
 
     puts("test: a component the firmware cannot start is not called stale");
@@ -126,6 +137,26 @@ int main(void)
         TILEFINCH_SWDEC_FAILURE_MISSING, 0, message, sizeof(message));
     CHECK(strcmp(message,
                  "OPTIONAL VIDEO DECODER NOT INSTALLED - SEE README") == 0);
+
+    puts("test: a refused load or start is retried a bounded number of times");
+    /* The firmware refusing memory for the load or the start thread is
+       tried again on a later open (MB-10), up to the attempt limit. */
+    CHECK(tilefinch_swdec_component_retry_allowed(
+              TILEFINCH_SWDEC_FAILURE_RUNTIME, true, 1u));
+    CHECK(tilefinch_swdec_component_retry_allowed(
+              TILEFINCH_SWDEC_FAILURE_RUNTIME, true,
+              TILEFINCH_SWDEC_COMPONENT_RUNTIME_ATTEMPTS - 1u));
+    CHECK(!tilefinch_swdec_component_retry_allowed(
+              TILEFINCH_SWDEC_FAILURE_RUNTIME, true,
+              TILEFINCH_SWDEC_COMPONENT_RUNTIME_ATTEMPTS));
+    /* A module the firmware kept loaded still owns its memory. */
+    CHECK(!tilefinch_swdec_component_retry_allowed(
+              TILEFINCH_SWDEC_FAILURE_RUNTIME, false, 1u));
+    /* A stale or missing component is not a transient refusal. */
+    CHECK(!tilefinch_swdec_component_retry_allowed(
+              TILEFINCH_SWDEC_FAILURE_REBUILD, true, 1u));
+    CHECK(!tilefinch_swdec_component_retry_allowed(
+              TILEFINCH_SWDEC_FAILURE_MISSING, true, 1u));
 
     puts("test: legacy single-EBOOT layout remains compatible");
     CHECK(tilefinch_install_paths_derive(

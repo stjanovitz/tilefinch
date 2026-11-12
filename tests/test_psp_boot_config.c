@@ -6,9 +6,11 @@
 #include "../src/media_backend_psp_policy.h"
 #include "../src/psp_boot_timing.h"
 
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "tilefinch/browser_engine.h"
@@ -136,7 +138,8 @@ static int test_game_audio_reference_selector(void)
 
     /* Saving ordinary user settings cannot persist a diagnostic backend. */
     config.validation_game_audio_reference = 1;
-    CHECK(psp_boot_config_write_overrides(&config, path));
+    CHECK(psp_boot_config_write_overrides(
+        &config, path, PSP_BOOT_CONFIG_KEYS_OVERRIDES));
     PspBootConfig saved;
     psp_boot_config_defaults(&saved);
     CHECK(psp_boot_config_load(&saved, path, NULL, NULL));
@@ -329,6 +332,223 @@ static int test_file_kb_migration(void)
     return 0;
 }
 
+/* A hand-edited file's last line often has no newline. It is read like any
+   other line; only a line too long for the reader rejects the file, and the
+   warning callback says so. */
+static int test_final_line_without_newline(void)
+{
+    char path[] = "/tmp/tilefinch-boot-final-line-XXXXXX";
+    int descriptor = mkstemp(path);
+    CHECK(descriptor >= 0 && close(descriptor) == 0);
+    CHECK(write_text(path, "url=https://example.org/\nnetwork_profile=3") == 0);
+    PspBootConfig config;
+    psp_boot_config_defaults(&config);
+    WarningCapture warning = {0};
+    CHECK(psp_boot_config_load(&config, path, capture_warning, &warning));
+    CHECK(config.network_profile == 3 && warning.calls == 0);
+    CHECK(strcmp(config.url, "https://example.org/") == 0);
+    /* The strict selector accepts its value at the end of the file too. */
+    CHECK(write_text(path, "validation_game_audio_reference=1") == 0);
+    CHECK(psp_boot_config_load(&config, path, capture_warning, &warning));
+    CHECK(config.validation_game_audio_reference == 1 && warning.calls == 0);
+    config.validation_game_audio_reference = 0;
+
+    static char long_line[2048];
+    memset(long_line, 'a', sizeof(long_line) - 1u);
+    memcpy(long_line, "url=", 4u);
+    long_line[sizeof(long_line) - 1u] = '\0';
+    CHECK(write_text(path, long_line) == 0);
+    PspBootConfig before = config;
+    warning = (WarningCapture) {0};
+    CHECK(!psp_boot_config_load(&config, path, capture_warning, &warning));
+    CHECK(memcmp(&config, &before, sizeof(config)) == 0);
+    CHECK(warning.calls == 1 && warning.line == 1);
+    CHECK(remove(path) == 0);
+    return 0;
+}
+
+/* An in-app save changes only the keys it sets. Every other line of the
+   file, comments, unknown keys, CRLF endings and order, stays as it was. */
+static int test_override_write_keeps_other_lines(void)
+{
+    char path[] = "/tmp/tilefinch-boot-keep-lines-XXXXXX";
+    int descriptor = mkstemp(path);
+    CHECK(descriptor >= 0 && close(descriptor) == 0);
+    char backup[sizeof(path) + 8u];
+    snprintf(backup, sizeof(backup), "%s.bak", path);
+    char text[20u * 1024u];
+    static const char hand_set[] =
+        "# tuned by hand\n"
+        "file_kb=1024\n"
+        "network_profile=1\n"
+        "module_cache_dir=ms0:/cache\r\n"
+        "url=https://kept.test/\n";
+    CHECK(write_text(path, hand_set) == 0);
+    PspBootConfig config;
+    psp_boot_config_defaults(&config);
+    CHECK(psp_boot_config_load(&config, path, NULL, NULL));
+    config.network_profile = 3;
+    snprintf(config.url, sizeof(config.url), "https://not-set.test/");
+    CHECK(psp_boot_config_write_overrides(
+        &config, path, PSP_BOOT_CONFIG_KEY_NETWORK_PROFILE));
+    CHECK(read_text(path, text, sizeof(text)) == 0);
+    CHECK(strcmp(text,
+                 "# tuned by hand\n"
+                 "file_kb=1024\n"
+                 "network_profile=3\n"
+                 "module_cache_dir=ms0:/cache\r\n"
+                 "url=https://kept.test/\n") == 0);
+    PspBootConfig saved;
+    psp_boot_config_defaults(&saved);
+    CHECK(psp_boot_config_load(&saved, path, NULL, NULL));
+    CHECK(saved.file_kb == 1024 && saved.network_profile == 3);
+    CHECK(strcmp(saved.module_cache_dir, "ms0:/cache") == 0);
+    CHECK(strcmp(saved.url, "https://kept.test/") == 0);
+    /* The previous generation is the .bak, as before. */
+    CHECK(read_text(backup, text, sizeof(text)) == 0
+          && strcmp(text, hand_set) == 0);
+
+    /* A key the file lacks is appended; a final line without a newline
+       gets one first. */
+    CHECK(write_text(path, "file_kb=1024") == 0);
+    snprintf(config.developer_update_url, sizeof(config.developer_update_url),
+             "https://dev.test/update.json");
+    CHECK(psp_boot_config_write_overrides(
+        &config, path, PSP_BOOT_CONFIG_KEY_DEVELOPER_UPDATE_URL));
+    CHECK(read_text(path, text, sizeof(text)) == 0);
+    CHECK(strcmp(text, "file_kb=1024\n"
+                       "developer_update_url=https://dev.test/update.json\n")
+          == 0);
+
+    /* The loader takes the last of repeated lines, so that one changes. */
+    CHECK(write_text(path, "network_profile=1\n#x\r\nnetwork_profile=2\r\n")
+          == 0);
+    CHECK(psp_boot_config_write_overrides(
+        &config, path, PSP_BOOT_CONFIG_KEY_NETWORK_PROFILE));
+    CHECK(read_text(path, text, sizeof(text)) == 0);
+    CHECK(strcmp(text, "network_profile=1\n#x\r\nnetwork_profile=3\r\n") == 0);
+
+    /* A file the loader rejects (and no loadable .bak) was not in effect:
+       the save starts a fresh file with the keys it sets. */
+    CHECK(remove(backup) == 0);
+    CHECK(write_text(path, "validation_game_audio_reference=yes\n") == 0);
+    CHECK(psp_boot_config_write_overrides(
+        &config, path, PSP_BOOT_CONFIG_KEY_NETWORK_PROFILE));
+    CHECK(read_text(path, text, sizeof(text)) == 0);
+    CHECK(strcmp(text, "network_profile=3\n") == 0);
+
+    /* A loadable file too large to edit is left alone and the save fails,
+       rather than dropping what it could not read. */
+    size_t length = 0;
+    while (length + 32u < sizeof(text) - 1u) {
+        memcpy(text + length, "# padding padding padding pad\n", 30u);
+        length += 30u;
+    }
+    text[length] = '\0';
+    CHECK(length > 16u * 1024u);
+    CHECK(write_text(path, text) == 0);
+    config.network_profile = 4;
+    CHECK(!psp_boot_config_write_overrides(
+        &config, path, PSP_BOOT_CONFIG_KEY_NETWORK_PROFILE));
+    char unchanged[sizeof(text)];
+    CHECK(read_text(path, unchanged, sizeof(unchanged)) == 0
+          && strcmp(unchanged, text) == 0);
+    char temporary[sizeof(path) + 8u];
+    snprintf(temporary, sizeof(temporary), "%s.tmp", path);
+    FILE *stranded = fopen(temporary, "rb");
+    CHECK(stranded == NULL);
+    CHECK(remove(path) == 0);
+    (void) remove(backup);
+    return 0;
+}
+
+/* Present, readable or not. */
+static bool file_exists(const char *path)
+{
+    struct stat status;
+    return stat(path, &status) == 0;
+}
+
+/* Only a file that is not there counts as absent. A boot file that exists
+   but cannot be opened or read (on the PSP: a Memory Stick read error, or
+   any open failure but "not found") may be the one in effect, so a save
+   refuses instead of replacing it with only the saved key. Readable files
+   the loader rejects keep starting from the .bak or a fresh file, which
+   test_override_write_keeps_other_lines covers. */
+static int test_override_write_refuses_unreadable(void)
+{
+    char path[] = "/tmp/tilefinch-boot-unreadable-XXXXXX";
+    int descriptor = mkstemp(path);
+    CHECK(descriptor >= 0 && close(descriptor) == 0);
+    char backup[sizeof(path) + 8u];
+    char temporary[sizeof(path) + 8u];
+    snprintf(backup, sizeof(backup), "%s.bak", path);
+    snprintf(temporary, sizeof(temporary), "%s.tmp", path);
+    static const char hand_set[] =
+        "# tuned by hand\n"
+        "file_kb=1024\n"
+        "app_heap_mb=12\n"
+        "network_profile=1\n"
+        "url=\n";
+    char text[1024];
+    PspBootConfig config;
+    psp_boot_config_defaults(&config);
+    config.network_profile = 3;
+
+    /* Both absent: a first save creates the file. */
+    CHECK(remove(path) == 0);
+    CHECK(psp_boot_config_write_overrides(
+        &config, path, PSP_BOOT_CONFIG_KEY_NETWORK_PROFILE));
+    CHECK(read_text(path, text, sizeof(text)) == 0
+          && strcmp(text, "network_profile=3\n") == 0);
+    CHECK(!file_exists(backup) && !file_exists(temporary));
+
+    /* Primary absent: the save edits the .bak the loader would read. */
+    CHECK(rename(path, backup) == 0);
+    config.network_profile = 4;
+    CHECK(psp_boot_config_write_overrides(
+        &config, path, PSP_BOOT_CONFIG_KEY_NETWORK_PROFILE));
+    CHECK(read_text(path, text, sizeof(text)) == 0
+          && strcmp(text, "network_profile=4\n") == 0);
+    CHECK(remove(backup) == 0 || !file_exists(backup));
+
+    /* chmod 0 does not stop root, so the unreadable cases need a user. */
+    if (geteuid() != 0) {
+        /* Present but unreadable, no .bak: refused, nothing written. */
+        CHECK(write_text(path, hand_set) == 0);
+        CHECK(chmod(path, 0) == 0);
+        CHECK(!psp_boot_config_write_overrides(
+            &config, path, PSP_BOOT_CONFIG_KEY_NETWORK_PROFILE));
+        CHECK(chmod(path, 0644) == 0);
+        CHECK(read_text(path, text, sizeof(text)) == 0
+              && strcmp(text, hand_set) == 0);
+        CHECK(!file_exists(backup) && !file_exists(temporary));
+
+        /* Primary absent, unreadable .bak: refused, the .bak unchanged. */
+        CHECK(rename(path, backup) == 0);
+        CHECK(chmod(backup, 0) == 0);
+        CHECK(!psp_boot_config_write_overrides(
+            &config, path, PSP_BOOT_CONFIG_KEY_NETWORK_PROFILE));
+        CHECK(!file_exists(path) && !file_exists(temporary));
+
+        /* A rejected primary still falls back to the .bak, and an
+           unreadable .bak refuses rather than starting a fresh file. */
+        CHECK(write_text(path, "validation_game_audio_reference=yes\n") == 0);
+        CHECK(!psp_boot_config_write_overrides(
+            &config, path, PSP_BOOT_CONFIG_KEY_NETWORK_PROFILE));
+        CHECK(read_text(path, text, sizeof(text)) == 0
+              && strcmp(text, "validation_game_audio_reference=yes\n") == 0);
+        CHECK(!file_exists(temporary));
+        CHECK(chmod(backup, 0644) == 0);
+        CHECK(read_text(backup, text, sizeof(text)) == 0
+              && strcmp(text, hand_set) == 0);
+    }
+    (void) remove(path);
+    (void) remove(backup);
+    (void) remove(temporary);
+    return 0;
+}
+
 /* The PSP app's boot.cfg defaults and the engine configuration the lab's
    --psp-profile realistic builds come from one set of constants. */
 static int test_defaults_match_shared_app_profile(void)
@@ -428,6 +648,9 @@ int main(void)
     CHECK(test_app_heap_key() == 0);
     CHECK(test_retired_decoder_spellings_boot() == 0);
     CHECK(test_file_kb_migration() == 0);
+    CHECK(test_final_line_without_newline() == 0);
+    CHECK(test_override_write_keeps_other_lines() == 0);
+    CHECK(test_override_write_refuses_unreadable() == 0);
     PspBootConfig config;
     psp_boot_config_defaults(&config);
     CHECK(config.limit_mb == 32);
@@ -973,7 +1196,8 @@ int main(void)
     snprintf(config.experimental_wide_video,
              sizeof(config.experimental_wide_video), "wide");
 
-    CHECK(psp_boot_config_write_overrides(&config, path));
+    CHECK(psp_boot_config_write_overrides(
+        &config, path, PSP_BOOT_CONFIG_KEYS_OVERRIDES));
     PspBootConfig saved;
     psp_boot_config_defaults(&saved);
     CHECK(psp_boot_config_load(&saved, path, NULL, NULL));
@@ -993,7 +1217,9 @@ int main(void)
     snprintf(backup, sizeof(backup), "%s.bak", path);
     config.network_profile = 1;
     snprintf(config.url, sizeof(config.url), "https://replaced.test/");
-    CHECK(psp_boot_config_write_overrides(&config, path));
+    CHECK(psp_boot_config_write_overrides(
+        &config, path,
+        PSP_BOOT_CONFIG_KEY_NETWORK_PROFILE | PSP_BOOT_CONFIG_KEY_URL));
     psp_boot_config_defaults(&saved);
     CHECK(psp_boot_config_load(&saved, path, NULL, NULL));
     CHECK(saved.network_profile == 1);
@@ -1027,8 +1253,11 @@ int main(void)
     CHECK(psp_boot_config_validate(&handoff, &invalid));
     /* An in-app settings change rewrites the overrides file. A hand-added
        handoff has to survive that or the remote loop breaks the first time
-       a developer touches a setting. */
-    CHECK(psp_boot_config_write_overrides(&handoff, exit_path));
+       a developer touches a setting: the save keeps the line it does not
+       set. */
+    handoff.network_profile = 2;
+    CHECK(psp_boot_config_write_overrides(
+        &handoff, exit_path, PSP_BOOT_CONFIG_KEY_NETWORK_PROFILE));
     psp_boot_config_defaults(&saved);
     CHECK(psp_boot_config_load(&saved, exit_path, NULL, NULL));
     CHECK(strcmp(saved.exit_to, "ms0:/PSP/GAME/PSPLINK/EBOOT.PBP") == 0);

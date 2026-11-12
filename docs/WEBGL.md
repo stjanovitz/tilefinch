@@ -316,7 +316,9 @@ error rather than a late native failure or context loss.
 The PSP keeps one bounded EDRAM color target, depth target, and texture cache,
 and shares GE command ownership with the media presenter rather than adding a
 second graphics authority. Texture generations avoid re-uploading unchanged
-pixels within one native `(realm epoch, canvas handle)` owner; fresh realms,
+pixels within one native `(realm epoch, canvas handle)` owner: textures a
+frame keeps using stay resident, and a new one takes a free gap, evicting the
+least recently used textures the frame does not use; fresh realms,
 context restoration, canvas changes, and the video layout's reuse of the
 EDRAM texture region clear that authority before lookup. Page-owned command,
 buffer, texture, depth, and presentation memory is charged through `Budget`,
@@ -342,7 +344,10 @@ fixed or sticky chrome in order. Scaled nearest-neighbor publication converts
 each source pixel once per run and copies repeated source rows, keeping the
 fast path bounded without another canvas-sized allocation. Transparent,
 filtered, rounded, multiply-blended, or ambiguously ordered canvases refuse
-this path and use the normal retained-tile renderer.
+this path and use the normal retained-tile renderer. A 2D canvas
+knows whether it is opaque without a per-frame scan: each commit reads the
+alpha of the rectangle it changed, and the whole surface only when that
+rectangle covers the last translucent pixel found.
 
 The host rasterizer exercises pixels, clipping, depth, culling, blending,
 texture wrapping, and line closure. PPSSPP's software renderer is used when

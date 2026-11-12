@@ -70,6 +70,39 @@ while response/parser work is active, and captures loading, immediate
 acknowledgement, and settled cancellation
 ([device qualification](DEVICE_QUALIFICATION.md#scripted-input-during-work)).
 
+### glyph-pack-install-menu, glyph-pack-install-offer, glyph-pack-install-heavy
+
+These install the Cyrillic language pack from recorded release responses, for a
+device that cannot use Wi-Fi. `scripts/record-glyph-pack-replay.py` records each
+redirect hop and the two assets into a keyed trace, with a Cyrillic page and a
+`glyph-replay.cfg` that names the install root. With `--base-trace` it adds them
+to an existing keyed trace instead, and `-heavy` runs on that page. Only the
+bytes on the wire are replaced: the route, session, update client, redirect
+policy, signature against the embedded root, hash, staging, activation and
+relayout are the shipping code. Replay answers on the browser thread, so the
+network worker, curl, TLS and the worker's slabs do not run.
+
+The run installs on the real Memory Stick and writes only below
+`<install_root>/components/`, in the installed pack's directory. If
+`components/` is absent it logs
+`tilefinch-glyph-replay: refused` and writes nothing, unless the sidecar has
+`make_components=1`. A pack that is already installed ends at `client=up-to-date`
+with nothing written, so a repeat run needs that directory removed by hand. The
+profile stays beside the program, and it remembers the page language the menu
+route selected, so remove it before repeating that route: its Page glyphs row
+would otherwise move past Cyrillic.
+
+Pass requires `tilefinch-glyph-component: installed pack=5` with
+`attached=0x0020`, `tilefinch-glyph-stage: reattach-relayout` with `relaid=1`,
+and `client=` stages through `hash-verified` with one
+`tilefinch-update-hop` per recorded hop. With `rename_probe=1` in the sidecar,
+`tilefinch-glyph-replay: cross-dir-rename` reports what this firmware's rename
+does when the target is in another directory, using scratch files in
+`components/glyph-cyrillic`. It is information, not a criterion, and it is off
+by default because it writes to the Memory Stick on every armed run. With `dump_frame=1` the final
+frame shows Russian text on the Cyrillic page. The 240x136 mark captures are too
+coarse to read body text.
+
 ## Page input during work
 
 ### runtime-input-live, runtime-cancel-live, wikipedia-navigation-live
@@ -84,6 +117,69 @@ and captures for visual inspection. Menu focus has a separate 150 ms
 emulator gate; menu activation is timed but still requires full relayout.
 Its golden ignores asynchronous action-cursor annotations, not receiver
 order or captures. A passing action golden alone is not a latency budget.
+
+### page-dialogs-live
+
+`page-dialogs-live` drives `tests/fixtures/page-dialogs.html`. The input
+script arms only after the start URL's boot load, so no dialog may open
+during that load. The fixture has two routes:
+
+- In PPSSPP it is served on loopback
+  (`python3 -m http.server 8779 --bind 127.0.0.1 --directory tests/fixtures`,
+  start URL `http://127.0.0.1:8779/page-dialogs.html`). The start page
+  navigates to `page-dialogs.html?dialogs`, whose alert opens while that
+  page loads, under the navigation supervisor.
+- On a PSP it runs as an installed offline app, with no network. An
+  installed app cannot navigate to itself, so its `?device` start URL opens
+  the alert from the timer after load instead. Package it with the
+  offline-library fixture tool (`PSPLINK_DEV_LOOP.md`). Copy the fixture to
+  a scratch directory as `index.html`, beside a `manifest.webmanifest` whose
+  `start_url` is `./index.html?device`, then run
+  `tilefinch-offline-library-fixture --web-app BUILD/offline
+  'https://dialogs.test/index.html?device' SCRATCH manifest.webmanifest`.
+  The start URL is `https://tilefinch.local/offline/app?id=1`. In PPSSPP,
+  pass the same directory as `--offline-library`.
+
+On both routes the confirm and prompt follow from the timer. Cross
+answers the alert and the confirm, and START accepts the prompt's prefilled
+answer. Two Cross presses then focus and click **Ask again**, a user
+gesture, whose alert offers Square. Square stops the page's dialogs. The
+handler's following 200 alerts and its confirm must return at once.
+
+Require:
+
+- four `tilefinch-page-dialog: open` lines with `shown=1`. These are the
+  alert, confirm, prompt and the gesture's alert, all but the first with
+  `suppress-offer=1`; the spam loop opens none;
+- `close` lines with `outcome=1` (accepted) for the first three and
+  `outcome=2` (suppressed) for the fourth;
+- the three `frame-mark-page-dialog-*.ppm` captures. Read them: a plain
+  square box under the address bar, with the host under **Page message**;
+- an `answers` capture showing `confirm: true, prompt: "Ada Lovelace"`;
+- a `spam` capture showing `spam: 200 alerts in N ms, confirm: false`.
+
+### page-dialogs-buttons-live
+
+`page-dialogs-buttons-live` drives the fixture's `?buttons` mode for the rest
+of the modal. Package it as for `page-dialogs-live`, with `?buttons` in the
+source URL and `start_url`. In one page load, it presses Cross before the arm
+delay and then Circle on a confirm, edits a prompt through the keyboard, then
+reaches the gesture limit, the rate window and, after waiting past the window,
+the gesture limit again. Triangle ends it. An app opened with no history
+stays on its page after Triangle, because Back has nowhere to go; the dialogs
+still stop.
+
+Require:
+
+- nine `tilefinch-page-dialog: open` lines with `shown=1`: a confirm, a prompt
+  and an alert, then two alerts, then three, then one. The other alerts in each
+  loop and the last confirm open none;
+- `close` lines with `outcome=0` (dismissed) for the first, `outcome=3` (left)
+  for the last, and `outcome=1` for the rest;
+- an `answers` capture showing `confirm: false` and a prompt answer that starts
+  with `Ada` and has one more character;
+- a `rate` capture with `click 1 done` and a `window` capture with
+  `click 2 done`.
 
 ### page-response-live, page-focus-live
 

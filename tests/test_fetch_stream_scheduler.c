@@ -541,6 +541,85 @@ static bool test_request_header_decisions(void)
     return true;
 }
 
+/* Every request shape the validator admits fits the PSP worker's slot
+   hand-off; one that did not ran curl on the browser thread (NW-04). */
+static bool test_worker_carries_large_request_shapes(void)
+{
+    static char body[FETCH_REQUEST_BODY_LIMIT + 1u];
+    static char headers[8192];
+    memset(body, 'b', sizeof(body));
+    size_t at = 0;
+    /* Two 3,000-byte lines and a short one: 6,080 bytes in all, past the
+       slot's inline 2,048 and a line past its old 2,047-byte line buffer. */
+    for (unsigned line = 0; line < 2; line++) {
+        at += (size_t) snprintf(headers + at, sizeof(headers) - at,
+                                "X-Large-%u: ", line);
+        memset(headers + at, 'h', 3000u);
+        at += 3000u;
+        headers[at++] = '\n';
+    }
+    at += (size_t) snprintf(headers + at, sizeof(headers) - at,
+                            "Authorization: Bearer token");
+    FetchRequest request = {
+        .method = "POST",
+        .body = body,
+        .body_length = 16u * 1024u,
+        .content_type = "application/json",
+        .extra_headers = headers,
+        .credentials = FETCH_CREDENTIALS_INCLUDE
+    };
+    const char *url = "https://example.test/api";
+    bool ok = fetch_request_validate(&request, NULL)
+        && fetch_background_transport_stream_shape_supported(
+               url, &request, 64u * 1024u, 30000, true);
+    request.body_length = FETCH_REQUEST_BODY_LIMIT;
+    ok = ok && fetch_request_validate(&request, NULL)
+        && fetch_background_transport_stream_shape_supported(
+               url, &request, 64u * 1024u, 30000, true);
+    /* The validator's bounds stay the worker's bounds. */
+    request.body_length = FETCH_REQUEST_BODY_LIMIT + 1u;
+    ok = ok && !fetch_background_transport_stream_shape_supported(
+                   url, &request, 64u * 1024u, 30000, true);
+    if (!ok) fprintf(stderr, "large request shape refused (%zu header "
+                     "bytes)\n", strlen(headers));
+    return ok;
+}
+
+/* The worker slot holds every Content-Type the validator admits (255
+   bytes); a 128-byte one failed on the PSP as worker-request-shape. */
+static bool test_worker_carries_longest_content_type(void)
+{
+    char type[257];
+    memcpy(type, "multipart/form-data; boundary=", 30u);
+    memset(type + 30, 'x', sizeof(type) - 30u);
+    FetchRequest request = {
+        .method = "POST", .body = "a=b", .body_length = 3u,
+        .content_type = type,
+        .credentials = FETCH_CREDENTIALS_INCLUDE
+    };
+    const char *url = "https://example.test/upload";
+    bool ok = true;
+    static const size_t lengths[] = {127u, 128u, 200u, 255u};
+    for (size_t i = 0; i < sizeof(lengths) / sizeof(lengths[0]); i++) {
+        type[lengths[i]] = '\0';
+        bool valid = fetch_request_validate(&request, NULL);
+        bool carried = fetch_background_transport_stream_shape_supported(
+            url, &request, 64u * 1024u, 30000, true);
+        if (!valid || !carried) {
+            fprintf(stderr, "content type of %zu bytes: valid=%d "
+                    "carried=%d\n", lengths[i], valid, carried);
+            ok = false;
+        }
+        type[lengths[i]] = 'x';
+    }
+    /* One byte past the validator's limit is invalid everywhere. */
+    type[256] = '\0';
+    ok = ok && !fetch_request_validate(&request, NULL)
+        && !fetch_background_transport_stream_shape_supported(
+               url, &request, 64u * 1024u, 30000, true);
+    return ok;
+}
+
 static bool test_request_validation_before_replay(void)
 {
     FetchRequest candidate = request();
@@ -1873,6 +1952,9 @@ int main(void)
         {"ca-bundle", test_ca_bundle_configuration},
         {"critical-client-hints", test_accepted_critical_client_hints},
         {"request-validation", test_request_validation_before_replay},
+        {"worker-large-shapes", test_worker_carries_large_request_shapes},
+        {"worker-content-type-limit",
+         test_worker_carries_longest_content_type},
         {"request-header-decisions", test_request_header_decisions},
         {"handshake-counters", test_handshake_counter_rendering},
         {"absent-handshake", test_replay_reports_absent_handshake_fields},

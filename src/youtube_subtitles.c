@@ -1,8 +1,12 @@
 #include "tilefinch/youtube_subtitles.h"
+#include "tilefinch/utf8_encode.h"
 
 #include <stdbool.h>
 #include <string.h>
 
+/* One wire line with its markup removed (tags are stripped as it is read,
+   so per-word timing tags do not count). A longer line keeps its first
+   bytes, cut on a character boundary. */
 #define YOUTUBE_SUBTITLE_LINE_CAPACITY 512u
 #define YOUTUBE_SUBTITLE_TEXT_BLOCK_BYTES 4096u
 #define YOUTUBE_SUBTITLE_TEXT_BLOCK_LIMIT \
@@ -57,6 +61,8 @@ struct YoutubeSubtitleBuilder {
     size_t cue_text_length;
     bool have_timing;
     bool line_overflow;
+    bool line_in_tag;
+    bool line_had_markup;
     bool previous_was_cr;
     bool truncated;
     unsigned char line[YOUTUBE_SUBTITLE_LINE_CAPACITY];
@@ -215,6 +221,12 @@ static void subtitle_builder_reset_cue(YoutubeSubtitleBuilder *builder)
 static void subtitle_builder_finish_cue(YoutubeSubtitleBuilder *builder)
 {
     if (builder == NULL || !builder->have_timing) return;
+    /* Once a cue was refused, a later (shorter) one must not be kept: the
+       window would end after a cue it does not hold. */
+    if (builder->truncated) {
+        subtitle_builder_reset_cue(builder);
+        return;
+    }
     YoutubeSubtitleDocument *document = builder->document;
     size_t first = 0;
     size_t last = builder->cue_text_length;
@@ -224,6 +236,9 @@ static void subtitle_builder_finish_cue(YoutubeSubtitleBuilder *builder)
     while (last > first
            && (builder->cue_text[last - 1u] == ' '
                || builder->cue_text[last - 1u] == '\t')) last--;
+    /* Text cut at the capacity can end inside a character. */
+    last = first + tilefinch_utf8_complete_prefix(
+        builder->cue_text + first, last - first);
     size_t length = last - first;
     if (length == 0 || builder->end_us <= builder->minimum_time_us) {
         subtitle_builder_reset_cue(builder);
@@ -315,6 +330,22 @@ static void subtitle_builder_line(
             builder->cue_text, &builder->cue_text_length, line, length);
 }
 
+static void subtitle_builder_end_line(YoutubeSubtitleBuilder *builder)
+{
+    size_t length = builder->line_length;
+    if (builder->line_overflow)
+        length = tilefinch_utf8_complete_prefix(
+            (const char *) builder->line, length);
+    /* A line of markup alone is a text line with no text, not the blank
+       line that ends a cue. */
+    if (length != 0 || !builder->line_had_markup)
+        subtitle_builder_line(builder, builder->line, length);
+    builder->line_length = 0;
+    builder->line_overflow = false;
+    builder->line_in_tag = false;
+    builder->line_had_markup = false;
+}
+
 YoutubeSubtitleBuilder *youtube_subtitles_builder_create(
     Budget *budget, uint64_t minimum_time_us)
 {
@@ -348,6 +379,8 @@ bool youtube_subtitles_builder_feed(
         || length > YOUTUBE_SUBTITLE_WIRE_LIMIT - builder->wire_bytes)
         return false;
     builder->wire_bytes += length;
+    /* Nothing after a refused cue is retained; do not parse it. */
+    if (builder->truncated) return true;
     for (size_t at = 0; at < length; at++) {
         unsigned char byte = bytes[at];
         if (byte == '\n' && builder->previous_was_cr) {
@@ -355,15 +388,22 @@ bool youtube_subtitles_builder_feed(
             continue;
         }
         if (byte == '\r' || byte == '\n') {
-            if (!builder->line_overflow)
-                subtitle_builder_line(
-                    builder, builder->line, builder->line_length);
-            builder->line_length = 0;
-            builder->line_overflow = false;
+            subtitle_builder_end_line(builder);
             builder->previous_was_cr = byte == '\r';
             continue;
         }
         builder->previous_was_cr = false;
+        /* WebVTT markup (<c>, <b>, per-word <00:00:01.120> timing) is not
+           caption text; a literal '<' in text is written &lt;. Timing lines
+           hold no '<', so their "-->" is kept. */
+        if (byte == '<') {
+            builder->line_in_tag = true;
+            builder->line_had_markup = true;
+        }
+        if (builder->line_in_tag) {
+            if (byte == '>') builder->line_in_tag = false;
+            continue;
+        }
         if (builder->line_length < sizeof(builder->line))
             builder->line[builder->line_length++] = byte;
         else
@@ -372,12 +412,17 @@ bool youtube_subtitles_builder_feed(
     return true;
 }
 
+bool youtube_subtitles_builder_full(const YoutubeSubtitleBuilder *builder)
+{
+    return builder != NULL && builder->truncated;
+}
+
 YoutubeSubtitleDocument *youtube_subtitles_builder_finish(
     YoutubeSubtitleBuilder *builder)
 {
     if (builder == NULL) return NULL;
-    if (builder->line_length != 0 && !builder->line_overflow)
-        subtitle_builder_line(builder, builder->line, builder->line_length);
+    if (builder->line_length != 0 || builder->line_had_markup)
+        subtitle_builder_end_line(builder);
     subtitle_builder_finish_cue(builder);
     YoutubeSubtitleDocument *document = builder->document;
     document->truncated = builder->truncated;

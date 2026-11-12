@@ -637,6 +637,22 @@ static int test_bounded_site_adapter_state(Budget *budget)
           && !browser_session_site_adapter_state_get(
               &session, "fixture-adapter", copy, sizeof(copy), &length,
               251, 50));
+    /* A caller binding replaces the jar fingerprint: cookie changes keep
+       the state, a different binding or a cookie clear drops it. */
+    CHECK(browser_session_site_adapter_state_put_bound(
+              &session, "fixture-adapter", payload, sizeof(payload), 300, 7)
+          && browser_session_cookie_set_http(
+              &session, "https://fixture.test/",
+              "sid=again; Path=/; Secure")
+          && browser_session_site_adapter_state_get_bound(
+              &session, "fixture-adapter", copy, sizeof(copy), &length,
+              301, 50, 7)
+          && !browser_session_site_adapter_state_get_bound(
+              &session, "fixture-adapter", copy, sizeof(copy), &length,
+              301, 50, 8));
+    browser_session_cookie_clear(&session);
+    CHECK(!browser_session_site_adapter_state_get_bound(
+        &session, "fixture-adapter", copy, sizeof(copy), &length, 302, 50, 7));
     browser_session_site_adapter_state_remove(
         &session, "fixture-adapter");
     CHECK(!browser_session_site_adapter_state_get(
@@ -1477,6 +1493,62 @@ static int test_websocket_policy_and_close_payload(Budget *budget)
               "wss://blocked.test/chat", request,
               admitted, &protect_private));
 
+    /* connect-src names sockets by ws/wss sources (NW-07). Each policy:
+       its socket, then a target it must not cover. */
+    static const struct {
+        const char *header;
+        const char *allowed_socket;
+        const char *refused_socket;
+        bool fetch_allowed;
+    } socket_policies[] = {
+        { "content-security-policy: connect-src 'self' "
+              "wss://realtime.test\n",
+          "wss://realtime.test/chat", "wss://other.test/chat", false },
+        { "content-security-policy: connect-src wss:\n",
+          "wss://any.test/chat", NULL, false },
+        { "content-security-policy: connect-src ws://lan.test\n",
+          "wss://lan.test/chat", "wss://other.test/chat", false },
+        { "content-security-policy: connect-src https://socket.test\n",
+          "wss://socket.test/chat", "wss://realtime.test/chat", true },
+    };
+    for (size_t i = 0;
+         i < sizeof(socket_policies) / sizeof(socket_policies[0]); i++) {
+        TilefinchContentSecurityPolicy socket_csp;
+        CHECK(tilefinch_csp_parse_response_headers(
+            &socket_csp, "https://page.test/", socket_policies[i].header,
+            strlen(socket_policies[i].header), false));
+        const char *sockets[2] = {
+            socket_policies[i].allowed_socket,
+            socket_policies[i].refused_socket
+        };
+        for (size_t j = 0; j < 2 && sockets[j] != NULL; j++) {
+            char http_target[TILEFINCH_URL_SERIALIZED_LIMIT];
+            snprintf(http_target, sizeof(http_target), "https%s",
+                     sockets[j] + 3);
+            context.target_url = http_target;
+            CHECK(fetch_prepare_page_request_context(
+                &context, context.initiator_url, NULL, &session,
+                &socket_csp, NULL, NULL, &prepared, NULL));
+            request = fetch_prepared_page_request(&prepared);
+            bool admitted_socket = request != NULL
+                && fetch_websocket_prepare_admission(
+                    sockets[j], request, admitted, &protect_private);
+            if (admitted_socket != (j == 0)) {
+                fprintf(stderr, "websocket csp %s socket=%s admitted=%d\n",
+                        socket_policies[i].header, sockets[j],
+                        admitted_socket ? 1 : 0);
+                return 1;
+            }
+            /* A ws/wss source does not admit a plain fetch. */
+            if (j == 0) {
+                CHECK(fetch_request_security_allows_target(
+                          request, http_target)
+                      == socket_policies[i].fetch_allowed);
+            }
+        }
+    }
+    context.target_url = "https://blocked.test/chat";
+
     /* HTTPS documents may not open plaintext sockets unless the existing
        explicit per-site compatibility control grants that same target. */
     context.target_url = "http://socket.test/chat";
@@ -2052,6 +2124,172 @@ static int test_cookie_overlay_growth_follows_checks(Budget *budget)
     return 0;
 }
 
+/* Servers send several cookie-date forms. An expiry we cannot read makes the
+   cookie a session cookie, so a sign-out's "Expires in the past" left the old
+   credential in the jar. */
+static int test_cookie_date_forms(Budget *budget)
+{
+    static const struct { const char *text; int64_t epoch; } valid[] = {
+        { "Tue, 07-Nov-2028 20:40:33 GMT", INT64_C(1857242433) },
+        { "Tue, 07 Nov 2028 20:40:33 GMT", INT64_C(1857242433) },
+        { "Tuesday, 07-Nov-28 20:40:33 GMT", INT64_C(1857242433) },
+        { "Tue Nov 7 20:40:33 2028", INT64_C(1857242433) },
+        { "7 nov 2028 20:40:33", INT64_C(1857242433) },
+        { "Mon, 01-Jan-1990 00:00:00 GMT", INT64_C(631152000) },
+        { "Thu, 01 Jan 1970 00:00:00 GMT", INT64_C(0) },
+    };
+    for (size_t i = 0; i < sizeof(valid) / sizeof(valid[0]); i++) {
+        int64_t epoch = -1;
+        bool parsed = browser_cookie_parse_date(
+            valid[i].text, strlen(valid[i].text), &epoch);
+        if (!parsed || epoch != valid[i].epoch)
+            fprintf(stderr, "cookie date '%s' parsed=%d epoch=%lld\n",
+                    valid[i].text, parsed, (long long) epoch);
+        CHECK(parsed && epoch == valid[i].epoch);
+    }
+    static const char *const invalid[] = {
+        "", "garbage", "Tue, 07-Nov-2028", "Tue, 32-Nov-2028 20:40:33 GMT",
+        "Tue, 07-Foo-2028 20:40:33 GMT", "Tue, 07-Nov-1600 20:40:33 GMT",
+        "Tue, 07-Nov-2028 24:40:33 GMT", "Tue, 07-Nov-2028 20:60:33 GMT",
+        "Tue, 07-Nov-2028 20:40:60 GMT", "Tue, 31-Feb-2028 20:40:33 GMT",
+        "Tue, 07-Nov-2 20:40:33 GMT",
+    };
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        int64_t epoch = -1;
+        CHECK(!browser_cookie_parse_date(invalid[i], strlen(invalid[i]), &epoch));
+    }
+
+    size_t baseline = budget->current;
+    BrowserSession session;
+    char header[256];
+    CHECK(browser_session_init(&session, budget, 32u * 1024u));
+    TilefinchRequestContext context =
+        overlay_test_context("https://dates.test/");
+    CHECK(browser_session_cookie_set_http_context(
+              &session, &context, "SID=old; Path=/; Secure")
+          && browser_session_cookie_set_http_context(
+              &session, &context,
+              "SID=x; Path=/; Secure; Expires=Mon, 01-Jan-1990 00:00:00 GMT"));
+    CHECK(!browser_session_cookie_header_context(
+              &session, &context, header, sizeof(header))
+          || header[0] == '\0');
+    browser_session_destroy(&session);
+    CHECK(budget->current == baseline);
+    return 0;
+}
+
+/* A full jar makes room rather than dropping the newest cookie: a sign-in
+   whose session cookie was refused because earlier browsing filled the jar
+   only shows the sign-in page again. The eviction rules stay those of the slot
+   table: script may not retire HttpOnly, nor an insecure origin Secure. */
+static int test_cookie_byte_quota_evicts_oldest(Budget *budget)
+{
+    size_t baseline = budget->current;
+    BrowserSession session;
+    char cookie[1400], header[4096];
+    CHECK(browser_session_init(&session, budget, 32u * 1024u));
+    /* The shipping jar holds a signed-in Google + YouTube cookie set. */
+    CHECK(session.maximum_cookie_bytes >= 16u * 1024u);
+    session.maximum_cookie_bytes = 4096u;
+    TilefinchRequestContext ads = overlay_test_context("https://ads.test/");
+    TilefinchRequestContext signin = overlay_test_context("https://signin.test/");
+    for (unsigned i = 0; i < 4u; i++) {
+        snprintf(cookie, sizeof(cookie), "old%u=%01000u; Path=/; Secure", i, i);
+        CHECK(browser_session_cookie_set_http_context(&session, &ads, cookie));
+    }
+    CHECK(session.cookie_bytes == 4000u);
+    snprintf(cookie, sizeof(cookie), "SID=%01200u; Path=/; Secure; HttpOnly", 7u);
+    CHECK(browser_session_cookie_set_http_context(&session, &signin, cookie));
+    /* Two oldest went; the newcomer and the rest stayed. */
+    CHECK(session.cookie_bytes == 3200u);
+    CHECK(browser_session_cookie_header_context(
+              &session, &signin, header, sizeof(header))
+          && strncmp(header, "SID=", 4) == 0);
+    CHECK(browser_session_cookie_header_context(
+              &session, &ads, header, sizeof(header))
+          && strstr(header, "old0=") == NULL && strstr(header, "old1=") == NULL
+          && strstr(header, "old2=") != NULL && strstr(header, "old3=") != NULL);
+
+    /* Overwriting in place evicts nothing when the new size fits. */
+    snprintf(cookie, sizeof(cookie), "old2=%01100u; Path=/; Secure", 2u);
+    CHECK(browser_session_cookie_set_http_context(&session, &ads, cookie)
+          && session.cookie_bytes == 3300u);
+
+    /* A value larger than the whole quota is refused and evicts nothing. */
+    memset(cookie, 'x', sizeof(cookie) - 1u);
+    memcpy(cookie, "big=", 4);
+    cookie[sizeof(cookie) - 1u] = '\0';
+    session.maximum_cookie_bytes = 1300u;
+    CHECK(!browser_session_cookie_set_http_context(&session, &ads, cookie)
+          && session.cookie_bytes == 3300u);
+    session.maximum_cookie_bytes = 4096u;
+
+    /* An insecure origin cannot push out Secure cookies to make room. */
+    TilefinchRequestContext plain = overlay_test_context("http://plain.test/");
+    snprintf(cookie, sizeof(cookie), "p=%01000u; Path=/", 1u);
+    CHECK(!browser_session_cookie_set_http_context(&session, &plain, cookie)
+          && session.cookie_bytes == 3300u);
+    browser_session_destroy(&session);
+    CHECK(budget->current == baseline);
+    return 0;
+}
+
+/* The cookie shapes a large account service's sign-in chain sets: host-locked
+   and Secure prefixes, parent-domain credentials, extension attributes, dated
+   expiries. All are stored and go out on the hosts they match. */
+static int test_signin_shaped_cookies(Budget *budget)
+{
+    size_t baseline = budget->current;
+    BrowserSession session;
+    char header[4096];
+    CHECK(browser_session_init(&session, budget, 32u * 1024u));
+    TilefinchRequestContext accounts =
+        overlay_test_context("https://accounts.sign.test/");
+    TilefinchRequestContext www = overlay_test_context("https://www.sign.test/");
+    static const char *const set_cookies[] = {
+        "__Host-G=1:v; Expires=Tue, 07-Nov-2028 20:40:33 GMT; Path=/; Secure; "
+        "HttpOnly; Priority=HIGH",
+        "__Host-1L=v; Max-Age=63072000; Path=/; Secure; HttpOnly; SameSite=None",
+        "__Secure-1S=v; Domain=.sign.test; Expires=Tue, 07-Nov-2028 20:40:33 GMT; "
+        "Path=/; Secure; HttpOnly; Priority=HIGH; SameParty",
+        "__Secure-3S=v; Domain=sign.test; Path=/; Secure; HttpOnly; "
+        "SameSite=None; Partitioned",
+        "SID=v; Domain=.sign.test; Path=/; Priority=HIGH",
+        "HSID=v; Domain=.sign.test; Path=/; HttpOnly",
+        "SIDCC=v; Domain=.sign.test; Path=/; Priority=HIGH; SameSite=lax",
+        "LSID=v; Path=/; Secure; HttpOnly; SameSite=Strict",
+    };
+    for (size_t i = 0; i < sizeof(set_cookies) / sizeof(set_cookies[0]); i++) {
+        bool stored = browser_session_cookie_set_http_context(
+            &session, &accounts, set_cookies[i]);
+        if (!stored) fprintf(stderr, "refused: %s\n", set_cookies[i]);
+        CHECK(stored);
+    }
+    CHECK(browser_session_cookie_header_context(
+              &session, &accounts, header, sizeof(header))
+          && strstr(header, "__Host-G=1:v") != NULL
+          && strstr(header, "__Host-1L=v") != NULL
+          && strstr(header, "__Secure-1S=v") != NULL
+          && strstr(header, "SID=v") != NULL
+          && strstr(header, "HSID=v") != NULL
+          && strstr(header, "SIDCC=v") != NULL
+          && strstr(header, "LSID=v") != NULL);
+    CHECK(browser_session_cookie_header_context(
+              &session, &www, header, sizeof(header))
+          && strstr(header, "__Secure-1S=v") != NULL
+          && strstr(header, "SID=v") != NULL
+          && strstr(header, "__Host-") == NULL
+          && strstr(header, "LSID=") == NULL);
+    /* A __Host- cookie may not name a domain; a __Secure- one must be Secure. */
+    CHECK(!browser_session_cookie_set_http_context(
+              &session, &accounts, "__Host-X=v; Domain=sign.test; Path=/; Secure"));
+    CHECK(!browser_session_cookie_set_http_context(
+              &session, &accounts, "__Secure-X=v; Path=/"));
+    browser_session_destroy(&session);
+    CHECK(budget->current == baseline);
+    return 0;
+}
+
 static int test_cookie_service_handoff_retention(Budget *budget)
 {
     size_t baseline = budget->current;
@@ -2152,6 +2390,9 @@ int main(void)
     CHECK(test_cookie_header_bound(&budget) == 0);
     CHECK(test_cookie_header_bound_same_name(&budget) == 0);
     CHECK(test_cookie_overlay_growth_follows_checks(&budget) == 0);
+    CHECK(test_cookie_date_forms(&budget) == 0);
+    CHECK(test_signin_shaped_cookies(&budget) == 0);
+    CHECK(test_cookie_byte_quota_evicts_oldest(&budget) == 0);
     CHECK(test_cookie_service_handoff_retention(&budget) == 0);
     CHECK(test_cookie_overlay_footprint_and_equivalence(&budget) == 0);
     TilefinchRequestContext opaque_context = {
@@ -2530,6 +2771,39 @@ int main(void)
               &session, request.top_level_url, true)
           && browser_session_cookie_header_context(
               &session, &request, header, sizeof(header))
+          && contains_cookie(header, "none"));
+
+    /* NW-03: a cross-site frame (initiator other.test) in a target.test
+       page requests target.test. The top-level site matches the target,
+       but the requesting document is cross-site, so the site for cookies
+       is null: Strict and Lax cookies stay home and SameSite=None goes. A
+       same-site initiator in the same page gets all three. */
+    TilefinchRequestContext cross_site_frame = {
+        .target_url = "https://target.test/account/email",
+        .initiator_url = "https://other.test/widget",
+        .top_level_url = "https://target.test/",
+        .method = "POST",
+        .mode = TILEFINCH_REQUEST_MODE_NO_CORS,
+        .credentials = TILEFINCH_CREDENTIALS_INCLUDE,
+        .destination = TILEFINCH_DESTINATION_FETCH
+    };
+    CHECK(browser_session_cookie_header_context(
+              &session, &cross_site_frame, header, sizeof(header))
+          && !contains_cookie(header, "strict")
+          && !contains_cookie(header, "lax")
+          && contains_cookie(header, "none"));
+    cross_site_frame.method = "GET";
+    cross_site_frame.destination = TILEFINCH_DESTINATION_IMAGE;
+    CHECK(browser_session_cookie_header_context(
+              &session, &cross_site_frame, header, sizeof(header))
+          && !contains_cookie(header, "strict")
+          && !contains_cookie(header, "lax"));
+    TilefinchRequestContext same_site_document = cross_site_frame;
+    same_site_document.initiator_url = "https://www.target.test/page";
+    CHECK(browser_session_cookie_header_context(
+              &session, &same_site_document, header, sizeof(header))
+          && contains_cookie(header, "strict")
+          && contains_cookie(header, "lax")
           && contains_cookie(header, "none"));
 
     /* A Critical-CH restart is still the same frame request context. A

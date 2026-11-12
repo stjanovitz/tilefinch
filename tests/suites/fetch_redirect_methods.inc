@@ -119,6 +119,49 @@ static bool test_redirect_methods(Budget *budget, unsigned port)
     return true;
 }
 
+/* A form POST that redirects becomes a GET, which carries no Origin, even as
+   `null` on a hop to another site. A chain that left the initiator's origin
+   is not same-origin when it comes back. */
+static bool test_redirected_navigation_metadata(Budget *budget, unsigned port)
+{
+    char url[256], origin[64];
+    snprintf(url, sizeof(url), "http://127.0.0.1:%u/post302", port);
+    snprintf(origin, sizeof(origin), "http://127.0.0.1:%u", port);
+    FetchRequest request = {
+        .method = "POST", .body = "payload", .body_length = 7,
+        .content_type = "application/x-www-form-urlencoded",
+        .origin = origin, .initiator_url = url,
+        .sec_fetch_site = "same-origin", .allow_http_errors = true
+    };
+    FetchResult result = {.budget = budget};
+    bool fetched = fetch_redirect(budget, url, &request, &result);
+    if (!fetched || result.data == NULL
+        || strstr(result.data, "origin=<none>") == NULL)
+        fprintf(stderr, "post302 metadata fetched=%d body=%s error=%s\n", fetched,
+                result.data == NULL ? "<null>" : result.data, result.error);
+    bool dropped = fetched && result.data != NULL
+        && strstr(result.data, "method=GET") != NULL
+        && strstr(result.data, "origin=<none>") != NULL;
+    fetch_result_destroy(&result);
+    if (!dropped) return false;
+
+    snprintf(url, sizeof(url), "http://127.0.0.1:%u/cross-port-return", port);
+    FetchRequest chain = {
+        .method = "GET", .initiator_url = url,
+        .sec_fetch_site = "same-origin", .allow_http_errors = true
+    };
+    result = (FetchResult) {.budget = budget};
+    fetched = fetch_redirect(budget, url, &chain, &result);
+    if (!fetched || result.data == NULL
+        || strstr(result.data, "fetch-site=cross-site") == NULL)
+        fprintf(stderr, "return chain fetched=%d body=%s error=%s\n", fetched,
+                result.data == NULL ? "<null>" : result.data, result.error);
+    bool sticky = fetched && result.data != NULL
+        && strstr(result.data, "fetch-site=cross-site") != NULL;
+    fetch_result_destroy(&result);
+    return sticky;
+}
+
 static bool test_generic_method_bodies_and_head(Budget *budget,
                                                 unsigned port)
 {
@@ -364,7 +407,9 @@ static bool test_navigation_critical_hint_redirect_scope(
     CHECK(browser_session_init(&browser, budget, 64 * 1024)
           && navigation_init(&navigation, budget, 4));
     navigation_attach_browser_session(&navigation, &browser);
-    navigation_enable_scripts(&navigation, 2 * MIB, 1000);
+    navigation_enable_scripts(
+        &navigation, test_small_realm_bytes(budget, TEST_SMALL_REALM_MARGIN_BYTES),
+        1000);
     navigation_enable_document_scripts(
         &navigation, 4, 32 * 1024, 16 * 1024, 1000);
 

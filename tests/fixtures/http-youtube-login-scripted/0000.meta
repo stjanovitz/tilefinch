@@ -1,0 +1,13 @@
+psp-http-trace=1
+method=GET
+url=https://accounts.google.com/v3/signin/identifier
+success=1
+async-delay-pumps=3
+external-cancel=0
+transport-timeout=0
+error=
+status=200
+length=65
+effective-url=https://accounts.google.com/v3/signin/identifier
+content-type=text/html
+set-cookie-count=0

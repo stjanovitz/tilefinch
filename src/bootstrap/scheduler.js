@@ -91,9 +91,9 @@
   publishTimers();
   const limit = 128,
     /* Browser-owned clocks that each keep at most one timer pending (the CSS
-       transition event clock and the property-effect frame) draw on these
-       slots above the author limit, so a page that fills the table cannot
-       strand a transition half-way. */
+       transition event clock, the property-effect frame, the CSS animation
+       event clock and the motion scan's next chunk) draw on these slots above
+       the author limit, so a page that fills the table cannot strand one. */
     reservedLimit = limit + 4;
   /* The frame loop registers an animation-frame timer every presented frame.
      Reusing retired records and one shared empty argument list keeps the
@@ -729,8 +729,8 @@
       hostState[HOST_SCROLL_PENDING] = 0;
       /* Viewport scrolling targets Document and bubbles to Window. Dispatching
          directly on Window skips document listeners used by sticky controls. */
-      document.dispatchEvent(__tilefinchTrustedEvent(new Event("scroll", { bubbles: true })));
-      visualViewport.dispatchEvent(__tilefinchTrustedEvent(new Event("scroll")));
+      document.dispatchEvent(trusted(new Event("scroll", { bubbles: true })));
+      visualViewport.dispatchEvent(trusted(new Event("scroll")));
       return true;
     };
     const scrollTo = (xOrOptions = undefined, y = undefined) => {
@@ -867,7 +867,8 @@
     ];
   };
   const createBootstrapEvent = Document.prototype.createEvent;
-  const trusted = __tilefinchRealmGlobal.__tilefinchTrustedEvent,
+  const trusted =
+      __tilefinchRealmGlobal.__tilefinchTrustedEventShare.trustedEvent,
     nonBubblingEventTypes = new Set([
       "focus", "blur", "load", "error", "scroll", "mouseenter",
       "mouseleave", "pointerenter", "pointerleave",
@@ -1249,7 +1250,7 @@
     if (!form) return false;
     if (!form.noValidate && !submitter?.formNoValidate && !form.checkValidity())
       return false;
-    return form.dispatchEvent(
+    const proceed = form.dispatchEvent(
       trusted(
         new SubmitEvent("submit", {
           bubbles: true,
@@ -1258,5 +1259,18 @@
         }),
       ),
     );
+    /* Native submission sends the same entry list a script submission does:
+       values native control state cannot hold, plus `formdata` additions. A
+       list that fails to build leaves the DOM serializer to send the form. */
+    if (proceed) {
+      try {
+        __tilefinchRealmGlobal.__tilefinchSubmittedBody =
+          __tilefinchRealmGlobal.__tilefinchSubmissionBody?.(form, submitter) ??
+          null;
+      } catch {
+        __tilefinchRealmGlobal.__tilefinchSubmittedBody = null;
+      }
+    }
+    return proceed;
   };
 })();

@@ -673,6 +673,70 @@ size_t script_runtime_heap_available(const ScriptRuntime *runtime)
     return remaining > SIZE_MAX - growable ? SIZE_MAX : remaining + growable;
 }
 
+/* The heap a compile could reach after `budget_taken_first` more Budget
+   bytes are taken. With `count_stored_text`, as if the function text kept
+   in the source store were in the heap (the unstripped realm): the heap
+   would hold all of it, past the current limit if need be, and the Budget
+   would hold only what the store keeps in fewer bytes (compressed blocks)
+   on top of what it already holds. The store's own bytes are already out
+   of the free Budget, so they are not taken again. */
+static size_t js_rt_heap_reachable_raw(const ScriptRuntime *runtime,
+                                       size_t budget_taken_first,
+                                       bool count_stored_text)
+{
+    if (runtime == NULL || runtime->runtime == NULL
+        || runtime->quickjs_pool == NULL || runtime->budget == NULL)
+        return 0;
+    size_t remaining = script_runtime_heap_remaining(runtime);
+    size_t limit = script_runtime_current_limit(runtime);
+    size_t ceiling_room = runtime->heap_growth_enabled
+            && limit < runtime->heap_growth_ceiling
+        ? runtime->heap_growth_ceiling - limit : 0;
+    size_t taken = budget_taken_first;
+    if (count_stored_text && runtime->source_store != NULL) {
+        ScriptSourceStoreStats stats;
+        script_source_store_stats(runtime->source_store, &stats);
+        size_t text = stats.text_bytes;
+        size_t in_limit = text < remaining ? text : remaining;
+        remaining -= in_limit;
+        /* Text past the headroom would have raised the limit. */
+        size_t past_limit = text - in_limit;
+        ceiling_room = ceiling_room > past_limit
+            ? ceiling_room - past_limit : 0;
+        size_t unheld = text > stats.held_bytes
+            ? text - stats.held_bytes : 0;
+        taken = taken > SIZE_MAX - unheld ? SIZE_MAX : taken + unheld;
+    }
+    size_t free_bytes = budget_remaining(runtime->budget);
+    free_bytes = free_bytes > taken ? free_bytes - taken : 0;
+    /* Allocations under the current limit still come from the page
+       Budget: headroom the Budget cannot back is not reachable. */
+    size_t reachable = remaining < free_bytes ? remaining : free_bytes;
+    /* Growth as js_rt_heap_growth_hook grants it: only Budget above the
+       growth reserve and above the headroom already granted under the
+       limit (which is drawn from the same Budget) is spare. */
+    if (ceiling_room != 0
+        && free_bytes > runtime->heap_growth_reserve
+        && free_bytes - runtime->heap_growth_reserve > remaining) {
+        size_t spare = free_bytes - runtime->heap_growth_reserve - remaining;
+        if (spare > ceiling_room) spare = ceiling_room;
+        reachable = reachable > SIZE_MAX - spare
+            ? SIZE_MAX : reachable + spare;
+    }
+    return reachable;
+}
+
+size_t script_runtime_heap_reachable(const ScriptRuntime *runtime,
+                                     size_t budget_taken_first)
+{
+    return js_rt_heap_reachable_raw(runtime, budget_taken_first, true);
+}
+
+size_t script_runtime_heap_obtainable(const ScriptRuntime *runtime)
+{
+    return js_rt_heap_reachable_raw(runtime, 0, false);
+}
+
 bool script_error_reports_out_of_memory(const char *error)
 {
     return error != NULL

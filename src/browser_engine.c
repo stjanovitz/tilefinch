@@ -68,6 +68,7 @@ typedef struct {
     bool record_history;
     char url[NAVIGATION_URL_LIMIT];
     char download_filename[FILE_DOWNLOAD_FILENAME_LIMIT];
+    char media_audio_url[NAVIGATION_URL_LIMIT];
 } BrowserEngineNavigationWork;
 
 /* The load preview on screen. NONE: nothing. FRAME: a frame is presented
@@ -96,8 +97,6 @@ static bool browser_preview_view_live(BrowserPreviewView view)
         || view == BROWSER_PREVIEW_VIEW_FILLING;
 }
 
-/* Largest url-encoded body a script form submission may send. */
-#define BROWSER_ENGINE_SCRIPT_FORM_BODY_LIMIT (64u * 1024u)
 /* Nodes a whole-document walk (history controls, provider controls, a
    restored focus target) visits at most. */
 #define BROWSER_ENGINE_DOM_WALK_LIMIT 8192u
@@ -107,6 +106,21 @@ typedef enum {
     YOUTUBE_SIGNIN_HANDOFF, YOUTUBE_SIGNIN_VERIFYING, YOUTUBE_SIGNIN_VERIFIED,
     YOUTUBE_SIGNIN_FAILED, YOUTUBE_SIGNIN_CANCELLED, YOUTUBE_SIGNIN_MANUAL
 } YoutubeSigninState;
+
+/* What happened on the account pages since diagnostics were turned on.
+   Counts and fixed classes only, never field contents. */
+typedef struct {
+    unsigned auth_navigations;
+    unsigned activations, activations_without_scripts;
+    unsigned form_submits, forms_not_sent;
+    unsigned text_edits;
+    unsigned form_posts;
+    unsigned token_kind;
+    size_t token_length;
+    unsigned post_target, post_landing, post_outcome;
+    long post_http_status;
+    bool post_pending;
+} BrowserSigninTrail;
 
 /* YouTube provider state, owned by browser_engine/youtube.inc. The facade's
    navigation, commit, finish, cancel and idle paths reach it through that
@@ -121,6 +135,7 @@ typedef struct {
     uint64_t login_rejected;
     unsigned login_events;
     bool signin_diagnostics;
+    BrowserSigninTrail signin_trail;
     unsigned signin_retries;
     YoutubeSigninState signin_state;
     YoutubeLiteFeedDiagnostics signin_feed;
@@ -193,7 +208,6 @@ struct BrowserEngine {
     Budget budget;
     /* The last script form submission's body when it outgrew
        ControllerAction.body; the action points here. */
-    char *script_form_body;
     BrowserSession session;
     ContentBlocker *content_blocker;
     NavigationSession navigation;
@@ -257,12 +271,15 @@ struct BrowserEngine {
     /* A completion-time scroll left tiles to fill; one happened at all
        (the frame loop then repaints, whatever the completion's outcome). */
     bool completion_frame_pending;
+    /* The frame shows queued page presses, not the page's position. */
+    bool press_preview_shown;
     bool completion_scrolled;
     bool font_publication_guarded;
     FontSetFaceMask font_requested_faces;
     FontSetFaceMask font_failed_faces;
     bool controller_ready;
     bool render_ready;
+    bool optional_glyph_repaint_pending;
     bool candidate_controller_ready;
     bool candidate_render_ready;
     bool candidate_shell_prepared;
@@ -384,6 +401,12 @@ static bool browser_engine_finish_input(BrowserEngine *engine,
 
 /* YouTube provider hooks the facade calls before browser_engine/youtube.inc,
    which is included ahead of browser_engine_run_idle_work. */
+static void browser_engine_youtube_note_request(
+    BrowserEngine *engine, const char *url, const char *method,
+    const char *body, size_t body_length);
+static void browser_engine_youtube_note_activation(
+    BrowserEngine *engine, const ControllerAction *action);
+static void browser_engine_youtube_note_text_edit(BrowserEngine *engine);
 static void browser_engine_youtube_on_navigation_begin(
     BrowserEngine *engine, const char *url, bool signin_recovery);
 static const char *browser_engine_youtube_commit_url(const char *url);
@@ -404,7 +427,7 @@ static void browser_engine_deferred_reader_images_ready(
     void *opaque, NavigationSession *navigation);
 static void browser_engine_image_table_moved(
     void *opaque, NavigationSession *navigation, uintptr_t previous_base,
-    size_t previous_count);
+    size_t previous_count, const uint8_t *remap);
 
 static void copy_error(char *output, size_t capacity, const char *message)
 {
@@ -1750,8 +1773,6 @@ bool browser_engine_shutdown(BrowserEngine *engine)
     browser_engine_cancel_navigation(engine, "browser engine shutdown");
     browser_engine_release_page_network(engine);
     (void) browser_engine_youtube_cancel(engine);
-    budget_free(&engine->budget, engine->script_form_body);
-    engine->script_form_body = NULL;
     /* A page cancellation only invalidates the JPEG completion token; it
        deliberately never waits on entropy decoding. Engine teardown is the
        ownership boundary that must join the worker before destroying the
@@ -2052,12 +2073,14 @@ bool browser_engine_apply_layout_damage(BrowserEngine *engine)
     bool (*replace_damage)(TileCache *, const LayoutDocument *, int, int, int, int) =
         preserve_fixed ? tile_cache_replace_layout_damage_preserving_fixed
                        : tile_cache_replace_layout_damage;
+    /* A generation without damage leaves every painted tile valid. */
+    bool damaged = engine->navigation.relayout_damage_valid;
     if (!replace_damage(
             &engine->render, &engine->navigation.page.layout,
-            engine->navigation.relayout_damage_left,
-            engine->navigation.relayout_damage_top,
-            engine->navigation.relayout_damage_right,
-            engine->navigation.relayout_damage_bottom)) {
+            damaged ? engine->navigation.relayout_damage_left : 0,
+            damaged ? engine->navigation.relayout_damage_top : 0,
+            damaged ? engine->navigation.relayout_damage_right : 0,
+            damaged ? engine->navigation.relayout_damage_bottom : 0)) {
         return set_error_code(
             engine, TILEFINCH_SUBSYSTEM_RENDER,
             TILEFINCH_DIAGNOSTIC_RENDER_FAILED, "render-layout-damage",
@@ -2190,6 +2213,7 @@ bool browser_engine_optional_glyphs_updated(BrowserEngine *engine)
         tile_cache_invalidate_glyphs(&engine->render);
     if (engine->candidate_render_ready)
         tile_cache_invalidate_glyphs(&engine->candidate_render);
+    engine->optional_glyph_repaint_pending = true;
     clear_error(engine);
     return true;
 }
@@ -2203,7 +2227,16 @@ bool browser_engine_optional_glyph_payloads_ready(BrowserEngine *engine)
         tile_cache_repaint_glyphs(&engine->render);
     if (engine->candidate_render_ready)
         tile_cache_repaint_glyphs(&engine->candidate_render);
+    engine->optional_glyph_repaint_pending = true;
     clear_error(engine);
+    return true;
+}
+
+bool browser_engine_take_optional_glyph_repaint(BrowserEngine *engine)
+{
+    if (engine == NULL || !engine->optional_glyph_repaint_pending)
+        return false;
+    engine->optional_glyph_repaint_pending = false;
     return true;
 }
 
@@ -2333,6 +2366,7 @@ static void browser_engine_copy_adapter_metrics(
     metrics->load.total_pump_us = adapter->network_us;
     metrics->load.maximum_pump_us =
         adapter->maximum_pump_us;
+    metrics->load.progress_units = adapter->progress_units;
     metrics->adapter_request_wall_us =
         adapter->request_wall_us;
     metrics->adapter_transport_total_us =
@@ -2393,6 +2427,18 @@ static BrowserNavigationJobStatus browser_engine_finish_navigation_work(
         snprintf(work->download_filename, sizeof(work->download_filename), "%s", download);
         terminal = NAVIGATION_LOAD_CANCELLED;
         snprintf(engine->navigation.last_error, sizeof(engine->navigation.last_error), "File download awaiting confirmation");
+    } else if (navigation_load_no_content(work->load)) {
+        terminal = NAVIGATION_LOAD_CANCELLED;
+        snprintf(engine->navigation.last_error, sizeof(engine->navigation.last_error), "Response has no content; staying on this page");
+    }
+    const char *media_audio = navigation_load_media_audio_url(work->load);
+    if (media_audio != NULL) {
+        snprintf(work->media_audio_url, sizeof(work->media_audio_url),
+                 "%s", media_audio);
+        terminal = NAVIGATION_LOAD_CANCELLED;
+        snprintf(engine->navigation.last_error,
+                 sizeof(engine->navigation.last_error),
+                 "Audio opened in the player");
     }
     if (work->hooks_installed) {
         (void) navigation_set_candidate_commit_hooks(
@@ -2447,6 +2493,24 @@ static BrowserNavigationJobStatus browser_engine_finish_navigation_work(
                     : navigation_current(
                           &engine->navigation)->scroll_y;
         }
+        /* The committed page is the reader's screen from here on. */
+        if (work->metrics.first_text_us == 0) {
+            const NavigationEntry *entry =
+                navigation_current(&engine->navigation);
+            const LayoutDocument *page = &engine->navigation.page.layout;
+            int top = entry == NULL ? 0 : entry->scroll_y;
+            int screen = engine->navigation.viewport.css_height;
+            unsigned shown = screen <= 0 ? 0u
+                : browser_engine_band_content(
+                      page, top,
+                      top <= INT_MAX - screen ? top + screen : INT_MAX);
+            uint64_t at_us = work->metrics.elapsed_us != 0
+                ? work->metrics.elapsed_us : 1u;
+            if (shown != 0 && work->metrics.first_content_us == 0)
+                work->metrics.first_content_us = at_us;
+            if ((shown & BROWSER_SCREEN_TEXT) != 0)
+                work->metrics.first_text_us = at_us;
+        }
         /* Focus chosen on the preview stays; an activation that waited
            for the page runs now (the frontend takes it). */
         if (provisional_focus != NULL
@@ -2493,6 +2557,7 @@ static BrowserNavigationJobStatus browser_engine_finish_navigation_work(
             (size_t) engine->config.device.framebuffer_height,
             (size_t) engine->config.device.framebuffer_width);
     }
+    browser_engine_end_reading_hint(engine, work->metrics.elapsed_us);
     browser_engine_reset_provisional_viewport(engine);
     return work->status;
 }
@@ -2514,6 +2579,7 @@ static bool browser_engine_begin_navigation_request(
             "browser navigation job cannot be started");
     }
     browser_engine_youtube_on_navigation_begin(engine, url, signin_recovery);
+    browser_engine_youtube_note_request(engine, url, method, body, body_length);
     (void) browser_engine_youtube_cancel(engine);
     /* Only the navigation that was refused may fall back. */
     site_identity_clear_google_fallback();
@@ -2719,44 +2785,12 @@ static bool browser_engine_collect_script_form_submission(BrowserEngine *engine,
         || !engine->navigation.page.loaded
         || engine->navigation.page.runtime == NULL) return false;
     lxb_dom_node_t *form = NULL, *submitter = NULL;
-    char *body = NULL;
-    size_t body_length = 0;
-    bool script_body = script_runtime_take_form_submission_body(
-        engine->navigation.page.runtime, &engine->budget,
-        BROWSER_ENGINE_SCRIPT_FORM_BODY_LIMIT, &body, &body_length);
-    if (!script_runtime_take_form_submission(
-            engine->navigation.page.runtime, &form, &submitter)) {
-        budget_free(&engine->budget, body);
-        return false;
-    }
-    if (!controller_build_form_action(
-            &engine->controller, form, submitter, false, action)
-        || (action->type != CONTROLLER_ACTION_FORM_SUBMIT
-            && action->type != CONTROLLER_ACTION_NAVIGATE)) {
-        budget_free(&engine->budget, body);
-        return false;
-    }
-    /* Preserve the entry list produced by script, including formdata
-       additions/deletions, rather than serializing the DOM a second time.
-       Large entry lists use the engine-owned bounded navigation storage. */
-    if (script_body && action->type == CONTROLLER_ACTION_FORM_SUBMIT
-        && strcasecmp(action->method, "POST") == 0
-        && (action->content_type[0] == '\0'
-            || strncasecmp(action->content_type,
-                           "application/x-www-form-urlencoded", 33) == 0)) {
-        controller_action_clear_body(action);
-        action->body_length = body_length;
-        if (body_length < sizeof(action->body)) {
-            memcpy(action->body, body, body_length + 1);
-        } else {
-            budget_free(&engine->budget, engine->script_form_body);
-            engine->script_form_body = body;
-            action->external_body = body;
-            body = NULL;
-        }
-    }
-    budget_free(&engine->budget, body);
-    return true;
+    return script_runtime_take_form_submission(
+               engine->navigation.page.runtime, &form, &submitter)
+        && controller_build_form_action(
+               &engine->controller, form, submitter, false, action)
+        && (action->type == CONTROLLER_ACTION_FORM_SUBMIT
+            || action->type == CONTROLLER_ACTION_NAVIGATE);
 }
 
 bool browser_engine_take_script_form_submission(BrowserEngine *engine,
@@ -3269,6 +3303,8 @@ bool browser_engine_stop_page_scripts(BrowserEngine *engine)
 {
     if (engine == NULL || !engine->navigation.page.loaded
         || engine->navigation.page.runtime == NULL) return false;
+    navigation_record_script_stop(&engine->navigation,
+                                  NAVIGATION_SCRIPT_STOP_BROWSER);
     navigation_retire_current_page_scripts(&engine->navigation);
     engine->navigation.page.script_degradation_observed = true;
     snprintf(engine->navigation.page.script_result.summary,
@@ -3307,6 +3343,8 @@ BrowserMediaRoomStep browser_engine_make_media_room(
                would lose them: its DOM, layout and position stay for the
                return, and the page says its scripts were stopped. */
             (*stage)++;
+            navigation_record_script_stop(&engine->navigation,
+                                          NAVIGATION_SCRIPT_STOP_MEDIA_ROOM);
             if (browser_engine_stop_page_scripts(engine)) {
                 engine->media_room_scripts_stopped = true;
                 engine->media_room_generation =
@@ -3751,7 +3789,10 @@ bool browser_engine_load_url_with_limits(
     if (url == NULL) return set_error_code(
         engine, TILEFINCH_SUBSYSTEM_NETWORK, TILEFINCH_DIAGNOSTIC_INVALID_INPUT,
         "url-load", "URL load is invalid");
-    if (engine != NULL) engine->navigation_work.download_filename[0] = '\0';
+    if (engine != NULL) {
+        engine->navigation_work.download_filename[0] = '\0';
+        engine->navigation_work.media_audio_url[0] = '\0';
+    }
     if (maximum_bytes == 0 || timeout_ms <= 0) return set_error_code(
         engine, TILEFINCH_SUBSYSTEM_NETWORK, TILEFINCH_DIAGNOSTIC_INVALID_INPUT,
         "url-load", "URL load limits are invalid");
@@ -4026,6 +4067,8 @@ static bool browser_engine_finish_input(BrowserEngine *engine,
     /* Explicit focus/scroll/pointer actions retain immediate feedback, even
        during the provider's short automatic first-paint coalescing window. */
     engine->initial_tile_hold = false;
+    if (engine->render_ready)
+        (void) navigation_prepare_near_vector_images(&engine->navigation);
     if (engine->render_ready
         && engine->render_relayout_generation
                != engine->navigation.incremental_relayouts
@@ -4203,6 +4246,32 @@ bool browser_engine_completion_scroll_page(BrowserEngine *engine,
     return true;
 }
 
+bool browser_engine_preview_page_presses(BrowserEngine *engine, int presses)
+{
+    if (engine == NULL || !engine->render_ready
+        || !engine->navigation.page.loaded) return false;
+    const NavigationEntry *entry = navigation_current(&engine->navigation);
+    int step = controller_page_press_preview_step(&engine->controller);
+    if (entry == NULL || step <= 0) return false;
+    long long target = (long long) entry->scroll_y + (long long) presses * step;
+    if (target < 0) target = 0;
+    if (target > INT_MAX) target = INT_MAX;
+    if (!tile_cache_compose_resident(
+            &engine->render,
+            viewport_css_to_device(&engine->navigation.viewport, (int) target),
+            engine->config.device.framebuffer_width,
+            engine->config.device.framebuffer_height)) return false;
+    engine->press_preview_shown = true;
+    return true;
+}
+
+bool browser_engine_take_press_preview(BrowserEngine *engine)
+{
+    if (engine == NULL || !engine->press_preview_shown) return false;
+    engine->press_preview_shown = false;
+    return true;
+}
+
 bool browser_engine_completion_raster_step(BrowserEngine *engine,
                                            bool show_progress)
 {
@@ -4323,6 +4392,12 @@ bool browser_engine_text_input_info(
         && controller_text_input_info(&engine->controller, info);
 }
 
+bool browser_engine_keyboard_done_submits(const BrowserEngine *engine)
+{
+    return browser_engine_input_ready(engine)
+        && controller_keyboard_done_submits(&engine->controller);
+}
+
 bool browser_engine_replace_text(BrowserEngine *engine, const char *utf8,
                                  size_t length)
 {
@@ -4332,6 +4407,7 @@ bool browser_engine_replace_text(BrowserEngine *engine, const char *utf8,
     /* Editing a field takes control of the page: a pending refresh would
        discard what was typed. */
     (void) navigation_cancel_refresh(&engine->navigation);
+    browser_engine_youtube_note_text_edit(engine);
     return browser_engine_finish_input(
         engine, controller_replace_text(&engine->controller, utf8, length));
 }
@@ -4343,6 +4419,7 @@ bool browser_engine_insert_text(BrowserEngine *engine, const char *utf8,
     browser_engine_cancel_idle_work(engine);
     if (!browser_engine_settle_bounded_layout(engine)) return false;
     (void) navigation_cancel_refresh(&engine->navigation);
+    browser_engine_youtube_note_text_edit(engine);
     return browser_engine_finish_input(
         engine, controller_insert_text(&engine->controller, utf8, length));
 }
@@ -4384,6 +4461,7 @@ bool browser_engine_activate(BrowserEngine *engine,
        Otherwise the next idle turn can return to the search field while a
        provider edit is still being confirmed, moving both focus and scroll. */
     if (activated) engine->autofocus_pending = false;
+    browser_engine_youtube_note_activation(engine, action);
     bool youtube_finished = false;
     if (browser_engine_youtube_activate(engine, action, activated,
                                         &youtube_finished))
@@ -5387,6 +5465,7 @@ browser_idle_optional_fonts(BrowserEngine *engine, BrowserIdleTurn *turn)
                 *font_order[at].face = *font_order[at].staged;
                 memset(font_order[at].staged, 0, sizeof(*font_order[at].staged));
             }
+            font_set_mark_bold_faces(&engine->fonts);
             /* Metrics changed in place, not CSS. Reuse font-independent
                styles but remeasure every geometry and ch-dependent value. */
             layout_reuse_cache_begin_font_publication(
@@ -6377,6 +6456,18 @@ bool browser_engine_take_download_offer(BrowserEngine *engine,
     strcpy(url, work->url);
     strcpy(filename, work->download_filename);
     work->download_filename[0] = '\0';
+    return true;
+}
+
+bool browser_engine_take_media_audio_offer(BrowserEngine *engine,
+                                           char *url, size_t url_capacity)
+{
+    if (engine == NULL || url == NULL) return false;
+    BrowserEngineNavigationWork *work = &engine->navigation_work;
+    size_t length = strlen(work->media_audio_url);
+    if (length == 0 || length >= url_capacity) return false;
+    memcpy(url, work->media_audio_url, length + 1u);
+    work->media_audio_url[0] = '\0';
     return true;
 }
 

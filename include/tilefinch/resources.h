@@ -221,6 +221,8 @@ typedef struct ImageCanvasNativeSurface {
 /* The most entries an ImageResources table tracks (one per image node,
    shared-source aliases included). */
 #define IMAGE_TRACKED_NODE_LIMIT 192u
+/* Elements above a node whose inherited style can be resolved by itself. */
+#define IMAGE_SUBTREE_ANCESTOR_LIMIT 64u
 
 typedef struct ImageResource {
     lxb_dom_node_t *node;
@@ -245,11 +247,15 @@ typedef struct ImageResource {
     /* Mutable page-authored canvas snapshots use the same bounded decoded
        surface path as images, but are never refetched or colour-remapped. */
     bool is_canvas;
-    /* WebGL advertises alpha:false and both native backends force every
-       resolved pixel opaque. This lets publication avoid rescanning the
-       complete RGBA surface on every animation frame. Canvas 2D leaves the
-       bit clear because its backing may contain transparency. */
+    /* Every pixel's alpha is 255, so publication never rescans the RGBA
+       surface per frame. WebGL advertises alpha:false and both native
+       backends force every resolved pixel opaque; a 2D commit keeps the bit
+       exact by scanning only what it changed (images_commit_canvas_surface). */
     bool canvas_opaque;
+    /* 2D only, while canvas_opaque is false: 1 + the index of a pixel known
+       to be translucent, or 0 when none is known. A commit that leaves that
+       pixel alone needs no scan to stay translucent. */
+    uint32_t canvas_translucent_pixel;
     /* A PSP WebGL surface may remain authoritative in EDRAM until normal
        painting consumes it. The page-owned RGBA allocation remains the
        bounded fallback/readback store; this borrowed pointer is never freed
@@ -304,6 +310,17 @@ typedef struct ImageResource {
    decodes it at its painted size before that layout is painted
    (images_retarget_decode_awaiting). */
 #define IMAGE_RETARGET_AWAITING_LAYOUT UINT8_C(64)
+/* With DROPPED and VECTOR: a large SVG raster that is not held because
+   every paint of it is far from the reader (or that a load never
+   rasterized for that reason); display retargeting rasterizes it when the
+   reader comes near (see tilefinch/image_retarget.h). */
+#define IMAGE_RETARGET_DISTANT UINT8_C(128)
+
+/* At most this many parsed SVG documents, holding this many budget bytes
+   in all, wait in a table for the layout that rasterizes them. */
+#define IMAGE_SVG_KEPT_PARSE_LIMIT 4u
+#define IMAGE_SVG_KEPT_PARSE_BYTES (96u * 1024u)
+struct ImageSvgParse;
 
 typedef enum {
     IMAGE_CANVAS_COMMIT_REFUSED = 0,
@@ -394,6 +411,8 @@ typedef struct {
     size_t inline_svg_refresh_reused;
     uint64_t inline_svg_serialize_us;
     uint64_t inline_svg_rasterize_us;
+    /* Nodes visited resolving inline <use> references by id. */
+    size_t inline_svg_id_visits;
 } ExternalImageStats;
 
 typedef struct {
@@ -421,10 +440,27 @@ typedef struct {
         size_t deferred;
         size_t released_bytes;
         size_t restored_bytes;
+        /* Large SVG rasters a load left unrasterized because a layout
+           follows, released for distance from the reader, and rasterized
+           again as the reader approached (by idle work or, when a scroll
+           reached one first, before that frame). */
+        size_t distant_deferred;
+        size_t distant_releases;
+        size_t distant_restores;
+        size_t distant_input_restores;
         uint64_t us;
     } retarget;
     /* Bounded, generation-keyed display-size scan, owned by this table. */
     struct ImageRetargetPlan *retarget_plan;
+    /* Parses of large SVG backgrounds a load left for the layout that
+       follows (IMAGE_RETARGET_AWAITING_LAYOUT), each by the markup it was
+       parsed from, so that layout rasterizes them without parsing them
+       again (see tilefinch/image_retarget.h). */
+    struct {
+        const void *identity;
+        struct ImageSvgParse *parse;
+    } svg_parses[IMAGE_SVG_KEPT_PARSE_LIMIT];
+    size_t svg_parse_bytes;
     /* <img> elements whose source failed for good while loading into this
        table: a fetch error, a refused or invalid request, or bytes no
        decoder takes. Script fires their error event once the table is
@@ -826,6 +862,19 @@ bool images_load_external_reusing_layout_styles_excluding(
     long timeout_ms, FetchScheduler *scheduler, BrowserSession *session,
     struct LayoutReuseCache *style_cache, const FontSet *fonts, int viewport_width,
     lxb_dom_node_t *const *deferred_nodes, size_t deferred_node_count);
+/* Additive discovery as in images_load_external_reusing_layout_styles_excluding,
+   walking only these connected subtrees. Each has at most
+   IMAGE_SUBTREE_ANCESTOR_LIMIT element ancestors. */
+bool images_load_external_within_subtrees(
+    const PocDocument *document, Stylesheet *stylesheet,
+    ImageResources *images, lxb_dom_node_t *const *roots, size_t root_count,
+    Budget *budget, const char *base_url, const char *document_url,
+    const char *referrer_policy, size_t maximum_count,
+    size_t maximum_total_encoded_bytes,
+    size_t maximum_single_encoded_bytes, size_t maximum_decoded_bytes,
+    long timeout_ms, FetchScheduler *scheduler, BrowserSession *session,
+    struct LayoutReuseCache *style_cache, const FontSet *fonts, int viewport_width,
+    lxb_dom_node_t *const *deferred_nodes, size_t deferred_node_count);
 /* Loads a bounded set of nodes already proven visible by provisional layout.
    A subsequent images_load_external() call remains authoritative and
    deduplicates these retained resources while discovering the rest of the
@@ -872,6 +921,37 @@ bool images_refresh_external_nodes_reusing_layout_styles(
    to retained aliases before releasing anything. */
 void images_discard_nodes(
     ImageResources *images, lxb_dom_node_t *const *nodes, size_t node_count);
+/* Whether this page has been, or now would be, refused an image by a bound
+   the page cannot outgrow: the tracked-node table, the image count or a byte
+   quota. Only then does an image's distance from the reader decide whether
+   it is kept (images_evict_farthest). */
+bool images_admission_scarce(
+    const ImageResources *images, size_t maximum_count,
+    size_t maximum_total_encoded_bytes, size_t maximum_decoded_bytes);
+/* An <img> or inline <svg> entry a later admission can recreate from its
+   element. Canvases, adopted surfaces, masks, backgrounds and generated
+   images have no such path. */
+bool image_resource_evictable(const ImageResource *image);
+/* The entry `remap` marks as removed. */
+#define IMAGE_EVICTED UINT8_MAX
+_Static_assert(IMAGE_TRACKED_NODE_LIMIT < IMAGE_EVICTED,
+               "an evicted entry's mark is not a table index");
+/* Makes room for `slots` more entries and takes a byte quota back under its
+   limit, by removing the entries with the largest `distances[i]` (one per
+   entry; zero keeps an entry). Entries that only share a surface go first for
+   slots. For bytes, all the entries showing a surface go together, as far away
+   as the nearest of them; one that is kept keeps the surface. A shared surface
+   passes to a retained entry; the last entry to show one returns its bytes and
+   its attempt. May fall short when too few entries may be removed. The table's
+   allocation stays put and survivors move down:
+   `remap[i]` (one per entry) is each entry's new index or IMAGE_EVICTED, and
+   every pointer into the table must be translated before it is read
+   (layout_remap_image_resources). Returns the number removed; `*released`
+   says whether any surface was freed. */
+size_t images_evict_farthest(
+    ImageResources *images, const uint32_t *distances, size_t slots,
+    size_t maximum_total_encoded_bytes, size_t maximum_decoded_bytes,
+    uint8_t *remap, bool *released);
 bool images_load_external_priority_targets(
     const PocDocument *document, Stylesheet *stylesheet,
     ImageResources *images, const ImagePriorityTarget *targets,
@@ -935,6 +1015,9 @@ bool image_inline_svg_draws_content(lxb_dom_node_t *svg, size_t visit_limit,
                                     bool *bounded_out);
 const ImageResource *images_find_node(const ImageResources *images,
                                       const lxb_dom_node_t *node);
+/* Its current source failed: only a new source is worth another request. */
+bool images_node_failed(const ImageResources *images,
+                        const lxb_dom_node_t *node);
 const ImageResource *images_find_mask_node(const ImageResources *images,
                                            const lxb_dom_node_t *node);
 const ImageResource *images_find_background_node(const ImageResources *images,
@@ -1038,6 +1121,10 @@ bool images_prepare_canvas_depth(ImageResources *images, Budget *budget,
                                  uint16_t **depth_values);
 bool images_set_canvas_opaque(ImageResources *images,
                               lxb_dom_node_t *node, bool opaque);
+#if !defined(__PSP__)
+/* Alpha bytes 2D canvas commits have read since the process started. */
+size_t images_test_canvas_alpha_scan_pixels(void);
+#endif
 bool images_set_canvas_native_surface(ImageResources *images,
                                       lxb_dom_node_t *node,
                                       const unsigned char *pixels,

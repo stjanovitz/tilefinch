@@ -787,8 +787,12 @@ typedef struct {
     int rounded_ordinal;
 } OverflowClipBox;
 
+/* The geometry of a run of consecutive overflow-flagged commands
+   [command_index, command_end) that the same clip boxes apply to, so it is
+   the same for each of them at every scroll offset. */
 typedef struct {
     uint32_t command_index;
+    uint32_t command_end;
     int dx;
     int dy;
     int clip_left;
@@ -874,13 +878,100 @@ static bool overflow_cache_size_add(size_t *total, size_t count,
     return true;
 }
 
+static int overflow_clip_key_order(const void *left, const void *right)
+{
+    uint64_t a = *(const uint64_t *) left, b = *(const uint64_t *) right;
+    return a < b ? -1 : (a > b);
+}
+
+typedef struct {
+    /* Clip boxes by scroll_command_start: start << 32 | box index. */
+    const uint64_t *order;
+    uint32_t *active;        /* boxes whose scroll range holds the command */
+    uint32_t *applying;      /* of those, the ones it does not escape */
+    uint32_t *previous;      /* the previous flagged command's applying */
+    size_t clip_count;
+} OverflowRunSweep;
+
+/* Group the overflow-flagged commands into runs that the same clip boxes
+   apply to (overflow_cache_prepare folds exactly those boxes, so every
+   command of a run gets identical geometry). A run ends at an unflagged
+   command and wherever the applying boxes change. Counts the runs; also
+   records them when `runs` is not NULL. Clip boxes enter in scroll-range
+   order and leave in place, so equal sets of consecutive commands are
+   equal lists. */
+static size_t overflow_sweep_runs(TileCache *cache,
+                                  const LayoutDocument *layout,
+                                  OverflowRunSweep *sweep,
+                                  OverflowGeometry *runs)
+{
+    LayoutPositionedClipIndex positioned = {0};
+    layout_positioned_clip_index_prepare(layout, &positioned);
+    size_t next = 0, active_count = 0, previous_count = 0, run_count = 0;
+    bool open = false;
+    for (size_t i = 0; i < layout->count; i++) {
+        render_prepare_checkpoint(cache);
+        if (!(layout->command_flags[i] & LAYOUT_COMMAND_OVERFLOW)) {
+            open = false;
+            continue;
+        }
+        while (next < sweep->clip_count
+               && (sweep->order[next] >> 32) <= i) {
+            sweep->active[active_count++] =
+                (uint32_t) (sweep->order[next++] & UINT32_MAX);
+        }
+        size_t kept = 0, applying_count = 0;
+        for (size_t at = 0; at < active_count; at++) {
+            uint32_t box_index = sweep->active[at];
+            const LayoutNodeBox *box = &layout->node_boxes[box_index];
+            if (i >= box->scroll_command_end) continue;
+            sweep->active[kept++] = box_index;
+            if (!layout_positioned_command_escapes_clip_indexed(
+                    layout, i, box, &positioned))
+                sweep->applying[applying_count++] = box_index;
+        }
+        active_count = kept;
+        bool same = open && applying_count == previous_count
+            && memcmp(sweep->applying, sweep->previous,
+                      applying_count * sizeof(*sweep->applying)) == 0;
+        if (same) {
+            if (runs != NULL) runs[run_count - 1u].command_end++;
+            continue;
+        }
+        if (runs != NULL) {
+            runs[run_count].command_index = (uint32_t) i;
+            runs[run_count].command_end = (uint32_t) i + 1u;
+        }
+        run_count++;
+        open = true;
+        uint32_t *swap = sweep->previous;
+        sweep->previous = sweep->applying;
+        sweep->applying = swap;
+        previous_count = applying_count;
+    }
+    return run_count;
+}
+
+/* The accelerator's own allowance grows with the page: the base budget plus
+   TILEFINCH_OVERFLOW_CACHE_BYTES_PER_BOX per node box, never above
+   TILEFINCH_OVERFLOW_CACHE_MAX_BYTES. */
+static size_t overflow_cache_allowance(const LayoutDocument *layout)
+{
+    size_t allowance = TILEFINCH_OVERFLOW_CACHE_BYTES;
+    size_t room = TILEFINCH_OVERFLOW_CACHE_MAX_BYTES - allowance;
+    if (layout->node_box_count >= room / TILEFINCH_OVERFLOW_CACHE_BYTES_PER_BOX)
+        return TILEFINCH_OVERFLOW_CACHE_MAX_BYTES;
+    return allowance
+        + layout->node_box_count * TILEFINCH_OVERFLOW_CACHE_BYTES_PER_BOX;
+}
+
 static bool overflow_cache_build(TileCache *cache)
 {
     const LayoutDocument *layout = cache->layout;
     if (layout == NULL || layout->command_flags == NULL
         || layout->node_box_count == 0
         || layout->node_box_count > UINT32_MAX
-        || layout->count > UINT32_MAX) return false;
+        || layout->count > UINT32_MAX - 1u) return false;
     size_t clip_count = 0;
     for (size_t i = 0; i < layout->node_box_count; i++) {
         render_prepare_checkpoint(cache);
@@ -888,14 +979,13 @@ static bool overflow_cache_build(TileCache *cache)
             clip_count++;
         }
     }
-    size_t geometry_count = 0;
-    for (size_t i = 0; i < layout->count; i++) {
+    bool flagged = false;
+    for (size_t i = 0; i < layout->count && !flagged; i++) {
         render_prepare_checkpoint(cache);
-        if (layout->command_flags[i] & LAYOUT_COMMAND_OVERFLOW) {
-            geometry_count++;
-        }
+        flagged = (layout->command_flags[i] & LAYOUT_COMMAND_OVERFLOW) != 0;
     }
-    if (clip_count == 0 || geometry_count == 0) return false;
+    if (clip_count == 0 || !flagged) return false;
+    size_t allowance = overflow_cache_allowance(layout);
     size_t persistent_bytes = sizeof(struct RenderOverflowCache);
     if (!overflow_cache_size_add(&persistent_bytes, layout->node_box_count,
                                  sizeof(uint32_t))
@@ -903,13 +993,44 @@ static bool overflow_cache_build(TileCache *cache)
                                     layout->node_box_count, 2u * sizeof(int))
         || !overflow_cache_size_add(&persistent_bytes, clip_count,
                                     sizeof(OverflowClipBox))
-        || !overflow_cache_size_add(&persistent_bytes, geometry_count,
-                                    sizeof(OverflowGeometry))
-        || persistent_bytes > TILEFINCH_OVERFLOW_CACHE_BYTES) return false;
+        || persistent_bytes > allowance
+        || clip_count > SIZE_MAX / (sizeof(uint64_t)
+                                    + 3u * sizeof(uint32_t))) return false;
+
+    /* Transient sweep state: the sorted clip boxes and three index
+       lists. */
+    uint64_t *order = budget_malloc(
+        cache->budget, clip_count * (sizeof(uint64_t) + 3u * sizeof(uint32_t)));
+    if (order == NULL) return false;
+    uint32_t *sweep_storage = (uint32_t *) (order + clip_count);
+    size_t clip_at = 0;
+    for (size_t i = 0; i < layout->node_box_count; i++) {
+        const LayoutNodeBox *box = &layout->node_boxes[i];
+        if (box->clips_x || box->clips_y)
+            order[clip_at++] = (uint64_t) box->scroll_command_start << 32 | i;
+    }
+    qsort(order, clip_count, sizeof(*order), overflow_clip_key_order);
+    OverflowRunSweep sweep = {
+        .order = order,
+        .active = sweep_storage,
+        .applying = sweep_storage + clip_count,
+        .previous = sweep_storage + 2u * clip_count,
+        .clip_count = clip_count
+    };
+    size_t geometry_count = overflow_sweep_runs(cache, layout, &sweep, NULL);
+    if (!overflow_cache_size_add(&persistent_bytes, geometry_count,
+                                 sizeof(OverflowGeometry))
+        || persistent_bytes > allowance) {
+        budget_free(cache->budget, order);
+        return false;
+    }
 
     struct RenderOverflowCache *overflow = budget_calloc(
         cache->budget, 1, sizeof(*overflow));
-    if (overflow == NULL) return false;
+    if (overflow == NULL) {
+        budget_free(cache->budget, order);
+        return false;
+    }
     overflow->parent_indices = budget_malloc(
         cache->budget, layout->node_box_count * sizeof(uint32_t));
     overflow->scroll_values = budget_malloc(
@@ -921,12 +1042,17 @@ static bool overflow_cache_build(TileCache *cache)
     if (overflow->parent_indices == NULL || overflow->scroll_values == NULL
         || overflow->clip_boxes == NULL
         || overflow->geometry == NULL) {
+        budget_free(cache->budget, order);
         cache->overflow_cache = overflow;
         overflow_cache_destroy(cache);
         return false;
     }
     overflow->clip_count = clip_count;
-    overflow->geometry_count = geometry_count;
+    sweep.applying = sweep_storage + clip_count;
+    sweep.previous = sweep_storage + 2u * clip_count;
+    overflow->geometry_count = overflow_sweep_runs(
+        cache, layout, &sweep, overflow->geometry);
+    budget_free(cache->budget, order);
 
     for (size_t i = 0; i < layout->node_box_count; i++) {
         uint32_t parent = OVERFLOW_PARENT_NONE;
@@ -946,7 +1072,7 @@ static bool overflow_cache_build(TileCache *cache)
         overflow->parent_indices[i] = parent;
     }
 
-    size_t clip_at = 0;
+    clip_at = 0;
     size_t rounded = 0;
     for (size_t i = 0; i < layout->node_box_count; i++) {
         const LayoutNodeBox *box = &layout->node_boxes[i];
@@ -967,12 +1093,6 @@ static bool overflow_cache_build(TileCache *cache)
         };
     }
     overflow->rounded_count = rounded;
-    size_t geometry_at = 0;
-    for (size_t i = 0; i < layout->count; i++) {
-        render_prepare_checkpoint(cache);
-        if (!(layout->command_flags[i] & LAYOUT_COMMAND_OVERFLOW)) continue;
-        overflow->geometry[geometry_at++].command_index = (uint32_t) i;
-    }
     cache->overflow_cache = overflow;
     cache->overflow_cache_bytes = persistent_bytes;
     cache->overflow_cache_builds++;
@@ -1062,24 +1182,31 @@ static bool overflow_cache_prepare(TileCache *cache)
         }
     }
     if (!changed) return true;
-    /* What tiles bake depends only on which boxes are scrolled and by how
-       much: a rebuild after damage-limited relayout with nothing scrolled
-       keeps every undamaged tile. */
+    /* The stream depends on which boxes are scrolled and by how much; the
+       tiles only on whether any is (overflow_stream_static bakes the stream
+       into them while none is, and their own content never holds it). So
+       scrolling a box that is already scrolled keeps every tile, and a
+       rebuild after damage-limited relayout with nothing scrolled keeps
+       every undamaged tile. */
     uint64_t signature = RENDER_OVERFLOW_SIGNATURE_EMPTY;
+    bool scrolled = false;
     for (size_t i = 0; i < layout->node_box_count; i++) {
         render_prepare_checkpoint(cache);
         const LayoutNodeBox *box = &layout->node_boxes[i];
         if (box->scroll_x == 0 && box->scroll_y == 0) continue;
+        scrolled = true;
         const int values[4] = { box->x, box->y, box->scroll_x, box->scroll_y };
         const unsigned char *bytes = (const unsigned char *) values;
         for (size_t at = 0; at < sizeof(values); at++) {
             signature = (signature ^ bytes[at]) * UINT64_C(1099511628211);
         }
     }
-    if (signature != cache->overflow_scroll_signature) {
-        cache->overflow_scroll_signature = signature;
-        cache->overflow_tile_generation++;
-    }
+    if (scrolled && signature == RENDER_OVERFLOW_SIGNATURE_EMPTY)
+        signature ^= 1u;
+    bool was_scrolled =
+        cache->overflow_scroll_signature != RENDER_OVERFLOW_SIGNATURE_EMPTY;
+    if (scrolled != was_scrolled) cache->overflow_tile_generation++;
+    cache->overflow_scroll_signature = signature;
     LayoutPositionedClipIndex positioned = {0};
     if (overflow->clip_count != 0 && overflow->geometry_count != 0)
         layout_positioned_clip_index_prepare(layout, &positioned);
@@ -1177,9 +1304,13 @@ static const OverflowGeometry *overflow_cached_geometry(
     const struct RenderOverflowCache *overflow = cache->overflow_cache;
     if (overflow == NULL || !overflow->prepared) return NULL;
     size_t at = overflow_geometry_lower_bound(overflow, command_index);
-    if (at >= overflow->geometry_count
-        || overflow->geometry[at].command_index != command_index) return NULL;
-    return &overflow->geometry[at];
+    if (at < overflow->geometry_count
+        && overflow->geometry[at].command_index == command_index)
+        return &overflow->geometry[at];
+    /* Inside the run before: every command of a run is flagged. */
+    if (at == 0 || overflow->geometry[at - 1u].command_end <= command_index)
+        return NULL;
+    return &overflow->geometry[at - 1u];
 }
 
 /* The per-frame stream (overflow-clipped content, and late-positioned

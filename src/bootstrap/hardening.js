@@ -9,6 +9,8 @@
   /* Set by the host for host and validation realms only; the probes it
      enabled are published by now. */
   deleteProperty(globalThis, "__tilefinchTestProbes");
+  /* Every bootstrap module captured the trusted-event share (dom.js). */
+  deleteProperty(globalThis, "__tilefinchTrustedEventShare");
   const markNative = globalThis.__tilefinchMarkNativeFunction,
     markInterface = (constructor) => {
       if (typeof constructor !== "function") return;

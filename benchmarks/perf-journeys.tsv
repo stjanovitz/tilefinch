@@ -1,11 +1,19 @@
 # PSP performance journeys: benchmarks/run-perf-journeys.py runs each under
 # PPSSPP at 111 MHz; traces live under perf/traces (not committed) and are
 # pinned by trace_sha256. '-' means none. See docs/engineering/PERF_JOURNEYS.md.
-name	script	url	trace	trace_sha256	data_dir	boot	cpu_mhz
-home-menu	menu-tour	-	-	-	tests/fixtures/ppsspp-menu-tour-data	-	-
-site-restore	site-restore	-	-	-	tests/fixtures/ppsspp-site-data	-	-
-article-scroll-during-load	scroll-during-load-live	https://en.wikipedia.org/w/index.php?search=PlayStation+Portable&title=Special%3ASearch&go=Go	wikipedia-article	cb64d13e10e7dab00e861ea88689261c6128c2048ac81ad719af123d63455783	-	-	-
-article-page-down-fast	scroll-fast-live	https://en.wikipedia.org/w/index.php?search=PlayStation+Portable&title=Special%3ASearch&go=Go	wikipedia-article	cb64d13e10e7dab00e861ea88689261c6128c2048ac81ad719af123d63455783	-	-	-
-article-drawer	drawer-scroll-during-completion-live	https://en.wikipedia.org/w/index.php?search=PlayStation+Portable&title=Special%3ASearch&go=Go	wikipedia-article	cb64d13e10e7dab00e861ea88689261c6128c2048ac81ad719af123d63455783	-	-	-
-youtube-bbb	youtube-bbb	https://m.youtube.com/results?search_query=big+buck+bunny	youtube-bbb	fafb53c9be7d0b28f3e7e718ee4b7694859b247b316c55ac73242f7358ed26d0	-	-	-
-chatgpt-ask	chatgpt-ask	https://chatgpt.com/	chatgpt-ask-send76	6440c59283ec5516a46d7842fc24362a71a3a1c139c563723a8f1625b991c676	-	trace_ignore_request_body=1;trace_volatile_uuids=1;validation_js_profile=0	333
+name	script	url	trace	trace_sha256	data_dir	boot	cpu_mhz	clock	sheet_marks	frames
+home-menu	menu-tour	-	-	-	tests/fixtures/ppsspp-menu-tour-data	-	-	-	-	-
+site-restore	site-restore	-	-	-	tests/fixtures/ppsspp-site-data	-	-	-	-	-
+article-scroll-during-load	scroll-during-load-live	https://en.wikipedia.org/w/index.php?search=PlayStation+Portable&title=Special%3ASearch&go=Go	wikipedia-article	cb64d13e10e7dab00e861ea88689261c6128c2048ac81ad719af123d63455783	-	-	-	-	-	-
+article-page-down-fast	scroll-fast-live	https://en.wikipedia.org/w/index.php?search=PlayStation+Portable&title=Special%3ASearch&go=Go	wikipedia-article	cb64d13e10e7dab00e861ea88689261c6128c2048ac81ad719af123d63455783	-	-	-	-	-	-
+article-drawer	drawer-scroll-during-completion-live	https://en.wikipedia.org/w/index.php?search=PlayStation+Portable&title=Special%3ASearch&go=Go	wikipedia-article	cb64d13e10e7dab00e861ea88689261c6128c2048ac81ad719af123d63455783	-	-	-	-	-	-
+youtube-bbb	youtube-bbb	https://m.youtube.com/results?search_query=big+buck+bunny	youtube-bbb	fafb53c9be7d0b28f3e7e718ee4b7694859b247b316c55ac73242f7358ed26d0	-	-	-	-	returned	-
+chatgpt-ask	chatgpt-ask	https://chatgpt.com/	chatgpt-ask-send76	6440c59283ec5516a46d7842fc24362a71a3a1c139c563723a8f1625b991c676	-	trace_ignore_request_body=1;trace_volatile_uuids=1;validation_js_profile=0	333	-	-	-
+wiki-revisit	wiki-article-revisit	https://en.wikipedia.org/wiki/PlayStation_Portable	wiki-abc	03cc838a3734a80f72a2ba0df1327cbfa7c81fd47f90a8f823cee4ac307b2a9b	-	-	-	-	b-settled,c-settled	-
+wiki-revisit-dark	wiki-article-revisit	https://en.wikipedia.org/wiki/PlayStation_Portable	wiki-abc	03cc838a3734a80f72a2ba0df1327cbfa7c81fd47f90a8f823cee4ac307b2a9b	-	-	-	22:00	b-settled,c-settled	-
+wiki-revisit-night	wiki-article-revisit-night	https://en.wikipedia.org/wiki/PlayStation_Portable	wiki-abc	03cc838a3734a80f72a2ba0df1327cbfa7c81fd47f90a8f823cee4ac307b2a9b	-	-	-	-	b-settled,c-settled	b-frame=wiki-revisit-dark:b-frame,c-frame=wiki-revisit-dark:c-frame
+bbc-home-load	news-load	https://www.bbc.com/news	bbc-home	d43eaf3317b0f9961519ee2d0792ead8cda7cdd57f589d476b612831f22c8d80	-	-	-	-	-	-
+bbc-home-load-night	news-load	https://www.bbc.com/news	bbc-home	d43eaf3317b0f9961519ee2d0792ead8cda7cdd57f589d476b612831f22c8d80	-	-	-	22:00	-	-
+www-reddit-load	news-load	https://www.reddit.com/r/PSP/	www-reddit	a9aa18f1cf477d2fddcdc130a0fe9e4582b1d0d7b1f9d716a45625df01739af5	-	-	-	-	-	-
+ia-search	ia-search-probe	https://archive.org/search?query=psp	ia-search-thumbs	4f129161abd46044f4dd90accc13bcf48a07c8905eb96e2dc293d715c2b1e88a	-	trace_ignore_request_body=1	-	-	top,p3	-
+press-during-preview	scroll-during-load-live	https://en.wikipedia.org/wiki/PlayStation_Portable	wikipedia-article-psp	9eec364a1b400cc87de616a75839304a3eba709be9840cc2a50a4a86b83fef42	-	-	-	-	-	-

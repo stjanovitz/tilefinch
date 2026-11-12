@@ -336,7 +336,7 @@ static bool fetch_redirect_target_admitted(
         && browser_session_captive_portal_url_allowed(
                security_session, next);
     if (tilefinch_url_is_downgrade(current_url, next)
-        && !fetch_request_mixed_override(base)
+        && !fetch_request_mixed_override(base, security_session)
         && !admitted_portal_target) return false;
     if (!fetch_request_target_allowed_with_session(
             base, security_session, next)) return false;
@@ -491,6 +491,7 @@ static bool fetch_hop_advance(FetchHopState *hop,
     if (rewrite) {
         if (!hop_replace(hop->budget, &hop->method, "GET", 16)) return false;
         hop->body_enabled = false;
+        if (base != NULL && !base->enforce_cors) hop->origin_dropped = true;
     }
     if (!fetch_hop_filter_headers(hop, cross_origin, rewrite)) return false;
     if (base != NULL
@@ -522,14 +523,14 @@ static bool fetch_hop_advance(FetchHopState *hop,
         && !hop->origin_tainted
         && tilefinch_url_same_origin(hop->initiator, next);
     if (base != NULL && base->origin != NULL
-        && !omit_same_origin_origin) {
+        && !omit_same_origin_origin && !hop->origin_dropped) {
         origin = hop->origin_tainted ? "null" : base->origin;
     }
     if (!hop_replace(hop->budget, &hop->origin, origin, 2047)) return false;
-    const char *site = hop->fetch_site_none
-        ? "none"
-        : (tilefinch_url_same_origin(hop->initiator, next)
-              ? "same-origin" : "cross-site");
+    hop->fetch_site_crossed = hop->fetch_site_crossed
+        || !tilefinch_url_same_origin(hop->initiator, next);
+    const char *site = hop->fetch_site_none ? "none"
+        : hop->fetch_site_crossed ? "cross-site" : "same-origin";
     if (!hop_replace(hop->budget, &hop->fetch_site, site, 63)
         || !hop_replace(
                hop->budget, &hop->logical_url, next_logical, 4095)
@@ -1165,6 +1166,8 @@ static bool fetch_request_internal(Budget *budget, const char *url,
                != CURLE_OK
         || curl_easy_setopt(
                easy, CURLOPT_USERAGENT, effective_user_agent) != CURLE_OK
+        || !fetch_configure_icy_status(
+               easy, request != NULL && request->icy_status_line)
         || curl_easy_setopt(
                easy, CURLOPT_CONNECTTIMEOUT_MS,
                fetch_connect_timeout_ms(request, timeout_ms)) != CURLE_OK
@@ -1559,6 +1562,9 @@ bool fetch_request_stream_cancelable(
 }
 
 #define FETCH_SCHEDULER_LIMIT 16u
+/* Item slots: a scheduler's cap plus the one reserved for a blocking
+   request (fetch_scheduler_request_blocking). */
+#define FETCH_SCHEDULER_ITEM_LIMIT (FETCH_SCHEDULER_LIMIT + 1u)
 
 typedef struct {
     uint64_t id;
@@ -1633,11 +1639,23 @@ typedef struct {
     uint64_t background_request_id;
     bool background_backend;
     bool background_allowed;
+    /* Not allowed although the worker is up: why ("worker-off": its
+       scheduler never asked for it; "worker-start", "worker-chunk": the
+       scheduler's last attach failed there). Static strings. */
+    const char *background_refusal;
     /* Nonzero: issue worker hops with the foreground-media descriptor
        priority and this publication quantum (page media ranges). */
     size_t background_media_publication_bytes;
+    /* scheduled_stall_seconds() at prepare: a worker hop's stall rule. */
+    long background_stall_seconds;
     bool background_headers_delivered;
     bool domain_slot_reserved;
+    /* A request the calling thread blocks on: its hops may take the
+       worker's reserved descriptor (FETCH_BACKGROUND_LANE_BLOCKING). */
+    bool blocking;
+    /* It holds the reserved slot past the scheduler's and the domain's
+       caps rather than an ordinary one. */
+    bool blocking_slot;
     bool tls12_retry_attempted;
     CURLcode transport_result;
 } ScheduledFetch;
@@ -1653,14 +1671,19 @@ struct FetchSchedulerDomain {
     size_t peak_active_views;
     /* fetch_scheduler_domain_set_held: no new admissions. */
     bool held;
+    /* A blocking request holds the one slot past maximum_active_slots. */
+    bool blocking_slot_active;
 };
 
 struct FetchScheduler {
     Budget *budget;
     CURLM *multi;
-    ScheduledFetch *items[FETCH_SCHEDULER_LIMIT];
+    ScheduledFetch *items[FETCH_SCHEDULER_ITEM_LIMIT];
     FetchSchedulerDomain *domain;
+    /* Item slots (ordinary_capacity plus the blocking slot) and the cap
+       ordinary requests share. */
     size_t capacity;
+    size_t ordinary_capacity;
     size_t maximum_reserved_bytes;
     size_t reserved_bytes;
     size_t pending;
@@ -1668,6 +1691,10 @@ struct FetchScheduler {
     size_t pump_generation;
     size_t pump_cursor;
     bool global_acquired;
+    /* The owner asked for the worker (fetch_scheduler_enable_background_
+       transport). A failed attach leaves this set, so the next admitted
+       request attaches again instead of demoting the scheduler for life. */
+    bool background_transport_requested;
     bool background_transport_enabled;
     size_t background_media_publication_bytes;
     unsigned char *background_chunk;

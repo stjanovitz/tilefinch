@@ -46,6 +46,8 @@ endif()
 set(frontend_validation_only_sources
     psp_app_input_script.c
     psp_app_validation_cadence.c
+    psp_app_validation_entropy.c
+    psp_app_validation_glyph.c
     psp_app_validation_loop.c
     psp_app_validation_present.c
     psp_app_validation_qualify.c)

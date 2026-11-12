@@ -1,6 +1,7 @@
 #include "tilefinch/psp_boot_config.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -177,13 +178,39 @@ void psp_boot_config_disable_automation(PspBootConfig *config)
     config->exit_to[0] = '\0';
 }
 
-static bool psp_boot_config_load_one(
+typedef enum {
+    BOOT_CONFIG_LOADED,
+    /* The open said "not found" (ENOENT; the PSP firmware's 0x80010002,
+       which libcglue maps to ENOENT). */
+    BOOT_CONFIG_NOT_FOUND,
+    /* Read whole, but a line was too long or a value invalid. */
+    BOOT_CONFIG_REJECTED,
+    /* Any other open failure, or a read or close error: the file may be
+       there and in effect. */
+    BOOT_CONFIG_UNREADABLE
+} BootConfigLoad;
+
+/* Opens PATH for reading; *absent is set when it failed as not found. */
+static FILE *boot_config_open(const char *path, const char *mode,
+                              bool *absent)
+{
+    /* libcglue sets errno only for 0x8001xxxx firmware errors, so a failure
+       outside that range would otherwise leave an older ENOENT behind. */
+    errno = 0;
+    FILE *file = fopen(path, mode);
+    *absent = file == NULL && errno == ENOENT;
+    return file;
+}
+
+static BootConfigLoad psp_boot_config_load_one(
     PspBootConfig *config, const char *path,
     PspBootConfigWarning warning, void *warning_context)
 {
-    if (config == NULL || path == NULL) return false;
-    FILE *file = fopen(path, "r");
-    if (file == NULL) return false;
+    if (config == NULL || path == NULL) return BOOT_CONFIG_UNREADABLE;
+    bool absent = false;
+    FILE *file = boot_config_open(path, "r", &absent);
+    if (file == NULL)
+        return absent ? BOOT_CONFIG_NOT_FOUND : BOOT_CONFIG_UNREADABLE;
     PspBootConfig loaded = *config;
     char line[1600];
     size_t line_number = 0;
@@ -191,8 +218,17 @@ static bool psp_boot_config_load_one(
     while (fgets(line, sizeof(line), file) != NULL) {
         line_number++;
         size_t raw_length = strlen(line);
-        if (raw_length == 0 || (line[raw_length - 1u] != '\n'
-                                && line[raw_length - 1u] != '\r')) {
+        /* A line without its newline is the file's last line when the read
+           stopped at the end of the file short of the buffer (hand-edited
+           files often end so). One that filled the buffer was cut by it:
+           reject the file rather than read part of a value. */
+        if (raw_length == 0
+            || (line[raw_length - 1u] != '\n'
+                && line[raw_length - 1u] != '\r'
+                && (raw_length >= sizeof(line) - 1u || !feof(file)))) {
+            if (warning != NULL)
+                warning(warning_context, path, line_number,
+                        "(line too long)");
             complete = false;
             break;
         }
@@ -284,7 +320,10 @@ static bool psp_boot_config_load_one(
             /* Do not let atol turn a typo into a successful OFF selection. */
             const char *end = value + strlen(value);
             size_t tail = raw_length - (size_t) (end - line);
-            bool complete_value = tail == 1u || (tail == 2u && end[1] == '\n');
+            /* Nothing after the value but its line end (none on a final
+               line without a newline). */
+            bool complete_value = tail == 0u || tail == 1u
+                || (tail == 2u && end[1] == '\n');
             if (!complete_value || (strcmp(value, "0") != 0 && strcmp(value, "1") != 0)) {
                 if (warning != NULL)
                     warning(warning_context, path, line_number, line);
@@ -360,9 +399,10 @@ static bool psp_boot_config_load_one(
         }
     }
     bool read_ok = !ferror(file);
-    bool ok = fclose(file) == 0 && complete && read_ok;
-    if (ok) *config = loaded;
-    return ok;
+    if (fclose(file) != 0 || !read_ok) return BOOT_CONFIG_UNREADABLE;
+    if (!complete) return BOOT_CONFIG_REJECTED;
+    *config = loaded;
+    return BOOT_CONFIG_LOADED;
 }
 
 bool psp_boot_config_load(
@@ -370,13 +410,14 @@ bool psp_boot_config_load(
     PspBootConfigWarning warning, void *warning_context)
 {
     if (config == NULL || path == NULL) return false;
-    if (psp_boot_config_load_one(
-            config, path, warning, warning_context)) return true;
+    if (psp_boot_config_load_one(config, path, warning, warning_context)
+        == BOOT_CONFIG_LOADED) return true;
     char backup[TILEFINCH_INSTALL_PATH_LIMIT + 8u];
     int written = snprintf(backup, sizeof(backup), "%s.bak", path);
     return written > 0 && (size_t) written < sizeof(backup)
         && psp_boot_config_load_one(
-               config, backup, warning, warning_context);
+               config, backup, warning, warning_context)
+               == BOOT_CONFIG_LOADED;
 }
 
 /* Replaces `path` with the written `temporary`, keeping the previous file
@@ -389,36 +430,172 @@ static bool boot_config_publish(const char *temporary, const char *path,
     return false;
 }
 
-bool psp_boot_config_write_overrides(
-    const PspBootConfig *config, const char *path)
+/* A boot file is small; one larger than this is not one an in-app edit
+   rewrites. The two in-place edits (a settings save, the file_kb migration)
+   share this buffer: both run on the browser thread, never at once. */
+#define BOOT_CONFIG_EDIT_MAX_BYTES (16u * 1024u)
+static char boot_config_edit_text[BOOT_CONFIG_EDIT_MAX_BYTES + 1u];
+
+typedef enum {
+    BOOT_CONFIG_TEXT_READ,
+    BOOT_CONFIG_TEXT_ABSENT,
+    /* Any other open failure, a read error, too large for the buffer, or
+       not text. */
+    BOOT_CONFIG_TEXT_UNUSABLE
+} BootConfigText;
+
+static BootConfigText boot_config_read_edit_text(const char *path,
+                                                 size_t *length)
 {
-    if (config == NULL || path == NULL) return false;
+    *length = 0;
+    bool absent = false;
+    FILE *file = boot_config_open(path, "rb", &absent);
+    if (file == NULL)
+        return absent ? BOOT_CONFIG_TEXT_ABSENT : BOOT_CONFIG_TEXT_UNUSABLE;
+    size_t read = fread(boot_config_edit_text, 1,
+                        BOOT_CONFIG_EDIT_MAX_BYTES + 1u, file);
+    bool read_ok = !ferror(file);
+    (void) fclose(file);
+    if (!read_ok || read > BOOT_CONFIG_EDIT_MAX_BYTES
+        || memchr(boot_config_edit_text, '\0', read) != NULL)
+        return BOOT_CONFIG_TEXT_UNUSABLE;
+    boot_config_edit_text[read] = '\0';
+    *length = read;
+    return BOOT_CONFIG_TEXT_READ;
+}
+
+static const char *const boot_config_override_keys[] = {
+    "url", "network_profile", "developer_update_url",
+    "developer_package_url", "experimental_wide_video", "exit_to"
+};
+#define BOOT_CONFIG_OVERRIDE_KEY_COUNT \
+    (sizeof(boot_config_override_keys) / sizeof(boot_config_override_keys[0]))
+_Static_assert(PSP_BOOT_CONFIG_KEYS_OVERRIDES
+                   == (1u << BOOT_CONFIG_OVERRIDE_KEY_COUNT) - 1u,
+               "one PSP_BOOT_CONFIG_KEY_* bit per override key");
+
+/* The loader's key is everything before the first '='. */
+static bool boot_config_line_has_key(const char *line, size_t length,
+                                     const char *key)
+{
+    size_t key_length = strlen(key);
+    return line[0] != '#' && length > key_length
+        && memcmp(line, key, key_length) == 0 && line[key_length] == '=';
+}
+
+static bool boot_config_write_key(FILE *file, const PspBootConfig *config,
+                                  size_t key, const char *eol)
+{
+    const char *name = boot_config_override_keys[key];
+    switch (key) {
+    case 0: return fprintf(file, "%s=%s%s", name, config->url, eol) > 0;
+    case 1:
+        return fprintf(file, "%s=%ld%s", name, config->network_profile,
+                       eol) > 0;
+    case 2:
+        return fprintf(file, "%s=%s%s", name, config->developer_update_url,
+                       eol) > 0;
+    case 3:
+        return fprintf(file, "%s=%s%s", name, config->developer_package_url,
+                       eol) > 0;
+    case 4:
+        return fprintf(file, "%s=%s%s", name,
+                       config->experimental_wide_video, eol) > 0;
+    default:
+        return fprintf(file, "%s=%s%s", name, config->exit_to, eol) > 0;
+    }
+}
+
+bool psp_boot_config_write_overrides(
+    const PspBootConfig *config, const char *path, unsigned keys)
+{
+    keys &= PSP_BOOT_CONFIG_KEYS_OVERRIDES;
+    if (config == NULL || path == NULL || keys == 0u) return false;
     char temporary[TILEFINCH_INSTALL_PATH_LIMIT + 8u];
     char backup[TILEFINCH_INSTALL_PATH_LIMIT + 8u];
     int written = snprintf(temporary, sizeof(temporary), "%s.tmp", path);
     if (written <= 0 || (size_t) written >= sizeof(temporary)) return false;
     written = snprintf(backup, sizeof(backup), "%s.bak", path);
     if (written <= 0 || (size_t) written >= sizeof(backup)) return false;
+
+    /* Start from what the loader reads (psp_boot_config_load): the file,
+       else its backup. One that is not there, or that the loader rejects,
+       was not in effect: the next is tried, and with neither the save
+       starts a fresh file. One that cannot be read (any open failure but
+       "not found", a read error) may be the file in effect, and a loadable
+       one that cannot be read whole would lose its lines: both fail the
+       save and nothing is written. */
+    size_t length = 0;
+    const char *const sources[] = {path, backup};
+    for (size_t at = 0; at < sizeof(sources) / sizeof(sources[0]); at++) {
+        PspBootConfig probe;
+        psp_boot_config_defaults(&probe);
+        BootConfigLoad loaded =
+            psp_boot_config_load_one(&probe, sources[at], NULL, NULL);
+        if (loaded == BOOT_CONFIG_UNREADABLE) return false;
+        if (loaded != BOOT_CONFIG_LOADED) continue;
+        if (boot_config_read_edit_text(sources[at], &length)
+                != BOOT_CONFIG_TEXT_READ)
+            return false;
+        break;
+    }
+    const char *text = boot_config_edit_text;
+    if (length == 0) boot_config_edit_text[0] = '\0';
+
+    /* The loader takes the last line of a repeated key; that line changes. */
+    size_t last[BOOT_CONFIG_OVERRIDE_KEY_COUNT];
+    for (size_t key = 0; key < BOOT_CONFIG_OVERRIDE_KEY_COUNT; key++)
+        last[key] = SIZE_MAX;
+    const char *eol = "\n";
+    bool eol_known = false;
+    for (size_t at = 0; at < length;) {
+        const char *line = text + at;
+        const char *end = memchr(line, '\n', length - at);
+        size_t line_length = end == NULL ? length - at
+                                         : (size_t) (end - line) + 1u;
+        if (!eol_known && end != NULL) {
+            eol = line_length >= 2u && line[line_length - 2u] == '\r'
+                ? "\r\n" : "\n";
+            eol_known = true;
+        }
+        for (size_t key = 0; key < BOOT_CONFIG_OVERRIDE_KEY_COUNT; key++) {
+            if ((keys & (1u << key)) != 0u
+                && boot_config_line_has_key(line, line_length,
+                                            boot_config_override_keys[key]))
+                last[key] = at;
+        }
+        at += line_length;
+    }
+
     FILE *file = fopen(temporary, "wb");
     bool ok = file != NULL;
-    if (ok)
-        ok = fprintf(file,
-                     "url=%s\nnetwork_profile=%ld\n"
-                     "developer_update_url=%s\n"
-                     "developer_package_url=%s\n"
-                     "experimental_wide_video=%s\n"
-                     /* Hand-edited like the developer endpoints above and
-                        never set from the UI, so it is written back for the
-                        same reason they are: an in-app settings change
-                        rewrites this file, and a key it did not carry
-                        forward would silently disappear. */
-                     "exit_to=%s\n",
-                     config->url, config->network_profile,
-                     config->developer_update_url,
-                     config->developer_package_url,
-                     config->experimental_wide_video,
-                     config->exit_to) > 0
-            && fflush(file) == 0;
+    for (size_t at = 0; ok && at < length;) {
+        const char *line = text + at;
+        const char *end = memchr(line, '\n', length - at);
+        size_t line_length = end == NULL ? length - at
+                                         : (size_t) (end - line) + 1u;
+        size_t replaced = BOOT_CONFIG_OVERRIDE_KEY_COUNT;
+        for (size_t key = 0; key < BOOT_CONFIG_OVERRIDE_KEY_COUNT; key++) {
+            if (last[key] == at) replaced = key;
+        }
+        if (replaced < BOOT_CONFIG_OVERRIDE_KEY_COUNT) {
+            /* Keep the line's own ending; a final line without one gets
+               the file's. */
+            const char *line_eol = end == NULL ? eol
+                : line_length >= 2u && line[line_length - 2u] == '\r'
+                    ? "\r\n" : "\n";
+            ok = boot_config_write_key(file, config, replaced, line_eol);
+        } else {
+            ok = fwrite(line, 1, line_length, file) == line_length;
+            if (ok && end == NULL) ok = fputs(eol, file) >= 0;
+        }
+        at += line_length;
+    }
+    for (size_t key = 0; ok && key < BOOT_CONFIG_OVERRIDE_KEY_COUNT; key++) {
+        if ((keys & (1u << key)) != 0u && last[key] == SIZE_MAX)
+            ok = boot_config_write_key(file, config, key, eol);
+    }
+    if (ok) ok = fflush(file) == 0;
     if (file != NULL && fclose(file) != 0) ok = false;
     if (!ok) {
         remove(temporary);
@@ -762,9 +939,6 @@ long psp_boot_config_default_file_kb(void)
     return PSP_DEFAULT_SCRIPT_FILE_KB;
 }
 
-/* A boot.cfg is small; a larger file is not one this migration rewrites. */
-#define BOOT_CONFIG_MIGRATION_MAX_BYTES (16u * 1024u)
-
 static bool boot_config_line_is(const char *line, size_t length,
                                 const char *text)
 {
@@ -789,13 +963,12 @@ PspBootConfigMigration psp_boot_config_migrate_file_kb(const char *path)
     }
     FILE *file = fopen(path, "rb");
     if (file == NULL) return PSP_BOOT_CONFIG_MIGRATION_NOT_NEEDED;
-    static char text[BOOT_CONFIG_MIGRATION_MAX_BYTES + 1u];
-    size_t length = fread(text, 1, BOOT_CONFIG_MIGRATION_MAX_BYTES + 1u,
-                          file);
+    char *text = boot_config_edit_text;
+    size_t length = fread(text, 1, BOOT_CONFIG_EDIT_MAX_BYTES + 1u, file);
     bool read_ok = !ferror(file);
     (void) fclose(file);
     if (!read_ok) return PSP_BOOT_CONFIG_MIGRATION_FAILED;
-    if (length > BOOT_CONFIG_MIGRATION_MAX_BYTES
+    if (length > BOOT_CONFIG_EDIT_MAX_BYTES
         || memchr(text, '\0', length) != NULL)
         return PSP_BOOT_CONFIG_MIGRATION_NOT_NEEDED;
     text[length] = '\0';

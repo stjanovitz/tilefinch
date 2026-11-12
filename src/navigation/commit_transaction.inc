@@ -15,6 +15,65 @@ static void navigation_record_compiled_stylesheet(
         && session->performance.stylesheet_pressure_fallbacks == 0;
 }
 
+/* The compiled-stylesheet cache key of a browser-authored static document
+   (a site adapter's page): its inline <style> text and the inputs that
+   sheet is compiled against. It covers only what such a document carries;
+   one with a stylesheet link, a CSP, a CSSOM override, constructed sheets
+   or registered properties declines and builds its sheet as before. The
+   seed differs from the streamed web-page key
+   (navigation_stream_stylesheet_fingerprint), so neither path takes the
+   other's sheet. */
+static bool navigation_static_stylesheet_fingerprint(
+    const NavigationSession *session, const PocDocument *document,
+    uint64_t *fingerprint)
+{
+    if (session == NULL || document == NULL || document->html == NULL
+        || fingerprint == NULL
+        || (session->user_css_length != 0 && session->user_css == NULL)
+        || document->content_security_policy.header_present
+        || document->content_security_policy.policy_count != 0
+        || document_adopted_sheets_signature(document) != 0
+        || document->registered_property_count != 0) return false;
+    uint64_t hash = UINT64_C(0x9e3779b97f4a7c15);
+    hash = navigation_stylesheet_fingerprint_field(
+        hash, "base-url", session->page.resource_base_url,
+        strlen(session->page.resource_base_url), true);
+    hash = navigation_stylesheet_fingerprint_field(
+        hash, "referrer-policy", session->page.referrer_policy,
+        strlen(session->page.referrer_policy), true);
+    /* Media queries are resolved at compile, so the sheet also depends on
+       the prefers-color-scheme answer (night mode). */
+    const int inputs[] = {
+        session->viewport.css_width, session->viewport.css_height,
+        stylesheet_prefers_dark_color_scheme() ? 1 : 0
+    };
+    hash = fingerprint_bytes(hash, (const char *) inputs, sizeof(inputs));
+    const size_t limits[] = {
+        session->external_resources_enabled, session->maximum_stylesheets,
+        session->maximum_stylesheet_bytes,
+        session->maximum_stylesheet_file_bytes
+    };
+    hash = fingerprint_bytes(hash, (const char *) limits, sizeof(limits));
+    hash = navigation_stylesheet_fingerprint_field(
+        hash, "user-css", session->user_css, session->user_css_length,
+        session->user_css_length != 0);
+    NavigationStylesheetWalk walk;
+    NavigationStylesheetSource source;
+    NavigationStylesheetWalkStep step;
+    navigation_stylesheet_walk_begin(&walk, document);
+    while ((step = navigation_stylesheet_walk_next(&walk, &source))
+           == NAVIGATION_STYLESHEET_WALK_SOURCE) {
+        size_t length = 0;
+        if (!source.style
+            || document_cssom_sheet_text(source.node, &length) != NULL)
+            return false;
+        hash = navigation_stylesheet_style_hash(hash, source.node);
+    }
+    if (step == NAVIGATION_STYLESHEET_WALK_LIMIT) return false;
+    *fingerprint = hash;
+    return true;
+}
+
 static bool navigation_replace_server_body_with_runtime(
     void *opaque, PocDocument *document,
     const char *markup, size_t length)
@@ -190,6 +249,70 @@ static bool navigation_preview_has_visible_content(
         }
     }
     return false;
+}
+
+/* Smallest image slot, in CSS px on each side, that counts as first-screen
+   content: an icon or a logo, not a tracking pixel or a spacer. */
+#define NAVIGATION_PREVIEW_SLOT_MINIMUM 16
+
+static bool navigation_preview_text_visible(const DrawCommand *command)
+{
+    if (command->type != DRAW_TEXT || command->text == NULL
+        || command->opacity_scale == 0) return false;
+    for (size_t byte = 0; byte < command->text_length; byte++) {
+        unsigned char character = (unsigned char) command->text[byte];
+        if (character != ' ' && character != '\t' && character != '\n'
+            && character != '\r' && character != '\f') return true;
+    }
+    return false;
+}
+
+/* A first screen whose only content is image slots that have not been
+   filled yet (bbc.com/news: a masthead with an inline-SVG logo and a grey
+   band, its first headline at y=318) is still a page, not an empty
+   preview. Without this such a page shows the loading screen until its
+   deferred scripts have run. It counts only when all three hold, so it
+   cannot paint a blank or misleading screen:
+   - a visible slot of at least icon size inside the first screen;
+   - other visible paint there that is not the page background (a band, a
+     border, a placeholder box): a lone hero slot or a grid of slots on the
+     bare page background would be an empty screen until the images
+     arrive, so it waits as before;
+   - visible text laid out below the first screen, so the reader can page
+     down to it while the images and scripts finish.
+   Opacity 0 and visibility:hidden keep their geometry with a zero opacity
+   scale and count for none of these. The slots stay transparent until the
+   image pass fills them, as they already do in a preview with text. */
+static bool navigation_preview_has_slots_above_text(
+    const LayoutDocument *preview, int viewport_width, int viewport_height)
+{
+    if (preview == NULL || viewport_width <= 0 || viewport_height <= 0)
+        return false;
+    bool slot = false, paint = false, text = false;
+    for (size_t i = 0; i < preview->count && !(slot && paint && text); i++) {
+        const DrawCommand *command = &preview->commands[i];
+        if (command->width <= 0 || command->height <= 0
+            || command->opacity_scale == 0
+            || command->x >= viewport_width
+            || (int64_t) command->x + command->width <= 0
+            || (int64_t) command->y + command->height <= 0) continue;
+        if (command->y >= viewport_height) {
+            if (navigation_preview_text_visible(command)) text = true;
+            continue;
+        }
+        if (command->type == DRAW_IMAGE) {
+            if (command->image == NULL
+                && command->width >= NAVIGATION_PREVIEW_SLOT_MINIMUM
+                && command->height >= NAVIGATION_PREVIEW_SLOT_MINIMUM)
+                slot = true;
+            continue;
+        }
+        if (command->type == DRAW_TEXT) continue;
+        if (command->type != DRAW_FILL_RECT
+            || command->color != preview->page_background
+            || draw_command_fill_gradient(command, NULL)) paint = true;
+    }
+    return slot && paint && text;
 }
 
 static bool navigation_image_priority_contains(
@@ -598,6 +721,22 @@ static bool navigation_document_images_are_defer_safe(
     return visited < NAVIGATION_DOM_TRAVERSAL_NODE_LIMIT;
 }
 
+/* Every entry of `images` is a document <svg> element's published raster
+   (navigation_publish_static_svg), which a layout built with that table
+   already drew at its final size. */
+static bool navigation_images_are_inline_svg(const ImageResources *images)
+{
+    if (images == NULL) return true;
+    for (size_t i = 0; i < images->count; i++) {
+        const ImageResource *image = &images->items[i];
+        if (image->node == NULL || image->pixels == NULL || image->is_mask
+            || image->is_background || image->is_canvas
+            || image->node->type != LXB_DOM_NODE_TYPE_ELEMENT
+            || !node_name_is(image->node, "svg")) return false;
+    }
+    return true;
+}
+
 static bool navigation_plan_static_image_geometry(
     NavigationSession *session, const FontSet *fonts,
     const ImageResources *images, ImagePriorityTarget *targets,
@@ -655,15 +794,17 @@ static bool navigation_plan_static_image_geometry(
         }
     }
     /* With no eager visible images and no other image-producing content,
-       the complete plan is already the final no-image layout. The caller
-       defers this entire image queue and cannot run author script. Move the
-       layout into the candidate page so its ordinary abort/commit owner
-       handles every later failure; never retain a second layout allocation.
-       Nonempty external image tables keep the existing rebuild path. */
+       the complete plan is already the final layout: the page's only
+       published images are its inline SVG artwork, drawn by this layout.
+       The caller defers this entire image queue and cannot run author
+       script. Move the layout into the candidate page so its ordinary
+       abort/commit owner handles every later failure; never retain a second
+       layout allocation. Any other image table keeps the rebuild path. */
     if (collected && total_count != 0 && *count == 0
         && layout_ready != NULL && session->page.layout.commands == NULL
-        && session->page.images.count == 0
-        && (images == NULL || images->count == 0)
+        && navigation_images_are_inline_svg(&session->page.images)
+        && (images == NULL || images == &session->page.images
+            || images->count == 0)
         && navigation_document_images_are_defer_safe(
                &session->page.document, &session->page.stylesheet, images)) {
         session->page.layout = probe;
@@ -725,8 +866,11 @@ static void navigation_decode_awaiting_images(
 {
     if (images != &session->page.images) return;
     uint64_t started = navigation_now_us();
+    ImageRetargetReader reader = navigation_image_reader(
+        session, NAVIGATION_IMAGE_READER_NEAR, NAVIGATION_IMAGE_READER_FAR);
     if (images_retarget_decode_awaiting(&session->page.images, layout,
-                                        session->browser_session) == 0)
+                                        session->browser_session,
+                                        &reader) == 0)
         return;
     uint64_t elapsed = navigation_now_us() - started;
     session->performance.image_resource_us += elapsed;
@@ -1203,6 +1347,10 @@ typedef struct {
     bool user_stylesheet_current;
     bool script_document_may_have_changed;
     uint64_t adopted_stylesheet_fingerprint;
+    /* A static document's cache key (navigation_static_stylesheet_fingerprint)
+       of the inputs commit_style compiled or took its sheet from. */
+    uint64_t static_stylesheet_fingerprint;
+    bool static_stylesheet_fingerprinted;
     bool progressive_preview_candidate;
     bool final_layout_ready;
     bool provisional_commit;
@@ -1277,6 +1425,7 @@ static TILEFINCH_OUT_OF_LINE bool commit_setup(NavigationSession *session,
             session->page.runtime, &session->page.document);
         session->page.script_result = txn->streaming->script_result;
         txn->streaming->runtime_transferred = true;
+        navigation_bind_node_retirement(session);
         /* canvas_images moved from streaming storage into page storage before
            this realm was adopted. Rebind before any remaining deferred script
            runs so a late drawing cannot publish into the emptied staging
@@ -1497,6 +1646,25 @@ static TILEFINCH_OUT_OF_LINE bool commit_style(NavigationSession *session,
             navigation_record_compiled_stylesheet(session, final_fingerprint);
         }
     }
+    /* A static document (a provider page, including Back to one) whose
+       sheet inputs match the compiled sheet the previous page left. */
+    if (txn->streaming == NULL && !txn->allow_runtime) {
+        txn->static_stylesheet_fingerprinted =
+            navigation_static_stylesheet_fingerprint(
+                session, &session->page.document,
+                &txn->static_stylesheet_fingerprint);
+        if (txn->static_stylesheet_fingerprinted
+            && navigation_compiled_stylesheet_cache_take(
+                session, txn->static_stylesheet_fingerprint,
+                &session->page.stylesheet,
+                &session->page.external_stylesheets)) {
+            txn->adopted_compiled_stylesheet = true;
+            txn->stylesheet_external_current = true;
+            txn->user_stylesheet_current = true;
+            txn->adopted_stylesheet_fingerprint =
+                txn->static_stylesheet_fingerprint;
+        }
+    }
     if (!txn->adopted_streaming_stylesheet && !txn->adopted_compiled_stylesheet
         && !navigation_build_stylesheet(session)) {
         snprintf(session->last_error, sizeof(session->last_error),
@@ -1629,6 +1797,7 @@ static TILEFINCH_OUT_OF_LINE bool commit_scripts(NavigationSession *session,
                 &session->page.stylesheet, &session->page.images,
                 txn->fonts,
                 &session->page.script_result);
+            navigation_bind_node_retirement(session);
         }
         if (session->page.runtime == NULL) {
             if (session->budget->failure_count == runtime_failure_count) {
@@ -1647,6 +1816,8 @@ static TILEFINCH_OUT_OF_LINE bool commit_scripts(NavigationSession *session,
             session->page.script_degradation_observed = true;
             session->page.script_result.success = false;
             session->page.script_memory_limited = true;
+            navigation_record_script_stop(
+                session, NAVIGATION_SCRIPT_STOP_NOT_CREATED);
             session->page.script_result.error[0] = '\0';
             session->page.script_result.error_source_context[0] = '\0';
             snprintf(
@@ -2036,6 +2207,43 @@ static TILEFINCH_OUT_OF_LINE bool commit_final_style(NavigationSession *session,
             session->page.stylesheet.count);
 }
 
+/* Records whether the committed sheet's <head> part can serve a later
+   document (the compiled-sheet cache's head entry): the head key, and
+   whether the document has sources outside <head>. Those must all be
+   <style> elements, so that the external statistics are the head's own;
+   a sheet cut from a sampled large source, a failed, partial or deferred
+   external load, @import, adopted sheets or registered properties is not
+   shared this way. The user stylesheet is in the head key (its text is
+   part of the stylesheet context) and is added again after the cut. */
+static void navigation_record_compiled_stylesheet_head(
+    NavigationSession *session, NavigationDocumentStream *stream)
+{
+    NavigationPage *page = &session->page;
+    page->compiled_stylesheet_head_valid = false;
+    page->compiled_stylesheet_head_body_sources = false;
+    page->compiled_stylesheet_head_key = 0;
+    const ExternalStylesheetStats *stats = &page->external_stylesheets;
+    if (!page->compiled_stylesheet_cacheable
+        || !session->external_resources_enabled
+        || page->stylesheet_resources.sampled_large_source
+        || page->document.registered_property_count != 0
+        || document_adopted_sheets_signature(&page->document) != 0
+        || stats->failed != 0 || stats->skipped_limit != 0
+        || stats->skipped_pressure != 0 || stats->truncated != 0
+        || stats->transient_failures != 0 || stats->terminal_failures != 0
+        || stats->deadline_cancelled != 0 || stats->deadline_exceeded
+        || stats->imports_discovered != 0) return;
+    uint64_t key = 0;
+    size_t head_inputs = 0, body_inputs = 0;
+    bool body_inline = false;
+    if (!navigation_stream_stylesheet_head_key(
+            stream, &page->document, &key, &head_inputs, &body_inputs,
+            &body_inline) || !body_inline) return;
+    page->compiled_stylesheet_head_valid = true;
+    page->compiled_stylesheet_head_body_sources = body_inputs != 0;
+    page->compiled_stylesheet_head_key = key;
+}
+
 /* Fonts: record the compiled sheet for reuse and start the page's web
    fonts. */
 static TILEFINCH_OUT_OF_LINE bool commit_fonts(NavigationSession *session,
@@ -2046,13 +2254,20 @@ static TILEFINCH_OUT_OF_LINE bool commit_fonts(NavigationSession *session,
        compile rules that have no representation in the DOM fingerprint;
        replaying those on another document would be incorrect. */
     session->page.compiled_stylesheet_cacheable = false;
+    session->page.compiled_stylesheet_head_valid = false;
     if (txn->streaming != NULL && session->script_attempted == 0) {
         uint64_t final_fingerprint = 0;
         if (navigation_stream_stylesheet_fingerprint(
                 txn->streaming, &session->page.document,
                 &final_fingerprint)) {
             navigation_record_compiled_stylesheet(session, final_fingerprint);
+            navigation_record_compiled_stylesheet_head(
+                session, txn->streaming);
         }
+    } else if (txn->static_stylesheet_fingerprinted) {
+        /* No author script runs in a static document. */
+        navigation_record_compiled_stylesheet(
+            session, txn->static_stylesheet_fingerprint);
     }
     if (session->web_fonts_enabled) {
         phase_started = navigation_now_us();
@@ -2076,6 +2291,42 @@ static TILEFINCH_OUT_OF_LINE bool commit_fonts(NavigationSession *session,
     return navigation_commit_checkpoint(
             session, "navigation-fonts",
             session->page.external_fonts.attempted);
+}
+
+/* A browser-authored static document's inline SVG artwork needs no network
+   and does not depend on layout. Publish it before the image-planning
+   layout, so that layout draws it and can become the final one
+   (navigation_plan_static_image_geometry) instead of the page being laid
+   out again once its icons exist. False when the loader refused; it rolled
+   its suffix back. */
+static bool navigation_publish_static_svg(NavigationSession *session,
+                                          NavigationCommitTxn *txn,
+                                          ImagePriorityTarget *targets,
+                                          size_t capacity)
+{
+    size_t count = navigation_collect_markup_svg_priority(
+        &session->page.document, targets, capacity, 0);
+    if (count == 0) return true;
+    uint64_t started = navigation_now_us();
+    ImageLayoutBoxes image_scale;
+    navigation_lend_image_scale(session, &image_scale);
+    bool loaded = images_load_external_priority_targets(
+        &session->page.document, &session->page.stylesheet,
+        &session->page.images, targets, count, session->budget,
+        session->page.resource_base_url, txn->url,
+        session->page.referrer_policy, session->maximum_images,
+        session->maximum_image_bytes, session->maximum_image_file_bytes,
+        session->maximum_decoded_image_bytes, session->resource_timeout_ms,
+        session->page.resource_scheduler, session->browser_session);
+    navigation_return_image_boxes(session, &image_scale);
+    uint64_t finished = navigation_now_us();
+    session->performance.image_resource_us +=
+        finished >= started ? finished - started : 0;
+    if (!loaded) return false;
+    txn->images = &session->page.images;
+    navigation_ensure_layout_reuse(session);
+    layout_reuse_cache_update_images(session->page.layout_reuse, txn->images);
+    return true;
 }
 
 /* Images: reserve the frame tail, load the visible-priority images (from a
@@ -2111,6 +2362,14 @@ static TILEFINCH_OUT_OF_LINE bool commit_images(NavigationSession *session,
         session->external_resources_enabled
         && navigation_document_may_have_images(
             &session->page.document, &session->page.stylesheet);
+    size_t markup_priority_capacity = NAVIGATION_VISIBLE_IMAGE_PRIORITY_LIMIT;
+    if (session->maximum_images < markup_priority_capacity) {
+        markup_priority_capacity = session->maximum_images;
+    }
+    size_t svg_priority_capacity = markup_priority_capacity;
+    /* Inline SVG published ahead of a static plan (navigation_publish_static_svg);
+       a refusal there stands for the whole visible-priority load. */
+    bool static_svg_published = false, static_svg_refused = false;
     if (pre_image_preview_candidate) {
         (void) navigation_try_progressive_preview(
             session, txn->streaming, txn->previous_page, true, txn->fonts, txn->images, false,
@@ -2124,6 +2383,9 @@ static TILEFINCH_OUT_OF_LINE bool commit_images(NavigationSession *session,
            retain the streaming-preview/markup policy above. */
         if (image_priority_count == 0 && !txn->allow_runtime
             && txn->streaming == NULL) {
+            static_svg_published = navigation_publish_static_svg(
+                session, txn, image_priority_targets, svg_priority_capacity);
+            static_svg_refused = !static_svg_published;
             static_image_plan = navigation_plan_static_image_geometry(
                 session, txn->fonts, txn->images, image_priority_targets,
                 NAVIGATION_VISIBLE_IMAGE_PRIORITY_LIMIT,
@@ -2132,11 +2394,6 @@ static TILEFINCH_OUT_OF_LINE bool commit_images(NavigationSession *session,
                 image_priority_count;
         }
     }
-    size_t markup_priority_capacity = NAVIGATION_VISIBLE_IMAGE_PRIORITY_LIMIT;
-    if (session->maximum_images < markup_priority_capacity) {
-        markup_priority_capacity = session->maximum_images;
-    }
-    size_t svg_priority_capacity = markup_priority_capacity;
     /* The markup fallback is intentionally less authoritative than a
        successful viewport layout. Leave a small quota for the complete
        style-aware traversal so late responsive icons, CSS backgrounds, and
@@ -2147,7 +2404,9 @@ static TILEFINCH_OUT_OF_LINE bool commit_images(NavigationSession *session,
         markup_priority_capacity -= reserve;
     }
     size_t layout_priority_count = image_priority_count;
-    size_t markup_priority_added = pre_image_preview_candidate
+    size_t markup_priority_added =
+        pre_image_preview_candidate && !static_svg_published
+        && !static_svg_refused
         ? navigation_collect_markup_svg_priority(
               &session->page.document, image_priority_targets,
               svg_priority_capacity, image_priority_count)
@@ -2193,7 +2452,8 @@ static TILEFINCH_OUT_OF_LINE bool commit_images(NavigationSession *session,
         bool image_pipeline_refused = false;
         ImageLayoutBoxes image_scale;
         navigation_lend_image_scale(session, &image_scale);
-        bool priority_loaded = image_priority_count == 0
+        bool priority_loaded = !static_svg_refused
+            && (image_priority_count == 0
             || images_load_external_priority_targets(
                 &session->page.document, &session->page.stylesheet,
                 &session->page.images, image_priority_targets,
@@ -2205,7 +2465,7 @@ static TILEFINCH_OUT_OF_LINE bool commit_images(NavigationSession *session,
                 session->maximum_decoded_image_bytes,
                 session->resource_timeout_ms,
                 session->page.resource_scheduler,
-                session->browser_session);
+                session->browser_session));
         navigation_return_image_boxes(session, &image_scale);
         if (!priority_loaded) {
             if (session->page.images.stats.load_cancelled) {
@@ -2223,7 +2483,9 @@ static TILEFINCH_OUT_OF_LINE bool commit_images(NavigationSession *session,
             session->performance.progressive_image_priority_loaded =
                 session->page.images.stats.loaded - loaded_before;
         }
-        if (image_priority_count != 0 && !image_pipeline_refused) {
+        /* An adopted static plan is already the final layout. */
+        if (image_priority_count != 0 && !image_pipeline_refused
+            && !txn->final_layout_ready) {
             txn->images = &session->page.images;
             layout_reuse_cache_update_images(
                 session->page.layout_reuse, txn->images);

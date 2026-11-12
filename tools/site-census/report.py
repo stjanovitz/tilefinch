@@ -151,6 +151,29 @@ def ms(v):
     return "-" if v is None else ("%.0f" % v if v >= 10 else "%.1f" % v)
 
 
+def probe_pass_failures(recs, probe):
+    """Pages of the metrics pass the API-probe pass did not sweep, as
+    (name, reason). A page that ran no script has no realm to probe and is
+    not listed. Any other page without a parsed sweep (no record in the
+    probe pass, no probe-chunk output because its realm was gone or never
+    ran the probe, or chunks that do not parse) is a failure of the probe
+    pass: its missing APIs are simply absent from the table."""
+    failures = []
+    for n in sorted(recs):
+        if not recs[n].get("script_list"):
+            continue
+        record = probe.get(n)
+        if record is None:
+            failures.append((n, "no record in the probe pass"))
+        elif "api_probe" not in record:
+            failures.append((n, "no probe sweep (%d page scripts; the realm "
+                                "was gone or never ran the probe)"
+                             % len(record.get("script_list") or [])))
+        elif "error" in record["api_probe"]:
+            failures.append((n, record["api_probe"]["error"]))
+    return failures
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("metrics")
@@ -210,6 +233,9 @@ def main():
                      r["timing"]["longest_step_phase"]].add(n)
         if r["memory"]["peak_mb"] > 20:
             problems["memory: peak > 20 MiB"].add(n)
+    probe_failures = probe_pass_failures(recs, probe) if args.probe else []
+    for n, _ in probe_failures:
+        problems["probe pass: page not swept for missing APIs"].add(n)
     api_sites = collections.defaultdict(set)
     api_kind = {}
     api_callers = collections.defaultdict(collections.Counter)
@@ -262,6 +288,24 @@ def main():
         callers = ", ".join("%s %d" % kv for kv in api_callers[api].most_common(3))
         print("| `%s` | %d | %s | %s | %s |" % (api, len(sites), api_kind[api], callers,
                                               ", ".join(sorted(sites))))
+
+    if args.probe:
+        print("\n## API-probe pass failures\n")
+        if probe_failures:
+            print("These pages ran scripts but produced no API-probe sweep, so "
+                  "the table above says nothing about them. Pages that ran no "
+                  "script have no realm to probe and are not listed.\n")
+            print("| site | reason |")
+            print("|---|---|")
+            for n, reason in probe_failures:
+                print("| %s | %s |" % (n, reason.replace("|", "\\|")))
+        else:
+            print("Every page that ran scripts was swept.")
+        scriptless = [n for n in names if not recs[n].get("script_list")]
+        if scriptless:
+            print("\nNot probed, not failures: %d pages ran no script (native "
+                  "routes, script-free or refused pages): %s." % (
+                      len(scriptless), ", ".join(scriptless)))
 
     # ---- Per-site table ----
     print("\n## Per-site results\n")

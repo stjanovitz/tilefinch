@@ -96,14 +96,25 @@ typedef struct {
        of a form body (body_length bytes, media_candidates format). */
     char body[4096];
     size_t body_length;
-    /* Set instead of body when the request body does not fit it (a script
-       form submission carrying several-KiB tokens). Owned by the engine
-       that produced the action and valid until it produces another. */
+    /* Set instead of body when the request body does not fit it (a form
+       carrying several-KiB tokens). Owned by the NavigationSession and valid
+       until it produces another large form body. */
     const char *external_body;
+    /* A form submission was asked for and refused: policy (CSP form-action),
+       a body or URL over its limit, or memory. The frontend says so. */
+    bool form_not_sent;
+    /* The press did nothing because what it activates lives in page scripts
+       that were stopped (memory, media room, the browser) or never started
+       for memory. Not set when the user turned JavaScript off or the page
+       has no scripts. The frontend says so; otherwise Cross looks broken. */
+    bool page_scripts_stopped;
     int64_t media_node_handle;
     TilefinchRequestMode media_mode;
     TilefinchCredentialsMode media_credentials;
     MediaDiscoveryKind media_kind;
+    /* The activated media element's title attribute, cut to fit at a
+       character boundary; empty when it has none. */
+    char media_title[96];
 } ControllerAction;
 
 static inline const char *controller_action_body(const ControllerAction *action)
@@ -294,6 +305,13 @@ bool controller_text_value(const BrowserController *controller,
                            char *output, size_t capacity, size_t *length);
 bool controller_text_input_info(
     const BrowserController *controller, ControllerTextInputInfo *info);
+/* Whether the keyboard's Done on the focused field is Enter: the field is
+   a single-line input that is the only field of its form blocking HTML
+   implicit submission, and Enter would submit that form (the form's
+   default button, if it has one, is not disabled). With two or more such
+   fields Done only commits the text. Walks the form, so it is asked once,
+   after Done, not on every refresh. */
+bool controller_keyboard_done_submits(const BrowserController *controller);
 bool controller_backspace(BrowserController *controller);
 bool controller_reveal_focus(BrowserController *controller);
 bool controller_scroll_by(BrowserController *controller, int delta_y,
@@ -319,6 +337,10 @@ int controller_page_step(const LayoutDocument *layout,
                          int direction);
 bool controller_scroll_page(BrowserController *controller, int direction,
                             int viewport_height);
+/* The CSS pixels controller_scroll_page would move the document, read without
+   the layout, so before pinned bars shorten it. Zero when a focused or hovered
+   element could take the press instead. */
+int controller_page_press_preview_step(const BrowserController *controller);
 bool controller_scroll_to_top(BrowserController *controller,
                               int viewport_height);
 bool controller_scroll_to_bottom(BrowserController *controller,

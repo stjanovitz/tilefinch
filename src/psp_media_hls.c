@@ -4,6 +4,8 @@
 #include <string.h>
 
 #include "tilefinch/fetch.h"
+#include "tilefinch/media_mp3.h"
+#include "tilefinch/platform.h"
 #include "tilefinch/media_worker_request.h"
 #include "tilefinch/navigation.h"
 #include "tilefinch/user_agent.h"
@@ -18,6 +20,12 @@
 #define PSP_HLS_TIMEOUT_MS 30000
 #define PSP_HLS_MASTER_DEPTH_LIMIT 4u
 #define PSP_HLS_PLAYLIST_WIRE_CHUNK_BYTES MEDIA_HLS_TRANSPORT_CHUNK_BYTES
+/* An MP3 response is read until the resource or the station ends. The
+   worker's deadline is total time, so it is long; the worker's stall
+   detector ends a response that stops arriving. Either end reconnects or
+   resumes in MediaMp3Source. */
+#define PSP_MP3_TIMEOUT_MS (6L * 60L * 60L * 1000L)
+#define PSP_MP3_MAXIMUM_BYTES ((size_t) UINT32_MAX)
 
 typedef struct {
     /* Stable for the logical request; the HLS core and the playlist pump
@@ -29,6 +37,11 @@ typedef struct {
     size_t consumed;
     size_t maximum_bytes;
     size_t publication_bytes;
+    /* MP3 requests: the first byte asked for by Range, when ranged. */
+    uint64_t range_first;
+    /* MP3 requests: the admitted response's Content-Length, 0 if none. */
+    uint64_t declared_length;
+    bool ranged;
     bool headers_admitted;
     bool raw_gzip;
     MediaWorkerHop hop;
@@ -58,6 +71,9 @@ struct PspMediaHlsContext {
     char playlist_url[PSP_HLS_SOURCE_LIMIT][NAVIGATION_URL_LIMIT];
     unsigned char *playlist_chunk;
     unsigned char *playlist_wire_chunk;
+    /* Zeroed header scratch kept across polls while a response's headers
+       are pending; the worker leaves it untouched until they arrive. */
+    FetchResult *pending_headers;
     MediaHlsPlaylistStream *playlist_stream;
     MediaHlsSource *source[PSP_HLS_SOURCE_LIMIT];
     MediaHlsTrackSelection track_selection[PSP_HLS_SOURCE_LIMIT];
@@ -82,6 +98,18 @@ struct PspMediaHlsContext {
     /* The chosen variant exceeds the software bound on an undeclared
        profile; its SPS decides. */
     bool selection_unverified;
+    /* MP3 mode (psp_media_hls_create_mp3): no playlist and no HLS
+       sources. */
+    bool audio;
+    bool mp3_seekable;
+    MediaMp3Source *mp3;
+    /* The station's icy-name and icy-genre response headers, as sent: read
+       from headers only (no Icy-MetaData is requested). */
+    char icy_name[PSP_MEDIA_HLS_STATION_TEXT_BYTES];
+    char icy_genre[PSP_MEDIA_HLS_STATION_TEXT_BYTES];
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    uint64_t mp3_report_next_us;
+#endif
     char error[192];
 };
 
@@ -148,7 +176,8 @@ static MediaWorkerAuthority psp_hls_authority(
         .mode = context->mode,
         .credentials = context->credentials,
         .content_security_policy = context->content_security_policy,
-        .page_redirects = context->page_redirects
+        .page_redirects = context->page_redirects,
+        .audio = context->audio
     };
 }
 
@@ -170,9 +199,18 @@ static PspHlsIssueStatus psp_hls_issue(
         snprintf(error, error_size, "%s", "HLS request budget refused");
         return PSP_HLS_ISSUE_FAILED;
     }
+    char range_header[48];
+    if (request->ranged)
+        snprintf(range_header, sizeof(range_header), "Range: bytes=%llu-",
+                 (unsigned long long) request->range_first);
     FetchRequest transport = {
         .allow_http_errors = true,
-        .accept = "application/vnd.apple.mpegurl,video/mp2t,video/*;q=0.9,*/*;q=0.5",
+        .accept = context->audio
+            ? "audio/mpeg,audio/*;q=0.9,*/*;q=0.5"
+            : "application/vnd.apple.mpegurl,video/mp2t,video/*;q=0.9,*/*;q=0.5",
+        .extra_headers = request->ranged ? range_header : NULL,
+        /* Radio servers that predate HTTP answer "ICY 200 OK". */
+        .icy_status_line = context->audio,
         /* A long live DVR playlist can expand far beyond one publication
            quantum. Let the browser-owned playlist pump inflate gzip in
            bounded slices; libcurl must never retain a decoded tail while its
@@ -192,12 +230,12 @@ static PspHlsIssueStatus psp_hls_issue(
     uint64_t id = !prepared_ok ? 0 : context->page_redirects
         ? fetch_background_transport_enqueue_media_hop_stream_sized_diagnosed(
               request->hop.url, &stream_request, request->maximum_bytes,
-              PSP_HLS_TIMEOUT_MS, request->publication_bytes,
-              &enqueue_status)
+              context->audio ? PSP_MP3_TIMEOUT_MS : PSP_HLS_TIMEOUT_MS,
+              request->publication_bytes, &enqueue_status)
         : fetch_background_transport_enqueue_media_stream_sized_diagnosed(
               request->hop.url, &stream_request, request->maximum_bytes,
-              PSP_HLS_TIMEOUT_MS, request->publication_bytes,
-              &enqueue_status);
+              context->audio ? PSP_MP3_TIMEOUT_MS : PSP_HLS_TIMEOUT_MS,
+              request->publication_bytes, &enqueue_status);
     budget_free(context->budget, prepared);
     request->background_id = id;
     request->consumed = 0;
@@ -213,14 +251,12 @@ static PspHlsIssueStatus psp_hls_issue(
     return PSP_HLS_ISSUE_FAILED;
 }
 
-static uint64_t psp_hls_start_sized(
-    void *opaque, const char *url, size_t maximum_bytes,
-    size_t publication_bytes, bool raw_gzip,
-    char *error, size_t error_size)
+static uint64_t psp_hls_start_request(
+    PspMediaHlsContext *context, const char *url, size_t maximum_bytes,
+    size_t publication_bytes, bool raw_gzip, bool ranged,
+    uint64_t range_first, char *error, size_t error_size)
 {
-    PspMediaHlsContext *context = opaque;
-    if (context == NULL || url == NULL
-        || maximum_bytes > MEDIA_HLS_MAXIMUM_SEGMENT_BYTES) return 0;
+    if (context == NULL || url == NULL) return 0;
     size_t slot = PSP_HLS_REQUEST_LIMIT;
     for (size_t i = 0; i < PSP_HLS_REQUEST_LIMIT; i++)
         if (context->requests[i].handle == 0) { slot = i; break; }
@@ -229,6 +265,8 @@ static uint64_t psp_hls_start_sized(
     *request = (PspHlsRequest) {
         .maximum_bytes = maximum_bytes,
         .publication_bytes = publication_bytes,
+        .range_first = range_first,
+        .ranged = ranged,
         .raw_gzip = raw_gzip
     };
     if (!media_worker_hop_init(&request->hop, url)) {
@@ -261,6 +299,17 @@ static uint64_t psp_hls_start_sized(
     if (++context->next_handle == 0) context->next_handle = 1;
     request->handle = context->next_handle;
     return request->handle;
+}
+
+static uint64_t psp_hls_start_sized(
+    void *opaque, const char *url, size_t maximum_bytes,
+    size_t publication_bytes, bool raw_gzip,
+    char *error, size_t error_size)
+{
+    if (maximum_bytes > MEDIA_HLS_MAXIMUM_SEGMENT_BYTES) return 0;
+    return psp_hls_start_request(
+        opaque, url, maximum_bytes, publication_bytes, raw_gzip, false, 0,
+        error, error_size);
 }
 
 static void psp_hls_request_cancel(PspHlsRequest *request,
@@ -312,21 +361,42 @@ static PspHlsHeadersStatus psp_hls_follow_redirect(
         ? PSP_HLS_HEADERS_REFUSED : PSP_HLS_HEADERS_REDIRECTED;
 }
 
+/* The response's Content-Length, or 0 when it has none or it is not a
+   plain decimal number. */
+static uint64_t psp_hls_content_length(const FetchResult *metadata)
+{
+    char value[32];
+    if (!fetch_response_header_value(metadata, "content-length", value,
+                                     sizeof(value)) || value[0] == '\0')
+        return 0;
+    uint64_t length = 0;
+    for (const char *at = value; *at != '\0'; at++) {
+        if (*at < '0' || *at > '9') return 0;
+        unsigned digit = (unsigned) (*at - '0');
+        if (length > (UINT64_MAX - digit) / 10u) return 0;
+        length = length * 10u + digit;
+    }
+    return length;
+}
+
 static PspHlsHeadersStatus psp_hls_admit_headers(
     PspMediaHlsContext *context, PspHlsRequest *request,
     char *error, size_t error_size)
 {
-    FetchResult *metadata = fetch_result_create(context->budget);
+    /* Polled every frame until the headers land: allocate and zero the
+       13.5 KiB FetchResult once, not on every poll. */
+    if (context->pending_headers == NULL)
+        context->pending_headers = fetch_result_create(context->budget);
+    FetchResult *metadata = context->pending_headers;
     if (metadata == NULL) {
         snprintf(error, error_size, "%s", "HLS response metadata budget");
         return PSP_HLS_HEADERS_REFUSED;
     }
-    bool available = fetch_background_transport_take_headers(
-        request->background_id, metadata);
-    if (!available) {
-        fetch_result_free(metadata);
+    if (!fetch_background_transport_take_headers(
+            request->background_id, metadata))
         return PSP_HLS_HEADERS_PENDING;
-    }
+    /* This response owns the filled scratch; the next one gets a new one. */
+    context->pending_headers = NULL;
     if (context->page_redirects && metadata->status_code >= 300
         && metadata->status_code < 400) {
         MediaWorkerAuthority authority = psp_hls_authority(context);
@@ -357,7 +427,8 @@ static PspHlsHeadersStatus psp_hls_admit_headers(
         .method = "GET",
         .mode = context->mode,
         .credentials = context->credentials,
-        .destination = TILEFINCH_DESTINATION_MEDIA
+        .destination = context->audio
+            ? TILEFINCH_DESTINATION_AUDIO : TILEFINCH_DESTINATION_MEDIA
     };
     TilefinchResourceGrant grant;
     TilefinchResourceDeniedReason denied;
@@ -367,10 +438,34 @@ static PspHlsHeadersStatus psp_hls_admit_headers(
             metadata, &authority,
             context->mode == TILEFINCH_REQUEST_MODE_CORS,
             true, false, &grant, &denied);
+    /* A ranged MP3 read must start where it asked: a 200 would replay the
+       file from its first byte into the middle of the stream. */
+    char content_range[96];
+    unsigned long long first = 0;
+    if (admitted && request->ranged
+        && (metadata->status_code != 206
+            || !fetch_response_header_value(
+                   metadata, "content-range", content_range,
+                   sizeof(content_range))
+            || sscanf(content_range, "bytes %llu-", &first) != 1
+            || first != request->range_first))
+        admitted = false;
     if (!admitted)
         snprintf(error, error_size,
                  "HLS response authority refused (HTTP %ld)",
                  metadata->status_code);
+    else if (context->mp3 != NULL) {
+        /* A reconnect's answer replaces the description only if it gives
+           one. */
+        char value[PSP_MEDIA_HLS_STATION_TEXT_BYTES];
+        if (fetch_response_header_value(metadata, "icy-name", value,
+                                        sizeof(value)) && value[0] != '\0')
+            memcpy(context->icy_name, value, sizeof(value));
+        if (fetch_response_header_value(metadata, "icy-genre", value,
+                                        sizeof(value)) && value[0] != '\0')
+            memcpy(context->icy_genre, value, sizeof(value));
+        request->declared_length = psp_hls_content_length(metadata);
+    }
     fetch_result_free(metadata);
     request->headers_admitted = admitted;
     return admitted ? PSP_HLS_HEADERS_ADMITTED : PSP_HLS_HEADERS_REFUSED;
@@ -462,7 +557,8 @@ static MediaHlsTransportPollResult psp_hls_poll(
             .method = "GET",
             .mode = context->mode,
             .credentials = context->credentials,
-            .destination = TILEFINCH_DESTINATION_MEDIA
+            .destination = context->audio
+                ? TILEFINCH_DESTINATION_AUDIO : TILEFINCH_DESTINATION_MEDIA
         };
         for (size_t i = 0; i < result->set_cookie_count; i++) {
             cookie_context.target_url = fetch_set_cookie_url(
@@ -670,6 +766,95 @@ PspMediaHlsContext *psp_media_hls_create(
     return context;
 }
 
+static uint64_t psp_mp3_start(void *opaque, uint64_t offset,
+                              char *error, size_t error_size)
+{
+    PspMediaHlsContext *context = opaque;
+    if (context == NULL) return 0;
+    return psp_hls_start_request(
+        context, context->playlist_url[0], PSP_MP3_MAXIMUM_BYTES,
+        MEDIA_HLS_TRANSPORT_CHUNK_BYTES, false, context->mp3_seekable,
+        offset, error, error_size);
+}
+
+static uint64_t psp_mp3_declared_length(void *opaque, uint64_t handle)
+{
+    PspHlsRequest *request = psp_hls_request(opaque, handle);
+    return request != NULL && request->headers_admitted
+        ? request->declared_length : 0;
+}
+
+PspMediaHlsContext *psp_media_hls_create_mp3(
+    Budget *budget, BrowserSession *session,
+    const char *url, const char *document_url,
+    TilefinchRequestMode mode, TilefinchCredentialsMode credentials,
+    const TilefinchContentSecurityPolicy *content_security_policy,
+    uint64_t content_length, bool seekable,
+    char *error, size_t error_size)
+{
+    if (budget == NULL || session == NULL || url == NULL
+        || document_url == NULL || !fetch_background_transport_available()
+        || strlen(url) >= NAVIGATION_URL_LIMIT
+        || strlen(document_url) >= NAVIGATION_URL_LIMIT) {
+        snprintf(error, error_size, "%s", "page audio transport unavailable");
+        return NULL;
+    }
+    PspMediaHlsContext *context = budget_calloc_category(
+        budget, BUDGET_CATEGORY_NAVIGATION, 1, sizeof(*context));
+    if (context == NULL) {
+        snprintf(error, error_size, "%s", "page audio budget refused");
+        return NULL;
+    }
+    context->budget = budget;
+    context->session = session;
+    context->mode = mode;
+    context->credentials = credentials;
+    context->content_security_policy = content_security_policy;
+    context->page_redirects = true;
+    context->audio = true;
+    context->mp3_seekable = seekable && content_length != 0;
+    snprintf(context->playlist_url[0], sizeof(context->playlist_url[0]), "%s",
+             url);
+    snprintf(context->document_url, sizeof(context->document_url), "%s",
+             document_url);
+    MediaMp3Transport transport = {
+        .opaque = context,
+        .start = psp_mp3_start,
+        .poll = psp_hls_poll,
+        .cancel = psp_hls_cancel,
+        .declared_length = psp_mp3_declared_length
+    };
+    MediaMp3SourceOptions options = {
+        .content_length = content_length,
+        .seekable = context->mp3_seekable
+    };
+    context->mp3 = media_mp3_source_create(
+        budget, &transport, &options, error, error_size);
+    if (context->mp3 == NULL) {
+        budget_free(budget, context);
+        return NULL;
+    }
+    /* The open's single source; nothing for the HLS path to open. */
+    context->source_count = 0;
+    return context;
+}
+
+bool psp_media_hls_station(const PspMediaHlsContext *context,
+                           const char **name, const char **genre)
+{
+    if (name != NULL) *name = "";
+    if (genre != NULL) *genre = "";
+    if (context == NULL || context->mp3 == NULL) return false;
+    if (name != NULL) *name = context->icy_name;
+    if (genre != NULL) *genre = context->icy_genre;
+    return context->icy_name[0] != '\0' || context->icy_genre[0] != '\0';
+}
+
+bool psp_media_hls_is_audio(const PspMediaHlsContext *context)
+{
+    return context != NULL && context->audio;
+}
+
 void psp_media_hls_set_memory_recovery(
     PspMediaHlsContext *context, void *opaque,
     bool (*make_room)(void *, size_t, unsigned *))
@@ -688,6 +873,18 @@ PspMediaHlsOpenStatus psp_media_hls_pump(
             ? "HLS source unavailable" : context->error);
         return PSP_MEDIA_HLS_OPEN_FAILED;
     }
+    if (context->audio) {
+        media_mp3_source_pump(
+            context->mp3, tilefinch_platform_monotonic_time_us());
+        MediaHlsPrimeStatus status = media_mp3_source_prime(
+            context->mp3, error, error_size);
+        if (status == MEDIA_HLS_PRIME_FAILED)
+            return psp_hls_open_fail(
+                context, error[0] == '\0' ? "page audio failed" : error,
+                error, error_size);
+        return status == MEDIA_HLS_PRIME_READY
+            ? PSP_MEDIA_HLS_OPEN_READY : PSP_MEDIA_HLS_OPEN_PENDING;
+    }
     if (context->opening_source >= context->source_count) {
         while (context->priming_source < context->source_count) {
             MediaHlsPrimeStatus status = media_hls_source_prime(
@@ -702,6 +899,16 @@ PspMediaHlsOpenStatus psp_media_hls_pump(
             if (status == MEDIA_HLS_PRIME_PENDING)
                 return PSP_MEDIA_HLS_OPEN_PENDING;
             context->priming_source++;
+        }
+        /* Line a separate audio rendition up with the video by the first
+           timestamps both primed; a move to another segment primes the
+           audio again. Nothing has been taken from either yet. */
+        if (context->source_count == 2u
+            && context->track_selection[1] == MEDIA_HLS_TRACK_AUDIO
+            && media_hls_source_align_live_start(
+                   context->source[0], context->source[1])) {
+            context->priming_source = 1u;
+            return PSP_MEDIA_HLS_OPEN_PENDING;
         }
         return PSP_MEDIA_HLS_OPEN_READY;
     }
@@ -897,6 +1104,30 @@ PspMediaHlsOpenStatus psp_media_hls_pump(
 void psp_media_hls_pump_delivery(
     PspMediaHlsContext *context, uint64_t now_us)
 {
+    if (context != NULL && context->audio) {
+        if (!context->failed) media_mp3_source_pump(context->mp3, now_us);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        /* Device check: whether the ring is fed and drained. */
+        if (now_us >= context->mp3_report_next_us) {
+            context->mp3_report_next_us = now_us + 5000000u;
+            MediaMp3Stats stats;
+            media_mp3_source_stats(context->mp3, &stats);
+            printf("tilefinch-media-mp3: event=delivery received=%llu "
+                   "buffered=%zu/%u until=%lluus frames=%llu skipped=%llu "
+                   "sync-losses=%u reconnects=%u holding=%d ended=%d "
+                   "failed=%d\n",
+                   (unsigned long long) stats.bytes_received,
+                   stats.buffered_bytes, (unsigned) MEDIA_MP3_RING_BYTES,
+                   (unsigned long long) stats.buffered_until_us,
+                   (unsigned long long) stats.frames,
+                   (unsigned long long) stats.skipped_bytes,
+                   stats.sync_losses, stats.reconnects,
+                   stats.holding ? 1 : 0, stats.ended ? 1 : 0,
+                   media_mp3_source_failed(context->mp3) ? 1 : 0);
+        }
+#endif
+        return;
+    }
     if (context == NULL || context->failed
         || context->opening_source < context->source_count) return;
     for (size_t i = 0; i < context->source_count; i++)
@@ -987,6 +1218,7 @@ bool psp_media_hls_failed(const PspMediaHlsContext *context)
 {
     if (context == NULL) return false;
     if (context->failed) return true;
+    if (context->audio) return media_mp3_source_failed(context->mp3);
     for (size_t i = 0; i < context->source_count; i++)
         if (media_hls_source_failed(context->source[i])) return true;
     return false;
@@ -997,6 +1229,11 @@ bool psp_media_hls_sample_sources(
     MediaSampleSource *audio_source, bool *has_separate_audio)
 {
     if (has_separate_audio != NULL) *has_separate_audio = false;
+    if (context != NULL && context->audio) {
+        if (audio_source != NULL) *audio_source = (MediaSampleSource) {0};
+        return video_source != NULL
+            && media_mp3_source_sample_source(context->mp3, video_source);
+    }
     if (context == NULL || video_source == NULL
         || context->source[0] == NULL
         || !media_hls_source_sample_source(
@@ -1016,6 +1253,11 @@ bool psp_media_hls_stream_info(
     PspMediaHlsContext *context, MediaMp4TrackInfo *video,
     MediaMp4TrackInfo *audio)
 {
+    if (context != NULL && context->audio) {
+        if (video != NULL) *video = (MediaMp4TrackInfo) {0};
+        return audio == NULL
+            || media_mp3_source_track_info(context->mp3, audio);
+    }
     if (context == NULL || context->source[0] == NULL
         || !media_hls_source_stream_info(
             context->source[0], video,
@@ -1034,6 +1276,21 @@ bool psp_media_hls_stats(
 {
     if (context == NULL || stats == NULL) return false;
     memset(stats, 0, sizeof(*stats));
+    if (context->audio) {
+        MediaMp3Stats mp3;
+        media_mp3_source_stats(context->mp3, &mp3);
+        stats->bytes_received = (size_t) (mp3.bytes_received > SIZE_MAX
+            ? SIZE_MAX : mp3.bytes_received);
+        stats->queued_bytes = mp3.buffered_bytes;
+        stats->buffered_until_us = mp3.buffered_until_us;
+        stats->live = mp3.live;
+        stats->ended = mp3.ended;
+        stats->holding = mp3.holding || mp3.ended;
+        stats->reconnecting = mp3.reconnecting;
+        for (size_t i = 0; i < PSP_HLS_REQUEST_LIMIT; i++)
+            if (context->requests[i].handle != 0) stats->active_requests++;
+        return true;
+    }
     stats->playlist_bytes_received = context->playlist_bytes_received;
     if (context->playlist_stream != NULL) {
         size_t current = media_hls_playlist_stream_bytes_seen(
@@ -1087,12 +1344,15 @@ bool psp_media_hls_selection_unverified(const PspMediaHlsContext *context)
 void psp_media_hls_destroy(PspMediaHlsContext *context)
 {
     if (context == NULL) return;
+    media_mp3_source_destroy(context->mp3);
+    context->mp3 = NULL;
     for (size_t i = 0; i < PSP_HLS_REQUEST_LIMIT; i++)
         if (context->requests[i].handle != 0)
             psp_hls_cancel(context, context->requests[i].handle);
     for (size_t i = 0; i < PSP_HLS_SOURCE_LIMIT; i++)
         media_hls_source_destroy(context->source[i]);
     psp_hls_destroy_playlist_stream(context);
+    fetch_result_free(context->pending_headers);
     budget_free(context->budget, context->playlist_wire_chunk);
     budget_free(context->budget, context->playlist_chunk);
     budget_free(context->budget, context);

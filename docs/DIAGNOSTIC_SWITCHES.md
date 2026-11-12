@@ -107,6 +107,7 @@ default applies, but the code and its strings ship.
 | `TILEFINCH_TRACE_SENTINEL` | 1 | `src/diagnostic_trace.h` | host | Inject sentinel/submit diagnostics into matching bundles. |
 | `TILEFINCH_TRACE_STARTUP_FAILURE` | 1 | `src/diagnostic_trace.h` | host | Expose a startup-recovery failure to the page for diagnosis. |
 | `TILEFINCH_TRACE_STYLESHEETS` | 9 | `src/resources.c` | host | Stylesheet compile, fragment, cache and truncation decisions (15 print sites; the stylesheet loader reads it once per load). |
+| `TILEFINCH_TRACE_STYLE_APPEND_VERIFY` | 1 | `src/navigation/style_append_verify.inc` | host | After each relayout that changed the page sheet in place (inserted, retired or reordered style sources), force a whole-sheet rebuild of the same DOM and print one `style-append-verify` line comparing every element's computed style (interned IDs folded by what they name) and the draw commands, with `-diff`/`-cmd` lines for differences; `dom=changed` marks a check whose forced rebuild ran stylesheet event handlers, so it proves nothing. Each check costs a rebuild: for proving equality, never for timing. Gated by `tilefinch-style-append-verify-tests` and `census.py replay --verify-style-appends`. |
 | `TILEFINCH_TRACE_TASKS` | 1 | `src/diagnostic_trace.h` | host | Timer and task counters at teardown. |
 | `TILEFINCH_TRACE_WASM` | 1 | `src/diagnostic_trace.h` | host | WebAssembly export calls and memory growth. |
 | `TILEFINCH_TRACE_WORKER_MESSAGES` | 1 | `src/js_runtime/runtime_creation.inc` | host | Worker messages; the value filters by direction. |

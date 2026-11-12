@@ -57,9 +57,10 @@ build.
 | Unicode paragraph segments in one inline flow | 32 | use readable logical-order layout |
 | UAX #9 visual runs per line | 256 | keep that line in logical order |
 | inline source spans | 512 | keep the formatting context in logical order |
-| mapped text commands | 1,024 | unmatched commands retain logical rendering |
+| mapped text commands per inline flow | 1,024 | unmatched commands retain logical rendering |
 | atomic inline boxes | 256 | keep the formatting context in logical order |
-| retained shaped glyphs per layout | 4,096 | keep the affected line in logical order |
+| retained shaped glyphs per layout | 65,536 | keep the affected line in logical order |
+| retained mapped commands per layout | 16,384 | keep the affected line in logical order |
 | SheenBidi scratch arena | 12 KiB | fail the analysis without partial state |
 
 Paragraph analysis uses one page-budget allocation and a reusable aligned
@@ -96,10 +97,35 @@ Bengali–Assamese pack uses the same sequence mechanism, including Assamese
 ra/wa, shared Indic punctuation and complete interface clusters. Both
 interface languages share a pack but retain separate catalog IDs. This does
 not claim arbitrary runtime Bengali or Assamese shaping; the fixed inventory's
-scalar fallback applies outside its coverage. Downscaled monochrome pack cells
-average their source footprint at glyph creation so small vowel marks and thin
-strokes are not dropped by a nearest sample; retained painting still uses the
-same cached glyph bitmap.
+scalar fallback applies outside its coverage. There a pre-base vowel (U+093F,
+U+09BF, U+09C7, U+09C8) still draws ahead of its consonants at the same total
+width, while two-part Bengali vowels and lines of mixed direction keep stored
+order. Monochrome pack cells are
+resampled with an exact box filter at glyph creation, so small vowel marks and
+thin strokes survive at small sizes and a stem keeps one weight wherever it
+falls against the pixel grid; retained painting still uses the same cached glyph
+bitmap.
+
+A pack cell has no metrics of its own, so a pack built by fitting each glyph to
+its cell draws lowercase as tall as capitals and shrinks its widest letters. That
+suits CJK, whose glyphs fill the em, but not an alphabet. A metric pack instead
+renders every glyph at one scale on a shared baseline, and declares that baseline
+and each glyph's column box in a form older browsers ignore
+(`include/tilefinch/glyph_component.h`). Its text is measured from the column
+boxes, so letters keep their own widths without reading the pack during layout.
+A combining mark in such a pack has no advance and its box ends at the pen, so it
+draws back over the letter before it, which is the letter it follows in a
+right-to-left cluster's stored order too. Marks are not positioned per letter:
+the font's default placement is the only one a pack holds. That placement suits
+a lowercase letter, so a pack can also list a capital and its accent (U+0300-036F)
+as a shaped cluster, which draws the accent raised; a browser older than this
+ignores those entries.
+
+A pack stores one weight. Bold text reaches its monochrome glyphs through either
+a synthetic bold or a real bold face, and both embolden the cell by one column
+before it is scaled, so the extra weight stays in proportion to the size. A
+metric glyph's advance gains that column, so layout and paint agree, and a color
+glyph is drawn unchanged.
 
 ### In-page install offer
 

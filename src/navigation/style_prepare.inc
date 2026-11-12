@@ -65,7 +65,7 @@ static bool navigation_stream_style_prepare_continuation(
     size_t current_count)
 {
     if (!stream->blocking_stylesheet_ready
-        || !stream->blocking_stylesheet_user_context_neutral
+        || stream->blocking_stylesheet.user_css_changes_context
         || stream->stylesheet_input_overflow
         || stream->blocking_stylesheet.scopes.adopted_source_count != 0)
         return false;
@@ -77,6 +77,11 @@ static bool navigation_stream_style_prepare_continuation(
             .blocking_stylesheet_viewport_rebuilds++;
         return false;
     }
+    if (stream->blocking_stylesheet.prefers_dark
+        != stylesheet_prefers_dark_color_scheme()
+        || stream->blocking_stylesheet_user_css
+            != navigation_stylesheet_user_css_hash(stream->session))
+        return false;
     if (current_count <= stream->stylesheet_input_count) return false;
 #ifndef TILEFINCH_NO_TRACE
     if (getenv("TILEFINCH_DISABLE_STYLESHEET_CONTINUATION") != NULL)
@@ -92,9 +97,74 @@ static bool navigation_stream_style_prepare_continuation(
     return true;
 }
 
+/* Starts from the cached sheet's <head> part when this document's <head>
+   sources have its key: the head inputs become the ready prefix and the
+   remaining inputs append as a continuation (the APPEND phase), exactly
+   as a fresh pass would parse them after the head. False leaves the
+   preparation to build the sheet. */
+static bool navigation_stream_style_prepare_take_head(
+    NavigationDocumentStream *stream, uint64_t fingerprint)
+{
+    NavigationSession *session = stream->session;
+    NavigationStylePrepare *prepare = &stream->style_prepare;
+    PocDocument *document = &stream->parser->document;
+    if (!session->external_resources_enabled
+        || !session->compiled_stylesheet_cache_ready
+        || !session->compiled_stylesheet_cache_head_valid) return false;
+    uint64_t key = 0;
+    size_t head_inputs = 0, body_inputs = 0;
+    bool body_inline = false;
+    if (!navigation_stream_stylesheet_head_key(
+            stream, document, &key, &head_inputs, &body_inputs,
+            &body_inline)
+        || key != session->compiled_stylesheet_cache_head_key) return false;
+    NavigationStylesheetInput *inputs = NULL;
+    size_t count = 0;
+    bool overflow = false;
+    if (!navigation_stream_collect_stylesheet_inputs(
+            stream, document, &inputs, &count, &overflow)
+        || overflow || count != head_inputs + body_inputs) {
+        budget_free(session->budget, inputs);
+        return false;
+    }
+    NavigationStylesheetInput *prefix = head_inputs == 0 ? NULL
+        : budget_malloc(session->budget, head_inputs * sizeof(*prefix));
+    if (head_inputs != 0 && prefix == NULL) {
+        budget_free(session->budget, inputs);
+        return false;
+    }
+    if (!navigation_compiled_stylesheet_cache_take_head(
+            session, key, &stream->blocking_stylesheet,
+            &stream->blocking_stylesheets)) {
+        budget_free(session->budget, prefix);
+        budget_free(session->budget, inputs);
+        return false;
+    }
+    Stylesheet *sheet = &stream->blocking_stylesheet;
+    sheet->noscript_rendered = document->noscript_rendered;
+    sheet->font_text_pages = document->font_text_pages;
+    if (head_inputs != 0)
+        memcpy(prefix, inputs, head_inputs * sizeof(*prefix));
+    navigation_stream_replace_stylesheet_inputs(
+        stream, prefix, head_inputs, false);
+    /* The take added the session's user stylesheet after the cut. */
+    stream->blocking_stylesheet_user_css =
+        navigation_stylesheet_user_css_hash(session);
+    prepare->continuation = true;
+    prepare->inputs = inputs;
+    prepare->input_count = count;
+    prepare->next_input = head_inputs;
+    prepare->fingerprint = fingerprint;
+    prepare->rules_before = sheet->count;
+    stream->blocking_stylesheet_ready = false;
+    stream->blocking_stylesheet_fingerprint_valid = false;
+    prepare->phase = NAVIGATION_STYLE_PREPARE_APPEND;
+    return true;
+}
+
 /* Starts the build: an append to the ready sheet when its inputs are a
-   prefix, else a fresh sheet from the compiled cache or a sliced full
-   pass. False abandons the preparation. */
+   prefix, else a fresh sheet from the compiled cache (whole, or its <head>
+   part with the rest appended) or a sliced full pass. False abandons the preparation. */
 static bool navigation_stream_style_prepare_build(
     NavigationDocumentStream *stream)
 {
@@ -159,6 +229,8 @@ static bool navigation_stream_style_prepare_build(
         prepare->phase = NAVIGATION_STYLE_PREPARE_FINISH;
         return true;
     }
+    if (navigation_stream_style_prepare_take_head(stream, fingerprint))
+        return true;
     bool built = session->external_resources_enabled
         ? stylesheet_build_context_deferred(
               &stream->blocking_stylesheet, session->budget, document,
@@ -234,21 +306,17 @@ static bool navigation_stream_style_prepare_finish(
         layout_reuse_cache_destroy(stream->preview_layout_reuse);
         stream->preview_layout_reuse = NULL;
     } else if (prepare->from_cache) {
-        stream->blocking_stylesheet_user_context_neutral = true;
+        stream->blocking_stylesheet_user_css =
+            navigation_stylesheet_user_css_hash(session);
         navigation_stream_capture_stylesheet_inputs(stream, document);
     } else {
-        stream->blocking_stylesheet_user_context_neutral = true;
         if (session->user_css_length != 0) {
-            uint64_t context_before_user =
-                stylesheet_parse_context_signature(
-                    &stream->blocking_stylesheet);
             if (!stylesheet_add_user_css(
                     &stream->blocking_stylesheet, session->user_css,
                     session->user_css_length)) return false;
-            stream->blocking_stylesheet_user_context_neutral =
-                stylesheet_parse_context_signature(
-                    &stream->blocking_stylesheet) == context_before_user;
         }
+        stream->blocking_stylesheet_user_css =
+            navigation_stylesheet_user_css_hash(session);
         navigation_stream_capture_stylesheet_inputs(stream, document);
         session->performance.blocking_stylesheet_builds++;
     }

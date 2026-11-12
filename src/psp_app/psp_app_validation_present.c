@@ -1504,6 +1504,14 @@ void psp_load_scroll_note_moved(void)
     psp_load_scroll_moved(&psp_load_scroll, now);
 }
 
+/* A load-relative time in ms, or "never" for 0. */
+static const char *psp_load_ms_text(char *text, size_t size, uint64_t us)
+{
+    if (us == 0) return "never";
+    snprintf(text, size, "%llums", (unsigned long long) (us / 1000u));
+    return text;
+}
+
 void psp_load_experience_report(const char *scope, BrowserEngine *engine,
                                 const BrowserNavigationJobMetrics *metrics)
 {
@@ -1537,14 +1545,30 @@ void psp_load_experience_report(const char *scope, BrowserEngine *engine,
             break;
         used += (size_t) written;
     }
+    /* first-present counts any preview frame, a blank one included;
+       first-content and first-text count the reader's screen only.
+       reading-hint is when the "preview ready" hint showed and cleared. */
+    char content_text[24], text_text[24], hint_text[48];
+    if (metrics->reading_hint_shown_us == 0)
+        snprintf(hint_text, sizeof(hint_text), "none");
+    else
+        snprintf(hint_text, sizeof(hint_text), "%llums-%llums",
+                 (unsigned long long) (metrics->reading_hint_shown_us / 1000u),
+                 (unsigned long long) (metrics->reading_hint_cleared_us / 1000u));
     printf("tilefinch-load-experience: scope=%s status=%d "
-           "first-present=%llums preview-reach=%dpx@%llums "
+           "first-present=%llums first-content=%s first-text=%s "
+           "reading-hint=%s "
+           "preview-reach=%dpx@%llums "
            "loaded=%llums height=%d screens-reached=%s "
            "screens-at-5s=%u screens-at-10s=%u "
            "load-scroll=%u/%u max-move=%lums longest-wait=%lums%s\n",
            scope, (int) metrics->status,
            (unsigned long long) (reach.first_present_us / 1000u),
-           reach.preview_reach_px,
+           psp_load_ms_text(content_text, sizeof(content_text),
+                            metrics->first_content_us),
+           psp_load_ms_text(text_text, sizeof(text_text),
+                            metrics->first_text_us),
+           hint_text, reach.preview_reach_px,
            (unsigned long long) (reach.preview_reach_us / 1000u),
            (unsigned long long) (reach.loaded_us / 1000u),
            reach.page_height_px, reach_text,

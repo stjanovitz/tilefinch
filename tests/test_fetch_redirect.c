@@ -4,12 +4,14 @@
 #include "tilefinch/fetch.h"
 #include "tilefinch/js_runtime.h"
 #include "tilefinch/navigation.h"
+#include "tilefinch/platform.h"
 #include "tilefinch/resources.h"
 #include "tilefinch/session.h"
 #include "tilefinch/style.h"
 #include "tilefinch/user_agent.h"
 
 #include "../src/fetch_redirect_abort.h"
+#include "bootstrap_resident_probe.h"
 
 #include <stdbool.h>
 #include <stdio.h>

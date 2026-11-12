@@ -721,6 +721,12 @@ static inline bool psp_media_refusal_resume_has_room(
  * batching optimisation introduced a tighter bound than the codec has.
  */
 #define PSP_MEDIA_AUDIO_AU_BYTES 4096u
+/* Layer III frames the decoder may refuse in a row before playback fails.
+   A live join opens on frames whose bit reservoir (main_data_begin, up to
+   511 bytes) lies in audio never received: one or two frames at 128
+   kbit/s. Eight covers that at every bitrate without hiding a decoder
+   that never starts (about 0.2 s of audio). */
+#define PSP_MEDIA_MP3_REFUSAL_LIMIT 8u
 #define PSP_MEDIA_AUDIO_STAGING_BYTES \
     (PSP_MEDIA_AUDIO_AU_BYTES * PSP_MEDIA_AUDIO_BATCH_MAXIMUM)
 
@@ -810,6 +816,37 @@ static inline void psp_media_audio_delivery_observe(
 /* A lone compressed unit may wait for its partner only while playback already
    has a safe PCM cushion. The count and age bounds keep end-of-stream and
    network stalls from retaining it indefinitely. */
+/*
+ * PCM-queue room for the access unit the codec worker decodes next.
+ *
+ * An AAC unit writes one block. A Layer III frame fills the block it carries
+ * and may publish two more, so it needs three. The worker refuses a unit that
+ * does not fit (it stays staged), and the end-of-pump flush does not queue a
+ * job for one, which would only come back refused -- every frame, while
+ * paused (MB-04, MB-08).
+ */
+static inline bool psp_media_audio_unit_fits_queue(
+    uint32_t queue_depth, bool mp3)
+{
+    if (queue_depth >= PSP_MEDIA_AUDIO_QUEUE_SLOTS) return false;
+    return PSP_MEDIA_AUDIO_QUEUE_SLOTS - queue_depth >= (mp3 ? 3u : 1u);
+}
+
+/* How many pending units the end-of-pump flush may promote into one batch:
+   no more than the submit path would, and no more than whose blocks the PCM
+   queue can still take -- the room test the submit path applies before it
+   promotes a batch, which the flush used to skip (MB-04). */
+static inline unsigned psp_media_audio_flush_promote_count(
+    unsigned pending, uint32_t queue_depth, unsigned blocks_per_unit)
+{
+    unsigned promote = pending < PSP_MEDIA_AUDIO_BATCH_MAXIMUM
+        ? pending : PSP_MEDIA_AUDIO_BATCH_MAXIMUM;
+    if (queue_depth >= PSP_MEDIA_AUDIO_QUEUE_SLOTS) return 0;
+    uint32_t room = PSP_MEDIA_AUDIO_QUEUE_SLOTS - queue_depth;
+    while (promote > 0u && promote * blocks_per_unit > room) promote--;
+    return promote;
+}
+
 static inline bool psp_media_audio_pending_should_wait(
     unsigned pending, unsigned queue_depth, bool playing, uint32_t age_us)
 {
@@ -1616,6 +1653,73 @@ static inline bool psp_media_audio_prefer_standard_channel(
 }
 
 /*
+ * Releasing an output channel, for both decoder backends.
+ *
+ * A blocking output call can return after queueing its final DMA buffer. On
+ * real firmware the immediate channel release may then report busy -- the
+ * standard channel's SCE_AUDIO_ERROR_OUTPUT_BUSY, or the SRC channel's
+ * queue-busy code -- even though the output thread has already stopped. Such
+ * a release is retried, a poll interval at a time, until wait_limit_us has
+ * passed; "not reserved" means there is nothing left to release. Any other
+ * failure, or busy past the limit, is final: the caller must then keep every
+ * buffer the audio service may still own (quarantine), because a channel
+ * that was never released is never released by anyone.
+ */
+#define PSP_MEDIA_AUDIO_OUTPUT_BUSY UINT32_C(0x80260002)
+#define PSP_MEDIA_AUDIO_SRC_QUEUE_BUSY UINT32_C(0x80268002)
+#define PSP_MEDIA_AUDIO_NOT_RESERVED UINT32_C(0x80260008)
+#define PSP_MEDIA_AUDIO_CHANNEL_POLL_US 2000u
+#define PSP_MEDIA_AUDIO_CHANNEL_DRAIN_WAIT_US 160000u
+
+typedef struct {
+    /* One release attempt; returns the firmware status. */
+    int (*release)(void *context);
+    void *context;
+    uint32_t (*now_us)(void);
+    /* Sleep; a negative result ends the wait. */
+    int (*delay_us)(uint32_t us);
+} PspMediaAudioReleaseOps;
+
+static inline bool psp_media_audio_release_retryable(int status)
+{
+    uint32_t code = (uint32_t) status;
+    return code == PSP_MEDIA_AUDIO_OUTPUT_BUSY
+        || code == PSP_MEDIA_AUDIO_SRC_QUEUE_BUSY;
+}
+
+static inline bool psp_media_audio_release_bounded(
+    const PspMediaAudioReleaseOps *ops, uint32_t wait_limit_us,
+    int *native_status, unsigned *attempts, uint32_t *waited_us)
+{
+    if (native_status != NULL) *native_status = 0;
+    if (attempts != NULL) *attempts = 0;
+    if (waited_us != NULL) *waited_us = 0;
+    if (ops == NULL || ops->release == NULL || ops->now_us == NULL
+        || ops->delay_us == NULL) return false;
+    uint32_t started = ops->now_us();
+    /* Bounded by wait_limit_us; the attempt cap also bounds a clock that
+       does not advance. */
+    for (unsigned attempt = 0;
+         attempt <= wait_limit_us / PSP_MEDIA_AUDIO_CHANNEL_POLL_US + 1u;
+         attempt++) {
+        if (attempts != NULL) (*attempts)++;
+        int status = ops->release(ops->context);
+        if (native_status != NULL) *native_status = status;
+        if (status >= 0 || (uint32_t) status == PSP_MEDIA_AUDIO_NOT_RESERVED)
+            return true;
+        uint32_t elapsed = ops->now_us() - started;
+        if (waited_us != NULL) *waited_us = elapsed;
+        if (!psp_media_audio_release_retryable(status)
+            || elapsed >= wait_limit_us) return false;
+        uint32_t remaining = wait_limit_us - elapsed;
+        uint32_t delay = remaining < PSP_MEDIA_AUDIO_CHANNEL_POLL_US
+            ? remaining : PSP_MEDIA_AUDIO_CHANNEL_POLL_US;
+        if (delay == 0 || ops->delay_us(delay) < 0) return false;
+    }
+    return false;
+}
+
+/*
  * Keep the ordinary playback horizon tight, but let a newly opened H.264
  * stream submit a bounded prefix before audio presentation starts. Main
  * profile commonly delays its first picture until later reference frames
@@ -1636,13 +1740,37 @@ static inline uint64_t psp_media_decode_clock_us(
         ? preroll_clock : clock_us;
 }
 
-/* The initial-picture transaction belongs to the open attempt, not to its
+/* The initial-output transaction belongs to the open attempt, not to its
    eventual play/pause target. Autoplay therefore remains a first-frame wait
-   until a picture exists even though it never arms pause_boundary_pending. */
+   until a picture exists even though it never arms pause_boundary_pending.
+   Audio-only media (page MP3 or AAC, YouTube audio-only) has no picture to
+   wait for: its first output is the first audio block the output accepted.
+   Without that, a radio stream playing for 30 s still counted as waiting
+   for a picture and the first-frame watchdog's absolute cap ended it. And
+   paused, it has nothing to show and decodes nothing, so there is no output
+   to wait for at all: a paused open would only ever time out. */
 static inline bool psp_media_first_frame_pending(
-    bool have_frame, uint64_t first_frame_opened_us)
+    bool have_frame, bool audio_only, bool audio_presented,
+    bool wants_playing, uint64_t first_frame_opened_us)
 {
-    return !have_frame && first_frame_opened_us != 0;
+    bool started = have_frame
+        || (audio_only && (audio_presented || !wants_playing));
+    return !started && first_frame_opened_us != 0;
+}
+
+/* Whether Retry after a first-output timeout plays. Video retries paused so
+   its first picture shows before anything runs; audio has no picture, and a
+   paused listening view would only wait for another press. */
+static inline bool psp_media_first_output_retry_plays(bool audio_only)
+{
+    return audio_only;
+}
+
+/* The player panel's headline when that first output never arrives. */
+static inline const char *psp_media_first_output_timeout_headline(
+    bool audio_only)
+{
+    return audio_only ? "AUDIO DIDN'T START" : "VIDEO FIRST FRAME TIMED OUT";
 }
 
 /* A seek floor freezes the public clock at an arbitrary authored time. If the
@@ -2131,13 +2259,13 @@ static inline unsigned psp_media_admitted_quality(
 static inline bool psp_media_transport_refresh_policy(
     unsigned attempts, bool cancelled,
     long video_http_status, long audio_http_status,
-    uint64_t expires_unix, uint64_t now_unix)
+    uint64_t expires_s, uint64_t now_s)
 {
     if (attempts >= PSP_MEDIA_TRANSPORT_REFRESH_MAXIMUM_ATTEMPTS
         || cancelled) return false;
     if (video_http_status == 403 || audio_http_status == 403) return true;
-    return expires_unix != 0
-        && expires_unix <= now_unix + UINT64_C(30);
+    return expires_s != 0
+        && expires_s <= now_s + UINT64_C(30);
 }
 
 /* Do not let bad replacement URLs create an unbounded resolve loop. Once the

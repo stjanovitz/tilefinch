@@ -9,6 +9,8 @@
 #include "tilefinch/youtube_subtitles.h"
 #include "../src/psp_ui_theme.h"
 #include "../src/tilefinch_test_faults.h"
+#include "tilefinch/psp_input_route.h"
+#include "media_presentation_fence_probe.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -110,6 +112,50 @@ static bool test_page_activation_activity(void)
     CHECK(ui.toast_frames == 180 && strcmp(ui.status, "REQUEST FAILED") == 0);
     CHECK(!psp_ui_finish_page_activation(&ui, receipt));
     CHECK(!psp_ui_finish_page_activation(NULL, receipt));
+    return true;
+}
+
+/* The retained top and bottom bars repaint when any input they draw from
+   changes, and a return to earlier inputs paints the earlier pixels. */
+static bool test_chrome_cache_follows_its_inputs(void)
+{
+    enum { W = 480, H = 272 };
+    static uint16_t base[W * H], changed[W * H];
+    PspUiState ui;
+    psp_ui_init(&ui);
+    ui.screen = PSP_UI_SCREEN_PAGE;
+    ui.chrome_visible = true;
+    ui.toast_frames = 0;
+    psp_ui_set_page(&ui, "Example page", "https://example.org/a", true);
+    psp_ui_set_scroll(&ui, 100, 4000);
+    const PspUiState original = ui;
+    memset(base, 0, sizeof(base));
+    psp_ui_composite(&ui, base, W, H, W);
+    for (unsigned change = 0; change < 6u; change++) {
+        ui = original;
+        switch (change) {
+        case 0:
+            snprintf(ui.url, sizeof(ui.url), "https://other.example/a");
+            break;
+        case 1: ui.secure = !ui.secure; break;
+        case 2: ui.can_go_back = !ui.can_go_back; break;
+        case 3: ui.scroll_y = 2000; break;
+        case 4: ui.page_requests_blocked = 7; break;
+        default:
+            ui.focus_label_valid = true;
+            snprintf(ui.focus_label, sizeof(ui.focus_label), "Search");
+            break;
+        }
+        memset(changed, 0, sizeof(changed));
+        psp_ui_composite(&ui, changed, W, H, W);
+        if (memcmp(base, changed, sizeof(base)) == 0)
+            fprintf(stderr, "chrome input %u did not repaint\n", change);
+        CHECK(memcmp(base, changed, sizeof(base)) != 0);
+        ui = original;
+        memset(changed, 0, sizeof(changed));
+        psp_ui_composite(&ui, changed, W, H, W);
+        CHECK(memcmp(base, changed, sizeof(base)) == 0);
+    }
     return true;
 }
 
@@ -1399,6 +1445,32 @@ static bool test_input_mapping_and_menu(void)
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_update(&ui, &input);
     CHECK(intent.update_primary_requested);
+    /* IS-10: a trial that did not finish starting takes X (TRY AGAIN) and
+       Square (DISCARD) in place of the Versions list. */
+    psp_ui_set_update(&ui, "0.1.0", "UPDATE DID NOT FINISH STARTING", "",
+                      -1, "TRY AGAIN", true, false);
+    psp_ui_set_update_discard(&ui, true);
+    input.pressed = PSP_UI_BUTTON_RELOAD;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(ui.screen == PSP_UI_SCREEN_UPDATE
+          && intent.update_discard_requested
+          && !intent.update_versions_requested
+          && !psp_ui_intent_predispatch_is_complete(&intent));
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(intent.update_primary_requested && !intent.update_discard_requested);
+    /* Any other Update display clears it, so Square is Versions again. */
+    psp_ui_set_update(&ui, "0.1.0", "UPDATE AVAILABLE", "", -1,
+                      "DOWNLOAD", true, false);
+    CHECK(!ui.update_discard_enabled);
+    input.pressed = PSP_UI_BUTTON_RELOAD;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(ui.screen == PSP_UI_SCREEN_UPDATE_VERSIONS
+          && intent.update_versions_requested
+          && !intent.update_discard_requested);
+    input.pressed = PSP_UI_BUTTON_CANCEL;
+    (void) psp_ui_update(&ui, &input);
+    CHECK(ui.screen == PSP_UI_SCREEN_UPDATE);
     input.pressed = PSP_UI_BUTTON_CANCEL;
     intent = psp_ui_update(&ui, &input);
     CHECK(ui.screen == PSP_UI_SCREEN_OPTION_ITEMS);
@@ -3179,7 +3251,7 @@ static bool test_site_storage_screens(void)
         BROWSER_SITE_STORAGE_ASK
     };
     ui.screen = PSP_UI_SCREEN_SITE_CONTROLS;
-    ui.menu_selection = 6;
+    ui.menu_selection = 7;
     ui.site_storage_state = BROWSER_SITE_STORAGE_ASK;
     for (size_t at = 0; at < 3; at++) {
         intent = site_storage_press(&ui, PSP_UI_BUTTON_CONFIRM);
@@ -4289,6 +4361,117 @@ static bool test_media_controls_and_composite(void)
             second_caption_row |= frame[y * WIDTH + x] != 0;
     }
     CHECK(first_caption_row && second_caption_row);
+    /* A right-to-left cue is ordered for display and starts at the right. */
+    static Budget caption_budget;
+    budget_init(&caption_budget, 256u * 1024u);
+    psp_ui_media_set_subtitle_bidi(
+        &caption_media, &caption_budget,
+        "\xd7\x90\xd7\x91 \xd7\x92\xd7\x93"); /* alef bet, gimel dalet */
+    CHECK(caption_media.presentation->subtitle_right_to_left);
+    CHECK(strcmp(caption_media.presentation->subtitle_text,
+                 "\xd7\x93\xd7\x92 \xd7\x91\xd7\x90") == 0);
+    memset(frame, 0, sizeof(frame));
+    psp_ui_media_composite(&caption_media, frame, WIDTH, HEIGHT, WIDTH);
+    bool ink_right = false, ink_left = false;
+    for (int y = 205; y < 252; y++) {
+        for (int x = 38; x < 120; x++) ink_left |= frame[y * WIDTH + x] != 0;
+        for (int x = 400; x < 432; x++) ink_right |= frame[y * WIDTH + x] != 0;
+    }
+    CHECK(ink_right && !ink_left);
+    /* Arabic reaches the painter joined: beh + fatha + teh. */
+    psp_ui_media_set_subtitle_bidi(
+        &caption_media, &caption_budget, "\xd8\xa8\xd9\x8e\xd8\xaa");
+    CHECK(strcmp(caption_media.presentation->subtitle_text,
+                 "\xef\xba\x96\xef\xba\x91\xd9\x8e") == 0);
+    /* The first row holds the start of the sentence, kept right-to-left. */
+    char long_cue[401];
+    memset(long_cue, 0, sizeof(long_cue));
+    for (size_t at = 0; at + 5u < sizeof(long_cue); at += 5u)
+        memcpy(long_cue + at, "\xd7\x90\xd7\x91 ", 5u);
+    memcpy(long_cue, "\xd7\x92\xd7\x93", 4u); /* gimel dalet first */
+    psp_ui_media_set_subtitle_bidi(&caption_media, &caption_budget, long_cue);
+    const char *row_break = strchr(caption_media.presentation->subtitle_text, '\n');
+    CHECK(row_break != NULL
+          && row_break > caption_media.presentation->subtitle_text + 4);
+    CHECK(memcmp(row_break - 4, "\xd7\x93\xd7\x92", 4u) == 0);
+    psp_ui_media_set_subtitle(&caption_media, "Back to Latin");
+    CHECK(!caption_media.presentation->subtitle_right_to_left);
+    CHECK(caption_budget.current == 0);
+
+    /* The title bar's text arrives in display order. Called every frame, it
+       allocates nothing while the title stays the same. */
+    static const char hebrew_title[] = "\xd7\x90\xd7\x91 \xd7\x92\xd7\x93";
+    const char *shown_title = psp_ui_media_shown_title(
+        &caption_media, &caption_budget, hebrew_title);
+    CHECK(strcmp(shown_title, "\xd7\x93\xd7\x92 \xd7\x91\xd7\x90") == 0);
+    size_t title_allocations = caption_budget.allocation_count;
+    CHECK(psp_ui_media_shown_title(&caption_media, &caption_budget, hebrew_title)
+          == shown_title);
+    CHECK(caption_budget.allocation_count == title_allocations);
+    /* Ordinary text passes through and costs no paragraph. */
+    CHECK(strcmp(psp_ui_media_shown_title(&caption_media, &caption_budget, "Plain"),
+                 "Plain") == 0);
+    CHECK(caption_budget.allocation_count == title_allocations);
+    /* A title that does not fit keeps its beginning, on the right, and the dots
+       go where it ends, on the left. The painter never cuts it again. */
+    char long_title[401];
+    memset(long_title, 0, sizeof(long_title));
+    for (size_t at = 0; at + 5u < sizeof(long_title); at += 5u)
+        memcpy(long_title + at, "\xd7\x90\xd7\x91 ", 5u);
+    memcpy(long_title, "\xd7\x92\xd7\x93", 4u); /* gimel dalet first */
+    shown_title = psp_ui_media_shown_title(
+        &caption_media, &caption_budget, long_title);
+    CHECK(strncmp(shown_title, "...", 3u) == 0);
+    CHECK(strlen(shown_title) >= 4u && memcmp(
+              shown_title + strlen(shown_title) - 4u, "\xd7\x93\xd7\x92", 4u) == 0);
+    /* Arabic takes more bytes once shaped, so its long title must not lose its
+       beginning to the buffer's size: beh, then lam-alef-free letters. */
+    char long_arabic[261];
+    memset(long_arabic, 0, sizeof(long_arabic));
+    for (size_t at = 0; at + 2u < sizeof(long_arabic); at += 2u)
+        memcpy(long_arabic + at, "\xd8\xb3", 2u);
+    memcpy(long_arabic, "\xd9\x85", 2u); /* meem first */
+    shown_title = psp_ui_media_shown_title(
+        &caption_media, &caption_budget, long_arabic);
+    CHECK(strncmp(shown_title, "...", 3u) == 0
+          && strlen(shown_title) < PSP_UI_MEDIA_TITLE_CAPACITY);
+    /* The initial meem, FEE3, is the last thing on the row. */
+    CHECK(strlen(shown_title) >= 3u && memcmp(
+              shown_title + strlen(shown_title) - 3u, "\xef\xbb\xa3", 3u) == 0);
+    /* A menu row is prepared once, in place; its ligature's alef draws nothing. */
+    char row_text[96] = "\xd9\x84\xd8\xa7"; /* lam alef */
+    psp_ui_media_prepare_row_text(&caption_media, &caption_budget,
+                                  row_text, sizeof(row_text));
+    CHECK(strcmp(row_text, "\xef\xbb\xbb") == 0);
+    char latin_row[96] = "English (auto)";
+    psp_ui_media_prepare_row_text(&caption_media, &caption_budget,
+                                  latin_row, sizeof(latin_row));
+    CHECK(strcmp(latin_row, "English (auto)") == 0);
+    CHECK(caption_budget.current == 0);
+
+    /* The title bar fits a title by width, not by counting characters, so a
+       title in narrow letters or a proportional language pack is not cut with
+       half of the bar empty. */
+    PspUiMediaState title_media;
+    PspUiMediaPresentation title_presentation;
+    psp_ui_media_init(&title_media);
+    psp_ui_media_bind_presentation(&title_media, &title_presentation);
+    char narrow_title[81];
+    memset(narrow_title, 'i', sizeof(narrow_title) - 1u);
+    narrow_title[sizeof(narrow_title) - 1u] = '\0';
+    psp_ui_media_set(&title_media, true, true, false,
+                     UINT64_C(5000000), UINT64_C(20000000), narrow_title);
+    memset(frame, 0, sizeof(frame));
+    psp_ui_media_composite(&title_media, frame, WIDTH, HEIGHT, WIDTH);
+    int title_right = 0;
+    for (int y = 12; y < 28; y++) {
+        for (int x = 14; x < WIDTH - 46; x++) {
+            uint16_t pixel = frame[y * WIDTH + x];
+            if (pixel != frame[6 * WIDTH + x] && x > title_right)
+                title_right = x;
+        }
+    }
+    CHECK(title_right > WIDTH - 46 - 40);
 
     /* The same rule applies in the other direction. The UI update only makes
        controls visible; Playing becomes Paused when the session consumes the
@@ -6062,6 +6245,74 @@ static bool test_media_overlay_regions_and_the_32_bit_wrapper(void)
     return true;
 }
 
+/* Audio-only media: a listening view that keeps its controls, paints the
+   whole screen (no blank picture area) as one declared region, and carries
+   its station text only while it is audio-only. */
+static bool test_media_audio_listening_view(void)
+{
+    enum { WIDTH = 480, HEIGHT = 272 };
+    PspUiMediaState media;
+    static PspUiMediaPresentation presentation;
+    psp_ui_media_init(&media);
+    psp_ui_media_bind_presentation(&media, &presentation);
+    psp_ui_media_set(&media, true, true, false, UINT64_C(95000000), 0,
+                     "DEEP FM");
+    media.live = true;
+    psp_ui_media_set_audio(&media, true, "Dance", "141.94.96.97:8888", true,
+                           false);
+    CHECK(media.audio_only && !media.reconnecting && media.controls_visible);
+    CHECK(strcmp(presentation.audio_detail, "Dance") == 0
+          && strcmp(presentation.audio_source, "141.94.96.97:8888") == 0
+          && presentation.audio_unencrypted);
+    CHECK(psp_ui_media_state_bytes() <= 288);
+    /* Nothing to uncover, so the controls never time out. */
+    for (unsigned at = 0; at < 100u; at++) psp_ui_media_tick(&media, 1000u);
+    CHECK(media.controls_visible && psp_ui_media_overlay_paints(&media));
+    PspUiOverlayRegion regions[PSP_UI_MEDIA_OVERLAY_REGION_LIMIT];
+    CHECK(psp_ui_media_overlay_regions(&media, NULL, WIDTH, HEIGHT, regions,
+              PSP_UI_MEDIA_OVERLAY_REGION_LIMIT) == 1u);
+    CHECK(regions[0].left == 0 && regions[0].top == 0
+          && regions[0].right == WIDTH && regions[0].bottom == HEIGHT
+          && !regions[0].needs_backdrop);
+    /* Every pixel is the view's own: the stale picture underneath never
+       shows through, whatever the state. */
+    static uint16_t frame[WIDTH * HEIGHT];
+    const uint16_t poison = 0xf81fu;
+    for (unsigned lane = 0; lane < 6u; lane++) {
+        psp_ui_media_set(&media, true, lane != 1u, false,
+                         UINT64_C(95000000),
+                         lane == 3u ? UINT64_C(215000000) : 0, "DEEP FM");
+        media.live = lane != 3u;
+        psp_ui_media_set_audio(&media, true, "Dance", "141.94.96.97:8888",
+                               true, lane == 2u);
+        CHECK(media.reconnecting == (lane == 2u));
+        if (lane == 4u) {
+            psp_ui_media_set_resolving(&media, "DEEP FM");
+            psp_ui_media_set_resolving_progress(&media, "Loading...", 300u);
+        }
+        if (lane == 5u)
+            psp_ui_media_set_error_reason(&media, "AUDIO DIDN'T START",
+                                          "NO PACKETS");
+        for (size_t at = 0; at < WIDTH * HEIGHT; at++) frame[at] = poison;
+        psp_ui_media_composite(&media, frame, WIDTH, HEIGHT, WIDTH);
+        for (size_t at = 0; at < WIDTH * HEIGHT; at++)
+            CHECK(frame[at] != poison);
+        CHECK(media_overlay_regions_cover_every_written_pixel(
+            &media, NULL, WIDTH, HEIGHT, "audio"));
+    }
+    /* Video again: the station text and the always-on controls go. */
+    psp_ui_media_set(&media, true, true, false, 0, UINT64_C(20000000),
+                     "Example video");
+    psp_ui_media_set_audio(&media, false, "Dance", "a.example", true, true);
+    CHECK(!media.audio_only && !media.reconnecting);
+    CHECK(presentation.audio_detail[0] == '\0'
+          && presentation.audio_source[0] == '\0'
+          && !presentation.audio_unencrypted);
+    for (unsigned at = 0; at < 100u; at++) psp_ui_media_tick(&media, 1000u);
+    CHECK(!media.controls_visible);
+    return true;
+}
+
 static bool test_media_buffering_transition_frames_are_stable(void)
 {
     enum { WIDTH = 480, HEIGHT = 272 };
@@ -6644,6 +6895,45 @@ static bool test_media_open_status_dismissed_at_scope_end(void)
     psp_ui_dismiss_status(&ui, NULL);
     psp_ui_dismiss_status(NULL, "VIDEO OPEN STOPPED");
     CHECK(ui.toast_frames == 180);
+    return true;
+}
+
+/* The load preview's reading hint: it takes the place of the load's own
+   announcement, settles while the browser loop keeps it (each frame), never
+   displaces another toast (it waits for it), and is retired exactly when
+   the hint ends; a toast raised since stands. */
+static bool test_preview_hint_toast(void)
+{
+    PspUiState ui;
+    psp_ui_init(&ui);
+    PspUiInput idle = { .analog_x = 128, .analog_y = 128, .elapsed_ms = 16 };
+    psp_ui_show_status(&ui, "LOADING  O CANCEL", 120);
+    psp_ui_set_preview_hint(&ui, true);
+    CHECK(strcmp(ui.status, "PREVIEW READY  R TO READ") == 0
+          && ui.toast_entry_frames != 0 && ui.toast_frames == 600);
+    for (unsigned frame = 0; frame < 30; frame++) {
+        psp_ui_set_preview_hint(&ui, true);
+        (void) psp_ui_update(&ui, &idle);
+    }
+    CHECK(ui.toast_entry_frames == 0 && ui.toast_frames > 590
+          && strcmp(ui.status, "PREVIEW READY  R TO READ") == 0);
+    psp_ui_set_preview_hint(&ui, false);
+    CHECK(ui.toast_frames == 0 && ui.status[0] == '\0');
+    /* Another toast stands while the hint is wanted, and the hint follows
+       once it has gone. */
+    psp_ui_show_status(&ui, "PAGE UPDATE - INPUT QUEUED", 2);
+    psp_ui_set_preview_hint(&ui, true);
+    CHECK(strcmp(ui.status, "PAGE UPDATE - INPUT QUEUED") == 0);
+    for (unsigned frame = 0; frame < 3; frame++)
+        (void) psp_ui_update(&ui, &idle);
+    psp_ui_set_preview_hint(&ui, true);
+    CHECK(strcmp(ui.status, "PREVIEW READY  R TO READ") == 0);
+    /* Ending the hint leaves a toast raised since it. */
+    psp_ui_show_status(&ui, "PAGE LOAD STOPPED", 180);
+    psp_ui_set_preview_hint(&ui, false);
+    CHECK(ui.toast_frames == 180
+          && strcmp(ui.status, "PAGE LOAD STOPPED") == 0);
+    psp_ui_set_preview_hint(NULL, true);
     return true;
 }
 
@@ -8253,8 +8543,673 @@ static bool test_focus_change_shows_hint_bar(void)
     return true;
 }
 
+/* UI-1: the bounded site fields the frontend fills (tab domains, Site data
+   rows, the storage and large-app offers) keep a host's end. A host too
+   long for the field gives way at its start, by whole labels down to the
+   registrable domain, and only then by characters. */
+static bool test_host_label_keeps_the_registrable_end(void)
+{
+    char out[48];
+    static const struct {
+        const char *text;
+        size_t capacity;
+        const char *shown;
+    } cases[] = {
+        {"shop.example.com", 48, "shop.example.com"},
+        {"https://shop.example.com", 48, "https://shop.example.com"},
+        {"shop.example.com/path?q=1", 48, "shop.example.com"},
+        {"accounts.google.com.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+         ".evil.example", 48, "...evil.example"},
+        {"accounts.google.com.aaaaaaaaaa.evil.example", 28,
+         "...aaaaaaaaaa.evil.example"},
+        {"https://accounts.google.com.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+         ".evil.example",
+         48, "https://...evil.example"},
+        {"a.b.c.d.example.co.uk:8443", 24, "...d.example.co.uk:8443"},
+        {"www.example.co.uk", 17, "...example.co.uk"},
+        /* A registrable domain too long by itself loses characters, still
+           from the left. */
+        {"www.averyveryverylongregistrablename.example", 20,
+         "...ablename.example"},
+        /* So does an address, which has no registrable domain. */
+        {"203.0.113.250:8443", 12, "...250:8443"},
+        /* A label DNS would refuse (over 63 bytes) does not hide the
+           registrable domain after it. */
+        {"accounts.google.com.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.evil.example", 48,
+         "...evil.example"},
+        /* An earlier shortening is kept and continued. */
+        {"...aaaaaaaaaaaaaaaaaaaaaaaaaaaaa.evil.example", 24,
+         "...evil.example"}
+    };
+    for (size_t at = 0; at < sizeof(cases) / sizeof(cases[0]); at++) {
+        psp_ui_host_label(cases[at].text, out, cases[at].capacity);
+        if (strcmp(out, cases[at].shown) != 0) {
+            fprintf(stderr, "host label %s in %zu bytes: '%s', want '%s'\n",
+                    cases[at].text, cases[at].capacity, out,
+                    cases[at].shown);
+            return false;
+        }
+    }
+    PspUiState ui;
+    psp_ui_init(&ui);
+#define PAD40 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    psp_ui_show_heavy_offer(
+        &ui, "accounts.google.com." PAD40 "." PAD40 ".evil.example",
+        4096u, 1000u);
+    CHECK(strcmp(ui.heavy_offer_site, "..." PAD40 ".evil.example") == 0);
+#undef PAD40
+    return true;
+}
+
+/* A copy of the player state drawn by the loading supervisor still points
+   at the presentation (AU-05): every setter stores what that copy draws
+   under the fence, shapes text before taking it, and leaves it alone when
+   nothing changed. */
+static bool test_presentation_setters_store_under_fence(void)
+{
+    static Budget budget;
+    budget_init(&budget, 256u * 1024u);
+    PspUiMediaState media;
+    static PspUiMediaPresentation presentation;
+    psp_ui_media_init(&media);
+    psp_ui_media_bind_presentation(&media, &presentation);
+    psp_ui_media_set(&media, true, true, false, 0, UINT64_C(60000000),
+                     "Fence fixture");
+    media_fence_probe_install(&presentation, &budget);
+
+    PspUiMediaTrack audio[2] = {{"English"}, {"Deutsch"}};
+    PspUiMediaTrack captions[1] = {{"English (auto)"}};
+    psp_ui_media_set_tracks(&media, audio, 2, 1, captions, 1, 0);
+    CHECK(media_fence_probe.acquires == 1u && media_fence_probe_clean());
+    CHECK(presentation.audio_track_count == 2u
+          && strcmp(presentation.audio_tracks[1].label, "Deutsch") == 0);
+
+    MediaChapter chapters[2] = {{0, "Intro"}, {90, "Middle"}};
+    psp_ui_media_set_chapters(&media, chapters, 2);
+    CHECK(media_fence_probe.acquires == 2u && media_fence_probe_clean());
+    CHECK(presentation.chapter_count == 2u);
+
+    psp_ui_media_set_subtitle(&media, "A plain cue");
+    CHECK(media_fence_probe.acquires == 3u && media_fence_probe_clean());
+
+    /* A right-to-left cue is shaped (allocates) before the fence. */
+    size_t allocations = budget.allocation_count;
+    psp_ui_media_set_subtitle_bidi(&media, &budget,
+                                   "\xd7\x90\xd7\x91 \xd7\x92\xd7\x93");
+    CHECK(budget.allocation_count > allocations);
+    CHECK(media_fence_probe.acquires == 4u && media_fence_probe_clean());
+    CHECK(presentation.subtitle_right_to_left
+          && strcmp(presentation.subtitle_text,
+                    "\xd7\x93\xd7\x92 \xd7\x91\xd7\x90") == 0);
+    psp_ui_media_set_subtitle_bidi(&media, &budget, "Latin again");
+    CHECK(media_fence_probe.acquires == 5u && media_fence_probe_clean());
+    CHECK(!presentation.subtitle_right_to_left
+          && strcmp(presentation.subtitle_text, "Latin again") == 0);
+
+    static const char hebrew_title[] = "\xd7\x90\xd7\x91 \xd7\x92\xd7\x93";
+    allocations = budget.allocation_count;
+    const char *shown = psp_ui_media_shown_title(&media, &budget,
+                                                 hebrew_title);
+    CHECK(budget.allocation_count > allocations);
+    CHECK(media_fence_probe.acquires == 6u && media_fence_probe_clean());
+    CHECK(strcmp(shown, "\xd7\x93\xd7\x92 \xd7\x91\xd7\x90") == 0);
+    /* Every frame asks again; an unchanged title takes no fence. */
+    CHECK(psp_ui_media_shown_title(&media, &budget, hebrew_title) == shown);
+    CHECK(media_fence_probe.acquires == 6u);
+
+    psp_ui_media_set_audio(&media, true, "Jazz", "radio.example:8000", true,
+                           false);
+    CHECK(media_fence_probe.acquires == 7u && media_fence_probe_clean());
+    CHECK(strcmp(presentation.audio_source, "radio.example:8000") == 0
+          && presentation.audio_unencrypted);
+    /* Called every frame: the same details take no fence. */
+    psp_ui_media_set_audio(&media, true, "Jazz", "radio.example:8000", true,
+                           false);
+    CHECK(media_fence_probe.acquires == 7u && media_fence_probe_clean());
+    CHECK(budget.current == 0);
+    return true;
+}
+
+/* The loading supervisor's player copy borrows the owner's presentation
+   and never writes it (AU-05): a press that would moves the copy onto its
+   own presentation, which shows the press at once, and the owner, applying
+   the same presses later, reaches the same menu. */
+static bool test_supervisor_copy_never_writes_presentation(void)
+{
+    PspUiMediaState owner;
+    static PspUiMediaPresentation presentation, before, own;
+    psp_ui_media_init(&owner);
+    psp_ui_media_bind_presentation(&owner, &presentation);
+    psp_ui_media_set(&owner, true, true, false, UINT64_C(5000000),
+                     UINT64_C(60000000), "Detached fixture");
+    const PspUiMediaTrack audio[] = {{"English"}, {"Deutsch"}};
+    const PspUiMediaTrack captions[] = {{"English (auto)"}};
+    psp_ui_media_set_tracks(&owner, audio, 2u, 0, captions, 1u, 0);
+    PspUiMediaState copy = owner;
+    memcpy(&before, &presentation, sizeof(before));
+    PspUiMediaPressQueue presses = {0};
+    PspUiInput input = {.analog_x = 128, .analog_y = 128, .elapsed_ms = 16};
+    bool detached = true;
+
+    /* Play/pause leaves the presentation alone: the copy keeps borrowing. */
+    input.pressed = input.held = PSP_UI_BUTTON_CONFIRM;
+    PspUiMediaIntent intent = psp_ui_media_update_detached(
+        &copy, &own, &input, &detached);
+    CHECK(intent.action == PSP_UI_MEDIA_ACTION_PLAY_PAUSE && !detached
+          && copy.presentation == &presentation);
+
+    /* Triangle opens the menu on the copy's own presentation. */
+    static const uint32_t sequence[] = {
+        PSP_UI_BUTTON_TOOLBAR, PSP_UI_BUTTON_DOWN, PSP_UI_BUTTON_CONFIRM,
+        PSP_UI_BUTTON_RELOAD
+    };
+    PspUiMediaIntent last = {0};
+    for (size_t at = 0; at < sizeof(sequence) / sizeof(sequence[0]); at++) {
+        input.pressed = input.held = sequence[at];
+        intent = psp_ui_media_update_detached(&copy, &own, &input, &detached);
+        CHECK(detached && copy.presentation == &own);
+        CHECK(psp_ui_media_press_queue_push(&presses, sequence[at]));
+        if (intent.action != PSP_UI_MEDIA_ACTION_NONE) last = intent;
+        if (at == 0) CHECK(own.track_menu_open && !presentation.track_menu_open);
+        if (at == 1) CHECK(own.track_menu_selection == 1u);
+        if (at == 2) CHECK(intent.action
+                               == PSP_UI_MEDIA_ACTION_SELECT_AUDIO_TRACK
+                           && intent.track_index == 1u
+                           && !own.track_menu_open);
+    }
+    /* Square turned the captions off and remembered the track. */
+    CHECK(last.action == PSP_UI_MEDIA_ACTION_SELECT_SUBTITLE_TRACK
+          && last.track_index == UINT8_MAX
+          && strcmp(own.last_subtitle_label, "English (auto)") == 0);
+    CHECK(memcmp(&presentation, &before, sizeof(before)) == 0);
+
+    /* The owner applies the same presses and agrees with what was shown. */
+    PspUiMediaMailbox mailbox = {0};
+    psp_ui_media_press_queue_settle(&presses, &owner, &mailbox);
+    CHECK(presses.count == 0u);
+    CHECK(mailbox.command.action == last.action
+          && mailbox.command.track_index == last.track_index);
+    CHECK(presentation.track_menu_open == own.track_menu_open
+          && presentation.track_menu_tab == own.track_menu_tab
+          && presentation.track_menu_selection == own.track_menu_selection
+          && presentation.automatic_next == own.automatic_next
+          && strcmp(presentation.last_subtitle_label,
+                    own.last_subtitle_label) == 0);
+
+    /* A full queue refuses the press, so the copy must not take it. */
+    for (unsigned at = 0; at < PSP_UI_MEDIA_PRESS_LIMIT; at++)
+        CHECK(psp_ui_media_press_queue_push(&presses, PSP_UI_BUTTON_DOWN));
+    CHECK(!psp_ui_media_press_queue_push(&presses, PSP_UI_BUTTON_DOWN));
+    return true;
+}
+
+/* One press during a supervised media open, as both threads take it: the
+   supervisor's tick (route MEDIA) shows it on its copy; the browser loop's
+   next frame samples the same pad, where the button is still down and new
+   against that loop's previous buttons, and keeps the edge only when
+   psp_input_loop_edges gives it the pad (psp_script_main.c); the copy's
+   refresh applies the queue to the owner and takes the copy afresh. Every
+   action the owner would execute is counted. */
+static bool media_open_frame(
+    PspUiMediaState *owner, PspUiMediaState *copy,
+    PspUiMediaPresentation *own, PspUiMediaPressQueue *queue,
+    uint32_t pressed, PspUiMediaState *shown, unsigned *actions,
+    PspUiMediaIntent *last)
+{
+    PspUiMediaIntent intent = {0};
+    CHECK(psp_ui_media_supervisor_press(copy, own, queue, pressed, &intent));
+    CHECK(intent.visual_changed);
+    *shown = *copy;
+    PspUiInput loop = {.held = pressed, .pressed = pressed,
+                       .analog_x = 128, .analog_y = 128, .elapsed_ms = 16};
+    if (psp_input_loop_edges(true, false, true) != PSP_INPUT_EDGES_PAD)
+        loop.pressed = 0;
+    intent = psp_ui_media_update(owner, &loop);
+    if (intent.action != PSP_UI_MEDIA_ACTION_NONE) {
+        (*actions)++;
+        *last = intent;
+    }
+    PspUiMediaMailbox mailbox = {0};
+    psp_ui_media_press_queue_settle(queue, owner, &mailbox);
+    intent = mailbox.command.action != PSP_UI_MEDIA_ACTION_NONE
+        ? mailbox.command : mailbox.timeline;
+    if (intent.action != PSP_UI_MEDIA_ACTION_NONE) {
+        (*actions)++;
+        *last = intent;
+    }
+    CHECK(queue->count == 0u);
+    *copy = *owner;
+    return true;
+}
+
+/* The copy keeps, after its refresh, what it showed for the press. */
+static bool media_copy_kept(const PspUiMediaState *shown,
+                            const PspUiMediaState *copy)
+{
+    const PspUiMediaPresentation *a = shown->presentation;
+    const PspUiMediaPresentation *b = copy->presentation;
+    return shown->controls_visible == copy->controls_visible
+        && a->track_menu_open == b->track_menu_open
+        && a->track_menu_tab == b->track_menu_tab
+        && a->track_menu_selection == b->track_menu_selection;
+}
+
+/* During a media open the loading supervisor and the browser loop both
+   sample the pad. Each press must reach the owner's player once: one Down
+   in the queue menu while the next entry opens, or in the track menu while
+   a long rewind reopens the decoder, moves one row, and the Cross after it
+   chooses that row once. A press that does not detach the copy (one that
+   only shows the controls) still reaches the owner, so the refreshed copy
+   keeps showing it. */
+static bool test_media_open_press_has_one_owner(void)
+{
+    static PspUiMediaPresentation p, own;
+    PspUiMediaState owner;
+    psp_ui_media_init(&owner);
+    psp_ui_media_bind_presentation(&owner, &p);
+    psp_ui_media_set(&owner, true, false, false, UINT64_C(0),
+                     UINT64_C(60000000), "Queue entry");
+    psp_ui_media_set_resolving(&owner, "Opening video");
+    p.queue_active = p.queue_next = true;
+    p.queue_count = 6;
+    p.queue_position = 1;
+    PspUiMediaState copy = owner, shown;
+    PspUiMediaPressQueue queue = {0};
+    PspUiMediaIntent last = {0};
+    unsigned actions = 0;
+
+    /* Triangle opens the queue menu at the first upcoming entry. */
+    CHECK(media_open_frame(&owner, &copy, &own, &queue,
+                           PSP_UI_BUTTON_TOOLBAR, &shown, &actions, &last));
+    CHECK(p.track_menu_open && p.track_menu_tab == PSP_UI_MEDIA_TAB_QUEUE);
+    CHECK(media_copy_kept(&shown, &copy));
+    unsigned row = p.track_menu_selection;
+    CHECK(row == PSP_UI_MEDIA_QUEUE_CONTROL_ROWS + 1u);
+
+    /* One Down: one row, on the owner and on what the copy shows. */
+    CHECK(media_open_frame(&owner, &copy, &own, &queue,
+                           PSP_UI_BUTTON_DOWN, &shown, &actions, &last));
+    CHECK(shown.presentation->track_menu_selection == row + 1u);
+    CHECK(p.track_menu_selection == row + 1u);
+    CHECK(media_copy_kept(&shown, &copy));
+
+    /* Cross chooses that entry, once. */
+    CHECK(actions == 0u);
+    CHECK(media_open_frame(&owner, &copy, &own, &queue,
+                           PSP_UI_BUTTON_CONFIRM, &shown, &actions, &last));
+    CHECK(actions == 1u && last.action == PSP_UI_MEDIA_ACTION_QUEUE_SELECT
+          && last.track_index
+                 == row + 1u - PSP_UI_MEDIA_QUEUE_CONTROL_ROWS);
+
+    /* A long rewind reopens the decoder: the track menu stays usable. */
+    static PspUiMediaPresentation rp, rown;
+    PspUiMediaState rewind;
+    psp_ui_media_init(&rewind);
+    psp_ui_media_bind_presentation(&rewind, &rp);
+    psp_ui_media_set(&rewind, true, true, false, UINT64_C(95000000),
+                     UINT64_C(600000000), "Rewind");
+    const PspUiMediaTrack audio[] = {{"English"}, {"Deutsch"}, {"Español"}};
+    psp_ui_media_set_tracks(&rewind, audio, 3u, 0, NULL, 0u, 0);
+    psp_ui_media_set_resolving(&rewind, "Seeking video");
+    psp_ui_media_commit_seek(&rewind, UINT64_C(20000000));
+    CHECK(rewind.resolving && rewind.seek_in_progress);
+    PspUiMediaState rcopy = rewind;
+    actions = 0;
+    CHECK(media_open_frame(&rewind, &rcopy, &rown, &queue,
+                           PSP_UI_BUTTON_TOOLBAR, &shown, &actions, &last));
+    CHECK(rp.track_menu_open && rp.track_menu_tab == PSP_UI_MEDIA_TAB_AUDIO
+          && rp.track_menu_selection == 0u);
+    CHECK(media_open_frame(&rewind, &rcopy, &rown, &queue,
+                           PSP_UI_BUTTON_DOWN, &shown, &actions, &last));
+    CHECK(shown.presentation->track_menu_selection == 1u);
+    CHECK(rp.track_menu_selection == 1u);
+    CHECK(media_copy_kept(&shown, &rcopy));
+    CHECK(media_open_frame(&rewind, &rcopy, &rown, &queue,
+                           PSP_UI_BUTTON_CONFIRM, &shown, &actions, &last));
+    CHECK(actions == 1u
+          && last.action == PSP_UI_MEDIA_ACTION_SELECT_AUDIO_TRACK
+          && last.track_index == 1u);
+
+    /* Up with the menu closed only shows the controls: the copy keeps
+       borrowing, and the owner still takes the press. */
+    rewind.controls_visible = false;
+    rewind.controls_enabled = false;
+    rcopy = rewind;
+    CHECK(!rp.track_menu_open);
+    CHECK(media_open_frame(&rewind, &rcopy, &rown, &queue,
+                           PSP_UI_BUTTON_UP, &shown, &actions, &last));
+    CHECK(shown.presentation == &rp && shown.controls_visible);
+    CHECK(rewind.controls_visible && media_copy_kept(&shown, &rcopy));
+    CHECK(actions == 1u);
+
+    /* The loop's own pad edges are back once no supervised media scope
+       holds them. */
+    CHECK(psp_input_loop_edges(false, false, true) == PSP_INPUT_EDGES_PAD);
+    CHECK(psp_input_loop_edges(true, false, false) == PSP_INPUT_EDGES_PAD);
+    CHECK(psp_input_loop_edges(true, true, true)
+          == PSP_INPUT_EDGES_FORWARDED);
+
+    /* A full queue: the copy takes no press, so the two still agree. */
+    for (unsigned at = 0; at < PSP_UI_MEDIA_PRESS_LIMIT; at++)
+        CHECK(psp_ui_media_press_queue_push(&queue, PSP_UI_BUTTON_DOWN));
+    PspUiMediaState before = rcopy;
+    PspUiMediaIntent refused = {0};
+    CHECK(!psp_ui_media_supervisor_press(&rcopy, &rown, &queue,
+                                         PSP_UI_BUTTON_TOOLBAR, &refused));
+    CHECK(memcmp(&before, &rcopy, sizeof(before)) == 0
+          && !refused.visual_changed);
+    return true;
+}
+
+/* One frame of a media open with the owner's mailbox, as
+   psp_work_cooperate_refresh_media keeps it: the supervisor's copy takes
+   each press, the refresh settles the queue into the mailbox and hands the
+   timeline action to the session, and the copy is taken afresh. `presses`
+   all arrive inside one blocking primitive (one refresh). */
+static bool media_open_mailbox_frame(
+    PspUiMediaState *owner, PspUiMediaState *copy,
+    PspUiMediaPresentation *own, PspUiMediaPressQueue *queue,
+    PspUiMediaMailbox *mailbox, const uint32_t *presses, unsigned count,
+    PspUiMediaIntent *handed)
+{
+    for (unsigned at = 0; at < count; at++) {
+        PspUiMediaIntent shown = {0};
+        CHECK(psp_ui_media_supervisor_press(copy, own, queue, presses[at],
+                                            &shown));
+    }
+    psp_ui_media_press_queue_settle(queue, owner, mailbox);
+    CHECK(queue->count == 0u);
+    if (psp_ui_media_timeline_action(mailbox->timeline.action)) {
+        *handed = mailbox->timeline;
+        mailbox->timeline = (PspUiMediaIntent) {0};
+    }
+    *copy = *owner;
+    return true;
+}
+
+/* Review finding MS-2: during a media open the queue, track and other
+   commands wait for the scope's end, while timeline presses are handed to
+   the session at each refresh. With one mailbox entry, a timeline press
+   after a command (Right after choosing a track during a long rewind's
+   reopen) replaced the waiting command, which was then never carried out;
+   so did one in the same batch. The command must reach the scope's end,
+   and the timeline press must still be handed over. */
+static bool test_media_open_command_outlasts_later_presses(void)
+{
+    const PspUiMediaTrack audio[] = {{"English"}, {"Deutsch"}, {"Español"}};
+    for (unsigned batched = 0; batched < 2u; batched++) {
+        static PspUiMediaPresentation p, own;
+        memset(&own, 0, sizeof(own));
+        PspUiMediaState owner;
+        psp_ui_media_init(&owner);
+        psp_ui_media_bind_presentation(&owner, &p);
+        psp_ui_media_set(&owner, true, true, false, UINT64_C(95000000),
+                         UINT64_C(600000000), "Rewind");
+        psp_ui_media_set_tracks(&owner, audio, 3u, 0, NULL, 0u, 0);
+        psp_ui_media_set_resolving(&owner, "Seeking video");
+        psp_ui_media_commit_seek(&owner, UINT64_C(20000000));
+        psp_ui_media_set_continuation(&owner, UINT64_C(20000000),
+                                      UINT64_C(600000000), true);
+        CHECK(owner.resolving && owner.seek_in_progress
+              && owner.seek_enabled);
+        PspUiMediaState copy = owner;
+        PspUiMediaPressQueue queue = {0};
+        PspUiMediaMailbox mailbox = {0};
+        PspUiMediaIntent handed = {0};
+        /* Triangle, Down, Cross: the second audio track; then Right. */
+        const uint32_t presses[] = {
+            PSP_UI_BUTTON_TOOLBAR, PSP_UI_BUTTON_DOWN,
+            PSP_UI_BUTTON_CONFIRM, PSP_UI_BUTTON_RIGHT
+        };
+        if (batched) {
+            CHECK(media_open_mailbox_frame(&owner, &copy, &own, &queue,
+                                           &mailbox, presses, 4u, &handed));
+        } else {
+            for (unsigned at = 0; at < 4u; at++)
+                CHECK(media_open_mailbox_frame(&owner, &copy, &own, &queue,
+                                               &mailbox, &presses[at], 1u,
+                                               &handed));
+        }
+        printf("media open, %s: handed %d at %llu us, waiting %d track %u\n",
+               batched ? "one batch" : "one refresh each",
+               (int) handed.action, (unsigned long long) handed.seek_time_us,
+               (int) mailbox.command.action,
+               (unsigned) mailbox.command.track_index);
+        /* Right previewed 10 s on, and the session got it at the refresh. */
+        CHECK(handed.action == PSP_UI_MEDIA_ACTION_PREVIEW_SEEK
+              && handed.seek_time_us == UINT64_C(30000000));
+        /* The track choice still waits for the end of the open. */
+        CHECK(mailbox.command.action
+                  == PSP_UI_MEDIA_ACTION_SELECT_AUDIO_TRACK
+              && mailbox.command.track_index == 1u);
+        CHECK(mailbox.timeline.action == PSP_UI_MEDIA_ACTION_NONE);
+    }
+    return true;
+}
+
+/* What each open-phase event does to the owner on the browser thread
+   (psp_media_apply_active_projection) while the next queue entry, a live
+   HLS stream, opens: the lifecycle is projected again, the live window
+   gets no timeline, and the loading progress moves. The supervisor's copy
+   was taken at the refresh before it, so its next press lands on a copy
+   that is one projection behind the owner. */
+static void media_open_live_reproject(PspUiMediaState *owner,
+                                      unsigned progress)
+{
+    const PspMediaUiProjection opening = {
+        .mode = PSP_MEDIA_UI_OPENING, .visible = true, .show_progress = true
+    };
+    psp_ui_media_apply_projection(owner, &opening);
+    owner->live = true;
+    owner->seek_enabled = false;
+    psp_ui_media_set_resolving_progress(owner, "Loading...", progress);
+}
+
+/* Polish T9: the queue menu during a live entry's open, with the owner
+   projected again between every two presses (each refresh lands between
+   the supervisor's presses). Each press reaches the owner once and
+   agrees with what the copy showed; the queue choice waits for the end of
+   the open; and the timeline presses that follow it, which a live window
+   cannot take, neither reach the session nor replace that choice. */
+static bool test_media_open_live_entry_reprojected_between_presses(void)
+{
+    static PspUiMediaPresentation p, own;
+    memset(&own, 0, sizeof(own));
+    PspUiMediaState owner;
+    psp_ui_media_init(&owner);
+    psp_ui_media_bind_presentation(&owner, &p);
+    psp_ui_media_set(&owner, true, false, false, 0, 0, "Live entry");
+    psp_ui_media_set_resolving(&owner, "Live entry");
+    p.queue_active = p.queue_next = true;
+    p.queue_count = 6;
+    p.queue_position = 1;
+    PspUiMediaState copy = owner, shown;
+    PspUiMediaPressQueue queue = {0};
+    PspUiMediaMailbox mailbox = {0};
+    PspUiMediaIntent handed = {0};
+    unsigned progress = 100u;
+
+    /* Triangle opens the queue menu at the first upcoming entry. */
+    const uint32_t triangle = PSP_UI_BUTTON_TOOLBAR;
+    CHECK(media_open_mailbox_frame(&owner, &copy, &own, &queue, &mailbox,
+                                   &triangle, 1u, &handed));
+    media_open_live_reproject(&owner, progress += 100u);
+    CHECK(p.track_menu_open && p.track_menu_tab == PSP_UI_MEDIA_TAB_QUEUE);
+    unsigned row = p.track_menu_selection;
+    CHECK(row == PSP_UI_MEDIA_QUEUE_CONTROL_ROWS + 1u);
+
+    /* Down, then Right (the menu has no use for it): one row on both, as
+       the loop's own edges stay off for the supervised scope. */
+    const uint32_t moves[] = {PSP_UI_BUTTON_DOWN, PSP_UI_BUTTON_RIGHT};
+    for (unsigned at = 0; at < 2u; at++) {
+        PspUiMediaIntent seen = {0};
+        CHECK(psp_ui_media_supervisor_press(&copy, &own, &queue, moves[at],
+                                            &seen));
+        shown = copy;
+        PspUiInput loop = {.held = moves[at], .pressed = moves[at],
+                           .analog_x = 128, .analog_y = 128,
+                           .elapsed_ms = 16};
+        if (psp_input_loop_edges(true, false, true) != PSP_INPUT_EDGES_PAD)
+            loop.pressed = 0;
+        CHECK(psp_ui_media_update(&owner, &loop).action
+              == PSP_UI_MEDIA_ACTION_NONE);
+        CHECK(media_open_mailbox_frame(&owner, &copy, &own, &queue,
+                                       &mailbox, NULL, 0u, &handed));
+        media_open_live_reproject(&owner, progress += 100u);
+        CHECK(media_copy_kept(&shown, &copy));
+        CHECK(p.track_menu_selection == row + 1u);
+    }
+
+    /* Cross chooses that entry; it waits for the end of the open. */
+    const uint32_t cross = PSP_UI_BUTTON_CONFIRM;
+    CHECK(media_open_mailbox_frame(&owner, &copy, &own, &queue, &mailbox,
+                                   &cross, 1u, &handed));
+    media_open_live_reproject(&owner, progress += 100u);
+    CHECK(!p.track_menu_open);
+    CHECK(mailbox.command.action == PSP_UI_MEDIA_ACTION_QUEUE_SELECT
+          && mailbox.command.track_index
+                 == row + 1u - PSP_UI_MEDIA_QUEUE_CONTROL_ROWS);
+
+    /* Timeline presses after it (Right, Left, Cross), one refresh each and
+       then in one batch: the live window has no timeline and nothing
+       plays yet, so none is handed to the session, and the queue choice
+       still waits. (R and L here are Next and Previous, commands of
+       their own: the newest command wins.) */
+    const uint32_t timeline[] = {
+        PSP_UI_BUTTON_RIGHT, PSP_UI_BUTTON_LEFT, PSP_UI_BUTTON_CONFIRM
+    };
+    for (unsigned at = 0; at < 3u; at++) {
+        CHECK(media_open_mailbox_frame(&owner, &copy, &own, &queue,
+                                       &mailbox, &timeline[at], 1u,
+                                       &handed));
+        media_open_live_reproject(&owner, progress += 100u);
+    }
+    CHECK(media_open_mailbox_frame(&owner, &copy, &own, &queue, &mailbox,
+                                   timeline, 3u, &handed));
+    printf("live entry open: handed %d, waiting %d entry %u, row %u\n",
+           (int) handed.action, (int) mailbox.command.action,
+           (unsigned) mailbox.command.track_index, row + 1u);
+    CHECK(handed.action == PSP_UI_MEDIA_ACTION_NONE);
+    CHECK(mailbox.timeline.action == PSP_UI_MEDIA_ACTION_NONE);
+    CHECK(mailbox.command.action == PSP_UI_MEDIA_ACTION_QUEUE_SELECT
+          && mailbox.command.track_index
+                 == row + 1u - PSP_UI_MEDIA_QUEUE_CONTROL_ROWS);
+    CHECK(owner.live && !owner.seek_preview_active);
+    return true;
+}
+
+/* What psp_media_open does to the owner when the playback pipeline is
+   created (stage=open-complete): the open's last loading phase, with its
+   duration and progress. */
+static void media_open_complete(PspUiMediaState *owner, const char *title,
+                                uint64_t duration_us)
+{
+    psp_ui_media_continue_resolving(owner, title);
+    owner->duration_us = duration_us;
+    psp_ui_media_set_resolving_progress(owner, "Loading...", 920u);
+}
+
+/* User decision Q9 (2026-11-11): a track or queue menu open when the media
+   open completes stays open, on its tab and highlighted row, so a Cross
+   meant for that row picks it. Before, the open-complete phase closed the
+   menu like a fresh open, and the Cross that followed reached the
+   timeline as play/pause. Two opens: the next queue entry, and a long
+   rewind's reopen with the audio-track menu. */
+static bool test_media_open_complete_keeps_open_menu(void)
+{
+    const PspUiMediaTrack audio[] = {{"English"}, {"Deutsch"}, {"Español"}};
+    for (unsigned rewind = 0; rewind < 2u; rewind++) {
+        static PspUiMediaPresentation p, own;
+        memset(&p, 0, sizeof(p));
+        memset(&own, 0, sizeof(own));
+        PspUiMediaState owner;
+        psp_ui_media_init(&owner);
+        psp_ui_media_bind_presentation(&owner, &p);
+        if (rewind) {
+            psp_ui_media_set(&owner, true, true, false, UINT64_C(95000000),
+                             UINT64_C(600000000), "Rewind");
+            psp_ui_media_set_tracks(&owner, audio, 3u, 0, NULL, 0u, 0);
+            psp_ui_media_set_resolving(&owner, "Seeking video");
+            psp_ui_media_commit_seek(&owner, UINT64_C(20000000));
+        } else {
+            psp_ui_media_set(&owner, true, false, false, 0, 0, "Entry");
+            psp_ui_media_set_resolving(&owner, "Entry");
+            p.queue_active = p.queue_next = true;
+            p.queue_count = 6;
+            p.queue_position = 1;
+        }
+        PspUiMediaState copy = owner;
+        PspUiMediaPressQueue queue = {0};
+        PspUiMediaMailbox mailbox = {0};
+        PspUiMediaIntent handed = {0};
+        /* Triangle opens the menu; Down highlights the next row. */
+        const uint32_t moves[] = {PSP_UI_BUTTON_TOOLBAR, PSP_UI_BUTTON_DOWN};
+        CHECK(media_open_mailbox_frame(&owner, &copy, &own, &queue,
+                                       &mailbox, moves, 2u, &handed));
+        unsigned tab = rewind ? PSP_UI_MEDIA_TAB_AUDIO : PSP_UI_MEDIA_TAB_QUEUE;
+        unsigned row = rewind ? 1u : PSP_UI_MEDIA_QUEUE_CONTROL_ROWS + 2u;
+        CHECK(p.track_menu_open && p.track_menu_tab == tab
+              && p.track_menu_selection == row);
+
+        /* The pipeline is created; the next refresh copies the owner. */
+        media_open_complete(&owner, rewind ? "Rewind" : "Entry",
+                            UINT64_C(600000000));
+        if (rewind) psp_ui_media_commit_seek(&owner, UINT64_C(20000000));
+        copy = owner;
+        printf("media open complete, %s: menu %s tab %u row %u\n",
+               rewind ? "rewind" : "queue entry",
+               p.track_menu_open ? "open" : "closed",
+               (unsigned) p.track_menu_tab,
+               (unsigned) p.track_menu_selection);
+        CHECK(owner.resolving && p.track_menu_open
+              && p.track_menu_tab == tab && p.track_menu_selection == row);
+
+        /* Cross picks the highlighted row; it waits for the end of the
+           open, and nothing reaches the timeline. */
+        const uint32_t cross = PSP_UI_BUTTON_CONFIRM;
+        CHECK(media_open_mailbox_frame(&owner, &copy, &own, &queue,
+                                       &mailbox, &cross, 1u, &handed));
+        printf("media open complete, %s: Cross gave command %d index %u, "
+               "handed %d\n", rewind ? "rewind" : "queue entry",
+               (int) mailbox.command.action,
+               (unsigned) mailbox.command.track_index, (int) handed.action);
+        CHECK(handed.action == PSP_UI_MEDIA_ACTION_NONE
+              && mailbox.timeline.action == PSP_UI_MEDIA_ACTION_NONE);
+        if (rewind)
+            CHECK(mailbox.command.action
+                      == PSP_UI_MEDIA_ACTION_SELECT_AUDIO_TRACK
+                  && mailbox.command.track_index == 1u);
+        else
+            CHECK(mailbox.command.action == PSP_UI_MEDIA_ACTION_QUEUE_SELECT
+                  && mailbox.command.track_index
+                         == row - PSP_UI_MEDIA_QUEUE_CONTROL_ROWS);
+        CHECK(!p.track_menu_open);
+
+        /* A fresh open still closes the old pipeline's menu. */
+        psp_ui_media_set(&owner, true, true, false, 0, UINT64_C(600000000),
+                         "Playing");
+        PspUiInput triangle = {.pressed = PSP_UI_BUTTON_TOOLBAR,
+                               .held = PSP_UI_BUTTON_TOOLBAR,
+                               .analog_x = 128, .analog_y = 128,
+                               .elapsed_ms = 16};
+        (void) psp_ui_media_update(&owner, &triangle);
+        CHECK(p.track_menu_open);
+        psp_ui_media_set_resolving(&owner, "Next");
+        CHECK(!p.track_menu_open);
+    }
+    return true;
+}
+
 int main(void)
 {
+    if (!test_media_open_press_has_one_owner()) return 1;
+    if (!test_media_open_command_outlasts_later_presses()) return 1;
+    if (!test_media_open_live_entry_reprojected_between_presses()) return 1;
+    if (!test_media_open_complete_keeps_open_menu()) return 1;
+    if (!test_supervisor_copy_never_writes_presentation()) return 1;
+    if (!test_presentation_setters_store_under_fence()) return 1;
+    if (!test_host_label_keeps_the_registrable_end()) return 1;
     if (!test_media_ink_check_follows_glyph_state()) return 1;
     if (!test_media_chrome_warmup_avoids_unused_weight()
         || !test_media_control_ground_exact_colors()) return 1;
@@ -8280,6 +9235,7 @@ int main(void)
         || !test_media_clockwise_controls_and_pixels()
         || !test_page_activation_activity()
         || !test_focused_action_hint() || !test_signed_out_note()
+        || !test_chrome_cache_follows_its_inputs()
         || !test_every_interface_language_fits_the_ui_state()
         || !test_priority_menu_during_page_work()
         || !test_input_mapping_and_menu()
@@ -8334,6 +9290,7 @@ int main(void)
         || !test_media_status_uses_antialiased_chrome_font()
         || !test_media_subtitle_shadow_tracks_regular_glyphs()
         || !test_media_overlay_regions_and_the_32_bit_wrapper()
+        || !test_media_audio_listening_view()
         || !test_media_buffering_transition_frames_are_stable()
         || !test_media_subtitle_transition_ground_is_stable()
         || !test_media_timeline_churn_is_bounded()
@@ -8346,6 +9303,7 @@ int main(void)
         || !test_kept_status_settles()
         || !test_progress_status_updates_in_place()
         || !test_media_open_status_dismissed_at_scope_end()
+        || !test_preview_hint_toast()
         || !test_media_title_glyphs_are_retained()
         || !test_loading_progress_ramp_pixels()
         || !test_native_surfaces_own_the_panel()

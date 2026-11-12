@@ -1079,6 +1079,73 @@ int main(void) {
         actions = without_comments((ROOT / "src/psp_app/psp_app_actions.c").read_text())
         self.assertIn("psp_app_ensure_network_for_navigation(app, method, url, engine_frame)", actions)
 
+    def test_association_wait_seeds_without_a_warmup_owner(self):
+        # A direct boot (restore-last-page, custom homepage) and a resume
+        # reconnect call psp_connect_network with no preparation app. The
+        # association wait spends one bounded estimator batch per vblank so
+        # the first navigation's curl_global_init finds the pool released,
+        # and it does so only when the warm-up owner is not already doing it
+        # (docs/engineering/PSP_TRANSPORT.md, "Entropy").
+        source = without_comments((ROOT / "src/psp_app/psp_app_network.c").read_text())
+        connection = source[source.index("static bool psp_connect_network_prepared("):
+                            source.index("bool psp_connect_network(")]
+        self.assertEqual(connection.count("psp_entropy_prepare_step("), 1)
+        self.assertNotIn("psp_entropy_fill(", connection)
+        step = connection.index("psp_entropy_prepare_step(")
+        guard = connection[connection.rindex("if (", 0, step):step]
+        self.assertRegex(guard, r"^if \(!terminal && pad\.Buttons == 0\s*&& "
+                         r"\(preparation_app == NULL\s*\|\| "
+                         r"!preparation_app->interactive->transport_prepare_pending\)\)\s*"
+                         r"\(void\) $")
+        # After controls (Circle still cancels first), after the warm-up
+        # owner's own slice, and before the terminal break.
+        self.assertLess(connection.index("PSP_CTRL_CIRCLE"), step)
+        self.assertLess(connection.index("psp_app_prepare_transport("), step)
+        self.assertLess(step, connection.index("if (terminal) break;"))
+        main = without_comments((ROOT / "src/psp_script_main.c").read_text())
+        direct = main[main.index("bool network_ready = psp_connect_network("):]
+        self.assertIn("&network, (int) process.config.network_profile, "
+                      "engine_views.frame, &process.presentation.ui);",
+                      direct[:direct.index(";") + 1])
+
+    def test_trace_replay_preseeds_before_initial_navigation_in_validation_only(self):
+        # Trace replay has no association wait, so a validation boot seeds
+        # just before the initial navigation and first-present does not
+        # carry it. Shipping builds compile the hook to nothing.
+        main = without_comments((ROOT / "src/psp_script_main.c").read_text())
+        body = main[main.index("int main(int argc, char *argv[])"):]
+        self.assertEqual(body.count("psp_validation_entropy_preseed("), 1)
+        self.assertNotIn("psp_entropy_fill(", body)
+        preseed = body.index("psp_validation_entropy_preseed(&process);")
+        self.assertLess(body.index("psp_validation_network_qualification("), preseed)
+        self.assertLess(preseed, body.index("psp_boot_initial_navigation("))
+        header = without_comments((ROOT / "src/psp_app/psp_app_validation.h").read_text())
+        validation = header[header.index("#ifdef TILEFINCH_PSP_VALIDATION_LOG\n\n"):]
+        shipping = validation[validation.index("\n#else\n"):]
+        validation = validation[:validation.index("\n#else\n")]
+        self.assertIn("void psp_validation_entropy_preseed(const PspProcessResources *process);",
+                      validation)
+        stub = shipping[shipping.index("static inline void psp_validation_entropy_preseed("):]
+        stub = stub[:stub.index("}") + 1]
+        self.assertNotIn("psp_entropy", stub.replace("psp_validation_entropy_preseed", ""))
+        qualify = without_comments((ROOT / "src/psp_app/psp_app_validation_qualify.c").read_text())
+        hook = qualify[qualify.index("TILEFINCH_COLD_PATH void psp_validation_entropy_preseed("):]
+        hook = hook[:hook.index("\n}\n")]
+        self.assertIn('if (strcmp(process->config.trace, "none") != 0)\n'
+                      "        (void) psp_entropy_fill(NULL, 0u);", hook)
+        self.assertEqual(hook.count("psp_entropy_fill("), 1)
+        # The unit is linked only into validation images, and the linked
+        # shipping image is checked for the symbol itself.
+        targets = (ROOT / "cmake/TilefinchTargets.cmake").read_text()
+        blocks = re.findall(r"\n        if\(TILEFINCH_PSP_VALIDATION_LOG\)\n(.*?)\n        endif\(\)\n",
+                            targets, re.DOTALL)
+        self.assertEqual(sum("src/psp_app/psp_app_validation_qualify.c" in block
+                             for block in blocks), 1)
+        self.assertEqual(targets.count("src/psp_app/psp_app_validation_qualify.c"), 1)
+        symbols = (ROOT / "cmake/CheckPspHotSymbolSizes.cmake").read_text()
+        self.assertRegex(symbols, r"if\(NOT PSP_VALIDATION_LOG\)\n"
+                         r"    check_absent_symbol\(psp_validation_entropy_preseed\)\n")
+
     def test_native_ca_preparation_bounds_reads_and_closes_partial_state(self):
         compiler = shutil.which("cc")
         if compiler is None:
@@ -2465,271 +2532,6 @@ int main(void) {
                     f"TILEFINCH_QUICKJS_COMPILE_SOURCE_DIR:INTERNAL={selected}\n")
                 self.assertEqual(benchmark.compiled_quickjs_directory(build), selected)
 
-    def test_psplink_screenshot_requires_the_user_partition_capability(self):
-        patch = (ROOT / "tools/psplink-home-exit/"
-                 "psplink-v3.2.1-safe-screenshot.patch").read_text()
-        added = "\n".join(line[1:] for line in patch.splitlines()
-                          if line.startswith("+") and not line.startswith("+++"))
-        self.assertIn('sceKernelAllocPartitionMemory(2, "scrshot"', added)
-        self.assertNotIn("sceKernelAllocPartitionMemory(4,", added)
-        self.assertIn('SHELL_CMD("scrshot-user"', added)
-        builder = (ROOT / "scripts/build-psplink-home-exit.sh").read_text()
-        self.assertIn("psplink-v3.2.1-safe-screenshot.patch", builder)
-
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            pspsh = root / "pspsh"
-            pspsh.write_text(
-                '#!/bin/sh\nif [ "$2" = ver ]; then echo "PSPLink v3.2.1"; '
-                'else printf "%s\\n" "$2"; fi\n')
-            pspsh.chmod(0o755)
-            (root / ".tilefinch-usbhostfs.pid").write_text(str(os.getpid()))
-            (root / ".tilefinch-usbhostfs.root").write_text(str(root))
-            environment = dict(os.environ, HOST_ROOT=str(root),
-                               PSPLINK_STATE_DIR=str(root), PSPSH=str(pspsh),
-                               USBHOSTFS="/usr/bin/true",
-                               PSPLINK_POLLS_PER_SECOND="10")
-            for command in ("scrshot", "ss", "scrshot host0:/frame.bmp",
-                            "ss host0:/frame.bmp"):
-                result = subprocess.run(
-                    [str(ROOT / "scripts/psplink-shell.sh"), "exec", command],
-                    env=environment, capture_output=True, text=True,
-                    timeout=5, check=False)
-                self.assertEqual(0, result.returncode, result.stderr)
-                expected = "scrshot-user" + (
-                    " host0:/frame.bmp" if " " in command else "")
-                self.assertEqual(expected, result.stdout.strip())
-
-    def test_psplink_timeout_reaps_a_console_ignoring_term(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            pspsh = root / "pspsh"
-            pid = root / "console-pid"
-            pspsh.write_text(
-                '#!/bin/sh\nif [ "$2" = ver ]; then echo "PSPLink v3.2.1"; exit 0; fi\n'
-                'trap "" TERM\nprintf "%s\\n" "$$" >"$MOCK_PID"\n'
-                'while :; do sleep 0.05; done\n')
-            pspsh.chmod(0o755)
-            (root / ".tilefinch-usbhostfs.pid").write_text(str(os.getpid()))
-            (root / ".tilefinch-usbhostfs.root").write_text(str(root))
-            environment = dict(os.environ, HOST_ROOT=str(root),
-                               PSPLINK_STATE_DIR=str(root), PSPSH=str(pspsh),
-                               USBHOSTFS="/usr/bin/true", MOCK_PID=str(pid),
-                               LINK_TIMEOUT_SECONDS="1", PSPLINK_POLLS_PER_SECOND="10")
-            try:
-                result = subprocess.run(
-                    [str(ROOT / "scripts/psplink-shell.sh"), "exec", "wait"],
-                    env=environment, capture_output=True, text=True, timeout=4)
-                self.assertEqual(result.returncode, 124, result.stderr)
-                self.assertIn("command timed out", result.stderr)
-                with self.assertRaises(ProcessLookupError):
-                    os.kill(int(pid.read_text()), 0)
-            finally:
-                if pid.exists():
-                    try:
-                        os.kill(int(pid.read_text()), 9)
-                    except ProcessLookupError:
-                        pass
-
-    def test_psplink_device_loop_establishes_the_host_bridge(self):
-        shell = (ROOT / "scripts/psplink-shell.sh").read_text(
-            encoding="utf-8")
-        deploy = (ROOT / "scripts/psplink-device.sh").read_text(
-            encoding="utf-8")
-        youtube = (ROOT / "scripts/run-psplink-youtube-ux.sh").read_text(
-            encoding="utf-8")
-        self.assertIn('nohup "$USBHOSTFS" "$HOST_ROOT"', shell)
-        self.assertIn("BRIDGE_START_TIMEOUT_SECONDS", shell)
-        self.assertIn('run_pspsh ver "$probe_timeout"', shell)
-        self.assertIn('scripts/psplink-shell.sh" ready', deploy)
-        self.assertIn('scripts/psplink-shell.sh" ready', youtube)
-
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            host = root / "host"
-            host.mkdir()
-            second_host = root / "second-host"
-            second_host.mkdir()
-            ready = root / "ready"
-            active_root = root / "active-root"
-            pspsh = root / "pspsh"
-            usbhostfs = root / "usbhostfs_pc"
-            pspsh.write_text(
-                "#!/bin/sh\n"
-                "if [ -f \"$MOCK_PSP_READY\" ] "
-                "&& [ \"$(cat \"$MOCK_ACTIVE_ROOT\")\" = "
-                "\"$MOCK_EXPECTED_ROOT\" ]; then\n"
-                "  echo 'PSPLink v3.2.1'\n"
-                "  exit 0\n"
-                "fi\n"
-                "echo 'connect: Connection refused' >&2\n"
-                "exit 1\n", encoding="utf-8")
-            usbhostfs.write_text(
-                "#!/bin/sh\n"
-                "printf '%s\\n' \"$1\" >\"$MOCK_ACTIVE_ROOT\"\n"
-                ": > \"$MOCK_PSP_READY\"\n"
-                "sleep 8\n", encoding="utf-8")
-            pspsh.chmod(0o755)
-            usbhostfs.chmod(0o755)
-            environment = os.environ.copy()
-            environment.update({
-                "HOST_ROOT": str(host),
-                "PSPLINK_STATE_DIR": str(root),
-                "PSPSH": str(pspsh),
-                "USBHOSTFS": str(usbhostfs),
-                "MOCK_PSP_READY": str(ready),
-                "MOCK_ACTIVE_ROOT": str(active_root),
-                "MOCK_EXPECTED_ROOT": str(host),
-                "LINK_TIMEOUT_SECONDS": "2",
-                "BRIDGE_START_TIMEOUT_SECONDS": "3",
-                "PSPLINK_POLLS_PER_SECOND": "10",
-            })
-            result = subprocess.run(
-                [str(ROOT / "scripts/psplink-shell.sh"), "ready"],
-                env=environment, capture_output=True, text=True,
-                timeout=8, check=False)
-            self.assertEqual(0, result.returncode, result.stderr)
-            self.assertIn("PSPLink ready", result.stdout)
-            self.assertTrue(ready.exists())
-            self.assertTrue((root / ".tilefinch-usbhostfs.pid").exists())
-            self.assertEqual(
-                str(host),
-                (root / ".tilefinch-usbhostfs.root").read_text(
-                    encoding="utf-8").strip())
-
-            environment["HOST_ROOT"] = str(second_host)
-            environment["MOCK_EXPECTED_ROOT"] = str(second_host)
-            switched = subprocess.run(
-                [str(ROOT / "scripts/psplink-shell.sh"), "ready"],
-                env=environment, capture_output=True, text=True,
-                timeout=8, check=False)
-            self.assertEqual(0, switched.returncode, switched.stderr)
-            self.assertEqual(
-                str(second_host), active_root.read_text(
-                    encoding="utf-8").strip())
-            self.assertEqual(
-                str(second_host),
-                (root / ".tilefinch-usbhostfs.root").read_text(
-                    encoding="utf-8").strip())
-            bridge_pid = int((root / ".tilefinch-usbhostfs.pid").read_text(
-                encoding="utf-8").strip())
-            try:
-                os.kill(bridge_pid, 15)
-            except ProcessLookupError:
-                pass
-
-    def test_psplink_hold_observes_one_bridge_without_replacement(self):
-        # Real wrapper, mocked host tools only. Every wait and mock lifetime
-        # is bounded; this test never opens USB or a PSPLink socket.
-        for change in ("pid", "root", "death", "stop"):
-            with self.subTest(change=change), tempfile.TemporaryDirectory() as temporary:
-                root = Path(temporary)
-                host = root / "host"
-                ready = root / "ready"
-                starts = root / "starts"
-                mock_pid = root / "mock-pid"
-                pspsh = root / "pspsh"
-                usbhostfs = root / "usbhostfs_pc"
-                pspsh.write_text(
-                    '#!/bin/sh\n[ -f "$MOCK_READY" ] || exit 1\n'
-                    'echo "PSPLink v3.2.1"\n')
-                usbhostfs.write_text(
-                    '#!/bin/sh\nprintf "%s\\n" "$$" >"$MOCK_PID"\n'
-                    'echo start >>"$MOCK_STARTS"\n: >"$MOCK_READY"\n'
-                    'exec sleep 20\n')
-                pspsh.chmod(0o755)
-                usbhostfs.chmod(0o755)
-                environment = dict(
-                    os.environ, HOST_ROOT=str(host), PSPLINK_STATE_DIR=str(root),
-                    PSPSH=str(pspsh), USBHOSTFS=str(usbhostfs),
-                    MOCK_READY=str(ready), MOCK_PID=str(mock_pid), MOCK_STARTS=str(starts),
-                    LINK_TIMEOUT_SECONDS="1", BRIDGE_START_TIMEOUT_SECONDS="2",
-                    PSPLINK_POLLS_PER_SECOND="10")
-                command = [str(ROOT / "scripts/psplink-shell.sh")]
-                hold = subprocess.Popen(command + ["hold"], env=environment,
-                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                        text=True)
-                try:
-                    readable, _, _ = select.select([hold.stdout], [], [], 5)
-                    self.assertTrue(readable, "bounded hold readiness")
-                    line = hold.stdout.readline()
-                    self.assertIn("PSPLink hold ready", line)
-                    bridge_pid = int(mock_pid.read_text().strip())
-                    self.assertIn(f"bridge PID: {bridge_pid}", line)
-                    self.assertIsNone(hold.poll())
-                    # Ordinary commands reuse the held bridge unchanged.
-                    probe = subprocess.run(command + ["exec", "ver"], env=environment,
-                                           capture_output=True, text=True, timeout=3)
-                    self.assertEqual(probe.returncode, 0, probe.stderr)
-                    self.assertEqual(starts.read_text().splitlines(), ["start"])
-                    self.assertIsNone(hold.poll())
-                    if change == "pid":
-                        (root / ".tilefinch-usbhostfs.pid").write_text(str(os.getpid()))
-                    elif change == "root":
-                        (root / ".tilefinch-usbhostfs.root").write_text(str(root / "other"))
-                    elif change == "death":
-                        os.kill(bridge_pid, 15)
-                    else:
-                        hold.terminate()
-                    _, error = hold.communicate(timeout=3)
-                    if change == "stop":
-                        self.assertEqual(hold.returncode, 0, error)
-                    else:
-                        self.assertNotEqual(hold.returncode, 0)
-                        self.assertIn("not replacing it", error)
-                    self.assertEqual(starts.read_text().splitlines(), ["start"])
-                    if change != "death":
-                        # Neither ownership failure nor stopping hold kills
-                        # the bridge (or the newly recorded PID).
-                        os.kill(bridge_pid, 0)
-                        os.kill(os.getpid(), 0)
-                finally:
-                    if hold.poll() is None:
-                        hold.terminate()
-                    hold.communicate(timeout=3)
-                    if mock_pid.exists():
-                        try:
-                            os.kill(int(mock_pid.read_text().strip()), 15)
-                        except ProcessLookupError:
-                            pass
-
-    def test_psplink_bridge_reports_host_socket_denial(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            host = root / "host"
-            host.mkdir()
-            pspsh = root / "pspsh"
-            usbhostfs = root / "usbhostfs_pc"
-            pspsh.write_text(
-                "#!/bin/sh\n"
-                "echo 'connect: Connection refused' >&2\n"
-                "exit 1\n", encoding="utf-8")
-            usbhostfs.write_text(
-                "#!/bin/sh\n"
-                "echo 'bind: Operation not permitted' >&2\n"
-                "sleep 8\n", encoding="utf-8")
-            pspsh.chmod(0o755)
-            usbhostfs.chmod(0o755)
-            environment = os.environ.copy()
-            environment.update({
-                "HOST_ROOT": str(host),
-                "PSPLINK_STATE_DIR": str(root),
-                "PSPSH": str(pspsh),
-                "USBHOSTFS": str(usbhostfs),
-                "LINK_TIMEOUT_SECONDS": "1",
-                "BRIDGE_START_TIMEOUT_SECONDS": "3",
-                "PSPLINK_POLLS_PER_SECOND": "10",
-            })
-            result = subprocess.run(
-                [str(ROOT / "scripts/psplink-shell.sh"), "ready"],
-                env=environment, capture_output=True, text=True,
-                timeout=8, check=False)
-            self.assertNotEqual(0, result.returncode)
-            self.assertIn(
-                "host environment denied usbhostfs_pc", result.stderr)
-            self.assertIn(
-                "does not need to be relaunched", result.stderr)
-
     def test_official_psp_preset_embeds_the_pinned_public_update_root(self):
         presets = json.loads(
             (ROOT / "CMakePresets.json").read_text(encoding="utf-8"))
@@ -2798,6 +2600,38 @@ int main(void) {
             (ROOT / "src/psp_boot_module_client.c").read_text(encoding="utf-8"))
         self.assertNotIn("__wrap___libcglue_init", client)
         self.assertNotIn("__real___libcglue_init", client)
+
+    def test_boot_heap_line_is_validation_only_and_sampled_before_the_heap(self):
+        # The heap's size is the largest free block _sbrk sees less the
+        # threshold, so the sample must follow the threshold choice and come
+        # before the real init claims the heap. Sample, report and call are
+        # all compiled out of shipping builds.
+        reserve = without_comments(
+            (ROOT / "src/psp_heap_reserve.c").read_text(encoding="utf-8"))
+        wrapper = reserve[reserve.index("void __wrap___libcglue_init("):]
+        sample = ("#ifdef TILEFINCH_PSP_VALIDATION_LOG\n"
+                  "    heap_reserve_largest_free_before_heap = "
+                  "sceKernelMaxFreeMemSize();\n#endif\n")
+        self.assertEqual(reserve.count("sceKernelMaxFreeMemSize()"), 1)
+        self.assertIn(sample, wrapper)
+        self.assertLess(wrapper.index("sce_newlib_heap_threshold_kb_size ="),
+                        wrapper.index(sample))
+        self.assertLess(wrapper.index(sample),
+                        wrapper.index("__real___libcglue_init(argc, argv)"))
+        report = reserve.index("void psp_heap_reserve_report(void)")
+        block = reserve.rindex("#ifdef TILEFINCH_PSP_VALIDATION_LOG", 0, report)
+        self.assertNotIn("#endif", reserve[block:report])
+        # Plain printf goes to stdout, which the validation log never sees.
+        body = reserve[report:reserve.index("\n}\n", report)]
+        self.assertIn('psp_log_printf("tilefinch-psp-script: heap bytes=',
+                      body)
+        self.assertNotIn(" printf(", body)
+        main = without_comments(
+            (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
+        self.assertEqual(main.count("psp_heap_reserve_report();"), 1)
+        call = main.index("psp_heap_reserve_report();")
+        guard = main.rindex("#ifdef TILEFINCH_PSP_VALIDATION_LOG", 0, call)
+        self.assertNotIn("#endif", main[guard:call])
 
     def test_nonblocking_code_does_not_use_timed_thread_waits(self):
         offenders = []
@@ -3731,8 +3565,8 @@ int main(void) {
         refresh = runtime[
             runtime.index("bool psp_work_cooperate_refresh_media("):
             runtime.index("void psp_work_cooperate_begin_media_open(")]
-        self.assertIn("psp_media_timeline_action(pending.action)", refresh)
-        self.assertIn("cooperate->pending_media_intent = (PspUiMediaIntent) {0}",
+        self.assertIn("psp_ui_media_timeline_action(pending.action)", refresh)
+        self.assertIn("cooperate->pending_media.timeline = (PspUiMediaIntent) {0}",
                       refresh)
         self.assertIn(".media_preview_active = cooperate->media_surface",
                       runtime)
@@ -4028,8 +3862,16 @@ int main(void) {
         tick = runtime[
             runtime.index("void psp_background_ui_tick(void)"):
             runtime.index("bool psp_platform_cooperate(")]
-        self.assertIn("psp_ui_media_update(", tick)
-        self.assertIn("cooperate->pending_media_intent", tick)
+        # The supervisor's player copy never writes the presentation it
+        # borrows (AU-05): its presses move it onto its own copy. Every
+        # press it takes is queued and the owner derives its state and
+        # action by applying the queue at the refresh and at the scope's
+        # end, so the tick posts no action of its own.
+        self.assertIn("psp_ui_media_supervisor_press(", tick)
+        self.assertIn("&cooperate->media_presses, ui_pressed", tick)
+        self.assertNotIn("psp_ui_media_update(", tick)
+        self.assertNotIn("psp_ui_media_update_detached(", tick)
+        self.assertNotIn("cooperate->pending_media", tick)
         self.assertIn("cooperate->pending_page_input", tick)
         self.assertIn("psp_controller_take_latched_pressed()", tick)
         self.assertIn("PSP_SUPERVISOR_PAGE_INPUT_LIMIT", tick)
@@ -4039,9 +3881,37 @@ int main(void) {
             runtime.index("void psp_navigation_cooperate_end("):
             runtime.index("bool psp_navigation_cooperate_take_media_intent(")]
         self.assertLess(
-            end.index("while (psp_navigation_cooperate.presenting != 0)"),
+            end.index("while (psp_navigation_cooperate.presenting != 0"),
+            end.index("psp_completed_supervisor_media_intent ="))
+        self.assertLess(
+            end.index("while (psp_navigation_cooperate.presenting != 0"),
+            end.index("psp_cooperate_settle_media_presses("))
+        self.assertLess(
+            end.index("psp_cooperate_settle_media_presses("),
             end.index("psp_completed_supervisor_media_intent ="))
         self.assertIn("psp_completed_supervisor_page_input", end)
+        refresh = runtime[
+            runtime.index("bool psp_work_cooperate_refresh_media("):
+            runtime.index("void psp_work_cooperate_begin_media_open(")]
+        self.assertLess(
+            refresh.index("psp_cooperate_settle_media_presses(cooperate)"),
+            refresh.index("cooperate->supervisor_media_ui = *media_ui"))
+        # Meanwhile the browser loop takes no edge of its own from the pad
+        # or the latch: one press, one receiver (a Down moved a media menu
+        # two rows). The scripted source still replaces the input after.
+        main = without_comments(
+            (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
+        frame = main[
+            main.index("PSP_LOOP_PHASE(LOOP_INPUT);"):
+            main.index("psp_validation_scripted_frame(")]
+        self.assertIn("psp_input_loop_edges(", frame)
+        self.assertIn("loop->media_open_scope && browser->media.ui.visible",
+                      frame)
+        self.assertIn("if (loop_edges == PSP_INPUT_EDGES_PAD)\n"
+                      "        input.pressed |= "
+                      "psp_controller_take_latched_pressed();", frame)
+        self.assertIn("else if (loop_edges == PSP_INPUT_EDGES_REPLAYED)\n"
+                      "        input.pressed = 0;", frame)
 
         open_source = without_comments(
             (ROOT / "src/psp_media_open.c").read_text(encoding="utf-8"))
@@ -5035,7 +4905,7 @@ int main(void) {
             source.index("static MediaBackendResult swdec_dispatch_queued("):
             source.index("static MediaBackendResult swdec_submit(")]
         self.assertIn(
-            "media_h264_annexb_sample_is_admitted(", dispatch)
+            "media_h264_annexb_software_sample_verdict(", dispatch)
         release_prior = source[
             source.index("static void swdec_release_prior_claim("):
             source.index("static bool swdec_take_video_frame(")]
@@ -5275,6 +5145,11 @@ int main(void) {
         source = without_comments(
             (ROOT / "src/fetch/background_transport.inc").read_text(
                 encoding="utf-8"))
+        # The WebSocket lane lives in its own include; the behavioural
+        # tilefinch-websocket-loopback-tests drives it against pinned curl.
+        websocket = without_comments(
+            (ROOT / "src/fetch/background_websocket.inc").read_text(
+                encoding="utf-8"))
         self.assertIn("FETCH_BACKGROUND_REQUEST_LIMIT 6u", header)
         self.assertIn("FETCH_BACKGROUND_ACTIVE_LIMIT 2u", header)
         self.assertIn("FETCH_BACKGROUND_STREAM_ACTIVE_LIMIT 6u", header)
@@ -5316,32 +5191,36 @@ int main(void) {
         self.assertIn("CURLOPT_USERAGENT, TILEFINCH_BROWSER_USER_AGENT",
                       preconnect)
         self.assertIn("CURLOPT_USERAGENT, FETCH_BACKGROUND_USER_AGENT",
-                      source)
+                      source + websocket)
         self.assertNotIn("CURLOPT_CONNECT_ONLY,", preconnect)
         self.assertEqual(
-            source.count("CURLOPT_CONNECT_ONLY,"), 1,
+            (source + websocket).count("CURLOPT_CONNECT_ONLY,"), 1,
             "only the bounded WebSocket lane may retain a connected socket")
-        websocket_config = source[
-            source.index("static bool fetch_background_websocket_configure("):
-            source.index("static void fetch_background_websocket_start_queued(")]
+        websocket_config = websocket[
+            websocket.index("static bool fetch_background_websocket_configure("):
+            websocket.index("static void fetch_background_websocket_start_queued(")]
         self.assertIn("CURLOPT_CONNECT_ONLY, 2L", websocket_config)
         websocket_open = source[
             source.index("uint64_t fetch_background_websocket_open("):
-            source.index("bool fetch_background_websocket_send(")]
+            source.index("static bool fetch_background_all_free(")]
+        websocket_claim = websocket[
+            websocket.index("static uint64_t fetch_background_websocket_claim("):
+            websocket.index("bool fetch_background_websocket_send(")]
         self.assertIn("fetch_websocket_prepare_admission(", websocket_open)
         self.assertIn(
             "socket->private_network.required = protect_private_network",
-            websocket_open)
+            websocket_claim)
         self.assertNotIn(
-            "request->block_private_network", websocket_open,
+            "request->block_private_network", websocket_open + websocket_claim,
             "page WebSockets must derive PNA at the native sink")
         self.assertLess(
             websocket_open.index("fetch_websocket_prepare_admission("),
-            websocket_open.index("FETCH_BACKGROUND_WEBSOCKET_PREPARING"),
+            websocket_open.index("fetch_background_websocket_claim("),
             "policy must pass before a worker slot is claimed")
-        websocket_send = source[
-            source.index("static void fetch_background_websocket_service_send("):
-            source.index(
+        self.assertIn("FETCH_BACKGROUND_WEBSOCKET_PREPARING", websocket_claim)
+        websocket_send = websocket[
+            websocket.index("static void fetch_background_websocket_service_send("):
+            websocket.index(
                 "static bool fetch_background_websocket_publish_pending_drain(")]
         self.assertIn(
             "fetch_background_websocket_publish_close_bytes(",
@@ -5355,46 +5234,45 @@ int main(void) {
             "socket->event.kind = FETCH_WEBSOCKET_EVENT_DRAIN",
             websocket_send,
             "send completion must enter the pending latch before publication")
-        websocket_drain = source[
-            source.index(
+        websocket_drain = websocket[
+            websocket.index(
                 "static bool fetch_background_websocket_publish_pending_drain("):
-            source.index("static void fetch_background_websocket_service_receive(")]
+            websocket.index("static void fetch_background_websocket_service_receive(")]
         self.assertIn(
             "FETCH_BACKGROUND_WEBSOCKET_DRAIN_PUBLISHED", websocket_drain)
         self.assertNotIn(
             "if (sent == 0)", websocket_drain,
             "a zero-byte text send still requires DRAIN to release the JS queue")
-        websocket_receive = source[
-            source.index("static void fetch_background_websocket_service_receive("):
-            source.index("static void fetch_background_websocket_service(void)")]
+        websocket_receive = websocket[
+            websocket.index("static void fetch_background_websocket_service_receive("):
+            websocket.index("static void fetch_background_websocket_service(void)")]
         self.assertLess(
             websocket_receive.index("fetch_websocket_text_payload_valid("),
             websocket_receive.index("FETCH_WEBSOCKET_EVENT_MESSAGE_TEXT"),
             "malformed text must close with 1007 before JavaScript delivery")
-        websocket_service = source[
-            source.index("static void fetch_background_websocket_service(void)"):
-            source.index("static int fetch_background_worker_main(")]
+        websocket_service = websocket[
+            websocket.index("static void fetch_background_websocket_service(void)"):
+            websocket.index("static void fetch_background_websocket_reap_closed(")]
         self.assertGreaterEqual(
             websocket_service.count(
                 "fetch_background_websocket_publish_pending_drain(socket)"),
             2,
             "pending send completion must run before receive and immediately "
             "after a completed send")
-        websocket_take = source[
-            source.index("bool fetch_background_websocket_take_event("):
-            source.index("static bool fetch_background_all_free(")]
+        websocket_take = websocket[
+            websocket.index("bool fetch_background_websocket_take_event("):]
         self.assertIn(
             "FETCH_BACKGROUND_WEBSOCKET_DRAIN_PENDING", websocket_take,
             "consuming a busy event slot must wake pending DRAIN publication")
-        websocket_native_send = source[
-            source.index("bool fetch_background_websocket_send("):
-            source.index("bool fetch_background_websocket_close(")]
+        websocket_native_send = websocket[
+            websocket.index("bool fetch_background_websocket_send("):
+            websocket.index("bool fetch_background_websocket_close(")]
         self.assertIn("length != 0 && data == NULL", websocket_native_send)
         self.assertIn(
             "FETCH_BACKGROUND_WEBSOCKET_DRAIN_EMPTY", websocket_native_send,
             "the next native send must wait for the preceding DRAIN event")
         raw_transport_source = (
-            ROOT / "src/fetch/background_transport.inc").read_text(
+            ROOT / "src/fetch/background_websocket.inc").read_text(
                 encoding="utf-8")
         self.assertIn(
             "Hash-pinned curl 8.22.0 auto-enqueues", raw_transport_source)
@@ -6611,7 +6489,9 @@ int main(void) {
             source.index("bool psp_media_present_ge_stage_dma_quarantined(")]
         # The timeout arm is the only one that quarantines, and it records
         # both addresses -- the slot the copy read and the buffer it wrote.
-        self.assertIn("psp_media_dma_quarantine_live = true", join)
+        self.assertIn(
+            "psp_media_dma_quarantine_state = PSP_MEDIA_DMA_QUARANTINE_LIVE",
+            join)
         self.assertIn("psp_media_dma_quarantine_slot =", join)
         self.assertIn("psp_media_dma_quarantine_dst =", join)
         self.assertIn("PSP_MEDIA_DMA_JOIN_TIMED_OUT_STILL_LIVE", join)
@@ -6621,12 +6501,13 @@ int main(void) {
         # The quarantine is lifted by observing the completion, never by a
         # timer. Poll, never wait: this runs on frames with work to do.
         poll = source[
-            source.index("bool psp_media_present_ge_stage_dma_quarantine_poll("):
             source.index(
-                "bool psp_media_present_ge_stage_dma_quarantine_expired(")]
+                "PspMediaDmaQuarantineStep "
+                "psp_media_present_ge_stage_dma_quarantine_step(void)"):
+            source.index("bool psp_media_present_ge_stage_dma_recover(")]
         self.assertIn("sceKernelPollEventFlag(", poll)
         self.assertNotIn("sceKernelWaitEventFlag(", poll)
-        self.assertIn("psp_media_dma_quarantine_live = false", poll)
+        self.assertIn("psp_media_present_dma_quarantine_step(", poll)
         self.assertIn("psp_media_dma_late_completions", poll)
         session = without_comments(
             psp_media_session_sources())
@@ -6693,8 +6574,7 @@ int main(void) {
             pump.index("media_playback_release_video_slot("))
         # A transfer never observed to finish ends the session rather than
         # being assumed complete.
-        self.assertIn(
-            "psp_media_present_ge_stage_dma_quarantine_expired()", pump)
+        self.assertIn("PSP_MEDIA_DMA_QUARANTINE_STEP_EXPIRED", pump)
         self.assertIn("psp_media_raise_error(", pump)
 
     def test_a_refused_access_unit_says_which_side_produced_it(self):
@@ -7619,7 +7499,8 @@ int main(void) {
             (ROOT / "src/psp_boot_config.c").read_text(encoding="utf-8"))
         self.assertIn('strcmp(line, "experimental_wide_video") == 0', boot)
         self.assertIn("psp_media_wide_program_name_valid(", boot)
-        self.assertIn("experimental_wide_video=%s", boot)
+        # The override writer's round trip of every picker spelling is
+        # tilefinch-psp-boot-config-tests.
 
     def test_audio_codec_work_buffer_follows_pmplayer_not_the_grant(self):
         # PMPlayer, the hardware-proven implementation this backend is
@@ -8990,6 +8871,40 @@ int main(void) {
             2,
             "streaming and fixed-window requests must both preserve the flag",
         )
+
+    def test_refused_worker_hop_never_runs_on_the_browser_thread(self):
+        """NW-04: once the PSP worker is up, every step of the support probe
+        that refuses a hop (its Cookie header, its passed deadline, its
+        shape) names itself, and the PSP build fails such a hop instead of
+        falling through to curl_easy_init on the browser thread, where DNS,
+        TCP and TLS would run (and a passed deadline would get a fresh full
+        timeout). Behaviour is PSP-only (TILEFINCH_PSP_OWNED_TRANSPORT)."""
+        source = without_comments(
+            (ROOT / "src/fetch/scheduler.inc").read_text(encoding="utf-8"))
+        probe = source[
+            source.index("static bool scheduled_background_hop_supported("):
+            source.index("static bool scheduled_background_start_hop_with(")]
+        up = probe.index("fetch_background_transport_initialize(")
+        after_up = probe[probe.index("return false;", up)
+                         + len("return false;"):]
+        refusals = re.findall(
+            r"\*refusal = \(ScheduledHopRefusal\) \{\s*\"([a-z-]+)\"",
+            after_up)
+        self.assertEqual(
+            sorted(refusals), ["cookie", "deadline", "worker-request-shape"])
+        self.assertEqual(
+            after_up.count("return false;"), len(refusals),
+            "a refusal after the worker is up must name its step")
+        prepare = source[
+            source.index("static bool scheduled_fetch_prepare("):
+            source.index("static uint64_t fetch_scheduler_enqueue_internal(")]
+        psp = prepare[
+            prepare.index("#if defined(TILEFINCH_PSP_OWNED_TRANSPORT)"):
+            prepare.index("item->easy = curl_easy_init();")]
+        # The failure itself is host-tested behind
+        # TilefinchTestFaults.fail_worker_refused_hops (trace-media-replay).
+        self.assertIn("bool fail_refused = true;", psp)
+        self.assertIn("if (fail_refused && refusal.stage != NULL)", psp)
 
     def test_background_streaming_keeps_budget_and_parsing_on_browser_thread(self):
         source = without_comments(
@@ -10841,6 +10756,24 @@ int main(void) {
                       "CANVAS_SURFACE_PIXEL_LIMIT", bridge)
         self.assertIn("<= CANVAS_RASTER_WORK_LIMIT", bridge)
 
+    def test_page_press_outcome_is_the_host_tested_file(self):
+        # tests/test_psp_page_press.c runs psp_app_page_press.inc itself, with
+        # its own psp_app_activate_page. The real one must still clear the
+        # flag first (its action is uninitialized stack) and hand over what
+        # the outcome reads.
+        activation = without_comments(
+            (ROOT / "src/psp_app/psp_app_activation.c").read_text())
+        self.assertEqual(activation.count('#include "psp_app_page_press.inc"'), 1)
+        self.assertNotIn("void psp_app_dispatch_activation(", activation)
+        self.assertLess(activation.index("action->form_not_sent = false;"),
+                        activation.index("browser_engine_activate(engine, action)"))
+        self.assertLess(activation.index("activations_before = app->views->controller->activations;"),
+                        activation.index("browser_engine_activate(engine, action)"))
+        self.assertIn("activation->activations_before = activations_before;", activation)
+        self.assertIn(
+            "psp_app_dispatch_activation",
+            (ROOT / "tests/test_psp_page_press.c").read_text())
+
     def test_status_toasts_store_english_keys(self):
         # draw_toast translates ui->status at paint time. A caller that
         # stores an already-translated string overflows the 80-byte status
@@ -10848,6 +10781,7 @@ int main(void) {
         # translated a second time, and defeats psp_ui_dismiss_status.
         sources = [ROOT / "src/psp_script_main.c"]
         sources += sorted((ROOT / "src/psp_app").glob("*.c"))
+        sources += sorted((ROOT / "src/psp_app").glob("*.inc"))
         offenders = []
         for path in sources:
             source = without_comments(path.read_text(encoding="utf-8"))
@@ -11011,6 +10945,278 @@ int main(void) {
             self.assertEqual(compiled.returncode, 0, compiled.stderr)
             run = subprocess.run([str(path / "language")], capture_output=True)
             self.assertEqual(run.returncode, 0, run.stderr)
+
+
+class PspLinkWrapperTimingTests(unittest.TestCase):
+    """The PSPLink wrapper run for real against mock host tools, with
+    wall-clock bounds (bridge start, link probes, readiness). CTest runs
+    them as their own test with processors reserved, so a loaded -j8 gate
+    does not starve the wrapper's polls past those bounds."""
+
+    def test_psplink_screenshot_requires_the_user_partition_capability(self):
+        patch = (ROOT / "tools/psplink-home-exit/"
+                 "psplink-v3.2.1-safe-screenshot.patch").read_text()
+        added = "\n".join(line[1:] for line in patch.splitlines()
+                          if line.startswith("+") and not line.startswith("+++"))
+        self.assertIn('sceKernelAllocPartitionMemory(2, "scrshot"', added)
+        self.assertNotIn("sceKernelAllocPartitionMemory(4,", added)
+        self.assertIn('SHELL_CMD("scrshot-user"', added)
+        builder = (ROOT / "scripts/build-psplink-home-exit.sh").read_text()
+        self.assertIn("psplink-v3.2.1-safe-screenshot.patch", builder)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pspsh = root / "pspsh"
+            pspsh.write_text(
+                '#!/bin/sh\nif [ "$2" = ver ]; then echo "PSPLink v3.2.1"; '
+                'else printf "%s\\n" "$2"; fi\n')
+            pspsh.chmod(0o755)
+            (root / ".tilefinch-usbhostfs.pid").write_text(str(os.getpid()))
+            (root / ".tilefinch-usbhostfs.root").write_text(str(root))
+            environment = dict(os.environ, HOST_ROOT=str(root),
+                               PSPLINK_STATE_DIR=str(root), PSPSH=str(pspsh),
+                               USBHOSTFS="/usr/bin/true",
+                               PSPLINK_POLLS_PER_SECOND="10")
+            for command in ("scrshot", "ss", "scrshot host0:/frame.bmp",
+                            "ss host0:/frame.bmp"):
+                result = subprocess.run(
+                    [str(ROOT / "scripts/psplink-shell.sh"), "exec", command],
+                    env=environment, capture_output=True, text=True,
+                    timeout=5, check=False)
+                self.assertEqual(0, result.returncode, result.stderr)
+                expected = "scrshot-user" + (
+                    " host0:/frame.bmp" if " " in command else "")
+                self.assertEqual(expected, result.stdout.strip())
+
+    def test_psplink_timeout_reaps_a_console_ignoring_term(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pspsh = root / "pspsh"
+            pid = root / "console-pid"
+            pspsh.write_text(
+                '#!/bin/sh\nif [ "$2" = ver ]; then echo "PSPLink v3.2.1"; exit 0; fi\n'
+                'trap "" TERM\nprintf "%s\\n" "$$" >"$MOCK_PID"\n'
+                'while :; do sleep 0.05; done\n')
+            pspsh.chmod(0o755)
+            (root / ".tilefinch-usbhostfs.pid").write_text(str(os.getpid()))
+            (root / ".tilefinch-usbhostfs.root").write_text(str(root))
+            environment = dict(os.environ, HOST_ROOT=str(root),
+                               PSPLINK_STATE_DIR=str(root), PSPSH=str(pspsh),
+                               USBHOSTFS="/usr/bin/true", MOCK_PID=str(pid),
+                               LINK_TIMEOUT_SECONDS="1", PSPLINK_POLLS_PER_SECOND="10")
+            try:
+                result = subprocess.run(
+                    [str(ROOT / "scripts/psplink-shell.sh"), "exec", "wait"],
+                    env=environment, capture_output=True, text=True, timeout=4)
+                self.assertEqual(result.returncode, 124, result.stderr)
+                self.assertIn("command timed out", result.stderr)
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(int(pid.read_text()), 0)
+            finally:
+                if pid.exists():
+                    try:
+                        os.kill(int(pid.read_text()), 9)
+                    except ProcessLookupError:
+                        pass
+
+    def test_psplink_device_loop_establishes_the_host_bridge(self):
+        shell = (ROOT / "scripts/psplink-shell.sh").read_text(
+            encoding="utf-8")
+        deploy = (ROOT / "scripts/psplink-device.sh").read_text(
+            encoding="utf-8")
+        youtube = (ROOT / "scripts/run-psplink-youtube-ux.sh").read_text(
+            encoding="utf-8")
+        self.assertIn('nohup "$USBHOSTFS" "$HOST_ROOT"', shell)
+        self.assertIn("BRIDGE_START_TIMEOUT_SECONDS", shell)
+        self.assertIn('run_pspsh ver "$probe_timeout"', shell)
+        self.assertIn('scripts/psplink-shell.sh" ready', deploy)
+        self.assertIn('scripts/psplink-shell.sh" ready', youtube)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            host = root / "host"
+            host.mkdir()
+            second_host = root / "second-host"
+            second_host.mkdir()
+            ready = root / "ready"
+            active_root = root / "active-root"
+            pspsh = root / "pspsh"
+            usbhostfs = root / "usbhostfs_pc"
+            pspsh.write_text(
+                "#!/bin/sh\n"
+                "if [ -f \"$MOCK_PSP_READY\" ] "
+                "&& [ \"$(cat \"$MOCK_ACTIVE_ROOT\")\" = "
+                "\"$MOCK_EXPECTED_ROOT\" ]; then\n"
+                "  echo 'PSPLink v3.2.1'\n"
+                "  exit 0\n"
+                "fi\n"
+                "echo 'connect: Connection refused' >&2\n"
+                "exit 1\n", encoding="utf-8")
+            usbhostfs.write_text(
+                "#!/bin/sh\n"
+                "printf '%s\\n' \"$1\" >\"$MOCK_ACTIVE_ROOT\"\n"
+                ": > \"$MOCK_PSP_READY\"\n"
+                "sleep 8\n", encoding="utf-8")
+            pspsh.chmod(0o755)
+            usbhostfs.chmod(0o755)
+            environment = os.environ.copy()
+            environment.update({
+                "HOST_ROOT": str(host),
+                "PSPLINK_STATE_DIR": str(root),
+                "PSPSH": str(pspsh),
+                "USBHOSTFS": str(usbhostfs),
+                "MOCK_PSP_READY": str(ready),
+                "MOCK_ACTIVE_ROOT": str(active_root),
+                "MOCK_EXPECTED_ROOT": str(host),
+                "LINK_TIMEOUT_SECONDS": "2",
+                "BRIDGE_START_TIMEOUT_SECONDS": "3",
+                "PSPLINK_POLLS_PER_SECOND": "10",
+            })
+            result = subprocess.run(
+                [str(ROOT / "scripts/psplink-shell.sh"), "ready"],
+                env=environment, capture_output=True, text=True,
+                timeout=8, check=False)
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertIn("PSPLink ready", result.stdout)
+            self.assertTrue(ready.exists())
+            self.assertTrue((root / ".tilefinch-usbhostfs.pid").exists())
+            self.assertEqual(
+                str(host),
+                (root / ".tilefinch-usbhostfs.root").read_text(
+                    encoding="utf-8").strip())
+
+            environment["HOST_ROOT"] = str(second_host)
+            environment["MOCK_EXPECTED_ROOT"] = str(second_host)
+            switched = subprocess.run(
+                [str(ROOT / "scripts/psplink-shell.sh"), "ready"],
+                env=environment, capture_output=True, text=True,
+                timeout=8, check=False)
+            self.assertEqual(0, switched.returncode, switched.stderr)
+            self.assertEqual(
+                str(second_host), active_root.read_text(
+                    encoding="utf-8").strip())
+            self.assertEqual(
+                str(second_host),
+                (root / ".tilefinch-usbhostfs.root").read_text(
+                    encoding="utf-8").strip())
+            bridge_pid = int((root / ".tilefinch-usbhostfs.pid").read_text(
+                encoding="utf-8").strip())
+            try:
+                os.kill(bridge_pid, 15)
+            except ProcessLookupError:
+                pass
+
+    def test_psplink_hold_observes_one_bridge_without_replacement(self):
+        # Real wrapper, mocked host tools only. Every wait and mock lifetime
+        # is bounded; this test never opens USB or a PSPLink socket.
+        for change in ("pid", "root", "death", "stop"):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                host = root / "host"
+                ready = root / "ready"
+                starts = root / "starts"
+                mock_pid = root / "mock-pid"
+                pspsh = root / "pspsh"
+                usbhostfs = root / "usbhostfs_pc"
+                pspsh.write_text(
+                    '#!/bin/sh\n[ -f "$MOCK_READY" ] || exit 1\n'
+                    'echo "PSPLink v3.2.1"\n')
+                usbhostfs.write_text(
+                    '#!/bin/sh\nprintf "%s\\n" "$$" >"$MOCK_PID"\n'
+                    'echo start >>"$MOCK_STARTS"\n: >"$MOCK_READY"\n'
+                    'exec sleep 20\n')
+                pspsh.chmod(0o755)
+                usbhostfs.chmod(0o755)
+                environment = dict(
+                    os.environ, HOST_ROOT=str(host), PSPLINK_STATE_DIR=str(root),
+                    PSPSH=str(pspsh), USBHOSTFS=str(usbhostfs),
+                    MOCK_READY=str(ready), MOCK_PID=str(mock_pid), MOCK_STARTS=str(starts),
+                    LINK_TIMEOUT_SECONDS="1", BRIDGE_START_TIMEOUT_SECONDS="2",
+                    PSPLINK_POLLS_PER_SECOND="10")
+                command = [str(ROOT / "scripts/psplink-shell.sh")]
+                hold = subprocess.Popen(command + ["hold"], env=environment,
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                        text=True)
+                try:
+                    readable, _, _ = select.select([hold.stdout], [], [], 5)
+                    self.assertTrue(readable, "bounded hold readiness")
+                    line = hold.stdout.readline()
+                    self.assertIn("PSPLink hold ready", line)
+                    bridge_pid = int(mock_pid.read_text().strip())
+                    self.assertIn(f"bridge PID: {bridge_pid}", line)
+                    self.assertIsNone(hold.poll())
+                    # Ordinary commands reuse the held bridge unchanged.
+                    probe = subprocess.run(command + ["exec", "ver"], env=environment,
+                                           capture_output=True, text=True, timeout=3)
+                    self.assertEqual(probe.returncode, 0, probe.stderr)
+                    self.assertEqual(starts.read_text().splitlines(), ["start"])
+                    self.assertIsNone(hold.poll())
+                    if change == "pid":
+                        (root / ".tilefinch-usbhostfs.pid").write_text(str(os.getpid()))
+                    elif change == "root":
+                        (root / ".tilefinch-usbhostfs.root").write_text(str(root / "other"))
+                    elif change == "death":
+                        os.kill(bridge_pid, 15)
+                    else:
+                        hold.terminate()
+                    _, error = hold.communicate(timeout=3)
+                    if change == "stop":
+                        self.assertEqual(hold.returncode, 0, error)
+                    else:
+                        self.assertNotEqual(hold.returncode, 0)
+                        self.assertIn("not replacing it", error)
+                    self.assertEqual(starts.read_text().splitlines(), ["start"])
+                    if change != "death":
+                        # Neither ownership failure nor stopping hold kills
+                        # the bridge (or the newly recorded PID).
+                        os.kill(bridge_pid, 0)
+                        os.kill(os.getpid(), 0)
+                finally:
+                    if hold.poll() is None:
+                        hold.terminate()
+                    hold.communicate(timeout=3)
+                    if mock_pid.exists():
+                        try:
+                            os.kill(int(mock_pid.read_text().strip()), 15)
+                        except ProcessLookupError:
+                            pass
+
+    def test_psplink_bridge_reports_host_socket_denial(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            host = root / "host"
+            host.mkdir()
+            pspsh = root / "pspsh"
+            usbhostfs = root / "usbhostfs_pc"
+            pspsh.write_text(
+                "#!/bin/sh\n"
+                "echo 'connect: Connection refused' >&2\n"
+                "exit 1\n", encoding="utf-8")
+            usbhostfs.write_text(
+                "#!/bin/sh\n"
+                "echo 'bind: Operation not permitted' >&2\n"
+                "sleep 8\n", encoding="utf-8")
+            pspsh.chmod(0o755)
+            usbhostfs.chmod(0o755)
+            environment = os.environ.copy()
+            environment.update({
+                "HOST_ROOT": str(host),
+                "PSPLINK_STATE_DIR": str(root),
+                "PSPSH": str(pspsh),
+                "USBHOSTFS": str(usbhostfs),
+                "LINK_TIMEOUT_SECONDS": "1",
+                "BRIDGE_START_TIMEOUT_SECONDS": "3",
+                "PSPLINK_POLLS_PER_SECOND": "10",
+            })
+            result = subprocess.run(
+                [str(ROOT / "scripts/psplink-shell.sh"), "ready"],
+                env=environment, capture_output=True, text=True,
+                timeout=8, check=False)
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn(
+                "host environment denied usbhostfs_pc", result.stderr)
+            self.assertIn(
+                "does not need to be relaunched", result.stderr)
 
 
 class QuickJsVariantPreparationTests(unittest.TestCase):

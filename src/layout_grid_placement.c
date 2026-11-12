@@ -23,19 +23,50 @@ void grid_placement_init(GridPlacementState *state, int columns, int rows,
     state->explicit_rows = state->rows;
     state->flow_column = computed_style_grid_auto_flow_column(container);
     state->dense = computed_style_grid_auto_flow_dense(container);
+    state->row_limit = GRID_IMPLICIT_ROW_LIMIT;
+}
+
+/* Whether rows [row, row + row_span) lie inside the occupancy window. */
+static bool grid_placement_in_window(const GridPlacementState *state,
+                                     int row, int row_span)
+{
+    return row >= state->row_base && row_span >= 1
+        && row_span <= GRID_PLACEMENT_ROW_LIMIT
+        && row <= state->row_limit - row_span
+        && row - state->row_base <= GRID_PLACEMENT_ROW_LIMIT - row_span;
+}
+
+/* Move the window down so it starts at `row` (never past the last full
+   window). Rows above it are forgotten and count as occupied. */
+static void grid_placement_slide(GridPlacementState *state, int row)
+{
+    int last_base = state->row_limit - GRID_PLACEMENT_ROW_LIMIT;
+    if (row > last_base) row = last_base;
+    if (row <= state->row_base) return;
+    int shift = row - state->row_base;
+    if (shift >= GRID_PLACEMENT_ROW_LIMIT) {
+        memset(state->occupied, 0, sizeof(state->occupied));
+    } else {
+        memmove(state->occupied, state->occupied + shift,
+                (size_t) (GRID_PLACEMENT_ROW_LIMIT - shift)
+                    * sizeof(state->occupied[0]));
+        memset(state->occupied + (GRID_PLACEMENT_ROW_LIMIT - shift), 0,
+               (size_t) shift * sizeof(state->occupied[0]));
+    }
+    state->row_base = (uint16_t) row;
 }
 
 static bool grid_placement_fits(const GridPlacementState *state,
                                 int row, int column,
                                 int row_span, int column_span)
 {
-    if (state == NULL || row < 0 || column < 0
-        || row_span < 1 || column_span < 1
-        || row + row_span > GRID_PLACEMENT_ROW_LIMIT
+    if (state == NULL || column < 0 || column_span < 1
+        || !grid_placement_in_window(state, row, row_span)
         || column + column_span > state->columns) return false;
     uint32_t mask = ((UINT32_C(1) << column_span) - 1u) << column;
+    int first = row - state->row_base;
     for (int offset = 0; offset < row_span; offset++) {
-        if ((state->occupied[row + offset] & mask) != 0) return false;
+        if ((state->occupied[first + offset] & mask) != 0) return false;
     }
     return true;
 }
@@ -44,10 +75,39 @@ static void grid_placement_mark(GridPlacementState *state,
                                 int row, int column,
                                 int row_span, int column_span)
 {
+    if (!grid_placement_in_window(state, row, row_span)) return;
     uint32_t mask = ((UINT32_C(1) << column_span) - 1u) << column;
+    int first = row - state->row_base;
     for (int offset = 0; offset < row_span; offset++) {
-        state->occupied[row + offset] |= mask;
+        state->occupied[first + offset] |= mask;
     }
+}
+
+/* First free area in row-flow order from (row, column), one column when
+   `fixed_column` is set. The window slides forward when the search passes
+   its end, so sparse auto-placement continues past 64 rows. */
+static bool grid_row_flow_search(GridPlacementState *state, int row,
+                                 int column, bool fixed_column,
+                                 int row_span, int column_span,
+                                 int *found_row, int *found_column)
+{
+    while (row <= state->row_limit - row_span) {
+        if (row - state->row_base > GRID_PLACEMENT_ROW_LIMIT - row_span) {
+            grid_placement_slide(state, row);
+        }
+        if (column + column_span <= state->columns
+            && grid_placement_fits(state, row, column,
+                                   row_span, column_span)) {
+            *found_row = row;
+            *found_column = column;
+            return true;
+        }
+        if (fixed_column || ++column >= state->columns) {
+            if (!fixed_column) column = 0;
+            row++;
+        }
+    }
+    return false;
 }
 
 static int grid_line_position(unsigned encoded, int origin,
@@ -126,6 +186,7 @@ static void grid_resolve_area(const GridPlacementState *state,
     }
     if (column < 0) column = 0;
     if (row < 0) row = 0;
+    if (row > state->row_limit - row_span) row = state->row_limit - row_span;
     if (column + column_span > state->columns) {
         column = state->columns - column_span;
     }
@@ -209,7 +270,8 @@ bool grid_placement_reserve(GridPlacementState *state, LayoutContext *context,
                 /* Step 1: items positioned in both axes may overlap; they
                    only claim their cells for later auto-placement. */
                 if (both
-                    && area.row + area.row_span <= GRID_PLACEMENT_ROW_LIMIT) {
+                    && grid_placement_in_window(state, area.row,
+                                                area.row_span)) {
                     grid_placement_mark(state, area.row, area.column,
                                         area.row_span, area.column_span);
                 }
@@ -284,7 +346,7 @@ bool grid_place_item(GridPlacementState *state, const ComputedStyle *style,
         /* Explicitly positioned grid items may overlap. Occupancy only
            constrains auto-placement; treating an occupied explicit area as
            a placement failure incorrectly moves later authored items. */
-        found = row + row_span <= GRID_PLACEMENT_ROW_LIMIT
+        found = grid_placement_in_window(state, row, row_span)
                 && column + column_span <= state->columns;
     } else if (explicit_row) {
         for (int candidate = 0;
@@ -295,6 +357,9 @@ bool grid_place_item(GridPlacementState *state, const ComputedStyle *style,
             found = true;
             break;
         }
+    } else if (explicit_column && !state->flow_column) {
+        found = grid_row_flow_search(state, state->row_base, column, true,
+                                     row_span, column_span, &row, &column);
     } else if (explicit_column) {
         for (int candidate = 0;
              candidate + row_span <= GRID_PLACEMENT_ROW_LIMIT; candidate++) {
@@ -324,29 +389,15 @@ bool grid_place_item(GridPlacementState *state, const ComputedStyle *style,
             }
         }
     } else {
-        int candidate_row = state->dense ? 0 : state->cursor_row;
-        int candidate_column = state->dense ? 0 : state->cursor_column;
-        while (candidate_row + row_span <= GRID_PLACEMENT_ROW_LIMIT) {
-            if (candidate_column + column_span <= state->columns
-                && grid_placement_fits(
-                    state, candidate_row, candidate_column,
-                    row_span, column_span)) {
-                row = candidate_row;
-                column = candidate_column;
-                found = true;
-                break;
-            }
-            candidate_column++;
-            if (candidate_column >= state->columns) {
-                candidate_column = 0;
-                candidate_row++;
-            }
-        }
+        found = grid_row_flow_search(
+            state, state->dense ? state->row_base : state->cursor_row,
+            state->dense ? 0 : state->cursor_column, false,
+            row_span, column_span, &row, &column);
     }
     if (!found) {
         /* Explicit collisions and documents beyond the bounded row envelope
-           retain content deterministically in the final available cell. */
-        row = GRID_PLACEMENT_ROW_LIMIT - row_span;
+           retain content deterministically in the window's final cell. */
+        row = state->row_base + GRID_PLACEMENT_ROW_LIMIT - row_span;
         column = state->columns - column_span;
     }
     grid_placement_mark(state, row, column, row_span, column_span);
@@ -369,16 +420,16 @@ bool grid_place_item(GridPlacementState *state, const ComputedStyle *style,
         if (next_column >= state->columns) {
             next_column = state->columns - 1;
         }
-        if (next_row >= GRID_PLACEMENT_ROW_LIMIT) {
-            next_row = GRID_PLACEMENT_ROW_LIMIT - 1;
+        if (next_row >= state->row_limit) {
+            next_row = state->row_limit - 1;
         }
-        state->cursor_row = (uint8_t) next_row;
+        state->cursor_row = (uint16_t) next_row;
         state->cursor_column = (uint8_t) next_column;
     }
     *placement = (GridItemPlacement) {
         .column = (uint8_t) column,
         .column_span = (uint8_t) column_span,
-        .row = (uint8_t) row,
+        .row = (uint16_t) row,
         .row_span = (uint8_t) row_span
     };
     return found;

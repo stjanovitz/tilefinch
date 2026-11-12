@@ -21,6 +21,7 @@
    a stale pre-uninstall active directory if power fails before the uninstall
    tombstone can be retired. */
 #define GLYPH_COMPONENT_ACTIVATED_MARKER "ACTIVATED"
+#define GLYPH_COMPONENT_DOWNLOAD_NAME "glyph-component.part"
 #define GLYPH_INSTALL_RECONCILE_ATTEMPTS 2u
 
 /* Published packs are about 1 MB each and color emoji about 5 MB
@@ -405,8 +406,16 @@ static bool restore_pre_activation_package(
     if (job->activated || path_exists(job->package_path)) return true;
     if (!path_exists(job->candidate_pack)
         || rename(job->candidate_pack, job->package_path) != 0) return false;
-    size_t entries = 0;
-    (void) remove_tree(job->candidate, 0, &entries);
+    /* A retry stages from the same directory, so no record of this attempt
+       may stay beside the package. */
+    static const char *const records[] = {
+        "READY", "component.tfgm", GLYPH_COMPONENT_ACTIVATED_MARKER
+    };
+    for (size_t at = 0; at < sizeof(records) / sizeof(records[0]); at++) {
+        char record[TILEFINCH_INSTALL_PATH_LIMIT];
+        if (join_path(job->candidate, records[at], record, sizeof(record)))
+            (void) unlink(record);
+    }
     return true;
 }
 
@@ -422,13 +431,58 @@ static void install_fail_before_activation(
     install_fail(job, status, message);
 }
 
+static bool candidate_paths(
+    const char *install_root, const TilefinchGlyphPackSpec *spec,
+    char *component, char *candidate)
+{
+    char relative[96];
+    snprintf(relative, sizeof(relative), "components/%s", spec->id);
+    return join_path(install_root, relative, component,
+                     TILEFINCH_INSTALL_PATH_LIMIT)
+        && join_path(component, "candidate.tmp", candidate,
+                     TILEFINCH_INSTALL_PATH_LIMIT);
+}
+
+bool tilefinch_glyph_component_download_path(
+    const char *install_root, TilefinchGlyphPack pack,
+    char *output, size_t output_size)
+{
+    const TilefinchGlyphPackSpec *spec = tilefinch_glyph_pack_spec(pack);
+    char component[TILEFINCH_INSTALL_PATH_LIMIT];
+    char candidate[TILEFINCH_INSTALL_PATH_LIMIT];
+    return install_root != NULL && spec != NULL
+        && candidate_paths(install_root, spec, component, candidate)
+        && join_path(candidate, GLYPH_COMPONENT_DOWNLOAD_NAME,
+                     output, output_size);
+}
+
+bool tilefinch_glyph_component_prepare_download(
+    const char *install_root, TilefinchGlyphPack pack,
+    char *output, size_t output_size)
+{
+    const TilefinchGlyphPackSpec *spec = tilefinch_glyph_pack_spec(pack);
+    char component[TILEFINCH_INSTALL_PATH_LIMIT];
+    char candidate[TILEFINCH_INSTALL_PATH_LIMIT];
+    if (install_root == NULL || spec == NULL
+        || !candidate_paths(install_root, spec, component, candidate)
+        || !join_path(candidate, GLYPH_COMPONENT_DOWNLOAD_NAME,
+                      output, output_size)) return false;
+    char mutable_component[TILEFINCH_INSTALL_PATH_LIMIT];
+    snprintf(mutable_component, sizeof(mutable_component), "%s", component);
+    size_t entries = 0;
+    return make_directories(mutable_component)
+        && (mkdir(component, 0777) == 0 || errno == EEXIST)
+        && remove_tree(candidate, 0, &entries)
+        && mkdir(candidate, 0777) == 0;
+}
+
 TilefinchGlyphComponentInstall *tilefinch_glyph_component_install_create(
     Budget *budget, const TilefinchGlyphComponentInstallOptions *options)
 {
     const TilefinchGlyphPackSpec *spec = options == NULL ? NULL
         : tilefinch_glyph_pack_spec(options->pack);
     if (budget == NULL || options == NULL || spec == NULL
-        || options->package_path == NULL || options->envelope == NULL
+        || options->envelope == NULL
         || options->envelope_length == 0 || options->manifest == NULL
         || options->manifest_digest == NULL || options->install_root == NULL
         || options->manifest->package_format
@@ -455,14 +509,10 @@ TilefinchGlyphComponentInstall *tilefinch_glyph_component_install_create(
     job->pack = options->pack;
     job->fault = options->fault;
     job->fault_opaque = options->fault_opaque;
-    snprintf(job->package_path, sizeof(job->package_path), "%s",
-             options->package_path);
-    char relative[96];
-    snprintf(relative, sizeof(relative), "components/%s", spec->id);
-    if (!join_path(options->install_root, relative, job->component,
-                   sizeof(job->component))
-        || !join_path(job->component, "candidate.tmp", job->candidate,
-                      sizeof(job->candidate))
+    if (!candidate_paths(options->install_root, spec, job->component,
+                         job->candidate)
+        || !join_path(job->candidate, GLYPH_COMPONENT_DOWNLOAD_NAME,
+                      job->package_path, sizeof(job->package_path))
         || !join_path(job->candidate, "pack.tfgf", job->candidate_pack,
                       sizeof(job->candidate_pack))
         || !join_path(job->component, "active", job->active,
@@ -505,19 +555,6 @@ bool tilefinch_glyph_component_install_cancel(
         return false;
     job->cancel_requested = true;
     return true;
-}
-
-static bool prepare_candidate(TilefinchGlyphComponentInstall *job)
-{
-    char mutable_component[TILEFINCH_INSTALL_PATH_LIMIT];
-    snprintf(mutable_component, sizeof(mutable_component), "%s",
-             job->component);
-    size_t entries = 0;
-    return make_directories(mutable_component)
-        && (mkdir(job->component, 0777) == 0 || errno == EEXIST)
-        && remove_tree(job->candidate, 0, &entries)
-        && mkdir(job->candidate, 0777) == 0
-        && rename(job->package_path, job->candidate_pack) == 0;
 }
 
 static bool finalize_candidate(TilefinchGlyphComponentInstall *job)
@@ -651,7 +688,7 @@ bool tilefinch_glyph_component_install_pump(
         job->phase = TILEFINCH_UPDATE_INSTALL_PREPARING;
     }
     if (job->phase == TILEFINCH_UPDATE_INSTALL_PREPARING) {
-        if (!prepare_candidate(job)) {
+        if (rename(job->package_path, job->candidate_pack) != 0) {
             install_fail(job, TILEFINCH_UPDATE_IO,
                          "FONT PACK STAGING FAILED");
             return true;

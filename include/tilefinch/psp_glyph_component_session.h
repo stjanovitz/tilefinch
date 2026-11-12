@@ -43,6 +43,16 @@ typedef struct {
     /* An install or removal retired after detaching the runtime packs; see
        psp_glyph_component_session_reattach(). */
     bool reattach_pending;
+    /* Why the last selection failed; NULL means no more specific reason. */
+    const char *select_failure;
+    /* A verified download whose installer could not start (memory, or the
+       file would not open). It stays downloaded for an explicit retry. */
+    bool install_refused;
+    /* The download could not begin because the pack's candidate folder
+       could not be emptied or created. */
+    bool download_folder_failed;
+    /* The current failure has been handed to the UI. */
+    bool failure_reported;
 } PspGlyphComponentSession;
 
 typedef enum {
@@ -57,6 +67,10 @@ typedef enum {
    generation. Never compiled into the browser. */
 extern bool (*psp_glyph_component_session_test_identity)(
     const TilefinchInstallPaths *paths, TilefinchGlyphPack pack);
+/* Host tests only: edits each client snapshot, standing in for a transfer
+   the host has no HTTPS origin to complete. */
+extern void (*psp_glyph_component_session_test_client)(
+    TilefinchUpdateClientSnapshot *snapshot);
 #endif
 
 /* Boot attachment is deliberately inert for the embedded-only defaults. It
@@ -108,6 +122,15 @@ bool psp_glyph_component_session_pump_operation(
     const TilefinchInstallPaths *paths, BrowserEngine *engine);
 bool psp_glyph_component_session_active(
     const PspGlyphComponentSession *session);
+/* Why psp_glyph_component_session_select_operation() last returned false, or
+   NULL when it has no more specific reason than the caller's own notice. */
+const char *psp_glyph_component_session_select_failure(
+    const PspGlyphComponentSession *session);
+/* The reason the operation has failed, once per failure: NULL while nothing
+   has failed, after the reason was taken, and after a cancellation. A new
+   attempt (primary, or a phase that is not a failure) arms it again. */
+const char *psp_glyph_component_session_take_failure(
+    PspGlyphComponentSession *session);
 /* After a retired install (menu or in-page offer) or removal: put back the selected
    language and emoji packs the install detached, then attach installed
    packs for script_mask (the page's scripts) through the lazy path, so the

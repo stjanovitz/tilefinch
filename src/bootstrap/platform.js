@@ -1,4 +1,6 @@
 (() => {
+  const trustedEvent =
+    __tilefinchRealmGlobal.__tilefinchTrustedEventShare.trustedEvent;
   const wrap = __tilefinchRealmGlobal.__tilefinchWrap;
   const retentionStats = __tilefinchRealmGlobal.__tilefinchRetentionStats;
   const documentListeners = __tilefinchRealmGlobal.__tilefinchDocumentListeners;
@@ -8,13 +10,19 @@
   const ancestorLimit = __tilefinchRealmGlobal.__tilefinchAncestorLimit;
   /* Web IDL exposes interface members as enumerable; class syntax defines
      them non-enumerable, so interfaces written as classes flip them here. */
-  const {
-    createPrivateSlot,
-    reflectString,
-    reflectBoolean,
-    reflectEnumerated,
-    secondaryDocumentPrototype,
-  } = __tilefinchRealmGlobal.__tilefinchDomShared;
+  const domShared = __tilefinchRealmGlobal.__tilefinchDomShared,
+    {
+      createPrivateSlot,
+      reflectString,
+      reflectBoolean,
+      reflectEnumerated,
+      secondaryDocumentPrototype,
+      checkElementName,
+      checkAttributeName,
+      checkQualifiedName,
+      asciiLower,
+      checkDoctypeName,
+    } = domShared;
   const enumerateInterfaceMembers = (constructor) => {
     const prototype = constructor.prototype;
     for (const key of Reflect.ownKeys(prototype)) {
@@ -210,192 +218,32 @@
   /* File-private helpers assigned inside the blocks below. */
   let isNativeFunction, detachNode;
   {
-    const selectorPseudoClasses = new Set([
-        "active", "any-link", "autofill", "blank", "buffering", "checked",
-        "current", "default", "defined", "dir", "disabled", "empty",
-        "enabled", "first", "first-child", "first-of-type", "focus",
-        "focus-visible", "focus-within", "fullscreen", "future", "has",
-        "heading", "host", "host-context", "hover", "indeterminate",
-        "in-range", "invalid", "is", "lang", "last-child", "last-of-type",
-        "left", "link", "local-link", "modal", "muted", "not",
-        "nth-child", "nth-col", "nth-last-child", "nth-last-col",
-        "nth-last-of-type", "nth-of-type", "only-child", "only-of-type",
-        "open", "optional", "out-of-range", "past", "paused",
-        "picture-in-picture", "placeholder-shown", "playing", "popover-open",
-        "read-only", "read-write", "required", "right", "root", "scope",
-        "seeking", "stalled", "state", "target", "target-current",
-        "user-invalid", "user-valid", "valid", "visited", "volume-locked",
-        "where", "-webkit-any-link", "-webkit-autofill",
-        "-webkit-full-screen",
-      ]),
-      selectorPseudoElements = new Set([
-        "after", "backdrop", "before", "cue", "cue-region",
-        "file-selector-button", "first-letter", "first-line", "marker",
-        "part", "placeholder", "selection", "slotted",
-      ]),
-      selectorBalanced = (selector) => {
-        const stack = [];
-        let quote = "";
-        for (let at = 0; at < selector.length; at++) {
-          const char = selector[at];
-          if (quote) {
-            if (char === "\\") at++;
-            else if (char === quote) quote = "";
-            continue;
-          }
-          if (char === '"' || char === "'") {
-            quote = char;
-            continue;
-          }
-          if (char === "\\") {
-            at++;
-            continue;
-          }
-          if (char === "(" || char === "[") stack.push(char);
-          else if (char === ")" || char === "]") {
-            const open = stack.pop();
-            if (
-              (char === ")" && open !== "(") ||
-              (char === "]" && open !== "[")
-            )
-              return false;
-          }
-        }
-        return !quote && stack.length === 0;
-      },
-      selectorListSegmentsValid = (selector) => {
-        let quote = "", squareDepth = 0, roundDepth = 0, segmentStart = 0;
-        for (let at = 0; at <= selector.length; at++) {
-          const char = selector[at] || ",";
-          if (quote) {
-            if (char === "\\") at++;
-            else if (char === quote) quote = "";
-            continue;
-          }
-          if (char === '"' || char === "'") {
-            quote = char;
-            continue;
-          }
-          if (char === "\\") {
-            at++;
-            continue;
-          }
-          if (char === "[") squareDepth++;
-          else if (char === "]") squareDepth--;
-          else if (char === "(") roundDepth++;
-          else if (char === ")") roundDepth--;
-          else if (char === "," && squareDepth === 0 && roundDepth === 0) {
-            if (!selector.slice(segmentStart, at).trim()) return false;
-            segmentStart = at + 1;
-          }
-        }
-        return true;
-      },
-      selectorPseudosValid = (selector) => {
-        let quote = "", squareDepth = 0;
-        for (let at = 0; at < selector.length; at++) {
-          const char = selector[at];
-          if (quote) {
-            if (char === "\\") at++;
-            else if (char === quote) quote = "";
-            continue;
-          }
-          if (char === '"' || char === "'") {
-            quote = char;
-            continue;
-          }
-          if (char === "\\") {
-            at++;
-            continue;
-          }
-          if (char === "[") {
-            squareDepth++;
-            continue;
-          }
-          if (char === "]") {
-            squareDepth--;
-            continue;
-          }
-          if (char !== ":" || squareDepth > 0) continue;
-          const pseudoElement = selector[at + 1] === ":";
-          if (pseudoElement) at++;
-          const start = at + 1;
-          if (selector[start] === "\\") continue;
-          let end = start;
-          while (end < selector.length && /[A-Za-z0-9_-]/.test(selector[end]))
-            end++;
-          if (end === start) return false;
-          const name = selector.slice(start, end).toLowerCase(),
-            known = pseudoElement
-              ? selectorPseudoElements.has(name)
-              : selectorPseudoClasses.has(name);
-          if (!known) return false;
-          at = end - 1;
-        }
-        return true;
-      },
-      selectorSyntaxValid = (value) => {
-        const selector = String(value).trim();
-        return (
-          !!selector &&
-          selectorBalanced(selector) &&
-          selectorListSegmentsValid(selector) &&
-          selectorPseudosValid(selector) &&
-          !/#\s/.test(selector) &&
-          !/:not\(\s*\)/i.test(selector) &&
-          !/:not\([^)]*::/i.test(selector) &&
-          !/:host\(:not\([^)]*\S\s+\S[^)]*\)\)/i.test(selector) &&
-          !/:has\b(?!\s*\()/i.test(selector) &&
-          !/:has\(\s*\)/i.test(selector) &&
-          !/:has\(\s*\d/i.test(selector) &&
-          !/:has\([^)]*,\s*\d/i.test(selector)
-        );
-      },
+    /* DOM's "parse a selector": the Selectors Level 4 grammar, checked
+       natively (selector_syntax.c). An invalid selector must throw
+       SyntaxError rather than match nothing: jQuery and similar engines
+       try querySelectorAll first and use their own matcher (":first",
+       "[a!=b]") only when it throws. */
+    const selectorSyntaxNative =
+        __tilefinchRealmGlobal.__tilefinchSelectorSyntaxValid,
+      /* CSS.supports(selector(...)) also refuses what the native matcher
+         parses but does not implement. */
       selectorSupported = (value) => {
         const selector = String(value).trim();
         return (
-          selectorSyntaxValid(selector) &&
+          selectorSyntaxNative(selector) &&
           !/:host\(:(?:is|where)\([^)]*\S\s+\S[^)]*\)\)/i.test(selector) &&
-          !/:(?:is|where)\([^)]*::/i.test(selector) &&
           !/::part\([^)]*\):(is|where)\(\s*\[/i.test(selector)
         );
       };
-    /* Validation is a dozen regular expressions and three character scans,
-       far more than the native match; pages ask the same few selectors
-       repeatedly (closest() once per ancestor). Remember recent valid
-       ones, dropping the oldest, so a page that also builds one-off
-       selectors (per-id attribute lookups) does not flush the common ones;
-       an invalid selector is re-checked and throws every time. */
-    const validSelectors = new Set(),
-      validSelectorLimit = 256,
-      /* Plain selectors -- type, #id, .class and [attr] / [attr=value]
-         compounds joined by descendant, >, +, ~ or commas, with identifiers
-         that cannot start with a digit and no pseudo-classes or escapes --
-         are valid by construction: one native test instead of the scans.
-         Anything else takes the full check. */
-      plainIdent = String.raw`-?[A-Za-z_][\w-]*`,
-      plainAttribute = String.raw`\[\s*` + plainIdent +
-        String.raw`\s*(?:[~|^$*]?=\s*(?:"[^"\\\n]*"|'[^'\\\n]*'|` +
-        plainIdent + String.raw`)\s*)?\]`,
-      plainSubclass = "(?:[#.]" + plainIdent + "|" + plainAttribute + ")",
-      plainCompound = "(?:(?:" + plainIdent + String.raw`|\*)` +
-        plainSubclass + "*|" + plainSubclass + "+)",
-      plainComplex = plainCompound + String.raw`(?:\s*[>+~]\s*` +
-        plainCompound + String.raw`|\s+` + plainCompound + ")*",
-      plainSelector = new RegExp(String.raw`^\s*` + plainComplex +
-        String.raw`(?:\s*,\s*` + plainComplex + String.raw`)*\s*$`);
+    /* Pages repeat one selector in a row (a loop of matches() calls),
+       so the last valid one skips the native check. */
+    let lastValidSelector = "*";
     __tilefinchRealmGlobal.__tilefinchAssertSelector = (value) => {
       value = String(value);
-      if (validSelectors.has(value)) return value;
-      if (!(value.length <= 256 && plainSelector.test(value)) &&
-          !selectorSyntaxValid(value))
+      if (value === lastValidSelector) return value;
+      if (!selectorSyntaxNative(value))
         throw new DOMException("Invalid selector", "SyntaxError");
-      if (value.length <= 256) {
-        if (validSelectors.size >= validSelectorLimit)
-          validSelectors.delete(validSelectors.values().next().value);
-        validSelectors.add(value);
-      }
-      return value;
+      return (lastValidSelector = value);
     };
     const documentQuery = Document.prototype.querySelector,
       documentQueryAll = Document.prototype.querySelectorAll,
@@ -1021,12 +869,26 @@
         [Symbol.iterator]() { return this; },
       };
     };
+  /* application/x-www-form-urlencoded serialization of one pair. */
+  const urlParamEncode = (value) => {
+      value = encodeURIComponent(tilefinchUSVString(value));
+      if (value.indexOf("%20") >= 0) value = value.replace(/%20/g, "+");
+      return /[!'()~]/.test(value) ? value.replace(/[!'()~]/g,
+        (char) => "%" + char.charCodeAt(0).toString(16).toUpperCase())
+        : value;
+    },
+    urlParamPair = (key, value) =>
+      urlParamEncode(key) + "=" + urlParamEncode(value);
   /* Named as the interface: the class name is what `name` and toString()
      report. */
   const TilefinchURLSearchParams = class URLSearchParams {
     constructor(query = "", changed = null) {
       this.items = [];
       this.changed = changed;
+      /* The serialized list while it is known (append extends it), so a
+         URL's searchParams.append costs one pair, not the whole query. */
+      this._text = null;
+      this._count = 0;
       if (query === undefined) query = "";
       if (typeof query === "string") {
         for (const part of query.replace(/^\?/, "").split("&")) {
@@ -1072,6 +934,7 @@
     }
     _replace(query) {
       this.items.length = 0;
+      this._text = null;
       for (const part of String(query).replace(/^\?/, "").split("&")) {
         if (!part) continue;
         const at = part.indexOf("=");
@@ -1082,7 +945,14 @@
       }
     }
     append(key, value) {
-      this._append(tilefinchUSVString(key), tilefinchUSVString(value));
+      key = tilefinchUSVString(key);
+      value = tilefinchUSVString(value);
+      const text = this._text;
+      this._append(key, value);
+      if (text !== null) {
+        this._text = (text ? text + "&" : "") + urlParamPair(key, value);
+        this._count = this.items.length;
+      }
       this.notify();
     }
     delete(key, value) {
@@ -1093,6 +963,7 @@
         if (this.items[index][0] === key
             && (!matchValue || this.items[index][1] === wanted))
           this.items.splice(index, 1);
+      this._text = null;
       this.notify();
     }
     get(key) {
@@ -1128,10 +999,12 @@
         } else this.items.splice(index, 1);
       }
       if (!seen) this._append(key, value);
+      this._text = null;
       this.notify();
     }
     sort() {
       this.items.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+      this._text = null;
       this.notify();
     }
     forEach(callback, thisArg) {
@@ -1157,21 +1030,45 @@
       if (this.changed) this.changed(this.toString());
     }
     toString() {
-      const enc = (value) =>
-        encodeURIComponent(tilefinchUSVString(value))
-          .replace(/%20/g, "+")
-          .replace(
-            /[!'()~]/g,
-            (char) => "%" + char.charCodeAt(0).toString(16).toUpperCase(),
-          );
-      return this.items
-        .map((pair) => enc(pair[0]) + "=" + enc(pair[1]))
-        .join("&");
+      if (this._text !== null && this._count === this.items.length)
+        return this._text;
+      this._count = this.items.length;
+      return (this._text = this.items
+        .map((pair) => urlParamPair(pair[0], pair[1])).join("&"));
     }
   };
-  const tilefinchURLInput = (value) =>
-    tilefinchUSVString(value).replace(
-      /[^\x21-\x7e]/gu, (char) => encodeURIComponent(char));
+  /* The URL Standard's first steps: strip leading and trailing C0
+     controls and spaces, and remove every tab and newline. */
+  const tilefinchURLTrim = (value) => {
+      let text = tilefinchUSVString(value), start = 0, end = text.length;
+      while (start < end && text.charCodeAt(start) <= 32) start++;
+      while (end > start && text.charCodeAt(end - 1) <= 32) end--;
+      if (start > 0 || end < text.length) text = text.slice(start, end);
+      return text.indexOf("\t") < 0 && text.indexOf("\n") < 0 &&
+        text.indexOf("\r") < 0 ? text : text.replace(/[\t\n\r]/g, "");
+    },
+    tilefinchURLEncode = (value, pattern) =>
+      value.replace(pattern, (char) => encodeURIComponent(char)),
+    tilefinchURLInput = (value) =>
+      tilefinchURLEncode(tilefinchURLTrim(value), /[^\x21-\x7e]/gu),
+    /* ws and wss resolve as http and https, and a backslash before the
+       query is a slash, as in every special URL. */
+    tilefinchURLAsHTTP = (text) => {
+      if ((text.charCodeAt(0) | 32) === 119)
+        text = text.replace(/^ws(s?):/i, "http$1:");
+      return text.indexOf("\\") < 0 ? text :
+        text.replace(/^[^?#]*/, (head) => head.replace(/\\/g, "/"));
+    },
+    tilefinchURLScheme = (text) => {
+      const match = /^([A-Za-z][A-Za-z0-9+.-]*):/.exec(text);
+      return match ? match[1].toLowerCase() : "";
+    },
+    /* Schemes the URL Standard calls special; ws and wss resolve as http
+       and https, whose host and default port rules they share. ftp and
+       file are not represented here. */
+    tilefinchURLSpecial = Object.assign(Object.create(null), {
+      http: "80", https: "443", ws: "80", wss: "443", ftp: "21", file: "",
+    });
   const tilefinchURLPath = (value) => {
     value = tilefinchUSVString(value);
     if (!value.startsWith("/")) value = "/" + value;
@@ -1193,34 +1090,77 @@
       /[^\x21-\x7e]|[ #]/gu, (char) => encodeURIComponent(char));
   };
   const TilefinchURL = class URL {
+    /* Defined, not assigned, so an author setter on Object.prototype
+       cannot capture a URL's parts; the browser reads location, origins
+       and referrers from these fields, never the replaceable getters. */
+    _href = "";
+    _protocol = "";
+    _host = "";
+    _hostname = "";
+    _port = "";
+    _pathname = "";
+    _search = "";
+    _hash = "";
+    _origin = "null";
+    _prefix = "";
+    _opaque = false;
+    _searchParams = null;
     constructor(input, base) {
-      const text = tilefinchURLInput(input);
-      if (/^blob:/i.test(text)) {
-        this._setBlob(text);
+      const raw = tilefinchURLTrim(input),
+        scheme = tilefinchURLScheme(raw);
+      /* A base passed by script must itself be an absolute URL. A
+         non-special one (data:, mailto:, about:blank, blob:, x:/) is
+         parsed here; special ones go to the native resolver below. */
+      let baseURL = null, baseRaw = "", baseScheme = "";
+      if (base !== undefined) {
+        baseRaw = tilefinchURLTrim(base);
+        baseScheme = tilefinchURLScheme(baseRaw);
+        if (!baseScheme) throw new TypeError("Invalid URL");
+        if (!(baseScheme in tilefinchURLSpecial))
+          baseURL = new TilefinchURL(baseRaw);
+      }
+      if (scheme === "blob" || (scheme && !(scheme in tilefinchURLSpecial))) {
+        this._set(scheme === "blob" ? tilefinchURLInput(raw) : raw);
         return;
       }
-      /* A base passed by script must itself be a URL, but only relative
-         input is resolved against it: an opaque base (blob:, data:,
-         about:blank) rejects relative input and leaves absolute input
-         alone. The document's own URL keeps its fallback (a fixture file
-         path or an about:blank document still resolves relative input). */
+      if (baseURL && !scheme) {
+        /* An opaque path takes only a fragment as relative input. */
+        if (raw[0] !== "#" && baseURL._opaque)
+          throw new TypeError("Invalid URL");
+        this._set(raw[0] === "#"
+          ? baseURL._prefix + baseURL._pathname + baseURL._search + raw
+          : baseURL._resolve(raw));
+        return;
+      }
+      /* http(s), ws(s), and relative input against a special base or the
+         document's own URL, which keeps its fallback (a fixture file path
+         or an about:blank document still resolves relative input). */
       const own = base === undefined,
-        baseText = tilefinchURLInput(own
-          ? __tilefinchRealmGlobal.__tilefinchLocationHref || "https://example.invalid/"
-          : base),
-        resolved = (own || /^[A-Za-z][A-Za-z0-9+.-]*:/.test(baseText)) &&
-          __tilefinchResolveURL(text, baseText, own);
+        target = scheme || baseScheme,
+        resolved = target !== "ftp" && target !== "file" &&
+          __tilefinchResolveURL(
+            tilefinchURLAsHTTP(tilefinchURLEncode(raw, /[^\x21-\x7e]/gu)),
+            own
+              ? __tilefinchRealmGlobal.__tilefinchLocationHref ||
+                "https://example.invalid/"
+              : tilefinchURLAsHTTP(
+                  tilefinchURLEncode(baseRaw, /[^\x21-\x7e]/gu)), own);
       if (!resolved) throw new TypeError("Invalid URL");
-      this._set(resolved);
+      this._setSpecial(target === "ws" || target === "wss"
+        ? target + resolved.slice(resolved.indexOf(":"))
+        : resolved);
     }
     _setSearchParams(search) {
       if (this._searchParams) this._searchParams._replace(search);
       else
+        /* A list change rewrites only the query: its serialization is
+           already percent-encoded, so neither the search setter's encoding
+           nor its re-parse of the list is needed. */
         this._searchParams = new TilefinchURLSearchParams(search, (value) => {
-          this.search = value ? "?" + value : "";
-          this._href = this.protocol === "blob:"
-            ? "blob:" + this.pathname + this.search + this.hash
-            : this.origin + this.pathname + this.search + this.hash;
+          const query = value ? "?" + value : "";
+          this._search = query;
+          if (this._href)
+            this._href = this._prefix + this._pathname + query + this._hash;
         });
     }
     _setBlob(href) {
@@ -1244,16 +1184,83 @@
       this._search = search;
       this._hash = hash;
       this._origin = origin;
+      this._prefix = "blob:";
+      this._opaque = true;
       this._href = "blob:" + pathname + search + hash;
       this._setSearchParams(search);
     }
+    /* A URL whose scheme is not special, by the URL Standard's rules: an
+       optional //host[:port] (an opaque host; userinfo is refused, as
+       everywhere in Tilefinch), then either a hierarchical path, whose dot
+       segments are removed, or an opaque path such as mailto:'s. */
+    _setNonSpecial(text) {
+      const parsed =
+          /^([A-Za-z][A-Za-z0-9+.-]*:)(?:\/\/([^\/?#]*))?([^?#]*)(\?[^#]*)?(#[\s\S]*)?$/
+            .exec(text),
+        authority = parsed ? parsed[2] : undefined,
+        hostPort = authority === undefined ? null :
+          /^([^\x00\t\n\r #\/:<>?@\[\\\]^|]*)(?::([0-9]*))?$/.exec(authority);
+      if (!parsed || (authority !== undefined &&
+          (!hostPort || Number(hostPort[2]) > 65535)))
+        throw new TypeError("Invalid URL");
+      const encode = (value) => tilefinchURLEncode(value, /[^\x21-\x7e]/gu),
+        hostname = hostPort ? encode(hostPort[1]) : "",
+        port = hostPort && hostPort[2] ? String(Number(hostPort[2])) : "",
+        host = hostname + (port ? ":" + port : ""),
+        search = parsed[4] && parsed[4] !== "?" ? encode(parsed[4]) : "",
+        hash = parsed[5] && parsed[5] !== "#" ? encode(parsed[5]) : "";
+      let path = parsed[3];
+      this._opaque = authority === undefined && path[0] !== "/";
+      if (this._opaque) {
+        /* Spaces stay, except one just before the query or fragment. */
+        if (parsed[4] || parsed[5]) path = path.replace(/ $/, "%20");
+        path = tilefinchURLEncode(path, /[^\x20-\x7e]/gu);
+      } else {
+        const segments = encode(path).split("/"), kept = [];
+        for (let at = 1; at < segments.length; at++) {
+          const segment = segments[at].toLowerCase(),
+            last = at === segments.length - 1;
+          if (/^(?:\.|%2e){2}$/.test(segment)) kept.pop();
+          if (/^(?:\.|%2e){1,2}$/.test(segment)) {
+            if (last) kept.push("");
+          } else kept.push(segments[at]);
+        }
+        path = segments.length > 1 ? "/" + kept.join("/") : "";
+      }
+      this._protocol = parsed[1].toLowerCase();
+      this._hostname = hostname;
+      this._port = port;
+      this._host = host;
+      this._pathname = path;
+      this._search = search;
+      this._hash = hash;
+      this._origin = "null";
+      this._prefix = this._protocol + (authority === undefined ? "" : "//" + host);
+      this._href = this._prefix + path + search + hash;
+      this._setSearchParams(search);
+    }
+    /* Relative, non-fragment input against this hierarchical non-special
+       URL, as an absolute URL for _setNonSpecial. */
+    _resolve(input) {
+      if (!input) return this._prefix + this._pathname + this._search;
+      if (input.startsWith("//")) return this._protocol + input;
+      if (input[0] === "?") return this._prefix + this._pathname + input;
+      return this._prefix + (input[0] === "/" ? "" :
+        this._pathname.replace(/[^\/]*$/, "") || "/") + input;
+    }
     _set(href) {
-      if (/^blob:/i.test(String(href))) {
+      href = String(href);
+      const scheme = tilefinchURLScheme(href);
+      if (scheme === "blob") {
         this._setBlob(href);
         return;
       }
-      const parsed = String(href).match(
-        /^([^:]+:)\/\/([^\/?#:]+)(?::([0-9]+))?([^?#]*)(\?[^#]*)?(#.*)?$/,
+      if (!(scheme in tilefinchURLSpecial)) this._setNonSpecial(href);
+      else this._setSpecial(href);
+    }
+    _setSpecial(href) {
+      const parsed = href.match(
+        /^([^:]+:)\/\/(\[[^\]\/?#]*\]|[^\/?#:]+)(?::([0-9]+))?([^?#]*)(\?[^#]*)?(#.*)?$/,
       );
       if (!parsed) throw new TypeError("Invalid URL");
       const serialize = (value) =>
@@ -1276,6 +1283,8 @@
       this._search = search;
       this._hash = hash;
       this._origin = origin;
+      this._prefix = origin;
+      this._opaque = false;
       this._href = origin + pathname + search + hash;
       this._setSearchParams(search);
     }
@@ -1298,54 +1307,53 @@
     get protocol() { return this._protocol; }
     set protocol(value) {
       if (this._protocol === "blob:") return;
-      value = tilefinchUSVString(value);
-      if (!value.endsWith(":")) value += ":";
-      if (!/^[A-Za-z][A-Za-z0-9+.-]*:$/.test(value)) return;
-      this._setCandidate(value + "//" + this.host + this.pathname +
-        this.search + this.hash);
+      const scheme = tilefinchURLScheme(tilefinchUSVString(value) + ":");
+      /* A URL never changes between a special and a non-special scheme. */
+      if (scheme && (scheme in tilefinchURLSpecial) ===
+          (this._protocol.slice(0, -1) in tilefinchURLSpecial))
+        this._setCandidate(
+          scheme + ":" + this._href.slice(this._protocol.length));
     }
     get hostname() { return this._hostname; }
     set hostname(value) {
-      if (this._protocol === "blob:") return;
+      if (this._opaque) return;
       value = tilefinchUSVString(value);
       if (!value || /[\s\/?#@]/.test(value)) return;
-      this._setCandidate(this.protocol + "//" + value +
-        (this.port ? ":" + this.port : "") + this.pathname +
-        this.search + this.hash);
+      this._setCandidate(this._protocol + "//" + value +
+        (this._port ? ":" + this._port : "") + this._pathname +
+        this._search + this._hash);
     }
     get port() { return this._port; }
     set port(value) {
-      if (this._protocol === "blob:") return;
+      if (this._opaque) return;
       value = tilefinchUSVString(value);
       if (value && (!/^[0-9]+$/.test(value) || Number(value) > 65535)) return;
-      if ((this.protocol === "http:" && value === "80") ||
-          (this.protocol === "https:" && value === "443")) value = "";
-      this._setCandidate(this.protocol + "//" + this.hostname +
-        (value ? ":" + value : "") + this.pathname +
-        this.search + this.hash);
+      if (value === tilefinchURLSpecial[this._protocol.slice(0, -1)])
+        value = "";
+      this._setCandidate(this._protocol + "//" + this._hostname +
+        (value ? ":" + value : "") + this._pathname +
+        this._search + this._hash);
     }
     get host() { return this._host; }
     set host(value) {
-      if (this._protocol === "blob:") return;
+      if (this._opaque) return;
       value = tilefinchUSVString(value);
       if (!value || /[\s\/?#@]/.test(value)) return;
-      this._setCandidate(this.protocol + "//" + value + this.pathname +
-        this.search + this.hash);
+      this._setCandidate(this._protocol + "//" + value + this._pathname +
+        this._search + this._hash);
     }
     get pathname() { return this._pathname; }
     set pathname(value) {
-      if (this._protocol === "blob:") return;
-      this._setCandidate(this.origin + tilefinchURLPath(value) +
-        this.search + this.hash);
+      if (this._opaque) return;
+      this._setCandidate(this._prefix + tilefinchURLPath(value) +
+        this._search + this._hash);
     }
     get hash() { return this._hash || ""; }
     set hash(value) {
       const hash = tilefinchURLHash(value);
       this._hash = hash;
       if (this._href)
-        this._href = this.protocol === "blob:"
-          ? "blob:" + this.pathname + this.search + hash
-          : this.origin + this.pathname + this.search + hash;
+        this._href = this._prefix + this._pathname + this._search + hash;
     }
     get origin() { return this._origin; }
     /* Tilefinch's URL layer refuses userinfo outright (src/url.c), so no URL
@@ -1366,17 +1374,22 @@
       this._search = search;
       if (this._searchParams) this._searchParams._replace(search);
       if (this._href)
-        this._href = this.protocol === "blob:"
-          ? "blob:" + this.pathname + search + this.hash
-          : this.origin + this.pathname + search + this.hash;
+        this._href = this._prefix + this._pathname + search + this._hash;
     }
     toString() {
-      return this.href;
+      return this._href;
     }
     toJSON() {
-      return this.href;
+      return this._href;
     }
   };
+  /* The parser's own steps stay the browser's: an author cannot replace
+     or wrap them on the page-visible prototype. */
+  for (const key of Reflect.ownKeys(TilefinchURL.prototype))
+    if (typeof key === "string" && key[0] === "_")
+      Object.defineProperty(TilefinchURL.prototype, key, {
+        configurable: false, enumerable: false, writable: false,
+      });
   /* URL.parse and URL.canParse follow the URL Standard: without a base, a
      relative input fails. (The constructor still resolves such input
      against the document URL, as it always has here.) */
@@ -1410,59 +1423,44 @@
       get encoding() {
         return "utf-8";
       }
-      _next(text, at) {
-        const first = text.charCodeAt(at);
-        if (first >= 55296 && first <= 56319 && at + 1 < text.length) {
-          const second = text.charCodeAt(at + 1);
-          if (second >= 56320 && second <= 57343)
-            return {
-              cp: 65536 + ((first - 55296) << 10) + (second - 56320),
-              units: 2,
-            };
-        }
-        return {
-          cp: first >= 55296 && first <= 57343 ? 65533 : first,
-          units: 1,
-        };
-      }
-      _write(cp, bytes) {
-        if (cp <= 127) bytes.push(cp);
-        else if (cp <= 2047) bytes.push(192 | (cp >> 6), 128 | (cp & 63));
-        else if (cp <= 65535)
-          bytes.push(224 | (cp >> 12), 128 | ((cp >> 6) & 63), 128 | (cp & 63));
-        else
-          bytes.push(
-            240 | (cp >> 18),
-            128 | ((cp >> 12) & 63),
-            128 | ((cp >> 6) & 63),
-            128 | (cp & 63),
-          );
-      }
       encode(input = "") {
         return encodeUtf8Native(trustedStringToWellFormed(String(input)));
       }
+      /* Native encodes of the part that can fit, a chunk at a time (a
+         64 Ki-unit chunk stays under the encoder's bound), and one copy
+         per chunk. At most `room` UTF-16 units fit, since each takes a
+         byte or more. A chunk that does not fit is copied up to its last
+         whole sequence, and `read` counts the units those bytes came
+         from. */
       encodeInto(source, destination) {
-        if (!(destination instanceof Uint8Array))
+        if (!(destination instanceof TrustedUint8Array))
           throw new TypeError("Uint8Array destination required");
-        const text = String(source);
-        let read = 0,
-          written = 0;
-        while (read < text.length) {
-          const next = this._next(text, read),
-            need =
-              next.cp <= 127
-                ? 1
-                : next.cp <= 2047
-                  ? 2
-                  : next.cp <= 65535
-                    ? 3
-                    : 4;
-          if (written + need > destination.byteLength) break;
-          const bytes = [];
-          this._write(next.cp, bytes);
-          destination.set(bytes, written);
-          written += need;
-          read += next.units;
+        const text = String(source), room = destination.length;
+        let read = 0, written = 0;
+        while (read < text.length && written < room) {
+          let end = read + Math.min(room - written, 65536);
+          const last = text.charCodeAt(end - 1);
+          if (last >= 55296 && last <= 56319) end++;
+          const units = text.slice(read, end),
+            bytes = encodeUtf8Native(trustedStringToWellFormed(units));
+          if (bytes.length <= room - written) {
+            destination.set(bytes, written);
+            read += units.length;
+            written += bytes.length;
+            continue;
+          }
+          let cut = room - written;
+          while (cut > 0 && (bytes[cut] & 192) === 128) cut--;
+          const kept = bytes.subarray(0, cut),
+            decoded = decodeUtf8ValidNative
+              ? decodeUtf8ValidNative(kept, false) : null;
+          if (decoded !== null) read += decoded.length;
+          else
+            for (let at = 0; at < cut; at++)
+              if ((kept[at] & 192) !== 128) read += kept[at] >= 240 ? 2 : 1;
+          destination.set(kept, written);
+          written += cut;
+          break;
         }
         return { read, written };
       }
@@ -1985,24 +1983,70 @@
        moves: tree changes and id/form/type writes, not the class and style
        churn of a framework update. Like HTMLFormControlsCollection it cannot
        be modified by the page. */
-    cachedFormControls = (form) => {
+    /* The form's current cache entry, or null where there is no native
+       version to key one on. */
+    formControlEntry = (form) => {
       const version = nativeDomVersion?.(true),
         custom = __tilefinchRealmGlobal.__tilefinchFormAssociatedSelector?.() || "";
-      if (typeof version !== "number" || version < 0)
-        return formControls(form);
+      if (typeof version !== "number" || version < 0) return null;
       const cached = formControlCache.get(form);
       if (cached && cached.version === version && cached.custom === custom)
-        return cached.values;
-      const values = Object.freeze(formControls(form));
-      formControlCache.set(form, { version, custom, values });
-      return values;
-    };
-  Object.defineProperty(HTMLFormElement.prototype, "elements", {
-    configurable: true,
-    get() {
-      return cachedFormControls(this);
+        return cached;
+      const entry = {
+        version,
+        custom,
+        values: Object.freeze(formControls(form)),
+        published: null,
+      };
+      formControlCache.set(form, entry);
+      return entry;
+    },
+    cachedFormControls = (form) =>
+      formControlEntry(form)?.values ?? formControls(form);
+  /* Set below, once the select helpers it captures exist. */
+  let formCollections;
+  Object.defineProperties(HTMLFormElement.prototype, {
+    elements: {
+      configurable: true,
+      get() {
+        return formCollections().publishedFormControls(this);
+      },
+    },
+    length: {
+      configurable: true,
+      get() {
+        return cachedFormControls(this).length;
+      },
     },
   });
+  /* DOM0 form access (form.user.value, form[0]): a named-properties object
+     between HTMLFormElement.prototype and HTMLElement.prototype, like a
+     browser's. It answers only keys nothing above it defines, so a control
+     named "action" or "submit" never hides the form's own member from the
+     page or from the browser's code (a browser lets it). Lookups of members
+     further down pay one trap. */
+  {
+    const below = Object.getPrototypeOf(HTMLFormElement.prototype),
+      target = Object.create(below);
+    let resolving = false;
+    Object.setPrototypeOf(HTMLFormElement.prototype, new Proxy(target, {
+      get(object, key, receiver) {
+        const value = Reflect.get(object, key, receiver);
+        /* Symbols and the browser's own "__" probes are never names, and
+           must not load the module. */
+        if (value !== undefined || resolving || typeof key !== "string" ||
+            key === "" || key.startsWith("__") || key in object ||
+            !(receiver instanceof HTMLFormElement))
+          return value;
+        resolving = true;
+        try {
+          return formCollections().formNamedProperty(receiver, key);
+        } finally {
+          resolving = false;
+        }
+      },
+    }));
+  }
   /* The form owner's scope for an inline event handler of one of its
      controls (dom.js): HTMLFormElement's named properties (listed controls by
      id or name, LegacyOverrideBuiltIns) ahead of its members, so
@@ -2044,21 +2088,41 @@
       },
     },
   });
-  const controlStateLimit = 128,
-    controlStateKey = (control) =>
-      control?.__handle !== undefined ? Number(control.__handle) : control,
-    controlStateHas = (map, control) => map.has(controlStateKey(control)),
-    controlStateGet = (map, control) => map.get(controlStateKey(control)),
-    controlStateSet = (map, control, value) => {
-      const key = controlStateKey(control);
-      if (map.has(key)) map.delete(key);
-      while (map.size >= controlStateLimit)
-        map.delete(map.keys().next().value);
-      map.set(key, value);
+  /* Dirty control state (values, selectedness, checkedness defaults) is
+     the script-side source of truth, so it is never evicted: a table holds
+     one entry per live control that script or the user changed, keyed by
+     its native handle so it outlives the wrapper. The retirement hook below
+     deletes a node's entries when the native node itself is released, which
+     bounds every table by the page's live nodes. Script-side (detached
+     document) controls have no handle and live in a WeakMap instead. */
+  const controlStateTable = () => ({ handles: new Map(), objects: new WeakMap() }),
+    controlStateHas = (table, control) => {
+      const handle = control?.__handle;
+      return handle !== undefined
+        ? table.handles.has(handle)
+        : table.objects.has(control);
+    },
+    /* Stored values are never undefined, so a miss reads as undefined. */
+    controlStateGet = (table, control) => {
+      const handle = control?.__handle;
+      return handle !== undefined
+        ? table.handles.get(handle)
+        : table.objects.get(control);
+    },
+    controlStateSet = (table, control, value) => {
+      const handle = control?.__handle;
+      if (handle !== undefined) table.handles.set(handle, value);
+      else table.objects.set(control, value);
       return value;
     },
-    controlStateDelete = (map, control) =>
-      map.delete(controlStateKey(control)),
+    controlStateDelete = (table, control) => {
+      const handle = control?.__handle;
+      return handle !== undefined
+        ? table.handles.delete(handle)
+        : table.objects.delete(control);
+    },
+    /* Runs inside native node retirement: captured intrinsic only. */
+    controlStateRetire = (table, handle) => trustedMapDelete(table.handles, handle),
     selectList = (values) => {
       Object.defineProperty(values, "item", {
         value: (index) => values[Number(index)] ?? null,
@@ -2066,25 +2130,27 @@
       });
       return values;
     },
-    selectOptions = (select) => {
-      const values = [];
-      const walk = (node) => {
-        for (const child of node?.children || []) {
-          if (child instanceof HTMLOptionElement) values.push(child);
-          else walk(child);
-        }
-      };
-      walk(select);
-      return selectList(values);
-    },
+    /* The list of options: one native query rather than a wrapper and a
+       child collection per descendant. */
+    selectOptions = (select) =>
+      selectList(
+        select?.__handle !== undefined
+          ? Array.from(select.querySelectorAll("option"))
+          : Array.from(select?.children || []).flatMap((child) =>
+              child instanceof HTMLOptionElement
+                ? [child]
+                : Array.from(child.children || []).filter(
+                    (option) => option instanceof HTMLOptionElement,
+                  ),
+            ),
+      ),
     optionOwner = (option) => option.closest("select"),
-    optionSelectedState = new Map(),
-    rawOptionSelected = (option) =>
-      controlStateHas(optionSelectedState, option)
-        ? controlStateGet(optionSelectedState, option)
-        : option.hasAttribute("selected"),
-    selectedOptionSet = (select) => {
-      const options = selectOptions(select);
+    optionSelectedState = controlStateTable(),
+    rawOptionSelected = (option) => {
+      const dirty = controlStateGet(optionSelectedState, option);
+      return dirty !== undefined ? dirty : option.hasAttribute("selected");
+    },
+    computeSelectedOptions = (select, options) => {
       if (select.multiple) return options.filter(rawOptionSelected);
       const explicit = options.filter(rawOptionSelected);
       return explicit.length
@@ -2096,7 +2162,39 @@
         : options.length
           ? [options[0]]
           : [];
+    };
+  /* One select's options and selection, reused while neither the DOM (the
+     native version moves with every script mutation and parser growth) nor
+     any selectedness changed. Reading option.selected for every option
+     (FormData, a select's activation default, frameworks syncing a model)
+     is then linear in the options instead of quadratic. */
+  let selectionMemo = null,
+    selectionEpoch = 0;
+  const selectionOf = (select) => {
+      const version = nativeDomVersion?.(false),
+        memo = selectionMemo;
+      if (
+        memo !== null &&
+        memo.select === select &&
+        memo.epoch === selectionEpoch &&
+        typeof version === "number" &&
+        version >= 0 &&
+        memo.version === version
+      )
+        return memo;
+      const options = selectOptions(select),
+        selected = computeSelectedOptions(select, options);
+      selectionMemo = {
+        select,
+        version,
+        epoch: selectionEpoch,
+        options,
+        selected,
+        set: new Set(selected),
+      };
+      return selectionMemo;
     },
+    selectedOptionSet = (select) => selectionOf(select).selected,
     selectedContentCandidates = (select) =>
       Array.from(select.querySelectorAll("selectedcontent")).filter(
         (candidate) => {
@@ -2137,17 +2235,30 @@
         selectedContentSnapshots.set(candidate, { source, signature });
       }
     };
+  const nativeSetAttribute = __tilefinchRealmGlobal.__tilefinchSetAttribute,
+    nativeGetAttribute = __tilefinchRealmGlobal.__tilefinchGetAttribute,
+    optionMarker = "data-tilefinch-option-selected";
+  /* Records an option's dirty selectedness and tells native layout and the
+     controller through the option's marker attribute. The marker is
+     written natively: it is browser state, not an author mutation, so it
+     queues no MutationObserver record, and an unchanged option is not
+     rewritten (select.value on a long list touches only the options whose
+     state moved). */
   const markOptionSelected = (option, selected) => {
+    selectionEpoch++;
     controlStateSet(optionSelectedState, option, selected);
-    option.setAttribute(
-      "data-tilefinch-option-selected",
-      selected ? "true" : "false",
-    );
+    const marker = selected ? "true" : "false";
+    if (option.__handle === undefined) {
+      option.setAttribute(optionMarker, marker);
+      return;
+    }
+    if (nativeGetAttribute(option.__handle, optionMarker) !== marker)
+      nativeSetAttribute(option.__handle, optionMarker, marker);
   };
   __tilefinchRealmGlobal.__tilefinchOptionSelected = (option) => {
     const select = optionOwner(option);
     return select instanceof HTMLSelectElement
-      ? selectedOptionSet(select).includes(option)
+      ? selectionOf(select).set.has(option)
       : rawOptionSelected(option);
   };
   __tilefinchRealmGlobal.__tilefinchSetOptionSelected = (option, selected) => {
@@ -2167,12 +2278,14 @@
     const options = selectOptions(select),
       chosen = options.find((option) => option.value === String(value)) || null;
     for (const peer of options) markOptionSelected(peer, peer === chosen);
-    if (chosen) markOptionSelected(chosen, true);
     syncSelectedContent(select);
   };
-  const selectedCollections = new Map(),
+  /* The SameObject selectedOptions collection lives on the select wrapper
+     (it closes over it): a handle-keyed table would pin the wrapper and so
+     the node for the life of the page. */
+  const selectedCollections = createPrivateSlot(),
     liveSelectedOptions = (select) => {
-      let collection = controlStateGet(selectedCollections, select);
+      let collection = selectedCollections.get(select);
       if (collection) return collection;
       const values = () => selectedOptionSet(select),
         target = {
@@ -2205,20 +2318,72 @@
           return key in object;
         },
       });
-      controlStateSet(selectedCollections, select, collection);
+      selectedCollections.set(select, collection);
       return collection;
     };
+  const selectedIndexOf = (select) => {
+      const selection = selectionOf(select),
+        selected = selection.selected[0];
+      return selected ? selection.options.indexOf(selected) : -1;
+    },
+    setSelectedIndex = (select, value) => {
+      const chosen = selectOptions(select)[Number(value)] || null;
+      for (const peer of selectedOptionSet(select))
+        if (peer !== chosen) markOptionSelected(peer, false);
+      if (chosen) markOptionSelected(chosen, true);
+      syncSelectedContent(select);
+    };
+  /* The DOM0 collections live in the lazy forms.js module, built on the
+     first read that needs one; what it reads is captured now. */
+  const formCollectionInputs = {
+      selectionOf,
+      selectedIndexOf,
+      setSelectedIndex,
+      formControlEntry,
+      formControls,
+      /* Installed after this module; read when used, as above. */
+      controlType: (control) => __tilefinchControlType(control),
+      createPrivateSlot,
+      collectionPrototype: HTMLCollection.prototype,
+      doc: document,
+      Node,
+      HTMLInputElement,
+      HTMLOptionElement,
+      HTMLOptGroupElement,
+      domException: (message, name) => new DOMException(message, name),
+      MapType: Map,
+      WeakMapType: WeakMap,
+      ProxyType: Proxy,
+      objectCreate: Object.create,
+      defineProperty: Object.defineProperty,
+      defineProperties: Object.defineProperties,
+      freeze: Object.freeze,
+    },
+    ensureFormsBootstrap = __tilefinchRealmGlobal.__tilefinchEnsureFormsBootstrap;
+  let formCollectionMembers = null;
+  formCollections = () => {
+    if (formCollectionMembers) return formCollectionMembers;
+    ensureFormsBootstrap();
+    const create = __tilefinchRealmGlobal.__tilefinchCreateFormCollections;
+    delete __tilefinchRealmGlobal.__tilefinchCreateFormCollections;
+    return (formCollectionMembers = create(formCollectionInputs));
+  };
+  domShared.removeSelectOption = (select, index) =>
+    formCollections().removeOptionAt(select, index);
   Object.defineProperties(HTMLSelectElement.prototype, {
     options: {
       configurable: true,
       get() {
-        return selectOptions(this);
+        return formCollections().liveOptions(this);
       },
     },
     length: {
       configurable: true,
       get() {
-        return selectOptions(this).length;
+        return selectionOf(this).options.length;
+      },
+      set(value) {
+        formCollections().setOptionsLength(this, value);
       },
     },
     multiple: {
@@ -2234,15 +2399,10 @@
     selectedIndex: {
       configurable: true,
       get() {
-        const selected = selectedOptionSet(this)[0];
-        return selected ? selectOptions(this).indexOf(selected) : -1;
+        return selectedIndexOf(this);
       },
       set(value) {
-        const chosen = selectOptions(this)[Number(value)] || null;
-        for (const peer of selectedOptionSet(this))
-          if (peer !== chosen) markOptionSelected(peer, false);
-        if (chosen) markOptionSelected(chosen, true);
-        syncSelectedContent(this);
+        setSelectedIndex(this, value);
       },
     },
     selectedOptions: {
@@ -2264,17 +2424,7 @@
     );
   };
   HTMLSelectElement.prototype.add = function add(option, before = null) {
-    if (!(option instanceof HTMLOptionElement))
-      throw new TypeError("Option required");
-    if (before === null) this.appendChild(option);
-    else if (before instanceof HTMLOptionElement)
-      this.insertBefore(option, before);
-    else {
-      const reference = selectOptions(this)[Number(before)];
-      reference
-        ? this.insertBefore(option, reference)
-        : this.appendChild(option);
-    }
+    formCollections().addOption(this, option, before);
   };
   Object.defineProperties(HTMLOptionElement.prototype, {
     index: {
@@ -2322,7 +2472,7 @@
     return option;
   };
   Option.prototype = HTMLOptionElement.prototype;
-  const textareaValues = new Map(),
+  const textareaValues = controlStateTable(),
     textareaDefaultValue = (textarea) =>
       (textarea.childNodes || [])
         .filter((node) => node.nodeType === Node.TEXT_NODE)
@@ -2331,9 +2481,8 @@
     normalizeLineBreaks = (value) => String(value).replace(/\r\n?/g, "\n");
   __tilefinchRealmGlobal.__tilefinchTextAreaValue = (textarea) =>
     normalizeLineBreaks(
-      controlStateHas(textareaValues, textarea)
-        ? controlStateGet(textareaValues, textarea)
-        : textareaDefaultValue(textarea),
+      controlStateGet(textareaValues, textarea) ??
+        textareaDefaultValue(textarea),
     );
   __tilefinchRealmGlobal.__tilefinchSetTextAreaValue = (textarea, value) => {
     const text = value === null ? "" : String(value);
@@ -2395,15 +2544,15 @@
       return ["submit", "reset", "button"].includes(raw) ? raw : "submit";
     return inputTypes.has(raw) ? raw : "text";
   };
-  const inputValues = new Map();
+  const inputValues = controlStateTable();
   __tilefinchRealmGlobal.__tilefinchInputValue = (input) => {
     const type = __tilefinchControlType(input),
       attribute = input.getAttribute("value");
     if (type === "file") return "";
     if (type === "checkbox" || type === "radio")
       return attribute === null ? "on" : attribute;
-    if (controlStateHas(inputValues, input))
-      return controlStateGet(inputValues, input);
+    const dirty = controlStateGet(inputValues, input);
+    if (dirty !== undefined) return dirty;
     if (type === "range" && attribute === null) return "50";
     if (type === "color" && attribute === null) return "#000000";
     return attribute || "";
@@ -2534,20 +2683,25 @@
   document.exitFullscreen = exitFullscreen;
   document.webkitExitFullscreen = webkitExitFullscreen;
   __tilefinchRealmGlobal.__tilefinchExitFullscreenFromHost = () => leaveFullscreen(true);
+  /* Node-state cleanups run inside native node retirement (dom.js): no
+     author code may run there, so the retired fullscreen element leaves
+     fullscreen now and its fullscreenchange is dispatched from a task. */
   __tilefinchRealmGlobal.__tilefinchRegisterNativeNodeStateCleanup?.((handle) => {
-    if (fullscreenElement?.__handle === Number(handle)) leaveFullscreen(true);
+    const previous = fullscreenElement;
+    if (!previous || previous.__handle !== handle) return;
+    fullscreenElement = null;
+    __tilefinchRealmGlobal.__tilefinchScheduleTask?.(
+      () => dispatchFullscreenChange(previous), 0);
   });
 
-  const indeterminateState = new Map(),
-    checkedDefaultState = new Map();
+  const indeterminateState = controlStateTable(),
+    checkedDefaultState = controlStateTable();
   __tilefinchRealmGlobal.__tilefinchRegisterNativeNodeStateCleanup?.((handle) => {
-    handle = Number(handle);
-    optionSelectedState.delete(handle);
-    selectedCollections.delete(handle);
-    textareaValues.delete(handle);
-    inputValues.delete(handle);
-    indeterminateState.delete(handle);
-    checkedDefaultState.delete(handle);
+    controlStateRetire(optionSelectedState, handle);
+    controlStateRetire(textareaValues, handle);
+    controlStateRetire(inputValues, handle);
+    controlStateRetire(indeterminateState, handle);
+    controlStateRetire(checkedDefaultState, handle);
   });
   delete __tilefinchRealmGlobal.__tilefinchRegisterNativeNodeStateCleanup;
   Object.defineProperty(HTMLInputElement.prototype, "indeterminate", {
@@ -2576,7 +2730,10 @@
       }
     };
     copyControl(source, clone);
-    if (!deep) return;
+    /* One native query instead of six live collections per clone. */
+    if (!deep || (typeof source?.querySelector === "function"
+                  && !source.querySelector("input,textarea,option")))
+      return;
     for (const tag of ["input", "textarea", "option"]) {
       const fromControls = source.getElementsByTagName?.(tag) || [],
         toControls = clone?.getElementsByTagName?.(tag) || [],
@@ -2616,13 +2773,48 @@
     }
     input.toggleAttribute("checked", checked);
   };
-  const resetChecked = (input) => {
-    const checked = controlStateHas(checkedDefaultState, input)
+  /* The default checkedness: the checked attribute until script or the
+     user first sets checkedness, then the value latched at that moment
+     (checkedness itself lives in the attribute, which native layout,
+     selectors and the controller read). */
+  const defaultCheckedOf = (input) =>
+    controlStateHas(checkedDefaultState, input)
       ? !!controlStateGet(checkedDefaultState, input)
       : input.hasAttribute("checked");
-    input.checked = checked;
+  const resetChecked = (input) => {
+    input.checked = defaultCheckedOf(input);
     controlStateDelete(checkedDefaultState, input);
   };
+  Object.defineProperties(HTMLInputElement.prototype, {
+    /* Reflects the value attribute; a control the user or script has not
+       edited shows it at once. */
+    defaultValue: {
+      configurable: true,
+      enumerable: true,
+      get() {
+        return this.getAttribute("value") ?? "";
+      },
+      set(value) {
+        this.setAttribute("value", String(value));
+        if (this.__handle !== undefined && !controlStateHas(inputValues, this))
+          __tilefinchSetControlValue(this.__handle, __tilefinchInputValue(this));
+      },
+    },
+    defaultChecked: {
+      configurable: true,
+      enumerable: true,
+      get() {
+        return defaultCheckedOf(this);
+      },
+      set(value) {
+        value = !!value;
+        /* Before checkedness is dirty it follows the default. */
+        if (controlStateHas(checkedDefaultState, this))
+          controlStateSet(checkedDefaultState, this, value);
+        else this.toggleAttribute("checked", value);
+      },
+    },
+  });
   __tilefinchRealmGlobal.ValidityState = class ValidityState {
     constructor(fields) {
       Object.assign(this, fields);
@@ -2855,7 +3047,7 @@
     prototype.checkValidity = function checkValidity() {
       if (!this.willValidate || this.validity.valid) return true;
       this.dispatchEvent(
-        __tilefinchTrustedEvent(new Event("invalid", { cancelable: true })),
+        trustedEvent(new Event("invalid", { cancelable: true })),
       );
       return false;
     };
@@ -3168,7 +3360,7 @@
   HTMLFormElement.prototype.reportValidity =
     HTMLFormElement.prototype.checkValidity;
   const resetForm = (form, deferCustomCallbacks = false) => {
-    const event = __tilefinchTrustedEvent(
+    const event = trustedEvent(
       new Event("reset", { bubbles: true, cancelable: true }),
     );
     if (!form.dispatchEvent(event)) return false;
@@ -3235,7 +3427,7 @@
   );
   const constructingFormData = new WeakSet();
   __tilefinchRealmGlobal.FormData = class FormData {
-    constructor(form) {
+    constructor(form, submitter) {
       this.items = [];
       if (form !== undefined) {
         if (!(form instanceof HTMLFormElement))
@@ -3262,6 +3454,10 @@
           }
           const tag = String(control.tagName || "").toLowerCase(),
             type = String(control.type || "").toLowerCase();
+          if (control === submitter && type !== "image") {
+            this.append(name, control.value);
+            continue;
+          }
           if (
             tag === "button" ||
             tag === "output" ||
@@ -3277,21 +3473,16 @@
           if ((type === "checkbox" || type === "radio") && !control.checked)
             continue;
           if (tag === "select") {
-            const options = [];
-            const collect = (node) => {
-              for (const child of node.children || []) {
-                if (String(child.tagName || "").toLowerCase() === "option")
-                  options.push(child);
-                collect(child);
-              }
-            };
-            collect(control);
-            const hasExplicit = options.some((option) => option.selected),
-              selected = options.filter(
-                (option) => option.selected && !option.disabled,
+            /* One selection read for the whole select, not one per option. */
+            const selection = selectionOf(control),
+              hasExplicit = selection.selected.length !== 0,
+              selected = selection.selected.filter(
+                (option) => !option.disabled,
               );
             if (!selected.length && !hasExplicit) {
-              const fallback = options.find((option) => !option.disabled);
+              const fallback = selection.options.find(
+                (option) => !option.disabled,
+              );
               if (fallback) selected.push(fallback);
             }
             for (const option of selected)
@@ -3322,7 +3513,7 @@
             enumerable: true,
             value: this,
           });
-          form.dispatchEvent(__tilefinchTrustedEvent(event));
+          form.dispatchEvent(trustedEvent(event));
         } finally {
           constructingFormData.delete(form);
         }
@@ -3406,9 +3597,7 @@
     ).toLowerCase();
     if (enctype === "multipart/form-data" || enctype === "text/plain")
       return null;
-    const data = new FormData(form);
-    const name = submitter?.getAttribute?.("name");
-    if (name) data.append(name, submitter.value ?? "");
+    const data = new FormData(form, submitter);
     const params = new URLSearchParams();
     for (const [key, value] of data) {
       if (value instanceof Blob) return null;
@@ -3448,7 +3637,7 @@
     );
     let url;
     try {
-      url = new URL(action || location.href, location.href);
+      url = new TilefinchURL(action || location.href, location.href);
     } catch (_) {
       return false;
     }
@@ -3464,10 +3653,10 @@
       query.append(submitterName, String(submitter.value || ""));
     const serialized = query.toString();
     frame.src =
-      url.origin +
-      url.pathname +
+      url._origin +
+      url._pathname +
       (serialized ? "?" + serialized : "") +
-      url.hash;
+      url._hash;
     return true;
   };
   /* Web IDL static operations are non-constructible built-in functions and
@@ -3805,6 +3994,10 @@
           throw cloneError("unsupported transferable object");
         if (seen.has(value))
           throw cloneError("duplicate transferable object");
+        /* A WebAssembly.Memory buffer cannot be detached; refuse the list
+           before anything in it is serialized or detached. */
+        if (kind === 0 && !detachArrayBuffer(value, true))
+          throw cloneError("WebAssembly memory buffer is not transferable");
         seen.add(value);
         entries.push({ value, kind });
       }
@@ -3947,7 +4140,7 @@
       get origin() {
         if (locationOpaqueOrigin) return "null";
         synchronizeLocation();
-        return locationURL.origin;
+        return locationURL._origin;
       },
       assign(url) {
         navigateLocation(resolveLocationURL(url), false);
@@ -3987,39 +4180,100 @@
     Object.defineProperty(location, key, descriptor);
   }
   __tilefinchRealmGlobal.Location = Location;
+  /* A live HTMLCollection, so document.forms.login finds a form by name. */
+  let documentForms = null;
   Object.defineProperty(document, "forms", {
     configurable: true,
     enumerable: true,
     get() {
-      return document.querySelectorAll("form");
+      return (documentForms ||= __tilefinchRealmGlobal.__tilefinchLiveHTMLCollection(
+        () => Array.from(document.querySelectorAll("form")), true));
     },
   });
-  const qualifiedElementName = (namespace, qualifiedName) => {
-    const namespaceURI =
-        namespace === null || namespace === undefined || namespace === ""
-          ? null
-          : String(namespace),
-      name = String(qualifiedName),
-      match = name.match(
-        /^([A-Za-z_][A-Za-z0-9_.-]*)(?::([A-Za-z_][A-Za-z0-9_.-]*))?$/,
-      );
-    if (!match)
-      throw new DOMException(
-        "Invalid qualified name",
-        "InvalidCharacterError",
-      );
-    const prefix = match[2] === undefined ? null : match[1],
-      xml = "http://www.w3.org/XML/1998/namespace",
-      xmlns = "http://www.w3.org/2000/xmlns/";
+  /* A change to a document's own children, checked as the DOM standard's
+     pre-insertion and replace steps require before anything is inserted,
+     so a refused call inserts nothing. `values` is one node, or with `many` the
+     arguments of append, prepend or replaceChildren, which act as one
+     fragment: they leave their parents first, so arguments that are
+     children of the document no longer count as staying, a repeated
+     argument takes its last place, and a string (a text node) is refused.
+     `before` is the reference child (undefined: the first child that
+     stays, for prepend) and `old` a child being replaced. The result may
+     hold only elements, comments, processing instructions and doctypes
+     (types 1, 8, 7, 10), at most one element and one doctype, the doctype
+     first. Returns the nodes to insert and the child to insert them before,
+     past any reference that is itself moving. Every document shares it:
+     documents.js, compat.js and the detached documents below.
+     As in Chromium 156 (Blink gathers the arguments into one fragment
+     before checking it), a refused call still empties every fragment or
+     shadow root argument and, given several arguments, takes each node
+     argument out of its parent, so a refused append(root, text) loses the
+     root; a lone node argument moves nothing. A documents.js document's
+     child has no parentNode: planDocumentInsert.releaseChild (set by
+     documents.js once it is built) takes it out of its document. */
+  const planDocumentInsert = (children, values, many, before, old = null) => {
+    const refuse = (name = "HierarchyRequestError") => {
+      if (many)
+        for (const value of values)
+          if (value instanceof Node && (values.length > 1 || value.nodeType === 11))
+            for (const node of value.nodeType === 11 ? [...value.childNodes] : [value])
+              node.parentNode ? node.parentNode.removeChild(node)
+                : planDocumentInsert.releaseChild?.(node);
+      throw new DOMException("Invalid document child", name);
+    };
+    let items = [];
+    for (const value of many ? values : [values]) {
+      if (!(value instanceof Node)) {
+        if (many) refuse();
+        throw new TypeError("Node required");
+      }
+      for (const item of value.nodeType === Node.DOCUMENT_FRAGMENT_NODE
+        ? Array.from(value.childNodes) : [value]) {
+        items = items.filter((other) => other !== item);
+        items.push(item);
+      }
+    }
+    if ((before && !children.includes(before)) || (old && !children.includes(old)))
+      refuse("NotFoundError");
+    const stay = children.filter((child) => child !== old &&
+        !(many && values.length > 1 && items.includes(child))),
+      at = before === undefined ? 0
+        : old ? children.indexOf(old)
+        : before === null ? stay.length : stay.indexOf(before),
+      kinds = [...stay.slice(0, at), ...items, ...stay.slice(at)]
+        .map((node) => node.nodeType),
+      element = kinds.indexOf(1),
+      doctype = kinds.indexOf(10);
     if (
-      (prefix !== null && namespaceURI === null) ||
-      (prefix === "xml" && namespaceURI !== xml) ||
-      ((name === "xmlns" || prefix === "xmlns") &&
-        namespaceURI !== xmlns) ||
-      (namespaceURI === xmlns && name !== "xmlns" && prefix !== "xmlns")
+      items.some((node) => ![1, 7, 8, 10].includes(node.nodeType)) ||
+      kinds.lastIndexOf(1) !== element ||
+      kinds.lastIndexOf(10) !== doctype ||
+      (element >= 0 && doctype > element)
     )
-      throw new DOMException("Invalid namespace", "NamespaceError");
-    return { namespaceURI, name };
+      refuse();
+    let next = before === undefined ? stay[0] ?? null
+      : old ? children[children.indexOf(old) + 1] ?? null : before;
+    while (next && items.includes(next))
+      next = children[children.indexOf(next) + 1] ?? null;
+    return { items, before: next };
+  };
+  domShared.planDocumentInsert = planDocumentInsert;
+  /* The page's own document: the same checks, then the children that are
+     not kept leave. The native document takes no new children (its
+     appendChild and insertBefore refuse them too), so a call that would
+     add or reorder one throws HierarchyRequestError before anything
+     changes. */
+  document.replaceChildren = function replaceChildren(...values) {
+    if (this !== document) throw new TypeError("Illegal invocation");
+    const children = Array.from(document.childNodes),
+      { items } = planDocumentInsert(children, values, true, null);
+    let kept = 0;
+    for (const child of children)
+      if (child === items[kept]) kept++;
+    if (kept < items.length)
+      throw new DOMException("The document cannot take new children",
+        "HierarchyRequestError");
+    for (const child of children) if (!items.includes(child)) child.remove();
   };
   {
     const htmlNamespace = "http://www.w3.org/1999/xhtml",
@@ -4199,9 +4453,12 @@
         proto = Object.create(base);
         Object.defineProperties(proto, {
           nodeType: { configurable: true, value: Node.ELEMENT_NODE },
+          /* The qualified name, upper-cased only for an HTML element of an
+             HTML document. */
           tagName: {
             get() {
-              return this.__detachedNamespace === htmlNamespace
+              return this.__detachedNamespace === htmlNamespace &&
+                this.__detachedOwner?.contentType === "text/html"
                 ? this.__detachedTag.toUpperCase()
                 : this.__detachedTag;
             },
@@ -4213,7 +4470,14 @@
           },
           localName: {
             get() {
-              return this.__detachedTag;
+              return this.__detachedPrefix === null
+                ? this.__detachedTag
+                : this.__detachedTag.slice(this.__detachedPrefix.length + 1);
+            },
+          },
+          prefix: {
+            get() {
+              return this.__detachedPrefix;
             },
           },
           namespaceURI: {
@@ -4404,7 +4668,7 @@
           cloneNode(deep = false) {
             const clone = this.__detachedOwner.createElementNS(
               this.namespaceURI,
-              this.localName,
+              this.__detachedTag,
             );
             for (const attribute of this.attributes)
               clone.setAttributeNS(
@@ -4423,19 +4687,19 @@
               this.namespaceURI === htmlNamespace &&
               this.ownerDocument?.contentType === "text/html"
             )
-              name = name.toLowerCase();
+              name = asciiLower(name);
             const attribute = this.__detachedAttributeNodes.find(
               (item) => item.name === name,
             );
             return attribute ? attribute.value : null;
           },
           setAttribute(name, value) {
-            name = String(name);
+            name = checkAttributeName(String(name));
             if (
               this.namespaceURI === htmlNamespace &&
               this.ownerDocument?.contentType === "text/html"
             )
-              name = name.toLowerCase();
+              name = asciiLower(name);
             let attribute = this.__detachedAttributeNodes.find(
               (item) => item.namespaceURI === null && item.name === name,
             ),
@@ -4473,15 +4737,10 @@
             return attribute ? attribute.value : null;
           },
           setAttributeNS(namespace, qualifiedName, value) {
-            namespace =
-              namespace === null || namespace === undefined || namespace === ""
-                ? null
-                : String(namespace);
-            qualifiedName = String(qualifiedName);
-            const colon = qualifiedName.indexOf(":"),
-              prefix = colon < 0 ? null : qualifiedName.slice(0, colon),
-              localName =
-                colon < 0 ? qualifiedName : qualifiedName.slice(colon + 1);
+            const checked = checkQualifiedName(namespace, qualifiedName, false),
+              { prefix, localName } = checked;
+            namespace = checked.namespace;
+            qualifiedName = checked.name;
             let attribute = this.__detachedAttributeNodes.find(
               (item) =>
                 item.namespaceURI === namespace &&
@@ -4493,6 +4752,7 @@
                 this.ownerDocument,
                 qualifiedName,
                 namespace,
+                true,
               );
               attribute.__tilefinchAttributeOwner = this;
               this.__detachedAttributeNodes.push(attribute);
@@ -4523,7 +4783,7 @@
               this.namespaceURI === htmlNamespace &&
               this.ownerDocument?.contentType === "text/html"
             )
-              name = name.toLowerCase();
+              name = asciiLower(name);
             const at = this.__detachedAttributeNodes.findIndex(
               (item) => item.name === name,
             );
@@ -4641,8 +4901,10 @@
             xml ? XMLDocument.prototype : HTMLDocument.prototype,
           ),
         ),
-        makeElement = (tag, namespace = htmlNamespace) => {
-          tag = String(tag).toLowerCase();
+        /* `tag` is the qualified name as given: createElement lower-cases
+           it in an HTML document, createElementNS never. */
+        makeElement = (tag, namespace = htmlNamespace, prefix = null) => {
+          tag = String(tag);
           const normalizedNamespace =
               namespace === null || namespace === ""
                 ? null
@@ -4673,6 +4935,7 @@
           Object.defineProperties(node, {
             __detachedOwner: { value: doc, writable: true },
             __detachedTag: { value: tag },
+            __detachedPrefix: { value: prefix },
             __detachedNamespace: {
               value: normalizedNamespace,
               writable: true,
@@ -4704,7 +4967,9 @@
             const match =
               selector[0] === "#"
                 ? child.getAttribute("id") === selector.slice(1)
-                : child.localName === selector.toLowerCase();
+                : child.namespaceURI === htmlNamespace && !xml
+                  ? child.localName === selector.toLowerCase()
+                  : child.tagName === selector;
             if (match) output.push(child);
             walk(child, selector, output);
           }
@@ -4736,7 +5001,12 @@
         nodeType: { value: Node.DOCUMENT_NODE },
         nodeName: { value: "#document" },
         ownerDocument: { value: null },
-        contentType: { value: xml ? "application/xml" : "text/html" },
+        contentType: {
+          value: !xml ? "text/html"
+            : namespace === htmlNamespace ? "application/xhtml+xml"
+            : namespace === "http://www.w3.org/2000/svg" ? "image/svg+xml"
+            : "application/xml",
+        },
         compatMode: { value: compatMode },
         defaultView: { value: null, configurable: true },
         documentElement: { get: rootElement },
@@ -4861,25 +5131,23 @@
           },
         },
       });
-      doc.createElement = (tag) => makeElement(tag);
+      /* An XML document's elements have no namespace unless it is an
+         XHTML document, and keep their case. */
+      doc.createElement = (tag) => xml
+        ? makeElement(checkElementName(String(tag)),
+          doc.contentType === "application/xhtml+xml" ? htmlNamespace : null)
+        : makeElement(asciiLower(checkElementName(String(tag))));
       doc.createElementNS = (namespace, tag) => {
-        const qualified = qualifiedElementName(
-          namespace,
-          tag,
-        );
-        return makeElement(qualified.name, qualified.namespaceURI);
+        const qualified = checkQualifiedName(namespace, tag, true);
+        return makeElement(qualified.name, qualified.namespace, qualified.prefix);
       };
       doc.createAttribute = (name) =>
         __tilefinchCreateAttribute(
           doc,
-          xml ? String(name) : String(name).toLowerCase(),
+          xml ? String(name) : asciiLower(name),
         );
       doc.createAttributeNS = (namespace, name) =>
-        __tilefinchCreateAttribute(
-          doc,
-          String(name),
-          namespace === null ? null : String(namespace),
-        );
+        __tilefinchCreateAttribute(doc, name, namespace, true);
       doc.createTextNode = (value) => {
         const node = Object.create(textPrototype);
         Object.defineProperties(node, {
@@ -4902,7 +5170,7 @@
           __detachedParent: { value: null, writable: true },
           nodeType: { value: Node.DOCUMENT_TYPE_NODE },
           nodeName: { get() { return this.name; } },
-          name: { value: String(name) },
+          name: { value: checkDoctypeName(name) },
           publicId: { value: String(publicId) },
           systemId: { value: String(systemId) },
           ownerDocument: { get() { return this.__detachedOwner; } },
@@ -4925,18 +5193,33 @@
         });
         return node;
       };
-      doc.appendChild = (node) => insert(doc, node);
+      doc.appendChild = (node) => doc.insertBefore(node, null);
       doc.removeChild = (node) => {
         if (node?.__detachedParent !== doc)
           throw new DOMException("Node is not a child", "NotFoundError");
         return detach(node);
       };
-      doc.insertBefore = (node, child) => insert(doc, node, child ?? null);
+      doc.insertBefore = (node, child) => {
+        const plan = planDocumentInsert(
+          doc.__detachedChildren, node, false, child ?? null);
+        for (const item of plan.items) insert(doc, item, plan.before);
+        return node;
+      };
+      /* Checked whole before the old child leaves; the insertions go
+         through insertBefore, which compat.js gives mutation records. */
       doc.replaceChild = (node, child) => {
-        const next = child.nextSibling;
+        if (!(child instanceof Node)) throw new TypeError("Node required");
+        const plan = planDocumentInsert(
+          doc.__detachedChildren, node, false, null, child);
         doc.removeChild(child);
-        insert(doc, node, next);
+        for (const item of plan.items) doc.insertBefore(item, plan.before);
         return child;
+      };
+      doc.replaceChildren = (...values) => {
+        const { items } = planDocumentInsert(
+          doc.__detachedChildren, values, true, null);
+        for (const child of [...doc.__detachedChildren]) doc.removeChild(child);
+        for (const item of items) doc.insertBefore(item, null);
       };
       doc.querySelector = (selector) => {
         const output = [];
@@ -4949,35 +5232,17 @@
         return output;
       };
       doc.getElementById = (id) => doc.querySelector("#" + String(id));
-      doc.getElementsByTagName = (tag) => doc.querySelectorAll(String(tag));
+      doc.getElementsByTagName = (tag) =>
+        __tilefinchLiveHTMLCollection(() => doc.querySelectorAll(String(tag)));
       doc.adoptNode = (node) => {
         if (node instanceof Document)
           throw new DOMException("Documents cannot be adopted", "NotSupportedError");
+        if (node instanceof ShadowRoot)
+          throw new DOMException("Shadow roots cannot be adopted", "HierarchyRequestError");
         if (node?.parentNode?.removeChild) node.parentNode.removeChild(node);
         else detach(node);
         adoptOwner(node, doc);
         return node;
-      };
-      doc.append = (...values) => {
-        const nodes = values.map((value) =>
-          value instanceof Node ? value : doc.createTextNode(String(value)),
-        );
-        const elements =
-          doc.children.length +
-          nodes.filter((node) => node.nodeType === Node.ELEMENT_NODE).length;
-        if (
-          nodes.some(
-            (node) =>
-              node.nodeType !== Node.ELEMENT_NODE &&
-              node.nodeType !== Node.DOCUMENT_TYPE_NODE,
-          ) ||
-          elements > 1
-        )
-          throw new DOMException(
-            "Invalid document child sequence",
-            "HierarchyRequestError",
-          );
-        for (const node of nodes) doc.appendChild(node);
       };
       doc.cloneNode = (deep = false) => {
         const clone = detachedDocument(
@@ -4988,6 +5253,7 @@
           "",
           false,
         );
+        Object.setPrototypeOf(clone, Object.getPrototypeOf(doc));
         if (deep)
           for (const child of doc.__detachedChildren)
             clone.appendChild(child.cloneNode(true));
@@ -4996,7 +5262,7 @@
       if (suppliedDoctype) doc.appendChild(suppliedDoctype);
       if (xml) {
         if (qualifiedName)
-          doc.appendChild(makeElement(qualifiedName, namespace || ""));
+          doc.appendChild(doc.createElementNS(namespace, qualifiedName));
       } else if (initialize) {
         const html = doc.appendChild(doc.createElement("html")),
           head = html.appendChild(doc.createElement("head"));
@@ -5018,15 +5284,21 @@
         true,
         standards ? "CSS1Compat" : "BackCompat",
       );
-    __tilefinchRealmGlobal.__tilefinchNewDocument = () =>
-      detachedDocument(undefined, false, null, null, "", false);
+    /* new Document() asks for an XML document (type "xml", as the DOM
+       standard's constructor makes); the template contents owner and the
+       page's createElement fallback take an HTML one. */
+    __tilefinchRealmGlobal.__tilefinchNewDocument = (xml) => {
+      const doc = detachedDocument(undefined, !!xml, null, null, "", false);
+      if (xml) Object.setPrototypeOf(doc, secondaryDocumentPrototype(Document.prototype));
+      return doc;
+    };
     __tilefinchRealmGlobal.DOMImplementation = class DOMImplementation {
       constructor(token) {
         if (token !== implementationToken)
           throw new TypeError("Illegal constructor");
       }
       createHTMLDocument(title) {
-        return detachedDocument(title);
+        return domShared.createHTMLDocument(title);
       }
       createDocument(namespace, qualifiedName, doctype = null) {
         return detachedDocument(
@@ -5067,6 +5339,8 @@
   document.adoptNode = (node) => {
     if (node instanceof Document)
       throw new DOMException("Documents cannot be adopted", "NotSupportedError");
+    if (node instanceof ShadowRoot)
+      throw new DOMException("Shadow roots cannot be adopted", "HierarchyRequestError");
     if (!(node instanceof Node)) throw new TypeError("Node required");
     if (node === document.doctype && "__detachedParent" in node)
       node.__detachedParent = null;
@@ -5112,7 +5386,8 @@
       if (!collection) {
         collection = __tilefinchRealmGlobal.__tilefinchLiveHTMLCollection(() =>
           Array.from(this.querySelectorAll("img")),
-        );
+          /* The document's own list is native; a detached shim's is not. */
+          this === document);
         imagesCollections.set(this, collection);
       }
       return collection;
@@ -5129,7 +5404,7 @@
         if (!collection) {
           collection = __tilefinchRealmGlobal.__tilefinchLiveHTMLCollection(() =>
             Array.from(this.querySelectorAll("a[href],area[href]")),
-          );
+            this === document);
           linksCollections.set(this, collection);
         }
         return collection;
@@ -5141,7 +5416,7 @@
         if (!collection) {
           collection = __tilefinchRealmGlobal.__tilefinchLiveHTMLCollection(() =>
             Array.from(this.querySelectorAll("a[name]")),
-          );
+            this === document);
           anchorsCollections.set(this, collection);
         }
         return collection;
@@ -5444,6 +5719,24 @@
       if (seen.has(at)) return at;
     return document;
   };
+  /* Whether boundary point (node, offset) is after (other, otherOffset), or
+     in another tree (a range across trees collapses as if it were). */
+  const boundaryAfter = (node, offset, other, otherOffset) =>
+    node !== other &&
+      node.compareDocumentPosition(other) & Node.DOCUMENT_POSITION_DISCONNECTED
+      ? true
+      : compareBoundaryPoints(node, offset, other, otherOffset) > 0;
+  const isTextNode = (node) =>
+    node?.nodeType === Node.TEXT_NODE ||
+    node?.nodeType === Node.CDATA_SECTION_NODE;
+  /* The next node in tree order after `node` and its descendants. */
+  const followingNode = (node) => {
+    for (let at = node, steps = 0; at && steps < ancestorLimit; steps++) {
+      if (at.nextSibling) return at.nextSibling;
+      at = at.parentNode;
+    }
+    return null;
+  };
   /* DOM's boundary-point comparison: -1 before, 0 equal, 1 after. */
   const compareBoundaryPoints = (node, offset, otherNode, otherOffset) => {
     if (node === otherNode)
@@ -5572,17 +5865,25 @@
     get commonAncestorContainer() {
       return ancestor(this.startContainer, this.endContainer);
     }
+    /* A start after the end (or in another tree) collapses the range to
+       it, and an end before the start likewise. */
     setStart(node, offset) {
+      offset = boundedOffset(node, offset);
       this.startContainer = node;
-      this.startOffset = boundedOffset(node, offset);
-      if (this.endContainer === document) {
+      this.startOffset = offset;
+      if (boundaryAfter(node, offset, this.endContainer, this.endOffset)) {
         this.endContainer = node;
-        this.endOffset = this.startOffset;
+        this.endOffset = offset;
       }
     }
     setEnd(node, offset) {
+      offset = boundedOffset(node, offset);
       this.endContainer = node;
-      this.endOffset = boundedOffset(node, offset);
+      this.endOffset = offset;
+      if (boundaryAfter(this.startContainer, this.startOffset, node, offset)) {
+        this.startContainer = node;
+        this.startOffset = offset;
+      }
     }
     setStartBefore(node) {
       this.setStart(
@@ -5769,23 +6070,25 @@
       newParent.appendChild(fragment);
       this.selectNodeContents(newParent);
     }
+    /* The text of the Text nodes between the boundary points, with the
+       start and end Text nodes cut at their offsets. */
     toString() {
-      if (this.startContainer === this.endContainer) {
-        const node = this.startContainer,
-          text =
-            node.nodeType === Node.TEXT_NODE ||
-            node.nodeType === Node.COMMENT_NODE
-              ? node.data
-              : node.textContent;
-        return String(text || "").slice(
-          this.startOffset,
-          node.nodeType === Node.TEXT_NODE ||
-            node.nodeType === Node.COMMENT_NODE
-            ? this.endOffset
-            : undefined,
-        );
-      }
-      return String(this.commonAncestorContainer?.textContent || "");
+      const start = this.startContainer, end = this.endContainer,
+        startOffset = this.startOffset, endOffset = this.endOffset;
+      if (start === end && isTextNode(start))
+        return start.data.substring(startOffset, endOffset);
+      let text = isTextNode(start) ? start.data.substring(startOffset) : "",
+        at = isCharacterDataNode(start)
+          ? followingNode(start)
+          : start.childNodes[startOffset] ?? followingNode(start);
+      const stop = isCharacterDataNode(end)
+        ? end
+        : end.childNodes[endOffset] ?? followingNode(end);
+      for (; at && at !== stop; at = at.firstChild || followingNode(at))
+        if (isTextNode(at)) text += at.data;
+      if (isTextNode(end) && end !== start)
+        text += end.data.substring(0, endOffset);
+      return text;
     }
     getBoundingClientRect() {
       const node = this.commonAncestorContainer;
@@ -5893,7 +6196,11 @@
   Object.setPrototypeOf(document, HTMLDocument.prototype);
   document.createElement = (tag) => {
     tag = String(tag);
-    let node = wrap(__tilefinchCreate(tag, "http://www.w3.org/1999/xhtml"));
+    /* The native side refuses (-1) a name the DOM standard's check does. */
+    const created = __tilefinchCreate(tag, "http://www.w3.org/1999/xhtml");
+    if (created === -1)
+      throw new DOMException("Invalid name: " + tag, "InvalidCharacterError");
+    let node = wrap(created);
     /*
      * Lexbor rejects a few valid HTML local names which its XML-oriented
      * constructor cannot represent (for example ":good:times:"). Preserve
@@ -5904,7 +6211,6 @@
       node = __tilefinchRealmGlobal.__tilefinchNewDocument().createElement(tag);
       __tilefinchRealmGlobal.__tilefinchAdoptNodeOwner?.(node, document);
     }
-    if (node) node.__tilefinchProgrammatic = true;
     return node;
   };
   function Image(width, height) {
@@ -6257,6 +6563,8 @@
         if (!type.includes("codecs=")) return "maybe";
         if (type.includes("mp4a")) return "probably";
       }
+      const base = type.split(";")[0].trim();
+      if (base === "audio/mpeg" || base === "audio/mp3") return "maybe";
       return "";
     };
     HTMLMediaElement.prototype.load = function load() {
@@ -6322,35 +6630,33 @@
   };
   document.createTextNode = (value) => {
     const node = wrap(__tilefinchCreateText(String(value)));
-    if (node) node.__tilefinchProgrammatic = true;
     return node;
   };
   document.createComment = (value) => {
     const node = wrap(__tilefinchCreateComment(String(value)));
-    if (node) node.__tilefinchProgrammatic = true;
     return node;
   };
   document.createAttribute = (name) =>
-    __tilefinchCreateAttribute(document, String(name).toLowerCase());
+    __tilefinchCreateAttribute(document, asciiLower(name));
   document.createAttributeNS = (namespace, name) =>
-    __tilefinchCreateAttribute(
-      document,
-      String(name),
-      namespace === null ? null : String(namespace),
-    );
+    __tilefinchCreateAttribute(document, name, namespace, true);
   document.createElementNS = (namespace, tag) => {
-    const qualified = qualifiedElementName(namespace, tag);
+    const qualified = checkQualifiedName(namespace, tag, true);
     const node = wrap(
-      __tilefinchCreate(qualified.name, qualified.namespaceURI),
+      __tilefinchCreate(qualified.name, qualified.namespace, true),
     );
-    if (node) {
-      node.__tilefinchProgrammatic = true;
-      node.__namespaceURI = qualified.namespaceURI;
-    }
+    if (node) node.__namespaceURI = qualified.namespace;
     return node;
   };
   __tilefinchRealmGlobal.__tilefinchMaterializeDetachedNode = (node) => {
     if (!node || node.__handle !== undefined) return node;
+    /* Only something insertable has a native form. The live document has no
+       handle either, and copying a made-up element over it would destroy it
+       before validation could refuse the insertion. */
+    const kind = node.nodeType;
+    if (typeof kind !== "number" || kind === Node.DOCUMENT_NODE ||
+        kind === Node.ATTRIBUTE_NODE)
+      return node;
     const owner = node.ownerDocument,
       parent = node.parentNode,
       logicalType = node.nodeType,
@@ -6360,7 +6666,12 @@
           ? document.createTextNode(node.data)
           : node.nodeType === Node.COMMENT_NODE
             ? document.createComment(node.data)
-            : document.createElementNS(node.namespaceURI, node.localName);
+            : node.prefix || !node.localName.includes(":")
+              ? document.createElementNS(node.namespaceURI,
+                node.prefix ? node.prefix + ":" + node.localName : node.localName)
+              /* new Document().createElement("a:b") is the local name a:b */
+              : Object.assign(wrap(__tilefinchCreate(node.localName,
+                node.namespaceURI, true, true)), { __namespaceURI: node.namespaceURI });
     if (
       logicalType !== Node.ELEMENT_NODE &&
       logicalType !== Node.TEXT_NODE &&
@@ -6401,82 +6712,16 @@
     __tilefinchRealmGlobal.__tilefinchSetNodeOwner(node, document);
     return node;
   };
-  __tilefinchRealmGlobal.DOMParser = class DOMParser {
-    parseFromString(input, type) {
-      const source = String(input),
-        mime = String(type).trim().toLowerCase();
-      if (
-        mime === "text/xml" ||
-        mime === "application/xml" ||
-        mime === "application/xhtml+xml" ||
-        mime === "image/svg+xml"
-      ) {
-        const match = source.match(
-          /<\s*([A-Za-z_][A-Za-z0-9_.:-]*)\b[^>]*\/?\s*>/,
-        );
-        return document.implementation.createDocument(
-          mime === "image/svg+xml"
-            ? "http://www.w3.org/2000/svg"
-            : null,
-          match ? match[1] : "parsererror",
-          null,
-        );
-      }
-      if (mime !== "text/html")
-        throw new TypeError("Only text/html parsing is supported");
-      if (source.length > 256 * 1024)
-        throw new RangeError("parsed document exceeds bounded size");
-      const html = document.createElement("html"),
-        head = document.createElement("head"),
-        body = document.createElement("body"),
-        doctype = document.implementation.createDocumentType("html", "", "");
-      html.appendChild(head);
-      html.appendChild(body);
-      body.innerHTML = source;
-      const parsed = Object.create(
-        secondaryDocumentPrototype(Document.prototype),
-      );
-      doctype.__detachedOwner = parsed;
-      Object.defineProperties(parsed, {
-        nodeType: { value: Node.DOCUMENT_NODE },
-        nodeName: { value: "#document" },
-        documentElement: { value: html, enumerable: true },
-        head: { value: head, enumerable: true },
-        body: { value: body, enumerable: true },
-        contentType: { value: "text/html", enumerable: true },
-        URL: { value: "about:blank", enumerable: true },
-        documentURI: { value: "about:blank", enumerable: true },
-        characterSet: { value: "UTF-8", enumerable: true },
-        compatMode: { value: "CSS1Compat", enumerable: true },
-        readyState: { value: "complete", enumerable: true },
-        defaultView: {
-          configurable: true,
-          value: null,
-          enumerable: true,
-        },
-        doctype: { value: doctype, enumerable: true },
-        childNodes: {
-          get() {
-            return [doctype, html];
-          },
-        },
-      });
-      parsed.querySelector = (selector) => html.querySelector(String(selector));
-      parsed.querySelectorAll = (selector) =>
-        html.querySelectorAll(String(selector));
-      parsed.getElementById = (id) =>
-        html.querySelector("#" + CSS.escape(String(id)));
-      parsed.createElement = document.createElement;
-      parsed.createElementNS = document.createElementNS;
-      parsed.createTextNode = document.createTextNode;
-      parsed.createComment = document.createComment;
-      parsed.createDocumentFragment = document.createDocumentFragment;
-      parsed.cloneNode = (deep = false) =>
-        deep
-          ? document.implementation.createHTMLDocument()
-          : new Document();
-      return parsed;
-    }
+  /* compat.js builds the native-backed secondary documents
+     (createHTMLDocument, DOMParser) from the page document's own node
+     factories, captured here before custom-elements.js wraps them. */
+  domShared.documentFactories = {
+    createElement: document.createElement,
+    createElementNS: document.createElementNS,
+    createTextNode: document.createTextNode,
+    createComment: document.createComment,
+    createDocumentFragment: document.createDocumentFragment,
+    detach: (node) => detachNode?.(node),
   };
   const listenerCallable = (callback) =>
     typeof callback === "function" ||
@@ -6956,6 +7201,8 @@
       callback,
       options = false,
     ) {
+      if (this === __tilefinchRealmGlobal || this === document)
+        __tilefinchRealmGlobal.__tilefinchNoteTransitionListener?.(this, String(type));
       return __tilefinchRealmGlobal.__tilefinchAddEventListener(
         mapFor(this),
         type,
@@ -7035,15 +7282,12 @@
   }
   headWrapper = wrap(__tilefinchQuery("head"));
   document.getElementById = __tilefinchDocumentGetElementById;
-  document.getElementsByTagName = (tag) => {
-    tag = String(tag);
-    if (tag !== "*" && !/^[a-z][\w-]*$/i.test(tag))
-      return Array.from(document.querySelectorAll("*")).filter(
-        (node) => String(node.localName).toLowerCase() === tag.toLowerCase(),
-      );
-    return document.querySelectorAll(tag);
-  };
   {
+    /* While the parser runs a script of this document, write() feeds the
+       parser at its insertion point (written scripts run, in HTML's order);
+       the native reports false when there is no insertion point. */
+    const parserWrite = __tilefinchRealmGlobal.__tilefinchParserWrite;
+    delete __tilefinchRealmGlobal.__tilefinchParserWrite;
     const documentWriteStates = new WeakMap(),
       stateFor = (receiver) => {
         if (!(receiver instanceof Document))
@@ -7073,6 +7317,7 @@
         value: function write(...parts) {
           const state = stateFor(this),
             addition = parts.map(String).join("");
+          if (this === document && parserWrite(addition)) return;
           if (state.buffer.length + addition.length > 256 * 1024)
             throw new RangeError("document.write buffer exceeds bounded size");
           state.buffer += addition;
@@ -7097,15 +7342,16 @@
           if (state.pending) flush(this, state);
         },
       },
-      /* Tilefinch's write() appends markup to the body rather than feeding
-         a live parser, so open() is shaped to match: the three-argument
-         form is window.open; while the main document is still being parsed
-         HTML ignores open() (its active-parser case) and so does this; an
-         XML document throws; otherwise the reopened document starts empty:
+      /* Outside a parser-run script (no insertion point) Tilefinch's
+         write() appends markup to the body rather than opening a new
+         parser, so open() is shaped to match: the three-argument form is
+         window.open; while the main document is still being parsed HTML
+         ignores open() (its active-parser case) and so does this; an XML
+         document throws; otherwise the reopened document starts empty:
          queued writes are dropped and the body's children removed, so the
          write()/close() that follow replace the page as they would in a
          browser. The head (and its styles) and listeners are kept, and a
-         written <script> does not run, as for every write() here. */
+         <script> written this way does not run. */
       open: {
         configurable: true,
         writable: true,
@@ -7633,9 +7879,9 @@
       } catch (_) {
         throw new DOMException("Invalid target origin", "SyntaxError");
       }
-      if (!parsed.origin || parsed.origin === "null")
+      if (!parsed._origin || parsed._origin === "null")
         throw new DOMException("Invalid target origin", "SyntaxError");
-      return parsed.origin;
+      return parsed._origin;
     };
   Object.defineProperty(__tilefinchRealmGlobal, "__tilefinchPostParentMessage", {
     configurable: false,
@@ -7706,11 +7952,11 @@
       if (url !== undefined && url !== null) {
         const next = new TilefinchURL(url, location.href);
         if (
-          next.origin !== location.origin ||
-          !__tilefinchSetDocumentURL(next.href)
+          next._origin !== location.origin ||
+          !__tilefinchSetDocumentURL(next._href)
         )
           throw new Error("SecurityError");
-        setSynchronizedLocation(next.href);
+        setSynchronizedLocation(next._href);
       }
       historyState = state;
     },
@@ -8524,6 +8770,7 @@
       });
     class GamepadEvent {
       constructor(type, init = {}) {
+        init ??= {};
         /* Event is installed by the later compatibility bootstrap. Controller
            publication begins only after the complete bootstrap, so resolve
            it at construction time rather than making platform.js depend on
@@ -8628,10 +8875,12 @@
         ? new DOMException(message, "InvalidCharacterError")
         : new TypeError("InvalidCharacterError: " + message);
     };
+    /* No length caps: each result is one string charged to the realm's
+       heap, so its memory limit bounds them, as the engine's string limit
+       does in other browsers. Cloudflare's challenge decodes a payload
+       well over a mebibyte. */
     const btoa = (input) => {
       const text = String(input);
-      if (text.length > 256 * 1024)
-        throw new RangeError("base64 input exceeds bounded size");
       /* One native pass; a number is the index of the first code unit
          above 255. */
       const encoded = __tilefinchBase64EncodeLatin1(text);
@@ -8643,8 +8892,6 @@
     __tilefinchRealmGlobal.btoa = btoa;
     const atob = (input) => {
       const text = String(input);
-      if (text.length > 1024 * 1024)
-        throw new RangeError("base64 input exceeds bounded size");
       try {
         return __tilefinchBase64DecodeString(text);
       } catch (error) {
@@ -8975,6 +9222,7 @@
       };
     class MediaQueryListEvent {
       constructor(type, init = {}) {
+        init ??= {};
         if (typeof __tilefinchRealmGlobal.Event === "function") {
           const event = new __tilefinchRealmGlobal.Event(type, init);
           Object.setPrototypeOf(
@@ -9494,41 +9742,46 @@
     },
     navigationPerformanceEntry =
       new PerformanceNavigationTiming(location.href),
-    performanceEntries = [
-      navigationPerformanceEntry,
-      new VisibilityStateEntry(
-        visibilityStateEntryToken, document.visibilityState, 0),
-    ],
+    /* One bounded buffer per entry type: each type drops its own oldest
+       entry, so resource timings recorded between performance.mark() and
+       performance.measure() never evict the mark. */
+    performanceBufferLimits = {
+      __proto__: null,
+      mark: 256,
+      measure: 64,
+      resource: 128,
+      "visibility-state": 50,
+    },
+    performanceBuffers = {
+      __proto__: null,
+      navigation: [navigationPerformanceEntry],
+      "visibility-state": [new VisibilityStateEntry(
+        visibilityStateEntryToken, document.visibilityState, 0)],
+      mark: [],
+      measure: [],
+      resource: [],
+    },
+    performanceBuffer = (type) => (performanceBuffers[type] ??= []),
+    allPerformanceEntries = () => {
+      const entries = [];
+      for (const type in performanceBuffers)
+        for (const entry of performanceBuffers[type]) entries.push(entry);
+      return entries;
+    },
     appendPerformanceEntry = (entry) => {
-      if (entry.entryType === "visibility-state") {
-        let visibilityEntries = 0;
-        for (let at = performanceEntries.length - 1; at >= 0; at--) {
-          if (performanceEntries[at].entryType !== "visibility-state")
-            continue;
-          visibilityEntries++;
-          if (visibilityEntries >= 50) {
-            performanceEntries.splice(at, 1);
-            break;
-          }
-        }
-      }
-      if (performanceEntries.length >= 128) {
-        const at = performanceEntries.findIndex(
-          (value) => value.entryType !== "navigation",
-        );
-        if (at >= 0) performanceEntries.splice(at, 1);
-      }
-      if (performanceEntries.length < 128) performanceEntries.push(entry);
+      const type = entry.entryType, buffer = performanceBuffer(type);
+      if (type !== "navigation" &&
+          buffer.length >= (performanceBufferLimits[type] ?? 32))
+        buffer.shift();
+      buffer.push(entry);
       notifyPerformanceObservers(entry);
       return entry;
     },
     performanceMarkTime = (name) => {
       name = String(name);
-      for (let at = performanceEntries.length - 1; at >= 0; at--) {
-        const entry = performanceEntries[at];
-        if (entry.entryType === "mark" && entry.name === name)
-          return entry.startTime;
-      }
+      const marks = performanceBuffers.mark;
+      for (let at = marks.length - 1; at >= 0; at--)
+        if (marks[at].name === name) return marks[at].startTime;
       throw new DOMException(
         "The mark " + name + " does not exist",
         "SyntaxError",
@@ -9765,6 +10018,12 @@
       get() { requirePerformanceValue(this); return performanceNavigation; },
     },
   });
+  /* Removes the named entries, or every entry without a name, in place. */
+  const clearPerformanceEntries = (buffer, name) => {
+    if (name !== undefined) name = String(name);
+    for (let at = buffer.length - 1; at >= 0; at--)
+      if (name === undefined || buffer[at].name === name) buffer.splice(at, 1);
+  };
   const performanceOperations = {
     now() {
       requirePerformanceValue(this);
@@ -9816,45 +10075,31 @@
     },
     getEntries() {
       requirePerformanceValue(this);
-      return sortPerformanceEntries(performanceEntries);
+      return sortPerformanceEntries(allPerformanceEntries());
     },
     getEntriesByType(type) {
       requirePerformanceValue(this);
-      type = String(type);
-      return sortPerformanceEntries(
-        performanceEntries.filter((entry) => entry.entryType === type));
+      return sortPerformanceEntries(performanceBuffers[String(type)] || []);
     },
     getEntriesByName(name, type) {
       requirePerformanceValue(this);
       name = String(name);
-      if (type !== undefined) type = String(type);
-      return sortPerformanceEntries(performanceEntries.filter(
-        (entry) => entry.name === name &&
-          (type === undefined || entry.entryType === type)));
+      const entries = type === undefined ? allPerformanceEntries()
+        : performanceBuffers[String(type)] || [];
+      return sortPerformanceEntries(
+        entries.filter((entry) => entry.name === name));
     },
     clearMarks(name) {
       requirePerformanceValue(this);
-      for (let i = performanceEntries.length - 1; i >= 0; i--)
-        if (
-          performanceEntries[i].entryType === "mark" &&
-          (name === undefined || performanceEntries[i].name === String(name))
-        )
-          performanceEntries.splice(i, 1);
+      clearPerformanceEntries(performanceBuffers.mark, name);
     },
     clearMeasures(name) {
       requirePerformanceValue(this);
-      for (let i = performanceEntries.length - 1; i >= 0; i--)
-        if (
-          performanceEntries[i].entryType === "measure" &&
-          (name === undefined || performanceEntries[i].name === String(name))
-        )
-          performanceEntries.splice(i, 1);
+      clearPerformanceEntries(performanceBuffers.measure, name);
     },
     clearResourceTimings() {
       requirePerformanceValue(this);
-      for (let i = performanceEntries.length - 1; i >= 0; i--)
-        if (performanceEntries[i].entryType === "resource")
-          performanceEntries.splice(i, 1);
+      performanceBuffers.resource.length = 0;
     },
     setResourceTimingBufferSize() { requirePerformanceValue(this); },
       toJSON() {
@@ -9977,8 +10222,7 @@
           schedulePerformanceObserver(observer, performanceObserverState.get(observer));
       };
       if (hasType && options.buffered && types.has(requested[0])) {
-        for (const entry of performanceEntries) {
-          if (entry.entryType !== requested[0]) continue;
+        for (const entry of performanceBuffers[requested[0]] || []) {
           if (state.records.length >= performanceObserverRecordLimit) {
             state.records.shift();
             state.dropped++;
@@ -10030,7 +10274,7 @@
     performanceTimingState.domContentLoadedEventStart =
       performanceTimeOrigin + navigationTiming.domContentLoadedEventStart;
     document.dispatchEvent(new Event("DOMContentLoaded", { bubbles: true }));
-    __tilefinchRealmGlobal.__tilefinchMaybeStartMotion?.();
+    __tilefinchRealmGlobal.__tilefinchMaybeStartMotion?.(true);
     const domContentLoadedEventEnd = __tilefinchPerformanceNow(3);
     documentReadyState = "complete";
     document.dispatchEvent(new Event("readystatechange"));

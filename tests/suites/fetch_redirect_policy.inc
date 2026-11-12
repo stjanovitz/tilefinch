@@ -216,6 +216,149 @@ static bool test_private_network_admission(Budget *budget, unsigned port)
     return true;
 }
 
+static char numeric_host_seen_url[TILEFINCH_URL_SERIALIZED_LIMIT];
+
+/* Records the URL the policy admitted and refuses it, so no connection is
+   attempted to the public addresses below. */
+static bool numeric_host_record_and_refuse(const char *url)
+{
+    snprintf(numeric_host_seen_url, sizeof(numeric_host_seen_url), "%s",
+             url == NULL ? "" : url);
+    return false;
+}
+
+/* NET-1: a host that is a number is an IPv4 address to inet_aton, the PSP
+   resolver and curl, however it is spelled. The policy used to call every
+   dotless host "local network", so http://134744072/ (8.8.8.8) skipped
+   HTTPS-first and its page could reach the LAN. Such hosts are classified
+   by the address they denote: public ones are upgraded and protected,
+   private ones keep the LAN escape hatch. */
+static bool test_numeric_hosts_classified_by_address(Budget *budget,
+                                                     unsigned port)
+{
+    static const char *const public_hosts[] = {
+        "134744072",          /* 8.8.8.8 as one decimal number */
+        "0x08080808",         /* hexadecimal */
+        "8.526344",           /* a.b */
+        "8.8.2056",           /* a.b.c */
+        "010.010.010.010",    /* octal parts */
+        "0x8.0x8.0x8.0x8",
+        "4294967296",         /* out of range: no address, never local */
+        "08",                 /* a stray octal digit: never local */
+        "[2001:db8::1]"       /* a public IPv6 literal has no dot either */
+    };
+    static const char *const private_hosts[] = {
+        "3232235777",         /* 192.168.1.1 */
+        "0xc0a80101",
+        "0x7f.1",             /* 127.0.0.1 */
+        "10.1",               /* 10.0.0.1 */
+        "224.0.0.251",        /* multicast (224/4): mDNS */
+        "239.255.255.250",    /* multicast: SSDP, which routers answer */
+        "240.0.0.1",          /* reserved (240/4) */
+        "255.255.255.255"     /* limited broadcast */
+    };
+    char url[256];
+    for (size_t i = 0;
+         i < sizeof(public_hosts) / sizeof(public_hosts[0]); i++) {
+        FetchRequest navigation = {
+            .method = "GET",
+            .sec_fetch_dest = "document",
+            .sec_fetch_mode = "navigate",
+            .redirect_url_validator = numeric_host_record_and_refuse
+        };
+        CHECK(fetch_request_validate(&navigation, NULL));
+        snprintf(url, sizeof(url), "http://%s/", public_hosts[i]);
+        numeric_host_seen_url[0] = '\0';
+        FetchResult result = {.budget = budget};
+        CHECK(!fetch_redirect(budget, url, &navigation, &result));
+        fetch_result_destroy(&result);
+        if (strncmp(numeric_host_seen_url, "https://", 8) != 0) {
+            fprintf(stderr, "numeric host %s was not upgraded: %s\n",
+                    public_hosts[i], numeric_host_seen_url);
+            return false;
+        }
+    }
+    for (size_t i = 0;
+         i < sizeof(private_hosts) / sizeof(private_hosts[0]); i++) {
+        FetchRequest navigation = {
+            .method = "GET",
+            .sec_fetch_dest = "document",
+            .sec_fetch_mode = "navigate",
+            .redirect_url_validator = numeric_host_record_and_refuse
+        };
+        snprintf(url, sizeof(url), "http://%s/", private_hosts[i]);
+        numeric_host_seen_url[0] = '\0';
+        FetchResult result = {.budget = budget};
+        CHECK(!fetch_redirect(budget, url, &navigation, &result));
+        fetch_result_destroy(&result);
+        CHECK(strncmp(numeric_host_seen_url, "http://", 7) == 0);
+    }
+
+    /* A page served from a public numeric host is a public page: its
+       subresources may not reach the loopback fixture. */
+    char target[256];
+    snprintf(target, sizeof(target), "http://127.0.0.1:%u/final", port);
+    static const char *const public_pages[] = {
+        "http://134744072/page",
+        "http://0x08080808/page",
+        "http://8.8.2056/page",
+        "http://[2001:db8::1]/page"
+    };
+    FetchRequest transport = {0};
+    FetchPreparedPageRequest prepared;
+    for (size_t i = 0;
+         i < sizeof(public_pages) / sizeof(public_pages[0]); i++) {
+        TilefinchRequestContext context = {
+            .target_url = target,
+            .initiator_url = public_pages[i],
+            .top_level_url = public_pages[i],
+            .method = "GET",
+            .mode = TILEFINCH_REQUEST_MODE_NO_CORS,
+            .credentials = TILEFINCH_CREDENTIALS_INCLUDE,
+            .destination = TILEFINCH_DESTINATION_IMAGE
+        };
+        CHECK(fetch_prepare_page_request_context(
+            &context, context.initiator_url, NULL, NULL, NULL, NULL,
+            &transport, &prepared, NULL));
+        FetchResult result = {.budget = budget};
+        bool loaded = fetch_redirect(
+            budget, target, fetch_prepared_page_request(&prepared), &result);
+        if (loaded || strstr(result.error, "private network") == NULL) {
+            fprintf(stderr,
+                    "page %s reached the LAN: success=%u status=%ld "
+                    "error=%s\n", public_pages[i], loaded ? 1u : 0u,
+                    result.status_code, result.error);
+            fetch_result_destroy(&result);
+            return false;
+        }
+        fetch_result_destroy(&result);
+    }
+
+    /* Positive control: a loopback page spelled as one number is still a
+       local page and may keep using its own address space. */
+    char local_page[256];
+    snprintf(local_page, sizeof(local_page),
+             "http://2130706433:%u/page", port);
+    TilefinchRequestContext context = {
+        .target_url = target,
+        .initiator_url = local_page,
+        .top_level_url = local_page,
+        .method = "GET",
+        .mode = TILEFINCH_REQUEST_MODE_NO_CORS,
+        .credentials = TILEFINCH_CREDENTIALS_INCLUDE,
+        .destination = TILEFINCH_DESTINATION_IMAGE
+    };
+    CHECK(fetch_prepare_page_request_context(
+        &context, context.initiator_url, NULL, NULL, NULL, NULL,
+        &transport, &prepared, NULL));
+    FetchResult result = {.budget = budget};
+    CHECK(fetch_redirect(
+              budget, target, fetch_prepared_page_request(&prepared), &result)
+          && result.status_code == 200);
+    fetch_result_destroy(&result);
+    return true;
+}
+
 /* BrowserEngine installs the process-wide Lexbor allocator. Keep this
    integration exercise after the redirect suite's other document tests so
    engine teardown does not uninstall their shared test Budget's hooks. */
@@ -587,6 +730,89 @@ static bool test_supported_accept_encoding(Budget *budget, unsigned port)
     fetch_result_destroy(&result);
     fetch_scheduler_destroy(scheduler);
     CHECK(unsetenv("TILEFINCH_DIAGNOSTIC_MOBILE_SAFARI") == 0);
+    return true;
+}
+
+/* RFC 3986 section 5: a Location that is a relative reference resolves
+   against the URL that answered it. A SHOUTcast DNAS root answers exactly
+   "Location:index.html?sid=1", with no space after the colon. Every fetch
+   path follows it: the blocking transport and the scheduler, for a plain
+   request and for a secure page's audio request shaped like the media
+   probe (ICY status lines, a Range header, HTTP errors returned) after the
+   listener allowed its unencrypted stream. That request names a public
+   http:// host, reached through the loopback HTTP proxy, because loopback
+   itself is trustworthy and would skip the mixed-content rules. */
+static bool test_relative_location_resolves(
+    Budget *budget, unsigned port, unsigned proxy_port)
+{
+    char url[256];
+    char expected[256];
+    snprintf(url, sizeof(url), "http://127.0.0.1:%u/dnas/", port);
+    snprintf(expected, sizeof(expected),
+             "http://127.0.0.1:%u/dnas/index.html?sid=1", port);
+    FetchRequest plain = {.method = "GET"};
+    FetchResult result = {.budget = budget};
+    CHECK(fetch_redirect(budget, url, &plain, &result)
+          && result.status_code == 200
+          && strcmp(result.effective_url, expected) == 0
+          && strstr(result.data, "sid=sid=1") != NULL);
+    fetch_result_destroy(&result);
+    result = (FetchResult) {.budget = budget};
+    CHECK(fetch_scheduled(budget, url, &plain, &result)
+          && result.status_code == 200
+          && strcmp(result.effective_url, expected) == 0);
+    fetch_result_destroy(&result);
+
+    static const char station[] = "http://radio.invalid:8000/dnas/";
+    static const char station_page[] =
+        "http://radio.invalid:8000/dnas/index.html?sid=1";
+    static const char document[] = "https://localhost/radio";
+    char proxy[64];
+    snprintf(proxy, sizeof(proxy), "http://127.0.0.1:%u", proxy_port);
+    BrowserSession browser;
+    CHECK(browser_session_init(&browser, budget, 64 * 1024)
+          && browser_session_set_insecure_audio_site(
+                 &browser, document, BROWSER_INSECURE_AUDIO_ALLOWED));
+    TilefinchRequestContext context = {
+        .target_url = station,
+        .initiator_url = document,
+        .top_level_url = document,
+        .method = "GET",
+        .mode = TILEFINCH_REQUEST_MODE_NO_CORS,
+        .credentials = TILEFINCH_CREDENTIALS_INCLUDE,
+        .destination = TILEFINCH_DESTINATION_AUDIO
+    };
+    FetchRequest transport = {
+        .allow_http_errors = true,
+        .accept = "audio/mpeg,audio/mp4,audio/*;q=0.9,*/*;q=0.5",
+        .icy_status_line = true,
+        .extra_headers = "Range: bytes=0-4095",
+        .redirect_same_origin_only = false
+    };
+    FetchPreparedPageRequest prepared;
+    CHECK(fetch_prepare_page_request_context(
+        &context, document, NULL, &browser, NULL, NULL,
+        &transport, &prepared, NULL));
+    const FetchRequest *audio = fetch_prepared_page_request(&prepared);
+    CHECK(audio != NULL && setenv("http_proxy", proxy, 1) == 0);
+    bool followed[2] = {false, false};
+    for (unsigned path = 0; path < 2u; path++) {
+        result = (FetchResult) {.budget = budget};
+        bool fetched = path == 0u
+            ? fetch_redirect(budget, station, audio, &result)
+            : fetch_scheduled(budget, station, audio, &result);
+        followed[path] = fetched && result.status_code == 200
+            && strcmp(result.effective_url, station_page) == 0;
+        if (!followed[path]) {
+            fprintf(stderr, "relative Location path=%u status=%ld url=%s "
+                    "error=%s\n", path, result.status_code,
+                    result.effective_url, result.error);
+        }
+        fetch_result_destroy(&result);
+    }
+    CHECK(unsetenv("http_proxy") == 0);
+    browser_session_destroy(&browser);
+    CHECK(followed[0] && followed[1]);
     return true;
 }
 

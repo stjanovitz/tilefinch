@@ -371,7 +371,7 @@ unsigned psp_input_script_step_now(const char **kind)
 {
     static const char *const names[] = {
         "wait", "hold", "press", "mark", "stick", "end", "until", "timed-press",
-        "page-action"
+        "page-action", "answer-question"
     };
     const PspInputScript *script = &psp_input_script;
     unsigned index = script->step;
@@ -399,6 +399,29 @@ void psp_input_script_interrupt_by_user(void)
     printf("tilefinch-input-script: event=physical-input-handoff\n");
 }
 
+/* answer-question's decision, once, on the frame it is made. */
+static void psp_input_script_log_question(uint16_t step)
+{
+    PspInputScriptQuestionOutcome outcome =
+        psp_input_script_question_outcome(&psp_input_script);
+    if (outcome == PSP_INPUT_SCRIPT_QUESTION_NONE) return;
+    /* The question's own picture, taken as it is answered: a fixed earlier
+       mark can fire before the upgrade attempt has failed. */
+    if (outcome == PSP_INPUT_SCRIPT_QUESTION_ANSWERED
+        && !psp_input_script_pending_capture_valid) {
+        snprintf(psp_input_script_pending_capture_mark,
+                 sizeof(psp_input_script_pending_capture_mark), "%s",
+                 "question");
+        psp_input_script_pending_capture_valid = true;
+    }
+    printf("tilefinch-input-script: step=%u action=answer-question "
+           "outcome=%s at-us=%llu\n", (unsigned) step,
+           outcome == PSP_INPUT_SCRIPT_QUESTION_ANSWERED ? "answered"
+           : outcome == PSP_INPUT_SCRIPT_QUESTION_NOT_ASKED ? "not-asked"
+           : "timed-out",
+           (unsigned long long) sceKernelGetSystemTimeWide());
+}
+
 bool psp_input_script_frame(
     PspUiInput *input, bool ready, bool page_ready)
 {
@@ -408,6 +431,7 @@ bool psp_input_script_frame(
     bool driving = psp_input_script_advance_with_page(
         &psp_input_script, input, psp_input_script_previous_buttons,
         ready, page_ready);
+    psp_input_script_log_question(frame_step);
     if (input != NULL) {
         psp_input_script_measure_edge(input, frame_step, psp_input_script.now_us);
         psp_input_script_previous_buttons = input->held;
@@ -439,6 +463,7 @@ bool psp_input_script_busy_frame(PspUiInput *input)
     psp_input_script.now_us = sceKernelGetSystemTimeWide();
     bool driving = psp_input_script_advance(
         &psp_input_script, input, psp_input_script_previous_buttons, false);
+    psp_input_script_log_question(frame_step);
     if (input != NULL) {
         psp_input_script_measure_edge(input, frame_step, psp_input_script.now_us);
         psp_input_script_previous_buttons = input->held;
@@ -691,7 +716,9 @@ void psp_input_script_observe_page(
        STYLE_SOURCE_NODE_LIMIT sources it is bounded out with 48. The
        compiled-cache, layout-reuse and relayout counters are cumulative for
        the session; ir= and fragments= are the page's external-sheet stats,
-       which a restored sheet carries over from the visit that stored it. */
+       which a restored sheet carries over from the visit that stored it.
+       head-cache= counts cached sheets cut back to their <head> sources
+       for a page with other body <style> blocks (taken/refused). */
     {
         const NavigationPerformance *perf = &navigation->performance;
         const Stylesheet *sheet = &page->stylesheet;
@@ -703,7 +730,7 @@ void psp_input_script_observe_page(
                "adopted-sources=%u adopted-failed=%u rules=%zu "
                "reuse-full-resets=%zu reuse-scoped=%zu "
                "reuse-styles=%zu/%zu relayouts=%zu/%zu "
-               "focus-skips=%zu/%zu\n",
+               "focus-skips=%zu/%zu head-cache=%zu/%zu\n",
                mark, (unsigned long long) navigation->generation,
                perf->compiled_stylesheet_cache_hits,
                perf->compiled_stylesheet_cache_misses,
@@ -727,7 +754,9 @@ void psp_input_script_observe_page(
                perf->layout_reuse_style_hits, perf->layout_reuse_style_misses,
                perf->fast_relayouts, perf->full_relayouts,
                perf->focus_outline_relayout_skips,
-               perf->focus_paint_relayout_skips);
+               perf->focus_paint_relayout_skips,
+               perf->compiled_stylesheet_cache_head_hits,
+               perf->compiled_stylesheet_cache_head_refusals);
     }
     printf("tilefinch-input-script-js: mark=%s discovered=%zu attempted=%zu "
            "loaded=%zu failed=%zu bytecode=%zu/%zu/%zu "
@@ -973,6 +1002,11 @@ void psp_input_script_observe_media(
     const PspUiMediaIntent *intent, const PspUiMediaState *media)
 {
     if (!psp_input_script_armed(&psp_input_script) || media == NULL) return;
+    psp_input_script_set_media_question(
+        &psp_input_script,
+        media->visible && media->failed && media->insecure_audio_offer,
+        media->visible && media->playing && !media->resolving
+            && !media->failed && media->current_time_us != 0);
     /* A fixed live wait can expire during decoder startup and send Select
        to the loading screen instead of the player. Native media readiness is
        deliberately independent of author JavaScript and loading duration. */

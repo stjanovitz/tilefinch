@@ -1,0 +1,27 @@
+# Measurement scenario, not golden-gated: three loads of one article URL in
+# a session, Wikipedia's JavaScript off as on the device. With a keyed trace
+# that holds three document records for the URL (articles A, B, C sharing
+# their <head> stylesheets), each Square reload is served the next article,
+# as following links between articles would be. The third load is the first
+# that can start from the compiled-sheet cache (the second still finds the
+# first page live): compare the three tilefinch-load-experience lines
+# (scope=initial, then scope=follow) and the head-cache= taken/refused
+# counters on tilefinch-input-stylesheets at each mark; the -frame marks
+# dump each settled article's frame (frame-mark-*.ppm) for comparison.
+# (A wait-page right after a reload stalls: only a -live step advances
+# through it.)
+wait-page 120
+wait 300
+mark a-settled
+mark-live a-frame
+tap square
+wait-live 2400
+wait 300
+mark b-settled
+mark-live b-frame
+tap square
+wait-live 2400
+wait 300
+mark c-settled
+mark-live c-frame
+end

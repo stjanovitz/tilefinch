@@ -1,4 +1,5 @@
 #include "tilefinch/media_failure_message.h"
+#include "tilefinch/media_hls.h"
 #include "tilefinch/media_mp4.h"
 
 #include <ctype.h>
@@ -40,9 +41,31 @@ const char *media_failure_headline(MediaFailureKind kind)
         return "NETWORK PROBLEM";
     case MEDIA_FAILURE_MEMORY:
         return "NOT ENOUGH MEMORY FOR VIDEO";
+    case MEDIA_FAILURE_COPY_PROTECTED:
+        return "THIS VIDEO IS COPY-PROTECTED";
+    case MEDIA_FAILURE_INSECURE_AUDIO_QUESTION:
+        return "PLAY UNENCRYPTED AUDIO?";
+    case MEDIA_FAILURE_INSECURE_AUDIO_BLOCKED:
+        return "UNENCRYPTED AUDIO BLOCKED";
+    case MEDIA_FAILURE_AUDIO_DECODE:
+        return "PSP CAN'T PLAY THIS AUDIO";
     case MEDIA_FAILURE_OTHER:
     default:
         return NULL;
+    }
+}
+
+const char *media_failure_audio_headline(MediaFailureKind kind)
+{
+    switch (kind) {
+    case MEDIA_FAILURE_DECODER_NOT_STARTED:
+        return "AUDIO DECODER COULDN'T START";
+    case MEDIA_FAILURE_SOURCE_REFUSED:
+        return "AUDIO SOURCE COULD NOT OPEN";
+    case MEDIA_FAILURE_MEMORY:
+        return "NOT ENOUGH MEMORY FOR AUDIO";
+    default:
+        return media_failure_headline(kind);
     }
 }
 
@@ -91,6 +114,16 @@ const char *media_failure_detail_text(MediaFailureDetail detail)
         return "Close other tabs, then retry";
     case MEDIA_FAILURE_DETAIL_RESTART:
         return "Retry, or restart Tilefinch";
+    case MEDIA_FAILURE_DETAIL_DRM:
+        return "PSP can't play DRM videos";
+    case MEDIA_FAILURE_DETAIL_PAID:
+        return "PSP can't play paid videos";
+    case MEDIA_FAILURE_DETAIL_NO_ENCRYPTED_STREAM:
+        return "This station is not encrypted";
+    case MEDIA_FAILURE_DETAIL_SITE_INFORMATION:
+        return "Change it in Site information";
+    case MEDIA_FAILURE_DETAIL_PLAYLIST_TOO_LONG:
+        return "Video playlist too long";
     case MEDIA_FAILURE_DETAIL_NONE:
     case MEDIA_FAILURE_DETAIL_CODE:
     case MEDIA_FAILURE_DETAIL_HTTP_STATUS:
@@ -127,6 +160,33 @@ static bool failure_http_status(const char *failure, char *code, size_t size)
     if (at[1] < '0' || at[1] > '9' || at[2] < '0' || at[2] > '9'
         || (at[3] != ')' && at[3] != ' ')) return false;
     snprintf(code, size, "HTTP %.3s", at);
+    return true;
+}
+
+/* The page media probe's own failure, "page audio range probe failed
+   (HTTP 302): ...": whatever status the server answered (a redirect that
+   could not be followed, a server error) the source did not open, and the
+   status is its code. No status at all is no answer from the network. */
+static bool failure_probe_status(
+    const char *failure, MediaFailureKind *kind, MediaFailureDetail *detail,
+    char *code, size_t size)
+{
+    static const char marker[] = "range probe failed (HTTP ";
+    const char *at = strstr(failure, marker);
+    if (at == NULL) return false;
+    at += sizeof(marker) - 1u;
+    char *end = NULL;
+    long status = strtol(at, &end, 10);
+    if (end == at || *end != ')' || status < 0 || status > 599) return false;
+    if (status == 0) {
+        *kind = MEDIA_FAILURE_NETWORK;
+        *detail = MEDIA_FAILURE_DETAIL_CHECK_NETWORK;
+        return true;
+    }
+    if (status < 100) return false;
+    *kind = MEDIA_FAILURE_SOURCE_REFUSED;
+    *detail = MEDIA_FAILURE_DETAIL_HTTP_STATUS;
+    snprintf(code, size, "HTTP %ld", status);
     return true;
 }
 
@@ -182,6 +242,8 @@ static bool failure_format(const char *failure, MediaFailureDetail *detail)
     } else if (strstr(failure, "has no supported track") != NULL
                || strstr(failure, "no compatible AVC rendition") != NULL) {
         *detail = MEDIA_FAILURE_DETAIL_CODEC;
+    } else if (strstr(failure, MEDIA_HLS_PLAYLIST_TOO_LONG) != NULL) {
+        *detail = MEDIA_FAILURE_DETAIL_PLAYLIST_TOO_LONG;
     } else {
         return false;
     }
@@ -280,7 +342,11 @@ static bool failure_playability(
         {"upcoming", MEDIA_FAILURE_NOT_STARTED_YET,
          MEDIA_FAILURE_DETAIL_TRY_WHEN_LIVE},
         {"live-unsupported", MEDIA_FAILURE_FORMAT_UNSUPPORTED,
-         MEDIA_FAILURE_DETAIL_LIVE}
+         MEDIA_FAILURE_DETAIL_LIVE},
+        {"drm-protected", MEDIA_FAILURE_COPY_PROTECTED,
+         MEDIA_FAILURE_DETAIL_DRM},
+        {"payment-required", MEDIA_FAILURE_VIDEO_UNAVAILABLE,
+         MEDIA_FAILURE_DETAIL_PAID}
     };
     const char *name = strstr(failure, "playability: ");
     if (name != NULL) {
@@ -330,6 +396,28 @@ static bool failure_media_module(
             return true;
         }
         at += 3;
+    }
+    return false;
+}
+
+/* The audio decoder's refusal: "MP3 decode: 0x807F00FD" (or AAC), shown
+   as "MP3 0x807F00FD". */
+static bool failure_audio_decode(const char *failure, char *code, size_t size)
+{
+    static const char *const codecs[] = {"MP3", "AAC"};
+    for (size_t i = 0; i < sizeof(codecs) / sizeof(codecs[0]); i++) {
+        char prefix[16];
+        snprintf(prefix, sizeof(prefix), "%s decode: 0x", codecs[i]);
+        const char *at = strstr(failure, prefix);
+        if (at == NULL) continue;
+        at += strlen(prefix);
+        size_t digits = 0;
+        while (digits < 8u && isxdigit((unsigned char) at[digits])) digits++;
+        if (digits != 8u || isxdigit((unsigned char) at[8])) continue;
+        snprintf(code, size, "%s 0x%.8s", codecs[i], at);
+        for (char *c = code; *c != '\0'; c++)
+            if (*c >= 'a' && *c <= 'f') *c = (char) (*c - 'a' + 'A');
+        return true;
     }
     return false;
 }
@@ -390,7 +478,17 @@ bool media_failure_message(const char *failure, MediaFailureMessage *message)
     memset(message, 0, sizeof(*message));
     if (failure == NULL) return false;
     MediaFailureDetail detail = MEDIA_FAILURE_DETAIL_NONE;
-    if (strstr(failure, "OPTIONAL VIDEO DECODER NOT INSTALLED") != NULL
+    if (strcmp(failure, MEDIA_INSECURE_AUDIO_QUESTION) == 0) {
+        message->kind = MEDIA_FAILURE_INSECURE_AUDIO_QUESTION;
+        detail = MEDIA_FAILURE_DETAIL_NO_ENCRYPTED_STREAM;
+    } else if (strcmp(failure, MEDIA_INSECURE_AUDIO_BLOCKED) == 0) {
+        message->kind = MEDIA_FAILURE_INSECURE_AUDIO_BLOCKED;
+        detail = MEDIA_FAILURE_DETAIL_SITE_INFORMATION;
+    } else if (failure_audio_decode(
+                   failure, message->code, sizeof(message->code))) {
+        message->kind = MEDIA_FAILURE_AUDIO_DECODE;
+        detail = MEDIA_FAILURE_DETAIL_CODE;
+    } else if (strstr(failure, "OPTIONAL VIDEO DECODER NOT INSTALLED") != NULL
         || strstr(failure, "OPTIONAL VIDEO DECODER IS NOT INSTALLED")
                != NULL) {
         message->kind = MEDIA_FAILURE_DECODER_NOT_INSTALLED;
@@ -413,6 +511,10 @@ bool media_failure_message(const char *failure, MediaFailureMessage *message)
         detail = failure_http_status(
                      failure, message->code, sizeof(message->code))
             ? MEDIA_FAILURE_DETAIL_HTTP_STATUS : MEDIA_FAILURE_DETAIL_NONE;
+    } else if (failure_probe_status(
+                   failure, &message->kind, &detail,
+                   message->code, sizeof(message->code))) {
+        /* The probe's status set the kind and its code. */
     } else if (failure_http_status(
                    failure, message->code, sizeof(message->code))) {
         message->kind = MEDIA_FAILURE_SOURCE_REFUSED;

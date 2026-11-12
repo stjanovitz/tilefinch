@@ -310,6 +310,8 @@ static int test_youtube_filters_and_chapters(void)
     CHECK(results_scroll_y > 0);
     CHECK(browser_engine_focus_node(engine, test_reader_find_id(root, "yt-search"))
         && browser_engine_replace_text(engine, "edited fixture", 14u));
+    /* Its form's only text field: the keyboard's Done searches (Q7). */
+    CHECK(browser_engine_keyboard_done_submits(engine));
     CHECK(browser_engine_focus_node(engine, test_reader_find_id(root, "yt-filter-apply")));
     if (navigation_current(nav)->scroll_y != results_scroll_y)
         CHECK(browser_engine_scroll_by(engine,

@@ -797,6 +797,7 @@ bool font_set_load_selected(
         }
         any = true;
     }
+    font_set_mark_bold_faces(fonts);
     return any || selected == 0;
 }
 
@@ -1067,6 +1068,14 @@ const FontFace *font_set_face_variant(const FontSet *fonts, FontFamily family,
         && (family == FONT_SANS || family == FONT_HUMANIST_SANS) && italic
         && fonts->sans_italic.loaded) return &fonts->sans_italic;
     return font_set_face(fonts, family);
+}
+
+void font_set_mark_bold_faces(FontSet *fonts)
+{
+    if (fonts == NULL) return;
+    fonts->sans_bold.application_bold = fonts->sans_bold.loaded;
+    fonts->serif_bold.application_bold = fonts->serif_bold.loaded;
+    fonts->metric_sans_bold.application_bold = fonts->metric_sans_bold.loaded;
 }
 
 bool font_set_face_is_bold(const FontSet *fonts, const FontFace *face)
@@ -1677,6 +1686,56 @@ bool font_optional_glyph_match_sequence(
     return true;
 }
 
+/* U+0900-09FF at TEXT, or 0. All are three bytes; other text is never read. */
+static unsigned indic_character(const char *text, size_t length)
+{
+    const unsigned char *at = (const unsigned char *) text;
+    if (length < 3u || at[0] != 0xe0u || (at[1] & 0xfcu) != 0xa4u
+        || (at[2] & 0xc0u) != 0x80u) return 0;
+    return 0x0900u | ((at[1] & 3u) << 6) | (at[2] & 0x3fu);
+}
+
+static bool indic_consonant(unsigned c)
+{
+    return (c >= 0x0915u && c <= 0x0939u) || (c >= 0x0958u && c <= 0x095fu)
+        || (c >= 0x0979u && c <= 0x097fu) || (c >= 0x0995u && c <= 0x09b9u)
+        || (c >= 0x09dcu && c <= 0x09dfu) || c == 0x09f0u || c == 0x09f1u;
+}
+
+size_t font_indic_prebase_vowel(const char *text, size_t length)
+{
+    /* The longest conjunct either pack's cluster lists holds. */
+    enum { CONSONANT_LIMIT = 5 };
+    size_t at = 0;
+    unsigned consonants = 0;
+    for (;;) {
+        if (!indic_consonant(indic_character(text + at, length - at)))
+            return 0;
+        at += 3u;
+        unsigned next = indic_character(text + at, length - at);
+        if (next == 0x093cu || next == 0x09bcu) {
+            at += 3u;
+            next = indic_character(text + at, length - at);
+        }
+        if (next == 0x093fu || next == 0x09bfu
+            || next == 0x09c7u || next == 0x09c8u) break;
+        if ((next != 0x094du && next != 0x09cdu)
+            || ++consonants == CONSONANT_LIMIT) return 0;
+        at += 3u;
+    }
+    /* Walk the cluster as the painter will. A sequence it reaches can draw the
+       vowel itself; one that ends on the vowel leaves it alone. */
+    for (size_t start = 0; start < at;) {
+        size_t used = 0;
+        unsigned key = 0;
+        if (!font_optional_glyph_match_sequence(
+                text + start, length - start, &used, &key)) used = 3u;
+        else if (used > at - start) return 0;
+        start += used;
+    }
+    return at;
+}
+
 bool font_optional_glyph_match_sequence_ending_at(
     const char *text, size_t end, size_t *start, unsigned *glyph_key)
 {
@@ -1852,30 +1911,87 @@ static bool builtin_navigation_icon(unsigned codepoint)
         || codepoint == 0x25b2u || codepoint == 0x25b3u;
 }
 
-static bool optional_fallback_advance_fixed(unsigned codepoint,
+/* A pack stores one weight, so its monochrome glyphs need emboldening whenever
+   the text is bold, including when the text's own face is a real bold face and
+   so needs no synthesis for its own glyphs. Color glyphs have no weight. */
+static bool optional_mono_bold(const FontFace *face, bool synthetic_bold,
+                               TilefinchGlyphComponentKind kind)
+{
+    return kind == TILEFINCH_GLYPH_COMPONENT_MONO
+        && (synthetic_bold
+            || (face != NULL
+                && (face->authored_weight != 0
+                    ? face->authored_weight >= 600 : face->application_bold)));
+}
+
+bool font_codepoint_combining_mark(unsigned codepoint)
+{
+    static const uint16_t ranges[][2] = {
+        {0x0300u, 0x036fu}, {0x0483u, 0x0489u}, {0x0591u, 0x05bdu},
+        {0x05bfu, 0x05bfu}, {0x05c1u, 0x05c2u}, {0x05c4u, 0x05c5u},
+        {0x05c7u, 0x05c7u}, {0x0610u, 0x061au}, {0x064bu, 0x065fu},
+        {0x0670u, 0x0670u}, {0x06d6u, 0x06dcu}, {0x06dfu, 0x06e4u},
+        {0x06e7u, 0x06e8u}, {0x06eau, 0x06edu}, {0x0898u, 0x089fu},
+        {0x08cau, 0x08e1u}, {0x08e3u, 0x0902u}, {0x093au, 0x093au},
+        {0x093cu, 0x093cu}, {0x0941u, 0x0948u}, {0x094du, 0x094du},
+        {0x0951u, 0x0957u}, {0x0962u, 0x0963u}, {0x0981u, 0x0981u},
+        {0x09bcu, 0x09bcu}, {0x09c1u, 0x09c4u}, {0x09cdu, 0x09cdu},
+        {0x09e2u, 0x09e3u}, {0x09feu, 0x09feu}, {0x1ab0u, 0x1affu},
+        {0x1dc0u, 0x1dffu}, {0x20d0u, 0x20f0u}, {0x2de0u, 0x2dffu},
+        {0xa66fu, 0xa672u},
+        {0xa674u, 0xa67du}, {0xa69eu, 0xa69fu}, {0xfb1eu, 0xfb1eu},
+        {0xfe20u, 0xfe2fu},
+    };
+    if (codepoint < 0x0300u || codepoint > 0xfe2fu) return false;
+    for (size_t at = 0; at < sizeof(ranges) / sizeof(ranges[0]); at++) {
+        if (codepoint <= ranges[at][1]) return codepoint >= ranges[at][0];
+    }
+    return false;
+}
+
+static bool optional_fallback_advance_fixed(const FontFace *face,
+                                            unsigned codepoint,
                                             int pixel_height_fixed,
                                             bool bold, int *advance)
 {
     unsigned width = 0, height = 0;
+    uint32_t key = 0;
+    TilefinchGlyphComponentKind kind = TILEFINCH_GLYPH_COMPONENT_MONO;
     if (advance == NULL
-        || !optional_fallback_metrics(codepoint, NULL, &width, &height)
-        || height == 0) return false;
-    int64_t scaled = (int64_t) pixel_height_fixed * width;
+        || !optional_fallback_metrics(codepoint, &key, &width, &height)
+        || height == 0
+        || !tilefinch_glyph_provider_metrics(
+            optional_glyph_provider, key, NULL, NULL, &kind)) return false;
+    /* A pack with column boxes stores a mark with its box ending at the pen, to
+       be drawn back over the letter before it. A pack without them draws a mark
+       as a glyph of its own, as it always has: its marks were fitted to the whole
+       cell and cannot sit on a letter. */
+    if (font_codepoint_combining_mark(codepoint)
+        && tilefinch_glyph_provider_key_is_metric(
+            optional_glyph_provider, key)) {
+        *advance = 0;
+        return true;
+    }
+    bool mono_bold = optional_mono_bold(face, bold, kind);
+    /* A proportional cell gains the stroke's column; a full-width cell already
+       has spare room around its centred ink. */
+    bool wider = mono_bold && width < height;
+    int64_t scaled = (int64_t) pixel_height_fixed * (width + (wider ? 1u : 0u));
     scaled = (scaled + (int64_t) height / 2) / height;
-    scaled += bold ? 22 : 0;
+    scaled += bold || mono_bold ? (wider ? 0 : 22) : 0;
     *advance = scaled > INT_MAX ? INT_MAX : (int) scaled;
     return true;
 }
 
 static bool optional_sequence_advance_fixed(
-    const char *text, size_t length, int pixel_height_fixed, bool bold,
-    size_t *used, int *advance)
+    const FontFace *face, const char *text, size_t length,
+    int pixel_height_fixed, bool bold, size_t *used, int *advance)
 {
     unsigned key = 0;
     return font_optional_glyph_match_sequence(
                text, length, used, &key)
         && optional_fallback_advance_fixed(
-               key, pixel_height_fixed, bold, advance);
+               face, key, pixel_height_fixed, bold, advance);
 }
 
 /*
@@ -1936,6 +2052,45 @@ static bool builtin_fallback_advance_fixed(unsigned codepoint,
     return true;
 }
 
+/* The exact share of one output pixel covered by a monochrome cell, computed
+   once at glyph creation. Between multiples of the cell, nearest sampling turns
+   a one-pixel stem into one or two pixels depending on where it falls, and
+   averaging every touched source pixel darkens small text, so the letters of a
+   word differ in weight either way. A one-pixel mark always keeps some ink.
+   Bold reads the cell with every stroke one column wider, so its weight stays
+   in proportion to the size instead of being one output pixel at any size;
+   the caller then passes a source one column wider than the stored glyph. */
+static unsigned char optional_mono_coverage(
+    const TilefinchGlyphSource *source, bool bold, unsigned width,
+    unsigned height, unsigned x, unsigned y)
+{
+    unsigned ink = 0;
+    for (unsigned sy = y * source->height / height;
+         sy * height < (y + 1u) * source->height; sy++) {
+        unsigned top = sy * height > y * source->height
+            ? sy * height : y * source->height;
+        unsigned bottom = (sy + 1u) * height < (y + 1u) * source->height
+            ? (sy + 1u) * height : (y + 1u) * source->height;
+        const uint8_t *row = source->pixels + sy * 2u;
+        for (unsigned sx = x * source->width / width;
+             sx * width < (x + 1u) * source->width; sx++) {
+            unsigned column = source->first_column + sx;
+            bool here = (!bold || sx + 1u < source->width)
+                && (row[column >> 3u] & (0x80u >> (column & 7u))) != 0;
+            bool before = bold && sx > 0
+                && (row[(column - 1u) >> 3u]
+                    & (0x80u >> ((column - 1u) & 7u))) != 0;
+            if (!here && !before) continue;
+            unsigned left = sx * width > x * source->width
+                ? sx * width : x * source->width;
+            unsigned right = (sx + 1u) * width < (x + 1u) * source->width
+                ? (sx + 1u) * width : (x + 1u) * source->width;
+            ink += (bottom - top) * (right - left);
+        }
+    }
+    return (unsigned char) (ink * 255u / (source->width * source->height));
+}
+
 static bool optional_fallback_glyph(
     const FontFace *face, unsigned codepoint, int pixel_height_fixed,
     bool bold, FontGlyph *glyph, bool *pending)
@@ -1956,6 +2111,11 @@ static bool optional_fallback_glyph(
     if (height < 1) height = 1;
     if (height > TILEFINCH_FONT_RASTER_PIXEL_LIMIT)
         height = TILEFINCH_FONT_RASTER_PIXEL_LIMIT;
+    bool mono_bold = optional_mono_bold(face, bold, source.kind);
+    if (mono_bold) {
+        source.width++;
+        source_width++;
+    }
     int width = (int) (((uint64_t) source_width * (unsigned) height
                         + source_height / 2u) / source_height);
     if (width < 1) width = 1;
@@ -1971,36 +2131,18 @@ static bool optional_fallback_glyph(
     }
     size_t source_pixels = (size_t) source.width * source.height;
     for (int y = 0; y < height; y++) {
-        unsigned source_y = (unsigned) y * source.height / (unsigned) height;
         for (int x = 0; x < width; x++) {
-            unsigned source_x = (unsigned) x * source.width / (unsigned) width;
-            size_t source_at = (size_t) source_y * source.width + source_x;
             size_t output_at = (size_t) y * (size_t) width + (size_t) x;
             if (source.kind == TILEFINCH_GLYPH_COMPONENT_MONO) {
-                if ((unsigned)width < source.width || (unsigned)height < source.height) {
-                    /* A nearest sample can delete an entire one-pixel mark
-                       when a 16px pack cell becomes 11px chrome. Average the
-                       bounded source footprint once at glyph creation. */
-                    unsigned end_x = ((unsigned)(x + 1) * source.width
-                                      + (unsigned)width - 1u) / (unsigned)width;
-                    unsigned end_y = ((unsigned)(y + 1) * source.height
-                                      + (unsigned)height - 1u) / (unsigned)height;
-                    unsigned ink = 0, samples = 0;
-                    for (unsigned sy = source_y; sy < end_y; sy++) {
-                        const uint8_t *row = source.pixels + sy * 2u;
-                        for (unsigned sx = source_x; sx < end_x; sx++) {
-                            ink += (row[sx >> 3u] >> (7u - (sx & 7u))) & 1u;
-                            samples++;
-                        }
-                    }
-                    coverage[output_at] = (unsigned char)(ink * 255u / samples);
-                } else {
-                    const uint8_t *row = source.pixels + source_y * 2u;
-                    if ((row[source_x >> 3u]
-                         & (uint8_t) (0x80u >> (source_x & 7u))) != 0)
-                        coverage[output_at] = 255u;
-                }
+                coverage[output_at] = optional_mono_coverage(
+                    &source, mono_bold, (unsigned) width, (unsigned) height,
+                    (unsigned) x, (unsigned) y);
             } else {
+                unsigned source_y =
+                    (unsigned) y * source.height / (unsigned) height;
+                unsigned source_x =
+                    (unsigned) x * source.width / (unsigned) width;
+                size_t source_at = (size_t) source_y * source.width + source_x;
                 const uint8_t *color = source.pixels + source_at * 2u;
                 colors[output_at] = (uint16_t) color[0] << 8 | color[1];
                 coverage[output_at] = source.pixels[source_pixels * 2u
@@ -2008,22 +2150,18 @@ static bool optional_fallback_glyph(
             }
         }
     }
-    if (bold && colors == NULL && width > 1) {
-        for (int y = 0; y < height; y++) {
-            unsigned char *row = coverage + (size_t) y * (size_t) width;
-            for (int x = width - 1; x > 0; x--)
-                if (row[x] == 0 && row[x - 1] != 0) row[x] = row[x - 1];
-        }
-    }
     glyph->pixels = coverage;
     glyph->colors = colors;
     glyph->budget = face->budget;
     glyph->width = width;
     glyph->height = height;
-    glyph->x_offset = 0;
-    glyph->y_offset = -(height * 7) / 8;
+    glyph->x_offset = source.baseline_rows != 0
+            && font_codepoint_combining_mark(codepoint) ? -width : 0;
+    glyph->y_offset = source.baseline_rows != 0
+        ? -(int) ((unsigned) height * source.baseline_rows / source.height)
+        : -(height * 7) / 8;
     if (!optional_fallback_advance_fixed(
-            codepoint, pixel_height_fixed, bold, &glyph->advance_fixed)) {
+            face, codepoint, pixel_height_fixed, bold, &glyph->advance_fixed)) {
         budget_free(face->budget, colors);
         budget_free(face->budget, coverage);
         memset(glyph, 0, sizeof(*glyph));
@@ -2253,7 +2391,7 @@ int font_text_width_at_size_fixed_mode(
             size_t sequence_used = 0;
             int sequence_advance = 0;
             if (optional_sequence_advance_fixed(
-                    text + at, length - at, pixel_height_fixed, bold,
+                    face, text + at, length - at, pixel_height_fixed, bold,
                     &sequence_used, &sequence_advance)) {
                 width += sequence_advance;
                 if (width > INT_MAX) return INT_MAX;
@@ -2273,7 +2411,7 @@ int font_text_width_at_size_fixed_mode(
             int fallback_advance = 0;
             if (glyph == 0
                 && (optional_fallback_advance_fixed(
-                        codepoint, pixel_height_fixed, bold,
+                        face, codepoint, pixel_height_fixed, bold,
                         &fallback_advance)
                     || builtin_fallback_advance_fixed(
                         codepoint, pixel_height_fixed, bold,
@@ -2328,7 +2466,7 @@ int font_text_width_at_size_fixed_mode(
         size_t sequence_used = 0;
         int sequence_advance = 0;
         if (optional_sequence_advance_fixed(
-                text + at, length - at, pixel_height_fixed, bold,
+                face, text + at, length - at, pixel_height_fixed, bold,
                 &sequence_used, &sequence_advance)) {
             if (!font_width_accumulate(
                     &numerator,
@@ -2351,7 +2489,7 @@ int font_text_width_at_size_fixed_mode(
            faces. Prefer the built-in glyph here: format-4 cmaps can alias
            supplementary code points into a bogus non-zero glyph index. */
         if (optional_fallback_advance_fixed(
-                codepoint, pixel_height_fixed, bold, &fallback_advance)
+                face, codepoint, pixel_height_fixed, bold, &fallback_advance)
             || builtin_fallback_advance_fixed(
                 codepoint, pixel_height_fixed, bold, &fallback_advance)) {
             if (!font_width_accumulate(
@@ -2594,7 +2732,7 @@ int font_text_width_for_family_at_size_fixed_mode(
         size_t sequence_used = 0;
         int sequence_advance = 0;
         if (optional_sequence_advance_fixed(
-                text + at, length - at, pixel_height_fixed,
+                face, text + at, length - at, pixel_height_fixed,
                 synthetic_bold, &sequence_used, &sequence_advance)) {
             if (!font_width_accumulate(
                     &numerator,
@@ -2616,6 +2754,24 @@ int font_text_width_for_family_at_size_fixed_mode(
         bool compatible = family_compatible_advance(
             metric_family, codepoint, pixel_height_fixed, metric_bold,
             &compatible_units);
+        /* Painting draws these from a pack or the built-in bitmaps, so they
+           must not be measured as this face's .notdef. */
+        int fallback_advance = 0;
+        if (!compatible
+            && (optional_fallback_advance_fixed(
+                    face, codepoint, pixel_height_fixed, synthetic_bold,
+                    &fallback_advance)
+                || builtin_fallback_advance_fixed(
+                    codepoint, pixel_height_fixed, synthetic_bold,
+                    &fallback_advance))) {
+            if (!font_width_accumulate(
+                    &numerator, (int64_t) fallback_advance * denominator)) {
+                return numerator < 0 ? INT_MIN : INT_MAX;
+            }
+            previous = 0;
+            at += used;
+            continue;
+        }
         int glyph = kerning || !compatible
             ? stbtt_FindGlyphIndex(info, (int) codepoint) : 0;
         if (kerning && previous != 0) {

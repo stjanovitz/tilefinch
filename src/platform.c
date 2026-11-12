@@ -76,10 +76,28 @@ bool tilefinch_platform_replace_file(const char *temporary, const char *path,
     if (temporary == NULL || path == NULL) return false;
     if (backup == NULL) {
         if (replace_rename(temporary, path) == 0) return true;
-        /* Remove the destination only for a temporary file that exists. */
+        /* FAT cannot rename over a file. Move the destination aside rather
+           than removing it, so a failed second rename can put it back; a
+           power cut in between leaves it as PATH.old beside TEMPORARY. */
         struct stat status;
-        return stat(temporary, &status) == 0 && remove(path) == 0
-            && replace_rename(temporary, path) == 0;
+        char aside[1280];
+        int written = snprintf(aside, sizeof(aside), "%s.old", path);
+        if (stat(temporary, &status) != 0 || stat(path, &status) != 0
+            || written <= 0 || (size_t) written >= sizeof(aside))
+            return false;
+        (void) remove(aside);
+        if (replace_rename(path, aside) != 0) return false;
+        bool refuse = false;
+#ifndef __PSP__
+        refuse = replace_fault(
+            &tilefinch_test_faults()->replace_file_fail_install);
+#endif
+        if (!refuse && replace_rename(temporary, path) == 0) {
+            (void) remove(aside);
+            return true;
+        }
+        (void) replace_rename(aside, path);
+        return false;
     }
     bool had_previous = replace_rename(path, backup) == 0;
     if (!had_previous) {
@@ -334,6 +352,15 @@ bool tilefinch_platform_cooperate_at(const char *phase,
     stall_window_started_us = tilefinch_platform_monotonic_time_us();
 #endif
     return result;
+}
+
+bool tilefinch_platform_page_dialog(const TilefinchPageDialogRequest *request,
+                                    TilefinchPageDialogResponse *response)
+{
+    if (request == NULL || response == NULL
+        || installed_services.page_dialog == NULL) return false;
+    return installed_services.page_dialog(installed_services.context,
+                                          request, response);
 }
 
 void tilefinch_platform_log_message(const char *message)

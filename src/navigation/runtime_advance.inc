@@ -581,7 +581,8 @@ consume_script_navigation:
     size_t heap_rejections_after = script_runtime_heap_rejections(
         session->page.runtime);
     bool relayout_requested =
-        script_runtime_consume_relayout(session->page.runtime);
+        !navigation_hold_image_changes(session, elapsed_ms)
+        && script_runtime_consume_relayout(session->page.runtime);
     /* A page task may catch an actual QuickJS allocation refusal, leaving the
        scheduler alive even though its last mutation hid the entire authored
        shell. Distinguish that allocator fact from an author merely throwing
@@ -594,9 +595,12 @@ consume_script_navigation:
         uint64_t relayout_started = navigation_now_us();
         ok = navigation_relayout(session);
         uint64_t relayout_finished = navigation_now_us();
-        if (relayout_finished > relayout_started)
+        if (relayout_finished > relayout_started) {
             session->performance.advance_relayout_us +=
                 relayout_finished - relayout_started;
+            session->image_hold_relayout_us =
+                relayout_finished - relayout_started;
+        }
     }
     /* Inspect the successfully settled layout, not the pre-mutation command
        count. Only a real allocator rejection plus blank paint/control output

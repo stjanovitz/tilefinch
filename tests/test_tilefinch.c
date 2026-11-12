@@ -1,8 +1,10 @@
 #include "tilefinch_test_common.h"
+#include "bootstrap_resident_probe.h"
 #include "../src/psp_network_policy.h"
 #include "../src/psp_navigation_watchdog.h"
 #include "../src/tilefinch_test_faults.h"
 #include "../src/style_cache_internal.h"
+#include "../src/style_internal.h"
 #include "tilefinch/work_vector.h"
 
 #include <stdarg.h>
@@ -88,6 +90,314 @@ static ScriptHeavyPolicy test_script_pressure_at_realm(void *opaque,
     seam->decisions_before =
         budget->pressure[BUDGET_PRESSURE_JAVASCRIPT].decisions;
     return seam->navigation->heavy_script_policy;
+}
+
+/* A page whose one large inline script is a bundled module registry of
+   `entries` small factories, followed by a small script and visible
+   text. */
+#define TEST_REGISTRY_LABEL \
+    "registry entry label text that a bundled module carries along with " \
+    "its code: a message, a class list, a route or a template fragment"
+
+/* How the registry reaches the page: inline, or the same text as an
+   external classic script, an external module script, or a script an
+   inline script inserts. The external forms come from the HTTP cache. */
+typedef enum {
+    TEST_REGISTRY_INLINE = 0,
+    TEST_REGISTRY_EXTERNAL,
+    TEST_REGISTRY_MODULE,
+    TEST_REGISTRY_DYNAMIC
+} TestRegistryForm;
+
+#define TEST_REGISTRY_URL "https://registry.test/registry.js"
+
+/* The registry script: "globalThis.registry={...};globalThis.registryRan=
+   true". */
+static char *test_function_registry_source(size_t entries, size_t *length)
+{
+    static const char head[] = "globalThis.registry={";
+    static const char tail[] = "};globalThis.registryRan=true";
+    size_t capacity = sizeof(head) + entries * 256u + sizeof(tail);
+    char *source = malloc(capacity);
+    if (source == NULL) return NULL;
+    size_t at = (size_t) snprintf(source, capacity, "%s", head);
+    for (size_t i = 0; i < entries; i++)
+        at += (size_t) snprintf(
+            source + at, capacity - at,
+            "%zu:function(e,t,n){var r=n(%zu),a='%s';"
+            "e.exports={id:%zu,label:a,size:r.length+a.length}},",
+            i, i / 2u, TEST_REGISTRY_LABEL, i);
+    at += (size_t) snprintf(source + at, capacity - at, "%s", tail);
+    *length = at;
+    return source;
+}
+
+static char *test_function_registry_page(size_t entries,
+                                         TestRegistryForm form,
+                                         size_t *length)
+{
+    static const char head[] =
+        "<!doctype html><body><p id=ready>READY</p>";
+    static const char tail[] =
+        "<script>globalThis.afterRan=true</script></body>";
+    static const char external[] =
+        "<script src='" TEST_REGISTRY_URL "'></script>";
+    static const char module[] =
+        "<script type=module src='" TEST_REGISTRY_URL "'></script>";
+    static const char dynamic[] =
+        "<script>var s=document.createElement('script');"
+        "s.src='" TEST_REGISTRY_URL "';document.head.appendChild(s)"
+        "</script>";
+    size_t source_length = 0;
+    char *source = form == TEST_REGISTRY_INLINE
+        ? test_function_registry_source(entries, &source_length) : NULL;
+    if (form == TEST_REGISTRY_INLINE && source == NULL) return NULL;
+    size_t capacity = sizeof(head) + sizeof(tail) + sizeof(dynamic)
+        + source_length + 32u;
+    char *html = malloc(capacity);
+    if (html == NULL) {
+        free(source);
+        return NULL;
+    }
+    size_t at = (size_t) snprintf(html, capacity, "%s", head);
+    if (form == TEST_REGISTRY_INLINE)
+        at += (size_t) snprintf(html + at, capacity - at,
+                                "<script id=registry>%s</script>", source);
+    else
+        at += (size_t) snprintf(
+            html + at, capacity - at, "%s",
+            form == TEST_REGISTRY_EXTERNAL ? external
+            : form == TEST_REGISTRY_MODULE ? module : dynamic);
+    at += (size_t) snprintf(html + at, capacity - at, "%s", tail);
+    free(source);
+    *length = at;
+    return html;
+}
+
+typedef struct {
+    bool committed;
+    bool registry_ran;
+    bool after_ran;
+    size_t attempted;
+    size_t loaded;
+    size_t failed;
+    size_t skipped_pressure;
+    size_t dynamic_failed;
+    size_t budget_failures;
+    size_t budget_peak;
+} TestRegistryOutcome;
+
+static bool test_cache_put_classic_script(
+    BrowserSession *session, const char *document_url, const char *script_url,
+    const unsigned char *source, size_t source_length);
+static bool test_cache_put_module(
+    BrowserSession *session, const char *url, const unsigned char *data,
+    size_t length, const char *initiator_origin);
+
+/* Commits the registry page in its own 32 MiB Budget (the realistic page
+   size) with all but `leave_free` of it held when the realm is created. */
+static bool test_commit_registry_page_as(size_t entries, size_t leave_free,
+                                         TestRegistryForm form,
+                                         TestRegistryOutcome *outcome)
+{
+    size_t length = 0;
+    char *html = test_function_registry_page(entries, form, &length);
+    if (html == NULL) return false;
+    size_t source_length = 0;
+    char *source = form == TEST_REGISTRY_INLINE ? NULL
+        : test_function_registry_source(entries, &source_length);
+    if (form != TEST_REGISTRY_INLINE && source == NULL) {
+        free(html);
+        return false;
+    }
+    static Budget budget;
+    static NavigationSession navigation;
+    static BrowserSession browser_session;
+    budget_init(&budget, 32u * MIB);
+    budget_install_lexbor(&budget);
+    BudgetReservation reservation = {0};
+    memset(outcome, 0, sizeof(*outcome));
+    bool session_ready = form == TEST_REGISTRY_INLINE
+        || browser_session_init(&browser_session, &budget, 4u * MIB);
+    bool ok = session_ready
+        && (form == TEST_REGISTRY_INLINE
+            || (form == TEST_REGISTRY_MODULE
+                ? test_cache_put_module(
+                      &browser_session, TEST_REGISTRY_URL,
+                      (const unsigned char *) source, source_length,
+                      "https://registry.test")
+                : test_cache_put_classic_script(
+                      &browser_session, "https://registry.test/",
+                      TEST_REGISTRY_URL, (const unsigned char *) source,
+                      source_length)))
+        && navigation_init(&navigation, &budget, 2);
+    free(source);
+    if (ok) {
+        if (form != TEST_REGISTRY_INLINE)
+            navigation_attach_browser_session(&navigation, &browser_session);
+        navigation_enable_scripts(&navigation, 5u * MIB, 4000);
+        navigation_enable_document_scripts(&navigation, 4, 8u * MIB,
+                                           4u * MIB, 4000);
+        TestScriptPressureSeam seam = {
+            .navigation = &navigation,
+            .reservation = &reservation,
+            .leave_free = leave_free
+        };
+        navigation.heavy_policy_resolver = test_script_pressure_at_realm;
+        navigation.heavy_policy_opaque = &seam;
+        uint64_t generation = navigation_begin(&navigation);
+        outcome->committed = navigation_commit_html(
+            &navigation, generation, "https://registry.test/", html, length,
+            480, NULL, NULL, true);
+        ScriptRuntime *runtime = navigation.page.runtime;
+        ScriptResult probe = {0};
+        for (unsigned tick = 0; outcome->committed && runtime != NULL
+             && form == TEST_REGISTRY_DYNAMIC && tick < 16u; tick++)
+            (void) navigation_advance_runtime(&navigation, 1, 8);
+        runtime = navigation.page.runtime;
+        outcome->registry_ran = outcome->committed && runtime != NULL
+            && script_runtime_evaluate_diagnostic(
+                runtime, "globalThis.pocSummary="
+                         "globalThis.registryRan?'ran':'missing'",
+                "https://registry.test/probe.js", &probe)
+            && strcmp(probe.summary, "ran") == 0;
+        outcome->after_ran = outcome->committed && runtime != NULL
+            && script_runtime_evaluate_diagnostic(
+                runtime, "globalThis.pocSummary="
+                         "globalThis.afterRan?'ran':'missing'",
+                "https://registry.test/probe.js", &probe)
+            && strcmp(probe.summary, "ran") == 0;
+        outcome->attempted = navigation.script_attempted;
+        outcome->loaded = navigation.script_loaded;
+        outcome->failed = navigation.script_failed;
+        outcome->skipped_pressure = navigation.script_skipped_pressure;
+        outcome->dynamic_failed =
+            navigation.page.script_result.dynamic_scripts_failed;
+        outcome->budget_failures =
+            budget.failure_count - seam.failures_before;
+        ok = seam.reserved;
+        budget_reservation_release(&reservation);
+        outcome->budget_peak = budget.peak;
+        navigation_destroy(&navigation);
+    }
+    if (session_ready && form != TEST_REGISTRY_INLINE)
+        browser_session_destroy(&browser_session);
+    free(html);
+    ok = ok && budget.current == 0;
+    return ok;
+}
+
+static bool test_commit_registry_page(size_t entries, size_t leave_free,
+                                      TestRegistryOutcome *outcome)
+{
+    return test_commit_registry_page_as(entries, leave_free,
+                                        TEST_REGISTRY_INLINE, outcome);
+}
+
+/* An inline script whose compile cannot fit the heap the realm can really
+   reach is refused before it compiles, as pressure (the census names it
+   script-memory-pressure): it neither runs nor fails, the Budget never
+   fails an allocation for it, and the page and its later scripts carry on.
+   Before, its admission counted heap the Budget could not back and the
+   compile ran out of memory after spending the time. The same script with
+   room to compile is admitted and runs. */
+static bool test_inline_script_refused_before_compile(Budget *main_budget)
+{
+    enum { REGISTRY_ENTRIES = 7000, SMALL_REGISTRY_ENTRIES = 1200 };
+    TestRegistryOutcome tight = {0}, roomy = {0}, small = {0};
+    bool ok = test_commit_registry_page(REGISTRY_ENTRIES, 6u * MIB, &tight)
+        && test_commit_registry_page(REGISTRY_ENTRIES, 20u * MIB, &roomy)
+        && test_commit_registry_page(SMALL_REGISTRY_ENTRIES, 6u * MIB,
+                                     &small);
+    budget_install_lexbor(main_budget);
+    bool refused = ok && tight.committed && !tight.registry_ran
+        && tight.after_ran && tight.skipped_pressure == 1u
+        && tight.failed == 0u && tight.budget_failures == 0u
+        && tight.budget_peak + 3u * MIB <= 32u * MIB;
+    bool admitted = ok && roomy.committed && roomy.registry_ran
+        && roomy.after_ran && roomy.skipped_pressure == 0u
+        && roomy.failed == 0u && small.committed && small.registry_ran
+        && small.after_ran && small.skipped_pressure == 0u
+        && small.failed == 0u;
+    if (!refused || !admitted) {
+        fprintf(stderr,
+                "registry refusal ok=%d tight: committed=%d ran=%d after=%d "
+                "attempted=%zu loaded=%zu failed=%zu pressure=%zu "
+                "budget-failures=%zu peak=%zu; roomy: committed=%d ran=%d "
+                "after=%d attempted=%zu loaded=%zu failed=%zu pressure=%zu; "
+                "small: ran=%d after=%d failed=%zu pressure=%zu\n",
+                ok, tight.committed, tight.registry_ran, tight.after_ran,
+                tight.attempted, tight.loaded, tight.failed,
+                tight.skipped_pressure, tight.budget_failures,
+                tight.budget_peak, roomy.committed, roomy.registry_ran,
+                roomy.after_ran, roomy.attempted, roomy.loaded, roomy.failed,
+                roomy.skipped_pressure, small.registry_ran, small.after_ran,
+                small.failed, small.skipped_pressure);
+    }
+    return refused && admitted;
+}
+
+/* The same refusal for the registry as an external classic script, an
+   external module script and a script an inline script inserts: each is
+   refused before it compiles when the compile cannot fit the heap the
+   realm can really reach, and the page carries on. Their admission asked
+   script_runtime_heap_available, which counts the heap left under the
+   realm's limit and the growth the free Budget could back as if they were
+   separate memory; at 6.75 MiB free each was admitted, compiled and failed
+   at the heap limit (a dynamic script with as little as 5 MiB free). The
+   same scripts with room, and a small one, still run. */
+static bool test_external_scripts_refused_before_compile(Budget *main_budget)
+{
+    enum { REGISTRY_ENTRIES = 7000, SMALL_REGISTRY_ENTRIES = 1200 };
+    static const char *const names[] = {"inline", "external", "module",
+                                        "dynamic"};
+    bool all = true;
+    for (int form = TEST_REGISTRY_EXTERNAL; form <= TEST_REGISTRY_DYNAMIC;
+         form++) {
+        TestRegistryOutcome tight = {0}, roomy = {0}, small = {0};
+        bool ok = test_commit_registry_page_as(
+                      REGISTRY_ENTRIES, 6912u * 1024u,
+                      (TestRegistryForm) form, &tight)
+            && test_commit_registry_page_as(
+                   REGISTRY_ENTRIES, 12u * MIB, (TestRegistryForm) form,
+                   &roomy)
+            && test_commit_registry_page_as(
+                   SMALL_REGISTRY_ENTRIES, 6912u * 1024u,
+                   (TestRegistryForm) form, &small);
+        /* A document script refused for memory is pressure; a dynamic one
+           fails its element (an error event). Either way nothing compiled:
+           the Budget never came near the heap limit's reserve. */
+        bool refused = ok && tight.committed && !tight.registry_ran
+            && tight.after_ran && tight.budget_failures == 0u
+            && tight.budget_peak + 3u * MIB <= 32u * MIB
+            && (form == TEST_REGISTRY_DYNAMIC
+                ? tight.dynamic_failed == 1u && tight.failed == 0u
+                : tight.skipped_pressure == 1u && tight.failed == 0u);
+        bool admitted = ok && roomy.committed && roomy.registry_ran
+            && roomy.after_ran && roomy.skipped_pressure == 0u
+            && roomy.failed == 0u && roomy.dynamic_failed == 0u
+            && small.committed && small.registry_ran && small.after_ran
+            && small.skipped_pressure == 0u && small.failed == 0u
+            && small.dynamic_failed == 0u;
+        if (!refused || !admitted) {
+            fprintf(stderr,
+                    "%s registry refusal ok=%d tight: ran=%d after=%d "
+                    "failed=%zu pressure=%zu dynamic-failed=%zu "
+                    "budget-failures=%zu peak=%zu; roomy: ran=%d failed=%zu "
+                    "pressure=%zu dynamic-failed=%zu; small: ran=%d "
+                    "failed=%zu pressure=%zu dynamic-failed=%zu\n",
+                    names[form], ok, tight.registry_ran, tight.after_ran,
+                    tight.failed, tight.skipped_pressure,
+                    tight.dynamic_failed, tight.budget_failures,
+                    tight.budget_peak, roomy.registry_ran, roomy.failed,
+                    roomy.skipped_pressure, roomy.dynamic_failed,
+                    small.registry_ran, small.failed, small.skipped_pressure,
+                    small.dynamic_failed);
+        }
+        all = all && refused && admitted;
+    }
+    budget_install_lexbor(main_budget);
+    return all;
 }
 
 static bool test_cache_put_classic_script(
@@ -789,6 +1099,133 @@ static bool test_parser_releases_large_token_storage(Budget *budget)
     return ok;
 }
 
+/* The streaming admission check sees an executable inline script's text as
+   it arrives. Once it refuses, the script is truncated like one over the
+   inline-script limit: its text is dropped while it streams (the token
+   buffer never holds more than about one window past the refusal), it is
+   not asked again, and its one collection is offered once. Scripts it
+   admits keep their text, and JSON-LD data is never asked. */
+typedef struct {
+    size_t limit;
+    size_t calls;
+    size_t largest;
+    size_t collect_offers;
+    size_t refusals;
+    bool asked_typed;
+    lxb_dom_node_t *refused;
+} TestInlineAdmitProbe;
+
+static bool test_inline_admit_probe(void *opaque, lxb_dom_node_t *script,
+                                    size_t bytes, bool *may_collect)
+{
+    TestInlineAdmitProbe *probe = opaque;
+    probe->calls++;
+    if (bytes > probe->largest) probe->largest = bytes;
+    size_t type_length = 0;
+    if (document_attribute(script, "type", &type_length) != NULL)
+        probe->asked_typed = true;
+    if (bytes <= probe->limit) return true;
+    if (*may_collect) {
+        probe->collect_offers++;
+        *may_collect = false;
+    }
+    probe->refusals++;
+    probe->refused = script;
+    return false;
+}
+
+static bool test_parser_streaming_inline_admission(Budget *budget)
+{
+    static const char head[] =
+        "<!doctype html><body><script id=small>var y = 2;</script>"
+        "<script id=bundle>";
+    static const char line[] = "var x = 1;\n";
+    static const char tail[] =
+        "</script><script id=data type='application/ld+json'>{\"a\":1}"
+        "</script><script id=later>var z = 3;</script>"
+        "<p id=after>after</p></body>";
+    size_t lines = (sizeof(line) - 1u) * PARSER_STORAGE_SCRIPT_LINES;
+    size_t length = sizeof(head) - 1u + lines + sizeof(tail) - 1u;
+    char *html = malloc(length);
+    if (html == NULL) return false;
+    char *at = html;
+    memcpy(at, head, sizeof(head) - 1u);
+    at += sizeof(head) - 1u;
+    for (size_t i = 0; i < PARSER_STORAGE_SCRIPT_LINES; i++) {
+        memcpy(at, line, sizeof(line) - 1u);
+        at += sizeof(line) - 1u;
+    }
+    memcpy(at, tail, sizeof(tail) - 1u);
+
+    TestInlineAdmitProbe probe = {.limit = 128u * 1024u};
+    DocumentParser parser = {0};
+    PocDocument document = {0};
+    /* The fixed limit is far above the script, so only the check drops it. */
+    bool ok = document_parser_begin(&parser, budget)
+        && document_parser_set_scripting(&parser, true)
+        && document_parser_set_inert_script_policy(
+               &parser, false, 256u * 1024u, 4u * 1024u * 1024u);
+    document_parser_set_inline_script_admit_callback(
+        &parser, test_inline_admit_probe, &probe);
+    size_t fed = 0, largest_capacity = 0;
+    while (ok && fed < length) {
+        size_t chunk = length - fed < PARSER_STORAGE_FEED
+            ? length - fed : PARSER_STORAGE_FEED;
+        ok = document_parser_feed(&parser, html + fed, chunk);
+        fed += chunk;
+        size_t capacity = test_tokenizer_capacity(&parser);
+        if (capacity > largest_capacity) largest_capacity = capacity;
+    }
+    lxb_dom_node_t *root = ok
+        ? lxb_dom_interface_node(parser.document.html) : NULL;
+    lxb_dom_node_t *bundle = root == NULL ? NULL : find_id(root, "bundle");
+    lxb_dom_node_t *small = root == NULL ? NULL : find_id(root, "small");
+    bool truncated = bundle != NULL
+        && document_parser_script_was_truncated(&parser, bundle);
+    bool small_kept = small != NULL
+        && !document_parser_script_was_truncated(&parser, small);
+    ok = ok && document_parser_finish(&parser, &document);
+    root = ok ? lxb_dom_interface_node(document.html) : NULL;
+    bundle = root == NULL ? NULL : find_id(root, "bundle");
+    small = root == NULL ? NULL : find_id(root, "small");
+    lxb_dom_node_t *later = root == NULL ? NULL : find_id(root, "later");
+    lxb_dom_node_t *data = root == NULL ? NULL : find_id(root, "data");
+    size_t bundle_length = SIZE_MAX, small_length = 0, later_length = 0;
+    size_t data_length = 0;
+    if (bundle != NULL) {
+        bundle_length = bundle->first_child == NULL ? 0u : SIZE_MAX;
+        if (bundle->first_child != NULL)
+            (void) document_text_data(bundle->first_child, &bundle_length);
+    }
+    if (small != NULL && small->first_child != NULL)
+        (void) document_text_data(small->first_child, &small_length);
+    if (later != NULL && later->first_child != NULL)
+        (void) document_text_data(later->first_child, &later_length);
+    if (data != NULL && data->first_child != NULL)
+        (void) document_text_data(data->first_child, &data_length);
+    ok = ok && truncated && small_kept && bundle_length == 0u
+        && small_length == 10u && later_length == 10u && data_length == 7u
+        && probe.refusals == 1u && probe.refused != NULL
+        && probe.collect_offers == 1u && !probe.asked_typed
+        && probe.largest <= probe.limit + 2u * PARSER_STORAGE_FEED
+        && largest_capacity <= probe.limit + 3u * PARSER_STORAGE_FEED
+        && find_id(root, "after") != NULL;
+    if (!ok) {
+        fprintf(stderr,
+                "streaming admission truncated=%d small=%d bundle=%zu "
+                "small=%zu later=%zu data=%zu refusals=%zu collect=%zu "
+                "typed=%d largest=%zu capacity=%zu calls=%zu\n",
+                truncated, small_kept, bundle_length, small_length,
+                later_length, data_length, probe.refusals,
+                probe.collect_offers, probe.asked_typed, probe.largest,
+                largest_capacity, probe.calls);
+    }
+    document_parser_abort(&parser);
+    document_destroy(&document);
+    free(html);
+    return ok;
+}
+
 static bool test_visible_text_glyph_script_hints(Budget *budget)
 {
     static const char html[] =
@@ -819,6 +1256,29 @@ static bool test_visible_text_glyph_script_hints(Budget *budget)
     for (size_t row = 0; row < sizeof(kana) / sizeof(kana[0]); row++) {
         ok = ok && document_parse(&document, budget, kana[row], strlen(kana[row]), 7u)
             && document.glyph_script_mask == DOCUMENT_GLYPH_SCRIPT_JAPANESE;
+        document_destroy(&document);
+    }
+
+    /* U+0301 asks for the pack of the letter it sits on, and for nothing when
+       it sits on nothing. */
+    static const struct {
+        const char *html;
+        uint16_t mask;
+    } marks[] = {
+        {"<p>Мо\xcc\x81сква и Ки\xcc\x81ев</p>", DOCUMENT_GLYPH_SCRIPT_CYRILLIC},
+        {"<p>cafe\xcc\x81</p>", DOCUMENT_GLYPH_SCRIPT_LATIN_EXTENDED},
+        {"<p>Ж\xcc\x81 e\xcc\x81</p>",
+         DOCUMENT_GLYPH_SCRIPT_CYRILLIC | DOCUMENT_GLYPH_SCRIPT_LATIN_EXTENDED},
+        {"<p>1\xcc\x81 \xcc\x81</p>", 0}
+    };
+    for (size_t row = 0; row < sizeof(marks) / sizeof(marks[0]); row++) {
+        ok = ok && document_parse(&document, budget, marks[row].html,
+                                  strlen(marks[row].html), 7u)
+            && document.glyph_script_mask == marks[row].mask
+            && document_text_glyph_scripts(
+                   marks[row].html, strlen(marks[row].html)) == marks[row].mask;
+        if (!ok) fprintf(stderr, "mark row %zu mask=%04x\n", row,
+                         document.glyph_script_mask);
         document_destroy(&document);
     }
 
@@ -907,7 +1367,7 @@ static bool test_parser_inner_html_mutation(void *opaque,
         || memcmp(name, "script", 6) != 0) return true;
     lxb_html_parser_t *parser = document->html->dom_document.parser;
     probe->runtime = script_runtime_create(
-        document, probe->budget, 2 * MIB, 1000,
+        document, probe->budget, 2 * MIB + 64 * 1024, 1000,
         "https://parser-inner-html.test/", &probe->result);
     probe->mutated = probe->runtime != NULL
         && script_runtime_evaluate_diagnostic(
@@ -1053,7 +1513,7 @@ static bool test_reentrant_incumbent_owner_isolation(Budget *budget)
                         sizeof(incumbent_html) - 1, 32)) return false;
     TestReentrantParserMutation probe = {.incumbent = &incumbent};
     probe.runtime = script_runtime_create(
-        &incumbent, budget, 2 * MIB, 1000,
+        &incumbent, budget, 2 * MIB + 64 * 1024, 1000,
         "https://incumbent.test/", &probe.result);
     DocumentParser parser;
     bool began = document_parser_begin(&parser, budget);
@@ -1707,6 +2167,94 @@ static bool test_streaming_navigation_lifecycle(Budget *budget)
     if (browser_ready) browser_session_destroy(&browser);
     fetch_trace_end();
     return ok;
+}
+
+/* A parser-blocking script changes an input only the stylesheet loader
+   reads, after a checkpoint compiled the sheet: it disables a <link>, or
+   switches the root's theme selection (the inert data-color-theme registry
+   picks which of the theme hrefs applies). The later script and the
+   committed page must see the sheet the changed document compiles to. */
+static bool streaming_loader_input_change_rebuilds(
+    Budget *budget, const char *url, const char *expected_summary,
+    const char *expected_final)
+{
+    char error[256] = {0};
+    if (!fetch_trace_replay_begin(
+            TILEFINCH_TEST_SOURCE_DIR
+                "/fixtures/http-stream-stylesheet-loader-inputs",
+            error, sizeof(error))) return false;
+    static const unsigned char grid[] = "#probe{display:grid}";
+    static const unsigned char flex[] = "#probe{display:flex}";
+    NavigationSession navigation;
+    BrowserSession browser;
+    bool browser_ready = browser_session_init(&browser, budget, 64 * 1024)
+        && test_cache_put_stylesheet(
+            &browser, "https://loader-inputs.test/grid.css", grid,
+            sizeof(grid) - 1, NULL)
+        && test_cache_put_stylesheet(
+            &browser, "https://loader-inputs.test/flex.css", flex,
+            sizeof(flex) - 1, NULL);
+    bool initialized = browser_ready
+        && navigation_init(&navigation, budget, 2);
+    if (initialized) {
+        navigation_attach_browser_session(&navigation, &browser);
+        navigation_enable_scripts(
+            &navigation, 2u * MIB + 192u * 1024u, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 8, 32u * 1024u, 16u * 1024u, 1000);
+        navigation_enable_external_resources(
+            &navigation, 2, 32 * 1024, 16 * 1024,
+            2, 32 * 1024, 16 * 1024, 64 * 1024, 1000);
+    }
+    uint64_t generation = initialized ? navigation_begin(&navigation) : 0;
+    bool loaded = initialized && navigation_load_url(
+        &navigation, generation, url, 4096, 1000, 480, NULL, NULL, true);
+    ScriptResult probe = {0};
+    bool probed = loaded && navigation.page.loaded
+        && script_runtime_evaluate_diagnostic(
+            navigation.page.runtime,
+            "globalThis.pocSummary=getComputedStyle("
+            "document.getElementById('probe')).display",
+            "<loader-input-probe>", &probe);
+    bool ok = probed
+        && strcmp(navigation.page.script_result.summary,
+                  expected_summary) == 0
+        && strcmp(probe.summary, expected_final) == 0;
+    if (!ok) {
+        fprintf(stderr,
+                "loader input change %s: loaded=%d page=%d summary=%s "
+                "(want %s) final=%s (want %s) builds=%zu reuses=%zu "
+                "adoptions=%zu final-reuses=%zu error=%s\n",
+                url, loaded ? 1 : 0,
+                initialized && navigation.page.loaded ? 1 : 0,
+                initialized ? navigation.page.script_result.summary : "",
+                expected_summary, probe.summary, expected_final,
+                initialized
+                    ? navigation.performance.blocking_stylesheet_builds : 0,
+                initialized
+                    ? navigation.performance.blocking_stylesheet_reuses : 0,
+                initialized
+                    ? navigation.performance.blocking_stylesheet_adoptions
+                    : 0,
+                initialized
+                    ? navigation.performance.blocking_stylesheet_final_reuses
+                    : 0,
+                initialized ? navigation.last_error : error);
+    }
+    if (initialized) navigation_destroy(&navigation);
+    if (browser_ready) browser_session_destroy(&browser);
+    fetch_trace_end();
+    return ok;
+}
+
+static bool test_streaming_loader_input_changes_rebuild(Budget *budget)
+{
+    bool disabled = streaming_loader_input_change_rebuilds(
+        budget, "https://loader-inputs.test/disabled", "grid/block",
+        "block");
+    bool theme = streaming_loader_input_change_rebuilds(
+        budget, "https://loader-inputs.test/theme", "grid/flex", "flex");
+    return disabled && theme;
 }
 
 static bool test_streaming_stylesheet_checkpoint_reuse(Budget *budget)
@@ -4216,6 +4764,149 @@ static bool test_inline_svg_symbol_use_resource(Budget *budget)
     return ok && budget->current == 0;
 }
 
+static bool inline_svg_resource_is(const ImageResources *images,
+                                   lxb_dom_node_t *node, uint8_t red,
+                                   uint8_t green, uint8_t blue)
+{
+    const ImageResource *resource = images_find_node(images, node);
+    if (resource == NULL || !image_resource_available(resource)
+        || resource->width != 16 || resource->height != 16) return false;
+    static const size_t samples[] = {0, 5, 120, 255};
+    for (size_t i = 0; i < sizeof(samples) / sizeof(samples[0]); i++) {
+        const uint8_t *pixel = resource->pixels + samples[i] * 4u;
+        if (abs(pixel[0] - red) > 3 || abs(pixel[1] - green) > 3
+            || abs(pixel[2] - blue) > 3 || pixel[3] < 240) return false;
+    }
+    return true;
+}
+
+/* RS-09 and RS-11: a <use> resolves its id once per inline <svg>, by
+   Lexbor's id pointer, preferring the svg's own elements; validation and
+   expansion follow the same target, and a target holding its own <use>
+   is refused instead of copied into itself round after round. */
+static bool test_inline_svg_use_ids_resolve_once(Budget *budget)
+{
+    enum { FILLER = 2000, ICONS = 6 };
+    static const char icon[] =
+        "<svg class=icon width=16 height=16 viewBox='0 0 16 16'>"
+        "<use href='#bar'/><use href='#bar' x=4 /><use href='#bar' x=8 />"
+        "<use href='#bar' x=12 /></svg>";
+    static const char tail[] =
+        "<div id=mark></div>"
+        "<svg id=local-icon width=16 height=16 viewBox='0 0 16 16'>"
+        "<symbol id=mark><rect width=16 height=16 fill='#c02040'/></symbol>"
+        "<use href='#mark'/></svg>"
+        "<svg style='display:none'><symbol id=bar>"
+        "<rect width=4 height=16 fill='#20c040'/></symbol></svg></body>";
+    size_t capacity = 128 + FILLER * 8 + ICONS * sizeof(icon) + sizeof(tail);
+    char *html = budget_malloc(budget, capacity);
+    if (html == NULL) return false;
+    size_t length = (size_t) snprintf(
+        html, capacity, "<!doctype html><style>body{margin:0}</style><body>");
+    for (size_t i = 0; i < FILLER; i++) {
+        memcpy(html + length, "<p>x</p>", 8);
+        length += 8;
+    }
+    for (size_t i = 0; i < ICONS; i++) {
+        memcpy(html + length, icon, sizeof(icon) - 1);
+        length += sizeof(icon) - 1;
+    }
+    memcpy(html + length, tail, sizeof(tail));
+    length += sizeof(tail) - 1;
+    PocDocument document = {0};
+    Stylesheet stylesheet = {0};
+    ImageResources images = {0};
+    bool ok = document_parse(&document, budget, html, length, 17)
+        && stylesheet_build(&stylesheet, budget, &document, 480)
+        && images_load_external(
+            &document, &stylesheet, &images, budget,
+            "https://inline-svg-ids.test/", "https://inline-svg-ids.test/",
+            NULL, 16, 64 * 1024, 32 * 1024, 256 * 1024, 1000, NULL, NULL);
+    budget_free(budget, html);
+    lxb_dom_node_t *root = ok ? lxb_dom_interface_node(document.html) : NULL;
+    size_t document_nodes = 0;
+    for (lxb_dom_node_t *node = root; node != NULL;) {
+        document_nodes++;
+        if (node->first_child != NULL) {
+            node = node->first_child;
+            continue;
+        }
+        while (node != root && node->next == NULL) node = node->parent;
+        node = node == root ? NULL : node->next;
+    }
+    size_t icons = 0;
+    for (lxb_dom_node_t *node = ok ? document_body_node(&document)->first_child
+                                   : NULL;
+         node != NULL; node = node->next) {
+        if (node->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
+        size_t class_length = 0;
+        const char *klass = document_attribute(node, "class", &class_length);
+        if (klass == NULL || class_length != 4) continue;
+        ok = ok && inline_svg_resource_is(&images, node, 0x20, 0xc0, 0x40);
+        icons++;
+    }
+    lxb_dom_node_t *local = ok ? find_id(root, "local-icon") : NULL;
+    bool local_drawn = ok
+        && inline_svg_resource_is(&images, local, 0xc0, 0x20, 0x40);
+    size_t visits = images.stats.inline_svg_id_visits;
+    if (!local_drawn || visits > ICONS * document_nodes + 64) {
+        fprintf(stderr, "inline svg ids: %zu visits for %d icons over %zu "
+                "nodes, local reference %s\n", visits, ICONS, document_nodes,
+                local_drawn ? "drawn" : "refused");
+    }
+    ok = ok && icons == ICONS && local_drawn && visits >= ICONS
+        && visits <= ICONS * document_nodes + 64;
+    images_destroy(&images);
+    stylesheet_destroy(&stylesheet);
+    document_destroy(&document);
+    if (!ok || budget->current != 0) return false;
+
+    /* The validated decoy is empty; the drawn #a holds a <use href=#a>. */
+    static const char feeding[] =
+        "<!doctype html><body><svg width=0 height=0><symbol id=a></symbol>"
+        "</svg><svg id=feed width=16 height=16 viewBox='0 0 16 16'><g id=a>"
+        "<use href='#a'/><path d='M0 0h8v8z'/></g>"
+        "<use href='#a'/><use href='#a'/><use href='#a'/><use href='#a'/>"
+        "<use href='#a'/><use href='#a'/><use href='#a'/><use href='#a'/>"
+        "<use href='#a'/><use href='#a'/><use href='#a'/><use href='#a'/>"
+        "<use href='#a'/><use href='#a'/><use href='#a'/><use href='#a'/>"
+        "<use href='#a'/><use href='#a'/><use href='#a'/><use href='#a'/>"
+        "<use href='#a'/><use href='#a'/><use href='#a'/><use href='#a'/>"
+        "<use href='#a'/><use href='#a'/><use href='#a'/><use href='#a'/>"
+        "<use href='#a'/><use href='#a'/></svg></body>";
+    Budget local_budget;
+    budget_init(&local_budget, 8 * MIB);
+    budget_install_lexbor(&local_budget);
+    PocDocument feed_document = {0};
+    Stylesheet feed_sheet = {0};
+    ImageResources feed_images = {0};
+    bool parsed = document_parse(&feed_document, &local_budget, feeding,
+                                 sizeof(feeding) - 1, 17)
+        && stylesheet_build(&feed_sheet, &local_budget, &feed_document, 480);
+    size_t failures = local_budget.failure_count;
+    bool loaded = parsed && images_load_external(
+        &feed_document, &feed_sheet, &feed_images, &local_budget,
+        "https://inline-svg-feed.test/", "https://inline-svg-feed.test/",
+        NULL, 8, 64 * 1024, 32 * 1024, 128 * 1024, 1000, NULL, NULL);
+    lxb_dom_node_t *feed = parsed
+        ? find_id(lxb_dom_interface_node(feed_document.html), "feed") : NULL;
+    bool refused = loaded && feed != NULL
+        && images_find_node(&feed_images, feed) == NULL
+        && feed_images.stats.unsupported >= 1
+        && local_budget.failure_count == failures;
+    if (!refused) {
+        fprintf(stderr, "self-feeding use: loaded=%d unsupported=%zu "
+                "budget failures %zu -> %zu, peak %zu\n", loaded,
+                feed_images.stats.unsupported, failures,
+                local_budget.failure_count, local_budget.peak);
+    }
+    images_destroy(&feed_images);
+    stylesheet_destroy(&feed_sheet);
+    document_destroy(&feed_document);
+    budget_install_lexbor(budget);
+    return parsed && refused && local_budget.current == 0;
+}
+
 static bool test_compact_adopted_sheet_indices(Budget *budget)
 {
     const char *html = "<!doctype html><style id=a></style>"
@@ -4245,8 +4936,9 @@ static bool test_compact_adopted_sheet_indices(Budget *budget)
     (void) document_adoptions_discard_subtree(&document, b, NULL, 0);
     ok = ok && document_adoption_list_at(&document, 0, &adopter, copied,
         &count, &active) && count == 1 && copied[0] == c;
-    /* Exercise every list/index growth and its rollback, including byte
-       index 255. A refused grow must not publish a partial adoption. */
+    /* Exercise every list/index growth and its rollback, including index
+       255 and past it. A refused grow must not publish a partial
+       adoption. */
     for (size_t i = 1; ok && i < DOCUMENT_ADOPTION_ROOT_LIMIT; i++) {
         lxb_dom_element_t *element = lxb_dom_document_create_element(
             &document.html->dom_document, (const lxb_char_t *) "div", 3, NULL);
@@ -5945,9 +6637,11 @@ static bool test_constructed_sheet_shared_by_roots(Budget *budget)
 static bool test_constructed_sheet_full_root_table(Budget *budget)
 {
     size_t baseline = budget->current;
-    /* The bridge admits one shared shadow root per 128 KiB of page limit. */
+    /* The bridge admits one shared shadow root per 80 KiB of page limit
+       (DOM_BRIDGE_SHARED_SHADOW_ROOT_BUDGET_BYTES). */
     size_t limit = budget->limit;
-    if (budget->limit < 32u * MIB) budget->limit = 32u * MIB;
+    size_t admitting = (size_t) DOCUMENT_ADOPTION_ROOT_LIMIT * 80u * 1024u;
+    if (budget->limit < admitting) budget->limit = admitting;
     static NavigationSession navigation;
     bool ok = constructed_sheet_open(&navigation, budget,
         "<span class=part>LIGHTPART</span><span class=doc>DOCTEXT</span>");
@@ -5988,6 +6682,167 @@ static bool test_constructed_sheet_full_root_table(Budget *budget)
     }
     constructed_sheet_close(&navigation);
     budget->limit = limit;
+    return ok && budget->current == baseline;
+}
+
+typedef struct {
+    const char *text;
+    uint32_t color;
+} ShadowCascadeExpectation;
+
+static bool shadow_cascade_colors(const LayoutDocument *layout,
+                                  const ShadowCascadeExpectation *expected,
+                                  size_t count)
+{
+    bool ok = true;
+    for (size_t i = 0; i < count; i++) {
+        uint32_t color = late_init_text_color(layout, expected[i].text);
+        if (color == expected[i].color) continue;
+        fprintf(stderr, "shadow cascade %s: color %06x, want %06x\n",
+                expected[i].text, (unsigned) color,
+                (unsigned) expected[i].color);
+        ok = false;
+    }
+    return ok;
+}
+
+/* Which rule wins must not depend on how many others match. Past 128 matches
+   the cascade takes its bounded fallback, which has to keep encapsulation
+   context ahead of specificity just as the small path does. */
+static bool test_shadow_cascade_dense_matches(Budget *budget)
+{
+    size_t baseline = budget->current;
+    static NavigationSession navigation;
+    bool ok = constructed_sheet_open(&navigation, budget,
+        "<style>x-outer{color:#0000ff}#strong{color:#0000ff!important}"
+        "x-slots p{color:#0000ff}p#light-imp{color:#0000ff!important}"
+        ".e{color:#ff0000}.e{color:#00ff00}</style>");
+    ok = ok && constructed_sheet_step(&navigation,
+        "(()=>{const rep=(n,f)=>{let s='';for(let i=0;i<n;i++)s+=f(i);return s};"
+        "const hosts=(n,m)=>rep(n,i=>`:host{margin-left:${i}px${m}}`);"
+        "const slots=(n,m)=>rep(n,i=>`::slotted(p){margin-left:${i}px${m}}`);"
+        "const root=(tag,css,inner,id)=>{const h=document.createElement(tag);"
+        "if(id)h.id=id;"
+        "document.body.appendChild(h);h.attachShadow({mode:'open'}).innerHTML="
+        "'<style>'+css+'</style>'+inner};"
+        "const light=(id,css,text)=>{const h=document.createElement('x-slots');"
+        "const p=document.createElement('p');if(id)p.id=id;p.textContent=text;"
+        "h.appendChild(p);document.body.appendChild(h);"
+        "h.attachShadow({mode:'open'}).innerHTML="
+        "'<style>'+css+'</style><slot></slot>'};"
+        "const red=':host{color:#ff0000}',strong=':host{color:#ff0000!important}',"
+        "slotted='::slotted(p){color:#ff0000}',"
+        "slottedStrong='::slotted(p){color:#ff0000!important}';"
+        "root('x-outer',red,'<span>NORMAL1</span>');"
+        "root('x-outer',hosts(126,'')+red,'<span>NORMAL127</span>');"
+        "root('x-outer',hosts(130,'')+red,'<span>NORMAL131</span>');"
+        "root('x-outer',red+hosts(130,''),'<span>EARLY131</span>');"
+        "const dense=hosts(130,'!important');"
+        "root('x-host',strong,'<span>IMP1</span>','strong');"
+        "root('x-host',dense+strong,'<span>IMP131</span>','strong');"
+        "root('x-host',strong+dense,'<span>IMPEARLY131</span>','strong');"
+        "light(null,slotted,'SLOT1');"
+        "light(null,slots(135,'')+slotted,'SLOT136');"
+        "light('light-imp',slottedStrong,'SLOTIMP1');"
+        "light('light-imp',slots(135,'!important')+slottedStrong,'SLOTIMP136');"
+        "root('x-host',rep(135,i=>`.d{margin-left:${i}px}`)"
+        "+'#i{color:#00ff00}.d{color:#ff0000}',"
+        "'<span id=i class=d>INNER136</span>');"
+        "const sheet=document.createElement('style');"
+        "sheet.textContent=rep(135,i=>`.dz{margin-left:${i}px}`);"
+        "document.head.appendChild(sheet);"
+        "const d=document.createElement('p');d.className='dz e';"
+        "d.textContent='DOC136';document.body.appendChild(d);"
+        "globalThis.pocSummary='DENSE-READY'})()", "DENSE-READY");
+    static const ShadowCascadeExpectation expected[] = {
+        {"NORMAL1", 0x0000ff}, {"NORMAL127", 0x0000ff},
+        {"NORMAL131", 0x0000ff}, {"EARLY131", 0x0000ff},
+        {"IMP1", 0xff0000}, {"IMP131", 0xff0000}, {"IMPEARLY131", 0xff0000},
+        {"SLOT1", 0x0000ff}, {"SLOT136", 0x0000ff},
+        {"SLOTIMP1", 0xff0000}, {"SLOTIMP136", 0xff0000},
+        {"INNER136", 0x00ff00}, {"DOC136", 0x00ff00}
+    };
+    ok = ok && shadow_cascade_colors(&navigation.page.layout, expected,
+        sizeof(expected) / sizeof(expected[0]));
+    constructed_sheet_close(&navigation);
+    return ok && budget->current == baseline;
+}
+
+/* For important declarations the inner context wins, and context comes before
+   element-attached styles, so an element's own :host or its parent's
+   ::slotted() beats its inline !important. A rule of the element's own tree
+   does not: there element-attached styles decide. */
+static bool test_shadow_cascade_inline_important(Budget *budget)
+{
+    size_t baseline = budget->current;
+    static NavigationSession navigation;
+    bool ok = constructed_sheet_open(&navigation, budget,
+        "<style>x-doc{color:#00ff00!important}p.outer{color:#00ff00!important}"
+        ".zz{margin-left:1px!important}</style>");
+    ok = ok && constructed_sheet_step(&navigation,
+        "(()=>{const rep=(n,f)=>{let s='';for(let i=0;i<n;i++)s+=f(i);return s};"
+        "const blue='color:#0000ff',strong=blue+'!important';"
+        "const root=(tag,css,inner,style)=>{const h=document.createElement(tag);"
+        "if(style)h.setAttribute('style',style);document.body.appendChild(h);"
+        "h.attachShadow({mode:'open'}).innerHTML='<style>'+css+'</style>'+inner;"
+        "return h};"
+        "const light=(css,text,style,cls)=>{const h=document.createElement('x-host');"
+        "const p=document.createElement('p');p.textContent=text;"
+        "p.setAttribute('style',style);if(cls)p.className=cls;h.appendChild(p);"
+        "document.body.appendChild(h);h.attachShadow({mode:'open'}).innerHTML="
+        "'<style>'+css+'</style><slot></slot>'};"
+        "const host=':host{color:#ff0000}',hostStrong=':host{color:#ff0000!important}',"
+        "slotted='::slotted(p){color:#ff0000}',"
+        "slottedStrong='::slotted(p){color:#ff0000!important}',"
+        "inner='.q{color:#ff0000!important}';"
+        "root('x-host',hostStrong,'<span>HOST-STRONG</span>',strong);"
+        "root('x-host',host,'<span>HOST-NORMAL</span>',strong);"
+        "root('x-host',hostStrong,'<span>HOST-OVER-NORMAL</span>',blue);"
+        "root('x-host',host,'<span>BOTH-NORMAL</span>',blue);"
+        "root('x-doc','','<span>DOC-RULE</span>',strong);"
+        "root('x-doc',hostStrong,'<span>DOC-HOST</span>',strong);"
+        "root('x-host',inner,'<span class=q style=\"'+strong+'\">INSIDE</span>');"
+        "root('x-host',inner,'<span class=q>INSIDE-ALONE</span>');"
+        "light(slottedStrong,'SLOT-STRONG',strong);"
+        "light(slotted,'SLOT-NORMAL',strong);"
+        "light(slotted,'SLOT-BOTH-NORMAL',blue);"
+        "light('','SLOT-DOC',strong,'outer');"
+        "const nested='x-n{color:#00ff00!important}',n='<x-n style=\"'+strong+'\"></x-n>';"
+        "const shadowText=(h,css,text)=>{const m=h.shadowRoot.lastChild;"
+        "m.attachShadow({mode:'open'}).innerHTML='<style>'+css+'</style><span>'+text+'</span>'};"
+        "shadowText(root('x-host',nested,n),'','NESTED-OUTER');"
+        "shadowText(root('x-host',nested,n),hostStrong,'NESTED-OWN');"
+        "root('x-host',rep(130,i=>`:host{margin-left:${i}px!important}`)+hostStrong,"
+        "'<span>DENSE-HOST</span>',strong);"
+        "root('x-host',rep(130,i=>`.q{margin-left:${i}px!important}`)+inner,"
+        "'<span class=q style=\"'+strong+'\">DENSE-INSIDE</span>');"
+        "const script=root('x-host',hostStrong,'<span>SCRIPTED</span>');"
+        "script.style.setProperty('color','#0000ff','important');"
+        "const wide=root('x-host',':host{width:11px!important}','<span>W</span>',"
+        "'width:22px!important');wide.id='wide';"
+        "root('x-host',':host{color:revert-layer!important}',"
+        "'<span>REVERT</span>',strong);"
+        "root('x-host',':host{all:initial!important}',"
+        "'<span>ALL</span>',strong);"
+        "globalThis.pocSummary='IMPORTANT-READY'})()", "IMPORTANT-READY");
+    static const ShadowCascadeExpectation expected[] = {
+        {"HOST-STRONG", 0xff0000}, {"HOST-NORMAL", 0x0000ff},
+        {"HOST-OVER-NORMAL", 0xff0000}, {"BOTH-NORMAL", 0x0000ff},
+        {"DOC-RULE", 0x0000ff}, {"DOC-HOST", 0xff0000},
+        {"INSIDE", 0x0000ff}, {"INSIDE-ALONE", 0xff0000},
+        {"SLOT-STRONG", 0xff0000}, {"SLOT-NORMAL", 0x0000ff},
+        {"SLOT-BOTH-NORMAL", 0x0000ff}, {"SLOT-DOC", 0x0000ff},
+        {"NESTED-OUTER", 0x0000ff}, {"NESTED-OWN", 0xff0000},
+        {"DENSE-HOST", 0xff0000}, {"DENSE-INSIDE", 0x0000ff},
+        {"SCRIPTED", 0xff0000}, {"REVERT", 0x000000}, {"ALL", 0x000000}
+    };
+    ok = ok && shadow_cascade_colors(&navigation.page.layout, expected,
+        sizeof(expected) / sizeof(expected[0]));
+    ok = ok && script_runtime_evaluate_diagnostic(navigation.page.runtime,
+        "globalThis.pocSummary=getComputedStyle(document.getElementById('wide'))"
+        ".width", "<shadow-cascade>", &navigation.page.script_result)
+        && strcmp(navigation.page.script_result.summary, "11px") == 0;
+    constructed_sheet_close(&navigation);
     return ok && budget->current == baseline;
 }
 
@@ -6098,6 +6953,325 @@ static bool test_constructed_sheet_nested_scope(Budget *budget)
     if (!ok) fprintf(stderr, "nested adopted stylesheet crossed a shadow boundary\n");
     constructed_sheet_close(&navigation);
     return ok && budget->current == baseline;
+}
+
+/* The retained-property gate (style_retained_gate_begin) answers exactly
+   as the full scan of every rule does, element by element, through keyed,
+   escaped, attribute-led and keyless rules, shadow-confined adopted sheets,
+   class and attribute changes, a sheet appended after the gate was built,
+   and the focus probes' marker, which no DOM attribute carries. */
+static const char *const retained_gate_properties[] = {
+    "user-select", "touch-action", "isolation", "resize", "hyphens",
+    "text-wrap", "text-size-adjust", "backdrop-filter"
+};
+
+static bool retained_gate_lookup(const Stylesheet *sheet,
+                                 lxb_dom_node_t *node, const char *name,
+                                 bool gated, char *value, size_t capacity)
+{
+    StyleRetainedGate saved = {0};
+    if (gated) saved = style_retained_gate_begin(sheet, node);
+    bool found = style_retained_property_value(sheet, node, name,
+                                               strlen(name), value, capacity);
+    if (gated) style_retained_gate_end(sheet, saved);
+    if (!found) value[0] = '\0';
+    return found;
+}
+
+/* Every element under `node` (shadow carriers are DOM children of their
+   hosts), every property: the gated answer is the ungated one. */
+static bool retained_gate_agrees(const Stylesheet *sheet, lxb_dom_node_t *node,
+                                 size_t *elements)
+{
+    for (; node != NULL; node = node->next) {
+        if (node->type == LXB_DOM_NODE_TYPE_ELEMENT) {
+            (*elements)++;
+            for (size_t i = 0; i < sizeof(retained_gate_properties)
+                                   / sizeof(retained_gate_properties[0]);
+                 i++) {
+                char full[STYLE_RETAINED_VALUE_CAPACITY];
+                char gated[STYLE_RETAINED_VALUE_CAPACITY];
+                bool found_full = retained_gate_lookup(
+                    sheet, node, retained_gate_properties[i], false, full,
+                    sizeof(full));
+                bool found_gated = retained_gate_lookup(
+                    sheet, node, retained_gate_properties[i], true, gated,
+                    sizeof(gated));
+                if (found_full != found_gated || strcmp(full, gated) != 0) {
+                    size_t length = 0;
+                    const lxb_char_t *tag = lxb_dom_element_local_name(
+                        lxb_dom_interface_element(node), &length);
+                    fprintf(stderr, "retained gate: <%.*s> %s full=%d:%s "
+                            "gated=%d:%s\n", (int) length, (const char *) tag,
+                            retained_gate_properties[i], (int) found_full,
+                            full, (int) found_gated, gated);
+                    return false;
+                }
+            }
+        }
+        if (!retained_gate_agrees(sheet, node->first_child, elements))
+            return false;
+    }
+    return true;
+}
+
+static bool retained_gate_value_is(NavigationSession *navigation,
+                                   const char *id, const char *name,
+                                   const char *expected)
+{
+    lxb_dom_node_t *root = lxb_dom_interface_node(
+        navigation->page.document.html);
+    lxb_dom_node_t *node = root == NULL ? NULL : find_id(root, id);
+    char value[STYLE_RETAINED_VALUE_CAPACITY];
+    bool found = node != NULL && retained_gate_lookup(
+        &navigation->page.stylesheet, node, name, true, value,
+        sizeof(value));
+    bool ok = expected == NULL ? node != NULL && !found
+                               : found && strcmp(value, expected) == 0;
+    if (!ok)
+        fprintf(stderr, "retained gate: #%s %s=%s, expected %s\n", id, name,
+                found ? value : "(none)", expected == NULL ? "(none)"
+                                                           : expected);
+    return ok;
+}
+
+static bool retained_gate_document_agrees(NavigationSession *navigation,
+                                          size_t *skips)
+{
+    const Stylesheet *sheet = &navigation->page.stylesheet;
+    uint64_t before = sheet->retained_gate_skips;
+    size_t elements = 0;
+    bool ok = retained_gate_agrees(
+        sheet, lxb_dom_interface_node(navigation->page.document.html),
+        &elements);
+    *skips = (size_t) (sheet->retained_gate_skips - before);
+    return ok && elements > 40 && sheet->retained_gate != NULL;
+}
+
+static bool test_retained_gate_matches_full_scan(Budget *budget)
+{
+    size_t baseline = budget->current;
+    static NavigationSession navigation;
+    static const char body[] =
+        "<style>.a{user-select:none}#iso{isolation:isolate}"
+        "SeCtIoN{resize:both}.rounded-\\[6px\\]{touch-action:pan-x}"
+        "[data-r]{resize:vertical}[DATA-Q=\"1\"]{hyphens:none}"
+        ":not(.k){text-wrap:balance}.p>*{touch-action:none}"
+        ".x .y{user-select:all}[data-tilefinch-focus]{isolation:auto}"
+        "svg|rect{resize:none}"
+        "</style>"
+        "<div id=light class='a b' data-r=1>"
+        "<span id=escaped class='rounded-[6px]'>S</span></div>"
+        "<section id=iso>SEC</section><p id=keyed class=k>K</p>"
+        "<div class=p><i id=child>C</i></div>"
+        "<div class=x><b id=nested class=y>Y</b></div>"
+        "<x-host id=host></x-host>"
+        "<svg><rect id=shape class=a width=1 height=1 /></svg>";
+    bool ok = constructed_sheet_open(&navigation, budget, body);
+    ok = ok && constructed_sheet_step(&navigation,
+        "(()=>{const r=document.getElementById('host')"
+        ".attachShadow({mode:'open'});"
+        "r.innerHTML='<p id=part class=part>PART</p><b id=q data-q=1>Q</b>';"
+        "const s=new CSSStyleSheet();s.replaceSync('.part{user-select:contain}"
+        ":host{touch-action:pinch-zoom}[data-q]{resize:horizontal}');"
+        "r.adoptedStyleSheets=[s];globalThis.pocSummary='GATE-SHADOW'})()",
+        "GATE-SHADOW");
+    size_t skips = 0;
+    ok = ok && retained_gate_document_agrees(&navigation, &skips)
+        && skips != 0;
+    if (!ok) fprintf(stderr, "retained gate: first pass skips=%zu\n", skips);
+    ok = ok && retained_gate_value_is(&navigation, "light", "user-select",
+                                      "none")
+        && retained_gate_value_is(&navigation, "light", "resize", "vertical")
+        && retained_gate_value_is(&navigation, "escaped", "touch-action",
+                                  "pan-x")
+        && retained_gate_value_is(&navigation, "iso", "isolation", "isolate")
+        && retained_gate_value_is(&navigation, "iso", "resize", "both")
+        && retained_gate_value_is(&navigation, "keyed", "text-wrap", NULL)
+        && retained_gate_value_is(&navigation, "iso", "text-wrap", "balance")
+        && retained_gate_value_is(&navigation, "child", "touch-action", "none")
+        && retained_gate_value_is(&navigation, "nested", "user-select", "all")
+        && retained_gate_value_is(&navigation, "part", "user-select",
+                                  "contain")
+        && retained_gate_value_is(&navigation, "host", "touch-action",
+                                  "pinch-zoom")
+        && retained_gate_value_is(&navigation, "q", "resize", "horizontal")
+        && retained_gate_value_is(&navigation, "light", "isolation", NULL);
+    /* Keys an element gains after the gate was built, and a sheet appended
+       after it (the rule index, and the gate with it, is rebuilt). */
+    ok = ok && constructed_sheet_step(&navigation,
+        "(()=>{document.getElementById('keyed').className='a late';"
+        "document.getElementById('iso').setAttribute('data-r','');"
+        "document.getElementById('host').shadowRoot.getElementById('part')"
+        ".setAttribute('data-q','2');"
+        "const st=document.createElement('style');"
+        "st.textContent='.late{touch-action:manipulation}"
+        "[data-late]{backdrop-filter:blur(1px)}';document.head.append(st);"
+        "document.getElementById('child').setAttribute('data-late','');"
+        "globalThis.pocSummary='GATE-LATE'})()", "GATE-LATE");
+    ok = ok && retained_gate_document_agrees(&navigation, &skips)
+        && skips != 0;
+    ok = ok && retained_gate_value_is(&navigation, "keyed", "user-select",
+                                      "none")
+        && retained_gate_value_is(&navigation, "keyed", "touch-action",
+                                  "manipulation")
+        && retained_gate_value_is(&navigation, "keyed", "text-wrap",
+                                  "balance")
+        && retained_gate_value_is(&navigation, "iso", "resize", "vertical")
+        && retained_gate_value_is(&navigation, "part", "resize", "horizontal")
+        && retained_gate_value_is(&navigation, "child", "backdrop-filter",
+                                  "blur(1px)");
+    /* The focus probes give an element the marker attribute without the
+       DOM carrying it. */
+    lxb_dom_node_t *keyed = ok ? find_id(lxb_dom_interface_node(
+        navigation.page.document.html), "nested") : NULL;
+    if (keyed != NULL) {
+        StyleFocusOverride previous = style_focus_override_swap(
+            (StyleFocusOverride) {.node = keyed, .focused = true});
+        size_t elements = 0;
+        ok = ok && retained_gate_agrees(&navigation.page.stylesheet, keyed,
+                                        &elements)
+            && retained_gate_value_is(&navigation, "nested", "isolation",
+                                      "auto");
+        style_focus_override_swap(previous);
+        ok = ok && retained_gate_value_is(&navigation, "nested", "isolation",
+                                          NULL);
+    } else {
+        ok = false;
+    }
+    if (!ok) fprintf(stderr, "retained gate disagreed with the full scan\n");
+    constructed_sheet_close(&navigation);
+    return ok && budget->current == baseline;
+}
+
+/* The retained-property gate over the compiled-sheet reuse paths: a head
+   cut (stylesheet_truncate_to_head) drops the custom rule index the gate
+   is built from, the next page's body source appends in place, and an
+   adopted sheet is inserted and retired in place. After each step the root's
+   color-scheme, read as browser_engine_page_declares_dark reads it, is the
+   step's own and the gated answer is the full scan's. */
+static bool retained_root_scheme_is(const Stylesheet *sheet,
+                                    lxb_dom_node_t *root, const char *step,
+                                    const char *expected)
+{
+    char full[STYLE_RETAINED_VALUE_CAPACITY];
+    char gated[STYLE_RETAINED_VALUE_CAPACITY];
+    bool found_full = root != NULL && retained_gate_lookup(
+        sheet, root, "color-scheme", false, full, sizeof(full));
+    bool found_gated = root != NULL && retained_gate_lookup(
+        sheet, root, "color-scheme", true, gated, sizeof(gated));
+    if (root == NULL) full[0] = gated[0] = '\0';
+    bool ok = found_full && found_gated && strcmp(full, expected) == 0
+        && strcmp(gated, expected) == 0;
+    if (!ok)
+        fprintf(stderr, "retained gate (%s): color-scheme full=%d:%s "
+                "gated=%d:%s, expected %s\n", step, (int) found_full, full,
+                (int) found_gated, gated, expected);
+    return ok;
+}
+
+static lxb_dom_node_t *retained_document_root(const PocDocument *document)
+{
+    return lxb_dom_interface_node(
+        lxb_dom_document_element(&document->html->dom_document));
+}
+
+static bool test_retained_gate_follows_head_cut_and_adoption(Budget *budget)
+{
+    size_t baseline = budget->current;
+    /* Two articles sharing a <head>, as the head take hands A's sheet to
+       B. */
+    static const char head[] =
+        "<!doctype html><html><head><style>:root{color-scheme:light}"
+        ".a{user-select:none}</style></head><body>";
+    static const char body_a[] =
+        "<style>:root{color-scheme:dark}</style><p class=a>A</p></body>";
+    static const char body_b[] =
+        "<style>:root{color-scheme:light dark}.a{resize:both}</style>"
+        "<p class=a>B</p></body>";
+    char html_a[512], html_b[512];
+    int length_a = snprintf(html_a, sizeof(html_a), "%s%s", head, body_a);
+    int length_b = snprintf(html_b, sizeof(html_b), "%s%s", head, body_b);
+    PocDocument document_a = {0}, document_b = {0};
+    Stylesheet sheet = {0};
+    bool ok = length_a > 0 && length_b > 0
+        && document_parse(&document_a, budget, html_a, (size_t) length_a, 17)
+        && document_parse(&document_b, budget, html_b, (size_t) length_b, 17)
+        && stylesheet_build(&sheet, budget, &document_a, 480);
+    lxb_dom_node_t *root_a = ok ? retained_document_root(&document_a) : NULL;
+    lxb_dom_node_t *root_b = ok ? retained_document_root(&document_b) : NULL;
+    /* The first lookup builds the index and its gate. */
+    ok = ok && retained_root_scheme_is(&sheet, root_a, "head+body", "dark")
+        && sheet.retained_gate != NULL;
+    stylesheet_prepare_for_document_reuse(&sheet);
+    ok = ok && stylesheet_truncate_to_head(&sheet, true)
+        && retained_root_scheme_is(&sheet, root_a, "head cut", "light");
+    lxb_dom_node_t *style_b = NULL;
+    lxb_dom_node_t *body = ok ? lxb_dom_interface_node(
+        lxb_html_document_body_element(document_b.html)) : NULL;
+    for (lxb_dom_node_t *node = body == NULL ? NULL : body->first_child;
+         node != NULL && style_b == NULL; node = node->next)
+        if (node->type == LXB_DOM_NODE_TYPE_ELEMENT
+            && node->local_name == LXB_TAG_STYLE) style_b = node;
+    if (ok) stylesheet_set_head_mark(&sheet);
+    size_t elements = 0;
+    ok = ok && style_b != NULL
+        && stylesheet_append_style_elements(&sheet, &style_b, 1, NULL)
+        && retained_root_scheme_is(&sheet, root_b, "appended body",
+                                   "light dark")
+        && retained_gate_agrees(&sheet, root_b, &elements) && elements >= 4;
+    stylesheet_destroy(&sheet);
+    document_destroy(&document_b);
+    document_destroy(&document_a);
+    if (!ok) fprintf(stderr, "retained gate: head cut and append failed\n");
+
+    /* A page's adopted sheet inserted, a <style> appended under it, and
+       the adopted sheet retired again, each in place. The rules select
+       html: an adopted sheet with :root rules is not retired in place, and
+       the adopted rule must not lose to a :root rule's specificity. */
+    static NavigationSession navigation;
+    bool live = constructed_sheet_open(&navigation, budget,
+        "<style>html{color-scheme:light}</style><p class=a>LIVE</p>");
+    bool adopted = live;
+    lxb_dom_node_t *root = adopted
+        ? retained_document_root(&navigation.page.document) : NULL;
+    size_t appends = navigation.performance.mutation_style_appends;
+    size_t fallbacks = navigation.performance.mutation_style_append_fallbacks;
+    adopted = adopted
+        && retained_root_scheme_is(&navigation.page.stylesheet, root,
+                                   "document", "light")
+        && constructed_sheet_step(&navigation,
+            "(()=>{globalThis.night=new CSSStyleSheet();"
+            "night.replaceSync('html{color-scheme:dark}');"
+            "document.adoptedStyleSheets=[night];"
+            "globalThis.pocSummary='ADOPT'})()", "ADOPT")
+        && retained_root_scheme_is(&navigation.page.stylesheet, root,
+                                   "adopted", "dark")
+        && constructed_sheet_step(&navigation,
+            "(()=>{const s=document.createElement('style');"
+            "s.textContent='html{color-scheme:only light}';"
+            "document.body.append(s);globalThis.pocSummary='APPEND'})()",
+            "APPEND")
+        && retained_root_scheme_is(&navigation.page.stylesheet, root,
+                                   "appended under adopted", "dark")
+        && constructed_sheet_step(&navigation,
+            "(()=>{document.adoptedStyleSheets=[];"
+            "globalThis.pocSummary='RETIRE'})()", "RETIRE")
+        && retained_root_scheme_is(&navigation.page.stylesheet, root,
+                                   "adopted retired", "only light");
+    /* Each change was applied to the sheet in place. */
+    size_t in_place = navigation.performance.mutation_style_appends - appends;
+    bool kept = navigation.performance.mutation_style_append_fallbacks
+        == fallbacks;
+    if (adopted && (in_place != 3 || !kept)) {
+        fprintf(stderr, "retained gate: %zu in-place style changes, "
+                "fallbacks %zu -> %zu\n", in_place, fallbacks,
+                navigation.performance.mutation_style_append_fallbacks);
+        adopted = false;
+    }
+    if (!adopted) fprintf(stderr, "retained gate: adopted steps failed\n");
+    if (live) constructed_sheet_close(&navigation);
+    return ok && adopted && budget->current == baseline;
 }
 
 static bool test_constructed_sheet_root_order_and_refusal(Budget *budget)
@@ -6764,6 +7938,248 @@ static int test_fixed_overlays_follow_z_index(Budget *budget)
         stylesheet_destroy(&stylesheet);
         document_destroy(&document);
     }
+    return 0;
+}
+
+/* `html, body { overflow-x: hidden }` flags every command of a long page
+   as overflow content. The accelerator kept one geometry entry per flagged
+   command and refused itself past 256 KiB (about 5,400 commands), so all
+   clipped content was painted again on every frame. Runs of commands that
+   the same clip boxes apply to share one entry, and the allowance grows
+   with the page; the frames match the uncached fallback. */
+static int test_overflow_cache_long_clipped_page(Budget *budget)
+{
+    enum { PARAGRAPHS = 4000 };
+    static char html[PARAGRAPHS * 64 + 256];
+    size_t used = (size_t) snprintf(html, sizeof(html),
+        "<!doctype html><style>html,body{overflow-x:hidden;margin:0}"
+        "p{margin:0}.c{color:#aa0000}</style><body>");
+    for (int i = 0; i < PARAGRAPHS; i++)
+        used += (size_t) snprintf(html + used, sizeof(html) - used,
+            "<p>row %d <span class=c>red</span> words</p>", i);
+    snprintf(html + used, sizeof(html) - used, "</body>");
+    PocDocument document = {0};
+    Stylesheet stylesheet = {0};
+    LayoutDocument layout = {0};
+    CHECK(document_parse(&document, budget, html, strlen(html), 17)
+          && stylesheet_build(&stylesheet, budget, &document, 480)
+          && layout_build(&layout, budget, &document, &stylesheet,
+                          NULL, NULL, 480));
+    size_t flagged = 0;
+    for (size_t i = 0; layout.command_flags != NULL && i < layout.count; i++)
+        if (layout.command_flags[i] & LAYOUT_COMMAND_OVERFLOW) flagged++;
+    /* Past the old cap: one 48-byte entry per flagged command. */
+    CHECK(flagged * 48u > TILEFINCH_OVERFLOW_CACHE_BYTES);
+    TileCache cache, uncached;
+    uint16_t *frame = budget_malloc(budget, 480u * 272u * sizeof(*frame));
+    uint16_t *expected = budget_malloc(budget, 480u * 272u * sizeof(*frame));
+    CHECK(frame != NULL && expected != NULL
+          && tile_cache_init(&cache, budget, &layout, 24)
+          && tile_cache_set_frame(&cache, frame, 480u * 272u)
+          && tile_cache_init(&uncached, budget, &layout, 24)
+          && tile_cache_set_frame(&uncached, expected, 480u * 272u));
+    uncached.overflow_cache_disabled = true;
+    const int offsets[] = {0, 272, layout.height / 2, layout.height - 272};
+    for (size_t i = 0; i < sizeof(offsets) / sizeof(offsets[0]); i++) {
+        CHECK(tile_cache_render_frame(&cache, offsets[i], 480, 272, NULL)
+              && tile_cache_render_frame(&uncached, offsets[i], 480, 272,
+                                         NULL)
+              && memcmp(frame, expected, 480u * 272u * sizeof(*frame)) == 0);
+    }
+    /* A repeated frame copies tiles: no clipped command is painted into
+       the frame again. */
+    size_t direct = cache.overflow_direct_commands;
+    CHECK(tile_cache_render_frame(&cache, offsets[3], 480, 272, NULL));
+    if (cache.overflow_cache_builds != 1 || cache.overflow_cache_fallbacks != 0
+        || cache.overflow_direct_commands != direct
+        || cache.overflow_tile_commands == 0
+        || cache.overflow_cache_bytes > TILEFINCH_OVERFLOW_CACHE_BYTES) {
+        fprintf(stderr, "long clipped page: flagged %zu builds %zu "
+                "fallbacks %zu direct %zu->%zu tile %zu bytes %zu\n",
+                flagged, (size_t) cache.overflow_cache_builds,
+                (size_t) cache.overflow_cache_fallbacks, direct,
+                (size_t) cache.overflow_direct_commands,
+                (size_t) cache.overflow_tile_commands,
+                (size_t) cache.overflow_cache_bytes);
+        CHECK(false);
+    }
+    tile_cache_destroy(&uncached);
+    tile_cache_destroy(&cache);
+    budget_free(budget, expected);
+    budget_free(budget, frame);
+    layout_destroy(&layout);
+    stylesheet_destroy(&stylesheet);
+    document_destroy(&document);
+    return 0;
+}
+
+/* The fixed and sticky passes ran once per composed frame over the whole
+   display list, each command checked against every fixed range, even with
+   the fixed layer cached: a fixed header over 8,000 paragraphs cost twice
+   what it cost over 1,000. They now visit only the fixed and sticky
+   commands, so a frame's work there does not depend on the page's length.
+   Pixels are covered by the lab frame hashes. */
+static int test_overlay_passes_skip_unrelated_commands(Budget *budget)
+{
+    uint64_t per_frame[2] = {0, 0};
+    for (int size = 0; size < 2; size++) {
+        int paragraphs = size == 0 ? 300 : 3000;
+        static char html[3000 * 48 + 1024];
+        size_t used = (size_t) snprintf(html, sizeof(html),
+            "<!doctype html><style>body{margin:0}"
+            "#h{position:fixed;top:0;left:0;width:480px;height:20px;"
+            "background:#123;color:#fff;z-index:4}"
+            "h2{position:sticky;top:20px;margin:0;background:#ddd}"
+            ".z{position:relative;z-index:2}</style><body>"
+            "<div id=h>Head <b>x</b></div><h2>Sticky</h2>");
+        for (int i = 0; i < paragraphs; i++)
+            used += (size_t) snprintf(html + used, sizeof(html) - used,
+                "<p%s>row %d</p>", i % 50 == 0 ? " class=z" : "", i);
+        CHECK(used < sizeof(html));
+        PocDocument document = {0};
+        Stylesheet stylesheet = {0};
+        LayoutDocument layout = {0};
+        CHECK(document_parse(&document, budget, html, used, 23)
+              && stylesheet_build(&stylesheet, budget, &document, 480)
+              && layout_build(&layout, budget, &document, &stylesheet,
+                              NULL, NULL, 480));
+        CHECK(layout.fixed_count != 0 && layout.sticky_count != 0
+              && layout.paint_order_count == layout.count);
+        TileCache cache;
+        uint16_t *frame = budget_malloc(budget, 480u * 272u * sizeof(*frame));
+        CHECK(frame != NULL && tile_cache_init(&cache, budget, &layout, 24)
+              && tile_cache_set_frame(&cache, frame, 480u * 272u)
+              && tile_cache_render_frame(&cache, 0, 480, 272, NULL));
+        uint64_t visited = cache.overlay_commands_visited;
+        enum { FRAMES = 8 };
+        for (int f = 1; f <= FRAMES; f++)
+            CHECK(tile_cache_render_frame(&cache, f * 40, 480, 272, NULL));
+        per_frame[size] = (cache.overlay_commands_visited - visited) / FRAMES;
+        bool once = cache.overlay_index_builds == 1;
+        if (!once || per_frame[size] > 64u)
+            fprintf(stderr, "overlay passes: %d paragraphs, %zu commands, "
+                    "%llu visits per frame, %zu index builds\n", paragraphs,
+                    layout.count, (unsigned long long) per_frame[size],
+                    cache.overlay_index_builds);
+        CHECK(once && per_frame[size] <= 64u);
+        tile_cache_destroy(&cache);
+        budget_free(budget, frame);
+        layout_destroy(&layout);
+        stylesheet_destroy(&stylesheet);
+        document_destroy(&document);
+    }
+    CHECK(per_frame[0] == per_frame[1]);
+    return 0;
+}
+
+/* A text run was walked glyph by glyph to its end for every tile it
+   crossed, so one unbroken 50,000-character line cost 31 ms per host frame
+   (and 1.5 to 3 s on the PSP). A left-to-right run now stops two ems past
+   the tile, so a frame's glyph work follows the screen's width, not the
+   line's length. Negative letter spacing can move the pen left, so such a
+   run is still walked to its end. */
+static int test_long_text_run_stops_past_target(Budget *budget)
+{
+    uint64_t steps[3] = {0, 0, 0};
+    FontSet fonts;
+    CHECK(font_set_load(&fonts, budget, TILEFINCH_TEST_SANS_FONT, NULL, NULL,
+                        NULL, NULL, NULL, NULL, 2u * 1024u * 1024u));
+    for (int variant = 0; variant < 3; variant++) {
+        int characters = variant == 0 ? 4000 : 16000;
+        static char html[16000 + 512];
+        size_t used = (size_t) snprintf(html, sizeof(html),
+            "<!doctype html><body style='margin:0'>"
+            "<div style='white-space:nowrap%s'>",
+            variant == 2 ? ";letter-spacing:-1px" : "");
+        for (int i = 0; i < characters; i++) html[used++] = "AVxo"[i % 4];
+        used += (size_t) snprintf(html + used, sizeof(html) - used,
+                                  "</div></body>");
+        CHECK(used < sizeof(html));
+        PocDocument document = {0};
+        Stylesheet stylesheet = {0};
+        LayoutDocument layout = {0};
+        CHECK(document_parse(&document, budget, html, used, 24)
+              && stylesheet_build(&stylesheet, budget, &document, 480)
+              && layout_build(&layout, budget, &document, &stylesheet,
+                              &fonts, NULL, 480));
+        TileCache cache;
+        uint16_t *frame = budget_malloc(budget, 480u * 272u * sizeof(*frame));
+        CHECK(frame != NULL && tile_cache_init(&cache, budget, &layout, 24)
+              && tile_cache_set_frame(&cache, frame, 480u * 272u)
+              && tile_cache_render_frame(&cache, 0, 480, 272, NULL));
+        steps[variant] = cache.text_glyph_steps;
+        tile_cache_destroy(&cache);
+        budget_free(budget, frame);
+        layout_destroy(&layout);
+        stylesheet_destroy(&stylesheet);
+        document_destroy(&document);
+    }
+    font_set_destroy(&fonts);
+    /* Two tile columns of about 30 glyphs each, a few times over. */
+    bool bounded = steps[0] == steps[1] && steps[1] <= 1000u
+        && steps[2] >= 16000u;
+    if (!bounded)
+        fprintf(stderr, "long text run: glyph steps 4000 chars %llu, "
+                "16000 chars %llu, negative spacing %llu\n",
+                (unsigned long long) steps[0], (unsigned long long) steps[1],
+                (unsigned long long) steps[2]);
+    CHECK(bounded);
+    return 0;
+}
+
+/* A fixed, sticky or shadow pass paints a moved copy of a text command,
+   and its visual-order glyphs were found by scanning every bidi command
+   for the copy's text, per copy and per frame. The pass now names the
+   source command and the glyphs come from one binary search. Pixels are
+   covered by the lab frame hashes. */
+static int test_bidi_copies_find_their_source(Budget *budget)
+{
+    FontSet fonts;
+    CHECK(font_set_load(&fonts, budget, TILEFINCH_TEST_SANS_FONT, NULL, NULL,
+                        NULL, NULL, NULL, NULL, 2u * 1024u * 1024u));
+    static char html[400 * 96 + 1024];
+    size_t used = (size_t) snprintf(html, sizeof(html),
+        "<!doctype html><style>body{margin:0}"
+        "#h{position:fixed;top:0;left:0;width:480px;height:24px;"
+        "direction:rtl;background:#fff;text-shadow:1px 1px 2px #f00}"
+        "h3{position:sticky;top:24px;margin:0;direction:rtl;"
+        "background:#eee}</style><body>"
+        "<h3>\xd7\xa9\xd7\x9c\xd7\x95\xd7\x9d sticky</h3>");
+    for (int i = 0; i < 400; i++)
+        used += (size_t) snprintf(html + used, sizeof(html) - used,
+            "<p dir=rtl>\xd7\xa9\xd7\x9c\xd7\x95\xd7\x9d %d "
+            "\xd7\xa2\xd7\x95\xd7\x9c\xd7\x9d</p>", i);
+    /* A fixed bar written last, as cookie bars are: its source is the
+       last bidi command. */
+    used += (size_t) snprintf(html + used, sizeof(html) - used,
+        "<div id=h>\xd7\xa9\xd7\x9c\xd7\x95\xd7\x9d head</div>");
+    CHECK(used < sizeof(html));
+    PocDocument document = {0};
+    Stylesheet stylesheet = {0};
+    LayoutDocument layout = {0};
+    CHECK(document_parse(&document, budget, html, used, 25)
+          && stylesheet_build(&stylesheet, budget, &document, 480)
+          && layout_build(&layout, budget, &document, &stylesheet,
+                          &fonts, NULL, 480));
+    TileCache cache;
+    uint16_t *frame = budget_malloc(budget, 480u * 272u * sizeof(*frame));
+    CHECK(frame != NULL && tile_cache_init(&cache, budget, &layout, 24)
+          && tile_cache_set_frame(&cache, frame, 480u * 272u));
+    for (int f = 0; f < 6; f++)
+        CHECK(tile_cache_render_frame(&cache, f * 60, 480, 272, NULL));
+    bool found = layout.bidi_command_count >= 400u
+        && cache.bidi_copy_scans == 0;
+    if (!found)
+        fprintf(stderr, "bidi copies: %zu bidi commands, %llu scanned\n",
+                layout.bidi_command_count,
+                (unsigned long long) cache.bidi_copy_scans);
+    CHECK(found);
+    tile_cache_destroy(&cache);
+    budget_free(budget, frame);
+    layout_destroy(&layout);
+    stylesheet_destroy(&stylesheet);
+    document_destroy(&document);
+    font_set_destroy(&fonts);
     return 0;
 }
 

@@ -15,6 +15,7 @@
   }
   class SpeechSynthesisEvent extends Event {
     constructor(type, init = {}) {
+      init ??= {};
       super(type, init);
       this.utterance = init.utterance || null;
       this.charIndex = Math.max(0, Number(init.charIndex) || 0);
@@ -25,6 +26,7 @@
   }
   class SpeechSynthesisErrorEvent extends SpeechSynthesisEvent {
     constructor(type, init = {}) {
+      init ??= {};
       super(type, init);
       this.error = String(init.error || "synthesis-unavailable");
     }

@@ -707,7 +707,7 @@ static bool runtime_parser_insertion_append(ScriptRuntime *runtime,
     for (size_t k = 0; k < 4; k++) {
         int64_t handle = nodes[k] == NULL ? 0
             : js_rt_bridge_register_node(&runtime->bridge, nodes[k]);
-        if (JS_SetPropertyUint32(runtime->context, batch, (*at)++,
+        if (js_rt_define_index(runtime->context, batch, (*at)++,
                                  JS_NewInt64(runtime->context, handle)) < 0)
             return false;
     }
@@ -765,7 +765,7 @@ static JSValue runtime_parser_insertion_batch(ScriptRuntime *runtime,
         ok = runtime_parser_insertion_append(runtime, batch, &at, nodes);
     }
     document_parser_insertions_clear(document);
-    if (!ok || JS_SetPropertyStr(context, batch, "coalesced",
+    if (!ok || js_rt_define_field(context, batch, "coalesced",
                                  JS_NewInt64(context,
                                              (int64_t) journal->coalesced))
                    < 0) {
@@ -1011,6 +1011,20 @@ bool script_runtime_set_frame_window_state(ScriptRuntime *runtime,
     runtime->result.success = ok;
     js_rt_runtime_update_result(runtime, result);
     return ok;
+}
+
+void script_runtime_set_frame_dynamic_code(ScriptRuntime *runtime,
+                                           long frame_handle, bool allowed)
+{
+    if (runtime == NULL || frame_handle <= 0) return;
+    for (size_t i = 0; i < SCRIPT_FRAME_REALM_LIMIT; i++) {
+        if (runtime->frame_realms[i].context == NULL
+            || runtime->frame_realms[i].frame_handle != frame_handle) continue;
+        runtime->frame_realms[i].dynamic_code_allowed = allowed;
+#if defined(TILEFINCH_QUICKJS_DYNAMIC_CODE_POLICY)
+        JS_SetDynamicCodeEnabled(runtime->frame_realms[i].context, allowed);
+#endif
+    }
 }
 
 void script_runtime_intersection_recheck(ScriptRuntime *runtime)
@@ -1647,6 +1661,7 @@ static bool runtime_pump_network(ScriptRuntime *runtime,
             bridge->fetch_scheduler, 1,
             wait_ms > 4 ? 4 : wait_ms);
     }
+    if (completion_budget == 0) js_rt_cors_preflights_settle(bridge);
     size_t author_tasks = 0;
     /*
      * A segmented classic script remains one author task. Once its first
@@ -1699,6 +1714,17 @@ static bool runtime_pump_network(ScriptRuntime *runtime,
             i++;
             continue;
         }
+        /* The result is taken: retire the record now, while i still names
+           it. Delivery below runs page script, which can abort another
+           request and so remove and shift records of this same table; an
+           index kept across that call would retire the wrong request, or
+           underflow the move length once the table shrank below it. The
+           local copy owns the integrity metadata from here on. */
+        bridge->async_fetch_count--;
+        memmove(bridge->async_fetches + i,
+                bridge->async_fetches + i + 1,
+                (bridge->async_fetch_count - i)
+                    * sizeof(bridge->async_fetches[0]));
         if (success && !fetched->opaque_redirect
             && async_fetch.integrity_length != 0u) {
             TilefinchIntegrityResult integrity =
@@ -1759,23 +1785,23 @@ static bool runtime_pump_network(ScriptRuntime *runtime,
             payload = JS_NewObject(runtime->context);
             if (!JS_IsException(payload)) {
                 bool filtered = fetched->opaque_redirect || opaque_response;
-                (void) JS_SetPropertyStr(runtime->context, payload, "status",
+                (void) js_rt_define_field(runtime->context, payload, "status",
                     JS_NewInt64(runtime->context,
                         filtered ? 0 : fetched->status_code));
-                (void) JS_SetPropertyStr(runtime->context, payload, "url",
+                (void) js_rt_define_field(runtime->context, payload, "url",
                     JS_NewString(runtime->context,
                         filtered ? "" : fetched->effective_url));
-                (void) JS_SetPropertyStr(runtime->context, payload,
+                (void) js_rt_define_field(runtime->context, payload,
                     "contentType", JS_NewString(runtime->context,
                         filtered ? "" : fetched->content_type));
-                (void) JS_SetPropertyStr(runtime->context, payload,
+                (void) js_rt_define_field(runtime->context, payload,
                     "headers", JS_NewStringLen(
                         runtime->context, visible_headers,
                         filtered ? 0u : visible_headers_length));
-                (void) JS_SetPropertyStr(runtime->context, payload,
+                (void) js_rt_define_field(runtime->context, payload,
                     "redirected", JS_NewBool(runtime->context,
                                                fetched->redirected));
-                (void) JS_SetPropertyStr(runtime->context, payload, "type",
+                (void) js_rt_define_field(runtime->context, payload, "type",
                     JS_NewString(runtime->context,
                         fetched->opaque_redirect ? "opaqueredirect"
                             : opaque_response ? "opaque"
@@ -1892,11 +1918,6 @@ static bool runtime_pump_network(ScriptRuntime *runtime,
             JS_FreeValue(runtime->context, arguments[value]);
         }
         budget_free(bridge->budget, async_fetch.integrity);
-        memmove(bridge->async_fetches + i,
-                bridge->async_fetches + i + 1,
-                (bridge->async_fetch_count - i - 1)
-                    * sizeof(bridge->async_fetches[0]));
-        bridge->async_fetch_count--;
         if (bridge->result != NULL) {
             bridge->result->async_network_completed++;
         }

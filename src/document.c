@@ -17,6 +17,7 @@
 #include <lexbor/ns/const.h>
 
 #include "tilefinch/platform.h"
+#include "tilefinch/script_loader.h"
 #include "tilefinch/font.h"
 #include "tilefinch/text_encoding.h"
 #include "tilefinch/media_discovery.h"
@@ -56,6 +57,57 @@
 
 static const char document_cssom_style_marker;
 
+static bool document_attr_id_named(const lxb_dom_document_t *document,
+                                   lxb_dom_attr_id_t id, const char *name,
+                                   size_t length)
+{
+    if (id == 0) return false;
+    const lxb_dom_attr_data_t *data =
+        lxb_dom_attr_data_by_id(document->attrs, id);
+    return data != NULL && data->entry.length == length
+        && memcmp(lexbor_hash_entry_str(&data->entry), name, length) == 0;
+}
+
+#if !defined(__PSP__)
+static size_t document_attribute_table_lookups;
+
+size_t document_test_attribute_table_lookups(void)
+{
+    return document_attribute_table_lookups;
+}
+#endif
+
+/* lxb_dom_element_attr_by_name for an HTML element and a lowercase name, the
+   usual question, comparing each attribute's stored names instead of hashing
+   the name into the document's table for every element of every layout pass.
+   That lookup lowers the name and matches stored names exactly, so this finds
+   the same attribute; anything else still takes it. */
+static lxb_dom_attr_t *document_attribute_node(lxb_dom_node_t *node,
+                                               const char *name, size_t length)
+{
+    lxb_dom_element_t *element = lxb_dom_interface_element(node);
+    const lxb_dom_document_t *document = node->owner_document;
+    bool plain = node->ns == LXB_NS_HTML
+        && document->type == LXB_DOM_DOCUMENT_DTYPE_HTML && length != 0;
+    for (size_t at = 0; plain && at < length; at++)
+        plain = name[at] < 'A' || name[at] > 'Z';
+    if (!plain) {
+#if !defined(__PSP__)
+        document_attribute_table_lookups++;
+#endif
+        return lxb_dom_element_attr_by_name(
+            element, (const lxb_char_t *) name, length);
+    }
+    for (lxb_dom_attr_t *attr = element->first_attr; attr != NULL;
+         attr = attr->next) {
+        if (document_attr_id_named(document, attr->node.local_name, name,
+                                   length)
+            || document_attr_id_named(document, attr->qualified_name, name,
+                                      length)) return attr;
+    }
+    return NULL;
+}
+
 bool document_style_attribute_cssom_authorized(lxb_dom_node_t *node)
 {
     if (node == NULL || node->type != LXB_DOM_NODE_TYPE_ELEMENT) return false;
@@ -88,6 +140,31 @@ static const char document_shadow_carrier_marker;
    per-element and per-text checks free on pages without shadow roots (it
    only ever gates, so sharing it between documents is harmless). */
 static size_t document_shadow_carriers_marked;
+
+/* Hosts with child lists that hold no carrier. A flat-tree walk asks about a
+   node's parent at every step, and layout walks each list several times, so
+   without this a list of n children costs n^2 per walk once any carrier exists,
+   short lists included: they are most of a document. A host gains a carrier only by a mark, which changes
+   `marked`, or by an insertion at its ends: script sees a shadow root as a
+   fragment, so it can move only the root's children, never the carrier, and a
+   clone drops the carriers it copied (js_dom_clone). */
+#define DOCUMENT_SHADOW_MISS_SLOTS 64u
+#define DOCUMENT_SHADOW_MISS_MIN_CHILDREN 2u
+typedef struct {
+    const lxb_dom_node_t *host;
+    const lxb_dom_node_t *first_child;
+    const lxb_dom_node_t *last_child;
+    size_t marked;
+} DocumentShadowMiss;
+static DocumentShadowMiss document_shadow_misses[DOCUMENT_SHADOW_MISS_SLOTS];
+#if !defined(__PSP__)
+static size_t document_shadow_scan_visits;
+
+size_t document_test_shadow_scan_visits(void)
+{
+    return document_shadow_scan_visits;
+}
+#endif
 #define DOCUMENT_SHADOW_CARRIER_ATTRIBUTE "data-tilefinch-shadow-root"
 #define DOCUMENT_SHADOW_SLOT_SEARCH_LIMIT 512u
 
@@ -110,23 +187,44 @@ bool document_node_is_shadow_carrier(const lxb_dom_node_t *node)
 {
     if (node == NULL || node->type != LXB_DOM_NODE_TYPE_ELEMENT
         ) return false;
-    lxb_dom_attr_t *attribute = lxb_dom_element_attr_by_name(
-        lxb_dom_interface_element((lxb_dom_node_t *) node),
-        (const lxb_char_t *) DOCUMENT_SHADOW_CARRIER_ATTRIBUTE,
-        sizeof(DOCUMENT_SHADOW_CARRIER_ATTRIBUTE) - 1u);
-    return attribute != NULL
-        && attribute->node.user == &document_shadow_carrier_marker;
+    /* Only document_mark_shadow_carrier sets this marker, so the attribute's
+       name adds nothing, and hashing it for every child a flat-tree walk
+       passes costs more than the walk. */
+    for (const lxb_dom_attr_t *attribute =
+             lxb_dom_interface_element((lxb_dom_node_t *) node)->first_attr;
+         attribute != NULL; attribute = attribute->next) {
+        if (attribute->node.user == &document_shadow_carrier_marker)
+            return true;
+    }
+    return false;
 }
 
 lxb_dom_node_t *document_shadow_carrier_of_host(const lxb_dom_node_t *host)
 {
     if (document_shadow_carriers_marked == 0 || host == NULL
         || host->type != LXB_DOM_NODE_TYPE_ELEMENT) return NULL;
+    uintptr_t address = (uintptr_t) host;
+    DocumentShadowMiss *miss = &document_shadow_misses[
+        ((address >> 4) ^ (address >> 10)) % DOCUMENT_SHADOW_MISS_SLOTS];
+    if (miss->host == host && miss->first_child == host->first_child
+        && miss->last_child == host->last_child
+        && miss->marked == document_shadow_carriers_marked) return NULL;
+    size_t children = 0;
     for (lxb_dom_node_t *child = host->first_child; child != NULL;
          child = child->next) {
+        children++;
+#if !defined(__PSP__)
+        document_shadow_scan_visits++;
+#endif
         if (child->type == LXB_DOM_NODE_TYPE_ELEMENT
             && child->local_name == LXB_TAG_DIV
             && document_node_is_shadow_carrier(child)) return child;
+    }
+    if (children >= DOCUMENT_SHADOW_MISS_MIN_CHILDREN) {
+        *miss = (DocumentShadowMiss) {
+            host, host->first_child, host->last_child,
+            document_shadow_carriers_marked
+        };
     }
     return NULL;
 }
@@ -309,8 +407,7 @@ bool document_node_is_inert(lxb_dom_node_t *node)
          node = document_flat_parent(node), depth++) {
         if (node->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
         lxb_dom_element_t *element = lxb_dom_interface_element(node);
-        if (lxb_dom_element_has_attribute(element,
-                (const lxb_char_t *) "inert", 5)) return true;
+        if (document_attribute_node(node, "inert", 5u) != NULL) return true;
         if (node->local_name == LXB_TAG_DIALOG && node->ns == LXB_NS_HTML
             && lxb_dom_element_has_attribute(element,
                 (const lxb_char_t *) "open", 4)
@@ -1112,11 +1209,26 @@ void document_parser_insertions_clear(PocDocument *document)
     document->parser_insertions.root_count = 0;
 }
 
+static DocumentParser *document_active_parser(PocDocument *document);
+
 void document_parser_insertions_discard_subtree(PocDocument *document,
                                                 lxb_dom_node_t *root)
 {
-    if (!document_parser_insertions_pending(document) || root == NULL)
-        return;
+    if (root == NULL) return;
+    /* A pending parsing-blocking script or a running script destroyed by
+       its own document's script is forgotten, never dereferenced. */
+    DocumentParser *parser = document_active_parser(document);
+    if (parser != NULL && parser->blocking_script != NULL
+        && document_ancestry(root, parser->blocking_script)
+               != DOCUMENT_ANCESTRY_OUTSIDE)
+        parser->blocking_script = NULL;
+    for (size_t i = 0; parser != NULL && i < parser->executing_count; i++) {
+        if (parser->executing[i] != NULL
+            && document_ancestry(root, parser->executing[i])
+                   != DOCUMENT_ANCESTRY_OUTSIDE)
+            parser->executing[i] = NULL;
+    }
+    if (!document_parser_insertions_pending(document)) return;
     DocumentParserInsertionJournal *journal = &document->parser_insertions;
     size_t write = 0;
     for (size_t i = 0; i < journal->count; i++) {
@@ -1148,6 +1260,26 @@ void document_parser_insertions_discard_subtree(PocDocument *document,
         journal->roots[write++] = item;
     }
     journal->root_count = write;
+}
+
+static bool document_parser_note_truncated_script(DocumentParser *parser,
+                                                  lxb_dom_node_t *script);
+static bool document_parser_inline_script_admitted(
+    DocumentParser *parser, lxb_dom_node_t *script, size_t bytes);
+
+/* Installed as the tokenizer state after a </script> token: Lexbor calls it
+   with the first byte after that end tag, so it records the position, puts
+   the real state back and ends the chunk there. When the end tag was the
+   chunk's last byte Lexbor never calls it; document_parser_run restores the
+   state itself. */
+static const lxb_char_t *document_parser_stop_state(
+    lxb_html_tokenizer_t *tokenizer, const lxb_char_t *data,
+    const lxb_char_t *end)
+{
+    DocumentParser *parser = tokenizer->callback_token_ctx;
+    parser->stop_at = data;
+    tokenizer->state = parser->resume_state;
+    return end;
 }
 
 static lxb_html_token_t *document_parser_token(
@@ -1205,6 +1337,18 @@ static lxb_html_token_t *document_parser_token(
                     } else {
                         parser->truncated_script_overflow = true;
                     }
+                    truncated = true;
+                }
+                if (!truncated && length != 0
+                    && !document_parser_inline_script_admitted(
+                           parser, current,
+                           parser->retained_current_script_bytes
+                                   > SIZE_MAX - length
+                               ? SIZE_MAX
+                               : parser->retained_current_script_bytes
+                                     + length)) {
+                    (void) document_parser_note_truncated_script(
+                        parser, current);
                     truncated = true;
                 }
                 if (truncated) token->text_start = token->text_end;
@@ -1298,6 +1442,25 @@ static lxb_html_token_t *document_parser_token(
     }
     if (processed != NULL && closed != NULL
         && parser->element_closed != NULL
+        && closed->local_name == LXB_TAG_SCRIPT) {
+        /* Stop Lexbor right after this end tag: the script runs between
+           Lexbor calls (document_parser_run), so the markup it writes is
+           fed at this point of the input with the tokenizer at rest. */
+        parser->closed_script = closed;
+        parser->resume_state = tokenizer->state;
+        tokenizer->state = document_parser_stop_state;
+        return processed;
+    }
+    /* Markup a script writes runs no other close-element checkpoint: those
+       lay out and paint, which must not happen inside the script. A
+       written </head> or </body> is still reported, so the document knows
+       it was closed; its callback skips the checkpoint's work. */
+    if (processed != NULL && closed != NULL
+        && parser->element_closed != NULL
+        && (parser->write_depth == 0
+            || (closed->ns == LXB_NS_HTML
+                && (closed->local_name == LXB_TAG_HEAD
+                    || closed->local_name == LXB_TAG_BODY)))
         && !parser->element_closed(parser->element_closed_opaque,
                                    &parser->document, closed)) {
         /* DOM changes made by a parser-blocking script belong to the
@@ -1368,7 +1531,6 @@ static uint16_t document_codepoint_glyph_script(unsigned codepoint)
         return DOCUMENT_GLYPH_SCRIPT_CYRILLIC;
     }
     if ((codepoint >= 0x0100u && codepoint <= 0x024fu)
-        || (codepoint >= 0x0300u && codepoint <= 0x036fu)
         || (codepoint >= 0x1e00u && codepoint <= 0x1effu)
         || (codepoint >= 0x2c60u && codepoint <= 0x2c7fu)
         || (codepoint >= 0xa720u && codepoint <= 0xa7ffu)
@@ -1385,6 +1547,19 @@ static uint16_t document_codepoint_glyph_script(unsigned codepoint)
         return DOCUMENT_GLYPH_SCRIPT_ARABIC;
     }
     return 0;
+}
+
+/* U+0300-036F serves several alphabets, so it takes the script of the letter it
+   sits on: a stress mark in Russian needs the Cyrillic pack and no other, and an
+   accent on a Latin letter needs Extended Latin, as the embedded faces lack it. */
+static uint16_t document_shared_mark_glyph_script(unsigned base)
+{
+    uint16_t script = document_codepoint_glyph_script(base);
+    if (script == DOCUMENT_GLYPH_SCRIPT_CYRILLIC
+        || script == DOCUMENT_GLYPH_SCRIPT_LATIN_EXTENDED) return script;
+    bool latin = (base >= 'A' && base <= 'Z') || (base >= 'a' && base <= 'z')
+        || (base >= 0x00c0u && base <= 0x00ffu);
+    return latin ? DOCUMENT_GLYPH_SCRIPT_LATIN_EXTENDED : 0;
 }
 
 /* One add and compare per classified codepoint. The 1st, 4th, 16th and
@@ -1405,6 +1580,25 @@ static void document_count_glyph_script(DocumentStats *stats,
     }
 }
 
+uint16_t document_text_glyph_scripts(const char *text, size_t length)
+{
+    uint16_t scripts = 0;
+    unsigned base = 0;
+    for (size_t at = 0; text != NULL && at < length;) {
+        unsigned codepoint = 0;
+        size_t used = font_utf8_next(text + at, length - at, &codepoint);
+        if (used == 0) break;
+        if (codepoint >= 0x0300u && codepoint <= 0x036fu) {
+            scripts |= document_shared_mark_glyph_script(base);
+        } else {
+            scripts |= document_codepoint_glyph_script(codepoint);
+            base = codepoint;
+        }
+        at += used;
+    }
+    return scripts;
+}
+
 static void document_note_glyph_scripts(DocumentStats *stats,
                                         const char *text, size_t length)
 {
@@ -1414,13 +1608,17 @@ static void document_note_glyph_scripts(DocumentStats *stats,
        seven scripts plus bidi text stopped early, so ordinary pages pay
        nothing new beyond one count per classified non-ASCII codepoint. */
     size_t at = 0;
+    unsigned base = 0;
     while (at < length) {
         /* Most top-site text is ASCII. Skip it without calling the UTF-8
            decoder; this pass runs only once in the parser's existing visible
            text/statistics walk. */
         size_t ascii_begin = at;
         while (at < length && (unsigned char) text[at] < 0x80u) at++;
-        if (at != ascii_begin) stats->font_text_pages |= UINT64_C(1);
+        if (at != ascii_begin) {
+            stats->font_text_pages |= UINT64_C(1);
+            base = (unsigned char) text[at - 1u];
+        }
         if (at >= length) break;
         unsigned codepoint = 0;
         size_t used = font_utf8_next(text + at, length - at, &codepoint);
@@ -1439,7 +1637,13 @@ static void document_note_glyph_scripts(DocumentStats *stats,
             || (codepoint >= 0x2066u && codepoint <= 0x2069u)) {
             stats->bidi_text_present = true;
         }
-        uint16_t script = document_codepoint_glyph_script(codepoint);
+        uint16_t script;
+        if (codepoint >= 0x0300u && codepoint <= 0x036fu) {
+            script = document_shared_mark_glyph_script(base);
+        } else {
+            script = document_codepoint_glyph_script(codepoint);
+            base = codepoint;
+        }
         if (script != 0) {
             stats->glyph_script_mask |= script;
             document_count_glyph_script(stats, script, codepoint);
@@ -1655,10 +1859,13 @@ static void document_parser_release_prescan(DocumentParser *parser)
     parser->prescan_length = 0;
 }
 
+static void document_parser_pending_release(DocumentParser *parser);
+
 void document_parser_abort(DocumentParser *parser)
 {
     if (parser == NULL) return;
     document_parser_release_prescan(parser);
+    document_parser_pending_release(parser);
     BudgetAllocationOwner allocation_owner =
         parser->document.allocation_owner;
     /* Lexbor can retain inconsistent internal pointers after an OOM. The
@@ -1791,6 +1998,28 @@ void document_parser_set_element_closed_callback(
     parser->element_closed_opaque = opaque;
 }
 
+void document_parser_set_inline_script_admit_callback(
+    DocumentParser *parser, DocumentInlineScriptAdmitCallback callback,
+    void *opaque)
+{
+    if (parser == NULL || !parser->active) return;
+    parser->inline_script_admit = callback;
+    parser->inline_script_admit_opaque = opaque;
+}
+
+/* Whether the streaming admission check still admits `script` with `bytes`
+   of text. */
+static bool document_parser_inline_script_admitted(
+    DocumentParser *parser, lxb_dom_node_t *script, size_t bytes)
+{
+    if (parser->inline_script_admit == NULL) return true;
+    bool may_collect = parser->inline_admit_collected_script != script;
+    bool admitted = parser->inline_script_admit(
+        parser->inline_script_admit_opaque, script, bytes, &may_collect);
+    if (!may_collect) parser->inline_admit_collected_script = script;
+    return admitted;
+}
+
 /* Lexbor's plain script-data state function is file-static. Its exported
    entry helper installs it; with is_eof set the helper touches nothing but
    tkz->state, so a zeroed probe yields the function pointer to compare
@@ -1857,8 +2086,17 @@ static void document_parser_discard_doomed_script_text(
         || parser->maximum_inline_script_bytes == 0u) return;
     size_t retained = parser->current_script_node == current
         ? parser->retained_current_script_bytes : 0u;
+    for (size_t at = 0; at < parser->truncated_script_count; at++) {
+        if (parser->truncated_script_nodes[at] == current) {
+            /* Already doomed: its later text is emptied at its token. */
+            tokenizer->pos = tokenizer->start;
+            return;
+        }
+    }
     if (retained > parser->maximum_inline_script_bytes
-        || pending > parser->maximum_inline_script_bytes - retained) {
+        || pending > parser->maximum_inline_script_bytes - retained
+        || !document_parser_inline_script_admitted(
+               parser, current, retained + pending)) {
         if (parser->current_script_node != current) {
             parser->current_script_node = current;
             parser->retained_current_script_bytes = 0u;
@@ -1906,6 +2144,208 @@ static void document_parser_trim_tokenizer(DocumentParser *parser)
     tokenizer->end = trimmed + target;
 }
 
+/* A parser-blocking external script, the kind HTML makes the pending
+   parsing-blocking script when write() closes it. */
+static bool document_parser_script_blocks(lxb_dom_node_t *script)
+{
+    if (!document_script_is_parser_blocking(script)) return false;
+    size_t length = 0;
+    const char *source = document_attribute(script, "src", &length);
+    if ((source == NULL || length == 0) && script->ns == LXB_NS_SVG)
+        source = document_attribute(script, "href", &length);
+    return source != NULL && length != 0;
+}
+
+/* Runs the closed callback of a script whose end tag the tokenizer has just
+   consumed, or, inside a write(), keeps a parser-blocking external one as
+   the pending parsing-blocking script (it runs once no write() is active).
+   The script's insertion point starts at the front of the waiting input;
+   the enclosing script's moves past whatever this one leaves waiting. */
+static bool document_parser_script_closed(DocumentParser *parser,
+                                          lxb_dom_node_t *script)
+{
+    if (parser->write_depth != 0 && document_parser_script_blocks(script)) {
+        parser->blocking_script = script;
+        return true;
+    }
+    size_t capacity = sizeof(parser->executing) / sizeof(parser->executing[0]);
+    if (parser->executing_count >= capacity) return false;
+    size_t insertion = parser->insertion;
+    size_t pending_before = parser->pending_length;
+    parser->executing[parser->executing_count++] = script;
+    parser->insertion = 0;
+    /* A written script sees what the write parsed before it. */
+    if (parser->write_depth != 0) parser->document.parser_writes++;
+    bool closed = parser->element_closed(parser->element_closed_opaque,
+                                         &parser->document, script);
+    parser->executing_count--;
+    /* Nothing is taken from the waiting input while a script runs. */
+    parser->insertion = insertion
+        + (parser->pending_length >= pending_before
+               ? parser->pending_length - pending_before : 0u);
+    /* A write() of the script's that failed the parser fails its caller
+       too: Lexbor is not fed again after an error. */
+    return closed && !parser->failed;
+}
+
+/* Inserts `length` bytes into the waiting input at `offset`. The caller
+   has checked DOCUMENT_PARSER_WRITE_PENDING_LIMIT. */
+static bool document_parser_pending_insert(DocumentParser *parser,
+                                           size_t offset, const char *data,
+                                           size_t length)
+{
+    if (length == 0) return true;
+    if (offset > parser->pending_length
+        || length > SIZE_MAX - parser->pending_length) return false;
+    size_t needed = parser->pending_length + length;
+    if (needed > parser->pending_capacity) {
+        size_t capacity = parser->pending_capacity < 256u
+            ? 256u : parser->pending_capacity;
+        while (capacity < needed)
+            capacity = capacity > SIZE_MAX / 2u ? needed : capacity * 2u;
+        BudgetAllocationOwner previous = budget_allocation_owner_enter(
+            parser->budget, parser->document.allocation_owner);
+        char *grown = budget_realloc(parser->budget, parser->pending_input,
+                                     capacity);
+        budget_allocation_owner_leave(parser->budget, previous);
+        if (grown == NULL) return false;
+        parser->pending_input = grown;
+        parser->pending_capacity = capacity;
+    }
+    memmove(parser->pending_input + offset + length,
+            parser->pending_input + offset,
+            parser->pending_length - offset);
+    memcpy(parser->pending_input + offset, data, length);
+    parser->pending_length += length;
+    return true;
+}
+
+static void document_parser_pending_release(DocumentParser *parser)
+{
+    if (parser->pending_input != NULL && parser->budget != NULL) {
+        BudgetAllocationOwner previous = budget_allocation_owner_enter(
+            parser->budget, parser->document.allocation_owner);
+        budget_free(parser->budget, parser->pending_input);
+        budget_allocation_owner_leave(parser->budget, previous);
+    }
+    parser->pending_input = NULL;
+    parser->pending_length = 0;
+    parser->pending_capacity = 0;
+    parser->pending_reserved = 0;
+    parser->insertion = 0;
+    parser->blocking_script = NULL;
+}
+
+/* Input waits in front of the insertion point: a pending parsing-blocking
+   script, or the waiting input such a script left behind when it was
+   destroyed and forgotten (the next drain parses that input). Input from
+   this point on goes after it. Waiting input behind the insertion point
+   (a drained script's) does not hold up what the script writes. */
+static bool document_parser_input_waiting(const DocumentParser *parser)
+{
+    return parser->blocking_script != NULL || parser->insertion != 0;
+}
+
+/* Feeds `data` to Lexbor, running each script it closes right after that
+   script's end tag (document_parser_stop_state). Stops early, with
+   `*consumed` short of `length`, once input waits at the insertion point
+   (document_parser_input_waiting): what follows must wait for it. */
+static bool document_parser_run(DocumentParser *parser, const char *data,
+                                size_t length, size_t *consumed)
+{
+    const lxb_char_t *bytes = (const lxb_char_t *) data;
+    size_t at = 0;
+    bool ok = true;
+    /* Each pass consumes at least the end tag that stopped it. */
+    while (ok && at < length) {
+        parser->closed_script = NULL;
+        parser->stop_at = NULL;
+        BudgetAllocationOwner previous = budget_allocation_owner_enter(
+            parser->budget, parser->document.allocation_owner);
+        lxb_status_t status = lxb_html_document_parse_chunk(
+            parser->document.html, bytes + at, length - at);
+        lxb_dom_node_t *script = parser->closed_script;
+        parser->closed_script = NULL;
+        size_t next = length;
+        if (script != NULL) {
+            if (parser->tokenizer->state == document_parser_stop_state) {
+                parser->tokenizer->state = parser->resume_state;
+            } else if (parser->stop_at != NULL && parser->stop_at > bytes + at
+                       && parser->stop_at <= bytes + length) {
+                next = (size_t) (parser->stop_at - bytes);
+            }
+        }
+        if (status != LXB_STATUS_OK) ok = false;
+        else if (script != NULL)
+            ok = document_parser_script_closed(parser, script);
+        budget_allocation_owner_leave(parser->budget, previous);
+        at = next;
+        if (document_parser_input_waiting(parser)) break;
+    }
+    *consumed = at;
+    /* The caller owns callback-created consumers. Leave the transaction
+       intact so it can destroy those consumers before the O(1) parser
+       rollback. */
+    if (!ok) parser->failed = true;
+    return ok;
+}
+
+/* Bounds one drain: each round runs a script or parses waiting input. */
+#define DOCUMENT_PARSER_DRAIN_ROUNDS 65536u
+
+/* With no write() active: runs the pending parsing-blocking script, then
+   parses the input waiting behind it, until neither remains. */
+static bool document_parser_drain(DocumentParser *parser)
+{
+    if (parser->draining || parser->write_depth != 0) return true;
+    parser->draining = true;
+    bool ok = true;
+    size_t round = 0;
+    for (; ok && round < DOCUMENT_PARSER_DRAIN_ROUNDS; round++) {
+        lxb_dom_node_t *blocking = parser->blocking_script;
+        if (blocking != NULL) {
+            parser->blocking_script = NULL;
+            parser->insertion = 0;
+            BudgetAllocationOwner previous = budget_allocation_owner_enter(
+                parser->budget, parser->document.allocation_owner);
+            ok = document_parser_script_closed(parser, blocking);
+            budget_allocation_owner_leave(parser->budget, previous);
+            if (!ok) parser->failed = true;
+            continue;
+        }
+        if (parser->pending_length == 0) break;
+        /* Take the waiting input: what its scripts write goes in front of
+           what is left of it. */
+        char *input = parser->pending_input;
+        size_t length = parser->pending_length;
+        parser->pending_input = NULL;
+        parser->pending_length = 0;
+        parser->pending_capacity = 0;
+        parser->pending_reserved = length;
+        parser->insertion = 0;
+        size_t consumed = 0;
+        ok = document_parser_run(parser, input, length, &consumed);
+        parser->pending_reserved = 0;
+        if (ok && consumed < length
+            && !document_parser_pending_insert(
+                   parser, parser->pending_length, input + consumed,
+                   length - consumed)) {
+            parser->failed = true;
+            ok = false;
+        }
+        BudgetAllocationOwner previous = budget_allocation_owner_enter(
+            parser->budget, parser->document.allocation_owner);
+        budget_free(parser->budget, input);
+        budget_allocation_owner_leave(parser->budget, previous);
+    }
+    /* A page that keeps writing scripts that write scripts loses only the
+       written input still waiting. */
+    if (round == DOCUMENT_PARSER_DRAIN_ROUNDS)
+        document_parser_pending_release(parser);
+    parser->draining = false;
+    return ok;
+}
+
 static bool document_parser_feed_utf8(DocumentParser *parser,
                                       const char *data, size_t length)
 {
@@ -1923,20 +2363,20 @@ static bool document_parser_feed_utf8(DocumentParser *parser,
         if (window > DOCUMENT_PARSE_COOPERATE_BYTES) {
             window = DOCUMENT_PARSE_COOPERATE_BYTES;
         }
+        /* Each pass consumes at least one end tag. */
+        for (size_t done = 0; done < window;) {
+            size_t consumed = 0;
+            if (!document_parser_run(parser, data + offset + done,
+                                     window - done, &consumed)
+                || !document_parser_drain(parser)) {
+                return false;
+            }
+            done += consumed;
+        }
         BudgetAllocationOwner previous = budget_allocation_owner_enter(
             parser->budget, parser->document.allocation_owner);
-        lxb_status_t status = lxb_html_document_parse_chunk(
-            parser->document.html,
-            (const lxb_char_t *) data + offset, window);
-        if (status == LXB_STATUS_OK) document_parser_trim_tokenizer(parser);
+        document_parser_trim_tokenizer(parser);
         budget_allocation_owner_leave(parser->budget, previous);
-        if (status != LXB_STATUS_OK) {
-            /* The caller owns callback-created consumers. Leave the
-               transaction intact so it can destroy those consumers before
-               the O(1) parser rollback. */
-            parser->failed = true;
-            return false;
-        }
         offset += window;
         parser->bytes_fed += window;
         if (offset < length
@@ -1948,6 +2388,88 @@ static bool document_parser_feed_utf8(DocumentParser *parser,
     }
     parser->chunks_fed++;
     return true;
+}
+
+/* `document`'s parser while it is active and still taking input. The
+   tokenizer's callback context is the DocumentParser that installed
+   document_parser_token, which is how a script's document finds it. */
+static DocumentParser *document_active_parser(PocDocument *document)
+{
+    if (document == NULL || document->html == NULL) return NULL;
+    lxb_dom_document_t *dom = lxb_dom_interface_document(document->html);
+    lxb_html_parser_t *html_parser = dom == NULL ? NULL : dom->parser;
+    if (html_parser == NULL || html_parser->tkz == NULL
+        || html_parser->tkz->callback_token_done != document_parser_token)
+        return NULL;
+    DocumentParser *parser = html_parser->tkz->callback_token_ctx;
+    return parser != NULL && &parser->document == document
+            && parser->active && !parser->input_ended
+            && parser->tokenizer == html_parser->tkz
+        ? parser : NULL;
+}
+
+lxb_dom_node_t *document_parser_executing_script(PocDocument *document)
+{
+    DocumentParser *parser = document_active_parser(document);
+    return parser == NULL || parser->executing_count == 0 ? NULL
+        : parser->executing[parser->executing_count - 1];
+}
+
+DocumentWriteOutcome document_parser_write(PocDocument *document,
+                                           const char *markup,
+                                           size_t length)
+{
+    DocumentParser *parser = document_active_parser(document);
+    if (parser == NULL || parser->executing_count == 0)
+        return DOCUMENT_WRITE_NO_INSERTION_POINT;
+    if (parser->failed) return DOCUMENT_WRITE_FAILED;
+    if (parser->write_too_deep
+        || parser->write_depth >= DOCUMENT_PARSER_WRITE_DEPTH_LIMIT) {
+        parser->write_too_deep = true;
+        return DOCUMENT_WRITE_IGNORED;
+    }
+    if (length == 0) return DOCUMENT_WRITE_INSERTED;
+    size_t waiting = parser->pending_length
+        > SIZE_MAX - parser->pending_reserved ? SIZE_MAX
+        : parser->pending_length + parser->pending_reserved;
+    document_style_changed();
+    if (document_parser_input_waiting(parser)) {
+        /* Behind a pending parsing-blocking script (or the input it left
+           waiting): wait with the rest. */
+        if (waiting > DOCUMENT_PARSER_WRITE_PENDING_LIMIT
+            || length > DOCUMENT_PARSER_WRITE_PENDING_LIMIT - waiting)
+            return DOCUMENT_WRITE_REFUSED;
+        if (!document_parser_pending_insert(parser, parser->insertion,
+                                            markup, length))
+            return DOCUMENT_WRITE_REFUSED;
+        parser->insertion += length;
+        return DOCUMENT_WRITE_INSERTED;
+    }
+    parser->write_depth++;
+    size_t consumed = 0;
+    DocumentWriteOutcome outcome =
+        document_parser_run(parser, markup, length, &consumed)
+            ? DOCUMENT_WRITE_INSERTED : DOCUMENT_WRITE_FAILED;
+    if (outcome == DOCUMENT_WRITE_INSERTED && consumed < length) {
+        /* A written parser-blocking script stopped the tokenizer: the rest
+           of this write waits at the insertion point. */
+        size_t rest = length - consumed;
+        waiting = parser->pending_length
+            > SIZE_MAX - parser->pending_reserved ? SIZE_MAX
+            : parser->pending_length + parser->pending_reserved;
+        if (waiting > DOCUMENT_PARSER_WRITE_PENDING_LIMIT
+            || rest > DOCUMENT_PARSER_WRITE_PENDING_LIMIT - waiting)
+            outcome = DOCUMENT_WRITE_REFUSED;
+        else if (!document_parser_pending_insert(
+                     parser, parser->insertion, markup + consumed, rest))
+            outcome = DOCUMENT_WRITE_REFUSED;
+        else
+            parser->insertion += rest;
+    }
+    parser->write_depth--;
+    if (parser->write_depth == 0) parser->write_too_deep = false;
+    parser->document.parser_writes++;
+    return outcome;
 }
 
 bool document_parser_set_transport_encoding(DocumentParser *parser,
@@ -2110,6 +2632,12 @@ bool document_parser_end_input(DocumentParser *parser)
         parser->budget, parser->document.allocation_owner);
     lxb_status_t status = lxb_html_document_parse_chunk_end(
         parser->document.html);
+    /* EOF emits no end tag, so it closes no script (document_parser_run
+       runs those); never leave the stop state installed. */
+    parser->closed_script = NULL;
+    if (parser->tokenizer != NULL
+        && parser->tokenizer->state == document_parser_stop_state)
+        parser->tokenizer->state = parser->resume_state;
     if (parser->tokenizer != NULL
         && parser->original_token_callback != NULL) {
         lxb_html_tokenizer_callback_token_done_set(
@@ -2153,6 +2681,7 @@ bool document_parser_finish(DocumentParser *parser, PocDocument *document)
         return false;
     }
     parser->active = false;
+    document_parser_pending_release(parser);
     /* No parser insertion can follow EOF. Keep the armed state for the
        committed document but return the journal's storage now. */
     bool armed = parser->document.parser_insertions.armed;
@@ -3140,9 +3669,14 @@ bool document_set_element_inner_html(PocDocument *document,
 
     lxb_dom_document_t *dom = &document->html->dom_document;
     lxb_html_parser_t *streaming_parser = dom->parser;
-    bool parser_active = streaming_parser != NULL
-        && lxb_html_parser_state(streaming_parser)
-               == LXB_HTML_PARSER_STATE_PROCESS;
+    /* A streaming parser that failed (a script may still run until its
+       page is abandoned) is kept out of the fragment parse too: Lexbor
+       would clean and reuse it under the document's DocumentParser. */
+    lxb_html_parser_state_t streaming_state = streaming_parser == NULL
+        ? LXB_HTML_PARSER_STATE_BEGIN
+        : lxb_html_parser_state(streaming_parser);
+    bool parser_active = streaming_state == LXB_HTML_PARSER_STATE_PROCESS
+        || streaming_state == LXB_HTML_PARSER_STATE_ERROR;
     if (parser_active) dom->parser = NULL;
 
     bool updated = lxb_html_element_inner_html_set(
@@ -3552,9 +4086,8 @@ const char *document_attribute(lxb_dom_node_t *node, const char *name,
     if (node == NULL || node->type != LXB_DOM_NODE_TYPE_ELEMENT || name == NULL) {
         return NULL;
     }
-    return (const char *) lxb_dom_element_get_attribute(
-        lxb_dom_interface_element(node), (const lxb_char_t *) name,
-        strlen(name), length);
+    lxb_dom_attr_t *attr = document_attribute_node(node, name, strlen(name));
+    return attr == NULL ? NULL : (const char *) lxb_dom_attr_value(attr, length);
 }
 
 bool document_is_refresh_meta(lxb_dom_node_t *node)

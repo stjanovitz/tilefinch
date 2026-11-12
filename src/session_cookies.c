@@ -51,23 +51,80 @@ static int64_t days_from_civil(int year, unsigned month, unsigned day)
     return (int64_t) era * 146097 + (int64_t) doe - 719468;
 }
 
+static bool cookie_date_delimiter(unsigned char c)
+{
+    return c == 0x09 || (c >= 0x20 && c <= 0x2f) || (c >= 0x3b && c <= 0x40)
+           || (c >= 0x5b && c <= 0x60) || (c >= 0x7b && c <= 0x7e);
+}
+
+/* Reads one to `maximum` leading digits; the next byte must not be a digit. */
+static bool cookie_date_number(const char **cursor, const char *end,
+                               unsigned maximum, unsigned *value)
+{
+    const char *at = *cursor;
+    unsigned digits = 0, number = 0;
+    while (at < end && *at >= '0' && *at <= '9') {
+        if (++digits > maximum) return false;
+        number = number * 10u + (unsigned) (*at++ - '0');
+    }
+    if (digits == 0) return false;
+    *cursor = at;
+    *value = number;
+    return true;
+}
+
+static bool cookie_date_time(const char *at, const char *end, unsigned *hour,
+                             unsigned *minute, unsigned *second)
+{
+    return cookie_date_number(&at, end, 2, hour)
+        && at < end && *at++ == ':'
+        && cookie_date_number(&at, end, 2, minute)
+        && at < end && *at++ == ':'
+        && cookie_date_number(&at, end, 2, second);
+}
+
+/* The RFC 6265 section 5.1.1 cookie-date algorithm: servers use several forms
+   (accounts.google.com sends "Tue, 07-Nov-2028 20:40:33 GMT"), and misreading
+   one turns an expiry that deletes a cookie into a session cookie. */
 static bool parse_cookie_date(const char *value, size_t length,
                               int64_t *epoch)
 {
-    char copy[96];
-    if (length == 0 || length >= sizeof(copy)) return false;
-    memcpy(copy, value, length); copy[length] = '\0';
-    char weekday[4] = {0}, month_name[4] = {0}, zone[4] = {0};
-    int day, year, hour, minute, second;
-    if (sscanf(copy, "%3[^,], %d %3s %d %d:%d:%d %3s", weekday,
-               &day, month_name, &year, &hour, &minute, &second, zone) != 8
-        || strcasecmp(zone, "GMT") != 0) return false;
-    int month = month_number(month_name);
-    if (month == 0 || day < 1 || day > 31 || year < 1601
-        || hour < 0 || hour > 23 || minute < 0 || minute > 59
-        || second < 0 || second > 60) return false;
-    *epoch = days_from_civil(year, (unsigned) month, (unsigned) day) * 86400
-             + hour * 3600 + minute * 60 + second;
+    if (length == 0 || length >= 96u) return false;
+    bool have_time = false, have_day = false, have_month = false,
+         have_year = false;
+    unsigned hour = 0, minute = 0, second = 0, day = 0, month = 0, year = 0;
+    const char *at = value, *end = value + length;
+    while (at < end) {
+        while (at < end && cookie_date_delimiter((unsigned char) *at)) at++;
+        const char *token = at;
+        while (at < end && !cookie_date_delimiter((unsigned char) *at)) at++;
+        if (token == at) break;
+        const char *number = token;
+        if (!have_time
+            && cookie_date_time(token, at, &hour, &minute, &second)) {
+            have_time = true;
+        } else if (!have_day
+                   && cookie_date_number(&number, at, 2, &day)) {
+            have_day = true;
+        } else if (!have_month && at - token >= 3
+                   && (month = (unsigned) month_number(token)) != 0) {
+            have_month = true;
+        } else if (!have_year
+                   && cookie_date_number(&number, at, 4, &year)
+                   && number - token >= 2) {
+            have_year = true;
+        }
+    }
+    if (!have_time || !have_day || !have_month || !have_year) return false;
+    if (year <= 69) year += 2000;
+    else if (year <= 99) year += 1900;
+    static const unsigned char month_days[12] = {
+        31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31
+    };
+    if (day < 1 || day > month_days[month - 1] || year < 1601
+        || hour > 23 || minute > 59 || second > 59) return false;
+    *epoch = days_from_civil((int) year, month, day) * 86400
+             + (int64_t) hour * 3600 + minute * 60 + second;
     return true;
 }
 
@@ -365,14 +422,20 @@ static bool cookie_candidates(const BrowserCookieStore *store, const char *url,
         (void) tilefinch_url_site_key(top_level, partition_key,
                                   sizeof(partition_key));
     }
-    bool same_site = request == NULL
-        || (facts != NULL ? facts->same_site
-                          : tilefinch_request_same_site(request));
+    TilefinchRequestFacts analyzed;
+    if (request != NULL && facts == NULL) {
+        if (!tilefinch_request_context_analyze(request, &analyzed))
+            analyzed = (TilefinchRequestFacts) {0};
+        facts = &analyzed;
+    }
+    bool same_site = request == NULL || facts->same_site;
+    /* SameSite needs the requesting document to be same-site with the top
+       level as well (RFC 6265bis site for cookies); third-party admission
+       compares only the top level with the target. */
+    bool cookie_same_site = request == NULL || facts->cookie_same_site;
     bool third_party_allowed = same_site
         || cookie_store_third_party_allowed(store, request);
-    bool lax_allowed = request == NULL
-        || (facts != NULL ? facts->allows_lax_cookie
-                          : tilefinch_request_allows_lax_cookie(request));
+    bool lax_allowed = request == NULL || facts->allows_lax_cookie;
     size_t count = 0;
     for (size_t i = 0; i < store->cookie_capacity; i++) {
         const BrowserCookieEntry *entry = &store->cookies[i];
@@ -387,7 +450,7 @@ static bool cookie_candidates(const BrowserCookieStore *store, const char *url,
                    parsed->path, parsed->path_length,
                    browser_cookie_entry_path(entry), entry->path_length)
             || (entry->same_site == BROWSER_COOKIE_SAME_SITE_STRICT
-                && !same_site)
+                && !cookie_same_site)
             || ((entry->same_site == BROWSER_COOKIE_SAME_SITE_LAX
                  || entry->same_site == BROWSER_COOKIE_SAME_SITE_DEFAULT)
                 && !lax_allowed)
@@ -1066,10 +1129,28 @@ static bool cookie_set_raw(BrowserCookieStore *store,
     size_t old_length = newly_created ? 0 : entry->value_length;
     size_t old_long_path_length =
         grow || entry->long_path == NULL ? 0 : entry->path_length;
-    if (*store->cookie_bytes - old_length + value_length
-        > store->maximum_cookie_bytes) {
+    /* Over the byte quota the oldest applicable cookies make room, under the
+       same rule as a slot: the newest cookie is the one the site needs next.
+       Refused only when eviction could not free enough. */
+    size_t retained_bytes = *store->cookie_bytes - old_length;
+    if (value_length > store->maximum_cookie_bytes) {
         cookie_diagnostic_add(store, COOKIE_DIAGNOSTIC_BYTES);
         return false;
+    }
+    size_t room = store->maximum_cookie_bytes - value_length;
+    if (retained_bytes > room) {
+        size_t evictable_bytes = 0;
+        for (size_t i = 0; i < store->cookie_capacity; i++) {
+            const BrowserCookieEntry *candidate = &store->cookies[i];
+            if (candidate->value != NULL && candidate != entry
+                && (from_http || !candidate->http_only)
+                && (secure || parsed.secure || !candidate->secure))
+                evictable_bytes += candidate->value_length;
+        }
+        if (retained_bytes - evictable_bytes > room) {
+            cookie_diagnostic_add(store, COOKIE_DIAGNOSTIC_BYTES);
+            return false;
+        }
     }
     size_t new_long_path_length =
         path_length >= sizeof(entry->path) ? path_length : 0;
@@ -1112,6 +1193,23 @@ static bool cookie_set_raw(BrowserCookieStore *store,
         newly_created = true;
         old_length = 0;
         old_long_path_length = 0;
+    }
+    while (*store->cookie_bytes - old_length > room) {
+        BrowserCookieEntry *oldest = NULL;
+        for (size_t i = 0; i < store->cookie_capacity; i++) {
+            BrowserCookieEntry *candidate = &store->cookies[i];
+            if (candidate->value != NULL && candidate != entry
+                && (from_http || !candidate->http_only)
+                && (secure || parsed.secure || !candidate->secure)
+                && (oldest == NULL
+                    || candidate->creation_sequence
+                           < oldest->creation_sequence)) {
+                oldest = candidate;
+            }
+        }
+        if (oldest == NULL) break; /* Admitted above: unreachable. */
+        cookie_diagnostic_add(store, COOKIE_DIAGNOSTIC_EVICTION);
+        clear_cookie_entry(store, oldest);
     }
     size_t creation_sequence = entry->creation_sequence;
     if (newly_created) {

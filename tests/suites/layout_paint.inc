@@ -2269,6 +2269,105 @@ static int test_first_text_data_deep_walk(Budget *budget)
     return 0;
 }
 
+/* The option a single-choice select shows, the long way: its first
+   selected option in tree order, else its first option. */
+static lxb_dom_node_t *select_option_oracle(lxb_dom_node_t *select)
+{
+    lxb_dom_node_t *first = NULL, *at = select->first_child;
+    while (at != NULL) {
+        if (at->type == LXB_DOM_NODE_TYPE_ELEMENT
+            && document_node_is_tag(at, LXB_TAG_OPTION)) {
+            if (first == NULL) first = at;
+            size_t length = 0;
+            const char *state = document_attribute(
+                at, "data-tilefinch-option-selected", &length);
+            bool selected = state != NULL
+                ? length == 4 && memcmp(state, "true", 4) == 0
+                : lxb_dom_element_has_attribute(lxb_dom_interface_element(at),
+                      (const lxb_char_t *) "selected", 8);
+            if (selected) return at;
+        }
+        if (at->first_child != NULL) { at = at->first_child; continue; }
+        while (at != select && at->next == NULL) at = at->parent;
+        if (at == select) break;
+        at = at->next;
+    }
+    return first;
+}
+
+/* Each option of a single-choice select asked which option the select
+   shows by walking the whole select: a 4,000-entry list took 1.3 s on the
+   host. Every option still gets the answer the whole walk gives (first
+   selected, else first; optgroups, the internal selection attribute and
+   several selected options included), and a list costs a few walks of
+   itself, not one per option. */
+static int test_select_options_shown_in_linear_work(Budget *budget)
+{
+    enum { OPTIONS = 2000 };
+    static const char *const shapes[] = {
+        "none", "middle", "last", "many", "groups", "state", "multiple"
+    };
+    for (size_t shape = 0; shape < sizeof(shapes) / sizeof(shapes[0]);
+         shape++) {
+        static char html[OPTIONS * 96 + 512];
+        size_t used = (size_t) snprintf(html, sizeof(html),
+            "<!doctype html><body><select id=s%s>",
+            shape == 6 ? " multiple" : "");
+        for (size_t i = 0; i < OPTIONS; i++) {
+            const char *mark = "";
+            if ((shape == 1 && i == OPTIONS / 2) || (shape == 2 && i == OPTIONS - 1)
+                || (shape == 3 && i >= OPTIONS / 3 && i % 3 != 0)
+                || (shape == 4 && i == OPTIONS / 2 + 7)
+                || (shape == 6 && i % 5 == 0))
+                mark = " selected";
+            if (shape == 5 && i == 10) mark = " selected";
+            if (shape == 5 && i == 900) mark = " data-tilefinch-option-selected=true";
+            if (shape == 5 && i == 10) mark = " selected data-tilefinch-option-selected=false";
+            if (shape == 4 && i % 100 == 0)
+                used += (size_t) snprintf(html + used, sizeof(html) - used,
+                    "%s<optgroup label=g%zu>", i == 0 ? "" : "</optgroup>", i);
+            used += (size_t) snprintf(html + used, sizeof(html) - used,
+                "<option id=o%zu%s>Option %zu</option>", i, mark, i);
+        }
+        used += (size_t) snprintf(html + used, sizeof(html) - used,
+            "%s</select></body>", shape == 4 ? "</optgroup>" : "");
+        CHECK(used < sizeof(html));
+        PocDocument document = {0};
+        Stylesheet stylesheet = {0};
+        CHECK(document_parse(&document, budget, html, used, 69)
+              && stylesheet_build(&stylesheet, budget, &document, 480));
+        lxb_dom_node_t *select = find_id(lxb_dom_interface_node(document.html), "s");
+        CHECK(select != NULL);
+        lxb_dom_node_t *shown = shape == 6 ? NULL : select_option_oracle(select);
+        size_t displayed = 0, mismatches = 0;
+        uint64_t visits = stylesheet.select_option_visits;
+        for (size_t i = 0; i < OPTIONS; i++) {
+            char id[16];
+            snprintf(id, sizeof(id), "o%zu", i);
+            lxb_dom_node_t *option = find_id(select, id);
+            CHECK(option != NULL);
+            bool expected = shape == 6 || option == shown;
+            bool actual = option_is_displayed_by_default(&stylesheet, option);
+            if (actual) displayed++;
+            if (actual != expected) mismatches++;
+        }
+        visits = stylesheet.select_option_visits - visits;
+        /* A few walks of the select (each option's text, its element
+           and the optgroups), not one per option. */
+        bool linear = visits <= 8u * OPTIONS;
+        if (mismatches != 0 || displayed != (shape == 6 ? OPTIONS : 1u)
+            || !linear)
+            fprintf(stderr, "select %s: displayed %zu mismatches %zu "
+                    "visits %llu\n", shapes[shape], displayed, mismatches,
+                    (unsigned long long) visits);
+        CHECK(mismatches == 0 && displayed == (shape == 6 ? OPTIONS : 1u));
+        CHECK(linear);
+        stylesheet_destroy(&stylesheet);
+        document_destroy(&document);
+    }
+    return 0;
+}
+
 static int test_select_option_deep_walk(Budget *budget)
 {
     static const char page[] =
@@ -2304,7 +2403,7 @@ static int test_select_option_deep_walk(Budget *budget)
                  cursor, lxb_dom_interface_node(option))
              == LXB_DOM_EXCEPTION_OK);
     document_allocation_owner_leave(&document, previous);
-    CHECK(option_is_displayed_by_default(lxb_dom_interface_node(option)));
+    CHECK(option_is_displayed_by_default(NULL, lxb_dom_interface_node(option)));
     document_destroy(&document);
     CHECK(budget->current == baseline);
     return 0;

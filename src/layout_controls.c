@@ -660,6 +660,7 @@ bool layout_block_control_paint(LayoutContext *context, lxb_dom_node_t *node,
                 .text = value,
                 .text_length = (uint32_t) value_length,
             };
+            size_t text_start = context->layout->count;
             if (text.width > 0
                 && layout_control_text_style(context, node, style, placeholder_value, &text)
                 && (!layout_add_text_shadow_commands(
@@ -668,6 +669,7 @@ bool layout_block_control_paint(LayoutContext *context, lxb_dom_node_t *node,
                            context->layout, text) == NULL)) {
                 return false;
             }
+            layout_bidi_control_text(context, node, style, text_start);
         }
     }
     if (block_input

@@ -1699,6 +1699,130 @@ static bool test_json_media_replay_delay(const char *directory, size_t index)
         && fputs(at + strlen(wanted), file) >= 0;
     return fclose(file) == 0 && ok;
 }
+
+/* A parser-blocking <script src> is a request the browser thread blocks
+   on, like a sync XHR or a module import: nothing it waits behind frees
+   while it waits, because a PSP worker descriptor frees only when its
+   owning scheduler is pumped. The replay lane stands in for the worker
+   with the PSP's descriptors. Four page loads of another scheduler that
+   nothing pumps while the parser waits (images, say) and the document's
+   own stream, still arriving, hold all five descriptors ordinary page
+   requests may use. The script still loads at once and the parse goes on:
+   its speculative preload, which could not start, gives way, and the
+   parser's request takes the slot and descriptor kept for blocking
+   requests. Before, the preload wait ran to its deadline (5 s) and the
+   request then waited out its timeout and failed (20 s in all). */
+static int test_parser_blocking_script_beside_stuck_loads(void)
+{
+    enum { STUCK = 4, PAD = 256 * 1024 };
+    static const char head[] =
+        "<!doctype html><body><p>lane</p>"
+        "<script src=\"https://lane.test/app.js\"></script>"
+        "<script>globalThis.afterRan=globalThis.appRan===true</script>"
+        "<p>after</p><!--";
+    static const char tail[] = "--></body>";
+    /* Long enough that the document is still arriving, and so still on its
+       own descriptor, when the parser reaches the script. */
+    static char page[sizeof(head) + PAD + sizeof(tail)];
+    memcpy(page, head, sizeof(head) - 1u);
+    memset(page + sizeof(head) - 1u, 'x', PAD);
+    memcpy(page + sizeof(head) - 1u + PAD, tail, sizeof(tail));
+    JsonMediaRecord records[STUCK + 2] = {
+        {"https://lane.test/", "text/html", page, NULL},
+        /* Not stored, so the speculative preload cannot answer the
+           parser's own request. */
+        {"https://lane.test/app.js", "text/javascript",
+         "globalThis.appRan=true", "cache-control: no-store"},
+    };
+    static char stuck_urls[STUCK][64];
+    for (size_t i = 0; i < STUCK; i++) {
+        snprintf(stuck_urls[i], sizeof(stuck_urls[i]),
+                 "https://lane.test/image-%zu.png", i);
+        records[i + 2] = (JsonMediaRecord) {
+            stuck_urls[i], "image/png", "png", NULL
+        };
+    }
+    char directory[128] = {0}, error[256] = {0};
+    CHECK(write_json_media_replay(directory, records, STUCK + 2u)
+          && fetch_trace_replay_begin_response_keyed(
+                 directory, error, sizeof(error)));
+    TilefinchTestFaults *faults = tilefinch_test_faults();
+    faults->replay_lane_worker_descriptors = true;
+    faults->replay_lane_runs_page_hops = true;
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    CHECK(browser_config_apply_psp_app_defaults(&config));
+    BrowserEngine *engine = browser_engine_create(
+        &config, error, sizeof(error));
+    CHECK(engine != NULL);
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    FetchSchedulerDomain *domain = fetch_scheduler_domain_create(
+        navigation->budget, STUCK);
+    FetchScheduler *images = domain == NULL ? NULL
+        : fetch_scheduler_create_in_domain(domain, STUCK, STUCK * 4096u);
+    fetch_scheduler_domain_release(domain);
+    CHECK(images != NULL
+          && fetch_scheduler_enable_background_transport(images, true));
+    static const FetchRequest image_request = {
+        .method = "GET", .accept = "image/png",
+        .credentials = FETCH_CREDENTIALS_OMIT
+    };
+    FetchTraceReplayStats before = {0}, held = {0};
+    (void) fetch_trace_replay_stats(&before);
+    uint64_t hops[STUCK] = {0};
+    for (size_t i = 0; i < STUCK; i++) {
+        hops[i] = fetch_scheduler_enqueue(images, stuck_urls[i],
+                                          &image_request, 4096u, 30000);
+        CHECK(hops[i] != 0);
+    }
+    (void) fetch_trace_replay_stats(&held);
+    size_t on_worker = held.media_lane_request_count
+        - before.media_lane_request_count;
+    uint64_t started_us = tilefinch_platform_monotonic_time_us();
+    bool loaded = browser_engine_load_url_with_limits(
+        engine, "https://lane.test/", 4u * MIB, 4000, true);
+    uint64_t elapsed_us = tilefinch_platform_monotonic_time_us() - started_us;
+    navigation = browser_engine_navigation(engine);
+    ScriptResult probe = {0};
+    bool probed = navigation->page.runtime != NULL
+        && script_runtime_evaluate_diagnostic(
+            navigation->page.runtime,
+            "globalThis.pocSummary=[globalThis.appRan===true,"
+            "globalThis.afterRan===true].join()",
+            "https://lane.test/probe.js", &probe);
+    bool ok = loaded && probed && on_worker == STUCK
+        && strcmp(probe.summary, "true,true") == 0
+        && navigation->script_failed == 0u
+        && elapsed_us < UINT64_C(1000000);
+    fprintf(stderr,
+            "parser-blocking script beside %d held loads (%zu on the "
+            "worker): loaded=%d summary=%s failed=%zu in %llu us\n",
+            STUCK, on_worker, loaded, probed ? probe.summary : "<none>",
+            navigation->script_failed, (unsigned long long) elapsed_us);
+    /* The held loads still finish once their owner pumps. */
+    for (size_t i = 0; i < STUCK; i++) {
+        FetchResult result = {0};
+        bool success = false;
+        for (unsigned turn = 0; turn < 64u
+             && !fetch_scheduler_take(images, hops[i], &success, &result);
+             turn++)
+            (void) fetch_scheduler_pump(images, STUCK, 1);
+        fetch_result_destroy(&result);
+    }
+    CHECK(fetch_scheduler_pending(images) == 0);
+    fetch_scheduler_destroy(images);
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    faults->replay_lane_worker_descriptors = false;
+    faults->replay_lane_runs_page_hops = false;
+    fetch_trace_end();
+    remove_json_media_replay(directory, STUCK + 2u);
+    CHECK(ok);
+    return 0;
+}
+
 #define LIVE_PLAYER_PAGE \
     "<!doctype html><html><head><title>Talk</title>" \
     "<script type=\"application/ld+json\">{\"@context\":" \
@@ -3058,6 +3182,144 @@ static int computed_style_dump(const char *fixture_path,
     return 0;
 }
 
+static char *geometry_refusal_page(size_t cells)
+{
+    static const char head[] =
+        "<!doctype html><html><head><style>.cell{padding:1px;margin:1px}"
+        "</style></head><body>";
+    static const char cell[] = "<div class=cell>cell text</div>";
+    size_t capacity = sizeof(head) + cells * (sizeof(cell) - 1u)
+        + sizeof("</body></html>");
+    char *page = malloc(capacity);
+    if (page == NULL) return NULL;
+    char *at = page;
+    memcpy(at, head, sizeof(head) - 1u);
+    at += sizeof(head) - 1u;
+    for (size_t i = 0; i < cells; i++) {
+        memcpy(at, cell, sizeof(cell) - 1u);
+        at += sizeof(cell) - 1u;
+    }
+    memcpy(at, "</body></html>", sizeof("</body></html>"));
+    return page;
+}
+
+/* A geometry read over a dirty layout builds one. When the budget refuses
+   that build, the next read on the same inputs must not pay for another
+   partial build ending at the same refusal: a loop over a page's cells would
+   multiply a layout by its reads. */
+static int test_geometry_refusal_not_retried_read_by_read(void)
+{
+    char *page = geometry_refusal_page(2000u);
+    CHECK(page != NULL);
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.javascript.enabled = true;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL && browser_engine_commit_html(engine,
+        "https://geometry-refusal.test/", page, strlen(page), true));
+    free(page);
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    ScriptRuntime *runtime = navigation->page.runtime;
+    Budget *budget = navigation->budget;
+    CHECK(runtime != NULL);
+
+    /* Leave far less room than this page's layout needs. */
+    document_note_connected_mutation(&navigation->page.document);
+    size_t room = 96u * 1024u;
+    CHECK(budget_remaining(budget) > room);
+    void *ballast = budget_malloc(budget, budget_remaining(budget) - room);
+    CHECK(ballast != NULL);
+    size_t failures = budget->failure_count;
+    CHECK(!script_runtime_flush_geometry_layout(runtime, &navigation->viewport));
+    CHECK(budget->failure_count > failures);
+
+    /* The same inputs and the same room: answered without building. */
+    failures = budget->failure_count;
+    size_t allocations = budget->allocation_count;
+    for (int read = 0; read < 8; read++) {
+        CHECK(!script_runtime_flush_geometry_layout(
+            runtime, &navigation->viewport));
+        CHECK(budget->failure_count == failures);
+        CHECK(budget->allocation_count == allocations);
+    }
+
+    /* A DOM change is a new input, tried once. */
+    document_note_connected_mutation(&navigation->page.document);
+    CHECK(!script_runtime_flush_geometry_layout(runtime, &navigation->viewport));
+    CHECK(budget->failure_count > failures);
+    failures = budget->failure_count;
+    CHECK(!script_runtime_flush_geometry_layout(runtime, &navigation->viewport));
+    CHECK(budget->failure_count == failures);
+
+    /* Room coming back is too, and script reads the current layout again. */
+    budget_free(budget, ballast);
+    CHECK(script_runtime_flush_geometry_layout(runtime, &navigation->viewport));
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+/* A layout reuse cache is an accelerator: it must not cost script the current
+   geometry. Across a range of room just short of this page's layout, each
+   read after a resize answers the new height unless the cache is already
+   gone and the build still does not fit. */
+static int test_geometry_refusal_gives_up_reuse_cache(void)
+{
+    char *page = geometry_refusal_page(3000u);
+    CHECK(page != NULL);
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.javascript.enabled = true;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL && browser_engine_commit_html(engine,
+        "https://geometry-refusal.test/", page, strlen(page), true));
+    free(page);
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    Budget *budget = navigation->budget;
+    size_t recoveries = 0;
+    int height = 40;
+    /* Above the pressure check that evicts the cache before the build. */
+    for (size_t room = 2048u * 1024u; room >= 960u * 1024u;
+         room -= 64u * 1024u) {
+        CHECK(navigation_relayout(navigation));
+        CHECK(navigation->page.layout_reuse != NULL);
+        height++;
+        char resize[128], read[128];
+        snprintf(resize, sizeof(resize),
+            "document.querySelector('.cell').style.height='%dpx'", height);
+        snprintf(read, sizeof(read),
+            "globalThis.pocSummary=String("
+            "document.querySelector('.cell').offsetHeight)");
+        ScriptResult result = {0};
+        CHECK(script_runtime_evaluate_diagnostic(navigation->page.runtime,
+            resize, "<resize>", &result) && result.success);
+        CHECK(budget_remaining(budget) > room);
+        void *ballast = budget_malloc(budget, budget_remaining(budget) - room);
+        CHECK(ballast != NULL);
+        size_t failures = budget->failure_count;
+        memset(&result, 0, sizeof(result));
+        CHECK(script_runtime_evaluate_diagnostic(navigation->page.runtime,
+            read, "<read>", &result) && result.success);
+        bool refused = budget->failure_count > failures;
+        bool current = atoi(result.summary) == height + 2;
+        budget_free(budget, ballast);
+        if (!current) CHECK(navigation->page.layout_reuse == NULL);
+        if (refused && current && navigation->page.layout_reuse == NULL) {
+            recoveries++;
+            break;
+        }
+    }
+    /* The range does reach builds which only fit once the cache is gone. */
+    CHECK(recoveries > 0);
+    browser_engine_destroy(engine);
+    return 0;
+}
+
 /* Stylesheet transitions reach getComputedStyle through the cascade, and a
    page waiting on transitionend gets it whether the listener came before or
    after the class change, through an ancestor's class, or from an inline
@@ -3655,12 +3917,12 @@ static int test_inline_style_mutations_skip_stylesheet_rebuild(void)
     return 0;
 }
 
-/* __tilefinchTransitionSnapshot hands four fresh arrays to its result. Any
-   of its element insertions can fail: a refused allocation, or (as here,
-   deterministically) an author setter on Array.prototype that throws. Each
-   insertion is failed in turn, and after a collection every array the call
-   built must be gone. (The heap total is too noisy between evaluations to
-   show a few leaked arrays; weak references name each one.) */
+/* __tilefinchTransitionSnapshot fills five fresh arrays (properties,
+   durations, delays, values, and the result holding them with the rendered
+   flag). It defines their elements: an author accessor on Array.prototype
+   that throws (which used to fail an insertion part way, deterministically)
+   never runs, and the result is complete. Its refusal paths are now reached
+   only by a refused allocation. */
 static int test_transition_snapshot_refusal_releases_arrays(void)
 {
     static const char html[] =
@@ -3669,55 +3931,25 @@ static int test_transition_snapshot_refusal_releases_arrays(void)
     TransitionPage page;
     CHECK(transition_page_open(&page, html, sizeof(html) - 1u));
     ScriptResult result = {0};
-    /* The setters stand in for ordinary insertion until call number
-       __failAt, which throws, and note every array they see. They exist
-       only while __snap runs. */
     CHECK(script_runtime_evaluate_diagnostic(page.runtime,
         "(()=>{const define=Object.defineProperty,remove=Reflect."
         "deleteProperty,snapshot=__tilefinchTransitionSnapshot,"
         "handle=document.getElementById('a').__handle,"
-        "names=['opacity','transform','color','display'];"
-        "let calls=0,seen=new Set();globalThis.__failAt=-1;"
-        "globalThis.__refs=[];globalThis.__calls=0;"
-        "const note=(value)=>{if(Array.isArray(value)&&!seen.has(value)){"
-        "seen.add(value);define(__refs,__refs.length,{value:new WeakRef(value),"
-        "enumerable:true,configurable:true,writable:true})}},"
-        "install=()=>{for(let i=0;i<8;i++)define(Array.prototype,i,"
-        "{configurable:true,set(value){note(this);note(value);"
-        "if(calls++===__failAt)throw 1;"
-        "define(this,i,{value,writable:true,enumerable:true,"
-        "configurable:true})}})},"
-        "uninstall=()=>{for(let i=0;i<8;i++)remove(Array.prototype,i)};"
-        "globalThis.__snap=()=>{calls=0;seen=new Set();__refs=[];install();"
-        "try{snapshot(handle,names)}catch{}finally{uninstall()}"
-        "seen=null;__calls=calls};__snap();"
-        "globalThis.pocSummary=String(__calls)})()",
-        "<snapshot-setup>", &result) && result.success);
-    unsigned insertions = (unsigned) strtoul(result.summary, NULL, 10);
-    /* 3 transitions x 3 lists, 4 values, 5 result slots (rendered flag). */
-    CHECK(insertions == 18u);
-    unsigned leaks = 0;
-    for (unsigned fail_at = 0; fail_at <= insertions; fail_at++) {
-        char source[64];
-        snprintf(source, sizeof(source), "__failAt=%u;__snap()", fail_at);
-        CHECK(script_runtime_evaluate_diagnostic(page.runtime, source,
-                                                 "<snapshot-refusal>",
-                                                 &result) && result.success);
-        (void) script_runtime_collect_and_trim(page.runtime);
-        CHECK(script_runtime_evaluate_diagnostic(page.runtime,
-            "globalThis.pocSummary=__refs.length+' '+"
-            "__refs.filter(ref=>ref.deref()!==undefined).length",
-            "<snapshot-live>", &result) && result.success);
-        unsigned seen = 0, live = 0;
-        CHECK(sscanf(result.summary, "%u %u", &seen, &live) == 2);
-        CHECK(seen >= 1u && seen <= 5u);
-        if (live != 0) {
-            leaks++;
-            fprintf(stderr, "snapshot insertion %u failed: %u of %u arrays "
-                    "still live\n", fail_at, live, seen);
-        }
-    }
-    CHECK(leaks == 0);
+        "names=['opacity','transform','color','display'];let calls=0,r;"
+        "for(let i=0;i<8;i++)define(Array.prototype,i,{configurable:true,"
+        "set(){calls++;throw 1}});"
+        "try{r=snapshot(handle,names)}finally{"
+        "for(let i=0;i<8;i++)remove(Array.prototype,i)}"
+        "const own=(o,k)=>Object.prototype.hasOwnProperty.call(o,k);"
+        "const lists=Array.isArray(r)&&[0,1,2,3].every(i=>own(r,i)"
+        "&&Array.isArray(r[i]));"
+        "globalThis.pocSummary=calls+' '+(lists?r[0].length+','+r[1].length"
+        "+','+r[2].length+','+r[3].length+','+own(r,4):'bad')})()",
+        "<snapshot-setters>", &result) && result.success);
+    if (strcmp(result.summary, "0 3,3,3,4,true") != 0)
+        fprintf(stderr, "transition snapshot under setters: %s\n",
+                result.summary);
+    CHECK(strcmp(result.summary, "0 3,3,3,4,true") == 0);
     CHECK(transition_page_close(&page));
     return 0;
 }
@@ -3767,6 +3999,124 @@ static int transition_timer_exhaustion(unsigned free_slots)
         "2o:end,2o:run,2o:start,2v:end,2v:run,2v:start|false,false");
     CHECK(transition_page_close(&page) && ok);
     return 0;
+}
+
+/* animationend comes on the same clock as the timers that deliver it:
+   scheduler milliseconds, whether or not the wall clock moved. The page has
+   filled the author timer table in the second run, which must not strand
+   the event: nothing would ever arm it again. */
+static int animation_lifecycle_run(bool fill_timers)
+{
+    static const char html[] =
+        "<!doctype html><style>@keyframes pop{from{opacity:0}to{opacity:1}}"
+        ".on{animation:pop 60ms linear 1}"
+        ".two{animation:pop 40ms linear 50ms 2}"
+        "</style><body><div id=a>a</div><div id=b>b</div></body>";
+    TransitionPage page;
+    CHECK(transition_page_open(&page, html, sizeof(html) - 1u));
+    char source[1024];
+    snprintf(source, sizeof(source),
+        "(()=>{const $=id=>document.getElementById(id),log={a:[],b:[]};"
+        "const at=()=>__tilefinchSchedulerTime();let begun;"
+        "for(const id of ['a','b'])for(const type of ['animationstart',"
+        "'animationiteration','animationend'])$(id).addEventListener(type,e=>{"
+        "log[id].push(e.type.slice(9)+'@'+Math.round((at()-begun)/10)*10);"
+        "globalThis.pocSummary=log.a.join()+'|'+log.b.join()});"
+        "%s"
+        "globalThis.pocSummary='pending';begun=at();"
+        "$('a').className='on';$('b').className='two';})()",
+        fill_timers
+            ? "const fill=[];let id;while((id=setTimeout(()=>{},1e7)))"
+              "fill.push(id);globalThis.__fill=fill;"
+            : "");
+    ScriptResult result = {0};
+    bool ok = script_runtime_evaluate_diagnostic(
+        page.runtime, source, "<animation-lifecycle>", &result) && result.success;
+    if (!ok) fprintf(stderr, "animation lifecycle: %s\n", result.error);
+    /* The scan runs in a render fixup: start times include its frame. */
+    for (unsigned tick = 0; ok && tick < 40; tick++)
+        ok = script_runtime_advance(page.runtime, 10, 16, &result);
+    ok = ok && script_runtime_evaluate_diagnostic(
+        page.runtime, "globalThis.pocSummary", "<animation-log>", &result);
+    /* Each event lands within two pumps of its authored time. */
+    const char *log = result.summary;
+    bool shaped = ok && strstr(log, "start@") != NULL;
+    int a_start = -1, a_end = -1, b_start = -1, b_iter = -1, b_end = -1;
+    if (shaped) {
+        shaped = sscanf(log, "start@%d,end@%d|start@%d,iteration@%d,end@%d",
+                        &a_start, &a_end, &b_start, &b_iter, &b_end) == 5;
+    }
+    bool timed = shaped && a_start <= 20 && a_end >= 60 && a_end <= 80
+        && b_start >= 50 && b_start <= 70 && b_iter >= 90 && b_iter <= 110
+        && b_end >= 130 && b_end <= 150;
+    if (!timed)
+        fprintf(stderr, "animation lifecycle (fill=%d): got %s\n",
+                fill_timers ? 1 : 0, log);
+    CHECK(transition_page_close(&page) && timed);
+    return 0;
+}
+
+static int test_animation_lifecycle_clock(void)
+{
+    int failed = animation_lifecycle_run(false);
+    failed |= animation_lifecycle_run(true);
+    return failed;
+}
+
+/* Transition events bubble to the document and the window. A listener up
+   there is as good as one on the element: class-driven stylesheet
+   transitions report run, start, end and cancel to it, past the watch bound
+   and in a page that has filled the timer table. */
+static int transition_document_listener_run(const char *target)
+{
+    char html[8192];
+    int used = snprintf(html, sizeof(html),
+        "<!doctype html><style>.tr{transition:opacity 40ms linear;opacity:0}"
+        ".tr.on{opacity:1}.host.on .kid{transition:opacity 40ms linear;opacity:.5}"
+        "</style><body><div id=a class=tr>a</div><div id=b class=tr>b</div>"
+        "<div id=host class=host><i id=kid class=kid>k</i></div>"
+        "<div id=gone class=tr>g</div>");
+    for (unsigned i = 0; i < 200 && used > 0
+         && (size_t) used < sizeof(html) - 64u; i++)
+        used += snprintf(html + used, sizeof(html) - (size_t) used,
+                         "<p id=t%u class=tr>t</p>", i);
+    TransitionPage page;
+    CHECK(transition_page_open(&page, html, (size_t) used));
+    char source[1400];
+    snprintf(source, sizeof(source),
+        "(()=>{const $=id=>document.getElementById(id),log=[];"
+        "const hear=e=>{log.push(e.target.id+':'+e.type.slice(10));"
+        "globalThis.pocSummary=log.slice().sort().join()};"
+        "for(const type of ['transitionrun','transitionstart','transitionend',"
+        "'transitioncancel'])%s.addEventListener(type,hear);"
+        "globalThis.__log=log;"
+        "const fill=[];let id;while((id=setTimeout(()=>{},1e7)))fill.push(id);"
+        "globalThis.pocSummary='pending';"
+        "$('a').classList.add('on');$('host').classList.add('on');"
+        /* The far end of the page, beyond the discovery walk and the watch bound. */
+        "$('t199').classList.add('on');"
+        "$('gone').classList.add('on');})()", target);
+    char label[64];
+    snprintf(label, sizeof(label), "<document-listener %s>", target);
+    bool ok = transition_expect(&page, label, source, 16, 24,
+        "a:end,a:run,a:start,gone:end,gone:run,gone:start,"
+        "kid:end,kid:run,kid:start,t199:end,t199:run,t199:start");
+    snprintf(label, sizeof(label), "<document-listener-cancel %s>", target);
+    ok &= transition_expect(&page, label,
+        "(()=>{__log.length=0;globalThis.pocSummary='pending';"
+        "const b=document.getElementById('b');let once=false;"
+        "b.addEventListener('transitionstart',()=>{if(once)return;once=true;"
+        "b.classList.remove('on')});b.classList.add('on')})()",
+        16, 24, "b:cancel,b:end,b:run,b:run,b:start,b:start");
+    CHECK(transition_page_close(&page) && ok);
+    return 0;
+}
+
+static int test_transition_document_listener(void)
+{
+    int failed = transition_document_listener_run("document");
+    failed |= transition_document_listener_run("window");
+    return failed;
 }
 
 static int test_transition_timer_exhaustion(void)
@@ -4194,6 +4544,181 @@ static int test_author_error_text_is_not_fatal(void)
     return 0;
 }
 
+/* The realm is created holding all but `leave_free` of the page Budget, so
+   a large inline script meets the headroom a heavy page leaves. */
+typedef struct {
+    Budget *budget;
+    BudgetReservation reservation;
+    size_t leave_free;
+    bool reserved;
+} TestInlineHeadroomSeam;
+
+static ScriptHeavyPolicy test_inline_headroom_at_realm(void *opaque,
+                                                       const char *url)
+{
+    (void) url;
+    TestInlineHeadroomSeam *seam = opaque;
+    size_t remaining = budget_remaining(seam->budget);
+    if (!seam->reserved && remaining > seam->leave_free)
+        seam->reserved = budget_reservation_acquire(
+            &seam->reservation, seam->budget, BUDGET_CATEGORY_RESOURCE,
+            remaining - seam->leave_free);
+    ScriptHeavyPolicy policy = {0};
+    return policy;
+}
+
+/* A streamed inline script that the realm cannot compile is refused while
+   its text arrives, once its text so far could not be admitted: the DOM
+   never holds the rest (the script reads as empty), it is reported as
+   pressure, nothing fails, and the scripts before and after it run.
+   Before, the parser buffered the whole text and only the end tag
+   refused it. */
+static int test_streamed_inline_script_refused_while_streaming(void)
+{
+    static const char head[] =
+        "<!doctype html><body><p id=ready>READY</p>"
+        "<script>globalThis.firstRan=true</script>"
+        "<script id=registry>globalThis.registry={";
+    static const char tail[] =
+        "};globalThis.registryRan=true</script>"
+        "<script>globalThis.afterRan=true</script><p>after</p></body>";
+    static const char label[] =
+        "registry entry label text that a bundled module carries along with "
+        "its code: a message, a class list, a route or a template fragment";
+    enum { ENTRIES = 14000 };
+    size_t capacity = sizeof(head) + ENTRIES * 256u + sizeof(tail);
+    char *html = malloc(capacity);
+    CHECK(html != NULL);
+    size_t length = (size_t) snprintf(html, capacity, "%s", head);
+    for (size_t i = 0; i < ENTRIES; i++)
+        length += (size_t) snprintf(
+            html + length, capacity - length,
+            "%zu:function(e,t,n){var r=n(%zu),a='%s';"
+            "e.exports={id:%zu,label:a,size:r.length+a.length}},",
+            i, i / 2u, label, i);
+    size_t script_bytes = length - (sizeof(head) - 1u);
+    length += (size_t) snprintf(html + length, capacity - length, "%s",
+                                tail);
+    static const char url[] = "https://streamed-registry.test/";
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    CHECK(browser_config_apply_psp_app_defaults(&config));
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error,
+                                                  sizeof(error));
+    CHECK(engine != NULL);
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    TestInlineHeadroomSeam seam = {
+        .budget = navigation->budget, .leave_free = 6u * MIB
+    };
+    browser_engine_set_heavy_page_resolver(
+        engine, test_inline_headroom_at_realm, &seam);
+    char fixture[128];
+    CHECK(write_document_replay(fixture, url, html, length, 200, "")
+          && fetch_trace_replay_begin(fixture, error, sizeof(error)));
+    (void) browser_engine_load_url_with_limits(engine, url, 4u * MIB, 4000,
+                                               true);
+    fetch_trace_end();
+    remove_large_youtube_replay(fixture);
+    size_t dom_peak =
+        navigation->budget->categories[BUDGET_CATEGORY_DOM].peak;
+    ScriptRuntime *runtime = navigation->page.runtime;
+    ScriptResult probe = {0};
+    bool probed = runtime != NULL && script_runtime_evaluate_diagnostic(
+        runtime,
+        "globalThis.pocSummary=[globalThis.firstRan===true,"
+        "globalThis.registryRan===true,globalThis.afterRan===true,"
+        "document.getElementById('registry').text.length,"
+        "document.getElementById('ready').textContent].join()",
+        "https://streamed-registry.test/probe.js", &probe);
+    bool ok = probed && seam.reserved
+        && strcmp(probe.summary, "true,false,true,0,READY") == 0
+        && navigation->script_skipped_pressure == 1u
+        && navigation->script_failed == 0u
+        && dom_peak < script_bytes;
+    if (!ok) {
+        fprintf(stderr,
+                "streamed refusal probed=%d reserved=%d summary=%s "
+                "pressure=%zu failed=%zu dom-peak=%zu script=%zu\n",
+                probed, seam.reserved, probe.summary,
+                navigation->script_skipped_pressure,
+                navigation->script_failed, dom_peak, script_bytes);
+    }
+    budget_reservation_release(&seam.reservation);
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    free(html);
+    CHECK(ok);
+    return 0;
+}
+
+/* A streamed inline script compiled in place may write into the document
+   (the parser inserts the written markup while the script runs) and
+   rewrite and remove its own text: its functions, compiled lazily from
+   their own stored copy, still run and print their source afterwards. */
+static int test_streamed_inline_script_rewrites_itself(void)
+{
+    static const char head[] =
+        "<!doctype html><body><p id=ready>READY</p><script id=writer>"
+        "function lazyW(){return 'lazy-w'}/*";
+    static const char tail[] =
+        "*/document.write('<p id=written>written</p>');"
+        "var me=document.currentScript;me.firstChild.data='changed';"
+        "me.parentNode.removeChild(me);globalThis.outer=lazyW()</script>"
+        "<script>globalThis.after=lazyW()+':'+String(lazyW)</script>"
+        "<p>after</p></body>";
+    enum { PAD = 64 * 1024 };
+    size_t length = sizeof(head) - 1u + PAD + sizeof(tail) - 1u;
+    char *html = malloc(length);
+    CHECK(html != NULL);
+    memcpy(html, head, sizeof(head) - 1u);
+    memset(html + sizeof(head) - 1u, 'x', PAD);
+    memcpy(html + sizeof(head) - 1u + PAD, tail, sizeof(tail) - 1u);
+    static const char url[] = "https://rewriting-script.test/";
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    CHECK(browser_config_apply_psp_app_defaults(&config));
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error,
+                                                  sizeof(error));
+    char fixture[128];
+    CHECK(engine != NULL
+          && write_document_replay(fixture, url, html, length, 200, "")
+          && fetch_trace_replay_begin(fixture, error, sizeof(error)));
+    (void) browser_engine_load_url_with_limits(engine, url, 4u * MIB, 4000,
+                                               true);
+    fetch_trace_end();
+    remove_large_youtube_replay(fixture);
+    free(html);
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    ScriptRuntime *runtime = navigation->page.runtime;
+    CHECK(runtime != NULL);
+    /* Collect the removed element, then call into its functions again. */
+    (void) script_runtime_collect_and_trim(runtime);
+    ScriptResult probe = {0};
+    bool probed = script_runtime_evaluate_diagnostic(
+        runtime,
+        "globalThis.pocSummary=[globalThis.outer,globalThis.after,lazyW(),"
+        "document.getElementById('written')?.textContent,"
+        "document.getElementById('writer')===null].join()",
+        "https://rewriting-script.test/probe.js", &probe);
+    static const char expected[] =
+        "lazy-w,lazy-w:function lazyW(){return 'lazy-w'},lazy-w,written,"
+        "true";
+    if (!probed || strcmp(probe.summary, expected) != 0)
+        fprintf(stderr, "rewriting script: probed=%d summary=%s failed=%zu\n",
+                probed, probe.summary, navigation->script_failed);
+    CHECK(probed && strcmp(probe.summary, expected) == 0
+          && navigation->script_failed == 0u);
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    return 0;
+}
+
 /* A frame taking part in a Cloudflare managed challenge gets a larger script
    heap, because the challenge interpreter does not fit the ordinary one. The
    signals are the top-level response's own `cf-mitigated: challenge` header
@@ -4342,8 +4867,145 @@ static int test_native_text_sync_does_not_relayout_twice(void)
           && browser_engine_activate(engine, &action)
           && action.type == CONTROLLER_ACTION_NONE
           && action.activation_outcome == CONTROLLER_ACTIVATION_CANCELLED);
+    /* A disabled default button: Enter submits nothing, as in Chrome
+       (HTML clicks the default button only when it is not disabled, and
+       the no-submit-button rule does not apply to a form that has one),
+       neither through the next enabled button nor as a one-field form. */
+    static const char disabled_default[] =
+        "<!doctype html><form action='/find'><input name=q type=search>"
+        "<button name=go disabled>Find</button>"
+        "<button name=other>Other</button></form>";
+    action = (ControllerAction) {0};
+    CHECK(browser_engine_commit_html(engine, "https://search.test/",
+              disabled_default, sizeof(disabled_default) - 1u, true)
+          && browser_engine_focus_move(engine, true));
+    bool disabled_activated = browser_engine_activate(engine, &action);
+    if (disabled_activated && action.type == CONTROLLER_ACTION_FORM_SUBMIT)
+        fprintf(stderr, "disabled default button submitted %s\n",
+                action.url);
+    CHECK(!disabled_activated
+          || action.type != CONTROLLER_ACTION_FORM_SUBMIT);
+    /* A disabled button inside a disabled fieldset is disabled too. */
+    static const char fieldset_default[] =
+        "<!doctype html><form action='/find'><input name=q type=search>"
+        "<fieldset disabled><button name=go>Find</button></fieldset>"
+        "<button name=other>Other</button></form>";
+    action = (ControllerAction) {0};
+    CHECK(browser_engine_commit_html(engine, "https://search.test/",
+              fieldset_default, sizeof(fieldset_default) - 1u, true)
+          && browser_engine_focus_move(engine, true));
+    disabled_activated = browser_engine_activate(engine, &action);
+    if (disabled_activated && action.type == CONTROLLER_ACTION_FORM_SUBMIT)
+        fprintf(stderr, "fieldset-disabled default button submitted %s\n",
+                action.url);
+    CHECK(!disabled_activated
+          || action.type != CONTROLLER_ACTION_FORM_SUBMIT);
     CHECK(browser_engine_shutdown(engine));
     browser_engine_destroy(engine);
+    return 0;
+}
+
+/* User decision Q7 (2026-11-11): the PSP keyboard's Done on a field that
+   is its form's only text-like field (the only field blocking HTML
+   implicit submission) submits the form, as Enter does in Chrome: the
+   submit event fires and can be cancelled, and the default button is
+   clicked when the form has one. With two text-like fields Done only
+   commits the text; START (Enter, browser_engine_activate) keeps the
+   HTML rules. A textarea never submits, and a form whose default button
+   is disabled is not submitted by Enter (Chrome's SubmitImplicitly). */
+typedef struct {
+    const char *name;
+    const char *html;
+    bool done_submits;
+    /* The URL Enter submits to, or NULL when Enter submits nothing. */
+    const char *submitted;
+    bool cancelled;
+} KeyboardDoneCase;
+
+static int test_keyboard_done_implicit_submission(void)
+{
+#define EV_SUBMIT \
+    " onsubmit=\"this.appendChild(Object.assign(document.createElement(" \
+    "'input'),{type:'hidden',name:'ev',value:event.submitter?" \
+    "event.submitter.name:'form'}))\""
+    static const KeyboardDoneCase cases[] = {
+        {"one field", "<form action='/find'" EV_SUBMIT
+         "><input name=q type=search></form>",
+         true, "https://search.test/find?q=psp&ev=form", false},
+        {"one field, untyped input and hidden fields",
+         "<form action='/find'" EV_SUBMIT "><input type=hidden name=h "
+         "value=1><input name=q></form>",
+         true, "https://search.test/find?h=1&q=psp&ev=form", false},
+        {"one field, submit cancelled",
+         "<form action='/find' onsubmit='event.preventDefault()'>"
+         "<input name=q type=search></form>", true, NULL, true},
+        {"one field and a checkbox, default button",
+         "<form action='/find'" EV_SUBMIT "><input name=q>"
+         "<input type=checkbox name=c checked>"
+         "<button name=go value=1>Go</button>"
+         "<button name=other value=2>Other</button></form>",
+         true, "https://search.test/find?q=psp&c=on&go=1&ev=go", false},
+        {"two fields, no button",
+         "<form action='/login'><input name=u><input name=p type=password>"
+         "</form>", false, NULL, false},
+        {"two fields, submit button",
+         "<form action='/login'" EV_SUBMIT "><input name=u>"
+         "<input name=p type=password><button name=go value=1>Sign in"
+         "</button></form>",
+         false, "https://search.test/login?u=psp&p=&go=1&ev=go", false},
+        {"textarea", "<form action='/post'><textarea name=t></textarea>"
+         "</form>", false, NULL, false},
+        {"disabled default button",
+         "<form action='/find'><input name=q><button disabled name=go>Go"
+         "</button><button name=other>Other</button></form>",
+         false, NULL, false},
+        {"no form", "<input name=q type=search>", false, NULL, false},
+    };
+#undef EV_SUBMIT
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 24u * MIB;
+    config.javascript.enabled = true;
+    char error[256] = {0};
+    BrowserEngine *engine =
+        browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL);
+    int failures = 0;
+    for (size_t at = 0; at < sizeof(cases) / sizeof(cases[0]); at++) {
+        const KeyboardDoneCase *c = &cases[at];
+        char page[768];
+        int length = snprintf(page, sizeof(page), "<!doctype html>%s",
+                              c->html);
+        CHECK(length > 0 && (size_t) length < sizeof(page));
+        CHECK(browser_engine_commit_html(engine, "https://search.test/",
+                                         page, (size_t) length, true)
+              && browser_engine_focus_move(engine, true));
+        CHECK(browser_engine_replace_text(engine, "psp", 3));
+        ControllerTextInputInfo info = {0};
+        bool text = browser_engine_text_input_info(engine, &info);
+        bool done_submits = browser_engine_keyboard_done_submits(engine);
+        ControllerAction action = {0};
+        bool activated = browser_engine_activate(engine, &action);
+        bool submitted = activated
+            && action.type == CONTROLLER_ACTION_FORM_SUBMIT;
+        bool cancelled = activated && action.type == CONTROLLER_ACTION_NONE
+            && action.activation_outcome == CONTROLLER_ACTIVATION_CANCELLED;
+        bool ok = text && info.editable
+            && done_submits == c->done_submits
+            && submitted == (c->submitted != NULL)
+            && (!submitted || strcmp(action.url, c->submitted) == 0)
+            && cancelled == c->cancelled;
+        printf("keyboard done, %s: done_submits=%d enter=%s%s\n", c->name,
+               (int) done_submits,
+               submitted ? action.url : cancelled ? "cancelled" : "none",
+               ok ? "" : "  <- unexpected");
+        if (!ok) failures++;
+    }
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    CHECK(failures == 0);
     return 0;
 }
 

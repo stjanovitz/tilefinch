@@ -1,4 +1,7 @@
 #include "psp_app_internal.h"
+#include "psp_app_validation.h"
+#include "tilefinch/document.h"
+#include "tilefinch_compiler.h"
 
 static void glyph_refresh_ui(
     const PspGlyphComponentSession *session, PspUiState *ui)
@@ -23,6 +26,8 @@ static void glyph_refresh_ui(
                     session->install_snapshot.bytes_processed * 1000u
                     / session->install_snapshot.bytes_total);
         }
+    } else if (session->install_refused) {
+        phase = PSP_UI_GLYPH_COMPONENT_ERROR;
     } else if (session->client != NULL) {
         switch (session->client_snapshot.phase) {
             case TILEFINCH_UPDATE_CLIENT_CHECKING:
@@ -56,6 +61,17 @@ static bool profile_language_uses_pack(
         browser_profile_glyph_language(profile), &selected) && selected == pack;
 }
 
+/* The pack session's paths. A validation run replaying the release's recorded
+   responses installs on the real Memory Stick from a host0: program
+   (psp_app_validation_glyph.c); every other build uses the process's own. */
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+#define GLYPH_PATHS(app) psp_validation_glyph_paths(app)
+#define GLYPH_RECORDED(app) psp_validation_glyph_armed(app)
+#else
+#define GLYPH_PATHS(app) (&(app)->process->install_paths)
+#define GLYPH_RECORDED(app) false
+#endif
+
 /* ---- In-page language-pack offer (docs/TEXT_BIDI.md#glyph-components) */
 
 typedef struct {
@@ -79,7 +95,7 @@ static bool glyph_offer_installed(void *opaque, TilefinchGlyphPack pack)
             probe->app->browser->glyph_component_session, pack)) return true;
     char resolved[TILEFINCH_INSTALL_PATH_LIMIT];
     return tilefinch_glyph_component_resolve(
-        &probe->app->process->install_paths, pack, resolved,
+        GLYPH_PATHS(probe->app), pack, resolved,
         sizeof(resolved));
 }
 
@@ -94,12 +110,14 @@ static bool glyph_offer_poll(PspApp *app, PspGlyphComponentSession *session,
     if (census == NULL || census->offer_mask == 0) return false;
     /* Never over a menu, a loading page, another notice, a game that owns
        the controls, or a running pack operation. Scripted and replayed runs
-       have no network to install from, so they never see it. */
+       have no network to install from, so they never see it, unless the
+       replay holds the pack's own recorded download (GLYPH_RECORDED). */
     if (ui->screen != PSP_UI_SCREEN_PAGE || ui->loading
         || ui->toast_frames != 0 || ui->page_fullscreen
         || ui->page_gamepad_capture || ui->captive_portal_active
-        || !app->process->install_paths.slotted
-        || strcmp(app->process->config.trace, "none") != 0
+        || !GLYPH_PATHS(app)->slotted
+        || (!GLYPH_RECORDED(app)
+            && strcmp(app->process->config.trace, "none") != 0)
         || session->offer_install_pending || session->offer_size_pending
         || psp_glyph_component_session_active(session)
         || browser_engine_navigation_pending(app->browser->engine))
@@ -147,14 +165,14 @@ static const char *glyph_begin_check(PspApp *app,
     char metadata_url[768];
     bool have_url = psp_glyph_component_session_metadata_url(
         pack, metadata_url, sizeof(metadata_url));
-    bool network_ready =
-        strcmp(app->process->config.trace, "none") == 0
-        && have_url
-        && psp_ensure_network_for_navigation(
-               app->network, app->network_lifecycle,
-               (int) app->process->config.network_profile,
-               "GET", metadata_url, false,
-               app->views->frame, ui);
+    bool network_ready = (GLYPH_RECORDED(app) && have_url)
+        || (strcmp(app->process->config.trace, "none") == 0
+            && have_url
+            && psp_ensure_network_for_navigation(
+                   app->network, app->network_lifecycle,
+                   (int) app->process->config.network_profile,
+                   "GET", metadata_url, false,
+                   app->views->frame, ui));
     time_t now = time(NULL);
     if (!network_ready) return "NETWORK NOT READY FOR FONT PACK";
     (void) psp_glyph_component_session_begin_check(
@@ -174,9 +192,12 @@ const char *psp_glyph_component_request_pack(PspApp *app, TilefinchGlyphPack pac
 {
     PspGlyphComponentSession *session = app->browser->glyph_component_session;
     if (!psp_glyph_component_session_select_operation(session, app->browser->budget,
-            &app->process->install_paths, pack)) return "SIGNED PACK DOWNLOAD UNAVAILABLE";
+            GLYPH_PATHS(app), pack)) {
+        const char *reason = psp_glyph_component_session_select_failure(session);
+        return reason != NULL ? reason : "SIGNED PACK DOWNLOAD UNAVAILABLE";
+    }
     PspGlyphComponentPrimaryResult primary = psp_glyph_component_session_primary(
-        session, &app->process->install_paths, app->browser->engine);
+        session, GLYPH_PATHS(app), app->browser->engine);
     if (primary == PSP_GLYPH_COMPONENT_PRIMARY_CHECK_REQUIRED)
         return glyph_begin_check(app, session, &app->process->presentation.ui, pack);
     return NULL;
@@ -205,6 +226,8 @@ static bool glyph_offer_size_track(PspGlyphComponentSession *session,
         case PSP_GLYPH_COMPONENT_SIZE_FAILED:
         case PSP_GLYPH_COMPONENT_SIZE_NONE:
             psp_ui_set_glyph_offer_error(ui, (uint8_t) pack, message);
+            /* The confirmation shows it; no toast repeats it. */
+            (void) psp_glyph_component_session_take_failure(session);
             break;
     }
     session->offer_size_pending = false;
@@ -229,9 +252,11 @@ static void glyph_offer_answer(PspApp *app,
             session->offer_install_pack = pack;
             if (!psp_glyph_component_session_prepare_size_check(
                     session, app->browser->budget,
-                    &app->process->install_paths, pack)) {
+                    GLYPH_PATHS(app), pack)) {
+                /* NULL here is the confirmation's own generic notice. */
                 psp_ui_set_glyph_offer_error(
-                    ui, (uint8_t) pack, "SIGNED PACK DOWNLOAD UNAVAILABLE");
+                    ui, (uint8_t) pack,
+                    psp_glyph_component_session_select_failure(session));
                 break;
             }
             session->offer_size_pending = true;
@@ -284,21 +309,10 @@ static void glyph_offer_answer(PspApp *app,
     }
 }
 
-/* A retired install or removal detached every runtime pack. Put back the
-   selected language and emoji, attach installed packs
-   for the page, and relayout in place: text measured against blank cells
-   needs new advances, not only a repaint. */
-static bool glyph_restore_runtime(PspApp *app,
-                                  PspGlyphComponentSession *session,
-                                  PspUiState *ui, uint16_t scripts)
+/* Text measured against blank cells needs new advances, not only a repaint. */
+static bool glyph_relayout_page(PspApp *app, PspUiState *ui)
 {
     BrowserEngine *engine = app->browser->engine;
-    if (!psp_glyph_component_session_reattach(
-            session, app->browser->budget, &app->process->install_paths,
-            browser_profile_glyph_language(app->browser->profile),
-            psp_ui_language_glyphs(app->browser->profile),
-            browser_profile_color_emoji(app->browser->profile), scripts,
-            engine)) return false;
     char entry_buffer[NAVIGATION_URL_LIMIT];
     const char *entry_url = psp_app_current_url(
         engine, entry_buffer, sizeof(entry_buffer));
@@ -308,6 +322,22 @@ static bool glyph_restore_runtime(PspApp *app,
         ui->page_font_percent, true);
     if (relaid) (void) psp_engine_views_refresh(app->views, engine);
     return relaid;
+}
+
+/* A retired install or removal detached every runtime pack. Put back the
+   selected language and emoji, attach installed packs for the page, and
+   relayout in place. */
+static bool glyph_restore_runtime(PspApp *app,
+                                  PspGlyphComponentSession *session,
+                                  PspUiState *ui, uint16_t scripts)
+{
+    if (!psp_glyph_component_session_reattach(
+            session, app->browser->budget, GLYPH_PATHS(app),
+            browser_profile_glyph_language(app->browser->profile),
+            psp_ui_language_glyphs(app->browser->profile),
+            browser_profile_color_emoji(app->browser->profile), scripts,
+            app->browser->engine)) return false;
+    return glyph_relayout_page(app, ui);
 }
 
 static void glyph_install_finish(PspApp *app,
@@ -322,7 +352,17 @@ static void glyph_install_finish(PspApp *app,
     bool activated = session->installer == NULL;
     uint16_t scripts = browser_engine_glyph_script_mask(engine);
     if (from_offer && activated && spec != NULL) scripts = spec->page_scripts;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    uint64_t restore_started_us = tilefinch_platform_monotonic_time_us();
+#endif
     bool relaid = glyph_restore_runtime(app, session, ui, scripts);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    printf("tilefinch-glyph-stage: reattach-relayout ms=%u relaid=%u "
+           "attached=0x%04x\n",
+           (unsigned) ((tilefinch_platform_monotonic_time_us()
+                        - restore_started_us) / 1000u),
+           relaid ? 1u : 0u, (unsigned) session->attached_mask);
+#endif
     bool attached = spec != NULL
         && (session->attached_mask & (1u << (unsigned) pack)) != 0;
     /* A failed/cancelled installer remains for its own error/retry UI. Pack
@@ -389,16 +429,11 @@ static bool glyph_offer_track(PspGlyphComponentSession *session,
     /* Not installed and nothing running: refused, offline, failed or
        cancelled. Offline already raised the menu path's own notice. */
     session->offer_install_pending = false;
-    const char *message = NULL;
-    if (session->installer != NULL
-        && (session->install_snapshot.phase == TILEFINCH_UPDATE_INSTALL_ERROR
-            || session->install_snapshot.phase
-                   == TILEFINCH_UPDATE_INSTALL_CANCELLED))
+    const char *message = psp_glyph_component_session_take_failure(session);
+    if (message == NULL && session->installer != NULL
+        && session->install_snapshot.phase
+               == TILEFINCH_UPDATE_INSTALL_CANCELLED)
         message = session->install_snapshot.message;
-    else if (session->client != NULL
-             && session->client_snapshot.phase
-                    == TILEFINCH_UPDATE_CLIENT_ERROR)
-        message = session->client_snapshot.message;
     if (message != NULL && message[0] != '\0')
         psp_ui_show_status(ui, message, 240);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
@@ -406,6 +441,71 @@ static bool glyph_offer_track(PspGlyphComponentSession *session,
            (unsigned) pack, message == NULL ? "" : message);
 #endif
     return true;
+}
+
+/* Every route ends here: the menu row can only say "Try again", so the reason
+   an operation failed is shown once, as the offer's install has always done. */
+static bool glyph_failure_report(PspGlyphComponentSession *session,
+                                 PspUiState *ui)
+{
+    const char *failure = psp_glyph_component_session_take_failure(session);
+    if (failure == NULL) return false;
+    psp_ui_show_status(ui, failure, 240);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    printf("tilefinch-glyph-component: failed pack=%u message=\"%s\"\n",
+           (unsigned) session->operation_pack, failure);
+#endif
+    return true;
+}
+
+/* Out of line: this runs every frame but does work once per script. */
+static TILEFINCH_OUT_OF_LINE bool glyph_lazy_attach(
+    PspApp *app, PspGlyphComponentSession *session, PspUiState *ui)
+{
+    bool attached = psp_glyph_component_session_attach_hinted(
+        session, GLYPH_PATHS(app),
+        browser_engine_glyph_script_mask(app->browser->engine),
+        app->browser->engine);
+    /* The page was measured before the pack it uses arrived. */
+    if (attached) {
+        (void) glyph_relayout_page(app, ui);
+        return true;
+    }
+    /* Captions can use a script the page does not, which needs no relayout:
+       the player's own text is measured as it is drawn. */
+    return psp_active_media != NULL
+        && psp_glyph_component_session_attach_hinted(
+            session, GLYPH_PATHS(app),
+            psp_active_media->caption_glyph_scripts, NULL);
+}
+
+/* What a page dialog changed while page script held the engine; the next
+   frame tells the engine (psp_glyph_component_dialog_glyphs). */
+static bool glyph_dialog_attached;
+static bool glyph_dialog_payloads;
+
+bool psp_glyph_component_dialog_glyphs(
+    PspApp *app, const char *message, const char *value)
+{
+    if (app == NULL || app->browser == NULL
+        || app->browser->glyph_component_session == NULL) return false;
+    PspGlyphComponentSession *session = app->browser->glyph_component_session;
+    uint16_t scripts = 0;
+    if (message != NULL)
+        scripts |= document_text_glyph_scripts(message, strlen(message));
+    if (value != NULL)
+        scripts |= document_text_glyph_scripts(value, strlen(value));
+    bool changed = false;
+    if (scripts != 0 && psp_glyph_component_session_attach_hinted(
+            session, GLYPH_PATHS(app), scripts, NULL)) {
+        glyph_dialog_attached = true;
+        changed = true;
+    }
+    if (psp_glyph_component_session_pump_runtime(session, NULL)) {
+        glyph_dialog_payloads = true;
+        changed = true;
+    }
+    return changed;
 }
 
 bool psp_glyph_component_handle_frame(
@@ -421,10 +521,18 @@ bool psp_glyph_component_handle_frame(
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     uint16_t attached_before_hint = session->attached_mask;
 #endif
-    bool visual_changed = psp_glyph_component_session_attach_hinted(
-        session, &app->process->install_paths,
-        browser_engine_glyph_script_mask(app->browser->engine),
-        app->browser->engine);
+    bool visual_changed = false;
+    if (glyph_dialog_attached) {
+        glyph_dialog_attached = false;
+        visual_changed |= browser_engine_optional_glyphs_updated(
+            app->browser->engine);
+    }
+    if (glyph_dialog_payloads) {
+        glyph_dialog_payloads = false;
+        visual_changed |= browser_engine_optional_glyph_payloads_ready(
+            app->browser->engine);
+    }
+    visual_changed |= glyph_lazy_attach(app, session, ui);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     if (session->attached_mask != attached_before_hint) {
         printf("tilefinch-glyph-component: lazy-attached=0x%04x "
@@ -439,7 +547,7 @@ bool psp_glyph_component_handle_frame(
 
     if (intent->glyph_component_probe_requested) {
         psp_glyph_component_session_probe(
-            session, &app->process->install_paths);
+            session, GLYPH_PATHS(app));
         glyph_refresh_ui(session, ui);
         visual_changed = true;
     }
@@ -501,7 +609,7 @@ bool psp_glyph_component_handle_frame(
         }
         bool removed = preference_saved
             && psp_glyph_component_session_remove(
-                session, &app->process->install_paths, requested,
+                session, GLYPH_PATHS(app), requested,
                 app->browser->engine);
         if (preference_saved)
             (void) glyph_restore_runtime(
@@ -533,15 +641,19 @@ bool psp_glyph_component_handle_frame(
             && session->operation_pack == requested;
         if (!selected && !psp_glyph_component_session_select_operation(
                 session, app->browser->budget,
-                &app->process->install_paths, requested)) {
+                GLYPH_PATHS(app), requested)) {
             psp_ui_set_glyph_component(
                 ui, session->installed_mask, (uint8_t) requested,
                 PSP_UI_GLYPH_COMPONENT_ERROR, -1);
-            psp_ui_show_status(ui, "SIGNED PACK DOWNLOAD UNAVAILABLE", 240);
+            const char *reason =
+                psp_glyph_component_session_select_failure(session);
+            psp_ui_show_status(
+                ui, reason != NULL ? reason : "SIGNED PACK DOWNLOAD UNAVAILABLE",
+                240);
         } else {
             PspGlyphComponentPrimaryResult primary =
                 psp_glyph_component_session_primary(
-                    session, &app->process->install_paths,
+                    session, GLYPH_PATHS(app),
                     app->browser->engine);
             if (primary == PSP_GLYPH_COMPONENT_PRIMARY_CHECK_REQUIRED) {
                 const char *failure =
@@ -555,12 +667,15 @@ bool psp_glyph_component_handle_frame(
 
     if (session->operation_initialized) {
         (void) psp_glyph_component_session_pump_operation(
-            session, &app->process->install_paths, app->browser->engine);
+            session, GLYPH_PATHS(app), app->browser->engine);
         glyph_refresh_ui(session, ui);
         visual_changed |= (ui->screen == PSP_UI_SCREEN_GLYPH_OPTIONS
                            || ui->screen == PSP_UI_SCREEN_GLYPH_OFFER)
             && psp_glyph_component_session_active(session);
     }
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    psp_validation_glyph_stage(app, session);
+#endif
     if (session->reattach_pending) {
         glyph_install_finish(app, session, ui);
         glyph_refresh_ui(session, ui);
@@ -568,6 +683,7 @@ bool psp_glyph_component_handle_frame(
     }
     visual_changed |= glyph_offer_size_track(session, ui);
     visual_changed |= glyph_offer_track(session, ui);
+    visual_changed |= glyph_failure_report(session, ui);
     if (glyph_offer_poll(app, session, ui)) visual_changed = true;
     return visual_changed;
 }

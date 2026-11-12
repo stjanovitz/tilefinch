@@ -5,7 +5,7 @@ static int test_youtube_login_unseeded_flow(void)
     BrowserDeviceProfile device; browser_device_profile_psp3000(&device);
     BrowserConfig config; browser_config_init(&config, &device);
     config.memory_limit = 16u * MIB; config.resources.web_fonts_enabled = false;
-    char error[256], report[1024];
+    char error[256], report[2048];
     for (unsigned lane = 0; lane < 8; lane++) {
         const char *fixture = lane == 0
             ? TILEFINCH_TEST_SOURCE_DIR "/tests/fixtures/http-youtube-login-flow"
@@ -165,7 +165,7 @@ static int test_youtube_login_unseeded_flow(void)
         snprintf(nav->page.script_result.error, sizeof(nav->page.script_result.error),
                  "%s", "never-export-private-error");
         size_t limit = session->maximum_cookie_bytes;
-        session->maximum_cookie_bytes = session->cookie_bytes;
+        session->maximum_cookie_bytes = 1u;
         CHECK(!browser_session_cookie_set_http(session, "https://accounts.google.com/",
             "extra=never-export-cookie; Secure; Path=/"));
         session->maximum_cookie_bytes = limit;
@@ -180,12 +180,112 @@ static int test_youtube_login_unseeded_flow(void)
     return 0;
 }
 
+/* The report says what happened on the account pages in numbers and classes,
+   and nothing the user typed or the page's token. */
+static int test_youtube_login_report_trail(void)
+{
+    const char *entry = "https://accounts.google.com/ServiceLogin?service=youtube&continue=https%3A%2F%2Fwww.youtube.com%2F";
+    BrowserDeviceProfile device; browser_device_profile_psp3000(&device);
+    BrowserConfig config; browser_config_init(&config, &device);
+    config.memory_limit = 16u * MIB; config.resources.web_fonts_enabled = false;
+    char error[256], report[2048];
+    CHECK(fetch_trace_replay_begin(TILEFINCH_TEST_SOURCE_DIR "/tests/fixtures/http-youtube-login-flow",
+                                   error, sizeof(error)));
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error)); CHECK(engine);
+    browser_engine_set_youtube_signin_diagnostics(engine, true);
+    browser_engine_set_defer_script_navigation(engine, true);
+    CHECK(browser_engine_set_javascript_enabled(engine, true));
+    CHECK(browser_engine_load_url(engine, "https://www.youtube.com/", true));
+    NavigationSession *nav = browser_engine_navigation(engine);
+    CHECK(browser_engine_render_frame(engine, NULL));
+    CHECK(browser_engine_begin_navigation_url(engine, entry, config.maximum_document_bytes,
+                                              config.navigation_timeout_ms, false));
+    for (unsigned i = 0; i < 512 && browser_engine_navigation_pending(engine); i++)
+        (void) browser_engine_pump_navigation(engine, NULL);
+    CHECK(!browser_engine_navigation_pending(engine) && nav->page.loaded);
+    CHECK(browser_engine_render_frame(engine, NULL));
+    CHECK(browser_engine_youtube_signin_report(engine, report, sizeof(report)));
+    CHECK(strstr(report, "diagnostics v3") && strstr(report, "script-stop=0 ")
+        && strstr(report, "text-present=0") && strstr(report, "auth-navigations=1")
+        && strstr(report, "form-posts=0") && !strstr(report, "budget-limit-kib=0 "));
+
+    lxb_dom_node_t *root = lxb_dom_interface_node(nav->page.document.html);
+    CHECK(browser_engine_focus_node(engine, test_reader_find_id(root, "user")));
+    CHECK(browser_engine_replace_text(engine, "synthetic-private-user", 22));
+    CHECK(browser_engine_youtube_signin_report(engine, report, sizeof(report)));
+    CHECK(strstr(report, "text-edits=1") && strstr(report, "text-present=1")
+        && !strstr(report, "synthetic-private-user"));
+
+    /* A press with no scripts left: the shape of "I press okay, nothing happens". */
+    fetch_trace_end();
+    CHECK(fetch_trace_replay_begin(TILEFINCH_TEST_SOURCE_DIR "/tests/fixtures/http-youtube-login-scripted",
+                                   error, sizeof(error)));
+    CHECK(browser_engine_begin_navigation_url(engine, "https://accounts.google.com/v3/signin/identifier",
+        config.maximum_document_bytes, config.navigation_timeout_ms, false));
+    for (unsigned i = 0; i < 512 && browser_engine_navigation_pending(engine); i++)
+        (void) browser_engine_pump_navigation(engine, NULL);
+    CHECK(!browser_engine_navigation_pending(engine) && nav->page.loaded);
+    CHECK(browser_engine_render_frame(engine, NULL));
+    CHECK(nav->page.runtime != NULL && browser_engine_stop_page_scripts(engine));
+    CHECK(browser_engine_render_frame(engine, NULL));
+    CHECK(browser_engine_focus_node(engine, test_reader_find_id(
+        lxb_dom_interface_node(nav->page.document.html), "user")));
+    ControllerAction press = {0};
+    (void) browser_engine_activate(engine, &press);
+    CHECK(browser_engine_youtube_signin_report(engine, report, sizeof(report)));
+    CHECK(strstr(report, "script-stop=2 ") && strstr(report, "runtime-present=0")
+        && strstr(report, "activations=1 activations-without-scripts=1")
+        && strstr(report, "page-class=3 ")
+        && !strstr(report, "stop-budget-free-kib=0"));
+    fetch_trace_end();
+
+    static const struct {
+        const char *body;
+        const char *expected;
+    } tokens[] = {
+        { "identifier=synthetic-private-user&at=1", "token-kind=0 token-length=0 " },
+        { "bgresponse=&at=1", "token-kind=1 token-length=0 " },
+        { "at=1&bgresponse=js_disabled", "token-kind=2 token-length=11 " },
+        { "at=1&bgresponse=FNLTypeError&x=1", "token-kind=3 token-length=12 " },
+        { "at=1&xbgresponse=FNL&bgresponse=!syntheticvalue&x=1", "token-kind=4 token-length=15 " },
+    };
+    for (size_t i = 0; i < sizeof(tokens) / sizeof(tokens[0]); i++) {
+        CHECK(fetch_trace_replay_begin(TILEFINCH_TEST_SOURCE_DIR "/tests/fixtures/http-youtube-login-flow",
+                                       error, sizeof(error)));
+        ControllerAction action = {0};
+        action.type = CONTROLLER_ACTION_FORM_SUBMIT;
+        snprintf(action.url, sizeof(action.url), "%s",
+                 "https://accounts.google.com/v3/signin/challenge/pwd?TL=synthetic");
+        snprintf(action.method, sizeof(action.method), "POST");
+        action.body_length = strlen(tokens[i].body);
+        memcpy(action.body, tokens[i].body, action.body_length);
+        snprintf(action.content_type, sizeof(action.content_type),
+                 "application/x-www-form-urlencoded");
+        CHECK(browser_engine_begin_navigation_action(engine, &action,
+            config.maximum_document_bytes, config.navigation_timeout_ms));
+        for (unsigned step = 0; step < 512 && browser_engine_navigation_pending(engine); step++)
+            (void) browser_engine_pump_navigation(engine, NULL);
+        CHECK(!browser_engine_navigation_pending(engine));
+        CHECK(browser_engine_youtube_signin_report(engine, report, sizeof(report)));
+        if (!strstr(report, tokens[i].expected)) fprintf(stderr, "%s\n", report);
+        CHECK(strstr(report, tokens[i].expected) && strstr(report, "post-target=2 ")
+            && !strstr(report, "syntheticvalue") && !strstr(report, "synthetic-private")
+            && !strstr(report, "TL=synthetic"));
+        char posts[32];
+        snprintf(posts, sizeof(posts), "form-posts=%zu ", i + 1u);
+        CHECK(strstr(report, posts));
+        fetch_trace_end();
+    }
+    CHECK(browser_engine_shutdown(engine)); browser_engine_destroy(engine);
+    return 0;
+}
+
 static int test_youtube_login_display_failures(void)
 {
     BrowserDeviceProfile device; browser_device_profile_psp3000(&device);
     BrowserConfig config; browser_config_init(&config, &device);
     config.memory_limit = 16u * MIB; config.resources.web_fonts_enabled = false;
-    char error[256], report[1024];
+    char error[256], report[2048];
     for (unsigned lane = 0; lane < 4; lane++) {
         CHECK(fetch_trace_replay_begin(TILEFINCH_TEST_SOURCE_DIR
             "/tests/fixtures/http-youtube-personalized", error, sizeof(error)));
@@ -413,7 +513,7 @@ static int test_youtube_login_late_session_changes(void)
     BrowserDeviceProfile device; browser_device_profile_psp3000(&device);
     BrowserConfig config; browser_config_init(&config, &device);
     config.memory_limit = 16u * MIB; config.resources.web_fonts_enabled = false;
-    char error[256], report[1024];
+    char error[256], report[2048];
     for (unsigned lane = 0; lane < 2; lane++) {
         CHECK(fetch_trace_replay_begin(TILEFINCH_TEST_SOURCE_DIR "/tests/fixtures/http-youtube-personalized",
             error, sizeof(error)));
@@ -482,15 +582,22 @@ static int test_youtube_login_rejection_preserves_failures(void)
         uint64_t offered = browser_engine_youtube_login_identity(engine); CHECK(offered);
         CHECK(browser_engine_take_youtube_login_events(engine) == BROWSER_YOUTUBE_LOGIN_VERIFIED);
         fetch_trace_end();
+        /* The verified feed cached its identity, so the refresh signs its
+           browse request with it first. Each refusal sends it back to the
+           home page once, whose answer then decides. */
+        GoogleIdentityRecord browse = {
+            .url="https://m.youtube.com/youtubei/v1/browse?key=fixture-key&prettyPrint=false",
+            .status=lane == 3 ? 503 : 200, .method="POST", .content_type="application/json",
+            .body=lane == 2 ? "{malformed" : lane == 4 ? "{\"responseContext\":{}}"
+                : "{\"responseContext\":{\"mainAppWebResponseContext\":{\"loggedOut\":true}}}"};
         GoogleIdentityRecord records[] = {
+            browse,
             {.url="https://m.youtube.com/", .status=200, .content_type="text/html",
                 .body=lane == 1 ? logged_out : bootstrap},
-            {.url="https://m.youtube.com/youtubei/v1/browse?key=fixture-key&prettyPrint=false",
-                .status=lane == 3 ? 503 : 200, .method="POST", .content_type="application/json",
-                .body=lane == 2 ? "{malformed" : lane == 4 ? "{\"responseContext\":{}}"
-                    : "{\"responseContext\":{\"mainAppWebResponseContext\":{\"loggedOut\":true}}}"}
+            browse
         };
-        char fixture[128]; CHECK(write_google_identity_replay(fixture, records, 2)
+        size_t record_count = lane == 1 ? 2u : 3u;
+        char fixture[128]; CHECK(write_google_identity_replay(fixture, records, record_count)
             && fetch_trace_replay_begin(fixture, error, sizeof(error)));
         NavigationSession *nav = browser_engine_navigation(engine);
         lxb_dom_node_t *root = lxb_dom_interface_node(nav->page.document.html);
@@ -509,7 +616,7 @@ static int test_youtube_login_rejection_preserves_failures(void)
         root = lxb_dom_interface_node(nav->page.document.html);
         CHECK((test_reader_find_id(root, "yt-signout-open") != NULL) == (lane >= 2));
         CHECK(browser_engine_shutdown(engine)); browser_engine_destroy(engine); fetch_trace_end();
-        remove_google_identity_replay(fixture, 2);
+        remove_google_identity_replay(fixture, record_count);
     }
     return 0;
 }
@@ -560,6 +667,7 @@ static int test_youtube_login_restored_rejection(void)
 static int test_youtube_login_journey(void)
 {
     CHECK(test_youtube_login_unseeded_flow() == 0);
+    CHECK(test_youtube_login_report_trail() == 0);
     CHECK(test_youtube_login_display_failures() == 0);
     CHECK(test_youtube_login_manual_continuation() == 0);
     CHECK(test_youtube_login_failure_diagnostics() == 0);

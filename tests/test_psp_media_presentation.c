@@ -53,7 +53,9 @@ typedef struct {
 
 static uint64_t journey_claim(JourneyTransport *transport, bool foreground)
 {
-    unsigned limit = fetch_background_admission_slot_limit(foreground, true);
+    unsigned limit = fetch_background_admission_slot_limit(
+        foreground ? FETCH_BACKGROUND_LANE_MEDIA
+                   : FETCH_BACKGROUND_LANE_ORDINARY, true);
     for (unsigned at = 0; at < limit; at++) {
         JourneySlot *slot = &transport->slots[at];
         if (slot->state != JOURNEY_SLOT_FREE) continue;

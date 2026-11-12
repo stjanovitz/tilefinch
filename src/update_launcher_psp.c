@@ -649,9 +649,11 @@ static bool launcher_recover(
         "version is still safe.\n\n"
         "X        TRY UPDATE AGAIN\n"
         "SQUARE   DISCARD UPDATE\n"
-        "O        START CURRENT VERSION\n\n"
+        "O        START CURRENT VERSION\n"
         "Starting the current version\n"
-        "in 10 seconds...\n");
+        "in 10 seconds. To choose later:\n"
+        "Settings - Updates -\n"
+        "Version and update.\n");
     /*
      * Never leave a user staring at a blind recovery timeout if the display
      * service rejected the mode or frame. In that case the safe default is
@@ -672,6 +674,12 @@ static bool launcher_recover(
             (void) tilefinch_update_journal_store(
                 paths->data_dir, state, NULL, NULL);
         }
+    } else if (wait_ms != 0u) {
+        /* O or the timeout on a screen the user saw: ask once. Later boots
+           of this trial start the current version normally and the
+           browser's Update page offers the same two choices. */
+        (void) tilefinch_update_decline_store(
+            paths->data_dir, state, NULL, NULL);
     }
     return false;
 }
@@ -738,7 +746,7 @@ int main(int argc, char **argv)
     if (recovery_button) {
         launcher_clear();
         launcher_puts(
-            state.previous_slot == TILEFINCH_UPDATE_SLOT_NONE
+            !tilefinch_update_state_previous_usable(&state)
                 ? "SAFE START: NO PREVIOUS VERSION YET\n"
                 : "SAFE START: PREVIOUS VERSION SELECTED\n");
     }
@@ -752,8 +760,10 @@ int main(int argc, char **argv)
         && launcher_verify_pending(
                &paths, &root, &state, &verify_status);
     TilefinchUpdateSlot slot = state.active_slot;
+    bool retry_declined = state.trial == TILEFINCH_UPDATE_TRIAL_STARTED
+        && tilefinch_update_decline_recorded(paths.data_dir, &state);
     TilefinchUpdateBootAction action = tilefinch_update_boot_decide(
-        &state, recovery_button, pending_verified, &slot);
+        &state, recovery_button, pending_verified, retry_declined, &slot);
     LAUNCHER_TIMING_MARK("update-decision");
 
     if (action == TILEFINCH_UPDATE_BOOT_START_TRIAL) {
@@ -822,10 +832,21 @@ int main(int argc, char **argv)
     }
     LAUNCHER_TIMING_MARK("handoff");
     /* Recovery and pre-held L always use the authoritative PBP directly.
-       A full/read-only card or a broken derived cache cannot block rollback. */
-    if (!launcher_boot_slot(&paths, slot,
-            !recovery_button && action != TILEFINCH_UPDATE_BOOT_RECOVERY,
-            fresh_install)) {
+       A full/read-only card or a broken derived cache cannot block rollback.
+       They also remove the derived copies: a copy that loads but never
+       reaches the browser would otherwise wedge every ordinary boot after
+       this one. The next ordinary boot prepares the cache again. */
+    bool fast_start =
+        tilefinch_update_boot_allows_fast_start(recovery_button, action);
+    if (!fast_start) {
+        psp_boot_cache_discard(paths.data_dir);
+        char slot_a[TILEFINCH_INSTALL_PATH_LIMIT];
+        if (fresh_install
+            && launcher_slot_path(
+                   &paths, TILEFINCH_UPDATE_SLOT_A, slot_a, sizeof(slot_a)))
+            (void) psp_boot_prepackaged_discard(slot_a);
+    }
+    if (!launcher_boot_slot(&paths, slot, fast_start, fresh_install)) {
         launcher_puts(
             "\nCould not start this slot.\n"
             "Hold L during startup to try the previous version.\n"

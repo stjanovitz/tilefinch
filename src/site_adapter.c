@@ -166,6 +166,9 @@ static bool youtube_metrics(
             youtube.transform_quota_overruns,
         .maximum_transform_slice_bytes =
             youtube.maximum_transform_slice_bytes,
+        .progress_units = youtube.body_bytes + youtube.transform_bytes
+            + youtube.build_slices + youtube.requests_started
+            + youtube.requests_completed,
         .network_us = youtube.network_us,
         .build_us = youtube.build_us,
         .request_wall_us = youtube.request_wall_us,

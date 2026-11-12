@@ -61,17 +61,28 @@ URL never starts media merely because of the URL shape.
 | --- | ---: |
 | Source response | 2 MiB |
 | Generated HTML | 96 KiB |
-| Search results | 12 |
-| Watch recommendations | 6 |
+| Search, playlist and history entries per page | 12 |
+| Watch recommendations | 12 |
 | Full description | 8 KiB |
 | Comments response | 256 KiB |
 | Rendered comments | 8 |
 
+A response that holds more entries than a page is shown a page at a time:
+**Load more** continues inside the same response (refetching it) before it
+follows YouTube's continuation token.
+
 Provider work runs through the ordinary one-slot fetch scheduler. Parsing and
 HTML generation advance in bounded slices, remain cancellable, and preserve
 the incumbent page until the replacement commits. A validated mobile API
-identity occupies one fixed 1.4 KiB session slot for at most 30 minutes and is
-invalidated when the cookie jar changes.
+identity occupies one fixed 1.4 KiB session slot for at most 30 minutes. It
+is bound to the signed-in account and the visitor cookie, so it is dropped
+when either changes or cookies are cleared, but not when YouTube's preference
+cookies or other sites' cookies change; the player resolver starts from it
+on every system language. Once the signed-in feed, a rating or an account
+action has read the mobile home page and found the account signed in, the
+slot also records that, so later feeds, ratings and account actions send
+their API request at once. If that first answer refuses the request, the job
+reads the home page once and tries again.
 
 ### Provider caches
 
@@ -87,7 +98,7 @@ thumbnail geometry, and their explicitly lazy images join the ordinary
 post-paint resource queue.
 
 Details and their expansions share this cache for a parsed snapshot of watch
-facts (at most 16 KiB per entry, never the raw response). The key is the
+facts (at most 28 KiB per entry, never the raw response). The key is the
 mapped watch URL, and the request-cookie fingerprint, language, date format,
 two-minute age limit, and captive-portal exclusion must all match. Returning
 to details can reuse these facts; an explicit Reload fetches fresh data.
@@ -134,8 +145,11 @@ audio path is dimensioned for AAC-LC.
 
 Provider-resolved URLs must remain on HTTPS port 443 at `googlevideo.com` or
 one of its subdomains. Redirects are disabled for those sources. Expiring URLs
-are rejected before playback when their remaining lifetime is inadequate;
-the bounded mid-playback refresh ladder may re-resolve and seek to the current
+are rejected before playback when their remaining lifetime is inadequate.
+That lifetime is the one the player response states (`expiresInSeconds`),
+counted on the monotonic clock from when the URL was resolved, so a PSP clock
+set wrong does not reject fresh URLs; only a response without it is judged by
+the URL's `expire=` against the device clock. The bounded mid-playback refresh ladder may re-resolve and seek to the current
 position after an expiry-related failure. Live refresh reopens at the new edge
 instead of attempting to seek into an expired rolling window.
 
@@ -191,27 +205,139 @@ both classes into “fragment plan failed.”
 
 HLS masters are parsed exactly, and large live media playlists
 incrementally, keeping only the newest twelve complete segment records
-rather than a DVR-sized response. Demuxed masters keep at most one video and
-one audio source, and each source streams one MPEG-TS segment at a time
-through the shared worker.
+rather than a DVR-sized response: a live playlist is compacted that way when
+its text passes 64 KiB or it lists more than 256 segments. A finite (VOD or
+ended) playlist is kept whole, so it may list at most 2,048 segments in at
+most 128 KiB of text: about 68 minutes at 2-second segments or 3.4 hours at
+6-second ones, and about 400 segments when each segment line is a 300-byte
+signed URL. A longer one fails as an unsupported format ("PSP CAN'T PLAY THIS
+VIDEO FORMAT", "Video playlist too long") and the page's next source, if any,
+is tried. The bounds are a memory choice. A segment record is 16 bytes (an
+offset into the retained playlist text, its start, duration and flags; its
+sequence number is the playlist's first plus its index), so the table is
+32 KiB, and the text is kept as an exact-size copy. While a playlist is
+parsed the stream's retained text and that copy are both held. A master
+lists at most 256 variants and audio renditions, in the same table.
+Demuxed masters keep at most one video and one audio source, and each source
+streams one MPEG-TS segment at a time through the shared worker.
 
 A live source starts from the last three advertised segments, refreshes the
 rolling media playlist at half its target duration, maps media-sequence
 changes onto one continuous local clock, and records any skipped window as a
-discontinuity. One of the two request slots stays free for a near-edge
-playlist refresh. Stale snapshots, temporary refresh failures, signed-URL
+discontinuity. With a separate audio rendition the two playlists number
+their segments independently and are fetched one after the other, so the
+server may publish a segment in between; segment numbers say nothing about
+which segments hold the same moment. Once both sources have primed, the
+audio is lined up with the video by the first timestamp each one read (the
+MPEG-TS PTS, or for packed audio the timestamp in the segment's ID3 tag).
+When the audio starts a segment or more away it moves once to the segment
+that holds the video's first picture and primes again; the remainder is
+trimmed, dropping sound from before the first picture, or kept as a late
+start of up to 50 ms. Audio whose timestamp lies outside the audio
+playlist (unrelated clocks) is left where it started. Packed audio must
+carry its timestamp in the segment's ID3 PRIV frame (RFC 8216, Packed
+Audio); without one, the only placement the standard leaves is the
+segment's position on its playlist timeline, so the two starts are matched
+by their distance from their playlists' ends, both of which are the live
+edge. A segment published between the two playlist fetches then shows up
+as a whole-segment offset that nothing in the playlists reveals.
+
+A live source that falls behind its window skips to the window's first
+segment, and its clock goes on without the skipped content. Once a
+separate audio rendition is lined up, the two share their skips, so a skip
+by either removes the same content from both clocks however far the other
+one skipped. The skipped duration comes from the timestamps: the new
+segment's first one against where the segment before the skip would put
+it. When there is none (packed audio without the ID3 timestamp), or it
+disagrees with the skip's EXTINF and sequence-number estimate by more than
+twice that estimate, the estimate is used. An estimate longer than the
+skipped segments the old playlist lists plus the new playlist's whole
+window is the numbers jumping (a renumbered playlist), not content: the
+timestamp is then checked against that length instead (or must match the
+estimate within an eighth, a long stall), and a skip neither measures
+stays the skipping rendition's own and unlinks the pair, which then play
+apart by the skipped content as unlinked renditions do. The rendition that
+did not skip drops a shared skip's content too and does not fetch segments
+wholly inside it; each segment it passes counts as progress for the
+60-second stall limit.
+The sound output is the clock and counts what it played, so sound
+already queued still plays and a picture skip removes only what follows
+it: the picture holds until the sound reaches it. Pictures dropped this
+way resume at the next keyframe. One of the two request slots
+stays free for a near-edge playlist refresh. Stale snapshots, temporary refresh failures, signed-URL
 replacement, and an eventual `ENDLIST` are all bounded transitions, and a
 playlist that makes no progress for 60 seconds fails visibly instead of
 spinning.
 
 HLS queues at most 64 samples and 576 KiB of payload, and it rejects
 encrypted, fragmented-MP4, byte-range, and explicitly non-AVC variants.
+A media playlist opened directly is played as muxed video and must carry AVC
+video: a program with no video stream, or packed-audio segments, fails as an
+unsupported format ("No supported codec"). Audio-only HLS is not supported.
+Audio that arrives before a muxed segment's first SPS is trimmed to the
+newest 48 frames instead of filling the queue.
 Neither MP4 nor HLS writes media bytes to the Memory Stick. A finite HLS seek
 resets only the selected segment and preserves an untouched in-flight request
 across repeated cooperative readiness probes; rolling live playback
 deliberately has no scrubber. Video-only variants may start priming as soon as
 their PMT and first video sample are known instead of filling the whole first
 segment.
+
+## MP3 page audio
+
+Page audio whose probe answers MPEG audio (an `audio/mpeg`-family type, or a
+body starting with an ID3v2 tag or two consistent Layer III frames) opens
+through `MediaMp3Source` (`src/media_mp3.c`) instead of the MP4 demuxer:
+
+- **Probe.** The page-audio probe is the ordinary 1 KiB range probe with an
+  `audio/mpeg` Accept and ICY status lines accepted as HTTP/1.0 200
+  (`FetchRequest.icy_status_line`, a libcurl 200 alias). A 206 is a seekable
+  file, a whole small 200 is a file of that length, and a body that
+  overflows the 32 KiB sniff window is a live stream.
+  `media_http_probe_route_audio` makes the call.
+- **SHOUTcast root addresses.** A SHOUTcast DNAS server (v1 and v2) picks
+  what its root address answers from the User-Agent: players get the
+  stream, and web browsers (any agent naming Mozilla, Tilefinch's
+  included) get a `302` to its status page, `index.html?sid=N`. Accept,
+  Range, `Icy-MetaData` and `Accept-Encoding` do not change that answer.
+  Every DNAS serves its first stream at `/;` to any client, and that is the
+  address its own `listen.pls` and `listen.m3u` give. When page audio at a
+  server root ends at that status page (same host and port, either
+  scheme), `media_shoutcast_stream_url` names `/;` on the same server and
+  the probe runs once more there, upgraded or not exactly as the first one
+  was. Nothing else is rewritten: another path, server or answer is
+  reported as it came.
+- **Transport.** The stream is one long worker response (`psp_media_hls.c`
+  in audio mode, a 6-hour transfer deadline, no `Icy-MetaData`), admitted
+  under the page's policy on every hop as `TILEFINCH_DESTINATION_AUDIO`.
+  A seekable file resumes or seeks with `Range: bytes=N-`.
+- **Source.** A 128 KiB compressed ring holds about 8 s of a 128 kbit/s
+  station, so an hour of radio uses the same memory as a second. Sync needs
+  two consistent headers; a damaged frame drops back into a resync bounded
+  at 64 KiB. Leading ID3 tags are skipped (by range when seekable), a Xing,
+  Info or VBRI frame supplies a VBR file's length and seek table and is not
+  decoded, and a dropped live stream reconnects with 0.5-4 s backoff, at
+  most four times without a delivered frame.
+- **Station text.** The stream's `icy-name` and `icy-genre` response
+  headers (headers only; the player never asks for in-band metadata) are
+  kept per response, and a reconnect's non-empty answer replaces them.
+  `media_mp3_station_text` reads each as UTF-8 when the whole value is
+  well-formed and as Latin-1 otherwise, drops C0 and C1 controls, collapses
+  whitespace and cuts on a character boundary at 96 bytes. The name becomes
+  the player title, ahead of the element's `title` attribute and the page
+  title; the genre is the line under the listening state. A live reconnect
+  reports `reconnecting` in the stats from the break until the new
+  response's first bytes.
+- **Decode.** `sceAudiocodec` in MP3 mode decodes one frame per call into a
+  1152-sample buffer that is re-blocked into the audio queue's 1024-sample
+  stereo blocks. MPEG-1, 2 and 2.5 at every Layer III rate, CBR or VBR,
+  mono or stereo. The decoder is skipped when the optional software decoder
+  owns the Media Engine.
+
+MP3 inside MP4 or HLS is not supported, and the host lab has no MP3 backend:
+host tests cover the parser, source and probe (`tilefinch-media-mp3-tests`,
+`tilefinch-media-mp3-stream-tests`), and decode is checked under PPSSPP and on
+the device.
 
 ## PSP decode and presentation
 
@@ -470,7 +596,9 @@ Software-decoder diagnostics are in
   `surface-quarantines=` on the `tilefinch-media-present:` line, plus
   `tilefinch-media-present: event=dma-quarantine*`. A quarantine without a
   matching late completion is a staging transfer that never came back, and
-  the session ends on it deliberately.
+  the session that posted it ends on it deliberately, once
+  (`event=dma-quarantine-expired ... owned=1`). Retry and later sessions play
+  without the staging copy until the transfer is seen to end.
 - Firmware events: `tilefinch-media-decoder: event=...` records setup,
   refusals, recoveries, and failures. Steady job timing is aggregated in
   `tilefinch-media-worker:` rather than logged per job; watchdog failures name

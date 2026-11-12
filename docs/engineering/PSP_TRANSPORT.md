@@ -79,10 +79,37 @@ may block in DNS, TCP, or TLS. It exposes bounded generation-bearing request
 slots:
 
 - ordinary page and resource lanes allocate 64 KiB response buffers lazily;
+  of the six response descriptors, page and resource requests take at most
+  five (three while a player holds the media reserve) and the sixth is kept
+  for a blocking request: a synchronous XHR, a module import or a document's
+  external script (parser-blocking, or async or deferred at the end of the
+  parse), whose thread pumps nothing else while it waits. Such a request
+  likewise takes the slot reserved past its scheduler's cap and past the
+  page domain's, so requests nobody takes meanwhile cannot hold it off; only
+  the byte pool is shared, and a synchronous XHR waits at most 2 s for it and
+  then fails. A parser-blocking script's speculative preload that is still
+  waiting for a descriptor is cancelled when the parser reaches the script,
+  which then fetches on the kept one. Scripts a page inserts are fetched
+  without blocking and stay on the ordinary lanes;
 - media range requests use two 256 KiB windows;
 - two optional WebSocket lanes retain one 64 KiB receive message and one
   64 KiB outbound message each, with one browser-visible event of backpressure;
 - HOME preconnect owns a bodyless descriptor;
+- a request slot holds a body under 8 KiB and extra headers under 2 KiB
+  inline; a larger body (up to `FETCH_REQUEST_BODY_LIMIT`, 96 KiB) or header
+  block (up to 8 KiB) gets a Budget copy of its exact size that the browser
+  thread frees once the slot is done, so every request shape the validator
+  admits runs on the worker. A scheduler request the worker cannot take
+  fails instead of running curl on the browser thread, with the reason in
+  its error: its shape, its Cookie header, or a deadline that passed while
+  the worker started; or the worker itself unavailable ("network transport
+  worker unavailable (worker-off)" for a scheduler that does not use it,
+  `worker-start` when the worker did not start, `worker-chunk` when the
+  scheduler's 64 KiB handoff buffer was refused). Only while an HTTP trace
+  is captured or replayed, which the worker cannot do, does a scheduler run
+  curl on the browser thread. A refused start or chunk fails that request
+  only: the next request tries again, a worker start at most once a
+  second;
 - update traffic uses the same worker but retains updater-owned verification
   and installation state.
 
@@ -90,6 +117,20 @@ The worker is a byte mover, not a browser-policy authority. It never touches
 the DOM, JavaScript runtime, page allocator, cookie jar, UI, profile, logger,
 or filesystem. The browser thread prepares and authorizes each request hop,
 then consumes immutable chunks through the ordinary fetch scheduler.
+
+Worker hops follow the scheduler's own timing (`FetchWorkerTiming`): a
+buffered request is bounded by its deadline, with a stall abort only when the
+caller asks for one; a stream's deadline bounds only the wait for its response
+headers, and afterwards the stream ends only when no byte arrives for its
+stall allowance (`scheduled_stall_seconds`). A stream's bytes are handed over
+when the slot holds the publication target or 50 ms after the last byte
+arrived, whichever comes first, so a slow stream is not held in the worker.
+A stream consumer that reports its room (`FetchStreamOptions.on_capacity`,
+as `EventSource` does for its 64 KiB buffer) is handed no more than that per
+pump; the rest stays published in the worker slot until script has taken
+what it holds.
+Other worker users keep the default: the deadline throughout and a 6 s stall
+once a status line has arrived.
 
 Redirect chains are intentionally sequential: only one already-authorized hop
 from a request is executing at a time. Independent requests still progress
@@ -211,9 +252,11 @@ credit is assigned per batch:
 
 1. Estimate the per-sample min-entropy as `-log2(p)`, where `p` is the 99%
    upper confidence bound (z = 2.576, SP 800-90B style) on the hit rate of the
-   best of several predictors: most-common value, repeat at lags 1..8, and a
-   linear-trend guess. Constants, alternations, short cycles and drifting
-   phase between two clocks all score near zero.
+   best of several predictors: most-common value, repeat at lags 1..64 (1..16
+   for a 64-sample sleep batch; a quarter of the batch, at most 64), and a
+   linear-trend guess. Constants, alternations, cycles up to the longest lag,
+   drifting phase and a beat between two clocks all score near zero: a beat is
+   a rotation, so some lag up to the longest nearly repeats it.
 2. Cap that at 1 bit per sample, then divide by 4, rounding down. The samples
    are not independent and an unanticipated predictor could beat ours; the
    divisor is the margin for both. A batch therefore earns at most 64 bits
@@ -267,23 +310,48 @@ waiting for credit (the first lookup precedes the first handshake), plus one
 timing sample per call. That is enough for an off-path guess; it is never used
 for keys.
 
-**Cost.** The first Home paint and input sample do not wait for seeding.
-After paint, association wait frames optionally mix the existing seed,
-gather one complete estimator batch per admitted slice, and perform the
-ordinary credited release in its own slice. An immediate navigation's
-foreground connection wait uses the same preparation owner after checking
-controls. Optional warm-up never releases uncredited output, even with the
-validation policy; if it refuses, ordinary demand retains its original
-bounded attempt and configured policy. It adds no network requests and
-moves, rather than duplicates, the existing seed-file read and write.
+**Cost.** Seeding is kept off the first paint wherever there is a wait to
+hide it in:
 
-Without completed preparation, the remaining first seeding runs inside
-curl's global initialization on the browser thread: at least 4 work and 3 sleep batches
-(1,216 samples) when every batch earns the maximum, which should take tens of
-milliseconds, plus one small Memory Stick read and a 48-byte write. After
-release, each mbed TLS entropy poll costs about ten SHA-256 compressions for
-its 128 bytes. The actual sample times and estimates are only known from a device
-run:
+- **Home or a profile page at boot.** The first Home paint and input sample
+  do not wait for seeding. After paint, association wait frames optionally
+  mix the existing seed, gather one complete estimator batch per admitted
+  slice, and perform the ordinary credited release in its own slice. An
+  immediate navigation's foreground connection wait uses the same
+  preparation owner after checking controls.
+- **A boot straight to a network page** (restore last page, or a custom
+  homepage), a reconnect after resume, and any later association wait whose
+  warm-up already retired. The foreground association wait has no
+  preparation owner, so it calls the same step, `psp_entropy_prepare_step()`,
+  once per vblank while no button is held. The pool is usually released
+  before `network-ready`, and the first navigation no longer pays for it.
+- **Trace replay (validation builds).** There is no association wait, so the
+  boot seeds just before the initial navigation
+  (`psp_validation_entropy_preseed()`). First-present does not include it;
+  the `event=seeded` line still reports it.
+
+Optional warm-up never releases uncredited output, even with the validation
+policy; if it refuses, ordinary demand retains its original bounded attempt
+and configured policy. It adds no network requests and moves, rather than
+duplicates, the existing seed-file read and write. The samples, the
+estimator, the credit and the release rule are the same whichever path runs
+the batches.
+
+Without completed preparation (for example, leaving Home for a page before
+the warm-up finishes, with Wi-Fi already up), the remaining first seeding runs
+inside curl's global initialization on the browser thread: at least 4 work
+and 3 sleep batches (1,216 samples) when every batch earns the maximum. On a
+PSP the full gathering measures 88–175 ms (`elapsed-us`), plus one small
+Memory Stick read and a 48-byte write. A work batch takes about 1.8 ms and a
+sleep batch about 15 ms, so the time is mostly the number of sleep batches.
+The work samples are a few microseconds measured on a 1 us clock, so each
+is one of two or three integers. Their credit therefore depends on where the
+mean duration falls between two ticks, and it moves when a relink shifts
+the code by a fraction of a microsecond
+(`test_estimator_tracks_tick_quantization`). In the association wait the
+whole seeding takes 11–21 vblanks. After release, each mbed TLS entropy poll
+costs about ten SHA-256 compressions for its 128 bytes. The actual sample
+times and estimates are only known from a device run:
 
 ```text
 tilefinch-entropy: event=seeded mode=credited credited-bits=... target=256 attempts=1 elapsed-us=... seed-file=loaded work-batches=... work-mbits=MIN..MAX work-sample-us=... sleep-batches=... sleep-mbits=MIN..MAX sleep-sample-us=...
@@ -293,6 +361,28 @@ tilefinch-entropy: seed-file=written
 `mode=uncredited` on hardware means the jitter estimate fell short within one
 attempt; `event=unseeded` is the shipping build refusing. Either must be
 understood before a release.
+
+**Raw-sample capture (validation builds).** The estimator sees one batch at a
+time, so structure longer than its lags (a beat between two clocks, or two
+such beats) needs the samples themselves. A validation build run from
+`host0:` with `host0:/entropy-capture.cfg` present records every batch the
+pool gathers, in measured order, with its estimate and credit, then at the
+preseed point seeds (even without a trace), takes the configured extra runs
+of contiguous work and sleep samples that never reach the pool, and writes
+one TFER file beside the program. It never arms from the Memory Stick and
+never writes there; keys and format are in `src/psp_entropy_capture.h`.
+`tools/entropy_capture_report.py capture-1.tfer ...` reads one or more boots
+and reports repeat rate and autocorrelation at lags 1..256 against
+independent samples with the same value frequencies, and screening
+min-entropy estimates in the style of SP 800-90B (most common value, best
+lag, first-order Markov). A lag past 8 beyond the Bonferroni threshold is
+reported as structure. A capture boot's samples are that boot's pool input,
+so its TLS session keys are not secret from whoever holds the file.
+
+```text
+tilefinch-entropy-capture: armed output=host0:/entropy-1.tfer extra-rounds=16 work-run=4096 sleep-run=1024 buffer-kib=1024
+tilefinch-entropy-capture: written path=host0:/entropy-1.tfer records=... dropped=0 work-samples=... sleep-samples=... bytes=... extra-us=...
+```
 
 ### Connection and session reuse
 

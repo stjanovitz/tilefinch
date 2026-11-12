@@ -64,13 +64,15 @@ typedef struct {
     bool truncated;
 } ContentBlockerCandidate;
 
-/* Deliberately conservative: these are dedicated advertising/auction hosts,
-   not general analytics/CDN hosts. BASIC applies them only to third-party
-   subresources to minimize compatibility surprises. */
+/* Deliberately conservative: these are dedicated advertising/auction and
+   ad-verification hosts, not general analytics/CDN hosts. BASIC applies
+   them only to third-party subresources to minimize compatibility
+   surprises. */
 static const char *const basic_hosts[] = {
     "33across.com", "adform.net", "adnxs.com", "adsrvr.org",
-    "amazon-adsystem.com", "bidswitch.net", "casalemedia.com",
-    "contextweb.com", "criteo.com", "criteo.net", "demdex.net",
+    "amazon-adsystem.com", "bidswitch.net", "btloader.com",
+    "casalemedia.com", "confiant-integrations.net", "contextweb.com",
+    "criteo.com", "criteo.net", "demdex.net",
     "doubleclick.net", "googleadservices.com", "googlesyndication.com",
     "indexww.com", "lijit.com", "mathtag.com", "media.net",
     "moatads.com", "openx.net", "outbrain.com", "pubmatic.com",
@@ -78,6 +80,53 @@ static const char *const basic_hosts[] = {
     "serving-sys.com", "sharethrough.com", "smartadserver.com",
     "smaato.net", "taboola.com", "teads.tv", "triplelift.com",
     "yieldmo.com", "zedo.com"
+};
+
+/* BASIC also refuses the dedicated hosts of two kinds of third-party
+   script SDK. They are large (hundreds of KB of script each), run before
+   or during the first paint, and the page reads as it was sent without
+   them.
+   Each entry is a vendor's own delivery and collection host, never a
+   shared CDN, and the same third-party-only rule applies. Feature-flag
+   services (whose answers apps read to work), recommendation and
+   personalisation engines (which supply page content) and analytics-only
+   hosts are deliberately not listed. Where a page waits for a refused tag
+   manager or A/B client, refused_script_shims below answers it. */
+static const char *const basic_sdk_hosts[] = {
+    /* Tag managers: Google Tag Manager and gtag.js, Adobe Experience
+       Platform Launch (DTM), Tealium iQ, Ensighten, Commanders Act
+       TagCommander, Segment. */
+    "googletagmanager.com", "adobedtm.com", "tiqcdn.com", "ensighten.com",
+    "tagcommander.com", "segment.com", "segment.io",
+    /* A/B testing: Optimizely, VWO, AB Tasty, Google Optimize, Kameleoon,
+       Convert, Adobe Target's delivery host. */
+    "optimizely.com", "visualwebsiteoptimizer.com", "abtasty.com",
+    "googleoptimize.com", "kameleoon.eu", "kameleoon.io",
+    "convertexperiments.com", "tt.omtrdc.net"
+};
+
+/* Reserved for a future opt-in level (with its Settings row, catalog v17),
+   not part of BASIC: the hosts of paywall and subscription SDKs, Piano
+   (and its Tinypass hosts) piano.io and tinypass.com, Poool poool.fr,
+   Pelcro pelcro.com and LaterPay laterpay.net. BASIC leaves them alone so
+   that a metered or subscription page counts and gates its articles as the
+   site intends; a Custom list or a player page can still refuse them. */
+
+#define BASIC_RULE_COUNT \
+    (sizeof(basic_hosts) / sizeof(basic_hosts[0]) \
+     + sizeof(basic_sdk_hosts) / sizeof(basic_sdk_hosts[0]))
+
+/* What a page waits for from a refused script, by the script's host: the
+   callbacks the loaded script would make (content_blocker.h). */
+static const struct {
+    const char *host;
+    unsigned shims;
+} refused_script_shims[] = {
+    {"googletagmanager.com", CONTENT_BLOCKER_SHIM_GOOGLE_TAG},
+    {"googleoptimize.com", CONTENT_BLOCKER_SHIM_GOOGLE_TAG},
+    {"adobedtm.com", CONTENT_BLOCKER_SHIM_ADOBE_TARGET},
+    {"tt.omtrdc.net", CONTENT_BLOCKER_SHIM_ADOBE_TARGET},
+    {"visualwebsiteoptimizer.com", CONTENT_BLOCKER_SHIM_VWO}
 };
 
 /* A player page (the page a site declares as its video's player, opened
@@ -342,7 +391,9 @@ static bool blocker_candidate_add(ContentBlockerCandidate *candidate,
     if (candidate->rule_count >= CONTENT_BLOCKER_RULE_LIMIT
         || host_length + 1u > CONTENT_BLOCKER_STRING_BYTES_LIMIT
                                   - candidate->string_bytes) {
+        /* The list keeps the rules that fit; this one is dropped. */
         candidate->truncated = true;
+        candidate->ignored_rule_count++;
         return false;
     }
     size_t index = candidate->rule_count++;
@@ -469,11 +520,25 @@ static bool blocker_load_custom(ContentBlocker *blocker, const char *path,
     char line[2048];
     size_t file_bytes = 0;
     bool ok = true;
-    while (fgets(line, sizeof(line), file) != NULL) {
+    while (ok && fgets(line, sizeof(line), file) != NULL) {
         size_t length = strlen(line);
         if (length == sizeof(line) - 1u && line[length - 1u] != '\n') {
-            ok = false;
-            break;
+            int next = fgetc(file);
+            if (next != EOF) {
+                /* Longer than any rule this matcher keeps (published lists
+                   carry long cosmetic and $domain= rules): skip to its end
+                   and count it, instead of refusing the whole list. */
+                size_t skipped = length + 1u;
+                while (next != EOF && next != '\n') {
+                    next = fgetc(file);
+                    skipped++;
+                }
+                if (skipped > CONTENT_BLOCKER_FILE_BYTES_LIMIT - file_bytes)
+                    ok = false;
+                file_bytes += ok ? skipped : 0u;
+                candidate->ignored_rule_count++;
+                continue;
+            }
         }
         if (length > CONTENT_BLOCKER_FILE_BYTES_LIMIT - file_bytes) {
             ok = false;
@@ -488,7 +553,7 @@ static bool blocker_load_custom(ContentBlocker *blocker, const char *path,
     }
     if (ferror(file)) ok = false;
     if (fclose(file) != 0) ok = false;
-    if (!ok || candidate->truncated) return false;
+    if (!ok) return false;
     if (candidate->rule_count == 0) {
         budget_free(blocker->budget, candidate->rules);
         budget_free(blocker->budget, candidate->strings);
@@ -684,6 +749,10 @@ bool content_blocker_would_block(
                     break;
                 }
             }
+            for (size_t i = 0; !blocked
+                 && i < sizeof(basic_sdk_hosts) / sizeof(basic_sdk_hosts[0]);
+                 i++)
+                blocked = blocker_host_suffix(host, basic_sdk_hosts[i]);
         }
     } else {
         (void) blocker_custom_host_decision(
@@ -691,6 +760,23 @@ bool content_blocker_would_block(
             third_party, &allowed, &blocked);
     }
     return blocked && !allowed;
+}
+
+unsigned content_blocker_refused_script_shims(
+    const ContentBlocker *blocker, const char *script_url,
+    const char *document_url)
+{
+    char host[CONTENT_BLOCKER_HOST_LIMIT];
+    if (!content_blocker_would_block(blocker, script_url, document_url,
+                                     "script", "no-cors")
+        || !blocker_url_host(script_url, host)) return 0;
+    unsigned shims = 0;
+    for (size_t i = 0; i < sizeof(refused_script_shims)
+                               / sizeof(refused_script_shims[0]); i++) {
+        if (blocker_host_suffix(host, refused_script_shims[i].host))
+            shims |= refused_script_shims[i].shims;
+    }
+    return shims;
 }
 
 static bool blocker_inline_contains(const char *source, size_t length, const char *token)
@@ -770,8 +856,7 @@ bool content_blocker_metrics(const ContentBlocker *blocker,
     *metrics = (ContentBlockerMetrics) {
         .mode = blocker->mode,
         .rule_count = blocker->mode == CONTENT_BLOCKER_BASIC
-            ? sizeof(basic_hosts) / sizeof(basic_hosts[0])
-            : blocker->rule_count,
+            ? BASIC_RULE_COUNT : blocker->rule_count,
         .allow_rule_count = blocker->allow_rule_count,
         .ignored_rule_count = blocker->ignored_rule_count,
         .allowed_site_count = blocker->allowed_site_count,

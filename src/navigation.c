@@ -5,6 +5,7 @@
 #include "tilefinch_test_faults.h"
 #include "tilefinch_compiler.h"
 #include "navigation_staging_policy.h"
+#include "stylesheet_inputs.h"
 #include "tilefinch/content_blocker.h"
 #include "tilefinch/declarative_refresh.h"
 #include "tilefinch/fetch.h"
@@ -12,6 +13,7 @@
 #include "tilefinch/image_retarget.h"
 #include "tilefinch/linked_video_preview.h"
 #include "tilefinch/media_discovery.h"
+#include "tilefinch/media_mp3.h"
 #include "tilefinch/script_loader.h"
 #include "tilefinch/platform.h"
 #include "tilefinch/pixel_math.h"
@@ -127,6 +129,7 @@ void navigation_destroy(NavigationSession *session)
         }
         budget_free(session->budget, session->history);
         budget_free(session->budget, session->user_css);
+        budget_free(session->budget, session->form_submission_body);
     }
     memset(session, 0, sizeof(*session));
 }

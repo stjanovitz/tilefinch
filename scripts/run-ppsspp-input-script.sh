@@ -59,6 +59,12 @@
 # PPSSPP 1.20 renamed the canonical setting to [CPU] CPUSpeed; the older
 # LockedCPUSpeed spelling is silently ignored.
 #
+# Set TILEFINCH_PPSSPP_TZ to a POSIX TZ string (for example UTC+8, or
+# TFC-03:15:00) to give the emulator that local time zone. The PSP's local
+# clock is the host's, and Night mode's Auto setting follows it, so a run
+# that must be day or night regardless of when it starts pins it here.
+# A LaunchServices launch does not inherit the shell's TZ.
+#
 # Set TILEFINCH_PPSSPP_DEBUGGER_PORT to a loopback port to start PPSSPP's
 # WebSocket debugger with the run, for tools/ppsspp_pc_sampler.py (program
 # counter sampling for code-layout work). The first boot then idles on
@@ -613,6 +619,16 @@ run_once() {
         # The direct (non-macOS) launch inherits it instead.
         [ "$is_darwin" -eq 1 ] || export SDL_AUDIODRIVER=dummy
     fi
+    tz_env=
+    if [ -n "${TILEFINCH_PPSSPP_TZ:-}" ]; then
+        case "$TILEFINCH_PPSSPP_TZ" in
+            *[!A-Za-z0-9:+-]*)
+                printf 'TILEFINCH_PPSSPP_TZ must be a POSIX TZ string\n' >&2
+                return 1 ;;
+        esac
+        tz_env="--env TZ=$TILEFINCH_PPSSPP_TZ"
+        [ "$is_darwin" -eq 1 ] || export TZ="$TILEFINCH_PPSSPP_TZ"
+    fi
 
     printf 'PPSSPP scripted input: %s run %s/%s\n' \
         "$scenario" "$run_index" "$runs"
@@ -621,7 +637,7 @@ run_once() {
         : >"$emulator_stderr"
         # shellcheck disable=SC2086
         open -g -n -W \
-            --env "HOME=$home_dir" $audio_env \
+            --env "HOME=$home_dir" $audio_env $tz_env \
             --stdout "$emulator_stdout" \
             --stderr "$emulator_stderr" \
             -a "$ppsspp_bundle" \
@@ -697,7 +713,10 @@ run_once() {
         [ -f "$f" ] && cp "$f" "$run_result/" 2>/dev/null || true
     done
     cp "$run_dir/script.ini" "$run_result/ppsspp-requested.ini"
-    for f in "$app_dir"/frame-mark-*.ppm "$app_dir"/data/frame-mark-*.ppm; do
+    # Mark samples, and the full-resolution final frame dump_frame=1 asks for.
+    for f in "$app_dir"/frame-mark-*.ppm "$app_dir"/data/frame-mark-*.ppm \
+             "$app_dir"/frame-device-final.ppm \
+             "$app_dir"/data/frame-device-final.ppm; do
         [ -f "$f" ] && cp "$f" "$run_result/" 2>/dev/null || true
     done
     # An engine-PGO training build (PSP_BROWSER_QUICKJS_PGO_GENERATE) writes

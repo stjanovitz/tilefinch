@@ -1,10 +1,14 @@
 #include "tilefinch/offline_library.h"
+#include "tilefinch/file_download.h"
 #include "tilefinch/media_file.h"
 #include "tilefinch/psp_offline_store.h"
+
+#include "offline_library_fence_probe.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -29,6 +33,269 @@ static uint32_t test_offline_hash(const unsigned char *data, size_t length)
     return hash;
 }
 
+static bool read_whole(const char *path, unsigned char *data, size_t capacity,
+                       size_t *length)
+{
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) return false;
+    *length = fread(data, 1, capacity, file);
+    bool okay = !ferror(file) && fgetc(file) == EOF;
+    return fclose(file) == 0 && okay;
+}
+
+static bool write_whole(const char *path, const unsigned char *data,
+                        size_t length)
+{
+    FILE *file = fopen(path, "wb");
+    if (file == NULL) return false;
+    bool okay = fwrite(data, 1, length, file) == length;
+    return fclose(file) == 0 && okay;
+}
+
+static bool same_file(const char *path, const unsigned char *data,
+                      size_t length)
+{
+    static unsigned char current[64u * 1024u];
+    size_t current_length = 0;
+    return read_whole(path, current, sizeof(current), &current_length)
+        && current_length == length && memcmp(current, data, length) == 0;
+}
+
+static void remove_test_tree(const char *path)
+{
+    DIR *directory = opendir(path);
+    if (directory == NULL) {
+        (void) unlink(path);
+        return;
+    }
+    struct dirent *entry = NULL;
+    while ((entry = readdir(directory)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+            continue;
+        char child[400];
+        snprintf(child, sizeof(child), "%s/%s", path, entry->d_name);
+        remove_test_tree(child);
+    }
+    (void) closedir(directory);
+    (void) rmdir(path);
+}
+
+/* Two queued videos: the primary names both, library.bin.bak names one. */
+static bool make_two_generation_library(
+    Budget *budget, const char *directory, uint32_t *first, uint32_t *second)
+{
+    OfflineLibrary library;
+    char error[256] = {0};
+    offline_library_init(&library, budget, directory);
+    return mkdir(directory, 0700) == 0 && offline_library_load(&library)
+        && offline_library_enqueue_youtube(
+               &library, "https://www.youtube.com/watch?v=TFTEST00011",
+               "First", first, error, sizeof(error))
+        && offline_library_enqueue_youtube(
+               &library, "https://www.youtube.com/watch?v=TFTEST00012",
+               "Second", second, error, sizeof(error));
+}
+
+/* IS-06: an index a later release wrote is not damage. Loading must not
+   fall back past it, publish an older generation over it or sweep the
+   payloads only it names. */
+static int test_newer_index_is_left_alone(Budget *budget, const char *root)
+{
+    for (unsigned newer_at = 0; newer_at < 3; newer_at++) {
+        static const char *suffixes[] = {"", ".tmp", ".bak"};
+        char directory[200], primary[240], newer_path[240], backup[240];
+        snprintf(directory, sizeof(directory), "%s/newer-%u", root, newer_at);
+        uint32_t first = 0, second = 0;
+        CHECK(make_two_generation_library(budget, directory, &first, &second));
+        snprintf(primary, sizeof(primary), "%s/library.bin", directory);
+        snprintf(backup, sizeof(backup), "%s/library.bin.bak", directory);
+        snprintf(newer_path, sizeof(newer_path), "%s/library.bin%s",
+                 directory, suffixes[newer_at]);
+        static unsigned char index[64u * 1024u];
+        size_t length = 0;
+        CHECK(read_whole(primary, index, sizeof(index), &length)
+              && length > 20u);
+        index[8] = 7u; /* version: the body checksum does not cover it */
+        if (newer_at != 0) CHECK(unlink(primary) == 0);
+        if (newer_at == 2) CHECK(unlink(backup) == 0);
+        CHECK(write_whole(newer_path, index, length));
+        char payload[240];
+        snprintf(payload, sizeof(payload), "%s/%08x.video.part", directory,
+                 (unsigned) second);
+        CHECK(write_whole(payload, (const unsigned char *) "part", 4));
+        static unsigned char backup_bytes[64u * 1024u];
+        size_t backup_length = 0;
+        bool had_backup = newer_at != 2
+            && read_whole(backup, backup_bytes, sizeof(backup_bytes),
+                          &backup_length);
+
+        OfflineLibrary older;
+        offline_library_init(&older, budget, directory);
+        CHECK(!offline_library_load(&older) && older.newer_format
+              && !older.loaded && !offline_library_save(&older));
+        CHECK(!offline_library_load(&older) && older.newer_format);
+        CHECK(same_file(newer_path, index, length));
+        CHECK(!had_backup || same_file(backup, backup_bytes, backup_length));
+        CHECK(access(payload, F_OK) == 0);
+        if (newer_at != 0) CHECK(access(primary, F_OK) != 0);
+
+        /* The release that wrote it opens it again once it is current. */
+        index[8] = 5u;
+        CHECK(write_whole(newer_path, index, length));
+        OfflineLibrary current;
+        offline_library_init(&current, budget, directory);
+        CHECK(offline_library_load(&current) && !current.newer_format
+              && offline_library_find(&current, second) != NULL);
+    }
+    return 0;
+}
+
+/* IS-08: a normalized index that cannot be written (full or read-only
+   card) is still used, and written once the card accepts it. */
+static int test_unwritable_index_still_opens(Budget *budget, const char *root)
+{
+    char directory[200], primary[240];
+    snprintf(directory, sizeof(directory), "%s/readonly", root);
+    snprintf(primary, sizeof(primary), "%s/library.bin", directory);
+    uint32_t first = 0, second = 0;
+    CHECK(make_two_generation_library(budget, directory, &first, &second));
+    OfflineLibrary writer;
+    offline_library_init(&writer, budget, directory);
+    CHECK(offline_library_load(&writer));
+    offline_library_find_mutable(&writer, second)->state =
+        OFFLINE_ITEM_DOWNLOADING;
+    CHECK(offline_library_save(&writer));
+    static unsigned char before[64u * 1024u];
+    size_t before_length = 0;
+    CHECK(read_whole(primary, before, sizeof(before), &before_length));
+    CHECK(chmod(directory, 0500) == 0);
+    OfflineLibrary reader;
+    offline_library_init(&reader, budget, directory);
+    bool loaded = offline_library_load(&reader);
+    bool paused = loaded && offline_library_find(&reader, second) != NULL
+        && offline_library_find(&reader, second)->state == OFFLINE_ITEM_PAUSED
+        && reader.save_pending;
+    bool untouched = same_file(primary, before, before_length);
+    CHECK(chmod(directory, 0700) == 0);
+    CHECK(loaded && paused && untouched);
+    /* The next load writes it. */
+    CHECK(offline_library_load(&reader) && !reader.save_pending
+          && !same_file(primary, before, before_length));
+    OfflineLibrary again;
+    offline_library_init(&again, budget, directory);
+    CHECK(offline_library_load(&again) && !again.save_pending
+          && offline_library_find(&again, second)->state
+                 == OFFLINE_ITEM_PAUSED);
+    return 0;
+}
+
+/* IS-09: a removed download whose published file outlives the index save
+   (a power cut between the two) is finished by the next load. */
+static int test_removed_download_is_finished(Budget *budget, const char *root)
+{
+    char directory[200], published[400], inner[440], note[240];
+    snprintf(directory, sizeof(directory), "%s/tombstone", root);
+    CHECK(mkdir(directory, 0700) == 0);
+    OfflineLibrary library;
+    offline_library_init(&library, budget, directory);
+    uint32_t id = 0;
+    char error[256] = {0};
+    CHECK(offline_library_load(&library)
+          && file_download_enqueue(
+                 &library, "https://files.test/report.pdf", NULL, &id, error,
+                 sizeof(error)));
+    OfflineLibraryItem *item = offline_library_find_mutable(&library, id);
+    CHECK(item != NULL);
+    item->state = OFFLINE_ITEM_READY;
+    item->content_bytes = 0;
+    CHECK(offline_library_save(&library)
+          && file_download_path(&library, id, published, sizeof(published)));
+    snprintf(note, sizeof(note), "%s/%08x.file.gone", directory, (unsigned) id);
+    /* The published name cannot be removed during this removal (a
+       non-empty directory stands in for the cut power). */
+    snprintf(inner, sizeof(inner), "%s/x", published);
+    CHECK(mkdir(published, 0700) == 0
+          && write_whole(inner, (const unsigned char *) "x", 1));
+    CHECK(offline_library_remove(&library, id)
+          && offline_library_find(&library, id) == NULL
+          && access(published, F_OK) == 0 && access(note, F_OK) == 0);
+    CHECK(unlink(inner) == 0);
+    OfflineLibrary next;
+    offline_library_init(&next, budget, directory);
+    CHECK(offline_library_load(&next) && access(published, F_OK) != 0
+          && access(note, F_OK) != 0);
+    /* An ordinary removal leaves neither behind. */
+    CHECK(file_download_enqueue(&next, "https://files.test/report.pdf", NULL,
+                                &id, error, sizeof(error)));
+    item = offline_library_find_mutable(&next, id);
+    item->state = OFFLINE_ITEM_READY;
+    CHECK(offline_library_save(&next)
+          && file_download_path(&next, id, published, sizeof(published))
+          && write_whole(published, (const unsigned char *) "", 0));
+    snprintf(note, sizeof(note), "%s/%08x.file.gone", directory, (unsigned) id);
+    CHECK(offline_library_remove(&next, id) && access(published, F_OK) != 0
+          && access(note, F_OK) != 0);
+    return 0;
+}
+
+/* A web app with a 16x16 icon on disk, every byte `id`. */
+static int put_icon_app(OfflineLibrary *library, size_t index, uint32_t id)
+{
+    unsigned char pixels[OFFLINE_LIBRARY_APP_ICON_LIMIT];
+    memset(pixels, (int) id, sizeof(pixels));
+    OfflineLibraryItem *item = &library->items[index];
+    memset(item, 0, sizeof(*item));
+    item->id = id;
+    item->type = OFFLINE_ITEM_WEB_APP;
+    item->state = OFFLINE_ITEM_READY;
+    item->icon_bytes = OFFLINE_LIBRARY_APP_ICON_LIMIT;
+    item->icon_hash = test_offline_hash(pixels, sizeof(pixels));
+    snprintf(item->title, sizeof(item->title), "App %u", (unsigned) id);
+    char path[240];
+    CHECK(offline_library_item_path(library, id, ".app.icon", path,
+                                    sizeof(path))
+          && write_whole(path, pixels, sizeof(pixels)));
+    return 0;
+}
+
+/* The Saved list takes each web app's icon in turn and its rows keep the
+   pointers, so one refill must never land in a slot an earlier row of the
+   same list holds. Twelve apps fill the cache; six are removed and six
+   others installed, so every slot is taken (six by removed apps) when the
+   newcomers are read. Choosing the slot by id alone put app 18 over app 7,
+   whose row then showed app 18's icon. */
+static int test_icon_refill_keeps_listed_icons(Budget *budget,
+                                               const char *root)
+{
+    char directory[200];
+    snprintf(directory, sizeof(directory), "%s/icons", root);
+    CHECK(mkdir(directory, 0700) == 0);
+    PspOfflineStore store;
+    psp_offline_store_init(&store, budget, NULL, directory);
+    CHECK(offline_library_load(&store.library) && store.library.count == 0);
+    for (uint32_t id = 1; id <= OFFLINE_LIBRARY_ITEM_LIMIT; id++)
+        CHECK(put_icon_app(&store.library, id - 1u, id) == 0);
+    store.library.count = OFFLINE_LIBRARY_ITEM_LIMIT;
+    for (uint32_t id = 1; id <= OFFLINE_LIBRARY_ITEM_LIMIT; id++)
+        CHECK(psp_offline_store_app_icon(&store, id) != NULL);
+    /* Apps 1-6 removed (7-12 move up), apps 13-18 appended. */
+    for (size_t at = 0; at < 6u; at++)
+        store.library.items[at] = store.library.items[at + 6u];
+    for (uint32_t id = 13; id <= 18; id++)
+        CHECK(put_icon_app(&store.library, id - 7u, id) == 0);
+    const unsigned char *rows[OFFLINE_LIBRARY_ITEM_LIMIT];
+    for (size_t at = 0; at < store.library.count; at++)
+        CHECK((rows[at] = psp_offline_store_app_icon(
+                   &store, store.library.items[at].id)) != NULL);
+    for (size_t at = 0; at < store.library.count; at++) {
+        unsigned char expected[OFFLINE_LIBRARY_APP_ICON_LIMIT];
+        memset(expected, (int) store.library.items[at].id, sizeof(expected));
+        CHECK(memcmp(rows[at], expected, sizeof(expected)) == 0);
+    }
+    psp_offline_store_destroy(&store);
+    return 0;
+}
+
 int main(void)
 {
     char directory[160];
@@ -38,6 +305,15 @@ int main(void)
     Budget budget;
     budget_init(&budget, 8u * 1024u * 1024u);
     budget_install_lexbor(&budget);
+    char p2_root[200];
+    snprintf(p2_root, sizeof(p2_root), "%s-p2", directory);
+    CHECK(mkdir(p2_root, 0700) == 0);
+    if (test_newer_index_is_left_alone(&budget, p2_root) != 0
+        || test_unwritable_index_still_opens(&budget, p2_root) != 0
+        || test_removed_download_is_finished(&budget, p2_root) != 0
+        || test_icon_refill_keeps_listed_icons(&budget, p2_root) != 0)
+        return 1;
+    remove_test_tree(p2_root);
     PocDocument document = {0};
     static const char page[] =
         "<!doctype html><title>A &amp; B</title>"
@@ -79,10 +355,14 @@ int main(void)
     budget_free(&budget, html);
 
     uint32_t video_id = 0;
+    /* AU-05: an append needs no fence (no row points past the count the
+       list was built with), and makes no change a built row could see. */
+    fence_probe_install(&library);
     CHECK(offline_library_enqueue_youtube(
               &library, "https://www.youtube.com/watch?v=TFTEST00001",
               "Fixture video", &video_id, error, sizeof(error))
           && library.count == 2 && video_id != article_id);
+    CHECK(fence_probe_clean());
     YoutubeStream stream = {
         .content_length = 17,
         .audio_content_length = 17,
@@ -93,8 +373,15 @@ int main(void)
         .audio_itag = 140,
         .split_streams = true
     };
-    snprintf(stream.title, sizeof(stream.title), "Fixture video");
-    CHECK(offline_library_apply_youtube_stream(&library, video_id, &stream));
+    snprintf(stream.title, sizeof(stream.title), "Fixture video (resolved)");
+    /* The resolved title renames the row in place: under the fence. */
+    fence_probe_install(&library);
+    CHECK(offline_library_apply_youtube_stream(&library, video_id, &stream)
+          && strcmp(offline_library_find(&library, video_id)->title,
+                    "Fixture video (resolved)") == 0);
+    CHECK(fence_probe_clean() && fence_probe.acquires == 1u);
+    library.fence_acquire = NULL;
+    library.fence_release = NULL;
 
     BrowserSession session;
     CHECK(browser_session_init(&session, &budget, 64u * 1024u));
@@ -261,9 +548,14 @@ int main(void)
           && strstr(html, "Heading") != NULL);
     budget_free(&budget, html);
 
+    /* A removal shifts the rows after it: under the fence. */
+    fence_probe_install(&loaded);
     CHECK(offline_library_remove(&loaded, article_id)
           && loaded.count == 1
           && offline_library_find(&loaded, article_id) == NULL);
+    CHECK(fence_probe_clean() && fence_probe.acquires == 1u);
+    loaded.fence_acquire = NULL;
+    loaded.fence_release = NULL;
 
     static const char manifest_json[] =
         "{\"name\":\"Tiny Game\",\"short_name\":\"Tiny\","

@@ -34,6 +34,10 @@ int main(int argc, char **argv)
         "private-network-admission",
         test_private_network_admission(&budget, (unsigned) parsed));
     RUN_REDIRECT_TEST(
+        "numeric-hosts-classified-by-address",
+        test_numeric_hosts_classified_by_address(
+            &budget, (unsigned) parsed));
+    RUN_REDIRECT_TEST(
         "captive-portal-redirect-origin-isolation",
         test_captive_portal_redirect_origin_isolation(
             &budget, (unsigned) parsed));
@@ -56,6 +60,10 @@ int main(int argc, char **argv)
         test_supported_accept_encoding(&budget, (unsigned) parsed));
     RUN_REDIRECT_TEST("same-host",
                       test_same_host_redirect(&budget, (unsigned) parsed));
+    RUN_REDIRECT_TEST("relative-location",
+                      test_relative_location_resolves(
+                          &budget, (unsigned) parsed,
+                          (unsigned) proxy_port));
     RUN_REDIRECT_TEST(
         "redirect-url-validator",
         test_redirect_url_validator(&budget, (unsigned) parsed));
@@ -82,6 +90,18 @@ int main(int argc, char **argv)
         "javascript-cors",
         test_javascript_cors(
             &budget, (unsigned) parsed, (unsigned) hint_port));
+    RUN_REDIRECT_TEST(
+        "javascript-cors-preflight-scheduling",
+        test_javascript_cors_preflight_scheduling(
+            &budget, (unsigned) parsed, (unsigned) hint_port));
+    RUN_REDIRECT_TEST(
+        "javascript-sync-xhr-page-hold",
+        test_javascript_sync_xhr_respects_page_hold(
+            &budget, (unsigned) parsed));
+    RUN_REDIRECT_TEST(
+        "javascript-sync-xhr-blocked-wait",
+        test_javascript_sync_xhr_blocked_wait(
+            &budget, (unsigned) parsed));
     RUN_REDIRECT_TEST(
         "redirect-cors-final-response",
         test_redirect_cors_final_response_boundary(
@@ -131,6 +151,9 @@ int main(int argc, char **argv)
     RUN_REDIRECT_TEST(
         "methods", test_redirect_methods(&budget, (unsigned) parsed));
     RUN_REDIRECT_TEST(
+        "redirected-navigation-metadata",
+        test_redirected_navigation_metadata(&budget, (unsigned) parsed));
+    RUN_REDIRECT_TEST(
         "generic-methods-and-head",
         test_generic_method_bodies_and_head(&budget, (unsigned) parsed));
     RUN_REDIRECT_TEST(
@@ -176,6 +199,9 @@ int main(int argc, char **argv)
     RUN_REDIRECT_TEST(
         "javascript-binary-responses",
         test_javascript_binary_responses(&budget, (unsigned) parsed));
+    RUN_REDIRECT_TEST(
+        "javascript-detached-request-body",
+        test_javascript_detached_request_body(&budget, (unsigned) parsed));
     RUN_REDIRECT_TEST(
         "send-beacon-delivery",
         test_send_beacon_delivery(&budget, (unsigned) parsed));

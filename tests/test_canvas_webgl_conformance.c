@@ -2,6 +2,7 @@
 #include "tilefinch/budget_quickjs.h"
 #include "tilefinch/browser_engine.h"
 #include "tilefinch/document.h"
+#include "tilefinch/font.h"
 #include "tilefinch/gamepad.h"
 #include "tilefinch/js_runtime.h"
 #include "tilefinch/offline_library.h"
@@ -139,6 +140,103 @@ static bool run_webgl_budget_refusal_ownership(void)
     return true;
 }
 
+/* A 2D commit used to clear canvas_opaque unconditionally, so every
+   canvas frame re-read the alpha byte of every pixel to find out whether
+   the fast full-screen path applied (NB-08). The commit now keeps the bit
+   exact while reading only what it changed. */
+static bool canvas_commit_fill(ImageResources *images, Budget *budget,
+                               lxb_dom_node_t *canvas, unsigned char *pixels,
+                               int width, int height, int left, int top,
+                               int right, int bottom, unsigned char alpha,
+                               int hole_x, int hole_y)
+{
+    for (int y = top; y < bottom; y++)
+        for (int x = left; x < right; x++) {
+            unsigned char *at = pixels + ((size_t) y * (size_t) width
+                                          + (size_t) x) * 4u;
+            at[0] = 0x40; at[1] = 0x80; at[2] = 0xc0;
+            at[3] = x == hole_x && y == hole_y ? 0u : alpha;
+        }
+    return images_commit_canvas_surface(
+               images, budget, canvas, pixels,
+               (size_t) width * (size_t) height * 4u, width, height,
+               left, top, right, bottom) != IMAGE_CANVAS_COMMIT_REFUSED;
+}
+
+static const ImageResource *canvas_record(const ImageResources *images)
+{
+    for (size_t i = 0; i < images->count; i++)
+        if (images->items[i].is_canvas) return &images->items[i];
+    return NULL;
+}
+
+static bool run_canvas_commit_opacity(void)
+{
+    static const char html[] =
+        "<!doctype html><html><body><canvas id=probe></canvas></body></html>";
+    Budget budget;
+    budget_init(&budget, 4u * MIB);
+    budget_install_lexbor(&budget);
+    PocDocument document;
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    lxb_dom_node_t *canvas = find_element_id(
+        lxb_dom_interface_node(document.html), "probe");
+    CHECK(canvas != NULL);
+    ImageResources images = {.budget = &budget};
+    static unsigned char pixels[16 * 16 * 4];
+    memset(pixels, 0, sizeof(pixels));
+    size_t scanned = images_test_canvas_alpha_scan_pixels();
+#define SCANNED_SINCE() (images_test_canvas_alpha_scan_pixels() - scanned)
+    /* A fresh surface committed in part is transparent elsewhere: no scan. */
+    CHECK(canvas_commit_fill(&images, &budget, canvas, pixels, 8, 8,
+                             0, 0, 4, 4, 255, -1, -1)
+          && !canvas_record(&images)->canvas_opaque && SCANNED_SINCE() == 0);
+    /* Fully opaque, then small opaque updates: one scan of the rectangle. */
+    scanned = images_test_canvas_alpha_scan_pixels();
+    CHECK(canvas_commit_fill(&images, &budget, canvas, pixels, 8, 8,
+                             0, 0, 8, 8, 255, -1, -1)
+          && canvas_record(&images)->canvas_opaque && SCANNED_SINCE() == 64);
+    scanned = images_test_canvas_alpha_scan_pixels();
+    CHECK(canvas_commit_fill(&images, &budget, canvas, pixels, 8, 8,
+                             1, 1, 3, 3, 255, -1, -1)
+          && canvas_record(&images)->canvas_opaque && SCANNED_SINCE() == 4);
+    /* A translucent pixel in the rectangle clears it, scanning at most the
+       rectangle; a commit elsewhere then needs no scan at all. */
+    scanned = images_test_canvas_alpha_scan_pixels();
+    CHECK(canvas_commit_fill(&images, &budget, canvas, pixels, 8, 8,
+                             4, 4, 6, 6, 255, 5, 5)
+          && !canvas_record(&images)->canvas_opaque && SCANNED_SINCE() <= 4);
+    scanned = images_test_canvas_alpha_scan_pixels();
+    CHECK(canvas_commit_fill(&images, &budget, canvas, pixels, 8, 8,
+                             0, 0, 2, 2, 255, -1, -1)
+          && !canvas_record(&images)->canvas_opaque && SCANNED_SINCE() == 0);
+    /* Covering that pixel with opaque paint makes the canvas opaque again. */
+    scanned = images_test_canvas_alpha_scan_pixels();
+    CHECK(canvas_commit_fill(&images, &budget, canvas, pixels, 8, 8,
+                             4, 4, 6, 6, 255, -1, -1)
+          && canvas_record(&images)->canvas_opaque
+          && SCANNED_SINCE() == 4 + 64);
+    /* Any translucent pixel in a full commit; a resized surface. */
+    CHECK(canvas_commit_fill(&images, &budget, canvas, pixels, 8, 8,
+                             0, 0, 8, 8, 255, 7, 0)
+          && !canvas_record(&images)->canvas_opaque);
+    CHECK(canvas_commit_fill(&images, &budget, canvas, pixels, 8, 8,
+                             0, 0, 8, 8, 254, -1, -1)
+          && !canvas_record(&images)->canvas_opaque);
+    CHECK(canvas_commit_fill(&images, &budget, canvas, pixels, 16, 16,
+                             0, 0, 16, 16, 255, -1, -1)
+          && canvas_record(&images)->canvas_opaque);
+    CHECK(canvas_commit_fill(&images, &budget, canvas, pixels, 8, 16,
+                             0, 1, 8, 16, 255, -1, -1)
+          && !canvas_record(&images)->canvas_opaque);
+#undef SCANNED_SINCE
+    images_destroy(&images);
+    document_destroy(&document);
+    CHECK(budget.current == 0
+          && budget_active_allocations(&budget, NULL) == 0);
+    return true;
+}
+
 static bool run_webgl_cache_epoch_admission(void)
 {
     DomBridge realm_a = {0}, realm_b = {0};
@@ -198,6 +296,136 @@ static bool run_webgl_cache_epoch_admission(void)
     CHECK(reset);
     CHECK(!script_runtime_webgl_cache_admit(
         &cache, 0u, 0u, repeated_canvas_handle, &reset));
+    return true;
+}
+
+/* The GE texture cache used to empty itself whenever cached entries plus
+   the frame's texture count exceeded eight, so a steady scene with five to
+   eight textures re-uploaded all of them every frame (NB-07). */
+static size_t texture_cache_frame(ScriptWebglTextureCache *cache,
+                                  size_t capacity,
+                                  const ScriptWebglTextureKey *keys,
+                                  size_t count, size_t *uploaded_bytes,
+                                  bool *reset, bool *placed)
+{
+    size_t slots[SCRIPT_WEBGL_TEXTURE_CACHE_ENTRY_LIMIT];
+    bool upload[SCRIPT_WEBGL_TEXTURE_CACHE_ENTRY_LIMIT];
+    *placed = script_runtime_webgl_texture_cache_place(
+        cache, capacity, keys, count, slots, upload, reset);
+    size_t uploads = 0;
+    *uploaded_bytes = 0;
+    if (!*placed) return 0;
+    for (size_t i = 0; i < count; i++) {
+        const ScriptWebglTextureCacheEntry *entry =
+            &cache->entries[slots[i]];
+        if (!entry->valid || entry->key.identifier != keys[i].identifier
+            || entry->offset > capacity
+            || entry->key.bytes > capacity - entry->offset) {
+            *placed = false;
+            return 0;
+        }
+        /* No two textures of one frame may share EDRAM bytes. */
+        for (size_t j = 0; j < i; j++) {
+            const ScriptWebglTextureCacheEntry *other =
+                &cache->entries[slots[j]];
+            if (slots[j] != slots[i]
+                && entry->offset < other->offset + other->key.bytes
+                && other->offset < entry->offset + entry->key.bytes) {
+                *placed = false;
+                return 0;
+            }
+        }
+        if (upload[i]) {
+            uploads++;
+            *uploaded_bytes += entry->key.bytes;
+        }
+    }
+    return uploads;
+}
+
+static bool run_webgl_texture_cache_policy(void)
+{
+    ScriptWebglTextureKey keys[10];
+    for (size_t i = 0; i < 10u; i++)
+        keys[i] = (ScriptWebglTextureKey) {
+            .identifier = (uint32_t) i + 1u, .generation = 1u,
+            .width = 64, .height = 64, .bytes = 64u * 64u * 4u };
+    const size_t unit = 64u * 64u * 4u;
+    ScriptWebglTextureCache cache = {0};
+    size_t bytes = 0;
+    bool reset = false, placed = false;
+    /* Five and eight steady textures: one upload each, then none. */
+    for (size_t steady = 5; steady <= 8; steady += 3) {
+        memset(&cache, 0, sizeof(cache));
+        CHECK(texture_cache_frame(&cache, 8u * unit, keys, steady, &bytes,
+                                  &reset, &placed) == steady
+              && placed && !reset && bytes == steady * unit);
+        for (int frame = 0; frame < 3; frame++)
+            CHECK(texture_cache_frame(&cache, 8u * unit, keys, steady,
+                                      &bytes, &reset, &placed) == 0
+                  && placed && !reset && bytes == 0);
+    }
+    /* A changed generation is a new texture; only it is uploaded. */
+    ScriptWebglTextureKey changed[5];
+    memcpy(changed, keys, sizeof(changed));
+    changed[2].generation = 2u;
+    CHECK(texture_cache_frame(&cache, 8u * unit, changed, 5, &bytes,
+                              &reset, &placed) == 1
+          && placed && !reset && bytes == unit);
+    /* Room for six: the least recently used texture the frame does not
+       use is evicted, never one it does. */
+    memset(&cache, 0, sizeof(cache));
+    const size_t six = 6u * unit;
+    CHECK(texture_cache_frame(&cache, six, keys, 6, &bytes, &reset,
+                              &placed) == 6 && placed);
+    ScriptWebglTextureKey later[6] = {
+        keys[1], keys[2], keys[3], keys[4], keys[5], keys[6] };
+    CHECK(texture_cache_frame(&cache, six, later, 6, &bytes, &reset,
+                              &placed) == 1
+          && placed && !reset && bytes == unit);
+    ScriptWebglTextureKey back[6] = {
+        keys[0], keys[2], keys[3], keys[4], keys[5], keys[6] };
+    /* keys[1] is now the oldest unused entry, so keys[0] takes its place. */
+    CHECK(texture_cache_frame(&cache, six, back, 6, &bytes, &reset,
+                              &placed) == 1
+          && placed && !reset);
+    CHECK(texture_cache_frame(&cache, six, later + 1, 5, &bytes, &reset,
+                              &placed) == 0 && placed);
+    /* A larger texture that no single gap fits evicts unused neighbours
+       until one does; the frame's own textures keep their places. */
+    memset(&cache, 0, sizeof(cache));
+    CHECK(texture_cache_frame(&cache, six, keys, 6, &bytes, &reset,
+                              &placed) == 6 && placed);
+    ScriptWebglTextureKey wide = {
+        .identifier = 99u, .generation = 1u, .width = 128, .height = 64,
+        .bytes = 2u * unit };
+    ScriptWebglTextureKey with_wide[3] = { keys[0], keys[1], wide };
+    CHECK(texture_cache_frame(&cache, six, with_wide, 3, &bytes, &reset,
+                              &placed) == 1
+          && placed && !reset && bytes == 2u * unit);
+    /* When only a repack fits (the frame's textures fragment the window),
+       the cache is repacked; when nothing fits, the frame is refused. */
+    memset(&cache, 0, sizeof(cache));
+    CHECK(texture_cache_frame(&cache, 3u * unit, keys, 3, &bytes, &reset,
+                              &placed) == 3 && placed);
+    ScriptWebglTextureKey fragmented[2] = { keys[1], wide };
+    CHECK(texture_cache_frame(&cache, 3u * unit, fragmented, 2, &bytes,
+                              &reset, &placed) == 2
+          && placed && reset && bytes == 3u * unit);
+    ScriptWebglTextureKey too_big[2] = { wide, wide };
+    too_big[1].identifier = 100u;
+    CHECK(texture_cache_frame(&cache, 3u * unit, too_big, 2, &bytes,
+                              &reset, &placed) == 0 && !placed);
+    for (size_t entry = 0; entry < SCRIPT_WEBGL_TEXTURE_CACHE_ENTRY_LIMIT;
+         entry++) CHECK(!cache.entries[entry].valid);
+    CHECK(!script_runtime_webgl_texture_cache_place(
+        &cache, 8u * unit, keys, 9, (size_t[9]) {0}, (bool[9]) {0},
+        &reset));
+    /* Duplicate textures in one frame share one upload. */
+    memset(&cache, 0, sizeof(cache));
+    ScriptWebglTextureKey twice[2] = { keys[0], keys[0] };
+    CHECK(texture_cache_frame(&cache, 8u * unit, twice, 2, &bytes, &reset,
+                              &placed) == 1 && placed && bytes == unit);
     return true;
 }
 
@@ -1164,6 +1392,486 @@ static bool run_deferred_webgl_flush(void)
     CHECK(budget.current == 0
           && budget_active_allocations(&budget, NULL) == 0);
     return true;
+}
+
+/* The __tilefinch* raster natives stay callable from page script, so an
+   argument whose toString(), getter or Proxy trap detaches a pixel, command
+   or source buffer must not leave the native writing or reading through the
+   stale pointer. ArrayBuffer.prototype.transfer() moves the storage into a
+   new buffer without copying, so a stale write or read lands in a live
+   buffer the script can inspect: no sanitizer is needed to see it. Each case
+   has a control call proving that the same arguments do paint. */
+static const char native_buffer_detach_script[] =
+    "(()=>{const fails=[],W=16,H=16,f64=a=>new Float64Array(a),"
+    "ink=b=>new Uint8Array(b).some(v=>v!==0),"
+    "call=f=>{try{return f()}catch(error){return 'threw'}};"
+    /* Paint batch, text command (R-02): toString runs after the pixel
+       pointer was resolved. */
+    "const text=t=>[1,t,1,13,12,0,false,false,255,255,255,255,1,1,false,1,"
+    "f64([1,0,0,1,0,0]),f64([0,0,W,H]),1,f64([0])];"
+    "{const px=new Uint8ClampedArray(W*H*4);"
+    "call(()=>__tilefinchCanvasRasterPaintBatch(px,W,H,[text('MW')]));"
+    "if(!ink(px.buffer))fails.push('text-control');}"
+    "{const px=new Uint8ClampedArray(W*H*4);let moved=null;"
+    "const hostile={toString(){moved=px.buffer.transfer();return 'MW'}};"
+    "call(()=>__tilefinchCanvasRasterPaintBatch(px,W,H,[text(hostile)]));"
+    "if(moved===null)fails.push('text-no-coercion');"
+    "else if(ink(moved))fails.push('text-wrote-detached-pixels');}"
+    /* Image batch (R-03): the source getter runs after the target and
+       command pointers were resolved. */
+    "const image=()=>f64([0,4,4,0,0,4,4,0,0,4,4,0,1,1,1,0,0,1,0,0,0,0,W,H]),"
+    "source=new Uint8ClampedArray(64).fill(255);"
+    "{const px=new Uint8ClampedArray(W*H*4);"
+    "call(()=>__tilefinchCanvasRasterImageBatch(px,W,H,[source],image()));"
+    "if(!ink(px.buffer))fails.push('image-control');}"
+    "{const px=new Uint8ClampedArray(W*H*4);let moved=null;"
+    "const sources={get 0(){moved=px.buffer.transfer();return source}};"
+    "call(()=>__tilefinchCanvasRasterImageBatch(px,W,H,sources,image()));"
+    "if(moved===null)fails.push('image-no-getter');"
+    "else if(ink(moved))fails.push('image-wrote-detached-target');}"
+    "{const px=new Uint8ClampedArray(W*H*4),commands=image();let moved=null;"
+    "const sources={get 0(){moved=commands.buffer.transfer();"
+    "new Float64Array(moved)[7]=8;return source}};"
+    "call(()=>__tilefinchCanvasRasterImageBatch(px,W,H,sources,commands));"
+    "if(moved===null)fails.push('image-commands-no-getter');"
+    "else if(ink(px.buffer))fails.push('image-read-detached-commands');}"
+    /* WebGL render (R-06): the source list getter runs after the command
+       pointer was resolved. One clear command; a stale read would paint
+       the colour written into the moved storage. */
+    "const canvas=document.createElement('canvas');canvas.width=4;"
+    "canvas.height=4;document.body.appendChild(canvas);"
+    "const handle=canvas.__handle,"
+    "wire=color=>{const u=new Uint32Array(100),f=new Float32Array(u.buffer);"
+    "u[0]=0x54465743;u[1]=5;u[2]=96;u[3]=1;u[4]=0;u[5]=0x4000;"
+    "f.set(color,6);f[10]=1;u[43]=0;return u},"
+    "textures=()=>new Uint32Array([0x54465754,5,9,0]),"
+    "pixel=()=>{const shot=__tilefinchWebGLSnapshot(handle);"
+    "return shot?Array.from(new Uint8Array(shot.pixels,0,4)).join(','):'none'};"
+    "{const r=call(()=>__tilefinchWebGLRender(handle,4,4,wire([0,1,0,1]),"
+    "[],textures(),false,false));"
+    "if(r!==1||pixel()!=='0,255,0,255')fails.push('webgl-control:'+r+':'+pixel());}"
+    "{const commands=wire([0,0,1,1]);let moved=null;"
+    "const sources={get length(){moved=commands.buffer.transfer();"
+    "new Float32Array(moved)[6]=1;return 0}};"
+    "const r=call(()=>__tilefinchWebGLRender(handle,4,4,commands,sources,"
+    "textures(),false,false));"
+    "if(moved===null)fails.push('webgl-no-getter');"
+    "else if(r===1||pixel()!=='0,255,0,255')"
+    "fails.push('webgl-read-detached-commands:'+r+':'+pixel());}"
+    "{const early=new Uint8Array(16),list=[early];"
+    "Object.defineProperty(list,1,{enumerable:true,"
+    "get(){early.buffer.transfer();return new Uint8Array(4)}});"
+    "const r=call(()=>__tilefinchWebGLRender(handle,4,4,wire([0,1,0,1]),"
+    "list,textures(),false,false));"
+    "if(!early.buffer.detached)fails.push('webgl-source-no-getter');"
+    "else if(r===1)fails.push('webgl-kept-detached-source');}"
+    "globalThis.pocSummary=fails.length===0?'NATIVE-DETACH-PASS'"
+    ":'NATIVE-DETACH-FAIL:'+fails.join(',');})()";
+
+typedef bool (*NativeRealmPrepare)(PocDocument *document,
+                                   ImageResources *images, Budget *budget);
+/* Reads the realm's document and image table after the script ran. */
+typedef bool (*NativeRealmInspect)(PocDocument *document,
+                                   const ImageResources *images,
+                                   void *data);
+
+/* One page realm with an image table, as the natives see it on a page:
+   evaluates `script` and requires globalThis.pocSummary == `expected`
+   (or, with `expected_prefix`, to start with it). */
+static bool run_native_realm_inspect(const char *html, const char *script,
+                                     const char *label, const char *expected,
+                                     bool expected_prefix,
+                                     NativeRealmPrepare prepare,
+                                     NativeRealmInspect inspect,
+                                     void *inspect_data)
+{
+    Budget budget;
+    budget_init(&budget, 24u * MIB);
+    budget_install_lexbor(&budget);
+    char sans[1024], serif[1024], italic[1024], bold[1024], serif_bold[1024];
+    snprintf(sans, sizeof(sans), "%s/fonts/DejaVuSans-Latin.ttf",
+             TILEFINCH_TEST_SOURCE_DIR);
+    snprintf(serif, sizeof(serif), "%s/fonts/DejaVuSerif-Latin.ttf",
+             TILEFINCH_TEST_SOURCE_DIR);
+    snprintf(italic, sizeof(italic), "%s/fonts/DejaVuSans-Oblique-Latin.ttf",
+             TILEFINCH_TEST_SOURCE_DIR);
+    snprintf(bold, sizeof(bold), "%s/fonts/DejaVuSans-Bold-Latin.ttf",
+             TILEFINCH_TEST_SOURCE_DIR);
+    snprintf(serif_bold, sizeof(serif_bold),
+             "%s/fonts/DejaVuSerif-Bold-Latin.ttf", TILEFINCH_TEST_SOURCE_DIR);
+    FontSet fonts = {0};
+    CHECK(font_set_load(&fonts, &budget, sans, serif, italic, bold,
+                        serif_bold, NULL, NULL, 2u * MIB));
+    PocDocument document;
+    CHECK(document_parse(&document, &budget, html, strlen(html), 17));
+    ViewportContext viewport;
+    CHECK(viewport_context_init(&viewport, 480, 272, 480, 272));
+    ScriptExecutionPolicy policy;
+    CHECK(script_execution_policy_for_profile(
+        SCRIPT_EXECUTION_PROFILE_PSP_REALISTIC, &policy));
+    policy.slow_compile_threshold_us = UINT64_MAX;
+    policy.slow_callback_threshold_us = UINT64_MAX;
+    ScriptRuntimeOptions options = {
+        .viewport = viewport,
+        .execution_policy = policy,
+        .fonts = &fonts
+    };
+    ScriptResult result;
+    ScriptRuntime *runtime = script_runtime_create_configured(
+        &document, &budget, 16u * MIB, 8000,
+        "https://games.test/detach", &options, &result);
+    CHECK(runtime != NULL && result.success);
+    ImageResources images = {.budget = &budget};
+    if (prepare != NULL) CHECK(prepare(&document, &images, &budget));
+    script_runtime_set_images(runtime, &images);
+    bool evaluated = script_runtime_evaluate_diagnostic(
+        runtime, script, label, &result);
+    bool matched = evaluated && (expected_prefix
+        ? strncmp(result.summary, expected, strlen(expected)) == 0
+        : strcmp(result.summary, expected) == 0);
+    if (!matched)
+        fprintf(stderr, "%s: %s (%s)\n", label,
+                result.summary, result.error);
+    else if (expected_prefix)
+        fprintf(stderr, "%s: %s\n", label, result.summary);
+    CHECK(matched);
+    if (inspect != NULL) CHECK(inspect(&document, &images, inspect_data));
+    script_runtime_destroy(runtime);
+    images_destroy(&images);
+    document_destroy(&document);
+    font_set_destroy(&fonts);
+    CHECK(budget.current == 0
+          && budget_active_allocations(&budget, NULL) == 0);
+    return true;
+}
+
+static bool run_native_realm_script(const char *html, const char *script,
+                                    const char *label, const char *expected,
+                                    NativeRealmPrepare prepare)
+{
+    return run_native_realm_inspect(html, script, label, expected, false,
+                                    prepare, NULL, NULL);
+}
+
+static bool run_native_buffer_detach(void)
+{
+    return run_native_realm_script(
+        "<!doctype html><html><body></body></html>",
+        native_buffer_detach_script, "<native-detach>",
+        "NATIVE-DETACH-PASS", NULL);
+}
+
+/* Natives that build a result object must not run page code while they do
+   (NB-01, NB-09). An Object.prototype setter for a result field used to run
+   inside the native: for the image source it shrank the committed surface
+   while the native still held the old pointer and length, and the returned
+   ArrayBuffer carried 65,532 bytes from past the new four-byte block. The
+   setter here records every call and shrinks the surface, so either symptom
+   fails the stage. */
+static const char native_result_builder_script[] =
+    "(()=>{const fails=[],canvas=document.createElement('canvas');"
+    "canvas.width=128;canvas.height=128;document.body.appendChild(canvas);"
+    "const handle=canvas.__handle,fired=[];"
+    "const commitBig=()=>__tilefinchCommitCanvasSurface(handle,128,128,"
+    "new Uint8Array(128*128*4).fill(0x11),0,0,128,128);"
+    "const hook=names=>{for(const name of names)"
+    "Object.defineProperty(Object.prototype,name,{configurable:true,"
+    "set(value){fired.push(name);"
+    "__tilefinchCommitCanvasSurface(handle,1,1,new Uint8Array(4).fill(0x22),"
+    "0,0,1,1);for(let i=0;i<12;i++){const extra=document.createElement("
+    "'canvas');document.body.appendChild(extra);"
+    "__tilefinchCommitCanvasSurface(extra.__handle,2,2,new Uint8Array(16),"
+    "0,0,2,2);}"
+    "Object.defineProperty(this,name,{value,writable:true,configurable:true,"
+    "enumerable:true});}})},"
+    "unhook=names=>{for(const name of names)delete Object.prototype[name]};"
+    "const fields=['width','height','sameOrigin','pixels','ascent','descent'];"
+    "const intact=(label,result)=>{if(!result){fails.push(label+'-null');"
+    "return}const bytes=new Uint8Array(result.pixels);"
+    "if(result.width!==128||result.height!==128||bytes.length!==128*128*4)"
+    "fails.push(label+'-shape:'+result.width+'x'+result.height+':'"
+    "+bytes.length);"
+    "else if(bytes.some(v=>v!==0x11))fails.push(label+'-foreign-bytes');};"
+    "if(!commitBig())fails.push('commit');"
+    "hook(fields);let source;"
+    "try{source=__tilefinchCanvasImageSource(handle)}finally{unhook(fields)}"
+    "intact('image-source',source);"
+    "if(fired.length)fails.push('image-source-ran:'+fired.join('/'));"
+    "fired.length=0;"
+    "if(!commitBig())fails.push('recommit');"
+    "hook(fields);let shot;"
+    "try{shot=__tilefinchWebGLSnapshot(handle)}finally{unhook(fields)}"
+    "intact('snapshot',shot);"
+    "if(fired.length)fails.push('snapshot-ran:'+fired.join('/'));"
+    "fired.length=0;"
+    "hook(fields);let metrics;"
+    "try{metrics=__tilefinchCanvasMeasureText('MW',12,0,false,false)}"
+    "finally{unhook(fields)}"
+    "if(!metrics||!(metrics.width>0)||!(metrics.ascent>0))"
+    "fails.push('measure-text-shape');"
+    "if(fired.length)fails.push('measure-text-ran:'+fired.join('/'));"
+    "globalThis.pocSummary=fails.length===0?'NATIVE-RESULT-PASS'"
+    ":'NATIVE-RESULT-FAIL:'+fails.join(',');})()";
+
+static bool run_native_result_builders(void)
+{
+    return run_native_realm_script(
+        "<!doctype html><html><body></body></html>",
+        native_result_builder_script, "<native-result>",
+        "NATIVE-RESULT-PASS", NULL);
+}
+
+/* A no-CORS cross-origin image may be drawn, but its pixels must never
+   reach page script (NB-04). The only check used to be a sameOrigin field
+   canvas.js read back from a native result, which an Object.prototype
+   accessor forged, and the native itself returned the pixels to any
+   caller. Taint now lives in native state: natives that return a canvas's
+   pixels refuse a tainted one, and every readback gate asks it. #x is
+   cross-origin (0x5a), #y same-origin (0x33). */
+static bool prepare_origin_images(PocDocument *document,
+                                  ImageResources *images, Budget *budget)
+{
+    lxb_dom_node_t *root = lxb_dom_interface_node(document->html);
+    const char *ids[2] = {"x", "y"};
+    for (size_t i = 0; i < 2u; i++) {
+        lxb_dom_node_t *node = find_element_id(root, ids[i]);
+        CHECK(node != NULL);
+        unsigned char *pixels = budget_malloc(budget, 4u * 4u * 4u);
+        CHECK(pixels != NULL);
+        for (size_t at = 0; at < 64u; at++)
+            pixels[at] = (at % 4u) == 3u ? 0xffu : (i == 0 ? 0x5au : 0x33u);
+        CHECK(images_adopt_decoded_surface(images, budget, node, pixels, 4, 4));
+        images->items[images->count - 1u].cross_origin = i == 0;
+    }
+    return true;
+}
+
+static const char canvas_origin_clean_script[] =
+    "(()=>{const fails=[],x=document.getElementById('x'),"
+    "y=document.getElementById('y');"
+    "const make=()=>{const c=document.createElement('canvas');c.width=4;"
+    "c.height=4;document.body.appendChild(c);return c};"
+    "const threw=f=>{try{f();return false}catch(e){"
+    "return !!e&&e.name==='SecurityError'}};"
+    "const unclean=v=>v===null||(v.sameOrigin===false&&!('pixels' in v));"
+    "if(!unclean(__tilefinchCanvasImageSource(x.__handle)))"
+    "fails.push('direct-cross-origin-pixels');"
+    "if(!__tilefinchCanvasImageSource(y.__handle))"
+    "fails.push('direct-same-origin-control');"
+    /* Control: a same-origin draw stays readable. */
+    "const clean=make(),cc=clean.getContext('2d');cc.drawImage(y,0,0);"
+    "try{const d=cc.getImageData(0,0,1,1).data;"
+    "if(d[0]!==0x33)fails.push('control-pixel:'+d[0])}"
+    "catch(e){fails.push('control-threw:'+e)}"
+    "for(const name of ['__tilefinchCanvasPrivateImageSource',"
+    "'__tilefinchCanvasTaint','__tilefinchCanvasOriginClean',"
+    "'__tilefinchCanvasNativeSurface','__tilefinchCanvasBitmapSurface',"
+    "'__tilefinchCanvasRasterPattern','__tilefinchCanvasPngChecksum'])"
+    "if(name in globalThis)fails.push('exposed:'+name);"
+    /* A forged sameOrigin answer must not keep the canvas clean. */
+    "Object.defineProperty(Object.prototype,'sameOrigin',{configurable:true,"
+    "get(){return true},set(value){}});"
+    "const a=make(),ac=a.getContext('2d');"
+    "try{ac.drawImage(x,0,0)}finally{delete Object.prototype.sameOrigin}"
+    "if(!threw(()=>ac.getImageData(0,0,1,1)))fails.push('getImageData');"
+    "if(!threw(()=>a.toDataURL()))fails.push('toDataURL');"
+    "if(!threw(()=>a.toBlob(()=>{})))fails.push('toBlob');"
+    /* Its committed surface is not readable through any native. */
+    "__tilefinchFlushCanvasSurfaces();__tilefinchFlushCanvasSurfaces();"
+    "if(!unclean(__tilefinchCanvasImageSource(a.__handle)))"
+    "fails.push('surface-image-source');"
+    "if(__tilefinchWebGLSnapshot(a.__handle)!==null)"
+    "fails.push('surface-snapshot');"
+    "if(__tilefinchWebGLReadPixels(a.__handle,0,0,1,1,new Uint8Array(4),1)"
+    "!==false)fails.push('surface-read-pixels');"
+    "__tilefinchFlushCanvasSurfaces();"
+    "if(!__tilefinchWebGLSnapshot(clean.__handle))"
+    "fails.push('surface-control');"
+    "if(globalThis.__tilefinchCanvasReadbackState?.(a))"
+    "fails.push('readback-hook');"
+    /* Resetting the bitmap does not make it clean again (HTML). */
+    "a.width=4;if(!threw(()=>ac.getImageData(0,0,1,1)))"
+    "fails.push('reset-cleared-taint');"
+    /* Pattern internals stay private, and painting with one taints. */
+    "const pattern=make().getContext('2d').createPattern(x,'repeat');"
+    "if(!pattern)fails.push('pattern-null');"
+    "else for(const key of Object.getOwnPropertyNames(pattern))"
+    "fails.push('pattern-own:'+key);"
+    "const b=make(),bc=b.getContext('2d');bc.fillStyle=pattern;"
+    "bc.fillRect(0,0,4,4);"
+    "if(!threw(()=>bc.getImageData(0,0,1,1)))fails.push('pattern-target');"
+    /* A canvas-backed pattern follows its live source's taint. */
+    "const src=make(),sc=src.getContext('2d');sc.fillStyle='#00f';"
+    "sc.fillRect(0,0,4,4);"
+    "const live=make().getContext('2d').createPattern(src,'repeat');"
+    "sc.drawImage(x,0,0);"
+    "const d=make(),dc=d.getContext('2d');dc.fillStyle=live;"
+    "dc.fillRect(0,0,4,4);"
+    "if(!threw(()=>dc.getImageData(0,0,1,1)))fails.push('live-pattern');"
+    "const e=make(),ec=e.getContext('2d');ec.drawImage(a,0,0);"
+    "if(!threw(()=>ec.getImageData(0,0,1,1)))fails.push('canvas-copy');"
+    "globalThis.pocSummary=fails.length===0?'ORIGIN-CLEAN-PASS'"
+    ":'ORIGIN-CLEAN-FAIL:'+fails.join(',');})()";
+
+static bool run_canvas_origin_clean(void)
+{
+    return run_native_realm_script(
+        "<!doctype html><html><body>"
+        "<img id=x src=\"https://other.test/x.png\" width=4 height=4>"
+        "<img id=y src=\"https://games.test/y.png\" width=4 height=4>"
+        "</body></html>",
+        canvas_origin_clean_script, "<origin-clean>",
+        "ORIGIN-CLEAN-PASS", prepare_origin_images);
+}
+
+/* NB-04, tainted canvases: a canvas that drew cross-origin pixels keeps
+   them in native memory only, so a scene drawn tainted commits exactly
+   what it commits drawn clean, every readback refuses, and no builtin a
+   hostile page traps ever sees the image's bytes. #x is a 16x16 image
+   with a distinctive pattern, cross-origin or not per run. */
+static bool taint_scene_cross_origin;
+
+static uint8_t taint_fixture_channel(size_t pixel, size_t channel)
+{
+    switch (channel) {
+    case 0: return (uint8_t) ((pixel * 53u + 7u) & 255u);
+    case 1: return (uint8_t) ((pixel * 97u + 131u) & 255u);
+    case 2: return (uint8_t) ((pixel * 29u + 211u) & 255u);
+    default: return 255u;
+    }
+}
+
+static bool prepare_taint_image(PocDocument *document,
+                                ImageResources *images, Budget *budget)
+{
+    lxb_dom_node_t *node = find_element_id(
+        lxb_dom_interface_node(document->html), "x");
+    CHECK(node != NULL);
+    unsigned char *pixels = budget_malloc(budget, 16u * 16u * 4u);
+    CHECK(pixels != NULL);
+    for (size_t at = 0; at < 16u * 16u * 4u; at++)
+        pixels[at] = taint_fixture_channel(at / 4u, at % 4u);
+    CHECK(images_adopt_decoded_surface(images, budget, node, pixels, 16, 16));
+    images->items[images->count - 1u].cross_origin = taint_scene_cross_origin;
+    return true;
+}
+
+typedef struct {
+    uint64_t hashes[32];
+    size_t count;
+    bool plain_matches;
+} TaintSceneSurfaces;
+
+/* FNV-1a of every committed canvas surface in document order; the first
+   canvas holds the image alone and must equal it byte for byte. */
+static void taint_collect(lxb_dom_node_t *node, const ImageResources *images,
+                          TaintSceneSurfaces *surfaces)
+{
+    for (lxb_dom_node_t *at = node; at != NULL; at = at->next) {
+        if (at->type == LXB_DOM_NODE_TYPE_ELEMENT
+            && at->local_name == LXB_TAG_CANVAS && surfaces->count < 32u) {
+            const ImageResource *image = images_find_node(images, at);
+            uint64_t hash = UINT64_C(14695981039346656037);
+            if (image != NULL && image->pixels != NULL) {
+                size_t length = (size_t) image->width
+                    * (size_t) image->height * 4u;
+                hash ^= (uint64_t) image->width << 16 ^ image->height;
+                for (size_t i = 0; i < length; i++) {
+                    hash ^= image->pixels[i];
+                    hash *= UINT64_C(1099511628211);
+                }
+                if (surfaces->count == 0u && image->width == 16
+                    && image->height == 16) {
+                    surfaces->plain_matches = true;
+                    for (size_t i = 0; i < length; i++)
+                        if (image->pixels[i]
+                            != taint_fixture_channel(i / 4u, i % 4u))
+                            surfaces->plain_matches = false;
+                }
+            }
+            surfaces->hashes[surfaces->count++] = hash;
+        }
+        taint_collect(at->first_child, images, surfaces);
+    }
+}
+
+static bool taint_inspect(PocDocument *document,
+                          const ImageResources *images, void *data)
+{
+    TaintSceneSurfaces *surfaces = data;
+    memset(surfaces, 0, sizeof(*surfaces));
+    taint_collect(lxb_dom_interface_node(document->html), images, surfaces);
+    return true;
+}
+
+static const char taint_scene_html[] =
+    "<!doctype html><html><body>"
+    "<img id=x src=\"https://other.test/x.png\" width=16 height=16>"
+    "</body></html>";
+
+/* The scene (optionally behind the hostile prelude), with #x cross-origin
+   or not; its committed surfaces land in `surfaces`. */
+static bool run_taint_scene_once(bool cross_origin, bool hostile,
+                                 const char *expected, bool prefix,
+                                 TaintSceneSurfaces *surfaces)
+{
+    size_t scene_length = 0, hostile_length = 0;
+    char *scene = read_fixture("canvas-taint-scene.js", &scene_length);
+    char *prelude = hostile
+        ? read_fixture("canvas-taint-hostile.js", &hostile_length) : NULL;
+    CHECK(scene != NULL && (!hostile || prelude != NULL));
+    const char *mode = cross_origin
+        ? "globalThis.expectTainted=true;\n"
+        : "globalThis.expectTainted=false;\n";
+    size_t length = strlen(mode) + hostile_length + scene_length + 2u;
+    char *script = malloc(length);
+    CHECK(script != NULL);
+    snprintf(script, length, "%s%s\n%s", mode, prelude ? prelude : "", scene);
+    free(scene);
+    free(prelude);
+    taint_scene_cross_origin = cross_origin;
+    bool ok = run_native_realm_inspect(
+        taint_scene_html, script,
+        hostile ? "<canvas-taint-hostile>" : "<canvas-taint-scene>",
+        expected, prefix, prepare_taint_image, taint_inspect, surfaces);
+    free(script);
+    return ok;
+}
+
+static bool run_canvas_taint_scene(void)
+{
+    TaintSceneSurfaces clean, tainted;
+    CHECK(run_taint_scene_once(false, false, "TAINT-SCENE-PASS", false,
+                               &clean));
+    CHECK(run_taint_scene_once(true, false, "TAINT-SCENE-PASS", false,
+                               &tainted));
+    CHECK(clean.count >= 8u && clean.count == tainted.count);
+    CHECK(clean.plain_matches && tainted.plain_matches);
+    bool same = true;
+    for (size_t i = 0; i < clean.count; i++) {
+        if (clean.hashes[i] != tainted.hashes[i]) {
+            fprintf(stderr, "canvas %zu: clean %016llx tainted %016llx\n", i,
+                    (unsigned long long) clean.hashes[i],
+                    (unsigned long long) tainted.hashes[i]);
+            same = false;
+        }
+    }
+    CHECK(same);
+    /* Each scene canvas drew something distinct. */
+    for (size_t i = 1; i < 8u; i++)
+        CHECK(clean.hashes[i] != clean.hashes[0]);
+    return true;
+}
+
+static bool run_canvas_taint_hostile(void)
+{
+    TaintSceneSurfaces surfaces;
+    /* Control: with #x same-origin its bytes do reach script, and the
+       traps see them, so a quiet run means they never went there. */
+    CHECK(run_taint_scene_once(false, true, "TAINT-HOSTILE-SEEN:", true,
+                               &surfaces));
+    return run_taint_scene_once(true, true, "TAINT-HOSTILE-PASS:", true,
+                                &surfaces);
 }
 
 /* Every program a shipping example links (including its instancing
@@ -4648,10 +5356,282 @@ static bool run_game_profile_script_admission(void)
     return true;
 }
 
+/* canvas.toDataURL() output, byte for byte, against a PNG built here from
+   the same pixels with the encoder's original definition: stored deflate
+   blocks of at most 65535 bytes, a bit-at-a-time CRC-32 and an Adler-32
+   reduced at every byte (what canvas.js computed before it used zlib's
+   checksums through __tilefinchCanvasPngChecksum). The sizes put the
+   filtered image data (height x (4 x width + 1) bytes) just below and
+   above zlib's Adler NMAX of 5552 bytes and past twice it, exactly on and
+   past one stored block, at the default and old.reddit.com sizes, and at
+   the largest surface (480x272, the drawing-size limit) with every byte
+   0xff, the largest Adler sums. */
+static const struct {
+    unsigned width, height;
+    bool white;
+} canvas_png_sizes[] = {
+    {1, 1, false}, {198, 7, false}, {154, 9, false}, {132, 21, false},
+    {480, 11, true}, {64, 255, false}, {64, 256, false}, {300, 150, false},
+    {480, 48, false}, {480, 272, true}
+};
+#define CANVAS_PNG_SIZE_COUNT \
+    (sizeof(canvas_png_sizes) / sizeof(canvas_png_sizes[0]))
+
+static uint8_t canvas_png_channel(unsigned x, unsigned y, unsigned channel,
+                                  bool white)
+{
+    if (white || channel == 3u) return 0xffu;
+    return channel == 0u ? (uint8_t) ((x * 7u + y * 13u) & 255u)
+        : channel == 1u ? (uint8_t) ((x * 29u + y * 3u + 85u) & 255u)
+        : (uint8_t) ((x ^ y) & 255u);
+}
+
+static const char canvas_png_script[] =
+    "(()=>{const sizes=[[1,1,0],[198,7,0],[154,9,0],[132,21,0],[480,11,1],"
+    "[64,255,0],[64,256,0],[300,150,0],[480,48,0],[480,272,1]];"
+    "globalThis.pngUrls=sizes.map(([w,h,white])=>{"
+    "const c=document.createElement('canvas');c.width=w;c.height=h;"
+    "const x=c.getContext('2d'),d=x.createImageData(w,h),p=d.data;"
+    "for(let y=0;y<h;y++)for(let i=0;i<w;i++){const o=(y*w+i)*4;"
+    "if(white){p[o]=p[o+1]=p[o+2]=p[o+3]=255;continue}"
+    "p[o]=(i*7+y*13)&255;p[o+1]=(i*29+y*3+85)&255;p[o+2]=(i^y)&255;"
+    "p[o+3]=255}x.putImageData(d,0,0);return c.toDataURL()});"
+    "globalThis.pocSummary=pngUrls.map(u=>u.length).join(',')})()";
+
+static uint32_t canvas_png_reference_crc(uint32_t crc, const uint8_t *bytes,
+                                         size_t length)
+{
+    for (size_t at = 0; at < length; at++) {
+        crc ^= bytes[at];
+        for (unsigned bit = 0; bit < 8u; bit++)
+            crc = (crc >> 1) ^ ((crc & 1u) ? UINT32_C(0xedb88320) : 0u);
+    }
+    return crc;
+}
+
+static void canvas_png_put32(uint8_t *at, uint32_t value)
+{
+    at[0] = (uint8_t) (value >> 24);
+    at[1] = (uint8_t) (value >> 16);
+    at[2] = (uint8_t) (value >> 8);
+    at[3] = (uint8_t) value;
+}
+
+/* Appends one chunk (length, type, data, CRC) at png + *used. */
+static void canvas_png_chunk(uint8_t *png, size_t *used, const char *type,
+                             const uint8_t *data, size_t length)
+{
+    uint8_t *at = png + *used;
+    canvas_png_put32(at, (uint32_t) length);
+    memcpy(at + 4, type, 4);
+    if (length != 0) memcpy(at + 8, data, length);
+    uint32_t crc = canvas_png_reference_crc(UINT32_MAX, at + 4, 4 + length);
+    canvas_png_put32(at + 8 + length, crc ^ UINT32_MAX);
+    *used += 12 + length;
+}
+
+/* The reference PNG of one canvas_png_sizes entry, from the Budget. */
+static uint8_t *canvas_png_reference(Budget *budget, unsigned width,
+                                     unsigned height, bool white,
+                                     size_t *png_length)
+{
+    size_t row = (size_t) width * 4u + 1u, raw_length = row * height;
+    size_t blocks = (raw_length + 65534u) / 65535u;
+    size_t idat_length = 2u + blocks * 5u + raw_length + 4u;
+    uint8_t *raw = budget_malloc(budget, raw_length);
+    uint8_t *idat = budget_malloc(budget, idat_length);
+    uint8_t *png = budget_malloc(budget, 8u + 25u + 12u + idat_length + 12u);
+    if (raw == NULL || idat == NULL || png == NULL) {
+        budget_free(budget, raw);
+        budget_free(budget, idat);
+        budget_free(budget, png);
+        return NULL;
+    }
+    for (unsigned y = 0; y < height; y++) {
+        raw[y * row] = 0;
+        for (unsigned x = 0; x < width; x++)
+            for (unsigned c = 0; c < 4u; c++)
+                raw[y * row + 1u + x * 4u + c] =
+                    canvas_png_channel(x, y, c, white);
+    }
+    uint32_t a = 1, b = 0;
+    for (size_t at = 0; at < raw_length; at++) {
+        a = (a + raw[at]) % 65521u;
+        b = (b + a) % 65521u;
+    }
+    size_t used = 0;
+    idat[used++] = 0x78;
+    idat[used++] = 0x01;
+    for (size_t offset = 0; offset < raw_length; offset += 65535u) {
+        size_t length = raw_length - offset < 65535u
+            ? raw_length - offset : 65535u;
+        idat[used++] = offset + length == raw_length ? 1u : 0u;
+        idat[used++] = (uint8_t) length;
+        idat[used++] = (uint8_t) (length >> 8);
+        idat[used++] = (uint8_t) ~length;
+        idat[used++] = (uint8_t) (~length >> 8);
+        memcpy(idat + used, raw + offset, length);
+        used += length;
+    }
+    canvas_png_put32(idat + used, (b << 16) | a);
+    static const uint8_t signature[8] = {137, 80, 78, 71, 13, 10, 26, 10};
+    uint8_t header[13] = {0};
+    canvas_png_put32(header, width);
+    canvas_png_put32(header + 4, height);
+    header[8] = 8;
+    header[9] = 6;
+    size_t length = 0;
+    memcpy(png, signature, 8);
+    length = 8;
+    canvas_png_chunk(png, &length, "IHDR", header, sizeof(header));
+    canvas_png_chunk(png, &length, "IDAT", idat, idat_length);
+    canvas_png_chunk(png, &length, "IEND", NULL, 0);
+    budget_free(budget, raw);
+    budget_free(budget, idat);
+    *png_length = length;
+    return png;
+}
+
+static int canvas_base64_value(char c)
+{
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    return c == '+' ? 62 : c == '/' ? 63 : -1;
+}
+
+/* Decodes padded base64 into out (capacity bytes); false if malformed. */
+static bool canvas_base64_decode(const char *text, size_t length,
+                                 uint8_t *out, size_t capacity,
+                                 size_t *decoded)
+{
+    if (length % 4u != 0) return false;
+    size_t used = 0;
+    for (size_t at = 0; at < length; at += 4u) {
+        int v[4];
+        size_t pad = 0;
+        for (size_t k = 0; k < 4u; k++) {
+            if (text[at + k] == '=' && at + 4u == length && k >= 2u) {
+                v[k] = 0;
+                pad++;
+            } else if ((v[k] = canvas_base64_value(text[at + k])) < 0
+                       || pad != 0) {
+                return false;
+            }
+        }
+        uint32_t bits = ((uint32_t) v[0] << 18) | ((uint32_t) v[1] << 12)
+            | ((uint32_t) v[2] << 6) | (uint32_t) v[3];
+        for (size_t k = 0; k < 3u - pad; k++) {
+            if (used == capacity) return false;
+            out[used++] = (uint8_t) (bits >> (16u - 8u * k));
+        }
+    }
+    *decoded = used;
+    return true;
+}
+
+static bool run_canvas_png_bytes(void)
+{
+    Budget budget;
+    budget_init(&budget, 40u * MIB);
+    budget_install_lexbor(&budget);
+    static const char html[] = "<!doctype html><html><body></body></html>";
+    PocDocument document;
+    CHECK(document_parse(&document, &budget, html, strlen(html), 17));
+    ViewportContext viewport;
+    CHECK(viewport_context_init(&viewport, 480, 272, 480, 272));
+    ScriptExecutionPolicy policy;
+    CHECK(script_execution_policy_for_profile(
+        SCRIPT_EXECUTION_PROFILE_PSP_REALISTIC, &policy));
+    policy.slow_compile_threshold_us = UINT64_MAX;
+    policy.slow_callback_threshold_us = UINT64_MAX;
+    ScriptRuntimeOptions options = {
+        .viewport = viewport,
+        .execution_policy = policy
+    };
+    ScriptResult result;
+    ScriptRuntime *runtime = script_runtime_create_configured(
+        &document, &budget, 24u * MIB, 60000, "https://games.test/png",
+        &options, &result);
+    CHECK(runtime != NULL && result.success);
+    bool evaluated = script_runtime_evaluate_diagnostic(
+        runtime, canvas_png_script, "<canvas-png>", &result);
+    if (!evaluated) fprintf(stderr, "canvas-png: %s\n", result.error);
+    CHECK(evaluated);
+    size_t lengths[CANVAS_PNG_SIZE_COUNT] = {0};
+    const char *cursor = result.summary;
+    for (size_t i = 0; i < CANVAS_PNG_SIZE_COUNT; i++) {
+        char *end = NULL;
+        unsigned long value = strtoul(cursor, &end, 10);
+        CHECK(end != cursor && (*end == ',' || *end == '\0'));
+        lengths[i] = value;
+        cursor = *end == ',' ? end + 1 : end;
+    }
+    static const char prefix[] = "data:image/png;base64,";
+    for (size_t i = 0; i < CANVAS_PNG_SIZE_COUNT; i++) {
+        size_t url_length = lengths[i];
+        char *url = budget_malloc(&budget, url_length + 1u);
+        CHECK(url != NULL);
+        /* pocSummary holds 2 KiB: read the URL in slices. */
+        for (size_t offset = 0; offset < url_length; offset += 1024u) {
+            char slice[96];
+            snprintf(slice, sizeof(slice),
+                     "globalThis.pocSummary=pngUrls[%zu].slice(%zu,%zu)",
+                     i, offset, offset + 1024u);
+            CHECK(script_runtime_evaluate_diagnostic(
+                runtime, slice, "<canvas-png-slice>", &result));
+            size_t part = strlen(result.summary);
+            CHECK(part == (url_length - offset < 1024u
+                               ? url_length - offset : 1024u));
+            memcpy(url + offset, result.summary, part);
+        }
+        url[url_length] = '\0';
+        CHECK(url_length > sizeof(prefix) - 1u
+              && memcmp(url, prefix, sizeof(prefix) - 1u) == 0);
+        size_t expected_length = 0, decoded = 0;
+        uint8_t *expected = canvas_png_reference(
+            &budget, canvas_png_sizes[i].width, canvas_png_sizes[i].height,
+            canvas_png_sizes[i].white, &expected_length);
+        uint8_t *actual = budget_malloc(&budget, url_length);
+        CHECK(expected != NULL && actual != NULL);
+        bool decodes = canvas_base64_decode(
+            url + sizeof(prefix) - 1u, url_length - (sizeof(prefix) - 1u),
+            actual, url_length, &decoded);
+        bool same = decodes && decoded == expected_length
+            && memcmp(actual, expected, expected_length) == 0;
+        if (!same)
+            fprintf(stderr, "canvas-png %ux%u: decoded=%d %zu bytes, "
+                    "expected %zu\n", canvas_png_sizes[i].width,
+                    canvas_png_sizes[i].height, decodes, decoded,
+                    expected_length);
+        budget_free(&budget, actual);
+        budget_free(&budget, expected);
+        budget_free(&budget, url);
+        CHECK(same);
+    }
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0
+          && budget_active_allocations(&budget, NULL) == 0);
+    return true;
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2 && strcmp(argv[1], "--validation-frame-packet") == 0)
         return run_validation_frame_packet() ? 0 : 1;
+    if (argc == 2 && strcmp(argv[1], "--native-buffer-detach") == 0)
+        return run_native_buffer_detach() ? 0 : 1;
+    if (argc == 2 && strcmp(argv[1], "--native-result-builders") == 0)
+        return run_native_result_builders() ? 0 : 1;
+    if (argc == 2 && strcmp(argv[1], "--canvas-origin-clean") == 0)
+        return run_canvas_origin_clean() ? 0 : 1;
+    if (argc == 2 && strcmp(argv[1], "--canvas-png-bytes") == 0)
+        return run_canvas_png_bytes() ? 0 : 1;
+    if (argc == 2 && strcmp(argv[1], "--canvas-taint-scene") == 0)
+        return run_canvas_taint_scene() ? 0 : 1;
+    if (argc == 2 && strcmp(argv[1], "--canvas-taint-hostile") == 0)
+        return run_canvas_taint_hostile() ? 0 : 1;
     /* Run one fixture alone, e.g. --fixture webgl-seams.js WEBGL-SEAMS-PASS. */
     if (argc == 4 && strcmp(argv[1], "--fixture") == 0)
         return run_fixture(argv[2], argv[3], false, false) ? 0 : 1;
@@ -4720,8 +5700,12 @@ int main(int argc, char **argv)
     if (!run_validation_frame_packet()) return 1;
     puts("test: native WebGL cache admission separates realm incarnations");
     if (!run_webgl_cache_epoch_admission()) return 1;
+    puts("test: 2D canvas commits keep the opaque bit exact cheaply");
+    if (!run_canvas_commit_opacity()) return 1;
     puts("test: translated WebGL geometry cache is exact and bounded");
     if (!run_webgl_geometry_cache_admission()) return 1;
+    puts("test: WebGL texture cache keeps a steady scene resident");
+    if (!run_webgl_texture_cache_policy()) return 1;
     puts("test: WebGL temporal AA admits only bounded camera motion");
     if (!run_webgl_temporal_matrix_admission()) return 1;
     puts("test: WebGL skips only disposable fully-cleared depth readback");
@@ -4730,6 +5714,18 @@ int main(int argc, char **argv)
     if (!run_webgl_antialias_edge_policy()) return 1;
     puts("test: refused WebGL color/depth preparation leaves Budget ownership");
     if (!run_webgl_budget_refusal_ownership()) return 1;
+    puts("test: raster natives never touch a buffer an argument detached");
+    if (!run_native_buffer_detach()) return 1;
+    puts("test: canvas and WebGL natives build results without page code");
+    if (!run_native_result_builders()) return 1;
+    puts("test: cross-origin image pixels never reach page script");
+    if (!run_canvas_origin_clean()) return 1;
+    puts("test: canvas PNG bytes match the reference encoder at every size");
+    if (!run_canvas_png_bytes()) return 1;
+    puts("test: a tainted canvas draws as a clean one from native memory");
+    if (!run_canvas_taint_scene()) return 1;
+    puts("test: a hostile realm's builtins never see cross-origin pixels");
+    if (!run_canvas_taint_hostile()) return 1;
     puts("test: representative Canvas game advances, responds, and pauses");
     if (!run_fixture("canvas-game.js", "CANVAS-GAME-PASS", true, true))
         return 1;

@@ -1454,7 +1454,92 @@ static bool bridge_transition_display_none(DomBridge *bridge, bool style_cache,
     return true;
 }
 
-JSValue js_transition_snapshot(JSContext *context,
+/* The cascade's transitions for the element, and whether one can run. */
+static bool bridge_transition_applies(DomBridge *bridge, lxb_dom_node_t *node,
+                                      StyleTransitionComputed *transition)
+{
+    (void) style_transition_computed_untimed(bridge->stylesheet, node,
+                                             PSEUDO_NONE, transition);
+    for (unsigned i = 0; i < transition->property_count; i++) {
+        double duration =
+            transition->duration_ms[i % transition->duration_count];
+        double delay = transition->delay_ms[i % transition->delay_count];
+        if ((duration > 0.0 ? duration : 0.0) + delay > 0.0
+            && strcmp(transition->properties[i], "none") != 0) return true;
+    }
+    return false;
+}
+
+/* The next element in `node`'s sibling list from `node` itself, past the
+   shadow carrier a host holds among its children. */
+static lxb_dom_node_t *bridge_light_element(lxb_dom_node_t *node)
+{
+    while (node != NULL && (node->type != LXB_DOM_NODE_TYPE_ELEMENT
+                            || document_node_is_shadow_carrier(node)))
+        node = node->next;
+    return node;
+}
+
+/* __tilefinchTransitionDiscover(handle, limit) -> [visited, ...handles]:
+   the descendant elements of the handle's element to which a transition
+   applies, walking the light tree in document order and visiting at most
+   `limit`. Wrapping each visited node in script cost more than the cascade
+   reads, and left a wrapper per descendant of every listener's target. */
+JS_RT_GUARDED_NATIVE(, js_transition_discover)(JSContext *context, JSValueConst this_value,
+                               int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    lxb_dom_node_t *root = argc > 0 && bridge != NULL
+        ? js_rt_bridge_node_arg(context, bridge, argv[0]) : NULL;
+    int32_t limit = 0;
+    if (argc < 2 || JS_ToInt32(context, &limit, argv[1]) < 0)
+        return JS_EXCEPTION;
+    JSValue found = JS_NewArray(context);
+    if (JS_IsException(found)) return found;
+    /* Entry 0 (the visit count) first, so the handles append and the
+       array stays a fast array; it is overwritten below. */
+    if (js_rt_define_index(context, found, 0, JS_NewInt32(context, 0)) < 0) {
+        JS_FreeValue(context, found);
+        return JS_EXCEPTION;
+    }
+    int32_t visited = 0;
+    uint32_t count = 1;
+    if (root != NULL && bridge->stylesheet != NULL) {
+        lxb_dom_node_t *node = bridge_light_element(root->first_child);
+        while (node != NULL && visited < limit) {
+            visited++;
+            StyleTransitionComputed transition;
+            if (bridge_transition_applies(bridge, node, &transition)) {
+                int64_t handle = js_rt_bridge_register_node(bridge, node);
+                if (handle <= 0) {
+                    JS_FreeValue(context, found);
+                    return JS_ThrowRangeError(context, "node handle table full");
+                }
+                if (js_rt_define_index(context, found, count++,
+                                         JS_NewInt64(context, handle)) < 0) {
+                    JS_FreeValue(context, found);
+                    return JS_EXCEPTION;
+                }
+            }
+            lxb_dom_node_t *next = bridge_light_element(node->first_child);
+            /* The depth this climbs was descended within `limit` visits. */
+            while (next == NULL && node != root) {
+                next = bridge_light_element(node->next);
+                if (next == NULL) node = node->parent;
+            }
+            node = next;
+        }
+    }
+    if (js_rt_define_index(context, found, 0,
+                             JS_NewInt32(context, visited)) < 0) {
+        JS_FreeValue(context, found);
+        return JS_EXCEPTION;
+    }
+    return found;
+}
+
+JS_RT_GUARDED_NATIVE(, js_transition_snapshot)(JSContext *context,
                                JSValueConst this_value,
                                int argc, JSValueConst *argv)
 {
@@ -1467,15 +1552,7 @@ JSValue js_transition_snapshot(JSContext *context,
     /* The snapshot reads properties, durations and delays, never the
        easings, so they are not validated again or serialized. */
     StyleTransitionComputed transition;
-    (void) style_transition_computed_untimed(bridge->stylesheet, node,
-                                             PSEUDO_NONE, &transition);
-    bool animated = false;
-    for (unsigned i = 0; i < transition.property_count && !animated; i++) {
-        double duration = transition.duration_ms[i % transition.duration_count];
-        double delay = transition.delay_ms[i % transition.delay_count];
-        animated = (duration > 0.0 ? duration : 0.0) + delay > 0.0
-            && strcmp(transition.properties[i], "none") != 0;
-    }
+    bool animated = bridge_transition_applies(bridge, node, &transition);
     /* Descendant discovery needs only the cascade's answer, not four
        temporary arrays or computed paint values for every visited node. */
     if (argc > 2 && JS_ToBool(context, argv[2]))
@@ -1490,14 +1567,14 @@ JSValue js_transition_snapshot(JSContext *context,
         && !JS_IsException(values);
     for (unsigned i = 0; ok && animated && i < transition.property_count;
          i++) {
-        ok = JS_SetPropertyUint32(
+        ok = js_rt_define_index(
                  context, properties, i,
                  JS_NewString(context, transition.properties[i])) >= 0
-            && JS_SetPropertyUint32(
+            && js_rt_define_index(
                  context, durations, i,
                  JS_NewFloat64(context, transition.duration_ms[
                      i % transition.duration_count])) >= 0
-            && JS_SetPropertyUint32(
+            && js_rt_define_index(
                  context, delays, i,
                  JS_NewFloat64(context, transition.delay_ms[
                      i % transition.delay_count])) >= 0;
@@ -1568,19 +1645,19 @@ JSValue js_transition_snapshot(JSContext *context,
                                               arguments);
         JS_FreeValue(context, name);
         if (JS_IsException(value)) { ok = false; break; }
-        ok = JS_SetPropertyUint32(context, values, i, value) >= 0;
+        ok = js_rt_define_index(context, values, i, value) >= 0;
     }
     bridge->computed_style_without_layout = saved;
-    /* JS_SetPropertyUint32 consumes its value whether or not the insertion
+    /* js_rt_define_index consumes its value whether or not the insertion
        succeeds, so a list is released here only if it was never offered. */
     JSValue *lists[4] = { &properties, &durations, &delays, &values };
     for (uint32_t i = 0; i < 4; i++) {
         JSValue list = *lists[i];
         *lists[i] = JS_UNDEFINED;
-        if (ok) ok = JS_SetPropertyUint32(context, result, i, list) >= 0;
+        if (ok) ok = js_rt_define_index(context, result, i, list) >= 0;
         else JS_FreeValue(context, list);
     }
-    if (ok) ok = JS_SetPropertyUint32(
+    if (ok) ok = js_rt_define_index(
         context, result, 4, JS_NewBool(context, rendered)) >= 0;
     if (!ok) {
         JS_FreeValue(context, result);
@@ -1632,7 +1709,7 @@ JSValue js_attribute_change_may_affect_has(JSContext *context,
    tree, where a shadow root is a child of its host. An element not under
    the document, or past the depth bound, answers true: the caller treats
    true as "may have changed". */
-JSValue js_style_reach(JSContext *context, JSValueConst this_value,
+JS_RT_GUARDED_NATIVE(, js_style_reach)(JSContext *context, JSValueConst this_value,
                        int argc, JSValueConst *argv)
 {
     (void) this_value;
@@ -1711,7 +1788,7 @@ JSValue js_computed_style_support(JSContext *context,
     uint32_t at = 0;
     for (size_t i = 0; i < COMPUTED_STYLE_PROPERTY_COUNT; i++) {
         if (!computed_style_properties[i].longhand) continue;
-        if (JS_SetPropertyUint32(
+        if (js_rt_define_index(
                 context, names, at++,
                 JS_NewString(context, computed_style_properties[i].name))
             < 0) {
@@ -2068,6 +2145,7 @@ static bool computed_style_resolve(JSContext *context, DomBridge *bridge,
         && !svg_presentation_attribute_relevant(node, name, name_length)) {
         return computed_style_answer(answer, computed_style_string(context, "", empty));
     }
+    js_rt_bridge_note_parser_writes_for_layout(bridge);
     const unsigned property_flags =
         id == CSP_NONE ? 0u : computed_style_properties[id].flags;
     bool used_geometry_property = (property_flags & CSP_USED_GEOMETRY) != 0;
@@ -3810,10 +3888,19 @@ static bool rendered_text_name_is(lxb_dom_node_t *node, const char *wanted)
            && strncasecmp(name, wanted, length) == 0;
 }
 
+/* A host's carrier holds its shadow tree, whose text is not part of innerText:
+   the steps walk child nodes, and a shadow root is not one. */
+static bool rendered_text_is_carrier(const lxb_dom_node_t *node)
+{
+    return node->local_name == LXB_TAG_DIV && document_shadow_trees_present()
+        && document_node_is_shadow_carrier(node);
+}
+
 static lxb_dom_node_t *rendered_text_next_element(lxb_dom_node_t *node)
 {
     for (lxb_dom_node_t *at = node->next; at != NULL; at = at->next) {
-        if (at->type == LXB_DOM_NODE_TYPE_ELEMENT) return at;
+        if (at->type == LXB_DOM_NODE_TYPE_ELEMENT
+            && !rendered_text_is_carrier(at)) return at;
     }
     return NULL;
 }
@@ -3878,7 +3965,7 @@ JSValue js_dom_rendered_text(JSContext *context, JSValueConst this_value,
             continue;
         }
         if (at->type != LXB_DOM_NODE_TYPE_ELEMENT
-            || rendered_text_skipped(at)) {
+            || rendered_text_skipped(at) || rendered_text_is_carrier(at)) {
             at = at->next;
             continue;
         }
@@ -3931,7 +4018,7 @@ JSValue js_dom_rendered_text(JSContext *context, JSValueConst this_value,
     return value;
 }
 
-JSValue js_computed_style_get(JSContext *context,
+JS_RT_GUARDED_NATIVE(, js_computed_style_get)(JSContext *context,
                               JSValueConst this_value,
                               int argc, JSValueConst *argv)
 {
@@ -3964,7 +4051,7 @@ JSValue js_computed_style_get(JSContext *context,
    the value needs script's post-processing (flex-basis and the scroll
    margins and paddings resolve em terms) or is empty for a non-custom
    name (script falls back to inline text). */
-JSValue js_computed_style_read(JSContext *context, JSValueConst this_value,
+JS_RT_GUARDED_NATIVE(, js_computed_style_read)(JSContext *context, JSValueConst this_value,
                                int argc, JSValueConst *argv)
 {
     (void) this_value;

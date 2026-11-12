@@ -83,7 +83,8 @@ MediaDiscoveryKind media_discovery_reference_kind(
             kind = MEDIA_DISCOVERY_MP4;
             suffix = 4u;
         } else if (remaining >= 4u
-                   && strncasecmp(value + i, ".m4a", 4u) == 0) {
+                   && (strncasecmp(value + i, ".m4a", 4u) == 0
+                       || strncasecmp(value + i, ".mp3", 4u) == 0)) {
             kind = MEDIA_DISCOVERY_AUDIO_MP4;
             suffix = 4u;
         } else if (remaining >= 5u
@@ -1200,7 +1201,15 @@ static void media_scan_text(
         if (i >= length) break;
         media_chain_note_value(&chain, context, source, begin - 1u, begin, i);
         /* embedUrl names a player/document, even when its route happens to
-           carry a media-looking suffix. Never feed it to the native decoder. */
+           carry a media-looking suffix. Never feed it to the native decoder.
+           Only that one key matters, so look exactly its length back from
+           the key's closing quote. Walking back to the key's opening quote
+           had no bound: a script of `\\"k\\":'v'` repeated (the forward
+           scan reads each quote as real, the walk as escaped) walked to the
+           start of the text for every literal, about three billion steps
+           for a 256 KiB data script on the main thread. */
+        static const char embed_key[] = "embedUrl";
+        const size_t embed_key_length = sizeof(embed_key) - 1u;
         bool embed_value = false;
         size_t before = begin - 1u;
         while (before != 0u
@@ -1214,18 +1223,15 @@ static void media_scan_text(
                     || source[key_end - 1u] == '\'')) {
                 char key_quote = source[key_end - 1u];
                 size_t key_close = key_end - 1u;
-                size_t key_open = key_close;
-                while (key_open != 0u) {
-                    key_open--;
-                    if (source[key_open] == key_quote
-                        && (key_open == 0u || source[key_open - 1u] != '\\')) {
-                        size_t key_length = key_close - key_open - 1u;
-                        embed_value = key_length == sizeof("embedUrl") - 1u
-                            && strncasecmp(
-                                   source + key_open + 1u, "embedUrl",
-                                   key_length) == 0;
-                        break;
-                    }
+                /* The key holds no quote, so its opening quote is the first
+                   unescaped one before it exactly when that quote sits
+                   embed_key_length bytes back. */
+                if (key_close > embed_key_length) {
+                    size_t key_open = key_close - embed_key_length - 1u;
+                    embed_value = source[key_open] == key_quote
+                        && (key_open == 0u || source[key_open - 1u] != '\\')
+                        && strncasecmp(source + key_open + 1u, embed_key,
+                                       embed_key_length) == 0;
                 }
             }
         }

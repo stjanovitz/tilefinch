@@ -65839,8 +65839,11 @@ void JS_DetachArrayBuffer(JSContext *ctx, JSValueConst obj)
 
     if (!abuf || abuf->detached)
         return;
-    if (abuf->free_func)
+    if (abuf->free_func) {
         abuf->free_func(ctx->rt, abuf->opaque, abuf->data);
+        abuf->free_func = NULL;
+        abuf->opaque = NULL;
+    }
     abuf->data = NULL;
     abuf->byte_length = 0;
     abuf->detached = TRUE;
@@ -65945,7 +65948,8 @@ static JSValue js_array_buffer_transfer(JSContext *ctx,
                     return res;
                 new_abuf = JS_GetOpaque2(ctx, res, JS_CLASS_ARRAY_BUFFER);
                 memcpy(new_abuf->data, abuf->data, min_int(old_len, new_len));
-                abuf->free_func(ctx->rt, abuf->opaque, abuf->data);
+                if (abuf->free_func)
+                    abuf->free_func(ctx->rt, abuf->opaque, abuf->data);
             } else {
                 JSArrayBuffer *new_abuf;
                 uint8_t *new_bs;
@@ -65979,6 +65983,8 @@ static JSValue js_array_buffer_transfer(JSContext *ctx,
         /* neuter the backing buffer */
         abuf->data = NULL;
         abuf->byte_length = 0;
+        abuf->free_func = NULL;
+        abuf->opaque = NULL;
         abuf->detached = TRUE;
         js_array_buffer_update_typed_arrays(abuf);
     }
@@ -69970,14 +69976,67 @@ static JSValue js_weakref_deref(JSContext *ctx, JSValueConst this_val, int argc,
         return JS_UNDEFINED;
 }
 
-/* Tilefinch: WeakRef.prototype.deref for the host, without a call; the
-   target or undefined (also for a value that is not a WeakRef). */
-JSValue JS_WeakRefDeref(JSContext *ctx, JSValueConst weakref)
+/* Tilefinch: a weak reference the host stores itself (the DOM handle
+   table), without a WeakRef object and its record per target. It does
+   not keep the object alive; once the object dies its structure stays
+   until JS_FreeWeakTarget, so a dead target still answers. */
+JSValue JS_NewWeakTarget(JSContext *ctx, JSValueConst obj)
 {
-    JSWeakRefData *wrd = JS_GetOpaque(weakref, JS_CLASS_WEAK_REF);
-    if (!wrd || !js_weakref_is_live(wrd->target))
+    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
         return JS_UNDEFINED;
-    return JS_DupValue(ctx, wrd->target);
+    return js_weakref_new(ctx, obj);
+}
+
+/* The target (a new reference), or undefined once it died. */
+JSValue JS_WeakTargetDeref(JSContext *ctx, JSValueConst target)
+{
+    if (JS_VALUE_GET_TAG(target) != JS_TAG_OBJECT ||
+        !js_weakref_is_live(target))
+        return JS_UNDEFINED;
+    return JS_DupValue(ctx, target);
+}
+
+void JS_FreeWeakTarget(JSRuntime *rt, JSValue target)
+{
+    js_weakref_free(rt, target);
+}
+
+/* Tilefinch: whether script could miss a weak target if it died: something
+   else holds it weakly too (a WeakMap or WeakSet key, a WeakRef target), or
+   it has an own property outside the host's `plain` ones. Private names
+   don't count: the host's own slots use them. Allocates nothing, so a GC hook
+   can ask. */
+int JS_WeakTargetCarriesState(JSRuntime *rt, JSValueConst target,
+                              const JSAtom *plain, int plain_count)
+{
+    JSObject *p;
+    JSShape *sh;
+    JSShapeProperty *pr;
+    int i, j;
+
+    if (JS_VALUE_GET_TAG(target) != JS_TAG_OBJECT ||
+        !js_weakref_is_live(target))
+        return FALSE;
+    p = JS_VALUE_GET_OBJ(target);
+    if (p->weakref_count > 1)
+        return TRUE;
+    sh = p->shape;
+    pr = get_shape_prop(sh);
+    for (i = 0; i < sh->prop_count; i++) {
+        if (pr[i].atom == JS_ATOM_NULL)
+            continue;
+        if (!__JS_AtomIsTaggedInt(pr[i].atom) &&
+            rt->atom_array[pr[i].atom]->atom_type == JS_ATOM_TYPE_SYMBOL &&
+            rt->atom_array[pr[i].atom]->hash == JS_ATOM_HASH_PRIVATE)
+            continue;
+        for (j = 0; j < plain_count; j++) {
+            if (pr[i].atom == plain[j])
+                break;
+        }
+        if (j == plain_count)
+            return TRUE;
+    }
+    return FALSE;
 }
 
 static const JSCFunctionListEntry js_weakref_proto_funcs[] = {

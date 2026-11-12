@@ -697,10 +697,60 @@ static int test_bounded_failure_and_framing(void)
     return 0;
 }
 
+/* connect-src for sockets (NW-07): request URLs are the http(s) spellings
+   a socket's fetch uses, http for ws and https for wss. */
+static int test_websocket_sources(void)
+{
+    static const char named[] =
+        "content-security-policy: connect-src 'self' wss://realtime.test\n";
+    TilefinchContentSecurityPolicy csp;
+    CHECK(tilefinch_csp_parse_response_headers(
+        &csp, "https://page.test/", named, sizeof(named) - 1, false));
+    CHECK(tilefinch_csp_allows_websocket(
+        &csp, "https://realtime.test/chat", 0));
+    CHECK(tilefinch_csp_allows_websocket(&csp, "https://page.test/chat", 0));
+    CHECK(!tilefinch_csp_allows_websocket(
+        &csp, "http://realtime.test/chat", 0));
+    CHECK(!tilefinch_csp_allows_websocket(
+        &csp, "https://other.test/chat", 0));
+    /* A wss source does not admit an ordinary fetch. */
+    CHECK(!tilefinch_csp_allows_request(
+        &csp, TILEFINCH_DESTINATION_FETCH, "https://realtime.test/chat"));
+    /* A policy's grant bit admits, as for any request. */
+    CHECK(tilefinch_csp_allows_websocket(
+        &csp, "https://other.test/chat", 1u));
+
+    static const char schemes[] =
+        "content-security-policy: connect-src ws:\n"
+        "content-security-policy: connect-src ws://lan.test wss:\n";
+    CHECK(tilefinch_csp_parse_response_headers(
+        &csp, "http://page.test/", schemes, sizeof(schemes) - 1, false));
+    CHECK(tilefinch_csp_allows_websocket(&csp, "http://lan.test/s", 0));
+    CHECK(tilefinch_csp_allows_websocket(&csp, "https://lan.test/s", 0));
+    CHECK(tilefinch_csp_allows_websocket(&csp, "https://any.test/s", 0));
+    CHECK(!tilefinch_csp_allows_websocket(&csp, "http://any.test/s", 0));
+    CHECK(!tilefinch_csp_allows_request(
+        &csp, TILEFINCH_DESTINATION_FETCH, "https://lan.test/s"));
+
+    /* An http(s) source keeps covering the socket of its scheme pair. */
+    static const char web[] =
+        "content-security-policy: connect-src https://secure.test "
+        "http://plain.test\n";
+    CHECK(tilefinch_csp_parse_response_headers(
+        &csp, "http://page.test/", web, sizeof(web) - 1, false));
+    CHECK(tilefinch_csp_allows_websocket(&csp, "https://secure.test/", 0));
+    CHECK(!tilefinch_csp_allows_websocket(&csp, "http://secure.test/", 0));
+    CHECK(tilefinch_csp_allows_websocket(&csp, "http://plain.test/", 0));
+    CHECK(tilefinch_csp_allows_websocket(&csp, "https://plain.test/", 0));
+    CHECK(!tilefinch_csp_allows_websocket(&csp, "wss://secure.test/", 0));
+    return 0;
+}
+
 int main(void)
 {
     CHECK(test_directives() == 0);
     CHECK(test_source_matching_and_intersection() == 0);
+    CHECK(test_websocket_sources() == 0);
     CHECK(test_element_and_attribute_directives() == 0);
     CHECK(test_worker_and_dynamic_code_policy() == 0);
     CHECK(test_inline_nonce_and_hash() == 0);

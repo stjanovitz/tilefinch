@@ -84,6 +84,13 @@ typedef struct {
        begin publishes one demand; later calls only sample its outcome. */
     void *network_context;
     PspMediaNetworkStatus (*prepare_network)(void *context, bool begin);
+    /* Optional: the loading supervisor's presentation fence (AU-05), the
+       signatures of psp_presentation_fence_acquire/release. A supervised
+       media scope draws a copy of `ui` that points at ui_presentation;
+       psp_media_init installs these as that presentation's fence, which
+       its writers take for the store alone (PspUiMediaPresentation). */
+    bool (*fence_acquire)(void);
+    void (*fence_release)(bool held);
 } PspMediaSessionPlatform;
 
 typedef struct {
@@ -112,6 +119,9 @@ typedef struct {
     uint64_t subtitle_request_id;
     size_t subtitle_received_bytes;
     size_t subtitle_cue_cursor;
+    const char *subtitle_shown_source;
+    /* Scripts in the captions shown so far, which the page may not use. */
+    uint16_t caption_glyph_scripts;
     bool subtitle_request_attempted;
     YoutubeSubtitleRetry subtitle_extension_retry;
     /* The initial resolver retains URLs only for the six presented tracks.
@@ -279,6 +289,16 @@ typedef struct {
        selects the existing audio-only demux/backend path. */
     bool page_audio;
     bool page_hls;
+    /* The page audio probe answered MPEG audio: open it through the MP3
+       source (psp_media_hls_create_mp3). Length 0 is a live stream. */
+    bool page_mp3;
+    bool page_mp3_seekable;
+    uint64_t page_mp3_length;
+    /* The open stopped to ask whether this page's plain-HTTP audio stream
+       may play (the failure panel shows the question). */
+    bool insecure_audio_offer;
+    /* The open was refused by a remembered decline for this site. */
+    bool insecure_audio_blocked;
     /* Narrowed after a selected HLS variant proved unusable on the firmware
        decoder -- an undeclared profile that is High, or a coding firmware
        refuses -- so the master is selected again at the software bound. */
@@ -373,6 +393,9 @@ typedef struct {
      */
     int dma_quarantine_slot;
     uint32_t dma_quarantine_generation;
+    /* True from the timed-out join until the playback that posted the
+       transfer is destroyed: only that session is failed if it expires. */
+    bool dma_quarantine_owned;
     /* The feed taken immediately before the frame blocks for the vertical
        blank, and what it handed the worker to do during it. */
     size_t prevblank_frames;
@@ -493,6 +516,21 @@ typedef struct {
     const char *deferred_checkpoint;
     uint32_t stale_service_completions;
     uint32_t deferred_dispatch_overflows;
+    /* Page audio's listening view. The label names the audio until the
+       stream does: the element's title attribute, else the page's title.
+       The station fields come from the stream's icy-name/icy-genre headers
+       (adopted once per pipeline); the source is the stream's host, and
+       unencrypted means a secure page plays it over plain HTTP. All are
+       kept for the route, across retries and reconnects. */
+    char page_media_label[96];
+    char audio_station[96];
+    char audio_detail[PSP_UI_MEDIA_AUDIO_TEXT_CAPACITY];
+    char audio_source[PSP_UI_MEDIA_AUDIO_TEXT_CAPACITY];
+    bool audio_unencrypted;
+    bool audio_station_checked;
+    /* The listening view's last presented second and state, so the panel
+       repaints when they change and not otherwise. */
+    uint32_t audio_view_signature;
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     /* Four bounded startup samples are retained in RAM and printed only at
        teardown. Logging while playback begins can itself stall host0 long
@@ -596,6 +634,11 @@ bool psp_media_open_page_source(
     TilefinchCredentialsMode credentials,
     const TilefinchContentSecurityPolicy *content_security_policy,
     bool autoplay, bool reload_source);
+/* Names page media opened just now: the element's title attribute or, when
+   it has none, the page's title. Either may be NULL. */
+void psp_media_set_page_media_label(PspMediaSession *media,
+                                    const char *element_title,
+                                    const char *page_title);
 bool psp_media_open_page_audio(
     PspMediaSession *media, const char *source_url,
     const char *document_url, uint64_t generation,

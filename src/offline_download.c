@@ -207,9 +207,17 @@ static void download_set_state(
         snprintf(manager->error, sizeof(manager->error), "%s", error);
 }
 
+static void download_release_resolve(OfflineDownloadManager *manager)
+{
+    if (manager == NULL || manager->resolve_job == NULL) return;
+    youtube_resolve_job_destroy(manager->resolve_job);
+    manager->resolve_job = NULL;
+}
+
 static void download_reset_active(OfflineDownloadManager *manager)
 {
     if (manager == NULL) return;
+    download_release_resolve(manager);
     download_cancel_request(manager);
     download_close_output(manager);
     if (manager->completion != NULL) {
@@ -341,18 +349,11 @@ static bool download_begin_part(
     return true;
 }
 
-static bool download_resolve(OfflineDownloadManager *manager)
+/* Applies a finished resolution in manager->stream; ERROR explains a
+   failed one. */
+static bool download_finish_resolve(
+    OfflineDownloadManager *manager, bool resolved, const char *error)
 {
-    OfflineLibraryItem *item = offline_library_find_mutable(
-        manager->library, manager->active_id);
-    if (item == NULL) return false;
-    char error[256] = {0};
-    memset(&manager->stream, 0, sizeof(manager->stream));
-    bool resolved = youtube_resolve_progressive_mp4_cancelable(
-        manager->budget, manager->session, item->source_url,
-        manager->maximum_height, 30000,
-        manager->cancel, manager->cancel_opaque,
-        &manager->stream, error, sizeof(error));
     if (!resolved || manager->stream.content_length == 0
         || manager->stream.content_length > OFFLINE_DOWNLOAD_STREAM_LIMIT
         || (manager->stream.split_streams
@@ -361,7 +362,8 @@ static bool download_resolve(OfflineDownloadManager *manager)
                        > OFFLINE_DOWNLOAD_STREAM_LIMIT))) {
         download_set_state(
             manager, OFFLINE_ITEM_FAILED,
-            error[0] == '\0' ? "video exceeds the offline size bound" : error);
+            error == NULL || error[0] == '\0'
+                ? "video exceeds the offline size bound" : error);
         download_reset_active(manager);
         return false;
     }
@@ -372,6 +374,54 @@ static bool download_resolve(OfflineDownloadManager *manager)
                        "resolved video failed download policy");
     download_reset_active(manager);
     return false;
+}
+
+/* The resolve runs as the resolver job playback uses: its requests go to
+   the worker transport and each call advances it one bounded step, so a
+   resolve of up to 30 s (three clients and a watch page of up to 6 MiB)
+   never waits on the network on the browser thread while the user reads
+   a page; a pump takes one response chunk or makes one parse. False while
+   it is pending. The synchronous resolver remains only for builds and
+   sessions without that transport (an HTTP trace capture, a host lab);
+   a shipping PSP build always has it. */
+static bool download_resolve(OfflineDownloadManager *manager)
+{
+    OfflineLibraryItem *item = offline_library_find_mutable(
+        manager->library, manager->active_id);
+    if (item == NULL) return false;
+    if (manager->resolve_job == NULL
+        && !fetch_background_transport_available()) {
+        char error[256] = {0};
+        memset(&manager->stream, 0, sizeof(manager->stream));
+        bool resolved = youtube_resolve_progressive_mp4_cancelable(
+            manager->budget, manager->session, item->source_url,
+            manager->maximum_height, 30000,
+            manager->cancel, manager->cancel_opaque,
+            &manager->stream, error, sizeof(error));
+        return download_finish_resolve(manager, resolved, error);
+    }
+    if (manager->resolve_job == NULL) {
+        manager->resolve_job = youtube_resolve_job_begin(
+            manager->budget, manager->session, item->source_url,
+            manager->maximum_height, 30000,
+            manager->cancel, manager->cancel_opaque);
+        if (manager->resolve_job == NULL)
+            return download_finish_resolve(
+                manager, false, "player: resolver worker was unavailable");
+    }
+    YoutubeResolveJobStatus status =
+        youtube_resolve_job_pump(manager->resolve_job);
+    if (status == YOUTUBE_RESOLVE_JOB_PENDING) return false;
+    memset(&manager->stream, 0, sizeof(manager->stream));
+    bool resolved = status == YOUTUBE_RESOLVE_JOB_COMPLETE
+        && youtube_resolve_job_take(manager->resolve_job, &manager->stream);
+    char error[256] = {0};
+    if (!resolved)
+        snprintf(error, sizeof(error), "%s",
+                 youtube_resolve_job_error(manager->resolve_job));
+    /* Its response buffers go back before the transfer opens a file. */
+    download_release_resolve(manager);
+    return download_finish_resolve(manager, resolved, error);
 }
 
 bool offline_download_manager_adopt_resolved(
@@ -723,6 +773,7 @@ bool offline_download_manager_pause(
     if (item == NULL || item->type != OFFLINE_ITEM_YOUTUBE
         || item->state == OFFLINE_ITEM_READY) return false;
     if (manager->active_id == id) {
+        download_release_resolve(manager);
         download_cancel_request(manager);
         download_close_output(manager);
         if (manager->completion != NULL) {

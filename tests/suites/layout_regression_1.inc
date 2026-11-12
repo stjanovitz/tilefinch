@@ -71,12 +71,18 @@
 
     puts("test: all:inherit and shed-script action-shell fallback");
     CHECK(test_all_inherit_and_static_action_shell(&budget) == 0);
+    puts("test: all:unset and all:initial");
+    CHECK(test_all_unset_and_initial(&budget) == 0);
+    puts("test: search header flex, generated and intrinsic widths");
+    CHECK(test_search_header_layout(&budget) == 0);
 
     puts("test: direction-aware logical dimensions, edges, and insets");
     CHECK(test_directional_logical_properties(&budget) == 0);
 
     puts("test: Unicode line opportunities and bounded RTL flow");
     CHECK(test_international_line_flow(&budget) == 0);
+    CHECK(test_bidi_long_document(&budget) == 0);
+    CHECK(test_control_text_visual_order(&budget) == 0);
 
     puts("test: HTML UA body margin and author spacing resets");
     CHECK(test_ua_body_spacing(&budget) == 0);
@@ -109,6 +115,7 @@
     CHECK(test_resumable_authoritative_layout(&budget) == 0);
     CHECK(test_wrapped_flex_preview_stops_at_limit(&budget) == 0);
     CHECK(test_preview_cut_repositioning_marks_inexact(&budget) == 0);
+    CHECK(test_flat_list_noise_costs_no_style_work(&budget) == 0);
 
     puts("test: table column constraints, rowspan placement, and captions");
     CHECK(test_table_column_and_rowspan_construction(&budget) == 0);
@@ -211,6 +218,7 @@
     CHECK(test_generated_content_counters_and_markers(&budget) == 0);
     CHECK(test_generated_counter_analysis_is_shared(&budget) == 0);
     CHECK(test_generated_counter_resource_reuse(&budget) == 0);
+    CHECK(test_reuse_image_load_in_place(&budget) == 0);
     CHECK(test_generated_counter_lookup_work(&budget) == 0);
     CHECK(test_retained_matches_reuse(&budget) == 0);
     CHECK(test_stylesheet_append_matches_rebuild(&budget) == 0);
@@ -279,6 +287,7 @@
     puts("test: first text discovery uses a bounded constant stack");
     CHECK(test_first_text_data_deep_walk(&budget) == 0);
     CHECK(test_select_option_deep_walk(&budget) == 0);
+    CHECK(test_select_options_shown_in_linear_work(&budget) == 0);
 
     puts("test: flex overlays use final size and flex-item paint order");
     CHECK(test_flex_overlay_used_size_and_paint_order(&budget) == 0);
@@ -349,6 +358,11 @@
 
     puts("test: table-cell vertical alignment and flattened row groups");
     CHECK(test_table_cell_vertical_alignment(&budget) == 0);
+    CHECK(test_table_cell_shift_scope(&budget) == 0);
+    CHECK(test_border_insert_fixup_scope(&budget) == 0);
+    CHECK(test_ordered_list_numbering_is_linear(&budget) == 0);
+    CHECK(test_general_sibling_selector_is_linear(&budget) == 0);
+    CHECK(test_table_tracks_past_slot_limit(&budget) == 0);
 
     puts("test: responsive CSS and flexbox");
     PocDocument responsive;

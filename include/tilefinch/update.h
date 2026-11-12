@@ -247,6 +247,18 @@ bool tilefinch_update_journal_store(
     const char *data_dir, const TilefinchUpdateState *state,
     TilefinchUpdateFaultHook fault, void *fault_opaque);
 
+/* Retry declined: data/update-declined holds the encoded journal record of
+   a STARTED trial whose recovery screen was answered with O or timed out.
+   It matches only that exact record (generation, slots, candidate), so any
+   later journal state, a new trial included, ignores it. Launchers that
+   predate it never read it, and the journal format is unchanged. */
+bool tilefinch_update_decline_store(
+    const char *data_dir, const TilefinchUpdateState *state,
+    TilefinchUpdateFaultHook fault, void *fault_opaque);
+bool tilefinch_update_decline_recorded(
+    const char *data_dir, const TilefinchUpdateState *state);
+void tilefinch_update_decline_clear(const char *data_dir);
+
 typedef enum {
     TILEFINCH_UPDATE_BOOT_ACTIVE = 0,
     TILEFINCH_UPDATE_BOOT_PREVIOUS,
@@ -254,9 +266,24 @@ typedef enum {
     TILEFINCH_UPDATE_BOOT_RECOVERY
 } TilefinchUpdateBootAction;
 
+/* Holding L (recovery_button) selects the previous slot only while it still
+   holds the build that ran before the active one: a slot that a later
+   update has been staged into (the pending slot), or that equals the active
+   slot, holds no known-good build. Without one, L still never starts a
+   pending candidate: it boots the active slot.
+   retry_declined (tilefinch_update_decline_recorded) turns the recovery
+   screen of that STARTED trial into an ordinary boot of the active slot;
+   the browser's Update page then offers the same choice. */
 TilefinchUpdateBootAction tilefinch_update_boot_decide(
     const TilefinchUpdateState *state, bool recovery_button,
-    bool pending_slot_verified, TilefinchUpdateSlot *slot);
+    bool pending_slot_verified, bool retry_declined,
+    TilefinchUpdateSlot *slot);
+bool tilefinch_update_state_previous_usable(const TilefinchUpdateState *state);
+/* Safe start (L held) and the recovery screen bypass the derived startup
+   module and remove it, so a module that loads but never reaches the
+   browser cannot wedge the next ordinary boot. */
+bool tilefinch_update_boot_allows_fast_start(
+    bool recovery_button, TilefinchUpdateBootAction action);
 bool tilefinch_update_state_start_trial(TilefinchUpdateState *state);
 bool tilefinch_update_state_retry_trial(TilefinchUpdateState *state);
 bool tilefinch_update_state_discard_trial(TilefinchUpdateState *state);
@@ -356,6 +383,15 @@ TilefinchUpdateClient *tilefinch_update_client_create(
 void tilefinch_update_client_destroy(TilefinchUpdateClient *client);
 bool tilefinch_update_client_begin_check(
     TilefinchUpdateClient *client, uint64_t now_unix, bool clock_valid);
+/* Replaces the installed sequence and package pair a check is judged
+   against, after the journal moved (a trial confirmed healthy). An offered
+   or downloaded release is judged again at once, without network: it can
+   become UP_TO_DATE or ERROR, which also removes its downloaded part file.
+   Refused while a transfer is in flight. */
+bool tilefinch_update_client_set_installed(
+    TilefinchUpdateClient *client, uint64_t installed_sequence,
+    const uint8_t installed_sha256[32], bool installed_sequence_valid,
+    bool installed_pair_valid);
 bool tilefinch_update_client_begin_download(TilefinchUpdateClient *client);
 bool tilefinch_update_client_cancel(TilefinchUpdateClient *client);
 bool tilefinch_update_client_pump(
@@ -368,6 +404,17 @@ const uint8_t *tilefinch_update_client_envelope(
 bool tilefinch_update_client_download_proof(
     const TilefinchUpdateClient *client,
     TilefinchUpdateDownloadedPackageProof *proof);
+
+/* The text a failed metadata fetch or package download shows: the transport's
+   own error, else FALLBACK with the HTTP status the server answered. */
+void tilefinch_update_transfer_failure_text(
+    char *output, size_t capacity, const char *fallback, long status_code,
+    const char *transport_error);
+/* Classifies a package download that did not produce the signed bytes, so a
+   server refusal or a Memory Stick write error is not reported as a bad file. */
+TilefinchUpdateStatus tilefinch_update_download_failure(
+    char *output, size_t capacity, bool transfer_success, long status_code,
+    const char *transport_error, bool write_failed);
 
 /* Bounded updater URL policy shared by boot configuration and the client. */
 bool tilefinch_update_url_is_valid(const char *url, size_t capacity);
@@ -400,6 +447,11 @@ typedef struct {
     const char *install_root;
     const char *data_dir;
     TilefinchUpdateSlot inactive_slot;
+    /* The slot this process runs from (NONE when unknown). The installer
+       never targets it, whatever current_state says. */
+    TilefinchUpdateSlot running_slot;
+    /* Must equal the journal on disk: the installer re-reads the journal
+       before it removes or renames anything and stops if it changed. */
     TilefinchUpdateState current_state;
     TilefinchUpdateTrust trust;
     bool allow_downgrade;
@@ -432,5 +484,10 @@ bool tilefinch_update_install_pump(
 bool tilefinch_update_install_snapshot(
     const TilefinchUpdateInstallJob *job,
     TilefinchUpdateInstallSnapshot *snapshot);
+/* Removes a failed install's slot-X.tmp and slot-X.old trees for SLOT in
+   bounded rounds, before a download's free-space check counts them. Never
+   touches slot-X itself. True when neither tree remains. */
+bool tilefinch_update_install_clear_staging(
+    const char *install_root, TilefinchUpdateSlot slot);
 
 #endif

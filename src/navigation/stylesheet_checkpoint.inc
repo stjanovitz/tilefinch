@@ -42,7 +42,6 @@ static void navigation_stream_release_blocking_stylesheet(
     }
     stylesheet_destroy(&stream->blocking_stylesheet);
     stream->blocking_stylesheet_ready = false;
-    stream->blocking_stylesheet_user_context_neutral = false;
     stream->blocking_stylesheet_fingerprint_valid = false;
 }
 
@@ -58,6 +57,167 @@ static uint64_t navigation_stylesheet_fingerprint_field(
     return fingerprint_bytes(hash, (const char *) &terminator, 1u);
 }
 
+/* The loader-visible attributes of a <link rel=stylesheet>
+   (stylesheet_inputs.h) and its nonce. `resolved_href`, when given, stands
+   for the href. */
+static uint64_t navigation_stylesheet_link_hash(
+    uint64_t hash, lxb_dom_node_t *node, const char *resolved_href)
+{
+    static const char *const attributes[] = {
+#define NAVIGATION_STYLESHEET_INPUT_NAME(name) name,
+        STYLESHEET_LINK_INPUTS(NAVIGATION_STYLESHEET_INPUT_NAME)
+#undef NAVIGATION_STYLESHEET_INPUT_NAME
+    };
+    for (size_t i = 0; i < sizeof(attributes) / sizeof(attributes[0]); i++) {
+        size_t length = 0;
+        const char *value = document_attribute(node, attributes[i], &length);
+        if (resolved_href != NULL && value != NULL
+            && strcmp(attributes[i], STYLESHEET_INPUT_HREF) == 0) {
+            value = resolved_href;
+            length = strlen(resolved_href);
+        }
+        hash = navigation_stylesheet_fingerprint_field(
+            hash, attributes[i], value, length, value != NULL);
+    }
+    size_t nonce_length = 0;
+    const char *nonce = document_element_nonce(node, &nonce_length);
+    return navigation_stylesheet_fingerprint_field(
+        hash, "nonce", nonce, nonce_length, nonce != NULL);
+}
+
+/* The root element's loader-visible attributes (its theme selection). */
+static uint64_t navigation_stylesheet_root_hash(
+    uint64_t hash, const PocDocument *document)
+{
+    lxb_dom_element_t *element = lxb_dom_document_element(
+        &document->html->dom_document);
+    lxb_dom_node_t *root = element == NULL
+        ? NULL : lxb_dom_interface_node(element);
+    static const char *const attributes[] = {
+#define NAVIGATION_STYLESHEET_INPUT_NAME(name) name,
+        STYLESHEET_ROOT_INPUTS(NAVIGATION_STYLESHEET_INPUT_NAME)
+#undef NAVIGATION_STYLESHEET_INPUT_NAME
+    };
+    for (size_t i = 0; i < sizeof(attributes) / sizeof(attributes[0]); i++) {
+        size_t length = 0;
+        const char *value = root == NULL
+            ? NULL : document_attribute(root, attributes[i], &length);
+        hash = navigation_stylesheet_fingerprint_field(
+            hash, attributes[i], value, length, value != NULL);
+    }
+    return hash;
+}
+
+/* One walk over the document's stylesheet sources, <style> and
+   <link rel=stylesheet>, in document order (the order the loader takes
+   them). The streamed fingerprint, the head key, the static key and the
+   continuation's input capture all fold this walk with the folds below, so
+   they cannot disagree on what a source is or what of it counts. */
+typedef struct {
+    lxb_dom_node_t *next;
+    lxb_dom_node_t *boundary_parent;
+    size_t visited;
+} NavigationStylesheetWalk;
+
+typedef struct {
+    lxb_dom_node_t *node;
+    const char *name;
+    size_t name_length;
+    bool style; /* otherwise a <link rel=stylesheet> */
+} NavigationStylesheetSource;
+
+typedef enum {
+    NAVIGATION_STYLESHEET_WALK_END,
+    NAVIGATION_STYLESHEET_WALK_SOURCE,
+    /* NAVIGATION_DOM_TRAVERSAL_NODE_LIMIT nodes visited. */
+    NAVIGATION_STYLESHEET_WALK_LIMIT
+} NavigationStylesheetWalkStep;
+
+static void navigation_stylesheet_walk_begin(
+    NavigationStylesheetWalk *walk, const PocDocument *document)
+{
+    walk->next = lxb_dom_interface_node(document->html);
+    walk->boundary_parent = walk->next->parent;
+    walk->visited = 0;
+}
+
+static NavigationStylesheetWalkStep navigation_stylesheet_walk_next(
+    NavigationStylesheetWalk *walk, NavigationStylesheetSource *source)
+{
+    while (walk->next != NULL && walk->next != walk->boundary_parent) {
+        if (++walk->visited > NAVIGATION_DOM_TRAVERSAL_NODE_LIMIT)
+            return NAVIGATION_STYLESHEET_WALK_LIMIT;
+        lxb_dom_node_t *node = walk->next;
+        if (node->first_child != NULL) {
+            walk->next = node->first_child;
+        } else {
+            lxb_dom_node_t *up = node;
+            while (up != NULL && up != walk->boundary_parent
+                   && up->next == NULL) up = up->parent;
+            walk->next = up != NULL && up != walk->boundary_parent
+                ? up->next : NULL;
+        }
+        size_t name_length = 0;
+        const char *name = document_element_name(node, &name_length);
+        bool style = name != NULL && name_length == 5
+            && memcmp(name, "style", 5) == 0;
+        bool link = name != NULL && name_length == 4
+            && memcmp(name, "link", 4) == 0;
+        if (link) {
+            size_t rel_length = 0;
+            const char *rel = document_attribute(
+                node, STYLESHEET_INPUT_REL, &rel_length);
+            link = rel != NULL
+                && navigation_token_contains(rel, rel_length, "stylesheet");
+        }
+        if (style || link) {
+            *source = (NavigationStylesheetSource) {
+                .node = node, .name = name, .name_length = name_length,
+                .style = style
+            };
+            return NAVIGATION_STYLESHEET_WALK_SOURCE;
+        }
+    }
+    return NAVIGATION_STYLESHEET_WALK_END;
+}
+
+/* A <style>'s nonce and text (the CSSOM's text once script replaced it). */
+static uint64_t navigation_stylesheet_style_hash(
+    uint64_t hash, lxb_dom_node_t *node)
+{
+    size_t nonce_length = 0;
+    const char *nonce = document_element_nonce(node, &nonce_length);
+    hash = navigation_stylesheet_fingerprint_field(
+        hash, "nonce", nonce, nonce_length, nonce != NULL);
+    size_t override_length = 0;
+    const char *override = document_cssom_sheet_text(node, &override_length);
+    if (override != NULL)
+        return navigation_stylesheet_fingerprint_field(
+            hash, "cssom", override, override_length, true);
+    for (lxb_dom_node_t *child = node->first_child; child != NULL;
+         child = child->next) {
+        size_t length = 0;
+        const char *text = document_text_data(child, &length);
+        hash = navigation_stylesheet_fingerprint_field(
+            hash, "css", text, length, text != NULL);
+    }
+    return hash;
+}
+
+/* A source as every key sees it: its element, then its text or its
+   loader-visible attributes. `resolved_href` as for
+   navigation_stylesheet_link_hash. */
+static uint64_t navigation_stylesheet_source_hash(
+    uint64_t hash, const NavigationStylesheetSource *source,
+    const char *resolved_href)
+{
+    hash = navigation_stylesheet_fingerprint_field(
+        hash, "element", source->name, source->name_length, true);
+    return source->style
+        ? navigation_stylesheet_style_hash(hash, source->node)
+        : navigation_stylesheet_link_hash(hash, source->node, resolved_href);
+}
+
 static bool navigation_stream_collect_stylesheet_inputs(
     NavigationDocumentStream *stream, const PocDocument *document,
     NavigationStylesheetInput **inputs, size_t *count, bool *overflow)
@@ -70,98 +230,53 @@ static bool navigation_stream_collect_stylesheet_inputs(
         || overflow == NULL) return false;
     NavigationStylesheetInput *collected = NULL;
     size_t capacity = 0;
-    lxb_dom_node_t *node = lxb_dom_interface_node(document->html);
-    lxb_dom_node_t *boundary_parent = node->parent;
-    size_t visited = 0;
-    while (node != NULL && node != boundary_parent) {
-        if (++visited > NAVIGATION_DOM_TRAVERSAL_NODE_LIMIT) {
-            budget_free(stream->session->budget, collected);
-            return false;
-        }
-        size_t name_length = 0;
-        const char *name = document_element_name(node, &name_length);
-        bool style = name != NULL && name_length == 5
-            && memcmp(name, "style", 5) == 0;
-        bool link = name != NULL && name_length == 4
-            && memcmp(name, "link", 4) == 0;
-        if (link) {
-            size_t rel_length = 0;
-            const char *rel = document_attribute(node, "rel", &rel_length);
-            link = rel != NULL
-                && navigation_token_contains(
-                       rel, rel_length, "stylesheet");
-            /* The raw preload scanner discovers links before Lexbor creates
-               their nodes. A provisional stylesheet checkpoint can precede
-               the broader metadata walk, so bind the already-walked node
-               here as well. Otherwise settle ignores the speculative request
-               and the authoritative loader starts a duplicate fetch. */
-            if (link) {
-                navigation_stream_confirm_stylesheet_preload(stream, node);
-            }
-        }
-        if (style || link) {
-            if (*count == NAVIGATION_STYLESHEET_INPUT_LIMIT) {
-                *overflow = true;
-            } else {
-                if (*count == capacity) {
-                    size_t next = capacity == 0 ? 8u : capacity * 2u;
-                    if (next > NAVIGATION_STYLESHEET_INPUT_LIMIT) {
-                        next = NAVIGATION_STYLESHEET_INPUT_LIMIT;
-                    }
-                    NavigationStylesheetInput *grown = budget_realloc(
-                        stream->session->budget, collected,
-                        next * sizeof(*grown));
-                    if (grown == NULL) {
-                        budget_free(stream->session->budget, collected);
-                        return false;
-                    }
-                    collected = grown;
-                    capacity = next;
-                }
-                uint64_t hash = UINT64_C(1469598103934665603);
-                hash = navigation_stylesheet_fingerprint_field(
-                    hash, "element", name, name_length, true);
-                if (style) {
-                    size_t override_length = 0;
-                    const char *override = document_cssom_sheet_text(node, &override_length);
-                    if (override != NULL)
-                        hash = navigation_stylesheet_fingerprint_field(
-                            hash, "cssom", override, override_length, true);
-                    for (lxb_dom_node_t *child = override == NULL ? node->first_child : NULL;
-                         child != NULL; child = child->next) {
-                        size_t length = 0;
-                        const char *text = document_text_data(child, &length);
-                        hash = navigation_stylesheet_fingerprint_field(
-                            hash, "css", text, length, text != NULL);
-                    }
-                } else {
-                    const char *attributes[] = {
-                        "rel", "href", "media", "referrerpolicy"
-                    };
-                    for (size_t i = 0;
-                         i < sizeof(attributes) / sizeof(attributes[0]);
-                         i++) {
-                        size_t length = 0;
-                        const char *value = document_attribute(
-                            node, attributes[i], &length);
-                        hash = navigation_stylesheet_fingerprint_field(
-                            hash, attributes[i], value, length,
-                            value != NULL);
-                    }
-                }
-                collected[*count] = (NavigationStylesheetInput) {
-                    .node = node, .hash = hash, .style = style
-                };
-                (*count)++;
-            }
-        }
-        if (node->first_child != NULL) {
-            node = node->first_child;
+    /* What a link applies depends on the root's theme selection too. */
+    const uint64_t root_inputs = navigation_stylesheet_root_hash(
+        UINT64_C(1469598103934665603), document);
+    NavigationStylesheetWalk walk;
+    NavigationStylesheetSource source;
+    NavigationStylesheetWalkStep step;
+    navigation_stylesheet_walk_begin(&walk, document);
+    while ((step = navigation_stylesheet_walk_next(&walk, &source))
+           == NAVIGATION_STYLESHEET_WALK_SOURCE) {
+        /* The raw preload scanner discovers links before Lexbor creates
+           their nodes. A provisional stylesheet checkpoint can precede the
+           broader metadata walk, so bind the already-walked node here as
+           well. Otherwise settle ignores the speculative request and the
+           authoritative loader starts a duplicate fetch. */
+        if (!source.style)
+            navigation_stream_confirm_stylesheet_preload(stream, source.node);
+        if (*count == NAVIGATION_STYLESHEET_INPUT_LIMIT) {
+            *overflow = true;
             continue;
         }
-        while (node != NULL && node != boundary_parent
-               && node->next == NULL) node = node->parent;
-        if (node != NULL && node != boundary_parent) node = node->next;
+        if (*count == capacity) {
+            size_t next = capacity == 0 ? 8u : capacity * 2u;
+            if (next > NAVIGATION_STYLESHEET_INPUT_LIMIT) {
+                next = NAVIGATION_STYLESHEET_INPUT_LIMIT;
+            }
+            NavigationStylesheetInput *grown = budget_realloc(
+                stream->session->budget, collected, next * sizeof(*grown));
+            if (grown == NULL) {
+                budget_free(stream->session->budget, collected);
+                return false;
+            }
+            collected = grown;
+            capacity = next;
+        }
+        uint64_t hash = navigation_stylesheet_source_hash(
+            UINT64_C(1469598103934665603), &source, NULL);
+        if (!source.style)
+            hash = fingerprint_bytes(hash, (const char *) &root_inputs,
+                                     sizeof(root_inputs));
+        collected[*count] = (NavigationStylesheetInput) {
+            .node = source.node, .hash = hash, .style = source.style
+        };
+        (*count)++;
+    }
+    if (step == NAVIGATION_STYLESHEET_WALK_LIMIT) {
+        budget_free(stream->session->budget, collected);
+        return false;
     }
     *inputs = collected;
     return true;
@@ -194,6 +309,16 @@ static void navigation_stream_capture_stylesheet_inputs(
         stream, inputs, count, overflow);
 }
 
+/* The session's user stylesheet, as a blocking sheet built or taken now
+   carries it. */
+static uint64_t navigation_stylesheet_user_css_hash(
+    const NavigationSession *session)
+{
+    return navigation_stylesheet_fingerprint_field(
+        UINT64_C(1469598103934665603), "user-css", session->user_css,
+        session->user_css_length, session->user_css_length != 0);
+}
+
 /* Appends the stylesheet inputs that follow an unchanged, already compiled
    prefix. `document` supplies both the inputs and the Content-Security-Policy
    that admits them: at commit the parser's document has already been moved
@@ -210,7 +335,7 @@ static bool navigation_stream_continue_stylesheet_suffix(
 #endif
     if (stream == NULL || stream->session == NULL || document == NULL
         || !stream->blocking_stylesheet_ready
-        || !stream->blocking_stylesheet_user_context_neutral
+        || stream->blocking_stylesheet.user_css_changes_context
         || stream->stylesheet_input_overflow) return false;
     /* A suffix appends at the end of the sheet, but adopted sheets must
        stay after every document source: rebuild instead. */
@@ -229,6 +354,16 @@ static bool navigation_stream_continue_stylesheet_suffix(
             .blocking_stylesheet_viewport_rebuilds++;
         return false;
     }
+    /* Likewise for prefers-color-scheme: night mode changed after the
+       prefix compiled. */
+    if (stream->blocking_stylesheet.prefers_dark
+        != stylesheet_prefers_dark_color_scheme()) return false;
+    /* And for the user stylesheet: one set after the prefix compiled (the
+       PSP's presentation sheet arriving while the page loads) is not in
+       it. */
+    if (stream->blocking_stylesheet_user_css
+        != navigation_stylesheet_user_css_hash(stream->session))
+        return false;
     uint64_t discovery_started = navigation_now_us();
     NavigationStylesheetInput *current = NULL;
     size_t current_count = 0;
@@ -351,27 +486,17 @@ static bool navigation_stream_continue_stylesheet_suffix(
     return true;
 }
 
-/* Parser-blocking scripts need the stylesheet state visible at their exact
-   checkpoint.  Hash only inputs which can alter the sheet itself: inline
-   CSS, external stylesheet references/provenance, user CSS, resource bounds,
-   the base URL, referrer policy, and viewport. Ordinary DOM/class/style
-   mutations are resolved against the same sheet and must not force CSS
-   reparsing. */
-static bool navigation_stream_stylesheet_fingerprint(
-    NavigationDocumentStream *stream, const PocDocument *document,
-    uint64_t *fingerprint)
+/* The parse context every compiled sheet depends on beyond its sources:
+   referrer policy, viewport, the prefers-color-scheme answer (night mode;
+   media queries are resolved at compile), resource switches and bounds,
+   user CSS, the Content-Security-Policy, adopted sheets and registered
+   properties. */
+static bool navigation_stylesheet_context_hash(
+    const NavigationDocumentStream *stream, const PocDocument *document,
+    uint64_t *io_hash)
 {
-    if (stream == NULL || stream->session == NULL
-        || document == NULL || document->html == NULL
-        || fingerprint == NULL) return false;
     const NavigationSession *session = stream->session;
-    if (session->user_css_length != 0 && session->user_css == NULL) {
-        return false;
-    }
-    uint64_t hash = UINT64_C(1469598103934665603);
-    hash = navigation_stylesheet_fingerprint_field(
-        hash, "base-url", stream->resource_base_url,
-        strlen(stream->resource_base_url), true);
+    uint64_t hash = *io_hash;
     hash = navigation_stylesheet_fingerprint_field(
         hash, "referrer-policy", stream->referrer_policy,
         strlen(stream->referrer_policy), true);
@@ -381,6 +506,9 @@ static bool navigation_stream_stylesheet_fingerprint(
     hash = fingerprint_bytes(
         hash, (const char *) &stream->viewport.css_height,
         sizeof(stream->viewport.css_height));
+    const bool prefers_dark = stylesheet_prefers_dark_color_scheme();
+    hash = fingerprint_bytes(
+        hash, (const char *) &prefers_dark, sizeof(prefers_dark));
     hash = fingerprint_bytes(
         hash, (const char *) &session->external_resources_enabled,
         sizeof(session->external_resources_enabled));
@@ -439,71 +567,135 @@ static bool navigation_stream_stylesheet_fingerprint(
     hash = fingerprint_bytes(hash,
         (const char *) &document->registered_property_count,
         sizeof(document->registered_property_count));
+    *io_hash = hash;
+    return true;
+}
 
-    lxb_dom_node_t *node = lxb_dom_interface_node(document->html);
-    lxb_dom_node_t *boundary_parent = node->parent;
-    size_t visited = 0;
-    while (node != NULL && node != boundary_parent) {
-        if (++visited > NAVIGATION_DOM_TRAVERSAL_NODE_LIMIT) return false;
-        size_t name_length = 0;
-        const char *name = document_element_name(node, &name_length);
-        bool style = name != NULL && name_length == 5
-            && memcmp(name, "style", 5) == 0;
-        bool link = name != NULL && name_length == 4
-            && memcmp(name, "link", 4) == 0;
-        if (link) {
-            size_t rel_length = 0;
-            const char *rel = document_attribute(node, "rel", &rel_length);
-            link = rel != NULL
-                && navigation_token_contains(
-                       rel, rel_length, "stylesheet");
-        }
-        if (style || link) {
-            hash = navigation_stylesheet_fingerprint_field(
-                hash, "element", name, name_length, true);
-        }
-        if (style) {
-            size_t nonce_length = 0;
-            const char *nonce = document_element_nonce(node, &nonce_length);
-            hash = navigation_stylesheet_fingerprint_field(
-                hash, "nonce", nonce, nonce_length, nonce != NULL);
-            size_t override_length = 0;
-            const char *override = document_cssom_sheet_text(node, &override_length);
-            if (override != NULL)
-                hash = navigation_stylesheet_fingerprint_field(
-                    hash, "cssom", override, override_length, true);
-            for (lxb_dom_node_t *child = override == NULL ? node->first_child : NULL; child != NULL;
-                 child = child->next) {
-                size_t length = 0;
-                const char *text = document_text_data(child, &length);
-                hash = navigation_stylesheet_fingerprint_field(
-                    hash, "css", text, length, text != NULL);
-            }
-        } else if (link) {
-            const char *attributes[] = {
-                "rel", "href", "media", "referrerpolicy",
-                "integrity", "crossorigin"
-            };
-            for (size_t i = 0;
-                 i < sizeof(attributes) / sizeof(attributes[0]); i++) {
-                size_t length = 0;
-                const char *value = document_attribute(
-                    node, attributes[i], &length);
-                hash = navigation_stylesheet_fingerprint_field(
-                    hash, attributes[i], value, length, value != NULL);
-            }
-        }
-        if (node->first_child != NULL) {
-            node = node->first_child;
+/* Parser-blocking scripts need the stylesheet state visible at their exact
+   checkpoint.  Hash only inputs which can alter the sheet itself: inline
+   CSS, external stylesheet references/provenance, user CSS, resource bounds,
+   the base URL, referrer policy, and viewport. Ordinary DOM/class/style
+   mutations are resolved against the same sheet and must not force CSS
+   reparsing. */
+static bool navigation_stream_stylesheet_fingerprint(
+    NavigationDocumentStream *stream, const PocDocument *document,
+    uint64_t *fingerprint)
+{
+    if (stream == NULL || stream->session == NULL
+        || document == NULL || document->html == NULL
+        || fingerprint == NULL) return false;
+    const NavigationSession *session = stream->session;
+    if (session->user_css_length != 0 && session->user_css == NULL) {
+        return false;
+    }
+    uint64_t hash = UINT64_C(1469598103934665603);
+    hash = navigation_stylesheet_fingerprint_field(
+        hash, "base-url", stream->resource_base_url,
+        strlen(stream->resource_base_url), true);
+    if (!navigation_stylesheet_context_hash(stream, document, &hash))
+        return false;
+    hash = navigation_stylesheet_root_hash(hash, document);
+    NavigationStylesheetWalk walk;
+    NavigationStylesheetSource source;
+    NavigationStylesheetWalkStep step;
+    navigation_stylesheet_walk_begin(&walk, document);
+    while ((step = navigation_stylesheet_walk_next(&walk, &source))
+           == NAVIGATION_STYLESHEET_WALK_SOURCE)
+        hash = navigation_stylesheet_source_hash(hash, &source, NULL);
+    if (step == NAVIGATION_STYLESHEET_WALK_LIMIT) return false;
+    *fingerprint = hash;
+    return true;
+}
+
+/* Whether a stylesheet input is inside <head>, as stylesheet_note_style_source
+   classifies the source of a head mark. */
+static bool navigation_stylesheet_input_in_head(const lxb_dom_node_t *node)
+{
+    for (const lxb_dom_node_t *parent = node->parent; parent != NULL;
+         parent = parent->parent) {
+        if (parent->type != LXB_DOM_NODE_TYPE_ELEMENT) return false;
+        if (parent->local_name == LXB_TAG_HEAD) return true;
+        if (parent->local_name == LXB_TAG_BODY
+            || parent->local_name == LXB_TAG_HTML) return false;
+    }
+    return false;
+}
+
+/* The key of the sheet compiled from the document's <head> sources alone
+   (the part stylesheet_truncate_to_head keeps): the fingerprint's parse
+   context and <head> inputs, hashed as the fingerprint hashes them, except
+   that a link's href is resolved and the base URL counts only when a
+   <head> <style> is present, so the pages of one site that share a <head>
+   share the key. The document's origin and the root's theme selection
+   (alternate theme links) count too. Also returns how many inputs follow
+   <head> and whether they are all <style> elements. False when the <head>
+   inputs are not a prefix of the document's inputs, when there are more
+   inputs than the continuation tracks, or when an href cannot be
+   resolved. */
+static bool navigation_stream_stylesheet_head_key(
+    NavigationDocumentStream *stream, const PocDocument *document,
+    uint64_t *key, size_t *head_count, size_t *body_count,
+    bool *body_inline)
+{
+    if (stream == NULL || stream->session == NULL || document == NULL
+        || document->html == NULL || key == NULL || head_count == NULL
+        || body_count == NULL || body_inline == NULL) return false;
+    const NavigationSession *session = stream->session;
+    if (session->user_css_length != 0 && session->user_css == NULL)
+        return false;
+    *head_count = 0;
+    *body_count = 0;
+    *body_inline = true;
+    bool head_style = false;
+    uint64_t inputs = UINT64_C(1469598103934665603);
+    inputs = navigation_stylesheet_root_hash(inputs, document);
+    NavigationStylesheetWalk walk;
+    NavigationStylesheetSource source;
+    NavigationStylesheetWalkStep step;
+    navigation_stylesheet_walk_begin(&walk, document);
+    while ((step = navigation_stylesheet_walk_next(&walk, &source))
+           == NAVIGATION_STYLESHEET_WALK_SOURCE) {
+        if (*head_count + *body_count == NAVIGATION_STYLESHEET_INPUT_LIMIT)
+            return false;
+        if (!navigation_stylesheet_input_in_head(source.node)) {
+            (*body_count)++;
+            if (!source.style) *body_inline = false;
             continue;
         }
-        while (node != NULL && node != boundary_parent
-               && node->next == NULL) {
-            node = node->parent;
+        if (*body_count != 0) return false;
+        (*head_count)++;
+        if (source.style) head_style = true;
+        size_t length = 0;
+        const char *href = source.style ? NULL : document_attribute(
+            source.node, STYLESHEET_INPUT_HREF, &length);
+        char resolved[NAVIGATION_URL_LIMIT * 2u];
+        if (href != NULL) {
+            char reference[NAVIGATION_URL_LIMIT];
+            if (length >= sizeof(reference)) return false;
+            memcpy(reference, href, length);
+            reference[length] = '\0';
+            if (!fetch_resolve_url(stream->resource_base_url, reference,
+                                   resolved, sizeof(resolved)))
+                return false;
         }
-        if (node != NULL && node != boundary_parent) node = node->next;
+        inputs = navigation_stylesheet_source_hash(
+            inputs, &source, href != NULL ? resolved : NULL);
     }
-    *fingerprint = hash;
+    if (step == NAVIGATION_STYLESHEET_WALK_LIMIT) return false;
+    char origin[NAVIGATION_URL_LIMIT];
+    if (!tilefinch_url_origin(stream->document_url, origin, sizeof(origin)))
+        return false;
+    uint64_t hash = UINT64_C(1469598103934665603);
+    hash = navigation_stylesheet_fingerprint_field(
+        hash, "head-key", NULL, 0, false);
+    hash = navigation_stylesheet_fingerprint_field(
+        hash, "base-url", stream->resource_base_url,
+        strlen(stream->resource_base_url), head_style);
+    hash = navigation_stylesheet_fingerprint_field(
+        hash, "origin", origin, strlen(origin), true);
+    if (!navigation_stylesheet_context_hash(stream, document, &hash))
+        return false;
+    *key = fingerprint_bytes(hash, (const char *) &inputs, sizeof(inputs));
     return true;
 }
 
@@ -537,7 +729,8 @@ static bool navigation_stream_build_blocking_stylesheet_with_timeout(
             session, fingerprint, &stream->blocking_stylesheet,
             &stream->blocking_stylesheets)) {
         stream->blocking_stylesheet_ready = true;
-        stream->blocking_stylesheet_user_context_neutral = true;
+        stream->blocking_stylesheet_user_css =
+            navigation_stylesheet_user_css_hash(session);
         navigation_stream_capture_stylesheet_inputs(stream, document);
         stream->blocking_stylesheet_fingerprint = fingerprint;
         stream->blocking_stylesheet_fingerprint_valid = true;
@@ -579,20 +772,16 @@ static bool navigation_stream_build_blocking_stylesheet_with_timeout(
         stream->blocking_stylesheet_ready = true;
         session->performance.stylesheet_pressure_fallbacks++;
     }
-    stream->blocking_stylesheet_user_context_neutral = true;
     if (session->user_css_length != 0) {
-        uint64_t context_before_user = stylesheet_parse_context_signature(
-            &stream->blocking_stylesheet);
         if (!stylesheet_add_user_css(
                 &stream->blocking_stylesheet, session->user_css,
                 session->user_css_length)) {
             navigation_stream_release_blocking_stylesheet(stream);
             return false;
         }
-        stream->blocking_stylesheet_user_context_neutral =
-            stylesheet_parse_context_signature(
-                &stream->blocking_stylesheet) == context_before_user;
     }
+    stream->blocking_stylesheet_user_css =
+        navigation_stylesheet_user_css_hash(session);
     navigation_stream_capture_stylesheet_inputs(stream, document);
     stream->blocking_stylesheet_fingerprint = fingerprint;
     stream->blocking_stylesheet_fingerprint_valid = true;

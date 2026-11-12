@@ -227,11 +227,11 @@ int main(void)
     };
     memcpy(state.candidate_sha256, verified.manifest.package_sha256, 32);
     TilefinchUpdateSlot slot = TILEFINCH_UPDATE_SLOT_NONE;
-    CHECK(tilefinch_update_boot_decide(&state, false, true, &slot)
+    CHECK(tilefinch_update_boot_decide(&state, false, true, false, &slot)
               == TILEFINCH_UPDATE_BOOT_START_TRIAL
           && slot == TILEFINCH_UPDATE_SLOT_B);
     /* An unverified pending slot never boots. */
-    CHECK(tilefinch_update_boot_decide(&state, false, false, &slot)
+    CHECK(tilefinch_update_boot_decide(&state, false, false, false, &slot)
               == TILEFINCH_UPDATE_BOOT_RECOVERY
           && slot == TILEFINCH_UPDATE_SLOT_A);
     CHECK(tilefinch_update_state_start_trial(&state)
@@ -244,7 +244,7 @@ int main(void)
           && memcmp(state.installed_sha256,
                     verified.manifest.package_sha256, 32) == 0);
     /* The recovery button still reaches the previous healthy slot. */
-    CHECK(tilefinch_update_boot_decide(&state, true, true, &slot)
+    CHECK(tilefinch_update_boot_decide(&state, true, true, false, &slot)
               == TILEFINCH_UPDATE_BOOT_PREVIOUS
           && slot == TILEFINCH_UPDATE_SLOT_A);
 

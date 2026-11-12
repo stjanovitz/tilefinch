@@ -39,6 +39,22 @@ PspMediaHlsContext *psp_media_hls_create(
     PspMediaHlsSelectionBound selection_bound,
     const TilefinchContentSecurityPolicy *content_security_policy,
     bool page_redirects, char *error, size_t error_size);
+/*
+ * Page audio in MPEG Layer III: the same context, holding one
+ * MediaMp3Source instead of HLS sources, with the same page authority as
+ * page HLS (each request and redirect hop is admitted on the browser
+ * thread, as TILEFINCH_DESTINATION_AUDIO). content_length 0 is a live
+ * stream; `seekable` sends Range requests and requires 206 answers.
+ */
+PspMediaHlsContext *psp_media_hls_create_mp3(
+    Budget *budget, BrowserSession *session,
+    const char *url, const char *document_url,
+    TilefinchRequestMode mode, TilefinchCredentialsMode credentials,
+    const TilefinchContentSecurityPolicy *content_security_policy,
+    uint64_t content_length, bool seekable,
+    char *error, size_t error_size);
+/* The context plays an MP3 audio source (it has no video track). */
+bool psp_media_hls_is_audio(const PspMediaHlsContext *context);
 /* Optional browser-owned recovery for source-buffer allocation refusal.
    Called only after partial allocations have been released. The callback
    must preserve this context, its session and the page's CSP; it may reclaim
@@ -60,6 +76,12 @@ bool psp_media_hls_stream_info(
     MediaMp4TrackInfo *audio);
 bool psp_media_hls_stats(
     PspMediaHlsContext *context, MediaHlsStats *stats);
+/* An MP3 stream's icy-name and icy-genre response headers, raw (see
+   media_mp3_station_text); empty strings when absent. The pointers live as
+   long as the context. False when neither was sent. */
+#define PSP_MEDIA_HLS_STATION_TEXT_BYTES 96u
+bool psp_media_hls_station(const PspMediaHlsContext *context,
+                           const char **name, const char **genre);
 /* True when the selected variant was admitted beyond the software decoder's
    bound without a declared Baseline/Main profile. */
 bool psp_media_hls_selection_unverified(const PspMediaHlsContext *context);

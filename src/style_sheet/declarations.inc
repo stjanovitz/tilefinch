@@ -279,6 +279,7 @@ void style_variable_cache_invalidate_node(
         StyleAncestorBloomCache *cache = sheet->resolve_scratch->ancestor_bloom_cache;
         memset(cache->entries, 0, sizeof(cache->entries));
         memset(cache->matched_ranges, 0, sizeof(cache->matched_ranges));
+        memset(cache->sibling_runs, 0, sizeof(cache->sibling_runs));
         if (cache->results != NULL) memset(cache->results, 0,
             STYLE_SELECTOR_RESULT_CACHE_CAPACITY * sizeof(*cache->results));
     }
@@ -522,6 +523,14 @@ static bool custom_rule_later(const Stylesheet *sheet, const lxb_dom_node_t *nod
     if (candidate->origin != current->origin) {
         return candidate->origin > current->origin;
     }
+    unsigned candidate_context = style_rule_shadow_context(
+        sheet, candidate->selector, candidate->selector_length);
+    unsigned current_context = style_rule_shadow_context(
+        sheet, current->selector, current->selector_length);
+    if (candidate_context != current_context) {
+        return candidate->important ? candidate_context > current_context
+                                    : candidate_context < current_context;
+    }
     if (candidate->layer != current->layer) {
         if (!candidate->important) {
             if (candidate->layer == UINT_MAX) return true;
@@ -547,10 +556,15 @@ struct StyleCustomRuleIndexEntry {
     /* The custom rule's index; STYLE_CUSTOM_INDEX_SCOPED marks a rule of a
        sheet only shadow roots adopt. Within one hash those sort after the
        others, so a lookup for an element outside every adopting carrier
-       stops at the first. */
+       stops at the first. STYLE_CUSTOM_INDEX_KEYED marks a rule with a
+       retained-gate key (stylesheet_custom_rule_gate_key); it does not
+       take part in the order. */
     uint32_t index;
 };
 #define STYLE_CUSTOM_INDEX_SCOPED UINT32_C(0x80000000)
+#define STYLE_CUSTOM_INDEX_KEYED UINT32_C(0x40000000)
+#define STYLE_CUSTOM_INDEX_FLAGS \
+    (STYLE_CUSTOM_INDEX_SCOPED | STYLE_CUSTOM_INDEX_KEYED)
 
 static uint32_t custom_rule_name_hash(const char *text, size_t length)
 {
@@ -904,9 +918,13 @@ static int compare_custom_rule_index_entries(const void *left,
     const StyleCustomRuleIndexEntry *a = left;
     const StyleCustomRuleIndexEntry *b = right;
     if (a->hash != b->hash) return a->hash < b->hash ? -1 : 1;
-    /* The scoped bit is the top bit: unscoped rules sort first. */
-    if (a->index == b->index) return 0;
-    return a->index < b->index ? -1 : 1;
+    /* The scoped bit is the top bit: unscoped rules sort first. Rules of
+       equal cascade weight resolve by this order (custom_rule_later), so
+       the keyed bit is left out of it. */
+    uint32_t left_index = a->index & ~STYLE_CUSTOM_INDEX_KEYED;
+    uint32_t right_index = b->index & ~STYLE_CUSTOM_INDEX_KEYED;
+    if (left_index == right_index) return 0;
+    return left_index < right_index ? -1 : 1;
 }
 
 static size_t custom_rule_index_lower_bound(
@@ -1174,10 +1192,13 @@ static bool style_block_image_uses_variable(const char *text, size_t length)
     return false;
 }
 
-static const StyleCustomRule *custom_rule_winner(
+/* keyless_only (an indexed sheet only): the caller has proved that no
+   rule with a retained-gate key can select the element, so only the
+   others are matched. */
+static const StyleCustomRule *custom_rule_winner_filtered(
     const Stylesheet *sheet, lxb_dom_node_t *node, PseudoElement pseudo,
     const char *name, size_t name_length, uint32_t hash,
-    const StyleMatchSubject *subject, size_t *candidates)
+    const StyleMatchSubject *subject, size_t *candidates, bool keyless_only)
 {
     if (name_length >= STYLE_CUSTOM_NAME_CAPACITY) return NULL;
     const StyleCustomRule *winner = NULL;
@@ -1195,7 +1216,9 @@ static const StyleCustomRule *custom_rule_winner(
             if (sheet->custom_rule_index[i].hash != hash
                 || (outside && (entry & STYLE_CUSTOM_INDEX_SCOPED) != 0))
                 break;
-            rule_index = entry & ~STYLE_CUSTOM_INDEX_SCOPED;
+            if (keyless_only && (entry & STYLE_CUSTOM_INDEX_KEYED) != 0)
+                continue;
+            rule_index = entry & ~STYLE_CUSTOM_INDEX_FLAGS;
         }
         if (candidates != NULL) (*candidates)++;
         const StyleCustomRule *rule = &sheet->custom_rules[rule_index];
@@ -1213,6 +1236,16 @@ static const StyleCustomRule *custom_rule_winner(
         if (custom_rule_later(sheet, node, rule, winner)) winner = rule;
     }
     return winner;
+}
+
+static const StyleCustomRule *custom_rule_winner(
+    const Stylesheet *sheet, lxb_dom_node_t *node, PseudoElement pseudo,
+    const char *name, size_t name_length, uint32_t hash,
+    const StyleMatchSubject *subject, size_t *candidates)
+{
+    return custom_rule_winner_filtered(sheet, node, pseudo, name,
+                                       name_length, hash, subject,
+                                       candidates, false);
 }
 
 /* The declared value of custom property `name` that wins on the element
@@ -1745,18 +1778,40 @@ static bool style_retained_property_value_scoped(
     }
     stylesheet_prepare_rule_index((Stylesheet *) sheet);
     style_relative_selector_cache_begin((Stylesheet *) sheet);
-    StyleMatchSubject subject = {0};
-    style_match_subject_prepare(node, &subject);
     uint32_t hash = custom_rule_name_hash(name, name_length);
-    const StyleCustomRule *winner = custom_rule_winner(
-        sheet, node, PSEUDO_NONE, name, name_length, hash, &subject, NULL);
+    bool custom_property = name_length > 2 && name[0] == '-'
+        && name[1] == '-';
+    /* Inside style_retained_gate_begin/end for this element, its gate mask
+       says whether a keyed rule of the property can select it; when none
+       can, only the keyless rules are matched, and with no keyless rule
+       either only the style attribute is left to read. The index must
+       still hold every rule the gate was built from. */
+    const StyleRetainedGate *gate = &sheet->resolve_scratch->retained_gate;
+    uint64_t gate_bit = UINT64_C(1) << (hash & 63u);
+    bool gated = !custom_property && gate->node == node
+        && sheet->retained_gate != NULL && sheet->custom_rule_index_ready
+        && sheet->custom_rule_index_count == sheet->custom_rule_count
+        && gate->generation == sheet->retained_gate_generation;
+    bool keyed_possible = !gated || (gate->mask & gate_bit) != 0;
+    bool keyless_possible = !gated
+        || (sheet->retained_gate_keyless & gate_bit) != 0;
+    const StyleCustomRule *winner = NULL;
+    if (keyed_possible || keyless_possible) {
+        StyleMatchSubject subject = {0};
+        style_match_subject_prepare(node, &subject);
+        winner = custom_rule_winner_filtered(
+            sheet, node, PSEUDO_NONE, name, name_length, hash, &subject,
+            NULL, !keyed_possible);
+    }
+    if (!custom_property)
+        STYLE_DIAGNOSTIC_COUNT((Stylesheet *) sheet, retained_lookup_calls);
+    if (!keyed_possible)
+        STYLE_DIAGNOSTIC_COUNT((Stylesheet *) sheet, retained_gate_skips);
     const char *value = winner == NULL ? NULL : winner->value;
     size_t value_length = value == NULL ? 0 : strlen(value);
     const char *inline_value = NULL;
     size_t inline_length = 0;
     bool inline_important = false;
-    bool custom_property = name_length > 2 && name[0] == '-'
-        && name[1] == '-';
     /* Sheet rules retain a vendor alias under the standard name; a style
        attribute keeps the spelling it was written with. */
     if (inline_variable_value(
@@ -2193,7 +2248,7 @@ bool style_retained_presentation_values(
                 if (sheet->custom_rule_index[i].hash != hash
                     || (outside
                         && (entry & STYLE_CUSTOM_INDEX_SCOPED) != 0)) break;
-                rule_index = entry & ~STYLE_CUSTOM_INDEX_SCOPED;
+                rule_index = entry & ~STYLE_CUSTOM_INDEX_FLAGS;
             }
             const StyleCustomRule *rule = &sheet->custom_rules[rule_index];
             if (rule->pseudo != PSEUDO_NONE
@@ -2533,9 +2588,14 @@ static bool style_declaration_equal(const Stylesheet *sheet,
                                     uint64_t mask, uint64_t mask_high,
                                     uint64_t inherit_mask,
                                     const char *deferred,
-                                    size_t deferred_length)
+                                    size_t deferred_length,
+                                    uint16_t all_flag)
 {
+    /* An `all` keyword resets the cascade baseline: a block with one is
+       never the same declaration as one without. */
     if (sheet == NULL || stored == NULL || stored->mask != mask
+        || (stored->deferred_program_reserved & STYLE_DECLARATION_ALL_MASK)
+               != all_flag
         || stored->mask_high != mask_high
         || stored->inherit_mask != inherit_mask
         || stored->deferred_length != deferred_length
@@ -2570,7 +2630,9 @@ static bool style_declarations_equal(const Stylesheet *sheet,
                candidate->values_length, candidate->mask,
                candidate->mask_high, candidate->inherit_mask,
                candidate->deferred_declarations,
-               candidate->deferred_length);
+               candidate->deferred_length,
+               (uint16_t) (candidate->deferred_program_reserved
+                           & STYLE_DECLARATION_ALL_MASK));
 }
 
 /*
@@ -2805,7 +2867,7 @@ static bool add_declaration(Stylesheet *sheet, const ComputedStyle *values,
                             uint64_t mask, uint64_t mask_high,
                             uint64_t inherit_mask,
                             const char *deferred, size_t deferred_length,
-                            bool force_unique,
+                            uint16_t all_flag, bool force_unique,
                             uint32_t *index)
 {
     if (sheet == NULL || values == NULL || index == NULL
@@ -2833,7 +2895,7 @@ static bool add_declaration(Stylesheet *sheet, const ComputedStyle *values,
                 && style_declaration_equal(
                     sheet, &sheet->declarations[candidate], encoded,
                     encoded_length, mask, mask_high, inherit_mask,
-                    deferred, deferred_length)) {
+                    deferred, deferred_length, all_flag)) {
                 *index = candidate;
                 return true;
             }
@@ -2847,7 +2909,8 @@ static bool add_declaration(Stylesheet *sheet, const ComputedStyle *values,
             if (style_declaration_equal(sheet, &sheet->declarations[i - 1],
                                         encoded, encoded_length,
                                         mask, mask_high, inherit_mask,
-                                        deferred, deferred_length)) {
+                                        deferred, deferred_length,
+                                        all_flag)) {
                 *index = (uint32_t) (i - 1);
                 return true;
             }
@@ -2904,7 +2967,8 @@ static bool add_declaration(Stylesheet *sheet, const ComputedStyle *values,
         .deferred_declarations = deferred_copy,
         .deferred_length = deferred_length,
         .deferred_program_offset = deferred_program_offset,
-        .deferred_program_count = deferred_program_count
+        .deferred_program_count = deferred_program_count,
+        .deferred_program_reserved = all_flag
     };
     sheet->deferred_bytes += deferred_length != 0
                              ? deferred_length + 1u : 0;
@@ -3615,7 +3679,9 @@ typedef struct {
     bool dynamic[2];
     bool ch_relative[2];
     bool container_relative[2];
-    bool all_inherit[2];
+    /* The block's `all` value: 0 for none (or one Tilefinch ignores), else
+       its STYLE_DECLARATION_ALL_* flag. */
+    uint16_t all_value[2];
 } StyleDeferredDeclarationAnalysis;
 
 static void declarations_analyze_deferred_resolution(
@@ -3645,8 +3711,13 @@ static void declarations_analyze_deferred_resolution(
                 if (span_case_equal(name, name_length, "all")) {
                     /* Last declaration at this importance wins. Unsupported
                        CSS-wide values remain an ordinary ignored declaration. */
-                    analysis->all_inherit[slot] = span_case_equal(
-                        value, value_length, "inherit");
+                    analysis->all_value[slot] =
+                        span_case_equal(value, value_length, "inherit")
+                            ? STYLE_DECLARATION_ALL_INHERIT
+                        : span_case_equal(value, value_length, "unset")
+                            ? STYLE_DECLARATION_ALL_UNSET
+                        : span_case_equal(value, value_length, "initial")
+                            ? STYLE_DECLARATION_ALL_INITIAL : 0;
                 }
                 if (span_case_equal(name, name_length, "font")
                     || span_case_equal(name, name_length, "font-family")) {
@@ -3673,7 +3744,8 @@ static void declarations_analyze_deferred_resolution(
                     analysis->dynamic[slot] = true;
                 }
                 for (size_t i = colon + 1; i + 4 <= end; i++) {
-                    if (memcmp(text + i, "var(", 4) == 0) {
+                    if (text[i] == 'v'
+                        && memcmp(text + i, "var(", 4) == 0) {
                         analysis->deferred[slot] = true;
                         analysis->dynamic[slot] = true;
                         break;
@@ -3687,18 +3759,19 @@ static void declarations_analyze_deferred_resolution(
                    per-node font basis. */
                 for (size_t i = colon + 1; i + 2 <= end; i++) {
                     size_t unit_length = 0;
-                    if (i + 3 <= end
-                        && tolower((unsigned char) text[i]) == 'r'
-                        && tolower((unsigned char) text[i + 1]) == 'e'
-                        && tolower((unsigned char) text[i + 2]) == 'm') {
+                    /* ASCII case folding: the unit letters have no other
+                       spelling, and most bytes are none of r, e, c. */
+                    unsigned char first = (unsigned char) text[i] | 0x20u;
+                    if (first != 'r' && first != 'e' && first != 'c')
+                        continue;
+                    unsigned char second =
+                        (unsigned char) text[i + 1] | 0x20u;
+                    if (first == 'r' && i + 3 <= end && second == 'e'
+                        && ((unsigned char) text[i + 2] | 0x20u) == 'm') {
                         unit_length = 3;
-                    } else if (tolower((unsigned char) text[i]) == 'e'
-                               && tolower((unsigned char) text[i + 1])
-                                  == 'm') {
+                    } else if (first == 'e' && second == 'm') {
                         unit_length = 2;
-                    } else if (tolower((unsigned char) text[i]) == 'c'
-                               && tolower((unsigned char) text[i + 1])
-                                  == 'h') {
+                    } else if (first == 'c' && second == 'h') {
                         unit_length = 2;
                         analysis->ch_relative[slot] = true;
                     }
@@ -3730,6 +3803,11 @@ static void declarations_analyze_deferred_resolution(
                     "cqw", "cqh", "cqi", "cqb", "cqmin", "cqmax"
                 };
                 for (size_t i = colon + 1; i < end; i++) {
+                    /* Every container unit starts "cq". */
+                    if (((unsigned char) text[i] | 0x20u) != 'c'
+                        || i + 1 >= end
+                        || ((unsigned char) text[i + 1] | 0x20u) != 'q')
+                        continue;
                     for (size_t unit = 0;
                          unit < sizeof(container_units)
                                 / sizeof(container_units[0]); unit++) {

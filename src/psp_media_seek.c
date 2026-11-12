@@ -51,7 +51,8 @@ static bool psp_media_reopen_backward_seek(
         .autoplay = resume_playing,
         .has_separate_audio = false
     }, "backward-seek-reopen-open");
-    psp_ui_media_set_resolving(&media->ui, "Seeking video");
+    psp_ui_media_set_resolving(
+        &media->ui, psp_media_resolving_title(media, "Seeking video"));
     media->ui.duration_us = psp_media_duration_us(media);
     psp_ui_media_commit_seek(&media->ui, target_us);
     psp_ui_media_set_resolving_progress(
@@ -396,7 +397,7 @@ bool psp_media_seek_decode_pump(
         media_playback_set_playing(media->playback, playing);
         psp_ui_media_set(
             &media->ui, true, playing, false, release_clock_us,
-            psp_media_duration_us(media), media->stream.title);
+            psp_media_duration_us(media), psp_media_shown_title(media));
         if (!resume_open || media->reopen_seek_completion_pending) {
             media->seek_completions++;
             media->reopen_seek_completion_pending = false;
@@ -647,7 +648,7 @@ bool psp_media_seek_decode_pump(
                 &media->ui, true, playing, false,
                 target_us,
                 psp_media_duration_us(media),
-                media->stream.title);
+                psp_media_shown_title(media));
             /* Decoding has reached the committed keyframe, but audio/video
                priming may still need more source data. Keep the target as
                the authoritative scrubber position until PRIME_READY instead

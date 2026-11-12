@@ -16,6 +16,7 @@
 #include "tilefinch/url.h"
 #include "data_url.h"
 #include "resources_internal.h"
+#include "stylesheet_inputs.h"
 
 #define budget_malloc(b, s) budget_malloc_category((b), BUDGET_CATEGORY_RESOURCE, (s))
 #define budget_calloc(b, n, s) budget_calloc_category((b), BUDGET_CATEGORY_RESOURCE, (n), (s))
@@ -632,7 +633,7 @@ static void stylesheet_referrer_policy_for_node(
         ? fallback : "";
     size_t length = 0;
     const char *attribute = document_attribute(
-        node, "referrerpolicy", &length);
+        node, STYLESHEET_INPUT_REFERRER_POLICY, &length);
     char normalized[STYLESHEET_REFERRER_POLICY_LIMIT] = {0};
     if (attribute != NULL && length != 0 && length < sizeof(normalized)) {
         for (size_t i = 0; i < length; i++) {
@@ -1180,15 +1181,15 @@ static void stylesheet_collect_alternate_themes(
     }
     if (html == NULL) return;
     size_t mode_length = 0;
-    const char *mode = document_attribute(html, "data-color-mode",
+    const char *mode = document_attribute(html, STYLESHEET_INPUT_COLOR_MODE,
                                           &mode_length);
     const char *theme_attribute = NULL;
     if (mode != NULL && mode_length == 5
         && strncasecmp(mode, "light", 5) == 0) {
-        theme_attribute = "data-light-theme";
+        theme_attribute = STYLESHEET_INPUT_LIGHT_THEME;
     } else if (mode != NULL && mode_length == 4
                && strncasecmp(mode, "dark", 4) == 0) {
-        theme_attribute = "data-dark-theme";
+        theme_attribute = STYLESHEET_INPUT_DARK_THEME;
     } else {
         return;
     }
@@ -1215,9 +1216,9 @@ static void stylesheet_collect_alternate_themes(
             && discovered_count < STYLESHEET_ALTERNATE_THEME_LIMIT) {
             size_t theme_length = 0, href_length = 0;
             const char *theme = document_attribute(
-                node, "data-color-theme", &theme_length);
+                node, STYLESHEET_INPUT_THEME, &theme_length);
             const char *href = document_attribute(
-                node, "data-href", &href_length);
+                node, STYLESHEET_INPUT_THEME_HREF, &href_length);
             if (theme != NULL && theme_length != 0 && theme_length <= 64
                 && href != NULL && href_length != 0 && href_length < 2048) {
                 char reference[2048], resolved[4096];
@@ -2625,7 +2626,8 @@ static bool flush_stylesheet_batch(ResourceContext *context)
             size_t integrity_length = 0;
             const char *integrity = pending->element == NULL ? NULL
                 : document_attribute(
-                    pending->element, "integrity", &integrity_length);
+                    pending->element, STYLESHEET_INPUT_INTEGRITY,
+                    &integrity_length);
             bool integrity_present = integrity != NULL
                 && integrity_length != 0;
             if (integrity_present && !pending->cors
@@ -2761,11 +2763,14 @@ static bool queue_stylesheet_link(ResourceContext *context,
                                   lxb_dom_node_t *node)
 {
     size_t rel_length = 0;
-    const char *rel = document_attribute(node, "rel", &rel_length);
+    const char *rel = document_attribute(
+        node, STYLESHEET_INPUT_REL, &rel_length);
     if (rel == NULL) return true;
     bool stylesheet = token_contains(rel, rel_length, "stylesheet");
     if (stylesheet && lxb_dom_element_has_attribute(
-            lxb_dom_interface_element(node), (const lxb_char_t *) "disabled", 8u))
+            lxb_dom_interface_element(node),
+            (const lxb_char_t *) STYLESHEET_INPUT_DISABLED,
+            sizeof(STYLESHEET_INPUT_DISABLED) - 1u))
         return true;
     if (!stylesheet) {
         size_t as_length = 0;
@@ -2779,7 +2784,8 @@ static bool queue_stylesheet_link(ResourceContext *context,
             STYLESHEET_DOCUMENT_RESOURCE_TERMINAL_FAILURE);
     context->stats->discovered++;
     size_t media_length = 0;
-    const char *media = document_attribute(node, "media", &media_length);
+    const char *media = document_attribute(
+        node, STYLESHEET_INPUT_MEDIA, &media_length);
     bool media_matches = media == NULL || media_length == 0
         || stylesheet_media_matches(context->sheet, media, media_length);
     if (!media_matches) {
@@ -2796,13 +2802,14 @@ static bool queue_stylesheet_link(ResourceContext *context,
         return true;
     }
     size_t href_length = 0;
-    const char *href = document_attribute(node, "href", &href_length);
+    const char *href = document_attribute(
+        node, STYLESHEET_INPUT_HREF, &href_length);
     if (href == NULL || href_length >= 2048) {
         size_t theme_length = 0, alternate_length = 0;
         const char *theme = document_attribute(
-            node, "data-color-theme", &theme_length);
+            node, STYLESHEET_INPUT_THEME, &theme_length);
         const char *alternate = document_attribute(
-            node, "data-href", &alternate_length);
+            node, STYLESHEET_INPUT_THEME_HREF, &alternate_length);
         if (theme != NULL && theme_length != 0
             && alternate != NULL && alternate_length != 0) {
             context->stats->skipped_alternate_theme++;
@@ -2836,9 +2843,9 @@ static bool queue_stylesheet_link(ResourceContext *context,
     }
     size_t integrity_length = 0, crossorigin_length = 0;
     const char *integrity = document_attribute(
-        node, "integrity", &integrity_length);
+        node, STYLESHEET_INPUT_INTEGRITY, &integrity_length);
     const char *crossorigin = document_attribute(
-        node, "crossorigin", &crossorigin_length);
+        node, STYLESHEET_INPUT_CROSSORIGIN, &crossorigin_length);
     bool integrity_present = integrity != NULL && integrity_length != 0;
     bool cors = crossorigin != NULL;
     TilefinchCredentialsMode credentials = cors
@@ -2873,8 +2880,9 @@ static bool queue_stylesheet_link(ResourceContext *context,
             PendingStylesheet *queued = &context->pending[i];
             size_t queued_integrity_length = 0;
             if (queued->element != NULL)
-                (void) document_attribute(queued->element, "integrity",
-                                           &queued_integrity_length);
+                (void) document_attribute(queued->element,
+                                          STYLESHEET_INPUT_INTEGRITY,
+                                          &queued_integrity_length);
             if (queued->url != NULL && strcmp(queued->url, resolved) == 0
                 && queued->cors == cors
                 && queued->credentials == credentials
@@ -3202,12 +3210,16 @@ static bool reserve_applied_links(ResourceContext *context, lxb_dom_node_t *node
         if (!resource_work(context, 1, false)) return false;
         if (name_is(node, "link")) {
             size_t rel_length = 0, href_length = 0, media_length = 0;
-            const char *rel = document_attribute(node, "rel", &rel_length);
-            const char *href = document_attribute(node, "href", &href_length);
-            const char *media = document_attribute(node, "media", &media_length);
+            const char *rel = document_attribute(
+                node, STYLESHEET_INPUT_REL, &rel_length);
+            const char *href = document_attribute(
+                node, STYLESHEET_INPUT_HREF, &href_length);
+            const char *media = document_attribute(
+                node, STYLESHEET_INPUT_MEDIA, &media_length);
             if (rel != NULL && token_contains(rel, rel_length, "stylesheet")
                 && !lxb_dom_element_has_attribute(lxb_dom_interface_element(node),
-                       (const lxb_char_t *) "disabled", 8u)
+                       (const lxb_char_t *) STYLESHEET_INPUT_DISABLED,
+                       sizeof(STYLESHEET_INPUT_DISABLED) - 1u)
                 && href != NULL && href_length < 2048u
                 && (media == NULL || media_length == 0u
                     || stylesheet_media_matches(context->sheet, media, media_length))) {
@@ -3333,7 +3345,8 @@ bool stylesheets_settle_style_preloads_with_context(
 {
     for (size_t i = 0; nodes != NULL && i < node_count; i++) {
         size_t rel_length = 0, as_length = 0;
-        const char *rel = document_attribute(nodes[i], "rel", &rel_length);
+        const char *rel = document_attribute(
+            nodes[i], STYLESHEET_INPUT_REL, &rel_length);
         const char *as = document_attribute(nodes[i], "as", &as_length);
         if (!name_is(nodes[i], "link") || rel == NULL
             || token_contains(rel, rel_length, "stylesheet")

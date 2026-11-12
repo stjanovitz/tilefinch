@@ -12,6 +12,22 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 import generate_ui_translations as generator
 
+PROBE = ROOT / "_resource_identity_probe"
+_OUTPUTS = {}
+
+
+def outputs(resources=None):
+    """generator.outputs() of the real catalogs, built once per run. It is a
+    pure function of the sources, and building it is most of this suite's
+    time; a resource directory other than PROBE is PROBE's map rebased."""
+    key = None if resources is None else PROBE
+    if key not in _OUTPUTS:
+        _OUTPUTS[key] = generator.outputs(key)
+    if resources is None or resources == PROBE:
+        return _OUTPUTS[key]
+    return {resources / path.relative_to(PROBE) if path.is_relative_to(PROBE)
+            else path: data for path, data in _OUTPUTS[key].items()}
+
 
 class ResourceTests(unittest.TestCase):
     def test_key_table_prepared_once_per_catalog(self):
@@ -25,7 +41,7 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual(sum(path.suffix == ".tful" for path in output), len(languages))
 
     def test_published_resources_remain_immutable(self):
-        resources = ROOT / "_resource_identity_probe"
+        resources = PROBE
         published = {
             "translations/ui/v12/es.tful": "ccebd012a6ee6461359f268879b5074953d47372b81620760520aef962b6b2c3",
             "translations/ui/v12/fr.tful": "201207ac1648e6b33835d953d56240ce36c97bfa01404fac934133a136d50348",
@@ -66,17 +82,30 @@ class ResourceTests(unittest.TestCase):
             "translations/ui/v14/pt.tful": "010d2a63272fda0c08a44fe409c2996915a46f7950acf2af7c7e70ce3e966397",
             "translations/ui/v14/bn.tful": "894e231ac2713c1c684602e4724457a6f5ca07d4bb994a32baec4d5c452b566a",
             "translations/ui/v14/as.tful": "18ff37c5fa1fd221a138fa2e37ea9416dbbe4aeb9f177a45ccb80ca236cfdf12",
+            "translations/ui/v15/es.tful": "7facd6eae79dbce53e03398a9e146b3a7b745ab57a3bd747d773657bb897d611",
+            "translations/ui/v15/fr.tful": "15f0e399ac9e6fde28ade43b20b0c58f85f915b9c7730b083e19242cd214d609",
+            "translations/ui/v15/de.tful": "a24edb29fe7d2fb0f5413ac95879993fc87e839c8d2d65bc9a3e5b535c81499b",
+            "translations/ui/v15/ja.tful": "00b57c30f653853c64c20c458fecc3243f028ca131747553000f534c87422054",
+            "translations/ui/v15/ru.tful": "d16d1cfe63e2933ba78db192ba7430f69c8a9ab51e88d6a3cf793ddba5554258",
+            "translations/ui/v15/uk.tful": "7dbcbadf5c3c7e6a9e2931ebd49a422f486a2b24a739f6e1427280e5bf79affa",
+            "translations/ui/v15/zh-hans.tful": "b6cee0583a5a3fec687453a9fd859b2bf91b0ad6f804ca838fc96f5e919b43e4",
+            "translations/ui/v15/ko.tful": "78cf6e881df95380c75463b1679895f3e140f74803876f387e8fd23f240f0f09",
+            "translations/ui/v15/hi.tful": "fbec1227ebecdab3c00589fec9716c676c4afb33c5921ec3d63a414145b6f8cc",
+            "translations/ui/v15/ar.tful": "6769bba07635cb006c7bacbf906cbcea02fa23e68acd4ed9aa20de0237171409",
+            "translations/ui/v15/pt.tful": "352adf59c77eed42869d200edf678c88dcc9e6a30cf567a8285bb0a18904fcfa",
+            "translations/ui/v15/bn.tful": "e1d66d88a3e569f8dd13261e6edca66687d643b5cd434f614db5b33c507e4da2",
+            "translations/ui/v15/as.tful": "d334d991dd2f0c3316522a9e1aaa1ebd88a331ca183c884916fb3d6747bd43a5",
         }
-        generated = generator.outputs(resources)
+        generated = outputs(resources)
         for key, digest in published.items():
             self.assertEqual(hashlib.sha256(generated[resources / key]).hexdigest(),
                              digest, key)
 
     def test_new_locale_preserves_existing_resource_identity(self):
-        manifest = generator.outputs()[ROOT / "src/generated/ui_languages.inc"].decode()
-        resources = ROOT / "_resource_identity_probe"
+        manifest = outputs()[ROOT / "src/generated/ui_languages.inc"].decode()
+        resources = PROBE
         historical = hashlib.sha256()
-        for path, data in sorted(generator.outputs(resources).items()):
+        for path, data in sorted(outputs(resources).items()):
             if path.is_relative_to(resources) and int(path.parent.name[1:]) <= 11:
                 historical.update(path.relative_to(resources).as_posix().encode() + b"\0" + data)
         # Fixed before v12: every previously published resource remains exact.
@@ -85,13 +114,13 @@ class ResourceTests(unittest.TestCase):
         old_languages = generator.CATALOGS[6][1]
         rows = generator.read_rows(7, old_languages)
         for column, (code, label, glyphs) in enumerate(old_languages, 1):
-            self.assertIn(f'"translations/ui/v15/{code}.tful"', manifest)
-        self.assertIn('"translations/ui/v15/pt.tful"', manifest)
+            self.assertIn(f'"translations/ui/v16/{code}.tful"', manifest)
+        self.assertIn('"translations/ui/v16/pt.tful"', manifest)
         portuguese = generator.read_rows(8, generator.CATALOGS[7][1])
         self.assertGreaterEqual({row[0] for row in portuguese}, {row[0] for row in rows})
         self.assertEqual(dict(portuguese)["Portuguese"], "Português")
-        self.assertIn('"translations/ui/v15/bn.tful"', manifest)
-        self.assertIn('"translations/ui/v15/as.tful"', manifest)
+        self.assertIn('"translations/ui/v16/bn.tful"', manifest)
+        self.assertIn('"translations/ui/v16/as.tful"', manifest)
 
     def test_download_labels_have_translations(self):
         rows = generator.read_rows(generator.ACTIVE_VERSION, generator.CATALOGS[-1][1])
@@ -187,7 +216,7 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual(list((ROOT / "translations").rglob("*.tful")), [])
 
     def test_export_matches_keys_and_pins_without_editing_sources(self):
-        authored = generator.outputs()
+        authored = outputs()
         before = {path: path.read_bytes() for path in authored}
         with tempfile.TemporaryDirectory() as directory:
             resources = Path(directory)
@@ -195,7 +224,7 @@ class ResourceTests(unittest.TestCase):
                        "--resource-dir", directory, "--resources-only"]
             subprocess.run(command, check=True)
             subprocess.run(command + ["--check"], check=True)
-            expected = generator.outputs(resources)
+            expected = outputs(resources)
             files = list(resources.rglob("*.tful"))
             self.assertEqual(len(files), sum(len(languages) for _, languages in generator.CATALOGS))
             manifest = before[ROOT / "src/generated/ui_languages.inc"].decode()

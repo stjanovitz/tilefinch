@@ -1,10 +1,14 @@
 #include "tilefinch/psp_glyph_component_session.h"
 #include "tilefinch/document.h"
 
-#include <errno.h>
 #include <stdio.h>
 #include <string.h>
-#include <sys/stat.h>
+
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+/* Into the validation report with the app's lines, not the PSP's stdout. */
+#include "tilefinch/psp_log.h"
+#define printf psp_log_printf
+#endif
 
 #define GLYPH_COMPONENT_IO_UNIT (16u * 1024u)
 
@@ -18,7 +22,19 @@
 #ifdef TILEFINCH_GLYPH_SESSION_TEST_SEAM
 bool (*psp_glyph_component_session_test_identity)(
     const TilefinchInstallPaths *paths, TilefinchGlyphPack pack) = NULL;
+void (*psp_glyph_component_session_test_client)(
+    TilefinchUpdateClientSnapshot *snapshot) = NULL;
 #endif
+
+static void client_snapshot_refresh(PspGlyphComponentSession *session)
+{
+    (void) tilefinch_update_client_snapshot(
+        session->client, &session->client_snapshot);
+#ifdef TILEFINCH_GLYPH_SESSION_TEST_SEAM
+    if (psp_glyph_component_session_test_client != NULL)
+        psp_glyph_component_session_test_client(&session->client_snapshot);
+#endif
+}
 
 static uint16_t pack_bit(TilefinchGlyphPack pack)
 {
@@ -114,10 +130,13 @@ bool psp_glyph_component_session_attach_selected(
     const TilefinchInstallPaths *paths, BrowserGlyphLanguage language,
     BrowserGlyphLanguage interface_language, bool color_emoji)
 {
-    if (session == NULL || budget == NULL || paths == NULL
-        || !paths->slotted || session->provider != NULL
-        || installer_owns_runtime(session)) return false;
+    if (session == NULL || budget == NULL || paths == NULL) return false;
+    /* Kept even when boot attaches nothing: lazy attach and the menu probe
+       allocate from it, including after an unslotted (host0) boot whose
+       validation replay later supplies slotted paths. */
     session->budget = budget;
+    if (!paths->slotted || session->provider != NULL
+        || installer_owns_runtime(session)) return false;
     TilefinchGlyphPack regional = TILEFINCH_GLYPH_PACK_JAPANESE;
     TilefinchGlyphPack interface = TILEFINCH_GLYPH_PACK_JAPANESE;
     bool have_regional = tilefinch_glyph_pack_for_language(
@@ -332,6 +351,9 @@ static void clear_operation(PspGlyphComponentSession *session)
     session->client = NULL;
     session->operation_initialized = false;
     session->auto_install = false;
+    session->install_refused = false;
+    session->download_folder_failed = false;
+    session->failure_reported = false;
     memset(&session->client_snapshot, 0, sizeof(session->client_snapshot));
     memset(&session->install_snapshot, 0, sizeof(session->install_snapshot));
 }
@@ -391,8 +413,7 @@ bool psp_glyph_component_session_prepare_size_check(
             session, budget, paths, pack)) return false;
     /* Stop at AVAILABLE: only the confirmation's second X downloads. */
     session->auto_install = false;
-    (void) tilefinch_update_client_snapshot(
-        session->client, &session->client_snapshot);
+    client_snapshot_refresh(session);
     return true;
 }
 
@@ -431,14 +452,16 @@ bool psp_glyph_component_session_select_operation(
         || psp_glyph_component_session_active(session)) return false;
     clear_operation(session);
     session->budget = budget;
+    session->select_failure = NULL;
     if (!ensure_root(session)) return false;
-    char update_dir[TILEFINCH_INSTALL_PATH_LIMIT];
-    if (!tilefinch_install_data_path(
-            paths, "update", update_dir, sizeof(update_dir))
-        || (mkdir(update_dir, 0777) != 0 && errno != EEXIST)
-        || !tilefinch_install_data_path(
-            paths, "update/glyph-component.part", session->package_path,
-            sizeof(session->package_path))) return false;
+    /* Only the name: the candidate folder is emptied and created when the
+       download begins, so the offer's size check writes nothing. */
+    if (!tilefinch_glyph_component_download_path(
+            paths->install_root, pack, session->package_path,
+            sizeof(session->package_path))) {
+        session->select_failure = "FONT PACK FOLDER COULD NOT BE CREATED";
+        return false;
+    }
     uint64_t sequence = 0;
     uint8_t digest[32] = {0};
     bool installed = tilefinch_glyph_component_installed_identity(
@@ -460,7 +483,26 @@ bool psp_glyph_component_session_select_operation(
         });
     session->operation_pack = pack;
     session->operation_initialized = session->client != NULL;
+    /* Every option above is fixed and valid: only allocation can refuse. */
+    if (!session->operation_initialized)
+        session->select_failure = "NOT ENOUGH MEMORY FOR FONT PACK";
     return session->operation_initialized;
+}
+
+static void begin_download(PspGlyphComponentSession *session,
+                           const TilefinchInstallPaths *paths)
+{
+    char package_path[TILEFINCH_INSTALL_PATH_LIMIT];
+    if (paths == NULL || !tilefinch_glyph_component_prepare_download(
+            paths->install_root, session->operation_pack, package_path,
+            sizeof(package_path))) {
+        /* Ends the attempt, as an installer that cannot start does. */
+        session->auto_install = false;
+        session->install_refused = true;
+        session->download_folder_failed = true;
+        return;
+    }
+    (void) tilefinch_update_client_begin_download(session->client);
 }
 
 PspGlyphComponentPrimaryResult psp_glyph_component_session_primary(
@@ -470,6 +512,9 @@ PspGlyphComponentPrimaryResult psp_glyph_component_session_primary(
     if (session == NULL || !session->operation_initialized
         || session->client == NULL)
         return PSP_GLYPH_COMPONENT_PRIMARY_NONE;
+    session->install_refused = false;
+    session->download_folder_failed = false;
+    session->failure_reported = false;
     if (session->installer != NULL) {
         if (session->install_snapshot.phase
                 == TILEFINCH_UPDATE_INSTALL_COMPLETE) {
@@ -491,8 +536,7 @@ PspGlyphComponentPrimaryResult psp_glyph_component_session_primary(
             return PSP_GLYPH_COMPONENT_PRIMARY_NONE;
         }
     }
-    (void) tilefinch_update_client_snapshot(
-        session->client, &session->client_snapshot);
+    client_snapshot_refresh(session);
     switch (session->client_snapshot.phase) {
         case TILEFINCH_UPDATE_CLIENT_IDLE:
         case TILEFINCH_UPDATE_CLIENT_ERROR:
@@ -501,7 +545,7 @@ PspGlyphComponentPrimaryResult psp_glyph_component_session_primary(
             return PSP_GLYPH_COMPONENT_PRIMARY_CHECK_REQUIRED;
         case TILEFINCH_UPDATE_CLIENT_AVAILABLE:
             session->auto_install = true;
-            (void) tilefinch_update_client_begin_download(session->client);
+            begin_download(session, paths);
             break;
         case TILEFINCH_UPDATE_CLIENT_DOWNLOADED: {
             size_t envelope_length = 0;
@@ -510,7 +554,6 @@ PspGlyphComponentPrimaryResult psp_glyph_component_session_primary(
             session->installer = tilefinch_glyph_component_install_create(
                 session->budget,
                 &(TilefinchGlyphComponentInstallOptions) {
-                    .package_path = session->package_path,
                     .envelope = envelope,
                     .envelope_length = envelope_length,
                     .manifest = &session->client_snapshot.manifest,
@@ -523,6 +566,11 @@ PspGlyphComponentPrimaryResult psp_glyph_component_session_primary(
                 (void) tilefinch_glyph_component_install_snapshot(
                     session->installer, &session->install_snapshot);
                 deactivate_runtime(session, engine);
+            } else {
+                /* Ends the attempt: pump_operation() would otherwise retry
+                   the allocations and the open on every frame, unreported. */
+                session->auto_install = false;
+                session->install_refused = true;
             }
             break;
         }
@@ -578,14 +626,12 @@ bool psp_glyph_component_session_pump_operation(
     }
     if (session->client == NULL) return false;
     (void) tilefinch_update_client_pump(session->client, 2000u);
-    (void) tilefinch_update_client_snapshot(
-        session->client, &session->client_snapshot);
+    client_snapshot_refresh(session);
     if (session->auto_install
         && session->client_snapshot.phase
                == TILEFINCH_UPDATE_CLIENT_AVAILABLE) {
-        (void) tilefinch_update_client_begin_download(session->client);
-        (void) tilefinch_update_client_snapshot(
-            session->client, &session->client_snapshot);
+        begin_download(session, paths);
+        client_snapshot_refresh(session);
     } else if (session->auto_install
                && session->client_snapshot.phase
                       == TILEFINCH_UPDATE_CLIENT_DOWNLOADED) {
@@ -608,6 +654,40 @@ bool psp_glyph_component_session_active(
                 == TILEFINCH_UPDATE_CLIENT_DOWNLOADING
             || session->client_snapshot.phase
                 == TILEFINCH_UPDATE_CLIENT_CANCELLING);
+}
+
+const char *psp_glyph_component_session_select_failure(
+    const PspGlyphComponentSession *session)
+{
+    return session == NULL ? NULL : session->select_failure;
+}
+
+static const char *operation_failure(const PspGlyphComponentSession *session)
+{
+    if (session->installer != NULL)
+        return session->install_snapshot.phase
+                == TILEFINCH_UPDATE_INSTALL_ERROR
+            ? session->install_snapshot.message : NULL;
+    if (session->download_folder_failed)
+        return "FONT PACK FOLDER COULD NOT BE CREATED";
+    if (session->install_refused) return "FONT PACK INSTALL COULD NOT START";
+    return session->client != NULL
+            && session->client_snapshot.phase == TILEFINCH_UPDATE_CLIENT_ERROR
+        ? session->client_snapshot.message : NULL;
+}
+
+const char *psp_glyph_component_session_take_failure(
+    PspGlyphComponentSession *session)
+{
+    if (session == NULL) return NULL;
+    const char *failure = operation_failure(session);
+    if (failure == NULL || failure[0] == '\0') {
+        session->failure_reported = false;
+        return NULL;
+    }
+    if (session->failure_reported) return NULL;
+    session->failure_reported = true;
+    return failure;
 }
 
 bool psp_glyph_component_session_remove(

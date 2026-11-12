@@ -310,11 +310,118 @@ void browser_engine_set_youtube_signin_diagnostics(BrowserEngine *engine, bool e
 {
     if (engine == NULL) return;
     engine->youtube.signin_diagnostics = enabled;
+    memset(&engine->youtube.signin_trail, 0, sizeof(engine->youtube.signin_trail));
     engine->youtube.signin_feed = (YoutubeLiteFeedDiagnostics) {0};
     engine->youtube.handoff_http_status = 0;
     engine->youtube.handoff_service_origin = false;
     engine->youtube.feed_build_outcome = engine->youtube.feed_publication_outcome = 0;
     engine->session.cookie_diagnostics = (BrowserCookieDiagnostics) {.enabled = enabled};
+}
+
+static bool browser_engine_youtube_auth_origin(const char *url);
+
+/* Which kind of account page a URL is. Fixed classes so that no path, account
+   hint or query value can reach a shared report. */
+static unsigned browser_engine_youtube_signin_page_class(const char *url)
+{
+    if (url == NULL || !browser_engine_youtube_auth_origin(url)) return 0u;
+    const char *path = strstr(url, "://");
+    path = path == NULL ? NULL : strchr(path + 3, '/');
+    if (path == NULL) return 6u;
+    char bounded[96];
+    size_t length = strcspn(path, "?#");
+    if (length >= sizeof(bounded)) length = sizeof(bounded) - 1u;
+    memcpy(bounded, path, length);
+    bounded[length] = '\0';
+    if (strstr(bounded, "rejected") != NULL) return 1u;
+    if (strstr(bounded, "challenge") != NULL) return 2u;
+    if (strstr(bounded, "identifier") != NULL) return 3u;
+    if (strstr(bounded, "accountchooser") != NULL) return 4u;
+    if (strstr(bounded, "speedbump") != NULL) return 5u;
+    return 6u;
+}
+
+/* What the page's anti-bot check put in the form, by kind and length:
+   0 no field, 1 empty, 2 script-disabled marker, 3 failure marker, 4 token. */
+static unsigned browser_engine_youtube_token_kind(const char *body, size_t length,
+                                                  size_t *token_length)
+{
+    static const char field[] = "bgresponse=";
+    const size_t field_length = sizeof(field) - 1u;
+    *token_length = 0;
+    for (size_t at = 0; body != NULL && at + field_length <= length;) {
+        if (memcmp(body + at, field, field_length) == 0) {
+            const char *value = body + at + field_length;
+            const char *end = memchr(value, '&', length - at - field_length);
+            size_t size = end != NULL ? (size_t) (end - value)
+                                      : length - at - field_length;
+            *token_length = size;
+            if (size == 0) return 1u;
+            if (size == 11u && memcmp(value, "js_disabled", 11u) == 0) return 2u;
+            if (size >= 3u && memcmp(value, "FNL", 3u) == 0) return 3u;
+            return 4u;
+        }
+        const char *next = memchr(body + at, '&', length - at);
+        if (next == NULL) break;
+        at = (size_t) (next - body) + 1u;
+    }
+    return 0u;
+}
+
+static void browser_engine_youtube_note_request(
+    BrowserEngine *engine, const char *url, const char *method,
+    const char *body, size_t body_length)
+{
+    if (!engine->youtube.signin_diagnostics) return;
+    unsigned target = browser_engine_youtube_signin_page_class(url);
+    if (target == 0u) return;
+    engine->youtube.signin_trail.auth_navigations++;
+    if (strcasecmp(method, "POST") != 0) return;
+    engine->youtube.signin_trail.form_posts++;
+    engine->youtube.signin_trail.post_target = target;
+    engine->youtube.signin_trail.post_landing = 0u;
+    engine->youtube.signin_trail.post_outcome = 0u;
+    engine->youtube.signin_trail.post_http_status = 0;
+    engine->youtube.signin_trail.post_pending = true;
+    engine->youtube.signin_trail.token_kind = browser_engine_youtube_token_kind(
+        body, body_length, &engine->youtube.signin_trail.token_length);
+}
+
+static void browser_engine_youtube_note_activation(
+    BrowserEngine *engine, const ControllerAction *action)
+{
+    if (!engine->youtube.signin_diagnostics
+        || browser_engine_youtube_signin_page_class(
+               engine->navigation.page.document_url) == 0u) return;
+    engine->youtube.signin_trail.activations++;
+    if (engine->navigation.page.runtime == NULL)
+        engine->youtube.signin_trail.activations_without_scripts++;
+    if (action->type == CONTROLLER_ACTION_FORM_SUBMIT)
+        engine->youtube.signin_trail.form_submits++;
+    if (action->form_not_sent) engine->youtube.signin_trail.forms_not_sent++;
+}
+
+static void browser_engine_youtube_note_text_edit(BrowserEngine *engine)
+{
+    if (engine->youtube.signin_diagnostics
+        && browser_engine_youtube_signin_page_class(
+               engine->navigation.page.document_url) != 0u)
+        engine->youtube.signin_trail.text_edits++;
+}
+
+/* Lengths only; no field contents enter diagnostics. */
+static bool browser_engine_youtube_signin_text_present(const BrowserEngine *engine)
+{
+    for (size_t i = 0; i < engine->navigation.page.layout.control_count; i++) {
+        const ControlRegion *control = &engine->navigation.page.layout.controls[i];
+        if (control->type != CONTROL_INPUT && control->type != CONTROL_TEXTAREA
+            && control->type != CONTROL_EDITABLE) continue;
+        size_t length = 0;
+        if (document_control_value(control->node, &length) == NULL)
+            (void) document_attribute(control->node, "value", &length);
+        if (length != 0) return true;
+    }
+    return false;
 }
 
 bool browser_engine_youtube_signin_report(const BrowserEngine *engine, char *out, size_t capacity)
@@ -325,9 +432,18 @@ bool browser_engine_youtube_signin_report(const BrowserEngine *engine, char *out
     const YoutubeLiteFeedDiagnostics *feed = &engine->youtube.signin_feed;
     const BrowserCookieDiagnostics *cookies = &engine->session.cookie_diagnostics;
     uint64_t identity = youtube_lite_session_login_identity((BrowserSession *) &engine->session);
+    const NavigationSession *navigation = &engine->navigation;
+    const NavigationScriptStop *stop = &navigation->page.script_stop;
+    const BrowserSigninTrail *trail = &engine->youtube.signin_trail;
+    unsigned long heap_limit_kib = 0;
+    if (navigation->page.runtime != NULL) {
+        ScriptHeapGrowth growth;
+        script_runtime_heap_growth(navigation->page.runtime, &growth);
+        heap_limit_kib = (unsigned long) (growth.limit / 1024u);
+    }
     /* Only enum/boolean/count fields, never generic errors or identity hashes. */
     int n = snprintf(out, capacity,
-        "Tilefinch YouTube sign-in diagnostics v2\n"
+        "Tilefinch YouTube sign-in diagnostics v3\n"
         "stage=%u recovery-attempts=%u scripts-enabled=%u runtime-present=%u degraded=%u\n"
         "handoff-http-status=%ld handoff-service-origin=%u\n"
         "dynamic-transport-failures=%zu dynamic-authority-failures=%zu dynamic-source-failures=%zu allocation-refusals=%zu\n"
@@ -338,7 +454,15 @@ bool browser_engine_youtube_signin_report(const BrowserEngine *engine, char *out
         "configuration-valid=%u clock-available=%u api-request-admitted=%u history-outcome=%u\n"
         "feed-phase=%u http-status=%ld transported=%u same-origin=%u bootstrap-signed-in=%u auth-index-known=%u request-signed=%u api-authenticated=%u\n"
         "transport-code=%ld transport-timed-out=%u tls-result-available=%u tls-result=%ld tls-failed=%u\n"
-        "cookie-refusals=%zu byte-refusals=%zu slot-refusals=%zu allocation-refusals=%zu policy-ignored=%zu evictions=%zu\n",
+        "cookie-refusals=%zu byte-refusals=%zu slot-refusals=%zu allocation-refusals=%zu policy-ignored=%zu evictions=%zu\n"
+        "script-stop=%u stop-after-commit-ms=%lu stop-heap-limit-kib=%lu stop-heap-used-kib=%lu stop-heap-refusals=%lu stop-refused-kib=%lu stop-refused-reason=%u stop-budget-free-kib=%lu\n"
+        "document-scripts-enabled=%u memory-limited=%u memory-rescued=%u heap-used-kib=%lu heap-limit-kib=%lu\n"
+        "budget-current-kib=%lu budget-peak-kib=%lu budget-limit-kib=%lu page-age-s=%lu\n"
+        "scripts-discovered=%zu scripts-loaded=%zu scripts-failed=%zu scripts-skipped-quota=%zu scripts-skipped-pressure=%zu scripts-cost-rejected=%zu\n"
+        "frames-discovered=%zu frames-loaded=%zu frames-failed=%zu\n"
+        "page-class=%u document-http-status=%ld text-present=%u auth-navigations=%u\n"
+        "activations=%u activations-without-scripts=%u form-submits=%u forms-not-sent=%u text-edits=%u\n"
+        "form-posts=%u token-kind=%u token-length=%zu post-target=%u post-outcome=%u post-http-status=%ld post-landing=%u\n",
         engine->youtube.signin_state, engine->youtube.signin_retries,
         engine->navigation.scripts_enabled, engine->navigation.page.runtime != NULL,
         engine->navigation.page.script_degradation_observed,
@@ -364,7 +488,37 @@ bool browser_engine_youtube_signin_report(const BrowserEngine *engine, char *out
         feed->transport_code, feed->transport_timed_out,
         feed->tls_verify_result_available, feed->tls_verify_result, feed->tls_verification_failed,
         cookies->refused, cookies->byte_refusals, cookies->slot_refusals,
-        cookies->allocation_refusals, cookies->policy_ignored, cookies->evictions);
+        cookies->allocation_refusals, cookies->policy_ignored, cookies->evictions,
+        (unsigned) stop->reason, (unsigned long) stop->after_commit_ms,
+        (unsigned long) stop->heap_limit_kib, (unsigned long) stop->heap_used_kib,
+        (unsigned long) stop->heap_refusals, (unsigned long) stop->refused_kib,
+        (unsigned) stop->refused_reason, (unsigned long) stop->budget_free_kib,
+        navigation->document_scripts_enabled, navigation->page.script_memory_limited,
+        navigation->page.script_memory_rescued,
+        navigation->page.runtime != NULL
+            ? (unsigned long) (script_runtime_heap_used(navigation->page.runtime) / 1024u) : 0ul,
+        heap_limit_kib,
+        (unsigned long) (engine->budget.current / 1024u),
+        (unsigned long) (engine->budget.peak / 1024u),
+        (unsigned long) (engine->budget.limit / 1024u),
+        navigation->page.committed_us != 0
+            ? (unsigned long) ((tilefinch_platform_monotonic_time_us()
+                                - navigation->page.committed_us) / 1000000u) : 0ul,
+        navigation->script_discovered, navigation->script_loaded, navigation->script_failed,
+        navigation->script_skipped_quota, navigation->script_skipped_pressure,
+        navigation->script_cost_class_rejections,
+        navigation->frames_discovered, navigation->frames_loaded, navigation->frames_failed,
+        browser_engine_youtube_signin_page_class(navigation->page.document_url),
+        navigation->last_http_status >= 100 && navigation->last_http_status <= 599
+            ? navigation->last_http_status : 0L,
+        browser_engine_youtube_signin_text_present(engine),
+        trail->auth_navigations, trail->activations, trail->activations_without_scripts,
+        trail->form_submits, trail->forms_not_sent, trail->text_edits,
+        trail->form_posts, trail->token_kind, trail->token_length,
+        trail->post_target, trail->post_outcome,
+        trail->post_http_status >= 100 && trail->post_http_status <= 599
+            ? trail->post_http_status : 0L,
+        trail->post_landing);
     if (n < 0 || (size_t) n >= capacity) { out[0] = '\0'; return false; }
     return true;
 }
@@ -989,20 +1143,11 @@ static BrowserYoutubeRecovery browser_engine_youtube_idle_recovery(
         engine->youtube.login_events |= BROWSER_YOUTUBE_LOGIN_FAILED;
         return BROWSER_YOUTUBE_RECOVERY_DECLINED;
     }
-    /* Never discard an identifier/password the user has already entered.
-       Inspect lengths only; no field contents enter diagnostics. */
-    for (size_t i = 0; i < engine->navigation.page.layout.control_count; i++) {
-        const ControlRegion *control = &engine->navigation.page.layout.controls[i];
-        if (control->type != CONTROL_INPUT && control->type != CONTROL_TEXTAREA
-            && control->type != CONTROL_EDITABLE) continue;
-        size_t length = 0;
-        if (document_control_value(control->node, &length) == NULL)
-            (void) document_attribute(control->node, "value", &length);
-        if (length != 0) {
-            engine->youtube.signin_state = YOUTUBE_SIGNIN_MANUAL;
-            engine->youtube.login_events |= BROWSER_YOUTUBE_LOGIN_FAILED;
-            return BROWSER_YOUTUBE_RECOVERY_DECLINED;
-        }
+    /* Never discard an identifier/password the user has already entered. */
+    if (browser_engine_youtube_signin_text_present(engine)) {
+        engine->youtube.signin_state = YOUTUBE_SIGNIN_MANUAL;
+        engine->youtube.login_events |= BROWSER_YOUTUBE_LOGIN_FAILED;
+        return BROWSER_YOUTUBE_RECOVERY_DECLINED;
     }
     /* Retry the stable GET entry once after the predecessor is gone.
        Never replay a password POST, single-use URL, or saved input. */
@@ -1078,6 +1223,15 @@ static void browser_engine_youtube_on_finish(
         && adapter->handoff_http_status != 0) {
         engine->youtube.handoff_http_status = adapter->handoff_http_status;
         engine->youtube.handoff_service_origin = adapter->handoff_service_origin;
+    }
+    if (engine->youtube.signin_trail.post_pending) {
+        engine->youtube.signin_trail.post_pending = false;
+        engine->youtube.signin_trail.post_outcome = (unsigned) outcome;
+        engine->youtube.signin_trail.post_http_status =
+            engine->navigation.last_http_status;
+        engine->youtube.signin_trail.post_landing =
+            browser_engine_youtube_signin_page_class(
+                engine->navigation.page.document_url);
     }
     if (!browser_engine_youtube_signin_pending(engine)) return;
     if (outcome == BROWSER_NAVIGATION_JOB_CANCELLED) {

@@ -336,6 +336,16 @@ int main(void)
     CHECK(frame_paint_progress_due(33000, 1000, false, true));
     CHECK(frame_paint_progress_due(999, 1000, false, true));
     CHECK(!frame_paint_progress_due(100000, 1000, false, false));
+    /* A provider navigation pumps again only after a pump that made
+       progress, and only inside the frame's slice. */
+    CHECK(frame_navigation_slice_continue(10, 11, 1000, 1000));
+    CHECK(frame_navigation_slice_continue(10, 11, 1000,
+                                          1000 + FRAME_NAVIGATION_SLICE_US - 1));
+    CHECK(!frame_navigation_slice_continue(10, 11, 1000,
+                                           1000 + FRAME_NAVIGATION_SLICE_US));
+    CHECK(!frame_navigation_slice_continue(10, 10, 1000, 1001));
+    CHECK(frame_navigation_slice_continue(SIZE_MAX, 0, 1000, 1001));
+    CHECK(!frame_navigation_slice_continue(10, 11, 1000, 999));
     if (test_policy_table() != 0) return 1;
     if (test_admission() != 0) return 1;
     if (test_order_is_observed() != 0) return 1;

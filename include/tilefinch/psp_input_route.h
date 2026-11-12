@@ -111,6 +111,20 @@ typedef enum {
      | PSP_UI_BUTTON_RIGHT | PSP_UI_BUTTON_PAGE_UP | PSP_UI_BUTTON_PAGE_DOWN \
      | PSP_UI_BUTTON_CONFIRM | PSP_UI_BUTTON_MENU | PSP_UI_BUTTON_TOOLBAR)
 
+/* Pages from here that the queue's leading page presses ask for (signed): a
+   press of any other kind holds its place, and what follows it depends on it. */
+static inline int psp_input_queued_page_presses(const uint32_t *queued,
+                                                unsigned count)
+{
+    int pages = 0;
+    for (unsigned i = 0; i < count; i++) {
+        if (queued[i] == 0
+            || (queued[i] & ~PSP_INPUT_ROUTE_SCROLL_BUTTONS) != 0) break;
+        pages += (queued[i] & PSP_UI_BUTTON_PAGE_DOWN) != 0 ? 1 : -1;
+    }
+    return pages;
+}
+
 static inline PspInputRoute psp_input_route(const PspInputRouteContext *c)
 {
     if (c == NULL) return PSP_INPUT_ROUTE_NONE;
@@ -153,6 +167,34 @@ static inline PspInputRoute psp_input_route(const PspInputRouteContext *c)
         return PSP_INPUT_ROUTE_QUEUE_PAGE;
     if (loading) return PSP_INPUT_ROUTE_FORWARD;
     return c->acknowledge_busy ? PSP_INPUT_ROUTE_BUSY : PSP_INPUT_ROUTE_NONE;
+}
+
+/*
+ * Where the browser loop's button edges come from on one of its frames. A
+ * supervised scope's callback-thread supervisor samples the same pad, so
+ * each press must have one receiver:
+ *  - PAD: no supervisor runs; the loop's own sample (and the latch).
+ *  - FORWARDED: a supervised load; only what the supervisor forwarded
+ *    (psp_navigation_cooperate_owner_frame).
+ *  - REPLAYED: a supervised scope over the visible player that spans loop
+ *    frames (a media open, including a long rewind's reopen and a queue
+ *    entry's open). The supervisor takes every edge into its player copy
+ *    and queues it (psp_ui_media_supervisor_press); the loop applies that
+ *    queue to the player at the copy's refresh and at the scope's end. Its
+ *    own sample keeps the stick and the held buttons only.
+ */
+typedef enum {
+    PSP_INPUT_EDGES_PAD = 0,
+    PSP_INPUT_EDGES_FORWARDED,
+    PSP_INPUT_EDGES_REPLAYED
+} PspInputLoopEdges;
+
+static inline PspInputLoopEdges psp_input_loop_edges(
+    bool supervised, bool navigation_pending, bool media_scope)
+{
+    if (!supervised) return PSP_INPUT_EDGES_PAD;
+    if (navigation_pending) return PSP_INPUT_EDGES_FORWARDED;
+    return media_scope ? PSP_INPUT_EDGES_REPLAYED : PSP_INPUT_EDGES_PAD;
 }
 
 #endif

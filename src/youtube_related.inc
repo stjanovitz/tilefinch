@@ -95,7 +95,7 @@ static bool lite_html_watch_channel(YoutubeLiteHtml *html, const YoutubeLiteWatc
         && (!owner || watch->owner_avatar[0] == '\0'
             || (lite_html_text(html, "<img class=channel-avatar src=\"")
                 && lite_html_escape(html, watch->owner_avatar)
-                && lite_html_text(html, "\" width=24 height=24 alt=\"\">")))
+                && lite_html_text(html, "\" width=24 height=24 loading=lazy alt=\"\">")))
         && lite_html_escape(html, watch->video.channel)
         && lite_html_text(html, "</a>");
 }

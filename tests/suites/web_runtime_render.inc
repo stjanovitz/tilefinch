@@ -498,6 +498,14 @@ static int test_web_runtime(void)
     if (test_stroke_rounded_clip(&budget) != 0) return 1;
     puts("test: fixed overlays stack by z-index across fixed elements");
     if (test_fixed_overlays_follow_z_index(&budget) != 0) return 1;
+    puts("test: overflow accelerator covers a long page clipped at the root");
+    if (test_overflow_cache_long_clipped_page(&budget) != 0) return 1;
+    puts("test: fixed and sticky passes visit only their own commands");
+    if (test_overlay_passes_skip_unrelated_commands(&budget) != 0) return 1;
+    puts("test: a long text run stops past the tile it paints");
+    if (test_long_text_run_stops_past_target(&budget) != 0) return 1;
+    puts("test: moved copies of bidi text find their source directly");
+    if (test_bidi_copies_find_their_source(&budget) != 0) return 1;
 
     puts("test: native wrappers share methods and stay small");
     static const char wrapper_page[] =
@@ -523,8 +531,10 @@ static int test_web_runtime(void)
         "if(a.getBoundingClientRect!==b.getBoundingClientRect||"
         "a.scrollIntoView!==b.scrollIntoView||a.dispatchEvent!==b.dispatchEvent||"
         "datasetDescriptor(a).get!==datasetDescriptor(b).get)throw Error('wrapper closures');"
-        "if(Object.getOwnPropertyDescriptor(a,'style').get!=="
-        "Object.getOwnPropertyDescriptor(b,'style').get)throw Error('style closures');"
+        /* style and classList are Element.prototype accessors, not a
+           slot per wrapper. */
+        "if(Object.getOwnPropertyDescriptor(a,'style')||"
+        "Object.getOwnPropertyDescriptor(b,'classList'))throw Error('own accessor slots');"
         "const savedStyle=a.style;a.style='color:red';b.style='color:blue';"
         "if(a.style!==savedStyle||a.style===b.style||a.style.color!=='red'||"
         "b.style.color!=='blue')throw Error('style identity');"
@@ -550,7 +560,7 @@ static int test_web_runtime(void)
     printf("native wrapper memory: 64 nodes=%zu bytes\n",
            wrapper_headroom_before - wrapper_headroom_after);
     CHECK(wrapper_headroom_before >= wrapper_headroom_after
-          && wrapper_headroom_before - wrapper_headroom_after < 384u * 1024u);
+          && wrapper_headroom_before - wrapper_headroom_after < 48u * 1024u);
     CHECK(script_runtime_evaluate_diagnostic(wrapper_runtime,
         "delete globalThis.wrapperMemoryProbe", "<wrapper-memory-release>",
         &wrapper_result));
@@ -2585,12 +2595,50 @@ static int test_web_runtime(void)
             && memcmp(overflow_fallback_frame, overflow_frame,
                       480u * 272u * sizeof(*overflow_frame)) == 0);
     }
+    /* Once a box is scrolled the tiles hold none of the clipped content,
+       so a further scroll step re-rasterizes no tile; only going back to
+       no scroll at all (the stream bakes into tiles again) does. */
+    puts("test: a further nested scroll step keeps every tile");
+    TileCache step_cache;
+    uint16_t *step_frame = budget_malloc(
+        &budget, 480u * 272u * sizeof(*step_frame));
+    CHECK(step_frame != NULL
+          && tile_cache_init(&step_cache, &budget,
+                             &geometry_navigation.page.layout, 24)
+          && tile_cache_set_frame(&step_cache, step_frame, 480u * 272u)
+          && layout_scroll_node(&geometry_navigation.page.layout, shell, 0,
+                                nested_maximum / 3)
+          && tile_cache_render_frame(&step_cache, 0, 480, 272, NULL)
+          && tile_cache_render_frame(&step_cache, 0, 480, 272, NULL));
+    size_t rasterized_scrolled = step_cache.rasterized;
+    CHECK(layout_scroll_node(&geometry_navigation.page.layout, shell, 0,
+                             nested_maximum * 2 / 3)
+          && tile_cache_render_frame(&step_cache, 0, 480, 272, NULL)
+          && tile_cache_render_frame(&overflow_fallback_cache, 0, 480, 272,
+                                     NULL));
+    if (step_cache.rasterized != rasterized_scrolled)
+        fprintf(stderr, "nested scroll step: rasterized %zu -> %zu\n",
+                rasterized_scrolled, step_cache.rasterized);
+    CHECK(step_cache.rasterized == rasterized_scrolled
+          && memcmp(overflow_fallback_frame, step_frame,
+                    480u * 272u * sizeof(*step_frame)) == 0);
+    CHECK(layout_scroll_node(&geometry_navigation.page.layout, shell, 0, 0)
+          && tile_cache_render_frame(&step_cache, 0, 480, 272, NULL)
+          && tile_cache_render_frame(&overflow_fallback_cache, 0, 480, 272,
+                                     NULL)
+          && step_cache.rasterized > rasterized_scrolled
+          && memcmp(overflow_fallback_frame, step_frame,
+                    480u * 272u * sizeof(*step_frame)) == 0);
+    tile_cache_destroy(&step_cache);
+    budget_free(&budget, step_frame);
     tile_cache_destroy(&overflow_fallback_cache);
     budget_free(&budget, overflow_fallback_frame);
     tile_cache_destroy(&overflow_cache);
     budget_free(&budget, overflow_frame);
     puts("test: overflow accelerator obeys its persistent byte cap");
-    const size_t oversized_node_box_count = 22000;
+    /* Past the largest allowance on node boxes alone (12 bytes each). */
+    const size_t oversized_node_box_count =
+        TILEFINCH_OVERFLOW_CACHE_MAX_BYTES / (3u * sizeof(uint32_t)) + 1024u;
     LayoutNodeBox *oversized_node_boxes = budget_calloc(
         &budget, oversized_node_box_count, sizeof(*oversized_node_boxes));
     uint8_t oversized_overflow_flags[2] = {

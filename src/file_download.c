@@ -408,8 +408,12 @@ static bool headers(void *opaque, const FetchResult *response)
         if (!safe_validator(manager->validator)) manager->validator[0] = '\0';
         char disposition[4097], filename[FILE_DOWNLOAD_FILENAME_LIMIT];
         bool have = fetch_response_header_value(response, "content-disposition", disposition, sizeof(disposition));
-        if (have && file_download_filename(item->source_url, disposition, filename))
+        if (have && file_download_filename(item->source_url, disposition, filename)) {
+            /* The Downloads row shows this title. */
+            bool held = offline_library_fence_acquire(manager->library);
             snprintf(item->title, sizeof(item->title), "%s", filename);
+            offline_library_fence_release(manager->library, held);
+        }
     }
     if ((known && total > FILE_DOWNLOAD_LIMIT)
         || !tilefinch_update_query_free_space(manager->library->directory, &manager->available)

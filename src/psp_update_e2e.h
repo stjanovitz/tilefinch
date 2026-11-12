@@ -4,11 +4,20 @@
 #if defined(TILEFINCH_PSP_VALIDATION_LOG) \
     && defined(TILEFINCH_PSP_LIVE_NETWORK)
 
+#include "psp_update_route.h"
+
 typedef struct {
     bool requested;
     bool candidate_boot;
     bool started;
     bool terminal;
+    /* The recorded route (psp_update_route.h), armed by update-route.cfg
+       beside the trace. */
+    bool route_loaded;
+    bool route_armed;
+    int client_phase;
+    int install_phase;
+    PspUpdateRoute route;
 } PspUpdateE2E;
 
 void psp_update_e2e_init(

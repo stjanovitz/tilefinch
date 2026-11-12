@@ -62,6 +62,7 @@ struct TilefinchUpdateClient {
     bool package_table_capture_disabled;
     bool package_table_verified;
     char message[96];
+    bool part_write_failed;
 };
 
 static bool update_identifier(const char *value, size_t capacity)
@@ -516,11 +517,15 @@ static bool update_package_body(
                > client->verified.manifest.package_size
         || length > client->verified.manifest.package_size
                          - client->package_bytes
-        || !update_capture_package_table(client, data, length)
-        || fwrite(data, 1, length, client->part) != length
-        || !tilefinch_sha256_update(&client->package_sha, data, length)) {
+        || !update_capture_package_table(client, data, length)) {
         return false;
     }
+    if (fwrite(data, 1, length, client->part) != length) {
+        client->part_write_failed = true;
+        return false;
+    }
+    if (!tilefinch_sha256_update(&client->package_sha, data, length))
+        return false;
     client->package_bytes += length;
     return true;
 }
@@ -583,6 +588,7 @@ bool tilefinch_update_client_begin_download(TilefinchUpdateClient *client)
     }
     tilefinch_sha256_init(&client->package_sha);
     client->package_bytes = 0;
+    client->part_write_failed = false;
     update_reset_package_proof(client);
     FetchRequest request = update_request(client, client->package_url);
     FetchStreamOptions stream = {
@@ -622,24 +628,41 @@ bool tilefinch_update_client_cancel(TilefinchUpdateClient *client)
     return true;
 }
 
-static void update_finish_check(
-    TilefinchUpdateClient *client, bool success, FetchResult *result)
+void tilefinch_update_transfer_failure_text(
+    char *output, size_t capacity, const char *fallback, long status_code,
+    const char *transport_error)
 {
-    if (!success || result->status_code != 200 || result->data == NULL) {
-        update_client_error(
-            client, TILEFINCH_UPDATE_IO,
-            result->error[0] == '\0' ? "UPDATE CHECK FAILED" : result->error);
-        return;
+    if (output == NULL || capacity == 0) return;
+    if (transport_error != NULL && transport_error[0] != '\0')
+        snprintf(output, capacity, "%s", transport_error);
+    else if (status_code != 0 && status_code != 200)
+        snprintf(output, capacity, "%s: HTTP %ld", fallback, status_code);
+    else
+        snprintf(output, capacity, "%s", fallback);
+}
+
+TilefinchUpdateStatus tilefinch_update_download_failure(
+    char *output, size_t capacity, bool transfer_success, long status_code,
+    const char *transport_error, bool write_failed)
+{
+    if (write_failed) {
+        snprintf(output, capacity, "UPDATE FILE COULD NOT BE WRITTEN");
+        return TILEFINCH_UPDATE_IO;
     }
-    client->envelope = budget_malloc_category(
-        client->budget, BUDGET_CATEGORY_SESSION, result->length);
-    if (client->envelope == NULL) {
-        update_client_error(
-            client, TILEFINCH_UPDATE_IO, "NOT ENOUGH MEMORY FOR METADATA");
-        return;
+    if (!transfer_success || status_code != 200) {
+        tilefinch_update_transfer_failure_text(
+            output, capacity, "DOWNLOAD FAILED", status_code, transport_error);
+        return TILEFINCH_UPDATE_IO;
     }
-    memcpy(client->envelope, result->data, result->length);
-    client->envelope_length = result->length;
+    snprintf(output, capacity, "DOWNLOADED FILE DID NOT VERIFY");
+    return TILEFINCH_UPDATE_PACKAGE_MISMATCH;
+}
+
+/* Verifies the stored envelope against the installed sequence and pair the
+   client holds now, and sets the phase it implies: ERROR, UP_TO_DATE or
+   AVAILABLE. */
+static void update_classify_envelope(TilefinchUpdateClient *client)
+{
     TilefinchUpdateStatus status;
     if (client->trust == TILEFINCH_UPDATE_TRUST_DEVELOPER_UNSIGNED) {
         status = tilefinch_update_parse_developer_envelope(
@@ -693,6 +716,73 @@ static void update_finish_check(
     }
 }
 
+bool tilefinch_update_client_set_installed(
+    TilefinchUpdateClient *client, uint64_t installed_sequence,
+    const uint8_t installed_sha256[32], bool installed_sequence_valid,
+    bool installed_pair_valid)
+{
+    if (client == NULL
+        || client->phase == TILEFINCH_UPDATE_CLIENT_CHECKING
+        || client->phase == TILEFINCH_UPDATE_CLIENT_DOWNLOADING
+        || client->phase == TILEFINCH_UPDATE_CLIENT_CANCELLING)
+        return false;
+    uint8_t sha256[32] = {0};
+    if (installed_sha256 != NULL) memcpy(sha256, installed_sha256, 32);
+    if (client->installed_sequence == installed_sequence
+        && client->installed_sequence_valid == installed_sequence_valid
+        && client->installed_pair_valid == installed_pair_valid
+        && memcmp(client->installed_sha256, sha256, 32) == 0)
+        return true;
+    client->installed_sequence = installed_sequence;
+    client->installed_sequence_valid = installed_sequence_valid;
+    client->installed_pair_valid = installed_pair_valid;
+    memcpy(client->installed_sha256, sha256, 32);
+    if ((client->phase != TILEFINCH_UPDATE_CLIENT_AVAILABLE
+         && client->phase != TILEFINCH_UPDATE_CLIENT_DOWNLOADED)
+        || client->envelope == NULL)
+        return true;
+    /* The release was judged against a floor that no longer holds, for
+       example the build that just passed its trial. Judge it again: the
+       running build is no longer offered as new, and a release the new
+       floor refuses is not installed from the old verdict. */
+    bool downloaded = client->phase == TILEFINCH_UPDATE_CLIENT_DOWNLOADED;
+    char downloaded_message[sizeof(client->message)];
+    memcpy(downloaded_message, client->message, sizeof(downloaded_message));
+    update_classify_envelope(client);
+    if (downloaded && client->phase == TILEFINCH_UPDATE_CLIENT_AVAILABLE) {
+        /* Same verified manifest, so the download and its proof stand. */
+        client->phase = TILEFINCH_UPDATE_CLIENT_DOWNLOADED;
+        memcpy(client->message, downloaded_message, sizeof(client->message));
+    } else if (downloaded) {
+        update_reset_package_proof(client);
+        (void) remove(client->part_path);
+    }
+    return true;
+}
+
+static void update_finish_check(
+    TilefinchUpdateClient *client, bool success, FetchResult *result)
+{
+    if (!success || result->status_code != 200 || result->data == NULL) {
+        char message[sizeof(client->message)];
+        tilefinch_update_transfer_failure_text(
+            message, sizeof(message), "UPDATE CHECK FAILED",
+            result->status_code, result->error);
+        update_client_error(client, TILEFINCH_UPDATE_IO, message);
+        return;
+    }
+    client->envelope = budget_malloc_category(
+        client->budget, BUDGET_CATEGORY_SESSION, result->length);
+    if (client->envelope == NULL) {
+        update_client_error(
+            client, TILEFINCH_UPDATE_IO, "NOT ENOUGH MEMORY FOR METADATA");
+        return;
+    }
+    memcpy(client->envelope, result->data, result->length);
+    client->envelope_length = result->length;
+    update_classify_envelope(client);
+}
+
 static void update_finish_download(
     TilefinchUpdateClient *client, bool success, FetchResult *result)
 {
@@ -707,13 +797,11 @@ static void update_finish_download(
                digest, client->verified.manifest.package_sha256, 32) != 0) {
         remove(client->part_path);
         update_reset_package_proof(client);
-        update_client_error(
-            client,
-            success ? TILEFINCH_UPDATE_PACKAGE_MISMATCH
-                    : TILEFINCH_UPDATE_IO,
-            success ? "DOWNLOADED FILE DID NOT VERIFY"
-                    : (result->error[0] == '\0'
-                           ? "DOWNLOAD FAILED" : result->error));
+        char message[sizeof(client->message)];
+        TilefinchUpdateStatus status = tilefinch_update_download_failure(
+            message, sizeof(message), success, result->status_code,
+            result->error, client->part_write_failed || !close_ok);
+        update_client_error(client, status, message);
         return;
     }
     client->package_table_verified =

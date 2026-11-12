@@ -9,6 +9,7 @@
 #include "tilefinch/diagnostic_qr.h"
 #include "tilefinch/diagnostics.h"
 #include "tilefinch/media_chapters.h"
+#include "tilefinch/page_dialog.h"
 #include "tilefinch/psp_media_state.h"
 #include "tilefinch/psp_ui_theme.h"
 
@@ -79,6 +80,9 @@ typedef struct {
 typedef struct {
     char label[PSP_UI_HOME_LABEL_CAPACITY];
     char detail[PSP_UI_HOME_DETAIL_CAPACITY];
+    /* detail is a site's host (psp_ui_host_label), shown so its end stays
+       on screen; otherwise it is plain text. */
+    bool detail_is_host;
 } PspUiHomeEntry;
 
 typedef struct {
@@ -161,6 +165,19 @@ typedef struct {
     char name[128];
     char origin[320];
 } PspUiFileDownloadPreview;
+
+/* A page's alert(), confirm() or prompt() (tilefinch/page_dialog.h). Every
+   string is already plain, bounded text; host is empty when the page has no
+   host to name. value is prompt's current answer. right_to_left says message
+   holds prepared right-to-left rows (psp_ui_page_dialog_prepare). */
+typedef struct {
+    PageDialogKind kind;
+    bool offer_suppress;
+    bool right_to_left;
+    const char *host;
+    const char *message;
+    const char *value;
+} PspUiPageDialogView;
 
 typedef enum {
     PSP_UI_BUTTON_UP       = 1u << 0,
@@ -458,6 +475,9 @@ typedef struct {
     bool reset_site_permissions_requested;
     bool update_primary_requested;
     bool update_cancel_requested;
+    /* Square on the Update page while it offers a trial that did not
+       finish starting (update_discard_enabled). */
+    bool update_discard_requested;
     bool update_versions_requested;
     bool update_versions_closed;
     bool update_version_selected;
@@ -524,7 +544,10 @@ typedef enum {
     PSP_UI_SCREEN_GLYPH_OFFER,
     PSP_UI_SCREEN_YOUTUBE_LOGIN,
     PSP_UI_SCREEN_FILE_DOWNLOAD,
-    PSP_UI_SCREEN_ZIP_INSTALL
+    PSP_UI_SCREEN_ZIP_INSTALL,
+    /* A page's simple dialog, over the page. Shown only by the modal loop
+       in psp_app_page_dialog.c, which owns its input. */
+    PSP_UI_SCREEN_PAGE_DIALOG
 } PspUiScreen;
 
 /* True for the native surfaces above, which draw instead of the page. */
@@ -594,6 +617,15 @@ typedef struct {
     uint8_t youtube_login_policy : 2;
     uint8_t rotate_hint_always : 1;
     uint8_t youtube_signin_continue : 1;
+    /* The Unencrypted audio row, in this byte's spare bits: a
+       BrowserInsecureAudioAnswer (Ask, Allow or Block) for the page's site,
+       this session only. */
+    uint8_t insecure_audio_site_answer : 2;
+    /* The Update page offers TRY AGAIN (X) and DISCARD (Square) for a
+       trial whose recovery screen was answered with O or timed out; one of
+       this byte's spare bits. Every psp_ui_set_update clears it and
+       psp_ui_set_update_discard sets it. */
+    uint8_t update_discard_enabled : 1;
     uint16_t cursor_shape : 4;
     uint16_t video_language : 4;
     uint16_t subtitle_language : 4;
@@ -792,6 +824,7 @@ typedef struct {
         const PspUiOfflineAppPreview *offline_app_preview;
         const PspUiFileDownloadPreview *file_download_preview;
         const ZipInstallPreview *zip_install_preview;
+        const PspUiPageDialogView *page_dialog;
     };
     unsigned browser_ui_scale;
     /* Page text size and Page zoom (both at most 150%) share one word so
@@ -954,11 +987,14 @@ typedef struct {
 /* Legacy selection IDs reserve 0 for failure controls and 1 for current.
    Normal queue navigation skips both; upcoming entries begin at ID 2. */
 #define PSP_UI_MEDIA_QUEUE_CONTROL_ROWS 1u
-#define PSP_UI_MEDIA_TRACK_LABEL_CAPACITY 48u
-#define PSP_UI_MEDIA_SUBTITLE_TEXT_CAPACITY 160u
+/* Bytes, and two per letter in most non-Latin scripts: two caption rows hold
+   about 100 Cyrillic letters, and YouTube's longest track name is about 60. */
+#define PSP_UI_MEDIA_TRACK_LABEL_CAPACITY 96u
+#define PSP_UI_MEDIA_SUBTITLE_TEXT_CAPACITY 256u
 #define PSP_UI_MEDIA_TRACK_MENU_WIDTH 352u
 #define PSP_UI_MEDIA_TRACK_MENU_HEIGHT 176u
 #define PSP_UI_MEDIA_TRACK_MENU_MAX_HEIGHT 208u
+#define PSP_UI_MEDIA_AUDIO_TEXT_CAPACITY 72u
 
 typedef struct {
     char label[PSP_UI_MEDIA_TRACK_LABEL_CAPACITY];
@@ -973,6 +1009,16 @@ typedef enum {
     PSP_UI_MEDIA_TAB_CHAPTERS = 2,
     PSP_UI_MEDIA_TAB_QUEUE = 3
 } PspUiMediaTab;
+
+/* A hold on whoever else may draw a presentation while it is written: on the
+   PSP, the loading supervisor's presentation fence (AU-05). acquire returns
+   whether it was taken and release is given that answer, the same
+   signatures as psp_presentation_fence_acquire/release. NULL members: no
+   other reader. */
+typedef struct {
+    bool (*acquire)(void);
+    void (*release)(bool held);
+} PspUiMediaFence;
 
 /* Player-only presentation storage is owned beside the media session rather
    than copied into every transient UI snapshot. This keeps the hot
@@ -989,6 +1035,8 @@ typedef struct {
     int8_t selected_audio_track;
     int8_t selected_subtitle_track;
     uint8_t subtitle_size;
+    /* subtitle_text is already in display order, one row per line. */
+    bool subtitle_right_to_left;
     uint8_t subtitle_background;
     bool clockwise;
     bool rotation_available;
@@ -1019,6 +1067,29 @@ typedef struct {
     uint32_t queue_position;
     char queue_titles[6][128];
     char queue_error[160];
+    /* The stream title in display order, and what it was prepared from. */
+    char shown_title[PSP_UI_MEDIA_TITLE_CAPACITY];
+    uint32_t shown_title_hash;
+    uint64_t shown_title_glyphs;
+    /* Audio-only media (PspUiMediaState.audio_only): the station's own
+       description (an ICY genre), where the audio comes from (host and
+       port), and whether it arrives over plain HTTP. Author/network text,
+       never catalog keys. */
+    char audio_detail[PSP_UI_MEDIA_AUDIO_TEXT_CAPACITY];
+    char audio_source[PSP_UI_MEDIA_AUDIO_TEXT_CAPACITY];
+    bool audio_unencrypted;
+    /* A copy of the player state drawn on another thread (the loading
+       supervisor's) still points here. The strings and arrays above, the
+       counts that index them and the rotation (clockwise with
+       portrait_crop) are stored under this fence, for the store alone:
+       the setters below take it themselves and prepare text outside it,
+       and the owner's own stores use psp_ui_media_fence_acquire. Lowering
+       a count needs none, nor does a field stored on its own (the menu's
+       open/tab/selection, which the owner's input update moves, a
+       selected track, Auto next, the rotation offer, the slow-load clock):
+       an aligned byte or halfword store cannot tear, and a copy reads each
+       once per present. psp_ui_media_bind_presentation clears it. */
+    PspUiMediaFence fence;
 } PspUiMediaPresentation;
 
 typedef struct {
@@ -1051,6 +1122,12 @@ typedef struct {
      * an ordinary recoverable error keeps its Retry affordance.
      */
     bool retry_unavailable;
+    /* The failure is the one-time question whether a secure page's
+       plain-HTTP audio stream may play: Retry reads "Play anyway" and
+       answers yes, Back answers no. Blocked is a remembered no, changed in
+       Site information. psp_ui_media_set_error clears both. */
+    bool insecure_audio_offer;
+    bool insecure_audio_blocked;
     bool audio_only_recovery_available;
     bool lower_quality_recovery_available;
     bool playing;
@@ -1063,6 +1140,13 @@ typedef struct {
     bool play_pause_enabled;
     bool seek_enabled;
     int8_t analog_seek_direction;
+    /* Audio-only media has no picture: the player is a full-screen
+       listening view whose controls never hide. Reconnecting is a live
+       stream between responses (it may still play buffered audio). Both
+       share the byte of padding before the next word; the state stays at
+       its 288-byte bound. */
+    bool audio_only : 1;
+    bool reconnecting : 1;
     unsigned controls_remaining_ms;
     unsigned resolving_progress_per_mille;
     /* Presentation-only timeline state. Playback time and buffered_until_us
@@ -1159,6 +1243,10 @@ bool psp_ui_page_work_paused(const PspUiState *ui);
  */
 void psp_ui_set_chrome_fonts(
     const FontFace *regular, const FontFace *bold, unsigned scale);
+/* The owner thread's Budget, charged for putting right-to-left page text
+   in chrome (titles, hosts, labels) into display order. Until it is set
+   such text draws as stored. Call on the thread that owns the chrome. */
+void psp_ui_set_text_budget(Budget *budget);
 /* Rasterize the ASCII chrome set at another scale on the owning thread;
    the scale setting's handler calls this before the next frame draws. A
    call from any other thread is ignored. */
@@ -1233,6 +1321,11 @@ void psp_ui_show_status(PspUiState *ui, const char *status,
    count down only in psp_ui_update, which does not run while the video
    player owns input, so without this it outlives its work. */
 void psp_ui_dismiss_status(PspUiState *ui, const char *status);
+/* The load preview's reading hint (BrowserProvisionalViewport.reading_hint):
+   shown, and kept up, while `shown`; retired otherwise. It takes the place
+   of the load's own "LOADING..." announcement and waits behind any other
+   toast. */
+void psp_ui_set_preview_hint(PspUiState *ui, bool shown);
 /* As psp_ui_show_status(), timed in real milliseconds (at most 60000) rather
    than UI frames, whose rate follows the page's presentation cadence. */
 void psp_ui_show_status_ms(PspUiState *ui, const char *status,
@@ -1291,6 +1384,7 @@ void psp_ui_set_update(
     PspUiState *ui, const char *version, const char *status,
     const char *notes, int progress_per_mille, const char *primary_label,
     bool primary_enabled, bool cancel_enabled);
+void psp_ui_set_update_discard(PspUiState *ui, bool enabled);
 void psp_ui_set_update_history(
     PspUiState *ui, const TilefinchUpdateHistorySnapshot *snapshot);
 bool psp_ui_update_history_tag(
@@ -1315,6 +1409,26 @@ void psp_ui_show_offline_app_preview(
 void psp_ui_show_file_download(PspUiState *ui,
                                const PspUiFileDownloadPreview *preview);
 void psp_ui_show_zip_install(PspUiState *ui, const ZipInstallPreview *preview);
+/* The preview behind `view` is about to be freed: a state still showing it
+   (the offline-app, file-download or ZIP sheet over that very view) falls
+   back to the page and forgets the pointer. Returns whether it did. For a
+   copy of the UI drawn from another thread, under that thread's fence. */
+bool psp_ui_release_view(PspUiState *ui, const void *view);
+/* Borrowed for as long as the dialog shows; clear before the view's storage
+   goes away. */
+void psp_ui_show_page_dialog(PspUiState *ui, const PspUiPageDialogView *view);
+/* Orders and shapes a dialog's page text before it is painted; the painter
+   cannot allocate. Text needing neither, or a failed allocation, leaves the
+   view pointing at the original. The storage must outlive the dialog. */
+enum {
+    PSP_UI_PAGE_DIALOG_SHOWN_MESSAGE_BYTES = PAGE_DIALOG_MESSAGE_BYTES * 3u / 2u + 8u,
+    PSP_UI_PAGE_DIALOG_SHOWN_VALUE_BYTES = 128u
+};
+void psp_ui_page_dialog_prepare(
+    Budget *budget, PspUiPageDialogView *view,
+    char message[PSP_UI_PAGE_DIALOG_SHOWN_MESSAGE_BYTES],
+    char value[PSP_UI_PAGE_DIALOG_SHOWN_VALUE_BYTES]);
+void psp_ui_clear_page_dialog(PspUiState *ui);
 /* The same panel offered from Library > Saved (a recompile): Circle
    returns to the Library instead of Page tools. */
 void psp_ui_show_offline_app_offer(
@@ -1372,6 +1486,12 @@ void psp_ui_set_site_storage(PspUiState *ui,
                              const PspUiSiteStorageView *view);
 /* "812 KB", "1.4 MB", "3.2 GB". */
 void psp_ui_format_bytes(char *out, size_t capacity, uint64_t bytes);
+/* A site's host, "host:port" or "scheme://host[:port]" as the chrome stores
+   it in a bounded field: anything after the host is dropped, and a host too
+   long for capacity gives way at its start with a leading "...", never at
+   its end, where the registrable domain names the site's owner. Every
+   surface that names a page's site shows it this way. */
+void psp_ui_host_label(const char *text, char *output, size_t capacity);
 /* Opens the Memory Stick offer over the page. It ignores every button for
    PSP_UI_STORAGE_OFFER_ARMING_FRAMES: it can open in the middle of a game,
    and those presses are the game's. */
@@ -1452,12 +1572,31 @@ size_t psp_ui_state_bytes(void);
 void psp_ui_media_init(PspUiMediaState *media);
 void psp_ui_media_bind_presentation(
     PspUiMediaState *media, PspUiMediaPresentation *presentation);
+/* The presentation's fence (PspUiMediaPresentation.fence) around a store
+   the owner makes itself; release is given acquire's answer. Only the
+   owner's thread writes the presentation: never call a writer from the
+   thread that draws the copy. */
+bool psp_ui_media_fence_acquire(const PspUiMediaState *media);
+void psp_ui_media_fence_release(const PspUiMediaState *media, bool held);
 void psp_ui_media_set_title_font(PspUiMediaState *media,
                                  const FontFace *font);
 void psp_ui_media_set(PspUiMediaState *media, bool visible, bool playing,
                       bool ended, uint64_t current_time_us,
                       uint64_t duration_us, const char *title);
 void psp_ui_media_set_resolving(PspUiMediaState *media, const char *title);
+/* A later phase of the open already under way (the playback pipeline's
+   creation): as psp_ui_media_set_resolving, but an open track or queue menu
+   stays open on its tab and highlighted row, so a press meant for a row
+   still reaches it. A fresh open uses psp_ui_media_set_resolving, which
+   closes the old pipeline's menu. */
+void psp_ui_media_continue_resolving(PspUiMediaState *media,
+                                     const char *title);
+/* Marks the player audio-only (or not) with its listening-view details:
+   `detail` a station description, `source` where it comes from; either may
+   be NULL or empty. Text is copied, bounded and never translated. */
+void psp_ui_media_set_audio(PspUiMediaState *media, bool audio_only,
+                            const char *detail, const char *source,
+                            bool unencrypted, bool reconnecting);
 void psp_ui_media_set_resolving_progress(
     PspUiMediaState *media, const char *status,
     unsigned progress_per_mille);
@@ -1494,6 +1633,30 @@ void psp_ui_media_set_tracks(
     const PspUiMediaTrack *subtitle_tracks, size_t subtitle_count,
     int selected_subtitle);
 void psp_ui_media_set_subtitle(PspUiMediaState *media, const char *text);
+/* The same for text that may be right-to-left: shapes it, wraps it in the
+   rows the caption box holds, and orders each row for display. Call on the
+   browser thread, which owns glyph loading; painting then only reads the rows. */
+/* Page text in display order for a chrome painter that draws left to right and
+   must not allocate or shape: up to `rows` rows separated by '\n', each within
+   maximum_width at the chrome `scale` (`font` is the fallback the painter is
+   given), the last one cut with dots on the side the text ends. Run it when the
+   text arrives, on the browser thread. False, leaving nothing usable in output,
+   when the text needs no reordering or cannot be prepared; show it as it is. */
+bool psp_ui_visual_text(Budget *budget, const char *text, int maximum_width,
+                        int scale, const FontFace *font, unsigned rows,
+                        char *output, size_t capacity, bool *right_to_left);
+/* The title to hand psp_ui_media_set: `source` itself for ordinary text, or the
+   presentation's prepared copy for right-to-left text. Called every frame, it
+   hashes the title and only prepares it again when the title or the attached
+   language packs have changed. */
+const char *psp_ui_media_shown_title(PspUiMediaState *media, Budget *budget,
+                                     const char *source);
+/* Rewrites a menu row's text (a track label, chapter or queue title) in display
+   order, once, when it is set. Up to 128 bytes of capacity. */
+void psp_ui_media_prepare_row_text(PspUiMediaState *media, Budget *budget,
+                                   char *text, size_t capacity);
+void psp_ui_media_set_subtitle_bidi(PspUiMediaState *media, Budget *budget,
+                                    const char *text);
 /* The open in progress, or the next one, retries at 240p: its loading
    status reads "Retrying at 240p" until it plays or fails. */
 void psp_ui_media_note_lower_quality_retry(PspUiMediaState *media);
@@ -1505,6 +1668,61 @@ void psp_ui_media_set_subtitle_style(
 void psp_ui_media_tick(PspUiMediaState *media, unsigned elapsed_ms);
 PspUiMediaIntent psp_ui_media_update(PspUiMediaState *media,
                                      const PspUiInput *input);
+/* psp_ui_media_update for a copy of the player state drawn on another
+   thread (the loading supervisor's), whose presentation the owner keeps
+   writing: the copy never writes the presentation it borrows. A press that
+   would change it (the track menu, Auto next, the caption toggle's memory,
+   the lower-quality note) first moves the copy onto `own`, a private copy
+   of the presentation, where it stays: *detached says so, and the owner is
+   to apply that press and every later one itself (PspUiMediaPressQueue).
+   A fresh copy of the owner's state borrows its presentation again. Call
+   it where the owner's writers cannot run (under the presentation fence). */
+PspUiMediaIntent psp_ui_media_update_detached(
+    PspUiMediaState *media, PspUiMediaPresentation *own,
+    const PspUiInput *input, bool *detached);
+/* The presses a detached copy took, for the owner to apply in order: each
+   is one 16 ms update with the stick centred, as the copy took it. Full
+   means the copy must not take another press either. */
+#define PSP_UI_MEDIA_PRESS_LIMIT 16u
+typedef struct {
+    uint32_t pressed[PSP_UI_MEDIA_PRESS_LIMIT];
+    uint8_t count;
+} PspUiMediaPressQueue;
+bool psp_ui_media_press_queue_push(PspUiMediaPressQueue *queue,
+                                   uint32_t pressed);
+/* Actions that only move the timeline (preview, seek, cancel a preview,
+   play/pause): the session can take them as a target while an open still
+   runs. The others (queue, track, rotation, close and retry commands)
+   wait for the open's end. */
+bool psp_ui_media_timeline_action(PspUiMediaAction action);
+/* The owner's mailbox for the presses of one media open: the newest
+   timeline action, handed to the session at each refresh of the copy, and
+   the newest other action, which waits for the scope's end. Kept apart so
+   a timeline press after a command (Right after choosing a track) cannot
+   replace the waiting command. */
+typedef struct {
+    PspUiMediaIntent timeline;
+    PspUiMediaIntent command;
+} PspUiMediaMailbox;
+/* Applies the queued presses to the owner's state, oldest first, and
+   empties the queue. Each press's action joins its slot of the mailbox,
+   newest of each kind, so a command also survives a timeline press after
+   it inside the same batch. */
+void psp_ui_media_press_queue_settle(PspUiMediaPressQueue *queue,
+                                     PspUiMediaState *owner,
+                                     PspUiMediaMailbox *mailbox);
+/* One press the loading supervisor takes for its player copy: the copy
+   shows it at once (psp_ui_media_update_detached) and the press is queued,
+   whether or not it detached the copy. The owner derives the press's state
+   and action only by applying the queue, and its own loop takes no edges
+   meanwhile (psp_input_loop_edges), so each press reaches the owner's
+   player exactly once and the refreshed copy keeps what it showed. False,
+   with nothing changed, when the queue is full. The intent returned is the
+   copy's, for its feedback only: its action is the owner's to derive. */
+bool psp_ui_media_supervisor_press(
+    PspUiMediaState *copy, PspUiMediaPresentation *own,
+    PspUiMediaPressQueue *queue, uint32_t pressed,
+    PspUiMediaIntent *intent);
 /* True only when psp_ui_media_update() has already changed pixels worth
  * publishing before the session consumes the intent. */
 bool psp_ui_media_intent_has_predispatch_visual(

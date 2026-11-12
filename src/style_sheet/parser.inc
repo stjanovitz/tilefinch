@@ -725,6 +725,8 @@ static bool parse_keyframes_block(StyleCssParseContext *context,
     if (context->parsed_ir != NULL)
         context->parsed_ir->has_motion_keyframes = true;
     sheet->has_motion_keyframes = true;
+    if (!sheet->parsing_adopted_sheet)
+        sheet->motion_keyframes_outside_adopted = true;
     stylesheet_note_motion_source(sheet, header, header_length,
                                   body, body_length, true);
     return style_parsed_ir_builder_append(context, STYLE_PARSED_IR_KEYFRAMES,
@@ -1341,6 +1343,8 @@ static bool style_css_parse_context_finish(StyleCssParseContext *context)
     if (context == NULL || context->sheet == NULL) return false;
     Stylesheet *sheet = context->sheet;
     bool completed = true;
+    /* Fixups re-encode declarations parsed before their @font-face. */
+    if (context->font_fixup_count != 0) sheet->rewrite_epoch++;
     for (size_t i = 0; i < context->font_fixup_count; i++) {
         if ((i & 15u) == 0
             && !tilefinch_platform_cooperate("stylesheet-font-fixup", i)) {

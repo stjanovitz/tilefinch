@@ -93,30 +93,9 @@ static bool translation_prepare_visual_text(TilefinchUiTranslation *t)
             t->budget, value, length, TEXT_BIDI_BASE_RTL, &status);
         if (!p) { okay = false; break; }
         size_t count = text_bidi_paragraph_count(p);
-        uint16_t order[256];
-        okay = count <= sizeof(order) / sizeof(order[0])
-            && text_bidi_line_visual_order(p, 0, count, order,
-                                          sizeof(order) / sizeof(order[0]), NULL);
-        const TextBidiUnit *units = text_bidi_paragraph_units(p);
         size_t start = at;
-        for (size_t i = 0; okay && i < count; i++) {
-            uint32_t cp = units[order[i]].shaped_codepoint;
-            unsigned char out[4];
-            size_t bytes;
-            if (cp < 0x80u) { out[0] = (unsigned char)cp; bytes = 1; }
-            else if (cp < 0x800u) {
-                out[0] = 0xc0u | (cp >> 6); out[1] = 0x80u | (cp & 63u); bytes = 2;
-            } else if (cp < 0x10000u) {
-                out[0] = 0xe0u | (cp >> 12); out[1] = 0x80u | ((cp >> 6) & 63u);
-                out[2] = 0x80u | (cp & 63u); bytes = 3;
-            } else {
-                out[0] = 0xf0u | (cp >> 18); out[1] = 0x80u | ((cp >> 12) & 63u);
-                out[2] = 0x80u | ((cp >> 6) & 63u); out[3] = 0x80u | (cp & 63u); bytes = 4;
-            }
-            if (bytes >= bound - at) { okay = false; break; }
-            memcpy(text + at, out, bytes);
-            at += bytes;
-        }
+        /* One byte stays free for the terminator. */
+        okay = text_bidi_line_append_utf8(p, 0, count, text, bound - 1u, &at);
         text_bidi_paragraph_destroy(p);
         if (!okay) break;
         text[at++] = 0;

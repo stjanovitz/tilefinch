@@ -1,4 +1,5 @@
 #include "tilefinch/psp_media_session.h"
+#include "tilefinch/document.h"
 #include "tilefinch/psp_media_present.h"
 
 #include <stdio.h>
@@ -8,6 +9,8 @@
 #include "media_backend_psp_policy.h"
 #include "psp_media_session_internal.h"
 #include "tilefinch/media_failure_message.h"
+#include "tilefinch/media_mp3.h"
+#include "tilefinch/psp_media_hls.h"
 #include "tilefinch/platform.h"
 #include "tilefinch/psp_log.h"
 #include "tilefinch/user_agent.h"
@@ -194,6 +197,8 @@ void psp_media_report_failure_snapshot(
 /* Back to landscape, with the rotation offer and its probe forgotten. */
 static void psp_media_reset_rotation(PspMediaSession *media)
 {
+    /* A supervised player copy draws with these together (AU-05). */
+    bool held = psp_ui_media_fence_acquire(&media->ui);
     media->ui_presentation.clockwise = false;
     media->ui_presentation.portrait_crop = false;
     media->ui_presentation.rotation_available = false;
@@ -201,6 +206,7 @@ static void psp_media_reset_rotation(PspMediaSession *media)
     media->ui_presentation.rotation_probe_phase = 0;
     media->ui_presentation.rotation_probe_playback_ms = 0;
     media->ui_presentation.rotation_probe_matches = 0;
+    psp_ui_media_fence_release(&media->ui, held);
 }
 
 /* Whether the current picture is one the rotated presentation can draw. */
@@ -226,7 +232,8 @@ void psp_media_raise_error(
     MediaFailureMessage friendly;
     const char *shown = message, *shown_reason = reason;
     if (reason == NULL && media_failure_message(message, &friendly)) {
-        shown = friendly.headline;
+        shown = media->audio_only
+            ? media_failure_audio_headline(friendly.kind) : friendly.headline;
         shown_reason = friendly.details;
     }
     if (shown_reason != NULL) {
@@ -544,9 +551,87 @@ static void psp_media_present_continuation(PspMediaSession *media)
         psp_media_machine_wants_playing(media));
 }
 
+/* "Play anyway" or Back on the unencrypted-audio question. The answer is
+   for the page's site, held for this session only (session.c). */
+static void psp_media_answer_insecure_audio(
+    PspMediaSession *media, bool allowed)
+{
+    bool stored = browser_session_set_insecure_audio_site(
+        media->session, media->page_document_url,
+        allowed ? BROWSER_INSECURE_AUDIO_ALLOWED
+                : BROWSER_INSECURE_AUDIO_DECLINED);
+    media->insecure_audio_offer = false;
+    media->ui.insecure_audio_offer = false;
+    printf("tilefinch-page-media: event=insecure-audio-answer allowed=%d "
+           "stored=%d\n", allowed ? 1 : 0, stored ? 1 : 0);
+}
+
+/* No timeline to show or seek: a live HLS window, or an MP3 stream that
+   declared no length. */
+static bool psp_media_stream_live(const PspMediaSession *media)
+{
+    return media->stream.live_hls
+        || (media->page_mp3 && media->page_mp3_length == 0);
+}
+
+/*
+ * Projects audio-only media's listening view: the station's name and
+ * description once its response headers name them, where the audio comes
+ * from, and whether a live stream is reconnecting. True when what the view
+ * shows changed -- a new listening second, a reconnect starting or ending,
+ * or the station being named -- since it has no pictures to carry a repaint.
+ */
+static bool psp_media_present_audio_view(PspMediaSession *media)
+{
+    bool reconnecting = false;
+    if (media->audio_only && media->hls != NULL) {
+        const char *name = NULL, *genre = NULL;
+        if (!media->audio_station_checked
+            && psp_media_hls_station(media->hls, &name, &genre)) {
+            media->audio_station_checked = true;
+            char text[sizeof(media->audio_station)];
+            if (media_mp3_station_text(name, text, sizeof(text)))
+                memcpy(media->audio_station, text, sizeof(text));
+            if (media_mp3_station_text(genre, text,
+                                       sizeof(media->audio_detail)))
+                memcpy(media->audio_detail, text,
+                       sizeof(media->audio_detail));
+            if (media->audio_station[0] != '\0')
+                snprintf(media->stream.title, sizeof(media->stream.title),
+                         "%s", media->audio_station);
+        }
+        MediaHlsStats stats = {0};
+        reconnecting = psp_media_hls_stats(media->hls, &stats)
+            && stats.reconnecting;
+    }
+    psp_ui_media_set_audio(&media->ui, media->audio_only,
+                           media->audio_detail, media->audio_source,
+                           media->audio_unencrypted, reconnecting);
+    if (!media->audio_only) return false;
+    uint32_t signature = (uint32_t) (media->ui.current_time_us / 1000000u)
+        ^ (reconnecting ? UINT32_C(0x80000000) : 0u)
+        ^ (media->audio_station_checked ? UINT32_C(0x40000000) : 0u);
+    bool changed = signature != media->audio_view_signature;
+    media->audio_view_signature = signature;
+    return changed;
+}
+
+/* The title bar while an open or a recovery is in progress. Audio-only
+   media keeps naming what it plays; it has no video to open. */
+const char *psp_media_resolving_title(const PspMediaSession *media,
+                                      const char *video_title)
+{
+    if (media == NULL || !media->audio_only) return video_title;
+    if (media->stream.title[0] != '\0') return media->stream.title;
+    if (media->audio_station[0] != '\0') return media->audio_station;
+    if (media->page_media_label[0] != '\0') return media->page_media_label;
+    return tilefinch_ui_text("Opening audio");
+}
+
 static void psp_media_apply_active_projection(PspMediaSession *media)
 {
     if (media == NULL) return;
+    (void) psp_media_present_audio_view(media);
     if ((media->machine.state != PSP_MEDIA_SESSION_PLAYING
          && media->machine.state != PSP_MEDIA_SESSION_PAUSED)
         || media->machine.preview_active)
@@ -555,7 +640,10 @@ static void psp_media_apply_active_projection(PspMediaSession *media)
     PspMediaUiProjection projection =
         psp_media_machine_project_ui(&media->machine);
     psp_ui_media_apply_projection(&media->ui, &projection);
-    if (media->stream.live_hls) {
+    /* A declined station is answered in Site information, not by Retry. */
+    if (media->insecure_audio_blocked && media->ui.failed)
+        media->ui.retry_unavailable = true;
+    if (psp_media_stream_live(media)) {
         media->ui.live = true;
         media->ui.seek_enabled = false;
     }
@@ -1094,6 +1182,7 @@ bool psp_media_backend_stats_snapshot(
 void psp_media_pipeline_destroy(PspMediaSession *media)
 {
     if (media == NULL) return;
+    media->audio_station_checked = false;
     media->open_network_pending = false;
     media->presentation_deferred = false;
     psp_media_buffering_end(media, psp_media_now_us(media));
@@ -1115,6 +1204,8 @@ void psp_media_pipeline_destroy(PspMediaSession *media)
     media->subtitle_builder = NULL;
     media->subtitle_received_bytes = 0;
     media->subtitle_cue_cursor = 0;
+    media->subtitle_shown_source = NULL;
+    media->caption_glyph_scripts = 0;
     media->subtitle_request_attempted = false;
     media->subtitle_extension_retry = (YoutubeSubtitleRetry) {0};
     psp_ui_media_set_subtitle(&media->ui, NULL);
@@ -1243,6 +1334,21 @@ void psp_media_pipeline_destroy(PspMediaSession *media)
                 + rendition_stats.refused_video_packets;
     }
     media_playback_destroy(media->playback);
+    if (media->dma_quarantine_owned) {
+        /*
+         * A staging transfer this playback posted is still outstanding. Its
+         * source slot has just been returned with the rest of the surfaces,
+         * so the firmware backend's standing refusal of that slot number
+         * protects nothing and would fail every seek of the next session
+         * (MB-02). The presenter keeps the staging buffer refused until the
+         * transfer is seen to end, which is the half that still matters.
+         */
+        if (media->dma_quarantine_slot >= 0)
+            media_psp_backend_release_surface_quarantine(
+                (unsigned) media->dma_quarantine_slot);
+        media->dma_quarantine_slot = -1;
+        media->dma_quarantine_owned = false;
+    }
     psp_media_hls_destroy(media->hls);
     media_mp4_close(media->demux);
     media_mp4_close(media->audio_demux);
@@ -1369,6 +1475,8 @@ void psp_media_init(
     psp_ui_media_init(&media->ui);
     psp_ui_media_bind_presentation(
         &media->ui, &media->ui_presentation);
+    media->ui_presentation.fence = (PspUiMediaFence) {
+        media->platform.fence_acquire, media->platform.fence_release };
     psp_ui_media_set_title_font(&media->ui, title_font);
     psp_ui_media_set_subtitle_style(
         &media->ui, browser_profile_subtitle_size(profile),
@@ -1504,7 +1612,8 @@ void psp_media_resume(PspMediaSession *media)
     if (media->source[0] != '\0' && media->ui.visible) {
         media->continuation.playing = media->system_resume_playing;
         media->open_service_pending = true;
-        psp_ui_media_set_resolving(&media->ui, "Resuming video");
+        psp_ui_media_set_resolving(
+            &media->ui, psp_media_resolving_title(media, "Resuming video"));
     } else {
         psp_media_continuation_clear(&media->continuation);
     }
@@ -1593,6 +1702,9 @@ static void psp_media_prepare_route_kind(
             media->page_source = false;
             media->page_audio = false;
             media->page_hls = false;
+            media->page_mp3 = false;
+            media->insecure_audio_offer = false;
+            media->insecure_audio_blocked = false;
             psp_media_page_candidates_release(media);
             media->page_document_url[0] = '\0';
             media->page_media_node_handle = 0;
@@ -1689,6 +1801,15 @@ static void psp_media_prepare_route_kind(
     media->page_source = direct_page_route;
     media->page_audio = direct_page_route && direct_page_audio;
     media->page_hls = false;
+    media->page_mp3 = false;
+    media->insecure_audio_offer = false;
+    media->insecure_audio_blocked = false;
+    media->page_media_label[0] = '\0';
+    media->audio_station[0] = '\0';
+    media->audio_detail[0] = '\0';
+    media->audio_source[0] = '\0';
+    media->audio_unencrypted = false;
+    media->audio_station_checked = false;
     media->hls_selection_bound = PSP_MEDIA_HLS_BOUND_FIRMWARE;
     /* A further page rendition opens through here too and keeps the rest
        of its list; any other route ends it. */
@@ -1706,10 +1827,18 @@ static void psp_media_prepare_route_kind(
     media->offline_audio_path[0] = '\0';
     media->suspended_for_internal_view = false;
     snprintf(media->source, sizeof(media->source), "%s", url);
+    /* Prepared aside, then stored in one fenced step: a supervised player
+       copy may be drawing the chapter menu (AU-05). */
+    MediaChapter chapters[MEDIA_CHAPTER_LIMIT];
     size_t chapter_count = youtube_lite_copy_chapters(media->session, url,
-        media->ui_presentation.chapters, MEDIA_CHAPTER_LIMIT);
-    psp_ui_media_set_chapters(&media->ui, media->ui_presentation.chapters,
-                              chapter_count);
+        chapters, MEDIA_CHAPTER_LIMIT);
+    if (chapter_count > MEDIA_CHAPTER_LIMIT) chapter_count = MEDIA_CHAPTER_LIMIT;
+    for (size_t at = 0; at < chapter_count; at++)
+        if (memchr(chapters[at].title, '\0', sizeof(chapters[at].title)))
+            psp_ui_media_prepare_row_text(
+                &media->ui, media->budget, chapters[at].title,
+                sizeof(chapters[at].title));
+    psp_ui_media_set_chapters(&media->ui, chapters, chapter_count);
     media->generation = generation;
     media->last_resume_saved_us = 0;
     media->requested_quality = psp_media_open_quality(media);
@@ -1796,7 +1925,8 @@ static void psp_media_prepare_route_kind(
         psp_media_continuation_reopen(&media->continuation, explicit_start_us, autoplay);
     psp_ui_media_set_resolving(
         &media->ui, offline_route ? "Saved video"
-            : media->page_audio ? "Page audio"
+            : media->page_audio
+            ? psp_media_resolving_title(media, "Page audio")
             : direct_page_route ? "Page video" : "YouTube video");
 }
 
@@ -1862,8 +1992,16 @@ static void psp_media_playlist_projection(PspMediaSession *media)
 {
     PspUiMediaPresentation *p = &media->ui_presentation;
     YoutubePlaylistEntry entries[YOUTUBE_PLAYLIST_VIEW_LIMIT];
+    size_t count = youtube_playlist_view(media->playlist, entries, YOUTUBE_PLAYLIST_VIEW_LIMIT);
+    if (count > YOUTUBE_PLAYLIST_VIEW_LIMIT) count = YOUTUBE_PLAYLIST_VIEW_LIMIT;
+    /* Titles are prepared in the view, then the queue is stored in one
+       fenced step: a supervised player copy may be drawing it (AU-05). */
+    for (size_t i = 0; i < count; i++)
+        psp_ui_media_prepare_row_text(&media->ui, media->budget, entries[i].title,
+                                      sizeof(entries[i].title));
+    bool held = psp_ui_media_fence_acquire(&media->ui);
     p->queue_active = media->playlist != NULL;
-    p->queue_count = (uint8_t) youtube_playlist_view(media->playlist, entries, YOUTUBE_PLAYLIST_VIEW_LIMIT);
+    p->queue_count = (uint8_t) count;
     p->queue_position = (uint32_t) youtube_playlist_position(media->playlist);
     p->queue_next = youtube_playlist_has_next(media->playlist);
     p->queue_loading = youtube_playlist_loading(media->playlist);
@@ -1873,9 +2011,10 @@ static void psp_media_playlist_projection(PspMediaSession *media)
         && p->queue_failed && !p->queue_retry;
     if (youtube_playlist_selecting(media->playlist) && p->queue_failed)
         media->ui.retry_unavailable = p->queue_terminal;
-    for (size_t i = 0; i < p->queue_count; i++)
+    for (size_t i = 0; i < count; i++)
         memcpy(p->queue_titles[i], entries[i].title, sizeof(p->queue_titles[i]));
     snprintf(p->queue_error, sizeof(p->queue_error), "%s", youtube_playlist_error(media->playlist));
+    psp_ui_media_fence_release(&media->ui, held);
 }
 
 bool psp_media_open_playlist_route(PspMediaSession *media, const char *url,
@@ -2050,7 +2189,9 @@ static bool psp_media_open_page_source_kind(
                 .has_separate_audio = false
             }, audio_only ? "page-audio-retry" : "page-video-retry");
             psp_ui_media_set_resolving(
-                &media->ui, audio_only ? "Page audio" : "Page video");
+                &media->ui, audio_only
+                    ? psp_media_resolving_title(media, "Page audio")
+                    : "Page video");
         }
         return media->open_service_pending;
     }
@@ -2074,6 +2215,28 @@ bool psp_media_open_page_source(
         media, source_url, document_url, generation, node_handle,
         mode, credentials, content_security_policy, false, autoplay,
         reload_source);
+}
+
+void psp_media_set_page_media_label(PspMediaSession *media,
+                                    const char *element_title,
+                                    const char *page_title)
+{
+    if (media == NULL || !media->page_source) return;
+    char label[sizeof(media->page_media_label)];
+    if (!media_mp3_station_text(element_title, label, sizeof(label))
+        && !media_mp3_station_text(page_title, label, sizeof(label)))
+        return;
+    memcpy(media->page_media_label, label, sizeof(label));
+    /* Audio's open already named itself generically; a station that names
+       itself later still wins (psp_media_present_audio_view). Video keeps
+       its own title; the label names it only if the probe finds audio. */
+    if (media->audio_only && media->audio_station[0] == '\0') {
+        if (media->stream.title[0] != '\0')
+            snprintf(media->stream.title, sizeof(media->stream.title),
+                     "%s", label);
+        if (media->ui.resolving)
+            snprintf(media->ui.title, sizeof(media->ui.title), "%s", label);
+    }
 }
 
 bool psp_media_open_page_audio(
@@ -2294,6 +2457,9 @@ void psp_media_close(PspMediaSession *media)
         || media->recovery_service_active
         || media->ui.failed
         || (media->playback != NULL && !media->have_frame)
+        /* Page MP3 is often an endless station: closing the player ends
+           it rather than holding its connection open behind the page. */
+        || psp_media_hls_is_audio(media->hls)
         /* The backing results document, not a watch document, owns this
            route. Back returns to it immediately; retaining the decoder would
            reserve transport and ME memory for no same-page return path. */
@@ -2518,7 +2684,9 @@ void psp_media_execute_intent(PspMediaSession *media,
             if (media->ui_presentation.rotation_available
                 && psp_media_rotation_supported(media)) {
                 /* Landscape -> portrait fit -> central portrait crop ->
-                   landscape. Native portrait frames need no crop step. */
+                   landscape. Native portrait frames need no crop step. A
+                   supervised player copy draws with both (AU-05). */
+                bool held = psp_ui_media_fence_acquire(&media->ui);
                 if (!media->ui_presentation.clockwise) {
                     media->ui_presentation.clockwise = true;
                     media->ui_presentation.portrait_crop = media->frame.width > 512;
@@ -2529,6 +2697,7 @@ void psp_media_execute_intent(PspMediaSession *media,
                     media->ui_presentation.clockwise = false;
                     media->ui_presentation.portrait_crop = false;
                 }
+                psp_ui_media_fence_release(&media->ui, held);
                 psp_ui_media_show_controls(&media->ui);
             }
             break;
@@ -2538,7 +2707,7 @@ void psp_media_execute_intent(PspMediaSession *media,
                 bool starts_from_zero = !was_playing && media->clock_us == 0;
                 if (media->ui.ended) {
                     psp_ui_media_set_resolving(
-                        &media->ui, media->stream.title);
+                        &media->ui, psp_media_shown_title(media));
                     psp_ui_media_set_resolving_progress(
                         &media->ui, "RESTARTING VIDEO", 940u);
                     if (!psp_media_request_seek_with_resume(
@@ -2645,6 +2814,8 @@ void psp_media_execute_intent(PspMediaSession *media,
             break;
         }
         case PSP_UI_MEDIA_ACTION_RETRY:
+            if (media->ui.insecure_audio_offer)
+                psp_media_answer_insecure_audio(media, true);
             psp_media_request_user_retry(media);
             break;
         case PSP_UI_MEDIA_ACTION_AUDIO_ONLY:
@@ -2696,6 +2867,8 @@ void psp_media_execute_intent(PspMediaSession *media,
             }
             break;
         case PSP_UI_MEDIA_ACTION_CLOSE:
+            if (media->ui.insecure_audio_offer)
+                psp_media_answer_insecure_audio(media, false);
             psp_media_close(media);
             break;
         case PSP_UI_MEDIA_ACTION_NONE:
@@ -2706,16 +2879,22 @@ void psp_media_execute_intent(PspMediaSession *media,
 }
 
 static __attribute__((noinline)) bool
-psp_media_subtitle_finish_request(PspMediaSession *media)
+psp_media_subtitle_finish_request(PspMediaSession *media, bool full)
 {
     if (media == NULL || media->subtitle_request_id == 0) return false;
     FetchBackgroundMediaResponse result = {0};
     uint64_t request = media->subtitle_request_id;
     media->subtitle_request_id = 0;
-    bool taken = fetch_background_transport_take_media_result_consumed(
-        request, &result, media->subtitle_received_bytes);
+    /* A builder that is full keeps nothing from the rest of the track:
+       stop the transfer instead of downloading it to the end. Its chunks
+       came from an admitted (2xx) response. */
+    bool taken = full
+        ? fetch_background_transport_cancel(request, "subtitle window full")
+        : fetch_background_transport_take_media_result_consumed(
+              request, &result, media->subtitle_received_bytes);
     YoutubeSubtitleDocument *document = NULL;
-    if (taken && result.status_code >= 200 && result.status_code < 300
+    if (taken && (full || (result.status_code >= 200
+                           && result.status_code < 300))
         && media->subtitle_builder != NULL) {
         document = youtube_subtitles_builder_finish(media->subtitle_builder);
         media->subtitle_builder = NULL;
@@ -2917,12 +3096,14 @@ static bool psp_media_subtitle_load_pump(PspMediaSession *media)
                 return false;
             }
             media->subtitle_received_bytes += length;
+            if (youtube_subtitles_builder_full(media->subtitle_builder))
+                return psp_media_subtitle_finish_request(media, true);
         }
         if (!fetch_background_transport_progress(
                 media->subtitle_request_id, &progress)) return false;
         if (!progress.complete || progress.available_body_bytes != 0)
             return false;
-        return psp_media_subtitle_finish_request(media);
+        return psp_media_subtitle_finish_request(media, false);
     }
     return false;
 }
@@ -2980,9 +3161,16 @@ static bool psp_media_subtitle_update_display(PspMediaSession *media)
     const char *text = youtube_subtitles_text_at(
         media->subtitles, media->clock_us, &media->subtitle_cue_cursor);
     const char *display = text == NULL ? "" : text;
-    if (strcmp(media->ui_presentation.subtitle_text, display) == 0)
+    /* The stored row text is in display order, so a right-to-left cue is told
+       apart by its source. */
+    if (text == media->subtitle_shown_source
+        || (!media->ui_presentation.subtitle_right_to_left
+            && strcmp(media->ui_presentation.subtitle_text, display) == 0))
         return false;
-    psp_ui_media_set_subtitle(&media->ui, display);
+    media->subtitle_shown_source = text;
+    psp_ui_media_set_subtitle_bidi(&media->ui, media->budget, display);
+    media->caption_glyph_scripts |=
+        document_text_glyph_scripts(display, strlen(display));
     return true;
 }
 
@@ -3148,19 +3336,29 @@ static bool psp_media_pump_dma_quarantine(PspMediaSession *media)
      * and its join is what gave up. The session's remembered slot says which
      * picture is owed a release and may legitimately be absent -- a quarantine
      * with no slot to hand back still has to be polled to its end, or staging
-     * would be refused for the rest of the session with nothing left to clear
-     * it.
+     * would be refused for the rest of the process with nothing left to clear
+     * it. The presenter reports an expiry once; afterwards it keeps only the
+     * staging buffer refused, so later frames and sessions are not failed.
      */
     /* The only caller is advance, after its session NULL guard. */
-    if (!psp_media_present_ge_stage_dma_quarantined())
+    PspMediaDmaQuarantineStep step =
+        psp_media_present_ge_stage_dma_quarantine_step();
+    if (step != PSP_MEDIA_DMA_QUARANTINE_STEP_COMPLETED
+        && step != PSP_MEDIA_DMA_QUARANTINE_STEP_EXPIRED)
         return false;
     int slot = media->dma_quarantine_slot;
-    if (psp_media_present_ge_stage_dma_quarantine_poll()) {
+    /* False once the playback that posted the transfer was destroyed: its
+       slot went with it (see psp_media_destroy_pipeline), and this session
+       did not cause the transfer. */
+    bool owned = media->dma_quarantine_owned;
+    media->dma_quarantine_slot = -1;
+    media->dma_quarantine_owned = false;
+    if (step == PSP_MEDIA_DMA_QUARANTINE_STEP_COMPLETED) {
         printf("tilefinch-media-present: event=dma-quarantine-cleared "
-               "slot=%d generation=%u\n",
-               slot, (unsigned) media->dma_quarantine_generation);
-        media->dma_quarantine_slot = -1;
-        if (slot >= 0) {
+               "slot=%d generation=%u owned=%d\n",
+               slot, (unsigned) media->dma_quarantine_generation,
+               owned ? 1 : 0);
+        if (owned && slot >= 0) {
             /* The refusal is withdrawn first, because the release below is
                one of the paths it refuses. */
             media_playback_release_video_slot_quarantine(
@@ -3172,10 +3370,18 @@ static bool psp_media_pump_dma_quarantine(PspMediaSession *media)
         }
         return false;
     }
-    if (!psp_media_present_ge_stage_dma_quarantine_expired()) return false;
     printf("tilefinch-media-present: event=dma-quarantine-expired slot=%d "
-           "generation=%u\n", slot,
-           (unsigned) media->dma_quarantine_generation);
+           "generation=%u owned=%d\n", slot,
+           (unsigned) media->dma_quarantine_generation, owned ? 1 : 0);
+    /* Abandoned. The presenter still refuses the staging buffer, so the
+       transfer can only ever land where nothing stages or samples; the slot
+       it reads protects nothing any more, and a standing refusal would fail
+       every later seek of this backend. The claim itself stays until the
+       pipeline is destroyed. */
+    if (owned && slot >= 0)
+        media_playback_release_video_slot_quarantine(
+            media->playback, (unsigned) slot);
+    if (!owned) return false;
     if (media->playback != NULL) {
         media_playback_set_playing(media->playback, false);
     }
@@ -3487,8 +3693,13 @@ bool psp_media_advance(
     }
     char error[256] = {0};
     MEDIA_SWDEC_CPU_END(MEDIA_SWDEC_CPU_CLOCK);
+    uint64_t first_audio_us = 0;
     bool first_frame_pending = psp_media_first_frame_pending(
-        media->have_frame, media->first_frame_opened_us);
+        media->have_frame, media->audio_only,
+        media->audio_only && media_playback_audio_cursor_us(
+            media->playback, &first_audio_us),
+        psp_media_machine_wants_playing(media),
+        media->first_frame_opened_us);
     bool awaiting_pause_boundary =
         media->pause_boundary_pending && !media->have_frame;
     uint64_t decode_clock_us = psp_media_session_decode_clock_us(
@@ -4131,8 +4342,13 @@ bool psp_media_advance(
                media->pause_boundary_pending ? 1 : 0);
         return true;
     }
+    uint64_t presented_audio_us = 0;
     first_frame_pending = psp_media_first_frame_pending(
-        media->have_frame, media->first_frame_opened_us);
+        media->have_frame, media->audio_only,
+        media->audio_only && media_playback_audio_cursor_us(
+            media->playback, &presented_audio_us),
+        psp_media_machine_wants_playing(media),
+        media->first_frame_opened_us);
     uint64_t now_us = psp_media_now_us(media);
     if (!first_frame_pending) {
         media->first_frame_opened_us = 0;
@@ -4196,13 +4412,15 @@ bool psp_media_advance(
                 && psp_media_retry_delivery_failure(
                        media, "first-frame-stalled-candidate", reason,
                        true)) return true;
-            psp_media_remember_retry_state(media, false);
+            psp_media_remember_retry_state(
+                media, psp_media_first_output_retry_plays(media->audio_only));
             media_playback_set_playing(media->playback, false);
             media->ui.playing = false;
             media->decode_job_pending = false;
             psp_media_retire_first_frame(media);
             psp_media_raise_error(
-                media, "VIDEO FIRST FRAME TIMED OUT", reason);
+                media, psp_media_first_output_timeout_headline(
+                           media->audio_only), reason);
             return true;
         }
     }
@@ -4233,8 +4451,8 @@ bool psp_media_advance(
             media->ui.playing && !ended,
             ended, media->clock_us,
             psp_media_duration_us(media),
-            media->stream.title);
-        media->ui.live = media->stream.live_hls;
+            psp_media_shown_title(media));
+        media->ui.live = psp_media_stream_live(media);
         media->ui_presentation.rotation_available =
             psp_media_rotation_supported(media);
     }
@@ -4256,6 +4474,7 @@ bool psp_media_advance(
 #endif
     psp_ui_media_set_buffering(&media->ui, buffering, buffered);
     changed = (indicator_was_buffering != buffering) || changed;
+    changed = psp_media_present_audio_view(media) || changed;
     psp_ui_media_tick(&media->ui, elapsed_ms);
     /* Captions are optional background work. The old ordering parsed as much
        as 8 KiB before ranges, codec submission, audio queueing and frame

@@ -263,6 +263,15 @@ bool fetch_scheduler_enqueue_would_block(
     return false;
 }
 
+FetchBlockingWait fetch_scheduler_wait_for_blocking_capacity(
+    FetchScheduler *scheduler, size_t maximum_bytes, uint64_t limit_us)
+{
+    (void) scheduler;
+    (void) maximum_bytes;
+    (void) limit_us;
+    return FETCH_BLOCKING_WAIT_READY;
+}
+
 const char *fetch_scheduler_last_error(const FetchScheduler *scheduler)
 {
     (void) scheduler;
@@ -331,6 +340,14 @@ bool fetch_scheduler_request(FetchScheduler *scheduler, const char *url, const F
     (void) timeout_ms;
     (void) result;
     return false;
+}
+
+bool fetch_scheduler_request_blocking(
+    FetchScheduler *scheduler, const char *url, const FetchRequest *request,
+    size_t maximum_bytes, long timeout_ms, FetchResult *result)
+{
+    return fetch_scheduler_request(scheduler, url, request, maximum_bytes,
+                                   timeout_ms, result);
 }
 
 void fetch_sync_wait_note(uint64_t elapsed_us)

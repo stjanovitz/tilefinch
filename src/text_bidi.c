@@ -9,6 +9,7 @@
 #include <API/SBAllocator.h>
 
 #include "tilefinch/font.h"
+#include "tilefinch/utf8_encode.h"
 
 #define TEXT_BIDI_SCRATCH_BYTES (12u * 1024u)
 #define TEXT_BIDI_SCRATCH_ALIGNMENT _Alignof(max_align_t)
@@ -166,7 +167,7 @@ static size_t bidi_cluster_end(const TextBidiParagraph *paragraph,
     bool join_next = false;
     while (cursor < end) {
         uint32_t codepoint = paragraph->units[cursor].codepoint;
-        if (!join_next && !bidi_cluster_extender(codepoint)) break;
+        if (!join_next && !paragraph->units[cursor].cluster_extender) break;
         cursor++;
         join_next = codepoint == 0x200du;
     }
@@ -247,6 +248,11 @@ static const ArabicShapeEntry *arabic_joining_neighbor(
             return &join_causing;
         if (paragraph->units[cursor].codepoint == 0x200cu)
             return NULL;
+        /* Marks are joining-transparent by general category, so
+           ArabicShaping.txt and the table generated from it do not list them. */
+        if (font_codepoint_combining_mark(paragraph->units[cursor].codepoint)
+            || paragraph->units[cursor].codepoint == 0x061cu)
+            continue;
         const ArabicShapeEntry *entry = arabic_shape_entry(
             paragraph->units[cursor].codepoint);
         if (entry != NULL && entry->joining == ARABIC_JOIN_TRANSPARENT)
@@ -254,6 +260,32 @@ static const ArabicShapeEntry *arabic_joining_neighbor(
         return entry;
     }
     return NULL;
+}
+
+/* The alef that lam at `at` forms a required ligature with, or `count`. Marks
+   between them stay on the ligature; ZWJ and ZWNJ ask for the separate forms. */
+static size_t arabic_lam_alef_partner(const TextBidiParagraph *paragraph,
+                                      size_t at)
+{
+    for (size_t cursor = at + 1u; cursor < paragraph->count; cursor++) {
+        const TextBidiUnit *unit = &paragraph->units[cursor];
+        if (unit->level != paragraph->units[at].level) break;
+        if (font_codepoint_combining_mark(unit->codepoint)
+            || unit->codepoint == 0x061cu) continue;
+        if (unit->codepoint == 0x0622u || unit->codepoint == 0x0623u
+            || unit->codepoint == 0x0625u || unit->codepoint == 0x0627u)
+            return cursor;
+        break;
+    }
+    return paragraph->count;
+}
+
+/* The isolated presentation form; the final form follows it. */
+static uint32_t arabic_lam_alef_form(uint32_t alef)
+{
+    return alef == 0x0622u ? 0xfef5u
+        : alef == 0x0623u ? 0xfef7u
+        : alef == 0x0625u ? 0xfef9u : 0xfefbu;
 }
 
 static void arabic_shape(TextBidiParagraph *paragraph)
@@ -273,6 +305,21 @@ static void arabic_shape(TextBidiParagraph *paragraph)
         bool joins_after = after != NULL
             && arabic_connects_next(entry->joining)
             && arabic_connects_previous(after->joining);
+        size_t alef = unit->codepoint == 0x0644u
+            ? arabic_lam_alef_partner(paragraph, at) : paragraph->count;
+        if (alef != paragraph->count) {
+            /* The ligature replaces both letters and takes the letter before
+               lam. The alef keeps its unit, so source offsets still map, but
+               it draws nothing and stays with lam when a line is reversed. */
+            unit->shaped_codepoint = arabic_lam_alef_form(
+                paragraph->units[alef].codepoint) + (joins_before ? 1u : 0u);
+            paragraph->units[alef].shaped_codepoint = TEXT_BIDI_NO_GLYPH;
+            paragraph->units[alef].cluster_extender = 1u;
+            for (size_t mark = at + 1u; mark < alef; mark++)
+                paragraph->units[mark].cluster_extender = 1u;
+            at = alef;
+            continue;
+        }
         uint32_t shaped = joins_before && joins_after ? entry->medial
             : (joins_before ? entry->final
                : (joins_after ? entry->initial : entry->isolated));
@@ -514,4 +561,25 @@ bool text_bidi_line_visual_order(
     bidi_allocator_leave(previous);
     if (run_count != NULL) *run_count = runs;
     return okay && output == line_count && runs <= TEXT_BIDI_RUN_LIMIT;
+}
+
+bool text_bidi_line_append_utf8(
+    TextBidiParagraph *paragraph, size_t line_start, size_t line_count,
+    char *output, size_t capacity, size_t *used)
+{
+    uint16_t order[TEXT_BIDI_LINE_UNIT_LIMIT];
+    if (output == NULL || used == NULL || *used > capacity
+        || !text_bidi_line_visual_order(
+               paragraph, line_start, line_count, order,
+               sizeof(order) / sizeof(order[0]), NULL)) return false;
+    for (size_t at = 0; at < line_count; at++) {
+        uint32_t codepoint = paragraph->units[order[at]].shaped_codepoint;
+        if (codepoint == TEXT_BIDI_NO_GLYPH || codepoint == '\n') continue;
+        unsigned char bytes[4];
+        size_t size = tilefinch_utf8_encode(codepoint, bytes);
+        if (size > capacity - *used) return false;
+        memcpy(output + *used, bytes, size);
+        *used += size;
+    }
+    return true;
 }

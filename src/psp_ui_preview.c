@@ -1,4 +1,5 @@
 #include "tilefinch/psp_ui.h"
+#include "tilefinch/psp_ui_theme.h"
 #include "tilefinch/media_failure_message.h"
 #include "tilefinch/psp_reader_policy.h"
 #include "tilefinch/budget.h"
@@ -49,6 +50,7 @@ static bool preview_media_mode(const char *mode)
         || strcmp(mode, "media-captions") == 0
         || strcmp(mode, "seek") == 0
         || strncmp(mode, "media-error", 11) == 0
+        || strncmp(mode, "media-audio-", 12) == 0
         || strcmp(mode, "media-retry") == 0;
 }
 
@@ -64,6 +66,10 @@ static const char *preview_media_failure(const char *mode)
         return "player: fetch failed: connection timed out";
     if (strcmp(mode, "media-error-memory") == 0)
         return "AV WC 800200D9 (create-module-worker)";
+    if (strcmp(mode, "media-error-insecure-audio") == 0)
+        return MEDIA_INSECURE_AUDIO_QUESTION;
+    if (strcmp(mode, "media-error-insecure-audio-blocked") == 0)
+        return MEDIA_INSECURE_AUDIO_BLOCKED;
     return "AV WP 800200D2 (poll-module-worker)";
 }
 
@@ -158,6 +164,7 @@ int main(int argc, char **argv)
         "fonts/DejaVuSerif-Bold-Latin.ttf",
         "fonts/TilefinchSans-Regular.ttf",
         "fonts/TilefinchSans-Bold.ttf", 1536u * 1024u);
+    psp_ui_set_text_budget(&font_budget);
     /*
      * The boot entrance's keyframes, so the choreography is reviewable as
      * stills: mark-centred (frame one), wave-up, mid-glide, and the
@@ -893,15 +900,57 @@ int main(int argc, char **argv)
             psp_ui_media_set_seek_preview(&media, UINT64_C(15000000));
         else if (strncmp(mode, "media-error", 11) == 0) {
             preview_media_raise(&media, preview_media_failure(mode));
+            bool insecure_audio =
+                strncmp(mode, "media-error-insecure-audio", 26) == 0;
             /* A YouTube route offers audio-only and 240p recovery. */
             media.audio_only_recovery_available =
-                strcmp(mode, "media-error") != 0;
+                strcmp(mode, "media-error") != 0 && !insecure_audio;
             media.lower_quality_recovery_available =
-                strcmp(mode, "media-error") != 0;
+                strcmp(mode, "media-error") != 0 && !insecure_audio;
+            /* Page audio's unencrypted-audio question and its remembered
+               no, as psp_media_present_insecure_audio marks them. */
+            media.insecure_audio_offer =
+                strcmp(mode, "media-error-insecure-audio") == 0;
+            media.insecure_audio_blocked = media.retry_unavailable =
+                strcmp(mode, "media-error-insecure-audio-blocked") == 0;
         } else if (strcmp(mode, "media-retry") == 0) {
             psp_ui_media_set_resolving(&media, "Fixture video");
             psp_ui_media_set_resolving_progress(
                 &media, "Retrying at 240p", 400u);
+        }
+        if (strncmp(mode, "media-audio-", 12) == 0) {
+            /* An internet radio station over plain HTTP from an HTTPS page:
+               the listening view in each of its states. `file` is a
+               seekable MP3 instead. */
+            char state[24];
+            snprintf(state, sizeof(state), "%s", mode + 12);
+            /* A `-light` suffix shows the same state in the light theme. */
+            size_t length = strlen(state);
+            if (length > 6 && strcmp(state + length - 6, "-light") == 0) {
+                state[length - 6] = '\0';
+                psp_ui_theme_select(BROWSER_CHROME_THEME_LIGHT);
+            }
+            bool file = strcmp(state, "file") == 0;
+            psp_ui_media_set(&media, true, strcmp(state, "paused") != 0,
+                             false, UINT64_C(754000000),
+                             file ? UINT64_C(3215000000) : 0,
+                             file ? "Episode 42: Night Trains"
+                                  : "Radio Manele Romania");
+            media.live = !file;
+            psp_ui_media_set_audio(
+                &media, true, file ? "" : "Manele, Romanian pop and dance",
+                file ? "podcasts.example.net" : "141.94.96.97:8888", !file,
+                strcmp(state, "reconnecting") == 0);
+            if (strcmp(state, "buffering") == 0)
+                psp_ui_media_set_buffering(&media, true, 0);
+            else if (strcmp(state, "loading") == 0) {
+                psp_ui_media_set_resolving(&media, "Radio Manele Romania");
+                psp_ui_media_set_resolving_progress(
+                    &media, "Loading...", 400u);
+            } else if (strcmp(state, "error") == 0)
+                psp_ui_media_set_error_reason(
+                    &media, "AUDIO DIDN'T START",
+                    "NO AUDIO PACKETS IN 20 S");
         }
         psp_ui_media_composite(
             &media, frame, PREVIEW_WIDTH, PREVIEW_HEIGHT, PREVIEW_WIDTH);

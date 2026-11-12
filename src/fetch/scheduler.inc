@@ -178,9 +178,13 @@ static void scheduled_fetch_clear(FetchScheduler *scheduler,
         scheduler->reserved_bytes -= item->reserved_bytes;
     }
     bool domain_slot_reserved = item->domain_slot_reserved;
+    bool blocking_slot = item->blocking_slot;
     budget_free(scheduler->budget, item);
     *slot = NULL;
-    if (domain_slot_reserved) {
+    if (domain_slot_reserved && blocking_slot) {
+        if (scheduler->domain != NULL)
+            scheduler->domain->blocking_slot_active = false;
+    } else if (domain_slot_reserved) {
         fetch_scheduler_domain_release_slot(scheduler->domain);
     }
 }
@@ -324,7 +328,8 @@ static FetchScheduler *fetch_scheduler_create_in_domain_ex(
         return NULL;
     }
     scheduler->domain = domain;
-    scheduler->capacity = maximum_concurrent;
+    scheduler->capacity = maximum_concurrent + 1u;
+    scheduler->ordinary_capacity = maximum_concurrent;
     scheduler->maximum_reserved_bytes = maximum_reserved_bytes;
     scheduler->next_id = 1;
     domain->active_views++;
@@ -385,21 +390,18 @@ FetchScheduler *fetch_scheduler_create_ex(
     return scheduler;
 }
 
-bool fetch_scheduler_enable_background_transport(
-    FetchScheduler *scheduler, bool enabled)
+/* Attaches the worker to a scheduler whose owner asked for it: starts the
+   worker if it is not running and allocates the scheduler's handoff chunk.
+   NULL on success, else the refusal stage. Only the caller's transport
+   must already be prepared (the chunk is sized by the byte bound). */
+static const char *fetch_scheduler_background_attach(
+    FetchScheduler *scheduler)
 {
-    if (scheduler == NULL || scheduler->pending != 0
-        || scheduler->reserved_bytes != 0) return false;
-    if (!scheduler->global_acquired) {
-        if (enabled && !fetch_background_transport_available()) return false;
-        scheduler->background_transport_enabled = enabled;
-        return true;
-    }
-    if (enabled
-        && (!fetch_background_transport_available()
-            || !fetch_background_transport_initialize(
-                   scheduler->budget))) return false;
-    if (enabled && scheduler->background_chunk == NULL) {
+    scheduler->background_transport_enabled = false;
+    if (!fetch_background_transport_available()) return "worker-off";
+    if (!fetch_background_transport_initialize(scheduler->budget))
+        return "worker-start";
+    if (scheduler->background_chunk == NULL) {
         scheduler->background_chunk_capacity =
             fetch_background_scheduler_chunk_capacity(
                 scheduler->maximum_reserved_bytes);
@@ -408,11 +410,30 @@ bool fetch_scheduler_enable_background_transport(
             scheduler->background_chunk_capacity);
         if (scheduler->background_chunk == NULL) {
             scheduler->background_chunk_capacity = 0;
-            return false;
+            return "worker-chunk";
         }
     }
-    scheduler->background_transport_enabled = enabled;
-    return true;
+    scheduler->background_transport_enabled = true;
+    return NULL;
+}
+
+bool fetch_scheduler_enable_background_transport(
+    FetchScheduler *scheduler, bool enabled)
+{
+    if (scheduler == NULL || scheduler->pending != 0
+        || scheduler->reserved_bytes != 0) return false;
+    scheduler->background_transport_requested = enabled;
+    if (!enabled) {
+        scheduler->background_transport_enabled = false;
+        return true;
+    }
+    if (!scheduler->global_acquired) {
+        /* Deferred: the first admitted request attaches. */
+        scheduler->background_transport_enabled =
+            fetch_background_transport_available();
+        return scheduler->background_transport_enabled;
+    }
+    return fetch_scheduler_background_attach(scheduler) == NULL;
 }
 
 bool fetch_scheduler_set_background_media_hops(
@@ -475,8 +496,15 @@ static FetchRequest scheduled_background_hop_shape(
             && base->upgrade_insecure_requests,
         .identity_encoding = base != NULL && base->identity_encoding,
         .raw_gzip_encoding = base != NULL && base->raw_gzip_encoding,
+        .icy_status_line = base != NULL && base->icy_status_line,
         .user_agent = base == NULL ? NULL : base->user_agent,
         .connect_timeout_ms = base == NULL ? 0 : base->connect_timeout_ms,
+        /* The browser-thread path's stream rules (scheduled_stall_seconds):
+           a stream's deadline bounds only its headers. */
+        .stall_abort_seconds = item == NULL ? 0
+            : item->background_stall_seconds,
+        .worker_timing = item != NULL && item->streaming
+            ? FETCH_WORKER_TIMING_STREAM : FETCH_WORKER_TIMING_BUFFERED,
         .block_private_network = base != NULL
             && base->block_private_network,
         /* The cookie/referrer/CORS policies have already produced the fixed
@@ -486,21 +514,84 @@ static FetchRequest scheduled_background_hop_shape(
     };
 }
 
-static bool scheduled_background_hop_supported(ScheduledFetch *item)
+/* Under a response-keyed replay the updater's GitHub release chain runs the
+   real hop machine instead of the scheduler's whole-response replay: each hop
+   takes the worker's API, which the replay lane answers from one recorded
+   response, so redirect admission and the response checks run as they do live
+   (scripts/record-glyph-pack-replay.py). Lab and validation builds only; a
+   build without the fetch trace has no replay. */
+#ifdef TILEFINCH_NO_FETCH_TRACE
+#define scheduled_replay_runs_hops(request) false
+#else
+static bool scheduled_replay_runs_hops(const FetchRequest *request)
 {
-    if (item == NULL || !item->background_allowed || item->hop == NULL
-        || FETCH_TRACE_MODE != FETCH_TRACE_OFF
-        || !fetch_background_transport_available()
-        || !fetch_background_transport_initialize(item->result.budget)
-        || !fetch_hop_configure_cookie(
-               NULL, item->hop, &item->request,
-               item->hop->redirects == 0)) return false;
+    if (fetch_trace.mode != FETCH_TRACE_REPLAY
+        || !fetch_trace.replay_response_keyed || request == NULL)
+        return false;
+#if !defined(__PSP__)
+    if (tilefinch_test_faults()->replay_lane_runs_page_hops) return true;
+#endif
+    return request->redirect_policy == FETCH_REDIRECT_GITHUB_RELEASE;
+}
+#endif
+
+/* `refusal`: the worker would carry this hop (no HTTP trace is active),
+   but cannot: the step that failed and its curl code, or a NULL stage.
+   The scheduler does not use the worker ("worker-off"), the worker did
+   not start ("worker-start"), the scheduler's handoff chunk was refused
+   ("worker-chunk"), or the hop's Cookie header, its deadline or its
+   request shape. Only an active trace (which the worker neither records
+   nor replays, fetch_background_transport_available) returns false
+   without a stage, so on the PSP no other hop reaches the browser-thread
+   curl path. */
+typedef struct {
+    const char *stage;
+    CURLcode code;
+    /* The worker itself was unavailable to this request. */
+    bool worker_unavailable;
+} ScheduledHopRefusal;
+
+static bool scheduled_background_hop_supported(ScheduledFetch *item,
+                                               ScheduledHopRefusal *refusal)
+{
+    *refusal = (ScheduledHopRefusal) {NULL, CURLE_OK, false};
+    if (item == NULL || item->hop == NULL
+        || (FETCH_TRACE_MODE != FETCH_TRACE_OFF
+            && !scheduled_replay_runs_hops(&item->request))
+        || !fetch_background_transport_available())
+        return false;
+    if (!item->background_allowed) {
+        *refusal = (ScheduledHopRefusal) {
+            item->background_refusal == NULL
+                ? "worker-off" : item->background_refusal,
+            CURLE_FAILED_INIT, true};
+        return false;
+    }
+    if (!fetch_background_transport_initialize(item->result.budget)) {
+        *refusal = (ScheduledHopRefusal) {
+            "worker-start", CURLE_FAILED_INIT, true};
+        return false;
+    }
+    if (!fetch_hop_configure_cookie(
+            NULL, item->hop, &item->request, item->hop->redirects == 0)) {
+        *refusal = (ScheduledHopRefusal) {
+            "cookie", CURLE_BAD_FUNCTION_ARGUMENT, false};
+        return false;
+    }
     FetchRequest shape = scheduled_background_hop_shape(item);
     long remaining_ms = fetch_hop_remaining_ms(item->hop);
-    return remaining_ms > 0
-        && fetch_background_transport_hop_supported(
-               item->hop->url, &shape, item->reserved_bytes,
-               remaining_ms);
+    if (remaining_ms <= 0) {
+        *refusal = (ScheduledHopRefusal) {
+            "deadline", CURLE_OPERATION_TIMEDOUT, false};
+        return false;
+    }
+    if (!fetch_background_transport_hop_supported(
+            item->hop->url, &shape, item->reserved_bytes, remaining_ms)) {
+        *refusal = (ScheduledHopRefusal) {
+            "worker-request-shape", CURLE_BAD_FUNCTION_ARGUMENT, false};
+        return false;
+    }
+    return true;
 }
 
 /* `cookie_ready`: the caller configured this hop's cookie header just
@@ -531,6 +622,9 @@ static bool scheduled_background_start_hop_with(ScheduledFetch *item,
         ? fetch_background_transport_enqueue_media_hop_stream_sized_diagnosed(
               item->hop->url, &shape, item->reserved_bytes, remaining_ms,
               item->background_media_publication_bytes, NULL)
+        : item->blocking
+        ? fetch_background_transport_enqueue_blocking_hop_stream(
+              item->hop->url, &shape, item->reserved_bytes, remaining_ms)
         : fetch_background_transport_enqueue_hop_stream(
               item->hop->url, &shape, item->reserved_bytes, remaining_ms);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
@@ -578,7 +672,8 @@ static bool scheduled_fetch_prepare(FetchScheduler *scheduler,
         source == NULL ? 0 : source->body_length,
         FETCH_REQUEST_BODY_LIMIT);
     item->content_type = scheduler_copy(
-        scheduler->budget, source == NULL ? NULL : source->content_type, 255);
+        scheduler->budget, source == NULL ? NULL : source->content_type,
+        FETCH_REQUEST_CONTENT_TYPE_MAX);
     item->extra_headers = scheduler_copy(
         scheduler->budget, source == NULL ? NULL : source->extra_headers,
         FETCH_EXTRA_HEADERS_MAX);
@@ -702,6 +797,7 @@ static bool scheduled_fetch_prepare(FetchScheduler *scheduler,
             source != NULL && source->upgrade_insecure_requests,
         .identity_encoding = source != NULL && source->identity_encoding,
         .raw_gzip_encoding = source != NULL && source->raw_gzip_encoding,
+        .icy_status_line = source != NULL && source->icy_status_line,
         .connect_timeout_ms = source == NULL ? 0 : source->connect_timeout_ms,
         .stall_abort_seconds =
             source == NULL ? 0 : source->stall_abort_seconds,
@@ -770,13 +866,40 @@ static bool scheduled_fetch_prepare(FetchScheduler *scheduler,
     item->request.cookie_context = NULL;
     item->writer.hop = item->hop;
     item->writer.credentials_tainted = item->hop->credentials_tainted;
-    if (scheduled_background_hop_supported(item)) {
+    item->background_stall_seconds = scheduled_stall_seconds(item, timeout_ms);
+    ScheduledHopRefusal refusal;
+    if (scheduled_background_hop_supported(item, &refusal)) {
         item->background_backend = true;
         /* A full descriptor is transient backpressure, not permission to run
            curl on the browser thread. Later pumps retry the fixed worker
            queue while preserving the scheduler/domain reservation. */
         (void) scheduled_background_start_hop_with(item, true);
         return true;
+    }
+    /* The worker carries every shape fetch_request_validate() admits. A hop
+       it still refuses, or a request the worker is unavailable to, fails
+       here on the PSP: the curl path below would run DNS, TCP and TLS on
+       the browser thread, and for a passed deadline with a fresh full
+       timeout (none at all for a stream). Only an active HTTP trace, which
+       the worker cannot record or replay, still takes that path. The host
+       keeps it (its worker exists only under a replay); a test can ask for
+       the PSP rule. */
+#if defined(TILEFINCH_PSP_OWNED_TRANSPORT)
+    bool fail_refused = true;
+#elif !defined(__PSP__)
+    bool fail_refused = tilefinch_test_faults()->fail_worker_refused_hops;
+#else
+    bool fail_refused = false;
+#endif
+    if (fail_refused && refusal.worker_unavailable) {
+        snprintf(item->result.error, sizeof(item->result.error),
+                 "network transport worker unavailable (%s)",
+                 refusal.stage);
+        return false;
+    }
+    if (fail_refused && refusal.stage != NULL) {
+        return scheduled_fetch_prepare_failure(
+            item, refusal.stage, refusal.code);
     }
     item->easy = curl_easy_init();
     if (item->easy == NULL) {
@@ -800,6 +923,11 @@ static bool scheduled_fetch_prepare(FetchScheduler *scheduler,
     if (!fetch_configure_http_version(item->easy)) {
         return scheduled_fetch_prepare_failure(
             item, "http-version", CURLE_FAILED_INIT);
+    }
+    if (!fetch_configure_icy_status(item->easy,
+                                    item->request.icy_status_line)) {
+        return scheduled_fetch_prepare_failure(
+            item, "icy-status", CURLE_FAILED_INIT);
     }
     if (!fetch_configure_private_network(
             item->easy, &item->hop->private_network)
@@ -906,10 +1034,45 @@ static bool scheduled_fetch_prepare(FetchScheduler *scheduler,
     return true;
 }
 
+/* Ordinary requests in a scheduler (those not on its blocking slot). */
+static size_t scheduler_ordinary_items(const FetchScheduler *scheduler)
+{
+    size_t count = 0;
+    for (size_t i = 0; i < scheduler->capacity; i++) {
+        const ScheduledFetch *item = scheduler->items[i];
+        if (item != NULL && !item->blocking_slot) count++;
+    }
+    return count;
+}
+
+typedef enum {
+    SCHEDULER_ADMIT_NONE = 0,
+    SCHEDULER_ADMIT_ORDINARY,
+    SCHEDULER_ADMIT_BLOCKING_SLOT
+} SchedulerAdmission;
+
+/* Which slots a request may take now. An ordinary request takes one under
+   the scheduler's cap and the domain's. A blocking one takes the slot
+   reserved past both: a slot frees only when its owner takes the result,
+   and no owner does while the calling thread waits. Only one blocking
+   request runs at a time (its script is suspended until it returns); should
+   another arrive meanwhile it competes for an ordinary slot. */
+static SchedulerAdmission scheduler_slot_admission(
+    const FetchScheduler *scheduler, bool blocking)
+{
+    const FetchSchedulerDomain *domain = scheduler->domain;
+    if (domain == NULL) return SCHEDULER_ADMIT_NONE;
+    if (blocking && !domain->blocking_slot_active)
+        return SCHEDULER_ADMIT_BLOCKING_SLOT;
+    return scheduler_ordinary_items(scheduler) < scheduler->ordinary_capacity
+            && domain->active_slots < domain->maximum_active_slots
+        ? SCHEDULER_ADMIT_ORDINARY : SCHEDULER_ADMIT_NONE;
+}
+
 static uint64_t fetch_scheduler_enqueue_internal(
     FetchScheduler *scheduler, const char *url, const FetchRequest *request,
     size_t maximum_bytes, long timeout_ms,
-    const FetchStreamOptions *stream)
+    const FetchStreamOptions *stream, bool blocking)
 {
     char normalized_logical_url[TILEFINCH_URL_SERIALIZED_LIMIT];
     char canonical_url[TILEFINCH_URL_SERIALIZED_LIMIT];
@@ -988,6 +1151,25 @@ static uint64_t fetch_scheduler_enqueue_internal(
                 replay_cookie, sizeof(replay_cookie))) return 0;
         trace_request = &replay_shape;
     }
+    FetchSchedulerDomain *domain = scheduler->domain;
+    SchedulerAdmission admission = scheduler_slot_admission(
+        scheduler, blocking);
+    if (admission == SCHEDULER_ADMIT_NONE) {
+        if (domain != NULL && scheduler_ordinary_items(scheduler)
+                                  >= scheduler->ordinary_capacity) {
+            fetch_scheduler_set_error(
+                scheduler, "scheduler request slots are full");
+            return 0;
+        }
+        if (domain != NULL && domain->rejected_enqueues != SIZE_MAX) {
+            domain->rejected_enqueues++;
+        }
+        fetch_scheduler_set_error(
+            scheduler, "shared page request slots are full");
+        return 0;
+    }
+    /* Admission leaves an item slot free: ordinary items stay under
+       ordinary_capacity and at most one holds the blocking slot. */
     ScheduledFetch **item_slot = NULL;
     for (size_t i = 0; i < scheduler->capacity; i++) {
         if (scheduler->items[i] == NULL) {
@@ -999,24 +1181,19 @@ static uint64_t fetch_scheduler_enqueue_internal(
         fetch_scheduler_set_error(scheduler, "scheduler request slots are full");
         return 0;
     }
-    FetchSchedulerDomain *domain = scheduler->domain;
-    if (domain == NULL
-        || domain->active_slots >= domain->maximum_active_slots) {
-        if (domain != NULL && domain->rejected_enqueues != SIZE_MAX) {
-            domain->rejected_enqueues++;
-        }
-        fetch_scheduler_set_error(
-            scheduler, "shared page request slots are full");
-        return 0;
-    }
     /* Local page construction must not initialize the network. Only an
        admitted request may do so; failure owns no request slot/reservation. */
     if (!fetch_scheduler_prepare_transport(scheduler)) return 0;
-    if (scheduler->background_transport_enabled
-        && scheduler->background_chunk == NULL) {
-        /* Match eager callers' optional-worker fallback on refusal. */
-        scheduler->background_transport_enabled = false;
-        (void) fetch_scheduler_enable_background_transport(scheduler, true);
+    /* A scheduler whose owner asked for the worker attaches now if it has
+       not yet (a deferred scheduler), or if its last attach failed (the
+       worker did not start, or its 64 KiB chunk was refused). The failure
+       stays this request's: the next one tries again. */
+    const char *background_refusal =
+        scheduler->background_transport_requested ? NULL : "worker-off";
+    if (scheduler->background_transport_requested
+        && (!scheduler->background_transport_enabled
+            || scheduler->background_chunk == NULL)) {
+        background_refusal = fetch_scheduler_background_attach(scheduler);
     }
     ScheduledFetch *item = budget_calloc(
         scheduler->budget, 1, sizeof(*item));
@@ -1026,16 +1203,23 @@ static uint64_t fetch_scheduler_enqueue_internal(
         return 0;
     }
     *item_slot = item;
-    domain->active_slots++;
-    if (domain->active_slots > domain->peak_active_slots) {
-        domain->peak_active_slots = domain->active_slots;
+    if (admission == SCHEDULER_ADMIT_BLOCKING_SLOT) {
+        domain->blocking_slot_active = true;
+        item->blocking_slot = true;
+    } else {
+        domain->active_slots++;
+        if (domain->active_slots > domain->peak_active_slots) {
+            domain->peak_active_slots = domain->active_slots;
+        }
     }
     item->domain_slot_reserved = true;
+    item->blocking = blocking;
     item->id = scheduler->next_id++;
     if (item->id == 0) item->id = scheduler->next_id++;
     item->reserved_bytes = maximum_bytes;
     item->background_allowed =
         scheduler->background_transport_enabled;
+    item->background_refusal = background_refusal;
     item->background_media_publication_bytes =
         scheduler->background_media_publication_bytes;
     scheduler->reserved_bytes += maximum_bytes;
@@ -1049,7 +1233,8 @@ static uint64_t fetch_scheduler_enqueue_internal(
         item->complete = true;
         return item->id;
     }
-    if (FETCH_TRACE_MODE == FETCH_TRACE_REPLAY) {
+    if (FETCH_TRACE_MODE == FETCH_TRACE_REPLAY
+        && !scheduled_replay_runs_hops(request)) {
         item->writer = (WriteContext) {
             .result = &item->result,
             .maximum_bytes = maximum_bytes,
@@ -1234,7 +1419,7 @@ uint64_t fetch_scheduler_enqueue(FetchScheduler *scheduler, const char *url,
                                  size_t maximum_bytes, long timeout_ms)
 {
     return fetch_scheduler_enqueue_internal(
-        scheduler, url, request, maximum_bytes, timeout_ms, NULL);
+        scheduler, url, request, maximum_bytes, timeout_ms, NULL, false);
 }
 
 uint64_t fetch_scheduler_enqueue_stream(
@@ -1243,7 +1428,7 @@ uint64_t fetch_scheduler_enqueue_stream(
     const FetchStreamOptions *stream)
 {
     return fetch_scheduler_enqueue_internal(
-        scheduler, url, request, maximum_bytes, timeout_ms, stream);
+        scheduler, url, request, maximum_bytes, timeout_ms, stream, false);
 }
 
 bool fetch_scheduler_enqueue_would_block(
@@ -1257,13 +1442,8 @@ bool fetch_scheduler_enqueue_would_block(
         || maximum_bytes > scheduler->maximum_reserved_bytes) {
         return false;
     }
-    bool has_local_slot = false;
-    for (size_t i = 0; i < scheduler->capacity; i++) {
-        if (scheduler->items[i] == NULL) {
-            has_local_slot = true;
-            break;
-        }
-    }
+    bool has_local_slot = scheduler_ordinary_items(scheduler)
+        < scheduler->ordinary_capacity;
     bool reservation_busy =
         maximum_bytes > scheduler->maximum_reserved_bytes
                             - scheduler->reserved_bytes;
@@ -1450,6 +1630,10 @@ static bool scheduled_replay_body(FetchScheduler *scheduler,
         }
         size_t wanted = item->replay_chunk_remaining;
         if (wanted > *bytes_remaining) wanted = *bytes_remaining;
+        /* A full consumer leaves the rest in the file for a later pump. */
+        size_t room = stream_consumer_capacity(&item->writer);
+        if (room == 0) break;
+        if (wanted > room) wanted = room;
         if (item->replay_offset >= item->reserved_bytes) {
             item->result.response_limit_exceeded = true;
             snprintf(item->result.error, sizeof(item->result.error),
@@ -1524,6 +1708,9 @@ static bool scheduled_drain_pending(FetchScheduler *scheduler,
     if (*bytes_remaining == 0 || *callbacks_remaining == 0) return true;
     size_t wanted = writer->pending_length - writer->pending_offset;
     if (wanted > *bytes_remaining) wanted = *bytes_remaining;
+    size_t room = stream_consumer_capacity(writer);
+    if (room == 0) return true;
+    if (wanted > room) wanted = room;
     bool injected = false;
     wanted = stream_injected_boundary(writer, wanted, &injected);
     if (wanted != 0
@@ -1830,10 +2017,25 @@ static bool scheduled_background_deliver_chunk(
                  "background body chunk exceeded scheduler bound");
         return false;
     }
+    /* Take no more than this pump's body quota leaves, as the
+       browser-thread path stages what exceeds it; the rest stays published
+       in the worker slot for a later pump. */
+    size_t capacity = scheduler->background_chunk_capacity;
+    if (item->writer.pump_quota_enabled) {
+        const size_t *bytes = item->writer.pump_bytes_remaining;
+        const size_t *callbacks = item->writer.pump_callbacks_remaining;
+        if ((bytes != NULL && *bytes == 0)
+            || (callbacks != NULL && *callbacks == 0)) return true;
+        if (bytes != NULL && *bytes < capacity) capacity = *bytes;
+    }
+    /* A full consumer leaves the rest published in the worker slot. */
+    size_t room = stream_consumer_capacity(&item->writer);
+    if (room == 0) return true;
+    if (room < capacity) capacity = room;
     size_t length = 0;
     if (!fetch_background_transport_take_chunk(
             item->background_request_id, scheduler->background_chunk,
-            scheduler->background_chunk_capacity, &length)) return true;
+            capacity, &length)) return true;
     if (!write_deliver_chunk(
             &item->writer, scheduler->background_chunk, length)) {
         if (item->result.error[0] == '\0') {
@@ -1844,6 +2046,34 @@ static bool scheduled_background_deliver_chunk(
     }
     return true;
 }
+
+static bool scheduled_any_background_item(const FetchScheduler *scheduler)
+{
+    for (size_t i = 0; i < scheduler->capacity; i++) {
+        const ScheduledFetch *item = scheduler->items[i];
+        if (item != NULL && item->active && item->background_backend)
+            return true;
+    }
+    return false;
+}
+
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+/* One line per finished hop of an updater request, so a report shows where a
+   download ended and how long each redirect took. */
+static void scheduled_update_hop_log(const ScheduledFetch *item, bool success)
+{
+    if (item->request.redirect_policy != FETCH_REDIRECT_GITHUB_RELEASE) return;
+    char message[256];
+    snprintf(message, sizeof(message),
+             "tilefinch-update-hop: hop=%u status=%ld ok=%d bytes=%zu "
+             "at-us=%llu error=\"%.48s\" url=%.96s",
+             (unsigned) item->hop->redirects, item->result.status_code,
+             success ? 1 : 0, item->result.received_body_bytes,
+             (unsigned long long) tilefinch_platform_monotonic_time_us(),
+             item->result.error, item->hop->url);
+    tilefinch_platform_log_message(message);
+}
+#endif
 
 static bool scheduled_background_finish_hop(
     FetchScheduler *scheduler, ScheduledFetch *item)
@@ -1865,6 +2095,9 @@ static bool scheduled_background_finish_hop(
     bool success = fetch_background_transport_take_fetch_result_consumed(
         completed_id, scheduler->budget, &item->result, consumed);
     item->background_request_id = 0;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    scheduled_update_hop_log(item, success);
+#endif
     FetchHandshakeSample handshake = {
         .classified = item->result.tls_connection_reuse_known,
         .measured = item->result.tls_handshake_measured,
@@ -1970,9 +2203,9 @@ size_t fetch_scheduler_pump_bounded(
     if (maximum_wait_ms > 10) maximum_wait_ms = 10;
     uint64_t started_us = tilefinch_platform_monotonic_time_us();
     scheduler->pump_generation++;
-    size_t stream_start[FETCH_SCHEDULER_LIMIT] = {0};
-    bool active_seen[FETCH_SCHEDULER_LIMIT] = {0};
-    bool stream_seen[FETCH_SCHEDULER_LIMIT] = {0};
+    size_t stream_start[FETCH_SCHEDULER_ITEM_LIMIT] = {0};
+    bool active_seen[FETCH_SCHEDULER_ITEM_LIMIT] = {0};
+    bool stream_seen[FETCH_SCHEDULER_ITEM_LIMIT] = {0};
     for (size_t i = 0; i < scheduler->capacity; i++) {
         ScheduledFetch *item = scheduler->items[i];
         if (item == NULL) continue;
@@ -1988,7 +2221,8 @@ size_t fetch_scheduler_pump_bounded(
         item->writer.pump_metrics = pump;
     }
     size_t completed = 0;
-    if (FETCH_TRACE_MODE == FETCH_TRACE_REPLAY) {
+    bool replay_pump = FETCH_TRACE_MODE == FETCH_TRACE_REPLAY;
+    if (replay_pump) {
         for (size_t visited = 0; visited < scheduler->capacity
                                  && completed < maximum_completions;
              visited++) {
@@ -1996,7 +2230,8 @@ size_t fetch_scheduler_pump_bounded(
                      % scheduler->capacity;
             ScheduledFetch *item = scheduler->items[i];
             if (item == NULL) continue;
-            if (!item->active || item->easy != NULL) continue;
+            if (!item->active || item->easy != NULL
+                || item->background_backend) continue;
             if (item->result.trace_external_cancel
                 && !item->replay_retained_external_cancel) continue;
             if (item->replay_release_us != 0
@@ -2049,7 +2284,10 @@ size_t fetch_scheduler_pump_bounded(
                 completed++;
             }
         }
-    } else {
+    }
+    /* A replay's hop-machine requests (scheduled_replay_runs_hops) pump here
+       like live ones; nothing else in a replay has work below. */
+    if (!replay_pump || scheduled_any_background_item(scheduler)) {
         bool background_active = false;
         for (size_t visited = 0; visited < scheduler->capacity
                                  && completed < maximum_completions;
@@ -2356,7 +2594,10 @@ bool fetch_scheduler_request_progress(
                 FETCH_TRACE_MODE == FETCH_TRACE_REPLAY
                     ? item->replay_pumps_remaining : 0,
             .active = item->active,
-            .complete = item->complete
+            .complete = item->complete,
+            .transport_waiting = item->active && !item->complete
+                && item->background_backend
+                && item->background_request_id == 0
         };
         return true;
     }
@@ -2385,6 +2626,93 @@ void fetch_sync_wait_totals(uint64_t *us, uint64_t *count)
     if (count != NULL) *count = fetch_sync_wait_count;
 }
 
+typedef enum {
+    SCHEDULER_BLOCKER_NONE = 0,
+    SCHEDULER_BLOCKER_HELD,
+    SCHEDULER_BLOCKER_SLOTS,
+    SCHEDULER_BLOCKER_POOL
+} SchedulerBlocker;
+
+/* What keeps a request of maximum_bytes out of this scheduler now. A slot
+   (local or domain) frees only on an owner's take; the byte pool also frees
+   inside a pump, when a response completes and returns the unused part of
+   its reservation (scheduled_release_unused_reservation). */
+static SchedulerBlocker scheduler_blocker(const FetchScheduler *scheduler,
+                                          size_t maximum_bytes)
+{
+    /* Invalid limits are left for the enqueue to refuse with its error. */
+    if (scheduler == NULL || scheduler->domain == NULL)
+        return SCHEDULER_BLOCKER_NONE;
+    if (fetch_scheduler_held(scheduler)) return SCHEDULER_BLOCKER_HELD;
+    if (maximum_bytes == 0 || maximum_bytes == SIZE_MAX
+        || maximum_bytes > scheduler->maximum_reserved_bytes)
+        return SCHEDULER_BLOCKER_NONE;
+    if (scheduler_slot_admission(scheduler, true) == SCHEDULER_ADMIT_NONE)
+        return SCHEDULER_BLOCKER_SLOTS;
+    return maximum_bytes > scheduler->maximum_reserved_bytes
+                               - scheduler->reserved_bytes
+        ? SCHEDULER_BLOCKER_POOL : SCHEDULER_BLOCKER_NONE;
+}
+
+/* A blocking wait's idle step after a pump turn that made no progress and
+   did not wait itself. The pump sleeps only while one of its own requests
+   is on the worker, and tilefinch_platform_cooperate only during the
+   worker's connection setup, so without this the wait spins the browser
+   thread above the worker, the image decoder and the firmware's network
+   service it is waiting for. A replay keeps its virtual pump cadence. */
+#define FETCH_BLOCKING_IDLE_MS 2u
+
+static void fetch_scheduler_blocking_idle(void)
+{
+    unsigned ledger = work_ledger_enter(WORK_LEDGER_SLEEP);
+#if defined(TILEFINCH_PSP_OWNED_TRANSPORT)
+    fetch_background_transport_wait(FETCH_BLOCKING_IDLE_MS);
+#elif !defined(__PSP__)
+    if (FETCH_TRACE_MODE != FETCH_TRACE_REPLAY) {
+        struct timespec idle = {0, (long) FETCH_BLOCKING_IDLE_MS * 1000000L};
+        (void) nanosleep(&idle, NULL);
+    }
+#endif
+    work_ledger_leave(ledger);
+}
+
+FetchBlockingWait fetch_scheduler_wait_for_blocking_capacity(
+    FetchScheduler *scheduler, size_t maximum_bytes, uint64_t limit_us)
+{
+    uint64_t started = tilefinch_platform_monotonic_time_us();
+    size_t turns = 0;
+    FetchBlockingWait outcome = FETCH_BLOCKING_WAIT_READY;
+    for (;;) {
+        SchedulerBlocker blocker = scheduler_blocker(scheduler, maximum_bytes);
+        if (blocker == SCHEDULER_BLOCKER_NONE) break;
+        if (blocker == SCHEDULER_BLOCKER_HELD) {
+            outcome = FETCH_BLOCKING_WAIT_HELD;
+            break;
+        }
+        /* Only a completing response can free pool bytes here. */
+        if (blocker == SCHEDULER_BLOCKER_SLOTS || scheduler->pending == 0) {
+            outcome = FETCH_BLOCKING_WAIT_FULL;
+            break;
+        }
+        if (tilefinch_platform_monotonic_time_us() - started >= limit_us) {
+            outcome = FETCH_BLOCKING_WAIT_TIMED_OUT;
+            break;
+        }
+        FetchPumpMetrics pump = {0};
+        (void) fetch_scheduler_pump_bounded(scheduler, 1, 10, NULL, &pump);
+        if (pump.completions == 0 && pump.body_callbacks == 0
+            && pump.elapsed_us < (uint64_t) FETCH_BLOCKING_IDLE_MS * 1000u)
+            fetch_scheduler_blocking_idle();
+        if (!tilefinch_platform_cooperate("fetch", ++turns)) {
+            outcome = FETCH_BLOCKING_WAIT_CANCELLED;
+            break;
+        }
+    }
+    if (turns != 0)
+        fetch_sync_wait_note(tilefinch_platform_monotonic_time_us() - started);
+    return outcome;
+}
+
 bool fetch_scheduler_request(FetchScheduler *scheduler, const char *url,
                              const FetchRequest *request,
                              size_t maximum_bytes, long timeout_ms,
@@ -2406,6 +2734,25 @@ bool fetch_scheduler_request(FetchScheduler *scheduler, const char *url,
     uint64_t id = fetch_scheduler_enqueue(scheduler, url, request,
                                           maximum_bytes, timeout_ms);
     if (id == 0) return false;
+    return fetch_scheduler_wait_enqueued(scheduler, id, result);
+}
+
+bool fetch_scheduler_request_blocking(
+    FetchScheduler *scheduler, const char *url, const FetchRequest *request,
+    size_t maximum_bytes, long timeout_ms, FetchResult *result)
+{
+    if (result == NULL) return false;
+    Budget *result_budget = scheduler == NULL
+        ? result->budget : scheduler->budget;
+    memset(result, 0, sizeof(*result));
+    result->budget = result_budget;
+    uint64_t id = fetch_scheduler_enqueue_internal(
+        scheduler, url, request, maximum_bytes, timeout_ms, NULL, true);
+    if (id == 0) {
+        fetch_scheduler_copy_error(result->error, sizeof(result->error),
+                                   fetch_scheduler_last_error(scheduler));
+        return false;
+    }
     return fetch_scheduler_wait_enqueued(scheduler, id, result);
 }
 

@@ -50,6 +50,17 @@ if(PSP_NO_FETCH_TRACE)
     check_absent_symbol(trace_replay_response_with_scratch)
 endif()
 
+# Validation-only boot work (the trace-replay entropy pre-seed) must not
+# reach a shipping image through a hook that stopped being a no-op.
+if(NOT PSP_VALIDATION_LOG)
+    check_absent_symbol(psp_validation_entropy_preseed)
+    # The raw entropy-sample capture (src/psp_entropy_capture.h).
+    check_absent_symbol(psp_validation_entropy_capture_arm)
+    check_absent_symbol(psp_entropy_capture_run)
+    check_absent_symbol(psp_entropy_capture_set_sink)
+    check_absent_symbol(psp_entropy_capture_copy "[Bb]")
+endif()
+
 function(hot_symbol_size symbol out)
     string(REGEX MATCHALL
         "[0-9A-Fa-f]+[ \t]+[0-9A-Fa-f]+[ \t]+[Tt][ \t]+${symbol}(\\.[^ \t\r\n]+)?([\r\n]|$)"

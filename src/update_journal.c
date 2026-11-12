@@ -161,3 +161,70 @@ bool tilefinch_update_journal_store(
     journal_sync_directory(data_dir);
     return true;
 }
+
+static bool decline_paths(
+    const char *data_dir, char *path, char *temporary, size_t size)
+{
+    int written = snprintf(path, size, "%s/update-declined", data_dir);
+    int written_temporary =
+        snprintf(temporary, size, "%s/update-declined.tmp", data_dir);
+    return written > 0 && (size_t) written < size
+        && written_temporary > 0 && (size_t) written_temporary < size;
+}
+
+/* Losing this file only shows the recovery screen once more, so it takes
+   no device sync. A cut leaves no file, the old one, or a .tmp that the
+   next store truncates; a torn file fails the byte comparison. Both names
+   are in data_dir, so the rename never crosses a directory. */
+bool tilefinch_update_decline_store(
+    const char *data_dir, const TilefinchUpdateState *state,
+    TilefinchUpdateFaultHook fault, void *fault_opaque)
+{
+    uint8_t encoded[TILEFINCH_UPDATE_STATE_BYTES];
+    char path[768], temporary[768];
+    if (data_dir == NULL || state == NULL
+        || state->trial != TILEFINCH_UPDATE_TRIAL_STARTED
+        || tilefinch_update_state_encode(state, encoded) != TILEFINCH_UPDATE_OK
+        || !decline_paths(data_dir, path, temporary, sizeof(path)))
+        return false;
+    if (journal_fault(fault, fault_opaque, "before-decline-open"))
+        return false;
+    FILE *file = fopen(temporary, "wb");
+    if (file == NULL) return false;
+    bool ok = !journal_fault(fault, fault_opaque, "before-decline-write")
+        && fwrite(encoded, 1, sizeof(encoded), file) == sizeof(encoded)
+        && fflush(file) == 0;
+    if (fclose(file) != 0) ok = false;
+    if (!ok
+        || journal_fault(fault, fault_opaque, "before-decline-remove")
+        || (remove(path) != 0 && errno != ENOENT)
+        || journal_fault(fault, fault_opaque, "before-decline-rename")
+        || rename(temporary, path) != 0) {
+        remove(temporary);
+        return false;
+    }
+    return true;
+}
+
+bool tilefinch_update_decline_recorded(
+    const char *data_dir, const TilefinchUpdateState *state)
+{
+    uint8_t expected[TILEFINCH_UPDATE_STATE_BYTES];
+    uint8_t recorded[TILEFINCH_UPDATE_STATE_BYTES];
+    char path[768], temporary[768];
+    return data_dir != NULL && state != NULL
+        && state->trial == TILEFINCH_UPDATE_TRIAL_STARTED
+        && tilefinch_update_state_encode(state, expected) == TILEFINCH_UPDATE_OK
+        && decline_paths(data_dir, path, temporary, sizeof(path))
+        && journal_read(path, recorded) == sizeof(recorded)
+        && memcmp(expected, recorded, sizeof(expected)) == 0;
+}
+
+void tilefinch_update_decline_clear(const char *data_dir)
+{
+    char path[768], temporary[768];
+    if (data_dir == NULL
+        || !decline_paths(data_dir, path, temporary, sizeof(path))) return;
+    (void) remove(path);
+    (void) remove(temporary);
+}

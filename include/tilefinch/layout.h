@@ -17,6 +17,8 @@
 #define LAYOUT_VISUAL_PRIORITY_LIMIT 128
 #define LAYOUT_GENERATED_TEXT_LIMIT 4096
 #define LAYOUT_STICKY_RANGE_LIMIT 64u
+/* Table entries summarized by one LayoutRunBounds value. */
+#define LAYOUT_BOUND_RUN 64u
 #define LAYOUT_FIXED_RANGE_LIMIT 64u
 #define LAYOUT_COMMAND_FIXED UINT8_C(1)
 #define LAYOUT_COMMAND_OVERFLOW UINT8_C(2)
@@ -269,9 +271,14 @@ static inline void draw_command_set_text_scale(DrawCommand *command, int scale)
 /* Sparse visual-order data exists only for commands in paragraphs that need
    bidi analysis. DrawCommand keeps logical UTF-8 and its stable PSP size;
    these glyphs supply shaped codepoints and exact visual positions to paint,
-   hit testing, and find geometry without duplicating ordinary LTR text. */
-#define LAYOUT_BIDI_GLYPH_LIMIT 4096u
-#define LAYOUT_BIDI_COMMAND_LIMIT 1024u
+   hit testing, and find geometry without duplicating ordinary LTR text.
+   Each line's share is bounded by its paragraph's analysis limits
+   (TEXT_BIDI_CODEPOINT_LIMIT glyphs, LAYOUT_BIDI_FLOW_COMMAND_LIMIT
+   commands); these document totals (1 MiB and 192 KiB on the PSP at most,
+   grown under the Budget as right-to-left text is laid out) only stop
+   hostile input, not a long article. */
+#define LAYOUT_BIDI_GLYPH_LIMIT 65536u
+#define LAYOUT_BIDI_COMMAND_LIMIT 16384u
 typedef struct {
     uint32_t codepoint;
     int32_t x_fixed;
@@ -1181,6 +1188,16 @@ typedef struct {
     uint64_t flex_minimum_requests;
     uint64_t float_band_queries;
     uint64_t float_exclusion_probes;
+    /* Boxes, links and controls examined while shifting vertically aligned
+       table cell contents; proportional to the shifted cells' content. */
+    uint64_t table_cell_shift_visits;
+    /* Node boxes, links and stacking contexts examined while fixing up
+       indices after a command insertion (border strokes and other
+       decorations inserted ahead of a box's content). */
+    uint64_t command_insert_visits;
+    /* List children stepped over while numbering ordered-list markers;
+       proportional to the lists' children, not to items times position. */
+    uint64_t list_marker_steps;
     uint64_t coordinate_clamps;
     uint64_t coordinate_containments;
     uint64_t bidi_paragraphs;
@@ -1218,6 +1235,19 @@ _Static_assert(sizeof(LayoutNodeBox) == 68,
 _Static_assert(sizeof(LayoutNodeBox) == 72,
                "64-bit LayoutNodeBox host layout changed");
 #endif
+
+/*
+ * Build-only summary of a table that holds draw-command indices: for each
+ * run of LAYOUT_BOUND_RUN entries, an upper bound of the largest index any
+ * entry of the run holds. A command insertion examines only the runs whose
+ * bound reaches the insertion point. Lost after a refused
+ * growth and at compaction; insertion then examines every entry.
+ */
+typedef struct LayoutRunBounds {
+    uint32_t *bounds;
+    size_t capacity;
+    bool lost;
+} LayoutRunBounds;
 
 typedef struct LayoutDocument {
     Budget *budget;
@@ -1301,6 +1331,11 @@ typedef struct LayoutDocument {
     LayoutNodeBox *node_boxes;
     size_t node_box_count;
     size_t node_box_capacity;
+    /* Build-only bounds of the command indices held by node boxes (the
+       four command fields) and by links (a transient command index), so a
+       command insertion visits only the entries it can move. */
+    LayoutRunBounds node_box_command_bounds;
+    LayoutRunBounds link_command_bounds;
     /* Optional, bounded used grid tracks; no per-node/style expansion. */
     LayoutGridColumns *grid_columns;
     size_t grid_column_count;
@@ -1376,6 +1411,10 @@ typedef struct LayoutDocument {
     /* Bumped whenever an overflow box's scroll offset changes after the
        build, so per-frame consumers can skip unchanged scroll state. */
     uint32_t scroll_generation;
+    /* How far overflow boxes have scrolled since the build, in CSS pixels
+       summed over both axes (wraps; compare by subtraction), so a consumer
+       can wait for a given distance rather than react to every step. */
+    uint32_t scroll_travel;
 } LayoutDocument;
 
 bool layout_build(LayoutDocument *layout, Budget *budget,
@@ -1494,6 +1533,20 @@ void layout_reuse_cache_note_stylesheet_appended(
     LayoutReuseCache *cache, const Stylesheet *sheet, const uint16_t *remap,
     size_t old_count, const uint32_t *appended, size_t appended_count,
     bool lists_valid);
+/* layout_reuse_cache_note_stylesheet_appended that keeps the retained
+   computed styles: for a change whose rules can reach only known subtrees.
+   The caller must then call layout_reuse_cache_drop_styles_within for
+   them (or for the whole cache) before the next style resolution. */
+void layout_reuse_cache_note_stylesheet_appended_keeping_styles(
+    LayoutReuseCache *cache, const Stylesheet *sheet, const uint16_t *remap,
+    size_t old_count, const uint32_t *appended, size_t appended_count,
+    bool lists_valid);
+/* Discards the retained computed styles of every node in the subtrees of
+   `roots` (`count` of them), or of every node when `roots` is NULL; the
+   retained matched-rule lists stay. */
+void layout_reuse_cache_drop_styles_within(LayoutReuseCache *cache,
+                                           lxb_dom_node_t *const *roots,
+                                           size_t count);
 /* Attach the cache's retained matched-rule table to `sheet` for the caller's
    own style resolutions (pseudo-element styles resolved outside
    layout_reuse_cache_resolve_style); returns the previous attachment. */
@@ -1698,6 +1751,12 @@ size_t layout_rebind_image_resources(LayoutDocument *layout,
                                      uintptr_t previous_base,
                                      size_t previous_count,
                                      const ImageResources *images);
+/* The same for images_evict_farthest, which keeps the table's allocation but
+   renumbers its survivors. `remap` has `previous_count` entries. */
+size_t layout_remap_image_resources(LayoutDocument *layout,
+                                    const uint8_t *remap,
+                                    size_t previous_count,
+                                    const ImageResources *images);
 /* Rebinds an unchanged stylesheet after transactional struct ownership
    moves. Content rebuilds must use the ordinary invalidation path. */
 void layout_reuse_cache_rebind_stylesheet(
@@ -1727,6 +1786,7 @@ const LayoutNodeBox *layout_box_for_node(const LayoutDocument *layout,
 /* A layout's element boxes lent to image loading (images_set_layout_boxes):
    a view of a live layout, or the box array taken from one about to be
    released (a full rebuild releases its layout before it loads images). */
+#define LAYOUT_IMAGE_BOXES_FLOATING_SPANS 8
 struct ImageLayoutBoxes {
     const LayoutDocument *layout;
     LayoutNodeBox *taken;
@@ -1739,6 +1799,22 @@ struct ImageLayoutBoxes {
        with no known box keeps its encoded bytes until then instead of
        decoding at its source size. */
     bool decode_after_layout;
+    /* Where the reader is when the boxes are of a live page (layout
+       coordinates): a large SVG background whose every box is shown more
+       than reader_near beyond [reader_top, reader_bottom) is not
+       rasterized by this load (layout_image_box_far). */
+    bool reader_known;
+    int reader_top;
+    int reader_bottom;
+    int reader_near;
+    /* Command spans of the viewport-fixed and sticky layers, kept with the
+       boxes when their layout is released (past the last slot, the rest
+       widen it), so such a box is never taken for a far one. */
+    struct {
+        size_t start;
+        size_t end;
+    } floating[LAYOUT_IMAGE_BOXES_FLOATING_SPANS];
+    size_t floating_count;
 };
 void layout_lend_image_boxes(const LayoutDocument *layout,
                              ImageLayoutBoxes *boxes);
@@ -1753,6 +1829,13 @@ void layout_release_image_boxes(ImageLayoutBoxes *boxes);
 bool layout_image_box_size(const ImageLayoutBoxes *boxes,
                            const lxb_dom_node_t *node, int *width,
                            int *height);
+/* Whether the lent boxes know the reader and `node` has a box lying more
+   than reader_near beyond the reader's viewport where it is shown: moved
+   by the scroll containers around it, and only what their clips can show
+   (widened by reader_near), so a box scrolled out of a scroller beside the
+   reader is far and one a scroller shows is near. */
+bool layout_image_box_far(const ImageLayoutBoxes *boxes,
+                          const lxb_dom_node_t *node);
 /* The device-pixel raster that paints a single-layer CSS background of
    source_width x source_height in an area of area_width x area_height CSS
    pixels, under the style's background-size (cover, contain, explicit or

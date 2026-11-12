@@ -245,6 +245,11 @@ typedef struct {
     /* The process-wide frame-container insertion count when this document's
        parse began; see document_frames_impossible(). */
     uint64_t frame_insertions_at_parse;
+    /* Advances when document.write() may have inserted nodes: before each
+       script a write closes and when a write() returns. A realm's DOM
+       caches (its DOM version) follow it, since a script's own write()
+       changes the tree under the caches it filled. */
+    uint64_t parser_writes;
 } PocDocument;
 
 static inline bool document_is_declared_video_card(
@@ -288,9 +293,26 @@ typedef struct {
     int scale_denominator;
 } MobileViewport;
 
+/* Chromium's kCMaxWriteRecursionDepth: a write() nested deeper is
+   ignored. */
+#define DOCUMENT_PARSER_WRITE_DEPTH_LIMIT 21u
+/* Written input that waits behind a pending parsing-blocking script. */
+#define DOCUMENT_PARSER_WRITE_PENDING_LIMIT (256u * 1024u)
+
 typedef bool (*DocumentElementClosedCallback)(void *opaque,
                                               PocDocument *document,
                                               lxb_dom_node_t *element);
+
+/* Asked while an inline script's text streams in: whether a script of
+   `bytes` text could still be admitted. False drops the text (it is
+   recorded as truncated, as the inline-script limit does), so a script
+   that cannot run is never buffered. `may_collect` is true while the
+   callback may still spend this script's one garbage collection; it is
+   cleared when the callback spends it. */
+typedef bool (*DocumentInlineScriptAdmitCallback)(void *opaque,
+                                                  lxb_dom_node_t *script,
+                                                  size_t bytes,
+                                                  bool *may_collect);
 
 /* A parser transaction has a distinct DOM allocation owner until
    document_parser_finish transfers the completed document to its caller.
@@ -310,6 +332,10 @@ typedef struct {
     void *original_token_context;
     DocumentElementClosedCallback element_closed;
     void *element_closed_opaque;
+    DocumentInlineScriptAdmitCallback inline_script_admit;
+    void *inline_script_admit_opaque;
+    /* The script whose one admission collection has been spent. */
+    const lxb_dom_node_t *inline_admit_collected_script;
     size_t retained_json_script_bytes;
     size_t maximum_json_script_bytes;
     size_t retained_current_script_bytes;
@@ -336,8 +362,63 @@ typedef struct {
     size_t encoding_skip;
     unsigned char *prescan_bytes;
     size_t prescan_length;
+    /* Script execution and document.write() (HTML 13.2.6 "script" end
+       tag, 8.4.3 document.write). A closed <script> stops Lexbor right
+       after its end tag (`closed_script`, `stop_at`, `resume_state`), so
+       the closed callback runs between Lexbor calls and whatever the
+       script writes is fed to Lexbor at that point of the input: the
+       insertion point. `executing` lists the scripts whose callback is
+       running, innermost last. A parser-blocking external script closed
+       inside a write() is the pending parsing-blocking script
+       (`blocking_script`): it runs once no write() is active, and until
+       then written input waits in `pending_input`, `insertion` bytes of
+       it before the insertion point. */
+    lxb_dom_node_t *closed_script;
+    const unsigned char *stop_at;
+    lxb_html_tokenizer_state_f resume_state;
+    lxb_dom_node_t *executing[DOCUMENT_PARSER_WRITE_DEPTH_LIMIT + 2];
+    size_t executing_count;
+    lxb_dom_node_t *blocking_script;
+    char *pending_input;
+    size_t pending_length;
+    size_t pending_capacity;
+    /* Waiting input taken out for parsing, counted against the limit. */
+    size_t pending_reserved;
+    size_t insertion;
+    unsigned write_depth;
+    bool write_too_deep;
+    bool draining;
 } DocumentParser;
 
+typedef enum {
+    /* No parser-executed script is running: write() has no insertion
+       point here and takes its other path. */
+    DOCUMENT_WRITE_NO_INSERTION_POINT = 0,
+    /* Inserted at the insertion point (and parsed up to it, or kept
+       behind a pending parsing-blocking script). */
+    DOCUMENT_WRITE_INSERTED,
+    /* Dropped as Chromium does: the write is nested too deeply. */
+    DOCUMENT_WRITE_IGNORED,
+    /* Input that has to wait would pass DOCUMENT_PARSER_WRITE_PENDING_LIMIT
+       or the Budget refused its memory: that input is dropped. */
+    DOCUMENT_WRITE_REFUSED,
+    /* The parser failed (allocation, or a callback refused the page). */
+    DOCUMENT_WRITE_FAILED
+} DocumentWriteOutcome;
+
+/* The script element whose closed callback is running on `document`'s
+   active parser, innermost first, or NULL. */
+lxb_dom_node_t *document_parser_executing_script(PocDocument *document);
+/* document.write() of UTF-8 `markup` while `document`'s active parser runs
+   a script: inserts it at the insertion point and parses it there, running
+   the inline scripts it closes before returning. Nested writes past
+   DOCUMENT_PARSER_WRITE_DEPTH_LIMIT are ignored, as in Chromium. */
+DocumentWriteOutcome document_parser_write(PocDocument *document,
+                                           const char *markup,
+                                           size_t length);
+
+/* The language-pack scripts in text that is not part of a document. */
+uint16_t document_text_glyph_scripts(const char *text, size_t length);
 bool document_parser_begin(DocumentParser *parser, Budget *budget);
 /* Select the HTML parsing model before feeding the first byte.  In
    particular, enabled scripting makes <noscript> raw text as required by the
@@ -367,6 +448,12 @@ bool document_parser_feed(DocumentParser *parser, const char *data,
                           size_t length);
 void document_parser_set_element_closed_callback(
     DocumentParser *parser, DocumentElementClosedCallback callback,
+    void *opaque);
+/* Installs the streaming inline-script admission check (NULL removes it).
+   It is asked only for executable script text the inline-script limit has
+   not already dropped. */
+void document_parser_set_inline_script_admit_callback(
+    DocumentParser *parser, DocumentInlineScriptAdmitCallback callback,
     void *opaque);
 /* Deliver EOF to the tree builder without finalizing, so a caller can run a
    last parser mutation checkpoint over the insertions EOF performs while the
@@ -428,10 +515,10 @@ bool document_nonce_clone_subtree(lxb_dom_node_t *source,
 #define DOCUMENT_ADOPTED_SHEETS_PER_ROOT 16u
 /* Lit gives every component instance's shadow root its class's sheets, so
    a component page needs one list per live root (MDN: ~100 when its
-   budget admits that many roots, DOM_BRIDGE_SHADOW_ROOT_LIMIT). Kept
-   within uint8_t for the sorted index; the registry exists only on pages
-   that adopt sheets. */
-#define DOCUMENT_ADOPTION_ROOT_LIMIT 256u
+   budget admits that many roots; the Internet Archive's search results
+   ~385), bounded by DOM_BRIDGE_SHADOW_ROOT_LIMIT. The sorted index is
+   uint16_t; the registry exists only on pages that adopt sheets. */
+#define DOCUMENT_ADOPTION_ROOT_LIMIT 512u
 #define DOCUMENT_CONSTRUCTED_SHEET_LIMIT 128u
 #define DOCUMENT_CONSTRUCTED_TEXT_LIMIT (1024u * 1024u)
 /* CSSOM override entries: at most one per script DOM handle, so this is
@@ -557,6 +644,22 @@ bool document_constructed_sheet_cache_store(const PocDocument *document,
 bool document_constructed_sheet_note_parse(const PocDocument *document,
                                            const lxb_dom_node_t *sheet,
                                            uint32_t revision);
+/* Records whether a parse of `sheet`'s text at `revision` declared
+   @keyframes (Stylesheet.has_motion_keyframes). A text change forgets it. */
+void document_constructed_sheet_note_keyframes(const PocDocument *document,
+                                               const lxb_dom_node_t *sheet,
+                                               uint32_t revision,
+                                               bool keyframes);
+/* What the last parse of `sheet`'s current text recorded: 1 when it
+   declared @keyframes, 0 when not, -1 when no parse of this text was
+   recorded (or the sheet is not registered). */
+int document_constructed_sheet_keyframes(const PocDocument *document,
+                                         const lxb_dom_node_t *sheet);
+/* The text revision of a registered constructed sheet; false when `sheet`
+   is not registered. */
+bool document_constructed_sheet_revision(const PocDocument *document,
+                                         const lxb_dom_node_t *sheet,
+                                         uint32_t *revision);
 size_t document_constructed_sheet_cache_bytes(const PocDocument *document);
 /* Registered constructed sheets (diagnostics and tests). */
 size_t document_constructed_sheet_count(const PocDocument *document);
@@ -707,6 +810,12 @@ void document_style_attribute_set_cssom_authorized(lxb_dom_node_t *node,
    slot does not render because it or a shadow ancestor is `hidden`) is
    also resolved display:none, so no path gives it a box. */
 bool document_mark_shadow_carrier(lxb_dom_node_t *node);
+#if !defined(__PSP__)
+/* Children visited looking for carriers since the process started. */
+size_t document_test_shadow_scan_visits(void);
+/* Attribute lookups that went through lexbor's name table. */
+size_t document_test_attribute_table_lookups(void);
+#endif
 bool document_node_is_shadow_carrier(const lxb_dom_node_t *node);
 lxb_dom_node_t *document_shadow_carrier_of_host(const lxb_dom_node_t *host);
 /* The nearest carrier at or above `node` (bounded walk), or NULL. */

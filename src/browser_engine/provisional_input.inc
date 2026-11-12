@@ -24,7 +24,10 @@ bool browser_engine_provisional_viewport(
             ? engine->provisional_viewport_height
             : engine->config.device.framebuffer_height,
         .complete = engine->provisional_view != BROWSER_PREVIEW_VIEW_FILLING,
-        .ready = true
+        .ready = true,
+        .reading_hint = live
+            && engine->navigation_work.metrics.reading_hint_shown_us != 0
+            && engine->navigation_work.metrics.reading_hint_cleared_us == 0
     };
     return true;
 }
@@ -52,6 +55,10 @@ bool browser_engine_scroll_provisional_by(BrowserEngine *engine, int delta)
     engine->navigation.provisional_reader_y = y;
     engine->navigation_work.metrics.provisional_scrolls++;
     engine->navigation_work.metrics.provisional_scroll_y = y;
+    /* The reader is paging: whatever the next screen holds, the hint has
+       done its work. */
+    browser_engine_end_reading_hint(
+        engine, browser_engine_navigation_now(&engine->navigation_work));
     (void) browser_engine_compose_provisional(engine, 0);
     return true;
 }

@@ -29,6 +29,16 @@ int main(void)
     const PspInputLoopState in_menu = PSP_INPUT_LOOP_IN_MENU;
     const PspInputLoopState behind = PSP_INPUT_LOOP_BEHIND;
 
+    /* Only the leading page presses can be shown ahead of the turn. */
+    const uint32_t down = PSP_UI_BUTTON_PAGE_DOWN, up = PSP_UI_BUTTON_PAGE_UP;
+    const uint32_t queued[] = { down, down, up, PSP_UI_BUTTON_CONFIRM, down };
+    CHECK(psp_input_queued_page_presses(queued, 0) == 0);
+    CHECK(psp_input_queued_page_presses(queued, 2) == 2);
+    CHECK(psp_input_queued_page_presses(queued, 3) == 1);
+    CHECK(psp_input_queued_page_presses(queued, 5) == 1);
+    const uint32_t focus_first[] = { PSP_UI_BUTTON_CONFIRM, down };
+    CHECK(psp_input_queued_page_presses(focus_first, 2) == 0);
+
     /* A captured game's buttons must never become raster cancellation,
        page scrolling, optional-work preemption, or a BUSY notification. */
     PspInputRouteContext game = {

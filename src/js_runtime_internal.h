@@ -9,6 +9,7 @@
 #include "diagnostic_trace.h"
 #include "tilefinch_test_faults.h"
 
+#include "tilefinch/page_dialog.h"
 #include "tilefinch/js_runtime.h"
 #ifndef __PSP__
 /* Numeric ownership observation for host tests, never a page hook. */
@@ -176,7 +177,7 @@ JSValue js_dom_parse_color(JSContext *context,
 #define SCRIPT_REALM_MAXIMUM_SCRIPTS 256u
 #define SCRIPT_REALM_MAXIMUM_FILE_BYTES (8u * 1024u * 1024u)
 #define SCRIPT_REALM_MAXIMUM_TOTAL_BYTES (128u * 1024u * 1024u)
-#define SCRIPT_LAZY_BOOTSTRAP_FEATURE_COUNT 13u
+#define SCRIPT_LAZY_BOOTSTRAP_FEATURE_COUNT 16u
 /* A fully hydrated long article exceeds 4096 nodes several times
    over; a truncated walk silently drops querySelectorAll matches (the
    mobile section transform only saw the first few sections).
@@ -220,19 +221,30 @@ typedef struct {
    it grow to DOM_BRIDGE_NODE_LIMIT_MAX (see DomBridge.node_capacity). */
 #define DOM_BRIDGE_NODE_LIMIT SCRIPT_DOM_HANDLE_SLOT_CAPACITY
 #define DOM_BRIDGE_NODE_LIMIT_MAX SCRIPT_DOM_HANDLE_SLOT_CAPACITY_MAX
+#define DOM_BRIDGE_WRAPPER_PLAIN_KEYS 6
 /* Live shadow roots per realm: the handle table's capacity. How many a page
    may attach scales with its page budget (js_dom_register_shadow_root):
    component sites nest them (MDN's Lit reference page attaches ~70), and
    every root and the component behind it costs memory. Native members now
    share one prototype instead of a full property/shape copy per root; the
    unchanged 32 MiB page budget can admit the table's smaller representation.
-   The 64-root minimum and the table's 256-root hard bound stay unchanged;
-   actual allocations still require the shared page Budget. shadow.js
-   mirrors this bound as ROOT_LIMIT for its identity table. */
-#define DOM_BRIDGE_SHADOW_ROOT_LIMIT 256u
+   A shared-prototype root costs about 8 KiB beside its host (host
+   fixture: 200 one-sheet components cost 11 KiB each, 200 plain subtrees
+   3.3 KiB), so 80 KiB of page budget per root leaves the component behind
+   it ample room: 32 MiB admits 409, enough for the Internet Archive's
+   50-result buffer (Chrome attaches ~385 roots). Actual allocations still
+   require the shared page Budget. shadow.js mirrors the hard bound as
+   ROOT_LIMIT for its identity table, as does DOCUMENT_ADOPTION_ROOT_LIMIT
+   for the adopted-sheet registry. */
+#define DOM_BRIDGE_SHADOW_ROOT_LIMIT 512u
+/* Tainted canvases a realm can hold; past it a cross-origin draw is refused. */
+#define DOM_BRIDGE_CANVAS_TAINT_LIMIT 64u
+/* Native stores of ImageBitmaps that are not origin-clean; canvas.js keeps
+   at most this many bitmaps alive. */
+#define DOM_BRIDGE_CANVAS_BITMAP_LIMIT 8u
 #define DOM_BRIDGE_SHADOW_ROOT_BASE 64u
 #define DOM_BRIDGE_SHADOW_ROOT_BUDGET_BYTES (512u * 1024u)
-#define DOM_BRIDGE_SHARED_SHADOW_ROOT_BUDGET_BYTES (128u * 1024u)
+#define DOM_BRIDGE_SHARED_SHADOW_ROOT_BUDGET_BYTES (80u * 1024u)
 #define BRIDGE_NODE_NATIVE_PIN 0x01u
 #define BRIDGE_NODE_LIVE_WRAPPER 0x02u
 #define BRIDGE_NODE_PENDING_RETIRE_NOTIFY 0x04u
@@ -294,6 +306,32 @@ typedef struct {
     size_t response_bound;
 } ScriptAsyncFetch;
 
+/* A realm's CORS preflights: one in flight on the realm scheduler, or a
+   decided result kept for its owner to claim (and an allowed one reused
+   until its Access-Control-Max-Age runs out). The key is Budget-owned
+   (bridge->budget): credentials mode, method, origin, sorted header names
+   and URL, each NUL-terminated, compared whole. */
+#define SCRIPT_CORS_PREFLIGHT_SLOTS 4u
+typedef enum {
+    SCRIPT_CORS_PREFLIGHT_FREE = 0,
+    SCRIPT_CORS_PREFLIGHT_PENDING,
+    SCRIPT_CORS_PREFLIGHT_ALLOWED,
+    SCRIPT_CORS_PREFLIGHT_REFUSED
+} ScriptCorsPreflightState;
+
+typedef struct {
+    char *key;
+    size_t key_length;
+    /* The OPTIONS request while PENDING. */
+    uint64_t request_id;
+    /* A decided entry is dropped at this time. */
+    uint64_t expires_us;
+    uint32_t last_use;
+    uint8_t state;
+    /* Access-Control-Max-Age: 0 allowed only the request that asked. */
+    bool single_use;
+} ScriptCorsPreflightEntry;
+
 #define SCRIPT_EVENT_SOURCE_LIMIT 2u
 #define SCRIPT_EVENT_SOURCE_PENDING_BYTES (64u * 1024u)
 
@@ -337,6 +375,9 @@ typedef struct {
     bool html;
     bool force_async;
     bool already_started;
+    /* Created by innerHTML-style fragment parsing, not the document's own
+       parser: never registers an import map. */
+    bool fragment_parsed;
 #if TILEFINCH_SCRIPT_CLONE_CENSUS
     /* A clone of a started script not yet seen connected (lab census). */
     bool census_started_clone;
@@ -368,6 +409,11 @@ typedef struct {
     ScriptResourceTiming resource_timing;
     /* Budget-owned minimized MIME type referenced by resource_timing. */
     char *resource_timing_content_type;
+    /* Budget-owned copy of the element's integrity attribute, taken when
+       the script was prepared: SRI and the CSP integrity grant both use
+       it, so a later attribute change cannot split the two decisions. */
+    char *integrity;
+    size_t integrity_length;
     TilefinchRequestMode mode;
     TilefinchCredentialsMode credentials;
     uint8_t incoming_referrer_policy;
@@ -447,6 +493,41 @@ typedef struct {
 #endif
 } DomEventState;
 
+/* getElementById answers, found or not, for the bridge's document. They
+   hold while neither the structure version (script child-list, text and
+   id writes; see dom_structure_version) nor the host style generation
+   (parser and other native writes, through Lexbor's callbacks) moves.
+   Script class and style writes move neither, so lookups between them
+   stay answered. Inline in the budget-owned runtime: a fixed 8 entries. */
+#define DOM_ID_MEMO_ENTRIES 8u
+#define DOM_ID_MEMO_KEY_BYTES 40u
+typedef struct {
+    lxb_dom_node_t *node; /* NULL: no element has the id. */
+    uint8_t length;       /* 0: the entry is unused. */
+    char key[DOM_ID_MEMO_KEY_BYTES];
+} DomIdMemoEntry;
+
+typedef struct {
+    uint64_t structure_version;
+    uint64_t host_generation;
+    uint8_t next;
+    DomIdMemoEntry entries[DOM_ID_MEMO_ENTRIES];
+} DomIdMemo;
+
+/* The pixels of a tainted canvas, or of an ImageBitmap that is not
+   origin-clean. They live only here, never in a script-visible buffer:
+   script names a canvas's store by the element's handle and a bitmap's by
+   its negative id. `pixels` is width * height RGBA bytes allocated from the
+   realm's JavaScript heap (the limit a Uint8ClampedArray of the same size is
+   charged to), or NULL while there is no surface. */
+typedef struct {
+    lxb_dom_node_t *node; /* the canvas element; NULL for a bitmap store */
+    int32_t bitmap_id;    /* > 0 for a bitmap store */
+    int32_t width;
+    int32_t height;
+    uint8_t *pixels;
+} DomBridgeCanvasStore;
+
 typedef struct DomBridge {
     PocDocument *document;
     Budget *budget;
@@ -476,6 +557,8 @@ typedef struct DomBridge {
        http-equiv/content changed): navigation looks for a declarative
        refresh again (script_runtime_take_refresh_meta_mutation). */
     bool refresh_meta_mutated;
+    /* The write being journaled is ScriptMutationRecord.keeps_images. */
+    bool mutation_keeps_images;
     /* Native URL publication precedes advisory same-document callbacks.  A
        generation lets the Location facade detect and repair a callback/OOM
        split without allocating a URL string on ordinary property reads. */
@@ -498,11 +581,19 @@ typedef struct DomBridge {
     unsigned char *node_retention_flags;
     /* NULL slots whose generation can still advance, one bit per slot. */
     uint32_t *node_reusable_bits;
+    /* Slots whose wrapper one collection is holding; clear between
+       collections (js_rt_bridge_collection_holds). */
+    uint32_t *node_wrapper_held_bits;
+    size_t node_wrappers_held;
+    /* A wrapper's own keys that a new wrapper would have again
+       (bridge_note_plain_wrapper_keys). */
+    JSAtom wrapper_plain_keys[DOM_BRIDGE_WRAPPER_PLAIN_KEYS];
+    int wrapper_plain_key_count;
     size_t node_capacity;
     size_t node_capacity_limit;
-    /* Per handle slot, the WeakRef the script wrapper cache holds for the
-       live wrapper (a strong reference to the WeakRef only), so native
-       getters can return an existing wrapper. Budget-allocated on first
+    /* Per handle slot, a weak target (JS_NewWeakTarget) of the live
+       wrapper: the wrapper cache, which native getters and the bootstrap
+       (__tilefinchNodeWrapper) answer from. Budget-allocated on first
        use; NULL when unavailable (the getters then ask script to wrap). */
     JSValue *wrapper_refs;
     /* Per handle slot, the adopted owner document's tag: 0 unknown, 1 the
@@ -648,8 +739,15 @@ typedef struct DomBridge {
     uint64_t dom_version;
     /* Advances with dom_version except for attribute, inline-style and
        canvas changes that cannot move a form control between owners
-       (anything but id, form, type or an internal state attribute). */
+       (anything but id, form, name, type or an internal state
+       attribute). */
     uint64_t dom_structure_version;
+    /* The document's parser_writes the two versions above last took in
+       (js_rt_bridge_note_parser_writes). */
+    uint64_t parser_writes_seen;
+    /* The same for the layout (js_rt_bridge_note_parser_writes_for_layout). */
+    uint64_t parser_writes_laid_out;
+    DomIdMemo id_memo;
     /* Native setAttribute calls: total, those writing the value already
        present, and time spent in the native setter. */
     size_t attribute_writes;
@@ -659,6 +757,20 @@ typedef struct DomBridge {
        still to handle without a collection after a futile one (cleared at
        each entry into JavaScript), and the next such backoff. */
     bool node_reclaim_active;
+    /* Guarded DOM natives (JS_RT_GUARDED_NATIVE) on the stack. A native
+       keeps the node pointers it resolved across any page code it calls
+       (argument coercion, an accessor, an inline script), so while one
+       runs a discard retires its subtree's handles at once but leaves the
+       destroy to the outermost native's return: deferred_discards holds
+       those roots (Budget-grown up to JS_RT_DEFERRED_DISCARD_LIMIT). A
+       root the list cannot take stays undestroyed until teardown and is
+       counted in deferred_discard_refusals. */
+    bool deferred_draining;
+    uint32_t native_depth;
+    size_t deferred_discard_count;
+    size_t deferred_discard_capacity;
+    size_t deferred_discard_refusals;
+    lxb_dom_node_t **deferred_discards;
     uint16_t node_reclaim_gc_skip;
     uint16_t node_reclaim_gc_backoff;
     uint16_t node_wrapper_sweep_cursor;
@@ -711,6 +823,7 @@ typedef struct DomBridge {
     int64_t media_node_handle;
     double media_value;
     char *media_source;
+    char media_title[SCRIPT_MEDIA_TITLE_CAPACITY];
     int64_t fullscreen_node_handle;
     /* Page controls entry notice (navigator.tilefinch.requestPageControls
        {notice: "once"}): the page's pending request to skip a repeat, and
@@ -720,6 +833,9 @@ typedef struct DomBridge {
     bool user_activation_active;
     bool user_activation_has_been_active;
     uint64_t user_activation_expires_ms;
+    /* Advances with every trusted activation: a page dialog's gesture limit
+       restarts when it changes (page_dialogs.inc). */
+    uint32_t user_activation_generation;
     /* Popunder guard (docs/SECURITY_MODEL.md): a new window this document
        asked for during a user activation (Tilefinch opens none), kept while
        that activation is transient, and the hyperlink the activation
@@ -762,10 +878,18 @@ typedef struct DomBridge {
     FetchScheduler *fetch_scheduler;
     ScriptAsyncFetch async_fetches[8];
     size_t async_fetch_count;
+    ScriptCorsPreflightEntry cors_preflights[SCRIPT_CORS_PREFLIGHT_SLOTS];
+    uint32_t cors_preflight_uses;
+    /* Counts preflights that left PENDING; the JavaScript FIFO resubmits a
+       request parked on its preflight when this moves. */
+    uint32_t cors_preflight_decisions;
     ScriptEventSource event_sources[SCRIPT_EVENT_SOURCE_LIMIT];
     size_t event_source_count;
     ScriptWebSocket websockets[SCRIPT_WEBSOCKET_LIMIT];
     size_t websocket_count;
+    /* Slot js_rt_websockets_deliver tries first; it moves past the slot
+       that delivered so one busy socket cannot starve the other. */
+    size_t websocket_deliver_next;
     unsigned char *websocket_event_scratch;
     ScriptMultiplayer multiplayer;
     unsigned char *multiplayer_event_scratch;
@@ -773,6 +897,11 @@ typedef struct DomBridge {
     ScriptElementState script_elements[SCRIPT_DYNAMIC_NODE_LIMIT];
     size_t script_element_count;
     uint32_t next_script_element_identity;
+    /* A fragment-parsed (innerHTML) script found the state table full, so
+       it carries no "already started" state and cannot be told from a
+       parser-inserted one. The import map scan then trusts no stateless
+       script (js_module_loader.c). */
+    bool fragment_script_state_overflow;
     size_t dynamic_script_count;
     size_t dynamic_script_bytes;
     size_t script_quota_count;
@@ -811,6 +940,20 @@ typedef struct DomBridge {
     /* Descendant CSP grant of the script being evaluated (module roots and
        classic import() inherit it); zero outside a script element. */
     uint8_t current_script_csp_grant;
+    /* Canvas elements that have drawn pixels which are not origin-clean,
+       each with its native pixel store, and the stores of ImageBitmaps that
+       are not origin-clean. Natives that hand a canvas's pixels to script
+       refuse these, and the bootstrap's readback gates ask here, so no
+       script-visible field decides it. A taint is never cleared while the
+       element lives (HTML: resetting the bitmap keeps the flag); a
+       discarded subtree drops its entries and frees their stores
+       (js_rt_bridge_canvas_taints_retire_subtree). Budget-allocated on the
+       first taint, at most DOM_BRIDGE_CANVAS_TAINT_LIMIT canvases plus
+       DOM_BRIDGE_CANVAS_BITMAP_LIMIT bitmaps. */
+    DomBridgeCanvasStore *canvas_taints;
+    size_t canvas_taint_count;
+    size_t canvas_taint_capacity;
+    int32_t canvas_bitmap_next_id;
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     uint64_t webgl_native_total_us;
     size_t webgl_native_frames;
@@ -891,6 +1034,9 @@ typedef enum {
 typedef struct ScriptImageLoadState {
     long handle;
     uint64_t source_hash;
+    /* What script keeps reading while the table has made way for the image. */
+    int natural_width;
+    int natural_height;
     bool pending;
     bool delivered;
 } ScriptImageLoadState;
@@ -964,6 +1110,17 @@ struct ScriptRuntime {
     uint64_t geometry_font_generation;
     uint64_t geometry_container_generation;
     bool geometry_paint_stale;
+    /* The inputs and free budget of the geometry build the budget last
+       refused (script_runtime_flush_geometry_layout_reuse). */
+    bool geometry_refused;
+    uint64_t geometry_refused_content_generation;
+    uint64_t geometry_refused_style_generation;
+    uint64_t geometry_refused_sheet_generation;
+    uint64_t geometry_refused_font_generation;
+    uint64_t geometry_refused_container_generation;
+    int geometry_refused_css_width;
+    int geometry_refused_css_height;
+    size_t geometry_refused_room;
     ScriptDocumentScope document_scope;
     JSRuntime *runtime;
     JSContext *context;
@@ -989,6 +1146,11 @@ struct ScriptRuntime {
         /* Core context owns the permanent global; other intrinsics are lazy.
            0 core-only, 1 initializing, 2 ready, 3 failed/retired. */
         uint8_t intrinsic_state;
+        /* Eval runs under the policy of the frame whose eval was called, not
+           the caller's. A new realm inherits its parent's, as about:blank and
+           srcdoc do; committing a fetched document replaces it natively. */
+        bool dynamic_code_allowed;
+        long frame_handle;
     } frame_realms[SCRIPT_FRAME_REALM_LIMIT];
     /* Boot-window donation experiment (TILEFINCH_JS_BOOT_WINDOW_KB): the page
        heap opens at base_memory_limit plus the donated window; once the
@@ -1191,6 +1353,9 @@ struct ScriptRuntime {
     JSValue host_trusted_event;
     /* First resize only: do not charge every tiny realm for this code. */
     JSValue viewport_resize_dispatch;
+    /* CONTENT_BLOCKER_SHIM_* answers this realm already gave for refused
+       scripts (js_rt_answer_refused_script). */
+    unsigned refused_script_shims;
     JSValue host_callbacks[SCRIPT_HOST_CALLBACK_COUNT];
 #ifdef JS_RT_XHR_DIAGNOSTICS
     ScriptXHRDiagnostics *xhr_diagnostics;
@@ -1220,6 +1385,12 @@ struct ScriptRuntime {
     TilefinchGamepadState gamepad_state;
     bool gamepad_state_valid;
     bool page_visibility_desired;
+    /* window.alert/confirm/prompt (page_dialogs.inc). The top-level realm
+       owns its page load's policy; a child frame's realm shares the policy
+       of dialog_parent, the parent realm navigation names when the frame
+       may open dialogs at all (NULL refuses every dialog). */
+    PageDialogPolicy page_dialogs;
+    struct ScriptRuntime *dialog_parent;
     bool page_visibility_queue[2];
     uint8_t page_visibility_queue_head;
     uint8_t page_visibility_queue_count;
@@ -1357,6 +1528,61 @@ static inline bool js_rt_property_name_equal(const char *first,
     return true;
 }
 
+/* Fill a result object or array a native has just created. JS_SetProperty*
+   is an ordinary [[Set]]: an accessor a page put on Object.prototype (named
+   keys) or Array.prototype (indices) would run author code in the middle
+   of the native, while it still holds node, layout or image pointers.
+   Defining an own data property never consults the prototype chain. Both
+   consume `value`, as JS_SetProperty* does; -1 means an exception. */
+static inline int js_rt_define_field(JSContext *context, JSValueConst object,
+                                     const char *name, JSValue value)
+{
+    return JS_DefinePropertyValueStr(context, object, name, value,
+                                     JS_PROP_C_W_E);
+}
+
+static inline int js_rt_define_index(JSContext *context, JSValueConst array,
+                                     uint32_t index, JSValue value)
+{
+    return JS_DefinePropertyValueUint32(context, array, index, value,
+                                        JS_PROP_C_W_E);
+}
+
+/* The DOM-native guard (DomBridge.native_depth). A guarded native's body
+   is NAME_unguarded; NAME enters, runs it and leaves, and the outermost
+   leave destroys the subtrees discarded meanwhile. A plain C wrapper per
+   native keeps the engine's direct native call path. */
+#define JS_RT_DEFERRED_DISCARD_LIMIT 4096u
+void js_rt_bridge_drain_deferred_discards(JSContext *context,
+                                          DomBridge *bridge);
+static inline DomBridge *js_rt_native_enter(JSContext *context)
+{
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    if (bridge != NULL) bridge->native_depth++;
+    return bridge;
+}
+
+static inline void js_rt_native_leave(JSContext *context, DomBridge *bridge)
+{
+    if (bridge == NULL) return;
+    if (--bridge->native_depth == 0 && bridge->deferred_discard_count != 0)
+        js_rt_bridge_drain_deferred_discards(context, bridge);
+}
+
+/* `storage` is empty or static: JS_RT_GUARDED_NATIVE(, js_dom_x)(args). */
+#define JS_RT_GUARDED_NATIVE(storage, name)                                  \
+    static JSValue name##_unguarded(JSContext *, JSValueConst, int,          \
+                                    JSValueConst *);                         \
+    storage JSValue name(JSContext *context, JSValueConst this_value,        \
+                         int argc, JSValueConst *argv)                       \
+    {                                                                        \
+        DomBridge *guarded = js_rt_native_enter(context);                    \
+        JSValue value = name##_unguarded(context, this_value, argc, argv);   \
+        js_rt_native_leave(context, guarded);                                \
+        return value;                                                        \
+    }                                                                        \
+    static JSValue name##_unguarded
+
 /* Whether `scope` is `node` or one of its first 256 ancestors. Shared by
    the mutation journal's overflow roots and the computed-style ring's
    scoped invalidation. */
@@ -1384,6 +1610,7 @@ static inline void js_rt_bridge_notify_user_activation(DomBridge *bridge)
     uint64_t now_ms = js_rt_bridge_elapsed_ms(bridge);
     bridge->user_activation_active = true;
     bridge->user_activation_has_been_active = true;
+    bridge->user_activation_generation++;
     bridge->user_activation_expires_ms =
         now_ms > UINT64_MAX - SCRIPT_TRANSIENT_USER_ACTIVATION_MS
         ? UINT64_MAX : now_ms + SCRIPT_TRANSIENT_USER_ACTIVATION_MS;
@@ -1485,6 +1712,11 @@ ImageResources *js_rt_image_preload_resources(DomBridge *bridge);
 /* Before pinning js_rt_image_preload_resources(bridge)->items[index]. */
 void js_rt_image_preload_prepare_pin(DomBridge *bridge, size_t index);
 int js_rt_image_preload_status(DomBridge *bridge, const lxb_dom_node_t *node);
+/* Whether the page was told `node`'s current source loaded, or is about to be,
+   and the natural size it reported: an image's load outlives its table entry,
+   which viewport admission can remove and bring back. */
+bool js_rt_image_load_remembered(DomBridge *bridge, const lxb_dom_node_t *node,
+                                 int *natural_width, int *natural_height);
 /* Whether `node` is a detached image refused a load slot whose error event
    has been dispatched: broken until its source changes. */
 bool js_rt_image_preload_broken(DomBridge *bridge, const lxb_dom_node_t *node);
@@ -1575,10 +1807,24 @@ lxb_dom_node_t *js_rt_bridge_node_arg(JSContext *context,
 bool js_rt_network_error_is_timeout(const char *error);
 int js_rt_dynamic_prepare_subtree(JSContext *context,
                                   lxb_dom_node_t *root);
+/* After inserting the siblings first..last under parent: prepares the
+   scripts that insertion made ready (parent too, when it is a script).
+   first NULL means parent's whole subtree. */
+int js_rt_dynamic_prepare_insertion(JSContext *context,
+                                    lxb_dom_node_t *parent,
+                                    lxb_dom_node_t *first,
+                                    lxb_dom_node_t *last);
 
 /* js_fetch_cors.c entry points. */
 bool js_fetch_cors_install(JSContext *context, JSValue global);
 void js_rt_event_sources_destroy(DomBridge *bridge);
+/* Cancels in-flight CORS preflights and frees the realm's preflight keys;
+   before the realm scheduler is destroyed. */
+void js_rt_cors_preflights_destroy(DomBridge *bridge);
+/* Decides completed preflights, releasing their scheduler entries; once
+   per host turn, so one whose request was aborted does not hold its entry
+   until the realm's next request. */
+void js_rt_cors_preflights_settle(DomBridge *bridge);
 bool js_rt_event_sources_deliver(ScriptRuntime *runtime,
                                  size_t completion_budget,
                                  size_t *author_tasks);
@@ -1743,6 +1989,14 @@ void js_rt_script_element_states_purge_marked(
 void bridge_invalidate_node_slot(DomBridge *bridge, size_t slot);
 void bridge_release_native_node_pin(DomBridge *bridge, int64_t handle);
 void bridge_pin_node_slot(DomBridge *bridge, size_t slot);
+/* Takes document.write()'s insertions since the last call into the DOM
+   versions and the computed-style cache (js_dom_bindings.c); every read
+   that compares those calls it first. The _for_layout form, called by
+   style and geometry reads, also marks the layout dirty once per write, so
+   the read rebuilds it (and a sheet a written <style> or link changed):
+   only a script that reads layout after writing pays for it. */
+void js_rt_bridge_note_parser_writes(DomBridge *bridge);
+void js_rt_bridge_note_parser_writes_for_layout(DomBridge *bridge);
 bool js_rt_bridge_flush_synchronous_layout(DomBridge *bridge,
                                            lxb_dom_node_t *node);
 /* Script never observes a truncated layout (see bridge_state.inc). */
@@ -1761,6 +2015,25 @@ JSValue js_canvas_commit_surface(JSContext *context,
 JSValue js_canvas_image_source(JSContext *context,
                                JSValueConst this_value,
                                int argc, JSValueConst *argv);
+/* Bootstrap-only (installed only while canvas.js is evaluated, which
+   captures them): taint a canvas and move its pixels into its native store,
+   create or release an ImageBitmap store, the taint query, pattern fill,
+   and the PNG encoder's checksums. */
+JSValue js_canvas_native_surface(JSContext *context, JSValueConst this_value,
+                                 int argc, JSValueConst *argv);
+JSValue js_canvas_bitmap_surface(JSContext *context, JSValueConst this_value,
+                                 int argc, JSValueConst *argv);
+JSValue js_canvas_origin_clean(JSContext *context, JSValueConst this_value,
+                               int argc, JSValueConst *argv);
+JSValue js_canvas_raster_pattern(JSContext *context, JSValueConst this_value,
+                                 int argc, JSValueConst *argv);
+JSValue js_canvas_png_checksum(JSContext *context, JSValueConst this_value,
+                               int argc, JSValueConst *argv);
+bool js_rt_bridge_canvas_tainted(const DomBridge *bridge,
+                                 const lxb_dom_node_t *node);
+void js_rt_bridge_canvas_taints_retire_subtree(DomBridge *bridge,
+                                               const lxb_dom_node_t *root);
+void js_rt_bridge_canvas_taints_free(DomBridge *bridge);
 JSValue js_webgl_render(JSContext *context,
                         JSValueConst this_value,
                         int argc, JSValueConst *argv);
@@ -1807,6 +2080,13 @@ JSValue js_wasm_global_set(JSContext *context, JSValueConst this_value,
                            int argc, JSValueConst *argv);
 JSValue js_wasm_detach_buffer(JSContext *context, JSValueConst this_value,
                               int argc, JSValueConst *argv);
+/* Whether value is an attached ArrayBuffer aliasing WebAssembly linear
+   memory; such a buffer cannot be transferred or detached by script. */
+bool js_wasm_buffer_aliases_memory(JSContext *context, JSValueConst value);
+/* Guards the realm's ArrayBuffer.prototype.transfer and
+   transferToFixedLength against WebAssembly.Memory buffers. Run once per
+   realm, after its typed-array intrinsics exist and before author code. */
+bool js_wasm_guard_buffer_transfer(JSContext *realm);
 JSValue js_wasm_snapshot_source(JSContext *context, JSValueConst this_value,
                                 int argc, JSValueConst *argv);
 JSValue js_dom_set_fullscreen(JSContext *context,
@@ -1860,6 +2140,8 @@ JSValue js_computed_style_read(JSContext *context,
                                int argc, JSValueConst *argv);
 JSValue js_dom_rendered_text(JSContext *context, JSValueConst this_value,
                              int argc, JSValueConst *argv);
+JSValue js_transition_discover(JSContext *context, JSValueConst this_value,
+                               int argc, JSValueConst *argv);
 JSValue js_transition_snapshot(JSContext *context,
                                JSValueConst this_value,
                                int argc, JSValueConst *argv);
@@ -1878,14 +2160,13 @@ JSValue js_dom_append(JSContext *context, JSValueConst this_value,
 JSValue js_dom_prepare_dynamic_subtree(JSContext *context,
                                        JSValueConst this_value,
                                        int argc, JSValueConst *argv);
-JSValue js_dom_append_many(JSContext *context,
-                           JSValueConst this_value,
-                           int argc, JSValueConst *argv);
 JSValue js_dom_attributes(JSContext *context,
                           JSValueConst this_value,
                           int argc, JSValueConst *argv);
 JSValue js_dom_body(JSContext *context, JSValueConst this_value,
                     int argc, JSValueConst *argv);
+JSValue js_dom_parser_write(JSContext *context, JSValueConst this_value,
+                            int argc, JSValueConst *argv);
 JSValue js_dom_child_nodes(JSContext *context,
                            JSValueConst this_value,
                            int argc, JSValueConst *argv);
@@ -1912,6 +2193,9 @@ JSValue js_dom_create_text(JSContext *context,
 JSValue js_dom_descendants(JSContext *context,
                            JSValueConst this_value,
                            int argc, JSValueConst *argv);
+JSValue js_dom_custom_element_candidates(JSContext *context,
+                                         JSValueConst this_value,
+                                         int argc, JSValueConst *argv);
 JSValue js_dom_traverse(JSContext *context, JSValueConst this_value,
                         int argc, JSValueConst *argv);
 JSValue js_dom_observe_parser_insertions(JSContext *context,
@@ -1951,6 +2235,8 @@ JSValue js_dom_insert_before(JSContext *context,
 JSValue js_dom_is_connected(JSContext *context,
                             JSValueConst this_value,
                             int argc, JSValueConst *argv);
+JSValue js_dom_shadow_relevant(JSContext *context, JSValueConst this_value,
+                               int argc, JSValueConst *argv);
 JSValue js_dom_root_node(JSContext *context, JSValueConst this_value,
                          int argc, JSValueConst *argv);
 JSValue js_dom_node_owner(JSContext *context, JSValueConst this_value,
@@ -1986,6 +2272,7 @@ JSValue js_dom_make_fast_getter(JSContext *context, JSValueConst this_value,
 JSValue js_dom_make_fast_method(JSContext *context, JSValueConst this_value,
                                 int argc, JSValueConst *argv);
 void js_rt_bridge_wrapper_refs_free(DomBridge *bridge);
+void js_rt_bridge_hold_stateful_wrappers(DomBridge *bridge, bool hold);
 void js_rt_bridge_sweep_node_wrappers(DomBridge *bridge);
 /* Allocates the base slot table; `limit` (0 for the default) is the most
    slots registration may later grow it to. Freed by
@@ -2061,9 +2348,15 @@ JSValue js_dom_remove(JSContext *context, JSValueConst this_value,
 JSValue js_dom_remove_attribute(JSContext *context,
                                 JSValueConst this_value,
                                 int argc, JSValueConst *argv);
+JSValue js_dom_pre_insert_clear(JSContext *context, JSValueConst this_value,
+                                int argc, JSValueConst *argv);
+JSValue js_dom_make_wrapper(JSContext *context, JSValueConst this_value,
+                            int argc, JSValueConst *argv);
 JSValue js_dom_retain_node_wrapper(JSContext *context,
                                    JSValueConst this_value,
                                    int argc, JSValueConst *argv);
+JSValue js_dom_node_wrapper(JSContext *context, JSValueConst this_value,
+                            int argc, JSValueConst *argv);
 JSValue js_dom_note_event_state(JSContext *context,
                                 JSValueConst this_value,
                                 int argc, JSValueConst *argv);

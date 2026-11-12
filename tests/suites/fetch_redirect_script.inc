@@ -358,6 +358,55 @@ static bool test_javascript_binary_responses(Budget *budget, unsigned port)
     return true;
 }
 
+/* The fetch natives borrow an ArrayBuffer body without copying it, and the
+   header, mode and referrer coercions after that read can run author code.
+   A content-type toString() that moves the body's storage elsewhere
+   (transfer() keeps it live in a new buffer) must make the request refuse,
+   never send whatever the stale pointer now reaches. /method echoes the
+   POST body, so a stale send shows up as body=XXXX. */
+static bool test_javascript_detached_request_body(Budget *budget,
+                                                  unsigned port)
+{
+    size_t baseline = budget->current;
+    static const char html[] =
+        "<!doctype html><title>Detached body</title><body></body>";
+    PocDocument document = {0};
+    ScriptResult result = {0};
+    char document_url[256];
+    snprintf(document_url, sizeof(document_url),
+             "http://127.0.0.1:%u/page", port);
+    CHECK(document_parse(&document, budget, html, sizeof(html) - 1, 17));
+    ScriptRuntime *runtime = script_runtime_create(
+        &document, budget, 4u * MIB, 5000, document_url, &result);
+    CHECK(runtime != NULL && result.success);
+    static const char probe[] =
+        "(()=>{const run=(native,label)=>{"
+        "const body=new Uint8Array([65,66,67,68]).buffer;let moved=null;"
+        "const type={toString(){moved=body.transfer();"
+        "new Uint8Array(moved).set([88,88,88,88]);return 'text/plain'}};"
+        "let outcome;try{const raw=native('POST','/method',body,type,'',"
+        "'cors','same-origin');outcome=raw&&raw.bodyBytes?'sent:'"
+        "+new TextDecoder().decode(raw.bodyBytes).split(';').pop()"
+        ":'returned:'+raw}catch(error){outcome=error instanceof TypeError"
+        "&&/detached/.test(error.message)?'refused':'threw:'+error}"
+        "return moved===null?label+':no-coercion'"
+        ":outcome==='refused'?'':label+':'+outcome};"
+        "const fails=[run(__tilefinchFetchSync,'sync'),"
+        "run(__tilefinchFetchAsync,'async')].filter(Boolean);"
+        "globalThis.pocSummary=fails.length===0?'detached-body-ok'"
+        ":'detached-body-failed:'+fails.join(',');})()";
+    bool evaluated = script_runtime_evaluate_diagnostic(
+        runtime, probe, "<detached-body-probe>", &result);
+    if (!evaluated || strcmp(result.summary, "detached-body-ok") != 0)
+        fprintf(stderr, "detached-body summary=\"%s\" error=\"%s\"\n",
+                result.summary, result.error);
+    CHECK(evaluated && strcmp(result.summary, "detached-body-ok") == 0);
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget->current == baseline);
+    return true;
+}
+
 /* navigator.sendBeacon() must deliver its body: the size check used to
    consume the Request's body, so the fetch() that followed rejected and no
    beacon ever reached the network while sendBeacon() still returned true. */
@@ -930,6 +979,477 @@ static bool test_javascript_cors(Budget *budget, unsigned document_port,
           && strstr(result.summary, ":visible=visible:secret=null") != NULL);
 
     script_runtime_destroy(runtime);
+    browser_session_destroy(&session);
+    document_destroy(&document);
+    CHECK(budget->current == baseline);
+    return true;
+}
+
+/* The slow preflight endpoint sleeps SLOW_PREFLIGHT_SECONDS (1.5 s, in
+   run_fetch_redirect_test.py) before answering. */
+#define CORS_SLOW_CALL_LIMIT_US UINT64_C(750000)
+
+static size_t cors_fetch_cooperations;
+static bool cors_cancel_fetch;
+
+static bool cors_count_cooperate(void *context, const char *phase,
+                                 size_t completed_work_units)
+{
+    (void) context;
+    (void) completed_work_units;
+    if (phase == NULL || strcmp(phase, "fetch") != 0) return true;
+    cors_fetch_cooperations++;
+    return !cors_cancel_fetch;
+}
+
+/* Evaluates source and pumps until no task is left, timing every call. */
+static bool cors_run_timed(ScriptRuntime *runtime, const char *source,
+                           const char *name, ScriptResult *result,
+                           uint64_t *longest_us)
+{
+    *longest_us = 0;
+    uint64_t started = tilefinch_platform_monotonic_time_us();
+    bool ok = script_runtime_evaluate_diagnostic(
+        runtime, source, name, result);
+    uint64_t now = tilefinch_platform_monotonic_time_us();
+    *longest_us = now - started;
+    while (ok && result->pending_tasks != 0
+           && now - started < UINT64_C(15000000)) {
+        uint64_t before = now;
+        ok = script_runtime_advance(runtime, 4, 4, result);
+        now = tilefinch_platform_monotonic_time_us();
+        if (now - before > *longest_us) *longest_us = now - before;
+    }
+    return ok && result->pending_tasks == 0;
+}
+
+/* NET-2: a preflight is a scheduled request, never a transfer inside the
+   script call, and a sync XHR waits for its requests cooperatively. */
+static bool test_javascript_cors_preflight_scheduling(
+    Budget *budget, unsigned document_port, unsigned target_port)
+{
+    size_t baseline = budget->current;
+    static const char html[] =
+        "<!doctype html><title>CORS preflight</title><body></body>";
+    PocDocument document = {0};
+    BrowserSession session;
+    ScriptResult result = {0};
+    char document_url[256], source[4096];
+    snprintf(document_url, sizeof(document_url),
+             "http://localhost:%u/page", document_port);
+    CHECK(document_parse(&document, budget, html, sizeof(html) - 1, 17));
+    CHECK(browser_session_init(&session, budget, 64u * 1024u));
+    ScriptRuntime *runtime = script_runtime_create_with_session(
+        &document, budget, 4u * MIB, 5000, document_url, &session, &result);
+    CHECK(runtime != NULL && result.success);
+
+    /* An async fetch keeps the page running while its preflight waits on
+       the slow server: no call blocks for the OPTIONS round trip. */
+    uint64_t longest_us = 0;
+    int written = snprintf(
+        source, sizeof(source),
+        "globalThis.pocSummary='pending';"
+        "fetch('http://127.0.0.1:%u/cors-preflight-slow?case=async',"
+        "{method:'PUT',headers:{'Content-Type':'application/json',"
+        "'X-Test':'yes'},body:'async'})"
+        ".then(response=>response.text())"
+        ".then(text=>globalThis.pocSummary='preflight:'+text)"
+        ".catch(error=>globalThis.pocSummary='blocked:'+error)",
+        target_port);
+    bool async_ok = written > 0 && (size_t) written < sizeof(source)
+        && cors_run_timed(runtime, source, "<cors-preflight-slow>", &result,
+                          &longest_us);
+    if (!async_ok || longest_us >= CORS_SLOW_CALL_LIMIT_US
+        || strstr(result.summary, "preflight:cors-method=PUT") == NULL) {
+        fprintf(stderr, "slow async preflight longest=%llu us summary=\"%s\"\n",
+                (unsigned long long) longest_us, result.summary);
+    }
+    CHECK(async_ok && longest_us < CORS_SLOW_CALL_LIMIT_US
+          && strstr(result.summary, "preflight:cors-method=PUT") != NULL
+          && strstr(result.summary, "body=async;options=1") != NULL);
+
+    /* Access-Control-Max-Age: the second request reuses the first grant. */
+    written = snprintf(
+        source, sizeof(source),
+        "globalThis.pocSummary='pending';"
+        "const cachedUrl='http://127.0.0.1:%u/cors-preflight-cached';"
+        "const cachedInit=body=>({method:'PUT',headers:{"
+        "'Content-Type':'application/json','X-Test':'yes'},body});"
+        "fetch(cachedUrl,cachedInit('one')).then(r=>r.text())"
+        ".then(one=>fetch(cachedUrl,cachedInit('two')).then(r=>r.text())"
+        ".then(two=>globalThis.pocSummary='cached:'+one+'|'+two))"
+        ".catch(error=>globalThis.pocSummary='blocked:'+error)",
+        target_port);
+    bool cached_ok = written > 0 && (size_t) written < sizeof(source)
+        && cors_run_timed(runtime, source, "<cors-preflight-cached>",
+                          &result, &longest_us);
+    if (!cached_ok || strstr(result.summary, "body=two;options=1") == NULL) {
+        fprintf(stderr, "cached preflight summary=\"%s\"\n", result.summary);
+    }
+    CHECK(cached_ok && strstr(result.summary, "body=one;options=1") != NULL
+          && strstr(result.summary, "body=two;options=1") != NULL);
+
+    /* A sync XHR stays synchronous, but its preflight and request are
+       scheduled transfers this thread waits for at cooperation points. */
+    TilefinchPlatformServices services = {
+        .cooperate = cors_count_cooperate
+    };
+    tilefinch_platform_set_services(&services);
+    cors_fetch_cooperations = 0;
+    cors_cancel_fetch = false;
+    written = snprintf(
+        source, sizeof(source),
+        "(()=>{const xhr=new XMLHttpRequest;"
+        "xhr.open('PUT','http://127.0.0.1:%u/cors-preflight-slow?case=sync',"
+        "false);xhr.setRequestHeader('Content-Type','application/json');"
+        "xhr.setRequestHeader('X-Test','yes');"
+        "try{xhr.send('sync');globalThis.pocSummary='xhr:'+xhr.status+':'"
+        "+xhr.responseText}catch(error){globalThis.pocSummary="
+        "'threw:'+error}})()", target_port);
+    bool sync_ok = written > 0 && (size_t) written < sizeof(source)
+        && script_runtime_evaluate_diagnostic(
+               runtime, source, "<cors-preflight-sync>", &result);
+    size_t sync_cooperations = cors_fetch_cooperations;
+    if (!sync_ok || sync_cooperations == 0
+        || strstr(result.summary, "xhr:200:cors-method=PUT") == NULL) {
+        fprintf(stderr, "sync preflight cooperations=%zu summary=\"%s\"\n",
+                sync_cooperations, result.summary);
+    }
+    CHECK(sync_ok && sync_cooperations != 0
+          && strstr(result.summary, "xhr:200:cors-method=PUT") != NULL
+          && strstr(result.summary, "body=sync;options=2") != NULL);
+
+    /* The frontend can cancel that wait: the XHR fails at once instead of
+       holding the thread for the slow preflight. */
+    cors_fetch_cooperations = 0;
+    cors_cancel_fetch = true;
+    written = snprintf(
+        source, sizeof(source),
+        "(()=>{const xhr=new XMLHttpRequest;"
+        "xhr.open('PUT','http://127.0.0.1:%u/cors-preflight-slow?case=cancel',"
+        "false);xhr.setRequestHeader('Content-Type','application/json');"
+        "xhr.setRequestHeader('X-Test','yes');"
+        "try{xhr.send('cancel');globalThis.pocSummary='xhr:'+xhr.status+':'"
+        "+xhr.responseText}catch(error){globalThis.pocSummary="
+        "'threw:'+error}})()", target_port);
+    uint64_t cancel_started = tilefinch_platform_monotonic_time_us();
+    bool cancel_ok = written > 0 && (size_t) written < sizeof(source)
+        && script_runtime_evaluate_diagnostic(
+               runtime, source, "<cors-preflight-cancel>", &result);
+    uint64_t cancel_us =
+        tilefinch_platform_monotonic_time_us() - cancel_started;
+    tilefinch_platform_set_services(NULL);
+    cors_cancel_fetch = false;
+    if (!cancel_ok || cancel_us >= CORS_SLOW_CALL_LIMIT_US
+        || strstr(result.summary, "xhr:200") != NULL) {
+        fprintf(stderr, "cancelled sync preflight %llu us summary=\"%s\"\n",
+                (unsigned long long) cancel_us, result.summary);
+    }
+    CHECK(cancel_ok && cancel_us < CORS_SLOW_CALL_LIMIT_US
+          && strstr(result.summary, "xhr:200") == NULL);
+
+    /* NW-05: a request waiting for its slow preflight does not hold up
+       the realm's other requests; a same-origin fetch queued behind it
+       finishes long before the preflight is answered. */
+    written = snprintf(
+        source, sizeof(source),
+        "globalThis.pocSummary='pending';const holOrder=[];"
+        "const holCross=fetch('http://127.0.0.1:%u/cors-preflight-slow"
+        "?case=hol',{method:'PUT',headers:{'Content-Type':"
+        "'application/json','X-Test':'yes'},body:'hol'})"
+        ".then(r=>r.text()).then(()=>holOrder.push('cross'));"
+        "const holSame=fetch('/final?case=hol').then(r=>r.text())"
+        ".then(()=>{holOrder.push('same');"
+        "if(holOrder.length===1)globalThis.pocSummary='same-done';});"
+        "Promise.all([holCross,holSame]).then(()=>globalThis.pocSummary="
+        "'hol:'+holOrder.join()).catch(error=>globalThis.pocSummary="
+        "'hol-error:'+error)", target_port);
+    uint64_t hol_started = tilefinch_platform_monotonic_time_us();
+    uint64_t hol_same_us = 0;
+    bool hol_ok = written > 0 && (size_t) written < sizeof(source)
+        && script_runtime_evaluate_diagnostic(
+               runtime, source, "<cors-preflight-hol>", &result);
+    while (hol_ok && strncmp(result.summary, "hol", 3) != 0
+           && tilefinch_platform_monotonic_time_us() - hol_started
+                  < UINT64_C(15000000)) {
+        hol_ok = script_runtime_advance(runtime, 4, 4, &result);
+        if (hol_same_us == 0 && strcmp(result.summary, "same-done") == 0)
+            hol_same_us = tilefinch_platform_monotonic_time_us()
+                - hol_started;
+    }
+    if (!hol_ok || hol_same_us == 0 || hol_same_us >= CORS_SLOW_CALL_LIMIT_US
+        || strcmp(result.summary, "hol:same,cross") != 0) {
+        fprintf(stderr, "preflight head of line same=%llu us summary=\"%s\"\n",
+                (unsigned long long) hol_same_us, result.summary);
+    }
+    CHECK(hol_ok && hol_same_us != 0 && hol_same_us < CORS_SLOW_CALL_LIMIT_US
+          && strcmp(result.summary, "hol:same,cross") == 0);
+
+    /* A preflight whose request is aborted is still decided when it
+       completes, which releases its scheduler entry (and the page domain's
+       transfer slot it holds until taken) though the page makes no further
+       request. This one is refused (X-Other is not allowed), which the
+       realm counts as a network failure when it decides it. */
+    written = snprintf(
+        source, sizeof(source),
+        "globalThis.pocSummary='pending';const abortPreflight="
+        "new AbortController;fetch('http://127.0.0.1:%u/cors-preflight-slow"
+        "?case=abort',{method:'PUT',headers:{'Content-Type':"
+        "'application/json','X-Other':'yes'},body:'abort',"
+        "signal:abortPreflight.signal}).catch(()=>{});"
+        "abortPreflight.abort();globalThis.pocSummary='aborted'",
+        target_port);
+    bool abort_ok = written > 0 && (size_t) written < sizeof(source)
+        && script_runtime_evaluate_diagnostic(
+               runtime, source, "<cors-preflight-abort>", &result)
+        && strcmp(result.summary, "aborted") == 0;
+    size_t failures_before = result.network_failures;
+    uint64_t abort_started = tilefinch_platform_monotonic_time_us();
+    while (abort_ok && result.network_failures == failures_before
+           && tilefinch_platform_monotonic_time_us() - abort_started
+                  < UINT64_C(4000000))
+        abort_ok = script_runtime_advance(runtime, 4, 4, &result);
+    if (!abort_ok || result.network_failures != failures_before + 1u)
+        fprintf(stderr, "aborted preflight ok=%d failures=%zu->%zu\n",
+                abort_ok, failures_before, result.network_failures);
+    CHECK(abort_ok && result.network_failures == failures_before + 1u);
+
+    script_runtime_destroy(runtime);
+    browser_session_destroy(&session);
+    document_destroy(&document);
+    CHECK(budget->current == baseline);
+    return true;
+}
+
+static bool sync_xhr_run(ScriptRuntime *runtime, unsigned port,
+                         const char *label, ScriptResult *result,
+                         uint64_t *elapsed_us)
+{
+    char source[1024];
+    int written = snprintf(
+        source, sizeof(source),
+        "(()=>{const xhr=new XMLHttpRequest;"
+        "xhr.open('GET','http://localhost:%u/final?case=%s',false);"
+        "try{xhr.send();globalThis.pocSummary='xhr:'+xhr.status}"
+        "catch(error){globalThis.pocSummary='threw:'+error}})()",
+        port, label);
+    uint64_t started = tilefinch_platform_monotonic_time_us();
+    bool ok = written > 0 && (size_t) written < sizeof(source)
+        && script_runtime_evaluate_diagnostic(
+               runtime, source, "<sync-xhr>", result);
+    *elapsed_us = tilefinch_platform_monotonic_time_us() - started;
+    return ok;
+}
+
+/* NW-04: while the page's network is held for the native player, a sync
+   XHR fails at once. It used to run as a direct transfer on the calling
+   thread (on the PSP, DNS, TCP and TLS on the browser thread during
+   playback), past the hold. */
+static bool test_javascript_sync_xhr_respects_page_hold(
+    Budget *budget, unsigned document_port)
+{
+    size_t baseline = budget->current;
+    static const char html[] =
+        "<!doctype html><title>sync XHR</title><body></body>";
+    PocDocument document = {0};
+    BrowserSession session;
+    ScriptResult result = {0};
+    char document_url[256];
+    snprintf(document_url, sizeof(document_url),
+             "http://localhost:%u/page", document_port);
+    CHECK(document_parse(&document, budget, html, sizeof(html) - 1, 17));
+    CHECK(browser_session_init(&session, budget, 64u * 1024u));
+    FetchSchedulerDomain *domain = fetch_scheduler_domain_create(budget, 4);
+    CHECK(domain != NULL);
+    ViewportContext viewport;
+    CHECK(viewport_context_init(&viewport, 480, 272, 480, 272));
+    ScriptRuntimeOptions options = {
+        .session = &session, .viewport = viewport,
+        .fetch_scheduler_domain = domain
+    };
+    ScriptRuntime *runtime = script_runtime_create_configured(
+        &document, budget, 4u * MIB, 5000, document_url, &options, &result);
+    CHECK(runtime != NULL && result.success);
+    uint64_t elapsed_us = 0;
+
+    bool plain_ok = sync_xhr_run(runtime, document_port, "plain", &result,
+                                 &elapsed_us);
+    if (!plain_ok || strcmp(result.summary, "xhr:200") != 0)
+        fprintf(stderr, "plain sync XHR summary=\"%s\"\n", result.summary);
+    CHECK(plain_ok && strcmp(result.summary, "xhr:200") == 0);
+
+    /* The bootstrap reports a failed sync XHR as status 0. */
+    size_t failures = result.network_failures;
+    fetch_scheduler_domain_set_held(domain, true);
+    bool held_ok = sync_xhr_run(runtime, document_port, "held", &result,
+                                &elapsed_us);
+    fetch_scheduler_domain_set_held(domain, false);
+    if (!held_ok || strcmp(result.summary, "xhr:0") != 0)
+        fprintf(stderr, "held sync XHR %llu us summary=\"%s\"\n",
+                (unsigned long long) elapsed_us, result.summary);
+    CHECK(held_ok && strcmp(result.summary, "xhr:0") == 0
+          && result.network_failures == failures + 1u
+          && elapsed_us < UINT64_C(1000000));
+
+    /* Released: it runs again. */
+    bool released_ok = sync_xhr_run(runtime, document_port, "released",
+                                    &result, &elapsed_us);
+    CHECK(released_ok && strcmp(result.summary, "xhr:200") == 0);
+
+    script_runtime_destroy(runtime);
+    fetch_scheduler_domain_release(domain);
+    browser_session_destroy(&session);
+    document_destroy(&document);
+    CHECK(budget->current == baseline);
+    return true;
+}
+
+static size_t sync_wait_cooperations;
+
+static bool sync_wait_count_cooperate(void *context, const char *phase,
+                                      size_t completed_work_units)
+{
+    (void) context;
+    (void) completed_work_units;
+    if (phase != NULL && strcmp(phase, "fetch") == 0)
+        sync_wait_cooperations++;
+    return true;
+}
+
+/* Runs one sync XHR with fetch cooperations counted. */
+static bool sync_xhr_run_counted(ScriptRuntime *runtime, unsigned port,
+                                 const char *label, ScriptResult *result,
+                                 uint64_t *elapsed_us, size_t *cooperations)
+{
+    TilefinchPlatformServices services = {
+        .cooperate = sync_wait_count_cooperate
+    };
+    tilefinch_platform_set_services(&services);
+    sync_wait_cooperations = 0;
+    bool ok = sync_xhr_run(runtime, port, label, result, elapsed_us);
+    *cooperations = sync_wait_cooperations;
+    tilefinch_platform_set_services(NULL);
+    return ok;
+}
+
+/* Pumps until every listed request is complete. */
+static bool sync_wait_pump_complete(FetchScheduler *scheduler,
+                                    const uint64_t *ids, size_t count)
+{
+    for (size_t turn = 0; turn < 4000u; turn++) {
+        size_t complete = 0;
+        for (size_t i = 0; i < count; i++)
+            if (fetch_scheduler_request_complete(scheduler, ids[i]))
+                complete++;
+        if (complete == count) return true;
+        (void) fetch_scheduler_pump(scheduler, 1, 5);
+    }
+    return false;
+}
+
+static void sync_wait_take_all(FetchScheduler *scheduler,
+                               const uint64_t *ids, size_t count)
+{
+    for (size_t i = 0; i < count; i++) {
+        if (ids[i] == 0) continue;
+        (void) fetch_scheduler_cancel(scheduler, ids[i], "test cleanup");
+        bool success = false;
+        FetchResult taken = {0};
+        if (fetch_scheduler_take(scheduler, ids[i], &success, &taken))
+            fetch_result_destroy(&taken);
+    }
+}
+
+/* NW-04 questions 1 and 2: a sync XHR's wait for room in the realm
+   scheduler does not spin. When only an owner's take could make room (here
+   both of the page domain's slots hold finished, untaken responses) it
+   does not wait: it runs on the slot reserved past the domain's cap, on
+   the scheduler (which pumps and cooperates; the browser-thread transfer
+   it used to fall back to cooperates with nothing). It used to pump and
+   cooperate for the whole 2 s bound first, millions of turns with nothing
+   to wait for. When the byte pool is the blocker (a response that stays in
+   flight 3 s holds nearly all of it) the wait pumps at a bounded rate and
+   fails at 2 s instead of running the transfer on this thread. */
+static bool test_javascript_sync_xhr_blocked_wait(
+    Budget *budget, unsigned document_port)
+{
+    size_t baseline = budget->current;
+    static const char html[] =
+        "<!doctype html><title>sync XHR wait</title><body></body>";
+    PocDocument document = {0};
+    BrowserSession session;
+    ScriptResult result = {0};
+    char document_url[256], url[256];
+    snprintf(document_url, sizeof(document_url),
+             "http://localhost:%u/page", document_port);
+    CHECK(document_parse(&document, budget, html, sizeof(html) - 1, 17));
+    CHECK(browser_session_init(&session, budget, 64u * 1024u));
+    FetchSchedulerDomain *domain = fetch_scheduler_domain_create(budget, 2);
+    CHECK(domain != NULL);
+    ViewportContext viewport;
+    CHECK(viewport_context_init(&viewport, 480, 272, 480, 272));
+    ScriptRuntimeOptions options = {
+        .session = &session, .viewport = viewport,
+        .fetch_scheduler_domain = domain
+    };
+    ScriptRuntime *runtime = script_runtime_create_configured(
+        &document, budget, 4u * MIB, 5000, document_url, &options, &result);
+    CHECK(runtime != NULL && result.success);
+    FetchScheduler *scheduler = script_runtime_fetch_scheduler(runtime);
+    CHECK(scheduler != NULL);
+    uint64_t elapsed_us = 0;
+    size_t cooperations = 0;
+
+    /* Slots: two finished responses nobody takes fill the domain. */
+    uint64_t finished[2] = {0, 0};
+    for (size_t i = 0; i < 2; i++) {
+        snprintf(url, sizeof(url),
+                 "http://localhost:%u/final?case=slot-%zu",
+                 document_port, i);
+        finished[i] = fetch_scheduler_enqueue(
+            scheduler, url, NULL, 64u * 1024u, 5000);
+        CHECK(finished[i] != 0);
+    }
+    CHECK(sync_wait_pump_complete(scheduler, finished, 2));
+    CHECK(fetch_scheduler_enqueue_would_block(scheduler, 64u * 1024u));
+    bool slots_ok = sync_xhr_run_counted(
+        runtime, document_port, "slots", &result, &elapsed_us,
+        &cooperations);
+    fprintf(stderr,
+            "sync XHR behind full slots: %llu us, %zu fetch cooperations, "
+            "summary=\"%s\"\n",
+            (unsigned long long) elapsed_us, cooperations, result.summary);
+    CHECK(slots_ok && strcmp(result.summary, "xhr:200") == 0
+          && elapsed_us < UINT64_C(1000000) && cooperations > 0u
+          && cooperations < 2000u);
+    sync_wait_take_all(scheduler, finished, 2);
+
+    /* Byte pool: one held response reserves all but 1 KiB of it. */
+    size_t reserved = 0, maximum = 0;
+    fetch_scheduler_reservation_state(scheduler, &reserved, &maximum,
+                                      NULL, NULL);
+    CHECK(reserved == 0 && maximum > 2048u);
+    snprintf(url, sizeof(url), "http://localhost:%u/hold", document_port);
+    uint64_t held = fetch_scheduler_enqueue(
+        scheduler, url, NULL, maximum - 1024u, 10000);
+    size_t failures = result.network_failures;
+    CHECK(held != 0);
+    CHECK(fetch_scheduler_enqueue_would_block(scheduler, 64u * 1024u));
+    bool pool_ok = sync_xhr_run_counted(
+        runtime, document_port, "pool", &result, &elapsed_us,
+        &cooperations);
+    fprintf(stderr,
+            "sync XHR behind a full byte pool: %llu us, %zu fetch "
+            "cooperations, summary=\"%s\"\n",
+            (unsigned long long) elapsed_us, cooperations, result.summary);
+    CHECK(pool_ok && strcmp(result.summary, "xhr:0") == 0
+          && result.network_failures == failures + 1u
+          && elapsed_us >= UINT64_C(1900000)
+          && elapsed_us < UINT64_C(2900000) && cooperations < 2000u);
+    sync_wait_take_all(scheduler, &held, 1);
+
+    script_runtime_destroy(runtime);
+    fetch_scheduler_domain_release(domain);
     browser_session_destroy(&session);
     document_destroy(&document);
     CHECK(budget->current == baseline);

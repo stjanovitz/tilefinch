@@ -273,7 +273,7 @@ static bool test_late_script_oom_reveals_staged_page_shell(void)
         /* The test still drives a much larger author allocation through the
            late-OOM path; this reserve only admits bounded bootstrap growth. */
         navigation_enable_scripts(
-            &navigation, 2 * MIB + 8 * 1024, 1000);
+            &navigation, 2 * MIB + 64 * 1024, 1000);
         navigation_enable_document_scripts(
             &navigation, 4, 64 * 1024, 32 * 1024, 1000);
         /* Exercises exhaustion itself: keep the configured heap fixed. */
@@ -763,7 +763,8 @@ static bool test_late_script_oom_frees_queued_frame_messages(void)
         long anchor_handle = anchor == NULL ? 0
             : script_runtime_node_handle(navigation.page.runtime, anchor);
         frame->runtime = script_runtime_create(
-            &frame->document, &budget, 2u * MIB, 1000,
+            &frame->document, &budget,
+            test_small_realm_bytes(&budget, TEST_SMALL_REALM_MARGIN_BYTES), 1000,
             "https://queued-oom-child.test/", &frame->script_result);
         frame->parent_runtime = navigation.page.runtime;
         frame->element = anchor;
@@ -861,7 +862,7 @@ static bool test_late_script_oom_frees_queued_frame_messages(void)
    allocator refusal lands in that step whatever the arenas have left. */
 #define FRAME_OOM_EXHAUST_JS \
     "globalThis.hoard=null;globalThis.exhaust=()=>{let h=null;" \
-    "for(const n of [65536,4096,512,64]){try{for(;;)" \
+    "for(const n of [65536,4096,512,64,16,1]){try{for(;;)" \
     "h={b:new ArrayBuffer(n),n:h}}catch(e){}}" \
     "try{for(;;)h={n:h}}catch(e){}globalThis.hoard=h};"
 
@@ -1160,10 +1161,13 @@ static bool frame_completion_window_state_failure_keeps_page(unsigned failure)
         "realm ran out of memory recording a completed iframe.</p></main>"
         "<iframe id=victim src='https://frame-oom.test/a.html'></iframe>"
         "<script>" FRAME_OOM_EXHAUST_JS "</script></body>";
+    /* After exhaust() the arenas may still hold a few free blocks, enough
+       for the lookup itself; allocating until refused keeps the failure in
+       this step however much is left. */
     static const char arm[] =
         "const frameWindow=globalThis.__tilefinchFrameWindow;"
         "globalThis.__tilefinchFrameWindow=h=>{exhaust();"
-        "return [frameWindow(h)][0]};";
+        "const w=frameWindow(h);for(;;)globalThis.hoard={n:globalThis.hoard,w}};";
     static const char recover_arm[] =
         "const frameWindow=globalThis.__tilefinchFrameWindow;let failed=false;"
         "globalThis.__tilefinchFrameWindow=h=>{if(!failed){failed=true;"
@@ -1244,7 +1248,9 @@ static bool test_frame_load_event_oom_retires_realm(void)
     bool degraded = completed && frame_oom_page_degraded(&navigation);
     bool kept = completed && navigation.frames_loaded == 1u
         && frame->loaded && !frame->retired && frame->runtime == NULL
-        && navigation.page.message_count == 0u;
+        && navigation.page.message_count == 0u
+        && navigation.page.script_stop.reason == NAVIGATION_SCRIPT_STOP_MEMORY
+        && navigation.page.script_stop.heap_limit_kib != 0u;
     bool idle = completed && navigation_advance_runtime(&navigation, 16, 4);
     bool next = degraded && kept && idle
         && frame_oom_next_page_starts_frames(&navigation);
@@ -1902,7 +1908,7 @@ static bool test_full_relayout_reclaims_owner_caches(void)
 
 static bool test_overflow_preserves_admitted_stylesheet(void)
 {
-    char html[16384];
+    char html[32768];
     int used = snprintf(html, sizeof(html), "<!doctype html><style>"
         "p{color:#112233}</style><p>Outside</p><div id=ha></div><div id=hb></div>");
     for (unsigned i = 0; i < SCRIPT_MUTATION_JOURNAL_LIMIT + 32; i++)
@@ -2017,6 +2023,418 @@ static bool test_adopted_sources_insert_between_existing(void)
     return ok && budget.current == 0;
 }
 
+/* A constructed sheet parsed twice keeps its compiled selector fragment;
+   a later in-place insertion replays it. The fragment's seeds are keyed by
+   the rules' cascade orders at the tail of the sheet, before the insertion
+   moves those rules to their document position and the later rules up:
+   a stale key handed #b's compiled program to #c1's rule. */
+static bool test_adopted_reinsertion_keeps_selector_programs(void)
+{
+    static const char html[] =
+        "<!doctype html><p id=pa>Alpha</p><p id=pb>Bravo</p>"
+        "<p id=pc1>Charlie</p><script>"
+        "globalThis.a=new CSSStyleSheet();a.replaceSync('#pa{color:#111111}');"
+        "globalThis.b=new CSSStyleSheet();b.replaceSync('#pb{color:#222222}');"
+        "globalThis.c=new CSSStyleSheet();"
+        "c.replaceSync('#pz{color:#999999}#pc1{color:#333333}');"
+        "document.adoptedStyleSheets=[a,b,c];</script>";
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 4);
+    if (ready) {
+        navigation_enable_scripts(&navigation, 4 * MIB, 1000);
+        navigation_enable_document_scripts(&navigation, 4, 32 * 1024,
+                                            16 * 1024, 1000);
+    }
+    bool ok = ready && navigation_commit_html(&navigation,
+        navigation_begin(&navigation), "https://fragment-seeds.test/",
+        html, sizeof(html) - 1, 480, NULL, NULL, true);
+    /* A second parse of every sheet keeps its parsed form. */
+    if (ok) navigation.style_rebuild_required = true;
+    ok = ok && navigation_relayout(&navigation)
+        && append_order_mutate(&navigation,
+               "document.adoptedStyleSheets=[a,c]", "<drop-middle>")
+        && append_order_text_color(&navigation.page.layout, "Bravo")
+               != 0x222222;
+    size_t appends = navigation.performance.mutation_style_appends;
+    ok = ok && append_order_mutate(&navigation,
+               "document.adoptedStyleSheets=[a,b,c]", "<reinsert-middle>")
+        && navigation.performance.mutation_style_appends == appends + 1;
+    uint32_t alpha = append_order_text_color(&navigation.page.layout, "Alpha");
+    uint32_t bravo = append_order_text_color(&navigation.page.layout, "Bravo");
+    uint32_t charlie =
+        append_order_text_color(&navigation.page.layout, "Charlie");
+    ok = ok && alpha == 0x111111 && bravo == 0x222222 && charlie == 0x333333
+        && append_order_matches_rebuild(&navigation, "fragment reinsertion");
+    if (!ok) fprintf(stderr, "fragment seeds: appends=%zu/%zu colors=%06x "
+        "%06x %06x error=%s\n", appends,
+        navigation.performance.mutation_style_appends, alpha, bravo, charlie,
+        navigation.last_error);
+    if (ready) navigation_destroy(&navigation);
+    bool clean = budget.current == 0;
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+/* A scripted session over `html` for the in-place style-change tests. */
+static bool append_order_open(NavigationSession *navigation, Budget *budget,
+                              bool *installed, const char *url,
+                              const char *html, size_t length)
+{
+    budget_init(budget, 16 * MIB);
+    *installed = budget_install_lexbor(budget);
+    if (!*installed || !navigation_init(navigation, budget, 4)) return false;
+    navigation_enable_scripts(navigation, 4 * MIB, 1000);
+    navigation_enable_document_scripts(navigation, 4, 32 * 1024, 16 * 1024,
+                                        1000);
+    return navigation_commit_html(navigation, navigation_begin(navigation),
+                                  url, html, length, 480, NULL, NULL, true);
+}
+
+/* One script step that must change the sheet in place (no full rebuild,
+   one more style append) and leave it equal to a rebuild of the DOM. */
+static bool append_order_in_place(NavigationSession *navigation,
+                                  const char *script, const char *label)
+{
+    size_t full = navigation->performance.full_relayouts;
+    size_t appends = navigation->performance.mutation_style_appends;
+    bool ok = append_order_mutate(navigation, script, label);
+    bool in_place = ok && navigation->performance.full_relayouts == full
+        && navigation->performance.mutation_style_appends == appends + 1;
+    if (ok && !in_place)
+        fprintf(stderr, "%s: full=%zu->%zu appends=%zu->%zu\n", label, full,
+                navigation->performance.full_relayouts, appends,
+                navigation->performance.mutation_style_appends);
+    return in_place && append_order_matches_rebuild(navigation, label);
+}
+
+/* An adoption list that reorders or drops sheets the page sheet already
+   holds is applied in place: the sheets it dropped, and the fewest of the
+   reordered ones, leave the sheet with their rules, and the reordered
+   ones are inserted again at their new position (archive.org's search
+   page did this four times per load, each a full rebuild). Document and
+   shadow-root lists both. */
+static bool test_adopted_reorder_and_retire_in_place(void)
+{
+    static const char html[] =
+        "<!doctype html><p id=pa>Alpha</p><p id=pb>Bravo</p>"
+        "<div id=host></div><script>"
+        "globalThis.a=new CSSStyleSheet();a.replaceSync('#pa{color:#111111}');"
+        "globalThis.b=new CSSStyleSheet();"
+        "b.replaceSync('#pa{color:#222222}#pb{color:#222222}');"
+        "globalThis.c=new CSSStyleSheet();c.replaceSync('#pb{color:#333333}');"
+        "document.adoptedStyleSheets=[a,b,c];"
+        "globalThis.x=new CSSStyleSheet();x.replaceSync('p{color:#444444}');"
+        "globalThis.y=new CSSStyleSheet();y.replaceSync('p{color:#555555}');"
+        "globalThis.root=document.getElementById('host')"
+        ".attachShadow({mode:'open'});"
+        "root.innerHTML='<p>Shadow</p>';root.adoptedStyleSheets=[x,y];"
+        "</script>";
+    Budget budget;
+    bool installed = false;
+    NavigationSession navigation = {0};
+    bool ok = append_order_open(&navigation, &budget, &installed,
+                                "https://adopted-reorder.test/", html,
+                                sizeof(html) - 1);
+    uint32_t alpha[4] = {0}, bravo[4] = {0}, shadow = 0;
+    ok = ok && append_order_in_place(&navigation,
+               "document.adoptedStyleSheets=[c,a,b]", "<reorder>");
+    alpha[0] = append_order_text_color(&navigation.page.layout, "Alpha");
+    bravo[0] = append_order_text_color(&navigation.page.layout, "Bravo");
+    ok = ok && append_order_in_place(&navigation,
+               "document.adoptedStyleSheets=[b,a,c]", "<reorder-again>");
+    alpha[1] = append_order_text_color(&navigation.page.layout, "Alpha");
+    bravo[1] = append_order_text_color(&navigation.page.layout, "Bravo");
+    ok = ok && append_order_in_place(&navigation,
+               "document.adoptedStyleSheets=[b,c]", "<retire-middle>");
+    alpha[2] = append_order_text_color(&navigation.page.layout, "Alpha");
+    bravo[2] = append_order_text_color(&navigation.page.layout, "Bravo");
+    ok = ok && append_order_in_place(&navigation,
+               "document.adoptedStyleSheets=[c,a]", "<retire-and-readopt>");
+    alpha[3] = append_order_text_color(&navigation.page.layout, "Alpha");
+    bravo[3] = append_order_text_color(&navigation.page.layout, "Bravo");
+    ok = ok && append_order_in_place(&navigation,
+               "root.adoptedStyleSheets=[y,x]", "<shadow-reorder>");
+    shadow = append_order_text_color(&navigation.page.layout, "Shadow");
+    ok = ok && alpha[0] == 0x222222 && bravo[0] == 0x222222
+        && alpha[1] == 0x111111 && bravo[1] == 0x333333
+        && alpha[2] == 0x222222 && bravo[2] == 0x333333
+        && alpha[3] == 0x111111 && bravo[3] == 0x333333
+        && shadow == 0x444444;
+    if (!ok) fprintf(stderr, "adopted reorder: alpha=%06x %06x %06x %06x "
+        "bravo=%06x %06x %06x %06x shadow=%06x error=%s\n", alpha[0],
+        alpha[1], alpha[2], alpha[3], bravo[0], bravo[1], bravo[2], bravo[3],
+        shadow, navigation.last_error);
+    navigation_destroy(&navigation);
+    bool clean = budget.current == 0;
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+/* Retiring the one sheet with @keyframes clears the sheet's keyframes
+   summary, as a rebuild without it would; a document <style> keyframes
+   rule keeps it set. */
+static bool test_adopted_retirement_recomputes_keyframes(void)
+{
+    static const char html[] =
+        "<!doctype html><p id=pa>Alpha</p><p id=pb>Bravo</p><script>"
+        "globalThis.k=new CSSStyleSheet();"
+        "k.replaceSync('@keyframes spin{from{opacity:0}to{opacity:1}}"
+        "#pa{color:#111111}');"
+        "globalThis.b=new CSSStyleSheet();b.replaceSync('#pb{color:#222222}');"
+        "document.adoptedStyleSheets=[k,b];</script>";
+    Budget budget;
+    bool installed = false;
+    NavigationSession navigation = {0};
+    bool ok = append_order_open(&navigation, &budget, &installed,
+                                "https://adopted-keyframes.test/", html,
+                                sizeof(html) - 1);
+    bool held = ok && navigation.page.stylesheet.has_motion_keyframes;
+    ok = ok && append_order_in_place(&navigation,
+               "document.adoptedStyleSheets=[b]", "<retire-keyframes>");
+    bool retired = navigation.page.stylesheet.has_motion_keyframes;
+    ok = ok && append_order_in_place(&navigation,
+               "document.adoptedStyleSheets=[b,k]", "<readopt-keyframes>");
+    bool readopted = navigation.page.stylesheet.has_motion_keyframes;
+    ok = ok && append_order_mutate(&navigation,
+               "const s=document.createElement('style');"
+               "s.textContent='@keyframes fade{to{opacity:0}}';"
+               "document.head.appendChild(s)", "<document-keyframes>")
+        && append_order_in_place(&navigation,
+               "document.adoptedStyleSheets=[b]", "<retire-beside-document>");
+    bool kept = navigation.page.stylesheet.has_motion_keyframes;
+    /* append_order_matches_rebuild rebuilt each step: the summary above is
+       the in-place one; a rebuild's is checked here. */
+    navigation.style_rebuild_required = true;
+    ok = ok && navigation_relayout(&navigation);
+    bool rebuilt = navigation.page.stylesheet.has_motion_keyframes;
+    ok = ok && held && !retired && readopted && kept && rebuilt;
+    if (!ok) fprintf(stderr, "adopted keyframes: held=%d retired=%d "
+        "readopted=%d kept=%d rebuilt=%d error=%s\n", held, retired,
+        readopted, kept, rebuilt, navigation.last_error);
+    navigation_destroy(&navigation);
+    bool clean = budget.current == 0;
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+/* What a constructed sheet contributes beyond its own rules cannot be
+   taken out again: a sheet with :root variables (the sheet-wide variable
+   table) or @layer (sheet-wide layer order) that must leave or move still
+   rebuilds the sheet. (A plain sheet moving past one is still moved in
+   place: only the sheet that leaves its position must be plain.) */
+static bool test_adopted_sheet_wide_state_still_rebuilds(void)
+{
+    static const char html[] =
+        "<!doctype html><p id=pa>Alpha</p><p id=pb>Bravo</p><script>"
+        "globalThis.v=new CSSStyleSheet();"
+        "v.replaceSync(':root{--tone:#111111}#pa{color:var(--tone)}');"
+        "globalThis.l=new CSSStyleSheet();"
+        "l.replaceSync('@layer base{#pb{color:#222222}}');"
+        "globalThis.b=new CSSStyleSheet();b.replaceSync('#pb{color:#333333}');"
+        "globalThis.c=new CSSStyleSheet();c.replaceSync('#pb{color:#444444}');"
+        "document.adoptedStyleSheets=[v,l,b,c];</script>";
+    Budget budget;
+    bool installed = false;
+    NavigationSession navigation = {0};
+    bool ok = append_order_open(&navigation, &budget, &installed,
+                                "https://adopted-guard.test/", html,
+                                sizeof(html) - 1);
+    size_t full = navigation.performance.full_relayouts;
+    ok = ok && append_order_mutate(&navigation,
+               "document.adoptedStyleSheets=[l,b,c]", "<retire-root-sheet>")
+        && navigation.performance.full_relayouts == full + 1;
+    uint32_t alpha = append_order_text_color(&navigation.page.layout, "Alpha");
+    full = navigation.performance.full_relayouts;
+    ok = ok && append_order_mutate(&navigation,
+               "document.adoptedStyleSheets=[b,c,l]", "<move-layer-sheet>")
+        && navigation.performance.full_relayouts == full + 1;
+    uint32_t bravo = append_order_text_color(&navigation.page.layout, "Bravo");
+    ok = ok && alpha != 0x111111 && bravo == 0x444444;
+    if (!ok) fprintf(stderr, "adopted guard: alpha=%06x bravo=%06x full=%zu "
+        "error=%s\n", alpha, bravo, navigation.performance.full_relayouts,
+        navigation.last_error);
+    navigation_destroy(&navigation);
+    bool clean = budget.current == 0;
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+/* A component framework inserts a whole rendered tree at once, and adopts
+   a dozen new constructed sheets in one task: neither alone is a reason
+   to rebuild the sheet (the subtree walk shares the document walk's
+   bound; the candidate table holds the whole adopted tier). The tree's
+   first <style> is what the journal's own bounded walk sees; the one past
+   its bound is found by the navigation walk. */
+static bool test_large_insertions_append_in_place(void)
+{
+    static const char html[] =
+        "<!doctype html><p id=pa>Alpha</p><p id=pb>Bravo</p>"
+        "<style>#pa{color:#010101}</style>";
+    Budget budget;
+    bool installed = false;
+    NavigationSession navigation = {0};
+    bool ok = append_order_open(&navigation, &budget, &installed,
+                                "https://large-insertion.test/", html,
+                                sizeof(html) - 1);
+    ok = ok && append_order_in_place(&navigation,
+               "const d=document.createElement('div');"
+               "const s=document.createElement('style');"
+               "s.textContent='#pa{color:#555555}';d.appendChild(s);"
+               "for(let i=0;i<300;i++){const p=document.createElement('span');"
+               "p.textContent='x';d.appendChild(p);}"
+               "const t=document.createElement('style');"
+               "t.textContent='#pb{color:#666666}';d.appendChild(t);"
+               "document.body.appendChild(d)", "<large-subtree>");
+    uint32_t late = append_order_text_color(&navigation.page.layout, "Bravo");
+    uint32_t alpha = append_order_text_color(&navigation.page.layout, "Alpha");
+    ok = ok && append_order_in_place(&navigation,
+               "const list=[];for(let i=0;i<12;i++){"
+               "const s=new CSSStyleSheet();"
+               "s.replaceSync('#pb{color:#'+(0x100000+i).toString(16)+'}');"
+               "list.push(s);}document.adoptedStyleSheets=list",
+               "<many-adoptions>");
+    uint32_t bravo = append_order_text_color(&navigation.page.layout, "Bravo");
+    ok = ok && alpha == 0x555555 && late == 0x666666 && bravo == 0x10000b;
+    if (!ok) fprintf(stderr, "large insertions: alpha=%06x late=%06x "
+        "bravo=%06x error=%s\n", alpha, late, bravo, navigation.last_error);
+    navigation_destroy(&navigation);
+    bool clean = budget.current == 0;
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+/* A constructed sheet adopted by shadow roots alone reaches only those
+   hosts' subtrees: an in-place change of it re-resolves the styles there
+   and keeps every other element's. A sheet that also moves sheet-wide
+   state (here :root variables), or names keyframes, still re-resolves
+   them all. Each step is checked against a rebuild. */
+static bool test_shadow_only_adoption_keeps_outside_styles(void)
+{
+    static char html[16384];
+    size_t length = (size_t) snprintf(html, sizeof(html),
+        "<!doctype html><div id=host></div>");
+    for (unsigned i = 0; i < 300 && length < sizeof(html) - 64u; i++)
+        length += (size_t) snprintf(html + length, sizeof(html) - length,
+                                    "<p class=o>Outside %u</p>", i);
+    length += (size_t) snprintf(html + length, sizeof(html) - length,
+        "<script>globalThis.root=document.getElementById('host')"
+        ".attachShadow({mode:'open'});root.innerHTML='<p>Inside</p>';"
+        "globalThis.x=new CSSStyleSheet();x.replaceSync('p{color:#111111}');"
+        "root.adoptedStyleSheets=[x];</script>");
+    Budget budget;
+    bool installed = false;
+    NavigationSession navigation = {0};
+    bool ok = length < sizeof(html)
+        && append_order_open(&navigation, &budget, &installed,
+                             "https://shadow-scope.test/", html, length);
+    size_t misses[3] = {0};
+    uint32_t inside[3] = {0};
+    static const char *const steps[3] = {
+        "globalThis.y=new CSSStyleSheet();y.replaceSync('p{color:#222222}');"
+        "root.adoptedStyleSheets=[x,y]",
+        "globalThis.v=new CSSStyleSheet();"
+        "v.replaceSync(':root{--t:#333333}p{color:var(--t,#333333)}');"
+        "root.adoptedStyleSheets=[x,y,v]",
+        "globalThis.k=new CSSStyleSheet();"
+        "k.replaceSync('@keyframes spin{to{opacity:0}}p{color:#444444}');"
+        "root.adoptedStyleSheets=[x,y,v,k]"
+    };
+    for (size_t i = 0; ok && i < 3; i++) {
+        LayoutReuseStats before = {0}, after = {0};
+        layout_reuse_cache_stats(navigation.page.layout_reuse, &before);
+        size_t full = navigation.performance.full_relayouts;
+        size_t appends = navigation.performance.mutation_style_appends;
+        ok = append_order_mutate(&navigation, steps[i], "<shadow-step>")
+            && navigation.performance.full_relayouts == full
+            && navigation.performance.mutation_style_appends == appends + 1;
+        layout_reuse_cache_stats(navigation.page.layout_reuse, &after);
+        misses[i] = after.style_misses - before.style_misses;
+        inside[i] = append_order_text_color(&navigation.page.layout, "Inside");
+        ok = ok && append_order_text_color(&navigation.page.layout,
+                                           "Outside") == 0
+            && append_order_matches_rebuild(&navigation, "shadow step");
+    }
+    /* The scoped step re-resolves the host, its shadow tree and the
+       elements the relayout itself touches; the others, all 300. */
+    ok = ok && misses[0] < 50 && misses[1] >= 300 && misses[2] >= 300
+        && inside[0] == 0x222222 && inside[1] == 0x333333
+        && inside[2] == 0x444444;
+    if (!ok) fprintf(stderr, "shadow scope: misses=%zu %zu %zu inside=%06x "
+        "%06x %06x error=%s\n", misses[0], misses[1], misses[2], inside[0],
+        inside[1], inside[2], navigation.last_error);
+    navigation_destroy(&navigation);
+    bool clean = budget.current == 0;
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+/* A <style> element's text can change through its child list: a text
+   node inserted into it or removed from it (archive.org's theme writes
+   its :root variables into head <style> elements that way). Each such
+   change must reach the sheet; the journal used to classify it by the
+   text node's own subtree, which holds no stylesheet, so the page kept
+   the old cascade until some unrelated rebuild. */
+static bool test_style_text_child_changes_reach_sheet(void)
+{
+    static const char html[] =
+        "<!doctype html><style id=empty></style>"
+        "<style id=full>#pb{color:#222222}</style>"
+        "<p id=pa>Alpha</p><p id=pb>Bravo</p>"
+        "<script>globalThis.later=document.createElement('style');"
+        "document.head.appendChild(later);</script>";
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 4);
+    if (ready) {
+        navigation_enable_scripts(&navigation, 4 * MIB, 1000);
+        navigation_enable_document_scripts(&navigation, 4, 32 * 1024,
+                                            16 * 1024, 1000);
+    }
+    bool ok = ready && navigation_commit_html(&navigation,
+        navigation_begin(&navigation), "https://style-text-child.test/",
+        html, sizeof(html) - 1, 480, NULL, NULL, true);
+    uint32_t inserted = 0, removed = 0, replaced = 0, appended = 0;
+    ok = ok && append_order_mutate(&navigation,
+               "document.getElementById('empty').appendChild("
+               "document.createTextNode('#pa{color:#111111}'))",
+               "<insert-text>");
+    inserted = append_order_text_color(&navigation.page.layout, "Alpha");
+    ok = ok && inserted == 0x111111
+        && append_order_matches_rebuild(&navigation, "inserted text")
+        && append_order_mutate(&navigation,
+               "document.getElementById('full').firstChild.remove()",
+               "<remove-text>");
+    removed = append_order_text_color(&navigation.page.layout, "Bravo");
+    ok = ok && removed != 0x222222
+        && append_order_matches_rebuild(&navigation, "removed text")
+        && append_order_mutate(&navigation,
+               "const e=document.getElementById('empty');"
+               "e.firstChild.remove();"
+               "e.appendChild(document.createTextNode('#pa{color:#333333}'))",
+               "<replace-text>");
+    replaced = append_order_text_color(&navigation.page.layout, "Alpha");
+    ok = ok && replaced == 0x333333
+        && append_order_matches_rebuild(&navigation, "replaced text")
+        && append_order_mutate(&navigation,
+               "later.appendChild(document.createTextNode("
+               "'#pb{color:#444444}'))", "<later-text>");
+    appended = append_order_text_color(&navigation.page.layout, "Bravo");
+    ok = ok && appended == 0x444444
+        && append_order_matches_rebuild(&navigation, "later text");
+    if (!ok) fprintf(stderr, "style text child: inserted=%06x removed=%06x "
+        "replaced=%06x appended=%06x error=%s\n", inserted, removed,
+        replaced, appended, navigation.last_error);
+    if (ready) navigation_destroy(&navigation);
+    bool clean = budget.current == 0;
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
 static bool test_confined_style_append_keeps_selector_cache(void)
 {
     static const char html[] =
@@ -2096,15 +2514,20 @@ static bool test_confined_style_append_keeps_selector_cache(void)
    whole document. */
 static bool test_style_append_past_source_bound_keeps_confinement(void)
 {
-    static const char html[] =
+    /* Fill the source table: the first <style>, LIMIT - 2 more and the
+       shadow-only constructed sheet. */
+    char html[1024];
+    int html_length = snprintf(html, sizeof(html),
         "<!doctype html><style>.sample{color:#010203}</style>"
         "<p class=sample>Outside</p><div id=ha></div><script>"
-        "for(let i=0;i<46;i++){let s=document.createElement('style');"
+        "for(let i=0;i<%u;i++){let s=document.createElement('style');"
         "s.textContent='.unused'+i+'{color:red}';document.head.appendChild(s);}"
         "globalThis.a=new CSSStyleSheet();a.replaceSync('.sample{color:#112233}');"
         "globalThis.ra=document.getElementById('ha').attachShadow({mode:'open'});"
         "ra.innerHTML='<span class=sample>InsideA</span>';"
-        "ra.adoptedStyleSheets=[a];</script>";
+        "ra.adoptedStyleSheets=[a];</script>",
+        (unsigned) (STYLE_SOURCE_NODE_LIMIT - 2u));
+    if (html_length < 0 || (size_t) html_length >= sizeof(html)) return false;
     Budget budget;
     budget_init(&budget, 16 * MIB);
     bool installed = budget_install_lexbor(&budget);
@@ -2117,10 +2540,10 @@ static bool test_style_append_past_source_bound_keeps_confinement(void)
     }
     uint64_t generation = ready ? navigation_begin(&navigation) : 0;
     bool ok = ready && navigation_commit_html(&navigation, generation,
-        "https://source-bound.test/", html, sizeof(html) - 1,
+        "https://source-bound.test/", html, (size_t) html_length,
         480, NULL, NULL, true);
     const Stylesheet *sheet = &navigation.page.stylesheet;
-    /* 47 document sources and the shadow-only constructed sheet. */
+    /* LIMIT - 1 document sources and the shadow-only constructed sheet. */
     ok = ok && sheet->style_source_count == STYLE_SOURCE_NODE_LIMIT
         && !sheet->style_sources_bounded_out
         && sheet->scopes.adopted_source_count == 1
@@ -2620,7 +3043,7 @@ static bool test_image_only_changes_rebuild_images_alone(void)
     "CAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="
 #define IMAGE_TIER_TWO "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAAC" \
     "CAYAAABytg0kAAAAEUlEQVR4nGP4z8DwH4QZYAwAR8oH+WdZbrcAAAAASUVORK5CYII="
-    char html[16384];
+    char html[32768];
     int used = snprintf(html, sizeof(html),
         "<!doctype html><title>Image tier</title>"
         "<style>p{color:#102030}.hot{color:#405060}</style><body>"
@@ -2674,16 +3097,17 @@ static bool test_image_only_changes_rebuild_images_alone(void)
                      navigation.page.images.stats.inline_svg_refresh_reused,
                      navigation.page.images.stats.inline_svg_rasterized);
     ok = ok && append_order_matches_rebuild(&navigation, "image removal");
-    /* 200 distinct changes in one turn (chatgpt.com's conversation swap
-       makes 247) still fit the journal: no overflow, no image rebuild. */
+    /* 600 distinct changes in one turn (a component page's batch of promise
+       jobs commits about that many) still fit the journal: no overflow, no
+       image rebuild. */
     size_t overflows = navigation.performance.mutation_journal_overflows;
     tiers = navigation.performance.mutation_image_rebuilds;
     ok = ok && append_order_mutate(&navigation,
         "document.querySelectorAll('.row').forEach((p,i)=>"
-        "{if(i<200)p.setAttribute('data-k',String(i));})", "<journal-200>")
+        "{if(i<600)p.setAttribute('data-k',String(i));})", "<journal-600>")
         && navigation.performance.mutation_journal_overflows == overflows
         && navigation.performance.mutation_image_rebuilds == tiers;
-    if (!ok) fprintf(stderr, "journal 200: overflows=%zu tiers=%zu\n",
+    if (!ok) fprintf(stderr, "journal 600: overflows=%zu tiers=%zu\n",
                      navigation.performance.mutation_journal_overflows,
                      navigation.performance.mutation_image_rebuilds);
     full = navigation.performance.full_relayouts;

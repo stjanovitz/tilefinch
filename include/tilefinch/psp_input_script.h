@@ -60,8 +60,20 @@ typedef enum {
     PSP_INPUT_SCRIPT_STEP_TIMED_PRESS,
     /* One idle frame on which the host performs a named page action (see
        PspInputScriptPageAction). */
-    PSP_INPUT_SCRIPT_STEP_PAGE_ACTION
+    PSP_INPUT_SCRIPT_STEP_PAGE_ACTION,
+    /* answer-question: up to `ticks` idle frames waiting on the player.
+       While a media question is pending (the unencrypted-audio "Play
+       anyway?") it presses `buttons` as a tap; once the media is already
+       playing, or the bound runs out, it ends without pressing. */
+    PSP_INPUT_SCRIPT_STEP_ANSWER_QUESTION
 } PspInputScriptStepKind;
+
+typedef enum {
+    PSP_INPUT_SCRIPT_QUESTION_NONE = 0,
+    PSP_INPUT_SCRIPT_QUESTION_ANSWERED,
+    PSP_INPUT_SCRIPT_QUESTION_NOT_ASKED,
+    PSP_INPUT_SCRIPT_QUESTION_TIMED_OUT
+} PspInputScriptQuestionOutcome;
 
 typedef enum {
     PSP_INPUT_SCRIPT_PAGE_ACTION_NONE = 0,
@@ -115,6 +127,15 @@ typedef struct {
     const char *mark;
     /* Likewise the current page-action step's action. */
     uint8_t page_action;
+    /* Set by the host each frame from the visible player, for
+       answer-question. */
+    bool media_question_pending;
+    bool media_playing;
+    /* answer-question: its tap is under way. */
+    bool question_pressing;
+    /* The answer-question decision made on this frame, for the host's log
+       (PspInputScriptQuestionOutcome; NONE on other frames). */
+    uint8_t question_outcome;
 } PspInputScript;
 
 typedef void (*PspInputScriptWarning)(
@@ -144,6 +165,12 @@ bool psp_input_script_exit_pending(const PspInputScript *script);
    cancellation once so the modal receiver can unwind and report the failure. */
 bool psp_input_script_cancel_exhausted_modal(
     PspInputScript *script, PspUiInput *input);
+
+/* The player's state for answer-question; the host sets it every frame. */
+void psp_input_script_set_media_question(
+    PspInputScript *script, bool question_pending, bool playing);
+PspInputScriptQuestionOutcome psp_input_script_question_outcome(
+    const PspInputScript *script);
 
 /* True while the current step is an `until` wait the host should test. */
 bool psp_input_script_awaiting_condition(const PspInputScript *script);

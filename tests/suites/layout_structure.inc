@@ -1241,6 +1241,61 @@ static int test_directional_logical_properties(Budget *budget)
     return 0;
 }
 
+/* Every right-to-left paragraph of a long page is reordered. The
+   retained glyph and command caps were 4,096 and 1,024 for the whole
+   document, so after a few paragraphs every later line fell back to
+   logical order. 64 paragraphs of 40 four-letter Hebrew words need
+   10,240 glyphs and at least 2,560 mapped commands. */
+static int test_bidi_long_document(Budget *budget)
+{
+    enum { PARAGRAPHS = 64, WORDS = 40 };
+    static char page[PARAGRAPHS * (WORDS * 9 + 32) + 128];
+    size_t used = (size_t) snprintf(page, sizeof(page),
+        "<!doctype html><style>body{margin:0}</style><body>");
+    for (int p = 0; p < PARAGRAPHS; p++) {
+        used += (size_t) snprintf(page + used, sizeof(page) - used,
+                                  "<p dir=rtl>");
+        for (int w = 0; w < WORDS; w++)
+            used += (size_t) snprintf(page + used, sizeof(page) - used,
+                "\xd7\x90\xd7\x91\xd7\x92\xd7\x93 ");
+        used += (size_t) snprintf(page + used, sizeof(page) - used, "</p>");
+    }
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument layout = {0};
+    CHECK(document_parse(&document, budget, page, used, 19)
+          && stylesheet_build(&sheet, budget, &document, 480)
+          && layout_build(&layout, budget, &document, &sheet,
+                          NULL, NULL, 480));
+    size_t hebrew = 0, unmapped = 0;
+    const DrawCommand *last = NULL;
+    for (size_t i = 0; i < layout.count; i++) {
+        const DrawCommand *command = &layout.commands[i];
+        if (command->type != DRAW_TEXT || command->text_length < 2
+            || (unsigned char) command->text[0] != 0xd7) continue;
+        hebrew++;
+        last = command;
+        if (layout_bidi_command_for_index(&layout, i) == NULL) unmapped++;
+    }
+    if (layout.performance.bidi_paragraphs < PARAGRAPHS
+        || layout.performance.bidi_limit_degradations != 0
+        || hebrew == 0 || unmapped != 0 || last == NULL
+        || layout.bidi_glyph_count < (size_t) PARAGRAPHS * WORDS * 4u) {
+        fprintf(stderr, "long rtl document: paragraphs %llu degraded %llu "
+                "hebrew commands %zu unmapped %zu glyphs %zu\n",
+                (unsigned long long) layout.performance.bidi_paragraphs,
+                (unsigned long long)
+                    layout.performance.bidi_limit_degradations,
+                hebrew, unmapped, layout.bidi_glyph_count);
+        CHECK(false);
+    }
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == 0);
+    return 0;
+}
+
 static int test_international_line_flow(Budget *budget)
 {
     static const char page[] =
@@ -1324,14 +1379,14 @@ static int test_international_line_flow(Budget *budget)
     size_t arabic_index = (size_t) (arabic - layout.commands);
     const LayoutBidiCommand *arabic_bidi = layout_bidi_command_for_index(
         &layout, arabic_index);
-    CHECK(arabic_bidi != NULL && arabic_bidi->glyph_count == 4);
+    /* Lam and alef form the required ligature (FEFC, joined to the seen). */
+    CHECK(arabic_bidi != NULL && arabic_bidi->glyph_count == 3);
     const LayoutBidiGlyph *arabic_glyphs =
         &layout.bidi_glyphs[arabic_bidi->glyph_start];
     CHECK(arabic_glyphs[0].codepoint == 0xfee1u
-          && arabic_glyphs[1].codepoint == 0xfe8eu
-          && arabic_glyphs[2].codepoint == 0xfee0u
-          && arabic_glyphs[3].codepoint == 0xfeb3u
-          && arabic_glyphs[0].x_fixed < arabic_glyphs[3].x_fixed);
+          && arabic_glyphs[1].codepoint == 0xfefcu
+          && arabic_glyphs[2].codepoint == 0xfeb3u
+          && arabic_glyphs[0].x_fixed < arabic_glyphs[2].x_fixed);
     size_t visual_logical = SIZE_MAX;
     int visual_caret = -1;
     CHECK(layout_bidi_visual_hit_test(
@@ -1597,6 +1652,162 @@ static int test_international_line_flow(Budget *budget)
         CHECK(layout.commands[i].type != DRAW_TEXT
               || !draw_command_text_rtl(&layout.commands[i]));
     }
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == 0);
+    return 0;
+}
+
+/* Every painted copy of an Arabic word in a form control: meem, then the
+   lam-alef ligature, then the first letter's initial form, left to right. */
+#define CONTROL_WORD_TAIL "\xd9\x84\xd8\xa7\xd9\x85"
+static int check_control_word(const LayoutDocument *layout, const char *word,
+                              uint32_t initial_form, size_t wanted_copies)
+{
+    size_t length = strlen(word), copies = 0;
+    for (size_t at = 0; at < layout->count; at++) {
+        const DrawCommand *command = &layout->commands[at];
+        if (command->type != DRAW_TEXT || command->text_length != length
+            || memcmp(command->text, word, length) != 0) continue;
+        copies++;
+        const LayoutBidiCommand *bidi = layout_bidi_command_for_index(layout, at);
+        CHECK(bidi != NULL && bidi->glyph_count == 3);
+        const LayoutBidiGlyph *glyphs = &layout->bidi_glyphs[bidi->glyph_start];
+        CHECK(glyphs[0].codepoint == 0xfee1u && glyphs[1].codepoint == 0xfefcu
+              && glyphs[2].codepoint == initial_form
+              && glyphs[0].x_fixed == draw_command_text_x_fixed(command)
+              && glyphs[0].x_fixed < glyphs[1].x_fixed
+              && glyphs[1].x_fixed < glyphs[2].x_fixed);
+    }
+    CHECK(copies == wanted_copies);
+    return 0;
+}
+
+static int test_control_text_visual_order(Budget *budget)
+{
+    static const char page[] =
+        "<!doctype html><style>"
+        "input,textarea{width:200px;border:0;padding:0;margin:0}"
+        "#block{display:block;text-shadow:1px 1px #000}"
+        "</style>"
+        "<div><input id=placeholder placeholder=\"\xd8\xb3" CONTROL_WORD_TAIL "\"></div>"
+        "<div><input id=value value=\"\xd8\xa8" CONTROL_WORD_TAIL "\"></div>"
+        "<div><textarea id=area>\xd8\xaa" CONTROL_WORD_TAIL "</textarea></div>"
+        "<div><input id=submit type=submit value=\"\xd9\x86" CONTROL_WORD_TAIL "\"></div>"
+        "<div><input id=block placeholder=\"\xd9\x8a" CONTROL_WORD_TAIL "\"></div>"
+        "<div style=text-align:right><input placeholder=\"\xd9\x81" CONTROL_WORD_TAIL "\"></div>"
+        /* The control's entry lands before the line's lower commands. */
+        "<p>\xd8\xac" CONTROL_WORD_TAIL " <input placeholder=\"\xd9\x83" CONTROL_WORD_TAIL "\"> "
+        "\xd8\xad" CONTROL_WORD_TAIL "</p>"
+        "<div dir=rtl style=width:300px>\xd9\x82" CONTROL_WORD_TAIL " "
+        "<input placeholder=\"\xd9\x87" CONTROL_WORD_TAIL "\"></div>"
+        /* A right-to-left inline fragment mirrors what it holds. */
+        "<p>abc <span dir=rtl><input placeholder=\"\xd8\xb5" CONTROL_WORD_TAIL "\"></span> def</p>"
+        /* These paint their text as ordinary child content. */
+        "<div><select><option>\xd8\xb8" CONTROL_WORD_TAIL "</option></select></div>"
+        "<div><button>\xd8\xae" CONTROL_WORD_TAIL "</button></div>"
+        "<div contenteditable>\xd8\xb4" CONTROL_WORD_TAIL "</div>"
+        "<div><input id=hebrew placeholder=\"\xd7\xa9\xd7\x9c\xd7\x95\xd7\x9d\"></div>"
+        "<div><input id=mixed placeholder=\"\xd8\xb9" CONTROL_WORD_TAIL " YouTube\"></div>"
+        "<div dir=rtl><input id=rtl placeholder=\"\xd8\xba" CONTROL_WORD_TAIL " YouTube\"></div>"
+        "<div><input id=latin placeholder=\"Search\"></div>"
+        "<div><input type=password value=\"\xd8\xb6" CONTROL_WORD_TAIL "\"></div>";
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument layout = {0};
+    CHECK(document_parse(&document, budget, page, strlen(page), 443)
+          && stylesheet_build(&sheet, budget, &document, 480)
+          && layout_build(&layout, budget, &document, &sheet, NULL, NULL, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+
+    CHECK(check_control_word(&layout, "\xd8\xb3" CONTROL_WORD_TAIL, 0xfeb3u, 1) == 0);
+    CHECK(check_control_word(&layout, "\xd8\xa8" CONTROL_WORD_TAIL, 0xfe91u, 1) == 0);
+    CHECK(check_control_word(&layout, "\xd8\xaa" CONTROL_WORD_TAIL, 0xfe97u, 1) == 0);
+    CHECK(check_control_word(&layout, "\xd9\x86" CONTROL_WORD_TAIL, 0xfee7u, 1) == 0);
+    /* The block arm paints a shadow copy first, as its own command. */
+    CHECK(check_control_word(&layout, "\xd9\x8a" CONTROL_WORD_TAIL, 0xfef3u, 2) == 0);
+    /* A line aligned after the pass moves the glyphs with the command. */
+    CHECK(check_control_word(&layout, "\xd9\x81" CONTROL_WORD_TAIL, 0xfed3u, 1) == 0);
+    CHECK(check_control_word(&layout, "\xd8\xac" CONTROL_WORD_TAIL, 0xfe9fu, 1) == 0);
+    CHECK(check_control_word(&layout, "\xd9\x83" CONTROL_WORD_TAIL, 0xfedbu, 1) == 0);
+    CHECK(check_control_word(&layout, "\xd8\xad" CONTROL_WORD_TAIL, 0xfea3u, 1) == 0);
+    CHECK(check_control_word(&layout, "\xd9\x82" CONTROL_WORD_TAIL, 0xfed7u, 1) == 0);
+    CHECK(check_control_word(&layout, "\xd9\x87" CONTROL_WORD_TAIL, 0xfeebu, 1) == 0);
+    CHECK(check_control_word(&layout, "\xd8\xb5" CONTROL_WORD_TAIL, 0xfebbu, 1) == 0);
+    CHECK(check_control_word(&layout, "\xd8\xb8" CONTROL_WORD_TAIL, 0xfec7u, 1) == 0);
+    CHECK(check_control_word(&layout, "\xd8\xae" CONTROL_WORD_TAIL, 0xfea7u, 1) == 0);
+    CHECK(check_control_word(&layout, "\xd8\xb4" CONTROL_WORD_TAIL, 0xfeb7u, 1) == 0);
+    for (size_t at = 1; at < layout.bidi_command_count; at++)
+        CHECK(layout.bidi_commands[at - 1].command_index
+              < layout.bidi_commands[at].command_index);
+
+    /* Hebrew has no joining, so only the order shows. */
+    const DrawCommand *hebrew = text_command(
+        &layout, "\xd7\xa9\xd7\x9c\xd7\x95\xd7\x9d");
+    CHECK(hebrew != NULL);
+    const LayoutBidiCommand *hebrew_bidi = layout_bidi_command_for_index(
+        &layout, (size_t) (hebrew - layout.commands));
+    CHECK(hebrew_bidi != NULL && hebrew_bidi->glyph_count == 4);
+    const LayoutBidiGlyph *hebrew_glyphs =
+        &layout.bidi_glyphs[hebrew_bidi->glyph_start];
+    CHECK(hebrew_glyphs[0].codepoint == 0x05ddu
+          && hebrew_glyphs[3].codepoint == 0x05e9u
+          && hebrew_glyphs[0].x_fixed < hebrew_glyphs[3].x_fixed);
+
+    /* Its own direction decides the order of mixed text and the edge it sits
+       against: Arabic first from the left in a left-to-right control, and in
+       a right-to-left one the Latin word on the left, ending at the box. */
+    const DrawCommand *mixed = text_command(
+        &layout, "\xd8\xb9" CONTROL_WORD_TAIL " YouTube");
+    const LayoutNodeBox *mixed_box = layout_box_for_node(&layout, find_id(root, "mixed"));
+    CHECK(mixed != NULL && mixed_box != NULL && mixed->x == mixed_box->x);
+    const LayoutBidiCommand *mixed_bidi = layout_bidi_command_for_index(
+        &layout, (size_t) (mixed - layout.commands));
+    CHECK(mixed_bidi != NULL && mixed_bidi->glyph_count == 11);
+    const LayoutBidiGlyph *mixed_glyphs = &layout.bidi_glyphs[mixed_bidi->glyph_start];
+    CHECK(mixed_glyphs[0].codepoint == 0xfee1u && mixed_glyphs[10].codepoint == 'e');
+    const DrawCommand *rtl = text_command(
+        &layout, "\xd8\xba" CONTROL_WORD_TAIL " YouTube");
+    const LayoutNodeBox *rtl_box = layout_box_for_node(&layout, find_id(root, "rtl"));
+    CHECK(rtl != NULL && rtl_box != NULL && rtl->width < rtl_box->width
+          && rtl->x + rtl->width == rtl_box->x + rtl_box->width);
+    const LayoutBidiCommand *rtl_bidi = layout_bidi_command_for_index(
+        &layout, (size_t) (rtl - layout.commands));
+    CHECK(rtl_bidi != NULL && rtl_bidi->glyph_count == 11);
+    const LayoutBidiGlyph *rtl_glyphs = &layout.bidi_glyphs[rtl_bidi->glyph_start];
+    CHECK(rtl_glyphs[0].codepoint == 'Y' && rtl_glyphs[10].codepoint == 0xfecfu
+          && rtl_glyphs[0].x_fixed == draw_command_text_x_fixed(rtl));
+
+    /* Latin keeps the plain path and its whole box; a password stays masked. */
+    const DrawCommand *latin = text_command(&layout, "Search");
+    CHECK(latin != NULL && latin->width == 200
+          && layout_bidi_command_for_index(
+                 &layout, (size_t) (latin - layout.commands)) == NULL);
+    const DrawCommand *mask = text_command(&layout, "********");
+    CHECK(mask != NULL
+          && layout_bidi_command_for_index(
+                 &layout, (size_t) (mask - layout.commands)) == NULL);
+
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+
+    /* A paragraph over the span limit gets no flow, so its right-to-left lines
+       mirror instead of resolving, and the control's glyphs must follow. */
+    static char degraded[32768];
+    size_t used = (size_t) snprintf(degraded, sizeof(degraded),
+        "<!doctype html><div dir=rtl>");
+    for (size_t span = 0; span < 600; span++)
+        used += (size_t) snprintf(degraded + used, sizeof(degraded) - used,
+                                  "<span>a </span>");
+    snprintf(degraded + used, sizeof(degraded) - used,
+             "<input placeholder=\"\xd8\xb7" CONTROL_WORD_TAIL "\"></div>");
+    CHECK(document_parse(&document, budget, degraded, strlen(degraded), 443)
+          && stylesheet_build(&sheet, budget, &document, 480)
+          && layout_build(&layout, budget, &document, &sheet, NULL, NULL, 480)
+          && layout.performance.bidi_limit_degradations != 0);
+    CHECK(check_control_word(&layout, "\xd8\xb7" CONTROL_WORD_TAIL, 0xfec3u, 1) == 0);
     layout_destroy(&layout);
     stylesheet_destroy(&sheet);
     document_destroy(&document);
@@ -3213,6 +3424,112 @@ static int test_all_inherit_and_static_action_shell(Budget *budget)
     return 0;
 }
 
+/* `all: unset` and `all: initial` reset every property but direction to
+   its inherited or initial value (the Internet Archive's tile statistics
+   reset their <ul> this way). The flag is part of a declaration's
+   identity: an `li` rule with the same remaining declarations must not
+   share the reset. */
+static int test_all_unset_and_initial(Budget *budget)
+{
+    static const char page[] =
+        "<!doctype html><style>"
+        "ul.u{all:unset;list-style-type:none}li{list-style-type:none}"
+        "#row{display:flex}p.i{all:initial}"
+        "div.inh{color:#008000}</style><body><div class=inh id=inh>"
+        "<ul class=u id=row><li id=a>a</li></ul>"
+        "<ul class=u id=plain><li>c</li></ul><p class=i id=p>x</p></div>"
+        "</body>";
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    CHECK(document_parse(&document, budget, page, sizeof(page) - 1u, 19)
+          && stylesheet_build(&sheet, budget, &document, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    ComputedStyle inh = style_for_node(&sheet, find_id(root, "inh"), NULL);
+    ComputedStyle row = style_for_node(&sheet, find_id(root, "row"), &inh);
+    ComputedStyle plain = style_for_node(
+        &sheet, find_id(root, "plain"), &inh);
+    ComputedStyle item = style_for_node(&sheet, find_id(root, "a"), &row);
+    ComputedStyle reset = style_for_node(&sheet, find_id(root, "p"), &inh);
+    CHECK(row.display == DISPLAY_FLEX && row.padding.left == 0
+          && row.margin.top == 0);
+    CHECK(plain.display == DISPLAY_INLINE && plain.padding.left == 0
+          && plain.color == 0x008000u);
+    CHECK(item.display == DISPLAY_BLOCK && item.list_item);
+    CHECK(reset.display == DISPLAY_INLINE && reset.color == 0x000000u
+          && reset.margin.top == 0);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == 0);
+    return 0;
+}
+
+/* Flex, generated-box and intrinsic-width cases from the Internet
+   Archive's search header: an inflexible zero-basis item keeps its content
+   minimum out of its siblings' growth; a height:0 bold-width reservation
+   ::before takes no room; a comment before a wrapped icon does not drop
+   the space before it from a shrink-to-fit button. */
+static int test_search_header_layout(Budget *budget)
+{
+    static const char page[] =
+        "<!doctype html><style>body{margin:0;font-size:14px}"
+        ".bar{display:flex;width:453px}.grow{flex:1 1 auto}"
+        ".zero{flex:0 1 0%}.zero div{width:108px;height:10px}"
+        ".tab{display:block;padding:6px 5px 2px}"
+        ".tab::before{content:attr(data-sizing);display:block;"
+        "font-weight:bold;height:0;overflow:hidden;visibility:hidden}"
+        ".btn{display:inline-block}svg{width:10px;height:10px}"
+        "</style><body>"
+        "<div class=bar><div class=grow id=grow>Sort by</div>"
+        "<div class=zero id=zero><div></div></div></div>"
+        "<div class=tab id=sized data-sizing=All>All</div>"
+        "<div class=tab id=plain>All</div>"
+        "<div><span class=btn id=marked>Feedback "
+        "<span><!--part--><svg></svg></span> <span><svg></svg></span>"
+        "</span></div>"
+        "<div><span class=btn id=unmarked>Feedback "
+        "<span><svg></svg></span> <span><svg></svg></span></span></div>"
+        "</body>";
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument layout = {0};
+    CHECK(document_parse(&document, budget, page, sizeof(page) - 1u, 19)
+          && stylesheet_build(&sheet, budget, &document, 480)
+          && layout_build(&layout, budget, &document, &sheet,
+                          NULL, NULL, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    const LayoutNodeBox *grow = layout_box_for_node(
+        &layout, find_id(root, "grow"));
+    const LayoutNodeBox *zero = layout_box_for_node(
+        &layout, find_id(root, "zero"));
+    const LayoutNodeBox *sized = layout_box_for_node(
+        &layout, find_id(root, "sized"));
+    const LayoutNodeBox *plain = layout_box_for_node(
+        &layout, find_id(root, "plain"));
+    const LayoutNodeBox *marked = layout_box_for_node(
+        &layout, find_id(root, "marked"));
+    const LayoutNodeBox *unmarked = layout_box_for_node(
+        &layout, find_id(root, "unmarked"));
+    CHECK(grow != NULL && zero != NULL && sized != NULL && plain != NULL
+          && marked != NULL && unmarked != NULL);
+    if (grow->width != 345 || zero->width != 108 || zero->x != 345
+        || sized->height != plain->height
+        || marked->width != unmarked->width
+        || marked->height != unmarked->height)
+        fprintf(stderr, "search header: grow=%d zero=%d@%d tab=%d/%d "
+                "button=%dx%d/%dx%d\n", grow->width, zero->width, zero->x,
+                sized->height, plain->height, marked->width,
+                marked->height, unmarked->width, unmarked->height);
+    CHECK(grow->width == 345 && zero->width == 108 && zero->x == 345);
+    CHECK(sized->height == plain->height);
+    CHECK(marked->width == unmarked->width
+          && marked->height == unmarked->height);
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == 0);
+    return 0;
+}
+
 static int test_native_form_control_fidelity(Budget *budget)
 {
     size_t baseline = budget->current;
@@ -3596,6 +3913,469 @@ static int test_table_cell_vertical_alignment(Budget *budget)
           && positioned_marker_box->positioned_ancestor_distance != 0
           && positioned_marker_box->y == position_row_box->y
           && positioned_link->y == positioned_marker_box->y);
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == 0);
+    return 0;
+}
+/* Shifting a vertically aligned cell's contents is scoped to that cell.
+   Every middle-aligned (the tbody default) or bottom-aligned cell used to
+   scan every box, link and control in the document, so a long table below
+   a long article cost cells x document. Placement of the cell's boxes,
+   links, controls, nested table and positioned children is unchanged. */
+static const LinkRegion *shift_scope_link(const LayoutDocument *layout,
+                                          const lxb_dom_node_t *node)
+{
+    for (size_t i = 0; i < layout->link_count; i++)
+        if (layout->links[i].node == node) return &layout->links[i];
+    return NULL;
+}
+
+static int test_table_cell_shift_scope(Budget *budget)
+{
+    enum { PREAMBLE = 300, ROWS = 20 };
+    static char page[PREAMBLE * 48 + ROWS * 640 + 1024];
+    size_t used = (size_t) snprintf(page, sizeof(page),
+        "<!doctype html><style>body{margin:0;padding:0}"
+        "table{width:400px;border-spacing:0}td{padding:0}"
+        "tr.r{height:40px}.m{display:block;width:8px;height:10px}"
+        ".b{vertical-align:bottom}.t{vertical-align:top}"
+        ".rel{position:relative}.abs{position:absolute;left:0;top:0}"
+        "input{display:block;width:30px;height:12px;padding:0;border:0}"
+        "</style><body>");
+    for (int i = 0; i < PREAMBLE; i++)
+        used += (size_t) snprintf(page + used, sizeof(page) - used,
+                                  "<p><a href=/p%d>p</a></p>", i);
+    used += (size_t) snprintf(page + used, sizeof(page) - used, "<table>");
+    for (int r = 0; r < ROWS; r++) {
+        used += (size_t) snprintf(page + used, sizeof(page) - used,
+            "<tr class=r id=row%d>"
+            "<td><a class=m id=mid%d href=/m%d></a></td>"
+            "<td class=b><a class=m id=bot%d href=/b%d></a></td>"
+            "<td class=t><span class=m id=top%d></span></td>"
+            "<td><input id=in%d></td>"
+            "<td class=rel><a class='m abs' id=abs%d href=/a%d></a>"
+            "<span class=m id=flow%d></span></td>"
+            "<td><table id=inner%d><tr id=irow%d><td>"
+            "<a class=m id=imid%d href=/i%d></a></td></tr></table></td>"
+            "</tr>", r, r, r, r, r, r, r, r, r, r, r, r, r, r);
+    }
+    snprintf(page + used, sizeof(page) - used, "</table></body>");
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument layout = {0};
+    CHECK(document_parse(&document, budget, page, strlen(page), 19)
+          && stylesheet_build(&sheet, budget, &document, 480)
+          && layout_build(&layout, budget, &document, &sheet,
+                          NULL, NULL, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    for (int r = 0; r < ROWS; r++) {
+        char id[16];
+#define SHIFT_SCOPE_BOX(name, prefix) \
+        snprintf(id, sizeof(id), prefix "%d", r); \
+        lxb_dom_node_t *name##_node = find_id(root, id); \
+        const LayoutNodeBox *name = layout_box_for_node(&layout, name##_node); \
+        CHECK(name != NULL)
+        SHIFT_SCOPE_BOX(row, "row");
+        SHIFT_SCOPE_BOX(mid, "mid");
+        SHIFT_SCOPE_BOX(bot, "bot");
+        SHIFT_SCOPE_BOX(top, "top");
+        SHIFT_SCOPE_BOX(input, "in");
+        SHIFT_SCOPE_BOX(abs, "abs");
+        SHIFT_SCOPE_BOX(flow, "flow");
+        SHIFT_SCOPE_BOX(inner, "inner");
+        SHIFT_SCOPE_BOX(irow, "irow");
+        SHIFT_SCOPE_BOX(imid, "imid");
+#undef SHIFT_SCOPE_BOX
+        const LinkRegion *mid_link = shift_scope_link(&layout, mid_node);
+        const LinkRegion *bot_link = shift_scope_link(&layout, bot_node);
+        const LinkRegion *abs_link = shift_scope_link(&layout, abs_node);
+        const LinkRegion *imid_link = shift_scope_link(&layout, imid_node);
+        const ControlRegion *control = NULL;
+        for (size_t i = 0; i < layout.control_count; i++)
+            if (layout.controls[i].node == input_node)
+                control = &layout.controls[i];
+        CHECK(mid_link != NULL && bot_link != NULL && abs_link != NULL
+              && imid_link != NULL && control != NULL);
+        int inner_offset = (row->height - inner->height + 1) / 2;
+        int inner_marker = (irow->height - imid->height + 1) / 2;
+        if (row->height != 40 || mid->y != row->y + 15
+            || mid_link->y != mid->y || bot->y != row->y + 30
+            || bot_link->y != bot->y || top->y != row->y
+            || input->y != row->y + 14 || control->y != input->y
+            || flow->y != row->y + 15 || abs->y != row->y
+            || abs_link->y != abs->y || inner->height != 10
+            || inner->y != row->y + inner_offset
+            || irow->y != inner->y
+            || imid->y != irow->y + inner_marker
+            || imid_link->y != imid->y) {
+            fprintf(stderr,
+                    "cell shift row %d: row %d+%d mid %d/%d bot %d/%d "
+                    "top %d input %d/%d flow %d abs %d/%d inner %d+%d "
+                    "irow %d imid %d/%d\n", r, row->y, row->height,
+                    mid->y, mid_link->y, bot->y, bot_link->y, top->y,
+                    input->y, control->y, flow->y, abs->y, abs_link->y,
+                    inner->y, inner->height, irow->y, imid->y,
+                    imid_link->y);
+            CHECK(false);
+        }
+    }
+    /* Work is per cell, not per document: the preamble's 300 boxes and
+       links are never examined. */
+    if (layout.performance.table_cell_shift_visits > (uint64_t) ROWS * 64u) {
+        fprintf(stderr, "cell shift visits %llu for %d rows\n",
+                (unsigned long long) layout.performance.table_cell_shift_visits,
+                ROWS);
+        CHECK(false);
+    }
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == 0);
+    return 0;
+}
+/* Square border strokes are inserted ahead of their box's content once
+   the box's height is known. The index fix-up after each insertion used to
+   examine every node box and link in the document, so first layout was
+   quadratic in bordered boxes. The strokes, the box ranges and the links
+   inside the bordered boxes are unchanged. */
+static int count_border_strokes(const LayoutDocument *layout,
+                                const LayoutNodeBox *box, uint32_t color)
+{
+    int strokes = 0;
+    for (size_t i = box->command_start; i < box->command_end; i++) {
+        const DrawCommand *command = &layout->commands[i];
+        if (command->type == DRAW_FILL_RECT && command->color == color)
+            strokes++;
+    }
+    return strokes;
+}
+
+static bool link_inside_box(const LinkRegion *link, const LayoutNodeBox *box)
+{
+    return link != NULL && link->x >= box->x && link->y >= box->y
+        && link->x + link->width <= box->x + box->width
+        && link->y + link->height <= box->y + box->height;
+}
+
+/* Marker ordinals in paint order: every DRAW_TEXT that is a decimal
+   number followed by a period. */
+static size_t collect_decimal_markers(const LayoutDocument *layout,
+                                      long *out, size_t capacity)
+{
+    size_t count = 0;
+    for (size_t i = 0; i < layout->count; i++) {
+        const DrawCommand *command = &layout->commands[i];
+        if (command->type != DRAW_TEXT || command->text == NULL
+            || command->text_length < 2 || command->text_length > 15
+            || command->text[command->text_length - 1u] != '.') continue;
+        char text[16];
+        memcpy(text, command->text, command->text_length - 1u);
+        text[command->text_length - 1u] = '\0';
+        char *end = NULL;
+        long value = strtol(text, &end, 10);
+        if (end == text || *end != '\0') continue;
+        if (count < capacity) out[count] = value;
+        count++;
+    }
+    return count;
+}
+
+/* Each <li> of an <ol> counted its ordinal from the list's first child (and
+   a reversed list counted all its items first): a 4,000-item list took
+   108 ms of host layout against 25 ms as a <ul>, and Wikipedia reference
+   lists run to hundreds of items. Items now count on from the item before
+   them, lists nested in items included, with the same ordinals; a count
+   past INT_MAX stays there instead of overflowing. */
+static int test_ordered_list_numbering_is_linear(Budget *budget)
+{
+    enum { ITEMS = 600 };
+    static char page[ITEMS * 64 + 1024];
+    static long markers[ITEMS * 4 + 16], expected[ITEMS * 4 + 16];
+    for (int shape = 0; shape < 5; shape++) {
+        size_t used = (size_t) snprintf(page, sizeof(page),
+            "<!doctype html><style>body{margin:0}li{margin:0}</style><body>");
+        size_t wanted = 0;
+        if (shape == 0 || shape == 1 || shape == 2) {
+            used += (size_t) snprintf(page + used, sizeof(page) - used,
+                "<ol%s>", shape == 1 ? " reversed"
+                : shape == 2 ? " reversed=reversed start=-3" : "");
+            long next = shape == 0 ? 1 : shape == 1 ? ITEMS : -3;
+            for (int i = 0; i < ITEMS; i++) {
+                bool valued = shape == 2 && i == ITEMS / 2;
+                used += (size_t) snprintf(page + used, sizeof(page) - used,
+                    valued ? "<li value=40>i</li>" : "<li>i</li>");
+                if (valued) next = 40;
+                expected[wanted++] = next;
+                next += shape == 0 ? 1 : -1;
+            }
+            used += (size_t) snprintf(page + used, sizeof(page) - used, "</ol>");
+        } else if (shape == 3) {
+            used += (size_t) snprintf(page + used, sizeof(page) - used, "<ol>");
+            for (int i = 0; i < ITEMS / 4; i++) {
+                used += (size_t) snprintf(page + used, sizeof(page) - used,
+                    "<li>o<ol start=7><li>a</li><li>b</li><li>c</li></ol></li>");
+                expected[wanted++] = i + 1;
+                expected[wanted++] = 7;
+                expected[wanted++] = 8;
+                expected[wanted++] = 9;
+            }
+            used += (size_t) snprintf(page + used, sizeof(page) - used, "</ol>");
+        } else {
+            used += (size_t) snprintf(page + used, sizeof(page) - used,
+                "<ol><li value=2147483646>a</li><li>b</li><li>c</li>"
+                "</ol><ol reversed><li value=-2147483647>d</li><li>e</li>"
+                "<li>f</li></ol>");
+            static const long saturated[] = {
+                2147483646L, 2147483647L, 2147483647L,
+                -2147483647L, -2147483647L - 1L, -2147483647L - 1L
+            };
+            for (size_t k = 0; k < 6; k++) expected[wanted++] = saturated[k];
+        }
+        CHECK(used < sizeof(page));
+        PocDocument document = {0};
+        Stylesheet sheet = {0};
+        LayoutDocument layout = {0};
+        CHECK(document_parse(&document, budget, page, used, 20)
+              && stylesheet_build(&sheet, budget, &document, 480)
+              && layout_build(&layout, budget, &document, &sheet,
+                              NULL, NULL, 480));
+        size_t found = collect_decimal_markers(
+            &layout, markers, sizeof(markers) / sizeof(markers[0]));
+        size_t mismatch = found == wanted ? wanted : 0;
+        for (size_t k = 0; found == wanted && k < wanted; k++)
+            if (markers[k] != expected[k]) { mismatch = k; break; }
+        uint64_t steps = layout.performance.list_marker_steps;
+        bool linear = steps <= 4u * ITEMS + 64u;
+        if (found != wanted || mismatch != wanted || !linear)
+            fprintf(stderr, "ol shape %d: markers %zu of %zu, first "
+                    "mismatch %zu (%ld, wanted %ld), steps %llu\n", shape,
+                    found, wanted, mismatch,
+                    mismatch < found ? markers[mismatch] : 0L,
+                    mismatch < wanted ? expected[mismatch] : 0L,
+                    (unsigned long long) steps);
+        CHECK(found == wanted && mismatch == wanted);
+        CHECK(linear);
+        layout_destroy(&layout);
+        stylesheet_destroy(&sheet);
+        document_destroy(&document);
+    }
+    return 0;
+}
+
+/* RS-12: a general-sibling selector answers each sibling from the one
+   before it, in linear work, and still matches exactly the paragraphs the
+   rule selects. Text runs sit between the elements. */
+static int test_general_sibling_selector_is_linear(Budget *budget)
+{
+    enum { ITEMS = 1200, GROUPS = 24 };
+    static char page[ITEMS * 48 + 1024];
+    static bool wanted[ITEMS];
+    static bool painted[ITEMS];
+    static const char *const shapes[] = {
+        "no-anchor", "anchor-in-middle", "many-parents", "two-steps"
+    };
+    for (size_t shape = 0; shape < 4; shape++) {
+        size_t used = (size_t) snprintf(page, sizeof(page),
+            "<!doctype html><style>body{margin:0}p{margin:0}%s"
+            "{color:#ff0000}</style><body>",
+            shape == 3 ? ".a ~ .b ~ p" : "h3 ~ p");
+        bool open = false, seen_a = false, seen_b = false, seen_h3 = false;
+        for (size_t i = 0; i < ITEMS; i++) {
+            if (shape == 2 && i % (ITEMS / GROUPS) == 0) {
+                used += (size_t) snprintf(page + used, sizeof(page) - used,
+                    "%s<div>\n", open ? "</div>" : "");
+                open = true;
+                seen_h3 = false;
+                /* Group g's anchor comes after its g-th paragraph. */
+            }
+            size_t in_group = i % (ITEMS / GROUPS);
+            size_t group = i / (ITEMS / GROUPS);
+            if ((shape == 1 && i == ITEMS / 2)
+                || (shape == 2 && in_group == group)) {
+                used += (size_t) snprintf(page + used, sizeof(page) - used,
+                    "<h3>h</h3>\n");
+                seen_h3 = true;
+            }
+            if (shape == 3 && i == ITEMS / 5) {
+                used += (size_t) snprintf(page + used, sizeof(page) - used,
+                    "<i class=b>b</i>\n<i class=a>a</i>\n");
+            }
+            if (shape == 3 && i == ITEMS / 3) {
+                used += (size_t) snprintf(page + used, sizeof(page) - used,
+                    "<i class=b>b</i>\n");
+                seen_a = seen_b = true;
+            }
+            used += (size_t) snprintf(page + used, sizeof(page) - used,
+                "<p>p%zu</p>\n", i);
+            wanted[i] = shape == 3 ? seen_a && seen_b : seen_h3;
+        }
+        if (open)
+            used += (size_t) snprintf(page + used, sizeof(page) - used,
+                "</div>");
+        CHECK(used < sizeof(page));
+        PocDocument document = {0};
+        Stylesheet sheet = {0};
+        LayoutDocument layout = {0};
+        CHECK(document_parse(&document, budget, page, used, 20)
+              && stylesheet_build(&sheet, budget, &document, 480));
+        uint64_t visits = sheet.selector_sibling_visits;
+        CHECK(layout_build(&layout, budget, &document, &sheet, NULL, NULL,
+                           480));
+        visits = sheet.selector_sibling_visits - visits;
+        memset(painted, 0, sizeof(painted));
+        size_t texts = 0, mismatches = 0, first = ITEMS;
+        for (size_t at = 0; at < layout.count; at++) {
+            const DrawCommand *command = &layout.commands[at];
+            if (command->type != DRAW_TEXT || command->text_length < 2
+                || command->text[0] != 'p') continue;
+            size_t index = 0;
+            for (uint32_t k = 1; k < command->text_length; k++)
+                index = index * 10u + (size_t) (command->text[k] - '0');
+            if (index >= ITEMS) continue;
+            texts++;
+            painted[index] = (command->color & 0xffffffu) == 0xff0000u;
+        }
+        for (size_t i = 0; i < ITEMS; i++) {
+            if (painted[i] == wanted[i]) continue;
+            if (first == ITEMS) first = i;
+            mismatches++;
+        }
+        /* Each paragraph's question is a step or two, plus the
+           elements and text runs before an anchor. */
+        bool linear = visits <= 8u * ITEMS;
+        if (texts != ITEMS || mismatches != 0 || !linear)
+            fprintf(stderr, "general sibling %s: %zu texts, %zu "
+                    "mismatches (first p%zu), sibling visits %llu\n",
+                    shapes[shape], texts, mismatches, first,
+                    (unsigned long long) visits);
+        CHECK(texts == ITEMS && mismatches == 0);
+        CHECK(linear);
+        layout_destroy(&layout);
+        stylesheet_destroy(&sheet);
+        document_destroy(&document);
+    }
+    return 0;
+}
+
+static int test_border_insert_fixup_scope(Budget *budget)
+{
+    enum { PREAMBLE = 1000, BOXES = 1000 };
+    static char page[PREAMBLE * 48 + BOXES * 160 + 512];
+    size_t used = (size_t) snprintf(page, sizeof(page),
+        "<!doctype html><style>body{margin:0;padding:0}"
+        ".b{border:1px solid #888888}"
+        ".i{display:inline-block;border:2px solid #ff0000}</style><body>");
+    for (int i = 0; i < PREAMBLE; i++)
+        used += (size_t) snprintf(page + used, sizeof(page) - used,
+                                  "<p><a href=/p%d>p</a></p>", i);
+    for (int i = 0; i < BOXES; i++)
+        used += (size_t) snprintf(page + used, sizeof(page) - used,
+            "<div class=b id=d%d><a id=a%d href=/a%d>outer</a> "
+            "<span class=i><a id=c%d href=/c%d>inner</a></span></div>",
+            i, i, i, i, i);
+    snprintf(page + used, sizeof(page) - used, "</body>");
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument layout = {0};
+    CHECK(document_parse(&document, budget, page, strlen(page), 19)
+          && stylesheet_build(&sheet, budget, &document, 480)
+          && layout_build(&layout, budget, &document, &sheet,
+                          NULL, NULL, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    lxb_dom_node_t *div = find_id(root, "d0");
+    CHECK(div != NULL);
+    for (int i = 0; i < BOXES; i++) {
+        CHECK(div != NULL && div->type == LXB_DOM_NODE_TYPE_ELEMENT);
+        lxb_dom_node_t *outer = div->first_child;
+        lxb_dom_node_t *span = outer == NULL || outer->next == NULL
+            ? NULL : outer->next->next;
+        lxb_dom_node_t *inner = span == NULL ? NULL : span->first_child;
+        const LayoutNodeBox *div_box = layout_box_for_node(&layout, div);
+        const LayoutNodeBox *span_box = span == NULL
+            ? NULL : layout_box_for_node(&layout, span);
+        CHECK(div_box != NULL && span_box != NULL && inner != NULL);
+        const LinkRegion *outer_link = shift_scope_link(&layout, outer);
+        const LinkRegion *inner_link = shift_scope_link(&layout, inner);
+        int div_strokes = count_border_strokes(&layout, div_box, 0x888888u);
+        int span_strokes = count_border_strokes(&layout, span_box, 0xff0000u);
+        if (span_box->command_start < div_box->command_start
+            || span_box->command_end > div_box->command_end
+            || div_strokes != 4 || span_strokes != 4
+            || !link_inside_box(outer_link, div_box)
+            || !link_inside_box(inner_link, span_box)) {
+            fprintf(stderr, "border insert box %d: div %u..%u strokes %d "
+                    "span %u..%u strokes %d links %d/%d\n", i,
+                    div_box->command_start, div_box->command_end,
+                    div_strokes, span_box->command_start,
+                    span_box->command_end, span_strokes,
+                    link_inside_box(outer_link, div_box),
+                    link_inside_box(inner_link, span_box));
+            CHECK(false);
+        }
+        div = div->next;
+    }
+    /* Two insertions per bordered div; each examines the most recent run of
+       boxes, never the 1,000 preamble paragraphs and links. */
+    if (layout.performance.command_insert_visits > (uint64_t) BOXES * 160u) {
+        fprintf(stderr, "border insert visits %llu for %d boxes\n",
+                (unsigned long long) layout.performance.command_insert_visits,
+                BOXES);
+        CHECK(false);
+    }
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == 0);
+    return 0;
+}
+/* Every table in a layout gets column tracks, not only the first 32: the
+   later ones fell back to equal shares of the row, ignoring content. */
+static int test_table_tracks_past_slot_limit(Budget *budget)
+{
+    enum { TABLES = 48 };
+    static char page[TABLES * 160 + 256];
+    size_t used = (size_t) snprintf(page, sizeof(page),
+        "<!doctype html><style>body{margin:0;padding:0}"
+        "table{width:300px;border-spacing:0}td{padding:0}</style><body>");
+    for (int t = 0; t < TABLES; t++)
+        used += (size_t) snprintf(page + used, sizeof(page) - used,
+            "<table><tr><td id=a%d>x</td>"
+            "<td id=b%d>wide wide wide wide text</td></tr></table>", t, t);
+    snprintf(page + used, sizeof(page) - used, "</body>");
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument layout = {0};
+    CHECK(document_parse(&document, budget, page, strlen(page), 19)
+          && stylesheet_build(&sheet, budget, &document, 480)
+          && layout_build(&layout, budget, &document, &sheet,
+                          NULL, NULL, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    const LayoutNodeBox *first_a = layout_box_for_node(
+        &layout, find_id(root, "a0"));
+    const LayoutNodeBox *first_b = layout_box_for_node(
+        &layout, find_id(root, "b0"));
+    CHECK(first_a != NULL && first_b != NULL
+          && first_b->width > first_a->width);
+    for (int t = 1; t < TABLES; t++) {
+        char id[8];
+        snprintf(id, sizeof(id), "a%d", t);
+        const LayoutNodeBox *a = layout_box_for_node(&layout,
+                                                     find_id(root, id));
+        snprintf(id, sizeof(id), "b%d", t);
+        const LayoutNodeBox *b = layout_box_for_node(&layout,
+                                                     find_id(root, id));
+        if (a == NULL || b == NULL || a->x != first_a->x
+            || a->width != first_a->width || b->x != first_b->x
+            || b->width != first_b->width) {
+            fprintf(stderr, "table %d: a %d+%d b %d+%d, want a %d+%d "
+                    "b %d+%d\n", t, a ? a->x : -1, a ? a->width : -1,
+                    b ? b->x : -1, b ? b->width : -1, first_a->x,
+                    first_a->width, first_b->x, first_b->width);
+            CHECK(false);
+        }
+    }
     layout_destroy(&layout);
     stylesheet_destroy(&sheet);
     document_destroy(&document);

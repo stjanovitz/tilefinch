@@ -47,7 +47,17 @@ typedef enum {
     /* The player request did not complete: fetch failed or timed out. */
     MEDIA_FAILURE_NETWORK,
     /* The PSP ran out of memory for the player or its response. */
-    MEDIA_FAILURE_MEMORY
+    MEDIA_FAILURE_MEMORY,
+    /* YouTube offers the video only with DRM (its movies and shows). */
+    MEDIA_FAILURE_COPY_PROTECTED,
+    /* A secure page's audio stream is plain HTTP only: the panel asks
+       whether it may play (SECURITY_MODEL.md, "Unencrypted audio"). */
+    MEDIA_FAILURE_INSECURE_AUDIO_QUESTION,
+    /* The same, after the user answered no for this site this session. */
+    MEDIA_FAILURE_INSECURE_AUDIO_BLOCKED,
+    /* The firmware audio decoder refused the stream's frames ("MP3 decode:
+       0x807F00FD", "AAC decode: ..."); the code is shown with the codec. */
+    MEDIA_FAILURE_AUDIO_DECODE
 } MediaFailureKind;
 
 typedef enum {
@@ -75,7 +85,12 @@ typedef enum {
     MEDIA_FAILURE_DETAIL_LIVE,
     MEDIA_FAILURE_DETAIL_CHECK_NETWORK,
     MEDIA_FAILURE_DETAIL_CLOSE_TABS,
-    MEDIA_FAILURE_DETAIL_RESTART
+    MEDIA_FAILURE_DETAIL_RESTART,
+    MEDIA_FAILURE_DETAIL_DRM,
+    MEDIA_FAILURE_DETAIL_PAID,
+    MEDIA_FAILURE_DETAIL_NO_ENCRYPTED_STREAM,
+    MEDIA_FAILURE_DETAIL_SITE_INFORMATION,
+    MEDIA_FAILURE_DETAIL_PLAYLIST_TOO_LONG
 } MediaFailureDetail;
 
 typedef struct {
@@ -98,6 +113,11 @@ typedef struct {
    core's own "HLS playlist is empty" and "HLS playlist lacks EXTM3U", and
    an HLS request answered 404 or 410, are classified the same way. */
 #define MEDIA_STREAM_UNAVAILABLE "stream is offline or not available"
+/* Engine text for the two unencrypted-audio kinds. */
+#define MEDIA_INSECURE_AUDIO_QUESTION \
+    "page audio: plain-HTTP stream awaits the user's answer"
+#define MEDIA_INSECURE_AUDIO_BLOCKED \
+    "page audio: plain-HTTP stream declined for this site"
 
 /* What a media address's first response says it is, from its status,
    Content-Type and first body bytes (a range probe's, or a whole small
@@ -126,6 +146,9 @@ bool media_failure_message(const char *failure, MediaFailureMessage *message);
 bool media_failure_playback_memory(const char *failure);
 /* The panel headline key of a kind, or NULL for MEDIA_FAILURE_OTHER. */
 const char *media_failure_headline(MediaFailureKind kind);
+/* The same for audio-only media, which has no video to name: the decoder,
+   source and memory headlines say audio. */
+const char *media_failure_audio_headline(MediaFailureKind kind);
 /* The details-line key of a detail, or NULL for one that carries a code or
    nothing. */
 const char *media_failure_detail_text(MediaFailureDetail detail);

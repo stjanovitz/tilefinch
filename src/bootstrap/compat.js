@@ -13,6 +13,9 @@
     testProbes = !!globalThis.__tilefinchTestProbes,
     TrustedObject = Object,
     TrustedString = String,
+    /* Platform's URL; internal reads use its fields (_origin, _href), which
+       an author cannot replace the way the prototype getters can be. */
+    TrustedURL = URL,
     TrustedTypeError = TypeError,
     TrustedRangeError = RangeError,
     TrustedWeakMap = WeakMap,
@@ -153,8 +156,9 @@
     };
     document.exitPointerLock = { exitPointerLock() {} }.exitPointerLock;
   }
-  const { reflectString, secondaryDocumentPrototype } =
-    globalThis.__tilefinchDomShared;
+  const domShared = globalThis.__tilefinchDomShared,
+    { reflectString, secondaryDocumentPrototype, asciiLower, checkDoctypeName } =
+      domShared;
   delete globalThis.__tilefinchDomShared;
   {
     /* Reflected <meta> attributes. Without the interface, meta.content fell
@@ -447,6 +451,7 @@
     };
   globalThis.Event = class Event {
     constructor(type, options = {}) {
+      options ??= {};
       if (arguments.length < 1)
         throw new TypeError("Event type is required");
       eventStateSet(this, {
@@ -620,12 +625,20 @@
   };
   document.createEvent = createEvent;
   Document.prototype.createEvent = createEvent;
-  globalThis.__tilefinchTrustedEvent = (event) => {
+  const trustedEvent = (event) => {
     eventState(event).trusted = true;
     return event;
   };
+  __tilefinchRealmGlobal.__tilefinchTrustedEventShare.install(trustedEvent);
+  /* Boot-time only: the host captures it once the bootstrap has run and
+     deletes it before any author code (runtime_creation.inc). */
+  Object.defineProperty(globalThis, "__tilefinchTrustedEvent", {
+    configurable: true,
+    value: trustedEvent,
+  });
   globalThis.CustomEvent = class CustomEvent extends Event {
     constructor(type, options = {}) {
+      options ??= {};
       super(type, options);
       this.detail = options.detail === undefined ? null : options.detail;
     }
@@ -639,11 +652,28 @@
   };
   globalThis.UIEvent = class UIEvent extends Event {
     constructor(type, options = {}) {
+      options ??= {};
       super(type, options);
       this.view = options.view ?? globalThis;
       this.detail = Number(options.detail) || 0;
       this.which = Number(options.which) || 0;
     }
+    initUIEvent(type, bubbles = false, cancelable = false, view = null,
+      detail = 0) {
+      if (arguments.length < 1)
+        throw new TypeError("UIEvent type is required");
+      if (this.__dispatching) return;
+      this.initEvent(type, bubbles, cancelable);
+      this.view = view;
+      this.detail = Number(detail) || 0;
+    }
+  };
+  /* The legacy init methods' modifier arguments, in their order. */
+  const initModifiers = (target, ctrlKey, altKey, shiftKey, metaKey) => {
+    target.ctrlKey = !!ctrlKey;
+    target.altKey = !!altKey;
+    target.shiftKey = !!shiftKey;
+    target.metaKey = !!metaKey;
   };
   const modifierFields = (target, options) => {
     target.ctrlKey = !!options.ctrlKey;
@@ -660,6 +690,7 @@
   };
   globalThis.MouseEvent = class MouseEvent extends UIEvent {
     constructor(type, options = {}) {
+      options ??= {};
       super(type, options);
       for (const name of [
         "screenX",
@@ -689,9 +720,28 @@
       this.relatedTarget = options.relatedTarget ?? null;
       modifierFields(this, options);
     }
+    initMouseEvent(type, bubbles = false, cancelable = false, view = null,
+      detail = 0, screenX = 0, screenY = 0, clientX = 0, clientY = 0,
+      ctrlKey = false, altKey = false, shiftKey = false, metaKey = false,
+      button = 0, relatedTarget = null) {
+      if (arguments.length < 1)
+        throw new TypeError("MouseEvent type is required");
+      if (this.__dispatching) return;
+      this.initUIEvent(type, bubbles, cancelable, view, detail);
+      this.screenX = Number(screenX) || 0;
+      this.screenY = Number(screenY) || 0;
+      this.x = this.clientX = Number(clientX) || 0;
+      this.y = this.clientY = Number(clientY) || 0;
+      this.pageX = this.clientX + (Number(globalThis.scrollX) || 0);
+      this.pageY = this.clientY + (Number(globalThis.scrollY) || 0);
+      initModifiers(this, ctrlKey, altKey, shiftKey, metaKey);
+      this.button = Number(button) || 0;
+      this.relatedTarget = relatedTarget;
+    }
   };
   globalThis.PointerEvent = class PointerEvent extends MouseEvent {
     constructor(type, options = {}) {
+      options ??= {};
       super(type, options);
       this.pointerId = Number(
         options.pointerId === undefined ? 0 : options.pointerId,
@@ -710,6 +760,7 @@
   };
   globalThis.KeyboardEvent = class KeyboardEvent extends UIEvent {
     constructor(type, options = {}) {
+      options ??= {};
       super(type, options);
       this.key = String(options.key || "");
       this.code = String(options.code || "");
@@ -721,6 +772,17 @@
       this.which =
         Number(options.which === undefined ? this.keyCode : options.which) || 0;
       modifierFields(this, options);
+    }
+    initKeyboardEvent(type, bubbles = false, cancelable = false, view = null,
+      key = "", location = 0, ctrlKey = false, altKey = false,
+      shiftKey = false, metaKey = false) {
+      if (arguments.length < 1)
+        throw new TypeError("KeyboardEvent type is required");
+      if (this.__dispatching) return;
+      this.initUIEvent(type, bubbles, cancelable, view, 0);
+      this.key = String(key);
+      this.location = Number(location) || 0;
+      initModifiers(this, ctrlKey, altKey, shiftKey, metaKey);
     }
   };
   for (const [name, value] of Object.entries({
@@ -734,6 +796,7 @@
   }
   globalThis.InputEvent = class InputEvent extends UIEvent {
     constructor(type, options = {}) {
+      options ??= {};
       super(type, options);
       this.data = options.data === undefined ? null : options.data;
       this.inputType = String(options.inputType || "");
@@ -766,24 +829,28 @@
   globalThis.TextEvent = TextEventInterface;
   globalThis.FocusEvent = class FocusEvent extends UIEvent {
     constructor(type, options = {}) {
+      options ??= {};
       super(type, options);
       this.relatedTarget = options.relatedTarget ?? null;
     }
   };
   globalThis.CompositionEvent = class CompositionEvent extends UIEvent {
     constructor(type, options = {}) {
+      options ??= {};
       super(type, options);
       this.data = String(options.data || "");
     }
   };
   globalThis.SubmitEvent = class SubmitEvent extends Event {
     constructor(type, options = {}) {
+      options ??= {};
       super(type, options);
       this.submitter = options.submitter ?? null;
     }
   };
   globalThis.TransitionEvent = class TransitionEvent extends Event {
     constructor(type, options = {}) {
+      options ??= {};
       super(type, options);
       this.propertyName = String(options.propertyName || "");
       this.elapsedTime = Math.max(0, Number(options.elapsedTime) || 0);
@@ -792,6 +859,7 @@
   };
   globalThis.ToggleEvent = class ToggleEvent extends Event {
     constructor(type, options = {}) {
+      options ??= {};
       super(type, options);
       this.oldState = String(options.oldState || "closed");
       this.newState = String(options.newState || "closed");
@@ -799,6 +867,7 @@
   };
   globalThis.ProgressEvent = class ProgressEvent extends Event {
     constructor(type, options = {}) {
+      options ??= {};
       super(type, options);
       const state = eventState(this);
       state.lengthComputable = !!options.lengthComputable;
@@ -842,6 +911,7 @@
     };
   globalThis.ErrorEvent = class ErrorEvent extends Event {
     constructor(type, options = {}) {
+      options ??= {};
       super(type, options);
       errorEventStates.set(this, {
         message: String(options.message || ""),
@@ -976,6 +1046,7 @@
     };
   globalThis.MessageEvent = class MessageEvent extends Event {
     constructor(type, options = {}) {
+      options ??= {};
       super(type, options);
       messageEventStateSet(this, {
         data: options.data === undefined ? null : options.data,
@@ -1064,6 +1135,7 @@
   });
   globalThis.CloseEvent = class CloseEvent extends Event {
     constructor(type, options = {}) {
+      options ??= {};
       super(type, options);
       this.wasClean = !!options.wasClean;
       this.code = Number(options.code) || 0;
@@ -1092,7 +1164,7 @@
     get result() { return this.#state.result; }
     get error() { return this.#state.error; }
     #emit(type, loaded = 0, total = 0) {
-      const event = __tilefinchTrustedEvent(
+      const event = trustedEvent(
         new ProgressEvent(type, {
           lengthComputable: true,
           loaded,
@@ -1177,18 +1249,22 @@
         new TextDecoder(String(encoding || "utf-8")).decode(bytes),
       );
     }
-    readAsDataURL(blob) {
+    readAsBinaryString(blob) {
       this.#read(blob, (bytes) => {
         let binary = "";
-        for (let at = 0; at < bytes.length; at += 4096)
-          binary += String.fromCharCode(...bytes.slice(at, at + 4096));
-        return (
-          "data:" +
-          (blob.type || "application/octet-stream") +
-          ";base64," +
-          btoa(binary)
-        );
+        for (let at = 0; at < bytes.length; at += 8192)
+          binary += trustedFunctionApply(TrustedString.fromCharCode, null,
+            bytes.subarray(at, at + 8192));
+        return binary;
       });
+    }
+    readAsDataURL(blob) {
+      this.#read(blob, (bytes) =>
+        "data:" +
+        (blob.type || "application/octet-stream") +
+        ";base64," +
+        /* The native is a frozen global, which a page cannot replace. */
+        (bytes.length ? __tilefinchBase64EncodeBytes(bytes) : ""));
     }
     abort() {
       const state = this.#state;
@@ -1381,10 +1457,12 @@
      ancestor chain once other mutations have invalidated the style cache
      (an answer streaming beside a focused composer did this after every
      task). */
+  const nativeBodyHandle = globalThis.__tilefinchBody;
   globalThis.__tilefinchQueueFocusFixup = (target, type, name, added) => {
     if (focusCheckQueued || focusFixupPending) return;
     const active = globalThis.__tilefinchActiveElement;
-    if (!active || active === document.body) return;
+    /* The body's handle: no wrapper lookup per mutation. */
+    if (!active || active.__handle === nativeBodyHandle()) return;
     if (
       target !== undefined &&
       !focusMutationRelevant(target, active, type, name, added)
@@ -1406,6 +1484,26 @@
       getSelection().collapse(target.firstChild, 0);
     }
   };
+  /* Whether `target` is rendered for focus: neither it nor an ancestor
+     (across shadow hosts) computes display:none. One native computed
+     value per step and no declaration object, except where the host has
+     no cascade to answer from (no stylesheet attached). */
+  const computedStyleRead = globalThis.__tilefinchComputedStyleRead,
+    computedStyleOf = getComputedStyle,
+    focusRendered = (target) => {
+      for (let at = target, steps = 0; at && steps < 1024; steps++) {
+        const handle = at.__handle;
+        if (!(handle > 0)) return true;
+        const display = computedStyleRead(handle, "display", "") ||
+          computedStyleOf(at).display;
+        if (display === "none") return false;
+        const parent = at.parentNode;
+        at = parent instanceof ShadowRoot
+          ? parent.host
+          : parent?.nodeType === Node.ELEMENT_NODE ? parent : null;
+      }
+      return true;
+    };
   const focusElement = function focus(options = undefined) {
     const shadow = globalThis.__tilefinchShadowRootForHost?.(this);
     if (shadow?.delegatesFocus) {
@@ -1423,7 +1521,13 @@
         return;
       }
     }
-    if (globalThis.__tilefinchActiveElement === this || !isFocusable(this))
+    /* Only a rendered element takes focus. The fixup after mutations
+       keeps the cheaper isFocusable alone. */
+    if (
+      globalThis.__tilefinchActiveElement === this ||
+      !isFocusable(this) ||
+      !focusRendered(this)
+    )
       return;
     const previous = globalThis.__tilefinchActiveElement || document.body;
     if (!globalThis.__tilefinchFocusEventsObserved?.()) {
@@ -1435,7 +1539,7 @@
     }
     const fire = (target, type, options) =>
       target.dispatchEvent(
-        __tilefinchTrustedEvent(new FocusEvent(type, options)),
+        trustedEvent(new FocusEvent(type, options)),
       );
     if (previous && previous !== document.body) {
       markFocus(previous, false);
@@ -1453,7 +1557,7 @@
     if (globalThis.__tilefinchActiveElement !== this) return;
     const next = document.body,
       fire = (type, options) =>
-        this.dispatchEvent(__tilefinchTrustedEvent(new FocusEvent(type, options)));
+        this.dispatchEvent(trustedEvent(new FocusEvent(type, options)));
     markFocus(this, false);
     fire("blur", { relatedTarget: next });
     fire("focusout", { bubbles: true, relatedTarget: next });
@@ -1506,11 +1610,11 @@
     if (value !== undefined) this.returnValue = value;
     this.removeAttribute("open");
     this.removeAttribute("data-tilefinch-modal");
-    this.dispatchEvent(__tilefinchTrustedEvent(new Event("close")));
+    this.dispatchEvent(trustedEvent(new Event("close")));
   };
   HTMLDialogElement.prototype.requestClose = function requestClose(value) {
     if (!this.open) return;
-    const event = __tilefinchTrustedEvent(
+    const event = trustedEvent(
       new Event("cancel", { cancelable: true }),
     );
     if (this.dispatchEvent(event)) this.close(value);
@@ -1534,7 +1638,7 @@
     const wasOpen = details.open;
     details.open = !wasOpen;
     details.dispatchEvent(
-      __tilefinchTrustedEvent(
+      trustedEvent(
         new ToggleEvent("toggle", {
           oldState: wasOpen ? "open" : "closed",
           newState: wasOpen ? "closed" : "open",
@@ -1600,7 +1704,8 @@
   });
   globalThis.__tilefinchBeginControlDefault = (target, native = false) => {
     if (native && target instanceof HTMLSelectElement) {
-      const options = target.options,
+      /* options is a live HTMLOptionsCollection; take a snapshot. */
+      const options = Array.from(target.options),
         states = options.map((option) => [option, option.selected]);
       if (!options.length) return null;
       let next = target.selectedIndex;
@@ -1669,10 +1774,13 @@
   globalThis.__tilefinchFinishControlDefault = (state, accepted) => {
     if (!state) return false;
     if (!accepted) {
-      if (state.kind === "select")
+      if (state.kind === "select") {
+        /* Only the options the default moved: each write invalidates the
+           select's cached selection, so rewriting all of them would
+           recompute it once per option. */
         for (const [option, selected] of state.states)
-          option.selected = selected;
-      else if (state.kind === "range") state.target.value = state.value;
+          if (option.selected !== selected) option.selected = selected;
+      } else if (state.kind === "range") state.target.value = state.value;
       else
         for (const [item, checked] of state.states) item.checked = checked;
       return true;
@@ -1683,10 +1791,10 @@
     }
     if (state.changed) {
       state.target.dispatchEvent(
-        __tilefinchTrustedEvent(new Event("input", { bubbles: true })),
+        trustedEvent(new Event("input", { bubbles: true })),
       );
       state.target.dispatchEvent(
-        __tilefinchTrustedEvent(new Event("change", { bubbles: true })),
+        trustedEvent(new Event("change", { bubbles: true })),
       );
     }
     return true;
@@ -1708,7 +1816,7 @@
     if (current === open) return current;
     const oldState = current ? "open" : "closed",
       newState = open ? "open" : "closed",
-      before = __tilefinchTrustedEvent(
+      before = trustedEvent(
         new ToggleEvent("beforetoggle", {
           cancelable: open,
           oldState,
@@ -1719,7 +1827,7 @@
     if (open) target.setAttribute("data-tilefinch-popover-open", "");
     else target.removeAttribute("data-tilefinch-popover-open");
     target.dispatchEvent(
-      __tilefinchTrustedEvent(new ToggleEvent("toggle", { oldState, newState })),
+      trustedEvent(new ToggleEvent("toggle", { oldState, newState })),
     );
     return open;
   };
@@ -1810,10 +1918,10 @@
       childrenOf = (node) => Array.from(node?.childNodes || []),
       nativeRootNode = globalThis.__tilefinchRootNode,
       wrapHandle = globalThis.__tilefinchWrap,
-      /* Is `node` an inclusive ancestor of `parent`: one native walk to
-         parent's tree root; a root with a script-side detached parent, or a
-         tree the native leaves to script (shadow), takes the bounded
-         walk, which throws on a cycle or an over-deep chain. */
+      /* Is `node` a host-including inclusive ancestor of `parent`: one native
+         walk to the root past shadow roots and template contents; a root with
+         a script-side detached parent takes the bounded walk, which throws on
+         a cycle or an over-deep chain. */
       isAncestor = (node, parent) => {
         if (
           typeof nativeRootNode === "function" &&
@@ -1821,13 +1929,18 @@
           node?.__handle > 0 &&
           !parent.__tilefinchDetachedParent
         ) {
-          const found = Number(nativeRootNode(parent.__handle, node.__handle));
+          const found = Number(
+            nativeRootNode(parent.__handle, node.__handle, true));
           if (found === Number(node.__handle)) return true;
           if (found < 0) return false;
           if (found > 0 && !wrapHandle(found)?.__tilefinchDetachedParent)
             return false;
         }
-        for (let at = parent, steps = 0; at; at = parentOf(at), steps++) {
+        for (
+          let at = parent, steps = 0;
+          at;
+          at = at instanceof ShadowRoot ? at.host : parentOf(at), steps++
+        ) {
           if (steps >= ancestorLimit)
             throw new DOMException(
               "Cyclic or excessively deep node ancestry",
@@ -1837,12 +1950,21 @@
         }
         return false;
       };
+    const nativePreInsertClear = globalThis.__tilefinchPreInsertClear,
+      planDocumentInsert = domShared.planDocumentInsert;
     const validatePreInsert = (
       parent,
       node,
       child,
       replacingAll = false,
     ) => {
+      /* Every insertion: the native table settles the ordinary case, and
+         script raises what applies in any other. */
+      const clear = nativePreInsertClear(
+        parent?.__handle, node, node?.__handle, child, child?.__handle);
+      if (clear > 0 ||
+          (clear < 0 && !wrapHandle(-clear)?.__tilefinchDetachedParent))
+        return true;
       if (!(node instanceof Node)) throw new TypeError("Node required");
       if (child !== null && child !== undefined && !(child instanceof Node))
         throw new TypeError("Reference child must be a Node or null");
@@ -1894,64 +2016,14 @@
           );
         return true;
       }
-      const payload =
-          nodeType === Node.DOCUMENT_FRAGMENT_NODE ? childrenOf(node) : [node],
-        current = replacingAll
-          ? []
-          : childrenOf(parent).filter(
-              (item) => !payload.some((value) => sameNode(item, value)),
-            );
-      let reference = child;
-      if (payload.some((value) => sameNode(value, reference))) {
-        reference = null;
-        for (const item of childrenOf(parent)) {
-          if (payload.some((value) => sameNode(value, item))) continue;
-          const original = childrenOf(parent),
-            childAt = original.findIndex((value) => sameNode(value, child));
-          if (original.indexOf(item) > childAt) {
-            reference = item;
-            break;
-          }
-        }
-      }
-      let at =
-        reference === null || reference === undefined
-          ? current.length
-          : current.findIndex((item) => sameNode(item, reference));
-      if (at < 0) at = current.length;
-      current.splice(at, 0, ...payload);
-      let elements = 0,
-        doctypes = 0,
-        elementAt = -1,
-        doctypeAt = -1;
-      for (let index = 0; index < current.length; index++) {
-        const type = parentKind(current[index]);
-        if (
-          type === Node.TEXT_NODE ||
-          type === Node.DOCUMENT_NODE ||
-          type === Node.DOCUMENT_FRAGMENT_NODE
-        )
-          throw new DOMException(
-            "Invalid document child",
-            "HierarchyRequestError",
-          );
-        if (type === Node.ELEMENT_NODE) {
-          elements++;
-          elementAt = index;
-        } else if (type === Node.DOCUMENT_TYPE_NODE) {
-          doctypes++;
-          doctypeAt = index;
-        }
-      }
-      if (
-        elements > 1 ||
-        doctypes > 1 ||
-        (doctypeAt >= 0 && elementAt >= 0 && doctypeAt > elementAt)
-      )
-        throw new DOMException(
-          "Invalid document child order",
-          "HierarchyRequestError",
-        );
+      /* The shared document check (platform.js), on the children as this
+         node and reference see them. */
+      if (replacingAll) planDocumentInsert([], node, false, null);
+      else
+        planDocumentInsert(
+          childrenOf(parent).map((item) =>
+            sameNode(item, node) ? node : sameNode(item, child) ? child : item),
+          node, false, child ?? null);
       return true;
     };
     globalThis.__tilefinchValidatePreInsert = validatePreInsert;
@@ -1973,6 +2045,31 @@
       value: genericInsertBefore,
     });
     const parentAppend = (parent, values, prepend) => {
+      /* A document checks the whole list before any argument moves; a
+         script-side one then takes the nodes in directly, so a doctype
+         need not pass through a fragment. */
+      if (parent.nodeType === Node.DOCUMENT_NODE) {
+        const plan = planDocumentInsert(
+          childrenOf(parent), values, true, prepend ? undefined : null);
+        if (Array.isArray(parent.__detachedChildren)) {
+          for (const item of plan.items)
+            rawDetachedInsert(parent, item, plan.before);
+          return;
+        }
+        /* The page's document takes no new children (platform.js
+           replaceChildren): a call that leaves the children as they are,
+           such as append(root, root), changes nothing, as in Chromium, and
+           any other throws before an argument moves. */
+        const children = childrenOf(parent),
+          after = children.filter((child) => !plan.items.includes(child));
+        after.splice(plan.before ? after.indexOf(plan.before) : after.length, 0,
+          ...plan.items);
+        if (after.some((child, at) => child !== children[at])
+            || after.length !== children.length)
+          throw new DOMException("The document cannot take new children",
+            "HierarchyRequestError");
+        return;
+      }
       const owner =
           parent.nodeType === Node.DOCUMENT_NODE
             ? parent
@@ -2242,7 +2339,10 @@
             configurable: true,
             writable: true,
             value: function replaceChildren(...values) {
-              const owner = this.ownerDocument || this,
+              const items = this.nodeType === Node.DOCUMENT_NODE
+                  ? planDocumentInsert(childrenOf(this), values, true, null).items
+                  : null,
+                owner = this.ownerDocument || this,
                 nodes = values.map((value) =>
                   value instanceof Node
                     ? value
@@ -2267,16 +2367,18 @@
                       nextSibling: candidate.nextSibling,
                     });
               }
-              validatePreInsert(this, insertion, null, true);
+              if (!items) validatePreInsert(this, insertion, null, true);
               globalThis.__tilefinchMutationSuppressed =
                 (globalThis.__tilefinchMutationSuppressed || 0) + 1;
               let removed;
               try {
-                if (nodes.length !== 1)
+                if (!items && nodes.length !== 1)
                   for (const node of nodes) insertion.appendChild(node);
                 removed = [...this.childNodes];
                 for (const child of removed) this.removeChild(child);
-                if (nodes.length) this.appendChild(insertion);
+                if (items)
+                  for (const item of items) rawDetachedInsert(this, item, null);
+                else if (nodes.length) this.appendChild(insertion);
               } finally {
                 globalThis.__tilefinchMutationSuppressed--;
               }
@@ -2444,8 +2546,7 @@
       node.insertBefore = genericInsertBefore;
       return node;
     };
-    const originalHTMLDocument = document.implementation.createHTMLDocument,
-      originalXMLDocument = document.implementation.createDocument,
+    const originalXMLDocument = document.implementation.createDocument,
       upgradeDocument = (doc) => {
         const upgrade = (node, parent = null) => {
           if (parent)
@@ -2494,12 +2595,13 @@
       };
     const originalNewDocument = globalThis.__tilefinchNewDocument;
     if (typeof originalNewDocument === "function")
-      globalThis.__tilefinchNewDocument = () =>
-        upgradeDocument(originalNewDocument());
+      globalThis.__tilefinchNewDocument = (xml) =>
+        upgradeDocument(originalNewDocument(xml));
     const makeDoctype = (name = "html", publicId = "", systemId = "") => {
-      const node = detachedLeaf(null, Node.DOCUMENT_TYPE_NODE, String(name));
+      name = checkDoctypeName(name);
+      const node = detachedLeaf(null, Node.DOCUMENT_TYPE_NODE, name);
       Object.defineProperties(node, {
-        name: { value: String(name) },
+        name: { value: name },
         publicId: { value: String(publicId) },
         systemId: { value: String(systemId) },
       });
@@ -2507,6 +2609,79 @@
       return node;
     };
     document.implementation.createDocumentType = makeDoctype;
+    /* Secondary documents backed by native nodes (createHTMLDocument and
+       DOMParser): the document object is script-side, but its tree is a
+       detached native subtree whose nodes report it as their owner (the
+       bridge's per-handle owner tag; parsed descendants inherit it). Every
+       element member, selector, innerHTML and serializer is therefore the
+       real one, each node costs what a page node costs, and the document has
+       no browsing context, so custom elements are neither constructed nor
+       upgraded until a node is adopted into the page. */
+    /* The builder is the lazy documents.js module, loaded on first use. What
+       it reads from the realm is captured now, before page script runs. */
+    const documentBuilderInputs = {
+        factories: domShared.documentFactories,
+        createPrivateSlot: domShared.createPrivateSlot,
+        setNativeNodeOwner: globalThis.__tilefinchSetNodeOwner,
+        adoptIntoDocument: globalThis.__tilefinchAdoptNodeOwner,
+        liveCollection: globalThis.__tilefinchLiveHTMLCollection,
+        ancestorLimit: globalThis.__tilefinchAncestorLimit,
+        escapeSelector: CSS.escape,
+        makeDoctype,
+        asciiLower,
+        createAttribute: globalThis.__tilefinchCreateAttribute,
+        secondaryDocumentPrototype,
+        htmlDocumentPrototype: HTMLDocument.prototype,
+        xmlDocumentPrototype: XMLDocument.prototype,
+        realm: globalThis,
+        Node,
+        Document,
+        ShadowRoot,
+        Range,
+        HTMLBodyElement,
+        HTMLFrameSetElement,
+        DOMException,
+        MapType: Map,
+        objectCreate: Object.create,
+        defineProperty: Object.defineProperty,
+        defineProperties: Object.defineProperties,
+        arrayFrom: Array.from,
+        planDocumentInsert,
+      },
+      ensureDocumentsBootstrap = globalThis.__tilefinchEnsureDocumentsBootstrap;
+    let documentBuilder = null;
+    const nativeDocuments = () => {
+      if (documentBuilder) return documentBuilder;
+      ensureDocumentsBootstrap();
+      const { realm } = documentBuilderInputs,
+        create = realm.__tilefinchCreateSecondaryDocuments;
+      delete realm.__tilefinchCreateSecondaryDocuments;
+      return (documentBuilder = create(documentBuilderInputs));
+    };
+    globalThis.DOMParser = class DOMParser {
+      parseFromString(input, type) {
+        const source = String(input),
+          mime = String(type).trim().toLowerCase();
+        if (
+          mime !== "text/html" &&
+          mime !== "text/xml" &&
+          mime !== "application/xml" &&
+          mime !== "application/xhtml+xml" &&
+          mime !== "image/svg+xml"
+        )
+          throw new TypeError("Unsupported DOMParser type: " + mime);
+        if (source.length > 256 * 1024)
+          throw new RangeError("parsed document exceeds bounded size");
+        if (mime === "text/html")
+          return nativeDocuments().parseNativeHTMLDocument(source);
+        if (mime === "image/svg+xml")
+          return nativeDocuments().parseNativeSVGDocument(source, mime);
+        return nativeDocuments().parseErrorDocument(
+          mime, "XML documents are not supported by this browser.");
+      }
+    };
+    domShared.createHTMLDocument = (title) =>
+      nativeDocuments().createNativeHTMLDocument(title);
     Object.defineProperty(Element.prototype, "outerHTML", Object.getOwnPropertyDescriptor({
       get outerHTML() {
         const container = (
@@ -2550,18 +2725,12 @@
       },
     }, "outerHTML"));
     Document.prototype.cloneNode = function cloneNode(deep = false) {
-      const clone = new Document();
+      const clone = this.contentType === "text/html"
+        ? globalThis.__tilefinchNewDocument() : new Document();
       if (deep)
         for (const child of this.childNodes || [])
           clone.appendChild(child.cloneNode(true));
       return clone;
-    };
-    document.implementation.createHTMLDocument = (title) => {
-      const doc = upgradeDocument(originalHTMLDocument(title)),
-        doctype = makeDoctype("html");
-      doctype.__detachedOwner = doc;
-      rawDetachedInsert(doc, doctype, doc.firstChild);
-      return doc;
     };
     document.implementation.createDocument = (
       namespace,
@@ -2575,11 +2744,7 @@
       doc.createAttribute = (name) =>
         __tilefinchCreateAttribute(doc, String(name));
       doc.createAttributeNS = (namespace, name) =>
-        __tilefinchCreateAttribute(
-          doc,
-          String(name),
-          namespace === null ? null : String(namespace),
-        );
+        __tilefinchCreateAttribute(doc, name, namespace, true);
       const cloneXMLDocument = doc.cloneNode;
       doc.cloneNode = (deep = false) => {
         const clone = cloneXMLDocument.call(doc, deep);
@@ -2608,10 +2773,11 @@
             return this.__detachedOwner;
           },
         },
+        /* The native parent: a page script may remove the doctype. */
         parentNode: {
           configurable: true,
           get() {
-            return this.__detachedParent;
+            return doctypeRelation(this.__handle, 8) ? document : null;
           },
         },
         parentElement: { configurable: true, get: () => null },
@@ -2620,17 +2786,13 @@
         previousSibling: {
           configurable: true,
           get() {
-            return this.__detachedParent === document
-              ? doctypeWrap(doctypeRelation(this.__handle, 6)) || null
-              : null;
+            return doctypeWrap(doctypeRelation(this.__handle, 6)) || null;
           },
         },
         nextSibling: {
           configurable: true,
           get() {
-            return this.__detachedParent === document
-              ? doctypeWrap(doctypeRelation(this.__handle, 5)) || null
-              : null;
+            return doctypeWrap(doctypeRelation(this.__handle, 5)) || null;
           },
         },
       });
@@ -2639,7 +2801,7 @@
       configurable: true,
       enumerable: true,
       get() {
-        return mainDoctype.__detachedParent === document ? mainDoctype : null;
+        return mainDoctype.parentNode === document ? mainDoctype : null;
       },
     });
     document.createProcessingInstruction = (target, data) =>
@@ -3176,9 +3338,9 @@
     normalizeRequestReferrer = (value) => {
       value = String(value);
       if (value === "" || value === "about:client") return value;
-      const parsed = new URL(value, location.href);
-      if (parsed.origin !== location.origin) return "about:client";
-      const href = parsed.href,
+      const parsed = new TrustedURL(value, location.href);
+      if (parsed._origin !== location.origin) return "about:client";
+      const href = parsed._href,
         fragment = href.indexOf("#");
       return fragment < 0 ? href : href.slice(0, fragment);
     },
@@ -3561,7 +3723,15 @@
             throw new TypeError("Algorithm name is required");
           if (typeof name === "symbol")
             throw new TypeError("Symbol is not a string");
-          if (TrustedString(name).toUpperCase() !== "SHA-256")
+          /* WebCrypto normalizes the name case-insensitively; the index is
+             the native TilefinchWebDigest. Plain comparisons keep no table
+             object resident and cannot be redirected by page script. */
+          const upper = TrustedString(name).toUpperCase();
+          const algorithmIndex = upper === "SHA-1" ? 0
+            : upper === "SHA-256" ? 1
+            : upper === "SHA-384" ? 2
+            : upper === "SHA-512" ? 3 : -1;
+          if (algorithmIndex < 0)
             throw new DOMException(
               "Unsupported digest algorithm",
               "NotSupportedError",
@@ -3584,7 +3754,7 @@
              bounded same-origin Window realm. Worker-local raw buffers were
              normalized to a local view above before crossing realms. */
           const result = trustedPromiseResolve(
-            __tilefinchCryptoDigestSHA256(source));
+            __tilefinchCryptoDigest(source, algorithmIndex));
           return normalizers
             ? trustedPromiseThen(result, normalizers.output) : result;
         } catch (error) {
@@ -3798,10 +3968,16 @@
     networkQueueByteLimit = 96 * 1024,
     nativeNetworkLimit = 4;
   let nextNetworkId = 1,
-    activeNetwork = 0;
+    activeNetwork = 0,
+    preflightPollTimer = 0,
+    preflightDecisions = 0;
   const pendingNetwork = new Map(),
     nativeNetwork = new Map(),
     waitingNetwork = [],
+    /* Requests waiting for their CORS preflight (the -2 deferral), in
+       arrival order. They hold no ordering claim over the requests behind
+       them, which start meanwhile. */
+    parkedNetwork = [],
     networkQueueStats = {
       admitted: 0,
       launched: 0,
@@ -3859,9 +4035,10 @@
   const releaseNetwork = (entry) => {
     if (!entry || !pendingNetwork.has(entry.id)) return false;
     pendingNetwork.delete(entry.id);
-    if (entry.state === "waiting") {
-      const at = waitingNetwork.indexOf(entry);
-      if (at >= 0) waitingNetwork.splice(at, 1);
+    if (entry.state === "waiting" || entry.state === "parked") {
+      const queue = entry.state === "parked" ? parkedNetwork : waitingNetwork;
+      const at = queue.indexOf(entry);
+      if (at >= 0) queue.splice(at, 1);
       networkQueueStats.waiting = Math.max(0, networkQueueStats.waiting - 1);
     } else if (entry.state === "active") {
       nativeNetwork.delete(entry.nativeId);
@@ -3880,6 +4057,26 @@
     entry.start = null;
     return true;
   };
+  /* Resubmits parked requests, ahead of the FIFO and in their order, once a
+     preflight of this realm has been decided. The probe is one native
+     call that reads a counter; it does not run request admission. */
+  const pollPreflights = () => {
+    preflightPollTimer = 0;
+    if (!parkedNetwork.length) return;
+    const decisions = Number(__tilefinchCorsPreflightDecisions());
+    if (decisions !== preflightDecisions) {
+      preflightDecisions = decisions;
+      const resumed = parkedNetwork.splice(0, parkedNetwork.length);
+      for (let i = resumed.length - 1; i >= 0; i--) {
+        resumed[i].state = "waiting";
+        waitingNetwork.unshift(resumed[i]);
+      }
+      pumpNetworkQueue();
+    }
+    if (parkedNetwork.length && !preflightPollTimer)
+      preflightPollTimer = __tilefinchRealmGlobal.__tilefinchScheduleTask(
+        pollPreflights, 10);
+  };
   const pumpNetworkQueue = () => {
     while (activeNetwork < nativeNetworkLimit && waitingNetwork.length) {
       const entry = waitingNetwork.shift();
@@ -3889,6 +4086,20 @@
       entry.state = "launching";
       try {
         const nativeId = Number(entry.start());
+        if (nativeId === -2) {
+          /* Native policy admitted this request but its preflight is not
+             decided: park it and go on with the requests behind it. */
+          if (!parkedNetwork.length && !preflightPollTimer)
+            preflightDecisions = Number(__tilefinchCorsPreflightDecisions());
+          entry.state = "parked";
+          entry.nativeId = 0;
+          parkedNetwork.push(entry);
+          networkQueueStats.waiting++;
+          if (!preflightPollTimer)
+            preflightPollTimer = __tilefinchRealmGlobal.__tilefinchScheduleTask(
+              pollPreflights, 10);
+          continue;
+        }
         if (nativeId === 0 || nativeId === -1) {
           /* Native policy has already admitted this immutable request.  Zero
              means the shared page scheduler is temporarily full; -1 means
@@ -4691,7 +4902,7 @@
           if (data.length) {
             const event = new MessageEvent(type || "message", {
               data: data.join("\n"),
-              origin: new URL(this.url).origin,
+              origin: new TrustedURL(this.url)._origin,
               lastEventId: this._lastEventId,
               source: null,
             });
@@ -5069,7 +5280,7 @@
           ? buffer : new Blob([buffer]);
         socket._emit(new MessageEvent("message", {
           data,
-          origin: new URL(socket.url.replace(/^ws/, "http")).origin,
+          origin: new TrustedURL(socket.url)._origin,
           source: null,
         }));
       } else if (kind === "drain") {
@@ -5969,7 +6180,7 @@
          the one plain Event in this sequence.  Challenge runtimes inspect
          both distinctions when deciding whether a response callback came
          from the transport or from an authored redispatch. */
-      const event = __tilefinchTrustedEvent(
+      const event = trustedEvent(
         type === "readystatechange"
           ? new Event(type)
           : new ProgressEvent(type, {
@@ -6642,4 +6853,63 @@ storage-access window-management ";
     configurable: false, enumerable: false, writable: false,
     value: createTrustedTypesRealm,
   });
+  /* Number and BigInt toLocaleString and Date's toLocale*String format
+     through intl.js, which loads on first use and hands its formatters to
+     this closure once through a frozen hook, so a page's own Intl global
+     never formats them. A date formatted without locales or options keeps
+     the engine's (or the deterministic clock's) text and loads nothing. */
+  {
+    let formatNumber = null, formatDate = null;
+    trustedDefineProperty(globalThis, "__tilefinchRegisterLocaleFormat", {
+      configurable: false, enumerable: false, writable: false,
+      value: (number, date) => {
+        if (formatNumber) return;
+        formatNumber = number;
+        formatDate = date;
+      },
+    });
+    const loadIntl = TrustedObject.getOwnPropertyDescriptor(globalThis, "Intl")
+        ?.get,
+      ready = () => {
+        if (!formatNumber && loadIntl)
+          try {
+            trustedFunctionApply(loadIntl, globalThis, []);
+          } catch (_) {
+            /* Formatting falls back to the engine. */
+          }
+        return formatNumber !== null;
+      },
+      dateProto = Date.prototype,
+      thisTime = dateProto.getTime,
+      method = (target, name, value) =>
+        trustedDefineProperty(target, name, {
+          configurable: true, enumerable: false, writable: true, value,
+        });
+    for (const proto of [Number.prototype, BigInt.prototype]) {
+      const valueOf = proto.valueOf, engine = proto.toLocaleString;
+      method(proto, "toLocaleString", {
+        toLocaleString() {
+          const value = trustedFunctionApply(valueOf, this, []);
+          return ready() ? formatNumber(value, arguments[0], arguments[1])
+            : trustedFunctionApply(engine, value, []);
+        },
+      }.toLocaleString);
+    }
+    for (const [name, required, defaults] of [
+      ["toLocaleString", "any", "all"],
+      ["toLocaleDateString", "date", "date"],
+      ["toLocaleTimeString", "time", "time"],
+    ]) {
+      const engine = dateProto[name];
+      method(dateProto, name, {
+        [name]() {
+          const time = trustedFunctionApply(thisTime, this, []);
+          return (arguments[0] === undefined && arguments[1] === undefined) ||
+              !ready()
+            ? trustedFunctionApply(engine, this, arguments)
+            : formatDate(time, arguments[0], arguments[1], required, defaults);
+        },
+      }[name]);
+    }
+  }
 })();

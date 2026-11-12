@@ -14,7 +14,8 @@ typedef enum {
     TILEFINCH_SANDBOX_ALLOW_FORMS = 1u << 3,
     TILEFINCH_SANDBOX_ALLOW_POPUPS = 1u << 4,
     TILEFINCH_SANDBOX_ALLOW_TOP_NAVIGATION = 1u << 5,
-    TILEFINCH_SANDBOX_ALLOW_TOP_NAVIGATION_BY_USER = 1u << 6
+    TILEFINCH_SANDBOX_ALLOW_TOP_NAVIGATION_BY_USER = 1u << 6,
+    TILEFINCH_SANDBOX_ALLOW_MODALS = 1u << 7
 } TilefinchFrameSandboxFlag;
 
 uint32_t tilefinch_frame_sandbox_parse(const char *value, size_t length,

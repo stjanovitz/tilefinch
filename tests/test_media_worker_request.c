@@ -19,6 +19,7 @@
 #include "tilefinch/fetch.h"
 #include "tilefinch/media_candidates.h"
 #include "tilefinch/media_hls.h"
+#include "tilefinch/media_http.h"
 #include "tilefinch/media_worker_request.h"
 #include "tilefinch/session.h"
 
@@ -596,6 +597,137 @@ static void test_redirect_without_scratch_is_a_memory_failure(void)
     fixture_destroy(&fixture);
 }
 
+/* A secure page's plain-HTTP audio stream (SECURITY_MODEL.md, "Unencrypted
+   audio"). It is upgraded once, like any passive media, until the user says
+   yes for the page's site; then that site's audio hops alone may use HTTP,
+   on the first hop and on every redirect. Video, other sites and the broad
+   mixed-content grant are untouched, and the answer lives only in the
+   session. */
+static void test_insecure_audio_answer_is_narrow(void)
+{
+    Fixture fixture;
+    CHECK(fixture_init(&fixture));
+    MediaWorkerAuthority audio = page_authority(&fixture, NULL);
+    audio.audio = true;
+    MediaWorkerAuthority video = page_authority(&fixture, NULL);
+    MediaWorkerAuthority elsewhere = audio;
+    elsewhere.document_url = "https://other.test/radio";
+    const char *station = "http://station.test:8002/stream?fromyp=true";
+    const char *upgraded = "https://station.test:8002/stream?fromyp=true";
+    MediaWorkerHop hop;
+
+    /* Unasked and declined: upgraded, and an HTTP redirect is refused. */
+    for (unsigned pass = 0; pass < 2u; pass++) {
+        CHECK(media_worker_hop_init(&hop, station)
+              && media_worker_hop_admit(&audio, &hop, fixture.scratch)
+                     == MEDIA_WORKER_HOP_ADMITTED
+              && strcmp(hop.url, upgraded) == 0);
+        expect_refused(&fixture, &audio, upgraded, "http://relay.test/live");
+        CHECK(browser_session_set_insecure_audio_site(
+            &fixture.session, DOCUMENT, BROWSER_INSECURE_AUDIO_DECLINED));
+    }
+    CHECK(browser_session_insecure_audio_site(&fixture.session, DOCUMENT)
+          == BROWSER_INSECURE_AUDIO_DECLINED);
+
+    /* Yes, for the page's site: any page of it, its audio only. */
+    CHECK(browser_session_set_insecure_audio_site(
+              &fixture.session, "https://video.test/another/page",
+              BROWSER_INSECURE_AUDIO_ALLOWED)
+          && browser_session_insecure_audio_site(&fixture.session, DOCUMENT)
+                 == BROWSER_INSECURE_AUDIO_ALLOWED
+          && !browser_session_mixed_content_site_allowed(
+                 &fixture.session, DOCUMENT));
+    CHECK(media_worker_hop_init(&hop, station)
+          && media_worker_hop_admit(&audio, &hop, fixture.scratch)
+                 == MEDIA_WORKER_HOP_ADMITTED
+          && strcmp(hop.url, station) == 0);
+    bool ok = false;
+    FetchRequest request = worker_request(&fixture, &audio, &hop, &ok);
+    CHECK(ok && request.block_private_network
+          && strcmp(request.sec_fetch_dest, "audio") == 0);
+    CHECK(media_worker_redirect(
+              &audio, &hop,
+              redirect_response(&fixture, 302, "http://relay.test/live",
+                                NULL),
+              fixture.scratch) == MEDIA_WORKER_REDIRECT_FOLLOW
+          && strcmp(hop.url, "http://relay.test/live") == 0);
+    /* The page's video, and another site's audio, are still upgraded, and
+       still refuse an HTTP redirect. */
+    CHECK(media_worker_hop_init(&hop, station)
+          && media_worker_hop_admit(&video, &hop, fixture.scratch)
+                 == MEDIA_WORKER_HOP_ADMITTED
+          && strcmp(hop.url, upgraded) == 0);
+    expect_refused(&fixture, &video, upgraded, "http://relay.test/live");
+    CHECK(media_worker_hop_init(&hop, station)
+          && media_worker_hop_admit(&elsewhere, &hop, fixture.scratch)
+                 == MEDIA_WORKER_HOP_ADMITTED
+          && strcmp(hop.url, upgraded) == 0);
+    expect_refused(&fixture, &elsewhere, upgraded, "http://relay.test/live");
+
+    /* The question itself: asked for a refused or empty probe of a plain
+       HTTP address on a secure page, never for loopback, an HTTPS address,
+       an insecure page or a probe that found audio. */
+    BrowserSession *session = &fixture.session;
+    CHECK(media_http_insecure_audio_step(
+              session, station, "https://new.test/", MEDIA_HTTP_PROBE_REFUSED)
+          == MEDIA_INSECURE_AUDIO_ASK
+          && media_http_insecure_audio_step(
+              session, station, "https://new.test/",
+              MEDIA_HTTP_PROBE_UNAVAILABLE) == MEDIA_INSECURE_AUDIO_ASK
+          && media_http_insecure_audio_step(
+              session, station, "https://new.test/", MEDIA_HTTP_PROBE_MP3)
+                 == MEDIA_INSECURE_AUDIO_NONE
+          && media_http_insecure_audio_step(
+              session, "http://127.0.0.1:8002/stream", "https://new.test/",
+              MEDIA_HTTP_PROBE_REFUSED) == MEDIA_INSECURE_AUDIO_NONE
+          && media_http_insecure_audio_step(
+              session, upgraded, "https://new.test/",
+              MEDIA_HTTP_PROBE_REFUSED) == MEDIA_INSECURE_AUDIO_NONE
+          && media_http_insecure_audio_step(
+              session, station, "http://new.test/",
+              MEDIA_HTTP_PROBE_REFUSED) == MEDIA_INSECURE_AUDIO_NONE
+          && media_http_insecure_audio_step(
+              session, station, DOCUMENT, MEDIA_HTTP_PROBE_REFUSED)
+                 == MEDIA_INSECURE_AUDIO_NONE);
+    CHECK(browser_session_set_insecure_audio_site(
+              session, "https://new.test/", BROWSER_INSECURE_AUDIO_DECLINED)
+          && media_http_insecure_audio_step(
+              session, station, "https://new.test/a",
+              MEDIA_HTTP_PROBE_REFUSED) == MEDIA_INSECURE_AUDIO_DECLINED);
+    /* Ask again: the answer is forgotten. */
+    CHECK(browser_session_set_insecure_audio_site(
+              session, "https://new.test/", BROWSER_INSECURE_AUDIO_UNASKED)
+          && browser_session_insecure_audio_site(session, "https://new.test/")
+                 == BROWSER_INSECURE_AUDIO_UNASKED);
+
+    /* The table is bounded; a full table refuses a new site but still
+       changes one it holds. */
+    char site[64];
+    bool stored = true;
+    unsigned held = 0;
+    for (unsigned at = 0; at < 64u && stored; at++) {
+        snprintf(site, sizeof(site), "https://s%u.test/", at);
+        stored = browser_session_set_insecure_audio_site(
+            session, site, BROWSER_INSECURE_AUDIO_DECLINED);
+        if (stored) held++;
+    }
+    CHECK(!stored && held >= 8u
+          && browser_session_set_insecure_audio_site(
+                 session, DOCUMENT, BROWSER_INSECURE_AUDIO_DECLINED)
+          && browser_session_insecure_audio_site(session, DOCUMENT)
+                 == BROWSER_INSECURE_AUDIO_DECLINED);
+
+    /* A new session is the restart boundary: nothing carries over. */
+    CHECK(browser_session_set_insecure_audio_site(
+        session, DOCUMENT, BROWSER_INSECURE_AUDIO_ALLOWED));
+    browser_session_destroy(session);
+    CHECK(browser_session_init(session, &fixture.budget, 128u * 1024u)
+          && browser_session_insecure_audio_site(session, DOCUMENT)
+                 == BROWSER_INSECURE_AUDIO_UNASKED);
+    fixture_destroy(&fixture);
+    CHECK(fixture.budget.current == 0);
+}
+
 int main(void)
 {
     test_hls_redirect_chain_crosses_origins();
@@ -608,6 +740,7 @@ int main(void)
     test_first_hop_private_page_and_hsts();
     test_provider_first_hop_passes_through();
     test_redirect_without_scratch_is_a_memory_failure();
+    test_insecure_audio_answer_is_narrow();
     if (failures != 0) {
         printf("media-worker-request-tests: %d check(s) failed\n", failures);
         return 1;

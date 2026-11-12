@@ -224,8 +224,29 @@ static bool node_effectively_disabled(lxb_dom_node_t *node)
     return false;
 }
 
-static bool append_url_encoded(char *output, size_t capacity, size_t *used,
-                               const char *text, size_t length)
+/* Url-encoded entry list being written. Past `capacity` it stops storing and
+   keeps counting, so one pass learns the size a spilled body needs. */
+typedef struct {
+    char *output;
+    size_t capacity;
+    size_t length;
+    bool overflowed;
+} FormBodyWriter;
+
+static void form_body_put(FormBodyWriter *writer, const char *bytes,
+                          size_t count)
+{
+    if (!writer->overflowed && count < writer->capacity - writer->length) {
+        memcpy(writer->output + writer->length, bytes, count);
+        writer->output[writer->length + count] = '\0';
+    } else {
+        writer->overflowed = true;
+    }
+    writer->length += count;
+}
+
+static void form_body_put_encoded(FormBodyWriter *writer, const char *text,
+                                  size_t length)
 {
     static const char hex[] = "0123456789ABCDEF";
     for (size_t i = 0; i < length; i++) {
@@ -235,35 +256,25 @@ static bool append_url_encoded(char *output, size_t capacity, size_t *used,
                      || (value >= '0' && value <= '9')
                      || value == '-' || value == '_' || value == '.'
                      || value == '~';
-        size_t needed = plain || value == ' ' ? 1 : 3;
-        if (*used + needed >= capacity) return false;
-        if (plain) output[(*used)++] = (char) value;
-        else if (value == ' ') output[(*used)++] = '+';
-        else {
-            output[(*used)++] = '%';
-            output[(*used)++] = hex[value >> 4];
-            output[(*used)++] = hex[value & 15u];
+        if (plain) {
+            form_body_put(writer, (const char *) &value, 1);
+        } else if (value == ' ') {
+            form_body_put(writer, "+", 1);
+        } else {
+            char escaped[3] = { '%', hex[value >> 4], hex[value & 15u] };
+            form_body_put(writer, escaped, sizeof(escaped));
         }
     }
-    output[*used] = '\0';
-    return true;
 }
 
-static bool append_form_pair(ControllerAction *action,
+static void append_form_pair(FormBodyWriter *writer,
                              const char *name, size_t name_length,
                              const char *value, size_t value_length)
 {
-    if (action->body_length != 0) {
-        if (action->body_length + 1 >= sizeof(action->body)) return false;
-        action->body[action->body_length++] = '&';
-    }
-    if (!append_url_encoded(action->body, sizeof(action->body),
-                            &action->body_length, name, name_length)
-        || action->body_length + 1 >= sizeof(action->body)) return false;
-    action->body[action->body_length++] = '=';
-    action->body[action->body_length] = '\0';
-    return append_url_encoded(action->body, sizeof(action->body),
-                              &action->body_length, value, value_length);
+    if (writer->length != 0) form_body_put(writer, "&", 1);
+    form_body_put_encoded(writer, name, name_length);
+    form_body_put(writer, "=", 1);
+    form_body_put_encoded(writer, value, value_length);
 }
 
 static bool option_value(lxb_dom_node_t *select, const char **value,
@@ -307,9 +318,9 @@ static bool option_value(lxb_dom_node_t *select, const char **value,
     return *value != NULL;
 }
 
-static bool serialize_form_controls(lxb_dom_node_t *node,
+static void serialize_form_controls(lxb_dom_node_t *node,
                                     lxb_dom_node_t *submitter,
-                                    ControllerAction *action)
+                                    FormBodyWriter *writer)
 {
     for (lxb_dom_node_t *at = node; at != NULL; at = at->next) {
         if (at->type == LXB_DOM_NODE_TYPE_ELEMENT
@@ -362,25 +373,62 @@ static bool serialize_form_controls(lxb_dom_node_t *node,
                     }
                     if (value == NULL) { value = ""; value_length = 0; }
                 }
-                if (successful && value != NULL
-                    && !append_form_pair(action, name, name_length,
-                                         value, value_length)) {
-                    if (allocated != NULL) {
-                        lxb_dom_document_destroy_text(at->owner_document,
-                                                      allocated);
-                    }
-                    return false;
+                if (successful && value != NULL) {
+                    append_form_pair(writer, name, name_length,
+                                     value, value_length);
                 }
             }
             if (allocated != NULL) {
                 lxb_dom_document_destroy_text(at->owner_document, allocated);
             }
         }
-        if (at->first_child != NULL
-            && !serialize_form_controls(at->first_child, submitter, action)) {
-            return false;
+        if (at->first_child != NULL) {
+            serialize_form_controls(at->first_child, submitter, writer);
         }
     }
+}
+
+/* Hands a Budget-owned body to the session and points the action at it: the
+   action is a value the frontend holds across Wi-Fi association, and tokens
+   of several KiB do not fit its inline buffer. */
+static void controller_action_adopt_body(NavigationSession *navigation,
+                                         ControllerAction *action,
+                                         char *body, size_t length)
+{
+    budget_free(navigation->budget, navigation->form_submission_body);
+    navigation->form_submission_body = body;
+    action->body[0] = '\0';
+    action->body_length = length;
+    action->external_body = body;
+}
+
+/* Serializes the form's controls from the DOM: inline when they fit, else in
+   a second pass into storage the first pass measured. False only when the
+   body is over the limit every form submission shares, or memory ran out. */
+static bool controller_serialize_form_body(NavigationSession *navigation,
+                                           lxb_dom_node_t *form,
+                                           lxb_dom_node_t *submitter,
+                                           ControllerAction *action)
+{
+    FormBodyWriter writer = {
+        .output = action->body, .capacity = sizeof(action->body)
+    };
+    action->body[0] = '\0';
+    serialize_form_controls(form->first_child, submitter, &writer);
+    if (!writer.overflowed) {
+        action->body_length = writer.length;
+        return true;
+    }
+    action->body[0] = '\0';
+    if (writer.length > NAVIGATION_FORM_BODY_LIMIT) return false;
+    size_t length = writer.length;
+    char *body = budget_malloc_category(
+        navigation->budget, BUDGET_CATEGORY_NAVIGATION, length + 1u);
+    if (body == NULL) return false;
+    writer = (FormBodyWriter) { .output = body, .capacity = length + 1u };
+    body[0] = '\0';
+    serialize_form_controls(form->first_child, submitter, &writer);
+    controller_action_adopt_body(navigation, action, body, length);
     return true;
 }
 
@@ -422,18 +470,26 @@ static bool node_is_submit_button(lxb_dom_node_t *node)
                    || attribute_is(node, "type", "image")));
 }
 
+static bool media_type_is(const char *type, size_t length, const char *name)
+{
+    size_t name_length = strlen(name);
+    if (length < name_length
+        || strncasecmp(type, name, name_length) != 0) return false;
+    if (length == name_length) return true;
+    unsigned char next = (unsigned char) type[name_length];
+    return next == ';' || isspace(next);
+}
+
+/* MP4, and for audio also MPEG audio (MP3, media_mp3.c). */
 static bool media_type_supported(lxb_dom_node_t *node, bool audio_only)
 {
     size_t length = 0;
     const char *type = document_attribute(node, "type", &length);
     if (type == NULL || length == 0) return true;
-    const char *mp4 = audio_only ? "audio/mp4" : "video/mp4";
-    size_t mp4_length = strlen(mp4);
-    if (length < mp4_length
-        || strncasecmp(type, mp4, mp4_length) != 0) return false;
-    if (length == mp4_length) return true;
-    unsigned char next = (unsigned char) type[mp4_length];
-    return next == ';' || isspace(next);
+    if (!audio_only) return media_type_is(type, length, "video/mp4");
+    return media_type_is(type, length, "audio/mp4")
+        || media_type_is(type, length, "audio/mpeg")
+        || media_type_is(type, length, "audio/mp3");
 }
 
 /* The quality a <source> declares through the attributes players commonly
@@ -753,6 +809,21 @@ static bool controller_build_media_action(
     action->media_node_handle = runtime == NULL || media == NULL ? 0
         : script_runtime_node_handle(runtime, media);
     action->media_audio_only = audio_only;
+    action->media_title[0] = '\0';
+    size_t title_length = 0;
+    const char *title = media == NULL ? NULL
+        : document_attribute(media, "title", &title_length);
+    if (title != NULL) {
+        if (title_length >= sizeof(action->media_title)) {
+            title_length = sizeof(action->media_title) - 1u;
+            while (title_length > 0
+                   && ((unsigned char) title[title_length] & 0xC0u)
+                          == 0x80u)
+                title_length--;
+        }
+        memcpy(action->media_title, title, title_length);
+        action->media_title[title_length] = '\0';
+    }
     controller_action_clear_body(action);
     memmove(action->body, build.packed, build.packed_length);
     action->body_length = build.packed_length;
@@ -1043,6 +1114,7 @@ static bool controller_build_structured_audio_action(
             TILEFINCH_DESTINATION_MEDIA, action->url)) return false;
     action->type = CONTROLLER_ACTION_MEDIA;
     action->media_audio_only = true;
+    action->media_title[0] = '\0';
     action->media_node_handle = 0;
     action->media_mode = TILEFINCH_REQUEST_MODE_NO_CORS;
     action->media_credentials = TILEFINCH_CREDENTIALS_INCLUDE;
@@ -1081,17 +1153,21 @@ static bool controller_try_structured_audio_fallback(
         controller, node, association, action);
 }
 
+/* The form's default button is its first submit button in tree order,
+   disabled or not: a disabled one means Enter submits nothing (HTML
+   implicit submission; Chrome's HTMLFormElement::SubmitImplicitly). */
 static void form_implicit_controls(lxb_dom_node_t *node,
                                    lxb_dom_node_t **default_submitter,
                                    size_t *blocking_fields)
 {
     for (lxb_dom_node_t *at = node; at != NULL; at = at->next) {
-        if (at->type == LXB_DOM_NODE_TYPE_ELEMENT
-            && !node_effectively_disabled(at)) {
+        if (at->type == LXB_DOM_NODE_TYPE_ELEMENT) {
             if (*default_submitter == NULL && node_is_submit_button(at)) {
                 *default_submitter = at;
+            } else if (!node_effectively_disabled(at)
+                       && input_blocks_implicit_submission(at)) {
+                (*blocking_fields)++;
             }
-            if (input_blocks_implicit_submission(at)) (*blocking_fields)++;
         }
         if (at->first_child != NULL) {
             form_implicit_controls(at->first_child, default_submitter,
@@ -1115,6 +1191,8 @@ static bool controller_build_implicit_form_action(
     lxb_dom_node_t *submitter = NULL;
     size_t blocking_fields = 0;
     form_implicit_controls(form->first_child, &submitter, &blocking_fields);
+    if (submitter != NULL && node_effectively_disabled(submitter))
+        return false;
     if (submitter != NULL) {
         long form_handle = controller_node_snapshot_handle(controller, form);
         long submitter_handle = controller_node_snapshot_handle(
@@ -1150,7 +1228,7 @@ static bool controller_build_implicit_form_action(
         controller, form, NULL, true, initial_outcome, action);
 }
 
-static bool controller_build_form_action_with_outcome(
+static bool controller_prepare_form_action(
     BrowserController *controller, lxb_dom_node_t *form,
     lxb_dom_node_t *submitter, bool dispatch_submit_event,
     ControllerActivationOutcome initial_outcome, ControllerAction *action)
@@ -1229,8 +1307,14 @@ static bool controller_build_form_action_with_outcome(
     }
     const NavigationEntry *current = navigation_current(navigation);
     if (current == NULL) return false;
+    /* A submit button overrides the form's action and method, except on a
+       projected Basic form, whose admission rests on the form's own GET. */
+    lxb_dom_node_t *override = native_basic_form ? NULL : submitter;
     size_t action_length = 0;
-    const char *target = document_attribute(form, "action", &action_length);
+    const char *target = override == NULL ? NULL
+        : document_attribute(override, "formaction", &action_length);
+    if (target == NULL)
+        target = document_attribute(form, "action", &action_length);
     char target_copy[NAVIGATION_URL_LIMIT];
     const char *resolution_base = current->url;
     if (target == NULL || action_length == 0) {
@@ -1251,13 +1335,43 @@ static bool controller_build_form_action_with_outcome(
     if (!tilefinch_csp_allows_form_action(
             &navigation->page.document.content_security_policy,
             action->url)) return false;
-    bool post = attribute_is(form, "method", "post");
+    bool post = override != NULL && has_attribute(override, "formmethod")
+        ? attribute_is(override, "formmethod", "post")
+        : attribute_is(form, "method", "post");
     snprintf(action->method, sizeof(action->method), "%s",
              post ? "POST" : "GET");
     snprintf(action->content_type, sizeof(action->content_type),
              "application/x-www-form-urlencoded");
     action->type = CONTROLLER_ACTION_FORM_SUBMIT;
-    if (!serialize_form_controls(form->first_child, submitter, action)) {
+    /* With a live realm the entry list comes from script: it holds control
+       values native state cannot (above DOCUMENT_CONTROL_VALUE_LIMIT) and
+       what `formdata` listeners added. Null means script left this form to
+       the DOM serializer (multipart, or the entry list failed to build). A
+       list too large to send is refused, not replaced by those stale values. */
+    char *entries = NULL;
+    size_t entries_length = 0;
+    ScriptFormBodyTake take = navigation->page.runtime != NULL
+            && !native_basic_form
+        ? script_runtime_take_form_submission_body(
+              navigation->page.runtime, navigation->budget,
+              NAVIGATION_FORM_BODY_LIMIT, &entries, &entries_length)
+        : SCRIPT_FORM_BODY_NONE;
+    if (take == SCRIPT_FORM_BODY_REFUSED) {
+        action->type = CONTROLLER_ACTION_NONE;
+        return false;
+    }
+    if (take == SCRIPT_FORM_BODY_TAKEN) {
+        if (entries_length < sizeof(action->body)) {
+            memcpy(action->body, entries, entries_length + 1u);
+            action->body_length = entries_length;
+            budget_free(navigation->budget, entries);
+        } else {
+            controller_action_adopt_body(
+                navigation, action, entries, entries_length);
+        }
+    } else if (!controller_serialize_form_body(
+                   navigation, form, submitter, action)) {
+        action->type = CONTROLLER_ACTION_NONE;
         return false;
     }
     if (!post && action->body_length != 0) {
@@ -1274,14 +1388,29 @@ static bool controller_build_form_action_with_outcome(
                     url_length - insert_at + 1u);
         }
         action->url[insert_at] = has_query ? '&' : '?';
-        memcpy(action->url + insert_at + 1u, action->body,
+        memcpy(action->url + insert_at + 1u, controller_action_body(action),
                action->body_length);
         if (fragment == NULL)
             action->url[insert_at + needed] = '\0';
-        action->body_length = 0;
-        action->body[0] = '\0';
+        controller_action_clear_body(action);
     }
     return true;
+}
+
+static bool controller_build_form_action_with_outcome(
+    BrowserController *controller, lxb_dom_node_t *form,
+    lxb_dom_node_t *submitter, bool dispatch_submit_event,
+    ControllerActivationOutcome initial_outcome, ControllerAction *action)
+{
+    if (controller_prepare_form_action(
+            controller, form, submitter, dispatch_submit_event,
+            initial_outcome, action)) return true;
+    if (action != NULL) {
+        memset(action, 0, sizeof(*action));
+        action->activation_outcome = initial_outcome;
+        action->form_not_sent = true;
+    }
+    return false;
 }
 
 bool controller_build_form_action(
@@ -3678,6 +3807,24 @@ bool controller_focused_download_url(BrowserController *controller,
         && file_download_url_supported(url);
 }
 
+/* A press that left the page as it was because its behaviour is in page
+   scripts that stopped. NATIVE_NOTHING says the browser's own default for
+   NODE changed nothing either. A label is left out: its native default is
+   focusing its control, which is not a script's job. */
+static void controller_note_stopped_scripts(
+    const BrowserController *controller, lxb_dom_node_t *node,
+    bool native_nothing, ControllerAction *action)
+{
+    const NavigationSession *navigation = controller->navigation;
+    action->page_scripts_stopped = native_nothing
+        && action->type == CONTROLLER_ACTION_CONTROL
+        && action->activation_outcome
+               == CONTROLLER_ACTIVATION_RUNTIME_UNAVAILABLE
+        && navigation->page.runtime == NULL
+        && navigation->page.script_stop.reason != NAVIGATION_SCRIPT_STOP_NONE
+        && !node_name_is(node, "label");
+}
+
 bool controller_activate(BrowserController *controller,
                          ControllerAction *action)
 {
@@ -3737,6 +3884,8 @@ bool controller_activate(BrowserController *controller,
             action->url[0] = '\0';
         } else if (action->type == CONTROLLER_ACTION_NAVIGATE) {
             script_runtime_note_link_default(navigation->page.runtime);
+        } else if (javascript_reference) {
+            controller_note_stopped_scripts(controller, node, true, action);
         }
         /* javascript: URLs are executable navigation defaults, not request
            targets. Tilefinch has no policy-admitted JavaScript-URL evaluator;
@@ -3807,6 +3956,7 @@ bool controller_activate(BrowserController *controller,
         if (media_element
             && (node_name_is(node, "video") || node_name_is(node, "audio")))
             return controller_build_media_action(controller, node, action);
+        bool native_nothing = false;
         if (action->activation_outcome
                 == CONTROLLER_ACTIVATION_RUNTIME_UNAVAILABLE
             || action->activation_outcome
@@ -3815,6 +3965,7 @@ bool controller_activate(BrowserController *controller,
                 controller_native_default(controller, node, 0);
             if (default_result == CONTROLLER_NATIVE_DEFAULT_FAILED)
                 return false;
+            native_nothing = default_result == CONTROLLER_NATIVE_DEFAULT_NONE;
         }
         if (action->activation_outcome
                 == CONTROLLER_ACTIVATION_RUNTIME_FAILED) {
@@ -3835,6 +3986,7 @@ bool controller_activate(BrowserController *controller,
         }
         (void) controller_try_structured_audio_fallback(
             controller, node, handlers_before, action);
+        controller_note_stopped_scripts(controller, node, native_nothing, action);
         return true;
     }
     if (controller->focus_kind == CONTROLLER_FOCUS_POINTER
@@ -3858,6 +4010,7 @@ bool controller_activate(BrowserController *controller,
             .event_handlers_invoked;
         action->type = CONTROLLER_ACTION_CONTROL;
         controller->activations++;
+        bool native_nothing = false;
         action->activation_outcome =
             controller_dispatch_activation(controller, node);
         if (action->activation_outcome == CONTROLLER_ACTIVATION_CANCELLED) {
@@ -3883,6 +4036,8 @@ bool controller_activate(BrowserController *controller,
                     controller_native_default(controller, node, 0);
                 if (default_result == CONTROLLER_NATIVE_DEFAULT_FAILED)
                     return false;
+                native_nothing =
+                    default_result == CONTROLLER_NATIVE_DEFAULT_NONE;
             }
             if (action->activation_outcome
                     == CONTROLLER_ACTIVATION_RUNTIME_FAILED) {
@@ -3901,6 +4056,8 @@ bool controller_activate(BrowserController *controller,
         } else {
             (void) controller_try_structured_audio_fallback(
                 controller, node, handlers_before, action);
+            controller_note_stopped_scripts(
+                controller, node, native_nothing, action);
         }
         return true;
     }
@@ -4130,22 +4287,56 @@ bool controller_text_input_info(
     return true;
 }
 
+/* User decision 2026-11-11: a PSP has no Enter key, and a phone keyboard's
+   Done or Go submits a form with one text field. Forms with more (a user
+   name and a password) keep Done as a plain commit, as a phone's Next
+   does, so the first field's Done does not send the rest empty. */
+bool controller_keyboard_done_submits(const BrowserController *controller)
+{
+    if (controller == NULL || controller->navigation == NULL) return false;
+    bool control_focus = false;
+    size_t index = 0;
+    if (!current_focus_region(controller, &control_focus, &index)
+        || !control_focus) return false;
+    const LayoutDocument *layout = &controller->navigation->page.layout;
+    if (index >= layout->control_count
+        || layout->controls[index].type != CONTROL_INPUT) return false;
+    lxb_dom_node_t *input = layout->controls[index].node;
+    lxb_dom_node_t *form = form_ancestor(input);
+    if (form == NULL || node_effectively_disabled(input)
+        || has_attribute(input, "readonly")
+        || !input_blocks_implicit_submission(input)) return false;
+    lxb_dom_node_t *submitter = NULL;
+    size_t blocking_fields = 0;
+    form_implicit_controls(form->first_child, &submitter, &blocking_fields);
+    return blocking_fields == 1
+        && (submitter == NULL || !node_effectively_disabled(submitter));
+}
+
 bool controller_replace_text(BrowserController *controller,
                              const char *utf8, size_t length)
 {
     if (controller == NULL || utf8 == NULL) return false;
-    char ignored[CONTROLLER_EDIT_LIMIT + 1];
+    char previous[CONTROLLER_EDIT_LIMIT + 1];
     size_t previous_length = 0;
-    if (!current_control_value(controller, ignored, &previous_length)) {
+    if (!current_control_value(controller, previous, &previous_length)) {
         return false;
     }
-    (void) previous_length;
     if (length > CONTROLLER_EDIT_LIMIT) length = CONTROLLER_EDIT_LIMIT;
     char value[CONTROLLER_EDIT_LIMIT + 1];
     if (length > 0) memcpy(value, utf8, length);
     value[length] = '\0';
-    return set_control_value(controller, value, length, value,
-                             "insertReplacementText");
+    if (!set_control_value(controller, value, length, value,
+                           "insertReplacementText")) return false;
+    /* The native keyboard's Done commits the edit, which is what `change`
+       reports: pages enable their Next button or validate on it. */
+    lxb_dom_node_t *node = retained_focus_node(controller);
+    if (node != NULL && (previous_length != length
+                         || memcmp(previous, value, length) != 0)) {
+        (void) navigation_dispatch_node_event(
+            controller->navigation, node, "change");
+    }
+    return true;
 }
 
 bool controller_insert_text(BrowserController *controller,
@@ -4523,6 +4714,19 @@ bool controller_scroll_page(BrowserController *controller, int direction,
                                  viewport_height) || nested;
 }
 
+int controller_page_press_preview_step(const BrowserController *controller)
+{
+    if (controller == NULL || controller->navigation == NULL
+        || controller->focus_handle != 0 || controller->focus_node != NULL
+        || controller->pointer_hover_handle != 0
+        || controller->pointer_hover_node != NULL) return 0;
+    const ViewportContext *viewport = &controller->navigation->viewport;
+    int css_overlap = viewport->css_height / 8;
+    int minimum_overlap = viewport_device_to_css(viewport, 16);
+    if (css_overlap < minimum_overlap) css_overlap = minimum_overlap;
+    return viewport->css_height - css_overlap;
+}
+
 bool controller_scroll_to_top(BrowserController *controller,
                               int viewport_height)
 {
@@ -4561,7 +4765,8 @@ bool controller_execute_action(BrowserController *controller,
                          ? copy.method : "GET";
     bool loaded = navigation_load_request(
         navigation, generation, copy.url, method,
-        copy.body_length == 0 ? NULL : copy.body, copy.body_length,
+        copy.body_length == 0 ? NULL : controller_action_body(&copy),
+        copy.body_length,
         copy.content_type[0] == '\0' ? NULL : copy.content_type,
         maximum_bytes, timeout_ms,
         navigation->viewport.device_width == 0

@@ -84,6 +84,18 @@ static uint32_t psp_entropy_work_area[PSP_ENTROPY_WORK_WORDS]
     __attribute__((aligned(64)));
 static bool psp_entropy_work_area_flushed;
 
+#ifdef TILEFINCH_PSP_ENTROPY_CAPTURE
+#include "psp_entropy_capture.h"
+
+/* Validation builds only (cmake/PspOwnedTransport.cmake): each batch's raw
+   samples, copied before the estimator sorts them in place, for the
+   recorder in src/psp_app/psp_app_validation_entropy.c. */
+static PspEntropyCaptureSink psp_entropy_capture_sink;
+static void *psp_entropy_capture_context;
+static uint16_t psp_entropy_capture_phase = PSP_ENTROPY_CAPTURE_PHASE_FILL;
+static uint32_t psp_entropy_capture_copy[PSP_ENTROPY_MAX_BATCH];
+#endif
+
 static void psp_entropy_emit(const char *line)
 {
     if (psp_entropy.report != NULL) {
@@ -222,18 +234,45 @@ static void psp_entropy_gather_batch_locked(bool sleep, uint32_t *salt)
     }
     uint64_t batch_us = (uint64_t) sceKernelGetSystemTimeWide() - batch_started;
     uint32_t credited = 0;
+#ifdef TILEFINCH_PSP_ENTROPY_CAPTURE
+    if (psp_entropy_capture_sink != NULL)
+        memcpy(psp_entropy_capture_copy, psp_entropy_samples,
+               count * sizeof(psp_entropy_samples[0]));
+#endif
     uint32_t millibits = psp_entropy_pool_add_batch(
         &psp_entropy.pool,
         sleep ? PSP_ENTROPY_DOMAIN_SLEEP_TIMING : PSP_ENTROPY_DOMAIN_WORK_TIMING,
         psp_entropy_samples, count, &credited);
     psp_entropy_note(sleep ? &psp_entropy.sleep : &psp_entropy.work,
                      count, millibits, batch_us);
+#ifdef TILEFINCH_PSP_ENTROPY_CAPTURE
+    if (psp_entropy_capture_sink != NULL) {
+        PspEntropyCaptureBatch batch = {
+            .source = sleep ? PSP_ENTROPY_CAPTURE_SOURCE_SLEEP
+                            : PSP_ENTROPY_CAPTURE_SOURCE_WORK,
+            .phase = psp_entropy_capture_phase,
+            .count = count,
+            .millibits = millibits,
+            .credited_bits = credited,
+            .pool_bits = psp_entropy.pool.credited_bits,
+            .batch_us = (uint32_t) batch_us,
+            .start_us = batch_started
+        };
+        psp_entropy_capture_sink(&batch, psp_entropy_capture_copy,
+                                 psp_entropy_capture_context);
+        psp_entropy_zeroize(psp_entropy_capture_copy,
+                            sizeof(psp_entropy_capture_copy));
+    }
+#endif
 }
 
 static void psp_entropy_gather_locked(void)
 {
     uint64_t started = (uint64_t) sceKernelGetSystemTimeWide();
     uint32_t salt = (uint32_t) started;
+#ifdef TILEFINCH_PSP_ENTROPY_CAPTURE
+    psp_entropy_capture_phase = PSP_ENTROPY_CAPTURE_PHASE_FILL;
+#endif
     for (uint32_t batch = 0;
          batch < PSP_ENTROPY_ATTEMPT_BATCHES
              && !psp_entropy_pool_ready(&psp_entropy.pool);
@@ -360,6 +399,9 @@ PspEntropyPreparation psp_entropy_prepare_step(void)
     } else if (psp_entropy.preparation_batches < PSP_ENTROPY_ATTEMPT_BATCHES) {
         uint64_t started = (uint64_t) sceKernelGetSystemTimeWide();
         uint32_t salt = (uint32_t) started;
+#ifdef TILEFINCH_PSP_ENTROPY_CAPTURE
+        psp_entropy_capture_phase = PSP_ENTROPY_CAPTURE_PHASE_PREPARE;
+#endif
         psp_entropy_gather_batch_locked(
             (psp_entropy.preparation_batches & 1u) != 0u, &salt);
         psp_entropy.preparation_batches++;
@@ -406,3 +448,57 @@ void psp_entropy_fill_best_effort(void *output, size_t length)
     psp_entropy_pool_generate(&psp_entropy.pool, output, length);
     psp_entropy_unlock();
 }
+
+#ifdef TILEFINCH_PSP_ENTROPY_CAPTURE
+void psp_entropy_capture_set_sink(PspEntropyCaptureSink sink, void *context)
+{
+    /* Under the lock, so a batch in flight on another thread finishes with
+       the sink it started with. */
+    bool locked = psp_entropy_lock();
+    psp_entropy_capture_sink = sink;
+    psp_entropy_capture_context = context;
+    if (locked) psp_entropy_unlock();
+}
+
+void psp_entropy_capture_shape(PspEntropyCaptureShape *shape)
+{
+    shape->work_batch = PSP_ENTROPY_WORK_BATCH;
+    shape->sleep_batch = PSP_ENTROPY_SLEEP_BATCH;
+    shape->work_touches = PSP_ENTROPY_WORK_TOUCHES;
+    shape->sleep_us = PSP_ENTROPY_SLEEP_US;
+}
+
+bool psp_entropy_capture_run(PspEntropyCaptureSource source,
+                             uint32_t *samples, uint32_t count,
+                             PspEntropyCaptureBatch *batch)
+{
+    bool sleep = source == PSP_ENTROPY_CAPTURE_SOURCE_SLEEP;
+    if ((!sleep && source != PSP_ENTROPY_CAPTURE_SOURCE_WORK)
+        || samples == NULL || count == 0 || batch == NULL
+        || !psp_entropy_lock())
+        return false;
+    /* The same sample functions and salt chain as a pool batch, run without
+       the batch boundaries so lags past one batch can be measured. */
+    uint64_t started = (uint64_t) sceKernelGetSystemTimeWide();
+    uint32_t salt = (uint32_t) started;
+    for (uint32_t index = 0; index < count; index++) {
+        uint32_t sample = sleep ? psp_entropy_sample_sleep()
+                                : psp_entropy_sample_work(salt);
+        samples[index] = sample;
+        salt = salt * UINT32_C(2654435761) + sample;
+    }
+    uint64_t elapsed = (uint64_t) sceKernelGetSystemTimeWide() - started;
+    *batch = (PspEntropyCaptureBatch) {
+        .source = (uint16_t) source,
+        .phase = PSP_ENTROPY_CAPTURE_PHASE_EXTRA,
+        .count = count,
+        .millibits = PSP_ENTROPY_CAPTURE_NOT_ESTIMATED,
+        .credited_bits = PSP_ENTROPY_CAPTURE_NOT_ESTIMATED,
+        .pool_bits = psp_entropy.pool.credited_bits,
+        .batch_us = (uint32_t) elapsed,
+        .start_us = started
+    };
+    psp_entropy_unlock();
+    return true;
+}
+#endif

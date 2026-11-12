@@ -8,18 +8,31 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Next node of a pre-order walk of `root`'s subtree; `skip` passes over
+   the current node's children. */
+static lxb_dom_node_t *table_cell_walk_next(lxb_dom_node_t *at,
+                                            const lxb_dom_node_t *root,
+                                            bool skip)
+{
+    if (!skip && at->first_child != NULL) return at->first_child;
+    while (at != root && at->next == NULL) at = at->parent;
+    return at == root ? NULL : at->next;
+}
+
+/* Move a vertically aligned cell's content down by dy, leaving the cell's
+   own box, background and interaction regions in place. Work is bounded by
+   the cell: the box index finds the root, links and controls come from the
+   range the cell recorded (everything its layout produced), and boxes from a
+   walk of its DOM subtree. Positioned descendants keep their positions. */
 void translate_table_cell_contents(LayoutDocument *layout,
                                           lxb_dom_node_t *node, int dy)
 {
     if (layout == NULL || node == NULL || dy == 0) return;
-    LayoutNodeBox *root = NULL;
-    for (size_t i = 0; i < layout->node_box_count; i++) {
-        if (layout->node_boxes[i].node == node) {
-            root = &layout->node_boxes[i];
-            break;
-        }
-    }
+    LayoutNodeBox *root = layout_box_for_node_mutable(layout, node);
     if (root == NULL) return;
+    size_t root_index = (size_t) (root - layout->node_boxes);
+    if (layout->node_interaction_ranges == NULL
+        || root_index >= layout->node_interaction_capacity) return;
     size_t command_start = root->scroll_command_start;
     size_t command_end = root->scroll_command_end;
     if (command_start > layout->count) command_start = layout->count;
@@ -27,43 +40,44 @@ void translate_table_cell_contents(LayoutDocument *layout,
     for (size_t i = command_start; i < command_end; i++) {
         layout->commands[i].y += dy;
     }
-    for (size_t i = 0; i < layout->link_count; i++) {
+    const uint32_t *interactions = layout->node_interaction_ranges
+        + root_index * LAYOUT_NODE_INTERACTION_STRIDE;
+    size_t link_start = interactions[LAYOUT_NODE_LINK_START];
+    size_t link_end = interactions[LAYOUT_NODE_LINK_END];
+    if (link_end > layout->link_count) link_end = layout->link_count;
+    for (size_t i = link_start; i < link_end; i++) {
+        layout->performance.table_cell_shift_visits++;
         if (layout->links[i].node != node
             && layout_node_within(layout->links[i].node, node)) {
             layout->links[i].y += dy;
         }
     }
-    for (size_t i = 0; i < layout->control_count; i++) {
+    size_t control_start = interactions[LAYOUT_NODE_CONTROL_START];
+    size_t control_end = interactions[LAYOUT_NODE_CONTROL_END];
+    if (control_end > layout->control_count)
+        control_end = layout->control_count;
+    for (size_t i = control_start; i < control_end; i++) {
+        layout->performance.table_cell_shift_visits++;
         if (layout->controls[i].node != node
             && layout_node_within(layout->controls[i].node, node)) {
             layout->controls[i].y += dy;
         }
     }
-    for (size_t i = 0; i < layout->node_box_count; i++) {
-        LayoutNodeBox *box = &layout->node_boxes[i];
-        if (box->node != node && layout_node_within(box->node, node)) {
-            box->y += dy;
-        }
+    for (lxb_dom_node_t *at = node->first_child; at != NULL;
+         at = table_cell_walk_next(at, node, false)) {
+        layout->performance.table_cell_shift_visits++;
+        LayoutNodeBox *box = layout_box_for_node_mutable(layout, at);
+        if (box != NULL) box->y += dy;
     }
-    for (size_t i = 0; i < layout->node_box_count; i++) {
-        const LayoutNodeBox *box = &layout->node_boxes[i];
-        if (box->positioned_ancestor_distance == 0 || box->node == node
-            || !layout_node_within(box->node, node)) continue;
-        bool nested_out_of_flow = false;
-        for (lxb_dom_node_t *ancestor = box->node->parent;
-             ancestor != NULL && ancestor != node;
-             ancestor = ancestor->parent) {
-            const LayoutNodeBox *ancestor_box = layout_box_for_node(
-                layout, ancestor);
-            if (ancestor_box != NULL
-                && ancestor_box->positioned_ancestor_distance != 0) {
-                nested_out_of_flow = true;
-                break;
-            }
-        }
-        if (!nested_out_of_flow) {
-            translate_node_subtree(layout, box->node, 0, -dy);
-        }
+    /* Undo the move for each outermost positioned descendant; a positioned
+       box nested in another moves with it. */
+    for (lxb_dom_node_t *at = node->first_child; at != NULL;) {
+        layout->performance.table_cell_shift_visits++;
+        const LayoutNodeBox *box = layout_box_for_node(layout, at);
+        bool positioned = box != NULL
+            && box->positioned_ancestor_distance != 0;
+        if (positioned) translate_node_subtree(layout, at, 0, -dy);
+        at = table_cell_walk_next(at, node, positioned);
     }
 }
 
@@ -879,6 +893,41 @@ static bool table_fixed_first_row_tracks(
     return false;
 }
 
+/* A slot for `table`'s tracks: a free one, else the least recently used
+   slot whose table does not enclose `table`. Slots of enclosing tables are
+   still in use by their rows, so they are never taken; NULL when every slot
+   belongs to one (nesting deeper than LAYOUT_TABLE_TRACK_SLOTS). */
+static TableTracks *table_tracks_acquire(LayoutContext *context,
+                                         const lxb_dom_node_t *table)
+{
+    TableTracks *victim = NULL;
+    for (size_t i = 0; i < context->table_track_count; i++) {
+        TableTracks *slot = &context->table_tracks[i];
+        if (slot->table == NULL) return slot;
+        if (layout_node_within(table, slot->table)) continue;
+        if (victim == NULL || slot->last_use < victim->last_use) {
+            victim = slot;
+        }
+    }
+    if (context->table_track_count < LAYOUT_TABLE_TRACK_SLOTS) {
+        return &context->table_tracks[context->table_track_count++];
+    }
+    if (victim != NULL) {
+        budget_free(context->layout->budget, victim->placements);
+        *victim = (TableTracks) {0};
+    }
+    return victim;
+}
+
+static void table_tracks_release(LayoutContext *context, TableTracks *tracks)
+{
+    budget_free(context->layout->budget, tracks->placements);
+    *tracks = (TableTracks) {0};
+    if (tracks == &context->table_tracks[context->table_track_count - 1u]) {
+        context->table_track_count--;
+    }
+}
+
 const TableTracks *table_tracks_for_table(
     LayoutContext *context, lxb_dom_node_t *table,
     const ComputedStyle *table_style, int available_width)
@@ -889,22 +938,20 @@ const TableTracks *table_tracks_for_table(
     for (size_t i = 0; i < context->table_track_count; i++) {
         if (context->table_tracks[i].table == table
             && context->table_tracks[i].available_width == available_width) {
+            context->table_tracks[i].last_use = ++context->table_track_clock;
             return &context->table_tracks[i];
         }
     }
-    if (context->table_track_count
-        >= sizeof(context->table_tracks) / sizeof(context->table_tracks[0])) {
-        return NULL;
-    }
+    TableTracks *tracks = table_tracks_acquire(context, table);
+    if (tracks == NULL) return NULL;
     int preferred[16] = {0};
     int minimum[16] = {0};
     int boundaries[17] = {0};
     size_t count = 0;
     bool has_row_spans = false;
-    TableTracks *tracks =
-        &context->table_tracks[context->table_track_count++];
     *tracks = (TableTracks) {
-        .table = table, .available_width = available_width
+        .table = table, .available_width = available_width,
+        .last_use = ++context->table_track_clock
     };
     const StylePaintStack *table_paint = stylesheet_paint_stack(
         context->sheet, computed_style_paint_stack_id(table_style));
@@ -917,7 +964,7 @@ const TableTracks *table_tracks_for_table(
     if (!table_build_placements(
             context, table, table_style, &tracks->placements,
             &tracks->placement_count, &count, &has_row_spans)) {
-        context->table_track_count--;
+        table_tracks_release(context, tracks);
         return NULL;
     }
     table_measure_columns(
@@ -930,21 +977,18 @@ const TableTracks *table_tracks_for_table(
         tracks->placement_count, &first_row, &last_row,
         &top_gutter, &bottom_gutter);
     if (context->cancelled) {
-        budget_free(context->layout->budget, tracks->placements);
-        context->table_track_count--;
+        table_tracks_release(context, tracks);
         return NULL;
     }
     if (!table_measure_rows(context, table, table_style, available_width,
                             preferred, minimum, &count,
                             collapsed_geometry, tracks->placements,
                             tracks->placement_count, has_row_spans)) {
-        budget_free(context->layout->budget, tracks->placements);
-        context->table_track_count--;
+        table_tracks_release(context, tracks);
         return NULL;
     }
     if (count == 0) {
-        budget_free(context->layout->budget, tracks->placements);
-        context->table_track_count--;
+        table_tracks_release(context, tracks);
         return NULL;
     }
     tracks->count = count;
@@ -1017,6 +1061,7 @@ const TableTracks *table_tracks_for_row(
     for (size_t i = 0; i < context->table_track_count; i++) {
         if (context->table_tracks[i].table == table
             && context->table_tracks[i].available_width == available_width) {
+            context->table_tracks[i].last_use = ++context->table_track_clock;
             return &context->table_tracks[i];
         }
     }

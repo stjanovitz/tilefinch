@@ -123,6 +123,18 @@ static int test_failure_kinds(void)
         {"HLS master has no compatible AVC rendition",
          MEDIA_FAILURE_FORMAT_UNSUPPORTED, MEDIA_FAILURE_DETAIL_CODEC,
          "PSP CAN'T PLAY THIS VIDEO FORMAT", "No supported codec"},
+        {"HLS playlist is too long (over 2048 entries)",
+         MEDIA_FAILURE_FORMAT_UNSUPPORTED,
+         MEDIA_FAILURE_DETAIL_PLAYLIST_TOO_LONG,
+         "PSP CAN'T PLAY THIS VIDEO FORMAT", "Video playlist too long"},
+        {"HLS playlist is too long (VOD text over 128 KiB)",
+         MEDIA_FAILURE_FORMAT_UNSUPPORTED,
+         MEDIA_FAILURE_DETAIL_PLAYLIST_TOO_LONG,
+         "PSP CAN'T PLAY THIS VIDEO FORMAT", "Video playlist too long"},
+        {"HLS stream has no supported track (no AVC video; audio-only HLS "
+         "is not supported)",
+         MEDIA_FAILURE_FORMAT_UNSUPPORTED, MEDIA_FAILURE_DETAIL_CODEC,
+         "PSP CAN'T PLAY THIS VIDEO FORMAT", "No supported codec"},
         /* d: the server refused the request. */
         {"page video range probe failed (HTTP 403): forbidden",
          MEDIA_FAILURE_SOURCE_REFUSED, MEDIA_FAILURE_DETAIL_HTTP_STATUS,
@@ -192,6 +204,26 @@ static int test_failure_kinds(void)
          MEDIA_FAILURE_FORMAT_UNSUPPORTED, MEDIA_FAILURE_DETAIL_LIVE,
          "PSP CAN'T PLAY THIS VIDEO FORMAT",
          "Unsupported live stream\nlive-unsupported"},
+        {"playability: drm-protected: OK (offers only DRM-protected "
+             "streams)",
+         MEDIA_FAILURE_COPY_PROTECTED, MEDIA_FAILURE_DETAIL_DRM,
+         "THIS VIDEO IS COPY-PROTECTED",
+         "PSP can't play DRM videos\ndrm-protected"},
+        {"watch: page omitted bounded player configuration after 4 client "
+             "attempts (drm-protected)",
+         MEDIA_FAILURE_COPY_PROTECTED, MEDIA_FAILURE_DETAIL_DRM,
+         "THIS VIDEO IS COPY-PROTECTED",
+         "PSP can't play DRM videos\ndrm-protected"},
+        {"playability: payment-required: UNPLAYABLE (This video requires "
+             "payment to watch)",
+         MEDIA_FAILURE_VIDEO_UNAVAILABLE, MEDIA_FAILURE_DETAIL_PAID,
+         "THIS VIDEO ISN'T AVAILABLE",
+         "PSP can't play paid videos\npayment-required"},
+        {"watch: page omitted bounded player configuration after 4 client "
+             "attempts (payment-required)",
+         MEDIA_FAILURE_VIDEO_UNAVAILABLE, MEDIA_FAILURE_DETAIL_PAID,
+         "THIS VIDEO ISN'T AVAILABLE",
+         "PSP can't play paid videos\npayment-required"},
         /* g: the player request itself. */
         {"player: fetch failed: connection timed out",
          MEDIA_FAILURE_NETWORK, MEDIA_FAILURE_DETAIL_CHECK_NETWORK,
@@ -221,6 +253,13 @@ static int test_failure_kinds(void)
          MEDIA_FAILURE_MEMORY, MEDIA_FAILURE_DETAIL_CLOSE_TABS,
          "NOT ENOUGH MEMORY FOR VIDEO",
          "Close other tabs, then retry\nAV ML 80020190"},
+        /* i: the firmware audio decoder refused the frames. */
+        {"MP3 decode: 0x807F00FD", MEDIA_FAILURE_AUDIO_DECODE,
+         MEDIA_FAILURE_DETAIL_CODE, "PSP CAN'T PLAY THIS AUDIO",
+         "MP3 0x807F00FD"},
+        {"AAC decode: 0x807f0002 calls=2 packets=2",
+         MEDIA_FAILURE_AUDIO_DECODE, MEDIA_FAILURE_DETAIL_CODE,
+         "PSP CAN'T PLAY THIS AUDIO", "AAC 0x807F0002"},
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         MediaFailureMessage message;
@@ -247,16 +286,58 @@ static int test_failure_kinds(void)
     return 0;
 }
 
-/* Everything else keeps its existing presentation: network and server
-   errors, redirect refusals, cancellation and timeouts, and the player's
-   own headlines. */
+/* Everything else keeps its existing presentation: HLS redirect
+   refusals, cancellation and timeouts, and the player's own headlines. */
+/* A page media probe that did not open names the status it got, whatever
+   it was; no status at all is the network. */
+static int test_probe_failures(void)
+{
+    static const struct {
+        const char *failure;
+        MediaFailureKind kind;
+        const char *audio_headline;
+        const char *details;
+    } cases[] = {
+        {"page audio range probe failed (HTTP 302): "
+             "response redirect target is invalid",
+         MEDIA_FAILURE_SOURCE_REFUSED, "AUDIO SOURCE COULD NOT OPEN",
+         "HTTP 302"},
+        {"page video range probe failed (HTTP 500): upstream",
+         MEDIA_FAILURE_SOURCE_REFUSED, "AUDIO SOURCE COULD NOT OPEN",
+         "HTTP 500"},
+        {"page audio range probe failed (HTTP 200): "
+             "server did not authorize byte ranges",
+         MEDIA_FAILURE_SOURCE_REFUSED, "AUDIO SOURCE COULD NOT OPEN",
+         "HTTP 200"},
+        {"page audio range probe failed (HTTP 403): forbidden",
+         MEDIA_FAILURE_SOURCE_REFUSED, "AUDIO SOURCE COULD NOT OPEN",
+         "HTTP 403"},
+        {"page video range probe failed (HTTP 0): connection reset",
+         MEDIA_FAILURE_NETWORK, "NETWORK PROBLEM",
+         "Check Wi-Fi, then press X to retry"}
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        MediaFailureMessage message;
+        CHECK(media_failure_message(cases[i].failure, &message));
+        CHECK(message.kind == cases[i].kind);
+        CHECK(strcmp(media_failure_audio_headline(message.kind),
+                     cases[i].audio_headline) == 0);
+        CHECK(strcmp(message.details, cases[i].details) == 0);
+    }
+    MediaFailureMessage message;
+    CHECK(media_failure_message(
+              "page video range probe failed (HTTP 302): x", &message)
+          && strcmp(message.headline, "VIDEO SOURCE COULD NOT OPEN") == 0);
+    CHECK(!media_failure_message(
+        "page audio range probe failed (HTTP 99): x", &message));
+    CHECK(!media_failure_message(
+        "page audio range probe failed (HTTP 302", &message));
+    return 0;
+}
+
 static int test_other_failures_unchanged(void)
 {
     static const char *const kept[] = {
-        "page video range probe failed (HTTP 0): connection reset",
-        "page video range probe failed (HTTP 500): upstream",
-        "page video range probe failed (HTTP 302): "
-            "response redirect target is invalid",
         "HLS redirect refused (HTTP 302)",
         "VIDEO OPEN STOPPED",
         "VIDEO OPEN TIMED OUT IN VIDEO RANGE",
@@ -285,6 +366,17 @@ static int test_other_failures_unchanged(void)
     CHECK(!media_failure_message(NULL, &message));
     CHECK(!media_failure_message("unsupported AVC profile", NULL));
     CHECK(media_failure_headline(MEDIA_FAILURE_OTHER) == NULL);
+    /* Audio-only media names audio where the video headline names video. */
+    CHECK(media_failure_message("AV ML 80010002 (load-mpeg-vsh)", &message)
+          && strcmp(media_failure_audio_headline(message.kind),
+                    "AUDIO DECODER COULDN'T START") == 0);
+    CHECK(strcmp(media_failure_audio_headline(MEDIA_FAILURE_SOURCE_REFUSED),
+                 "AUDIO SOURCE COULD NOT OPEN") == 0
+          && strcmp(media_failure_audio_headline(MEDIA_FAILURE_MEMORY),
+                    "NOT ENOUGH MEMORY FOR AUDIO") == 0
+          && media_failure_audio_headline(MEDIA_FAILURE_NETWORK)
+                 == media_failure_headline(MEDIA_FAILURE_NETWORK)
+          && media_failure_audio_headline(MEDIA_FAILURE_OTHER) == NULL);
     return 0;
 }
 
@@ -367,6 +459,7 @@ int main(void)
     CHECK(!media_failure_playback_memory("player: fetch failed: timed out"));
     if (test_response_kinds() != 0) return 1;
     if (test_failure_kinds() != 0) return 1;
+    if (test_probe_failures() != 0) return 1;
     if (test_other_failures_unchanged() != 0) return 1;
     puts("media failure message tests passed");
     return 0;

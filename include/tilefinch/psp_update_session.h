@@ -20,6 +20,14 @@ typedef struct {
     TilefinchUpdateClientSnapshot client_snapshot;
     TilefinchUpdateInstallSnapshot install_snapshot;
     char package_path[TILEFINCH_INSTALL_PATH_LIMIT];
+    /* Journal location and the slot this process runs from. The journal is
+       re-read before every check and install; state is only its last copy. */
+    char data_dir[TILEFINCH_INSTALL_PATH_LIMIT];
+    TilefinchUpdateSlot running_slot;
+    bool state_from_journal;
+    bool install_refused;
+    /* TRY AGAIN made the declined trial PENDING; restarting starts it. */
+    bool trial_retry_requested;
     char release_tag[16];
     uint64_t install_maximum_unit_us;
     uint64_t install_units;
@@ -82,6 +90,22 @@ bool psp_update_session_initialized(const PspUpdateSession *session);
 
 PspUpdatePrimaryResult psp_update_session_primary(
     PspUpdateSession *session, const TilefinchInstallPaths *paths);
+/* Re-reads the journal and returns the slot an install may replace now:
+   the inactive slot, never the slot this process runs from (as after safe
+   start, or during an unconfirmed trial). NONE refuses the install. */
+TilefinchUpdateSlot psp_update_session_install_target(
+    PspUpdateSession *session);
+/* The journal holds a STARTED trial of a slot this process does not run
+   from: its recovery screen was answered with O or timed out (or safe
+   start chose the previous build). The Update page then offers TRY AGAIN
+   and DISCARD in place of a check. */
+bool psp_update_session_trial_declined(const PspUpdateSession *session);
+/* Re-reads the journal and, while it still holds that trial, does what X
+   (retry) or Square (discard) does on the recovery screen. The staged slot
+   is kept either way. False when the journal moved on or could not be
+   written. */
+bool psp_update_session_resolve_trial(
+    PspUpdateSession *session, bool retry);
 bool psp_update_session_begin_check(
     PspUpdateSession *session, uint64_t wall_time_seconds,
     bool wall_time_valid);

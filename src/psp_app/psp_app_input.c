@@ -27,6 +27,45 @@ void psp_text_input_present(
 #endif
 }
 
+/* Text entry (address bar, Find, a page field, the developer URL) runs
+   its own pad and present loop on this thread. Under a loading scope the
+   callback-thread supervisor is fenced out for that loop's life, as for a
+   page dialog (psp_app_page_dialog.c): otherwise it repaints the loading
+   page over the keyboard every 100 ms, takes the keyboard's presses as page
+   input (a Circle character stops the load) and composes beside it. The
+   load is not pumped meanwhile, so that time is paused out of its watchdog.
+   A page dialog's prompt keyboard runs inside the dialog's own fence, which
+   does this bookkeeping itself. */
+static uint64_t psp_text_entry_opened_us;
+
+bool psp_text_input_modal_begin(void *user)
+{
+    (void) user;
+    if (psp_presentation_fence_held_here()
+        || !psp_presentation_fence_acquire()) return false;
+    psp_text_entry_opened_us = (uint64_t) sceKernelGetSystemTimeWide();
+    return true;
+}
+
+void psp_text_input_modal_end(void *user, bool begun)
+{
+    if (!begun) return;
+    PspInteractiveState *interactive = user;
+    PspNavigationCooperate *cooperate = &psp_navigation_cooperate;
+    /* The button that closed the keyboard is still held: the supervisor
+       takes it as already seen, so it cannot also act on the page. */
+    SceCtrlData pad = {0};
+    uint32_t still = sceCtrlPeekBufferPositive(&pad, 1) > 0 ? pad.Buttons : 0;
+    uint64_t now_us = (uint64_t) sceKernelGetSystemTimeWide();
+    cooperate->supervisor_previous_buttons = still;
+    cooperate->fallback_previous_buttons = still;
+    cooperate->last_checkpoint_us = now_us;
+    if (interactive != NULL && now_us > psp_text_entry_opened_us)
+        psp_navigation_watchdog_pause(&interactive->navigation_watchdog,
+                                      now_us - psp_text_entry_opened_us);
+    psp_presentation_fence_release(true);
+}
+
 _Static_assert(PSP_UI_FIND_QUERY_LIMIT == BROWSER_FIND_QUERY_LIMIT,
                "PSP find UI and engine query limits must agree");
 
@@ -34,12 +73,15 @@ void psp_find_view_update(PspUiFindView *view,
                                  const BrowserFindSnapshot *snapshot)
 {
     if (view == NULL || snapshot == NULL) return;
+    /* A supervised Find bar draws this view from the callback thread. */
+    bool held = psp_presentation_fence_acquire();
     memset(view, 0, sizeof(*view));
     snprintf(view->query, sizeof(view->query), "%s", snapshot->query);
     view->match_count = snapshot->match_count;
     view->selected = snapshot->selected;
     view->truncated = snapshot->truncated;
     view->wrapped = snapshot->wrapped;
+    psp_presentation_fence_release(held);
 }
 
 void psp_find_sync(BrowserEngine *engine, PspUiState *ui,
@@ -578,7 +620,7 @@ void psp_app_capture_supervisor_media_intent(
 }
 
 void psp_app_refresh_supervisor_media(
-    PspInteractiveState *interactive, const PspUiMediaState *media_ui)
+    PspInteractiveState *interactive, PspUiMediaState *media_ui)
 {
     if (interactive == NULL) return;
     PspUiMediaIntent intent = {0};
@@ -844,6 +886,9 @@ void psp_sync_ui(PspUiState *ui, const BrowserEngine *engine,
         ui->mixed_content_site_allowed =
             browser_session_mixed_content_site_allowed(
                 security_session, view.url);
+        ui->insecure_audio_site_answer =
+            (unsigned) browser_session_insecure_audio_site(
+                security_session, view.url);
         ui->third_party_cookie_site_allowed =
             browser_profile_third_party_cookie_site_allowed(
                 profile, view.url);
@@ -963,7 +1008,11 @@ void psp_app_take_screenshot(
             &app->process->presentation.ui, "SCREENSHOT FOLDER UNAVAILABLE", 240);
         return;
     }
+    /* Under a loading scope the supervisor presents too: fence it out from
+       this present until its picture has been copied. */
+    bool fenced = psp_presentation_fence_acquire();
     if (!psp_present_internal(engine_frame, &app->process->presentation.ui, true)) {
+        psp_presentation_fence_release(fenced);
         psp_ui_show_status(
             &app->process->presentation.ui, "SCREENSHOT VIEW UNAVAILABLE", 240);
         return;
@@ -976,6 +1025,7 @@ void psp_app_take_screenshot(
         budget, BUDGET_CATEGORY_RENDER,
         screenshot_pixel_count * sizeof(*app->interactive->screenshot.pixels));
     if (visible == NULL || app->interactive->screenshot.pixels == NULL) {
+        psp_presentation_fence_release(fenced);
         budget_free(budget, app->interactive->screenshot.pixels);
         app->interactive->screenshot.pixels = NULL;
         psp_ui_show_status(
@@ -989,6 +1039,7 @@ void psp_app_take_screenshot(
             visible + (size_t) y * PSP_VRAM_STRIDE,
             PSP_SCREEN_WIDTH * sizeof(*app->interactive->screenshot.pixels));
     }
+    psp_presentation_fence_release(fenced);
     if (!screenshot_png_begin(
             &app->interactive->screenshot.writer, destination,
             app->interactive->screenshot.pixels, PSP_SCREEN_WIDTH,

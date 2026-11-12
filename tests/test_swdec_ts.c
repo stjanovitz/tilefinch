@@ -112,8 +112,10 @@ static int test_valid_stream(void)
     };
     Capture capture = {0};
     SwdecTs *ts = calloc(1u, sizeof(*ts));
-    CHECK(ts != NULL);
-    swdec_ts_init(ts, capture_video, capture_audio, &capture);
+    uint8_t *au_buffer = malloc(SWDEC_TS_MAX_AU);
+    CHECK(ts != NULL && au_buffer != NULL);
+    swdec_ts_init(ts, au_buffer, SWDEC_TS_MAX_AU,
+                  capture_video, capture_audio, &capture);
     uint8_t packet[188];
     psi_packet(packet, 0u, pat, sizeof(pat));
     CHECK(swdec_ts_feed(ts, packet, sizeof(packet)) == 0);
@@ -142,6 +144,86 @@ static int test_valid_stream(void)
     CHECK(ts->stats.sync_losses == 0u);
     CHECK(ts->stats.malformed_packets == 0u);
     CHECK(ts->stats.malformed_psi == 0u);
+    free(au_buffer);
+    free(ts);
+    return 0;
+}
+
+/* MD-07: a reset (each HLS seek and discontinuity) forgets the stream
+   without writing the 512 KiB access-unit buffer, and a demuxer with no
+   video buffer (an audio rendition) still delivers audio. */
+static int test_reset_keeps_buffers_and_audio_only_use(void)
+{
+    static const uint8_t pat[] = {
+        0x00, 0xb0, 0x0d, 0, 1, 0xc1, 0, 0, 0, 1, 0xe1, 0, 0, 0, 0, 0
+    };
+    static const uint8_t pmt[] = {
+        0x02, 0xb0, 0x17, 0, 1, 0xc1, 0, 0, 0xe1, 1, 0xf0, 0,
+        0x1b, 0xe1, 1, 0xf0, 0, 0x0f, 0xe1, 2, 0xf0, 0, 0, 0, 0, 0
+    };
+    static const uint8_t au[] = {
+        0, 0, 1, 9, 0xf0, 0, 0, 1, 0x65, 0x80, 0x11
+    };
+    static const uint8_t adts_pair[] = {
+        0xff, 0xf1, 0x50, 0x80, 0x00, 0xff, 0xfc,
+        0xff, 0xf1, 0x50, 0x80, 0x00, 0xff, 0xfc
+    };
+    printf("swdec-ts: demuxer state %zu bytes, video buffer caller-owned\n",
+           sizeof(SwdecTs));
+    CHECK(sizeof(SwdecTs) < SWDEC_TS_MAX_ADTS + 1024u);
+    uint8_t *au_buffer = malloc(SWDEC_TS_MAX_AU);
+    SwdecTs *ts = calloc(1u, sizeof(*ts));
+    CHECK(ts != NULL && au_buffer != NULL);
+    memset(au_buffer, 0xa5, SWDEC_TS_MAX_AU);
+    Capture capture = {0};
+    swdec_ts_init(ts, au_buffer, SWDEC_TS_MAX_AU,
+                  capture_video, capture_audio, &capture);
+    uint8_t packet[188];
+    uint8_t payload[184];
+    psi_packet(packet, 0u, pat, sizeof(pat));
+    CHECK(swdec_ts_feed(ts, packet, sizeof(packet)) == 0);
+    psi_packet(packet, 0x100u, pmt, sizeof(pmt));
+    CHECK(swdec_ts_feed(ts, packet, sizeof(packet)) == 0);
+    size_t bytes = pes(payload, 0xe0u, 90000u, au, sizeof(au));
+    ts_packet(packet, 0x101u, true, payload, bytes);
+    CHECK(swdec_ts_feed(ts, packet, sizeof(packet)) == 0);
+    CHECK(ts->au_len == sizeof(au));
+    swdec_ts_reset(ts);
+    CHECK(ts->au_len == 0 && ts->pmt_pid == -1 && ts->video_pid == -1
+          && ts->audio_pid == -1 && ts->au_buf == au_buffer
+          && ts->au_capacity == SWDEC_TS_MAX_AU
+          && ts->video_cb == capture_video && ts->user == &capture);
+    /* Bytes past the unit fed above were never written, reset included. */
+    size_t untouched = 0;
+    for (size_t i = sizeof(au); i < SWDEC_TS_MAX_AU; i++)
+        if (au_buffer[i] == 0xa5) untouched++;
+    CHECK(untouched == SWDEC_TS_MAX_AU - sizeof(au));
+    /* After the reset the stream is found again from its PAT. */
+    psi_packet(packet, 0u, pat, sizeof(pat));
+    CHECK(swdec_ts_feed(ts, packet, sizeof(packet)) == 0);
+    psi_packet(packet, 0x100u, pmt, sizeof(pmt));
+    CHECK(swdec_ts_feed(ts, packet, sizeof(packet)) == 0);
+    CHECK(ts->video_pid == 0x101);
+    free(au_buffer);
+
+    /* No video buffer: video payloads are dropped, audio still flows. */
+    memset(&capture, 0, sizeof(capture));
+    swdec_ts_init(ts, NULL, 0, capture_video, capture_audio, &capture);
+    psi_packet(packet, 0u, pat, sizeof(pat));
+    CHECK(swdec_ts_feed(ts, packet, sizeof(packet)) == 0);
+    psi_packet(packet, 0x100u, pmt, sizeof(pmt));
+    CHECK(swdec_ts_feed(ts, packet, sizeof(packet)) == 0);
+    for (unsigned i = 0; i < 2u; i++) {
+        bytes = pes(payload, 0xe0u, 90000u + 3600u * i, au, sizeof(au));
+        ts_packet(packet, 0x101u, true, payload, bytes);
+        CHECK(swdec_ts_feed(ts, packet, sizeof(packet)) == 0);
+    }
+    bytes = pes(payload, 0xc0u, 90000u, adts_pair, sizeof(adts_pair));
+    ts_packet(packet, 0x102u, true, payload, bytes);
+    CHECK(swdec_ts_feed(ts, packet, sizeof(packet)) == 0);
+    swdec_ts_flush(ts);
+    CHECK(capture.video_count == 0u && capture.audio_count == 2u
+          && ts->stats.au_overflows == 0u);
     free(ts);
     return 0;
 }
@@ -149,8 +231,9 @@ static int test_valid_stream(void)
 static int test_hostile_bounds(void)
 {
     SwdecTs *ts = calloc(1u, sizeof(*ts));
-    CHECK(ts != NULL);
-    swdec_ts_init(ts, NULL, NULL, NULL);
+    uint8_t *au_buffer = malloc(SWDEC_TS_MAX_AU);
+    CHECK(ts != NULL && au_buffer != NULL);
+    swdec_ts_init(ts, au_buffer, SWDEC_TS_MAX_AU, NULL, NULL, NULL);
     uint8_t packet[188] = {0};
     packet[0] = 0x47u; packet[1] = 0x40u; packet[3] = 0x10u;
     packet[4] = 0xffu;
@@ -182,6 +265,7 @@ static int test_hostile_bounds(void)
         }
         (void) swdec_ts_feed(ts, fuzz, sizeof(fuzz));
     }
+    free(au_buffer);
     free(ts);
     return 0;
 }
@@ -190,6 +274,7 @@ int main(void)
 {
     if (test_valid_stream() != 0) return 1;
     if (test_hostile_bounds() != 0) return 1;
+    if (test_reset_keeps_buffers_and_audio_only_use() != 0) return 1;
     puts("swdec TS tests passed");
     return 0;
 }

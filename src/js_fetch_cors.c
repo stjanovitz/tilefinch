@@ -152,7 +152,7 @@ bool js_rt_script_set_response_body(JSContext *context, JSValue response,
     if (context == NULL || fetched == NULL || JS_IsException(response)) {
         return false;
     }
-    if (JS_SetPropertyStr(context, response, "bodyLength",
+    if (js_rt_define_field(context, response, "bodyLength",
             JS_NewInt64(context, (int64_t) fetched->length)) < 0) {
         return false;
     }
@@ -175,10 +175,10 @@ bool js_rt_script_set_response_body(JSContext *context, JSValue response,
             bytes += 3u;
             length -= 3u;
         }
-        return JS_SetPropertyStr(context, response, "body",
+        return js_rt_define_field(context, response, "body",
             JS_NewStringLen(context, (const char *) bytes, length)) >= 0;
     }
-    return JS_SetPropertyStr(context, response, "bodyBytes",
+    return js_rt_define_field(context, response, "bodyBytes",
         JS_NewArrayBufferCopy(context, (const uint8_t *) fetched->data,
                               fetched->length)) >= 0;
 }
@@ -734,75 +734,502 @@ static void dynamic_resource_timing_set_content_type(
         task->resource_timing_content_type;
 }
 
-static bool script_cors_preflight_request(
+/* A preflight's response is small; this bounds what its body may hold. */
+#define SCRIPT_CORS_PREFLIGHT_BYTES (64u * 1024u)
+/* Fetch's default and a cap on Access-Control-Max-Age (Chromium caps at two
+   hours; ten minutes keeps a stale grant short on a device that sleeps). */
+#define SCRIPT_CORS_PREFLIGHT_DEFAULT_MAX_AGE_S 5u
+#define SCRIPT_CORS_PREFLIGHT_MAXIMUM_MAX_AGE_S 600u
+/* How long a decided result waits for the request that asked for it. Its
+   owner retries from a 10 ms timer, so this only bounds an abandoned one. */
+#define SCRIPT_CORS_PREFLIGHT_CLAIM_US UINT64_C(5000000)
+/* A blocking request waits at most this long, cooperatively, for room in
+   the realm scheduler's byte pool, and then fails. */
+#define SCRIPT_FETCH_BLOCKING_CAPACITY_WAIT_US UINT64_C(2000000)
+
+static long script_fetch_timeout_ms(const DomBridge *bridge)
+{
+    return bridge->fetch_timeout_ms < 5000 ? 5000
+                                           : (long) bridge->fetch_timeout_ms;
+}
+
+/* A request a page script waits for (sync XHR and its preflight). It runs
+   on the realm scheduler, which on the PSP is the transport worker, while
+   this thread pumps and cooperates: the UI keeps presenting and the
+   frontend can cancel it, which it cannot do inside a curl transfer on
+   this thread. It takes the slot and the worker descriptor reserved for
+   blocking requests (fetch_scheduler_request_blocking), so the page's own
+   requests holding every slot or descriptor cannot keep it waiting: no
+   owner takes a result, and no other scheduler is pumped, while this
+   thread waits. Only the byte pool is not reserved: when it is full this
+   waits up to SCRIPT_FETCH_BLOCKING_CAPACITY_WAIT_US for in-flight
+   responses to return their unused bound, and then fails. It also fails
+   without a scheduler, while the page domain is held by the native player
+   (which stops the page's network work), and with a NULL budget (no
+   script result to account it to). It never runs a transfer on this
+   thread: on the PSP that is DNS, TCP and TLS on the browser thread
+   (NW-04). */
+static bool script_fetch_blocking(DomBridge *bridge, Budget *budget,
+                                  const char *url,
+                                  const FetchRequest *request,
+                                  size_t maximum_bytes, long timeout_ms,
+                                  FetchResult *fetched)
+{
+    if (bridge->fetch_scheduler == NULL) {
+        bridge->fetch_scheduler = script_runtime_fetch_scheduler(bridge->host);
+    }
+    FetchScheduler *scheduler = bridge->fetch_scheduler;
+    const char *refusal = budget == NULL || scheduler == NULL
+        ? "network scheduler unavailable"
+        : fetch_scheduler_held(scheduler) ? "page network held" : NULL;
+    if (refusal == NULL) {
+        switch (fetch_scheduler_wait_for_blocking_capacity(
+                    scheduler, maximum_bytes,
+                    SCRIPT_FETCH_BLOCKING_CAPACITY_WAIT_US)) {
+        case FETCH_BLOCKING_WAIT_READY:
+            return fetch_scheduler_request_blocking(
+                scheduler, url, request, maximum_bytes, timeout_ms, fetched);
+        case FETCH_BLOCKING_WAIT_HELD:
+            refusal = "page network held";
+            break;
+        case FETCH_BLOCKING_WAIT_CANCELLED:
+            refusal = "request cancelled by platform";
+            break;
+        case FETCH_BLOCKING_WAIT_TIMED_OUT:
+            refusal = "page response memory stayed full";
+            break;
+        case FETCH_BLOCKING_WAIT_FULL:
+        default:
+            refusal = "page request capacity full";
+            break;
+        }
+    }
+    snprintf(fetched->error, sizeof(fetched->error), "%s", refusal);
+    return false;
+}
+
+/* The OPTIONS request for a preflight, authorized like any page request.
+   headers and prepared back the returned request's strings. */
+static bool script_cors_preflight_prepare(
+    DomBridge *bridge, const char *url, const char *method,
+    const ScriptCorsPreflight *preflight, char *headers, size_t headers_size,
+    FetchPreparedPageRequest *prepared, FetchRequest *request)
+{
+    ScriptRequestPolicy policy;
+    if (!script_request_policy_prepare(
+            bridge, url, "OPTIONS", TILEFINCH_REQUEST_MODE_CORS,
+            TILEFINCH_CREDENTIALS_SAME_ORIGIN, TILEFINCH_DESTINATION_FETCH, true,
+            &policy)) return false;
+    int written = snprintf(
+        headers, headers_size, "Access-Control-Request-Method: %s%s%s",
+        method, preflight->header_count == 0 ? "" : "\nAccess-Control-Request-Headers: ",
+        preflight->header_count == 0
+          ? "" : preflight->serialized_header_names);
+    if (written <= 0 || (size_t) written >= headers_size) return false;
+    FetchRequest options = {
+        .method = "OPTIONS", .extra_headers = headers,
+        .cors_preflight = true, .allow_http_errors = true,
+        .send_low_client_hints = true, .accept = "*/*",
+        .redirect_same_origin_only = true
+    };
+    const FetchRequest *authorized = script_request_policy_apply(
+        &policy, bridge->session, &options, prepared);
+    if (authorized == NULL || authorized->origin == NULL
+        || authorized->origin[0] == '\0') return false;
+    *request = *authorized;
+    FetchRequestValidationError validation = FETCH_REQUEST_VALIDATION_OK;
+    return fetch_request_validate(request, &validation);
+}
+
+/* Whether a completed preflight grants the request. header_names is the
+   preflight's sorted ", "-separated list (no name holds a comma or space). */
+static bool script_cors_preflight_allows(
+    const FetchResult *fetched, bool ok, const char *url, const char *method,
+    const char *origin, TilefinchCredentialsMode credentials,
+    const char *header_names)
+{
+    bool credentials_included = credentials == TILEFINCH_CREDENTIALS_INCLUDE;
+    bool allowed = ok && fetched->status_code >= 200
+        && fetched->status_code < 300
+        && fetched->effective_url[0] != '\0'
+        && tilefinch_url_same_origin(url, fetched->effective_url)
+        && fetch_cors_response_allows(fetched, origin, credentials_included);
+    bool wildcard = false;
+    if (allowed && !script_cors_method_safelisted(method)) {
+        allowed = script_response_header_token_contains(
+            fetched, "access-control-allow-methods", method, false,
+            &wildcard)
+            || (wildcard && !credentials_included);
+    }
+    char name[SCRIPT_CORS_HEADER_NAME_LENGTH];
+    for (const char *at = header_names; allowed && *at != '\0';) {
+        const char *end = strchr(at, ',');
+        if (end == NULL) end = at + strlen(at);
+        size_t length = (size_t) (end - at);
+        if (length == 0 || length >= sizeof(name)) return false;
+        memcpy(name, at, length);
+        name[length] = '\0';
+        wildcard = false;
+        bool listed = script_response_header_token_contains(
+            fetched, "access-control-allow-headers", name, true, &wildcard);
+        allowed = listed || (wildcard && !credentials_included
+                             && strcasecmp(name, "authorization") != 0);
+        at = *end == '\0' ? end : end + 1;
+        while (*at == ' ') at++;
+    }
+    return allowed;
+}
+
+/* Access-Control-Max-Age in microseconds: 5 s when absent or invalid,
+   capped at SCRIPT_CORS_PREFLIGHT_MAXIMUM_MAX_AGE_S. */
+static uint64_t script_cors_preflight_lifetime_us(const FetchResult *fetched)
+{
+    char value[32];
+    if (!fetch_response_header_value(fetched, "access-control-max-age",
+                                     value, sizeof(value))) {
+        return (uint64_t) SCRIPT_CORS_PREFLIGHT_DEFAULT_MAX_AGE_S * 1000000u;
+    }
+    const char *at = value;
+    while (*at == ' ' || *at == '\t') at++;
+    uint32_t seconds = 0;
+    bool digits = false;
+    for (; *at >= '0' && *at <= '9'; at++) {
+        digits = true;
+        if (seconds < SCRIPT_CORS_PREFLIGHT_MAXIMUM_MAX_AGE_S) {
+            seconds = seconds * 10u + (uint32_t) (*at - '0');
+        }
+    }
+    while (*at == ' ' || *at == '\t' || *at == '\r') at++;
+    if (!digits || *at != '\0') {
+        seconds = SCRIPT_CORS_PREFLIGHT_DEFAULT_MAX_AGE_S;
+    }
+    if (seconds > SCRIPT_CORS_PREFLIGHT_MAXIMUM_MAX_AGE_S) {
+        seconds = SCRIPT_CORS_PREFLIGHT_MAXIMUM_MAX_AGE_S;
+    }
+    return (uint64_t) seconds * 1000000u;
+}
+
+/* Key fields, in order. */
+enum {
+    SCRIPT_CORS_KEY_CREDENTIALS,
+    SCRIPT_CORS_KEY_METHOD,
+    SCRIPT_CORS_KEY_ORIGIN,
+    SCRIPT_CORS_KEY_HEADERS,
+    SCRIPT_CORS_KEY_URL,
+    SCRIPT_CORS_KEY_FIELDS
+};
+
+static char *script_cors_preflight_key(
+    DomBridge *bridge, const char *url, const char *method,
+    const char *origin, TilefinchCredentialsMode credentials,
+    const ScriptCorsPreflight *preflight, size_t *key_length)
+{
+    char mode[2] = {(char) ('0' + (int) credentials), '\0'};
+    const char *fields[SCRIPT_CORS_KEY_FIELDS] = {
+        mode, method, origin, preflight->serialized_header_names, url
+    };
+    size_t lengths[SCRIPT_CORS_KEY_FIELDS];
+    size_t total = 0;
+    for (size_t i = 0; i < SCRIPT_CORS_KEY_FIELDS; i++) {
+        lengths[i] = strlen(fields[i]);
+        if (lengths[i] >= SIZE_MAX - total) return NULL;
+        total += lengths[i] + 1u;
+    }
+    char *key = budget_malloc(bridge->budget, total);
+    if (key == NULL) return NULL;
+    size_t used = 0;
+    for (size_t i = 0; i < SCRIPT_CORS_KEY_FIELDS; i++) {
+        memcpy(key + used, fields[i], lengths[i] + 1u);
+        used += lengths[i] + 1u;
+    }
+    *key_length = total;
+    return key;
+}
+
+static const char *script_cors_key_field(const ScriptCorsPreflightEntry *entry,
+                                         size_t field)
+{
+    const char *at = entry->key;
+    for (size_t i = 0; i < field; i++) at += strlen(at) + 1u;
+    return at;
+}
+
+static void script_cors_preflight_clear(DomBridge *bridge,
+                                        ScriptCorsPreflightEntry *entry)
+{
+    if (entry->state == SCRIPT_CORS_PREFLIGHT_PENDING
+        && entry->request_id != 0) {
+        (void) fetch_scheduler_cancel(bridge->fetch_scheduler,
+                                      entry->request_id,
+                                      "CORS preflight abandoned");
+        (void) fetch_scheduler_discard(bridge->fetch_scheduler,
+                                       entry->request_id);
+    }
+    budget_free(bridge->budget, entry->key);
+    memset(entry, 0, sizeof(*entry));
+}
+
+void js_rt_cors_preflights_destroy(DomBridge *bridge)
+{
+    if (bridge == NULL) return;
+    for (size_t i = 0; i < SCRIPT_CORS_PREFLIGHT_SLOTS; i++) {
+        if (bridge->cors_preflights[i].state != SCRIPT_CORS_PREFLIGHT_FREE)
+            script_cors_preflight_clear(bridge, &bridge->cors_preflights[i]);
+    }
+}
+
+/* Decides every completed preflight (releasing its scheduler entry, which
+   holds one of the page domain's transfer slots until taken) and drops
+   decided entries past their time. */
+static void script_cors_preflights_settle(DomBridge *bridge, uint64_t now_us)
+{
+    for (size_t i = 0; i < SCRIPT_CORS_PREFLIGHT_SLOTS; i++) {
+        ScriptCorsPreflightEntry *entry = &bridge->cors_preflights[i];
+        if (entry->state == SCRIPT_CORS_PREFLIGHT_FREE) continue;
+        if (entry->state != SCRIPT_CORS_PREFLIGHT_PENDING) {
+            if (now_us >= entry->expires_us)
+                script_cors_preflight_clear(bridge, entry);
+            continue;
+        }
+        if (!fetch_scheduler_request_complete(bridge->fetch_scheduler,
+                                              entry->request_id)) continue;
+        FetchResult *fetched = fetch_result_create(bridge->document->budget);
+        if (fetched == NULL) return;
+        bool ok = false;
+        if (!fetch_scheduler_take(bridge->fetch_scheduler, entry->request_id,
+                                  &ok, fetched)) {
+            fetch_result_free(fetched);
+            continue;
+        }
+        entry->request_id = 0;
+        const char *mode = script_cors_key_field(
+            entry, SCRIPT_CORS_KEY_CREDENTIALS);
+        bool allowed = script_cors_preflight_allows(
+            fetched, ok, script_cors_key_field(entry, SCRIPT_CORS_KEY_URL),
+            script_cors_key_field(entry, SCRIPT_CORS_KEY_METHOD),
+            script_cors_key_field(entry, SCRIPT_CORS_KEY_ORIGIN),
+            (TilefinchCredentialsMode) (mode[0] - '0'),
+            script_cors_key_field(entry, SCRIPT_CORS_KEY_HEADERS));
+        uint64_t lifetime = allowed
+            ? script_cors_preflight_lifetime_us(fetched) : 0;
+        fetch_result_free(fetched);
+        entry->state = allowed ? SCRIPT_CORS_PREFLIGHT_ALLOWED
+                               : SCRIPT_CORS_PREFLIGHT_REFUSED;
+        entry->single_use = lifetime == 0;
+        entry->expires_us = now_us
+            + (lifetime != 0 ? lifetime : SCRIPT_CORS_PREFLIGHT_CLAIM_US);
+        if (!allowed && bridge->result != NULL)
+            bridge->result->network_failures++;
+        bridge->cors_preflight_decisions++;
+    }
+}
+
+void js_rt_cors_preflights_settle(DomBridge *bridge)
+{
+    if (bridge == NULL || bridge->document == NULL) return;
+    for (size_t i = 0; i < SCRIPT_CORS_PREFLIGHT_SLOTS; i++) {
+        if (bridge->cors_preflights[i].state != SCRIPT_CORS_PREFLIGHT_FREE) {
+            script_cors_preflights_settle(
+                bridge, tilefinch_platform_monotonic_time_us());
+            return;
+        }
+    }
+}
+
+static ScriptCorsPreflightEntry *script_cors_preflight_find(
+    DomBridge *bridge, const char *key, size_t key_length)
+{
+    for (size_t i = 0; i < SCRIPT_CORS_PREFLIGHT_SLOTS; i++) {
+        ScriptCorsPreflightEntry *entry = &bridge->cors_preflights[i];
+        if (entry->state != SCRIPT_CORS_PREFLIGHT_FREE
+            && entry->key_length == key_length
+            && memcmp(entry->key, key, key_length) == 0) return entry;
+    }
+    return NULL;
+}
+
+/* A free entry, else the least recently used decided one. An in-flight
+   preflight is never evicted: its owner is waiting for it, and it ends by
+   its own timeout. NULL when all are in flight. */
+static ScriptCorsPreflightEntry *script_cors_preflight_claim_slot(
+    DomBridge *bridge)
+{
+    ScriptCorsPreflightEntry *victim = NULL;
+    for (size_t i = 0; i < SCRIPT_CORS_PREFLIGHT_SLOTS; i++) {
+        ScriptCorsPreflightEntry *entry = &bridge->cors_preflights[i];
+        if (entry->state == SCRIPT_CORS_PREFLIGHT_FREE) return entry;
+        if (entry->state == SCRIPT_CORS_PREFLIGHT_PENDING) continue;
+        if (victim == NULL || entry->last_use < victim->last_use)
+            victim = entry;
+    }
+    if (victim != NULL) script_cors_preflight_clear(bridge, victim);
+    return victim;
+}
+
+static uint32_t script_cors_preflight_use(DomBridge *bridge)
+{
+    if (++bridge->cors_preflight_uses == 0u) bridge->cors_preflight_uses = 1u;
+    return bridge->cors_preflight_uses;
+}
+
+/* The synchronous preflight: a blocking request (see script_fetch_blocking),
+   or a still-valid grant this realm already holds for the same request. */
+static bool script_cors_preflight_blocking(
     DomBridge *bridge, const char *url, const char *method,
     TilefinchCredentialsMode credentials,
     const ScriptCorsPreflight *preflight)
 {
     if (bridge == NULL || url == NULL || method == NULL
         || preflight == NULL || !preflight->required) return true;
-    ScriptRequestPolicy policy;
-    if (!script_request_policy_prepare(
-            bridge, url, "OPTIONS", TILEFINCH_REQUEST_MODE_CORS,
-            TILEFINCH_CREDENTIALS_SAME_ORIGIN, TILEFINCH_DESTINATION_FETCH, true,
-            &policy)) return false;
     char headers[1400];
-    int written = snprintf(
-        headers, sizeof(headers), "Access-Control-Request-Method: %s%s%s",
-        method, preflight->header_count == 0 ? "" : "\nAccess-Control-Request-Headers: ",
-        preflight->header_count == 0
-          ? "" : preflight->serialized_header_names);
-    if (written <= 0 || (size_t) written >= sizeof(headers)) return false;
-    FetchRequest request = {
-        .method = "OPTIONS", .extra_headers = headers,
-        .cors_preflight = true, .allow_http_errors = true,
-        .send_low_client_hints = true, .accept = "*/*",
-        .redirect_same_origin_only = true
-    };
     FetchPreparedPageRequest prepared;
-    const FetchRequest *authorized = script_request_policy_apply(
-        &policy, bridge->session, &request, &prepared);
-    if (authorized == NULL) return false;
-    request = *authorized;
-    FetchRequestValidationError validation = FETCH_REQUEST_VALIDATION_OK;
-    if (!fetch_request_validate(&request, &validation)) return false;
-    FetchResult *fetched = fetch_result_create(bridge->document->budget);
-    if (fetched == NULL) return false;
-    if (bridge->result != NULL) bridge->result->network_requests++;
-    bool ok = fetch_request_cancelable(
-        bridge->document->budget, url, &request, 64u * 1024u,
-        bridge->fetch_timeout_ms < 5000 ? 5000
-                                       : (long) bridge->fetch_timeout_ms,
-        NULL, NULL, fetched);
-    bool credentials_included = credentials == TILEFINCH_CREDENTIALS_INCLUDE;
-    bool allowed = ok && fetched->status_code >= 200
-        && fetched->status_code < 300
-        && fetched->effective_url[0] != '\0'
-        && tilefinch_url_same_origin(url, fetched->effective_url)
-        && fetch_cors_response_allows(
-               fetched, request.origin, credentials_included);
-    bool wildcard = false;
-    if (allowed && preflight->method_requires_permission) {
-        allowed = script_response_header_token_contains(
-            fetched, "access-control-allow-methods", method, false,
-            &wildcard)
-            || (wildcard && !credentials_included);
+    FetchRequest request;
+    if (!script_cors_preflight_prepare(bridge, url, method, preflight,
+                                       headers, sizeof(headers), &prepared,
+                                       &request)) return false;
+    uint64_t now_us = tilefinch_platform_monotonic_time_us();
+    script_cors_preflights_settle(bridge, now_us);
+    size_t key_length = 0;
+    char *key = script_cors_preflight_key(bridge, url, method, request.origin,
+                                          credentials, preflight,
+                                          &key_length);
+    ScriptCorsPreflightEntry *cached = key == NULL ? NULL
+        : script_cors_preflight_find(bridge, key, key_length);
+    if (cached != NULL && cached->state == SCRIPT_CORS_PREFLIGHT_ALLOWED) {
+        budget_free(bridge->budget, key);
+        if (cached->single_use) script_cors_preflight_clear(bridge, cached);
+        else cached->last_use = script_cors_preflight_use(bridge);
+        return true;
     }
-    for (size_t i = 0; allowed && i < preflight->header_count; i++) {
-        wildcard = false;
-        bool listed = script_response_header_token_contains(
-            fetched, "access-control-allow-headers",
-            preflight->header_names[i], true, &wildcard);
-        allowed = listed || (wildcard && !credentials_included
-                             && strcasecmp(
-                                    preflight->header_names[i],
-                                    "authorization") != 0);
+    FetchResult *fetched = fetch_result_create(bridge->document->budget);
+    if (fetched == NULL) {
+        budget_free(bridge->budget, key);
+        return false;
+    }
+    if (bridge->result != NULL) bridge->result->network_requests++;
+    bool ok = script_fetch_blocking(
+        bridge, bridge->document->budget, url, &request,
+        SCRIPT_CORS_PREFLIGHT_BYTES, script_fetch_timeout_ms(bridge),
+        fetched);
+    bool allowed = script_cors_preflight_allows(
+        fetched, ok, url, method, request.origin, credentials,
+        preflight->serialized_header_names);
+    uint64_t lifetime = allowed ? script_cors_preflight_lifetime_us(fetched)
+                                : 0;
+    fetch_result_free(fetched);
+    /* Another entry for this key is an async request's own; leave it. */
+    ScriptCorsPreflightEntry *slot = key != NULL && lifetime != 0
+            && cached == NULL
+        ? script_cors_preflight_claim_slot(bridge) : NULL;
+    if (slot != NULL) {
+        *slot = (ScriptCorsPreflightEntry) {
+            .key = key, .key_length = key_length,
+            .expires_us = tilefinch_platform_monotonic_time_us() + lifetime,
+            .last_use = script_cors_preflight_use(bridge),
+            .state = SCRIPT_CORS_PREFLIGHT_ALLOWED
+        };
+    } else {
+        budget_free(bridge->budget, key);
     }
     if (!allowed && bridge->result != NULL) {
         bridge->result->network_failures++;
     }
-    fetch_result_free(fetched);
     return allowed;
+}
+
+typedef enum {
+    SCRIPT_CORS_PREFLIGHT_GRANTED,
+    /* Retry the same request soon (the reserved 0 deferral). */
+    SCRIPT_CORS_PREFLIGHT_WAIT,
+    /* Retry it once a preflight of this realm is decided (the -2
+       deferral): its own is in flight, or every preflight slot is. */
+    SCRIPT_CORS_PREFLIGHT_WAIT_DECISION,
+    /* Retry it once this realm frees capacity (the -1 deferral). */
+    SCRIPT_CORS_PREFLIGHT_WAIT_REALM,
+    SCRIPT_CORS_PREFLIGHT_DENIED
+} ScriptCorsPreflightOutcome;
+
+/* The preflight for an asynchronous request, which never waits for the
+   network. The first call enqueues the OPTIONS request on the realm
+   scheduler and asks the JavaScript FIFO to park the request; the FIFO
+   resubmits the same immutable request only after a preflight of this
+   realm is decided (cors_preflight_decisions moved), and meanwhile starts
+   the requests behind it. A resubmission finds the entry decided, or still
+   pending if another preflight was decided first. A grant is reused until its max-age; one that allowed only
+   this request (max-age 0) is consumed when the request is enqueued
+   (*grant is set for that). A refusal is consumed by the retry that
+   throws it. */
+static ScriptCorsPreflightOutcome script_cors_preflight_async(
+    DomBridge *bridge, const char *url, const char *method,
+    TilefinchCredentialsMode credentials,
+    const ScriptCorsPreflight *preflight, ScriptCorsPreflightEntry **grant)
+{
+    *grant = NULL;
+    if (!preflight->required) return SCRIPT_CORS_PREFLIGHT_GRANTED;
+    char headers[1400];
+    FetchPreparedPageRequest prepared;
+    FetchRequest request;
+    if (!script_cors_preflight_prepare(bridge, url, method, preflight,
+                                       headers, sizeof(headers), &prepared,
+                                       &request)) {
+        return SCRIPT_CORS_PREFLIGHT_DENIED;
+    }
+    if (bridge->fetch_scheduler == NULL) {
+        bridge->fetch_scheduler = script_runtime_fetch_scheduler(bridge->host);
+    }
+    FetchScheduler *scheduler = bridge->fetch_scheduler;
+    if (scheduler == NULL) return SCRIPT_CORS_PREFLIGHT_DENIED;
+    uint64_t now_us = tilefinch_platform_monotonic_time_us();
+    script_cors_preflights_settle(bridge, now_us);
+    size_t key_length = 0;
+    char *key = script_cors_preflight_key(bridge, url, method, request.origin,
+                                          credentials, preflight,
+                                          &key_length);
+    if (key == NULL) return SCRIPT_CORS_PREFLIGHT_DENIED;
+    ScriptCorsPreflightEntry *entry =
+        script_cors_preflight_find(bridge, key, key_length);
+    if (entry != NULL) {
+        budget_free(bridge->budget, key);
+        if (entry->state == SCRIPT_CORS_PREFLIGHT_PENDING)
+            return SCRIPT_CORS_PREFLIGHT_WAIT_DECISION;
+        if (entry->state == SCRIPT_CORS_PREFLIGHT_REFUSED) {
+            script_cors_preflight_clear(bridge, entry);
+            return SCRIPT_CORS_PREFLIGHT_DENIED;
+        }
+        entry->last_use = script_cors_preflight_use(bridge);
+        *grant = entry;
+        return SCRIPT_CORS_PREFLIGHT_GRANTED;
+    }
+    /* As for the request itself: a held page domain admits nothing until
+       the native player releases it. */
+    if (fetch_scheduler_held(scheduler)) {
+        budget_free(bridge->budget, key);
+        return SCRIPT_CORS_PREFLIGHT_WAIT_REALM;
+    }
+    entry = script_cors_preflight_claim_slot(bridge);
+    if (entry == NULL) {
+        budget_free(bridge->budget, key);
+        return SCRIPT_CORS_PREFLIGHT_WAIT_DECISION;
+    }
+    uint64_t id = fetch_scheduler_enqueue(
+        scheduler, url, &request, SCRIPT_CORS_PREFLIGHT_BYTES,
+        script_fetch_timeout_ms(bridge));
+    if (id == 0) {
+        budget_free(bridge->budget, key);
+        if (fetch_scheduler_enqueue_would_block(
+                scheduler, SCRIPT_CORS_PREFLIGHT_BYTES)) {
+            return SCRIPT_CORS_PREFLIGHT_WAIT;
+        }
+        if (bridge->result != NULL) bridge->result->network_failures++;
+        return SCRIPT_CORS_PREFLIGHT_DENIED;
+    }
+    *entry = (ScriptCorsPreflightEntry) {
+        .key = key, .key_length = key_length, .request_id = id,
+        .last_use = script_cors_preflight_use(bridge),
+        .state = SCRIPT_CORS_PREFLIGHT_PENDING
+    };
+    if (bridge->result != NULL) bridge->result->network_requests++;
+    return SCRIPT_CORS_PREFLIGHT_WAIT_DECISION;
 }
 
 bool js_rt_script_response_origin_allowed(
@@ -1017,6 +1444,22 @@ static void script_fetch_strings_free(
     JS_FreeCString(context, extra_headers);
 }
 
+/* A non-string body is borrowed from the caller's ArrayBuffer, not copied.
+   The header, mode, timeout and referrer coercions that follow its first
+   read can run author code that detaches or resizes that buffer, so re-read
+   it after the last of them and refuse a body that moved or changed length
+   rather than send freed memory. */
+static bool script_fetch_body_still_borrowed(
+    JSContext *context, int argc, JSValueConst *argv, const char *body,
+    bool body_is_cstring, size_t body_length)
+{
+    if (body_is_cstring || body == NULL || argc <= 2) return true;
+    size_t length = 0;
+    const uint8_t *current = JS_GetArrayBuffer(context, &length, argv[2]);
+    if (current == NULL) JS_FreeValue(context, JS_GetException(context));
+    return current == (const uint8_t *) body && length == body_length;
+}
+
 static JSValue js_fetch_sync(JSContext *context, JSValueConst this_value,
                              int argc, JSValueConst *argv)
 {
@@ -1130,6 +1573,15 @@ static JSValue js_fetch_sync(JSContext *context, JSValueConst this_value,
     bool referrer_valid = script_request_policy_read_referrer(
         context, bridge, argc, argv, 9, 10, &policy,
         &author_referrer, &author_referrer_policy);
+    if (!script_fetch_body_still_borrowed(
+            context, argc, argv, body, body_is_cstring, body_length)) {
+        script_request_policy_free_referrer(
+            context, author_referrer, author_referrer_policy);
+        script_fetch_strings_free(
+            context, method, reference, body, body_is_cstring,
+            content_type, extra_headers);
+        return JS_ThrowTypeError(context, "request body was detached");
+    }
     const FetchRequest *authorized = script_request_policy_apply(
         referrer_valid ? &policy : NULL, bridge->session, &request, &prepared);
     if (authorized != NULL) request = *authorized;
@@ -1149,7 +1601,7 @@ static JSValue js_fetch_sync(JSContext *context, JSValueConst this_value,
         ScriptCorsPreflight preflight;
         bool preflight_ok = script_cors_analyze_request(
                 method, content_type, extra_headers, &preflight)
-            && script_cors_preflight_request(
+            && script_cors_preflight_blocking(
                 bridge, url, method, credentials, &preflight);
         if (!preflight_ok) {
             script_request_policy_free_referrer(
@@ -1175,14 +1627,11 @@ static JSValue js_fetch_sync(JSContext *context, JSValueConst this_value,
         return JS_ThrowInternalError(context, "network result allocation failed");
     }
     if (bridge->result != NULL) bridge->result->network_requests++;
-    bool ok = fetch_request_cancelable(bridge->result == NULL ? NULL
-                                       : bridge->document->budget,
-                                       url, &request,
-                                       js_fetch_response_limit(bridge),
-                                       bridge->fetch_timeout_ms < 5000
-                                           ? 5000
-                                           : (long) bridge->fetch_timeout_ms,
-                                       NULL, NULL, fetched);
+    bool ok = script_fetch_blocking(bridge, bridge->result == NULL ? NULL
+                                    : bridge->document->budget,
+                                    url, &request,
+                                    js_fetch_response_limit(bridge),
+                                    script_fetch_timeout_ms(bridge), fetched);
     script_request_policy_free_referrer(
         context, author_referrer, author_referrer_policy);
     script_fetch_strings_free(
@@ -1214,15 +1663,15 @@ static JSValue js_fetch_sync(JSContext *context, JSValueConst this_value,
         sizeof(visible_headers));
     JSValue response = JS_NewObject(context);
     if (!JS_IsException(response)) {
-        (void) JS_SetPropertyStr(context, response, "status",
+        (void) js_rt_define_field(context, response, "status",
                                 JS_NewInt64(context, fetched->status_code));
-        (void) JS_SetPropertyStr(context, response, "url",
+        (void) js_rt_define_field(context, response, "url",
                                 JS_NewString(context,
                                   fetched->effective_url[0] == '\0'
                                   ? url : fetched->effective_url));
-        (void) JS_SetPropertyStr(context, response, "contentType",
+        (void) js_rt_define_field(context, response, "contentType",
                                 JS_NewString(context, fetched->content_type));
-        (void) JS_SetPropertyStr(context, response, "headers",
+        (void) js_rt_define_field(context, response, "headers",
                                 JS_NewStringLen(
                                     context, visible_headers,
                                     visible_headers_length));
@@ -1438,13 +1887,17 @@ static JSValue js_fetch_async_setup(JSContext *context, int argc,
     FetchPreparedPageRequest prepared;
     const char *author_referrer = NULL;
     const char *author_referrer_policy = NULL;
+    bool body_detached = false;
     if (valid) {
         bool referrer_valid = script_request_policy_read_referrer(
             context, bridge, argc, argv, 9, 10, &policy,
             &author_referrer, &author_referrer_policy);
-        const FetchRequest *authorized = script_request_policy_apply(
-            referrer_valid ? &policy : NULL,
-            bridge->session, &request, &prepared);
+        body_detached = !script_fetch_body_still_borrowed(
+            context, argc, argv, body, body_is_cstring, body_length);
+        const FetchRequest *authorized = body_detached ? NULL
+            : script_request_policy_apply(
+                  referrer_valid ? &policy : NULL,
+                  bridge->session, &request, &prepared);
         if (authorized != NULL) request = *authorized;
         request.redirect_same_origin_only = true;
         request_valid = authorized != NULL
@@ -1465,14 +1918,28 @@ static JSValue js_fetch_async_setup(JSContext *context, int argc,
     }
     bool slot_deferred = valid && native_slots_full;
     if (slot_deferred) valid = false;
+    /* The preflight never blocks here: while it is in flight the request
+       is deferred like a full scheduler (see script_cors_preflight_async). */
+    bool preflight_deferred = false, preflight_realm_deferred = false,
+         preflight_decision_deferred = false;
+    ScriptCorsPreflightEntry *preflight_grant = NULL;
     if (valid && cross_origin
         && request_mode == TILEFINCH_REQUEST_MODE_CORS) {
         ScriptCorsPreflight preflight;
-        bool preflight_ok = script_cors_analyze_request(
+        ScriptCorsPreflightOutcome outcome = script_cors_analyze_request(
                 method, content_type, extra_headers, &preflight)
-            && script_cors_preflight_request(
-                bridge, url, method, credentials, &preflight);
-        if (!preflight_ok) {
+            ? script_cors_preflight_async(
+                  bridge, url, method, credentials, &preflight,
+                  &preflight_grant)
+            : SCRIPT_CORS_PREFLIGHT_DENIED;
+        preflight_deferred = outcome == SCRIPT_CORS_PREFLIGHT_WAIT;
+        preflight_realm_deferred =
+            outcome == SCRIPT_CORS_PREFLIGHT_WAIT_REALM;
+        preflight_decision_deferred =
+            outcome == SCRIPT_CORS_PREFLIGHT_WAIT_DECISION;
+        if (preflight_deferred || preflight_realm_deferred
+            || preflight_decision_deferred) valid = false;
+        if (outcome == SCRIPT_CORS_PREFLIGHT_DENIED) {
             script_request_policy_free_referrer(
                 context, author_referrer, author_referrer_policy);
             script_fetch_strings_free(
@@ -1561,8 +2028,11 @@ static JSValue js_fetch_async_setup(JSContext *context, int argc,
        one of its own requests completing or being cancelled, both of which
        pump the FIFO: return -1 so it waits for that instead of polling.  All
        policy, URL and request-shape failures continue to throw below. */
-    bool realm_deferred = slot_deferred || fetch_pool_deferred;
-    bool scheduler_deferred = realm_deferred
+    if (id != 0 && preflight_grant != NULL && preflight_grant->single_use)
+        script_cors_preflight_clear(bridge, preflight_grant);
+    bool realm_deferred = slot_deferred || fetch_pool_deferred
+        || preflight_realm_deferred;
+    bool scheduler_deferred = realm_deferred || preflight_deferred
         || (id == 0 && valid
         && fetch_scheduler_enqueue_would_block(
                bridge->fetch_scheduler, response_limit));
@@ -1579,10 +2049,14 @@ static JSValue js_fetch_async_setup(JSContext *context, int argc,
                 id != 0 ? "admitted"
                     : slot_deferred ? "deferred-slots"
                     : fetch_pool_deferred ? "deferred-pool"
+                    : preflight_deferred || preflight_realm_deferred
+                            || preflight_decision_deferred
+                        ? "deferred-preflight"
                     : scheduler_deferred ? "deferred" : "refused",
                 /* Only an attempted enqueue owns the scheduler's last
                    error; a realm deferral never reached it. */
                 id != 0 || !valid || realm_deferred
+                        || preflight_decision_deferred
                         || bridge->fetch_scheduler == NULL ? ""
                     : fetch_scheduler_last_error(bridge->fetch_scheduler),
                 url[0] == '\0' ? "<invalid>" : url);
@@ -1597,12 +2071,18 @@ static JSValue js_fetch_async_setup(JSContext *context, int argc,
     }
     if (id == 0) {
         budget_free(bridge->budget, integrity_copy);
+        /* -2: waiting for a preflight decision. The FIFO parks this
+           request and starts the ones behind it (see
+           __tilefinchCorsPreflightDecisions). */
+        if (preflight_decision_deferred) return JS_NewInt32(context, -2);
         if (scheduler_deferred)
             return JS_NewInt32(context, realm_deferred ? -1 : 0);
         if (integrity_copy_failed) {
             return JS_ThrowRangeError(
                 context, "integrity metadata exceeded memory budget");
         }
+        if (body_detached)
+            return JS_ThrowTypeError(context, "request body was detached");
         if (!request_valid) {
             return script_throw_request_validation(context, validation);
         }
@@ -1666,6 +2146,19 @@ static bool script_event_source_headers(void *opaque,
                  "EventSource requires HTTP 200 text/event-stream");
     }
     return source->headers_valid;
+}
+
+/* The scheduler hands the stream no more than the pending buffer has room
+   for and keeps the rest until script takes the buffer, so a page busy
+   between two pumps (a synchronous XHR, a long script) does not fail the
+   stream. */
+static size_t script_event_source_capacity(void *opaque)
+{
+    const ScriptEventSource *source = opaque;
+    if (source == NULL || !source->active || !source->headers_valid
+        || source->pending_length > SCRIPT_EVENT_SOURCE_PENDING_BYTES)
+        return SIZE_MAX;
+    return SCRIPT_EVENT_SOURCE_PENDING_BYTES - source->pending_length;
 }
 
 static bool script_event_source_body(void *opaque,
@@ -1792,6 +2285,7 @@ static JSValue js_event_source_start(JSContext *context,
         source->stream = (FetchStreamOptions) {
             .on_headers = script_event_source_headers,
             .on_body = script_event_source_body,
+            .on_capacity = script_event_source_capacity,
             .opaque = source
         };
         source->id = fetch_scheduler_enqueue_stream(
@@ -1917,6 +2411,10 @@ bool js_rt_event_sources_deliver(ScriptRuntime *runtime,
                     : JS_NewStringLen(runtime->context, text, text_length),
                 JS_NewString(runtime->context, source->response_origin)
             };
+            /* The chunk is copied into script's ArrayBuffer. Empty the
+               buffer before script runs: a handler that pumps the scheduler
+               (a synchronous XHR) appends the next bytes to it. */
+            if (strcmp(kind, "chunk") == 0) source->pending_length = 0;
             bool delivered = js_rt_network_call_global(
                 runtime, "__tilefinchDeliverEventSource", 4,
                 arguments);
@@ -1924,7 +2422,6 @@ bool js_rt_event_sources_deliver(ScriptRuntime *runtime,
                 JS_FreeValue(runtime->context, arguments[value]);
             }
             if (!delivered) return false;
-            if (strcmp(kind, "chunk") == 0) source->pending_length = 0;
             if (author_tasks != NULL) (*author_tasks)++;
             return true;
         }
@@ -2216,7 +2713,9 @@ bool js_rt_websockets_deliver(ScriptRuntime *runtime,
 {
     if (runtime == NULL || completion_budget == 0) return true;
     DomBridge *bridge = &runtime->bridge;
-    for (size_t i = 0; i < SCRIPT_WEBSOCKET_LIMIT; i++) {
+    size_t first = bridge->websocket_deliver_next % SCRIPT_WEBSOCKET_LIMIT;
+    for (size_t step = 0; step < SCRIPT_WEBSOCKET_LIMIT; step++) {
+        size_t i = (first + step) % SCRIPT_WEBSOCKET_LIMIT;
         ScriptWebSocket *socket = &bridge->websockets[i];
         if (!socket->active) continue;
         if (bridge->websocket_event_scratch == NULL) return false;
@@ -2224,6 +2723,7 @@ bool js_rt_websockets_deliver(ScriptRuntime *runtime,
         if (!fetch_background_websocket_take_event(
                 socket->id, bridge->websocket_event_scratch,
                 FETCH_WEBSOCKET_MESSAGE_LIMIT, &event)) continue;
+        bridge->websocket_deliver_next = (i + 1u) % SCRIPT_WEBSOCKET_LIMIT;
         bool delivered = js_rt_websocket_deliver_event(runtime, i, &event);
         if (delivered && author_tasks != NULL) (*author_tasks)++;
         return delivered;
@@ -2487,6 +2987,22 @@ bool js_rt_multiplayer_deliver(ScriptRuntime *runtime,
     return true;
 }
 
+/* The realm's preflight decision count, after deciding completed
+   preflights: the JavaScript FIFO resubmits parked requests when it moves.
+   Read-only, so a page calling it cannot hide a decision from the FIFO. */
+static JSValue js_cors_preflight_decisions(
+    JSContext *context, JSValueConst this_value, int argc,
+    JSValueConst *argv)
+{
+    (void) this_value;
+    (void) argc;
+    (void) argv;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    if (bridge == NULL) return JS_NewUint32(context, 0u);
+    js_rt_cors_preflights_settle(bridge);
+    return JS_NewUint32(context, bridge->cors_preflight_decisions);
+}
+
 static JSValue js_fetch_cancel(JSContext *context, JSValueConst this_value,
                                int argc, JSValueConst *argv)
 {
@@ -2605,14 +3121,21 @@ static void dynamic_cache_revalidate(BrowserSession *session,
 }
 
 /* A script-inserted element: its nonce or integrity may satisfy a policy,
-   and 'strict-dynamic' admits it without either. */
+   and 'strict-dynamic' admits it without either. The integrity is the
+   prepared copy that dynamic_task_take_source verifies the bytes against,
+   never the live attribute. Grants are per-policy bits, so the nonce and
+   integrity grants combine by OR. */
 static uint8_t dynamic_script_csp_grant(const DomBridge *bridge,
                                         const ScriptDynamicTask *task)
 {
-    return bridge == NULL || task == NULL || bridge->document == NULL ? 0
-        : tilefinch_csp_element_grant(
-              &bridge->document->content_security_policy,
-              TILEFINCH_DESTINATION_SCRIPT, task->node, false);
+    if (bridge == NULL || task == NULL || bridge->document == NULL) return 0;
+    const TilefinchContentSecurityPolicy *csp =
+        &bridge->document->content_security_policy;
+    return (uint8_t) (tilefinch_csp_element_descendant_grant(
+                          csp, task->node, false)
+        | tilefinch_csp_request_grant(
+              csp, TILEFINCH_DESTINATION_SCRIPT, NULL, 0, task->integrity,
+              task->integrity_length, false));
 }
 
 static TilefinchRequestContext dynamic_script_request_context(
@@ -2702,6 +3225,7 @@ void js_rt_dynamic_task_clear(DomBridge *bridge, ScriptDynamicTask *task,
     budget_free(bridge->budget, task->request_url);
     budget_free(bridge->budget, task->response_url);
     budget_free(bridge->budget, task->resource_timing_content_type);
+    budget_free(bridge->budget, task->integrity);
     bridge_release_native_node_pin(bridge, task->node_handle);
     if (bridge->dynamic_script_count != 0) {
         bridge->dynamic_script_count--;
@@ -2710,6 +3234,34 @@ void js_rt_dynamic_task_clear(DomBridge *bridge, ScriptDynamicTask *task,
         js_rt_saturating_add_size(&bridge->result->dynamic_scripts_cancelled, 1);
     }
     memset(task, 0, sizeof(*task));
+}
+
+/* Subresource Integrity for a script-inserted script, exactly as for a
+   parser-inserted one (script_evaluate_external_node): every body, from the
+   network, a 304 or a fresh cache entry, passes here before it can run. A
+   classic no-CORS script with integrity must be same-origin, by request
+   and by response, or its integrity check would be an oracle on
+   cross-origin bytes. */
+static bool dynamic_task_integrity_allows(const DomBridge *bridge,
+                                          const ScriptDynamicTask *task,
+                                          const BrowserSharedBody *body,
+                                          size_t length)
+{
+    if (task->integrity == NULL || task->integrity_length == 0) return true;
+    const char *response_url = task->response_url == NULL
+        ? task->request_url : task->response_url;
+    if (task->mode != TILEFINCH_REQUEST_MODE_CORS
+        && (bridge->opaque_origin || task->request_url == NULL
+            || !tilefinch_url_same_origin(
+                   bridge->document_url, task->request_url)
+            || !tilefinch_url_same_origin(
+                   task->request_url, response_url))) return false;
+    if (length != 0 && (body == NULL || body->data == NULL)) return false;
+    TilefinchIntegrityResult result = tilefinch_resource_integrity_verify(
+        task->integrity, task->integrity_length,
+        length == 0 ? (const uint8_t *) "" : body->data, length);
+    return result != TILEFINCH_INTEGRITY_MISMATCH
+        && result != TILEFINCH_INTEGRITY_INVALID;
 }
 
 static bool dynamic_task_take_source(DomBridge *bridge,
@@ -2721,6 +3273,15 @@ static bool dynamic_task_take_source(DomBridge *bridge,
         || (length != 0 && !dynamic_source_body_usable(body, length))) {
         if (bridge != NULL && task != NULL) {
             js_rt_bridge_script_quota_abort(bridge, &task->quota_reservation);
+        }
+        browser_shared_body_release(body);
+        return false;
+    }
+    if (!dynamic_task_integrity_allows(bridge, task, body, length)) {
+        js_rt_bridge_script_quota_abort(bridge, &task->quota_reservation);
+        if (bridge->result != NULL) {
+            js_rt_saturating_add_size(
+                &bridge->result->dynamic_scripts_integrity_rejected, 1);
         }
         browser_shared_body_release(body);
         return false;
@@ -2848,6 +3409,21 @@ bool js_rt_dynamic_start_task(ScriptRuntime *runtime,
     if (deferred != NULL) *deferred = false;
     if (task == NULL || !task->active
         || task->state != SCRIPT_DYNAMIC_QUEUED) return true;
+    /* Integrity on a cross-origin no-CORS script can never be checked
+       (dynamic_task_integrity_allows): refuse it before any request, as
+       the parser does (script_integrity_request_eligible). */
+    if (task->integrity != NULL && task->mode != TILEFINCH_REQUEST_MODE_CORS
+        && (bridge->opaque_origin
+            || !tilefinch_url_same_origin(
+                   bridge->document_url, task->request_url))) {
+        if (bridge->result != NULL) {
+            js_rt_saturating_add_size(
+                &bridge->result->dynamic_scripts_integrity_rejected, 1);
+        }
+        task->state = SCRIPT_DYNAMIC_READY;
+        task->success = false;
+        return true;
+    }
     /* A fresh cache hit never reaches the transport's CSP check. */
     if (bridge->document != NULL && !tilefinch_csp_allows_request_granted(
             &bridge->document->content_security_policy,
@@ -2871,7 +3447,8 @@ bool js_rt_dynamic_start_task(ScriptRuntime *runtime,
         && content_blocker_would_block(
                bridge->session->content_blocker, task->request_url,
                bridge->document_url, "script",
-               task->module ? "cors" : "no-cors");
+               task->mode == TILEFINCH_REQUEST_MODE_CORS
+                   ? "cors" : "no-cors");
     TilefinchRequestContext resource_context =
         dynamic_script_request_context(bridge, task);
     if (!cache_blocked && bridge->session != NULL
@@ -3041,8 +3618,12 @@ bool js_rt_dynamic_start_task(ScriptRuntime *runtime,
         .connect_timeout_ms = JS_DYNAMIC_SCRIPT_CONNECT_TIMEOUT_MS,
         .if_none_match = cached == NULL ? NULL : etag,
         .if_modified_since = cached == NULL ? NULL : last_modified,
-        .cors_cached_response_validated = task->module && cached != NULL
-            && !cached->module_cors_redirect_origin_tainted
+        .cors_cached_response_validated = cached != NULL
+            && (task->module
+                ? !cached->module_cors_redirect_origin_tainted
+                : task->mode == TILEFINCH_REQUEST_MODE_CORS
+                    && task->stale_resource_grant_valid
+                    && task->stale_resource_grant.cors_validated)
             && (etag[0] != '\0' || last_modified[0] != '\0'),
         .redirect_same_origin_only = false
     };
@@ -3240,7 +3821,8 @@ bool js_rt_dynamic_take_completion(ScriptRuntime *runtime,
         resource_grant_valid = task->stale_resource_grant_valid
             && fetch_resource_grant_revalidate_304(
                 fetched, &resource_context, &task->stale_resource_grant,
-                false, fetched->content_type[0] == '\0'
+                task->mode == TILEFINCH_REQUEST_MODE_CORS,
+                fetched->content_type[0] == '\0'
                     ? task->stale_resource_grant.mime_validated
                     : script_module_mime_type_allowed(fetched->content_type),
                 false, &resource_grant, NULL);
@@ -3255,8 +3837,11 @@ bool js_rt_dynamic_take_completion(ScriptRuntime *runtime,
             snprintf(fetched->effective_url,
                      sizeof(fetched->effective_url), "%s", response_url);
         }
+        /* The transport validated CORS for a CORS-mode request (a module,
+           or a classic script with crossorigin) before it delivered it. */
         resource_grant_valid = fetch_resource_grant_create(
-            fetched, &resource_context, task->module,
+            fetched, &resource_context,
+            task->mode == TILEFINCH_REQUEST_MODE_CORS,
             script_module_mime_type_allowed(fetched->content_type),
             task->module, &resource_grant, NULL);
         success = resource_grant_valid;
@@ -3523,10 +4108,12 @@ static bool dynamic_admit_compile(ScriptRuntime *runtime,
               SCRIPT_ADMISSION_EXECUTION_RESERVE_BYTES);
     size_t reserve = floor;
     /* Admission asks whether the planned working set fits the heap the
-       realm can still reach. */
+       realm can still reach: headroom under its limit and growth both come
+       out of the free page Budget, so they are not added
+       (script_runtime_heap_obtainable). */
     bool budget_pressure = budget_pressure_required(
         runtime->budget, working_bytes, reserve);
-    size_t heap = script_runtime_heap_available(runtime);
+    size_t heap = script_runtime_heap_obtainable(runtime);
     bool heap_pressure = working_bytes > heap
         || reserve > heap - (working_bytes > heap ? heap : working_bytes);
     if (!budget_pressure && !heap_pressure) {
@@ -3558,7 +4145,7 @@ static bool dynamic_admit_compile(ScriptRuntime *runtime,
     }
     budget_pressure = budget_pressure_required(
         runtime->budget, working_bytes, reserve);
-    heap = script_runtime_heap_available(runtime);
+    heap = script_runtime_heap_obtainable(runtime);
     heap_pressure = working_bytes > heap
         || reserve > heap - (working_bytes > heap ? heap : working_bytes);
     return !budget_pressure && !heap_pressure;
@@ -3922,6 +4509,8 @@ static const JsRtNative fetch_cors_natives[] = {
       js_fetch_async, 16, JS_RT_NATIVE_TEST_OVERRIDABLE },
     { "__tilefinchCancelNetwork",
       js_fetch_cancel, 2, JS_RT_NATIVE_TEST_OVERRIDABLE },
+    { "__tilefinchCorsPreflightDecisions",
+      js_cors_preflight_decisions, 0, JS_RT_NATIVE_TEST_OVERRIDABLE },
     { "__tilefinchEventSourceStart",
       js_event_source_start, 3, JS_RT_NATIVE_TEST_OVERRIDABLE },
     { "__tilefinchEventSourceClose",

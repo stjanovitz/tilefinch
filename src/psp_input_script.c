@@ -51,6 +51,7 @@ const char *psp_input_script_screen_name(PspUiScreen screen)
             return "offline-app-preview";
         case PSP_UI_SCREEN_FILE_DOWNLOAD: return "file-download";
         case PSP_UI_SCREEN_ZIP_INSTALL: return "zip-install";
+        case PSP_UI_SCREEN_PAGE_DIALOG: return "page-dialog";
         case PSP_UI_SCREEN_FAILURE_RECOVERY: return "failure-recovery";
         case PSP_UI_SCREEN_HELP: return "help";
         case PSP_UI_SCREEN_HELP_DETAIL: return "help-detail";
@@ -340,6 +341,22 @@ static bool script_parse_line(
         snprintf(step->mark, sizeof(step->mark), "%s", fields[1]);
         return true;
     }
+    if (strcmp(command, "answer-question") == 0) {
+        if (field_count != 3u || advance_in_text_entry
+            || !script_positive_count(fields[1], &count) || count < 2u
+            || !script_parse_buttons(fields[2], &buttons)) {
+            *reason = "answer-question needs a frame bound (2 or more) and buttons";
+            return false;
+        }
+        step = script_push(script);
+        if (step == NULL) { *reason = "too many steps"; return false; }
+        step->kind = (uint8_t) PSP_INPUT_SCRIPT_STEP_ANSWER_QUESTION;
+        step->advance_while_busy = advance_while_busy;
+        step->advance_when_painted = advance_when_painted;
+        step->ticks = (uint16_t) count;
+        step->buttons = (uint16_t) buttons;
+        return true;
+    }
     if (strcmp(command, "focus-page-media") == 0) {
         if (field_count != 1u || advance_in_text_entry) {
             *reason = "focus-page-media takes no operands";
@@ -506,6 +523,21 @@ const char *psp_input_script_mark(const PspInputScript *script)
     return script == NULL ? NULL : script->mark;
 }
 
+void psp_input_script_set_media_question(
+    PspInputScript *script, bool question_pending, bool playing)
+{
+    if (script == NULL) return;
+    script->media_question_pending = question_pending;
+    script->media_playing = playing;
+}
+
+PspInputScriptQuestionOutcome psp_input_script_question_outcome(
+    const PspInputScript *script)
+{
+    return script == NULL ? PSP_INPUT_SCRIPT_QUESTION_NONE
+        : (PspInputScriptQuestionOutcome) script->question_outcome;
+}
+
 PspInputScriptPageAction psp_input_script_page_action(
     const PspInputScript *script)
 {
@@ -571,9 +603,11 @@ bool psp_input_script_advance_with_page(
     script->mark = NULL;
     script->page_action = 0u;
     script->pressed_us = 0;
+    script->question_outcome = (uint8_t) PSP_INPUT_SCRIPT_QUESTION_NONE;
     if (!script->armed || script->finished) return false;
     while (script->step < script->step_count && script->step_remaining == 0u) {
         script->step++;
+        script->question_pressing = false;
         script->step_due_us = script->next_step_due_us;
         script->next_step_due_us = 0;
         if (script->step < script->step_count)
@@ -631,6 +665,23 @@ bool psp_input_script_advance_with_page(
     if (step->kind == (uint8_t) PSP_INPUT_SCRIPT_STEP_PAGE_ACTION
         && script->step_remaining == step->ticks)
         script->page_action = step->page_action;
+    if (step->kind == (uint8_t) PSP_INPUT_SCRIPT_STEP_ANSWER_QUESTION
+        && !script->question_pressing) {
+        /* Decide on this frame: a pending question becomes a tap (held
+           frame, then release); media already playing, or the last frame
+           of the bound, ends the step idle. */
+        if (script->media_question_pending) {
+            script->question_pressing = true;
+            script->step_remaining = 2u;
+            script->question_outcome =
+                (uint8_t) PSP_INPUT_SCRIPT_QUESTION_ANSWERED;
+        } else if (script->media_playing || script->step_remaining <= 1u) {
+            script->step_remaining = 1u;
+            script->question_outcome = (uint8_t) (script->media_playing
+                ? PSP_INPUT_SCRIPT_QUESTION_NOT_ASKED
+                : PSP_INPUT_SCRIPT_QUESTION_TIMED_OUT);
+        }
+    }
     bool holding = step->kind == (uint8_t) PSP_INPUT_SCRIPT_STEP_HOLD
         || (step->kind == (uint8_t) PSP_INPUT_SCRIPT_STEP_ANALOG
             && step->buttons != 0);
@@ -640,6 +691,9 @@ bool psp_input_script_advance_with_page(
            held half and the following odd remainder releases it. */
         holding = (script->step_remaining % 2u) == 0u;
     }
+    if (step->kind == (uint8_t) PSP_INPUT_SCRIPT_STEP_ANSWER_QUESTION)
+        holding = script->question_pressing
+            && script->step_remaining == 2u;
     if (holding && input != NULL) {
         input->held = step->buttons;
         input->pressed = step->buttons & ~previous_buttons;

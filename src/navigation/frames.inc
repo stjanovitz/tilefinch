@@ -1341,6 +1341,8 @@ static bool navigation_refresh_frame_presentation(
 
     NavigationFramePresentation *retired = frame->presentation;
     frame->presentation = fresh;
+    script_runtime_set_node_retirement_callback(
+        frame->runtime, navigation_frame_presentation_note_retired, fresh);
     /* A child browsing context owns the iframe's CSS viewport while screen
        continues to describe the physical display. Publish the new realm
        dimensions only after the replacement snapshot succeeds so a refused
@@ -1620,6 +1622,14 @@ static bool navigation_complete_frame(NavigationSession *session,
             navigation_frame_parent_result(session, frame));
         parent_state_oom = !ok
             && script_runtime_heap_rejections(frame->parent_runtime) > before;
+        /* contentWindow.eval compiles in the parent's runtime but obeys the
+           child document's own policy, which a fetched child does not inherit. */
+        if (ok) {
+            script_runtime_set_frame_dynamic_code(
+                frame->parent_runtime, frame->parent_handle,
+                tilefinch_csp_allows_dynamic_code(
+                    &frame->document.content_security_policy));
+        }
     }
     if (ok && scripts_allowed) {
         int frame_width = 0, frame_height = 0;
@@ -1653,6 +1663,15 @@ static bool navigation_complete_frame(NavigationSession *session,
                 navigation_queue_frame_message,
                 session);
         if (ok) script_runtime_set_images(frame->runtime, &frame->images);
+        /* Simple dialogs: a same-origin, unsandboxed (or allow-modals)
+           chain up to the top-level document shares its page load's
+           dialog policy; every other frame's alert/confirm/prompt get the
+           default-deny answers without a dialog. */
+        if (ok && page_dialog_frame_allowed(
+                exposed_same_origin, frame->sandbox_flags,
+                script_runtime_dialogs_allowed(frame->parent_runtime)))
+            script_runtime_set_dialog_parent(frame->runtime,
+                                             frame->parent_runtime);
     }
     if (ok && frame->runtime != NULL && NAVIGATION_TRACES_FRAME_CAPABILITIES(session)) {
         ok = navigation_install_frame_capability_trace(frame);
@@ -1740,9 +1759,9 @@ static bool navigation_complete_frame(NavigationSession *session,
 #if !defined(__PSP__)
 /* The unit fetch backend has no frame responses: complete a discovered frame
    with a synthetic response, as the runtime pump does when its fetch ends. */
-bool navigation_test_complete_frame(NavigationSession *session,
-                                    NavigationFrame *frame, long status_code,
-                                    const char *html, size_t length)
+bool navigation_test_complete_frame_with_headers(
+    NavigationSession *session, NavigationFrame *frame, long status_code,
+    const char *html, size_t length, const char *response_headers)
 {
     if (session == NULL || frame == NULL || html == NULL
         || length == SIZE_MAX) return false;
@@ -1759,10 +1778,24 @@ bool navigation_test_complete_frame(NavigationSession *session,
     fetch->capacity = length + 1u;
     fetch->status_code = status_code;
     snprintf(fetch->content_type, sizeof(fetch->content_type), "text/html");
+    if (response_headers != NULL) {
+        int written = snprintf(fetch->response_headers,
+                               sizeof(fetch->response_headers), "%s",
+                               response_headers);
+        fetch->response_headers_length = written > 0 ? (size_t) written : 0u;
+    }
     frame->fetch_pending = true;
     bool completed = navigation_complete_frame(session, frame, true, fetch);
     fetch_result_free(fetch);
     return completed;
+}
+
+bool navigation_test_complete_frame(NavigationSession *session,
+                                    NavigationFrame *frame, long status_code,
+                                    const char *html, size_t length)
+{
+    return navigation_test_complete_frame_with_headers(
+        session, frame, status_code, html, length, NULL);
 }
 #endif
 

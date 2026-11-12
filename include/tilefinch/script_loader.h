@@ -94,6 +94,17 @@ typedef struct {
    their closing tag. */
 bool document_script_is_parser_blocking(lxb_dom_node_t *element);
 
+/* Whether a classic inline script of `source_length` bytes could still be
+   admitted by the realm's real headroom: the rule the loader applies at
+   its end tag, which refuses a script whose compile cannot fit before
+   compiling it. Optional caches give way first; while `*may_collect` is
+   true one collection is tried before a refusal, and `*may_collect` is then
+   cleared. The parser asks this while the text streams in and drops the
+   text of a script that can no longer be admitted (more text only needs
+   more), so a doomed script is never buffered. */
+bool script_inline_source_admissible(ScriptRuntime *runtime, Budget *budget,
+                                     size_t source_length, bool *may_collect);
+
 /* The Cache-Control and Vary a fetched script is cached under. */
 void script_cache_response_policy(const FetchResult *fetch,
                                   char cache_control[256], char vary[128]);

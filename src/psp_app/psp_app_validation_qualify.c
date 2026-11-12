@@ -19,6 +19,9 @@
 #include "tilefinch/psp_raster_fixture.h"
 #include "psp_boot_timing.h"
 #include "tilefinch/game_audio.h"
+#include "tilefinch/psp_entropy.h"
+
+#include <string.h>
 
 static TILEFINCH_COLD_PATH bool psp_validation_clock_shutdown(PspClockWorker *worker)
 {
@@ -496,6 +499,23 @@ bool psp_validation_network_qualification(
     *exit_code = psp_run_media_range_qualification(
         browser->engine, &process->config, &process->clock_worker);
     return true;
+}
+
+TILEFINCH_COLD_PATH void psp_validation_entropy_preseed(
+    const PspProcessResources *process)
+{
+#ifdef TILEFINCH_PSP_LIVE_NETWORK
+    /* The existing release path (psp_entropy_prepare_step calls it the same
+       way): under PPSSPP this moves the one bounded uncredited attempt
+       earlier; it does not add one. A raw-sample capture finishes here:
+       it seeds a boot without a trace too, so its file always holds the
+       boot's own batches, then takes its extra runs and writes the file. */
+    if (strcmp(process->config.trace, "none") != 0)
+        (void) psp_entropy_fill(NULL, 0u);
+    psp_validation_entropy_capture_finish();
+#else
+    (void) process;
+#endif
 }
 
 /* Boot reports and boot-time validation settings. */

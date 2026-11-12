@@ -147,7 +147,10 @@ static bool h264_skip_scaling(H264Bits *bits, unsigned count)
     for (unsigned i = 0; i < count; i++) {
         if (next != 0) {
             int32_t delta = 0;
-            if (!h264_se(bits, &delta)) return false;
+            /* delta_scale is -128..127; a larger one is no SPS, and the
+               add below would overflow int. */
+            if (!h264_se(bits, &delta) || delta < -128 || delta > 127)
+                return false;
             next = (last + delta + 256) & 255;
         }
         if (next != 0) last = next;
@@ -383,6 +386,49 @@ static bool h264_slice_tail(
     return h264_no_escape_before(bits->data, bits->bytes, *payload_byte);
 }
 
+/* Whether three consecutive NAL bytes would read as an emulated start code
+   or an emulation-prevention pattern: 00 00 00..03. */
+static bool h264_emulation_triplet(
+    unsigned char a, unsigned char b, unsigned char c)
+{
+    return a == 0u && b == 0u && c <= 3u;
+}
+
+/*
+ * The rewritten header is written as raw bytes, with no emulation-prevention
+ * bytes inserted, so it must not form a triplet a decoder would read as one
+ * -- within itself or across its seam with the untouched payload. The old
+ * seam must not have held one either: an emulation-prevention byte at the
+ * start of the payload owes its meaning to the zero bytes before it, which
+ * the old header supplied and the new one does not (MB-06). Checked before
+ * anything is moved, so a refusal leaves the NAL as it was.
+ */
+static bool h264_header_seam_safe(
+    const unsigned char *nal, size_t length,
+    const H264Writer *header, size_t old_payload_byte)
+{
+    size_t header_bytes = header->bit / 8u;
+    for (size_t at = old_payload_byte > 3u ? old_payload_byte - 2u : 1u;
+         at < old_payload_byte && at + 2u < length; at++) {
+        if (h264_emulation_triplet(nal[at], nal[at + 1u], nal[at + 2u]))
+            return false;
+    }
+    size_t payload = length - old_payload_byte;
+    size_t span = header_bytes + (payload < 2u ? payload : 2u);
+    for (size_t at = 1u; at < header_bytes && at + 2u < span; at++) {
+        unsigned char window[3];
+        for (size_t k = 0; k < 3u; k++) {
+            size_t index = at + k;
+            window[k] = index < header_bytes
+                ? header->data[index]
+                : nal[old_payload_byte + (index - header_bytes)];
+        }
+        if (h264_emulation_triplet(window[0], window[1], window[2]))
+            return false;
+    }
+    return true;
+}
+
 static bool h264_replace_header(
     unsigned char *nal, size_t *length, size_t capacity,
     const H264Writer *header, size_t old_payload_byte)
@@ -393,6 +439,8 @@ static bool h264_replace_header(
     size_t header_bytes = header->bit / 8u;
     size_t payload = *length - old_payload_byte;
     if (header_bytes > capacity || payload > capacity - header_bytes)
+        return false;
+    if (!h264_header_seam_safe(nal, *length, header, old_payload_byte))
         return false;
     memmove(nal + header_bytes, nal + old_payload_byte, payload);
     memcpy(nal, header->data, header_bytes);
@@ -528,29 +576,56 @@ static bool h264_skip_pred_weight_table(
     return true;
 }
 
+/*
+ * The first reference picture after a rewritten recovery point: drop the
+ * adaptive marking operations that unmark pre-recovery pictures, which the
+ * synthetic IDR made obsolete.
+ *
+ * Any slice type may be that picture -- a P, a scene-cut I, a reference B of
+ * a pyramid -- so the header is walked for each (MB-07). A slice using the
+ * sliding window has nothing to remove and is left as it is, which is also
+ * the only edit allowed when the slice is not the access unit's last NAL
+ * (may_resize false): every other edit changes the slice's length.
+ */
 static bool h264_remove_first_reference_marking(
     MediaH264PspCompat *compat,
-    unsigned char *nal, size_t *length, size_t capacity)
+    unsigned char *nal, size_t *length, size_t capacity, bool may_resize)
 {
     H264Bits bits;
     H264SlicePrefix prefix;
     if (!h264_slice_prefix(compat, nal, *length, &bits, &prefix)
-        || prefix.slice_type % 5u != 0u
         || !h264_slice_poc(compat, &bits)) return false;
+    unsigned slice_class = prefix.slice_type % 5u;
+    bool b_slice = slice_class == 1u;
     uint32_t value = 0;
-    unsigned l0 = compat->num_ref_idx_l0_default;
-    if (!h264_bit(&bits, &value)) return false;
-    if (value) {
-        if (!h264_ue(&bits, &value) || value >= UINT8_MAX) return false;
-        l0 = value + 1u;
+    /* direct_spatial_mv_pred_flag */
+    if (b_slice && !h264_bit(&bits, &value)) return false;
+    if (slice_class == 0u || b_slice || slice_class == 3u) {
+        unsigned l0 = compat->num_ref_idx_l0_default;
+        unsigned l1 = compat->num_ref_idx_l1_default;
+        if (!h264_bit(&bits, &value)) return false;
+        if (value) {
+            if (!h264_ue(&bits, &value) || value >= UINT8_MAX) return false;
+            l0 = value + 1u;
+            if (b_slice) {
+                if (!h264_ue(&bits, &value) || value >= UINT8_MAX)
+                    return false;
+                l1 = value + 1u;
+            }
+        }
+        if (!h264_skip_ref_list_modification(&bits, b_slice ? 2u : 1u))
+            return false;
+        bool weighted = b_slice ? compat->weighted_bipred_idc == 1u
+                                : compat->weighted_pred;
+        if (weighted
+            && !h264_skip_pred_weight_table(
+                compat, &bits, l0, b_slice ? l1 : 0u))
+            return false;
     }
-    if (!h264_skip_ref_list_modification(&bits, 1u)) return false;
-    if (compat->weighted_pred
-        && !h264_skip_pred_weight_table(compat, &bits, l0, 0u))
-        return false;
     size_t marking_at = bits.bit;
     if (!h264_bit(&bits, &value)) return false;
     if (value == 0u) return true;
+    if (!may_resize) return false;
     unsigned operations = 0;
     uint32_t operation = 0;
     do {
@@ -747,14 +822,14 @@ MediaH264PspCompatResult media_h264_psp_compat_transform(
             if (next.first_reference_pending
                 && (prefix.nal_header >> 5u) != 0u) {
                 size_t old_length = nal_length;
-                /* See the recovery-slice restriction above: this edit is
-                   variable-length and is intentionally confined to the final
-                   NAL of the access unit. */
-                if (nal_at + old_length != *sample_length)
-                    return MEDIA_H264_PSP_COMPAT_ERROR;
+                /* See the recovery-slice restriction above: a removal is
+                   variable-length and is confined to the final NAL of the
+                   access unit; an earlier slice passes only when it has
+                   nothing to remove. */
                 if (!h264_remove_first_reference_marking(
                         &next, sample + nal_at, &nal_length,
-                        capacity - nal_at))
+                        capacity - nal_at,
+                        nal_at + old_length == *sample_length))
                     return MEDIA_H264_PSP_COMPAT_ERROR;
                 ptrdiff_t delta =
                     (ptrdiff_t) nal_length - (ptrdiff_t) old_length;

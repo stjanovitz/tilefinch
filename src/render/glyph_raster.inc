@@ -412,6 +412,55 @@ static bool glyph_text_face(const LayoutDocument *layout,
     return true;
 }
 
+/* The display-list index of `command`, or SIZE_MAX for a copy. */
+static size_t layout_command_slot(const LayoutDocument *layout,
+                                  const DrawCommand *command)
+{
+    uintptr_t command_address = (uintptr_t) command;
+    uintptr_t commands_address = (uintptr_t) layout->commands;
+    size_t commands_bytes = layout->count * sizeof(DrawCommand);
+    if (commands_address <= UINTPTR_MAX - commands_bytes
+        && command_address >= commands_address
+        && command_address < commands_address + commands_bytes
+        && (command_address - commands_address) % sizeof(DrawCommand) == 0)
+        return (command_address - commands_address) / sizeof(DrawCommand);
+    return SIZE_MAX;
+}
+
+/* A fixed, sticky or shadow pass paints a moved copy of a command, which only
+   its text pointer ties back to the layout's visual-order glyphs. Those carry
+   layout positions, so the copy also reports how far it moved. */
+static __attribute__((noinline)) const LayoutBidiCommand *bidi_command_for_copy(
+    TileCache *cache, const DrawCommand *command, int *x_delta_fixed)
+{
+    const LayoutDocument *layout = cache->layout;
+    /* The pass that made the copy names its source: one binary search. */
+    if (cache->raster_copy_source != 0
+        && cache->raster_copy_source <= layout->count) {
+        size_t source_index = cache->raster_copy_source - 1u;
+        const DrawCommand *source = &layout->commands[source_index];
+        const LayoutBidiCommand *bidi = source->text == command->text
+                && source->text_length == command->text_length
+            ? layout_bidi_command_for_index(layout, source_index) : NULL;
+        if (bidi != NULL) {
+            *x_delta_fixed = draw_command_text_x_fixed(command)
+                             - draw_command_text_x_fixed(source);
+            return bidi;
+        }
+    }
+    for (size_t at = 0; at < layout->bidi_command_count; at++) {
+        cache->bidi_copy_scans++;
+        const LayoutBidiCommand *bidi = &layout->bidi_commands[at];
+        const DrawCommand *source = &layout->commands[bidi->command_index];
+        if (source->text != command->text
+            || source->text_length != command->text_length) continue;
+        *x_delta_fixed = draw_command_text_x_fixed(command)
+                         - draw_command_text_x_fixed(source);
+        return bidi;
+    }
+    return NULL;
+}
+
 static void rasterize_truetype_text(TileCache *cache, RasterTarget *target,
                                     const DrawCommand *command)
 {
@@ -443,20 +492,26 @@ static void rasterize_truetype_text(TileCache *cache, RasterTarget *target,
     unsigned previous = 0;
     bool word_start = true;
     const LayoutBidiCommand *bidi_command = NULL;
-    uintptr_t command_address = (uintptr_t) command;
-    uintptr_t commands_address = (uintptr_t) cache->layout->commands;
-    size_t commands_bytes = cache->layout->count * sizeof(DrawCommand);
-    if (commands_address <= UINTPTR_MAX - commands_bytes
-        && command_address >= commands_address
-        && command_address < commands_address + commands_bytes
-        && (command_address - commands_address) % sizeof(DrawCommand) == 0) {
-        size_t command_index = (command_address - commands_address)
-                               / sizeof(DrawCommand);
+    int bidi_x_delta_fixed = 0;
+    size_t command_index = layout_command_slot(cache->layout, command);
+    if (command_index != SIZE_MAX) {
         bidi_command = layout_bidi_command_for_index(
             cache->layout, command_index);
+    } else if (cache->layout->bidi_command_count != 0) {
+        bidi_command = bidi_command_for_copy(
+            cache, command, &bidi_x_delta_fixed);
     }
     size_t bidi_at = 0;
     bool rtl = bidi_command == NULL && draw_command_text_rtl(command);
+    /* Left to right, unrotated, with no negative letter spacing, the pen
+       only moves right but for kerning and a mark's offset, each well under
+       an em: once it is two ems (plus bold) past the target, nothing later
+       in the run reaches it. A long unbroken line then costs the target's
+       width, not the run's length. */
+    int pixel_height = (pixel_height_fixed + 63) / 64;
+    bool cull_right = bidi_command == NULL && !rtl && rotation == 0
+        && draw_command_text_letter_spacing_fixed(command) >= 0;
+    int64_t cull_right_x = (int64_t) target->right + 2 * pixel_height + 4;
     bool ink_rows = rotation == 0 && !synthetic_italic
         && target->blend_mode == LAYOUT_MIX_BLEND_NORMAL;
 #ifndef __PSP__
@@ -466,6 +521,9 @@ static void rasterize_truetype_text(TileCache *cache, RasterTarget *target,
     if (ink_rows) glyph_ink_init(&ink, raster_target_color(target,
                                                            command->color));
     size_t rtl_number_at = 0, rtl_number_end = 0;
+    /* A pre-base vowel drawn ahead of its cluster: the bytes to skip when the
+       cluster's end reaches it, and where the cluster itself starts. */
+    size_t prebase_skip = SIZE_MAX, prebase_return = SIZE_MAX;
     for (size_t at = rtl ? command->text_length : 0;
          bidi_command != NULL ? bidi_at < bidi_command->glyph_count
          : (rtl ? (at > 0 || rtl_number_at < rtl_number_end)
@@ -503,12 +561,28 @@ static void rasterize_truetype_text(TileCache *cache, RasterTarget *target,
             const LayoutBidiGlyph *glyph = &cache->layout->bidi_glyphs[
                 bidi_command->glyph_start + bidi_at];
             codepoint = glyph->codepoint;
-            pen_x_fixed = glyph->x_fixed;
+            pen_x_fixed = glyph->x_fixed + bidi_x_delta_fixed;
             used = 1;
         } else if (!rtl) {
-            provider_sequence = font_optional_glyph_match_sequence(
-                command->text + character_at,
-                command->text_length - character_at, &used, &codepoint);
+            if (at == prebase_skip) {
+                prebase_skip = SIZE_MAX;
+                at += 3u;
+                continue;
+            }
+            if ((unsigned char) command->text[at] == 0xe0u
+                && prebase_skip == SIZE_MAX) {
+                size_t vowel = font_indic_prebase_vowel(
+                    command->text + at, command->text_length - at);
+                if (vowel != 0) {
+                    prebase_return = at;
+                    prebase_skip = at + vowel;
+                    character_at = prebase_skip;
+                }
+            }
+            if (character_at == at)
+                provider_sequence = font_optional_glyph_match_sequence(
+                    command->text + character_at,
+                    command->text_length - character_at, &used, &codepoint);
         } else if (!(rtl_number_at < rtl_number_end)) {
             size_t sequence_start = 0;
             provider_sequence = font_optional_glyph_match_sequence_ending_at(
@@ -547,6 +621,9 @@ static void rasterize_truetype_text(TileCache *cache, RasterTarget *target,
             pen_x_fixed += font_kerning_for_family_at_size_fixed(
                 face, metric_family, previous, codepoint, pixel_height_fixed,
                 metric_bold);
+        if (cull_right && ((int64_t) pen_x_fixed + 32) / 64 > cull_right_x)
+            break;
+        cache->text_glyph_steps++;
         FontGlyph temporary;
         memset(&temporary, 0, sizeof(temporary));
         bool smoothed = false;
@@ -735,6 +812,9 @@ static void rasterize_truetype_text(TileCache *cache, RasterTarget *target,
             if (rtl_number_at >= rtl_number_end) {
                 rtl_number_at = rtl_number_end = 0;
             }
+        } else if (prebase_return != SIZE_MAX) {
+            at = prebase_return;
+            prebase_return = SIZE_MAX;
         } else {
             at = rtl ? character_at : character_at + used;
         }
@@ -852,6 +932,12 @@ static void rasterize_blurred_text_shadow(
        energy; four cardinal samples retain the soft extent. Glyph cache hits
        make the uncommon shadow path deterministic and allocation-free. */
     int distance = (blur + 1) / 2;
+    /* Each sample is a copy; name the display-list command it came from. */
+    size_t saved_source = cache->raster_copy_source;
+    if (saved_source == 0) {
+        size_t slot = layout_command_slot(cache->layout, command);
+        if (slot != SIZE_MAX) cache->raster_copy_source = slot + 1u;
+    }
     static const int8_t dx[5] = {0, -1, 1, 0, 0};
     static const int8_t dy[5] = {0, 0, 0, -1, 1};
     static const uint8_t weight[5] = {4, 1, 1, 1, 1};
@@ -874,4 +960,5 @@ static void rasterize_blurred_text_shadow(
         rasterize_truetype_text(cache, target, &sample);
         rasterize_text_underline(cache, target, &sample);
     }
+    cache->raster_copy_source = saved_source;
 }

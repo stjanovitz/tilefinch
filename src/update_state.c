@@ -145,17 +145,30 @@ bool tilefinch_update_state_select(
 
 TilefinchUpdateBootAction tilefinch_update_boot_decide(
     const TilefinchUpdateState *state, bool recovery_button,
-    bool pending_slot_verified, TilefinchUpdateSlot *slot)
+    bool pending_slot_verified, bool retry_declined,
+    TilefinchUpdateSlot *slot)
 {
     if (state == NULL) return TILEFINCH_UPDATE_BOOT_RECOVERY;
-    if (recovery_button
-        && state->previous_slot != TILEFINCH_UPDATE_SLOT_NONE) {
-        if (slot != NULL) *slot = state->previous_slot;
-        return TILEFINCH_UPDATE_BOOT_PREVIOUS;
+    if (recovery_button) {
+        if (tilefinch_update_state_previous_usable(state)) {
+            if (slot != NULL) *slot = state->previous_slot;
+            return TILEFINCH_UPDATE_BOOT_PREVIOUS;
+        }
+        /* Journals written before the installer cleared previous_slot can
+           still name the staged candidate as previous. Safe start never
+           runs a candidate, staged or failed: it keeps the active build. */
+        if (state->trial == TILEFINCH_UPDATE_TRIAL_PENDING) {
+            if (slot != NULL) *slot = state->active_slot;
+            return TILEFINCH_UPDATE_BOOT_ACTIVE;
+        }
     }
     if (state->trial == TILEFINCH_UPDATE_TRIAL_STARTED) {
         if (slot != NULL) *slot = state->active_slot;
-        return TILEFINCH_UPDATE_BOOT_RECOVERY;
+        /* The user already chose the current version for this trial; the
+           candidate stays staged until the Update page retries or
+           discards it. */
+        return retry_declined ? TILEFINCH_UPDATE_BOOT_ACTIVE
+                              : TILEFINCH_UPDATE_BOOT_RECOVERY;
     }
     if (state->trial == TILEFINCH_UPDATE_TRIAL_PENDING) {
         if (!pending_slot_verified) {
@@ -167,6 +180,21 @@ TilefinchUpdateBootAction tilefinch_update_boot_decide(
     }
     if (slot != NULL) *slot = state->active_slot;
     return TILEFINCH_UPDATE_BOOT_ACTIVE;
+}
+
+bool tilefinch_update_state_previous_usable(const TilefinchUpdateState *state)
+{
+    return state != NULL
+        && (state->previous_slot == TILEFINCH_UPDATE_SLOT_A
+            || state->previous_slot == TILEFINCH_UPDATE_SLOT_B)
+        && state->previous_slot != state->active_slot
+        && state->previous_slot != state->pending_slot;
+}
+
+bool tilefinch_update_boot_allows_fast_start(
+    bool recovery_button, TilefinchUpdateBootAction action)
+{
+    return !recovery_button && action != TILEFINCH_UPDATE_BOOT_RECOVERY;
 }
 
 bool tilefinch_update_state_start_trial(TilefinchUpdateState *state)
@@ -207,6 +235,13 @@ bool tilefinch_update_state_discard_trial(TilefinchUpdateState *state)
     if (state == NULL || state->pending_slot == TILEFINCH_UPDATE_SLOT_NONE
         || state->generation == UINT64_MAX) return false;
     state->generation++;
+    /* The discarded candidate's slot no longer holds the build that ran
+       before the active one, so it must not stay labelled previous. */
+    if (state->previous_slot == state->pending_slot) {
+        state->previous_slot = TILEFINCH_UPDATE_SLOT_NONE;
+        state->previous_sequence = 0;
+        memset(state->previous_sha256, 0, 32);
+    }
     state->pending_slot = TILEFINCH_UPDATE_SLOT_NONE;
     state->trial = TILEFINCH_UPDATE_TRIAL_NONE;
     state->candidate_sequence = 0;

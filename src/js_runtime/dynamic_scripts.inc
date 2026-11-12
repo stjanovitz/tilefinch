@@ -178,7 +178,20 @@ static bool dynamic_task_activate(
     size_t slot = 0;
     if (handle == 0
         || !js_rt_bridge_node_slot_for_handle(bridge, handle, &slot)) return false;
+    size_t integrity_length = 0;
+    const char *integrity = document_attribute(
+        node, "integrity", &integrity_length);
+    char *integrity_copy = NULL;
+    if (integrity != NULL && integrity_length != 0) {
+        if (integrity_length >= SIZE_MAX) return false;
+        integrity_copy = budget_malloc(bridge->budget, integrity_length + 1);
+        if (integrity_copy == NULL) return false;
+        memcpy(integrity_copy, integrity, integrity_length);
+        integrity_copy[integrity_length] = '\0';
+    }
     memset(task, 0, sizeof(*task));
+    task->integrity = integrity_copy;
+    task->integrity_length = integrity_copy == NULL ? 0 : integrity_length;
     task->active = true;
     task->state = state;
     task->success = success;
@@ -191,10 +204,14 @@ static bool dynamic_task_activate(
     task->request_url = request_url;
     task->module = module;
     task->ordered = ordered;
-    task->mode = module ? TILEFINCH_REQUEST_MODE_CORS
-                        : TILEFINCH_REQUEST_MODE_NO_CORS;
-    task->credentials = module ? js_rt_module_credentials_for_node(node)
-                               : TILEFINCH_CREDENTIALS_INCLUDE;
+    /* As for parser-inserted scripts (script_loader.c): a classic script
+       with a crossorigin attribute is a CORS request whose credentials the
+       attribute chooses. */
+    bool cors = module || dynamic_attribute_present(node, "crossorigin");
+    task->mode = cors ? TILEFINCH_REQUEST_MODE_CORS
+                      : TILEFINCH_REQUEST_MODE_NO_CORS;
+    task->credentials = cors ? js_rt_module_credentials_for_node(node)
+                             : TILEFINCH_CREDENTIALS_INCLUDE;
     char referrer_policy[BROWSER_MODULE_REFERRER_POLICY_LIMIT];
     js_rt_module_referrer_policy_for_node(
         node, bridge->referrer_policy, referrer_policy);
@@ -383,41 +400,149 @@ static int dynamic_prepare_node(JSContext *context, lxb_dom_node_t *node)
     return 1;
 }
 
-int js_rt_dynamic_prepare_subtree(JSContext *context,
-                            lxb_dom_node_t *root)
+/* A state dynamic_prepare_node could still start: a script created by
+   author code that has not started (the rest is decided at preparation). */
+static bool dynamic_state_preparable(const ScriptElementState *state)
+{
+    return state->programmatic && state->html && !state->already_started;
+}
+
+static bool dynamic_node_within(const lxb_dom_node_t *node,
+                                const lxb_dom_node_t *root)
+{
+    return node == root || js_rt_node_is_strict_descendant(node, root);
+}
+
+/* Adds `node` to the tree-order snapshot when it is one of the candidates. */
+static void dynamic_snapshot_candidate(
+    DomBridge *bridge, lxb_dom_node_t *node,
+    lxb_dom_node_t *const *candidates, size_t candidate_count,
+    ScriptElementSnapshot *ordered, size_t *count)
+{
+    for (size_t i = 0; i < candidate_count; i++) {
+        if (candidates[i] != node) continue;
+        ScriptElementState *state = js_rt_script_element_state_find(bridge, node);
+        int64_t handle = state == NULL ? 0
+            : js_rt_bridge_register_node(bridge, node);
+        if (handle != 0)
+            ordered[(*count)++] = (ScriptElementSnapshot) {
+                .node_handle = handle, .identity = state->identity
+            };
+        return;
+    }
+}
+
+/* Prepares, in tree order, the script elements an insertion may have made
+   ready. With `parent` NULL the scope is first's inclusive subtree (first
+   == last): innerHTML, textContent, a src change. Otherwise it is the
+   inserted siblings first..last of `parent` and their subtrees, plus
+   `parent` itself when it is a script (its children changed); scripts
+   elsewhere under `parent` were not inserted and are left alone.
+
+   The script-state table, not the tree, is scanned first: it holds at most
+   SCRIPT_DYNAMIC_NODE_LIMIT entries, nearly all already started, so an
+   insertion with nothing preparable in its scope walks no tree at all.
+   Only then does a walk of the inserted subtrees (never the receiver's
+   existing ones) put the candidates in tree order, and it stops once it
+   has found them all. */
+static int dynamic_prepare_scope(JSContext *context, lxb_dom_node_t *parent,
+                                 lxb_dom_node_t *first,
+                                 lxb_dom_node_t *last)
 {
     DomBridge *bridge = JS_GetContextOpaque(context);
-    if (bridge == NULL || root == NULL) return 0;
-    size_t capacity = bridge->script_element_count;
-    if (capacity == 0) return 0;
-    ScriptElementSnapshot *candidates = budget_calloc(
-        bridge->budget, capacity, sizeof(*candidates));
-    if (candidates == NULL) return -1;
-    size_t count = 0;
-    DomDocumentOrderTraversal traversal = {
-        .next = root, .boundary = root
-    };
-    for (lxb_dom_node_t *at = dom_document_order_next(&traversal);
-         at != NULL && count < capacity;
-         at = dom_document_order_next(&traversal)) {
-        ScriptElementState *state = js_rt_script_element_state_find(bridge, at);
-#if TILEFINCH_SCRIPT_CLONE_CENSUS
-        if (state != NULL && state->census_started_clone
-            && bridge_node_is_connected(at)) {
-            state->census_started_clone = false;
-            if (bridge->result != NULL) js_rt_saturating_add_size(
-                &bridge->result->script_clones_suppressed, 1);
-        }
-#endif
-        if (state != NULL) {
-            int64_t handle = js_rt_bridge_register_node(bridge, at);
-            if (handle != 0) {
-                candidates[count++] = (ScriptElementSnapshot) {
-                    .node_handle = handle, .identity = state->identity
-                };
-            }
+    if (bridge == NULL || first == NULL || last == NULL) return 0;
+    size_t states = bridge->script_element_count;
+    if (states == 0) return 0;
+    if (parent != NULL) {
+        /* Author code run during the insertion (a frame load) can move the
+           inserted nodes; then fall back to parent's whole subtree, the
+           broadest scope the insertion can have connected. */
+        size_t steps = 0;
+        const lxb_dom_node_t *at = first;
+        while (at != NULL && at != last
+               && steps++ < DOM_TRAVERSAL_VISIT_LIMIT) at = at->next;
+        if (first->parent != parent || at != last) {
+            first = last = parent;
+            parent = NULL;
         }
     }
+    /* A detached tree holds nothing to prepare: its later insertion is. */
+    if (!bridge_node_is_connected(parent != NULL ? parent : first)) return 0;
+    lxb_dom_node_t **candidates = NULL;
+    ScriptElementSnapshot *ordered = NULL;
+
+    /* Counted first, so nothing is allocated for the common insertion
+       that connects no preparable script. */
+    size_t candidate_count = 0;
+    for (size_t pass = 0; pass < 2; pass++) {
+        size_t found = 0;
+        for (size_t i = 0; i < states && i < SCRIPT_DYNAMIC_NODE_LIMIT; i++) {
+            ScriptElementState *state = &bridge->script_elements[i];
+            bool preparable = dynamic_state_preparable(state);
+#if TILEFINCH_SCRIPT_CLONE_CENSUS
+            bool census = pass == 0 && state->census_started_clone;
+#else
+            bool census = false;
+#endif
+            if (!preparable && !census) continue;
+            lxb_dom_node_t *node = state->node;
+            /* Several siblings: anything under parent may be in the range;
+               the walk below visits only the range. */
+            bool inside = parent == NULL ? dynamic_node_within(node, first)
+                : node == parent
+                || (first == last
+                    ? dynamic_node_within(node, first)
+                    : js_rt_node_is_strict_descendant(node, parent));
+            if (!inside) continue;
+#if TILEFINCH_SCRIPT_CLONE_CENSUS
+            if (census) {
+                state->census_started_clone = false;
+                if (bridge->result != NULL) js_rt_saturating_add_size(
+                    &bridge->result->script_clones_suppressed, 1);
+            }
+#endif
+            if (!preparable) continue;
+            if (pass == 1) candidates[found] = node;
+            found++;
+        }
+        if (pass == 0) {
+            candidate_count = found;
+            if (candidate_count == 0) return 0;
+            /* One allocation: the snapshots first, which keeps their
+               64-bit handles aligned on the 32-bit PSP. */
+            ordered = budget_calloc(
+                bridge->budget, candidate_count,
+                sizeof(*ordered) + sizeof(*candidates));
+            if (ordered == NULL) return -1;
+            candidates = (lxb_dom_node_t **) (void *)
+                (ordered + candidate_count);
+        }
+    }
+
+    size_t count = 0, visited = 0;
+    if (parent != NULL)
+        dynamic_snapshot_candidate(bridge, parent, candidates,
+                                   candidate_count, ordered, &count);
+    lxb_dom_node_t *sibling = first;
+    for (size_t siblings = 0; sibling != NULL && count < candidate_count
+         && siblings < DOM_TRAVERSAL_VISIT_LIMIT; siblings++) {
+        DomDocumentOrderTraversal traversal = {
+            .next = sibling, .boundary = sibling
+        };
+        for (lxb_dom_node_t *at = dom_document_order_next(&traversal);
+             at != NULL && count < candidate_count;
+             at = dom_document_order_next(&traversal)) {
+            visited++;
+            dynamic_snapshot_candidate(bridge, at, candidates,
+                                       candidate_count, ordered, &count);
+        }
+        if (sibling == last) break;
+        sibling = sibling->next;
+    }
+    if (bridge->result != NULL)
+        js_rt_saturating_add_size(
+            &bridge->result->dynamic_script_scan_nodes, visited);
+
     int prepared = 0;
     for (size_t i = 0; i < count; i++) {
         /* A preceding inline script can replace the remaining subtree. The
@@ -425,22 +550,40 @@ int js_rt_dynamic_prepare_subtree(JSContext *context,
            it, so lookup is a safe liveness gate before dereferencing. */
         size_t slot = 0;
         if (!js_rt_bridge_node_slot_for_handle(
-                bridge, candidates[i].node_handle, &slot)) continue;
+                bridge, ordered[i].node_handle, &slot)) continue;
         lxb_dom_node_t *node = bridge->nodes[slot];
         ScriptElementState *state = js_rt_script_element_state_find(bridge, node);
-        if (state == NULL || state->identity != candidates[i].identity) {
+        if (state == NULL || state->identity != ordered[i].identity) {
             continue;
         }
         if (!bridge_node_is_connected(node)) continue;
         int result = dynamic_prepare_node(context, node);
         if (result < 0) {
-            budget_free(bridge->budget, candidates);
+            budget_free(bridge->budget, ordered);
             return -1;
         }
         if (result > 0) prepared = 1;
     }
-    budget_free(bridge->budget, candidates);
+    budget_free(bridge->budget, ordered);
     return prepared;
+}
+
+int js_rt_dynamic_prepare_subtree(JSContext *context,
+                                  lxb_dom_node_t *root)
+{
+    return dynamic_prepare_scope(context, NULL, root, root);
+}
+
+int js_rt_dynamic_prepare_insertion(JSContext *context,
+                                    lxb_dom_node_t *parent,
+                                    lxb_dom_node_t *first,
+                                    lxb_dom_node_t *last)
+{
+    if (parent == NULL) return 0;
+    if (first == NULL || last == NULL) first = last = NULL;
+    return first == NULL
+        ? dynamic_prepare_scope(context, NULL, parent, parent)
+        : dynamic_prepare_scope(context, parent, first, last);
 }
 
 bool js_rt_runtime_script_checkpoint(ScriptRuntime *runtime,

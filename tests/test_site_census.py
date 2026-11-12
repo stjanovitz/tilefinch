@@ -165,6 +165,59 @@ def check_focus_moves(lab, root):
         {"p": record}, {"p": final}, ["p"]))
 
 
+BANNER = """<!doctype html><html><head><title>banner</title></head><body>
+<p>Article text above the notice.</p>
+<div id="onetrust-banner-sdk" style="height:200px;background:#c00">We use
+cookies</div><p>Article text below the notice.</p></body></html>
+"""
+
+
+def check_user_css_before_load(lab, root):
+    """--user-css-before-load sets the cookie-banner sheet before the load,
+    as the PSP app does: the same frames as applying it after the load, one
+    whole-sheet rebuild fewer, and the banner is really hidden."""
+    (root / "banner.html").write_text(BANNER)
+    page = ["--fixture", str(root / "banner.html")]
+    bare = run(lab, root, "banner-bare", {}, False, page)
+    after = run(lab, root, "banner-after", {}, False,
+                page + ["--hide-cookie-banners"])
+    before = run(lab, root, "banner-before", {}, False,
+                 page + ["--hide-cookie-banners", "--user-css-before-load"])
+    frames = {r.name: (r / "frames" / "top.ppm").read_bytes()
+              for r in (bare, after, before)}
+    assert frames["banner-after"] != frames["banner-bare"], "banner not hidden"
+    assert frames["banner-before"] == frames["banner-after"], \
+        "user CSS before the load changed the page"
+    rebuilds = {r.name: extract.extract(str(r))["timing"]["full_relayouts"]
+                for r in (after, before)}
+    assert rebuilds["banner-before"] == rebuilds["banner-after"] - 1, rebuilds
+    args = census.lab_command("lab", {"url": "https://a.test/"}, str(root),
+                              [], 0, user_css_before_load=True)
+    assert "--user-css-before-load" in args and "--hide-cookie-banners" in args
+    assert "--user-css-before-load" not in census.lab_command(
+        "lab", {"url": "https://a.test/"}, str(root), [], 0)
+
+
+def check_null_exception_limits(root):
+    """A page can throw null without any memory refusal; real refusals must
+    remain visible even when the engine could not allocate its error."""
+    run_dir = root / "null-exception"
+    run_dir.mkdir()
+    exception = 'census-exception message="null" where="https://example.test/app.js:1"\n'
+    for evidence, heap_limited in (
+            ("", False),
+            ("script-heap heap-rejections=0\n", False),
+            ("script-heap heap-rejections=1\n", True),
+            ("js-heap-reject reason=budget\n", True)):
+        (run_dir / "lab.log").write_text(exception + evidence)
+        record = extract.extract(str(run_dir))
+        assert record["errors"]["exceptions"][0]["message"] == "null", record
+        assert ("js-heap" in record["limits"]) == heap_limited, record["limits"]
+    (run_dir / "lab.log").write_text(
+        'census-exception message="InternalError: out of memory" where="app.js:1"\n')
+    assert "js-heap" in extract.extract(str(run_dir))["limits"]
+
+
 def main():
     assert classify.classify('https://aax-us-east-retail-direct.amazon.com/e/is/example/impb',
                              'https://www.amazon.com/') == 'ads'
@@ -187,6 +240,7 @@ def main():
     lab = pathlib.Path(sys.argv[1]).resolve()
     with tempfile.TemporaryDirectory() as directory:
         root = pathlib.Path(directory)
+        check_null_exception_limits(root)
         (root / "page.html").write_text(PAGE)
 
         # Switches unset: no ledger records, and the page sees no probe.
@@ -253,6 +307,7 @@ def main():
         assert record["timing"]["loaded_ms"] is not None, record["timing"]
 
         check_focus_moves(lab, root)
+        check_user_css_before_load(lab, root)
 
 
 if __name__ == "__main__":

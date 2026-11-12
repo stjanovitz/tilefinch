@@ -82,3 +82,6 @@ PSP_UI_SETTING(WEB_FONTS, "web-fonts")
 PSP_UI_SETTING(YOUTUBE_SIGNIN_DIAGNOSTICS, "youtube-signin-diagnostics")
 PSP_UI_SETTING(YOUTUBE_CHANNEL_BANNERS, "youtube-channel-banners")
 PSP_UI_SETTING(PAGE_ZOOM, "page-zoom")
+/* unsigned_value is a BrowserInsecureAudioAnswer for the current page's
+   site, held for this session only. */
+PSP_UI_SETTING(INSECURE_AUDIO_SITE, "insecure-audio-site")

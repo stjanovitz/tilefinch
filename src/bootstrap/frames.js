@@ -9,6 +9,8 @@
    observes a privileged bridge on the global object. This module must be
    evaluated after dom.js and before platform.js. */
 globalThis.__tilefinchInstallFrames = (support) => {
+  const trustedEvent =
+    __tilefinchRealmGlobal.__tilefinchTrustedEventShare.trustedEvent;
   const reflectDescriptor = Reflect.getOwnPropertyDescriptor,
     reflectKeys = Reflect.ownKeys,
     reflectDefine = Reflect.defineProperty,
@@ -146,7 +148,7 @@ globalThis.__tilefinchInstallFrames = (support) => {
             : null;
         },
       });
-      scope.eval = __tilefinchCreateFrameEval(scope, proxy);
+      scope.eval = __tilefinchCreateFrameEval(scope, proxy, handle);
       scope.postMessage = function (data, targetOrigin = "/") {
         const current = wrap(handle);
         if (!state.active || !current?.isConnected) return;
@@ -396,7 +398,7 @@ globalThis.__tilefinchInstallFrames = (support) => {
       state.initialAboutBlank = false;
     queueMicrotask(() => {
       if (element.isConnected && state.loadGeneration === generation)
-        element.dispatchEvent(__tilefinchTrustedEvent(new Event("load")));
+        element.dispatchEvent(trustedEvent(new Event("load")));
     });
   };
   globalThis.__tilefinchSetFrameWindowState = (
@@ -467,7 +469,7 @@ globalThis.__tilefinchInstallFrames = (support) => {
             : __tilefinchFrameWindow(Number(sourceHandle));
         /* compat.js installs this private factory after frames.js has been
            initialized, but before any author task can deliver a message. */
-        const event = globalThis.__tilefinchTrustedEvent(
+        const event = trustedEvent(
           globalThis.__tilefinchCreateMessageEvent(
           "message", decodeFrameMessage(wire), String(origin), source, []));
         globalThis.__tilefinchDispatchWindowEventCheckpointed(event);

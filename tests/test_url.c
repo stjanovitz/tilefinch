@@ -37,6 +37,24 @@ int main(void)
           && strcmp(output, "https://example.com:8080/a") == 0);
     CHECK(!tilefinch_url_upgrade_to_https(
         "https://example.com/already", output, sizeof(output)));
+    /* The HTTPS-first attempt keeps every explicit port but HTTP's own:
+       a station at :8000 is tried at https://host:8000 (as on run 7's
+       SHOUTcast server), and :80 becomes HTTPS's default. */
+    static const char *const upgrades[][2] = {
+        {"http://shoutcast.example:8000/", "https://shoutcast.example:8000/"},
+        {"http://shoutcast.example:8000?fromyp=true",
+         "https://shoutcast.example:8000/?fromyp=true"},
+        {"http://radio.example:80/;", "https://radio.example/;"},
+        {"http://radio.example/live", "https://radio.example/live"},
+        {"http://radio.example:443/live", "https://radio.example/live"},
+        {"http://radio.example:8443/live", "https://radio.example:8443/live"},
+        {"http://[2001:db8::1]:8000/a", "https://[2001:db8::1]:8000/a"}
+    };
+    for (size_t i = 0; i < sizeof(upgrades) / sizeof(upgrades[0]); i++) {
+        CHECK(tilefinch_url_upgrade_to_https(
+                  upgrades[i][0], output, sizeof(output))
+              && strcmp(output, upgrades[i][1]) == 0);
+    }
 
     CHECK(tilefinch_url_potentially_trustworthy(
         "https://ordinary.example/path"));
@@ -56,6 +74,59 @@ int main(void)
         "http://192.168.1.20/private"));
     CHECK(!tilefinch_url_potentially_trustworthy(
         "http://127.evil/path"));
+    /* Loopback spelled the ways the resolver accepts is still loopback. */
+    CHECK(tilefinch_url_potentially_trustworthy("http://2130706433/"));
+    CHECK(tilefinch_url_potentially_trustworthy("http://0x7f.1/"));
+    CHECK(tilefinch_url_potentially_trustworthy("http://127.1/"));
+    CHECK(!tilefinch_url_potentially_trustworthy("http://134744072/"));
+    CHECK(!tilefinch_url_potentially_trustworthy("http://127.0.0.256/"));
+
+    /* IPv4 hosts as inet_aton, curl and the URL Standard read them. */
+    static const struct {
+        const char *host;
+        TilefinchHostIpv4 kind;
+        unsigned char address[4];
+    } ipv4_hosts[] = {
+        {"8.8.8.8", TILEFINCH_HOST_IPV4_ADDRESS, {8, 8, 8, 8}},
+        {"134744072", TILEFINCH_HOST_IPV4_ADDRESS, {8, 8, 8, 8}},
+        {"0x08080808", TILEFINCH_HOST_IPV4_ADDRESS, {8, 8, 8, 8}},
+        {"0X8080808", TILEFINCH_HOST_IPV4_ADDRESS, {8, 8, 8, 8}},
+        {"8.526344", TILEFINCH_HOST_IPV4_ADDRESS, {8, 8, 8, 8}},
+        {"8.8.2056", TILEFINCH_HOST_IPV4_ADDRESS, {8, 8, 8, 8}},
+        {"010.010.010.010", TILEFINCH_HOST_IPV4_ADDRESS, {8, 8, 8, 8}},
+        {"0xc0.0250.1.1", TILEFINCH_HOST_IPV4_ADDRESS, {192, 168, 1, 1}},
+        {"4294967295", TILEFINCH_HOST_IPV4_ADDRESS, {255, 255, 255, 255}},
+        {"0", TILEFINCH_HOST_IPV4_ADDRESS, {0, 0, 0, 0}},
+        {"0x", TILEFINCH_HOST_IPV4_ADDRESS, {0, 0, 0, 0}},
+        {"1.2.3.4.", TILEFINCH_HOST_IPV4_ADDRESS, {1, 2, 3, 4}},
+        {"4294967296", TILEFINCH_HOST_IPV4_INVALID, {0}},
+        {"99999999999999999999", TILEFINCH_HOST_IPV4_INVALID, {0}},
+        {"08", TILEFINCH_HOST_IPV4_INVALID, {0}},
+        {"1.2.3.4.5", TILEFINCH_HOST_IPV4_INVALID, {0}},
+        {"256.1.1.1", TILEFINCH_HOST_IPV4_INVALID, {0}},
+        {"1.2.3.256", TILEFINCH_HOST_IPV4_INVALID, {0}},
+        {"1.16777216", TILEFINCH_HOST_IPV4_INVALID, {0}},
+        {"example.123", TILEFINCH_HOST_IPV4_INVALID, {0}},
+        {"1.0xg", TILEFINCH_HOST_IPV4_NAME, {0}},
+        {"example.com", TILEFINCH_HOST_IPV4_NAME, {0}},
+        {"intranet", TILEFINCH_HOST_IPV4_NAME, {0}},
+        {"127.evil", TILEFINCH_HOST_IPV4_NAME, {0}},
+        {"1e5", TILEFINCH_HOST_IPV4_NAME, {0}},
+        {"0x1g", TILEFINCH_HOST_IPV4_NAME, {0}}
+    };
+    for (size_t i = 0; i < sizeof(ipv4_hosts) / sizeof(ipv4_hosts[0]); i++) {
+        unsigned char address[4] = {0};
+        TilefinchHostIpv4 kind = tilefinch_host_ipv4(
+            ipv4_hosts[i].host, strlen(ipv4_hosts[i].host), address);
+        if (kind != ipv4_hosts[i].kind
+            || (kind == TILEFINCH_HOST_IPV4_ADDRESS
+                && memcmp(address, ipv4_hosts[i].address, 4) != 0)) {
+            fprintf(stderr, "IPv4 host %s: kind %d address %u.%u.%u.%u\n",
+                    ipv4_hosts[i].host, (int) kind, address[0], address[1],
+                    address[2], address[3]);
+            return 1;
+        }
+    }
 
     CHECK(!tilefinch_url_origin("https://User:Pass@Example.COM:443/a", output,
                              sizeof(output)));
@@ -151,6 +222,10 @@ int main(void)
     CHECK(tilefinch_public_suffix_classify("co.uk", &is_public_suffix)
           && is_public_suffix);
     CHECK(tilefinch_public_suffix_classify("github.io", &is_public_suffix)
+          && is_public_suffix);
+    CHECK(tilefinch_public_suffix_classify("gov.de", &is_public_suffix)
+          && is_public_suffix);
+    CHECK(tilefinch_public_suffix_classify("cloudzyro.app", &is_public_suffix)
           && is_public_suffix);
     CHECK(tilefinch_public_suffix_classify("newtenant.replit.dev", &is_public_suffix)
           && is_public_suffix);
@@ -282,6 +357,45 @@ int main(void)
     }
     CHECK(tilefinch_referrer_policy_name(TILEFINCH_REFERRER_POLICY_COUNT + 1u)
           == NULL);
+    /* NW-08: an IPv4 host is serialized as its dotted quad however it is
+       spelled, so origin, site key and cookie scope are per address. Two
+       machines whose spellings share "0x1.1" are different sites, and
+       127.1 is the origin 127.0.0.1. */
+    static const char *const canonical_hosts[][2] = {
+        {"http://127.1/a", "http://127.0.0.1/a"},
+        {"http://0x7F.0.0.1:8080/x?y#z", "http://127.0.0.1:8080/x?y#z"},
+        {"http://2130706433/", "http://127.0.0.1/"},
+        {"http://192.168.0x1.1/", "http://192.168.1.1/"},
+        {"https://010.010.010.010/", "https://8.8.8.8/"},
+        {"http://8.8.8.8/", "http://8.8.8.8/"},
+        {"http://Example.123/", "http://example.123/"},
+        {"http://1.0xg/", "http://1.0xg/"},
+        {"http://[2001:db8::1]/", "http://[2001:db8::1]/"}
+    };
+    for (size_t i = 0;
+         i < sizeof(canonical_hosts) / sizeof(canonical_hosts[0]); i++) {
+        if (!tilefinch_url_normalize(canonical_hosts[i][0], output,
+                                     sizeof(output))
+            || strcmp(output, canonical_hosts[i][1]) != 0)
+            fprintf(stderr, "normalize %s -> %s\n", canonical_hosts[i][0],
+                    output);
+        CHECK(tilefinch_url_normalize(canonical_hosts[i][0], output,
+                                      sizeof(output))
+              && strcmp(output, canonical_hosts[i][1]) == 0);
+    }
+    CHECK(tilefinch_url_origin("http://127.1:8080/x", output, sizeof(output))
+          && strcmp(output, "http://127.0.0.1:8080") == 0);
+    CHECK(tilefinch_url_same_origin("http://127.1/", "http://127.0.0.1/"));
+    CHECK(tilefinch_url_same_origin("http://0x7f000001/a", "http://127.1/b"));
+    CHECK(!tilefinch_url_same_origin("http://127.1/", "http://127.0.0.2/"));
+    char other_site[TILEFINCH_URL_SERIALIZED_LIMIT];
+    CHECK(tilefinch_url_site_key("http://192.168.0x1.1/", output,
+                                 sizeof(output))
+          && tilefinch_url_site_key("http://10.9.0x1.1/", other_site,
+                                    sizeof(other_site))
+          && strcmp(output, "http://192.168.1.1") == 0
+          && strcmp(other_site, "http://10.9.1.1") == 0);
+
     puts("url-tests status=PASS");
     return 0;
 }

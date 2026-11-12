@@ -99,6 +99,14 @@ _Static_assert(SWDEC_SAMPLE_MAX_BYTES == PSP_MEDIA_MAXIMUM_PACKET_BYTES,
    surfaces, the audio output and the Media Engine's audio queue before
    playback fails. */
 #define SWDEC_RESET_DEADLINE_US 2000000u
+/* How long close waits for the decode worker before quarantining the
+   software route for the process. It must outlast the worker's longest
+   legitimate job: the component gives up on a stalled Media Engine slice
+   after 2 s, tested once every 1024 polls of 100 us sleeps, so a job can
+   return 2.1 s or more after its slice began. A shorter wait turned a
+   close during such a stall into a process-long refusal of the route
+   (MB-05). */
+#define SWDEC_WORKER_STOP_WAIT_US 3000000u
 #define SWDEC_MAX_WIDTH 432u
 #define SWDEC_MAX_HEIGHT 240u
 #define SWDEC_PARAMETER_SET_SLACK 1024u
@@ -230,6 +238,10 @@ typedef struct {
     SceUID audio_thread;
     bool worker_started;
     bool audio_started;
+    /* The output channel the audio thread reserved: -1 none, -2 the SRC
+       channel, else a standard channel. Written by that thread; released by
+       destroy once the thread has ended (MB-03). */
+    atomic_int audio_channel;
     atomic_bool stop;
     atomic_bool playing;
     atomic_bool buffering;
@@ -295,6 +307,9 @@ typedef struct {
        recheck of a unit queued ahead. */
     SwdecPublishedU64 dispatch_clock_us;
     atomic_int worker_error;     /* the audio worker's channel failure */
+    /* The decode worker's failed event wait: the worker has ended, so a
+       reset never clears it. */
+    atomic_int worker_wait_error;
     bool drained;
 
     SwdecVideoSlot slots[SWDEC_RING_SLOTS];
@@ -1124,9 +1139,18 @@ static int swdec_worker_main(SceSize arguments, void *argument)
     PspSwdecBackend *backend = *(PspSwdecBackend **) argument;
     while (!atomic_load_explicit(&backend->stop, memory_order_acquire)) {
         u32 bits = 0;
-        (void) sceKernelWaitEventFlag(
+        int waited = sceKernelWaitEventFlag(
             backend->worker_event, SWDEC_EVENT_WAKE,
             PSP_EVENT_WAITOR | PSP_EVENT_WAITCLEAR, &bits, NULL);
+        if (waited < 0) {
+            /* A failing wait returns at once: looping would spin this
+               thread, which outranks the browser. Report it (the next pump
+               fails playback, as the firmware workers do) and end; close
+               then finds the thread already stopped. */
+            atomic_store_explicit(
+                &backend->worker_wait_error, waited, memory_order_release);
+            break;
+        }
         /* Run every published job in order, then sleep. A job the browser
            queued while the previous one decoded starts at once. */
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
@@ -1236,6 +1260,8 @@ static int swdec_audio_main(SceSize arguments, void *argument)
         swdec_audio_fence_set_thread(&backend->audio_fence, false);
         return 0;
     }
+    atomic_store_explicit(&backend->audio_channel, use_src ? -2 : channel,
+                          memory_order_release);
     unsigned output = 0;
     unsigned audio_epoch = atomic_load_explicit(
         &backend->audio_epoch, memory_order_acquire);
@@ -1463,10 +1489,57 @@ static int swdec_audio_main(SceSize arguments, void *argument)
 #endif
         }
     }
-    if (use_src) (void) sceAudioSRCChRelease();
-    else sceAudioChRelease(channel);
+    /* The channel is released by destroy, after this thread has ended: the
+       release straight after a blocking output can report busy, and has to
+       be retried rather than dropped (MB-03). */
     swdec_audio_fence_set_thread(&backend->audio_fence, false);
     return 0;
+}
+
+static int swdec_audio_channel_release_once(void *context)
+{
+    int channel = *(const int *) context;
+    return channel == -2 ? sceAudioSRCChRelease()
+                         : sceAudioChRelease(channel);
+}
+
+static uint32_t swdec_audio_release_now_us(void)
+{
+    return (uint32_t) sceKernelGetSystemTimeLow();
+}
+
+static int swdec_audio_release_delay_us(uint32_t us)
+{
+    return sceKernelDelayThread((SceUInt) us);
+}
+
+/* Destroy only, after the audio thread has ended. False when the channel
+   is still held: the audio service may then still own the last PCM block,
+   so the caller keeps everything. */
+static bool swdec_release_audio_channel(PspSwdecBackend *backend)
+{
+    int channel = atomic_load_explicit(
+        &backend->audio_channel, memory_order_acquire);
+    if (channel == -1) return true;
+    const PspMediaAudioReleaseOps ops = {
+        swdec_audio_channel_release_once, &channel,
+        swdec_audio_release_now_us, swdec_audio_release_delay_us
+    };
+    int status = 0;
+    unsigned attempts = 0;
+    uint32_t waited_us = 0;
+    bool released = psp_media_audio_release_bounded(
+        &ops, PSP_MEDIA_AUDIO_CHANNEL_DRAIN_WAIT_US,
+        &status, &attempts, &waited_us);
+    /* Only the abnormal releases: a busy answer, or none at all. */
+    if (!released || attempts > 1u)
+        psp_log_printf("tilefinch-swdec-audio: event=channel-release "
+                       "channel=%d released=%d status=0x%08X attempts=%u "
+                       "waited=%uus\n", channel, released ? 1 : 0,
+                       (unsigned) status, attempts, (unsigned) waited_us);
+    if (!released) return false;
+    atomic_store_explicit(&backend->audio_channel, -1, memory_order_release);
+    return true;
 }
 
 /* Browser thread: retire every finished job in order. WOULD_BLOCK while the
@@ -1912,12 +1985,22 @@ static MediaBackendResult swdec_dispatch_queued(
                         "invalid length-prefixed H.264 AU");
             return MEDIA_BACKEND_ERROR;
         }
-        if (!media_h264_annexb_sample_is_admitted(
+        /* Every in-band SPS keeps the geometry and the coding the decoder
+           was admitted for at open: one switching to field coding, another
+           chroma format or bit depth is refused here, before the decoder
+           and its Media Engine split see a form they were never run on. */
+        MediaH264SampleVerdict verdict =
+            media_h264_annexb_software_sample_verdict(
                 job->packet, written,
-                (uint16_t) backend->width, (uint16_t) backend->height)) {
+                (uint16_t) backend->width, (uint16_t) backend->height);
+        if (verdict != MEDIA_H264_SAMPLE_ADMITTED) {
             swdec_free_slot(backend, slot);
-            swdec_error(error, error_size,
-                        "H.264 access unit changed decoded geometry");
+            if (verdict == MEDIA_H264_SAMPLE_CODING_UNSUPPORTED)
+                swdec_error(error, error_size, "%s",
+                            MEDIA_H264_SOFTWARE_CODING_REFUSAL);
+            else
+                swdec_error(error, error_size,
+                            "H.264 access unit changed decoded geometry");
             return MEDIA_BACKEND_ERROR;
         }
         swdec_au_pop(backend);
@@ -2255,6 +2338,14 @@ static bool swdec_advance(
     }
     MediaBackendResult result = swdec_collect(backend, error, error_size);
     if (result == MEDIA_BACKEND_ERROR) return false;
+    int wait_error = atomic_load_explicit(
+        &backend->worker_wait_error, memory_order_acquire);
+    if (wait_error != 0) {
+        backend->stats.last_native_error = wait_error;
+        swdec_error(error, error_size,
+                    "software decoder worker wait failed (%d)", wait_error);
+        return false;
+    }
     int output_error = atomic_load_explicit(
         &backend->worker_error, memory_order_acquire);
     if (output_error != 0) {
@@ -3259,11 +3350,18 @@ static void swdec_destroy(void *opaque)
         (void) sceKernelSetEventFlag(backend->worker_event, SWDEC_EVENT_WAKE);
     bool worker_stopped = !backend->worker_started
         || psp_thread_wait_end_bounded(
-               backend->worker_thread, 2000000u) >= 0;
+               backend->worker_thread, SWDEC_WORKER_STOP_WAIT_US) >= 0;
     bool audio_stopped = !backend->audio_started
         || psp_thread_wait_end_bounded(
                backend->audio_thread, 2000000u) >= 0;
     if (!worker_stopped || !audio_stopped) {
+        swdec_quarantined = true;
+        return;
+    }
+    if (!swdec_release_audio_channel(backend)) {
+        /* Never released: the audio service may still own the last PCM
+           block, so nothing it could read is freed, as on the firmware
+           backend. */
         swdec_quarantined = true;
         return;
     }
@@ -3651,6 +3749,7 @@ bool media_psp_swdec_backend_create_sources(
     backend->ready_event = -1;
     backend->worker_thread = -1;
     backend->audio_thread = -1;
+    atomic_init(&backend->audio_channel, -1);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     memset(&swdec_holds, 0, sizeof(swdec_holds));
     swdec_hold_last_take_us = swdec_hold_take_gap_us = 0;
@@ -3694,6 +3793,7 @@ bool media_psp_swdec_backend_create_sources(
     swdec_audio_fence_init(&backend->audio_fence);
     swdec_reset_gate_init(&backend->reset_gate, SWDEC_RESET_DEADLINE_US);
     atomic_init(&backend->worker_error, 0);
+    atomic_init(&backend->worker_wait_error, 0);
 
     backend->decoder_arena_bytes = component->arena_bytes(
         (int) width, (int) height, arena_refs);
@@ -4116,6 +4216,7 @@ bool media_psp_swdec_backend_create_audio(
     backend->ready_event = -1;
     backend->worker_thread = -1;
     backend->audio_thread = -1;
+    atomic_init(&backend->audio_channel, -1);
     backend->last_claimed_slot = -1;
     backend->speed = -1;
     backend->epoch = 1;
@@ -4152,6 +4253,7 @@ bool media_psp_swdec_backend_create_audio(
     swdec_audio_fence_init(&backend->audio_fence);
     swdec_reset_gate_init(&backend->reset_gate, SWDEC_RESET_DEADLINE_US);
     atomic_init(&backend->worker_error, 0);
+    atomic_init(&backend->worker_wait_error, 0);
 
     (void) swdec_take_aux_arena(backend, budget);
     (void) swdec_take_audio_packets(backend, budget);

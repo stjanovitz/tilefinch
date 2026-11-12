@@ -299,8 +299,29 @@ bool psp_boot_config_load(
     PspBootConfig *config, const char *path,
     PspBootConfigWarning warning, void *warning_context);
 
+/* The keys an in-app settings save may write. */
+#define PSP_BOOT_CONFIG_KEY_URL 0x01u
+#define PSP_BOOT_CONFIG_KEY_NETWORK_PROFILE 0x02u
+#define PSP_BOOT_CONFIG_KEY_DEVELOPER_UPDATE_URL 0x04u
+#define PSP_BOOT_CONFIG_KEY_DEVELOPER_PACKAGE_URL 0x08u
+#define PSP_BOOT_CONFIG_KEY_EXPERIMENTAL_WIDE_VIDEO 0x10u
+#define PSP_BOOT_CONFIG_KEY_EXIT_TO 0x20u
+#define PSP_BOOT_CONFIG_KEYS_OVERRIDES 0x3fu
+/*
+ * Write the KEYS (PSP_BOOT_CONFIG_KEY_*) of CONFIG into the boot file PATH,
+ * editing it: the last line of each key is replaced, a key the file lacks
+ * is appended, and every other line (comments, unknown and hand-set keys,
+ * CRLF endings, order) is kept byte for byte. The edit starts from the file
+ * the loader reads: PATH, else PATH.bak, else nothing when neither loads
+ * (each not found, or read but rejected by the loader). The result is
+ * written to PATH.tmp and replaces PATH, the previous file kept as PATH.bak.
+ * False, with nothing written, when PATH or the PATH.bak it falls back to
+ * exists but cannot be read (any open failure other than not found, or a
+ * read error), when a loadable file is too large to edit (16 KiB), or when
+ * any write fails.
+ */
 bool psp_boot_config_write_overrides(
-    const PspBootConfig *config, const char *path);
+    const PspBootConfig *config, const char *path, unsigned keys);
 
 bool psp_boot_config_validate(
     const PspBootConfig *config, const char **invalid_field);

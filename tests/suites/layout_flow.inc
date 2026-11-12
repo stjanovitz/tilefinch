@@ -1228,6 +1228,59 @@ static int test_wrapped_flex_preview_stops_at_limit(Budget *budget)
     return 0;
 }
 
+/* Style resolutions and item count for one flex container whose items sit in a
+   display:contents wrapper, with `noise` comments and whitespace nodes among
+   them. */
+static int flat_noise_layout(Budget *budget, int noise, uint64_t *resolutions,
+                             int *item_y)
+{
+    char page[16000];
+    size_t used = (size_t) snprintf(
+        page, sizeof(page),
+        "<!doctype html><style>html,body{margin:0}.f{display:flex;flex-wrap:wrap}"
+        ".w{display:contents}.i{width:100%%;height:10px}</style><body><div class=f>"
+        "<div class=w><div class=i></div>");
+    for (int i = 0; i < noise && used < sizeof(page) - 64; i++)
+        used += (size_t) snprintf(page + used, sizeof(page) - used,
+                                  "<!--c-->\n");
+    used += (size_t) snprintf(page + used, sizeof(page) - used,
+                              "<div class=i id=last></div></div></div></body>");
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument layout = {0};
+    ViewportContext viewport = {0};
+    CHECK(document_parse(&document, budget, page, used, 24)
+          && stylesheet_build(&sheet, budget, &document, 480)
+          && viewport_context_init(&viewport, 480, 272, 480, 272));
+    bool truncated = true;
+    CHECK(layout_build_context_preview(
+              &layout, budget, &document, &sheet, NULL, NULL,
+              &viewport, NULL, INT_MAX, &truncated)
+          && !truncated);
+    const LayoutNodeBox *box = layout_box_for_node(
+        &layout, find_id(lxb_dom_interface_node(document.html), "last"));
+    CHECK(box != NULL);
+    *item_y = box->y;
+    *resolutions = layout.performance.style_resolutions;
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    return 0;
+}
+
+/* A comment or whitespace node in a flat list never uses its parent's style, so
+   it costs no style work however deep in display:contents it sits. */
+static int test_flat_list_noise_costs_no_style_work(Budget *budget)
+{
+    uint64_t clean = 0, noisy = 0;
+    int clean_y = -1, noisy_y = -2;
+    CHECK(flat_noise_layout(budget, 0, &clean, &clean_y) == 0);
+    CHECK(flat_noise_layout(budget, 400, &noisy, &noisy_y) == 0);
+    CHECK(clean_y == 10 && noisy_y == clean_y);
+    CHECK(noisy == clean);
+    return 0;
+}
+
 /* A provisional cut's contract (layout_note_preview_cut): what it recorded
    before the cut is the complete layout's own, unless it marked the cut
    inexact. Containers that move their items after the loop by totals the
@@ -1805,6 +1858,90 @@ static int test_generated_counter_lookup_work(Budget *budget)
     layout_reuse_cache_destroy(reuse);
     stylesheet_destroy(&sheet);
     document_destroy(&document);
+    CHECK(budget->current == 0);
+    return 0;
+}
+
+/* An image that loads in place (same ImageResources table) changes the
+   intrinsic width of what contains it. The reuse cache returned the
+   width measured before the load, because both of its image hooks
+   returned early when the table pointer was unchanged. */
+static int test_reuse_image_load_in_place(Budget *budget)
+{
+    static const char html[] =
+        "<!doctype html><style>body{margin:0}"
+        ".f{float:left}.i{display:inline-block}</style><body>"
+        "<div class=f id=float><img id=a></div>"
+        "<div class=i id=block><img id=b></div>"
+        "<div class=f><img id=sized width=10 height=10></div>";
+    for (int notify = 0; notify < 2; notify++) {
+        PocDocument document = {0};
+        Stylesheet sheet = {0};
+        LayoutDocument layout = {0};
+        ViewportContext viewport;
+        CHECK(document_parse(&document, budget, html, sizeof(html) - 1, 19)
+            && viewport_context_init(&viewport, 480, 272, 480, 272)
+            && stylesheet_build_context(&sheet, budget, &document,
+                                        &viewport));
+        lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+        lxb_dom_node_t *float_node = find_id(root, "float");
+        lxb_dom_node_t *block_node = find_id(root, "block");
+        static unsigned char pixel[4] = {0xff, 0xff, 0xff, 0xff};
+        ImageResource items[3] = {
+            {.node = find_id(root, "a")},
+            {.node = find_id(root, "b")},
+            {.node = find_id(root, "sized"), .pixels = pixel,
+             .width = 10, .height = 10}
+        };
+        ImageResources images = {.items = items, .count = 3};
+        LayoutReuseCache *reuse = layout_reuse_cache_create(budget);
+        CHECK(reuse != NULL && float_node != NULL && block_node != NULL);
+        layout_reuse_cache_update_images(reuse, &images);
+        CHECK(layout_build_context_reuse(&layout, budget, &document, &sheet,
+            NULL, &images, &viewport, reuse));
+        const LayoutNodeBox *before = layout_box_for_node(&layout,
+                                                          float_node);
+        CHECK(before != NULL && before->width < 40);
+        layout_destroy(&layout);
+        /* Both images arrive in place; the sized one changes nothing. */
+        items[0].pixels = pixel;
+        items[0].width = 40;
+        items[0].height = 20;
+        items[1].pixels = pixel;
+        items[1].width = 50;
+        items[1].height = 20;
+        LayoutReuseStats stats_before, stats_after;
+        layout_reuse_cache_stats(reuse, &stats_before);
+        if (notify) layout_reuse_cache_update_images(reuse, &images);
+        CHECK(layout_build_context_reuse(&layout, budget, &document, &sheet,
+            NULL, &images, &viewport, reuse));
+        layout_reuse_cache_stats(reuse, &stats_after);
+        const LayoutNodeBox *loaded_float = layout_box_for_node(&layout,
+                                                                float_node);
+        const LayoutNodeBox *loaded_block = layout_box_for_node(&layout,
+                                                                block_node);
+        if (loaded_float == NULL || loaded_float->width != 40
+            || loaded_block == NULL || loaded_block->width != 50
+            || stats_after.scoped_invalidations
+                   != stats_before.scoped_invalidations + 1u) {
+            fprintf(stderr, "in-place image load (notify %d): float %d "
+                    "block %d, scoped invalidations %llu -> %llu\n", notify,
+                    loaded_float ? loaded_float->width : -1,
+                    loaded_block ? loaded_block->width : -1,
+                    (unsigned long long) stats_before.scoped_invalidations,
+                    (unsigned long long) stats_after.scoped_invalidations);
+            CHECK(false);
+        }
+        layout_destroy(&layout);
+        /* Nothing changed since: no further invalidation. */
+        layout_reuse_cache_update_images(reuse, &images);
+        layout_reuse_cache_stats(reuse, &stats_before);
+        CHECK(stats_before.scoped_invalidations
+              == stats_after.scoped_invalidations);
+        layout_reuse_cache_destroy(reuse);
+        stylesheet_destroy(&sheet);
+        document_destroy(&document);
+    }
     CHECK(budget->current == 0);
     return 0;
 }

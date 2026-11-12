@@ -1,0 +1,40 @@
+# Internet radio from directory.shoutcast.com on a real PSP: play the first
+# MP3 station in the Top list with the d-pad and, when the station's HTTPS
+# upgrade fails, answer the unencrypted-audio question with Cross. Boot with
+# url=https://directory.shoutcast.com/.
+#
+# Down walks the header (menu, logo, search, Advanced Search, the cookie
+# notice's privacy link) to the first station's name; Left reaches its play
+# link. The companion mark.js reports the focused element and station at
+# "focused". From the play press on the player is a sustained media session,
+# so every later step is -live: an ordinary step would wait for an idle
+# browser that never comes. answer-question presses Cross only if the
+# question appears (logging outcome=answered and capturing "question"); a
+# station whose upgrade succeeds plays at once (outcome=not-asked).
+until 2400
+tap down
+wait 8
+tap down
+wait 8
+tap down
+wait 8
+tap down
+wait 8
+tap down
+wait 8
+tap down
+wait 30
+tap left
+wait 30
+mark focused
+tap cross
+answer-question-live 2400 cross
+wait-live 900
+mark-live playing
+wait-live 3600
+mark-live listened
+tap-live circle
+wait-live 120
+mark-live closed
+wait 30
+end

@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width">
+<title>Page dialogs</title>
+<style>
+body { font: 18px sans-serif; margin: 12px; background: #f4f1ea; color: #222; }
+h1 { font-size: 22px; margin: 0 0 8px; }
+p { margin: 6px 0; }
+.answer { font-weight: bold; }
+#again { position: fixed; left: 10%; top: 44%; width: 80%; height: 44%;
+         font: bold 20px sans-serif; background: #2b5d8a; color: #fff;
+         border: 0; }
+</style>
+</head>
+<body>
+<h1>Page dialogs</h1>
+<p id="answers" class="answer">Waiting for answers.</p>
+<p id="spam" class="answer"></p>
+<button id="again" type="button">Ask again</button>
+<!--
+  Driven by tests/input-scripts/page-dialogs-live.txt. A scripted run's input
+  script arms only after the start page's boot load, so no dialog opens
+  during that load:
+  - page-dialogs.html (loopback, PPSSPP) navigates to page-dialogs.html?dialogs,
+    whose alert then opens while that page loads;
+  - ?device (the installed offline app, on a PSP) opens its alert from the
+    timer after load instead, since an installed app cannot navigate to
+    itself without the network.
+  The confirm and prompt follow from that timer. "Ask again" is a user
+  gesture: its alert offers Square (stop dialogs), after which a loop of
+  alerts must return at once.
+
+  ?buttons (page-dialogs-buttons-live.txt, installed offline app) exercises
+  the rest of the modal: a Cross pressed before the arm delay, Circle, Cross
+  into the keyboard, the gesture limit, the rate window, and Triangle.
+-->
+<script>
+(function () {
+  var mode = location.search;
+  if (mode === "?buttons") {
+    var report = function (id, text) {
+      document.getElementById(id).textContent = text;
+      document.title = text;
+    };
+    var clicks = 0;
+    window.addEventListener("load", function () {
+      setTimeout(function () {
+        var proceed = confirm("Cancel me: Cross is too early, Circle answers.");
+        var name = prompt("Edit me with Cross, then accept with START.", "Ada");
+        /* The third dialog of this turn; the rest are over the gesture limit. */
+        for (var turn = 0; turn < 5; turn++) alert("Turn " + turn);
+        report("answers", "confirm: " + proceed + ", prompt: " + JSON.stringify(name));
+      }, 500);
+    });
+    document.getElementById("again").addEventListener("click", function () {
+      clicks++;
+      if (clicks < 3) {
+        /* Click 1 reaches the rate limit after two; click 2, past the
+           window, the gesture limit after three. */
+        for (var i = 0; i < 5; i++) alert("Click " + clicks + " alert " + i);
+        report("spam", "click " + clicks + " done");
+        return;
+      }
+      alert("Press Triangle to leave this page.");
+      var after = confirm("Not shown: leaving stops this page's dialogs.");
+      report("spam", "left, confirm: " + after);
+    });
+    return;
+  }
+  if (mode === "") {
+    window.addEventListener("load", function () {
+      setTimeout(function () { location.replace("page-dialogs.html?dialogs"); }, 300);
+    });
+    return;
+  }
+  if (mode === "?dialogs")
+    alert("Hello from the page.\nThis alert opened while the page was still loading.");
+  window.addEventListener("load", function () {
+    setTimeout(function () {
+      if (mode !== "?dialogs")
+        alert("Hello from the page.\nThis alert opened from a timer after the page loaded.");
+      var proceed = confirm("Do you want to continue? Your answer is shown on the page.");
+      var name = prompt("What is your name?", "Ada Lovelace");
+      var shown = "confirm: " + proceed + ", prompt: " + JSON.stringify(name);
+      document.getElementById("answers").textContent = shown;
+      document.title = shown;
+    }, 500);
+  });
+  document.getElementById("again").addEventListener("click", function () {
+    document.getElementById("spam").textContent = "Asking again.";
+    alert("This page is asking again. Press Square to stop its dialogs.");
+    var started = Date.now();
+    var calls = 0;
+    for (; calls < 200; calls++) alert("Spam " + calls);
+    var later = confirm("Still there?");
+    var shown = "spam: " + calls + " alerts in " + (Date.now() - started)
+        + " ms, confirm: " + later;
+    document.getElementById("spam").textContent = shown;
+    document.title = shown;
+  });
+})();
+</script>
+</body>
+</html>

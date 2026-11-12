@@ -217,13 +217,23 @@ static bool fetch_replay_lane_same_url(const char *left, const char *right)
 static uint64_t fetch_replay_lane_enqueue(
     const char *url, const FetchRequest *request, size_t maximum_bytes,
     long timeout_ms, bool streaming, bool single_hop,
-    size_t publication_bytes, FetchBackgroundEnqueueStatus *status)
+    size_t publication_bytes, FetchBackgroundLane lane,
+    FetchBackgroundEnqueueStatus *status)
 {
     if (status != NULL) *status = FETCH_BACKGROUND_ENQUEUE_UNSUPPORTED;
     if (url == NULL || maximum_bytes == 0
         || !fetch_request_validate(request, NULL)) return 0;
     FetchReplayLaneOperation *operation = NULL;
-    for (size_t i = 0; i < FETCH_REPLAY_LANE_LIMIT; i++) {
+    size_t limit = FETCH_REPLAY_LANE_LIMIT;
+#if !defined(__PSP__)
+    /* A host test can give the lane the PSP worker's descriptors: the same
+       count and the same per-lane ranges, claimed lowest index first. */
+    if (tilefinch_test_faults()->replay_lane_worker_descriptors)
+        limit = fetch_background_admission_slot_limit(lane, false);
+#else
+    (void) lane;
+#endif
+    for (size_t i = 0; i < limit; i++) {
         if (fetch_replay_lane.operations[i].id == 0) {
             operation = &fetch_replay_lane.operations[i];
             break;
@@ -513,8 +523,10 @@ static bool fetch_replay_lane_take_chunk(uint64_t request_id,
     FetchReplayLaneOperation *operation = fetch_replay_lane_find(request_id);
     if (operation == NULL || destination == NULL || length == NULL
         || capacity == 0 || !operation->streaming || !operation->success
-        || !operation->headers_taken
         || operation->delivered == operation->length) return false;
+    /* Like a worker slot, the body does not wait for a header take: the
+       YouTube resolver streams a player response without reading its
+       headers. */
     size_t take = operation->length - operation->delivered;
     if (take > operation->publication_bytes)
         take = operation->publication_bytes;

@@ -33,7 +33,8 @@ static const FetchRequest *media_worker_page_request(
         .method = "GET",
         .mode = authority->mode,
         .credentials = authority->credentials,
-        .destination = TILEFINCH_DESTINATION_MEDIA
+        .destination = authority->audio
+            ? TILEFINCH_DESTINATION_AUDIO : TILEFINCH_DESTINATION_MEDIA
     };
     FetchRequestValidationError validation_error;
     BrowserSession *session = authority->session;

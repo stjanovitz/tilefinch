@@ -64,7 +64,13 @@ class StartupBundleTests(unittest.TestCase):
     def test_shortcut_is_fresh_only_and_recovery_bypasses_it(self):
         source = (ROOT/'src/update_launcher_psp.c').read_text()
         self.assertIn('allow_module && fresh_install && slot == TILEFINCH_UPDATE_SLOT_A', source)
-        self.assertIn('!recovery_button && action != TILEFINCH_UPDATE_BOOT_RECOVERY', source)
+        self.assertIn('tilefinch_update_boot_allows_fast_start(recovery_button, action)', source)
+        state = (ROOT/'src/update_state.c').read_text()
+        self.assertIn('!recovery_button && action != TILEFINCH_UPDATE_BOOT_RECOVERY', state)
+        # L-hold and recovery also discard the startup copies (IS-07).
+        bypass = source[source.index('if (!fast_start) {'):source.index('launcher_boot_slot(&paths, slot, fast_start')]
+        self.assertIn('psp_boot_cache_discard(', bypass)
+        self.assertIn('psp_boot_prepackaged_discard(', bypass)
         self.assertIn('fresh_install = !tilefinch_update_journal_load', source)
         self.assertIn('psp_boot_cache_prepare(eboot, cache, temporary', source)
         branch = source[source.index('if (allow_module && fresh_install'):source.index('char cache[TILEFINCH_INSTALL_PATH_LIMIT]')]

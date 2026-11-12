@@ -11,8 +11,10 @@ Categories, in the order they are tested:
   first-party                                   (the site's own code; inline)
   third-party                                   (anything else)
 
-Rules are host suffixes and path substrings, plus the hosts of Tilefinch's
-basic content-blocker list (src/content_blocker.c), which count as ads.
+Rules are host suffixes and path substrings, plus the ad hosts of Tilefinch's
+basic content-blocker list (src/content_blocker.c basic_hosts), which count as
+ads. The list's tag-manager and A/B testing hosts (basic_sdk_hosts) keep the
+categories the rules below give them.
 Order matters: a Google Tag Manager URL is a tag manager, not analytics.
 """
 import re
@@ -22,11 +24,12 @@ from urllib.parse import urlsplit
 NON_ESSENTIAL = ("ads", "tag-manager", "consent", "ab-testing", "analytics",
                  "chat", "social")
 
-# Tilefinch's basic content-blocker hosts (src/content_blocker.c basic_hosts).
+# Tilefinch's basic content-blocker ad hosts (src/content_blocker.c basic_hosts).
 BLOCKER_HOSTS = (
     "33across.com", "adform.net", "adnxs.com", "adsrvr.org",
-    "amazon-adsystem.com", "bidswitch.net", "casalemedia.com",
-    "contextweb.com", "criteo.com", "criteo.net", "demdex.net",
+    "amazon-adsystem.com", "bidswitch.net", "btloader.com",
+    "casalemedia.com", "confiant-integrations.net", "contextweb.com",
+    "criteo.com", "criteo.net", "demdex.net",
     "doubleclick.net", "googleadservices.com", "googlesyndication.com",
     "indexww.com", "lijit.com", "mathtag.com", "media.net",
     "moatads.com", "openx.net", "outbrain.com", "pubmatic.com",

@@ -35,7 +35,10 @@ typedef enum {
     BROWSER_SESSION_PERSISTENCE_IO_ERROR,
     BROWSER_SESSION_PERSISTENCE_LIMIT_EXCEEDED,
     BROWSER_SESSION_PERSISTENCE_CORRUPT,
-    BROWSER_SESSION_PERSISTENCE_OUT_OF_MEMORY
+    BROWSER_SESSION_PERSISTENCE_OUT_OF_MEMORY,
+    /* A later release wrote the snapshot. Loads leave it and its backup
+       alone, and saves refuse to rotate it away. */
+    BROWSER_SESSION_PERSISTENCE_NEWER_FORMAT
 } BrowserSessionPersistenceStatus;
 
 typedef struct BrowserSessionPersistenceLoad BrowserSessionPersistenceLoad;
@@ -79,6 +82,12 @@ BrowserSessionPersistenceStatus browser_session_persistence_load(
  * and resumes into the ordinary session after sign-in closes. Terminal load
  * results remain terminal even if a portal subsequently opens.
  */
+/* The size of the file a save of MASK would write now, header included,
+   counted without writing or hashing (a free-space preflight). The save
+   itself returns the same status for a plan that does not fit. */
+BrowserSessionPersistenceStatus browser_session_persistence_planned_bytes(
+    const BrowserSession *session, BrowserSessionPersistenceMask mask,
+    const BrowserSessionPersistenceLimits *limits, uint64_t *bytes);
 BrowserSessionPersistenceLoad *browser_session_persistence_load_begin(
     BrowserSession *session, const char *path,
     BrowserSessionPersistenceMask mask,
@@ -94,6 +103,15 @@ BrowserSessionPersistenceStatus browser_session_persistence_clear(
 /* Removes the complete backing file. Missing files are already clear. */
 BrowserSessionPersistenceStatus browser_session_persistence_remove(
     const char *path);
+
+/* True when a load that ended with STATUS may have left a snapshot on disk
+   that the session never read (an I/O error, a memory or limit refusal, a
+   newer format).
+   Saving over it would rotate data the session does not have behind an
+   empty or partial store, so callers skip that save. OK, NOT_FOUND (nothing
+   to keep) and CORRUPT (both generations unreadable) return false. */
+bool browser_session_persistence_load_left_unread(
+    BrowserSessionPersistenceStatus status);
 
 const char *browser_session_persistence_status_name(
     BrowserSessionPersistenceStatus status);

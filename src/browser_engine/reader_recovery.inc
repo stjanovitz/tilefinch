@@ -169,7 +169,7 @@ static void browser_engine_alias_reader_images(
 
 static void browser_engine_image_table_moved(
     void *opaque, NavigationSession *navigation, uintptr_t previous_base,
-    size_t previous_count)
+    size_t previous_count, const uint8_t *remap)
 {
     BrowserEngine *engine = opaque;
     if (engine == NULL || navigation == NULL) return;
@@ -178,9 +178,14 @@ static void browser_engine_image_table_moved(
         TileCache *cache = caches[i];
         if (cache->owns_visual_layout
             && cache->source_layout == &navigation->page.layout
-            && cache->layout == &cache->visual_layout)
-            (void) layout_rebind_image_resources(&cache->visual_layout,
-                previous_base, previous_count, &navigation->page.images);
+            && cache->layout == &cache->visual_layout) {
+            if (remap != NULL)
+                (void) layout_remap_image_resources(&cache->visual_layout,
+                    remap, previous_count, &navigation->page.images);
+            else
+                (void) layout_rebind_image_resources(&cache->visual_layout,
+                    previous_base, previous_count, &navigation->page.images);
+        }
     }
 }
 

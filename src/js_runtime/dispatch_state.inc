@@ -53,6 +53,86 @@ bool script_runtime_dispatch(ScriptRuntime *runtime, const char *selector,
     return ok;
 }
 
+/* A page that loads a tag manager or an A/B testing client often waits on
+   it: an anti-flicker snippet keeps the page hidden until the client says
+   it is done, and a link handler navigates from a tag-manager callback.
+   When the content blocker refused such a script, answer what the loaded
+   script would have (content_blocker_refused_script_shims), before its
+   error event: once per realm and kind, except that a Google tag is
+   answered once per data layer (a second container may name its own with
+   `l=`; one already answered keeps its marked push). Page functions it
+   calls run guarded; callbacks run as ordinary page timers. Private,
+   first-use code. */
+static const char refused_script_answer[] =
+    "(function(shims,url){try{var w=globalThis,d=w.document;"
+    "if(shims&1){var m=/[?&]l=([A-Za-z_$][\\w$]{0,63})(?:[&#]|$)/.exec(url),"
+    "name=m?m[1]:'dataLayer',layer=w[name];"
+    "if(layer===undefined)layer=w[name]=[];"
+    "if(Array.isArray(layer)&&!(layer.push&&layer.push.__tilefinchAnswer)){var hide=layer.hide;"
+    "if(hide&&typeof hide.end==='function')try{hide.end()}catch(e){}"
+    "var answer=function(item){try{if(item===null||typeof item!=='object')return;"
+    "var callback=item.eventCallback;"
+    "if(typeof callback!=='function'&&item[0]==='event'&&item[2]!==null"
+    "&&typeof item[2]==='object')callback=item[2].event_callback;"
+    "if(typeof callback==='function')setTimeout(callback,0)}catch(e){}};"
+    "for(var i=0;i<layer.length;i++)answer(layer[i]);var push=layer.push;"
+    "layer.push=function(){for(var j=0;j<arguments.length;j++)answer(arguments[j]);"
+    "return push.apply(this,arguments)};"
+    "Object.defineProperty(layer.push,'__tilefinchAnswer',{value:true})}}"
+    "if(shims&2){var style=d.getElementById('at-body-style');if(style)style.remove()}"
+    "if(shims&4){var vwo=w._vwo_code;if(vwo&&typeof vwo.finish==='function')vwo.finish()}"
+    "}catch(e){}})";
+
+static void js_rt_answer_refused_script(ScriptRuntime *runtime,
+                                        lxb_dom_node_t *node)
+{
+    DomBridge *bridge = &runtime->bridge;
+    if (bridge->session == NULL || bridge->session->content_blocker == NULL
+        || bridge->document_url == NULL
+        || node->type != LXB_DOM_NODE_TYPE_ELEMENT
+        || node->ns != LXB_NS_HTML || node->local_name != LXB_TAG_SCRIPT)
+        return;
+    size_t length = 0;
+    const char *src = document_attribute(node, "src", &length);
+    const char *base = js_rt_bridge_calculated_base_url(bridge);
+    char reference[TILEFINCH_URL_SERIALIZED_LIMIT];
+    char resolved[TILEFINCH_URL_SERIALIZED_LIMIT];
+    if (src == NULL || length == 0 || length >= sizeof(reference)
+        || base == NULL) return;
+    memcpy(reference, src, length);
+    reference[length] = '\0';
+    if (!tilefinch_url_resolve(base, reference, resolved, sizeof(resolved)))
+        return;
+    unsigned shims = content_blocker_refused_script_shims(
+        bridge->session->content_blocker, resolved, bridge->document_url)
+        & ~(runtime->refused_script_shims & ~CONTENT_BLOCKER_SHIM_GOOGLE_TAG);
+    if (shims == 0) return;
+    runtime->refused_script_shims |= shims;
+    JSValue function = JS_Eval(
+        runtime->context, refused_script_answer,
+        sizeof(refused_script_answer) - 1u, "<refused-script-answer>",
+        JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(function)) {
+        JSValue exception = JS_GetException(runtime->context);
+        JS_FreeValue(runtime->context, exception);
+        return;
+    }
+    JSValue arguments[2] = {
+        JS_NewInt32(runtime->context, (int32_t) shims),
+        JS_NewString(runtime->context, resolved)
+    };
+    if (JS_IsException(arguments[1])) {
+        JSValue exception = JS_GetException(runtime->context);
+        JS_FreeValue(runtime->context, exception);
+    } else {
+        (void) runtime_call_captured(runtime, function,
+                                     "refused script answer", 2, arguments,
+                                     NULL);
+        JS_FreeValue(runtime->context, arguments[1]);
+    }
+    JS_FreeValue(runtime->context, function);
+}
+
 bool script_runtime_dispatch_node(ScriptRuntime *runtime,
                                   lxb_dom_node_t *node,
                                   const char *event_type,
@@ -78,6 +158,8 @@ bool script_runtime_dispatch_node(ScriptRuntime *runtime,
         return false;
     }
     js_rt_runtime_arm_watchdog(runtime);
+    if (strcmp(event_type, "error") == 0)
+        js_rt_answer_refused_script(runtime, node);
     JSValue arguments[2] = {
         JS_NewInt64(runtime->context, handle),
         JS_NewString(runtime->context, event_type)
@@ -456,6 +538,12 @@ bool script_runtime_has_pending_mutations(const ScriptRuntime *runtime)
         || runtime->bridge.mutations.overflowed);
 }
 
+const ScriptMutationJournal *script_runtime_pending_journal(
+    const ScriptRuntime *runtime)
+{
+    return runtime == NULL ? NULL : &runtime->bridge.mutations;
+}
+
 bool script_runtime_has_pending_resource_mutations(const ScriptRuntime *runtime)
 {
     return runtime != NULL
@@ -530,6 +618,9 @@ bool script_runtime_consume_media_request(ScriptRuntime *runtime,
         snprintf(request->source, sizeof(request->source), "%s",
                  runtime->bridge.media_source);
     }
+    memcpy(request->title, runtime->bridge.media_title,
+           sizeof(request->title));
+    runtime->bridge.media_title[0] = '\0';
     budget_free(runtime->bridge.budget, runtime->bridge.media_source);
     runtime->bridge.media_source = NULL;
     runtime->bridge.media_requested = false;
@@ -680,6 +771,7 @@ void script_runtime_set_layout(ScriptRuntime *runtime, LayoutDocument *layout,
     runtime->bridge.layout_region_end = 0;
     runtime->geometry_incumbent = NULL;
     runtime->geometry_paint_stale = false;
+    runtime->geometry_refused = false;
     geometry_inputs_capture(runtime);
     runtime->bridge.viewport_height = viewport_height > 0
                                       ? viewport_height : 272;
@@ -750,9 +842,55 @@ bool script_runtime_take_geometry_layout(ScriptRuntime *runtime,
     return true;
 }
 
+/* Room that must come free before a refused geometry build is worth trying
+   again with unchanged inputs: the step its last refused request was. */
+#define GEOMETRY_REFUSAL_RETRY_ROOM ((size_t) 64u * 1024u)
+
+static void geometry_refusal_record(ScriptRuntime *runtime,
+                                    const ViewportContext *viewport)
+{
+    const DomBridge *bridge = &runtime->bridge;
+    runtime->geometry_refused = true;
+    runtime->geometry_refused_content_generation =
+        bridge->document->content_generation;
+    runtime->geometry_refused_style_generation = document_style_generation();
+    runtime->geometry_refused_sheet_generation =
+        bridge->stylesheet->build_generation;
+    runtime->geometry_refused_font_generation = font_generation();
+    runtime->geometry_refused_container_generation =
+        bridge->stylesheet->container_state_generation;
+    runtime->geometry_refused_css_width = viewport->css_width;
+    runtime->geometry_refused_css_height = viewport->css_height;
+    runtime->geometry_refused_room = budget_remaining(runtime->budget);
+}
+
+/* Whether the same build, on the same inputs, would only be refused again.
+   A page reading a box per element in a loop would otherwise pay a partial
+   layout per read, each ending at the same refused allocation. */
+static bool geometry_refusal_stands(const ScriptRuntime *runtime,
+                                    const ViewportContext *viewport)
+{
+    const DomBridge *bridge = &runtime->bridge;
+    return runtime->geometry_refused
+        && runtime->geometry_refused_content_generation
+            == bridge->document->content_generation
+        && runtime->geometry_refused_style_generation
+            == document_style_generation()
+        && runtime->geometry_refused_sheet_generation
+            == bridge->stylesheet->build_generation
+        && runtime->geometry_refused_font_generation == font_generation()
+        && runtime->geometry_refused_container_generation
+            == bridge->stylesheet->container_state_generation
+        && runtime->geometry_refused_css_width == viewport->css_width
+        && runtime->geometry_refused_css_height == viewport->css_height
+        && budget_remaining(runtime->budget)
+            < runtime->geometry_refused_room + GEOMETRY_REFUSAL_RETRY_ROOM;
+}
+
 bool script_runtime_flush_geometry_layout_reuse(
     ScriptRuntime *runtime, const ViewportContext *viewport,
-    ScriptGeometryReuseCallback prepare, void *opaque)
+    ScriptGeometryReuseCallback prepare, ScriptGeometryReuseRelease release,
+    void *opaque)
 {
     if (runtime == NULL || viewport == NULL) return false;
     DomBridge *bridge = &runtime->bridge;
@@ -763,6 +901,7 @@ bool script_runtime_flush_geometry_layout_reuse(
 #endif
         return true;
     }
+    if (geometry_refusal_stands(runtime, viewport)) return false;
 #ifndef TILEFINCH_NO_TRACE
     bool trace_geometry = tilefinch_trace_runtime_steps();
     uint64_t trace_begin = trace_geometry
@@ -808,13 +947,40 @@ bool script_runtime_flush_geometry_layout_reuse(
     uint64_t trace_prepared = trace_geometry
         ? tilefinch_platform_monotonic_time_us() : 0;
 #endif
-    if (!layout_build_context_reuse(runtime->geometry_layout, runtime->budget,
-            bridge->document, bridge->stylesheet, bridge->fonts,
-            bridge->images, viewport, reuse)) {
+    size_t failures = runtime->budget->failure_count;
+    size_t injections = runtime->budget->injected_failure_count;
+    bool built = layout_build_context_reuse(
+        runtime->geometry_layout, runtime->budget, bridge->document,
+        bridge->stylesheet, bridge->fonts, bridge->images, viewport, reuse);
+    bool refused = !built && !runtime->geometry_layout->performance.cancelled
+        && runtime->budget->failure_count > failures
+        && runtime->budget->injected_failure_count == injections;
+    if (!built) {
         layout_destroy(runtime->geometry_layout);
         memset(runtime->geometry_layout, 0, sizeof(*runtime->geometry_layout));
+    }
+    /* An accelerator must not cost the page its geometry. The cache's own
+       memory and growth can be what the build was refused for, and whether
+       the pressure check before the build had already evicted it can come
+       down to a few KiB. */
+    if (refused && reuse != NULL && release != NULL) {
+        release(opaque);
+        built = layout_build_context_reuse(
+            runtime->geometry_layout, runtime->budget, bridge->document,
+            bridge->stylesheet, bridge->fonts, bridge->images, viewport, NULL);
+        refused = !built && !runtime->geometry_layout->performance.cancelled
+            && runtime->budget->injected_failure_count == injections;
+        if (!built) {
+            layout_destroy(runtime->geometry_layout);
+            memset(runtime->geometry_layout, 0,
+                   sizeof(*runtime->geometry_layout));
+        }
+    }
+    if (!built) {
+        if (refused) geometry_refusal_record(runtime, viewport);
         return false;
     }
+    runtime->geometry_refused = false;
 #ifndef TILEFINCH_NO_TRACE
     if (trace_geometry) {
         const LayoutPerformance *p = &runtime->geometry_layout->performance;
@@ -852,7 +1018,7 @@ bool script_runtime_flush_geometry_layout(ScriptRuntime *runtime,
                                           const ViewportContext *viewport)
 {
     return script_runtime_flush_geometry_layout_reuse(
-        runtime, viewport, NULL, NULL);
+        runtime, viewport, NULL, NULL, NULL);
 }
 
 bool js_rt_geometry_opacity_write_begin(DomBridge *bridge, lxb_dom_node_t *node)
@@ -934,12 +1100,15 @@ void script_runtime_set_viewport(ScriptRuntime *runtime, int css_width,
     JS_FreeValue(runtime->context, global);
 }
 
-/* Records cover the <img> entries of one tracked image table (a delivered
-   record keeps its source so republication does not fire `load` again)
-   plus pending ones whose node has since left it. */
+/* A record keeps an <img>'s load: its source, so republication does not fire
+   `load` again, and its natural size, for script to read. It outlives the
+   image's table entry, because viewport admission removes entries far from the
+   reader and brings them back; to the page that image never stopped being
+   loaded. It ends with the element's connection or a change of source. */
 enum { SCRIPT_IMAGE_LOAD_LIMIT = 2u * IMAGE_TRACKED_NODE_LIMIT };
 
 /* Room for one more record: grow within the limit, else drop the oldest
+   delivered record of an image outside the table, or failing that the oldest
    delivered record (a later republication may then deliver it again). */
 static bool runtime_image_load_reserve(ScriptRuntime *runtime)
 {
@@ -958,14 +1127,24 @@ static bool runtime_image_load_reserve(ScriptRuntime *runtime)
             return true;
         }
     }
+    size_t oldest = count;
     for (size_t i = 0; i < count; i++) {
         if (runtime->image_load_states[i].pending) continue;
-        runtime->image_load_state_count--;
-        memmove(&runtime->image_load_states[i], &runtime->image_load_states[i + 1u],
-            (runtime->image_load_state_count - i) * sizeof(*runtime->image_load_states));
-        return true;
+        if (oldest == count) oldest = i;
+        if (images_find_node(runtime->bridge.images,
+                script_runtime_node_handle_resolve(
+                    runtime, runtime->image_load_states[i].handle)) == NULL) {
+            oldest = i;
+            break;
+        }
     }
-    return false;
+    if (oldest == count) return false;
+    runtime->image_load_state_count--;
+    memmove(&runtime->image_load_states[oldest],
+        &runtime->image_load_states[oldest + 1u],
+        (runtime->image_load_state_count - oldest)
+            * sizeof(*runtime->image_load_states));
+    return true;
 }
 
 /* The record for `handle`, or the record count. Tables are republished in
@@ -984,6 +1163,26 @@ static size_t runtime_image_load_find(const ScriptRuntime *runtime,
     return count;
 }
 
+bool js_rt_image_load_remembered(DomBridge *bridge, const lxb_dom_node_t *node,
+                                 int *natural_width, int *natural_height)
+{
+    ScriptRuntime *runtime = bridge == NULL ? NULL : bridge->host;
+    long handle = runtime == NULL || node == NULL ? 0
+        : (long) js_rt_bridge_find_node_handle(bridge, node);
+    if (handle == 0) return false;
+    size_t hint = 0;
+    size_t at = runtime_image_load_find(runtime, handle, &hint);
+    if (at == runtime->image_load_state_count) return false;
+    const ScriptImageLoadState *state = &runtime->image_load_states[at];
+    if (state->natural_width <= 0 || state->natural_height <= 0
+        || state->source_hash
+               != image_current_source_hash(bridge->stylesheet, node))
+        return false;
+    *natural_width = state->natural_width;
+    *natural_height = state->natural_height;
+    return true;
+}
+
 static void runtime_queue_image_loads(ScriptRuntime *runtime, ImageResources *images)
 {
     for (size_t i = 0; i < runtime->image_load_state_count;) {
@@ -991,7 +1190,10 @@ static void runtime_queue_image_loads(ScriptRuntime *runtime, ImageResources *im
         lxb_dom_node_t *node = script_runtime_node_handle_resolve_connected(
             runtime, state->handle);
         if (node != NULL && (state->pending
-            || images_find_node(runtime->bridge.images, node) != NULL)) {
+            || images_find_node(runtime->bridge.images, node) != NULL
+            || (state->delivered
+                && state->source_hash == image_current_source_hash(
+                       runtime->bridge.stylesheet, node)))) {
             i++;
         } else {
             if (state->pending) runtime->image_load_pending--;
@@ -1030,7 +1232,9 @@ static void runtime_queue_image_loads(ScriptRuntime *runtime, ImageResources *im
         ScriptImageLoadState *state = &runtime->image_load_states[at];
         if (!state->pending) runtime->image_load_pending++;
         ScriptImageLoadState queued = {.handle = handle,
-            .source_hash = image->source_hash, .pending = true};
+            .source_hash = image->source_hash,
+            .natural_width = image->source_width,
+            .natural_height = image->source_height, .pending = true};
         /* A replacement completion is a newly queued task, not the old source's
            place in line. Preserve order when pruning or replacing records. */
         memmove(state, state + 1,

@@ -12,6 +12,8 @@ typedef enum {
     MEDIA_DISCOVERY_MP4,
     MEDIA_DISCOVERY_HLS,
     MEDIA_DISCOVERY_WEBM,
+    /* An audio-only file: .m4a, or .mp3 (the audio open routes it by what
+       it answers, media_http_probe_route_audio). */
     MEDIA_DISCOVERY_AUDIO_MP4
 } MediaDiscoveryKind;
 

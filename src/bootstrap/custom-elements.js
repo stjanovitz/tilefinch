@@ -1,4 +1,6 @@
 (() => {
+  const trustedEvent =
+    __tilefinchRealmGlobal.__tilefinchTrustedEventShare.trustedEvent;
   /* Definitions made in any registry, main or scoped. */
   let definedAnywhere = 0;
   const definitions = new Map(),
@@ -77,9 +79,26 @@
         return true;
     return false;
   };
+  const wrapHandle = globalThis.__tilefinchWrap,
+    nativeCandidates = globalThis.__tilefinchCustomElementCandidates;
   const descendants = (root) => {
     const values = [],
       pending = [];
+    /* A native subtree lists only the elements a reaction can concern
+       (custom names, `is`, a custom state, shadow hosts): wrapping every
+       node, with a live child list each, cost Lit pages a wrapper per
+       inserted node. */
+    const start = root?.nodeType === Node.DOCUMENT_NODE
+      ? root.documentElement : root;
+    if (Number(start?.__handle) > 0 && typeof nativeCandidates === "function"
+        && typeof wrapHandle === "function") {
+      const handles = nativeCandidates(start.__handle);
+      for (let index = 0; index < handles.length && values.length < 4096; index++) {
+        const node = wrapHandle(handles[index]);
+        if (node) values.push(node);
+      }
+      return values;
+    }
     if (root instanceof Element) pending.push(root);
     else if (root === document && document.documentElement)
       pending.push(document.documentElement);
@@ -442,8 +461,11 @@
       definedAnywhere++;
       activeConstructors.set(constructor, name);
       definitionByConstructor.set(constructor, definition);
-      for (const node of descendants(scoped?.document || document))
-        upgradeOne(node, definitionForRegistry(node, activeDefinitions));
+      for (const node of descendants(scoped?.document || document)) {
+        const found = definitionForRegistry(node, activeDefinitions);
+        /* upgradeOne would look an undefined definition up a second time. */
+        if (found || scoped) upgradeOne(node, found);
+      }
       const waiter = activeWaiting.get(name);
       if (waiter) {
         activeWaiting.delete(name);
@@ -750,7 +772,7 @@
       checkValidity() {
         if (!this.willValidate || this.validity.valid) return true;
         this.__target.dispatchEvent(
-          __tilefinchTrustedEvent(
+          trustedEvent(
             new Event("invalid", { cancelable: true }),
           ),
         );
@@ -961,11 +983,74 @@
   delete globalThis.__tilefinchSheetRevision;
   delete globalThis.__tilefinchCssStatementEnds;
   delete globalThis.__tilefinchSetAdoptedSheets;
+  /* CSSOM rule objects live in the on-demand cssom-rules.js module, loaded
+     the first time a page reads cssRules or names a rule interface, so pages
+     that never inspect rules pay nothing at startup. */
+  const makeTextStyle = globalThis.__tilefinchMakeTextStyle,
+    ensureRuleBootstrap = __tilefinchRealmGlobal.__tilefinchEnsureRuleBootstrap,
+    assertSelector = __tilefinchRealmGlobal.__tilefinchAssertSelector;
+  delete globalThis.__tilefinchMakeTextStyle;
+  const ruleToken = {},
+    ruleInterfaces = [
+      "CSSRule", "CSSStyleRule", "CSSGroupingRule", "CSSConditionRule",
+      "CSSMediaRule", "CSSSupportsRule", "CSSImportRule", "CSSFontFaceRule",
+      "CSSKeyframesRule", "CSSKeyframeRule",
+    ];
+  let ruleModel = null;
+  const ruleList = (rules) =>
+      Object.defineProperty(rules, "item", {
+        configurable: true,
+        value: (index) => rules[Number(index) >>> 0] ?? null,
+      }),
+    /* One rule: a block whose braces balance, or an at-rule statement. */
+    validRuleText = (rule) => {
+      const text = rule.trim(), open = text.indexOf("{"),
+        close = text.lastIndexOf("}");
+      if (open < 0) return text[0] === "@" && text.endsWith(";");
+      if (open === 0 && text[0] !== "@" || close < open) return false;
+      let depth = 0;
+      for (const char of text) {
+        if (char === "{") depth++;
+        else if (char === "}" && --depth < 0) return false;
+      }
+      return depth === 0;
+    },
+    rules = () => {
+      if (ruleModel) return ruleModel;
+      ensureRuleBootstrap();
+      const create = globalThis.__tilefinchCreateRuleModel;
+      delete globalThis.__tilefinchCreateRuleModel;
+      ruleModel = create(ruleToken, makeTextStyle, splitConstructedRules,
+        constructedSheetTextLimit, ruleList, validRuleText, assertSelector);
+      for (const name of ruleInterfaces)
+        Object.defineProperty(globalThis, name, {
+          configurable: true,
+          writable: true,
+          value: ruleModel.model[name],
+        });
+      return ruleModel;
+    },
+    parseRule = (text, sheet, parent) => rules().parseRule(text, sheet, parent);
+  for (const name of ruleInterfaces)
+    Object.defineProperty(globalThis, name, {
+      configurable: true,
+      get() {
+        return rules().model[name];
+      },
+      set(value) {
+        rules();
+        Object.defineProperty(globalThis, name, {
+          configurable: true,
+          writable: true,
+          value,
+        });
+      },
+    });
   class CSSStyleSheet {
     constructor() {
       this.__rules = [];
       this.__textLength = 0;
-      this.__cssRules = [];
+      this.__cssRules = ruleList([]);
       this.__constructed = true;
       /* The native sheet element, once adopted. */
       this.__node = null;
@@ -990,7 +1075,7 @@
     }
     /* Makes `rules` the sheet's rules. The native copy is replaced first,
        so a refusal leaves the sheet exactly as it was. */
-    __commit(rules) {
+    __commit(rules, keepRuleObjects = false) {
       const text = rules.join("\n");
       const nativeOwner = this.__constructed ? this.__node
         : this.ownerNode instanceof HTMLStyleElement ? this.ownerNode : null;
@@ -1009,8 +1094,10 @@
          replaceSync: a framework sheet of thousands of rules is usually
          applied without being inspected. The list is live, so once read
          it is kept current. */
-      this.__cssRulesStale = true;
-      if (this.__cssRulesRead) this.cssRules;
+      if (!keepRuleObjects) {
+        this.__cssRulesStale = true;
+        if (this.__cssRulesRead) this.cssRules;
+      }
       /* Link sheets retain their existing reflection path. Their response
          URL, rel/href changes and source fetching are a separate lifetime
          contract, not an inline CSSOM source. */
@@ -1051,20 +1138,42 @@
       if (this.__cssRulesStale) {
         this.__cssRulesStale = false;
         this.__cssRules.length = 0;
-        for (const cssText of this.__rules) {
-          const atRule = cssText.trimStart().startsWith("@"),
-            open = cssText.indexOf("{");
-          this.__cssRules.push({
-            cssText,
-            parentStyleSheet: this,
-            type: atRule ? 4 : 1,
-            selectorText: !atRule && open >= 0
-              ? cssText.slice(0, open).trim()
-              : undefined,
-          });
-        }
+        for (const cssText of this.__rules)
+          this.__cssRules.push(parseRule(cssText, this, null));
       }
       return this.__cssRules;
+    }
+    get rules() {
+      return this.cssRules;
+    }
+    get type() {
+      return "text/css";
+    }
+    get title() {
+      return null;
+    }
+    get ownerRule() {
+      return null;
+    }
+    get parentStyleSheet() {
+      return null;
+    }
+    /* A rule object changed its own text (CSSRule.__changed). */
+    __replaceRule(rule) {
+      const index = this.__cssRules.indexOf(rule);
+      if (index < 0) return;
+      this.__assertWholeAuthorSheet();
+      const rules = this.__rules.slice();
+      rules[index] = rule.__text;
+      this.__commit(rules, true);
+    }
+    addRule(selector = "undefined", style = "undefined", index) {
+      this.insertRule(String(selector) + " { " + String(style) + " }",
+        index === undefined ? this.__rules.length : index);
+      return -1;
+    }
+    removeRule(index = 0) {
+      this.deleteRule(index);
     }
     /* An author <style> past the text bound is reflected only in part;
        writing that part back would delete the rest of the element. */
@@ -1101,6 +1210,8 @@
           "insertRule requires exactly one rule",
           "SyntaxError",
         );
+      if (!validRuleText(parsed[0]))
+        throw new DOMException("Invalid CSS rule", "SyntaxError");
       /* The text bound is the one replaceSync applies a prefix under. One
          rule has no prefix to apply: refuse it whole so cssRules always
          lists exactly the rules the cascade holds. */
@@ -1193,20 +1304,12 @@
             "Adopted stylesheet limit reached",
             "QuotaExceededError",
           );
-        const unique = new Set();
-        for (const sheet of next) {
+        for (const sheet of next)
           if (!(sheet instanceof CSSStyleSheet) || !sheet.__constructed)
             throw new DOMException(
               "Only constructed stylesheets can be adopted",
               "NotAllowedError",
             );
-          if (unique.has(sheet))
-            throw new DOMException(
-              "A stylesheet cannot be adopted twice",
-              "NotAllowedError",
-            );
-          unique.add(sheet);
-        }
         /* The document and connected shadow roots style the page: their
            lists go to the native registry (rootHandle 0 is the document).
            Any other document, and a shadow root without a native carrier,
@@ -1218,21 +1321,84 @@
               ? target.__handle
               : undefined;
         if (rootHandle !== undefined) {
-          const handles = next.map((sheet) => sheet.__adoptionNode().__handle);
+          /* A sheet listed twice applies once, at its last place: the
+             cascade outcome of applying it at both. */
+          const handles = [], seen = new Set();
+          for (let at = next.length - 1; at >= 0; at--)
+            if (!seen.has(next[at])) {
+              seen.add(next[at]);
+              handles.unshift(next[at].__adoptionNode().__handle);
+            }
           if (!nativeSetAdopted(rootHandle, handles))
             throw new DOMException(
               "Adopted stylesheet limit reached",
               "QuotaExceededError",
             );
         }
-        adoptedByTarget.set(target, next.slice());
+        const list = adoptedList(target);
+        list.sheets.length = 0;
+        for (const sheet of next) list.sheets[list.sheets.length] = sheet;
+      },
+      arrayIndex = (key) =>
+        typeof key === "string" && /^(?:0|[1-9][0-9]{0,9})$/.test(key) &&
+        Number(key) < 4294967295,
+      /* One edit of the list, checked and registered as a whole list. An
+         index past the end and a longer length are refused, as Web IDL's
+         ObservableArray does. */
+      editAdopted = (target, sheets, key, value) => {
+        const next = sheets.slice();
+        if (key === "length") {
+          const length = Number(value);
+          if (length !== length >>> 0)
+            throw new RangeError("Invalid array length");
+          if (length > next.length) return false;
+          next.length = length;
+        } else {
+          if (Number(key) > next.length) return false;
+          next[Number(key)] = value;
+        }
+        setAdopted(target, next);
+        return true;
+      },
+      /* The same array every read, as an ObservableArray: push, splice,
+         index writes and length changes go through setAdopted. */
+      adoptedList = (target) => {
+        let list = adoptedByTarget.get(target);
+        if (list) return list;
+        const sheets = [];
+        list = {
+          sheets,
+          view: new Proxy(sheets, {
+            set(array, key, value, receiver) {
+              if (key === "length" || arrayIndex(key))
+                return editAdopted(target, array, key, value);
+              return Reflect.set(array, key, value, receiver === list.view
+                ? array : receiver);
+            },
+            defineProperty(array, key, descriptor) {
+              if (key !== "length" && !arrayIndex(key))
+                return Reflect.defineProperty(array, key, descriptor);
+              return "value" in descriptor &&
+                editAdopted(target, array, key, descriptor.value);
+            },
+            deleteProperty(array, key) {
+              if (!arrayIndex(key))
+                return Reflect.deleteProperty(array, key);
+              if (Number(key) >= array.length) return true;
+              return Number(key) === array.length - 1 &&
+                editAdopted(target, array, "length", array.length - 1);
+            },
+          }),
+        };
+        adoptedByTarget.set(target, list);
+        return list;
       };
     for (const prototype of [Document.prototype, ShadowRoot.prototype])
       Object.defineProperty(prototype, "adoptedStyleSheets", {
         configurable: true,
         enumerable: true,
         get() {
-          return (adoptedByTarget.get(this) || []).slice();
+          return adoptedList(this).view;
         },
         set(value) {
           setAdopted(this, value);
@@ -1262,19 +1428,8 @@
        failed; wrapping every node must not pay the registry lookup. */
     if (!definedAnywhere) return node;
     if (globalThis.__tilefinchCustomElementCreationSuppressed) return node;
-    const state = __tilefinchGetCustomState(node.__handle);
-    /* Only a hyphenated name or an is attribute can have a definition; an
-       element neither custom (3) nor failed (1) without one has nothing to
-       restore, so spare every wrapper creation the registry lookup. */
-    if (
-      state !== 3 &&
-      state !== 1 &&
-      !node.__tilefinchCustomElementDefinition &&
-      !String(node.tagName || "").includes("-") &&
-      !node.getAttribute?.("is")
-    )
-      return node;
-    const definition = definitionFor(node);
+    const state = __tilefinchGetCustomState(node.__handle),
+      definition = definitionFor(node);
     if (state === 3 && definition) {
       globalThis.__tilefinchPrepareNativePrototype?.(
         node, definition.constructor.prototype);
@@ -1296,6 +1451,11 @@
      * has a definition; scoped frame registries remain eligible separately.
      */
     if (!definitions.size && root?.ownerDocument === document) return;
+    /* Most insertions hold no candidate: spare them the list and its walk. */
+    if (root?.nodeType !== Node.DOCUMENT_NODE && Number(root?.__handle) > 0
+        && typeof nativeCandidates === "function"
+        && !nativeCandidates(root.__handle, true))
+      return;
     for (const node of descendants(root)) {
       globalThis.__tilefinchShadowRootForHost?.(node, true);
       const definition = definitionFor(node);
@@ -1396,20 +1556,19 @@
     newValue,
     namespace = null,
   ) => {
-    const lowerName = String(name).toLowerCase(),
-      localName = String(node?.localName || "").toLowerCase();
-    if (
-      namespace === null &&
-      ((localName === "form" && lowerName === "id") ||
-        (localName === "fieldset" && lowerName === "disabled"))
-    )
-      for (const candidate of descendants(
-        localName === "fieldset" ? node : document,
-      )) {
-        const candidateDefinition = definitionFor(candidate);
-        synchronizeFormOwner(candidate, candidateDefinition);
-        synchronizeDisabled(candidate, candidateDefinition);
-      }
+    const lowerName = String(name).toLowerCase();
+    if (namespace === null && (lowerName === "id" || lowerName === "disabled")) {
+      const localName = String(node?.localName || "").toLowerCase();
+      if ((localName === "form" && lowerName === "id") ||
+          (localName === "fieldset" && lowerName === "disabled"))
+        for (const candidate of descendants(
+          localName === "fieldset" ? node : document,
+        )) {
+          const candidateDefinition = definitionFor(candidate);
+          synchronizeFormOwner(candidate, candidateDefinition);
+          synchronizeDisabled(candidate, candidateDefinition);
+        }
+    }
     if (oldValue === newValue || node.__tilefinchCustomElementState !== "custom")
       return;
     const pendingAdoption = pendingAdoptions.get(node);
@@ -1551,7 +1710,7 @@
     return node;
   };
   document.createElement = (tag, options = undefined) => {
-    const localName = String(tag).toLowerCase(),
+    const localName = (tag = String(tag)).toLowerCase(),
       is =
         options && typeof options === "object" && options.is !== undefined
           ? String(options.is).toLowerCase()
@@ -1561,8 +1720,11 @@
      * Keep ordinary element creation on the native bridge. Suppressing the
      * wrapper's restore hook is needed only while constructing a known custom
      * element and needlessly changes handle/cache lifecycle for every div.
+     * The bridge folds A-Z only, as the standard does; localName is just the
+     * lookup key, and no custom element name holds a non-ASCII code point
+     * ("\u212a" lower-cases to "k").
      */
-    if (!definition) return nativeCreateElement(localName);
+    if (!definition || /[^\0-\x7f]/.test(tag)) return nativeCreateElement(tag);
     const node = createUnupgraded(localName);
     if (is) node.setAttribute("is", is);
     return upgradeOne(node, definition, true);
@@ -1620,13 +1782,13 @@
     scopedRegistryStates.set(frameRegistry, state);
     registryByDocument.set(frameDocument, frameRegistry);
     frameDocument.createElement = (tag, options = undefined) => {
-      const localName = String(tag).toLowerCase(),
+      const localName = (tag = String(tag)).toLowerCase(),
         is =
           options && typeof options === "object" && options.is !== undefined
             ? String(options.is).toLowerCase()
             : "",
         definition = state.definitions.get(is || localName);
-      if (!definition) return nativeCreate(localName);
+      if (!definition || /[^\0-\x7f]/.test(tag)) return nativeCreate(tag);
       const node = createRaw(localName);
       if (is) node.setAttribute("is", is);
       return upgradeOne(node, definition, true);

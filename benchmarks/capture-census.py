@@ -22,6 +22,7 @@ import sys
 import time
 from urllib.parse import urljoin, urlsplit
 
+import trace_document
 from visual_scenario import load_manifest, trace_digest, inline_tracker_evidence_ready, cosmetic_evidence_ready
 
 HERE = Path(__file__).resolve().parent
@@ -259,37 +260,17 @@ def source_response_barrier(trace: Path, url: str) -> str | None:
     responsible for qualification. Never return a redirect URL or cookie.
     """
     target = url.split('#', 1)[0]
-    records = sorted(trace.glob('[0-9][0-9][0-9][0-9].meta'))
-    if len(records) > 4096:
-        raise ValueError('source response inventory exceeds its bound')
-    for path in records:
-        if path.is_symlink() or not path.is_file() or path.stat().st_size > 1024 * 1024:
-            raise ValueError('source response metadata is not a bounded regular file')
-        fields = {}
-        for line in path.read_text(encoding='utf-8').splitlines():
-            if not line or line.startswith('#'):
-                continue
-            key, separator, value = line.partition('=')
-            if not separator or not key or key in fields:
-                raise ValueError('invalid source response metadata')
-            fields[key] = value
-        if fields.get('url') != target or fields.get('method') != 'GET':
-            continue
-        headers = {}
-        for key, value in fields.items():
-            if re.fullmatch(r'response-header-[0-9]+', key):
-                name, separator, content = value.partition(':')
-                if separator:
-                    headers.setdefault(name.strip().lower(), []).append(content.strip())
-        if (any(v.lower() == 'challenge' for v in headers.get('x-amzn-waf-action', []))
-                or any(v.lower() == 'challenge' for v in headers.get('cf-mitigated', []))):
-            return 'source-access-challenge'
-        if fields.get('status') in ('301', '302', '303', '307', '308'):
-            for location in headers.get('location', []):
-                redirect = urlsplit(urljoin(target, location))
-                if re.search(r'/(?:login|signin|sign-in)(?:/|$)', redirect.path, re.I):
-                    return 'source-signin-required'
+    fields = trace_document.document_response(trace, target)
+    if fields is None:
         return None
+    headers = trace_document.response_headers(fields)
+    if (any(v.lower() == 'challenge' for v in headers.get('x-amzn-waf-action', []))
+            or any(v.lower() == 'challenge' for v in headers.get('cf-mitigated', []))):
+        return 'source-access-challenge'
+    if fields.get('status') in trace_document.REDIRECT_STATUSES:
+        for location in headers.get('location', []):
+            if trace_document.signin_redirect(target, location):
+                return 'source-signin-required'
     return None
 
 

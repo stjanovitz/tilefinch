@@ -103,6 +103,18 @@ static bool component_unload_module(PspSwdecComponent *component)
     return true;
 }
 
+/* A load or start failed: keep the refusal, or return to COLD so a later
+   open tries again (tilefinch_swdec_component_retry_allowed). */
+static void component_load_failed(
+    PspSwdecComponent *component, PspSwdecComponentFailure failure)
+{
+    component->failure = failure;
+    component->runtime_failures++;
+    component->state = tilefinch_swdec_component_retry_allowed(
+            failure, component->module_id < 0, component->runtime_failures)
+        ? PSP_SWDEC_COMPONENT_COLD : PSP_SWDEC_COMPONENT_FAILED;
+}
+
 static void component_failed_message(
     const PspSwdecComponent *component,
     char *error, size_t error_size)
@@ -193,8 +205,7 @@ static bool psp_swdec_component_load(
     int module = sceKernelLoadModule(path, 0, NULL);
     if (module < 0) {
         component->last_native_error = module;
-        component->state = PSP_SWDEC_COMPONENT_FAILED;
-        component->failure = PSP_SWDEC_COMPONENT_FAILURE_RUNTIME;
+        component_load_failed(component, PSP_SWDEC_COMPONENT_FAILURE_RUNTIME);
         component_error(error, error_size,
                         "software decoder load failed (0x%08x)",
                         (unsigned) module);
@@ -259,11 +270,12 @@ static bool psp_swdec_component_load(
     if (start_failure != TILEFINCH_SWDEC_FAILURE_NONE) {
         /* A firmware refusal to start the module (memory for its start
            thread, most often) is not a sign of a stale component: only
-           module_start's own refusal or a foreign API table are. */
-        component->state = PSP_SWDEC_COMPONENT_FAILED;
-        component->failure = start_failure;
+           module_start's own refusal or a foreign API table are. The
+           former is tried again on a later open once the module is
+           unloaded. */
         memset(&component->api, 0, sizeof(component->api));
         (void) component_unload_module(component);
+        component_load_failed(component, start_failure);
         component->last_native_error = result < 0 ? result : status;
         if (start_failure == TILEFINCH_SWDEC_FAILURE_RUNTIME)
             component_error(error, error_size,
@@ -274,6 +286,7 @@ static bool psp_swdec_component_load(
         return false;
     }
     component->state = PSP_SWDEC_COMPONENT_LOADED;
+    component->runtime_failures = 0;
     printf("tilefinch-swdec: event=component-loaded module=0x%08x\n",
            (unsigned) module);
     return true;

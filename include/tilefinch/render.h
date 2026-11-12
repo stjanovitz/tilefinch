@@ -19,7 +19,13 @@
 #define TILEFINCH_IMAGE_CACHE_ENTRIES 4
 #define TILEFINCH_DECODED_IMAGE_CACHE_BYTES (512u * 1024u)
 #define TILEFINCH_SCALED_IMAGE_CACHE_BYTES (512u * 1024u)
+/* The overflow geometry accelerator may use the base bytes plus the
+   per-box bytes for each layout node box, up to the maximum; past that,
+   or when the Budget refuses it, overflow-clipped content paints per
+   frame. */
 #define TILEFINCH_OVERFLOW_CACHE_BYTES (256u * 1024u)
+#define TILEFINCH_OVERFLOW_CACHE_BYTES_PER_BOX 32u
+#define TILEFINCH_OVERFLOW_CACHE_MAX_BYTES (1024u * 1024u)
 
 _Static_assert(TILEFINCH_GLYPH_CACHE_ENTRIES % TILEFINCH_GLYPH_CACHE_WAYS == 0,
                "glyph cache entries must divide into complete sets");
@@ -271,6 +277,14 @@ typedef struct {
     size_t glyph_cache_count;
     size_t glyph_cache_bytes;
     size_t glyph_cache_hits;
+    /* While a moved copy of a display-list command (fixed, sticky or
+       overflow-scrolled) is rasterized: its source index plus one, else 0.
+       Text finds the source's visual-order glyphs from it. */
+    size_t raster_copy_source;
+    /* Bidi commands examined to find a moved copy's glyphs by text. */
+    uint64_t bidi_copy_scans;
+    /* Glyphs a text raster looked at (acquired from the glyph cache). */
+    uint64_t text_glyph_steps;
     size_t glyph_cache_misses;
     size_t glyph_cache_evictions;
     size_t scaled_image_hits;
@@ -338,6 +352,12 @@ typedef struct {
     uint64_t command_candidates;
     uint64_t stroke_pixel_tests; /* Host/validation only; zero in ordinary PSP. */
     struct RenderOverflowCache *overflow_cache;
+    /* The fixed and sticky commands in paint order, built once per layout,
+       so those passes do not walk the whole display list each frame. */
+    struct RenderOverlayIndex *overlay_index;
+    size_t overlay_index_builds;
+    /* Display-list entries the fixed and sticky passes examined. */
+    uint64_t overlay_commands_visited;
     struct RenderGradientCache *gradient_cache;
     size_t gradient_lut_hits;
     size_t gradient_lut_builds;
@@ -433,6 +453,8 @@ typedef struct {
     uint64_t max_startup_visual_slice_us;
     uint64_t max_startup_visual_unit_us;
     int last_frame_scroll_y;
+    /* The page's furthest position when that frame was composed. */
+    int last_frame_maximum_scroll;
     int last_frame_viewport_width;
     int last_frame_viewport_height;
     bool last_frame_scroll_valid;
@@ -509,6 +531,12 @@ void tile_cache_destroy(TileCache *cache);
 bool tile_cache_render_frame(TileCache *cache, int scroll_y,
                              int viewport_width, int viewport_height,
                              const char *output_path);
+/* The resident tiles at scroll_y (device pixels) with a checkerboard for the
+   rest, and nothing else: no layout is read, so author work may be changing
+   the page. Overlays and the scroll indicator return with the next ordinary
+   frame, which this forces to compose everything. */
+bool tile_cache_compose_resident(TileCache *cache, int scroll_y,
+                                 int viewport_width, int viewport_height);
 /* An opaque, simply transformed canvas can replace its rectangle in the prior
    page pixels directly and then replay later page overlays. More complex
    canvas composition returns NOT_APPLICABLE and retains the ordinary tile

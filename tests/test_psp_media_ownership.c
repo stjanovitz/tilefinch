@@ -203,8 +203,150 @@ static void *prepared_worker(void *opaque)
     return NULL;
 }
 
+/* A fake audio service for psp_media_audio_release_bounded: answers busy a
+   given number of times, then the final status; time advances only by the
+   loop's own sleeps. */
+typedef struct {
+    unsigned busy_answers;
+    int busy_status;
+    int final_status;
+    unsigned calls;
+} FakeAudioRelease;
+static uint32_t fake_audio_clock_us;
+static int fake_audio_release(void *context)
+{
+    FakeAudioRelease *fake = context;
+    fake->calls++;
+    if (fake->busy_answers != 0) {
+        fake->busy_answers--;
+        return fake->busy_status;
+    }
+    return fake->final_status;
+}
+static uint32_t fake_audio_now_us(void) { return fake_audio_clock_us; }
+static int fake_audio_delay_us(uint32_t us)
+{
+    fake_audio_clock_us += us;
+    return 0;
+}
+
+static int test_audio_channel_release_retries_busy(void)
+{
+    FakeAudioRelease fake = {0};
+    PspMediaAudioReleaseOps ops = {
+        fake_audio_release, &fake, fake_audio_now_us, fake_audio_delay_us
+    };
+    int status = 0;
+    unsigned attempts = 0;
+    uint32_t waited = 0;
+    /* Busy twice (standard channel), then released. */
+    fake = (FakeAudioRelease) {2u, (int) PSP_MEDIA_AUDIO_OUTPUT_BUSY, 0, 0};
+    fake_audio_clock_us = 1000u;
+    CHECK(psp_media_audio_release_bounded(
+              &ops, PSP_MEDIA_AUDIO_CHANNEL_DRAIN_WAIT_US,
+              &status, &attempts, &waited)
+          && status == 0 && attempts == 3u && fake.calls == 3u);
+    /* The SRC channel's queue-busy code is retried the same way. */
+    fake = (FakeAudioRelease) {
+        5u, (int) PSP_MEDIA_AUDIO_SRC_QUEUE_BUSY, 0, 0};
+    CHECK(psp_media_audio_release_bounded(
+              &ops, PSP_MEDIA_AUDIO_CHANNEL_DRAIN_WAIT_US,
+              &status, &attempts, &waited)
+          && attempts == 6u);
+    /* Nothing reserved any more counts as released. */
+    fake = (FakeAudioRelease) {
+        0u, 0, (int) PSP_MEDIA_AUDIO_NOT_RESERVED, 0};
+    CHECK(psp_media_audio_release_bounded(
+              &ops, PSP_MEDIA_AUDIO_CHANNEL_DRAIN_WAIT_US,
+              &status, &attempts, &waited)
+          && attempts == 1u);
+    /* Busy for ever: given up at the drain limit, not before, not never. */
+    fake = (FakeAudioRelease) {
+        UINT32_MAX, (int) PSP_MEDIA_AUDIO_OUTPUT_BUSY, 0, 0};
+    CHECK(!psp_media_audio_release_bounded(
+              &ops, PSP_MEDIA_AUDIO_CHANNEL_DRAIN_WAIT_US,
+              &status, &attempts, &waited)
+          && (uint32_t) status == PSP_MEDIA_AUDIO_OUTPUT_BUSY
+          && waited >= PSP_MEDIA_AUDIO_CHANNEL_DRAIN_WAIT_US
+          && attempts <= PSP_MEDIA_AUDIO_CHANNEL_DRAIN_WAIT_US
+                 / PSP_MEDIA_AUDIO_CHANNEL_POLL_US + 2u);
+    /* Any other failure is final at once. */
+    fake = (FakeAudioRelease) {0u, 0, (int) 0x80260003u, 0};
+    CHECK(!psp_media_audio_release_bounded(
+              &ops, PSP_MEDIA_AUDIO_CHANNEL_DRAIN_WAIT_US,
+              &status, &attempts, &waited)
+          && attempts == 1u);
+    /* A zero limit is one attempt, as the firmware backend's wake-up uses. */
+    fake = (FakeAudioRelease) {1u, (int) PSP_MEDIA_AUDIO_OUTPUT_BUSY, 0, 0};
+    CHECK(!psp_media_audio_release_bounded(
+              &ops, 0, &status, &attempts, &waited)
+          && attempts == 1u);
+    CHECK(!psp_media_audio_release_bounded(
+              NULL, 0, &status, &attempts, &waited));
+    return 0;
+}
+
+/* MB-04 / MB-08: the end-of-pump flush promotes and dispatches only what the
+   24-block PCM queue can take. The report's case: depth 23, a deferred unit
+   and a second one the submit path held back for room; the flush used to
+   promote both and the worker wrote a 25th block over the oldest unplayed
+   one. */
+static int test_audio_flush_respects_queue_room(void)
+{
+    const uint32_t slots = PSP_MEDIA_AUDIO_QUEUE_SLOTS;
+    CHECK(psp_media_audio_flush_promote_count(2u, slots - 1u, 1u) == 1u);
+    CHECK(psp_media_audio_flush_promote_count(2u, slots, 1u) == 0u);
+    CHECK(psp_media_audio_flush_promote_count(2u, slots + 3u, 1u) == 0u);
+    CHECK(psp_media_audio_flush_promote_count(2u, slots - 2u, 1u) == 2u);
+    CHECK(psp_media_audio_flush_promote_count(1u, slots - 1u, 1u) == 1u);
+    CHECK(psp_media_audio_flush_promote_count(4u, 0u, 1u) == 2u);
+    CHECK(psp_media_audio_flush_promote_count(0u, 0u, 1u) == 0u);
+    /* Layer III: two blocks a frame. */
+    CHECK(psp_media_audio_flush_promote_count(2u, slots - 4u, 2u) == 2u);
+    CHECK(psp_media_audio_flush_promote_count(2u, slots - 3u, 2u) == 1u);
+    CHECK(psp_media_audio_flush_promote_count(2u, slots - 1u, 2u) == 0u);
+    /* The worker's own test for the next unit. */
+    CHECK(psp_media_audio_unit_fits_queue(slots - 1u, false)
+          && !psp_media_audio_unit_fits_queue(slots, false)
+          && !psp_media_audio_unit_fits_queue(slots + 1u, false));
+    CHECK(psp_media_audio_unit_fits_queue(slots - 3u, true)
+          && !psp_media_audio_unit_fits_queue(slots - 2u, true));
+
+    /* A model pump: every visit submits AAC units as the submit path does,
+       flushes at the end as psp_media_flush_staged_audio does, and the
+       output thread plays one block on some visits. The flush alone (the
+       worker guard is not modelled) must keep the queue within its slots. */
+    uint32_t depth = slots - 3u;
+    unsigned pending = 0, staged = 0;
+    for (unsigned visit = 0; visit < 2000u; visit++) {
+        unsigned arrivals = 1u + (visit % 3u);
+        for (unsigned i = 0; i < arrivals; i++) {
+            if (depth >= slots || pending >= PSP_MEDIA_AUDIO_PENDING_SLOTS)
+                break;
+            pending++;
+            if (pending < PSP_MEDIA_AUDIO_BATCH_MAXIMUM) continue;
+            if (depth + PSP_MEDIA_AUDIO_BATCH_MAXIMUM > slots) continue;
+            if (staged != 0) continue;
+            staged = PSP_MEDIA_AUDIO_BATCH_MAXIMUM;
+            pending -= staged;
+            depth += staged;
+            staged = 0;
+            CHECK(depth <= slots);
+        }
+        unsigned promote =
+            psp_media_audio_flush_promote_count(pending, depth, 1u);
+        pending -= promote;
+        depth += promote;
+        CHECK(depth <= slots);
+        if (visit % 4u != 3u && depth > 0) depth--;
+    }
+    return 0;
+}
+
 int main(void)
 {
+    if (test_audio_channel_release_retries_busy() != 0) return 1;
+    if (test_audio_flush_respects_queue_room() != 0) return 1;
     CHECK(!psp_media_startup_preroll_ready(0u));
     CHECK(!psp_media_startup_preroll_ready(1u));
     CHECK(psp_media_startup_preroll_ready(PSP_MEDIA_SURFACE_SLOTS));

@@ -245,6 +245,23 @@ bool browser_profile_load_without_content_blocker_sites(
     BrowserProfile *profile, const char *path);
 bool browser_profile_save(const BrowserProfile *profile, const char *path);
 
+/* A 64-bit FNV-1a hash and the length of the profile body a save writes
+   (everything before the END footer). Equal fingerprints mean a save would
+   write the same bytes. */
+typedef struct {
+    uint64_t hash;
+    size_t length;
+} BrowserProfileFingerprint;
+
+/* Formats the profile in memory only: no file is touched. */
+bool browser_profile_fingerprint(const BrowserProfile *profile,
+                                 BrowserProfileFingerprint *fingerprint);
+/* browser_profile_save, also reporting the fingerprint of what it wrote
+   (zeroed when the save fails). */
+bool browser_profile_save_fingerprinted(
+    const BrowserProfile *profile, const char *path,
+    BrowserProfileFingerprint *written);
+
 unsigned browser_profile_ui_scale(const BrowserProfile *profile);
 unsigned browser_profile_page_font_percent(const BrowserProfile *profile);
 /* Settings -> Appearance -> Web pages text sizes, smallest first. */

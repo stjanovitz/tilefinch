@@ -346,10 +346,10 @@ bool psp_open_keyboard_for_late_script_focus(PspApp *app)
     printf("tilefinch-script-text-focus: adopted=1\n");
 #endif
     (void) psp_engine_views_refresh(app->views, engine);
-    bool submit_focused = false;
+    /* This keyboard does not submit: no activation follows it. */
     if (psp_replace_focused_text(
             engine, app->views->frame, &app->process->presentation.ui,
-            &app->process->text_input, false, &submit_focused))
+            &app->process->text_input, false, NULL))
         (void) psp_engine_views_refresh(app->views, engine);
     interactive->previous_buttons = 0;
     return true;
@@ -392,6 +392,13 @@ bool psp_replace_focused_text(
     if (!accepted
         || !browser_engine_replace_text(
                engine, replacement, strlen(replacement))) return false;
+    /* Done on its form's only text field is Enter, as on a phone; R+START
+       is Enter on any single-line field. Asked after the edit, whose
+       input and change events may have changed the form. */
+    if (submit_requested != NULL && !voice_requested && !requested_submit
+        && request.allow_submit
+        && browser_engine_keyboard_done_submits(engine))
+        requested_submit = true;
     if (submit_requested != NULL) *submit_requested = requested_submit;
     if (!requested_submit) {
         psp_ui_show_status(
@@ -454,6 +461,10 @@ bool psp_run_initial_page_load(
 #endif
     PspNavigationWatchdog watchdog;
     psp_navigation_watchdog_start(&watchdog, started_us, 0);
+    /* A page dialog's open time is not a stall; and the Circle that
+       dismissed one, still held, is not a cancel. */
+    uint64_t dialog_open_us = psp_page_dialog_open_us();
+    bool circle_released = true;
     BrowserNavigationJobStatus status = BROWSER_NAVIGATION_JOB_PENDING;
     bool provisional_dump_attempted = false;
     bool provisional_dumped = false;
@@ -462,7 +473,10 @@ bool psp_run_initial_page_load(
     while (status == BROWSER_NAVIGATION_JOB_PENDING) {
         psp_log_heartbeat();
         SceCtrlData pad = {0};
-        if (sceCtrlPeekBufferPositive(&pad, 1) > 0
+        bool sampled = sceCtrlPeekBufferPositive(&pad, 1) > 0;
+        if (!sampled || (pad.Buttons & PSP_CTRL_CIRCLE) == 0)
+            circle_released = true;
+        if (sampled && circle_released
             && (pad.Buttons & PSP_CTRL_CIRCLE) != 0) {
             user_cancelled = true;
             browser_engine_cancel_navigation(
@@ -526,6 +540,12 @@ bool psp_run_initial_page_load(
         psp_ui_set_loading(
             ui, true, (int) metrics.completion_per_mille);
         uint64_t now_us = (uint64_t) sceKernelGetSystemTimeWide();
+        if (psp_page_dialog_open_us() != dialog_open_us) {
+            psp_navigation_watchdog_pause(
+                &watchdog, psp_page_dialog_open_us() - dialog_open_us);
+            dialog_open_us = psp_page_dialog_open_us();
+            circle_released = false;
+        }
         if (status == BROWSER_NAVIGATION_JOB_PENDING
             && psp_navigation_watchdog_expired(
                    &watchdog, now_us, metrics.load.progress_units)) {
@@ -777,10 +797,12 @@ BrowserSessionPersistenceLimits psp_site_data_limits(
 bool psp_site_data_load(
     BrowserSession *session, const char *path,
     BrowserSessionPersistenceMask mask,
-    const BrowserSessionPersistenceLimits *limits)
+    const BrowserSessionPersistenceLimits *limits,
+    BrowserSessionPersistenceStatus *status_out)
 {
     BrowserSessionPersistenceStatus status =
         browser_session_persistence_load(session, path, mask, limits);
+    if (status_out != NULL) *status_out = status;
     bool loaded = status == BROWSER_SESSION_PERSISTENCE_OK;
     if (!loaded && status != BROWSER_SESSION_PERSISTENCE_NOT_FOUND) {
         printf("tilefinch-site-data: load=%s path=%s\n",

@@ -304,6 +304,70 @@ static int test_import_map_resolution(void)
     return 0;
 }
 
+/* Import maps come only from the document's own parser (JR-29): one added
+   by innerHTML or insertAdjacentHTML is "already started" in browsers and
+   never registers, so markup injection that cannot run script cannot
+   redirect a later import() either; nor can a script-inserted one, or a
+   fragment script that found the element-state table full. */
+static int test_import_map_parser_inserted_only(void)
+{
+    static const char map_markup[] =
+        "<script type=importmap>{\"imports\":{\"alias\":\"./a.js\"}}</script>";
+    static const char *const injections[] = {
+        "document.body.insertAdjacentHTML('beforeend',MAP);",
+        "const d=document.createElement('div');document.body.appendChild(d);"
+        "d.innerHTML=MAP;",
+        "const s=document.createElement('script');s.type='importmap';"
+        "s.textContent='{\"imports\":{\"alias\":\"./a.js\"}}';"
+        "document.head.appendChild(s);",
+        "for(let i=0;i<300;i++)document.createElement('script');"
+        "const d=document.createElement('div');document.body.appendChild(d);"
+        "d.innerHTML=MAP;",
+    };
+    for (size_t i = 0; i < sizeof(injections) / sizeof(injections[0]); i++) {
+        ModuleFixture fixture;
+        CHECK(script_page_fixture_open(&fixture, "<script></script>", 0));
+        ModuleMap map = {0};
+        CHECK(module_map_add(&map, "https://mod.test/a.js",
+              "https://mod.test/a.js", copy_text("export const value=7", 20)));
+        char source[640];
+        snprintf(source, sizeof(source),
+            "const MAP=%s;%s"
+            "import('alias').then(m=>{globalThis.pocSummary='MAP:'+m.value},"
+            "e=>{globalThis.pocSummary='ERR:'+e.name});",
+            "'<script type=importmap>{\"imports\":{\"alias\":\"./a.js\"}}"
+            "<\\/script>'", injections[i]);
+        ScriptResult result;
+        ScriptRuntime *runtime = NULL;
+        CHECK(run_root(&fixture, &map, source, &runtime, &result));
+        if (strcmp(result.summary, "ERR:TypeError") != 0 || map.loads[0] != 0)
+            fprintf(stderr, "import map injection %zu: summary=%s loads=%u "
+                    "error=%s\n", i, result.summary, (unsigned) map.loads[0],
+                    result.error);
+        CHECK(strcmp(result.summary, "ERR:TypeError") == 0
+              && map.loads[0] == 0);
+        script_runtime_destroy(runtime);
+        module_map_free(&map);
+        CHECK(fixture_close(&fixture));
+    }
+    /* The parser's own map still resolves a dynamic import. */
+    ModuleFixture fixture;
+    CHECK(script_page_fixture_open(&fixture, map_markup, 0));
+    ModuleMap map = {0};
+    CHECK(module_map_add(&map, "https://mod.test/a.js",
+          "https://mod.test/a.js", copy_text("export const value=7", 20)));
+    ScriptResult result;
+    ScriptRuntime *runtime = NULL;
+    CHECK(run_root(&fixture, &map,
+        "import('alias').then(m=>{globalThis.pocSummary='MAP:'+m.value},"
+        "e=>{globalThis.pocSummary='ERR:'+e.name});", &runtime, &result));
+    CHECK(strcmp(result.summary, "MAP:7") == 0 && map.loads[0] == 1);
+    script_runtime_destroy(runtime);
+    module_map_free(&map);
+    CHECK(fixture_close(&fixture));
+    return 0;
+}
+
 static int test_import_map_cache_rebinding(void)
 {
     ModuleFixture fixture;
@@ -1234,6 +1298,7 @@ int main(void)
     char private_root[] = "module-bytecode-tests-XXXXXX";
     CHECK(mkdtemp(private_root) != NULL && chdir(private_root) == 0);
     CHECK(test_import_map_resolution() == 0);
+    CHECK(test_import_map_parser_inserted_only() == 0);
     CHECK(test_module_allocation_refusal_recovery() == 0);
     CHECK(test_import_map_cache_rebinding() == 0);
     CHECK(test_large_module_heap_excludes_source() == 0);

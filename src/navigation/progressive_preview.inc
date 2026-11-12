@@ -420,6 +420,9 @@ static void navigation_stream_try_pre_eof_preview(
 {
     if (stream == NULL || stream->session == NULL || stream->parser == NULL)
         return;
+    /* A script a write() closed runs inside its writer: no layout or paint
+       there. The writer's own checkpoint comes after it returns. */
+    if (stream->parser->write_depth != 0u) return;
     /* A parser refusal retires optional work and invalidates its temporary
        sheet. Keep any already-presented preview, but do not reconstruct and
        fingerprint that sheet on every remaining body chunk. EOF still builds
@@ -744,7 +747,13 @@ static void navigation_stream_try_pre_eof_preview(
         stream->parsed_body_bytes;
     session->performance.streaming_preview_node_count =
         preview_node_count;
-    if (!navigation_preview_has_visible_content(
+    bool slots_only = !navigation_preview_has_visible_content(
+            &preview, stream->viewport.css_width,
+            stream->viewport.css_height)
+        && navigation_preview_has_slots_above_text(
+               &preview, stream->viewport.css_width,
+               stream->viewport.css_height);
+    if (!slots_only && !navigation_preview_has_visible_content(
             &preview, stream->viewport.css_width,
             stream->viewport.css_height)) {
         session->performance.streaming_preview_empty_raster_skips++;
@@ -834,6 +843,16 @@ static void navigation_stream_try_pre_eof_preview(
             session->performance.first_paint_us =
                 navigation_now_us() - session->navigation_started_us;
         }
+    } else if (slots_only) {
+        /* A first screen of slots over a band can still raster to one
+           colour (night mode turns bbc.com/news's white masthead and grey
+           band near-black), and the compositor declines it. Laying the
+           same screen out again at every response chunk cost bbc.com/news
+           117 layouts (16 s at 111 MHz); wait for more rendering elements
+           as for an empty preview. */
+        preview_policy_empty(&stream->preview_policy, &decision,
+                             policy_input.closed_content_elements,
+                             truncated);
     } else {
         /* The compositor can decline a structurally valid preview when its
            current viewport is still visually empty. Keep the immutable

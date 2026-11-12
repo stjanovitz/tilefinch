@@ -8,7 +8,18 @@ struct NavigationFramePresentation {
     LayoutDocument layout;
     int width;
     int height;
+    /* The child freed a node since this snapshot, and its layout's regions may
+       name it. Input rebuilds the snapshot before reading them. */
+    bool nodes_retired;
 };
+
+static void navigation_frame_presentation_note_retired(
+    void *opaque, const lxb_dom_node_t *root)
+{
+    (void) root;
+    NavigationFramePresentation *presentation = opaque;
+    presentation->nodes_retired = true;
+}
 
 static bool navigation_refresh_frame_presentation(
     NavigationSession *session, NavigationFrame *frame);
@@ -59,6 +70,7 @@ static void navigation_frame_presentation_destroy(
         return;
     }
     if (frame->runtime != NULL) {
+        script_runtime_set_node_retirement_callback(frame->runtime, NULL, NULL);
         script_runtime_set_layout(frame->runtime, NULL, 0);
         script_runtime_set_stylesheet(frame->runtime, NULL);
     }
@@ -267,6 +279,9 @@ static void navigation_compiled_stylesheet_cache_discard(
     session->compiled_stylesheet_cache_resource_signature = 0;
     session->compiled_stylesheet_cache_retained_bytes = 0;
     session->compiled_stylesheet_cache_ready = false;
+    session->compiled_stylesheet_cache_head_valid = false;
+    session->compiled_stylesheet_cache_head_body_sources = false;
+    session->compiled_stylesheet_cache_head_key = 0;
     session->performance.compiled_stylesheet_cache_retained_bytes = 0;
     session->performance.compiled_stylesheet_cache_evictions++;
 }
@@ -303,6 +318,12 @@ static void navigation_compiled_stylesheet_cache_move(
         source->compiled_stylesheet_cache_retained_bytes;
     destination->compiled_stylesheet_cache_ready =
         source->compiled_stylesheet_cache_ready;
+    destination->compiled_stylesheet_cache_head_valid =
+        source->compiled_stylesheet_cache_head_valid;
+    destination->compiled_stylesheet_cache_head_body_sources =
+        source->compiled_stylesheet_cache_head_body_sources;
+    destination->compiled_stylesheet_cache_head_key =
+        source->compiled_stylesheet_cache_head_key;
     memset(&source->compiled_stylesheet_cache, 0,
            sizeof(source->compiled_stylesheet_cache));
     memset(&source->compiled_stylesheet_cache_external_stats, 0,
@@ -311,14 +332,19 @@ static void navigation_compiled_stylesheet_cache_move(
     source->compiled_stylesheet_cache_resource_signature = 0;
     source->compiled_stylesheet_cache_retained_bytes = 0;
     source->compiled_stylesheet_cache_ready = false;
+    source->compiled_stylesheet_cache_head_valid = false;
+    source->compiled_stylesheet_cache_head_body_sources = false;
+    source->compiled_stylesheet_cache_head_key = 0;
     source->performance.compiled_stylesheet_cache_retained_bytes = 0;
     destination->performance.compiled_stylesheet_cache_retained_bytes =
         destination->compiled_stylesheet_cache_retained_bytes;
 }
 
-static bool navigation_compiled_stylesheet_cache_take(
-    NavigationSession *session, uint64_t fingerprint, Stylesheet *sheet,
-    ExternalStylesheetStats *external_stats)
+/* Moves the cached sheet out when its fingerprint (or, for `head`, its
+   head key) matches; a miss leaves it cached. */
+static bool navigation_compiled_stylesheet_cache_take_entry(
+    NavigationSession *session, uint64_t fingerprint, bool head,
+    Stylesheet *sheet, ExternalStylesheetStats *external_stats)
 {
     if (session == NULL || sheet == NULL || external_stats == NULL) {
         return false;
@@ -336,7 +362,7 @@ static bool navigation_compiled_stylesheet_cache_take(
         fingerprint;
     if (signature == 0) {
         navigation_compiled_stylesheet_cache_discard(session);
-        session->performance.compiled_stylesheet_cache_misses++;
+        if (!head) session->performance.compiled_stylesheet_cache_misses++;
         return false;
     }
     if (session->compiled_stylesheet_cache_ready
@@ -345,8 +371,12 @@ static bool navigation_compiled_stylesheet_cache_take(
         navigation_compiled_stylesheet_cache_discard(session);
     }
     if (!session->compiled_stylesheet_cache_ready
-        || session->compiled_stylesheet_cache_fingerprint != fingerprint) {
-        session->performance.compiled_stylesheet_cache_misses++;
+        || (head ? !session->compiled_stylesheet_cache_head_valid
+                   || session->compiled_stylesheet_cache_head_key
+                          != fingerprint
+                 : session->compiled_stylesheet_cache_fingerprint
+                       != fingerprint)) {
+        if (!head) session->performance.compiled_stylesheet_cache_misses++;
         return false;
     }
     *sheet = session->compiled_stylesheet_cache;
@@ -362,8 +392,53 @@ static bool navigation_compiled_stylesheet_cache_take(
     session->compiled_stylesheet_cache_resource_signature = 0;
     session->compiled_stylesheet_cache_retained_bytes = 0;
     session->compiled_stylesheet_cache_ready = false;
+    session->compiled_stylesheet_cache_head_valid = false;
+    session->compiled_stylesheet_cache_head_body_sources = false;
+    session->compiled_stylesheet_cache_head_key = 0;
     session->performance.compiled_stylesheet_cache_retained_bytes = 0;
-    session->performance.compiled_stylesheet_cache_hits++;
+    if (!head) session->performance.compiled_stylesheet_cache_hits++;
+    return true;
+}
+
+static bool navigation_compiled_stylesheet_cache_take(
+    NavigationSession *session, uint64_t fingerprint, Stylesheet *sheet,
+    ExternalStylesheetStats *external_stats)
+{
+    return navigation_compiled_stylesheet_cache_take_entry(
+        session, fingerprint, false, sheet, external_stats);
+}
+
+/* Takes the cached sheet cut back to its <head> sources, for a document
+   whose <head> sources have `head_key`. The external statistics are the
+   head's own: the cached document's other sources were all <style>
+   elements (navigation_record_compiled_stylesheet_head). The cut removes
+   the user stylesheet with the body; it is added again here, before the
+   new document's body sources, where a streamed continuation has it. One
+   that changes the parse context (variables, layers, fonts) would refuse
+   that continuation, so the take is refused instead. */
+static bool navigation_compiled_stylesheet_cache_take_head(
+    NavigationSession *session, uint64_t head_key, Stylesheet *sheet,
+    ExternalStylesheetStats *external_stats)
+{
+    if (session == NULL || !session->compiled_stylesheet_cache_ready
+        || !session->compiled_stylesheet_cache_head_valid) return false;
+    bool body_sources = session->compiled_stylesheet_cache_head_body_sources;
+    if (!navigation_compiled_stylesheet_cache_take_entry(
+            session, head_key, true, sheet, external_stats)) return false;
+    bool cut = stylesheet_truncate_to_head(sheet, body_sources);
+    if (cut) stylesheet_set_head_mark(sheet);
+    if (cut && session->user_css_length != 0) {
+        cut = stylesheet_add_user_css(sheet, session->user_css,
+                                      session->user_css_length)
+            && !sheet->user_css_changes_context;
+    }
+    if (!cut) {
+        stylesheet_destroy(sheet);
+        memset(external_stats, 0, sizeof(*external_stats));
+        session->performance.compiled_stylesheet_cache_head_refusals++;
+        return false;
+    }
+    session->performance.compiled_stylesheet_cache_head_hits++;
     return true;
 }
 
@@ -420,6 +495,12 @@ static void navigation_compiled_stylesheet_cache_store(
         page->compiled_stylesheet_fingerprint;
     session->compiled_stylesheet_cache_retained_bytes = retained;
     session->compiled_stylesheet_cache_ready = true;
+    session->compiled_stylesheet_cache_head_valid =
+        page->compiled_stylesheet_head_valid;
+    session->compiled_stylesheet_cache_head_body_sources =
+        page->compiled_stylesheet_head_body_sources;
+    session->compiled_stylesheet_cache_head_key =
+        page->compiled_stylesheet_head_key;
     session->performance.compiled_stylesheet_cache_retained_bytes = retained;
     session->performance.compiled_stylesheet_cache_stores++;
     memset(&page->stylesheet, 0, sizeof(page->stylesheet));
@@ -497,6 +578,28 @@ static bool navigation_install_minimal_stylesheet_fallback(
     return true;
 }
 
+/* The reader's viewport for the large-SVG distance rule
+   (tilefinch/image_retarget.h): rasterized within `near` viewports of it,
+   released beyond `far`. */
+static ImageRetargetReader navigation_image_reader(
+    const NavigationSession *session, int near, int far)
+{
+    const NavigationEntry *entry = navigation_current(session);
+    int top = entry == NULL ? 0 : entry->scroll_y;
+    int height = session->viewport.css_height > 0
+        ? session->viewport.css_height : 1;
+    if (height > INT_MAX / 8) height = INT_MAX / 8;
+    return (ImageRetargetReader) {
+        .top = top,
+        .bottom = top > INT_MAX - height ? INT_MAX : top + height,
+        .near = height * near,
+        .far = height * far
+    };
+}
+
+#define NAVIGATION_IMAGE_READER_NEAR 2
+#define NAVIGATION_IMAGE_READER_FAR 4
+
 /* Lend the page's committed layout boxes to its image table for one pass
    of image loading (images_set_layout_boxes), so CSS backgrounds decode at
    the size that layout paints them. No copy: the lend views the live
@@ -508,8 +611,15 @@ static void navigation_lend_image_boxes(NavigationSession *session,
     layout_lend_image_boxes(
         session != NULL && session->page.loaded
             ? &session->page.layout : NULL, boxes);
-    if (boxes->layout != NULL)
+    if (boxes->layout != NULL) {
+        ImageRetargetReader reader = navigation_image_reader(
+            session, NAVIGATION_IMAGE_READER_NEAR, NAVIGATION_IMAGE_READER_FAR);
+        boxes->reader_known = true;
+        boxes->reader_top = reader.top;
+        boxes->reader_bottom = reader.bottom;
+        boxes->reader_near = reader.near;
         images_set_layout_boxes(&session->page.images, boxes);
+    }
 }
 
 /* Lend only the page's CSS-to-device scale, for priority loads whose
@@ -861,12 +971,23 @@ static LayoutReuseCache *navigation_prepare_geometry_reuse(
     return session->page.layout_reuse;
 }
 
+static void navigation_release_geometry_reuse(void *opaque)
+{
+    NavigationSession *session = opaque;
+    if (session == NULL || session->page.layout_reuse == NULL) return;
+    layout_reuse_cache_destroy(session->page.layout_reuse);
+    session->page.layout_reuse = NULL;
+    session->performance.layout_reuse_pressure_evictions++;
+    session->performance.layout_reuse_retained_bytes = 0;
+}
+
 static bool navigation_flush_candidate_geometry(void *opaque)
 {
     NavigationSession *session = opaque;
     return session != NULL && session->page.runtime != NULL
         && script_runtime_flush_geometry_layout_reuse(session->page.runtime,
-            &session->viewport, navigation_prepare_geometry_reuse, session);
+            &session->viewport, navigation_prepare_geometry_reuse,
+            navigation_release_geometry_reuse, session);
 }
 
 static bool navigation_flush_committed_geometry(void *opaque)
@@ -948,6 +1069,7 @@ static void navigation_attach_layout(NavigationSession *session)
         session->page.bounded_focus_region_end = 0;
         session->page.bounded_focus_geometry_refused = false;
         session->page.bounded_focus_completion_counted = false;
+        session->page.viewport_images_pending = true;
         if (!session->page.layout_provisional) {
             session->page.layout_complete_us =
                 session->page.layout.performance.total_us;
@@ -1948,6 +2070,30 @@ static void navigation_freeze_reader_root_provenance(NavigationPage *page)
     page->reader_root_kind = READER_PAGE_RAW;
 }
 
+void navigation_record_script_stop(NavigationSession *session,
+                                   NavigationScriptStopReason reason)
+{
+    if (session == NULL || session->page.script_stop.reason != 0) return;
+    NavigationScriptStop *stop = &session->page.script_stop;
+    ScriptRuntime *runtime = session->page.runtime;
+    if (runtime == NULL && reason != NAVIGATION_SCRIPT_STOP_NOT_CREATED) return;
+    stop->reason = (uint8_t) reason;
+    stop->budget_free_kib = (uint32_t) (budget_remaining(session->budget) / 1024u);
+    if (session->page.committed_us != 0) {
+        stop->after_commit_ms = (uint32_t) (
+            (tilefinch_platform_monotonic_time_us() - session->page.committed_us)
+            / 1000u);
+    }
+    if (runtime == NULL) return;
+    ScriptHeapGrowth growth;
+    script_runtime_heap_growth(runtime, &growth);
+    stop->heap_limit_kib = (uint32_t) (growth.limit / 1024u);
+    stop->heap_used_kib = (uint32_t) (script_runtime_heap_used(runtime) / 1024u);
+    stop->heap_refusals = (uint32_t) growth.refusals;
+    stop->refused_kib = (uint32_t) (growth.refused_bytes / 1024u);
+    stop->refused_reason = (uint8_t) growth.refused_reason;
+}
+
 void navigation_retire_current_page_scripts(NavigationSession *session)
 {
     if (session == NULL) return;
@@ -1976,8 +2122,10 @@ void navigation_retire_large_incumbent_realm(NavigationSession *session)
        frontend-owned and runtime-owned navigation; both retain static DOM
        and pixels for rollback if the replacement fails. */
     if (session != NULL && session->page.runtime != NULL
-        && script_runtime_heap_used(session->page.runtime) >= 4u * 1024u * 1024u)
+        && script_runtime_heap_used(session->page.runtime) >= 4u * 1024u * 1024u) {
+        navigation_record_script_stop(session, NAVIGATION_SCRIPT_STOP_INCUMBENT);
         navigation_retire_current_page_scripts(session);
+    }
 }
 
 static bool navigation_retire_exhausted_script_realms_mode(
@@ -2041,6 +2189,7 @@ static bool navigation_retire_exhausted_script_realms_mode(
         tilefinch_platform_log_message(message);
     }
 #endif
+    navigation_record_script_stop(session, NAVIGATION_SCRIPT_STOP_MEMORY);
     navigation_retire_current_page_scripts(session);
     session->page.script_result.success = false;
     session->page.script_degradation_observed = true;

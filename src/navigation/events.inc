@@ -183,6 +183,20 @@ static bool navigation_finish_frame_pointer_click(
     return delivered;
 }
 
+/* The layout a press may read. A snapshot can outlive nodes it names (children
+   rebuild one per owner tick, and a refused rebuild keeps the old one), so one
+   that has seen a free is rebuilt first. If that is refused the press is
+   dropped: the page has moved on from what the snapshot lists. */
+static const LayoutDocument *navigation_frame_press_layout(
+    NavigationSession *session, NavigationFrame *frame)
+{
+    if (frame->presentation->nodes_retired)
+        (void) navigation_refresh_frame_presentation_or_defer(session, frame);
+    return frame->runtime == NULL || frame->presentation == NULL
+            || frame->presentation->nodes_retired
+        ? NULL : &frame->presentation->layout;
+}
+
 bool navigation_activate_frame(NavigationSession *session,
                                lxb_dom_node_t *frame_element)
 {
@@ -195,7 +209,9 @@ bool navigation_activate_frame(NavigationSession *session,
         || tilefinch_trace_frame_controls();
     lxb_dom_node_t *target = NULL;
     for (size_t depth = 0; depth < NAVIGATION_FRAME_LIMIT; depth++) {
-        const LayoutDocument *layout = &frame->presentation->layout;
+        const LayoutDocument *layout =
+            navigation_frame_press_layout(session, frame);
+        if (layout == NULL) return false;
         const ControlRegion *nested_region = NULL;
         uint64_t nested_area = 0;
         if (trace_frame_controls) {
@@ -265,7 +281,9 @@ bool navigation_activate_frame_at(NavigationSession *session,
         frame_element);
     if (frame == NULL || offset_x < 0 || offset_y < 0) return false;
     for (size_t depth = 0; depth < NAVIGATION_FRAME_LIMIT; depth++) {
-        const LayoutDocument *layout = &frame->presentation->layout;
+        const LayoutDocument *layout =
+            navigation_frame_press_layout(session, frame);
+        if (layout == NULL) return false;
         bool trace_frame_controls =
             tilefinch_trace_frame_controls();
         if (trace_frame_controls) {

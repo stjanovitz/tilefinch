@@ -538,6 +538,80 @@ bool layout_add_text_shadow_commands(
     return true;
 }
 
+/* Shift every node box index at or after `index` by `count`. Boxes are
+   recorded when their element finishes, so only the runs written while the
+   inserting element was being laid out (its descendants, and boxes recorded
+   again by a repeated layout) can reach the insertion point; the bounds
+   skip every other run without reading its boxes. */
+static void layout_insert_shift_node_boxes(LayoutDocument *layout,
+                                           size_t index, size_t count)
+{
+    size_t boxes = layout->node_box_count;
+    uint32_t *bounds = layout_run_bounds_for(
+        &layout->node_box_command_bounds, boxes);
+    for (size_t first = 0; first < boxes; first += LAYOUT_BOUND_RUN) {
+        size_t run = first / LAYOUT_BOUND_RUN;
+        if (bounds != NULL && bounds[run] < index) continue;
+        size_t end = boxes - first < LAYOUT_BOUND_RUN
+            ? boxes : first + LAYOUT_BOUND_RUN;
+        uint32_t maximum = 0;
+        for (size_t i = first; i < end; i++) {
+            LayoutNodeBox *box = &layout->node_boxes[i];
+            if (index <= box->command_start) box->command_start += count;
+            if (index < box->command_end) box->command_end += count;
+            if (index <= box->scroll_command_start) {
+                box->scroll_command_start += count;
+            }
+            if (index < box->scroll_command_end) {
+                box->scroll_command_end += count;
+            }
+            uint32_t box_maximum = layout_node_box_command_max(box);
+            if (box_maximum > maximum) maximum = box_maximum;
+        }
+        layout->performance.command_insert_visits += end - first;
+        if (bounds != NULL) bounds[run] = maximum;
+    }
+}
+
+/* The same for the transient command index a link keeps until its line is
+   flushed: only links of open lines carry one. */
+static void layout_insert_shift_links(LayoutDocument *layout,
+                                      size_t index, size_t count)
+{
+    size_t links = layout->link_count;
+    uint32_t *bounds = layout_run_bounds_for(
+        &layout->link_command_bounds, links);
+    for (size_t first = 0; first < links; first += LAYOUT_BOUND_RUN) {
+        size_t run = first / LAYOUT_BOUND_RUN;
+        if (bounds != NULL && bounds[run] < index) continue;
+        size_t end = links - first < LAYOUT_BOUND_RUN
+            ? links : first + LAYOUT_BOUND_RUN;
+        uint32_t maximum = 0;
+        for (size_t i = first; i < end; i++) {
+            LinkRegion *link = &layout->links[i];
+            if ((link->url_length
+                 & LAYOUT_LINK_TRANSIENT_COMMAND) == 0) continue;
+            size_t command_index =
+                (size_t) (-(int64_t) link->z_index - 1);
+            if (command_index >= index) {
+                if (count <= (size_t) INT_MAX - 1u
+                    && command_index
+                       <= (size_t) INT_MAX - 1u - count) {
+                    command_index += count;
+                    link->z_index = -(int) (command_index + 1u);
+                } else {
+                    link->z_index = 0;
+                    link->url_length &= LAYOUT_LINK_URL_LENGTH_MASK;
+                    continue;
+                }
+            }
+            if (command_index > maximum) maximum = (uint32_t) command_index;
+        }
+        layout->performance.command_insert_visits += end - first;
+        if (bounds != NULL) bounds[run] = maximum;
+    }
+}
+
 bool layout_insert_commands(LayoutContext *context, size_t index,
                             const DrawCommand *commands, size_t count)
 {
@@ -576,33 +650,11 @@ bool layout_insert_commands(LayoutContext *context, size_t index,
             if (index <= range->command_start) range->command_start += count;
             if (index < range->command_end) range->command_end += count;
         }
-        for (size_t i = 0; i < layout->node_box_count; i++) {
-            LayoutNodeBox *box = &layout->node_boxes[i];
-            if (index <= box->command_start) box->command_start += count;
-            if (index < box->command_end) box->command_end += count;
-            if (index <= box->scroll_command_start) {
-                box->scroll_command_start += count;
-            }
-            if (index < box->scroll_command_end) {
-                box->scroll_command_end += count;
-            }
-        }
-        for (size_t i = 0; i < layout->link_count; i++) {
-            LinkRegion *link = &layout->links[i];
-            if ((link->url_length
-                 & LAYOUT_LINK_TRANSIENT_COMMAND) == 0) continue;
-            size_t command_index =
-                (size_t) (-(int64_t) link->z_index - 1);
-            if (command_index < index) continue;
-            if (count <= (size_t) INT_MAX - 1u
-                && command_index
-                   <= (size_t) INT_MAX - 1u - count) {
-                link->z_index = -(int) (command_index + count + 1u);
-            } else {
-                link->z_index = 0;
-                link->url_length &= LAYOUT_LINK_URL_LENGTH_MASK;
-            }
-        }
+        layout_insert_shift_node_boxes(layout, index, count);
+        layout_insert_shift_links(layout, index, count);
+        layout->performance.command_insert_visits +=
+            context->stacking_context_count
+            + context->visibility_range_count;
         for (size_t i = 0; i < context->stacking_context_count; i++) {
             LayoutStackingContext *range = &context->stacking_contexts[i];
             if (index <= range->command_start) range->command_start += count;

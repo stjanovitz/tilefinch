@@ -64,7 +64,9 @@ void script_runtime_destroy(ScriptRuntime *runtime)
     js_rt_bridge_wrapper_refs_free(&runtime->bridge);
     budget_free(runtime->bridge.budget, runtime->bridge.node_owner_tags);
     runtime->bridge.node_owner_tags = NULL;
+    js_rt_bridge_canvas_taints_free(&runtime->bridge);
     js_rt_event_sources_destroy(&runtime->bridge);
+    js_rt_cors_preflights_destroy(&runtime->bridge);
     js_rt_websockets_destroy(&runtime->bridge);
     js_rt_multiplayer_destroy(&runtime->bridge);
     for (size_t i = 0; i < runtime->bridge.async_fetch_count; i++) {

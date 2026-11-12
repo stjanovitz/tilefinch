@@ -34,9 +34,10 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     size_t chunk = 188u * (1u + data[0] % 8u) + data[0] / 8u;
     data++;
     size--;
-    static SwdecTs ts; /* ~520 KiB: keep it off the stack. */
+    static SwdecTs ts; /* ~8 KiB of ADTS buffer: keep it off the stack. */
+    static uint8_t au[SWDEC_TS_MAX_AU];
     size_t emitted = 0;
-    swdec_ts_init(&ts, on_video, on_audio, &emitted);
+    swdec_ts_init(&ts, au, sizeof(au), on_video, on_audio, &emitted);
     uint8_t *pending = malloc(chunk + 188u * 2u);
     if (pending == NULL) return 0;
     size_t pending_length = 0;

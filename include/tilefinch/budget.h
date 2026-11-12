@@ -233,6 +233,12 @@ void budget_allocation_owner_leave(Budget *budget,
 void budget_rollback_owner_category(Budget *budget,
                                     BudgetAllocationOwner owner,
                                     BudgetCategory category);
+/* Live owned charges (including headers), excluding external storage.
+   Only visits allocations newer than checkpoint, like budget_rollback. */
+size_t budget_owner_category_bytes_since(const Budget *budget,
+                                         BudgetAllocationOwner owner,
+                                         BudgetCategory category,
+                                         uint64_t checkpoint);
 const char *budget_category_name(BudgetCategory category);
 bool budget_categories_reconcile(const Budget *budget);
 void budget_mark_phase(Budget *budget, const char *phase);

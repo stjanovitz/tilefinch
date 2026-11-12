@@ -69,10 +69,16 @@ _Static_assert(
         <= BROWSER_MODULE_REFERRER_POLICY_LIMIT,
     "module cache must retain every normalized referrer policy token");
 
+/* Whether `working_bytes` and a reserve beside it no longer fit the heap a
+   compile could actually reach (script_runtime_heap_reachable). Its source
+   is already in the page Budget and compiles in place, so nothing is taken
+   before the compile. Before, this asked script_runtime_heap_available,
+   which adds the headroom under the current limit to the growth the free
+   Budget could back, though both come out of the same free Budget. */
 static bool script_heap_pressure_required(
     ScriptRuntime *runtime, size_t working_bytes, size_t reserve_bytes)
 {
-    size_t remaining = script_runtime_heap_admission_available(runtime);
+    size_t remaining = script_runtime_heap_reachable(runtime, 0);
     return working_bytes > remaining
         || reserve_bytes > remaining - working_bytes;
 }
@@ -88,10 +94,8 @@ static bool script_heap_pressure_required(
    for the runtime; once the source length is known, compilation additionally
    reserves one source-sized working copy. Both rules scale with generic work,
    not a page or host. */
-static size_t script_collect_pressure_once(
-    ScriptRuntime *runtime, Budget *budget, size_t working_bytes,
-    size_t budget_reserve_bytes, size_t heap_reserve_bytes,
-    ExternalScriptMetrics *metrics)
+static size_t script_collect_for_pressure(
+    ScriptRuntime *runtime, Budget *budget, ExternalScriptMetrics *metrics)
 {
     /* One collection per page load, then at most one a second: a page that
        settled after load leaves garbage a later dynamic import can use
@@ -101,11 +105,7 @@ static size_t script_collect_pressure_once(
     if (budget == NULL || metrics == NULL
         || (metrics->pressure_collections != 0
             && now_us - metrics->last_pressure_collection_us
-                   < UINT64_C(1000000))
-        || (!budget_pressure_required(
-                budget, working_bytes, budget_reserve_bytes)
-            && !script_heap_pressure_required(
-                runtime, working_bytes, heap_reserve_bytes))) {
+                   < UINT64_C(1000000))) {
         return 0;
     }
     size_t before = budget_remaining(budget);
@@ -120,6 +120,21 @@ static size_t script_collect_pressure_once(
         metrics->pressure_reclaimed_bytes += reclaimed;
     }
     return reclaimed;
+}
+
+static size_t script_collect_pressure_once(
+    ScriptRuntime *runtime, Budget *budget, size_t working_bytes,
+    size_t budget_reserve_bytes, size_t heap_reserve_bytes,
+    ExternalScriptMetrics *metrics)
+{
+    if (budget == NULL
+        || (!budget_pressure_required(
+                budget, working_bytes, budget_reserve_bytes)
+            && !script_heap_pressure_required(
+                runtime, working_bytes, heap_reserve_bytes))) {
+        return 0;
+    }
+    return script_collect_for_pressure(runtime, budget, metrics);
 }
 
 /* Compiled-script tables are optional Budget memory: they give way, through
@@ -176,7 +191,7 @@ static bool script_admit_known_working_set_with_reserve(
    collection, a refusal counts as memory pressure. A unit that needs more
    than planned is stopped by the heap limit and refused at compile time
    with the realm intact. A page realm's heap grows on demand
-   (script_runtime_heap_available counts that headroom). */
+   (script_runtime_heap_reachable counts the growth it can still get). */
 static bool script_admit_known_working_set(
     ScriptRuntime *runtime, Budget *budget, size_t unit_bytes,
     ExternalScriptMetrics *metrics)
@@ -1252,6 +1267,102 @@ static bool script_execute_inline_admitted(
     return !script_runtime_document_refresh_failed(runtime);
 }
 
+/* What compiling an inline script of `source` bytes takes. The page Budget
+   holds `source` (the realm's stored copy of the text) beside a reserve of
+   at least the presentation reserve; `copy` more of it goes to an assembled
+   copy of the text before the heap grows, which only a script of several
+   text children needs (script_runtime_evaluate_inline compiles a single
+   child's text in place); the heap must reach the source plus the
+   expansion window script_runtime_inline_execution_reserve() selects (the
+   presentation reserve already covers the script's DOM work). */
+typedef struct {
+    size_t source;
+    size_t copy;
+    size_t heap_need;
+    size_t budget_reserve;
+} ScriptInlineWorkingSet;
+
+static ScriptInlineWorkingSet script_inline_working_set(
+    ScriptRuntime *runtime, size_t source_length, bool assembled)
+{
+    size_t execution_reserve =
+        script_runtime_inline_execution_reserve(runtime, source_length);
+    size_t heap_reserve = source_length > execution_reserve
+        ? source_length : execution_reserve;
+    return (ScriptInlineWorkingSet) {
+        .source = source_length,
+        .copy = assembled ? source_length : 0,
+        .heap_need = source_length > SIZE_MAX - heap_reserve
+            ? SIZE_MAX : source_length + heap_reserve,
+        .budget_reserve = source_length > SCRIPT_PRESENTATION_RESERVE_BYTES
+            ? source_length : SCRIPT_PRESENTATION_RESERVE_BYTES
+    };
+}
+
+/* Whether the working set fits the realm's real headroom now: the Budget
+   keeps its reserve, and the heap the compile can actually reach after the
+   copy is taken (script_runtime_heap_reachable) holds the heap need. With
+   `make_room`, optional caches give way first, as the heap growth hook
+   would let them during the compile. */
+static bool script_inline_working_set_fits(
+    ScriptRuntime *runtime, Budget *budget,
+    const ScriptInlineWorkingSet *working, bool make_room)
+{
+    if (make_room ? script_budget_pressure(
+                        budget, working->source, working->budget_reserve)
+                  : budget_pressure_required(
+                        budget, working->source, working->budget_reserve))
+        return false;
+    size_t reachable = script_runtime_heap_reachable(runtime, working->copy);
+    if (working->heap_need <= reachable) return true;
+    if (!make_room) return false;
+    size_t free_bytes = budget_remaining(budget);
+    size_t shortfall = working->heap_need - reachable;
+    (void) budget_make_room(budget, free_bytes > SIZE_MAX - shortfall
+                                        ? SIZE_MAX : free_bytes + shortfall);
+    return working->heap_need
+        <= script_runtime_heap_reachable(runtime, working->copy);
+}
+
+static void script_trace_inline_admission(
+    ScriptRuntime *runtime, const ScriptInlineWorkingSet *working,
+    bool streaming, bool admitted)
+{
+    fprintf(stderr,
+            "inline-script-admission bytes=%zu heap-remaining=%zu "
+            "budget-reserve=%zu heap-need=%zu heap-reachable=%zu copy=%zu "
+            "streaming=%s admitted=%s\n",
+            working->source, script_runtime_heap_remaining(runtime),
+            working->budget_reserve, working->heap_need,
+            script_runtime_heap_reachable(runtime, working->copy),
+            working->copy, streaming ? "yes" : "no",
+            admitted ? "yes" : "no");
+}
+
+bool script_inline_source_admissible(ScriptRuntime *runtime, Budget *budget,
+                                     size_t source_length, bool *may_collect)
+{
+    if (runtime == NULL || budget == NULL || source_length == 0) return true;
+    /* The parser appends streamed text to one text child. */
+    ScriptInlineWorkingSet working =
+        script_inline_working_set(runtime, source_length, false);
+    bool admitted = script_inline_working_set_fits(
+        runtime, budget, &working, true);
+    if (!admitted && may_collect != NULL && *may_collect) {
+        *may_collect = false;
+        (void) script_runtime_collect_and_trim(runtime);
+        admitted = script_inline_working_set_fits(
+            runtime, budget, &working, false);
+    }
+    if (!admitted) {
+        budget_record_pressure(
+            budget, BUDGET_PRESSURE_JAVASCRIPT, source_length, 0);
+        if (tilefinch_trace_script_failures())
+            script_trace_inline_admission(runtime, &working, true, false);
+    }
+    return admitted;
+}
+
 static bool script_admit_inline_node(ScriptRuntime *runtime, Budget *budget,
                                      lxb_dom_node_t *node,
                                      const TilefinchContentSecurityPolicy *csp,
@@ -1265,7 +1376,7 @@ static bool script_admit_inline_node(ScriptRuntime *runtime, Budget *budget,
         metrics->policy_refusals++;
         return false;
     }
-    size_t source_length = 0;
+    size_t source_length = 0, text_children = 0;
     for (lxb_dom_node_t *child = node->first_child; child != NULL;
          child = child->next) {
         size_t length = 0;
@@ -1278,26 +1389,31 @@ static bool script_admit_inline_node(ScriptRuntime *runtime, Budget *budget,
             return false;
         }
         source_length += length;
+        text_children++;
     }
     if (source_length == 0) return true;
-    /* The QuickJS heap keeps the expansion window
-       script_runtime_inline_execution_reserve() selects; the page Budget
-       keeps the presentation reserve, which already covers the inline
-       script's DOM work. */
-    size_t execution_reserve =
-        script_runtime_inline_execution_reserve(runtime, source_length);
-    size_t budget_reserve = SCRIPT_PRESENTATION_RESERVE_BYTES;
-    bool admitted = script_admit_known_working_set_with_reserve(
-        runtime, budget, source_length,
-        budget_reserve, execution_reserve, metrics);
+    ScriptInlineWorkingSet working = script_inline_working_set(
+        runtime, source_length, text_children > 1u);
+    bool admitted = script_inline_working_set_fits(
+        runtime, budget, &working, true);
+    if (!admitted) {
+        size_t reclaimed =
+            script_collect_for_pressure(runtime, budget, metrics);
+        admitted = script_inline_working_set_fits(
+            runtime, budget, &working, false);
+        if (admitted) {
+            budget_record_pressure(
+                budget, BUDGET_PRESSURE_JAVASCRIPT, 0, reclaimed);
+        } else {
+            metrics->skipped_pressure++;
+            budget_record_pressure(
+                budget, BUDGET_PRESSURE_JAVASCRIPT, source_length,
+                reclaimed);
+        }
+    }
     if (tilefinch_trace_script_failures()) {
-        size_t heap_remaining = script_runtime_heap_remaining(runtime);
-        fprintf(stderr,
-                "inline-script-admission bytes=%zu heap-remaining=%zu "
-                "budget-reserve=%zu heap-reserve=%zu admitted=%s\n",
-                source_length, heap_remaining,
-                budget_reserve, execution_reserve,
-                admitted ? "yes" : "no");
+        script_trace_inline_admission(
+            runtime, &working, false, admitted);
     }
     return admitted;
 }
@@ -1394,6 +1510,43 @@ bool document_script_is_parser_blocking(lxb_dom_node_t *element)
     bool external = source != NULL && source_length != 0;
     return !external || (!attribute_present(element, "async")
                          && !attribute_present(element, "defer"));
+}
+
+/* A script the page is waiting on (a module import, or an external script
+   the loader fetches and then runs) must not be refused because other
+   responses briefly hold the scheduler's byte pool (chatgpt.com's page
+   fetches reserve 1 MiB each). Wait until capacity frees, bounded by the
+   request timeout; completed requests release their unused bound. Slots
+   need no wait: the request takes the slot and the worker descriptor
+   reserved for blocking requests (fetch_scheduler_request_blocking), and a
+   held page domain frees nothing while this thread waits. */
+static void script_wait_for_fetch_capacity(FetchScheduler *scheduler,
+                                           size_t bytes, long timeout_ms)
+{
+    uint64_t limit = timeout_ms > 0
+        ? (uint64_t) timeout_ms * UINT64_C(1000) : UINT64_C(15000000);
+    (void) fetch_scheduler_wait_for_blocking_capacity(scheduler, bytes, limit);
+}
+
+/* The loader fetches a document's external script (parser-blocking, or
+   async or deferred once the parse ends) and waits for it on this thread
+   before running it, as a sync XHR waits. Nothing it waits behind frees
+   meanwhile: a request slot frees only on its owner's take and a PSP
+   worker descriptor only when its own scheduler is pumped, and this wait
+   pumps only the script's. On the ordinary lane, page loads of other
+   schedulers (images, a realm's fetches) holding every descriptor kept
+   the script waiting out its whole timeout. So it takes the blocking
+   lane: one at a time, since the loader waits for each in turn.
+   Script-inserted scripts are enqueued and taken on later turns
+   (js_fetch_cors.c) and stay ordinary. */
+static bool script_fetch_awaited(FetchScheduler *scheduler, const char *url,
+                                 const FetchRequest *request,
+                                 size_t maximum_bytes, long timeout_ms,
+                                 FetchResult *fetch)
+{
+    script_wait_for_fetch_capacity(scheduler, maximum_bytes, timeout_ms);
+    return fetch_scheduler_request_blocking(
+        scheduler, url, request, maximum_bytes, timeout_ms, fetch);
 }
 
 static bool execute_external_node(
@@ -1737,8 +1890,9 @@ static bool execute_external_node(
         script_cache_source_release(&cached_source);
         return false;
     }
-    if (request == NULL || !fetch_scheduler_request(scheduler, resolved, request,
-                                 response_limit, timeout_ms, fetch)) {
+    if (request == NULL || !script_fetch_awaited(scheduler, resolved, request,
+                                                 response_limit, timeout_ms,
+                                                 fetch)) {
         if (tilefinch_trace_script_failures()) {
             fprintf(stderr,
                     "script-fetch-failure url=\"%s\" limit=%zu "
@@ -1774,7 +1928,10 @@ static bool execute_external_node(
        but not its unused capacity; trimming here prevents a 2.1 MiB bundle
        from pinning a 4 MiB response allocation throughout the page realm. */
     script_compact_fetch_source(fetch);
-    const char *source = fetch->data;
+    /* An empty body is an empty script, which runs and fires load as in
+       Chromium; a NULL source would mean an installed app's bytecode. */
+    const char *source = fetch->data == NULL && fetch->length == 0
+        ? "" : fetch->data;
     size_t source_length = fetch->length;
     const char *response_url = fetch->effective_url[0] == '\0'
         ? (module && fetch->status_code == 304 && cached != NULL
@@ -2090,29 +2247,6 @@ static void module_load_refused(const char *url, const char *reason)
 #endif
 }
 
-/* A module the page is waiting on must not be refused because other
-   responses briefly hold the scheduler's byte pool (chatgpt.com's page
-   fetches reserve 1 MiB each). Pump until capacity frees, bounded by the
-   request timeout; completed requests release their unused bound. */
-static void script_wait_for_fetch_capacity(FetchScheduler *scheduler,
-                                           size_t bytes, long timeout_ms)
-{
-    uint64_t started = tilefinch_platform_monotonic_time_us();
-    uint64_t limit = timeout_ms > 0
-        ? (uint64_t) timeout_ms * UINT64_C(1000) : UINT64_C(15000000);
-    size_t turns = 0;
-    /* A held page domain frees nothing until the player closes: do not
-       wait out the timeout on the browser thread for it. */
-    while (!fetch_scheduler_held(scheduler)
-           && fetch_scheduler_enqueue_would_block(scheduler, bytes)
-           && tilefinch_platform_monotonic_time_us() - started < limit) {
-        (void) fetch_scheduler_pump(scheduler, 1, 10);
-        if (!tilefinch_platform_cooperate("fetch", ++turns)) break;
-    }
-    if (turns != 0)
-        fetch_sync_wait_note(tilefinch_platform_monotonic_time_us() - started);
-}
-
 static size_t module_prefetch_total;
 static size_t module_prefetch_hit_total;
 
@@ -2425,7 +2559,7 @@ static bool pipeline_module_load(void *opaque,
              attempt++) {
             script_wait_for_fetch_capacity(
                 scheduler, response_limit, context->timeout_ms);
-            fetched = fetch_scheduler_request(
+            fetched = fetch_scheduler_request_blocking(
                 scheduler, url,
                 use_fresh_connection ? &fresh_request : request,
                 response_limit, context->timeout_ms, fetch);
@@ -2553,18 +2687,21 @@ static bool pipeline_module_load(void *opaque,
             }
             /* Both sharing attempts can relocate the response, including a
                failed descriptor allocation after a successful shrink. */
-            selected = (const unsigned char *) fetch->data;
+            selected = fetch->data == NULL && selected_length == 0
+                ? (const unsigned char *) ""
+                : (const unsigned char *) fetch->data;
             selected_body = fetch->shared_body != NULL
                 && script_source_has_terminator(
                     fetch->shared_body->data, fetch->shared_body->length)
                 ? fetch->shared_body : NULL;
         }
     }
-    if (selected == NULL || selected_length == 0
-        || selected_length > response_limit) {
+    /* An empty module is a module that exports nothing (Chromium loads
+       it); its empty response is selected as "". */
+    if (selected == NULL || selected_length > response_limit) {
         module_load_refused(url, selected == NULL
                                      ? (refusal == NULL ? "response" : refusal)
-                            : selected_length == 0 ? "empty" : "too-large");
+                                     : "too-large");
         script_runtime_script_quota_abort(context->runtime, &quota);
         if (selected_length > response_limit) {
             context->metrics->skipped_quota++; script_trace_skip(url);

@@ -67,6 +67,19 @@ bool psp_validation_raster_qualification(
 bool psp_validation_network_qualification(
     PspBrowserResources *browser, PspProcessResources *process,
     int *exit_code);
+/* Trace replay has no association wait to seed in, so a replay boot seeds
+   here, just before the initial navigation, and first-present does not
+   carry it. The tilefinch-entropy seeded line still reports the cost. */
+void psp_validation_entropy_preseed(const PspProcessResources *process);
+
+/* src/psp_app/psp_app_validation_entropy.c: the raw entropy-sample capture
+   (src/psp_entropy_capture.h). main arms it right after configuring the
+   entropy source, before any batch can be gathered; it arms only for a
+   host0: program with host0:/entropy-capture.cfg present. The preseed above
+   finishes it: seeding a boot that has no trace too, then the extra runs,
+   then one host0: write. */
+void psp_validation_entropy_capture_arm(const TilefinchInstallPaths *paths);
+void psp_validation_entropy_capture_finish(void);
 
 /* Boot reports (psp_app_validation_qualify.c). main starts the boot clock
    with psp_boot_timing_begin; PSP_BOOT_TIMING_MARK then works in main and
@@ -210,6 +223,13 @@ void psp_vprobe_frame_begin(
 void psp_webgl_measurement_bind(const NavigationSession *navigation);
 /* The canvas-followup-off mark: no early wake for a canvas follow-up. */
 bool psp_validation_canvas_followup_disabled(void);
+
+/* src/psp_app/psp_app_validation_glyph.c: a language-pack install replayed
+   from the release's recorded responses. */
+bool psp_validation_glyph_armed(PspApp *app);
+const TilefinchInstallPaths *psp_validation_glyph_paths(PspApp *app);
+void psp_validation_glyph_stage(PspApp *app,
+                                const PspGlyphComponentSession *session);
 
 /* src/psp_app/psp_app_validation_loop.c */
 
@@ -371,6 +391,16 @@ static inline bool psp_validation_network_qualification(
 {
     (void) browser; (void) process; (void) exit_code;
     return false;
+}
+static inline void psp_validation_entropy_preseed(
+    const PspProcessResources *process)
+{
+    (void) process;
+}
+static inline void psp_validation_entropy_capture_arm(
+    const TilefinchInstallPaths *paths)
+{
+    (void) paths;
 }
 
 #define PSP_BOOT_TIMING_MARK(stage_name) do { (void) (stage_name); } while (0)

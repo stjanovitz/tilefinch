@@ -178,7 +178,9 @@ static bool style_property_clip_path(const StylePropertyParse *parse)
         if (percent) unit++;
         else if (unit[0] == 'p' && unit[1] == 'x') unit += 2;
         else if (value != 0.0) return true;
-        unsigned inset = (unsigned) (value + 0.5);
+        /* Clamp before converting: a double past UINT_MAX has no unsigned
+           value. */
+        unsigned inset = value >= 127.0 ? 127u : (unsigned) (value + 0.5);
         if (inset > 127u) inset = 127u;
         unsigned radius = 0;
         char *round = strstr(unit, "round");
@@ -188,7 +190,7 @@ static bool style_property_clip_path(const StylePropertyParse *parse)
             char *radius_unit = NULL;
             double parsed = strtod(round, &radius_unit);
             if (radius_unit != round && isfinite(parsed) && parsed > 0.0) {
-                radius = (unsigned) (parsed + 0.5);
+                radius = parsed >= 63.0 ? 63u : (unsigned) (parsed + 0.5);
                 if (radius > 63u) radius = 63u;
             }
         }

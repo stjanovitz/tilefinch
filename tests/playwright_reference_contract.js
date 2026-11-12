@@ -346,7 +346,7 @@ async function main() {
     time: "10 PM",
     number: "1,234.5",
     percent: "25%",
-    currency: "USD 1,234.5",
+    currency: "$1,234.50",
     plurals: ["one", "other", "two"],
     locale: "en-US",
     native: true,

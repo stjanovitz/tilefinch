@@ -207,8 +207,14 @@ static SttStatus voice_create_engine(PspVoiceJob *job)
     return voice_create_tier(job, VOICE_MODEL_SMALL);
 }
 
+/* Called by the recognizer between chunks and phases. The worker outranks
+   the browser thread, which owns the cancel flag, the 30 s timeout, the
+   progress line and the watchdog heartbeat; PSP threads are strictly
+   prioritised, so a compute-bound decode would starve all four. Sleeping
+   1 ms here lets the browser thread take its turn once per chunk. */
 static int voice_decode_cancelled(void *user)
 {
+    (void) sceKernelDelayThread(1000);
     const PspVoiceJob *job = user;
     return job != NULL
         && voice_job_lifecycle_cancelled(&job->lifecycle);

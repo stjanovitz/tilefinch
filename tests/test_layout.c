@@ -534,6 +534,118 @@ static int test_grid_implicit_tracks_and_repeat_floors(void)
     return 0;
 }
 
+/* Auto-placed grids keep stacking rows past 64: a list or card grid with
+   more items used to paint every item from the 65th row on in one cell.
+   A full-width item (grid-column: 1 / -1) every sixth item exercises the
+   definite-column search as well as plain auto-placement. */
+static int test_grid_rows_past_placement_window(void)
+{
+    enum { ITEMS = 200, GROUPS = 25 };
+    static char page[ITEMS * 40 + GROUPS * 48 + 512];
+    static char ids[ITEMS * 2 + GROUPS * 6 + 2][8];
+    static GridTrackExpectation expected[ITEMS * 2 + GROUPS * 6 + 2];
+    size_t used = (size_t) snprintf(page, sizeof(page),
+        "<!doctype html><style>body{margin:0}div{margin:0}"
+        ".g{display:grid;width:200px;grid-template-columns:1fr 1fr;"
+        "gap:4px}.g i{display:block;height:10px}"
+        ".full{grid-column:1 / -1}</style><div id=list class=g>");
+    size_t count = 0;
+    for (int i = 0; i < ITEMS; i++) {
+        used += (size_t) snprintf(page + used, sizeof(page) - used,
+                                  "<i id=l%d></i>", i);
+        snprintf(ids[count], sizeof(ids[count]), "l%d", i);
+        expected[count] = (GridTrackExpectation) {
+            ids[count], (i % 2) * 102, (i / 2) * 14, 98 };
+        count++;
+    }
+    int list_height = (ITEMS / 2) * 14 - 4;
+    used += (size_t) snprintf(page + used, sizeof(page) - used,
+                              "</div><div id=cards class=g>");
+    for (int g = 0; g < GROUPS; g++) {
+        for (int j = 0; j < 6; j++) {
+            used += (size_t) snprintf(page + used, sizeof(page) - used,
+                j == 0 ? "<i class=full id=c%d_%d></i>" : "<i id=c%d_%d></i>",
+                g, j);
+            snprintf(ids[count], sizeof(ids[count]), "c%d_%d", g, j);
+            int row = j == 0 ? 4 * g : 4 * g + 1 + (j - 1) / 2;
+            expected[count] = (GridTrackExpectation) {
+                ids[count], j == 0 ? 0 : ((j - 1) % 2) * 102,
+                list_height + row * 14, j == 0 ? 200 : 98 };
+            count++;
+        }
+    }
+    int cards_height = (4 * GROUPS) * 14 - 4;
+    snprintf(page + used, sizeof(page) - used,
+             "</div><div id=after></div>");
+    expected[count++] = (GridTrackExpectation) {
+        "after", 0, list_height + cards_height, -1 };
+    CHECK(check_grid_track_page(page, 480, expected, count) == 0);
+
+    /* The row table is optional: a refusal at any allocation leaves the
+       budget as it was, whether the build fails or keeps to the window. */
+    used = (size_t) snprintf(page, sizeof(page),
+        "<!doctype html><style>.g{display:grid;gap:2px}"
+        ".g i{display:block;height:4px}</style><div class=g>");
+    for (int i = 0; i < 100; i++)
+        used += (size_t) snprintf(page + used, sizeof(page) - used,
+                                  "<i></i>");
+    used += (size_t) snprintf(page + used, sizeof(page) - used, "</div>");
+    Budget budget;
+    budget_init(&budget, 4u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    Stylesheet sheet;
+    LayoutDocument layout = {0};
+    CHECK(document_parse(&document, &budget, page, used, 42)
+          && stylesheet_build(&sheet, &budget, &document, 480)
+          && layout_build(&layout, &budget, &document, &sheet,
+                          NULL, NULL, 480));
+    layout_destroy(&layout);
+    size_t warmed = budget.current;
+    bool completed = false;
+    for (size_t refused_after = 0;
+         refused_after < 4096u && !completed; refused_after++) {
+        budget_inject_failure_after(&budget, refused_after);
+        bool built = layout_build(&layout, &budget, &document, &sheet,
+                                  NULL, NULL, 480);
+        completed = built && budget.failure_injection_enabled;
+        budget_clear_failure_injection(&budget);
+        layout_destroy(&layout);
+        CHECK(budget.current == warmed);
+    }
+    CHECK(completed);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0u && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* A positioned grid child's lines are resolved against the tracks that
+   layout built (at most 24). An in-flow item at line 60 made the
+   unclamped implicit count 60, so lines 50-55 read past the 24-entry
+   track arrays; they do not exist, so the area is the padding box. */
+static int test_grid_positioned_lines_past_tracks(void)
+{
+    static const char page[] =
+        "<!doctype html><style>body{margin:0}div{margin:0}"
+        ".g{display:grid;position:relative;width:240px;"
+        "grid-template-columns:repeat(4,60px)}"
+        ".g i{display:block;height:10px}"
+        "#far{position:absolute;grid-column:50 / 55;top:0;left:0;right:0;"
+        "height:5px}"
+        "#near{position:absolute;grid-column:2 / 4;top:0;left:0;right:0;"
+        "height:5px}</style>"
+        "<div class=g><i></i><i style='grid-column:60'></i>"
+        "<b id=far></b><b id=near></b></div>";
+    static const GridTrackExpectation expected[] = {
+        { "far", 0, 0, 240 },
+        { "near", 60, 0, 120 },
+    };
+    CHECK(check_grid_track_page(page, 480, expected,
+                                sizeof(expected) / sizeof(expected[0])) == 0);
+    return 0;
+}
+
 static int test_column_flex_scroller_height(void)
 {
     for (unsigned nested = 0; nested < 3; nested++) {
@@ -866,6 +978,12 @@ int main(int argc, char **argv)
     CHECK(test_individual_calc_translate() == 0);
     CHECK(test_column_flex_scroller_height() == 0);
     CHECK(test_grid_implicit_tracks_and_repeat_floors() == 0);
+    if (argc == 2 && strcmp(argv[1], "--grid-rows-only") == 0)
+        return test_grid_rows_past_placement_window();
+    CHECK(test_grid_rows_past_placement_window() == 0);
+    if (argc == 2 && strcmp(argv[1], "--grid-positioned-lines-only") == 0)
+        return test_grid_positioned_lines_past_tracks();
+    CHECK(test_grid_positioned_lines_past_tracks() == 0);
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc == 2 && strcmp(argv[1], "--page-font-leading-only") == 0)
         return test_page_font_normal_leading();

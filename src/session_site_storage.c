@@ -450,12 +450,28 @@ static bool stick_write_header(FILE *file, const char *origin,
     return true;
 }
 
+typedef enum {
+    STICK_LOG_MISSING = 0,   /* could not be opened */
+    STICK_LOG_INVALID,       /* opened, but no intact header */
+    STICK_LOG_FOREIGN,       /* an intact header naming another origin */
+    STICK_LOG_NEWER,         /* a later release's format */
+    STICK_LOG_VALID
+} StickLogState;
+
+static StickLogState stick_name_state(const SiteRecord *site,
+                                      BrowserSiteStorageTier tier,
+                                      const char *name);
+static bool stick_name_protected(const SiteRecord *site,
+                                 BrowserSiteStorageTier tier,
+                                 const char *name);
+
 /* Creates an empty file for the site at its current tier's name. */
 static bool stick_create(struct BrowserSiteStore *store, size_t index)
 {
     SiteRecord *site = &store->sites[index];
     char path[STICK_PATH_BYTES];
-    if (!stick_path(store, index, site->tier, path)) return false;
+    if (!stick_path(store, index, site->tier, path)
+        || stick_name_protected(site, site->tier, path)) return false;
     stick_close(site);
     stick_make_room(store, index);
     if (site->tier == BROWSER_SITE_STORAGE_STICK_SESSION)
@@ -519,11 +535,25 @@ static bool stick_append(struct BrowserSiteStore *store, size_t index,
     put_u32(header + 16, checksum);
     put_u32(header + 20, fnv32(fnv32(UINT32_C(2166136261), header, 20),
                                key, key_length));
-    if (fseek(file, (long) site->file_bytes, SEEK_SET) != 0
-        || fwrite(header, 1, sizeof(header), file) != sizeof(header)
-        || fwrite(key, 1, key_length, file) != key_length
-        || (value_length != 0
-            && fwrite(value, 1, value_length, file) != value_length)) {
+    /* The record is acknowledged only once it has left the stdio buffer:
+       a full stick or a write error must fail this call, not a later one,
+       or file_bytes would count a record that is not on the card and the
+       next load would end the log at the hole it leaves. On failure
+       file_bytes stays, so the next append overwrites whatever part of the
+       record did land. */
+    bool flushed = fseek(file, (long) site->file_bytes, SEEK_SET) == 0
+        && fwrite(header, 1, sizeof(header), file) == sizeof(header)
+        && fwrite(key, 1, key_length, file) == key_length
+        && (value_length == 0
+            || fwrite(value, 1, value_length, file) == value_length)
+        && fflush(file) == 0;
+#ifndef __PSP__
+    if (flushed && tilefinch_test_faults()->fail_site_storage_flushes != 0) {
+        tilefinch_test_faults()->fail_site_storage_flushes--;
+        flushed = false;
+    }
+#endif
+    if (!flushed) {
         clearerr(file);
         return false;
     }
@@ -650,12 +680,6 @@ static void stick_drop_site_items(BrowserSession *session,
         if (store->items[i].site == index) item_drop(session, store, i);
 }
 
-typedef enum {
-    STICK_LOG_MISSING = 0,   /* could not be opened */
-    STICK_LOG_INVALID,       /* opened, but not this site's log */
-    STICK_LOG_VALID
-} StickLogState;
-
 /* Opens name as the site's log when its header is intact, leaving the
    position after the header. */
 static StickLogState stick_open_log(const char *name, const char *site_origin,
@@ -669,15 +693,23 @@ static StickLogState stick_open_log(const char *name, const char *site_origin,
     if (fseek(file, 0, SEEK_END) == 0) *end = ftell(file);
     unsigned char header[STICK_HEADER_FIXED];
     char origin[BROWSER_ORIGIN_LIMIT];
-    bool valid = *end >= (long) STICK_HEADER_FIXED
+    bool tagged = *end >= (long) STICK_HEADER_FIXED
         && fseek(file, 0, SEEK_SET) == 0
         && fread(header, 1, sizeof(header), file) == sizeof(header)
-        && memcmp(header, "TFSS", 4) == 0 && header[4] == STICK_VERSION
+        && memcmp(header, "TFSS", 4) == 0;
+    if (tagged && header[4] > STICK_VERSION) {
+        fclose(file);
+        return STICK_LOG_NEWER;
+    }
+    bool valid = tagged && header[4] == STICK_VERSION
         && (*origin_length = get_u16(header + 6)) < sizeof(origin)
         && fread(origin, 1, *origin_length, file) == *origin_length;
     if (valid) {
         origin[*origin_length] = '\0';
-        valid = strcmp(origin, site_origin) == 0;
+        if (strcmp(origin, site_origin) != 0) {
+            fclose(file);
+            return STICK_LOG_FOREIGN;
+        }
     }
     if (!valid) {
         fclose(file);
@@ -685,6 +717,34 @@ static StickLogState stick_open_log(const char *name, const char *site_origin,
     }
     *opened = file;
     return STICK_LOG_VALID;
+}
+
+/* An always-kept log is named by a 64-bit hash of its origin, so another
+   origin's log can hold the name, and a later release may have written it
+   in a format this one cannot read. Neither may be truncated, replaced or
+   replaced on this site's behalf, and only the user's own removal of this
+   site's data may delete a newer one. Session logs are named by slot and
+   die at exit, so whatever holds their names is dead data (MISSING). */
+static StickLogState stick_name_state(const SiteRecord *site,
+                                      BrowserSiteStorageTier tier,
+                                      const char *name)
+{
+    if (tier != BROWSER_SITE_STORAGE_STICK_ALWAYS) return STICK_LOG_MISSING;
+    FILE *file = NULL;
+    long end = -1;
+    size_t origin_length = 0;
+    StickLogState state = stick_open_log(name, site->origin, &file, &end,
+                                         &origin_length);
+    if (file != NULL) fclose(file);
+    return state;
+}
+
+static bool stick_name_protected(const SiteRecord *site,
+                                 BrowserSiteStorageTier tier,
+                                 const char *name)
+{
+    StickLogState state = stick_name_state(site, tier, name);
+    return state == STICK_LOG_FOREIGN || state == STICK_LOG_NEWER;
 }
 
 /* True when name is the site's log and every record in it, value
@@ -762,6 +822,11 @@ static bool stick_load(BrowserSession *session,
         states[i] = stick_open_log(candidates[i], site->origin, &probe,
                                    &probe_end, &probe_origin);
         if (probe != NULL) fclose(probe);
+        if (states[i] == STICK_LOG_FOREIGN || states[i] == STICK_LOG_NEWER) {
+            if (site->tier == BROWSER_SITE_STORAGE_STICK_ALWAYS)
+                return false;   /* not ours: leave every copy alone */
+            states[i] = STICK_LOG_INVALID;
+        }
     }
     size_t chosen = 3;
     if (states[2] == STICK_LOG_VALID) {
@@ -800,10 +865,24 @@ static bool stick_load(BrowserSession *session,
     }
     size_t offset = STICK_HEADER_FIXED + origin_length;
     bool failed = false;
+    bool session_records = false;
     char key[BROWSER_OPFS_PATH_LIMIT];
+#ifndef __PSP__
+    unsigned read_fault = tilefinch_test_faults()->fail_site_storage_load_read_at;
+    tilefinch_test_faults()->fail_site_storage_load_read_at = 0;
+    unsigned records_read = 0;
+#endif
     for (;;) {
         unsigned char record[STICK_RECORD_HEADER];
-        if (fread(record, 1, sizeof(record), file) != sizeof(record)) break;
+        bool header_read =
+            fread(record, 1, sizeof(record), file) == sizeof(record);
+#ifndef __PSP__
+        if (read_fault != 0 && ++records_read == read_fault) {
+            header_read = false;
+            failed = true;
+        }
+#endif
+        if (!header_read) break;
         uint8_t kind = record[0], op = record[1];
         size_t key_length = get_u16(record + 2);
         size_t value_length = get_u32(record + 4);
@@ -821,6 +900,7 @@ static bool stick_load(BrowserSession *session,
         int existing = item_find(store, index, kind, key);
         if (kind == ITEM_SESSION) {
             site->dead_bytes += length;
+            session_records = true;
         } else if (op == RECORD_REMOVE) {
             site->dead_bytes += length;
             if (existing >= 0) {
@@ -870,6 +950,11 @@ static bool stick_load(BrowserSession *session,
         }
         offset += length;
     }
+    /* A short read is a torn tail only when the card answered. A read
+       error says nothing about what follows, so fail the load instead of
+       ending the log here, which would let the next append overwrite every
+       record after it. */
+    if (ferror(file)) failed = true;
     if (failed) {
         fclose(file);
         stick_drop_site_items(session, store, index);
@@ -882,8 +967,11 @@ static bool stick_load(BrowserSession *session,
     site->loaded = true;
     /* A torn tail needs no repair: appends start at the last good record
        and overwrite it, and a load always stops at the first bad one. */
-    if (site->dead_bytes > STICK_LOAD_COMPACT_DEAD_BYTES
-        && site->dead_bytes >= site->bytes)
+    /* sessionStorage from an earlier boot is dead on arrival but readable
+       in the file: rewrite it away at once, whatever its size. */
+    if (session_records
+        || (site->dead_bytes > STICK_LOAD_COMPACT_DEAD_BYTES
+            && site->dead_bytes >= site->bytes))
         (void) stick_compact(session, store, index);
     return true;
 }
@@ -917,7 +1005,8 @@ static bool site_move_to_stick(BrowserSession *session,
         }
     }
     site->tier = tier;
-    bool ok = stick_create(store, index);
+    bool created = stick_create(store, index);
+    bool ok = created;
     size_t ordinal = 0;
     for (size_t i = 0; ok && i < store->item_count; i++) {
         const SiteItem *item = &store->items[i];
@@ -934,7 +1023,7 @@ static bool site_move_to_stick(BrowserSession *session,
     if (!ok) {
         char path[STICK_PATH_BYTES];
         stick_close(site);
-        if (stick_path(store, index, tier, path)) remove(path);
+        if (created && stick_path(store, index, tier, path)) remove(path);
         site->tier = BROWSER_SITE_STORAGE_MEMORY;
         site->file_bytes = 0;
         budget_free(session->budget, offsets);
@@ -967,7 +1056,8 @@ static bool site_retier(struct BrowserSiteStore *store, size_t index,
     SiteRecord *site = &store->sites[index];
     char from[STICK_PATH_BYTES], to[STICK_PATH_BYTES];
     if (!stick_path(store, index, site->tier, from)
-        || !stick_path(store, index, tier, to)) return false;
+        || !stick_path(store, index, tier, to)
+        || stick_name_protected(site, tier, to)) return false;
     stick_close(site);
     if (tier == BROWSER_SITE_STORAGE_STICK_SESSION)
         stick_mark_session_files(store);
@@ -985,13 +1075,39 @@ static void site_remove_file(struct BrowserSiteStore *store, size_t index)
     char path[STICK_PATH_BYTES], other[STICK_PATH_BYTES];
     stick_close(site);
     if (stick_path(store, index, site->tier, path)) {
-        remove(path);
+        if (stick_name_state(site, site->tier, path) != STICK_LOG_FOREIGN)
+            remove(path);
         /* A load would bring an interrupted compaction's copy back. */
-        if (temporary_path(path, other)) remove(other);
-        if (backup_path(path, other)) remove(other);
+        if (temporary_path(path, other)
+            && stick_name_state(site, site->tier, other) != STICK_LOG_FOREIGN)
+            remove(other);
+        if (backup_path(path, other)
+            && stick_name_state(site, site->tier, other) != STICK_LOG_FOREIGN)
+            remove(other);
     }
     site->file_bytes = 0;
     site->dead_bytes = 0;
+}
+
+/* A removal on the stick only appends a REMOVE record: the cleared value
+   stays readable in the log's SET record until a compaction. After a clear,
+   rewrite the log with its live records, or delete it when none remain, so
+   "cleared" also means gone from the card. False when the old values are
+   still there. */
+static bool stick_scrub(BrowserSession *session,
+                        struct BrowserSiteStore *store, size_t index)
+{
+    SiteRecord *site = &store->sites[index];
+    if (!stick_tier(site) || !site->loaded || site->file_bytes == 0
+        || site->dead_bytes == 0) return true;
+    if (site->item_count == 0) {
+        char path[STICK_PATH_BYTES];
+        site_remove_file(store, index);
+        struct stat status;
+        return !stick_path(store, index, site->tier, path)
+            || stat(path, &status) != 0;
+    }
+    return stick_compact(session, store, index);
 }
 
 /* ---- admission -------------------------------------------------------- */
@@ -1298,6 +1414,9 @@ bool browser_session_storage_clear(BrowserSession *session, const char *url,
         if (store->items[i].site == (size_t) index
             && store->items[i].kind == storage_kind(local)
             && !item_remove(session, i)) cleared = false;
+    /* The page's clear() is done once the removals are logged; scrubbing
+       the values off the card is best effort here. */
+    (void) stick_scrub(session, store, (size_t) index);
     site_idle(session, (size_t) index);
     return cleared;
 }
@@ -1319,6 +1438,10 @@ bool browser_session_storage_clear_all(BrowserSession *session, bool local)
     for (size_t i = store->item_count; i-- > 0;)
         if (store->items[i].kind == storage_kind(local)
             && !item_remove(session, i)) cleared = false;
+    /* The user's clear promises the values are gone from the card too. */
+    for (size_t i = 0; i < BROWSER_SITE_STORAGE_SITES; i++)
+        if (store->sites[i].used && !stick_scrub(session, store, i))
+            cleared = false;
     for (size_t i = 0; i < BROWSER_SITE_STORAGE_SITES; i++)
         site_release_if_idle(store, i);
     store_trim(session);

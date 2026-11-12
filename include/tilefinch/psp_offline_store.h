@@ -38,6 +38,12 @@ typedef struct {
        that work runs, e.g. on the PSP's busy-work status line. */
     void (*show_progress)(void *context, const char *status);
     void *show_progress_context;
+    /* Optional: called with a preview's view (the app preparation's, the
+       file offer's or the ZIP install's) just before that view is freed.
+       A frontend that draws a copy of its UI state from another thread
+       drops the copy's pointer here (the PSP's loading supervisor); the
+       live UI has already closed the overlay or never showed it. */
+    void (*release_view)(const void *view);
     /* Library row activation of an app with stale bytecode: the app the
        recompile offer is shown for, and one the user chose to open anyway. */
     uint32_t recompile_offer_id;

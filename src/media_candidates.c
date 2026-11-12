@@ -1,5 +1,6 @@
 #include "tilefinch/media_candidates.h"
 #include "tilefinch/media_failure_message.h"
+#include "tilefinch/media_hls.h"
 #include "tilefinch/media_mp4.h"
 
 #include <string.h>
@@ -139,6 +140,8 @@ bool media_candidate_refused(const char *error)
         "requires exactly one SPS and PPS",
         "High profile format coming soon",
         "has no supported track",
+        /* A finite HLS playlist past the retained entry or text bound. */
+        MEDIA_HLS_PLAYLIST_TOO_LONG,
         "(HTTP 4",
         /* A stream address with nothing to play now: an empty or ended
            playlist, or an error body where media was expected

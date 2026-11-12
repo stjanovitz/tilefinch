@@ -1,0 +1,20 @@
+# Measurement scenario, not golden-gated: the ia-search performance journey
+# (benchmarks/perf-journeys.tsv). Internet Archive search results for
+# "psp": let the page's scripts build the result grid, then page down three
+# times on the ready page. Read the full and fast relayout counts on
+# tilefinch-input-stylesheets at each mark (every full rebuild reloads the
+# whole sheet and resolves every style again), the navigation phases and
+# the budget peak.
+wait-live 90
+wait-page 90
+mark-page top
+tap-page rtrigger
+wait-page 45
+mark-page p1
+tap-page rtrigger
+wait-page 45
+tap-page rtrigger
+wait-page 45
+mark-page p3
+wait-page 30
+end

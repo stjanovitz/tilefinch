@@ -137,19 +137,45 @@ static void navigation_retire_subtree(void *opaque,
     layout_reuse_cache_retire_subtree(session->page.layout_reuse, root);
 }
 
-/* Idempotent: the page runtime reports every freed subtree to the page
-   cache from the first journal consumption on; earlier frees stayed
-   conservative through the journal's overflow signal. */
+static bool navigation_node_retirement_disabled(void)
+{
+#ifndef TILEFINCH_NO_TRACE
+    if (getenv("TILEFINCH_DISABLE_NODE_RETIREMENT") != NULL) return true;
+#endif
+    return false;
+}
+
+/* A runtime reports every subtree it frees from before its first script can
+   run, cache or no cache: whatever is retained later or adopted from the
+   preview must not hold a node freed earlier, and a free is seen by nothing
+   else unless a journal record happens to name a node inside it. Idempotent;
+   also marks a cache created since (navigation_prepare_layout_reuse). */
 static void navigation_bind_node_retirement(NavigationSession *session)
 {
     if (session == NULL || session->page.runtime == NULL
-        || session->page.layout_reuse == NULL) return;
-#ifndef TILEFINCH_NO_TRACE
-    if (getenv("TILEFINCH_DISABLE_NODE_RETIREMENT") != NULL) return;
-#endif
+        || navigation_node_retirement_disabled()) return;
     script_runtime_set_node_retirement_callback(
         session->page.runtime, navigation_retire_subtree, session);
     layout_reuse_cache_enable_node_retirement(session->page.layout_reuse);
+}
+
+/* The parser's realm frees nodes the preview's layout cache holds, and that
+   cache and sheet become the page's at commit, which rebinds the realm to
+   navigation_retire_subtree. */
+static void navigation_stream_retire_subtree(void *opaque,
+                                             const lxb_dom_node_t *root)
+{
+    NavigationDocumentStream *stream = opaque;
+    navigation_retire_style_sources(&stream->blocking_stylesheet, root);
+    layout_reuse_cache_retire_subtree(stream->preview_layout_reuse, root);
+}
+
+static void navigation_stream_bind_node_retirement(
+    NavigationDocumentStream *stream)
+{
+    if (navigation_node_retirement_disabled()) return;
+    script_runtime_set_node_retirement_callback(
+        stream->runtime, navigation_stream_retire_subtree, stream);
 }
 
 static bool navigation_mutation_is_transient(

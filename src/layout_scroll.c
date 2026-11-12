@@ -406,8 +406,11 @@ bool layout_scroll_node_chain(LayoutDocument *layout, lxb_dom_node_t *node,
         int next_y = scroll_apply_axis(
             box->scroll_y, maximum_y < 0 ? 0 : maximum_y,
             rest_y, &next_rest_y);
-        if (next_x != box->scroll_x || next_y != box->scroll_y)
+        if (next_x != box->scroll_x || next_y != box->scroll_y) {
             layout->scroll_generation++;
+            layout_note_scroll_travel(layout, next_x - box->scroll_x,
+                                      next_y - box->scroll_y);
+        }
         changed |= next_x != box->scroll_x || next_y != box->scroll_y;
         box->scroll_x = next_x;
         box->scroll_y = next_y;
@@ -642,7 +645,13 @@ void layout_scroll_placement_prepare(const LayoutDocument *layout,
 
 enum { SCROLL_PLACEMENT_CLIP_LIMIT = 16 };
 
-static bool scroll_placement_walk(const LayoutDocument *layout,
+static const LayoutNodeBox *scroll_layout_box(const void *layout,
+                                              const lxb_dom_node_t *node)
+{
+    return layout_box_for_node(layout, node);
+}
+
+static bool scroll_placement_walk(LayoutBoxLookup lookup, const void *boxes,
                                   const lxb_dom_node_t *node,
                                   bool overflow_clips,
                                   LayoutScrollPlacement *placement)
@@ -654,12 +663,12 @@ static bool scroll_placement_walk(const LayoutDocument *layout,
     size_t applied_count = 0;
     bool enclosed = false;
     int dx = 0, dy = 0;
-    unsigned skip = scroll_escape_span(layout_box_for_node(layout, node));
+    unsigned skip = scroll_escape_span(lookup(boxes, node));
     unsigned steps = 0;
     for (const lxb_dom_node_t *at = node->parent;
          at != NULL && steps < SCROLL_ANCESTOR_LIMIT;
          at = at->parent, steps++) {
-        const LayoutNodeBox *box = layout_box_for_node(layout, at);
+        const LayoutNodeBox *box = lookup(boxes, at);
         bool escaped = skip != 0;
         if (escaped) skip--;
         unsigned span = scroll_escape_span(box);
@@ -732,7 +741,8 @@ bool layout_node_scroll_placement(const LayoutDocument *layout,
         }
         if (!enclosed) return false;
     }
-    return scroll_placement_walk(layout, node, false, placement);
+    return scroll_placement_walk(scroll_layout_box, layout, node, false,
+                                 placement);
 }
 
 bool layout_node_overflow_placement(const LayoutDocument *layout,
@@ -745,7 +755,22 @@ bool layout_node_overflow_placement(const LayoutDocument *layout,
         .clip_right = INT_MAX / 2, .clip_bottom = INT_MAX / 2
     };
     if (layout == NULL || node == NULL) return false;
-    return scroll_placement_walk(layout, node, true, placement);
+    return scroll_placement_walk(scroll_layout_box, layout, node, true,
+                                 placement);
+}
+
+bool layout_boxes_overflow_placement(LayoutBoxLookup lookup,
+                                     const void *boxes,
+                                     const lxb_dom_node_t *node,
+                                     LayoutScrollPlacement *placement)
+{
+    if (placement == NULL) return false;
+    *placement = (LayoutScrollPlacement) {
+        .clip_left = INT_MIN / 2, .clip_top = INT_MIN / 2,
+        .clip_right = INT_MAX / 2, .clip_bottom = INT_MAX / 2
+    };
+    if (lookup == NULL || node == NULL) return false;
+    return scroll_placement_walk(lookup, boxes, node, true, placement);
 }
 
 LayoutCursor layout_cursor_for_node(const Stylesheet *stylesheet,

@@ -452,6 +452,9 @@ typedef enum {
     LAZY_BOOTSTRAP_OPFS,
     LAZY_BOOTSTRAP_TRAVERSAL,
     LAZY_BOOTSTRAP_SHADOW,
+    LAZY_BOOTSTRAP_DOCUMENTS,
+    LAZY_BOOTSTRAP_FORMS,
+    LAZY_BOOTSTRAP_CSSOM_RULES,
     LAZY_BOOTSTRAP_COUNT
 } LazyBootstrapFeature;
 
@@ -584,6 +587,9 @@ static const char *runtime_lazy_bootstrap_name(LazyBootstrapFeature feature)
     case LAZY_BOOTSTRAP_OPFS: return "Origin-private file system";
     case LAZY_BOOTSTRAP_TRAVERSAL: return "DOM traversal";
     case LAZY_BOOTSTRAP_SHADOW: return "Shadow DOM ownership";
+    case LAZY_BOOTSTRAP_DOCUMENTS: return "Secondary documents";
+    case LAZY_BOOTSTRAP_FORMS: return "Form collections";
+    case LAZY_BOOTSTRAP_CSSOM_RULES: return "CSSOM rules";
     default: return "Platform feature";
     }
 }
@@ -813,7 +819,6 @@ static JSValue runtime_harden_global_hooks(JSContext *context,
         "__tilefinchResizeRecheck",
         "__tilefinchRestoreSameDocument",
         "__tilefinchSetFrameWindowState",
-        "__tilefinchTrustedEvent",
         "__tilefinchTrustedString",
         "__tilefinchUpdateGamepad",
     };
@@ -906,10 +911,14 @@ static bool runtime_define_host_channel(ScriptRuntime *runtime,
             return false;
         }
     }
+    /* Only TRUE counts: a page-owned non-configurable name answers FALSE,
+       and its accessor would then receive what the bootstrap attaches and
+       hand the native a page object in its place (see
+       runtime_lazy_test_probes). */
     JSValue global = JS_GetGlobalObject(context);
     bool defined = JS_DefinePropertyValueStr(
         context, global, "__tilefinchHostChannel", channel,
-        JS_PROP_CONFIGURABLE) >= 0;
+        JS_PROP_CONFIGURABLE) > 0;
     JS_FreeValue(context, global);
     return defined;
 }
@@ -978,6 +987,22 @@ static const JsRtNative runtime_motion_source_bridge = {
     JS_RT_NATIVE_TRANSIENT };
 static const JsRtNative runtime_opfs_command = {
     "__tilefinchOpfsCommand", js_opfs_command, 4, JS_RT_NATIVE_TRANSIENT };
+/* canvas.js captures these; page code never sees them. */
+static const JsRtNative runtime_canvas_private_natives[] = {
+    { "__tilefinchCanvasNativeSurface", js_canvas_native_surface, 4,
+      JS_RT_NATIVE_TRANSIENT },
+    { "__tilefinchCanvasBitmapSurface", js_canvas_bitmap_surface, 2,
+      JS_RT_NATIVE_TRANSIENT },
+    { "__tilefinchCanvasOriginClean", js_canvas_origin_clean, 1,
+      JS_RT_NATIVE_TRANSIENT },
+    { "__tilefinchCanvasRasterPattern", js_canvas_raster_pattern, 11,
+      JS_RT_NATIVE_TRANSIENT },
+    { "__tilefinchCanvasPngChecksum", js_canvas_png_checksum, 3,
+      JS_RT_NATIVE_TRANSIENT },
+};
+#define RUNTIME_CANVAS_PRIVATE_NATIVE_COUNT \
+    (sizeof(runtime_canvas_private_natives) \
+     / sizeof(runtime_canvas_private_natives[0]))
 #ifdef TILEFINCH_GAME_AUDIO_REFERENCE
 static const JsRtNative runtime_game_audio_reference_natives[] = {
     { "__tilefinchGameAudioDecode", js_game_audio_decode, 1, 0 },
@@ -1001,12 +1026,30 @@ static bool runtime_load_lazy_bootstrap(
     if (!runtime_lazy_test_probes(runtime, true)) {
         /* A page-defined, non-configurable flag: fail the load. */
     } else if (feature == LAZY_BOOTSTRAP_CANVAS) {
-        evaluated = runtime_evaluate_bootstrap_profiled(
-            runtime, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
-                         browser_bootstrap_canvas,
-                         browser_bootstrap_canvas_bytecode),
-            "<browser-canvas-lazy>", &browser_bootstrap_canvas_bytecode,
-            false, trace, &total_us, &compile_us);
+        JSValue global = JS_GetGlobalObject(runtime->context);
+        bool bridge_ready = !JS_IsException(global)
+            && js_rt_install_natives(
+                   runtime->context, global, runtime_canvas_private_natives,
+                   RUNTIME_CANVAS_PRIVATE_NATIVE_COUNT);
+        if (bridge_ready) {
+            evaluated = runtime_evaluate_bootstrap_profiled(
+                runtime, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
+                             browser_bootstrap_canvas,
+                             browser_bootstrap_canvas_bytecode),
+                "<browser-canvas-lazy>", &browser_bootstrap_canvas_bytecode,
+                false, trace, &total_us, &compile_us);
+        }
+        /* canvas.js deletes them itself; keep them from author code even
+           when its evaluation failed first. */
+        for (size_t i = 0; !JS_IsException(global)
+             && i < RUNTIME_CANVAS_PRIVATE_NATIVE_COUNT; i++) {
+            JSAtom atom = JS_NewAtom(
+                runtime->context, runtime_canvas_private_natives[i].name);
+            if (atom == JS_ATOM_NULL) continue;
+            (void) JS_DeleteProperty(runtime->context, global, atom, 0);
+            JS_FreeAtom(runtime->context, atom);
+        }
+        JS_FreeValue(runtime->context, global);
     } else if (feature == LAZY_BOOTSTRAP_INDEXED_DB) {
         JSValue global = JS_GetGlobalObject(runtime->context);
         JSAtom bridge_atom = JS_NewAtom(
@@ -1106,12 +1149,22 @@ static bool runtime_load_lazy_bootstrap(
             "<browser-webgl-lazy>", &browser_bootstrap_webgl_bytecode,
             false, trace, &total_us, &compile_us);
     } else if (feature == LAZY_BOOTSTRAP_WORKER) {
+        /* worker.js stores its installer in this slot, and the installer
+           receives natives no author code may hold (create_worker_realm
+           evaluates a string, so it would bypass a CSP without
+           'unsafe-eval'). The slot must be the loader's own data property:
+           only TRUE counts as defined (a page-owned non-configurable name
+           answers FALSE and fails the load), the installer is read from
+           the own data descriptor without running any accessor, and the
+           slot is deleted before author code resumes. */
         JSValue global = JS_GetGlobalObject(runtime->context);
+        JSAtom slot_atom = JS_NewAtom(
+            runtime->context, "__tilefinchInstallWorker");
         bool slot_ready = !JS_IsException(global)
-            && JS_DefinePropertyValueStr(
-                   runtime->context, global,
-                   "__tilefinchInstallWorker", JS_UNDEFINED,
-                   JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE) >= 0;
+            && slot_atom != JS_ATOM_NULL
+            && JS_DefinePropertyValue(
+                   runtime->context, global, slot_atom, JS_UNDEFINED,
+                   JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE) > 0;
         if (slot_ready) {
             evaluated = runtime_evaluate_bootstrap_profiled(
                 runtime, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
@@ -1121,17 +1174,24 @@ static bool runtime_load_lazy_bootstrap(
                 &browser_bootstrap_worker_bytecode, false, trace,
                 &total_us, &compile_us);
         }
-        JSValue installer = evaluated
-            ? JS_GetPropertyStr(
-                  runtime->context, global,
-                  "__tilefinchInstallWorker")
-            : JS_UNDEFINED;
-        bool hidden = false;
-        if (slot_ready) {
-            hidden = JS_SetPropertyStr(
-                runtime->context, global,
-                "__tilefinchInstallWorker", JS_UNDEFINED) >= 0;
+        JSValue installer = JS_UNDEFINED;
+        JSPropertyDescriptor slot;
+        if (evaluated
+            && JS_GetOwnProperty(
+                   runtime->context, &slot, global, slot_atom) > 0) {
+            if ((slot.flags & JS_PROP_GETSET) == 0) {
+                installer = slot.value;
+            } else {
+                JS_FreeValue(runtime->context, slot.value);
+            }
+            JS_FreeValue(runtime->context, slot.getter);
+            JS_FreeValue(runtime->context, slot.setter);
         }
+        bool hidden = slot_ready
+            && JS_DeleteProperty(
+                   runtime->context, global, slot_atom, 0) > 0;
+        if (slot_atom != JS_ATOM_NULL)
+            JS_FreeAtom(runtime->context, slot_atom);
         JSValue run_worker = JS_NewCFunction(
             runtime->context, js_runtime_run_worker,
             "__tilefinchRunWorker", 3);
@@ -1159,11 +1219,16 @@ static bool runtime_load_lazy_bootstrap(
             runtime->bridge.document_url != NULL
                 && tilefinch_url_potentially_trustworthy(
                     runtime->bridge.document_url));
+        /* new URL() rejects an empty base even for an absolute input, so
+           a realm with no document URL resolves workers against
+           about:blank (absolute blob: and https: workers still load). */
         JSValue creator_url_value = JS_NewString(
             runtime->context, runtime->bridge.document_url == NULL
+                    || runtime->bridge.document_url[0] == '\0'
                 ? "about:blank" : runtime->bridge.document_url);
         bool installed = hidden
             && JS_IsFunction(runtime->context, installer)
+            && JS_IsFunction(runtime->context, runtime->host_trusted_event)
             && !JS_IsException(run_worker)
             && !JS_IsException(trace_worker_message)
             && !JS_IsException(create_realm)
@@ -1172,13 +1237,14 @@ static bool runtime_load_lazy_bootstrap(
             && !JS_IsException(creator_secure_context)
             && !JS_IsException(creator_url_value);
         if (installed) {
-            JSValue arguments[7] = {
+            JSValue arguments[8] = {
                 run_worker, trace_worker_message, create_realm,
                 destroy_realm, creator_origin_value,
-                creator_secure_context, creator_url_value};
+                creator_secure_context, creator_url_value,
+                runtime->host_trusted_event};
             JSValue result = JS_Call(
                 runtime->context, installer, JS_UNDEFINED,
-                7, arguments);
+                8, arguments);
             installed = !JS_IsException(result);
             JS_FreeValue(runtime->context, result);
         }
@@ -1249,6 +1315,29 @@ static bool runtime_load_lazy_bootstrap(
                          browser_bootstrap_shadow_bytecode),
             "<browser-shadow-lazy>", &browser_bootstrap_shadow_bytecode,
             false, trace, &total_us, &compile_us);
+    } else if (feature == LAZY_BOOTSTRAP_DOCUMENTS) {
+        evaluated = runtime_evaluate_bootstrap_profiled(
+            runtime, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
+                         browser_bootstrap_documents,
+                         browser_bootstrap_documents_bytecode),
+            "<browser-documents-lazy>",
+            &browser_bootstrap_documents_bytecode, false, trace,
+            &total_us, &compile_us);
+    } else if (feature == LAZY_BOOTSTRAP_FORMS) {
+        evaluated = runtime_evaluate_bootstrap_profiled(
+            runtime, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
+                         browser_bootstrap_forms,
+                         browser_bootstrap_forms_bytecode),
+            "<browser-forms-lazy>", &browser_bootstrap_forms_bytecode,
+            false, trace, &total_us, &compile_us);
+    } else if (feature == LAZY_BOOTSTRAP_CSSOM_RULES) {
+        evaluated = runtime_evaluate_bootstrap_profiled(
+            runtime, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
+                         browser_bootstrap_cssom_rules,
+                         browser_bootstrap_cssom_rules_bytecode),
+            "<browser-cssom-rules-lazy>",
+            &browser_bootstrap_cssom_rules_bytecode, false, trace,
+            &total_us, &compile_us);
     } else if (feature == LAZY_BOOTSTRAP_OPFS) {
         JSValue global = JS_GetGlobalObject(runtime->context);
         JSAtom bridge_atom = JS_NewAtom(
@@ -1465,6 +1554,51 @@ static JSValue js_runtime_ensure_shadow_bootstrap(
     return JS_TRUE;
 }
 
+static JSValue js_runtime_ensure_documents_bootstrap(
+    JSContext *context, JSValueConst this_value, int argc,
+    JSValueConst *argv)
+{
+    (void) this_value;
+    (void) argc;
+    (void) argv;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    if (bridge == NULL || !runtime_load_lazy_bootstrap(
+            bridge->host, LAZY_BOOTSTRAP_DOCUMENTS))
+        return JS_ThrowInternalError(context,
+            "Secondary documents could not be initialized");
+    return JS_TRUE;
+}
+
+static JSValue js_runtime_ensure_forms_bootstrap(
+    JSContext *context, JSValueConst this_value, int argc,
+    JSValueConst *argv)
+{
+    (void) this_value;
+    (void) argc;
+    (void) argv;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    if (bridge == NULL || !runtime_load_lazy_bootstrap(
+            bridge->host, LAZY_BOOTSTRAP_FORMS))
+        return JS_ThrowInternalError(context,
+            "Form collections could not be initialized");
+    return JS_TRUE;
+}
+
+static JSValue js_runtime_ensure_rule_bootstrap(
+    JSContext *context, JSValueConst this_value, int argc,
+    JSValueConst *argv)
+{
+    (void) this_value;
+    (void) argc;
+    (void) argv;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    if (bridge == NULL || !runtime_load_lazy_bootstrap(
+            bridge->host, LAZY_BOOTSTRAP_CSSOM_RULES))
+        return JS_ThrowInternalError(context,
+            "CSSOM rules could not be initialized");
+    return JS_TRUE;
+}
+
 static JSValue js_runtime_ensure_canvas_bootstrap(
     JSContext *context, JSValueConst this_value, int argc,
     JSValueConst *argv)
@@ -1627,6 +1761,7 @@ static JSValue js_runtime_create_worker_realm(
 #endif
     JSValue global = JS_GetGlobalObject(realm);
     bool ok = !JS_IsException(global)
+        && js_wasm_guard_buffer_transfer(realm)
         && JS_SetPrototype(realm, global, argv[1]) >= 0
         && js_runtime_copy_scope_properties(context, realm, global, argv[0])
         && JS_DefinePropertyValueStr(
@@ -1954,10 +2089,17 @@ static const JsRtNative runtime_entry_natives[] = {
       js_runtime_ensure_motion_bootstrap, 0, JS_RT_NATIVE_UNPROFILED },
     { "__tilefinchEnsureWebGLBootstrap",
       js_runtime_ensure_webgl_bootstrap, 0, JS_RT_NATIVE_UNPROFILED },
+    { "__tilefinchEnsureDocumentsBootstrap",
+      js_runtime_ensure_documents_bootstrap, 0, 0 },
+    { "__tilefinchEnsureFormsBootstrap",
+      js_runtime_ensure_forms_bootstrap, 0, 0 },
+    { "__tilefinchEnsureRuleBootstrap",
+      js_runtime_ensure_rule_bootstrap, 0, JS_RT_NATIVE_UNPROFILED },
 };
 
 static const JsRtNative runtime_natives_first[] = {
     { "__tilefinchCssSupports", js_css_supports, 2, 0 },
+    { "__tilefinchSelectorSyntaxValid", js_selector_syntax_valid, 1, 0 },
     { "__tilefinchFontShorthandValid", js_font_shorthand_valid, 1, 0 },
     { "__tilefinchCompileInlineEventHandler",
       js_compile_inline_event_handler, 4, 0 },
@@ -2000,6 +2142,8 @@ static const JsRtNative runtime_natives_first[] = {
     { "__tilefinchNextAncestorEntry", js_dom_next_ancestor_entry, 3, 0 },
     { "__tilefinchIsConnected", js_dom_is_connected, 1, 0 },
     { "__tilefinchRootNode", js_dom_root_node, 2, 0 },
+    { "__tilefinchShadowRelevant", js_dom_shadow_relevant, 1, 0 },
+    { "__tilefinchPreInsertClear", js_dom_pre_insert_clear, 5, 0 },
     { "__tilefinchNodeOwner", js_dom_node_owner, 2, 0 },
     { "__tilefinchChildren", js_dom_children, 1, 0 },
     { "__tilefinchChildNodes", js_dom_child_nodes, 1, 0 },
@@ -2029,6 +2173,8 @@ static const JsRtNative runtime_natives_first[] = {
       js_canvas_raster_image_batch, 5, 0 },
     { "__tilefinchNodeType", js_dom_node_type, 1, 0 },
     { "__tilefinchDescendants", js_dom_descendants, 2, 0 },
+    { "__tilefinchCustomElementCandidates",
+      js_dom_custom_element_candidates, 2, 0 },
     { "__tilefinchTraverse", js_dom_traverse, 4, 0 },
     { "__tilefinchObserveParserInsertions",
       js_dom_observe_parser_insertions, 1, 0 },
@@ -2042,8 +2188,10 @@ static const JsRtNative runtime_natives_first[] = {
     { "__tilefinchCreateText", js_dom_create_text, 1, 0 },
     { "__tilefinchCreateComment", js_dom_create_comment, 1, 0 },
     { "__tilefinchSetCustomState", js_dom_set_custom_state, 2, 0 },
-    { "__tilefinchGetCustomState", js_dom_get_custom_state, 1, 0 },
+    { "__tilefinchGetCustomState", js_dom_get_custom_state, 2, 0 },
     { "__tilefinchRetainNodeWrapper", js_dom_retain_node_wrapper, 1, 0 },
+    { "__tilefinchMakeWrapper", js_dom_make_wrapper, 6, 0 },
+    { "__tilefinchNodeWrapper", js_dom_node_wrapper, 1, 0 },
     { "__tilefinchNoteEventState", js_dom_note_event_state, 3, 0 },
     { "__tilefinchGrowEventTargets", js_dom_grow_event_targets, 1, 0 },
     { "__tilefinchGetText", js_dom_get_text, 1, 0 },
@@ -2071,6 +2219,7 @@ static const JsRtNative runtime_natives_second[] = {
     { "__tilefinchRenderedText", js_dom_rendered_text, 1, 0 },
     { "__tilefinchComputedStyleSupport", js_computed_style_support, 1, 0 },
     { "__tilefinchTransitionSnapshot", js_transition_snapshot, 2, 0 },
+    { "__tilefinchTransitionDiscover", js_transition_discover, 2, 0 },
     { "__tilefinchTimingFunction", js_timing_function, 1, 0 },
     { "__tilefinchAttributeChangeMayAffectHas",
       js_attribute_change_may_affect_has, 3, 0 },
@@ -2078,8 +2227,7 @@ static const JsRtNative runtime_natives_second[] = {
     { "__tilefinchStyleSet", js_style_set, 3, 0 },
     { "__tilefinchAppend", js_dom_append, 2, 0 },
     { "__tilefinchPrepareDynamicSubtree",
-      js_dom_prepare_dynamic_subtree, 1, 0 },
-    { "__tilefinchAppendMany", js_dom_append_many, 2, 0 },
+      js_dom_prepare_dynamic_subtree, 3, 0 },
     { "__tilefinchInsertBefore", js_dom_insert_before, 3, 0 },
     { "__tilefinchRemove", js_dom_remove, 1, 0 },
     { "__tilefinchRecordEvent", js_dom_record_event, 0, 0 },
@@ -2119,7 +2267,7 @@ static const JsRtNative runtime_natives_third[] = {
     { "__tilefinchEncodeUtf8", js_utf8_encode, 1, JS_RT_NATIVE_TRANSIENT },
     { "__tilefinchDetachArrayBuffer", js_detach_array_buffer, 1, 0 },
     { "__tilefinchIsProxy", js_is_proxy, 1, 0 },
-    { "__tilefinchCryptoDigestSHA256", js_crypto_digest_sha256, 1, 0 },
+    { "__tilefinchCryptoDigest", js_crypto_digest, 2, 0 },
     { "__tilefinchVerifyResourceIntegrity",
       js_resource_integrity_verify, 2, 0 },
     { "__tilefinchBase64EncodeBytes", js_base64_encode_bytes, 1, 0 },
@@ -2143,8 +2291,10 @@ static const JsRtNative runtime_natives_third[] = {
     { "__tilefinchRequestScroll", js_request_scroll, 1, 0 },
     { "__tilefinchGeometry", js_element_geometry, 1, 0 },
     { "__tilefinchSetElementScroll", js_set_element_scroll, 3, 0 },
-    { "__tilefinchCreateFrameEval", js_create_frame_eval, 2, 0 },
+    { "__tilefinchCreateFrameEval", js_create_frame_eval, 3, 0 },
     { "__tilefinchFrameScope", js_frame_scope, 1, 0 },
+    { "__tilefinchParserWrite",
+      js_dom_parser_write, 1, JS_RT_NATIVE_TRANSIENT },
 };
 
 typedef struct {
@@ -2520,7 +2670,8 @@ static bool runtime_create_engine(ScriptRuntime *host, Budget *budget,
         snprintf(result->error, sizeof(result->error), "could not create QuickJS context");
         return false;
     }
-    if (!js_wasm_runtime_init(host->runtime)) {
+    if (!js_wasm_runtime_init(host->runtime)
+        || !js_wasm_guard_buffer_transfer(host->context)) {
         snprintf(result->error, sizeof(result->error),
                  "could not initialize WebAssembly bindings");
         return false;
@@ -3015,6 +3166,8 @@ static bool runtime_install_late_surface(ScriptRuntime *host,
     bool evaluated = true;
     if (evaluated)
         evaluated = runtime_install_legacy_surface(host, global);
+    if (evaluated)
+        evaluated = runtime_install_page_dialogs(host, global);
     if (evaluated) {
         /* Publish after bootstrap reflection so QuickJS's lazy function
            entry remains cold on pages that never register a property. */
@@ -3067,6 +3220,16 @@ static bool runtime_capture_trusted_hooks(ScriptRuntime *host,
             && JS_IsFunction(host->context, host->host_event_constructor)
             && JS_IsFunction(host->context, host->host_trusted_event)
             && runtime_capture_host_callbacks(host, global);
+        /* The marker sets an event's isTrusted. compat.js leaves it for
+           this capture only; a page that could call it could forge
+           trusted events. Lazy worker.js receives it from its loader. */
+        if (evaluated) {
+            JSAtom marker = JS_NewAtom(host->context,
+                                       "__tilefinchTrustedEvent");
+            evaluated = marker != JS_ATOM_NULL
+                && JS_DeleteProperty(host->context, global, marker, 0) > 0;
+            if (marker != JS_ATOM_NULL) JS_FreeAtom(host->context, marker);
+        }
     }
     return evaluated;
 }

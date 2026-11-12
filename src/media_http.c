@@ -7,7 +7,9 @@
 
 #include "tilefinch/fetch.h"
 #include "tilefinch/media_failure_message.h"
+#include "tilefinch/media_mp3.h"
 #include "tilefinch/platform.h"
+#include "tilefinch/url.h"
 #include "tilefinch/user_agent.h"
 #include "tilefinch_compiler.h"
 
@@ -15,6 +17,11 @@
 #define MEDIA_HTTP_MINIMUM_CACHE_BYTES (4u * 1024u)
 #define MEDIA_HTTP_MAXIMUM_CACHE_BYTES (256u * 1024u)
 #define MEDIA_HTTP_MAXIMUM_LOOKAHEAD_WINDOWS 2u
+/* A retained window served a read within this many completed reads is still
+   in use. One sequential reader leaves its previous window behind within a
+   few dozen reads; a muxed MP4's second track reads its own window every
+   few samples. */
+#define MEDIA_HTTP_RECENT_WINDOW_READS 64u
 #define MEDIA_HTTP_USER_AGENT TILEFINCH_BROWSER_USER_AGENT
 /*
  * Start the next window after one quarter of the current one has been
@@ -71,6 +78,15 @@ struct MediaHttpRange {
     unsigned lookahead_capacity;
     unsigned lookahead_slots;
     unsigned lookahead_count;
+    /* Completed reads so far, and the clock value of the last read each
+       resident window served (zero: none yet). A demuxer with two read
+       positions in one range -- a muxed fragmented MP4 keeps a fragment's
+       video run and audio run apart -- reads two windows alternately; the
+       stamps keep read-ahead from evicting the window the other position is
+       still reading. */
+    uint64_t read_clock;
+    uint64_t cache_last_read;
+    uint64_t lookahead_last_read[MEDIA_HTTP_MAXIMUM_LOOKAHEAD_WINDOWS];
     unsigned lookahead_fetch_limit;
     size_t stream_publication_bytes;
     uint64_t content_length;
@@ -286,6 +302,22 @@ bool media_http_build_probe_range_header(char *output, size_t output_size)
         0, MEDIA_HTTP_PROBE_RANGE_BYTES - 1u, output, output_size);
 }
 
+/* A probe response's Set-Cookie headers, kept as for any page media
+   response so the reopen that follows carries them. */
+static void probe_keep_cookies(
+    BrowserSession *session, const TilefinchRequestContext *context,
+    const FetchResult *result)
+{
+    TilefinchRequestContext cookie_context = *context;
+    for (size_t at = 0; session != NULL && at < result->set_cookie_count;
+         at++) {
+        cookie_context.target_url = fetch_set_cookie_url(
+            result, at, result->effective_url);
+        (void) browser_session_cookie_set_http_context(
+            session, &cookie_context, result->set_cookies[at]);
+    }
+}
+
 MediaHttpProbeRoute media_http_probe_route(
     BrowserSession *session, const TilefinchRequestContext *context,
     bool hls_allowed, const FetchResult *result, bool fetched,
@@ -322,15 +354,59 @@ MediaHttpProbeRoute media_http_probe_route(
         *complete_length = 0;
         return route;
     }
-    TilefinchRequestContext cookie_context = *context;
-    for (size_t at = 0; session != NULL && at < result->set_cookie_count;
-         at++) {
-        cookie_context.target_url = fetch_set_cookie_url(
-            result, at, result->effective_url);
-        (void) browser_session_cookie_set_http_context(
-            session, &cookie_context, result->set_cookies[at]);
-    }
+    probe_keep_cookies(session, context, result);
     return route;
+}
+
+MediaHttpProbeRoute media_http_probe_route_audio(
+    BrowserSession *session, const TilefinchRequestContext *context,
+    const FetchResult *result, bool fetched, uint64_t *complete_length,
+    bool *seekable)
+{
+    if (complete_length != NULL) *complete_length = 0;
+    if (seekable != NULL) *seekable = false;
+    if (context == NULL || result == NULL || complete_length == NULL
+        || seekable == NULL) return MEDIA_HTTP_PROBE_REFUSED;
+    if (!fetched) {
+        /* An endless body overflows the sniff window; the stream request
+           decides what it is. A status that did arrive must still be a
+           success: a large error page is not audio. */
+        bool success = result->status_code == 0
+            || (result->status_code >= 200 && result->status_code < 300);
+        return result->response_limit_exceeded && success
+            ? MEDIA_HTTP_PROBE_MP3 : MEDIA_HTTP_PROBE_REFUSED;
+    }
+    const unsigned char *body = (const unsigned char *) result->data;
+    bool mp3 = result->status_code >= 200 && result->status_code < 300
+        && (media_mp3_content_type(result->content_type)
+            || media_mp3_sniff(body, body == NULL ? 0 : result->length));
+    if (!mp3) {
+        return media_http_probe_route(
+            session, context, false, result, fetched, complete_length);
+    }
+    char content_range[128];
+    TilefinchResourceGrant grant;
+    TilefinchResourceDeniedReason denied;
+    if (!fetch_resource_grant_create(
+            result, context, context->mode == TILEFINCH_REQUEST_MODE_CORS,
+            true, false, &grant, &denied)) return MEDIA_HTTP_PROBE_REFUSED;
+    if (result->status_code == 206) {
+        if (result->length == 0u
+            || !fetch_response_header_value(
+                   result, "content-range", content_range,
+                   sizeof(content_range))
+            || !media_http_parse_content_range(
+                   content_range, 0, MEDIA_HTTP_PROBE_RANGE_BYTES - 1u,
+                   result->length, complete_length)) {
+            *complete_length = 0;
+            return MEDIA_HTTP_PROBE_REFUSED;
+        }
+        *seekable = true;
+    } else {
+        *complete_length = result->length;
+    }
+    probe_keep_cookies(session, context, result);
+    return MEDIA_HTTP_PROBE_MP3;
 }
 
 /* One request shape for both the blocking and the issue/poll paths, so a
@@ -1207,6 +1283,7 @@ static bool range_fill_install_into(
         range->cache_offset = aligned;
         range->cache_length = taken.received;
         range->cache_consumed = 0;
+        range->cache_last_read = 0;
     } else {
         unsigned slot = lookahead_slot;
         if (slot >= range->lookahead_slots) return false;
@@ -1261,28 +1338,148 @@ static bool range_fill_install(MediaHttpRange *range)
         range, range->cache, range->cache_capacity, true, 0);
 }
 
-static bool range_fill_install_lookahead(
-    MediaHttpRange *range, bool preserve_predecessor)
+static bool range_window_recent(const MediaHttpRange *range, uint64_t stamp)
+{
+    return stamp != 0 && range->read_clock - stamp
+        < MEDIA_HTTP_RECENT_WINDOW_READS;
+}
+
+/* Unregister one owned window. Registered slots stay contiguous; buffers
+   only exchange places, so an in-flight streamed fill (always in an
+   unregistered slot) keeps its own buffer. */
+static void range_lookahead_forget(MediaHttpRange *range, unsigned slot)
+{
+    if (slot >= range->lookahead_count) return;
+    unsigned last = range->lookahead_count - 1u;
+    size_t dropped = range->lookahead_length[slot];
+    if (slot != last) {
+        unsigned char *buffer = range->lookahead[slot];
+        range->lookahead[slot] = range->lookahead[last];
+        range->lookahead[last] = buffer;
+        range->lookahead_offset[slot] = range->lookahead_offset[last];
+        range->lookahead_length[slot] = range->lookahead_length[last];
+        range->lookahead_last_read[slot] = range->lookahead_last_read[last];
+    }
+    range->lookahead_offset[last] = 0;
+    range->lookahead_length[last] = 0;
+    range->lookahead_last_read[last] = 0;
+    range->lookahead_count = last;
+    range->stats.lookahead_retained_bytes =
+        dropped > range->stats.lookahead_retained_bytes
+            ? 0 : range->stats.lookahead_retained_bytes - dropped;
+}
+
+/*
+ * Choose the owned slot a completed fill lands in. A streamed fill's bytes
+ * are already in its own unregistered slot, which becomes the next
+ * registered one. Otherwise a free slot, else a victim: never one of the
+ * active window's sequential successors, never its immediate predecessor
+ * when `preserve_predecessor` asks (a lazy demux reads behind itself), and
+ * for speculative read-ahead never a window a read used recently -- with two
+ * read positions in one range that is the other position's window, and
+ * evicting it refetched a window on every switch between them. Of the rest
+ * the least recently read goes. A demanded window always gets a slot: when
+ * every slot holds a successor, the farthest one is needed last.
+ */
+static bool range_fill_slot(
+    MediaHttpRange *range, bool speculative, bool preserve_predecessor,
+    unsigned *slot_out)
 {
     if (range->lookahead_slots == 0
         || range->fill_length > range->cache_capacity) return false;
-    unsigned slot = range->lookahead_count;
-    if (slot >= range->lookahead_slots) {
-        bool successor[MEDIA_HTTP_MAXIMUM_LOOKAHEAD_WINDOWS] = {false};
-        (void) range_contiguous_lookahead_tail(
-            range, NULL, successor);
-        for (slot = 0; slot < range->lookahead_count; slot++) {
-            uint64_t offset = range->lookahead_offset[slot];
-            size_t length = range->lookahead_length[slot];
-            bool predecessor = preserve_predecessor
-                && length <= UINT64_MAX - offset
-                && offset + length == range->cache_offset;
-            if (!successor[slot] && !predecessor) break;
+    unsigned count = range->lookahead_count;
+    if (range->fill_streaming) {
+        unsigned slot = range->fill_stream_slot;
+        if (slot >= range->lookahead_slots || slot < count) return false;
+        if (slot != count) {
+            unsigned char *buffer = range->lookahead[slot];
+            range->lookahead[slot] = range->lookahead[count];
+            range->lookahead[count] = buffer;
+            range->fill_stream_slot = count;
         }
-        if (slot >= range->lookahead_count) return false;
+        *slot_out = count;
+        return true;
     }
-    return range_fill_install_into(
-        range, range->lookahead[slot], range->cache_capacity, false, slot);
+    if (count < range->lookahead_slots) {
+        *slot_out = count;
+        return true;
+    }
+    bool successor[MEDIA_HTTP_MAXIMUM_LOOKAHEAD_WINDOWS] = {false};
+    (void) range_contiguous_lookahead_tail(range, NULL, successor);
+    /* Read-ahead is for whichever read position will cross next, so a
+       speculative install also keeps the windows that follow any window in
+       use, not only the active one's. */
+    bool protect[MEDIA_HTTP_MAXIMUM_LOOKAHEAD_WINDOWS] = {false};
+    if (speculative) {
+        for (unsigned slot = 0; slot < count; slot++) {
+            if (!range_window_recent(range, range->lookahead_last_read[slot])
+                || range->lookahead_length[slot]
+                       > UINT64_MAX - range->lookahead_offset[slot]) continue;
+            uint64_t cursor = range->lookahead_offset[slot]
+                + range->lookahead_length[slot];
+            for (unsigned step = 0; step < count; step++) {
+                int next = range_lookahead_at_offset(range, cursor);
+                if (next < 0 || protect[(unsigned) next]
+                    || range->lookahead_length[(unsigned) next]
+                           > UINT64_MAX - cursor) break;
+                protect[(unsigned) next] = true;
+                cursor += range->lookahead_length[(unsigned) next];
+            }
+        }
+    }
+    unsigned victim = count;
+    uint64_t oldest = UINT64_MAX;
+    for (unsigned slot = 0; slot < count; slot++) {
+        if (successor[slot] || protect[slot]) continue;
+        uint64_t offset = range->lookahead_offset[slot];
+        size_t length = range->lookahead_length[slot];
+        if (preserve_predecessor && length <= UINT64_MAX - offset
+            && offset + length == range->cache_offset) continue;
+        uint64_t stamp = range->lookahead_last_read[slot];
+        if (speculative && range_window_recent(range, stamp)) continue;
+        if (stamp < oldest) {
+            oldest = stamp;
+            victim = slot;
+        }
+    }
+    if (victim == count && !speculative) {
+        uint64_t farthest = 0;
+        for (unsigned slot = 0; slot < count; slot++) {
+            if (successor[slot]
+                && range->lookahead_offset[slot] >= farthest) {
+                farthest = range->lookahead_offset[slot];
+                victim = slot;
+            }
+        }
+    }
+    if (victim == count) return false;
+    *slot_out = victim;
+    return true;
+}
+
+static bool range_fill_install_slot(MediaHttpRange *range, unsigned slot)
+{
+    bool replacing = slot < range->lookahead_count;
+    bool streaming = range->fill_streaming;
+    if (range_fill_install_into(
+            range, range->lookahead[slot], range->cache_capacity, false,
+            slot)) {
+        range->lookahead_last_read[slot] = 0;
+        return true;
+    }
+    /* A native fixed-result take copies before this layer admits the
+       headers, so a rejected response may have overwritten the window it
+       was given. Never leave that window's old offset live. */
+    if (replacing && !streaming) range_lookahead_forget(range, slot);
+    return false;
+}
+
+static bool range_fill_install_lookahead(
+    MediaHttpRange *range, bool speculative, bool preserve_predecessor)
+{
+    unsigned slot = 0;
+    return range_fill_slot(range, speculative, preserve_predecessor, &slot)
+        && range_fill_install_slot(range, slot);
 }
 
 static bool range_promote_lookahead(MediaHttpRange *range, uint64_t offset)
@@ -1296,74 +1493,96 @@ static bool range_promote_lookahead(MediaHttpRange *range, uint64_t offset)
         unsigned char *old_cache = range->cache;
         uint64_t old_offset = range->cache_offset;
         size_t old_length = range->cache_length;
+        uint64_t old_read = range->cache_last_read;
         range->cache = range->lookahead[slot];
         range->cache_offset = front;
         range->cache_length = length;
         range->cache_consumed = 0;
+        range->cache_last_read = range->lookahead_last_read[slot];
         range->lookahead[slot] = old_cache;
         range->lookahead_offset[slot] = old_offset;
         range->lookahead_length[slot] = old_length;
+        range->lookahead_last_read[slot] = old_read;
         range->stats.lookahead_promotions++;
         range->stats.lookahead_retained_bytes =
             length > range->stats.lookahead_retained_bytes
                 ? old_length
                 : range->stats.lookahead_retained_bytes
                     - length + old_length;
+        /* An empty active window (never filled, or retired after a
+           rejected take) holds nothing worth an owned slot. */
+        if (old_length == 0) range_lookahead_forget(range, slot);
         return true;
     }
     return false;
 }
 
 /*
- * Make a completed sequential fill active without overwriting the window the
- * demux just left. With one owned auxiliary allocation and one bounded
- * transport response, the useful rotation is:
+ * Make a completed fill active without overwriting the window the demux just
+ * left. With one owned auxiliary allocation and one bounded transport
+ * response, the useful rotation is:
  *
  *     previous(aux), current(active), next(transport)
  *       -> current(aux), next(active)
  *
  * Installing next into the auxiliary and then swapping pointers performs that
- * rotation without copying a cache window on the browser thread. It also
- * fixes the streaming case, whose bytes already live in the auxiliary rather
- * than in `cache`.
+ * rotation without copying a cache window on the browser thread. Every
+ * install takes this route, not only the sequential successor's:
+ *
+ * - a streamed fill's bytes already live in its auxiliary slot, not in
+ *   `cache`; installing it straight into `cache` labelled the old window's
+ *   bytes with the new offset (a scrub back into a retained window while the
+ *   successor streamed, then forward into the successor);
+ * - a non-sequential install keeps the window it replaces, which a second
+ *   read position in the same range (a muxed stream's other track) is
+ *   usually still reading.
  */
 static bool range_fill_install_active(
     MediaHttpRange *range, bool *active_preserved)
 {
     if (active_preserved != NULL) *active_preserved = false;
-    if (range == NULL || range->lookahead_slots == 0
-        || range->cache_length == 0) return range_fill_install(range);
+    if (range == NULL) return false;
+    /* Without owned slots the response lands in the active buffer. A
+       native fixed-result take copies before this layer admits the headers,
+       so after a rejection those bytes are no longer the window the active
+       offset names: retire it rather than serve them. */
+    if (range->lookahead_slots == 0) {
+        if (range_fill_install(range)) return true;
+        range->cache_length = 0;
+        range->cache_consumed = 0;
+        return false;
+    }
 
     uint64_t cache_end = range->cache_offset + range->cache_length;
-    if (cache_end < range->cache_offset) return range_fill_install(range);
-
     /* A low-bitrate stream can have current + completed successor while the
        following response is already complete. Advance through that owned
        successor first, so the following response can rotate into its slot. */
-    int successor_slot = range_lookahead_at_offset(range, cache_end);
+    int successor_slot = range->cache_length == 0
+        || cache_end < range->cache_offset
+        ? -1 : range_lookahead_at_offset(range, cache_end);
     if (range->fill_offset != cache_end && successor_slot >= 0
         && range->lookahead_length[(unsigned) successor_slot]
                <= UINT64_MAX - cache_end
         && range->fill_offset == cache_end
              + range->lookahead_length[(unsigned) successor_slot]) {
         if (!range_promote_lookahead(range, cache_end)) return false;
-        cache_end = range->cache_offset + range->cache_length;
     }
-    if (range->fill_offset != cache_end) return range_fill_install(range);
 
-    uint64_t installed_offset = range->fill_offset;
-    if (active_preserved != NULL) *active_preserved = true;
-    if (!range_fill_install_lookahead(range, false)) {
-        /* A native fixed-result take copies before this layer admits the
-           headers. On rejection the old auxiliary bytes may therefore have
-           been overwritten; never leave their old offset live. */
-        range->lookahead_count = 0;
-        range->stats.lookahead_retained_bytes = 0;
+    /* An empty active window loses nothing to a fixed response landing
+       in it directly, and a rejected take leaves it empty. */
+    if (!range->fill_streaming && range->cache_length == 0) {
+        if (range_fill_install(range)) return true;
+        range->cache_consumed = 0;
         return false;
     }
+    unsigned slot = 0;
+    if (!range_fill_slot(range, false, false, &slot)) return false;
+    uint64_t installed_offset = range->fill_offset;
+    if (active_preserved != NULL) *active_preserved = true;
+    if (!range_fill_install_slot(range, slot)) return false;
     if (range_promote_lookahead(range, installed_offset)) return true;
     snprintf(range->last_error, sizeof(range->last_error),
-             "installed sequential media window could not be promoted");
+             "installed media window could not be promoted");
     return false;
 }
 
@@ -1405,19 +1624,22 @@ static void range_prefetch(MediaHttpRange *range)
 {
     if (!range_uses_async_transport(range) || range->cache_length == 0) return;
     range->stats.readahead_checks++;
-    /* Retire a completed sequential response into the optional owned
-       lookahead, then immediately give the worker the following window. */
+    /* Retire a completed response into the optional owned lookahead, then
+       immediately give the worker the following window. A response that is
+       not the active window's successor is retired too: the read position
+       that asked for it (another track of a muxed stream, or this one before
+       it moved) will want it, and a speculative install never evicts a
+       window in use. */
     unsigned contiguous_windows = 0;
     uint64_t tail_end = range_contiguous_lookahead_tail(
         range, &contiguous_windows, NULL);
     bool have_contiguous_lookahead = contiguous_windows != 0;
     bool have_contiguous_predecessor =
         range_has_immediate_predecessor(range);
-    if (range->fill_request != 0 && range->fill_offset == tail_end
-        && range_fill_complete(range)) {
+    if (range->fill_request != 0 && range_fill_complete(range)) {
         bool preserve_predecessor = range->lookahead_fetch_limit <= 1u;
         if (!range_fill_install_lookahead(
-                range, preserve_predecessor)) return;
+                range, true, preserve_predecessor)) return;
         tail_end = range_contiguous_lookahead_tail(
             range, &contiguous_windows, NULL);
         have_contiguous_lookahead = contiguous_windows != 0;
@@ -1592,6 +1814,13 @@ static MediaRangeReadStatus range_fill_window(
 {
     uint64_t aligned = range_window_start(range, offset, span_length);
     size_t wanted = range_window_bytes(range, aligned);
+    /* Selecting another window retires the outstanding fill. When that fill
+       has completed it is not a misprediction to throw away -- with two read
+       positions in one range it is the other position's next window -- so
+       keep it if a slot can take it without evicting a window in use. */
+    if (range_uses_async_transport(range) && range->fill_request != 0
+        && range->fill_offset != aligned && range_fill_complete(range))
+        (void) range_fill_install_lookahead(range, true, false);
     if (range_promote_lookahead(range, offset)) {
         uint64_t into = offset - range->cache_offset;
         if (into < range->cache_length
@@ -1630,6 +1859,7 @@ static MediaRangeReadStatus range_fill_window(
                 range->cache_offset = aligned;
                 range->cache_length = received;
                 range->cache_consumed = 0;
+                range->cache_last_read = 0;
                 range->stats.bytes_received += received;
                 range->stats.window_installs++;
                 return MEDIA_RANGE_READ_COMPLETE;
@@ -1991,6 +2221,12 @@ static MediaRangeReadStatus range_read_bounded(
         offset += copied;
         length -= copied;
     }
+    /* Stamp the window that served the read's last byte. */
+    if (offset != range->last_read_offset && range->cache_length != 0
+        && offset > range->cache_offset
+        && offset - range->cache_offset <= range->cache_length) {
+        range->cache_last_read = ++range->read_clock;
+    }
     /* Decide the refill from what the window has left, not from having run out
        of it: the request has to be on the wire before the decoder arrives. */
     range_prefetch(range);
@@ -2350,7 +2586,7 @@ MediaHttpRangePrimeStatus media_http_range_prime_successor(
         return MEDIA_HTTP_RANGE_PRIME_FAILED;
     }
     if (!range_fill_complete(range)) return MEDIA_HTTP_RANGE_PRIME_PENDING;
-    if (range_fill_install_lookahead(range, true)) {
+    if (range_fill_install_lookahead(range, false, true)) {
         range->successor_prime_complete = true;
         return MEDIA_HTTP_RANGE_PRIME_READY;
     }
@@ -2575,4 +2811,26 @@ void media_http_range_destroy(MediaHttpRange *range)
     budget_free(budget, range->url);
     memset(range, 0, sizeof(*range));
     budget_free(budget, range);
+}
+
+MediaInsecureAudioStep media_http_insecure_audio_step(
+    const BrowserSession *session, const char *source_url,
+    const char *document_url, MediaHttpProbeRoute route)
+{
+    if (source_url == NULL || document_url == NULL
+        || (route != MEDIA_HTTP_PROBE_REFUSED
+            && route != MEDIA_HTTP_PROBE_UNAVAILABLE)
+        || strncmp(source_url, "http://", 7u) != 0
+        || strncmp(document_url, "https://", 8u) != 0
+        || tilefinch_url_potentially_trustworthy(source_url))
+        return MEDIA_INSECURE_AUDIO_NONE;
+    switch (browser_session_insecure_audio_site(session, document_url)) {
+    case BROWSER_INSECURE_AUDIO_UNASKED:
+        return MEDIA_INSECURE_AUDIO_ASK;
+    case BROWSER_INSECURE_AUDIO_DECLINED:
+        return MEDIA_INSECURE_AUDIO_DECLINED;
+    case BROWSER_INSECURE_AUDIO_ALLOWED:
+    default:
+        return MEDIA_INSECURE_AUDIO_NONE;
+    }
 }

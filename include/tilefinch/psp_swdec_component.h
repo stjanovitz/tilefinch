@@ -41,6 +41,9 @@ typedef struct {
     int last_native_error;
     PspSwdecComponentState state;
     PspSwdecComponentFailure failure;
+    /* Failed loads and starts since the last successful load
+       (tilefinch_swdec_component_retry_allowed). */
+    unsigned runtime_failures;
     bool module_started;
     bool took_me;
     bool shared_install;

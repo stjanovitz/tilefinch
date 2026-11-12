@@ -180,7 +180,10 @@ small games:
 
 One JavaScript RGBA backing is limited to 512 KiB: at most 131,072 pixels, with
 authored dimensions proportionally bounded to 480×272 (a zero-sized axis
-stays zero while the other is still capped). The renderer retains at
+stays zero while the other is still capped). A canvas that drew a
+cross-origin image keeps the same backing in native memory instead, under
+the same limits and QuickJS budget (see
+[SECURITY_MODEL.md](SECURITY_MODEL.md)); it draws identically. The renderer retains at
 most four native presentation snapshots and 1 MiB across them. Eight
 `ImageBitmap` objects may retain at most 1 MiB in aggregate; their pixels
 stay in the QuickJS budget, preserve the canvas origin-clean state, and add

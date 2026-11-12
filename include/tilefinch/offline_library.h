@@ -107,16 +107,35 @@ typedef struct {
     size_t count;
     uint32_t next_id;
     bool loaded;
+    /* The last load found an index written by a later release and left it
+       untouched; nothing loads or saves until that release runs again. */
+    bool newer_format;
+    /* The index was normalized at load but could not be written (a full or
+       read-only card); later loads retry until a save succeeds. */
+    bool save_pending;
     OfflineLibraryProgress progress;
     void *progress_context;
     /* Bytecode a preview compiled, kept for the confirming install. */
     OfflineAppStagedBytecode *staged;
     /* Classic scripts compiled by install/preview/recompile (telemetry). */
     size_t script_compiles;
+    /* Optional, both or neither: bracket every in-memory write that changes
+       what a Library row borrows, an item below count (its slot, title or
+       address: a replace, a rename, a removal), never I/O. A frontend
+       whose rows are drawn from another thread holds its presentation
+       fence here (the PSP's loading supervisor); acquire returns whether
+       it holds the fence. Appending at items[count] needs none, since no
+       row points there before the list is rebuilt; nor does failure text,
+       written only for the active download, whose row never shows it. */
+    bool (*fence_acquire)(void);
+    void (*fence_release)(bool held);
 } OfflineLibrary;
 
 void offline_library_init(
     OfflineLibrary *library, Budget *budget, const char *directory);
+/* The fence above, for writers outside this file (the download manager). */
+bool offline_library_fence_acquire(const OfflineLibrary *library);
+void offline_library_fence_release(const OfflineLibrary *library, bool held);
 bool offline_library_load(OfflineLibrary *library);
 bool offline_library_save(const OfflineLibrary *library);
 const OfflineLibraryItem *offline_library_find(

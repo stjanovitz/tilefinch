@@ -33,6 +33,8 @@ int main(void)
     if (!test_connected_src_mutation_and_namespaces(&budget)) failures++;
     if (!test_deep_tree_traversal_bounds(&budget)) failures++;
     if (!test_parser_time_dynamic_insertion(&budget)) failures++;
+    if (!test_insertion_prepares_only_inserted_scripts(&budget)) failures++;
+    if (!test_live_collection_memo_ends_with_script_run(&budget)) failures++;
     if (!test_inert_script_types_do_not_consume_quota(&budget)) failures++;
     if (!test_inline_json_assignments_avoid_compiler(&budget)) failures++;
     if (!test_inline_data_does_not_displace_logic_quota(&budget)) failures++;

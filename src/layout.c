@@ -897,6 +897,38 @@ static void layout_index_focus_pseudo_texts(LayoutDocument *layout,
     layout->focus_pseudo_texts_indexed = true;
 }
 
+void layout_run_bounds_release(Budget *budget, LayoutRunBounds *bounds)
+{
+    budget_free(budget, bounds->bounds);
+    bounds->bounds = NULL;
+    bounds->capacity = 0;
+    bounds->lost = true;
+}
+
+/* Cover `entries` table entries. True when the bounds were created just
+   now, so the caller raises them for the entries it already holds. A
+   refusal is not a layout failure: insertion then examines every entry. */
+bool layout_run_bounds_grow(Budget *budget, LayoutRunBounds *bounds,
+                            size_t entries)
+{
+    if (bounds->lost) return false;
+    size_t runs = entries / LAYOUT_BOUND_RUN
+        + (entries % LAYOUT_BOUND_RUN != 0);
+    if (runs <= bounds->capacity) return false;
+    bool fresh = bounds->bounds == NULL;
+    uint32_t *grown = runs > SIZE_MAX / sizeof(*grown) ? NULL
+        : budget_realloc(budget, bounds->bounds, runs * sizeof(*grown));
+    if (grown == NULL) {
+        layout_run_bounds_release(budget, bounds);
+        return false;
+    }
+    memset(grown + bounds->capacity, 0,
+           (runs - bounds->capacity) * sizeof(*grown));
+    bounds->bounds = grown;
+    bounds->capacity = runs;
+    return fresh;
+}
+
 bool add_node_box(LayoutDocument *layout, lxb_dom_node_t *node,
                          int x, int y, int width, int height,
                          int client_width, int client_height,
@@ -989,6 +1021,9 @@ bool add_node_box(LayoutDocument *layout, lxb_dom_node_t *node,
                 clip_inset_top > UINT8_MAX ? UINT8_MAX
                 : (clip_inset_top < 0 ? 0 : clip_inset_top))
         };
+        layout_run_bounds_raise(&layout->node_box_command_bounds, i,
+                                layout_node_box_command_max(
+                                    &layout->node_boxes[i]));
         int retained_clip_radius = clips_x && clips_y
             ? clip_radius : style_border_radius_maximum(clip_radius);
         if (!layout_set_node_clip_radius_code(
@@ -1041,6 +1076,14 @@ bool add_node_box(LayoutDocument *layout, lxb_dom_node_t *node,
             layout->node_clip_radius_codes = codes;
         }
         layout->node_box_capacity = capacity;
+        if (layout_run_bounds_grow(layout->budget,
+                                   &layout->node_box_command_bounds,
+                                   capacity)) {
+            for (size_t i = 0; i < layout->node_box_count; i++)
+                layout_run_bounds_raise(
+                    &layout->node_box_command_bounds, i,
+                    layout_node_box_command_max(&layout->node_boxes[i]));
+        }
     }
     size_t index = layout->node_box_count++;
     if (layout->retain_container_padding) {
@@ -1091,6 +1134,9 @@ bool add_node_box(LayoutDocument *layout, lxb_dom_node_t *node,
             clip_inset_top > UINT8_MAX ? UINT8_MAX
             : (clip_inset_top < 0 ? 0 : clip_inset_top))
     };
+    layout_run_bounds_raise(&layout->node_box_command_bounds, index,
+                            layout_node_box_command_max(
+                                &layout->node_boxes[index]));
     int retained_clip_radius = clips_x && clips_y
         ? clip_radius : style_border_radius_maximum(clip_radius);
     if (!layout_set_node_clip_radius_code(
@@ -1109,6 +1155,10 @@ static void compact_layout_storage(LayoutDocument *layout)
     budget_free(layout->budget, layout->node_interaction_ranges);
     layout->node_interaction_ranges = NULL;
     layout->node_interaction_capacity = 0;
+    /* Command insertion ends with the flow; so do its bounds. */
+    layout_run_bounds_release(layout->budget,
+                              &layout->node_box_command_bounds);
+    layout_run_bounds_release(layout->budget, &layout->link_command_bounds);
     if (layout->count != 0 && layout->count < layout->capacity) {
         DrawCommand *commands = budget_realloc(
             layout->budget, layout->commands,
@@ -1488,6 +1538,13 @@ static bool layout_job_init(LayoutBuildJob *job)
     layout->web_fonts = stylesheet_web_font_set(job->stylesheet);
     layout->page_background = 0xffffff;
     job->body = document_body_node(job->document);
+    if (job->body == NULL && job->document->html != NULL) {
+        /* A page script removed the body (parser-run scripts may): lay out
+           the root element instead, as Chromium renders html without one. */
+        lxb_dom_element_t *root =
+            lxb_dom_document_element(&job->document->html->dom_document);
+        job->body = root == NULL ? NULL : lxb_dom_interface_node(root);
+    }
     if (job->body == NULL) return false;
 
     context->layout = layout;
@@ -2402,7 +2459,9 @@ ImagePriorityTarget *layout_note_unresolved_external_visual(
         return NULL;
     LayoutDocument *layout = context->layout;
     layout->unresolved_external_visuals = true;
-    if (context->preview_y_limit <= 0
+    /* Backgrounds and masks are always kept: they are few, and a later change
+       can reveal one that only layout's style resolution would ever see. */
+    if (context->preview_y_limit <= 0 && kind == IMAGE_PRIORITY_KIND_DOCUMENT
         && !context->record_unresolved_visuals) return NULL;
     for (size_t i = 0; i < layout->visual_priority_count; i++) {
         ImagePriorityTarget *target = &layout->visual_priority_targets[i];
@@ -2839,6 +2898,8 @@ void layout_destroy(LayoutDocument *layout)
         budget_free(layout->budget, layout->sticky_ranges);
         budget_free(layout->budget, layout->fixed_ranges);
         budget_free(layout->budget, layout->node_boxes);
+        budget_free(layout->budget, layout->node_box_command_bounds.bounds);
+        budget_free(layout->budget, layout->link_command_bounds.bounds);
         budget_free(layout->budget, layout->grid_columns);
         budget_free(layout->budget, layout->scroll_containers);
         budget_free(layout->budget, layout->scroll_snap_candidates);
@@ -3048,9 +3109,33 @@ static int layout_image_box_order(const void *left, const void *right)
     return a < b ? -1 : (a > b ? 1 : 0);
 }
 
+static void layout_image_boxes_note_floating(ImageLayoutBoxes *boxes,
+                                             size_t start, size_t end)
+{
+    if (boxes->floating_count < LAYOUT_IMAGE_BOXES_FLOATING_SPANS) {
+        boxes->floating[boxes->floating_count].start = start;
+        boxes->floating[boxes->floating_count].end = end;
+        boxes->floating_count++;
+        return;
+    }
+    size_t last = LAYOUT_IMAGE_BOXES_FLOATING_SPANS - 1u;
+    if (start < boxes->floating[last].start)
+        boxes->floating[last].start = start;
+    if (end > boxes->floating[last].end) boxes->floating[last].end = end;
+}
+
 void layout_keep_image_boxes(LayoutDocument *layout, ImageLayoutBoxes *boxes)
 {
     if (layout == NULL || boxes == NULL || boxes->layout != layout) return;
+    boxes->floating_count = 0;
+    for (size_t r = 0; r < layout->fixed_count; r++)
+        layout_image_boxes_note_floating(boxes,
+            layout->fixed_ranges[r].command_start,
+            layout->fixed_ranges[r].command_end);
+    for (size_t r = 0; r < layout->sticky_count; r++)
+        layout_image_boxes_note_floating(boxes,
+            layout->sticky_ranges[r].command_start,
+            layout->sticky_ranges[r].command_end);
     boxes->taken = layout->node_boxes;
     boxes->taken_count = layout->node_box_count;
     /* Ordered by node, in place, so each background's lookup is a binary
@@ -3072,11 +3157,10 @@ void layout_release_image_boxes(ImageLayoutBoxes *boxes)
     memset(boxes, 0, sizeof(*boxes));
 }
 
-bool layout_image_box_size(const ImageLayoutBoxes *boxes,
-                           const lxb_dom_node_t *node, int *width,
-                           int *height)
+static const LayoutNodeBox *layout_image_box_find(
+    const ImageLayoutBoxes *boxes, const lxb_dom_node_t *node)
 {
-    if (boxes == NULL || node == NULL) return false;
+    if (boxes == NULL || node == NULL) return NULL;
     const LayoutNodeBox *box = NULL;
     if (boxes->layout != NULL) {
         box = layout_box_for_node(boxes->layout, node);
@@ -3097,6 +3181,75 @@ bool layout_image_box_size(const ImageLayoutBoxes *boxes,
             else high = middle;
         }
     }
+    return box;
+}
+
+static const LayoutNodeBox *layout_image_boxes_lookup(
+    const void *boxes, const lxb_dom_node_t *node)
+{
+    return layout_image_box_find(boxes, node);
+}
+
+bool layout_image_box_far(const ImageLayoutBoxes *boxes,
+                          const lxb_dom_node_t *node)
+{
+    if (boxes == NULL || !boxes->reader_known) return false;
+    const LayoutNodeBox *box = layout_image_box_find(boxes, node);
+    if (box == NULL || box->width <= 0 || box->height <= 0) return false;
+    /* A viewport-fixed or sticky box paints away from its document
+       position. */
+    const LayoutDocument *layout = boxes->layout;
+    if (layout != NULL) {
+        for (size_t r = 0; r < layout->fixed_count; r++) {
+            if (box->command_end > layout->fixed_ranges[r].command_start
+                && box->command_start < layout->fixed_ranges[r].command_end)
+                return false;
+        }
+        for (size_t r = 0; r < layout->sticky_count; r++) {
+            if (box->command_end > layout->sticky_ranges[r].command_start
+                && box->command_start < layout->sticky_ranges[r].command_end)
+                return false;
+        }
+    } else {
+        for (size_t r = 0; r < boxes->floating_count; r++) {
+            if (box->command_end > boxes->floating[r].start
+                && box->command_start < boxes->floating[r].end)
+                return false;
+        }
+    }
+    /* Where the box is shown once the scroll containers around it have
+       scrolled, and what of it their clips can show: a box scrolled out of
+       a scroller near the reader is far, and one a scroller brings into
+       view is near, wherever its document position lies. */
+    int64_t near = boxes->reader_near;
+    int64_t top = box->y, bottom = top + box->height;
+    LayoutScrollPlacement placement;
+    if (layout_boxes_overflow_placement(layout_image_boxes_lookup, boxes,
+                                        node, &placement)) {
+        top += placement.dy;
+        bottom += placement.dy;
+        if (placement.clipped_y) {
+            if (top < placement.clip_top - near)
+                top = placement.clip_top - near;
+            if (bottom > placement.clip_bottom + near)
+                bottom = placement.clip_bottom + near;
+            if (top >= bottom) return true;
+        }
+        int64_t left = (int64_t) box->x + placement.dx;
+        int64_t right = left + box->width;
+        if (placement.clipped_x
+            && (right <= placement.clip_left - near
+                || left >= placement.clip_right + near)) return true;
+    }
+    return bottom <= (int64_t) boxes->reader_top - near
+        || top >= (int64_t) boxes->reader_bottom + near;
+}
+
+bool layout_image_box_size(const ImageLayoutBoxes *boxes,
+                           const lxb_dom_node_t *node, int *width,
+                           int *height)
+{
+    const LayoutNodeBox *box = layout_image_box_find(boxes, node);
     if (box == NULL || box->width <= 0 || box->height <= 0) return false;
     *width = box->width;
     *height = box->height;
@@ -3692,8 +3845,11 @@ bool layout_scroll_node(LayoutDocument *layout, lxb_dom_node_t *node,
         if (scroll_y < 0) scroll_y = 0;
         if (scroll_x > maximum_x) scroll_x = maximum_x;
         if (scroll_y > maximum_y) scroll_y = maximum_y;
-        if (box->scroll_x != scroll_x || box->scroll_y != scroll_y)
+        if (box->scroll_x != scroll_x || box->scroll_y != scroll_y) {
             layout->scroll_generation++;
+            layout_note_scroll_travel(layout, scroll_x - box->scroll_x,
+                                      scroll_y - box->scroll_y);
+        }
         box->scroll_x = scroll_x;
         box->scroll_y = scroll_y;
         return true;

@@ -202,9 +202,12 @@ available there. The active row shows percent complete, measured transfer
 speed, and the most recently sampled free-space reserve; paused and failed
 rows keep their failure reason across restarts.
 
-Transfers use exact 256 KiB ranged chunks, give one UI pump at most 32 KiB or
-2 ms of body work, and write straight to `.part` files, renaming a complete
-stream into place. After an app or power interruption, restarting converts an
+The video lookup (up to 30 s) runs as the same resolver job as playback: its
+requests go to the network worker and each UI pump advances it by one step,
+so the page stays responsive while a queued download starts. Transfers use
+exact 256 KiB ranged chunks, give one UI pump at most 32 KiB or 2 ms of body
+work, and write straight to `.part` files, renaming a complete stream into
+place. After an app or power interruption, restarting converts an
 in-progress record to Paused and reconciles the file sizes, so Resume
 fetches a fresh, expiring YouTube URL and continues from the saved byte
 offset.

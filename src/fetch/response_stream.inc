@@ -535,6 +535,28 @@ static void stream_record_peak(WriteContext *context, size_t bytes)
     }
 }
 
+/* Charges one delivery to the pump's quota. A delivery may exceed what was
+   left (a callback the quota could not split, such as one already handed
+   to the consumer); the counters stop at zero rather than wrapping, so the
+   pump still reads as spent. */
+static void stream_charge_pump_quota(WriteContext *context, size_t length)
+{
+    size_t *bytes = context->pump_bytes_remaining;
+    size_t *callbacks = context->pump_callbacks_remaining;
+    if (bytes != NULL) *bytes = length < *bytes ? *bytes - length : 0;
+    if (callbacks != NULL && *callbacks != 0) (*callbacks)--;
+}
+
+/* What the stream consumer can take now (FetchStreamOptions.on_capacity);
+   SIZE_MAX for a buffered response or a consumer without the callback. */
+static size_t stream_consumer_capacity(const WriteContext *context)
+{
+    const FetchStreamOptions *stream = context->stream;
+    if (stream == NULL || stream->on_body == NULL
+        || stream->on_capacity == NULL) return SIZE_MAX;
+    return stream->on_capacity(stream->opaque);
+}
+
 static bool stream_deliver_chunk(WriteContext *context,
                                  const unsigned char *data, size_t length)
 {
@@ -556,12 +578,7 @@ static bool stream_deliver_chunk(WriteContext *context,
         context->metrics->chunks_received++;
     }
     if (context->pump_quota_enabled) {
-        if (context->pump_bytes_remaining != NULL) {
-            *context->pump_bytes_remaining -= length;
-        }
-        if (context->pump_callbacks_remaining != NULL) {
-            (*context->pump_callbacks_remaining)--;
-        }
+        stream_charge_pump_quota(context, length);
         if (context->pump_metrics != NULL) {
             context->pump_metrics->body_bytes += length;
             context->pump_metrics->body_callbacks++;
@@ -684,12 +701,7 @@ static bool buffered_deliver_chunk(WriteContext *context,
         context->metrics->peak_buffered_bytes = result->capacity;
     }
     if (context->pump_quota_enabled) {
-        if (context->pump_bytes_remaining != NULL) {
-            *context->pump_bytes_remaining -= length;
-        }
-        if (context->pump_callbacks_remaining != NULL) {
-            (*context->pump_callbacks_remaining)--;
-        }
+        stream_charge_pump_quota(context, length);
         if (context->pump_metrics != NULL) {
             context->pump_metrics->body_bytes += length;
             context->pump_metrics->body_callbacks++;
@@ -782,6 +794,13 @@ static size_t receive_data(char *data, size_t size, size_t count, void *opaque)
         }
         if (context->pump_callbacks_remaining != NULL
             && *context->pump_callbacks_remaining == 0) deliver = 0;
+        /* Staged bytes go first; a full consumer takes what fits. */
+        if (context->pending_offset < context->pending_length) {
+            deliver = 0;
+        } else if (deliver != 0) {
+            size_t room = stream_consumer_capacity(context);
+            if (deliver > room) deliver = room;
+        }
         bool injected_fault = false;
         deliver = stream_injected_boundary(
             context, deliver, &injected_fault);
@@ -1782,6 +1801,10 @@ struct FetchHopState {
     uint64_t deadline_ns;
     bool body_enabled;
     bool fetch_site_none;
+    /* The chain has left the initiator's origin: no later hop is same-origin. */
+    bool fetch_site_crossed;
+    /* A POST became GET on a navigation, which carries no Origin. */
+    bool origin_dropped;
     bool origin_tainted;
     bool credentials_tainted;
     bool client_hints_tainted;

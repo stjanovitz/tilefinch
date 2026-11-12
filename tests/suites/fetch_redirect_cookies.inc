@@ -252,6 +252,16 @@ static bool test_redirect_short_circuit_and_cookie_bounds(
           && strlen(result.set_cookies[0]) == 4095);
     fetch_result_destroy(&result);
 
+    /* A sign-in chain sets the whole credential cookie set on several hops. */
+    snprintf(url, sizeof(url),
+             "http://127.0.0.1:%u/redirect-cookie-chain", port);
+    result = (FetchResult) {.budget = budget};
+    CHECK(fetch_redirect(budget, url, &request, &result)
+          && result.status_code == 200
+          && result.set_cookie_count >= 60u
+          && !result.set_cookies_truncated);
+    fetch_result_destroy(&result);
+
     snprintf(url, sizeof(url),
              "http://127.0.0.1:%u/response-cookie-capacity", port);
     result = (FetchResult) {.budget = budget};

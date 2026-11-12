@@ -437,6 +437,139 @@ static int test_forget_and_clear(void)
     return 0;
 }
 
+/* True when any file in the storage directory contains NEEDLE. */
+static bool directory_contains(const char *needle)
+{
+    static const char *const names[] = {
+        "s-00", "s-01", "s-02", "session-files"
+    };
+    char always[64];
+    (void) always_file(always, sizeof(always));
+    char candidates[8][80];
+    size_t count = 0;
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+        snprintf(candidates[count++], sizeof(candidates[0]), "%s", names[i]);
+    snprintf(candidates[count++], sizeof(candidates[0]), "%s", always);
+    snprintf(candidates[count++], sizeof(candidates[0]), "%s.tmp", always);
+    snprintf(candidates[count++], sizeof(candidates[0]), "%s.bak", always);
+    size_t needle_length = strlen(needle);
+    static unsigned char contents[64u * 1024u];
+    for (size_t i = 0; i < count; i++) {
+        char path[256];
+        snprintf(path, sizeof(path), "%s/%s", directory, candidates[i]);
+        FILE *file = fopen(path, "rb");
+        if (file == NULL) continue;
+        size_t length = fread(contents, 1, sizeof(contents), file);
+        fclose(file);
+        for (size_t at = 0; at + needle_length <= length; at++)
+            if (memcmp(contents + at, needle, needle_length) == 0)
+                return true;
+    }
+    return false;
+}
+
+/* IS-04: clearing storage on a Memory Stick site removes the values from
+   the card, not only from the index. */
+static int test_clear_scrubs_stick_values(void)
+{
+    static const char secret[] = "SECRET-TOKEN-4417";
+    static const char other[] = "SESSION-ONLY-9921";
+    Budget budget;
+    budget_init(&budget, 2u * MIB);
+    BrowserSession session;
+    CHECK(browser_session_init(&session, &budget, 32u * 1024u)
+          && browser_session_site_storage_configure(&session, directory)
+          && browser_session_storage_set(&session, game, true, "token",
+                                         secret, sizeof(secret) - 1u)
+          && browser_session_storage_set(&session, game, true, "keep", "1",
+                                         1)
+          && browser_session_site_storage_set_policy(
+                 &session, game, BROWSER_SITE_STORAGE_STICK));
+    char name[64];
+    CHECK(always_file(name, sizeof(name)) && directory_contains(secret));
+    /* The user's "Clear local storage". */
+    CHECK(browser_session_storage_clear_all(&session, true)
+          && !directory_contains(secret)
+          && !browser_session_storage_get(&session, game, true, "keep",
+                                          NULL, NULL));
+    /* The page's localStorage.clear() with another live kind kept. */
+    CHECK(browser_session_storage_set(&session, game, true, "token", secret,
+                                      sizeof(secret) - 1u)
+          && browser_session_storage_set(&session, game, false, "tab", other,
+                                         sizeof(other) - 1u)
+          && directory_contains(secret)
+          && browser_session_storage_clear(&session, game, true)
+          && !directory_contains(secret)
+          && browser_session_storage_get(&session, game, false, "tab", NULL,
+                                         NULL));
+    browser_session_destroy(&session);
+    /* sessionStorage written to an always-kept log is gone after the next
+       load of that log. */
+    CHECK(directory_contains(other));
+    CHECK(browser_session_init(&session, &budget, 32u * 1024u)
+          && browser_session_site_storage_configure(&session, directory)
+          && browser_session_site_storage_set_policy(
+                 &session, game, BROWSER_SITE_STORAGE_STICK)
+          && !browser_session_storage_get(&session, game, false, "tab", NULL,
+                                          NULL)
+          && !directory_contains(other));
+    CHECK(browser_session_site_storage_forget(&session, game));
+    browser_session_destroy(&session);
+    CHECK(budget.current == 0 && !always_file(name, sizeof(name)));
+    return 0;
+}
+
+/* IS-05: a stick record that could not be flushed is reported failed at
+   once and costs nothing written after it; a read error at load fails the
+   load rather than ending the log there. */
+static int test_unflushed_append_is_refused(void)
+{
+    Budget budget;
+    budget_init(&budget, 2u * MIB);
+    BrowserSession session;
+    CHECK(browser_session_init(&session, &budget, 32u * 1024u)
+          && browser_session_site_storage_configure(&session, directory)
+          && browser_session_site_storage_set_policy(
+                 &session, game, BROWSER_SITE_STORAGE_STICK)
+          && browser_session_storage_set(&session, game, true, "a", "1", 1));
+    TilefinchTestFaults *faults = tilefinch_test_faults();
+    faults->fail_site_storage_flushes = 1;
+    CHECK(!browser_session_storage_set(&session, game, true, "lost", "2", 1)
+          && faults->fail_site_storage_flushes == 0
+          && !browser_session_storage_get(&session, game, true, "lost", NULL,
+                                          NULL));
+    CHECK(browser_session_storage_set(&session, game, true, "b", "3", 1)
+          && browser_session_storage_set(&session, game, true, "c", "4", 1));
+    browser_session_destroy(&session);
+
+    const char *read = NULL;
+    size_t length = 0;
+    CHECK(browser_session_init(&session, &budget, 32u * 1024u)
+          && browser_session_site_storage_configure(&session, directory)
+          && browser_session_site_storage_set_policy(
+                 &session, game, BROWSER_SITE_STORAGE_STICK));
+    /* A read error on the second record: the load fails and keeps the
+       file as it is. */
+    faults->fail_site_storage_load_read_at = 2;
+    CHECK(!browser_session_storage_get(&session, game, true, "a", NULL,
+                                       NULL));
+    CHECK(browser_session_storage_get(&session, game, true, "a", &read,
+                                      &length)
+          && length == 1 && read[0] == '1'
+          && browser_session_storage_get(&session, game, true, "b", &read,
+                                         &length)
+          && length == 1 && read[0] == '3'
+          && browser_session_storage_get(&session, game, true, "c", &read,
+                                         &length)
+          && length == 1 && read[0] == '4'
+          && !browser_session_storage_get(&session, game, true, "lost", NULL,
+                                          NULL));
+    CHECK(browser_session_site_storage_forget(&session, game));
+    browser_session_destroy(&session);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
 static int test_torn_tail_and_compaction(void)
 {
     Budget budget;
@@ -838,6 +971,132 @@ static int test_boot_cleanup(void)
     return 0;
 }
 
+static bool read_log(const char *name, unsigned char *bytes, size_t capacity,
+                     size_t *length)
+{
+    char path[256];
+    snprintf(path, sizeof(path), "%s/%s", directory, name);
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) return false;
+    *length = fread(bytes, 1, capacity, file);
+    bool okay = !ferror(file) && fgetc(file) == EOF;
+    return fclose(file) == 0 && okay;
+}
+
+static bool write_log(const char *name, const unsigned char *bytes,
+                      size_t length)
+{
+    char path[256];
+    snprintf(path, sizeof(path), "%s/%s", directory, name);
+    FILE *file = fopen(path, "wb");
+    if (file == NULL) return false;
+    bool okay = fwrite(bytes, 1, length, file) == length;
+    return fclose(file) == 0 && okay;
+}
+
+static bool log_unchanged(const char *name, const unsigned char *bytes,
+                          size_t length)
+{
+    static unsigned char current[64u * 1024u];
+    size_t current_length = 0;
+    return read_log(name, current, sizeof(current), &current_length)
+        && current_length == length && memcmp(current, bytes, length) == 0;
+}
+
+static void remove_log(const char *name)
+{
+    char path[256];
+    snprintf(path, sizeof(path), "%s/%s", directory, name);
+    remove(path);
+}
+
+/* IS-06 and IS-17: an always-kept log a later release wrote, or one that
+   names another origin under the same hashed name, is never removed,
+   truncated or replaced on this site's behalf. */
+static int test_newer_and_foreign_logs_are_kept(void)
+{
+    Budget budget;
+    budget_init(&budget, 2u * MIB);
+    BrowserSession session;
+    char name[64], backup[80];
+    static unsigned char log[64u * 1024u], older[64u * 1024u];
+    size_t log_length = 0, older_length = 0;
+
+    /* A newer format beside a valid .bak of this release. */
+    CHECK(browser_session_init(&session, &budget, 32u * 1024u)
+          && browser_session_site_storage_configure(&session, directory)
+          && browser_session_storage_set(&session, game, true, "k", "v", 1)
+          && browser_session_site_storage_set_policy(
+                 &session, game, BROWSER_SITE_STORAGE_STICK));
+    browser_session_destroy(&session);
+    CHECK(always_file(name, sizeof(name))
+          && read_log(name, log, sizeof(log), &log_length)
+          && log_length > 8u);
+    snprintf(backup, sizeof(backup), "%s.bak", name);
+    memcpy(older, log, log_length);
+    older_length = log_length;
+    CHECK(write_log(backup, older, older_length));
+    log[4] = 2u;
+    CHECK(write_log(name, log, log_length));
+    CHECK(browser_session_init(&session, &budget, 32u * 1024u)
+          && browser_session_site_storage_configure(&session, directory)
+          && browser_session_site_storage_set_policy(
+                 &session, game, BROWSER_SITE_STORAGE_STICK)
+          && !browser_session_storage_get(&session, game, true, "k", NULL,
+                                          NULL));
+    (void) browser_session_storage_set(&session, game, true, "k", "x", 1);
+    CHECK(log_unchanged(name, log, log_length)
+          && log_unchanged(backup, older, older_length));
+    browser_session_destroy(&session);
+    CHECK(log_unchanged(name, log, log_length)
+          && log_unchanged(backup, older, older_length));
+    remove_log(name);
+    remove_log(backup);
+
+    /* Another origin's log under game.test's name (a hash collision). */
+    CHECK(browser_session_init(&session, &budget, 32u * 1024u)
+          && browser_session_site_storage_configure(&session, directory)
+          && browser_session_storage_set(&session, news, true, "n", "1", 1)
+          && browser_session_site_storage_set_policy(
+                 &session, news, BROWSER_SITE_STORAGE_STICK));
+    browser_session_destroy(&session);
+    unsigned long long hash = 14695981039346656037ull;
+    for (const unsigned char *at = (const unsigned char *) "https://news.test";
+         *at != '\0'; at++) {
+        hash ^= *at;
+        hash *= 1099511628211ull;
+    }
+    char news_name[64];
+    snprintf(news_name, sizeof(news_name), "p-%016llx", hash);
+    CHECK(read_log(news_name, log, sizeof(log), &log_length));
+    remove_log(news_name);
+    CHECK(write_log(name, log, log_length));
+    /* First use after a boot: the load refuses and keeps the file. */
+    CHECK(browser_session_init(&session, &budget, 32u * 1024u)
+          && browser_session_site_storage_configure(&session, directory)
+          && browser_session_site_storage_set_policy(
+                 &session, game, BROWSER_SITE_STORAGE_STICK)
+          && !browser_session_storage_get(&session, game, true, "n", NULL,
+                                          NULL));
+    (void) browser_session_storage_set(&session, game, true, "k", "x", 1);
+    (void) browser_session_site_storage_forget(&session, game);
+    CHECK(log_unchanged(name, log, log_length));
+    browser_session_destroy(&session);
+    /* A RAM site moved to the stick does not create its log over it. */
+    CHECK(browser_session_init(&session, &budget, 32u * 1024u)
+          && browser_session_site_storage_configure(&session, directory)
+          && browser_session_storage_set(&session, game, true, "k", "v", 1));
+    (void) browser_session_site_storage_set_policy(
+        &session, game, BROWSER_SITE_STORAGE_STICK);
+    (void) browser_session_storage_clear_all(&session, true);
+    (void) browser_session_site_storage_forget(&session, game);
+    CHECK(log_unchanged(name, log, log_length));
+    browser_session_destroy(&session);
+    CHECK(log_unchanged(name, log, log_length) && budget.current == 0);
+    remove_log(name);
+    return 0;
+}
+
 int main(void)
 {
     snprintf(directory, sizeof(directory),
@@ -850,6 +1109,9 @@ int main(void)
         || test_decline_and_policies()
         || test_always_survives_reboot()
         || test_forget_and_clear()
+        || test_clear_scrubs_stick_values()
+        || test_unflushed_append_is_refused()
+        || test_newer_and_foreign_logs_are_kept()
         || test_torn_tail_and_compaction()
         || test_full_rewrite_compacts()
         || test_compaction_swap_is_crash_safe()

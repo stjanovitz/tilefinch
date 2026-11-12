@@ -28,7 +28,11 @@ typedef enum {
     TILEFINCH_DESTINATION_OTHER = 6,
     TILEFINCH_DESTINATION_FONT = 7,
     TILEFINCH_DESTINATION_MEDIA = 8,
-    TILEFINCH_DESTINATION_WORKER = 9
+    TILEFINCH_DESTINATION_WORKER = 9,
+    /* An audio-only media stream (native audio playback). Media policy
+       applies to it as to MEDIA; it is the one destination the unencrypted
+       audio grant can open (fetch_request_mixed_override). */
+    TILEFINCH_DESTINATION_AUDIO = 10
 } TilefinchRequestDestination;
 
 /* All security decisions for a request are derived from this immutable
@@ -70,7 +74,16 @@ typedef struct {
     TilefinchRequestSite site;
     bool valid;
     bool same_origin;
+    /* The top-level site and the target site match (third-party cookie
+       admission). */
     bool same_site;
+    /* RFC 6265bis "same-site" for cookie retrieval: same_site, and the
+       requesting document is same-site with the top level too (its site
+       for cookies is not null). Strict cookies require it; Lax cookies
+       require it or a safe top-level navigation. Frames are direct
+       children of the top level, so the initiator is the whole ancestor
+       chain below it. */
+    bool cookie_same_site;
     bool safe_method;
     bool sends_credentials;
     bool allows_lax_cookie;

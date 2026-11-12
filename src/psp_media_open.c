@@ -1,4 +1,5 @@
 #include "psp_media_session_internal.h"
+#include "tilefinch/utf8_encode.h"
 #include "tilefinch/psp_log.h"
 
 /* Validation EBOOT only (src/psp_transport_probe.c); absent elsewhere. */
@@ -14,31 +15,42 @@ void psp_media_publish_track_catalog(PspMediaSession *media)
         audio_count = PSP_UI_MEDIA_TRACK_LIMIT;
     if (caption_count > PSP_UI_MEDIA_TRACK_LIMIT)
         caption_count = PSP_UI_MEDIA_TRACK_LIMIT;
-    psp_ui_media_set_tracks(
-        &media->ui, NULL, audio_count, media->stream.selected_audio_track,
-        NULL, caption_count, media->stream.selected_caption_track);
+    /* Labels are prepared here, then stored with their counts in one fenced
+       step: a supervised player copy may be drawing the menu (AU-05). */
+    PspUiMediaTrack audio[PSP_UI_MEDIA_TRACK_LIMIT];
+    PspUiMediaTrack captions[PSP_UI_MEDIA_TRACK_LIMIT];
     for (size_t at = 0; at < audio_count; at++) {
         const YoutubeTrack *track = &media->stream.audio_tracks[at];
-        snprintf(media->ui_presentation.audio_tracks[at].label,
-                 sizeof(media->ui_presentation.audio_tracks[at].label),
-                 "%s%s",
+        char *audio_label = audio[at].label;
+        snprintf(audio_label, sizeof(audio[at].label), "%s%s",
                  track->label[0] == '\0'
                     ? (track->language[0] == '\0'
                         ? "Audio" : track->language)
                     : track->label,
                  track->automatic ? " (auto)" : "");
+        audio_label[tilefinch_utf8_complete_prefix(
+            audio_label, strlen(audio_label))] = '\0';
+        psp_ui_media_prepare_row_text(
+            &media->ui, media->budget, audio_label, sizeof(audio[at].label));
     }
     for (size_t at = 0; at < caption_count; at++) {
         const YoutubeTrack *track = &media->stream.caption_tracks[at];
-        snprintf(media->ui_presentation.subtitle_tracks[at].label,
-                 sizeof(media->ui_presentation.subtitle_tracks[at].label),
-                 "%s%s",
+        char *caption_label = captions[at].label;
+        snprintf(caption_label, sizeof(captions[at].label), "%s%s",
                  track->label[0] == '\0'
                     ? (track->language[0] == '\0'
                         ? "Subtitles" : track->language)
                     : track->label,
                  track->automatic ? " (auto)" : "");
+        caption_label[tilefinch_utf8_complete_prefix(
+            caption_label, strlen(caption_label))] = '\0';
+        psp_ui_media_prepare_row_text(
+            &media->ui, media->budget, caption_label,
+            sizeof(captions[at].label));
     }
+    psp_ui_media_set_tracks(
+        &media->ui, audio, audio_count, media->stream.selected_audio_track,
+        captions, caption_count, media->stream.selected_caption_track);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     /* Which six caption tracks the menu offers, against which preference:
        the menu keeps only the best-ranked six of a long YouTube list. */
@@ -66,6 +78,7 @@ void psp_media_publish_track_catalog(PspMediaSession *media)
 
 #include "media_backend_psp_policy.h"
 #include "tilefinch/media_failure_message.h"
+#include "tilefinch/media_mp3.h"
 #include "tilefinch/platform.h"
 #include "tilefinch/psp_log.h"
 #include "tilefinch/user_agent.h"
@@ -83,8 +96,58 @@ typedef enum {
     PSP_PAGE_MEDIA_PROBE_READY,
     PSP_PAGE_MEDIA_PROBE_FAILED,
     /* The address answered with an HLS playlist: open it as one. */
-    PSP_PAGE_MEDIA_PROBE_HLS
+    PSP_PAGE_MEDIA_PROBE_HLS,
+    /* Page audio answered MPEG audio: open it as MP3. */
+    PSP_PAGE_MEDIA_PROBE_MP3
 } PspPageMediaProbeStatus;
+
+/* The secure page's plain-HTTP audio address the one HTTPS upgrade could
+   not reach: ask, or keep the remembered no (SECURITY_MODEL.md). */
+static bool psp_media_page_audio_refused(
+    PspMediaSession *media, MediaHttpProbeRoute route,
+    char *error, size_t error_size)
+{
+    MediaInsecureAudioStep step = media->page_audio
+        ? media_http_insecure_audio_step(
+              media->session, media->source, media->page_document_url, route)
+        : MEDIA_INSECURE_AUDIO_NONE;
+    if (step == MEDIA_INSECURE_AUDIO_NONE) return false;
+    media->insecure_audio_offer = step == MEDIA_INSECURE_AUDIO_ASK;
+    media->insecure_audio_blocked = step == MEDIA_INSECURE_AUDIO_DECLINED;
+    snprintf(error, error_size, "%s", step == MEDIA_INSECURE_AUDIO_ASK
+             ? MEDIA_INSECURE_AUDIO_QUESTION : MEDIA_INSECURE_AUDIO_BLOCKED);
+    printf("tilefinch-page-media: event=insecure-audio step=%s\n",
+           step == MEDIA_INSECURE_AUDIO_ASK ? "ask" : "declined");
+    return true;
+}
+
+/* What page media is called before the stream says. Audio: the station it
+   named on an earlier attempt, the element's or page's title, else a
+   generic name. Video keeps its generic name. */
+static const char *psp_media_page_media_title(const PspMediaSession *media,
+                                              bool audio)
+{
+    if (!audio) return "Page video";
+    if (media->audio_station[0] != '\0') return media->audio_station;
+    if (media->page_media_label[0] != '\0') return media->page_media_label;
+    return "Page audio";
+}
+
+/* Where page audio comes from, and whether a secure page plays it over
+   plain HTTP -- which the unencrypted-audio answer allowed. */
+static void psp_media_note_audio_source(PspMediaSession *media,
+                                        const char *url)
+{
+    if (!media_audio_source_label(url, media->audio_source,
+                                  sizeof(media->audio_source)))
+        media->audio_source[0] = '\0';
+    media->audio_unencrypted = url != NULL
+        && strncmp(url, "http://", 7) == 0
+        && strncmp(media->page_document_url, "https://", 8) == 0;
+}
+
+static PspPageMediaProbeStatus psp_media_page_probe(
+    PspMediaSession *media, char *error, size_t error_size);
 
 static PspPageMediaProbeStatus psp_media_page_probe_finish(
     PspMediaSession *media, FetchResult *result,
@@ -99,14 +162,60 @@ static PspPageMediaProbeStatus psp_media_page_probe_finish(
         .method = "GET",
         .mode = media->page_media_mode,
         .credentials = media->page_media_credentials,
-        .destination = TILEFINCH_DESTINATION_MEDIA
+        .destination = media->page_audio
+            ? TILEFINCH_DESTINATION_AUDIO : TILEFINCH_DESTINATION_MEDIA
     };
     /* Routed here because the address had no HLS sign; what it answers
        decides. An offline stream's address answers 404 or an error body. */
-    MediaHttpProbeRoute route = media_http_probe_route(
-        media->session, &context, !media->page_audio, result, fetched,
-        &complete_length);
+    bool mp3_seekable = false;
+    MediaHttpProbeRoute route = media->page_audio
+        ? media_http_probe_route_audio(
+              media->session, &context, result, fetched, &complete_length,
+              &mp3_seekable)
+        : media_http_probe_route(
+              media->session, &context, true, result, fetched,
+              &complete_length);
     if (route == MEDIA_HTTP_PROBE_HLS) return PSP_PAGE_MEDIA_PROBE_HLS;
+    if (route == MEDIA_HTTP_PROBE_MP3) {
+        psp_media_clear_resolved_stream(media);
+        snprintf(media->stream.title, sizeof(media->stream.title), "%s",
+                 psp_media_page_media_title(media, true));
+        /* An endless body carried no headers back; the stream request
+           starts from the page's address under the same policy. */
+        snprintf(media->stream.audio_url, sizeof(media->stream.audio_url),
+                 "%s", fetched && result->effective_url[0] != '\0'
+                     ? result->effective_url : media->source);
+        snprintf(media->stream.audio_mime_type,
+                 sizeof(media->stream.audio_mime_type), "%s", "audio/mpeg");
+        media->stream.audio_content_length = complete_length;
+        media->stream.expires_monotonic_s = UINT64_MAX;
+        media->page_mp3 = true;
+        media->page_mp3_length = complete_length;
+        media->page_mp3_seekable = mp3_seekable;
+        psp_media_note_audio_source(media, media->stream.audio_url);
+        printf("tilefinch-page-media: event=probe-routed-mp3 length=%llu "
+               "seekable=%d stream=%d\n",
+               (unsigned long long) complete_length, mp3_seekable ? 1 : 0,
+               fetched ? 0 : 1);
+        return PSP_PAGE_MEDIA_PROBE_MP3;
+    }
+    /* A SHOUTcast server sent its root's browser visitor to its status
+       page; its stream is at "/;" (media_shoutcast_stream_url). Probed
+       once: the new source is no longer a root. */
+    char shoutcast[sizeof(media->source)];
+    if (media->page_audio && fetched
+        && media_shoutcast_stream_url(
+               media->source, result->effective_url, shoutcast,
+               sizeof(shoutcast))) {
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        printf("tilefinch-page-media: event=shoutcast-stream-path\n");
+#endif
+        snprintf(media->source, sizeof(media->source), "%s", shoutcast);
+        return psp_media_page_probe(media, error, error_size);
+    }
+    /* The once-upgraded HTTPS address did not answer audio. */
+    if (psp_media_page_audio_refused(media, route, error, error_size))
+        return PSP_PAGE_MEDIA_PROBE_FAILED;
     if (route == MEDIA_HTTP_PROBE_UNAVAILABLE) {
         snprintf(error, error_size,
                  "page %s: " MEDIA_STREAM_UNAVAILABLE " (HTTP %ld)",
@@ -138,10 +247,11 @@ static PspPageMediaProbeStatus psp_media_page_probe_finish(
     }
     psp_media_clear_resolved_stream(media);
     snprintf(media->stream.title, sizeof(media->stream.title), "%s",
-             media->page_audio ? "Page audio" : "Page video");
+             psp_media_page_media_title(media, media->page_audio));
     const char *effective_url = result->effective_url[0] == '\0'
         ? media->source : result->effective_url;
     if (media->page_audio) {
+        psp_media_note_audio_source(media, effective_url);
         snprintf(media->stream.audio_url,
                  sizeof(media->stream.audio_url), "%s", effective_url);
         snprintf(media->stream.audio_mime_type,
@@ -154,7 +264,7 @@ static PspPageMediaProbeStatus psp_media_page_probe_finish(
                  sizeof(media->stream.mime_type), "%s", "video/mp4");
         media->stream.content_length = complete_length;
     }
-    media->stream.expires_unix = UINT64_MAX;
+    media->stream.expires_monotonic_s = UINT64_MAX;
     return PSP_PAGE_MEDIA_PROBE_READY;
 }
 
@@ -223,13 +333,15 @@ static PspPageMediaProbeStatus psp_media_page_probe(
         .method = "GET",
         .mode = media->page_media_mode,
         .credentials = media->page_media_credentials,
-        .destination = TILEFINCH_DESTINATION_MEDIA
+        .destination = media->page_audio
+            ? TILEFINCH_DESTINATION_AUDIO : TILEFINCH_DESTINATION_MEDIA
     };
     FetchRequest transport = {
         .allow_http_errors = true,
         .accept = media->page_audio
-            ? "audio/mp4,audio/*;q=0.9,*/*;q=0.5"
+            ? "audio/mpeg,audio/mp4,audio/*;q=0.9,*/*;q=0.5"
             : "video/mp4,video/*;q=0.9,*/*;q=0.5",
+        .icy_status_line = media->page_audio,
         .user_agent = TILEFINCH_BROWSER_USER_AGENT,
         .connect_timeout_ms = PSP_MEDIA_CONNECT_TIMEOUT_MS,
         /* A page's media URL commonly redirects to a CDN on another origin.
@@ -487,10 +599,10 @@ bool psp_media_resolved_stream_reusable(const PspMediaSession *media)
     if (media->stream.split_streams
         && (media->stream.audio_content_length == 0
             || media->stream.audio_url[0] == '\0')) return false;
-    uint64_t now = tilefinch_platform_wall_time_ns()
+    uint64_t now = tilefinch_platform_monotonic_time_ns()
         / UINT64_C(1000000000);
-    return media->stream.expires_unix > now
-        && media->stream.expires_unix - now
+    return media->stream.expires_monotonic_s > now
+        && media->stream.expires_monotonic_s - now
              >= PSP_MEDIA_REUSED_URL_MINIMUM_LIFETIME_SECONDS;
 }
 
@@ -774,7 +886,7 @@ void psp_media_job_failed(PspMediaSession *media,
         media_playback_set_playing(media->playback, false);
         psp_ui_media_set(
             &media->ui, true, false, false, media->clock_us,
-            psp_media_duration_us(media), media->stream.title);
+            psp_media_duration_us(media), psp_media_shown_title(media));
         if (commit_pending)
             psp_ui_media_commit_seek(&media->ui, preview_target_us);
         else
@@ -860,12 +972,12 @@ static bool psp_media_transport_refresh_needed(
             : video.last_http_status != 0
                 ? video.last_http_status : audio.last_http_status;
     if (status != NULL) *status = failed_status;
-    uint64_t now = tilefinch_platform_wall_time_ns()
+    uint64_t now = tilefinch_platform_monotonic_time_ns()
                  / UINT64_C(1000000000);
     return video.failures != 0 || audio.failures != 0
         || psp_media_transport_refresh_policy(
         false, false, video.last_http_status, audio.last_http_status,
-        media->stream.expires_unix, now);
+        media->stream.expires_monotonic_s, now);
 }
 
 /* What a retry that rebuilds the pipeline carries across it: a committed
@@ -940,7 +1052,9 @@ bool psp_media_retry_transport(
         .has_separate_audio = false,
         .audio_only = media->audio_only
     }, "transport-refresh-open");
-    psp_ui_media_set_resolving(&media->ui, "Refreshing video link");
+    psp_ui_media_set_resolving(
+        &media->ui,
+        psp_media_resolving_title(media, "Refreshing video link"));
     if (preview_pending || commit_pending) {
         media->ui.duration_us = duration_us;
         if (commit_pending)
@@ -1056,7 +1170,7 @@ bool psp_media_retry_240p(
     psp_ui_media_set_resolving(
         &media->ui,
         media->stream.title[0] == '\0'
-            ? "YouTube video" : media->stream.title);
+            ? "YouTube video" : psp_media_shown_title(media));
     /* Say so, as the failure screen's own 240p choice does. */
     psp_ui_media_note_lower_quality_retry(&media->ui);
     psp_ui_media_set_resolving_progress(
@@ -1118,7 +1232,28 @@ bool psp_media_retry_delivery_failure(
         media, operation, error, delivery_candidate_rejected || failed);
 }
 
+/*
+ * The failed-open panel doubles as the unencrypted-audio question: the
+ * headline asks and the details say why (media_failure_message.c), and the
+ * Retry chip becomes "Play anyway". A remembered decline names where to
+ * change it instead and offers no Retry.
+ */
+void psp_media_present_insecure_audio(PspMediaSession *media)
+{
+    if (media == NULL || !media->page_audio) return;
+    if (media->insecure_audio_offer) {
+        media->ui.insecure_audio_offer = true;
+    } else if (media->insecure_audio_blocked) {
+        media->ui.retry_unavailable = true;
+        media->ui.insecure_audio_blocked = true;
+    }
+}
+
 static bool psp_media_open_pump_step(PspMediaSession *media);
+
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+static void psp_media_open_chart_check(PspMediaSession *media);
+#endif
 
 /*
  * Publish the caller's cancellation token for exactly the duration of one
@@ -1217,6 +1352,7 @@ bool psp_media_open_pump(
             media, "open-failed-released");
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     psp_media_session_checkpoint(media, "open-pump");
+    psp_media_open_chart_check(media);
 #endif
     return pumped;
 }
@@ -1237,6 +1373,54 @@ static const char *psp_media_open_stage_name(PspMediaJobPhase phase)
         default: return "none";
     }
 }
+
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+/* The controller chart phase a physical open phase stands for. */
+static PspMediaOpeningPhase psp_media_open_chart_phase(PspMediaJobPhase phase)
+{
+    switch (phase) {
+    case PSP_MEDIA_JOB_OPEN_RESOLVE: return PSP_MEDIA_OPEN_RESOLVING;
+    case PSP_MEDIA_JOB_OPEN_VIDEO_RANGE: return PSP_MEDIA_OPEN_VIDEO_RANGE;
+    case PSP_MEDIA_JOB_OPEN_VIDEO_DEMUX: return PSP_MEDIA_OPEN_VIDEO_DEMUX;
+    case PSP_MEDIA_JOB_OPEN_VIDEO_PRIME: return PSP_MEDIA_OPEN_VIDEO_PRIME;
+    case PSP_MEDIA_JOB_OPEN_AUDIO_RANGE: return PSP_MEDIA_OPEN_AUDIO_RANGE;
+    case PSP_MEDIA_JOB_OPEN_AUDIO_DEMUX: return PSP_MEDIA_OPEN_AUDIO_DEMUX;
+    case PSP_MEDIA_JOB_OPEN_DECODER_PREPARE:
+        return PSP_MEDIA_OPEN_DECODER_PREPARE;
+    case PSP_MEDIA_JOB_OPEN_PLAYBACK: return PSP_MEDIA_OPEN_PLAYBACK_CREATE;
+    default: return PSP_MEDIA_OPEN_NONE;
+    }
+}
+
+/* Device check: the physical open must walk the controller's chart. A
+   divergence otherwise shows only as a stuck "Loading" and a mismatch
+   count, as when MP3 page audio took the video chart. Logged once per
+   divergent pair. */
+static void psp_media_open_chart_check(PspMediaSession *media)
+{
+    static int last_physical = -1, last_chart = -1;
+    PspMediaOpeningPhase physical =
+        psp_media_open_chart_phase(media->job_phase);
+    PspMediaOpeningPhase chart =
+        media->machine.state == PSP_MEDIA_SESSION_OPENING
+            ? media->machine.opening_phase : PSP_MEDIA_OPEN_NONE;
+    if (physical == chart || (physical == PSP_MEDIA_OPEN_NONE
+                              && media->machine.state
+                                     != PSP_MEDIA_SESSION_OPENING)) {
+        last_physical = last_chart = -1;
+        return;
+    }
+    if ((int) physical == last_physical && (int) chart == last_chart) return;
+    last_physical = (int) physical;
+    last_chart = (int) chart;
+    printf("tilefinch-media-open: event=chart-divergence physical=%s "
+           "chart-phase=%d machine-state=%d audio-only=%d stream=%d\n",
+           psp_media_open_stage_name(media->job_phase), (int) chart,
+           (int) media->machine.state, media->audio_only ? 1 : 0,
+           media->hls != NULL ? 1 : 0);
+}
+#endif
+
 
 /*
  * Hand both range sources what is left of the open's clocks, so the blocking
@@ -1512,18 +1696,36 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
             && psp_media_resolved_stream_reusable(media);
         media->continuation.reuse_resolved = false;
         if (reused) {
-            uint64_t now = tilefinch_platform_wall_time_ns()
+            uint64_t now = tilefinch_platform_monotonic_time_ns()
                 / UINT64_C(1000000000);
             printf(
                 "tilefinch-media-open: event=reuse-resolved-stream "
                 "itag=%d audio-itag=%d expire-remaining=%llus\n",
                 media->stream.itag, media->stream.audio_itag,
                 (unsigned long long) (media->offline_source
-                    || media->stream.expires_unix <= now
-                        ? 0 : media->stream.expires_unix - now));
-        } else if (media->page_hls
+                    || media->stream.expires_monotonic_s <= now
+                        ? 0 : media->stream.expires_monotonic_s - now));
+        } else if (media->page_mp3 && media->hls == NULL
+                   && psp_swdec_component_owns_me(&media->swdec)) {
+            /* The software video decoder holds the Media Engine for the
+               rest of the process; MP3 decodes on its firmware codec. */
+            snprintf(error, sizeof(error), "%s",
+                     "MP3 needs the firmware decoder; restart Tilefinch");
+            ok = false;
+        } else if (media->page_hls || media->page_mp3
                    || (media->stream.live_hls && media->hls != NULL)) {
             bool provider_live = media->stream.live_hls;
+            if (media->hls == NULL && media->page_mp3) {
+                media->hls = psp_media_hls_create_mp3(
+                    media->budget, media->session,
+                    media->stream.audio_url[0] != '\0'
+                        ? media->stream.audio_url : media->source,
+                    media->page_document_url, media->page_media_mode,
+                    media->page_media_credentials,
+                    psp_media_page_content_security_policy(media),
+                    media->page_mp3_length, media->page_mp3_seekable,
+                    error, sizeof(error));
+            }
             if (media->hls == NULL) {
                 media->hls = psp_media_hls_create(
                     media->budget, media->session,
@@ -1561,7 +1763,32 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
                     snprintf(error, sizeof(error), "%s",
                              "HLS sample-source handoff failed");
                 }
-                if (ok) {
+                if (ok && psp_media_hls_is_audio(media->hls)) {
+                    MediaMp4TrackInfo audio = {0};
+                    ok = psp_media_hls_stream_info(media->hls, NULL, &audio)
+                        && audio.sample_rate != 0;
+                    printf("tilefinch-media-mp3-open: rate=%u channels=%u "
+                           "duration=%llu live=%d\n",
+                           (unsigned) audio.sample_rate,
+                           (unsigned) audio.channels,
+                           (unsigned long long) audio.duration,
+                           media->page_mp3_length == 0 ? 1 : 0);
+                    if (!ok) {
+                        snprintf(error, sizeof(error), "%s",
+                                 "MP3 decoder metadata is unavailable");
+                        break;
+                    }
+                    snprintf(media->stream.title,
+                             sizeof(media->stream.title), "%s", "Page audio");
+                    snprintf(media->stream.audio_mime_type,
+                             sizeof(media->stream.audio_mime_type), "%s",
+                             "audio/mpeg");
+                    media->stream.duration_ms = audio.timescale == 0 ? 0
+                        : audio.duration * UINT64_C(1000) / audio.timescale;
+                    media->stream.expires_monotonic_s = UINT64_MAX;
+                    media->stream.split_streams = false;
+                    media->use_swdec = false;
+                } else if (ok) {
                     MediaMp4TrackInfo video = {0}, audio = {0};
                     bool info_ready = psp_media_hls_stream_info(
                         media->hls, &video, &audio);
@@ -1740,7 +1967,7 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
                             video.timescale == 0 ? 0
                             : video.duration * UINT64_C(1000)
                                 / video.timescale;
-                        media->stream.expires_unix = UINT64_MAX;
+                        media->stream.expires_monotonic_s = UINT64_MAX;
                         media->stream.split_streams = separate_audio;
                     }
                 }
@@ -1749,6 +1976,11 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
             PspPageMediaProbeStatus status = psp_media_page_probe(
                 media, error, sizeof(error));
             if (status == PSP_PAGE_MEDIA_PROBE_PENDING) {
+                ok = true;
+                break;
+            }
+            if (status == PSP_PAGE_MEDIA_PROBE_MP3) {
+                /* The next pump opens it on the MP3 branch above. */
                 ok = true;
                 break;
             }
@@ -1880,11 +2112,11 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
         }
         if (ok) {
             psp_media_apply_decoder_hint(media);
-            uint64_t now = tilefinch_platform_wall_time_ns()
+            uint64_t now = tilefinch_platform_monotonic_time_ns()
                          / UINT64_C(1000000000);
             uint64_t expiry_remaining =
-                media->stream.expires_unix > now
-                    ? media->stream.expires_unix - now : 0;
+                media->stream.expires_monotonic_s > now
+                    ? media->stream.expires_monotonic_s - now : 0;
             printf(
                 "tilefinch-media: resolved itag=%d audio-itag=%d split=%d "
                 "source=%dx%d video=%lluB audio=%lluB "
@@ -1919,7 +2151,8 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
                Generic page media says only video/mp4 until avcC is parsed;
                defer its decoder choice until VIDEO_DEMUX rather than loading
                firmware first and the larger software component afterward. */
-            media->job_phase = (media->page_hls || media->stream.live_hls)
+            media->job_phase = (media->page_hls || media->page_mp3
+                                || media->stream.live_hls)
                 ? PSP_MEDIA_JOB_OPEN_DECODER_PREPARE
                 : media->page_audio
                 ? PSP_MEDIA_JOB_OPEN_DECODER_PREPARE
@@ -2177,7 +2410,12 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
             if (prepared == MEDIA_PSP_PREPARE_PENDING) break;
             ok = prepared == MEDIA_PSP_PREPARE_READY;
         }
-        if (ok) media->job_phase = media->hls != NULL
+        /* These follow the controller's chart (psp_media_state.c): an
+           audio-only open, MP3 page audio over the stream transport
+           included, goes AUDIO_RANGE -> AUDIO_DEMUX -> PLAYBACK. Taking the
+           video chart there completes one phase more than the controller
+           counts, so it reaches PRIMING while PLAYBACK was never built. */
+        if (ok) media->job_phase = media->hls != NULL && !media->audio_only
             ? PSP_MEDIA_JOB_OPEN_VIDEO_RANGE
             : media->page_audio && media->audio_demux != NULL
             ? PSP_MEDIA_JOB_OPEN_PLAYBACK
@@ -2227,7 +2465,11 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
                (unsigned long long) media->first_frame_opened_us,
                media->stream.width, media->stream.height,
                media->stream.itag);
-        psp_ui_media_set_resolving(&media->ui, media->stream.title);
+        /* The same open's last phase: a track or queue menu the reader
+           opened during it stays open on its row, so the Cross meant for
+           that row is not taken as play/pause. */
+        psp_ui_media_continue_resolving(
+            &media->ui, psp_media_shown_title(media));
         media->ui.duration_us = psp_media_duration_us(media);
         psp_ui_media_set_resolving_progress(
             &media->ui, "Loading...", 920u);
@@ -2399,12 +2641,19 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
         /* A page that offers further renditions tries the next one when
            this one cannot work here at all. Refreshing the same URL cannot
            change its picture size, profile or a 4xx answer. */
-        bool fallback = psp_media_retry_page_candidate(media, failure);
+        /* The unencrypted-audio question is the user's to answer; no
+           retry or other rendition can change it. */
+        bool consent_failure = media->insecure_audio_offer
+            || media->insecure_audio_blocked;
+        bool fallback = consent_failure
+            || psp_media_retry_page_candidate(media, failure);
         /* Candidate one is the requested 360p stream, candidate two is a
            fresh URL at the same quality, and candidate three is newly
            resolved at 240p. Resolution is deliberately changed only after a
            second candidate proves the problem is delivery, not one bad URL. */
-        if (!fallback) {
+        if (consent_failure) {
+            fallback = false;
+        } else if (!fallback) {
             fallback = psp_media_retry_delivery_failure(
                 media, "open", failure, delivery_candidate_rejected);
         }
@@ -2413,7 +2662,7 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
            module failure and leaves the user waiting for a fallback which
            cannot help.  Backend creation and decode failures still retain
            the lower-memory/lower-profile 240p recovery. */
-        if (!fallback
+        if (!fallback && !consent_failure
             && phase_before != PSP_MEDIA_JOB_OPEN_DECODER_PREPARE) {
             fallback = psp_media_retry_240p(
                 media, "open", failure, false);
@@ -2424,6 +2673,7 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
                 true);
             psp_media_pipeline_destroy(media);
             psp_media_job_failed(media, "open", failure);
+            psp_media_present_insecure_audio(media);
         }
     }
     return true;

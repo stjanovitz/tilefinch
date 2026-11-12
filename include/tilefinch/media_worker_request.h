@@ -35,6 +35,8 @@ typedef struct {
     /* The opening document's CSP, or NULL when it sent none. */
     const TilefinchContentSecurityPolicy *content_security_policy;
     bool page_redirects;
+    /* An audio-only stream: its hops carry TILEFINCH_DESTINATION_AUDIO. */
+    bool audio;
 } MediaWorkerAuthority;
 
 /* The current hop of one logical request. Start with media_worker_hop_init. */

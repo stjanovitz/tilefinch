@@ -654,7 +654,8 @@ static bool loop_drain_turn(BrowserEngine *engine,
              && !work_pending
              && !navigation_background_resources_pending(navigation)
              && !browser_engine_navigation_pending(engine)
-             && loop_drain_pending_work(navigation) == 0;
+             && loop_drain_pending_work(navigation) == 0
+             && !script_runtime_has_pending_mutations(navigation->page.runtime);
     return true;
 }
 

@@ -508,6 +508,108 @@ static void layout_block_apply_transform(
                     "transform", node);
 }
 
+/* An authored start or value attribute: absent (0; also empty or 16 bytes
+   or longer), present but not a number (1), or a number (2) in *out,
+   saturated to the int range (strtol's long is wider than int on the
+   host). */
+static int layout_list_integer_attribute(const lxb_dom_node_t *node,
+                                         const char *name, int *out)
+{
+    size_t length = 0;
+    const char *text = document_attribute(
+        (lxb_dom_node_t *) node, name, &length);
+    if (text == NULL || length == 0 || length >= 16) return 0;
+    char value[16];
+    memcpy(value, text, length);
+    value[length] = '\0';
+    char *end = NULL;
+    long parsed = strtol(value, &end, 10);
+    if (end == value) return 1;
+    *out = parsed > INT_MAX ? INT_MAX : parsed < INT_MIN ? INT_MIN
+        : (int) parsed;
+    return 2;
+}
+
+/* The ordinal of an <ol>'s <li> child: the list's start (or, reversed, its
+   item count), counted up (down) per item, an item's value restarting the
+   count. Items are numbered in order during a build, so this counts on
+   from the <li> numbered last when `node` follows it in the same list. The
+   count saturates at the int range instead of overflowing. */
+static int layout_list_item_ordinal(LayoutContext *context,
+                                    const lxb_dom_node_t *node)
+{
+    const lxb_dom_node_t *list = node->parent;
+    /* A boolean attribute: present with or without a value. */
+    bool reversed = lxb_dom_element_has_attribute(
+        lxb_dom_interface_element((lxb_dom_node_t *) list),
+        (const lxb_char_t *) "reversed", 8);
+    LayoutPerformance *performance = &context->layout->performance;
+    /* Most recently numbered list first: an outer list's next item comes
+       right after the lists nested in its previous item. */
+    size_t slot = 0;
+    while (slot < LAYOUT_LIST_MARKER_MEMO
+           && context->list_markers[slot].list != list) slot++;
+    __typeof__(context->list_markers[0]) entry = {.list = list};
+    if (slot == LAYOUT_LIST_MARKER_MEMO) slot--;
+    else entry = context->list_markers[slot];
+    memmove(&context->list_markers[1], &context->list_markers[0],
+            slot * sizeof(context->list_markers[0]));
+    context->list_markers[0] = entry;
+    __typeof__(&context->list_markers[0]) memo = &context->list_markers[0];
+    if (memo->item == node) return memo->ordinal;
+    int next = 1;
+    const lxb_dom_node_t *from = list->first_child;
+    if (memo->item != NULL) {
+        /* Only a later sibling continues; anything else starts over. */
+        const lxb_dom_node_t *at = memo->item->next;
+        while (at != NULL && at != node) {
+            performance->list_marker_steps++;
+            at = at->next;
+        }
+        if (at == node) {
+            from = memo->item->next;
+            next = reversed
+                ? (memo->ordinal == INT_MIN ? INT_MIN : memo->ordinal - 1)
+                : (memo->ordinal == INT_MAX ? INT_MAX : memo->ordinal + 1);
+        }
+    }
+    if (from == list->first_child
+        && layout_list_integer_attribute(list, "start", &next) == 0
+        && reversed) {
+        if (!memo->counted) {
+            int count = 0;
+            for (const lxb_dom_node_t *child = list->first_child;
+                 child != NULL; child = child->next) {
+                performance->list_marker_steps++;
+                if (child->type == LXB_DOM_NODE_TYPE_ELEMENT
+                    && document_node_is_tag(
+                           (lxb_dom_node_t *) child, LXB_TAG_LI)
+                    && count != INT_MAX) count++;
+            }
+            memo->count = count;
+            memo->counted = true;
+        }
+        next = memo->count;
+    }
+    for (const lxb_dom_node_t *child = from; child != NULL;
+         child = child->next) {
+        performance->list_marker_steps++;
+        if (child->type != LXB_DOM_NODE_TYPE_ELEMENT
+            || !document_node_is_tag((lxb_dom_node_t *) child, LXB_TAG_LI))
+            continue;
+        (void) layout_list_integer_attribute(child, "value", &next);
+        if (child == node) {
+            memo->item = node;
+            memo->ordinal = next;
+            return next;
+        }
+        next = reversed ? (next == INT_MIN ? INT_MIN : next - 1)
+            : (next == INT_MAX ? INT_MAX : next + 1);
+    }
+    /* A list-item box that is not an <li> child counts as the first. */
+    return 1;
+}
+
 /* The ::marker of a display:list-item block: its ordinal from the list's
    start, reversed and value attributes, its text, and its outside or inside
    placement on the first line. Cold: the caller admits only list items. */
@@ -520,51 +622,7 @@ static bool layout_block_list_marker(LayoutContext *context,
     bool ordered = node->parent != NULL
                    && document_node_is_tag(node->parent, LXB_TAG_OL);
     int position = 1;
-    if (ordered) {
-        bool reversed = document_attribute(
-            node->parent, "reversed", &(size_t) {0}) != NULL;
-        int next = 1;
-        size_t start_length = 0;
-        const char *start = document_attribute(
-            node->parent, "start", &start_length);
-        if (start != NULL && start_length != 0 && start_length < 16) {
-            char value[16];
-            memcpy(value, start, start_length);
-            value[start_length] = '\0';
-            char *end = NULL;
-            long parsed = strtol(value, &end, 10);
-            if (end != value) next = (int) parsed;
-        } else if (reversed) {
-            next = 0;
-            for (lxb_dom_node_t *child = node->parent->first_child;
-                 child != NULL; child = child->next) {
-                if (child->type == LXB_DOM_NODE_TYPE_ELEMENT
-                    && document_node_is_tag(child, LXB_TAG_LI)) next++;
-            }
-        }
-        for (lxb_dom_node_t *child = node->parent->first_child;
-             child != NULL; child = child->next) {
-            if (child->type != LXB_DOM_NODE_TYPE_ELEMENT
-                || !document_node_is_tag(child, LXB_TAG_LI)) continue;
-            size_t value_length = 0;
-            const char *authored = document_attribute(
-                child, "value", &value_length);
-            if (authored != NULL && value_length != 0
-                && value_length < 16) {
-                char value[16];
-                memcpy(value, authored, value_length);
-                value[value_length] = '\0';
-                char *end = NULL;
-                long parsed = strtol(value, &end, 10);
-                if (end != value) next = (int) parsed;
-            }
-            if (child == node) {
-                position = next;
-                break;
-            }
-            next += reversed ? -1 : 1;
-        }
-    }
+    if (ordered) position = layout_list_item_ordinal(context, node);
     ListStyleType marker_type = (ListStyleType) style->list_style_type;
     if (marker_type == LIST_STYLE_AUTO) {
         marker_type = ordered ? LIST_STYLE_DECIMAL : LIST_STYLE_DISC;

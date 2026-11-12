@@ -142,6 +142,9 @@ static int test_refusal_classification(void)
         "HLS carries unsupported AVC syntax",
         "HLS master has no compatible AVC rendition",
         "PSP media has no supported track",
+        /* A finite HLS playlist past its retained bounds (MD-10). */
+        "HLS playlist is too long (over 2048 entries)",
+        "HLS playlist is too long (VOD text over 128 KiB)",
         "page video range probe failed (HTTP 403): forbidden",
         "page video range probe failed (HTTP 404): "
             "server did not authorize byte ranges",

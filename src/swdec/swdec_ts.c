@@ -20,15 +20,28 @@
 
 static void au_reset(SwdecTs *ts) { ts->au_len = 0; ts->au_pts = SWDEC_TS_NOPTS; }
 
-void swdec_ts_init(SwdecTs *ts,
-                   swdec_ts_video_cb video_cb, swdec_ts_audio_cb audio_cb, void *user)
+void swdec_ts_reset(SwdecTs *ts)
 {
-    memset(ts, 0, sizeof *ts);
+    /* Field by field: the buffers hold no state beyond au_len and ad_len,
+       and clearing them cost a 520 KiB memset per seek or discontinuity. */
     ts->pmt_pid = -1; ts->video_pid = -1; ts->audio_pid = -1;
-    ts->video_cb = video_cb; ts->audio_cb = audio_cb; ts->user = user;
     au_reset(ts);
     ts->pes_pts = SWDEC_TS_NOPTS;
+    ts->au_has_slice = 0;
+    ts->ad_len = 0;
     ts->apes_pts = SWDEC_TS_NOPTS;
+    ts->audio_pts_remainder = 0;
+    ts->audio_sample_rate = 0;
+    memset(&ts->stats, 0, sizeof ts->stats);
+}
+
+void swdec_ts_init(SwdecTs *ts, uint8_t *au_buf, size_t au_capacity,
+                   swdec_ts_video_cb video_cb, swdec_ts_audio_cb audio_cb, void *user)
+{
+    ts->video_cb = video_cb; ts->audio_cb = audio_cb; ts->user = user;
+    ts->au_buf = au_capacity != 0 ? au_buf : NULL;
+    ts->au_capacity = au_buf != NULL ? au_capacity : 0;
+    swdec_ts_reset(ts);
 }
 
 static uint64_t parse_pts(const uint8_t *p)
@@ -103,7 +116,8 @@ static void video_payload(SwdecTs *ts, const uint8_t *p, size_t n, int pes_start
         if (9u + hdrlen > n) return;
         p += 9 + hdrlen; n -= 9 + hdrlen;
     }
-    if (ts->au_len + n > sizeof ts->au_buf) {    /* overflow: drop the AU */
+    if (ts->au_capacity == 0) return;            /* audio-only use */
+    if (n > ts->au_capacity - ts->au_len) {      /* overflow: drop the AU */
         ts->stats.au_overflows++;
         au_reset(ts);
         ts->au_has_slice = 0;

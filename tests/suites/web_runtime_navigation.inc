@@ -62,10 +62,12 @@
             sizeof(pressure_html) - pressure_length, ".unused%u{margin:0}", i);
     pressure_length += (size_t) snprintf(pressure_html + pressure_length,
         sizeof(pressure_html) - pressure_length, "</style><body>");
+    /* Distinct values: equal styles share one payload, and reclaiming these
+       must free what the pressure below asks for. */
     for (unsigned i = 0; i < 1400; i++)
         pressure_length += (size_t) snprintf(pressure_html + pressure_length,
             sizeof(pressure_html) - pressure_length,
-            "<span class=item>row%u</span>", i);
+            "<span class=item style=margin-top:%upx>row%u</span>", i, i);
     CHECK(pressure_length < sizeof(pressure_html));
     CHECK(navigation_init(&navigation, &budget, 2));
     CHECK(navigation_commit_static_html(&navigation, navigation_begin(&navigation),
@@ -2013,8 +2015,16 @@
     puts("test: one constructed sheet shared by many shadow roots");
     CHECK(test_constructed_sheet_shared_by_roots(&budget));
     CHECK(test_constructed_sheet_nested_scope(&budget));
+    puts("test: the retained-property gate answers as the full rule scan");
+    CHECK(test_retained_gate_matches_full_scan(&budget));
+    puts("test: the retained-property gate follows head cuts and adoption");
+    CHECK(test_retained_gate_follows_head_cut_and_adoption(&budget));
     puts("test: a full adopted root table keeps shadow-confined rules");
     CHECK(test_constructed_sheet_full_root_table(&budget));
+    puts("test: a dense match set keeps the shadow context order");
+    CHECK(test_shadow_cascade_dense_matches(&budget));
+    puts("test: inner important rules beat inline important");
+    CHECK(test_shadow_cascade_inline_important(&budget));
     puts("test: adopted sheets keep cascade order and leave when dropped");
     CHECK(test_constructed_sheet_order_and_removal(&budget));
     puts("test: adopted roots preserve independent order and confinement on refusal");
@@ -5182,7 +5192,8 @@
 
     /* Shadow encapsulation of styles (CSS Scoping 3): a shadow tree's own
        <style> applies inside that tree only; :host and :host(<compound>)
-       reach the host and ::slotted(<compound>) its assigned light children.
+       reach the host and ::slotted(<compound>) its assigned light children,
+       below the outer tree's own normal declarations (Cascade 5, 6.1).
        The same holds for a constructed sheet a shadow root adopts. A
        document sheet's :host never matches. MDN's Lit components declare
        `:host{display:contents}` and generic `a`/`button` resets this way. */
@@ -5197,7 +5208,8 @@
         "const r=document.getElementById('a').attachShadow({mode:'open'});"
         "r.innerHTML='<style>:host{display:block;padding-left:40px}"
         ":host(.wide){padding-left:60px}p{color:#ff0000}"
-        "::slotted(p){color:#00ff00}.out,span{color:#0000ff}</style>"
+        "::slotted(p){color:#00ff00;margin-left:20px}"
+        ".out,span{color:#0000ff}</style>"
         "<p>INSIDE</p><slot name=s></slot>';"
         "const t=document.getElementById('t').attachShadow({mode:'open'});"
         "const sheet=new CSSStyleSheet();"
@@ -5229,7 +5241,9 @@
     bool shadow_styles_ok = inside != NULL && light != NULL
         && outside != NULL && adopted != NULL && probe != NULL
         && inside->color == 0xff0000u && inside->x == 8 + 60
-        && light->color == 0x00ff00u && light->x == 8 + 60
+        /* The document's own p rule outranks ::slotted() (an inner
+           context); its unopposed margin still applies. */
+        && light->color == 0x000000u && light->x == 8 + 60 + 20
         && outside->color == 0x000000u && outside->x == 8
         && probe->color == 0x000000u
         && adopted->color == 0x00aaaau && adopted->x == 8 + 30
@@ -5252,6 +5266,143 @@
                 shadow_style_navigation.page.script_result.summary);
     CHECK(shadow_styles_ok);
     navigation_destroy(&shadow_style_navigation);
+    CHECK(budget.current == 0);
+
+    /* Cascade contexts (CSS Cascade 5, 6.1): a normal declaration of the
+       host's own tree beats its shadow tree's :host rule whatever their
+       specificity, custom properties included (the Internet Archive sets
+       --search-bar-width on a component whose :host rule defaults it to
+       auto); an important :host declaration beats an important outer one. */
+    puts("test: outer rules beat :host; important :host wins");
+    static const char host_context_page[] =
+        "<!doctype html><style>body{margin:0}"
+        "x-a{color:#00aa00;padding-left:20px;--w:50px}"
+        "x-a.imp{color:#0000aa !important}</style><body>"
+        "<x-a id=n></x-a><x-a id=i class=imp></x-a><script>"
+        "const s=new CSSStyleSheet();"
+        "s.replaceSync(':host{display:block;color:#ff0000;padding-left:90px;"
+        "--w:300px}:host(.imp){color:#aa00aa !important}"
+        "#box{width:var(--w);height:4px;background:#000}');"
+        "for(const id of ['n','i']){"
+        "const r=document.getElementById(id).attachShadow({mode:'open'});"
+        "r.adoptedStyleSheets=[s];"
+        "r.innerHTML=(id==='n'?'NORMALHOST':'IMPHOST')+'<div id=box></div>';}"
+        "setTimeout(()=>{globalThis.pocSummary=[...document.querySelectorAll("
+        "'x-a')].map(h=>getComputedStyle(h).color+'/'"
+        "+getComputedStyle(h).getPropertyValue('--w').trim()).join('|')});"
+        "</script></body>";
+    static NavigationSession host_context_navigation;
+    CHECK(navigation_init(&host_context_navigation, &budget, 2));
+    navigation_enable_scripts(&host_context_navigation, 4 * MIB, 1000);
+    uint64_t host_context_generation =
+        navigation_begin(&host_context_navigation);
+    CHECK(navigation_commit_html(
+        &host_context_navigation, host_context_generation,
+        "https://host-context.test/", host_context_page,
+        strlen(host_context_page), 480, NULL, NULL, true));
+    for (size_t frame = 0; frame < 4; frame++)
+        CHECK(navigation_advance_runtime(&host_context_navigation, 16, 8));
+    const LayoutDocument *host_context_layout =
+        &host_context_navigation.page.layout;
+    const DrawCommand *normal_host =
+        text_command(host_context_layout, "NORMALHOST");
+    const DrawCommand *important_host =
+        text_command(host_context_layout, "IMPHOST");
+    bool host_context_ok = normal_host != NULL && important_host != NULL
+        && normal_host->color == 0x00aa00u && normal_host->x == 20
+        && important_host->color == 0xaa00aau && important_host->x == 20
+        && strcmp(host_context_navigation.page.script_result.summary,
+                  "rgb(0, 170, 0)/50px|rgb(170, 0, 170)/50px") == 0;
+    if (!host_context_ok)
+        fprintf(stderr, "host context: normal=%06x/%d important=%06x/%d "
+                "summary=%s\n",
+                normal_host ? (unsigned) normal_host->color : 0u,
+                normal_host ? normal_host->x : -1,
+                important_host ? (unsigned) important_host->color : 0u,
+                important_host ? important_host->x : -1,
+                host_context_navigation.page.script_result.summary);
+    CHECK(host_context_ok);
+    navigation_destroy(&host_context_navigation);
+    CHECK(budget.current == 0);
+
+    /* Lit sites adopt one constructed sheet per component class (the
+       Internet Archive's search page: 54). Every one is a style source;
+       the source table used to decline those past 48, so later
+       components rendered unstyled. */
+    puts("test: a page adopting 60 constructed sheets styles them all");
+    static const char many_sheets_page[] =
+        "<!doctype html><style>body{margin:0}</style>"
+        "<style>p{margin:0}</style><body><div id=hosts></div><script>"
+        "const hosts=document.getElementById('hosts');"
+        "for(let i=0;i<60;i++){"
+        "const s=new CSSStyleSheet();"
+        "s.replaceSync(':host{display:block} b{color:#0000'+"
+        "(i+16).toString(16)+'}');"
+        "const h=document.createElement('x-h'+i);hosts.appendChild(h);"
+        "const r=h.attachShadow({mode:'open'});r.adoptedStyleSheets=[s];"
+        "r.innerHTML='<b>SHEET'+i+'</b>';}"
+        "globalThis.pocSummary='SHEETS';"
+        "</script></body>";
+    static NavigationSession many_sheets_navigation;
+    CHECK(navigation_init(&many_sheets_navigation, &budget, 2));
+    navigation_enable_scripts(&many_sheets_navigation, 4 * MIB, 1000);
+    uint64_t many_sheets_generation =
+        navigation_begin(&many_sheets_navigation);
+    CHECK(navigation_commit_html(
+        &many_sheets_navigation, many_sheets_generation,
+        "https://many-sheets.test/", many_sheets_page,
+        strlen(many_sheets_page), 480, NULL, NULL, true));
+    for (size_t frame = 0; frame < 4; frame++)
+        CHECK(navigation_advance_runtime(&many_sheets_navigation, 16, 8));
+    const DrawCommand *first_sheet = text_command(
+        &many_sheets_navigation.page.layout, "SHEET0");
+    const DrawCommand *last_sheet = text_command(
+        &many_sheets_navigation.page.layout, "SHEET59");
+    if (first_sheet == NULL || last_sheet == NULL
+        || first_sheet->color != 0x000010u || last_sheet->color != 0x00004bu)
+        fprintf(stderr, "many sheets: first=%06x last=%06x\n",
+                first_sheet ? (unsigned) first_sheet->color : 0u,
+                last_sheet ? (unsigned) last_sheet->color : 0u);
+    CHECK(first_sheet != NULL && last_sheet != NULL
+          && first_sheet->color == 0x000010u
+          && last_sheet->color == 0x00004bu);
+    navigation_destroy(&many_sheets_navigation);
+    CHECK(budget.current == 0);
+
+    /* Component libraries deep-clone their template fragments for every
+       instance. A clone without a <template> inside it needs no JS walk;
+       the walk wrapped every node of both trees, and connected wrappers
+       keep their handles, so a long list exhausted the handle table. */
+    puts("test: deep clones of template-free fragments keep few handles");
+    static const char clone_handles_page[] =
+        "<!doctype html><body><div id=list></div><script>"
+        "const t=document.createElement('div');"
+        "t.innerHTML='<p><b>x</b><i>y</i></p><span>z</span><em>w</em>';"
+        "const list=document.getElementById('list');let made=0;"
+        "try{for(let i=0;i<1800;i++){list.appendChild(t.cloneNode(true));"
+        "made++;}}catch(e){}"
+        "globalThis.pocSummary='CLONES '+made;"
+        "</script></body>";
+    static NavigationSession clone_handles_navigation;
+    CHECK(navigation_init(&clone_handles_navigation, &budget, 2));
+    /* This counts handles, so the script gets far longer than it needs: under
+       sanitizers on a busy machine 1800 clones can outlast a second. */
+    navigation_enable_scripts(&clone_handles_navigation, 6 * MIB, 20000);
+    uint64_t clone_handles_generation =
+        navigation_begin(&clone_handles_navigation);
+    CHECK(navigation_commit_html(
+        &clone_handles_navigation, clone_handles_generation,
+        "https://clone-handles.test/", clone_handles_page,
+        strlen(clone_handles_page), 480, NULL, NULL, true));
+    for (size_t frame = 0; frame < 4; frame++)
+        CHECK(navigation_advance_runtime(&clone_handles_navigation, 16, 8));
+    if (strcmp(clone_handles_navigation.page.script_result.summary,
+               "CLONES 1800") != 0)
+        fprintf(stderr, "clone handles: %s\n",
+                clone_handles_navigation.page.script_result.summary);
+    CHECK(strcmp(clone_handles_navigation.page.script_result.summary,
+                 "CLONES 1800") == 0);
+    navigation_destroy(&clone_handles_navigation);
     CHECK(budget.current == 0);
 
     /* Flat-tree composition: a slotted light child lays out where its slot

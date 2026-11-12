@@ -700,7 +700,7 @@ static bool prepare_rule_declarations(
         }
         if (masks[slot] == 0 && masks_high[slot] == 0
             && !deferred.deferred[slot]
-            && !deferred.all_inherit[slot]) continue;
+            && deferred.all_value[slot] == 0) continue;
         uint8_t image_source_slot =
             sheet->resolve_scratch->current_image_source_slot;
         if (deferred.deferred[slot]
@@ -712,7 +712,7 @@ static bool prepare_rule_declarations(
                 inherit_masks[slot],
                 deferred.deferred[slot] ? declarations : NULL,
                 deferred.deferred[slot] ? declaration_length : 0,
-                font_fixup,
+                deferred.all_value[slot], font_fixup,
                 &declaration_index)) return false;
         if (declaration_index >= sheet->declaration_count) return false;
         if (font_fixup
@@ -741,10 +741,6 @@ static bool prepare_rule_declarations(
         }
         if (deferred.ch_relative[slot]) {
             stored->deferred_program_reserved |= STYLE_DEFERRED_CH;
-        }
-        if (deferred.all_inherit[slot]) {
-            stored->deferred_program_reserved |=
-                STYLE_DECLARATION_ALL_INHERIT;
         }
         parsed->declaration_indices[important] = declaration_index;
         parsed->image_source_slots[important] = image_source_slot;

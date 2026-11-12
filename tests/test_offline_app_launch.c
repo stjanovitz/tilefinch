@@ -22,6 +22,7 @@
 #include <unistd.h>
 
 #include "script_test_support.h"
+#include "supervisor_view_probe.h"
 
 #ifndef TILEFINCH_TEST_SOURCE_DIR
 #define TILEFINCH_TEST_SOURCE_DIR "."
@@ -666,8 +667,17 @@ static bool stale_library_flow(const char *directory)
     CHECK(offer != NULL && offer->operation == PSP_UI_OFFLINE_APP_RECOMPILE
           && offer->captured_resources == 7u
           && strcmp(offer->name, "Treadline") == 0);
+    /* The offer sheet over Library > Saved under a supervisor scope begun
+       while it was up: answering frees it, and the copy must not keep
+       drawing it (nor the Library from the slot it took). */
+    PspUiState live; psp_ui_init(&live);
+    psp_ui_show_offline_app_offer(&live, offer);
+    view_probe_begin(&store, &live);
     CHECK(psp_offline_store_take_offer(&store, false) == id
           && psp_offline_store_app_preview(&store) == NULL);
+    CHECK(view_probe_present(offer) && view_probe.dropped == 1u
+          && view_probe.copy.screen == PSP_UI_SCREEN_PAGE);
+    view_probe_end(&store);
     CHECK(psp_offline_store_offer_recompile(&store, id)
           && psp_offline_store_take_offer(&store, true) == id
           && !psp_offline_store_offer_recompile(&store, id)
@@ -793,8 +803,14 @@ static bool reinstall_from_library(const char *directory)
           && preview->operation != OFFLINE_WEB_APP_INSTALL
           && preview->display_mode == stored->app_display_mode
           && preview->captured_resources >= 8u);
+    /* Installing consumes the preview sheet the copy may still show. */
+    PspUiState live; psp_ui_init(&live);
+    psp_ui_show_offline_app_preview(&live, preview);
+    view_probe_begin(&store, &live);
     CHECK(psp_offline_store_install_current_app(&store, engine)
-          && strncmp(psp_offline_store_status(&store), "OFFLINE APP ", 12) == 0
+          && view_probe_present(preview) && view_probe.dropped == 1u);
+    view_probe_end(&store);
+    CHECK(strncmp(psp_offline_store_status(&store), "OFFLINE APP ", 12) == 0
           && strcmp(psp_offline_store_status(&store),
                     "OFFLINE APP INSTALLED") != 0
           && store.library.count == 1u

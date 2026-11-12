@@ -96,6 +96,55 @@ static bool bridge_mutation_style_property_affects_svg_raster(
         || (length >= 6 && strncasecmp(name, "stroke", 6) == 0);
 }
 
+static bool bridge_mutation_style_property_reaches_images(
+    const char *name, size_t length)
+{
+    return bridge_mutation_name_equal(name, length, "display")
+        || bridge_mutation_name_equal(name, length, "visibility")
+        || bridge_mutation_name_equal(name, length, "opacity")
+        || bridge_mutation_style_property_affects_svg_raster(name, length);
+}
+
+/* Whether a style attribute's text names only box geometry. Unknown names and
+   anything that could indirect (a url() or var()) count against it. */
+static bool bridge_style_text_is_geometry(const char *text, size_t length)
+{
+    static const struct { const char *name; uint8_t length; } geometry[] = {
+        {"height", 6}, {"width", 5}, {"min-height", 10}, {"min-width", 9},
+        {"max-height", 10}, {"max-width", 9}, {"top", 3}, {"left", 4},
+        {"right", 5}, {"bottom", 6}, {"margin", 6}, {"padding", 7},
+        {"grid", 4}, {"flex", 4}, {"transform", 9}, {"position", 8},
+        {"order", 5}, {"gap", 3}, {"inset", 5}, {"z-index", 7}
+    };
+    if (length > 512u) return false;
+    for (size_t at = 0; at < length;) {
+        while (at < length && (text[at] == ';' || text[at] == ' '
+                               || text[at] == '\t' || text[at] == '\n')) at++;
+        if (at == length) break;
+        size_t name = at;
+        while (at < length && text[at] != ':' && text[at] != ';') at++;
+        if (at == length || text[at] != ':') return false;
+        size_t name_length = at - name;
+        bool known = false;
+        for (size_t i = 0; !known && i < sizeof(geometry) / sizeof(geometry[0]);
+             i++) {
+            /* Longhands of the same family (margin-top, grid-row). */
+            known = name_length >= geometry[i].length
+                && strncasecmp(text + name, geometry[i].name,
+                               geometry[i].length) == 0
+                && (name_length == geometry[i].length
+                    || text[name + geometry[i].length] == '-');
+        }
+        if (!known) return false;
+        for (; at < length && text[at] != ';'; at++)
+            if (text[at] == '(' && (at < 3
+                    || strncasecmp(text + at - 3, "url", 3) == 0
+                    || strncasecmp(text + at - 3, "var", 3) == 0))
+                return false;
+    }
+    return true;
+}
+
 static bool bridge_mutation_inside_style(lxb_dom_node_t *node)
 {
     for (lxb_dom_node_t *at = node; at != NULL; at = at->parent) {
@@ -111,7 +160,11 @@ typedef enum {
     BRIDGE_MUTATION_RESOURCE_BOUNDED_OUT = 1u << 2,
     /* Not a fetched resource: a <meta http-equiv=refresh>, which navigation
        must consider for the document's declarative refresh. */
-    BRIDGE_MUTATION_RESOURCE_REFRESH_META = 1u << 3
+    BRIDGE_MUTATION_RESOURCE_REFRESH_META = 1u << 3,
+    /* An inline <svg> below the root. Nothing to retire when it leaves, but
+       an inserted one is drawn only once image discovery has seen it, and
+       no record names it: it arrived inside the record's root. */
+    BRIDGE_MUTATION_RESOURCE_NESTED_SVG = 1u << 4
 } BridgeMutationResourceFlags;
 
 /* An HTML <meta> whose http-equiv is "refresh" (ASCII case-insensitive,
@@ -259,6 +312,10 @@ static BridgeMutationResourceFlags bridge_mutation_resource_subtree(
         }
         if (document_is_refresh_meta(node)) {
             result |= BRIDGE_MUTATION_RESOURCE_REFRESH_META;
+        }
+        if (node != root
+            && bridge_mutation_name_equal(tag, tag_length, "svg")) {
+            result |= BRIDGE_MUTATION_RESOURCE_NESTED_SVG;
         }
         /* A shadow root's adopted sheets enter or leave the cascade with
            its carrier. */
@@ -437,6 +494,8 @@ static void bridge_mutation_journal_append(
         ScriptMutationRecord *record = &journal->records[reverse - 1];
         if (bridge_mutation_record_equal(
                 record, kind, node, attribute, attribute_length)) {
+            record->keeps_images =
+                record->keeps_images && bridge->mutation_keeps_images;
             record->relational |= relational;
             record->has_entries |= has_serial == 0 ? UINT64_MAX : has_entries;
             /* Coalescing the node/attribute must retain every dependency
@@ -502,6 +561,7 @@ static void bridge_mutation_journal_append(
     record->inserted_from_detached = false;
     record->scope = NULL;
     record->removed_last = false;
+    record->keeps_images = bridge->mutation_keeps_images;
     size_t copy_length = attribute == NULL ? 0 : attribute_length;
     if (copy_length >= sizeof(record->attribute)) {
         copy_length = sizeof(record->attribute) - 1;
@@ -536,8 +596,11 @@ static bool bridge_mutation_moves_form_controls(ScriptMutationKind kind,
     if (kind == SCRIPT_MUTATION_INLINE_STYLE
         || kind == SCRIPT_MUTATION_CANVAS) return false;
     if (kind != SCRIPT_MUTATION_ATTRIBUTE || attribute == NULL) return true;
+    /* name: form.elements and the form's named properties are cached
+       per structural version. */
     return (length == 2 && strncasecmp(attribute, "id", 2) == 0)
         || (length == 4 && (strncasecmp(attribute, "form", 4) == 0
+                            || strncasecmp(attribute, "name", 4) == 0
                             || strncasecmp(attribute, "type", 4) == 0))
         || (length > 14 && strncasecmp(attribute, "data-tilefinch", 14) == 0);
 }
@@ -621,10 +684,16 @@ static void bridge_mutated_summarized(
     if (bridge->relayout_dirty != NULL) *bridge->relayout_dirty = true;
 
     ScriptMutationJournal *journal = &bridge->mutations;
+    if (kind == SCRIPT_MUTATION_INLINE_STYLE)
+        bridge->mutation_keeps_images =
+            !bridge_mutation_style_property_reaches_images(
+                attribute, attribute_length);
+    bool keeps_images = bridge->mutation_keeps_images;
     bridge_mutation_journal_append(
         bridge, kind, node, attribute, attribute_length, changed_tokens,
         changed_token_count, relational_selector_sensitive, has_entries,
         has_serial);
+    bridge->mutation_keeps_images = false;
 
     bool resource_rebuild = false;
     /* resource_rebuild's causes: a stylesheet source and/or an image. */
@@ -754,11 +823,16 @@ static void bridge_mutated_summarized(
             stylesheet_cause =
                 (subtree & BRIDGE_MUTATION_RESOURCE_STYLESHEET) != 0;
         } else {
+            /* A child inserted into or removed from a <style> (a removal is
+               journaled while still connected) changes that sheet's text,
+               whatever the child's own subtree holds. */
             resource_rebuild =
-                (subtree & BRIDGE_MUTATION_RESOURCE_STYLESHEET) != 0;
+                (subtree & BRIDGE_MUTATION_RESOURCE_STYLESHEET) != 0
+                || bridge_mutation_inside_style(node->parent);
             stylesheet_cause = resource_rebuild;
             image_resource_scan =
-                (subtree & BRIDGE_MUTATION_RESOURCE_IMAGE) != 0;
+                (subtree & (BRIDGE_MUTATION_RESOURCE_IMAGE
+                            | BRIDGE_MUTATION_RESOURCE_NESTED_SVG)) != 0;
         }
         conservative_scan =
             (subtree & BRIDGE_MUTATION_RESOURCE_BOUNDED_OUT) != 0;
@@ -804,8 +878,9 @@ static void bridge_mutated_summarized(
     bool descendant_image_sensitive =
         node != NULL && !identity_bounded
         && (bridge_mutation_inside_svg(node)
-            || ((kind == SCRIPT_MUTATION_ATTRIBUTE
-                 || kind == SCRIPT_MUTATION_INLINE_STYLE)
+            || (!keeps_images
+                && (kind == SCRIPT_MUTATION_ATTRIBUTE
+                    || kind == SCRIPT_MUTATION_INLINE_STYLE)
                 && (bridge_mutation_name_equal(
                         attribute, attribute_length, "class")
                     || bridge_mutation_name_equal(
@@ -826,6 +901,22 @@ static void bridge_mutated_summarized(
                                        attribute, attribute_length)))))
                && bridge_mutation_subtree_contains_image(bridge, node)));
     if (refresh_meta) bridge->refresh_meta_mutated = true;
+    /* identity_bounded and keeps_images rule the change out, and so does an
+       attribute no selector tests that has no presentational effect. */
+    journal->image_reveal_possible |= node != NULL && !identity_bounded
+        && !keeps_images && kind != SCRIPT_MUTATION_TEXT
+        && kind != SCRIPT_MUTATION_CANVAS && kind != SCRIPT_MUTATION_HEAD_SCRIPT
+        && (kind != SCRIPT_MUTATION_ATTRIBUTE || attribute == NULL
+            || bridge->stylesheet == NULL
+            || bridge_mutation_name_equal(attribute, attribute_length, "class")
+            || bridge_mutation_name_equal(attribute, attribute_length, "id")
+            || bridge_mutation_name_equal(attribute, attribute_length, "style")
+            || bridge_mutation_name_equal(attribute, attribute_length, "hidden")
+            || bridge_mutation_name_equal(attribute, attribute_length, "width")
+            || bridge_mutation_name_equal(attribute, attribute_length, "height")
+            || bridge_mutation_name_equal(attribute, attribute_length, "open")
+            || stylesheet_selectors_reference_attribute_prefix(
+                   bridge->stylesheet, attribute, attribute_length));
     journal->resource_rebuild_required |= resource_rebuild;
     journal->image_rebuild_required |= resource_rebuild && image_rebuild;
     journal->stylesheet_rebuild_required |= resource_rebuild && stylesheet_cause;

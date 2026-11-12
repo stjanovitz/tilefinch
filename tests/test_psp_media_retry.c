@@ -43,6 +43,11 @@ void psp_media_remember_retry_state(PspMediaSession *media, bool playing)
 {
     psp_media_continuation_reopen(&media->continuation, media->clock_us, playing);
 }
+const char *psp_media_resolving_title(const PspMediaSession *media,
+                                      const char *video_title)
+{
+    return media->audio_only ? "Opening audio" : video_title;
+}
 void psp_media_pipeline_destroy(PspMediaSession *media)
 {
     destroyed++;
@@ -101,6 +106,34 @@ int main(void)
         CHECK(media.continuation.playing == (playing != 0));
         CHECK(media.open_service_pending && !media.ui.failed);
         CHECK(media.transport_reresolve_attempts == 0);
+        CHECK(psp_media_machine_violations(&media.machine) == 0);
+    }
+    /* An open that fails before it builds a pipeline -- a probe failure,
+       or the unencrypted-audio question a page station raises -- records
+       no continuation. Its Retry ("Play anyway") must still play: opening
+       paused left a station with nothing to decode until the first-output
+       watchdog ended it. A paused open's Retry stays paused. */
+    for (unsigned autoplay = 0; autoplay < 2; autoplay++) {
+        memset(&media, 0, sizeof(media));
+        strcpy(media.source, "http://127.0.0.1:8000/stream");
+        media.audio_only = true;
+        media.machine = psp_media_machine_initial();
+        psp_media_session_dispatch_event(&media, (PspMediaEvent) {
+            .type = PSP_MEDIA_EVENT_OPEN, .autoplay = autoplay != 0,
+            .audio_only = true
+        }, "route-open");
+        psp_media_job_failed(&media, "page audio",
+                             "PLAY UNENCRYPTED AUDIO?");
+        psp_media_finish_synchronous_quiesce(&media, "failed");
+        CHECK(media.machine.state == PSP_MEDIA_SESSION_FAILED);
+        CHECK(media.playback == NULL
+              && !psp_media_continuation_reopening(&media.continuation));
+        media.ui.failed = media.ui.visible = true;
+        psp_media_request_user_retry(&media);
+        CHECK(media.machine.state == PSP_MEDIA_SESSION_OPENING);
+        CHECK(media.machine.audio_only);
+        CHECK(media.machine.resume_target == (autoplay
+                  ? PSP_MEDIA_RESUME_PLAYING : PSP_MEDIA_RESUME_PAUSED));
         CHECK(psp_media_machine_violations(&media.machine) == 0);
     }
     quarantined = true;

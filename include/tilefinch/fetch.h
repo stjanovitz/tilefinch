@@ -15,7 +15,9 @@ struct ContentBlocker;
 struct TilefinchContentSecurityPolicy;
 
 #define FETCH_SET_COOKIE_LIMIT 4096
-#define FETCH_RESPONSE_COOKIE_CAPACITY 32
+/* Cumulative over a redirect transaction. Sign-in chains set the full
+   credential cookie set on each of several hosts; the same size as the jar. */
+#define FETCH_RESPONSE_COOKIE_CAPACITY 64
 /* Page fetch/XHR bodies are retained once by the JavaScript value and once by
    the bounded scheduler while a request is in flight. 96 KiB admits measured
    standards-based challenge redemption payloads (about 87 KiB) without
@@ -232,6 +234,22 @@ typedef enum {
 
 typedef bool (*FetchRedirectUrlValidator)(const char *url);
 
+/* How the PSP transport worker times a transfer. */
+typedef enum {
+    /* The deadline bounds the whole transfer; once a status line has
+       arrived, FETCH_STALL_LOW_SPEED_SECONDS without a byte ends it
+       (stall_abort_seconds instead, from the start, when set). */
+    FETCH_WORKER_TIMING_DEFAULT = 0,
+    /* A scheduler hop for a buffered consumer, as the browser-thread path
+       times it: the deadline throughout, and a stall only by
+       stall_abort_seconds (0: none). */
+    FETCH_WORKER_TIMING_BUFFERED,
+    /* A scheduler hop for a streaming consumer: the deadline bounds only
+       the wait for response headers; afterwards only a stall of
+       stall_abort_seconds ends the transfer. */
+    FETCH_WORKER_TIMING_STREAM
+} FetchWorkerTiming;
+
 typedef struct {
     const char *method;
     const char *body;
@@ -272,6 +290,9 @@ typedef struct {
        incremental inflater. It is mutually exclusive with identity_encoding;
        ordinary page fetches must leave it false. */
     bool raw_gzip_encoding;
+    /* Native audio streams only: read a SHOUTcast "ICY 200 OK" status line
+       as HTTP/1.0 200. Every other request keeps libcurl's refusal. */
+    bool icy_status_line;
     const char *user_agent;
     /*
      * Optional per-request connect bound in milliseconds, covering DNS-to-TLS
@@ -288,6 +309,9 @@ typedef struct {
        deadline bounds it). For callers that block on the result and retry,
        such as the synchronous module loader. */
     long stall_abort_seconds;
+    /* Set by the scheduler on its worker hops (scheduled_background_hop_shape);
+       other callers keep the default. */
+    FetchWorkerTiming worker_timing;
     /* Native retry policy only. A stalled media-range retry uses this to
        escape the exact HTTP/2 connection whose throughput floor fired.
        Ordinary page requests leave it false and retain connection reuse. */
@@ -491,11 +515,18 @@ typedef bool (*FetchStreamBodyCallback)(void *opaque,
                                         const unsigned char *data,
                                         size_t length);
 typedef bool (*FetchStreamStallCallback)(void *opaque);
+/* The body bytes the consumer can take now. */
+typedef size_t (*FetchStreamCapacityCallback)(void *opaque);
 
 typedef struct {
     FetchStreamHeadersCallback on_headers;
     FetchStreamBodyCallback on_body;
     FetchStreamStallCallback on_stall;
+    /* Optional, for scheduler streams. A pump hands on_body no more than
+       this reports; the rest waits, in the scheduler's staging buffer, the
+       PSP worker's slot or the replay file, for a later pump, instead of
+       failing the stream. NULL: no limit. */
+    FetchStreamCapacityCallback on_capacity;
     void *opaque;
     /* Replay-only delivery controls. Zero selects the canonical 16 KiB
        schedule. A nonzero irregular seed takes precedence over chunk_bytes. */
@@ -557,6 +588,10 @@ typedef struct {
     unsigned replay_delay_pumps_remaining;
     bool active;
     bool complete;
+    /* Admitted but not yet on the network: the PSP worker had no free
+       descriptor for its next hop, which it takes on a later pump of its
+       own scheduler. */
+    bool transport_waiting;
 } FetchRequestProgress;
 
 /*
@@ -759,6 +794,14 @@ uint64_t fetch_background_transport_enqueue_media_diagnosed(
  * the next target are decided by the ordinary scheduler policy code.
  */
 uint64_t fetch_background_transport_enqueue_hop_stream(
+    const char *url, const FetchRequest *request,
+    size_t maximum_bytes, long timeout_ms);
+/* A hop of a request the browser thread blocks on (a sync XHR, its CORS
+   preflight, a module import). Besides the descriptors every request
+   shares it may take the one kept free for such hops: a descriptor frees
+   only when its owning scheduler is pumped, and the blocking wait pumps
+   only its own (src/fetch/background_slot_policy.h). */
+uint64_t fetch_background_transport_enqueue_blocking_hop_stream(
     const char *url, const FetchRequest *request,
     size_t maximum_bytes, long timeout_ms);
 bool fetch_background_transport_hop_supported(
@@ -1254,6 +1297,18 @@ bool fetch_scheduler_request(FetchScheduler *scheduler, const char *url,
                              const FetchRequest *request,
                              size_t maximum_bytes, long timeout_ms,
                              FetchResult *result);
+/* fetch_scheduler_request for a request the calling thread blocks on (a
+   sync XHR, its CORS preflight, a module import). It may take the one slot
+   reserved past the scheduler's cap and its domain's, and its worker hops
+   the descriptor kept for them, so a page's own requests holding every
+   slot or descriptor cannot keep it waiting: nothing frees those while
+   this thread waits. One blocking request at a time takes the reserve; a
+   second competes for ordinary capacity. The byte pool is not reserved
+   (fetch_scheduler_wait_for_blocking_capacity). On refusal result->error
+   holds the scheduler's reason. */
+bool fetch_scheduler_request_blocking(
+    FetchScheduler *scheduler, const char *url, const FetchRequest *request,
+    size_t maximum_bytes, long timeout_ms, FetchResult *result);
 /* Waits for a request enqueued earlier, pumping the scheduler with the same
    cooperation as fetch_scheduler_request, and takes its result. */
 /* Cumulative owner time blocked in synchronous fetch waits (see
@@ -1261,6 +1316,29 @@ bool fetch_scheduler_request(FetchScheduler *scheduler, const char *url,
    measured by a caller (the script loader's byte-pool capacity wait). */
 void fetch_sync_wait_note(uint64_t elapsed_us);
 void fetch_sync_wait_totals(uint64_t *us, uint64_t *count);
+/* How a blocking caller's wait for room in its scheduler ended. */
+typedef enum {
+    FETCH_BLOCKING_WAIT_READY = 0,
+    /* The page domain is held (fetch_scheduler_domain_set_held). */
+    FETCH_BLOCKING_WAIT_HELD,
+    /* Only an owner's take could make room: a request slot is the blocker,
+       or the byte pool is held by results that are no longer in flight. No
+       owner takes while this thread waits, so nothing was waited for. */
+    FETCH_BLOCKING_WAIT_FULL,
+    /* The byte pool stayed full for the whole bound. */
+    FETCH_BLOCKING_WAIT_TIMED_OUT,
+    /* tilefinch_platform_cooperate refused (the frontend cancelled). */
+    FETCH_BLOCKING_WAIT_CANCELLED
+} FetchBlockingWait;
+/* The shared wait of a request the calling thread blocks on (a sync XHR, its
+   CORS preflight, a module import) before fetch_scheduler_request_blocking.
+   Judges room as that admission does (the reserved slot included). Waits
+   only when the byte pool is the blocker and this scheduler has work in
+   flight whose completion returns unused reservation; pumps this scheduler
+   and cooperates each turn, sleeping about 2 ms after a turn that made no
+   progress, for at most limit_us. Counted by fetch_sync_wait_note. */
+FetchBlockingWait fetch_scheduler_wait_for_blocking_capacity(
+    FetchScheduler *scheduler, size_t maximum_bytes, uint64_t limit_us);
 bool fetch_scheduler_wait(FetchScheduler *scheduler, uint64_t request_id,
                           FetchResult *result);
 bool fetch_scheduler_cancel(FetchScheduler *scheduler, uint64_t request_id,

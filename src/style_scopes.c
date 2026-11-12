@@ -192,6 +192,22 @@ static StyleShadowRuleKind style_shadow_rule_kind(const char *selector,
     return STYLE_SHADOW_RULE_INSIDE;
 }
 
+unsigned style_rule_shadow_context(const Stylesheet *sheet,
+                                   const char *selector, size_t length)
+{
+    if (sheet == NULL || selector == NULL
+        || (sheet->scopes.shadow_scope_count == 0
+            && sheet->scopes.adopted_source_count == 0)) return 0;
+    /* Unscoped sources drop :host and ::slotted() selectors
+       (style_shadow_selector_rewrite), so a matched rule of either kind
+       came from a shadow tree around the subject. */
+    switch (style_shadow_rule_kind(selector, length)) {
+    case STYLE_SHADOW_RULE_HOST: return 2u;
+    case STYLE_SHADOW_RULE_SLOTTED: return 1u;
+    default: return 0;
+    }
+}
+
 static const StyleShadowScope *style_shadow_scope_for_order(
     const Stylesheet *sheet, unsigned order)
 {
@@ -410,6 +426,12 @@ _Static_assert(DOCUMENT_ADOPTED_TIER_LIMIT <= 64u
                && sizeof(((StyleAdoptedScopeRoot *) 0)->order) == 64u,
                "scope masks and order tables must cover the adopted tier");
 
+/* A full adopted tier must not crowd the document's own sources out of the
+   source table (or be declined by it), and the count is a byte. */
+_Static_assert(STYLE_SOURCE_NODE_LIMIT >= DOCUMENT_ADOPTED_TIER_LIMIT + 32u
+               && STYLE_SOURCE_NODE_LIMIT <= UINT8_MAX,
+               "the style source table must hold the adopted tier");
+
 /* Sets adopted_order_varies when `order` lists a source out of place. */
 static void stylesheet_note_adopted_order(Stylesheet *sheet,
                                           const uint8_t order[64],
@@ -462,7 +484,8 @@ static size_t stylesheet_adopted_scope_changes(const PocDocument *document,
                 translated.mask = stylesheet_remap_scope_mask(entry->mask, remap);
                 memset(translated.order, 0, sizeof(translated.order));
                 for (size_t k = 0; k < previous_count; k++)
-                    translated.order[remap[k]] = entry->order[k];
+                    if (remap[k] < 64u)
+                        translated.order[remap[k]] = entry->order[k];
                 entry = &translated;
             }
             const StyleAdoptedScopeRoot *match = style_adopted_scope_root_lookup(
@@ -476,7 +499,8 @@ static size_t stylesheet_adopted_scope_changes(const PocDocument *document,
                 const uint8_t *other_order = match->order;
                 if (tracked && pass == 0) {
                     for (size_t bit = 0; bit < previous_count; bit++)
-                        order[remap[bit]] = other_order[bit];
+                        if (remap[bit] < 64u)
+                            order[remap[bit]] = other_order[bit];
                     other_order = order;
                 }
                 same_order = memcmp(other_order, entry->order,
@@ -501,12 +525,43 @@ static size_t stylesheet_adopted_scope_changes(const PocDocument *document,
 }
 
 /* The roots a scope update builds stay on the stack up to this many; more
-   go to a budget block (DOCUMENT_ADOPTION_ROOT_LIMIT entries are 20 KiB). */
+   go to a budget block (DOCUMENT_ADOPTION_ROOT_LIMIT entries are 40 KiB). */
 #define STYLE_ADOPTED_SCOPE_STACK_ROOTS 8u
+
+static bool stylesheet_set_tracked_adopted_scopes(Stylesheet *sheet,
+    const PocDocument *document,
+    const lxb_dom_node_t *const *previous_sources, size_t previous_count,
+    const lxb_dom_node_t *const *removed, size_t removed_count,
+    const lxb_dom_node_t **changed, size_t capacity, size_t *changed_count,
+    bool *global);
 
 bool stylesheet_set_appended_adopted_scopes(Stylesheet *sheet,
     const PocDocument *document,
     const lxb_dom_node_t *const *previous_sources, size_t previous_count,
+    const lxb_dom_node_t **changed, size_t capacity, size_t *changed_count,
+    bool *global)
+{
+    return stylesheet_set_tracked_adopted_scopes(sheet, document,
+        previous_sources, previous_count, NULL, 0, changed, capacity,
+        changed_count, global);
+}
+
+bool stylesheet_set_rescoped_adopted_scopes(Stylesheet *sheet,
+    const PocDocument *document,
+    const lxb_dom_node_t *const *previous_sources, size_t previous_count,
+    const lxb_dom_node_t *const *removed, size_t removed_count,
+    const lxb_dom_node_t **changed, size_t capacity, size_t *changed_count,
+    bool *global)
+{
+    return stylesheet_set_tracked_adopted_scopes(sheet, document,
+        previous_sources, previous_count, removed, removed_count, changed,
+        capacity, changed_count, global);
+}
+
+static bool stylesheet_set_tracked_adopted_scopes(Stylesheet *sheet,
+    const PocDocument *document,
+    const lxb_dom_node_t *const *previous_sources, size_t previous_count,
+    const lxb_dom_node_t *const *removed, size_t removed_count,
     const lxb_dom_node_t **changed, size_t capacity, size_t *changed_count,
     bool *global)
 {
@@ -531,8 +586,14 @@ bool stylesheet_set_appended_adopted_scopes(Stylesheet *sheet,
             }
         }
         /* Removal is not an append. Fall back if the caller cannot prove
-           that all previously scoped sources still exist. */
-        if (remap[i] == UINT8_MAX) tracked = false;
+           that all previously scoped sources still exist, unless it removed
+           this one with its rules (stylesheet_remove_adopted_sources_tracked):
+           its bit then simply leaves the old masks. */
+        bool dropped = false;
+        for (size_t r = 0; remap[i] == UINT8_MAX && !dropped
+                           && r < removed_count; r++)
+            dropped = removed[r] == previous_sources[i];
+        if (remap[i] == UINT8_MAX && !dropped) tracked = false;
     }
     /* Compute: every active root's confined sources and their order. */
     size_t active_lists = 0;
@@ -674,4 +735,42 @@ void style_scopes_release(Stylesheet *sheet)
     sheet->scopes.shadow_scopes = NULL;
     sheet->scopes.shadow_scope_count = 0;
     sheet->scopes.shadow_scope_capacity = 0;
+}
+
+size_t stylesheet_adopted_source_hosts(const Stylesheet *sheet,
+                                       const lxb_dom_node_t *source,
+                                       lxb_dom_node_t **hosts,
+                                       size_t capacity)
+{
+    if (sheet == NULL || source == NULL || sheet->style_sources_bounded_out
+        || sheet->scopes.adopted_scopes_failed
+        || style_adopted_scopes_document_only(sheet)) return SIZE_MAX;
+    size_t held = sheet->scopes.adopted_source_count;
+    if (held > sheet->style_source_count) return SIZE_MAX;
+    size_t base = sheet->style_source_count - held, index = held;
+    for (size_t k = 0; k < held; k++) {
+        if (sheet->style_source_nodes[base + k] == source) {
+            index = k;
+            break;
+        }
+    }
+    if (index >= held || index >= 64u
+        || (sheet->scopes.adopted_document_mask >> index & 1u) != 0)
+        return SIZE_MAX;
+    uint64_t bit = UINT64_C(1) << index;
+    size_t count = 0;
+    for (size_t r = 0; r < sheet->scopes.adopted_scope_root_count; r++) {
+        const StyleAdoptedScopeRoot *root = &sheet->scopes.adopted_scope_roots[r];
+        if ((root->mask & bit) == 0) continue;
+        lxb_dom_node_t *host = root->root == NULL ? NULL
+            : ((lxb_dom_node_t *) root->root)->parent;
+        if (host == NULL || host->type != LXB_DOM_NODE_TYPE_ELEMENT)
+            return SIZE_MAX;
+        bool known = false;
+        for (size_t h = 0; !known && h < count; h++) known = hosts[h] == host;
+        if (known) continue;
+        if (count == capacity) return SIZE_MAX;
+        hosts[count++] = host;
+    }
+    return count;
 }

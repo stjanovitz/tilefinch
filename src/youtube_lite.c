@@ -46,7 +46,7 @@
 #define YOUTUBE_LITE_FETCH_URL_CAPACITY 1024
 #define YOUTUBE_LITE_LANGUAGE_LIMIT 8
 #define YOUTUBE_LITE_IDENTITY_CACHE_KEY "youtube-mweb-identity-v1"
-#define YOUTUBE_LITE_IDENTITY_CACHE_VERSION 2u
+#define YOUTUBE_LITE_IDENTITY_CACHE_VERSION 3u
 #define YOUTUBE_LITE_IDENTITY_CACHE_MAX_AGE_NS \
     (UINT64_C(30) * 60u * UINT64_C(1000000000))
 #define YOUTUBE_LITE_DOCUMENT_CACHE_ADAPTER "youtube-lite"
@@ -400,20 +400,6 @@ static char *lite_initial_data(Budget *budget, const char *source,
     return decoded;
 }
 
-static size_t lite_utf8_complete_prefix(const char *text, size_t length)
-{
-    if (length == 0) return 0;
-    size_t start = length - 1u;
-    while (start > 0
-           && ((unsigned char) text[start] & 0xc0u) == 0x80u) start--;
-    unsigned char lead = (unsigned char) text[start];
-    size_t expected = lead < 0x80u ? 1u
-        : ((lead & 0xe0u) == 0xc0u ? 2u
-        : ((lead & 0xf0u) == 0xe0u ? 3u
-        : ((lead & 0xf8u) == 0xf0u ? 4u : 1u)));
-    return length - start < expected ? start : length;
-}
-
 /*
  * Trims an already bounded snippet to its visible byte budget on a UTF-8
  * boundary and marks the cut. The caller's buffer must leave room for the
@@ -426,7 +412,7 @@ static void lite_clamp_snippet(char *text, size_t capacity, size_t budget)
     if (text == NULL || capacity <= budget + marker_length) return;
     size_t length = strlen(text);
     if (length <= budget) return;
-    length = lite_utf8_complete_prefix(text, budget);
+    length = tilefinch_utf8_complete_prefix(text, budget);
     /* "Friday.…" reads as two stops: the marker replaces trailing
        punctuation as well as space. */
     while (length > 0 && ((unsigned char) text[length - 1u] <= ' '
@@ -637,7 +623,7 @@ static bool lite_text_runs(const YoutubeLiteSpan *scope, const char *key,
         size_t length = strlen(part);
         if (length > output_size - 1u - used)
             length = output_size - 1u - used;
-        length = lite_utf8_complete_prefix(part, length);
+        length = tilefinch_utf8_complete_prefix(part, length);
         memcpy(output + used, part, length);
         used += length;
         found = true;
@@ -1254,7 +1240,7 @@ static bool lite_query_value_bounded(const char *url, const char *name,
                     return false;
                 }
                 if (used >= output_size - 1u) {
-                    used = truncate ? lite_utf8_complete_prefix(output, used) : 0u;
+                    used = truncate ? tilefinch_utf8_complete_prefix(output, used) : 0u;
                     output[used] = '\0';
                     return truncate;
                 }
@@ -1348,6 +1334,14 @@ static bool lite_html_text(YoutubeLiteHtml *html, const char *text)
 }
 
 static bool lite_html_ui_markup(YoutubeLiteHtml *html, const char *markup);
+
+static bool lite_html_vformat(YoutubeLiteHtml *html, bool localized,
+                             const char *format, va_list arguments)
+    __attribute__((format(printf, 3, 0)));
+static bool lite_html_format(YoutubeLiteHtml *html, const char *format, ...)
+    __attribute__((format(printf, 2, 3)));
+static bool lite_html_ui_format(YoutubeLiteHtml *html, const char *format, ...)
+    __attribute__((format(printf, 2, 3)));
 
 static bool lite_html_vformat(YoutubeLiteHtml *html, bool localized,
                              const char *format, va_list arguments)
@@ -1558,7 +1552,8 @@ static bool lite_html_header(YoutubeLiteHtml *html, const char *query,
         "#383838 48%,#242424 66%);border-radius:7px}"
         ".thumb{display:block;width:100%;height:100%;border-radius:7px;"
         "object-fit:cover}"
-        ".info{min-width:0}.title{display:block;font-size:15px;line-height:1.25;"
+        ".info{min-width:0}.title{display:-webkit-box;-webkit-box-orient:vertical;"
+        "-webkit-line-clamp:2;font-size:15px;line-height:1.25;"
         "font-weight:bold;margin:1px 0 5px;max-height:38px;overflow:clip}.meta{font-size:12px;"
         "display:block;line-height:1.35;margin-top:2px}.duration{position:"
         "absolute;right:5px;bottom:4px;color:#eee;background:rgba(0,0,0,.78);"
@@ -1696,7 +1691,10 @@ static bool lite_html_header(YoutubeLiteHtml *html, const char *query,
     static const char search_form[] =
         "</div>"
         "<form action=\"https://www.youtube.com/results\" method=get>"
-        "<input id=yt-search name=search_query type=search"
+        /* Its own text decides its direction: this page stays left to right
+           in every language, which would put the "YouTube" of an Arabic
+           placeholder on the wrong side of the words around it. */
+        "<input id=yt-search name=search_query type=search dir=auto"
         " aria-label=\"{{Search YouTube}}\""
         " placeholder=\"{{Search YouTube}}\" value=\"";
     return lite_html_text(html, prefix)
@@ -1781,7 +1779,7 @@ static bool lite_html_queue_label(YoutubeLiteHtml *html, const char *title)
     size_t length = strlen(title);
     bool cut = length > LABEL_BYTES - used;
     if (cut) {
-        length = lite_utf8_complete_prefix(title, LABEL_BYTES - used - MARKER_BYTES);
+        length = tilefinch_utf8_complete_prefix(title, LABEL_BYTES - used - MARKER_BYTES);
         while (length > 0 && ((unsigned char) title[length - 1u] <= ' '
                || strchr(".,;:", title[length - 1u]) != NULL)) length--;
     }
@@ -2426,8 +2424,11 @@ static bool lite_build_document_with_comments_decoded(
             direct_search_continuation ? comments_source : prepared_decoded,
             direct_search_continuation ? comments_length : prepared_decoded_length,
             signed_in, document);
-    /* Watch and history pages have only the cooperative builder. */
-    if (route == YOUTUBE_LITE_ROUTE_WATCH || route == YOUTUBE_LITE_ROUTE_HISTORY)
+    /* Watch, history and search pages have only the cooperative builder,
+       the one browser loads use (search slices a response's entries into
+       pages; review 1109 pass 2, YT-03). */
+    if (route == YOUTUBE_LITE_ROUTE_WATCH || route == YOUTUBE_LITE_ROUTE_HISTORY
+        || route == YOUTUBE_LITE_ROUTE_SEARCH)
         return lite_build_work_sync(budget, url, source, source_length,
             comments_source, comments_length, prepared_decoded,
             prepared_decoded_length, signed_in, document, error, error_size);
@@ -2680,6 +2681,12 @@ typedef struct {
     size_t playlist_row_offset, playlist_rows, playlist_next_row;
     bool playlist_row_cursor;
     bool playlist_more;
+    /* Search, Your playlists and History show one slice of a response's
+       entries: tilefinch_row names the first row, and list_more says the
+       response holds rows past this slice, so "Load more" continues inside
+       the same response before it takes YouTube's continuation token. */
+    size_t list_row_offset, list_rows, list_next_row;
+    bool list_more;
     unsigned library_depth;
     unsigned library_owner_depth;
     bool library_string, library_escape, library_matches, library_editable;
@@ -2922,6 +2929,16 @@ static YoutubeLiteBuildWork *lite_build_work_create(
             work->playlist_row_offset = n;
         }
     }
+    if (route == YOUTUBE_LITE_ROUTE_SEARCH
+        || route == YOUTUBE_LITE_ROUTE_PLAYLISTS
+        || route == YOUTUBE_LITE_ROUTE_HISTORY) {
+        char number[16];
+        if (lite_query_value(url, "tilefinch_row", number, sizeof(number))) {
+            char *end; unsigned long n = strtoul(number, &end, 10);
+            if (!number[0] || *end || n > 65535u) { budget_free(budget, work); return NULL; }
+            work->list_row_offset = n;
+        }
+    }
     if (lite_query_value(url, "tilefinch_save", work->save_video, sizeof(work->save_video))
         && !lite_valid_video_id(work->save_video)) work->save_video[0] = '\0';
     lite_search_query(url, work->query);
@@ -2959,12 +2976,22 @@ static void lite_build_video_pump(YoutubeLiteBuildWork *work)
         YoutubeLiteSpan scope = lite_build_window(work->decoded,
             work->decoded_length, work->scan_offset), renderer;
         YoutubeLiteVideo record;
-        if (work->video_count < YOUTUBE_LITE_MAXIMUM_RESULTS
-            && lite_parse_playlist_card(&scope, &renderer, &record)) {
+        if (lite_parse_playlist_card(&scope, &renderer, &record)) {
+            /* Every card that names a playlist is a row, so each slice of
+               the same response numbers its rows alike. */
+            size_t row = record.playlist_id[0] != '\0'
+                ? work->list_rows++ : SIZE_MAX;
+            if (row != SIZE_MAX && row >= work->list_row_offset
+                && work->video_count >= YOUTUBE_LITE_MAXIMUM_RESULTS) {
+                work->list_more = true;
+                work->list_next_row = row;
+                lite_build_after_videos(work);
+                return;
+            }
             bool duplicate = false;
             for (size_t i = 0; i < work->video_count; i++)
                 duplicate |= strcmp(work->videos[i].playlist_id, record.playlist_id) == 0;
-            if (record.playlist_id[0] != '\0' && !duplicate)
+            if (row != SIZE_MAX && row >= work->list_row_offset && !duplicate)
                 work->videos[work->video_count++] = record;
             lite_build_seek(work, (size_t) (renderer.end - work->decoded));
         } else {
@@ -3006,9 +3033,7 @@ static void lite_build_video_pump(YoutubeLiteBuildWork *work)
         return;
     }
     if (work->video_count >= YOUTUBE_LITE_MAXIMUM_RESULTS
-        && (work->route == YOUTUBE_LITE_ROUTE_SEARCH
-            || work->route == YOUTUBE_LITE_ROUTE_CHANNEL
-            || work->route == YOUTUBE_LITE_ROUTE_HISTORY)) {
+        && work->route == YOUTUBE_LITE_ROUTE_CHANNEL) {
         /* Once the bounded result table is full, only the next-page token is
            useful. The object-window parser below deliberately overlaps each
            16 KiB advance by 32 KiB so a renderer cannot straddle a window;
@@ -3058,7 +3083,9 @@ static void lite_build_video_pump(YoutubeLiteBuildWork *work)
        needed for result cards. A separate key scan doubled the overlapping
        JSON-window work on PSP until the header happened to be found. */
     bool found = (work->video_count < YOUTUBE_LITE_MAXIMUM_RESULTS
-                 || work->route == YOUTUBE_LITE_ROUTE_PLAYLIST)
+                 || work->route == YOUTUBE_LITE_ROUTE_PLAYLIST
+                 || work->route == YOUTUBE_LITE_ROUTE_SEARCH
+                 || work->route == YOUTUBE_LITE_ROUTE_HISTORY)
         && lite_next_video_renderer(
             &scope, scope.start,
             (work->route == YOUTUBE_LITE_ROUTE_WATCH
@@ -3107,12 +3134,32 @@ static void lite_build_video_pump(YoutubeLiteBuildWork *work)
             && (work->route != YOUTUBE_LITE_ROUTE_PLAYLIST
                 || kind != YOUTUBE_LITE_RENDERER_LOCKUP
                 || lite_playlist_lockup_matches(&renderer, work->playlist_id, parsed.id))
-            && (work->route == YOUTUBE_LITE_ROUTE_PLAYLIST || !lite_video_duplicate(
-                work->videos, work->video_count, parsed.id))) {
+            && (work->route == YOUTUBE_LITE_ROUTE_PLAYLIST
+                || work->route == YOUTUBE_LITE_ROUTE_SEARCH
+                || work->route == YOUTUBE_LITE_ROUTE_HISTORY
+                || !lite_video_duplicate(
+                    work->videos, work->video_count, parsed.id))) {
             /* Display slices count every row; queue positions count only
                playable videos. Keep a separate raw cursor so even a whole
                slice of unavailable entries advances without losing rows. */
-            if (work->route != YOUTUBE_LITE_ROUTE_PLAYLIST)
+            if (work->route == YOUTUBE_LITE_ROUTE_SEARCH
+                || work->route == YOUTUBE_LITE_ROUTE_HISTORY) {
+                /* A repeat is still a row, so every slice of the response
+                   numbers its rows alike; it is only not shown twice in
+                   one slice. */
+                size_t row = work->list_rows++;
+                if (row >= work->list_row_offset
+                    && work->video_count >= YOUTUBE_LITE_MAXIMUM_RESULTS) {
+                    work->list_more = true;
+                    work->list_next_row = row;
+                    lite_build_after_videos(work);
+                    return;
+                }
+                if (row >= work->list_row_offset
+                    && !lite_video_duplicate(
+                        work->videos, work->video_count, parsed.id))
+                    work->videos[work->video_count++] = parsed;
+            } else if (work->route != YOUTUBE_LITE_ROUTE_PLAYLIST)
                 work->videos[work->video_count++] = parsed;
             else {
                 size_t row = work->playlist_rows++;
@@ -3462,6 +3509,52 @@ static bool lite_playlist_next_url(YoutubeLiteBuildWork *work, char *url, size_t
     return n > 0 && (size_t) n < capacity;
 }
 
+/* "Load more" for the rows of this response past the slice: the same
+   page (and continuation token, if any) from row list_next_row. */
+static bool lite_html_row_cursor_link(YoutubeLiteBuildWork *work)
+{
+    char token[YOUTUBE_LITE_CONTINUATION_LIMIT] = {0};
+    char encoded[YOUTUBE_LITE_CONTINUATION_LIMIT * 3u] = {0};
+    (void) lite_query_value(work->url, "tilefinch_token", token, sizeof(token));
+    if (!lite_url_encode(token, encoded, sizeof(encoded))
+        || work->list_next_row > 65535u) return false;
+    char base[1024];
+    int count;
+    if (work->route == YOUTUBE_LITE_ROUTE_SEARCH) {
+        char encoded_query[YOUTUBE_LITE_QUERY_LIMIT * 3u] = {0};
+        char suffix[96];
+        if (!lite_url_encode(work->query, encoded_query, sizeof(encoded_query))
+            || !lite_filter_suffix(work->url, suffix)) return false;
+        count = snprintf(base, sizeof(base),
+            "https://www.youtube.com/results?search_query=%s%s&",
+            encoded_query, suffix);
+    } else if (work->route == YOUTUBE_LITE_ROUTE_PLAYLISTS) {
+        count = snprintf(base, sizeof(base),
+            "https://www.youtube.com/feed/playlists?tilefinch_save=%s&",
+            work->save_video);
+    } else {
+        TilefinchUrl url;
+        if (!tilefinch_url_parse(work->url, &url)) return false;
+        count = snprintf(base, sizeof(base), "https://www.youtube.com%.*s?",
+            (int) url.path_length, url.value + url.path_offset);
+    }
+    if (count <= 0 || (size_t) count >= sizeof(base)) return false;
+    char row[48];
+    snprintf(row, sizeof(row), "tilefinch_row=%zu", work->list_next_row);
+    return lite_html_text(&work->html, "<p><a class=more href=\"")
+        && lite_html_escape(&work->html, base)
+        && (token[0] == '\0'
+            || (lite_html_text(&work->html, "tilefinch_token=")
+                && lite_html_text(&work->html, encoded)
+                && lite_html_text(&work->html, "&amp;")))
+        && lite_html_text(&work->html, row)
+        && lite_html_text(&work->html, "\">")
+        && lite_html_escape(&work->html, tilefinch_ui_logical_text(
+            work->route == YOUTUBE_LITE_ROUTE_SEARCH
+                ? "Load more results" : "Load more"))
+        && lite_html_text(&work->html, "</a></p>");
+}
+
 static bool lite_build_emit_search_continuation(
     YoutubeLiteBuildWork *work)
 {
@@ -3472,6 +3565,7 @@ static bool lite_build_emit_search_continuation(
                 && lite_html_escape(&work->html, next)
                 && lite_html_ui_markup(&work->html, "\">{{Load more}}</a></p>")));
     }
+    if (work->list_more) return lite_html_row_cursor_link(work);
     if ((work->route != YOUTUBE_LITE_ROUTE_SEARCH
         && work->route != YOUTUBE_LITE_ROUTE_CHANNEL
         && work->route != YOUTUBE_LITE_ROUTE_PLAYLIST
@@ -3842,6 +3936,11 @@ typedef struct {
     char visitor[1024];
     unsigned auth_user;
     bool auth_user_known;
+    /* Read from a bootstrap page that named the MWEB client and said
+       LOGGED_IN true, and a feed, rating or account action signed with it
+       succeeded: those jobs may sign their API request with this identity
+       instead of downloading the page again. */
+    bool signed_in_mweb;
 } YoutubeLiteIdentity;
 
 static bool lite_session_index_at(const char *data, size_t length, size_t at, unsigned *result)
@@ -3968,27 +4067,101 @@ static bool lite_identity_valid(const YoutubeLiteIdentity *identity)
         && youtube_header_value_safe(identity->visitor);
 }
 
-static bool lite_identity_cache_get(
+/* What the cached identity depends on in the jar: the signed-in account
+   (the SAPISID identity) and the visitor cookie that VISITOR_DATA names.
+   Not the whole jar: the provider and the resolver each rewrite PREF and
+   SOCS with their own language, and other sites' cookies change all the
+   time, so a whole-jar fingerprint missed on every play on a non-English
+   system (review 1109 pass 2, YT-01). Clearing cookies drops the state. */
+static TilefinchRequestContext lite_supplemental_context(
+    const char *page_url, const char *endpoint);
+
+static uint64_t lite_identity_binding(BrowserSession *session)
+{
+    uint64_t hash = UINT64_C(14695981039346656037);
+    uint64_t login = youtube_lite_session_login_identity(session);
+    for (size_t i = 0; i < sizeof(login); i++)
+        hash = (hash ^ (unsigned char) (login >> (i * 8u)))
+            * UINT64_C(1099511628211);
+    const char *origin = "https://m.youtube.com/";
+    TilefinchRequestContext context = lite_supplemental_context(origin, origin);
+    context.initiator_url = origin;
+    const char *visitor = NULL;
+    size_t visitor_length = 0;
+    hash = (hash ^ 0xffu) * UINT64_C(1099511628211);
+    if (browser_session_cookie_value_context(
+            session, &context, "VISITOR_INFO1_LIVE", &visitor,
+            &visitor_length) && visitor != NULL) {
+        for (size_t i = 0; i < visitor_length; i++)
+            hash = (hash ^ (unsigned char) visitor[i])
+                * UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static bool lite_identity_state_get(
     BrowserSession *session, YoutubeLiteIdentity *identity)
 {
     size_t length = 0;
     uint64_t now_ns = tilefinch_platform_monotonic_time_ns();
-    return browser_session_site_adapter_state_get(
+    return session != NULL
+        && browser_session_site_adapter_state_get_bound(
                session, YOUTUBE_LITE_IDENTITY_CACHE_KEY,
                identity, sizeof(*identity), &length, now_ns,
-               YOUTUBE_LITE_IDENTITY_CACHE_MAX_AGE_NS)
-        && length == sizeof(*identity)
+               YOUTUBE_LITE_IDENTITY_CACHE_MAX_AGE_NS,
+               lite_identity_binding(session))
+        && length == sizeof(*identity);
+}
+
+static bool lite_identity_state_put(
+    BrowserSession *session, const YoutubeLiteIdentity *identity)
+{
+    return session != NULL
+        && browser_session_site_adapter_state_put_bound(
+            session, YOUTUBE_LITE_IDENTITY_CACHE_KEY,
+            identity, sizeof(*identity),
+            tilefinch_platform_monotonic_time_ns(),
+            lite_identity_binding(session));
+}
+
+static bool lite_identity_cache_get(
+    BrowserSession *session, YoutubeLiteIdentity *identity)
+{
+    return lite_identity_state_get(session, identity)
         && lite_identity_valid(identity);
 }
 
+/* A page load reads the identity without the account facts. When the
+   cached entry holds the same identity with them, they are kept: the entry
+   is bound to the same sign-in and visitor cookies, so they still hold. */
 static bool lite_identity_cache_put(
     BrowserSession *session, const YoutubeLiteIdentity *identity)
 {
-    return lite_identity_valid(identity)
-        && browser_session_site_adapter_state_put(
-            session, YOUTUBE_LITE_IDENTITY_CACHE_KEY,
-            identity, sizeof(*identity),
-            tilefinch_platform_monotonic_time_ns());
+    if (!lite_identity_valid(identity)) return false;
+    YoutubeLiteIdentity merged = *identity, cached = {0};
+    if (!merged.signed_in_mweb && lite_identity_cache_get(session, &cached)
+        && cached.signed_in_mweb
+        && strcmp(cached.api_key, merged.api_key) == 0
+        && strcmp(cached.client_version, merged.client_version) == 0
+        && strcmp(cached.visitor, merged.visitor) == 0
+        && (!merged.auth_user_known
+            || (cached.auth_user_known
+                && cached.auth_user == merged.auth_user))) {
+        merged.signed_in_mweb = true;
+        merged.auth_user = cached.auth_user;
+        merged.auth_user_known = cached.auth_user_known;
+    }
+    return lite_identity_state_put(session, &merged);
+}
+
+/* Drops the account facts of the cached identity, keeping the identity. */
+static void lite_identity_cache_forget_account(BrowserSession *session)
+{
+    YoutubeLiteIdentity cached = {0};
+    if (!lite_identity_cache_get(session, &cached) || !cached.signed_in_mweb)
+        return;
+    cached.signed_in_mweb = false;
+    (void) lite_identity_state_put(session, &cached);
 }
 
 bool youtube_lite_resolver_identity_get(
@@ -3996,13 +4169,7 @@ bool youtube_lite_resolver_identity_get(
 {
     if (session == NULL || identity == NULL) return false;
     YoutubeLiteIdentity cached = {0};
-    size_t length = 0;
-    uint64_t now_ns = tilefinch_platform_monotonic_time_ns();
-    if (!browser_session_site_adapter_state_get(
-            session, YOUTUBE_LITE_IDENTITY_CACHE_KEY,
-            &cached, sizeof(cached), &length, now_ns,
-            YOUTUBE_LITE_IDENTITY_CACHE_MAX_AGE_NS)
-        || length != sizeof(cached)
+    if (!lite_identity_state_get(session, &cached)
         || cached.version != YOUTUBE_LITE_IDENTITY_CACHE_VERSION
         || !youtube_api_token_safe(cached.api_key, false)
         || !youtube_header_value_safe(cached.visitor)) return false;
@@ -4019,9 +4186,7 @@ static void lite_resolver_identity_cache_put(
     if (session == NULL || identity == NULL
         || !youtube_api_token_safe(identity->api_key, false)
         || !youtube_header_value_safe(identity->visitor)) return;
-    (void) browser_session_site_adapter_state_put(
-        session, YOUTUBE_LITE_IDENTITY_CACHE_KEY,
-        identity, sizeof(*identity), tilefinch_platform_monotonic_time_ns());
+    (void) lite_identity_state_put(session, identity);
 }
 
 typedef enum {
@@ -4304,6 +4469,9 @@ static bool lite_prepare_supplemental_request(
 
 static void lite_load_job_fail(YoutubeLiteLoadJob *job,
                                const char *format, ...)
+    __attribute__((format(printf, 2, 3)));
+static void lite_load_job_fail(YoutubeLiteLoadJob *job,
+                               const char *format, ...)
 {
     if (job == NULL) return;
     va_list arguments;
@@ -4478,6 +4646,15 @@ static bool lite_load_decode_pump(YoutubeLiteLoadJob *job)
     job->walked_bytes += job->decoder.input - input;
     if (status == YOUTUBE_PAGE_DATA_FAILED) return false;
     if (status == YOUTUBE_PAGE_DATA_DONE) {
+        /* The buffer was sized to the rest of the page; the decoded JSON is
+           smaller (the mobile carrier is a hex-escaped string). Nothing
+           points into it yet, so give the difference back. */
+        char *trimmed = job->decoded_length < SIZE_MAX
+            ? budget_realloc_category(
+                  job->budget, BUDGET_CATEGORY_RESOURCE, job->decoded,
+                  job->decoded_length + 1u)
+            : NULL;
+        if (trimmed != NULL) job->decoded = trimmed;
         job->decode_attempted = true;
         lite_load_after_decode(job);
     }
@@ -4933,7 +5110,7 @@ YoutubeLiteLoadJob *youtube_lite_load_begin_navigation(
         snprintf(detail, sizeof(detail), "YouTube network startup failed: %s",
                  scheduler_error[0] == '\0'
                      ? "scheduler unavailable" : scheduler_error);
-        youtube_error(error, error_size, detail);
+        youtube_error(error, error_size, "%s", detail);
         youtube_lite_load_destroy(job);
         return NULL;
     }
@@ -4968,7 +5145,7 @@ YoutubeLiteLoadJob *youtube_lite_load_begin_navigation(
         snprintf(
             detail, sizeof(detail), "YouTube request could not start: %s",
             fetch_scheduler_last_error(job->scheduler));
-        youtube_error(error, error_size, detail);
+        youtube_error(error, error_size, "%s", detail);
         youtube_lite_load_destroy(job);
         return NULL;
     }
@@ -5276,6 +5453,11 @@ static YoutubeLiteLoadStatus lite_load_pump_step(
             job->supplemental = NULL;
         }
         fetch_result_destroy(&job->source);
+        /* The engine parses and lays out the document before it destroys
+           this job; nothing reads the decoded data again. */
+        if (job->decoded != NULL) budget_free(job->budget, job->decoded);
+        job->decoded = NULL;
+        job->decoded_length = 0;
         return job->status;
     }
     if (job->phase == YOUTUBE_LITE_JOB_DECODE) {
@@ -5506,6 +5688,7 @@ YoutubeLiteLoadStatus youtube_lite_load_pump(
         now = tilefinch_platform_monotonic_time_us();
         if (now < started || now - started >= maximum_time) break;
     }
+    job->metrics.transform_bytes += work;
     if (transformed) {
         uint64_t finished = tilefinch_platform_monotonic_time_us();
         uint64_t elapsed = finished >= started ? finished - started : 0;

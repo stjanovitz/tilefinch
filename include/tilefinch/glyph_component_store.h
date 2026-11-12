@@ -72,7 +72,6 @@ typedef bool (*TilefinchGlyphInstallFaultHook)(
     void *opaque, TilefinchGlyphInstallFaultPoint point);
 
 typedef struct {
-    const char *package_path;
     const uint8_t *envelope;
     size_t envelope_length;
     const TilefinchUpdateManifest *manifest;
@@ -82,6 +81,21 @@ typedef struct {
     TilefinchGlyphInstallFaultHook fault;
     void *fault_opaque;
 } TilefinchGlyphComponentInstallOptions;
+
+/* Names the file the pack's download goes in, touching nothing on the
+   card (a size check must not write). */
+bool tilefinch_glyph_component_download_path(
+    const char *install_root, TilefinchGlyphPack pack,
+    char *output, size_t output_size);
+
+/* Empties the pack's candidate directory and names the file its download goes
+   in; called when the download begins. The installer takes the verified package from there: a staged package
+   only ever moves within one directory, because the PSP's rename cannot be
+   relied on to move a file between directories (PPSSPP drops the target's
+   directory and renames in place). */
+bool tilefinch_glyph_component_prepare_download(
+    const char *install_root, TilefinchGlyphPack pack,
+    char *output, size_t output_size);
 
 TilefinchGlyphComponentInstall *tilefinch_glyph_component_install_create(
     Budget *budget, const TilefinchGlyphComponentInstallOptions *options);

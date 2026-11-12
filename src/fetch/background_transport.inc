@@ -27,9 +27,16 @@ extern void psp_transport_probe_tls_sessions(char *output, size_t size)
 #define FETCH_BACKGROUND_ORIGIN_CAPACITY 2048u
 #define FETCH_BACKGROUND_ACCEPT_CAPACITY 512u
 #define FETCH_BACKGROUND_USER_AGENT_CAPACITY 512u
-#define FETCH_BACKGROUND_CONTENT_TYPE_CAPACITY 128u
+#define FETCH_BACKGROUND_CONTENT_TYPE_CAPACITY \
+    (FETCH_REQUEST_CONTENT_TYPE_MAX + 1u)
 #define FETCH_BACKGROUND_METHOD_CAPACITY 16u
 #define FETCH_BACKGROUND_FETCH_TOKEN_CAPACITY 64u
+/* A body or extra-header block too large for the slot's inline field goes
+   to a Budget copy of its exact size, up to what fetch_request_validate()
+   admits, so a valid page request never needs the browser-thread curl
+   path (scheduler.inc) on the PSP. */
+#define FETCH_BACKGROUND_LARGE_BODY_LIMIT FETCH_REQUEST_BODY_LIMIT
+#define FETCH_BACKGROUND_LARGE_EXTRA_HEADERS_LIMIT FETCH_EXTRA_HEADERS_MAX
 
 #include "background_chunk.h"
 #include "background_slot_policy.h"
@@ -48,7 +55,7 @@ bool fetch_background_transport_stream_shape_supported(
         && strlen(method) < FETCH_BACKGROUND_METHOD_CAPACITY
         && (single_hop || strcasecmp(method, "GET") == 0
             || strcasecmp(method, "POST") == 0)
-        && request->body_length < FETCH_BACKGROUND_BODY_CAPACITY
+        && request->body_length <= FETCH_BACKGROUND_LARGE_BODY_LIMIT
         && (request->body_length == 0 || request->body != NULL)
         && (single_hop
             || (request->redirect_url_validator != NULL
@@ -67,7 +74,7 @@ bool fetch_background_transport_stream_shape_supported(
                FETCH_BACKGROUND_CONTENT_TYPE_CAPACITY)
         && FETCH_BACKGROUND_FIELD_FITS(
                request->extra_headers,
-               FETCH_BACKGROUND_EXTRA_HEADERS_CAPACITY)
+               FETCH_BACKGROUND_LARGE_EXTRA_HEADERS_LIMIT + 1u)
         && FETCH_BACKGROUND_FIELD_FITS(
                request->cookie, FETCH_BACKGROUND_COOKIE_CAPACITY)
         && FETCH_BACKGROUND_FIELD_FITS(
@@ -94,124 +101,6 @@ bool fetch_background_transport_stream_shape_supported(
                FETCH_BACKGROUND_FETCH_TOKEN_CAPACITY);
 #undef FETCH_BACKGROUND_FIELD_FITS
     return supported;
-}
-
-bool fetch_websocket_text_payload_valid(
-    const unsigned char *value, size_t length)
-{
-    if (length != 0 && value == NULL) return false;
-    size_t at = 0;
-    while (at < length) {
-        unsigned char first = value[at++];
-        if (first <= 0x7fu) continue;
-        if (first >= 0xc2u && first <= 0xdfu) {
-            if (at >= length || (value[at++] & 0xc0u) != 0x80u)
-                return false;
-            continue;
-        }
-        if (first >= 0xe0u && first <= 0xefu) {
-            if (length - at < 2u) return false;
-            unsigned char second = value[at++];
-            unsigned char third = value[at++];
-            if ((third & 0xc0u) != 0x80u
-                || (first == 0xe0u
-                    ? second < 0xa0u || second > 0xbfu
-                    : first == 0xedu
-                        ? second < 0x80u || second > 0x9fu
-                        : (second & 0xc0u) != 0x80u)) return false;
-            continue;
-        }
-        if (first >= 0xf0u && first <= 0xf4u) {
-            if (length - at < 3u) return false;
-            unsigned char second = value[at++];
-            unsigned char third = value[at++];
-            unsigned char fourth = value[at++];
-            if ((third & 0xc0u) != 0x80u || (fourth & 0xc0u) != 0x80u
-                || (first == 0xf0u
-                    ? second < 0x90u || second > 0xbfu
-                    : first == 0xf4u
-                        ? second < 0x80u || second > 0x8fu
-                        : (second & 0xc0u) != 0x80u)) return false;
-            continue;
-        }
-        return false;
-    }
-    return true;
-}
-
-static bool fetch_websocket_peer_close_code_valid(uint16_t code)
-{
-    if (code >= 3000u && code <= 4999u) return true;
-    return code >= 1000u && code <= 1014u
-        && code != 1004u && code != 1005u && code != 1006u;
-}
-
-#if defined(TILEFINCH_PSP_OWNED_TRANSPORT)
-static bool fetch_websocket_local_close_code_valid(uint16_t code)
-{
-    return code == 1000u || (code >= 3000u && code <= 4999u);
-}
-#endif
-
-FetchWebSocketClosePayloadStatus fetch_websocket_close_payload_parse(
-    const unsigned char *payload, size_t length,
-    FetchWebSocketClosePayload *parsed)
-{
-    if (parsed == NULL) return FETCH_WEBSOCKET_CLOSE_PAYLOAD_PROTOCOL_ERROR;
-    memset(parsed, 0, sizeof(*parsed));
-    parsed->code = 1005u;
-    if (length > 125u || (length != 0 && payload == NULL) || length == 1u)
-        return FETCH_WEBSOCKET_CLOSE_PAYLOAD_PROTOCOL_ERROR;
-    if (length == 0) return FETCH_WEBSOCKET_CLOSE_PAYLOAD_VALID;
-    uint16_t code = (uint16_t) (((uint16_t) payload[0] << 8u)
-                                | (uint16_t) payload[1]);
-    if (!fetch_websocket_peer_close_code_valid(code))
-        return FETCH_WEBSOCKET_CLOSE_PAYLOAD_PROTOCOL_ERROR;
-    size_t reason_length = length - 2u;
-    if (!fetch_websocket_text_payload_valid(payload + 2u, reason_length))
-        return FETCH_WEBSOCKET_CLOSE_PAYLOAD_INVALID_UTF8;
-    parsed->code = code;
-    parsed->has_code = true;
-    parsed->reason_length = reason_length;
-    if (reason_length != 0)
-        memcpy(parsed->reason, payload + 2u, reason_length);
-    parsed->reason[reason_length] = '\0';
-    return FETCH_WEBSOCKET_CLOSE_PAYLOAD_VALID;
-}
-
-FetchWebSocketClosePayloadStatus fetch_websocket_close_payload_accumulate(
-    FetchWebSocketCloseAccumulator *accumulator,
-    const unsigned char *chunk, size_t chunk_length,
-    size_t bytes_remaining, FetchWebSocketClosePayload *parsed)
-{
-    if (accumulator == NULL || parsed == NULL
-        || (chunk_length != 0 && chunk == NULL)) {
-        return FETCH_WEBSOCKET_CLOSE_PAYLOAD_PROTOCOL_ERROR;
-    }
-    if (!accumulator->active) {
-        accumulator->active = true;
-        accumulator->length = 0;
-    }
-    if (chunk_length > sizeof(accumulator->bytes) - accumulator->length
-        || bytes_remaining > sizeof(accumulator->bytes)
-                                  - accumulator->length - chunk_length) {
-        accumulator->active = false;
-        accumulator->length = 0;
-        return FETCH_WEBSOCKET_CLOSE_PAYLOAD_PROTOCOL_ERROR;
-    }
-    if (chunk_length != 0) {
-        memcpy(accumulator->bytes + accumulator->length,
-               chunk, chunk_length);
-        accumulator->length += chunk_length;
-    }
-    if (bytes_remaining != 0)
-        return FETCH_WEBSOCKET_CLOSE_PAYLOAD_INCOMPLETE;
-    FetchWebSocketClosePayloadStatus status =
-        fetch_websocket_close_payload_parse(
-            accumulator->bytes, accumulator->length, parsed);
-    accumulator->active = false;
-    accumulator->length = 0;
-    return status;
 }
 
 #if defined(TILEFINCH_PSP_OWNED_TRANSPORT)
@@ -265,34 +154,6 @@ typedef enum {
     FETCH_BACKGROUND_PRECONNECT_FAILED
 } FetchBackgroundPreconnectState;
 
-typedef enum {
-    FETCH_BACKGROUND_WEBSOCKET_FREE = 0,
-    FETCH_BACKGROUND_WEBSOCKET_PREPARING,
-    FETCH_BACKGROUND_WEBSOCKET_QUEUED,
-    FETCH_BACKGROUND_WEBSOCKET_HANDSHAKING,
-    FETCH_BACKGROUND_WEBSOCKET_OPEN,
-    FETCH_BACKGROUND_WEBSOCKET_CLOSING,
-    FETCH_BACKGROUND_WEBSOCKET_CLOSED
-} FetchBackgroundWebSocketState;
-
-typedef enum {
-    FETCH_BACKGROUND_WEBSOCKET_EVENT_EMPTY = 0,
-    FETCH_BACKGROUND_WEBSOCKET_EVENT_READY,
-    FETCH_BACKGROUND_WEBSOCKET_EVENT_TAKING
-} FetchBackgroundWebSocketEventState;
-
-typedef enum {
-    FETCH_BACKGROUND_WEBSOCKET_TX_EMPTY = 0,
-    FETCH_BACKGROUND_WEBSOCKET_TX_PREPARING,
-    FETCH_BACKGROUND_WEBSOCKET_TX_READY
-} FetchBackgroundWebSocketTxState;
-
-typedef enum {
-    FETCH_BACKGROUND_WEBSOCKET_DRAIN_EMPTY = 0,
-    FETCH_BACKGROUND_WEBSOCKET_DRAIN_PENDING,
-    FETCH_BACKGROUND_WEBSOCKET_DRAIN_PUBLISHED
-} FetchBackgroundWebSocketDrainState;
-
 typedef struct {
     uint16_t value_offset;
     uint16_t value_length;
@@ -334,11 +195,14 @@ typedef struct {
     bool redirect_same_origin_only;
     bool body_enabled;
     bool identity_encoding;
+    bool icy_status_line;
     bool raw_gzip_encoding;
     bool force_fresh_connection;
     bool tls12_session_resumption;
-    /* FetchRequest.stall_abort_seconds: also bounds the wait for headers. */
+    /* FetchRequest.stall_abort_seconds and worker_timing
+       (fetch_background_expiry). */
     long stall_abort_seconds;
+    FetchWorkerTiming timing;
     FetchCacheMode cache_mode;
     bool send_low_client_hints;
     bool send_client_hints;
@@ -357,6 +221,14 @@ typedef struct {
     size_t body_length;
     char content_type[FETCH_BACKGROUND_CONTENT_TYPE_CAPACITY];
     char extra_headers[FETCH_BACKGROUND_EXTRA_HEADERS_CAPACITY];
+    /* Non-NULL when the request's body or extra headers did not fit the
+       inline field above (FETCH_BACKGROUND_LARGE_*_LIMIT). Budget is
+       single-owner, so only the browser thread allocates or frees these:
+       when it claims the slot, when it moves a finished or queued slot to
+       FREE, and at shutdown. A slot the worker frees after a discard keeps
+       its copy until the next claim. */
+    char *large_body;
+    char *large_extra_headers;
     char cookie[FETCH_BACKGROUND_COOKIE_CAPACITY];
     char origin[FETCH_BACKGROUND_ORIGIN_CAPACITY];
     char accept[FETCH_BACKGROUND_ACCEPT_CAPACITY];
@@ -389,50 +261,7 @@ typedef struct {
     char origin[TILEFINCH_ORIGIN_SERIALIZED_LIMIT];
 } FetchBackgroundPreconnect;
 
-typedef struct {
-    atomic_int state;
-    atomic_int event_state;
-    atomic_int tx_state;
-    atomic_int cancel_requested;
-    atomic_int close_pending;
-    atomic_int drain_state;
-    atomic_uint generation;
-    CURL *easy;
-    struct curl_slist *headers;
-    bool in_multi;
-    unsigned char *receive_buffer;
-    unsigned char *send_buffer;
-    size_t receive_length;
-    size_t send_length;
-    size_t send_offset;
-    int send_flags;
-    unsigned drain_pending_bytes;
-    bool receive_binary;
-    bool receive_started;
-    bool peer_close_received;
-    bool peer_close_had_code;
-    bool close_frame_sent;
-    atomic_int discard_when_closed;
-    uint16_t peer_close_code;
-    size_t peer_close_reason_length;
-    char peer_close_reason[FETCH_WEBSOCKET_CLOSE_REASON_LIMIT + 1u];
-    FetchWebSocketCloseAccumulator close_payload;
-    uint16_t pending_close_code;
-    bool pending_close_clean;
-    size_t pending_close_reason_length;
-    char pending_close_reason[FETCH_WEBSOCKET_CLOSE_REASON_LIMIT + 1u];
-    FetchWebSocketEvent event;
-    uint64_t deadline_us;
-    uint64_t last_progress_us;
-    FetchPrivateNetworkGuard private_network;
-    char url[FETCH_BACKGROUND_URL_CAPACITY];
-    char origin[FETCH_BACKGROUND_ORIGIN_CAPACITY];
-    char cookie[FETCH_BACKGROUND_COOKIE_CAPACITY];
-    char protocols[FETCH_WEBSOCKET_PROTOCOLS_LIMIT];
-    char selected_protocol[128];
-    char user_agent[FETCH_BACKGROUND_USER_AGENT_CAPACITY];
-    char curl_error[CURL_ERROR_SIZE];
-} FetchBackgroundWebSocket;
+#include "fetch/background_websocket_types.inc"
 
 typedef struct {
     Budget *budget;
@@ -750,8 +579,12 @@ static size_t fetch_background_receive_header(
         &fetch_background.header_callbacks, 1u, memory_order_relaxed);
     size_t length = size * count;
     slot->last_progress_us = fetch_background_now_us();
-    bool status_line = length >= 5u
-        && strncasecmp(data, "HTTP/", 5u) == 0;
+    /* libcurl accepts "ICY 200 OK" through CURLOPT_HTTP200ALIASES and
+       passes the line through unchanged. */
+    bool icy_line = slot->icy_status_line && length >= 4u
+        && strncasecmp(data, "ICY ", 4u) == 0;
+    bool status_line = icy_line
+        || (length >= 5u && strncasecmp(data, "HTTP/", 5u) == 0);
     bool header_snapshot_published = atomic_load_explicit(
         &slot->headers_state, memory_order_acquire)
         != FETCH_BACKGROUND_HEADERS_EMPTY;
@@ -769,7 +602,8 @@ static size_t fetch_background_receive_header(
             ? length : sizeof(status_line) - 1u;
         memcpy(status_line, data, copied);
         status_line[copied] = '\0';
-        if (sscanf(status_line, "HTTP/%*s %ld", &status) == 1) {
+        if (icy_line ? sscanf(status_line, "ICY %ld", &status) == 1
+                     : sscanf(status_line, "HTTP/%*s %ld", &status) == 1) {
             fetch_background_reset_response_headers(slot);
             slot->result.negotiated_http_version = negotiated_http_version;
             slot->header_status = status;
@@ -931,7 +765,7 @@ static bool fetch_background_append_named_header(
     FetchBackgroundSlot *slot, const char *name, const char *value)
 {
     if (value == NULL || value[0] == '\0') return true;
-    char line[FETCH_BACKGROUND_EXTRA_HEADERS_CAPACITY + 96u];
+    char line[FETCH_BACKGROUND_COOKIE_CAPACITY + 96u];
     int written = snprintf(line, sizeof(line), "%s: %s", name, value);
     return written >= 0 && (size_t) written < sizeof(line)
         && fetch_background_append_header(slot, line);
@@ -946,9 +780,9 @@ static bool fetch_background_append_extra_headers(
         const char *end = strchr(at, '\n');
         if (end == NULL) end = at + strlen(at);
         size_t length = (size_t) (end - at);
-        if (length == 0 || length >= FETCH_BACKGROUND_EXTRA_HEADERS_CAPACITY)
+        if (length == 0 || length >= FETCH_EXTRA_HEADER_LINE_MAX)
             return false;
-        char line[FETCH_BACKGROUND_EXTRA_HEADERS_CAPACITY];
+        char line[FETCH_EXTRA_HEADER_LINE_MAX];
         memcpy(line, at, length);
         line[length] = '\0';
         if (!fetch_background_append_header(slot, line)) return false;
@@ -957,12 +791,76 @@ static bool fetch_background_append_extra_headers(
     return true;
 }
 
+static const char *fetch_background_slot_body(
+    const FetchBackgroundSlot *slot)
+{
+    return slot->large_body != NULL ? slot->large_body : slot->body;
+}
+
+static const char *fetch_background_slot_extra_headers(
+    const FetchBackgroundSlot *slot)
+{
+    return slot->large_extra_headers != NULL
+        ? slot->large_extra_headers : slot->extra_headers;
+}
+
+/* Browser thread only, on a slot the worker no longer reads. */
+static void fetch_background_slot_drop_large_fields(
+    FetchBackgroundSlot *slot)
+{
+    budget_free(fetch_background.budget, slot->large_body);
+    budget_free(fetch_background.budget, slot->large_extra_headers);
+    slot->large_body = NULL;
+    slot->large_extra_headers = NULL;
+}
+
+/* Copies `length` bytes plus a terminator into the inline field when they
+   fit and into a fresh Budget block otherwise. */
+static bool fetch_background_slot_store_payload(
+    char *inline_field, size_t inline_capacity, char **large_field,
+    const char *source, size_t length)
+{
+    char *destination = inline_field;
+    if (length >= inline_capacity) {
+        destination = budget_malloc_category(
+            fetch_background.budget, BUDGET_CATEGORY_RESOURCE, length + 1u);
+        if (destination == NULL) return false;
+        *large_field = destination;
+    }
+    if (length != 0) memcpy(destination, source, length);
+    destination[length] = '\0';
+    return true;
+}
+
+/* Browser thread, slot PREPARING. The shape check bounds both lengths. */
+static bool fetch_background_slot_store_request_payload(
+    FetchBackgroundSlot *slot, const FetchRequest *request)
+{
+    fetch_background_slot_drop_large_fields(slot);
+    const char *headers = request->extra_headers == NULL
+        ? "" : request->extra_headers;
+    size_t headers_length = strlen(headers);
+    if (headers_length > FETCH_BACKGROUND_LARGE_EXTRA_HEADERS_LIMIT
+        || request->body_length > FETCH_BACKGROUND_LARGE_BODY_LIMIT
+        || (request->body_length != 0 && request->body == NULL))
+        return false;
+    bool stored = fetch_background_slot_store_payload(
+            slot->extra_headers, sizeof(slot->extra_headers),
+            &slot->large_extra_headers, headers, headers_length)
+        && fetch_background_slot_store_payload(
+            slot->body, sizeof(slot->body), &slot->large_body,
+            request->body, request->body_length);
+    if (!stored) fetch_background_slot_drop_large_fields(slot);
+    return stored;
+}
+
 static bool fetch_background_configure_request_shape(
     FetchBackgroundSlot *slot)
 {
     FetchRequest request = {
         .method = slot->method,
-        .body = slot->body_enabled ? slot->body : NULL,
+        .body = slot->body_enabled
+            ? fetch_background_slot_body(slot) : NULL,
         .body_length = slot->body_enabled ? slot->body_length : 0,
         .content_type = slot->content_type
     };
@@ -997,8 +895,9 @@ static bool fetch_background_configure_request_shape(
     }
     const char *cache_control = NULL;
     const char *pragma = NULL;
+    const char *extra_headers = fetch_background_slot_extra_headers(slot);
     fetch_cache_mode_headers(
-        slot->cache_mode, slot->extra_headers, &cache_control, &pragma);
+        slot->cache_mode, extra_headers, &cache_control, &pragma);
     return hints_ready && configure_easy_method(
                slot->easy, slot->method, &request, slot->body_enabled)
         && fetch_background_append_header(
@@ -1028,8 +927,7 @@ static bool fetch_background_configure_request_shape(
                slot, "If-None-Match", slot->if_none_match)
         && fetch_background_append_named_header(
                slot, "If-Modified-Since", slot->if_modified_since)
-        && fetch_background_append_extra_headers(
-               slot, slot->extra_headers)
+        && fetch_background_append_extra_headers(slot, extra_headers)
         && fetch_background_append_named_header(
                slot, "Cache-Control", cache_control)
         && fetch_background_append_named_header(slot, "Pragma", pragma);
@@ -1102,6 +1000,7 @@ static bool fetch_background_configure_easy(FetchBackgroundSlot *slot)
                slot->user_agent[0] == '\0'
                    ? FETCH_BACKGROUND_USER_AGENT : slot->user_agent)
                != CURLE_OK
+        || !fetch_configure_icy_status(slot->easy, slot->icy_status_line)
         || curl_easy_setopt(
                slot->easy, CURLOPT_CONNECTTIMEOUT_MS, connect_ms) != CURLE_OK
         || curl_easy_setopt(
@@ -1939,16 +1838,12 @@ static void fetch_background_expire_active_deadlines(void)
             || !fetch_background_deadline_eligible(
                 slot->transfer_done, slot->curl_paused,
                 slot->pause_started_us)) continue;
-        bool deadline_expired = now_us >= slot->deadline_us;
-        uint64_t stall_window_us = (uint64_t) (
-            slot->stall_abort_seconds > 0
-                ? slot->stall_abort_seconds
-                : FETCH_STALL_LOW_SPEED_SECONDS) * UINT64_C(1000000);
-        bool response_stalled =
-            (slot->header_status != 0 || slot->stall_abort_seconds > 0)
-            && now_us >= slot->last_progress_us
-            && now_us - slot->last_progress_us >= stall_window_us;
-        if (!deadline_expired && !response_stalled) continue;
+        FetchBackgroundExpiry expiry = fetch_background_expiry(
+            slot->timing, slot->header_status != 0,
+            slot->stall_abort_seconds, FETCH_STALL_LOW_SPEED_SECONDS,
+            now_us, slot->deadline_us, slot->last_progress_us);
+        if (expiry == FETCH_BACKGROUND_EXPIRY_NONE) continue;
+        bool deadline_expired = expiry == FETCH_BACKGROUND_EXPIRY_DEADLINE;
         snprintf(
             slot->result.error, sizeof(slot->result.error), "%s",
             deadline_expired
@@ -1974,6 +1869,24 @@ static void fetch_background_expire_active_deadlines(void)
         else
             fetch_background_publish_complete(
                 slot, false, CURLE_OPERATION_TIMEDOUT);
+    }
+}
+
+static void fetch_background_publish_idle_streams(void)
+{
+    uint64_t now_us = fetch_background_now_us();
+    for (unsigned i = 0; i < FETCH_BACKGROUND_REQUEST_LIMIT; i++) {
+        FetchBackgroundSlot *slot = &fetch_background.slots[i];
+        if (!slot->streaming
+            || atomic_load_explicit(&slot->state, memory_order_acquire)
+                   != FETCH_BACKGROUND_SLOT_RUNNING) continue;
+        if (fetch_background_stream_idle_publish_due(
+                slot->length,
+                atomic_load_explicit(
+                    &slot->chunk_state, memory_order_acquire)
+                    == FETCH_BACKGROUND_CHUNK_EMPTY,
+                slot->transfer_done, now_us, slot->last_progress_us))
+            fetch_background_publish_stream_chunk(slot);
     }
 }
 
@@ -2044,600 +1957,19 @@ static bool fetch_background_perform_has_setup_work(void)
     return false;
 }
 
-static uint64_t fetch_background_websocket_make_id(
-    unsigned slot, uint32_t generation)
+static void fetch_background_wake_worker(void)
 {
-    return ((uint64_t) generation << 8u) | (uint64_t) (slot + 1u);
+    (void) sceKernelSetEventFlag(
+        fetch_background.event, FETCH_BACKGROUND_EVENT_WAKE);
+#if LIBCURL_VERSION_NUM >= 0x074400
+    (void) curl_multi_wakeup(fetch_background.multi);
+#endif
 }
 
-static bool fetch_background_websocket_id_slot(
-    uint64_t id, unsigned *slot_out, uint32_t *generation_out)
-{
-    unsigned encoded = (unsigned) (id & UINT64_C(0xff));
-    uint64_t generation = id >> 8u;
-    if (encoded == 0 || encoded > FETCH_WEBSOCKET_LIMIT
-        || generation == 0 || generation > UINT32_MAX) return false;
-    if (slot_out != NULL) *slot_out = encoded - 1u;
-    if (generation_out != NULL) *generation_out = (uint32_t) generation;
-    return true;
-}
-
-static FetchBackgroundWebSocket *fetch_background_websocket_for_id(
-    uint64_t id)
-{
-    unsigned index = 0;
-    uint32_t generation = 0;
-    if (!fetch_background_websocket_id_slot(id, &index, &generation))
-        return NULL;
-    FetchBackgroundWebSocket *socket = &fetch_background.websockets[index];
-    return atomic_load_explicit(
-               &socket->generation, memory_order_acquire) == generation
-        ? socket : NULL;
-}
-
-static void fetch_background_websocket_release_curl(
-    FetchBackgroundWebSocket *socket, bool remove_from_multi)
-{
-    if (socket == NULL) return;
-    if (socket->easy != NULL) {
-        if (remove_from_multi && socket->in_multi) {
-            (void) curl_multi_remove_handle(
-                fetch_background.multi, socket->easy);
-            socket->in_multi = false;
-        }
-        curl_easy_cleanup(socket->easy);
-        socket->easy = NULL;
-    }
-    curl_slist_free_all(socket->headers);
-    socket->headers = NULL;
-}
-
-static void fetch_background_websocket_publish_close_bytes(
-    FetchBackgroundWebSocket *socket, uint16_t code,
-    const unsigned char *reason, size_t reason_length, bool was_clean)
-{
-    if (socket == NULL || reason_length > FETCH_WEBSOCKET_CLOSE_REASON_LIMIT
-        || (reason_length != 0 && reason == NULL)) return;
-    fetch_background_websocket_release_curl(socket, true);
-    socket->receive_length = 0;
-    socket->close_payload = (FetchWebSocketCloseAccumulator) {0};
-    socket->send_length = 0;
-    socket->send_offset = 0;
-    atomic_store_explicit(
-        &socket->tx_state, FETCH_BACKGROUND_WEBSOCKET_TX_EMPTY,
-        memory_order_release);
-    socket->drain_pending_bytes = 0;
-    atomic_store_explicit(
-        &socket->drain_state, FETCH_BACKGROUND_WEBSOCKET_DRAIN_EMPTY,
-        memory_order_release);
-    bool discard = atomic_load_explicit(
-        &socket->discard_when_closed, memory_order_acquire) != 0;
-    int event_state = atomic_load_explicit(
-        &socket->event_state, memory_order_acquire);
-    if (!discard && event_state == FETCH_BACKGROUND_WEBSOCKET_EVENT_EMPTY) {
-        memset(&socket->event, 0, sizeof(socket->event));
-        socket->event.kind = FETCH_WEBSOCKET_EVENT_CLOSE;
-        socket->event.close_code = code;
-        socket->event.was_clean = was_clean;
-        socket->event.reason_length = reason_length;
-        if (reason_length != 0)
-            memcpy(socket->event.reason, reason, reason_length);
-        socket->event.reason[reason_length] = '\0';
-        atomic_store_explicit(
-            &socket->event_state, FETCH_BACKGROUND_WEBSOCKET_EVENT_READY,
-            memory_order_release);
-    } else if (!discard) {
-        socket->pending_close_code = code;
-        socket->pending_close_clean = was_clean;
-        socket->pending_close_reason_length = reason_length;
-        if (reason_length != 0)
-            memcpy(socket->pending_close_reason, reason, reason_length);
-        socket->pending_close_reason[reason_length] = '\0';
-        atomic_store_explicit(
-            &socket->close_pending, 1, memory_order_release);
-    } else {
-        atomic_store_explicit(
-            &socket->close_pending, 0, memory_order_release);
-        atomic_store_explicit(
-            &socket->event_state, FETCH_BACKGROUND_WEBSOCKET_EVENT_EMPTY,
-            memory_order_release);
-    }
-    atomic_store_explicit(
-        &socket->state, FETCH_BACKGROUND_WEBSOCKET_CLOSED,
-        memory_order_release);
-}
-
-static void fetch_background_websocket_publish_close(
-    FetchBackgroundWebSocket *socket, uint16_t code,
-    const char *reason, bool was_clean)
-{
-    const char *safe_reason = reason == NULL ? "" : reason;
-    size_t length = strlen(safe_reason);
-    if (length > FETCH_WEBSOCKET_CLOSE_REASON_LIMIT)
-        length = FETCH_WEBSOCKET_CLOSE_REASON_LIMIT;
-    fetch_background_websocket_publish_close_bytes(
-        socket, code, (const unsigned char *) safe_reason, length, was_clean);
-}
-
-static size_t fetch_background_websocket_receive_header(
-    char *data, size_t size, size_t count, void *opaque)
-{
-    FetchBackgroundWebSocket *socket = opaque;
-    static const char name[] = "Sec-WebSocket-Protocol:";
-    if (socket == NULL || (size != 0 && count > SIZE_MAX / size)) return 0;
-    size_t length = size * count;
-    socket->last_progress_us = fetch_background_now_us();
-    if (length > sizeof(name) - 1u
-        && strncasecmp(data, name, sizeof(name) - 1u) == 0) {
-        const char *value = data + sizeof(name) - 1u;
-        const char *end = data + length;
-        while (value < end && (*value == ' ' || *value == '\t')) value++;
-        while (end > value
-               && (end[-1] == '\r' || end[-1] == '\n'
-                   || end[-1] == ' ' || end[-1] == '\t')) end--;
-        size_t value_length = (size_t) (end - value);
-        if (value_length == 0
-            || value_length >= sizeof(socket->selected_protocol)) return 0;
-        memcpy(socket->selected_protocol, value, value_length);
-        socket->selected_protocol[value_length] = '\0';
-    }
-    return length;
-}
-
-static bool fetch_background_websocket_append_header(
-    FetchBackgroundWebSocket *socket, const char *name, const char *value)
-{
-    if (socket == NULL || name == NULL || value == NULL) return false;
-    char line[FETCH_WEBSOCKET_PROTOCOLS_LIMIT + 32u];
-    int written = snprintf(line, sizeof(line), "%s: %s", name, value);
-    if (written <= 0 || (size_t) written >= sizeof(line)) return false;
-    struct curl_slist *next = curl_slist_append(socket->headers, line);
-    if (next == NULL) return false;
-    socket->headers = next;
-    return true;
-}
-
-static bool fetch_background_websocket_protocol_selected(
-    const FetchBackgroundWebSocket *socket)
-{
-    if (socket == NULL) return false;
-    if (socket->selected_protocol[0] == '\0') return true;
-    const char *at = socket->protocols;
-    size_t selected_length = strlen(socket->selected_protocol);
-    while (at != NULL && *at != '\0') {
-        while (*at == ' ' || *at == '\t' || *at == ',') at++;
-        const char *end = strchr(at, ',');
-        if (end == NULL) end = at + strlen(at);
-        const char *trimmed = end;
-        while (trimmed > at
-               && (trimmed[-1] == ' ' || trimmed[-1] == '\t')) trimmed--;
-        if ((size_t) (trimmed - at) == selected_length
-            && memcmp(at, socket->selected_protocol,
-                      selected_length) == 0) return true;
-        at = *end == '\0' ? NULL : end + 1;
-    }
-    return false;
-}
-
-static bool fetch_background_websocket_configure(
-    FetchBackgroundWebSocket *socket)
-{
-    if (socket == NULL || socket->url[0] == '\0') return false;
-    socket->easy = curl_easy_init();
-    bool headers_ready = socket->easy != NULL
-        && fetch_background_websocket_append_header(
-               socket, "Origin", socket->origin)
-        && (socket->cookie[0] == '\0'
-            || fetch_background_websocket_append_header(
-                   socket, "Cookie", socket->cookie))
-        && (socket->protocols[0] == '\0'
-            || fetch_background_websocket_append_header(
-                   socket, "Sec-WebSocket-Protocol", socket->protocols));
-    if (!headers_ready
-        || !curl_easy_attach_shared_state(socket->easy)
-        || !fetch_configure_tls(socket->easy)
-        || !fetch_configure_private_network(
-               socket->easy, &socket->private_network)
-        || curl_easy_setopt(socket->easy, CURLOPT_URL, socket->url)
-               != CURLE_OK
-        || curl_easy_setopt(socket->easy, CURLOPT_FOLLOWLOCATION, 0L)
-               != CURLE_OK
-        || curl_easy_setopt(socket->easy, CURLOPT_PROTOCOLS_STR, "ws,wss")
-               != CURLE_OK
-        || curl_easy_setopt(socket->easy, CURLOPT_REDIR_PROTOCOLS_STR, "ws,wss")
-               != CURLE_OK
-        || curl_easy_setopt(socket->easy, CURLOPT_CONNECT_ONLY, 2L)
-               != CURLE_OK
-        || curl_easy_setopt(socket->easy, CURLOPT_HTTPHEADER, socket->headers)
-               != CURLE_OK
-        || curl_easy_setopt(socket->easy, CURLOPT_USERAGENT,
-               socket->user_agent[0] == '\0'
-                   ? FETCH_BACKGROUND_USER_AGENT : socket->user_agent)
-               != CURLE_OK
-        || curl_easy_setopt(socket->easy, CURLOPT_TIMEOUT_MS, 0L) != CURLE_OK
-        || curl_easy_setopt(socket->easy, CURLOPT_CONNECTTIMEOUT_MS,
-               15000L) != CURLE_OK
-        || curl_easy_setopt(socket->easy, CURLOPT_NOSIGNAL, 1L) != CURLE_OK
-        || curl_easy_setopt(socket->easy, CURLOPT_ERRORBUFFER,
-               socket->curl_error) != CURLE_OK
-        || curl_easy_setopt(socket->easy, CURLOPT_HEADERFUNCTION,
-               fetch_background_websocket_receive_header) != CURLE_OK
-        || curl_easy_setopt(socket->easy, CURLOPT_HEADERDATA, socket)
-               != CURLE_OK
-        || curl_easy_setopt(socket->easy, CURLOPT_PRIVATE, socket) != CURLE_OK) {
-        fetch_background_websocket_release_curl(socket, false);
-        return false;
-    }
-    if (curl_multi_add_handle(fetch_background.multi, socket->easy)
-            != CURLM_OK) {
-        fetch_background_websocket_release_curl(socket, false);
-        return false;
-    }
-    socket->in_multi = true;
-    return true;
-}
-
-static void fetch_background_websocket_start_queued(void)
-{
-    for (unsigned i = 0; i < FETCH_WEBSOCKET_LIMIT; i++) {
-        FetchBackgroundWebSocket *socket = &fetch_background.websockets[i];
-        if (atomic_load_explicit(&socket->state, memory_order_acquire)
-                != FETCH_BACKGROUND_WEBSOCKET_QUEUED) continue;
-        if (atomic_load_explicit(
-                &socket->cancel_requested, memory_order_acquire)) {
-            fetch_background_websocket_publish_close(
-                socket, 1006u, "WebSocket cancelled", false);
-            continue;
-        }
-        if (!fetch_background_websocket_configure(socket)) {
-            fetch_background_websocket_publish_close(
-                socket, 1006u, "WebSocket handshake setup failed", false);
-            continue;
-        }
-        atomic_store_explicit(
-            &socket->state, FETCH_BACKGROUND_WEBSOCKET_HANDSHAKING,
-            memory_order_release);
-    }
-}
-
-static bool fetch_background_websocket_finish_handshake(
-    CURL *easy, CURLcode code)
-{
-    FetchBackgroundWebSocket *socket = NULL;
-    for (unsigned i = 0; i < FETCH_WEBSOCKET_LIMIT; i++) {
-        if (fetch_background.websockets[i].easy == easy) {
-            socket = &fetch_background.websockets[i];
-            break;
-        }
-    }
-    if (socket == NULL
-        || atomic_load_explicit(&socket->state, memory_order_acquire)
-               != FETCH_BACKGROUND_WEBSOCKET_HANDSHAKING) return false;
-    (void) curl_multi_remove_handle(fetch_background.multi, socket->easy);
-    socket->in_multi = false;
-    if (code != CURLE_OK) {
-        const char *reason = socket->curl_error[0] != '\0'
-            ? socket->curl_error : curl_easy_strerror(code);
-        fetch_background_websocket_publish_close(
-            socket, 1006u, reason, false);
-        return true;
-    }
-    if (!fetch_background_websocket_protocol_selected(socket)) {
-        fetch_background_websocket_publish_close(
-            socket, 1006u, "WebSocket protocol negotiation failed", false);
-        return true;
-    }
-    memset(&socket->event, 0, sizeof(socket->event));
-    socket->event.kind = FETCH_WEBSOCKET_EVENT_OPEN;
-    snprintf(socket->event.protocol, sizeof(socket->event.protocol), "%s",
-             socket->selected_protocol);
-    atomic_store_explicit(
-        &socket->event_state, FETCH_BACKGROUND_WEBSOCKET_EVENT_READY,
-        memory_order_release);
-    atomic_store_explicit(
-        &socket->state, FETCH_BACKGROUND_WEBSOCKET_OPEN,
-        memory_order_release);
-    socket->last_progress_us = fetch_background_now_us();
-    return true;
-}
-
-static void fetch_background_websocket_service_send(
-    FetchBackgroundWebSocket *socket)
-{
-    if (socket == NULL || socket->easy == NULL
-        || atomic_load_explicit(&socket->tx_state, memory_order_acquire)
-            != FETCH_BACKGROUND_WEBSOCKET_TX_READY) return;
-    size_t sent = 0;
-    CURLcode code = curl_ws_send(
-        socket->easy, socket->send_buffer + socket->send_offset,
-        socket->send_length - socket->send_offset, &sent,
-        0, (unsigned int) socket->send_flags);
-    if (sent != 0) {
-        socket->send_offset += sent;
-        socket->last_progress_us = fetch_background_now_us();
-    }
-    if (code == CURLE_AGAIN) return;
-    if (code != CURLE_OK || socket->send_offset != socket->send_length) {
-        fetch_background_websocket_publish_close(
-            socket, 1006u, "WebSocket send failed", false);
-        return;
-    }
-    size_t completed = socket->send_length;
-    bool sent_close = (socket->send_flags & CURLWS_CLOSE) != 0;
-    socket->send_length = 0;
-    socket->send_offset = 0;
-    if (sent_close) {
-        socket->close_frame_sent = true;
-        atomic_store_explicit(
-            &socket->tx_state, FETCH_BACKGROUND_WEBSOCKET_TX_EMPTY,
-            memory_order_release);
-        if (socket->peer_close_received) {
-            fetch_background_websocket_publish_close_bytes(
-                socket, socket->peer_close_code,
-                (const unsigned char *) socket->peer_close_reason,
-                socket->peer_close_reason_length, true);
-            return;
-        }
-        socket->deadline_us = fetch_background_now_us() + UINT64_C(2000000);
-        atomic_store_explicit(
-            &socket->state, FETCH_BACKGROUND_WEBSOCKET_CLOSING,
-            memory_order_release);
-        return;
-    }
-    if (socket->peer_close_received) {
-        size_t reason_length = socket->peer_close_reason_length;
-        if (socket->peer_close_had_code) {
-            socket->send_buffer[0] =
-                (unsigned char) (socket->peer_close_code >> 8u);
-            socket->send_buffer[1] = (unsigned char) socket->peer_close_code;
-            if (reason_length != 0)
-                memcpy(socket->send_buffer + 2u,
-                       socket->peer_close_reason, reason_length);
-            socket->send_length = reason_length + 2u;
-        } else {
-            socket->send_length = 0;
-        }
-        socket->send_flags = CURLWS_CLOSE;
-        atomic_store_explicit(
-            &socket->tx_state, FETCH_BACKGROUND_WEBSOCKET_TX_READY,
-            memory_order_release);
-        return;
-    }
-    unsigned add = completed > UINT_MAX ? UINT_MAX : (unsigned) completed;
-    socket->drain_pending_bytes = add;
-    atomic_store_explicit(
-        &socket->drain_state, FETCH_BACKGROUND_WEBSOCKET_DRAIN_PENDING,
-        memory_order_release);
-    atomic_store_explicit(
-        &socket->tx_state, FETCH_BACKGROUND_WEBSOCKET_TX_EMPTY,
-        memory_order_release);
-}
-
-static bool fetch_background_websocket_publish_pending_drain(
-    FetchBackgroundWebSocket *socket)
-{
-    if (socket == NULL
-        || atomic_load_explicit(
-               &socket->event_state, memory_order_acquire)
-               != FETCH_BACKGROUND_WEBSOCKET_EVENT_EMPTY) return false;
-    int expected = FETCH_BACKGROUND_WEBSOCKET_DRAIN_PENDING;
-    if (!atomic_compare_exchange_strong_explicit(
-            &socket->drain_state, &expected,
-            FETCH_BACKGROUND_WEBSOCKET_DRAIN_PUBLISHED,
-            memory_order_acq_rel, memory_order_acquire)) return false;
-    memset(&socket->event, 0, sizeof(socket->event));
-    socket->event.kind = FETCH_WEBSOCKET_EVENT_DRAIN;
-    socket->event.sent_bytes = socket->drain_pending_bytes;
-    atomic_store_explicit(
-        &socket->event_state, FETCH_BACKGROUND_WEBSOCKET_EVENT_READY,
-        memory_order_release);
-    return true;
-}
-
-static void fetch_background_websocket_service_receive(
-    FetchBackgroundWebSocket *socket)
-{
-    if (socket == NULL || socket->easy == NULL
-        || atomic_load_explicit(
-               &socket->event_state, memory_order_acquire)
-               != FETCH_BACKGROUND_WEBSOCKET_EVENT_EMPTY) return;
-    size_t received = 0;
-    const struct curl_ws_frame *frame = NULL;
-    unsigned char scratch[4096];
-    CURLcode code = curl_ws_recv(
-        socket->easy, scratch, sizeof(scratch), &received, &frame);
-    if (code == CURLE_AGAIN) return;
-    if (code != CURLE_OK || frame == NULL) {
-        fetch_background_websocket_publish_close(
-            socket, 1006u, "WebSocket receive failed", false);
-        return;
-    }
-    socket->last_progress_us = fetch_background_now_us();
-    if ((frame->flags & CURLWS_CLOSE) != 0) {
-        FetchWebSocketClosePayload parsed;
-        FetchWebSocketClosePayloadStatus status =
-            fetch_websocket_close_payload_accumulate(
-                &socket->close_payload, scratch, received,
-                frame->bytesleft, &parsed);
-        /* libcurl may expose a complete control frame over several recv
-           calls. Never interpret, echo, or report a partial close payload. */
-        if (status == FETCH_WEBSOCKET_CLOSE_PAYLOAD_INCOMPLETE) return;
-        if (status != FETCH_WEBSOCKET_CLOSE_PAYLOAD_VALID) {
-            fetch_background_websocket_publish_close(
-                socket,
-                status == FETCH_WEBSOCKET_CLOSE_PAYLOAD_INVALID_UTF8
-                    ? 1007u : 1002u,
-                status == FETCH_WEBSOCKET_CLOSE_PAYLOAD_INVALID_UTF8
-                    ? "Invalid WebSocket close reason"
-                    : "Invalid WebSocket close frame",
-                false);
-            return;
-        }
-        if (socket->close_frame_sent) {
-            fetch_background_websocket_publish_close_bytes(
-                socket, parsed.code,
-                (const unsigned char *) parsed.reason,
-                parsed.reason_length, true);
-            return;
-        }
-        socket->peer_close_code = parsed.code;
-        socket->peer_close_had_code = parsed.has_code;
-        socket->peer_close_reason_length = parsed.reason_length;
-        if (parsed.reason_length != 0) {
-            memcpy(socket->peer_close_reason, parsed.reason,
-                   parsed.reason_length);
-        }
-        socket->peer_close_reason[parsed.reason_length] = '\0';
-        socket->peer_close_received = true;
-        socket->deadline_us =
-            fetch_background_now_us() + UINT64_C(2000000);
-        atomic_store_explicit(
-            &socket->state, FETCH_BACKGROUND_WEBSOCKET_CLOSING,
-            memory_order_release);
-        int expected = FETCH_BACKGROUND_WEBSOCKET_TX_EMPTY;
-        if (atomic_compare_exchange_strong_explicit(
-                &socket->tx_state, &expected,
-                FETCH_BACKGROUND_WEBSOCKET_TX_PREPARING,
-                memory_order_acq_rel, memory_order_acquire)) {
-            size_t reason_length = socket->peer_close_reason_length;
-            if (socket->peer_close_had_code) {
-                socket->send_buffer[0] =
-                    (unsigned char) (parsed.code >> 8u);
-                socket->send_buffer[1] = (unsigned char) parsed.code;
-                if (reason_length != 0)
-                    memcpy(socket->send_buffer + 2u,
-                           socket->peer_close_reason, reason_length);
-                socket->send_length = reason_length + 2u;
-            } else {
-                socket->send_length = 0;
-            }
-            socket->send_offset = 0;
-            socket->send_flags = CURLWS_CLOSE;
-            atomic_store_explicit(
-                &socket->tx_state, FETCH_BACKGROUND_WEBSOCKET_TX_READY,
-                memory_order_release);
-        }
-        return;
-    }
-    if (socket->close_payload.active) {
-        fetch_background_websocket_publish_close(
-            socket, 1002u, "Interrupted WebSocket close frame", false);
-        return;
-    }
-    /* Hash-pinned curl 8.22.0 auto-enqueues a matching PONG unless the
-       unset CURLWS_NOAUTOPONG option disables it. Control frames therefore
-       need no page-visible event or second Tilefinch transmit slot. */
-    if ((frame->flags & (CURLWS_PING | CURLWS_PONG)) != 0) return;
-    if (!socket->receive_started) {
-        socket->receive_binary = (frame->flags & CURLWS_BINARY) != 0;
-        socket->receive_started = true;
-    }
-    if (received > FETCH_WEBSOCKET_MESSAGE_LIMIT - socket->receive_length) {
-        fetch_background_websocket_publish_close(
-            socket, 1009u, "WebSocket message exceeded 64 KiB", false);
-        return;
-    }
-    memcpy(socket->receive_buffer + socket->receive_length,
-           scratch, received);
-    socket->receive_length += received;
-    if (frame->bytesleft != 0 || (frame->flags & CURLWS_CONT) != 0) return;
-    if (!socket->receive_binary
-        && !fetch_websocket_text_payload_valid(
-               socket->receive_buffer, socket->receive_length)) {
-        fetch_background_websocket_publish_close(
-            socket, 1007u, "Invalid WebSocket text message", false);
-        return;
-    }
-    memset(&socket->event, 0, sizeof(socket->event));
-    socket->event.kind = socket->receive_binary
-        ? FETCH_WEBSOCKET_EVENT_MESSAGE_BINARY
-        : FETCH_WEBSOCKET_EVENT_MESSAGE_TEXT;
-    socket->event.length = socket->receive_length;
-    socket->receive_started = false;
-    atomic_store_explicit(
-        &socket->event_state, FETCH_BACKGROUND_WEBSOCKET_EVENT_READY,
-        memory_order_release);
-}
-
-static void fetch_background_websocket_service(void)
-{
-    uint64_t now_us = fetch_background_now_us();
-    for (unsigned i = 0; i < FETCH_WEBSOCKET_LIMIT; i++) {
-        FetchBackgroundWebSocket *socket = &fetch_background.websockets[i];
-        int state = atomic_load_explicit(&socket->state, memory_order_acquire);
-        if (state == FETCH_BACKGROUND_WEBSOCKET_CLOSED
-            && atomic_load_explicit(
-                   &socket->close_pending, memory_order_acquire)
-            && atomic_load_explicit(
-                   &socket->event_state, memory_order_acquire)
-                   == FETCH_BACKGROUND_WEBSOCKET_EVENT_EMPTY) {
-            if (atomic_exchange_explicit(
-                    &socket->close_pending, 0, memory_order_acq_rel)) {
-                memset(&socket->event, 0, sizeof(socket->event));
-                socket->event.kind = FETCH_WEBSOCKET_EVENT_CLOSE;
-                socket->event.close_code = socket->pending_close_code;
-                socket->event.was_clean = socket->pending_close_clean;
-                socket->event.reason_length =
-                    socket->pending_close_reason_length;
-                if (socket->event.reason_length != 0) {
-                    memcpy(socket->event.reason,
-                           socket->pending_close_reason,
-                           socket->event.reason_length);
-                }
-                socket->event.reason[socket->event.reason_length] = '\0';
-                atomic_store_explicit(
-                    &socket->event_state,
-                    FETCH_BACKGROUND_WEBSOCKET_EVENT_READY,
-                    memory_order_release);
-            }
-            continue;
-        }
-        if (state == FETCH_BACKGROUND_WEBSOCKET_HANDSHAKING
-            && atomic_load_explicit(
-                   &socket->cancel_requested, memory_order_acquire)) {
-            fetch_background_websocket_publish_close(
-                socket, 1006u, "WebSocket cancelled", false);
-            continue;
-        }
-        if (state == FETCH_BACKGROUND_WEBSOCKET_HANDSHAKING
-            && now_us >= socket->deadline_us) {
-            fetch_background_websocket_release_curl(socket, true);
-            fetch_background_websocket_publish_close(
-                socket, 1006u, "WebSocket handshake timed out", false);
-            continue;
-        }
-        if (state != FETCH_BACKGROUND_WEBSOCKET_OPEN
-            && state != FETCH_BACKGROUND_WEBSOCKET_CLOSING) continue;
-        if (atomic_load_explicit(
-                &socket->cancel_requested, memory_order_acquire)) {
-            fetch_background_websocket_publish_close(
-                socket, 1006u, "WebSocket cancelled", false);
-            continue;
-        }
-        /* A receive/open event can occupy the sole browser handoff while a
-           send completes. Publish the accumulated acknowledgement before
-           taking more input so bufferedAmount always makes progress. */
-        if (fetch_background_websocket_publish_pending_drain(socket))
-            continue;
-        fetch_background_websocket_service_send(socket);
-        if (fetch_background_websocket_publish_pending_drain(socket))
-            continue;
-        state = atomic_load_explicit(&socket->state, memory_order_acquire);
-        if ((state == FETCH_BACKGROUND_WEBSOCKET_OPEN
-             || state == FETCH_BACKGROUND_WEBSOCKET_CLOSING)
-            && socket->easy != NULL
-            && atomic_load_explicit(
-                   &socket->tx_state, memory_order_acquire)
-                   == FETCH_BACKGROUND_WEBSOCKET_TX_EMPTY)
-            fetch_background_websocket_service_receive(socket);
-        if (atomic_load_explicit(&socket->state, memory_order_acquire)
-                == FETCH_BACKGROUND_WEBSOCKET_CLOSING
-            && now_us >= socket->deadline_us) {
-            fetch_background_websocket_publish_close(
-                socket, 1006u, "WebSocket close timed out", false);
-        }
-    }
-}
+/* Worker and browser halves of the WebSocket lane. The host loopback test
+   (tests/test_websocket_worker_loopback.c) compiles the same file against
+   the pinned libcurl. */
+#include "fetch/background_websocket.inc"
 
 static int fetch_background_worker_main(SceSize args, void *argp)
 {
@@ -2655,6 +1987,7 @@ static int fetch_background_worker_main(SceSize args, void *argp)
         fetch_background_websocket_start_queued();
         fetch_background_websocket_service();
         fetch_background_expire_active_deadlines();
+        fetch_background_publish_idle_streams();
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
         uint64_t service_us =
             fetch_background_now_us() - service_started_us;
@@ -2821,29 +2154,8 @@ static int fetch_background_worker_main(SceSize args, void *argp)
         if (running > 0 || fetch_background_has_worker_work()) {
             int descriptors = 0;
             struct curl_waitfd websocket_fds[FETCH_WEBSOCKET_LIMIT];
-            unsigned websocket_fd_count = 0;
-            for (unsigned i = 0; i < FETCH_WEBSOCKET_LIMIT; i++) {
-                FetchBackgroundWebSocket *socket =
-                    &fetch_background.websockets[i];
-                int state = atomic_load_explicit(
-                    &socket->state, memory_order_acquire);
-                if ((state != FETCH_BACKGROUND_WEBSOCKET_OPEN
-                     && state != FETCH_BACKGROUND_WEBSOCKET_CLOSING)
-                    || socket->easy == NULL) continue;
-                curl_socket_t fd = CURL_SOCKET_BAD;
-                if (curl_easy_getinfo(
-                        socket->easy, CURLINFO_ACTIVESOCKET, &fd) != CURLE_OK
-                    || fd == CURL_SOCKET_BAD) continue;
-                websocket_fds[websocket_fd_count++] = (struct curl_waitfd) {
-                    .fd = fd,
-                    .events = (short) (CURL_WAIT_POLLIN
-                        | (atomic_load_explicit(
-                               &socket->tx_state, memory_order_acquire)
-                               == FETCH_BACKGROUND_WEBSOCKET_TX_READY
-                            ? CURL_WAIT_POLLOUT : 0)),
-                    .revents = 0
-                };
-            }
+            unsigned websocket_fd_count =
+                fetch_background_websocket_poll_fds(websocket_fds);
             (void) atomic_fetch_add_explicit(
                 &fetch_background.worker_polls, 1u,
                 memory_order_relaxed);
@@ -2933,6 +2245,10 @@ void fetch_background_transport_cooperate(uint64_t now_us)
 #endif
 }
 
+static bool fetch_background_transport_start(Budget *budget);
+/* When the last start failed, or 0 (fetch_background_start_retry_due). */
+static uint64_t fetch_background_start_failed_us;
+
 bool fetch_background_transport_initialize(Budget *budget)
 {
     FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_active(),
@@ -2940,6 +2256,16 @@ bool fetch_background_transport_initialize(Budget *budget)
     if (fetch_background.initialized)
         return fetch_background.budget == budget;
     if (budget == NULL) return false;
+    uint64_t now = fetch_background_now_us();
+    if (!fetch_background_start_retry_due(
+            now, fetch_background_start_failed_us)) return false;
+    bool started = fetch_background_transport_start(budget);
+    fetch_background_start_failed_us = started ? 0 : (now == 0 ? 1 : now);
+    return started;
+}
+
+static bool fetch_background_transport_start(Budget *budget)
+{
     if (!curl_global_acquire(budget)) {
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
         psp_log_printf(
@@ -3184,13 +2510,13 @@ static bool fetch_background_stream_request_supported(
 static uint64_t fetch_background_transport_enqueue_stream_internal(
     const char *url, const FetchRequest *request,
     size_t maximum_bytes, long timeout_ms, bool single_hop,
-    size_t publication_bytes, bool foreground_media,
+    size_t publication_bytes, FetchBackgroundLane lane,
     FetchBackgroundEnqueueStatus *status)
 {
     FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_active(),
         fetch_replay_lane_enqueue(url, request, maximum_bytes, timeout_ms,
                                   true, single_hop, publication_bytes,
-                                  status));
+                                  lane, status));
     if (status != NULL) *status = FETCH_BACKGROUND_ENQUEUE_UNAVAILABLE;
     if (!fetch_background.initialized) return 0;
     if (atomic_load_explicit(
@@ -3218,7 +2544,7 @@ static uint64_t fetch_background_transport_enqueue_stream_internal(
         return 0;
     }
     unsigned slot_limit = fetch_background_admission_slot_limit(
-        foreground_media,
+        lane,
         atomic_load_explicit(
             &fetch_background_media_priority_active,
             memory_order_acquire) != 0);
@@ -3238,9 +2564,6 @@ static uint64_t fetch_background_transport_enqueue_stream_internal(
             && fetch_background_copy_field(
                 slot->content_type, sizeof(slot->content_type),
                 request->content_type)
-            && fetch_background_copy_field(
-                slot->extra_headers, sizeof(slot->extra_headers),
-                request->extra_headers)
             && fetch_background_copy_field(
                 slot->cookie, sizeof(slot->cookie), request->cookie)
             && fetch_background_copy_field(
@@ -3275,18 +2598,16 @@ static uint64_t fetch_background_transport_enqueue_stream_internal(
             && fetch_background_copy_field(
                 slot->sec_fetch_site, sizeof(slot->sec_fetch_site),
                 request->sec_fetch_site);
-        if (copied && request->body_length != 0) {
-            memcpy(slot->body, request->body, request->body_length);
-            slot->body[request->body_length] = '\0';
-        } else {
-            slot->body[0] = '\0';
-        }
-        if (!copied) {
+        bool payload_stored = copied
+            && fetch_background_slot_store_request_payload(slot, request);
+        if (!payload_stored) {
+            fetch_background_slot_drop_large_fields(slot);
             atomic_store_explicit(
                 &slot->state, FETCH_BACKGROUND_SLOT_FREE,
                 memory_order_release);
             if (status != NULL)
-                *status = FETCH_BACKGROUND_ENQUEUE_UNSUPPORTED;
+                *status = copied ? FETCH_BACKGROUND_ENQUEUE_MEMORY
+                                 : FETCH_BACKGROUND_ENQUEUE_UNSUPPORTED;
             return 0;
         }
         uint32_t generation = fetch_background_generation_next(
@@ -3305,10 +2626,12 @@ static uint64_t fetch_background_transport_enqueue_stream_internal(
         slot->body_enabled = true;
         slot->body_length = request->body_length;
         slot->identity_encoding = request->identity_encoding;
+        slot->icy_status_line = request->icy_status_line;
         slot->raw_gzip_encoding = request->raw_gzip_encoding;
         slot->force_fresh_connection = request->force_fresh_connection;
         slot->tls12_session_resumption = request->tls12_session_resumption;
         slot->stall_abort_seconds = request->stall_abort_seconds;
+        slot->timing = request->worker_timing;
         slot->cache_mode = request->cache_mode;
         slot->send_low_client_hints = request->send_low_client_hints;
         slot->send_client_hints = request->send_client_hints;
@@ -3378,7 +2701,7 @@ uint64_t fetch_background_transport_enqueue_stream(
 {
     return fetch_background_transport_enqueue_stream_internal(
         url, request, maximum_bytes, timeout_ms, false,
-        FETCH_BACKGROUND_STREAM_CHUNK_TARGET, false, NULL);
+        FETCH_BACKGROUND_STREAM_CHUNK_TARGET, FETCH_BACKGROUND_LANE_ORDINARY, NULL);
 }
 
 uint64_t fetch_background_transport_enqueue_stream_diagnosed(
@@ -3388,7 +2711,7 @@ uint64_t fetch_background_transport_enqueue_stream_diagnosed(
 {
     return fetch_background_transport_enqueue_stream_internal(
         url, request, maximum_bytes, timeout_ms, false,
-        FETCH_BACKGROUND_STREAM_CHUNK_TARGET, false, status);
+        FETCH_BACKGROUND_STREAM_CHUNK_TARGET, FETCH_BACKGROUND_LANE_ORDINARY, status);
 }
 
 uint64_t fetch_background_transport_enqueue_media_stream_diagnosed(
@@ -3398,7 +2721,7 @@ uint64_t fetch_background_transport_enqueue_media_stream_diagnosed(
 {
     return fetch_background_transport_enqueue_stream_internal(
         url, request, maximum_bytes, timeout_ms, false,
-        FETCH_BACKGROUND_STREAM_CHUNK_TARGET, true, status);
+        FETCH_BACKGROUND_STREAM_CHUNK_TARGET, FETCH_BACKGROUND_LANE_MEDIA, status);
 }
 
 uint64_t fetch_background_transport_enqueue_stream_sized(
@@ -3407,7 +2730,7 @@ uint64_t fetch_background_transport_enqueue_stream_sized(
 {
     return fetch_background_transport_enqueue_stream_internal(
         url, request, maximum_bytes, timeout_ms, false,
-        publication_bytes, false, NULL);
+        publication_bytes, FETCH_BACKGROUND_LANE_ORDINARY, NULL);
 }
 
 uint64_t fetch_background_transport_enqueue_media_stream_sized_diagnosed(
@@ -3417,7 +2740,7 @@ uint64_t fetch_background_transport_enqueue_media_stream_sized_diagnosed(
 {
     return fetch_background_transport_enqueue_stream_internal(
         url, request, maximum_bytes, timeout_ms, false,
-        publication_bytes, true, status);
+        publication_bytes, FETCH_BACKGROUND_LANE_MEDIA, status);
 }
 
 uint64_t fetch_background_transport_enqueue_hop_stream(
@@ -3426,7 +2749,17 @@ uint64_t fetch_background_transport_enqueue_hop_stream(
 {
     return fetch_background_transport_enqueue_stream_internal(
         url, request, maximum_bytes, timeout_ms, true,
-        FETCH_BACKGROUND_STREAM_CHUNK_TARGET, false, NULL);
+        FETCH_BACKGROUND_STREAM_CHUNK_TARGET, FETCH_BACKGROUND_LANE_ORDINARY, NULL);
+}
+
+uint64_t fetch_background_transport_enqueue_blocking_hop_stream(
+    const char *url, const FetchRequest *request,
+    size_t maximum_bytes, long timeout_ms)
+{
+    return fetch_background_transport_enqueue_stream_internal(
+        url, request, maximum_bytes, timeout_ms, true,
+        FETCH_BACKGROUND_STREAM_CHUNK_TARGET, FETCH_BACKGROUND_LANE_BLOCKING,
+        NULL);
 }
 
 uint64_t fetch_background_transport_enqueue_media_hop_stream_sized_diagnosed(
@@ -3436,7 +2769,7 @@ uint64_t fetch_background_transport_enqueue_media_hop_stream_sized_diagnosed(
 {
     return fetch_background_transport_enqueue_stream_internal(
         url, request, maximum_bytes, timeout_ms, true,
-        publication_bytes, true, status);
+        publication_bytes, FETCH_BACKGROUND_LANE_MEDIA, status);
 }
 
 bool fetch_background_transport_hop_supported(
@@ -3452,12 +2785,12 @@ bool fetch_background_transport_hop_supported(
 static uint64_t fetch_background_transport_enqueue_fixed_internal(
     const char *url, const FetchRequest *request,
     size_t maximum_bytes, long timeout_ms,
-    bool foreground_media,
+    FetchBackgroundLane lane,
     FetchBackgroundEnqueueStatus *status)
 {
     FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_active(),
         fetch_replay_lane_enqueue(url, request, maximum_bytes, timeout_ms,
-                                  false, false, 0, status));
+                                  false, false, 0, lane, status));
     if (status != NULL) *status = FETCH_BACKGROUND_ENQUEUE_UNAVAILABLE;
     if (!fetch_background.initialized) return 0;
     if (atomic_load_explicit(
@@ -3491,7 +2824,7 @@ static uint64_t fetch_background_transport_enqueue_fixed_internal(
         return 0;
     }
     unsigned slot_limit = fetch_background_admission_slot_limit(
-        foreground_media,
+        lane,
         atomic_load_explicit(
             &fetch_background_media_priority_active,
             memory_order_acquire) != 0);
@@ -3527,6 +2860,7 @@ static uint64_t fetch_background_transport_enqueue_fixed_internal(
         slot->redirect_same_origin_only = false;
         slot->body_enabled = false;
         slot->identity_encoding = false;
+        slot->icy_status_line = request->icy_status_line;
         slot->raw_gzip_encoding = false;
         /* Fixed-size media windows use this enqueue path. Preserve the
            caller's retry policy just as the streaming path does; clearing it
@@ -3535,6 +2869,7 @@ static uint64_t fetch_background_transport_enqueue_fixed_internal(
         slot->force_fresh_connection = request->force_fresh_connection;
         slot->tls12_session_resumption = request->tls12_session_resumption;
         slot->stall_abort_seconds = request->stall_abort_seconds;
+        slot->timing = FETCH_WORKER_TIMING_DEFAULT;
         slot->send_low_client_hints = false;
         slot->send_client_hints = false;
         slot->suppress_high_client_hints = false;
@@ -3564,6 +2899,7 @@ static uint64_t fetch_background_transport_enqueue_fixed_internal(
         slot->content_range[0] = '\0';
         slot->content_type_response[0] = '\0';
         slot->method[0] = '\0';
+        fetch_background_slot_drop_large_fields(slot);
         slot->body[0] = '\0';
         slot->body_length = 0;
         slot->content_type[0] = '\0';
@@ -3610,7 +2946,7 @@ uint64_t fetch_background_transport_enqueue(
     size_t maximum_bytes, long timeout_ms)
 {
     return fetch_background_transport_enqueue_fixed_internal(
-        url, request, maximum_bytes, timeout_ms, false, NULL);
+        url, request, maximum_bytes, timeout_ms, FETCH_BACKGROUND_LANE_ORDINARY, NULL);
 }
 
 uint64_t fetch_background_transport_enqueue_media_diagnosed(
@@ -3619,7 +2955,7 @@ uint64_t fetch_background_transport_enqueue_media_diagnosed(
     FetchBackgroundEnqueueStatus *status)
 {
     return fetch_background_transport_enqueue_fixed_internal(
-        url, request, maximum_bytes, timeout_ms, true, status);
+        url, request, maximum_bytes, timeout_ms, FETCH_BACKGROUND_LANE_MEDIA, status);
 }
 
 bool fetch_background_transport_progress(
@@ -4001,6 +3337,7 @@ bool fetch_background_transport_take_chunk(
 
 static void fetch_background_release_slot(FetchBackgroundSlot *slot)
 {
+    fetch_background_slot_drop_large_fields(slot);
     atomic_store_explicit(
         &slot->state, FETCH_BACKGROUND_SLOT_FREE, memory_order_release);
     (void) sceKernelSetEventFlag(
@@ -4223,6 +3560,7 @@ bool fetch_background_transport_take(
         .reused = result->tls_connection_reused
     };
     fetch_tls_counters_add(&fetch_tls_counters, &handshake);
+    fetch_background_slot_drop_large_fields(slot);
     atomic_store_explicit(
         &slot->state, FETCH_BACKGROUND_SLOT_FREE, memory_order_release);
     (void) sceKernelSetEventFlag(
@@ -4264,14 +3602,17 @@ bool fetch_background_transport_cancel(
         }
     }
     int expected = FETCH_BACKGROUND_SLOT_QUEUED;
-    if (!atomic_compare_exchange_strong_explicit(
-            &slot->state, &expected, FETCH_BACKGROUND_SLOT_FREE,
-            memory_order_acq_rel, memory_order_acquire)) {
+    bool freed = atomic_compare_exchange_strong_explicit(
+        &slot->state, &expected, FETCH_BACKGROUND_SLOT_FREE,
+        memory_order_acq_rel, memory_order_acquire);
+    if (!freed) {
         expected = FETCH_BACKGROUND_SLOT_COMPLETE;
-        (void) atomic_compare_exchange_strong_explicit(
+        freed = atomic_compare_exchange_strong_explicit(
             &slot->state, &expected, FETCH_BACKGROUND_SLOT_FREE,
             memory_order_acq_rel, memory_order_acquire);
     }
+    /* Only this thread claims FREE slots, so the copy is not yet reused. */
+    if (freed) fetch_background_slot_drop_large_fields(slot);
     (void) sceKernelSetEventFlag(
         fetch_background.event, FETCH_BACKGROUND_EVENT_WAKE);
 #if LIBCURL_VERSION_NUM >= 0x074400
@@ -4286,28 +3627,6 @@ void fetch_background_transport_wait(unsigned milliseconds)
     uint64_t delay = (uint64_t) milliseconds * 1000u;
     (void) sceKernelDelayThread(
         delay > UINT_MAX ? UINT_MAX : (SceUInt) delay);
-}
-
-static void fetch_background_websocket_reap_closed(void)
-{
-    if (!fetch_background.initialized) return;
-    for (unsigned i = 0; i < FETCH_WEBSOCKET_LIMIT; i++) {
-        FetchBackgroundWebSocket *socket = &fetch_background.websockets[i];
-        if (atomic_load_explicit(&socket->state, memory_order_acquire)
-                != FETCH_BACKGROUND_WEBSOCKET_CLOSED
-            || atomic_load_explicit(
-                   &socket->event_state, memory_order_acquire)
-                   != FETCH_BACKGROUND_WEBSOCKET_EVENT_EMPTY
-            || atomic_load_explicit(
-                   &socket->close_pending, memory_order_acquire)) continue;
-        budget_free(fetch_background.budget, socket->receive_buffer);
-        budget_free(fetch_background.budget, socket->send_buffer);
-        socket->receive_buffer = NULL;
-        socket->send_buffer = NULL;
-        atomic_store_explicit(
-            &socket->state, FETCH_BACKGROUND_WEBSOCKET_FREE,
-            memory_order_release);
-    }
 }
 
 uint64_t fetch_background_websocket_open(
@@ -4350,273 +3669,9 @@ uint64_t fetch_background_websocket_open(
         || atomic_load_explicit(
                &fetch_background_admission_open, memory_order_acquire) == 0)
         return 0;
-    fetch_background_websocket_reap_closed();
-    for (unsigned i = 0; i < FETCH_WEBSOCKET_LIMIT; i++) {
-        FetchBackgroundWebSocket *socket = &fetch_background.websockets[i];
-        int expected = FETCH_BACKGROUND_WEBSOCKET_FREE;
-        if (!atomic_compare_exchange_strong_explicit(
-                &socket->state, &expected,
-                FETCH_BACKGROUND_WEBSOCKET_PREPARING,
-                memory_order_acq_rel, memory_order_acquire)) continue;
-        unsigned char *receive = budget_malloc_category(
-            budget, BUDGET_CATEGORY_RESOURCE,
-            FETCH_WEBSOCKET_MESSAGE_LIMIT);
-        unsigned char *send = receive == NULL ? NULL : budget_malloc_category(
-            budget, BUDGET_CATEGORY_RESOURCE,
-            FETCH_WEBSOCKET_MESSAGE_LIMIT);
-        if (send == NULL) {
-            budget_free(budget, receive);
-            atomic_store_explicit(
-                &socket->state, FETCH_BACKGROUND_WEBSOCKET_FREE,
-                memory_order_release);
-            return 0;
-        }
-        uint32_t generation = fetch_background_generation_next(
-            atomic_load_explicit(
-                &socket->generation, memory_order_relaxed));
-        socket->receive_buffer = receive;
-        socket->send_buffer = send;
-        socket->receive_length = 0;
-        socket->send_length = 0;
-        socket->send_offset = 0;
-        socket->send_flags = 0;
-        socket->receive_binary = false;
-        socket->receive_started = false;
-        socket->peer_close_received = false;
-        socket->peer_close_had_code = false;
-        socket->close_frame_sent = false;
-        socket->peer_close_code = 1005u;
-        socket->peer_close_reason_length = 0;
-        socket->peer_close_reason[0] = '\0';
-        socket->close_payload = (FetchWebSocketCloseAccumulator) {0};
-        socket->pending_close_reason_length = 0;
-        socket->pending_close_reason[0] = '\0';
-        socket->selected_protocol[0] = '\0';
-        socket->curl_error[0] = '\0';
-        socket->easy = NULL;
-        socket->headers = NULL;
-        socket->in_multi = false;
-        socket->private_network.required = protect_private_network;
-        socket->private_network.blocked = false;
-        snprintf(socket->url, sizeof(socket->url), "%s", admitted_url);
-        snprintf(socket->origin, sizeof(socket->origin), "%s",
-                 request->origin);
-        snprintf(socket->cookie, sizeof(socket->cookie), "%s",
-                 request->cookie == NULL ? "" : request->cookie);
-        snprintf(socket->protocols, sizeof(socket->protocols), "%s",
-                 protocols == NULL ? "" : protocols);
-        snprintf(socket->user_agent, sizeof(socket->user_agent), "%s",
-                 request->user_agent == NULL ? "" : request->user_agent);
-        uint64_t now_us = fetch_background_now_us();
-        uint64_t duration = (uint64_t) timeout_ms * UINT64_C(1000);
-        socket->deadline_us = duration > UINT64_MAX - now_us
-            ? UINT64_MAX : now_us + duration;
-        socket->last_progress_us = now_us;
-        memset(&socket->event, 0, sizeof(socket->event));
-        atomic_store_explicit(
-            &socket->generation, generation, memory_order_release);
-        atomic_store_explicit(
-            &socket->cancel_requested, 0, memory_order_release);
-        atomic_store_explicit(
-            &socket->close_pending, 0, memory_order_release);
-        socket->drain_pending_bytes = 0;
-        atomic_store_explicit(
-            &socket->drain_state, FETCH_BACKGROUND_WEBSOCKET_DRAIN_EMPTY,
-            memory_order_release);
-        atomic_store_explicit(
-            &socket->discard_when_closed, 0, memory_order_release);
-        atomic_store_explicit(
-            &socket->tx_state, FETCH_BACKGROUND_WEBSOCKET_TX_EMPTY,
-            memory_order_release);
-        atomic_store_explicit(
-            &socket->event_state, FETCH_BACKGROUND_WEBSOCKET_EVENT_EMPTY,
-            memory_order_release);
-        atomic_store_explicit(
-            &socket->state, FETCH_BACKGROUND_WEBSOCKET_QUEUED,
-            memory_order_release);
-        (void) sceKernelSetEventFlag(
-            fetch_background.event, FETCH_BACKGROUND_EVENT_WAKE);
-#if LIBCURL_VERSION_NUM >= 0x074400
-        (void) curl_multi_wakeup(fetch_background.multi);
-#endif
-        return fetch_background_websocket_make_id(i, generation);
-    }
-    return 0;
-}
-
-bool fetch_background_websocket_send(
-    uint64_t socket_id, const unsigned char *data, size_t length,
-    bool binary)
-{
-    FetchBackgroundWebSocket *socket =
-        fetch_background_websocket_for_id(socket_id);
-    if (socket == NULL || (length != 0 && data == NULL)
-        || length > FETCH_WEBSOCKET_MESSAGE_LIMIT
-        || atomic_load_explicit(&socket->state, memory_order_acquire)
-               != FETCH_BACKGROUND_WEBSOCKET_OPEN
-        || atomic_load_explicit(&socket->drain_state, memory_order_acquire)
-               != FETCH_BACKGROUND_WEBSOCKET_DRAIN_EMPTY) return false;
-    int expected = FETCH_BACKGROUND_WEBSOCKET_TX_EMPTY;
-    if (!atomic_compare_exchange_strong_explicit(
-            &socket->tx_state, &expected,
-            FETCH_BACKGROUND_WEBSOCKET_TX_PREPARING,
-            memory_order_acq_rel, memory_order_acquire)) return false;
-    if (atomic_load_explicit(&socket->drain_state, memory_order_acquire)
-            != FETCH_BACKGROUND_WEBSOCKET_DRAIN_EMPTY) {
-        atomic_store_explicit(
-            &socket->tx_state, FETCH_BACKGROUND_WEBSOCKET_TX_EMPTY,
-            memory_order_release);
-        return false;
-    }
-    if (length != 0) memcpy(socket->send_buffer, data, length);
-    socket->send_length = length;
-    socket->send_offset = 0;
-    socket->send_flags = binary ? CURLWS_BINARY : CURLWS_TEXT;
-    atomic_store_explicit(
-        &socket->tx_state, FETCH_BACKGROUND_WEBSOCKET_TX_READY,
-        memory_order_release);
-    (void) sceKernelSetEventFlag(
-        fetch_background.event, FETCH_BACKGROUND_EVENT_WAKE);
-#if LIBCURL_VERSION_NUM >= 0x074400
-    (void) curl_multi_wakeup(fetch_background.multi);
-#endif
-    return true;
-}
-
-bool fetch_background_websocket_close(
-    uint64_t socket_id, uint16_t code, const char *reason)
-{
-    FetchBackgroundWebSocket *socket =
-        fetch_background_websocket_for_id(socket_id);
-    size_t reason_length = reason == NULL ? 0u : strlen(reason);
-    int state = socket == NULL ? FETCH_BACKGROUND_WEBSOCKET_FREE
-        : atomic_load_explicit(&socket->state, memory_order_acquire);
-    if (socket == NULL || !fetch_websocket_local_close_code_valid(code)
-        || reason_length > FETCH_WEBSOCKET_CLOSE_REASON_LIMIT
-        || !fetch_websocket_text_payload_valid(
-               (const unsigned char *) reason, reason_length)
-        || (state != FETCH_BACKGROUND_WEBSOCKET_OPEN
-            && state != FETCH_BACKGROUND_WEBSOCKET_QUEUED
-            && state != FETCH_BACKGROUND_WEBSOCKET_HANDSHAKING)) return false;
-    if (state != FETCH_BACKGROUND_WEBSOCKET_OPEN) {
-        atomic_store_explicit(
-            &socket->cancel_requested, 1, memory_order_release);
-    } else {
-        int expected = FETCH_BACKGROUND_WEBSOCKET_TX_EMPTY;
-        if (!atomic_compare_exchange_strong_explicit(
-                &socket->tx_state, &expected,
-                FETCH_BACKGROUND_WEBSOCKET_TX_PREPARING,
-                memory_order_acq_rel, memory_order_acquire)) return false;
-        socket->send_buffer[0] = (unsigned char) (code >> 8u);
-        socket->send_buffer[1] = (unsigned char) code;
-        if (reason_length != 0)
-            memcpy(socket->send_buffer + 2u, reason, reason_length);
-        socket->send_length = reason_length + 2u;
-        socket->send_offset = 0;
-        socket->send_flags = CURLWS_CLOSE;
-        atomic_store_explicit(
-            &socket->tx_state, FETCH_BACKGROUND_WEBSOCKET_TX_READY,
-            memory_order_release);
-    }
-    (void) sceKernelSetEventFlag(
-        fetch_background.event, FETCH_BACKGROUND_EVENT_WAKE);
-#if LIBCURL_VERSION_NUM >= 0x074400
-    (void) curl_multi_wakeup(fetch_background.multi);
-#endif
-    return true;
-}
-
-bool fetch_background_websocket_cancel(uint64_t socket_id)
-{
-    FetchBackgroundWebSocket *socket =
-        fetch_background_websocket_for_id(socket_id);
-    if (socket == NULL) return false;
-    atomic_store_explicit(
-        &socket->discard_when_closed, 1, memory_order_release);
-    atomic_store_explicit(
-        &socket->cancel_requested, 1, memory_order_release);
-    if (atomic_load_explicit(&socket->state, memory_order_acquire)
-            == FETCH_BACKGROUND_WEBSOCKET_CLOSED) {
-        atomic_store_explicit(
-            &socket->close_pending, 0, memory_order_release);
-        atomic_store_explicit(
-            &socket->event_state, FETCH_BACKGROUND_WEBSOCKET_EVENT_EMPTY,
-            memory_order_release);
-        fetch_background_websocket_reap_closed();
-    } else {
-        (void) sceKernelSetEventFlag(
-            fetch_background.event, FETCH_BACKGROUND_EVENT_WAKE);
-#if LIBCURL_VERSION_NUM >= 0x074400
-        (void) curl_multi_wakeup(fetch_background.multi);
-#endif
-    }
-    return true;
-}
-
-bool fetch_background_websocket_abort(uint64_t socket_id)
-{
-    FetchBackgroundWebSocket *socket =
-        fetch_background_websocket_for_id(socket_id);
-    if (socket == NULL) return false;
-    atomic_store_explicit(
-        &socket->cancel_requested, 1, memory_order_release);
-    (void) sceKernelSetEventFlag(
-        fetch_background.event, FETCH_BACKGROUND_EVENT_WAKE);
-#if LIBCURL_VERSION_NUM >= 0x074400
-    (void) curl_multi_wakeup(fetch_background.multi);
-#endif
-    return true;
-}
-
-bool fetch_background_websocket_take_event(
-    uint64_t socket_id, unsigned char *data, size_t capacity,
-    FetchWebSocketEvent *event)
-{
-    FetchBackgroundWebSocket *socket =
-        fetch_background_websocket_for_id(socket_id);
-    if (socket == NULL || event == NULL) return false;
-    int expected = FETCH_BACKGROUND_WEBSOCKET_EVENT_READY;
-    if (!atomic_compare_exchange_strong_explicit(
-            &socket->event_state, &expected,
-            FETCH_BACKGROUND_WEBSOCKET_EVENT_TAKING,
-            memory_order_acq_rel, memory_order_acquire)) return false;
-    *event = socket->event;
-    if ((event->kind == FETCH_WEBSOCKET_EVENT_MESSAGE_TEXT
-         || event->kind == FETCH_WEBSOCKET_EVENT_MESSAGE_BINARY)
-        && (event->length > capacity
-            || (event->length != 0 && data == NULL))) {
-        atomic_store_explicit(
-            &socket->event_state, FETCH_BACKGROUND_WEBSOCKET_EVENT_READY,
-            memory_order_release);
-        return false;
-    }
-    if (event->length != 0)
-        memcpy(data, socket->receive_buffer, event->length);
-    if (event->kind == FETCH_WEBSOCKET_EVENT_MESSAGE_TEXT
-        || event->kind == FETCH_WEBSOCKET_EVENT_MESSAGE_BINARY)
-        socket->receive_length = 0;
-    if (event->kind == FETCH_WEBSOCKET_EVENT_DRAIN) {
-        atomic_store_explicit(
-            &socket->drain_state, FETCH_BACKGROUND_WEBSOCKET_DRAIN_EMPTY,
-            memory_order_release);
-    }
-    atomic_store_explicit(
-        &socket->event_state, FETCH_BACKGROUND_WEBSOCKET_EVENT_EMPTY,
-        memory_order_release);
-    if (atomic_load_explicit(
-            &socket->close_pending, memory_order_acquire)
-        || atomic_load_explicit(
-            &socket->drain_state, memory_order_acquire)
-               == FETCH_BACKGROUND_WEBSOCKET_DRAIN_PENDING) {
-        (void) sceKernelSetEventFlag(
-            fetch_background.event, FETCH_BACKGROUND_EVENT_WAKE);
-#if LIBCURL_VERSION_NUM >= 0x074400
-        (void) curl_multi_wakeup(fetch_background.multi);
-#endif
-    }
-    if (event->kind == FETCH_WEBSOCKET_EVENT_CLOSE)
-        fetch_background_websocket_reap_closed();
-    return true;
+    return fetch_background_websocket_claim(
+        budget, admitted_url, protect_private_network, request->origin,
+        request->cookie, protocols, request->user_agent, timeout_ms);
 }
 
 static bool fetch_background_all_free(void)
@@ -4801,15 +3856,22 @@ bool fetch_background_transport_shutdown(unsigned timeout_ms)
 #endif
     (void) sceKernelDeleteThread(fetch_background.thread);
     (void) sceKernelDeleteEventFlag(fetch_background.event);
+    /* Open sockets keep their connect-only handle in the multi for their
+       whole life (removing it closes the connection); detach them before
+       the multi goes away. */
+    for (unsigned i = 0; i < FETCH_WEBSOCKET_LIMIT; i++) {
+        fetch_background_websocket_release_curl(
+            &fetch_background.websockets[i], true);
+    }
     (void) curl_multi_cleanup(fetch_background.multi);
     Budget *budget = fetch_background.budget;
+    for (unsigned i = 0; i < FETCH_BACKGROUND_REQUEST_LIMIT; i++)
+        fetch_background_slot_drop_large_fields(&fetch_background.slots[i]);
     for (unsigned i = 0; i < FETCH_BACKGROUND_STREAM_ACTIVE_LIMIT; i++)
         budget_free(budget, fetch_background.stream_buffers[i]);
     for (unsigned i = 0; i < FETCH_BACKGROUND_ACTIVE_LIMIT; i++)
         budget_free(budget, fetch_background.fixed_buffers[i]);
     for (unsigned i = 0; i < FETCH_WEBSOCKET_LIMIT; i++) {
-        fetch_background_websocket_release_curl(
-            &fetch_background.websockets[i], false);
         budget_free(budget, fetch_background.websockets[i].receive_buffer);
         budget_free(budget, fetch_background.websockets[i].send_buffer);
     }
@@ -4870,7 +3932,7 @@ uint64_t fetch_background_transport_enqueue(
 {
     FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_active(),
         fetch_replay_lane_enqueue(url, request, maximum_bytes, timeout_ms,
-                                  false, false, 0, NULL));
+                                  false, false, 0, FETCH_BACKGROUND_LANE_ORDINARY, NULL));
     (void) url; (void) request; (void) maximum_bytes; (void) timeout_ms;
     return 0;
 }
@@ -4880,7 +3942,7 @@ uint64_t fetch_background_transport_enqueue_stream(
 {
     FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_active(),
         fetch_replay_lane_enqueue(url, request, maximum_bytes, timeout_ms,
-                                  true, false, 0, NULL));
+                                  true, false, 0, FETCH_BACKGROUND_LANE_ORDINARY, NULL));
     (void) url; (void) request; (void) maximum_bytes; (void) timeout_ms;
     return 0;
 }
@@ -4891,7 +3953,7 @@ uint64_t fetch_background_transport_enqueue_stream_diagnosed(
 {
     FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_active(),
         fetch_replay_lane_enqueue(url, request, maximum_bytes, timeout_ms,
-                                  true, false, 0, status));
+                                  true, false, 0, FETCH_BACKGROUND_LANE_ORDINARY, status));
     (void) url; (void) request; (void) maximum_bytes; (void) timeout_ms;
     if (status != NULL) *status = FETCH_BACKGROUND_ENQUEUE_UNAVAILABLE;
     return 0;
@@ -4903,7 +3965,7 @@ uint64_t fetch_background_transport_enqueue_media_stream_diagnosed(
 {
     FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_active(),
         fetch_replay_lane_enqueue(url, request, maximum_bytes, timeout_ms,
-                                  true, false, 0, status));
+                                  true, false, 0, FETCH_BACKGROUND_LANE_MEDIA, status));
     (void) url; (void) request; (void) maximum_bytes; (void) timeout_ms;
     if (status != NULL) *status = FETCH_BACKGROUND_ENQUEUE_UNAVAILABLE;
     return 0;
@@ -4914,7 +3976,7 @@ uint64_t fetch_background_transport_enqueue_stream_sized(
 {
     FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_active(),
         fetch_replay_lane_enqueue(url, request, maximum_bytes, timeout_ms,
-                                  true, false, publication_bytes, NULL));
+                                  true, false, publication_bytes, FETCH_BACKGROUND_LANE_ORDINARY, NULL));
     (void) url; (void) request; (void) maximum_bytes; (void) timeout_ms;
     (void) publication_bytes;
     return 0;
@@ -4926,7 +3988,7 @@ uint64_t fetch_background_transport_enqueue_media_stream_sized_diagnosed(
 {
     FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_active(),
         fetch_replay_lane_enqueue(url, request, maximum_bytes, timeout_ms,
-                                  true, false, publication_bytes, status));
+                                  true, false, publication_bytes, FETCH_BACKGROUND_LANE_MEDIA, status));
     (void) url; (void) request; (void) maximum_bytes; (void) timeout_ms;
     (void) publication_bytes;
     if (status != NULL) *status = FETCH_BACKGROUND_ENQUEUE_UNAVAILABLE;
@@ -4939,7 +4001,7 @@ uint64_t fetch_background_transport_enqueue_media_diagnosed(
 {
     FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_active(),
         fetch_replay_lane_enqueue(url, request, maximum_bytes, timeout_ms,
-                                  false, false, 0, status));
+                                  false, false, 0, FETCH_BACKGROUND_LANE_MEDIA, status));
     (void) url; (void) request; (void) maximum_bytes; (void) timeout_ms;
     if (status != NULL) *status = FETCH_BACKGROUND_ENQUEUE_UNAVAILABLE;
     return 0;
@@ -4950,7 +4012,18 @@ uint64_t fetch_background_transport_enqueue_hop_stream(
 {
     FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_active(),
         fetch_replay_lane_enqueue(url, request, maximum_bytes, timeout_ms,
-                                  true, true, 0, NULL));
+                                  true, true, 0, FETCH_BACKGROUND_LANE_ORDINARY, NULL));
+    (void) url; (void) request; (void) maximum_bytes; (void) timeout_ms;
+    return 0;
+}
+uint64_t fetch_background_transport_enqueue_blocking_hop_stream(
+    const char *url, const FetchRequest *request,
+    size_t maximum_bytes, long timeout_ms)
+{
+    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_active(),
+        fetch_replay_lane_enqueue(url, request, maximum_bytes, timeout_ms,
+                                  true, true, 0,
+                                  FETCH_BACKGROUND_LANE_BLOCKING, NULL));
     (void) url; (void) request; (void) maximum_bytes; (void) timeout_ms;
     return 0;
 }
@@ -4961,7 +4034,7 @@ uint64_t fetch_background_transport_enqueue_media_hop_stream_sized_diagnosed(
 {
     FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_active(),
         fetch_replay_lane_enqueue(url, request, maximum_bytes, timeout_ms,
-                                  true, true, publication_bytes, status));
+                                  true, true, publication_bytes, FETCH_BACKGROUND_LANE_MEDIA, status));
     (void) url; (void) request; (void) maximum_bytes; (void) timeout_ms;
     (void) publication_bytes;
     if (status != NULL) *status = FETCH_BACKGROUND_ENQUEUE_UNAVAILABLE;

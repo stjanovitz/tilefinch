@@ -9,7 +9,11 @@
 
 #define YOUTUBE_SUBTITLE_WIRE_LIMIT (4u * 1024u * 1024u)
 #define YOUTUBE_SUBTITLE_CUE_LIMIT 2048u
-#define YOUTUBE_SUBTITLE_TEXT_CAPACITY 160u
+/* A cue's visible text, in bytes with its terminator: the player's caption
+   buffer (PSP_UI_MEDIA_SUBTITLE_TEXT_CAPACITY), enough for two rows of a
+   script at two or three bytes per letter. Longer text is cut on a
+   character boundary. */
+#define YOUTUBE_SUBTITLE_TEXT_CAPACITY 256u
 #define YOUTUBE_SUBTITLE_TEXT_POOL_LIMIT (128u * 1024u)
 
 typedef struct YoutubeSubtitleDocument YoutubeSubtitleDocument;
@@ -24,6 +28,10 @@ YoutubeSubtitleBuilder *youtube_subtitles_builder_create(
 bool youtube_subtitles_builder_feed(
     YoutubeSubtitleBuilder *builder, const unsigned char *bytes,
     size_t length);
+/* True once the cue or text-pool bound refused a cue. No later cue is
+   kept after that (the window ends at the last cue before the refusal), so
+   the caller can stop the transfer and finish the builder. */
+bool youtube_subtitles_builder_full(const YoutubeSubtitleBuilder *builder);
 YoutubeSubtitleDocument *youtube_subtitles_builder_finish(
     YoutubeSubtitleBuilder *builder);
 void youtube_subtitles_builder_destroy(YoutubeSubtitleBuilder *builder);

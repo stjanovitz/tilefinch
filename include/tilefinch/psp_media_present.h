@@ -481,19 +481,47 @@ PspMediaPresentDmaJoin psp_media_present_ge_stage_dma_join(void);
  * and that event can only mean the abandoned one finished -- which is what
  * makes an opportunistic poll a proof rather than a guess.
  *
- * A transfer that is never observed to finish has no safe continuation at
- * all, so `expired` reports the outer deadline and the caller ends the
- * session through its ordinary failure surface. Failing a video is a cost;
- * displaying one picture's identity over another's pixels is a defect.
+ * A transfer that is not observed to finish within the outer deadline is
+ * ABANDONED: the step reports EXPIRED once, and the caller ends the session
+ * that posted it through its ordinary failure surface. Failing a video is a
+ * cost; displaying one picture's identity over another's pixels is a defect.
+ * From then on the source slot is no longer refused -- whatever the
+ * transfer reads can only reach the staging buffer -- but the staging buffer
+ * stays refused until the transfer is seen to end, however late, so nothing
+ * ever samples or stages into memory it may still write. Later sessions draw
+ * unstaged meanwhile; they are not failed.
  */
+typedef enum {
+    PSP_MEDIA_DMA_QUARANTINE_CLEAR = 0,
+    PSP_MEDIA_DMA_QUARANTINE_LIVE,
+    PSP_MEDIA_DMA_QUARANTINE_ABANDONED
+} PspMediaDmaQuarantineState;
+typedef enum {
+    /* Nothing for the session to do. */
+    PSP_MEDIA_DMA_QUARANTINE_STEP_IDLE = 0,
+    /* Live, not yet seen to end, deadline not reached. */
+    PSP_MEDIA_DMA_QUARANTINE_STEP_WAITING,
+    /* The live transfer was seen to end: the slot it read is owed a release. */
+    PSP_MEDIA_DMA_QUARANTINE_STEP_COMPLETED,
+    /* The deadline passed; reported once, on the move to ABANDONED. */
+    PSP_MEDIA_DMA_QUARANTINE_STEP_EXPIRED
+} PspMediaDmaQuarantineStep;
+/* The pure transition the presenter applies each frame (host-tested). */
+PspMediaDmaQuarantineStep psp_media_present_dma_quarantine_step(
+    PspMediaDmaQuarantineState *state, bool completion_seen,
+    uint32_t held_us, uint32_t deadline_us);
+bool psp_media_present_dma_quarantine_refuses_slot(
+    PspMediaDmaQuarantineState state);
+bool psp_media_present_dma_quarantine_refuses_staging(
+    PspMediaDmaQuarantineState state);
+/* True while a transfer nobody joined is outstanding (LIVE or ABANDONED). */
 bool psp_media_present_ge_stage_dma_quarantined(void);
 bool psp_media_present_ge_stage_dma_quarantine_holds(int slot);
 bool psp_media_present_ge_stage_dma_quarantine_holds_staging(
     const void *destination);
-/* True the once, on the frame the abandoned transfer is finally seen to have
-   completed. Poll from anywhere on the interactive thread. */
-bool psp_media_present_ge_stage_dma_quarantine_poll(void);
-bool psp_media_present_ge_stage_dma_quarantine_expired(void);
+/* Poll the outstanding transfer once (never wait) and apply the step above.
+   Call from the interactive thread, once per frame. */
+PspMediaDmaQuarantineStep psp_media_present_ge_stage_dma_quarantine_step(void);
 /*
  * Repeat the last posted copy on the calling thread, for a join that failed.
  * The same bytes from the same source to the same destination, so a stalled

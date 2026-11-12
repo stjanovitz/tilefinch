@@ -13,6 +13,9 @@
 
 #define INSTALL_IO_CHUNK (16u * 1024u)
 #define INSTALL_REMOVE_ENTRY_LIMIT 256u
+/* remove_tree_bounded deletes up to INSTALL_REMOVE_ENTRY_LIMIT entries per
+   call, so a larger stale tree shrinks with each round. */
+#define INSTALL_REMOVE_ROUNDS 16u
 #define INSTALL_REMOVE_DEPTH_LIMIT 8u
 #define INSTALL_FREE_SPACE_MARGIN (4u * 1024u * 1024u)
 
@@ -29,6 +32,7 @@ struct TilefinchUpdateInstallJob {
     TilefinchUpdateManifest manifest;
     uint8_t manifest_digest[32];
     TilefinchUpdateSlot inactive_slot;
+    TilefinchUpdateSlot running_slot;
     TilefinchUpdateTrust trust;
     bool allow_downgrade;
     TilefinchUpdateState state;
@@ -152,6 +156,66 @@ static bool remove_tree_bounded(
     return ok && rmdir(path) == 0;
 }
 
+/* Removes a stale tree in bounded rounds. True when PATH no longer exists. */
+static bool remove_tree_rounds(const char *path)
+{
+    for (unsigned round = 0; round < INSTALL_REMOVE_ROUNDS; round++) {
+        size_t entries = 0;
+        if (remove_tree_bounded(path, 0, &entries)) return true;
+        /* No progress: a symlink, special file or a refused removal. */
+        if (entries == 0) return false;
+    }
+    return false;
+}
+
+static bool install_slot_paths(
+    const char *install_root, TilefinchUpdateSlot slot,
+    char target[768], char temporary[768], char old[768])
+{
+    const char *name = slot == TILEFINCH_UPDATE_SLOT_A ? "slot-a"
+        : slot == TILEFINCH_UPDATE_SLOT_B ? "slot-b" : NULL;
+    if (install_root == NULL || name == NULL
+        || !install_path(target, 768, install_root, name)) return false;
+    int length = snprintf(temporary, 768, "%s.tmp", target);
+    int old_length = snprintf(old, 768, "%s.old", target);
+    return length > 0 && (size_t) length < 768
+        && old_length > 0 && (size_t) old_length < 768;
+}
+
+bool tilefinch_update_install_clear_staging(
+    const char *install_root, TilefinchUpdateSlot slot)
+{
+    char target[768], temporary[768], old[768];
+    if (!install_slot_paths(install_root, slot, target, temporary, old))
+        return false;
+    bool temporary_clear = remove_tree_rounds(temporary);
+    return remove_tree_rounds(old) && temporary_clear;
+}
+
+/* The journal on the card is the only authority on which slot is active.
+   The job captured it when it was created; another writer (the browser's
+   trial-health confirmation, the launcher of a different boot) may have
+   advanced it since. Every step that deletes or renames a slot tree first
+   re-reads it and stops unless it is still exactly the captured state. */
+static bool install_journal_unchanged(const TilefinchUpdateInstallJob *job)
+{
+    TilefinchUpdateState on_disk;
+    if (!tilefinch_update_journal_load(job->data_dir, &on_disk, NULL)) {
+        /* No readable journal: only the fresh-install default the caller
+           derived from the running slot may proceed (update_journal.c then
+           writes the first copy). */
+        return job->state.generation <= 1u
+            && job->state.trial == TILEFINCH_UPDATE_TRIAL_NONE;
+    }
+    uint8_t expected[TILEFINCH_UPDATE_STATE_BYTES];
+    uint8_t actual[TILEFINCH_UPDATE_STATE_BYTES];
+    return tilefinch_update_state_encode(&job->state, expected)
+               == TILEFINCH_UPDATE_OK
+        && tilefinch_update_state_encode(&on_disk, actual)
+               == TILEFINCH_UPDATE_OK
+        && memcmp(expected, actual, sizeof(expected)) == 0;
+}
+
 static bool install_make_parents(char *path)
 {
     for (char *at = path; *at != '\0'; at++) {
@@ -192,6 +256,7 @@ TilefinchUpdateInstallJob *tilefinch_update_install_create(
         || (options->inactive_slot != TILEFINCH_UPDATE_SLOT_A
             && options->inactive_slot != TILEFINCH_UPDATE_SLOT_B)
         || options->inactive_slot == options->current_state.active_slot
+        || options->inactive_slot == options->running_slot
         || options->trust > TILEFINCH_UPDATE_TRUST_DEVELOPER_UNSIGNED
         || (options->allow_downgrade
             && (options->trust != TILEFINCH_UPDATE_TRUST_SIGNED
@@ -238,6 +303,7 @@ TilefinchUpdateInstallJob *tilefinch_update_install_create(
     job->allow_downgrade = options->allow_downgrade;
     job->prepare_startup = options->prepare_startup;
     job->state = options->current_state;
+    job->running_slot = options->running_slot;
     job->fault = options->fault;
     job->fault_opaque = options->fault_opaque;
     if (have_download_proof) {
@@ -255,22 +321,9 @@ TilefinchUpdateInstallJob *tilefinch_update_install_create(
     snprintf(job->install_root, sizeof(job->install_root), "%s",
              options->install_root);
     snprintf(job->data_dir, sizeof(job->data_dir), "%s", options->data_dir);
-    const char *slot = options->inactive_slot == TILEFINCH_UPDATE_SLOT_A
-        ? "slot-a" : "slot-b";
-    if (!install_path(
-            job->target_path, sizeof(job->target_path),
-            job->install_root, slot)) {
-        tilefinch_update_install_destroy(job);
-        return NULL;
-    }
-    int length = snprintf(
-        job->temporary_path, sizeof(job->temporary_path),
-        "%s.tmp", job->target_path);
-    int old_length = snprintf(
-        job->old_path, sizeof(job->old_path), "%s.old", job->target_path);
-    if (length <= 0 || (size_t) length >= sizeof(job->temporary_path)
-        || old_length <= 0
-        || (size_t) old_length >= sizeof(job->old_path)) {
+    if (!install_slot_paths(
+            job->install_root, options->inactive_slot, job->target_path,
+            job->temporary_path, job->old_path)) {
         tilefinch_update_install_destroy(job);
         return NULL;
     }
@@ -354,18 +407,20 @@ static bool install_prepare(TilefinchUpdateInstallJob *job)
             > UINT64_MAX - INSTALL_FREE_SPACE_MARGIN
         ? UINT64_MAX
         : job->manifest.package_size + INSTALL_FREE_SPACE_MARGIN;
+    if (!install_journal_unchanged(job)) {
+        job->status = TILEFINCH_UPDATE_INVALID_ARGUMENT;
+        return false;
+    }
     if (!install_has_free_space(job->install_root, required)) {
         job->status = TILEFINCH_UPDATE_NO_SPACE;
         return false;
     }
-    size_t entries = 0;
+    /* remove_tree_bounded already treats a missing tree as removed; errno
+       after a failure is whatever its last call left, so it is not read. */
     if (install_fault(job, "before-remove-temporary")) return false;
-    if (!remove_tree_bounded(job->temporary_path, 0, &entries)
-        && errno != ENOENT) return false;
-    entries = 0;
+    if (!remove_tree_rounds(job->temporary_path)) return false;
     if (install_fault(job, "before-remove-old")) return false;
-    if (!remove_tree_bounded(job->old_path, 0, &entries)
-        && errno != ENOENT) return false;
+    if (!remove_tree_rounds(job->old_path)) return false;
     if (install_fault(job, "before-create-temporary")) return false;
     return mkdir(job->temporary_path, 0777) == 0;
 }
@@ -460,6 +515,39 @@ static bool install_write_metadata(TilefinchUpdateInstallJob *job)
 
 static bool install_promote(TilefinchUpdateInstallJob *job)
 {
+    if (!install_journal_unchanged(job)) {
+        job->status = TILEFINCH_UPDATE_INVALID_ARGUMENT;
+        return false;
+    }
+    /* The target slot is about to stop holding what the journal says it
+       holds. While it is labelled the previous (known-good) build or a
+       staged candidate, first commit a record that names neither: a power
+       cut at any later step then leaves a journal that never sends safe
+       start or a trial into a half-replaced or untrialled slot. */
+    if (job->state.previous_slot == job->inactive_slot
+        || job->state.pending_slot == job->inactive_slot) {
+        TilefinchUpdateState retiring = job->state;
+        if (retiring.generation == UINT64_MAX) return false;
+        retiring.generation++;
+        if (retiring.previous_slot == job->inactive_slot) {
+            retiring.previous_slot = TILEFINCH_UPDATE_SLOT_NONE;
+            retiring.previous_sequence = 0;
+            memset(retiring.previous_sha256, 0, 32);
+        }
+        if (retiring.pending_slot == job->inactive_slot) {
+            retiring.pending_slot = TILEFINCH_UPDATE_SLOT_NONE;
+            retiring.trial = TILEFINCH_UPDATE_TRIAL_NONE;
+            retiring.candidate_sequence = 0;
+            memset(retiring.candidate_sha256, 0, 32);
+            retiring.candidate_downgrade = false;
+        }
+        if (install_fault(job, "before-write-retiring-journal")
+            || !tilefinch_update_journal_store(
+                   job->data_dir, &retiring, job->fault, job->fault_opaque))
+            return false;
+        job->state = retiring;
+        if (install_fault(job, "after-write-retiring-journal")) return false;
+    }
     if (install_fault(job, "before-retire-inactive-slot")) return false;
     bool had_target = rename(job->target_path, job->old_path) == 0;
     if (!had_target && errno != ENOENT) return false;
@@ -492,8 +580,7 @@ static bool install_promote(TilefinchUpdateInstallJob *job)
         return false;
     job->state = pending;
     if (install_fault(job, "after-write-pending-journal")) return false;
-    size_t entries = 0;
-    (void) remove_tree_bounded(job->old_path, 0, &entries);
+    (void) remove_tree_rounds(job->old_path);
     return true;
 }
 
@@ -547,6 +634,12 @@ bool tilefinch_update_install_pump(
     }
     if (job->phase == TILEFINCH_UPDATE_INSTALL_PREPARING) {
         if (!install_prepare(job)) {
+            if (job->status == TILEFINCH_UPDATE_INVALID_ARGUMENT) {
+                /* A fresh session re-reads the journal; this one may not. */
+                install_error(job, TILEFINCH_UPDATE_INVALID_ARGUMENT,
+                              "RESTART TO UPDATE");
+                return true;
+            }
             install_error(
                 job,
                 job->status == TILEFINCH_UPDATE_NO_SPACE
@@ -618,8 +711,12 @@ bool tilefinch_update_install_pump(
     }
     if (job->phase == TILEFINCH_UPDATE_INSTALL_PROMOTING) {
         if (!install_promote(job)) {
-            install_error(job, TILEFINCH_UPDATE_IO,
-                          "UPDATE COULD NOT BE ACTIVATED");
+            if (job->status == TILEFINCH_UPDATE_INVALID_ARGUMENT)
+                install_error(job, TILEFINCH_UPDATE_INVALID_ARGUMENT,
+                              "RESTART TO UPDATE");
+            else
+                install_error(job, TILEFINCH_UPDATE_IO,
+                              "UPDATE COULD NOT BE ACTIVATED");
             return true;
         }
         /* No readers remain after durable promotion. Reclaim the download

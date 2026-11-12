@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "tilefinch/page_dialog.h"
 #include "tilefinch/budget.h"
 #include "tilefinch/document.h"
 #include "tilefinch/gamepad.h"
@@ -166,6 +167,8 @@ typedef struct {
     size_t dom_handle_exhaustions;
     size_t dom_handle_wrapper_releases;
     size_t dom_handle_connected_preserves;
+    /* Most wrappers one collection held for their expandos or weak-key use. */
+    size_t dom_handle_wrappers_held_peak;
     size_t dom_handle_stale_releases;
     /* Current slot-table size, and how often it grew or was refused
        growth by the Budget (see ScriptExecutionPolicy). */
@@ -229,8 +232,16 @@ typedef struct {
     size_t dynamic_scripts_ordered_waits;
     size_t dynamic_scripts_peak_pending;
     size_t dynamic_scripts_nomodule_skipped;
+    /* Nodes walked to put the scripts an insertion made ready in tree
+       order; the script-state table rules out most insertions unwalked. */
+    size_t dynamic_script_scan_nodes;
+    /* document.getElementById calls the id memo could not answer, each a
+       walk of the document. */
+    size_t element_id_walks;
     size_t dynamic_script_bytes;
     size_t dynamic_scripts_quota_rejected;
+    /* Script-inserted scripts refused by Subresource Integrity. */
+    size_t dynamic_scripts_integrity_rejected;
     /* Host-lab census of cloned script elements (always zero on the PSP):
        clones of started and of not-started scripts, started clones later
        inserted into the document (whose execution the copied "already
@@ -616,6 +627,44 @@ bool script_runtime_webgl_cache_admit(
     int64_t canvas_handle,
     bool *reset);
 
+/* Placement of the PSP GE texture cache in its EDRAM window, host-testable.
+   Textures a frame still uses stay where they are; a new texture takes a
+   free gap, evicting the least recently used entries the frame does not
+   use until one fits. Only when no such eviction makes room (the frame's
+   own textures fragment the window) is the cache emptied and the frame's
+   textures packed from offset zero. Bytes are the padded upload size. */
+#define SCRIPT_WEBGL_TEXTURE_CACHE_ENTRY_LIMIT 8u
+
+typedef struct {
+    uint32_t identifier;
+    uint32_t generation;
+    int width;
+    int height;
+    size_t bytes;
+} ScriptWebglTextureKey;
+
+typedef struct {
+    ScriptWebglTextureKey key;
+    size_t offset;
+    uint32_t last_used;
+    bool valid;
+} ScriptWebglTextureCacheEntry;
+
+typedef struct {
+    ScriptWebglTextureCacheEntry
+        entries[SCRIPT_WEBGL_TEXTURE_CACHE_ENTRY_LIMIT];
+    uint32_t clock;
+} ScriptWebglTextureCache;
+
+/* On success, slots[i] is the entry holding textures[i] and upload[i] says
+   it must be written there this frame; *reset reports the full repack.
+   False (cache emptied) when the frame's textures cannot fit together or
+   count exceeds the entry limit. */
+bool script_runtime_webgl_texture_cache_place(
+    ScriptWebglTextureCache *cache, size_t capacity,
+    const ScriptWebglTextureKey *textures, size_t count,
+    size_t slots[], bool upload[], bool *reset);
+
 /* Four exact, Budget-backed translated-geometry entries cover the common
    static/dynamic/instanced/HUD split without the pathological short LRU cycle
    in which every draw evicts the one needed next frame. The byte ceiling is
@@ -701,11 +750,13 @@ typedef struct {
 /* Hydrated acceptance pages can commit just over 64 distinct connected-node
    changes in one author turn after detached-tree coalescing, and
    chatgpt.com's conversation view swaps in 247 in one turn after a send.
-   An overflowed journal resets layout reuse (every style re-resolves, 90%
-   of them to the same values) and re-derives the image table. 256 records
-   are 21,504 bytes per active realm on the PSP (84 each), 10,752 more
-   than 128 (0.04% of the realistic 24 MiB engine ceiling). */
-#define SCRIPT_MUTATION_JOURNAL_LIMIT 256u
+   Component pages commit up to about 600 in one batch of promise jobs,
+   and each of those overflows cost a full style and image rebuild on the
+   page's largest documents. An overflowed journal resets layout reuse (every
+   style re-resolves, 90% of them to the same values) and re-derives the image
+   table. 640 records are 53,760 bytes per active realm on the PSP (84 each),
+   and as much of the owner's stack while one is consumed. */
+#define SCRIPT_MUTATION_JOURNAL_LIMIT 640u
 #define SCRIPT_MUTATION_ATTRIBUTE_LIMIT 32u
 /* Changed class/id tokens are kept in one pool per journal. StyleX pages
    (chatgpt.com) swap 10-56 atomic classes per class write, so a small
@@ -771,6 +822,9 @@ typedef struct {
     /* The removal that set `scope` took the child from after every element
        sibling: the siblings left kept their positions from the start. */
     bool removed_last;
+    /* An inline style write of only box geometry: which images and SVG rasters
+       below this element exist and what they draw is as it was. */
+    bool keeps_images;
     /* For tree and text changes the bridge probed while the change was
        visible (stylesheet_tree_change_has_entries): which :has() entries
        of the journal's plan build (`has_serial`) the writes coalesced here
@@ -809,6 +863,9 @@ typedef struct {
     bool retirement_unobserved;
     bool image_resource_scan_required;
     bool image_resource_refresh_required;
+    /* Some selector or ancestor may now show an image the records don't name:
+       the next layout says which. */
+    bool image_reveal_possible;
     bool conservative_resource_scan;
     bool relational_selector_sensitive;
 } ScriptMutationJournal;
@@ -909,6 +966,9 @@ void script_runtime_clear_execution_limit(ScriptRuntime *runtime);
    media bridge at the same bound avoids carrying an extra 2 KiB in every
    ScriptMediaRequest stack object for a URL no downstream player can use. */
 #define SCRIPT_MEDIA_SOURCE_CAPACITY 2048
+/* The element's title attribute, the player's name for audio when the
+   stream names nothing better. Longer titles are cut. */
+#define SCRIPT_MEDIA_TITLE_CAPACITY 96
 
 typedef enum {
     SCRIPT_MEDIA_COMMAND_LOAD = 0,
@@ -925,6 +985,7 @@ typedef struct {
     TilefinchRequestMode mode;
     TilefinchCredentialsMode credentials;
     char source[SCRIPT_MEDIA_SOURCE_CAPACITY];
+    char title[SCRIPT_MEDIA_TITLE_CAPACITY];
 } ScriptMediaRequest;
 
 typedef enum {
@@ -1306,6 +1367,21 @@ size_t script_runtime_heap_available(const ScriptRuntime *runtime);
    which scripts a page admits as it was, and the room it frees goes to
    the scripts the page already runs. */
 size_t script_runtime_heap_admission_available(const ScriptRuntime *runtime);
+/* The heap a compile could actually reach after `budget_taken_first` more
+   bytes of the page Budget are taken (a source copy made before it), with
+   stored function text counted as in the heap, once (the store's own
+   Budget bytes are already out of the free Budget). Unlike
+   script_runtime_heap_available it follows js_rt_heap_growth_hook's
+   arithmetic: headroom under the current limit is reachable only as far
+   as the Budget backs it, and growth only from Budget beyond the growth
+   reserve and that headroom. Script admission (inline, external and
+   module scripts, module imports) decides on it. */
+size_t script_runtime_heap_reachable(const ScriptRuntime *runtime,
+                                     size_t budget_taken_first);
+/* The same with nothing taken first and stored function text not counted:
+   the heap an allocation could actually obtain now. Dynamic-script
+   admission decides on it (it never counted that text). */
+size_t script_runtime_heap_obtainable(const ScriptRuntime *runtime);
 /* Whether a script error's text is what QuickJS leaves when an allocation
    was refused: "InternalError: out of memory", or "null" when even that
    error object could not be allocated (JS_ThrowOutOfMemory). A page can
@@ -1673,6 +1749,10 @@ bool script_runtime_set_frame_window_state(ScriptRuntime *runtime,
                                            const char *committed_url,
                                            bool document_committed,
                                            ScriptResult *result);
+/* Adopts a committed child document's CSP eval decision for the parent-side
+   realm behind that frame's contentWindow. Native only: no script can ask. */
+void script_runtime_set_frame_dynamic_code(ScriptRuntime *runtime,
+                                           long frame_handle, bool allowed);
 void script_runtime_report_memory(ScriptRuntime *runtime, FILE *output);
 /* Emits one fixed-size phase/realm census without evaluating author code or
    forcing collection. Suitable for high-water and pre-teardown PSP logging. */
@@ -1874,6 +1954,22 @@ bool script_runtime_dispatch_pointer_node(
    the synchronous event callback. Embedders notify ancestor runtimes for a
    trusted child-frame input before dispatching the event. */
 void script_runtime_notify_user_activation(ScriptRuntime *runtime);
+/* window.alert/confirm/prompt (tilefinch/page_dialog.h). A child-frame realm
+   refuses every dialog until navigation names the PARENT realm whose page
+   load it belongs to, which it does only for a frame that
+   page_dialog_frame_allowed() admits; NULL withdraws it. */
+void script_runtime_set_dialog_parent(ScriptRuntime *child,
+                                      ScriptRuntime *parent);
+/* True for a top-level document realm, or a frame realm whose parent chain
+   reaches one. */
+bool script_runtime_dialogs_allowed(ScriptRuntime *runtime);
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+/* Test seam: the policy state that decides RUNTIME's dialogs (its
+   top-level realm's); false, with the realm's own refusal counts, for a
+   refused frame. Not in the shipping PSP build. */
+bool script_runtime_page_dialog_policy(ScriptRuntime *runtime,
+                                       PageDialogPolicy *policy);
+#endif
 bool script_runtime_dispatch_input_node(ScriptRuntime *runtime,
                                         lxb_dom_node_t *node,
                                         const char *event_type,
@@ -1999,6 +2095,9 @@ bool script_runtime_consume_relayout(ScriptRuntime *runtime);
 bool script_runtime_take_refresh_meta_mutation(ScriptRuntime *runtime);
 /* Read-only admission check for rollback-safe optional layout work. */
 bool script_runtime_has_pending_mutations(const ScriptRuntime *runtime);
+/* What the next relayout will consume, for its owner to look at. */
+const ScriptMutationJournal *script_runtime_pending_journal(
+    const ScriptRuntime *runtime);
 /* Resource-completion callbacks can enqueue another resource pass after
    the current layout was built; attachment must not consume that work. */
 bool script_runtime_has_pending_resource_mutations(const ScriptRuntime *runtime);
@@ -2029,14 +2128,19 @@ bool script_runtime_update_media_state(
     ScriptRuntime *runtime, int64_t node_handle, ScriptMediaState state,
     double current_time, double duration);
 /* The url-encoded entry list page script's last form submission sends,
-   after `formdata` listeners ran, in a budget allocation the caller frees;
-   false when there is none, the form is multipart, or it exceeds
-   maximum_length. Clears it. */
-bool script_runtime_take_form_submission_body(ScriptRuntime *runtime,
-                                              Budget *budget,
-                                              size_t maximum_length,
-                                              char **output,
-                                              size_t *length);
+   after `formdata` listeners ran, in a budget allocation the caller frees.
+   NONE when script built none (a multipart form, or building it failed).
+   REFUSED when it exists but cannot be held (over maximum_length, or out of
+   memory): the caller must not fall back to native control state, which
+   holds the stale markup values script replaced. Clears it. */
+typedef enum {
+    SCRIPT_FORM_BODY_NONE = 0,
+    SCRIPT_FORM_BODY_TAKEN,
+    SCRIPT_FORM_BODY_REFUSED
+} ScriptFormBodyTake;
+ScriptFormBodyTake script_runtime_take_form_submission_body(
+    ScriptRuntime *runtime, Budget *budget, size_t maximum_length,
+    char **output, size_t *length);
 /* Consumes the successful default action of form.submit()/requestSubmit().
    The returned nodes belong to the current document and remain valid only
    until the caller starts another navigation. */
@@ -2101,9 +2205,13 @@ bool script_runtime_flush_geometry_layout(ScriptRuntime *runtime,
 typedef LayoutReuseCache *(*ScriptGeometryReuseCallback)(
     void *opaque, const ScriptMutationJournal *mutations,
     bool *geometry_unchanged);
+/* The budget refused a build using the lent cache. The owner gives the cache
+   up so the build can run once more without it. May be NULL. */
+typedef void (*ScriptGeometryReuseRelease)(void *opaque);
 bool script_runtime_flush_geometry_layout_reuse(
     ScriptRuntime *runtime, const ViewportContext *viewport,
-    ScriptGeometryReuseCallback prepare, void *opaque);
+    ScriptGeometryReuseCallback prepare, ScriptGeometryReuseRelease release,
+    void *opaque);
 /* Owner-only move of a current complete geometry snapshot. The caller must
    exclude resource-changing journals; failure leaves the snapshot owned by
    the runtime. No author work runs during the move. */

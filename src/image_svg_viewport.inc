@@ -192,8 +192,10 @@ static void svg_viewport_end_native(void *opaque, const char *name)
 
 /* Attribute CSS is bounded by the admitted SVG source. Only local URL
    references are supported; an external clip can never trigger a fetch. */
-static const char *svg_clip_attribute(const char **attributes, const char *name)
+static const char *svg_clip_attribute_from(const char **attributes,
+                                           const char *name, bool *in_style)
 {
+    if (in_style != NULL) *in_style = false;
     const char *style = NULL, *attribute = NULL;
     for (unsigned i = 0; attributes[i] != NULL; i += 2) {
         if (strcmp(attributes[i], name) == 0) attribute = attributes[i + 1];
@@ -208,12 +210,35 @@ static const char *svg_clip_attribute(const char **attributes, const char *name)
             while (*value == ' ' || *value == '\t') value++;
             if (*value++ == ':') {
                 while (*value == ' ' || *value == '\t') value++;
+                if (in_style != NULL) *in_style = true;
                 return value;
             }
         }
         while (*at != '\0' && *at != ';') at++;
     }
     return attribute;
+}
+
+static const char *svg_clip_attribute(const char **attributes, const char *name)
+{
+    return svg_clip_attribute_from(attributes, name, NULL);
+}
+
+/* Whether `name` is the keyword. A value read from `style` runs on to the
+   rest of the declarations, so there it ends at blanks, `;` or
+   `!important`; an attribute's value is the whole string. */
+static bool svg_clip_keyword(const char **attributes, const char *name,
+                             const char *keyword)
+{
+    bool in_style = false;
+    const char *value = svg_clip_attribute_from(attributes, name, &in_style);
+    if (value == NULL) return false;
+    if (!in_style) return strcmp(value, keyword) == 0;
+    size_t length = strlen(keyword);
+    if (strncmp(value, keyword, length) != 0) return false;
+    value += length;
+    while (*value == ' ' || *value == '\t') value++;
+    return *value == '\0' || *value == ';' || *value == '!';
 }
 
 static unsigned svg_clip_id_bit(const char *id)
@@ -312,11 +337,10 @@ static void svg_viewport_start(void *opaque, const char *name,
         memset(definition, 0, sizeof(*definition));
         definition->luminance_mask = strcmp(name, "mask") == 0;
         if (definition->luminance_mask) {
-            const char *type = svg_clip_attribute(attributes, "mask-type");
-            definition->alpha_mask = type != NULL && strcmp(type, "alpha") == 0;
-            const char *units = svg_clip_attribute(attributes, "maskUnits");
-            definition->region_object_space = units == NULL
-                || strcmp(units, "userSpaceOnUse") != 0;
+            definition->alpha_mask = svg_clip_keyword(
+                attributes, "mask-type", "alpha");
+            definition->region_object_space = !svg_clip_keyword(
+                attributes, "maskUnits", "userSpaceOnUse");
             static const char *const names[] = {"x", "y", "width", "height"};
             for (unsigned i = 0; i < 4; i++) {
                 float basis = definition->region_object_space ? 1.0f
@@ -330,10 +354,9 @@ static void svg_viewport_start(void *opaque, const char *name,
         const char *id = svg_clip_attribute(attributes, "id");
         if (id != NULL && strlen(id) < sizeof(definition->id))
             memcpy(definition->id, id, strlen(id) + 1);
-        const char *units = svg_clip_attribute(attributes,
-            definition->luminance_mask ? "maskContentUnits" : "clipPathUnits");
-        definition->object_space = units != NULL
-            && strcmp(units, "objectBoundingBox") == 0;
+        definition->object_space = svg_clip_keyword(attributes,
+            definition->luminance_mask ? "maskContentUnits" : "clipPathUnits",
+            "objectBoundingBox");
         definition->next = context->definitions;
         context->definitions = definition;
         context->definition_count++;

@@ -35,10 +35,24 @@ typedef struct {
     unsigned width;
     unsigned height;
     TilefinchGlyphComponentKind kind;
+    /* A monochrome glyph's own columns are first_column .. first_column +
+       width - 1 of its cell. baseline_rows is how many cell rows sit above the
+       baseline, or 0 when the pack declares none and glyphs use the fallback
+       7/8 em baseline. */
+    unsigned first_column;
+    unsigned baseline_rows;
 } TilefinchGlyphSource;
 
 TilefinchGlyphProvider *tilefinch_glyph_provider_create(Budget *budget);
 void tilefinch_glyph_provider_destroy(TilefinchGlyphProvider *provider);
+
+/* A scalar script's letters need a shared baseline and their own widths, which
+   square CJK cells do not. A pack declares both with a nonzero header byte 15
+   (cell rows above the baseline) plus one byte per glyph in the last glyph_count
+   bytes of its notice: high nibble columns - 1, low nibble first column. They
+   sit there so a reader that predates them still accepts the same file and
+   draws its cells at their full width. The table is read at attach because
+   measuring text may not touch the file. */
 
 /* Opens and validates only the bounded index. Glyph payloads remain on disk
    and are read solely by tilefinch_glyph_provider_pump(). Earlier packs have
@@ -56,6 +70,9 @@ bool tilefinch_glyph_provider_match(
 bool tilefinch_glyph_provider_has_codepoint(
     TilefinchGlyphProvider *provider, unsigned codepoint,
     uint32_t *glyph_key, unsigned *source_width);
+/* Whether a glyph comes from a pack that declares a baseline and column boxes. */
+bool tilefinch_glyph_provider_key_is_metric(
+    const TilefinchGlyphProvider *provider, uint32_t glyph_key);
 bool tilefinch_glyph_provider_metrics(
     const TilefinchGlyphProvider *provider, uint32_t glyph_key,
     unsigned *source_width, unsigned *source_height,

@@ -44,6 +44,13 @@ static void offline_status(PspOfflineStore *store, const char *text)
              text == NULL ? "OFFLINE LIBRARY ERROR" : text);
 }
 
+static void offline_unavailable(PspOfflineStore *store)
+{
+    offline_status(store, store != NULL && store->library.newer_format
+        ? "OFFLINE LIBRARY UNAVAILABLE - UPDATE TILEFINCH"
+        : "OFFLINE LIBRARY UNAVAILABLE");
+}
+
 static const char offline_homebrew_route[] = OFFLINE_ROOT "/homebrew";
 static const char offline_remove_homebrew_prefix[] =
     OFFLINE_ROOT "/remove-homebrew?name=";
@@ -162,11 +169,19 @@ static bool offline_fetch_page_resource(
         && result->status_code >= 200 && result->status_code < 300;
 }
 
+/* A supervised UI copy may still show the preview being freed (AU-05). */
+static void offline_release_view(const PspOfflineStore *store,
+                                 const void *view)
+{
+    if (store->release_view != NULL) store->release_view(view);
+}
+
 void psp_offline_store_discard_app_preparation(PspOfflineStore *store)
 {
     if (store == NULL) return;
     offline_library_discard_staged(&store->library);
     if (store->app_preparation == NULL) return;
+    offline_release_view(store, &store->app_preparation->view);
     budget_free(store->library.budget, store->app_preparation);
     store->app_preparation = NULL;
 }
@@ -437,6 +452,15 @@ const unsigned char *psp_offline_store_app_icon(
     size_t slot = 0;
     while (slot < OFFLINE_LIBRARY_ITEM_LIMIT
            && store->app_icon_ids[slot] != 0) slot++;
+    /* All taken: reuse the slot of an app no longer in the Library. A
+       listed app's slot may already back a row of the list being built, so
+       overwriting it would show this icon on that row too. With one slot
+       per item, one such slot exists whenever `id` itself is listed. */
+    for (size_t at = 0; slot == OFFLINE_LIBRARY_ITEM_LIMIT
+             && at < OFFLINE_LIBRARY_ITEM_LIMIT; at++)
+        if (offline_library_find(&store->library,
+                                 store->app_icon_ids[at]) == NULL)
+            slot = at;
     if (slot == OFFLINE_LIBRARY_ITEM_LIMIT) slot = id % OFFLINE_LIBRARY_ITEM_LIMIT;
     unsigned char *pixels = store->app_icon_cache
         + slot * OFFLINE_LIBRARY_APP_ICON_LIMIT;
@@ -566,6 +590,8 @@ bool psp_offline_store_take_download_offer(PspOfflineStore *store, BrowserEngine
 void psp_offline_store_discard_file(PspOfflineStore *store)
 {
     if (store == NULL) return;
+    if (store->file_offer != NULL)
+        offline_release_view(store, &store->file_offer->view);
     budget_free(store->library.budget, store->file_offer);
     store->file_offer = NULL;
 }
@@ -589,6 +615,9 @@ bool psp_offline_store_accept_file(PspOfflineStore *store)
 void psp_offline_store_discard_zip(PspOfflineStore *store)
 {
     if (store == NULL) return;
+    /* Before the destroy, whose cleanup touches the Memory Stick. */
+    if (store->zip_install != NULL)
+        offline_release_view(store, zip_install_preview(store->zip_install));
     zip_install_destroy(store->zip_install);
     store->zip_install = NULL;
 }
@@ -624,7 +653,7 @@ bool psp_offline_store_open_library(
 {
     if (store == NULL || engine == NULL
         || !offline_library_load(&store->library)) {
-        offline_status(store, "OFFLINE LIBRARY UNAVAILABLE");
+        offline_unavailable(store);
         return false;
     }
     for (size_t at = 0; at < store->library.count; at++)
@@ -806,7 +835,7 @@ PspOfflineRouteResult psp_offline_store_handle_url(
         || (url[root_length] != '\0' && url[root_length] != '/'))
         return PSP_OFFLINE_ROUTE_NONE;
     if (!offline_library_load(&store->library)) {
-        offline_status(store, "OFFLINE LIBRARY UNAVAILABLE");
+        offline_unavailable(store);
         return PSP_OFFLINE_ROUTE_ERROR;
     }
     if (strcmp(url, OFFLINE_ROOT) == 0)

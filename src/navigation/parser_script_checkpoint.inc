@@ -210,12 +210,29 @@ static void navigation_stream_mark_parser_refusal(
     }
 }
 
+/* True while a script written by document.write() closes: the writing
+   script is still running inside write(), with its frames on the realm's
+   stack. */
+static bool navigation_stream_inside_write(
+    const NavigationDocumentStream *stream)
+{
+    return stream != NULL && stream->parser != NULL
+        && stream->parser->write_depth != 0u;
+}
+
 static bool navigation_stream_suppress_optional_parser_work(
     NavigationDocumentStream *stream, NavigationParserRefusalReason reason)
 {
     if (stream == NULL || stream->session == NULL
         || stream->session->cancelled) {
         return false;
+    }
+    /* Shedding destroys the realm, which the writing script is still
+       running in. Defer it: the outermost script boundary (no write()
+       active) consumes the pending reason once evaluation has unwound. */
+    if (navigation_stream_inside_write(stream)) {
+        navigation_stream_mark_parser_refusal(stream, reason);
+        return true;
     }
     if (stream->pending_parser_refusal != NAVIGATION_PARSER_REFUSAL_NONE) {
         reason = stream->pending_parser_refusal;
@@ -418,6 +435,47 @@ static bool navigation_stream_account_parser_script(
     return summary == NULL
         || navigation_stream_open_parser_script_circuit(
                stream, summary, reason);
+}
+
+/* What the scripts written so far added to the shared execution-time and
+   source-work counters, taken when a script's checkpoint starts. */
+typedef struct {
+    uint64_t us;
+    size_t work;
+} NavigationWrittenShare;
+
+static NavigationWrittenShare navigation_stream_written_mark(
+    const NavigationDocumentStream *stream)
+{
+    return (NavigationWrittenShare) {
+        .us = stream->parser_script_written_us,
+        .work = stream->parser_script_written_work
+    };
+}
+
+/* A script's counter deltas include what the scripts it wrote added in
+   the meantime: take those off to leave its own share. Each script charges
+   its own source work. Only a script outside any write() charges the
+   stage's time (returned): its own time already spans the scripts it
+   wrote, which charge none. */
+static uint64_t navigation_stream_take_written_share(
+    NavigationDocumentStream *stream, NavigationWrittenShare mark,
+    uint64_t *execution_us, size_t *source_bytes)
+{
+    uint64_t written_us = stream->parser_script_written_us - mark.us;
+    size_t written_work = stream->parser_script_written_work - mark.work;
+    *execution_us = *execution_us > written_us
+        ? *execution_us - written_us : 0;
+    *source_bytes = *source_bytes > written_work
+        ? *source_bytes - written_work : 0;
+    if (!navigation_stream_inside_write(stream)) return *execution_us;
+    stream->parser_script_written_us =
+        *execution_us > UINT64_MAX - stream->parser_script_written_us
+            ? UINT64_MAX : stream->parser_script_written_us + *execution_us;
+    stream->parser_script_written_work =
+        *source_bytes > SIZE_MAX - stream->parser_script_written_work
+            ? SIZE_MAX : stream->parser_script_written_work + *source_bytes;
+    return 0;
 }
 
 typedef struct {
@@ -709,6 +767,37 @@ static TILEFINCH_OUT_OF_LINE bool navigation_stream_script_closed(
     NavigationDocumentStream *stream, PocDocument *document,
     lxb_dom_node_t *element);
 
+/* The parser's streaming check (DocumentInlineScriptAdmitCallback): a
+   classic inline script the live realm could no longer admit at its end tag
+   loses its text as it arrives. Anything that end tag would not compile in
+   this realm keeps its text, as before: other types (data the page reads),
+   modules (which run later, against a different heap), `nomodule`, a script
+   with `src`, and every script before the realm exists or after scripts
+   were stopped. */
+static bool navigation_stream_inline_script_admit(
+    void *opaque, lxb_dom_node_t *script, size_t bytes, bool *may_collect)
+{
+    NavigationDocumentStream *stream = opaque;
+    if (stream == NULL || stream->session == NULL || stream->runtime == NULL
+        || script == NULL || script->type != LXB_DOM_NODE_TYPE_ELEMENT
+        || !stream->session->scripts_enabled
+        || !stream->session->document_scripts_enabled
+        || stream->script_disabled_after_failure
+        || stream->parser_script_circuit_open) return true;
+    lxb_dom_element_t *element = lxb_dom_interface_element(script);
+    if (lxb_dom_element_has_attribute(
+            element, (const lxb_char_t *) "src", 3u)
+        || lxb_dom_element_has_attribute(
+               element, (const lxb_char_t *) "nomodule", 8u)) return true;
+    size_t type_length = 0;
+    const char *type = document_attribute(script, "type", &type_length);
+    bool module = false;
+    if (!script_type_attribute_classify(type, type_length, &module)
+        || module) return true;
+    return script_inline_source_admissible(
+        stream->runtime, stream->session->budget, bytes, may_collect);
+}
+
 static bool navigation_stream_element_closed(void *opaque,
                                              PocDocument *document,
                                              lxb_dom_node_t *element)
@@ -731,6 +820,8 @@ static bool navigation_stream_element_closed(void *opaque,
     if (name != NULL && name_length == 4
         && memcmp(name, "head", 4) == 0) {
         stream->head_closed = true;
+        /* Written </head>: the next script's checkpoint scans metadata. */
+        if (navigation_stream_inside_write(stream)) return true;
         NavigationParserCheckpointOutcome metadata =
             navigation_stream_metadata_checkpoint(stream);
         if (metadata == NAVIGATION_PARSER_CHECKPOINT_HARD_FAILURE) {
@@ -746,6 +837,7 @@ static bool navigation_stream_element_closed(void *opaque,
            browsers may already have painted after the head and a useful body
            prefix. Keep it as a final pre-EOF opportunity. */
         stream->body_closed = true;
+        if (navigation_stream_inside_write(stream)) return true;
         preview_policy_reopen_checks(&stream->preview_policy);
         navigation_stream_try_pre_eof_preview(stream);
         return true;
@@ -773,7 +865,11 @@ static TILEFINCH_OUT_OF_LINE bool navigation_stream_script_closed(
     NavigationParserScriptShape script_shape =
         navigation_parser_script_shape(element);
     bool parser_blocking = script_shape.parser_blocking;
-    if (stream->parser_script_circuit_open) {
+    /* A written script after one whose refusal awaits the writer's return
+       would run in a realm that is about to be stopped. */
+    if (stream->parser_script_circuit_open
+        || (stream->pending_parser_refusal != NAVIGATION_PARSER_REFUSAL_NONE
+            && navigation_stream_inside_write(stream))) {
         if (parser_blocking)
             navigation_stream_record_skipped_parser_script(stream);
         return true;
@@ -853,6 +949,8 @@ static TILEFINCH_OUT_OF_LINE bool navigation_stream_script_closed(
         size_t execution_failures_before =
             stream->scripts.early.execution_failures;
         uint64_t execution_us_before = stream->scripts.early.execution_us;
+        NavigationWrittenShare written_mark =
+            navigation_stream_written_mark(stream);
         size_t skipped_quota_before = stream->scripts.early.skipped_quota;
         size_t skipped_pressure_before =
             stream->scripts.early.skipped_pressure;
@@ -898,9 +996,6 @@ static TILEFINCH_OUT_OF_LINE bool navigation_stream_script_closed(
             stream->scripts.early.source_work_bytes >= source_bytes_before
             ? stream->scripts.early.source_work_bytes - source_bytes_before
             : 0;
-        if (!external && source_bytes == 0) {
-            source_bytes = inline_source_bytes;
-        }
         size_t mutations =
             telemetry_after.dom_mutations >= telemetry_before.dom_mutations
             ? telemetry_after.dom_mutations
@@ -915,6 +1010,11 @@ static TILEFINCH_OUT_OF_LINE bool navigation_stream_script_closed(
         uint64_t execution_us = stream->scripts.early.execution_us
                 >= execution_us_before
             ? stream->scripts.early.execution_us - execution_us_before : 0;
+        uint64_t stage_us = navigation_stream_take_written_share(
+            stream, written_mark, &execution_us, &source_bytes);
+        if (!external && source_bytes == 0) {
+            source_bytes = inline_source_bytes;
+        }
         NavigationBlockingScriptSample sample = {
             .ordinal = script_ordinal,
             .node_count = document == NULL ? 0 : document->node_count,
@@ -953,7 +1053,7 @@ static TILEFINCH_OUT_OF_LINE bool navigation_stream_script_closed(
             && stream->scripts.early.skipped_pressure
                    == skipped_pressure_before;
         if (!navigation_stream_account_parser_script(
-                stream, execution_us, source_bytes, execution_failed,
+                stream, stage_us, source_bytes, execution_failed,
                 completed_cleanly)) {
             return false;
         }
@@ -1149,6 +1249,8 @@ static TILEFINCH_OUT_OF_LINE bool navigation_stream_script_closed(
     size_t execution_failures_before =
         stream->scripts.early.execution_failures;
     uint64_t execution_us_before = stream->scripts.early.execution_us;
+    NavigationWrittenShare written_mark =
+        navigation_stream_written_mark(stream);
     size_t skipped_quota_before = stream->scripts.early.skipped_quota;
     size_t skipped_pressure_before = stream->scripts.early.skipped_pressure;
     uint64_t script_started = stylesheet_finished;
@@ -1227,6 +1329,8 @@ static TILEFINCH_OUT_OF_LINE bool navigation_stream_script_closed(
     size_t source_bytes =
         stream->scripts.early.source_work_bytes >= source_bytes_before
         ? stream->scripts.early.source_work_bytes - source_bytes_before : 0;
+    uint64_t stage_us = navigation_stream_take_written_share(
+        stream, written_mark, &execution_us, &source_bytes);
     if (!external && source_bytes == 0) {
         source_bytes = inline_source_bytes;
     }
@@ -1285,7 +1389,7 @@ static TILEFINCH_OUT_OF_LINE bool navigation_stream_script_closed(
         && stream->scripts.early.skipped_quota == skipped_quota_before
         && stream->scripts.early.skipped_pressure == skipped_pressure_before;
     if (!navigation_stream_account_parser_script(
-            stream, execution_us, source_bytes, execution_failed,
+            stream, stage_us, source_bytes, execution_failed,
             completed_cleanly)) {
         return false;
     }

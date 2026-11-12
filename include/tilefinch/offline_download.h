@@ -49,6 +49,9 @@ typedef struct {
     OfflineLibrary *library;
     FetchScheduler *scheduler;
     FetchResult *completion;
+    /* The RESOLVE phase's worker-transport resolver, pumped one step per
+       manager pump; NULL in every other phase. */
+    YoutubeResolveJob *resolve_job;
     YoutubeStream stream;
     OfflineDownloadPhase phase;
     uint32_t active_id;
@@ -109,6 +112,10 @@ bool offline_download_manager_start_next_queued(
    direct YouTube stream. */
 bool offline_download_manager_adopt_resolved(
     OfflineDownloadManager *manager, const YoutubeStream *stream);
+/* One bounded step. In the RESOLVE phase that is one step of a
+   youtube_resolve_job on the worker transport, so a resolve spans many
+   pumps; only without that transport (an HTTP trace capture, a host lab)
+   does the synchronous resolver run inside one pump. */
 bool offline_download_manager_pump(OfflineDownloadManager *manager);
 bool offline_download_manager_pause(
     OfflineDownloadManager *manager, uint32_t id);

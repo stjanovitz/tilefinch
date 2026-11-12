@@ -214,6 +214,13 @@ struct TilefinchWasmInstance {
     uint8_t empty_memory_sentinel;
     bool memory_needs_refresh;
     bool zombie;
+    /* Every native instance, live or zombie, sits on the runtime's list
+       from instantiation until its native release, so a buffer can be
+       recognised as an alias of some instance's memory (see
+       js_wasm_buffer_aliases_memory). */
+    bool listed;
+    TilefinchWasmInstance *previous_native;
+    TilefinchWasmInstance *next_native;
     bool counted_live;
     bool owns_runtime_operation;
     /* The finite interpreter ceiling bounds a single call; the host realm's
@@ -257,6 +264,8 @@ typedef struct {
     void *pool;
     size_t live_instances;
     size_t active_operations;
+    TilefinchWasmInstance *native_instances;
+    size_t native_instance_count;
     bool initialized;
 } TilefinchWasmRuntime;
 
@@ -577,6 +586,18 @@ void js_wasm_release_idle_runtime(void)
    buffer's free hook. */
 static void wasm_instance_release_native(TilefinchWasmInstance *instance)
 {
+    if (instance->listed) {
+        if (instance->previous_native != NULL)
+            instance->previous_native->next_native = instance->next_native;
+        else
+            wasm_runtime_state.native_instances = instance->next_native;
+        if (instance->next_native != NULL)
+            instance->next_native->previous_native =
+                instance->previous_native;
+        if (wasm_runtime_state.native_instance_count != 0)
+            wasm_runtime_state.native_instance_count--;
+        instance->listed = false;
+    }
     if (instance->execution != NULL)
         wasm_runtime_destroy_exec_env(instance->execution);
     if (instance->instance != NULL)
@@ -644,14 +665,99 @@ static void wasm_instance_destroy(
 static void wasm_memory_alias_free(JSRuntime *runtime, void *opaque, void *ptr)
 {
     (void) runtime;
-    /* QuickJS calls this again with NULL when a detached buffer is finally
-       collected. Its opaque owner may already be gone at that point. */
+    /* Reject an empty/stale backing pointer before inspecting its owner.
+       Keep this defensive even though detach retires the cleanup hook. */
     if (ptr == NULL) return;
     TilefinchWasmInstance *instance = opaque;
     if (instance == NULL) return;
     if (instance->alias_buffers != 0) instance->alias_buffers--;
     if (instance->zombie && instance->alias_buffers == 0)
         wasm_instance_release_native(instance);
+}
+
+/* Whether value is an attached ArrayBuffer over the linear memory of a live
+   or zombie instance. Only the bridge creates such buffers, always over the
+   instance's current base (or its empty sentinel), and detaches the old one
+   before publishing a successor, so a data-pointer match identifies one. */
+bool js_wasm_buffer_aliases_memory(JSContext *context, JSValueConst value)
+{
+    if (!JS_IsObject(value) || wasm_runtime_state.native_instance_count == 0)
+        return false;
+    size_t length = 0;
+    uint8_t *data = JS_GetArrayBuffer(context, &length, value);
+    if (data == NULL) {
+        /* Not an ArrayBuffer, detached, or empty: none of them is an
+           attached alias. Drop the class error the probe raised. */
+        JSValue exception = JS_GetException(context);
+        JS_FreeValue(context, exception);
+        return false;
+    }
+    size_t remaining = wasm_runtime_state.native_instance_count;
+    for (const TilefinchWasmInstance *at = wasm_runtime_state.native_instances;
+         at != NULL && remaining != 0; at = at->next_native, remaining--) {
+        if (at->alias_buffers == 0) continue;
+        if (data == &at->empty_memory_sentinel
+            || (at->memory_base != NULL && data == at->memory_base))
+            return true;
+    }
+    return false;
+}
+
+/* ArrayBuffer.prototype.transfer and transferToFixedLength, guarded. A
+   WebAssembly.Memory buffer has a detach key, so script cannot transfer it
+   (TypeError). The engine's transfer would otherwise move the alias into a
+   new ArrayBuffer the bridge does not know, which no refresh can detach:
+   once growth moves the memory (it does on the PSP), that buffer reads and
+   writes freed native heap. Anything else goes to the realm's own
+   intrinsic, held as function data. */
+static JSValue wasm_guarded_buffer_transfer(
+    JSContext *context, JSValueConst this_value, int argc,
+    JSValueConst *argv, int magic, JSValue *function_data)
+{
+    (void) magic;
+    if (js_wasm_buffer_aliases_memory(context, this_value)) {
+        return JS_ThrowTypeError(
+            context, "a WebAssembly.Memory buffer cannot be transferred");
+    }
+    return JS_Call(context, function_data[0], this_value, argc, argv);
+}
+
+bool js_wasm_guard_buffer_transfer(JSContext *realm)
+{
+    static const char *const names[] = {
+        "transfer", "transferToFixedLength"
+    };
+    /* The realm's intrinsic prototype, reached from a fresh buffer rather
+       than through its global, which a frame's parent may already have
+       written to. */
+    JSValue probe = JS_NewArrayBufferCopy(realm, NULL, 0);
+    if (JS_IsException(probe)) return false;
+    JSValue prototype = JS_GetPrototype(realm, probe);
+    JS_FreeValue(realm, probe);
+    if (JS_IsException(prototype)) return false;
+    bool ok = JS_IsObject(prototype);
+    for (size_t i = 0; ok && i < sizeof(names) / sizeof(names[0]); i++) {
+        JSValue original = JS_GetPropertyStr(realm, prototype, names[i]);
+        if (JS_IsException(original)) { ok = false; break; }
+        if (!JS_IsFunction(realm, original)) {
+            JS_FreeValue(realm, original);
+            continue;
+        }
+        JSValue guarded = JS_NewCFunctionData(
+            realm, wasm_guarded_buffer_transfer, 0, (int) i, 1, &original);
+        JS_FreeValue(realm, original);
+        ok = !JS_IsException(guarded)
+            && JS_DefinePropertyValueStr(
+                   realm, guarded, "name", JS_NewString(realm, names[i]),
+                   JS_PROP_CONFIGURABLE | JS_PROP_THROW) > 0
+            && JS_DefinePropertyValueStr(
+                   realm, prototype, names[i], JS_DupValue(realm, guarded),
+                   JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE
+                       | JS_PROP_THROW) > 0;
+        JS_FreeValue(realm, guarded);
+    }
+    JS_FreeValue(realm, prototype);
+    return ok;
 }
 
 #ifndef __PSP__
@@ -814,7 +920,7 @@ static JSValue wasm_throw_tagged(
         detail == NULL ? "" : detail);
     JSValue error = JS_NewError(context);
     if (JS_IsException(error)) return JS_EXCEPTION;
-    if (JS_SetPropertyStr(
+    if (js_rt_define_field(
             context, error, "message", JS_NewString(context, message)) < 0
         || JS_DefinePropertyValueStr(
                context, error, marker,
@@ -920,7 +1026,7 @@ static bool wasm_memory_refresh(
     JS_FreeValue(context, instance->memory_buffer);
     instance->memory_buffer = JS_DupValue(context, replacement);
     if (!JS_IsUndefined(instance->memory_object)
-        && JS_SetPropertyStr(
+        && js_rt_define_field(
                context, instance->memory_object, "buffer",
                JS_DupValue(context, replacement)) < 0) {
         JS_FreeValue(context, replacement);
@@ -1072,7 +1178,7 @@ static JSValue js_wasm_call_export(
         return JS_EXCEPTION;
     }
     for (uint32_t i = 0; i < result_count; i++) {
-        if (JS_SetPropertyUint32(context, array, i, converted[i]) < 0) {
+        if (js_rt_define_index(context, array, i, converted[i]) < 0) {
             for (uint32_t j = i + 1; j < result_count; j++)
                 JS_FreeValue(context, converted[j]);
             JS_FreeValue(context, array);
@@ -1114,7 +1220,7 @@ static JSValue wasm_memory_export(
         JS_FreeValue(context, retained);
         return JS_EXCEPTION;
     }
-    if (JS_SetPropertyStr(context, memory_object, "buffer", buffer) < 0) {
+    if (js_rt_define_field(context, memory_object, "buffer", buffer) < 0) {
         JS_FreeValue(context, retained);
         JS_FreeValue(context, memory_object);
         return JS_EXCEPTION;
@@ -1633,12 +1739,12 @@ static JSValue wasm_descriptor_object(
     JSValue descriptor = JS_NewObject(context);
     if (JS_IsException(descriptor)) return JS_EXCEPTION;
     bool ready = (module_name == NULL
-            || JS_SetPropertyStr(
+            || js_rt_define_field(
                    context, descriptor, "module",
                    JS_NewString(context, module_name)) >= 0)
-        && JS_SetPropertyStr(
+        && js_rt_define_field(
                context, descriptor, "name", JS_NewString(context, name)) >= 0
-        && JS_SetPropertyStr(
+        && js_rt_define_field(
                context, descriptor, "kind",
                JS_NewString(context, kind_name)) >= 0;
     if (!ready) {
@@ -1693,9 +1799,9 @@ static JSValue wasm_module_custom_sections(
                     JS_FreeValue(context, result);
                     return JS_EXCEPTION;
                 }
-                if (JS_SetPropertyUint32(
+                if (js_rt_define_index(
                         context, result, match_count++, copy) < 0) {
-                    /* JS_SetPropertyUint32 consumes copy on failure. */
+                    /* js_rt_define_index consumes copy on failure. */
                     JS_FreeValue(context, result);
                     return JS_EXCEPTION;
                 }
@@ -1757,7 +1863,7 @@ JSValue js_wasm_module_info(
                 wasm_external_kind_name(
                     (wasm_import_export_kind_t) descriptor->kind));
             if (JS_IsException(descriptor_object)
-                || JS_SetPropertyUint32(
+                || js_rt_define_index(
                        context, result, i, descriptor_object) < 0) {
                 JS_FreeValue(context, result);
                 result = JS_EXCEPTION;
@@ -1820,9 +1926,9 @@ JSValue js_wasm_module_info(
             result = JS_EXCEPTION;
             break;
         }
-        /* JS_SetPropertyUint32 consumes descriptor on both success and
+        /* js_rt_define_index consumes descriptor on both success and
            failure, so the error path must not free it again. */
-        if (JS_SetPropertyUint32(
+        if (js_rt_define_index(
                 context, result, (uint32_t) i, descriptor) < 0) {
             JS_FreeValue(context, result);
             result = JS_EXCEPTION;
@@ -2027,6 +2133,12 @@ JSValue js_wasm_instantiate(
         return JS_ThrowOutOfMemory(context);
     }
     instance->budget = bridge->budget;
+    instance->next_native = wasm_runtime_state.native_instances;
+    if (instance->next_native != NULL)
+        instance->next_native->previous_native = instance;
+    wasm_runtime_state.native_instances = instance;
+    wasm_runtime_state.native_instance_count++;
+    instance->listed = true;
     instance->memory_buffer = JS_UNDEFINED;
     instance->memory_object = JS_UNDEFINED;
     instance->pending_import_exception = JS_UNDEFINED;
@@ -2238,15 +2350,15 @@ JSValue js_wasm_instantiate(
             return JS_EXCEPTION;
         }
         if (!JS_IsUndefined(value)
-            && JS_SetPropertyStr(
+            && js_rt_define_field(
                    context, exports, exported.name, value) < 0) {
-            /* JS_SetPropertyStr consumes value even when it fails. */
+            /* js_rt_define_field consumes value even when it fails. */
             JS_FreeValue(context, exports);
             JS_FreeValue(context, instance_object);
             return JS_EXCEPTION;
         }
     }
-    if (JS_SetPropertyStr(context, instance_object, "exports", exports) < 0) {
+    if (js_rt_define_field(context, instance_object, "exports", exports) < 0) {
         JS_FreeValue(context, instance_object);
         return JS_EXCEPTION;
     }
@@ -2259,6 +2371,18 @@ JSValue js_wasm_instantiate(
 
 void js_wasm_release_idle_runtime(void)
 {
+}
+
+bool js_wasm_buffer_aliases_memory(JSContext *context, JSValueConst value)
+{
+    (void) context;
+    (void) value;
+    return false;
+}
+
+bool js_wasm_guard_buffer_transfer(JSContext *realm)
+{
+    return realm != NULL;
 }
 
 bool js_wasm_runtime_init(JSRuntime *runtime)

@@ -72,6 +72,27 @@ bool tilefinch_url_site_key(const char *value, char *output, size_t output_size)
 bool tilefinch_host_within(const char *host, size_t host_length,
                            const char *domain, size_t domain_length);
 
+typedef enum {
+    /* An ordinary name: the last label is not a number. */
+    TILEFINCH_HOST_IPV4_NAME = 0,
+    /* An IPv4 address in any form inet_aton, curl and the URL Standard's
+       IPv4 parser accept: one to four decimal, 0x-hex or 0-octal parts, so
+       134744072, 0x08080808, 8.526344 and 010.8.8.8 all denote 8.8.8.8. */
+    TILEFINCH_HOST_IPV4_ADDRESS,
+    /* The last label is a number but the host is no valid address (an
+       out-of-range part, a stray digit, too many parts). The URL Standard
+       rejects such a host; a resolver may still map it somewhere, so
+       callers must not trust it as local. */
+    TILEFINCH_HOST_IPV4_INVALID
+} TilefinchHostIpv4;
+
+/* Classifies host[0..host_length) by the URL Standard's "ends in a number"
+   rule and, for an address, stores it in network order in address[4]. Every
+   local/private decision made from a host string goes through this, so the
+   policy sees the address the resolver will connect to. */
+TilefinchHostIpv4 tilefinch_host_ipv4(const char *host, size_t host_length,
+                                      unsigned char address[4]);
+
 /* Referrer-Policy tokens. A policy code is 0 for the empty (default) policy
    and 1 + the token's position in the specification's list otherwise. Codes
    are stored (module-map entries, computed image styles), so the order is

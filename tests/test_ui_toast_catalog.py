@@ -76,7 +76,8 @@ STATUS_CALLS = (
     ("psp_ui_set_glyph_offer_error", 2),
 )
 
-SOURCES = ("src/psp_app/*.c", "src/psp_script_main.c", "src/psp_ui.c",
+SOURCES = ("src/psp_app/*.c", "src/psp_app/*.inc",
+           "src/psp_script_main.c", "src/psp_ui.c",
            "src/psp_ui_menu.c", "src/psp_ui_media_8888.c",
            "src/psp_offline_store.c", "src/psp_glyph_component_session.c",
            "src/psp_ui_theme.c", "src/psp_media_session.c",
@@ -366,7 +367,7 @@ def shipped_toasts():
             macros[match.group(1)] = match.group(2)
     found = {}
     for path in sources:
-        if path.suffix != ".c":
+        if path.suffix not in (".c", ".inc"):
             continue
         source = shipping_text(
             without_comments(path.read_text(encoding="utf-8")))
@@ -478,7 +479,10 @@ class UiToastCatalogTests(unittest.TestCase):
                     "WAIT FOR THE PAGE TO FINISH, THEN RETRY",
                     # A font-pack install's failure and cancel messages.
                     "FONT PACK COULD NOT BE ACTIVATED",
-                    "FONT PACK RECOVERY FAILED", "CANCELLED"):
+                    "FONT PACK RECOVERY FAILED", "CANCELLED",
+                    # A press's outcome, in a file the host test compiles.
+                    "FORM COULD NOT BE SENT",
+                    "PAGE SCRIPTS STOPPED - RELOAD TO RETRY"):
             self.assertIn(key, toasts)
         # Painted from state: a literal routed through a local variable,
         # a setting's reload notices, a theme error buffer, the Update
@@ -504,8 +508,14 @@ class UiToastCatalogTests(unittest.TestCase):
                     "PSP decoder refused its pictures",
                     "High profile, over 432x240", "Unsupported H.264 profile",
                     "Picture size too large", "No supported codec",
+                    "Video playlist too long",
                     "VIDEO SOURCE COULD NOT OPEN",
-                    "STREAM OFFLINE OR NOT AVAILABLE"):
+                    "STREAM OFFLINE OR NOT AVAILABLE",
+                    # The unencrypted-audio question (psp_media_open.c).
+                    "PLAY UNENCRYPTED AUDIO?",
+                    "This station is not encrypted", "Play anyway",
+                    "UNENCRYPTED AUDIO BLOCKED",
+                    "Change it in Site information"):
             self.assertIn(key, toasts)
         # A plain on/off setting's confirmations, from its descriptor.
         for key in ("URL HISTORY ON", "URL HISTORY OFF", "ROTATE HINT AUTO",

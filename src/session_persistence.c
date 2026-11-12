@@ -29,6 +29,8 @@ typedef struct {
     size_t bytes;
     uint32_t hash;
     bool failed;
+    /* Count bytes only: no file and no hash (a free-space preflight). */
+    bool size_only;
 } PersistWriter;
 
 typedef struct {
@@ -195,7 +197,8 @@ static void writer_bytes(PersistWriter *writer, const void *data,
         writer->failed = true;
         return;
     }
-    writer->hash = hash_update(writer->hash, data, length);
+    if (!writer->size_only)
+        writer->hash = hash_update(writer->hash, data, length);
 }
 
 static void writer_u32(PersistWriter *writer, uint32_t value)
@@ -466,6 +469,43 @@ static void build_header(unsigned char header[PERSIST_HEADER_BYTES],
     put_u32(header + 32, (uint32_t) plan->storage_count);
 }
 
+/* The format version a snapshot file declares, or 0 when it is missing or
+   not a snapshot. */
+static uint32_t persist_file_version(const char *path)
+{
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) return 0;
+    unsigned char header[12];
+    bool read = fread(header, 1, sizeof(header), file) == sizeof(header);
+    (void) fclose(file);
+    return read && memcmp(header, persist_magic, sizeof(persist_magic)) == 0
+        ? get_u32(header + 8) : 0;
+}
+
+BrowserSessionPersistenceStatus browser_session_persistence_planned_bytes(
+    const BrowserSession *session, BrowserSessionPersistenceMask mask,
+    const BrowserSessionPersistenceLimits *requested_limits, uint64_t *bytes)
+{
+    BrowserSessionPersistenceLimits limits;
+    if (bytes != NULL) *bytes = 0;
+    if (session == NULL || session->budget == NULL || bytes == NULL
+        || browser_session_captive_portal_active(session)
+        || mask == 0 || (mask & ~BROWSER_SESSION_PERSIST_ALL) != 0
+        || !effective_limits(requested_limits, &limits))
+        return BROWSER_SESSION_PERSISTENCE_INVALID_ARGUMENT;
+    PersistPlan plan;
+    BrowserSessionPersistenceStatus status =
+        build_plan(session, mask, &limits, &plan);
+    if (status != BROWSER_SESSION_PERSISTENCE_OK) return status;
+    PersistWriter sizing = {.size_only = true};
+    if (!emit_payload(&sizing, session, &plan) || sizing.failed
+        || sizing.bytes > UINT32_MAX
+        || sizing.bytes > limits.maximum_file_bytes - PERSIST_HEADER_BYTES)
+        return BROWSER_SESSION_PERSISTENCE_LIMIT_EXCEEDED;
+    *bytes = (uint64_t) PERSIST_HEADER_BYTES + sizing.bytes;
+    return BROWSER_SESSION_PERSISTENCE_OK;
+}
+
 BrowserSessionPersistenceStatus browser_session_persistence_save(
     const BrowserSession *session, const char *path,
     BrowserSessionPersistenceMask mask,
@@ -491,6 +531,14 @@ BrowserSessionPersistenceStatus browser_session_persistence_save(
         || sizing.bytes > limits.maximum_file_bytes - PERSIST_HEADER_BYTES) {
         return BROWSER_SESSION_PERSISTENCE_LIMIT_EXCEEDED;
     }
+    /* Publishing rotates the primary into .bak and drops the old .bak (the
+       latest data when the primary is unreadable). Neither may be a
+       generation a later release wrote. */
+    uint32_t primary_version = persist_file_version(path);
+    if (primary_version > PERSIST_VERSION
+        || (primary_version != PERSIST_VERSION
+            && persist_file_version(backup) > PERSIST_VERSION))
+        return BROWSER_SESSION_PERSISTENCE_NEWER_FORMAT;
     unsigned char header[PERSIST_HEADER_BYTES];
     build_header(header, &plan, sizing.bytes, sizing.hash);
     FILE *file = fopen(temporary, "wb");
@@ -945,6 +993,13 @@ BrowserSessionPersistenceLoadProgress browser_session_persistence_load_pump(
             load->expected_hash = get_u32(load->header + 24);
             load->expected_cache = get_u32(load->header + 28);
             load->expected_storage = get_u32(load->header + 32);
+            if (memcmp(load->header, persist_magic,
+                       sizeof(persist_magic)) == 0
+                && get_u32(load->header + 8) > PERSIST_VERSION) {
+                /* Not damage: never fall back past it to an older one. */
+                load->status = BROWSER_SESSION_PERSISTENCE_NEWER_FORMAT;
+                break;
+            }
             if (memcmp(
                     load->header, persist_magic, sizeof(persist_magic)) != 0
                 || get_u32(load->header + 8) != PERSIST_VERSION
@@ -1266,12 +1321,20 @@ BrowserSessionPersistenceStatus browser_session_persistence_remove(
                    : BROWSER_SESSION_PERSISTENCE_IO_ERROR;
 }
 
+bool browser_session_persistence_load_left_unread(
+    BrowserSessionPersistenceStatus status)
+{
+    return status != BROWSER_SESSION_PERSISTENCE_OK
+        && status != BROWSER_SESSION_PERSISTENCE_NOT_FOUND
+        && status != BROWSER_SESSION_PERSISTENCE_CORRUPT;
+}
+
 const char *browser_session_persistence_status_name(
     BrowserSessionPersistenceStatus status)
 {
     static const char *const names[] = {
         "ok", "invalid-argument", "not-found", "io-error",
-        "limit-exceeded", "corrupt", "out-of-memory"
+        "limit-exceeded", "corrupt", "out-of-memory", "newer-format"
     };
     return (unsigned) status < sizeof(names) / sizeof(names[0])
         ? names[status] : "unknown";

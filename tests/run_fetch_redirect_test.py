@@ -11,6 +11,15 @@ import time
 from urllib.parse import urlparse
 
 
+# OPTIONS requests seen per preflight path, reported in its PUT response.
+PREFLIGHT_OPTIONS = {}
+PREFLIGHT_OPTIONS_LOCK = Lock()
+# A slow preflight: longer than any page-script call may block.
+SLOW_PREFLIGHT_SECONDS = 1.5
+# A response that stays in flight past a sync XHR's 2 s capacity wait.
+HOLD_SECONDS = 3.0
+
+
 class RedirectHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -35,6 +44,17 @@ class RedirectHandler(BaseHTTPRequestHandler):
             ("X-Intermediate", "must-not-survive"),
             ("Set-Cookie", cookie),
         ))
+
+    def dnas_root(self):
+        # A SHOUTcast DNAS v2 server's answer to its root path, byte for
+        # byte: a path-relative Location with no space after the colon.
+        body = b"<html><head><title>Redirect</title></head></html>"
+        self.wfile.write(
+            b"HTTP/1.1 302 Found\r\n"
+            b"Content-Type:text/html;charset=utf-8\r\n"
+            b"Location:index.html?sid=1\r\n"
+            b"Content-Length:" + str(len(body)).encode() + b"\r\n\r\n"
+            + body)
 
     def portal_redirect(self, path):
         prefix = "/portal-redirect-"
@@ -244,6 +264,12 @@ class RedirectHandler(BaseHTTPRequestHandler):
                 ("Set-Cookie", 'structured={"code":"ZZ"}; Path=/'),
                 ("Set-Cookie", 'quoted="value"; Path=/'),
             ))
+        elif path == "/dnas/":
+            self.dnas_root()
+        elif path == "/dnas/index.html":
+            self.reply(200, b"<html>DNAS status page sid="
+                       + urlparse(self.path).query.encode() + b"</html>",
+                       (("Content-Type", "text/html;charset=utf-8"),))
         elif path == "/same":
             self.redirect(302, "/final", "hop=seen; Path=/")
         elif path == "/fragment-inherit":
@@ -365,6 +391,12 @@ class RedirectHandler(BaseHTTPRequestHandler):
                 "cross_only=blocked; Path=/")
         elif path == "/final":
             self.final("GET")
+        elif path == "/hold":
+            time.sleep(HOLD_SECONDS)
+            try:
+                self.reply(200, b"held", (("Content-Type", "text/plain"),))
+            except (BrokenPipeError, ConnectionResetError):
+                pass
         elif path == "/cors-simple":
             query = urlparse(self.path).query
             self.cors_final(
@@ -512,7 +544,7 @@ class RedirectHandler(BaseHTTPRequestHandler):
         elif path == "/response-cookie-capacity":
             self.reply(200, b"response-cookie-capacity", tuple(
                 ("Set-Cookie", f"cookie{i}=value; Path=/")
-                for i in range(32)))
+                for i in range(64)))
         elif path == "/response-cookie-twenty":
             self.reply(200, b"response-cookie-twenty", tuple(
                 ("Set-Cookie", f"cookie{i}=value; Path=/")
@@ -520,12 +552,22 @@ class RedirectHandler(BaseHTTPRequestHandler):
         elif path == "/response-cookie-overflow":
             self.reply(200, b"response-cookie-overflow", tuple(
                 ("Set-Cookie", f"cookie{i}=value; Path=/")
-                for i in range(33)))
+                for i in range(65)))
+        elif path == "/redirect-cookie-chain":
+            self.reply(302, b"redirect-cookie-chain", (
+                (("Location", "/redirect-cookie-chain-2"),)
+                + tuple(("Set-Cookie", f"first{i}=value; Path=/")
+                        for i in range(30))))
+        elif path == "/redirect-cookie-chain-2":
+            self.reply(302, b"redirect-cookie-chain-2", (
+                (("Location", "/final"),)
+                + tuple(("Set-Cookie", f"second{i}=value; Path=/")
+                        for i in range(30))))
         elif path == "/redirect-cookie-overflow":
             self.reply(302, b"redirect-cookie-overflow", (
                 (("Location", "/final"),)
                 + tuple(("Set-Cookie", f"cookie{i}=value; Path=/")
-                        for i in range(33))))
+                        for i in range(65))))
         elif path == "/duplicate-client-hints":
             self.reply(200, b"duplicate-client-hints", (
                 ("Accept-CH", "Sec-CH-UA-Arch"),
@@ -669,6 +711,10 @@ class RedirectHandler(BaseHTTPRequestHandler):
                 credentials="credentials=1" in urlparse(self.path).query)
         elif path == "/cors-preflight-denied":
             self.cors_final(method, body)
+        elif path in ("/cors-preflight-slow", "/cors-preflight-cached"):
+            with PREFLIGHT_OPTIONS_LOCK:
+                seen = PREFLIGHT_OPTIONS.get(path, 0)
+            self.cors_final(method, body + f";options={seen}".encode())
         else:
             self.reply(404)
 
@@ -691,9 +737,15 @@ class RedirectHandler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self):
         path = urlparse(self.path).path
-        if path not in ("/cors-preflight", "/cors-preflight-denied"):
+        if path not in ("/cors-preflight", "/cors-preflight-denied",
+                        "/cors-preflight-slow", "/cors-preflight-cached"):
             self.reply(404)
             return
+        if path in ("/cors-preflight-slow", "/cors-preflight-cached"):
+            with PREFLIGHT_OPTIONS_LOCK:
+                PREFLIGHT_OPTIONS[path] = PREFLIGHT_OPTIONS.get(path, 0) + 1
+        if path == "/cors-preflight-slow":
+            time.sleep(SLOW_PREFLIGHT_SECONDS)
         origin = self.headers.get("Origin", "")
         method = self.headers.get("Access-Control-Request-Method", "")
         headers = self.headers.get("Access-Control-Request-Headers", "")
@@ -707,8 +759,11 @@ class RedirectHandler(BaseHTTPRequestHandler):
             ("Access-Control-Allow-Methods", "PUT"),
             ("Access-Control-Allow-Headers", "content-type, x-test"),
         ]
-        if path == "/cors-preflight":
+        if path != "/cors-preflight-denied":
             response.append(("Access-Control-Allow-Origin", origin))
+        if path == "/cors-preflight-cached":
+            response.append(("Access-Control-Max-Age", "60"))
+        if path == "/cors-preflight":
             if "credentials=1" in urlparse(self.path).query:
                 response.append(("Access-Control-Allow-Credentials", "true"))
         self.reply(204, headers=tuple(response))

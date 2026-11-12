@@ -421,6 +421,49 @@
     stylesheet_destroy(&abspos_grid_sheet);
     document_destroy(&abspos_grid_document);
 
+    puts("test: auto-fill grid with only positioned children distributes space");
+    /* No in-flow item: the adaptive column cap once left zero columns, and
+       justify-content:space-around divided the free space by that count. */
+    static const char *const abspos_fill_justify[] = {
+        "space-around", "space-evenly", "space-between", "center", "end",
+        "stretch"
+    };
+    for (size_t justify = 0;
+         justify < sizeof(abspos_fill_justify) / sizeof(abspos_fill_justify[0]);
+         justify++) {
+        char abspos_fill_page[512];
+        snprintf(abspos_fill_page, sizeof(abspos_fill_page),
+            "<!doctype html><style>html,body{margin:0;padding:0}"
+            "#fill{display:grid;position:relative;margin-left:20px;"
+            "width:300px;height:40px;justify-content:%s;align-content:%s;"
+            "grid-template-columns:repeat(auto-fill,minmax(100px,1fr))}"
+            "#abs{position:absolute;grid-column:1;inset-inline:0;top:0;"
+            "height:10px}</style><body><div id=fill><span id=abs></span>"
+            "</div></body>",
+            abspos_fill_justify[justify], abspos_fill_justify[justify]);
+        PocDocument abspos_fill_document;
+        Stylesheet abspos_fill_sheet;
+        LayoutDocument abspos_fill_layout;
+        CHECK(document_parse(&abspos_fill_document, &budget, abspos_fill_page,
+                             strlen(abspos_fill_page), 46)
+              && stylesheet_build(&abspos_fill_sheet, &budget,
+                                  &abspos_fill_document, 480)
+              && layout_build(&abspos_fill_layout, &budget,
+                              &abspos_fill_document, &abspos_fill_sheet,
+                              NULL, NULL, 480));
+        const LayoutNodeBox *abspos_fill_item = layout_box_for_node(
+            &abspos_fill_layout,
+            find_id(lxb_dom_interface_node(abspos_fill_document.html),
+                    "abs"));
+        /* Three 100px repetitions fill the 300px grid; the item spans the
+           first, as auto-fill specifies. */
+        CHECK(abspos_fill_item != NULL && abspos_fill_item->x == 20
+              && abspos_fill_item->width == 100);
+        layout_destroy(&abspos_fill_layout);
+        stylesheet_destroy(&abspos_fill_sheet);
+        document_destroy(&abspos_fill_document);
+    }
+
     puts("test: shrink-wrapped grid sizes its implicit columns");
     /* No grid-template-columns, one item at grid-area 1/1 and one at
        grid-column 2 (Cloudflare Turnstile's checkbox label). The grid's

@@ -1,0 +1,51 @@
+# Page dialogs, the rest of the modal (tests/fixtures/page-dialogs.html?buttons);
+# see INPUT_SCENARIOS.md. Each -text step advances only while a dialog or the
+# keyboard samples input.
+# Confirm: Cross well inside the arm delay does nothing; Circle cancels.
+wait-text 3
+tap-text cross
+tap-text circle
+# Prompt: Cross opens the keyboard. Type one character, leave with START, then
+# START accepts the edited answer.
+wait-text 45
+tap-text cross
+wait-text 5
+stick-text 1 up-right cross
+wait-text 2
+hold-text 1 start
+wait-text 45
+tap-text start
+# Third dialog of the turn. The other four alerts are over the gesture limit.
+wait-text 45
+tap-text cross
+wait-live 120
+mark-live answers
+# Focus and click Ask again. Three earlier dialogs leave two in the rate
+# window, so the third alert of this click is refused.
+tap cross
+wait 30
+tap cross
+wait-text 45
+tap-text cross
+wait-text 45
+tap-text cross
+wait-live 120
+mark-live rate
+# Past the 30 s window, a click shows three: the gesture limit, not the rate.
+wait-live 1700
+wait-live 1700
+tap cross
+wait-text 45
+tap-text cross
+wait-text 45
+tap-text cross
+wait-text 45
+tap-text cross
+wait-live 120
+mark-live window
+# Triangle leaves, and the handler's confirm is answered without a box.
+tap cross
+wait-text 45
+tap-text triangle
+wait-live 180
+mark-live left

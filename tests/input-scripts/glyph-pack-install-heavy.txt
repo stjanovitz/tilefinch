@@ -1,0 +1,28 @@
+# glyph-pack-install-menu on a heavy replayed page (record-glyph-pack-replay.py
+# --base-trace), so the install runs with a loaded page's memory in use. The
+# page has time to finish first. Steps are -live because a replayed page can
+# keep background resources pending, which a plain step would wait out and
+# then report as a stall.
+
+wait-live 1200
+mark-page page-before
+tap-live select
+press-live 4 down
+tap-live cross
+tap-live cross
+press-live 7 down
+tap-live cross
+wait-live 8
+mark-live glyph-options
+press-live 5 right
+wait-live 4
+press-live 2 down
+tap-live cross
+mark-live install-started
+wait-live 900
+mark-live install-ended
+tap-live select
+wait-live 90
+mark-page page-after
+wait-live 300
+end

@@ -333,6 +333,8 @@ typedef struct {
 
 typedef struct {
     BrowserNavigationJobStatus status;
+    /* For a site adapter's navigation, load carries the adapter's transport
+       counters and its progress_units (see SiteAdapterLoadMetrics). */
     NavigationLoadMetrics load;
     /* Monotonic overall navigation completion, from 0 through 1000. It
        combines transport progress with explicit parse/build/commit phases. */
@@ -377,6 +379,20 @@ typedef struct {
        provisional_first_present_us). */
     int provisional_reach_px;
     uint64_t provisional_reach_us;
+    /* What the reader's screen showed, relative to the navigation start
+       like provisional_first_present_us, which counts any preview frame:
+       when a presented, fully rasterized screen at the reader's position
+       (a load preview's, or the committed page's as the load ends) first
+       held non-space text or a decoded image, and when it first held
+       text. 0 = not by the end of the load. */
+    uint64_t first_content_us;
+    uint64_t first_text_us;
+    /* The load preview's reading hint: when a presented preview screen
+       first held neither while the preview held some further down, and
+       when that ended (the screen showed content, a page press moved the
+       preview, or the load ended). 0 = never shown. */
+    uint64_t reading_hint_shown_us;
+    uint64_t reading_hint_cleared_us;
     size_t transform_slices;
     size_t transform_quota_overruns;
     /* See YoutubeLiteLoadMetrics: the largest transform slice in bytes. */
@@ -397,6 +413,10 @@ typedef struct {
     /* Every visible tile is rasterized. */
     bool complete;
     bool ready;
+    /* The reader's screen of the preview shows no text or decoded image
+       but the preview holds some further down, and the reader has not
+       paged since: a frontend may say that a page press reaches it. */
+    bool reading_hint;
 } BrowserProvisionalViewport;
 
 void browser_device_profile_psp3000(BrowserDeviceProfile *profile);
@@ -768,6 +788,16 @@ bool browser_engine_scroll(BrowserEngine *engine,
  * running or the page did not move / nothing changed.
  */
 bool browser_engine_layout_completion_running(const BrowserEngine *engine);
+/*
+ * Page presses queued behind author work or a relayout, which may be changing
+ * the page, cannot scroll it yet. This shows where they will land, `presses`
+ * pages away (signed), from resident tiles with a checkerboard for the rest;
+ * the page's position, layout and tiles stay as they are. False when no such
+ * frame can be shown. browser_engine_take_press_preview says, once, that the
+ * framebuffer holds one and the page must be painted again.
+ */
+bool browser_engine_preview_page_presses(BrowserEngine *engine, int presses);
+bool browser_engine_take_press_preview(BrowserEngine *engine);
 /* One page in direction; paints at once from resident tiles with a
    checkerboard for the rest. */
 bool browser_engine_completion_scroll_page(BrowserEngine *engine,
@@ -810,6 +840,8 @@ bool browser_engine_text_value(const BrowserEngine *engine, char *output,
                                size_t capacity, size_t *length);
 bool browser_engine_text_input_info(
     const BrowserEngine *engine, ControllerTextInputInfo *info);
+/* controller_keyboard_done_submits for the page's focused field. */
+bool browser_engine_keyboard_done_submits(const BrowserEngine *engine);
 bool browser_engine_replace_text(BrowserEngine *engine, const char *utf8,
                                  size_t length);
 bool browser_engine_insert_text(BrowserEngine *engine, const char *utf8,
@@ -944,6 +976,10 @@ bool browser_engine_optional_glyphs_updated(BrowserEngine *engine);
 /* Repaint after one deferred block read without evicting glyphs that are
    already independent of the provider's small block cache. */
 bool browser_engine_optional_glyph_payloads_ready(BrowserEngine *engine);
+/* True once after either of those two. They only invalidate retained pixels,
+   so the frontend must render the page again for the change to reach the
+   screen. It takes this while the page is what is showing. */
+bool browser_engine_take_optional_glyph_repaint(BrowserEngine *engine);
 /* Visible Unicode-script hints gathered without a second DOM walk. The
    frontend may use these to attach installed optional glyph packs lazily. */
 uint16_t browser_engine_glyph_script_mask(const BrowserEngine *engine);
@@ -1409,6 +1445,10 @@ BrowserController *browser_engine_controller(BrowserEngine *engine);
    No file is saved by navigation itself. New navigation clears an old offer. */
 bool browser_engine_take_download_offer(BrowserEngine *engine,
     char *url, size_t url_capacity, char *filename, size_t filename_capacity);
+/* One-shot: a navigation answered MPEG audio (audio/mpeg), so its body was
+   not parsed; the native audio player opens this address instead. */
+bool browser_engine_take_media_audio_offer(BrowserEngine *engine,
+                                           char *url, size_t url_capacity);
 FontSet *browser_engine_fonts(BrowserEngine *engine);
 TileCache *browser_engine_render_shell(BrowserEngine *engine);
 uint16_t *browser_engine_framebuffer(BrowserEngine *engine,

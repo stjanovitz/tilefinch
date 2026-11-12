@@ -57,9 +57,19 @@ struct RenderGradientCache {
     RenderGradientCacheEntry entries[RENDER_GRADIENT_CACHE_ENTRIES];
 };
 
+static void overlay_index_release(TileCache *cache);
 #include "render/raster_primitives.inc"
 #include "render/glyph_raster.inc"
 #include "render/visual_raster.inc"
+
+/* Rasterizes a moved copy of layout->commands[source]. */
+static void rasterize_command_copy(TileCache *cache, RasterTarget *target,
+                                   const DrawCommand *copy, size_t source)
+{
+    cache->raster_copy_source = source + 1u;
+    rasterize_command(cache, target, copy);
+    cache->raster_copy_source = 0;
+}
 
 static void rasterize_tile(TileCache *cache, RenderTile *tile)
 {
@@ -518,7 +528,7 @@ static void paint_overflow_command(TileCache *cache, uint16_t *frame,
         .rounded_clips = rounded_clips,
         .rounded_clip_count = rounded_clip_count
     };
-    rasterize_command(cache, &target, &command);
+    rasterize_command_copy(cache, &target, &command, index);
     cache->overflow_direct_commands++;
 }
 
@@ -693,6 +703,7 @@ void tile_cache_destroy(TileCache *cache)
     if (cache == NULL) return;
     if (cache->budget != NULL) {
         overflow_cache_destroy(cache);
+        overlay_index_release(cache);
         budget_free(cache->budget, cache->gradient_cache);
         glyph_cache_clear(cache, false);
         scaled_image_clear(cache);
@@ -749,6 +760,144 @@ static size_t fixed_command_owner(const LayoutDocument *layout,
         }
     }
     return owner;
+}
+
+/* Paint-order positions of the commands the fixed and sticky passes can
+   paint: those a fixed range owns, and those flagged sticky (or, without
+   command flags, inside a sticky range). Built from one walk of the paint
+   order the first time a frame needs it, and released with the layout. */
+typedef struct {
+    uint32_t order;
+    uint32_t command;
+} OverlayPaintEntry;
+
+/* Entries per list; past it (fixed or sticky content is most of the page)
+   the pass walks the display list, which painting dominates anyway. */
+#define RENDER_OVERLAY_INDEX_LIMIT 4096u
+
+struct RenderOverlayIndex {
+    const LayoutDocument *layout;
+    size_t count;
+    size_t fixed_count;
+    size_t sticky_count;
+    const uint32_t *paint_order;
+    OverlayPaintEntry *fixed;
+    size_t fixed_entries;
+    OverlayPaintEntry *sticky;
+    size_t sticky_entries;
+    bool fixed_indexed;
+    bool sticky_indexed;
+};
+
+static void overlay_index_release(TileCache *cache)
+{
+    if (cache == NULL || cache->overlay_index == NULL) return;
+    budget_free(cache->budget, cache->overlay_index->fixed);
+    budget_free(cache->budget, cache->overlay_index->sticky);
+    budget_free(cache->budget, cache->overlay_index);
+    cache->overlay_index = NULL;
+}
+
+static bool overlay_command_sticky(const LayoutDocument *layout,
+                                   size_t command_index, size_t range_count)
+{
+    if (layout->command_flags != NULL)
+        return (layout->command_flags[command_index]
+                & LAYOUT_COMMAND_STICKY) != 0;
+    for (size_t r = 0; r < range_count; r++) {
+        const StickyRange *range = &layout->sticky_ranges[r];
+        if (command_index >= range->command_start
+            && command_index < range->command_end) return true;
+    }
+    return false;
+}
+
+/* The index for the current layout, or NULL when it cannot be held (the
+   passes then walk the display list as before). */
+static const struct RenderOverlayIndex *overlay_index_prepare(TileCache *cache)
+{
+    const LayoutDocument *layout = cache->layout;
+    struct RenderOverlayIndex *index = cache->overlay_index;
+    if (index != NULL && index->layout == layout
+        && index->count == layout->count
+        && index->fixed_count == layout->fixed_count
+        && index->sticky_count == layout->sticky_count
+        && index->paint_order == layout->paint_order) return index;
+    overlay_index_release(cache);
+    if (layout->count > UINT32_MAX) return NULL;
+    size_t sticky_ranges = layout->sticky_count;
+    if (sticky_ranges > LAYOUT_STICKY_RANGE_LIMIT)
+        sticky_ranges = LAYOUT_STICKY_RANGE_LIMIT;
+    /* The commands any fixed or sticky range can hold. */
+    size_t low = SIZE_MAX, high = 0;
+    for (size_t r = 0; r < layout->fixed_count; r++) {
+        const FixedRange *range = &layout->fixed_ranges[r];
+        if (range->command_start < low) low = range->command_start;
+        if (range->command_end > high) high = range->command_end;
+    }
+    size_t sticky_low = SIZE_MAX, sticky_high = 0;
+    for (size_t r = 0; r < sticky_ranges; r++) {
+        const StickyRange *range = &layout->sticky_ranges[r];
+        if (range->command_start < sticky_low)
+            sticky_low = range->command_start;
+        if (range->command_end > sticky_high)
+            sticky_high = range->command_end;
+    }
+    bool flagged = layout->command_flags != NULL;
+    bool ordered = layout->paint_order_count == layout->count;
+    size_t fixed_entries = 0, sticky_entries = 0;
+    for (size_t pass = 0; pass < 2; pass++) {
+        if (pass == 1) {
+            index = budget_calloc(cache->budget, 1, sizeof(*index));
+            if (index == NULL) return NULL;
+            index->fixed_indexed = fixed_entries <= RENDER_OVERLAY_INDEX_LIMIT;
+            index->sticky_indexed =
+                sticky_entries <= RENDER_OVERLAY_INDEX_LIMIT;
+            if (!index->fixed_indexed) fixed_entries = 0;
+            if (!index->sticky_indexed) sticky_entries = 0;
+            index->fixed = fixed_entries == 0 ? NULL : budget_malloc(
+                cache->budget, fixed_entries * sizeof(*index->fixed));
+            index->sticky = sticky_entries == 0 ? NULL : budget_malloc(
+                cache->budget, sticky_entries * sizeof(*index->sticky));
+            cache->overlay_index = index;
+            if ((fixed_entries != 0 && index->fixed == NULL)
+                || (sticky_entries != 0 && index->sticky == NULL)) {
+                overlay_index_release(cache);
+                return NULL;
+            }
+        }
+        size_t fixed_at = 0, sticky_at = 0;
+        for (size_t order = 0; order < layout->count; order++) {
+            render_prepare_checkpoint(cache);
+            size_t i = ordered ? layout->paint_order[order] : order;
+            if ((pass == 0 || index->fixed_indexed)
+                && i >= low && i < high
+                && fixed_command_owner(layout, i) != SIZE_MAX) {
+                if (pass == 1) index->fixed[fixed_at] = (OverlayPaintEntry) {
+                    (uint32_t) order, (uint32_t) i };
+                fixed_at++;
+            }
+            if ((pass == 0 || index->sticky_indexed)
+                && sticky_ranges != 0
+                && (flagged || (i >= sticky_low && i < sticky_high))
+                && overlay_command_sticky(layout, i, sticky_ranges)) {
+                if (pass == 1) index->sticky[sticky_at] = (OverlayPaintEntry) {
+                    (uint32_t) order, (uint32_t) i };
+                sticky_at++;
+            }
+        }
+        fixed_entries = fixed_at;
+        sticky_entries = sticky_at;
+    }
+    index->layout = layout;
+    index->count = layout->count;
+    index->fixed_count = layout->fixed_count;
+    index->sticky_count = layout->sticky_count;
+    index->paint_order = layout->paint_order;
+    index->fixed_entries = fixed_entries;
+    index->sticky_entries = sticky_entries;
+    cache->overlay_index_builds++;
+    return index;
 }
 
 typedef struct {
@@ -1090,7 +1239,7 @@ static bool build_fixed_cache(TileCache *cache, int viewport_width,
             }
             clipped.rounded_clips = fixed.rounded_clips;
             clipped.rounded_clip_count = fixed.rounded_clip_count;
-            rasterize_command(cache, &clipped, &fixed.command);
+            rasterize_command_copy(cache, &clipped, &fixed.command, i);
         }
     }
     for (size_t y = 0; y < height; y++) {
@@ -1194,9 +1343,14 @@ static bool fixed_cache_patch(TileCache *cache, int left, int top,
         .top = screen_top, .right = screen_right, .bottom = screen_bottom
     };
     /* The same global paint order and clips as build_fixed_cache. */
-    for (size_t order = 0; order < cache->layout->count; order++) {
-        size_t i = cache->layout->paint_order_count == cache->layout->count
-                   ? cache->layout->paint_order[order] : order;
+    const struct RenderOverlayIndex *index = overlay_index_prepare(cache);
+    bool indexed = index != NULL && index->fixed_indexed;
+    size_t end = indexed ? index->fixed_entries : cache->layout->count;
+    for (size_t at = 0; at < end; at++) {
+        cache->overlay_commands_visited++;
+        size_t i = indexed ? index->fixed[at].command
+            : cache->layout->paint_order_count == cache->layout->count
+                ? cache->layout->paint_order[at] : at;
         size_t range_index = fixed_command_owner(cache->layout, i);
         if (range_index == SIZE_MAX) continue;
         const FixedRange *range = &cache->layout->fixed_ranges[range_index];
@@ -1215,7 +1369,7 @@ static bool fixed_cache_patch(TileCache *cache, int left, int top,
             continue;
         clipped.rounded_clips = fixed.rounded_clips;
         clipped.rounded_clip_count = fixed.rounded_clip_count;
-        rasterize_command(cache, &clipped, &fixed.command);
+        rasterize_command_copy(cache, &clipped, &fixed.command, i);
     }
     for (int y = screen_top; y < screen_bottom; y++) {
         size_t row = (size_t) (y - cache->fixed_top);
@@ -1317,8 +1471,10 @@ static void paint_sticky_command(TileCache *cache, uint16_t *frame, size_t i,
     if (cache->layout->command_flags == NULL
         || !(cache->layout->command_flags[i]
              & LAYOUT_COMMAND_OVERFLOW)) {
+        cache->raster_copy_source = i + 1u;
         paint_overlay_command(cache, frame, &command, scroll_y,
                               viewport_width, viewport_height);
+        cache->raster_copy_source = 0;
         return;
     }
 
@@ -1385,7 +1541,7 @@ static void paint_sticky_command(TileCache *cache, uint16_t *frame, size_t i,
         .rounded_clips = rounded_clips,
         .rounded_clip_count = rounded_clip_count
     };
-    rasterize_command(cache, &target, &command);
+    rasterize_command_copy(cache, &target, &command, i);
 }
 
 /* Sticky ranges paint after the tiles and the overflow stream, in paint
@@ -1431,12 +1587,25 @@ static void paint_sticky_overlays(TileCache *cache, uint16_t *frame,
     }
     if (!painting) return;
     bool ordered = layout->paint_order_count == layout->count;
+    const struct RenderOverlayIndex *index = overlay_index_prepare(cache);
+    const OverlayPaintEntry *entries = index != NULL && index->sticky_indexed
+        ? index->sticky : NULL;
+    size_t entry_count = entries == NULL ? 0 : index->sticky_entries;
+    /* The first entry at or after first_order. */
+    size_t entry_start = 0;
+    while (entries != NULL && entry_start < entry_count
+           && entries[entry_start].order < first_order) entry_start++;
+    bool indexed = index != NULL && index->sticky_indexed;
     if (untiled) {
         /* One pass in paint order, each command once. A sticky box nested
            in another moves with it and sticks on its own once that takes
            it further: the largest offset of the ranges holding it. */
-        for (size_t order = first_order; order < layout->count; order++) {
-            size_t i = ordered ? layout->paint_order[order] : order;
+        size_t end = indexed ? entry_count : layout->count;
+        for (size_t at = indexed ? entry_start : first_order; at < end;
+             at++) {
+            cache->overlay_commands_visited++;
+            size_t i = indexed ? entries[at].command
+                : ordered ? layout->paint_order[at] : at;
             if ((layout->command_flags[i] & LAYOUT_COMMAND_STICKY) == 0)
                 continue;
             int sticky_dy = INT_MIN;
@@ -1459,8 +1628,12 @@ static void paint_sticky_overlays(TileCache *cache, uint16_t *frame,
     for (size_t range_index = 0; range_index < range_count; range_index++) {
         const StickyRange *range = &layout->sticky_ranges[range_index];
         if (offsets[range_index] == INT_MIN) continue;
-        for (size_t order = first_order; order < layout->count; order++) {
-            size_t i = ordered ? layout->paint_order[order] : order;
+        size_t end = indexed ? entry_count : layout->count;
+        for (size_t at = indexed ? entry_start : first_order; at < end;
+             at++) {
+            cache->overlay_commands_visited++;
+            size_t i = indexed ? entries[at].command
+                : ordered ? layout->paint_order[at] : at;
             if (i < range->command_start || i >= range->command_end) continue;
             paint_sticky_command(cache, frame, i, offsets[range_index],
                                  scroll_y, viewport_width, viewport_height);
@@ -1484,9 +1657,21 @@ static void paint_fixed_overlays(TileCache *cache, uint16_t *frame,
         .right = viewport_width,
         .bottom = viewport_height
     };
-    for (size_t order = 0; order < cache->layout->count; order++) {
-        size_t i = cache->layout->paint_order_count == cache->layout->count
-                   ? cache->layout->paint_order[order] : order;
+    const struct RenderOverlayIndex *index = overlay_index_prepare(cache);
+    bool indexed = index != NULL && index->fixed_indexed;
+    if (indexed && bounded_only) {
+        /* The cached layer holds every unbounded range. */
+        bool bounded = false;
+        for (size_t r = 0; !bounded && r < cache->layout->fixed_count; r++)
+            bounded = cache->layout->fixed_ranges[r].scroll_end != INT_MAX;
+        if (!bounded) return;
+    }
+    size_t end = indexed ? index->fixed_entries : cache->layout->count;
+    for (size_t at = 0; at < end; at++) {
+        cache->overlay_commands_visited++;
+        size_t i = indexed ? index->fixed[at].command
+            : cache->layout->paint_order_count == cache->layout->count
+                ? cache->layout->paint_order[at] : at;
         size_t range_index = fixed_command_owner(cache->layout, i);
         if (range_index == SIZE_MAX) continue;
         const FixedRange *range = &cache->layout->fixed_ranges[range_index];
@@ -1527,7 +1712,7 @@ static void paint_fixed_overlays(TileCache *cache, uint16_t *frame,
             clipped.bottom = fixed.clip_bottom;
             clipped.rounded_clips = fixed.rounded_clips;
             clipped.rounded_clip_count = fixed.rounded_clip_count;
-            rasterize_command(cache, &clipped, &fixed.command);
+            rasterize_command_copy(cache, &clipped, &fixed.command, i);
         }
     }
 }
@@ -1991,6 +2176,36 @@ RenderFrameWorkResult tile_cache_prepare_frame_bounded_cancelable(
     return RENDER_FRAME_WORK_PENDING;
 }
 
+bool tile_cache_compose_resident(TileCache *cache, int scroll_y,
+                                 int viewport_width, int viewport_height)
+{
+    if (cache == NULL || cache->tiles == NULL || cache->frame == NULL
+        || cache->frame_composing || cache->preparation_polling
+        || viewport_width != cache->last_frame_viewport_width
+        || viewport_height != cache->last_frame_viewport_height
+        || tile_cache_canvas_deferral(cache) != NULL) return false;
+    if (scroll_y > cache->last_frame_maximum_scroll)
+        scroll_y = cache->last_frame_maximum_scroll;
+    if (scroll_y < 0) scroll_y = 0;
+    int last_tx = (viewport_width - 1) / TILEFINCH_TILE_SIZE;
+    int first_ty = scroll_y / TILEFINCH_TILE_SIZE;
+    int last_ty = (scroll_y + viewport_height - 1) / TILEFINCH_TILE_SIZE;
+    for (int ty = first_ty; ty <= last_ty; ty++) {
+        for (int tx = 0; tx <= last_tx; tx++) {
+            const RenderTile *tile = find_tile(cache, tx, ty);
+            if (tile != NULL)
+                copy_tile_to_frame(tile, cache->frame, scroll_y,
+                                   viewport_width, viewport_height);
+            else
+                checkerboard_tile_to_frame(cache, tx, ty, cache->frame,
+                                           scroll_y, viewport_width,
+                                           viewport_height);
+        }
+    }
+    cache->last_frame_scroll_valid = false;
+    return true;
+}
+
 bool tile_cache_render_frame(TileCache *cache, int scroll_y,
                              int viewport_width, int viewport_height,
                              const char *output_path)
@@ -2249,6 +2464,7 @@ bool tile_cache_render_frame(TileCache *cache, int scroll_y,
     cache->frame_indicator_us += phase_finished - phase_started;
     if (ok) {
         cache->last_frame_scroll_y = scroll_y;
+        cache->last_frame_maximum_scroll = maximum_scroll;
         cache->last_frame_viewport_width = viewport_width;
         cache->last_frame_viewport_height = viewport_height;
         cache->last_frame_scroll_valid = true;
@@ -3215,6 +3431,7 @@ size_t tile_cache_reclaim_optional(TileCache *cache)
         cache->tiles_allocated--;
     }
     overflow_cache_destroy(cache);
+    overlay_index_release(cache);
     cache->overflow_cache_disabled = false;
     size_t after = budget_remaining(cache->budget);
     return after > before ? after - before : 0;
@@ -3243,6 +3460,7 @@ static void tile_cache_commit_layout(TileCache *cache,
     const FontSet *old_fonts = cache->source_layout != NULL
                                ? cache->source_layout->fonts : NULL;
     overflow_cache_destroy(cache);
+    overlay_index_release(cache);
     cache->overflow_cache_disabled = false;
     tile_cache_cancel_frame_work(cache);
     cache->last_frame_scroll_valid = false;

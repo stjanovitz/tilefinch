@@ -1,3 +1,5 @@
+#include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1355,6 +1357,114 @@ static size_t make_format_sps(unsigned char output[64], uint32_t profile,
     return length;
 }
 
+static void sps_se(SpsFixture *sps, int64_t value)
+{
+    sps_ue(sps, value > 0 ? (uint32_t) (2 * value - 1)
+                          : (uint32_t) (-2 * value));
+}
+
+/* A 432x240 High-profile SPS whose first 4x4 scaling list starts with
+   delta_scale `delta` and continues flat. */
+static size_t make_scaling_sps(unsigned char output[64], int64_t delta)
+{
+    SpsFixture sps = {0};
+    sps_bits(&sps, 0x67, 8);
+    sps_bits(&sps, 100u, 8);
+    sps_bits(&sps, 0, 8);
+    sps_bits(&sps, 30, 8);
+    sps_ue(&sps, 0);            /* seq_parameter_set_id */
+    sps_ue(&sps, 1);            /* 4:2:0 */
+    sps_ue(&sps, 0);
+    sps_ue(&sps, 0);
+    sps_bits(&sps, 0, 1);       /* qpprime_y_zero_transform_bypass */
+    sps_bits(&sps, 1, 1);       /* seq_scaling_matrix_present */
+    sps_bits(&sps, 1, 1);       /* list 0 present */
+    sps_se(&sps, delta);
+    int64_t next = ((8 + delta) % 256 + 256) % 256;
+    for (unsigned i = 1; i < 16u && next != 0; i++) sps_se(&sps, 0);
+    sps_bits(&sps, 0, 7);       /* lists 1..7 absent */
+    sps_ue(&sps, 0);            /* log2_max_frame_num_minus4 */
+    sps_ue(&sps, 0);            /* pic_order_cnt_type */
+    sps_ue(&sps, 0);            /* log2_max_pic_order_cnt_lsb_minus4 */
+    sps_ue(&sps, 1);            /* max_num_ref_frames */
+    sps_bits(&sps, 0, 1);
+    sps_ue(&sps, 26);
+    sps_ue(&sps, 14);
+    sps_bits(&sps, 1, 1);       /* frame_mbs_only */
+    sps_bits(&sps, 1, 1);
+    sps_bits(&sps, 0, 1);
+    sps_bits(&sps, 0, 1);
+    sps_bits(&sps, 1, 1);
+    size_t length = (sps.bit + 7u) / 8u;
+    memcpy(output, sps.bytes, length);
+    return length;
+}
+
+/* MD-08: delta_scale must be -128..127. Both SPS readers took any value
+   and wrapped it; an out-of-range one is now refused by both (as ffmpeg
+   does). ue(v) caps |delta| below 2^30, so `last + delta + 256` could not
+   in fact overflow int. */
+static int test_sps_scaling_delta_range(void)
+{
+    puts("test: an SPS scaling-list delta outside -128..127 is refused");
+    static const struct { int64_t delta; bool valid; } cases[] = {
+        {1, true}, {127, true}, {-128, true}, {-8, true},
+        {128, false}, {-129, false},
+        /* The largest magnitudes se(v) can carry here: ue(v) stops at 30
+           leading zeros. */
+        {(1 << 30) - 1, false}, {-((1 << 30) - 1), false}
+    };
+    /* PPS: ids 0, CABAC, the defaults the compat adapter admits. */
+    SpsFixture pps = {0};
+    sps_bits(&pps, 0x68, 8);
+    sps_ue(&pps, 0);
+    sps_ue(&pps, 0);
+    sps_bits(&pps, 1, 1);       /* entropy_coding_mode (CABAC) */
+    sps_bits(&pps, 0, 1);
+    sps_ue(&pps, 0);            /* one slice group */
+    sps_ue(&pps, 0);
+    sps_ue(&pps, 0);
+    sps_bits(&pps, 0, 1);
+    sps_bits(&pps, 0, 2);
+    sps_se(&pps, 0);
+    sps_se(&pps, 0);
+    sps_se(&pps, 0);
+    sps_bits(&pps, 1, 1);
+    sps_bits(&pps, 0, 1);
+    sps_bits(&pps, 0, 1);
+    sps_bits(&pps, 1, 1);
+    size_t pps_length = (pps.bit + 7u) / 8u;
+    for (size_t at = 0; at < sizeof(cases) / sizeof(cases[0]); at++) {
+        unsigned char sps[64];
+        size_t sps_length = make_scaling_sps(sps, cases[at].delta);
+        uint16_t width = 0, height = 0;
+        bool parsed = media_h264_sps_dimensions(
+            sps, sps_length, &width, &height);
+        unsigned char avcc[160] = {
+            1, 100, 0, 30, 0xff, 0xe1,
+            (unsigned char) (sps_length >> 8), (unsigned char) sps_length
+        };
+        size_t avcc_length = 8u;
+        memcpy(avcc + avcc_length, sps, sps_length);
+        avcc_length += sps_length;
+        avcc[avcc_length++] = 1u;
+        avcc[avcc_length++] = (unsigned char) (pps_length >> 8);
+        avcc[avcc_length++] = (unsigned char) pps_length;
+        memcpy(avcc + avcc_length, pps.bytes, pps_length);
+        avcc_length += pps_length;
+        MediaH264PspCompat compat;
+        bool compat_ok = media_h264_psp_compat_init(
+            &compat, avcc, avcc_length);
+        printf("scaling delta %lld: SPS reader %s, compat adapter %s\n",
+               (long long) cases[at].delta,
+               parsed ? "accepts" : "refuses",
+               compat_ok ? "accepts" : "refuses");
+        CHECK(parsed == cases[at].valid && compat_ok == cases[at].valid);
+        if (parsed) CHECK(width == 432u && height == 240u);
+    }
+    return 0;
+}
+
 static int test_sps_held_frames(void)
 {
     puts("test: the software decoder's arena depth comes from the SPS");
@@ -1478,6 +1588,57 @@ static int test_sps_held_frames(void)
         CHECK(media_h264_config_software_coding(NULL, 0, true)
               == MEDIA_H264_SOFTWARE_CODING_UNKNOWN);
     }
+    puts("test: an in-band SPS on the software route keeps the open-time "
+         "coding (MB-01)");
+    {
+        static const struct {
+            uint32_t profile, chroma, depth, frame_only;
+            bool admitted;
+        } cases[] = {
+            {100u, 1u, 0u, 1u, true},
+            {66u, 1u, 0u, 1u, true},
+            {100u, 1u, 0u, 0u, false},   /* field / MBAFF */
+            {122u, 2u, 0u, 1u, false},   /* 4:2:2 */
+            {244u, 3u, 0u, 1u, false},   /* 4:4:4 */
+            {110u, 1u, 2u, 1u, false},   /* 10-bit */
+            {110u, 0u, 2u, 1u, false},   /* 10-bit monochrome */
+            {88u, 1u, 0u, 1u, false},    /* Extended: no decoder route */
+        };
+        static const unsigned char slice[] = {0, 0, 1, 0x65, 0x88, 0x84};
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            unsigned char format_sps[64];
+            size_t format_length = make_format_sps(
+                format_sps, cases[i].profile, cases[i].chroma,
+                cases[i].depth, cases[i].frame_only);
+            unsigned char unit[96] = {0, 0, 0, 1};
+            memcpy(unit + 4u, format_sps, format_length);
+            memcpy(unit + 4u + format_length, slice, sizeof(slice));
+            size_t unit_length = 4u + format_length + sizeof(slice);
+            uint16_t unit_width = 0, unit_height = 0;
+            CHECK(media_h264_sps_dimensions(
+                format_sps, format_length, &unit_width, &unit_height));
+            /* The size is unchanged, so the geometry rule admits every one
+               of them; only the coding rule tells them apart. */
+            CHECK(media_h264_annexb_sample_is_admitted(
+                unit, unit_length, unit_width, unit_height));
+            CHECK(media_h264_annexb_software_sample_verdict(
+                      unit, unit_length, unit_width, unit_height)
+                  == (cases[i].admitted
+                          ? MEDIA_H264_SAMPLE_ADMITTED
+                          : MEDIA_H264_SAMPLE_CODING_UNSUPPORTED));
+            /* A geometry change is still a geometry refusal. */
+            CHECK(media_h264_annexb_software_sample_verdict(
+                      unit, unit_length, (uint16_t) (unit_width + 16u),
+                      unit_height)
+                  == MEDIA_H264_SAMPLE_REFUSED);
+        }
+        /* A unit with no SPS keeps the one admitted earlier. */
+        CHECK(media_h264_annexb_software_sample_verdict(
+                  slice, sizeof(slice), 432, 240)
+              == MEDIA_H264_SAMPLE_ADMITTED);
+        CHECK(media_h264_annexb_software_sample_verdict(NULL, 0, 432, 240)
+              == MEDIA_H264_SAMPLE_REFUSED);
+    }
     puts("test: reorder-free streams let colour conversion start early");
     length = make_reference_avcc(
         config, reference_sps_a, sizeof(reference_sps_a));   /* reorder 0 */
@@ -1504,6 +1665,353 @@ static int test_sps_held_frames(void)
               == MEDIA_H264_ENTROPY_UNKNOWN
           && media_h264_config_entropy(NULL, 0, true)
               == MEDIA_H264_ENTROPY_UNKNOWN);
+    return 0;
+}
+
+/* Bit writer for the PSP compat-transform fixtures below. */
+typedef struct {
+    unsigned char bytes[128];
+    size_t bit;
+} CompatNal;
+
+static void compat_bits(CompatNal *nal, uint32_t value, unsigned count)
+{
+    for (unsigned i = 0; i < count; i++) {
+        if (((value >> (count - i - 1u)) & 1u) != 0)
+            nal->bytes[nal->bit / 8u] |=
+                (unsigned char) (1u << (7u - nal->bit % 8u));
+        nal->bit++;
+    }
+}
+
+static void compat_ue(CompatNal *nal, uint32_t value)
+{
+    uint32_t code = value + 1u;
+    unsigned bits = 0;
+    for (uint32_t at = code; at != 0; at >>= 1u) bits++;
+    compat_bits(nal, 0, bits - 1u);
+    compat_bits(nal, code, bits);
+}
+
+static void compat_se(CompatNal *nal, int32_t value)
+{
+    compat_ue(nal, value > 0 ? (uint32_t) value * 2u - 1u
+                             : (uint32_t) -value * 2u);
+}
+
+static size_t compat_finish_rbsp(CompatNal *nal)
+{
+    compat_bits(nal, 1u, 1u);
+    while (nal->bit % 8u != 0) compat_bits(nal, 0, 1u);
+    return nal->bit / 8u;
+}
+
+/* Main-profile avcC the compat adapter admits: CABAC, POC type 0, the
+   given field widths and pps_id, deblocking control present. */
+static size_t compat_avcc(unsigned char output[128], unsigned frame_minus4,
+                          unsigned poc_minus4, uint32_t pps_id)
+{
+    CompatNal sps = {{0}, 0};
+    compat_bits(&sps, 0x67, 8);
+    compat_bits(&sps, 77, 8);
+    compat_bits(&sps, 0x40, 8);
+    compat_bits(&sps, 30, 8);
+    compat_ue(&sps, 0);              /* sps_id */
+    compat_ue(&sps, frame_minus4);
+    compat_ue(&sps, 0);              /* pic_order_cnt_type */
+    compat_ue(&sps, poc_minus4);
+    compat_ue(&sps, 2);              /* max_num_ref_frames */
+    compat_bits(&sps, 0, 1);
+    compat_ue(&sps, 19);
+    compat_ue(&sps, 14);
+    compat_bits(&sps, 1, 1);         /* frame_mbs_only */
+    compat_bits(&sps, 1, 1);
+    compat_bits(&sps, 0, 1);
+    compat_bits(&sps, 0, 1);
+    size_t sps_length = compat_finish_rbsp(&sps);
+    CompatNal pps = {{0}, 0};
+    compat_bits(&pps, 0x68, 8);
+    compat_ue(&pps, pps_id);
+    compat_ue(&pps, 0);
+    compat_bits(&pps, 1, 1);         /* CABAC */
+    compat_bits(&pps, 0, 1);
+    compat_ue(&pps, 0);              /* one slice group */
+    compat_ue(&pps, 1);              /* two l0 references by default */
+    compat_ue(&pps, 0);
+    compat_bits(&pps, 0, 1);
+    compat_bits(&pps, 0, 2);
+    compat_se(&pps, 25);             /* pic_init_qp 51 */
+    compat_se(&pps, 0);
+    compat_se(&pps, 0);
+    compat_bits(&pps, 1, 1);         /* deblocking control present */
+    compat_bits(&pps, 0, 1);
+    compat_bits(&pps, 0, 1);
+    size_t pps_length = compat_finish_rbsp(&pps);
+    size_t at = 0;
+    output[at++] = 1; output[at++] = 77; output[at++] = 0x40;
+    output[at++] = 30; output[at++] = 0xff; output[at++] = 0xe1;
+    output[at++] = 0; output[at++] = (unsigned char) sps_length;
+    memcpy(output + at, sps.bytes, sps_length); at += sps_length;
+    output[at++] = 1;
+    output[at++] = 0; output[at++] = (unsigned char) pps_length;
+    memcpy(output + at, pps.bytes, pps_length); at += pps_length;
+    return at;
+}
+
+typedef struct {
+    unsigned nal_header;          /* 0x61 reference, 0x01 non-reference */
+    uint32_t slice_type;
+    uint32_t pps_id;
+    unsigned frame_bits;
+    uint32_t frame_num;
+    unsigned poc_bits;
+    uint32_t poc;
+    /* Adaptive marking: 0 = sliding window, else the number of MMCO 1
+       operations, each with difference_of_pic_nums_minus1 = mmco_value. */
+    unsigned mmco_ops;
+    uint32_t mmco_value;
+    int32_t qp_delta;
+} CompatSlice;
+
+/* One CABAC slice header (non-IDR) followed by a payload with no zero
+   bytes, so any 00 00 0x in a rewritten NAL is the rewrite's doing. */
+static size_t compat_slice(unsigned char *output, const CompatSlice *slice)
+{
+    CompatNal nal = {{0}, 0};
+    unsigned class = slice->slice_type % 5u;
+    compat_bits(&nal, slice->nal_header, 8);
+    compat_ue(&nal, 0);                          /* first_mb */
+    compat_ue(&nal, slice->slice_type);
+    compat_ue(&nal, slice->pps_id);
+    compat_bits(&nal, slice->frame_num, slice->frame_bits);
+    compat_bits(&nal, slice->poc, slice->poc_bits);
+    if (class == 1u) compat_bits(&nal, 1, 1);    /* direct_spatial */
+    if (class == 0u || class == 1u) {
+        compat_bits(&nal, 0, 1);                 /* no override */
+        compat_bits(&nal, 0, 1);                 /* no l0 modification */
+        if (class == 1u) compat_bits(&nal, 0, 1);
+    }
+    if ((slice->nal_header >> 5u) != 0u) {
+        compat_bits(&nal, slice->mmco_ops != 0u, 1);
+        if (slice->mmco_ops != 0u) {
+            for (unsigned i = 0; i < slice->mmco_ops; i++) {
+                compat_ue(&nal, 1);
+                compat_ue(&nal, slice->mmco_value);
+            }
+            compat_ue(&nal, 0);
+        }
+    }
+    if (class != 2u) compat_ue(&nal, 0);         /* cabac_init_idc */
+    compat_se(&nal, slice->qp_delta);
+    compat_ue(&nal, 1);                          /* deblocking off */
+    while (nal.bit % 8u != 0) compat_bits(&nal, 1, 1);
+    size_t length = nal.bit / 8u;
+    static const unsigned char payload[] = {0xaa, 0x55, 0xc3, 0x5a, 0x99};
+    memcpy(nal.bytes + length, payload, sizeof(payload));
+    length += sizeof(payload);
+    memcpy(output, nal.bytes, length);
+    return length;
+}
+
+static void compat_put_u32(unsigned char *output, size_t value)
+{
+    output[0] = (unsigned char) (value >> 24u);
+    output[1] = (unsigned char) (value >> 16u);
+    output[2] = (unsigned char) (value >> 8u);
+    output[3] = (unsigned char) value;
+}
+
+/* A closed recovery-point SEI followed by the given slice. */
+static size_t compat_recovery_unit(
+    unsigned char output[256], const CompatSlice *slice)
+{
+    static const unsigned char sei[] = {0x06, 0x06, 0x01, 0xc4, 0x80};
+    size_t at = 0;
+    compat_put_u32(output, sizeof(sei)); at += 4u;
+    memcpy(output + at, sei, sizeof(sei)); at += sizeof(sei);
+    size_t length = compat_slice(output + at + 4u, slice);
+    compat_put_u32(output + at, length);
+    return at + 4u + length;
+}
+
+static size_t compat_single_unit(
+    unsigned char output[256], const CompatSlice *slice)
+{
+    size_t length = compat_slice(output + 4u, slice);
+    compat_put_u32(output, length);
+    return 4u + length;
+}
+
+/* Whether any NAL of a length-prefixed unit holds 00 00 00..03. */
+static bool compat_unit_has_emulation(const unsigned char *unit, size_t length)
+{
+    size_t at = 0;
+    while (length - at >= 4u) {
+        size_t nal = ((size_t) unit[at] << 24u) | ((size_t) unit[at + 1u] << 16u)
+            | ((size_t) unit[at + 2u] << 8u) | unit[at + 3u];
+        at += 4u;
+        if (nal > length - at) return true;
+        for (size_t i = 0; i + 2u < nal; i++) {
+            if (unit[at + i] == 0 && unit[at + i + 1u] == 0
+                && unit[at + i + 2u] <= 3u) return true;
+        }
+        at += nal;
+    }
+    return false;
+}
+
+static int test_psp_compat_emulation(void)
+{
+    puts("test: PSP recovery rewrites never write an emulated start code "
+         "(MB-06)");
+    unsigned char avcc[128];
+    unsigned char unit[256];
+    MediaH264PspCompat compat;
+    /* Zeroing a 16-bit frame_num after pps_id 127 (whose code ends in seven
+       zeros) puts 00 00 01 into the rewritten header. */
+    size_t avcc_length = compat_avcc(avcc, 12u, 12u, 127u);
+    CHECK(media_h264_psp_compat_init(&compat, avcc, avcc_length));
+    CompatSlice start_code = {
+        0x61, 7u, 127u, 16u, 0xffffu, 16u, 0x8001u, 0, 0, 0
+    };
+    size_t length = compat_recovery_unit(unit, &start_code);
+    CHECK(!compat_unit_has_emulation(unit, length));
+    unsigned char before[256];
+    memcpy(before, unit, length);
+    size_t before_length = length;
+    CHECK(media_h264_psp_compat_transform(
+              &compat, unit, &length, sizeof(unit))
+          == MEDIA_H264_PSP_COMPAT_ERROR);
+    /* Refused before anything moved. */
+    CHECK(length == before_length && memcmp(unit, before, length) == 0);
+    /* The two inserted header bits move a run of zeros (a zero 16-bit POC,
+       the marking bits and a large slice_qp_delta) onto a byte boundary:
+       00 00 02 after the rewrite, 00 00 08 before it. */
+    avcc_length = compat_avcc(avcc, 0u, 12u, 0u);
+    CHECK(media_h264_psp_compat_init(&compat, avcc, avcc_length));
+    CompatSlice shifted = {0x61, 7u, 0u, 4u, 0xfu, 16u, 0u, 0, 0, -32};
+    length = compat_recovery_unit(unit, &shifted);
+    CHECK(!compat_unit_has_emulation(unit, length));
+    CHECK(media_h264_psp_compat_transform(
+              &compat, unit, &length, sizeof(unit))
+          == MEDIA_H264_PSP_COMPAT_ERROR);
+    /* Whatever is admitted, over a spread of field values, comes out with
+       no emulation pattern: recovery rewrites and first-P marking
+       removals both. */
+    unsigned rewritten = 0, refused = 0;
+    for (int32_t qp = -40; qp <= 40; qp += 3) {
+        for (uint32_t poc = 0; poc < 0x10000u; poc += 0x3fffu) {
+            media_h264_psp_compat_reset(&compat);
+            CompatSlice recovery = {
+                0x61, 7u, 0u, 4u, 0x9u, 16u, poc, 0, 0, qp
+            };
+            length = compat_recovery_unit(unit, &recovery);
+            if (compat_unit_has_emulation(unit, length)) continue;
+            MediaH264PspCompatResult result =
+                media_h264_psp_compat_transform(
+                    &compat, unit, &length, sizeof(unit));
+            if (result == MEDIA_H264_PSP_COMPAT_ERROR) {
+                refused++;
+                continue;
+            }
+            CHECK(result == MEDIA_H264_PSP_COMPAT_REWRITTEN);
+            CHECK(!compat_unit_has_emulation(unit, length));
+            rewritten++;
+            CompatSlice first_p = {
+                0x61, 5u, 0u, 4u, 0xau, 16u, poc, 2u,
+                (uint32_t) (qp + 40) % 7u, qp
+            };
+            length = compat_single_unit(unit, &first_p);
+            if (compat_unit_has_emulation(unit, length)) continue;
+            result = media_h264_psp_compat_transform(
+                &compat, unit, &length, sizeof(unit));
+            if (result == MEDIA_H264_PSP_COMPAT_ERROR) {
+                refused++;
+                continue;
+            }
+            CHECK(!compat_unit_has_emulation(unit, length));
+            rewritten++;
+        }
+    }
+    CHECK(rewritten > 20u);
+    (void) refused;
+    return 0;
+}
+
+static int test_psp_compat_first_reference(void)
+{
+    puts("test: any first reference picture after a recovery point plays "
+         "(MB-07)");
+    unsigned char avcc[128];
+    unsigned char unit[256];
+    MediaH264PspCompat compat;
+    size_t length = 0;
+    size_t avcc_length = compat_avcc(avcc, 0u, 4u, 0u);
+    CHECK(media_h264_psp_compat_init(&compat, avcc, avcc_length));
+    CompatSlice recovery = {0x61, 7u, 0u, 4u, 0x5u, 8u, 0x10u, 0, 0, -3};
+    length = compat_recovery_unit(unit, &recovery);
+    CHECK(media_h264_psp_compat_transform(
+              &compat, unit, &length, sizeof(unit))
+              == MEDIA_H264_PSP_COMPAT_REWRITTEN
+          && compat.first_reference_pending);
+    /* A non-reference B leaves the first reference still to come. */
+    CompatSlice b_non_ref = {0x01, 6u, 0u, 4u, 0x6u, 8u, 0x12u, 0, 0, 2};
+    length = compat_single_unit(unit, &b_non_ref);
+    CHECK(media_h264_psp_compat_transform(
+              &compat, unit, &length, sizeof(unit))
+              == MEDIA_H264_PSP_COMPAT_REWRITTEN
+          && compat.first_reference_pending);
+    /* A scene-cut I with sliding-window marking: nothing to remove, the
+       frame number still rebased, the transaction closed. */
+    CompatSlice i_ref = {0x61, 7u, 0u, 4u, 0x6u, 8u, 0x14u, 0, 0, 1};
+    length = compat_single_unit(unit, &i_ref);
+    size_t i_length = length;
+    CHECK(media_h264_psp_compat_transform(
+              &compat, unit, &length, sizeof(unit))
+              == MEDIA_H264_PSP_COMPAT_REWRITTEN
+          && length == i_length && !compat.first_reference_pending
+          && compat.reference_markings_removed == 0u);
+    /* A reference B (pyramid) carrying adaptive unmarking: removed. */
+    media_h264_psp_compat_reset(&compat);
+    length = compat_recovery_unit(unit, &recovery);
+    CHECK(media_h264_psp_compat_transform(
+              &compat, unit, &length, sizeof(unit))
+          == MEDIA_H264_PSP_COMPAT_REWRITTEN);
+    CompatSlice b_ref = {0x61, 6u, 0u, 4u, 0x6u, 8u, 0x12u, 1u, 0u, 2};
+    length = compat_single_unit(unit, &b_ref);
+    size_t b_length = length;
+    CHECK(media_h264_psp_compat_transform(
+              &compat, unit, &length, sizeof(unit))
+              == MEDIA_H264_PSP_COMPAT_REWRITTEN
+          && length <= b_length && !compat.first_reference_pending
+          && compat.reference_markings_removed == 1u);
+    /* A two-slice reference P with sliding-window marking: the first slice
+       is not the unit's last NAL, and needs no edit. */
+    media_h264_psp_compat_reset(&compat);
+    length = compat_recovery_unit(unit, &recovery);
+    CHECK(media_h264_psp_compat_transform(
+              &compat, unit, &length, sizeof(unit))
+          == MEDIA_H264_PSP_COMPAT_REWRITTEN);
+    CompatSlice p_ref = {0x61, 5u, 0u, 4u, 0x6u, 8u, 0x14u, 0, 0, 0};
+    length = compat_single_unit(unit, &p_ref);
+    length += compat_single_unit(unit + length, &p_ref);
+    CHECK(media_h264_psp_compat_transform(
+              &compat, unit, &length, sizeof(unit))
+              == MEDIA_H264_PSP_COMPAT_REWRITTEN
+          && !compat.first_reference_pending);
+    /* The same picture with an adaptive marking in a non-final slice still
+       fails closed: removing it there would move the rest of the unit. */
+    media_h264_psp_compat_reset(&compat);
+    length = compat_recovery_unit(unit, &recovery);
+    CHECK(media_h264_psp_compat_transform(
+              &compat, unit, &length, sizeof(unit))
+          == MEDIA_H264_PSP_COMPAT_REWRITTEN);
+    CompatSlice p_mmco = {0x61, 5u, 0u, 4u, 0x6u, 8u, 0x14u, 1u, 0u, 0};
+    length = compat_single_unit(unit, &p_mmco);
+    length += compat_single_unit(unit + length, &p_mmco);
+    CHECK(media_h264_psp_compat_transform(
+              &compat, unit, &length, sizeof(unit))
+          == MEDIA_H264_PSP_COMPAT_ERROR);
     return 0;
 }
 
@@ -1906,6 +2414,9 @@ int main(void)
 {
     if (test_firmware_reference_structure() != 0) return 1;
     if (test_sps_held_frames() != 0) return 1;
+    if (test_sps_scaling_delta_range() != 0) return 1;
+    if (test_psp_compat_emulation() != 0) return 1;
+    if (test_psp_compat_first_reference() != 0) return 1;
     puts("test: embedded PSP decoder fixtures are admissible");
     CHECK(validate_device_media_fixture(
               TILEFINCH_TEST_MEDIA_FIXTURE_240, 320, 240));
@@ -4007,9 +4518,33 @@ int main(void)
                     - PSP_MEDIA_DECODE_LEAD_US
           && psp_media_decode_clock_us(UINT64_C(700000), true)
                  == UINT64_C(700000)
-          && psp_media_first_frame_pending(false, UINT64_C(1))
-          && !psp_media_first_frame_pending(true, UINT64_C(1))
-          && !psp_media_first_frame_pending(false, 0)
+          && psp_media_first_frame_pending(
+                 false, false, false, true, UINT64_C(1))
+          && !psp_media_first_frame_pending(
+                 true, false, false, true, UINT64_C(1))
+          && !psp_media_first_frame_pending(false, false, false, true, 0)
+          /* A paused video still waits for the picture it shows. */
+          && psp_media_first_frame_pending(
+                 false, false, false, false, UINT64_C(1))
+          /* Audio-only media starts with its first presented audio, not a
+             picture it never has; audio in A/V media is not a picture. */
+          && psp_media_first_frame_pending(
+                 false, true, false, true, UINT64_C(1))
+          && !psp_media_first_frame_pending(
+                 false, true, true, true, UINT64_C(1))
+          && psp_media_first_frame_pending(
+                 false, false, true, true, UINT64_C(1))
+          /* Paused audio-only media has no output to wait for. */
+          && !psp_media_first_frame_pending(
+                 false, true, false, false, UINT64_C(1))
+          && strcmp(psp_media_first_output_timeout_headline(true),
+                    "AUDIO DIDN'T START") == 0
+          && strcmp(psp_media_first_output_timeout_headline(false),
+                    "VIDEO FIRST FRAME TIMED OUT") == 0
+          /* After that timeout, audio retries playing (there is no first
+             picture to show paused); video retries paused on its picture. */
+          && psp_media_first_output_retry_plays(true)
+          && !psp_media_first_output_retry_plays(false)
           && !psp_media_deadline_reached(0, UINT64_C(9000000), 1)
           && !psp_media_deadline_reached(
                  UINT64_C(100), UINT64_C(5099), UINT64_C(5000))
@@ -5155,7 +5690,11 @@ int main(void)
            submission overwrites -- being asked to hold it. */
         CHECK(PSP_MEDIA_AUDIO_STAGING_BYTES == 8192u);
         CHECK(PSP_MEDIA_AUDIO_PENDING_BYTES == 16384u);
-        CHECK(PSP_MEDIA_POOL_BYTES == 5538392u);
+        /* 5,538,392 before the decoder output buffer grew from one AAC
+           frame (1,024 stereo samples) to one MPEG-1 Layer III frame
+           (1,152): 512 bytes. */
+        CHECK(PSP_MEDIA_AUDIO_DECODE_BYTES == 4608u);
+        CHECK(PSP_MEDIA_POOL_BYTES == 5538904u);
 
         /*
          * The slot ownership machine's decisions, which are pure and so are

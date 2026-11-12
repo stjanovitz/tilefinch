@@ -545,6 +545,13 @@ typedef struct BrowserSession {
                                         [BROWSER_ORIGIN_LIMIT];
     size_t mixed_content_allowed_site_count;
     size_t third_party_cookie_allowed_site_count;
+    /* The unencrypted-audio answers, by top-level site: session-only like
+       the mixed-content grants. A decline is kept so the question is asked
+       once per site per session. */
+    char insecure_audio_sites[BROWSER_SECURITY_SITE_LIMIT]
+                             [BROWSER_ORIGIN_LIMIT];
+    uint8_t insecure_audio_answers[BROWSER_SECURITY_SITE_LIMIT];
+    size_t insecure_audio_site_count;
     /* The cookies a signed-in site needs to authenticate, registered by its
        provider (browser_session_set_credential_cookies; static storage). */
     const char *credential_cookie_site;
@@ -635,6 +642,21 @@ bool browser_session_mixed_content_site_allowed(
     const BrowserSession *session, const char *url);
 bool browser_session_set_third_party_cookie_site_allowed(
     BrowserSession *session, const char *url, bool allowed);
+/* The answer to "play this site's unencrypted audio stream?". ALLOWED lets
+   that top-level site's audio playback requests (and only those) use plain
+   HTTP for the rest of the session; nothing here reaches storage. */
+typedef enum {
+    BROWSER_INSECURE_AUDIO_UNASKED = 0,
+    BROWSER_INSECURE_AUDIO_ALLOWED,
+    BROWSER_INSECURE_AUDIO_DECLINED
+} BrowserInsecureAudioAnswer;
+BrowserInsecureAudioAnswer browser_session_insecure_audio_site(
+    const BrowserSession *session, const char *url);
+/* UNASKED forgets the answer. False when the URL has no site or the table
+   is full. */
+bool browser_session_set_insecure_audio_site(
+    BrowserSession *session, const char *url,
+    BrowserInsecureAudioAnswer answer);
 /* Begins and ends a temporary captive-portal partition. The normal cookie and
    storage tables are restored byte-for-byte; portal data is destroyed. */
 bool browser_session_captive_portal_begin(
@@ -665,6 +687,17 @@ bool browser_session_site_adapter_state_get(
     BrowserSession *session, const char *key, void *data,
     size_t data_capacity, size_t *data_length, uint64_t now_ns,
     uint64_t maximum_age_ns);
+/* The _bound pair replaces the whole-jar cookie fingerprint with a caller's
+   binding: the state stays valid while the caller's value is unchanged, so an
+   adapter can depend on the cookies it actually reads and not on preference
+   cookies it rewrites itself. Clearing cookies still drops the state. */
+bool browser_session_site_adapter_state_put_bound(
+    BrowserSession *session, const char *key, const void *data,
+    size_t data_length, uint64_t now_ns, uint64_t binding);
+bool browser_session_site_adapter_state_get_bound(
+    BrowserSession *session, const char *key, void *data,
+    size_t data_capacity, size_t *data_length, uint64_t now_ns,
+    uint64_t maximum_age_ns, uint64_t binding);
 void browser_session_site_adapter_state_remove(
     BrowserSession *session, const char *key);
 bool browser_session_site_adapter_document_cache_put(

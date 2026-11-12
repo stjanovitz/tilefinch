@@ -1,6 +1,11 @@
 /* Intl polyfill: QuickJS has no Intl, so pages that touch it receive this
-   bounded surface. Installed lazily on first access to the Intl global
-   (see lazy_bootstrap_properties); nothing in the eager bootstrap needs it. */
+   bounded en-US surface (the "bounded-en-us-utc" replay contract; other
+   locales format as en-US, and a named time zone other than the host's
+   formats as UTC). Installed lazily on first access to the Intl global
+   (see lazy_bootstrap_properties), or on the first Number or BigInt
+   toLocaleString, or Date toLocale*String with locales or options, which
+   compat.js routes here. benchmarks/capture-reference.js keeps a copy of
+   NumberFormat in lockstep for reference captures. */
 (() => {
   if (globalThis.Intl === undefined) {
     const localeTag = (value) =>
@@ -33,80 +38,312 @@
         return new Locale(this.baseName);
       }
     }
+    /* en-US number formatting (the bounded en-US contract): grouping,
+       ECMA-402 fraction-digit defaults, currency symbols and minor units,
+       percent, compact and scientific notation, significant digits and
+       sign display. Other locales format as en-US. */
+    const currencyDigits = (code) =>
+        /^(?:BIF|CLP|DJF|GNF|ISK|JPY|KMF|KRW|PYG|RWF|UGX|UYI|VND|VUV|XAF|XOF|XPF)$/
+          .test(code) ? 0
+          : /^(?:BHD|IQD|JOD|KWD|LYD|OMR|TND)$/.test(code) ? 3 : 2,
+      currencySymbols = {
+        USD: "$", EUR: "€", GBP: "£", JPY: "¥", INR: "₹", CNY: "CN¥",
+        KRW: "₩", CAD: "CA$", AUD: "A$", MXN: "MX$", BRL: "R$", HKD: "HK$",
+        NZD: "NZ$", ILS: "₪", VND: "₫", TWD: "NT$", PHP: "₱", XAF: "FCFA",
+      },
+      narrowSymbols = {
+        CAD: "$", AUD: "$", MXN: "$", HKD: "$", NZD: "$", TWD: "$",
+        CNY: "¥", RUB: "₽", UAH: "₴", TRY: "₺", PLN: "zł", THB: "฿",
+        NGN: "₦", KZT: "₸", SEK: "kr", NOK: "kr", DKK: "kr",
+      },
+      compactShort = ["", "K", "M", "B", "T"],
+      compactLong = ["", "thousand", "million", "billion", "trillion"],
+      /* Short unit labels; "" joins the label to the number. */
+      unitLabels = {
+        percent: "%", celsius: "°C", fahrenheit: "°F", degree: "deg",
+        kilometer: " km", meter: " m", centimeter: " cm", millimeter: " mm",
+        mile: " mi", foot: " ft", inch: " in", kilogram: " kg", gram: " g",
+        pound: " lb", liter: " L", milliliter: " mL", second: " sec",
+        minute: " min", hour: " hr", millisecond: " ms", byte: " byte",
+        kilobyte: " kB", megabyte: " MB", gigabyte: " GB",
+        "kilometer-per-hour": " km/h", "mile-per-hour": " mph",
+      },
+      choice = (options, key, allowed, fallback) => {
+        const value = options[key];
+        if (value === undefined) return fallback;
+        const text = String(value);
+        if (!allowed.includes(text))
+          throw new RangeError("Value " + text + " out of range for " + key);
+        return text;
+      },
+      digitOption = (options, key, minimum, maximum, fallback) => {
+        const value = options[key];
+        if (value === undefined) return fallback;
+        const number = Math.floor(Number(value));
+        if (!(number >= minimum && number <= maximum))
+          throw new RangeError(key + " value is out of range.");
+        return number;
+      },
+      /* A decimal as [digits, exponent], value = 0.digits x 10^exponent,
+         from the shortest round-trip text of a number (as ICU formats) or
+         a BigInt's digits; zero is ["", 1]. */
+      decimalOf = (value) => {
+        let text = String(value), exponent = 0;
+        const e = text.indexOf("e");
+        if (e >= 0) {
+          exponent = Number(text.slice(e + 1));
+          text = text.slice(0, e);
+        }
+        const point = text.indexOf(".");
+        let digits = text.replace(".", "");
+        exponent += point < 0 ? text.length : point;
+        const leading = digits.length - digits.replace(/^0+/, "").length;
+        digits = digits.slice(leading).replace(/0+$/, "");
+        return digits ? [digits, exponent - leading] : ["", 1];
+      },
+      /* Keeps `keep` leading digits, rounding half away from zero. */
+      roundDecimal = ([digits, exponent], keep) => {
+        if (keep >= digits.length) return [digits, exponent];
+        if (keep < 0) return ["", 1];
+        let kept = digits.slice(0, keep);
+        if (digits.charCodeAt(keep) >= 53) {
+          let at = kept.length - 1;
+          while (at >= 0 && kept[at] === "9") at--;
+          if (at < 0) {
+            kept = "1";
+            exponent++;
+          } else
+            kept = kept.slice(0, at) +
+              String.fromCharCode(kept.charCodeAt(at) + 1);
+        }
+        kept = kept.replace(/0+$/, "");
+        return kept ? [kept, exponent] : ["", 1];
+      },
+      /* Plain digits with at least `fraction` fraction digits. */
+      plainDecimal = ([digits, exponent], fraction) => {
+        const integer = exponent <= 0 ? "0"
+            : digits.slice(0, exponent).padEnd(exponent, "0"),
+          shown = (exponent < 0 ? "0".repeat(-exponent) + digits
+            : digits.slice(exponent)).padEnd(fraction, "0");
+        return shown ? integer + "." + shown : integer;
+      };
     class NumberFormat {
       constructor(locales, options = {}) {
         this.locale = localeTag(Array.isArray(locales) ? locales[0] : locales);
-        this.options = options || {};
+        options = options === undefined ? {} : Object(options);
+        const r = (this.resolved = {});
+        r.style = choice(options, "style",
+          ["decimal", "percent", "currency", "unit"], "decimal");
+        if (options.currency !== undefined) {
+          r.currency = String(options.currency).toUpperCase();
+          if (!/^[A-Z]{3}$/.test(r.currency))
+            throw new RangeError("Invalid currency code : " + options.currency);
+        } else if (r.style === "currency")
+          throw new TypeError("Currency code is required with currency style.");
+        if (r.style === "currency") {
+          r.currencyDisplay = choice(options, "currencyDisplay",
+            ["symbol", "narrowSymbol", "code", "name"], "symbol");
+          r.currencySign = choice(options, "currencySign",
+            ["standard", "accounting"], "standard");
+        }
+        if (r.style === "unit") {
+          if (options.unit === undefined)
+            throw new TypeError("Unit is required with unit style.");
+          r.unit = String(options.unit);
+          r.unitDisplay = choice(options, "unitDisplay",
+            ["short", "narrow", "long"], "short");
+        }
+        r.notation = choice(options, "notation",
+          ["standard", "scientific", "engineering", "compact"], "standard");
+        if (r.notation === "compact")
+          r.compactDisplay = choice(options, "compactDisplay",
+            ["short", "long"], "short");
+        r.minimumIntegerDigits =
+          digitOption(options, "minimumIntegerDigits", 1, 21, 1);
+        const significant = options.minimumSignificantDigits !== undefined ||
+            options.maximumSignificantDigits !== undefined,
+          fractional = options.minimumFractionDigits !== undefined ||
+            options.maximumFractionDigits !== undefined,
+          defaultMinimum = r.style === "currency" && r.notation !== "compact"
+            ? currencyDigits(r.currency) : 0,
+          defaultMaximum = r.style === "currency" && r.notation !== "compact"
+            ? defaultMinimum : r.style === "percent" ? 0 : 3;
+        if (significant) {
+          r.minimumSignificantDigits =
+            digitOption(options, "minimumSignificantDigits", 1, 21, 1);
+          r.maximumSignificantDigits = digitOption(options,
+            "maximumSignificantDigits", r.minimumSignificantDigits, 21, 21);
+        } else if (fractional || r.notation !== "compact") {
+          let minimum = digitOption(options, "minimumFractionDigits", 0, 100,
+              undefined),
+            maximum = digitOption(options, "maximumFractionDigits", 0, 100,
+              undefined);
+          if (minimum === undefined)
+            minimum = Math.min(defaultMinimum, maximum ?? defaultMinimum);
+          else if (maximum === undefined)
+            maximum = Math.max(defaultMaximum, minimum);
+          else if (minimum > maximum)
+            throw new RangeError("maximumFractionDigits value is out of range.");
+          r.minimumFractionDigits = minimum;
+          r.maximumFractionDigits = maximum ?? Math.max(defaultMaximum, minimum);
+        } else r.compactRounding = true;
+        const grouping = options.useGrouping;
+        r.useGrouping = grouping === undefined
+          ? (r.notation === "compact" ? "min2" : "auto")
+          : grouping === true || grouping === "true" ? "always"
+          : grouping === false || grouping === "false" ? false
+          : choice({ grouping }, "grouping", ["min2", "auto", "always"]);
+        r.signDisplay = choice(options, "signDisplay",
+          ["auto", "never", "always", "exceptZero", "negative"], "auto");
       }
-      format(value) {
-        let number = Number(value);
-        if (this.options.style === "percent") number *= 100;
-        const minimum =
-            this.options.minimumFractionDigits === undefined
-              ? 0
-              : Number(this.options.minimumFractionDigits),
-          maximum =
-            this.options.maximumFractionDigits === undefined
-              ? Math.max(minimum, 3)
-              : Number(this.options.maximumFractionDigits);
-        let text = Number.isFinite(number)
-          ? number.toFixed(Math.min(20, maximum))
-          : "NaN";
-        if (maximum > minimum && text.includes(".")) {
-          while (text.endsWith("0") && text.split(".")[1].length > minimum)
-            text = text.slice(0, -1);
-          if (text.endsWith(".")) text = text.slice(0, -1);
+      /* The digits of a decimal per the rounding options. */
+      _digits(decimal) {
+        const r = this.resolved;
+        let minimum = r.minimumSignificantDigits,
+          maximum = r.maximumSignificantDigits;
+        if (r.compactRounding) {
+          if (decimal[1] >= 3)
+            return plainDecimal(roundDecimal(decimal, decimal[1]), 0);
+          minimum = 1;
+          maximum = 2;
         }
-        if (this.options.useGrouping !== false) {
-          const pair = text.split(".");
-          pair[0] = pair[0].replace(/\B(?=(\d{3})+(?!\d))/g, ",");
-          text = pair.join(".");
-        }
-        if (this.options.style === "percent") text += "%";
-        if (this.options.style === "currency")
-          text = (this.options.currency || "USD") + " " + text;
-        return text;
+        if (maximum === undefined)
+          return plainDecimal(roundDecimal(decimal,
+            decimal[1] + r.maximumFractionDigits), r.minimumFractionDigits);
+        const rounded = roundDecimal(decimal, maximum);
+        return plainDecimal(rounded, minimum - rounded[1]);
       }
       formatToParts(value) {
-        const parts = [];
-        let text = this.format(value);
-        if (this.options.style === "currency") {
-          const separator = text.lastIndexOf(" ");
-          parts.push({ type: "currency", value: text.slice(0, separator) },
-            { type: "literal", value: " " });
-          text = text.slice(separator + 1);
+        const r = this.resolved,
+          parts = [],
+          add = (type, text) => parts.push({ type, value: text });
+        let number = typeof value === "bigint" ? value : Number(value),
+          negative, digits = null, exponent = 0, scale = 0, decimal = null;
+        if (typeof number === "bigint") {
+          negative = number < 0n;
+          decimal = decimalOf(negative ? -number : number);
+        } else {
+          negative = number < 0 || Object.is(number, -0);
+          if (Number.isFinite(number)) decimal = decimalOf(Math.abs(number));
         }
-        const percent = text.endsWith("%");
-        if (percent) text = text.slice(0, -1);
-        if (text.startsWith("-")) {
-          parts.push({ type: "minusSign", value: "-" });
-          text = text.slice(1);
+        if (decimal) {
+          if (r.style === "percent" && decimal[0]) decimal[1] += 2;
+          const shifted = (by) => [decimal[0], decimal[0] ? decimal[1] - by : 1];
+          if (r.notation === "compact" && decimal[0] && decimal[1] >= 4) {
+            scale = Math.min(4, Math.floor((decimal[1] - 1) / 3));
+            digits = this._digits(shifted(scale * 3));
+            if (scale < 4 && digits.length >= 4 && !digits.includes(".")) {
+              scale++;
+              digits = this._digits(shifted(scale * 3));
+            }
+          } else if ((r.notation === "scientific" ||
+                      r.notation === "engineering") && decimal[0]) {
+            exponent = decimal[1] - 1;
+            if (r.notation === "engineering")
+              exponent -= ((exponent % 3) + 3) % 3;
+            digits = this._digits(shifted(exponent));
+            if (digits.indexOf(".") > (r.notation === "engineering" ? 3 : 1) ||
+                (!digits.includes(".") &&
+                 digits.length > (r.notation === "engineering" ? 3 : 1))) {
+              exponent += r.notation === "engineering" ? 3 : 1;
+              digits = this._digits(shifted(exponent));
+            }
+          } else digits = this._digits(decimal);
         }
-        const pair = text.split(".");
-        const groups = pair[0].split(",");
-        for (let i = 0; i < groups.length; i++) {
-          if (i) parts.push({ type: "group", value: "," });
-          parts.push({ type: text === "NaN" ? "nan" : "integer", value: groups[i] });
+        const zero = digits !== null && !/[1-9]/.test(digits),
+          sign = Number.isNaN(number) ? ""
+            : r.signDisplay === "never" ? ""
+            : r.signDisplay === "always" ? (negative ? "-" : "+")
+            : r.signDisplay === "exceptZero"
+              ? (zero ? "" : negative ? "-" : "+")
+            : r.signDisplay === "negative" ? (negative && !zero ? "-" : "")
+            : negative ? "-" : "",
+          accounting = sign === "-" && r.currencySign === "accounting",
+          code = r.currency,
+          display = r.currencyDisplay,
+          symbol = r.style !== "currency" ? ""
+            : display === "code" ? code
+            : display === "name" ? ""
+            : (display === "narrowSymbol" && narrowSymbols[code]) ||
+              currencySymbols[code] || code;
+        if (accounting) add("literal", "(");
+        else if (sign) add(sign === "-" ? "minusSign" : "plusSign", sign);
+        if (symbol) {
+          add("currency", symbol);
+          if (/[A-Za-z]$/.test(symbol)) add("literal", " ");
         }
-        if (pair.length > 1) parts.push({ type: "decimal", value: "." },
-          { type: "fraction", value: pair[1] });
-        if (percent) parts.push({ type: "percentSign", value: "%" });
+        if (digits === null)
+          add(Number.isNaN(number) ? "nan" : "infinity",
+            Number.isNaN(number) ? "NaN" : "∞");
+        else {
+          const point = digits.indexOf("."),
+            integer = (point < 0 ? digits : digits.slice(0, point))
+              .padStart(r.minimumIntegerDigits, "0"),
+            groups = r.useGrouping === false ||
+              (r.useGrouping === "min2" && integer.length < 5)
+              ? [integer] : integer.replace(/\B(?=(\d{3})+$)/g, ",").split(",");
+          groups.forEach((group, at) => {
+            if (at) add("group", ",");
+            add("integer", group);
+          });
+          if (point >= 0) {
+            add("decimal", ".");
+            add("fraction", digits.slice(point + 1));
+          }
+        }
+        if (scale && r.compactDisplay === "long")
+          add("literal", " "), add("compact", compactLong[scale]);
+        else if (scale) add("compact", compactShort[scale]);
+        if (r.notation === "scientific" || r.notation === "engineering") {
+          add("exponentSeparator", "E");
+          if (exponent < 0) add("exponentMinusSign", "-");
+          add("exponentInteger", String(Math.abs(exponent)));
+        }
+        if (r.style === "percent") add("percentSign", "%");
+        if (r.style === "currency" && display === "name")
+          add("literal", " "), add("currency", code);
+        if (r.style === "unit") {
+          const label = unitLabels[r.unit] ?? " " + r.unit;
+          if (label[0] === " ") add("literal", " ");
+          add("unit", label.trimStart());
+        }
+        if (accounting) add("literal", ")");
         return parts;
       }
+      /* ECMA-402: format is an accessor returning a bound function. */
+      get format() {
+        let bound = boundFormats.get(this);
+        if (!bound) {
+          bound = (value) => {
+            let text = "";
+            for (const part of this.formatToParts(value)) text += part.value;
+            return text;
+          };
+          boundFormats.set(this, bound);
+        }
+        return bound;
+      }
       resolvedOptions() {
-        return {
-          locale: this.locale,
-          numberingSystem: "latn",
-          style: this.options.style || "decimal",
-          minimumFractionDigits: this.options.minimumFractionDigits || 0,
-          maximumFractionDigits:
-            this.options.maximumFractionDigits === undefined
-              ? 3
-              : this.options.maximumFractionDigits,
-          useGrouping: this.options.useGrouping !== false,
-          notation: "standard",
-          signDisplay: "auto",
-        };
+        const r = this.resolved,
+          compact = r.compactRounding,
+          result = { locale: this.locale, numberingSystem: "latn" };
+        for (const key of [
+          "style", "currency", "currencyDisplay", "currencySign", "unit",
+          "unitDisplay", "minimumIntegerDigits", "minimumFractionDigits",
+          "maximumFractionDigits", "minimumSignificantDigits",
+          "maximumSignificantDigits", "useGrouping", "notation",
+          "compactDisplay", "signDisplay",
+        ]) {
+          const value = compact && key.endsWith("FractionDigits") ? 0
+            : compact && key === "minimumSignificantDigits" ? 1
+            : compact && key === "maximumSignificantDigits" ? 2 : r[key];
+          if (value !== undefined) result[key] = value;
+        }
+        result.roundingIncrement = 1;
+        result.roundingMode = "halfExpand";
+        result.roundingPriority = compact ? "morePrecision" : "auto";
+        result.trailingZeroDisplay = "auto";
+        return result;
       }
       static supportedLocalesOf(locales) {
         return (Array.isArray(locales) ? locales : [locales])
@@ -431,6 +668,34 @@
         return NumberFormat.supportedLocalesOf(locales);
       },
     };
+    /* Number and Date toLocale*String format through these classes, not
+       through whatever the page's Intl global holds (compat.js). Date's
+       options default as ECMA-402 ToDateTimeOptions does. */
+    const dateKeys = ["weekday", "year", "month", "day"],
+      timeKeys = ["dayPeriod", "hour", "minute", "second",
+        "fractionalSecondDigits"];
+    globalThis.__tilefinchRegisterLocaleFormat?.(
+      (value, locales, options) =>
+        new NumberFormat(locales, options).format(value),
+      (time, locales, options, required, defaults) => {
+        if (!Number.isFinite(time)) return "Invalid Date";
+        const source = options === undefined ? {} : Object(options),
+          merged = {};
+        for (const key of [...dateKeys, ...timeKeys, "timeZoneName",
+          "dateStyle", "timeStyle", "hour12", "hourCycle", "timeZone"])
+          if (source[key] !== undefined) merged[key] = source[key];
+        let needDefaults = merged.dateStyle === undefined &&
+          merged.timeStyle === undefined;
+        if (required !== "time" && dateKeys.some((key) => key in merged))
+          needDefaults = false;
+        if (required !== "date" && timeKeys.some((key) => key in merged))
+          needDefaults = false;
+        if (needDefaults && defaults !== "time")
+          merged.year = merged.month = merged.day = "numeric";
+        if (needDefaults && defaults !== "date")
+          merged.hour = merged.minute = merged.second = "numeric";
+        return new DateTimeFormat(locales, merged).format(time);
+      });
   }
   if (typeof globalThis.Intl.Collator !== "function") {
     const canonicalLocale = (value) => {

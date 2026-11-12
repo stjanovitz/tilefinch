@@ -44,6 +44,7 @@ CATALOGS.append((12, list(latest_languages.values())))
 CATALOGS.append((13, list(latest_languages.values())))
 CATALOGS.append((14, list(latest_languages.values())))
 CATALOGS.append((15, list(latest_languages.values())))
+CATALOGS.append((16, list(latest_languages.values())))
 ACTIVE_VERSION = CATALOGS[-1][0]
 # Keys a version drops because the browser no longer looks them up. Every
 # other key of the previous version must remain, so a newly added locale
@@ -76,7 +77,8 @@ MINIMUM_GLYPH_SEQUENCES = {
     ("DEVANAGARI", 1): 2, ("DEVANAGARI", 5): 3, ("DEVANAGARI", 7): 4,
     ("DEVANAGARI", 10): 5, ("DEVANAGARI", 11): 6, ("DEVANAGARI", 12): 7,
     ("BENGALI_ASSAMESE", 11): 2, ("BENGALI_ASSAMESE", 12): 3,
-    ("DEVANAGARI", 13): 8, ("BENGALI_ASSAMESE", 13): 4}
+    ("DEVANAGARI", 13): 8, ("BENGALI_ASSAMESE", 13): 4,
+    ("DEVANAGARI", 16): 9, ("BENGALI_ASSAMESE", 16): 5}
 
 
 def minimum_glyph_sequence(glyphs, version):

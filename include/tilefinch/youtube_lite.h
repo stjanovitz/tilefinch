@@ -139,6 +139,10 @@ typedef struct {
        emitted as HTML: the slice's size as work, which unlike
        maximum_transform_slice_us does not depend on the host. */
     size_t maximum_transform_slice_bytes;
+    /* Every byte the transform slices advanced through or emitted, summed
+       (it wraps). With body_bytes and build_slices it tells a pump that did
+       work from one that only waited. */
+    size_t transform_bytes;
     uint64_t network_us;
     uint64_t build_us;
     uint64_t request_wall_us;

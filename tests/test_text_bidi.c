@@ -3,6 +3,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "tilefinch/font.h"
+
 #define CHECK(condition) do {                                             \
     if (!(condition)) {                                                   \
         fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__,          \
@@ -152,8 +154,8 @@ int main(void)
     text_bidi_paragraph_destroy(paragraph);
 
     /* Arabic joining is contextual, but logical source order remains intact.
-       Tilefinch intentionally does not synthesize the optional lam-alef
-       ligature: each source codepoint retains one mapping unit. */
+       Lam-alef is a required ligature: each source codepoint keeps its one
+       mapping unit, the lam showing the ligature and the alef nothing. */
     static const char arabic[] =
         "\xd8\xb3\xd9\x84\xd8\xa7\xd9\x85"; /* salaam */
     paragraph = text_bidi_paragraph_create(
@@ -164,16 +166,48 @@ int main(void)
     CHECK(units[0].codepoint == 0x0633u
           && units[0].shaped_codepoint == 0xfeb3u);
     CHECK(units[1].codepoint == 0x0644u
-          && units[1].shaped_codepoint == 0xfee0u);
+          && units[1].shaped_codepoint == 0xfefcu);
     CHECK(units[2].codepoint == 0x0627u
-          && units[2].shaped_codepoint == 0xfe8eu);
+          && units[2].shaped_codepoint == TEXT_BIDI_NO_GLYPH);
+    CHECK(font_codepoint_default_ignorable(units[2].shaped_codepoint));
     CHECK(units[3].codepoint == 0x0645u
           && units[3].shaped_codepoint == 0xfee1u);
+    /* Reversed as one unit: the ligature first, so what follows it, its
+       marks included, draws over it and not over the next letter. */
     CHECK(text_bidi_line_visual_order(
         paragraph, 0, 4, order, 4, &runs));
-    CHECK(order[0] == 3 && order[1] == 2
-          && order[2] == 1 && order[3] == 0);
+    CHECK(order[0] == 3 && order[1] == 1
+          && order[2] == 2 && order[3] == 0);
     text_bidi_paragraph_destroy(paragraph);
+
+    /* The other alefs, a lam with nothing to join, a mark on either side of
+       the alef, and the joiners that ask for the letters apart. */
+    static const struct {
+        const char *text;
+        size_t count;
+        uint32_t first;
+        uint32_t second;
+    } lam_alefs[] = {
+        {"\xd9\x84\xd8\xa7", 2, 0xfefbu, TEXT_BIDI_NO_GLYPH},
+        {"\xd9\x84\xd8\xa2", 2, 0xfef5u, TEXT_BIDI_NO_GLYPH},
+        {"\xd9\x84\xd8\xa3", 2, 0xfef7u, TEXT_BIDI_NO_GLYPH},
+        {"\xd9\x84\xd8\xa5", 2, 0xfef9u, TEXT_BIDI_NO_GLYPH},
+        {"\xd9\x84\xd9\x8e\xd8\xa7", 3, 0xfefbu, 0x064eu},
+        {"\xd9\x84\xe2\x80\x8c\xd8\xa7", 3, 0xfeddu, 0x200cu},
+        {"\xd9\x84\xe2\x80\x8d\xd8\xa7", 3, 0xfedfu, 0x200du},
+        {"\xd9\x84\xd9\x85", 2, 0xfedfu, 0xfee2u}
+    };
+    for (size_t at = 0; at < sizeof(lam_alefs) / sizeof(lam_alefs[0]); at++) {
+        paragraph = text_bidi_paragraph_create(
+            &budget, lam_alefs[at].text, strlen(lam_alefs[at].text),
+            TEXT_BIDI_BASE_RTL, &status);
+        CHECK(paragraph != NULL
+              && text_bidi_paragraph_count(paragraph) == lam_alefs[at].count);
+        units = text_bidi_paragraph_units(paragraph);
+        CHECK(units[0].shaped_codepoint == lam_alefs[at].first);
+        CHECK(units[1].shaped_codepoint == lam_alefs[at].second);
+        text_bidi_paragraph_destroy(paragraph);
+    }
 
     /* Rule L3: an Arabic combining mark and a ZWJ emoji sequence remain in
        logical order inside their visually reordered grapheme cluster. */
@@ -186,6 +220,11 @@ int main(void)
     CHECK(text_bidi_line_visual_order(
         paragraph, 0, 3, order, 3, &runs));
     CHECK(order[0] == 2 && order[1] == 0 && order[2] == 1);
+    /* A vowel mark between two letters does not break their join. */
+    units = text_bidi_paragraph_units(paragraph);
+    CHECK(units[0].shaped_codepoint == 0xfe91u
+          && units[1].shaped_codepoint == 0x064eu
+          && units[2].shaped_codepoint == 0xfe96u);
     text_bidi_paragraph_destroy(paragraph);
 
     static const char rtl_emoji[] =

@@ -79,8 +79,10 @@ boundaries. Moving APIs between modules or changing runtime order should be a
 separate, behavior-reviewed change.
 
 Canvas, IndexedDB, CSS motion, bounded Streams, bounded capability probes,
-and DOM traversal (NodeFilter, TreeWalker, NodeIterator and the Document
-factories for them) are ROM-backed on-demand modules. The capability module exposes the Web Speech
+DOM traversal (NodeFilter, TreeWalker, NodeIterator and the Document
+factories for them) and the CSSOM rule objects (`cssom-rules.js`: CSSRule
+and its subclasses, built the first time a page reads a sheet's `cssRules`
+or names a rule interface) are ROM-backed on-demand modules. The capability module exposes the Web Speech
 shape with an empty engine and a Media Source shape that advertises no
 supported byte-stream types; it does not pretend the PSP implements either
 pipeline. Their standards-visible globals and Canvas prototype entries begin
@@ -99,7 +101,12 @@ the fetch pipeline: those eager API definitions mention stream constructors
 only inside callable methods. The first actual stream body or direct Streams
 constructor access activates `streams.js`; pages which use neither retain only
 the small configurable accessors. The bounded stream behavior is tested through
-both the unloaded and first-use paths.
+both the unloaded and first-use paths. Stream queues follow the page's queuing
+strategy (one chunk by default) for `desiredSize` and pull backpressure, and
+are bounded by the realm's free heap, not a chunk count: once 256 KiB is
+queued (1 MiB for compression streams), each further step of that size checks
+that the realm keeps that much heap free, and a queue that would not errors
+its stream with a `RangeError`.
 
 `motion.js` is evaluated after the scheduler because stylesheet keyframes,
 inline transitions, and `Element.animate()` deliberately share one bounded

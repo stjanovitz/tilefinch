@@ -1690,6 +1690,8 @@ static uint8_t psp_completed_supervisor_page_input_count;
 volatile unsigned psp_validation_cancel_after_ms;
 volatile unsigned psp_validation_preview_scroll;
 
+static void psp_presentation_drain(void);
+
 void psp_platform_retire_frame(void *context, const uint16_t *pixels)
 {
     PspNavigationCooperate *cooperate = context;
@@ -1701,18 +1703,15 @@ void psp_platform_retire_frame(void *context, const uint16_t *pixels)
        presenting for one frame copy and a vblank. Wait it out however long
        it takes (as psp_navigation_cooperate_end does): freeing after a time
        limit would let a delayed display operation read freed pixels. The
-       browser thread never holds presenting here (its presents return
-       before the engine frees). */
-    unsigned waited_ms = 0;
-    while (cooperate->presenting != 0) {
-        (void) sceKernelDelayThread(1000);
-        if ((++waited_ms & 63u) == 0) psp_log_heartbeat();
-    }
+       browser thread's own presents return before the engine frees, and
+       while it holds the fence (a modal over the page) no other present
+       runs. */
+    psp_presentation_drain();
 }
 
 /* What a supervisor present repaints under its chrome: the load preview
    while one is on screen, else the incumbent page. */
-static const uint16_t *psp_supervisor_page_frame(
+const uint16_t *psp_supervisor_page_frame(
     const PspNavigationCooperate *cooperate)
 {
     const uint16_t *preview = cooperate->page_frame;
@@ -1762,16 +1761,47 @@ bool psp_platform_present(
     return shown;
 }
 
+/* The presses the supervisor's player copy took reach the owner's state,
+   in order (their only way there: psp_input_loop_edges); each action joins
+   its slot of the mailbox. Browser thread, with no supervisor present in
+   flight. */
+static void psp_cooperate_settle_media_presses(
+    PspNavigationCooperate *cooperate)
+{
+    if (cooperate->media_presses.count == 0) return;
+    psp_ui_media_press_queue_settle(
+        &cooperate->media_presses, cooperate->media_owner,
+        &cooperate->pending_media);
+}
+
 static void psp_work_cooperate_begin_internal(
     PspUiState *ui, const uint16_t *frame,
     bool periodic_present, bool acknowledge_non_cancel_busy,
     bool log_session, const char *cancel_status, const char *phase,
-    BrowserEngine *engine, const PspUiMediaState *media_ui,
+    BrowserEngine *engine, PspUiMediaState *media_ui,
     bool owner_thread_only)
 {
+    /* A scope begun over an active one (a navigation started while another
+       is pending) retires it first, as psp_navigation_cooperate_end does: a
+       supervisor present in flight still reads this record and holds the
+       fence, so rewriting it, or clearing presenting under it, would let
+       the next fenced change (a chrome font rebind) run beside that
+       present. */
+    if (psp_navigation_cooperate.active != 0) {
+        psp_navigation_cooperate.active = 0;
+        __sync_synchronize();
+        psp_navigation_cooperate.page_frame = NULL;
+        psp_presentation_drain();
+        psp_cooperate_settle_media_presses(&psp_navigation_cooperate);
+    }
     /* Publish an immutable page-frame pointer and a private UI copy before
        making the job visible to the callback-thread supervisor. The engine
-       does not paint this framebuffer while candidate navigation is active. */
+       does not paint this framebuffer while candidate navigation is active.
+       The copy still points at the HOME, Library and Find views and the
+       Library's item and profile strings: the browser thread writes those
+       only under psp_presentation_fence_acquire, never across I/O. It may
+       also show a preview sheet, which psp_work_cooperate_release_view
+       takes off it before the preview is freed (docs/ARCHITECTURE.md). */
     psp_navigation_cooperate.ui = ui;
     if (ui != NULL) {
         psp_navigation_cooperate.supervisor_ui = *ui;
@@ -1781,6 +1811,8 @@ static void psp_work_cooperate_begin_internal(
     psp_navigation_cooperate.input_yield = false;
     psp_navigation_cooperate.media_surface = media_ui != NULL;
     psp_navigation_cooperate.media_detached = false;
+    psp_navigation_cooperate.media_owner = media_ui;
+    psp_navigation_cooperate.media_presses.count = 0;
     if (media_ui != NULL)
         psp_navigation_cooperate.supervisor_media_ui = *media_ui;
     psp_navigation_cooperate.engine = engine;
@@ -1818,7 +1850,8 @@ static void psp_work_cooperate_begin_internal(
     psp_navigation_cooperate.supervised = atomic_load_explicit(
         &psp_background_ui_available, memory_order_acquire) != 0
             ? 1u : 0u;
-    psp_navigation_cooperate.presenting = 0;
+    /* presenting is not reset here: it is 0 unless this thread holds the
+       fence, and only its CAS owner may release it. */
     psp_navigation_cooperate.provisional_present_requested = 0;
     psp_navigation_cooperate.provisional_scroll_requests = 0;
     psp_navigation_cooperate.page_frame = NULL;
@@ -1830,8 +1863,7 @@ static void psp_work_cooperate_begin_internal(
     psp_navigation_cooperate.owner_page_screen = 1;
     psp_navigation_cooperate.pending_page_input_count = 0;
     psp_navigation_cooperate.pending_page_input_dropped = 0;
-    psp_navigation_cooperate.pending_media_intent =
-        (PspUiMediaIntent) {0};
+    psp_navigation_cooperate.pending_media = (PspUiMediaMailbox) {0};
     tilefinch_cancellation_init(&psp_navigation_cooperate.cancellation);
     __sync_synchronize();
     psp_navigation_cooperate.active =
@@ -1842,7 +1874,7 @@ void psp_work_cooperate_begin(
     PspUiState *ui, const uint16_t *frame,
     bool periodic_present, bool acknowledge_non_cancel_busy,
     bool log_session, const char *cancel_status, const char *phase,
-    BrowserEngine *engine, const PspUiMediaState *media_ui)
+    BrowserEngine *engine, PspUiMediaState *media_ui)
 {
     psp_work_cooperate_begin_internal(
         ui, frame, periodic_present, acknowledge_non_cancel_busy,
@@ -1867,6 +1899,9 @@ static struct {
     bool completion;
     bool serving;
     bool painting;
+    /* A runtime turn of this engine, and the presses its frame shows. */
+    BrowserEngine *preview_engine;
+    int previewed_presses;
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     /* The oldest press being served, and when its move was first shown,
        for tilefinch-scroll-feedback. */
@@ -1892,6 +1927,8 @@ void psp_runtime_cooperate_begin(PspUiState *ui, const uint16_t *frame,
     psp_runtime_cooperate.completion = false;
     psp_runtime_cooperate.serving = false;
     psp_runtime_cooperate.painting = false;
+    psp_runtime_cooperate.preview_engine = NULL;
+    psp_runtime_cooperate.previewed_presses = 0;
     /* A short render may never activate the lazy supervisor. Its caller
        still needs a fresh cancellation token, not a prior scope's refusal. */
     tilefinch_cancellation_init(&psp_navigation_cooperate.cancellation);
@@ -1907,6 +1944,11 @@ void psp_runtime_cooperate_begin(PspUiState *ui, const uint16_t *frame,
 void psp_runtime_cooperate_serve_page_scroll(BrowserEngine *engine)
 {
     psp_runtime_cooperate.engine = engine;
+}
+
+void psp_runtime_cooperate_preview_page_presses(BrowserEngine *engine)
+{
+    psp_runtime_cooperate.preview_engine = engine;
 }
 
 bool psp_runtime_cooperate_end(uint32_t *observed_buttons)
@@ -1941,17 +1983,7 @@ void psp_navigation_cooperate_begin(
         "STOPPING PAGE LOAD...", "navigation-begin", engine, NULL);
 }
 
-/* Presses that only move the timeline; the session can record them as
-   intent while an open is still running. */
-static bool psp_media_timeline_action(PspUiMediaAction action)
-{
-    return action == PSP_UI_MEDIA_ACTION_PREVIEW_SEEK
-        || action == PSP_UI_MEDIA_ACTION_SEEK
-        || action == PSP_UI_MEDIA_ACTION_CANCEL_SEEK_PREVIEW
-        || action == PSP_UI_MEDIA_ACTION_PLAY_PAUSE;
-}
-
-bool psp_work_cooperate_refresh_media(const PspUiMediaState *media_ui,
+bool psp_work_cooperate_refresh_media(PspUiMediaState *media_ui,
                                       PspUiMediaIntent *timeline_intent)
 {
     PspNavigationCooperate *cooperate = &psp_navigation_cooperate;
@@ -1964,18 +1996,22 @@ bool psp_work_cooperate_refresh_media(const PspUiMediaState *media_ui,
     __sync_synchronize();
     if (cooperate->active != 0 && cooperate->media_surface
         && !tilefinch_cancellation_requested(&cooperate->cancellation)) {
-        PspUiMediaIntent pending = cooperate->pending_media_intent;
+        /* The presses the copy took privately are the owner's now, and the
+           fresh copy borrows the owner's presentation again. */
+        psp_cooperate_settle_media_presses(cooperate);
+        PspUiMediaIntent pending = cooperate->pending_media.timeline;
         cooperate->supervisor_media_ui = *media_ui;
         /*
          * An open can run for seconds (a rewind re-resolves its URLs). Hand
          * timeline presses to the browser thread now rather than at the end
          * of the scope, so the session's recorded target and this snapshot
          * agree. The press's own visual is carried onto the fresh snapshot:
-         * the browser thread shows it from the next frame on.
+         * the browser thread shows it from the next frame on. A command
+         * stays in its own slot for the scope's end.
          */
         if (timeline_intent != NULL
-            && psp_media_timeline_action(pending.action)) {
-            cooperate->pending_media_intent = (PspUiMediaIntent) {0};
+            && psp_ui_media_timeline_action(pending.action)) {
+            cooperate->pending_media.timeline = (PspUiMediaIntent) {0};
             PspUiMediaState *snapshot = &cooperate->supervisor_media_ui;
             if (pending.action == PSP_UI_MEDIA_ACTION_PREVIEW_SEEK)
                 psp_ui_media_set_seek_preview(snapshot, pending.seek_time_us);
@@ -2000,9 +2036,29 @@ bool psp_work_cooperate_refresh_media(const PspUiMediaState *media_ui,
    or filling it while a presentation is in flight would let the callback
    thread read freed or half-built glyph storage. The wait is one
    presentation at most (a framebuffer copy and a vblank). */
-static bool psp_presentation_fence_acquire(void)
+/* The thread holding the fence through psp_presentation_fence_acquire, and
+   how many acquires it has not yet released. Only the holder writes them;
+   another thread never finds its own id here, so the held-here test is
+   safe from any thread. */
+static volatile int psp_presentation_fence_owner;
+static volatile unsigned psp_presentation_fence_depth;
+
+bool psp_presentation_fence_held_here(void)
+{
+    return psp_presentation_fence_depth != 0
+        && psp_presentation_fence_owner == sceKernelGetThreadId();
+}
+
+bool psp_presentation_fence_acquire(void)
 {
     PspNavigationCooperate *cooperate = &psp_navigation_cooperate;
+    /* A nested modal (the prompt keyboard inside a page dialog) or a glyph
+       change inside one already owns the screen: count it, never wait on
+       ourselves. */
+    if (psp_presentation_fence_held_here()) {
+        psp_presentation_fence_depth++;
+        return true;
+    }
     if (cooperate->active == 0) return false;
     unsigned waited_ms = 0;
     while (!__sync_bool_compare_and_swap(&cooperate->presenting, 0u, 1u)) {
@@ -2010,14 +2066,45 @@ static bool psp_presentation_fence_acquire(void)
         if ((++waited_ms & 63u) == 0) psp_log_heartbeat();
     }
     __sync_synchronize();
+    psp_presentation_fence_owner = sceKernelGetThreadId();
+    psp_presentation_fence_depth = 1;
     return true;
 }
 
-static void psp_presentation_fence_release(bool held)
+void psp_presentation_fence_release(bool held)
 {
     if (!held) return;
+    if (psp_presentation_fence_depth > 1) {
+        psp_presentation_fence_depth--;
+        return;
+    }
+    psp_presentation_fence_depth = 0;
+    psp_presentation_fence_owner = 0;
     __sync_synchronize();
     psp_navigation_cooperate.presenting = 0;
+}
+
+void psp_work_cooperate_release_view(const void *view)
+{
+    /* Not held: no scope, so no copy to correct. Held, no supervisor
+       present is reading the copy while it changes. */
+    bool held = psp_presentation_fence_acquire();
+    if (held)
+        (void) psp_ui_release_view(
+            &psp_navigation_cooperate.supervisor_ui, view);
+    psp_presentation_fence_release(held);
+}
+
+/* Wait out a presentation in flight on another thread. The fence's own
+   holder waits for nothing: no other thread can be presenting. */
+static void psp_presentation_drain(void)
+{
+    if (psp_presentation_fence_held_here()) return;
+    unsigned waited_ms = 0;
+    while (psp_navigation_cooperate.presenting != 0) {
+        (void) sceKernelDelayThread(1000);
+        if ((++waited_ms & 63u) == 0) psp_log_heartbeat();
+    }
 }
 
 void psp_presentation_rebind_chrome_fonts(
@@ -2037,7 +2124,7 @@ void psp_presentation_preload_chrome_scale(unsigned scale)
 
 void psp_work_cooperate_begin_media_open(
     PspUiState *ui, const uint16_t *engine_frame,
-    const PspUiMediaState *media_ui)
+    PspUiMediaState *media_ui)
 {
     if (ui == NULL || media_ui == NULL) return;
     /* Populate playback's actual weights/buttons before the supervisor draws,
@@ -2224,6 +2311,40 @@ bool psp_request_provisional_scroll(
     return true;
 }
 
+void psp_navigation_preview_hint_refresh(BrowserEngine *engine,
+                                         PspUiState *ui)
+{
+    PspNavigationCooperate *cooperate = &psp_navigation_cooperate;
+    BrowserProvisionalViewport viewport;
+    bool shown = engine != NULL
+        && browser_engine_provisional_viewport(engine, &viewport)
+        && viewport.reading_hint
+        && !psp_navigation_cancel_requested();
+    psp_ui_set_preview_hint(ui, shown);
+    /* The supervisor presents its own copy while this thread is busy; it
+       never reads the engine. Take its fence only for a change, or every
+       few seconds to keep a shown hint's toast frames up (they count down
+       at its presents); a copy the supervisor is presenting right now
+       takes the hint at the next refresh. */
+    if (cooperate->active == 0 || cooperate->engine != engine) return;
+    uint64_t now_us = sceKernelGetSystemTimeWide();
+    if (shown == cooperate->supervisor_reading_hint
+        && (!shown || now_us - cooperate->supervisor_reading_hint_us
+                          < UINT64_C(5000000)))
+        return;
+    if (!__sync_bool_compare_and_swap(&cooperate->presenting, 0u, 1u))
+        return;
+    __sync_synchronize();
+    if (cooperate->active != 0
+        && !tilefinch_cancellation_requested(&cooperate->cancellation)) {
+        psp_ui_set_preview_hint(&cooperate->supervisor_ui, shown);
+        cooperate->supervisor_reading_hint = shown;
+        cooperate->supervisor_reading_hint_us = now_us;
+    }
+    __sync_synchronize();
+    cooperate->presenting = 0;
+}
+
 void psp_navigation_cooperate_end(const char *scope)
 {
     psp_navigation_cooperate.active = 0;
@@ -2235,7 +2356,8 @@ void psp_navigation_cooperate_end(const char *scope)
        use-after-reset on an unusually delayed display operation. */
     unsigned drain_wait_ms = 0;
     psp_navigation_cooperate.page_frame = NULL;
-    while (psp_navigation_cooperate.presenting != 0) {
+    while (psp_navigation_cooperate.presenting != 0
+           && !psp_presentation_fence_held_here()) {
         (void) sceKernelDelayThread(1000);
         drain_wait_ms++;
         if ((drain_wait_ms & 63u) == 0) psp_log_heartbeat();
@@ -2253,13 +2375,20 @@ void psp_navigation_cooperate_end(const char *scope)
                              psp_navigation_cooperate.original_screen,
                              psp_navigation_cooperate.original_chrome_visible);
     }
-    if (psp_navigation_cooperate.pending_media_intent.action
-            != PSP_UI_MEDIA_ACTION_NONE) {
+    psp_cooperate_settle_media_presses(&psp_navigation_cooperate);
+    /* A waiting command wins over a timeline press after the last refresh:
+       the command is what the open was holding back, and the session takes
+       one intent here. */
+    PspUiMediaIntent completed_media =
+        psp_navigation_cooperate.pending_media.command.action
+            != PSP_UI_MEDIA_ACTION_NONE
+            ? psp_navigation_cooperate.pending_media.command
+            : psp_navigation_cooperate.pending_media.timeline;
+    if (completed_media.action != PSP_UI_MEDIA_ACTION_NONE) {
         /* The presentation fence above also fences the callback's 64-bit
            seek target on 32-bit Allegrex. Do not read it while the callback
            can still be updating the tuple. */
-        psp_completed_supervisor_media_intent =
-            psp_navigation_cooperate.pending_media_intent;
+        psp_completed_supervisor_media_intent = completed_media;
     }
     if ((!psp_navigation_cancel_requested()
          || (psp_navigation_cooperate.owner_thread_only
@@ -2390,6 +2519,8 @@ void psp_navigation_cooperate_end(const char *scope)
                psp_navigation_cooperate.validation_cancel_injected
                    ? 1u : 0u);
     }
+    /* The reading hint belongs to the load this scope supervised. */
+    psp_ui_set_preview_hint(psp_navigation_cooperate.ui, false);
     memset(&psp_navigation_cooperate, 0,
            sizeof(psp_navigation_cooperate));
 }
@@ -2448,6 +2579,20 @@ bool psp_navigation_cooperate_page_input_pending(void)
 {
     /* The owner reads only the completed FIFO, after the scope fence. */
     return psp_completed_supervisor_page_input_count != 0;
+}
+
+bool psp_navigation_cooperate_queue_page_input(uint32_t pressed)
+{
+    if (pressed == 0
+        || psp_completed_supervisor_page_input_count
+               >= PSP_SUPERVISOR_PAGE_INPUT_LIMIT) return false;
+    psp_completed_supervisor_page_input[
+        psp_completed_supervisor_page_input_count] = pressed;
+    psp_completed_supervisor_page_input_us[
+        psp_completed_supervisor_page_input_count] =
+            (uint64_t) sceKernelGetSystemTimeWide();
+    psp_completed_supervisor_page_input_count++;
+    return true;
 }
 
 bool psp_navigation_cooperate_take_page_input(uint32_t *pressed,
@@ -2688,18 +2833,18 @@ static void psp_work_ui_tick(bool owner_thread)
              * A preview seek can spend several callback ticks in a firmware
              * or range unit. Dropping direction edges here made the player
              * appear unresponsive until that picture returned. Apply each
-             * edge to the supervisor's private UI snapshot immediately and
-             * retain one latest command for the browser thread. The
-             * one-entry mailbox is deliberate: repeated directions are a
-             * target, not N decoder transactions.
+             * edge to the supervisor's private UI snapshot immediately.
+             *
+             * The copy borrows the owner's presentation (AU-05) and moves
+             * onto its own only for a press that would change it. Every
+             * press is queued: the browser thread applies the queue to its
+             * own player at the next refresh or at the scope's end, and
+             * derives each action there (the newest joins the mailbox, so
+             * repeated directions are still one target). Its loop takes no
+             * edges of its own meanwhile (psp_input_loop_edges), so one
+             * press moves a menu row once and toggles play once. Past the
+             * queue's room the copy takes none, so the two agree.
              */
-            PspUiInput media_input = {
-                .pressed = ui_pressed,
-                .held = ui_pressed,
-                .analog_x = 128,
-                .analog_y = 128,
-                .elapsed_ms = 16
-            };
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
             bool menu_was_open = cooperate->supervisor_media_ui.presentation != NULL
                 && cooperate->supervisor_media_ui.presentation->track_menu_open;
@@ -2708,16 +2853,15 @@ static void psp_work_ui_tick(bool owner_thread)
             uint32_t menu_pressed_us = (uint32_t) (scripted
                 ? psp_input_script_request_time(now_us) : (uint64_t) sceKernelGetSystemTimeWide());
 #endif
-            supervisor_media_intent = psp_ui_media_update(
-                &cooperate->supervisor_media_ui, &media_input);
+            if (!psp_ui_media_supervisor_press(
+                    &cooperate->supervisor_media_ui,
+                    &cooperate->supervisor_presentation,
+                    &cooperate->media_presses, ui_pressed,
+                    &supervisor_media_intent)) break;
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
             psp_media_menu_feedback_input(&cooperate->supervisor_media_ui,
                 menu_was_open, menu_old_tab, menu_pressed_us);
 #endif
-            if (supervisor_media_intent.action
-                    != PSP_UI_MEDIA_ACTION_NONE) {
-                cooperate->pending_media_intent = supervisor_media_intent;
-            }
             if (supervisor_media_intent.visual_changed) {
                 cooperate->input_acknowledgements++;
                 acknowledgement_started_us =
@@ -2856,9 +3000,11 @@ static void psp_work_ui_tick(bool owner_thread)
             .analog_y = 128
         };
         (void) psp_ui_update(&cooperate->supervisor_ui, &idle);
-        /* Both variants are immutable snapshots. The supervisor never reads
-           the main thread's mutable media or browser state while a native
-           decoder, resolver, or raster unit is running. */
+        /* Both variants are snapshots; what the UI copy borrows is written
+           only under the fence this tick holds (see the scope's begin). The
+           supervisor never reads the main thread's mutable media or browser
+           state while a native decoder, resolver, or raster unit is
+           running. */
         if (cooperate->media_surface)
             psp_present_supervisor_media(&cooperate->supervisor_media_ui);
         else if (!psp_present_supervisor_ui(
@@ -2950,6 +3096,34 @@ static bool psp_runtime_apply_completion_scrolls(
     /* The move first: resident tiles and a checkerboard, at once. */
     if (moved) (void) psp_runtime_present_completion_frame(cooperate);
     return moved;
+}
+
+/* Queued page presses move the picture now; the page follows when the turn
+   hands them to the loop. */
+static void psp_runtime_preview_queued_presses(
+    PspNavigationCooperate *cooperate)
+{
+    int presses = psp_input_queued_page_presses(
+        cooperate->pending_page_input, cooperate->pending_page_input_count);
+    if (presses == psp_runtime_cooperate.previewed_presses
+        || !browser_engine_preview_page_presses(
+               psp_runtime_cooperate.preview_engine, presses)) return;
+    psp_runtime_cooperate.previewed_presses = presses;
+    bool shown = psp_platform_present(
+        cooperate, psp_runtime_cooperate.frame, PSP_SCREEN_WIDTH,
+        PSP_SCREEN_HEIGHT, PSP_SCREEN_WIDTH);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    if (shown && cooperate->pending_page_input_count != 0) {
+        uint64_t shown_us = sceKernelGetSystemTimeWide();
+        uint64_t pressed_us = cooperate->pending_page_input_us[
+            cooperate->pending_page_input_count - 1u];
+        printf("tilefinch-scroll-feedback: action=preview presses=%d "
+               "first-visible=%lldus\n", presses,
+               (long long) shown_us - (long long) pressed_us);
+    }
+#else
+    (void) shown;
+#endif
 }
 
 static void psp_runtime_serve_completion_scroll(
@@ -3165,13 +3339,20 @@ bool psp_platform_cooperate(
             psp_work_ui_tick(true);
             cooperate->page_input_yield_boundary = false;
         }
-        if (cooperate->active && psp_runtime_cooperate.completion
-            && psp_runtime_cooperate.engine != NULL
+        bool scroll_served = psp_runtime_cooperate.completion
+            && psp_runtime_cooperate.engine != NULL;
+        if (cooperate->active && scroll_served
             && !psp_runtime_cooperate.serving
             /* Cache preparation borrows the render shell. Never reenter
                it to apply a scroll from one of its own checkpoints. */
             && (boundary & TILEFINCH_COOPERATE_RENDER_SHELL_BORROWED) == 0)
             psp_runtime_serve_completion_scroll(cooperate, now);
+        else if (cooperate->active && !scroll_served
+            && psp_runtime_cooperate.preview_engine != NULL
+            /* Tiles are only read between raster units' own checkpoints. */
+            && (boundary & (TILEFINCH_COOPERATE_RENDER_SHELL_BORROWED
+                            | TILEFINCH_COOPERATE_RENDER_INPUT)) == 0)
+            psp_runtime_preview_queued_presses(cooperate);
         if ((boundary & PSP_COOPERATE_YIELD_BOUNDARY) != 0) {
             /* These are resumable owner boundaries, not VM interrupts.
                Leave jobs and prepared tiles intact; the main loop dispatches
@@ -3274,6 +3455,8 @@ bool psp_platform_cooperate(
         cooperate->provisional_fill_us = fill_now_us;
         (void) browser_engine_provisional_raster_step(cooperate->engine);
     }
+    if (cooperate->engine != NULL)
+        psp_navigation_preview_hint_refresh(cooperate->engine, cooperate->ui);
     bool urgent_present = false;
     uint64_t acknowledgement_started_us = 0;
     if (cooperate->supervised == 0 && !cooperate->owner_thread_only) {

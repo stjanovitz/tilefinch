@@ -189,15 +189,40 @@ static bool fetch_request_is_captive_portal_navigation(
         request, request == NULL ? NULL : request->cookie_session);
 }
 
-static bool fetch_url_has_private_address_literal(const TilefinchUrl *url);
-
+/* Whether a URL names the user's own network: localhost, an mDNS .local
+   name, a single-label intranet name, or an address in a private range.
+   A host whose last label is a number is an address however it is spelled
+   (134744072, 0x08080808 and 8.8.8.8 are one host to the resolver), so it
+   is classified only by that address; the single-label rule applies to
+   names alone. An IP literal the policy cannot read is not local. */
 static bool fetch_url_names_local_network(const char *url)
 {
     TilefinchUrl parsed;
     if (url == NULL || !tilefinch_url_parse(url, &parsed)) return false;
-    if (fetch_url_has_private_address_literal(&parsed)) return true;
     const char *host = url + parsed.host_offset;
     size_t length = parsed.host_length;
+    if (parsed.ipv6_literal) {
+#if defined(AF_INET6) && !defined(__PSP__)
+        char literal[64];
+        unsigned char ipv6[16];
+        if (length < 3u || length - 2u >= sizeof(literal)) return false;
+        memcpy(literal, host + 1u, length - 2u);
+        literal[length - 2u] = '\0';
+        return inet_pton(AF_INET6, literal, ipv6) == 1
+            && fetch_private_ipv6(ipv6);
+#else
+        return false;
+#endif
+    }
+    unsigned char ipv4[4];
+    switch (tilefinch_host_ipv4(host, length, ipv4)) {
+    case TILEFINCH_HOST_IPV4_ADDRESS:
+        return fetch_private_ipv4(ipv4);
+    case TILEFINCH_HOST_IPV4_INVALID:
+        return false;
+    case TILEFINCH_HOST_IPV4_NAME:
+        break;
+    }
     static const char localhost[] = "localhost";
     size_t local_length = sizeof(localhost) - 1u;
     static const char local_suffix[] = ".local";
@@ -251,43 +276,28 @@ static bool fetch_request_private_network_protected(
         initial_url);
 }
 
-static bool fetch_request_mixed_override(const FetchRequest *request)
+/* The user's session grants that let a secure page reach plain HTTP: the
+   broad per-site compatibility grant, or the narrow one an audio stream's
+   prompt gives, which opens only audio playback requests. Either way the
+   request goes out as HTTP, not upgraded first. The grants are read from
+   the hop's security session: a scheduled request drops its own
+   cookie_session pointer once its hop is built, and its redirects must
+   still see the answer the first hop saw. */
+static bool fetch_request_mixed_override(
+    const FetchRequest *request, const BrowserSession *session)
 {
-    if (request == NULL || request->cookie_session == NULL) return false;
+    if (request == NULL) return false;
+    if (session == NULL) session = request->cookie_session;
+    if (session == NULL) return false;
     const char *site = request->page_context != NULL
         && request->page_context->top_level_url != NULL
         ? request->page_context->top_level_url : request->initiator_url;
-    return browser_session_mixed_content_site_allowed(
-        request->cookie_session, site);
-}
-
-static bool fetch_url_has_private_address_literal(const TilefinchUrl *url)
-{
-    if (url == NULL || url->host_length == 0 || url->host_length >= 256u)
-        return false;
-    char host[256];
-    size_t offset = url->host_offset;
-    size_t length = url->host_length;
-    if (url->ipv6_literal) {
-        if (length < 3u) return false;
-        offset++;
-        length -= 2u;
-    }
-    memcpy(host, url->value + offset, length);
-    host[length] = '\0';
-    struct sockaddr_storage address;
-    memset(&address, 0, sizeof(address));
-    struct sockaddr_in *ipv4 = (struct sockaddr_in *) &address;
-    if (inet_pton(AF_INET, host, &ipv4->sin_addr) == 1) {
-        ipv4->sin_family = AF_INET;
-        return fetch_private_sockaddr((const struct sockaddr *) &address);
-    }
-#if defined(AF_INET6) && !defined(__PSP__)
-    unsigned char ipv6[16];
-    if (inet_pton(AF_INET6, host, ipv6) == 1)
-        return fetch_private_ipv6(ipv6);
-#endif
-    return false;
+    if (browser_session_mixed_content_site_allowed(session, site))
+        return true;
+    return request->page_context != NULL
+        && request->page_context->destination == TILEFINCH_DESTINATION_AUDIO
+        && browser_session_insecure_audio_site(session, site)
+               == BROWSER_INSECURE_AUDIO_ALLOWED;
 }
 
 /* Apply HSTS and HTTPS-first before the request target is admitted. Passive
@@ -323,7 +333,7 @@ static bool fetch_request_prepare_security_url_with_session(
         && initiator.scheme == TILEFINCH_URL_SCHEME_HTTPS
         && target.scheme == TILEFINCH_URL_SCHEME_HTTP
         && fetch_destination_is_passive(request)
-        && !fetch_request_mixed_override(request);
+        && !fetch_request_mixed_override(request, security_session);
     if (target.scheme == TILEFINCH_URL_SCHEME_HTTP
         && upgrade_initial_insecure_request
         && (ordinary_navigation || mixed_passive)) {
@@ -355,9 +365,11 @@ static bool fetch_request_prepare_security_url(
  * accidentally omit it. It is also applied again to every explicit redirect
  * hop; libcurl never follows redirects on its own.
  */
-static bool fetch_request_target_allowed_with_session(
+/* `websocket`: target_url is a socket's http(s) request URL, matched
+   against connect-src as the ws(s) URL it stands for. */
+static bool fetch_request_target_allowed_for(
     const FetchRequest *request, const BrowserSession *session,
-    const char *target_url)
+    const char *target_url, bool websocket)
 {
     const TilefinchRequestContext *page = request == NULL
         ? NULL : request->page_context;
@@ -369,14 +381,20 @@ static bool fetch_request_target_allowed_with_session(
         && browser_session_captive_portal_active(session);
     if (captive_portal_active
         && page != NULL
-        && page->destination == TILEFINCH_DESTINATION_MEDIA) return false;
+        && (page->destination == TILEFINCH_DESTINATION_MEDIA
+            || page->destination == TILEFINCH_DESTINATION_AUDIO))
+        return false;
     bool captive_portal_target = request != NULL && session != NULL
         && browser_session_captive_portal_url_allowed(
             session, target_url);
     if (page != NULL && request->content_security_policy != NULL
-        && !tilefinch_csp_allows_request_granted(
-               request->content_security_policy, page->destination,
-               target_url, page->csp_grant)) return false;
+        && !(websocket
+                 ? tilefinch_csp_allows_websocket(
+                       request->content_security_policy, target_url,
+                       page->csp_grant)
+                 : tilefinch_csp_allows_request_granted(
+                       request->content_security_policy, page->destination,
+                       target_url, page->csp_grant))) return false;
     /* Portal authority relaxes only mixed-content/PNA policy. It must not
        bypass the portal document's own CSP. Initial user navigation is still
        admitted far enough for the resolved-peer PNA guard to provide its
@@ -393,7 +411,15 @@ static bool fetch_request_target_allowed_with_session(
         || tilefinch_url_potentially_trustworthy(target_url)) {
         return true;
     }
-    return fetch_request_mixed_override(request);
+    return fetch_request_mixed_override(request, session);
+}
+
+static bool fetch_request_target_allowed_with_session(
+    const FetchRequest *request, const BrowserSession *session,
+    const char *target_url)
+{
+    return fetch_request_target_allowed_for(
+        request, session, target_url, false);
 }
 
 bool fetch_request_security_allows_target(const FetchRequest *request,
@@ -565,7 +591,8 @@ bool fetch_websocket_prepare_admission(
         || !tilefinch_url_request_key(
                working_url, canonical_target,
                sizeof(canonical_target))
-        || !fetch_request_target_allowed(request, canonical_target)
+        || !fetch_request_target_allowed_for(
+               request, request->cookie_session, canonical_target, true)
         || fetch_origin_blocked(canonical_target)) {
         return false;
     }
@@ -757,7 +784,8 @@ static bool fetch_request_validate_with_facts(
         REQUEST_INVALID(FETCH_REQUEST_VALIDATION_CONTEXT);
     }
     static const size_t limits[] = {
-        255, 4095, 191, 127, 4095, 2047, 255, 63, 63, 63, 511, 63
+        FETCH_REQUEST_CONTENT_TYPE_MAX,
+        4095, 191, 127, 4095, 2047, 255, 63, 63, 63, 511, 63
     };
     const char *values[] = {
         request->content_type, request->cookie, request->if_none_match,

@@ -98,6 +98,9 @@ bool youtube_start_seconds_parse(const char *value, const char *end,
 
 static inline void youtube_error(char *error, size_t error_size,
                                  const char *format, ...)
+    __attribute__((format(printf, 3, 4)));
+static inline void youtube_error(char *error, size_t error_size,
+                                 const char *format, ...)
 {
     if (error == NULL || error_size == 0) return;
     va_list arguments;

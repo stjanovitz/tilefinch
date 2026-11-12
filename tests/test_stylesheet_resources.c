@@ -2245,6 +2245,422 @@ static bool test_icon_images_do_not_spend_image_count(void)
     return ok && clean;
 }
 
+/* A request's referrer source keeps a page's and its stylesheet's use of one URL
+   in separate entries. On a page the session has seen, each takes its surface
+   from the decoded cache: both then own a lease on the same pixels. Removing
+   one must return that entry's own lease and bytes while the other keeps
+   showing the surface. */
+#define TWO_OWNERS_URL "https://owners.example/shared.svg"
+#define TWO_OWNERS_SHEET "https://owners.example/theme.css"
+#define TWO_OWNERS_PAGE "https://owners.example/page"
+#define TWO_OWNERS_SVG \
+    "<svg xmlns='http://www.w3.org/2000/svg' width='64' height='64'>" \
+    "<rect width='64' height='64' fill='#123456'/></svg>"
+
+typedef struct {
+    char directory[128];
+    Budget budget;
+    bool installed, written, replaying;
+    BrowserSession session;
+    PocDocument document;
+    Stylesheet stylesheet;
+    StylesheetDocumentResources resources;
+    ImageResources images;
+    size_t page_entry;
+} TwoOwnersFixture;
+
+static bool two_owners_open(TwoOwnersFixture *f, bool fresh_first)
+{
+    static const char html[] =
+        "<!doctype html><link rel=stylesheet href=theme.css>"
+        "<body><img id=page src=shared.svg><div class=bg></div></body>";
+    static const char image_accept[] =
+#if defined(TILEFINCH_DISABLE_GIF)
+        "image/png,image/jpeg,image/webp,image/svg+xml,image/*;q=0.8,"
+        "*/*;q=0.5";
+#else
+        "image/png,image/jpeg,image/gif,image/webp,image/svg+xml,"
+        "image/*;q=0.8,*/*;q=0.5";
+#endif
+    static const StylesheetReplayRecord replay[] = {
+        {
+            .url = TWO_OWNERS_SHEET,
+            .body = ".bg{width:64px;height:64px;"
+                    "background-image:url(shared.svg)}",
+            .effective_url = TWO_OWNERS_SHEET,
+            .request_referer = TWO_OWNERS_PAGE,
+            .request_sec_fetch_site = "same-origin",
+            .request_credential_origin = TWO_OWNERS_PAGE,
+            .request_initiator_url = TWO_OWNERS_PAGE,
+            .request_referrer_source = TWO_OWNERS_PAGE,
+            .request_referrer_policy = "unsafe-url",
+            .status = 200
+        },
+        {
+            .url = TWO_OWNERS_URL,
+            .body = TWO_OWNERS_SVG,
+            .effective_url = TWO_OWNERS_URL,
+            .content_type = "image/svg+xml",
+            .request_accept = image_accept,
+            .request_sec_fetch_dest = "image",
+            .request_sec_fetch_mode = "no-cors",
+            .request_referer = TWO_OWNERS_PAGE,
+            .request_sec_fetch_site = "same-origin",
+            .request_credential_origin = TWO_OWNERS_PAGE,
+            .request_initiator_url = TWO_OWNERS_PAGE,
+            .request_referrer_source = TWO_OWNERS_PAGE,
+            .request_referrer_policy = "unsafe-url",
+            .response_cache_control = "max-age=3600",
+            .status = 200,
+            .request_send_low_client_hints = true
+        },
+        {
+            .url = TWO_OWNERS_URL,
+            .body = TWO_OWNERS_SVG,
+            .effective_url = TWO_OWNERS_URL,
+            .content_type = "image/svg+xml",
+            .request_accept = image_accept,
+            .request_sec_fetch_dest = "image",
+            .request_sec_fetch_mode = "no-cors",
+            .request_referer = TWO_OWNERS_SHEET,
+            .request_sec_fetch_site = "same-origin",
+            .request_credential_origin = TWO_OWNERS_PAGE,
+            .request_initiator_url = TWO_OWNERS_PAGE,
+            .request_referrer_source = TWO_OWNERS_SHEET,
+            .request_referrer_policy = "unsafe-url",
+            .response_cache_control = "max-age=3600",
+            .status = 200,
+            .request_send_low_client_hints = true
+        }
+    };
+    memset(f, 0, sizeof(*f));
+    f->written = write_stylesheet_replay(f->directory, replay, 3);
+    budget_init(&f->budget, 8u * MIB);
+    f->installed = budget_install_lexbor(&f->budget);
+    char error[256] = {0};
+    ExternalStylesheetStats sheets = {0};
+    bool ok = f->written && f->installed
+        && browser_session_init(&f->session, &f->budget, 512u * 1024u)
+        && document_parse(&f->document, &f->budget, html, sizeof(html) - 1u,
+                          17)
+        && stylesheet_build(&f->stylesheet, &f->budget, &f->document, 480);
+    f->replaying = ok && fetch_trace_replay_begin(
+        f->directory, error, sizeof(error));
+    ok = f->replaying && stylesheets_load_external_tracked_with_context(
+            &f->document, &f->stylesheet, &f->budget, TWO_OWNERS_PAGE,
+            TWO_OWNERS_PAGE, "unsafe-url", 4, 4096, 4096, 1000, NULL,
+            &f->session, &f->resources, &sheets);
+    /* A seen page, or one whose image alone has loaded when the sheet's use
+       turns up: the first owner then holds the response it fetched. */
+    ImageResources visited = {0};
+    lxb_dom_node_t *image = ok ? find_element_id(
+        lxb_dom_interface_node(f->document.html), "page") : NULL;
+    ok = ok && (fresh_first
+        ? images_load_external_priority_nodes(
+              &f->document, &f->stylesheet, &f->images, &image, 1u, &f->budget,
+              TWO_OWNERS_PAGE, TWO_OWNERS_PAGE, "unsafe-url", 8, 64u * 1024u,
+              32u * 1024u, 1024u * 1024u, 1000, NULL, &f->session)
+        : images_load_external(
+              &f->document, &f->stylesheet, &visited, &f->budget,
+              TWO_OWNERS_PAGE, TWO_OWNERS_PAGE, "unsafe-url", 8, 64u * 1024u,
+              32u * 1024u, 1024u * 1024u, 1000, NULL, &f->session))
+        && images_load_external(
+              &f->document, &f->stylesheet, &f->images, &f->budget,
+              TWO_OWNERS_PAGE, TWO_OWNERS_PAGE, "unsafe-url", 8, 64u * 1024u,
+              32u * 1024u, 1024u * 1024u, 1000, NULL, &f->session);
+    images_destroy(&visited);
+    bool shared = ok && f->images.count == 2
+        && f->images.items[0].pixels != NULL
+        && f->images.items[0].pixels == f->images.items[1].pixels
+        && f->images.items[0].owns_pixels && f->images.items[1].owns_pixels
+        && f->images.stats.decoded_cache_hits >= 1u;
+    f->page_entry = shared && f->images.items[1].is_background ? 0u : 1u;
+    if (!shared) {
+        FetchTraceReplayStats stats = {0};
+        (void) fetch_trace_replay_stats(&stats);
+        fprintf(stderr, "two owners sheets=%zu count=%zu hits=%zu failed=%zu "
+                "duplicate=%zu replay='%s' requests=%zu served=%zu "
+                "unmatched=%zu mismatch=%zu\n", sheets.loaded, f->images.count,
+                f->images.stats.decoded_cache_hits, f->images.stats.failed,
+                f->images.stats.duplicate, error, stats.request_count,
+                stats.served_request_count, stats.unmatched_request_count,
+                stats.request_shape_mismatch_count);
+        for (size_t i = 0; i < f->images.count; i++)
+            fprintf(stderr, " entry %zu pixels=%p owns=%d/%d encoded=%p bg=%d\n",
+                    i, (void *) f->images.items[i].pixels,
+                    f->images.items[i].owns_pixels,
+                    f->images.items[i].owns_encoded,
+                    (void *) f->images.items[i].encoded,
+                    f->images.items[i].is_background);
+    }
+    return shared;
+}
+
+static bool two_owners_close(TwoOwnersFixture *f)
+{
+    if (f->replaying) fetch_trace_end();
+    images_destroy(&f->images);
+    stylesheet_document_resources_destroy(&f->resources);
+    stylesheet_destroy(&f->stylesheet);
+    document_destroy(&f->document);
+    browser_session_destroy(&f->session);
+    bool clean = f->budget.current == 0;
+    if (!clean)
+        fprintf(stderr, "two owners left %zu bytes\n", f->budget.current);
+    if (f->installed) clean = budget_uninstall_lexbor(&f->budget) && clean;
+    if (f->written) remove_stylesheet_replay(f->directory, 3);
+    return clean;
+}
+
+static bool two_owners_evict(bool fresh_first)
+{
+    TwoOwnersFixture f;
+    bool ok = two_owners_open(&f, fresh_first);
+    size_t decoded = f.images.stats.decoded_bytes;
+    if (ok) {
+        uint32_t distances[2] = {0u, 0u};
+        uint8_t remap[2] = {0};
+        bool released = false;
+        distances[f.page_entry] = 1u;
+        ok = images_evict_farthest(&f.images, distances, 1u, SIZE_MAX,
+                                   SIZE_MAX, remap, &released) == 1u
+            && f.images.count == 1u && f.images.items[0].is_background
+            && f.images.items[0].owns_pixels
+            && f.images.items[0].pixels != NULL
+            && f.images.stats.decoded_bytes == decoded - 64u * 64u * 4u;
+        if (!ok) fprintf(stderr, "evicted decoded=%zu from %zu\n",
+                         f.images.stats.decoded_bytes, decoded);
+    }
+    return two_owners_close(&f) && ok;
+}
+
+static bool test_evicting_one_of_two_lease_owners(void)
+{
+    return two_owners_evict(false);
+}
+
+static bool test_evicting_owner_of_a_fetched_response(void)
+{
+    return two_owners_evict(true);
+}
+
+/* An owner of pixels and markup, an alias of both, and a second lease on the
+   pixels with no markup: a raster's fetched entry beside a decoded-cache one.
+   Each removal must leave every retained pointer owned or held, and removing
+   them all but the lease must release the markup. */
+static bool test_evicted_markup_follows_its_own_alias(void)
+{
+    Budget budget;
+    budget_init(&budget, MIB);
+    ImageResources images = {.budget = &budget};
+    unsigned char *pixels = budget_malloc(&budget, 16u);
+    unsigned char *markup = budget_malloc(&budget, 8u);
+    BrowserSharedBody *body = pixels == NULL ? NULL
+        : browser_shared_body_take(&budget, pixels, 16u);
+    bool ok = body != NULL && markup != NULL
+        && images_reserve_capacity(&images, &budget, 3u);
+    if (!ok) {
+        browser_shared_body_release(body);
+        budget_free(&budget, markup);
+        images_destroy(&images);
+        return false;
+    }
+    ImageResource owner = {
+        .pixels = pixels, .pixel_body = body, .encoded = markup,
+        .encoded_length = 8u, .width = 2, .height = 2,
+        .source_width = 2, .source_height = 2,
+        .owns_pixels = true, .owns_encoded = true
+    };
+    ImageResource alias = owner;
+    alias.owns_pixels = alias.owns_encoded = false;
+    ImageResource lease = owner;
+    lease.encoded = NULL;
+    lease.encoded_length = 0u;
+    lease.owns_encoded = false;
+    lease.pixel_body = browser_shared_body_retain(body);
+    /* The lease comes first, so a search for any one sharer finds it. */
+    images.items[0] = lease;
+    images.items[1] = owner;
+    images.items[2] = alias;
+    images.count = 3u;
+    images.stats.decoded_bytes = 32u;
+    images.stats.encoded_bytes = 8u;
+    uint32_t distances[3] = {0u, 1u, 0u};
+    uint8_t remap[3] = {0};
+    bool released = false;
+    ok = images_evict_farthest(&images, distances, 1u, SIZE_MAX, SIZE_MAX,
+                               remap, &released) == 1u
+        && images.count == 2u
+        && images.items[1].owns_encoded && images.items[1].encoded == markup
+        && images.items[1].encoded[0] == markup[0]
+        && images.stats.encoded_bytes == 8u;
+    distances[0] = 0u;
+    distances[1] = 1u;
+    ok = ok && images_evict_farthest(&images, distances, 1u, SIZE_MAX,
+                                     SIZE_MAX, remap, &released) == 1u
+        && images.count == 1u && images.items[0].pixels == pixels
+        && images.items[0].owns_pixels && images.stats.encoded_bytes == 0u;
+    images_destroy(&images);
+    return ok && budget.current == 0;
+}
+
+/* One owner of a 2 x 2 surface and an alias of it, in either order. */
+static bool add_shared_surface(ImageResources *images, Budget *budget,
+                               size_t at, bool owner_first)
+{
+    unsigned char *pixels = budget_malloc(budget, 16u);
+    BrowserSharedBody *body = pixels == NULL ? NULL
+        : browser_shared_body_take(budget, pixels, 16u);
+    if (body == NULL) return false;
+    ImageResource owner = {
+        .pixels = pixels, .pixel_body = body, .width = 2, .height = 2,
+        .source_width = 2, .source_height = 2, .owns_pixels = true
+    };
+    ImageResource alias = owner;
+    alias.owns_pixels = false;
+    alias.pixel_body = NULL;
+    images->items[at] = owner_first ? owner : alias;
+    images->items[at + 1u] = owner_first ? alias : owner;
+    images->stats.decoded_bytes += 16u;
+    return true;
+}
+
+/* Neither entry of a shared surface frees it alone, and none is needed for
+   slots here: the surface goes whole, as far away as its nearest entry, and
+   stays while anything must keep showing it. */
+static bool test_eviction_takes_whole_surfaces(void)
+{
+    Budget budget;
+    budget_init(&budget, MIB);
+    ImageResources images = {.budget = &budget};
+    bool ok = images_reserve_capacity(&images, &budget, 8u);
+    for (size_t at = 0; ok && at < 8u; at += 2u)
+        ok = add_shared_surface(&images, &budget, at, at != 2u);
+    images.count = ok ? 8u : 0u;
+    /* Its alias's position keeps the first surface; the fourth's alias cannot
+       come back from its element at all. */
+    images.items[7].is_background = true;
+    /* A far owner, a near alias, then an evenly placed pair, then two kept. */
+    uint32_t distances[8] = {100u, 10u, 50u, 50u, 200u, 0u, 300u, 300u};
+    uint8_t remap[8] = {0};
+    bool released = false;
+    /* One surface meets the limit: the pair, not the far owner's. */
+    ok = ok && images_evict_farthest(&images, distances, 0u, SIZE_MAX, 64u,
+                                     remap, &released) == 2u
+        && released && images.count == 6u && images.stats.decoded_bytes == 48u
+        && remap[0] == 0u && remap[1] == 1u && remap[2] == IMAGE_EVICTED
+        && remap[3] == IMAGE_EVICTED && remap[4] == 2u && remap[7] == 5u;
+    uint32_t next[6] = {100u, 10u, 200u, 0u, 300u, 300u};
+    ok = ok && images_evict_farthest(&images, next, 0u, SIZE_MAX, 40u,
+                                     remap, &released) == 2u
+        && released && images.count == 4u && images.stats.decoded_bytes == 32u;
+    /* The rest may not go, whatever the limit. */
+    uint32_t last[4] = {200u, 0u, 300u, 300u};
+    ok = ok && images_evict_farthest(&images, last, 0u, SIZE_MAX, 1u,
+                                     remap, &released) == 0u
+        && !released && images.count == 4u && images.stats.decoded_bytes == 32u
+        && images.items[0].owns_pixels && images.items[0].pixels != NULL
+        && images.items[1].pixels == images.items[0].pixels
+        && images.items[2].owns_pixels && images.items[2].pixels != NULL;
+    images_destroy(&images);
+    return ok && budget.current == 0;
+}
+
+/* Two lease owners return their own charges and all of the memory. Markup a
+   retained entry shows goes to that entry and frees nothing, so it does not
+   count toward the limit. */
+static bool test_eviction_counts_leases_and_retained_markup(void)
+{
+    Budget budget;
+    budget_init(&budget, MIB);
+    ImageResources images = {.budget = &budget};
+    unsigned char *pixels = budget_malloc(&budget, 16u);
+    unsigned char *markup = budget_malloc(&budget, 8u);
+    BrowserSharedBody *body = pixels == NULL ? NULL
+        : browser_shared_body_take(&budget, pixels, 16u);
+    bool ok = body != NULL && markup != NULL
+        && images_reserve_capacity(&images, &budget, 3u);
+    if (!ok) {
+        browser_shared_body_release(body);
+        budget_free(&budget, markup);
+        images_destroy(&images);
+        return false;
+    }
+    memset(markup, 'm', 8u);
+    ImageResource owner = {
+        .pixels = pixels, .pixel_body = body, .encoded = markup,
+        .encoded_length = 8u, .width = 2, .height = 2,
+        .source_width = 2, .source_height = 2,
+        .owns_pixels = true, .owns_encoded = true
+    };
+    ImageResource lease = owner;
+    lease.encoded = NULL;
+    lease.encoded_length = 0u;
+    lease.owns_encoded = false;
+    lease.pixel_body = browser_shared_body_retain(body);
+    /* Shows the markup and no pixels, so its surface is the markup. */
+    ImageResource holder = {
+        .encoded = markup, .encoded_length = 8u,
+        .source_width = 2, .source_height = 2
+    };
+    images.items[0] = holder;
+    images.items[1] = owner;
+    images.items[2] = lease;
+    images.count = 3u;
+    images.stats.decoded_bytes = 32u;
+    images.stats.encoded_bytes = 8u;
+    uint32_t distances[3] = {0u, 5u, 5u};
+    uint8_t remap[3] = {0};
+    bool released = false;
+    /* The markup is over its limit too, and the surface leaves regardless:
+       only the markup stays behind, with its new owner. */
+    ok = images_evict_farthest(&images, distances, 0u, 1u, 1u,
+                               remap, &released) == 2u
+        && released && images.count == 1u
+        && images.stats.decoded_bytes == 0u && images.stats.encoded_bytes == 8u
+        && images.items[0].owns_encoded && images.items[0].encoded == markup
+        && images.items[0].encoded[0] == 'm';
+    /* With no holder left at a distance of zero, it goes too. */
+    uint32_t away[1] = {5u};
+    ok = ok && images_evict_farthest(&images, away, 0u, 1u, 1u,
+                                     remap, &released) == 1u
+        && released && images.count == 0u && images.stats.encoded_bytes == 0u;
+    images_destroy(&images);
+    return ok && budget.current == 0;
+}
+
+/* The image's own surface is replaced, and the sheet's use keeps the old one. */
+static bool test_replacing_one_of_two_lease_owners(void)
+{
+    TwoOwnersFixture f;
+    bool ok = two_owners_open(&f, false);
+    unsigned char *rgba = NULL;
+    if (ok) {
+        rgba = budget_malloc(&f.budget, 4u);
+        ok = rgba != NULL && images_replace_with_decoded_surface(
+            &f.images, &f.budget, f.images.items[f.page_entry].node,
+            rgba, 1, 1);
+        if (!ok) budget_free(&f.budget, rgba);
+        ok = ok && f.images.items[1u - f.page_entry].owns_pixels;
+    }
+    return two_owners_close(&f) && ok;
+}
+
+/* A refresh of the image's node rebuilds its entry while the sheet's stays. */
+static bool test_refreshing_one_of_two_lease_owners(void)
+{
+    TwoOwnersFixture f;
+    bool ok = two_owners_open(&f, false);
+    if (ok) {
+        lxb_dom_node_t *image = f.images.items[f.page_entry].node;
+        ok = images_refresh_external_nodes(
+            &f.document, &f.stylesheet, &f.images, &image, 1u, &f.budget,
+            TWO_OWNERS_PAGE, TWO_OWNERS_PAGE, "unsafe-url", 8, 64u * 1024u,
+            32u * 1024u, 1024u * 1024u, 1000, NULL, &f.session);
+    }
+    return two_owners_close(&f) && ok;
+}
+
 static bool test_css_paint_layers_keep_distinct_resources(void)
 {
     static const char html[] =
@@ -4749,6 +5165,14 @@ static bool test_sliced_pass_stops_at_deferred_sheet(void)
 
 int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--lease-owners-only") == 0)
+        return test_evicting_one_of_two_lease_owners()
+            && test_evicting_owner_of_a_fetched_response()
+            && test_evicted_markup_follows_its_own_alias()
+            && test_eviction_takes_whole_surfaces()
+            && test_eviction_counts_leases_and_retained_markup()
+            && test_replacing_one_of_two_lease_owners()
+            && test_refreshing_one_of_two_lease_owners() ? 0 : 1;
     if (argc == 2 && strcmp(argv[1], "--skipped-import-only") == 0)
         return test_rebuild_skipped_retained_import_is_not_applied() ? 0 : 1;
     if (argc == 2 && strcmp(argv[1], "--retained-admission-only") == 0)
@@ -4818,6 +5242,13 @@ int main(int argc, char **argv)
     RUN_TEST(test_complete_rules_prefix_scanner);
     RUN_TEST(test_truncated_sheet_applies_only_complete_rules);
     RUN_TEST(test_large_sheet_admitted_by_memory);
+    RUN_TEST(test_evicting_one_of_two_lease_owners);
+    RUN_TEST(test_evicting_owner_of_a_fetched_response);
+    RUN_TEST(test_evicted_markup_follows_its_own_alias);
+    RUN_TEST(test_eviction_takes_whole_surfaces);
+    RUN_TEST(test_eviction_counts_leases_and_retained_markup);
+    RUN_TEST(test_replacing_one_of_two_lease_owners);
+    RUN_TEST(test_refreshing_one_of_two_lease_owners);
 #undef RUN_TEST
     puts("stylesheet resource tests passed");
     return 0;

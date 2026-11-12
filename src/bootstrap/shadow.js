@@ -2,13 +2,13 @@
 Object.defineProperty(globalThis, "__tilefinchCreateShadowState", {
   configurable: true,
   value(MapType, WeakRefType, deref, apply, connected, emptyArguments,
-        createPrivateSlot) {
+        createPrivateSlot, mapDelete) {
     const byHandle = new MapType(),
       // Keep host/root cycles on the objects, not in global WeakMap values.
       peers = createPrivateSlot(),
       peerOf = (target) => peers.get(target) ?? null,
       // DOM_BRIDGE_SHADOW_ROOT_LIMIT, the native root table's bound.
-      ROOT_LIMIT = 256;
+      ROOT_LIMIT = 512;
     let prepared = false;
     const forHandle = handle => {
       const entry = byHandle.get(handle),
@@ -29,7 +29,8 @@ Object.defineProperty(globalThis, "__tilefinchCreateShadowState", {
         }
         return peer || (handle === undefined ? null : forHandle(Number(handle)));
       },
-      retire(handle) { byHandle.delete(handle); },
+      /* Native node retirement calls this: captured intrinsics only. */
+      retire(handle) { mapDelete(byHandle, handle); },
       remember(host, root) {
         peers.set(host, root);
         peers.set(root, host);

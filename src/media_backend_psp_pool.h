@@ -44,6 +44,12 @@
     (PSP_MEDIA_AUDIO_SAMPLES * 2u * sizeof(int16_t))
 #define PSP_MEDIA_AUDIO_QUEUE_BYTES \
     (PSP_MEDIA_AUDIO_QUEUE_SLOTS * PSP_MEDIA_AUDIO_PCM_BYTES)
+/* The decoder's output buffer: one AAC frame, or one MPEG-1 Layer III frame
+   of 1152 stereo samples, which the queue re-blocks into 1024-sample
+   blocks. A 64-byte multiple. */
+#define PSP_MEDIA_AUDIO_MP3_FRAME_SAMPLES 1152u
+#define PSP_MEDIA_AUDIO_DECODE_BYTES \
+    (PSP_MEDIA_AUDIO_MP3_FRAME_SAMPLES * 2u * sizeof(int16_t))
 #define PSP_MEDIA_VIDEO_AU_BYTES 64u
 
 /*
@@ -90,7 +96,7 @@
      + PSP_MEDIA_POOL_MPEG_WORKSPACE_BYTES                                   \
      + (size_t) PSP_MEDIA_PACKET_STAGING_BYTES                              \
      + (size_t) PSP_MEDIA_AUDIO_CODEC_BYTES                                  \
-     + (size_t) PSP_MEDIA_AUDIO_PCM_BYTES                                    \
+     + (size_t) PSP_MEDIA_AUDIO_DECODE_BYTES                                 \
      + (size_t) PSP_MEDIA_AUDIO_QUEUE_BYTES                                  \
      /* Two compressed AAC access units, so one worker job can carry a
         batch. Separate from the shared packet staging on purpose: that

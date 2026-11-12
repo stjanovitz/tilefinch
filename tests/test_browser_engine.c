@@ -1,5 +1,8 @@
 #include "browser_engine_test_support.h"
+#include "bootstrap_resident_probe.h"
 #include "../src/tilefinch_test_faults.h"
+#include "../src/psp_navigation_watchdog.h"
+#include "tilefinch/work_vector.h"
 #include "tilefinch/content_blocker.h"
 #include "tilefinch/media_candidates.h"
 #include "tilefinch/platform.h"
@@ -268,6 +271,7 @@ static bool capture_provisional_present(
 #include "suites/browser_engine_lifecycle.inc"
 #include "suites/browser_engine_navigation.inc"
 #include "suites/browser_engine_adapters.inc"
+#include "suites/youtube_provider_costs.inc"
 #include "suites/youtube_login_journey.inc"
 #include "suites/youtube_navigation_journey.inc"
 #include "suites/youtube_watch_next.inc"
@@ -277,6 +281,11 @@ int main(int argc, char **argv)
 {
     if (argc == 2 && strcmp(argv[1], "--scroll-noop-only") == 0)
         return test_scroll_noop_reports_unchanged();
+    if (argc == 2 && strcmp(argv[1], "--reader-screen-only") == 0) {
+        CHECK(test_reader_screen_masthead() == 0);
+        CHECK(test_reader_screen_text_first() == 0);
+        return 0;
+    }
     if (argc == 2 && strcmp(argv[1], "--grid-columns-only") == 0)
         return test_computed_grid_columns();
     if (argc == 2 && strcmp(argv[1], "--basic-recovery-only") == 0) {
@@ -328,8 +337,11 @@ int main(int argc, char **argv)
             || test_youtube_library_actions() || test_youtube_library_native_action();
     if (argc == 2 && strcmp(argv[1], "--youtube-navigation-journey") == 0)
         return test_youtube_provider_layout_states() || test_youtube_filters_and_chapters();
+    if (argc == 2 && strcmp(argv[1], "--youtube-provider-costs-only") == 0)
+        return test_youtube_provider_costs();
     if (argc == 2 && strcmp(argv[1], "--youtube-watch-next-only") == 0)
-        return test_youtube_watch_next_cards() || test_youtube_history_page();
+        return test_youtube_watch_next_cards() || test_youtube_history_page()
+            || test_youtube_watch_commit_defers_avatar();
     if ((argc == 4 || argc == 5)
         && (strcmp(argv[1], "--native-navigation-replay") == 0
             || strcmp(argv[1], "--native-navigation-strict-replay") == 0)) {
@@ -375,6 +387,8 @@ int main(int argc, char **argv)
             || test_optional_bold_faces_follow_page_families();
     if (argc == 2 && strcmp(argv[1], "--native-text-sync-only") == 0)
         return test_native_text_sync_does_not_relayout_twice();
+    if (argc == 2 && strcmp(argv[1], "--keyboard-done-only") == 0)
+        return test_keyboard_done_implicit_submission();
     if (argc == 2 && strcmp(argv[1], "--settings-policy-only") == 0)
         return test_settings_failure_policy_with_engine()
             || test_settings_boot_and_refresh_with_engine();
@@ -393,6 +407,9 @@ int main(int argc, char **argv)
             || test_computed_paint_style_does_not_force_layout();
     if (argc == 2 && strcmp(argv[1], "--focus-geometry-only") == 0)
         return test_focus_paint_geometry_reuse();
+    if (argc == 2 && strcmp(argv[1], "--geometry-refusal-only") == 0)
+        return test_geometry_refusal_not_retried_read_by_read()
+            || test_geometry_refusal_gives_up_reuse_cache();
     if (argc == 2 && strcmp(argv[1], "--computed-style-values-only") == 0)
         return test_computed_style_resolved_values();
     if (argc == 2 && strcmp(argv[1], "--container-style-only") == 0)
@@ -404,6 +421,8 @@ int main(int argc, char **argv)
         int failed = test_css_transition_lifecycle();
         failed |= test_transition_snapshot_refusal_releases_arrays();
         failed |= test_transition_timer_exhaustion();
+        failed |= test_animation_lifecycle_clock();
+        failed |= test_transition_document_listener();
         failed |= test_transition_handler_replacement();
         failed |= test_transition_negative_delay();
         failed |= test_transition_named_colors();
@@ -425,6 +444,12 @@ int main(int argc, char **argv)
         return test_idle_page_drains_wrapper_cleanups();
     if (argc == 2 && strcmp(argv[1], "--managed-challenge-heap-only") == 0)
         return test_managed_challenge_script_heap();
+    if (argc == 2 && strcmp(argv[1], "--inline-refusal-only") == 0)
+        return test_streamed_inline_script_refused_while_streaming();
+    if (argc == 2 && strcmp(argv[1], "--inline-rewrite-only") == 0)
+        return test_streamed_inline_script_rewrites_itself();
+    if (argc == 2 && strcmp(argv[1], "--script-lane-only") == 0)
+        return test_parser_blocking_script_beside_stuck_loads();
     if (argc == 2 && strcmp(argv[1], "--deferred-startup-only") == 0)
         return test_deferred_startup_journey();
     if (argc == 2 && strcmp(argv[1], "--image-admission-only") == 0)
@@ -490,6 +515,11 @@ int main(int argc, char **argv)
     CHECK(test_inset_pseudo_disc() == 0);
     CHECK(test_night_mode_prefers_dark() == 0);
     CHECK(test_declared_var_and_script_form_submission() == 0);
+    CHECK(test_native_form_submission_sends_script_entries() == 0);
+    CHECK(test_native_form_submission_large_bodies() == 0);
+    CHECK(test_form_submitter_overrides() == 0);
+    CHECK(test_no_content_navigation_stays() == 0);
+    CHECK(test_keyboard_commit_fires_change() == 0);
     CHECK(test_module_dependency_prefetch() == 0);
     CHECK(test_script_free_browsing_journey() == 0);
     CHECK(test_background_interruption_journey() == 0);
@@ -526,10 +556,13 @@ int main(int argc, char **argv)
     CHECK(test_staged_optional_fonts_relayout_before_repaint() == 0);
     CHECK(test_optional_bold_faces_follow_page_families() == 0);
     CHECK(test_native_text_sync_does_not_relayout_twice() == 0);
+    CHECK(test_keyboard_done_implicit_submission() == 0);
     CHECK(test_geometry_only_callback_skips_style_only_flow() == 0);
     CHECK(test_focus_paint_geometry_reuse() == 0);
     CHECK(test_computed_paint_style_does_not_force_layout() == 0);
     CHECK(test_computed_grid_columns() == 0);
+    CHECK(test_geometry_refusal_not_retried_read_by_read() == 0);
+    CHECK(test_geometry_refusal_gives_up_reuse_cache() == 0);
     CHECK(test_computed_style_resolved_values() == 0);
     CHECK(test_computed_style_tracks_container_geometry() == 0);
     CHECK(test_opacity_geometry_snapshot_reuse() == 0);
@@ -539,6 +572,8 @@ int main(int argc, char **argv)
     CHECK(test_css_transition_lifecycle() == 0);
     CHECK(test_transition_snapshot_refusal_releases_arrays() == 0);
     CHECK(test_transition_timer_exhaustion() == 0);
+    CHECK(test_animation_lifecycle_clock() == 0);
+    CHECK(test_transition_document_listener() == 0);
     CHECK(test_transition_handler_replacement() == 0);
     CHECK(test_transition_negative_delay() == 0);
     CHECK(test_transition_named_colors() == 0);
@@ -551,12 +586,17 @@ int main(int argc, char **argv)
     CHECK(test_author_error_text_is_not_fatal() == 0);
     CHECK(test_emergency_break_uses_pair_kerning() == 0);
     CHECK(test_managed_challenge_script_heap() == 0);
+    CHECK(test_streamed_inline_script_refused_while_streaming() == 0);
+    CHECK(test_streamed_inline_script_rewrites_itself() == 0);
+    CHECK(test_parser_blocking_script_beside_stuck_loads() == 0);
     CHECK(test_deferred_image_relayout_requests_repaint() == 0);
     CHECK(test_deferred_image_retry_fires_load() == 0);
     CHECK(test_committed_document_glyph_script_hints() == 0);
     CHECK(test_responsive_navigation_convergence() == 0);
     CHECK(test_animated_canvas_follows_transactional_page_move() == 0);
     CHECK(test_scrollable_provisional_navigation() == 0);
+    CHECK(test_reader_screen_masthead() == 0);
+    CHECK(test_reader_screen_text_first() == 0);
     CHECK(test_provisional_preview_retries_and_refreshes(false) == 0);
     CHECK(test_provisional_preview_retries_and_refreshes(true) == 0);
     CHECK(test_provisional_preview_empty_backoff() == 0);
@@ -570,6 +610,7 @@ int main(int argc, char **argv)
     CHECK(test_youtube_localized_watch_metadata() == 0);
     CHECK(test_youtube_lite_escaped_title_is_valid_utf8() == 0);
     CHECK(test_youtube_cooperative_build_convergence() == 0);
+    CHECK(test_youtube_provider_costs() == 0);
     CHECK(test_youtube_initial_tiles_are_coalesced() == 0);
     CHECK(test_youtube_home_topics_are_lazy() == 0);
     CHECK(test_settings_failure_policy_with_engine() == 0);
@@ -583,6 +624,7 @@ int main(int argc, char **argv)
     CHECK(test_youtube_provider_layout_states() == 0);
     CHECK(test_youtube_filters_and_chapters() == 0);
     CHECK(test_youtube_watch_next_cards() == 0);
+    CHECK(test_youtube_watch_commit_defers_avatar() == 0);
     CHECK(test_youtube_history_page() == 0);
     CHECK(test_youtube_like_action() == 0);
     CHECK(test_youtube_like_canonical_link() == 0);
@@ -645,6 +687,15 @@ int main(int argc, char **argv)
           && browser_engine_config(policy_engine)->javascript.enabled
           && browser_engine_config(policy_engine)
                   ->javascript.document_scripts_enabled);
+    /* Invalidating retained pixels shows nothing by itself: a pack that goes
+       live has to tell the frontend to render the page again, once. */
+    CHECK(!browser_engine_take_optional_glyph_repaint(policy_engine));
+    CHECK(browser_engine_optional_glyphs_updated(policy_engine)
+          && browser_engine_take_optional_glyph_repaint(policy_engine)
+          && !browser_engine_take_optional_glyph_repaint(policy_engine));
+    CHECK(browser_engine_optional_glyph_payloads_ready(policy_engine)
+          && browser_engine_take_optional_glyph_repaint(policy_engine)
+          && !browser_engine_take_optional_glyph_repaint(policy_engine));
     browser_engine_destroy(policy_engine);
 
     BrowserConfig invalid;

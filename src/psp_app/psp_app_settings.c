@@ -242,7 +242,9 @@ bool psp_app_edit_developer_update_url(
     }
     snprintf(app->process->config.developer_update_url,
              sizeof(app->process->config.developer_update_url), "%s", edited);
-    if (!psp_boot_config_write_overrides(&app->process->config, override_path)) {
+    if (!psp_boot_config_write_overrides(
+            &app->process->config, override_path,
+            PSP_BOOT_CONFIG_KEY_DEVELOPER_UPDATE_URL)) {
         snprintf(app->process->config.developer_update_url,
                  sizeof(app->process->config.developer_update_url), "%s", previous);
         psp_ui_show_status(&app->process->presentation.ui, "DEVELOPER URL NOT SAVED", 240);
@@ -360,7 +362,9 @@ bool psp_app_set_video_decoder(PspApp *app)
              app->process->config.experimental_wide_video);
     snprintf(app->process->config.experimental_wide_video,
              sizeof(app->process->config.experimental_wide_video), "%s", selected);
-    if (!psp_boot_config_write_overrides(&app->process->config, override_path)) {
+    if (!psp_boot_config_write_overrides(
+            &app->process->config, override_path,
+            PSP_BOOT_CONFIG_KEY_EXPERIMENTAL_WIDE_VIDEO)) {
         snprintf(app->process->config.experimental_wide_video,
                  sizeof(app->process->config.experimental_wide_video), "%s",
                  previous);
@@ -498,7 +502,8 @@ static void psp_setting_network_profile(
                 sizeof(override_path));
             app->process->config.network_profile = selected;
             if (!have_path || !psp_boot_config_write_overrides(
-                                  &app->process->config, override_path)) {
+                                  &app->process->config, override_path,
+                                  PSP_BOOT_CONFIG_KEY_NETWORK_PROFILE)) {
                 app->process->config.network_profile = saved;
                 psp_app_refresh_network_profile_label(app, saved);
                 psp_ui_show_status(
@@ -912,6 +917,30 @@ static void psp_setting_mixed_content_site(
     }
 }
 
+/* The unencrypted-audio answer only gates the next audio open, so nothing
+   reloads: the page's Play asks, plays or is refused accordingly. */
+static void psp_setting_insecure_audio_site(
+    PspApp *app, const PspUiIntent *intent)
+{
+    PspUiState *ui = &app->process->presentation.ui;
+    BrowserSession *session = app->browser->session;
+    BrowserInsecureAudioAnswer previous =
+        browser_session_insecure_audio_site(session, ui->url);
+    BrowserInsecureAudioAnswer answer =
+        (BrowserInsecureAudioAnswer) intent->setting.value.unsigned_value;
+    if (browser_session_set_insecure_audio_site(session, ui->url, answer)) {
+        psp_ui_show_status(
+            ui, answer == BROWSER_INSECURE_AUDIO_ALLOWED
+                    ? "UNENCRYPTED AUDIO ALLOWED THIS SESSION"
+                : answer == BROWSER_INSECURE_AUDIO_DECLINED
+                    ? "UNENCRYPTED AUDIO BLOCKED"
+                    : "UNENCRYPTED AUDIO WILL ASK", 180);
+    } else {
+        ui->insecure_audio_site_answer = (unsigned) previous;
+        psp_ui_show_status(ui, "SITE EXCEPTION LIMIT REACHED", 240);
+    }
+}
+
 static void psp_setting_third_party_cookies_site(
     PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
 {
@@ -1254,7 +1283,9 @@ static void psp_setting_content_blocker_mode(
                 ? "AD BLOCKING OFF"
                 : (requested == CONTENT_BLOCKER_BASIC
                        ? "AD BLOCKING BASIC"
-                       : "CUSTOM %u RULES - %u IGNORED"),
+                       : (blocker_metrics.truncated
+                              ? "CUSTOM %u RULES - %u IGNORED - LIST TOO LONG"
+                              : "CUSTOM %u RULES - %u IGNORED")),
             (unsigned) blocker_metrics.rule_count,
             (unsigned) blocker_metrics.ignored_rule_count);
         psp_ui_show_status(&app->process->presentation.ui, status, 180);
@@ -1816,6 +1847,9 @@ void psp_app_apply_setting(
         break;
     case PSP_UI_SETTING_MIXED_CONTENT_SITE:
         psp_setting_mixed_content_site(app, frame, intent);
+        break;
+    case PSP_UI_SETTING_INSECURE_AUDIO_SITE:
+        psp_setting_insecure_audio_site(app, intent);
         break;
     case PSP_UI_SETTING_THIRD_PARTY_COOKIES_SITE:
         psp_setting_third_party_cookies_site(app, frame, intent);

@@ -203,7 +203,7 @@ static bool image_preload_slot_dead(ScriptRuntime *runtime, size_t at)
     JSValue owner = JS_UNDEFINED;
     if (js_rt_bridge_node_slot_for_handle(bridge, slot->handle, &native_slot)
         && bridge->wrapper_refs != NULL)
-        owner = JS_WeakRefDeref(runtime->context, bridge->wrapper_refs[native_slot]);
+        owner = JS_WeakTargetDeref(runtime->context, bridge->wrapper_refs[native_slot]);
     bool live = JS_IsObject(owner);
     JS_FreeValue(runtime->context, owner);
     return !live;
@@ -298,7 +298,7 @@ static JSValue image_preload_owner(ScriptRuntime *runtime, long handle)
     size_t native_slot = 0;
     if (!js_rt_bridge_node_slot_for_handle(bridge, handle, &native_slot)
         || bridge->wrapper_refs == NULL) return JS_UNDEFINED;
-    JSValue owner = JS_WeakRefDeref(runtime->context,
+    JSValue owner = JS_WeakTargetDeref(runtime->context,
                                     bridge->wrapper_refs[native_slot]);
     if (JS_IsObject(owner)) return owner;
     JS_FreeValue(runtime->context, owner);

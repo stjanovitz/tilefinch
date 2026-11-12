@@ -13,7 +13,7 @@ third-party data: the corpus lives outside the repository (by default
 | `replay.sh OUT [opts] [SELECTOR...]` | Parallel offline replay of the corpus (wraps `census.py replay`; `LAB=` selects another build's lab, `CORPUS=` another corpus generation such as `../census/corpus-v2`, `SITES=` a page list other than `sites.tsv`). |
 | `extract.py RUN_DIR` | One lab log to one JSON record. |
 | `compare.py BASE.jsonl NEW.jsonl` | Per-metric and per-page deltas; also the noise check. |
-| `report.py METRICS.jsonl` | Markdown tables for the census report. |
+| `report.py METRICS.jsonl [--probe PROBE.jsonl]` | Markdown tables for the census report. With `--probe` it lists, as probe-pass failures, the pages that ran scripts but produced no API-probe sweep. |
 | `factory_cache.py pages\|pairs RUN_DIR ...` | Lazy webpack bundle costs per page and a two-visit session simulation of caching compiled factories, from a replay run with `TILEFINCH_TRACE_FACTORY_CACHE=1` (see `docs/DIAGNOSTIC_SWITCHES.md`). |
 | `classify.py` | Hand-maintained script classifier (first-party, framework, analytics, ads, tag manager, consent, A/B testing, chat, social). |
 | `api-probe.js` | Lab-only missing-API probe, loaded by `--probe` runs. |
@@ -26,13 +26,18 @@ Every page is loaded by `psp-browser-interactive-lab` with the shipping
 defaults: Tilefinch's honest default UA, `--psp-profile realistic` (the PSP
 app's memory, script and document caps), basic content blocking, cookie
 notices hidden (never clicked), 480x272, a seeded clock and random source
-(`--deterministic-replay-seed 1`). The command script ticks the page for 150
+(`--deterministic-replay-seed 1`). By default the lab applies the
+cookie-notice sheet after the load, which costs a whole-sheet rebuild the
+PSP never does; `replay --user-css-before-load` sets it before the load, as
+the PSP app sets its presentation CSS before each navigation (same frames,
+one full rebuild fewer). Use it for timing, and compare runs only within
+one mode. The command script ticks the page for 150
 x 33 ms, renders the top and two scrolled screens, runs the `census` lab
 command (first-paint timebase, off-screen layout share, decoded vs. painted
 size of every image, Reader analysis), records a few page facts and prints
 the script heap report.
 
-There are four replay passes, each writing its own JSONL:
+There are five replay passes, each writing its own JSONL:
 
 - the metrics pass (default): what the census and `compare.py` read. Each
   page runs `--repeat` times (default 3) and every timing is the minimum
@@ -66,6 +71,15 @@ There are four replay passes, each writing its own JSONL:
   process's log; `bytecode.py` reads it as visit 1. The record's
   `js.script_disk_*` fields come from the `javascript-script-cache-disk`
   line (disk hits, synchronous read time, packs and bytes read and written).
+- `--verify-style-appends`, a correctness pass: after every relayout that
+  changed the page sheet in place it forces a whole-sheet rebuild and
+  compares (`TILEFINCH_TRACE_STYLE_APPEND_VERIFY`). It writes
+  `style-append-verify.tsv` (checks per page) and exits 1 when a rebuild
+  failed, a conclusive check found different computed styles, or no check
+  ran on any page. A layout-only difference is image-load timing on a
+  captured page and is listed, not failed; a check whose rebuild ran
+  stylesheet event handlers (`dom=changed`) is inconclusive. Each check
+  costs a rebuild, so this pass is never timed; `--repeat 1` is enough.
 
 `--idle N` adds up to N owner idle turns to the measured visit, after its
 ticks and before it is rendered (the lab's `idle` command, which stops at
@@ -81,6 +95,19 @@ idle turns whatever `--idle` says.
 
 `CENSUS_LAB_ARGS` appends lab options to every run (an experiment knob, for
 example `CENSUS_LAB_ARGS="--classic-bytecode-cache-kb 2048"`).
+
+`CENSUS_LAB_ARGS="--pending-load"` loads each page the way the PSP app does:
+as a pumped navigation job under the app's per-pump quotas, with the load
+preview painted while it streams, instead of the lab's one blocking load.
+The lab prints a `pending-load` line, and `extract.py` adds to `timing`:
+`first_content_ms` and `first_text_ms` (the first time the preview's
+current screen shows visible text or a decoded image, or text only; the
+load's end when the preview never does; absent when the loaded page does
+not either) and, when the preview showed its "Preview ready" hint,
+`reading_hint_at_ms` and `reading_hint_ms` (when it showed and for how
+long). `--pending-load-page-downs N` presses page-down N times on the
+preview, one per pump, starting once a preview is painted. The pending-load
+pass is not the timing pass: compare it only with another pending-load pass.
 
 `census-bytecode-*` and `census-visit` ledger lines classify every classic
 external-script bytecode lookup (hit, no cached entry, ineligible, ...), each
@@ -141,6 +168,16 @@ python3 tools/site-census/census.py capture --retry news       # by tag
 One capture per page, at most one retry. Never solve challenges or log in: a
 challenge or block is a finding, recorded as the page's outcome. The trace
 lands in `CENSUS/corpus/NAME/capture`.
+
+`meta.json` records `final_url`, the page URL the lab reported last (after
+redirects; a native route such as YouTube's keeps the page URL). When its
+host or path (ignoring a trailing slash) differs from the requested URL the
+capture is some other page: `final_url_mismatch` says why
+(`source-signin-required` for a sign-in path, the rule
+`benchmarks/capture-census.py` uses for references, otherwise
+`source-redirected`), the page is not retried, and the command exits 1
+after listing every such page. Point `sites.tsv` at the final URL when the
+redirect is the page itself (a canonical slug, a locale prefix).
 
 ## Replaying a branch against the corpus
 

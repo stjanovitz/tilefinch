@@ -372,6 +372,20 @@
           );
         let node = state.current,
           result = FILTER_ACCEPT;
+        /* Template instantiation walks every cloned node this way. */
+        if (state.filter === null) {
+          const root = state.root,
+            rootHandle = root === document ? 0 : root.__handle,
+            from = node === root ? 0 : node === document ? -1 : node.__handle;
+          if (rootHandle >= 0 && from >= 0) {
+            const found = nativeTraverse(rootHandle, from, state.whatToShow, 0);
+            if (found === 0) return null;
+            if (found > 0) return (state.current = wrap(found));
+          }
+          const next = step(state, node, 0);
+          if (next) state.current = next;
+          return next;
+        }
         for (let steps = 0; steps < traversalStepLimit; steps++) {
           /* Nodes whatToShow excludes are FILTER_SKIP: the walk enters them
              without consulting the filter, so the native step passes over

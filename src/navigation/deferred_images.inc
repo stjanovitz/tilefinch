@@ -2,11 +2,39 @@
    pending bytecode stores, network cancellation, deferred images and
    background resources. */
 
+/* How far the reader, and the scroll containers inside the page, have
+   moved since a look at top and the layout's scroll_travel. */
+static int64_t navigation_image_reader_distance(
+    const NavigationSession *session, int judged_top, uint32_t judged_travel)
+{
+    const NavigationEntry *entry = navigation_current(session);
+    int64_t moved = (int64_t) (entry == NULL ? 0 : entry->scroll_y)
+        - judged_top;
+    if (moved < 0) moved = -moved;
+    return moved + (int64_t) (uint32_t) (session->page.layout.scroll_travel
+                                         - judged_travel);
+}
+
+/* Whether the reader has moved half a viewport from where the settled
+   retarget step judged a table whose large SVG rasters depend on it. */
+static bool navigation_image_reader_moved(const NavigationSession *session,
+                                          int judged_top,
+                                          uint32_t judged_travel)
+{
+    return navigation_image_reader_distance(session, judged_top,
+                                            judged_travel)
+        >= session->viewport.css_height / 2;
+}
+
 /* Identifies the committed layout and image table a retarget step judged. */
 static bool navigation_image_retarget_current(const NavigationSession *session)
 {
     const NavigationPage *page = &session->page;
     return page->image_retarget.settled
+        && (!page->image_retarget.distance_candidates
+            || !navigation_image_reader_moved(
+                   session, page->image_retarget.reader_top,
+                   page->image_retarget.scroll_travel))
         && page->image_retarget.commands == page->layout.commands
         && page->image_retarget.count == page->layout.count
         && page->image_retarget.images == page->images.count
@@ -28,6 +56,11 @@ static void navigation_image_retarget_settle(NavigationSession *session)
         + session->performance.fast_relayouts
         + session->performance.full_relayouts;
     page->image_retarget.loads = session->loads_committed;
+    const NavigationEntry *entry = navigation_current(session);
+    page->image_retarget.reader_top = entry == NULL ? 0 : entry->scroll_y;
+    page->image_retarget.scroll_travel = page->layout.scroll_travel;
+    page->image_retarget.distance_candidates =
+        images_retarget_distance_candidates(&page->images);
     page->image_retarget.settled = true;
     page->image_retarget.retries = 0;
 }
@@ -221,16 +254,151 @@ NavigationBackgroundWorkOutcome navigation_run_web_font_memory_work(
         ? NAVIGATION_BACKGROUND_WORK_SUCCESS : NAVIGATION_BACKGROUND_WORK_SOFT_REFUSAL;
 }
 
+static size_t navigation_layout_generation(const NavigationSession *session)
+{
+    return session->incremental_relayouts + session->performance.fast_relayouts
+        + session->performance.full_relayouts;
+}
+
+/* A layout generation that changes no pixel: the display list stays, and
+   only what the render shell keeps by an image's address goes. No tile is
+   damaged, and the fixed layer stays when its images prove unchanged. */
+static void navigation_publish_undamaged_generation(NavigationSession *session)
+{
+    session->relayout_damage_valid = false;
+    session->relayout_damage_left = 0;
+    session->relayout_damage_top = 0;
+    session->relayout_damage_right = 0;
+    session->relayout_damage_bottom = 0;
+    session->incremental_relayouts++;
+    session->fixed_paint_relayout_generation = session->incremental_relayouts;
+}
+
+/* Records the inputs of a look (valid) or forgets them. */
+static void navigation_viewport_look_note(NavigationSession *session,
+                                          int scroll_y, bool valid)
+{
+    NavigationPage *page = &session->page;
+    page->viewport_look_witness.valid = valid;
+    if (!valid) return;
+    page->viewport_look_witness.scroll_y = scroll_y;
+    page->viewport_look_witness.css_height = session->viewport.css_height;
+    page->viewport_look_witness.generation = navigation_layout_generation(session);
+    page->viewport_look_witness.node_boxes = page->layout.node_box_count;
+    page->viewport_look_witness.images = page->images.count;
+    page->viewport_look_witness.attempted = page->images.stats.attempted;
+    page->viewport_look_witness.loaded = page->images.stats.loaded;
+    page->viewport_look_witness.evictions =
+        session->performance.viewport_image_evictions;
+    page->viewport_look_witness.queue = page->deferred_image_targets;
+    page->viewport_look_witness.queue_count = page->deferred_image_count;
+    page->viewport_look_witness.queue_cursor = page->deferred_image_cursor;
+}
+
+/* Whether the last look found only the resting queue's own targets and
+   nothing it reads has changed since: the same look would find the same. */
+static bool navigation_viewport_look_repeats(const NavigationSession *session)
+{
+    const NavigationPage *page = &session->page;
+    const NavigationEntry *entry = navigation_current(session);
+    int scroll_y = entry == NULL ? 0 : entry->scroll_y;
+    return page->viewport_look_witness.valid
+        && page->viewport_look_witness.scroll_y == scroll_y
+        && page->viewport_look_witness.css_height == session->viewport.css_height
+        && page->viewport_look_witness.generation
+               == navigation_layout_generation(session)
+        && page->viewport_look_witness.node_boxes == page->layout.node_box_count
+        && page->viewport_look_witness.images == page->images.count
+        && page->viewport_look_witness.attempted == page->images.stats.attempted
+        && page->viewport_look_witness.loaded == page->images.stats.loaded
+        && page->viewport_look_witness.evictions
+               == session->performance.viewport_image_evictions
+        && page->viewport_look_witness.queue == page->deferred_image_targets
+        && page->viewport_look_witness.queue_count == page->deferred_image_count
+        && page->viewport_look_witness.queue_cursor == page->deferred_image_cursor;
+}
+
+/* Whether images around the reader are to be looked for now. An active job
+   borrows the table; a queue being worked through for this position, and work
+   that is about to replace the layout, go first. */
+static bool navigation_viewport_images_due(const NavigationSession *session)
+{
+    const NavigationPage *page = &session->page;
+    return page->viewport_images_pending && session->external_resources_enabled
+        && !page->layout_provisional && page->layout.count != 0
+        && page->deferred_image_job == NULL
+        && page->visual_batch_targets == NULL
+        && !page->visual_image_publication_pending
+        && (page->deferred_image_targets == NULL
+            || (page->deferred_images_from_viewport
+                && page->viewport_images_moved)
+            /* A queue at rest, holding what has no box yet, can wait for the
+               reader for as long as the page is open. */
+            || (page->image_reveal_look && !page->image_continuation_pending))
+        && !script_runtime_has_pending_mutations(page->runtime)
+        && (page->image_reveal_look
+            || images_admission_scarce(&page->images, session->maximum_images,
+                                       session->maximum_image_bytes,
+                                       session->maximum_decoded_image_bytes))
+        && !navigation_viewport_look_repeats(session);
+}
+
 bool navigation_background_resources_pending(
     const NavigationSession *session)
 {
     return session != NULL && session->page.loaded
         && (navigation_web_font_fallback_pending(session)
+            || navigation_viewport_images_due(session)
             || fonts_external_loader_pending(
                 &session->page.external_font_loader)
             || session->page.image_continuation_pending
             || session->page.visual_image_publication_pending
             || session->page.visual_batch_targets != NULL);
+}
+
+/* A retarget changed a surface: the render shell drops what it keeps by the
+   old surface's address on the next frame, and every painted tile stays. */
+static void navigation_publish_retargeted_images(NavigationSession *session)
+{
+    NavigationPage *page = &session->page;
+    session->images = &page->images;
+    navigation_ensure_layout_reuse(session);
+    layout_reuse_cache_update_images(page->layout_reuse, &page->images);
+    navigation_publish_undamaged_generation(session);
+    page->image_retarget.settled = false;
+}
+
+bool navigation_prepare_near_vector_images(NavigationSession *session)
+{
+    if (session == NULL || !session->page.loaded
+        || session->page.layout.count == 0
+        || session->page.images.count == 0) return false;
+    NavigationPage *page = &session->page;
+    const NavigationEntry *entry = navigation_current(session);
+    int top = entry == NULL ? 0 : entry->scroll_y;
+    size_t generation = navigation_layout_generation(session);
+    /* A press that moves the page and its scroll containers less than a
+       quarter viewport on the same layout cannot bring a paint a viewport
+       away into the frame. */
+    if (page->vector_input_look.valid
+        && page->vector_input_look.generation == generation
+        && page->vector_input_look.images == page->images.count
+        && navigation_image_reader_distance(
+               session, page->vector_input_look.top,
+               page->vector_input_look.scroll_travel)
+               < session->viewport.css_height / 4) return false;
+    page->vector_input_look.valid = true;
+    page->vector_input_look.top = top;
+    page->vector_input_look.scroll_travel = page->layout.scroll_travel;
+    page->vector_input_look.generation = generation;
+    page->vector_input_look.images = page->images.count;
+    /* One viewport on either side: what this frame's tiles can cover. */
+    ImageRetargetReader reader = navigation_image_reader(session, 1, 1);
+    if (images_retarget_restore_near(&page->images, &page->layout,
+            session->browser_session, &reader, 4) == 0) return false;
+    navigation_publish_retargeted_images(session);
+    page->vector_input_look.generation = navigation_layout_generation(session);
+    return true;
 }
 
 /* One bounded display-retarget step once the page's image loading is done.
@@ -241,21 +409,22 @@ bool navigation_run_image_retarget_work(NavigationSession *session)
 {
     if (!navigation_image_retarget_pending(session)) return false;
     NavigationPage *page = &session->page;
+    ImageRetargetReader reader = navigation_image_reader(
+        session, NAVIGATION_IMAGE_READER_NEAR, NAVIGATION_IMAGE_READER_FAR);
+    /* Without a surface the distance rule can change, the plan need not
+       be judged again each time the reader moves. */
+    bool distance = images_retarget_distance_candidates(&page->images);
     ImageRetargetOutcome step = images_retarget_display_step(
         &page->images, &page->layout, session->browser_session,
         session->incremental_relayouts + session->performance.fast_relayouts
-            + session->performance.full_relayouts);
+            + session->performance.full_relayouts,
+        distance ? &reader : NULL);
     switch (step) {
     case IMAGE_RETARGET_CHANGED:
-        session->images = &page->images;
-        navigation_ensure_layout_reuse(session);
-        layout_reuse_cache_update_images(page->layout_reuse, &page->images);
-        session->relayout_damage_valid = false;
-        session->incremental_relayouts++;
+        navigation_publish_retargeted_images(session);
         images_retarget_plan_rebase(&page->images,
             session->incremental_relayouts + session->performance.fast_relayouts
                 + session->performance.full_relayouts);
-        page->image_retarget.settled = false;
         break;
     case IMAGE_RETARGET_RETRY:
         if (++page->image_retarget.retries >= 8u) {
@@ -348,6 +517,11 @@ size_t navigation_hold_network_work(
 static void navigation_deferred_images_finish(NavigationSession *session)
 {
     if (session == NULL) return;
+    /* A batch held for its queue's shared flow (see
+       navigation_publish_deferred_images) still gets it. */
+    if (session->page.deferred_images_from_viewport
+        && session->page.deferred_image_publication_age != 0)
+        session->page.visual_image_publication_pending = true;
     images_priority_load_destroy(session->page.deferred_image_job);
     session->page.deferred_image_job = NULL;
     session->page.deferred_image_batch_count = 0;
@@ -358,6 +532,7 @@ static void navigation_deferred_images_finish(NavigationSession *session)
     session->page.deferred_image_cursor = 0;
     session->page.deferred_image_rank_scroll_y = 0;
     session->page.deferred_image_rank_valid = false;
+    session->page.deferred_images_from_viewport = false;
     session->page.image_continuation_pending = false;
 }
 
@@ -577,7 +752,14 @@ static void navigation_rank_deferred_images(NavigationSession *session, int scro
     NavigationPage *page = &session->page;
     uint64_t distances[NAVIGATION_VISIBLE_IMAGE_PRIORITY_LIMIT];
     size_t start = page->deferred_image_cursor;
-    for (size_t i = start; i < page->deferred_image_count; i++) {
+    /* Every producer keeps what is left of the queue within the table; were
+       one not to, the targets past it would wait unranked behind it. */
+    size_t pending = page->deferred_image_count > start
+        ? page->deferred_image_count - start : 0;
+    if (pending > NAVIGATION_VISIBLE_IMAGE_PRIORITY_LIMIT)
+        pending = NAVIGATION_VISIBLE_IMAGE_PRIORITY_LIMIT;
+    size_t end = start + pending;
+    for (size_t i = start; i < end; i++) {
         ImagePriorityTarget *target = &page->deferred_image_targets[i];
         ImagePriorityTarget presentation = *target;
         bool visible = navigation_image_target_visible(session, target, false);
@@ -599,29 +781,30 @@ static void navigation_rank_deferred_images(NavigationSession *session, int scro
                 if (distance != 0) distance = UINT64_MAX;
             } else if (distance == UINT64_MAX) distance--;
         }
-        distances[i] = distance;
+        distances[i - start] = distance;
     }
     /* Stable bounded insertion sort: compute geometry/styles once per
        target, not once per comparison or once per downloaded image. */
-    for (size_t i = start + 1; i < page->deferred_image_count; i++) {
+    for (size_t i = start + 1; i < end; i++) {
         ImagePriorityTarget target = page->deferred_image_targets[i];
-        uint64_t distance = distances[i];
+        uint64_t distance = distances[i - start];
         size_t at = i;
-        while (at > start && distance < distances[at - 1]) {
+        while (at > start && distance < distances[at - 1 - start]) {
             page->deferred_image_targets[at] = page->deferred_image_targets[at - 1];
-            distances[at] = distances[at - 1];
+            distances[at - start] = distances[at - 1 - start];
             at--;
         }
         page->deferred_image_targets[at] = target;
-        distances[at] = distance;
+        distances[at - start] = distance;
     }
     page->deferred_image_rank_scroll_y = scroll_y;
     page->deferred_image_rank_valid = true;
     page->deferred_image_eligible_end = start;
-    while (page->deferred_image_eligible_end < page->deferred_image_count
-           && distances[page->deferred_image_eligible_end] != UINT64_MAX)
+    while (page->deferred_image_eligible_end < end
+           && distances[page->deferred_image_eligible_end - start] != UINT64_MAX)
         page->deferred_image_eligible_end++;
-    if (distances[start] == UINT64_MAX) page->image_continuation_pending = false;
+    if (end == start || distances[0] == UINT64_MAX)
+        page->image_continuation_pending = false;
 }
 
 static bool navigation_publish_fixed_image_paint(NavigationSession *session)
@@ -773,6 +956,14 @@ static bool navigation_publish_deferred_images(NavigationSession *session)
        coalescing window include this completed document-image batch. */
     if (page->visual_image_publication_pending) return true;
     if (navigation_publish_fixed_image_paint(session)) return true;
+    /* The images around one position share a flow: on a page whose relayout
+       takes seconds, one per pair would hold them all back further. */
+    if (page->deferred_images_from_viewport
+        && page->deferred_image_cursor + page->deferred_image_batch_count
+               < page->deferred_image_count) {
+        page->deferred_image_publication_age = 1;
+        return true;
+    }
     if (!navigation_relayout(session)) {
         session->performance.background_image_failures++;
         navigation_deferred_images_finish(session);
@@ -792,7 +983,7 @@ static void navigation_rebind_appended_images(NavigationSession *session,
         previous_base, previous_count, &session->page.images);
     if (session->image_table_moved != NULL)
         session->image_table_moved(session->image_table_moved_opaque,
-            session, previous_base, previous_count);
+            session, previous_base, previous_count, NULL);
 }
 
 /* An optional image publication also yields to page input queued during
@@ -900,6 +1091,11 @@ static bool navigation_run_deferred_image(NavigationSession *session)
         }
         if (page->deferred_image_rank_valid
             && page->deferred_image_cursor >= page->deferred_image_eligible_end) {
+            if (page->deferred_images_from_viewport
+                && page->deferred_image_publication_age != 0) {
+                page->deferred_image_publication_age = 0;
+                page->visual_image_publication_pending = true;
+            }
             page->image_continuation_pending = false;
             return true;
         }
@@ -921,6 +1117,14 @@ static bool navigation_run_deferred_image(NavigationSession *session)
             maximum_attempts += page->images.stats.failed;
         } else {
             maximum_attempts = SIZE_MAX;
+        }
+        /* The reader's position bounds this queue, not the image count. */
+        if (page->deferred_images_from_viewport) {
+            const ExternalImageStats *stats = &page->images.stats;
+            size_t spent = stats->attempted
+                - (stats->count_exempt <= stats->attempted
+                   ? stats->count_exempt : stats->attempted);
+            if (spent + 2u > maximum_attempts) maximum_attempts = spent + 2u;
         }
         size_t batch_count = 1u;
         if (target->retry_count == 0
@@ -1040,6 +1244,331 @@ static bool navigation_run_deferred_image(NavigationSession *session)
     return true;
 }
 
+/* The images looked for at one position, nearest first. More are found by
+   the next pass; this bounds the work between two looks at the input. */
+#define NAVIGATION_VIEWPORT_IMAGE_BATCH 16u
+
+/* A quota that refused an image can still be some way from full, so eviction
+   works toward leaving a quarter of it free rather than toward the limit. */
+static size_t navigation_image_quota_room(size_t maximum)
+{
+    return maximum - maximum / 4u;
+}
+
+/* Removes tracked images far from the reader to make room for `slots` entries
+   and for bytes. Only an image whose box does not depend on its resource is
+   removed (a slot naming its node), so the page cannot shift under the reader,
+   and none of a fixed layer, which paints at any scroll. Entries of retired
+   elements have no use at all and go first. */
+static void navigation_evict_far_images(
+    NavigationSession *session, int64_t band_top, int64_t band_bottom,
+    size_t slots)
+{
+    NavigationPage *page = &session->page;
+    ImageResources *images = &page->images;
+    LayoutDocument *layout = &page->layout;
+    size_t previous_count = images->count;
+    if (previous_count == 0 || previous_count > IMAGE_TRACKED_NODE_LIMIT)
+        return;
+    uint32_t distances[IMAGE_TRACKED_NODE_LIMIT];
+    uint8_t remap[IMAGE_TRACKED_NODE_LIMIT];
+    bool kept[IMAGE_TRACKED_NODE_LIMIT] = {false};
+    for (size_t i = 0; i < previous_count; i++)
+        distances[i] = images->items[i].node == NULL
+            && image_resource_evictable(&images->items[i]) ? UINT32_MAX : 0;
+    for (size_t i = 0; i < layout->count; i++) {
+        const DrawCommand *command = &layout->commands[i];
+        if (command->type != DRAW_IMAGE || command->image == NULL
+            || command->image < images->items
+            || command->image >= images->items + previous_count) continue;
+        size_t at = (size_t) (command->image - images->items);
+        int64_t top = command->y, bottom = top + command->height;
+        bool fixed = false;
+        for (size_t r = 0; !fixed && r < layout->fixed_count; r++)
+            fixed = i >= layout->fixed_ranges[r].command_start
+                && i < layout->fixed_ranges[r].command_end;
+        if (kept[at] || fixed || command->text == NULL
+            || command->text != (const char *) command->image->node
+            || !image_resource_evictable(command->image)
+            || (bottom > band_top && top < band_bottom)) {
+            kept[at] = true;
+            distances[at] = 0;
+            continue;
+        }
+        int64_t distance = bottom <= band_top
+            ? band_top - bottom + 1 : top - band_bottom + 1;
+        if (distance >= UINT32_MAX) distance = UINT32_MAX - 1;
+        if (distance > distances[at]) distances[at] = (uint32_t) distance;
+    }
+    bool released = false;
+    if (images_evict_farthest(images, distances, slots,
+            navigation_image_quota_room(session->maximum_image_bytes),
+            navigation_image_quota_room(session->maximum_decoded_image_bytes),
+            remap, &released) == 0) return;
+    images_retarget_plan_discard(images);
+    (void) layout_remap_image_resources(layout, remap, previous_count, images);
+    layout->image_resource_count = images->count;
+    if (session->image_table_moved != NULL)
+        session->image_table_moved(session->image_table_moved_opaque, session,
+            (uintptr_t) images->items, previous_count, remap);
+    /* A freed surface's address can return under another image. A new layout
+       generation with no damage drops what the render shell keeps by address;
+       the painted tiles stay valid. */
+    if (released) navigation_publish_undamaged_generation(session);
+    session->performance.viewport_image_evictions +=
+        previous_count - images->count;
+}
+
+/* Backgrounds and masks the laid-out page wanted around the reader and has
+   no entry for. Layout resolved their styles anyway and kept the list, so this
+   costs no style work. One that failed stays failed until its source changes,
+   and none of them can be evicted, so they cannot come and go. They are few
+   distinct icons: one batch, loaded in the next idle turn. */
+static void navigation_queue_revealed_visuals(
+    NavigationSession *session, int64_t band_top, int64_t band_bottom,
+    bool *more)
+{
+    NavigationPage *page = &session->page;
+    const LayoutDocument *layout = &page->layout;
+    ImagePriorityTarget found[NAVIGATION_VIEWPORT_IMAGE_BATCH];
+    size_t count = 0;
+    for (size_t i = 0; i < layout->visual_priority_count; i++) {
+        const ImagePriorityTarget *target = &layout->visual_priority_targets[i];
+        if (target->kind == IMAGE_PRIORITY_KIND_DOCUMENT
+            || images_node_failed(&page->images, target->node)) continue;
+        const ImageResource *held = target->kind == IMAGE_PRIORITY_KIND_MASK
+            ? images_find_mask_source(&page->images, target->node,
+                                      target->source, target->pseudo)
+            : images_find_background_source(&page->images, target->node,
+                                            target->source, target->pseudo);
+        if (held != NULL) continue;
+        const LayoutNodeBox *box = layout_box_for_node(layout, target->node);
+        if (box == NULL || (int64_t) box->y + box->height <= band_top
+            || box->y >= band_bottom) continue;
+        if (count == NAVIGATION_VIEWPORT_IMAGE_BATCH) {
+            *more = true;
+            break;
+        }
+        found[count++] = *target;
+    }
+    if (count == 0) return;
+    size_t room = page->images.count < IMAGE_TRACKED_NODE_LIMIT
+        ? IMAGE_TRACKED_NODE_LIMIT - page->images.count : 0;
+    if (count > room)
+        navigation_evict_far_images(session, band_top, band_bottom, count - room);
+    ImagePriorityTarget *targets = budget_malloc(
+        session->budget, count * sizeof(*targets));
+    if (targets == NULL) return;
+    memcpy(targets, found, count * sizeof(*targets));
+    page->visual_batch_targets = targets;
+    page->visual_batch_count = count;
+}
+
+/* Admission refuses what the page's bounds cannot hold and never comes back
+   to it, so whatever the reader reaches after the bound is spent stays blank.
+   Find the unresolved images in and around the viewport from the laid-out page
+   and make room for them. The image count limits what a page starts on its
+   own; these are bounded by the reader's position instead, a batch per half
+   viewport moved, so they do not spend it, and the byte quotas still hold.
+   Inline SVG is rasterized here; it needs no network. An <img> goes through
+   the deferred queue, which fetches without blocking input. Everything is
+   proportional to the page's boxes and commands and to one batch of images:
+   no document walk and no style reset. */
+static void navigation_admit_viewport_images(NavigationSession *session)
+{
+    NavigationPage *page = &session->page;
+    const NavigationEntry *entry = navigation_current(session);
+    int scroll_y = entry == NULL ? 0 : entry->scroll_y;
+    bool moved = page->viewport_images_moved;
+    bool reveal = page->image_reveal_look;
+    page->viewport_images_pending = false;
+    page->viewport_images_moved = false;
+    page->image_reveal_look = false;
+    page->viewport_images_scroll_y = scroll_y;
+    session->performance.viewport_image_looks++;
+    size_t evictions = session->performance.viewport_image_evictions;
+    /* Targets queued for a position the reader has left. */
+    if (moved && page->deferred_images_from_viewport)
+        navigation_deferred_images_finish(session);
+    int64_t view_top = scroll_y;
+    int64_t view_bottom = view_top + session->viewport.css_height;
+    int64_t band_top = view_top - session->viewport.css_height;
+    int64_t band_bottom = view_bottom + session->viewport.css_height;
+    struct {
+        lxb_dom_node_t *node;
+        int64_t distance;
+    } found[NAVIGATION_VIEWPORT_IMAGE_BATCH];
+    size_t count = 0, documents = 0;
+    size_t queued = page->deferred_image_targets == NULL ? 0
+        : page->deferred_image_count - page->deferred_image_cursor;
+    bool more = false, queue_reached = false;
+    if (reveal)
+        navigation_queue_revealed_visuals(session, band_top, band_bottom, &more);
+    for (size_t i = 0; i < page->layout.node_box_count; i++) {
+        const LayoutNodeBox *box = &page->layout.node_boxes[i];
+        int64_t top = box->y, bottom = top + box->height;
+        if (box->node == NULL || bottom <= band_top || top >= band_bottom
+            || box->node->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
+        bool document_image = document_node_is_tag(box->node, LXB_TAG_IMG);
+        /* A revealed <img> with no size of its own has no height until it
+           loads. */
+        if ((box->width <= 0 || box->height <= 0)
+            && !(reveal && document_image)) continue;
+        if ((!document_image && !document_node_is_tag(box->node, LXB_TAG_SVG))
+            || images_find_node(&page->images, box->node) != NULL
+            || images_node_failed(&page->images, box->node)) continue;
+        if (document_image) {
+            size_t length = 0;
+            if (image_select_source(&page->stylesheet, box->node, &length)
+                    == NULL || length == 0) continue;
+        }
+        int64_t distance = bottom <= view_top ? view_top - bottom
+            : top >= view_bottom ? top - view_bottom : 0;
+        size_t at = count;
+        while (at != 0 && distance < found[at - 1u].distance) at--;
+        if (at == NAVIGATION_VIEWPORT_IMAGE_BATCH) {
+            more = true;
+            continue;
+        }
+        if (count == NAVIGATION_VIEWPORT_IMAGE_BATCH) more = true;
+        else count++;
+        memmove(&found[at + 1u], &found[at],
+                (count - 1u - at) * sizeof(found[0]));
+        found[at].node = box->node;
+        found[at].distance = distance;
+    }
+    page->viewport_images_pending = more;
+    page->image_reveal_look = more && reveal;
+    navigation_viewport_look_note(session, scroll_y, false);
+    if (count == 0) return;
+    lxb_dom_node_t *inline_svgs[NAVIGATION_VIEWPORT_IMAGE_BATCH];
+    ImagePriorityTarget targets[NAVIGATION_VIEWPORT_IMAGE_BATCH];
+    /* Offsets past the cursor of the resting queue's targets this look
+       reached; they outrank the rest of it when the queue must shrink. */
+    size_t reached[NAVIGATION_VIEWPORT_IMAGE_BATCH];
+    size_t inline_count = 0, reached_count = 0;
+    for (size_t i = 0; i < count; i++) {
+        lxb_dom_node_t *node = found[i].node;
+        if (!document_node_is_tag(node, LXB_TAG_IMG)) {
+            inline_svgs[inline_count++] = node;
+            continue;
+        }
+        /* The resting queue's own target: its rank now finds it a box. */
+        bool in_queue = false;
+        for (size_t at = 0; !in_queue && at < queued; at++) {
+            in_queue = page->deferred_image_targets[
+                page->deferred_image_cursor + at].node == node;
+            if (in_queue) reached[reached_count++] = at;
+        }
+        if (in_queue) {
+            queue_reached = true;
+            continue;
+        }
+        long handle = page->runtime == NULL ? 0
+            : script_runtime_node_weak_handle(page->runtime, node);
+        if (page->runtime != NULL && handle == 0) continue;
+        targets[documents++] = (ImagePriorityTarget) {
+            .node = node, .weak_handle = handle,
+            .kind = IMAGE_PRIORITY_KIND_DOCUMENT
+        };
+    }
+    const ExternalImageStats *stats = &page->images.stats;
+    size_t spent = stats->attempted
+        - (stats->count_exempt <= stats->attempted
+           ? stats->count_exempt : stats->attempted);
+    size_t room = page->images.count < IMAGE_TRACKED_NODE_LIMIT
+        ? IMAGE_TRACKED_NODE_LIMIT - page->images.count : 0;
+    size_t wanted = inline_count + documents;
+    size_t slots = wanted > room ? wanted - room : 0;
+    /* A look on a page with bounds to spare makes room only if it must. */
+    if (slots != 0 || (images_admission_scarce(&page->images,
+                           session->maximum_images, session->maximum_image_bytes,
+                           session->maximum_decoded_image_bytes)
+            && (stats->encoded_bytes
+                    >= navigation_image_quota_room(session->maximum_image_bytes)
+                || stats->decoded_bytes >= navigation_image_quota_room(
+                       session->maximum_decoded_image_bytes))))
+        navigation_evict_far_images(session, band_top, band_bottom, slots);
+    if (inline_count != 0) {
+        uintptr_t image_base = (uintptr_t) page->images.items;
+        size_t image_count = page->images.count;
+        size_t loaded_before = page->images.stats.loaded;
+        size_t duplicate_before = page->images.stats.duplicate;
+        navigation_ensure_layout_reuse(session);
+        bool loaded = images_refresh_external_nodes_reusing_layout_styles(
+            &page->document, &page->stylesheet, &page->images, inline_svgs,
+            inline_count, session->budget, page->resource_base_url,
+            page->document_url, page->referrer_policy,
+            spent + inline_count, session->maximum_image_bytes,
+            session->maximum_image_file_bytes,
+            session->maximum_decoded_image_bytes,
+            session->resource_timeout_ms, page->resource_scheduler,
+            session->browser_session, page->layout_reuse, session->fonts,
+            session->viewport.css_width);
+        /* Input cancelled the walk: the next idle turn looks again. */
+        if (!loaded && page->images.stats.load_cancelled) {
+            page->viewport_images_pending = true;
+            page->image_reveal_look = reveal;
+        }
+        navigation_rebind_appended_images(session, image_base, image_count);
+        session->images = &page->images;
+        layout_reuse_cache_update_images(page->layout_reuse, &page->images);
+        if (loaded && (page->images.stats.loaded != loaded_before
+                       || page->images.stats.duplicate != duplicate_before))
+            page->visual_image_publication_pending = true;
+    }
+    /* Whatever else the queue holds has no box and is found again by a later
+       look when it gets one, so the reader's position can bound it all. */
+    if (queue_reached || documents != 0) {
+        page->deferred_images_from_viewport = true;
+        page->deferred_image_rank_valid = false;
+        page->image_continuation_pending = true;
+    }
+    /* Everything this look found already waits in the queue, and what lies
+       past the batch is farther than all of it. */
+    if (queue_reached && documents == 0 && inline_count == 0
+        && page->visual_batch_targets == NULL
+        && evictions == session->performance.viewport_image_evictions)
+        navigation_viewport_look_note(session, scroll_y, true);
+    if (documents == 0) return;
+    /* The rank holds NAVIGATION_VISIBLE_IMAGE_PRIORITY_LIMIT targets. A
+       resting queue grows by a batch per look, so past that this batch and
+       what the look reached stay and the longest resting of the rest, at
+       the queue's front, give way. None of those is near the reader now; a
+       later look finds each again once it is. */
+    size_t kept = queued;
+    if (kept > NAVIGATION_VISIBLE_IMAGE_PRIORITY_LIMIT - documents)
+        kept = NAVIGATION_VISIBLE_IMAGE_PRIORITY_LIMIT - documents;
+    ImagePriorityTarget *queue = budget_malloc_category(
+        session->budget, BUDGET_CATEGORY_RESOURCE,
+        (kept + documents) * sizeof(*queue));
+    if (queue == NULL) return;
+    if (kept == queued) {
+        if (queued != 0)
+            memcpy(queue,
+                   page->deferred_image_targets + page->deferred_image_cursor,
+                   queued * sizeof(*queue));
+    } else {
+        size_t dropped = queued - kept, at_queue = 0;
+        for (size_t at = 0; at < queued; at++) {
+            bool was_reached = false;
+            for (size_t r = 0; !was_reached && r < reached_count; r++)
+                was_reached = reached[r] == at;
+            if (!was_reached && dropped != 0) {
+                dropped--;
+                continue;
+            }
+            queue[at_queue++] = page->deferred_image_targets[
+                page->deferred_image_cursor + at];
+        }
+    }
+    memcpy(queue + kept, targets, documents * sizeof(*queue));
+    budget_free(session->budget, page->deferred_image_targets);
+    page->deferred_image_targets = queue;
+    page->deferred_image_count = kept + documents;
+    page->deferred_image_cursor = 0;
+}
+
 bool navigation_image_publication_allowed(const NavigationSession *session)
 {
     return session != NULL && (session->maximum_publication_work_units == 0
@@ -1047,11 +1576,72 @@ bool navigation_image_publication_allowed(const NavigationSession *session)
         || session->page.layout.layout_work_units <= session->maximum_publication_work_units);
 }
 
+/* Loads the backgrounds and masks a look queued
+   (navigation_queue_revealed_visuals) and publishes what arrived. */
+static NavigationBackgroundWorkOutcome navigation_load_visual_batch(
+    NavigationSession *session, NavigationBackgroundWorkOutcome outcome)
+{
+    NavigationPage *page = &session->page;
+    ImagePriorityTarget *targets = page->visual_batch_targets;
+    size_t count = page->visual_batch_count;
+    page->visual_batch_targets = NULL;
+    page->visual_batch_count = 0;
+    size_t loaded_before = page->images.stats.loaded;
+    uintptr_t image_base = (uintptr_t) page->images.items;
+    size_t image_count = page->images.count;
+    ImageLayoutBoxes image_scale;
+    navigation_lend_image_scale(session, &image_scale);
+    bool loaded = images_load_external_priority_targets(
+        &page->document, &page->stylesheet, &page->images, targets,
+        count, session->budget, page->resource_base_url,
+        page->document_url, page->referrer_policy,
+        session->maximum_images, session->maximum_image_bytes,
+        session->maximum_image_file_bytes,
+        session->maximum_decoded_image_bytes,
+        session->resource_timeout_ms, page->resource_scheduler,
+        session->browser_session);
+    navigation_return_image_boxes(session, &image_scale);
+    budget_free(session->budget, targets);
+    navigation_rebind_appended_images(session, image_base, image_count);
+    session->images = &page->images;
+    navigation_ensure_layout_reuse(session);
+    layout_reuse_cache_update_images(page->layout_reuse, &page->images);
+    if (loaded && page->images.stats.loaded > loaded_before) {
+        session->performance.background_images_loaded +=
+            page->images.stats.loaded - loaded_before;
+        page->visual_image_publication_pending = true;
+        return navigation_publish_visual_images(session);
+    } else if (!loaded) {
+        session->performance.background_image_failures++;
+        if (page->images.stats.load_cancelled) {
+            page->viewport_images_pending = true;
+            page->image_reveal_look = page->image_reveal_armed;
+        }
+    }
+    return outcome;
+}
+
 bool navigation_run_deferred_image_work(NavigationSession *session)
 {
     if (session == NULL || !session->page.loaded) return false;
     if (!session->page.image_continuation_pending
-        || session->page.deferred_image_targets == NULL) return true;
+        || session->page.deferred_image_targets == NULL) {
+        /* The image units of a page-idle turn, one per call. A page whose
+           canvas commits a picture every frame is never idle, and a look
+           one change asked for (with the batch and publication it starts)
+           would wait for as long as the page stays open, holding back all
+           that waits for the page to settle. */
+        NavigationPage *page = &session->page;
+        NavigationBackgroundWorkOutcome outcome =
+            NAVIGATION_BACKGROUND_WORK_SUCCESS;
+        if (page->visual_image_publication_pending)
+            outcome = navigation_publish_visual_images(session);
+        else if (page->visual_batch_targets != NULL)
+            outcome = navigation_load_visual_batch(session, outcome);
+        else if (navigation_viewport_images_due(session))
+            navigation_admit_viewport_images(session);
+        return outcome != NAVIGATION_BACKGROUND_WORK_HARD_FAILURE;
+    }
     /* Pages that relayout provisionally show each batch in a fraction of
        a second and complete in preemptible idle work. */
     if (!navigation_image_publication_allowed(session)) {
@@ -1082,11 +1672,9 @@ void navigation_test_refuse_next_background_font_relayout(void)
 }
 #endif
 
-NavigationBackgroundWorkOutcome navigation_run_background_resources(
+static NavigationBackgroundWorkOutcome navigation_background_resources_turn(
     NavigationSession *session)
 {
-    if (session == NULL || !session->page.loaded)
-        return NAVIGATION_BACKGROUND_WORK_HARD_FAILURE;
     if (session->page.visual_image_publication_pending)
         return navigation_publish_visual_images(session);
     NavigationBackgroundWorkOutcome outcome =
@@ -1165,42 +1753,8 @@ NavigationBackgroundWorkOutcome navigation_run_background_resources(
             }
         }
     }
-    if (session->page.visual_batch_targets != NULL) {
-        NavigationPage *page = &session->page;
-        ImagePriorityTarget *targets = page->visual_batch_targets;
-        size_t count = page->visual_batch_count;
-        page->visual_batch_targets = NULL;
-        page->visual_batch_count = 0;
-        size_t loaded_before = page->images.stats.loaded;
-        uintptr_t image_base = (uintptr_t) page->images.items;
-        size_t image_count = page->images.count;
-        ImageLayoutBoxes image_scale;
-        navigation_lend_image_scale(session, &image_scale);
-        bool loaded = images_load_external_priority_targets(
-            &page->document, &page->stylesheet, &page->images, targets,
-            count, session->budget, page->resource_base_url,
-            page->document_url, page->referrer_policy,
-            session->maximum_images, session->maximum_image_bytes,
-            session->maximum_image_file_bytes,
-            session->maximum_decoded_image_bytes,
-            session->resource_timeout_ms, page->resource_scheduler,
-            session->browser_session);
-        navigation_return_image_boxes(session, &image_scale);
-        budget_free(session->budget, targets);
-        navigation_rebind_appended_images(session, image_base, image_count);
-        session->images = &page->images;
-        navigation_ensure_layout_reuse(session);
-        layout_reuse_cache_update_images(page->layout_reuse, &page->images);
-        if (loaded && page->images.stats.loaded > loaded_before) {
-            session->performance.background_images_loaded +=
-                page->images.stats.loaded - loaded_before;
-            page->visual_image_publication_pending = true;
-            return navigation_publish_visual_images(session);
-        } else if (!loaded) {
-            session->performance.background_image_failures++;
-        }
-        return outcome;
-    }
+    if (session->page.visual_batch_targets != NULL)
+        return navigation_load_visual_batch(session, outcome);
     if (!session->page.image_continuation_pending) return outcome;
     if (session->page.deferred_image_targets != NULL) {
         return navigation_run_deferred_image(session)
@@ -1266,5 +1820,20 @@ NavigationBackgroundWorkOutcome navigation_run_background_resources(
        change semantics because corrupt early resources are intentionally not
        retained in the successful-image table and could consume quota again. */
     session->page.image_continuation_pending = false;
+    return outcome;
+}
+
+NavigationBackgroundWorkOutcome navigation_run_background_resources(
+    NavigationSession *session)
+{
+    if (session == NULL || !session->page.loaded)
+        return NAVIGATION_BACKGROUND_WORK_HARD_FAILURE;
+    NavigationBackgroundWorkOutcome outcome =
+        navigation_background_resources_turn(session);
+    /* Last, so that the turn which spends the page's bound finds out at once
+       what the bound left unresolved and nothing idles waiting to look. */
+    if (outcome != NAVIGATION_BACKGROUND_WORK_HARD_FAILURE
+        && navigation_viewport_images_due(session))
+        navigation_admit_viewport_images(session);
     return outcome;
 }

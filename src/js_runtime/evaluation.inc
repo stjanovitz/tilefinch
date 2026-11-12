@@ -360,6 +360,7 @@ static void script_runtime_gc_hook(void *opaque, int begin)
     if (begin && owner->bytecode_pending_count != 0)
         (void) script_runtime_release_pending_bytecode_for_heap(
             owner, owner->heap_growth_refusals != owner->gc_advance_refusals);
+    js_rt_bridge_hold_stateful_wrappers(&owner->bridge, begin != 0);
 #if !defined(TILEFINCH_NO_TRACE) || defined(TILEFINCH_PSP_VALIDATION_LOG)
     if (begin) {
         owner->gc_begin_ns = js_rt_monotonic_time_ns();

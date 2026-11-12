@@ -110,13 +110,22 @@ typedef struct {
     unsigned parser_checkpoint_fault;
     /* Fail this many upcoming Memory Stick site-storage record appends. */
     unsigned fail_site_storage_appends;
+    /* Report this many upcoming site-storage record flushes as failed (the
+       bytes reach the file; the stick is "full" for the caller). */
+    unsigned fail_site_storage_flushes;
+    /* Fail the Nth record-header read (1-based) of the next site-storage
+       log load as a read error, not a torn tail. Consumed once. */
+    unsigned fail_site_storage_load_read_at;
+    /* Fail this many glyph-pack block reads as card read errors. */
+    unsigned fail_glyph_block_reads;
     /* tilefinch_platform_replace_file: while set, rename refuses to
        replace an existing file, as FAT does. */
     bool replace_file_no_replace;
-    /* tilefinch_platform_replace_file with a backup, consumed once: fail
-       the rename that installs the temporary file (the previous file is
-       moved back), or stop right after the previous file moved aside, as a
-       power loss there would. */
+    /* tilefinch_platform_replace_file, consumed once: fail the rename that
+       installs the temporary file after the previous file moved aside (it
+       is moved back; with or without a backup), or, with a backup, stop
+       right after the previous file moved aside, as a power loss there
+       would. */
     bool replace_file_fail_install;
     bool replace_file_crash_after_backup;
     bool refuse_next_youtube_feed_build;
@@ -159,6 +168,22 @@ typedef struct {
         unsigned fetch_site; /* 0 unknown, 1 none, 2 origin, 3 site, 4 cross-site. */
     } replayed_requests[16];
     unsigned replayed_request_count;
+    /* Fail a scheduler hop the worker transport refuses (a named
+       ScheduledHopRefusal: the worker off, not started or without the
+       scheduler's chunk, or the hop's cookie, deadline or shape) as the
+       PSP build does, instead of the host's browser-thread curl path. The
+       host has a worker only under a response-keyed replay. */
+    bool fail_worker_refused_hops;
+    /* Give the response-keyed replay lane, which stands in for the worker
+       on the host, the PSP worker's FETCH_BACKGROUND_REQUEST_LIMIT
+       descriptors and their per-lane admission ranges
+       (fetch_background_admission_slot_limit) instead of its 8 slots. */
+    bool replay_lane_worker_descriptors;
+    /* Under a response-keyed replay, run every scheduler request's hops on
+       the replay lane (the worker's API), not only the updater's release
+       chain, so a page's requests hold worker descriptors as they do on the
+       PSP: until their own scheduler is pumped. */
+    bool replay_lane_runs_page_hops;
 } TilefinchTestFaults;
 
 TilefinchTestFaults *tilefinch_test_faults(void);

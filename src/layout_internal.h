@@ -14,16 +14,19 @@
 #include <limits.h>
 
 
-/* DRAW_IMAGE does not use its text member. A fixed raster <img> may borrow
-   its node identity there (text_length stays zero), allowing allocation-free
-   resource rebinding after the image table moves. This is native metadata,
-   never an author DOM marker. Intrinsic sizing retains full flow; fallback
-   alt ink is a separate retained text command, retired on image arrival. */
+/* DRAW_IMAGE does not use its text member. A fixed <img> or inline <svg> may
+   borrow its node identity there (text_length stays zero), allowing
+   allocation-free resource rebinding after the image table moves. This is
+   native metadata, never an author DOM marker. Its box does not depend on the
+   resource, so the resource can arrive or be evicted without a flow. Intrinsic
+   sizing retains full flow; fallback alt ink is a separate retained text
+   command, retired on image arrival. */
 static inline bool layout_fixed_image_slot(lxb_dom_node_t *node,
                                            const ComputedStyle *style,
                                            const ComputedStyle *parent)
 {
-    return document_node_is_tag(node, LXB_TAG_IMG)
+    return (document_node_is_tag(node, LXB_TAG_IMG)
+            || document_node_is_tag(node, LXB_TAG_SVG))
         && style->has_width && style->has_height
         && style->width > 0 && style->height > 0
         && style->width <= STYLE_LENGTH_DIRECT_LIMIT
@@ -75,7 +78,15 @@ typedef struct {
     uint8_t spacing_x;
     uint8_t spacing_y;
     bool border_collapse;
+    /* LayoutContext.table_track_clock at the last lookup that found it. */
+    uint32_t last_use;
 } TableTracks;
+
+/* Column-track slots in one layout pass. A slot is needed only while its
+   table (or a table nested inside it) is being laid out; when all are
+   taken, the least recently used slot of a table that does not enclose the
+   requesting one is reused, so the bound is table nesting depth. */
+#define LAYOUT_TABLE_TRACK_SLOTS 32
 
 #define LAYOUT_MARGIN_CACHE_CAPACITY 128
 #define LAYOUT_MARGIN_CACHE_PROBE_LIMIT 4
@@ -281,18 +292,30 @@ typedef struct {
 
 /* A cache starts with this many style entries and grows, by powers of
    two up to the limit, when a build walks more styled elements than it
-   holds (layout_reuse_fit_styles). */
+   holds (layout_reuse_fit_styles). Entries are small: the computed values
+   live in payloads shared by every entry that resolved to the same bytes, so
+   a page of repeated components needs far fewer payloads than elements. */
 #define LAYOUT_REUSE_STYLE_CAPACITY 1024u
-#define LAYOUT_REUSE_STYLE_CAPACITY_LIMIT 4096u
+#define LAYOUT_REUSE_STYLE_CAPACITY_LIMIT 16384u
+#define LAYOUT_REUSE_STYLE_PAYLOAD_LIMIT 4096u
 #define LAYOUT_REUSE_STYLE_PAGE_SIZE 128u
 #define LAYOUT_REUSE_STYLE_PAGE_COUNT \
-    (LAYOUT_REUSE_STYLE_CAPACITY_LIMIT / LAYOUT_REUSE_STYLE_PAGE_SIZE)
-typedef union {
+    (LAYOUT_REUSE_STYLE_PAYLOAD_LIMIT / LAYOUT_REUSE_STYLE_PAGE_SIZE)
+#define LAYOUT_REUSE_STYLE_SHARE_BUCKETS 512u
+typedef struct {
     ComputedStyle style;
-    uint16_t next_free;
+    uint32_t hash;
+    uint16_t references;
+    /* The next payload in its share bucket, or on the free list; plus one,
+       zero ending either list. */
+    uint16_t next;
 } LayoutReuseStylePayload;
-_Static_assert(LAYOUT_REUSE_STYLE_CAPACITY_LIMIT < UINT16_MAX,
-    "style payload indices must fit their sentinel encoding");
+_Static_assert(LAYOUT_REUSE_STYLE_PAYLOAD_LIMIT < UINT16_MAX
+               && LAYOUT_REUSE_STYLE_CAPACITY_LIMIT < UINT16_MAX,
+    "style payload indices and reference counts must fit 16 bits");
+_Static_assert((LAYOUT_REUSE_STYLE_SHARE_BUCKETS
+                & (LAYOUT_REUSE_STYLE_SHARE_BUCKETS - 1u)) == 0,
+    "style share buckets are masked");
 #define LAYOUT_REUSE_PENDING_NODE_LIMIT 32u
 #define LAYOUT_REUSE_PENDING_TOKEN_LIMIT 32u
 #define LAYOUT_REUSE_INTRINSIC_CAPACITY 128u
@@ -392,6 +415,16 @@ struct LayoutReuseCache {
     uint64_t sheet_generation;
     const FontSet *fonts;
     const ImageResources *images;
+    /* How each entry of `images` looked to layout when last seen. Loads and
+       arrivals happen in place in the same table, so the pointer alone
+       cannot tell that an image's intrinsic size changed. */
+    struct LayoutReuseImageSeen {
+        const lxb_dom_node_t *node;
+        int width;
+        int height;
+        bool available;
+    } images_seen[IMAGE_TRACKED_NODE_LIMIT];
+    size_t images_seen_count;
     int viewport_width;
     uint64_t clock;
     uint64_t style_build_clock;
@@ -400,8 +433,10 @@ struct LayoutReuseCache {
     LayoutReuseStyleEntry *styles;
     /* Hash metadata retains the original probe/LRU plan. Full styles are
        admitted only for occupied slots, in bounded pages without grow-copy
-       peaks. Invalidations recycle payloads; clear reuses existing pages. */
+       peaks, and shared by value through the buckets. Invalidations recycle
+       payloads; clear reuses existing pages. */
     LayoutReuseStylePayload *style_pages[LAYOUT_REUSE_STYLE_PAGE_COUNT];
+    uint16_t style_share[LAYOUT_REUSE_STYLE_SHARE_BUCKETS]; /* index + 1 */
     uint16_t style_payload_count;
     uint16_t style_payload_free; /* index + 1, zero means no free payload */
     bool style_payload_refused;
@@ -572,6 +607,9 @@ typedef struct {
     LineAtomic entries[LINE_ATOMIC_LIMIT];
 } LineAtomicStack;
 
+/* Ordered lists whose numbering a build remembers at once. */
+#define LAYOUT_LIST_MARKER_MEMO 4u
+
 typedef struct {
     LayoutDocument *layout;
     const PocDocument *document;
@@ -649,8 +687,9 @@ typedef struct {
     LayoutIntrinsicCacheEntry
         intrinsic_cache[LAYOUT_INTRINSIC_CACHE_CAPACITY];
     LayoutMarginCacheEntry margin_cache[LAYOUT_MARGIN_CACHE_CAPACITY];
-    TableTracks table_tracks[32];
+    TableTracks table_tracks[LAYOUT_TABLE_TRACK_SLOTS];
     size_t table_track_count;
+    uint32_t table_track_clock;
     LayoutStackingContext *stacking_contexts;
     size_t stacking_context_count;
     size_t stacking_context_capacity;
@@ -755,6 +794,18 @@ typedef struct {
     size_t bidi_rtl_ancestor_count;
     bool cancelled;
     LayoutReuseCache *reuse;
+    /* Per ordered list (the few most recent, so lists nested in items keep
+       their parents'): the <li> numbered last and its ordinal, so the next
+       item counts on from it instead of from the list's start, and a
+       reversed list's item count (layout_list_item_ordinal). The DOM does
+       not change during a build. */
+    struct {
+        const lxb_dom_node_t *list;
+        const lxb_dom_node_t *item;
+        int ordinal;
+        int count;
+        bool counted;
+    } list_markers[LAYOUT_LIST_MARKER_MEMO];
 #if !defined(TILEFINCH_NO_TRACE) || defined(TILEFINCH_PROFILE_LAYOUT_FLOW)
     size_t pseudo_resolutions, pseudo_generated, pseudo_absence_hits;
 #endif
@@ -946,6 +997,45 @@ static inline bool layout_style_establishes_fixed_containing_block(
 #define LAYOUT_LINK_TRANSIENT_COMMAND UINT32_C(0x80000000)
 #define LAYOUT_LINK_URL_LENGTH_MASK UINT32_C(0x7fffffff)
 
+/* The largest command index a node box holds; a command insertion at or
+   after it changes nothing in the box. */
+static inline uint32_t layout_node_box_command_max(const LayoutNodeBox *box)
+{
+    uint32_t maximum = box->command_start;
+    if (box->command_end > maximum) maximum = box->command_end;
+    if (box->scroll_command_start > maximum)
+        maximum = box->scroll_command_start;
+    if (box->scroll_command_end > maximum) maximum = box->scroll_command_end;
+    return maximum;
+}
+
+/* Keep `bounds` an upper bound after entry `index` came to hold command
+   index `value`. */
+static inline void layout_run_bounds_raise(LayoutRunBounds *bounds,
+                                           size_t index, uint32_t value)
+{
+    if (bounds->bounds == NULL) return;
+    size_t run = index / LAYOUT_BOUND_RUN;
+    if (run >= bounds->capacity) {
+        bounds->lost = true;
+        return;
+    }
+    if (value > bounds->bounds[run]) bounds->bounds[run] = value;
+}
+
+/* The bounds covering `count` entries, or NULL when every entry must be
+   examined. */
+static inline uint32_t *layout_run_bounds_for(LayoutRunBounds *bounds,
+                                              size_t count)
+{
+    size_t runs = count / LAYOUT_BOUND_RUN + (count % LAYOUT_BOUND_RUN != 0);
+    return bounds->lost || runs > bounds->capacity ? NULL : bounds->bounds;
+}
+
+bool layout_run_bounds_grow(Budget *budget, LayoutRunBounds *bounds,
+                            size_t entries);
+void layout_run_bounds_release(Budget *budget, LayoutRunBounds *bounds);
+
 typedef struct {
     int start_x;
     int base_left;
@@ -1115,11 +1205,21 @@ typedef struct {
 
 #define FLEX_ORDER_VALUE_LIMIT 32u
 #define GRID_TRACK_LIMIT GRID_TRACK_REPEAT_LIMIT
+/* Rows of the occupancy window, and of the explicit/fixed-size row tables
+   kept on the stack. */
 #define GRID_PLACEMENT_ROW_LIMIT 64
+/* Rows a grid can have in all. Rows past the window's 64 are reached by
+   sliding it (grid_placement_slide) and sized in a Budget-charged table
+   that layout_block_grid.c allocates only for grids that need it. */
+#define GRID_IMPLICIT_ROW_LIMIT 4096
 
 /* Grid auto-placement is transient and deliberately fixed-size. One word per
-   possible row is an occupancy bitmap for the supported columns; no
-   placement matrix or per-item retained allocation reaches the page. */
+   row of a 64-row window is an occupancy bitmap for the supported columns;
+   no placement matrix or per-item retained allocation reaches the page.
+   Row-flow auto-placement moves forward, so when it runs past the window
+   the window slides down to the search position: the rows it leaves are
+   then treated as full (a dense or explicitly placed item can no longer go
+   back into a hole there). */
 _Static_assert(GRID_TRACK_LIMIT < 32,
                "grid occupancy rows are 32-bit column bitmaps");
 /* Items locked to a major-axis track (a definite row in row flow) whose
@@ -1127,7 +1227,11 @@ _Static_assert(GRID_TRACK_LIMIT < 32,
    placed in document order like before. */
 #define GRID_LOCKED_ITEM_LIMIT 64
 #define GRID_LOCKED_NO_FIT UINT8_MAX
+_Static_assert(GRID_IMPLICIT_ROW_LIMIT >= GRID_PLACEMENT_ROW_LIMIT
+               && GRID_IMPLICIT_ROW_LIMIT <= UINT16_MAX,
+               "grid rows are 16-bit and the window must fit");
 typedef struct {
+    /* occupied[i] is row row_base + i. */
     uint32_t occupied[GRID_PLACEMENT_ROW_LIMIT];
     /* Minor-axis start of each locked item, in placement order, chosen by
        grid_placement_reserve() before any auto-placed item (CSS Grid 8.5
@@ -1142,17 +1246,21 @@ typedef struct {
     uint8_t explicit_rows;
     uint8_t column_origin;
     uint8_t row_origin;
-    uint8_t cursor_row;
     uint8_t cursor_column;
     bool flow_column;
     bool dense;
+    uint16_t cursor_row;
+    uint16_t row_base;
+    /* Rows placement may use in all: GRID_IMPLICIT_ROW_LIMIT, or the window
+       alone when layout could not size more rows. */
+    uint16_t row_limit;
 } GridPlacementState;
 
 typedef struct {
     uint8_t column;
     uint8_t column_span;
-    uint8_t row;
     uint8_t row_span;
+    uint16_t row;
 } GridItemPlacement;
 
 /* Iterators retain two complete ComputedStyle values.  Keeping the active
@@ -1302,6 +1410,8 @@ bool layout_bidi_fitting_shaped_prefix(
     TextTransformMode transform, bool kerning, int available_fixed,
     size_t *prefix);
 bool layout_bidi_resolve_line(LineState *line);
+void layout_bidi_control_text(LayoutContext *context, lxb_dom_node_t *node,
+                              const ComputedStyle *style, size_t command_start);
 const LayoutBidiCommand *layout_bidi_command_for_index(
     const LayoutDocument *layout, size_t command_index);
 void layout_bidi_translate_commands(
@@ -1740,5 +1850,23 @@ void translate_table_cell_contents(LayoutDocument *layout, lxb_dom_node_t *node,
 void update_float_bounds(LineState *line);
 void update_float_band(LineState *line);
 void update_float_bounds_for_span(LineState *line, int height);
+
+/* Adds a scroll offset change to layout->scroll_travel. */
+static inline void layout_note_scroll_travel(LayoutDocument *layout, int dx,
+                                             int dy)
+{
+    uint32_t x = dx < 0 ? (uint32_t) 0 - (uint32_t) dx : (uint32_t) dx;
+    uint32_t y = dy < 0 ? (uint32_t) 0 - (uint32_t) dy : (uint32_t) dy;
+    layout->scroll_travel += x + y;
+}
+
+/* layout_node_overflow_placement over boxes found by `lookup` (a live
+   layout's, or ones kept after it was released). */
+typedef const LayoutNodeBox *(*LayoutBoxLookup)(const void *boxes,
+                                               const lxb_dom_node_t *node);
+bool layout_boxes_overflow_placement(LayoutBoxLookup lookup,
+                                     const void *boxes,
+                                     const lxb_dom_node_t *node,
+                                     LayoutScrollPlacement *placement);
 
 #endif /* TILEFINCH_LAYOUT_INTERNAL_H */

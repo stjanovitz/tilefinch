@@ -22,7 +22,7 @@ static inline size_t psp_ui_page_tools_count(const PspUiState *ui)
 {
     return UI_PAGE_TOOLS_ITEM_COUNT + (ui->youtube_signin_continue ? 1u : 0u);
 }
-#define UI_SITE_CONTROLS_ITEM_COUNT 7u
+#define UI_SITE_CONTROLS_ITEM_COUNT 8u
 #define UI_HELP_ITEM_COUNT 6u
 #define UI_SETTINGS_GROUP_COUNT 7u
 #define UI_SITE_INFO_ACTION_COUNT 4u

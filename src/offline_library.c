@@ -179,6 +179,27 @@ void offline_library_init(
     library->next_id = 1;
 }
 
+bool offline_library_fence_acquire(const OfflineLibrary *library)
+{
+    return library->fence_acquire != NULL && library->fence_acquire();
+}
+
+void offline_library_fence_release(const OfflineLibrary *library, bool held)
+{
+    if (held) library->fence_release(true);
+}
+
+/* The in-memory step of a publish or its rollback: ITEM (when not NULL)
+   into SLOT and the new COUNT, under the fence. */
+static void offline_index_put(OfflineLibrary *library, size_t slot,
+                              const OfflineLibraryItem *item, size_t count)
+{
+    bool held = offline_library_fence_acquire(library);
+    if (item != NULL) library->items[slot] = *item;
+    library->count = count;
+    offline_library_fence_release(library, held);
+}
+
 static bool offline_item_valid(const OfflineLibraryItem *item)
 {
     return item != NULL && item->id != 0
@@ -325,10 +346,11 @@ static bool decode_item(
 
 static bool offline_library_decode_index(
     const OfflineLibrary *library, const char *suffix,
-    OfflineLibrary *decoded, bool *exists);
+    OfflineLibrary *decoded, bool *exists, bool *newer);
 static bool offline_library_decode_index_with_buffer(
     const OfflineLibrary *library, const char *suffix,
-    OfflineLibrary *decoded, bool *exists, unsigned char *data);
+    OfflineLibrary *decoded, bool *exists, bool *newer,
+    unsigned char *data);
 
 static bool offline_library_save_with_buffer(
     const OfflineLibrary *library, unsigned char *data)
@@ -376,8 +398,13 @@ static bool offline_library_save_with_buffer(
         remove(temporary);
         return false;
     }
+    bool primary_newer = false;
     bool primary_valid = offline_library_decode_index_with_buffer(
-        library, "", NULL, NULL, data);
+        library, "", NULL, NULL, &primary_newer, data);
+    if (primary_newer) {
+        remove(temporary);
+        return false;
+    }
     if (!primary_valid) {
         /* Recovery may have loaded .tmp or .bak because the primary is
            absent/corrupt. Preserve those known-good generations while
@@ -406,12 +433,14 @@ bool offline_library_save(const OfflineLibrary *library)
 
 static bool offline_library_decode_index_with_buffer(
     const OfflineLibrary *library, const char *suffix,
-    OfflineLibrary *decoded, bool *exists, unsigned char *data)
+    OfflineLibrary *decoded, bool *exists, bool *newer,
+    unsigned char *data)
 {
     static const unsigned char magic[8] = {
         'T', 'F', 'O', 'F', 'F', '0', '1', 0
     };
     if (exists != NULL) *exists = false;
+    if (newer != NULL) *newer = false;
     if (library == NULL || suffix == NULL
         || library->directory[0] == '\0') return false;
     char path[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 32u];
@@ -431,9 +460,15 @@ static bool offline_library_decode_index_with_buffer(
     uint32_t version = 0, count = 0, checksum = 0;
     if (!get_u32(data, OFFLINE_INDEX_HEADER_BYTES, &used, &version)
         || !get_u32(data, OFFLINE_INDEX_HEADER_BYTES, &used, &count)
-        || !get_u32(data, OFFLINE_INDEX_HEADER_BYTES, &used, &checksum)
-        || version < OFFLINE_INDEX_MINIMUM_VERSION
-        || version > OFFLINE_INDEX_VERSION
+        || !get_u32(data, OFFLINE_INDEX_HEADER_BYTES, &used, &checksum))
+        return false;
+    if (version > OFFLINE_INDEX_VERSION) {
+        /* A later release wrote this index. It is not damage: report it so
+           the loader leaves it and every older generation alone. */
+        if (newer != NULL) *newer = true;
+        return false;
+    }
+    if (version < OFFLINE_INDEX_MINIMUM_VERSION
         || count > OFFLINE_LIBRARY_ITEM_LIMIT
         || checksum != offline_hash(
                data + OFFLINE_INDEX_HEADER_BYTES,
@@ -468,7 +503,7 @@ static bool offline_library_decode_index_with_buffer(
 
 static bool offline_library_decode_index(
     const OfflineLibrary *library, const char *suffix,
-    OfflineLibrary *decoded, bool *exists)
+    OfflineLibrary *decoded, bool *exists, bool *newer)
 {
     if (library == NULL || library->budget == NULL) return false;
     unsigned char *data = budget_malloc_category(
@@ -476,9 +511,50 @@ static bool offline_library_decode_index(
         OFFLINE_LIBRARY_INDEX_LIMIT);
     if (data == NULL) return false;
     bool decoded_ok = offline_library_decode_index_with_buffer(
-        library, suffix, decoded, exists, data);
+        library, suffix, decoded, exists, newer, data);
     budget_free(library->budget, data);
     return decoded_ok;
+}
+
+/* A downloaded file is published under its own name, <id>-<filename>,
+   which the orphan sweep cannot tell from a file somebody else put there.
+   Removal first records that name in <id>.file.gone, so a power cut between
+   the index save and the file's removal leaves a note the next load
+   finishes. The name ends with a newline, so a torn note is ignored. */
+static bool offline_write_file_tombstone(const char *path,
+                                         const char *filename)
+{
+    FILE *file = fopen(path, "wb");
+    if (file == NULL) return false;
+    bool okay = fprintf(file, "%s\n", filename) > 0 && fflush(file) == 0
+        && ferror(file) == 0;
+    if (fclose(file) != 0) okay = false;
+    if (!okay) (void) remove(path);
+    return okay;
+}
+
+static void offline_finish_file_tombstone(const OfflineLibrary *library,
+                                          uint32_t id, const char *path)
+{
+    char filename[FILE_DOWNLOAD_FILENAME_LIMIT + 2u] = {0};
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) return;
+    size_t length = fread(filename, 1, sizeof(filename) - 1u, file);
+    bool okay = !ferror(file) && fgetc(file) == EOF;
+    (void) fclose(file);
+    if (okay && length > 1u && filename[length - 1u] == '\n') {
+        filename[length - 1u] = '\0';
+        char published[FILE_DOWNLOAD_PATH_LIMIT];
+        int written = snprintf(published, sizeof(published), "%s/%08x-%s",
+                               library->directory, (unsigned) id, filename);
+        if (file_download_filename_valid(filename) && written > 0
+            && (size_t) written < sizeof(published)) {
+            struct stat status;
+            if (remove(published) != 0 && stat(published, &status) == 0)
+                return; /* keep the note until the file is gone */
+        }
+    }
+    (void) remove(path);
 }
 
 static bool offline_library_load_with_staged(
@@ -488,14 +564,22 @@ static bool offline_library_load_with_staged(
     if (library->loaded) return true;
     static const char *candidates[] = {"", ".tmp", ".bak"};
     memset(staged, 0, sizeof(*staged));
+    library->newer_format = false;
     bool any_index = false;
     bool recovered = false;
     for (size_t at = 0; at < sizeof(candidates) / sizeof(candidates[0]); at++) {
         bool exists = false;
+        bool newer = false;
         if (offline_library_decode_index(
-                library, candidates[at], staged, &exists)) {
+                library, candidates[at], staged, &exists, &newer)) {
             recovered = at != 0;
             break;
+        }
+        if (newer) {
+            /* Falling back past a newer generation would publish an older
+               index over it and sweep the payloads only it names. */
+            library->newer_format = true;
+            return false;
         }
         any_index = any_index || exists;
     }
@@ -577,8 +661,19 @@ static bool offline_library_load_with_staged(
             }
         }
     }
-    if (normalized && !offline_library_save(staged)) return false;
+    /* A full or write-protected card must not lock the library: without it
+       nothing saved can be opened or deleted to free space. Use the
+       normalized index in memory and write it on a later load or with the
+       next change, which saves the whole index anyway. */
+    bool save_pending = normalized && !offline_library_save(staged);
     *library = *staged;
+    library->save_pending = save_pending;
+    if (recovered && save_pending) {
+        /* The primary still holds whatever made it unreadable. Sweeping
+           now would judge orphans against an index that is not yet on the
+           card, so wait until it is. */
+        return true;
+    }
     /* Files are named only by a fixed-width library id. A bounded lazy scan
        reclaims files left behind if power failed after file publication but
        before index promotion; unrelated files are never touched. */
@@ -594,6 +689,13 @@ static bool offline_library_load_with_staged(
             if (sscanf(entry->d_name, "%8x%23s%c", &id, suffix, &tail) != 2
                 || id == 0 || offline_library_find(library, id) != NULL)
                 continue;
+            if (strcmp(suffix, ".file.gone") == 0) {
+                char note[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 40u];
+                if (offline_library_item_path(library, id, ".file.gone",
+                                              note, sizeof(note)))
+                    offline_finish_file_tombstone(library, id, note);
+                continue;
+            }
             static const char *owned[] = {
                 ".article.html", ".article.tmp", ".article.bak",
                 ".app.html", ".app.pack", ".app.icon",
@@ -620,7 +722,11 @@ static bool offline_library_load_with_staged(
 bool offline_library_load(OfflineLibrary *library)
 {
     if (library == NULL || library->budget == NULL) return false;
-    if (library->loaded) return true;
+    if (library->loaded) {
+        if (library->save_pending && offline_library_save(library))
+            library->save_pending = false;
+        return true;
+    }
     OfflineLibrary *staged = budget_calloc_category(
         library->budget, BUDGET_CATEGORY_SESSION, 1, sizeof(*staged));
     if (staged == NULL) return false;
@@ -1027,11 +1133,12 @@ bool offline_library_save_article(
     snprintf(replacement.title, sizeof(replacement.title), "%s", title);
     snprintf(replacement.source_url, sizeof(replacement.source_url), "%s",
              source_url);
-    library->items[slot] = replacement;
-    if (slot == library->count) library->count++;
+    size_t count = library->count;
+    offline_index_put(library, slot, &replacement,
+                      replacing ? count : count + 1u);
     if (!offline_library_save(library)) {
-        if (replacing) library->items[slot] = previous;
-        else library->count--;
+        offline_index_put(library, slot, replacing ? &previous : NULL,
+                          count);
         remove(path);
         if (backed_up) (void) rename(backup, path);
         offline_error(error, error_size, "offline index could not be saved");
@@ -1660,11 +1767,12 @@ static bool offline_app_publish(OfflineLibrary *library, size_t slot,
         if (!tilefinch_platform_replace_file(temporary, final, NULL))
             return false;
     }
-    library->items[slot] = *item;
-    if (!replacing) library->count++;
+    /* A supervised Library screen may be drawing this row: write it under
+       the fence, never across the index save. */
+    size_t count = library->count;
+    offline_index_put(library, slot, item, replacing ? count : count + 1u);
     if (!offline_library_save(library)) {
-        if (replacing) library->items[slot] = *previous;
-        else library->count--;
+        offline_index_put(library, slot, replacing ? previous : NULL, count);
         offline_error(error, error_size, "offline index could not be saved");
         return false;
     }
@@ -2393,6 +2501,8 @@ bool offline_library_apply_youtube_stream(
         || (stream->split_streams && stream->audio_content_length == 0))
         return false;
     OfflineLibraryItem previous = *item;
+    /* The Downloads row shows this title. */
+    bool held = offline_library_fence_acquire(library);
     item->content_bytes = stream->content_length;
     item->audio_bytes = stream->audio_content_length;
     item->duration_ms = stream->duration_ms;
@@ -2404,8 +2514,11 @@ bool offline_library_apply_youtube_stream(
     if (stream->title[0] != '\0')
         snprintf(item->title, sizeof(item->title), "%.*s",
                  (int) sizeof(item->title) - 1, stream->title);
+    offline_library_fence_release(library, held);
     if (offline_library_save(library)) return true;
+    held = offline_library_fence_acquire(library);
     *item = previous;
+    offline_library_fence_release(library, held);
     return false;
 }
 
@@ -2424,19 +2537,33 @@ bool offline_library_remove(OfflineLibrary *library, uint32_t id)
        publication owns the final filename; partials have fixed owned paths. */
     bool have_file = library->items[index].state == OFFLINE_ITEM_READY
         && file_download_path(library, id, downloaded_file, sizeof(downloaded_file));
+    char tombstone[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 40u];
+    /* Best effort: on a full card the removal must still go ahead. */
+    bool noted = have_file
+        && offline_library_item_path(library, id, ".file.gone", tombstone,
+                                     sizeof(tombstone))
+        && offline_write_file_tombstone(tombstone, library->items[index].title);
+    bool held = offline_library_fence_acquire(library);
     if (index + 1u < library->count)
         memmove(&library->items[index], &library->items[index + 1u],
                 (library->count - index - 1u) * sizeof(library->items[0]));
     memset(&library->items[library->count - 1u], 0,
            sizeof(library->items[0]));
     library->count--;
+    offline_library_fence_release(library, held);
     if (!offline_library_save(library)) {
+        held = offline_library_fence_acquire(library);
         *library = *previous;
+        offline_library_fence_release(library, held);
         budget_free(library->budget, previous);
+        if (noted) (void) remove(tombstone);
         return false;
     }
     budget_free(library->budget, previous);
-    if (have_file) (void) remove(downloaded_file);
+    struct stat published;
+    bool file_left = have_file && remove(downloaded_file) != 0
+        && stat(downloaded_file, &published) == 0;
+    if (noted && !file_left) (void) remove(tombstone);
     const char *suffixes[] = {
         ".article.html", ".article.bak", ".article.tmp",
         ".app.html", ".app.pack", ".app.icon",

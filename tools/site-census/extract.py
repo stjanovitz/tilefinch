@@ -224,6 +224,23 @@ def extract(run_dir, name=None, url=None, tags=None):
         "resource_ms": round(num(perf.get("resource")) / 1000.0, 1),
         "raster_ms": round(num(perf.get("raster")) / 1000.0, 1),
     }
+    # A --pending-load run (CENSUS_LAB_ARGS): the PSP app's pending load.
+    # When the reader's screen first showed content and text, and how long
+    # the load preview's reading hint was up; None when it never was.
+    pending = fields(last_line(lines, "pending-load ") or "")
+    if pending:
+        def pending_ms(us):
+            return round(us / 1000.0, 1) if us else None
+        hint = (pending.get("reading-hint-us") or "0/0").split("/")
+        shown = num(hint[0])
+        cleared = num(hint[1]) if len(hint) > 1 else 0
+        rec["timing"]["first_content_ms"] = pending_ms(
+            num(pending.get("first-content-us")))
+        rec["timing"]["first_text_ms"] = pending_ms(
+            num(pending.get("first-text-us")))
+        rec["timing"]["reading_hint_at_ms"] = pending_ms(shown)
+        rec["timing"]["reading_hint_ms"] = (
+            round(max(cleared - shown, 0) / 1000.0, 1) if shown else None)
     # census.py --focus-moves: the D-pad focus moves' latency, and whether
     # they kept the layout-reuse cache (scoped invalidation) or reset it.
     # The lab prints an interaction-latency line only for a move that
@@ -361,7 +378,9 @@ def extract(run_dir, name=None, url=None, tags=None):
     rec["images"]["retarget"] = {
         key: num(rt.get(key)) for key in (
             "scans", "shrinks", "grows", "drops", "rasters", "deferred",
-            "released", "restored", "us")
+            "released", "restored", "us", "distant-deferred",
+            "distant-releases", "distant-restores",
+            "distant-input-restores", "svg-parses")
     }
 
     # Stylesheets.
@@ -580,6 +599,9 @@ def extract(run_dir, name=None, url=None, tags=None):
             if "js-heap" not in limits:
                 limits.append("js-heap")
     for e in exceptions:
+        # Bare null is ambiguous: author code may throw it too. Allocation
+        # refusals above independently establish a heap limit, including when
+        # QuickJS cannot allocate the out-of-memory error object itself.
         if "out of memory" in e["message"] or "InternalError: interrupted" in e["message"]:
             tag = "js-heap" if "memory" in e["message"] else "script-watchdog"
             if tag not in limits:

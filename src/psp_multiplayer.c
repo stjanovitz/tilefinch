@@ -21,6 +21,10 @@
 #define PSP_MULTIPLAYER_EVENT_STORAGE 10u
 #define PSP_MULTIPLAYER_COMMAND_STORAGE 8u
 #define PSP_MULTIPLAYER_PACKET_LIMIT TILEFINCH_MULTIPLAYER_WIRE_PACKET_LIMIT
+/* Consecutive failed polls, each followed by this sleep, before the worker
+   takes the network as gone (about half a second). */
+#define PSP_MULTIPLAYER_POLL_FAILURE_LIMIT 50u
+#define PSP_MULTIPLAYER_POLL_FAILURE_DELAY_US 10000
 #define PSP_MULTIPLAYER_STUN_BYTES 20u
 #define PSP_MULTIPLAYER_STUN_SERVER "stun.cloudflare.com"
 #define PSP_MULTIPLAYER_STUN_PORT 3478u
@@ -647,6 +651,12 @@ static int multiplayer_worker(SceSize arguments, void *argument)
     if (session->request.mode == TILEFINCH_MULTIPLAYER_MODE_JOIN)
         session->remote_valid = multiplayer_decode_endpoint(
             session->request.invite_code, &session->remote);
+    /* The poll's 10 ms wait is all that paces this loop, at a priority
+       above the browser thread. A poll the firmware fails returns at once,
+       so a failure sleeps instead, and a run of them (the link or the inet
+       stack gone) ends the session rather than spinning until its 15 s or
+       30 s timeout. */
+    unsigned poll_failures = 0;
     while (!atomic_load_explicit(
                &session->stop_requested, memory_order_acquire)
            && !atomic_load_explicit(
@@ -657,6 +667,18 @@ static int multiplayer_worker(SceSize arguments, void *argument)
             .events = SCE_NET_INET_POLLIN
         };
         int ready = sceNetInetPoll(&descriptor, 1u, 10);
+        if (ready < 0) {
+            if (++poll_failures >= PSP_MULTIPLAYER_POLL_FAILURE_LIMIT) {
+                multiplayer_close_event(session, 1006u, false,
+                                        "network lost");
+                atomic_store_explicit(
+                    &session->stop_requested, 1, memory_order_release);
+                break;
+            }
+            (void) sceKernelDelayThread(PSP_MULTIPLAYER_POLL_FAILURE_DELAY_US);
+            continue;
+        }
+        poll_failures = 0;
         for (unsigned received = 0;
              ready > 0 && (descriptor.revents & SCE_NET_INET_POLLIN) != 0
                  && received < 4u;

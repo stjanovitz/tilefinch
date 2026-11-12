@@ -490,7 +490,16 @@ bool navigation_set_scroll(NavigationSession *session, int scroll_y)
         session->page.image_continuation_pending = true;
         session->page.deferred_image_rank_valid = false;
     }
-    if (entry != NULL) entry->scroll_y = next;
+    if (entry != NULL) {
+        entry->scroll_y = next;
+        int64_t moved = (int64_t) next - session->page.viewport_images_scroll_y;
+        if (moved < 0) moved = -moved;
+        if (moved >= session->viewport.css_height / 2) {
+            session->page.viewport_images_pending = true;
+            session->page.viewport_images_moved = true;
+            session->page.image_reveal_look = session->page.image_reveal_armed;
+        }
+    }
     return entry != NULL;
 }
 

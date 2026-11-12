@@ -104,7 +104,7 @@ static bool bridge_node_table_resize(DomBridge *bridge, size_t capacity)
     size_t pointer_bytes = capacity
         * (sizeof(lxb_dom_node_t *) + sizeof(uintptr_t));
     size_t word_bytes = capacity * 2u * sizeof(uint32_t)
-        + capacity / 32u * sizeof(uint32_t);
+        + capacity / 32u * 2u * sizeof(uint32_t);
     unsigned char *block = budget_calloc(
         bridge->budget, 1, pointer_bytes + word_bytes + capacity);
     if (block == NULL) return false;
@@ -144,7 +144,8 @@ static bool bridge_node_table_resize(DomBridge *bridge, size_t capacity)
     uint32_t *generations = (uint32_t *) (void *) (owners + capacity);
     uint32_t *leases = generations + capacity;
     uint32_t *reusable = leases + capacity;
-    unsigned char *flags = (unsigned char *) (reusable + capacity / 32u);
+    uint32_t *held = reusable + capacity / 32u;
+    unsigned char *flags = (unsigned char *) (held + capacity / 32u);
     size_t old = bridge->node_capacity;
     if (old != 0) {
         memcpy(nodes, bridge->nodes, old * sizeof(*nodes));
@@ -165,6 +166,7 @@ static bool bridge_node_table_resize(DomBridge *bridge, size_t capacity)
     bridge->node_generations = generations;
     bridge->node_wrapper_leases = leases;
     bridge->node_reusable_bits = reusable;
+    bridge->node_wrapper_held_bits = held;
     bridge->node_retention_flags = flags;
     bridge->node_index = index;
     bridge->node_index_capacity = index_capacity;
@@ -192,11 +194,17 @@ void js_rt_bridge_node_table_free(DomBridge *bridge)
     if (bridge == NULL) return;
     budget_free(bridge->budget, bridge->nodes);
     budget_free(bridge->budget, bridge->node_index);
+    /* Teardown frees the document, deferred subtrees with it. */
+    budget_free(bridge->budget, bridge->deferred_discards);
+    bridge->deferred_discards = NULL;
+    bridge->deferred_discard_count = 0;
+    bridge->deferred_discard_capacity = 0;
     bridge->nodes = NULL;
     bridge->node_owner_document_identities = NULL;
     bridge->node_generations = NULL;
     bridge->node_wrapper_leases = NULL;
     bridge->node_reusable_bits = NULL;
+    bridge->node_wrapper_held_bits = NULL;
     bridge->node_retention_flags = NULL;
     bridge->node_index = NULL;
     bridge->node_index_capacity = 0;
@@ -366,6 +374,10 @@ retry:
                Reuse the handle-table sweep and its unproductive-GC backoff;
                author-held roots and connected wrappers remain live. */
             bridge_reclaim_node_slots(bridge, bridge->nodes[slot], true);
+            /* Reclamation runs the retirement hook: resolve again. */
+            if (!js_rt_bridge_node_slot_for_handle(bridge, handle, &slot)
+                || bridge->nodes[slot]->type != LXB_DOM_NODE_TYPE_ELEMENT)
+                return JS_FALSE;
             goto retry;
         }
         return JS_FALSE;
@@ -631,37 +643,117 @@ static void bridge_wrapper_ref_clear(DomBridge *bridge, size_t slot)
 {
     if (bridge == NULL || bridge->wrapper_refs == NULL
         || bridge->host == NULL || bridge->host->runtime == NULL) return;
-    /* A kept wrapper's reference ends with its slot's WeakRef (only a
+    /* A kept wrapper's reference ends with its slot's weak target (only a
        rebind replaces that while the wrapper lives). */
     if ((bridge->node_retention_flags[slot] & BRIDGE_NODE_EVENT_KEPT) != 0)
         bridge_set_event_state(bridge, slot, 0, false);
     JSValue *ref = &bridge->wrapper_refs[slot];
-    if (JS_IsObject(*ref)) JS_FreeValueRT(bridge->host->runtime, *ref);
+    if (JS_IsObject(*ref)) JS_FreeWeakTarget(bridge->host->runtime, *ref);
     *ref = JS_UNDEFINED;
 }
 
 /* Before the realm is freed: drop every stored reference and the table. */
 void js_rt_bridge_wrapper_refs_free(DomBridge *bridge)
 {
-    if (bridge == NULL || bridge->wrapper_refs == NULL) return;
+    if (bridge == NULL) return;
+    for (int i = 0; i < bridge->wrapper_plain_key_count; i++)
+        JS_FreeAtomRT(bridge->host->runtime, bridge->wrapper_plain_keys[i]);
+    bridge->wrapper_plain_key_count = 0;
+    if (bridge->wrapper_refs == NULL) return;
     for (size_t slot = 0; slot < bridge->node_capacity; slot++)
         bridge_wrapper_ref_clear(bridge, slot);
     budget_free(bridge->budget, bridge->wrapper_refs);
     bridge->wrapper_refs = NULL;
 }
 
-JSValue js_dom_retain_node_wrapper(JSContext *context,
-                                   JSValueConst this_value,
-                                   int argc, JSValueConst *argv)
+static lxb_dom_node_t *bridge_owned_lifetime_root(lxb_dom_node_t *node);
+
+/* Around a collection. A wrapper with nothing on it can die and be remade
+   from its node; one with an expando, or that is a WeakMap key, cannot: the
+   page reaches that state through the element, and the element is still in
+   the document. So for one collection those wrappers count as referenced.
+   The hold ends with the collection and is decided afresh by the next, so a
+   removed element's wrapper dies as any other, and no wrapper of a plain
+   node stays. Neither direction may allocate or call script. */
+void js_rt_bridge_hold_stateful_wrappers(DomBridge *bridge, bool hold)
+{
+    if (bridge == NULL || bridge->wrapper_refs == NULL
+        || bridge->host == NULL || bridge->wrapper_plain_key_count == 0) return;
+    JSRuntime *runtime = bridge->host->runtime;
+    if (!hold) {
+        if (bridge->node_wrappers_held == 0) return;
+        for (size_t word = 0; word <= bridge->node_count / 32u
+             && word < bridge->node_capacity / 32u; word++) {
+            uint32_t bits = bridge->node_wrapper_held_bits[word];
+            bridge->node_wrapper_held_bits[word] = 0;
+            for (unsigned bit = 0; bits != 0; bit++, bits >>= 1)
+                if ((bits & 1u) != 0)
+                    JS_FreeValueRT(runtime,
+                                   bridge->wrapper_refs[word * 32u + bit]);
+        }
+        bridge->node_wrappers_held = 0;
+        return;
+    }
+    for (size_t slot = 0; slot < bridge->node_count; slot++) {
+        if ((bridge->node_retention_flags[slot] & BRIDGE_NODE_LIVE_WRAPPER) == 0
+            || bridge->nodes[slot] == NULL
+            || !JS_WeakTargetCarriesState(runtime,
+                                          bridge->wrapper_refs[slot],
+                                          bridge->wrapper_plain_keys,
+                                          bridge->wrapper_plain_key_count))
+            continue;
+        lxb_dom_node_t *root = bridge_owned_lifetime_root(bridge->nodes[slot]);
+        if (root == NULL || root->type != LXB_DOM_NODE_TYPE_DOCUMENT) continue;
+        JS_DupValueRT(runtime, bridge->wrapper_refs[slot]);
+        bridge->node_wrapper_held_bits[slot / 32u] |= 1u << (slot % 32u);
+        bridge->node_wrappers_held++;
+    }
+    if (bridge->result != NULL
+        && bridge->node_wrappers_held > bridge->result->dom_handle_wrappers_held_peak)
+        bridge->result->dom_handle_wrappers_held_peak = bridge->node_wrappers_held;
+}
+
+/* __tilefinchNodeWrapper(handle): the live wrapper the handle's slot
+   references, else null. The slot's weak target is the wrapper cache: a
+   script-side map and a WeakRef object per wrapper cost two records per
+   wrapper. Without an argument: how many slots reference a live wrapper;
+   with a true second argument: the slot's lease (both for tests). */
+JSValue js_dom_node_wrapper(JSContext *context, JSValueConst this_value,
+                            int argc, JSValueConst *argv)
 {
     (void) this_value;
     DomBridge *bridge = JS_GetContextOpaque(context);
     int64_t handle = 0;
     size_t slot = 0;
-    if (argc < 1 || JS_ToInt64(context, &handle, argv[0]) < 0
-        || !js_rt_bridge_node_slot_for_handle(bridge, handle, &slot)) {
-        return JS_NewInt32(context, 0);
+    if (argc == 0) {
+        uint32_t live = 0;
+        for (size_t at = 0; bridge != NULL && bridge->wrapper_refs != NULL
+             && at < bridge->node_count; at++) {
+            if (!JS_IsObject(bridge->wrapper_refs[at])) continue;
+            JSValue wrapper = JS_WeakTargetDeref(context, bridge->wrapper_refs[at]);
+            if (JS_IsObject(wrapper)) live++;
+            JS_FreeValue(context, wrapper);
+        }
+        return JS_NewUint32(context, live);
     }
+    if (bridge == NULL || bridge->wrapper_refs == NULL
+        || JS_ToInt64(context, &handle, argv[0]) < 0
+        || !js_rt_bridge_node_slot_for_handle(bridge, handle, &slot))
+        return JS_NULL;
+    if (argc > 1 && JS_ToBool(context, argv[1]))
+        return JS_NewUint32(context, bridge->node_wrapper_leases[slot]);
+    if (!JS_IsObject(bridge->wrapper_refs[slot])) return JS_NULL;
+    JSValue wrapper = JS_WeakTargetDeref(context, bridge->wrapper_refs[slot]);
+    if (JS_IsObject(wrapper)) return wrapper;
+    JS_FreeValue(context, wrapper);
+    return JS_NULL;
+}
+
+/* A new lease on the slot for `wrapper` (held weakly: that is the wrapper
+   cache), or none for a non-object. */
+static JSValue bridge_retain_wrapper(JSContext *context, DomBridge *bridge,
+                                     size_t slot, JSValueConst wrapper)
+{
     uint32_t lease = bridge->node_wrapper_leases[slot];
     if (lease == UINT32_MAX) {
         /* At this practically unreachable boundary, retain the native handle
@@ -670,8 +762,7 @@ JSValue js_dom_retain_node_wrapper(JSContext *context,
         bridge_pin_node_slot(bridge, slot);
         return JS_NewInt32(context, 0);
     }
-    /* The wrapper cache's WeakRef for this lease, for native getters. */
-    if (argc > 1 && JS_IsObject(argv[1])) {
+    if (JS_IsObject(wrapper)) {
         if (bridge->wrapper_refs == NULL) {
             bridge->wrapper_refs = budget_calloc(
                 bridge->budget, bridge->node_capacity, sizeof(JSValue));
@@ -687,7 +778,7 @@ JSValue js_dom_retain_node_wrapper(JSContext *context,
             return JS_ThrowOutOfMemory(context);
         }
         bridge_wrapper_ref_clear(bridge, slot);
-        bridge->wrapper_refs[slot] = JS_DupValue(context, argv[1]);
+        bridge->wrapper_refs[slot] = JS_NewWeakTarget(context, wrapper);
     } else {
         bridge_wrapper_ref_clear(bridge, slot);
     }
@@ -697,6 +788,93 @@ JSValue js_dom_retain_node_wrapper(JSContext *context,
     bridge->node_retention_flags[slot] |= BRIDGE_NODE_LIVE_WRAPPER;
     bridge->node_wrapper_sweep_remaining = bridge->node_count;
     return JS_NewInt64(context, lease);
+}
+
+JSValue js_dom_retain_node_wrapper(JSContext *context,
+                                   JSValueConst this_value,
+                                   int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    int64_t handle = 0;
+    size_t slot = 0;
+    if (argc < 1 || JS_ToInt64(context, &handle, argv[0]) < 0
+        || !js_rt_bridge_node_slot_for_handle(bridge, handle, &slot)) {
+        return JS_NewInt32(context, 0);
+    }
+    return bridge_retain_wrapper(context, bridge, slot,
+                                 argc > 1 ? argv[1] : JS_UNDEFINED);
+}
+
+/* What a wrapper holds that a new wrapper would have again: the three keys
+   every wrapper is built with, then bootstrap's caches of what its node can
+   answer (the owner document and namespace, from native state, and the live
+   children collection). Bootstrap's private slots (attribute objects, a
+   sheet) count as caches too, and are not listed: they were reclaimed with
+   the wrapper before and a page's sheets can be large. Anything else on a
+   wrapper is the page's, and keeps it through a collection. */
+static void bridge_note_plain_wrapper_keys(JSContext *context,
+                                           DomBridge *bridge,
+                                           const JSAtom keys[3])
+{
+    static const char *const caches[] = {
+        "__tilefinchAdoptedOwner", "__tilefinchChildrenCollection",
+        "__namespaceURI"
+    };
+    _Static_assert(3u + sizeof(caches) / sizeof(caches[0])
+                       <= DOM_BRIDGE_WRAPPER_PLAIN_KEYS,
+                   "plain wrapper keys must fit");
+    int count = 0;
+    for (unsigned i = 0; i < 3; i++)
+        bridge->wrapper_plain_keys[count++] = JS_DupAtom(context, keys[i]);
+    for (size_t i = 0; i < sizeof(caches) / sizeof(caches[0]); i++) {
+        JSAtom atom = JS_NewAtom(context, caches[i]);
+        /* A refused name only holds more wrappers than it needs to. */
+        if (atom != JS_ATOM_NULL) bridge->wrapper_plain_keys[count++] = atom;
+    }
+    bridge->wrapper_plain_key_count = count;
+}
+
+/* __tilefinchMakeWrapper(prototype, handle, handleKey, classListKey,
+   listenersKey, listeners): an ordinary node's wrapper, built and cached in
+   one call. wrap()'s other cases stay in script. The keys come from there so
+   the shape matches a wrapper it builds: three defineProperty calls and their
+   descriptor objects cost more than the rest of a new wrapper together. */
+JSValue js_dom_make_wrapper(JSContext *context, JSValueConst this_value,
+                            int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    int64_t handle = 0;
+    size_t slot = 0;
+    if (argc < 6 || JS_ToInt64(context, &handle, argv[1]) < 0)
+        return JS_EXCEPTION;
+    JSValue node = JS_NewObjectProto(context, argv[0]);
+    if (JS_IsException(node)) return node;
+    JSAtom keys[3] = {JS_ValueToAtom(context, argv[2]),
+                      JS_ValueToAtom(context, argv[3]),
+                      JS_ValueToAtom(context, argv[4])};
+    bool ok = keys[0] != JS_ATOM_NULL && keys[1] != JS_ATOM_NULL
+        && keys[2] != JS_ATOM_NULL
+        && JS_DefinePropertyValue(context, node, keys[0],
+                                  JS_DupValue(context, argv[1]), 0) >= 0
+        && JS_DefinePropertyValue(context, node, keys[1],
+                                  JS_DupValue(context, node),
+                                  JS_PROP_WRITABLE) >= 0
+        && JS_DefinePropertyValue(context, node, keys[2],
+                                  JS_DupValue(context, argv[5]),
+                                  JS_PROP_WRITABLE) >= 0;
+    if (ok && bridge->wrapper_plain_key_count == 0)
+        bridge_note_plain_wrapper_keys(context, bridge, keys);
+    for (unsigned i = 0; i < 3; i++)
+        if (keys[i] != JS_ATOM_NULL) JS_FreeAtom(context, keys[i]);
+    if (ok && js_rt_bridge_node_slot_for_handle(bridge, handle, &slot)) {
+        JSValue lease = bridge_retain_wrapper(context, bridge, slot, node);
+        ok = !JS_IsException(lease);
+    }
+    if (ok) return node;
+    JS_FreeValue(context, node);
+    return JS_EXCEPTION;
 }
 
 bool bridge_node_is_connected(const lxb_dom_node_t *node)
@@ -847,7 +1025,7 @@ JSValue js_dom_release_node_wrapper(JSContext *context,
 }
 #endif
 
-/* Owner turns release cleared wrapper WeakRefs in bounded slices. A long
+/* Owner turns release dead wrappers' slots in bounded slices. A long
    synchronous task can still fill the table before its next owner turn.
    Registration then sweeps the whole table, collecting first when that alone
    frees too little (a wrapper cycle clears only at a collection). The sweep
@@ -870,7 +1048,7 @@ static size_t bridge_release_dead_wrappers(DomBridge *bridge,
              & BRIDGE_NODE_LIVE_WRAPPER) == 0
             || bridge->nodes[slot] == NULL
             || !JS_IsObject(bridge->wrapper_refs[slot])) continue;
-        JSValue wrapper = JS_WeakRefDeref(context, bridge->wrapper_refs[slot]);
+        JSValue wrapper = JS_WeakTargetDeref(context, bridge->wrapper_refs[slot]);
         bool live = JS_IsObject(wrapper);
         JS_FreeValue(context, wrapper);
         if (!live)
@@ -915,7 +1093,7 @@ void js_rt_bridge_sweep_node_wrappers(DomBridge *bridge)
         if ((bridge->node_retention_flags[slot] & BRIDGE_NODE_LIVE_WRAPPER) == 0
             || bridge->nodes[slot] == NULL
             || !JS_IsObject(bridge->wrapper_refs[slot])) continue;
-        JSValue wrapper = JS_WeakRefDeref(bridge->host->context,
+        JSValue wrapper = JS_WeakTargetDeref(bridge->host->context,
                                          bridge->wrapper_refs[slot]);
         bool live = JS_IsObject(wrapper);
         JS_FreeValue(bridge->host->context, wrapper);
@@ -959,7 +1137,7 @@ static void bridge_reclaim_node_slots(DomBridge *bridge,
             (*skip)--;
         } else {
             /* As at every explicit full collection: one pass breaks a
-               wrapper self-cycle and the next clears its WeakRef. */
+               wrapper self-cycle and the next collects what it freed. */
             JS_RunGC(bridge->host->runtime);
             JS_RunGC(bridge->host->runtime);
             released += bridge_release_dead_wrappers(bridge, keep);

@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "tilefinch/budget.h"
 #include "tilefinch/document.h"
@@ -605,6 +606,62 @@ static int test_late_related_clips(void)
    code, is read past the 64 KiB per-script cap (within the shared text
    budget): its player's rendition list sits deep in the literal. Ordinary
    code keeps the cap. */
+/* A data script built so that the forward scan reads each quote as real and
+   the old embedUrl key check, walking back to the key's opening quote, read
+   it as escaped: every literal walked to the start of the text, 3.1 billion
+   steps for the 256 KiB the scan admits (1.4 s on a desktop, minutes on a
+   PSP, on the main thread when the user presses Play). The check now looks
+   one key length back. CPU time is the work counter here: the bound is
+   two orders of magnitude above the fixed scan and several times below
+   the old one on a host. */
+static int test_hostile_key_quotes_scan_bounded(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    budget_install_lexbor(&budget);
+    static const char head[] = "<!doctype html><script type=application/json>";
+    static const char tail[] = "</script>";
+    static const char unit[] = "\\\\\"k\\\\\":'v'";
+    const size_t unit_length = sizeof(unit) - 1u;
+    const size_t text_length = 256u * 1024u;
+    CHECK(unit_length == 11u);
+    size_t length = sizeof(head) - 1u + text_length + sizeof(tail) - 1u;
+    char *html = malloc(length + 1u);
+    CHECK(html != NULL);
+    memcpy(html, head, sizeof(head) - 1u);
+    for (size_t at = 0; at < text_length; at++)
+        html[sizeof(head) - 1u + at] = unit[at % unit_length];
+    memcpy(html + sizeof(head) - 1u + text_length, tail, sizeof(tail));
+    PocDocument document;
+    bool parsed = document_parse(&document, &budget, html, length, 73);
+    free(html);
+    CHECK(parsed);
+    char url[512];
+    char streaming[512];
+    MediaDiscoveryResult result;
+    clock_t started = clock();
+    bool found = media_discover_document_candidates(
+        &document, "https://site.test/watch", NULL, url, sizeof(url),
+        streaming, sizeof(streaming), &result);
+    double seconds = (double) (clock() - started) / CLOCKS_PER_SEC;
+    document_destroy(&document);
+    printf("hostile key-quote data script: %.3f s\n", seconds);
+    CHECK(!found);
+    CHECK(seconds < 0.25);
+
+    /* The bounded check still recognises the key, quoted either way and in
+       any case, and nothing else of its length. */
+    static const char declared_html[] =
+        "<!doctype html><script type=application/json>"
+        "{'EMBEDURL':'/player/a.mp4',\"embedurl\" : \"/player/b.mp4\","
+        "\"embedUrx\":\"/clip/c.mp4\"}</script>";
+    found = discover_page(&budget, declared_html, sizeof(declared_html) - 1u,
+                          "https://site.test/watch", url, sizeof(url),
+                          &result);
+    CHECK(found && strcmp(url, "/clip/c.mp4") == 0);
+    return 0;
+}
+
 static int test_large_assignment_script(void)
 {
     Budget budget;
@@ -1115,6 +1172,7 @@ int main(void)
     CHECK(test_promo_and_extensionless_video() == 0);
     CHECK(test_late_related_clips() == 0);
     CHECK(test_large_assignment_script() == 0);
+    CHECK(test_hostile_key_quotes_scan_bounded() == 0);
     CHECK(test_quality_hint_ignores_id_fragments() == 0);
     CHECK(test_activation_affinity_signals() == 0);
     CHECK(test_structured_scan_parity() == 0);
@@ -1140,6 +1198,7 @@ int main(void)
         "'loadedmetadata','timeupdate','seeked','ended','error'])"
         "media.addEventListener(event,()=>events.push(event));"
         "media.src='https://media.example.test/movie.mp4';"
+        "media.setAttribute('title','Night radio \\u00e9');"
         "globalThis.mediaProbe=media;globalThis.mediaEvents=events;"
         "media.play();globalThis.pocSummary=media.paused"
         "?'MEDIA-DOM-FAILED':'MEDIA-DOM-QUEUED'";
@@ -1152,7 +1211,9 @@ int main(void)
           && request.mode == TILEFINCH_REQUEST_MODE_CORS
           && request.credentials == TILEFINCH_CREDENTIALS_SAME_ORIGIN
           && strcmp(request.source,
-                    "https://media.example.test/movie.mp4") == 0);
+                    "https://media.example.test/movie.mp4") == 0
+          /* The element's own title names what plays. */
+          && strcmp(request.title, "Night radio \xc3\xa9") == 0);
     CHECK(script_runtime_evaluate_diagnostic(
               runtime,
               "globalThis.mediaHijacked=false;"

@@ -185,7 +185,8 @@ static bool lite_html_chapters(YoutubeLiteHtml *html, const YoutubeLiteWatch *wa
         const YoutubeLiteChapter *chapter = &watch->chapters[i];
         ok = lite_html_format(html,
             "<a class=chapter data-tilefinch-provider-media href=\"https://www.youtube.com/watch?v=%s&amp;t=%u\">%u:%02u &mdash; ",
-            watch->video.id, chapter->seconds, chapter->seconds / 60u, chapter->seconds % 60u)
+            watch->video.id, (unsigned) chapter->seconds,
+            (unsigned) (chapter->seconds / 60u), (unsigned) (chapter->seconds % 60u))
             && lite_html_escape(html, chapter->title) && lite_html_text(html, "</a>");
     }
     return ok && lite_html_text(html, "</details>");

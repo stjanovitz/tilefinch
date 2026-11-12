@@ -45,6 +45,8 @@ class IndicTests(unittest.TestCase):
     def test_minimum_glyph_sequence_table(self):
         expected = {("DEVANAGARI", 3): 2, ("DEVANAGARI", 5): 3, ("DEVANAGARI", 7): 4,
                     ("DEVANAGARI", 10): 5, ("DEVANAGARI", 11): 6,
+                    ("DEVANAGARI", 16): 9,
+                    ("BENGALI_ASSAMESE", 16): 5,
                     ("BENGALI_ASSAMESE", 9): 1, ("BENGALI_ASSAMESE", 11): 2,
                     ("CYRILLIC", 11): 1, ("EMBEDDED", 1): 1}
         for (glyphs, version), sequence in expected.items():

@@ -38,6 +38,7 @@ static int failures;
 
 #define DOCUMENT "https://video.test/talks/clip"
 #define PLAYLIST "https://hls.video.test/master.m3u8"
+#define MP3 "https://audio.video.test/talk.mp3"
 
 typedef enum {
     /* Queued or running on the worker; nothing published yet. */
@@ -48,7 +49,9 @@ typedef enum {
     /* Complete and reported successful, but no header snapshot was ever
        published (must never deliver a body unadmitted). */
     FAKE_COMPLETE_WITHOUT_HEADERS,
-    FAKE_PLAYLIST
+    FAKE_PLAYLIST,
+    /* Page audio: headers from fake.mp3_headers, then one body chunk. */
+    FAKE_MP3
 } FakeOutcome;
 
 #define FAKE_LIMIT 8u
@@ -61,6 +64,7 @@ static struct {
     long connect_timeout_ms;
     bool body_taken;
     bool admission_closed;
+    const char *mp3_headers;
 } fake;
 
 bool fake_transport_available(void) { return true; }
@@ -134,6 +138,16 @@ bool fake_transport_take_headers(uint64_t request_id, FetchResult *metadata)
                  PLAYLIST);
         return true;
     }
+    if (fake_outcome(request_id) == FAKE_MP3) {
+        metadata->status_code = 200;
+        snprintf(metadata->effective_url, sizeof(metadata->effective_url), "%s",
+                 MP3);
+        int written = snprintf(metadata->response_headers,
+                               sizeof(metadata->response_headers), "%s",
+                               fake.mp3_headers);
+        metadata->response_headers_length = written < 0 ? 0 : (size_t) written;
+        return true;
+    }
     return false;
 }
 
@@ -149,6 +163,13 @@ bool fake_transport_take_chunk(uint64_t request_id,
         && capacity >= sizeof(playlist) - 1u) {
         memcpy(destination, playlist, sizeof(playlist) - 1u);
         *length = sizeof(playlist) - 1u;
+        fake.body_taken = true;
+        return true;
+    }
+    if (fake_outcome(request_id) == FAKE_MP3 && !fake.body_taken
+        && capacity >= 64u) {
+        memset(destination, 0x11, 64u);
+        *length = 64u;
         fake.body_taken = true;
         return true;
     }
@@ -227,6 +248,16 @@ static void test_running_playlist_stays_pending(bool page_redirects)
        not consume it (src/psp_media_hls_policy.h). */
     CHECK(fake.connect_timeout_ms == PSP_HLS_CONNECT_TIMEOUT_MS);
     CHECK(fake.connect_timeout_ms >= 8000);
+    /* MD-11: header polls while the response is pending allocate nothing
+       after the first (the FetchResult scratch is about 13.5 KiB). */
+    size_t allocations = fixture.budget.allocation_count;
+    CHECK(pump(&fixture, 50, error, sizeof(error))
+          == PSP_MEDIA_HLS_OPEN_PENDING);
+    size_t pending_allocations =
+        fixture.budget.allocation_count - allocations;
+    printf("psp-media-hls-transport: 50 pending header polls, "
+           "%zu allocations\n", pending_allocations);
+    CHECK(pending_allocations == 0);
     fixture_destroy(&fixture);
 }
 
@@ -408,8 +439,51 @@ static void test_source_without_pressure(bool page_redirects)
     fixture_destroy(&fixture);
 }
 
+/* Page audio's response reports its Content-Length to the MP3 source, which
+   ends a live-routed response that delivered all of it (a finite file from
+   a server that ignores Range) instead of replaying it. */
+static void test_mp3_declared_length(const char *headers, uint64_t expected)
+{
+    memset(&fake, 0, sizeof(fake));
+    fake.outcome[0] = FAKE_MP3;
+    fake.mp3_headers = headers;
+    Budget budget;
+    budget_init(&budget, 4u * 1024u * 1024u);
+    BrowserSession session;
+    CHECK(browser_session_init(&session, &budget, 128u * 1024u));
+    char error[192] = {0};
+    PspMediaHlsContext *context = psp_media_hls_create_mp3(
+        &budget, &session, MP3, DOCUMENT, TILEFINCH_REQUEST_MODE_NO_CORS,
+        TILEFINCH_CREDENTIALS_INCLUDE, NULL, 0, false, error, sizeof(error));
+    CHECK(context != NULL);
+    if (context != NULL) {
+        uint64_t handle = psp_mp3_start(context, 0, error, sizeof(error));
+        CHECK(handle != 0);
+        /* Nothing is known before the headers are admitted. */
+        CHECK(psp_mp3_declared_length(context, handle) == 0);
+        unsigned char chunk[256];
+        size_t length = 0;
+        CHECK(psp_hls_poll(context, handle, chunk, sizeof(chunk), &length,
+                           error, sizeof(error))
+              == MEDIA_HLS_TRANSPORT_CHUNK);
+        CHECK(length == 64u);
+        CHECK(psp_mp3_declared_length(context, handle) == expected);
+        psp_media_hls_destroy(context);
+    }
+    browser_session_destroy(&session);
+    CHECK(budget.current == 0);
+}
+
 int main(void)
 {
+    test_mp3_declared_length(
+        "content-type: audio/mpeg\r\ncontent-length: 5242880\r\n",
+        UINT64_C(5242880));
+    /* A station names no length; a malformed one counts as none. */
+    test_mp3_declared_length("content-type: audio/mpeg\r\n", 0);
+    test_mp3_declared_length("content-length: 12x4\r\n", 0);
+    test_mp3_declared_length(
+        "content-length: 99999999999999999999999\r\n", 0);
     for (int redirects = 0; redirects < 2; redirects++) {
         test_running_playlist_stays_pending(redirects != 0);
         test_failure_before_headers_retries_then_fails(redirects != 0);

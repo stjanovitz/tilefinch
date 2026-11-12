@@ -1,4 +1,53 @@
 (() => {
+  /* Origin-clean authority, and every pixel that is not origin-clean, is
+     native (DomBridge.canvas_taints). The host installs these bridges only
+     while this module is evaluated: capture them before anything else runs,
+     so page script can never call them. Without them (an unexpected
+     evaluation path) nothing can be tainted, so unclean sources are not
+     drawn. */
+  const nativeSurface = globalThis.__tilefinchCanvasNativeSurface,
+    bitmapSurface = globalThis.__tilefinchCanvasBitmapSurface,
+    rasterPattern = globalThis.__tilefinchCanvasRasterPattern,
+    originCleanNative = globalThis.__tilefinchCanvasOriginClean,
+    pngChecksum = globalThis.__tilefinchCanvasPngChecksum;
+  delete globalThis.__tilefinchCanvasNativeSurface;
+  delete globalThis.__tilefinchCanvasBitmapSurface;
+  delete globalThis.__tilefinchCanvasRasterPattern;
+  delete globalThis.__tilefinchCanvasOriginClean;
+  delete globalThis.__tilefinchCanvasPngChecksum;
+  /* A canvas is origin-clean only while both the bootstrap's flag and the
+     native registry agree. Tainting is one-way (HTML keeps the flag false
+     across a bitmap reset) and moves the canvas's pixels into a native
+     store: from then on state.pixels is null and every drawing call names
+     the store by the element's handle, so no script-visible value ever
+     holds an unclean pixel. Cross-origin images, tainted canvases and
+     unclean ImageBitmaps are likewise passed to natives by handle or id,
+     and natives draw those only into a native store. A canvas the registry
+     cannot record (or whose store cannot be allocated) stays clean and
+     must not receive the unclean pixels, so callers skip the draw. */
+  const canvasElementOriginClean = (canvas) =>
+      typeof originCleanNative !== "function" ||
+      originCleanNative(canvas?.__handle) !== false,
+    canvasOriginClean = (state) =>
+      state.originClean !== false && canvasElementOriginClean(state.canvas),
+    /* What drawing natives write: a clean canvas's script buffer, a tainted
+       one's store (its element handle), or null while it has none. */
+    surfaceTarget = (state) => state.originClean !== false ? state.pixels
+      : state.nativeStore ? state.canvas.__handle : null,
+    taintCanvas = (state) => {
+      if (state.originClean === false) return true;
+      if (typeof nativeSurface !== "function") return false;
+      /* Queued work lands in the script pixels first, so its fallbacks still
+         apply; whatever a flush leaves queued replays onto the store. */
+      if (state.pixels) flushRectCommands(state);
+      const pixels = state.pixels;
+      if (nativeSurface(state.canvas.__handle, pixels ? state.width : 0,
+          pixels ? state.height : 0, pixels) !== true) return false;
+      state.originClean = false;
+      state.nativeStore = !!pixels;
+      state.pixels = null;
+      return true;
+    };
   /* Pixel storage remains deliberately small and lazy. QuickJS charges every
      backing Uint8ClampedArray to the existing script heap, while this
      per-surface ceiling prevents one canvas from consuming the whole PSP
@@ -21,9 +70,11 @@
     imageBitmapStates = new WeakMap(),
     imageBitmapConstructorKey = {},
     imageBitmapFinalizer = typeof FinalizationRegistry === "function"
-      ? new FinalizationRegistry((bytes) => {
-          imageBitmapState.bytes = Math.max(0, imageBitmapState.bytes - bytes);
+      ? new FinalizationRegistry((held) => {
+          imageBitmapState.bytes = Math.max(
+            0, imageBitmapState.bytes - held.bytes);
           imageBitmapState.count = Math.max(0, imageBitmapState.count - 1);
+          if (held.surface) bitmapSurface(held.surface);
         }) : null,
     pendingCommits = [],
     canvasDiagnostics = {
@@ -41,18 +92,23 @@
       surfaceCommits: 0,
     },
     flushPaintCommands = (state) => {
-      if (!state.paintCommands.length || !state.pixels) return true;
+      const target = state.paintCommands.length ? surfaceTarget(state) : null;
+      if (!target) return true;
       const payloads = state.paintCommands.map(
           (command) => [command.kind, ...command.args]),
         outcome = Number(__tilefinchCanvasRasterPaintBatch(
-          state.pixels, state.width, state.height, payloads,
+          target, state.width, state.height, payloads,
         ));
       if (!Number.isSafeInteger(outcome) || outcome < 0) return false;
       const failed = outcome & 0xffff,
         clipped = (outcome >>> 16) & 0xffff;
       for (let index = 0; index < state.paintCommands.length; index++) {
         const command = state.paintCommands[index];
-        if (failed & (1 << index)) fallbackPaintCommand(state, command);
+        /* The script fallback blends script pixels: a tainted canvas has
+           none, so a path its native raster refuses is not drawn. */
+        if (failed & (1 << index)) {
+          if (state.originClean !== false) fallbackPaintCommand(state, command);
+        }
         else {
           if (clipped & (1 << index)) canvasDiagnostics.clippedCommands++;
           if (command.kind === 0) canvasDiagnostics.pathRasters++;
@@ -66,7 +122,8 @@
     },
     flushImageCommands = (state) => {
       if (!flushPaintCommands(state)) return false;
-      if (!state.imageCommands.length || !state.pixels) return true;
+      const target = state.imageCommands.length ? surfaceTarget(state) : null;
+      if (!target) return true;
       const sources = [],
         serialized = new Float64Array(state.imageCommands.length * 24);
       let at = 0;
@@ -82,7 +139,7 @@
         ]) serialized[at++] = value;
       }
       const outcome = Number(__tilefinchCanvasRasterImageBatch(
-        state.pixels, state.width, state.height, sources, serialized,
+        target, state.width, state.height, sources, serialized,
       ));
       if (!outcome) return false;
       if (outcome === 2) canvasDiagnostics.clippedCommands++;
@@ -93,13 +150,14 @@
     },
     flushRectCommands = (state) => {
       if (!flushImageCommands(state)) return false;
-      if (!state.rectCommands.length || !state.pixels) return true;
+      const target = state.rectCommands.length ? surfaceTarget(state) : null;
+      if (!target) return true;
       const serialized = new Float64Array(state.rectCommands.length * 10);
       let at = 0;
       for (const command of state.rectCommands)
         for (const value of command) serialized[at++] = value;
       const outcome = Number(__tilefinchCanvasRasterRectBatch(
-        state.pixels, state.width, state.height, serialized,
+        target, state.width, state.height, serialized,
       ));
       if (outcome !== 1) {
         if (outcome === 2) canvasDiagnostics.clippedCommands++;
@@ -111,13 +169,14 @@
     },
     flushCanvasState = (state) => {
       const dirty = state.dirty;
-      if (!dirty || !state.pixels) return false;
+      if (!dirty || !surfaceTarget(state)) return false;
       /* A disconnected canvas cannot publish and must not occupy one of the
          eight strong queue slots indefinitely. Keep its dirty state and
          commands intact: the DOM insertion hook schedules it again if the
          author later reconnects the same canvas. */
       if (!state.canvas.isConnected) return false;
       if (!flushRectCommands(state)) return true;
+      /* A tainted canvas passes null: the native commits its store. */
       const committed = __tilefinchCommitCanvasSurface(
         state.canvas.__handle,
         state.width,
@@ -153,7 +212,7 @@
       }
     },
     scheduleCanvasCommit = (state, rect) => {
-      if (!state.pixels || !rect) return;
+      if (!surfaceTarget(state) || !rect) return;
       if (!state.dirty) state.dirty = { ...rect };
       else {
         state.dirty.left = Math.min(state.dirty.left, rect.left);
@@ -217,6 +276,10 @@
       state.width = size.width;
       state.height = size.height;
       state.pixels = null;
+      if (state.originClean === false && state.nativeStore) {
+        nativeSurface(state.canvas.__handle, 0, 0, null);
+        state.nativeStore = false;
+      }
       state.dirty = null;
       state.rectCommands.length = 0;
       state.imageCommands.length = 0;
@@ -227,7 +290,8 @@
         size.width !== 0 &&
         size.height !== 0 &&
         size.width > Math.floor(pixelLimit / size.height);
-      state.originClean = true;
+      /* originClean is deliberately kept: resetting the bitmap does not make
+         a canvas origin-clean again (HTML), and the native taint stays. */
       state.ignoredSaveDepth = 0;
       state.fill = [0, 0, 0, 255];
       state.fillStyle = "#000000";
@@ -268,6 +332,7 @@
           width: 0,
           height: 0,
           pixels: null,
+          nativeStore: false,
           surfaceUnavailable: false,
           originClean: true,
           ignoredSaveDepth: 0,
@@ -382,6 +447,12 @@
     ensureSurface = (state) => {
       if (state.surfaceUnavailable || state.width === 0 || state.height === 0)
         return null;
+      if (state.originClean === false) {
+        if (!state.nativeStore)
+          state.nativeStore = nativeSurface(state.canvas.__handle,
+            state.width, state.height, null) === true;
+        return surfaceTarget(state);
+      }
       if (!state.pixels)
         state.pixels = new Uint8ClampedArray(
           state.width * state.height * 4,
@@ -428,7 +499,8 @@
       for (const clip of state.clipPaths)
         if (!pointInSubpaths(clip.subpaths, x + 0.5, y + 0.5, clip.evenOdd))
           return;
-      const pixels = ensureSurface(state);
+      /* Script blending writes script pixels; a tainted canvas has none. */
+      const pixels = state.originClean === false ? null : ensureSurface(state);
       if (!pixels) return;
       const at = (y * state.width + x) * 4,
         sourceAlpha = (color[3] / 255) * state.globalAlpha;
@@ -720,7 +792,7 @@
               blendPixel(
                 local, x, y,
                 fallback.paint
-                  ? fallback.paint._colorAt(x + 0.5, y + 0.5)
+                  ? paintColorAt(fallback.paint, x + 0.5, y + 0.5)
                   : fallback.color,
               );
       } else {
@@ -889,26 +961,75 @@
     }
   }
 
+  /* A pattern's source pixels may be cross-origin, and a canvas source's
+     state is the live canvas: neither may be reachable from the pattern
+     object page script holds. */
+  const patternStates = new WeakMap();
   class CanvasPattern {
-    constructor(source, repetition) {
-      this._state = source instanceof HTMLCanvasElement
-        ? stateFor(source) : source;
-      this._originClean = this._state.originClean !== false;
-      this._repetition = repetition;
-      this._transform = new DOMMatrix();
+    /* `source` is the retained pixel state; `sourceCanvas` the 2D canvas
+       it is the live state of, if any. An unclean image or ImageBitmap
+       source has no script pixels: `native` names its pixels (an element
+       handle or a bitmap store id), and `element` keeps it alive. */
+    constructor(source, repetition, sourceCanvas = null, native = null,
+        element = null) {
+      const state = source;
+      if (!(sourceCanvas instanceof HTMLCanvasElement)) sourceCanvas = null;
+      patternStates.set(this, {
+        state,
+        sourceCanvas,
+        native,
+        element,
+        originClean: sourceCanvas ? canvasOriginClean(state)
+          : state.originClean !== false,
+        repetition,
+        transform: new DOMMatrix(),
+      });
     }
     setTransform(transform) {
-      this._transform =
+      const pattern = patternStates.get(this);
+      if (!pattern) return;
+      pattern.transform =
         transform instanceof DOMMatrix ? transform : new DOMMatrix(transform);
     }
-    _colorAt(x, y) {
-      const state = this._state;
+  }
+  /* A canvas-backed pattern reads the live source canvas, so it stops being
+     origin-clean as soon as that canvas does. */
+  const patternOriginClean = (paint) => {
+      const pattern = patternStates.get(paint);
+      return !pattern || (pattern.originClean &&
+        (!pattern.sourceCanvas || canvasOriginClean(pattern.state)));
+    },
+    /* Painting with an unclean pattern taints the target first; a target
+       that cannot be tainted is not painted. */
+    paintAllowed = (state, paint) =>
+      patternOriginClean(paint) || taintCanvas(state),
+    /* A pattern's pixels as raster natives take them: a clean script
+       buffer, a number naming native pixels, or null for none. */
+    patternSource = (pattern) => {
+      if (pattern.sourceCanvas) return surfaceTarget(pattern.state);
+      return pattern.native ?? pattern.state.pixels ?? null;
+    },
+    patternParameters = (pattern, ...extra) => {
+      const repeat = pattern.repetition;
+      return new Float64Array([
+        pattern.transform.e, pattern.transform.f,
+        repeat === "repeat" || repeat === "repeat-x" ? 1 : 0,
+        repeat === "repeat" || repeat === "repeat-y" ? 1 : 0,
+        pattern.state.width, pattern.state.height, ...extra,
+      ]);
+    },
+    paintColorAt = (paint, x, y) => {
+      const pattern = patternStates.get(paint);
+      if (!pattern) return paint._colorAt(x, y);
+      const state = pattern.state;
       if (!state.pixels || state.width === 0 || state.height === 0)
         return [0, 0, 0, 0];
-      x = Math.floor(x - this._transform.e);
-      y = Math.floor(y - this._transform.f);
-      const repeatX = this._repetition === "repeat" || this._repetition === "repeat-x",
-        repeatY = this._repetition === "repeat" || this._repetition === "repeat-y";
+      x = Math.floor(x - pattern.transform.e);
+      y = Math.floor(y - pattern.transform.f);
+      const repeatX = pattern.repetition === "repeat" ||
+          pattern.repetition === "repeat-x",
+        repeatY = pattern.repetition === "repeat" ||
+          pattern.repetition === "repeat-y";
       if (!repeatX && (x < 0 || x >= state.width)) return [0, 0, 0, 0];
       if (!repeatY && (y < 0 || y >= state.height)) return [0, 0, 0, 0];
       x = ((x % state.width) + state.width) % state.width;
@@ -920,8 +1041,7 @@
         state.pixels[at + 2],
         state.pixels[at + 3],
       ];
-    }
-  }
+    };
 
   const domMatrixNumber = (text, unit = "") => {
       const match = String(text).trim().match(
@@ -1627,16 +1747,19 @@
   }
 
   class ImageBitmap {
-    constructor(key, width, height, pixels, originClean) {
+    /* A clean bitmap keeps script pixels; an unclean one only `surface`,
+       the id of its native store. */
+    constructor(key, width, height, pixels, originClean, surface = 0) {
       if (key !== imageBitmapConstructorKey)
         throw new TypeError("Illegal constructor");
-      const state = { width, height, pixels,
-        originClean: originClean !== false, bytes: pixels.byteLength,
+      const state = { width, height, pixels, surface,
+        originClean: originClean !== false, bytes: width * height * 4,
         closed: false, finalizerToken: {} };
       imageBitmapStates.set(this, state);
       imageBitmapState.bytes += state.bytes;
       imageBitmapState.count++;
-      imageBitmapFinalizer?.register(this, state.bytes, state.finalizerToken);
+      imageBitmapFinalizer?.register(this,
+        { bytes: state.bytes, surface }, state.finalizerToken);
     }
     get width() { return imageBitmapStates.get(this)?.width || 0; }
     get height() { return imageBitmapStates.get(this)?.height || 0; }
@@ -1649,6 +1772,8 @@
       imageBitmapState.count--;
       state.bytes = 0;
       state.pixels = null;
+      if (state.surface) bitmapSurface(state.surface);
+      state.surface = 0;
       state.width = 0;
       state.height = 0;
     }
@@ -1656,35 +1781,45 @@
 
   const liveBitmapState = (bitmap) => {
       const state = imageBitmapStates.get(bitmap);
-      if (!state || state.closed || !state.pixels)
+      if (!state || state.closed || (!state.pixels && !state.surface))
         throw new DOMException("ImageBitmap is closed", "InvalidStateError");
       return state;
     },
+    /* A drawing source: `pixels` is a clean script buffer or a number
+       naming native pixels (a tainted canvas or a cross-origin image by
+       handle, an unclean bitmap by store id). */
     bitmapSource = (source) => {
       if (source instanceof ImageBitmap) {
         const state = liveBitmapState(source);
         return { width: state.width, height: state.height,
-          pixels: state.pixels, originClean: state.originClean };
+          pixels: state.pixels || state.surface,
+          originClean: state.originClean };
       }
       if (source instanceof ImageData)
         return { width: source.width, height: source.height,
           pixels: source.data, originClean: true };
       if (source instanceof HTMLCanvasElement) {
-        const state = contextKinds.get(source) === "webgl"
-          ? globalThis.__tilefinchWebGLReadback?.(source)
-          : stateFor(source);
-        if (!state || (contextKinds.get(source) !== "webgl" &&
-            !flushRectCommands(state)) || !state.pixels) return null;
-        return { width: state.width, height: state.height,
-          pixels: state.pixels, originClean: state.originClean };
+        if (contextKinds.get(source) === "webgl") {
+          const state = globalThis.__tilefinchWebGLReadback?.(source);
+          return state?.pixels ? { width: state.width, height: state.height,
+            pixels: state.pixels, originClean: state.originClean !== false }
+            : null;
+        }
+        const state = stateFor(source);
+        if (!flushRectCommands(state)) return null;
+        const pixels = surfaceTarget(state);
+        return pixels ? { width: state.width, height: state.height, pixels,
+          originClean: canvasOriginClean(state) } : null;
       }
       if (typeof HTMLImageElement === "function" &&
           source instanceof HTMLImageElement) {
-        const snapshot = __tilefinchCanvasImageSource(source.__handle);
-        if (!snapshot) return null;
-        return { width: Number(snapshot.width), height: Number(snapshot.height),
-          pixels: new Uint8ClampedArray(snapshot.pixels),
-          originClean: snapshot.sameOrigin !== false };
+        const image = __tilefinchCanvasImageSource(source.__handle);
+        if (!image) return null;
+        const clean = image.sameOrigin === true;
+        return { width: Number(image.width), height: Number(image.height),
+          pixels: clean ? new Uint8ClampedArray(image.pixels)
+            : source.__handle,
+          originClean: clean };
       }
       throw new TypeError("Unsupported ImageBitmap source");
     },
@@ -1721,16 +1856,26 @@
           imageBitmapState.count >= imageBitmapCountLimit ||
           bytes > imageBitmapByteLimit - imageBitmapState.bytes)
         throw new DOMException("ImageBitmap budget exceeded", "QuotaExceededError");
-      const pixels = new Uint8ClampedArray(bytes),
+      /* An unclean bitmap's pixels go straight into a native store. */
+      const clean = input.originClean !== false;
+      if (!clean && typeof bitmapSurface !== "function")
+        throw new DOMException("Bitmap conversion failed", "OperationError");
+      const surface = clean ? 0 : Number(bitmapSurface(width, height)) || 0;
+      if (!clean && !surface)
+        throw new DOMException("ImageBitmap budget exceeded", "QuotaExceededError");
+      const pixels = clean ? new Uint8ClampedArray(bytes) : null,
         smooth = options.resizeQuality !== "pixelated";
       if (!__tilefinchCanvasRasterImage(
-        pixels, width, height, input.pixels, input.width, input.height,
-        sx, sy, sw, sh, 0, 0, width, height, smooth, 1, 1,
+        pixels || surface, width, height, input.pixels, input.width,
+        input.height, sx, sy, sw, sh, 0, 0, width, height, smooth, 1, 1,
         new Float64Array([1, 0, 0, 1, 0, 0]),
         new Float64Array([0, 0, width, height]), new Float64Array(0),
-      )) throw new DOMException("Bitmap conversion failed", "OperationError");
-      return new ImageBitmap(
-        imageBitmapConstructorKey, width, height, pixels, input.originClean);
+      )) {
+        if (surface) bitmapSurface(surface);
+        throw new DOMException("Bitmap conversion failed", "OperationError");
+      }
+      return new ImageBitmap(imageBitmapConstructorKey, width, height,
+        pixels, clean, surface);
     };
   const createImageBitmap = (image, ...args) =>
     Promise.resolve().then(() => createBitmap(image, args));
@@ -1751,6 +1896,7 @@
     set fillStyle(value) {
       if (value instanceof CanvasGradient || value instanceof CanvasPattern) {
         const state = stateFor(this.canvas);
+        if (!paintAllowed(state, value)) return;
         state.fillPaint = value;
         state.fillStyle = value;
         return;
@@ -1986,8 +2132,9 @@
     }
     clearRect(x, y, width, height) {
       const state = stateFor(this.canvas);
-      if (!state.pixels) return;
+      if (!surfaceTarget(state)) return;
       if (!flushRectCommands(state)) return;
+      const target = surfaceTarget(state);
       if (state.clipPaths.length || state.transform.some(
         (value, index) => value !== identityTransform[index],
       )) {
@@ -1996,7 +2143,7 @@
         const subpaths = this._subpaths(path),
           dirty = canvasDirtyBounds(state, subpaths, 1);
         if (__tilefinchCanvasRasterPath(
-          state.pixels, state.width, state.height, flattenedPath(subpaths),
+          target, state.width, state.height, flattenedPath(subpaths),
           true, false, 0, 0, 0, 0, 1, 2,
           1, 0, 0, 10, new Float64Array(), 0,
           new Float64Array(state.clipRect), new Float64Array(),
@@ -2007,7 +2154,7 @@
       const rect = normalizedRect(state, x, y, width, height);
       if (!rect) return;
       if (!__tilefinchCanvasRasterRect(
-        state.pixels, state.width, state.height, rect.left, rect.top,
+        target, state.width, state.height, rect.left, rect.top,
         rect.right, rect.bottom, 0, 0, 0, 0, 1, 0,
       )) return;
       scheduleCanvasCommit(state, rect);
@@ -2043,9 +2190,19 @@
         return;
       if (state.clipPaths.length) {
         if (!flushRectCommands(state)) return;
-        for (let row = rect.top; row < rect.bottom; row++)
-          for (let column = rect.left; column < rect.right; column++)
-            blendPixel(state, column, row, state.fill);
+        if (state.originClean === false) {
+          /* The native mirrors blendPixel's clip test and blend. */
+          if (!__tilefinchCanvasRasterRect(
+            pixels, state.width, state.height, rect.left, rect.top,
+            rect.right, rect.bottom, red, green, blue, state.fill[3],
+            state.globalAlpha,
+            compositeOperations.indexOf(state.globalCompositeOperation),
+            serializedClips(state),
+          )) return;
+        } else
+          for (let row = rect.top; row < rect.bottom; row++)
+            for (let column = rect.left; column < rect.right; column++)
+              blendPixel(state, column, row, state.fill);
       } else {
         state.rectCommands.push([
           rect.left, rect.top, rect.right, rect.bottom,
@@ -2200,7 +2357,26 @@
         dirty = canvasDirtyBounds(state, subpaths, 1 + shadowPadding(state)),
         evenOdd = fillRule === "evenodd";
       if (state.fillPaint instanceof CanvasPattern) {
+        if (!paintAllowed(state, state.fillPaint)) return;
         if (!flushPaintCommands(state)) return;
+        if (state.originClean === false) {
+          /* A tainted canvas's pattern fill runs natively, pixel for pixel
+             as the loop below; the pattern's pixels never reach script. */
+          const target = ensureSurface(state),
+            pattern = patternStates.get(state.fillPaint);
+          if (!target || !pattern) return;
+          const source = pattern.state.width && pattern.state.height
+            ? patternSource(pattern) : null;
+          if (!rasterPattern(
+            target, state.width, state.height, flattened, evenOdd,
+            state.globalAlpha,
+            compositeOperations.indexOf(state.globalCompositeOperation),
+            new Float64Array(state.clipRect), serializedClips(state),
+            source, patternParameters(pattern),
+          )) return;
+          scheduleCanvasCommit(state, dirty);
+          return;
+        }
         let left = state.width, top = state.height, right = 0, bottom = 0;
         for (const points of subpaths)
           for (const point of points) {
@@ -2218,7 +2394,9 @@
             if (pointInSubpaths(subpaths, x + 0.5, y + 0.5, fillRule === "evenodd"))
               blendPixel(
                 state, x, y,
-                state.fillPaint ? state.fillPaint._colorAt(x + 0.5, y + 0.5) : state.fill,
+                state.fillPaint
+                  ? paintColorAt(state.fillPaint, x + 0.5, y + 0.5)
+                  : state.fill,
               );
       } else {
         const args = [
@@ -2523,8 +2701,13 @@
         y += (metrics.actualBoundingBoxAscent - metrics.actualBoundingBoxDescent) / 2;
       else if (["bottom", "ideographic"].includes(state.textBaseline))
         y -= metrics.actualBoundingBoxDescent;
-      const color = state.fillPaint
-          ? state.fillPaint._colorAt(x, y) : state.fill,
+      if (state.fillPaint && !paintAllowed(state, state.fillPaint)) return;
+      /* On a tainted canvas a pattern's colour is sampled natively. */
+      const pattern = state.originClean === false &&
+          state.fillPaint instanceof CanvasPattern
+          ? patternStates.get(state.fillPaint) : null,
+        color = pattern ? [0, 0, 0, 0] : state.fillPaint
+          ? paintColorAt(state.fillPaint, x, y) : state.fill,
         textWidth = Math.min(metrics.width, limit),
         dirty = canvasDirtyBounds(state, [[
           transformPoint(state, x, y - metrics.actualBoundingBoxAscent),
@@ -2540,7 +2723,13 @@
           new Float64Array(state.clipRect), scale, serializedClips(state),
         ];
       if (queueTextShadows(state, args) &&
-          queuePaintCommand(state, { kind: 1, args }))
+          queuePaintCommand(state, pattern ? {
+            kind: 2,
+            args: [...args,
+              pattern.state.width && pattern.state.height
+                ? patternSource(pattern) : null,
+              patternParameters(pattern, x, y)],
+          } : { kind: 1, args }))
         scheduleCanvasCommit(state, dirty);
     }
     strokeText(text, x, y, maximumWidth) {
@@ -2589,11 +2778,20 @@
         scheduleCanvasCommit(state, dirty);
     }
     drawImage(source, ...arguments_) {
+      /* sourceState.pixels is a clean script buffer or a number naming
+         unclean pixels (a tainted canvas or cross-origin image by handle,
+         an unclean ImageBitmap by store id), which only natives read. */
       let sourceState = null;
       if (source instanceof HTMLCanvasElement) {
-        sourceState = contextKinds.get(source) === "webgl"
-          ? globalThis.__tilefinchWebGLReadback?.(source)
-          : stateFor(source);
+        if (contextKinds.get(source) === "webgl")
+          sourceState = globalThis.__tilefinchWebGLReadback?.(source);
+        else {
+          const state = stateFor(source);
+          if (!flushRectCommands(state)) return;
+          sourceState = { width: state.width, height: state.height,
+            pixels: surfaceTarget(state), originClean: canvasOriginClean(state),
+            state };
+        }
         if (!sourceState) return;
       }
       else if (
@@ -2611,20 +2809,28 @@
         if (!snapshot) {
           const decoded = __tilefinchCanvasImageSource(source.__handle);
           if (!decoded) return;
-          snapshot = {
-            width: Number(decoded.width),
-            height: Number(decoded.height),
-            pixels: new Uint8ClampedArray(decoded.pixels),
-            originClean: decoded.sameOrigin !== false,
-          };
-          rememberImageSnapshot(source, sourceKey, snapshot);
+          /* A cross-origin image is drawn by handle and never cached. */
+          if (decoded.sameOrigin !== true) {
+            sourceState = { width: Number(decoded.width),
+              height: Number(decoded.height), pixels: source.__handle,
+              originClean: false };
+          } else {
+            snapshot = {
+              width: Number(decoded.width),
+              height: Number(decoded.height),
+              pixels: new Uint8ClampedArray(decoded.pixels),
+              originClean: true,
+            };
+            rememberImageSnapshot(source, sourceKey, snapshot);
+          }
         } else if (newestImageSource !== source)
           rememberImageSnapshot(source, sourceKey, snapshot);
-        sourceState = snapshot;
+        sourceState ||= snapshot;
       } else if (source instanceof ImageBitmap) {
         const bitmap = liveBitmapState(source);
         sourceState = { width: bitmap.width, height: bitmap.height,
-          pixels: bitmap.pixels, originClean: bitmap.originClean };
+          pixels: bitmap.pixels || bitmap.surface,
+          originClean: bitmap.originClean };
       } else
         throw new DOMException(
           "The image source is not supported by this bounded backend",
@@ -2660,16 +2866,21 @@
         dh,
       ].map(Number);
       if (![sx, sy, sw, sh, dx, dy, dw, dh].every(Number.isFinite)) return;
-      const target = stateFor(this.canvas);
-      if (sourceState.originClean === false) target.originClean = false;
+      const target = stateFor(this.canvas),
+        sourceClean = sourceState.originClean !== false &&
+          (!(source instanceof HTMLCanvasElement) ||
+            canvasElementOriginClean(source));
+      if (!sourceClean && !taintCanvas(target)) return;
       if (target.rectCommands.length && !flushRectCommands(target)) return;
-      if (source instanceof HTMLCanvasElement &&
-          contextKinds.get(source) !== "webgl" &&
-          !flushRectCommands(sourceState)) return;
-      const
-        retainedSourcePixels =
-          source instanceof HTMLCanvasElement && sourceState === target
-            ? sourcePixels.slice() : sourcePixels,
+      /* Tainting the target can move the source's own pixels (a canvas
+         drawn onto itself) into its store: name them as they are now. A
+         native copies a store that is also the target. */
+      const currentSourcePixels = sourceState.state
+          ? surfaceTarget(sourceState.state) : sourcePixels,
+        retainedSourcePixels = typeof currentSourcePixels === "number" ||
+          !currentSourcePixels ? currentSourcePixels
+          : sourceState.state === target
+            ? currentSourcePixels.slice() : currentSourcePixels,
         targetPixels = ensureSurface(target),
         destination = [[
           transformPoint(target, dx, dy),
@@ -2678,7 +2889,8 @@
           transformPoint(target, dx, dy + dh),
         ]],
         dirty = canvasDirtyBounds(target, destination, 1);
-      if (!targetPixels || !sw || !sh || !dw || !dh) return;
+      if (!targetPixels || !retainedSourcePixels || !sw || !sh || !dw || !dh)
+        return;
       const operation = compositeOperations.indexOf(
         target.globalCompositeOperation,
       );
@@ -2688,12 +2900,16 @@
         const sourceAlreadyQueued = target.imageCommands.some(
           (command) => command.source === retainedSourcePixels,
         );
-        const sourceBytes = sourceAlreadyQueued ? 0 : retainedSourcePixels.byteLength;
+        const sourceBytes = sourceAlreadyQueued ||
+          typeof retainedSourcePixels === "number"
+          ? 0 : retainedSourcePixels.byteLength;
         if (sourceBytes > pixelByteLimit ||
             (sourceBytes > pixelByteLimit - target.imageCommandBytes &&
              !flushImageCommands(target))) return;
         target.imageCommands.push({
           source: retainedSourcePixels,
+          /* Keeps a handle-named source alive until the flush. */
+          element: source,
           sourceWidth: sourceState.width,
           sourceHeight: sourceState.height,
           sx, sy, sw, sh, dx, dy, dw, dh,
@@ -2736,7 +2952,7 @@
       repetition = repetition === "" ? "repeat" : String(repetition);
       if (!["repeat", "repeat-x", "repeat-y", "no-repeat"].includes(repetition))
         throw new DOMException("Invalid pattern repetition", "SyntaxError");
-      let retained = source;
+      let retained = source, native = null;
       if (source instanceof HTMLCanvasElement) {
         retained = contextKinds.get(source) === "webgl"
           ? globalThis.__tilefinchWebGLReadback?.(source)
@@ -2752,26 +2968,31 @@
       ) {
         const snapshot = __tilefinchCanvasImageSource(source.__handle);
         if (!snapshot) return null;
+        const clean = snapshot.sameOrigin === true;
         retained = {
           width: Number(snapshot.width),
           height: Number(snapshot.height),
-          pixels: new Uint8ClampedArray(snapshot.pixels),
-          originClean: snapshot.sameOrigin !== false,
+          pixels: clean ? new Uint8ClampedArray(snapshot.pixels) : null,
+          originClean: clean,
         };
+        if (!clean) native = source.__handle;
       } else if (source instanceof ImageBitmap) {
         const bitmap = liveBitmapState(source);
         retained = { width: bitmap.width, height: bitmap.height,
           pixels: bitmap.pixels, originClean: bitmap.originClean };
+        if (!bitmap.pixels) native = bitmap.surface;
       } else if (!(source instanceof HTMLCanvasElement))
         throw new DOMException(
           "The pattern source is not supported by this bounded backend",
           "NotSupportedError",
         );
-      const pattern = new CanvasPattern(retained, repetition);
-      /* A pattern retains its source pixels for later paint. Latch the
-         security state now so no intervening readback can observe them. */
-      if (!pattern._originClean) stateFor(this.canvas).originClean = false;
-      return pattern;
+      /* An unclean pattern holds no pixels script can reach (natives read
+         them by handle), so creating one taints nothing: painting with it
+         taints the canvas painted. */
+      return new CanvasPattern(retained, repetition,
+        source instanceof HTMLCanvasElement &&
+          contextKinds.get(source) !== "webgl" ? source : null,
+        native, native === null ? null : source);
     }
     createImageData(width, height) {
       if (width instanceof ImageData) {
@@ -2784,7 +3005,7 @@
       return new ImageData(width, height);
     }
     getImageData(x, y, width, height) {
-      if (!stateFor(this.canvas).originClean)
+      if (!canvasOriginClean(stateFor(this.canvas)))
         throw new DOMException("Canvas is not origin-clean", "SecurityError");
       x = Math.trunc(Number(x));
       y = Math.trunc(Number(y));
@@ -2861,6 +3082,20 @@
         copyWidth = sourceRight - sourceLeft,
         copyHeight = sourceBottom - sourceTop;
       if (copyWidth <= 0 || copyHeight <= 0) return;
+      if (typeof target === "number") {
+        /* Into a tainted canvas's store: a raw copy (operation 0). */
+        if (!__tilefinchCanvasRasterImage(
+          target, state.width, state.height, imageData.data,
+          imageData.width, imageData.height, sourceLeft, sourceTop,
+          copyWidth, copyHeight, x + sourceLeft, y + sourceTop, copyWidth,
+          copyHeight, false, 1, 0, new Float64Array(identityTransform),
+          new Float64Array([0, 0, state.width, state.height]),
+          new Float64Array(0),
+        )) return;
+        scheduleCanvasCommit(state, normalizedRect(
+          state, x + sourceLeft, y + sourceTop, copyWidth, copyHeight));
+        return;
+      }
       const rowBytes = copyWidth * 4;
       for (let row = 0; row < copyHeight; row++) {
         const sourceY = sourceTop + row,
@@ -2893,15 +3128,11 @@
         (value >>> 8) & 255,
         value & 255,
       ]),
+    /* zlib's CRC-32 (native): an interpreted one cost 8 steps a byte. */
     crc32 = (parts) => {
-      let crc = 0xffffffff;
-      for (const part of parts)
-        for (const value of part) {
-          crc ^= value;
-          for (let bit = 0; bit < 8; bit++)
-            crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
-        }
-      return (crc ^ 0xffffffff) >>> 0;
+      let crc = 0;
+      for (const part of parts) crc = pngChecksum(false, crc, part);
+      return crc;
     },
     pngChunk = (name, data) => {
       const type = new TextEncoder().encode(name),
@@ -2920,8 +3151,10 @@
       return state;
     },
     encodeCanvasPNG = (canvas) => {
+      if (typeof pngChecksum !== "function") return new Uint8Array();
       const state = canvasReadbackState(canvas);
-      if (!state) return new Uint8Array();
+      if (!state || state.originClean === false ||
+          !canvasElementOriginClean(canvas)) return new Uint8Array();
       if (state.width === 0 || state.height === 0) return new Uint8Array();
       const pixels =
           state.pixels ||
@@ -2948,13 +3181,7 @@
           ]);
         deflateParts.push(header, raw.subarray(offset, offset + length));
       }
-      let a = 1,
-        b = 0;
-      for (const value of raw) {
-        a = (a + value) % 65521;
-        b = (b + a) % 65521;
-      }
-      deflateParts.push(uint32Bytes(((b << 16) | a) >>> 0));
+      deflateParts.push(uint32Bytes(pngChecksum(true, 1, raw)));
       const compressedLength = deflateParts.reduce(
           (total, part) => total + part.length,
           0,
@@ -3037,7 +3264,7 @@
   HTMLCanvasElement.prototype.toDataURL = function toDataURL() {
     const state = canvasReadbackState(this);
     if (!state) return "data:,";
-    if (!state.originClean)
+    if (state.originClean === false || !canvasElementOriginClean(this))
       throw new DOMException("Canvas is not origin-clean", "SecurityError");
     if (
       state.width === 0 ||
@@ -3055,13 +3282,16 @@
       queueMicrotask(() => callback(null));
       return;
     }
-    if (!state.originClean)
+    if (state.originClean === false || !canvasElementOriginClean(this))
       throw new DOMException("Canvas is not origin-clean", "SecurityError");
     __tilefinchRealmGlobal.__tilefinchScheduleTask(() => {
+      /* The canvas can be tainted before the task runs. */
       if (
         state.width === 0 ||
         state.height === 0 ||
-        state.surfaceUnavailable
+        state.surfaceUnavailable ||
+        state.originClean === false ||
+        !canvasElementOriginClean(this)
       ) {
         callback(null);
         return;
@@ -3098,7 +3328,17 @@
   globalThis.__tilefinchSetCanvasDimension = (node, name, value) =>
     node.setAttribute(name, String(Number(value) >>> 0));
   globalThis.__tilefinchFlushCanvasSurfaces = flushCanvasSurfaces;
-  globalThis.__tilefinchCanvasReadbackState = canvasReadbackState;
+  /* webgl.js's texImage2D(canvas) source. It is page-callable, so it hands
+     out a copy of an origin-clean canvas only, never the live state. */
+  globalThis.__tilefinchCanvasReadbackState = (canvas) => {
+    if (!(canvas instanceof HTMLCanvasElement)) return null;
+    const state = canvasReadbackState(canvas);
+    if (!state || state.originClean === false ||
+        !canvasElementOriginClean(canvas)) return null;
+    return { width: state.width, height: state.height,
+      pixels: state.pixels ? state.pixels.slice().buffer : null,
+      originClean: true };
+  };
   /* Batching counters for host tests (test-probe realms only). */
   if (globalThis.__tilefinchTestProbes)
     Object.defineProperty(globalThis, "__tilefinchCanvasDiagnostics", {
