@@ -6,14 +6,21 @@
 
 /*
  * Per-site browser identity: the one place where a document may present a
- * User-Agent other than TILEFINCH_BROWSER_USER_AGENT.
+ * User-Agent other than TILEFINCH_BROWSER_USER_AGENT. Two Google sites use
+ * the honest TILEFINCH_GOOGLE_USER_AGENT instead:
  *
- * Google is the only such site. With the shipping compatibility UA it serves
- * a WAP "Update your browser" page, so Google searches open a local
- * compatibility page (site_adapter.c). Choosing "Try Google anyway" opts the
- * browsing session in: from then until the browser restarts, google.com and
- * www.google.com documents use the honest TILEFINCH_GOOGLE_USER_AGENT, for
- * which Google serves its scripted page and SearchGuard check.
+ * - accounts.google.com, always. With the shipping UA it serves its heavy
+ *   sign-in page (about 3.9 MB of script, near the PSP's whole budget);
+ *   with the honest one it serves a light page of inline scripts. If Google
+ *   refuses the honest UA there (HTTP 429, a /sorry/ interstitial, or its
+ *   sign-in rejection page), the session goes back to the shipping UA on
+ *   accounts.google.com until the browser restarts and the browser reloads
+ *   the page once.
+ * - google.com and www.google.com, only after "Try Google anyway". With the
+ *   shipping UA Google serves a WAP "Update your browser" page, so Google
+ *   searches open a local compatibility page (site_adapter.c). Choosing
+ *   "Try Google anyway" opts the browsing session in until the browser
+ *   restarts.
  *
  * Scope is the top-level document, as in a real browser: the navigation
  * request (decided by its target), and every request a Google document makes
@@ -22,7 +29,10 @@
  * realms report it as navigator.userAgent/appVersion (workers mirror their
  * owner's navigator). Client Hints already name Tilefinch on PlayStation
  * Portable and need no change. Other top-level documents keep the shipping
- * UA. A redirect hop leaving Google keeps the UA its request started with.
+ * UA. Each redirect hop of a top-level navigation takes the identity of its
+ * own target, so every document gets the identity of the host that served
+ * it (YouTube's sign-in hands off through accounts.youtube.com and
+ * www.youtube.com, which keep the shipping UA).
  *
  * The opt-in is process state, never a URL parameter on the wire: the
  * compatibility form carries a tilefinch_raw=1 marker that the navigation
@@ -49,9 +59,32 @@ void site_identity_google_opt_in(void);
 bool site_identity_take_google_opt_in_marker(
     const char *url, char *output, size_t capacity);
 
+/* http(s)://accounts.google.com on its default port. */
+bool site_identity_accounts_host(const char *url);
+
 /* The User-Agent a document at document_url presents, or NULL for the
    shipping identity. For a top-level navigation pass the target URL. */
 const char *site_identity_user_agent_override(const char *document_url);
+/* Whether user_agent is NULL or the honest identity: a value this module
+   chose, which a redirect hop may replace with its target's identity. */
+bool site_identity_user_agent_derived(const char *user_agent);
+
+/* Classify a top-level navigation's response on accounts.google.com. True
+   while accounts.google.com still uses the honest identity and Google
+   refused it: HTTP 429 from accounts.google.com, its sign-in rejection page
+   (/signin/rejected or /v3/signin/rejected), or a /sorry/ interstitial that
+   an accounts.google.com request redirected to or an accounts.google.com
+   page (source_url) navigated to. Pure: changes no state. */
+bool site_identity_accounts_refusal(
+    const char *request_url, const char *source_url,
+    const char *effective_url, long status);
+/* Returns accounts.google.com to the shipping identity until the browser
+   restarts, and records as the pending fallback the first of reload_url and
+   source_url that is an accounts.google.com page other than a refusal page.
+   The browser loads it once; with the shipping identity no refusal is
+   classified again, so the fallback cannot repeat. */
+void site_identity_accounts_refused(const char *reload_url,
+                                    const char *source_url);
 
 /* Classify the outcome of a top-level navigation. True when the session is
    opted in and either request_url is Google's /sorry/ interstitial, or it is
@@ -64,7 +97,8 @@ bool site_identity_google_refusal(
 /* Clears the opt-in, arms the compatibility-page note, and records
    search_url (when it is a Google search) as the pending fallback. */
 void site_identity_google_refused(const char *search_url);
-/* Consumes the pending fallback navigation, if any. */
+/* Consumes the pending fallback navigation, if any: a Google search for
+   the compatibility page, or an accounts.google.com page to reload. */
 bool site_identity_take_google_fallback(char *url, size_t capacity);
 void site_identity_clear_google_fallback(void);
 /* Consumes the "Google didn't accept this search" note. */

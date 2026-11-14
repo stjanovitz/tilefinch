@@ -1,0 +1,75 @@
+# Device A/B, not golden-gated: a same-page jump and Find while the
+# PlayStation Portable article's layout is still provisional. Mobile
+# Wikipedia hides its Contents list, so the jump is the lead's first note
+# link ("[a]", #cite_note-5, in Notes near the page end). Nine Ups from no
+# focus reach it; Down cannot leave the first screen while provisional.
+# j1 jumps while provisional; j2 repeats it after Back; Back and Reload
+# then make the page provisional again for Find "umd" and two Downs.
+# Validation builds type into Danzeff. Never press during a jump's
+# build: input cancels it. Read tilefinch-control-activation, the
+# operation journal, input-script-edge at-us and each mark's
+# tilefinch-input-page scroll.
+wait-live 30
+tap-live up
+wait-live 6
+tap-live up
+wait-live 6
+tap-live up
+wait-live 6
+tap-live up
+wait-live 6
+tap-live up
+wait-live 6
+tap-live up
+wait-live 6
+tap-live up
+wait-live 6
+tap-live up
+wait-live 6
+tap-live up
+wait-live 6
+mark-live j1-focus
+tap-live cross
+wait-live 1500
+mark-live j1-landed
+tap-live circle
+wait-live 60
+mark-live back-top
+tap-live cross
+wait-live 300
+mark-live j2-landed
+tap-live circle
+wait-live 60
+mark-live back-top2
+tap-live square
+wait-page 1
+wait-live 30
+mark-live reloaded
+tap-live select
+wait-live 8
+tap-live down
+wait-live 4
+tap-live down
+wait-live 4
+tap-live cross
+wait-live 8
+tap-live cross
+wait-text 5
+stick-text 1 down square
+wait-text 2
+tap-text square
+wait-text 2
+stick-text 1 up square
+wait-text 2
+hold-text 1 start
+wait-live 300
+mark-live find-umd
+tap-live down
+wait-live 60
+mark-live find-next1
+tap-live down
+wait-live 60
+mark-live find-next2
+wait 120
+mark settled
+end

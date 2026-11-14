@@ -3,12 +3,14 @@ set(TILEFINCH_CORE_SOURCES
     src/browser_profile.c
     src/browser_tabs.c
     src/budget.c
+    src/frame_lite.c
     src/frame_pumps.c
     src/preview_policy.c
     src/declarative_refresh.c
     src/tilefinch_test_faults.c
     src/bot_wall.c
     src/captive_portal.c
+    src/component_store.c
     src/content_blocker.c
     src/content_security_policy.c
     src/controller.c
@@ -28,8 +30,11 @@ set(TILEFINCH_CORE_SOURCES
     src/fetch_websocket_frames.c
     src/frame_sandbox.c
     src/page_dialog.c
+    src/media_capture.c
+    src/media_capture_input.c
     src/font.c
     src/game_audio.c
+    src/game_audio_timeline.c
     src/gamepad.c
     src/glyph_component.c
     src/glyph_component_store.c
@@ -44,6 +49,7 @@ set(TILEFINCH_CORE_SOURCES
     src/generated/js_bootstrap_bytecode.c
     src/js_dom_bindings.c
     src/js_game_audio.c
+    src/js_media_capture.c
     src/js_canvas_bridge.c
     src/js_computed_style.c
     src/js_webgl_bridge.c
@@ -80,6 +86,7 @@ set(TILEFINCH_CORE_SOURCES
     src/layout_replaced.c
     src/layout_reuse.c
     src/layout_text_cache.c
+    src/layout_validation_diff.c
     src/layout_scroll.c
     src/layout_table.c
     src/navigation.c
@@ -105,6 +112,7 @@ set(TILEFINCH_CORE_SOURCES
     src/public_suffix.c
     src/render.c
     src/canvas_ge_presenter.c
+    src/ge_scratch.c
     src/reader_mode.c
     src/request_context.c
     src/resource_integrity.c
@@ -202,9 +210,6 @@ if(TILEFINCH_CENSUS_BOOTSTRAP_BYTECODE)
     if(PSP AND NOT TILEFINCH_PSP_VALIDATION_LOG)
         message(FATAL_ERROR "Census bootstrap override is forbidden in shipping PSP builds")
     endif()
-    if(NOT PSP_BROWSER_USE_BELLARD_QUICKJS)
-        message(FATAL_ERROR "Census bootstrap override requires the Bellard engine")
-    endif()
     list(REMOVE_ITEM TILEFINCH_CORE_SOURCES src/generated/js_bootstrap_bytecode.c)
     list(APPEND TILEFINCH_CORE_SOURCES "${TILEFINCH_CENSUS_BOOTSTRAP_BYTECODE}")
 endif()
@@ -282,10 +287,6 @@ else()
         include src)
     target_link_libraries(tilefinch_bootstrap_bytecode_generator PRIVATE
         qjs)
-    if(PSP_BROWSER_USE_BELLARD_QUICKJS)
-        target_compile_definitions(tilefinch_bootstrap_bytecode_generator
-            PRIVATE PSP_BROWSER_BELLARD_QUICKJS=1)
-    endif()
     add_custom_target(regenerate_tilefinch_bootstrap
         COMMAND tilefinch_bootstrap_bytecode_generator
             "${TILEFINCH_BOOTSTRAP_SOURCE_DIR}"
@@ -432,9 +433,6 @@ else()
     find_package(OpenSSL REQUIRED COMPONENTS Crypto)
     target_sources(tilefinch_core PRIVATE src/update_crypto_openssl.c)
     target_link_libraries(tilefinch_core PUBLIC OpenSSL::Crypto)
-endif()
-if(PSP_BROWSER_USE_BELLARD_QUICKJS)
-    target_compile_definitions(tilefinch_core PUBLIC PSP_BROWSER_BELLARD_QUICKJS=1)
 endif()
 if(PSP_BROWSER_FREETYPE_AVAILABLE)
     target_compile_definitions(tilefinch_core PRIVATE TILEFINCH_HAVE_FREETYPE=1)

@@ -437,6 +437,7 @@ static const LabCommand lab_commands[] = {
     {"dpad-right", LAB_INPUT, NULL},
     {"dpad-left", LAB_INPUT, NULL},
     {"tap", LAB_INPUT | LAB_PRIVATE, "tap X Y"},
+    {"pointer-move", LAB_INPUT, "pointer-move X Y"},
     {"click", LAB_INPUT | LAB_PRIVATE, "click TARGET|X Y"},
     {"focus-up", LAB_INPUT | LAB_PRIVATE,
         "focus-up|focus-down|focus-left|focus-right"},
@@ -453,6 +454,10 @@ static const LabCommand lab_commands[] = {
     {"history-controls", 0u, "history-controls"},
     {"control-value", 0u, "control-value ID"},
     {"anchor", 0u, "anchor ID"},
+    {"jump", LAB_INPUT, "jump URL"},
+    {"find", LAB_INPUT, "find TEXT|find-next|find-prev"},
+    {"find-next", LAB_INPUT, NULL},
+    {"find-prev", LAB_INPUT, NULL},
     {"node-text", 0u, "node-text ID"},
     {"text-checksum", 0u, "text-checksum TAG"},
     {"node-attribute", 0u, "node-attribute ID NAME"},
@@ -463,6 +468,7 @@ static const LabCommand lab_commands[] = {
     {"profile", 0u, "profile [LABEL]"},
     {"work", 0u, "work [LABEL]"},
     {"census", 0u, "census"},
+    {"memory-report", 0u, "memory-report [PHASE]"},
     {"js", 0u, "js EXPRESSION"},
     {"stop-scripts", 0u, "stop-scripts"},
     {"heavy-answer", LAB_PRIVATE, "heavy-answer run|stop"},
@@ -1803,6 +1809,10 @@ static bool run_command_loop(FILE *commands, bool interactive,
         }
         if (private_console_fd >= 0
             && !private_console_command_allowed(line)) goto failed;
+        if (getenv("TILEFINCH_LAYOUT_DIFF") != NULL)
+            fprintf(stderr, "lab-command: %s%s%s\n", line,
+                    argument == NULL ? "" : " ",
+                    argument == NULL ? "" : argument);
         if (loop_command_is_user_input(line))
             browser_engine_note_user_input(engine);
         bool changed = true, reset_cache = false, ok = true;
@@ -2003,6 +2013,49 @@ static bool run_command_loop(FILE *commands, bool interactive,
             ok = browser_engine_focus_node(engine, node);
         } else if (lab_cmd_inspect(&command, line, argument, &changed,
                                    &reset_cache, &ok, &frame_number)) {
+        } else if (strcmp(line, "jump") == 0 && argument != NULL) {
+            /* The link activation path: a same-document URL scrolls to
+               its fragment (browser_engine_execute_action). */
+            memset(&scratch->action, 0, sizeof(scratch->action));
+            scratch->action.type = CONTROLLER_ACTION_NAVIGATE;
+            snprintf(scratch->action.url, sizeof(scratch->action.url), "%s",
+                     argument);
+            snprintf(scratch->action.method, sizeof(scratch->action.method),
+                     "GET");
+            uint64_t started = tilefinch_platform_monotonic_time_us();
+            ok = browser_engine_execute_action(engine, &scratch->action,
+                                               4 * MIB, 30000);
+            const NavigationEntry *entry = navigation_current(navigation);
+            printf("loop-jump ok=%d scroll=%d height=%d limit=%d us=%llu "
+                   "through=%zu fallbacks=%zu\n", ok,
+                   entry == NULL ? -1 : entry->scroll_y,
+                   navigation->page.layout.height,
+                   navigation->page.layout.content_limit_y,
+                   (unsigned long long) (tilefinch_platform_monotonic_time_us()
+                                         - started),
+                   navigation->performance.layout_through_builds,
+                   navigation->performance.layout_through_fallbacks);
+            reset_cache = ok;
+        } else if ((strcmp(line, "find") == 0 && argument != NULL)
+                   || strcmp(line, "find-next") == 0
+                   || strcmp(line, "find-prev") == 0) {
+            BrowserFindSnapshot found = {0};
+            uint64_t started = tilefinch_platform_monotonic_time_us();
+            ok = strcmp(line, "find") == 0
+                ? browser_engine_find_begin(engine, argument, &found)
+                : browser_engine_find_move(
+                      engine, strcmp(line, "find-next") == 0 ? 1 : -1,
+                      &found);
+            const NavigationEntry *entry = navigation_current(navigation);
+            printf("loop-find ok=%d selected=%zu matches=%zu%s scroll=%d "
+                   "limit=%d us=%llu through=%zu\n", ok, found.selected,
+                   found.match_count, found.truncated ? "+" : "",
+                   entry == NULL ? -1 : entry->scroll_y,
+                   navigation->page.layout.content_limit_y,
+                   (unsigned long long) (tilefinch_platform_monotonic_time_us()
+                                         - started),
+                   navigation->performance.layout_through_builds);
+            reset_cache = ok;
         } else if (strcmp(line, "anchor") == 0 && argument != NULL) {
             int written = snprintf(
                 scratch->reference, sizeof(scratch->reference), "#%s",
@@ -2023,6 +2076,21 @@ static bool run_command_loop(FILE *commands, bool interactive,
                 ok = x >= 0 && y >= 0
                     && browser_engine_focus_at(engine, (int) x, (int) y);
             }
+        } else if (strcmp(line, "pointer-move") == 0 && argument != NULL) {
+            /* Layout reuse study: the nub cursor's pointer-move, which the
+               PSP sends on every frame the cursor moves. */
+            char *end = NULL;
+            long x = strtol(argument, &end, 10);
+            long y = end == argument ? -1 : strtol(end, NULL, 10);
+            bool activate = false, page_changed = false;
+            ok = x >= 0 && y >= 0
+                && browser_engine_pointer_event(
+                       engine, CONTROLLER_POINTER_MOVE, (int) x, (int) y,
+                       &activate, &page_changed);
+            if (getenv("TILEFINCH_LAYOUT_DIFF") != NULL)
+                fprintf(stderr, "lab-pointer-move: x=%ld y=%ld ok=%d "
+                        "page-changed=%d\n", x, y, (int) ok,
+                        (int) page_changed);
         } else if (strcmp(line, "click") == 0 && argument != NULL) {
             char *end = NULL;
             long x = strtol(argument, &end, 10);
@@ -2085,6 +2153,17 @@ static bool run_command_loop(FILE *commands, bool interactive,
             printf("stop-scripts ok=%s\n", ok ? "yes" : "no");
         } else if (strcmp(line, "census") == 0) {
             interactive_census_report(engine, navigation);
+            ok = true;
+        } else if (strcmp(line, "memory-report") == 0) {
+            /* The validation memory make-up lines (VALIDATION_RECORDS.md,
+               "Memory make-up"); TILEFINCH_TRACE_JS_HEAP_DETAIL adds the
+               compact heap census of every realm. */
+            const char *detail = getenv("TILEFINCH_TRACE_JS_HEAP_DETAIL");
+            browser_engine_memory_report(
+                engine, argument == NULL ? "lab" : argument,
+                detail != NULL && detail[0] != '\0'
+                    && strcmp(detail, "0") != 0,
+                printf);
             ok = true;
         } else if (strcmp(line, "work") == 0) {
             /* The deterministic work record (LAB_USAGE.md, "Work vector"). */

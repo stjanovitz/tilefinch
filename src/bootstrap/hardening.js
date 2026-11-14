@@ -9,7 +9,13 @@
   /* Set by the host for host and validation realms only; the probes it
      enabled are published by now. */
   deleteProperty(globalThis, "__tilefinchTestProbes");
-  /* Every bootstrap module captured the trusted-event share (dom.js). */
+  /* Every bootstrap module captured the trusted-event share (dom.js); the
+     lazy modules get its event creator, brand check and interfaces from
+     the globals published below. */
+  const createEvent =
+      globalThis.__tilefinchTrustedEventShare.createBrowserEvent,
+    isEvent = globalThis.__tilefinchTrustedEventShare.isEvent,
+    eventInterfaces = globalThis.__tilefinchTrustedEventShare.interfaces();
   deleteProperty(globalThis, "__tilefinchTrustedEventShare");
   const markNative = globalThis.__tilefinchMarkNativeFunction,
     markInterface = (constructor) => {
@@ -51,6 +57,38 @@
     enumerable: false,
     writable: false,
     value: createPrivateWeakMap,
+  });
+  /* Lazy modules mark some of the events they build trusted, so they must
+     not build them with whatever constructor the page left at
+     globalThis.Event. A page that calls this gets an ordinary untrusted
+     event. */
+  markNative(createEvent);
+  defineProperty(globalThis, "__tilefinchCreateEvent", {
+    configurable: false,
+    enumerable: false,
+    writable: false,
+    value: createEvent,
+  });
+  /* A page that calls it learns only whether a value is a real Event. */
+  markNative(isEvent);
+  defineProperty(globalThis, "__tilefinchIsEvent", {
+    configurable: false,
+    enumerable: false,
+    writable: false,
+    value: isEvent,
+  });
+  /* compat.js's frozen, null-prototype table of the event interfaces it
+     captured before author code: Event, EventTarget and the Event
+     subclasses it defines, keyed by global name. Lazy modules evaluate
+     after the page may have replaced those globals, so they extend these
+     instead (`const { Event, EventTarget } = __tilefinchEventInterfaces`).
+     Every entry is the object the page itself received at that global, so
+     the table grants a page nothing it lacked. */
+  defineProperty(globalThis, "__tilefinchEventInterfaces", {
+    configurable: false,
+    enumerable: false,
+    writable: false,
+    value: eventInterfaces,
   });
   for (const name of [
     "Blob", "DOMImplementation", "MutationObserver", "Navigator", "NavigatorUAData",

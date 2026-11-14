@@ -1,4 +1,5 @@
 #include "tilefinch/psp_profile_store.h"
+#include "tilefinch/session.h"
 
 #include <string.h>
 
@@ -21,6 +22,21 @@ void psp_profile_store_mark_dirty(
     store->dirty_since_us = now_us;
     if (!store->dirty) store->first_dirty_us = now_us;
     store->dirty = true;
+}
+
+bool psp_profile_store_forget_site_storage(
+    PspProfileStore *store, BrowserSession *session,
+    const char *origin, uint64_t now_us)
+{
+    if (store == NULL || store->profile == NULL || session == NULL
+        || origin == NULL) return false;
+    bool deleted = browser_session_site_storage_forget(session, origin);
+    if (deleted && browser_profile_site_storage_policy(store->profile, origin)
+            != BROWSER_SITE_STORAGE_ASK
+        && browser_profile_set_site_storage_policy(
+               store->profile, origin, BROWSER_SITE_STORAGE_ASK))
+        psp_profile_store_mark_dirty(store, now_us);
+    return deleted;
 }
 
 static void profile_store_clean(PspProfileStore *store)

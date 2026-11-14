@@ -48,8 +48,14 @@
    prefix shows the same nothing: a large inline script or JSON blob can add
    megabytes without a single element, and every attempt is a layout from
    the top plus the stylesheet fingerprint. An empty attempt that already
-   laid out past the first screen (truncated at its limit) waits for the
-   body to double: what follows flows below the screen. */
+   laid out past the first screen (truncated at its limit) is laid out once
+   more at the refresh depth (three screens), at the next checkpoint and
+   without a wait, and from then on every first-screen attempt goes that
+   deep: content the cut left out can still paint into the first screen
+   (cnn.com's headline is an absolutely positioned link whose static
+   position follows a 320 px video, so a 408 px cut drops it). A covered
+   empty attempt at that depth waits for the body to double: what follows
+   flows below the screen. */
 #define PREVIEW_POLICY_EMPTY_ELEMENTS 32u
 #define PREVIEW_POLICY_EMPTY_ELEMENTS_LIMIT (64u * 1024u)
 /* Admitted checks (past the stream's cheap gates) without new input. */
@@ -95,6 +101,11 @@ typedef struct {
     size_t empty_elements;
     size_t empty_bytes;
     size_t empty_wait_elements;
+    /* A covered empty attempt asked for first screens laid out to the
+       refresh depth; the next attempt, the first that deep, comes without
+       the empty wait. */
+    bool deep_first;
+    bool deep_retry;
 } PreviewPolicy;
 
 typedef struct {
@@ -120,6 +131,9 @@ typedef struct {
     int limit_y;
     /* Fresh input since the last admitted check (reopens the check cap). */
     bool fresh;
+    /* A first-screen attempt shallower than the refresh depth: if it comes
+       out empty and covered, the next one goes that deep. */
+    bool deepens;
     /* Why nothing is built (for validation logs); NULL when building. */
     const char *reason;
 } PreviewDecision;
@@ -158,7 +172,8 @@ void preview_policy_painted(PreviewPolicy *policy,
 void preview_policy_failed(PreviewPolicy *policy);
 /* The attempt laid out but nothing in the viewport could be shown.
    closed_content_elements: the input's, when the attempt was decided;
-   covered: the layout reached its limit (the first screen is complete). */
+   covered: the layout reached its limit (its flow covers the first
+   screen). */
 void preview_policy_empty(PreviewPolicy *policy,
                           const PreviewDecision *decision,
                           size_t closed_content_elements, bool covered);

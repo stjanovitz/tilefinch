@@ -1,0 +1,12 @@
+# Microphone stream voices and AnalyserNodes under PPSSPP or on a PSP, from
+# native HOME with no page. The validation build feeds a stream voice
+# synthetic samples (it never opens the microphone) and times the mixer
+# with a stream voice and a 1 kHz oscillator each tapped by an analyser
+# against the same voices without analysers (tilefinch-audio-analyser-run:),
+# then one getFloatFrequencyData's work at fftSize 256, 1024 and 2048
+# (tilefinch-audio-analyser-fft:, peak-bin 6, 23 and 46).
+# A measurement scenario.
+wait 120
+mark audio-fft-probe
+wait 30
+end

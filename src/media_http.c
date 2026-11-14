@@ -163,15 +163,7 @@ struct MediaHttpRange {
     char last_error[256];
 };
 
-static void media_http_error(char *error, size_t error_size,
-                             const char *format, ...)
-{
-    if (error == NULL || error_size == 0) return;
-    va_list arguments;
-    va_start(arguments, format);
-    vsnprintf(error, error_size, format, arguments);
-    va_end(arguments);
-}
+#define media_http_error tilefinch_format_error
 
 bool media_http_parse_content_range(
     const char *value, uint64_t expected_first,

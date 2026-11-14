@@ -577,10 +577,10 @@ The first configure downloads pinned archives and verifies their hashes:
 | Lexbor, stb, NanoSVG, DejaVu fonts, libwebp | every build |
 | FreeType, brotli | `PSP_BROWSER_ENABLE_WEB_FONTS` (default on) |
 | WAMR | PSP builds, and host builds with `PSP_BROWSER_ENABLE_HOST_WEBASSEMBLY` (default on); `PSP_BROWSER_WAMR_SOURCE_DIR` supplies a local tree |
-| QuickJS-NG | only with `PSP_BROWSER_USE_BELLARD_QUICKJS=OFF` |
 | PocketSphinx 5.1.1 | the `psp` presets, for the voice component |
 
-The vendored Bellard QuickJS in `third_party/quickjs` is the default engine.
+The JavaScript engine, Bellard QuickJS, is vendored in `third_party/quickjs`
+and is not fetched.
 The PSP transport archives are not fetched by CMake; see
 [PSP transport dependencies](#psp-transport-dependencies).
 `PSP_BROWSER_VENDOR_DIR` can supply prepared dependencies in its documented
@@ -605,10 +605,9 @@ QuickJS is vendored in `third_party/quickjs` with the repository's changes
 applied, and its two engine files are fingerprint-pinned at configure time.
 Engine edits go into that tree and update the pins in
 `cmake/TilefinchDependencies.cmake`; `third_party/quickjs/README.md` lists the
-carried changes and the update procedure. Every configure selects the
-vendored engine; `-DPSP_BROWSER_USE_BELLARD_QUICKJS=OFF` builds against
-pinned QuickJS-NG instead. Use a separate raw CMake tree for an unpatched
-upstream comparison.
+carried changes and the update procedure. It is the only engine the build
+supports. Use a separate raw CMake tree for an unpatched upstream
+comparison.
 
 The portable configuration enables one source-neutral interpreter shortcut:
 a two-instruction function that only returns one captured value returns it
@@ -646,9 +645,12 @@ browser capabilities.
 
 ### JavaScript heap composition
 
-Host builds compile a read-only heap walk, `JS_ComputeMemoryDetail`
-(`CONFIG_TILEFINCH_HEAP_DETAIL`, set for every non-PSP build in
-`cmake/TilefinchDependencies.cmake`; no PSP image compiles it).
+Host builds and PSP validation builds compile a read-only heap walk,
+`JS_ComputeMemoryDetail` (`CONFIG_TILEFINCH_HEAP_DETAIL`, set in
+`cmake/TilefinchDependencies.cmake`; a shipping PSP image never compiles it).
+On the PSP it runs only from the memory report, with boot key
+`validation_js_heap_detail=1`, and prints the compact form
+(see [Memory make-up](engineering/VALIDATION_RECORDS.md#memory-make-up)).
 `TILEFINCH_TRACE_JS_HEAP_DETAIL=1` prints a census of a realm at the first
 safe point after its allocator refuses a request, at every 4 MiB high-water
 step (`TILEFINCH_TRACE_JS_HEAP_DETAIL_STEP_KB`), and with each memory report.
@@ -658,6 +660,9 @@ retained source, closures, instances per prototype, strings by size band,
 atoms, shapes, pending jobs, `Function.prototype.toString` calls, the Budget
 categories, and the refused request. `=gc` also collects after an OOM census
 and censuses again, answering whether a collection would have freed enough.
+`=compact` prints the bounded form the PSP log uses: no `tostring` row, the
+twelve largest prototypes, and one `kind=file-total` row summing every
+script plus the eight largest scripts.
 Summarise a run directory (one subdirectory per page with `lab.log` and
 `lab.err`):
 

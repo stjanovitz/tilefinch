@@ -1815,6 +1815,135 @@ static int test_control_text_visual_order(Budget *budget)
     return 0;
 }
 
+/* The first text command whose text starts with `prefix`. */
+static const DrawCommand *bidi_translate_text_command(
+    const LayoutDocument *layout, const char *prefix)
+{
+    size_t length = strlen(prefix);
+    for (size_t i = 0; i < layout->count; i++) {
+        const DrawCommand *command = &layout->commands[i];
+        if (command->type == DRAW_TEXT && command->text_length >= length
+            && memcmp(command->text, prefix, length) == 0) return command;
+    }
+    return NULL;
+}
+
+/* Visual-order glyphs carry absolute x. A caller that moves a laid-out
+   subtree sideways (flex cross alignment, row-reverse, column wrapping,
+   multicolumn placement, a positioned item's static position) must move
+   them with the command, or the text paints where the subtree was. */
+static int test_bidi_glyphs_follow_subtree_translation(Budget *budget)
+{
+    static const char page[] =
+        "<!doctype html><style>body{margin:0}"
+        ".box{width:400px}.item{width:120px}"
+        "</style>"
+        /* Moved after layout by translate_node_subtree. */
+        "<div class=box style=display:flex;flex-direction:column;align-items:center>"
+        "<div id=cross-center class=item>\xd8\xa8" CONTROL_WORD_TAIL "</div></div>"
+        "<div class=box style=display:flex;flex-direction:column;align-items:flex-end>"
+        "<div id=cross-end class=item>\xd8\xaa" CONTROL_WORD_TAIL "</div></div>"
+        "<div class=box style=display:flex;flex-direction:column;align-items:center>"
+        "<div id=cross-mixed class=item>abc \xd8\xab" CONTROL_WORD_TAIL " def</div></div>"
+        "<div class=box style=display:flex;flex-direction:row-reverse>"
+        "<div id=row-reverse class=item>\xd8\xac" CONTROL_WORD_TAIL "</div></div>"
+        "<div class=box style=display:flex;flex-direction:column;flex-wrap:wrap;height:24px>"
+        "<div class=item>x</div>"
+        "<div id=column-wrap class=item>\xd8\xad" CONTROL_WORD_TAIL "</div></div>"
+        "<div class=box style=columns:2;column-gap:0>"
+        "<div>x</div><div id=multicolumn>\xd8\xae" CONTROL_WORD_TAIL "</div></div>"
+        "<div class=box style=display:flex;justify-content:center;position:relative;height:30px>"
+        "<div id=positioned style=position:absolute>\xd8\xb3" CONTROL_WORD_TAIL "</div></div>"
+        "<div class=box style=display:flex;flex-direction:column;align-items:center>"
+        "<div id=cross-hebrew class=item>\xd7\xa9\xd7\x9c\xd7\x95\xd7\x9d</div></div>"
+        "<div class=box style=display:flex;flex-direction:column;align-items:center>"
+        "<div id=cross-rtl class=item dir=rtl>\xd8\xb4" CONTROL_WORD_TAIL " abc</div></div>"
+        /* Latin text in a right-to-left element is visually ordered too. */
+        "<div class=box style=display:flex;flex-direction:column;align-items:center>"
+        "<div id=cross-rtl-latin class=item dir=rtl>Plain words</div></div>"
+        /* A fixed descendant keeps its viewport place, glyphs included. */
+        "<div class=box style=display:flex;flex-direction:column;align-items:center>"
+        "<div class=item>x<div id=fixed style=position:fixed;top:200px;left:0>"
+        "\xd8\xb9" CONTROL_WORD_TAIL "</div></div></div>"
+        /* Placed at their final x while laid out. */
+        "<div class=box style=display:flex;justify-content:center>"
+        "<div id=main-center class=item>\xd8\xb5" CONTROL_WORD_TAIL "</div></div>"
+        "<div class=box style=display:grid;grid-template-columns:400px>"
+        "<div id=grid-center class=item style=justify-self:center>\xd8\xb6" CONTROL_WORD_TAIL "</div></div>"
+        "<div class=box><div id=auto-margin class=item style='margin:0 auto'>"
+        "\xd8\xb7" CONTROL_WORD_TAIL "</div></div>"
+        "<div class=box style=text-align:center>"
+        "<div id=text-center>\xd8\xb8" CONTROL_WORD_TAIL "</div></div>";
+    static const struct {
+        const char *id;
+        const char *word;
+    } cases[] = {
+        {"cross-center", "\xd8\xa8" CONTROL_WORD_TAIL},
+        {"cross-end", "\xd8\xaa" CONTROL_WORD_TAIL},
+        {"cross-mixed", "\xd8\xab" CONTROL_WORD_TAIL},
+        {"row-reverse", "\xd8\xac" CONTROL_WORD_TAIL},
+        {"column-wrap", "\xd8\xad" CONTROL_WORD_TAIL},
+        {"multicolumn", "\xd8\xae" CONTROL_WORD_TAIL},
+        {"positioned", "\xd8\xb3" CONTROL_WORD_TAIL},
+        {"cross-hebrew", "\xd7\xa9\xd7\x9c\xd7\x95\xd7\x9d"},
+        {"cross-rtl", "\xd8\xb4" CONTROL_WORD_TAIL},
+        {"cross-rtl-latin", "Plain"},
+        {"fixed", "\xd8\xb9" CONTROL_WORD_TAIL},
+        {"main-center", "\xd8\xb5" CONTROL_WORD_TAIL},
+        {"grid-center", "\xd8\xb6" CONTROL_WORD_TAIL},
+        {"auto-margin", "\xd8\xb7" CONTROL_WORD_TAIL},
+        {"text-center", "\xd8\xb8" CONTROL_WORD_TAIL},
+    };
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument layout = {0};
+    CHECK(document_parse(&document, budget, page, strlen(page), 443)
+          && stylesheet_build(&sheet, budget, &document, 480)
+          && layout_build(&layout, budget, &document, &sheet, NULL, NULL, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    int failures = 0;
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        const LayoutNodeBox *box = layout_box_for_node(
+            &layout, find_id(root, cases[c].id));
+        const DrawCommand *command = bidi_translate_text_command(
+            &layout, cases[c].word);
+        const LayoutBidiCommand *bidi = command == NULL ? NULL
+            : layout_bidi_command_for_index(
+                  &layout, (size_t) (command - layout.commands));
+        if (box == NULL || command == NULL || bidi == NULL
+            || bidi->glyph_count == 0) {
+            fprintf(stderr, "bidi translate %s: box=%d command=%d bidi=%d\n",
+                    cases[c].id, box != NULL, command != NULL, bidi != NULL);
+            failures++;
+            continue;
+        }
+        const LayoutBidiGlyph *glyphs = &layout.bidi_glyphs[bidi->glyph_start];
+        int left = INT_MAX, right = INT_MIN;
+        for (size_t g = 0; g < bidi->glyph_count; g++) {
+            if (glyphs[g].x_fixed < left) left = glyphs[g].x_fixed;
+            int end = glyphs[g].x_fixed + glyphs[g].advance_fixed;
+            if (end > right) right = end;
+        }
+        int text_x = draw_command_text_x_fixed(command);
+        bool inside = left >= box->x * 64
+                      && right <= (box->x + box->width) * 64;
+        if (left != text_x || !inside) {
+            fprintf(stderr,
+                    "bidi translate %s: box x=%d w=%d command x=%d "
+                    "glyphs %d..%d (px %d..%d)\n",
+                    cases[c].id, box->x, box->width, command->x,
+                    left, right, left / 64, right / 64);
+            failures++;
+        }
+    }
+    CHECK(failures == 0);
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == 0);
+    return 0;
+}
+
 static int test_text_run_scan_reuse(Budget *budget)
 {
     static const struct {

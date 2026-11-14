@@ -90,6 +90,7 @@ PspVoiceComponentPrimaryResult psp_voice_component_session_primary(
 {
     if (session == NULL || !session->available || session->client == NULL)
         return PSP_VOICE_COMPONENT_PRIMARY_NONE;
+    session->install_stopped = false;
     if (session->installer != NULL) {
         if (session->install_snapshot.phase
                 == TILEFINCH_UPDATE_INSTALL_COMPLETE) {
@@ -135,6 +136,17 @@ PspVoiceComponentPrimaryResult psp_voice_component_session_primary(
                         session->client_snapshot.manifest_digest,
                     .install_root = paths->install_root
                 });
+            if (session->installer != NULL) {
+                /* A new attempt owns a fresh snapshot, not the previous
+                   cancelled/failed job's terminal UI and busy state. */
+                (void) tilefinch_voice_component_install_snapshot(
+                    session->installer, &session->install_snapshot);
+            } else {
+                /* Refusal ends this automatic chain. Only an explicit
+                   retry may allocate/open again after the failure. */
+                session->auto_install = false;
+                session->install_stopped = true;
+            }
             break;
         }
         default:
@@ -173,6 +185,16 @@ bool psp_voice_component_session_pump(
                 == TILEFINCH_UPDATE_INSTALL_COMPLETE) {
             psp_voice_component_session_probe(session, paths);
             session->auto_install = false;
+            tilefinch_voice_component_install_destroy(session->installer);
+            session->installer = NULL;
+        } else if (session->install_snapshot.phase
+                       == TILEFINCH_UPDATE_INSTALL_ERROR
+                   || session->install_snapshot.phase
+                       == TILEFINCH_UPDATE_INSTALL_CANCELLED) {
+            /* The snapshot is sufficient for status and explicit retry.
+               Do not hold work buffers or open files behind a closed menu. */
+            session->auto_install = false;
+            session->install_stopped = true;
             tilefinch_voice_component_install_destroy(session->installer);
             session->installer = NULL;
         }
@@ -233,6 +255,7 @@ bool psp_voice_component_session_remove(
         session->initialized = false;
         session->available = false;
         session->auto_install = false;
+        session->install_stopped = false;
         memset(&session->client_snapshot, 0,
                sizeof(session->client_snapshot));
         memset(&session->install_snapshot, 0,
@@ -252,7 +275,9 @@ void psp_voice_component_session_refresh_ui(
                : PSP_UI_VOICE_COMPONENT_READY)
         : PSP_UI_VOICE_COMPONENT_NOT_INSTALLED;
     int progress = -1;
-    if (session->installer != NULL) {
+    if (session->install_stopped) {
+        phase = PSP_UI_VOICE_COMPONENT_ERROR;
+    } else if (session->installer != NULL) {
         if (session->install_snapshot.phase
                 == TILEFINCH_UPDATE_INSTALL_ERROR
             || session->install_snapshot.phase

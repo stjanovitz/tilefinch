@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "tilefinch/component_store.h"
 #include "tilefinch/install_paths.h"
 #include "tilefinch/sha256.h"
 #include "tilefinch/psp_boot_cache.h"
@@ -58,13 +59,6 @@ struct TilefinchUpdateInstallJob {
     char startup_source[768], startup_cache[768], startup_temporary[768];
     char message[96];
 };
-
-static bool install_path(
-    char *output, size_t size, const char *directory, const char *name)
-{
-    int length = snprintf(output, size, "%s/%s", directory, name);
-    return length > 0 && (size_t) length < size;
-}
 
 static void install_error(
     TilefinchUpdateInstallJob *job, TilefinchUpdateStatus status,
@@ -136,7 +130,8 @@ static bool remove_tree_bounded(
             break;
         }
         char child[768];
-        if (!install_path(child, sizeof(child), path, entry->d_name)) {
+        if (!tilefinch_component_store_join(
+                path, entry->d_name, child, sizeof(child))) {
             ok = false;
             break;
         }
@@ -175,7 +170,8 @@ static bool install_slot_paths(
     const char *name = slot == TILEFINCH_UPDATE_SLOT_A ? "slot-a"
         : slot == TILEFINCH_UPDATE_SLOT_B ? "slot-b" : NULL;
     if (install_root == NULL || name == NULL
-        || !install_path(target, 768, install_root, name)) return false;
+        || !tilefinch_component_store_join(install_root, name, target, 768))
+        return false;
     int length = snprintf(temporary, 768, "%s.tmp", target);
     int old_length = snprintf(old, 768, "%s.old", target);
     return length > 0 && (size_t) length < 768
@@ -214,22 +210,6 @@ static bool install_journal_unchanged(const TilefinchUpdateInstallJob *job)
         && tilefinch_update_state_encode(&on_disk, actual)
                == TILEFINCH_UPDATE_OK
         && memcmp(expected, actual, sizeof(expected)) == 0;
-}
-
-static bool install_make_parents(char *path)
-{
-    for (char *at = path; *at != '\0'; at++) {
-        if (*at != '/') continue;
-        if (at == path || (at > path && at[-1] == ':')) continue;
-        char saved = *at;
-        *at = '\0';
-        if (mkdir(path, 0777) != 0 && errno != EEXIST) {
-            *at = saved;
-            return false;
-        }
-        *at = saved;
-    }
-    return true;
 }
 
 static bool install_has_free_space(
@@ -430,10 +410,10 @@ static bool install_open_entry(TilefinchUpdateInstallJob *job)
     const TilefinchUpdatePackageEntry *entry =
         &job->package.entries[job->file_index];
     char output_path[768];
-    if (!install_path(
-            output_path, sizeof(output_path),
-            job->temporary_path, entry->path)
-        || !install_make_parents(output_path)
+    if (!tilefinch_component_store_join(
+            job->temporary_path, entry->path,
+            output_path, sizeof(output_path))
+        || !tilefinch_component_store_make_parents(output_path)
         || fseek(
                job->package_file, (long) entry->payload_offset,
                SEEK_SET) != 0
@@ -448,8 +428,8 @@ static bool install_open_entry(TilefinchUpdateInstallJob *job)
 static bool install_write_metadata(TilefinchUpdateInstallJob *job)
 {
     char path[768];
-    if (!install_path(
-            path, sizeof(path), job->temporary_path, "slot.tfum"))
+    if (!tilefinch_component_store_join(
+            job->temporary_path, "slot.tfum", path, sizeof(path)))
         return false;
     if (install_fault(job, "before-write-slot-envelope")) return false;
     FILE *file = fopen(path, "wb");
@@ -463,8 +443,8 @@ static bool install_write_metadata(TilefinchUpdateInstallJob *job)
     if (ok && install_fault(job, "after-sync-slot-envelope")) ok = false;
     if (file != NULL && fclose(file) != 0) ok = false;
     if (!ok) return false;
-    if (!install_path(
-            path, sizeof(path), job->temporary_path, "slot.tfut"))
+    if (!tilefinch_component_store_join(
+            job->temporary_path, "slot.tfut", path, sizeof(path)))
         return false;
     if (install_fault(job, "before-write-slot-table")) return false;
     file = fopen(path, "wb");
@@ -478,8 +458,8 @@ static bool install_write_metadata(TilefinchUpdateInstallJob *job)
     if (file != NULL && fclose(file) != 0) ok = false;
     if (!ok) return false;
     if (job->trust == TILEFINCH_UPDATE_TRUST_DEVELOPER_UNSIGNED) {
-        if (!install_path(
-                path, sizeof(path), job->temporary_path, "DEVELOPER")
+        if (!tilefinch_component_store_join(
+                job->temporary_path, "DEVELOPER", path, sizeof(path))
             || install_fault(job, "before-write-developer-marker")) {
             return false;
         }
@@ -496,7 +476,8 @@ static bool install_write_metadata(TilefinchUpdateInstallJob *job)
         if (file != NULL && fclose(file) != 0) ok = false;
         if (!ok) return false;
     }
-    if (!install_path(path, sizeof(path), job->temporary_path, "READY"))
+    if (!tilefinch_component_store_join(
+            job->temporary_path, "READY", path, sizeof(path)))
         return false;
     if (install_fault(job, "before-write-ready")) return false;
     file = fopen(path, "wb");
@@ -549,13 +530,17 @@ static bool install_promote(TilefinchUpdateInstallJob *job)
         if (install_fault(job, "after-write-retiring-journal")) return false;
     }
     if (install_fault(job, "before-retire-inactive-slot")) return false;
-    bool had_target = rename(job->target_path, job->old_path) == 0;
+    bool had_target = tilefinch_component_store_rename(
+        job->target_path, job->old_path);
     if (!had_target && errno != ENOENT) return false;
     if (had_target
         && install_fault(job, "after-retire-inactive-slot")) return false;
     if (install_fault(job, "before-promote-staged-slot")) return false;
-    if (rename(job->temporary_path, job->target_path) != 0) {
-        if (had_target) (void) rename(job->old_path, job->target_path);
+    if (!tilefinch_component_store_rename(
+            job->temporary_path, job->target_path)) {
+        if (had_target)
+            (void) tilefinch_component_store_rename(
+                job->old_path, job->target_path);
         return false;
     }
     if (install_fault(job, "after-promote-staged-slot")) return false;
@@ -735,8 +720,9 @@ bool tilefinch_update_install_pump(
         if (job->prepare_startup) {
             if (!job->startup_begun) {
                 job->startup_begun = true;
-                if (install_path(job->startup_source, sizeof(job->startup_source),
-                                 job->target_path, "EBOOT.PBP")
+                if (tilefinch_component_store_join(
+                        job->target_path, "EBOOT.PBP", job->startup_source,
+                        sizeof(job->startup_source))
                     && psp_boot_cache_paths(job->data_dir, job->startup_cache,
                                             job->startup_temporary,
                                             sizeof(job->startup_cache))

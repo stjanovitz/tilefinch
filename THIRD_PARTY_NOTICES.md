@@ -18,16 +18,12 @@ runtime assets or immutable engine data.
   equivalent internal element dispatch; original entity values and public
   interface functions are preserved.
 - **Bellard QuickJS**, commit `04be246001599f5995fa2f2d8c91a0f198d3f34c`
-  (upstream VERSION 2026-06-04): MIT License. This is the backend used by
-  every checked-in preset, including the PSP build. The engine is vendored
+  (upstream VERSION 2026-06-04): MIT License. It is the only JavaScript
+  engine, in every build including the PSP build. The engine is vendored
   under `third_party/quickjs` with the repository's bounded-lifetime and
   responsiveness changes applied (listed in `third_party/quickjs/README.md`;
   the original patch files under `patches/` are retained as history). The
   vendored tree contains upstream's complete `LICENSE` file.
-- **QuickJS-NG 0.15.0**, commit `433941b99fb3c5e7f98b7ebd78727972bcf467ee`:
-  MIT License (per upstream). Selectable via
-  `PSP_BROWSER_USE_BELLARD_QUICKJS=OFF`; no checked-in preset uses it, so it
-  is not part of release binaries.
 - **stb**, commit `31c1ad37456438565541f4919958214b6e762fb4`: dual
   public-domain / MIT single-file libraries. The build uses `stb_truetype.h`
   v1.26 and `stb_image.h`, both with budget-allocation hooks. Shipping the
@@ -60,7 +56,9 @@ runtime assets or immutable engine data.
   `docs/FTL.TXT`.
   Local patches route WOFF2 allocation and cancellation through the browser,
   compact tables not consumed by its outline backend, and make partial
-  variation initialization and retries safe after allocation refusal.
+  variation initialization and retries safe after allocation refusal. The
+  outline-only backend omits embedded bitmap image decoding while preserving
+  strike metadata and sizing behavior.
 - **Public Suffix List** snapshot `f540a06159213b6e8ed9c87d2dd3a52373637e92`:
   MPL-2.0 data encoded as a checked-in DAFSA. The fixed-set decoder in
   `src/public_suffix.c` was adapted from libpsl/Chromium under its

@@ -24,11 +24,12 @@ static unsigned case_ordinal;
     }                                                                        \
 } while (0)
 
-enum { INSTALL_ADMISSIONS = 42, PUBLISH_ADMISSIONS = 11 };
+enum { INSTALL_ADMISSIONS = 58, PUBLISH_ADMISSIONS = 14 };
 static const char *const constructor_names[] = {
     "AudioParam", "AudioNode", "GainNode", "StereoPannerNode",
     "OscillatorNode", "AudioBufferSourceNode", "AudioDestinationNode",
-    "AudioBuffer", "BaseAudioContext", "AudioContext", "webkitAudioContext"
+    "AudioBuffer", "BaseAudioContext", "AudioContext", "webkitAudioContext",
+    "BiquadFilterNode", "MediaStreamAudioSourceNode", "AnalyserNode"
 };
 
 typedef struct {
@@ -280,7 +281,7 @@ int main(void)
     allocation_trial(2); /* Destination AudioSlotNodeRef, after context ownership. */
     clear_faults();
     script_runtime_configure_deterministic_replay(false, 0);
-    puts("game audio slots faults: 42 install + 11 publication + 2 allocation refusals; "
+    puts("game audio slots faults: 48 install + 12 publication + 2 allocation refusals; "
          "rollback, fresh retries and zero Budget ownership passed");
     return 0;
 }

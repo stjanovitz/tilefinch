@@ -213,48 +213,10 @@ static bool navigation_css_mentions(const char *css, size_t length,
     return false;
 }
 
-/* Whether a constructed sheet's parse contributes nothing to the sheet but
-   its own rules (with their custom-property, transition and revert
-   records) and the keyframes summary, so that removing those rules, or
-   parsing them again at another position, leaves the sheet a build of the
-   new tier would produce. Read from the text, conservatively: any at-rule
-   but @media, @supports and @keyframes refuses (@layer and @font-face
-   order sheet-wide tables by first appearance, @property registers,
-   @container adds query scopes), as do :root rules (they set the
-   sheet-wide variable table, last one wins) and right-to-left or override
-   text (the sheet's bidi summary is never cleared). */
+/* stylesheet_constructed_text_plain, of the sheet's current text. */
 static bool navigation_adopted_sheet_plain(lxb_dom_node_t *node)
 {
-    size_t length = 0;
-    const char *css = document_cssom_sheet_text(node, &length);
-    if (css == NULL) {
-        lxb_dom_node_t *child = node->first_child;
-        /* The builders parse a multi-child sheet as a <style> element. */
-        if (child != NULL && child->next != NULL) return false;
-        css = child == NULL ? NULL : document_text_data(child, &length);
-    }
-    if (css == NULL || length == 0) return true;
-    static const char *const allowed[] = {
-        "media", "supports", "keyframes", "-webkit-keyframes"
-    };
-    for (size_t i = 0; i < length; i++) {
-        if (css[i] != '@') continue;
-        size_t end = i + 1;
-        while (end < length && (isalnum((unsigned char) css[end])
-                                || css[end] == '-' || css[end] == '_'))
-            end++;
-        size_t name_length = end - i - 1;
-        bool known = false;
-        for (size_t a = 0; !known && a < sizeof(allowed) / sizeof(allowed[0]);
-             a++)
-            known = strlen(allowed[a]) == name_length
-                && strncasecmp(css + i + 1, allowed[a], name_length) == 0;
-        if (!known) return false;
-        i = end - 1;
-    }
-    return !navigation_css_mentions(css, length, ":root")
-        && !navigation_css_mentions(css, length, "rtl")
-        && !navigation_css_mentions(css, length, "override");
+    return stylesheet_constructed_sheet_plain(node);
 }
 
 /* Whether a constructed sheet's text mentions `word` (ASCII case
@@ -321,13 +283,44 @@ static void navigation_style_image_scope_add_source(
     if (count == SIZE_MAX) scope->whole_document = true;
 }
 
+/* getComputedStyle keeps resolved styles across reads (js_computed_style.c):
+   an in-place sheet change drops those it can reach, by the scope the
+   layout reuse cache's styles follow (the hosts the changed rules reach,
+   the hosts of the roots whose adoption moved: navigation_invalidate_
+   rescoped_roots); `everything` or too many subtrees, all of them. A new
+   sheet generation (rules appended or removed) empties them regardless. */
+#define NAVIGATION_COMPUTED_STYLE_SCOPE_LIMIT 16u
+static void navigation_drop_computed_styles(
+    NavigationSession *session, const NavigationStyleImageScope *scope,
+    const lxb_dom_node_t *const *rescoped, size_t rescoped_count,
+    bool everything)
+{
+    if (session->page.runtime == NULL) return;
+    lxb_dom_node_t *roots[NAVIGATION_COMPUTED_STYLE_SCOPE_LIMIT];
+    size_t count = 0;
+    bool whole = everything || (scope != NULL && scope->whole_document);
+    for (size_t i = 0; !whole && scope != NULL && i < scope->count; i++) {
+        if (count == NAVIGATION_COMPUTED_STYLE_SCOPE_LIMIT) whole = true;
+        else roots[count++] = scope->hosts[i];
+    }
+    for (size_t i = 0; !whole && i < rescoped_count; i++) {
+        if (count == NAVIGATION_COMPUTED_STYLE_SCOPE_LIMIT) whole = true;
+        else roots[count++] = (lxb_dom_node_t *) (rescoped[i]->parent != NULL
+            ? rescoped[i]->parent : rescoped[i]);
+    }
+    script_runtime_drop_computed_styles_within(
+        session->page.runtime, whole ? NULL : roots, whole ? 0 : count);
+}
+
 /* The held adopted sources (the sheet's adopted tail) that must leave the
    sheet before the tier can be appended in place: those the tier no longer
-   holds, and those it reordered, chosen as the fewest whose removal leaves
-   the rest in tier order (the complement of a longest increasing run of
-   tier positions). The reordered ones are parsed again at their new
-   position by the caller, from the parsed form the document caches. NULL
-   when that is possible (count 0: nothing to remove), else the refusal. */
+   holds, those whose text was replaced since they were parsed
+   (replaceSync), and those it reordered, chosen as the fewest whose removal
+   leaves the rest in tier order (the complement of a longest increasing
+   run of tier positions). The reordered and replaced ones are parsed again
+   at their position by the caller, a reordered one from the parsed form
+   the document caches. NULL when that is possible (count 0: nothing to
+   remove), else the refusal. */
 static const char *navigation_plan_adopted_removal(
     NavigationSession *session, lxb_dom_node_t *const *tier,
     const uint32_t *tier_revisions, size_t tier_count,
@@ -341,7 +334,8 @@ static const char *navigation_plan_adopted_removal(
         return "adopted bound";
     size_t base = sheet->style_source_count - held;
     int position[DOCUMENT_ADOPTED_TIER_LIMIT];
-    bool in_order = true;
+    bool replaced[DOCUMENT_ADOPTED_TIER_LIMIT] = {false};
+    bool in_order = true, any_replaced = false;
     int last = -1;
     for (size_t k = 0; k < held; k++) {
         position[k] = -1;
@@ -353,17 +347,25 @@ static const char *navigation_plan_adopted_removal(
         }
         if (position[k] <= last) in_order = false;
         else last = position[k];
+        /* Revision 0 is unknown: the signature below then refuses. */
+        uint32_t parsed = sheet->style_source_revisions[base + k];
+        replaced[k] = position[k] >= 0 && parsed != 0
+            && parsed != tier_revisions[position[k]];
+        any_replaced = any_replaced || replaced[k];
     }
-    /* In order and all present: the ordinary insertion below applies. */
-    if (in_order) return NULL;
-    /* Every held source must still be the text the sheet parsed: removing
-       the others cannot repair one that changed in place. */
+    /* In order, all present and unchanged: the ordinary insertion below
+       applies. */
+    if (in_order && !any_replaced) return NULL;
+    /* Every held source's rules must be those of the text revision the
+       sheet records for it (the parsed fold proves it): only then can its
+       rules be taken out, or one replaced in place be told from the rest. */
     uint64_t signature = 0;
     for (size_t k = 0; k < held; k++) {
         lxb_dom_node_t *node =
             (lxb_dom_node_t *) sheet->style_source_nodes[base + k];
-        uint32_t revision = 0;
-        if (position[k] >= 0) revision = tier_revisions[position[k]];
+        uint32_t revision = sheet->style_source_revisions[base + k];
+        if (revision != 0) {
+        } else if (position[k] >= 0) revision = tier_revisions[position[k]];
         else if (!document_constructed_sheet_revision(
                      &session->page.document, node, &revision))
             return "adopted changed";
@@ -377,7 +379,7 @@ static const char *navigation_plan_adopted_removal(
     for (size_t k = 0; k < held; k++) {
         length[k] = 0;
         previous[k] = -1;
-        if (position[k] < 0) continue;
+        if (position[k] < 0 || replaced[k]) continue;
         length[k] = 1;
         for (size_t j = 0; j < k; j++) {
             if (position[j] >= 0 && position[j] < position[k]
@@ -395,8 +397,11 @@ static const char *navigation_plan_adopted_removal(
         if (keep[k]) continue;
         lxb_dom_node_t *node =
             (lxb_dom_node_t *) sheet->style_source_nodes[base + k];
-        if (!navigation_adopted_sheet_plain(node)) return "adopted order";
-        if (document_constructed_sheet_keyframes(
+        /* A replaced text's rules came from the text it held then. */
+        if (replaced[k] ? !sheet->style_source_plain[base + k]
+                        : !navigation_adopted_sheet_plain(node))
+            return "adopted order";
+        if (replaced[k] || document_constructed_sheet_keyframes(
                 &session->page.document, node) != 0)
             keyframes_removed = true;
         removed[(*removed_count)++] = node;
@@ -412,6 +417,22 @@ static const char *navigation_plan_adopted_removal(
         }
     }
     return NULL;
+}
+
+/* Whether held source `node`'s text changed since the sheet parsed it. */
+static bool navigation_adopted_text_replaced(NavigationSession *session,
+                                             const lxb_dom_node_t *node)
+{
+    const Stylesheet *sheet = &session->page.stylesheet;
+    for (size_t i = 0; i < sheet->style_source_count; i++) {
+        if (sheet->style_source_nodes[i] != node) continue;
+        uint32_t revision = 0;
+        return sheet->style_source_revisions[i] == 0
+            || !document_constructed_sheet_revision(
+                   &session->page.document, node, &revision)
+            || revision != sheet->style_source_revisions[i];
+    }
+    return false;
 }
 
 /* Takes the planned sources and their rules out of the page sheet, tells
@@ -460,11 +481,14 @@ static bool navigation_remove_adopted_sources(
 
 /* `images_rebuilt`: this relayout re-derives the whole image table anyway,
    so image elements the journal cannot account for are not a reason to
-   refuse. */
+   refuse. `for_read`: a script read is installing the change ahead of the
+   relayout (navigation_settle_read_sheets), which takes only sources that
+   need no fetch and dispatch no event: <style> and constructed sheets. A
+   <link> sheet still loading is not one a read sees either. */
 static bool navigation_try_append_style_sources(
     NavigationSession *session, const ScriptMutationJournal *mutations,
     bool images_rebuilt, bool *images_affected,
-    NavigationStyleImageScope *image_scope)
+    NavigationStyleImageScope *image_scope, bool for_read)
 {
     /* Document candidates (inserted <style>/<link>) stay few; a component
        framework adopts many new constructed sheets at once (archive.org
@@ -502,6 +526,9 @@ static bool navigation_try_append_style_sources(
         lxb_dom_node_t *node = record->node;
         if (record->kind == SCRIPT_MUTATION_HEAD_SCRIPT
             || record->kind == SCRIPT_MUTATION_CANVAS) continue;
+        /* A read already installed this change, and nothing has written
+           here since (a freed node is looked at again below). */
+        if (record->sheet_settled && node != NULL) continue;
         if (node == NULL) {
             /* Freed since. A freed source bounded the sheet's sources out
                (navigation_retire_subtree); what it left must not be one. */
@@ -536,6 +563,7 @@ static bool navigation_try_append_style_sources(
             continue;
         }
         if (node_name_is(node, "link")) {
+            if (for_read) return navigation_style_append_refused("read link");
             /* A link whose sheet is applied cannot change or leave without
                taking its rules along. Any other link holds no rule. */
             if (stylesheet_style_source_known(sheet, node)
@@ -576,6 +604,10 @@ static bool navigation_try_append_style_sources(
         default:
             return navigation_style_append_refused("record kind");
         }
+    }
+    for (size_t k = 0; for_read && k < count; k++) {
+        if (!node_name_is(candidates[k], "style"))
+            return navigation_style_append_refused("read link");
     }
     const char *document_url = navigation_page_document_url(session);
     bool fetch_links = session->external_resources_enabled
@@ -636,10 +668,16 @@ static bool navigation_try_append_style_sources(
     if (removal_refused != NULL)
         return navigation_style_append_refused(removal_refused);
     bool removal_discovery = false;
-    /* The scope table still numbers the held sources as before removal. */
-    for (size_t r = 0; r < removed_count; r++)
-        navigation_style_image_scope_add_source(image_scope, sheet,
-                                                removed[r]);
+    /* The scope table still numbers the held sources as before removal. A
+       replaced text may have held keyframes an element outside names:
+       its old rules reach the whole document. */
+    for (size_t r = 0; r < removed_count; r++) {
+        if (navigation_adopted_text_replaced(session, removed[r]))
+            image_scope->whole_document = true;
+        else
+            navigation_style_image_scope_add_source(image_scope, sheet,
+                                                    removed[r]);
+    }
     if (removed_count != 0
         && !navigation_remove_adopted_sources(
                session, removed, removed_count, &removal_discovery)) {
@@ -822,6 +860,8 @@ static bool navigation_try_append_style_sources(
     for (size_t k = 0; k < discovered_count; k++)
         navigation_style_image_scope_add_source(image_scope, sheet,
                                                 discovered[k]);
+    navigation_drop_computed_styles(session, image_scope, rescoped,
+                                    rescoped_count, rescoped_everything);
     if (session->page.layout_reuse != NULL) {
         /* The notes above kept every computed style: drop those the
            changed rules can reach. */
@@ -854,6 +894,96 @@ static bool navigation_try_append_style_sources(
     return true;
 }
 
+_Static_assert(NAVIGATION_READ_SHEET_HOST_LIMIT
+                   == NAVIGATION_STYLE_IMAGE_HOST_LIMIT,
+               "a read-time scope holds what an append's scope holds");
+
+/* Adds `hosts` (or the whole document) to the scope an image pass walks. */
+static void navigation_style_image_scope_merge(
+    NavigationStyleImageScope *scope, bool whole_document,
+    lxb_dom_node_t *const *hosts, size_t host_count)
+{
+    if (scope->whole_document) return;
+    if (whole_document) {
+        scope->whole_document = true;
+        return;
+    }
+    for (size_t h = 0; h < host_count; h++) {
+        bool known = false;
+        for (size_t at = 0; !known && at < scope->count; at++)
+            known = scope->hosts[at] == hosts[h];
+        if (known) continue;
+        if (scope->count == NAVIGATION_STYLE_IMAGE_HOST_LIMIT) {
+            scope->whole_document = true;
+            return;
+        }
+        scope->hosts[scope->count++] = hosts[h];
+    }
+}
+
+/* The sheet-settle callback (script_runtime_set_sheet_settle_callback): a
+   script read in the turn that changed a sheet installs the change the way
+   the relayout would, by the in-place append, so the read resolves against
+   it. The relayout then finds the sheet settled (the runtime clears the
+   journal's stylesheet cause) and runs the image pass the append asked for
+   (read_sheet_settle). Refused (a change only a rebuild can apply, a
+   <link>), the read answers from the installed cascade as before and the
+   relayout applies the change. An append that failed part way leaves the
+   sheet for the relayout's rebuild. */
+static bool navigation_settle_read_sheets(void *opaque)
+{
+    NavigationSession *session = opaque;
+    if (session == NULL || !session->page.loaded
+        || session->page.runtime == NULL || session->style_rebuild_required)
+        return false;
+    const ScriptMutationJournal *journal =
+        script_runtime_pending_journal(session->page.runtime);
+    if (journal == NULL || !journal->stylesheet_rebuild_required
+        || !journal->resource_rebuild_required || journal->overflowed
+        || journal->retirement_unobserved) return false;
+#ifndef TILEFINCH_NO_TRACE
+    if (getenv("TILEFINCH_DISABLE_STYLE_APPEND") != NULL) return false;
+#endif
+    size_t fallbacks = session->performance.mutation_style_append_fallbacks;
+    bool images = false;
+    NavigationStyleImageScope scope = {.whole_document = true};
+    /* Detached-image jobs borrow this cascade, as at relayout: requeue them
+       before the append changes it. */
+    script_runtime_pause_image_preloads(session->page.runtime);
+    for (size_t i = 0; i < session->page.frame_count; i++)
+        script_runtime_pause_image_preloads(session->page.frames[i].runtime);
+    if (!navigation_try_append_style_sources(session, journal,
+            journal->image_rebuild_required, &images, &scope, true)) {
+        if (session->performance.mutation_style_append_fallbacks != fallbacks)
+            session->style_rebuild_required = true;
+        return false;
+    }
+    NavigationPage *page = &session->page;
+    if (images) {
+        NavigationStyleImageScope owed = {
+            .whole_document = !page->read_sheet_settle.images
+                ? false : page->read_sheet_settle.whole_document,
+            .count = 0
+        };
+        if (page->read_sheet_settle.images && !owed.whole_document)
+            navigation_style_image_scope_merge(&owed, false,
+                page->read_sheet_settle.hosts,
+                page->read_sheet_settle.host_count);
+        navigation_style_image_scope_merge(&owed, scope.whole_document,
+                                           scope.hosts, scope.count);
+        page->read_sheet_settle.images = true;
+        page->read_sheet_settle.whole_document = owed.whole_document;
+        page->read_sheet_settle.host_count =
+            owed.whole_document ? 0 : (uint8_t) owed.count;
+        if (!owed.whole_document)
+            memcpy(page->read_sheet_settle.hosts, owed.hosts,
+                   owed.count * sizeof(owed.hosts[0]));
+    }
+    page->read_sheet_settle.pending = true;
+    session->performance.mutation_style_read_appends++;
+    return true;
+}
+
 static bool navigation_rescope_unchanged_sources(NavigationSession *session)
 {
     Stylesheet *sheet = &session->page.stylesheet;
@@ -875,7 +1005,12 @@ static bool navigation_rescope_unchanged_sources(NavigationSession *session)
     const lxb_dom_node_t *changed[DOCUMENT_ADOPTION_ROOT_LIMIT];
     size_t changed_count = 0;
     if (!stylesheet_set_adopted_scopes(sheet, &session->page.document,
-            changed, DOCUMENT_ADOPTION_ROOT_LIMIT, &changed_count, &global)) return false;
+            changed, DOCUMENT_ADOPTION_ROOT_LIMIT, &changed_count, &global)) {
+        navigation_drop_computed_styles(session, NULL, NULL, 0, true);
+        return false;
+    }
+    navigation_drop_computed_styles(session, NULL, changed, changed_count,
+                                    global);
     if (global) {
         layout_reuse_cache_reset(session->page.layout_reuse);
     } else {

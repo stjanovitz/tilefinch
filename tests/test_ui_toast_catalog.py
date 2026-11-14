@@ -96,7 +96,10 @@ STATUS_RETURNS = ("psp_offline_store_route_cancel_status",
                   "psp_ui_action_acknowledgement",
                   # The failed-video panel's headline and details line for
                   # a failure psp_media_raise_error recognises.
-                  "media_failure_headline", "media_failure_detail_text")
+                  "media_failure_headline", "media_failure_detail_text",
+                  # A failed load's headline and next step, composed as
+                  # two lines of its toast and failure page.
+                  "psp_ui_failure_headline", "psp_ui_failure_next_step")
 
 # An installer job's message: a font-pack install started from the page's
 # language-pack offer shows it as a toast when the install fails or is
@@ -419,6 +422,13 @@ def shipped_toasts():
     return found
 
 
+# Keys of the active catalog the browser no longer looks up. A published
+# catalog is immutable (translations/README.md), so they stay until the next
+# catalog version lists them in generate_ui_translations.RETIRED_KEYS and
+# drops them; then remove them here.
+AWAITING_RETIREMENT = set()
+
+
 def active_catalog():
     version, languages = generate_ui_translations.CATALOGS[-1]
     return {row[0].lower(): row
@@ -459,7 +469,7 @@ class UiToastCatalogTests(unittest.TestCase):
         catalog = active_catalog()
         unused = sorted(catalog[key][0]
                         for key in set(catalog) - referenced_keys(catalog))
-        self.assertEqual([], unused)
+        self.assertEqual(sorted(AWAITING_RETIREMENT), unused)
 
     def test_helper_routed_toasts_are_seen(self):
         # Statuses that reach ui->status through a helper, a returned

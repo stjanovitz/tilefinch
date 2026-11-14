@@ -9,6 +9,7 @@
 
 #include <stdarg.h>
 #include <lexbor/core/mraw.h>
+#include <lexbor/dom/interfaces/character_data.h>
 #include <lexbor/dom/interfaces/document_fragment.h>
 
 static bool test_cache_put_stylesheet(BrowserSession *session,
@@ -1095,6 +1096,263 @@ static bool test_parser_releases_large_token_storage(Budget *budget)
     document_parser_abort(&inert);
     document_destroy(&windowed);
     document_destroy(&whole);
+    free(html);
+    return ok;
+}
+
+/* A <script> or <style> body of at least 64 KiB is handed from the
+   tokenizer buffer to its text node instead of being copied
+   (document_parser_adopt_raw_text). The parsed text is byte for byte what
+   Lexbor's copying insertion makes (CR LF folding, NUL replacement and the
+   escaped script states included) and NUL-terminated; it can be edited,
+   replaced and freed like any text; and the DOM peak drops by about the
+   script body. Under an allocation refusal at any point the parse either
+   ends with the same document or fails cleanly, with nothing leaked. */
+static char *test_raw_text_page(size_t rules, size_t lines, size_t *length)
+{
+    static const char head[] = "<!doctype html><head><style id=sheet>";
+    static const char rule[] = ".r{color:red}\r\n";
+    static const char middle[] =
+        "</style></head><body><p id=before>before</p><script id=bundle>"
+        "var s = '<!-- x';\r\n";
+    static const char line[] = "var x = 1;\r\n";
+    static const char nul_line[] = "var n = '\0';\n";
+    static const char tail[] =
+        "--></script><script id=small>var t = 1;</script>"
+        "<p id=after>after</p></body>";
+    size_t total = sizeof(head) - 1u + rules * (sizeof(rule) - 1u)
+        + sizeof(middle) - 1u + lines * (sizeof(line) - 1u)
+        + sizeof(nul_line) - 1u + sizeof(tail) - 1u;
+    char *html = malloc(total);
+    if (html == NULL) return NULL;
+    char *at = html;
+#define TEST_RAW_TEXT_PUT(text, size) \
+    do { memcpy(at, (text), (size)); at += (size); } while (0)
+    TEST_RAW_TEXT_PUT(head, sizeof(head) - 1u);
+    for (size_t i = 0; i < rules; i++)
+        TEST_RAW_TEXT_PUT(rule, sizeof(rule) - 1u);
+    TEST_RAW_TEXT_PUT(middle, sizeof(middle) - 1u);
+    for (size_t i = 0; i < lines; i++) {
+        TEST_RAW_TEXT_PUT(line, sizeof(line) - 1u);
+        if (i == lines / 2u)
+            TEST_RAW_TEXT_PUT(nul_line, sizeof(nul_line) - 1u);
+    }
+    TEST_RAW_TEXT_PUT(tail, sizeof(tail) - 1u);
+#undef TEST_RAW_TEXT_PUT
+    *length = total;
+    return html;
+}
+
+typedef struct {
+    bool parsed;
+    size_t dom_peak;
+    size_t adoptions;
+    char *sheet;
+    size_t sheet_length;
+    char *bundle;
+    size_t bundle_length;
+    bool terminated;
+    bool edited;
+} TestRawTextParse;
+
+static char *test_raw_text_copy(lxb_dom_node_t *element, size_t *length,
+                                bool *terminated)
+{
+    *length = 0;
+    if (element == NULL || element->first_child == NULL
+        || element->first_child != element->last_child) return NULL;
+    const char *text = document_text_data(element->first_child, length);
+    if (text == NULL) return NULL;
+    if (text[*length] != '\0') *terminated = false;
+    char *copy = malloc(*length + 1u);
+    if (copy != NULL) memcpy(copy, text, *length + 1u);
+    return copy;
+}
+
+/* Parses the page in 32 KiB windows into a fresh Budget, with the hand-over
+   refused when `refuse` is set, and refuses every allocation after the
+   `fail_after`th when it is not SIZE_MAX. Returns false on a leak. */
+static bool test_raw_text_parse(Budget *main_budget, const char *html,
+                                size_t length, bool refuse,
+                                size_t fail_after, TestRawTextParse *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->terminated = true;
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    budget_install_lexbor(&budget);
+    tilefinch_test_faults()->raw_text_adoptions = 0;
+    tilefinch_test_faults()->refuse_raw_text_adoption = refuse;
+    if (fail_after != SIZE_MAX) budget_inject_failure_after(&budget, fail_after);
+    DocumentParser parser = {0};
+    PocDocument document = {0};
+    bool ok = document_parser_begin(&parser, &budget)
+        && document_parser_set_scripting(&parser, true)
+        && document_parser_set_inert_script_policy(
+               &parser, false, 256u * 1024u, 4u * 1024u * 1024u);
+    for (size_t fed = 0; ok && fed < length;) {
+        size_t chunk = length - fed < PARSER_STORAGE_FEED
+            ? length - fed : PARSER_STORAGE_FEED;
+        ok = document_parser_feed(&parser, html + fed, chunk);
+        fed += chunk;
+    }
+    ok = ok && document_parser_finish(&parser, &document);
+    budget_clear_failure_injection(&budget);
+    out->parsed = ok;
+    out->adoptions = tilefinch_test_faults()->raw_text_adoptions;
+    tilefinch_test_faults()->refuse_raw_text_adoption = false;
+    out->dom_peak = budget.categories[BUDGET_CATEGORY_DOM].peak;
+    lxb_dom_node_t *root = ok ? lxb_dom_interface_node(document.html) : NULL;
+    lxb_dom_node_t *sheet = root == NULL ? NULL : find_id(root, "sheet");
+    lxb_dom_node_t *bundle = root == NULL ? NULL : find_id(root, "bundle");
+    out->sheet = test_raw_text_copy(sheet, &out->sheet_length,
+                                    &out->terminated);
+    out->bundle = test_raw_text_copy(bundle, &out->bundle_length,
+                                     &out->terminated);
+    if (ok && sheet != NULL && bundle != NULL) {
+        /* Grow the adopted sheet text (Lexbor's replace sets the whole
+           data, reallocating it in the arena), then replace the script's
+           adopted text and parse more markup into the arena. */
+        lxb_dom_character_data_t *data =
+            lxb_dom_interface_character_data(sheet->first_child);
+        size_t before = data->data.length;
+        static const char extra[] = ".z{}";
+        static const char script[] = "var replaced = 1;";
+        static const char markup[] = "<p id=fresh>fresh text</p>";
+        lxb_dom_node_t *after = find_id(root, "after");
+        lxb_char_t *grown = malloc(before + sizeof(extra));
+        if (grown != NULL) {
+            memcpy(grown, data->data.data, before);
+            memcpy(grown + before, extra, sizeof(extra));
+        }
+        out->edited = grown != NULL
+            && lxb_dom_character_data_replace(
+                   data, grown, before + sizeof(extra) - 1u, 0, 0)
+                   == LXB_STATUS_OK
+            && data->data.length == before + sizeof(extra) - 1u
+            && memcmp(data->data.data, grown, before + sizeof(extra)) == 0
+            && document_set_element_inner_html(
+                   &document, bundle, script, sizeof(script) - 1u)
+            && bundle->first_child != NULL
+            && after != NULL
+            && document_set_element_inner_html(
+                   &document, after, markup, sizeof(markup) - 1u)
+            && find_id(root, "fresh") != NULL;
+        size_t replaced_length = 0;
+        const char *replaced = bundle->first_child == NULL ? NULL
+            : document_text_data(bundle->first_child, &replaced_length);
+        free(grown);
+        out->edited = out->edited && replaced != NULL
+            && replaced_length == sizeof(script) - 1u
+            && memcmp(replaced, script, sizeof(script)) == 0;
+    }
+    document_parser_abort(&parser);
+    document_destroy(&document);
+    budget_install_lexbor(main_budget);
+    if (budget.current != 0)
+        fprintf(stderr, "raw text parse leaked %zu bytes (refuse=%d "
+                "fail-after=%zu)\n", budget.current, refuse, fail_after);
+    return budget.current == 0;
+}
+
+static void test_raw_text_parse_free(TestRawTextParse *parse)
+{
+    free(parse->sheet);
+    free(parse->bundle);
+    memset(parse, 0, sizeof(*parse));
+}
+
+static bool test_parser_hands_over_large_raw_text(Budget *main_budget)
+{
+    size_t length = 0;
+    char *html = test_raw_text_page(PARSER_STORAGE_STYLE_RULES,
+                                    PARSER_STORAGE_SCRIPT_LINES, &length);
+    if (html == NULL) return false;
+    TestRawTextParse copied, adopted;
+    bool ok = test_raw_text_parse(main_budget, html, length, true, SIZE_MAX,
+                                  &copied)
+        && test_raw_text_parse(main_budget, html, length, false, SIZE_MAX,
+                               &adopted);
+    const size_t script_bytes = copied.bundle_length;
+    ok = ok && copied.parsed && adopted.parsed
+        && copied.adoptions == 0 && adopted.adoptions == 2
+        && copied.sheet != NULL && adopted.sheet != NULL
+        && copied.bundle != NULL && adopted.bundle != NULL
+        && copied.sheet_length == adopted.sheet_length
+        && copied.bundle_length == adopted.bundle_length
+        && memcmp(copied.sheet, adopted.sheet, copied.sheet_length) == 0
+        && memcmp(copied.bundle, adopted.bundle, copied.bundle_length) == 0
+        /* CR LF folded, the NUL replaced, the escape kept. */
+        && copied.sheet_length
+               == (sizeof(".r{color:red}\n") - 1u) * PARSER_STORAGE_STYLE_RULES
+        && memchr(copied.bundle, '\r', copied.bundle_length) == NULL
+        && memchr(copied.bundle, '\0', copied.bundle_length) == NULL
+        && strstr(copied.bundle, "<!-- x") != NULL
+        && copied.terminated && adopted.terminated
+        && copied.edited && adopted.edited
+        && adopted.dom_peak + script_bytes * 3u / 4u < copied.dom_peak;
+    if (!ok) {
+        fprintf(stderr,
+                "raw text hand-over parsed=%d/%d adoptions=%zu/%zu "
+                "sheet=%zu/%zu bundle=%zu/%zu terminated=%d/%d "
+                "edited=%d/%d dom-peak=%zu/%zu\n",
+                copied.parsed, adopted.parsed, copied.adoptions,
+                adopted.adoptions, copied.sheet_length,
+                adopted.sheet_length, copied.bundle_length,
+                adopted.bundle_length, copied.terminated,
+                adopted.terminated, copied.edited, adopted.edited,
+                copied.dom_peak, adopted.dom_peak);
+    }
+    test_raw_text_parse_free(&adopted);
+    free(html);
+
+    /* Allocation sweep over a page whose two bodies just exceed the
+       hand-over size: every refusal point either completes with the
+       copying parse's text or fails without a leak. */
+    TestRawTextParse small_reference;
+    html = ok ? test_raw_text_page(5000, 6500, &length) : NULL;
+    ok = html != NULL
+        && test_raw_text_parse(main_budget, html, length, true, SIZE_MAX,
+                               &small_reference)
+        && small_reference.parsed
+        && small_reference.sheet_length >= 64u * 1024u
+        && small_reference.bundle_length >= 64u * 1024u;
+    size_t completed = 0, failed = 0;
+    for (size_t countdown = 0; ok; countdown++) {
+        TestRawTextParse swept;
+        if (!test_raw_text_parse(main_budget, html, length, false, countdown,
+                                 &swept)) {
+            ok = false;
+        } else if (swept.parsed) {
+            completed++;
+            ok = swept.sheet != NULL && swept.bundle != NULL
+                && swept.terminated
+                && swept.sheet_length == small_reference.sheet_length
+                && swept.bundle_length == small_reference.bundle_length
+                && memcmp(swept.sheet, small_reference.sheet,
+                          swept.sheet_length) == 0
+                && memcmp(swept.bundle, small_reference.bundle,
+                          swept.bundle_length) == 0;
+            if (!ok)
+                fprintf(stderr, "raw text sweep countdown=%zu parsed a "
+                        "different document\n", countdown);
+            /* Past the parse's last allocation every countdown completes
+               with both hand-overs made. */
+            bool done = swept.adoptions == 2 && swept.edited;
+            test_raw_text_parse_free(&swept);
+            if (done) break;
+        } else {
+            failed++;
+        }
+        test_raw_text_parse_free(&swept);
+        if (countdown > 4096u) ok = false;
+    }
+    ok = ok && failed != 0 && completed != 0;
+    if (!ok)
+        fprintf(stderr, "raw text sweep completed=%zu failed=%zu\n",
+                completed, failed);
+    test_raw_text_parse_free(&small_reference);
+    test_raw_text_parse_free(&copied);
     free(html);
     return ok;
 }
@@ -6637,25 +6895,29 @@ static bool test_constructed_sheet_shared_by_roots(Budget *budget)
 static bool test_constructed_sheet_full_root_table(Budget *budget)
 {
     size_t baseline = budget->current;
-    /* The bridge admits one shared shadow root per 80 KiB of page limit
-       (DOM_BRIDGE_SHARED_SHADOW_ROOT_BUDGET_BYTES). */
+    /* The bridge admits roots while memory allows (16 KiB a root beside
+       the 3 MiB presentation reserve, js_runtime_internal.h): give it
+       room for the whole table. */
     size_t limit = budget->limit;
-    size_t admitting = (size_t) DOCUMENT_ADOPTION_ROOT_LIMIT * 80u * 1024u;
+    size_t admitting = (size_t) DOCUMENT_ADOPTION_ROOT_LIMIT * 64u * 1024u;
     if (budget->limit < admitting) budget->limit = admitting;
     static NavigationSession navigation;
     bool ok = constructed_sheet_open(&navigation, budget,
         "<span class=part>LIGHTPART</span><span class=doc>DOCTEXT</span>");
     char script[1024];
+    /* Every root holds a few DOM handles (host, carrier, content), so the
+       middle roots carry text only: the whole table fits the strict
+       profile's handle table. */
     snprintf(script, sizeof(script),
         "(()=>{const doc=new CSSStyleSheet(),part=new CSSStyleSheet();"
         "doc.replaceSync('.doc{color:#00ff00}');"
         "part.replaceSync(':host{color:#ff0000}.part{color:#0000ff}');"
-        "document.adoptedStyleSheets=[doc];"
-        "for(let i=0;i<%u;i++){const host=document.createElement('x-host');"
+        "document.adoptedStyleSheets=[doc];const n=%u;"
+        "for(let i=0;i<n;i++){const host=document.createElement('x-host');"
         "document.body.appendChild(host);"
         "const root=host.attachShadow({mode:'open'});"
-        "root.innerHTML='<span>HOST'+i+'</span><span class=part>PART'+i"
-        "+'</span>';root.adoptedStyleSheets=[part]}"
+        "root.innerHTML=i<4||i==n-1?'<span>HOST'+i+'</span><span class=part>PART'+i"
+        "+'</span>':'H';root.adoptedStyleSheets=[part]}"
         "globalThis.pocSummary='FULL-READY'})()",
         (unsigned) (DOCUMENT_ADOPTION_ROOT_LIMIT - 1u));
     ok = ok && constructed_sheet_step(&navigation, script, "FULL-READY");
@@ -6682,6 +6944,139 @@ static bool test_constructed_sheet_full_root_table(Budget *budget)
     }
     constructed_sheet_close(&navigation);
     budget->limit = limit;
+    return ok && budget->current == baseline;
+}
+
+/* Shadow-root admission is memory-based (js_dom_register_shadow_root).
+   With memory to spare, a component page attaches far more roots than the
+   old fixed share of the page limit allowed (one per 80 KiB: 307 at
+   24 MiB), and every one of them renders: the Internet Archive's late
+   infinite-scroll tiles lost their components to that share. Each
+   component root (shared sheet, small subtree) costs less than the
+   admission estimate (DOM_BRIDGE_SHADOW_ROOT_COST_BYTES, 16 KiB). Once only
+   the presentation reserve (3 MiB) is left, attachShadow refuses with
+   QuotaExceededError and leaves the host as it was; with memory back it
+   admits again. */
+static bool test_shadow_root_memory_admission(Budget *budget)
+{
+    enum { ROOTS = 600 };
+    size_t baseline = budget->current;
+    size_t limit = budget->limit;
+    budget->limit = 24u * 1024u * 1024u;
+    static NavigationSession navigation;
+    bool ok = constructed_sheet_open(&navigation, budget, "<div id=list></div>");
+    ok = ok && constructed_sheet_step(&navigation,
+        "(()=>{const sheet=new CSSStyleSheet();"
+        "sheet.replaceSync('.t{color:#0000ff}');globalThis.tileSheet=sheet;"
+        "globalThis.addTile=i=>{const host=document.createElement('x-host');"
+        "document.getElementById('list').appendChild(host);"
+        "const root=host.attachShadow({mode:'open'});"
+        "root.adoptedStyleSheets=[sheet];"
+        "root.innerHTML='<div><span class=t>R'+i+'</span><b>by</b></div>';"
+        "return host};document.getElementById('list').append('LIST');"
+        "globalThis.pocSummary='READY'})()", "READY");
+    size_t before = budget->current;
+    ok = ok && constructed_sheet_step(&navigation,
+        "(()=>{let made=0;for(let i=0;i<600;i++){try{addTile(i);made++}"
+        "catch(e){globalThis.pocSummary='refused at '+i+': '+e.name;return}}"
+        "globalThis.pocSummary='MADE-'+made})()", "MADE-600");
+    size_t per_root = ok && budget->current > before
+        ? (budget->current - before) / ROOTS : 0;
+    if (ok && per_root > 16u * 1024u) {
+        fprintf(stderr, "a component root costs %zu bytes, over the "
+                "16 KiB admission estimate\n", per_root);
+        ok = false;
+    }
+    if (getenv("TILEFINCH_TEST_VERBOSE") != NULL)
+        fprintf(stderr, "shadow root cost: %zu bytes each\n", per_root);
+    const LayoutDocument *layout = &navigation.page.layout;
+    ok = ok && late_init_text_color(layout, "R0") == 0x0000ff
+        && late_init_text_color(layout, "R599") == 0x0000ff;
+    /* Inside the reserve: refused cleanly, then admitted again. The
+       refusal collects garbage first (bridge_reclaim_node_slots), so the
+       limit leaves 1 MiB less than the reserve, more than the loop above
+       left behind. */
+    size_t page_limit = budget->limit;
+    budget->limit = budget->current + 2u * 1024u * 1024u;
+    ok = ok && constructed_sheet_step(&navigation,
+        "(()=>{const host=document.createElement('x-host');"
+        "document.body.appendChild(host);let name='admitted';"
+        "try{host.attachShadow({mode:'open'})}catch(e){name=e.name}"
+        "globalThis.refusedHost=host;globalThis.pocSummary=name+':'"
+        "+(host.shadowRoot===null)+':'+host.childNodes.length})()",
+        "QuotaExceededError:true:0");
+    budget->limit = page_limit;
+    ok = ok && constructed_sheet_step(&navigation,
+        "(()=>{const root=refusedHost.attachShadow({mode:'open'});"
+        "root.adoptedStyleSheets=[tileSheet];"
+        "root.innerHTML='<span class=t>AGAIN</span>';"
+        "globalThis.pocSummary='OK'})()", "OK");
+    ok = ok && late_init_text_color(layout, "AGAIN") == 0x0000ff;
+    constructed_sheet_close(&navigation);
+    budget->limit = limit;
+    return ok && budget->current == baseline;
+}
+
+/* ResizeObserver measures a target through the engine's computed values,
+   one native read per target per pass (__tilefinchComputedStyleValues),
+   not through getComputedStyle: a page that replaces getComputedStyle
+   sees none of the observer's reads, and the boxes still follow the
+   target's padding, border and box-sizing. On the Internet Archive the
+   observer's per-pass declarations were most of the page's style reads. */
+static bool test_resize_observer_reads_engine_style(Budget *budget)
+{
+    size_t baseline = budget->current;
+    static NavigationSession navigation;
+    bool ok = constructed_sheet_open(&navigation, budget,
+        "<div id=box style='width:100px;height:20px;padding:3px;"
+        "border:2px solid red;box-sizing:border-box'>BOX</div>"
+        "<div id=plain style='width:50px;height:8px;padding:1px'>P</div>"
+        "<div id=wrap style='width:200px'><div id=pct style='padding:5% 2em;"
+        "border-left:3px solid;--tone:red;color:var(--tone);float:left'>Q"
+        "<span id=inl style='padding:4px;margin:2px'>S</span></div>"
+        "<div id=gone style='display:none;width:9px'>G</div></div>");
+    ok = ok && constructed_sheet_step(&navigation,
+        "(()=>{const original=globalThis.getComputedStyle;let calls=0;"
+        "globalThis.getComputedStyle=(...args)=>{calls++;return original(...args)};"
+        "const seen={},box=document.getElementById('box'),"
+        "plain=document.getElementById('plain'),"
+        "observer=new ResizeObserver(entries=>{for(const entry of entries){"
+        "const border=entry.borderBoxSize[0],content=entry.contentBoxSize[0];"
+        "seen[entry.target.id]=[entry.contentRect.width,entry.contentRect.height,"
+        "border.inlineSize,border.blockSize,content.inlineSize,content.blockSize]"
+        ".join(',')}if(seen.box&&seen.plain){observer.disconnect();"
+        "globalThis.getComputedStyle=original;globalThis.pocSummary="
+        "calls+'|'+seen.box+'|'+seen.plain}});"
+        "observer.observe(box);observer.observe(plain);"
+        "document.body.append('MORE');globalThis.pocSummary='PENDING'})()",
+        "PENDING");
+    for (int i = 0; ok && i < 8
+         && strcmp(navigation.page.script_result.summary, "PENDING") == 0; i++) {
+        ok = script_runtime_advance(navigation.page.runtime, 16, 8,
+                                    &navigation.page.script_result);
+        if (ok && script_runtime_consume_relayout(navigation.page.runtime))
+            ok = navigation_relayout(&navigation);
+    }
+    static const char expected[] = "0|90,10,100,20,90,10|50,8,52,10,50,8";
+    if (ok && strcmp(navigation.page.script_result.summary, expected) != 0) {
+        fprintf(stderr, "resize observer style: %s, want %s\n",
+                navigation.page.script_result.summary, expected);
+        ok = false;
+    }
+    /* The batch answers exactly what one read per name answers. */
+    ok = ok && constructed_sheet_step(&navigation,
+        "(()=>{const names=['display','padding-left','padding-top','width',"
+        "'height','border-left-width','box-sizing','color','--tone','float',"
+        "'flex-basis','margin-top','transition-duration','transform'],bad=[];"
+        "for(const id of ['box','plain','pct','inl','gone']){"
+        "const el=document.getElementById(id),"
+        "batch=__tilefinchComputedStyleValues(el.__handle,names),"
+        "one=names.map(n=>__tilefinchComputedStyleRead(el.__handle,n));"
+        "if(!batch||JSON.stringify(batch)!==JSON.stringify(one))"
+        "bad.push(id+':'+JSON.stringify(batch)+' vs '+JSON.stringify(one))}"
+        "document.body.append('');globalThis.pocSummary=bad.length?bad.join(';'):'SAME'})()",
+        "SAME");
+    constructed_sheet_close(&navigation);
     return ok && budget->current == baseline;
 }
 

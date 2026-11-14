@@ -351,9 +351,49 @@ static int test_basic_ad_verification_hosts(void)
     return 0;
 }
 
-/* Basic refuses third-party tag managers and A/B testing clients, leaves
-   paywall and subscription SDKs alone, and says which refused scripts a
-   page may be waiting on. */
+/* Basic refuses Google's IMA video-ad SDK, which cnn.com loads once its
+   page is up (0.5 MB of script it then cannot compile), without touching
+   the rest of googleapis.com. */
+static int test_basic_ima_sdk_host(void)
+{
+    Budget budget;
+    budget_init(&budget, 1024u * 1024u);
+    ContentBlocker *blocker = content_blocker_create(&budget);
+    CHECK(blocker != NULL
+          && content_blocker_configure(blocker, CONTENT_BLOCKER_BASIC, NULL));
+    const char *page = "https://www.cnn.com/";
+    CHECK(content_blocker_would_block(
+              blocker, "https://imasdk.googleapis.com/js/sdkloader/ima3.js",
+              page, "script", "no-cors")
+          && content_blocker_would_block(
+                 blocker,
+                 "https://imasdk.googleapis.com/js/core/bridge3.680.0_en.html",
+                 page, "iframe", "navigate"));
+    const char *const kept[] = {
+        "https://ajax.googleapis.com/ajax/libs/jquery/3.7.1/jquery.min.js",
+        "https://fonts.googleapis.com/css2?family=Inter",
+        "https://www.googleapis.com/youtube/v3/videos",
+        "https://notimasdk.googleapis.com/x.js",
+        "https://imasdk.googleapis.com.example/ima3.js",
+    };
+    for (size_t i = 0; i < sizeof(kept) / sizeof(kept[0]); i++) {
+        if (content_blocker_would_block(blocker, kept[i], page, "script",
+                                        "no-cors")) {
+            fprintf(stderr, "refused: %s\n", kept[i]);
+            return 1;
+        }
+    }
+    CHECK(content_blocker_configure(blocker, CONTENT_BLOCKER_OFF, NULL)
+          && !content_blocker_would_block(
+                 blocker, "https://imasdk.googleapis.com/js/sdkloader/ima3.js",
+                 page, "script", "no-cors"));
+    content_blocker_destroy(blocker);
+    CHECK(budget.current == 0u);
+    return 0;
+}
+
+/* Basic refuses third-party tag managers and A/B testing clients, and says
+   which refused scripts a page may be waiting on. */
 static int test_basic_sdk_hosts(void)
 {
     Budget budget;
@@ -393,32 +433,8 @@ static int test_basic_sdk_hosts(void)
               blocker, "https://www.googletagmanager.com/ns.html?id=GTM-1",
               page, "iframe", "navigate")
           && content_blocker_would_block(
-                 blocker, "https://api.segment.io/v1/t", page, "", "cors"));
-    /* Paywall and subscription SDKs load under Basic, by any destination:
-       the opt-in level that would refuse them is not offered yet. */
-    const char *const paywall[] = {
-        "https://cdn.tinypass.com/api/tinypass.min.js",
-        "https://cdn.piano.io/api/tinypass.min.js",
-        "https://experience.piano.io/xbuilder/experience/load",
-        "https://assets.poool.fr/audit.min.js",
-        "https://js.pelcro.com/sdk/main.min.js",
-        "https://connector.laterpay.net/1/laterpay.js",
-    };
-    for (size_t i = 0; i < sizeof(paywall) / sizeof(paywall[0]); i++) {
-        if (content_blocker_would_block(blocker, paywall[i], page, "script",
-                                        "no-cors")
-            || content_blocker_refused_script_shims(blocker, paywall[i],
-                                                    page) != 0u) {
-            fprintf(stderr, "paywall SDK refused: %s\n", paywall[i]);
-            return 1;
-        }
-    }
-    CHECK(!content_blocker_would_block(
-              blocker, "https://api.piano.io/api/v3/access", page, "",
-              "cors")
-          && !content_blocker_would_block(
-                 blocker, "https://buy.tinypass.com/checkout/template",
-                 page, "iframe", "navigate"));
+                 blocker, "https://tags.tiqcdn.com/utag/x.json", page, "",
+                 "cors"));
     /* Look-alikes, Adobe's analytics host beside Target's, the vendors' own
        pages and first-party copies are not refused. */
     const char *const kept[] = {
@@ -442,7 +458,7 @@ static int test_basic_sdk_hosts(void)
     ContentBlockerMetrics metrics;
     CHECK(content_blocker_metrics(blocker, &metrics)
           && metrics.mode == CONTENT_BLOCKER_BASIC
-          && metrics.rule_count == 36u + 15u);
+          && metrics.rule_count == 37u + 15u);
 
     /* What a page waits for from a refused script. */
     CHECK(content_blocker_refused_script_shims(
@@ -484,9 +500,83 @@ static int test_basic_sdk_hosts(void)
     return 0;
 }
 
+/* Paywall and subscription SDK hosts are refused only when the user opts
+   in, only by Basic, and only as third parties. */
+static int test_paywall_opt_in(void)
+{
+    Budget budget;
+    budget_init(&budget, 1024u * 1024u);
+    ContentBlocker *blocker = content_blocker_create(&budget);
+    CHECK(blocker != NULL
+          && content_blocker_configure(blocker, CONTENT_BLOCKER_BASIC, NULL)
+          && !content_blocker_paywall_scripts(blocker));
+    const char *page = "https://www.example-news.com/story";
+    const char *const paywall[] = {
+        "https://cdn.tinypass.com/api/tinypass.min.js",
+        "https://cdn.piano.io/api/tinypass.min.js",
+        "https://experience.piano.io/xbuilder/experience/load",
+        "https://assets.poool.fr/audit.min.js",
+        "https://js.pelcro.com/sdk/main.min.js",
+        "https://connector.laterpay.net/1/laterpay.js",
+    };
+    const size_t count = sizeof(paywall) / sizeof(paywall[0]);
+    for (size_t i = 0; i < count; i++) {
+        if (content_blocker_would_block(blocker, paywall[i], page, "script",
+                                        "no-cors")) {
+            fprintf(stderr, "refused by default: %s\n", paywall[i]);
+            return 1;
+        }
+    }
+    ContentBlockerMetrics metrics;
+    CHECK(content_blocker_metrics(blocker, &metrics)
+          && metrics.rule_count == 37u + 15u);
+    content_blocker_set_paywall_scripts(blocker, true);
+    for (size_t i = 0; i < count; i++) {
+        if (!content_blocker_would_block(blocker, paywall[i], page,
+                                         "script", "no-cors")) {
+            fprintf(stderr, "not refused when opted in: %s\n", paywall[i]);
+            return 1;
+        }
+    }
+    CHECK(content_blocker_would_block(
+              blocker, "https://api.piano.io/api/v3/access", page, "",
+              "cors")
+          && !content_blocker_would_block(
+                 blocker, "https://piano.io.example/sdk.js", page, "script",
+                 "no-cors")
+          /* The vendor's own site loads its own SDK. */
+          && !content_blocker_would_block(
+                 blocker, "https://cdn.piano.io/api/tinypass.min.js",
+                 "https://piano.io/", "script", "no-cors")
+          && content_blocker_metrics(blocker, &metrics)
+          && metrics.rule_count == 37u + 20u);
+    /* An allowed site and Off load them; the choice outlives a mode
+       change. */
+    const char *const allowed[] = {"example-news.com"};
+    CHECK(content_blocker_set_allowed_sites(blocker, allowed, 1u)
+          && !content_blocker_would_block(blocker, paywall[0], page,
+                                          "script", "no-cors")
+          && content_blocker_set_allowed_sites(blocker, NULL, 0u));
+    CHECK(content_blocker_configure(blocker, CONTENT_BLOCKER_OFF, NULL)
+          && !content_blocker_would_block(blocker, paywall[0], page,
+                                          "script", "no-cors")
+          && content_blocker_configure(blocker, CONTENT_BLOCKER_BASIC, NULL)
+          && content_blocker_paywall_scripts(blocker)
+          && content_blocker_would_block(blocker, paywall[0], page,
+                                         "script", "no-cors"));
+    content_blocker_set_paywall_scripts(blocker, false);
+    CHECK(!content_blocker_would_block(blocker, paywall[0], page, "script",
+                                       "no-cors"));
+    content_blocker_destroy(blocker);
+    CHECK(budget.current == 0u);
+    return 0;
+}
+
 int main(void)
 {
     CHECK(test_basic_sdk_hosts() == 0);
+    CHECK(test_basic_ima_sdk_host() == 0);
+    CHECK(test_paywall_opt_in() == 0);
     CHECK(test_basic_ad_verification_hosts() == 0);
     CHECK(test_player_page_list() == 0);
     CHECK(test_long_lines_and_rule_limit() == 0);

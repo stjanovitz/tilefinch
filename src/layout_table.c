@@ -406,9 +406,9 @@ static bool table_collapsed_boundaries(
     while (flat_iterator_next(&rows, &row)) {
         if (row.anonymous_text
             || row.style.display != DISPLAY_TABLE_ROW) continue;
-        if (context->preview_y_limit > 0
+        if (context->preview_y_limit > 0 && !context->preview_through
             && measured_rows >= LAYOUT_PREVIEW_TABLE_ROW_LIMIT) {
-            layout_note_preview_cut(context, true);
+            layout_note_preview_inexact(context, INT_MIN);
             break;
         }
         if (!layout_cooperate(context, row.node)) break;
@@ -636,9 +636,9 @@ static bool table_measure_rows(LayoutContext *context, lxb_dom_node_t *table,
     while (flat_iterator_next(&rows, &row)) {
         if (row.anonymous_text
             || row.style.display != DISPLAY_TABLE_ROW) continue;
-        if (context->preview_y_limit > 0
+        if (context->preview_y_limit > 0 && !context->preview_through
             && measured_rows >= LAYOUT_PREVIEW_TABLE_ROW_LIMIT) {
-            layout_note_preview_cut(context, true);
+            layout_note_preview_inexact(context, INT_MIN);
             break;
         }
         if (!layout_cooperate(context, row.node)) return false;

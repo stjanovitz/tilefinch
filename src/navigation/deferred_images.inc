@@ -2,6 +2,66 @@
    pending bytecode stores, network cancellation, deferred images and
    background resources. */
 
+#ifdef TILEFINCH_LAYOUT_DIFF
+/* Layout reuse study (validation only): which image path asked for the
+   next relayout and the queue's state then, appended to its diff line. */
+static const char *navigation_visual_reason = "none";
+static const char *navigation_fixed_paint_refusal = "none";
+#define NAVIGATION_FIXED_REFUSED(reason) \
+    (navigation_fixed_paint_refusal = (reason), false)
+static void navigation_image_trigger_note(const NavigationSession *session,
+                                          const char *trigger)
+{
+    const NavigationPage *page = &session->page;
+    char note[200];
+    snprintf(note, sizeof(note),
+             "trigger=%s/%s fixed=%s loaded=%zu dup=%zu queue=%zu/%zu/%zu "
+             "batch=%u age=%u vage=%u view=%d job=%d",
+             trigger, navigation_visual_reason, navigation_fixed_paint_refusal,
+             page->images.stats.loaded,
+             page->images.stats.duplicate, page->deferred_image_cursor,
+             page->deferred_image_eligible_end, page->deferred_image_count,
+             (unsigned) page->deferred_image_batch_count,
+             (unsigned) page->deferred_image_publication_age,
+             (unsigned) page->visual_image_publication_age,
+             (int) page->deferred_images_from_viewport,
+             (int) (page->deferred_image_job != NULL));
+    layout_validation_note(note);
+    if (!layout_validation_enabled()) return;
+    char message[240];
+    snprintf(message, sizeof(message), "tilefinch-image-event: relayout %s",
+             note);
+    tilefinch_platform_log_message(message);
+}
+#define NAVIGATION_VISUAL_REASON(reason) (navigation_visual_reason = (reason))
+static void navigation_image_event(const NavigationSession *session,
+                                   const char *event, size_t a, size_t b)
+{
+    if (!layout_validation_enabled()) return;
+    const NavigationPage *page = &session->page;
+    char message[256];
+    snprintf(message, sizeof(message),
+             "tilefinch-image-event: %s a=%zu b=%zu loaded=%zu "
+             "queue=%zu/%zu/%zu batch=%u age=%u view=%d "
+             "count=%zu attempted=%zu exempt=%zu skipped=%zu",
+             event, a, b, page->images.stats.loaded,
+             page->deferred_image_cursor, page->deferred_image_eligible_end,
+             page->deferred_image_count,
+             (unsigned) page->deferred_image_batch_count,
+             (unsigned) page->deferred_image_publication_age,
+             (int) page->deferred_images_from_viewport,
+             page->images.count, page->images.stats.attempted,
+             page->images.stats.count_exempt,
+             page->images.stats.skipped_limit);
+    tilefinch_platform_log_message(message);
+}
+#else
+#define navigation_image_trigger_note(session, trigger) ((void) 0)
+#define NAVIGATION_VISUAL_REASON(reason) ((void) 0)
+#define NAVIGATION_FIXED_REFUSED(reason) false
+#define navigation_image_event(session, event, a, b) ((void) 0)
+#endif
+
 /* How far the reader, and the scroll containers inside the page, have
    moved since a look at top and the layout's scroll_travel. */
 static int64_t navigation_image_reader_distance(
@@ -180,6 +240,9 @@ static TILEFINCH_OUT_OF_LINE bool navigation_fallback_web_fonts(NavigationSessio
     LayoutDocument next = {0};
     uint64_t started = navigation_now_us();
     layout_reuse_cache_begin_font_publication(session->page.layout_reuse);
+#ifdef TILEFINCH_LAYOUT_DIFF
+    layout_validation_set_cause("font-publish");
+#endif
     bool built = navigation_build_layout(session, &next, session->fonts, session->images);
     layout_reuse_cache_end_font_publication(session->page.layout_reuse);
     if (!built) {
@@ -520,8 +583,10 @@ static void navigation_deferred_images_finish(NavigationSession *session)
     /* A batch held for its queue's shared flow (see
        navigation_publish_deferred_images) still gets it. */
     if (session->page.deferred_images_from_viewport
-        && session->page.deferred_image_publication_age != 0)
+        && session->page.deferred_image_publication_age != 0) {
         session->page.visual_image_publication_pending = true;
+        NAVIGATION_VISUAL_REASON("finish");
+    }
     images_priority_load_destroy(session->page.deferred_image_job);
     session->page.deferred_image_job = NULL;
     session->page.deferred_image_batch_count = 0;
@@ -814,22 +879,30 @@ static bool navigation_publish_fixed_image_paint(NavigationSession *session)
     /* A live realm is safe too when its journal is clean and the exact
        committed generations still match. Queued author tasks run later;
        any mutation they make must go through ordinary replacement flow. */
-    if ((page->runtime != NULL
-         && script_runtime_has_pending_mutations(page->runtime))
-        || page->layout_provisional
-        || session->style_rebuild_required || layout->count == 0
-        || layout->image_content_generation != page->document.content_generation
-        || layout->image_style_generation != document_style_generation()
-        || layout->image_sheet_generation != page->stylesheet.build_generation
-        || layout->image_resource_count > page->images.count)
-        return false;
+    if (page->runtime != NULL
+        && script_runtime_has_pending_mutations(page->runtime))
+        return NAVIGATION_FIXED_REFUSED("mutations");
+    if (page->layout_provisional || session->style_rebuild_required
+        || layout->count == 0)
+        return NAVIGATION_FIXED_REFUSED("provisional");
+    if (layout->image_content_generation != page->document.content_generation)
+        return NAVIGATION_FIXED_REFUSED("content-gen");
+    if (layout->image_style_generation != document_style_generation()
+        || layout->image_sheet_generation != page->stylesheet.build_generation)
+        return NAVIGATION_FIXED_REFUSED("style-gen");
+    if (layout->image_resource_count > page->images.count)
+        return NAVIGATION_FIXED_REFUSED("table-shrunk");
     /* Resource-table growth can move every ImageResource, not just the new
        images. Preflight the entire list without dereferencing old pointers.
-       Unknown paint/intrinsic forms retain the transactional full rebuild. */
+       Unknown paint/intrinsic forms retain the transactional full rebuild.
+       A filter code is a colour transform of the command's own pixels
+       (grayscale, invert, ...), painted with it, so an arriving image changes
+       nothing outside its box and needs no flow for it. A backdrop blur
+       samples what lies under it. */
     for (size_t i = 0; i < layout->count; i++) {
         const DrawCommand *command = &layout->commands[i];
-        if (draw_command_filter_code(command) != 0
-            || draw_command_backdrop_blur(command) != 0) return false;
+        if (draw_command_backdrop_blur(command) != 0)
+            return NAVIGATION_FIXED_REFUSED("backdrop");
     }
     /* Already-laid-out intrinsic images and SVGs need no new proof. Only the
        newly appended suffix can change geometry. Table moves are rebound by
@@ -837,10 +910,11 @@ static bool navigation_publish_fixed_image_paint(NavigationSession *session)
     for (size_t i = layout->image_resource_count; i < page->images.count; i++) {
         const ImageResource *image = &page->images.items[i];
         if (image->is_background || image->is_canvas)
-            return false;
+            return NAVIGATION_FIXED_REFUSED(image->is_background
+                ? "background" : "canvas");
         if (image->is_mask && (image->pseudo != PSEUDO_NONE
             || image != images_find_mask_node(&page->images, image->node)))
-            return false;
+            return NAVIGATION_FIXED_REFUSED("mask");
         bool found = false;
         for (size_t j = 0; j < layout->count; j++) {
             const DrawCommand *command = &layout->commands[j];
@@ -854,13 +928,13 @@ static bool navigation_publish_fixed_image_paint(NavigationSession *session)
                 if (image->is_mask && command->image == NULL) {
                     DrawCommand probe = *command;
                     if (!layout_bind_fixed_mask_image(&page->stylesheet, &probe, image))
-                        return false;
+                        return NAVIGATION_FIXED_REFUSED("mask-bind");
                 }
                 found = true;
                 break;
             }
         }
-        if (!found) return false;
+        if (!found) return NAVIGATION_FIXED_REFUSED("no-box");
     }
     bool unresolved = false;
     int alt_margin = 0;
@@ -962,8 +1036,10 @@ static bool navigation_publish_deferred_images(NavigationSession *session)
         && page->deferred_image_cursor + page->deferred_image_batch_count
                < page->deferred_image_count) {
         page->deferred_image_publication_age = 1;
+        navigation_image_event(session, "deferred-hold", 0, 0);
         return true;
     }
+    navigation_image_trigger_note(session, "deferred");
     if (!navigation_relayout(session)) {
         session->performance.background_image_failures++;
         navigation_deferred_images_finish(session);
@@ -1022,6 +1098,7 @@ static NavigationBackgroundWorkOutcome navigation_publish_visual_images(
                 : NAVIGATION_BACKGROUND_WORK_HARD_FAILURE;
         }
     }
+    if (allowed && !painted) navigation_image_trigger_note(session, "visual");
     bool adopted = painted || (allowed && navigation_relayout(session));
     if (optional)
         (void) tilefinch_platform_cooperate_at(
@@ -1095,6 +1172,7 @@ static bool navigation_run_deferred_image(NavigationSession *session)
                 && page->deferred_image_publication_age != 0) {
                 page->deferred_image_publication_age = 0;
                 page->visual_image_publication_pending = true;
+                NAVIGATION_VISUAL_REASON("eligible-end");
             }
             page->image_continuation_pending = false;
             return true;
@@ -1192,6 +1270,8 @@ static bool navigation_run_deferred_image(NavigationSession *session)
     navigation_ensure_layout_reuse(session);
     layout_reuse_cache_update_images(page->layout_reuse, &page->images);
     if (added != 0) {
+        navigation_image_event(session, "deferred-added", added,
+                               (size_t) status);
         if (page->deferred_image_publication_age == 0)
             page->deferred_image_publication_age = 1;
         /* Decoded resources are page-owned even while layout publication
@@ -1199,11 +1279,15 @@ static bool navigation_run_deferred_image(NavigationSession *session)
         images_priority_load_commit_progress(page->deferred_image_job);
     }
     if (page->deferred_image_publication_age != 0) {
-        /* At most three further owner pumps: a slow second response cannot
-           hold the first image until its network timeout. No bigger queue,
-           retained DOM cursor, or unbounded settle delay. */
+        /* At most three further owner pumps spent waiting on the network: a
+           slow second response cannot hold the first image until its
+           network timeout. A pump that took a response or decoded does not
+           count: a second image already here joins the first one's flow
+           instead of costing a flow of its own a moment later. No bigger
+           queue, retained DOM cursor, or unbounded settle delay. */
         if (status == IMAGE_PRIORITY_LOAD_PENDING
-            && page->deferred_image_publication_age++ < 4) return true;
+            && (images_priority_load_progressed(page->deferred_image_job)
+                || page->deferred_image_publication_age++ < 4)) return true;
         if (!navigation_publish_deferred_images(session)) return true;
     }
     if (status == IMAGE_PRIORITY_LOAD_PENDING) return true;
@@ -1440,6 +1524,8 @@ static void navigation_admit_viewport_images(NavigationSession *session)
     page->viewport_images_pending = more;
     page->image_reveal_look = more && reveal;
     navigation_viewport_look_note(session, scroll_y, false);
+    navigation_image_event(session, moved ? "look-moved" : "look", count,
+                           (size_t) scroll_y);
     if (count == 0) return;
     lxb_dom_node_t *inline_svgs[NAVIGATION_VIEWPORT_IMAGE_BATCH];
     ImagePriorityTarget targets[NAVIGATION_VIEWPORT_IMAGE_BATCH];
@@ -1514,8 +1600,11 @@ static void navigation_admit_viewport_images(NavigationSession *session)
         session->images = &page->images;
         layout_reuse_cache_update_images(page->layout_reuse, &page->images);
         if (loaded && (page->images.stats.loaded != loaded_before
-                       || page->images.stats.duplicate != duplicate_before))
+                       || page->images.stats.duplicate != duplicate_before)) {
             page->visual_image_publication_pending = true;
+            NAVIGATION_VISUAL_REASON(page->images.stats.loaded != loaded_before
+                ? "inline-svg" : "inline-dup");
+        }
     }
     /* Whatever else the queue holds has no box and is found again by a later
        look when it gets one, so the reader's position can bound it all. */
@@ -1610,6 +1699,7 @@ static NavigationBackgroundWorkOutcome navigation_load_visual_batch(
         session->performance.background_images_loaded +=
             page->images.stats.loaded - loaded_before;
         page->visual_image_publication_pending = true;
+        NAVIGATION_VISUAL_REASON("visual-batch");
         return navigation_publish_visual_images(session);
     } else if (!loaded) {
         session->performance.background_image_failures++;
@@ -1802,6 +1892,7 @@ static NavigationBackgroundWorkOutcome navigation_background_resources_turn(
         session->performance.background_images_loaded = SIZE_MAX;
     }
     if (added != 0) {
+        navigation_image_trigger_note(session, "scan");
         if (!navigation_relayout(session)) {
             session->page.image_continuation_pending = false;
             session->performance.background_image_failures++;

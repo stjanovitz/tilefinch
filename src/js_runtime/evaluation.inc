@@ -376,11 +376,9 @@ static void script_runtime_gc_hook(void *opaque, int begin)
         owner->heap_collections++;
         owner->bridge.node_wrapper_sweep_remaining = owner->bridge.wrapper_refs
             ? owner->bridge.node_count : 0;
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
         if (JS_GetGCCause(owner->runtime) == JS_GC_CAUSE_THRESHOLD)
             owner->gc_threshold_collections++;
-#endif
-#if !defined(TILEFINCH_NO_TRACE) && defined(PSP_BROWSER_BELLARD_QUICKJS)
+#if !defined(TILEFINCH_NO_TRACE)
         if (tilefinch_trace_gc()) {
             uint64_t now = js_rt_monotonic_time_ns();
             fprintf(stderr,
@@ -1114,7 +1112,8 @@ void script_runtime_profile_report(ScriptRuntime *runtime, const char *label)
     snprintf(message, sizeof(message),
              "tilefinch-js-profile: label=%s native-ms=%llu "
              "style-cache=%zu/%zu clears=%zu/%zu host-clears=%zu bytes=%zu "
-             "var-cache=%zu/%zu var-clears=%zu style-probes=%zu",
+             "var-cache=%zu/%zu var-clears=%zu style-probes=%zu "
+             "dependency-scans=%zu/%zu",
              label == NULL ? "" : label,
              (unsigned long long) (native_total_us / 1000u),
              style_cache->hits, style_cache->misses,
@@ -1122,7 +1121,8 @@ void script_runtime_profile_report(ScriptRuntime *runtime, const char *label)
              style_cache->host_clears,
              js_rt_bridge_computed_style_cache_bytes(&runtime->bridge),
              style_cache->variables.hits, style_cache->variables.misses,
-             style_cache->variables.clears, style_cache->lookup_probes);
+             style_cache->variables.clears, style_cache->lookup_probes,
+             style_cache->flag_scans, style_cache->key_scans);
     style_cache->hits = 0;
     style_cache->misses = 0;
     style_cache->lookup_probes = 0;
@@ -1132,6 +1132,8 @@ void script_runtime_profile_report(ScriptRuntime *runtime, const char *label)
     style_cache->variables.hits = 0;
     style_cache->variables.misses = 0;
     style_cache->variables.clears = 0;
+    style_cache->flag_scans = 0;
+    style_cache->key_scans = 0;
     script_profile_emit(message);
     for (int rank = 0; rank < script_profile_ranks(); rank++) {
         size_t best = SIZE_MAX;
@@ -1188,14 +1190,12 @@ uint32_t script_runtime_work_counters(const ScriptRuntime *runtime,
         | (1u << SCRIPT_WORK_NATIVE_CALLS);
     memset(work, 0, SCRIPT_WORK_COUNT * sizeof(work[0]));
     if (runtime == NULL) return missing;
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
     _Static_assert(SCRIPT_WORK_LAZY_BYTES == JS_WORK_LAZY_BYTES
                    && SCRIPT_WORK_CALLS == JS_WORK_CALLS,
                    "script work leads with the engine's counters");
     if (runtime->runtime != NULL)
         missing = (uint32_t) JS_GetWorkCounters(runtime->runtime, work)
             | (1u << SCRIPT_WORK_NATIVE_CALLS);
-#endif
     if (runtime->profile != NULL) {
         missing &= ~(1u << SCRIPT_WORK_NATIVE_CALLS);
         work[SCRIPT_WORK_NATIVE_CALLS] = runtime->profile->work_native_total;
@@ -1241,12 +1241,8 @@ size_t script_runtime_opcode_counts(const ScriptRuntime *runtime,
                                     const char **names, uint64_t *counts,
                                     size_t capacity)
 {
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
     if (runtime != NULL && runtime->runtime != NULL)
         return JS_GetOpcodeCounts(runtime->runtime, names, counts, capacity);
-#else
-    (void) runtime; (void) names; (void) counts; (void) capacity;
-#endif
     return 0;
 }
 
@@ -1475,13 +1471,7 @@ bool js_rt_runtime_callback_checkpoint(ScriptRuntime *runtime)
     return true;
 }
 
-static bool node_name_is(lxb_dom_node_t *node, const char *wanted)
-{
-    size_t length = 0;
-    const char *name = document_element_name(node, &length);
-    return name != NULL && strlen(wanted) == length
-           && memcmp(name, wanted, length) == 0;
-}
+#define node_name_is document_element_name_is
 
 /* Error formatting is best-effort. A hostile thrown value can itself throw
    from ToPrimitive/toString; drain that secondary exception so it cannot
@@ -1635,11 +1625,7 @@ void js_rt_record_exception(JSContext *context, ScriptResult *result)
 static void promise_rejection_tracker(JSContext *context,
                                       JSValueConst promise,
                                       JSValueConst reason,
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
                                       int is_handled,
-#else
-                                      bool is_handled,
-#endif
                                       void *opaque)
 {
     if (opaque == NULL) return;
@@ -2029,6 +2015,7 @@ static bool js_rt_compile_source_admitted(
                 js_rt_saturating_add_size(
                     &result->host_compile_memory_refused_bytes, length);
                 script_runtime_note_oversized_script(owner, length);
+                script_runtime_note_memory_refusal(owner);
                 snprintf(result->error, sizeof(result->error),
                          "JavaScript source rejected before compile: "
                          "%s has %zu bytes; compiling it needs at least "
@@ -2181,7 +2168,6 @@ bool js_rt_evaluate_compiled_source(
  * offline copy) whose lazy functions need it does not restore, and the
  * script compiles from source.
  */
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
 #define SCRIPT_SOURCE_STORE_MINIMUM_BYTES (8u * 1024u)
 
 typedef enum {
@@ -2449,34 +2435,7 @@ static void js_rt_source_store_census(const ScriptRuntime *runtime)
            (unsigned long long) stats.released);
 }
 #endif
-#else
-uint32_t js_rt_source_store_begin_restore(ScriptRuntime *runtime,
-                                          const char *source, size_t length)
-{
-    (void) runtime; (void) source; (void) length;
-    return 0;
-}
 
-bool js_rt_source_store_end_restore(ScriptRuntime *runtime,
-                                    uint32_t source_id, const char *source)
-{
-    (void) runtime; (void) source_id; (void) source;
-    return true;
-}
-
-size_t js_rt_source_store_relieve(ScriptRuntime *runtime, size_t needed)
-{
-    (void) runtime; (void) needed;
-    return 0;
-}
-
-void js_rt_source_store_safe_point(ScriptRuntime *runtime, bool refused)
-{
-    (void) runtime; (void) refused;
-}
-#endif
-
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
 /*
  * Lazy function compilation (JS_SetLazyFunctionThreshold). An inner function
  * of a page script or module whose source is at least this long keeps no
@@ -2529,7 +2488,6 @@ static bool script_lazy_function_preparse(void)
     }
     return enabled;
 }
-#endif
 
 JSValue js_rt_compile_source_type(JSContext *context, const char *source,
                                    size_t length, const char *name,
@@ -2589,13 +2547,11 @@ JSValue js_rt_compile_source_type(JSContext *context, const char *source,
         tilefinch_platform_log_message(gc_message);
 #endif
     }
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
     /* Read when the parse starts; imports compiled from inside this JS_Eval
        come back through here and restore it on their way out. */
     uint32_t previous_lazy_threshold = JS_GetLazyFunctionThreshold(js_runtime);
     JS_SetLazyFunctionThreshold(js_runtime, script_lazy_function_threshold());
     JS_SetLazyFunctionPreparse(js_runtime, script_lazy_function_preparse());
-#endif
     ScriptRuntime *profile_owner = bridge == NULL ? NULL : bridge->host;
     unsigned compile_ledger = work_ledger_enter(WORK_LEDGER_SCRIPT);
     /* A compile entered from outside script (a parser-inserted script or
@@ -2618,19 +2574,15 @@ JSValue js_rt_compile_source_type(JSContext *context, const char *source,
         profile_owner->jsmem_compile_bytes = length;
     }
 #endif
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
     uint32_t stored_source = 0;
     int previous_strip = js_rt_source_store_compile_begin(
         profile_owner, js_runtime, source, length, source_kind,
         &stored_source);
-#endif
     JSValue value = JS_Eval(
         context, source, length, name == NULL ? "<script>" : name,
         evaluation_type | JS_EVAL_FLAG_COMPILE_ONLY);
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
     js_rt_source_store_compile_end(profile_owner, js_runtime, previous_strip,
                                    stored_source);
-#endif
 #if defined(CONFIG_TILEFINCH_HEAP_DETAIL) && !defined(TILEFINCH_NO_TRACE)
     if (profile_owner != NULL) {
         profile_owner->jsmem_compile_name = jsmem_previous_name;
@@ -2642,9 +2594,7 @@ JSValue js_rt_compile_source_type(JSContext *context, const char *source,
     work_ledger_leave(compile_ledger);
     if (profile_owner != NULL && profile_owner->profile != NULL)
         profile_owner->profile->compile_depth--;
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
     JS_SetLazyFunctionThreshold(js_runtime, previous_lazy_threshold);
-#endif
     uint64_t compile_finished = js_rt_monotonic_time_ns();
     uint64_t compile_us = compile_finished >= compile_started
         ? (compile_finished - compile_started) / UINT64_C(1000) : 0;
@@ -2683,6 +2633,7 @@ JSValue js_rt_compile_source_type(JSContext *context, const char *source,
             js_rt_saturating_add_size(&result->host_compile_memory_abandoned,
                                       1);
             script_runtime_note_oversized_script(profile_owner, length);
+            script_runtime_note_memory_refusal(profile_owner);
             snprintf(result->error, sizeof(result->error),
                      "JavaScript source rejected while compiling: %s has "
                      "%zu bytes and needs more script memory to compile "
@@ -3026,7 +2977,7 @@ bool js_rt_current_script_scope_begin(JSContext *context,
             grant_bridge->document == NULL ? NULL
             : &grant_bridge->document->content_security_policy;
         grant_bridge->current_script_csp_grant =
-            csp == NULL || !csp->header_present || node == NULL ? 0
+            !tilefinch_csp_enforced(csp) || node == NULL ? 0
             : tilefinch_csp_element_descendant_grant(
                   csp, node, script_runtime_script_parser_inserted(
                                  grant_bridge->host, node));
@@ -3217,6 +3168,8 @@ static bool evaluate_scripts(JSContext *context, lxb_dom_node_t *node,
         state->force_async = false;
         state->already_started = true;
         int64_t handle = js_rt_bridge_register_node(bridge, at);
+        /* Scripts run between snapshot entries. */
+        js_rt_bridge_keep_node_handle(bridge, handle);
         if (handle != 0) {
             scripts[script_count++] = (ScriptElementSnapshot) {
                 .node_handle = handle, .identity = state->identity

@@ -2704,16 +2704,6 @@ uint64_t fetch_background_transport_enqueue_stream(
         FETCH_BACKGROUND_STREAM_CHUNK_TARGET, FETCH_BACKGROUND_LANE_ORDINARY, NULL);
 }
 
-uint64_t fetch_background_transport_enqueue_stream_diagnosed(
-    const char *url, const FetchRequest *request,
-    size_t maximum_bytes, long timeout_ms,
-    FetchBackgroundEnqueueStatus *status)
-{
-    return fetch_background_transport_enqueue_stream_internal(
-        url, request, maximum_bytes, timeout_ms, false,
-        FETCH_BACKGROUND_STREAM_CHUNK_TARGET, FETCH_BACKGROUND_LANE_ORDINARY, status);
-}
-
 uint64_t fetch_background_transport_enqueue_media_stream_diagnosed(
     const char *url, const FetchRequest *request,
     size_t maximum_bytes, long timeout_ms,
@@ -3524,53 +3514,6 @@ bool fetch_background_transport_take_fetch_result(
                request_id, budget, result, result->length);
 }
 
-bool fetch_background_transport_take(
-    uint64_t request_id, unsigned char *destination,
-    size_t capacity, FetchBackgroundResult *result)
-{
-    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_owns(request_id),
-        fetch_replay_lane_take(request_id, destination, capacity, result));
-    unsigned index = fetch_background_id_slot(request_id);
-    if (!fetch_background.initialized || result == NULL
-        || index >= FETCH_BACKGROUND_REQUEST_LIMIT) return false;
-    FetchBackgroundSlot *slot = &fetch_background.slots[index];
-    if (slot->streaming) return false;
-    int expected = FETCH_BACKGROUND_SLOT_COMPLETE;
-    if (!fetch_background_slot_matches(slot, request_id)
-        || !atomic_compare_exchange_strong_explicit(
-               &slot->state, &expected, FETCH_BACKGROUND_SLOT_TAKING,
-               memory_order_acq_rel, memory_order_acquire)) return false;
-    *result = slot->result;
-    unsigned char *source = fetch_background_slot_buffer(slot);
-    bool copied = result->length <= capacity
-        && (result->length == 0 || destination != NULL)
-        && source != NULL;
-    if (copied && result->length != 0) {
-        memcpy(destination, source, result->length);
-    }
-    if (!copied) {
-        result->success = false;
-        snprintf(result->error, sizeof(result->error), "%s",
-                 "background result destination was too small");
-    }
-    FetchHandshakeSample handshake = {
-        .classified = result->tls_connection_reuse_known,
-        .measured = result->tls_handshake_measured,
-        .handshake_us = result->tls_handshake_us,
-        .reused = result->tls_connection_reused
-    };
-    fetch_tls_counters_add(&fetch_tls_counters, &handshake);
-    fetch_background_slot_drop_large_fields(slot);
-    atomic_store_explicit(
-        &slot->state, FETCH_BACKGROUND_SLOT_FREE, memory_order_release);
-    (void) sceKernelSetEventFlag(
-        fetch_background.event, FETCH_BACKGROUND_EVENT_WAKE);
-#if LIBCURL_VERSION_NUM >= 0x074400
-    (void) curl_multi_wakeup(fetch_background.multi);
-#endif
-    return true;
-}
-
 bool fetch_background_transport_cancel(
     uint64_t request_id, const char *reason)
 {
@@ -3946,18 +3889,6 @@ uint64_t fetch_background_transport_enqueue_stream(
     (void) url; (void) request; (void) maximum_bytes; (void) timeout_ms;
     return 0;
 }
-uint64_t fetch_background_transport_enqueue_stream_diagnosed(
-    const char *url, const FetchRequest *request,
-    size_t maximum_bytes, long timeout_ms,
-    FetchBackgroundEnqueueStatus *status)
-{
-    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_active(),
-        fetch_replay_lane_enqueue(url, request, maximum_bytes, timeout_ms,
-                                  true, false, 0, FETCH_BACKGROUND_LANE_ORDINARY, status));
-    (void) url; (void) request; (void) maximum_bytes; (void) timeout_ms;
-    if (status != NULL) *status = FETCH_BACKGROUND_ENQUEUE_UNAVAILABLE;
-    return 0;
-}
 uint64_t fetch_background_transport_enqueue_media_stream_diagnosed(
     const char *url, const FetchRequest *request,
     size_t maximum_bytes, long timeout_ms,
@@ -4096,15 +4027,6 @@ bool fetch_background_transport_take_fetch_result(
             request_id, budget, result,
             result == NULL ? 0 : result->length));
     (void) request_id; (void) budget; (void) result;
-    return false;
-}
-bool fetch_background_transport_take(
-    uint64_t request_id, unsigned char *destination,
-    size_t capacity, FetchBackgroundResult *result)
-{
-    FETCH_REPLAY_LANE_ROUTE(fetch_replay_lane_owns(request_id),
-        fetch_replay_lane_take(request_id, destination, capacity, result));
-    (void) request_id; (void) destination; (void) capacity; (void) result;
     return false;
 }
 bool fetch_background_transport_cancel(

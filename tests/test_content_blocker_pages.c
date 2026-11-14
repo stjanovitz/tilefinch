@@ -115,6 +115,8 @@ typedef enum {
     BLOCKER_BASIC,
     /* Basic, with the page's site allowed. */
     BLOCKER_BASIC_SITE_ALLOWED,
+    /* Basic, also blocking paywall scripts (opt-in). */
+    BLOCKER_BASIC_PAYWALL,
     /* A custom list that refuses only the tag manager's host. */
     BLOCKER_CUSTOM_TAG_MANAGER,
     /* A custom list that refuses only Piano's Tinypass host. */
@@ -147,6 +149,10 @@ static bool configure_blocker(ContentBlocker *blocker, BlockerSetup setup,
     case BLOCKER_OFF:
         return content_blocker_configure(blocker, CONTENT_BLOCKER_OFF, NULL);
     case BLOCKER_BASIC:
+        return content_blocker_configure(blocker, CONTENT_BLOCKER_BASIC,
+                                         NULL);
+    case BLOCKER_BASIC_PAYWALL:
+        content_blocker_set_paywall_scripts(blocker, true);
         return content_blocker_configure(blocker, CONTENT_BLOCKER_BASIC,
                                          NULL);
     case BLOCKER_BASIC_SITE_ALLOWED: {
@@ -538,11 +544,13 @@ int main(void)
          BLOCKER_BASIC, 100, 4, "error,revealed"},
         {"timeout anti-flicker, off", TIMEOUT_PAGE, optimizely_client, 1,
          BLOCKER_OFF, 100, 4, "optimizely-ran,revealed"},
-        /* Basic loads a paywall SDK, which answers its queue. */
+        /* Basic loads a paywall SDK unless the user opts in; a refused
+           one leaves its queue unanswered and the page as it was sent. */
         {"paywall sdk, basic", PIANO_PAGE, piano_sdk, 1, BLOCKER_BASIC, 1, 4,
          "piano-ran,piano-init,page-ready"},
-        /* A paywall SDK a Custom list refuses gets no answer: its queue
-           stays unanswered and the page stays as it was sent. */
+        {"paywall sdk, basic + paywall scripts", PIANO_PAGE, piano_sdk, 1,
+         BLOCKER_BASIC_PAYWALL, 1, 4, "error,page-ready"},
+        /* A paywall SDK a Custom list refuses gets no answer either. */
         {"paywall sdk, custom list", PIANO_PAGE, piano_sdk, 1,
          BLOCKER_CUSTOM_PAYWALL, 1, 4, "error,page-ready"},
         {"paywall sdk, off", PIANO_PAGE, piano_sdk, 1, BLOCKER_OFF, 1, 4,

@@ -1,0 +1,30 @@
+# Measurement scenario for layout reuse, not golden-gated: the three input
+# triggers that can relay a page out, measured separately on a loaded
+# page. Each mark closes one trigger's window, so the tilefinch-layout-diff and
+# tilefinch-geometry-adoption lines between two marks belong to it.
+# R: three ready-gated page presses.
+# hover: the nub cursor sweeps left and right across the content (about
+#   7 px a frame at full deflection), sending a pointer move every frame.
+# edge: the cursor runs to the bottom edge and the held nub scrolls the
+#   page from there (about 26-40 px a frame), the analog scroll path.
+wait-live 90
+wait-page 90
+mark-page top
+tap-page rtrigger
+wait-page 45
+tap-page rtrigger
+wait-page 45
+tap-page rtrigger
+wait-page 45
+mark-page r3
+stick 30 left
+stick 30 right
+stick 30 right
+stick 30 left
+wait-page 45
+mark-page hover
+stick 25 down
+stick 90 down
+wait-page 45
+mark-page edge
+end

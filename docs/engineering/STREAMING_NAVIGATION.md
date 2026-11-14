@@ -140,7 +140,7 @@ mode; a declined slots-only preview backs off the same way.
 
 A painted preview whose current screen shows no text or decoded image while
 the preview holds some further down sets the provisional viewport's
-`reading_hint`. The PSP app then shows **Preview ready  R to read** in the
+`reading_hint`. The PSP app then shows **PREVIEW READY  R TO READ** in the
 loading toast. The browser thread sets that toast in its own UI and, under
 the presentation fence, in the supervisor's copy; the supervisor never
 reads the engine. The hint ends for that load at the first screen that
@@ -148,6 +148,24 @@ shows content (a rasterized logo included), at the first page press, at
 cancellation and when the load ends. The job records when it showed and
 ended (`reading_hint_shown_us`, `reading_hint_cleared_us`; validation
 `reading-hint=`).
+
+## Provisional layouts
+
+A page can be published with a provisional layout: the screens at the
+reader's position laid out, the rest a placeholder that idle work fills
+(`navigation_complete_layout_step`). A reader of one place below the cut,
+a same-page `#fragment` or a Find match, lays the page out only through it
+(`navigation_layout_through`): the build has no limit until the target's
+box (or its nearest ancestor's) is recorded, then stops three screens
+below it. The target counts only when its box was recorded before the cut
+and its screen ends above the cut and above any container the cut may have
+moved (`LayoutDocument.preview_moved_top`: a flex row, table, inline-level
+or transformed box, a box with a descendant pinned to its bottom, or an
+inexact multicolumn, column flex, grid or first-rows table cut). Anything
+else completes the layout. Find takes a match from a provisional index only
+when every match before it is proven too, guides the build by the next DOM
+text that holds the term, and completes the layout to wrap or to show that
+there is no match. A page with a script realm is always completed.
 
 ## Resumable finalization
 

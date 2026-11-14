@@ -36,8 +36,8 @@ typedef struct {
 /*
  * Start and advance the ownership protocol independently from any PSP
  * thread/event implementation. Once cancellation is requested, the owner
- * must continue polling until COMPLETED_AFTER_TIMEOUT before reclaiming
- * worker-owned memory.
+ * must continue polling until a completed result, then separately retire
+ * firmware worker resources before reclaiming worker-owned memory.
  */
 VoiceJobLifecycleResult voice_job_lifecycle_start(
     VoiceJobLifecycle *lifecycle,
@@ -51,5 +51,8 @@ VoiceJobLifecycleResult voice_job_lifecycle_pump(
 void voice_job_lifecycle_request_cancel(VoiceJobLifecycle *lifecycle);
 bool voice_job_lifecycle_cancelled(const VoiceJobLifecycle *lifecycle);
 bool voice_job_lifecycle_disables_voice(const VoiceJobLifecycle *lifecycle);
+/* Completion permits result publication only if cancellation did not win.
+   Worker thread/event retirement remains a separate firmware obligation. */
+bool voice_job_lifecycle_accepts_result(const VoiceJobLifecycle *lifecycle);
 
 #endif

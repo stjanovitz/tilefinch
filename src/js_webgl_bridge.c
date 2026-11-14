@@ -76,6 +76,7 @@ static bool webgl_temporal_matrix_same(const float left[16],
 #endif
 
 #if defined(__PSP__)
+#include "tilefinch/ge_scratch.h"
 #include "tilefinch/psp_display.h"
 #include "tilefinch/psp_media_present.h"
 #pragma GCC diagnostic push
@@ -98,6 +99,34 @@ static bool webgl_temporal_matrix_same(const float left[16],
 #define WEBGL_TEXTURE_WIRE_MAGIC UINT32_C(0x54465754)
 #define WEBGL_WIRE_VERSION 5u
 #define WEBGL_COMMAND_LIMIT 64u
+/* Material records (wire v5 extension): one 256-word record per command
+   slot, selected by command word 95 = slot + 1. They carry the uniform
+   terms the link-time semantic pass mapped onto GE fixed function. */
+#define WEBGL_MATERIAL_WIRE_MAGIC UINT32_C(0x5446574d)
+#define WEBGL_MATERIAL_WORDS 256u
+#define WEBGL_MATERIAL_LIGHTS 4u
+#define WEBGL_MATERIAL_LIGHTING 1u
+#define WEBGL_MATERIAL_FOG 2u
+#define WEBGL_MATERIAL_POINT_SIZE 4u
+#define WEBGL_MATERIAL_TEXTURE_TRANSFORM 8u
+#define WEBGL_MATERIAL_SPECULAR 16u
+#define WEBGL_MATERIAL_ALPHA_TEST 32u
+#define WEBGL_MATERIAL_POINT_COORD 64u
+#define WEBGL_MATERIAL_POINT_COORD_FLIP 128u
+#define WEBGL_MATERIAL_SPLIT 256u
+#define WEBGL_MATERIAL_PROGRAM 512u
+#define WEBGL_MATERIAL_FLAGS 1023u
+/* Per-vertex program (webgl.js compileVertexProgram): header word, 32
+   two-word steps, then 15 vec4 constants. Work is bounded per draw. */
+#define WEBGL_PROGRAM_WORD 128u
+#define WEBGL_PROGRAM_CONSTANT_WORD 194u
+#define WEBGL_PROGRAM_STEPS 32u
+#define WEBGL_PROGRAM_CONSTANTS 15u
+#define WEBGL_PROGRAM_STEP_LIMIT 65536u
+#define WEBGL_PROGRAM_OPS 38u
+/* Material record words 116-117: the normal buffer's id and generation. */
+#define WEBGL_MATERIAL_NORMAL_IDENTITY_WORD 116u
+#define WEBGL_POINT_SIZE_LIMIT 64.0f
 #define WEBGL_SOURCE_LIMIT 32u
 #define WEBGL_TEXTURE_LIMIT 8u
 #define WEBGL_VERTEX_LIMIT 4096u
@@ -414,6 +443,55 @@ bool script_runtime_webgl_geometry_cache_admit(
     return true;
 }
 
+bool script_runtime_webgl_geometry_cache_lit_layout(
+    const ScriptWebglGeometryCacheState *state,
+    uint32_t realm_epoch_high,
+    uint32_t realm_epoch_low,
+    int64_t canvas_handle,
+    const ScriptWebglGeometryCacheSignature *signature,
+    uint32_t *base,
+    uint32_t *vertices,
+    uint32_t *indices)
+{
+    if (state == NULL || signature == NULL || !state->valid
+        || state->realm_epoch_high != realm_epoch_high
+        || state->realm_epoch_low != realm_epoch_low
+        || state->canvas_handle != canvas_handle) return false;
+    for (size_t i = 0; i < SCRIPT_WEBGL_GEOMETRY_CACHE_ENTRY_LIMIT; i++) {
+        const ScriptWebglGeometryCacheRecord *record = &state->records[i];
+        if (!record->valid || !record->lit_layout
+            || memcmp(&record->signature, signature, sizeof(*signature)) != 0)
+            continue;
+        *base = record->lit_base;
+        *vertices = record->lit_vertices;
+        *indices = record->lit_indices;
+        return true;
+    }
+    return false;
+}
+
+bool script_runtime_webgl_lit_span_index(uint32_t base, uint32_t vertices,
+                                         uint32_t index, uint16_t *rebased)
+{
+    if (index < base || index - base >= vertices
+        || index - base > UINT16_MAX) return false;
+    *rebased = (uint16_t) (index - base);
+    return true;
+}
+
+void script_runtime_webgl_geometry_cache_set_lit_layout(
+    ScriptWebglGeometryCacheState *state, size_t slot, uint32_t base,
+    uint32_t vertices, uint32_t indices)
+{
+    if (state == NULL || slot >= SCRIPT_WEBGL_GEOMETRY_CACHE_ENTRY_LIMIT
+        || !state->records[slot].valid) return;
+    ScriptWebglGeometryCacheRecord *record = &state->records[slot];
+    record->lit_layout = true;
+    record->lit_base = base;
+    record->lit_vertices = vertices;
+    record->lit_indices = indices;
+}
+
 enum {
     WEBGL_POINTS = 0,
     WEBGL_LINES = 1,
@@ -470,6 +548,11 @@ typedef struct {
     float green;
     float blue;
     float alpha;
+    /* Material draws only: separate specular (0..255, added after the
+       texture), the GE fog factor (1 = no fog) and the point size. */
+    float specular[3];
+    float fog;
+    float point_size;
     bool clip_valid;
     bool geometry_valid;
 } WebglVertex;
@@ -484,7 +567,42 @@ typedef struct {
 } WebglAttributeView;
 
 typedef struct {
+    int type; /* 1 directional (vector = direction), 2 point (position) */
+    float vector[3];
+    float diffuse[3];
+    float specular[3];
+    float attenuation[3];
+} WebglMaterialLight;
+
+typedef struct {
+    uint32_t flags;
+    uint32_t light_count;
+    float model_view[16];
+    float projection[16];
+    float ambient[3];
+    float emissive[3];
+    float specular[3];
+    float shininess;
+    float fog_color[3];
+    float fog_near;
+    float fog_far;
+    float point_size;
+    float point_scale;
+    float texture_transform[6];
+    float alpha_reference;
+    WebglAttributeView normal;
+    WebglMaterialLight lights[WEBGL_MATERIAL_LIGHTS];
+    /* WEBGL_MATERIAL_PROGRAM: the per-vertex colour program. */
+    uint32_t program_steps;
+    uint32_t program_outputs; /* 1 rgb factor, 2 alpha factor */
+    uint32_t program_out;
+    uint32_t program_code[WEBGL_PROGRAM_STEPS * 2u];
+    float program_constants[WEBGL_PROGRAM_CONSTANTS][4];
+} WebglMaterial;
+
+typedef struct {
     const WebglSource *index_source;
+    const WebglMaterial *material;
     WebglAttributeView position;
     WebglAttributeView color;
     WebglAttributeView texcoord;
@@ -846,6 +964,15 @@ static bool webgl_attribute_from_view(
         || (size_t) vertex > (SIZE_MAX - view->offset) / view->stride)
         return false;
     size_t base = view->offset + (size_t) vertex * view->stride;
+    if (view->type == WEBGL_FLOAT) {
+        /* One bounds test covers every component: webgl_source_scalar's
+           per-component test passes exactly when the last one fits. */
+        size_t bytes = (size_t) view->size * sizeof(float);
+        if (base > view->source->length
+            || bytes > view->source->length - base) return false;
+        memcpy(output, view->source->bytes + base, bytes);
+        return true;
+    }
     for (int component = 0; component < view->size; component++) {
         size_t component_offset = base + (size_t) component * scalar_bytes;
         if (component_offset < base
@@ -1040,6 +1167,360 @@ static bool webgl_instance_draw(const WebglDecodedDraw *base,
     return true;
 }
 
+/* Decode command slot `slot`'s material record. present is false for an
+   ordinary draw (word 95 = 0). Every float must be finite and every enum
+   in range; a malformed record refuses the batch like any wire error. */
+static bool webgl_material_decode(const uint8_t *command, size_t slot,
+                                  const uint8_t *records, size_t record_count,
+                                  const WebglSource *sources,
+                                  size_t source_count,
+                                  WebglMaterial *material, bool *present)
+{
+    *present = false;
+    uint32_t selector = webgl_wire_u32(command, 95u);
+    if (selector == 0u) return true;
+    if (records == NULL || selector != slot + 1u || slot >= record_count)
+        return false;
+    const uint8_t *record = records
+        + slot * WEBGL_MATERIAL_WORDS * sizeof(uint32_t);
+    *material = (WebglMaterial) {0};
+    material->flags = webgl_wire_u32(record, 0u);
+    material->light_count = webgl_wire_u32(record, 1u);
+    if ((material->flags & ~WEBGL_MATERIAL_FLAGS) != 0u
+        || material->light_count > WEBGL_MATERIAL_LIGHTS) return false;
+    float *fields[] = {
+        material->model_view, material->projection, material->ambient,
+        material->emissive, material->specular, &material->shininess,
+        material->fog_color, &material->fog_near, &material->fog_far,
+        &material->point_size, &material->point_scale,
+        material->texture_transform, &material->alpha_reference
+    };
+    static const size_t widths[] = {16, 16, 3, 3, 3, 1, 3, 1, 1, 1, 1, 6, 1};
+    size_t word = 2u;
+    for (size_t field = 0; field < sizeof(widths) / sizeof(widths[0]);
+         field++) {
+        for (size_t at = 0; at < widths[field]; at++, word++) {
+            float value = webgl_wire_float(record, word);
+            if (!isfinite(value)) return false;
+            fields[field][at] = value;
+        }
+    }
+    if (!webgl_attribute_view(record, 58u, sources, source_count,
+                              &material->normal)) return false;
+    for (uint32_t light = 0; light < material->light_count; light++) {
+        size_t base = 64u + (size_t) light * 13u;
+        WebglMaterialLight *entry = &material->lights[light];
+        entry->type = webgl_wire_i32(record, base);
+        if (entry->type != 1 && entry->type != 2) return false;
+        float *values[] = {entry->vector, entry->diffuse, entry->specular,
+                           entry->attenuation};
+        for (size_t group = 0; group < 4u; group++)
+            for (size_t at = 0; at < 3u; at++) {
+                float value = webgl_wire_float(
+                    record, base + 1u + group * 3u + at);
+                if (!isfinite(value)) return false;
+                values[group][at] = value;
+            }
+    }
+    if ((material->flags & WEBGL_MATERIAL_PROGRAM) != 0u) {
+        uint32_t header = webgl_wire_u32(record, WEBGL_PROGRAM_WORD);
+        uint32_t steps = header & 0xffu, constants = (header >> 8) & 0xffu;
+        material->program_steps = steps;
+        material->program_outputs = (header >> 16) & 15u;
+        material->program_out = (header >> 20) & 15u;
+        if (steps == 0u || steps > WEBGL_PROGRAM_STEPS
+            || constants > WEBGL_PROGRAM_CONSTANTS
+            || material->program_outputs == 0u
+            || material->program_outputs > 3u) return false;
+        for (uint32_t step = 0; step < steps; step++) {
+            uint32_t word = webgl_wire_u32(
+                record, WEBGL_PROGRAM_WORD + 2u + step * 2u);
+            uint32_t op = word & 63u, imm = word >> 22;
+            if (op >= WEBGL_PROGRAM_OPS
+                || (op == 28u && imm >= constants)
+                || (op == 29u && (((word >> 14) & 15u) < 3u
+                                  || ((word >> 14) & 15u) > 4u
+                                  || imm + ((word >> 14) & 15u)
+                                      > constants))
+                || (op == 27u && (imm < 1u || imm > 4u))) return false;
+            material->program_code[step * 2u] = word;
+            material->program_code[step * 2u + 1u] = webgl_wire_u32(
+                record, WEBGL_PROGRAM_WORD + 3u + step * 2u);
+        }
+        for (uint32_t at = 0; at < constants * 4u; at++) {
+            float value = webgl_wire_float(
+                record, WEBGL_PROGRAM_CONSTANT_WORD + at);
+            if (!isfinite(value)) return false;
+            material->program_constants[at / 4u][at % 4u] = value;
+        }
+    }
+    *present = true;
+    return true;
+}
+
+static float webgl_clamp_unit(float value)
+{
+    return value <= 0.0f ? 0.0f : value >= 1.0f ? 1.0f : value;
+}
+
+/* The GE's per-vertex lighting equation (colour material on ambient and
+   diffuse, non-local viewer off, separate specular), evaluated in the eye
+   space MODEL = model-view, VIEW = identity gives it on the PSP. */
+static void webgl_material_light(const WebglMaterial *material,
+                                 const float eye[3], const float normal[3],
+                                 const float base[4], float lit[3],
+                                 float specular[3])
+{
+    float n[3] = {
+        material->model_view[0] * normal[0] + material->model_view[4] * normal[1]
+            + material->model_view[8] * normal[2],
+        material->model_view[1] * normal[0] + material->model_view[5] * normal[1]
+            + material->model_view[9] * normal[2],
+        material->model_view[2] * normal[0] + material->model_view[6] * normal[1]
+            + material->model_view[10] * normal[2]
+    };
+    float length = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+    if (length > 0.000001f) { n[0] /= length; n[1] /= length; n[2] /= length; }
+    for (int k = 0; k < 3; k++) {
+        lit[k] = material->emissive[k] + base[k] * material->ambient[k];
+        specular[k] = 0.0f;
+    }
+    for (uint32_t index = 0; index < material->light_count; index++) {
+        const WebglMaterialLight *light = &material->lights[index];
+        float l[3], attenuation = 1.0f;
+        if (light->type == 1) {
+            memcpy(l, light->vector, sizeof(l));
+        } else {
+            for (int k = 0; k < 3; k++) l[k] = light->vector[k] - eye[k];
+        }
+        float distance = sqrtf(l[0] * l[0] + l[1] * l[1] + l[2] * l[2]);
+        if (distance > 0.000001f) {
+            l[0] /= distance; l[1] /= distance; l[2] /= distance;
+        }
+        if (light->type == 2) {
+            float divisor = light->attenuation[0]
+                + light->attenuation[1] * distance
+                + light->attenuation[2] * distance * distance;
+            attenuation = divisor > 0.000001f ? 1.0f / divisor : 0.0f;
+            if (attenuation > 1.0f) attenuation = 1.0f;
+        }
+        float diffuse = n[0] * l[0] + n[1] * l[1] + n[2] * l[2];
+        if (diffuse <= 0.0f) continue;
+        for (int k = 0; k < 3; k++)
+            lit[k] += attenuation * base[k]
+                * webgl_clamp_unit(light->diffuse[k]) * diffuse;
+        if ((material->flags & WEBGL_MATERIAL_SPECULAR) == 0u) continue;
+        float h[3] = {l[0], l[1], l[2] + 1.0f};
+        float h_length = sqrtf(h[0] * h[0] + h[1] * h[1] + h[2] * h[2]);
+        if (h_length <= 0.000001f) continue;
+        float facing = (n[0] * h[0] + n[1] * h[1] + n[2] * h[2]) / h_length;
+        if (facing <= 0.0f) continue;
+        float lobe = powf(facing, material->shininess);
+        for (int k = 0; k < 3; k++)
+            specular[k] += attenuation * webgl_clamp_unit(material->specular[k])
+                * webgl_clamp_unit(light->specular[k]) * lobe;
+    }
+    for (int k = 0; k < 3; k++) {
+        lit[k] = webgl_clamp_unit(lit[k]);
+        specular[k] = webgl_clamp_unit(specular[k]);
+    }
+}
+
+/* Per-fragment material terms: alpha test (the GE's GEQUAL reference
+   test), separate specular after the texture, then linear fog. Returns
+   false for a fragment the alpha test removes. */
+static bool webgl_material_shade(const WebglMaterial *material,
+                                 const float specular[3], float fog,
+                                 float color[4])
+{
+    if (material == NULL) return true;
+    if ((material->flags & WEBGL_MATERIAL_ALPHA_TEST) != 0u
+        && color[3] < material->alpha_reference * 255.0f - 0.5f) return false;
+    for (int k = 0; k < 3; k++) {
+        float value = color[k] + specular[k];
+        if ((material->flags & WEBGL_MATERIAL_FOG) != 0u) {
+            float f = webgl_clamp_unit(fog);
+            value = f * value + (1.0f - f)
+                * webgl_clamp_unit(material->fog_color[k]) * 255.0f;
+        }
+        color[k] = value > 255.0f ? 255.0f : value;
+    }
+    return true;
+}
+
+/* One transcendental step over four lanes: on the PSP on the VFPU (C400,
+   saved and restored around the step), elsewhere in C. vsin.q and vcos.q
+   take quarter turns, so the lanes are scaled by 2/pi first. */
+static void webgl_program_transcendental(uint32_t op, const float in[4],
+                                         float out[4])
+{
+#if defined(_MIPS_ARCH_ALLEGREX)
+    float lanes[4] __attribute__((aligned(16)));
+    float saved[4] __attribute__((aligned(16)));
+    float scale = op == 12u || op == 13u ? 0.63661977f
+        : op == 16u ? 1.44269504f : 1.0f;
+    for (int k = 0; k < 4; k++) lanes[k] = in[k] * scale;
+    switch (op) {
+    case 12u:
+        __asm__ volatile ("sv.q C400,0(%1)\n" "lv.q C400,0(%0)\n"
+            "vsin.q C400,C400\n" "sv.q C400,0(%0)\n" "lv.q C400,0(%1)\n"
+            : : "r" (lanes), "r" (saved) : "memory");
+        break;
+    case 13u:
+        __asm__ volatile ("sv.q C400,0(%1)\n" "lv.q C400,0(%0)\n"
+            "vcos.q C400,C400\n" "sv.q C400,0(%0)\n" "lv.q C400,0(%1)\n"
+            : : "r" (lanes), "r" (saved) : "memory");
+        break;
+    case 14u:
+        __asm__ volatile ("sv.q C400,0(%1)\n" "lv.q C400,0(%0)\n"
+            "vsqrt.q C400,C400\n" "sv.q C400,0(%0)\n" "lv.q C400,0(%1)\n"
+            : : "r" (lanes), "r" (saved) : "memory");
+        break;
+    case 15u:
+        __asm__ volatile ("sv.q C400,0(%1)\n" "lv.q C400,0(%0)\n"
+            "vrsq.q C400,C400\n" "sv.q C400,0(%0)\n" "lv.q C400,0(%1)\n"
+            : : "r" (lanes), "r" (saved) : "memory");
+        break;
+    case 16u: case 17u:
+        __asm__ volatile ("sv.q C400,0(%1)\n" "lv.q C400,0(%0)\n"
+            "vexp2.q C400,C400\n" "sv.q C400,0(%0)\n" "lv.q C400,0(%1)\n"
+            : : "r" (lanes), "r" (saved) : "memory");
+        break;
+    default:
+        __asm__ volatile ("sv.q C400,0(%1)\n" "lv.q C400,0(%0)\n"
+            "vlog2.q C400,C400\n" "sv.q C400,0(%0)\n" "lv.q C400,0(%1)\n"
+            : : "r" (lanes), "r" (saved) : "memory");
+        if (op == 18u)
+            for (int k = 0; k < 4; k++) lanes[k] *= 0.69314718f;
+        break;
+    }
+    memcpy(out, lanes, sizeof(lanes));
+#else
+    for (int k = 0; k < 4; k++) {
+        float x = in[k];
+        out[k] = op == 12u ? sinf(x) : op == 13u ? cosf(x)
+            : op == 14u ? sqrtf(x) : op == 15u ? 1.0f / sqrtf(x)
+            : op == 16u ? expf(x) : op == 17u ? exp2f(x)
+            : op == 18u ? logf(x) : log2f(x);
+    }
+#endif
+}
+
+/* Runs the material's per-vertex colour program (webgl.js
+   compileVertexProgram) with r0-r2 holding the position, texture-
+   coordinate and normal attributes. False when an output is not finite:
+   the vertex is dropped like non-finite attribute data. */
+static bool webgl_program_run(const WebglMaterial *material,
+                              float r[16][4], float out[4])
+{
+    for (uint32_t step = 0; step < material->program_steps; step++) {
+        uint32_t w0 = material->program_code[step * 2u];
+        uint32_t w1 = material->program_code[step * 2u + 1u];
+        uint32_t op = w0 & 63u, dst = (w0 >> 6) & 15u;
+        uint32_t ra = (w0 >> 10) & 15u, rb = (w0 >> 14) & 15u;
+        uint32_t rc = (w0 >> 18) & 15u, imm = w0 >> 22;
+        float a[4], b[4], c[4], v[4] = {0, 0, 0, 0};
+        for (int k = 0; k < 4; k++) {
+            a[k] = r[ra][(w1 >> (k * 2)) & 3u];
+            b[k] = r[rb][(w1 >> (8 + k * 2)) & 3u];
+            c[k] = r[rc][(w1 >> (16 + k * 2)) & 3u];
+        }
+        if (op >= 12u && op <= 19u) {
+            webgl_program_transcendental(op, a, v);
+        } else if (op == 27u) {
+            float sum = 0.0f;
+            for (uint32_t k = 0; k < imm; k++) sum += a[k] * b[k];
+            v[0] = v[1] = v[2] = v[3] = sum;
+        } else if (op == 28u) {
+            memcpy(v, material->program_constants[imm], sizeof(v));
+        } else if (op == 29u) {
+            for (uint32_t row = 0; row < rb; row++)
+                for (uint32_t k = 0; k < rb; k++)
+                    v[row] += material->program_constants[imm + k][row] * a[k];
+        } else {
+            for (int k = 0; k < 4; k++) {
+                float x = a[k], y = b[k], z = c[k], t;
+                switch (op) {
+                case 0u: t = x; break;
+                case 1u: t = x + y; break;
+                case 2u: t = x - y; break;
+                case 3u: t = x * y; break;
+                case 4u: t = x / y; break;
+                case 5u: t = -x; break;
+                case 6u: t = y < x ? y : x; break;
+                case 7u: t = y > x ? y : x; break;
+                case 8u: t = fabsf(x); break;
+                case 9u: t = floorf(x); break;
+                case 10u: t = ceilf(x); break;
+                case 11u: t = x - floorf(x); break;
+                case 20u: t = powf(x, y); break;
+                case 21u: t = y >= x ? 1.0f : 0.0f; break;
+                case 22u: t = x - y * floorf(x / y); break;
+                case 23u: t = x > 0.0f ? 1.0f : x < 0.0f ? -1.0f : 0.0f; break;
+                case 24u: t = x * (1.0f - z) + y * z; break;
+                case 25u: t = x < y ? y : x; t = t > z ? z : t; break;
+                case 26u:
+                    t = (z - x) / (y - x);
+                    t = t < 0.0f ? 0.0f : t > 1.0f ? 1.0f : t;
+                    t = t * t * (3.0f - 2.0f * t);
+                    break;
+                case 30u: t = x != 0.0f ? y : z; break;
+                case 31u: t = x < y ? 1.0f : 0.0f; break;
+                case 32u: t = x <= y ? 1.0f : 0.0f; break;
+                case 33u: t = x > y ? 1.0f : 0.0f; break;
+                case 34u: t = x >= y ? 1.0f : 0.0f; break;
+                case 35u: t = x == y ? 1.0f : 0.0f; break;
+                case 36u: t = x != y ? 1.0f : 0.0f; break;
+                default: t = x == 0.0f ? 1.0f : 0.0f; break;
+                }
+                v[k] = t;
+            }
+        }
+        for (int k = 0; k < 4; k++)
+            if ((w1 >> (24 + k)) & 1u) r[dst][k] = v[k];
+    }
+    memcpy(out, r[material->program_out], sizeof(float) * 4u);
+    bool finite = true;
+    for (int k = 0; k < 4; k++)
+        if ((k < 3 ? material->program_outputs & 1u
+                   : material->program_outputs & 2u) != 0u)
+            finite = finite && isfinite(out[k]);
+    return finite;
+}
+
+/* The per-draw program budget webgl.js enforces before it records a draw:
+   vertices x instances x steps. A draw past it is dropped. */
+static bool webgl_program_bounded(const WebglMaterial *material,
+                                  int count, uint32_t instances)
+{
+    if ((material->flags & WEBGL_MATERIAL_PROGRAM) == 0u) return true;
+    uint64_t work = (uint64_t) (count > 0 ? count : 0) * instances
+        * material->program_steps;
+    return work <= WEBGL_PROGRAM_STEP_LIMIT;
+}
+
+/* Multiplies color by the program's per-vertex factor for this vertex.
+   *drawn is false when the factor is not finite. False is a read error. */
+static bool webgl_program_color(const WebglMaterial *material,
+                                uint32_t index, const float position[4],
+                                const float texcoord[4], float color[4],
+                                bool *drawn)
+{
+    static const float normal_fallback[4] = {0, 0, 1, 0};
+    float r[16][4] = {{0}};
+    memcpy(r[0], position, sizeof(r[0]));
+    memcpy(r[1], texcoord, sizeof(r[1]));
+    if (!webgl_attribute_from_view(&material->normal, index, r[2],
+                                   normal_fallback)) return false;
+    float factor[4];
+    *drawn = webgl_program_run(material, r, factor);
+    if (!*drawn) return true;
+    if ((material->program_outputs & 1u) != 0u)
+        for (int k = 0; k < 3; k++) color[k] *= factor[k];
+    if ((material->program_outputs & 2u) != 0u) color[3] *= factor[3];
+    return true;
+}
+
 static bool webgl_draw_vertex_index(const WebglDecodedDraw *draw,
                                     uint32_t sequence, uint32_t *vertex)
 {
@@ -1089,9 +1570,109 @@ static void webgl_vertex_project(const WebglDecodedDraw *draw,
         && vertex->z >= -1048576.0f && vertex->z <= 1048576.0f;
 }
 
+/* The material point transform: the clip matrix's rows and the
+   model-view row giving eye-space z (identity's z row when the record has
+   no split model-view). On the PSP, webgl_point_transform_begin parks the
+   rows in VFPU registers for the whole draw (clip rows in C000..C030, the
+   eye row in C100; C200, C300 and C310 are per-point scratch) and each
+   vertex then costs four vdot.q and a vdot.t. Elsewhere the same rows are
+   applied in C, in the order webgl_decode_vertex's own loop sums them, so
+   the host lab draws the same points. Only unlit point draws use it:
+   lighting needs the full eye position. */
+typedef struct {
+    float rows[5][4] __attribute__((aligned(16)));
+#if defined(_MIPS_ARCH_ALLEGREX)
+    float saved[8][4] __attribute__((aligned(16)));
+    uint32_t prefix[3];
+#endif
+} WebglPointTransform;
+
+static void webgl_point_transform_begin(const WebglDecodedDraw *draw,
+                                        WebglPointTransform *transform)
+{
+    for (int row = 0; row < 4; row++)
+        for (int column = 0; column < 4; column++)
+            transform->rows[row][column] = draw->matrix[column * 4 + row];
+    const WebglMaterial *material = draw->material;
+    bool split = material != NULL
+        && (material->flags & WEBGL_MATERIAL_SPLIT) != 0u;
+    for (int column = 0; column < 4; column++)
+        transform->rows[4][column] = split
+            ? material->model_view[column * 4 + 2]
+            : column == 2 ? 1.0f : 0.0f;
+#if defined(_MIPS_ARCH_ALLEGREX)
+    /* Other VFPU users on this thread save and restore what they borrow;
+       so does this, and it clears any pending prefix before the dots. */
+    __asm__ volatile (
+        "sv.q C000,0(%3)\n" "sv.q C010,16(%3)\n" "sv.q C020,32(%3)\n"
+        "sv.q C030,48(%3)\n" "sv.q C100,64(%3)\n" "sv.q C200,80(%3)\n"
+        "sv.q C300,96(%3)\n" "sv.q C310,112(%3)\n"
+        "mfvc %0,$128\n" "mfvc %1,$129\n" "mfvc %2,$130\n"
+        "mtvc %5,$128\n" "mtvc %5,$129\n" "mtvc $0,$130\n"
+        "lv.q C000,0(%4)\n" "lv.q C010,16(%4)\n" "lv.q C020,32(%4)\n"
+        "lv.q C030,48(%4)\n" "lv.q C100,64(%4)\n"
+        : "=&r" (transform->prefix[0]), "=&r" (transform->prefix[1]),
+          "=&r" (transform->prefix[2])
+        : "r" (transform->saved), "r" (transform->rows),
+          "r" (UINT32_C(0xe4)) : "memory");
+#endif
+}
+
+static void webgl_point_transform_end(WebglPointTransform *transform)
+{
+#if defined(_MIPS_ARCH_ALLEGREX)
+    __asm__ volatile (
+        "lv.q C000,0(%3)\n" "lv.q C010,16(%3)\n" "lv.q C020,32(%3)\n"
+        "lv.q C030,48(%3)\n" "lv.q C100,64(%3)\n" "lv.q C200,80(%3)\n"
+        "lv.q C300,96(%3)\n" "lv.q C310,112(%3)\n"
+        "mtvc %0,$128\n" "mtvc %1,$129\n" "mtvc %2,$130\n"
+        : : "r" (transform->prefix[0]), "r" (transform->prefix[1]),
+            "r" (transform->prefix[2]), "r" (transform->saved)
+        : "memory");
+#else
+    (void) transform;
+#endif
+}
+
+/* clip = rows[0..3] . position and *eye_z = rows[4] . (x, y, z, 1), as
+   webgl_decode_vertex computes them (the authored w, within 1e-6 of one,
+   enters the clip product only). */
+static void webgl_point_transform_apply(const WebglPointTransform *transform,
+                                        const float position[4],
+                                        float clip[4], float *eye_z)
+{
+#if defined(_MIPS_ARCH_ALLEGREX)
+    float in[4] __attribute__((aligned(16))) = {
+        position[0], position[1], position[2], position[3]
+    };
+    float out[8] __attribute__((aligned(16)));
+    (void) transform;
+    __asm__ volatile (
+        "lv.q C200,0(%1)\n"
+        "vdot.q S300,C000,C200\n" "vdot.q S301,C010,C200\n"
+        "vdot.q S302,C020,C200\n" "vdot.q S303,C030,C200\n"
+        "vdot.t S310,C100,C200\n" "vadd.s S310,S310,S103\n"
+        "sv.q C300,0(%0)\n" "sv.s S310,16(%0)\n"
+        : : "r" (out), "r" (in) : "memory");
+    memcpy(clip, out, sizeof(float) * 4u);
+    *eye_z = out[4];
+#else
+    for (int row = 0; row < 4; row++) {
+        float value = 0.0f;
+        for (int column = 0; column < 4; column++)
+            value += transform->rows[row][column] * position[column];
+        clip[row] = value;
+    }
+    const float *eye = transform->rows[4];
+    *eye_z = eye[0] * position[0] + eye[1] * position[1]
+        + eye[2] * position[2] + eye[3];
+#endif
+}
+
 static bool webgl_decode_vertex(const WebglDecodedDraw *draw,
                                 uint32_t sequence,
                                 int surface_height,
+                                const WebglPointTransform *transform,
                                 WebglVertex *output)
 {
     uint32_t index = 0;
@@ -1117,12 +1698,25 @@ static bool webgl_decode_vertex(const WebglDecodedDraw *draw,
        non-unit position w; perspective generated by matrices remains fully
        supported. */
     if (fabsf(position[3] - 1.0f) > 0.000001f) return true;
+    if (draw->material != NULL
+        && (draw->material->flags & WEBGL_MATERIAL_PROGRAM) != 0u) {
+        bool drawn = true;
+        if (!webgl_program_color(draw->material, index, position, texcoord,
+                                 color, &drawn)) return false;
+        if (!drawn) return true;
+    }
     float transformed[4] = {0, 0, 0, 0};
-    for (int row = 0; row < 4; row++) {
-        for (int column = 0; column < 4; column++) {
-            transformed[row] += draw->matrix[(size_t) column * 4u
-                                              + (size_t) row]
-                                * position[column];
+    float transformed_eye_z = 0.0f;
+    if (transform != NULL) {
+        webgl_point_transform_apply(transform, position, transformed,
+                                    &transformed_eye_z);
+    } else {
+        for (int row = 0; row < 4; row++) {
+            for (int column = 0; column < 4; column++) {
+                transformed[row] += draw->matrix[(size_t) column * 4u
+                                                  + (size_t) row]
+                                    * position[column];
+            }
         }
     }
     for (int component = 0; component < 4; component++)
@@ -1133,6 +1727,57 @@ static bool webgl_decode_vertex(const WebglDecodedDraw *draw,
     output->green = webgl_color_byte(color[1] * draw->uniform[1]);
     output->blue = webgl_color_byte(color[2] * draw->uniform[2]);
     output->alpha = webgl_color_byte(color[3] * draw->uniform[3]);
+    output->fog = 1.0f;
+    output->point_size = 1.0f;
+    const WebglMaterial *material = draw->material;
+    if (material != NULL) {
+        float eye[3] = {position[0], position[1], position[2]};
+        if (transform != NULL
+            && (material->flags & WEBGL_MATERIAL_LIGHTING) == 0u) {
+            eye[2] = transformed_eye_z;
+        } else if ((material->flags & WEBGL_MATERIAL_SPLIT) != 0u) {
+            for (int row = 0; row < 3; row++)
+                eye[row] = material->model_view[row]
+                    * position[0] + material->model_view[4 + row] * position[1]
+                    + material->model_view[8 + row] * position[2]
+                    + material->model_view[12 + row];
+        }
+        if ((material->flags & WEBGL_MATERIAL_LIGHTING) != 0u) {
+            float normal[4];
+            static const float normal_fallback[4] = {0, 0, 1, 0};
+            if (!webgl_attribute_from_view(&material->normal, index, normal,
+                                           normal_fallback)) return false;
+            float base[4] = {
+                output->red / 255.0f, output->green / 255.0f,
+                output->blue / 255.0f, output->alpha / 255.0f
+            }, lit[3], specular[3];
+            webgl_material_light(material, eye, normal, base, lit, specular);
+            output->red = webgl_color_byte(lit[0]);
+            output->green = webgl_color_byte(lit[1]);
+            output->blue = webgl_color_byte(lit[2]);
+            for (int k = 0; k < 3; k++)
+                output->specular[k] = webgl_color_byte(specular[k]);
+        }
+        if ((material->flags & WEBGL_MATERIAL_TEXTURE_TRANSFORM) != 0u) {
+            const float *t = material->texture_transform;
+            output->u = t[0] * texcoord[0] + t[1] * texcoord[1] + t[2];
+            output->v = t[3] * texcoord[0] + t[4] * texcoord[1] + t[5];
+        }
+        float depth = -eye[2];
+        if ((material->flags & WEBGL_MATERIAL_FOG) != 0u) {
+            float range = material->fog_far - material->fog_near;
+            output->fog = fabsf(range) < 0.000001f ? (depth < material->fog_far)
+                : webgl_clamp_unit((material->fog_far - depth) / range);
+        }
+        if ((material->flags & WEBGL_MATERIAL_POINT_SIZE) != 0u) {
+            float size = material->point_size;
+            if (material->point_scale != 0.0f)
+                size += depth > 0.000001f ? material->point_scale / depth
+                                          : WEBGL_POINT_SIZE_LIMIT;
+            output->point_size = size < 1.0f ? 1.0f
+                : size > WEBGL_POINT_SIZE_LIMIT ? WEBGL_POINT_SIZE_LIMIT : size;
+        }
+    }
     output->clip_valid = true;
     webgl_vertex_project(draw, surface_height, output);
     return true;
@@ -1215,6 +1860,7 @@ typedef struct {
     bool blend;
     bool depth;
     bool cull;
+    const WebglMaterial *material;
 } WebglRasterState;
 
 /* Resolve a partially covered edge sample without allocating a multisample
@@ -1505,11 +2151,34 @@ static bool webgl_raster_triangle(uint8_t *surface, int width, int height,
             float pa = wa * a->inverse_w / perspective_sum;
             float pb = wb * b->inverse_w / perspective_sum;
             float pc = wc * c->inverse_w / perspective_sum;
+            uint8_t sample[4];
+            if (state->material != NULL) {
+                webgl_sample_texture(texture, sources,
+                    pa * a->u + pb * b->u + pc * c->u,
+                    pa * a->v + pb * b->v + pc * c->v, sample);
+                float shaded[4] = {
+                    (pa * a->red + pb * b->red + pc * c->red) * sample[0] / 255.0f,
+                    (pa * a->green + pb * b->green + pc * c->green) * sample[1] / 255.0f,
+                    (pa * a->blue + pb * b->blue + pc * c->blue) * sample[2] / 255.0f,
+                    (pa * a->alpha + pb * b->alpha + pc * c->alpha) * sample[3] / 255.0f
+                }, specular[3];
+                for (int k = 0; k < 3; k++)
+                    specular[k] = pa * a->specular[k] + pb * b->specular[k]
+                        + pc * c->specular[k];
+                if (!webgl_material_shade(state->material, specular,
+                        pa * a->fog + pb * b->fog + pc * c->fog, shaded)
+                    || !webgl_depth_test_write(
+                        depth, width, height, x, y,
+                        wa * a->z + wb * b->z + wc * c->z, centre, state))
+                    continue;
+                webgl_pixel_coverage(surface, width, height, x, y,
+                    shaded[0], shaded[1], shaded[2], shaded[3], state, coverage);
+                continue;
+            }
             if (!webgl_depth_test_write(
                     depth, width, height, x, y,
                     wa * a->z + wb * b->z + wc * c->z, centre, state))
                 continue;
-            uint8_t sample[4];
             webgl_sample_texture(texture, sources,
                 pa * a->u + pb * b->u + pc * c->u,
                 pa * a->v + pb * b->v + pc * c->v, sample);
@@ -1557,6 +2226,10 @@ static void webgl_clip_edge(const WebglVertex *inside,
     output->green += t * (outside->green - inside->green);
     output->blue += t * (outside->blue - inside->blue);
     output->alpha += t * (outside->alpha - inside->alpha);
+    for (size_t component = 0; component < 3u; component++)
+        output->specular[component] += t
+            * (outside->specular[component] - inside->specular[component]);
+    output->fog += t * (outside->fog - inside->fog);
 }
 
 /* Rasterize a triangle, clipping it against the near and far planes in
@@ -1657,15 +2330,86 @@ static bool webgl_raster_line(uint8_t *surface, uint16_t *depth,
             || fabsf(perspective_sum) < 0.000001f) continue;
         float right = ratio * b->inverse_w / perspective_sum;
         float left = 1.0f - right;
+        float shaded[4] = {
+            left * a->red + right * b->red,
+            left * a->green + right * b->green,
+            left * a->blue + right * b->blue,
+            left * a->alpha + right * b->alpha
+        }, specular[3];
+        for (int k = 0; k < 3; k++)
+            specular[k] = left * a->specular[k] + right * b->specular[k];
+        if (!webgl_material_shade(state->material, specular,
+                                  left * a->fog + right * b->fog, shaded))
+            continue;
         if (!webgl_depth_test_write(
                 depth, width, height, x, y,
                 (1.0f - ratio) * a->z + ratio * b->z, true, state)) continue;
         webgl_pixel(surface, width, height, x, y,
-                    left * a->red + right * b->red,
-                    left * a->green + right * b->green,
-                    left * a->blue + right * b->blue,
-                    left * a->alpha + right * b->alpha, state->blend,
+                    shaded[0], shaded[1], shaded[2], shaded[3], state->blend,
                     state->source_factor, state->destination_factor);
+    }
+    return true;
+}
+
+/* A material point is a square sprite of its point size (the GE draws
+   the same square as a through-mode GU_SPRITES pair), textured over
+   gl_PointCoord when the shader samples it, else with the one texel at the
+   point's own (transformed) texcoord, as WebGL samples a varying that is
+   constant over the point. */
+static bool webgl_raster_point(uint8_t *surface, uint16_t *depth,
+                               int width, int height,
+                               const WebglVertex *point,
+                               const WebglRasterState *state,
+                               const WebglTexture *texture,
+                               const WebglSource *sources, size_t *work)
+{
+    if (!point->geometry_valid) return true;
+    const WebglMaterial *material = state->material;
+    float size = point->point_size;
+    float left = point->x - size * 0.5f, top = point->y - size * 0.5f;
+    int x0 = (int) floorf(left + 0.5f), y0 = (int) floorf(top + 0.5f);
+    int extent = (int) floorf(size + 0.5f);
+    if (extent < 1) extent = 1;
+    if ((size_t) extent * (size_t) extent > WEBGL_RASTER_WORK_LIMIT - *work)
+        return false;
+    *work += (size_t) extent * (size_t) extent;
+    bool coord = (material->flags & WEBGL_MATERIAL_POINT_COORD) != 0u;
+    uint8_t point_sample[4] = {255, 255, 255, 255};
+    if (!coord) webgl_sample_texture(texture, sources, point->u, point->v,
+                                     point_sample);
+    for (int y = y0; y < y0 + extent; y++) {
+        for (int x = x0; x < x0 + extent; x++) {
+            if (x < 0 || y < 0 || x >= width || y >= height
+                || !webgl_scissor_contains(&state->scissor, x, y)) continue;
+            uint8_t sample[4];
+            memcpy(sample, point_sample, sizeof(sample));
+            if (coord) {
+                float s = ((float) x + 0.5f - left) / size;
+                float t = ((float) y + 0.5f - top) / size;
+                if ((material->flags & WEBGL_MATERIAL_POINT_COORD_FLIP) != 0u)
+                    t = 1.0f - t;
+                float u = s, v = t;
+                if ((material->flags & WEBGL_MATERIAL_TEXTURE_TRANSFORM) != 0u) {
+                    const float *m = material->texture_transform;
+                    u = m[0] * s + m[1] * t + m[2];
+                    v = m[3] * s + m[4] * t + m[5];
+                }
+                webgl_sample_texture(texture, sources, u, v, sample);
+            }
+            float shaded[4] = {
+                point->red * sample[0] / 255.0f,
+                point->green * sample[1] / 255.0f,
+                point->blue * sample[2] / 255.0f,
+                point->alpha * sample[3] / 255.0f
+            };
+            if (!webgl_material_shade(material, point->specular, point->fog,
+                                      shaded)
+                || !webgl_depth_test_write(depth, width, height, x, y,
+                                           point->z, true, state)) continue;
+            webgl_pixel(surface, width, height, x, y, shaded[0], shaded[1],
+                        shaded[2], shaded[3], state->blend,
+                        state->source_factor, state->destination_factor);
+        }
     }
     return true;
 }
@@ -1680,7 +2424,9 @@ static bool webgl_render_software(Budget *budget, uint8_t *surface,
                                   const WebglSource *sources,
                                   size_t source_count,
                                   const WebglTexture *textures,
-                                  size_t texture_count, bool antialias)
+                                  size_t texture_count, bool antialias,
+                                  const uint8_t *materials,
+                                  size_t material_count)
 {
     size_t work = 0;
     WebglVertex *decoded = budget_malloc_category(
@@ -1757,11 +2503,23 @@ static bool webgl_render_software(Budget *budget, uint8_t *surface,
                                      &texture_index)) { rendered = false; break; }
         WebglDecodedDraw base_draw;
         WebglRasterState raster_state;
+        WebglMaterial material;
+        bool material_present = false;
         if (!webgl_decode_draw(command, sources, source_count,
                                width, height, &base_draw)
-            || !webgl_raster_state_decode(command, height, &raster_state)) {
+            || !webgl_raster_state_decode(command, height, &raster_state)
+            || !webgl_material_decode(command, command_index, materials,
+                                      material_count, sources, source_count,
+                                      &material, &material_present)) {
             rendered = false;
             break;
+        }
+        if (material_present
+            && !webgl_program_bounded(&material, count,
+                                      base_draw.instance_count)) continue;
+        if (material_present) {
+            base_draw.material = &material;
+            raster_state.material = &material;
         }
         const WebglTexture *texture = texture_index >= 0
             ? &textures[texture_index] : NULL;
@@ -1771,18 +2529,35 @@ static bool webgl_render_software(Budget *budget, uint8_t *surface,
             if (!webgl_instance_draw(&base_draw, instance, &draw)) {
                 rendered = false; break;
             }
+            /* Unlit material points take the shared point transform, as
+               the PSP's sprite path does. */
+            bool point_transform = mode == WEBGL_POINTS
+                && material_present
+                && (material.flags & WEBGL_MATERIAL_LIGHTING) == 0u;
+            WebglPointTransform transform;
+            if (point_transform) webgl_point_transform_begin(&draw, &transform);
             for (int i = 0; i < count; i++) {
                 if (!webgl_decode_vertex(&draw, (uint32_t) i, height,
+                                         point_transform ? &transform : NULL,
                                          &decoded[i])) {
                     rendered = false; break;
                 }
             }
+            if (point_transform) webgl_point_transform_end(&transform);
             if (!rendered) break;
             if (mode == WEBGL_POINTS) {
             if ((size_t) count > WEBGL_RASTER_WORK_LIMIT - work) {
                 budget_free(budget, decoded); return true;
             }
             work += (size_t) count;
+            if (raster_state.material != NULL) {
+                for (int i = 0; i < count; i++) {
+                    if (!webgl_raster_point(surface, depth, width, height,
+                                            &decoded[i], &raster_state,
+                                            texture, sources, &work)) break;
+                }
+                continue;
+            }
             for (int i = 0; i < count; i++) {
                 if (!decoded[i].geometry_valid) continue;
                 int pixel_x = (int) decoded[i].x;
@@ -1847,6 +2622,10 @@ static bool webgl_render_software(Budget *budget, uint8_t *surface,
 
 #if defined(__PSP__)
 #define WEBGL_GE_LIST_BYTES (64u * 1024u)
+/* Scratch slots one flush may reserve: every vertex, LINE_LOOP closing
+   and material doubling, plus a material draw's two spare slots. */
+#define WEBGL_GE_SCRATCH_SLOT_LIMIT \
+    (2u * (WEBGL_VERTEX_LIMIT + 2u * WEBGL_COMMAND_LIMIT))
 #define WEBGL_GE_COLOR_OFFSET ((size_t) 0x0cc000)
 #define WEBGL_GE_DEPTH_OFFSET ((size_t) 0x154000)
 #define WEBGL_GE_TEXTURE_OFFSET ((size_t) 0x198000)
@@ -1950,7 +2729,8 @@ static void webgl_ge_tint_colors(WebglGeVertex *vertices, size_t count,
 }
 
 static bool webgl_ge_stable_signature(
-    const uint8_t *command, ScriptWebglGeometryCacheSignature *signature)
+    const uint8_t *command, ScriptWebglGeometryCacheSignature *signature,
+    size_t *used)
 {
     if (command == NULL || signature == NULL) return false;
     memset(signature, 0, sizeof(*signature));
@@ -1979,6 +2759,7 @@ static bool webgl_ge_stable_signature(
         signature->words[out++] = webgl_wire_u32(command, slot);
     for (size_t slot = 60u; slot < 64u; slot++)
         signature->words[out++] = webgl_wire_u32(command, slot);
+    if (used != NULL) *used = out;
     return out <= SCRIPT_WEBGL_GEOMETRY_CACHE_SIGNATURE_WORDS;
 }
 
@@ -2080,8 +2861,20 @@ static const ScePspFMatrix4 webgl_ge_identity = {
 _Static_assert(sizeof(ScePspFMatrix4) == sizeof(float) * 16u,
                "PSP GE matrix must retain 16 WebGL column-major floats");
 
-static unsigned int __attribute__((aligned(64)))
-    webgl_ge_list[WEBGL_GE_LIST_BYTES / sizeof(unsigned int)];
+/* The display list is held only while a realm renders WebGL (ge_scratch.h):
+   allocated by the first frame, reused by every later one, and freed when
+   the realm that last rendered is destroyed. Every webgl_render_ge() exit
+   after sceGuStart() waits in sceGuSync(), so outside a render the GE never
+   reads it. Written through the uncached alias only. */
+static GeScratch webgl_ge_list_scratch;
+static unsigned int *webgl_ge_list;
+/* Identity only, never dereferenced. Not the realm epoch: releasing a
+   surface advances that while the realm keeps rendering. */
+static const DomBridge *webgl_ge_list_owner;
+static const GeScratchOps webgl_ge_list_ops = {
+    .allocate = ge_scratch_heap_allocate,
+    .release = ge_scratch_heap_release
+};
 
 /* Most list bytes one step between two webgl_ge_list_make_room() calls can
    emit. The largest step is a command's state block with its sceGuClear
@@ -2243,10 +3036,17 @@ static bool webgl_ge_vertex_storage_required(
                 && (size_t) instances > SIZE_MAX / required) return false;
             required *= (size_t) instances;
         }
+        bool material = webgl_wire_u32(command, 95u) != 0u;
+        /* A material draw's lit block is 36 bytes a vertex, and an indexed
+           one adds up to one spare span vertex and 2-byte indices:
+           36 (count + 1) + 2 (count + 1) bytes fits 2 (count + 1) 24-byte
+           slots for every count (2 count alone is short below four). */
         if (required > WEBGL_VERTEX_LIMIT + 1u
-            || vertices > WEBGL_VERTEX_LIMIT + WEBGL_COMMAND_LIMIT
-            || required > WEBGL_VERTEX_LIMIT + WEBGL_COMMAND_LIMIT - vertices)
+            || vertices > WEBGL_GE_SCRATCH_SLOT_LIMIT
+            || (material ? 2u * required + 2u : required)
+                > WEBGL_GE_SCRATCH_SLOT_LIMIT - vertices)
             return false;
+        if (material) required = 2u * required + 2u;
         vertices += required;
         if ((size_t) count > maximum_draw) maximum_draw = (size_t) count;
         if ((size_t) instances > maximum_instances)
@@ -2495,6 +3295,523 @@ static void webgl_ge_geometry_cache_abandon(DomBridge *bridge, size_t slot)
     bridge->webgl_geometry_vertices[slot] = NULL;
 }
 
+/* GE vertex for material draws: lit triangles and lines carry a normal. */
+typedef struct {
+    float u;
+    float v;
+    uint32_t color;
+    float nx;
+    float ny;
+    float nz;
+    float x;
+    float y;
+    float z;
+} WebglGeLitVertex;
+
+/* A lit block has at most REQUIRED + 1 vertices and REQUIRED indices
+   (REQUIRED = count plus a LINE_LOOP closing), so the 2 * REQUIRED + 2
+   slots webgl_ge_vertex_storage_required reserves always suffice. */
+_Static_assert(sizeof(WebglGeLitVertex) + sizeof(uint16_t)
+                   <= 2u * sizeof(WebglGeVertex),
+               "a lit vertex and its index fit two scratch slots");
+
+static uint32_t webgl_ge_rgb(const float color[3])
+{
+    return (uint32_t) webgl_color_byte(color[0])
+        | (uint32_t) webgl_color_byte(color[1]) << 8
+        | (uint32_t) webgl_color_byte(color[2]) << 16
+        | UINT32_C(0xff000000);
+}
+
+/* A material draw's lit vertices (and, for an indexed draw, its 16-bit
+   indices rebased to the lowest vertex used) in one block: the form the GE
+   draws and the geometry cache retains. */
+typedef struct {
+    WebglGeLitVertex *vertices;
+    uint16_t *indices;
+    size_t vertex_count;
+    size_t index_count;
+    size_t bytes;
+    bool drawable;
+} WebglGeLitBlock;
+
+static size_t webgl_ge_lit_block_bytes(size_t vertices, size_t indices)
+{
+    return vertices * sizeof(WebglGeLitVertex) + indices * sizeof(uint16_t);
+}
+
+/* Reads one lit vertex; *finite is false for geometry the draw drops. */
+static bool webgl_ge_lit_vertex(const WebglDecodedDraw *draw,
+                                const WebglMaterial *material,
+                                uint32_t index, WebglGeLitVertex *lit,
+                                bool *finite)
+{
+    float position[4], color[4], texcoord[4], normal[4];
+    static const float position_fallback[4] = {0, 0, 0, 1};
+    static const float color_fallback[4] = {1, 1, 1, 1};
+    static const float texcoord_fallback[4] = {0, 0, 0, 1};
+    static const float normal_fallback[4] = {0, 0, 1, 0};
+    if (!webgl_attribute_from_view(&draw->position, index, position,
+                                   position_fallback)
+        || !webgl_attribute_from_view(&draw->color, index, color,
+                                      color_fallback)
+        || !webgl_attribute_from_view(&draw->texcoord, index, texcoord,
+                                      texcoord_fallback)
+        || !webgl_attribute_from_view(&material->normal, index, normal,
+                                      normal_fallback)) return false;
+    bool valid = fabsf(position[3] - 1.0f) <= 0.000001f;
+    for (int k = 0; k < 4; k++)
+        valid = valid && isfinite(position[k]) && isfinite(color[k])
+            && isfinite(texcoord[k]) && isfinite(normal[k]);
+    if (valid && (material->flags & WEBGL_MATERIAL_PROGRAM) != 0u
+        && !webgl_program_color(material, index, position, texcoord, color,
+                                 &valid)) return false;
+    *finite = valid;
+    if (!valid) return true;
+    float u = texcoord[0], v = texcoord[1];
+    if ((material->flags & WEBGL_MATERIAL_TEXTURE_TRANSFORM) != 0u) {
+        const float *m = material->texture_transform;
+        u = m[0] * texcoord[0] + m[1] * texcoord[1] + m[2];
+        v = m[3] * texcoord[0] + m[4] * texcoord[1] + m[5];
+    }
+    *lit = (WebglGeLitVertex) {
+        .u = u, .v = v,
+        .color = (uint32_t) webgl_color_byte(color[0] * draw->uniform[0])
+            | (uint32_t) webgl_color_byte(color[1] * draw->uniform[1]) << 8
+            | (uint32_t) webgl_color_byte(color[2] * draw->uniform[2]) << 16
+            | (uint32_t) webgl_color_byte(color[3] * draw->uniform[3]) << 24,
+        .nx = normal[0], .ny = normal[1], .nz = normal[2],
+        .x = position[0], .y = position[1], .z = position[2]
+    };
+    return true;
+}
+
+/* The lit block's shape. An indexed draw whose indices span at most one
+   vertex more than it has is drawn indexed from that span's vertices (each
+   shared vertex read once); anything else is expanded per sequence, with
+   LINE_LOOP's closing vertex repeated. *base is the span's first vertex. */
+static bool webgl_ge_lit_layout(const WebglDecodedDraw *draw, int mode,
+                                int count, uint32_t *base,
+                                size_t *vertex_count, size_t *index_count)
+{
+    size_t closing = mode == WEBGL_LINE_LOOP && count > 1 ? 1u : 0u;
+    *base = 0;
+    *vertex_count = (size_t) count + closing;
+    *index_count = 0;
+    if (!draw->indexed || count <= 0) return true;
+    size_t element = draw->index_type == WEBGL_UNSIGNED_BYTE ? 1u : 2u;
+    const WebglSource *source = draw->index_source;
+    if (draw->index_offset > source->length
+        || (size_t) count > (source->length - draw->index_offset) / element)
+        return false;
+    const uint8_t *bytes = source->bytes + draw->index_offset;
+    uint32_t low = UINT32_MAX, high = 0;
+    for (int i = 0; i < count; i++) {
+        uint32_t value = bytes[(size_t) i * element];
+        if (element == 2u) {
+            uint16_t wide = 0;
+            memcpy(&wide, bytes + (size_t) i * 2u, sizeof(wide));
+            value = wide;
+        }
+        if (value < low) low = value;
+        if (value > high) high = value;
+    }
+    if ((size_t) (high - low) + 1u > (size_t) count + 1u) return true;
+    *base = low;
+    *vertex_count = (size_t) (high - low) + 1u;
+    *index_count = (size_t) count + closing;
+    return true;
+}
+
+/* Builds the draw's lit block in storage (capacity bytes, 4-byte aligned)
+   in the shape webgl_ge_lit_layout gave (BASE, VERTEX_COUNT, INDEX_COUNT).
+   A span vertex no index uses may hold any data; when one is not finite
+   the block is rebuilt expanded so only drawn vertices decide. A drawn
+   vertex that is not finite drops the draw (block->drawable false), as
+   ordinary draws do. False is a malformed draw. */
+static bool webgl_ge_lit_build(const WebglDecodedDraw *draw,
+                               const WebglMaterial *material, int mode,
+                               int count, uint32_t base, size_t vertex_count,
+                               size_t index_count, void *storage,
+                               size_t capacity, WebglGeLitBlock *block)
+{
+    *block = (WebglGeLitBlock) {0};
+    if (count <= 0) return true;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        size_t bytes = webgl_ge_lit_block_bytes(vertex_count, index_count);
+        if (bytes > capacity) return false;
+        WebglGeLitVertex *lit = (WebglGeLitVertex *) storage;
+        uint16_t *indices = (uint16_t *) (void *) (lit + vertex_count);
+        bool finite = true;
+        size_t drawn = index_count != 0u ? vertex_count : (size_t) count;
+        for (size_t i = 0; i < drawn && finite; i++) {
+            uint32_t index = 0;
+            if (index_count != 0u) index = base + (uint32_t) i;
+            else if (!webgl_draw_vertex_index(draw, (uint32_t) i, &index))
+                return false;
+            if (!webgl_ge_lit_vertex(draw, material, index, &lit[i],
+                                     &finite)) return false;
+        }
+        /* The span may have been recalled by the index buffer's
+           JS-supplied identity rather than scanned from these bytes, so
+           every index is checked against it; one outside it expands the
+           draw, as a non-finite span vertex does. */
+        if (finite && index_count != 0u) {
+            for (int i = 0; i < count && finite; i++) {
+                uint32_t index = 0;
+                if (!webgl_draw_vertex_index(draw, (uint32_t) i, &index))
+                    return false;
+                finite = script_runtime_webgl_lit_span_index(
+                    base, (uint32_t) vertex_count, index, &indices[i]);
+            }
+        }
+        if (!finite && index_count != 0u) {
+            vertex_count = (size_t) count
+                + (mode == WEBGL_LINE_LOOP && count > 1 ? 1u : 0u);
+            index_count = 0;
+            continue;
+        }
+        if (!finite) { block->bytes = bytes; return true; }
+        if (index_count != 0u) {
+            if (index_count > (size_t) count) indices[count] = indices[0];
+        } else if (vertex_count > (size_t) count) {
+            lit[count] = lit[0];
+        }
+        *block = (WebglGeLitBlock) {
+            .vertices = lit,
+            .indices = index_count != 0u ? indices : NULL,
+            .vertex_count = vertex_count, .index_count = index_count,
+            .bytes = bytes, .drawable = true
+        };
+        return true;
+    }
+    return false;
+}
+
+/* The geometry-cache signature of a material draw's lit block: the
+   ordinary draw signature, a material tag with the flags that shape lit
+   vertices, the texture transform, and the normal view and its source
+   identity. False when an input has no stable identity. */
+static bool webgl_ge_lit_signature(const uint8_t *command,
+                                   const uint8_t *record,
+                                   const WebglMaterial *material,
+                                   ScriptWebglGeometryCacheSignature *signature)
+{
+    size_t out = 0;
+    if (record == NULL
+        || (material->flags & WEBGL_MATERIAL_PROGRAM) != 0u
+        || !webgl_ge_stable_signature(command, signature, &out)
+        || out + 14u > SCRIPT_WEBGL_GEOMETRY_CACHE_SIGNATURE_WORDS)
+        return false;
+    signature->words[out++] = UINT32_C(0x80000000)
+        | (material->flags & (WEBGL_MATERIAL_LIGHTING
+                              | WEBGL_MATERIAL_TEXTURE_TRANSFORM));
+    for (size_t at = 0; at < 6u; at++) {
+        uint32_t bits = 0;
+        if ((material->flags & WEBGL_MATERIAL_TEXTURE_TRANSFORM) != 0u)
+            memcpy(&bits, &material->texture_transform[at], sizeof(bits));
+        signature->words[out++] = bits;
+    }
+    for (size_t at = 59u; at < 64u; at++)
+        signature->words[out++] = webgl_wire_u32(record, at);
+    int32_t id = webgl_wire_i32(record, WEBGL_MATERIAL_NORMAL_IDENTITY_WORD);
+    int32_t generation = webgl_wire_i32(
+        record, WEBGL_MATERIAL_NORMAL_IDENTITY_WORD + 1u);
+    if (material->normal.source != NULL && (id <= 0 || generation <= 0))
+        return false;
+    signature->words[out++] = (uint32_t) id;
+    signature->words[out++] = (uint32_t) generation;
+    return true;
+}
+
+/* Emit one material draw. Lighting, fog and the alpha test are GE state
+   (MODEL = model-view, VIEW = identity, PROJECTION = projection), so
+   lit triangles and lines need no per-vertex CPU math beyond the lit
+   block, which the caller builds or takes from the geometry cache. Points
+   become through-mode sprites projected on the CPU (on the VFPU on the
+   PSP) with the host raster's own vertex decode, so their size and
+   position match it exactly. The caller has applied texture, blend, depth
+   and cull state. */
+static bool webgl_ge_material_points(const WebglDecodedDraw *draw,
+                                     const WebglMaterial *material,
+                                     int count, const WebglTexture *texture,
+                                     int height, WebglGeVertex *storage,
+                                     size_t slots, size_t *used)
+{
+    *used = 0;
+    if (count <= 0) return true;
+    webgl_ge_list_make_room();
+    if ((size_t) count * 2u > slots) return false;
+    WebglGeVertex *sprites = storage;
+    size_t emitted = 0;
+    bool coord = (material->flags & WEBGL_MATERIAL_POINT_COORD) != 0u;
+    bool flip = (material->flags & WEBGL_MATERIAL_POINT_COORD_FLIP) != 0u;
+    const float *m = material->texture_transform;
+    bool transform = (material->flags
+                      & WEBGL_MATERIAL_TEXTURE_TRANSFORM) != 0u;
+    float tw = texture != NULL ? (float) texture->width : 1.0f;
+    float th = texture != NULL ? (float) texture->height : 1.0f;
+    float corner_u[2], corner_v[2];
+    for (int corner = 0; corner < 2; corner++) {
+        float s = (float) corner, t = flip ? 1.0f - s : s;
+        float u = s, v = t;
+        if (transform) {
+            u = m[0] * s + m[1] * t + m[2];
+            v = m[3] * s + m[4] * t + m[5];
+        }
+        corner_u[corner] = coord ? u * tw : 0.0f;
+        corner_v[corner] = coord ? v * th : 0.0f;
+    }
+    bool unlit = (material->flags & WEBGL_MATERIAL_LIGHTING) == 0u;
+    WebglPointTransform point_transform;
+    if (unlit) webgl_point_transform_begin(draw, &point_transform);
+    bool decoded = true;
+    for (int i = 0; i < count; i++) {
+        WebglVertex point;
+        if (!webgl_decode_vertex(draw, (uint32_t) i, height,
+                                 unlit ? &point_transform : NULL, &point)) {
+            decoded = false;
+            break;
+        }
+        if (!point.geometry_valid) continue;
+        float color[4] = {point.red, point.green, point.blue, point.alpha};
+        if ((material->flags & WEBGL_MATERIAL_FOG) != 0u)
+            (void) webgl_material_shade(material, point.specular,
+                                        point.fog, color);
+        uint32_t packed = (uint32_t) webgl_channel_byte(color[0] + 0.5f)
+            | (uint32_t) webgl_channel_byte(color[1] + 0.5f) << 8
+            | (uint32_t) webgl_channel_byte(color[2] + 0.5f) << 16
+            | (uint32_t) webgl_channel_byte(color[3] + 0.5f) << 24;
+        float half = point.point_size * 0.5f;
+        float depth = (1.0f - point.z) * 65535.0f;
+        /* Without gl_PointCoord both corners carry the point's own
+           texcoord (already transformed), so the sprite takes that one
+           texel, as the host raster does. */
+        float point_u = point.u * tw, point_v = point.v * th;
+        for (int corner = 0; corner < 2; corner++) {
+            sprites[emitted++] = (WebglGeVertex) {
+                .u = coord ? corner_u[corner] : point_u,
+                .v = coord ? corner_v[corner] : point_v,
+                .color = packed,
+                .x = point.x + (corner ? half : -half),
+                .y = point.y + (corner ? half : -half),
+                .z = depth
+            };
+        }
+    }
+    if (unlit) webgl_point_transform_end(&point_transform);
+    if (!decoded) return false;
+    if (emitted == 0u) return true;
+    if ((material->flags & WEBGL_MATERIAL_ALPHA_TEST) != 0u) {
+        sceGuEnable(GU_ALPHA_TEST);
+        sceGuAlphaFunc(GU_GEQUAL, (int) webgl_color_byte(
+            material->alpha_reference), 0xff);
+    }
+    sceKernelDcacheWritebackRange(sprites, emitted * sizeof(*sprites));
+    sceGuDrawArray(GU_SPRITES, GU_TEXTURE_32BITF | GU_COLOR_8888
+                   | GU_VERTEX_32BITF | GU_TRANSFORM_2D,
+                   (int) emitted, NULL, sprites);
+    sceGuDisable(GU_ALPHA_TEST);
+    *used = (size_t) count * 2u;
+    return true;
+}
+
+static void webgl_ge_material_draw(const WebglMaterial *material, int mode,
+                                   const WebglGeLitBlock *block)
+{
+    webgl_ge_list_make_room();
+    if (!block->drawable || block->vertex_count == 0u) return;
+    if ((material->flags & WEBGL_MATERIAL_LIGHTING) != 0u) {
+        sceGuEnable(GU_LIGHTING);
+        for (uint32_t light = 0; light < WEBGL_MATERIAL_LIGHTS; light++) {
+            if (light >= material->light_count) {
+                sceGuDisable(GU_LIGHT0 + (int) light);
+                continue;
+            }
+            const WebglMaterialLight *entry = &material->lights[light];
+            ScePspFVector3 vector = {
+                entry->vector[0], entry->vector[1], entry->vector[2]
+            };
+            bool specular = (material->flags & WEBGL_MATERIAL_SPECULAR) != 0u;
+            sceGuEnable(GU_LIGHT0 + (int) light);
+            sceGuLight((int) light,
+                       entry->type == 1 ? GU_DIRECTIONAL : GU_POINTLIGHT,
+                       specular ? GU_DIFFUSE_AND_SPECULAR : GU_DIFFUSE,
+                       &vector);
+            sceGuLightColor((int) light, GU_AMBIENT, 0u);
+            sceGuLightColor((int) light, GU_DIFFUSE,
+                            webgl_ge_rgb(entry->diffuse));
+            sceGuLightColor((int) light, GU_SPECULAR,
+                            webgl_ge_rgb(entry->specular));
+            sceGuLightAtt((int) light, entry->attenuation[0],
+                          entry->attenuation[1], entry->attenuation[2]);
+        }
+        sceGuAmbient(webgl_ge_rgb(material->ambient));
+        sceGuColorMaterial(GU_AMBIENT | GU_DIFFUSE);
+        sceGuModelColor(webgl_ge_rgb(material->emissive), UINT32_C(0xffffffff),
+                        UINT32_C(0xffffffff), webgl_ge_rgb(material->specular));
+        sceGuSpecular(material->shininess);
+        sceGuLightMode((material->flags & WEBGL_MATERIAL_SPECULAR) != 0u
+                       ? GU_SEPARATE_SPECULAR_COLOR : GU_SINGLE_COLOR);
+    }
+    if ((material->flags & WEBGL_MATERIAL_FOG) != 0u) {
+        sceGuFog(material->fog_near, material->fog_far,
+                 webgl_ge_rgb(material->fog_color));
+        sceGuEnable(GU_FOG);
+    }
+    if ((material->flags & WEBGL_MATERIAL_ALPHA_TEST) != 0u) {
+        sceGuEnable(GU_ALPHA_TEST);
+        sceGuAlphaFunc(GU_GEQUAL, (int) webgl_color_byte(
+            material->alpha_reference), 0xff);
+    }
+    ScePspFMatrix4 model = webgl_ge_identity;
+    if ((material->flags & WEBGL_MATERIAL_SPLIT) != 0u)
+        memcpy(&model, material->model_view, sizeof(model));
+    sceGumMatrixMode(GU_MODEL);
+    sceGumLoadMatrix(&model);
+    bool indexed = block->index_count != 0u;
+    sceGumDrawArray(webgl_ge_primitive(mode),
+                    GU_TEXTURE_32BITF | GU_COLOR_8888 | GU_NORMAL_32BITF
+                        | GU_VERTEX_32BITF | GU_TRANSFORM_3D
+                        | (indexed ? GU_INDEX_16BIT : 0),
+                    (int) (indexed ? block->index_count : block->vertex_count),
+                    indexed ? (const void *) block->indices : NULL,
+                    block->vertices);
+    sceGuDisable(GU_LIGHTING);
+    sceGuDisable(GU_FOG);
+    sceGuDisable(GU_ALPHA_TEST);
+}
+
+/* A lit triangle or line draw: its lit block comes from the geometry
+   cache while the signature's inputs are unchanged (drawn from the
+   retained block when this frame may, else copied to scratch), or is
+   built in scratch and retained on its second sighting, the ordinary
+   draws' admission rule. *used is the scratch slots consumed. */
+static bool webgl_ge_material_lit(
+    DomBridge *bridge, int64_t canvas_handle, const uint8_t *command,
+    const uint8_t *record, const WebglDecodedDraw *draw,
+    const WebglMaterial *material, int mode, int count,
+    WebglGeVertex *storage, size_t slots,
+    const size_t previous_cache_bytes[SCRIPT_WEBGL_GEOMETRY_CACHE_ENTRY_LIMIT],
+    uint32_t *direct_slots, size_t *direct_draws, size_t *used)
+{
+    *used = 0;
+    if (count <= 0) return true;
+    size_t capacity = slots * sizeof(WebglGeVertex);
+    uint32_t base = 0;
+    size_t vertex_count = 0, index_count = 0;
+    /* A recurring draw recalls the index span validated when its record
+       was admitted instead of scanning every index again. */
+    ScriptWebglGeometryCacheSignature signature;
+    bool signed_draw = webgl_ge_lit_signature(command, record, material,
+                                              &signature);
+    uint32_t known_vertices = 0, known_indices = 0;
+    bool known = signed_draw && script_runtime_webgl_geometry_cache_lit_layout(
+        &bridge->webgl_geometry_cache, bridge->webgl_realm_epoch_high,
+        bridge->webgl_realm_epoch_low, canvas_handle, &signature, &base,
+        &known_vertices, &known_indices);
+    if (known) {
+        vertex_count = known_vertices;
+        index_count = known_indices;
+    } else if (!webgl_ge_lit_layout(draw, mode, count, &base, &vertex_count,
+                                    &index_count)) return false;
+    size_t predicted = webgl_ge_lit_block_bytes(vertex_count, index_count);
+    size_t slot = 0;
+    bool cacheable = false, hit = false, reset = false, promote = false;
+    if (signed_draw
+        && script_runtime_webgl_geometry_cache_admit(
+            &bridge->webgl_geometry_cache, bridge->webgl_realm_epoch_high,
+            bridge->webgl_realm_epoch_low, canvas_handle, &signature,
+            predicted, &slot, &hit, &reset)) {
+        cacheable = true;
+        if (!known)
+            script_runtime_webgl_geometry_cache_set_lit_layout(
+                &bridge->webgl_geometry_cache, slot, base,
+                (uint32_t) vertex_count, (uint32_t) index_count);
+        for (size_t other = 0;
+             other < SCRIPT_WEBGL_GEOMETRY_CACHE_ENTRY_LIMIT; other++) {
+            if (reset || !bridge->webgl_geometry_cache.records[other].valid)
+                webgl_ge_geometry_release_slot(bridge, other, direct_slots);
+        }
+    }
+    uint32_t bit = UINT32_C(1) << slot;
+    void *retained = cacheable ? bridge->webgl_geometry_vertices[slot] : NULL;
+    WebglGeLitBlock block = {0};
+    if (cacheable && hit && retained != NULL) {
+        /* Drawing from the retained block defers its free past this list
+           (webgl_ge_geometry_release_slot); a slot already drawn direct
+           this frame adds no further retirement. */
+        bool direct = (*direct_slots & bit) != 0u
+            || *direct_draws < SCRIPT_WEBGL_GEOMETRY_DIRECT_DRAW_LIMIT;
+        void *source = retained;
+        if (direct) {
+            if ((*direct_slots & bit) == 0u) {
+                *direct_slots |= bit;
+                (*direct_draws)++;
+            }
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+            webgl_direct_draws++;
+#endif
+        } else {
+            if (predicted > capacity) return false;
+            memcpy(storage, retained, predicted);
+            sceKernelDcacheWritebackRange(storage, predicted);
+            source = storage;
+            *used = (predicted + sizeof(WebglGeVertex) - 1u)
+                / sizeof(WebglGeVertex);
+        }
+        WebglGeLitVertex *vertices = (WebglGeLitVertex *) source;
+        block = (WebglGeLitBlock) {
+            .vertices = vertices,
+            .indices = index_count != 0u
+                ? (uint16_t *) (void *) (vertices + vertex_count) : NULL,
+            .vertex_count = vertex_count, .index_count = index_count,
+            .bytes = predicted, .drawable = true
+        };
+#if defined(TILEFINCH_PSP_VALIDATION_LOG)
+        webgl_native_metrics.geometry_cache_hit_vertices += (size_t) count;
+#endif
+    } else {
+        if (cacheable) {
+            bool reuse_equal_block = !hit && retained != NULL
+                && previous_cache_bytes[slot] == predicted
+                && (*direct_slots & bit) == 0u;
+            promote = hit || reuse_equal_block;
+            if (!reuse_equal_block)
+                webgl_ge_geometry_release_slot(bridge, slot, direct_slots);
+        }
+        if (!webgl_ge_lit_build(draw, material, mode, count, base,
+                                vertex_count, index_count, storage,
+                                capacity, &block)) return false;
+        *used = (block.bytes + sizeof(WebglGeVertex) - 1u)
+            / sizeof(WebglGeVertex);
+        if (block.drawable)
+            sceKernelDcacheWritebackRange(storage, block.bytes);
+#if defined(TILEFINCH_PSP_VALIDATION_LOG)
+        if (cacheable) webgl_native_metrics.geometry_cache_misses++;
+#endif
+        /* A block built in another shape than the recorded layout (an
+           expanded fallback can match its size) is never retained, and its
+           record is dropped so the next sighting scans afresh. */
+        bool layout_kept = block.bytes == predicted
+            && block.index_count == index_count;
+        if (cacheable && promote && block.drawable && layout_kept) {
+            void *kept = bridge->webgl_geometry_vertices[slot];
+            if (kept == NULL) kept = budget_malloc_category(
+                bridge->budget, BUDGET_CATEGORY_RENDER, predicted);
+            if (kept != NULL) {
+                memcpy(kept, storage, predicted);
+                sceKernelDcacheWritebackRange(kept, predicted);
+                bridge->webgl_geometry_vertices[slot] = kept;
+            } else webgl_ge_geometry_cache_abandon(bridge, slot);
+        } else if (cacheable && (!block.drawable || !layout_kept)) {
+            webgl_ge_geometry_cache_abandon(bridge, slot);
+        }
+    }
+    webgl_ge_material_draw(material, mode, &block);
+    return true;
+}
+
 static bool webgl_render_ge(DomBridge *bridge,
                             int64_t canvas_handle,
                             uint8_t *surface,
@@ -2504,6 +3821,7 @@ static bool webgl_render_ge(DomBridge *bridge,
                             const WebglSource *sources, size_t source_count,
                             const WebglTexture *textures, size_t texture_count,
                             bool antialias, bool preserve_drawing_buffer,
+                            const uint8_t *materials, size_t material_count,
                             bool *native_authoritative)
 {
     if (native_authoritative != NULL) *native_authoritative = false;
@@ -2517,6 +3835,12 @@ static bool webgl_render_ge(DomBridge *bridge,
 #endif
     if (!psp_media_present_ge_context_acquire()
         || !psp_media_present_ge_context_idle()) return false;
+    /* A failure here is a failed flush, as for the vertex scratch below:
+       the context is lost and the page keeps running. */
+    webgl_ge_list = ge_scratch_acquire(
+        &webgl_ge_list_scratch, &webgl_ge_list_ops, WEBGL_GE_LIST_BYTES);
+    if (webgl_ge_list == NULL) return false;
+    webgl_ge_list_owner = bridge;
     webgl_ge_geometry_retired_release(bridge);
     size_t ge_vertex_capacity = 0, validity_capacity = 0;
     size_t edge_index_capacity = 0, instance_capacity = 0;
@@ -2851,11 +4175,20 @@ static bool webgl_render_ge(DomBridge *bridge,
         size_t command_vertices = (size_t) count
             + (mode == WEBGL_LINE_LOOP && count > 1 ? 1u : 0u);
         WebglDecodedDraw draw;
+        WebglMaterial material;
+        bool material_present = false;
         if (!webgl_decode_draw(command, sources, source_count,
-                               width, height, &draw)) {
+                               width, height, &draw)
+            || !webgl_material_decode(command, ci, materials, material_count,
+                                      sources, source_count, &material,
+                                      &material_present)
+            || (material_present && draw.instance_count != 1u)) {
             sceGuFinish(); sceGuSync(0, 0); budget_free(budget, scratch);
             return false;
         }
+        if (material_present
+            && !webgl_program_bounded(&material, count, 1u)) continue;
+        if (material_present) draw.material = &material;
 #if defined(TILEFINCH_PSP_VALIDATION_LOG)
         frame_decode_us += (uint64_t) sceKernelGetSystemTimeWide()
             - decode_started;
@@ -2890,8 +4223,8 @@ static bool webgl_render_ge(DomBridge *bridge,
         }
         ScriptWebglGeometryCacheSignature cache_signature;
         size_t cache_bytes = (size_t) count * sizeof(*draw_vertices);
-        if (fast && count > 0
-            && webgl_ge_stable_signature(command, &cache_signature)
+        if (fast && count > 0 && !material_present
+            && webgl_ge_stable_signature(command, &cache_signature, NULL)
             && script_runtime_webgl_geometry_cache_admit(
                 &bridge->webgl_geometry_cache,
                 bridge->webgl_realm_epoch_high,
@@ -2957,7 +4290,7 @@ static bool webgl_render_ge(DomBridge *bridge,
         uint64_t base_vertex_started =
             (uint64_t) sceKernelGetSystemTimeWide();
 #endif
-        if (!cache_hit) {
+        if (!cache_hit && !material_present) {
             for (int i = 0; i < count; i++) {
                 bool valid = false;
                 if (!webgl_ge_vertex(
@@ -3025,14 +4358,19 @@ static bool webgl_render_ge(DomBridge *bridge,
             vertex_cursor += (size_t) count;
             continue;
         }
+        /* A material draw with an eye-space split loads PROJECTION = P and
+           (below) MODEL = MV, so GE lighting and fog see eye space. */
+        const float *projection_source = material_present
+            && (material.flags & WEBGL_MATERIAL_SPLIT) != 0u
+            ? material.projection : draw.matrix;
         ScePspFMatrix4 projection;
-        memcpy(&projection, draw.matrix, sizeof(projection));
+        memcpy(&projection, projection_source, sizeof(projection));
         if (!projection_valid
-            || memcmp(loaded_projection, draw.matrix,
+            || memcmp(loaded_projection, projection_source,
                       sizeof(loaded_projection)) != 0) {
             sceGumMatrixMode(GU_PROJECTION);
             sceGumLoadMatrix(&projection);
-            memcpy(loaded_projection, draw.matrix,
+            memcpy(loaded_projection, projection_source,
                    sizeof(loaded_projection));
             projection_valid = true;
 #if defined(TILEFINCH_PSP_VALIDATION_LOG)
@@ -3171,6 +4509,33 @@ static bool webgl_render_ge(DomBridge *bridge,
             sceGuFrontFace(keep_clockwise ? GU_CCW : GU_CW);
             sceGuEnable(GU_CULL_FACE);
         } else sceGuDisable(GU_CULL_FACE);
+        if (material_present) {
+            size_t used = 0;
+            size_t slots = ge_vertex_capacity - vertex_cursor;
+            if (mode == WEBGL_POINTS) {
+                if (!webgl_ge_material_points(&draw, &material, count,
+                        texture_index >= 0 ? &textures[texture_index] : NULL,
+                        height, draw_vertices, slots, &used)) {
+                    sceGuFinish(); sceGuSync(0, 0);
+                    budget_free(budget, scratch);
+                    return false;
+                }
+            } else if (!webgl_ge_material_lit(
+                           bridge, canvas_handle, command,
+                           materials + ci * WEBGL_MATERIAL_WORDS
+                               * sizeof(uint32_t),
+                           &draw, &material, mode, count, draw_vertices,
+                           slots, previous_cache_bytes, &direct_slots,
+                           &direct_draws, &used)) {
+                sceGuFinish(); sceGuSync(0, 0); budget_free(budget, scratch);
+                return false;
+            }
+            vertex_cursor += used;
+#if defined(TILEFINCH_PSP_VALIDATION_LOG)
+            frame_draw_calls++;
+#endif
+            continue;
+        }
 #if defined(TILEFINCH_PSP_VALIDATION_LOG)
         frame_state_us += (uint64_t) sceKernelGetSystemTimeWide()
             - state_started;
@@ -3532,6 +4897,7 @@ static bool webgl_render_ge(DomBridge *bridge,
             depth_target + (size_t) y * PSP_DISPLAY_STRIDE * sizeof(uint16_t),
             (size_t) width * sizeof(uint16_t));
     }
+    js_rt_bridge_keep_node_handle(bridge, canvas_handle);
     webgl_ge_surface_owner = (WebglGeSurfaceOwner) {
         .realm_epoch_high = bridge->webgl_realm_epoch_high,
         .realm_epoch_low = bridge->webgl_realm_epoch_low,
@@ -3672,6 +5038,11 @@ void js_webgl_realm_epoch_release(DomBridge *bridge)
     if (bridge == NULL) return;
 #if defined(__PSP__)
     webgl_ge_geometry_cache_clear(bridge);
+    if (webgl_ge_list_owner == bridge
+        && ge_scratch_release(&webgl_ge_list_scratch, &webgl_ge_list_ops)) {
+        webgl_ge_list = NULL;
+        webgl_ge_list_owner = NULL;
+    }
     if (webgl_ge_surface_owner.valid
         && webgl_ge_surface_owner.realm_epoch_high
                == bridge->webgl_realm_epoch_high
@@ -3931,6 +5302,29 @@ JSValue js_webgl_render(JSContext *context, JSValueConst this_value,
         JS_FreeValue(context, command_buffer); return JS_NewInt32(context, 0);
     }
     command_values += WEBGL_WIRE_HEADER_WORDS * sizeof(uint32_t);
+    /* Optional material records: a typed array or null/undefined. */
+    const uint8_t *material_values = NULL;
+    size_t material_value_count = 0, material_count = 0;
+    JSValue material_buffer = JS_UNDEFINED;
+    if (argc >= 9 && !JS_IsNull(argv[8]) && !JS_IsUndefined(argv[8])) {
+        WebglJsReadResult material_read = webgl_typed_values(
+            context, argv[8], sizeof(uint32_t), &material_values,
+            &material_value_count, &material_buffer);
+        if (material_read != WEBGL_JS_READ_OK
+            || !webgl_wire_header(material_values, material_value_count,
+                                  WEBGL_MATERIAL_WIRE_MAGIC,
+                                  WEBGL_MATERIAL_WORDS, WEBGL_COMMAND_LIMIT,
+                                  &material_count)
+            || material_count != command_count) {
+            JS_FreeValue(context, material_buffer);
+            webgl_source_entries_release(
+                context, source_entries, source_entry_count);
+            JS_FreeValue(context, command_buffer);
+            return material_read == WEBGL_JS_READ_EXCEPTION
+                ? JS_EXCEPTION : JS_NewInt32(context, 0);
+        }
+        material_values += WEBGL_WIRE_HEADER_WORDS * sizeof(uint32_t);
+    }
     WebglSource sources[WEBGL_SOURCE_LIMIT] = {{0}};
     size_t source_count = 0;
     WebglJsReadResult source_read = webgl_sources_resolve(
@@ -3938,6 +5332,7 @@ JSValue js_webgl_render(JSContext *context, JSValueConst this_value,
     webgl_source_entries_release(context, source_entries, source_entry_count);
     if (source_read != WEBGL_JS_READ_OK) {
         webgl_sources_release(context, sources, source_count);
+        JS_FreeValue(context, material_buffer);
         JS_FreeValue(context, command_buffer);
         return source_read == WEBGL_JS_READ_EXCEPTION
             ? JS_EXCEPTION : JS_NewInt32(context, 0);
@@ -3947,6 +5342,7 @@ JSValue js_webgl_render(JSContext *context, JSValueConst this_value,
         &texture_value_count, &texture_buffer);
     if (texture_read != WEBGL_JS_READ_OK) {
         webgl_sources_release(context, sources, source_count);
+        JS_FreeValue(context, material_buffer);
         JS_FreeValue(context, command_buffer);
         return texture_read == WEBGL_JS_READ_EXCEPTION
             ? JS_EXCEPTION : JS_NewInt32(context, 0);
@@ -3957,6 +5353,7 @@ JSValue js_webgl_render(JSContext *context, JSValueConst this_value,
             WEBGL_TEXTURE_WORDS, WEBGL_TEXTURE_LIMIT, &texture_count)) {
         JS_FreeValue(context, texture_buffer);
         webgl_sources_release(context, sources, source_count);
+        JS_FreeValue(context, material_buffer);
         JS_FreeValue(context, command_buffer);
         return JS_NewInt32(context, 0);
     }
@@ -3998,7 +5395,7 @@ JSValue js_webgl_render(JSContext *context, JSValueConst this_value,
             bridge, handle, surface, depth, width, height, command_values,
             command_count, sources, source_count,
             textures, texture_count, antialias, preserve_drawing_buffer,
-            &native_authoritative);
+            material_values, material_count, &native_authoritative);
         if (rendered && native_authoritative) {
             void *edram = sceGeEdramGetAddr();
             rendered = edram != NULL && images_set_canvas_native_surface(
@@ -4011,10 +5408,12 @@ JSValue js_webgl_render(JSContext *context, JSValueConst this_value,
         rendered = webgl_render_software(
             bridge->budget, surface, depth, width, height, command_values,
             command_count, sources, source_count,
-            textures, texture_count, antialias);
+            textures, texture_count, antialias,
+            material_values, material_count);
 #endif
     }
     JS_FreeValue(context, texture_buffer);
+    JS_FreeValue(context, material_buffer);
     webgl_sources_release(context, sources, source_count);
     JS_FreeValue(context, command_buffer);
     if (!rendered) return JS_NewInt32(context, 0);

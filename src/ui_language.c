@@ -33,17 +33,20 @@
      the rows' values in order, each 1..TILEFINCH_UI_TRANSLATION_VALUE_BYTES
          printable bytes (no control byte or '%') ending in a line feed,
          and nothing after the last one.
-   One allocation holds this header, the decoded hashes, the value offsets,
-   the key lengths and the values. */
+   The file holds no offsets. One allocation holds this header, the decoded
+   hashes, the 32-bit value offsets, the key lengths and the values. Until
+   v17 the offsets were 16-bit, which capped a file at 64 KiB - 1 and left
+   Bengali (65,402 bytes in v16) no room to grow; the wire layout is
+   unchanged, so v12 to v16 files parse the same way. */
 struct TilefinchUiTranslation {
     Budget *budget;
     const uint32_t *hashes;
-    const uint16_t *values;
+    const uint32_t *values;
     const uint8_t *key_lengths;
     const char *text;
-    /* Arabic only: one allocation of a display offset per row (UINT16_MAX
+    /* Arabic only: one allocation of a display offset per row (UINT32_MAX
        when the value is used as is), followed by the display text. */
-    uint16_t *visual;
+    uint32_t *visual;
     const char *visual_text;
     size_t count;
     unsigned language;
@@ -74,17 +77,17 @@ static bool translation_prepare_visual_text(TilefinchUiTranslation *t)
         if (text_bidi_maybe_needed(value, strlen(value)))
             bound += translation_visual_bound(value);
     }
+    /* At most 3/2 of the value bytes plus a terminator per row, so the
+       32-bit display offsets below cannot wrap. */
     if (bound == 0) return true;
-    /* Display offsets are 16-bit, like the catalog's own. */
-    if (bound > TILEFINCH_UI_TRANSLATION_BYTES) bound = TILEFINCH_UI_TRANSLATION_BYTES;
-    size_t offsets = t->count * sizeof(uint16_t);
-    uint16_t *visual = budget_malloc(t->budget, offsets + bound);
+    size_t offsets = t->count * sizeof(uint32_t);
+    uint32_t *visual = budget_malloc(t->budget, offsets + bound);
     if (!visual) return false;
     char *text = (char *) visual + offsets;
     size_t at = 0;
     bool okay = true;
     for (size_t row = 0; okay && row < t->count; row++) {
-        visual[row] = UINT16_MAX;
+        visual[row] = UINT32_MAX;
         const char *value = t->text + t->values[row];
         size_t length = strlen(value);
         if (!text_bidi_maybe_needed(value, length)) continue;
@@ -99,14 +102,14 @@ static bool translation_prepare_visual_text(TilefinchUiTranslation *t)
         text_bidi_paragraph_destroy(p);
         if (!okay) break;
         text[at++] = 0;
-        visual[row] = (uint16_t)start;
+        visual[row] = (uint32_t)start;
     }
     if (!okay) {
         budget_free(t->budget, visual);
         return false;
     }
     if (at < bound) {
-        uint16_t *smaller = budget_realloc(t->budget, visual, offsets + at);
+        uint32_t *smaller = budget_realloc(t->budget, visual, offsets + at);
         if (smaller) visual = smaller;
     }
     t->visual = visual;
@@ -202,10 +205,10 @@ static TilefinchUiTranslation *translation_parse(
     if (values[value_bytes - 1] != '\n') return NULL;
     size_t header_bytes = sizeof(TilefinchUiTranslation);
     TilefinchUiTranslation *t = budget_malloc(budget, header_bytes
-        + count * (sizeof(uint32_t) + sizeof(uint16_t) + 1u) + value_bytes);
+        + count * (sizeof(uint32_t) + sizeof(uint32_t) + 1u) + value_bytes);
     if (!t) return NULL;
     uint32_t *hashes = (uint32_t *)((char *)t + header_bytes);
-    uint16_t *offsets = (uint16_t *)(hashes + count);
+    uint32_t *offsets = hashes + count;
     uint8_t *key_lengths = (uint8_t *)(offsets + count);
     char *text = (char *)(key_lengths + count);
     *t = (TilefinchUiTranslation){.budget = budget, .hashes = hashes,
@@ -222,7 +225,7 @@ static TilefinchUiTranslation *translation_parse(
        separator or other control byte. */
     size_t at = 0, row = 0;
     for (; at < value_bytes && row < count; row++) {
-        offsets[row] = (uint16_t)at;
+        offsets[row] = (uint32_t)at;
         size_t end = at;
         while (values[end] != '\n') {
             if (values[end] < 0x20u || values[end] == '%' || values[end] == 0x7fu)
@@ -266,7 +269,7 @@ static const char *translation_text(const TilefinchUiTranslation *t,
         size_t mid = lo + (hi-lo)/2;
         if (t->hashes[mid] == hash) {
             if (t->key_lengths[mid] != length) return english;
-            return visual && t->visual && t->visual[mid] != UINT16_MAX
+            return visual && t->visual && t->visual[mid] != UINT32_MAX
                 ? t->visual_text + t->visual[mid] : t->text + t->values[mid];
         }
         if (t->hashes[mid] < hash) lo = mid + 1; else hi = mid;
@@ -421,7 +424,7 @@ const char *tilefinch_ui_display_name(const char *logical)
     const TilefinchUiTranslation *t = bound_translation;
     if (t != NULL && t->visual != NULL && logical != NULL)
         for (size_t i = 0; i < t->count; i++)
-            if (t->visual[i] != UINT16_MAX
+            if (t->visual[i] != UINT32_MAX
                 && !strcmp(logical, t->text + t->values[i]))
                 return t->visual_text + t->visual[i];
     return logical;

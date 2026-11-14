@@ -229,6 +229,8 @@ void psp_validation_glyph_stage(PspApp *app,
     int client = session->client == NULL
         ? -1 : (int) session->client_snapshot.phase;
     int install = session->installer == NULL
+        && (!session->operation_initialized
+            || session->install_snapshot.phase < TILEFINCH_UPDATE_INSTALL_COMPLETE)
         ? -1 : (int) session->install_snapshot.phase;
     if (client == glyph_replay.client_phase
         && install == glyph_replay.install_phase) return;

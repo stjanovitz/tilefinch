@@ -908,16 +908,8 @@ static void bidi_translate_atomic(LayoutDocument *layout,
 {
     if (dx == 0) return;
     int delta_fixed = layout_fixed_from_integer(dx);
-    for (size_t i = bidi_command_lower_bound(layout, atomic->command_start);
-         i < layout->bidi_command_count; i++) {
-        const LayoutBidiCommand *mapped = &layout->bidi_commands[i];
-        if (mapped->command_index >= atomic->command_end) break;
-        for (size_t glyph = 0; glyph < mapped->glyph_count; glyph++) {
-            LayoutBidiGlyph *item = &layout->bidi_glyphs[
-                mapped->glyph_start + glyph];
-            item->x_fixed = layout_fixed_add(item->x_fixed, delta_fixed);
-        }
-    }
+    layout_bidi_translate_commands(
+        layout, atomic->command_start, atomic->command_end, dx);
     for (size_t i = atomic->command_start;
          i < atomic->command_end && i < layout->count; i++) {
         DrawCommand *command = &layout->commands[i];
@@ -1583,13 +1575,16 @@ bool layout_bidi_visual_step(const LayoutDocument *layout,
 }
 
 void layout_bidi_translate_commands(LayoutDocument *layout,
-                                    size_t command_start, int dx)
+                                    size_t command_start,
+                                    size_t command_end, int dx)
 {
-    if (layout == NULL || dx == 0) return;
+    if (layout == NULL || dx == 0 || command_start >= command_end
+        || layout->bidi_command_count == 0) return;
     int delta = layout_fixed_from_integer(dx);
     for (size_t i = bidi_command_lower_bound(layout, command_start);
          i < layout->bidi_command_count; i++) {
         const LayoutBidiCommand *command = &layout->bidi_commands[i];
+        if (command->command_index >= command_end) break;
         for (size_t glyph = 0; glyph < command->glyph_count; glyph++) {
             LayoutBidiGlyph *item = &layout->bidi_glyphs[
                 command->glyph_start + glyph];

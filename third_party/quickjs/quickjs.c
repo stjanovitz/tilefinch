@@ -354,6 +354,11 @@ struct JSRuntime {
     uint32_t *atom_hash;
     JSAtomStruct **atom_array;
     int atom_free_index; /* 0 = none */
+    /* Tilefinch: JS_PinAtomTable() atoms, at JS_ATOM_END and up, and the
+       FNV-1a hash of the table they came from. Bytecode written with
+       JS_WRITE_OBJ_PINNED_ATOMS names them by index. */
+    uint32_t pinned_atom_count;
+    uint32_t pinned_atom_hash;
     /* shared single-character latin-1 strings: page boot paths (base64
        model decodes, per-character spreads) can allocate millions of
        len-1 strings; strings are immutable and their object identity is
@@ -788,11 +793,26 @@ typedef struct JSBytecodeVarDef {
     uint16_t var_ref_idx;
 } JSBytecodeVarDef;
 
-/* for the encoding of the pc2line table */
-#define PC2LINE_BASE     (-1)
-#define PC2LINE_RANGE    5
-#define PC2LINE_OP_FIRST 1
-#define PC2LINE_DIFF_PC_MAX ((255 - PC2LINE_OP_FIRST) / PC2LINE_RANGE)
+/* for the encoding of the pc2line table. Tilefinch: after the leb128
+   line and column of the definition, each entry starts with one byte:
+   - 0: leb128 diff_pc, sleb128 diff_line, sleb128 diff_col (any entry);
+   - [PC2LINE_SHORT_FIRST, PC2LINE_PAIR_FIRST): same line, diff_pc and
+     diff_col both in the byte;
+   - [PC2LINE_PAIR_FIRST, PC2LINE_NEXT_FIRST): same line, diff_pc in the
+     byte, then one byte of diff_col (int8_t);
+   - [PC2LINE_NEXT_FIRST, PC2LINE_OP_END): next line, diff_pc in the byte,
+     then the leb128 column (minus 1, as in the header).
+   Bytes from PC2LINE_OP_END are not used. The table is lossless: the
+   decoded positions are those of upstream's encoding. */
+#define PC2LINE_SHORT_FIRST 1
+#define PC2LINE_SHORT_PC    7   /* diff_pc in [0, 7) */
+#define PC2LINE_SHORT_COL   14  /* diff_col in [-14, 14) */
+#define PC2LINE_PAIR_FIRST  (PC2LINE_SHORT_FIRST + \
+                             PC2LINE_SHORT_PC * 2 * PC2LINE_SHORT_COL)
+#define PC2LINE_PAIR_PC     32  /* diff_pc in [0, 32), diff_col int8_t */
+#define PC2LINE_NEXT_FIRST  (PC2LINE_PAIR_FIRST + PC2LINE_PAIR_PC)
+#define PC2LINE_NEXT_PC     16  /* diff_pc in [0, 16), diff_line == 1 */
+#define PC2LINE_OP_END      (PC2LINE_NEXT_FIRST + PC2LINE_NEXT_PC)
 
 typedef enum JSFunctionKindEnum {
     JS_FUNC_NORMAL = 0,
@@ -3180,6 +3200,11 @@ void JS_FreeRuntime(JSRuntime *rt)
 #endif
     assert(list_empty(&rt->gc_obj_list));
     assert(list_empty(&rt->weakref_list));
+
+    /* Tilefinch: release the JS_PinAtomTable() references. */
+    for(i = 0; i < (int)rt->pinned_atom_count; i++)
+        JS_FreeAtomRT(rt, JS_ATOM_END + i);
+    rt->pinned_atom_count = 0;
 
     /* free the classes */
     for(i = 0; i < rt->class_count; i++) {
@@ -8753,14 +8778,66 @@ static int get_sleb128(int32_t *pval, const uint8_t *buf,
     return ret;
 }
 
+/* Tilefinch: decode one pc2line entry at p (see PC2LINE_SHORT_FIRST),
+   advancing *ppc, *pline_num and *pcol_num. Returns the bytes read, or -1
+   for a truncated or invalid entry. */
+static int pc2line_get_entry(const uint8_t *p, const uint8_t *p_end,
+                             int *ppc, int *pline_num, int *pcol_num)
+{
+    const uint8_t *p_start = p;
+    unsigned int op;
+    uint32_t val;
+    int v, ret;
+
+    if (p >= p_end)
+        return -1;
+    op = *p++;
+    if (op == 0) {
+        ret = get_leb128(&val, p, p_end);
+        if (ret < 0)
+            return -1;
+        p += ret;
+        *ppc += val;
+        ret = get_sleb128(&v, p, p_end);
+        if (ret < 0)
+            return -1;
+        p += ret;
+        *pline_num += v;
+        ret = get_sleb128(&v, p, p_end);
+        if (ret < 0)
+            return -1;
+        p += ret;
+        *pcol_num += v;
+    } else if (op < PC2LINE_PAIR_FIRST) {
+        op -= PC2LINE_SHORT_FIRST;
+        *ppc += op / (2 * PC2LINE_SHORT_COL);
+        *pcol_num += (int)(op % (2 * PC2LINE_SHORT_COL)) - PC2LINE_SHORT_COL;
+    } else if (op < PC2LINE_NEXT_FIRST) {
+        if (p >= p_end)
+            return -1;
+        *ppc += op - PC2LINE_PAIR_FIRST;
+        *pcol_num += (int8_t)*p++;
+    } else if (op < PC2LINE_OP_END) {
+        ret = get_leb128(&val, p, p_end);
+        if (ret < 0)
+            return -1;
+        p += ret;
+        *ppc += op - PC2LINE_NEXT_FIRST;
+        *pline_num += 1;
+        *pcol_num = val + 1;
+    } else {
+        return -1;
+    }
+    return p - p_start;
+}
+
 /* use pc_value = -1 to get the position of the function definition */
 static int find_line_num(JSContext *ctx, JSFunctionBytecode *b,
                          uint32_t pc_value, int *pcol_num)
 {
     const uint8_t *p_end, *p;
-    int new_line_num, line_num, pc, v, ret, new_col_num, col_num;
+    int new_line_num, line_num, pc, ret, new_col_num, col_num;
     uint32_t val;
-    unsigned int op;
 
     if (!b->has_debug || !b->debug.pc2line_buf)
         goto fail; /* function was stripped */
@@ -8784,29 +8861,14 @@ static int find_line_num(JSContext *ctx, JSFunctionBytecode *b,
     if (pc_value != -1) {
         pc = 0;
         while (p < p_end) {
-            op = *p++;
-            if (op == 0) {
-                ret = get_leb128(&val, p, p_end);
-                if (ret < 0)
-                    goto fail;
-                pc += val;
-                p += ret;
-                ret = get_sleb128(&v, p, p_end);
-                if (ret < 0)
-                    goto fail;
-                p += ret;
-                new_line_num = line_num + v;
-            } else {
-                op -= PC2LINE_OP_FIRST;
-                pc += (op / PC2LINE_RANGE);
-                new_line_num = line_num + (op % PC2LINE_RANGE) + PC2LINE_BASE;
-            }
-            ret = get_sleb128(&v, p, p_end);
+            new_line_num = line_num;
+            new_col_num = col_num;
+            ret = pc2line_get_entry(p, p_end, &pc, &new_line_num,
+                                    &new_col_num);
             if (ret < 0)
                 goto fail;
             p += ret;
-            new_col_num = col_num + v;
-            
+
             if (pc_value < pc)
                 goto done;
             line_num = new_line_num;
@@ -35758,8 +35820,7 @@ static void dump_byte_code(JSContext *ctx, int pass,
 static __maybe_unused void dump_pc2line(JSContext *ctx, const uint8_t *buf, int len)
 {
     const uint8_t *p_end, *p;
-    int pc, v, line_num, col_num, ret;
-    unsigned int op;
+    int pc, line_num, col_num, ret;
     uint32_t val;
     
     if (len <= 0)
@@ -35787,29 +35848,11 @@ static __maybe_unused void dump_pc2line(JSContext *ctx, const uint8_t *buf, int 
     
     pc = 0;
     while (p < p_end) {
-        op = *p++;
-        if (op == 0) {
-            ret = get_leb128(&val, p, p_end);
-            if (ret < 0)
-                goto fail;
-            pc += val;
-            p += ret;
-            ret = get_sleb128(&v, p, p_end);
-            if (ret < 0)
-                goto fail;
-            p += ret;
-            line_num += v;
-        } else {
-            op -= PC2LINE_OP_FIRST;
-            pc += (op / PC2LINE_RANGE);
-            line_num += (op % PC2LINE_RANGE) + PC2LINE_BASE;
-        }
-        ret = get_sleb128(&v, p, p_end);
+        ret = pc2line_get_entry(p, p_end, &pc, &line_num, &col_num);
         if (ret < 0)
             goto fail;
         p += ret;
-        col_num += v;
-        
+
         printf("%5d %5d %5d\n", pc, line_num, col_num);
     }
  fail: ;
@@ -37875,18 +37918,27 @@ static void compute_pc2line_info(JSFunctionDef *s)
             if (diff_line == 0 && diff_col == 0)
                 continue;
 
-            if (diff_line >= PC2LINE_BASE &&
-                diff_line < PC2LINE_BASE + PC2LINE_RANGE &&
-                diff_pc <= PC2LINE_DIFF_PC_MAX) {
-                dbuf_putc(&s->pc2line, (diff_line - PC2LINE_BASE) +
-                          diff_pc * PC2LINE_RANGE + PC2LINE_OP_FIRST);
+            if (diff_line == 0 && diff_pc < PC2LINE_SHORT_PC &&
+                diff_col >= -PC2LINE_SHORT_COL &&
+                diff_col < PC2LINE_SHORT_COL) {
+                dbuf_putc(&s->pc2line, PC2LINE_SHORT_FIRST +
+                          diff_pc * 2 * PC2LINE_SHORT_COL +
+                          diff_col + PC2LINE_SHORT_COL);
+            } else if (diff_line == 0 && diff_pc < PC2LINE_PAIR_PC &&
+                       diff_col >= INT8_MIN && diff_col <= INT8_MAX) {
+                dbuf_putc(&s->pc2line, PC2LINE_PAIR_FIRST + diff_pc);
+                dbuf_putc(&s->pc2line, (uint8_t)(int8_t)diff_col);
+            } else if (diff_line == 1 && diff_pc < PC2LINE_NEXT_PC &&
+                       col_num >= 0) {
+                dbuf_putc(&s->pc2line, PC2LINE_NEXT_FIRST + diff_pc);
+                dbuf_put_leb128(&s->pc2line, col_num); /* column minus 1 */
             } else {
                 /* longer encoding */
                 dbuf_putc(&s->pc2line, 0);
                 dbuf_put_leb128(&s->pc2line, diff_pc);
                 dbuf_put_sleb128(&s->pc2line, diff_line);
+                dbuf_put_sleb128(&s->pc2line, diff_col);
             }
-            dbuf_put_sleb128(&s->pc2line, diff_col);
                 
             last_pc = pc;
             last_line_num = line_num;
@@ -45382,6 +45434,9 @@ typedef enum BCTagEnum {
 
 /* Version 6 preserves nested debug-source spans across cache round trips. */
 #define BC_VERSION 6
+/* Tilefinch: set in the version byte of JS_WRITE_OBJ_PINNED_ATOMS output,
+   which then carries the pinned table's atom count and hash. */
+#define BC_VERSION_PINNED_ATOMS 0x80
 
 typedef struct BCWriterState {
     JSContext *ctx;
@@ -45390,6 +45445,7 @@ typedef struct BCWriterState {
     BOOL allow_bytecode : 8;
     BOOL allow_sab : 8;
     BOOL allow_reference : 8;
+    BOOL pinned_atoms : 8; /* JS_WRITE_OBJ_PINNED_ATOMS */
     uint32_t first_atom;
     uint32_t *atom_to_idx;
     int atom_to_idx_size;
@@ -46241,7 +46297,16 @@ static int JS_WriteObjectAtoms(BCWriterState *s)
 
     dbuf1 = s->dbuf;
     js_dbuf_init(s->ctx, &s->dbuf);
-    bc_put_u8(s, BC_VERSION);
+    if (s->pinned_atoms) {
+        /* Tilefinch: atoms below first_atom past the predefined ones are
+           the runtime's pinned table, named by index; the reader must hold
+           the same table. */
+        bc_put_u8(s, BC_VERSION | BC_VERSION_PINNED_ATOMS);
+        bc_put_leb128(s, rt->pinned_atom_count);
+        bc_put_u32(s, rt->pinned_atom_hash);
+    } else {
+        bc_put_u8(s, BC_VERSION);
+    }
 
     bc_put_leb128(s, s->idx_to_atom_count);
     for(i = 0; i < s->idx_to_atom_count; i++) {
@@ -46282,6 +46347,11 @@ uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValueConst obj,
         s->first_atom = JS_ATOM_END;
     else
         s->first_atom = 1;
+    if (s->allow_bytecode && (flags & JS_WRITE_OBJ_PINNED_ATOMS) &&
+        ctx->rt->pinned_atom_count != 0) {
+        s->pinned_atoms = TRUE;
+        s->first_atom = JS_ATOM_END + ctx->rt->pinned_atom_count;
+    }
     js_dbuf_init(ctx, &s->dbuf);
     js_object_list_init(&s->object_list);
 
@@ -46319,6 +46389,87 @@ uint8_t *JS_WriteObject(JSContext *ctx, size_t *psize, JSValueConst obj,
                         int flags)
 {
     return JS_WriteObject2(ctx, psize, obj, flags, NULL, NULL);
+}
+
+/* Tilefinch: intern an embedder's atom table so that its atoms take the
+   indices JS_ATOM_END, JS_ATOM_END + 1, ... and stay alive until
+   JS_FreeRuntime(). Bytecode written with JS_WRITE_OBJ_PINNED_ATOMS in a
+   runtime holding the same table names those atoms by index, so it has no
+   atoms to relocate and JS_READ_OBJ_ROM_DATA can execute it in place.
+
+   The table is a leb128 count followed by that many strings in the
+   bytecode string encoding (leb128 length << 1 | wide, then the Latin-1
+   bytes or little-endian UTF-16 units), each distinct, none a predefined
+   atom or an array index. It must be the first atom the runtime creates
+   after JS_NewRuntime(). Returns 0, or -1 with no atom left pinned when the
+   table is malformed, memory runs out, or an atom lands elsewhere. */
+int JS_PinAtomTable(JSRuntime *rt, const uint8_t *table, size_t length)
+{
+    const uint8_t *ptr = table, *end = table + length;
+    uint32_t count, i, hash = 2166136261u;
+    size_t k;
+    int ret;
+
+    if (rt->pinned_atom_count != 0 || length == 0)
+        return -1;
+    for (k = 0; k < length; k++)
+        hash = (hash ^ table[k]) * 16777619u;
+    ret = get_leb128(&count, ptr, end);
+    if (ret < 0 || count == 0 || count > JS_ATOM_MAX - JS_ATOM_END)
+        return -1;
+    ptr += ret;
+    for (i = 0; i < count; i++) {
+        uint32_t v, len, wide;
+        size_t bytes;
+        JSString *str;
+        JSAtom atom;
+
+        ret = get_leb128(&v, ptr, end);
+        if (ret < 0)
+            goto fail;
+        ptr += ret;
+        len = v >> 1;
+        wide = v & 1;
+        bytes = (size_t)len << wide;
+        if (len > JS_STRING_LEN_MAX || (size_t)(end - ptr) < bytes)
+            goto fail;
+        str = js_alloc_string_rt(rt, len, wide);
+        if (!str)
+            goto fail;
+        memcpy(str->u.str8, ptr, bytes);
+        if (wide) {
+            if (is_be()) {
+                uint32_t j;
+                for (j = 0; j < len; j++)
+                    str->u.str16[j] = bswap16(str->u.str16[j]);
+            }
+        } else {
+            str->u.str8[len] = '\0';
+        }
+        ptr += bytes;
+        atom = __JS_NewAtom(rt, str, JS_ATOM_TYPE_STRING);
+        if (atom != JS_ATOM_END + i) {
+            JS_FreeAtomRT(rt, atom);
+            goto fail;
+        }
+        rt->pinned_atom_count = i + 1;
+    }
+    if (ptr != end)
+        goto fail;
+    rt->pinned_atom_hash = hash;
+    return 0;
+ fail:
+    /* Last first, so that the free list hands the indices out in order
+       again. */
+    for (i = rt->pinned_atom_count; i-- > 0;)
+        JS_FreeAtomRT(rt, JS_ATOM_END + i);
+    rt->pinned_atom_count = 0;
+    return -1;
+}
+
+uint32_t JS_GetPinnedAtomCount(JSRuntime *rt)
+{
+    return rt->pinned_atom_count;
 }
 
 typedef struct BCReaderState {
@@ -47591,7 +47742,20 @@ static int JS_ReadObjectAtoms(BCReaderState *s)
 
     if (bc_get_u8(s, &v8))
         return -1;
-    if (v8 != BC_VERSION) {
+    if (v8 == (BC_VERSION | BC_VERSION_PINNED_ATOMS) && s->allow_bytecode) {
+        /* Tilefinch: atoms up to the pinned table's end are named by index;
+           only a runtime holding that very table can read them. */
+        JSRuntime *rt = s->ctx->rt;
+        uint32_t count, hash;
+        if (bc_get_leb128(s, &count) || bc_get_u32(s, &hash))
+            return -1;
+        if (count == 0 || count != rt->pinned_atom_count ||
+            hash != rt->pinned_atom_hash) {
+            JS_ThrowSyntaxError(s->ctx, "bytecode needs another pinned atom table");
+            return -1;
+        }
+        s->first_atom = JS_ATOM_END + count;
+    } else if (v8 != BC_VERSION) {
         JS_ThrowSyntaxError(s->ctx, "invalid version (%d expected=%d)",
                             v8, BC_VERSION);
         return -1;
@@ -70449,15 +70613,28 @@ int JS_ProfileForEachBytecode(JSRuntime *rt, JSProfileBytecodeFunc *cb,
 }
 
 #ifdef CONFIG_TILEFINCH_HEAP_DETAIL
-/* Heap-detail diagnostic (CONFIG_TILEFINCH_HEAP_DETAIL: host builds only,
-   never compiled for the PSP): read-only heap composition walk. Allocation-free (static tables), so it
+/* Heap-detail diagnostic (CONFIG_TILEFINCH_HEAP_DETAIL: host builds and
+   PSP validation builds, never a shipping PSP image): read-only heap
+   composition walk. Allocation-free (static tables), so it
    may run at a safe point right after an allocation was refused. Exact
    allocation sizes come from the arena block headers
    (js_malloc_usable_size_rt); strings reached from several values are
    split by reference count, as in JS_ComputeMemoryUsage. */
+#if defined(__PSP__)
+/* PSP validation builds: the tables are static, so they are sized to cost
+   about 80 KiB of the device's heap rather than about 1 MiB; a fuller
+   table folds its overflow into one row (files), skips de-duplication
+   (sources) or shares a slot (prototypes). */
+#define JSMD_FILES 256
+#define JSMD_OWNERS 2048
+#define JSMD_CLASSES 512
+#define JSMD_PROTOS_SIZE 1024
+#else
 #define JSMD_FILES 2048
 #define JSMD_OWNERS 65536
 #define JSMD_CLASSES 1024
+#define JSMD_PROTOS_SIZE 16384
+#endif
 enum { JSMD_F_FUNCS, JSMD_F_BC, JSMD_F_LAZY, JSMD_F_LAZY_BYTES, JSMD_F_PC2LINE,
        JSMD_F_SRC_OWN, JSMD_F_SRC_SHARED, JSMD_F_CLOSURES, JSMD_F_CLOSURE_BYTES,
        JSMD_F_BODY, JSMD_F_LAZY_SPAN_SHARED, JSMD_F_COMPILED_SHARED,
@@ -70468,7 +70645,7 @@ static int64_t jsmd_file[JSMD_FILES + 1][JSMD_F_COUNT];
 static const void *jsmd_owner[JSMD_OWNERS];
 static int64_t jsmd_class[JSMD_CLASSES][4];
 static double jsmd_str[5][2];
-#define JSMD_PROTOS 16384
+#define JSMD_PROTOS JSMD_PROTOS_SIZE
 static JSObject *jsmd_proto[JSMD_PROTOS];
 static int64_t jsmd_proto_stat[JSMD_PROTOS][3];
 

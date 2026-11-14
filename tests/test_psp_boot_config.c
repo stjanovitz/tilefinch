@@ -352,6 +352,15 @@ static int test_final_line_without_newline(void)
     CHECK(psp_boot_config_load(&config, path, capture_warning, &warning));
     CHECK(config.validation_game_audio_reference == 1 && warning.calls == 0);
     config.validation_game_audio_reference = 0;
+    /* The heap-census key lives outside the struct (shipping layout is
+       unchanged); a load sets it and disable_automation clears it. */
+    CHECK(!psp_boot_config_validation_js_heap_detail());
+    CHECK(write_text(path, "validation_js_heap_detail=1\n") == 0);
+    CHECK(psp_boot_config_load(&config, path, capture_warning, &warning));
+    CHECK(psp_boot_config_validation_js_heap_detail() && warning.calls == 0);
+    psp_boot_config_disable_automation(&config);
+    CHECK(!psp_boot_config_validation_js_heap_detail());
+    psp_boot_config_defaults(&config);
 
     static char long_line[2048];
     memset(long_line, 'a', sizeof(long_line) - 1u);

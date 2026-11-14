@@ -3192,7 +3192,8 @@ int main(int argc, char **argv)
         printf("javascript-module-bytecode hits=%zu misses=%zu stores=%zu "
                "admission-skips=%zu restore-failures=%zu restored-bytes=%zu "
                "stored-bytes=%zu restore-us=%llu cache-bytes=%zu "
-               "entries=%zu evictions=%zu limit=%zu no-store-skips=%zu\n",
+               "entries=%zu evictions=%zu limit=%zu no-store-skips=%zu "
+               "disk-queued=%zu disk-queued-bytes=%zu\n",
                js->module_bytecode_cache_hits,
                js->module_bytecode_cache_misses,
                js->module_bytecode_cache_stores,
@@ -3207,7 +3208,9 @@ int main(int argc, char **argv)
                    ? 0 : bytecode_session->module_bytecode_evictions,
                bytecode_session == NULL
                    ? 0 : bytecode_session->maximum_module_bytecode_bytes,
-               js->module_bytecode_cache_no_store_skips);
+               js->module_bytecode_cache_no_store_skips,
+               js->module_bytecode_cache_disk_queued,
+               js->module_bytecode_cache_disk_queued_bytes);
         if (browser_session_script_disk_enabled(bytecode_session)) {
             BrowserScriptDiskStats disk;
             browser_session_script_disk_stats(bytecode_session, &disk);
@@ -3216,7 +3219,9 @@ int main(int argc, char **argv)
                    "read-us=%llu verify-us=%llu writes=%zu "
                    "written-bytes=%llu write-us=%llu index-reads=%zu "
                    "index-writes=%zu rejects=%zu removed=%zu evictions=%zu "
-                   "skipped=%zu write-failures=%zu files=%zu bytes=%llu\n",
+                   "skipped=%zu write-failures=%zu files=%zu bytes=%llu "
+                   "queued=%zu queued-bytes=%llu queue-drops=%zu "
+                   "direct-reads=%zu\n",
                    js->script_bytecode_disk_hits,
                    js->script_bytecode_disk_load_us, disk.reads,
                    (unsigned long long) disk.read_bytes, disk.promoted,
@@ -3228,12 +3233,15 @@ int main(int argc, char **argv)
                    disk.index_reads, disk.index_writes, disk.rejects,
                    disk.removed, disk.evictions, disk.skipped,
                    disk.write_failures, disk.files,
-                   (unsigned long long) disk.bytes);
+                   (unsigned long long) disk.bytes, disk.queued,
+                   (unsigned long long) disk.queued_bytes, disk.queue_drops,
+                   disk.direct_reads);
         }
     }
     printf("javascript-dom-handles live=%zu peak=%zu high-water=%zu "
            "reuses=%zu exhaustions=%zu wrapper-releases=%zu "
-           "connected-preserves=%zu held-wrappers=%zu stale-releases=%zu capacity=%zu "
+           "connected-preserves=%zu connected-releases=%zu held-wrappers=%zu "
+           "stale-releases=%zu capacity=%zu "
            "growths=%zu growth-refusals=%zu\n",
            navigation.page.script_result.dom_handle_slots_live,
            navigation.page.script_result.dom_handle_slots_peak,
@@ -3242,6 +3250,7 @@ int main(int argc, char **argv)
            navigation.page.script_result.dom_handle_exhaustions,
            navigation.page.script_result.dom_handle_wrapper_releases,
            navigation.page.script_result.dom_handle_connected_preserves,
+           navigation.page.script_result.dom_handle_connected_releases,
            navigation.page.script_result.dom_handle_wrappers_held_peak,
            navigation.page.script_result.dom_handle_stale_releases,
            navigation.page.script_result.dom_handle_slot_capacity,

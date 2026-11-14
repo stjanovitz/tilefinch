@@ -392,6 +392,20 @@ static const char worker_outbound_close[] =
     "let received=0;worker.onmessage=e=>{if(e.data.value!==++received)pocSummary='CLOSE-ORDER';"
     "else if(received===2){pocSummary='OK';worker.terminate();URL.revokeObjectURL(url)}};";
 
+static const char worker_transfer_termination[] =
+    "pocSummary='TRANSFER-TERMINATION-PENDING';const url=URL.createObjectURL(new Blob(['']));"
+    "let good=true;for(let kind=0;kind<4;kind++){const worker=new Worker(url),"
+    "buffer=new ArrayBuffer(8);let calls=0,failed=false;try{"
+    "if(kind===0)worker.postMessage({buffer},{get transfer(){calls++;worker.terminate();return [buffer]}});"
+    "else if(kind===1)worker.postMessage({get buffer(){calls++;worker.terminate();return buffer}},[buffer]);"
+    "else if(kind===2)worker.postMessage({buffer},{transfer:{*[Symbol.iterator](){"
+    "calls++;worker.terminate();yield buffer}}});"
+    "else worker.postMessage({get buffer(){calls++;worker.terminate();return buffer},bad:()=>{}},[buffer]);"
+    "}catch(e){failed=e.name==='DataCloneError'}let later=0;"
+    "worker.postMessage({get value(){later++;return 1}});worker.terminate();"
+    "good=good&&calls===1&&later===0&&failed===(kind===3)&&buffer.byteLength===(kind===3?8:0)}"
+    "URL.revokeObjectURL(url);pocSummary=good?'OK':'TRANSFER-TERMINATION-BAD';";
+
 static const char file_reader_admission[] =
     "pocSummary='READER-STRANDED';const ids=[],reader=new FileReader;"
     "for(let i=0;i<256;i++){const id=setTimeout(()=>{},600000);if(!id)break;ids.push(id)}"
@@ -660,10 +674,36 @@ static const char multiplayer_full_timers_success[] =
     "channel.onopen=()=>{for(const id of ids)clearTimeout(id);channel.close()};"
     "channel.onclose=()=>{pocSummary='OK'};";
 
+#include "suites/readable_lifecycle.inc"
+
 int main(int argc, char **argv)
 {
     typedef struct { const char *name, *source; } AsyncCase;
     static const AsyncCase cases[] = {
+        {"stream-owner-controls", stream_owner_controls},
+        {"iterator-queue-bound", iterator_queue_bound},
+        {"reader-release-handoff", reader_release_handoff},
+        {"reader-terminal-release", reader_terminal_release},
+        {"writer-release-handoff", writer_release_handoff},
+        {"writer-terminal-release", writer_terminal_release},
+        {"iterator-read-failure", iterator_read_failure},
+        {"iterator-cancel-failure", iterator_cancel_failure},
+        {"iterator-terminal-repeat", iterator_terminal_repeat},
+        {"iterator-return-order", iterator_return_order},
+        {"iterator-prevent-cancel", iterator_prevent_cancel},
+        {"readable-start-handoff", readable_start_handoff},
+        {"readable-start-rejection", readable_start_rejection},
+        {"readable-zero-demand", readable_zero_demand},
+        {"readable-close-drain", readable_close_drain},
+        {"readable-close-cancel", readable_close_cancel},
+        {"readable-close-error", readable_close_error},
+        {"readable-empty-cancel", readable_empty_cancel},
+        {"readable-cancel-start", readable_cancel_start},
+        {"pipe-locked-admission", pipe_locked_admission},
+        {"pipe-failed-cleanup", pipe_failed_cleanup},
+        {"pipe-destination-failure", pipe_destination_failure},
+        {"pipe-lifecycle-controls", pipe_lifecycle_controls},
+        {"readable-buffered-body", readable_buffered_body},
         {"ports", port_capacity}, {"performance", performance_capacity},
         {"resize", resize_capacity}, {"worker-performance", worker_performance_capacity},
         {"intersection", intersection_capacity},
@@ -686,6 +726,7 @@ int main(int argc, char **argv)
         {"worker-reentrant-admission", worker_reentrant_admission},
         {"worker-clone-rollback", worker_clone_rollback},
         {"worker-outbound-close", worker_outbound_close},
+        {"worker-transfer-termination", worker_transfer_termination},
         {"file-reader-admission", file_reader_admission},
         {"file-reader-async-start", file_reader_async_start},
         {"file-reader-load-chain", file_reader_load_chain},

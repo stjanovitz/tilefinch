@@ -711,6 +711,11 @@ typedef struct {
        origin reaches this CSS y coordinate can be deferred to the
        authoritative build. */
     int preview_y_limit;
+    /* A build laid out through one node (layout_build_context_through):
+       preview_y_limit stays 0 until that node's box is recorded, then
+       limits the rest. Tables measure every row, so none above the cut is
+       measured from its first rows only. */
+    bool preview_through;
     bool record_unresolved_visuals;
     /* This pass owns the sheet's container-query log: containers record
        their content box as layout learns it, and nothing measured by an
@@ -931,9 +936,43 @@ static inline void layout_note_preview_cut(LayoutContext *context,
         layout->preview_cut_link_count = layout->link_count;
         layout->preview_cut_control_count = layout->control_count;
         layout->preview_cut_box_count = layout->node_box_count;
+        layout->preview_cut_command_count = layout->count;
     }
     if (inexact && layout != NULL) layout->preview_inexact = true;
     context->preview_truncated = true;
+}
+
+/* layout_build_context_through: the first box recorded for `nodes` (each
+   target and its nearest ancestors, so one that records no box of its own
+   is still passed) sets *limit to that box's y plus depth. */
+#define LAYOUT_PREVIEW_THROUGH_NODES 16u
+typedef struct LayoutPreviewThrough {
+    const lxb_dom_node_t *nodes[LAYOUT_PREVIEW_THROUGH_NODES];
+    size_t count;
+    int depth;
+    int *limit;
+} LayoutPreviewThrough;
+
+/* A cut inside the container whose box starts at `top` may move what it
+   laid out before the cut, where the complete layout never places it
+   (LayoutDocument preview_moved_top). */
+static inline void layout_note_preview_moved(LayoutContext *context,
+                                             int top)
+{
+    LayoutDocument *layout = context->layout;
+    if (layout == NULL) return;
+    if (!layout->preview_moved || top < layout->preview_moved_top)
+        layout->preview_moved_top = top;
+    layout->preview_moved = true;
+}
+
+/* layout_note_preview_cut for an inexact cut inside the container at
+   `top`. */
+static inline void layout_note_preview_inexact(LayoutContext *context,
+                                               int top)
+{
+    layout_note_preview_cut(context, true);
+    layout_note_preview_moved(context, top);
 }
 
 static inline bool layout_preview_limit_reached(LayoutContext *context,
@@ -1414,8 +1453,12 @@ void layout_bidi_control_text(LayoutContext *context, lxb_dom_node_t *node,
                               const ComputedStyle *style, size_t command_start);
 const LayoutBidiCommand *layout_bidi_command_for_index(
     const LayoutDocument *layout, size_t command_index);
+/* Moves the visual-order glyphs of the commands in [command_start,
+   command_end) by dx. Their x is absolute, so every horizontal move of a
+   command range must make this call alongside it. */
 void layout_bidi_translate_commands(
-    LayoutDocument *layout, size_t command_start, int dx);
+    LayoutDocument *layout, size_t command_start, size_t command_end,
+    int dx);
 void layout_bidi_scale_commands(
     LayoutDocument *layout, size_t command_start,
     int origin_x_twice, uint16_t scale_q14);
@@ -1572,7 +1615,7 @@ bool layout_insert_commands(LayoutContext *context, size_t index,
                             const DrawCommand *commands, size_t count);
 bool layout_insert_command(LayoutContext *context, size_t index,
                            DrawCommand command);
-bool layout_node_within(const lxb_dom_node_t *node, const lxb_dom_node_t *ancestor);
+#define layout_node_within document_node_within
 bool layout_positioned_command_escapes_clip(
     const LayoutDocument *layout, size_t command_index,
     const LayoutNodeBox *clip_box);
@@ -1647,9 +1690,7 @@ int scale_fixed_around_center(int value_fixed, int origin_twice,
 bool layout_box_first_text_baseline(const LayoutDocument *layout,
                                     const LayoutNodeBox *box, int *baseline);
 /* All text-measurement tracking arguments below are signed 26.6 pixels. */
-int measured_text_width_fixed(const FontFace *face, FontFamily metric_family, const char *text, size_t length, int font_size_fixed, bool synthetic_bold, bool metric_bold, int scale, int letter_spacing);
 int measured_text_width_fixed_mode(const FontFace *face, FontFamily metric_family, const char *text, size_t length, int font_size_fixed, bool synthetic_bold, bool metric_bold, int scale, int letter_spacing, bool kerning);
-int measured_text_width(const FontFace *face, FontFamily metric_family, const char *text, size_t length, int font_size_fixed, bool synthetic_bold, bool metric_bold, int scale, int letter_spacing);
 int measured_flow_text_width_fixed(const FontFace *face, FontFamily metric_family, const char *text, size_t length, int font_size_fixed, bool synthetic_bold, bool metric_bold, int scale, int letter_spacing, TextTransformMode transform, bool kerning);
 int measured_flow_text_width(const FontFace *face, FontFamily metric_family, const char *text, size_t length, int font_size_fixed, bool synthetic_bold, bool metric_bold, int scale, int letter_spacing, TextTransformMode transform, bool kerning);
 /* measured_flow_text_width_fixed, and whether the face measured the run

@@ -25,6 +25,9 @@ typedef struct {
     bool available;
     bool installed;
     bool auto_install;
+    /* Refusal, failure or cancellation ended the automatic install chain;
+       only the snapshot survives until the user's next attempt. */
+    bool install_stopped;
     TilefinchVoiceComponentSource source;
 } PspVoiceComponentSession;
 

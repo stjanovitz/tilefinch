@@ -57,23 +57,3 @@ CaptureStatus inspect_and_condition_capture(
     }
     return CAPTURE_OK;
 }
-
-const char *capture_status_name(CaptureStatus status)
-{
-    switch (status) {
-    case CAPTURE_OK:
-        return "ok";
-    case CAPTURE_EMPTY:
-        return "empty";
-    case CAPTURE_TOO_SHORT:
-        return "too_short";
-    case CAPTURE_TOO_QUIET:
-        return "too_quiet";
-    case CAPTURE_TOO_CLIPPED:
-        return "too_clipped";
-    case CAPTURE_TOO_NOISY:
-        return "too_noisy";
-    default:
-        return "unknown";
-    }
-}

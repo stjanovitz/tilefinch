@@ -83,6 +83,7 @@
     CHECK(test_international_line_flow(&budget) == 0);
     CHECK(test_bidi_long_document(&budget) == 0);
     CHECK(test_control_text_visual_order(&budget) == 0);
+    CHECK(test_bidi_glyphs_follow_subtree_translation(&budget) == 0);
 
     puts("test: HTML UA body margin and author spacing resets");
     CHECK(test_ua_body_spacing(&budget) == 0);

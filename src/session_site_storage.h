@@ -17,7 +17,13 @@ void site_storage_attach(BrowserSession *session,
 void site_storage_usage(const BrowserSession *session, const char *origin,
                         BrowserSiteDataUsage *usage);
 /* Deletes the origin's data; its tier and standing choice remain. */
-void site_storage_clear_origin(BrowserSession *session, const char *origin);
+bool site_storage_clear_origin(BrowserSession *session, const char *origin);
+
+#if defined(TILEFINCH_MEMORY_DIAGNOSTICS)
+/* Memory-study diagnostics: the Budget charge of the RAM store (table,
+   item array, scratch and every RAM item's text). */
+size_t site_storage_budget_bytes(const BrowserSession *session);
+#endif
 
 /* The "Save local data" snapshot covers localStorage kept in RAM; a site
    on the Memory Stick already has its own file. */

@@ -1,4 +1,5 @@
 #include "tilefinch/media_hls.h"
+#include "tilefinch/platform.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -312,15 +313,7 @@ struct MediaHlsSource {
     MediaHlsStats stats;
 };
 
-static void hls_error(char *error, size_t error_size,
-                      const char *format, ...)
-{
-    if (error == NULL || error_size == 0) return;
-    va_list arguments;
-    va_start(arguments, format);
-    vsnprintf(error, error_size, format, arguments);
-    va_end(arguments);
-}
+#define hls_error tilefinch_format_error
 
 static void hls_source_fail(MediaHlsSource *source,
                             const char *format, ...)

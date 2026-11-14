@@ -96,14 +96,19 @@ static uint16_t psp_entropy_capture_phase = PSP_ENTROPY_CAPTURE_PHASE_FILL;
 static uint32_t psp_entropy_capture_copy[PSP_ENTROPY_MAX_BATCH];
 #endif
 
+/* Validation builds print the status lines to stdout when no sink is
+   installed; other builds report only to an installed sink (the crypto
+   selftest's log), so the shipping browser and the launcher stay silent. */
 static void psp_entropy_emit(const char *line)
 {
     if (psp_entropy.report != NULL) {
         psp_entropy.report(line);
         return;
     }
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
     fputs(line, stdout);
     fputc('\n', stdout);
+#endif
 }
 
 void psp_entropy_configure(const char *seed_path, PspEntropyPolicy policy,
@@ -289,6 +294,9 @@ static void psp_entropy_gather_locked(void)
 
 static void psp_entropy_report_state(const char *event)
 {
+#ifndef TILEFINCH_PSP_VALIDATION_LOG
+    if (psp_entropy.report == NULL) return;
+#endif
     char line[PSP_ENTROPY_REPORT_BYTES];
     const PspEntropySourceStats *work = &psp_entropy.work;
     const PspEntropySourceStats *sleep = &psp_entropy.sleep;

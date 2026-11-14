@@ -1184,6 +1184,8 @@ static bool navigation_finish_authoritative_layout(
         navigation_update_font_usage(session);
     }
     session->page.loaded = true;
+    session->page.script_compile_memory_refusals_at_commit =
+        session->page.script_result.host_compile_memory_refusals;
     script_runtime_heavy_commit(session->page.runtime);
     script_runtime_arm_memory_rescue(session->page.runtime);
     /* Runtime attachment publishes canvas surfaces queued by parser-time

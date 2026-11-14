@@ -95,6 +95,19 @@ class ResourceTests(unittest.TestCase):
             "translations/ui/v15/pt.tful": "352adf59c77eed42869d200edf678c88dcc9e6a30cf567a8285bb0a18904fcfa",
             "translations/ui/v15/bn.tful": "e1d66d88a3e569f8dd13261e6edca66687d643b5cd434f614db5b33c507e4da2",
             "translations/ui/v15/as.tful": "d334d991dd2f0c3316522a9e1aaa1ebd88a331ca183c884916fb3d6747bd43a5",
+            "translations/ui/v16/es.tful": "ba9f69592d730fa57c5130a7d7dd642d5865eb9cb5dc399d317aaa322c27f415",
+            "translations/ui/v16/fr.tful": "2fcb0401904d54c74648545fe058884ddec2d9ea73beae3040d45595a5048f99",
+            "translations/ui/v16/de.tful": "793d1186487878f60b91227a93401c1c60a4dd71311955bbc8ea37c7531529da",
+            "translations/ui/v16/ja.tful": "1ef05b73cc12771dd55512c2e69b490e569884e6b74c432d7fb40eb01dc3bc7e",
+            "translations/ui/v16/ru.tful": "e40be7ee2d989cdc7865aa427e25b8914e482cc730c0e5a4545c0b6c224afbc7",
+            "translations/ui/v16/uk.tful": "d25d963a4e6fe9132d1317388049053296c0926c771759712f681616adcaa4b8",
+            "translations/ui/v16/zh-hans.tful": "a2a7a55ee3c71355ab3259f67f49c44f50b66d4575235539c4ae4f38f0cd1e50",
+            "translations/ui/v16/ko.tful": "f378ec430a66e1a36ee2922a7d432c9eb3a6f1ebce1eccb75226309e3a43ec2a",
+            "translations/ui/v16/hi.tful": "9fda2ccb7ef1f04f8744f87c6449a00079781bde2652fd063047bde3004fe0d5",
+            "translations/ui/v16/ar.tful": "36edc3d11b99be1bb8aee53040efc8e8d9f67d3d06acd575232e33b97adfa6e9",
+            "translations/ui/v16/pt.tful": "43704abf269667b59ecd129a6728a0cf480c7429c0ed577af71ebd089564d954",
+            "translations/ui/v16/bn.tful": "3abd4a97e1ab4ac4cd9e6227afcfacc014ea746f44d57bb6a3a759ecd9666641",
+            "translations/ui/v16/as.tful": "1b14d3af11c10fc4d6ad845395da38adaa0f85c257f7fc84ea368438a2ed57eb",
         }
         generated = outputs(resources)
         for key, digest in published.items():
@@ -114,13 +127,52 @@ class ResourceTests(unittest.TestCase):
         old_languages = generator.CATALOGS[6][1]
         rows = generator.read_rows(7, old_languages)
         for column, (code, label, glyphs) in enumerate(old_languages, 1):
-            self.assertIn(f'"translations/ui/v16/{code}.tful"', manifest)
-        self.assertIn('"translations/ui/v16/pt.tful"', manifest)
+            self.assertIn(f'"translations/ui/v17/{code}.tful"', manifest)
+        self.assertIn('"translations/ui/v17/pt.tful"', manifest)
         portuguese = generator.read_rows(8, generator.CATALOGS[7][1])
         self.assertGreaterEqual({row[0] for row in portuguese}, {row[0] for row in rows})
         self.assertEqual(dict(portuguese)["Portuguese"], "Português")
-        self.assertIn('"translations/ui/v16/bn.tful"', manifest)
-        self.assertIn('"translations/ui/v16/as.tful"', manifest)
+        self.assertIn('"translations/ui/v17/bn.tful"', manifest)
+        self.assertIn('"translations/ui/v17/as.tful"', manifest)
+
+    def test_v16_stays_frozen_under_the_narrow_bound(self):
+        # v16 is pinned by the release candidate, whose reader has 16-bit
+        # value offsets: its sources, sequences and files never change, and
+        # every file before v17 fits 64 KiB - 1.
+        self.assertEqual(hashlib.sha256((ROOT / "translations/ui/v16/source.tsv")
+                                        .read_bytes()).hexdigest(),
+                         "cd5141d73bc0ab708b83bc6ed6af5fc61dfe572ba9cb9020bf79876a7192d153")
+        for name, digest in (("hi.sequences", "c764fd269b0f8ed2ca8d8c3a7779df2105f2d287f18091c3d8d148527f20cb09"),
+                             ("bengali-assamese.sequences", "6b6b9b9838821bf6545b5404b0b5e412dfaf0c13398b3c76cbb39544347970aa")):
+            self.assertEqual(hashlib.sha256((ROOT / "translations/ui/v16" / name)
+                                            .read_bytes()).hexdigest(), digest, name)
+        generated = outputs(PROBE)
+        for path, data in generated.items():
+            if path.is_relative_to(PROBE) and int(path.parent.name[1:]) < generator.WIDE_VERSION:
+                self.assertLessEqual(len(data), 64 * 1024 - 1, path)
+        self.assertEqual(generator.byte_limit(16), 64 * 1024 - 1)
+        self.assertEqual(generator.byte_limit(generator.WIDE_VERSION), 128 * 1024)
+        header = (ROOT / "include/tilefinch/ui_language.h").read_text()
+        self.assertIn("#define TILEFINCH_UI_TRANSLATION_BYTES (128u * 1024u)", header)
+
+    def test_active_clusters_are_in_the_required_glyph_revision(self):
+        # A pack revision is built from the sequences of the catalog that
+        # introduced it (MINIMUM_GLYPH_SEQUENCES). A later catalog that keeps
+        # that revision must not need a cluster outside those sequences;
+        # otherwise reword the row or raise the revision and rebuild the pack.
+        active = generator.ACTIVE_VERSION
+        for glyphs, name in (("DEVANAGARI", "hi.sequences"),
+                             ("BENGALI_ASSAMESE", "bengali-assamese.sequences")):
+            required = generator.minimum_glyph_sequence(glyphs, active)
+            built_from = max(first for (script, first), sequence
+                             in generator.MINIMUM_GLYPH_SEQUENCES.items()
+                             if script == glyphs and sequence == required)
+            def entries(version):
+                text = (ROOT / f"translations/ui/v{version}" / name).read_text()
+                return {line for line in text.splitlines()
+                        if line and not line.startswith("#")}
+            missing = sorted(entries(active) - entries(built_from))
+            self.assertEqual([], missing, (glyphs, required, built_from))
 
     def test_download_labels_have_translations(self):
         rows = generator.read_rows(generator.ACTIVE_VERSION, generator.CATALOGS[-1][1])

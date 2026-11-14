@@ -18,6 +18,7 @@
 #include "tilefinch/sha256.h"
 #include "tilefinch/url.h"
 #include "diagnostic_trace.h"
+#include "fnv1a.h"
 #include "session_cookies.h"
 #include "session_site_storage.h"
 
@@ -42,14 +43,7 @@ static bool copy_origin(const char *url,
     return tilefinch_url_origin(url, output, BROWSER_ORIGIN_LIMIT);
 }
 
-static uint64_t session_hash_bytes(uint64_t hash, const void *data,
-                                   size_t length)
-{
-    const unsigned char *bytes = data;
-    for (size_t i = 0; i < length; i++)
-        hash = (hash ^ bytes[i]) * UINT64_C(1099511628211);
-    return hash;
-}
+#define session_hash_bytes fnv1a64
 
 static size_t offline_deferred_find(
     BrowserSession *session, const char *key,
@@ -789,7 +783,7 @@ bool browser_session_clear_site_data(
     char origin[BROWSER_ORIGIN_LIMIT];
     if (!copy_origin(url, origin)
         || !session_cookie_clear_site(session, url)) return false;
-    site_storage_clear_origin(session, origin);
+    bool storage_cleared = site_storage_clear_origin(session, origin);
     for (size_t at = 0; at < BROWSER_CLIENT_HINT_ORIGIN_LIMIT; at++) {
         BrowserClientHintEntry *entry = &session->client_hints[at];
         if (entry->valid && strcmp(entry->origin, origin) == 0)
@@ -809,7 +803,7 @@ bool browser_session_clear_site_data(
         if (!browser_session_script_disk_clear_site(session, partition))
             return false;
     }
-    return true;
+    return storage_cleared;
 }
 
 bool browser_session_cache_get(BrowserSession *session, const char *url,
@@ -1690,6 +1684,7 @@ static void script_bytecode_clear_all(BrowserSession *session,
                                       const char *reason)
 {
     session->script_bytecode_epoch++;
+    browser_session_script_disk_queue_clear(session, NULL);
     script_bytecode_clear(session, BROWSER_SCRIPT_BYTECODE_MODULE, reason);
     script_bytecode_clear(session, BROWSER_SCRIPT_BYTECODE_CLASSIC, reason);
     browser_session_lazy_bundle_pending_clear(session, NULL);
@@ -1768,6 +1763,9 @@ void browser_session_script_bytecode_set_limit(
         session->maximum_module_bytecode_bytes = maximum_bytes;
     if (maximum_bytes == 0) {
         script_bytecode_clear(session, kind, "set-limit");
+        /* The persistent tier's write queue holds module records only. */
+        if (kind == BROWSER_SCRIPT_BYTECODE_MODULE)
+            browser_session_script_disk_queue_clear(session, NULL);
         return;
     }
     while (script_bytecode_table(session, kind) != NULL
@@ -1939,6 +1937,9 @@ bool browser_session_script_bytecode_put(
                                          "replaced");
         }
     }
+    /* This record supersedes one queued for the persistent tier. */
+    if (kind == BROWSER_SCRIPT_BYTECODE_MODULE)
+        browser_session_script_disk_unqueue(session, key);
     BrowserScriptBytecodeEntry *slot = NULL;
     for (size_t evictions = 0;
          evictions <= BROWSER_SCRIPT_BYTECODE_ENTRIES; evictions++) {
@@ -1958,7 +1959,19 @@ bool browser_session_script_bytecode_put(
             slot = NULL;
             break;
         }
-        script_bytecode_entry_remove(session, kind, victim, "evict-lru");
+        /* An earlier page's module record not yet written to the
+           persistent tier moves to its write queue instead of being lost
+           (no allocation: the queue takes its body and strings). */
+        size_t victim_bytes = victim->charged_bytes;
+        if (kind == BROWSER_SCRIPT_BYTECODE_MODULE
+            && victim->disk_state == BROWSER_SCRIPT_DISK_DIRTY
+            && browser_session_script_disk_adopt(session, victim)) {
+            cache->bytes = victim_bytes <= cache->bytes
+                ? cache->bytes - victim_bytes : 0;
+            memset(victim, 0, sizeof(*victim));
+        } else {
+            script_bytecode_entry_remove(session, kind, victim, "evict-lru");
+        }
         script_bytecode_count_eviction(session, kind);
     }
     if (slot == NULL) {
@@ -2028,7 +2041,8 @@ void browser_session_module_bytecode_invalidate(
 /* The compiled-script reclaim order, shared by the Budget reclaim hook and
    the session cache reclaim. Queued bundle records first: a queued
    record's reference may be all that keeps a response body alive. Then
-   classic and module entries, from the larger table. Bundle records
+   the persistent tier's write queue, then classic and module entries,
+   from the larger table. Bundle records
    themselves (a few KiB that save seconds) go last. Returns the charged
    bytes released. Frees only, never allocates; `release_table` also frees
    a table emptied on the way, which the Budget hook must not do (it can
@@ -2039,6 +2053,14 @@ static size_t script_bytecode_reclaim_ordered(BrowserSession *session,
 {
     size_t released = browser_session_lazy_bundle_pending_reclaim(
         session, target_bytes);
+    /* Then module records waiting only to be written to the persistent
+       tier: no lookup in this session can use them. */
+    if (released < target_bytes) {
+        size_t queued = browser_session_script_disk_queue_reclaim(
+            session, target_bytes - released);
+        released = queued > SIZE_MAX - released
+            ? SIZE_MAX : released + queued;
+    }
     while (released < target_bytes) {
         size_t charged = script_bytecode_evict_any(
             session, "reclaim", release_table);
@@ -2076,6 +2098,7 @@ void browser_session_script_bytecode_clear_partition(
        stored on a later visit. */
     session->script_bytecode_epoch++;
     browser_session_lazy_bundle_pending_clear(session, partition);
+    browser_session_script_disk_queue_clear(session, partition);
     for (int k = 0; k < (int) BROWSER_SCRIPT_BYTECODE_KINDS; k++) {
         BrowserScriptBytecodeKind kind = (BrowserScriptBytecodeKind) k;
         BrowserScriptBytecodeTable *cache =

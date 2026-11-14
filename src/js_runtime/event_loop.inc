@@ -85,15 +85,10 @@ void script_runtime_clear_execution_limit(ScriptRuntime *runtime)
 
 static uint64_t runtime_lazy_memory_failures(const ScriptRuntime *runtime)
 {
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
     JSLazyFunctionStats stats;
     if (runtime == NULL || runtime->runtime == NULL) return 0;
     JS_GetLazyFunctionStats(runtime->runtime, &stats);
     return stats.memory_failures;
-#else
-    (void) runtime;
-    return 0;
-#endif
 }
 
 static bool runtime_job_exception_is_fatal(const ScriptRuntime *runtime,
@@ -384,6 +379,7 @@ static bool runtime_run_jobs_checkpoint(ScriptRuntime *runtime)
             > runtime->gc_checkpoint_collections_max)
         runtime->gc_checkpoint_collections_max =
             runtime->heap_collections - gc_collections_before;
+    js_rt_bridge_computed_style_release_records(&runtime->bridge);
     /* Task boundary: a WebAssembly runtime left idle by this task's
        operations is released here (see wasm_runtime_leave). */
     uint64_t wasm_release_started_ns = trace_steps
@@ -473,7 +469,8 @@ bool script_runtime_has_pending_author_work(ScriptRuntime *runtime)
             || runtime->bridge.async_fetch_count != 0u
             || script_runtime_has_pending_startup_scripts(runtime)
             || runtime->page_visibility_queue_count != 0u
-            || runtime->viewport_resize_phase != 0u);
+            || runtime->viewport_resize_phase != 0u
+            || js_rt_media_capture_event_pending(runtime));
 }
 
 
@@ -517,7 +514,8 @@ static const char *const runtime_host_callback_names[] = {
     [SCRIPT_HOST_WRAP_NODE] = "__tilefinchWrap",
     [SCRIPT_HOST_RETIRE_NATIVE_NODE_STATE] = "__tilefinchRetireNativeNodeState",
     [SCRIPT_HOST_HOLD_EVENT_STATE] = "__tilefinchHoldEventState",
-    [SCRIPT_HOST_RELEASE_EVENT_HOLDERS] = "__tilefinchReleaseEventHolders"
+    [SCRIPT_HOST_RELEASE_EVENT_HOLDERS] = "__tilefinchReleaseEventHolders",
+    [SCRIPT_HOST_PERMISSIONS_CHANGED] = "__tilefinchPermissionsChanged"
 };
 _Static_assert(sizeof(runtime_host_callback_names)
                    / sizeof(runtime_host_callback_names[0])
@@ -1102,7 +1100,6 @@ void script_runtime_report_memory(ScriptRuntime *runtime, FILE *output)
             (long long) usage.fast_array_elements,
             (long long) usage.binary_object_count,
             (long long) usage.binary_object_size);
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
     JSLazyFunctionStats lazy;
     JS_GetLazyFunctionStats(runtime->runtime, &lazy);
     fprintf(output,
@@ -1120,7 +1117,6 @@ void script_runtime_report_memory(ScriptRuntime *runtime, FILE *output)
             (unsigned long long) lazy.preparsed_source_bytes,
             (unsigned long long) lazy.preparse_fallbacks,
             (unsigned long long) lazy.preparse_restarts);
-#endif
 }
 
 void script_runtime_report_roots(ScriptRuntime *runtime, FILE *output,
@@ -1415,8 +1411,11 @@ long script_runtime_node_handle(ScriptRuntime *runtime,
 long script_runtime_node_weak_handle(ScriptRuntime *runtime,
                                      lxb_dom_node_t *node)
 {
-    return runtime == NULL
-        ? 0 : (long) js_rt_bridge_register_node(&runtime->bridge, node);
+    if (runtime == NULL) return 0;
+    /* Native holders keep weak handles across turns: the slot is kept. */
+    int64_t handle = js_rt_bridge_register_node(&runtime->bridge, node);
+    js_rt_bridge_keep_node_handle(&runtime->bridge, handle);
+    return (long) handle;
 }
 
 void script_runtime_node_handle_release(ScriptRuntime *runtime, long handle)
@@ -1430,7 +1429,8 @@ bool script_runtime_node_handle_capacity_available(
 {
     if (runtime == NULL) return true;
     const DomBridge *bridge = &runtime->bridge;
-    if (bridge->node_count < bridge->node_capacity_limit) return true;
+    if (bridge->node_count < bridge->node_capacity
+        || js_rt_bridge_node_table_can_grow(bridge)) return true;
     for (size_t slot = 0; slot < bridge->node_count; slot++) {
         if (bridge->nodes[slot] == NULL
             && bridge->node_generations[slot] != 0

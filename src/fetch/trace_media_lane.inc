@@ -601,41 +601,6 @@ static bool fetch_replay_lane_take_media(
     return true;
 }
 
-static bool fetch_replay_lane_take(uint64_t request_id,
-                                   unsigned char *destination,
-                                   size_t capacity,
-                                   FetchBackgroundResult *result)
-{
-    FetchReplayLaneOperation *operation = fetch_replay_lane_find(request_id);
-    if (operation == NULL || result == NULL || operation->streaming)
-        return false;
-    const FetchResult *source = operation->result;
-    memset(result, 0, sizeof(*result));
-    bool copied = operation->length <= capacity
-        && (operation->length == 0 || destination != NULL)
-        && fetch_replay_lane_read(operation, destination, operation->length);
-    result->length = operation->length;
-    result->received_body_bytes = operation->length;
-    result->status_code = source->status_code;
-    result->success = copied && operation->success;
-    snprintf(result->effective_url, sizeof(result->effective_url), "%s",
-             source->effective_url);
-    snprintf(result->content_type, sizeof(result->content_type), "%s",
-             source->content_type);
-    (void) fetch_response_header_value(source, "content-range",
-                                       result->content_range,
-                                       sizeof(result->content_range));
-    memcpy(result->response_headers, source->response_headers,
-           source->response_headers_length + 1u);
-    result->response_headers_length = source->response_headers_length;
-    result->security = source->security;
-    snprintf(result->error, sizeof(result->error), "%s",
-             copied ? source->error
-                    : "background result destination was too small");
-    fetch_replay_lane_release(operation);
-    return true;
-}
-
 static bool fetch_replay_lane_cancel(uint64_t request_id)
 {
     FetchReplayLaneOperation *operation = fetch_replay_lane_find(request_id);

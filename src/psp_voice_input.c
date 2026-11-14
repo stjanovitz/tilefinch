@@ -17,6 +17,7 @@
 #include "tilefinch/voice_job_lifecycle.h"
 #include "psp_module_policy.h"
 #include "psp_thread_contract.h"
+#include "voice_worker_retirement.inc"
 #include "stt_engine.h"
 #include "stt_component_loader.h"
 
@@ -110,7 +111,7 @@ typedef struct {
     SttEngine *engine;
     int16_t *capture;
     size_t capture_samples;
-    SceUID completion_event;
+    VoiceWorkerResources worker;
     VoiceModelTier requested_tier;
     VoiceModelTier tier;
     VoiceCacheRows cache_rows;
@@ -122,6 +123,10 @@ typedef struct {
     SttStatus status;
     SttResult result;
 } PspVoiceJob;
+
+/* A refused firmware retirement retains at most one attempt until process
+   exit. The component quarantine prevents re-entry and keeps its reservation. */
+static PspVoiceJob *voice_quarantined_job;
 
 #define VOICE_JOB_COMPLETE 0x1u
 
@@ -235,7 +240,7 @@ static int voice_decode_thread(SceSize argument_size, void *arguments)
             voice_decode_cancelled, job, &job->result);
     }
     int signalled = sceKernelSetEventFlag(
-        job->completion_event, VOICE_JOB_COMPLETE);
+        job->worker.event, VOICE_JOB_COMPLETE);
     return signalled < 0 ? signalled : 0;
 }
 
@@ -266,7 +271,7 @@ static bool voice_lifecycle_poll_complete(void *user)
     PspVoiceLifecyclePlatform *platform = user;
     if (platform == NULL || platform->job == NULL) return false;
     int polled = sceKernelPollEventFlag(
-        platform->job->completion_event, VOICE_JOB_COMPLETE,
+        platform->job->worker.event, VOICE_JOB_COMPLETE,
         PSP_EVENT_WAITOR, &platform->completed_bits);
     platform->event_poll_status = polled;
     if (polled >= 0) return true;
@@ -307,6 +312,29 @@ static void voice_progress(
     PspVoiceProgress progress, void *user, const char *status)
 {
     if (progress != NULL) progress(user, status);
+}
+
+static bool voice_retire_or_quarantine(
+    PspVoiceInput *voice, PspVoiceJob *job,
+    PspVoiceProgress progress, void *progress_user)
+{
+    int result = voice_worker_retire(&job->worker);
+    if (result >= 0) return true;
+    printf("tilefinch-voice: retirement refused native=0x%08x "
+           "started=%u joined=%u thread-owned=%u event-owned=%u\n",
+           (unsigned) result, (unsigned) job->worker.started,
+           (unsigned) job->worker.joined,
+           (unsigned) (job->worker.thread >= 0),
+           (unsigned) (job->worker.event >= 0));
+    voice_quarantined_job = job;
+    voice->disabled_after_timeout = true;
+    psp_voice_component_quarantine();
+    voice->engine = NULL;
+    voice->tier = VOICE_MODEL_NONE;
+    /* In particular, do not wipe capture or inspect the engine here: a
+       refused join is not proof that the worker has stopped using them. */
+    voice_progress(progress, progress_user, "VOICE UNAVAILABLE UNTIL RESTART");
+    return false;
 }
 
 static void voice_log_early_end(
@@ -492,7 +520,7 @@ bool psp_voice_input_transcribe(
             progress, progress_user, "EXPERIMENTAL VOICE IS DISABLED");
         return false;
     }
-    if (voice != NULL && voice->disabled_after_timeout) {
+    if (voice->disabled_after_timeout || voice_quarantined_job != NULL) {
         voice_progress(progress, progress_user, "VOICE DISABLED AFTER TIMEOUT");
         return false;
     }
@@ -626,6 +654,8 @@ bool psp_voice_input_transcribe(
         return false;
     }
     job->capture = capture;
+    job->worker.thread = -1;
+    job->worker.event = -1;
     job->capture_samples = captured;
     job->status = STT_STATUS_INVALID_ARGUMENT;
     job->engine = (SttEngine *) voice->engine;
@@ -672,9 +702,9 @@ bool psp_voice_input_transcribe(
             job->model_root, sizeof(job->model_root), "%s",
             voice->model_root);
     }
-    job->completion_event = sceKernelCreateEventFlag(
+    job->worker.event = sceKernelCreateEventFlag(
         "tilefinch_voice_complete", 0, 0, NULL);
-    if (job->completion_event < 0) {
+    if (job->worker.event < 0) {
         free(job);
         memset(
             capture, 0,
@@ -690,6 +720,7 @@ bool psp_voice_input_transcribe(
         "tilefinch_voice_decode", voice_decode_thread,
         TILEFINCH_PSP_THREAD_PRIORITY_VOICE, VOICE_WORKER_STACK_BYTES,
         PSP_THREAD_ATTR_USER, NULL);
+    job->worker.thread = thread;
     if (thread < 0) {
         PspVoiceMemory memory = voice_memory_snapshot(voice);
         printf(
@@ -699,7 +730,8 @@ bool psp_voice_input_transcribe(
             (unsigned) thread, (unsigned) VOICE_WORKER_STACK_BYTES,
             memory.heap_free, memory.heap_largest,
             memory.system_free, memory.system_largest);
-        sceKernelDeleteEventFlag(job->completion_event);
+        if (!voice_retire_or_quarantine(voice, job, progress, progress_user))
+            return false;
         free(job);
         memset(
             capture, 0,
@@ -724,8 +756,8 @@ bool psp_voice_input_transcribe(
             &job->lifecycle, &lifecycle_platform,
             VOICE_DECODE_TIMEOUT_US)
         == VOICE_JOB_LIFECYCLE_START_FAILED) {
-        sceKernelDeleteThread(thread);
-        sceKernelDeleteEventFlag(job->completion_event);
+        if (!voice_retire_or_quarantine(voice, job, progress, progress_user))
+            return false;
         free(job);
         memset(
             capture, 0,
@@ -737,6 +769,8 @@ bool psp_voice_input_transcribe(
             captured, capture_us);
         return false;
     }
+
+    job->worker.started = true;
 
     bool timed_out = false;
     bool user_cancelled = false;
@@ -851,9 +885,8 @@ bool psp_voice_input_transcribe(
         }
     }
     timed_out = voice_job_lifecycle_disables_voice(&job->lifecycle);
-    sceKernelWaitThreadEnd(thread, NULL);
-    sceKernelDeleteThread(thread);
-    sceKernelDeleteEventFlag(job->completion_event);
+    if (!voice_retire_or_quarantine(voice, job, progress, progress_user))
+        return false;
 
     if (lifecycle_platform_state.completed_without_event) {
         printf(
@@ -910,7 +943,8 @@ bool psp_voice_input_transcribe(
         }
     }
 
-    bool success = !timed_out && job->status == STT_STATUS_OK
+    bool success = voice_job_lifecycle_accepts_result(&job->lifecycle)
+        && job->status == STT_STATUS_OK
         && job->result.text[0] != '\0';
     if (success) {
         voice->successes++;

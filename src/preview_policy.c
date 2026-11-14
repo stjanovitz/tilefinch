@@ -51,7 +51,9 @@ PreviewDecision preview_policy_decide(const PreviewPolicy *policy,
     int64_t viewport = input->viewport_height > 0 ? input->viewport_height : 0;
     PreviewDecision decision = {0};
     bool empty_retry = false;
-    if (policy->empty_attempts != 0
+    if (policy->deep_retry) {
+        empty_retry = true;
+    } else if (policy->empty_attempts != 0
         && (policy->phase == PREVIEW_PHASE_NONE
             || policy->phase == PREVIEW_PHASE_FIRST_SCREEN)) {
         size_t elements = input->closed_content_elements
@@ -66,12 +68,17 @@ PreviewDecision preview_policy_decide(const PreviewPolicy *policy,
         empty_retry = true;
     }
     switch (policy->phase) {
-        case PREVIEW_PHASE_NONE:
+        case PREVIEW_PHASE_NONE: {
+            /* As deep as a refresh, once a covered first screen came out
+               empty (see PREVIEW_POLICY_EMPTY_ELEMENTS). */
+            int deep = preview_policy_max(base, 3 * viewport);
             decision.action = PREVIEW_ACTION_FIRST;
-            decision.limit_y = base;
+            decision.limit_y = policy->deep_first ? deep : base;
+            decision.deepens = decision.limit_y < deep;
             decision.fresh = empty_retry
                 || growth >= PREVIEW_POLICY_REFRESH_BYTES;
             break;
+        }
         case PREVIEW_PHASE_FIRST_SCREEN:
             if (growth < PREVIEW_POLICY_REFRESH_BYTES)
                 return preview_policy_none("no-growth");
@@ -171,6 +178,7 @@ void preview_policy_attempt_started(PreviewPolicy *policy,
     if (policy == NULL || decision == NULL) return;
     policy->building = true;
     policy->refused = false;
+    policy->deep_retry = false;
     policy->attempt_bytes = parsed_bytes;
     if (decision->action == PREVIEW_ACTION_EXTEND) policy->extensions++;
     else if (decision->action == PREVIEW_ACTION_REFRESH) policy->refreshes++;
@@ -227,6 +235,11 @@ void preview_policy_empty(PreviewPolicy *policy,
     policy->building = false;
     if (decision == NULL || decision->action == PREVIEW_ACTION_EXTEND)
         return;
+    if (covered && decision->deepens) {
+        policy->deep_first = true;
+        policy->deep_retry = true;
+        return;
+    }
     policy->empty_wait_elements = covered
         ? PREVIEW_POLICY_EMPTY_ELEMENTS_LIMIT
         : policy->empty_attempts == 0

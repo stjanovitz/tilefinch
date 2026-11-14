@@ -1,0 +1,5 @@
+# frame-realm-lite: load, settle, report.
+wait-live 240
+wait-page 60
+mark-live settled
+end

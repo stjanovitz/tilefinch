@@ -11,6 +11,7 @@
 #include <time.h>
 
 #include "data_url.h"
+#include "fnv1a.h"
 #include "tilefinch/content_blocker.h"
 #include "tilefinch/fetch.h"
 #include "tilefinch/integer_math.h"
@@ -292,6 +293,8 @@ struct ImagePriorityLoadJob {
     bool terminal;
     bool failed;
     bool rolled_back;
+    /* The last pump took a response off the network or decoded. */
+    bool progressed;
 };
 
 static TilefinchRequestContext image_request_context(
@@ -629,14 +632,6 @@ static void cancel_expired_pending(ImageLoadContext *context)
     }
 }
 
-static bool image_name_is(lxb_dom_node_t *node, const char *wanted)
-{
-    size_t length = 0;
-    const char *name = document_element_name(node, &length);
-    return name != NULL && strlen(wanted) == length
-           && memcmp(name, wanted, length) == 0;
-}
-
 static bool image_name_is_any(lxb_dom_node_t *node,
                               const char *const *names, size_t count)
 {
@@ -747,11 +742,8 @@ static uint64_t image_hash_request(const char *url,
 
 static uint64_t image_hash_bytes(const char *data, size_t length)
 {
-    uint64_t hash = UINT64_C(1469598103934665603);
-    for (size_t i = 0; i < length; i++) {
-        hash = (hash ^ (unsigned char) data[i]) * UINT64_C(1099511628211);
-    }
-    return hash;
+    /* The same offset as image_hash_url (not FNV1A64_SEED). */
+    return fnv1a64(UINT64_C(1469598103934665603), data, length);
 }
 
 /* Records that `node`'s source `source_hash` failed for good, for its
@@ -2876,6 +2868,22 @@ static ImagePriorityLoadStatus image_pending_raster_pump(
         return IMAGE_PRIORITY_LOAD_COMPLETE;
     }
     ImageDecodeWorkerResult decoded = {0};
+#ifndef __PSP__
+    {
+        static uint32_t delayed_token;
+        static unsigned delayed;
+        TilefinchTestFaults *faults = tilefinch_test_faults();
+        if (delayed_token != pending->token) {
+            delayed_token = pending->token;
+            delayed = 0;
+        }
+        if (delayed < faults->image_decode_collect_delay) {
+            delayed++;
+            faults->image_decode_collect_delayed++;
+            return IMAGE_PRIORITY_LOAD_PENDING;
+        }
+    }
+#endif
     if (!image_decode_worker_collect(pending->token, &decoded))
         return IMAGE_PRIORITY_LOAD_PENDING;
     return image_pending_raster_publish(context, &decoded)
@@ -6242,6 +6250,7 @@ ImagePriorityLoadStatus images_priority_load_pump(
     if (job == NULL || job->failed) return IMAGE_PRIORITY_LOAD_FAILED;
     if (job->terminal) return IMAGE_PRIORITY_LOAD_COMPLETE;
     ImageLoadContext *context = &job->context;
+    job->progressed = false;
     if (!job->admitted) {
         /* A resumable boundary: queued input defers admission, not the
            transaction itself. Unlike a decoder checkpoint, no DOM/resource
@@ -6303,6 +6312,7 @@ ImagePriorityLoadStatus images_priority_load_pump(
     }
 
     if (context->raster_decode.active) {
+        job->progressed = true;
         ImagePriorityLoadStatus decode_status =
             image_pending_raster_pump(context);
         image_finish_slice(context);
@@ -6316,6 +6326,7 @@ ImagePriorityLoadStatus images_priority_load_pump(
     }
 
     cancel_expired_pending(context);
+    size_t pending_at_pump = context->pending_count;
     const FetchPumpQuota quota = {
         .maximum_body_callbacks = IMAGE_FETCH_PUMP_CALLBACKS,
         .maximum_body_bytes = IMAGE_FETCH_PUMP_BYTES,
@@ -6334,6 +6345,8 @@ ImagePriorityLoadStatus images_priority_load_pump(
         if (!finish_one_pending(context, false)) {
             return image_priority_load_fail(job);
         }
+        job->progressed = context->pending_count < pending_at_pump
+            || context->raster_decode.active;
         if (context->pending_count == pending_before) {
             image_finish_slice(context);
             return IMAGE_PRIORITY_LOAD_PENDING;
@@ -6341,6 +6354,8 @@ ImagePriorityLoadStatus images_priority_load_pump(
     } else if (!finish_one_pending(context, false)) {
         return image_priority_load_fail(job);
     }
+    job->progressed = context->pending_count < pending_at_pump
+        || context->raster_decode.active;
     if (context->pending_count != 0) {
         image_finish_slice(context);
         return IMAGE_PRIORITY_LOAD_PENDING;
@@ -6374,6 +6389,11 @@ void images_priority_load_commit_progress(ImagePriorityLoadJob *job)
         job->context.images->priority_staged;
 }
 
+bool images_priority_load_progressed(const ImagePriorityLoadJob *job)
+{
+    return job != NULL && job->progressed;
+}
+
 size_t images_priority_load_target_count(const ImagePriorityLoadJob *job)
 {
     return job == NULL ? 0 : job->target_count;
@@ -6387,6 +6407,12 @@ bool images_priority_load_contains_node(
         if (job->targets[at].node == node) return true;
     }
     return false;
+}
+
+bool images_priority_load_holds_decoder(const ImagePriorityLoadJob *job)
+{
+    return job != NULL && !job->terminal && job->context.raster_decode.active
+        && job->context.raster_decode.token != 0;
 }
 
 void images_priority_load_destroy(ImagePriorityLoadJob *job)
@@ -6503,18 +6529,6 @@ const ImageResource *images_find_mask_node(const ImageResources *images,
             && images->items[i].pseudo == PSEUDO_NONE) {
             return &images->items[i];
         }
-    }
-    return NULL;
-}
-
-const ImageResource *images_find_pseudo_mask(const ImageResources *images,
-                                             const lxb_dom_node_t *node,
-                                             PseudoElement pseudo)
-{
-    if (images == NULL || node == NULL || pseudo == PSEUDO_NONE) return NULL;
-    for (size_t i = 0; i < images->count; i++) {
-        if (images->items[i].node == node && images->items[i].is_mask
-            && images->items[i].pseudo == pseudo) return &images->items[i];
     }
     return NULL;
 }

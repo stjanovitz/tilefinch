@@ -359,8 +359,10 @@ tilefinch-entropy: seed-file=written
 ```
 
 `mode=uncredited` on hardware means the jitter estimate fell short within one
-attempt; `event=unseeded` is the shipping build refusing. Either must be
-understood before a release.
+attempt; `event=unseeded` is a build that requires credit refusing. Either
+must be understood before a release. Validation builds and the crypto selftest
+print these lines. The shipping browser installs no report sink and prints
+nothing, so there a refusal is seen only through the failed connection.
 
 **Raw-sample capture (validation builds).** The estimator sees one batch at a
 time, so structure longer than its lags (a beat between two clocks, or two

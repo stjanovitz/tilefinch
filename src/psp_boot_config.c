@@ -9,6 +9,7 @@
 #include "media_backend_psp_policy.h"
 #include "tilefinch/browser_engine.h"
 #include "tilefinch/install_paths.h"
+#include "tilefinch/frame_lite.h"
 #include "tilefinch/platform.h"
 #include "tilefinch/site_adapter.h"
 #include "tilefinch/update.h"
@@ -73,6 +74,15 @@ void psp_boot_config_defaults(PspBootConfig *config)
     config->css_height = PSP_DEFAULT_CSS_HEIGHT;
     config->network_profile = 1;
 }
+
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+static long boot_config_js_heap_detail;
+
+bool psp_boot_config_validation_js_heap_detail(void)
+{
+    return boot_config_js_heap_detail == 1;
+}
+#endif
 
 bool psp_boot_config_automated(const PspBootConfig *config)
 {
@@ -176,6 +186,10 @@ void psp_boot_config_disable_automation(PspBootConfig *config)
     config->validation_update_url[0] = '\0';
     config->input_script[0] = '\0';
     config->exit_to[0] = '\0';
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+    boot_config_js_heap_detail = 0;
+    tilefinch_frame_lite_reset();
+#endif
 }
 
 typedef enum {
@@ -212,6 +226,12 @@ static BootConfigLoad psp_boot_config_load_one(
     if (file == NULL)
         return absent ? BOOT_CONFIG_NOT_FOUND : BOOT_CONFIG_UNREADABLE;
     PspBootConfig loaded = *config;
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+    long loaded_js_heap_detail = boot_config_js_heap_detail;
+    /* Frame-realm prototype switches (frame_lite_* keys, frame_lite.h):
+       applied as they parse and restored if the file is not accepted. */
+    TilefinchFrameLiteSwitches loaded_frame_lite = *tilefinch_frame_lite();
+#endif
     char line[1600];
     size_t line_number = 0;
     bool complete = true;
@@ -394,14 +414,31 @@ static BootConfigLoad psp_boot_config_load_one(
                      sizeof(loaded.validation_update_url), "%s", value);
         } else if (strcmp(line, "validation_power_test_auto") == 0) {
             loaded.validation_power_test_auto = atol(value);
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+        } else if (strcmp(line, "validation_js_heap_detail") == 0) {
+            loaded_js_heap_detail = atol(value);
+        } else if (strncmp(line, "frame_lite_", 11) == 0
+                   && tilefinch_frame_lite_set(line + 11, value)) {
+            /* applied; restored below unless the load is accepted */
+#endif
         } else if (warning != NULL) {
             warning(warning_context, path, line_number, line);
         }
     }
     bool read_ok = !ferror(file);
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+    bool closed = fclose(file) == 0;
+    if (!closed || !read_ok || !complete)
+        tilefinch_frame_lite_restore(&loaded_frame_lite);
+    if (!closed || !read_ok) return BOOT_CONFIG_UNREADABLE;
+#else
     if (fclose(file) != 0 || !read_ok) return BOOT_CONFIG_UNREADABLE;
+#endif
     if (!complete) return BOOT_CONFIG_REJECTED;
     *config = loaded;
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+    boot_config_js_heap_detail = loaded_js_heap_detail;
+#endif
     return BOOT_CONFIG_LOADED;
 }
 
@@ -487,23 +524,22 @@ static bool boot_config_write_key(FILE *file, const PspBootConfig *config,
                                   size_t key, const char *eol)
 {
     const char *name = boot_config_override_keys[key];
+    char number[24];
+    const char *value;
     switch (key) {
-    case 0: return fprintf(file, "%s=%s%s", name, config->url, eol) > 0;
+    case 0: value = config->url; break;
     case 1:
-        return fprintf(file, "%s=%ld%s", name, config->network_profile,
-                       eol) > 0;
-    case 2:
-        return fprintf(file, "%s=%s%s", name, config->developer_update_url,
-                       eol) > 0;
-    case 3:
-        return fprintf(file, "%s=%s%s", name, config->developer_package_url,
-                       eol) > 0;
-    case 4:
-        return fprintf(file, "%s=%s%s", name,
-                       config->experimental_wide_video, eol) > 0;
-    default:
-        return fprintf(file, "%s=%s%s", name, config->exit_to, eol) > 0;
+        (void) snprintf(number, sizeof(number), "%ld",
+                        config->network_profile);
+        value = number;
+        break;
+    case 2: value = config->developer_update_url; break;
+    case 3: value = config->developer_package_url; break;
+    case 4: value = config->experimental_wide_video; break;
+    default: value = config->exit_to; break;
     }
+    return fputs(name, file) >= 0 && fputc('=', file) != EOF
+        && fputs(value, file) >= 0 && fputs(eol, file) >= 0;
 }
 
 bool psp_boot_config_write_overrides(
@@ -1012,14 +1048,16 @@ PspBootConfigMigration psp_boot_config_migrate_file_kb(const char *path)
         && effective[effective_length - 2u] == '\r';
     const char *eol = crlf ? "\r\n" : "\n";
     bool ok = fwrite(text, 1, before, out) == before
-        && fprintf(out, "file_kb=%ld%s", PSP_DEFAULT_SCRIPT_FILE_KB, eol) > 0
+        && tilefinch_platform_file_printf(
+               out, "file_kb=%ld%s", PSP_DEFAULT_SCRIPT_FILE_KB, eol) > 0
         && fwrite(after, 1, strlen(after), out) == strlen(after)
         && (length == 0 || text[length - 1u] == '\n'
             || fputs(eol, out) >= 0)
-        && fprintf(out,
-                   "# Memory-based script admission replaced the old "
-                   "file_kb=512 default.%s%s%s",
-                   eol, PSP_BOOT_CONFIG_FILE_KB_MIGRATED_MARK, eol) > 0
+        && tilefinch_platform_file_printf(
+               out,
+               "# Memory-based script admission replaced the old "
+               "file_kb=512 default.%s%s%s",
+               eol, PSP_BOOT_CONFIG_FILE_KB_MIGRATED_MARK, eol) > 0
         && fflush(out) == 0;
     if (fclose(out) != 0) ok = false;
     if (!ok) {

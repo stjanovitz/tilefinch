@@ -729,8 +729,9 @@
       hostState[HOST_SCROLL_PENDING] = 0;
       /* Viewport scrolling targets Document and bubbles to Window. Dispatching
          directly on Window skips document listeners used by sticky controls. */
-      document.dispatchEvent(trusted(new Event("scroll", { bubbles: true })));
-      visualViewport.dispatchEvent(trusted(new Event("scroll")));
+      document.dispatchEvent(
+        trusted(newEvent("scroll", { bubbles: true })));
+      visualViewport.dispatchEvent(trusted(newEvent("scroll")));
       return true;
     };
     const scrollTo = (xOrOptions = undefined, y = undefined) => {
@@ -869,6 +870,8 @@
   const createBootstrapEvent = Document.prototype.createEvent;
   const trusted =
       __tilefinchRealmGlobal.__tilefinchTrustedEventShare.trustedEvent,
+    newEvent =
+      __tilefinchRealmGlobal.__tilefinchTrustedEventShare.createBrowserEvent,
     nonBubblingEventTypes = new Set([
       "focus", "blur", "load", "error", "scroll", "mouseenter",
       "mouseleave", "pointerenter", "pointerleave",
@@ -897,16 +900,17 @@
       };
     let event;
     if (name === "input" || name === "beforeinput")
-      event = new InputEvent(name, {
+      event = newEvent(name, {
         ...options,
         data: null,
         inputType: name === "input" ? "insertText" : "",
-      });
-    else if (name.startsWith("key")) event = new KeyboardEvent(name, options);
+      }, "InputEvent");
+    else if (name.startsWith("key"))
+      event = newEvent(name, options, "KeyboardEvent");
     else if (name.startsWith("pointer") || name === "click") {
       const clickFromPointer =
         name === "click" && options.pointerId !== undefined;
-      event = new PointerEvent(name, {
+      event = newEvent(name, {
         ...options,
         pointerType:
           name === "click" && !clickFromPointer ? "" : "mouse",
@@ -916,7 +920,7 @@
           name === "click"
             ? clickFromPointer ? 1 : 0
             : 0,
-      });
+      }, "PointerEvent");
     }
     else if (
       name === "focus" ||
@@ -924,16 +928,17 @@
       name === "focusin" ||
       name === "focusout"
     )
-      event = new FocusEvent(name, options);
+      event = newEvent(name, options, "FocusEvent");
     else if (name.startsWith("composition"))
-      event = new CompositionEvent(name, options);
-    else if (name === "submit") event = new SubmitEvent(name, options);
+      event = newEvent(name, options, "CompositionEvent");
+    else if (name === "submit")
+      event = newEvent(name, options, "SubmitEvent");
     else if (name.startsWith("mouse"))
-      event = new MouseEvent(name, {
+      event = newEvent(name, {
         ...options,
         detail: 0,
-      });
-    else event = new Event(name, options);
+      }, "MouseEvent");
+    else event = newEvent(name, options);
     return trusted(event);
   };
   __tilefinchRealmGlobal.__tilefinchDispatchAt = (selector, type) => {
@@ -1235,12 +1240,12 @@
     }
     return target.dispatchEvent(
       trusted(
-        new InputEvent(name, {
+        newEvent(name, {
           bubbles: true,
           cancelable: name === "beforeinput",
           data: data === null ? null : String(data),
           inputType: String(inputType || ""),
-        }),
+        }, "InputEvent"),
       ),
     );
   };
@@ -1252,11 +1257,11 @@
       return false;
     const proceed = form.dispatchEvent(
       trusted(
-        new SubmitEvent("submit", {
+        newEvent("submit", {
           bubbles: true,
           cancelable: true,
           submitter,
-        }),
+        }, "SubmitEvent"),
       ),
     );
     /* Native submission sends the same entry list a script submission does:

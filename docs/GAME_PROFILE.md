@@ -13,6 +13,223 @@ values are bytes, pixels, counts, or microseconds as named. Authors should use
 feature detection and queried WebGL limits at runtime; the JSON is for build
 tools, coding agents, and preflight checks, not page fingerprinting.
 
+## Game Profile v1.1
+
+The current Tilefinch build implements **Game Profile v1.1**, whose
+machine-readable companion is
+[`tilefinch-game-profile-v1.1.json`](tilefinch-game-profile-v1.1.json). It
+keeps every v1 API, lifecycle rule and recipe, raises ceilings, and accepts
+calls that v1 refused, so a game that is v1 compatible is also v1.1
+compatible. One documented v1 behaviour changes: Web Audio's
+`linearRampToValueAtTime()` and `exponentialRampToValueAtTime()`, which v1
+described as immediate value setters, now schedule ramps as the specification
+says. A source whose chain does not reach the destination is now silent, as
+in browsers; v1 builds played it. The rest of this document is the released
+v1 text; the v1 companion
+stays as published. A game that needs any item below should say it targets
+v1.1:
+
+| Area | v1 | v1.1 |
+|---|---|---|
+| shader source | 16 KiB each | 64 KiB each |
+| vertex / fragment uniform vectors | 16 / 4 | 128 / 16, counted over the uniforms the program uses |
+| varying vectors | 2 | 8 |
+| split-alpha `blendFuncSeparate()` | refused (`INVALID_OPERATION`) | accepted; the colour factors apply to all channels of the opaque buffer |
+| mipmap minification filters, `generateMipmap()` | refused | accepted; the base level is sampled and no levels are built |
+| uniform arrays and structs; `int`, `bool`, `mat2`, `mat3` uniforms; `vertexAttrib*fv`; stencil and `blendColor` setters | partly unavailable | available (stencil and `blendColor` setters have no effect) |
+| numeric and uniform colour factors, uniform-only `?:` choosing them | linked with a warning, not applied | applied exactly, once per draw |
+| `if (color.a < uniform) discard;` | link refused | drawn as the GE alpha test |
+| colour math reading only attributes, uniforms and numbers | linked with a warning, not applied | evaluated per vertex and interpolated, with a warning; 32 steps and 15 constant vectors per program, 65,536 steps per draw (`OUT_OF_MEMORY` past it) |
+| built-in materials from scene libraries such as three.js | not translated | mapped onto GE per-vertex lighting (up to four directional or point lights), fog, alpha test and point sprites, with warnings for the approximations |
+| PSP GE display list (64 KiB) | reserved for the whole process | taken from memory by a page's first WebGL frame and returned when the page ends; if memory is exhausted at that frame, the flush fails and the context is lost, as for any WebGL allocation failure |
+| Web Audio `AudioParam` automation | gain and oscillator-frequency curves, gain target ramps; ramp methods set the value at once | specification timelines (`setValueAtTime`, linear and exponential ramps, `setTargetAtTime`, curves, `cancelScheduledValues` at any time, `cancelAndHoldAtTime`) on gain, frequency, detune, playback rate and filter parameters; 32 events per parameter, 16 automated parameters per page |
+| `createBuffer()`, `new AudioBuffer()`, channel data | refused (`NotSupportedError`) | one- or two-channel float buffers, 8,000–96,000 Hz, from the same 512 KiB pool; `getChannelData()` shares the mixer's samples |
+| `BiquadFilterNode` | unavailable | all eight types; the first filter on a source's chain applies |
+| `decodeAudioData()` of MP3 or Ogg | rejected | rejected with `EncodingError` naming the format |
+| Web Audio source chains | four nodes; a source plays even if its chain never reaches the destination | eight nodes; a source whose chain does not reach the destination is silent |
+| `createMediaStreamSource()`, `MediaStreamAudioSourceNode` | unavailable | a `getUserMedia()` microphone track as a source; heard through the destination only with headphones plugged in |
+| `AnalyserNode` | unavailable | time-domain and frequency data, `fftSize` 32–2048, two analysers per context |
+
+The WebGL details are in
+[Built-in materials](WEBGL.md#built-in-materials-from-scene-libraries) and the
+rest of the [WebGL guide](WEBGL.md); the Web Audio details follow.
+Qualification is unchanged: describe a game as **Tilefinch Game Profile v1.1
+compatible** after the same checklist, run on a build that implements v1.1.
+
+### Web Audio in v1.1
+
+This replaces the v1 [Web Audio](#web-audio) section for a game that targets
+v1.1.
+
+One user-activated `AudioContext` supports decoded PCM WAV effects, buffers a
+page fills itself, and simple generated waveforms. The nodes are buffer
+sources, microphone sources, gain, stereo panning, `BiquadFilterNode`,
+`AnalyserNode`, and sine, square, sawtooth, or triangle oscillators. Each
+source feeds one chain of at most eight nodes to the destination. A source
+whose chain does not reach the destination, because it was never connected
+or was disconnected, is silent. Buffer sources support loop points, playback rate, detune,
+scheduled start/stop, and `ended`/`onended`.
+
+The native pool admits eight buffers, four simultaneous voices, 16 audio nodes,
+and 512 KiB of PCM. Decoded WAV input is PCM mono or stereo, 8- or 16-bit,
+from 8,000 through 48,000 Hz, and costs 2 bytes per sample until JavaScript
+reads it. Scheduling is limited to ten seconds ahead and the mixer works in
+512-frame blocks. The context starts suspended and `resume()` requires trusted
+activation. Native media and PSP suspend release the audio channel while
+retaining buffers. Start the context from the trusted Play press: `resume()`
+without user activation rejects with `NotAllowedError`, and an automated run
+that never presses anything never starts game audio. Treat a rejection as
+"silent until the next Play", not as a reason to retry.
+
+`decodeAudioData()` decodes PCM WAV only. MP3 and Ogg (Vorbis, Opus) reject
+with `EncodingError`, and the message names the format. The PSP's MP3 decoder
+is tied to the media player, so ship short effects as WAV or generate them.
+Custom processing graphs, audio worklets, and long-horizon scheduling remain
+outside v1.1.
+
+#### Buffers a page fills
+
+`createBuffer(channels, length, sampleRate)` and `new AudioBuffer({length,
+sampleRate, numberOfChannels})` make one- or two-channel buffers from 8,000
+through 96,000 Hz. They belong to the page's open `AudioContext`; without one
+they throw `NotSupportedError`, as does a buffer the pool cannot hold.
+Float buffers cost 4 bytes per sample, so the pool holds about three seconds
+of mono 44.1 kHz audio. `getChannelData()` returns the mixer's own samples:
+the same `Float32Array` every call, with no copy. Writes are heard when the
+mixer next reaches those frames, including while the buffer plays. That
+differs from browsers, which freeze a buffer's content when a source starts.
+Fill a buffer before starting it for portable behaviour. `copyToChannel()`
+and `copyFromChannel()` take a `Float32Array`; an unknown channel throws
+`IndexSizeError`. Reading a decoded WAV with `getChannelData()` or
+`copyToChannel()` converts it to float in place and doubles its pool cost.
+`copyFromChannel()` alone reads it without converting.
+
+#### AudioParam automation
+
+Gain, oscillator `frequency` and `detune`, buffer-source `playbackRate` and
+`detune`, and filter `frequency`, `detune`, `Q` and `gain` run Web Audio
+automation timelines in the mixer, sample by sample and without JavaScript
+ticks. `setValueAtTime`, `linearRampToValueAtTime`,
+`exponentialRampToValueAtTime`, `setTargetAtTime`, `setValueCurveAtTime`,
+`cancelScheduledValues` (current or future time), and `cancelAndHoldAtTime`
+follow the specification's event rules. A ramp starts from the previous event,
+or from the current value if it is the first event. Exponential ramps reject
+zero or sign-changing values with `RangeError`, and non-finite arguments throw
+`TypeError`. A curve may not overlap another event (`NotSupportedError`).
+Reading `.value` returns the timeline's value at `currentTime`, and assigning
+`.value` while events exist acts as `setValueAtTime(value, currentTime)`.
+
+The limits keep the mixer bounded:
+
+- Each parameter holds at most 32 events. One more throws
+  `QuotaExceededError`; finished events are folded away, so a game that
+  schedules a few events per shot never reaches the limit.
+- At most 16 parameters per page are automated at once, and a source
+  passes through at most four automated gains.
+- One curve per parameter, 2–64 finite samples. Events must fall within ten
+  seconds of `currentTime`.
+- Values are clamped when computed: gain 0–4, frequency 1–20,000 Hz, detune
+  ±1,200 cents, playback rate 0.25–4, filter frequency 0–22,050 Hz, Q ±1,000
+  and filter gain ±100 dB.
+- `StereoPannerNode.pan` is not automatable. Only an immediate
+  `setValueAtTime(value, t <= currentTime)` works; scheduled pan throws
+  `NotSupportedError`.
+
+Exceeding the scheduling window throws `NotSupportedError`.
+
+`currentTime` follows the page clock, not the output position. Read it once
+per scheduling decision, and schedule a few milliseconds ahead when an attack
+must start exactly on a ramp.
+
+#### BiquadFilterNode
+
+All eight filter types (`lowpass`, `highpass`, `bandpass`, `lowshelf`,
+`highshelf`, `peaking`, `notch`, `allpass`) use the Web Audio specification's
+coefficient formulas at the computed frequency (`frequency` times
+2^(`detune`/1200), held to 0–22,050 Hz, the Nyquist frequency). Where those
+formulas divide by zero the filter is their limit, a constant gain, as in
+browsers: at 0 Hz a lowpass or bandpass passes nothing and a highpass,
+notch, allpass or peaking filter everything; at 22,050 Hz the reverse for
+lowpass and highpass, a bandpass passes nothing and the others pass
+everything; a lowshelf at 22,050 Hz and a highshelf at 0 Hz apply their
+gain to everything; and a bandpass, notch, allpass or peaking filter with
+`Q` of 0 or below passes everything, nothing, everything inverted, or
+everything at its gain. Between 0 and 10 Hz the PSP's single-precision
+filter cannot place a cutoff, so it filters as at 10 Hz. Coefficients are
+recomputed every 32 frames from the automated values, so a sweep is smooth
+but not per sample. Only the first
+filter on a source's chain applies; a second filter passes audio unchanged.
+`getFrequencyResponse()` is not available.
+
+#### Microphone sources and AnalyserNode
+
+`createMediaStreamSource(stream)` and `new MediaStreamAudioSourceNode(context,
+{mediaStream})` take a stream the same page got from `getUserMedia({audio:
+true})`. The source starts at once and holds one of the four voices until
+its track ends or the context closes. It has no `ended` event. As the
+specification says, it plays the stream's first audio track in `id` order,
+chosen when it is made, and keeps that track when the stream's tracks
+change later. While that track's `enabled` is false the source puts out
+silence, so a filter after it hears silence too (and rings out as it would
+after a sound ends) rather than holding what the microphone heard; it stops
+when that track ends, even while a clone of the track keeps the microphone
+on. A stream without an audio track, or whose chosen track has ended,
+throws `InvalidStateError`, and a fifth active source throws
+`QuotaExceededError`. Samples reach the mixer from the page's own thread at
+each page task turn, with no JavaScript, through a 1,024-sample (23 ms)
+prefill. A page that stalls for more than about 90 ms loses the older
+samples and the source catches up to the newest ones.
+
+The microphone is heard only when its chain reaches the destination and
+headphones are plugged in. Through the PSP speaker the microphone would
+hear itself, so the browser mutes the microphone's share of the output
+there. Analysers on its chain still hear it. Browsers play it in both
+cases; this deviation is deliberate. Meters, tuners and visualizers work
+without headphones, and a page cannot tell whether the PSP muted it.
+
+`createAnalyser()` and `new AnalyserNode(context, options)` follow the
+specification. `fftSize` is a power of two from 32 to 2048, with a default
+of 2048. A value from 4096 to 32768 throws `NotSupportedError`, and any
+other value throws `IndexSizeError`. `frequencyBinCount` is `fftSize / 2`.
+`minDecibels` (-100), `maxDecibels` (-30) and `smoothingTimeConstant` (0.8)
+reject crossed or out-of-range values with `IndexSizeError`.
+`getFloatTimeDomainData()`, `getByteTimeDomainData()`,
+`getFloatFrequencyData()` and `getByteFrequencyData()` take a
+`Float32Array` or `Uint8Array` and fill as much of it as the size allows.
+The frequency data uses a Blackman window, an FFT, magnitude over `fftSize`,
+and smoothing over time, as specified.
+
+A context has at most two analysers; a third throws `QuotaExceededError`
+until an unreachable one is collected. An analyser passes its input through
+unchanged, so it can sit anywhere on a chain, and it also works with no
+output connection. It hears every source passing through it, after the
+gains and the filter before it, mixed down to mono. A panner before an
+analyser is ignored there, and a source feeds only the first analyser on
+its chain. An analyser that no playing source feeds reads silence.
+
+Analysis runs only when a frequency method is called, on the page's thread.
+Its result is reused until the output advances by one 512-frame block, so
+calling it more than once per frame costs nothing extra. Time-domain reads
+are copies. The memory comes from the native pool: 16 KiB of history per
+analyser, 4 KiB per analyser that computes a spectrum, 24 KiB of shared
+analysis scratch, and a 16 KiB microphone ring. `fftSize` stops at 2048
+because one analysis at that size takes about 3 ms of the page's thread at
+333 MHz under PPSSPP; an analyser costs the mixer well under 1 % of the CPU.
+The mixer cost and the FFT times per size are in
+[the validation records](engineering/VALIDATION_RECORDS.md)
+(`audio-fft-probe`). Nothing a microphone source or an analyser hears
+is stored or sent anywhere: the samples stay inside the page's graph, and
+the ring is cleared when its sources end.
+
+#### Mixer cost
+
+A source with no automation and no filter, playing decoded integer PCM or an
+oscillator, takes the original integer mixer. Automation, a filter, or a
+float buffer moves the voice to a float path, once, for the rest of its life.
+The validation build's `audio-program-probe` mark measures four filtered,
+ramped oscillators against four plain ones; the figures are in
+[the validation records](engineering/VALIDATION_RECORDS.md).
+
 ## What compatibility means
 
 Game Profile v1 is a portable baseline, not a promise that every browser API

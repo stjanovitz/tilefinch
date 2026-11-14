@@ -269,7 +269,8 @@ typedef struct {
     int result;            /* forced scale() result when nonzero sentinel */
     bool use_result;
     bool busy;
-    unsigned scale_calls, busy_calls, fail_calls;
+    bool release_refused;
+    unsigned scale_calls, busy_calls, fail_calls, release_calls;
     const char *fail_reason;
     uint16_t expected[480 * 272];
 } FakeCanvasGe;
@@ -303,6 +304,13 @@ static void fake_canvas_ge_fail(void *context, const char *reason)
     FakeCanvasGe *fake = context;
     fake->fail_calls++;
     fake->fail_reason = reason;
+}
+
+static bool fake_canvas_ge_release(void *context)
+{
+    FakeCanvasGe *fake = context;
+    fake->release_calls++;
+    return !fake->release_refused;
 }
 
 /* Builds one deferred full-viewport canvas frame (poisoned RAM rectangle). */
@@ -363,7 +371,8 @@ static int test_canvas_ge_presenter(void)
         }
     CanvasGeBackend backend = {
         .scale = fake_canvas_ge_scale, .busy = fake_canvas_ge_busy,
-        .fail = fake_canvas_ge_fail, .context = &fake };
+        .fail = fake_canvas_ge_fail, .release = fake_canvas_ge_release,
+        .context = &fake };
     Budget budget;
     budget_init(&budget, 4 * MIB);
     TileCache cache;
@@ -475,9 +484,184 @@ static int test_canvas_ge_presenter(void)
           && PUBLISH(true, 0u, 272u) == CANVAS_GE_PRESENT_COPY
           && fake.scale_calls == 0u);
     tile_cache_destroy(&cache);
+    puts("test: GE presenter releases backend scratch after its page is gone");
+    canvas_ge_presenter_init(&presenter, &backend);
+    canvas_ge_presenter_enable(&presenter, true, false);
+    fake.use_result = false;
+    fake.busy = false;
+    fake.scale_calls = 0;
+    fake.release_calls = 0;
+    canvas_ge_presenter_set_page(&presenter, 7u);
+    /* A page that never deferred a canvas has nothing to release. */
+    CHECK(PUBLISH(true, 0u, 272u) == CANVAS_GE_PRESENT_COPY
+          && fake.release_calls == 0u && !presenter.scratch_held);
+    CHECK(PRESENTER_FRAME()
+          && PUBLISH(true, 0u, 272u) == CANVAS_GE_PRESENT_PUBLISHED
+          && fake.scale_calls == 1u && presenter.scratch_held);
+    tile_cache_destroy(&cache);
+    /* Same page, no deferral (the canvas left the viewport): kept, so a
+       page that comes back to its canvas does not allocate again. */
+    CHECK(PUBLISH(true, 0u, 272u) == CANVAS_GE_PRESENT_COPY
+          && fake.release_calls == 0u && presenter.scratch_held);
+    /* A navigation began, but the old page's canvas is still presented. */
+    canvas_ge_presenter_set_page(&presenter, 8u);
+    CHECK(PRESENTER_FRAME()
+          && PUBLISH(true, 0u, 272u) == CANVAS_GE_PRESENT_PUBLISHED
+          && fake.release_calls == 0u && presenter.scratch_page == 7u);
+    tile_cache_destroy(&cache);
+    /* Off the owner thread nothing is released. */
+    CHECK(PUBLISH(false, 0u, 272u) == CANVAS_GE_PRESENT_COPY
+          && fake.release_calls == 0u && presenter.scratch_held);
+    /* A backend that still reports a submission running keeps it, and is
+       asked again on the next present. */
+    fake.release_refused = true;
+    CHECK(PUBLISH(true, 0u, 272u) == CANVAS_GE_PRESENT_COPY
+          && fake.release_calls == 1u && presenter.scratch_held
+          && presenter.stats.scratch_releases == 0u);
+    fake.release_refused = false;
+    CHECK(PUBLISH(true, 0u, 272u) == CANVAS_GE_PRESENT_COPY
+          && fake.release_calls == 2u && !presenter.scratch_held
+          && presenter.stats.scratch_releases == 1u);
+    /* Released once: later presents of the new page do not ask again. */
+    for (int i = 0; i < 8; i++)
+        CHECK(PUBLISH(true, 0u, 272u) == CANVAS_GE_PRESENT_COPY);
+    CHECK(fake.release_calls == 2u);
+    /* The next page that defers allocates on its own first frame. */
+    CHECK(PRESENTER_FRAME()
+          && PUBLISH(true, 0u, 272u) == CANVAS_GE_PRESENT_PUBLISHED
+          && presenter.scratch_held && presenter.scratch_page == 8u);
+    tile_cache_destroy(&cache);
+
+    puts("test: GE presenter never releases under an outstanding submission");
+    canvas_ge_presenter_init(&presenter, &backend);
+    canvas_ge_presenter_enable(&presenter, true, false);
+    fake.release_calls = 0;
+    canvas_ge_presenter_set_page(&presenter, 1u);
+    fake.use_result = true;
+    fake.result = -1;
+    fake.busy = true;
+    CHECK(PRESENTER_FRAME()
+          && PUBLISH(true, 0u, 272u) == CANVAS_GE_PRESENT_REFUSE
+          && presenter.failed && presenter.outstanding
+          && presenter.scratch_held);
+    tile_cache_destroy(&cache);
+    canvas_ge_presenter_set_page(&presenter, 2u);
+    CHECK(PUBLISH(true, 0u, 272u) == CANVAS_GE_PRESENT_REFUSE
+          && fake.release_calls == 0u && presenter.scratch_held);
+    fake.busy = false;
+    CHECK(PUBLISH(true, 0u, 272u) == CANVAS_GE_PRESENT_COPY
+          && fake.release_calls == 1u && !presenter.scratch_held);
+    fake.use_result = false;
+    tile_cache_set_canvas_defer(false);
 #undef PRESENTER_FRAME
 #undef PUBLISH
     CHECK(budget.current == 0);
+    return 0;
+}
+
+#include "tilefinch/ge_scratch.h"
+
+typedef struct {
+    bool fail, busy;
+    unsigned allocations, releases;
+    size_t last_bytes;
+    _Alignas(64) unsigned char block[256];
+} FakeGeScratch;
+
+static void *fake_ge_scratch_allocate(void *context, size_t bytes)
+{
+    FakeGeScratch *fake = context;
+    fake->allocations++;
+    fake->last_bytes = bytes;
+    return fake->fail || bytes > sizeof(fake->block) ? NULL : fake->block;
+}
+
+static void fake_ge_scratch_release(void *context, void *block, size_t bytes)
+{
+    FakeGeScratch *fake = context;
+    if (block == fake->block && bytes == fake->last_bytes) fake->releases++;
+}
+
+static bool fake_ge_scratch_busy(void *context)
+{
+    return ((FakeGeScratch *) context)->busy;
+}
+
+static int test_ge_scratch(void)
+{
+    static FakeGeScratch fake;
+    GeScratchOps ops = {
+        .allocate = fake_ge_scratch_allocate,
+        .release = fake_ge_scratch_release,
+        .busy = fake_ge_scratch_busy, .context = &fake };
+
+    puts("test: GE scratch is not resident before the first frame");
+    GeScratch scratch = {0};
+    CHECK(!ge_scratch_resident(&scratch) && fake.allocations == 0u);
+    CHECK(ge_scratch_release(&scratch, &ops) && fake.releases == 0u);
+
+    puts("test: GE scratch allocates once and every later frame reuses it");
+    void *first = ge_scratch_acquire(&scratch, &ops, 100u);
+    CHECK(first == fake.block && fake.last_bytes == 128u
+          && ge_scratch_resident(&scratch) && scratch.bytes == 128u);
+    for (int frame = 0; frame < 600; frame++)
+        CHECK(ge_scratch_acquire(&scratch, &ops, 100u) == first);
+    CHECK(fake.allocations == 1u && scratch.allocations == 1u);
+
+    puts("test: GE scratch waits for the GE before it is freed");
+    fake.busy = true;
+    CHECK(!ge_scratch_release(&scratch, &ops)
+          && ge_scratch_resident(&scratch) && fake.releases == 0u
+          && scratch.deferred_releases == 1u);
+    /* Still the same block for a frame that runs meanwhile. */
+    CHECK(ge_scratch_acquire(&scratch, &ops, 100u) == first
+          && fake.allocations == 1u);
+    fake.busy = false;
+    CHECK(ge_scratch_release(&scratch, &ops) && !ge_scratch_resident(&scratch)
+          && fake.releases == 1u && scratch.releases == 1u);
+    CHECK(ge_scratch_release(&scratch, &ops) && fake.releases == 1u);
+
+    puts("test: GE scratch reports a failed first allocation");
+    fake.fail = true;
+    fake.allocations = 0;
+    CHECK(ge_scratch_acquire(&scratch, &ops, 64u) == NULL
+          && !ge_scratch_resident(&scratch) && scratch.failures == 1u
+          && fake.allocations == 1u);
+    /* Without a held failure the next frame tries again. */
+    fake.fail = false;
+    CHECK(ge_scratch_acquire(&scratch, &ops, 64u) == fake.block
+          && fake.allocations == 2u);
+    CHECK(ge_scratch_release(&scratch, &ops));
+
+    puts("test: GE scratch holds a failure until its release point");
+    ops.hold_failure = true;
+    fake.fail = true;
+    fake.allocations = 0;
+    CHECK(ge_scratch_acquire(&scratch, &ops, 64u) == NULL
+          && fake.allocations == 1u);
+    fake.fail = false;
+    for (int frame = 0; frame < 60; frame++)
+        CHECK(ge_scratch_acquire(&scratch, &ops, 64u) == NULL);
+    CHECK(fake.allocations == 1u);
+    CHECK(ge_scratch_release(&scratch, &ops)
+          && ge_scratch_acquire(&scratch, &ops, 64u) == fake.block
+          && fake.allocations == 2u);
+    CHECK(ge_scratch_release(&scratch, &ops));
+    CHECK(ge_scratch_acquire(&scratch, &ops, 0u) == NULL
+          && ge_scratch_acquire(&scratch, NULL, 64u) == NULL);
+    ops.hold_failure = false;
+
+    puts("test: GE scratch heap blocks own whole cache lines");
+    GeScratchOps heap = {
+        .allocate = ge_scratch_heap_allocate,
+        .release = ge_scratch_heap_release };
+    GeScratch list = {0};
+    unsigned char *block = ge_scratch_acquire(&list, &heap, 65537u);
+    CHECK(block != NULL
+          && (uintptr_t) block % GE_SCRATCH_ALIGNMENT == 0u
+          && list.bytes == 65600u && list.bytes % GE_SCRATCH_ALIGNMENT == 0u);
+    memset(block, 0xa5, list.bytes);
+    CHECK(ge_scratch_release(&list, &heap) && !ge_scratch_resident(&list));
     return 0;
 }
 
@@ -492,6 +676,7 @@ static int test_web_runtime(void)
     if (test_canvas_setup_publication() != 0) return 1;
     if (test_canvas_deferred_publication() != 0) return 1;
     if (test_canvas_ge_presenter() != 0) return 1;
+    if (test_ge_scratch() != 0) return 1;
     Budget budget;
     budget_init(&budget, 16 * MIB);
     budget_install_lexbor(&budget);

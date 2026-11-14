@@ -8,7 +8,7 @@ Object.defineProperty(globalThis, "__tilefinchCreateShadowState", {
       peers = createPrivateSlot(),
       peerOf = (target) => peers.get(target) ?? null,
       // DOM_BRIDGE_SHADOW_ROOT_LIMIT, the native root table's bound.
-      ROOT_LIMIT = 512;
+      ROOT_LIMIT = 2048;
     let prepared = false;
     const forHandle = handle => {
       const entry = byHandle.get(handle),
@@ -45,6 +45,8 @@ Object.defineProperty(globalThis, "__tilefinchCreateShadowState", {
           let reference = null;
           try { if (WeakRefType) reference = new WeakRefType(root); }
           catch (_) { /* Retain identity if optional reclamation is refused. */ }
+          /* The host's slot outlives its wrapper while this names it. */
+          __tilefinchKeepNodeHandle(host.__handle);
           byHandle.set(Number(host.__handle), { root, reference });
         }
       },

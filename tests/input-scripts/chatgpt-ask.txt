@@ -15,6 +15,14 @@ wait-live 60
 until-live 6000
 wait-page 60
 mark hook
+# The heavy-page notice "PAGE SCRIPTS: 1.7 MB, ABOUT 17 SECONDS" (X Stop
+# page scripts, O Keep reading) opens 5 s after the page is classed an app
+# shell (17.5 s from boot under the 333 MHz replay) and stays 360 frames,
+# in the Ask and Run settings alike. This mark lands at 24.5 s and its
+# chrome record shows the notice. Circle keeps the scripts running; without
+# it the composer Cross below answers the notice and stops them. With no
+# notice up, Circle would be Back, so keep it right after this mark.
+tap-live circle
 wait-live 120
 stick-live 18 left
 stick-live 9 down

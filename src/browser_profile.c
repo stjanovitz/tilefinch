@@ -31,6 +31,12 @@ typedef struct {
     BrowserSiteStoragePolicy policy;
 } BrowserStorageSite;
 
+/* A remembered microphone answer: GRANTED or DENIED (MIC records). */
+typedef struct {
+    char origin[CONTENT_BLOCKER_HOST_LIMIT];
+    uint8_t permission;
+} BrowserMicrophoneSite;
+
 struct BrowserProfile {
     Budget *budget;
     unsigned ui_scale;
@@ -101,6 +107,15 @@ struct BrowserProfile {
     size_t heavy_site_count;
     char heavy_sites[BROWSER_PROFILE_HEAVY_SITE_LIMIT]
                     [CONTENT_BLOCKER_HOST_LIMIT];
+    /* Sites whose page last stopped its scripts for memory, oldest first
+       (SMEM records): the next visit offers to load without scripts. */
+    size_t script_memory_site_count;
+    char script_memory_sites[BROWSER_PROFILE_SCRIPT_MEMORY_SITE_LIMIT]
+                            [CONTENT_BLOCKER_HOST_LIMIT];
+    /* Origins the user answered the microphone prompt for with "Always
+       allow" or "Block": only the origin and the answer. */
+    size_t microphone_site_count;
+    BrowserMicrophoneSite microphone_sites[BROWSER_PROFILE_SECURITY_SITE_LIMIT];
     bool update_check_enabled;
     BrowserUpdateChannel update_channel;
     BrowserGlyphLanguage glyph_language;
@@ -108,13 +123,14 @@ struct BrowserProfile {
     bool color_emoji;
     uint16_t glyph_offer_declined_mask;
     bool glyph_offers_off;
-    bool wave_background;
     uint64_t update_check_last_unix;
     uint64_t update_check_available_sequence;
     size_t reader_site_count;
     BrowserReaderSiteScale reader_sites[BROWSER_PROFILE_READER_SITE_LIMIT];
     ContentBlockerMode content_blocker_mode;
     bool content_blocker_cosmetic_hiding;
+    /* Basic also refuses paywall SDK hosts (opt-in; BLOCKPAY record). */
+    bool content_blocker_paywall_scripts;
     uint64_t content_blocker_total_blocked;
     size_t content_blocker_allowed_site_count;
     char content_blocker_allowed_sites[CONTENT_BLOCKER_ALLOW_SITE_LIMIT]
@@ -386,7 +402,6 @@ BrowserProfile *browser_profile_create(Budget *budget)
     profile->content_blocker_cosmetic_hiding = true;
     profile->update_check_enabled = true;
     profile->tls_session_persistence = true;
-    profile->wave_background = true;
     profile->javascript_enabled = true;
     profile->site_data_allowed = true;
     profile->site_storage_offers = true;
@@ -709,6 +724,11 @@ static bool profile_serialize(ProfileWriter *writer,
             (unsigned) profile->content_blocker_mode,
             profile->content_blocker_cosmetic_hiding ? 1u : 0u);
     }
+    /* Its own record, written only when on: an older build reading a
+       profile ignores it, and the default profile's bytes stay as they
+       were. */
+    if (ok && profile->content_blocker_paywall_scripts)
+        ok = profile_writef(writer, "BLOCKPAY\t1\n");
     if (ok) {
         ok = profile_writef(
             writer, "TABS\t%u\n",
@@ -744,13 +764,6 @@ static bool profile_serialize(ProfileWriter *writer,
         ok = profile_writef(writer, "GLYPHASK\t%u\t%u\n",
                      (unsigned) profile->glyph_offer_declined_mask,
                      profile->glyph_offers_off ? 1u : 0u);
-    }
-    if (ok) {
-        /* Appended after UPDCHK: an older build ignores the unknown key and
-           a newer build reading an older file keeps the default. */
-        ok = profile_writef(
-            writer, "WAVE\t%u\n",
-            profile->wave_background ? 1u : 0u);
     }
     if (ok) {
         /* Independent global page policies. This is a separate append-only
@@ -862,6 +875,24 @@ static bool profile_serialize(ProfileWriter *writer,
         ok = profile_encode(profile->heavy_sites[i], encoded,
                             sizeof(encoded))
             && profile_writef(writer, "HS\t%s\n", encoded);
+    }
+    /* Older builds ignore SMEM records. They name visited sites, so they
+       are kept only while URL history is on. */
+    for (size_t i = 0; ok && profile->history_enabled
+         && i < profile->script_memory_site_count; i++) {
+        char encoded[CONTENT_BLOCKER_HOST_LIMIT * 3u];
+        ok = profile_encode(profile->script_memory_sites[i], encoded,
+                            sizeof(encoded))
+            && profile_writef(writer, "SMEM\t%s\n", encoded);
+    }
+    /* Older builds ignore MIC records. */
+    for (size_t i = 0; ok && i < profile->microphone_site_count; i++) {
+        char encoded[CONTENT_BLOCKER_HOST_LIMIT * 3u];
+        ok = profile_encode(profile->microphone_sites[i].origin, encoded,
+                            sizeof(encoded))
+            && profile_writef(writer, "MIC\t%s\t%u\n", encoded,
+                              (unsigned) profile->microphone_sites[i]
+                                  .permission);
     }
     for (size_t i = 0;
          ok && i < profile->reader_site_count; i++) {
@@ -991,7 +1022,6 @@ static bool profile_load_internal(
         .content_blocker_cosmetic_hiding = true,
         .update_check_enabled = true,
         .tls_session_persistence = true,
-        .wave_background = true,
         .javascript_enabled = true,
         .site_data_allowed = true,
         .site_storage_offers = true
@@ -1223,6 +1253,9 @@ static bool profile_load_internal(
             if (second != NULL)
                 loaded->content_blocker_cosmetic_hiding =
                     strtoul(second, NULL, 10) != 0;
+        } else if (strcmp(line, "BLOCKPAY") == 0) {
+            loaded->content_blocker_paywall_scripts =
+                strtoul(first, NULL, 10) != 0;
         } else if (strcmp(line, "STATS") == 0) {
             /* Older profiles persisted this cosmetic lifetime counter. It is
                now session-only so blocking a request never dirties the card. */
@@ -1242,7 +1275,9 @@ static bool profile_load_internal(
                 && viewport_page_zoom_valid((unsigned) zoom))
                 loaded->page_zoom_percent = (unsigned) zoom;
         } else if (strcmp(line, "WAVE") == 0) {
-            loaded->wave_background = strtoul(first, NULL, 10) != 0;
+            /* The retired wave background's record. Older profiles carry
+               it; it is read and ignored, and no longer written. */
+            continue;
         } else if (strcmp(line, "POLICY") == 0 && second != NULL) {
             loaded->javascript_enabled = strtoul(first, NULL, 10) != 0;
             loaded->site_data_allowed = strtoul(second, NULL, 10) != 0;
@@ -1295,6 +1330,41 @@ static bool profile_load_internal(
             } else {
                 memset(site, 0, CONTENT_BLOCKER_HOST_LIMIT);
             }
+        } else if (strcmp(line, "MIC") == 0 && second != NULL
+                   && loaded->microphone_site_count
+                          < BROWSER_PROFILE_SECURITY_SITE_LIMIT) {
+            BrowserMicrophoneSite *site =
+                &loaded->microphone_sites[loaded->microphone_site_count];
+            unsigned permission = (unsigned) strtoul(second, NULL, 10);
+            char normalized[CONTENT_BLOCKER_HOST_LIMIT];
+            bool kept = profile_decode(first, site->origin,
+                                       sizeof(site->origin))
+                && tilefinch_url_origin(site->origin, normalized,
+                                        sizeof(normalized))
+                && strcmp(normalized, site->origin) == 0
+                && (permission == MEDIA_CAPTURE_PERMISSION_GRANTED
+                    || permission == MEDIA_CAPTURE_PERMISSION_DENIED);
+            for (size_t i = 0; kept && i < loaded->microphone_site_count; i++)
+                kept = strcmp(loaded->microphone_sites[i].origin,
+                              site->origin) != 0;
+            if (kept) {
+                site->permission = (uint8_t) permission;
+                loaded->microphone_site_count++;
+            } else {
+                memset(site, 0, sizeof(*site));
+            }
+        } else if (strcmp(line, "SMEM") == 0
+                   && loaded->script_memory_site_count
+                          < BROWSER_PROFILE_SCRIPT_MEMORY_SITE_LIMIT) {
+            char *site =
+                loaded->script_memory_sites[loaded->script_memory_site_count];
+            bool kept = profile_decode(first, site, CONTENT_BLOCKER_HOST_LIMIT)
+                && profile_valid_block_site(site);
+            for (size_t i = 0; kept && i < loaded->script_memory_site_count;
+                 i++)
+                kept = strcmp(loaded->script_memory_sites[i], site) != 0;
+            if (kept) loaded->script_memory_site_count++;
+            else memset(site, 0, CONTENT_BLOCKER_HOST_LIMIT);
         } else if (strcmp(line, "JSD") == 0
                    && loaded->javascript_disabled_site_count
                           < BROWSER_PROFILE_JAVASCRIPT_SITE_LIMIT) {
@@ -1948,6 +2018,12 @@ bool browser_profile_content_blocker_cosmetic_hiding(
     return profile == NULL || profile->content_blocker_cosmetic_hiding;
 }
 
+bool browser_profile_content_blocker_paywall_scripts(
+    const BrowserProfile *profile)
+{
+    return profile != NULL && profile->content_blocker_paywall_scripts;
+}
+
 uint64_t browser_profile_content_blocker_total_blocked(
     const BrowserProfile *profile)
 {
@@ -1975,6 +2051,21 @@ BrowserHeavyPagesMode browser_profile_heavy_pages_mode(
 {
     return profile == NULL ? BROWSER_HEAVY_PAGES_ASK
                            : profile->heavy_pages_mode;
+}
+
+bool browser_profile_site_script_memory_stopped(
+    const BrowserProfile *profile, const char *url)
+{
+    char site[CONTENT_BLOCKER_HOST_LIMIT];
+    /* An older build's notes loaded with URL history off are not used, and
+       the next save drops them. */
+    if (profile == NULL || !profile->history_enabled
+        || !content_blocker_site_from_url(url, site))
+        return false;
+    for (size_t i = 0; i < profile->script_memory_site_count; i++) {
+        if (strcmp(profile->script_memory_sites[i], site) == 0) return true;
+    }
+    return false;
 }
 
 bool browser_profile_heavy_site_allowed(const BrowserProfile *profile,
@@ -2110,18 +2201,14 @@ void browser_profile_set_page_zoom_percent(
 void browser_profile_set_history_enabled(
     BrowserProfile *profile, bool enabled)
 {
-    if (profile != NULL) profile->history_enabled = enabled;
-}
-
-bool browser_profile_wave_background(const BrowserProfile *profile)
-{
-    return profile == NULL || profile->wave_background;
-}
-
-void browser_profile_set_wave_background(
-    BrowserProfile *profile, bool enabled)
-{
-    if (profile != NULL) profile->wave_background = enabled;
+    if (profile == NULL) return;
+    profile->history_enabled = enabled;
+    /* The script-memory notes name sites the reader visited. */
+    if (!enabled) {
+        memset(profile->script_memory_sites, 0,
+               sizeof(profile->script_memory_sites));
+        profile->script_memory_site_count = 0;
+    }
 }
 
 void browser_profile_set_update_check_enabled(
@@ -2333,6 +2420,10 @@ bool browser_profile_reset_site_permissions(
         &profile->cookie_banner_visible_site_count, site);
     profile_remove_exact_site(profile->heavy_sites,
                               &profile->heavy_site_count, site);
+    profile_remove_exact_site(profile->script_memory_sites,
+                              &profile->script_memory_site_count, site);
+    (void) browser_profile_set_microphone_site(
+        profile, url, MEDIA_CAPTURE_PERMISSION_PROMPT);
     profile_remove_exact_site(
         profile->content_blocker_allowed_sites,
         &profile->content_blocker_allowed_site_count, site);
@@ -2351,6 +2442,65 @@ bool browser_profile_reset_site_permissions(
                sizeof(profile->reader_sites[0]));
         break;
     }
+    return true;
+}
+
+MediaCapturePermission browser_profile_microphone_site(
+    const BrowserProfile *profile, const char *url)
+{
+    char origin[CONTENT_BLOCKER_HOST_LIMIT];
+    if (profile == NULL || !profile_storage_origin(url, origin))
+        return MEDIA_CAPTURE_PERMISSION_PROMPT;
+    for (size_t i = 0; i < profile->microphone_site_count; i++)
+        if (strcmp(profile->microphone_sites[i].origin, origin) == 0)
+            return (MediaCapturePermission)
+                profile->microphone_sites[i].permission;
+    return MEDIA_CAPTURE_PERMISSION_PROMPT;
+}
+
+bool browser_profile_microphone_site_room(const BrowserProfile *profile,
+                                          const char *url)
+{
+    char origin[CONTENT_BLOCKER_HOST_LIMIT];
+    return profile != NULL && profile_storage_origin(url, origin)
+        && (profile->microphone_site_count
+                < BROWSER_PROFILE_SECURITY_SITE_LIMIT
+            || browser_profile_microphone_site(profile, url)
+                   != MEDIA_CAPTURE_PERMISSION_PROMPT);
+}
+
+bool browser_profile_set_microphone_site(
+    BrowserProfile *profile, const char *url,
+    MediaCapturePermission permission)
+{
+    char origin[CONTENT_BLOCKER_HOST_LIMIT];
+    if (profile == NULL || !profile_storage_origin(url, origin)
+        || (permission != MEDIA_CAPTURE_PERMISSION_PROMPT
+            && permission != MEDIA_CAPTURE_PERMISSION_GRANTED
+            && permission != MEDIA_CAPTURE_PERMISSION_DENIED))
+        return false;
+    size_t found = profile->microphone_site_count;
+    for (size_t i = 0; i < profile->microphone_site_count; i++)
+        if (strcmp(profile->microphone_sites[i].origin, origin) == 0)
+            found = i;
+    if (permission == MEDIA_CAPTURE_PERMISSION_PROMPT) {
+        if (found == profile->microphone_site_count) return true;
+        memmove(&profile->microphone_sites[found],
+                &profile->microphone_sites[found + 1u],
+                (profile->microphone_site_count - found - 1u)
+                    * sizeof(profile->microphone_sites[0]));
+        memset(&profile->microphone_sites[--profile->microphone_site_count],
+               0, sizeof(profile->microphone_sites[0]));
+        return true;
+    }
+    if (found == profile->microphone_site_count) {
+        if (found >= BROWSER_PROFILE_SECURITY_SITE_LIMIT) return false;
+        snprintf(profile->microphone_sites[found].origin,
+                 sizeof(profile->microphone_sites[found].origin), "%s",
+                 origin);
+        profile->microphone_site_count++;
+    }
+    profile->microphone_sites[found].permission = (uint8_t) permission;
     return true;
 }
 
@@ -2538,6 +2688,12 @@ void browser_profile_set_content_blocker_cosmetic_hiding(
     if (profile != NULL) profile->content_blocker_cosmetic_hiding = enabled;
 }
 
+void browser_profile_set_content_blocker_paywall_scripts(
+    BrowserProfile *profile, bool blocked)
+{
+    if (profile != NULL) profile->content_blocker_paywall_scripts = blocked;
+}
+
 void browser_profile_record_content_blocked(
     BrowserProfile *profile, uint64_t count)
 {
@@ -2599,6 +2755,32 @@ bool browser_profile_set_heavy_site_allowed(
     if (profile->heavy_site_count >= BROWSER_PROFILE_HEAVY_SITE_LIMIT)
         return false;
     snprintf(profile->heavy_sites[profile->heavy_site_count++],
+             CONTENT_BLOCKER_HOST_LIMIT, "%s", site);
+    return true;
+}
+
+bool browser_profile_set_site_script_memory_stopped(
+    BrowserProfile *profile, const char *url, bool stopped)
+{
+    char site[CONTENT_BLOCKER_HOST_LIMIT];
+    if (profile == NULL || !content_blocker_site_from_url(url, site))
+        return false;
+    bool present = browser_profile_site_script_memory_stopped(profile, url);
+    if (!stopped) {
+        profile_remove_exact_site(profile->script_memory_sites,
+                                  &profile->script_memory_site_count, site);
+        return present;
+    }
+    /* A note names a visited site: none is kept with URL history off. */
+    if (present || !profile->history_enabled) return false;
+    if (profile->script_memory_site_count
+            >= BROWSER_PROFILE_SCRIPT_MEMORY_SITE_LIMIT) {
+        char oldest[CONTENT_BLOCKER_HOST_LIMIT];
+        memcpy(oldest, profile->script_memory_sites[0], sizeof(oldest));
+        profile_remove_exact_site(profile->script_memory_sites,
+                                  &profile->script_memory_site_count, oldest);
+    }
+    snprintf(profile->script_memory_sites[profile->script_memory_site_count++],
              CONTENT_BLOCKER_HOST_LIMIT, "%s", site);
     return true;
 }
@@ -2999,6 +3181,9 @@ const BrowserProfilePage *browser_profile_history(
 bool browser_profile_forget_history(BrowserProfile *profile, const char *url)
 {
     if (profile == NULL || url == NULL || url[0] == '\0') return false;
+    /* Forgetting where the reader went forgets the site's script-memory
+       note too. */
+    (void) browser_profile_set_site_script_memory_stopped(profile, url, false);
     for (size_t i = 0; i < profile->history_count; i++) {
         if (strcmp(profile->history[i].url, url) != 0) continue;
         size_t remaining = profile->history_count - i - 1u;
@@ -3242,9 +3427,10 @@ bool browser_recovery_save(
     FILE *file = fopen(temporary, "wb");
     if (file == NULL) return false;
     uint32_t checksum = recovery_checksum(url, scroll_y);
-    bool ok = fprintf(
-        file, "TILEFINCH_RECOVERY\t1\nN\t%s\t%d\t%08x\n",
-        encoded, scroll_y, (unsigned) checksum) > 0;
+    bool ok = fputs("TILEFINCH_RECOVERY\t1\nN\t", file) >= 0
+        && fputs(encoded, file) >= 0
+        && tilefinch_platform_file_printf(
+               file, "\t%d\t%08x\n", scroll_y, (unsigned) checksum) > 0;
     ok = fclose(file) == 0 && ok;
     if (!ok) {
         remove(temporary);

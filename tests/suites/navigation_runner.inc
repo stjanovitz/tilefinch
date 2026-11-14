@@ -29,12 +29,24 @@ int main(int argc, char **argv)
         STYLE_APPEND_VERIFY_CASE(
             test_confined_style_append_keeps_selector_cache);
         STYLE_APPEND_VERIFY_CASE(test_deferred_media_stylesheet_onload_swap);
+        STYLE_APPEND_VERIFY_CASE(test_sheet_changes_reach_synchronous_reads);
+        STYLE_APPEND_VERIFY_CASE(test_style_scope_matches_cold_cache);
 #undef STYLE_APPEND_VERIFY_CASE
         return 0;
     }
+    if (argc == 2 && strcmp(argv[1], "--sheet-reads-only") == 0)
+        return test_sheet_changes_reach_synchronous_reads() ? 0 : 1;
+    if (argc == 2 && strcmp(argv[1], "--style-scope-only") == 0)
+        return test_style_scope_matches_cold_cache()
+            && test_style_scope_overflow_and_mixed_turns()
+            && test_style_scope_install_refusals() ? 0 : 1;
     if (argc == 2 && strcmp(argv[1], "--frame-oom-cleanup-only") == 0) {
         RUN_TEST(test_frame_completion_oom_cleanup_cannot_erase_failure);
         RUN_TEST(test_frame_completion_author_error_keeps_realm);
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--frame-local-replacement-only") == 0) {
+        RUN_TEST(test_remote_frame_local_replacement);
         return 0;
     }
     if (argc == 2 && strcmp(argv[1], "--cache-safety-only") == 0) {
@@ -307,6 +319,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_streaming_stylesheet_continuation_converges);
     RUN_TEST(test_streaming_preview_rejects_incomplete_external_css);
     RUN_TEST(test_streaming_stylesheet_follows_late_viewport);
+    RUN_TEST(test_streaming_sheet_survives_script_refusal);
     RUN_TEST(test_parser_blocking_stylesheet_prepared_in_slices);
     RUN_TEST(test_sliced_stylesheet_keeps_document_order);
     RUN_TEST(test_streaming_preview_cancel_is_transient);
@@ -338,9 +351,14 @@ int main(int argc, char **argv)
     RUN_TEST(test_frame_error_event_oom_commits_top_document);
     RUN_TEST(test_frame_messaging_refusal_keeps_page_and_realm);
     RUN_TEST(test_frame_completion_window_state_oom_keeps_page);
+    RUN_TEST(test_remote_frame_local_replacement);
     RUN_TEST(test_frame_completion_oom_cleanup_cannot_erase_failure);
     RUN_TEST(test_frame_completion_author_error_keeps_realm);
     RUN_TEST(test_frame_load_event_oom_retires_realm);
+    RUN_TEST(test_hidden_frame_snapshot_drawn_when_shown);
+#if defined(TILEFINCH_FRAME_LITE)
+    RUN_TEST(test_frame_lite_lazy_realm);
+#endif
     RUN_TEST(test_frame_completion_error_event_oom_retires_realm);
     RUN_TEST(test_frame_event_static_relayout_keeps_page);
     RUN_TEST(test_scroll_reflection_static_relayout_keeps_page);
@@ -357,6 +375,10 @@ int main(int argc, char **argv)
     RUN_TEST(test_stylesheet_sources_insert_in_document_order);
     RUN_TEST(test_adopted_sources_insert_between_existing);
     RUN_TEST(test_adopted_reinsertion_keeps_selector_programs);
+    RUN_TEST(test_sheet_changes_reach_synchronous_reads);
+    RUN_TEST(test_style_scope_matches_cold_cache);
+    RUN_TEST(test_style_scope_overflow_and_mixed_turns);
+    RUN_TEST(test_style_scope_install_refusals);
     RUN_TEST(test_full_relayout_reclaims_owner_caches);
     RUN_TEST(test_confined_style_append_keeps_selector_cache);
     RUN_TEST(test_style_append_past_source_bound_keeps_confinement);

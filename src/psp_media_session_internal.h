@@ -78,7 +78,6 @@ bool psp_media_retry_240p(
 bool psp_media_open_pump(
     PspMediaSession *media,
     const TilefinchCancellation *cancellation);
-void psp_media_seek_arm_wait_budget(PspMediaSession *media);
 void psp_media_open_arm_wait_budget(PspMediaSession *media);
 void psp_media_open_clear_wait_budget(PspMediaSession *media);
 bool psp_media_seek_decode_pump(

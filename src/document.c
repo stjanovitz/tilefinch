@@ -14,6 +14,7 @@
 #include <lexbor/html/parser.h>
 #include <lexbor/html/tokenizer/state_script.h>
 #include <lexbor/html/tree.h>
+#include <lexbor/html/tree/insertion_mode.h>
 #include <lexbor/ns/const.h>
 
 #include "tilefinch/platform.h"
@@ -979,6 +980,161 @@ bool document_nonce_hiding_enable(PocDocument *document)
     return true;
 }
 
+/* <meta> insertions into any tracked document's trees (connected or not),
+   counted by the insertion callbacks below: a cheap test before
+   document_apply_meta_csp scans a head. */
+static uint64_t document_meta_insertions;
+
+static bool document_meta_csp_content(lxb_dom_node_t *node,
+                                      const char **content, size_t *length)
+{
+    if (node->type != LXB_DOM_NODE_TYPE_ELEMENT || node->ns != LXB_NS_HTML
+        || node->local_name != LXB_TAG_META) return false;
+    size_t equiv_length = 0;
+    const char *equiv = document_attribute(node, "http-equiv", &equiv_length);
+    /* An enumerated keyword: Content-Security-Policy-Report-Only and any
+       other spelling are not this state. */
+    if (equiv == NULL || equiv_length != 23u
+        || strncasecmp(equiv, "content-security-policy", 23u) != 0)
+        return false;
+    *content = document_attribute(node, "content", length);
+    return *content != NULL && *length != 0;
+}
+
+/* Match the loader's two URL paths. data: bodies may exceed the network
+   URL buffer, so retain a fixed-size cryptographic identity, not a copy.
+   The input is DOM-owned and cannot exceed its owning page Budget. */
+static bool document_meta_csp_script_target(
+    const PocDocument *document, lxb_dom_node_t *node, const char *base_url,
+    uint8_t digest[TILEFINCH_SHA256_DIGEST_BYTES])
+{
+    size_t length = 0;
+    const char *source = document_attribute(node, "src", &length);
+    if (source == NULL || length == 0 || length > document->budget->limit
+        || memchr(source, '\0', length) != NULL) return false;
+    if (length >= 5u && strncasecmp(source, "data:", 5u) == 0)
+        return tilefinch_sha256_digest((const uint8_t *) source, length, digest);
+    if (length >= TILEFINCH_URL_SERIALIZED_LIMIT) return false;
+    char reference[TILEFINCH_URL_SERIALIZED_LIMIT];
+    char resolved[TILEFINCH_URL_SERIALIZED_LIMIT];
+    memcpy(reference, source, length);
+    reference[length] = '\0';
+    return tilefinch_url_resolve(base_url, reference, resolved, sizeof(resolved))
+        && tilefinch_sha256_digest((const uint8_t *) resolved, strlen(resolved),
+                                   digest);
+}
+
+void document_meta_csp_prepare_script(PocDocument *document,
+                                      lxb_dom_node_t *node,
+                                      const char *document_url)
+{
+    if (document == NULL || document->html == NULL || node == NULL
+        || node->type != LXB_DOM_NODE_TYPE_ELEMENT
+        || node->ns != LXB_NS_HTML || node->local_name != LXB_TAG_SCRIPT
+        || document_ancestry(lxb_dom_interface_node(document->html), node)
+               != DOCUMENT_ANCESTRY_INSIDE
+        || lxb_dom_element_has_attribute(lxb_dom_interface_element(node),
+                                         (const lxb_char_t *) "nomodule", 8)
+        || (!lxb_dom_element_has_attribute(lxb_dom_interface_element(node),
+                                          (const lxb_char_t *) "defer", 5)
+            && !lxb_dom_element_has_attribute(lxb_dom_interface_element(node),
+                                             (const lxb_char_t *) "async", 5)))
+        return;
+    size_t length = 0;
+    const char *type = document_attribute(node, "type", &length);
+    bool module = false;
+    if (!script_type_attribute_classify(type, length, &module) || module)
+        return;
+    size_t capacity = sizeof(document->meta_csp_prepared)
+        / sizeof(document->meta_csp_prepared[0]);
+    size_t free_slot = capacity;
+    for (size_t i = 0; i < capacity; i++) {
+        if (document->meta_csp_prepared[i].node == node) return;
+        if (document->meta_csp_prepared[i].node == NULL) free_slot = i;
+    }
+    if (free_slot == capacity) return;
+    char base[TILEFINCH_URL_SERIALIZED_LIMIT];
+    uint8_t digest[TILEFINCH_SHA256_DIGEST_BYTES];
+    if (!document_base_url(document, document_url, base, sizeof(base))
+        || !document_meta_csp_script_target(document, node, base, digest))
+        return;
+    document->meta_csp_prepared[free_slot].node = node;
+    memcpy(document->meta_csp_prepared[free_slot].target_digest, digest,
+           sizeof(digest));
+    document->meta_csp_prepared[free_slot].policies_before =
+        (uint8_t) document->content_security_policy.policy_count;
+}
+
+uint8_t document_meta_csp_take_prepared_grant(PocDocument *document,
+                                             const lxb_dom_node_t *node,
+                                             const char *base_url)
+{
+    if (document == NULL || node == NULL
+        || node->type != LXB_DOM_NODE_TYPE_ELEMENT
+        || node->local_name != LXB_TAG_SCRIPT) return 0;
+    size_t count = document->content_security_policy.policy_count;
+    for (size_t i = 0; i < sizeof(document->meta_csp_prepared)
+                              / sizeof(document->meta_csp_prepared[0]); i++) {
+        if (document->meta_csp_prepared[i].node != node) continue;
+        uint8_t grant = 0;
+        uint8_t digest[TILEFINCH_SHA256_DIGEST_BYTES];
+        if (document_meta_csp_script_target(document, (lxb_dom_node_t *) node,
+                                             base_url, digest)
+            && memcmp(digest, document->meta_csp_prepared[i].target_digest,
+                       sizeof(digest)) == 0)
+            for (size_t policy = document->meta_csp_prepared[i].policies_before;
+                 policy < count && policy < TILEFINCH_CSP_POLICY_LIMIT; policy++)
+                grant |= (uint8_t) (1u << policy);
+        memset(&document->meta_csp_prepared[i], 0,
+               sizeof(document->meta_csp_prepared[i]));
+        return grant;
+    }
+    return 0;
+}
+
+bool document_apply_meta_csp(PocDocument *document, bool force)
+{
+    if (document == NULL || document->html == NULL
+        || (!force && document->meta_insertions_seen
+                          == document_meta_insertions)) return false;
+    document->meta_insertions_seen = document_meta_insertions;
+    /* The live head: the parser's cached pointer can name a replaced or
+       destroyed one (document_head_node). */
+    lxb_dom_node_t *head = document_head_node(document);
+    if (head == NULL) return false;
+    bool changed = false;
+    lxb_dom_node_t *node = head->first_child;
+    for (size_t visited = 0; node != NULL; visited++) {
+        /* A head past the traversal ceiling keeps the policies found so far;
+           the next insertion scans again. */
+        if (visited >= DOCUMENT_TRAVERSAL_NODE_LIMIT) break;
+        const char *content = NULL;
+        size_t length = 0;
+        if (document_meta_csp_content(node, &content, &length)
+            && tilefinch_csp_add_meta_policy(
+                   &document->content_security_policy, content, length))
+            changed = true;
+        if (node->first_child != NULL) {
+            node = node->first_child;
+            continue;
+        }
+        while (node != head && node->next == NULL) node = node->parent;
+        node = node == head ? NULL : node->next;
+    }
+    if (!changed) return false;
+    /* A header policy hides nonces and keeps the values policies list; the
+       values a meta policy lists join them. */
+    DocumentNonceRegistry *registry = document->nonce_registry;
+    if (registry != NULL && registry->hide)
+        tilefinch_csp_visit_nonce_sources(
+            &document->content_security_policy, document_nonce_list_value,
+            registry);
+    if (document->content_security_policy_changed != NULL)
+        document->content_security_policy_changed(
+            document->content_security_policy_changed_opaque);
+    return true;
+}
+
 /* Host-side style generation (document.h). One browser thread owns every
    page DOM, so process-wide state is enough; a change in any page document
    conservatively reaches every cache. */
@@ -1083,6 +1239,9 @@ static lxb_status_t document_style_node_inserted(lxb_dom_node_t *node)
         && (node->local_name == LXB_TAG_IFRAME
             || node->local_name == LXB_TAG_FRAME))
         document_frame_insertions++;
+    if (node != NULL && node->type == LXB_DOM_NODE_TYPE_ELEMENT
+        && node->ns == LXB_NS_HTML && node->local_name == LXB_TAG_META)
+        document_meta_insertions++;
     document_style_note_write(node);
     document_nonce_hide(node);
     return document_style_tree_base->inserted == NULL ? LXB_STATUS_OK
@@ -1169,6 +1328,9 @@ static lxb_status_t document_parser_node_inserted(lxb_dom_node_t *node)
                              node->parent) == DOCUMENT_ANCESTRY_INSIDE) {
         document_parser_journal_record(document, node);
     }
+    if (node != NULL && node->type == LXB_DOM_NODE_TYPE_ELEMENT
+        && node->ns == LXB_NS_HTML && node->local_name == LXB_TAG_META)
+        document_meta_insertions++;
     document_nonce_hide(node);
     /* Only the inserted root is a parser insertion. Lexbor then walks its
        descendants, which exist only when the adoption agency reinserts an
@@ -1215,6 +1377,16 @@ void document_parser_insertions_discard_subtree(PocDocument *document,
                                                 lxb_dom_node_t *root)
 {
     if (root == NULL) return;
+    for (size_t i = 0; document != NULL
+             && i < sizeof(document->meta_csp_prepared)
+                        / sizeof(document->meta_csp_prepared[0]); i++) {
+        const lxb_dom_node_t *prepared = document->meta_csp_prepared[i].node;
+        if (prepared == NULL
+            || document_ancestry(root, prepared) == DOCUMENT_ANCESTRY_OUTSIDE)
+            continue;
+        memset(&document->meta_csp_prepared[i], 0,
+               sizeof(document->meta_csp_prepared[i]));
+    }
     /* A pending parsing-blocking script or a running script destroyed by
        its own document's script is forgotten, never dereferenced. */
     DocumentParser *parser = document_active_parser(document);
@@ -1280,6 +1452,111 @@ static const lxb_char_t *document_parser_stop_state(
     parser->stop_at = data;
     tokenizer->state = parser->resume_state;
     return end;
+}
+
+/* A <script> or <style> body is held whole in Lexbor's temporary token
+   buffer until its end tag, and Lexbor's text insertion then copies it into
+   the document's text arena: the body exists twice, and the stale buffer
+   capacity stays until the next input window trims it, after a
+   parser-blocking script has already compiled. A body of at least
+   DOCUMENT_TOKENIZER_RETAINED_BYTES is handed over instead. The buffer
+   becomes the text node's storage in the text arena
+   (patches/lexbor-v3.0.0-mraw-adopt.patch), with its bytes moved up by the
+   arena's size header and NUL-terminated, and the tokenizer takes a fresh
+   buffer. The node, its bytes and the insertion events are those Lexbor's
+   own insertion makes. Called from the token callback: after a text token
+   Lexbor's states reset pos to start and keep no pointer into the buffer
+   (the end tag's name was read before the text was emitted). On success the
+   token is left empty for Lexbor's insertion, which then appends nothing; on
+   any refusal nothing has changed and Lexbor copies as before. When the
+   arena accepted the block but the insertion failed, *orphan is the adopted
+   text, which the token now points at for Lexbor's ordinary insertion and
+   which the caller frees once that is done. */
+static bool document_parser_adopt_raw_text(
+    DocumentParser *parser, lxb_html_tokenizer_t *tokenizer,
+    lxb_html_token_t *token, lxb_char_t **orphan)
+{
+    *orphan = NULL;
+    lxb_html_tree_t *tree = parser->original_token_context;
+    if (tree == NULL || tree->document == NULL
+        || token->tag_id != LXB_TAG__TEXT
+        || tree->mode != lxb_html_tree_insertion_mode_text
+        || tokenizer->base != NULL || tokenizer->start == NULL
+        || token->text_start != tokenizer->start
+        || token->text_end != tokenizer->pos
+        || tokenizer->pos < tokenizer->start
+        || tokenizer->end < tokenizer->pos) return false;
+    size_t length = (size_t) (token->text_end - token->text_start);
+    if (length < DOCUMENT_TOKENIZER_RETAINED_BYTES) return false;
+    lxb_dom_node_t *current = lxb_html_tree_current_node(tree);
+    if (current == NULL || current->ns != LXB_NS_HTML
+        || lxb_html_tree_adjusted_current_node(tree) != current
+        || (current->local_name != LXB_TAG_SCRIPT
+            && current->local_name != LXB_TAG_STYLE)) return false;
+    lexbor_mraw_t *arena = tree->document->dom_document.text;
+    const size_t header = lexbor_mraw_meta_size();
+    if (arena == NULL || length > SIZE_MAX / 2u) return false;
+    const size_t stored = lexbor_mem_align(length + 1u);
+    const size_t needed = header + stored;
+#ifndef __PSP__
+    if (tilefinch_test_faults()->refuse_raw_text_adoption) return false;
+#endif
+    lxb_char_t *fresh = lexbor_malloc(DOCUMENT_TOKENIZER_TRIM_SLACK);
+    if (fresh == NULL) return false;
+    lxb_char_t *block = tokenizer->start;
+    size_t capacity = (size_t) (tokenizer->end - tokenizer->start);
+    if (capacity < needed) {
+        lxb_char_t *grown = lexbor_realloc(block, needed);
+        if (grown == NULL) {
+            lexbor_free(fresh);
+            return false;
+        }
+        block = grown;
+        capacity = needed;
+        tokenizer->start = block;
+        tokenizer->pos = block + length;
+        tokenizer->end = block + capacity;
+        token->text_start = block;
+        token->text_end = block + length;
+    }
+    memmove(block + header, block, length);
+    block[header + length] = 0x00;
+    if (capacity - needed >= DOCUMENT_TOKENIZER_TRIM_SLACK) {
+        /* Return the growth slack. A refused shrink keeps the block. */
+        lxb_char_t *shrunk = lexbor_realloc(block, needed);
+        if (shrunk != NULL) {
+            block = shrunk;
+            capacity = needed;
+        }
+    }
+    lxb_char_t *data = lexbor_mraw_adopt(arena, block, capacity, length + 1u);
+    if (data == NULL) {
+        memmove(block, block + header, length);
+        tokenizer->start = block;
+        tokenizer->pos = block + length;
+        tokenizer->end = block + capacity;
+        token->text_start = block;
+        token->text_end = block + length;
+        lexbor_free(fresh);
+        return false;
+    }
+    tokenizer->start = fresh;
+    tokenizer->pos = fresh;
+    tokenizer->end = fresh + DOCUMENT_TOKENIZER_TRIM_SLACK;
+    lexbor_str_t text = { .data = data, .length = length };
+    if (lxb_html_tree_insert_character_for_data(tree, &text, NULL)
+        != LXB_STATUS_OK) {
+        token->text_start = data;
+        token->text_end = data + length;
+        *orphan = data;
+        return false;
+    }
+    token->text_start = fresh;
+    token->text_end = fresh;
+#ifndef __PSP__
+    tilefinch_test_faults()->raw_text_adoptions++;
+#endif
+    return true;
 }
 
 static lxb_html_token_t *document_parser_token(
@@ -1393,12 +1670,23 @@ static lxb_html_token_t *document_parser_token(
         dom->mutation = &document_parser_insertion_cbs;
         document_insertion_recorder = &parser->document;
     }
+    lxb_char_t *orphan = NULL;
+    (void) document_parser_adopt_raw_text(parser, tokenizer, token, &orphan);
     lxb_html_token_t *processed = parser->original_token_callback(
         tokenizer, token, parser->original_token_context);
+    if (orphan != NULL) {
+        token->text_start = token->text_end = tokenizer->start;
+        lexbor_mraw_free(tree->document->dom_document.text, orphan);
+    }
     if (dom != NULL) {
         dom->mutation = mutation;
         document_insertion_recorder = previous_recorder;
     }
+    /* A <meta> policy takes effect where the parser inserts it: before the
+       next token, so a later script, style or image is checked against it
+       and an earlier one is not. */
+    if (processed != NULL && parser->apply_meta_csp)
+        (void) document_apply_meta_csp(&parser->document, false);
     if (processed != NULL && parser_form != NULL) {
         lxb_dom_node_t *current_after = lxb_html_tree_current_node(tree);
         lxb_dom_node_t *candidate =
@@ -1661,13 +1949,6 @@ static bool pointer_event_attribute_name(
                 && memcmp(name, "onpointer", 9u) == 0));
 }
 
-static bool name_is(lxb_dom_node_t *node, const char *wanted)
-{
-    size_t length = 0;
-    const char *name = document_element_name(node, &length);
-    return name != NULL && strlen(wanted) == length
-           && memcmp(name, wanted, length) == 0;
-}
 
 static bool document_stats_add(size_t *value, size_t amount)
 {
@@ -1677,7 +1958,7 @@ static bool document_stats_add(size_t *value, size_t amount)
 }
 
 /* Tag ids name exactly the elements whose local name is the static string,
-   so these match what name_is() would, without resolving the name. */
+   so these match what document_element_name_is() would, without resolving the name. */
 static bool stats_hidden_container(const lxb_dom_node_t *node)
 {
     return node->local_name == LXB_TAG_SCRIPT
@@ -1925,6 +2206,15 @@ bool document_parser_begin(DocumentParser *parser, Budget *budget)
     return true;
 }
 
+bool document_parser_set_meta_csp(DocumentParser *parser, bool enabled)
+{
+    if (parser == NULL || !parser->active || parser->bytes_fed != 0)
+        return false;
+    parser->apply_meta_csp = enabled;
+    parser->document.meta_insertions_seen = document_meta_insertions;
+    return true;
+}
+
 bool document_parser_set_scripting(DocumentParser *parser, bool enabled)
 {
     if (parser == NULL || !parser->active || parser->bytes_fed != 0
@@ -2125,6 +2415,10 @@ lxb_dom_node_t *document_parser_open_script(const DocumentParser *parser)
    start-relative entity offsets, exactly the invariant Lexbor's own
    lxb_html_tokenizer_temp_realloc relies on when it moves the buffer. A
    refused reallocation keeps the larger buffer, which is still valid. */
+#if defined(TILEFINCH_MEMORY_DIAGNOSTICS)
+static size_t document_tokenizer_capacity_high_water;
+#endif
+
 static void document_parser_trim_tokenizer(DocumentParser *parser)
 {
     lxb_html_tokenizer_t *tokenizer = parser->tokenizer;
@@ -2134,6 +2428,10 @@ static void document_parser_trim_tokenizer(DocumentParser *parser)
     document_parser_discard_doomed_script_text(parser, tokenizer);
     size_t capacity = (size_t) (tokenizer->end - tokenizer->start);
     size_t used = (size_t) (tokenizer->pos - tokenizer->start);
+#if defined(TILEFINCH_MEMORY_DIAGNOSTICS)
+    if (capacity > document_tokenizer_capacity_high_water)
+        document_tokenizer_capacity_high_water = capacity;
+#endif
     if (capacity <= DOCUMENT_TOKENIZER_RETAINED_BYTES
         || used > capacity / 4u) return;
     size_t target = used + DOCUMENT_TOKENIZER_TRIM_SLACK;
@@ -4065,6 +4363,25 @@ lxb_dom_node_t *document_body_node(const PocDocument *document)
     return NULL;
 }
 
+lxb_dom_node_t *document_head_node(const PocDocument *document)
+{
+    if (document == NULL || document->html == NULL) return NULL;
+    /* lexbor sets its head pointer once, when the parser creates the head,
+       and never clears it: a script that replaces the head, or the root's
+       children, leaves it naming a detached node, and the node can be
+       destroyed and its block reused. The head is the first HEAD child of
+       the root element, as the HTML standard defines it. */
+    lxb_dom_element_t *root = lxb_dom_document_element(&document->html->dom_document);
+    lxb_dom_node_t *node = root == NULL ? NULL : lxb_dom_interface_node(root)->first_child;
+    for (size_t visited = 0; node != NULL && visited < DOCUMENT_TRAVERSAL_NODE_LIMIT;
+         visited++, node = node->next) {
+        if (node->type == LXB_DOM_NODE_TYPE_ELEMENT && node->ns == LXB_NS_HTML
+            && node->local_name == LXB_TAG_HEAD)
+            return node;
+    }
+    return NULL;
+}
+
 const char *document_element_name(lxb_dom_node_t *node, size_t *length)
 {
     if (length != NULL) {
@@ -4716,7 +5033,7 @@ bool document_base_url(PocDocument *document, const char *document_url,
     size_t visited = 0;
     while (node != NULL) {
         if (++visited > DOCUMENT_TRAVERSAL_NODE_LIMIT) return false;
-        if (name_is(node, "base")) {
+        if (document_element_name_is(node, "base")) {
             size_t href_length = 0;
             const char *href = document_attribute(node, "href", &href_length);
             bool present = href != NULL
@@ -4854,7 +5171,7 @@ bool document_referrer_policy(const PocDocument *document,
     size_t visited = 0;
     while (node != NULL) {
         if (++visited > DOCUMENT_TRAVERSAL_NODE_LIMIT) return false;
-        if (name_is(node, "meta")) {
+        if (document_element_name_is(node, "meta")) {
             size_t name_length = 0, content_length = 0;
             const char *name = document_attribute(
                 node, "name", &name_length);
@@ -4891,7 +5208,7 @@ static bool find_viewport_meta(lxb_dom_node_t *node,
     size_t visited = 0;
     while (node != NULL && node != boundary_parent) {
         if (++visited > DOCUMENT_TRAVERSAL_NODE_LIMIT) return false;
-        if (node->type == LXB_DOM_NODE_TYPE_ELEMENT && name_is(node, "meta")) {
+        if (node->type == LXB_DOM_NODE_TYPE_ELEMENT && document_element_name_is(node, "meta")) {
             size_t name_length = 0;
             const char *name = document_attribute(node, "name", &name_length);
             if (name != NULL
@@ -5042,3 +5359,203 @@ bool document_mobile_viewport(const PocDocument *document, int device_width,
     }
     return true;
 }
+
+#if defined(TILEFINCH_MEMORY_DIAGNOSTICS)
+size_t document_tokenizer_high_water(void)
+{
+    return document_tokenizer_capacity_high_water;
+}
+
+static size_t document_lexbor_mem_bytes(const lexbor_mem_t *mem,
+                                        size_t *chunks, size_t *used)
+{
+    size_t bytes = 0;
+    if (mem == NULL) return 0;
+    bytes += budget_allocation_charge(mem, NULL);
+    size_t visited = 0;
+    for (const lexbor_mem_chunk_t *chunk = mem->chunk_first;
+         chunk != NULL && visited++ < DOCUMENT_TRAVERSAL_NODE_LIMIT;
+         chunk = chunk->next) {
+        bytes += budget_allocation_charge(chunk, NULL)
+            + budget_allocation_charge(chunk->data, NULL);
+        if (chunks != NULL) (*chunks)++;
+        if (used != NULL) *used += chunk->length;
+    }
+    return bytes;
+}
+
+static size_t document_lexbor_dobject_bytes(const lexbor_dobject_t *dobject);
+
+/* Every mraw keeps a free-block tree whose entries come from a dobject of
+   512 entries: a fixed cost per arena. */
+static size_t document_lexbor_mraw_bytes(const lexbor_mraw_t *mraw,
+                                         size_t *chunks, size_t *used)
+{
+    if (mraw == NULL) return 0;
+    size_t bytes = budget_allocation_charge(mraw, NULL)
+        + document_lexbor_mem_bytes(mraw->mem, chunks, used);
+    if (mraw->cache != NULL)
+        bytes += budget_allocation_charge(mraw->cache, NULL)
+            + document_lexbor_dobject_bytes(mraw->cache->dobject);
+    return bytes;
+}
+
+static size_t document_lexbor_hash_bytes(const lexbor_hash_t *hash)
+{
+    if (hash == NULL) return 0;
+    size_t bytes = budget_allocation_charge(hash, NULL)
+        + budget_allocation_charge(hash->table, NULL)
+        + document_lexbor_mraw_bytes(hash->mraw, NULL, NULL);
+    return bytes + document_lexbor_dobject_bytes(hash->entries);
+}
+
+static size_t document_lexbor_dobject_bytes(const lexbor_dobject_t *dobject)
+{
+    if (dobject == NULL) return 0;
+    size_t bytes = budget_allocation_charge(dobject, NULL)
+        + document_lexbor_mem_bytes(dobject->mem, NULL, NULL);
+    if (dobject->cache != NULL)
+        bytes += budget_allocation_charge(dobject->cache, NULL)
+            + budget_allocation_charge(dobject->cache->list, NULL);
+    return bytes;
+}
+
+static size_t document_lexbor_array_bytes(const lexbor_array_t *array)
+{
+    return array == NULL ? 0
+        : budget_allocation_charge(array, NULL)
+            + budget_allocation_charge(array->list, NULL);
+}
+
+static size_t document_lexbor_array_obj_bytes(const lexbor_array_obj_t *array)
+{
+    return array == NULL ? 0
+        : budget_allocation_charge(array, NULL)
+            + budget_allocation_charge(array->list, NULL);
+}
+
+static size_t document_lexbor_parser_bytes(const lxb_html_parser_t *parser)
+{
+    if (parser == NULL) return 0;
+    size_t bytes = budget_allocation_charge(parser, NULL);
+    const lxb_html_tokenizer_t *tkz = parser->tkz;
+    if (tkz != NULL) {
+        bytes += budget_allocation_charge(tkz, NULL)
+            + budget_allocation_charge(tkz->start, NULL)
+            + document_lexbor_dobject_bytes(tkz->dobj_token)
+            + document_lexbor_dobject_bytes(tkz->dobj_token_attr)
+            + document_lexbor_mraw_bytes(tkz->mraw, NULL, NULL)
+            + document_lexbor_array_obj_bytes(tkz->parse_errors);
+    }
+    const lxb_html_tree_t *tree = parser->tree;
+    if (tree != NULL) {
+        bytes += budget_allocation_charge(tree, NULL)
+            + document_lexbor_array_bytes(tree->open_elements)
+            + document_lexbor_array_bytes(tree->active_formatting)
+            + document_lexbor_array_obj_bytes(tree->template_insertion_modes)
+            + document_lexbor_array_obj_bytes(tree->parse_errors);
+    }
+    return bytes;
+}
+
+static size_t document_dom_charge(const void *pointer)
+{
+    BudgetCategory category = BUDGET_CATEGORY_UNCATEGORIZED;
+    size_t charge = budget_allocation_charge(pointer, &category);
+    return category == BUDGET_CATEGORY_DOM ? charge : 0;
+}
+
+static void document_memory_note_text(size_t length, size_t *bytes,
+                                       size_t *nodes, size_t *largest)
+{
+    *bytes += length;
+    (*nodes)++;
+    if (length > *largest) *largest = length;
+}
+
+bool document_memory_split(const PocDocument *document,
+                           DocumentMemorySplit *split)
+{
+    if (split == NULL) return false;
+    memset(split, 0, sizeof(*split));
+    if (document == NULL || document->html == NULL) return false;
+    lxb_dom_document_t *dom = lxb_dom_interface_document(document->html);
+    split->node_arena_bytes = document_lexbor_mraw_bytes(
+        dom->mraw, &split->node_arena_chunks, &split->node_arena_used);
+    split->text_arena_bytes = document_lexbor_mraw_bytes(
+        dom->text, &split->text_arena_chunks, &split->text_arena_used);
+    split->hash_bytes = document_lexbor_hash_bytes(dom->tags)
+        + document_lexbor_hash_bytes(dom->attrs)
+        + document_lexbor_hash_bytes(dom->prefix)
+        + document_lexbor_hash_bytes(dom->ns);
+    lxb_html_parser_t *parser = document->html->dom_document.parser;
+    if (parser != NULL && parser->tkz != NULL
+        && parser->tkz->start != NULL
+        && parser->tkz->end >= parser->tkz->start)
+        split->tokenizer_capacity =
+            (size_t) (parser->tkz->end - parser->tkz->start);
+    split->lexbor_object_bytes =
+        budget_allocation_charge(document->html, NULL)
+        + document_lexbor_parser_bytes(parser);
+    split->body_text_bytes = document_dom_charge(document->body_text);
+    split->side_table_bytes = document_dom_charge(document->title)
+        + document_dom_charge(document->base_href_snapshot)
+        + document_dom_charge(document->frozen_base_url)
+        + document_dom_charge(document->control_states)
+        + document_dom_charge(document->declared_video_cache)
+        + document_dom_charge(document->nonce_registry)
+        + document_dom_charge(document->adopted_sheets)
+        + document_dom_charge(document->registered_properties)
+        + document_dom_charge(document->cssom_sheets);
+    for (size_t i = 0; i < sizeof(document->media_json_responses)
+                               / sizeof(document->media_json_responses[0]);
+         i++)
+        split->side_table_bytes +=
+            document_dom_charge(document->media_json_responses[i]);
+    lxb_dom_node_t *node = lxb_dom_interface_node(dom);
+    size_t visited = 0;
+    while (node != NULL) {
+        if (++visited > DOCUMENT_TRAVERSAL_NODE_LIMIT) {
+            split->truncated = true;
+            break;
+        }
+        split->nodes++;
+        if (node->type == LXB_DOM_NODE_TYPE_ELEMENT) {
+            split->elements++;
+            for (lxb_dom_attr_t *attr =
+                     lxb_dom_interface_element(node)->first_attr;
+                 attr != NULL; attr = attr->next) {
+                split->attributes++;
+                if (attr->value != NULL)
+                    split->attribute_value_bytes += attr->value->length;
+            }
+        } else if (node->type == LXB_DOM_NODE_TYPE_TEXT) {
+            size_t length = 0;
+            (void) document_text_data(node, &length);
+            lxb_tag_id_t parent = node->parent == NULL
+                ? LXB_TAG__UNDEF : node->parent->local_name;
+            split->text_nodes++;
+            if (parent == LXB_TAG_SCRIPT)
+                document_memory_note_text(
+                    length, &split->script_text_bytes,
+                    &split->script_text_nodes, &split->script_text_largest);
+            else if (parent == LXB_TAG_STYLE)
+                document_memory_note_text(
+                    length, &split->style_text_bytes,
+                    &split->style_text_nodes, &split->style_text_largest);
+            else
+                split->other_text_bytes += length;
+        } else if (node->type == LXB_DOM_NODE_TYPE_COMMENT) {
+            split->comment_bytes +=
+                lxb_dom_interface_character_data(node)->data.length;
+        }
+        if (node->first_child != NULL) {
+            node = node->first_child;
+            continue;
+        }
+        while (node != NULL && node->next == NULL) node = node->parent;
+        if (node != NULL) node = node->next;
+    }
+    return true;
+}
+#endif

@@ -30,12 +30,12 @@ translation.
 
 ## Editing and publishing
 
-The current catalog version is **v16**. All thirteen downloadable languages
+The current catalog version is **v17**. All thirteen downloadable languages
 use it, and `src/generated/ui_languages.inc` pins each language's file name,
 SHA-256 and the signed glyph-pack revision its shaped labels need (Devanagari
 revision 9 for Hindi, Bengali–Assamese revision 5 for Bengali and Assamese).
 
-Edit the active catalog's `translations/ui/v16/source.tsv`, then run
+Edit the active catalog's `translations/ui/v17/source.tsv`, then run
 `python3 tools/generate_ui_translations.py`.
 Commit the authored sources, generated Hindi and Bengali–Assamese sequences
 and `src/generated/ui_languages.inc` here, not the `.tful` downloads. Each
@@ -52,7 +52,8 @@ tilefinch-models. Sources and generation tools remain in the browser
 repository. Host builds generate test resources in their build directory;
 public-clone tests need no network or optional-download checkout. The
 generated-file test checks their exact identity. The browser accepts only the
-SHA-256-pinned bytes, at most 64 KiB and 2,048 rows per file. Values are
+SHA-256-pinned bytes, at most 128 KiB and 2,048 rows per file (64 KiB - 1
+up to v16, which the generator still enforces for those versions). Values are
 display text, not executable code or formatting programs.
 
 **Published versions are immutable.** Released browsers download the exact
@@ -76,6 +77,13 @@ A lookup hashes the English string the same way, and a row is used only
 when the key length also agrees, so an unrelated string whose hash happens
 to collide stays English. The generator refuses a version whose keys
 collide.
+
+The file stores no offsets: the reader finds each value by scanning the
+lines once while loading and keeps a 32-bit offset per row. Until v17 that
+offset was 16-bit, which held every file under 64 KiB; the wire layout did
+not change, so v12 to v16 files still load. A loaded catalog costs its
+file's size plus 4 bytes per row; Arabic also keeps its display text, with
+another 4 bytes per row.
 
 ### Files on the Memory Stick
 
@@ -118,7 +126,10 @@ Bengali–Assamese packs from that version's sequence files, raise the
 required glyph revision, and publish the packs before shipping a browser that
 pins the catalog: older packs may not contain the new labels' syllable
 clusters. Selecting such a language updates an older pack before reporting
-installation complete.
+installation complete. `tilefinch-ui-translation-resources-tests` fails when
+the active catalog needs a cluster outside the sequences of the version its
+required revision was built from; reword the row, or raise the revision and
+rebuild the pack.
 
 ### What the catalog covers
 
@@ -135,5 +146,5 @@ screen size and clock, and "MIT". On Site information the site name, the TLS
 version and a server's certificate issuer stay as sent. Filenames, application
 names, paths and links are never translated. Generated HTML uses logical
 translations and escapes them; native chrome uses the pre-shaped display
-labels. A new key should reuse an existing word where one fits, since the 64
-KiB file limit binds before the row limit for the longest languages.
+labels. A new key should reuse an existing word where one fits: Bengali,
+the longest language, is the first to reach the file bound.

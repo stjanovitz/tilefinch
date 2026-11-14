@@ -1,5 +1,6 @@
 #include "psp_canvas_ge.h"
 
+#include "tilefinch/ge_scratch.h"
 #include "tilefinch/psp_display.h"
 #include "tilefinch/psp_media_present.h"
 #include "tilefinch/resources.h"
@@ -33,9 +34,17 @@ typedef struct {
     int16_t pad;
 } CanvasGeVertex;
 
-static CanvasGeVertex __attribute__((aligned(64)))
-    canvas_ge_vertices[CANVAS_GE_VERTICES];
-static unsigned int __attribute__((aligned(64))) canvas_ge_list[256];
+/* Held only while a page publishes through this path (ge_scratch.h): the
+   list is written through the uncached alias, the vertices through the
+   cache and written back. Both start on a cache line. */
+typedef struct {
+    unsigned int list[256];
+    CanvasGeVertex vertices[CANVAS_GE_VERTICES];
+} CanvasGeScratch;
+_Static_assert(offsetof(CanvasGeScratch, vertices) % GE_SCRATCH_ALIGNMENT
+                   == 0u,
+               "the vertices must not share a cache line with the list");
+
 static unsigned canvas_ge_vertex_count;
 static int canvas_ge_key[5] = {-1, -1, -1, -1, -1};
 
@@ -48,11 +57,15 @@ static unsigned texture_extent(int value)
 
 /* Strip-major sprites; each source row y spans the destination rows the
    CPU kernel floor-maps to it: [ceil(y*H/h), ceil((y+1)*H/h)). */
-static bool canvas_ge_prepare_vertices(const RenderCanvasDeferral *d)
+static bool canvas_ge_prepare_vertices(CanvasGeScratch *scratch,
+                                       const RenderCanvasDeferral *d)
 {
+    CanvasGeVertex *vertices = scratch->vertices;
     int key[5] = {d->source_width, d->source_height, d->height, d->x, d->y};
     if (memcmp(key, canvas_ge_key, sizeof(key)) == 0
         && canvas_ge_vertex_count != 0) return true;
+    /* A geometry that does not fit leaves no stale count behind. */
+    canvas_ge_vertex_count = 0;
     unsigned source_width = (unsigned) d->source_width;
     unsigned source_height = (unsigned) d->source_height;
     unsigned height = (unsigned) d->height;
@@ -65,18 +78,17 @@ static bool canvas_ge_prepare_vertices(const RenderCanvasDeferral *d)
             unsigned bottom = ((y + 1u) * height + source_height - 1u)
                 / source_height;
             if (count + 2u > CANVAS_GE_VERTICES) return false;
-            canvas_ge_vertices[count++] = (CanvasGeVertex) {
+            vertices[count++] = (CanvasGeVertex) {
                 (float) sx - .25f, (float) y,
                 (int16_t) (d->x + (int) (sx * 3u / 2u)),
                 (int16_t) (d->y + (int) top), 0, 0};
-            canvas_ge_vertices[count++] = (CanvasGeVertex) {
+            vertices[count++] = (CanvasGeVertex) {
                 (float) ex - .25f, (float) (y + 1u),
                 (int16_t) (d->x + (int) (ex * 3u / 2u)),
                 (int16_t) (d->y + (int) bottom), 0, 0};
         }
     }
-    sceKernelDcacheWritebackRange(
-        canvas_ge_vertices, count * sizeof(canvas_ge_vertices[0]));
+    sceKernelDcacheWritebackRange(vertices, count * sizeof(vertices[0]));
     canvas_ge_vertex_count = count;
     memcpy(canvas_ge_key, key, sizeof(key));
     return true;
@@ -102,6 +114,31 @@ bool psp_canvas_ge_busy(void *context)
     if (canvas_ge_outstanding && !canvas_ge_list_running())
         canvas_ge_outstanding = false;
     return canvas_ge_outstanding;
+}
+
+static bool canvas_ge_scratch_busy(void *context)
+{
+    return psp_canvas_ge_busy(context);
+}
+
+static GeScratch canvas_ge_scratch;
+/* A refused allocation is not retried every present: the CPU conversion
+   publishes this page's frames until the presenter's next release. */
+static const GeScratchOps canvas_ge_scratch_ops = {
+    .allocate = ge_scratch_heap_allocate,
+    .release = ge_scratch_heap_release,
+    .busy = canvas_ge_scratch_busy,
+    .hold_failure = true
+};
+
+bool psp_canvas_ge_release(void *context)
+{
+    (void) context;
+    if (!ge_scratch_release(&canvas_ge_scratch, &canvas_ge_scratch_ops))
+        return false;
+    /* The next block holds no vertices yet. */
+    canvas_ge_vertex_count = 0;
+    return true;
 }
 
 void psp_canvas_ge_fail(void *context, const char *reason)
@@ -131,8 +168,11 @@ int psp_canvas_ge_scale(void *context, uint16_t *back,
         || d->serial != image_canvas_native_serial()
         || d->epoch != psp_display_edram_content_epoch()
         || !psp_media_present_ge_context_acquire()
-        || !psp_media_present_ge_context_idle()
-        || !canvas_ge_prepare_vertices(d)) return 0;
+        || !psp_media_present_ge_context_idle()) return 0;
+    CanvasGeScratch *scratch = ge_scratch_acquire(
+        &canvas_ge_scratch, &canvas_ge_scratch_ops, sizeof(CanvasGeScratch));
+    if (scratch == NULL || !canvas_ge_prepare_vertices(scratch, d))
+        return 0;
     void *edram = sceGeEdramGetAddr();
     if (edram == NULL) return 0;
     uintptr_t base = (uintptr_t) edram & CANVAS_GE_PHYSICAL_MASK;
@@ -147,7 +187,7 @@ int psp_canvas_ge_scale(void *context, uint16_t *back,
        whole-cache form is a constant 16 KiB walk (6 us measured). */
     sceKernelDcacheWritebackInvalidateAll();
     int dither = sceGuGetStatus(GU_DITHER);
-    if (sceGuStart(GU_DIRECT, (void *) ((uintptr_t) canvas_ge_list
+    if (sceGuStart(GU_DIRECT, (void *) ((uintptr_t) scratch->list
                                         | CANVAS_GE_UNCACHED)) < 0)
         return 0;
     sceGuDrawBufferList(GU_PSM_5650, (void *) (target - base),
@@ -175,7 +215,7 @@ int psp_canvas_ge_scale(void *context, uint16_t *back,
     sceGuTexFlush();
     sceGuDrawArray(GU_SPRITES,
                    GU_TEXTURE_32BITF | GU_VERTEX_16BIT | GU_TRANSFORM_2D,
-                   (int) canvas_ge_vertex_count, NULL, canvas_ge_vertices);
+                   (int) canvas_ge_vertex_count, NULL, scratch->vertices);
     /* WebGL never sets dither; leave the shared context as found. */
     if (dither) sceGuEnable(GU_DITHER);
     int list_bytes = sceGuFinish();
@@ -218,6 +258,12 @@ bool psp_canvas_ge_busy(void *context)
 void psp_canvas_ge_fail(void *context, const char *reason)
 {
     (void) context; (void) reason;
+}
+
+bool psp_canvas_ge_release(void *context)
+{
+    (void) context;
+    return true;
 }
 
 #endif

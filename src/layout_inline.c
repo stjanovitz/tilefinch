@@ -3313,31 +3313,6 @@ int measured_text_width_fixed_mode(const FontFace *face,
         metric_bold, scale, letter_spacing, kerning, NULL);
 }
 
-int measured_text_width_fixed(const FontFace *face,
-                              FontFamily metric_family,
-                              const char *text, size_t length,
-                              int font_size_fixed,
-                              bool synthetic_bold, bool metric_bold,
-                              int scale, int letter_spacing)
-{
-    return measured_text_width_fixed_mode(
-        face, metric_family, text, length, font_size_fixed,
-        synthetic_bold, metric_bold, scale, letter_spacing, true);
-}
-
-int measured_text_width(const FontFace *face,
-                               FontFamily metric_family,
-                               const char *text, size_t length,
-                               int font_size_fixed,
-                               bool synthetic_bold, bool metric_bold,
-                               int scale, int letter_spacing)
-{
-    int fixed = measured_text_width_fixed(
-        face, metric_family, text, length, font_size_fixed,
-        synthetic_bold, metric_bold, scale, letter_spacing);
-    return fixed > INT_MAX - 32 ? INT_MAX / 64 : (fixed + 32) / 64;
-}
-
 int measured_flow_text_width_fixed_checked(
     const FontFace *face, FontFamily metric_family,
     const char *text, size_t length, int font_size_fixed,
@@ -3821,8 +3796,10 @@ bool flow_text(LayoutContext *context, LineState *line,
         if (line->clamp_pending) return layout_line_clamp_overflow(line);
         if (layout_preview_limit_reached(context, line->y)) break;
         if (flow_guard == 0) {
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
             fprintf(stderr, "layout-work-limit phase=%s bytes=%zu\n",
                     "inline-text", length);
+#endif
             break;
         }
         flow_guard--;
@@ -4046,8 +4023,10 @@ bool flow_text(LayoutContext *context, LineState *line,
             if (line->clamp_pending) return layout_line_clamp_overflow(line);
             if (layout_preview_limit_reached(context, line->y)) break;
             if (flow_guard == 0) {
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
                 fprintf(stderr, "layout-work-limit phase=%s bytes=%zu\n",
                         "inline-text-piece", length);
+#endif
                 break;
             }
             flow_guard--;
@@ -4348,9 +4327,11 @@ static bool layout_fallback_consume_work(LayoutContext *context,
 {
     if (context == NULL || context->cancelled) return false;
     if (context->fallback_visits >= LAYOUT_FALLBACK_VISIT_LIMIT) {
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
         fprintf(stderr,
                 "layout-work-limit phase=depth-fallback limit=%u\n",
                 (unsigned) LAYOUT_FALLBACK_VISIT_LIMIT);
+#endif
         context->cancelled = true;
         return false;
     }

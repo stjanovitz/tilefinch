@@ -44,7 +44,8 @@ PSP_UI_SETTING(CONTENT_BLOCKER_SITE_ALLOWED, "content-blocker-site-allowed")
 PSP_UI_SETTING(CONTENT_BLOCKER_COSMETIC_HIDING, "content-blocker-cosmetic-hiding")
 PSP_UI_SETTING(COOKIE_BANNER_HIDDEN, "cookie-banner-hidden")
 PSP_UI_SETTING(UPDATE_CHECK, "update-check")
-PSP_UI_SETTING(WAVE_BACKGROUND, "wave-background")
+/* Retired: the wave background. The slot keeps later values unchanged. */
+PSP_UI_SETTING(RETIRED_WAVE_BACKGROUND, "retired-wave-background")
 PSP_UI_SETTING(JAVASCRIPT, "javascript")
 PSP_UI_SETTING(SITE_JAVASCRIPT, "site-javascript")
 PSP_UI_SETTING(SITE_DATA_ALLOWED, "site-data-allowed")
@@ -85,3 +86,8 @@ PSP_UI_SETTING(PAGE_ZOOM, "page-zoom")
 /* unsigned_value is a BrowserInsecureAudioAnswer for the current page's
    site, held for this session only. */
 PSP_UI_SETTING(INSECURE_AUDIO_SITE, "insecure-audio-site")
+/* boolean: Basic content blocking also refuses paywall SDK hosts. */
+PSP_UI_SETTING(CONTENT_BLOCKER_PAYWALL_SCRIPTS, "content-blocker-paywall-scripts")
+/* unsigned_value is a MediaCapturePermission (Ask, Allow, Block) for the
+   current page's origin, remembered in the profile; Ask forgets it. */
+PSP_UI_SETTING(MICROPHONE_SITE, "microphone-site")

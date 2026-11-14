@@ -13,7 +13,6 @@
       "cacheVariables": {
         "PSP_BROWSER_BUILD_TESTS": "ON",
         "PSP_BROWSER_BUILD_JSC_SPIKE": "OFF",
-        "PSP_BROWSER_USE_BELLARD_QUICKJS": "ON",
         "PSP_BROWSER_USE_COMPILER_CACHE": "ON",
         "PSP_BROWSER_ENABLE_GIF": "ON"
       }

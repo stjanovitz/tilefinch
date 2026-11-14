@@ -1547,6 +1547,34 @@ static int test_websocket_policy_and_close_payload(Budget *budget)
             }
         }
     }
+    /* A policy from <meta http-equiv="Content-Security-Policy"> (no
+       header) gates sockets through the same admission. */
+    TilefinchContentSecurityPolicy meta_csp = {0};
+    tilefinch_csp_bind_document_origin(&meta_csp, "https://page.test/");
+    static const char meta_policy[] = "connect-src wss://realtime.test";
+    CHECK(tilefinch_csp_add_meta_policy(&meta_csp, meta_policy,
+                                        sizeof(meta_policy) - 1u));
+    static const char *const meta_sockets[2] = {
+        "wss://realtime.test/chat", "wss://other.test/chat"
+    };
+    for (size_t j = 0; j < 2; j++) {
+        char http_target[TILEFINCH_URL_SERIALIZED_LIMIT];
+        snprintf(http_target, sizeof(http_target), "https%s",
+                 meta_sockets[j] + 3);
+        context.target_url = http_target;
+        CHECK(fetch_prepare_page_request_context(
+            &context, context.initiator_url, NULL, &session, &meta_csp,
+            NULL, NULL, &prepared, NULL));
+        request = fetch_prepared_page_request(&prepared);
+        bool admitted_socket = request != NULL
+            && fetch_websocket_prepare_admission(
+                meta_sockets[j], request, admitted, &protect_private);
+        if (admitted_socket != (j == 0)) {
+            fprintf(stderr, "websocket meta csp socket=%s admitted=%d\n",
+                    meta_sockets[j], admitted_socket ? 1 : 0);
+            return 1;
+        }
+    }
     context.target_url = "https://blocked.test/chat";
 
     /* HTTPS documents may not open plaintext sockets unless the existing

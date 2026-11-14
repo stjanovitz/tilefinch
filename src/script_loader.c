@@ -151,6 +151,15 @@ static bool script_budget_pressure(Budget *budget, size_t working_bytes,
     return budget_pressure_required(budget, working_bytes, reserve_bytes);
 }
 
+/* A script skipped for lack of memory: the loader's count, and the page's
+   own (ScriptHeavyState's memory_refusals). */
+static void script_note_memory_skip(ScriptRuntime *runtime,
+                                    ExternalScriptMetrics *metrics)
+{
+    metrics->skipped_pressure++;
+    script_runtime_note_memory_refusal(runtime);
+}
+
 static bool script_admit_known_working_set_with_reserve(
     ScriptRuntime *runtime, Budget *budget, size_t working_bytes,
     size_t minimum_budget_reserve_bytes,
@@ -177,7 +186,7 @@ static bool script_admit_known_working_set_with_reserve(
             budget, BUDGET_PRESSURE_JAVASCRIPT, 0, reclaimed);
         return true;
     }
-    metrics->skipped_pressure++;
+    script_note_memory_skip(runtime, metrics);
     budget_record_pressure(
         budget, BUDGET_PRESSURE_JAVASCRIPT, working_bytes, reclaimed);
     return false;
@@ -213,7 +222,7 @@ static bool script_admit_known_working_set(
             budget, BUDGET_PRESSURE_JAVASCRIPT, 0, reclaimed);
         return true;
     }
-    metrics->skipped_pressure++;
+    script_note_memory_skip(runtime, metrics);
     budget_record_pressure(
         budget, BUDGET_PRESSURE_JAVASCRIPT, peak, reclaimed);
     return false;
@@ -255,7 +264,7 @@ static bool script_bound_network_working_set(
                 requested - affordable, reclaimed);
             return true;
         }
-        metrics->skipped_pressure++;
+        script_note_memory_skip(runtime, metrics);
         budget_record_pressure(
             budget, BUDGET_PRESSURE_JAVASCRIPT, requested, reclaimed);
         return false;
@@ -482,14 +491,6 @@ static void script_cache_source_release(ScriptCacheSource *source)
     memset(source, 0, sizeof(*source));
 }
 
-static bool node_name_is(lxb_dom_node_t *node, const char *wanted)
-{
-    size_t length = 0;
-    const char *name = document_element_name(node, &length);
-    return name != NULL && strlen(wanted) == length
-           && memcmp(name, wanted, length) == 0;
-}
-
 typedef enum {
     SCRIPT_KIND_INERT = 0,
     SCRIPT_KIND_CLASSIC,
@@ -498,7 +499,7 @@ typedef enum {
 
 static ScriptKind script_declared_kind(lxb_dom_node_t *node)
 {
-    if (!node_name_is(node, "script")) return SCRIPT_KIND_INERT;
+    if (!document_element_name_is(node, "script")) return SCRIPT_KIND_INERT;
     size_t length = 0;
     const char *type = document_attribute(node, "type", &length);
     bool module = false;
@@ -552,7 +553,7 @@ static uint8_t script_element_csp_grant(
     const TilefinchContentSecurityPolicy *csp, ScriptRuntime *runtime,
     lxb_dom_node_t *node)
 {
-    return csp == NULL || !csp->header_present ? 0
+    return !tilefinch_csp_enforced(csp) ? 0
         : tilefinch_csp_element_grant(
               csp, TILEFINCH_DESTINATION_SCRIPT, node,
               script_runtime_script_parser_inserted(runtime, node));
@@ -1355,6 +1356,7 @@ bool script_inline_source_admissible(ScriptRuntime *runtime, Budget *budget,
             runtime, budget, &working, false);
     }
     if (!admitted) {
+        script_runtime_note_memory_refusal(runtime);
         budget_record_pressure(
             budget, BUDGET_PRESSURE_JAVASCRIPT, source_length, 0);
         if (tilefinch_trace_script_failures())
@@ -1383,7 +1385,7 @@ static bool script_admit_inline_node(ScriptRuntime *runtime, Budget *budget,
         const char *source = document_text_data(child, &length);
         if (source == NULL || length == 0) continue;
         if (length > SIZE_MAX - source_length) {
-            metrics->skipped_pressure++;
+            script_note_memory_skip(runtime, metrics);
             budget_record_pressure(
                 budget, BUDGET_PRESSURE_JAVASCRIPT, SIZE_MAX, 0);
             return false;
@@ -1405,7 +1407,7 @@ static bool script_admit_inline_node(ScriptRuntime *runtime, Budget *budget,
             budget_record_pressure(
                 budget, BUDGET_PRESSURE_JAVASCRIPT, 0, reclaimed);
         } else {
-            metrics->skipped_pressure++;
+            script_note_memory_skip(runtime, metrics);
             budget_record_pressure(
                 budget, BUDGET_PRESSURE_JAVASCRIPT, source_length,
                 reclaimed);
@@ -1555,7 +1557,7 @@ static bool execute_external_node(
     lxb_dom_node_t *node, const char *base_url, const char *document_url,
     const char *referrer_policy,
     const TilefinchContentSecurityPolicy *content_security_policy,
-    bool module, bool executable_precounted,
+    uint8_t prepared_grant, bool module, bool executable_precounted,
     size_t maximum_total_bytes, size_t maximum_file_bytes,
     long timeout_ms, ExternalScriptMetrics *metrics,
     DocumentScriptProcessResult *process_result)
@@ -1577,7 +1579,7 @@ static bool execute_external_node(
         return false;
     }
     uint8_t csp_grant = script_element_csp_grant(
-        content_security_policy, runtime, node);
+        content_security_policy, runtime, node) | prepared_grant;
     if (reference_length >= 5
         && strncasecmp(reference, "data:", 5) == 0) {
         if (!executable_precounted
@@ -1909,7 +1911,7 @@ static bool execute_external_node(
             metrics->skipped_quota++;
             script_runtime_note_oversized_script(runtime, response_limit);
         } else if (script_fetch_was_pressure_rejected(fetch, pressure_capped)) {
-            metrics->skipped_pressure++;
+            script_note_memory_skip(runtime, metrics);
         } else {
             metrics->failed++;
         }
@@ -2129,11 +2131,20 @@ static bool execute_external_node_live(
         live_base = base_url;
         script_runtime_invalidate_document_base(runtime);
     }
+    /* Only the exact classic request prepared at a parser end tag can
+       predate a later meta policy. A new src or a changed base cannot borrow
+       that request's authority. Consume before executing author code. */
+    uint8_t prepared_grant = 0;
+    if (document != NULL && !module) {
+        prepared_grant = document_meta_csp_take_prepared_grant(
+            document, node, live_base);
+    }
     bool executed = execute_external_node(
         runtime, budget, session, scheduler, node, live_base,
         live_document_url,
         referrer_policy,
         document == NULL ? NULL : &document->content_security_policy,
+        prepared_grant,
         module, executable_precounted,
         maximum_total_bytes, maximum_file_bytes,
         timeout_ms, metrics, NULL);
@@ -2596,7 +2607,8 @@ static bool pipeline_module_load(void *opaque,
                 fetch_scheduler_debug_dump(scheduler, "module-fetch");
             }
             if (script_fetch_was_pressure_rejected(fetch, pressure_capped)) {
-                context->metrics->skipped_pressure++;
+                script_note_memory_skip(context->runtime,
+                                        context->metrics);
             }
             {
                 size_t pool_reserved = 0, pool_maximum = 0;
@@ -3424,7 +3436,7 @@ DocumentScriptProcessResult document_scripts_process_closed(
         ok = execute_external_node(
             runtime, budget, session, scheduler, element, base_url,
             document_url, referrer_policy, content_security_policy,
-            false, false, maximum_total_bytes,
+            0, false, false, maximum_total_bytes,
             maximum_file_bytes, timeout_ms, &state->early,
             &process_result);
     } else {

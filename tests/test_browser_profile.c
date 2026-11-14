@@ -399,6 +399,7 @@ int main(void)
           && browser_profile_content_blocker_mode(profile)
                  == CONTENT_BLOCKER_BASIC
           && browser_profile_content_blocker_cosmetic_hiding(profile)
+          && !browser_profile_content_blocker_paywall_scripts(profile)
           && browser_profile_content_blocker_total_blocked(profile) == 0
           && browser_profile_reader_font(profile)
                  == BROWSER_READER_FONT_SANS
@@ -473,8 +474,6 @@ int main(void)
           && !browser_profile_set_chrome_theme_file(profile, "../bad.tfth")
           && strcmp(browser_profile_chrome_theme_file(profile),
                     "midnight-rain.tfth") == 0);
-    CHECK(browser_profile_wave_background(profile));
-    browser_profile_set_wave_background(profile, false);
     browser_profile_set_youtube_quality(
         profile, BROWSER_YOUTUBE_QUALITY_240P);
     browser_profile_set_youtube_compact_results(profile, false);
@@ -511,6 +510,7 @@ int main(void)
     browser_profile_set_content_blocker_mode(
         profile, CONTENT_BLOCKER_CUSTOM);
     browser_profile_set_content_blocker_cosmetic_hiding(profile, false);
+    browser_profile_set_content_blocker_paywall_scripts(profile, true);
     browser_profile_record_content_blocked(profile, 37);
     CHECK(browser_profile_content_blocker_total_blocked(profile) == 37);
     browser_profile_set_reader_font(profile, BROWSER_READER_FONT_SERIF);
@@ -748,7 +748,6 @@ int main(void)
                  == BROWSER_CHROME_THEME_CUSTOM
           && strcmp(browser_profile_chrome_theme_file(loaded),
                     "midnight-rain.tfth") == 0
-          && !browser_profile_wave_background(loaded)
           && browser_profile_youtube_quality(loaded)
                  == BROWSER_YOUTUBE_QUALITY_240P
           && !browser_profile_youtube_compact_results(loaded)
@@ -779,6 +778,7 @@ int main(void)
           && browser_profile_content_blocker_mode(loaded)
                  == CONTENT_BLOCKER_CUSTOM
           && !browser_profile_content_blocker_cosmetic_hiding(loaded)
+          && browser_profile_content_blocker_paywall_scripts(loaded)
           && browser_profile_content_blocker_total_blocked(loaded) == 0
           && browser_profile_reader_font(loaded)
                  == BROWSER_READER_FONT_SERIF
@@ -865,7 +865,9 @@ int main(void)
         "UI\t2\t150\t1\n"
         "R\tTFTEST00001\t8000000\t19000000\n"
         "MIXED\tcompat.example\n"
-        "TPC\tcookies.example\n",
+        "TPC\tcookies.example\n"
+        /* The retired wave background's record is ignored. */
+        "WAVE\t0\n",
         legacy) >= 0);
     CHECK(fclose(legacy) == 0);
     CHECK(seal_profile(path));
@@ -897,8 +899,6 @@ int main(void)
           && browser_profile_chrome_theme(legacy_loaded)
                  == BROWSER_CHROME_THEME_FINCH
           && browser_profile_chrome_theme_file(legacy_loaded)[0] == '\0'
-          /* A file written before the WAVE record keeps the default. */
-          && browser_profile_wave_background(legacy_loaded)
           && browser_profile_youtube_quality(legacy_loaded)
                  == BROWSER_YOUTUBE_QUALITY_360P
           /* Compact and banners are the defaults without a saved value. */

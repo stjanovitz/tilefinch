@@ -1,4 +1,5 @@
 #include "tilefinch/media_backend.h"
+#include "tilefinch/platform.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -55,15 +56,7 @@ static bool source_valid(const MediaSampleSource *source)
         && source->ops->seek_after_us != NULL;
 }
 
-static void playback_error(char *error, size_t error_size,
-                           const char *format, ...)
-{
-    if (error == NULL || error_size == 0) return;
-    va_list arguments;
-    va_start(arguments, format);
-    vsnprintf(error, error_size, format, arguments);
-    va_end(arguments);
-}
+#define playback_error tilefinch_format_error
 
 typedef enum {
     PLAYBACK_PACKET_READY,
@@ -94,11 +87,6 @@ static PlaybackPacketStatus playback_ensure_packet_capacity(
     playback->packet[source] = grown;
     playback->packet_capacity[source] = needed;
     return PLAYBACK_PACKET_READY;
-}
-
-static uint64_t sample_time_us(const MediaMp4Sample *sample)
-{
-    return media_ticks_to_us(sample->dts, sample->timescale);
 }
 
 /*
@@ -144,7 +132,7 @@ static bool playback_note_head_block(
         lane_peek = true;
     }
     playback->job_stats.head_alt_pending++;
-    uint64_t alternate = lane_peek ? sample_time_us(&peeked)
+    uint64_t alternate = lane_peek ? media_mp4_sample_dts_us(&peeked)
                                    : playback->pending_time_us[other];
     if (alternate > horizon) return false;
     playback->job_stats.head_alt_in_horizon++;
@@ -191,7 +179,7 @@ static bool playback_take_muxed_audio(MediaPlayback *playback,
     MediaMp4Sample sample;
     if (!source->ops->peek_track_sample(
             source->opaque, MEDIA_MP4_TRACK_AUDIO, &sample)) return false;
-    uint64_t time_us = sample_time_us(&sample);
+    uint64_t time_us = media_mp4_sample_dts_us(&sample);
     if (time_us > horizon
         || playback_ensure_packet_capacity(
                playback, 1u, sample.size, NULL, 0) != PLAYBACK_PACKET_READY
@@ -444,7 +432,7 @@ static MediaPlaybackAdvanceResult playback_advance_bounded(
                 } else {
                     playback->have_pending[source] = true;
                     playback->pending_time_us[source] =
-                        sample_time_us(&playback->pending[source]);
+                        media_mp4_sample_dts_us(&playback->pending[source]);
                 }
             }
         }
@@ -902,15 +890,6 @@ void media_playback_release_video_slot_quarantine(
         ops->release_quarantine(playback->backend.opaque, slot);
 }
 
-bool media_playback_video_slot_quarantined(
-    const MediaPlayback *playback, unsigned slot)
-{
-    const MediaBackendPresentationOps *ops = playback != NULL
-        ? playback->backend.presentation : NULL;
-    return ops != NULL && ops->is_quarantined != NULL
-        && ops->is_quarantined(playback->backend.opaque, slot);
-}
-
 void media_playback_note_frame_staged(
     MediaPlayback *playback, const MediaVideoFrame *frame)
 {
@@ -1047,21 +1026,6 @@ bool media_playback_warm_video(MediaPlayback *playback, uint64_t target_us,
     return playback_warm_source(playback, 0, target_us, error, error_size);
 }
 
-bool media_playback_warm_audio(MediaPlayback *playback, uint64_t target_us,
-                               char *error, size_t error_size)
-{
-    if (playback == NULL || !playback->has_audio) return false;
-    /* Split A/V keeps AAC in source one. An audio-only pipeline deliberately
-       installs that same adaptive AAC demux as its sole source. Progressive
-       A/V remains source zero and callers warm it through warm_video. */
-    if (playback->source_count < 2) {
-        return playback_warm_source(
-            playback, 0, target_us, error, error_size);
-    }
-    return playback_warm_source(
-        playback, 1, target_us, error, error_size);
-}
-
 /* How many samples a seek prime may step over between the keyframe the
    demuxer resumed at and the first sample at the target. Stepping is a walk
    of the in-memory sample table, not a read or a decode. A muxed source
@@ -1128,7 +1092,7 @@ static MediaPlaybackSourcePrimeStatus playback_prime_source(
          skipped <= MEDIA_PLAYBACK_PRIME_MAXIMUM_SKIPPED_SAMPLES;
          skipped++) {
         if (!source->ops->next_sample(source->opaque, &sample)) break;
-        uint64_t time_us = sample_time_us(&sample);
+        uint64_t time_us = media_mp4_sample_dts_us(&sample);
         if (!at_or_after_target || time_us >= target_us || peek_only) {
             found = true;
             if (sample_us != NULL) *sample_us = time_us;

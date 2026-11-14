@@ -24,15 +24,9 @@
    The check changes the run it observes (each one costs a rebuild), so it
    is for proving equality, never for timing. */
 #include "style_values_internal.h"
+#include "fnv1a.h"
 
-static uint64_t navigation_verify_fold(uint64_t hash, const void *data,
-                                       size_t length)
-{
-    const unsigned char *bytes = data;
-    for (size_t i = 0; i < length; i++)
-        hash = (hash ^ bytes[i]) * UINT64_C(1099511628211);
-    return hash;
-}
+#define navigation_verify_fold fnv1a64
 
 static uint64_t navigation_verify_string(uint64_t hash, const char *text,
                                          size_t length)

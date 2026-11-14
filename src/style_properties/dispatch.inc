@@ -713,17 +713,6 @@ static bool style_parse_property_declaration(
     return true;
 }
 
-bool style_apply_deferred_program(
-    Stylesheet *sheet, const char *text, size_t length,
-    uint32_t program_offset, uint16_t program_count, bool important,
-    ComputedStyle *style, uint64_t *mask, uint64_t *mask_high,
-    uint64_t *inherit_mask)
-{
-    return style_apply_deferred_program_basis(
-        sheet, text, length, program_offset, program_count, important, true,
-        style, mask, mask_high, inherit_mask);
-}
-
 /* `font_size_possible` false (the text is proven to have no font-size)
    skips the absolute font-basis scan, which would find nothing. */
 bool style_apply_deferred_program_basis(

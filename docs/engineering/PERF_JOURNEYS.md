@@ -181,23 +181,28 @@ replays a journey trace with `trace_keyed=1`: responses are matched by method
 and URL (as the lab's `--replay-http-response-keyed` does), not in strict
 capture order, because a page's image and stylesheet requests race.
 
-The traces are private and are not in any clone. The maintainers' source
-copies sit outside the repository, in the workspace's `work/` tree; copy one
-into `perf/traces/NAME` (or prepare it there) and the manifest's SHA-256
-checks it.
+The traces are private and are not in any clone. Maintainers keep the source
+copies outside the repository, in their private trace archive; copy one into
+`perf/traces/NAME` (or prepare it there) and the manifest's SHA-256 checks it.
+The census traces start from the site census corpus
+(`CENSUS/corpus/NAME/capture`, see
+[tools/site-census](../../tools/site-census/README.md)) and are prepared with
+`--prepare-trace`.
 
-| Trace | Journeys | Source copy (workspace `work/`) | What it holds |
-| --- | --- | --- | --- |
-| `wikipedia-article` | `article-*` | lost; no copy matches its pin | a lab capture of a main page, a search and one long article |
-| `wikipedia-article-psp` | `press-during-preview` | `review-1109/perf-1110/wiki-archive-data/traces/` | a PSP capture of the PlayStation Portable article and its first-screen images |
-| `wiki-abc` | `wiki-revisit*` | `merge-tools/traces/` | the same article URL served three times, as three articles that share their `<head>` stylesheets |
-| `ia-search-thumbs` | `ia-search` | `review-1109/perf-1110/wiki-archive-data/traces/` | Internet Archive search results for "psp", with stand-in thumbnails |
-| `bbc-home`, `www-reddit` | `bbc-home-load*`, `www-reddit-load` | `census/corpus/NAME/capture`, prepared with `--prepare-trace` | census captures (2026-10-06) |
-| `youtube-bbb` | `youtube-bbb` | the main checkout's `perf/traces/` | see below |
-| `chatgpt-ask-send76` | `chatgpt-ask` | the main checkout's `build-preset-psp-validation/census-replay-trace` | a PSP capture of the chatgpt.com journey |
+| Trace | Journeys | What it holds |
+| --- | --- | --- |
+| `wikipedia-article` | `article-*` | a PSP capture (2026-11-11) of `scroll-during-load-live` from the search URL: the article, its reload, its stylesheets, icons and the images the scrolled screens asked for |
+| `wikipedia-article-psp` | `press-during-preview` | a PSP capture of the PlayStation Portable article and its first-screen images |
+| `wiki-abc` | `wiki-revisit*` | the same article URL served three times, as three articles that share their `<head>` stylesheets |
+| `ia-search-thumbs` | `ia-search` | Internet Archive search results for "psp", with stand-in thumbnails |
+| `bbc-home`, `www-reddit` | `bbc-home-load*`, `www-reddit-load` | census captures (2026-10-06) |
+| `youtube-bbb` | `youtube-bbb` | see below |
+| `chatgpt-ask-send76` | `chatgpt-ask` | a PSP capture of the chatgpt.com journey |
 
-The `article-*` journeys are skipped until their trace is re-captured and
-re-pinned. A new trace is a new baseline (`--record`), not a ratchet.
+The `wikipedia-article` capture also holds three image requests that made
+no progress on the live network (status 0), each followed by its
+successful retry. Re-capturing a trace is a new baseline (`--record`), not
+a ratchet.
 
 The `wiki-revisit*` journeys reload one URL; with keyed replay each reload
 is served the next of the trace's three document records. A fourth load of

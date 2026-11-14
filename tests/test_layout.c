@@ -983,6 +983,12 @@ int main(int argc, char **argv)
     CHECK(test_grid_rows_past_placement_window() == 0);
     if (argc == 2 && strcmp(argv[1], "--grid-positioned-lines-only") == 0)
         return test_grid_positioned_lines_past_tracks();
+    if (argc == 2 && strcmp(argv[1], "--bidi-translate-only") == 0) {
+        Budget budget;
+        budget_init(&budget, 16 * MIB);
+        budget_install_lexbor(&budget);
+        return test_bidi_glyphs_follow_subtree_translation(&budget);
+    }
     CHECK(test_grid_positioned_lines_past_tracks() == 0);
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc == 2 && strcmp(argv[1], "--page-font-leading-only") == 0)

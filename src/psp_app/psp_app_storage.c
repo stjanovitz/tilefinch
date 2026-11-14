@@ -200,18 +200,11 @@ static void site_storage_delete(PspApp *app, PspAppFrameState *frame,
                                 size_t row)
 {
     PspPresentationResources *presentation = &app->process->presentation;
-    BrowserProfile *profile = app->browser->profile;
     if (row >= presentation->site_storage_view.count) return;
     const char *origin = presentation->site_storage_origins[row];
-    bool deleted = browser_session_site_storage_forget(
-        app->browser->session, origin);
-    if (browser_profile_site_storage_policy(profile, origin)
-            != BROWSER_SITE_STORAGE_ASK
-        && browser_profile_set_site_storage_policy(
-               profile, origin, BROWSER_SITE_STORAGE_ASK)) {
-        psp_profile_store_mark_dirty(
-            &app->browser->profile_store, frame->ui_sample_us);
-    }
+    bool deleted = psp_profile_store_forget_site_storage(
+        &app->browser->profile_store, app->browser->session,
+        origin, frame->ui_sample_us);
     site_storage_fill(app);
     psp_ui_show_status(&presentation->ui,
                        deleted ? "SITE STORAGE DELETED"

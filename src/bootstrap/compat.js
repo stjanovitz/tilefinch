@@ -151,7 +151,7 @@
       try {
         recordVisibilityState?.(pageVisible ? "visible" : "hidden");
       } catch (_) {}
-      dispatchVisibility(new globalThis.Event("visibilitychange"));
+      dispatchVisibility(browserEvent(EventInterface, "visibilitychange"));
       return true;
     };
     document.exitPointerLock = { exitPointerLock() {} }.exitPointerLock;
@@ -441,6 +441,7 @@
     /* isTrusted is an unforgeable own attribute whose getter browsers share
        across events; one descriptor also spares a closure per event. */
     isTrustedDescriptor = {
+      __proto__: null,
       configurable: false,
       enumerable: true,
       get: Object.getOwnPropertyDescriptor({
@@ -449,12 +450,18 @@
         },
       }, "isTrusted").get,
     };
-  globalThis.Event = class Event {
+  /* compat.js runs before author code, so the interface objects it keeps in
+     locals (EventInterface and the rest) stay the bootstrap's own after a
+     page replaces the globals; browserEvent below builds with them. */
+  const EventInterface = globalThis.Event = class Event {
     constructor(type, options = {}) {
       options ??= {};
       if (arguments.length < 1)
         throw new TypeError("Event type is required");
+      /* Null prototype: a field another interface adds later (ProgressEvent's
+         loaded) must not reach a setter the page put on Object.prototype. */
       eventStateSet(this, {
+        __proto__: null,
         type: String(type),
         bubbles: !!options.bubbles,
         cancelable: !!options.cancelable,
@@ -472,7 +479,7 @@
         path: null,
         trusted: false,
       });
-      Object.defineProperty(this, "isTrusted", isTrustedDescriptor);
+      trustedDefineProperty(this, "isTrusted", isTrustedDescriptor);
     }
     preventDefault() {
       const state = eventState(this);
@@ -629,7 +636,22 @@
     eventState(event).trusted = true;
     return event;
   };
-  __tilefinchRealmGlobal.__tilefinchTrustedEventShare.install(trustedEvent);
+  /* Events the browser itself fires: built with a captured interface object
+     from a null-prototype copy of the init literal's own fields, so neither
+     a replaced global constructor nor an Object.prototype getter takes part
+     in making an event that trustedEvent may then mark. */
+  const emptyEventInit = Object.freeze({ __proto__: null }),
+    trustedObjectKeys = Object.keys,
+    browserEvent = (Interface, type, init) => {
+      let dictionary = emptyEventInit;
+      if (init != null) {
+        dictionary = { __proto__: null };
+        const keys = trustedObjectKeys(init);
+        for (let index = 0; index < keys.length; index++)
+          dictionary[keys[index]] = init[keys[index]];
+      }
+      return new Interface(type, dictionary);
+    };
   /* Boot-time only: the host captures it once the bootstrap has run and
      deletes it before any author code (runtime_creation.inc). */
   Object.defineProperty(globalThis, "__tilefinchTrustedEvent", {
@@ -827,7 +849,7 @@
     }
   };
   globalThis.TextEvent = TextEventInterface;
-  globalThis.FocusEvent = class FocusEvent extends UIEvent {
+  const FocusEventInterface = globalThis.FocusEvent = class FocusEvent extends UIEvent {
     constructor(type, options = {}) {
       options ??= {};
       super(type, options);
@@ -857,7 +879,7 @@
       this.pseudoElement = String(options.pseudoElement || "");
     }
   };
-  globalThis.ToggleEvent = class ToggleEvent extends Event {
+  const ToggleEventInterface = globalThis.ToggleEvent = class ToggleEvent extends Event {
     constructor(type, options = {}) {
       options ??= {};
       super(type, options);
@@ -1110,7 +1132,7 @@
     enumerable: false,
     writable: false,
     value(type, data, origin = "", source = null, ports = []) {
-      const event = new MessageEvent(type);
+      const event = browserEvent(messageEventConstructor, type);
       messageEventStateSet(event, {
         data,
         origin: String(origin),
@@ -1133,7 +1155,7 @@
       value: messageEventConstructor,
     },
   });
-  globalThis.CloseEvent = class CloseEvent extends Event {
+  const CloseEventInterface = globalThis.CloseEvent = class CloseEvent extends Event {
     constructor(type, options = {}) {
       options ??= {};
       super(type, options);
@@ -1142,6 +1164,40 @@
       this.reason = String(options.reason || "");
     }
   };
+  /* The interfaces the other bootstrap modules build browser events with,
+     captured while compat.js runs for the same reason as EventInterface.
+     They reach them through the share's createBrowserEvent (dom.js), and
+     hardening.js publishes the table as __tilefinchEventInterfaces for the
+     lazy modules to extend. */
+  const browserInterfaces = trustedObjectFreeze({
+    __proto__: null,
+    Event: EventInterface,
+    EventTarget,
+    UIEvent,
+    FocusEvent: FocusEventInterface,
+    MouseEvent,
+    PointerEvent,
+    KeyboardEvent,
+    InputEvent,
+    CompositionEvent,
+    SubmitEvent,
+    TransitionEvent,
+    ToggleEvent: ToggleEventInterface,
+    ProgressEvent: progressEventConstructor,
+    MessageEvent: messageEventConstructor,
+    CloseEvent: CloseEventInterface,
+    ErrorEvent: errorEventConstructor,
+    HashChangeEvent,
+    PopStateEvent,
+  });
+  __tilefinchRealmGlobal.__tilefinchTrustedEventShare.install(
+    trustedEvent,
+    (type, init, name = "Event") =>
+      browserEvent(browserInterfaces[name], type, init),
+    /* Only EventInterface's constructor gives an object event state. */
+    (value) => eventStateGet(value) !== undefined,
+    browserInterfaces,
+  );
   const fileReaderDispatch = EventTarget.prototype.dispatchEvent;
   let fileReaderState;
   globalThis.FileReader = class FileReader extends EventTarget {
@@ -1165,7 +1221,7 @@
     get error() { return this.#state.error; }
     #emit(type, loaded = 0, total = 0) {
       const event = trustedEvent(
-        new ProgressEvent(type, {
+        browserEvent(progressEventConstructor, type, {
           lengthComputable: true,
           loaded,
           total,
@@ -1539,7 +1595,7 @@
     }
     const fire = (target, type, options) =>
       target.dispatchEvent(
-        trustedEvent(new FocusEvent(type, options)),
+        trustedEvent(browserEvent(FocusEventInterface, type, options)),
       );
     if (previous && previous !== document.body) {
       markFocus(previous, false);
@@ -1557,7 +1613,8 @@
     if (globalThis.__tilefinchActiveElement !== this) return;
     const next = document.body,
       fire = (type, options) =>
-        this.dispatchEvent(trustedEvent(new FocusEvent(type, options)));
+        this.dispatchEvent(
+          trustedEvent(browserEvent(FocusEventInterface, type, options)));
     markFocus(this, false);
     fire("blur", { relatedTarget: next });
     fire("focusout", { bubbles: true, relatedTarget: next });
@@ -1610,12 +1667,12 @@
     if (value !== undefined) this.returnValue = value;
     this.removeAttribute("open");
     this.removeAttribute("data-tilefinch-modal");
-    this.dispatchEvent(trustedEvent(new Event("close")));
+    this.dispatchEvent(trustedEvent(browserEvent(EventInterface, "close")));
   };
   HTMLDialogElement.prototype.requestClose = function requestClose(value) {
     if (!this.open) return;
     const event = trustedEvent(
-      new Event("cancel", { cancelable: true }),
+      browserEvent(EventInterface, "cancel", { cancelable: true }),
     );
     if (this.dispatchEvent(event)) this.close(value);
   };
@@ -1639,7 +1696,7 @@
     details.open = !wasOpen;
     details.dispatchEvent(
       trustedEvent(
-        new ToggleEvent("toggle", {
+        browserEvent(ToggleEventInterface, "toggle", {
           oldState: wasOpen ? "open" : "closed",
           newState: wasOpen ? "closed" : "open",
         }),
@@ -1791,10 +1848,10 @@
     }
     if (state.changed) {
       state.target.dispatchEvent(
-        trustedEvent(new Event("input", { bubbles: true })),
+        trustedEvent(browserEvent(EventInterface, "input", { bubbles: true })),
       );
       state.target.dispatchEvent(
-        trustedEvent(new Event("change", { bubbles: true })),
+        trustedEvent(browserEvent(EventInterface, "change", { bubbles: true })),
       );
     }
     return true;
@@ -1817,7 +1874,7 @@
     const oldState = current ? "open" : "closed",
       newState = open ? "open" : "closed",
       before = trustedEvent(
-        new ToggleEvent("beforetoggle", {
+        browserEvent(ToggleEventInterface, "beforetoggle", {
           cancelable: open,
           oldState,
           newState,
@@ -1827,7 +1884,9 @@
     if (open) target.setAttribute("data-tilefinch-popover-open", "");
     else target.removeAttribute("data-tilefinch-popover-open");
     target.dispatchEvent(
-      trustedEvent(new ToggleEvent("toggle", { oldState, newState })),
+      trustedEvent(
+        browserEvent(ToggleEventInterface, "toggle", { oldState, newState }),
+      ),
     );
     return open;
   };
@@ -2287,21 +2346,21 @@
                   path[at],
                   event,
                   true,
-                  Event.CAPTURING_PHASE,
+                  1,
                 );
               if (!event.__stopped) {
                 globalThis.__tilefinchInvokeEventTarget(
                   this,
                   event,
                   true,
-                  Event.AT_TARGET,
+                  2,
                 );
                 if (!event.__stopped)
                   globalThis.__tilefinchInvokeEventTarget(
                     this,
                     event,
                     false,
-                    Event.AT_TARGET,
+                    2,
                   );
               }
               if (event.bubbles && !event.__stopped)
@@ -2310,7 +2369,7 @@
                     path[at],
                     event,
                     false,
-                    Event.BUBBLING_PHASE,
+                    3,
                   );
               globalThis.__tilefinchFinishEventDispatch(event);
               return !event.defaultPrevented;
@@ -2929,7 +2988,7 @@
           try { algorithm(); } catch (error) {
             __tilefinchReportUncaught(error, "AbortSignal algorithm");
           }
-        current.dispatchEvent(new Event("abort"));
+        current.dispatchEvent(browserEvent(EventInterface, "abort"));
         current = next;
       }
     };
@@ -3691,8 +3750,10 @@
       subtleToken = {},
       cryptoInstances = new WeakSet(),
       subtleInstances = new WeakSet(),
-      subtleBufferNormalizers = new WeakMap(),
-      cryptoSubtleInstances = new WeakMap(),
+      /* Worker normalizers are realm functions: a rooted WeakMap value
+         would keep the realm, its Crypto key and all globals alive. */
+      subtleBufferNormalizers = domShared.createPrivateSlot(),
+      cryptoSubtleInstances = domShared.createPrivateSlot(),
       integerRandomViews = new Set([
         "[object Int8Array]",
         "[object Uint8Array]",
@@ -3836,7 +3897,11 @@
       const subtle = cryptoSubtleInstances.get(crypto);
       if (!subtle || typeof input !== "function" || typeof output !== "function")
         throw new TypeError("invalid Crypto normalizer");
-      subtleBufferNormalizers.set(subtle, { input, output });
+      const current = subtleBufferNormalizers.get(subtle);
+      if (current) {
+        current.input = input;
+        current.output = output;
+      } else subtleBufferNormalizers.set(subtle, { input, output });
     };
   }
   if (globalThis.console === undefined) {
@@ -4900,7 +4965,7 @@
           this._dataBytes = 0;
           this._eventType = "";
           if (data.length) {
-            const event = new MessageEvent(type || "message", {
+            const event = browserEvent(messageEventConstructor, type || "message", {
               data: data.join("\n"),
               origin: new TrustedURL(this.url)._origin,
               lastEventId: this._lastEventId,
@@ -4924,7 +4989,7 @@
             this._data = [];
             this._dataBytes = 0;
             this.close();
-            this._emit(new Event("error"));
+            this._emit(browserEvent(EventInterface, "error"));
             return;
           }
           this._data.push(value);
@@ -4957,7 +5022,7 @@
           if (newline < 0) {
             if (this._text.length > 64 * 1024) {
               this.close();
-              this._emit(new Event("error"));
+              this._emit(browserEvent(EventInterface, "error"));
             }
             return;
           }
@@ -4980,7 +5045,7 @@
         this.readyState = EventSource.CONNECTING;
         this._reconnectAt = __tilefinchRealmGlobal.__tilefinchSchedulerTime() + this._retry;
         if (!scheduleSourceReconnect(this)) deferSourceReconnect(this);
-        this._emit(new Event("error"));
+        this._emit(browserEvent(EventInterface, "error"));
       }
       close() {
         if (this._closed) return;
@@ -5017,7 +5082,7 @@
       if (!source || source._closed) return false;
       if (kind === "open") {
         source.readyState = EventSource.OPEN;
-        source._emit(new Event("open"));
+        source._emit(browserEvent(EventInterface, "open"));
       } else if (kind === "chunk") {
         source._chunk(payload);
       } else {
@@ -5141,8 +5206,10 @@
         this.readyState = WebSocket.CLOSED;
         this._queue = [];
         this.bufferedAmount = 0;
-        if (withError) this._emit(new Event("error"));
-        this._emit(new CloseEvent("close", { code, reason, wasClean }));
+        if (withError) this._emit(browserEvent(EventInterface, "error"));
+        this._emit(browserEvent(CloseEventInterface, "close", {
+          code, reason, wasClean,
+        }));
       }
       _fail(reason) {
         this._finish(1006, String(reason || ""), false, true);
@@ -5268,7 +5335,7 @@
         if (socket.readyState !== WebSocket.CONNECTING) return false;
         socket.protocol = String(detail || "");
         socket.readyState = WebSocket.OPEN;
-        socket._emit(new Event("open"));
+        socket._emit(browserEvent(EventInterface, "open"));
         socket._pump();
       } else if (kind === "text" || kind === "binary") {
         if (socket.readyState !== WebSocket.OPEN) return false;
@@ -5278,7 +5345,7 @@
         if (kind === "text") data = new TextDecoder().decode(buffer);
         else data = socket.binaryType === "arraybuffer"
           ? buffer : new Blob([buffer]);
-        socket._emit(new MessageEvent("message", {
+        socket._emit(browserEvent(messageEventConstructor, "message", {
           data,
           origin: new TrustedURL(socket.url)._origin,
           source: null,
@@ -5320,7 +5387,7 @@
       bufferedLimit = messageLimit * queueLimit,
       multiplayerDispatch = EventTarget.prototype.dispatchEvent;
     const multiplayerEvent = (type, fields = {}) => {
-      const event = new Event(type);
+      const event = browserEvent(EventInterface, type);
       for (const [name, value] of Object.entries(fields))
         Object.defineProperty(event, name, {
           value, enumerable: true, configurable: true,
@@ -5396,7 +5463,7 @@
         this.bufferedAmount = 0;
         if (withError)
           this._emit(multiplayerEvent("error", { detail: String(reason || "") }));
-        this._emit(new CloseEvent("close", {
+        this._emit(browserEvent(CloseEventInterface, "close", {
           code: Number(code) || 0,
           reason: String(reason || ""),
           wasClean: !!clean,
@@ -5497,7 +5564,7 @@
       if (kind === "open") {
         if (channel.readyState !== "connecting") return false;
         channel.readyState = "open";
-        channel._emit(new Event("open"));
+        channel._emit(browserEvent(EventInterface, "open"));
         channel._pump();
       } else if (kind === "binary" || kind === "text") {
         if (channel.readyState !== "open") return false;
@@ -5505,7 +5572,7 @@
           ? payload : new Uint8Array(payload).buffer;
         const data = kind === "text"
           ? new TextDecoder().decode(buffer) : buffer;
-        channel._emit(new MessageEvent("message", {
+        channel._emit(browserEvent(messageEventConstructor, "message", {
           data, origin: "", source: null,
         }));
       } else if (kind === "drain") {
@@ -5517,7 +5584,7 @@
         );
         if (before > channel.bufferedAmountLowThreshold
             && channel.bufferedAmount <= channel.bufferedAmountLowThreshold)
-          channel._emit(new Event("bufferedamountlow"));
+          channel._emit(browserEvent(EventInterface, "bufferedamountlow"));
         channel._pump();
       } else if (kind === "status") {
         channel._emit(multiplayerEvent("status", { detail: String(detail || "") }));
@@ -5757,7 +5824,7 @@
       xhrPrivateState(this).mimeType = String(type);
     }
     emit(type, loaded = 0, total = 0) {
-      const event = new Event(type);
+      const event = browserEvent(EventInterface, type);
       event.target = this;
       event.loaded = loaded;
       event.total = total;
@@ -6182,8 +6249,8 @@
          from the transport or from an authored redispatch. */
       const event = trustedEvent(
         type === "readystatechange"
-          ? new Event(type)
-          : new ProgressEvent(type, {
+          ? browserEvent(EventInterface, type)
+          : browserEvent(progressEventConstructor, type, {
               lengthComputable,
               loaded,
               total,
@@ -6428,7 +6495,9 @@
      still allocated only when author code first asks for each capability. */
   /* Every powerful-feature name in the Permissions Registry and the
      earlier PermissionName enum (which fingerprinting scripts still walk)
-     answers "denied": the PSP has none of these features. Other names
+     answers "denied": the PSP has none of these features, except
+     "microphone", whose state is the site's own (prompt, granted or denied:
+     src/js_media_capture.c) and changes with a "change" event. Other names
      reject with a TypeError, as the Permissions spec requires. One string,
      not a Set: it is all the realm keeps for them. */
   const platformStatusToken = {},
@@ -6443,6 +6512,14 @@ storage-access window-management ";
     batteryManager = null,
     batteryPromise = null,
     permissions = null;
+  const microphonePermission = globalThis.__tilefinchMediaCapturePermission,
+    /* The newest microphone statuses, bounded; an older one stops
+       receiving change events. */
+    microphoneStatuses = [],
+    permissionState = (name) =>
+      name === "microphone" && typeof microphonePermission === "function"
+        ? microphonePermission() : "denied";
+  delete globalThis.__tilefinchMediaCapturePermission;
   const networkInformationStates = new TrustedWeakMap(),
     permissionStatusStates = new TrustedWeakMap(),
     batteryStates = new TrustedWeakMap(),
@@ -6529,17 +6606,25 @@ storage-access window-management ";
       if (token !== platformStatusToken)
         throw new TypeError("Illegal constructor");
       super();
+      name = String(name);
       trustedWeakMapSet(permissionStatusStates, this, {
-        name: String(name),
+        name,
+        state: permissionState(name),
         onchange: null,
       });
+      if (name === "microphone") {
+        if (microphoneStatuses.length === 16) microphoneStatuses.shift();
+        microphoneStatuses.push(this);
+      }
     }
     get name() { return permissionStatusState(this).name; }
-    get state() { permissionStatusState(this); return "denied"; }
+    get state() { return permissionStatusState(this).state; }
     get onchange() { return permissionStatusState(this).onchange; }
     set onchange(value) {
-      permissionStatusState(this).onchange =
-        typeof value === "function" ? value : null;
+      const state = permissionStatusState(this);
+      if (state.onchange) this.removeEventListener("change", state.onchange);
+      state.onchange = typeof value === "function" ? value : null;
+      if (state.onchange) this.addEventListener("change", state.onchange);
     }
   }
   class Permissions {
@@ -6579,6 +6664,17 @@ storage-access window-management ";
       });
     }
   }
+  /* Native code calls this at a task boundary after a microphone decision
+     changed (captured, then deleted before author code). */
+  globalThis.__tilefinchPermissionsChanged = () => {
+    for (const status of microphoneStatuses) {
+      const state = trustedWeakMapGet(permissionStatusStates, status),
+        next = permissionState("microphone");
+      if (state.state === next) continue;
+      state.state = next;
+      status.dispatchEvent(browserEvent(EventInterface, "change"));
+    }
+  };
   for (const [constructor, tag] of [
     [NetworkInformation, "NetworkInformation"],
     [BatteryManager, "BatteryManager"],

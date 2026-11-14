@@ -2186,7 +2186,10 @@
     TestScriptPressureSeam pressure_seam = {
         .navigation = &pressure_navigation,
         .reservation = &pressure_reservation,
-        .leave_free = 256 * 1024
+        /* Room for the page's layout after both scripts are skipped. The
+           realm heap takes Budget memory in arena steps, so a few hundred
+           bootstrap bytes can move this by 4 KiB: keep a margin. */
+        .leave_free = 272 * 1024
     };
     pressure_navigation.heavy_policy_resolver = test_script_pressure_at_realm;
     pressure_navigation.heavy_policy_opaque = &pressure_seam;

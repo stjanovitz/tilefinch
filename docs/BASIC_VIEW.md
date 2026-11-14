@@ -143,10 +143,15 @@ starting even though navigation links survived. That covers:
   memory" error): the page is examined once more if it is then blank or has
   no usable action. A page that keeps its content and links after such an
   error is left alone;
-- script loading refused under memory pressure, or scripts stopped at their
-  memory limit. This uses what the current page's memory accounting
-  reports, not a site's name or its error text, and does not carry over to
-  the next page;
+- script loading refused under memory pressure while the page was being
+  built, or scripts stopped at their memory limit. This uses what the
+  current page's memory accounting reports, not a site's name or its error
+  text, and does not carry over to the next page;
+- a script refused memory after the page was shown, such as an ad script a
+  page adds once it has loaded: like the case above, the page is examined
+  once more only if it is then blank or has no usable action. A page that
+  keeps its content keeps its scripts that already ran, and the status says
+  "A large page script was skipped: not enough memory";
 - large pages, which get a shortened Basic view.
 
 Pages that are still working are given a short time to settle first, so a

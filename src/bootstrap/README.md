@@ -22,7 +22,16 @@ the device's executable and memory image.
 Generated QuickJS bytecode is stored uncompressed in read-only C arrays and
 deserialized directly with QuickJS's ROM-data mode. The arrays outlive each
 runtime, so this avoids a per-realm inflate buffer and permits QuickJS to
-reference the serialized data in place. The bytecode omits its source text,
+reference the serialized data in place. QuickJS can only execute bytecode in
+place when it has no atoms to relocate, so the generator collects every atom
+the modules name into one table (`browser_bootstrap_atom_table` in
+`../generated/js_bootstrap_bytecode.c`), pins it at the start of its own
+runtime and of every page runtime (`JS_PinAtomTable`, before anything else
+interns an atom), and writes the modules naming those atoms by index
+(`JS_WRITE_OBJ_PINNED_ATOMS`). Without it QuickJS copied each function's code
+into the realm heap to patch its atoms: about 260 KiB of the resident
+bootstrap on the device realm (measured 2026-11-14). A runtime without the
+same table refuses this bytecode rather than misreading it. The bytecode omits its source text,
 line tables, and local-variable names, because QuickJS would copy them out of
 ROM into every realm's heap on restore. Bootstrap exceptions still name the
 module and function; for line numbers, run the host with

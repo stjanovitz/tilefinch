@@ -9,8 +9,8 @@ usually cannot.
 
 This is the detailed WebGL guide. The broader, versioned contract for Canvas,
 input, audio, storage, lifecycle, offline packaging, and qualification is
-[Tilefinch Game Profile v1](GAME_PROFILE.md), with a
-[machine-readable companion](tilefinch-game-profile-v1.json).
+[Tilefinch Game Profile v1.1](GAME_PROFILE.md), with a
+[machine-readable companion](tilefinch-game-profile-v1.1.json).
 
 ## Start with the PSP-sized surface
 
@@ -36,7 +36,11 @@ if (!gl) document.body.textContent = "WebGL is unavailable";
 </script>
 ```
 
-The drawing buffer is opaque and stencil buffers are not advertised. An
+The drawing buffer is opaque and stencil buffers are not advertised. Blending
+supports `ZERO`, `ONE`, `SRC_ALPHA` and `ONE_MINUS_SRC_ALPHA` with `FUNC_ADD`;
+`blendFuncSeparate()` with different alpha factors applies the colour factors
+to all four channels, which the opaque buffer never shows. Stencil, polygon
+offset and `blendColor()` setters are accepted and have no effect. An
 explicit `antialias:true` enables a bounded edge-coverage mode rather than a
 second multisample framebuffer: the PSP GE adds hardware-smoothed line and
 eligible triangle fringes, while the host fallback uses four fixed coverage
@@ -109,12 +113,14 @@ Everything else in `main()` is either refused or reported:
 
 | Construct | Result |
 |---|---|
-| `for`, `while`, `do`, `discard`, `dFdx`/`dFdy`/`fwidth` | link fails |
+| `for`, `while`, `do`, `dFdx`/`dFdy`/`fwidth` | link fails |
+| `discard` | link fails, except an alpha test `if (color.a < uniform) discard;` that the [material mapping](#built-in-materials-from-scene-libraries) draws as the GE alpha test |
 | `if` or `?:` whose condition reads a varying, attribute, texture sample, `gl_FragCoord`, `gl_FrontFacing`, `gl_PointCoord`, a helper function, or a local derived from them | link fails: the GE cannot branch per pixel or per vertex |
 | `texture2D` in the vertex shader; `textureCube`, `texture2DProj`, `texture2DLod` | link fails (`MAX_VERTEX_TEXTURE_IMAGE_UNITS` is 0; only 2D sampling exists) |
 | two or more samplers sampled | link fails (`MAX_TEXTURE_IMAGE_UNITS` is 1) |
-| `if` or `?:` that reads only uniforms and constants | links with a warning: neither branch is evaluated |
-| other colour math (`vColor * 0.5`, `vec4(vColor.rgb, 1.0)`, `mix`, lighting, `gl_FragCoord` effects, helpers) | links with a warning naming the factor; the PSP draws the recognised factors |
+| `if` or `?:` that reads only uniforms and constants | evaluated per draw when it chooses a uniform or constant factor (`vColor * (uMode > .5 ? 1. : .25)`); otherwise links with a warning and neither branch is evaluated |
+| numeric and uniform colour factors (`vColor * 0.5`, `vec4(vColor.rgb * uTint, 1.0)`) | applied exactly, evaluated once per draw |
+| other colour math (`vColor * vColor.g`, `vColor + vec4(0.25)`, `gl_FragCoord` effects) | links with a warning naming the factor; the PSP draws the recognised factors |
 | other position math (offsets, `mat3` transforms, swizzles) | links with a warning; the PSP draws the recognised transform |
 | `gl_FragColor` or `gl_Position` written in parts or more than once | links with a warning |
 
@@ -138,17 +144,91 @@ tells the author what is missing. A game in development should treat any
 program info log as a defect: on Tilefinch, a clean log means the PSP draws
 exactly what the shader says.
 
-Source is bounded to 16 KiB per shader; a larger shader is refused and is not
-retained for `getShaderSource()`. Vertex and fragment uniform-vector limits
-are enforced independently at the values returned by `getParameter()`.
+Source is bounded to 64 KiB per shader; a larger shader is refused and is not
+retained for `getShaderSource()`. The uniform limits are WebGL 1's minimums,
+128 vertex and 16 fragment uniform vectors, counted per stage over the
+uniforms the program actually uses, as WebGL counts them, and 8 varying
+vectors pass from the vertex to the fragment shader. Uniform values are
+evaluated in JavaScript once per draw rather than held in GE registers, so
+declared but unused uniforms cost nothing.
 
 Tilefinch intentionally substitutes PSP-practical texture defaults: a new
 texture starts with `LINEAR` minification/magnification and
-`CLAMP_TO_EDGE` wrapping. Mipmaps and the WebGL completeness rules that depend
-on them are not implemented; `generateMipmap()` reports an error. Queries
-return the effective substituted state, so a page never sees a spec default
-that the GE silently ignores. Set the parameters explicitly when portable
-behavior matters.
+`CLAMP_TO_EDGE` wrapping. Mipmaps are not stored: a mipmap minification filter
+samples the base level with its base filter (`LINEAR_MIPMAP_LINEAR` acts as
+`LINEAR`), and `generateMipmap()` succeeds without building levels. Cube maps
+are not available. Queries return the effective substituted state, so a page
+never sees a spec default that the GE silently ignores. Set the parameters
+explicitly when portable behavior matters.
+
+### Built-in materials from scene libraries
+
+Scene libraries such as three.js generate long shaders for their built-in
+materials: preprocessor switches, uniform structs and arrays, helper
+functions and `inout` accumulator structs. When the shape-based check above
+cannot translate a program exactly, Tilefinch evaluates the whole of `main()`
+symbolically (helpers inlined, struct values followed field by field,
+uniform-only `if` and `?:` kept as per-draw selections) and maps what it
+finds onto GE terms:
+
+| Shader content | GE term |
+|---|---|
+| a chain of up to four `mat4` uniforms applied to the position | model-view and projection, split where the eye-space position is read |
+| uniform and numeric colour factors, one 2D texture, one vertex colour | material colour evaluated per draw, texture, vertex colour |
+| `mat3` uniform applied to the texture coordinate (`uvTransform`) | the full affine transform, applied to each vertex's texture coordinate |
+| `gl_PointSize = size * (scale / -eye.z)`, `gl_PointCoord` sampling | point sprites with attenuated size and their own texture coordinates |
+| `mix(color, fogColor, smoothstep(near, far, depth))`, exponential squared fog | GE linear fog (warned for `smoothstep` and `exp2`) |
+| `if (alpha < uniform) discard;` | GE alpha test |
+| lighting helpers in programs whose `SHADER_NAME` is `MeshLambertMaterial`, `MeshPhongMaterial`, `MeshStandardMaterial` or `MeshPhysicalMaterial` | GE per-vertex lighting: ambient, emissive, up to four directional or point lights, Blinn-Phong specular |
+| other colour math that reads only attributes, uniforms and numbers, directly or through varyings (`0.5 + 0.5 * cos(uTime + vUv.xyx * 3.0)`) | evaluated per vertex in software (on the VFPU on a PSP) and interpolated by the GE |
+
+Lighting is recognised by data flow, not by matching source text: a helper
+that reads a light uniform (a struct uniform whose type ends in `Light`,
+`ambientLightColor` or `lightProbe`) or receives a light struct becomes one
+lighting term, and the light-struct uniforms passed to it (`pointLights[0]`,
+`directionalLights[1]`, ...) name the GE lights. The material struct passed
+beside them supplies the diffuse, specular and shininess inputs. `SHADER_NAME`
+only selects the reflectance model.
+
+The approximations link with a warning:
+
+- per-pixel lighting (Phong, Standard) is evaluated per vertex;
+- physically based shading uses GE Blinn-Phong: shininess
+  `2 / roughness^4 - 2`, specular colour `mix(0.04, diffuse, metalness)`;
+- point-light range falloff `(1 - d / distance)^decay` becomes GE
+  `1 / (1 + k d)` matched at half the range;
+- spot lights draw as point lights, hemisphere lights as ambient;
+- more than four lights keep the first four;
+- `smoothstep` and `exp2` fog draw as linear fog.
+- colour math evaluated per vertex is interpolated across each triangle, so
+  a term that is not linear in its inputs (a `cos` wave, a `step` edge) is
+  only as fine as the mesh: subdivide the geometry where it matters.
+
+Per-vertex colour math is bounded. A program may use at most 32 steps (one
+per operation or built-in call), 15 constant vectors (each number, uniform and
+`mat3`/`mat4` column it reads) and 12 temporaries; a larger one is refused at
+link time with the reason. A draw may run at most 65,536 steps in all
+(vertices × instances × steps), so a 32-step program draws up to 2,048
+vertices at once; a larger draw is not drawn, sets `OUT_OF_MEMORY`, and is
+reported once per program with `console.warn`. Programs that read a texture,
+`gl_FragCoord`, `gl_PointCoord` or the lights are not evaluated per vertex.
+
+A lit program the mapping cannot represent is refused rather than drawn
+unlit, for example a light type with no GE equivalent, lighting in a program
+without a lit `SHADER_NAME`, or a second texture (normal, environment,
+light or AO maps). Custom `ShaderMaterial` programs go through the same
+checks: shapes the mapping understands draw exactly, and anything else is
+refused or warned as in the table above. Mapping happens at link time; each
+draw only evaluates the program's uniform terms into a 256-word material
+record. A program keeps that record for each of the last 16 sets of values
+of the uniforms it reads, and a draw whose values match a kept set reuses
+its record without evaluating anything: setting a uniform to the value it
+already holds, as three.js does with its light-probe array before every
+draw, keeps the record, and materials of one type that share a program
+each find their own. A program whose values are new on almost every draw,
+such as a shader driven by a time uniform, soon stops looking for a kept
+set and evaluates its terms as each draw needs them. The position matrices
+are copied into every draw.
 
 ## Design for few submissions
 
@@ -222,7 +302,10 @@ surface straight into the back buffer in 32-texel column strips, pixel-exact
 with the CPU kernel. The RAM frame is produced only when something reads it
 (screenshots, thumbnails, a fallback); WebGL readback is unaffected. Any
 other frame, and any refused or failed GE submission, keeps the exact CPU
-conversion and copy.
+conversion and copy. The presenter's sprite list and vertices (86 KiB) are
+taken from the heap by the first frame it publishes and freed once the page
+has been left and no submission can still read them; if the heap cannot
+supply them, that page's frames use the CPU conversion.
 
 The GE scale costs a fraction of the CPU conversion and copy, so authors
 benefit most from a 320×180 opaque canvas with the HUD drawn inside it: a DOM
@@ -308,6 +391,18 @@ draw-time snapshots. The native side reads possibly unaligned words with
 `memcpy` and validates every scalar and byte span again before either the host
 reference rasterizer or the GE sees it.
 
+A draw from a [mapped material](#built-in-materials-from-scene-libraries)
+carries one more record: 256 words with the model-view and projection
+matrices, ambient, emissive, specular, fog, point-size, texture-transform and
+alpha-test terms, and up to four lights. The batch sends these records as an
+optional, separately versioned wire argument only when it holds such a draw.
+The host reference rasterizer applies the GE lighting equation per vertex;
+the GE path programs the same terms with `sceGuLight`, `sceGuFog` and
+`sceGuAlphaFunc`, and draws points as screen-space sprites. Material draws
+bypass the translated-geometry cache and do not combine with instancing: an
+instanced material draw sets `INVALID_OPERATION`. A material draw with the
+normal attribute disabled lights every vertex with normal (0, 0, 1).
+
 Draw admission validates enabled-attribute spans and indexed-draw alignment,
 count, offset, highest referenced vertex, and source-buffer bounds before a
 command enters the batch, so malformed game geometry is an ordinary WebGL
@@ -323,7 +418,12 @@ context restoration, canvas changes, and the video layout's reuse of the
 EDRAM texture region clear that authority before lookup. Page-owned command,
 buffer, texture, depth, and presentation memory is charged through `Budget`,
 so a failed allocation or an oversized scene refuses the operation without
-growing a hidden heap.
+growing a hidden heap. The one fixed block outside `Budget` is the 64 KiB GE
+display list, whose size does not depend on the scene: a realm's first frame
+takes it from the heap, later frames reuse it, and it is freed when the realm
+that last rendered ends (every frame waits for the GE before returning, so the
+GE never reads it after that). If the heap cannot supply it, that flush fails
+and the context is lost, as for any other allocation failure.
 
 PSP draw translation first counts the exact bounded vertex requirement, then
 charges only that much scratch for the submission. All emitted vertices occupy

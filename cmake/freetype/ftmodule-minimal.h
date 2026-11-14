@@ -18,10 +18,9 @@
  * the raster1/sdf/svg renderers are all unnecessary and are omitted here.  With
  * them unreferenced, the linker drops their objects from every final binary.
  *
- * WOFF1 decompression is not a module: it is FreeType's internal gzip, enabled
- * through FT_CONFIG_OPTION_USE_ZLIB (system zlib is disabled via
- * FT_DISABLE_ZLIB so the bundled implementation is used on both targets).  WOFF2
- * (brotli) is deliberately excluded and rejected upstream by the backend.
+ * WOFF1 uses the browser's zlib through FT_CONFIG_OPTION_USE_ZLIB. WOFF2 uses
+ * the pinned, decode-only Brotli target and capped FreeType allocator. These
+ * container decoders are independent of the module registration below.
  */
 
 FT_USE_MODULE( FT_Module_Class,    sfnt_module_class )

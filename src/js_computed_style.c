@@ -127,28 +127,59 @@ static int computed_style_positioning_width(
 }
 
 /* A ring of resolved ancestor styles, retained for the page's lifetime:
-   64 x 348 bytes = 22 KiB on the PSP (384 bytes, 24 KiB on 64-bit hosts).
-   ChatGPT send (1251 reads) misses 590 of 5330 lookups at 64, 128 and 256
-   slots alike (594 at 48) in the same 17 ms; misses there come from
-   mutation clears, not capacity. Only a whole-document sweep (715
-   elements, three passes) gains from more (2264 -> 1914 misses, 22 ->
-   17 ms host at 256), which does not pay for 87 KiB on the PSP. A bounded
-   index now avoids scanning the replacement ring on each lookup. */
-#define COMPUTED_STYLE_CACHE_SLOTS 64u
+   128 x 348 bytes = 44 KiB on the PSP (384 bytes, 48 KiB on 64-bit hosts).
+   The Internet Archive results scroller's ResizeObserver measures about 61
+   cell wrappers twice per check, each read resolving the wrapper and its
+   cell: at 64 slots every chain was evicted before its next read. 128
+   slots cut those checks from 9.4 to 7.2 s and the edge scroll from 82.6
+   to 80.3 s in PPSSPP (peak +24 KB). ChatGPT send (1251 reads) misses 590
+   of 5330 lookups at 64, 128 and 256 slots alike; misses there come from
+   mutation clears, not capacity. A whole-document sweep (715 elements,
+   three passes) gains a little more at 256 (2264 -> 1914 misses), which
+   does not pay for 87 KiB on the PSP. A bounded index avoids scanning the
+   replacement ring on each lookup. */
+#define COMPUTED_STYLE_CACHE_SLOTS 128u
+#define COMPUTED_STYLE_CACHE_CHANCES 8u
 _Static_assert(COMPUTED_STYLE_CACHE_SLOTS <= UINT8_MAX
     && (COMPUTED_STYLE_CACHE_SLOTS & (COMPUTED_STYLE_CACHE_SLOTS - 1u)) == 0
     && sizeof(((DomBridge *) 0)->computed_style_cache.buckets)
         == COMPUTED_STYLE_CACHE_SLOTS
     && sizeof(((DomBridge *) 0)->computed_style_cache.links)
+        == COMPUTED_STYLE_CACHE_SLOTS
+    && sizeof(((DomBridge *) 0)->computed_style_cache.filled) * 8u
+        == COMPUTED_STYLE_CACHE_SLOTS
+    && sizeof(((DomBridge *) 0)->computed_style_cache.referenced) * 8u
         == COMPUTED_STYLE_CACHE_SLOTS,
     "computed-style index must match its bounded replacement ring");
 struct ComputedStyleCacheEntry {
     const lxb_dom_node_t *node;
     ComputedStyle style;
     /* computed_style_parent_key() of the parent style it was resolved
-       from, and the cache epoch it was last known valid in. */
+       from, of `style` itself (what its children are keyed by), and the
+       cache epoch it was last known valid in. */
     uint64_t parent_key;
+    uint64_t key;
     uint32_t stamp;
+};
+
+/* The geometry table (see the cache's declaration): 512 x 20 bytes =
+   10 KiB on the PSP. Internet Archive search reads the used width, height
+   and padding of about 70 elements whose ancestors number about 300 (lab
+   trace), cyclically, so the 64-entry ring cannot keep the chains; these
+   records can. A lookup probes a short window and a stale stamp counts
+   as free, so an epoch change empties the table at no cost. */
+#define COMPUTED_STYLE_GEOMETRY_SLOTS 512u
+#define COMPUTED_STYLE_GEOMETRY_PROBES 8u
+_Static_assert((COMPUTED_STYLE_GEOMETRY_SLOTS
+                & (COMPUTED_STYLE_GEOMETRY_SLOTS - 1u)) == 0,
+               "geometry slots must be a power of two");
+struct ComputedStyleGeometryRecord {
+    const lxb_dom_node_t *node;
+    StyleLength padding_left;
+    StyleLength padding_right;
+    uint32_t stamp;
+    /* Neither inline nor display: contents (a containing block). */
+    bool container;
 };
 
 /* The identity of a parent style, as the layout reuse cache keys its
@@ -177,6 +208,98 @@ static uint64_t computed_style_parent_key(const ComputedStyle *style)
     return ((uint64_t) high << 32) | low;
 }
 
+static size_t computed_style_geometry_slot(const lxb_dom_node_t *node)
+{
+    uintptr_t key = (uintptr_t) node >> 3;
+    key ^= key >> 9;
+    key ^= key >> 17;
+    return (size_t) ((uint32_t) key * UINT32_C(2654435761) >> 16)
+        & (COMPUTED_STYLE_GEOMETRY_SLOTS - 1u);
+}
+
+/* `node`'s record in the current epoch, or NULL. */
+static const struct ComputedStyleGeometryRecord *computed_style_geometry_find(
+    const DomBridge *bridge, const lxb_dom_node_t *node)
+{
+    const __typeof__(bridge->computed_style_cache) *cache =
+        &bridge->computed_style_cache;
+    if (cache->geometry == NULL) return NULL;
+    size_t slot = computed_style_geometry_slot(node);
+    for (size_t probe = 0; probe < COMPUTED_STYLE_GEOMETRY_PROBES; probe++) {
+        const struct ComputedStyleGeometryRecord *record = &cache->geometry[
+            (slot + probe) & (COMPUTED_STYLE_GEOMETRY_SLOTS - 1u)];
+        if (record->node == node)
+            return record->stamp == cache->epoch ? record : NULL;
+    }
+    return NULL;
+}
+
+/* `node`'s slot in its probe window: its own, else the first that is free
+   in this epoch, else the window's first. */
+static struct ComputedStyleGeometryRecord *computed_style_geometry_slot_for(
+    DomBridge *bridge, const lxb_dom_node_t *node)
+{
+    __typeof__(bridge->computed_style_cache) *cache =
+        &bridge->computed_style_cache;
+    if (cache->geometry == NULL) return NULL;
+    size_t slot = computed_style_geometry_slot(node);
+    struct ComputedStyleGeometryRecord *free_record = NULL;
+    for (size_t probe = 0; probe < COMPUTED_STYLE_GEOMETRY_PROBES; probe++) {
+        struct ComputedStyleGeometryRecord *record = &cache->geometry[
+            (slot + probe) & (COMPUTED_STYLE_GEOMETRY_SLOTS - 1u)];
+        if (record->node == node) return record;
+        if (free_record == NULL
+            && (record->node == NULL || record->stamp != cache->epoch))
+            free_record = record;
+    }
+    return free_record != NULL ? free_record : &cache->geometry[slot];
+}
+
+static void computed_style_geometry_store(DomBridge *bridge,
+                                          const lxb_dom_node_t *node,
+                                          const ComputedStyle *style)
+{
+    /* Optional: without the table, used-geometry reads walk the ring. The
+       first store allocates it, after the walk has settled the layout it
+       needs (a build releases it). */
+    if (bridge->computed_style_cache.geometry == NULL)
+        bridge->computed_style_cache.geometry = budget_calloc(
+            bridge->budget, COMPUTED_STYLE_GEOMETRY_SLOTS,
+            sizeof(*bridge->computed_style_cache.geometry));
+    struct ComputedStyleGeometryRecord *record =
+        computed_style_geometry_slot_for(bridge, node);
+    if (record == NULL) return;
+    record->node = node;
+    record->padding_left = style->padding.left;
+    record->padding_right = style->padding.right;
+    record->container = style->display != DISPLAY_INLINE
+        && style->display != DISPLAY_CONTENTS;
+    record->stamp = bridge->computed_style_cache.epoch;
+}
+
+static void computed_style_geometry_release(DomBridge *bridge)
+{
+    budget_free(bridge->budget, bridge->computed_style_cache.geometry);
+    bridge->computed_style_cache.geometry = NULL;
+}
+
+static void computed_style_geometry_forget(DomBridge *bridge,
+                                           const lxb_dom_node_t *node)
+{
+    __typeof__(bridge->computed_style_cache) *cache =
+        &bridge->computed_style_cache;
+    if (cache->geometry == NULL) return;
+    size_t slot = computed_style_geometry_slot(node);
+    for (size_t probe = 0; probe < COMPUTED_STYLE_GEOMETRY_PROBES; probe++) {
+        struct ComputedStyleGeometryRecord *record = &cache->geometry[
+            (slot + probe) & (COMPUTED_STYLE_GEOMETRY_SLOTS - 1u)];
+        if (record->node == node) {
+            record->node = NULL;
+            return;
+        }
+    }
+}
+
 static size_t computed_style_cache_bucket(const lxb_dom_node_t *node)
 {
     uintptr_t key = (uintptr_t) node >> 3;
@@ -203,6 +326,67 @@ static void computed_style_cache_remove(DomBridge *bridge, size_t slot)
     }
     cache->entries[slot].node = NULL;
     cache->links[slot] = 0;
+    cache->filled[slot / 8u] &= (uint8_t) ~(1u << (slot % 8u));
+    cache->referenced[slot / 8u] &= (uint8_t) ~(1u << (slot % 8u));
+}
+
+/* A read used `entry`: it earns a second chance against replacement. */
+static void computed_style_cache_touch(DomBridge *bridge,
+                                       const struct ComputedStyleCacheEntry *entry)
+{
+    __typeof__(bridge->computed_style_cache) *cache =
+        &bridge->computed_style_cache;
+    size_t slot = (size_t) (entry - cache->entries);
+    cache->referenced[slot / 8u] |= (uint8_t) (1u << (slot % 8u));
+}
+
+/* A well-mixed 32-bit permutation (MurmurHash3's finalizer). */
+static uint32_t computed_style_cache_mix(uint32_t x)
+{
+    x ^= x >> 16;
+    x *= UINT32_C(0x85ebca6b);
+    x ^= x >> 13;
+    x *= UINT32_C(0xc2b2ae35);
+    x ^= x >> 16;
+    return x;
+}
+
+/* The slot a new style takes: a vacant one, else a pseudo-random slot
+   whose style was not used since it was stored or last passed over (at
+   most COMPUTED_STYLE_CACHE_CHANCES candidates; the last is taken
+   regardless). Scoped drops and node removals vacate slots anywhere;
+   evicting a live style while one is free costs a recomputation the next
+   time that style is read. Replacing in order (FIFO, or LRU) loses every
+   style of a read cycle longer than the ring: archive.org's scroller
+   reads its cells' chains in cycles of 150-500 styles, so each style was
+   evicted just before its next read. A random victim keeps a share of
+   any cycle, and the second chance keeps styles that reads keep using
+   beside one-off reads (a fixed toolbar beside a scrolled list). The
+   draw is a fixed sequence, so runs repeat exactly. */
+static size_t computed_style_cache_victim(DomBridge *bridge)
+{
+    __typeof__(bridge->computed_style_cache) *cache =
+        &bridge->computed_style_cache;
+    for (size_t byte = 0; byte < sizeof(cache->filled); byte++) {
+        unsigned vacant = ~(unsigned) cache->filled[byte] & 0xffu;
+        if (vacant == 0) continue;
+        size_t bit = 0;
+        while ((vacant & 1u) == 0) {
+            vacant >>= 1;
+            bit++;
+        }
+        return byte * 8u + bit;
+    }
+    size_t slot = 0;
+    for (unsigned chance = 0; chance < COMPUTED_STYLE_CACHE_CHANCES;
+         chance++) {
+        slot = computed_style_cache_mix((uint32_t) cache->next++)
+               & (COMPUTED_STYLE_CACHE_SLOTS - 1u);
+        uint8_t bit = (uint8_t) (1u << (slot % 8u));
+        if ((cache->referenced[slot / 8u] & bit) == 0) break;
+        cache->referenced[slot / 8u] &= (uint8_t) ~bit;
+    }
+    return slot;
 }
 
 /* The ancestor cache for this read, emptied when any cascade input moved
@@ -268,6 +452,80 @@ static void bridge_computed_style_custom_keys(
     }
 }
 
+/* What the flags below read off one selector, in one pass instead of a
+   substring search per feature: they run over every rule of a sheet, once
+   per sheet generation (a large news sheet holds 16,000 rules). Each bit
+   is set exactly when the substring search it replaces would match; zero
+   when the selector holds none of ':', '+' and '~'. */
+enum {
+    COMPUTED_STYLE_SELECTOR_HAS = 1u << 0,        /* ":has(" */
+    COMPUTED_STYLE_SELECTOR_ESCAPE = 1u << 1,     /* '\\' */
+    COMPUTED_STYLE_SELECTOR_FOCUS = 1u << 2,      /* ":focus" */
+    COMPUTED_STYLE_SELECTOR_EMPTY = 1u << 3,      /* ":empty", ":blank" */
+    /* '+', '~' or " of ": a sibling test (a '+' inside an An+B argument
+       counts too: conservative). */
+    COMPUTED_STYLE_SELECTOR_SIBLING = 1u << 4,
+    /* ":nth-", ":first-", ":last-", ":only-" */
+    COMPUTED_STYLE_SELECTOR_POSITIONAL = 1u << 5,
+    COMPUTED_STYLE_SELECTOR_STRUCTURE = COMPUTED_STYLE_SELECTOR_EMPTY
+        | COMPUTED_STYLE_SELECTOR_SIBLING
+        | COMPUTED_STYLE_SELECTOR_POSITIONAL
+};
+
+static unsigned computed_style_selector_features(const char *selector)
+{
+    if (selector == NULL) return 0;
+    unsigned bits = 0;
+    bool marked = false;
+    for (const char *at = selector; *at != '\0'; at++) {
+        switch (*at) {
+        case ':':
+            marked = true;
+            if (strncmp(at, ":has(", 5) == 0)
+                bits |= COMPUTED_STYLE_SELECTOR_HAS;
+            else if (strncmp(at, ":focus", 6) == 0)
+                bits |= COMPUTED_STYLE_SELECTOR_FOCUS;
+            else if (strncmp(at, ":empty", 6) == 0
+                     || strncmp(at, ":blank", 6) == 0)
+                bits |= COMPUTED_STYLE_SELECTOR_EMPTY;
+            else if (strncmp(at, ":nth-", 5) == 0
+                     || strncmp(at, ":first-", 7) == 0
+                     || strncmp(at, ":last-", 6) == 0
+                     || strncmp(at, ":only-", 6) == 0)
+                bits |= COMPUTED_STYLE_SELECTOR_POSITIONAL;
+            break;
+        case '+':
+        case '~':
+            marked = true;
+            bits |= COMPUTED_STYLE_SELECTOR_SIBLING;
+            break;
+        case '\\':
+            bits |= COMPUTED_STYLE_SELECTOR_ESCAPE;
+            break;
+        case ' ':
+            if (strncmp(at, " of ", 4) == 0)
+                bits |= COMPUTED_STYLE_SELECTOR_SIBLING;
+            break;
+        default:
+            break;
+        }
+    }
+    return marked ? bits : 0;
+}
+
+static const char *computed_style_rule_selector(const Stylesheet *sheet,
+                                                size_t pass, size_t i)
+{
+    return pass == 0 ? sheet->rules[i].selector
+                     : sheet->custom_rules[i].selector;
+}
+
+/* The sheet's selector dependencies that decide whether a change can be
+   scoped at all, for its current generation. The keys that bound a scope
+   (bridge_computed_style_keys) cost several times more and are built only
+   when a change reaches a structural test: most changes stop at these
+   flags (no retained style within reach, or a :has() sheet whose escaped
+   selectors keep every relational change conservative). */
 static void bridge_computed_style_flags(DomBridge *bridge)
 {
     __typeof__(bridge->computed_style_cache) *cache =
@@ -277,50 +535,70 @@ static void bridge_computed_style_flags(DomBridge *bridge)
         && cache->flags_generation == sheet->build_generation) return;
     cache->flags_sheet = sheet;
     cache->flags_generation = sheet->build_generation;
+    cache->flag_scans++;
     cache->flags_has = cache->flags_structure = cache->flags_focus = false;
     cache->flags_sibling = cache->flags_empty_sibling = false;
-    cache->empty_key_count = 0;
-    cache->empty_any = false;
     cache->flags_custom_has = cache->flags_has_escaped = false;
-    cache->custom_sibling_key_count = cache->custom_structure_key_count = 0;
-    cache->custom_sibling_any = cache->custom_structure_any = false;
-    memset(&cache->structure, 0, sizeof(cache->structure));
-    memset(&cache->sibling_structure, 0, sizeof(cache->sibling_structure));
     for (size_t pass = 0; pass < 2; pass++) {
         size_t count = pass == 0 ? sheet->count : sheet->custom_rule_count;
         for (size_t i = 0; i < count; i++) {
-            const char *selector = pass == 0 ? sheet->rules[i].selector
-                                             : sheet->custom_rules[i].selector;
-            if (selector == NULL || strpbrk(selector, ":+~") == NULL)
-                continue;
-            if (strstr(selector, ":has(") != NULL) {
+            unsigned bits = computed_style_selector_features(
+                computed_style_rule_selector(sheet, pass, i));
+            if (bits == 0) continue;
+            if ((bits & COMPUTED_STYLE_SELECTOR_HAS) != 0) {
                 cache->flags_has = true;
                 if (pass == 1) cache->flags_custom_has = true;
                 /* The :has() classifier compares attribute names as
                    written; an escaped selector keeps every change
                    conservative. */
-                if (strchr(selector, '\\') != NULL)
+                if ((bits & COMPUTED_STYLE_SELECTOR_ESCAPE) != 0)
                     cache->flags_has_escaped = true;
             }
-            if (strstr(selector, ":focus") != NULL) cache->flags_focus = true;
-            bool empty = strstr(selector, ":empty") != NULL
-                || strstr(selector, ":blank") != NULL;
-            bool sibling = strchr(selector, '+') != NULL
-                || strchr(selector, '~') != NULL
-                || strstr(selector, " of ") != NULL;
-            bool structure = sibling || empty
-                || strstr(selector, ":nth-") != NULL
-                || strstr(selector, ":first-") != NULL
-                || strstr(selector, ":last-") != NULL
-                || strstr(selector, ":only-") != NULL;
-            if (!structure) continue;
+            if ((bits & COMPUTED_STYLE_SELECTOR_FOCUS) != 0)
+                cache->flags_focus = true;
+            if ((bits & COMPUTED_STYLE_SELECTOR_STRUCTURE) == 0) continue;
             cache->flags_structure = true;
+            if ((bits & COMPUTED_STYLE_SELECTOR_SIBLING) != 0) {
+                cache->flags_sibling = true;
+                if ((bits & COMPUTED_STYLE_SELECTOR_EMPTY) != 0)
+                    cache->flags_empty_sibling = true;
+            }
+        }
+    }
+}
+
+/* The keys bounding a structural change's scope, for the generation the
+   flags were computed for (call bridge_computed_style_flags first): only
+   rules holding a structural test contribute. */
+static void bridge_computed_style_keys(DomBridge *bridge)
+{
+    __typeof__(bridge->computed_style_cache) *cache =
+        &bridge->computed_style_cache;
+    const Stylesheet *sheet = bridge->stylesheet;
+    if (cache->keys_sheet == (const void *) sheet
+        && cache->keys_generation == sheet->build_generation) return;
+    cache->keys_sheet = sheet;
+    cache->keys_generation = sheet->build_generation;
+    cache->key_scans++;
+    cache->empty_key_count = 0;
+    cache->empty_any = false;
+    cache->custom_sibling_key_count = cache->custom_structure_key_count = 0;
+    cache->custom_sibling_any = cache->custom_structure_any = false;
+    memset(&cache->structure, 0, sizeof(cache->structure));
+    memset(&cache->sibling_structure, 0, sizeof(cache->sibling_structure));
+    if (!cache->flags_structure) return;
+    for (size_t pass = 0; pass < 2; pass++) {
+        size_t count = pass == 0 ? sheet->count : sheet->custom_rule_count;
+        for (size_t i = 0; i < count; i++) {
+            const char *selector = computed_style_rule_selector(sheet, pass, i);
+            unsigned bits = computed_style_selector_features(selector);
+            if ((bits & COMPUTED_STYLE_SELECTOR_STRUCTURE) == 0) continue;
+            bool sibling = (bits & COMPUTED_STYLE_SELECTOR_SIBLING) != 0;
+            size_t length = strlen(selector);
             /* An element's :empty can restyle outside its own subtree only
                through a sibling test (layout_reuse_empty_reaches_siblings):
                keyed by the compound that tests it. */
-            if (empty && sibling) {
-                cache->flags_empty_sibling = true;
-                size_t length = strlen(selector);
+            if (sibling && (bits & COMPUTED_STYLE_SELECTOR_EMPTY) != 0) {
                 for (const char *at = selector; !cache->empty_any
                      && (at = strpbrk(at, ":")) != NULL; at++) {
                     if (strncmp(at, ":empty", 6) != 0
@@ -333,15 +611,12 @@ static void bridge_computed_style_flags(DomBridge *bridge)
                 }
             }
             /* As the layout reuse cache notes them
-               (layout_reuse_note_selector_dependencies). A '+' inside an
-               An+B argument counts too: conservative. */
-            style_selector_structure_keys(selector, strlen(selector),
+               (layout_reuse_note_selector_dependencies). */
+            style_selector_structure_keys(selector, length,
                                           &cache->structure);
-            if (sibling) {
-                cache->flags_sibling = true;
-                style_selector_structure_keys(selector, strlen(selector),
+            if (sibling)
+                style_selector_structure_keys(selector, length,
                                               &cache->sibling_structure);
-            }
             if (pass == 1) {
                 bridge_computed_style_custom_keys(
                     selector, false, cache->custom_structure_keys,
@@ -450,8 +725,10 @@ static bool bridge_computed_style_siblings(DomBridge *bridge,
 {
     __typeof__(bridge->computed_style_cache) *cache =
         &bridge->computed_style_cache;
-    if (parent == NULL || parent->type != LXB_DOM_NODE_TYPE_ELEMENT
-        || bridge_computed_style_structure_deep(
+    if (parent == NULL || parent->type != LXB_DOM_NODE_TYPE_ELEMENT)
+        return false;
+    bridge_computed_style_keys(bridge);
+    if (bridge_computed_style_structure_deep(
                tree ? &cache->structure : &cache->sibling_structure, parent))
         return false;
     bool custom_any = tree ? cache->custom_structure_any
@@ -490,6 +767,11 @@ void js_rt_bridge_computed_style_note_mutation(
 {
     __typeof__(bridge->computed_style_cache) *cache =
         &bridge->computed_style_cache;
+    /* The content generation this mutation moved advances the epoch at the
+       next read, which empties every geometry record; releasing the table
+       now keeps its 10 KiB out of the layout the mutation leads to (that
+       build is where a page's memory peaks). The next walk allocates it. */
+    computed_style_geometry_release(bridge);
     if (cache->entries == NULL || cache->dirty_all) return;
     if (bridge->stylesheet == NULL || node == NULL) {
         cache->dirty_all = true;
@@ -503,13 +785,25 @@ void js_rt_bridge_computed_style_note_mutation(
                                                 ? NULL
                                                 : bridge->document->html))
         return;
-    bridge_computed_style_flags(bridge);
     /* A change inside a shadow tree can change which of the host's light
-       children render (shadow composition): those are outside its scope. */
-    if (bridge->shadow_root_count != 0
-        && document_shadow_carrier_containing(node) != NULL) {
-        cache->dirty_all = true;
-        return;
+       children render and match ::slotted (shadow composition): those are
+       outside the change's own scope but inside the host's subtree, which
+       also holds what they pass on by inheritance (a retained style is
+       resolved from its DOM parent's). Composition is decided per host:
+       style_for_node tests a light child against its own host's carrier
+       only, and a slot search does not enter nested carriers, so the
+       nearest host bounds it. The scopes below still apply on top, for
+       what the change does as an ordinary DOM change. */
+    if (bridge->shadow_root_count != 0) {
+        lxb_dom_node_t *carrier = document_shadow_carrier_containing(node);
+        lxb_dom_node_t *host = carrier == NULL ? NULL : carrier->parent;
+        if (carrier != NULL
+            && (host == NULL || host->type != LXB_DOM_NODE_TYPE_ELEMENT
+                || (bridge_computed_style_cached_within(bridge, host)
+                    && !bridge_computed_style_scope(bridge, host)))) {
+            cache->dirty_all = true;
+            return;
+        }
     }
     bool known = kind == SCRIPT_MUTATION_ATTRIBUTE
         || kind == SCRIPT_MUTATION_INLINE_STYLE
@@ -530,18 +824,25 @@ void js_rt_bridge_computed_style_note_mutation(
         && !stylesheet_selectors_reference_attribute_prefix(
                bridge->stylesheet, attribute, attribute_length))
         return;
-    if (!known || (engine_state && cache->flags_focus)) {
+    if (!known) {
         cache->dirty_all = true;
         return;
     }
     bool tree = kind == SCRIPT_MUTATION_TEXT
         || kind == SCRIPT_MUTATION_CHILD_LIST
         || kind == SCRIPT_MUTATION_INNER_HTML;
-    /* Nothing retained, nothing to drop. */
+    /* Nothing retained, nothing to drop. Checked before the sheet's
+       selector dependencies are consulted: building them scans every rule
+       of a new sheet generation, which no decision here then reads. */
     bool retained = false;
     for (size_t i = 0; !retained && i < COMPUTED_STYLE_CACHE_SLOTS; i++)
         retained = cache->entries[i].node != NULL;
     if (!retained) return;
+    bridge_computed_style_flags(bridge);
+    if (engine_state && cache->flags_focus) {
+        cache->dirty_all = true;
+        return;
+    }
     /* A change a :has() rule may observe drops the elements whose answers
        can move, found from the changed position as layout's reuse cache
        finds them (style_has_invalidation.c), rather than every style. */
@@ -590,11 +891,14 @@ void js_rt_bridge_computed_style_note_mutation(
     /* A child list or text change can flip the parent's :empty, which a
        sibling test turns into its siblings' styles: the grandparent's
        subtree. */
-    bool empty_reaches = tree && cache->flags_empty_sibling && parent != NULL
-        && parent->type == LXB_DOM_NODE_TYPE_ELEMENT
-        && (cache->empty_any
-            || style_element_carries_any_key_unsorted(parent, cache->empty_keys,
-                                             cache->empty_key_count));
+    bool empty_reaches = false;
+    if (tree && cache->flags_empty_sibling && parent != NULL
+        && parent->type == LXB_DOM_NODE_TYPE_ELEMENT) {
+        bridge_computed_style_keys(bridge);
+        empty_reaches = cache->empty_any
+            || style_element_carries_any_key_unsorted(
+                   parent, cache->empty_keys, cache->empty_key_count);
+    }
     if (empty_reaches) {
         scope = parent->parent != NULL ? parent->parent : parent;
     } else if (kind == SCRIPT_MUTATION_CHILD_LIST
@@ -692,6 +996,7 @@ static void bridge_computed_style_node_removed(void *opaque,
     __typeof__(bridge->computed_style_cache) *cache =
         &bridge->computed_style_cache;
     if (cache->entries == NULL) return;
+    computed_style_geometry_forget(bridge, node);
     /* Queued drops must not name a node whose address can be reused. */
     style_has_pending_retire(&cache->has_pending, node);
     for (size_t i = 0; i < cache->shallow_count; i++) {
@@ -736,8 +1041,9 @@ static struct ComputedStyleCacheEntry *bridge_computed_style_cache(
     bool same_inputs = computed_style_inputs_hold(bridge, &cache->inputs);
     if (cache->has_active && cache->has_pending.styles_all)
         cache->dirty_all = true;
-    if (same_inputs && cache->content_generation != content_generation
-        && !cache->dirty_all) {
+    bool moved = cache->content_generation != content_generation
+        || cache->drops_pending;
+    if (same_inputs && moved && !cache->dirty_all) {
         /* Only the mutated subtrees' styles can have changed, and the own
            styles of the elements queued alone: their descendants are
            checked against their parents' styles when next read. Keyed
@@ -776,11 +1082,13 @@ static struct ComputedStyleCacheEntry *bridge_computed_style_cache(
         cache->has_active = false;
         memset(&cache->has_pending, 0, sizeof(cache->has_pending));
         cache->content_generation = content_generation;
+        cache->drops_pending = false;
         cache->scoped_clears++;
         cache->epoch++;
         style_variable_cache_lease_clear(&cache->variables);
     }
-    if (!same_inputs || cache->content_generation != content_generation) {
+    if (!same_inputs || cache->content_generation != content_generation
+        || cache->drops_pending) {
         if (cache->inputs.sheet != NULL
             && cache->inputs.host_generation != document_style_generation())
             cache->host_clears++;
@@ -791,16 +1099,65 @@ static struct ComputedStyleCacheEntry *bridge_computed_style_cache(
         memset(&cache->has_pending, 0, sizeof(cache->has_pending));
         cache->epoch++;
         cache->dirty_all = false;
+        cache->drops_pending = false;
         style_variable_cache_lease_clear(&cache->variables);
         for (size_t i = 0; i < COMPUTED_STYLE_CACHE_SLOTS; i++)
             cache->entries[i].node = NULL;
         memset(cache->buckets, 0, sizeof(cache->buckets));
         memset(cache->links, 0, sizeof(cache->links));
+        memset(cache->filled, 0, sizeof(cache->filled));
+        memset(cache->referenced, 0, sizeof(cache->referenced));
         computed_style_inputs_capture(bridge, &cache->inputs);
         cache->content_generation = content_generation;
         cache->next = 0;
     }
     return cache->entries;
+}
+
+bool js_rt_bridge_computed_style_drop_within(DomBridge *bridge,
+                                             lxb_dom_node_t *const *roots,
+                                             size_t count)
+{
+    if (bridge == NULL) return false;
+    __typeof__(bridge->computed_style_cache) *cache =
+        &bridge->computed_style_cache;
+    if (cache->scope_reports != UINT8_MAX) cache->scope_reports++;
+    /* The memo is not keyed by anything a scoped change moves. */
+    bridge->computed_style_memo.node = NULL;
+    bridge->transition_ancestors_memo.parent = NULL;
+    computed_style_geometry_release(bridge);
+    bool scoped = roots != NULL;
+    for (size_t i = 0; scoped && i < count; i++)
+        scoped = roots[i] != NULL
+            && (cache->entries == NULL || cache->dirty_all
+                || !bridge_computed_style_cached_within(bridge, roots[i])
+                || bridge_computed_style_scope(bridge, roots[i]));
+    if (!scoped) {
+        cache->scope_whole = true;
+        cache->dirty_all = true;
+    }
+    /* Applied at the next read even if the DOM content did not move. */
+    cache->drops_pending = true;
+    return scoped;
+}
+
+void js_rt_bridge_computed_style_host_described(DomBridge *bridge,
+                                                uint64_t before)
+{
+    if (bridge == NULL) return;
+    __typeof__(bridge->computed_style_cache) *cache =
+        &bridge->computed_style_cache;
+    uint64_t after = document_style_generation();
+    /* The queued drops were made against these inputs (as in the
+       mutation note); anything else empties the ring at the next read. */
+    if (cache->entries == NULL || cache->dirty_all
+        || cache->inputs.host_generation != before
+        || cache->inputs.sheet != (const void *) bridge->stylesheet
+        || cache->inputs.dom != (const void *) (bridge->document == NULL
+                                                ? NULL
+                                                : bridge->document->html))
+        return;
+    cache->inputs.host_generation = after;
 }
 
 void js_rt_bridge_computed_style_cache_free(DomBridge *bridge)
@@ -813,8 +1170,19 @@ void js_rt_bridge_computed_style_cache_free(DomBridge *bridge)
     style_variable_cache_lease_release(&bridge->computed_style_cache.variables);
     budget_free(bridge->budget, bridge->computed_style_cache.entries);
     bridge->computed_style_cache.entries = NULL;
+    computed_style_geometry_release(bridge);
     bridge->computed_style_memo.node = NULL;
     bridge->transition_ancestors_memo.parent = NULL;
+}
+
+/* The records serve the reads between one layout and the next within a
+   task (a page reads the sizes of many elements in one callback; on the
+   pages measured every task that reads also mutates, which empties them).
+   A page's memory peaks in a layout build or at its idle end state, which
+   a retained table would raise by its 10 KiB. */
+void js_rt_bridge_computed_style_release_records(DomBridge *bridge)
+{
+    if (bridge != NULL) computed_style_geometry_release(bridge);
 }
 
 bool js_rt_bridge_computed_style_cache_holds(const DomBridge *bridge,
@@ -834,6 +1202,9 @@ size_t js_rt_bridge_computed_style_cache_bytes(const DomBridge *bridge)
     return (bridge->computed_style_cache.entries == NULL ? 0
             : COMPUTED_STYLE_CACHE_SLOTS
                 * sizeof(*bridge->computed_style_cache.entries))
+        + (bridge->computed_style_cache.geometry == NULL ? 0
+            : COMPUTED_STYLE_GEOMETRY_SLOTS
+                * sizeof(*bridge->computed_style_cache.geometry))
         + style_variable_cache_lease_bytes(
             &bridge->computed_style_cache.variables);
 }
@@ -854,6 +1225,60 @@ static struct ComputedStyleCacheEntry *computed_style_cache_find(
     return NULL;
 }
 
+/* The containing-block widths a used-geometry read needs (see the walk in
+   bridge_computed_style), from `node`'s style valid in this epoch and its
+   ancestors' geometry records, with the same arithmetic as the walk. False
+   when an ancestor with a box has no current record. */
+static bool bridge_computed_style_record_geometry(
+    DomBridge *bridge, lxb_dom_node_t *const *ancestors, size_t count,
+    const ComputedStyle *style, int *containing_width, int *content_width)
+{
+    const LayoutDocument *settled = js_rt_bridge_layout(bridge);
+    int flow_width = settled == NULL ? 0 : settled->width;
+    /* The walk resolves the top of the chain first: look every record up
+       before anything is written back. */
+    const struct ComputedStyleGeometryRecord *records[64];
+    for (size_t at = count; at-- > 1;) {
+        records[at] = NULL;
+        if (settled == NULL
+            || layout_box_for_node(settled, ancestors[at]) == NULL) continue;
+        records[at] = computed_style_geometry_find(bridge, ancestors[at]);
+        if (records[at] == NULL) return false;
+    }
+    while (count != 0) {
+        lxb_dom_node_t *at = ancestors[--count];
+        /* As the walk's hit does: units resolve against this element's
+           containers. */
+        style_container_units_for_node((Stylesheet *) bridge->stylesheet, at);
+        if (settled == NULL) continue;
+        const LayoutNodeBox *box = layout_box_for_node(settled, at);
+        bool leaf = count == 0;
+        bool container = leaf
+            ? style->display != DISPLAY_INLINE
+                && style->display != DISPLAY_CONTENTS
+            : box != NULL && records[count]->container;
+        StyleLength padding_left = leaf ? style->padding.left
+            : box != NULL ? records[count]->padding_left : 0;
+        StyleLength padding_right = leaf ? style->padding.right
+            : box != NULL ? records[count]->padding_right : 0;
+        int basis = computed_style_positioning_width(
+            bridge, at, box, flow_width);
+        *containing_width = basis;
+        if (box != NULL && (container || leaf)) {
+            int left = 0, right = 0;
+            (void) style_length_resolve(bridge->stylesheet,
+                padding_left, basis, &left);
+            (void) style_length_resolve(bridge->stylesheet,
+                padding_right, basis, &right);
+            int64_t width = (int64_t) box->client_width
+                - (left > 0 ? left : 0) - (right > 0 ? right : 0);
+            flow_width = width > 0 ? (int) width : 0;
+        }
+        *content_width = flow_width;
+    }
+    return true;
+}
+
 static bool bridge_computed_style(DomBridge *bridge,
                                   lxb_dom_node_t *node, ComputedStyle *result,
                                   int *containing_width, int *content_width)
@@ -865,6 +1290,7 @@ static bool bridge_computed_style(DomBridge *bridge,
         const struct ComputedStyleCacheEntry *hit =
             computed_style_cache_find(bridge, node);
         if (hit != NULL && hit->stamp == epoch) {
+            computed_style_cache_touch(bridge, hit);
             *result = hit->style;
             /* A hit skips style_for_node's per-node unit basis setup.
                Inline units may exist without the authored-sheet flag. */
@@ -876,11 +1302,41 @@ static bool bridge_computed_style(DomBridge *bridge,
     }
     lxb_dom_node_t *ancestors[64];
     size_t count = 0;
-    for (lxb_dom_node_t *at = node; at != NULL && count < 64;
-         at = at->parent) {
-        if (at->type == LXB_DOM_NODE_TYPE_ELEMENT) ancestors[count++] = at;
+    lxb_dom_node_t *above = node;
+    for (; above != NULL && count < 64; above = above->parent) {
+        if (above->type == LXB_DOM_NODE_TYPE_ELEMENT) ancestors[count++] = above;
+    }
+    /* A chain the bound cut resolves its top without a parent style. */
+    while (above != NULL && above->type != LXB_DOM_NODE_TYPE_ELEMENT)
+        above = above->parent;
+    __typeof__(bridge->computed_style_cache) *state =
+        &bridge->computed_style_cache;
+    if (above != NULL) state->geometry_off = true;
+    bool records = cache != NULL && !state->geometry_off;
+    /* A used-geometry read of an element whose style is valid in this
+       epoch needs its ancestors only for their padding and whether they
+       are containing blocks: the geometry records hold exactly that. With
+       container states recorded, the walk's padding units can depend on
+       which ancestors it had to resolve (style_for_node restores the unit
+       basis it found), so such a page keeps the walk. */
+    if (records && containing_width != NULL
+        && !style_container_layout_state_present(bridge->stylesheet)) {
+        const struct ComputedStyleCacheEntry *hit =
+            computed_style_cache_find(bridge, node);
+        if (hit != NULL && hit->stamp == epoch
+            && bridge_computed_style_record_geometry(
+                   bridge, ancestors, count, &hit->style,
+                   containing_width, content_width)) {
+            computed_style_cache_touch(bridge, hit);
+            *result = hit->style;
+            state->hits++;
+            state->geometry_hits++;
+            return true;
+        }
     }
     ComputedStyle computed = {0};
+    /* computed_style_parent_key(&computed), while have_parent. */
+    uint64_t computed_key = 0;
     bool have_parent = false;
     const LayoutDocument *settled = js_rt_bridge_layout(bridge);
     int flow_width = settled == NULL ? 0 : settled->width;
@@ -888,8 +1344,6 @@ static bool bridge_computed_style(DomBridge *bridge,
        ancestor chain. A layout build memoizes them per build; this keeps
        them across reads under the cache's validity (see above). Lending
        allocates nothing: the first var() lookup creates the table. */
-    __typeof__(bridge->computed_style_cache) *state =
-        &bridge->computed_style_cache;
     state->variables.budget = bridge->budget;
     bool variable_cache = cache != NULL && style_variable_cache_attach(
         (Stylesheet *) bridge->stylesheet, &state->variables);
@@ -900,7 +1354,9 @@ static bool bridge_computed_style(DomBridge *bridge,
             const struct ComputedStyleCacheEntry *hit =
                 computed_style_cache_find(bridge, ancestors[at]);
             if (hit == NULL || hit->stamp != epoch) continue;
+            computed_style_cache_touch(bridge, hit);
             computed = hit->style;
+            computed_key = hit->key;
             have_parent = true;
             bridge->computed_style_cache.hits++;
             count = at;
@@ -914,11 +1370,13 @@ static bool bridge_computed_style(DomBridge *bridge,
         /* An entry from an earlier epoch still holds when the parent
            style it was resolved from is the parent's current style: its
            own inputs are unchanged unless a drop removed it. */
-        uint64_t parent_key = cache == NULL ? 0
-            : computed_style_parent_key(have_parent ? &computed : NULL);
+        uint64_t parent_key = cache == NULL ? 0 : have_parent ? computed_key
+            : computed_style_parent_key(NULL);
         if (hit != NULL
             && (hit->stamp == epoch || hit->parent_key == parent_key)) {
+            computed_style_cache_touch(bridge, hit);
             computed = hit->style;
+            computed_key = hit->key;
             hit->stamp = epoch;
             style_container_units_for_node(
                 (Stylesheet *) bridge->stylesheet, at);
@@ -939,25 +1397,29 @@ static bool bridge_computed_style(DomBridge *bridge,
             computed = style_for_node(bridge->stylesheet, at,
                                       have_parent ? &computed : NULL);
             bridge->computed_style_cache.misses++;
+            if (cache != NULL) computed_key = computed_style_parent_key(&computed);
             if (hit != NULL) {
                 /* A stale entry is refreshed in place. */
+                computed_style_cache_touch(bridge, hit);
                 hit->style = computed;
                 hit->parent_key = parent_key;
+                hit->key = computed_key;
                 hit->stamp = epoch;
             } else if (cache != NULL) {
-                __typeof__(bridge->computed_style_cache) *state =
-                    &bridge->computed_style_cache;
-                computed_style_cache_remove(bridge, state->next);
-                cache[state->next].node = at;
-                cache[state->next].style = computed;
-                cache[state->next].parent_key = parent_key;
-                cache[state->next].stamp = epoch;
+                size_t slot = computed_style_cache_victim(bridge);
+                computed_style_cache_remove(bridge, slot);
+                cache[slot].node = at;
+                cache[slot].style = computed;
+                cache[slot].parent_key = parent_key;
+                cache[slot].key = computed_key;
+                cache[slot].stamp = epoch;
                 size_t bucket = computed_style_cache_bucket(at);
-                state->links[state->next] = state->buckets[bucket];
-                state->buckets[bucket] = (uint8_t) (state->next + 1u);
-                state->next = (state->next + 1u) % COMPUTED_STYLE_CACHE_SLOTS;
+                state->links[slot] = state->buckets[bucket];
+                state->buckets[bucket] = (uint8_t) (slot + 1u);
+                state->filled[slot / 8u] |= (uint8_t) (1u << (slot % 8u));
             }
         }
+        if (records) computed_style_geometry_store(bridge, at, &computed);
         have_parent = true;
         /* Only geometry readers need this work. Resolve each ancestor's
            padding while its cascade is already in hand; cancellation stays
@@ -2151,21 +2613,24 @@ static bool computed_style_resolve(JSContext *context, DomBridge *bridge,
     bool used_geometry_property = (property_flags & CSP_USED_GEOMETRY) != 0;
     /* Hydration often toggles a class and immediately asks whether a node
        is visible. These values resolve from the current DOM/cascade without
-       rebuilding geometry. A geometry-only callback cannot install pending
-       stylesheets, so such reads need no scratch flow even during resource
-       changes. Other host callbacks can refresh the cascade and retain the
-       conservative path, as do container-dependent rules.
+       rebuilding geometry. A geometry-only callback does not install
+       pending stylesheets (a pending sheet change was installed above, by
+       js_rt_bridge_settle_pending_sheets, when it could be), so such reads
+       need no scratch flow even during resource changes. Other host
+       callbacks can refresh the cascade and retain the conservative path,
+       as do container-dependent rules.
        Container-relative units may exist only in style attributes; the
        last layout's collected container state reveals those too. */
     bool independent_style_property = (property_flags & CSP_STYLE_ONLY) != 0;
+    const ScriptMutationJournal *journal = bridge->mutations;
     bool geometry_independent = !stylesheet_has_container_queries(bridge->stylesheet)
         && !style_container_layout_state_present(bridge->stylesheet);
     bool style_only = independent_style_property
         && (bridge->synchronous_layout_geometry_only
-            || (bridge->mutations.count != 0
-                && !bridge->mutations.overflowed
-                && !bridge->mutations.resource_rebuild_required
-                && !bridge->mutations.conservative_resource_scan))
+            || (journal != NULL && journal->count != 0
+                && !journal->overflowed
+                && !journal->resource_rebuild_required
+                && !journal->conservative_resource_scan))
         && geometry_independent;
     /* Transitions and the watcher's snapshots need the cascade, not
        geometry: only a stylesheet change waiting to be applied forces the
@@ -2174,9 +2639,11 @@ static bool computed_style_resolve(JSContext *context, DomBridge *bridge,
         || bridge->computed_style_without_layout;
     bool sheet_stale = bridge->relayout_dirty != NULL
         && *bridge->relayout_dirty
-        && (bridge->mutations.overflowed
-            || bridge->mutations.resource_rebuild_required
-            || bridge->mutations.conservative_resource_scan);
+        && (bridge->mutations_unrecorded
+            || (journal != NULL
+                && (journal->overflowed
+                    || journal->resource_rebuild_required
+                    || journal->conservative_resource_scan)));
     /* Overflow can request a later whole-page resource audit, but a
        geometry-only callback cannot install those sources. Rebuilding the
        same scratch flow for every transition property cannot freshen the
@@ -3880,13 +4347,7 @@ static bool rendered_text_skipped(lxb_dom_node_t *node)
     return false;
 }
 
-static bool rendered_text_name_is(lxb_dom_node_t *node, const char *wanted)
-{
-    size_t length = 0;
-    const char *name = document_element_name(node, &length);
-    return name != NULL && strlen(wanted) == length
-           && strncasecmp(name, wanted, length) == 0;
-}
+#define rendered_text_name_is document_element_name_is_ignoring_case
 
 /* A host's carrier holds its shadow tree, whose text is not part of innerText:
    the steps walk child nodes, and a shadow root is not one. */
@@ -4040,6 +4501,12 @@ JS_RT_GUARDED_NATIVE(, js_computed_style_get)(JSContext *context,
     return value;
 }
 
+static JSValue computed_style_read_name(JSContext *context, DomBridge *bridge,
+                                        lxb_dom_node_t *node, int argc,
+                                        JSValueConst *argv);
+static int computed_style_canonical_name(JSContext *context, JSValueConst value,
+                                         char *canonical, size_t *used_out);
+
 /* __tilefinchComputedStyleRead(handle, name, pseudo) -> the value, or
    undefined for the script's general path. One call for the common read
    (getComputedStyle(el).prop), which otherwise canonicalizes the name,
@@ -4061,16 +4528,169 @@ JS_RT_GUARDED_NATIVE(, js_computed_style_read)(JSContext *context, JSValueConst 
     lxb_dom_node_t *node = js_rt_bridge_node_arg(context, bridge, argv[0]);
     if (node == NULL || node->type != LXB_DOM_NODE_TYPE_ELEMENT
         || !bridge_node_is_connected(node)) return JS_UNDEFINED;
+    return computed_style_read_name(context, bridge, node, argc, argv);
+}
+
+/* __tilefinchComputedStyleValues(handle, names) -> an array with, for each
+   of up to COMPUTED_STYLE_VALUES_LIMIT names, exactly what
+   __tilefinchComputedStyleRead(handle, name) answers (undefined entries
+   take script's general path). The whole answer is undefined for a node
+   that is not a connected element, or for more names than the limit. One
+   call instead of one per property for script that reads a fixed set of an
+   element's values (ResizeObserver's box sizes), and one resolution: the
+   element's style is resolved once, as a read of `border-left-width`
+   resolves it (it flushes a pending layout as a used size does, and needs
+   no ancestor geometry walk), and every registered property is serialized
+   from that. A used size or padding of an element whose padding has a
+   percentage needs the containing width, and a used size read before any
+   layout needs one built: those, custom properties, transition longhands,
+   SVG presentation attributes and unregistered names take the single
+   read's own path, as does every name after a read that changed the
+   document. */
+#define COMPUTED_STYLE_VALUES_LIMIT 16u
+
+/* The properties whose single read resolves the containing width (the
+   used size and padding serializers resolve percentage paddings with it). */
+static bool computed_style_padding_geometry_id(ComputedStylePropertyId id)
+{
+    return id == CSP_WIDTH || id == CSP_HEIGHT || id == CSP_PADDING
+        || id == CSP_PADDING_TOP || id == CSP_PADDING_RIGHT
+        || id == CSP_PADDING_BOTTOM || id == CSP_PADDING_LEFT;
+}
+
+static bool computed_style_padding_fixed(const ComputedStyle *style)
+{
+    return computed_style_edge_is_fixed(style->padding.top)
+        && computed_style_edge_is_fixed(style->padding.right)
+        && computed_style_edge_is_fixed(style->padding.bottom)
+        && computed_style_edge_is_fixed(style->padding.left);
+}
+JS_RT_GUARDED_NATIVE(, js_computed_style_values)(JSContext *context,
+                                 JSValueConst this_value,
+                                 int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    if (bridge == NULL || bridge->stylesheet == NULL || argc < 2
+        || !JS_IsArray(context, argv[1])) return JS_UNDEFINED;
+    lxb_dom_node_t *node = js_rt_bridge_node_arg(context, bridge, argv[0]);
+    if (node == NULL || node->type != LXB_DOM_NODE_TYPE_ELEMENT
+        || !bridge_node_is_connected(node)) return JS_UNDEFINED;
+    uint32_t count = 0;
+    JSValue length_value = JS_GetPropertyStr(context, argv[1], "length");
+    if (JS_IsException(length_value)
+        || JS_ToUint32(context, &count, length_value) < 0) {
+        JS_FreeValue(context, length_value);
+        return JS_EXCEPTION;
+    }
+    JS_FreeValue(context, length_value);
+    if (count > COMPUTED_STYLE_VALUES_LIMIT) return JS_UNDEFINED;
+    JSValue values = JS_NewArray(context);
+    if (JS_IsException(values)) return values;
+    ComputedStyleRead base;
+    bool base_tried = false, have_base = false;
+    uint64_t base_generation = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        JSValue name = JS_GetPropertyUint32(context, argv[1], i);
+        if (JS_IsException(name)) {
+            JS_FreeValue(context, values);
+            return name;
+        }
+        JSValue value = JS_UNDEFINED;
+        /* A read can lay the page out and run style watchers: the handle
+           is resolved afresh for each name, as separate calls would. */
+        lxb_dom_node_t *at = JS_IsString(name)
+            ? js_rt_bridge_node_arg(context, bridge, argv[0]) : NULL;
+        char canonical[128];
+        size_t used = 0;
+        int named = at != NULL && at->type == LXB_DOM_NODE_TYPE_ELEMENT
+            && bridge_node_is_connected(at)
+            ? computed_style_canonical_name(context, name, canonical, &used)
+            : 0;
+        ComputedStylePropertyId id = named > 0
+            ? computed_style_property_find(canonical) : CSP_NONE;
+        bool plain = named > 0 && id != CSP_NONE
+            && !(used >= 2 && canonical[0] == '-' && canonical[1] == '-')
+            && !computed_style_transition_id(id)
+            && !svg_presentation_attribute_relevant(at, canonical, used);
+        if (plain && !base_tried) {
+            base_tried = true;
+            JSValue answer = JS_UNDEFINED;
+            bool empty = false;
+            JSValueConst call[2] = { argv[0], name };
+            have_base = computed_style_resolve(context, bridge, at,
+                                               "border-left-width", 17, 2,
+                                               call, &base, &answer, &empty);
+            if (!have_base && JS_IsException(answer)) {
+                JS_FreeValue(context, name);
+                JS_FreeValue(context, values);
+                return JS_EXCEPTION;
+            }
+            if (!have_base) JS_FreeValue(context, answer);
+            base_generation = bridge->document == NULL
+                ? 0 : bridge->document->content_generation;
+            /* The flush can move the handle's node. */
+            at = js_rt_bridge_node_arg(context, bridge, argv[0]);
+        }
+        uint64_t generation = bridge->document == NULL
+            ? 0 : bridge->document->content_generation;
+        if (named < 0) {
+            value = JS_EXCEPTION;
+        } else if (plain && have_base && at == base.node
+                   && generation == base_generation
+                   && !(bridge->layout == NULL
+                        && (computed_style_properties[id].flags
+                            & CSP_USED_GEOMETRY) != 0)
+                   && !(computed_style_padding_geometry_id(id)
+                        && !computed_style_padding_fixed(&base.style))) {
+            ComputedStyleRead read = base;
+            ComputedStylePropertyId physical =
+                computed_style_scroll_physical_id(id, &read.style);
+            read.id = physical;
+            read.name = physical != id ? computed_style_properties[physical].name
+                                       : canonical;
+            read.name_length = strlen(read.name);
+            read.property_flags = computed_style_properties[id].flags;
+            /* Fixed paddings: the containing width is never consulted. */
+            read.containing_width = 0;
+            char serialized[640] = "";
+            computed_style_serialize(&read, serialized, sizeof(serialized));
+            bool empty = false;
+            value = computed_style_string(context, serialized, &empty);
+            if (empty && !JS_IsException(value)) {
+                JS_FreeValue(context, value);
+                value = JS_UNDEFINED;
+            }
+        } else if (named > 0) {
+            JSValueConst call[2] = { argv[0], name };
+            value = computed_style_read_name(context, bridge, at, 2, call);
+        }
+        JS_FreeValue(context, name);
+        if (JS_IsException(value)
+            || js_rt_define_index(context, values, i, value) < 0) {
+            JS_FreeValue(context, values);
+            return JS_EXCEPTION;
+        }
+    }
+    return values;
+}
+
+/* The dashed lower-case name __tilefinchComputedStyleRead reads for the
+   script name `value`, into canonical[128]: 1 when the native answers it,
+   0 when script's general path does (an embedded NUL, too long, or a name
+   whose value needs script's post-processing), -1 on an exception. */
+static int computed_style_canonical_name(JSContext *context, JSValueConst value,
+                                         char *canonical, size_t *used_out)
+{
     size_t length = 0;
-    const char *text = JS_ToCStringLen(context, &length, argv[1]);
-    if (text == NULL) return JS_EXCEPTION;
-    char canonical[128];
+    const char *text = JS_ToCStringLen(context, &length, value);
+    if (text == NULL) return -1;
     size_t used = 0;
     bool usable = strlen(text) == length;
     if (!usable) {
         /* An embedded NUL: the general path decides. */
     } else if (length >= 2 && text[0] == '-' && text[1] == '-') {
-        usable = length < sizeof(canonical);
+        usable = length < 128u;
         if (usable) memcpy(canonical, text, used = length);
     } else if (length == 8 && memcmp(text, "cssFloat", 8) == 0) {
         memcpy(canonical, "float", used = 5);
@@ -4078,7 +4698,7 @@ JS_RT_GUARDED_NATIVE(, js_computed_style_read)(JSContext *context, JSValueConst 
         for (size_t i = 0; usable && i < length; i++) {
             unsigned char byte = (unsigned char) text[i];
             bool capital = byte >= 'A' && byte <= 'Z';
-            if (used + (capital ? 2u : 1u) >= sizeof(canonical)) {
+            if (used + (capital ? 2u : 1u) >= 128u) {
                 usable = false;
                 break;
             }
@@ -4091,15 +4711,29 @@ JS_RT_GUARDED_NATIVE(, js_computed_style_read)(JSContext *context, JSValueConst 
         }
     }
     JS_FreeCString(context, text);
-    if (!usable) return JS_UNDEFINED;
+    if (!usable) return 0;
     canonical[used] = '\0';
+    *used_out = used;
     bool custom = used >= 2 && canonical[0] == '-' && canonical[1] == '-';
-    if (!custom
+    return !custom
         && ((used == 10 && memcmp(canonical, "flex-basis", 10) == 0)
             || (used >= 13 && memcmp(canonical, "scroll-margin", 13) == 0)
             || (used >= 14
-                && memcmp(canonical, "scroll-padding", 14) == 0)))
-        return JS_UNDEFINED;
+                && memcmp(canonical, "scroll-padding", 14) == 0)) ? 0 : 1;
+}
+
+/* js_computed_style_read's answer for a connected element `node`. */
+static JSValue computed_style_read_name(JSContext *context, DomBridge *bridge,
+                                        lxb_dom_node_t *node, int argc,
+                                        JSValueConst *argv)
+{
+    char canonical[128];
+    size_t used = 0;
+    int named = computed_style_canonical_name(context, argv[1], canonical,
+                                              &used);
+    if (named < 0) return JS_EXCEPTION;
+    if (named == 0) return JS_UNDEFINED;
+    bool custom = used >= 2 && canonical[0] == '-' && canonical[1] == '-';
     bool empty = false;
     JSValue value = computed_style_value(context, bridge, node, canonical,
                                          used, argc, argv, &empty);

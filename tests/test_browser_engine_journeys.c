@@ -2,4 +2,5 @@
    changing its executable, command-line selection, or CTest coverage. */
 #include "browser_engine_test_support.h"
 #include "../src/js_runtime_internal.h"
+#include "../src/tilefinch_test_faults.h"
 #include "suites/browser_engine_journeys.inc"

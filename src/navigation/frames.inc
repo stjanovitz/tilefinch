@@ -2,6 +2,73 @@
    retirement, <iframe> discovery and fetch, frame presentation, completion
    and progress, and the frame capability trace. */
 
+#if defined(TILEFINCH_FRAME_LITE)
+/* commit_transaction.inc: the top-level static-page scan (executable
+   script, frame elements, on* handlers, javascript: hrefs). */
+static bool navigation_document_has_author_runtime_content(
+    const PocDocument *document);
+
+/* frame_lite lazy_realm: a child document needs a realm when anything in it
+   can run script (the top-level scan above), when it holds a nested
+   browsing context or plug-in the child realm would discover (object,
+   embed, template content is not walked either), or when it has something
+   a press reaches: presses into a frame dispatch through its realm. */
+static bool navigation_frame_document_needs_realm(const PocDocument *document)
+{
+    if (document == NULL || document->html == NULL
+        || navigation_document_has_author_runtime_content(document))
+        return true;
+    static const char *const interactive[] = {
+        "a", "area", "button", "input", "select", "textarea", "form",
+        "label", "summary", "details", "object", "embed", "template",
+        "portal", "fencedframe", "video", "audio", "dialog", "applet",
+    };
+    lxb_dom_node_t *root = lxb_dom_interface_node(document->html);
+    size_t visited = 0;
+    for (lxb_dom_node_t *node = root; node != NULL;) {
+        if (++visited > NAVIGATION_DOM_TRAVERSAL_NODE_LIMIT) return true;
+        size_t length = 0;
+        const char *name = document_element_name(node, &length);
+        if (name != NULL) {
+            for (size_t i = 0;
+                 i < sizeof(interactive) / sizeof(interactive[0]); i++) {
+                if (strlen(interactive[i]) == length
+                    && strncasecmp(name, interactive[i], length) == 0)
+                    return true;
+            }
+            size_t ignored = 0;
+            if (document_attribute(node, "tabindex", &ignored) != NULL
+                || document_attribute(node, "contenteditable", &ignored)
+                       != NULL
+                || document_attribute(node, "popover", &ignored) != NULL)
+                return true;
+        }
+        if (node->first_child != NULL) {
+            node = node->first_child;
+            continue;
+        }
+        while (node != NULL && node != root && node->next == NULL)
+            node = node->parent;
+        if (node == root) break;
+        if (node != NULL) node = node->next;
+    }
+    return false;
+}
+#endif
+
+/* Whether the frame has a document a snapshot can be drawn from: its realm,
+   or (lazy_realm) a document committed without one. */
+static bool navigation_frame_presentable(const NavigationFrame *frame)
+{
+#if defined(TILEFINCH_FRAME_LITE)
+    if (frame->lite_realm_skipped) return true;
+#endif
+    return frame->runtime != NULL;
+}
+
+static bool navigation_frame_element_hidden(
+    NavigationSession *session, const NavigationFrame *frame);
+
 static bool navigation_queue_frame_message(void *opaque,
                                            ScriptRuntime *source,
                                            long target_frame_handle,
@@ -513,12 +580,19 @@ static bool navigation_deliver_frame_messages(NavigationSession *session)
     /* The parent can resize an iframe without the child changing (Turnstile
        shrinks its widget frame from the default 300x150 to 300x65 after the
        child has painted). A snapshot taken at the old size was then drawn
-       squashed into the new box; re-snapshot at the new size. */
+       squashed into the new box; re-snapshot at the new size. A hidden
+       frame's snapshot holds no pixels: draw it once the element is shown. */
     for (size_t i = 0; i < session->page.frame_count; i++) {
         NavigationFrame *frame = &session->page.frames[i];
-        if (frame->retired || !frame->loaded || frame->runtime == NULL
+        if (frame->retired || !frame->loaded
+            || !navigation_frame_presentable(frame)
             || frame->presentation == NULL || frame->presentation_dirty)
             continue;
+        if (frame->presentation->hidden) {
+            if (!navigation_frame_element_hidden(session, frame))
+                frame->presentation_dirty = true;
+            continue;
+        }
         int width = 0, height = 0;
         if (navigation_frame_presentation_dimensions(
                 session, frame, &width, &height)
@@ -531,7 +605,8 @@ static bool navigation_deliver_frame_messages(NavigationSession *session)
        an animation-heavy frame from forcing an unbounded raster cascade. */
     for (size_t i = 0; i < session->page.frame_count; i++) {
         NavigationFrame *frame = &session->page.frames[i];
-        if (frame->retired || !frame->loaded || frame->runtime == NULL
+        if (frame->retired || !frame->loaded
+            || !navigation_frame_presentable(frame)
             || !frame->presentation_dirty) continue;
         if (!navigation_refresh_frame_presentation_or_defer(
                 session, frame)) return false;
@@ -968,13 +1043,6 @@ static bool navigation_load_frames_for_context(
         lxb_dom_node_t *node = script_runtime_node_handle_resolve_connected(
             parent_runtime, handles[i]);
         if (node == NULL) continue;
-        size_t srcdoc_length = 0;
-        const char *srcdoc = document_attribute(
-            node, "srcdoc", &srcdoc_length);
-        /* Same-origin srcdoc/about:blank/Blob frames live in the bounded
-           bootstrap frame realm. They must never also enqueue a remote
-           fetch or dispatch a second load/error event here. */
-        if (srcdoc != NULL) continue;
         long parent_handle = script_runtime_node_handle(
             parent_runtime, node);
         NavigationFrame *frame = NULL;
@@ -992,16 +1060,33 @@ static bool navigation_load_frames_for_context(
         size_t source_length = 0;
         const char *source = document_attribute(node, "src",
                                                 &source_length);
+        size_t srcdoc_length = 0;
+        const char *srcdoc = document_attribute(
+            node, "srcdoc", &srcdoc_length);
+        /* The bootstrap owns local frame documents and their WindowProxy.
+           A local replacement must still retire the former remote owner,
+           including descendants, pending fetches and queued messages. Do
+           not reset the proxy here: it already belongs to the replacement. */
+        bool local = srcdoc != NULL || source == NULL || source_length == 0
+            || (source_length == 11u
+                && memcmp(source, "about:blank", 11u) == 0)
+            || (source_length >= 5u && memcmp(source, "blob:", 5u) == 0);
+        if (local) {
+            if (frame != NULL) {
+                navigation_retire_frame_descendants(
+                    session, (size_t) (frame - session->page.frames),
+                    "ancestor iframe became local");
+                navigation_retire_unloaded_frame(
+                    session, frame, "iframe became local");
+            }
+            continue;
+        }
         size_t sandbox_length = 0;
         const char *sandbox = document_attribute(
             node, "sandbox", &sandbox_length);
         uint32_t sandbox_flags = tilefinch_frame_sandbox_parse(
             sandbox, sandbox_length, sandbox != NULL);
-        /* Missing src is the local about:blank document installed by the
-           bootstrap. It is not a network failure. A later src mutation is
-           intentionally reconsidered because no C frame slot is retained. */
-        if (source == NULL || source_length == 0
-            || source_length >= NAVIGATION_URL_LIMIT) continue;
+        if (source_length >= NAVIGATION_URL_LIMIT) continue;
         char reference[NAVIGATION_URL_LIMIT];
         memcpy(reference, source, source_length);
         reference[source_length] = '\0';
@@ -1068,6 +1153,9 @@ static bool navigation_load_frames_for_context(
             memset(frame, 0, sizeof(*frame));
         }
         snprintf(frame->url, sizeof(frame->url), "%s", resolved_url);
+        if (!tilefinch_url_origin(resolved_url, frame->src_origin,
+                                  sizeof(frame->src_origin)))
+            frame->src_origin[0] = '\0';
         snprintf(frame->parent_url, sizeof(frame->parent_url), "%s",
                  parent_url);
         frame->element = node;
@@ -1234,6 +1322,20 @@ static bool navigation_frame_presentation_dimensions(
     return true;
 }
 
+/* Whether the frame's element is laid out nowhere: its parent's layout is
+   complete (not provisional, not empty) and holds no box for it, as for a
+   display:none frame or one under a display:none ancestor. An incomplete or
+   missing parent layout cannot tell, and counts as shown. */
+static bool navigation_frame_element_hidden(
+    NavigationSession *session, const NavigationFrame *frame)
+{
+    const LayoutDocument *parent_layout =
+        navigation_frame_parent_layout(session, frame);
+    return parent_layout != NULL && parent_layout->node_box_count != 0
+        && parent_layout->content_limit_y == 0
+        && layout_box_for_node(parent_layout, frame->element) == NULL;
+}
+
 /* Build one bounded visual snapshot of a child browsing context. The child
    DOM and its control nodes stay inside NavigationFrame; the parent receives
    only opaque pixels attached to the iframe element. This is deliberately a
@@ -1241,9 +1343,18 @@ static bool navigation_frame_presentation_dimensions(
 static bool navigation_refresh_frame_presentation(
     NavigationSession *session, NavigationFrame *frame)
 {
+#if defined(TILEFINCH_FRAME_LITE)
+    /* lazy_realm: a frame committed without a realm is drawn all the same
+       (nothing can mutate its document, so its snapshot never goes stale). */
+    if (session == NULL || frame == NULL
+        || (frame->runtime == NULL && !frame->lite_realm_skipped)
+        || frame->document.html == NULL || frame->element == NULL
+        || session->images != &session->page.images) return false;
+#else
     if (session == NULL || frame == NULL || frame->runtime == NULL
         || frame->document.html == NULL || frame->element == NULL
         || session->images != &session->page.images) return false;
+#endif
 #if !defined(__PSP__)
     if (tilefinch_test_faults()->refuse_next_frame_presentation) {
         tilefinch_test_faults()->refuse_next_frame_presentation = false;
@@ -1285,10 +1396,18 @@ static bool navigation_refresh_frame_presentation(
             &fresh->layout, session->budget, &frame->document,
             &fresh->stylesheet, session->fonts, &frame->images, &viewport);
 
+    /* A hidden frame keeps its layout (the child's script sees the same
+       viewport and geometry), but drawing pixels nothing shows would cost
+       the 4-byte surface the parent's image table keeps (0.18 MB at the
+       300x150 default). */
+    fresh->hidden = okay && navigation_frame_element_hidden(session, frame);
+#if defined(TILEFINCH_FRAME_LITE)
+    if (fresh->hidden) tilefinch_frame_lite_counters.hidden_snapshots_skipped++;
+#endif
     uint16_t *rgb565 = NULL;
     unsigned char *rgba = NULL;
     TileCache cache = {0};
-    if (okay) {
+    if (okay && !fresh->hidden) {
         rgb565 = budget_malloc_category(
             session->budget, BUDGET_CATEGORY_RENDER,
             pixels * sizeof(*rgb565));
@@ -1300,7 +1419,7 @@ static bool navigation_refresh_frame_presentation(
             && tile_cache_render_frame(
                 &cache, 0, width, height, NULL);
     }
-    if (okay) {
+    if (okay && !fresh->hidden) {
         for (size_t i = 0; i < pixels; i++) {
             unsigned red = tilefinch_rgb565_red_code(rgb565[i]);
             unsigned green = tilefinch_rgb565_green_code(rgb565[i]);
@@ -1359,6 +1478,8 @@ static bool navigation_refresh_frame_presentation(
         stylesheet_destroy(&retired->stylesheet);
         budget_free(session->budget, retired);
     }
+    /* No pixels changed: the parent's layout has nothing to acquire. */
+    if (fresh->hidden) return true;
     /* The immediate parent layout must acquire the new DRAW_IMAGE command.
        A nested snapshot is then propagated outward one bounded frame at a
        time; the top-level page alone publishes final damage. */
@@ -1394,6 +1515,17 @@ bool navigation_test_refresh_frame_presentation(
     NavigationSession *session, NavigationFrame *frame)
 {
     return navigation_refresh_frame_presentation(session, frame);
+}
+
+bool navigation_test_frame_presentation(const NavigationFrame *frame,
+                                        int *width, int *height,
+                                        bool *hidden)
+{
+    if (frame == NULL || frame->presentation == NULL) return false;
+    if (width != NULL) *width = frame->presentation->width;
+    if (height != NULL) *height = frame->presentation->height;
+    if (hidden != NULL) *hidden = frame->presentation->hidden;
+    return true;
 }
 #endif
 
@@ -1605,6 +1737,11 @@ static bool navigation_complete_frame(NavigationSession *session,
         frame->document.content_security_policy = response_csp;
         if (response_csp.header_present)
             (void) document_nonce_hiding_enable(&frame->document);
+        /* The child was parsed whole before any of its scripts run, so its
+           head's <meta> policies all apply before the first one. */
+        tilefinch_csp_bind_document_origin(
+            &frame->document.content_security_policy, final_url);
+        (void) document_apply_meta_csp(&frame->document, true);
     }
     fetch_result_destroy(fetch);
     /* Cleanup may free enough heap to succeed or replace the exception text.
@@ -1631,6 +1768,21 @@ static bool navigation_complete_frame(NavigationSession *session,
                     &frame->document.content_security_policy));
         }
     }
+#if defined(TILEFINCH_FRAME_LITE)
+    /* lazy_realm: a document nothing in which can run script or take a
+       press commits as a frame without allow-scripts would. Its parent's
+       WindowProxy state above is unchanged (contentWindow.eval compiles in
+       the parent's runtime under this document's policy). */
+    frame->lite_realm_skipped = false;
+    if (ok && scripts_allowed && tilefinch_frame_lite()->lazy_realm
+        && !NAVIGATION_TRACES_FRAME_CAPABILITIES(session)
+        && !navigation_frame_document_needs_realm(&frame->document)) {
+        scripts_allowed = false;
+        frame->lite_realm_skipped = true;
+        tilefinch_frame_lite_counters.realms_skipped++;
+    }
+    uint64_t lite_create_started = navigation_now_us();
+#endif
     if (ok && scripts_allowed) {
         int frame_width = 0, frame_height = 0;
         ViewportContext frame_viewport;
@@ -1655,6 +1807,16 @@ static bool navigation_complete_frame(NavigationSession *session,
                 NULL, NULL, session->fonts,
                 &frame->script_result);
         }
+#if defined(TILEFINCH_FRAME_LITE)
+        if (frame->runtime != NULL) {
+            tilefinch_frame_lite_counters.realms_created++;
+            tilefinch_frame_lite_counters.realm_create_us +=
+                navigation_now_us() - lite_create_started;
+        }
+#endif
+        /* The bootstrap's freed blocks are not this frame's working set:
+           hand them back to the page rather than keep them cached. */
+        (void) script_runtime_trim_pool(frame->runtime);
         ok = frame->runtime != NULL
             && script_runtime_configure_messaging(
                 frame->runtime, true, exposed_same_origin,
@@ -1672,6 +1834,26 @@ static bool navigation_complete_frame(NavigationSession *session,
                 script_runtime_dialogs_allowed(frame->parent_runtime)))
             script_runtime_set_dialog_parent(frame->runtime,
                                              frame->parent_runtime);
+        /* Microphone: Permissions Policy, from the container's allow
+           attribute and the default allowlist 'self'. 'src' (and a bare
+           "microphone") is the origin of the src the frame was created
+           with, so a frame redirected or navigated elsewhere loses it. */
+        if (ok) {
+            size_t allow_length = 0;
+            const char *allow = frame->element == NULL ? NULL
+                : document_attribute(frame->element, "allow", &allow_length);
+            char child_origin[TILEFINCH_ORIGIN_SERIALIZED_LIMIT];
+            if (!tilefinch_url_origin(frame->url, child_origin,
+                                      sizeof(child_origin)))
+                child_origin[0] = '\0';
+            script_runtime_set_media_capture_parent(
+                frame->runtime, frame->parent_runtime,
+                media_capture_frame_allowed(
+                    allow, allow_length, exposed_same_origin,
+                    frame->opaque_origin, child_origin, frame->src_origin,
+                    script_runtime_media_capture_allowed(
+                        frame->parent_runtime)));
+        }
     }
     if (ok && frame->runtime != NULL && NAVIGATION_TRACES_FRAME_CAPABILITIES(session)) {
         ok = navigation_install_frame_capability_trace(frame);
@@ -1743,6 +1925,8 @@ static bool navigation_complete_frame(NavigationSession *session,
     }
     frame->loaded = true;
     session->frames_loaded++;
+    /* Likewise what the load's scripts freed. */
+    (void) script_runtime_trim_pool(frame->runtime);
     if (!navigation_refresh_frame_presentation_or_defer(
             session, frame)) return false;
     if (tilefinch_trace_js_roots()) {

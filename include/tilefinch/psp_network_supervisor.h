@@ -240,7 +240,5 @@ uint32_t psp_network_supervisor_violations(
 unsigned psp_network_supervisor_pump_units(PspNetworkPumpUrgency urgency);
 const char *psp_network_supervisor_state_name(
     PspNetworkSupervisorState state);
-const char *psp_network_supervisor_event_name(
-    PspNetworkSupervisorEventType event);
 
 #endif

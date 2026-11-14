@@ -84,14 +84,6 @@ static size_t focus_count(const BrowserController *controller)
     return layout->link_count + layout->control_count;
 }
 
-static bool node_name_is(lxb_dom_node_t *node, const char *wanted)
-{
-    size_t length = 0;
-    const char *name = document_element_name(node, &length);
-    return name != NULL && strlen(wanted) == length
-           && memcmp(name, wanted, length) == 0;
-}
-
 static bool attribute_is(lxb_dom_node_t *node, const char *name,
                          const char *wanted)
 {
@@ -117,13 +109,7 @@ static bool controller_is_declared_media_card(
             &controller->navigation->page.document, node);
 }
 
-static bool node_descends_from(lxb_dom_node_t *node, lxb_dom_node_t *ancestor)
-{
-    for (lxb_dom_node_t *at = node; at != NULL; at = at->parent) {
-        if (at == ancestor) return true;
-    }
-    return false;
-}
+#define node_descends_from document_node_within
 
 static lxb_dom_node_t *controller_native_basic_root(
     const BrowserController *controller)
@@ -199,24 +185,24 @@ static bool controller_form_method_is_get(lxb_dom_node_t *form)
 static bool node_effectively_disabled(lxb_dom_node_t *node)
 {
     if (has_attribute(node, "disabled")) return true;
-    if (node_name_is(node, "option")) {
+    if (document_element_name_is(node, "option")) {
         for (lxb_dom_node_t *at = node->parent; at != NULL;
              at = at->parent) {
-            if ((node_name_is(at, "optgroup")
-                 || node_name_is(at, "select"))
+            if ((document_element_name_is(at, "optgroup")
+                 || document_element_name_is(at, "select"))
                 && has_attribute(at, "disabled")) return true;
-            if (node_name_is(at, "select")) break;
+            if (document_element_name_is(at, "select")) break;
         }
     }
     for (lxb_dom_node_t *at = node == NULL ? NULL : node->parent;
          at != NULL; at = at->parent) {
-        if (!node_name_is(at, "fieldset") || !has_attribute(at, "disabled")) {
+        if (!document_element_name_is(at, "fieldset") || !has_attribute(at, "disabled")) {
             continue;
         }
         lxb_dom_node_t *legend = NULL;
         for (lxb_dom_node_t *child = at->first_child; child != NULL;
              child = child->next) {
-            if (node_name_is(child, "legend")) { legend = child; break; }
+            if (document_element_name_is(child, "legend")) { legend = child; break; }
         }
         if (legend != NULL && node_descends_from(node, legend)) continue;
         return true;
@@ -283,7 +269,7 @@ static bool option_value(lxb_dom_node_t *select, const char **value,
     lxb_dom_node_t *first = NULL, *selected = NULL;
     bool any_selected = false;
     for (lxb_dom_node_t *at = select->first_child; at != NULL;) {
-        if (node_name_is(at, "option")) {
+        if (document_element_name_is(at, "option")) {
             bool disabled = node_effectively_disabled(at);
             if (!disabled && first == NULL) first = at;
             size_t state_length = 0;
@@ -325,10 +311,10 @@ static void serialize_form_controls(lxb_dom_node_t *node,
     for (lxb_dom_node_t *at = node; at != NULL; at = at->next) {
         if (at->type == LXB_DOM_NODE_TYPE_ELEMENT
             && !node_effectively_disabled(at)) {
-            bool input = node_name_is(at, "input");
-            bool textarea = node_name_is(at, "textarea");
-            bool select = node_name_is(at, "select");
-            bool button = node_name_is(at, "button");
+            bool input = document_element_name_is(at, "input");
+            bool textarea = document_element_name_is(at, "textarea");
+            bool select = document_element_name_is(at, "select");
+            bool button = document_element_name_is(at, "button");
             size_t name_length = 0;
             const char *name = (input || textarea || select || button)
                 ? document_attribute(at, "name", &name_length) : NULL;
@@ -435,14 +421,14 @@ static bool controller_serialize_form_body(NavigationSession *navigation,
 static lxb_dom_node_t *form_ancestor(lxb_dom_node_t *node)
 {
     for (lxb_dom_node_t *at = node; at != NULL; at = at->parent) {
-        if (node_name_is(at, "form")) return at;
+        if (document_element_name_is(at, "form")) return at;
     }
     return NULL;
 }
 
 static bool input_blocks_implicit_submission(lxb_dom_node_t *node)
 {
-    if (!node_name_is(node, "input")) return false;
+    if (!document_element_name_is(node, "input")) return false;
     size_t length = 0;
     const char *type = document_attribute(node, "type", &length);
     if (type == NULL || length == 0) return true;
@@ -462,10 +448,10 @@ static bool input_blocks_implicit_submission(lxb_dom_node_t *node)
 
 static bool node_is_submit_button(lxb_dom_node_t *node)
 {
-    return (node_name_is(node, "button")
+    return (document_element_name_is(node, "button")
             && !attribute_is(node, "type", "button")
             && !attribute_is(node, "type", "reset"))
-           || (node_name_is(node, "input")
+           || (document_element_name_is(node, "input")
                && (attribute_is(node, "type", "submit")
                    || attribute_is(node, "type", "image")));
 }
@@ -536,7 +522,7 @@ static size_t media_source_references(
            document's full node allowance; activation must remain a small,
            deterministic input operation rather than a second DOM walk. */
         if (child_elements++ >= MEDIA_SOURCE_SCAN_LIMIT) break;
-        if (!node_name_is(child, "source")) continue;
+        if (!document_element_name_is(child, "source")) continue;
         if (!media_type_supported(child, audio_only)) {
             continue;
         }
@@ -741,8 +727,8 @@ static bool controller_build_media_action(
     ControllerAction *action)
 {
     if (controller == NULL || action == NULL) return false;
-    bool audio_only = media != NULL && node_name_is(media, "audio");
-    if (media != NULL && !audio_only && !node_name_is(media, "video"))
+    bool audio_only = media != NULL && document_element_name_is(media, "audio");
+    if (media != NULL && !audio_only && !document_element_name_is(media, "video"))
         return false;
     const NavigationEntry *current = navigation_current(
         controller->navigation);
@@ -898,7 +884,7 @@ static bool controller_activation_label(
     const char *label = document_attribute(node, "aria-label", &length);
     if (label == NULL || length == 0)
         label = document_attribute(node, "title", &length);
-    if ((label == NULL || length == 0) && node_name_is(node, "input"))
+    if ((label == NULL || length == 0) && document_element_name_is(node, "input"))
         label = document_attribute(node, "value", &length);
     char bounded_text[192];
     if (label == NULL || length == 0) {
@@ -936,7 +922,7 @@ static bool controller_node_has_authored_media(lxb_dom_node_t *root)
 {
     lxb_dom_node_t *node = root;
     for (size_t visited = 0; node != NULL && visited < 64u; visited++) {
-        if (node_name_is(node, "audio") || node_name_is(node, "video")) {
+        if (document_element_name_is(node, "audio") || document_element_name_is(node, "video")) {
             return true;
         }
         if (node->first_child != NULL) {
@@ -975,7 +961,7 @@ static bool controller_nearby_matches_name(
     for (size_t level = 0; root != NULL && level < 4u;
          level++, root = root->parent) {
         if (root != button
-            && (node_name_is(root, "body") || node_name_is(root, "html"))) {
+            && (document_element_name_is(root, "body") || document_element_name_is(root, "html"))) {
             break;
         }
         lxb_dom_node_t *node = root;
@@ -1015,7 +1001,7 @@ static bool controller_nearby_matches_page_url(
     for (size_t level = 0; root != NULL && level < 4u;
          level++, root = root->parent) {
         if (root != button
-            && (node_name_is(root, "body") || node_name_is(root, "html"))) {
+            && (document_element_name_is(root, "body") || document_element_name_is(root, "html"))) {
             break;
         }
         lxb_dom_node_t *node = root;
@@ -1130,8 +1116,8 @@ static bool controller_try_structured_audio_fallback(
     size_t handlers_before, ControllerAction *action)
 {
     if (controller == NULL || node == NULL || action == NULL
-        || (!node_name_is(node, "button")
-            && !(node_name_is(node, "input")
+        || (!document_element_name_is(node, "button")
+            && !(document_element_name_is(node, "input")
                  && attribute_is(node, "type", "button")))
         || node_effectively_disabled(node)
         || (node_is_submit_button(node) && form_ancestor(node) != NULL)
@@ -1234,7 +1220,7 @@ static bool controller_prepare_form_action(
     ControllerActivationOutcome initial_outcome, ControllerAction *action)
 {
     if (controller == NULL || controller->navigation == NULL
-        || form == NULL || action == NULL || !node_name_is(form, "form")
+        || form == NULL || action == NULL || !document_element_name_is(form, "form")
         || (submitter != NULL && form_ancestor(submitter) != form)) {
         return false;
     }
@@ -1294,7 +1280,7 @@ static bool controller_prepare_form_action(
             if (action->activation_outcome
                     == CONTROLLER_ACTIVATION_RUNTIME_FAILED) return true;
         }
-        if (form == NULL || !node_name_is(form, "form")) return true;
+        if (form == NULL || !document_element_name_is(form, "form")) return true;
         if (submitter != NULL && form_ancestor(submitter) != form)
             submitter = NULL;
     }
@@ -2710,7 +2696,7 @@ static ControllerActivationOutcome controller_dispatch_activation(
     bool click_only = controller->pointer_click_pending;
     controller->pointer_click_pending = false;
     if (node == NULL) return CONTROLLER_ACTIVATION_NOT_DISPATCHED;
-    if (node_name_is(node, "iframe")) {
+    if (document_element_name_is(node, "iframe")) {
         bool frame_activated = click_only
             ? navigation_activate_frame_at(
                   navigation, node, controller->pointer_click_offset_x,
@@ -2851,7 +2837,7 @@ static bool controller_checked_set(BrowserController *controller,
 static bool controller_same_radio_group(lxb_dom_node_t *left,
                                         lxb_dom_node_t *right)
 {
-    if (left == NULL || right == NULL || !node_name_is(right, "input")
+    if (left == NULL || right == NULL || !document_element_name_is(right, "input")
         || !attribute_is(right, "type", "radio")
         || form_ancestor(left) != form_ancestor(right)) return false;
     size_t left_length = 0, right_length = 0;
@@ -2875,7 +2861,7 @@ static bool controller_choice_snapshot(
 {
     if (count != NULL) *count = 0;
     if (controller == NULL || node == NULL || snapshots == NULL
-        || count == NULL || !node_name_is(node, "input")
+        || count == NULL || !document_element_name_is(node, "input")
         || (!attribute_is(node, "type", "checkbox")
             && !attribute_is(node, "type", "radio"))) return true;
     if (!attribute_is(node, "type", "radio")) {
@@ -3034,7 +3020,7 @@ static size_t controller_select_options(lxb_dom_node_t *select,
     size_t count = 0, visited = 0;
     for (lxb_dom_node_t *at = select->first_child;
          at != NULL && visited++ < 1024u;) {
-        if (node_name_is(at, "option")) {
+        if (document_element_name_is(at, "option")) {
             if (count >= 128u) return SIZE_MAX;
             options[count] = at;
             count++;
@@ -3089,7 +3075,7 @@ size_t controller_select_history(lxb_dom_node_t *select, char *state,
 {
     lxb_dom_node_t *options[128];
     char previous[128];
-    if (!node_name_is(select, "select") || state == NULL) return 0;
+    if (!document_element_name_is(select, "select") || state == NULL) return 0;
     size_t count = controller_select_options(select, options);
     if (count == 0 || count > 128u || (restore ? count != length : count > length)) return 0;
     if (!restore) {
@@ -3279,14 +3265,14 @@ static ControllerNativeDefaultResult controller_reset_form(
     size_t visited = 0;
     for (lxb_dom_node_t *at = form->first_child;
          at != NULL && visited++ < 65536u;) {
-        bool admitted = node_name_is(at, "input")
-            || node_name_is(at, "textarea")
-            || (node_name_is(at, "option")
+        bool admitted = document_element_name_is(at, "input")
+            || document_element_name_is(at, "textarea")
+            || (document_element_name_is(at, "option")
                 && has_attribute(
                     at, "data-tilefinch-option-selected"));
         if (admitted && ++admitted_count > 128u)
             return CONTROLLER_NATIVE_DEFAULT_FAILED;
-        if (node_name_is(at, "option")
+        if (document_element_name_is(at, "option")
             && has_attribute(at, "data-tilefinch-option-selected")) {
             size_t marker_length = 0;
             const char *marker = document_attribute(
@@ -3317,7 +3303,7 @@ static ControllerNativeDefaultResult controller_reset_form(
     visited = 0;
     for (lxb_dom_node_t *at = form->first_child;
          at != NULL && visited++ < 65536u;) {
-        if (node_name_is(at, "input")) {
+        if (document_element_name_is(at, "input")) {
             ControllerResetSnapshot *snapshot =
                 &snapshots[snapshot_count++];
             snapshot->node = at;
@@ -3343,7 +3329,7 @@ static ControllerNativeDefaultResult controller_reset_form(
                     snapshot->kind = CONTROLLER_RESET_VALUE;
                 }
             }
-        } else if (node_name_is(at, "textarea")) {
+        } else if (document_element_name_is(at, "textarea")) {
             ControllerResetSnapshot *snapshot =
                 &snapshots[snapshot_count++];
             snapshot->node = at;
@@ -3355,7 +3341,7 @@ static ControllerNativeDefaultResult controller_reset_form(
                 if (!snapshot->value_state.default_value_known) goto failed;
                 snapshot->kind = CONTROLLER_RESET_VALUE;
             }
-        } else if (node_name_is(at, "option")
+        } else if (document_element_name_is(at, "option")
                    && has_attribute(
                           at, "data-tilefinch-option-selected")) {
             ControllerResetSnapshot *snapshot =
@@ -3467,8 +3453,8 @@ static lxb_dom_node_t *controller_label_control(
         } else if (at == label) {
             continue;
         }
-        if (node_name_is(at, "input") || node_name_is(at, "button")
-            || node_name_is(at, "select") || node_name_is(at, "textarea")) {
+        if (document_element_name_is(at, "input") || document_element_name_is(at, "button")
+            || document_element_name_is(at, "select") || document_element_name_is(at, "textarea")) {
             return at;
         }
         if (for_value != NULL && for_length != 0) return NULL;
@@ -3482,28 +3468,28 @@ static ControllerNativeDefaultResult controller_native_default(
     if (controller == NULL || node == NULL || depth > 1u
         || node_effectively_disabled(node)) return CONTROLLER_NATIVE_DEFAULT_NONE;
     ControllerNativeDefaultResult result = CONTROLLER_NATIVE_DEFAULT_NONE;
-    if (node_name_is(node, "input")
+    if (document_element_name_is(node, "input")
         && (attribute_is(node, "type", "checkbox")
             || attribute_is(node, "type", "radio"))) {
         result = controller_toggle_choice(controller, node);
-    } else if (node_name_is(node, "input")
+    } else if (document_element_name_is(node, "input")
                && attribute_is(node, "type", "range")) {
         result = controller_advance_range(controller, node);
-    } else if (node_name_is(node, "select")) {
+    } else if (document_element_name_is(node, "select")) {
         result = controller_advance_select(controller, node);
-    } else if ((node_name_is(node, "input")
-                || node_name_is(node, "button"))
+    } else if ((document_element_name_is(node, "input")
+                || document_element_name_is(node, "button"))
                && attribute_is(node, "type", "reset")) {
         lxb_dom_node_t *form = form_ancestor(node);
         result = form == NULL ? CONTROLLER_NATIVE_DEFAULT_NONE
                               : controller_reset_form(controller, form);
-    } else if (node_name_is(node, "summary")
+    } else if (document_element_name_is(node, "summary")
                && node->parent != NULL
-               && node_name_is(node->parent, "details")) {
+               && document_element_name_is(node->parent, "details")) {
         lxb_dom_node_t *first_summary = NULL;
         for (lxb_dom_node_t *child = node->parent->first_child;
              child != NULL; child = child->next) {
-            if (node_name_is(child, "summary")) {
+            if (document_element_name_is(child, "summary")) {
                 first_summary = child;
                 break;
             }
@@ -3522,7 +3508,7 @@ static ControllerNativeDefaultResult controller_native_default(
             (void) controller_native_default_refresh_changed(controller, node->parent);
             return CONTROLLER_NATIVE_DEFAULT_FAILED;
         }
-    } else if (node_name_is(node, "label")) {
+    } else if (document_element_name_is(node, "label")) {
         lxb_dom_node_t *control = controller_label_control(controller, node);
         result = control == NULL ? CONTROLLER_NATIVE_DEFAULT_NONE
             : controller_native_default(controller, control, depth + 1u);
@@ -3822,7 +3808,7 @@ static void controller_note_stopped_scripts(
                == CONTROLLER_ACTIVATION_RUNTIME_UNAVAILABLE
         && navigation->page.runtime == NULL
         && navigation->page.script_stop.reason != NAVIGATION_SCRIPT_STOP_NONE
-        && !node_name_is(node, "label");
+        && !document_element_name_is(node, "label");
 }
 
 bool controller_activate(BrowserController *controller,
@@ -3933,8 +3919,8 @@ bool controller_activate(BrowserController *controller,
            page's handler cancels it or fails (a page player whose own
            play() has nothing the PSP can open would otherwise leave Cross
            doing nothing). */
-        bool media_element = node_name_is(node, "video")
-            || node_name_is(node, "audio");
+        bool media_element = document_element_name_is(node, "video")
+            || document_element_name_is(node, "audio");
         action->activation_outcome =
             controller_dispatch_activation(controller, node);
         if (action->activation_outcome == CONTROLLER_ACTIVATION_CANCELLED
@@ -3954,7 +3940,7 @@ bool controller_activate(BrowserController *controller,
             return true;
         }
         if (media_element
-            && (node_name_is(node, "video") || node_name_is(node, "audio")))
+            && (document_element_name_is(node, "video") || document_element_name_is(node, "audio")))
             return controller_build_media_action(controller, node, action);
         bool native_nothing = false;
         if (action->activation_outcome
@@ -3974,7 +3960,7 @@ bool controller_activate(BrowserController *controller,
             action->type = CONTROLLER_ACTION_NONE;
             return true;
         }
-        if (node_name_is(node, "video") || node_name_is(node, "audio")) {
+        if (document_element_name_is(node, "video") || document_element_name_is(node, "audio")) {
             return controller_build_media_action(
                 controller, node, action);
         }
@@ -4049,8 +4035,8 @@ bool controller_activate(BrowserController *controller,
         }
         if (action->type == CONTROLLER_ACTION_NONE) {
             return true;
-        } else if (node_name_is(node, "video")
-                   || node_name_is(node, "audio")) {
+        } else if (document_element_name_is(node, "video")
+                   || document_element_name_is(node, "audio")) {
             return controller_build_media_action(
                 controller, node, action);
         } else {

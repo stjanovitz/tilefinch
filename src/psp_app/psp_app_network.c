@@ -770,7 +770,7 @@ static bool psp_connect_network_prepared(PspNetwork *network, int profile_index,
                     || now_us - last_present_us
                            >= PSP_NETWORK_PRESENT_INTERVAL_US);
             char status[64];
-            snprintf(status, sizeof(status), "NETWORK %s - CIRCLE CANCELS",
+            snprintf(status, sizeof(status), "NETWORK %s  O CANCEL",
                      psp_network_status_name(network->status));
             if (presentation_due) {
                 psp_ui_show_status(ui, status, 120);

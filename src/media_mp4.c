@@ -1,4 +1,5 @@
 #include "tilefinch/media_mp4.h"
+#include "tilefinch/platform.h"
 
 #include "media_mp4_policy.h"
 #include "media_video_geometry.h"
@@ -177,15 +178,7 @@ static uint64_t mp4_u64(const unsigned char *bytes)
     return ((uint64_t) mp4_u32(bytes) << 32) | mp4_u32(bytes + 4);
 }
 
-static void mp4_error(char *error, size_t error_size,
-                      const char *format, ...)
-{
-    if (error == NULL || error_size == 0) return;
-    va_list arguments;
-    va_start(arguments, format);
-    vsnprintf(error, error_size, format, arguments);
-    va_end(arguments);
-}
+#define mp4_error tilefinch_format_error
 
 static void mp4_reader_error(
     const MediaRangeReader *reader, char *error, size_t error_size,
@@ -2684,7 +2677,7 @@ bool media_mp4_read_sample_waiting(MediaMp4Demux *demux,
         demux, sample, destination, capacity, true);
 }
 
-static uint64_t mp4_sample_time_us(const MediaMp4Sample *sample)
+uint64_t media_mp4_sample_dts_us(const MediaMp4Sample *sample)
 {
     return media_ticks_to_us(sample->dts, sample->timescale);
 }
@@ -2806,7 +2799,7 @@ static bool media_mp4_seek_internal(MediaMp4Demux *demux,
             .dts = selected_dts,
             .timescale = demux->tracks[video_index].info.timescale
         };
-        selected_us = mp4_sample_time_us(&selected_sample);
+        selected_us = media_mp4_sample_dts_us(&selected_sample);
     } else if (video_index != SIZE_MAX) {
         uint64_t selected_dts = 0;
         for (;;) {
@@ -2857,7 +2850,7 @@ static bool media_mp4_seek_internal(MediaMp4Demux *demux,
             .dts = selected_dts,
             .timescale = demux->tracks[video_index].info.timescale
         };
-        selected_us = mp4_sample_time_us(&selected_sample);
+        selected_us = media_mp4_sample_dts_us(&selected_sample);
     } else {
         selected_us = target_us;
     }

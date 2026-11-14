@@ -628,6 +628,139 @@ static int test_control_value_beside_nonce(void)
     return 0;
 }
 
+/* <meta http-equiv="Content-Security-Policy">: policies join the header's
+   (every one must allow), frame-ancestors is dropped, an identical policy
+   is stored once, storage overflow fails closed, and only metas in the
+   head count. */
+static int test_meta_policies(void)
+{
+    /* No header: a meta policy alone is enforced, with 'self' bound to the
+       document; frame-ancestors in it is ignored. */
+    TilefinchContentSecurityPolicy csp = {0};
+    CHECK(!tilefinch_csp_enforced(&csp));
+    tilefinch_csp_bind_document_origin(&csp, "https://page.test/a/b");
+    static const char first[] =
+        "frame-ancestors 'none'; script-src 'self'; connect-src 'self'";
+    CHECK(tilefinch_csp_add_meta_policy(&csp, first, sizeof(first) - 1u));
+    CHECK(tilefinch_csp_enforced(&csp) && csp.valid && !csp.header_present
+          && csp.policy_count == 1u && csp.policies[0].meta);
+    CHECK(!tilefinch_csp_has_frame_ancestors(&csp));
+    CHECK(tilefinch_csp_allows_request(
+        &csp, TILEFINCH_DESTINATION_SCRIPT, "https://page.test/app.js"));
+    CHECK(!tilefinch_csp_allows_request(
+        &csp, TILEFINCH_DESTINATION_SCRIPT, "https://other.test/app.js"));
+    CHECK(!tilefinch_csp_allows_dynamic_code(&csp));
+    CHECK(!tilefinch_csp_allows_script_attribute(&csp));
+    /* Sockets are checked in their http(s) form (wss -> https). */
+    CHECK(tilefinch_csp_allows_websocket(&csp, "https://page.test/feed", 0));
+    CHECK(!tilefinch_csp_allows_websocket(&csp, "https://other.test/feed", 0));
+    /* Every consumer reads the same policy list: frames, workers, styles,
+       fonts, media and fetch all see a meta default-src. */
+    TilefinchContentSecurityPolicy every = {0};
+    tilefinch_csp_bind_document_origin(&every, "https://page.test/");
+    static const char everything[] = "default-src 'self'";
+    CHECK(tilefinch_csp_add_meta_policy(&every, everything,
+                                        sizeof(everything) - 1u));
+    static const TilefinchRequestDestination destinations[] = {
+        TILEFINCH_DESTINATION_FRAME, TILEFINCH_DESTINATION_SCRIPT,
+        TILEFINCH_DESTINATION_STYLE, TILEFINCH_DESTINATION_IMAGE,
+        TILEFINCH_DESTINATION_FETCH, TILEFINCH_DESTINATION_FONT,
+        TILEFINCH_DESTINATION_MEDIA, TILEFINCH_DESTINATION_WORKER,
+    };
+    for (size_t i = 0; i < sizeof(destinations) / sizeof(destinations[0]);
+         i++) {
+        CHECK(tilefinch_csp_allows_request(
+            &every, destinations[i], "https://page.test/r"));
+        CHECK(!tilefinch_csp_allows_request(
+            &every, destinations[i], "https://other.test/r"));
+    }
+    CHECK(tilefinch_csp_allows_worker(&every, "https://page.test/w.js"));
+    CHECK(!tilefinch_csp_allows_worker(&every, "https://other.test/w.js"));
+    /* The same text again changes nothing; a comma-separated list adds
+       each new policy. */
+    CHECK(!tilefinch_csp_add_meta_policy(&csp, first, sizeof(first) - 1u));
+    static const char list[] =
+        " script-src 'self' , img-src 'none' ,,";
+    CHECK(tilefinch_csp_add_meta_policy(&csp, list, sizeof(list) - 1u));
+    CHECK(csp.policy_count == 3u);
+    CHECK(!tilefinch_csp_allows_request(
+        &csp, TILEFINCH_DESTINATION_IMAGE, "https://page.test/a.png"));
+
+    /* Beside a header policy: both must allow, and the header's
+       frame-ancestors is kept. */
+    static const char header[] =
+        "content-security-policy: frame-ancestors 'self'; "
+        "script-src 'self' https://cdn.test 'unsafe-eval'\n";
+    CHECK(tilefinch_csp_parse_response_headers(
+        &csp, "https://page.test/", header, sizeof(header) - 1u, false));
+    CHECK(tilefinch_csp_allows_dynamic_code(&csp));
+    static const char narrower[] = "script-src https://cdn.test";
+    CHECK(tilefinch_csp_add_meta_policy(&csp, narrower,
+                                        sizeof(narrower) - 1u));
+    CHECK(csp.header_present && csp.policy_count == 2u);
+    CHECK(tilefinch_csp_has_frame_ancestors(&csp));
+    CHECK(tilefinch_csp_allows_request(
+        &csp, TILEFINCH_DESTINATION_SCRIPT, "https://cdn.test/lib.js"));
+    CHECK(!tilefinch_csp_allows_request(
+        &csp, TILEFINCH_DESTINATION_SCRIPT, "https://page.test/app.js"));
+    CHECK(!tilefinch_csp_allows_dynamic_code(&csp));
+
+    /* More policies than the bounded table holds: fail closed. */
+    TilefinchContentSecurityPolicy many = {0};
+    char text[32];
+    bool overflowed = false;
+    for (int i = 0; i < (int) TILEFINCH_CSP_POLICY_LIMIT + 1; i++) {
+        int length = snprintf(text, sizeof(text), "img-src https://h%d.test",
+                              i);
+        (void) tilefinch_csp_add_meta_policy(&many, text, (size_t) length);
+        if (!many.valid) overflowed = true;
+    }
+    CHECK(overflowed && many.policy_count == TILEFINCH_CSP_POLICY_LIMIT);
+    CHECK(!tilefinch_csp_allows_request(
+        &many, TILEFINCH_DESTINATION_SCRIPT, "https://h0.test/a.js"));
+
+    /* The document scan: head metas only, the exact keyword in any case,
+       not Report-Only, and a removed meta's policy stays. */
+    static const char html[] =
+        "<!doctype html><head>"
+        "<meta http-equiv=CONTENT-security-POLICY content=\"img-src 'self'\">"
+        "<meta http-equiv=Content-Security-Policy-Report-Only "
+        "content=\"script-src 'none'\">"
+        "<meta http-equiv=Content-Security-Policy content=\"\">"
+        "</head><body>"
+        "<meta http-equiv=Content-Security-Policy content=\"style-src 'none'\">"
+        "</body>";
+    Budget budget;
+    budget_init(&budget, 8u * 1024u * 1024u);
+    budget_install_lexbor(&budget);
+    PocDocument document = {0};
+    CHECK(document_parse(
+        &document, &budget, html, sizeof(html) - 1, sizeof(html)));
+    TilefinchContentSecurityPolicy *page = &document.content_security_policy;
+    tilefinch_csp_bind_document_origin(page, "https://page.test/");
+    CHECK(document_apply_meta_csp(&document, true));
+    CHECK(page->policy_count == 1u);
+    CHECK(!tilefinch_csp_allows_request(
+        page, TILEFINCH_DESTINATION_IMAGE, "https://other.test/a.png"));
+    CHECK(tilefinch_csp_allows_request(
+        page, TILEFINCH_DESTINATION_SCRIPT, "https://other.test/a.js"));
+    CHECK(tilefinch_csp_allows_request(
+        page, TILEFINCH_DESTINATION_STYLE, "https://other.test/a.css"));
+    CHECK(!document_apply_meta_csp(&document, true));
+    lxb_dom_node_t *meta = find_element(
+        lxb_dom_interface_node(document.html), "meta");
+    CHECK(meta != NULL);
+    lxb_dom_node_remove(meta);
+    lxb_dom_node_destroy(meta);
+    CHECK(!document_apply_meta_csp(&document, true));
+    CHECK(page->policy_count == 1u);
+    CHECK(!tilefinch_csp_allows_request(
+        page, TILEFINCH_DESTINATION_IMAGE, "https://other.test/a.png"));
+    document_destroy(&document);
+    CHECK(budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 static int test_bounded_failure_and_framing(void)
 {
     TilefinchContentSecurityPolicy csp;
@@ -759,6 +892,7 @@ int main(void)
     CHECK(test_inline_slots_and_strict_dynamic() == 0);
     CHECK(test_control_value_beside_nonce() == 0);
     CHECK(test_bounded_failure_and_framing() == 0);
+    CHECK(test_meta_policies() == 0);
     puts("content security policy tests passed");
     return 0;
 }

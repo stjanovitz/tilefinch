@@ -1266,6 +1266,9 @@ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx);
 #define JS_WRITE_OBJ_REFERENCE (1 << 3) /* allow object references to
                                            encode arbitrary object
                                            graph */
+/* Tilefinch: name the runtime's JS_PinAtomTable() atoms by index. Only a
+   runtime holding the same table reads the result. */
+#define JS_WRITE_OBJ_PINNED_ATOMS (1 << 4)
 uint8_t *JS_WriteObject(JSContext *ctx, size_t *psize, JSValueConst obj,
                         int flags);
 uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValueConst obj,
@@ -1282,6 +1285,9 @@ uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValueConst obj,
 #define JS_READ_OBJ_PLATFORM_METHODS (1 << 4)
 JSValue JS_ReadObject(JSContext *ctx, const uint8_t *buf, size_t buf_len,
                       int flags);
+/* Tilefinch: see quickjs.c. */
+int JS_PinAtomTable(JSRuntime *rt, const uint8_t *table, size_t length);
+uint32_t JS_GetPinnedAtomCount(JSRuntime *rt);
 /* instantiate and evaluate a bytecode function. Only used when
    reading a script or module with JS_ReadObject() */
 JSValue JS_EvalFunction(JSContext *ctx, JSValue fun_obj);

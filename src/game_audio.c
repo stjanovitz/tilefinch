@@ -34,6 +34,46 @@ typedef struct {
     uint32_t points[TILEFINCH_GAME_AUDIO_CURVE_POINT_LIMIT];
 } GameAudioCurveState;
 
+/* Program voices (src/game_audio_program.inc): a voice whose gains, pitch
+   or filter follow automation lanes, plays a float32 buffer, or passes
+   through a BiquadFilterNode. Published by the browser thread as a
+   seqlock-protected word block; the mixer decodes a private copy. */
+#define GAME_AUDIO_PROGRAM_WORDS 13u
+#define GAME_AUDIO_LANE_SEGMENTS TILEFINCH_AUDIO_TIMELINE_SEGMENT_LIMIT
+typedef struct GameAudioLane GameAudioLane;
+typedef struct GameAudioProgramScratch GameAudioProgramScratch;
+
+typedef struct {
+    uint32_t generation;
+    float gain_left, gain_right, pitch, detune, detune_factor;
+    float filter_values[4];
+    uint8_t gain_lanes[TILEFINCH_GAME_AUDIO_PROGRAM_GAIN_LANES];
+    uint8_t filter_lanes[4];
+    uint8_t pre_filter, pitch_lane, detune_lane, filter;
+    /* The analyser tap (game_audio_program.inc); analyser is a slot + 1. */
+    float tap_gain;
+    uint8_t analyser, tap_lanes;
+    bool tap_after_filter, muted, source_silent;
+} GameAudioProgramState;
+
+/* An AnalyserNode's input history. The browser thread allocates it; the
+   mixer appends what the voices feeding it played; it is freed once no
+   voice program names it and no block that began before is running. */
+typedef struct {
+    float *history;
+    _Atomic uint32_t written;
+    uint32_t generation, free_epoch;
+    uint32_t cleared_at; /* browser: written when last silenced */
+    bool retired;
+} GameAudioAnalyser;
+
+typedef struct {
+    float z[2][2];          /* transposed direct form II, per channel */
+    float coefficients[5];  /* b0 b1 b2 a1 a2, normalized by a0 */
+    float inputs[4];        /* the frequency, detune, Q and gain they use */
+    bool valid;
+} GameAudioFilterState;
+
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
 static _Atomic bool game_audio_validation_muted;
 static _Atomic bool game_audio_validation_mix_enabled;
@@ -136,10 +176,18 @@ void tilefinch_game_audio_validation_mute_output(bool muted)
 
 typedef struct {
     int16_t *samples;
+    /* Float32 planes (createBuffer, or a decoded buffer after
+       getChannelData): planes[channel * frames + frame]. The storage is
+       reference counted, so JavaScript views may outlive the slot. */
+    float *planes;
+    TilefinchGameAudioStorage *storage;
+    size_t bytes;
     uint32_t frames;
     uint32_t sample_rate;
     uint32_t generation;
+    uint32_t free_epoch;
     uint8_t channels;
+    bool retired;
 } GameAudioBuffer;
 
 typedef struct {
@@ -173,7 +221,25 @@ typedef struct {
     uint32_t mixer_coefficient_q15;
     GameAudioCurve gain_curve, pitch_curve;
     GameAudioCurveState mixer_gain_curve, mixer_pitch_curve;
-    uint8_t kind;
+    /* 0: the integer paths below; 1: program voice. Never returns to 0
+       during a voice's life. */
+    _Atomic uint32_t program_mode;
+    _Atomic uint32_t program_generation;
+    _Atomic uint32_t program_words[GAME_AUDIO_PROGRAM_WORDS];
+    /* The generation the mixer decoded last. */
+    _Atomic uint32_t program_ack;
+    /* Browser: lanes the current program names, and those any program the
+       mixer may still be using names. */
+    uint32_t program_lane_current, program_lane_mask;
+    /* Float planes captured at start (NULL: the buffer's integer PCM). */
+    const float *program_planes;
+    /* The playback rate an integer-path buffer voice started with. */
+    double legacy_rate;
+    /* Output frame = context frame + lane_anchor, fixed at start. */
+    uint32_t lane_anchor;
+    GameAudioProgramState mixer_program;
+    GameAudioFilterState filter_state;
+    uint8_t kind; /* 0 buffer, 1 oscillator, 2 microphone stream */
     uint8_t oscillator_type;
     bool loop;
 } GameAudioVoice;
@@ -184,6 +250,20 @@ struct TilefinchGameAudio {
     GameAudioBuffer buffers[TILEFINCH_GAME_AUDIO_BUFFER_LIMIT];
     GameAudioVoice voices[TILEFINCH_GAME_AUDIO_VOICE_LIMIT];
     size_t pcm_bytes;
+    GameAudioLane *lanes[TILEFINCH_GAME_AUDIO_LANE_LIMIT];
+    uint32_t lane_generations[TILEFINCH_GAME_AUDIO_LANE_LIMIT];
+    uint32_t lane_retire_epoch[TILEFINCH_GAME_AUDIO_LANE_LIMIT];
+    GameAudioProgramScratch *scratch;
+    GameAudioAnalyser analysers[TILEFINCH_GAME_AUDIO_ANALYSER_LIMIT];
+    /* Microphone samples for stream voices: the browser thread writes and
+       publishes stream_written; each stream voice keeps its own cursor. */
+    int16_t *stream;
+    _Atomic uint32_t stream_written;
+    _Atomic bool stream_audible;
+    /* Odd while tilefinch_game_audio_mix runs: a retired lane is freed only
+       once no block that may still read it is in progress. */
+    _Atomic uint32_t mix_epoch;
+    uint32_t mix_blocks;
     _Atomic uint32_t output_frame;
     _Atomic bool suspended;
     _Atomic bool stop;
@@ -206,6 +286,18 @@ struct TilefinchGameAudio {
     _Atomic bool worker_exited;
 #endif
 };
+
+static void game_audio_collect(TilefinchGameAudio *audio);
+
+typedef struct {
+    const uint32_t *words;
+    uint32_t mask;
+} GameAudioProgramStart;
+
+static bool game_audio_buffer_free(const GameAudioBuffer *buffer)
+{
+    return buffer->samples == NULL && buffer->planes == NULL;
+}
 
 static uint16_t read_u16(const unsigned char *at)
 {
@@ -233,8 +325,16 @@ TilefinchGameAudio *tilefinch_game_audio_create(Budget *budget)
     atomic_init(&audio->suspended, true);
     atomic_init(&audio->stop, false);
     atomic_init(&audio->output_frame, 0u);
+    atomic_init(&audio->mix_epoch, 0u);
+    for (size_t i = 0; i < TILEFINCH_GAME_AUDIO_BUFFER_LIMIT; i++)
+        audio->buffers[i].free_epoch = UINT32_MAX;
     for (size_t i = 0; i < TILEFINCH_GAME_AUDIO_VOICE_LIMIT; i++) {
         atomic_init(&audio->voices[i].active, 0u);
+        atomic_init(&audio->voices[i].program_mode, 0u);
+        atomic_init(&audio->voices[i].program_generation, 0u);
+        atomic_init(&audio->voices[i].program_ack, 0u);
+        for (size_t word = 0; word < GAME_AUDIO_PROGRAM_WORDS; word++)
+            atomic_init(&audio->voices[i].program_words[word], 0u);
         atomic_init(&audio->voices[i].stop_output_frame, UINT32_MAX);
         atomic_init(&audio->voices[i].step_fraction, 0u);
         atomic_init(&audio->voices[i].gains_q8, 0u);
@@ -310,13 +410,14 @@ bool tilefinch_game_audio_decode_wav(
     size_t sample_count = frames * (size_t) channels;
     if (sample_count > SIZE_MAX / sizeof(int16_t)) return false;
     size_t decoded_bytes = sample_count * sizeof(int16_t);
+    game_audio_collect(audio);
     if (decoded_bytes > TILEFINCH_GAME_AUDIO_PCM_BYTE_LIMIT
         || decoded_bytes
                > TILEFINCH_GAME_AUDIO_PCM_BYTE_LIMIT - audio->pcm_bytes)
         return false;
     size_t slot = TILEFINCH_GAME_AUDIO_BUFFER_LIMIT;
     for (size_t i = 0; i < TILEFINCH_GAME_AUDIO_BUFFER_LIMIT; i++) {
-        if (audio->buffers[i].samples == NULL) { slot = i; break; }
+        if (game_audio_buffer_free(&audio->buffers[i])) { slot = i; break; }
     }
     if (slot == TILEFINCH_GAME_AUDIO_BUFFER_LIMIT) return false;
     int16_t *decoded = budget_malloc_category(
@@ -331,8 +432,10 @@ bool tilefinch_game_audio_decode_wav(
     }
     GameAudioBuffer *buffer = &audio->buffers[slot];
     buffer->generation++;
-    if (buffer->generation == 0) buffer->generation = 1;
+    if (buffer->generation == 0 || buffer->generation > (UINT32_MAX >> 4))
+        buffer->generation = 1;
     buffer->samples = decoded;
+    buffer->bytes = decoded_bytes;
     buffer->frames = (uint32_t) frames;
     buffer->sample_rate = sample_rate;
     buffer->channels = (uint8_t) channels;
@@ -353,7 +456,7 @@ static GameAudioBuffer *game_audio_buffer(
         return NULL;
     GameAudioBuffer *buffer = &audio->buffers[slot - 1u];
     if (generation == 0 || buffer->generation != generation
-        || buffer->samples == NULL) return NULL;
+        || game_audio_buffer_free(buffer) || buffer->retired) return NULL;
     if (index != NULL) *index = slot - 1u;
     return buffer;
 }
@@ -664,11 +767,24 @@ static GameAudioVoice *game_audio_claim_voice(
         atomic_store_explicit(
             &voice->envelope_generation, envelope_generation,
             memory_order_release);
+        /* A claimed slot starts on the integer paths with no program. */
+        atomic_store_explicit(&voice->program_mode, 0u, memory_order_relaxed);
+        voice->mixer_program.generation = 0u;
+        voice->program_lane_current = voice->program_lane_mask = 0u;
+        voice->program_planes = NULL;
+        voice->lane_anchor = 0u;
+        voice->legacy_rate = 0.0;
+        memset(&voice->filter_state, 0, sizeof(voice->filter_state));
         *voice_handle = (voice->generation << 4) | (uint32_t) (i + 1u);
         return voice;
     }
     return NULL;
 }
+
+/* Browser-owned initialization of a program voice, before publication. */
+static void game_audio_stage_program(GameAudioVoice *voice,
+                                     const GameAudioProgramStart *staged,
+                                     uint32_t anchor);
 
 static void game_audio_publish_voice(TilefinchGameAudio *audio,
                                      GameAudioVoice *voice)
@@ -677,16 +793,18 @@ static void game_audio_publish_voice(TilefinchGameAudio *audio,
     game_audio_platform_wake(audio);
 }
 
-bool tilefinch_game_audio_start(
+static bool game_audio_start_voice(
     TilefinchGameAudio *audio, uint32_t handle, double offset_seconds,
     double duration_seconds, double playback_rate, double gain_left,
     double gain_right, bool loop, double loop_start_seconds,
-    double loop_end_seconds, double start_delay_seconds,
-    uint32_t *voice_handle)
+    double loop_end_seconds, double start_delay_seconds, uint32_t anchor,
+    const GameAudioProgramStart *staged, uint32_t *voice_handle)
 {
     size_t buffer_index = 0;
     uint32_t delay_frames = 0;
     GameAudioBuffer *buffer = game_audio_buffer(audio, handle, &buffer_index);
+    /* The integer paths read integer PCM only. */
+    if (buffer != NULL && staged == NULL && buffer->samples == NULL) return false;
     if (buffer == NULL || voice_handle == NULL || !isfinite(offset_seconds)
         || !isfinite(duration_seconds) || !isfinite(playback_rate)
         || !isfinite(loop_start_seconds) || !isfinite(loop_end_seconds)
@@ -749,8 +867,26 @@ bool tilefinch_game_audio_start(
         &voice->gains_q8, game_audio_gains_q8(gain_left, gain_right),
         memory_order_relaxed);
     voice->loop = loop;
+    voice->legacy_rate = playback_rate;
+    voice->lane_anchor = anchor;
+    if (staged != NULL) {
+        voice->program_planes = buffer->planes;
+        game_audio_stage_program(voice, staged, anchor);
+    }
     game_audio_publish_voice(audio, voice);
     return true;
+}
+
+bool tilefinch_game_audio_start(
+    TilefinchGameAudio *audio, uint32_t handle, double offset_seconds,
+    double duration_seconds, double playback_rate, double gain_left,
+    double gain_right, bool loop, double loop_start_seconds,
+    double loop_end_seconds, double start_delay_seconds,
+    uint32_t *voice_handle)
+{
+    return game_audio_start_voice(audio, handle, offset_seconds, duration_seconds,
+        playback_rate, gain_left, gain_right, loop, loop_start_seconds,
+        loop_end_seconds, start_delay_seconds, 0u, NULL, voice_handle);
 }
 
 static bool game_audio_oscillator_step(double frequency, uint32_t *step)
@@ -763,10 +899,11 @@ static bool game_audio_oscillator_step(double frequency, uint32_t *step)
     return true;
 }
 
-bool tilefinch_game_audio_start_oscillator(
+static bool game_audio_start_oscillator_voice(
     TilefinchGameAudio *audio, TilefinchGameAudioOscillatorType type,
     double frequency, double gain_left, double gain_right,
-    double start_delay_seconds, uint32_t *voice_handle)
+    double start_delay_seconds, uint32_t anchor,
+    const GameAudioProgramStart *staged, uint32_t *voice_handle)
 {
     uint32_t step = 0, delay_frames = 0;
     if (type < TILEFINCH_GAME_AUDIO_OSCILLATOR_SINE
@@ -793,8 +930,19 @@ bool tilefinch_game_audio_start_oscillator(
         &voice->gains_q8, game_audio_gains_q8(gain_left, gain_right),
         memory_order_relaxed);
     voice->loop = false;
+    voice->lane_anchor = anchor;
+    if (staged != NULL) game_audio_stage_program(voice, staged, anchor);
     game_audio_publish_voice(audio, voice);
     return true;
+}
+
+bool tilefinch_game_audio_start_oscillator(
+    TilefinchGameAudio *audio, TilefinchGameAudioOscillatorType type,
+    double frequency, double gain_left, double gain_right,
+    double start_delay_seconds, uint32_t *voice_handle)
+{
+    return game_audio_start_oscillator_voice(audio, type, frequency, gain_left,
+        gain_right, start_delay_seconds, 0u, NULL, voice_handle);
 }
 
 static GameAudioVoice *game_audio_voice(TilefinchGameAudio *audio,
@@ -1206,11 +1354,22 @@ static bool game_audio_fast_forward_silent(
     return true;
 }
 
+#include "game_audio_program.inc"
+
+static void game_audio_stage_program(GameAudioVoice *voice,
+                                     const GameAudioProgramStart *staged,
+                                     uint32_t anchor)
+{
+    voice->lane_anchor = anchor;
+    game_audio_program_store(voice, staged->words, staged->mask);
+    game_audio_voice_program_mode(voice);
+}
+
 static void game_audio_mix_constant_spans(
     TilefinchGameAudio *audio, int16_t *stereo, size_t frames,
     const uint8_t *slots, size_t count, const uint8_t *paths,
     const uint32_t *steps, const uint16_t *left_gains,
-    const uint16_t *right_gains)
+    const uint16_t *right_gains, const int32_t *program)
 {
     /* The admission below excludes automation, events and stereo buffers.
        Retain voice order, exact signed division, phase/position updates, and
@@ -1218,7 +1377,8 @@ static void game_audio_mix_constant_spans(
     _Static_assert(TILEFINCH_GAME_AUDIO_VOICE_LIMIT <= 4u,
                    "constant accumulation bound");
     int32_t *sum = audio->constant_accum;
-    memset(sum, 0, frames * 2u * sizeof(*sum));
+    if (program != NULL) memcpy(sum, program, frames * 2u * sizeof(*sum));
+    else memset(sum, 0, frames * 2u * sizeof(*sum));
     for (size_t at = 0; at < count; at++) {
         size_t i = slots[at];
         GameAudioVoice *voice = &audio->voices[i];
@@ -1398,10 +1558,11 @@ static void game_audio_mix_active_spans(
     uint32_t block_start, const uint8_t *slots, size_t count,
     const uint32_t *steps, const uint16_t *left, const uint16_t *right,
     bool fast_enabled, bool automation_enabled, bool measure,
-    const uint8_t *paths)
+    const uint8_t *paths, const int32_t *program)
 {
     int32_t *sum = audio->constant_accum;
-    memset(sum, 0, frames * 2u * sizeof(*sum));
+    if (program != NULL) memcpy(sum, program, frames * 2u * sizeof(*sum));
+    else memset(sum, 0, frames * 2u * sizeof(*sum));
     for (size_t at = 0; at < count; at++) {
         size_t i = slots[at];
         GameAudioVoice *v = &audio->voices[i];
@@ -1455,7 +1616,11 @@ bool tilefinch_game_audio_mix(TilefinchGameAudio *audio, int16_t *stereo,
     constant_enabled = !audio->reference_mix && !audio->reference_constant_mix;
     automation_enabled = !audio->reference_mix && !audio->reference_automation_mix;
 #endif
+    /* Odd while this block may read lanes and buffers (game_audio_collect). */
+    atomic_fetch_add_explicit(&audio->mix_epoch, 1u, memory_order_seq_cst);
+    audio->mix_blocks++;
     bool claimed[TILEFINCH_GAME_AUDIO_VOICE_LIMIT] = {false};
+    bool program[TILEFINCH_GAME_AUDIO_VOICE_LIMIT] = {false};
     bool alive[TILEFINCH_GAME_AUDIO_VOICE_LIMIT] = {false};
     bool completed[TILEFINCH_GAME_AUDIO_VOICE_LIMIT] = {false};
     bool fast_forwarded[TILEFINCH_GAME_AUDIO_VOICE_LIMIT] = {false};
@@ -1473,6 +1638,14 @@ bool tilefinch_game_audio_mix(TilefinchGameAudio *audio, int16_t *stereo,
             &audio->voices[i].active, &expected, 3u,
             memory_order_acq_rel, memory_order_acquire);
         alive[i] = claimed[i];
+        if (claimed[i] && atomic_load_explicit(&audio->voices[i].program_mode,
+                                               memory_order_acquire) == 1u) {
+            /* Program voices (game_audio_program.inc) take no integer path. */
+            program[i] = true;
+            stop_frames[i] = atomic_load_explicit(
+                &audio->voices[i].stop_output_frame, memory_order_acquire);
+            continue;
+        }
         if (claimed[i]) {
             game_audio_curve_snapshot(&audio->voices[i].gain_curve,
                                        &audio->voices[i].mixer_gain_curve);
@@ -1584,7 +1757,7 @@ bool tilefinch_game_audio_mix(TilefinchGameAudio *audio, int16_t *stereo,
     uint8_t mixing_slots[TILEFINCH_GAME_AUDIO_VOICE_LIMIT];
     size_t mixing_count = 0;
     for (size_t i = 0; i < TILEFINCH_GAME_AUDIO_VOICE_LIMIT; i++)
-        if (!fast_enabled || (alive[i] && !fast_forwarded[i])) {
+        if (!program[i] && (!fast_enabled || (alive[i] && !fast_forwarded[i]))) {
             mixing_slots[mixing_count++] = (uint8_t) i;
             GameAudioVoice *voice = &audio->voices[i];
             GameAudioCurveState *gain = &voice->mixer_gain_curve;
@@ -1630,6 +1803,14 @@ bool tilefinch_game_audio_mix(TilefinchGameAudio *audio, int16_t *stereo,
             if ((path & 8u) != 0u) audio->silent_samples += (uint32_t) frames;
 #endif
         }
+    const int32_t *program_sum = game_audio_program_mix(
+        audio, frames, block_start, program, alive, completed, stop_frames);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    if (measure && program_sum != NULL) {
+        audio->validation_work.audible += (uint32_t) frames;
+        audio->validation_work.automated += (uint32_t) frames;
+    }
+#endif
     bool span_safe = false;
     if (audio->constant_accum != NULL && fast_enabled) {
         bool admitted = true, audible_oscillator = false;
@@ -1697,7 +1878,8 @@ bool tilefinch_game_audio_mix(TilefinchGameAudio *audio, int16_t *stereo,
         audio->constant_span_blocks++;
 #endif
         game_audio_mix_constant_spans(audio, stereo, frames, mixing_slots,
-            mixing_count, constant_paths, steps, gains_left, gains_right);
+            mixing_count, constant_paths, steps, gains_left, gains_right,
+            program_sum);
     } else if (active_safe) {
 #ifdef TILEFINCH_GAME_AUDIO_MIX_TEST
         audio->active_span_blocks++;
@@ -1710,10 +1892,11 @@ bool tilefinch_game_audio_mix(TilefinchGameAudio *audio, int16_t *stereo,
 #else
             false
 #endif
-            , constant_paths);
+            , constant_paths, program_sum);
     } else {
     for (size_t frame = 0; frame < frames; frame++) {
-        int left = 0, right = 0;
+        int left = program_sum != NULL ? program_sum[frame * 2u] : 0;
+        int right = program_sum != NULL ? program_sum[frame * 2u + 1u] : 0;
         uint32_t output_frame = block_start + (uint32_t) frame;
         for (size_t mixing_at = 0; mixing_at < mixing_count; mixing_at++) {
             size_t i = mixing_slots[mixing_at];
@@ -1913,6 +2096,7 @@ bool tilefinch_game_audio_mix(TilefinchGameAudio *audio, int16_t *stereo,
                 &audio->voices[i].active, 5u, memory_order_release);
         }
     }
+    atomic_fetch_add_explicit(&audio->mix_epoch, 1u, memory_order_seq_cst);
     return true;
 }
 
@@ -1920,9 +2104,20 @@ void tilefinch_game_audio_destroy(TilefinchGameAudio *audio)
 {
     if (audio == NULL) return;
     tilefinch_game_audio_suspend(audio);
-    for (size_t i = 0; i < TILEFINCH_GAME_AUDIO_BUFFER_LIMIT; i++)
+    for (size_t i = 0; i < TILEFINCH_GAME_AUDIO_BUFFER_LIMIT; i++) {
         budget_free(audio->budget, audio->buffers[i].samples);
+        tilefinch_game_audio_storage_release(audio->buffers[i].storage);
+    }
+    for (size_t i = 0; i < TILEFINCH_GAME_AUDIO_LANE_LIMIT; i++)
+        budget_free(audio->budget, audio->lanes[i]);
+    for (size_t i = 0; i < TILEFINCH_GAME_AUDIO_ANALYSER_LIMIT; i++)
+        budget_free(audio->budget, audio->analysers[i].history);
+    /* Microphone samples never outlive the engine, even in freed memory. */
+    if (audio->stream != NULL)
+        memset(audio->stream, 0, TILEFINCH_GAME_AUDIO_STREAM_SAMPLES * sizeof(*audio->stream));
+    budget_free(audio->budget, audio->stream);
     Budget *budget = audio->budget;
+    budget_free(budget, audio->scratch);
     budget_free(budget, audio->constant_accum);
     budget_free(budget, audio);
 }
@@ -2094,5 +2289,310 @@ bool tilefinch_game_audio_validation_constant_probe(TilefinchGameAudioMixProbe *
 bool tilefinch_game_audio_validation_automation_probe(TilefinchGameAudioMixProbe *out)
 {
     return game_audio_validation_probe(out, GAME_AUDIO_PROBE_AUTOMATION);
+}
+#endif
+
+#if !defined(PSP) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+/*
+ * Validation scenarios: fixed Web Audio programs rendered through the real
+ * mixer with no hardware output, so a host test (and its WAV dump) and a PSP
+ * validation run render the same thing. Shipping PSP builds carry none of it.
+ */
+static TilefinchGameAudio *game_audio_scenario_engine(Budget *budget)
+{
+    TilefinchGameAudio *audio = tilefinch_game_audio_create(budget);
+    /* Do not resume: no hardware output or worker thread. */
+    if (audio != NULL) atomic_store_explicit(&audio->suspended, false, memory_order_release);
+    return audio;
+}
+
+static bool game_audio_scenario_event(TilefinchGameAudio *audio, uint32_t lane,
+                                      TilefinchAudioEventKind kind, double value,
+                                      double time, double aux)
+{
+    return tilefinch_game_audio_lane_insert(audio, lane, 0, kind, value, time, aux, NULL, 0)
+        == TILEFINCH_AUDIO_TIMELINE_OK;
+}
+
+static bool game_audio_scenario_voice(TilefinchGameAudio *audio, uint32_t buffer,
+                                      uint8_t oscillator,
+                                      const TilefinchGameAudioProgram *program,
+                                      uint32_t *voice)
+{
+    TilefinchGameAudioVoiceStart start = {.buffer = buffer, .oscillator = oscillator};
+    return tilefinch_game_audio_start_program(audio, &start, program, voice);
+}
+
+/* Four oscillators, each with a gain ramp and its own swept lowpass: the
+   heaviest per-voice program the slots front-end builds. */
+static bool game_audio_scenario_four(TilefinchGameAudio *audio)
+{
+    for (unsigned i = 0; i < 4u; i++) {
+        uint32_t gain = 0, cutoff = 0, voice = 0;
+        if (!tilefinch_game_audio_lane_create(audio, 0, 0, 4, &gain)
+            || !tilefinch_game_audio_lane_create(audio, 300, 0, 22050, &cutoff)
+            || !game_audio_scenario_event(audio, gain, TILEFINCH_AUDIO_EVENT_SET, 0, 0, 0)
+            || !game_audio_scenario_event(audio, gain, TILEFINCH_AUDIO_EVENT_LINEAR, .2, .5, 0)
+            || !game_audio_scenario_event(audio, cutoff, TILEFINCH_AUDIO_EVENT_SET, 300, 0, 0)
+            || !game_audio_scenario_event(audio, cutoff, TILEFINCH_AUDIO_EVENT_EXPONENTIAL,
+                                          5000, .5, 0))
+            return false;
+        TilefinchGameAudioProgram p = {.gain_left = 1, .gain_right = 1,
+            .pitch = 220.0 + 110.0 * i, .filter = TILEFINCH_GAME_AUDIO_FILTER_LOWPASS};
+        p.gain_lanes[0] = gain;
+        p.filter_values[TILEFINCH_GAME_AUDIO_FILTER_FREQUENCY] = 300;
+        p.filter_values[TILEFINCH_GAME_AUDIO_FILTER_Q] = 4;
+        p.filter_lanes[TILEFINCH_GAME_AUDIO_FILTER_FREQUENCY] = cutoff;
+        if (!game_audio_scenario_voice(audio, 0, (uint8_t) (i + 1u), &p, &voice)) return false;
+    }
+    return true;
+}
+
+static bool game_audio_scenario_setup(TilefinchGameAudio *audio, unsigned scenario)
+{
+    TilefinchGameAudioProgram p = {.gain_left = 1, .gain_right = 1, .pitch = 1};
+    uint32_t lane = 0, voice = 0;
+    switch (scenario) {
+    case TILEFINCH_GAME_AUDIO_SCENARIO_BEEP:
+        /* 10 ms attack to 0.5, exponential decay to 0.001 by 300 ms. */
+        p.pitch = 880;
+        if (!tilefinch_game_audio_lane_create(audio, 0, 0, 4, &lane)
+            || !game_audio_scenario_event(audio, lane, TILEFINCH_AUDIO_EVENT_SET, 0, 0, 0)
+            || !game_audio_scenario_event(audio, lane, TILEFINCH_AUDIO_EVENT_LINEAR, .5, .01, 0)
+            || !game_audio_scenario_event(audio, lane, TILEFINCH_AUDIO_EVENT_EXPONENTIAL,
+                                          .001, .3, 0))
+            return false;
+        p.gain_lanes[0] = lane;
+        if (!game_audio_scenario_voice(audio, 0, TILEFINCH_GAME_AUDIO_OSCILLATOR_SINE, &p,
+                                       &voice))
+            return false;
+        tilefinch_game_audio_stop(audio, voice, .35);
+        return true;
+    case TILEFINCH_GAME_AUDIO_SCENARIO_NOISE: {
+        /* A quarter second of createBuffer noise under a setTargetAtTime
+           release from 20 ms. */
+        TilefinchGameAudioBufferInfo info;
+        TilefinchGameAudioStorage *storage = NULL;
+        if (!tilefinch_game_audio_create_buffer(audio, 1, 11025, 44100, &info)) return false;
+        float *plane = tilefinch_game_audio_channel_data(audio, info.handle, 0, &storage);
+        if (plane == NULL) return false;
+        uint32_t state = 0x2545F491u;
+        for (uint32_t at = 0; at < info.frames; at++) {
+            state = state * 1664525u + 1013904223u;
+            plane[at] = (float) (int32_t) state * (1.0f / 2147483648.0f);
+        }
+        tilefinch_game_audio_storage_release(storage);
+        if (!tilefinch_game_audio_lane_create(audio, .8, 0, 4, &lane)
+            || !game_audio_scenario_event(audio, lane, TILEFINCH_AUDIO_EVENT_SET, .8, 0, 0)
+            || !game_audio_scenario_event(audio, lane, TILEFINCH_AUDIO_EVENT_TARGET, 0, .02,
+                                          .05))
+            return false;
+        p.gain_lanes[0] = lane;
+        bool okay = game_audio_scenario_voice(audio, info.handle, 0, &p, &voice);
+        tilefinch_game_audio_buffer_release(audio, info.handle);
+        return okay;
+    }
+    case TILEFINCH_GAME_AUDIO_SCENARIO_SWEEP:
+        /* A 220 Hz sawtooth under a Q 8 lowpass swept 200 Hz -> 8 kHz. */
+        p.pitch = 220;
+        p.gain_left = p.gain_right = .5;
+        p.filter = TILEFINCH_GAME_AUDIO_FILTER_LOWPASS;
+        p.filter_values[TILEFINCH_GAME_AUDIO_FILTER_FREQUENCY] = 200;
+        p.filter_values[TILEFINCH_GAME_AUDIO_FILTER_Q] = 8;
+        if (!tilefinch_game_audio_lane_create(audio, 200, 0, 22050, &lane)
+            || !game_audio_scenario_event(audio, lane, TILEFINCH_AUDIO_EVENT_SET, 200, 0, 0)
+            || !game_audio_scenario_event(audio, lane, TILEFINCH_AUDIO_EVENT_EXPONENTIAL, 8000,
+                                          .5, 0))
+            return false;
+        p.filter_lanes[TILEFINCH_GAME_AUDIO_FILTER_FREQUENCY] = lane;
+        return game_audio_scenario_voice(audio, 0, TILEFINCH_GAME_AUDIO_OSCILLATOR_SAWTOOTH,
+                                         &p, &voice);
+    case TILEFINCH_GAME_AUDIO_SCENARIO_FOUR:
+        return game_audio_scenario_four(audio);
+    default:
+        return false;
+    }
+}
+
+bool tilefinch_game_audio_validation_scenario(Budget *budget, unsigned scenario,
+                                              int16_t *stereo, size_t frames)
+{
+    if (budget == NULL || stereo == NULL || frames % TILEFINCH_GAME_AUDIO_OUTPUT_FRAMES != 0u)
+        return false;
+    TilefinchGameAudio *audio = game_audio_scenario_engine(budget);
+    bool okay = audio != NULL && game_audio_scenario_setup(audio, scenario);
+    for (size_t at = 0; okay && at < frames; at += TILEFINCH_GAME_AUDIO_OUTPUT_FRAMES)
+        okay = tilefinch_game_audio_mix(audio, stereo + at * 2u,
+                                        TILEFINCH_GAME_AUDIO_OUTPUT_FRAMES);
+    tilefinch_game_audio_destroy(audio);
+    return okay;
+}
+
+bool tilefinch_game_audio_validation_scenario_envelope(Budget *budget, unsigned scenario,
+                                                       uint32_t *rms, size_t windows)
+{
+    enum { WINDOW_BLOCKS = 4 };
+    if (budget == NULL || rms == NULL) return false;
+    TilefinchGameAudio *audio = game_audio_scenario_engine(budget);
+    bool okay = audio != NULL && game_audio_scenario_setup(audio, scenario);
+    int16_t pcm[TILEFINCH_GAME_AUDIO_OUTPUT_FRAMES * 2u];
+    for (size_t window = 0; okay && window < windows; window++) {
+        double sum = 0;
+        for (unsigned block = 0; okay && block < WINDOW_BLOCKS; block++) {
+            okay = tilefinch_game_audio_mix(audio, pcm, TILEFINCH_GAME_AUDIO_OUTPUT_FRAMES);
+            for (size_t f = 0; okay && f < TILEFINCH_GAME_AUDIO_OUTPUT_FRAMES; f++)
+                sum += (double) pcm[f * 2u] * pcm[f * 2u];
+        }
+        rms[window] = (uint32_t) (sqrt(sum / (WINDOW_BLOCKS * TILEFINCH_GAME_AUDIO_OUTPUT_FRAMES))
+                                  + .5);
+    }
+    tilefinch_game_audio_destroy(audio);
+    return okay;
+}
+#endif
+
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+/* Mixer CPU for four program voices against four integer-path oscillators,
+   256 blocks per run, alternating, outside any gameplay window. */
+bool tilefinch_game_audio_validation_program_probe(TilefinchGameAudioProgramProbe *out)
+{
+    if (out == NULL) return false;
+    memset(out, 0, sizeof(*out));
+    bool old_measure = atomic_exchange_explicit(&game_audio_validation_mix_enabled, false,
+                                                memory_order_acq_rel);
+    Budget budget;
+    budget_init(&budget, 256u * 1024u);
+    int16_t pcm[TILEFINCH_GAME_AUDIO_OUTPUT_FRAMES * 2u];
+    bool okay = true;
+    for (size_t run = 0; okay && run < 6u; run++) {
+        bool program = (run & 1u) == 0u;
+        TilefinchGameAudio *audio = game_audio_scenario_engine(&budget);
+        okay = audio != NULL;
+        if (okay && program) okay = game_audio_scenario_four(audio);
+        for (unsigned i = 0; okay && !program && i < 4u; i++) {
+            uint32_t voice = 0;
+            okay = tilefinch_game_audio_start_oscillator(
+                audio, (TilefinchGameAudioOscillatorType) (i + 1u), 220.0 + 110.0 * i,
+                .2, .2, 0, &voice);
+        }
+        for (size_t block = 0; okay && block < 256u; block++) {
+#if defined(PSP)
+            GameAudioCpuSample before = game_audio_cpu_sample();
+#endif
+            okay = tilefinch_game_audio_mix(audio, pcm, TILEFINCH_GAME_AUDIO_OUTPUT_FRAMES);
+#if defined(PSP)
+            GameAudioCpuSample after = game_audio_cpu_sample();
+            if (!before.valid || !after.valid || after.cpu_us < before.cpu_us) {
+                okay = false;
+                break;
+            }
+            uint32_t elapsed = (uint32_t) (after.cpu_us - before.cpu_us);
+            out->mix_cpu_us[run] += elapsed;
+            out->mix_wall_us[run] += (uint32_t) (after.query_begin_us - before.query_end_us);
+            if (elapsed > out->mix_max_us[run]) out->mix_max_us[run] = elapsed;
+#endif
+            if (okay) out->blocks++;
+        }
+        tilefinch_game_audio_destroy(audio);
+    }
+    atomic_store_explicit(&game_audio_validation_mix_enabled, old_measure, memory_order_release);
+    return okay && budget.current == 0u;
+}
+
+/* Microphone stream and AnalyserNode cost: a fed stream voice and a 1 kHz
+   oscillator, each into its own analyser (even runs) or without analysers
+   (odd runs), then on-demand analysis at three sizes. The stream is fed
+   synthetic samples here: the probe never opens the microphone. */
+bool tilefinch_game_audio_validation_analyser_probe(TilefinchGameAudioAnalyserProbe *out)
+{
+    static const unsigned sizes[3] = {256u, 1024u, 2048u};
+    if (out == NULL) return false;
+    memset(out, 0, sizeof(*out));
+    bool old_measure = atomic_exchange_explicit(&game_audio_validation_mix_enabled, false,
+                                                memory_order_acq_rel);
+    Budget budget;
+    budget_init(&budget, 512u * 1024u);
+    int16_t pcm[TILEFINCH_GAME_AUDIO_OUTPUT_FRAMES * 2u];
+    float feed[TILEFINCH_GAME_AUDIO_OUTPUT_FRAMES];
+    float *work = budget_malloc_category(&budget, BUDGET_CATEGORY_JAVASCRIPT,
+        (TILEFINCH_GAME_AUDIO_FFT_SIZE_MAX * 7u / 2u) * sizeof(float));
+    bool okay = work != NULL;
+    uint32_t phase = 0;
+    for (size_t run = 0; okay && run < 6u; run++) {
+        bool analysed = (run & 1u) == 0u;
+        TilefinchGameAudio *audio = game_audio_scenario_engine(&budget);
+        uint32_t analysers[2] = {0, 0}, lane = 0, voice = 0;
+        okay = audio != NULL && tilefinch_game_audio_lane_create(audio, .5, 0, 4, &lane)
+            && game_audio_scenario_event(audio, lane, TILEFINCH_AUDIO_EVENT_SET, .5, 0, 0);
+        for (unsigned i = 0; okay && analysed && i < 2u; i++)
+            okay = tilefinch_game_audio_analyser_create(audio, &analysers[i]);
+        TilefinchGameAudioProgram p = {.gain_left = 1, .gain_right = 1, .pitch = 1,
+            .analyser = analysers[0], .tap_gain = 1, .muted = true};
+        okay = okay && tilefinch_game_audio_start_stream(audio, 0, &p, &voice);
+        p.pitch = 1000;
+        p.muted = false;
+        p.analyser = analysers[1];
+        p.gain_lanes[0] = lane;
+        okay = okay && game_audio_scenario_voice(audio, 0, TILEFINCH_GAME_AUDIO_OSCILLATOR_SINE,
+                                                 &p, &voice);
+        for (size_t block = 0; okay && block < 256u; block++) {
+            for (size_t f = 0; f < TILEFINCH_GAME_AUDIO_OUTPUT_FRAMES; f++) {
+                feed[f] = (float) game_audio_oscillator_sample(
+                    TILEFINCH_GAME_AUDIO_OSCILLATOR_SINE, phase) * (.25f / 32768.0f);
+                phase += 97391549u; /* 1 kHz */
+            }
+            tilefinch_game_audio_stream_write(audio, feed, TILEFINCH_GAME_AUDIO_OUTPUT_FRAMES);
+#if defined(PSP)
+            GameAudioCpuSample before = game_audio_cpu_sample();
+#endif
+            okay = tilefinch_game_audio_mix(audio, pcm, TILEFINCH_GAME_AUDIO_OUTPUT_FRAMES);
+#if defined(PSP)
+            GameAudioCpuSample after = game_audio_cpu_sample();
+            if (!before.valid || !after.valid || after.cpu_us < before.cpu_us) {
+                okay = false;
+                break;
+            }
+            uint32_t elapsed = (uint32_t) (after.cpu_us - before.cpu_us);
+            out->mix_cpu_us[run] += elapsed;
+            out->mix_wall_us[run] += (uint32_t) (after.query_begin_us - before.query_end_us);
+            if (elapsed > out->mix_max_us[run]) out->mix_max_us[run] = elapsed;
+#endif
+            if (okay) out->blocks++;
+        }
+        /* What getFloatFrequencyData does, per call, 32 calls per size. */
+        for (unsigned size = 0; okay && analysed && run == 0u && size < 3u; size++) {
+            unsigned n = sizes[size];
+            float *spectrum = work + TILEFINCH_GAME_AUDIO_FFT_SIZE_MAX * 3u;
+            memset(spectrum, 0, n / 2u * sizeof(float));
+#if defined(PSP)
+            GameAudioCpuSample before = game_audio_cpu_sample();
+#endif
+            for (unsigned call = 0; okay && call < 32u; call++) {
+                uint32_t stamp = 0;
+                okay = tilefinch_game_audio_analyser_read(audio, analysers[1], work, n, &stamp);
+                tilefinch_game_audio_spectrum(work, n, .8f, spectrum,
+                                              work + TILEFINCH_GAME_AUDIO_FFT_SIZE_MAX);
+                for (unsigned k = 0; k < n / 2u; k++)
+                    work[k] = 20.0f * log10f(spectrum[k]);
+            }
+#if defined(PSP)
+            GameAudioCpuSample after = game_audio_cpu_sample();
+            if (!before.valid || !after.valid || after.cpu_us < before.cpu_us) okay = false;
+            else {
+                out->fft_cpu_us[size] = (uint32_t) ((after.cpu_us - before.cpu_us) / 32u);
+                out->fft_wall_us[size] = (uint32_t) ((after.query_begin_us
+                                                      - before.query_end_us) / 32u);
+            }
+#endif
+            unsigned peak = 0;
+            for (unsigned k = 1; k < n / 2u; k++)
+                if (work[k] > work[peak]) peak = k;
+            out->peak_bin[size] = peak;
+        }
+        tilefinch_game_audio_destroy(audio);
+    }
+    budget_free(&budget, work);
+    atomic_store_explicit(&game_audio_validation_mix_enabled, old_measure, memory_order_release);
+    return okay && budget.current == 0u;
 }
 #endif

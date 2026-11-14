@@ -133,15 +133,7 @@ static bool trace_replay_url_equal(const char *recorded,
     }
 }
 
-static uint64_t trace_hash_bytes(uint64_t hash, const char *bytes,
-                                 size_t length)
-{
-    for (size_t index = 0; index < length; index++) {
-        hash ^= (unsigned char) bytes[index];
-        hash *= UINT64_C(1099511628211);
-    }
-    return hash;
-}
+#define trace_hash_bytes fnv1a64
 
 /* Hashes the URL as trace_replay_url_equal() compares it: with the opt-in,
    each UUID-shaped query value hashes as one fixed marker byte (a C0

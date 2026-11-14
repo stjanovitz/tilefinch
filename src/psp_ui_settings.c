@@ -7,6 +7,8 @@
 
 #include "tilefinch/build_version.h"
 
+#include <string.h>
+
 #define PSP_UI_BOOL_MIRROR(field) \
     static void psp_ui_mirror_##field(PspUiState *ui, bool enabled) \
     { \
@@ -58,17 +60,6 @@ static const PspBoolSetting psp_bool_setting_table[] = {
         .ui_set = psp_ui_mirror_history_enabled,
         .on_status = "URL HISTORY ON",
         .off_status = "URL HISTORY OFF",
-        .status_frames = 180
-    },
-    {
-        /* The chrome keeps the serialized preference but spends no CPU or
-           presentation bandwidth on ambient motion, so it has no mirror.
-           A future GPU-owned version can adopt the same preference. */
-        .id = PSP_UI_SETTING_WAVE_BACKGROUND,
-        .profile_get = browser_profile_wave_background,
-        .profile_set = browser_profile_set_wave_background,
-        .on_status = "WAVE BACKGROUND ON",
-        .off_status = "WAVE BACKGROUND OFF",
         .status_frames = 180
     },
     {
@@ -340,6 +331,101 @@ PspSettingResult psp_site_javascript_setting_apply(
     return changed ? PSP_SETTING_ENGINE_REFUSED : PSP_SETTING_PROFILE_REFUSED;
 }
 
+static bool scripts_on_for_page(const BrowserProfile *profile,
+                                const PspUiState *ui)
+{
+    return ui != NULL && browser_profile_javascript_enabled(profile)
+        && browser_profile_site_javascript_enabled(profile, ui->url);
+}
+
+bool psp_scripts_off_note_stop(BrowserProfile *profile, const PspUiState *ui)
+{
+    return scripts_on_for_page(profile, ui)
+        && browser_profile_set_site_script_memory_stopped(
+               profile, ui->url, true);
+}
+
+bool psp_scripts_off_offer_due(const BrowserProfile *profile,
+                               const PspUiState *ui)
+{
+    return scripts_on_for_page(profile, ui)
+        && browser_profile_site_script_memory_stopped(profile, ui->url);
+}
+
+PspSettingResult psp_scripts_off_offer_answer(
+    BrowserProfile *profile, BrowserEngine *engine, PspUiState *ui,
+    bool accept)
+{
+    if (ui == NULL) return PSP_SETTING_PROFILE_REFUSED;
+    bool forgot = browser_profile_set_site_script_memory_stopped(
+        profile, ui->url, false);
+    if (accept) {
+        PspSettingResult result = psp_site_javascript_setting_apply(
+            profile, engine, ui, false);
+        if (result == PSP_SETTING_APPLIED) ui->site_javascript_enabled = 0u;
+        /* Refused, scripts stay on: the note stays for the next visit. */
+        if ((result == PSP_SETTING_PROFILE_REFUSED
+             || result == PSP_SETTING_ENGINE_REFUSED) && forgot)
+            (void) browser_profile_set_site_script_memory_stopped(
+                profile, ui->url, true);
+        return result;
+    }
+    return forgot ? PSP_SETTING_APPLIED : PSP_SETTING_UNCHANGED;
+}
+
+static bool scripts_off_session_ignored(const PspScriptsOffSession *session,
+                                        const char *site)
+{
+    for (size_t i = 0; i < session->ignored_count; i++)
+        if (strcmp(session->ignored[i], site) == 0) return true;
+    return false;
+}
+
+bool psp_scripts_off_session_due(const PspScriptsOffSession *session,
+                                 const BrowserProfile *profile,
+                                 const PspUiState *ui)
+{
+    char site[CONTENT_BLOCKER_HOST_LIMIT];
+    return session != NULL && ui != NULL
+        && content_blocker_site_from_url(ui->url, site)
+        && !scripts_off_session_ignored(session, site)
+        && psp_scripts_off_offer_due(profile, ui);
+}
+
+void psp_scripts_off_session_shown(PspScriptsOffSession *session,
+                                   const PspUiState *ui)
+{
+    if (session == NULL) return;
+    if (ui == NULL || !content_blocker_site_from_url(ui->url, session->pending))
+        session->pending[0] = '\0';
+}
+
+void psp_scripts_off_session_settle(PspScriptsOffSession *session,
+                                    const PspUiState *ui, bool page_changed)
+{
+    if (session == NULL || ui == NULL || session->pending[0] == '\0') return;
+    bool showing = ui->toast_kind == PSP_UI_TOAST_SCRIPTS_OFF_OFFER
+        && ui->toast_frames != 0;
+    if (showing && !page_changed) return;
+    if (!scripts_off_session_ignored(session, session->pending)) {
+        /* A full list forgets its oldest site. */
+        if (session->ignored_count == PSP_SCRIPTS_OFF_IGNORED_SITE_LIMIT) {
+            memmove(session->ignored[0], session->ignored[1],
+                    (PSP_SCRIPTS_OFF_IGNORED_SITE_LIMIT - 1u)
+                        * sizeof(session->ignored[0]));
+            session->ignored_count--;
+        }
+        memcpy(session->ignored[session->ignored_count++], session->pending,
+               sizeof(session->pending));
+    }
+    session->pending[0] = '\0';
+}
+
+void psp_scripts_off_session_answered(PspScriptsOffSession *session)
+{
+    if (session != NULL) session->pending[0] = '\0';
+}
+
 PspSettingResult psp_basic_fallback_setting_apply(
     BrowserProfile *profile, PspUiState *ui, BrowserBasicFallbackMode mode)
 {
@@ -420,6 +506,8 @@ void psp_app_ui_sync_from_profile(
         browser_profile_save_playback_positions(profile);
     ui->content_blocker_cosmetic_hiding =
         browser_profile_content_blocker_cosmetic_hiding(profile);
+    ui->content_blocker_paywall_scripts =
+        browser_profile_content_blocker_paywall_scripts(profile);
     ui->update_check_enabled = browser_profile_update_check_enabled(profile);
     ui->update_channel = (uint8_t) browser_profile_update_channel(profile);
     /* A release recorded by an earlier boot's background check stays marked

@@ -12,6 +12,9 @@ globalThis.__tilefinchInstallWorker = (
   creatorURL,
   trustedEvent,
 ) => {
+  /* Dispatch passes Event's phase numbers (1 capturing, 2 at target,
+     3 bubbling) as literals instead of reading them from the global Event,
+     which a page can replace. */
   /* Worker is intentionally a first-use module. Ordinary pages should not pay
      to compile its message/lifecycle machinery merely because the constructor
      is standards-visible. */
@@ -22,6 +25,14 @@ globalThis.__tilefinchInstallWorker = (
     workerCloneIntrinsics = globalThis.__tilefinchWorkerCloneIntrinsics,
     createPrivateWeakMap = globalThis.__tilefinchCreatePrivateWeakMap,
     createMessageEvent = globalThis.__tilefinchCreateMessageEvent,
+    /* hardening.js captured it before author code ran; this module loads on
+       first use, after the page may have replaced Event. */
+    createEvent = globalThis.__tilefinchCreateEvent,
+    isEvent = globalThis.__tilefinchIsEvent,
+    /* Worker, its global scopes and their performance objects extend it;
+       the worker realm's initializer receives the same table. */
+    eventInterfaces = globalThis.__tilefinchEventInterfaces,
+    { EventTarget } = eventInterfaces,
     fetchForWorker = globalThis.__tilefinchFetchForWorker,
     fetchWorkerScript = globalThis.__tilefinchFetchWorkerScript,
     fetchWorkerScriptSync = globalThis.__tilefinchFetchWorkerScriptSync,
@@ -63,6 +74,8 @@ globalThis.__tilefinchInstallWorker = (
     typeof blobForURL !== "function" ||
     typeof trustedString !== "function" ||
     !workerIntrinsics || typeof workerIntrinsics.sourceForBlob !== "function" ||
+    typeof workerIntrinsics.createPrivateSlot !== "function" ||
+    typeof workerIntrinsics.keys !== "function" ||
     typeof workerIntrinsics.apply !== "function" ||
     typeof workerIntrinsics.gpu !== "function" ||
     typeof workerIntrinsics.gpuFormat !== "function" ||
@@ -132,7 +145,13 @@ globalThis.__tilefinchInstallWorker = (
      prototype. Dedicated workers have their own realm, so install worker-local
      lazy accessors for the constructors sites commonly inspect. The accessor
      does not touch the owner group until author code requests the name. */
+  /* Worker code shares the owner's Event and EventTarget globals, which
+     the owner page may have replaced, so the initializer's classes extend
+     the owner's captured interfaces (scope.__tilefinchWorkerEventInterfaces
+     below). */
   const workerRealmConstructorInit = `(()=>{
+    const {Event,EventTarget}=globalThis.__tilefinchWorkerEventInterfaces;
+    delete globalThis.__tilefinchWorkerEventInterfaces;
     const root=globalThis,proto=Object.getPrototypeOf(root),
       names=['AnimationEvent','XMLHttpRequest','XMLHttpRequestEventTarget',
         'XMLHttpRequestUpload','FileReader','File','FileList','CustomEvent',
@@ -702,7 +721,9 @@ globalThis.__tilefinchInstallWorker = (
     traceWorkerMessage = (direction, value) => {
       traceWorkerNative(direction, value);
     },
-    workerStates = createPrivateWeakMap(),
+    /* Callback state can point back to its owner. Keep those cycles on the
+       owner, not in realm-rooted WeakMap values that this collector retains. */
+    workerStates = workerIntrinsics.createPrivateSlot(),
     newHandlerSlots = () => ({
       message: { value: null, wrapper: null },
       error: { value: null, wrapper: null },
@@ -805,12 +826,12 @@ globalThis.__tilefinchInstallWorker = (
     emitWorker = (owner, type, event = {}, complete = null) => {
       const state = workerStates.get(owner);
       if (!state || !state.active) return;
-      if (!(event instanceof Event)) event = new Event(type);
+      if (!isEvent(event)) event = createEvent(type);
       if (type === "message")
         traceWorkerMessage("deliver-to-owner", event.data);
       globalThis.__tilefinchPrepareEvent(event, owner, [owner]);
       event.currentTarget = owner;
-      event.eventPhase = Event.AT_TARGET;
+      event.eventPhase = 2;
       state.dispatchType = type;
       state.dispatchMessageData = type === "message" ? event.data : undefined;
       state.dispatchOwner = owner;
@@ -832,7 +853,7 @@ globalThis.__tilefinchInstallWorker = (
             invokeEventTargetCheckpointed(
               owner,
               event,
-              Event.AT_TARGET,
+              2,
               state.errorObserver,
               null,
               finish,
@@ -847,10 +868,10 @@ globalThis.__tilefinchInstallWorker = (
       try {
         if (!event.__stopped) {
           globalThis.__tilefinchInvokeEventTarget(
-            owner, event, true, Event.AT_TARGET, state.errorObserver);
+            owner, event, true, 2, state.errorObserver);
           if (!event.__stopped)
             globalThis.__tilefinchInvokeEventTarget(
-              owner, event, false, Event.AT_TARGET, state.errorObserver);
+              owner, event, false, 2, state.errorObserver);
         }
       } finally {
         finish();
@@ -858,7 +879,7 @@ globalThis.__tilefinchInstallWorker = (
       return !event.defaultPrevented;
     },
     workerErrorEvent = (error, url, exposeError = false) =>
-      trustedEvent(new ErrorEvent("error", {
+      trustedEvent(createEvent("error", {
         cancelable: true,
         message: String((error && error.message) || error),
         filename: String(url || ""),
@@ -866,7 +887,7 @@ globalThis.__tilefinchInstallWorker = (
         colno: 0,
         /* The creator does not receive a cross-realm exception object. */
         error: exposeError ? error : null,
-      })),
+      }, "ErrorEvent")),
     dispatchWorkerGlobalError = (state, error, url) => {
       if (!state || !state.active || !state.scope) return false;
       const event = workerErrorEvent(error, url, true),
@@ -875,10 +896,10 @@ globalThis.__tilefinchInstallWorker = (
       try {
         if (!event.__stopped) {
           globalThis.__tilefinchInvokeEventTarget(
-            target, event, true, Event.AT_TARGET);
+            target, event, true, 2);
           if (!event.__stopped)
             globalThis.__tilefinchInvokeEventTarget(
-              target, event, false, Event.AT_TARGET);
+              target, event, false, 2);
         }
       } finally {
         globalThis.__tilefinchFinishEventDispatch(event);
@@ -899,11 +920,11 @@ globalThis.__tilefinchInstallWorker = (
       if (emitWorker(owner, "error", workerErrorEvent(error, url)))
         globalThis.__tilefinchReportUncaught(error, "worker");
     },
-    workerPerformanceStates = createPrivateWeakMap(),
+    workerPerformanceStates = workerIntrinsics.createPrivateSlot(),
     workerPerformanceEntryTypes = Object.freeze([
       "mark", "measure", "resource",
     ]),
-    workerPerformanceObserverStates = createPrivateWeakMap(),
+    workerPerformanceObserverStates = workerIntrinsics.createPrivateSlot(),
     deferredWorkerPerformanceObservers = new Set(),
     workerPerformanceEntryLimit = 128,
     workerPerformanceObserverLimit = 16,
@@ -2454,6 +2475,7 @@ globalThis.__tilefinchInstallWorker = (
         }, { once: true });
       };
       scope.__tilefinchWorkerScriptURL = workerURL;
+      scope.__tilefinchWorkerEventInterfaces = eventInterfaces;
       state.realm = createWorkerRealmNative(
         scope, DedicatedWorkerGlobalScope.prototype,
         workerRealmConstructorInit);
@@ -2565,7 +2587,8 @@ globalThis.__tilefinchInstallWorker = (
           state.realm = null;
         }
         if (state) state.scope = null;
-        workerStates.delete(this);
+        /* The failed constructor never publishes its owner. Its private
+           state and callback cycle are collected together. */
         throw error;
       }
     }
@@ -2614,7 +2637,10 @@ globalThis.__tilefinchInstallWorker = (
       if (!state.active) return;
       if (arguments.length > 1) workerProgress.inboundTransferArguments++;
       traceWorkerMessage("owner-to-worker", value);
-      const ports = [];
+      /* Transfer-option getters can terminate the Worker. An admitted clone
+         borrows its realm constructors until that call finishes, while later
+         calls still see the retired state and do no serialization. */
+      const ports = [], cloneIntrinsics = state.cloneIntrinsics;
       let copied;
       const queued = scheduleTask(() => {
         if (!state.active || state.closing) {
@@ -2638,7 +2664,7 @@ globalThis.__tilefinchInstallWorker = (
         try {
           if (!event.__stopped)
             invokeEventTargetCheckpointed(
-              state.scope, event, Event.AT_TARGET,
+              state.scope, event, 2,
               state.scopeErrorObserver, null, finish);
           else finish();
         } catch (error) {
@@ -2651,6 +2677,7 @@ globalThis.__tilefinchInstallWorker = (
         throw new DOMException(
           "Worker message task quota exceeded", "QuotaExceededError");
       }
+      state.cloneDepth = (state.cloneDepth || 0) + 1;
       try {
         const transferOrOptions = arguments[1],
           transfer = transferOrOptions &&
@@ -2658,10 +2685,13 @@ globalThis.__tilefinchInstallWorker = (
               !Array.isArray(transferOrOptions) &&
               "transfer" in transferOrOptions
             ? transferOrOptions.transfer : transferOrOptions;
-        copied = cloneWorkerValue(value, state.cloneIntrinsics, transfer, ports);
+        copied = cloneWorkerValue(value, cloneIntrinsics, transfer, ports);
       } catch (error) {
         cancelTimer(queued);
         throw error;
+      } finally {
+        state.cloneDepth--;
+        if (!state.active) retireWorkerRealm(state);
       }
       workerProgress.inboundQueued++;
       workerProgress.lastId = state.id;
@@ -2679,6 +2709,13 @@ globalThis.__tilefinchInstallWorker = (
   function finishWorkerClose(state) {
     if (state.closing && state.closeTaskEnded && !(state.outboundPending > 0))
       shutdownWorkerState(state, 2);
+  }
+  function retireWorkerRealm(state) {
+    /* A transfer getter may terminate during cloning. Stop delivery at once,
+       but keep constructors callable until the admitted clone unwinds. */
+    if (!state.realm || state.cloneDepth > 0) return;
+    try { destroyWorkerRealmNative(state.realm); } catch (_) {}
+    state.realm = null;
   }
   function shutdownWorkerState(state, reason = 0) {
     if (!state.active) return;
@@ -2706,12 +2743,7 @@ globalThis.__tilefinchInstallWorker = (
         "Worker is terminated", "AbortError")); } catch (_) {}
     }
     state.opfsWriters.clear();
-    if (state.realm) {
-      try {
-        destroyWorkerRealmNative(state.realm);
-      } catch (_) {}
-      state.realm = null;
-    }
+    retireWorkerRealm(state);
     if (state.startTimer) {
       cancelTimer(state.startTimer);
       state.startTimer = 0;
@@ -2752,6 +2784,14 @@ globalThis.__tilefinchInstallWorker = (
       state.abortController = null;
     }
     state.scope = null;
+    /* Keep the owner EventTarget, not the stopped realm's constructors and
+       global handlers. The private table has only the fixed handler slots. */
+    state.cloneIntrinsics = null;
+    for (const type of workerIntrinsics.keys(state.scopeHandlers)) {
+      const slot = state.scopeHandlers[type];
+      slot.value = null;
+      slot.wrapper = null;
+    }
   }
   Object.defineProperty(globalThis.Worker.prototype, Symbol.toStringTag, {
     configurable: true,

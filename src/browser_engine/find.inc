@@ -11,7 +11,10 @@ static void browser_engine_find_copy_snapshot(
              engine->find.query);
     snapshot->match_count = engine->find.match_count;
     snapshot->selected = engine->find.selected;
-    snapshot->truncated = engine->find.truncated;
+    /* Matches of a provisional layout are those laid out so far ("+"):
+       the count refreshes when idle work completes it. */
+    snapshot->truncated = engine->find.truncated
+        || engine->navigation.page.layout_provisional;
     snapshot->wrapped = engine->find.wrapped;
 }
 
@@ -23,11 +26,16 @@ void browser_engine_find_clear(BrowserEngine *engine)
     engine->find_layout_generation = 0;
 }
 
+/* Rebuilds the index and selects the first match at or below the selected
+   one's top, or the selected one itself when it kept its index and top (a
+   line holding two matches, laid out further). */
 static bool browser_engine_find_rebuild(BrowserEngine *engine,
                                         int nearest_y)
 {
     char query[PAGE_FIND_QUERY_LIMIT + 1u];
     snprintf(query, sizeof(query), "%s", engine->find.query);
+    size_t kept = engine->find.match_count != 0 ? engine->find.selected
+                                                : SIZE_MAX;
     if (!page_find_build(
             &engine->find, &engine->budget,
             &engine->navigation.page.layout, query)) return false;
@@ -35,6 +43,9 @@ static bool browser_engine_find_rebuild(BrowserEngine *engine,
     engine->find_layout_generation = engine->navigation.incremental_relayouts;
     if (engine->find.match_count != 0)
         (void) page_find_select_nearest(&engine->find, nearest_y);
+    if (kept < engine->find.match_count
+        && engine->find.matches[kept].top == nearest_y)
+        engine->find.selected = kept;
     return true;
 }
 
@@ -81,11 +92,14 @@ static bool browser_engine_find_jump(BrowserEngine *engine)
 }
 
 /* Adopts the complete layout of a provisional page now, for a caller that
-   reads all of it. The render shell keeps tiles outside the damage. A
-   bounded focus layout's completion waits for pending author mutations
-   (navigation_complete_layout_step): they are published first, by the
-   relayout their next runtime turn would run. */
-static bool browser_engine_complete_layout(BrowserEngine *engine)
+   reads all of it, or with `through` one laid out only as far as the first
+   of those nodes (navigation_layout_through). The render shell keeps tiles
+   outside the damage. A bounded focus layout's completion waits for
+   pending author mutations (navigation_complete_layout_step): they are
+   published first, by the relayout their next runtime turn would run. */
+static bool browser_engine_complete_layout(
+    BrowserEngine *engine, const lxb_dom_node_t *const *through,
+    size_t through_count)
 {
     /* Not gated by the idle retry backoff: this caller needs it now. */
     if (!engine->navigation.page.loaded
@@ -101,10 +115,118 @@ static bool browser_engine_complete_layout(BrowserEngine *engine)
     }
     if (relaid && engine->navigation.page.loaded
         && engine->navigation.page.layout_provisional)
-        (void) navigation_complete_layout_sync(&engine->navigation);
+        (void) (through_count != 0
+            ? navigation_layout_through(&engine->navigation, through,
+                                        through_count)
+            : navigation_complete_layout_sync(&engine->navigation));
     if (engine->navigation.incremental_relayouts == before) return relaid;
     (void) controller_rebind_focus(&engine->controller);
     return browser_engine_apply_layout_damage(engine) && relaid;
+}
+
+/* Whether `match` is where the complete layout puts it, and so is the
+   screen around it: in a provisional layout, drawn by commands recorded
+   before the cut, with that screen above the cut and above any container
+   the cut may have moved (navigation_exact_box's test). */
+static bool browser_engine_find_match_exact(const BrowserEngine *engine,
+                                            const PageFindMatch *match)
+{
+    const LayoutDocument *layout = &engine->navigation.page.layout;
+    if (layout->content_limit_y == 0) return true;
+    int64_t screen_end = (int64_t) (match->top > 0 ? match->top : 0)
+        + engine->navigation.viewport.css_height;
+    return match->end.command_index < layout->preview_cut_command_count
+        && screen_end <= layout->content_limit_y
+        && (!layout->preview_moved || screen_end <= layout->preview_moved_top);
+}
+
+/* The match the complete layout's index would select next, when the
+   provisional index proves it: its matches before the cut are the
+   complete index's first ones, in order. From the start (`direction` 0)
+   that is the first at or below `document_y`, every one before it known to
+   lie above; otherwise the selected match's neighbour. Wrapping needs the
+   whole index. */
+static bool browser_engine_find_proven(BrowserEngine *engine, int direction,
+                                       int document_y)
+{
+    const PageFindIndex *find = &engine->find;
+    if (!engine->navigation.page.layout_provisional) return true;
+    if (direction != 0) {
+        size_t next = direction > 0 ? find->selected + 1u
+                                    : find->selected - 1u;
+        return find->selected < find->match_count
+            && (direction > 0 || find->selected != 0)
+            && next < find->match_count
+            && browser_engine_find_match_exact(engine, &find->matches[next]);
+    }
+    for (size_t i = 0; i < find->match_count; i++) {
+        if (!browser_engine_find_match_exact(engine, &find->matches[i]))
+            return false;
+        if (find->matches[i].top >= document_y) return true;
+    }
+    return false;
+}
+
+/* The first text nodes after the cut where the query ends, reading the
+   text in document order outside style and script as one run (a match may
+   span inline elements): how far Find lays a provisional page out (as far
+   as the first of them with a box, so text that is not displayed does not
+   carry the layout to the end). A guide only: the index decides, and none
+   seen completes the layout. Returns how many it stored. */
+static size_t browser_engine_find_text_after_cut(
+    BrowserEngine *engine, const lxb_dom_node_t *found[LAYOUT_THROUGH_TARGETS])
+{
+    const LayoutDocument *layout = &engine->navigation.page.layout;
+    size_t cut = layout->preview_cut_box_count < layout->node_box_count
+        ? layout->preview_cut_box_count : layout->node_box_count;
+    lxb_dom_node_t *node = cut == 0 ? NULL : layout->node_boxes[cut - 1].node;
+    bool skip = true;
+    PageFindTextScan scan = {0};
+    size_t count = 0;
+    for (size_t visited = 0; node != NULL && visited < 65536u
+                             && count < LAYOUT_THROUGH_TARGETS; visited++) {
+        if (!skip && node->first_child != NULL) {
+            node = node->first_child;
+        } else {
+            while (node != NULL && node->next == NULL) node = node->parent;
+            if (node == NULL) break;
+            node = node->next;
+        }
+        skip = node->type == LXB_DOM_NODE_TYPE_ELEMENT
+            && (node->local_name == LXB_TAG_STYLE
+                || node->local_name == LXB_TAG_SCRIPT
+                || node->local_name == LXB_TAG_TEMPLATE);
+        if (node->type != LXB_DOM_NODE_TYPE_TEXT) continue;
+        size_t length = 0;
+        const char *text = document_text_data(node, &length);
+        if (page_find_text_scan(engine->find.query, &scan, text, length))
+            found[count++] = node;
+    }
+    return count;
+}
+
+/* Lays a provisional page out until the index proves the match Find moves
+   to (browser_engine_find_proven): through the next text holding the
+   query a few times, then completely. A completion refused for memory
+   leaves the index of what is laid out, as before. */
+static bool browser_engine_find_reach(BrowserEngine *engine, int direction,
+                                      int document_y)
+{
+    for (unsigned round = 0;
+         !browser_engine_find_proven(engine, direction, document_y);
+         round++) {
+        if (round == 4u) return true;
+        const lxb_dom_node_t *through[LAYOUT_THROUGH_TARGETS] = {0};
+        size_t through_count = direction >= 0 && round < 3u
+            ? browser_engine_find_text_after_cut(engine, through) : 0;
+        const PageFindMatch *selected = page_find_selected(&engine->find);
+        int nearest_y = selected == NULL ? document_y : selected->top;
+        if (!browser_engine_complete_layout(engine, through, through_count)
+            || !browser_engine_find_rebuild(engine, nearest_y)) return false;
+        if (direction == 0 && engine->find.match_count != 0)
+            (void) page_find_select_nearest(&engine->find, document_y);
+    }
+    return true;
 }
 
 bool browser_engine_find_begin(BrowserEngine *engine, const char *query,
@@ -114,10 +236,11 @@ bool browser_engine_find_begin(BrowserEngine *engine, const char *query,
     if (!browser_engine_input_ready(engine) || query == NULL) return false;
     /* Find matches every text run, including those below a placeholder:
        never answered from a bounded focus layout, which is settled first
-       (refused when it cannot be). A scriptless provisional layout is
-       completed when it can be. */
+       (refused when it cannot be). A scriptless provisional layout is laid
+       out as far as the match it selects (browser_engine_find_reach). */
     if (!browser_engine_settle_bounded_layout(engine)
-        || !browser_engine_complete_layout(engine)) return false;
+        || (engine->navigation.page.runtime != NULL
+            && !browser_engine_complete_layout(engine, NULL, 0))) return false;
     browser_engine_find_clear(engine);
     if (!page_find_build(
             &engine->find, &engine->budget,
@@ -126,10 +249,11 @@ bool browser_engine_find_begin(BrowserEngine *engine, const char *query,
     engine->find_layout_generation = engine->navigation.incremental_relayouts;
     const NavigationEntry *entry = navigation_current(&engine->navigation);
     int scroll_y = entry == NULL ? 0 : entry->scroll_y;
-    if (engine->find.match_count != 0) {
+    if (engine->find.match_count != 0)
         (void) page_find_select_nearest(&engine->find, scroll_y);
+    if (!browser_engine_find_reach(engine, 0, scroll_y)) return false;
+    if (engine->find.match_count != 0)
         (void) browser_engine_find_jump(engine);
-    }
     browser_engine_find_copy_snapshot(engine, snapshot);
     clear_error(engine);
     return true;
@@ -140,6 +264,7 @@ bool browser_engine_find_move(BrowserEngine *engine, int direction,
 {
     if (snapshot != NULL) memset(snapshot, 0, sizeof(*snapshot));
     if (!browser_engine_find_refresh(engine) || direction == 0
+        || !browser_engine_find_reach(engine, direction, 0)
         || !page_find_move(&engine->find, direction)) return false;
     (void) browser_engine_find_jump(engine);
     browser_engine_find_copy_snapshot(engine, snapshot);

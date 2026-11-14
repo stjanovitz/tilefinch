@@ -287,7 +287,11 @@ The PSP link gate reads the final ELF with PSP binutils:
 - browser/media compositors, `layout_block_impl`, `rasterize_command`, and
   action dispatch have individual size ceilings tied to recurring
   instruction-cache cost;
-- raw frontend engine-view access is ratcheted at zero.
+- raw frontend engine-view access is ratcheted at zero;
+- with the hot-function order experiment on (`PSP_BROWSER_PSP_HOT_ORDER`,
+  off by default; [CODE_LAYOUT.md](CODE_LAYOUT.md)), the link must place at
+  least 95% of the order's listed heat in the ordered block at the start of
+  `.text`, and its two way alignments count toward the `.text` limits.
 
 Raising a ceiling requires a measured target-side reason. Moving code out of a
 ratcheted function without reducing the recurring call graph is not considered

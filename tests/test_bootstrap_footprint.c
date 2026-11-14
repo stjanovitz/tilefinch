@@ -22,7 +22,12 @@
 /* Resident bootstrap state after a trivial document is bound may take at
    most 2 MiB, leaving pages at least 3 MiB of the realm. Measured at
    1,922 KiB when this guard was introduced (2026-09), so the budget trips on
-   roughly 130 KiB of growth; raise it only with a device-side reason. */
+   roughly 130 KiB of growth; raise it only with a device-side reason.
+   2026-11-14 it had reached 2,104,066 bytes, over the budget: the
+   bootstrap's atoms were relocated on restore, so QuickJS copied every
+   function's code into the heap. Pinning the eager modules' atoms
+   (JS_PinAtomTable; src/bootstrap/README.md) lets that code run from ROM
+   in place; a regression there alone puts this figure back over 2 MiB. */
 #define FOOTPRINT_BOOTSTRAP_LIMIT_BYTES (2u * MIB)
 /* Each lazily installed module, measured as retained heap after its first
    activation; the largest (canvas) measured 222 KiB when introduced. */

@@ -1,19 +1,19 @@
 #include "tilefinch/glyph_component_store.h"
 
-#include <dirent.h>
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
-
+#include "tilefinch/component_store.h"
 #include "tilefinch/glyph_component.h"
 #include "tilefinch/browser_profile.h"
 #include "tilefinch/document.h"
 #include "tilefinch/sha256.h"
 
 #define GLYPH_INSTALL_IO_CHUNK (16u * 1024u)
+#define GLYPH_COMPONENT_TREE_DEPTH 4u
 #define GLYPH_COMPONENT_TREE_LIMIT 24u
 #define GLYPH_COMPONENT_REMOVED_MARKER "UNINSTALLED"
 /* Written before candidate promotion and removed only after the active
@@ -144,84 +144,6 @@ struct TilefinchGlyphComponentInstall {
 static bool restore_pre_activation_package(
     TilefinchGlyphComponentInstall *job);
 
-static bool join_path(const char *directory, const char *relative,
-                      char *output, size_t output_size)
-{
-    if (directory == NULL || relative == NULL || output == NULL
-        || output_size == 0) return false;
-    int written = snprintf(output, output_size, "%s/%s", directory, relative);
-    return written > 0 && (size_t) written < output_size;
-}
-
-static bool path_exists(const char *path)
-{
-    struct stat information;
-    return path != NULL && stat(path, &information) == 0;
-}
-
-static bool make_directories(char *path)
-{
-    for (char *at = path; *at != '\0'; at++) {
-        if (*at != '/') continue;
-        if (at == path || (at > path && at[-1] == ':')) continue;
-        char saved = *at;
-        *at = '\0';
-        if (mkdir(path, 0777) != 0 && errno != EEXIST) {
-            *at = saved;
-            return false;
-        }
-        *at = saved;
-    }
-    return true;
-}
-
-static bool remove_tree(const char *path, size_t depth, size_t *entries)
-{
-    if (path == NULL || entries == NULL || depth > 4u
-        || *entries >= GLYPH_COMPONENT_TREE_LIMIT) return false;
-    DIR *directory = opendir(path);
-    if (directory == NULL) return errno == ENOENT;
-    bool ok = true;
-    struct dirent *entry;
-    while (ok && (entry = readdir(directory)) != NULL) {
-        if (strcmp(entry->d_name, ".") == 0
-            || strcmp(entry->d_name, "..") == 0) continue;
-        if (++(*entries) > GLYPH_COMPONENT_TREE_LIMIT) {
-            ok = false;
-            break;
-        }
-        char child[TILEFINCH_INSTALL_PATH_LIMIT];
-        if (!join_path(path, entry->d_name, child, sizeof(child))) {
-            ok = false;
-            break;
-        }
-        struct stat information;
-        if (lstat(child, &information) != 0) ok = false;
-        else if (S_ISDIR(information.st_mode))
-            ok = remove_tree(child, depth + 1u, entries);
-        else
-            ok = unlink(child) == 0;
-    }
-    if (closedir(directory) != 0) ok = false;
-    return ok && rmdir(path) == 0;
-}
-
-static bool write_file_bytes(const char *path, const void *bytes,
-                             size_t length)
-{
-    FILE *file = fopen(path, "wb");
-    bool ok = file != NULL && fwrite(bytes, 1, length, file) == length
-        && fflush(file) == 0;
-#if !defined(__PSP__)
-    if (ok) ok = fsync(fileno(file)) == 0;
-#endif
-    if (file != NULL && fclose(file) != 0) ok = false;
-    /* A durability hint (tilefinch_memory_stick_sync): the checked write
-       already succeeded, so a rejected sync never fails it. */
-    if (ok) (void) tilefinch_memory_stick_sync();
-    return ok;
-}
-
 static bool component_paths(
     const TilefinchInstallPaths *paths, TilefinchGlyphPack pack,
     char *component, char *active, char *previous, char *marker)
@@ -231,26 +153,29 @@ static bool component_paths(
     char relative[96];
     int written = snprintf(relative, sizeof(relative), "components/%s", spec->id);
     return written > 0 && (size_t) written < sizeof(relative)
-        && join_path(paths->install_root, relative, component,
-                     TILEFINCH_INSTALL_PATH_LIMIT)
-        && join_path(component, "active", active,
-                     TILEFINCH_INSTALL_PATH_LIMIT)
-        && join_path(component, "previous", previous,
-                     TILEFINCH_INSTALL_PATH_LIMIT)
-        && join_path(component, GLYPH_COMPONENT_REMOVED_MARKER, marker,
-                     TILEFINCH_INSTALL_PATH_LIMIT);
+        && tilefinch_component_store_join(
+               paths->install_root, relative, component,
+               TILEFINCH_INSTALL_PATH_LIMIT)
+        && tilefinch_component_store_join(
+               component, "active", active, TILEFINCH_INSTALL_PATH_LIMIT)
+        && tilefinch_component_store_join(
+               component, "previous", previous, TILEFINCH_INSTALL_PATH_LIMIT)
+        && tilefinch_component_store_join(
+               component, GLYPH_COMPONENT_REMOVED_MARKER, marker,
+               TILEFINCH_INSTALL_PATH_LIMIT);
 }
 
 static bool directory_pack_path(const char *directory, char *output,
                                 size_t output_size)
 {
-    return join_path(directory, "pack.tfgf", output, output_size);
+    return tilefinch_component_store_join(
+        directory, "pack.tfgf", output, output_size);
 }
 
 static bool directory_activation_path(
     const char *directory, char *output, size_t output_size)
 {
-    return join_path(
+    return tilefinch_component_store_join(
         directory, GLYPH_COMPONENT_ACTIVATED_MARKER, output, output_size);
 }
 
@@ -259,8 +184,9 @@ static bool component_directory_complete(
 {
     char ready[TILEFINCH_INSTALL_PATH_LIMIT];
     char pack[TILEFINCH_INSTALL_PATH_LIMIT];
-    if (!join_path(directory, "READY", ready, sizeof(ready))
-        || !path_exists(ready)
+    if (!tilefinch_component_store_join(
+            directory, "READY", ready, sizeof(ready))
+        || !tilefinch_component_store_exists(ready)
         || !directory_pack_path(directory, pack, sizeof(pack))) return false;
     TilefinchGlyphProvider *provider = tilefinch_glyph_provider_create(budget);
     bool valid = provider != NULL
@@ -282,11 +208,11 @@ bool tilefinch_glyph_component_resolve(
     char marker[TILEFINCH_INSTALL_PATH_LIMIT];
     if (spec == NULL || !component_paths(
             paths, pack, component, active, previous, marker)) return false;
-    bool removed = path_exists(marker);
+    bool removed = tilefinch_component_store_exists(marker);
     char activated[TILEFINCH_INSTALL_PATH_LIMIT];
     bool active_supersedes_removal = removed
         && directory_activation_path(active, activated, sizeof(activated))
-        && path_exists(activated);
+        && tilefinch_component_store_exists(activated);
     if (removed && !active_supersedes_removal) return false;
     char pack_path[TILEFINCH_INSTALL_PATH_LIMIT];
     const char *directories[2] = {active, previous};
@@ -295,8 +221,10 @@ bool tilefinch_glyph_component_resolve(
         char ready[TILEFINCH_INSTALL_PATH_LIMIT];
         if (!directory_pack_path(
                 directories[at], pack_path, sizeof(pack_path))
-            || !join_path(directories[at], "READY", ready, sizeof(ready))
-            || !path_exists(pack_path) || !path_exists(ready)) continue;
+            || !tilefinch_component_store_join(
+                   directories[at], "READY", ready, sizeof(ready))
+            || !tilefinch_component_store_exists(pack_path)
+            || !tilefinch_component_store_exists(ready)) continue;
         int written = snprintf(output, output_size, "%s", pack_path);
         return written > 0 && (size_t) written < output_size;
     }
@@ -312,28 +240,15 @@ static bool identity_from_directory(
         return false;
     char metadata[TILEFINCH_INSTALL_PATH_LIMIT];
     char ready[TILEFINCH_INSTALL_PATH_LIMIT];
-    if (!join_path(directory, "component.tfgm", metadata, sizeof(metadata))
-        || !join_path(directory, "READY", ready, sizeof(ready))) return false;
-    FILE *file = fopen(metadata, "rb");
-    if (file == NULL || fseek(file, 0, SEEK_END) != 0) {
-        if (file != NULL) fclose(file);
-        return false;
-    }
-    long signed_length = ftell(file);
-    if (signed_length <= 0
-        || signed_length > (long) TILEFINCH_UPDATE_MAX_ENVELOPE_BYTES
-        || fseek(file, 0, SEEK_SET) != 0) {
-        fclose(file);
-        return false;
-    }
-    size_t length = (size_t) signed_length;
-    uint8_t *envelope = budget_malloc_category(
-        budget, BUDGET_CATEGORY_SESSION, length);
-    bool read = envelope != NULL
-        && fread(envelope, 1, length, file) == length && fgetc(file) == EOF;
-    fclose(file);
+    if (!tilefinch_component_store_join(
+            directory, "component.tfgm", metadata, sizeof(metadata))
+        || !tilefinch_component_store_join(
+               directory, "READY", ready, sizeof(ready))) return false;
+    size_t length = 0;
+    uint8_t *envelope = tilefinch_component_store_read_file(
+        budget, metadata, TILEFINCH_UPDATE_MAX_ENVELOPE_BYTES, &length);
     TilefinchUpdateVerifiedEnvelope verified = {0};
-    TilefinchUpdateStatus status = read
+    TilefinchUpdateStatus status = envelope != NULL
         ? tilefinch_update_verify_glyph_envelope(
               envelope, length,
               &(TilefinchUpdateVerifyOptions) {
@@ -344,15 +259,9 @@ static bool identity_from_directory(
               }, &verified)
         : TILEFINCH_UPDATE_IO;
     budget_free(budget, envelope);
-    uint8_t ready_digest[32];
-    file = status == TILEFINCH_UPDATE_OK ? fopen(ready, "rb") : NULL;
-    bool valid = file != NULL
-        && fread(ready_digest, 1, sizeof(ready_digest), file)
-               == sizeof(ready_digest)
-        && fgetc(file) == EOF
-        && memcmp(ready_digest, verified.manifest_digest, 32) == 0;
-    if (file != NULL) fclose(file);
-    if (!valid) return false;
+    if (status != TILEFINCH_UPDATE_OK
+        || !tilefinch_component_store_file_matches(
+               ready, verified.manifest_digest, 32)) return false;
     *sequence = verified.manifest.release_sequence;
     memcpy(package_sha256, verified.manifest.package_sha256, 32);
     return true;
@@ -372,11 +281,11 @@ bool tilefinch_glyph_component_installed_identity(
         || package_sha256 == NULL || spec == NULL
         || !component_paths(paths, pack, component, active, previous, marker))
         return false;
-    bool removed = path_exists(marker);
+    bool removed = tilefinch_component_store_exists(marker);
     char activated[TILEFINCH_INSTALL_PATH_LIMIT];
     bool active_supersedes_removal = removed
         && directory_activation_path(active, activated, sizeof(activated))
-        && path_exists(activated);
+        && tilefinch_component_store_exists(activated);
     if (removed && !active_supersedes_removal) return false;
     return identity_from_directory(
                budget, active, spec->id, root, sequence, package_sha256)
@@ -403,9 +312,11 @@ static bool install_fault(
 static bool restore_pre_activation_package(
     TilefinchGlyphComponentInstall *job)
 {
-    if (job->activated || path_exists(job->package_path)) return true;
-    if (!path_exists(job->candidate_pack)
-        || rename(job->candidate_pack, job->package_path) != 0) return false;
+    if (job->activated || tilefinch_component_store_exists(job->package_path))
+        return true;
+    if (!tilefinch_component_store_exists(job->candidate_pack)
+        || !tilefinch_component_store_rename(
+               job->candidate_pack, job->package_path)) return false;
     /* A retry stages from the same directory, so no record of this attempt
        may stay beside the package. */
     static const char *const records[] = {
@@ -413,7 +324,8 @@ static bool restore_pre_activation_package(
     };
     for (size_t at = 0; at < sizeof(records) / sizeof(records[0]); at++) {
         char record[TILEFINCH_INSTALL_PATH_LIMIT];
-        if (join_path(job->candidate, records[at], record, sizeof(record)))
+        if (tilefinch_component_store_join(
+                job->candidate, records[at], record, sizeof(record)))
             (void) unlink(record);
     }
     return true;
@@ -437,10 +349,11 @@ static bool candidate_paths(
 {
     char relative[96];
     snprintf(relative, sizeof(relative), "components/%s", spec->id);
-    return join_path(install_root, relative, component,
-                     TILEFINCH_INSTALL_PATH_LIMIT)
-        && join_path(component, "candidate.tmp", candidate,
-                     TILEFINCH_INSTALL_PATH_LIMIT);
+    return tilefinch_component_store_join(
+               install_root, relative, component, TILEFINCH_INSTALL_PATH_LIMIT)
+        && tilefinch_component_store_join(
+               component, "candidate.tmp", candidate,
+               TILEFINCH_INSTALL_PATH_LIMIT);
 }
 
 bool tilefinch_glyph_component_download_path(
@@ -452,8 +365,8 @@ bool tilefinch_glyph_component_download_path(
     char candidate[TILEFINCH_INSTALL_PATH_LIMIT];
     return install_root != NULL && spec != NULL
         && candidate_paths(install_root, spec, component, candidate)
-        && join_path(candidate, GLYPH_COMPONENT_DOWNLOAD_NAME,
-                     output, output_size);
+        && tilefinch_component_store_join(
+               candidate, GLYPH_COMPONENT_DOWNLOAD_NAME, output, output_size);
 }
 
 bool tilefinch_glyph_component_prepare_download(
@@ -465,14 +378,13 @@ bool tilefinch_glyph_component_prepare_download(
     char candidate[TILEFINCH_INSTALL_PATH_LIMIT];
     if (install_root == NULL || spec == NULL
         || !candidate_paths(install_root, spec, component, candidate)
-        || !join_path(candidate, GLYPH_COMPONENT_DOWNLOAD_NAME,
-                      output, output_size)) return false;
-    char mutable_component[TILEFINCH_INSTALL_PATH_LIMIT];
-    snprintf(mutable_component, sizeof(mutable_component), "%s", component);
-    size_t entries = 0;
-    return make_directories(mutable_component)
-        && (mkdir(component, 0777) == 0 || errno == EEXIST)
-        && remove_tree(candidate, 0, &entries)
+        || !tilefinch_component_store_join(
+               candidate, GLYPH_COMPONENT_DOWNLOAD_NAME, output, output_size))
+        return false;
+    return tilefinch_component_store_make_directory(component)
+        && tilefinch_component_store_remove_tree(
+               candidate, GLYPH_COMPONENT_TREE_DEPTH,
+               GLYPH_COMPONENT_TREE_LIMIT)
         && mkdir(candidate, 0777) == 0;
 }
 
@@ -511,16 +423,20 @@ TilefinchGlyphComponentInstall *tilefinch_glyph_component_install_create(
     job->fault_opaque = options->fault_opaque;
     if (!candidate_paths(options->install_root, spec, job->component,
                          job->candidate)
-        || !join_path(job->candidate, GLYPH_COMPONENT_DOWNLOAD_NAME,
-                      job->package_path, sizeof(job->package_path))
-        || !join_path(job->candidate, "pack.tfgf", job->candidate_pack,
-                      sizeof(job->candidate_pack))
-        || !join_path(job->component, "active", job->active,
-                      sizeof(job->active))
-        || !join_path(job->component, "previous", job->previous,
-                      sizeof(job->previous))
-        || !join_path(job->component, GLYPH_COMPONENT_REMOVED_MARKER,
-                      job->removed_marker, sizeof(job->removed_marker))) {
+        || !tilefinch_component_store_join(
+               job->candidate, GLYPH_COMPONENT_DOWNLOAD_NAME,
+               job->package_path, sizeof(job->package_path))
+        || !tilefinch_component_store_join(
+               job->candidate, "pack.tfgf", job->candidate_pack,
+               sizeof(job->candidate_pack))
+        || !tilefinch_component_store_join(
+               job->component, "active", job->active, sizeof(job->active))
+        || !tilefinch_component_store_join(
+               job->component, "previous", job->previous,
+               sizeof(job->previous))
+        || !tilefinch_component_store_join(
+               job->component, GLYPH_COMPONENT_REMOVED_MARKER,
+               job->removed_marker, sizeof(job->removed_marker))) {
         tilefinch_glyph_component_install_destroy(job);
         return NULL;
     }
@@ -571,14 +487,17 @@ static bool finalize_candidate(TilefinchGlyphComponentInstall *job)
     char activated[TILEFINCH_INSTALL_PATH_LIMIT];
     static const uint8_t activation_record[] = {'T','F','G','A','v','1','\n'};
     return valid
-        && join_path(job->candidate, "component.tfgm", metadata,
-                     sizeof(metadata))
-        && write_file_bytes(metadata, job->envelope, job->envelope_length)
-        && join_path(job->candidate, "READY", ready, sizeof(ready))
-        && write_file_bytes(ready, job->manifest_digest, 32)
+        && tilefinch_component_store_join(
+               job->candidate, "component.tfgm", metadata, sizeof(metadata))
+        && tilefinch_component_store_write_file(
+               metadata, job->envelope, job->envelope_length)
+        && tilefinch_component_store_join(
+               job->candidate, "READY", ready, sizeof(ready))
+        && tilefinch_component_store_write_file(
+               ready, job->manifest_digest, 32)
         && directory_activation_path(
             job->candidate, activated, sizeof(activated))
-        && write_file_bytes(
+        && tilefinch_component_store_write_file(
             activated, activation_record, sizeof(activation_record));
 }
 
@@ -601,19 +520,24 @@ static GlyphPromotionOutcome promote_candidate(
     TilefinchGlyphComponentInstall *job)
 {
     if (!job->activated) {
-        size_t entries = 0;
         if (install_fault(
                 job, TILEFINCH_GLYPH_INSTALL_FAULT_REMOVE_PREVIOUS)
-            || !remove_tree(job->previous, 0, &entries)) {
+            || !tilefinch_component_store_remove_tree(
+                   job->previous, GLYPH_COMPONENT_TREE_DEPTH,
+                   GLYPH_COMPONENT_TREE_LIMIT)) {
             return GLYPH_PROMOTION_PRE_ACTIVATION_FAILURE;
         }
-        bool had_active = rename(job->active, job->previous) == 0;
+        bool had_active = tilefinch_component_store_rename(
+            job->active, job->previous);
         if (!had_active && errno != ENOENT)
             return GLYPH_PROMOTION_PRE_ACTIVATION_FAILURE;
         if (install_fault(
                 job, TILEFINCH_GLYPH_INSTALL_FAULT_ACTIVATE_CANDIDATE)
-            || rename(job->candidate, job->active) != 0) {
-            if (had_active) (void) rename(job->previous, job->active);
+            || !tilefinch_component_store_rename(
+                   job->candidate, job->active)) {
+            if (had_active)
+                (void) tilefinch_component_store_rename(
+                    job->previous, job->active);
             return GLYPH_PROMOTION_PRE_ACTIVATION_FAILURE;
         }
         job->activated = true;
@@ -688,7 +612,8 @@ bool tilefinch_glyph_component_install_pump(
         job->phase = TILEFINCH_UPDATE_INSTALL_PREPARING;
     }
     if (job->phase == TILEFINCH_UPDATE_INSTALL_PREPARING) {
-        if (rename(job->package_path, job->candidate_pack) != 0) {
+        if (!tilefinch_component_store_rename(
+                job->package_path, job->candidate_pack)) {
             install_fail(job, TILEFINCH_UPDATE_IO,
                          "FONT PACK STAGING FAILED");
             return true;
@@ -765,28 +690,29 @@ bool tilefinch_glyph_component_remove(
     char marker[TILEFINCH_INSTALL_PATH_LIMIT];
     if (!component_paths(paths, pack, component, active, previous, marker))
         return false;
-    bool had_component = path_exists(active) || path_exists(previous)
-        || path_exists(marker);
-    char mutable_component[TILEFINCH_INSTALL_PATH_LIMIT];
-    snprintf(mutable_component, sizeof(mutable_component), "%s", component);
+    bool had_component = tilefinch_component_store_exists(active)
+        || tilefinch_component_store_exists(previous)
+        || tilefinch_component_store_exists(marker);
     static const uint8_t removed[] = {'T','F','G','R','v','1','\n'};
     char activated[TILEFINCH_INSTALL_PATH_LIMIT];
     bool activation_path_ready = directory_activation_path(
         active, activated, sizeof(activated));
-    if (!make_directories(mutable_component)
-        || (mkdir(component, 0777) != 0 && errno != EEXIST)
+    if (!tilefinch_component_store_make_directory(component)
         || !activation_path_ready
         || (unlink(activated) != 0 && errno != ENOENT)) return false;
     (void) tilefinch_memory_stick_sync();
-    if (!write_file_bytes(marker, removed, sizeof(removed))) return false;
-    size_t entries = 0;
-    (void) remove_tree(active, 0, &entries);
-    entries = 0;
-    (void) remove_tree(previous, 0, &entries);
+    if (!tilefinch_component_store_write_file(
+            marker, removed, sizeof(removed))) return false;
+    (void) tilefinch_component_store_remove_tree(
+        active, GLYPH_COMPONENT_TREE_DEPTH, GLYPH_COMPONENT_TREE_LIMIT);
+    (void) tilefinch_component_store_remove_tree(
+        previous, GLYPH_COMPONENT_TREE_DEPTH, GLYPH_COMPONENT_TREE_LIMIT);
     char candidate[TILEFINCH_INSTALL_PATH_LIMIT];
-    if (join_path(component, "candidate.tmp", candidate, sizeof(candidate))) {
-        entries = 0;
-        (void) remove_tree(candidate, 0, &entries);
+    if (tilefinch_component_store_join(
+            component, "candidate.tmp", candidate, sizeof(candidate))) {
+        (void) tilefinch_component_store_remove_tree(
+            candidate, GLYPH_COMPONENT_TREE_DEPTH,
+            GLYPH_COMPONENT_TREE_LIMIT);
     }
     return had_component;
 }

@@ -177,14 +177,7 @@ bool style_node_has_focus_marker(lxb_dom_node_t *node)
                sizeof(STYLE_FOCUS_MARKER) - 1);
 }
 
-static bool style_node_descends_from(lxb_dom_node_t *node,
-                                     lxb_dom_node_t *ancestor)
-{
-    for (lxb_dom_node_t *at = node; at != NULL; at = at->parent) {
-        if (at == ancestor) return true;
-    }
-    return false;
-}
+#define style_node_descends_from document_node_within
 
 static bool style_node_effectively_disabled(lxb_dom_node_t *node)
 {

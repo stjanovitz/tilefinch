@@ -189,9 +189,9 @@ static bool bridge_wrapper_slot_live(DomBridge *bridge, size_t slot)
 {
     if ((bridge->node_retention_flags[slot] & BRIDGE_NODE_LIVE_WRAPPER) == 0
         || bridge->wrapper_refs == NULL
-        || !JS_IsObject(bridge->wrapper_refs[slot])) return false;
+        || bridge->wrapper_refs[slot] == NULL) return false;
     JSValue wrapper = JS_WeakTargetDeref(bridge->host->context,
-                                      bridge->wrapper_refs[slot]);
+                                      js_rt_bridge_wrapper_ref(bridge, slot));
     bool live = JS_IsObject(wrapper);
     JS_FreeValue(bridge->host->context, wrapper);
     return live;
@@ -392,6 +392,9 @@ static void bridge_event_state_joining(DomBridge *bridge,
 void bridge_pin_node_slot(DomBridge *bridge, size_t slot)
 {
     bridge->node_retention_flags[slot] |= BRIDGE_NODE_NATIVE_PIN;
+    /* The pin is one bit that any holder's release clears; the handle
+       stays kept for the others (bridge_connected_slot_releasable). */
+    bridge_keep_node_slot(bridge, slot);
     if (bridge->events.held_slots == 0) return;
     lxb_dom_node_t *root = bridge_owned_lifetime_root(bridge->nodes[slot]);
     if (root != NULL && !bridge_node_is_connected(root))
@@ -493,8 +496,9 @@ static void bridge_set_event_state(DomBridge *bridge, size_t slot,
        while it is held, so its weak target still answers. */
     JSContext *context = bridge->host == NULL ? NULL : bridge->host->context;
     if (context == NULL || bridge->wrapper_refs == NULL
-        || !JS_IsObject(bridge->wrapper_refs[slot])) return;
-    JSValue wrapper = JS_WeakTargetDeref(context, bridge->wrapper_refs[slot]);
+        || bridge->wrapper_refs[slot] == NULL) return;
+    JSValue wrapper = JS_WeakTargetDeref(context,
+        js_rt_bridge_wrapper_ref(bridge, slot));
     if (!JS_IsObject(wrapper)) return;
     JS_FreeValue(context, wrapper);
     JS_FreeValue(context, wrapper);
@@ -528,9 +532,10 @@ JSValue js_dom_note_event_state(JSContext *context, JSValueConst this_value,
             || (bridge->node_retention_flags[slot]
                 & BRIDGE_NODE_LIVE_WRAPPER) == 0
             || bridge->wrapper_refs == NULL
-            || !JS_IsObject(bridge->wrapper_refs[slot]))
+            || bridge->wrapper_refs[slot] == NULL)
             return JS_FALSE;
-        JSValue wrapper = JS_WeakTargetDeref(context, bridge->wrapper_refs[slot]);
+        JSValue wrapper = JS_WeakTargetDeref(context,
+            js_rt_bridge_wrapper_ref(bridge, slot));
         if (!JS_IsObject(wrapper)
             || JS_VALUE_GET_PTR(wrapper) != JS_VALUE_GET_PTR(argv[2])) {
             JS_FreeValue(context, wrapper);

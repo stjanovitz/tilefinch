@@ -1,3 +1,5 @@
+#include "../fnv1a.h"
+
 #if defined(__PSP__) && defined(TILEFINCH_PSP_VALIDATION_LOG)
 #include "../validation_phase_internal.h"
 
@@ -157,12 +159,8 @@ typedef enum {
 
 static uint64_t bootstrap_source_hash(const char *source, size_t length)
 {
-    uint64_t hash = UINT64_C(1469598103934665603);
-    for (size_t i = 0; i < length; i++) {
-        hash ^= (unsigned char) source[i];
-        hash *= UINT64_C(1099511628211);
-    }
-    return hash;
+    /* Not FNV1A64_SEED (a digit short); kept so stored hashes still match. */
+    return fnv1a64(UINT64_C(1469598103934665603), source, length);
 }
 
 /* Trusted bytecode avoids QuickJS parsing, but the embedder's explicit
@@ -455,6 +453,7 @@ typedef enum {
     LAZY_BOOTSTRAP_DOCUMENTS,
     LAZY_BOOTSTRAP_FORMS,
     LAZY_BOOTSTRAP_CSSOM_RULES,
+    LAZY_BOOTSTRAP_MEDIA_CAPTURE,
     LAZY_BOOTSTRAP_COUNT
 } LazyBootstrapFeature;
 
@@ -465,7 +464,8 @@ typedef enum {
     LAZY_BOOTSTRAP_GLOBAL = 0,
     LAZY_BOOTSTRAP_CANVAS_PROTOTYPE,
     LAZY_BOOTSTRAP_STORAGE_MANAGER_PROTOTYPE,
-    LAZY_BOOTSTRAP_DOCUMENT_PROTOTYPE
+    LAZY_BOOTSTRAP_DOCUMENT_PROTOTYPE,
+    LAZY_BOOTSTRAP_NAVIGATOR_PROTOTYPE
 } LazyBootstrapTarget;
 
 typedef struct {
@@ -568,7 +568,22 @@ static const LazyBootstrapProperty lazy_bootstrap_properties[] = {
     {"createTreeWalker", LAZY_BOOTSTRAP_TRAVERSAL,
      LAZY_BOOTSTRAP_DOCUMENT_PROTOTYPE},
     {"createNodeIterator", LAZY_BOOTSTRAP_TRAVERSAL,
-     LAZY_BOOTSTRAP_DOCUMENT_PROTOTYPE}
+     LAZY_BOOTSTRAP_DOCUMENT_PROTOTYPE},
+    /* Secure contexts only (the module is not installed elsewhere). */
+    {"MediaStream", LAZY_BOOTSTRAP_MEDIA_CAPTURE, LAZY_BOOTSTRAP_GLOBAL},
+    {"MediaStreamTrack", LAZY_BOOTSTRAP_MEDIA_CAPTURE,
+     LAZY_BOOTSTRAP_GLOBAL},
+    {"MediaStreamTrackEvent", LAZY_BOOTSTRAP_MEDIA_CAPTURE,
+     LAZY_BOOTSTRAP_GLOBAL},
+    {"OverconstrainedError", LAZY_BOOTSTRAP_MEDIA_CAPTURE,
+     LAZY_BOOTSTRAP_GLOBAL},
+    {"MediaDeviceInfo", LAZY_BOOTSTRAP_MEDIA_CAPTURE,
+     LAZY_BOOTSTRAP_GLOBAL},
+    {"InputDeviceInfo", LAZY_BOOTSTRAP_MEDIA_CAPTURE,
+     LAZY_BOOTSTRAP_GLOBAL},
+    {"MediaDevices", LAZY_BOOTSTRAP_MEDIA_CAPTURE, LAZY_BOOTSTRAP_GLOBAL},
+    {"mediaDevices", LAZY_BOOTSTRAP_MEDIA_CAPTURE,
+     LAZY_BOOTSTRAP_NAVIGATOR_PROTOTYPE}
 };
 
 static const char *runtime_lazy_bootstrap_name(LazyBootstrapFeature feature)
@@ -590,6 +605,7 @@ static const char *runtime_lazy_bootstrap_name(LazyBootstrapFeature feature)
     case LAZY_BOOTSTRAP_DOCUMENTS: return "Secondary documents";
     case LAZY_BOOTSTRAP_FORMS: return "Form collections";
     case LAZY_BOOTSTRAP_CSSOM_RULES: return "CSSOM rules";
+    case LAZY_BOOTSTRAP_MEDIA_CAPTURE: return "Media capture";
     default: return "Platform feature";
     }
 }
@@ -693,6 +709,7 @@ static JSValue runtime_lazy_bootstrap_target(
     const char *constructor_name = target == LAZY_BOOTSTRAP_CANVAS_PROTOTYPE
         ? "HTMLCanvasElement"
         : target == LAZY_BOOTSTRAP_DOCUMENT_PROTOTYPE ? "Document"
+        : target == LAZY_BOOTSTRAP_NAVIGATOR_PROTOTYPE ? "Navigator"
         : "StorageManager";
     JSValue constructor = JS_GetPropertyStr(
         context, global, constructor_name);
@@ -987,6 +1004,9 @@ static const JsRtNative runtime_motion_source_bridge = {
     JS_RT_NATIVE_TRANSIENT };
 static const JsRtNative runtime_opfs_command = {
     "__tilefinchOpfsCommand", js_opfs_command, 4, JS_RT_NATIVE_TRANSIENT };
+static const JsRtNative runtime_media_capture_command = {
+    "__tilefinchMediaCaptureCommand", js_media_capture_command, 3,
+    JS_RT_NATIVE_TRANSIENT };
 /* canvas.js captures these; page code never sees them. */
 static const JsRtNative runtime_canvas_private_natives[] = {
     { "__tilefinchCanvasNativeSurface", js_canvas_native_surface, 4,
@@ -1338,6 +1358,64 @@ static bool runtime_load_lazy_bootstrap(
             "<browser-cssom-rules-lazy>",
             &browser_bootstrap_cssom_rules_bytecode, false, trace,
             &total_us, &compile_us);
+    } else if (feature == LAZY_BOOTSTRAP_MEDIA_CAPTURE) {
+        /* The module captures its command bridge; native code captures its
+           host event and stream-track resolver. No global survives the
+           load. */
+        JSValue global = JS_GetGlobalObject(runtime->context);
+        JSAtom command_atom = JS_NewAtom(
+            runtime->context, "__tilefinchMediaCaptureCommand");
+        JSAtom event_atom = JS_NewAtom(
+            runtime->context, "__tilefinchMediaCaptureHostEvent");
+        JSAtom track_atom = JS_NewAtom(
+            runtime->context, "__tilefinchMediaCaptureStreamTrack");
+        bool bridge_ready = !JS_IsException(global)
+            && command_atom != JS_ATOM_NULL && event_atom != JS_ATOM_NULL
+            && track_atom != JS_ATOM_NULL
+            && js_rt_install_native(
+                runtime->context, global, &runtime_media_capture_command);
+        if (bridge_ready) {
+            evaluated = runtime_evaluate_bootstrap_profiled(
+                runtime, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
+                             browser_bootstrap_media_capture,
+                             browser_bootstrap_media_capture_bytecode),
+                "<browser-media-capture-lazy>",
+                &browser_bootstrap_media_capture_bytecode, false, trace,
+                &total_us, &compile_us);
+        }
+        if (evaluated) {
+            JSValue event = JS_GetProperty(runtime->context, global,
+                                           event_atom);
+            JSValue track = JS_GetProperty(runtime->context, global,
+                                           track_atom);
+            if (JS_IsFunction(runtime->context, event)
+                && JS_IsFunction(runtime->context, track)
+                && JS_DeleteProperty(runtime->context, global, event_atom, 0)
+                       > 0
+                && JS_DeleteProperty(runtime->context, global, track_atom, 0)
+                       > 0) {
+                JS_FreeValue(runtime->context,
+                             runtime->media_capture_host_event);
+                JS_FreeValue(runtime->context,
+                             runtime->media_capture_stream_track);
+                runtime->media_capture_host_event = event;
+                runtime->media_capture_stream_track = track;
+            } else {
+                JS_FreeValue(runtime->context, event);
+                JS_FreeValue(runtime->context, track);
+                evaluated = false;
+            }
+        }
+        if (command_atom != JS_ATOM_NULL) {
+            (void) JS_DeleteProperty(
+                runtime->context, global, command_atom, 0);
+            JS_FreeAtom(runtime->context, command_atom);
+        }
+        if (event_atom != JS_ATOM_NULL)
+            JS_FreeAtom(runtime->context, event_atom);
+        if (track_atom != JS_ATOM_NULL)
+            JS_FreeAtom(runtime->context, track_atom);
+        JS_FreeValue(runtime->context, global);
     } else if (feature == LAZY_BOOTSTRAP_OPFS) {
         JSValue global = JS_GetGlobalObject(runtime->context);
         JSAtom bridge_atom = JS_NewAtom(
@@ -1805,9 +1883,7 @@ static JSValue js_runtime_destroy_worker_realm(
                    != JS_VALUE_GET_PTR(argv[0]))
             continue;
         JSContext *realm = host->worker_realms[slot].context;
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
         JS_RetireContext(realm);
-#endif
         JS_FreeValue(realm, host->worker_realms[slot].global);
         host->worker_realms[slot].global = JS_UNDEFINED;
         host->worker_realms[slot].context = NULL;
@@ -2190,6 +2266,8 @@ static const JsRtNative runtime_natives_first[] = {
     { "__tilefinchSetCustomState", js_dom_set_custom_state, 2, 0 },
     { "__tilefinchGetCustomState", js_dom_get_custom_state, 2, 0 },
     { "__tilefinchRetainNodeWrapper", js_dom_retain_node_wrapper, 1, 0 },
+    { "__tilefinchKeepNodeHandle", js_dom_keep_node_handle, 1, 0 },
+    { "__tilefinchHoldHandleRelease", js_dom_hold_handle_release, 1, 0 },
     { "__tilefinchMakeWrapper", js_dom_make_wrapper, 6, 0 },
     { "__tilefinchNodeWrapper", js_dom_node_wrapper, 1, 0 },
     { "__tilefinchNoteEventState", js_dom_note_event_state, 3, 0 },
@@ -2208,6 +2286,9 @@ static const JsRtNative runtime_natives_first[] = {
 /* js_fetch_cors_install() runs between the last two tables. */
 static const JsRtNative runtime_natives_second[] = {
     { "__tilefinchSetAttribute", js_dom_set_attribute, 3, 0 },
+    /* compat.js captures and deletes it (permissions.query()). */
+    { "__tilefinchMediaCapturePermission", js_media_capture_permission, 0,
+      JS_RT_NATIVE_TRANSIENT },
     { "__tilefinchSetControlValue", js_dom_set_control_value, 2, 0 },
     { "__tilefinchParserFormOwner", js_dom_parser_form_owner, 1, 0 },
     { "__tilefinchHasParserFormOwners", js_dom_has_parser_form_owners, 0, 0 },
@@ -2216,6 +2297,7 @@ static const JsRtNative runtime_natives_second[] = {
     { "__tilefinchStyleGet", js_style_get, 2, 0 },
     { "__tilefinchComputedStyleGet", js_computed_style_get, 2, 0 },
     { "__tilefinchComputedStyleRead", js_computed_style_read, 3, 0 },
+    { "__tilefinchComputedStyleValues", js_computed_style_values, 2, 0 },
     { "__tilefinchRenderedText", js_dom_rendered_text, 1, 0 },
     { "__tilefinchComputedStyleSupport", js_computed_style_support, 1, 0 },
     { "__tilefinchTransitionSnapshot", js_transition_snapshot, 2, 0 },
@@ -2258,7 +2340,6 @@ static const JsRtNative runtime_natives_third[] = {
     { "__tilefinchScriptAsyncAssigned", js_script_async_assigned, 1, 0 },
     { "__tilefinchElementNonce", js_element_nonce, 2, 0 },
     { "__tilefinchCryptoRandomFill", js_crypto_random_fill, 1, 0 },
-    { "__tilefinchPrefersDark", js_prefers_dark_color_scheme, 0, 0 },
     { "__tilefinchMediaMatches", js_media_matches, 4, 0 },
     { "__tilefinchDecodeUtf8Valid",
       js_utf8_decode_valid, 2, JS_RT_NATIVE_TRANSIENT },
@@ -2477,6 +2558,10 @@ static ScriptRuntime *runtime_create_host(
     host->opfs_storage_manager = JS_UNDEFINED;
     host->game_audio_host_suspend = JS_UNDEFINED;
     host->game_audio_host_complete = JS_UNDEFINED;
+    host->media_capture_host_event = JS_UNDEFINED;
+    host->media_capture_stream_track = JS_UNDEFINED;
+    host->media_capture_permission_epoch =
+        tilefinch_media_capture_permission_epoch();
 #ifdef TILEFINCH_GAME_AUDIO_REFERENCE
     host->game_audio_internal_slots = options->game_audio_internal_slots;
 #else
@@ -2588,6 +2673,11 @@ static bool runtime_create_engine(ScriptRuntime *host, Budget *budget,
                  "could not create QuickJS runtime");
         return false;
     }
+    /* First, before anything else interns an atom: the embedded bytecode
+       names these atoms by index. Without them it cannot be restored
+       (bootstrap source fallback, or a failed realm on the PSP). */
+    (void) JS_PinAtomTable(host->runtime, browser_bootstrap_atom_table,
+                           browser_bootstrap_atom_table_length);
     clock->runtime_ready_ns = js_rt_monotonic_time_ns();
     {
         const char *window_env = getenv("TILEFINCH_JS_BOOT_WINDOW_KB");
@@ -2720,7 +2810,10 @@ static bool runtime_create_bind_bridge(
     }
     if (!js_rt_bridge_node_table_init(
             &host->bridge,
-            host->bridge.execution_policy.dom_handle_slot_capacity)) {
+            host->bridge.execution_policy.dom_handle_slot_capacity,
+            options->document_scope == SCRIPT_DOCUMENT_SCOPE_CHILD_FRAME
+                ? SCRIPT_DOM_HANDLE_SLOT_INITIAL_CHILD_FRAME
+                : SCRIPT_DOM_HANDLE_SLOT_INITIAL_TOP_LEVEL)) {
         snprintf(result->error, sizeof(result->error),
                  "could not allocate the DOM node handle table");
         return false;
@@ -3073,6 +3166,8 @@ static const RuntimeBootstrapStep runtime_bootstrap_sequence[] = {
                                   LAZY_BOOTSTRAP_TRAVERSAL),
     RUNTIME_BOOTSTRAP_LAZY_MODULE(RUNTIME_BOOTSTRAP_IF_SECURE_ORIGIN,
                                   LAZY_BOOTSTRAP_OPFS),
+    RUNTIME_BOOTSTRAP_LAZY_MODULE(RUNTIME_BOOTSTRAP_IF_SECURE_ORIGIN,
+                                  LAZY_BOOTSTRAP_MEDIA_CAPTURE),
     { RUNTIME_BOOTSTRAP_HOST_CHANNEL, RUNTIME_BOOTSTRAP_ALWAYS, false, 0,
       NULL, NULL, NULL, NULL },
     RUNTIME_BOOTSTRAP_MODULE(RUNTIME_BOOTSTRAP_ALWAYS,
@@ -3284,6 +3379,8 @@ static bool runtime_remove_transient_globals(ScriptRuntime *host,
             host->context, "__tilefinchPageVisible");
         JSAtom user_activation_atom = JS_NewAtom(
             host->context, "__tilefinchUserActivationState");
+        JSAtom permissions_atom = JS_NewAtom(
+            host->context, "__tilefinchPermissionsChanged");
         if (media_state_atom == JS_ATOM_NULL
             || fullscreen_exit_atom == JS_ATOM_NULL
             || visibility_apply_atom == JS_ATOM_NULL
@@ -3298,9 +3395,14 @@ static bool runtime_remove_transient_globals(ScriptRuntime *host,
             || JS_DeleteProperty(
                    host->context, global, visibility_query_atom, 0) <= 0
             || JS_DeleteProperty(
-                   host->context, global, user_activation_atom, 0) <= 0) {
+                   host->context, global, user_activation_atom, 0) <= 0
+            || permissions_atom == JS_ATOM_NULL
+            || JS_DeleteProperty(
+                   host->context, global, permissions_atom, 0) <= 0) {
             evaluated = false;
         }
+        if (permissions_atom != JS_ATOM_NULL)
+            JS_FreeAtom(host->context, permissions_atom);
         JS_FreeAtom(host->context, media_state_atom);
         JS_FreeAtom(host->context, fullscreen_exit_atom);
         JS_FreeAtom(host->context, visibility_apply_atom);
@@ -3308,6 +3410,23 @@ static bool runtime_remove_transient_globals(ScriptRuntime *host,
         JS_FreeAtom(host->context, user_activation_atom);
     }
     return evaluated;
+}
+
+/* A <meta> policy that joined the document after the realm adopted its
+   dynamic-code decision: eval and Function turn off from here on if the
+   policy now refuses them. A later policy can only restrict, so this never
+   turns them back on. */
+static void runtime_document_policy_changed(void *opaque)
+{
+    ScriptRuntime *host = opaque;
+    if (host == NULL || host->document == NULL
+        || !host->bridge.dynamic_code_allowed
+        || tilefinch_csp_allows_dynamic_code(
+               &host->document->content_security_policy)) return;
+    host->bridge.dynamic_code_allowed = false;
+#if defined(TILEFINCH_QUICKJS_DYNAMIC_CODE_POLICY)
+    JS_SetDynamicCodeEnabled(host->context, 0);
+#endif
 }
 
 /* The last steps before author code: the lab's census probe, the
@@ -3338,6 +3457,13 @@ static bool runtime_prepare_author_code(
             host->context, options->dynamic_code_disabled ? 0 : 1);
     }
 #endif
+    /* The realm follows <meta> policies parsed or script-inserted after
+       this point. */
+    if (evaluated && host->document != NULL) {
+        host->document->content_security_policy_changed =
+            runtime_document_policy_changed;
+        host->document->content_security_policy_changed_opaque = host;
+    }
     /* Host bootstrap activity is not part of the page-visible contract.
        timeOrigin was captured from zero; author code and future event-loop
        ticks now start from the same independent wall/monotonic origin. */
@@ -3462,6 +3588,9 @@ static ScriptRuntime *script_runtime_create_internal(
             evaluated = runtime_remove_transient_globals(host, global);
         if (evaluated)
             evaluated = runtime_prepare_author_code(host, options);
+#if defined(TILEFINCH_MEMORY_DIAGNOSTICS)
+        if (evaluated) js_rt_note_bootstrap_memory(host);
+#endif
         if (evaluated)
             evaluated = runtime_start_document(host, document,
                                                run_document_scripts);

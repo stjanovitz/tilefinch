@@ -26,6 +26,12 @@
  *   to the exact CPU conversion (tile_cache_canvas_materialize) and the
  *   ordinary copy. A surface that has moved on forces a full repaint
  *   instead of publishing stale pixels.
+ * - The backend allocates its GE scratch on its first scale(). The presenter
+ *   asks it to release that scratch once the page that used it is gone: the
+ *   page generation (canvas_ge_presenter_set_page) has moved on and a
+ *   present on the owner thread carries no deferral. Never while an earlier
+ *   submission may still run; a backend that still reports busy is asked
+ *   again on a later present.
  */
 
 #include <stdbool.h>
@@ -51,12 +57,15 @@ typedef struct {
     bool (*busy)(void *context);
     /* Close shared GE admission for every other user. */
     void (*fail)(void *context, const char *reason);
+    /* Free what scale() allocated; true when nothing is held afterwards. */
+    bool (*release)(void *context);
     void *context;
 } CanvasGeBackend;
 
 typedef struct {
     uint32_t presents, ge_refusals, failures, foreign_refusals;
     uint32_t busy_refusals, materializations, materialize_failures;
+    uint32_t scratch_releases;
     uint32_t verify_frames, verify_bad_frames, verify_unavailable;
     uint64_t verify_pixels, verify_mismatches;
     uint64_t ge_us, ge_max_us;
@@ -68,6 +77,9 @@ typedef struct {
     bool failed;
     bool verify;
     bool outstanding;
+    /* The backend may hold scratch since a scale() made on scratch_page. */
+    bool scratch_held;
+    uint64_t page, scratch_page;
     CanvasGePresenterStats stats;
 } CanvasGePresenter;
 
@@ -78,6 +90,9 @@ void canvas_ge_presenter_init(CanvasGePresenter *presenter,
    CPU frame after each GE publication and compares the published rows. */
 void canvas_ge_presenter_enable(CanvasGePresenter *presenter, bool enabled,
                                 bool verify);
+/* The page now presented (browser_engine_page_generation). */
+void canvas_ge_presenter_set_page(CanvasGePresenter *presenter,
+                                  uint64_t page);
 CanvasGePresentResult canvas_ge_presenter_publish(
     CanvasGePresenter *presenter, TileCache *cache, const uint16_t *frame,
     uint16_t *back, size_t back_stride, unsigned width,

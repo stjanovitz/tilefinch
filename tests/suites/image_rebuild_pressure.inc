@@ -84,9 +84,14 @@ static int test_image_rebuild_pressure(void)
         lxb_dom_interface_node(session.page.document.html), "keep");
     CHECK(controller_focus_node(&controller, keep));
     navigation_set_scroll(&session, 100);
+    /* The 1.6 MB raster cannot fit the 128 KiB left below, so the rebuild
+       is refused; once the page's realm is retired it fits in what the
+       realm gave back. It must stay well below the realm's resident size:
+       a 768 px square (2.36 MB) fit only while the bootstrap kept about
+       250 KB more resident. */
     CHECK(script_runtime_evaluate_diagnostic(session.page.runtime,
         "const art=document.getElementById('art');"
-        "art.setAttribute('width','768');art.setAttribute('height','768')",
+        "art.setAttribute('width','640');art.setAttribute('height','640')",
         "<image-pressure-update>", &session.page.script_result));
     session.style_rebuild_required = true;
     size_t old_limit = budget.limit, failures = budget.failure_count;

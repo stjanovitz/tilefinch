@@ -497,7 +497,8 @@ static FetchRequest scheduled_background_hop_shape(
         .identity_encoding = base != NULL && base->identity_encoding,
         .raw_gzip_encoding = base != NULL && base->raw_gzip_encoding,
         .icy_status_line = base != NULL && base->icy_status_line,
-        .user_agent = base == NULL ? NULL : base->user_agent,
+        .user_agent = hop != NULL ? hop->user_agent
+            : (base == NULL ? NULL : base->user_agent),
         .connect_timeout_ms = base == NULL ? 0 : base->connect_timeout_ms,
         /* The browser-thread path's stream rules (scheduled_stall_seconds):
            a stream's deadline bounds only its headers. */

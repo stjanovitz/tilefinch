@@ -17,6 +17,7 @@
 #include "tilefinch/bot_wall.h"
 #include "tilefinch/build_version.h"
 #include "tilefinch/glyph_component_store.h"
+#include "tilefinch/media_capture.h"
 #include "tilefinch/ui_language.h"
 #include "tilefinch/offline_library.h"
 #include "tilefinch/update_history.h"
@@ -92,9 +93,9 @@ _Static_assert(TILEFINCH_UI_LANGUAGE_COUNT <= 16,
 /* A video still opening after this long says so beside its Cancel. */
 #define UI_MEDIA_SLOW_LOAD_MS 10000u
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
-#define UI_OPTIONS_ITEM_COUNT 55u
+#define UI_OPTIONS_ITEM_COUNT 56u
 #else
-#define UI_OPTIONS_ITEM_COUNT 53u
+#define UI_OPTIONS_ITEM_COUNT 54u
 #endif
 #define UI_SITE_DATA_VISIBLE_LINES 8u
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
@@ -301,7 +302,8 @@ typedef enum {
     UI_OPTION_WEB_FONTS,
     UI_OPTION_YOUTUBE_SIGNIN_DIAGNOSTICS,
     UI_OPTION_YOUTUBE_CHANNEL_BANNERS,
-    UI_OPTION_PAGE_ZOOM
+    UI_OPTION_PAGE_ZOOM,
+    UI_OPTION_PAYWALL_SCRIPTS
 } UiOptionId;
 
 _Static_assert(BROWSER_VIDEO_LANGUAGE_COUNT <= 16,
@@ -373,6 +375,8 @@ static const UiOptionId ui_option_order[UI_OPTIONS_ITEM_COUNT] = {
     UI_OPTION_ROTATE_HINT,
     UI_OPTION_WEB_FONTS,
     UI_OPTION_YOUTUBE_SIGNIN_DIAGNOSTICS,
+    /* The last row of Privacy & security, after the content blocker's. */
+    UI_OPTION_PAYWALL_SCRIPTS,
     /* Shown right after YouTube results (see below). */
     UI_OPTION_YOUTUBE_CHANNEL_BANNERS,
     /* Last index; shown right after the page text size (see below). */
@@ -481,7 +485,9 @@ static const UiOptionDesc ui_option_descs[] = {
     [UI_OPTION_RESUME_DOWNLOADS] = {"Resume saves",
         "Continue queued saves after startup", 2},
     [UI_OPTION_CONTENT_BLOCKER] = {"Content blocker",
-        "Block ads, tag managers and A/B tests", 3},
+        "Blocks ads and heavy tracking scripts", 3},
+    [UI_OPTION_PAYWALL_SCRIPTS] = {"Paywall scripts",
+        "Let Basic blocking stop paywall scripts", 3},
     [UI_OPTION_COSMETIC_HIDING] = {"Hide page ads",
         "Hide empty ad spaces in page layout", 3},
     [UI_OPTION_COOKIE_BANNERS] = {"Cookie notices",
@@ -546,7 +552,7 @@ static const UiOptionDesc ui_option_descs[] = {
         "Hide skips loading each channel's banner image", 2},
 };
 _Static_assert(sizeof(ui_option_descs) / sizeof(ui_option_descs[0])
-                   == (size_t) UI_OPTION_PAGE_ZOOM + 1u,
+                   == (size_t) UI_OPTION_PAYWALL_SCRIPTS + 1u,
                "every UiOptionId needs a UiOptionDesc");
 
 static const UiOptionDesc *ui_option_desc(UiOptionId option)
@@ -2663,6 +2669,12 @@ void psp_ui_set_loading(PspUiState *ui, bool loading,
     }
     ui->loading = loading;
     ui->progress_per_mille = progress_per_mille;
+    if (!loading && ui->toast_kind == PSP_UI_TOAST_LOADING) {
+        ui->toast_kind = PSP_UI_TOAST_PLAIN;
+        ui->toast_frames = 0;
+        ui->toast_entry_frames = 0;
+        ui->status[0] = '\0';
+    }
     if (loading) {
         /* Announce a new load, but respect Triangle during its continuation. */
         if (started) ui->chrome_visible = true;
@@ -2763,11 +2775,54 @@ void psp_ui_set_preview_hint(PspUiState *ui, bool shown)
         psp_ui_dismiss_status(ui, PSP_UI_PREVIEW_HINT);
         return;
     }
-    if (ui->toast_frames != 0
+    if (ui->toast_frames != 0 && ui->toast_kind != PSP_UI_TOAST_LOADING
         && (ui->toast_kind != PSP_UI_TOAST_PLAIN
             || (strcmp(ui->status, PSP_UI_PREVIEW_HINT) != 0
                 && strncmp(ui->status, "LOADING", 7u) != 0))) return;
     psp_ui_keep_status(ui, PSP_UI_PREVIEW_HINT, 600);
+}
+
+const char *psp_ui_loading_status_text(unsigned phase)
+{
+    switch (phase) {
+        case 0u: return "CONNECTING  O CANCEL";
+        case 1u: return "RECEIVING PAGE  O CANCEL";
+        case 2u: return "RUNNING PAGE SCRIPTS  O CANCEL";
+        default: return "LOADING PAGE  O CANCEL";
+    }
+}
+
+void psp_ui_show_loading_status(PspUiState *ui, unsigned phase,
+                                unsigned duration_frames)
+{
+    if (ui == NULL) return;
+    psp_ui_show_status(ui, psp_ui_loading_status_text(phase),
+                       duration_frames);
+    ui->toast_kind = PSP_UI_TOAST_LOADING;
+    ui->toast_payload = (uint8_t) (phase > 3u ? 3u : phase);
+}
+
+void psp_ui_follow_loading_phase(PspUiState *ui, unsigned phase,
+                                 bool may_show)
+{
+    if (ui == NULL) return;
+    if (phase > 3u) phase = 3u;
+    if (ui->toast_frames == 0) {
+        /* An ended loading status keeps its kind and phase (until the load
+           ends), so it comes back only for a new phase. */
+        if (may_show && (ui->toast_kind != PSP_UI_TOAST_LOADING
+                         || ui->toast_payload != phase))
+            psp_ui_show_loading_status(ui, phase, 120u);
+    } else if (ui->toast_kind == PSP_UI_TOAST_LOADING
+               && ui->toast_payload != phase) {
+        /* In place: the toast is already up, so no entry motion. */
+        copy_string(ui->status, sizeof(ui->status),
+                    psp_ui_loading_status_text(phase));
+        ui->toast_payload = (uint8_t) phase;
+        if ((ui->toast_frames & UI_TOAST_TIMED) == 0
+            && ui->toast_frames < 120u)
+            ui->toast_frames = 120u;
+    }
 }
 
 void psp_ui_keep_progress_status(PspUiState *ui, const char *status,
@@ -3242,6 +3297,23 @@ void psp_ui_clear_page_dialog(PspUiState *ui)
     if (ui->screen == PSP_UI_SCREEN_PAGE_DIALOG) ui->screen = PSP_UI_SCREEN_PAGE;
 }
 
+void psp_ui_show_microphone_prompt(PspUiState *ui,
+                                   const PspUiMicrophonePromptView *view)
+{
+    if (ui == NULL || view == NULL) return;
+    ui->microphone_prompt = view;
+    ui_open_overlay(ui, PSP_UI_SCREEN_MICROPHONE_PROMPT);
+    ui->overlay_animation_frames = 0;
+}
+
+void psp_ui_clear_microphone_prompt(PspUiState *ui)
+{
+    if (ui == NULL) return;
+    ui->microphone_prompt = NULL;
+    if (ui->screen == PSP_UI_SCREEN_MICROPHONE_PROMPT)
+        ui->screen = PSP_UI_SCREEN_PAGE;
+}
+
 void psp_ui_show_offline_app_preview(
     PspUiState *ui, const PspUiOfflineAppPreview *preview)
 {
@@ -3472,6 +3544,14 @@ void psp_ui_show_heavy_scripts_status(PspUiState *ui, const char *status,
     if (ui == NULL) return;
     psp_ui_show_status(ui, status, duration_frames);
     ui->toast_kind = PSP_UI_TOAST_HEAVY_SCRIPTS;
+}
+
+void psp_ui_show_scripts_off_offer(PspUiState *ui)
+{
+    if (ui == NULL) return;
+    psp_ui_show_status_ms(ui, "THIS PAGE RAN OUT OF SCRIPT MEMORY LAST TIME",
+                          PSP_UI_SCRIPTS_OFF_OFFER_MS);
+    ui->toast_kind = PSP_UI_TOAST_SCRIPTS_OFF_OFFER;
 }
 
 void psp_ui_show_heavy_recovery(PspUiState *ui, const char *detail,
@@ -4303,6 +4383,17 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
             return intent;
         }
     }
+    if (ui->toast_kind == PSP_UI_TOAST_SCRIPTS_OFF_OFFER
+        && ui->toast_frames != 0 && ui->screen == PSP_UI_SCREEN_PAGE
+        && (pressed & (PSP_UI_BUTTON_CONFIRM | PSP_UI_BUTTON_CANCEL)) != 0) {
+        intent.action = (pressed & PSP_UI_BUTTON_CONFIRM) != 0
+            ? PSP_UI_ACTION_SCRIPTS_OFF_ACCEPT
+            : PSP_UI_ACTION_SCRIPTS_OFF_DECLINE;
+        ui->toast_kind = PSP_UI_TOAST_PLAIN;
+        ui->toast_frames = 0;
+        intent.visual_changed = true;
+        return intent;
+    }
     if (ui->toast_kind == PSP_UI_TOAST_WIFI_SIGN_IN && ui->toast_frames != 0) {
         if (pressed & PSP_UI_BUTTON_CONFIRM) {
             ui->toast_kind = PSP_UI_TOAST_PLAIN;
@@ -5096,6 +5187,14 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
                         (ContentBlockerMode) ui->content_blocker_mode;
                     break;
                 }
+                case UI_OPTION_PAYWALL_SCRIPTS:
+                    ui->content_blocker_paywall_scripts =
+                        !ui->content_blocker_paywall_scripts;
+                    intent.setting.id =
+                        PSP_UI_SETTING_CONTENT_BLOCKER_PAYWALL_SCRIPTS;
+                    intent.setting.value.boolean =
+                        ui->content_blocker_paywall_scripts;
+                    break;
                 case UI_OPTION_COSMETIC_HIDING:
                     ui->content_blocker_cosmetic_hiding =
                         !ui->content_blocker_cosmetic_hiding;
@@ -6279,16 +6378,22 @@ static TILEFINCH_OUT_OF_LINE void draw_page_tools(
     const PspUiState *ui, uint16_t *pixels, int width, int height,
     int stride, uint16_t accent, uint16_t text, uint16_t muted)
 {
-    static const char *const labels[UI_PAGE_TOOLS_ITEM_COUNT + 1u] = {
+    const char *labels[UI_PAGE_TOOLS_ITEM_COUNT + 2u] = {
         "Find in page", "Reader mode", "Basic view",
         "Add/remove bookmark", "Save article", "Save screenshot",
         "Site information", "Install offline app", "Download focused link",
-        "Continue to YouTube"
+        "Continue to YouTube", "Stop microphone"
     };
-    const char *values[UI_PAGE_TOOLS_ITEM_COUNT + 1u] = {
+    const char *values[UI_PAGE_TOOLS_ITEM_COUNT + 2u] = {
         ">", ui->reader_mode ? "On" : "Off",
-        ui->basic_mode ? "On" : "Off", NULL, NULL, NULL, ">", NULL, ">", ">"
+        ui->basic_mode ? "On" : "Off", NULL, NULL, NULL, ">", NULL, ">", ">",
+        NULL
     };
+    /* The optional rows follow the fixed ones in this order. */
+    if (!ui->youtube_signin_continue) {
+        labels[UI_PAGE_TOOLS_ITEM_COUNT] = labels[UI_PAGE_TOOLS_ITEM_COUNT + 1u];
+        values[UI_PAGE_TOOLS_ITEM_COUNT] = NULL;
+    }
     draw_routed_list(
         ui, pixels, width, height, stride, "Page tools", NULL,
         labels, values, psp_ui_page_tools_count(ui), ui->menu_selection,
@@ -6302,13 +6407,18 @@ static TILEFINCH_OUT_OF_LINE void draw_site_controls(
     static const char *const labels[UI_SITE_CONTROLS_ITEM_COUNT] = {
         "JavaScript", "Content blocking", "Cookie notices",
         "Always Reader", "Third-party cookies", "Mixed HTTP (session)",
-        "Unencrypted audio", "Site storage"
+        "Unencrypted audio", "Microphone", "Site storage", "Blocked here"
     };
     static const char *const audio_answers[3] = {"Ask", "Allow", "Block"};
     char domain[64], detail[64];
     ui_url_presentation(ui, domain, sizeof(domain), detail, sizeof(detail));
     bool blocker_available = ui->content_blocker_mode != CONTENT_BLOCKER_OFF
         && ui_content_blocker_site_available(ui);
+    /* The requests the blocker refused while this page loaded (the
+       count the page legend shows as "B12"); no URLs are kept. */
+    char blocked[12];
+    snprintf(blocked, sizeof(blocked), "%u",
+             (unsigned) ui->page_requests_blocked);
     const char *values[UI_SITE_CONTROLS_ITEM_COUNT] = {
         !ui->javascript_enabled ? "Global off"
             : (ui->site_javascript_enabled ? "On" : "Off"),
@@ -6320,7 +6430,10 @@ static TILEFINCH_OUT_OF_LINE void draw_site_controls(
         ui->third_party_cookie_site_allowed ? "Allow" : "Block",
         ui->mixed_content_site_allowed ? "Allow" : "Block",
         audio_answers[ui->insecure_audio_site_answer % 3u],
-        ui_site_storage_states[ui->site_storage_state]
+        /* MediaCapturePermission order is Ask, Allow, Block too. */
+        audio_answers[ui->microphone_site_answer % 3u],
+        ui_site_storage_states[ui->site_storage_state],
+        ui_content_blocker_site_available(ui) ? blocked : "N/A"
     };
     draw_routed_list(
         ui, pixels, width, height, stride, "Permissions & controls", domain,
@@ -6706,6 +6819,99 @@ static TILEFINCH_OUT_OF_LINE void draw_page_dialog(
             right, muted, 1, false);
 }
 
+/*
+ * The browser's microphone question. Tilefinch's own panel, attached under
+ * the real address bar (the modal forces it visible), naming the top-level
+ * host from the URL: a page cannot draw over it, change its words, or
+ * answer it, since the modal loop owns the pad while it shows.
+ */
+static TILEFINCH_OUT_OF_LINE void draw_microphone_prompt(
+    const PspUiState *ui, uint16_t *pixels, int width, int height,
+    int stride, uint16_t accent, uint16_t text, uint16_t muted)
+{
+    const PspUiMicrophonePromptView *view = ui->microphone_prompt;
+    if (view == NULL) return;
+    UiRect box = {36, UI_TOP_HEIGHT + 4, width - 72, 216};
+    draw_panel_furniture(pixels, width, height, stride, box, 38, 24);
+    int left = box.x + 14, right = box.x + box.width - 14;
+    draw_fitted_ui_text(pixels, width, height, stride, left, box.y + 11,
+        tilefinch_ui_text("Use your microphone?"), right, text, 2, true);
+    /* The host keeps its right end, where the registrable name is. */
+    draw_host_text(pixels, width, height, stride, left, box.y + 46,
+                   view->host != NULL && view->host[0] != '\0'
+                       ? view->host : "?",
+                   right, accent, 2, false);
+    /* A delegated frame asks in the top-level site's name: the decision
+       and the host shown are that site's. */
+    draw_fitted_ui_text(pixels, width, height, stride, left, box.y + 72,
+        tilefinch_ui_text("This site wants to hear you."),
+        right, PSP_THEME_TEXT_BODY, 1, false);
+    draw_fitted_ui_text(pixels, width, height, stride, left, box.y + 88,
+        tilefinch_ui_text("A red microphone shows while it listens."),
+        right, muted, 1, false);
+    static const char *const rows[MEDIA_CAPTURE_PROMPT_ROW_COUNT] = {
+        "Allow this time", "Always allow on this site", "Block"
+    };
+    int row_y = box.y + 108;
+    for (unsigned at = 0; at < MEDIA_CAPTURE_PROMPT_ROW_COUNT; at++) {
+        bool disabled = at == 1u && !view->can_remember;
+        UiRect row = {box.x + 8, row_y, box.width - 16, 24};
+        if (at == view->selection && !disabled) {
+            fill_round_rect(pixels, width, height, stride, row,
+                            PSP_THEME_RADIUS_ROW, PSP_THEME_SURFACE_FOCUS, 4);
+            fill_rect(pixels, width, height, stride,
+                      (UiRect) {row.x, row.y + 4, 3, row.height - 8},
+                      accent, 4);
+        }
+        /* A full site list cannot remember: the row shows, faint, and
+           the selection steps over it. */
+        draw_fitted_ui_text(pixels, width, height, stride, left, row_y + 5,
+            tilefinch_ui_text(rows[at]),
+            right, disabled ? PSP_THEME_TEXT_FAINT : text, 1,
+            at == view->selection);
+        row_y += 26;
+    }
+    draw_fitted_ui_text(pixels, width, height, stride, left,
+        box.y + box.height - 18,
+        tilefinch_ui_text("X OK   O Cancel"), right, muted, 1, false);
+}
+
+/* The "microphone on" mark: a red pill with a microphone, drawn last over
+   everything, under the address bar when it shows and at the top edge
+   otherwise. Drawn from primitives, in no language. */
+void psp_ui_draw_microphone_indicator(uint16_t *pixels, int width,
+                                      int height, int stride,
+                                      bool below_chrome)
+{
+    if (pixels == NULL || width < 40 || height < 40) return;
+    const uint16_t red = rgb565(214, 32, 40);
+    const uint16_t white = rgb565(255, 255, 255);
+    int w = 30, h = 20;
+    int x = width - w - 6, y = below_chrome ? UI_TOP_HEIGHT + 4 : 4;
+    fill_round_rect(pixels, width, height, stride,
+                    (UiRect) {x - 1, y - 1, w + 2, h + 2}, 10, white, 4);
+    fill_round_rect(pixels, width, height, stride, (UiRect) {x, y, w, h}, 9,
+                    red, 4);
+    int cx = x + w / 2;
+    /* Capsule, cradle, stem and foot. */
+    fill_round_rect(pixels, width, height, stride,
+                    (UiRect) {cx - 3, y + 3, 7, 9}, 3, white, 4);
+    fill_rect(pixels, width, height, stride,
+              (UiRect) {cx - 6, y + 7, 2, 4}, white, 4);
+    fill_rect(pixels, width, height, stride,
+              (UiRect) {cx + 5, y + 7, 2, 4}, white, 4);
+    fill_rect(pixels, width, height, stride,
+              (UiRect) {cx - 5, y + 11, 2, 2}, white, 4);
+    fill_rect(pixels, width, height, stride,
+              (UiRect) {cx + 4, y + 11, 2, 2}, white, 4);
+    fill_rect(pixels, width, height, stride,
+              (UiRect) {cx - 3, y + 13, 7, 1}, white, 4);
+    fill_rect(pixels, width, height, stride,
+              (UiRect) {cx, y + 14, 1, 2}, white, 4);
+    fill_rect(pixels, width, height, stride,
+              (UiRect) {cx - 3, y + 16, 7, 1}, white, 4);
+}
+
 static TILEFINCH_OUT_OF_LINE void draw_offline_app_preview(
     const PspUiState *ui, uint16_t *pixels, int width, int height,
     int stride, uint16_t accent, uint16_t text, uint16_t muted)
@@ -6810,6 +7016,50 @@ static const char *ui_tls_guidance_text(unsigned guidance)
     }
 }
 
+const char *psp_ui_failure_headline(unsigned diagnostic_code)
+{
+    switch ((TilefinchDiagnosticCode) diagnostic_code) {
+        case TILEFINCH_DIAGNOSTIC_ALLOCATION_FAILED:
+            return "Not enough memory to open this page";
+        case TILEFINCH_DIAGNOSTIC_LIMIT_REACHED:
+            return "This page is too large for the PSP";
+        case TILEFINCH_DIAGNOSTIC_TIMEOUT:
+            return "The site took too long to answer";
+        case TILEFINCH_DIAGNOSTIC_NETWORK_FAILED:
+            return "Could not reach the site";
+        case TILEFINCH_DIAGNOSTIC_PARSE_FAILED:
+            return "The page could not be read";
+        case TILEFINCH_DIAGNOSTIC_SCRIPT_FAILED:
+            return "The page's scripts could not run";
+        case TILEFINCH_DIAGNOSTIC_LAYOUT_FAILED:
+        case TILEFINCH_DIAGNOSTIC_RENDER_FAILED:
+            return "The page could not be drawn";
+        default:
+            return "Something went wrong opening this page";
+    }
+}
+
+const char *psp_ui_failure_next_step(unsigned diagnostic_code)
+{
+    switch ((TilefinchDiagnosticCode) diagnostic_code) {
+        case TILEFINCH_DIAGNOSTIC_ALLOCATION_FAILED:
+            return "Basic view uses less memory";
+        case TILEFINCH_DIAGNOSTIC_LIMIT_REACHED:
+        case TILEFINCH_DIAGNOSTIC_PARSE_FAILED:
+        case TILEFINCH_DIAGNOSTIC_LAYOUT_FAILED:
+        case TILEFINCH_DIAGNOSTIC_RENDER_FAILED:
+            return "Basic view may still show it";
+        case TILEFINCH_DIAGNOSTIC_TIMEOUT:
+            return "Retry, or try again later";
+        case TILEFINCH_DIAGNOSTIC_NETWORK_FAILED:
+            return "Check Wi-Fi, then Retry";
+        case TILEFINCH_DIAGNOSTIC_SCRIPT_FAILED:
+            return "Turning JavaScript off may help";
+        default:
+            return "Retry. Diagnostic QR has the details";
+    }
+}
+
 static TILEFINCH_OUT_OF_LINE void draw_failure_recovery(
     const PspUiState *ui, uint16_t *pixels, int width, int height,
     int stride, uint16_t accent, uint16_t text, uint16_t muted)
@@ -6822,10 +7072,27 @@ static TILEFINCH_OUT_OF_LINE void draw_failure_recovery(
                    ui->failure_recovery_heavy ? "Too heavy for the PSP"
                                               : "Page did not open", 34,
                    PSP_THEME_WARN, 2);
-    draw_text_with_font(
-        pixels, width, height, stride, box.x + 15, box.y + 48,
-        ui->status, 64, box.x + box.width - 15, muted, 1, NULL, false);
-    bool clock_hint = ui->toast_kind == PSP_UI_TOAST_TLS
+    /* A failed load's detail is two catalog lines, its headline and next
+       step (psp_ui_failure_headline); any other detail is one line, as
+       sent. */
+    const char *second = strchr(ui->status, '\n');
+    if (second != NULL) {
+        char first[PSP_UI_STATUS_CAPACITY];
+        size_t length = (size_t) (second - ui->status);
+        memcpy(first, ui->status, length);
+        first[length] = '\0';
+        draw_fitted_ui_text(pixels, width, height, stride, box.x + 15,
+            box.y + 48, tilefinch_ui_text(first), box.x + box.width - 15,
+            text, 1, false);
+        draw_fitted_ui_text(pixels, width, height, stride, box.x + 15,
+            box.y + 64, tilefinch_ui_text(second + 1),
+            box.x + box.width - 15, muted, 1, false);
+    } else {
+        draw_text_with_font(
+            pixels, width, height, stride, box.x + 15, box.y + 48,
+            ui->status, 64, box.x + box.width - 15, muted, 1, NULL, false);
+    }
+    bool clock_hint = second == NULL && ui->toast_kind == PSP_UI_TOAST_TLS
         && ui->toast_payload == TILEFINCH_TLS_GUIDANCE_TIME;
     if (clock_hint) {
         draw_text_with_font(
@@ -6835,7 +7102,7 @@ static TILEFINCH_OUT_OF_LINE void draw_failure_recovery(
     }
     const char *labels[9] = {0};
     size_t count = psp_ui_menu_failure_labels(ui, labels, 9u);
-    int top = box.y + (clock_hint ? 86 : 70);
+    int top = box.y + (clock_hint || second != NULL ? 86 : 70);
     /* Rows share the space between the detail and the hint bar. */
     int available = box.height - (top - box.y) - 22;
     int row_height = count > 6u ? 23 : 25;
@@ -7280,6 +7547,9 @@ static TILEFINCH_OUT_OF_LINE void ui_option_row_presentation(
         }
         case UI_OPTION_COSMETIC_HIDING:
             *value = ui->content_blocker_cosmetic_hiding ? "On" : "Off";
+            break;
+        case UI_OPTION_PAYWALL_SCRIPTS:
+            *value = ui->content_blocker_paywall_scripts ? "Block" : "Allow";
             break;
         case UI_OPTION_COOKIE_BANNERS:
             *value = !ui_content_blocker_site_available(ui)
@@ -8642,8 +8912,8 @@ static UiRect ui_home_row_rect(const PspUiState *ui, size_t row)
     };
 }
 
-/* Shared ordered ramp matrix; unlike the retired wave it remains useful for
-   static accent fills and costs nothing between presentations. */
+/* Shared ordered ramp matrix for static accent fills; it costs nothing
+   between presentations. */
 static const uint8_t ui_ordered_bayer[16] = {
      0,  8,  2, 10,
     12,  4, 14,  6,
@@ -9047,9 +9317,9 @@ static TILEFINCH_OUT_OF_LINE void draw_collections(
 }
 
 /*
- * A dithered accent -> accent-hi ramp across `rect`, using the same 4x4
- * ordered matrix the wave band uses. Ordered, not error-diffused: a pixel is
- * a pure function of (x, y), so a band that slides does not shimmer.
+ * A dithered accent -> accent-hi ramp across `rect`, using the shared 4x4
+ * ordered matrix. Ordered, not error-diffused: a pixel is a pure function
+ * of (x, y), so a band that slides does not shimmer.
  */
 static void fill_accent_ramp(uint16_t *pixels, int width, int height,
                              int stride, UiRect rect,
@@ -9701,6 +9971,8 @@ static void draw_toast(const PspUiState *ui, uint16_t *pixels, int width,
         second_line = tilefinch_ui_text("X Open Wi-Fi sign-in  O Cancel");
     else if (ui->toast_kind == PSP_UI_TOAST_HEAVY_SCRIPTS)
         second_line = tilefinch_ui_text("X Stop page scripts  O Keep reading");
+    else if (ui->toast_kind == PSP_UI_TOAST_SCRIPTS_OFF_OFFER)
+        second_line = tilefinch_ui_text("Load without scripts?  X Yes  O No");
     bool multiline = second_line != NULL && second_line[0] != '\0';
     int scale = browser_ui_scale(ui);
     size_t viewport_maximum = width > 48
@@ -9962,6 +10234,9 @@ static TILEFINCH_OUT_OF_LINE void psp_ui_composite_browser(
         draw_zip_install(ui, pixels, width, height, stride, accent, text, muted);
     } else if (ui->screen == PSP_UI_SCREEN_PAGE_DIALOG) {
         draw_page_dialog(ui, pixels, width, height, stride, text, muted);
+    } else if (ui->screen == PSP_UI_SCREEN_MICROPHONE_PROMPT) {
+        draw_microphone_prompt(ui, pixels, width, height, stride, accent,
+                               text, muted);
     } else if (ui->screen == PSP_UI_SCREEN_FILE_DOWNLOAD) {
         draw_file_download(ui, pixels, width, height, stride, accent, text, muted);
     } else if (ui->screen == PSP_UI_SCREEN_OFFLINE_APP_PREVIEW) {
@@ -10045,6 +10320,12 @@ void psp_ui_composite(const PspUiState *ui, uint16_t *pixels,
         psp_ui_composite_native(&context);
     else
         psp_ui_composite_browser(&context);
+    /* Last, over every screen the page or a menu shows. */
+    if (tilefinch_media_capture_indicator())
+        psp_ui_draw_microphone_indicator(
+            pixels, width, height, stride,
+            ui->chrome_visible
+                && !psp_ui_screen_is_native_surface(ui->screen));
 }
 
 /*
@@ -10164,11 +10445,7 @@ void psp_ui_boot_entrance_composite(
         return;
     }
 
-    /*
-     * Steps one and two. The band fades up behind the mark in whole
-     * pre-rendered brightness steps -- each rendered once, then blitted --
-     * and is skipped entirely when the wave option is off.
-     */
+    /* Before the glide: the mark alone, centred. */
     draw_boot_mark(
         pixels, width, height, stride,
         (width - UI_ENTRANCE_MARK_SIZE) / 2, UI_ENTRANCE_MARK_TOP,
@@ -10604,7 +10881,10 @@ static void media_set_resolving(PspUiMediaState *media, const char *title,
         if (!keep_menu) media->presentation->track_menu_open = false;
         /* A fresh open starts the slow-load clock; the open's own later
            phases and a 240p retry inside it keep counting. */
-        if (!media->resolving) media->presentation->resolving_elapsed_ms = 0;
+        if (!media->resolving) {
+            media->presentation->resolving_elapsed_ms = 0;
+            media->presentation->parked_action = PSP_UI_MEDIA_ACTION_NONE;
+        }
     }
     media->visible = true;
     media->controls_visible = true;
@@ -11348,12 +11628,49 @@ void psp_ui_media_press_queue_settle(PspUiMediaPressQueue *queue,
         input.pressed = input.held = queue->pressed[at];
         PspUiMediaIntent intent = psp_ui_media_update(owner, &input);
         if (intent.action == PSP_UI_MEDIA_ACTION_NONE) continue;
-        if (psp_ui_media_timeline_action(intent.action))
+        if (psp_ui_media_timeline_action(intent.action)) {
             mailbox->timeline = intent;
-        else
+        } else {
             mailbox->command = intent;
+            if (owner != NULL && owner->presentation != NULL)
+                owner->presentation->parked_action = (uint8_t) intent.action;
+        }
     }
     queue->count = 0;
+}
+
+const char *psp_ui_media_parked_note(PspUiMediaAction action)
+{
+    switch (action) {
+        case PSP_UI_MEDIA_ACTION_NEXT:
+            return "Next video after this opens";
+        case PSP_UI_MEDIA_ACTION_PREVIOUS:
+            return "Previous video after this opens";
+        case PSP_UI_MEDIA_ACTION_QUEUE_SELECT:
+        case PSP_UI_MEDIA_ACTION_QUEUE_RETRY:
+            return "Chosen video plays after this opens";
+        case PSP_UI_MEDIA_ACTION_SELECT_AUDIO_TRACK:
+        case PSP_UI_MEDIA_ACTION_SELECT_SUBTITLE_TRACK:
+            return "Track changes after this opens";
+        case PSP_UI_MEDIA_ACTION_ROTATE:
+            return "Rotates after this opens";
+        case PSP_UI_MEDIA_ACTION_CLOSE:
+            return "Closes after this opens";
+        case PSP_UI_MEDIA_ACTION_NONE:
+        case PSP_UI_MEDIA_ACTION_PLAY_PAUSE:
+        case PSP_UI_MEDIA_ACTION_PREVIEW_SEEK:
+        case PSP_UI_MEDIA_ACTION_CANCEL_SEEK_PREVIEW:
+        case PSP_UI_MEDIA_ACTION_SEEK:
+            return NULL;
+        default:
+            return "Applies after this opens";
+    }
+}
+
+void psp_ui_media_clear_parked(PspUiMediaState *media)
+{
+    if (media != NULL && media->presentation != NULL)
+        media->presentation->parked_action = PSP_UI_MEDIA_ACTION_NONE;
 }
 
 bool psp_ui_media_supervisor_press(
@@ -11373,6 +11690,17 @@ bool psp_ui_media_supervisor_press(
     bool detached = false;
     PspUiMediaIntent shown =
         psp_ui_media_update_detached(copy, own, &input, &detached);
+    /* A command the open holds back says so on the copy at once (its own
+       presentation: the borrowed one is the owner's). */
+    if (psp_ui_media_parked_note(shown.action) != NULL && own != NULL
+        && copy->presentation != NULL) {
+        if (copy->presentation != own) {
+            memcpy(own, copy->presentation, sizeof(*own));
+            copy->presentation = own;
+        }
+        own->parked_action = (uint8_t) shown.action;
+        shown.visual_changed = true;
+    }
     (void) psp_ui_media_press_queue_push(queue, pressed);
     if (intent != NULL) *intent = shown;
     return true;
@@ -13528,7 +13856,14 @@ void psp_ui_media_composite_layers(
                 pixels, width, height, stride,
                 message.x + message.width - 16, message.y + 44,
                 percent, 5, muted, 1, false);
-            if (!media->seek_in_progress)
+            const char *parked = media->presentation == NULL ? NULL
+                : psp_ui_media_parked_note(
+                      (PspUiMediaAction) media->presentation->parked_action);
+            if (parked != NULL)
+                draw_fitted_ui_text(pixels, width, height, stride,
+                    track_x, message.y + 66, tilefinch_ui_text(parked),
+                    message.x + message.width - 18, text, 1, false);
+            else if (!media->seek_in_progress)
                 draw_fitted_ui_text(pixels, width, height, stride,
                     track_x, message.y + 66,
                     tilefinch_ui_text(media->presentation != NULL

@@ -1605,6 +1605,46 @@ static int test_init_events_and_token_list(void)
     return 0;
 }
 
+/* ---- Large character data ----
+   createTextNode and createComment take any string: a page that loads its
+   CSS late puts one style sheet of several hundred KiB into a <style> as a
+   single Text node, then appends the <style> to <head>. Both used to
+   return null above 256 KiB, so the append threw "Node required". (This
+   runner has no style engine; web_runtime_navigation.inc checks that such
+   a sheet applies.) */
+
+static const char large_character_data_probe[] =
+    "const failures=[],expect=(name,ok)=>{if(!ok)failures.push(name)};"
+    "const css='/*'+'x'.repeat(600000)+'*/#p{color:rgb(1, 2, 3)}';"
+    "const text=document.createTextNode(css);"
+    "expect('text node',text instanceof Text&&text.nodeType===3&&"
+    "text.data.length===css.length&&text.length===css.length);"
+    "const before=document.styleSheets.length,style=document.createElement("
+    "'STYLE');style.type='text/css';style.appendChild(text);"
+    "document.getElementsByTagName('HEAD')[0].appendChild(style);"
+    "expect('style inserted',style.parentNode===document.head&&"
+    "style.firstChild===text&&style.textContent.length===css.length);"
+    "expect('sheet count',document.styleSheets.length===before+1&&"
+    "document.styleSheets[before].ownerNode===style);"
+    "const comment=document.createComment('y'.repeat(300000));"
+    "expect('comment node',comment instanceof Comment&&"
+    "comment.data.length===300000);"
+    "document.body.appendChild(comment);"
+    "expect('comment inserted',document.body.lastChild===comment);"
+    "const other=document.implementation.createHTMLDocument('')"
+    ".createTextNode('z'.repeat(400000));"
+    "expect('other document',other instanceof Text&&other.data.length===400000);"
+    "globalThis.pocSummary=failures.length?failures.length+' FAIL '+failures.jo"
+    "in(' | '):'LARGE-CHARACTER-DATA-OK';";
+
+static int test_large_character_data(void)
+{
+    puts("test: createTextNode and createComment with data over 256 KiB");
+    CHECK(run_probe("large-character-data", large_character_data_probe,
+                    "LARGE-CHARACTER-DATA-OK"));
+    return 0;
+}
+
 static int test_writable_terminal_handoffs(void)
 {
     puts("test: writable stream abort, queued work, and in-flight close handoffs");
@@ -1714,6 +1754,7 @@ int main(int argc, char **argv)
     failures += test_handler_form_members_and_unscopables();
     failures += test_platform_methods_present_as_native();
     failures += test_init_events_and_token_list();
+    failures += test_large_character_data();
     failures += test_writable_terminal_handoffs();
     if (failures != 0) return 1;
     puts("web conformance tests passed");

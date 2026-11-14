@@ -1,6 +1,6 @@
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -48806,6 +48806,11 @@
+@@ -48848,6 +48848,11 @@
      return result;
  }
  
@@ -12,13 +12,13 @@
  static JSValue js_function_toString(JSContext *ctx, JSValueConst this_val,
                                      int argc, JSValueConst *argv)
  {
-@@ -48816,7 +48821,18 @@
+@@ -48858,6 +48863,17 @@
          return JS_EXCEPTION;
  
      p = JS_VALUE_GET_OBJ(this_val);
 +#ifdef CONFIG_TILEFINCH_HEAP_DETAIL
 +    jsmd_tostring[0]++;
-     if (js_class_has_bytecode(p->class_id)) {
++    if (js_class_has_bytecode(p->class_id)) {
 +        JSFunctionBytecode *tb = p->u.func.function_bytecode;
 +        jsmd_tostring[1]++;
 +        if (tb->has_debug && tb->debug.source) {
@@ -27,27 +27,37 @@
 +        }
 +    }
 +#endif
-+    if (js_class_has_bytecode(p->class_id)) {
+     if (js_class_has_bytecode(p->class_id)) {
          JSFunctionBytecode *b = p->u.func.function_bytecode;
          if (b->has_debug && b->debug.source) {
-             if (!b->debug.source_owner && b->debug.source_len >= 1024)
-@@ -69356,5 +69372,399 @@
-         if (reset) b->tf_calls = 0;
-     }
+@@ -69459,3 +69475,410 @@
      return TRUE;
-+#endif
-+}
+ #endif
+ }
 +
 +#ifdef CONFIG_TILEFINCH_HEAP_DETAIL
-+/* Heap-detail diagnostic (CONFIG_TILEFINCH_HEAP_DETAIL: host builds only,
-+   never compiled for the PSP): read-only heap composition walk. Allocation-free (static tables), so it
++/* Heap-detail diagnostic (CONFIG_TILEFINCH_HEAP_DETAIL: host builds and
++   PSP validation builds, never a shipping PSP image): read-only heap
++   composition walk. Allocation-free (static tables), so it
 +   may run at a safe point right after an allocation was refused. Exact
 +   allocation sizes come from the arena block headers
 +   (js_malloc_usable_size_rt); strings reached from several values are
 +   split by reference count, as in JS_ComputeMemoryUsage. */
++#if defined(__PSP__)
++/* PSP validation builds: the tables are static, so they are sized to cost
++   about 80 KiB of the device's heap rather than about 1 MiB; a fuller
++   table folds its overflow into one row (files), skips de-duplication
++   (sources) or shares a slot (prototypes). */
++#define JSMD_FILES 256
++#define JSMD_OWNERS 2048
++#define JSMD_CLASSES 512
++#define JSMD_PROTOS_SIZE 1024
++#else
 +#define JSMD_FILES 2048
 +#define JSMD_OWNERS 65536
 +#define JSMD_CLASSES 1024
++#define JSMD_PROTOS_SIZE 16384
++#endif
 +enum { JSMD_F_FUNCS, JSMD_F_BC, JSMD_F_LAZY, JSMD_F_LAZY_BYTES, JSMD_F_PC2LINE,
 +       JSMD_F_SRC_OWN, JSMD_F_SRC_SHARED, JSMD_F_CLOSURES, JSMD_F_CLOSURE_BYTES,
 +       JSMD_F_BODY, JSMD_F_LAZY_SPAN_SHARED, JSMD_F_COMPILED_SHARED,
@@ -57,7 +67,7 @@
 +static const void *jsmd_owner[JSMD_OWNERS];
 +static int64_t jsmd_class[JSMD_CLASSES][4];
 +static double jsmd_str[5][2];
-+#define JSMD_PROTOS 16384
++#define JSMD_PROTOS JSMD_PROTOS_SIZE
 +static JSObject *jsmd_proto[JSMD_PROTOS];
 +static int64_t jsmd_proto_stat[JSMD_PROTOS][3];
 +
@@ -250,7 +260,7 @@
 +#ifdef CONFIG_TILEFINCH_COMPACT_CHAR_ARRAY
 +                if (!p->compact_char_array && !p->compact_byte_array &&
 +                    !p->compact_signed_byte_array && !p->compact_short_array)
- #endif
++#endif
 +                    for (i = 0; i < (int)p->u.array.count; i++)
 +                        jsmd_value(rt, p->u.array.u.values[i]);
 +            }
@@ -429,5 +439,5 @@
 +        v[0] = n; v[1] = bytes;
 +        row(opaque, "jobs", "-", v, 2);
 +    }
- }
++}
 +#endif

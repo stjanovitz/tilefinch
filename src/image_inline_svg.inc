@@ -82,7 +82,7 @@ static lxb_dom_node_t *inline_svg_next_node(lxb_dom_node_t *root,
 
 static bool inline_svg_definition_container(lxb_dom_node_t *node)
 {
-    return image_name_is(node, "symbol") || image_name_is(node, "defs");
+    return document_element_name_is(node, "symbol") || document_element_name_is(node, "defs");
 }
 
 static const char *inline_svg_use_href(lxb_dom_node_t *node, size_t *length)
@@ -106,7 +106,7 @@ static const char *inline_svg_external_use_href(lxb_dom_node_t *root,
     for (lxb_dom_node_t *child = root->first_child; child != NULL;
          child = child->next) {
         if (child->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
-        if (use != NULL || !image_name_is(child, "use")) return NULL;
+        if (use != NULL || !document_element_name_is(child, "use")) return NULL;
         use = child;
     }
     size_t href_length = 0;
@@ -371,7 +371,7 @@ static lxb_dom_node_t *inline_svg_find_id(lxb_dom_node_t *root,
 static bool inline_svg_reference_target(lxb_dom_node_t *target)
 {
     if (target == NULL || target->type != LXB_DOM_NODE_TYPE_ELEMENT
-        || image_name_is(target, "use") || image_name_is(target, "defs")) {
+        || document_element_name_is(target, "use") || document_element_name_is(target, "defs")) {
         return false;
     }
     for (lxb_dom_node_t *at = target; at != NULL; at = at->parent) {
@@ -465,14 +465,7 @@ static lxb_dom_node_t *inline_svg_clone_counterpart(
     return copy;
 }
 
-static bool inline_svg_node_within(lxb_dom_node_t *node,
-                                   lxb_dom_node_t *root)
-{
-    for (lxb_dom_node_t *at = node; at != NULL; at = at->parent) {
-        if (at == root) return true;
-    }
-    return false;
-}
+#define inline_svg_node_within document_node_within
 
 /* Point every reference into the svg at its copy in the clone, so
    expansion draws the styled copy validation counted. */
@@ -536,7 +529,7 @@ static bool inline_svg_validate_tree(InlineSvgUseValidation *validation,
     for (lxb_dom_node_t *node = container->first_child; node != NULL;
          node = inline_svg_next_node(
              container, node, inline_svg_definition_container(node))) {
-        if (image_name_is(node, "use")
+        if (document_element_name_is(node, "use")
             && !inline_svg_validate_use(validation, node, depth)) {
             return false;
         }
@@ -649,8 +642,8 @@ static bool inline_svg_expand_one_use(InlineSvgUseValidation *validation,
         return false;
     }
     lxb_dom_node_t *group_node = lxb_dom_interface_node(group);
-    bool container = image_name_is(target, "symbol")
-        || image_name_is(target, "g") || document_node_is_tag(target, LXB_TAG_SVG);
+    bool container = document_element_name_is(target, "symbol")
+        || document_element_name_is(target, "g") || document_node_is_tag(target, LXB_TAG_SVG);
     lxb_dom_node_t *child = container ? target->first_child : target;
     while (child != NULL) {
         lxb_dom_node_t *next = container ? child->next : NULL;
@@ -681,7 +674,7 @@ static lxb_dom_node_t *inline_svg_first_rendered_use(lxb_dom_node_t *root)
     for (lxb_dom_node_t *node = root->first_child; node != NULL;
          node = inline_svg_next_node(
              root, node, inline_svg_definition_container(node))) {
-        if (image_name_is(node, "use")) return node;
+        if (document_element_name_is(node, "use")) return node;
     }
     return NULL;
 }
@@ -690,7 +683,7 @@ static void inline_svg_remove_symbols(lxb_dom_node_t *root)
 {
     lxb_dom_node_t *node = root->first_child;
     while (node != NULL) {
-        bool symbol = image_name_is(node, "symbol");
+        bool symbol = document_element_name_is(node, "symbol");
         lxb_dom_node_t *next = inline_svg_next_node(root, node, symbol);
         if (symbol) {
             lxb_dom_node_destroy_deep(node);

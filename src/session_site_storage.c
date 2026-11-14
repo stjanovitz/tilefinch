@@ -1,5 +1,6 @@
 #include "session_site_storage.h"
 
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -425,16 +426,17 @@ static void stick_make_room(struct BrowserSiteStore *store, size_t keep)
     }
 }
 
-static void stick_mark_session_files(struct BrowserSiteStore *store)
+static bool stick_mark_session_files(struct BrowserSiteStore *store)
 {
-    if (store->session_marker) return;
+    if (store->session_marker) return true;
     char path[STICK_PATH_BYTES];
     int written = snprintf(path, sizeof(path), "%s/%s", store->directory,
                            STICK_SESSION_MARKER);
-    if (written <= 0 || (size_t) written >= sizeof(path)) return;
+    if (written <= 0 || (size_t) written >= sizeof(path)) return false;
     FILE *marker = fopen(path, "wb");
-    if (marker != NULL) fclose(marker);
+    if (marker == NULL || fclose(marker) != 0) return false;
     store->session_marker = true;
+    return true;
 }
 
 static bool stick_write_header(FILE *file, const char *origin,
@@ -474,8 +476,8 @@ static bool stick_create(struct BrowserSiteStore *store, size_t index)
         || stick_name_protected(site, site->tier, path)) return false;
     stick_close(site);
     stick_make_room(store, index);
-    if (site->tier == BROWSER_SITE_STORAGE_STICK_SESSION)
-        stick_mark_session_files(store);
+    if (site->tier == BROWSER_SITE_STORAGE_STICK_SESSION
+        && !stick_mark_session_files(store)) return false;
     FILE *file = fopen(path, "w+b");
     if (file == NULL) return false;
     size_t written = 0;
@@ -1059,8 +1061,8 @@ static bool site_retier(struct BrowserSiteStore *store, size_t index,
         || !stick_path(store, index, tier, to)
         || stick_name_protected(site, tier, to)) return false;
     stick_close(site);
-    if (tier == BROWSER_SITE_STORAGE_STICK_SESSION)
-        stick_mark_session_files(store);
+    if (tier == BROWSER_SITE_STORAGE_STICK_SESSION
+        && !stick_mark_session_files(store)) return false;
     if (site->file_bytes != 0) {
         remove(to);
         if (rename(from, to) != 0) return false;
@@ -1069,24 +1071,39 @@ static bool site_retier(struct BrowserSiteStore *store, size_t index,
     return true;
 }
 
-static void site_remove_file(struct BrowserSiteStore *store, size_t index)
+static int stick_remove(const char *path)
+{
+#ifndef __PSP__
+    unsigned *remaining = &tilefinch_test_faults()->fail_site_storage_remove_at;
+    if (*remaining != 0 && --*remaining == 0) {
+        errno = EIO;
+        return -1;
+    }
+#endif
+    return remove(path);
+}
+
+static bool stick_remove_owned(const SiteRecord *site, const char *path)
+{
+    return stick_name_state(site, site->tier, path) == STICK_LOG_FOREIGN
+        || stick_remove(path) == 0 || errno == ENOENT;
+}
+
+static bool site_remove_file(struct BrowserSiteStore *store, size_t index)
 {
     SiteRecord *site = &store->sites[index];
     char path[STICK_PATH_BYTES], other[STICK_PATH_BYTES];
     stick_close(site);
-    if (stick_path(store, index, site->tier, path)) {
-        if (stick_name_state(site, site->tier, path) != STICK_LOG_FOREIGN)
-            remove(path);
-        /* A load would bring an interrupted compaction's copy back. */
-        if (temporary_path(path, other)
-            && stick_name_state(site, site->tier, other) != STICK_LOG_FOREIGN)
-            remove(other);
-        if (backup_path(path, other)
-            && stick_name_state(site, site->tier, other) != STICK_LOG_FOREIGN)
-            remove(other);
-    }
+    /* Retire recovery copies first. On refusal the primary and its index
+       must remain usable for retry; deleting the primary first could expose
+       an older copy at the next boot. ENOENT is an already-retired file. */
+    if (!stick_path(store, index, site->tier, path)
+        || !temporary_path(path, other) || !stick_remove_owned(site, other)
+        || !backup_path(path, other) || !stick_remove_owned(site, other)
+        || !stick_remove_owned(site, path)) return false;
     site->file_bytes = 0;
     site->dead_bytes = 0;
+    return true;
 }
 
 /* A removal on the stick only appends a REMOVE record: the cleared value
@@ -1101,11 +1118,7 @@ static bool stick_scrub(BrowserSession *session,
     if (!stick_tier(site) || !site->loaded || site->file_bytes == 0
         || site->dead_bytes == 0) return true;
     if (site->item_count == 0) {
-        char path[STICK_PATH_BYTES];
-        site_remove_file(store, index);
-        struct stat status;
-        return !stick_path(store, index, site->tier, path)
-            || stat(path, &status) != 0;
+        return site_remove_file(store, index);
     }
     return stick_compact(session, store, index);
 }
@@ -1859,15 +1872,17 @@ void browser_session_site_storage_decline(BrowserSession *session,
     site->declined = true;
 }
 
-static void site_clear_data(BrowserSession *session, size_t index)
+static bool site_clear_data(BrowserSession *session, size_t index)
 {
     struct BrowserSiteStore *store = session->site_store;
+    if (stick_tier(&store->sites[index])
+        && !site_remove_file(store, index)) return false;
     for (size_t i = store->item_count; i-- > 0;)
         if (store->items[i].site == index) item_drop(session, store, i);
     if (stick_tier(&store->sites[index])) {
-        site_remove_file(store, index);
         store->sites[index].loaded = true;
     }
+    return true;
 }
 
 bool browser_session_site_storage_forget(BrowserSession *session,
@@ -1879,7 +1894,7 @@ bool browser_session_site_storage_forget(BrowserSession *session,
     if (index < 0) return true;
     struct BrowserSiteStore *store = session->site_store;
     SiteRecord *site = &store->sites[index];
-    site_clear_data(session, (size_t) index);
+    if (!site_clear_data(session, (size_t) index)) return false;
     site_reset(site);
     store_trim(session);
     return true;
@@ -1988,16 +2003,18 @@ void browser_site_storage_remove_session_files(const char *directory)
     FILE *marker = fopen(path, "rb");
     if (marker == NULL) return;
     fclose(marker);
+    bool removed = true;
     for (unsigned slot = 0; slot < BROWSER_SITE_STORAGE_SITES; slot++) {
         snprintf(path, sizeof(path), "%s/s-%02u", directory, slot);
-        remove(path);
+        if (stick_remove(path) != 0 && errno != ENOENT) removed = false;
         snprintf(path, sizeof(path), "%s/s-%02u.tmp", directory, slot);
-        remove(path);
+        if (stick_remove(path) != 0 && errno != ENOENT) removed = false;
         snprintf(path, sizeof(path), "%s/s-%02u.bak", directory, slot);
-        remove(path);
+        if (stick_remove(path) != 0 && errno != ENOENT) removed = false;
     }
+    /* Keep the boot retry marker while any session file survives. */
     snprintf(path, sizeof(path), "%s/%s", directory, STICK_SESSION_MARKER);
-    remove(path);
+    if (removed) (void) stick_remove(path);
 }
 
 /* ---- session-internal hooks ------------------------------------------- */
@@ -2036,6 +2053,21 @@ void site_storage_attach(BrowserSession *session,
     session->site_store = store;
 }
 
+#if defined(TILEFINCH_MEMORY_DIAGNOSTICS)
+size_t site_storage_budget_bytes(const BrowserSession *session)
+{
+    const struct BrowserSiteStore *store =
+        session == NULL ? NULL : session->site_store;
+    if (store == NULL) return 0;
+    size_t bytes = budget_allocation_charge(store, NULL)
+        + budget_allocation_charge(store->items, NULL)
+        + budget_allocation_charge(store->scratch, NULL);
+    for (size_t i = 0; i < store->item_count; i++)
+        bytes += budget_allocation_charge(store->items[i].key, NULL);
+    return bytes;
+}
+#endif
+
 void site_storage_usage(const BrowserSession *session, const char *origin,
                         BrowserSiteDataUsage *usage)
 {
@@ -2058,15 +2090,16 @@ void site_storage_usage(const BrowserSession *session, const char *origin,
     }
 }
 
-void site_storage_clear_origin(BrowserSession *session, const char *origin)
+bool site_storage_clear_origin(BrowserSession *session, const char *origin)
 {
     int index = site_find(session->site_store, origin);
-    if (index < 0) return;
+    if (index < 0) return true;
     SiteRecord *site = &session->site_store->sites[index];
-    site_clear_data(session, (size_t) index);
+    if (!site_clear_data(session, (size_t) index)) return false;
     site->bytes = 0;
     site->allowance = BROWSER_SITE_STORAGE_INITIAL_BYTES;
     site_idle(session, (size_t) index);
+    return true;
 }
 
 bool site_storage_next_local(const BrowserSession *session, size_t *cursor,

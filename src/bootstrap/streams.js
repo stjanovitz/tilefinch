@@ -6,6 +6,35 @@
     compressionNative = globalThis.__tilefinchCompressionRun,
     heapSnapshot = globalThis.__tilefinchHeapMemorySnapshot,
     largeStreamEndpoints = new WeakSet(),
+    handledRejection = (reason) => {
+      const promise = Promise.reject(reason);
+      promise.catch(() => {});
+      return promise;
+    },
+    initializeStreamOwner = (owner, status, error) => {
+      owner._closeResolve = owner._closeReject = null;
+      if (status === "closed") owner.closed = Promise.resolve();
+      else if (status === "errored") owner.closed = handledRejection(error);
+      else {
+        owner.closed = new Promise((resolve, reject) => {
+          owner._closeResolve = resolve;
+          owner._closeReject = reject;
+        });
+        owner.closed.catch(() => {});
+      }
+    },
+    finishStreamOwner = (owner, error, failed = false) => {
+      if (!owner?._closeReject) return;
+      const settle = failed ? owner._closeReject : owner._closeResolve;
+      owner._closeResolve = owner._closeReject = null;
+      settle(error);
+    },
+    releaseStreamOwner = (owner, error) => {
+      /* Completion belongs to this lock, not to a later reader/writer.
+         Do not attach another reaction to a stream-wide pending promise. */
+      if (owner._closeReject) finishStreamOwner(owner, error, true);
+      else owner.closed = handledRejection(error);
+    },
     chunkBytes = (value) => {
       if (value instanceof ArrayBuffer) return value.byteLength;
       if (ArrayBuffer.isView(value)) return value.byteLength;
@@ -30,7 +59,7 @@
       state.status = "closed";
       while (state.reads.length)
         state.reads.shift().resolve({ done: true, value: undefined });
-      state.closeResolve();
+      finishStreamOwner(state.reader);
     },
     failReadableStream = (stream, reason) => {
       const state = readableState(stream);
@@ -41,26 +70,20 @@
       state.queueBytes = 0;
       state.queueSize = 0;
       while (state.reads.length) state.reads.shift().reject(reason);
-      state.closeReject(reason);
+      finishStreamOwner(state.reader, reason, true);
     },
     requestReadableStreamPull = (stream) => {
       const state = readableState(stream);
-      if (state.pulling) {
-        if (
-          state.status === "readable" &&
-          typeof state.source.pull === "function" &&
-          (state.reads.length || !state.queue.length)
-        )
-          state.pullAgain = true;
-        return;
-      }
       if (
-        state.status !== "readable" ||
+        !state.started || state.closeRequested || state.status !== "readable" ||
         typeof state.source.pull !== "function" ||
-        (!state.reads.length && state.queue.length &&
-          state.highWaterMark - state.queueSize <= 0)
+        (!state.reads.length && state.highWaterMark - state.queueSize <= 0)
       )
         return;
+      if (state.pulling) {
+        state.pullAgain = true;
+        return;
+      }
       state.pulling = true;
       try {
         Promise.resolve(state.source.pull(state.controller)).then(
@@ -88,16 +111,18 @@
       /* A body becomes disturbed when a read is attempted, not merely when a
          reader locks it. Fetch exposes that distinction through bodyUsed. */
       state.disturbed = true;
+      if (state.status === "closed")
+        return Promise.resolve({ done: true, value: undefined });
+      if (state.status === "errored") return Promise.reject(state.error);
       if (state.queue.length) {
         const entry = state.queue.shift();
         state.queueBytes -= entry.bytes;
         state.queueSize = state.queue.length ? state.queueSize - entry.size : 0;
-        requestReadableStreamPull(stream);
+        if (state.closeRequested && !state.queue.length)
+          closeReadableStream(stream);
+        else requestReadableStreamPull(stream);
         return Promise.resolve({ done: false, value: entry.value });
       }
-      if (state.status === "closed")
-        return Promise.resolve({ done: true, value: undefined });
-      if (state.status === "errored") return Promise.reject(state.error);
       if (state.reads.length >= streamQueueLimit)
         return Promise.reject(new RangeError("pending read limit exceeded"));
       const promise = new Promise((resolve, reject) => {
@@ -130,10 +155,11 @@
       if (!(stream instanceof ReadableStream))
         throw new TypeError("invalid readable stream");
       if (stream.locked) throw new TypeError("stream is locked");
-      this._stream = stream;
       const state = readableState(stream);
+      initializeStreamOwner(this, state.status, state.error);
+      this._stream = stream;
+      state.reader = this;
       state.locked = true;
-      this.closed = state.closedPromise;
     }
     read() {
       if (!this._stream)
@@ -148,10 +174,12 @@
     releaseLock() {
       if (!this._stream) return;
       const state = readableState(this._stream);
+      const error = new TypeError("reader lock released");
+      releaseStreamOwner(this, error);
       if (state.reads.length) {
-        const error = new TypeError("reader lock released");
         for (const read of state.reads.splice(0)) read.reject(error);
       }
+      state.reader = null;
       state.locked = false;
       this._stream = null;
     }
@@ -172,17 +200,11 @@
         throw new RangeError("invalid highWaterMark");
       if (size !== undefined && typeof size !== "function")
         throw new TypeError("strategy size must be a function");
-      let closeResolve, closeReject;
-      const closedPromise = new Promise((resolve, reject) => {
-        closeResolve = resolve;
-        closeReject = reject;
-      });
       const stream = this,
         state = {
-          closeReject,
-          closeResolve,
-          closedPromise,
+          reader: null,
           controller: null,
+          closeRequested: false,
           disturbed: false,
           error: null,
           highWaterMark: mark,
@@ -194,6 +216,7 @@
           queueSize: 0,
           reads: [],
           source: source || {},
+          started: false,
           status: "readable",
         };
       this.#state = state;
@@ -204,12 +227,13 @@
             : state.highWaterMark - state.queueSize;
         },
         enqueue(value) {
-          if (state.status !== "readable")
+          if (state.status !== "readable" || state.closeRequested)
             throw new TypeError("stream is not readable");
           const bytes = chunkBytes(value);
           if (state.reads.length) {
             const read = state.reads.shift();
             read.resolve({ done: false, value });
+            requestReadableStreamPull(stream);
             return;
           }
           let chunkSize = 1;
@@ -233,9 +257,13 @@
           state.queue.push({ value, bytes, size: chunkSize });
           state.queueBytes += bytes;
           state.queueSize += chunkSize;
+          requestReadableStreamPull(stream);
         },
         close() {
-          closeReadableStream(stream);
+          if (state.status !== "readable" || state.closeRequested)
+            throw new TypeError("stream cannot close");
+          state.closeRequested = true;
+          if (!state.queue.length) closeReadableStream(stream);
         },
         error(reason) {
           failReadableStream(stream, reason);
@@ -247,14 +275,12 @@
             ? state.source.start(state.controller)
             : undefined;
         Promise.resolve(started).then(
-          () => requestReadableStreamPull(this),
+          () => {
+            state.started = true;
+            requestReadableStreamPull(this);
+          },
           (reason) => failReadableStream(this, reason),
         );
-        if (
-          typeof state.source.start !== "function" &&
-          typeof state.source.pull !== "function"
-        )
-          closeReadableStream(this);
       } catch (reason) {
         failReadableStream(this, reason);
       }
@@ -268,46 +294,72 @@
       this.pipeTo(transform.writable, options).catch(() => {});
       return transform.readable;
     }
-    pipeTo(destination, options = {}) {
-      if (!destination || typeof destination.getWriter !== "function")
-        return Promise.reject(new TypeError("invalid destination"));
+    async pipeTo(destination, options = {}) {
+      if (!(destination instanceof WritableStream))
+        throw new TypeError("invalid destination");
       const signal = options.signal;
       if (signal !== undefined && !(signal instanceof AbortSignal))
-        return Promise.reject(new TypeError("invalid abort signal"));
-      const writer = destination.getWriter(),
-        reader = this.getReader();
-      let abortListener = null,
-        abortPromise = null;
+        throw new TypeError("invalid abort signal");
+      const preventClose = !!options.preventClose,
+        preventAbort = !!options.preventAbort,
+        preventCancel = !!options.preventCancel;
+      /* Admission is transactional: reject before taking either lock. */
+      if (readableState(this).locked || destination.locked)
+        throw new TypeError("stream is locked");
+      const writer = new WritableStreamDefaultWriter(destination);
+      let reader;
+      try {
+        reader = new ReadableStreamDefaultReader(this);
+      } catch (error) {
+        writer.releaseLock();
+        throw error;
+      }
+      let abortListener = null, failure = null, rejectRead = null,
+        finishing = false;
+      const stop = (error) => {
+        if (finishing || failure) return;
+        failure = { error };
+        if (rejectRead) rejectRead(error);
+      };
+      /* One subscription per endpoint, not a growing Promise.race chain
+         attached to the same pending terminal promise for every chunk. */
+      writer.closed.then(
+        () => stop(new TypeError("destination closed before source")), stop);
+      reader.closed.catch(stop);
       if (signal) {
-        abortPromise = new Promise((_, reject) => {
-          abortListener = () => reject(signal.reason);
-        });
+        abortListener = () => stop(signal.reason);
         globalThis.__tilefinchAddAbortAlgorithm(signal, abortListener);
       }
-      return (async () => {
-        try {
-          for (;;) {
-            if (signal?.aborted) throw signal.reason;
-            const { done, value } = await (abortPromise
-              ? Promise.race([reader.read(), abortPromise])
-              : reader.read());
-            if (done) break;
-            await writer.write(value);
-          }
-          if (!options.preventClose) await writer.close();
-        } catch (error) {
-          if (!options.preventAbort) await writer.abort(error);
-          if (!options.preventCancel) await reader.cancel(error);
-          throw error;
-        } finally {
-          if (abortListener)
-            globalThis.__tilefinchRemoveAbortAlgorithm(signal, abortListener);
-          try {
-            reader.releaseLock();
-          } catch (_) {}
-          writer.releaseLock();
+      try {
+        for (;;) {
+          if (signal?.aborted) stop(signal.reason);
+          if (failure) throw failure.error;
+          const { done, value } = await new Promise((resolve, reject) => {
+            rejectRead = reject;
+            reader.read().then(resolve, reject);
+          });
+          rejectRead = null;
+          if (failure) throw failure.error;
+          if (done) break;
+          await writer.write(value);
         }
-      })();
+        finishing = true;
+        if (!preventClose) await writer.close();
+      } catch (error) {
+        finishing = true;
+        /* A failed abort must not skip the other endpoint's cancellation. */
+        const actions = [];
+        if (!preventAbort) actions.push(writer.abort(error));
+        if (!preventCancel) actions.push(reader.cancel(error));
+        await Promise.all(actions);
+        throw error;
+      } finally {
+        rejectRead = null;
+        if (abortListener)
+          globalThis.__tilefinchRemoveAbortAlgorithm(signal, abortListener);
+        reader.releaseLock();
+        writer.releaseLock();
+      }
     }
     getReader(options = {}) {
       if (options && options.mode !== undefined)
@@ -432,17 +484,50 @@
       ];
     }
     values(options = {}) {
+      const preventCancel = !!options?.preventCancel;
       const reader = this.getReader();
+      let finished = false, pending = 0, chain = Promise.resolve();
+      const enqueue = (returning, value) => {
+        if (pending >= streamQueueLimit)
+          return Promise.reject(new RangeError("pending iterator limit exceeded"));
+        pending++;
+        const operation = chain.then(async () => {
+          if (finished) return { done: true, value: returning ? value : undefined };
+          if (returning) {
+            finished = true;
+            let cancellation;
+            try {
+              cancellation = preventCancel ? undefined : reader.cancel(value);
+            } finally {
+              /* Cancel closes the source synchronously; its cleanup promise
+                 must not keep the reader lock until external work completes. */
+              reader.releaseLock();
+            }
+            await cancellation;
+            return { done: true, value };
+          }
+          try {
+            const result = await reader.read();
+            if (result.done) {
+              finished = true;
+              reader.releaseLock();
+            }
+            return result;
+          } catch (error) {
+            finished = true;
+            reader.releaseLock();
+            throw error;
+          }
+        });
+        chain = operation.then(() => { pending--; }, () => { pending--; });
+        return operation;
+      };
       return {
-        async next() {
-          const result = await reader.read();
-          if (result.done) reader.releaseLock();
-          return result;
+        next() {
+          return enqueue(false);
         },
-        async return() {
-          if (!options.preventCancel) await reader.cancel();
-          reader.releaseLock();
-          return { done: true, value: undefined };
+        return(value) {
+          return enqueue(true, value);
         },
         [Symbol.asyncIterator]() {
           return this;
@@ -458,10 +543,12 @@
       if (!(stream instanceof WritableStream))
         throw new TypeError("invalid writable stream");
       if (stream.locked) throw new TypeError("stream is locked");
+      initializeStreamOwner(this, stream._state, stream._storedError);
+      this.ready = stream._state === "errored" || stream._state === "erroring"
+        ? handledRejection(stream._storedError) : Promise.resolve();
       this._stream = stream;
+      stream._writer = this;
       stream.locked = true;
-      this.ready = Promise.resolve();
-      this.closed = stream._closedPromise;
     }
     write(value) {
       if (!this._stream)
@@ -480,6 +567,10 @@
     }
     releaseLock() {
       if (!this._stream) return;
+      const error = new TypeError("writer lock released");
+      releaseStreamOwner(this, error);
+      this.ready = handledRejection(error);
+      this._stream._writer = null;
       this._stream.locked = false;
       this._stream = null;
     }
@@ -494,13 +585,7 @@
       this._queuedBytes = 0;
       this._chain = Promise.resolve();
       this.locked = false;
-      let closeResolve, closeReject;
-      this._closedPromise = new Promise((resolve, reject) => {
-        closeResolve = resolve;
-        closeReject = reject;
-      });
-      this._closeResolve = closeResolve;
-      this._closeReject = closeReject;
+      this._writer = null;
       try {
         if (typeof this._sink.start === "function")
           this._chain = Promise.resolve(this._sink.start(this)).then(
@@ -514,10 +599,11 @@
       if (this._state === "writable" || this._state === "closing") {
         this._storedError = reason;
         this._state = "errored";
-        this._closeReject(reason);
+        if (this._writer) this._writer.ready = handledRejection(reason);
+        finishStreamOwner(this._writer, reason, true);
       } else if (this._state === "erroring" && this._closeStarted) {
         this._state = "errored";
-        this._closeReject(this._storedError);
+        finishStreamOwner(this._writer, this._storedError, true);
       }
     }
     _write(value) {
@@ -568,7 +654,7 @@
         () => {
           this._state = "closed";
           this._storedError = undefined;
-          this._closeResolve();
+          finishStreamOwner(this._writer);
         },
         (reason) => {
           this._closeFailure = reason;
@@ -583,6 +669,7 @@
       if (this._state === "erroring") return this._abortPromise;
       this._state = "erroring";
       this._storedError = reason;
+      if (this._writer) this._writer.ready = handledRejection(reason);
       /* The chain owns accepted operations until they retire. Queued work
          checks erroring before entering the sink; an in-flight close wins
          over abort, but an in-flight write must finish before sink cleanup. */
@@ -593,9 +680,10 @@
         return typeof this._sink.abort === "function"
           ? this._sink.abort(reason) : undefined;
       }).then(() => {
-        if (this._state !== "closed") this._closeReject(this._storedError);
+        if (this._state !== "closed")
+          finishStreamOwner(this._writer, this._storedError, true);
       }, (error) => {
-        this._closeReject(this._storedError);
+        finishStreamOwner(this._writer, this._storedError, true);
         throw error;
       });
       return this._abortPromise;
@@ -729,7 +817,9 @@
       if (state.locked || state.disturbed)
         throw new TypeError("Body has already been consumed");
       if (state.status === "errored") throw state.error;
-      if (state.status !== "closed") return null;
+      /* A close-requested queue is a complete buffered body, but its public
+         closed notification must wait until this consumption drains it. */
+      if (state.status !== "closed" && !state.closeRequested) return null;
       let total = 0;
       for (const entry of state.queue) {
         if (!(entry.value instanceof Uint8Array))
@@ -748,6 +838,7 @@
       state.queueBytes = 0;
       state.queueSize = 0;
       state.disturbed = true;
+      closeReadableStream(stream);
       return bytes;
     };
   for (const [name, value] of [

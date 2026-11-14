@@ -6,6 +6,7 @@
    preserves the script-observable property order. */
 #include "style_cssom.h"
 #include "style_cache_internal.h"
+#include "style_scopes.h"
 #include "js_runtime_internal.h"
 #include <lexbor/dom/interfaces/character_data.h>
 #include <lexbor/dom/interfaces/text.h>
@@ -13,6 +14,7 @@
 
 #include "tilefinch/platform.h"
 #include "tilefinch/resources.h"
+#include "tilefinch/script_admission.h"
 #include "tilefinch_compiler.h"
 #include "tilefinch/media_discovery.h"
 
@@ -259,13 +261,42 @@ void js_rt_bridge_drain_deferred_discards(JSContext *context,
     bridge->deferred_draining = false;
 }
 
+static size_t bridge_discard_subtree_marking(DomBridge *bridge,
+                                             lxb_dom_node_t *root,
+                                             bool defer_destroy,
+                                             unsigned char *retire_slots);
+
+/* The retirement bitmap has one bit per slot the table has now (callbacks
+   that grow the table later only add slots the walk never marked). Up to
+   the Budget capacity it lives on the stack, as it always did; a larger
+   table's comes from the Budget, and without it the subtree stays until a
+   later sweep. */
 static size_t bridge_discard_subtree(DomBridge *bridge, lxb_dom_node_t *root,
                                      bool defer_destroy)
 {
     if (bridge == NULL || root == NULL || root->parent != NULL) return 0;
+    if (bridge->node_count <= DOM_BRIDGE_NODE_BUDGET_CAPACITY) {
+        unsigned char retire_slots[
+            (DOM_BRIDGE_NODE_BUDGET_CAPACITY + 7u) / 8u] = {0};
+        return bridge_discard_subtree_marking(bridge, root, defer_destroy,
+                                              retire_slots);
+    }
+    unsigned char *retire_slots = budget_calloc(
+        bridge->budget, (bridge->node_count + 7u) / 8u, 1);
+    if (retire_slots == NULL) return 0;
+    size_t released = bridge_discard_subtree_marking(
+        bridge, root, defer_destroy, retire_slots);
+    budget_free(bridge->budget, retire_slots);
+    return released;
+}
+
+static size_t bridge_discard_subtree_marking(DomBridge *bridge,
+                                             lxb_dom_node_t *root,
+                                             bool defer_destroy,
+                                             unsigned char *retire_slots)
+{
     /* One walk finds every handle inside the subtree through the pointer
        index; any still-retained identity keeps the whole subtree. */
-    unsigned char retire_slots[(DOM_BRIDGE_NODE_LIMIT_MAX + 7u) / 8u] = {0};
     BridgeSubtreeHandleScan handle_scan = {
         bridge, retire_slots, SIZE_MAX, 0
     };
@@ -280,16 +311,17 @@ static size_t bridge_discard_subtree(DomBridge *bridge, lxb_dom_node_t *root,
         if (result == BRIDGE_SUBTREE_INDETERMINATE) return 0;
         script_states[i] = result == BRIDGE_SUBTREE_FOUND;
     }
-    size_t mutation_count =
-        bridge->mutations.count < SCRIPT_MUTATION_JOURNAL_LIMIT
-            ? bridge->mutations.count : SCRIPT_MUTATION_JOURNAL_LIMIT;
+    ScriptMutationJournal *journal = bridge->mutations;
+    size_t mutation_count = journal == NULL ? 0
+        : journal->count < SCRIPT_MUTATION_JOURNAL_LIMIT
+            ? journal->count : SCRIPT_MUTATION_JOURNAL_LIMIT;
     unsigned char mutation_slots[
         (SCRIPT_MUTATION_JOURNAL_LIMIT + 7u) / 8u] = {0};
     bool mutations_retired = false;
     unsigned char scope_slots[
         (SCRIPT_MUTATION_JOURNAL_LIMIT + 7u) / 8u] = {0};
     for (size_t i = 0; i < mutation_count; i++) {
-        lxb_dom_node_t *scope = bridge->mutations.records[i].scope;
+        lxb_dom_node_t *scope = journal->records[i].scope;
         if (scope == NULL) continue;
         BridgeSubtreeSearchResult result =
             bridge_live_subtree_contains_node(root, scope);
@@ -299,7 +331,7 @@ static size_t bridge_discard_subtree(DomBridge *bridge, lxb_dom_node_t *root,
         }
     }
     for (size_t i = 0; i < mutation_count; i++) {
-        lxb_dom_node_t *target = bridge->mutations.records[i].node;
+        lxb_dom_node_t *target = journal->records[i].node;
         if (target == NULL) continue;
         BridgeSubtreeSearchResult result =
             bridge_live_subtree_contains_node(root, target);
@@ -310,9 +342,10 @@ static size_t bridge_discard_subtree(DomBridge *bridge, lxb_dom_node_t *root,
         }
     }
     bool overflow_root_retired = false;
-    for (size_t i = 0; i < bridge->mutations.overflow_root_count; i++) {
+    for (size_t i = 0;
+         journal != NULL && i < journal->overflow_root_count; i++) {
         BridgeSubtreeSearchResult result = bridge_live_subtree_contains_node(
-            root, bridge->mutations.overflow_roots[i]);
+            root, journal->overflow_roots[i]);
         if (result == BRIDGE_SUBTREE_INDETERMINATE) return 0;
         if (result == BRIDGE_SUBTREE_FOUND) overflow_root_retired = true;
     }
@@ -349,27 +382,27 @@ static size_t bridge_discard_subtree(DomBridge *bridge, lxb_dom_node_t *root,
     for (size_t i = 0; i < mutation_count; i++) {
         if ((scope_slots[i / 8u]
              & (unsigned char) (1u << (i % 8u))) == 0) continue;
-        bridge->mutations.records[i].scope = NULL;
+        journal->records[i].scope = NULL;
     }
     if (overflow_root_retired) {
         /* The pointer dies; so does the scoped overflow fallback. */
-        bridge->mutations.overflow_root_count = 0;
-        bridge->mutations.overflow_roots_lost = true;
+        journal->overflow_root_count = 0;
+        journal->overflow_roots_lost = true;
     }
     if (mutations_retired) {
         for (size_t i = 0; i < mutation_count; i++) {
             if ((mutation_slots[i / 8u]
                  & (unsigned char) (1u << (i % 8u))) == 0) continue;
-            bridge->mutations.records[i].node = NULL;
+            journal->records[i].node = NULL;
         }
-        bridge->mutations.conservative_resource_scan = true;
+        journal->conservative_resource_scan = true;
         /* Without a retirement listener the host cannot know which cached
            node pointers die here; with one, the retired records are simply
            skipped and the surviving removal scopes carry the structural
            change. */
         if (bridge->node_retirement == NULL) {
-            bridge->mutations.overflowed = true;
-            bridge->mutations.retirement_unobserved = true;
+            journal->overflowed = true;
+            journal->retirement_unobserved = true;
         }
     }
     js_rt_script_element_states_purge_marked(bridge, script_states);
@@ -406,10 +439,27 @@ static size_t bridge_discard_subtree(DomBridge *bridge, lxb_dom_node_t *root,
     lxb_dom_node_t *unadopted[DOCUMENT_CONSTRUCTED_SHEET_LIMIT];
     size_t unadopted_count = document_adoptions_discard_subtree(
         bridge->document, root, unadopted, DOCUMENT_CONSTRUCTED_SHEET_LIMIT);
+    /* Lexbor keeps the parser's <head> in document->head after script
+       removes it and reads it again: the "after head" insertion mode
+       pushes it back to insert a later <meta>, <link>, <script> or
+       <title>, and document_apply_meta_csp looks inside it. A subtree
+       holding it gives up its handles like any other but is not destroyed;
+       the document frees it. */
+    lxb_html_head_element_t *parser_head = bridge->document == NULL
+        || bridge->document->html == NULL ? NULL
+        : lxb_html_document_head_element(bridge->document->html);
+    const lxb_dom_node_t *head_root = parser_head == NULL ? NULL
+        : lxb_dom_interface_node(parser_head);
+    while (head_root != NULL && head_root->parent != NULL)
+        head_root = head_root->parent;
     /* Detached: no style can change, and the removal walk is wasted.
        Inside a guarded native the nodes outlive it (native_depth); the
        handles above are already gone, so script sees no difference. */
-    if (!defer_destroy || !bridge_defer_subtree_destroy(bridge, root)) {
+    if (head_root == root) {
+        if (bridge->deferred_discard_count != 0)
+            bridge_forget_deferred_inside(bridge, root);
+    } else if (!defer_destroy
+               || !bridge_defer_subtree_destroy(bridge, root)) {
         if (bridge->deferred_discard_count != 0)
             bridge_forget_deferred_inside(bridge, root);
         if (!defer_destroy) {
@@ -475,10 +525,24 @@ static void bridge_note_adopted_styles_changed(DomBridge *bridge,
     if (root_element == NULL) return;
     if (scope == NULL || !bridge_node_is_connected(scope))
         scope = lxb_dom_interface_node(root_element);
+    /* A shadow root's list reaches only its host's subtree: the shadow
+       tree, the host (:host) and its light children (::slotted), and what
+       they pass on by inheritance. The cascade itself changes when
+       navigation installs the change, which reports its own scope (the
+       sheet settle, the relayout's in-place append); a rebuild starts a
+       new sheet generation. */
+    lxb_dom_node_t *host = document_node_is_shadow_carrier(scope)
+        ? scope->parent : NULL;
+    if (host != NULL && host->type != LXB_DOM_NODE_TYPE_ELEMENT) host = NULL;
     bridge->dom_version++;
     document_note_connected_mutation(bridge->document);
+    uint64_t before = document_style_generation();
     document_style_changed();
-    bridge->computed_style_cache.dirty_all = true;
+    if (host != NULL && js_rt_bridge_computed_style_drop_within(
+                            bridge, &host, 1))
+        js_rt_bridge_computed_style_host_described(bridge, before);
+    else
+        bridge->computed_style_cache.dirty_all = true;
     if (bridge->result != NULL) {
         bridge->result->dom_mutations++;
         bridge->result->relayout_required = true;
@@ -487,8 +551,11 @@ static void bridge_note_adopted_styles_changed(DomBridge *bridge,
     bridge_mutation_journal_append(
         bridge, SCRIPT_MUTATION_ATTRIBUTE, scope, attribute,
         sizeof(attribute) - 1u, NULL, 0, false, UINT64_MAX, 0);
-    bridge->mutations.resource_rebuild_required = true;
-    bridge->mutations.stylesheet_rebuild_required = true;
+    ScriptMutationJournal *journal = js_rt_bridge_journal(bridge);
+    if (journal != NULL) {
+        journal->resource_rebuild_required = true;
+        journal->stylesheet_rebuild_required = true;
+    }
 }
 
 static JSValue registered_property_result(JSContext *context, int status)
@@ -948,6 +1015,17 @@ lxb_dom_node_t *dom_document_order_next(
     return node;
 }
 
+void dom_document_order_skip_children(DomDocumentOrderTraversal *traversal,
+                                      lxb_dom_node_t *node)
+{
+    /* A node without children has already moved past itself. */
+    if (traversal == NULL || node == NULL || node->first_child == NULL
+        || traversal->next != node->first_child) return;
+    dom_document_order_climb(
+        traversal, node, traversal->visit_limit == 0
+            ? DOM_TRAVERSAL_VISIT_LIMIT : traversal->visit_limit);
+}
+
 /* innerHTML marks every parsed script "already started", so it never runs.
    Range.createContextualFragment instead clears that flag and the parser
    document: its scripts are script-inserted (programmatic, not force-async)
@@ -1386,11 +1464,7 @@ JS_RT_GUARDED_NATIVE(, js_dom_closest)(JSContext *context, JSValueConst this_val
 static bool js_values_strict_equal(JSContext *context,
                                    JSValueConst left, JSValueConst right)
 {
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
     return JS_StrictEq(context, left, right);
-#else
-    return JS_IsStrictEqual(context, left, right);
-#endif
 }
 
 static int64_t dom_method_scope_handle(JSContext *context,
@@ -1559,6 +1633,7 @@ void js_rt_bridge_note_parser_writes(DomBridge *bridge)
 void js_rt_bridge_note_parser_writes_for_layout(DomBridge *bridge)
 {
     js_rt_bridge_note_parser_writes(bridge);
+    js_rt_bridge_settle_pending_sheets(bridge);
     if (bridge == NULL || bridge->document == NULL
         || bridge->parser_writes_laid_out == bridge->document->parser_writes)
         return;
@@ -1712,11 +1787,17 @@ static JSValue js_nodelist_item(JSContext *context,
     return value;
 }
 
-/* querySelectorAll, or with `by_name` getElementsByTagName's list. */
+/* querySelectorAll, or with `by_name` getElementsByTagName's list. With a
+   `list_prototype` object, the static NodeList itself: an ordinary object
+   of that prototype whose indices (enumerable, configurable, read-only)
+   and length (configurable, read-only, not enumerable) are own data
+   properties, exactly the object the bootstrap's nodeList() used to copy
+   the result array into, built here without the copy. */
+#define DOM_NODE_LIST_LIMIT 65536u
 static JSValue dom_query_all_method(JSContext *context,
                                     JSValueConst this_value,
                                     int argc, JSValueConst *argv,
-                                    bool by_name)
+                                    bool by_name, JSValueConst list_prototype)
 {
     int64_t scope = dom_method_scope_handle(context, this_value);
     if (scope < 0) return JS_EXCEPTION;
@@ -1737,9 +1818,23 @@ static JSValue dom_query_all_method(JSContext *context,
         return JS_EXCEPTION;
     }
     JS_FreeValue(context, length_value);
+    /* The list's own entries take the flags nodeList() gave them. */
+    bool as_list = !by_name && JS_IsObject(list_prototype);
+    const int entry_flags = JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE;
+    JSValue list = JS_UNDEFINED;
+    if (as_list) {
+        list = JS_NewObjectProto(context, list_prototype);
+        if (JS_IsException(list)) {
+            JS_FreeValue(context, values);
+            return list;
+        }
+    }
+    JSValue target = as_list ? list : values;
+    uint32_t list_length = length;
     if (scope == 0 && length == 0 && !by_name) {
         JSValue identifier = simple_id_selector_value(context, selector);
         if (JS_IsException(identifier)) {
+            JS_FreeValue(context, list);
             JS_FreeValue(context, values);
             return identifier;
         }
@@ -1748,32 +1843,57 @@ static JSValue dom_query_all_method(JSContext *context,
                 context, this_value, 1, &identifier);
             if (JS_IsException(by_id)
                 || (!JS_IsNull(by_id)
-                    && js_rt_define_index(context, values, 0, by_id) < 0)) {
+                    && (as_list
+                        ? JS_DefinePropertyValueUint32(context, list, 0,
+                                                       by_id, entry_flags)
+                        : js_rt_define_index(context, values, 0, by_id))
+                           < 0)) {
                 if (JS_IsNull(by_id)) JS_FreeValue(context, by_id);
                 JS_FreeValue(context, identifier);
+                JS_FreeValue(context, list);
                 JS_FreeValue(context, values);
                 return JS_EXCEPTION;
             }
             if (JS_IsNull(by_id)) JS_FreeValue(context, by_id);
+            else list_length = 1;
         }
         JS_FreeValue(context, identifier);
     }
     for (uint32_t index = 0; index < length; index++) {
         JSValue found = JS_GetPropertyUint32(context, values, index);
         if (JS_IsException(found)) {
+            JS_FreeValue(context, list);
             JS_FreeValue(context, values);
             return found;
         }
         JSValue wrapped = js_rt_wrap_dom_handle(context, found);
         JS_FreeValue(context, found);
+        /* Both definitions consume `wrapped`. */
         if (JS_IsException(wrapped)
-            || js_rt_define_index(context, values, index, wrapped) < 0) {
-            if (!JS_IsException(wrapped)) {
-                /* js_rt_define_index consumes wrapped. */
-            }
+            || (as_list
+                ? JS_DefinePropertyValueUint32(context, target, index,
+                                               wrapped, entry_flags)
+                : js_rt_define_index(context, target, index, wrapped)) < 0) {
+            JS_FreeValue(context, list);
             JS_FreeValue(context, values);
             return JS_EXCEPTION;
         }
+    }
+    if (as_list) {
+        JS_FreeValue(context, values);
+        /* The node-handle index space bounds every native result; the
+           check stays for parity with nodeList(). */
+        if (list_length > DOM_NODE_LIST_LIMIT) {
+            JS_FreeValue(context, list);
+            return JS_ThrowRangeError(context, "NodeList limit exceeded");
+        }
+        if (JS_DefinePropertyValueStr(context, list, "length",
+                                      JS_NewUint32(context, list_length),
+                                      JS_PROP_CONFIGURABLE) < 0) {
+            JS_FreeValue(context, list);
+            return JS_EXCEPTION;
+        }
+        return list;
     }
     JSValue item = JS_NewCFunction(context, js_nodelist_item, "item", 1);
     if (JS_IsException(item)
@@ -1793,7 +1913,8 @@ JSValue js_dom_query_selector_all_method(JSContext *context,
 {
     return dom_query_all_method(context, this_value, argc, argv,
                                 argc > 1 && JS_IsBool(argv[1])
-                                    && JS_VALUE_GET_BOOL(argv[1]));
+                                    && JS_VALUE_GET_BOOL(argv[1]),
+                                argc > 2 ? argv[2] : JS_UNDEFINED);
 }
 
 JS_RT_GUARDED_NATIVE(, js_dom_relation)(JSContext *context,
@@ -2090,8 +2211,9 @@ static lxb_dom_node_t *bridge_wrapper_node(JSContext *context,
         || bridge->wrapper_refs == NULL
         || JS_ToInt64(context, &handle, handle_value) < 0
         || !js_rt_bridge_node_slot_for_handle(bridge, handle, &slot)
-        || !JS_IsObject(bridge->wrapper_refs[slot])) return NULL;
-    JSValue wrapper = JS_WeakTargetDeref(context, bridge->wrapper_refs[slot]);
+        || bridge->wrapper_refs[slot] == NULL) return NULL;
+    JSValue wrapper = JS_WeakTargetDeref(context,
+        js_rt_bridge_wrapper_ref(bridge, slot));
     bool same = JS_IsObject(wrapper)
         && JS_VALUE_GET_PTR(wrapper) == JS_VALUE_GET_PTR(value);
     JS_FreeValue(context, wrapper);
@@ -2576,9 +2698,10 @@ static JSValue fast_getter_wrapper(JSContext *context, DomBridge *bridge,
     size_t slot = 0;
     if (bridge->wrapper_refs != NULL
         && js_rt_bridge_node_slot_for_handle(bridge, handle, &slot)
-        && JS_IsObject(bridge->wrapper_refs[slot])) {
+        && bridge->wrapper_refs[slot] != NULL) {
         JSValue cached = JS_WeakTargetDeref(context,
-                                         bridge->wrapper_refs[slot]);
+                                         js_rt_bridge_wrapper_ref(
+                                             bridge, slot));
         if (JS_IsObject(cached)) return cached;
         JS_FreeValue(context, cached);
     }
@@ -3568,14 +3691,17 @@ JSValue js_dom_create_text(JSContext *context,
     size_t length = 0;
     const char *data = JS_ToCStringLen(context, &length, argv[0]);
     if (data == NULL) return JS_EXCEPTION;
-    lxb_dom_text_t *node = length <= DOM_TEXT_NODE_LIMIT
-        ? lxb_dom_document_create_text_node(
-              &bridge->document->html->dom_document,
-              (const lxb_char_t *) data, length)
-        : NULL;
+    /* Any length, as in Chromium: the budget bounds the copy, and a page
+       that loads its CSS late appends one Text of several hundred KiB to a
+       <style>. A refused allocation throws rather than returning null,
+       which the caller's appendChild would reject as "Node required". */
+    lxb_dom_text_t *node = lxb_dom_document_create_text_node(
+        &bridge->document->html->dom_document,
+        (const lxb_char_t *) data, length);
     JS_FreeCString(context, data);
+    if (node == NULL) return JS_ThrowOutOfMemory(context);
     return bridge_node_handle_value(
-        context, bridge, node == NULL ? NULL : lxb_dom_interface_node(node));
+        context, bridge, lxb_dom_interface_node(node));
 }
 
 JSValue js_dom_create_comment(JSContext *context,
@@ -3588,14 +3714,14 @@ JSValue js_dom_create_comment(JSContext *context,
     size_t length = 0;
     const char *data = JS_ToCStringLen(context, &length, argv[0]);
     if (data == NULL) return JS_EXCEPTION;
-    lxb_dom_comment_t *node = length <= DOM_INNER_HTML_LIMIT
-        ? lxb_dom_document_create_comment(
-              &bridge->document->html->dom_document,
-              (const lxb_char_t *) data, length)
-        : NULL;
+    /* Any length, as createTextNode. */
+    lxb_dom_comment_t *node = lxb_dom_document_create_comment(
+        &bridge->document->html->dom_document,
+        (const lxb_char_t *) data, length);
     JS_FreeCString(context, data);
+    if (node == NULL) return JS_ThrowOutOfMemory(context);
     return bridge_node_handle_value(
-        context, bridge, node == NULL ? NULL : lxb_dom_interface_node(node));
+        context, bridge, lxb_dom_interface_node(node));
 }
 
 JS_RT_GUARDED_NATIVE(, js_dom_set_custom_state)(JSContext *context,
@@ -3669,11 +3795,7 @@ static lxb_dom_node_t *bridge_text_content_next(
 
 static JSValue bridge_text_string(JSContext *context, const char *text, size_t length)
 {
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
     return JS_NewStringLenUTF8RopePortable(context, text, length);
-#else
-    return JS_NewStringLen(context, text, length);
-#endif
 }
 
 JSValue js_dom_get_text(JSContext *context, JSValueConst this_value,
@@ -4875,8 +4997,9 @@ static ScriptMutationKind bridge_child_mutation_kind(
         && bridge->document->html != NULL && child != NULL
         && child->ns == LXB_NS_HTML && child->local_name == LXB_TAG_SCRIPT
         && parent != NULL
-        && parent == lxb_dom_interface_node(
-            lxb_html_document_head_element(bridge->document->html))
+        /* The live <head>: lexbor's cached pointer can name one script
+           has detached (document_head_node). */
+        && parent == document_head_node(bridge->document)
         && (child->parent == NULL || child->parent == parent)) {
         /* Keep the head's :empty state invariant as well. A sibling element
            guarantees nonemptiness before and after the move/removal. Bound
@@ -4897,8 +5020,9 @@ static void bridge_mutation_note_scope(
     DomBridge *bridge, ScriptMutationKind kind, const lxb_dom_node_t *node,
     lxb_dom_node_t *scope, bool last)
 {
-    if (scope == NULL || scope->type == LXB_DOM_NODE_TYPE_DOCUMENT) return;
-    ScriptMutationJournal *journal = &bridge->mutations;
+    ScriptMutationJournal *journal = bridge->mutations;
+    if (scope == NULL || scope->type == LXB_DOM_NODE_TYPE_DOCUMENT
+        || journal == NULL) return;
     for (size_t reverse = journal->count; reverse != 0; reverse--) {
         ScriptMutationRecord *record = &journal->records[reverse - 1];
         if (record->kind != kind || record->node != node) continue;
@@ -4936,14 +5060,19 @@ static void bridge_note_removal(DomBridge *bridge, lxb_dom_node_t *node)
     bridge_mutated(bridge, removal_kind, node, NULL, 0);
     bridge_mutation_note_scope(bridge, removal_kind, node, node->parent,
                                bridge_node_is_last_element(node));
-    if ((removed_resources & (BRIDGE_MUTATION_RESOURCE_IMAGE
-                              | BRIDGE_MUTATION_RESOURCE_STYLESHEET)) != 0) {
-        bridge->mutations.resource_rebuild_required = true;
+    ScriptMutationJournal *journal = (removed_resources
+            & (BRIDGE_MUTATION_RESOURCE_IMAGE
+               | BRIDGE_MUTATION_RESOURCE_STYLESHEET)) != 0
+        ? js_rt_bridge_journal(bridge) : NULL;
+    if (journal != NULL
+        && (removed_resources & (BRIDGE_MUTATION_RESOURCE_IMAGE
+                                 | BRIDGE_MUTATION_RESOURCE_STYLESHEET)) != 0) {
+        journal->resource_rebuild_required = true;
         if ((removed_resources & BRIDGE_MUTATION_RESOURCE_IMAGE) != 0)
-            bridge->mutations.image_rebuild_required = true;
+            journal->image_rebuild_required = true;
         if ((removed_resources & BRIDGE_MUTATION_RESOURCE_STYLESHEET) != 0)
-            bridge->mutations.stylesheet_rebuild_required = true;
-        bridge->mutations.image_resource_scan_required = false;
+            journal->stylesheet_rebuild_required = true;
+        journal->image_resource_scan_required = false;
         if (tilefinch_trace_mutation_policy()) {
             size_t name_length = 0;
             const char *name = document_element_name(node, &name_length);
@@ -5008,7 +5137,7 @@ static void bridge_child_inserted(
                            NULL, 0);
         return;
     }
-    size_t before = bridge->mutations.count;
+    size_t before = bridge->mutations == NULL ? 0 : bridge->mutations->count;
     /* A move also changed the parent it left, which the classification
        of the new position does not see. */
     if (was_detached) {
@@ -5036,8 +5165,9 @@ static void bridge_child_inserted(
     /* A prior removal/move of this node must win over a later re-insertion.
        Only a newly recorded child mutation can start a transient probe. */
     if ((kind == SCRIPT_MUTATION_CHILD_LIST || kind == SCRIPT_MUTATION_HEAD_SCRIPT)
-        && bridge->mutations.count > before) {
-        bridge->mutations.records[before].inserted_from_detached = was_detached;
+        && bridge->mutations != NULL && bridge->mutations->count > before) {
+        bridge->mutations->records[before].inserted_from_detached =
+            was_detached;
     }
     if (!was_detached)
         bridge_mutation_note_scope(bridge, kind, node, old_parent, false);

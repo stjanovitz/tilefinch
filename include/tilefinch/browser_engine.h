@@ -475,6 +475,12 @@ bool browser_engine_last_tls_verify_result_available(
     const BrowserEngine *engine);
 bool browser_engine_last_tls_verification_failed(
     const BrowserEngine *engine);
+/* Why the last load failed, from typed facts (a transport timeout, the
+   document over its byte limit, no response, a refused allocation), for a
+   frontend's headline; the engine's sentence stays in last_error. OK while
+   none has failed since the last load began. */
+TilefinchDiagnosticCode browser_engine_navigation_failure_code(
+    const BrowserEngine *engine);
 TilefinchDiagnosticCode browser_engine_last_diagnostic_code(
     const BrowserEngine *engine);
 bool browser_engine_metrics(const BrowserEngine *engine,
@@ -488,6 +494,26 @@ bool browser_engine_content_blocker_set_allowed_sites(
     BrowserEngine *engine, const char *const *sites, size_t count);
 bool browser_engine_content_blocker_metrics(
     const BrowserEngine *engine, ContentBlockerMetrics *metrics);
+/* content_blocker_set_paywall_scripts on the engine's blocker. */
+bool browser_engine_content_blocker_set_paywall_scripts(
+    BrowserEngine *engine, bool blocked);
+
+/* What a pending navigation is doing, for the frontend's loading status:
+   no response yet; the document arriving; the page's scripts running once
+   it has arrived (or while the parser waits on them after the last byte);
+   the rest of the load (building, laying out, committing). Over one load
+   it goes CONNECTING, RECEIVING, then RUNNING_SCRIPTS once a script has
+   run; a load whose first script runs after its last byte shows
+   FINISHING before RUNNING_SCRIPTS. It never goes back to an earlier
+   network phase. */
+typedef enum {
+    BROWSER_NAVIGATION_PHASE_CONNECTING = 0,
+    BROWSER_NAVIGATION_PHASE_RECEIVING,
+    BROWSER_NAVIGATION_PHASE_RUNNING_SCRIPTS,
+    BROWSER_NAVIGATION_PHASE_FINISHING
+} BrowserNavigationPhase;
+BrowserNavigationPhase browser_navigation_job_phase(
+    const BrowserNavigationJobMetrics *metrics);
 
 bool browser_engine_commit_html(BrowserEngine *engine, const char *url,
                                 const char *html, size_t html_length,
@@ -1026,11 +1052,6 @@ bool browser_engine_youtube_account_diagnostics(const BrowserEngine *engine,
 #endif
 bool browser_engine_render_frame(BrowserEngine *engine,
                                  const char *optional_ppm_path);
-/* Deferred canvas publication (see render.h): the deferral that describes
-   `frame` (the engine's own framebuffer), or NULL when its RAM pixels are
-   complete. Materialize before reading the RAM frame directly. */
-const RenderCanvasDeferral *browser_engine_canvas_deferral(
-    const BrowserEngine *engine, const uint16_t *frame);
 bool browser_engine_canvas_materialize(BrowserEngine *engine);
 /*
  * Compose the frame at the current scroll position from the tiles already
@@ -1148,10 +1169,18 @@ bool browser_engine_view_snapshot(
 uint64_t browser_engine_page_generation(const BrowserEngine *engine);
 bool browser_engine_page_loaded(const BrowserEngine *engine);
 /* The current page's scripts were refused or retired for memory: its realm
-   hit the script memory limit, a host compile was refused for memory, or the
-   runtime was retired after degrading. Not ordinary widget errors or
-   JavaScript disabled for the site. */
+   hit the script memory limit, a host compile was refused for memory before
+   the page committed, or the runtime was retired after degrading. Not
+   ordinary widget errors, JavaScript disabled for the site, or a script
+   refused after the page showed its content
+   (navigation_page_late_compile_memory_refusals), which counts only when the
+   page shows little (browser_engine_page_memory_recovery_due). */
 bool browser_engine_page_script_memory_failed(const BrowserEngine *engine);
+/* Narrower: the current page's scripts were stopped because their realm
+   ran out of memory (its server-rendered page kept, or put back), not by
+   the reader, for the media room or for the next page. */
+bool browser_engine_page_scripts_stopped_for_memory(
+    const BrowserEngine *engine);
 /* Whether a memory failure should send the current page back through the
    recovery checks (Basic view fallback): its scripts failed for memory as
    above, or its realm is still live after QuickJS refused it heap (an "out
@@ -1207,11 +1236,29 @@ typedef struct {
     LayoutPerformance layout_performance;
     char last_cf_mitigated[32];
     size_t managed_challenge_heap_raises;
+    /* Bound images at least 32 px square that the viewport shows (layout
+       reuse study: when the first thumbnail appears). */
+    size_t visible_images;
 } BrowserValidationCounters;
 /* False, with zeroed counters, before the engine has a navigation session. */
 bool browser_engine_validation_counters(
     const BrowserEngine *engine, BrowserValidationCounters *counters);
 #endif
+
+/* Memory study (host lab and PSP validation builds only;
+   docs/engineering/VALIDATION_RECORDS.md, "Memory make-up"): the
+   tilefinch-budget-at-peak, -js-budget-split, -dom-split, -resource-split,
+   -session-split, -render-split and -frame-realm lines for the committed
+   page, each through `print` (psp_log_printf on a PSP). Walks the page's
+   tables and documents; allocation-free. With `heap_detail` every realm
+   also logs a compact jsmem census (builds with the census compiled in). */
+typedef int (*BrowserMemoryPrint)(const char *format, ...);
+void browser_engine_memory_report(const BrowserEngine *engine,
+                                  const char *phase, bool heap_detail,
+                                  BrowserMemoryPrint print);
+/* Only the compact jsmem census of every live realm. */
+void browser_engine_memory_census(const BrowserEngine *engine,
+                                  const char *reason);
 
 typedef struct {
     const uint16_t *pixels;

@@ -26,6 +26,7 @@
 #include "tilefinch/game_audio.h"
 #include "tilefinch/work_ledger.h"
 #include "tilefinch/url.h"
+#include "tilefinch/platform.h"
 
 #include <stdarg.h>
 #ifdef TILEFINCH_HAVE_PSP_VOICE
@@ -142,30 +143,18 @@ static bool psp_write_failure_report_data(
     } else {
         snprintf(ca_bundle_sha256, sizeof(ca_bundle_sha256), "absent");
     }
-    bool okay = fprintf(
+    /* Written in bounded pieces (tilefinch_platform_file_printf holds 1 KiB
+       at a time); the URL and the detail go out unformatted, at most 2047
+       and 1023 bytes as before. */
+    size_t url_length = url == NULL ? 0 : strnlen(url, 2047u);
+    size_t detail_length = detail == NULL ? 0 : strnlen(detail, 1023u);
+    bool okay = tilefinch_platform_file_printf(
         file,
         "tilefinch-device-error-v3\n"
         "version=%s\nrelease-sequence=%llu\n"
         "stage=%s\nhttp=%ld\nnative=0x%08x\n"
         "uptime-us=%llu\nunix-time=%llu\nrtc-valid=%d\nrtc-status=%s\n"
-        "rtc=%04u-%02u-%02uT%02u:%02u:%02uZ\nfree=%d\nlargest=%d\n"
-        "transport-present=%d\ncurl-code=%ld\ntimed-out=%d\n"
-        "tls-verify=0x%08lx\ntls-verify-available=%d\n"
-        "tls-verification-failed=%d\ntls-version=%s\ntls12-retry=%d\n"
-        "tls-peer-issuer=%s\nca-bundle-present=%d\n"
-        "ca-bundle-version=%u\nca-bundle-bytes=%zu\n"
-        "ca-bundle-sha256=%s\n"
-        "worker-present=%d\nworker-slots=%zu\nworker-queued=%zu\n"
-        "worker-running=%zu\nworker-complete=%zu\n"
-        "network-present=%d\nnetwork-status=%d\n"
-        "network-failure-phase=%d\nprofile-requested=%d\n"
-        "profile-selected=%d\nprofile-fallback=%d\napctl=%d\n"
-        "wlan-switch=%d\nwlan-power=%d\nprofile-query-ok=0x%08x\n"
-        "profile-query-failed=0x%08x\nprofile-adopted=0x%08x\n"
-        "profile-security=%u\nprofile-static-ip=%d\n"
-        "profile-manual-dns=%d\nprofile-proxy=%d\nnetwork-pumps=%zu\n"
-        "network-elapsed-us=%llu\nnetwork-max-pump-us=%llu\n"
-        "network-max-pump-phase=%d\nurl=%.2047s\ndetail=%.1023s\n",
+        "rtc=%04u-%02u-%02uT%02u:%02u:%02uZ\nfree=%d\nlargest=%d\n",
         TILEFINCH_VERSION_STRING,
         (unsigned long long) TILEFINCH_RELEASE_SEQUENCE,
         stage == NULL ? "unknown" : stage, http_status,
@@ -175,7 +164,17 @@ static bool psp_write_failure_report_data(
         (unsigned) rtc.year, (unsigned) rtc.month,
         (unsigned) rtc.day, (unsigned) rtc.hour, (unsigned) rtc.minute,
         (unsigned) rtc.second,
-        sceKernelTotalFreeMemSize(), sceKernelMaxFreeMemSize(),
+        sceKernelTotalFreeMemSize(), sceKernelMaxFreeMemSize()) > 0
+        && tilefinch_platform_file_printf(
+        file,
+        "transport-present=%d\ncurl-code=%ld\ntimed-out=%d\n"
+        "tls-verify=0x%08lx\ntls-verify-available=%d\n"
+        "tls-verification-failed=%d\ntls-version=%s\ntls12-retry=%d\n"
+        "tls-peer-issuer=%s\nca-bundle-present=%d\n"
+        "ca-bundle-version=%u\nca-bundle-bytes=%zu\n"
+        "ca-bundle-sha256=%s\n"
+        "worker-present=%d\nworker-slots=%zu\nworker-queued=%zu\n"
+        "worker-running=%zu\nworker-complete=%zu\n",
         diagnostics->transport_present ? 1 : 0,
         diagnostics->transport_code,
         diagnostics->transport_timed_out ? 1 : 0,
@@ -193,7 +192,18 @@ static bool psp_write_failure_report_data(
         diagnostics->worker_occupied_slots,
         diagnostics->worker_queued_slots,
         diagnostics->worker_running_slots,
-        diagnostics->worker_complete_slots,
+        diagnostics->worker_complete_slots) > 0
+        && tilefinch_platform_file_printf(
+        file,
+        "network-present=%d\nnetwork-status=%d\n"
+        "network-failure-phase=%d\nprofile-requested=%d\n"
+        "profile-selected=%d\nprofile-fallback=%d\napctl=%d\n"
+        "wlan-switch=%d\nwlan-power=%d\nprofile-query-ok=0x%08x\n"
+        "profile-query-failed=0x%08x\nprofile-adopted=0x%08x\n"
+        "profile-security=%u\nprofile-static-ip=%d\n"
+        "profile-manual-dns=%d\nprofile-proxy=%d\nnetwork-pumps=%zu\n"
+        "network-elapsed-us=%llu\nnetwork-max-pump-us=%llu\n"
+        "network-max-pump-phase=%d\n",
         diagnostics->network_present ? 1 : 0,
         diagnostics->network_status,
         diagnostics->network_failure_phase,
@@ -213,8 +223,12 @@ static bool psp_write_failure_report_data(
         diagnostics->network_pump_calls,
         (unsigned long long) diagnostics->network_elapsed_us,
         (unsigned long long) diagnostics->network_maximum_pump_us,
-        diagnostics->network_maximum_pump_phase,
-        url == NULL ? "" : url, detail == NULL ? "" : detail) > 0;
+        diagnostics->network_maximum_pump_phase) > 0
+        && fputs("url=", file) >= 0
+        && fwrite(url, 1, url_length, file) == url_length
+        && fputs("\ndetail=", file) >= 0
+        && fwrite(detail, 1, detail_length, file) == detail_length
+        && fputc('\n', file) != EOF;
     /* The decoder is already destroyed when its failed-open report arrives.
        Its bounded numeric snapshot preserves the original refusal, not the
        misleading free-memory reading after teardown. No file is opened when
@@ -903,6 +917,16 @@ static TILEFINCH_OUT_OF_LINE void psp_navigation_present_failure(
             failed_view.tls_verification_failed,
             &tls_guidance,
             visible_error, sizeof(visible_error));
+        /* What the load ran into and what to try, from the engine's typed
+           failure; its sentence stays in the failure report and QR. */
+        if (tls_guidance == TILEFINCH_TLS_GUIDANCE_NONE) {
+            unsigned code = (unsigned) browser_engine_navigation_failure_code(
+                browser->engine);
+            snprintf(visible_error, sizeof(visible_error), "%s\n%s",
+                     psp_ui_failure_headline(code),
+                     psp_ui_failure_next_step(code));
+            visible_detail = visible_error;
+        }
     }
     bool wifi_sign_in = psp_navigation_suggests_wifi_sign_in(
             interactive, status, views->navigation,
@@ -1700,8 +1724,8 @@ static TILEFINCH_OUT_OF_LINE void psp_begin_script_navigation(PspApp *app)
                "body=%zu\n", action.method, action.url, action.body_length);
 #endif
         psp_ui_set_loading(&app->process->presentation.ui, true, -1);
-        psp_ui_show_status(&app->process->presentation.ui,
-                           "LOADING - CIRCLE CANCELS", 120);
+        psp_ui_show_loading_status(&app->process->presentation.ui,
+                                   BROWSER_NAVIGATION_PHASE_CONNECTING, 120);
         psp_navigation_cooperate_begin(
             &app->process->presentation.ui,
             app->views == NULL ? NULL : app->views->frame, engine);
@@ -2196,6 +2220,10 @@ static TILEFINCH_OUT_OF_LINE void psp_apply_storage_and_site_intent(
         && psp_content_blocker_apply_allowed_sites(
             browser->engine, browser->profile);
     if (reset) {
+        /* The site's microphone answer went with the rest: every grant
+           is gone, so a live capture stops. */
+        tilefinch_media_capture_permissions_changed();
+        tilefinch_media_capture_stop(MEDIA_CAPTURE_END_PERMISSION);
         (void) browser_engine_set_javascript_enabled(
             browser->engine,
             browser_profile_javascript_enabled(browser->profile));
@@ -3787,6 +3815,8 @@ static TILEFINCH_OUT_OF_LINE bool psp_loop_serve_lifecycle(
                 budget_free(browser->budget, interactive->screenshot.pixels);
                 interactive->screenshot.pixels = NULL;
             }
+            /* Sleep ends page capture: its tracks end when it resumes. */
+            tilefinch_media_capture_stop(MEDIA_CAPTURE_END_SUSPEND);
             psp_suspend_page_runtime(browser, process, interactive);
             if (psp_navigation_cooperate_active())
                 psp_navigation_cooperate_end("system-suspend");
@@ -5287,6 +5317,11 @@ static TILEFINCH_HOT_BOUNDARY void psp_loop_pump_navigation(
         navigation_status =
             BROWSER_NAVIGATION_JOB_CANCELLED;
     }
+    if (navigation_status == BROWSER_NAVIGATION_JOB_PENDING)
+        psp_ui_follow_loading_phase(
+            &process->presentation.ui,
+            browser_navigation_job_phase(&navigation_metrics),
+            navigation_metrics.provisional_first_present_us == 0);
     if (navigation_status
             != BROWSER_NAVIGATION_JOB_PENDING)
         psp_loop_finish_navigation(
@@ -5527,6 +5562,10 @@ static TILEFINCH_COLD_PATH PspShutdownReport psp_browser_close(
                    ? "none" : challenge_counters.last_cf_mitigated,
                challenge_counters.managed_challenge_heap_raises);
     }
+    psp_heap_commit_report("controlled-exit", browser->budget, true);
+    browser_engine_memory_report(
+        browser->engine, "controlled-exit",
+        psp_boot_config_validation_js_heap_detail(), psp_log_printf);
 #endif
     psp_log_operation_end(
         cleanup_operation, "safe-memory-report", "ok");
@@ -5945,10 +5984,10 @@ int main(int argc, char *argv[])
         psp_validation_display_wrap(psp_display_system_backend()));
     /* Frame one of the entrance: the mark alone. Nothing else has been read
        from the Memory Stick yet. */
-    /* Keep pre-input boot completely static. The old entrance rebuilt and
-       composited animated wave bands between slow initialization stages,
-       making startup look jerky while no input could yet be acknowledged. */
-    psp_present_boot_entrance(0u, "STARTING TILEFINCH", false, NULL);
+    /* Keep pre-input boot completely static. Animation between slow
+       initialization stages made startup look jerky while no input could
+       yet be acknowledged. */
+    psp_present_boot_entrance(0u, "STARTING TILEFINCH", NULL);
     uint64_t boot_surface_presented_us =
         (uint64_t) sceKernelGetSystemTimeWide();
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
@@ -6012,7 +6051,7 @@ int main(int argc, char *argv[])
     int sampling_cycle_result = sceCtrlSetSamplingCycle(0);
     int sampling_mode_result = sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
 
-    static const TilefinchPlatformServices services = {
+    static TilefinchPlatformServices services = {
         .context = &psp_navigation_cooperate,
         .wall_time_ns = psp_wall_time_ns,
         .monotonic_time_ns = psp_time_ns,
@@ -6026,6 +6065,7 @@ int main(int argc, char *argv[])
         .log_message = psp_log_message,
         .page_dialog = psp_page_dialog_show,
     };
+    psp_media_capture_install(&services);
     tilefinch_platform_set_services(&services);
     PSP_BOOT_TIMING_MARK("platform-ready");
     /*
@@ -6178,6 +6218,9 @@ int main(int argc, char *argv[])
         startup_failure_screen = "STARTUP FAILED: BROWSER STATE";
         goto sleep_forever;
     }
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    psp_heap_commit_watch(browser.budget);
+#endif
     js_wasm_component_configure(process.install_paths.program_dir);
 #ifdef TILEFINCH_HAVE_PSP_VOICE
     psp_voice_component_configure(process.install_paths.program_dir);
@@ -6338,6 +6381,10 @@ int main(int argc, char *argv[])
        every owner here lives until the process exits. */
     psp_page_dialog_bind(&process.presentation.ui, &engine_views,
                          &process.text_input, &interactive, browser.budget, argv0);
+    /* Page microphone capture: the same owners, and the profile its
+       remembered answers live in. */
+    psp_media_capture_bind(&process.presentation.ui, &engine_views,
+                           &process.text_input, &interactive, &browser, argv0);
     PspVoicePrepareContext voice_prepare = {
         .engine = browser.engine,
         .media = &browser.media,
@@ -6769,6 +6816,10 @@ report:
                engine_metrics.allocation_failures,
                sceKernelTotalFreeMemSize(), sceKernelMaxFreeMemSize());
     }
+    /* Memory make-up (docs/engineering/VALIDATION_RECORDS.md). */
+    psp_heap_commit_report("pre-interaction", browser.budget, false);
+    browser_engine_memory_report(browser.engine, "pre-interaction", false,
+                                 psp_log_printf);
 #endif
     psp_log_checkpoint("compact-report-complete");
 

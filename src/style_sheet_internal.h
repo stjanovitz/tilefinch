@@ -327,11 +327,6 @@ bool style_apply_deferred_program_basis(
     uint32_t program_offset, uint16_t program_count, bool important,
     bool font_size_possible, ComputedStyle *style, uint64_t *mask,
     uint64_t *mask_high, uint64_t *inherit_mask);
-bool style_apply_deferred_program(
-    Stylesheet *sheet, const char *text, size_t length,
-    uint32_t program_offset, uint16_t program_count, bool important,
-    ComputedStyle *style, uint64_t *mask, uint64_t *mask_high,
-    uint64_t *inherit_mask);
 
 /* style_sheet.c */
 bool style_set_variable(Stylesheet *sheet, const char *name,

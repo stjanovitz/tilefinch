@@ -54,6 +54,7 @@ static FetchHopState *fetch_hop_create(Budget *budget, const char *url,
     if (hop == NULL) return NULL;
     hop->budget = budget;
     hop->base = request;
+    hop->user_agent = request == NULL ? NULL : request->user_agent;
     hop->security_session = request == NULL ? NULL
         : (BrowserSession *) request->cookie_session;
     const char *method = request == NULL || request->method == NULL
@@ -484,6 +485,12 @@ static bool fetch_hop_advance(FetchHopState *hop,
     if (cross_origin && base != NULL
         && base->redirect_same_origin_only) return false;
     hop->client_hints_tainted = hop->client_hints_tainted || cross_origin;
+    /* Each document a top-level navigation reaches presents the identity of
+       its own host (site_identity.h), unless the caller fixed the UA. */
+    if (base != NULL && base->page_context != NULL
+        && base->page_context->top_level_navigation
+        && site_identity_user_agent_derived(hop->user_agent))
+        hop->user_agent = site_identity_user_agent_override(next);
     bool rewrite = response->status_code == 303
         && strcasecmp(hop->method, "HEAD") != 0;
     if ((response->status_code == 301 || response->status_code == 302)
@@ -885,6 +892,11 @@ static bool fetch_configure_redirect_hop(
     if (remaining_ms <= 0) return false;
     if (!fetch_configure_private_network(easy, &hop->private_network)
         || curl_easy_setopt(easy, CURLOPT_URL, hop->url) != CURLE_OK
+        || curl_easy_setopt(
+               easy, CURLOPT_USERAGENT,
+               fetch_effective_user_agent(
+                   &(FetchRequest) {.user_agent = hop->user_agent},
+                   context->diagnostic_mobile_safari)) != CURLE_OK
         || curl_easy_setopt(easy, CURLOPT_REFERER, hop->referer) != CURLE_OK
         || curl_easy_setopt(
                easy, CURLOPT_TIMEOUT_MS, remaining_ms) != CURLE_OK

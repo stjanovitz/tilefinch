@@ -1,0 +1,1 @@
+<!doctype html><title>Image pair</title><style>body{margin:4px}img{width:48px;height:36px;margin-right:4px}p{filter:grayscale(1)}</style><body><p>Two thumbnails in one row.</p><img id=left src=/left.jpg><img id=right src=/right.jpg><script>setInterval(function(){},1000)</script></body>

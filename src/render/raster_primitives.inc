@@ -221,14 +221,7 @@ static bool command_in_overflow(const LayoutDocument *layout, size_t index)
     return false;
 }
 
-static bool node_is_descendant(const lxb_dom_node_t *node,
-                               const lxb_dom_node_t *ancestor)
-{
-    for (const lxb_dom_node_t *at = node; at != NULL; at = at->parent) {
-        if (at == ancestor) return true;
-    }
-    return false;
-}
+#define node_is_descendant document_node_within
 
 /* A frame-local hint for the allocation-free overflow path. It never
    outlives the immutable composition pass or substitutes partial answers. */

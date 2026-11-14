@@ -574,18 +574,3 @@ const char *psp_network_supervisor_state_name(
         && state < PSP_NETWORK_SUPERVISOR_STATE_COUNT
         ? names[state] : "invalid";
 }
-
-const char *psp_network_supervisor_event_name(
-    PspNetworkSupervisorEventType event)
-{
-    static const char *const names[] = {
-        "none", "target-changed", "resume", "ladder-ready",
-        "ladder-failed", "regression-hint", "probe-healthy",
-        "probe-failed", "rejoined", "rejoin-failed",
-        "admission-stopped", "leases-released", "drain-timeout",
-        "apctl-disconnected", "leave-timeout", "rung-unwound",
-        "unwound", "retry"
-    };
-    return event >= PSP_NETWORK_EVENT_NONE
-        && event < PSP_NETWORK_EVENT_COUNT ? names[event] : "invalid";
-}

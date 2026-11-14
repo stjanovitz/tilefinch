@@ -265,8 +265,9 @@ static bool save_validator(FileDownloadManager *manager)
     FILE *file = fopen(temporary, "wb");
     if (file == NULL) return false;
     const OfflineLibraryItem *item = offline_library_find(manager->library, manager->id);
-    bool okay = item != NULL && fprintf(file, "TFDL01\n%s\n%s\n", item->source_url,
-                                        manager->validator) > 0;
+    bool okay = item != NULL && fputs("TFDL01\n", file) >= 0
+        && fputs(item->source_url, file) >= 0 && fputc('\n', file) != EOF
+        && fputs(manager->validator, file) >= 0 && fputc('\n', file) != EOF;
     if (fflush(file) != 0 || ferror(file)) okay = false;
     if (fclose(file) != 0) okay = false;
     if (!okay || !tilefinch_platform_replace_file(temporary, path, NULL)) {

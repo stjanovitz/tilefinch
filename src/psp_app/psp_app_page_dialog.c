@@ -74,6 +74,11 @@ uint64_t psp_page_dialog_open_us(void)
     return psp_page_dialog.open_us;
 }
 
+void psp_page_dialog_add_open_us(uint64_t open_us)
+{
+    psp_page_dialog.open_us += open_us;
+}
+
 static uint32_t psp_page_dialog_physical(uint32_t buttons)
 {
     uint32_t mapped = 0;

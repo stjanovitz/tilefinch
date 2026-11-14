@@ -11,6 +11,7 @@
 #include "tilefinch/media_discovery.h"
 #include "tilefinch/multiplayer.h"
 #include "tilefinch/platform.h"
+#include "fnv1a.h"
 #include "tilefinch/url.h"
 #include "tilefinch/resource_integrity.h"
 #include "tilefinch/script_loader.h"
@@ -102,12 +103,8 @@ void js_rt_record_network_response(ScriptResult *result,
        64-bit multiply per byte is soft work on the PSP, so trace-free
        builds leave the field zero. */
 #ifndef TILEFINCH_NO_TRACE
-    unsigned long long hash = UINT64_C(14695981039346656037);
-    for (size_t i = 0; i < fetched->length; i++) {
-        hash ^= (unsigned char) fetched->data[i];
-        hash *= UINT64_C(1099511628211);
-    }
-    result->last_network_body_hash = hash;
+    result->last_network_body_hash =
+        fnv1a64(FNV1A64_SEED, fetched->data, fetched->length);
 #else
     result->last_network_body_hash = 0;
 #endif
@@ -1412,21 +1409,6 @@ static JSValue script_throw_request_validation(
         message = "Invalid request security context";
     }
     return JS_ThrowTypeError(context, "%s", message);
-}
-
-static JSValue js_schedule_dynamic_script(JSContext *context,
-                                          JSValueConst this_value,
-                                          int argc, JSValueConst *argv)
-{
-    (void) this_value;
-    DomBridge *bridge = JS_GetContextOpaque(context);
-    lxb_dom_node_t *node = argc > 0
-        ? js_rt_bridge_node_arg(context, bridge, argv[0]) : NULL;
-    if (bridge == NULL || node == NULL) {
-        return JS_ThrowTypeError(context,
-                                 "dynamic script element required");
-    }
-    return JS_NewInt32(context, js_rt_dynamic_prepare_subtree(context, node));
 }
 
 /* Releases the strings the fetch bindings borrow from their arguments. A
@@ -4531,7 +4513,6 @@ static const JsRtNative fetch_cors_natives[] = {
       js_multiplayer_add_remote_code, 2, JS_RT_NATIVE_TEST_OVERRIDABLE },
     { "__tilefinchMultiplayerClose",
       js_multiplayer_close, 3, JS_RT_NATIVE_TEST_OVERRIDABLE },
-    { "__tilefinchScheduleDynamicScript", js_schedule_dynamic_script, 1, 0 },
 };
 
 bool js_fetch_cors_install(JSContext *context, JSValue global)

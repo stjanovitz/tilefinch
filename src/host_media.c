@@ -1,4 +1,5 @@
 #include "tilefinch/host_media.h"
+#include "tilefinch/platform.h"
 
 #include <limits.h>
 #include <stdarg.h>
@@ -119,15 +120,7 @@ struct HostMediaPlayer {
 #define HOST_MEDIA_VIDEO_PACKET_MAXIMUM_BYTES (256u * 1024u)
 #define HOST_MEDIA_VIDEO_QUEUE_MAXIMUM_BYTES (512u * 1024u)
 
-static void media_error(char *error, size_t error_size,
-                        const char *format, ...)
-{
-    if (error == NULL || error_size == 0) return;
-    va_list arguments;
-    va_start(arguments, format);
-    vsnprintf(error, error_size, format, arguments);
-    va_end(arguments);
-}
+#define media_error tilefinch_format_error
 
 /* The PSP page-media probe's shape (psp_media_open.c): the first bytes by
    Range (MEDIA_HTTP_PROBE_RANGE_BYTES), or a small whole body from a
@@ -229,13 +222,7 @@ static int media_pick_video_stream(AVFormatContext *format,
     return chosen;
 }
 
-static bool media_node_name_is(lxb_dom_node_t *node, const char *wanted)
-{
-    size_t length = 0;
-    const char *name = document_element_name(node, &length);
-    return name != NULL && strlen(wanted) == length
-        && strncasecmp(name, wanted, length) == 0;
-}
+#define media_node_name_is document_element_name_is_ignoring_case
 
 static uint64_t media_presented_audio_samples(const HostMediaPlayer *player)
 {

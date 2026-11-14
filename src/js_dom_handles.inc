@@ -11,9 +11,9 @@ static int64_t bridge_node_handle(const DomBridge *bridge, size_t slot)
         || bridge->node_generations[slot] == 0
         || bridge->node_generations[slot]
                >= DOM_BRIDGE_NODE_GENERATION_MAX) return 0;
-    return (int64_t) ((uint32_t) (bridge->node_generations[slot]
-                                 << DOM_BRIDGE_NODE_INDEX_BITS)
-                     | (uint32_t) (slot + 1));
+    return (int64_t) (((uint32_t) bridge->node_generations[slot]
+                       << DOM_BRIDGE_NODE_INDEX_BITS)
+                      | (uint32_t) (slot + 1));
 }
 
 static size_t bridge_node_index_home(const DomBridge *bridge,
@@ -25,7 +25,14 @@ static size_t bridge_node_index_home(const DomBridge *bridge,
     mixed ^= (uint32_t) (key >> 35);
 #endif
     mixed *= UINT32_C(2654435761);
-    return (size_t) mixed & (bridge->node_index_capacity - 1u);
+    /* The hash's high bits scaled to the index (which need not be a power
+       of two): a multiply and a shift. */
+    return (size_t) (((uint64_t) mixed * bridge->node_index_capacity) >> 32);
+}
+
+static size_t bridge_node_index_next(const DomBridge *bridge, size_t at)
+{
+    return at + 1u == bridge->node_index_capacity ? 0 : at + 1u;
 }
 
 /* The slot holding `node`, or SIZE_MAX. Compares pointers only: a slot may
@@ -41,7 +48,7 @@ static size_t bridge_node_index_find(const DomBridge *bridge,
         uint16_t entry = bridge->node_index[at];
         if (entry == 0u) return SIZE_MAX;
         if (bridge->nodes[entry - 1u] == node) return entry - 1u;
-        at = (at + 1u) & (bridge->node_index_capacity - 1u);
+        at = bridge_node_index_next(bridge, at);
     }
     return SIZE_MAX;
 }
@@ -50,7 +57,7 @@ static void bridge_node_index_insert(DomBridge *bridge, size_t slot)
 {
     size_t at = bridge_node_index_home(bridge, bridge->nodes[slot]);
     while (bridge->node_index[at] != 0u)
-        at = (at + 1u) & (bridge->node_index_capacity - 1u);
+        at = bridge_node_index_next(bridge, at);
     bridge->node_index[at] = (uint16_t) (slot + 1u);
 }
 
@@ -58,16 +65,16 @@ static void bridge_node_index_insert(DomBridge *bridge, size_t slot)
    probing with backward-shift deletion keeps every run unbroken. */
 static void bridge_node_index_remove(DomBridge *bridge, size_t slot)
 {
-    const size_t mask = bridge->node_index_capacity - 1u;
     size_t hole = bridge_node_index_home(bridge, bridge->nodes[slot]);
     for (size_t probes = 0;; probes++) {
         if (probes == bridge->node_index_capacity
             || bridge->node_index[hole] == 0u) return;
         if (bridge->node_index[hole] == (uint16_t) (slot + 1u)) break;
-        hole = (hole + 1u) & mask;
+        hole = bridge_node_index_next(bridge, hole);
     }
-    for (size_t at = (hole + 1u) & mask; bridge->node_index[at] != 0u;
-         at = (at + 1u) & mask) {
+    for (size_t at = bridge_node_index_next(bridge, hole);
+         bridge->node_index[at] != 0u;
+         at = bridge_node_index_next(bridge, at)) {
         size_t home = bridge_node_index_home(
             bridge, bridge->nodes[bridge->node_index[at] - 1u]);
         /* The entry may fill the hole unless its home lies cyclically in
@@ -81,11 +88,37 @@ static void bridge_node_index_remove(DomBridge *bridge, size_t slot)
     bridge->node_index[hole] = 0u;
 }
 
+/* Two entries per slot keep the load factor at or below one half. */
 static size_t bridge_node_index_capacity_for(size_t capacity)
 {
-    size_t index = 64u;
-    while (index < 2u * capacity) index *= 2u;
-    return index;
+    return 2u * capacity;
+}
+
+/* The slot arrays' one block (bridge_node_table_resize carves it). */
+static size_t bridge_node_table_block_bytes(size_t capacity)
+{
+    return capacity * (sizeof(lxb_dom_node_t *) + sizeof(uintptr_t))
+        + capacity * sizeof(uint32_t)
+        + capacity / 32u * 3u * sizeof(uint32_t)
+        + capacity * sizeof(uint16_t) + capacity;
+}
+
+/* The bytes the table keeps beyond its current size once it holds
+   `capacity` slots: the larger block and pointer index, and the lazily
+   allocated wrapper references and owner tags. (The move itself briefly
+   holds both blocks; the Budget admits that like any allocation.) */
+static size_t bridge_node_table_growth_bytes(const DomBridge *bridge,
+                                             size_t capacity)
+{
+    if (capacity <= bridge->node_capacity) return 0;
+    size_t added = capacity - bridge->node_capacity;
+    size_t bytes = bridge_node_table_block_bytes(capacity)
+        - bridge_node_table_block_bytes(bridge->node_capacity)
+        + (bridge_node_index_capacity_for(capacity)
+           - bridge->node_index_capacity) * sizeof(uint16_t);
+    if (bridge->wrapper_refs != NULL) bytes += added * sizeof(void *);
+    if (bridge->node_owner_tags != NULL) bytes += added;
+    return bytes;
 }
 
 /* Moves the slot table to `capacity` slots (a multiple of 32, at least the
@@ -101,12 +134,8 @@ static bool bridge_node_table_resize(DomBridge *bridge, size_t capacity)
         || capacity < bridge->node_capacity) return false;
     if (capacity == bridge->node_capacity) return true;
     size_t index_capacity = bridge_node_index_capacity_for(capacity);
-    size_t pointer_bytes = capacity
-        * (sizeof(lxb_dom_node_t *) + sizeof(uintptr_t));
-    size_t word_bytes = capacity * 2u * sizeof(uint32_t)
-        + capacity / 32u * 2u * sizeof(uint32_t);
     unsigned char *block = budget_calloc(
-        bridge->budget, 1, pointer_bytes + word_bytes + capacity);
+        bridge->budget, 1, bridge_node_table_block_bytes(capacity));
     if (block == NULL) return false;
     uint16_t *index = budget_calloc(
         bridge->budget, index_capacity, sizeof(uint16_t));
@@ -115,16 +144,16 @@ static bool bridge_node_table_resize(DomBridge *bridge, size_t capacity)
         return false;
     }
     if (bridge->wrapper_refs != NULL) {
-        JSValue *refs = budget_realloc(
+        void **refs = budget_realloc(
             bridge->budget, bridge->wrapper_refs,
-            capacity * sizeof(JSValue));
+            capacity * sizeof(void *));
         if (refs == NULL) {
             budget_free(bridge->budget, index);
             budget_free(bridge->budget, block);
             return false;
         }
         for (size_t at = bridge->node_capacity; at < capacity; at++)
-            refs[at] = JS_UNDEFINED;
+            refs[at] = NULL;
         bridge->wrapper_refs = refs;
     }
     if (bridge->node_owner_tags != NULL) {
@@ -139,13 +168,16 @@ static bool bridge_node_table_resize(DomBridge *bridge, size_t capacity)
                capacity - bridge->node_capacity);
         bridge->node_owner_tags = tags;
     }
+    /* Widest first, so every array is aligned (capacity is a multiple of
+       32). */
     lxb_dom_node_t **nodes = (lxb_dom_node_t **) (void *) block;
     uintptr_t *owners = (uintptr_t *) (void *) (nodes + capacity);
-    uint32_t *generations = (uint32_t *) (void *) (owners + capacity);
-    uint32_t *leases = generations + capacity;
+    uint32_t *leases = (uint32_t *) (void *) (owners + capacity);
     uint32_t *reusable = leases + capacity;
     uint32_t *held = reusable + capacity / 32u;
-    unsigned char *flags = (unsigned char *) (held + capacity / 32u);
+    uint32_t *kept = held + capacity / 32u;
+    uint16_t *generations = (uint16_t *) (void *) (kept + capacity / 32u);
+    unsigned char *flags = (unsigned char *) (generations + capacity);
     size_t old = bridge->node_capacity;
     if (old != 0) {
         memcpy(nodes, bridge->nodes, old * sizeof(*nodes));
@@ -156,6 +188,8 @@ static bool bridge_node_table_resize(DomBridge *bridge, size_t capacity)
         memcpy(leases, bridge->node_wrapper_leases, old * sizeof(*leases));
         memcpy(reusable, bridge->node_reusable_bits,
                old / 32u * sizeof(*reusable));
+        memcpy(kept, bridge->node_handle_kept_bits,
+               old / 32u * sizeof(*kept));
         memcpy(flags, bridge->node_retention_flags, old);
     }
     /* The arrays share one block whose base is `nodes`. */
@@ -167,6 +201,7 @@ static bool bridge_node_table_resize(DomBridge *bridge, size_t capacity)
     bridge->node_wrapper_leases = leases;
     bridge->node_reusable_bits = reusable;
     bridge->node_wrapper_held_bits = held;
+    bridge->node_handle_kept_bits = kept;
     bridge->node_retention_flags = flags;
     bridge->node_index = index;
     bridge->node_index_capacity = index_capacity;
@@ -177,7 +212,8 @@ static bool bridge_node_table_resize(DomBridge *bridge, size_t capacity)
     return true;
 }
 
-bool js_rt_bridge_node_table_init(DomBridge *bridge, size_t limit)
+bool js_rt_bridge_node_table_init(DomBridge *bridge, size_t limit,
+                                  size_t initial)
 {
     if (bridge == NULL || bridge->nodes != NULL) return false;
     if (limit == 0) limit = DOM_BRIDGE_NODE_LIMIT;
@@ -185,13 +221,31 @@ bool js_rt_bridge_node_table_init(DomBridge *bridge, size_t limit)
     limit -= limit % 32u;
     if (limit == 0) return false;
     bridge->node_capacity_limit = limit;
-    return bridge_node_table_resize(
-        bridge, limit < DOM_BRIDGE_NODE_LIMIT ? limit : DOM_BRIDGE_NODE_LIMIT);
+    initial -= initial % 32u;
+    if (initial < 32u) initial = 32u;
+    return bridge_node_table_resize(bridge, initial < limit ? initial : limit);
+}
+
+ScriptMutationJournal *js_rt_bridge_journal(DomBridge *bridge)
+{
+    if (bridge == NULL) return NULL;
+    if (bridge->mutations != NULL || bridge->mutations_unrecorded)
+        return bridge->mutations;
+    bridge->mutations = budget_calloc(bridge->budget, 1,
+                                      sizeof(*bridge->mutations));
+    if (bridge->mutations == NULL) bridge->mutations_unrecorded = true;
+#if defined(TILEFINCH_FRAME_LITE)
+    else tilefinch_frame_lite_counters.mutation_journals++;
+#endif
+    return bridge->mutations;
 }
 
 void js_rt_bridge_node_table_free(DomBridge *bridge)
 {
     if (bridge == NULL) return;
+    budget_free(bridge->budget, bridge->mutations);
+    bridge->mutations = NULL;
+    bridge->mutations_unrecorded = false;
     budget_free(bridge->budget, bridge->nodes);
     budget_free(bridge->budget, bridge->node_index);
     /* Teardown frees the document, deferred subtrees with it. */
@@ -205,24 +259,90 @@ void js_rt_bridge_node_table_free(DomBridge *bridge)
     bridge->node_wrapper_leases = NULL;
     bridge->node_reusable_bits = NULL;
     bridge->node_wrapper_held_bits = NULL;
+    bridge->node_handle_kept_bits = NULL;
     bridge->node_retention_flags = NULL;
     bridge->node_index = NULL;
     bridge->node_index_capacity = 0;
     bridge->node_capacity = 0;
     bridge->node_count = 0;
+    bridge->node_reusable_low_word = 0;
+    /* The registry names handles of the table just freed. */
+    budget_free(bridge->budget, bridge->shadow_root_handles);
+    bridge->shadow_root_handles = NULL;
+    bridge->shadow_root_count = 0;
+    bridge->shadow_root_capacity = 0;
 }
 
-/* One growth step when every slot is live: double, up to the policy's
-   ceiling. Growth is admitted like any page allocation; a refusal leaves the
-   table full and registration reports exhaustion as before. */
+/* The capacity one growth step reaches: double up to
+   DOM_BRIDGE_NODE_BUDGET_CAPACITY, then DOM_BRIDGE_NODE_GROWTH_STEP more
+   slots, never past the policy's ceiling. A step past the Budget capacity
+   allocates little at a time, so it fits the memory a nearly full page
+   still has. */
+static size_t bridge_node_table_next_capacity(const DomBridge *bridge)
+{
+    size_t capacity = bridge->node_capacity;
+    if (capacity < DOM_BRIDGE_NODE_BUDGET_CAPACITY) {
+        capacity *= 2u;
+        if (capacity > DOM_BRIDGE_NODE_BUDGET_CAPACITY)
+            capacity = DOM_BRIDGE_NODE_BUDGET_CAPACITY;
+    } else {
+        capacity += DOM_BRIDGE_NODE_GROWTH_STEP;
+    }
+    return capacity > bridge->node_capacity_limit
+        ? bridge->node_capacity_limit : capacity;
+}
+
+/* Whether the step to `capacity` may allocate: up to the Budget capacity
+   whenever the Budget allows; past it only while the page keeps the
+   presentation reserve free beside the step (script_admission.h), as a
+   shadow root or a script must. `make_room` lets optional caches give way
+   first. */
+static bool bridge_node_table_growth_admitted(const DomBridge *bridge,
+                                              size_t capacity, bool make_room)
+{
+    if (capacity <= DOM_BRIDGE_NODE_BUDGET_CAPACITY || bridge->budget == NULL)
+        return true;
+    return script_admission_affordable_bytes(bridge->budget, 0, make_room)
+        >= bridge_node_table_growth_bytes(bridge, capacity);
+}
+
+bool js_rt_bridge_node_table_can_grow(const DomBridge *bridge)
+{
+    if (bridge == NULL || bridge->node_capacity >= bridge->node_capacity_limit)
+        return false;
+    return bridge_node_table_growth_admitted(
+        bridge, bridge_node_table_next_capacity(bridge), false);
+}
+
+/* One growth step when every slot is live, up to the policy's ceiling. A
+   refusal (of the memory admission or of the Budget) leaves the table full
+   and registration reports exhaustion as before. */
 static bool bridge_node_table_grow(DomBridge *bridge)
 {
     if (bridge == NULL || bridge->node_capacity >= bridge->node_capacity_limit)
         return false;
-    size_t capacity = bridge->node_capacity * 2u;
-    if (capacity > bridge->node_capacity_limit)
-        capacity = bridge->node_capacity_limit;
-    if (!bridge_node_table_resize(bridge, capacity)) {
+    size_t capacity = bridge_node_table_next_capacity(bridge);
+    if (!bridge_node_table_growth_admitted(bridge, capacity, true)) {
+        if (bridge->result != NULL
+            && bridge->result->dom_handle_growth_refusals != SIZE_MAX)
+            bridge->result->dom_handle_growth_refusals++;
+        return false;
+    }
+#if defined(TILEFINCH_FRAME_LITE)
+    uint64_t growth_started = tilefinch_platform_monotonic_time_us();
+#endif
+    bool grown = bridge_node_table_resize(bridge, capacity);
+#if defined(TILEFINCH_FRAME_LITE)
+    if (grown) {
+        uint64_t spent = tilefinch_platform_monotonic_time_us()
+            - growth_started;
+        tilefinch_frame_lite_counters.handle_growths++;
+        tilefinch_frame_lite_counters.handle_growth_us += spent;
+        if (spent > tilefinch_frame_lite_counters.handle_growth_max_us)
+            tilefinch_frame_lite_counters.handle_growth_max_us = spent;
+    }
+#endif
+    if (!grown) {
         if (bridge->result != NULL
             && bridge->result->dom_handle_growth_refusals != SIZE_MAX)
             bridge->result->dom_handle_growth_refusals++;
@@ -240,19 +360,52 @@ static void bridge_node_set_reusable(DomBridge *bridge, size_t slot,
                                      bool reusable)
 {
     uint32_t bit = UINT32_C(1) << (slot % 32u);
-    if (reusable) bridge->node_reusable_bits[slot / 32u] |= bit;
-    else bridge->node_reusable_bits[slot / 32u] &= ~bit;
+    if (reusable) {
+        bridge->node_reusable_bits[slot / 32u] |= bit;
+        if (slot / 32u < bridge->node_reusable_low_word)
+            bridge->node_reusable_low_word = slot / 32u;
+    } else {
+        bridge->node_reusable_bits[slot / 32u] &= ~bit;
+    }
 }
 
-/* The lowest NULL slot whose generation can still advance, or SIZE_MAX. */
-static size_t bridge_first_reusable_slot(const DomBridge *bridge)
+static void bridge_keep_node_slot(DomBridge *bridge, size_t slot)
+{
+    bridge->node_handle_kept_bits[slot / 32u] |= UINT32_C(1) << (slot % 32u);
+}
+
+static bool bridge_node_slot_kept(const DomBridge *bridge, size_t slot)
+{
+    return (bridge->node_handle_kept_bits[slot / 32u]
+            & (UINT32_C(1) << (slot % 32u))) != 0u;
+}
+
+void js_rt_bridge_keep_node_handle(DomBridge *bridge, int64_t handle)
+{
+    size_t slot = 0;
+    if (js_rt_bridge_node_slot_for_handle(bridge, handle, &slot))
+        bridge_keep_node_slot(bridge, slot);
+}
+
+/* The lowest NULL slot whose generation can still advance, or SIZE_MAX.
+   The search starts at node_reusable_low_word, below which every word is
+   clear, so registering into a table with no free slot (every new node
+   while a page builds) reads no words instead of all of them. */
+static size_t bridge_first_reusable_slot(DomBridge *bridge)
 {
     size_t words = (bridge->node_count + 31u) / 32u;
-    for (size_t word = 0; word < words; word++) {
+    size_t word = bridge->node_reusable_low_word;
+    for (; word < words; word++) {
         uint32_t bits = bridge->node_reusable_bits[word];
-        if (bits != 0u) return word * 32u + (size_t) __builtin_ctz(bits);
+        if (bits != 0u) break;
     }
-    return SIZE_MAX;
+    if (bridge->result != NULL)
+        bridge->result->dom_handle_slot_search_words +=
+            word - bridge->node_reusable_low_word;
+    bridge->node_reusable_low_word = word;
+    return word < words
+        ? word * 32u + (size_t) __builtin_ctz(bridge->node_reusable_bits[word])
+        : SIZE_MAX;
 }
 
 static void bridge_notify_node_state_retired(DomBridge *bridge,
@@ -308,11 +461,15 @@ static bool bridge_node_is_shadow_root(const DomBridge *bridge,
 /* The carrier itself is not observable as part of the light tree, nor are
    its descendants.  A ShadowRoot-scoped query begins at the carrier's first
    child, so it remains able to inspect its own tree while nested shadow roots
-   are still isolated. */
+   are still isolated. The walk steps over a carrier's subtree rather than
+   through it: a page built of web components keeps most of its nodes in
+   them (about 96% of an Internet Archive search's querySelectorAll visits
+   were hidden nodes); `shadow_depth` hides whatever of it the walk would
+   still reach. */
 static bool bridge_query_node_hidden_by_shadow(
     const DomBridge *bridge, const lxb_dom_node_t *node,
     const lxb_dom_node_t *boundary,
-    const DomDocumentOrderTraversal *traversal, size_t *shadow_depth)
+    DomDocumentOrderTraversal *traversal, size_t *shadow_depth)
 {
     if (shadow_depth == NULL || traversal == NULL) return false;
     if (*shadow_depth != SIZE_MAX) {
@@ -320,6 +477,8 @@ static bool bridge_query_node_hidden_by_shadow(
         *shadow_depth = SIZE_MAX;
     }
     if (node != boundary && bridge_node_is_shadow_root(bridge, node)) {
+        dom_document_order_skip_children(traversal,
+                                         (lxb_dom_node_t *) node);
         *shadow_depth = traversal->current_depth;
         return true;
     }
@@ -329,6 +488,12 @@ static bool bridge_query_node_hidden_by_shadow(
 static void bridge_reclaim_node_slots(DomBridge *bridge,
                                       const lxb_dom_node_t *keep,
                                       bool shadow_pressure);
+
+/* The tables that hold one entry per admitted root share its hard bound
+   (DOM_BRIDGE_SHADOW_ROOT_LIMIT). */
+_Static_assert(DOCUMENT_ADOPTION_ROOT_LIMIT == DOM_BRIDGE_SHADOW_ROOT_LIMIT
+               && STYLE_SHADOW_SCOPE_LIMIT == DOM_BRIDGE_SHADOW_ROOT_LIMIT,
+               "shadow-root tables must share the bridge's bound");
 
 JSValue js_dom_register_shadow_root(JSContext *context,
                                     JSValueConst this_value,
@@ -357,17 +522,29 @@ retry:
         bridge->shadow_root_handles[write++] = existing;
     }
     bridge->shadow_root_count = write;
-    size_t admitted = DOM_BRIDGE_SHADOW_ROOT_BASE;
-    if (bridge->budget != NULL) {
-        size_t by_budget = bridge->budget->limit
-            / (argc > 2 && JS_ToBool(context, argv[2]) > 0
-               ? DOM_BRIDGE_SHARED_SHADOW_ROOT_BUDGET_BYTES
-               : DOM_BRIDGE_SHADOW_ROOT_BUDGET_BYTES);
-        if (by_budget > admitted) admitted = by_budget;
+    /* Memory-based admission (DOM_BRIDGE_SHADOW_ROOT_COST_BYTES): the
+       root and its content must fit beside the presentation reserve, as
+       a script must. Optional caches give way first. */
+    bool admitted = write < DOM_BRIDGE_SHADOW_ROOT_LIMIT
+        && (write < DOM_BRIDGE_SHADOW_ROOT_BASE || bridge->budget == NULL
+            || script_admission_affordable_bytes(bridge->budget, 0, true)
+                   >= DOM_BRIDGE_SHADOW_ROOT_COST_BYTES);
+    if (admitted && write == bridge->shadow_root_capacity) {
+        size_t capacity = bridge->shadow_root_capacity == 0 ? 64u
+            : bridge->shadow_root_capacity * 2u;
+        if (capacity > DOM_BRIDGE_SHADOW_ROOT_LIMIT)
+            capacity = DOM_BRIDGE_SHADOW_ROOT_LIMIT;
+        uint32_t *grown = budget_realloc(bridge->budget,
+                                         bridge->shadow_root_handles,
+                                         capacity * sizeof(*grown));
+        if (grown == NULL) {
+            admitted = false;
+        } else {
+            bridge->shadow_root_handles = grown;
+            bridge->shadow_root_capacity = capacity;
+        }
     }
-    if (admitted > DOM_BRIDGE_SHADOW_ROOT_LIMIT)
-        admitted = DOM_BRIDGE_SHADOW_ROOT_LIMIT;
-    if (write >= admitted) {
+    if (!admitted) {
         if (reclaim) {
             reclaim = false;
             /* The bootstrap has released only disconnected cache ownership.
@@ -383,8 +560,16 @@ retry:
         return JS_FALSE;
     }
     /* Style resolution recognises the carrier by this native-only mark
-       (shadow composition, document.h). */
-    if (!document_mark_shadow_carrier(bridge->nodes[slot])) return JS_FALSE;
+       (shadow composition, document.h). Marking is a host style write,
+       which restyles only the host's subtree: its light children now
+       compose through the carrier, which itself became one. */
+    lxb_dom_node_t *carrier = bridge->nodes[slot];
+    uint64_t before = document_style_generation();
+    if (!document_mark_shadow_carrier(carrier)) return JS_FALSE;
+    lxb_dom_node_t *host = carrier->parent;
+    if (host != NULL && host->type == LXB_DOM_NODE_TYPE_ELEMENT
+        && js_rt_bridge_computed_style_drop_within(bridge, &host, 1))
+        js_rt_bridge_computed_style_host_described(bridge, before);
     bridge->shadow_root_handles[write] = (uint32_t) handle;
     bridge->shadow_root_count = write + 1u;
     bridge->shadow_reclaim_gc_skip = 0;
@@ -430,7 +615,8 @@ static int64_t bridge_invalidate_node_slot_impl(
     if (bridge->node_owner_tags != NULL) bridge->node_owner_tags[slot] = 0;
     /* Never wrap an incarnation: a wrapped handle could make an arbitrarily
        old JavaScript wrapper refer to an unrelated replacement node.  A slot
-       that exhausts its hundreds of thousands of incarnations is retired. */
+       that reaches DOM_BRIDGE_NODE_GENERATION_MAX (about 32,000
+       incarnations) is retired. */
     if (bridge->node_generations[slot]
         < DOM_BRIDGE_NODE_GENERATION_MAX) {
         bridge->node_generations[slot]++;
@@ -438,6 +624,8 @@ static int64_t bridge_invalidate_node_slot_impl(
     bridge_node_set_reusable(
         bridge, slot,
         bridge->node_generations[slot] < DOM_BRIDGE_NODE_GENERATION_MAX);
+    bridge->node_handle_kept_bits[slot / 32u] &=
+        ~(UINT32_C(1) << (slot % 32u));
     bridge_set_event_state(bridge, slot, 0, false);
     bridge->events.holder_epoch++;
     bridge->node_retention_flags[slot] =
@@ -554,6 +742,12 @@ int64_t js_rt_bridge_register_node(DomBridge *bridge, lxb_dom_node_t *node)
         size_t first = bridge_first_reusable_slot(bridge);
         if (first != SIZE_MAX) reusable = first;
     }
+    /* A table below DOM_BRIDGE_NODE_LIMIT grows as soon as it is full: a
+       table of that size would have had a free slot, so reclaiming here
+       would run a collection no page ran before tables started small. */
+    if (reusable == none && bridge->node_count == bridge->node_capacity
+        && bridge->node_capacity < DOM_BRIDGE_NODE_LIMIT)
+        (void) bridge_node_table_grow(bridge);
     if (reusable == none
         && bridge->node_count == bridge->node_capacity) {
         /* Dead wrappers are reclaimed first, exactly as at a fixed-size
@@ -591,6 +785,9 @@ int64_t js_rt_bridge_register_node(DomBridge *bridge, lxb_dom_node_t *node)
     }
     bridge->nodes[reusable] = node;
     bridge->node_owner_document_identities[reusable] = owner;
+    /* An owner turn's sweep may release it if no wrapper or record names
+       it by then. */
+    bridge_arm_wrapper_sweep(bridge);
     bridge_node_set_reusable(bridge, reusable, false);
     bridge_node_index_insert(bridge, reusable);
     /* Tag at registration: once script holds the node, removal from its
@@ -647,9 +844,10 @@ static void bridge_wrapper_ref_clear(DomBridge *bridge, size_t slot)
        rebind replaces that while the wrapper lives). */
     if ((bridge->node_retention_flags[slot] & BRIDGE_NODE_EVENT_KEPT) != 0)
         bridge_set_event_state(bridge, slot, 0, false);
-    JSValue *ref = &bridge->wrapper_refs[slot];
-    if (JS_IsObject(*ref)) JS_FreeWeakTarget(bridge->host->runtime, *ref);
-    *ref = JS_UNDEFINED;
+    if (bridge->wrapper_refs[slot] != NULL)
+        JS_FreeWeakTarget(bridge->host->runtime,
+                          js_rt_bridge_wrapper_ref(bridge, slot));
+    bridge->wrapper_refs[slot] = NULL;
 }
 
 /* Before the realm is freed: drop every stored reference and the table. */
@@ -689,7 +887,8 @@ void js_rt_bridge_hold_stateful_wrappers(DomBridge *bridge, bool hold)
             for (unsigned bit = 0; bits != 0; bit++, bits >>= 1)
                 if ((bits & 1u) != 0)
                     JS_FreeValueRT(runtime,
-                                   bridge->wrapper_refs[word * 32u + bit]);
+                                   js_rt_bridge_wrapper_ref(
+                                       bridge, word * 32u + bit));
         }
         bridge->node_wrappers_held = 0;
         return;
@@ -698,13 +897,14 @@ void js_rt_bridge_hold_stateful_wrappers(DomBridge *bridge, bool hold)
         if ((bridge->node_retention_flags[slot] & BRIDGE_NODE_LIVE_WRAPPER) == 0
             || bridge->nodes[slot] == NULL
             || !JS_WeakTargetCarriesState(runtime,
-                                          bridge->wrapper_refs[slot],
+                                          js_rt_bridge_wrapper_ref(
+                                              bridge, slot),
                                           bridge->wrapper_plain_keys,
                                           bridge->wrapper_plain_key_count))
             continue;
         lxb_dom_node_t *root = bridge_owned_lifetime_root(bridge->nodes[slot]);
         if (root == NULL || root->type != LXB_DOM_NODE_TYPE_DOCUMENT) continue;
-        JS_DupValueRT(runtime, bridge->wrapper_refs[slot]);
+        JS_DupValueRT(runtime, js_rt_bridge_wrapper_ref(bridge, slot));
         bridge->node_wrapper_held_bits[slot / 32u] |= 1u << (slot % 32u);
         bridge->node_wrappers_held++;
     }
@@ -729,8 +929,9 @@ JSValue js_dom_node_wrapper(JSContext *context, JSValueConst this_value,
         uint32_t live = 0;
         for (size_t at = 0; bridge != NULL && bridge->wrapper_refs != NULL
              && at < bridge->node_count; at++) {
-            if (!JS_IsObject(bridge->wrapper_refs[at])) continue;
-            JSValue wrapper = JS_WeakTargetDeref(context, bridge->wrapper_refs[at]);
+            if (bridge->wrapper_refs[at] == NULL) continue;
+            JSValue wrapper = JS_WeakTargetDeref(context,
+                js_rt_bridge_wrapper_ref(bridge, at));
             if (JS_IsObject(wrapper)) live++;
             JS_FreeValue(context, wrapper);
         }
@@ -742,11 +943,43 @@ JSValue js_dom_node_wrapper(JSContext *context, JSValueConst this_value,
         return JS_NULL;
     if (argc > 1 && JS_ToBool(context, argv[1]))
         return JS_NewUint32(context, bridge->node_wrapper_leases[slot]);
-    if (!JS_IsObject(bridge->wrapper_refs[slot])) return JS_NULL;
-    JSValue wrapper = JS_WeakTargetDeref(context, bridge->wrapper_refs[slot]);
+    if (bridge->wrapper_refs[slot] == NULL) return JS_NULL;
+    JSValue wrapper = JS_WeakTargetDeref(context,
+        js_rt_bridge_wrapper_ref(bridge, slot));
     if (JS_IsObject(wrapper)) return wrapper;
     JS_FreeValue(context, wrapper);
     return JS_NULL;
+}
+
+/* __tilefinchKeepNodeHandle(handle): a handle-keyed bootstrap table names
+   the handle, so its connected node keeps the slot when its wrapper dies.
+   __tilefinchHoldHandleRelease(held): the bootstrap holds (or no longer
+   holds) raw handles of connected nodes across owner turns. Either only
+   keeps slots that could otherwise be released. */
+JSValue js_dom_keep_node_handle(JSContext *context, JSValueConst this_value,
+                                int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    int64_t handle = 0;
+    if (bridge != NULL && argc > 0
+        && JS_ToInt64(context, &handle, argv[0]) == 0)
+        js_rt_bridge_keep_node_handle(bridge, handle);
+    return JS_UNDEFINED;
+}
+
+JSValue js_dom_hold_handle_release(JSContext *context, JSValueConst this_value,
+                                   int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    if (bridge == NULL) return JS_UNDEFINED;
+    bool held = argc > 0 && JS_ToBool(context, argv[0]) > 0;
+    /* The slots the hold kept are released on the next turns. */
+    if (bridge->connected_release_held && !held)
+        bridge_arm_wrapper_sweep(bridge);
+    bridge->connected_release_held = held;
+    return JS_UNDEFINED;
 }
 
 /* A new lease on the slot for `wrapper` (held weakly: that is the wrapper
@@ -765,10 +998,7 @@ static JSValue bridge_retain_wrapper(JSContext *context, DomBridge *bridge,
     if (JS_IsObject(wrapper)) {
         if (bridge->wrapper_refs == NULL) {
             bridge->wrapper_refs = budget_calloc(
-                bridge->budget, bridge->node_capacity, sizeof(JSValue));
-            if (bridge->wrapper_refs != NULL)
-                for (size_t at = 0; at < bridge->node_capacity; at++)
-                    bridge->wrapper_refs[at] = JS_UNDEFINED;
+                bridge->budget, bridge->node_capacity, sizeof(void *));
         }
         if (bridge->wrapper_refs == NULL) {
             /* Rebinding can be materializing an author-held secondary node.
@@ -778,7 +1008,10 @@ static JSValue bridge_retain_wrapper(JSContext *context, DomBridge *bridge,
             return JS_ThrowOutOfMemory(context);
         }
         bridge_wrapper_ref_clear(bridge, slot);
-        bridge->wrapper_refs[slot] = JS_NewWeakTarget(context, wrapper);
+        /* The weak target is the object itself (JS_NewWeakTarget). */
+        JSValue target = JS_NewWeakTarget(context, wrapper);
+        bridge->wrapper_refs[slot] =
+            JS_IsObject(target) ? JS_VALUE_GET_PTR(target) : NULL;
     } else {
         bridge_wrapper_ref_clear(bridge, slot);
     }
@@ -942,14 +1175,67 @@ static void bridge_retired_wrappers_flush(DomBridge *bridge,
     JS_FreeValue(context, result);
 }
 
+/* Whether the slot of `node`, connected, whose wrapper just died, may
+   retire now, so that the node's next registration takes a new slot and
+   handle and its next wrapper is built as on a first access. Nothing that
+   names the old handle may outlive it:
+   - no native pin, event state (rooted, held or kept listeners and
+     handlers) or held-tree mark;
+   - no kept handle: no native record or handle-keyed bootstrap table names
+     it (node_handle_kept_bits);
+   - no adopted owner tag a new registration would not inherit (only the
+     document's: connected nodes inherit 1);
+   - not the document, a shadow root's carrier or the fullscreen element;
+   - the bootstrap is not holding raw handles across turns
+     (connected_release_held).
+   A dead wrapper carried no page state: one with an expando or used as a
+   weak key is held through each collection while its node is connected
+   (js_rt_bridge_hold_stateful_wrappers). Only the owner-turn sweep asks:
+   inside a task the bootstrap may hold handles native code returned that
+   it has not wrapped yet. */
+static bool bridge_connected_slot_releasable(const DomBridge *bridge,
+                                             size_t slot,
+                                             const lxb_dom_node_t *node)
+{
+    if (bridge->connected_release_held
+        || (bridge->node_retention_flags[slot]
+            & (BRIDGE_NODE_RETAINING | BRIDGE_NODE_EVENT_STATE
+               | BRIDGE_NODE_EVENT_STUCK | BRIDGE_NODE_EVENT_IN_HELD_TREE))
+               != 0
+        || bridge_node_slot_kept(bridge, slot)
+        || (bridge->node_owner_tags != NULL
+            && bridge->node_owner_tags[slot] > 1u)
+        || node->type == LXB_DOM_NODE_TYPE_DOCUMENT
+        || document_node_is_shadow_carrier(node))
+        return false;
+    int64_t handle = bridge_node_handle(bridge, slot);
+    return handle != 0 && handle != bridge->fullscreen_node_handle;
+}
+
+/* Retires a releasable connected slot. No retirement notice: no bootstrap
+   table names the handle (a dead wrapper's wrapper-only notice has gone to
+   its batch already). */
+static void bridge_release_connected_slot(DomBridge *bridge, size_t slot)
+{
+    (void) bridge_invalidate_node_slot_impl(bridge, slot, false);
+    bridge->node_retention_flags[slot] = 0;
+    if (bridge->result != NULL
+        && bridge->result->dom_handle_connected_releases != SIZE_MAX)
+        bridge->result->dom_handle_connected_releases++;
+}
+
 /* Ends the live wrapper identity of `slot` and reclaims its detached
    lifetime tree unless something else retains it. A tree that may contain
    `keep` (a node native code is still using) is left for the wrapper's own
    finalizer. With `batch`, the wrapper-only notice joins it instead of
-   calling into JavaScript now. Returns the handle slots released. */
+   calling into JavaScript now. With `release_connected` (the owner-turn
+   sweep), a connected node's slot retires too when nothing names its
+   handle (bridge_connected_slot_releasable). Returns the handle slots
+   released. */
 static size_t bridge_release_wrapper_slot(DomBridge *bridge, size_t slot,
                                           const lxb_dom_node_t *keep,
-                                          BridgeRetiredWrappers *batch)
+                                          BridgeRetiredWrappers *batch,
+                                          bool release_connected)
 {
     lxb_dom_node_t *node = bridge->nodes[slot];
     int64_t handle = bridge_node_handle(bridge, slot);
@@ -965,6 +1251,13 @@ static size_t bridge_release_wrapper_slot(DomBridge *bridge, size_t slot,
         (unsigned char) ~BRIDGE_NODE_LIVE_WRAPPER;
     if ((bridge->node_retention_flags[slot] & BRIDGE_NODE_NATIVE_PIN) != 0
         || bridge_node_is_connected(node)) {
+        if (release_connected
+            && bridge_connected_slot_releasable(bridge, slot, node)) {
+            bridge_release_connected_slot(bridge, slot);
+            return 1;
+        }
+        /* A later owner turn may release it (js_rt_bridge_sweep_node_wrappers). */
+        if (!release_connected) bridge_arm_wrapper_sweep(bridge);
         if (bridge->result != NULL
             && bridge->result->dom_handle_connected_preserves != SIZE_MAX) {
             bridge->result->dom_handle_connected_preserves++;
@@ -1020,7 +1313,7 @@ JSValue js_dom_release_node_wrapper(JSContext *context,
         }
         return JS_FALSE;
     }
-    return bridge_release_wrapper_slot(bridge, slot, NULL, NULL) != 0
+    return bridge_release_wrapper_slot(bridge, slot, NULL, NULL, false) != 0
         ? JS_TRUE : JS_FALSE;
 }
 #endif
@@ -1047,12 +1340,14 @@ static size_t bridge_release_dead_wrappers(DomBridge *bridge,
         if ((bridge->node_retention_flags[slot]
              & BRIDGE_NODE_LIVE_WRAPPER) == 0
             || bridge->nodes[slot] == NULL
-            || !JS_IsObject(bridge->wrapper_refs[slot])) continue;
-        JSValue wrapper = JS_WeakTargetDeref(context, bridge->wrapper_refs[slot]);
+            || bridge->wrapper_refs[slot] == NULL) continue;
+        JSValue wrapper = JS_WeakTargetDeref(context,
+            js_rt_bridge_wrapper_ref(bridge, slot));
         bool live = JS_IsObject(wrapper);
         JS_FreeValue(context, wrapper);
         if (!live)
-            released += bridge_release_wrapper_slot(bridge, slot, keep, &batch);
+            released += bridge_release_wrapper_slot(bridge, slot, keep, &batch,
+                                                    false);
     }
     bridge_retired_wrappers_flush(bridge, &batch);
     return released;
@@ -1073,6 +1368,10 @@ void js_rt_bridge_sweep_node_wrappers(DomBridge *bridge)
         holds_open = bridge_event_retry_open(bridge);
     }
     BridgeRetiredWrappers batch = {.count = 0};
+    /* Only between entries into JavaScript (see
+       bridge_connected_slot_releasable). */
+    bool release_connected = bridge->host->runtime != NULL
+        && !JS_IsStackActive(bridge->host->runtime);
     /* Detached nodes whose event state is still rooted. */
     size_t holds[64], hold_count = 0;
     for (size_t work = 0; work < 64 && bridge->node_wrapper_sweep_remaining != 0;
@@ -1090,14 +1389,27 @@ void js_rt_bridge_sweep_node_wrappers(DomBridge *bridge)
             && bridge->nodes[slot] != NULL
             && !bridge_node_is_connected(bridge->nodes[slot]))
             holds[hold_count++] = slot;
-        if ((bridge->node_retention_flags[slot] & BRIDGE_NODE_LIVE_WRAPPER) == 0
-            || bridge->nodes[slot] == NULL
-            || !JS_IsObject(bridge->wrapper_refs[slot])) continue;
+        if (bridge->nodes[slot] == NULL) continue;
+        if ((bridge->node_retention_flags[slot] & BRIDGE_NODE_LIVE_WRAPPER)
+            == 0) {
+            /* No wrapper since registration, or a dead one a registration's
+               reclaim found mid-task: an owner turn may release it now. */
+            if (release_connected
+                && bridge_connected_slot_releasable(bridge, slot,
+                                                    bridge->nodes[slot])
+                && bridge_node_is_connected(bridge->nodes[slot]))
+                bridge_release_connected_slot(bridge, slot);
+            continue;
+        }
+        if (bridge->wrapper_refs[slot] == NULL) continue;
         JSValue wrapper = JS_WeakTargetDeref(bridge->host->context,
-                                         bridge->wrapper_refs[slot]);
+                                         js_rt_bridge_wrapper_ref(
+                                             bridge, slot));
         bool live = JS_IsObject(wrapper);
         JS_FreeValue(bridge->host->context, wrapper);
-        if (!live) (void) bridge_release_wrapper_slot(bridge, slot, NULL, &batch);
+        if (!live)
+            (void) bridge_release_wrapper_slot(bridge, slot, NULL, &batch,
+                                               release_connected);
     }
     bridge_retired_wrappers_flush(bridge, &batch);
     /* After the releases: a tree they discarded needs no holder. */

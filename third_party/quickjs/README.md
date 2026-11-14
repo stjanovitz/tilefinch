@@ -77,6 +77,7 @@ pinned baseline fingerprint, which already contains them.
 | `add-in-place` | baseline | `OP_add` appends in place to a flat string whose only other reference is the local the next opcode overwrites. | `quickjs-oom` |
 | `locale-date-shape` | baseline | `toLocale*String` on dates produce browser en-US shapes, matching the default `Intl.DateTimeFormat`. | `tilefinch-web-conformance-tests` |
 | `platform-methods` | baseline | `JS_READ_OBJ_PLATFORM_METHODS`: lowercase plain functions in embedder bytecode get no `prototype` and are not constructors, like WebIDL operations. | `tilefinch-web-conformance-tests` |
+| `pinned-atoms` | baseline | `JS_PinAtomTable` interns an embedder atom table at `JS_ATOM_END` and up, first in a runtime and for its lifetime; `JS_WRITE_OBJ_PINNED_ATOMS` names those atoms by index (a marked version byte with the table's count and hash), so `JS_READ_OBJ_ROM_DATA` bytecode with no other atoms runs in place instead of copying its code to relocate atoms. A runtime without the same table refuses such bytecode. | `tilefinch-quickjs-pinned-atoms-tests` |
 | `cleanup-jobs` | baseline | FinalizationRegistry callbacks use a runtime-owned job list drained by `JS_ExecutePendingCleanupJob`; retired realms never run them. | `tilefinch-browser-engine-tests` |
 | `proxy-brand` | baseline | Trap-free `JS_IsProxy`, used by structured clone to reject a Proxy before reflecting over it. | — |
 | `stack-active` | baseline | `JS_GetStackTop` and `JS_IsStackActive`, so the host runs a microtask checkpoint only with an empty script stack. | — |
@@ -120,6 +121,7 @@ pinned baseline fingerprint, which already contains them.
 | `json-direct` | `JSON.parse` tokenizes the string in place instead of a UTF-8 copy, with identical results and errors. | `tilefinch-quickjs-json-parse-tests` |
 | `external-source` | `JS_SetExternalSourceHooks`: a stripped script's functions record offsets into embedder-held text for `toString()` and lazy compiles. | `tilefinch-quickjs-external-source-tests` |
 | `allocation-safety` | Promise result publication retains ownership through refusal; array append publishes length only after storage commits; proxy key tables reject lengths that cannot fit a 32-bit allocation. The noncompact lab variant uses the equivalent `allocation-safety-ordinary` patch. | `tilefinch-quickjs-read-refusal-tests` |
+| `compact-line-tables` | Each function's bytecode-to-source table (pc2line) uses a denser lossless entry encoding: same-line steps in one or two bytes, a step to the next line with its column. Reported lines and columns are those of upstream's encoding; tables take about 73% of upstream's bytes on minified page code. | `tilefinch-quickjs-line-table-tests` |
 
 ## Lab variants
 

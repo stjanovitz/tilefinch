@@ -617,12 +617,16 @@ static void runtime_boot_window_step(ScriptRuntime *runtime)
         runtime->boot_window_active = false;
         runtime->boot_window_returned_advance = runtime->boot_window_advances;
         size_t trimmed = budget_quickjs_pool_trim(runtime->quickjs_pool, 8);
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
         fprintf(stderr,
                 "tilefinch: boot-window returned advance=%llu live=%zu "
                 "base=%zu window=%zu trimmed=%zu\n",
                 (unsigned long long) runtime->boot_window_advances,
                 live, runtime->base_memory_limit,
                 runtime->boot_window_bytes, trimmed);
+#else
+        (void) trimmed;
+#endif
     }
 }
 
@@ -915,6 +919,37 @@ static bool runtime_dispatch_game_audio_completion(ScriptRuntime *runtime,
     return ok;
 }
 
+/* The browser ended capture under this realm's live tracks, or a
+   microphone permission it watches changed: one delivery per call. */
+static bool runtime_dispatch_media_capture(ScriptRuntime *runtime,
+                                           bool *dispatched)
+{
+    *dispatched = false;
+    if (runtime == NULL) return true;
+    uint32_t ended = js_rt_media_capture_take_ended(runtime);
+    if (ended != 0) {
+        if (!JS_IsFunction(runtime->context,
+                           runtime->media_capture_host_event)) return true;
+        /* The trusted-event marker goes with the call, so the module
+           never holds it. */
+        JSValue arguments[2] = {
+            JS_NewUint32(runtime->context, ended),
+            runtime->host_trusted_event
+        };
+        bool ok = runtime_call_captured(
+            runtime, runtime->media_capture_host_event,
+            "media capture ended", 2, arguments, NULL);
+        JS_FreeValue(runtime->context, arguments[0]);
+        *dispatched = true;
+        return ok;
+    }
+    if (!js_rt_media_capture_take_permission_change(runtime)) return true;
+    *dispatched = true;
+    return runtime_call_captured(
+        runtime, runtime->host_callbacks[SCRIPT_HOST_PERMISSIONS_CHANGED],
+        "permission change", 0, NULL, NULL);
+}
+
 static bool runtime_task_slice_available(const ScriptRuntime *runtime,
                                          uint64_t started_ns,
                                          size_t remaining, size_t budget)
@@ -1017,6 +1052,7 @@ bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
 {
     if (runtime == NULL || callback_budget > 1024) return false;
     uint64_t task_slice_started_ns = js_rt_monotonic_time_ns();
+    audio_slots_pump(runtime);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     uint64_t advance_started_ns = js_rt_monotonic_time_ns();
     uint64_t prelude_started_ns = advance_started_ns;
@@ -1170,6 +1206,17 @@ bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
                                            remaining, callback_budget)) {
         bool dispatched = false;
         ok = runtime_dispatch_game_audio_completion(runtime, &dispatched);
+        if (!ok || !dispatched) break;
+        remaining--;
+        ok = js_rt_runtime_run_jobs(runtime);
+    }
+    for (unsigned delivery = 0; delivery < 2u && ok && !classic_continuation
+         && !js_rt_runtime_checkpoint_pending(runtime) && remaining != 0
+         && runtime_task_slice_available(runtime, task_slice_started_ns,
+                                         remaining, callback_budget);
+         delivery++) {
+        bool dispatched = false;
+        ok = runtime_dispatch_media_capture(runtime, &dispatched);
         if (!ok || !dispatched) break;
         remaining--;
         ok = js_rt_runtime_run_jobs(runtime);

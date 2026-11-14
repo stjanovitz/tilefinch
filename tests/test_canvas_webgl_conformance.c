@@ -429,6 +429,93 @@ static bool run_webgl_texture_cache_policy(void)
     return true;
 }
 
+/* A lit draw's index span is kept with its geometry record and recalled
+   only while the record and its exact signature survive: the index
+   buffer's identity words are in the signature, so any write to it (or
+   another buffer bound) misses, and replacement, abandonment or a realm or
+   canvas change forgets the span. */
+static bool run_webgl_geometry_cache_lit_layout(void)
+{
+    ScriptWebglGeometryCacheState cache = {0};
+    ScriptWebglGeometryCacheSignature lit = {{0}}, written = {{0}};
+    lit.words[0] = 21u;
+    lit.words[1] = 5u; /* index buffer id */
+    lit.words[2] = 2u; /* its content generation */
+    written = lit;
+    written.words[2] = 3u;
+    uint32_t base = 0, vertices = 0, indices = 0;
+    size_t slot = SIZE_MAX;
+    bool hit = false, reset = false;
+    CHECK(!script_runtime_webgl_geometry_cache_lit_layout(
+        &cache, 0u, 7u, 41, &lit, &base, &vertices, &indices));
+    CHECK(script_runtime_webgl_geometry_cache_admit(
+        &cache, 0u, 7u, 41, &lit, 1200u, &slot, &hit, &reset) && !hit);
+    /* Admitted without a span: nothing to recall yet. */
+    CHECK(!script_runtime_webgl_geometry_cache_lit_layout(
+        &cache, 0u, 7u, 41, &lit, &base, &vertices, &indices));
+    script_runtime_webgl_geometry_cache_set_lit_layout(&cache, slot, 4u, 30u,
+                                                       36u);
+    CHECK(script_runtime_webgl_geometry_cache_lit_layout(
+        &cache, 0u, 7u, 41, &lit, &base, &vertices, &indices)
+          && base == 4u && vertices == 30u && indices == 36u);
+    /* The recall trusts the identity words, not the bytes: page script can
+       send the same words with other indices, so each rebased index is
+       checked against the recalled span (the lit build then expands the
+       draw). Frame 1 [0,1,2] -> span (0, 3); frame 2 [0,1,60000]. */
+    uint16_t rebased = 0;
+    CHECK(script_runtime_webgl_lit_span_index(base, vertices, 4u, &rebased)
+          && rebased == 0u);
+    CHECK(script_runtime_webgl_lit_span_index(base, vertices, 33u, &rebased)
+          && rebased == 29u);
+    CHECK(!script_runtime_webgl_lit_span_index(base, vertices, 3u, &rebased));
+    CHECK(!script_runtime_webgl_lit_span_index(base, vertices, 34u,
+                                               &rebased));
+    CHECK(script_runtime_webgl_lit_span_index(0u, 3u, 2u, &rebased)
+          && rebased == 2u);
+    CHECK(!script_runtime_webgl_lit_span_index(0u, 3u, 60000u, &rebased));
+    CHECK(!script_runtime_webgl_lit_span_index(0u, 70000u, 66000u,
+                                               &rebased));
+    /* A write to the index buffer is a new generation: no span. */
+    CHECK(!script_runtime_webgl_geometry_cache_lit_layout(
+        &cache, 0u, 7u, 41, &written, &base, &vertices, &indices));
+    /* Another realm or canvas never sees it, and admitting there resets
+       the cache, span and all. */
+    CHECK(!script_runtime_webgl_geometry_cache_lit_layout(
+        &cache, 0u, 8u, 41, &lit, &base, &vertices, &indices));
+    CHECK(!script_runtime_webgl_geometry_cache_lit_layout(
+        &cache, 0u, 7u, 42, &lit, &base, &vertices, &indices));
+    CHECK(script_runtime_webgl_geometry_cache_admit(
+        &cache, 0u, 7u, 42, &written, 1200u, &slot, &hit, &reset) && reset);
+    CHECK(script_runtime_webgl_geometry_cache_admit(
+        &cache, 0u, 7u, 41, &lit, 1200u, &slot, &hit, &reset)
+          && reset && !hit);
+    CHECK(!script_runtime_webgl_geometry_cache_lit_layout(
+        &cache, 0u, 7u, 41, &lit, &base, &vertices, &indices));
+    /* An evicted record takes its span with it: fill every slot so the
+       oldest (the lit record) is replaced. */
+    script_runtime_webgl_geometry_cache_set_lit_layout(&cache, slot, 4u, 30u,
+                                                       36u);
+    for (uint32_t other = 0;
+         other < SCRIPT_WEBGL_GEOMETRY_CACHE_ENTRY_LIMIT; other++) {
+        ScriptWebglGeometryCacheSignature filler = {{0}};
+        filler.words[0] = 100u + other;
+        CHECK(script_runtime_webgl_geometry_cache_admit(
+            &cache, 0u, 7u, 41, &filler, 1200u, &slot, &hit, &reset)
+              && !hit);
+    }
+    CHECK(!script_runtime_webgl_geometry_cache_lit_layout(
+        &cache, 0u, 7u, 41, &lit, &base, &vertices, &indices));
+    /* Readmitting the same signature starts without a span again. */
+    CHECK(script_runtime_webgl_geometry_cache_admit(
+        &cache, 0u, 7u, 41, &lit, 1200u, &slot, &hit, &reset) && !hit);
+    CHECK(!script_runtime_webgl_geometry_cache_lit_layout(
+        &cache, 0u, 7u, 41, &lit, &base, &vertices, &indices));
+    /* An invalid slot is ignored. */
+    script_runtime_webgl_geometry_cache_set_lit_layout(
+        &cache, SCRIPT_WEBGL_GEOMETRY_CACHE_ENTRY_LIMIT, 1u, 1u, 1u);
+    return true;
+}
+
 static bool run_webgl_geometry_cache_admission(void)
 {
     ScriptWebglGeometryCacheState cache = {0};
@@ -495,6 +582,117 @@ static bool run_webgl_geometry_cache_admission(void)
         &cache, 0u, 8u, 41, &first,
         SCRIPT_WEBGL_GEOMETRY_CACHE_BYTE_LIMIT + 1u,
         &slot, &hit, &reset));
+    return run_webgl_geometry_cache_lit_layout();
+}
+
+/* The PSP's geometry cache keys a lit draw's retained block, and the index
+   span validated for it, by the draw's wire signature. That is sound only
+   while the wire's index identity (id, content generation) changes on every
+   write to the bound index buffer: bufferData, bufferSubData, deleting it
+   and binding another, on ordinary frames and on repeated command lists. */
+static bool run_webgl_index_identity_invalidation(void)
+{
+    static const char html[] = "<!doctype html><html><body></body></html>";
+    Budget budget;
+    budget_init(&budget, 24u * MIB);
+    budget_install_lexbor(&budget);
+    PocDocument document;
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    ViewportContext viewport;
+    CHECK(viewport_context_init(&viewport, 480, 272, 480, 272));
+    ScriptExecutionPolicy policy;
+    CHECK(script_execution_policy_for_profile(
+        SCRIPT_EXECUTION_PROFILE_PSP_REALISTIC, &policy));
+    policy.slow_compile_threshold_us = UINT64_MAX;
+    policy.slow_callback_threshold_us = UINT64_MAX;
+    ScriptRuntimeOptions options = {
+        .viewport = viewport,
+        .execution_policy = policy,
+        .defer_document_scripts = true
+    };
+    ScriptResult result;
+    ScriptRuntime *runtime = script_runtime_create_configured(
+        &document, &budget, 16u * MIB, 8000,
+        "https://games.test/index-identity", &options, &result);
+    CHECK(runtime != NULL && result.success);
+    ImageResources images = {.budget = &budget};
+    script_runtime_set_images(runtime, &images);
+    bool evaluated = script_runtime_evaluate_diagnostic(
+        runtime,
+        "const canvas=document.createElement('canvas');"
+        "canvas.width=4;canvas.height=4;document.body.appendChild(canvas);"
+        "const gl=canvas.getContext('webgl');"
+        /* Every indexed draw each flush hands the native renderer: its
+           index identity words (64, 65) in the 96-word command records. */
+        "const seen=[],flush=gl._flushCurrent;"
+        "gl._flushCurrent=function(...rest){const u=this._commandWireU32;"
+        "for(let i=0;i<this._commands.length;i++){const b=4+i*96;"
+        "if(u[b+4]!==0)seen.push(u[b+64]+':'+u[b+65]);}"
+        "return flush.apply(this,rest)};"
+        "const shader=(kind,source)=>{const value=gl.createShader(kind);"
+        "gl.shaderSource(value,source);gl.compileShader(value);return value};"
+        "const program=gl.createProgram();"
+        "gl.attachShader(program,shader(gl.VERTEX_SHADER,"
+        "'attribute vec2 aPosition;void main(){gl_Position=vec4(aPosition,0.,1.);}'));"
+        "gl.attachShader(program,shader(gl.FRAGMENT_SHADER,"
+        "'uniform vec4 uColor;void main(){gl_FragColor=uColor;}'));"
+        "gl.linkProgram(program);gl.useProgram(program);"
+        "gl.uniform4f(gl.getUniformLocation(program,'uColor'),1,0,0,1);"
+        "const vertices=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,vertices);"
+        "gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,0,1,1,1]),"
+        "gl.STATIC_DRAW);"
+        "const position=gl.getAttribLocation(program,'aPosition');"
+        "gl.vertexAttribPointer(position,2,gl.FLOAT,false,0,0);"
+        "gl.enableVertexAttribArray(position);"
+        "const frame=()=>{const at=seen.length;gl.clear(gl.COLOR_BUFFER_BIT);"
+        "gl.drawElements(gl.TRIANGLES,3,gl.UNSIGNED_SHORT,0);gl.finish();"
+        "return seen.length===at+1?seen[at]:'missing'};"
+        "const first=gl.createBuffer();gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,first);"
+        "gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,new Uint16Array([0,1,2]),gl.STATIC_DRAW);"
+        "const k=[frame(),frame()];"
+        "gl.bufferSubData(gl.ELEMENT_ARRAY_BUFFER,0,new Uint16Array([1,2,3]));"
+        "k.push(frame());"
+        "gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,new Uint16Array([0,1,2]),gl.STATIC_DRAW);"
+        "k.push(frame());"
+        "gl.deleteBuffer(first);const second=gl.createBuffer();"
+        "gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,second);"
+        "gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,new Uint16Array([0,1,2]),gl.STATIC_DRAW);"
+        "k.push(frame());"
+        "const third=gl.createBuffer();gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,third);"
+        "gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,new Uint16Array([0,1,2]),gl.STATIC_DRAW);"
+        "k.push(frame());gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,second);k.push(frame());"
+        /* A repeated command list patches the live generation. */
+        "const ext=gl.getExtension('TILEFINCH_repeated_frame_commands');"
+        "ext.begin();gl.clear(gl.COLOR_BUFFER_BIT);"
+        "gl.drawElements(gl.TRIANGLES,3,gl.UNSIGNED_SHORT,0);"
+        "const list=ext.end(new Uint16Array([3,1]));gl.finish();"
+        "const replay=()=>{const at=seen.length;ext.execute(list,new Uint16Array([3,1]));"
+        "gl.finish();return seen.length>at?seen[seen.length-1]:'missing'};"
+        "k.push(replay());"
+        "gl.bufferSubData(gl.ELEMENT_ARRAY_BUFFER,0,new Uint16Array([3,2,1]));"
+        "k.push(replay());"
+        "const bad=[];const ids=k.map(v=>v.split(':').map(Number));"
+        "if(k.some(v=>v==='missing'||v.split(':').some(n=>!(Number(n)>0))))bad.push('zero');"
+        "if(k[0]!==k[1])bad.push('unchanged-redraw');"
+        "if(ids[2][0]!==ids[0][0]||ids[2][1]===ids[1][1])bad.push('subdata');"
+        "if(ids[3][0]!==ids[0][0]||ids[3][1]===ids[2][1])bad.push('data');"
+        "if(ids[4][0]===ids[3][0])bad.push('delete-rebind');"
+        "if(ids[5][0]===ids[4][0])bad.push('other-buffer');"
+        "if(k[6]!==k[4])bad.push('rebind-same');"
+        "if(ids[8][1]===ids[7][1]||ids[8][0]!==ids[7][0])bad.push('repeated-subdata');"
+        "globalThis.pocSummary=bad.length?'BAD '+bad+' '+k.join(','):"
+        "'INDEX-IDENTITY'",
+        "<webgl-index-identity>", &result);
+    if (!evaluated || strcmp(result.summary, "INDEX-IDENTITY") != 0)
+        fprintf(stderr, "index identity: %s (%s)\n", result.summary,
+                result.error);
+    CHECK(evaluated && strcmp(result.summary, "INDEX-IDENTITY") == 0);
+    script_runtime_set_images(runtime, NULL);
+    script_runtime_destroy(runtime);
+    images_destroy(&images);
+    document_destroy(&document);
+    CHECK(budget.current == 0
+          && budget_active_allocations(&budget, NULL) == 0);
     return true;
 }
 
@@ -1358,7 +1556,8 @@ static bool run_deferred_webgl_flush(void)
               "'WEBGL-TERMINAL-RECLAIM-FAIL'",
               "<webgl-terminal-reclaim>", &result)
           && strcmp(result.summary, "WEBGL-TERMINAL-RECLAIMED") == 0);
-    size_t mutations_before_detached = runtime->bridge.mutations.count;
+    size_t mutations_before_detached = runtime->bridge.mutations == NULL
+        ? 0 : runtime->bridge.mutations->count;
     bool detached_evaluated = script_runtime_evaluate_diagnostic(
               runtime,
               "detachedGl.clearColor(.1,.8,.2,1);"
@@ -1382,7 +1581,9 @@ static bool run_deferred_webgl_flush(void)
         fprintf(stderr, "detached WebGL result: %s (%s)\n",
                 result.summary, result.error);
     CHECK(detached_evaluated && strcmp(result.summary, "WEBGL-DETACHED") == 0);
-    CHECK(runtime->bridge.mutations.count == mutations_before_detached);
+    CHECK((runtime->bridge.mutations == NULL
+           ? 0 : runtime->bridge.mutations->count)
+          == mutations_before_detached);
 
     script_runtime_set_images(runtime, NULL);
     script_runtime_destroy(runtime);
@@ -1976,18 +2177,18 @@ static bool run_webgl_shader_diagnostics(void)
         "+'void main(){gl_FragColor=texture2D(uA,vTexCoord)*texture2D(uB,vTexCoord);}',"
         "false,/2 textures are sampled; MAX_TEXTURE_IMAGE_UNITS is 1/);"
         "expect('uniform-branch',colorVs,'uniform float uMode;varying vec4 vColor;'"
-        "+'void main(){if(uMode>.5)gl_FragColor=vColor;else gl_FragColor=vColor;}',"
+        "+'void main(){if(uMode>.5)gl_FragColor=vColor;else gl_FragColor=vColor*.25;}',"
         "true,/^WARNING: fragment shader line 1: 'if' on uniforms is not evaluated/);"
-        "expect('dropped-scale',colorVs,'varying vec4 vColor;\\n'"
-        "+'void main(){gl_FragColor=vColor*0.5;}',true,"
-        "/^WARNING: fragment shader line 2: '0.5' is not applied to gl_FragColor on the PSP$/);"
+        "expect('dropped-factor',colorVs,'varying vec4 vColor;\\n'"
+        "+'void main(){gl_FragColor=vColor*vColor.g;}',true,"
+        "/^WARNING: fragment shader line 2: 'vColor.g' is not applied to gl_FragColor on the PSP$/);"
         "expect('computed-varying',"
         "'attribute vec3 aPosition;attribute vec3 aNormal;attribute vec4 aColor;'"
         "+'uniform mat4 uMatrix;varying vec4 vColor;void main(){'"
         "+'vColor=aColor*max(dot(aNormal,vec3(0.,0.,1.)),0.);'"
         "+'gl_Position=uMatrix*vec4(aPosition,1.);}',"
         "'varying vec4 vColor;void main(){gl_FragColor=vColor;}',true,"
-        "/^WARNING: vertex shader line 1: 'max\\(dot\\(aNormal.*is not applied to varying vColor/);"
+        "/^WARNING: fragment shader: 'max\\(dot\\(aNormal, vec3\\(0, 0, 1\\)\\), 0\\)' is shaded per vertex on the PSP$/);"
         "expect('position-offset',"
         "'attribute vec2 aPosition;uniform vec2 uOffset;uniform vec4 uColor;'"
         "+'void main(){gl_Position=vec4(aPosition+uOffset,0.,1.);}',"
@@ -2040,7 +2241,7 @@ static bool run_webgl_shader_diagnostics(void)
         "true);"
         /* A relink of a reported program does not repeat the console line. */
         "const relinked=build(colorVs,'varying vec4 vColor;'"
-        "+'void main(){gl_FragColor=vColor*0.5;}');const once=warned.length;"
+        "+'void main(){gl_FragColor=vColor*vColor.g;}');const once=warned.length;"
         "gl.linkProgram(relinked);if(warned.length!==once)failures.push('repeat');"
         "gl.deleteProgram(relinked);"
         /* A constant colour is applied exactly instead of drawing white. */
@@ -2058,6 +2259,32 @@ static bool run_webgl_shader_diagnostics(void)
         "gl.readPixels(1,1,1,1,gl.RGBA,gl.UNSIGNED_BYTE,pixel);"
         "if(gl.getProgramInfoLog(constant)!==''||pixel[0]<240||pixel[1]>8"
         "||pixel[2]>8)failures.push('constant='+Array.from(pixel));"
+        /* A numeric scale and a uniform-only select are applied per draw:
+           green vertex colour times 0.5, then times (uMode>.5?1.:.25). */
+        "const colors=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,colors);"
+        "gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([0,1,0,1,0,1,0,1,0,1,0,1]),"
+        "gl.STATIC_DRAW);"
+        "const shade=(label,fs,mode,low,high)=>{const shaded=build(colorVs,fs);"
+        "gl.useProgram(shaded);gl.bindBuffer(gl.ARRAY_BUFFER,buffer);"
+        "const at=gl.getAttribLocation(shaded,'aPosition');"
+        "gl.vertexAttribPointer(at,2,gl.FLOAT,false,0,0);gl.enableVertexAttribArray(at);"
+        "gl.bindBuffer(gl.ARRAY_BUFFER,colors);"
+        "const tint=gl.getAttribLocation(shaded,'aColor');"
+        "gl.vertexAttribPointer(tint,4,gl.FLOAT,false,0,0);"
+        "gl.enableVertexAttribArray(tint);"
+        "if(mode!==undefined)gl.uniform1f(gl.getUniformLocation(shaded,'uMode'),mode);"
+        "gl.clear(gl.COLOR_BUFFER_BIT);gl.drawArrays(gl.TRIANGLES,0,3);gl.finish();"
+        "gl.readPixels(1,1,1,1,gl.RGBA,gl.UNSIGNED_BYTE,pixel);"
+        "if(gl.getProgramInfoLog(shaded)!==''||pixel[0]>8||pixel[1]<low"
+        "||pixel[1]>high||pixel[2]>8)failures.push(label+'='+Array.from(pixel)"
+        "+JSON.stringify(gl.getProgramInfoLog(shaded)));"
+        "gl.disableVertexAttribArray(tint);gl.deleteProgram(shaded);};"
+        "shade('numeric-scale','varying vec4 vColor;void main(){gl_FragColor=vColor*0.5;}',"
+        "undefined,120,136);"
+        "const select='uniform float uMode;varying vec4 vColor;'"
+        "+'void main(){gl_FragColor=vColor*(uMode>.5?1.:.25);}';"
+        "shade('uniform-select-high',select,1,247,255);"
+        "shade('uniform-select-low',select,0,56,72);"
         "if(stats.shaderWarnings!==6||stats.shaderRefusals!==6)"
         "failures.push('counters='+stats.shaderWarnings+'/'+stats.shaderRefusals);"
         "globalThis.pocSummary=failures.length?'SHADER-DIAGNOSTICS:'"
@@ -5744,11 +5971,16 @@ int main(int argc, char **argv)
     if (!run_fixture(
             "webgl-conformance.js", "WEBGL-CONFORMANCE-PASS", false, false))
         return 1;
+    puts("test: built-in material shaders map onto GE lighting, fog, and points");
+    if (!run_fixture(
+            "webgl-materials.js", "WEBGL-MATERIALS-PASS", false, false))
+        return 1;
     puts("test: WebGL triangles sharing edges cover each pixel exactly once");
     if (!run_fixture("webgl-seams.js", "WEBGL-SEAMS-PASS", false, false))
         return 1;
     puts("test: detached WebGL flush retains commands until reattachment");
     if (!run_deferred_webgl_flush()) return 1;
+    if (!run_webgl_index_identity_invalidation()) return 1;
     if (!run_webgl_shader_diagnostics()) return 1;
     puts("test: installable Prism Break exercises levels, input, and effects");
     if (!run_prism_break_game()) return 1;

@@ -7,6 +7,7 @@
 
 #include "tilefinch/browser_engine.h"
 #include "tilefinch/browser_profile.h"
+#include "tilefinch/content_blocker.h"
 #include "tilefinch/psp_ui.h"
 
 /*
@@ -118,6 +119,49 @@ unsigned psp_engine_settings_boot(
 PspSettingResult psp_site_javascript_setting_apply(
     BrowserProfile *profile, BrowserEngine *engine, PspUiState *ui,
     bool enabled);
+/* After a page's scripts ran out of memory (R5): the next visit to its
+   site offers to load it without scripts, never by itself.
+   psp_scripts_off_note_stop() remembers the stop for ui->url's site while
+   its scripts are on (true when the profile changed: mark it dirty).
+   psp_scripts_off_offer_due() says whether ui->url's page should offer:
+   its site was noted and JavaScript is on, globally and for the site.
+   psp_scripts_off_offer_answer() takes the reader's answer and forgets the
+   note either way (another stop notes it again). Accepting turns the
+   site's JavaScript off through psp_site_javascript_setting_apply(); on
+   PSP_SETTING_APPLIED the caller marks the profile dirty and reloads.
+   Declining returns PSP_SETTING_APPLIED when the note was forgotten (mark
+   dirty, no reload), PSP_SETTING_UNCHANGED otherwise. */
+bool psp_scripts_off_note_stop(BrowserProfile *profile, const PspUiState *ui);
+bool psp_scripts_off_offer_due(const BrowserProfile *profile,
+                               const PspUiState *ui);
+PspSettingResult psp_scripts_off_offer_answer(
+    BrowserProfile *profile, BrowserEngine *engine, PspUiState *ui,
+    bool accept);
+/* The offer within one browser session (user decision 2026-11-14): an
+   offer that ends without an answer (it runs out, or the reader goes on to
+   another page) was ignored, and its site does not offer again until the
+   browser restarts. psp_scripts_off_session_due() is
+   psp_scripts_off_offer_due() for a site not ignored this session;
+   psp_scripts_off_session_shown() records the offer just shown for ui->url;
+   psp_scripts_off_session_settle() runs every poll (page_changed when a new
+   page committed) and notes an offer that ended unanswered;
+   psp_scripts_off_session_answered() takes an answer. An answer forgets the
+   site's note either way, so an offer noted as ignored after its answer
+   changes nothing. */
+#define PSP_SCRIPTS_OFF_IGNORED_SITE_LIMIT 8u
+typedef struct {
+    char pending[CONTENT_BLOCKER_HOST_LIMIT];
+    size_t ignored_count;
+    char ignored[PSP_SCRIPTS_OFF_IGNORED_SITE_LIMIT][CONTENT_BLOCKER_HOST_LIMIT];
+} PspScriptsOffSession;
+bool psp_scripts_off_session_due(const PspScriptsOffSession *session,
+                                 const BrowserProfile *profile,
+                                 const PspUiState *ui);
+void psp_scripts_off_session_shown(PspScriptsOffSession *session,
+                                   const PspUiState *ui);
+void psp_scripts_off_session_settle(PspScriptsOffSession *session,
+                                    const PspUiState *ui, bool page_changed);
+void psp_scripts_off_session_answered(PspScriptsOffSession *session);
 /* Basic view fallback: Automatic, Ask or Off, in the profile only. The
    toast names the mode in effect. */
 PspSettingResult psp_basic_fallback_setting_apply(

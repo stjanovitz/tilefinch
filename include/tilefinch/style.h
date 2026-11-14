@@ -2147,8 +2147,8 @@ typedef struct StyleScopes {
     uint64_t adopted_document_mask;
     uint8_t adopted_document_order[64];
     struct StyleAdoptedScopeRoot *adopted_scope_roots;
-    /* Up to DOCUMENT_ADOPTION_ROOT_LIMIT (512) roots: a byte would wrap
-       a full table to zero (asserted in style_sheet.c). */
+    /* Up to DOCUMENT_ADOPTION_ROOT_LIMIT (2048) roots: a byte would wrap
+       a full table to zero (asserted in style_scopes.c). */
     uint16_t adopted_scope_root_count;
     /* A refused scope update must never turn confined rules global. */
     bool adopted_scopes_failed;
@@ -2674,6 +2674,14 @@ typedef struct {
 #define STYLE_SOURCE_NODE_LIMIT 96u
     const lxb_dom_node_t *style_source_nodes[STYLE_SOURCE_NODE_LIMIT];
     unsigned style_source_first_order[STYLE_SOURCE_NODE_LIMIT];
+    /* For a constructed (adopted) source, the text revision its rules were
+       parsed from, and whether that text was plain
+       (stylesheet_constructed_text_plain): what an in-place replacement of
+       the text (CSSStyleSheet.replaceSync) needs to take those rules out
+       after the text itself is gone. Revision 0: not a constructed source,
+       or unknown. */
+    uint32_t style_source_revisions[STYLE_SOURCE_NODE_LIMIT];
+    bool style_source_plain[STYLE_SOURCE_NODE_LIMIT];
     uint8_t style_source_count;
     bool style_sources_bounded_out;
     /* Bumped whenever rules or declarations already in the sheet are
@@ -2718,9 +2726,6 @@ bool stylesheet_end_rule_batch(Stylesheet *sheet);
 bool stylesheet_add_style_element(
     Stylesheet *sheet, lxb_dom_node_t *element,
     const TilefinchContentSecurityPolicy *content_security_policy);
-bool stylesheet_build_viewport(Stylesheet *sheet, Budget *budget,
-                               const PocDocument *document,
-                               int viewport_width, int viewport_height);
 bool stylesheet_add_css(Stylesheet *sheet, const char *css, size_t length);
 void stylesheet_enable_static_custom_element_fallback(Stylesheet *sheet);
 bool stylesheet_add_css_from(Stylesheet *sheet, const char *css,
@@ -2898,11 +2903,24 @@ bool stylesheet_add_adopted_sheets(Stylesheet *sheet,
 void stylesheet_note_style_source(Stylesheet *sheet,
                                   const lxb_dom_node_t *element);
 size_t stylesheet_style_source_count(const Stylesheet *sheet);
+/* Whether a constructed sheet's text contributes nothing to a sheet but
+   its own rules (with their custom-property, transition and revert
+   records) and the keyframes summary, so that removing those rules, or
+   parsing them again at another position, leaves the sheet a build of the
+   new tier would produce. Conservative: any at-rule but @media, @supports
+   and @keyframes refuses (@layer and @font-face order sheet-wide tables
+   by first appearance, @property registers, @container adds query
+   scopes), as do :root rules (they set the sheet-wide variable table,
+   last one wins) and right-to-left or override text (the sheet's bidi
+   summary is never cleared). */
+bool stylesheet_constructed_text_plain(const char *css, size_t length);
+/* The same for `sheet` (a constructed sheet's detached <style>): false
+   when its text cannot be read as one run. */
+bool stylesheet_constructed_sheet_plain(const lxb_dom_node_t *sheet);
 void stylesheet_append_result_release(Stylesheet *sheet,
                                       StylesheetAppendResult *result);
 bool stylesheet_style_source_known(const Stylesheet *sheet,
                                    const lxb_dom_node_t *element);
-const lxb_dom_node_t *stylesheet_last_style_source(const Stylesheet *sheet);
 /* Whether any of the rules at these indices can affect display/visibility
    or supply an image (see stylesheet_tokens_may_affect_discovery). */
 bool stylesheet_rules_affect_discovery(const Stylesheet *sheet,

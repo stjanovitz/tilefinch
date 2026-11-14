@@ -5204,24 +5204,6 @@ int main(void)
     media_playback_destroy(playback);
     media_mp4_close(demux);
 
-    puts("test: a seek warms on its own clock, not the open's");
-    /* The budget a seek hands a blocking read is what its decode leg used to
-       spend failing, and it only ever shrinks. Spent in full it reaches zero
-       -- "no budget left" -- which the source turns into an immediate refusal
-       rather than one more per-window wait; the warm is best effort, so that
-       costs the first playing frames a fetch and never costs the seek. */
-    CHECK(psp_media_seek_wait_budget_us(0, UINT64_C(9000000))
-              == PSP_MEDIA_SEEK_TIMEOUT_US
-          && psp_media_seek_wait_budget_us(
-                 UINT64_C(1000000), UINT64_C(1002000))
-              == PSP_MEDIA_SEEK_TIMEOUT_US - UINT64_C(2000)
-          && psp_media_seek_wait_budget_us(
-                 UINT64_C(1000000),
-                 UINT64_C(1000000) + PSP_MEDIA_SEEK_TIMEOUT_US) == 0
-          && psp_media_seek_wait_budget_us(
-                 UINT64_C(9000000), UINT64_C(1000000))
-              == PSP_MEDIA_SEEK_TIMEOUT_US);
-
     puts("test: the soak's seek target follows its configured fraction");
     /* 667 reproduces the two thirds the fraction was hardcoded to, on the
        exact duration the soak measured: 252261000us -> 168174087us, the

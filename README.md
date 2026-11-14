@@ -162,7 +162,7 @@ instructions rather than reporting a generic video failure.
 | Select | Menu: Home, Tabs, Page tools, Library, Settings, Help & diagnostics, Exit to XMB |
 | Start + Select (hold together) | Give the controls to the page's JavaScript; hold again to take them back |
 | L / R | Page up / page down |
-| L held at boot | Safe start: boot the previous version (once an update has been installed) |
+| L held at boot | Safe start: boot the previous version (once an update has finished its first start) |
 
 Type a URL in the address bar to go there, or anything else to search.
 
@@ -215,7 +215,9 @@ off; Tilefinch never downloads or installs an update unless you ask.
   unsigned and trusts the endpoint you configure.
 - A new version installs into a second slot and boots as a trial. If it
   fails to start properly, the launcher returns to the version that worked,
-  and holding L at boot always starts the previous version.
+  and holding L at boot starts the previous version. Until a new version
+  has finished its first start, L starts the version you were running and
+  never the new one.
 - On Stable, press Square on the update page to choose an older signed
   release. It installs into the inactive slot and must pass the same trial
   boot.

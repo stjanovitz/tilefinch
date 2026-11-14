@@ -3,6 +3,10 @@
      native and budget-charged; JavaScript retains only fixed metadata and a
      four-voice graph. The context never starts audio without trusted input. */
   const nativeDecode = globalThis.__tilefinchGameAudioDecode,
+    /* Loaded on first use, after author code may have replaced Event and
+       EventTarget: build and extend what hardening.js captured. */
+    createEvent = globalThis.__tilefinchCreateEvent,
+    { EventTarget } = globalThis.__tilefinchEventInterfaces,
     nativeCommand = globalThis.__tilefinchGameAudioCommand,
     nodeLimit = 16,
     contextStates = new WeakMap(),
@@ -425,7 +429,7 @@
       }
     }
     _stateChanged() {
-      const event = new Event("statechange"), handler = this.onstatechange;
+      const event = createEvent("statechange"), handler = this.onstatechange;
       this.dispatchEvent(event);
       if (typeof handler === "function")
         try {
@@ -533,7 +537,7 @@
       sourcesByVoice.delete(handle);
       source._voice = 0;
       stateFor(source.context).mixGraphRevision++;
-      const event = new Event("ended"), handler = source.onended;
+      const event = createEvent("ended"), handler = source.onended;
       source.dispatchEvent(event);
       if (typeof handler === "function")
         try {

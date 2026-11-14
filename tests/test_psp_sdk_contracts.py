@@ -1863,12 +1863,80 @@ int main(void) {
         self.assertIn("sceKernelQueryModuleInfo", loader)
         self.assertIn("TILEFINCH_STT_RESIDENT_LIMIT - resident", loader)
 
-    def test_game_profile_v1_matches_runtime_ceiling_contracts(self):
-        profile_path = ROOT / "docs/tilefinch-game-profile-v1.json"
+    def test_game_profile_v1_is_released_and_v1_1_satisfies_it(self):
+        # v1 is a published contract: its companion stays byte-identical.
+        v1_path = ROOT / "docs/tilefinch-game-profile-v1.json"
+        self.assertEqual(
+            hashlib.sha256(v1_path.read_bytes()).hexdigest(),
+            "45ffe6f2235915caff1291f21684bd30e5c0cae3361d26713d0495b7ef58966c")
+        v1 = json.loads(v1_path.read_text(encoding="utf-8"))
+        v11 = json.loads((ROOT / "docs/tilefinch-game-profile-v1.1.json")
+                         .read_text(encoding="utf-8"))
+        self.assertEqual(v1["profile_id"], "tilefinch-game-profile-v1")
+        self.assertEqual(v1["version"], 1)
+        self.assertEqual(v1["limits"]["webgl"]["shader_source_bytes_each"],
+                         16 * 1024)
+        self.assertEqual(v1["limits"]["webgl"]["vertex_uniform_vectors"], 16)
+        self.assertEqual(v1["limits"]["webgl"]["fragment_uniform_vectors"], 4)
+        self.assertEqual(v1["limits"]["webgl"]["varying_vectors"], 2)
+
+    def test_game_profile_v1_1_satisfies_v1(self):
+        v1 = json.loads((ROOT / "docs/tilefinch-game-profile-v1.json")
+                        .read_text(encoding="utf-8"))
+        v11 = json.loads((ROOT / "docs/tilefinch-game-profile-v1.1.json")
+                         .read_text(encoding="utf-8"))
+        self.assertNotIn("web_audio_automation", v1["limits"])
+        self.assertEqual(v11["satisfies"], ["tilefinch-game-profile-v1"])
+        # Every v1 ceiling exists in v1.1 and is at least as large, so a v1
+        # game fits v1.1; everything outside the WebGL and Web Audio API
+        # descriptions is unchanged.
+        for category, ceilings in v1["limits"].items():
+            for key, value in ceilings.items():
+                with self.subTest(limit=f"{category}.{key}"):
+                    self.assertIn(key, v11["limits"][category])
+                    if isinstance(value, (int, float)):
+                        self.assertGreaterEqual(
+                            v11["limits"][category][key], value)
+                    else:
+                        self.assertEqual(v11["limits"][category][key], value)
+        for key, value in v1.items():
+            if key in ("profile_id", "limits", "apis"):
+                continue
+            self.assertEqual(v11[key], value, key)
+        for name, api in v1["apis"].items():
+            if name not in ("webgl", "web_audio"):
+                self.assertEqual(v11["apis"][name], api, name)
+        # Web Audio v1.1 keeps every v1 node, format and activation rule;
+        # the v1 curves and target ramps are among its automated parameters.
+        audio_v1, audio_v11 = v1["apis"]["web_audio"], v11["apis"]["web_audio"]
+        for key in ("status", "trusted_activation_required",
+                    "resume_without_activation_rejects", "decoded_formats"):
+            self.assertEqual(audio_v11[key], audio_v1[key], key)
+        self.assertLessEqual(set(audio_v1["interfaces"]),
+                            set(audio_v11["interfaces"]))
+        self.assertLessEqual(
+            set(audio_v1["native_value_curves"])
+            | set(audio_v1["native_target_ramps"]),
+            set(audio_v11["automated_parameters"]))
+        self.assertIn("setValueCurveAtTime", audio_v11["automation_methods"])
+        self.assertIn("setTargetAtTime", audio_v11["automation_methods"])
+        webgl_v1, webgl_v11 = v1["apis"]["webgl"], v11["apis"]["webgl"]
+        for key in webgl_v1:
+            self.assertIn(key, webgl_v11)
+        self.assertEqual(webgl_v11["extensions"], webgl_v1["extensions"])
+        narrowed = {"discard": "discard_except_uniform_alpha_test",
+                    "mipmaps": "mipmap_levels"}
+        self.assertEqual(webgl_v11["unsupported"],
+                         [narrowed.get(item, item)
+                          for item in webgl_v1["unsupported"]])
+
+    def test_game_profile_v1_1_matches_runtime_ceiling_contracts(self):
+        profile_path = ROOT / "docs/tilefinch-game-profile-v1.1.json"
         profile = json.loads(profile_path.read_text(encoding="utf-8"))
         self.assertEqual(profile["profile_id"],
-                         "tilefinch-game-profile-v1")
+                         "tilefinch-game-profile-v1.1")
         self.assertEqual(profile["version"], 1)
+        self.assertEqual(profile["minor_version"], 1)
         self.assertEqual(profile["authority"], "docs/GAME_PROFILE.md")
 
         engine_header = (ROOT / "include/tilefinch/browser_engine.h").read_text(
@@ -1909,7 +1977,7 @@ int main(void) {
             "texture_objects": 8,
             "texture_bytes_total": 416 * 1024,
             "shader_objects": 16,
-            "shader_source_bytes_each": 16 * 1024,
+            "shader_source_bytes_each": 64 * 1024,
             "program_objects": 8,
             "vertex_array_objects": 8,
             "draw_command_template_words": 96,
@@ -1927,10 +1995,24 @@ int main(void) {
             "maximum_pixels": 131072,
             "vertex_attributes": 8,
             "texture_image_units": 1,
-            "varying_vectors": 2,
-            "vertex_uniform_vectors": 16,
-            "fragment_uniform_vectors": 4,
+            "varying_vectors": 8,
+            "vertex_uniform_vectors": 128,
+            "fragment_uniform_vectors": 16,
+            "per_vertex_program_steps": 32,
+            "per_vertex_program_constant_vectors": 15,
+            "per_vertex_program_steps_per_draw": 65536,
         })
+        # The per-vertex program bounds are enforced by the translator and
+        # again by the native interpreter.
+        webgl_js = (ROOT / "src/bootstrap/webgl.js").read_text(encoding="utf-8")
+        bridge = (ROOT / "src/js_webgl_bridge.c").read_text(encoding="utf-8")
+        for needle in ("PROGRAM_STEPS = 32, PROGRAM_CONSTANTS = 15",
+                       "MATERIAL_PROGRAM_STEP_LIMIT = 65536"):
+            self.assertIn(needle, webgl_js)
+        for name, value in (("WEBGL_PROGRAM_STEPS", 32),
+                            ("WEBGL_PROGRAM_CONSTANTS", 15),
+                            ("WEBGL_PROGRAM_STEP_LIMIT", 65536)):
+            self.assertEqual(header_integer(bridge, name), value)
         self.assertEqual(profile["limits"]["web_audio"], {
             "contexts": 1,
             "decoded_buffers": 8,
@@ -1947,6 +2029,65 @@ int main(void) {
             "channels": [1, 2],
             "sample_bits": [8, 16],
         })
+        audio_header = (ROOT / "include/tilefinch/game_audio.h").read_text(
+            encoding="utf-8")
+        timeline_header = (ROOT / "include/tilefinch/game_audio_timeline.h"
+                           ).read_text(encoding="utf-8")
+        self.assertEqual(profile["limits"]["web_audio_automation"], {
+            "events_per_parameter": header_integer(
+                timeline_header, "TILEFINCH_AUDIO_TIMELINE_EVENT_LIMIT"),
+            "automated_parameters": header_integer(
+                audio_header, "TILEFINCH_GAME_AUDIO_LANE_LIMIT"),
+            "automated_gains_per_source": header_integer(
+                audio_header, "TILEFINCH_GAME_AUDIO_PROGRAM_GAIN_LANES"),
+            "nodes_per_source_chain": 8,
+            "created_buffer_minimum_sample_rate_hz": header_integer(
+                audio_header, "TILEFINCH_GAME_AUDIO_BUFFER_RATE_MIN"),
+            "created_buffer_maximum_sample_rate_hz": header_integer(
+                audio_header, "TILEFINCH_GAME_AUDIO_BUFFER_RATE_MAX"),
+            "float_buffer_bytes_per_sample": 4,
+            "filter_coefficient_frames": header_integer(
+                audio_header, "TILEFINCH_GAME_AUDIO_FILTER_FRAMES"),
+        })
+        self.assertEqual(profile["apis"]["web_audio"]["interfaces"][-4:],
+                         ["BiquadFilterNode", "AudioBuffer",
+                          "MediaStreamAudioSourceNode", "AnalyserNode"])
+        # Both chain walks (program and analyser taps) stop at eight nodes.
+        slots = (ROOT / "src/js_runtime/game_audio_slots.inc").read_text(
+            encoding="utf-8")
+        self.assertEqual(slots.count(
+            "!JS_IsUndefined(target) && visits < 8; visits++"), 2)
+        fft_max = header_integer(audio_header,
+                                 "TILEFINCH_GAME_AUDIO_FFT_SIZE_MAX")
+        ring = header_integer(audio_header,
+                              "TILEFINCH_GAME_AUDIO_STREAM_SAMPLES")
+        self.assertEqual(profile["limits"]["web_audio_analysis"], {
+            "analysers_per_context": header_integer(
+                audio_header, "TILEFINCH_GAME_AUDIO_ANALYSER_LIMIT"),
+            "fft_size_minimum": 32,
+            "fft_size_maximum": fft_max,
+            "fft_size_not_supported_maximum": 32768,
+            "analyser_history_samples": header_integer(
+                audio_header, "TILEFINCH_GAME_AUDIO_ANALYSER_HISTORY"),
+            "spectrum_bytes_per_analyser": fft_max // 2 * 4,
+            "analysis_scratch_bytes": 3 * fft_max * 4,
+            "media_stream_ring_samples": ring,
+            "media_stream_prefill_samples": header_integer(
+                audio_header, "TILEFINCH_GAME_AUDIO_STREAM_PREFILL"),
+            "media_stream_burst_samples": ring // 2,
+            "media_stream_sources_count_as_voices": True,
+        })
+        for needle in ("3u * TILEFINCH_GAME_AUDIO_FFT_SIZE_MAX * sizeof(float)",
+                       "TILEFINCH_GAME_AUDIO_FFT_SIZE_MAX / 2 * sizeof(float)",
+                       "size < 32 || size > 32768"):
+            self.assertIn(needle, slots)
+        self.assertIn("count > TILEFINCH_GAME_AUDIO_STREAM_SAMPLES / 2u",
+                      (ROOT / "src/game_audio_program.inc").read_text(
+                          encoding="utf-8"))
+        self.assertEqual(profile["apis"]["web_audio"]["media_stream_output"],
+                         "headphones_only")
+        self.assertEqual(profile["apis"]["web_audio"][
+            "immediate_only_parameters"], ["StereoPannerNode.pan"])
         self.assertEqual(profile["limits"]["offline_installation"], {
             "manifest_bytes": 64 * 1024,
             "document_bytes": 1024 * 1024,
@@ -2040,7 +2181,10 @@ int main(void) {
             "MAX_VERTEX_ARRAY_OBJECTS = 8",
             "MAX_FRAMEBUFFER_OBJECTS = 4",
             "MAX_RENDERBUFFER_OBJECTS = 4",
-            "MAX_SHADER_BYTES = 16 * 1024",
+            "MAX_SHADER_BYTES = 64 * 1024",
+            "MAX_VERTEX_UNIFORM_VECTORS = 128",
+            "MAX_FRAGMENT_UNIFORM_VECTORS = 16",
+            "MAX_VARYING_VECTORS = 8",
             "MAX_DRAWS = 64",
             "MAX_INSTANCES = 64",
             "MAX_VERTICES = 4096",
@@ -2137,8 +2281,10 @@ int main(void) {
 
         docs_map = (ROOT / "docs/README.md").read_text(encoding="utf-8")
         guide = (ROOT / "docs/GAME_PROFILE.md").read_text(encoding="utf-8")
-        self.assertIn("[Game Profile v1](GAME_PROFILE.md)", docs_map)
+        self.assertIn("[Game Profile v1.1](GAME_PROFILE.md)", docs_map)
+        self.assertIn("tilefinch-game-profile-v1.json", docs_map)
         self.assertIn("tilefinch-game-profile-v1.json", guide)
+        self.assertIn("tilefinch-game-profile-v1.1.json", guide)
 
     def test_page_fullscreen_retracts_chrome_before_its_first_present(self):
         # Page script enters fullscreen during dispatch or the runtime
@@ -3690,7 +3836,7 @@ int main(void) {
         self.assertIn(
             ".write_failure_report = psp_media_platform_write_failure_report",
             main)
-        self.assertIn('detail=%.1023s', main)
+        self.assertIn('strnlen(detail, 1023u)', main)
 
     def test_manual_media_retry_remembers_failure_position(self):
         source = without_comments(
@@ -3876,7 +4022,7 @@ int main(void) {
         self.assertIn("psp_controller_take_latched_pressed()", tick)
         self.assertIn("PSP_SUPERVISOR_PAGE_INPUT_LIMIT", tick)
         self.assertLess(tick.index("cooperate->pending_page_input"),
-                        tick.index('"BUSY - CIRCLE CANCELS"'))
+                        tick.index('"BUSY  O CANCEL"'))
         end = runtime[
             runtime.index("void psp_navigation_cooperate_end("):
             runtime.index("bool psp_navigation_cooperate_take_media_intent(")]
@@ -11228,8 +11374,8 @@ class QuickJsVariantPreparationTests(unittest.TestCase):
         dependencies = (ROOT / "cmake/TilefinchDependencies.cmake").read_text()
         # Exercise the production preparation block in a disposable, dependency-
         # free CMake project; never alter a shared engine or build tree.
-        block = dependencies.split("if(PSP_BROWSER_USE_BELLARD_QUICKJS)\n    # The engine", 1)[1]
-        block = "if(PSP_BROWSER_USE_BELLARD_QUICKJS)\n    # The engine" + block.split("    add_library(qjs STATIC", 1)[0] + "endif()\n"
+        block = dependencies.split("\n# The engine is vendored", 1)[1]
+        block = "# The engine is vendored" + block.split("\nadd_library(qjs STATIC", 1)[0] + "\n"
         with tempfile.TemporaryDirectory() as temporary:
             source, build = Path(temporary) / "source", Path(temporary) / "build"
             vendor = source / "third_party/quickjs"
@@ -11238,7 +11384,6 @@ class QuickJsVariantPreparationTests(unittest.TestCase):
             (source / "CMakeLists.txt").write_text(
                 'cmake_minimum_required(VERSION 3.24)\nproject(qjs_review NONE)\n'
                 'find_program(PATCH_EXECUTABLE patch REQUIRED)\n'
-                'set(PSP_BROWSER_USE_BELLARD_QUICKJS ON)\n'
                 'option(PSP_BROWSER_QUICKJS_CAPTURE_GETTER_FASTPATH "" OFF)\n'
                 'option(PSP_BROWSER_QUICKJS_COMPACT_CHAR_ARRAY "" ON)\n'
                 'option(PSP_BROWSER_JS_PROPERTY_FAULT_TRACE "" OFF)\n' + block +

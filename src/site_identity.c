@@ -6,25 +6,47 @@
 #include <string.h>
 #include <strings.h>
 
-/* One browsing session per process: the opt-in lasts until the browser
-   restarts. The PSP frontend is single-threaded for navigation, and every
-   reader runs on the browser thread. */
+/* One browsing session per process: the opt-in and an accounts refusal
+   last until the browser restarts. The PSP frontend is single-threaded for
+   navigation, and every reader runs on the browser thread. */
 static struct {
     bool google_opted_in;
     bool google_refusal_note;
+    bool accounts_refused;
     char google_fallback[TILEFINCH_URL_SERIALIZED_LIMIT];
 } site_identity_state;
 
-static bool site_identity_parse_google(const char *url, TilefinchUrl *parsed)
+typedef enum {
+    SITE_IDENTITY_OTHER,
+    SITE_IDENTITY_GOOGLE,
+    SITE_IDENTITY_ACCOUNTS
+} SiteIdentityHost;
+
+static bool site_identity_host_is(const TilefinchUrl *parsed,
+                                  const char *name)
+{
+    size_t length = strlen(name);
+    return parsed->host_length == length
+        && strncasecmp(parsed->value + parsed->host_offset, name,
+                       length) == 0;
+}
+
+static SiteIdentityHost site_identity_parse(const char *url,
+                                            TilefinchUrl *parsed)
 {
     if (url == NULL || !tilefinch_url_parse(url, parsed)
-        || parsed->explicit_port || parsed->ipv6_literal) return false;
-    const char *host = parsed->value + parsed->host_offset;
-    size_t length = parsed->host_length;
-    return (length == sizeof("google.com") - 1u
-            && strncasecmp(host, "google.com", length) == 0)
-        || (length == sizeof("www.google.com") - 1u
-            && strncasecmp(host, "www.google.com", length) == 0);
+        || parsed->explicit_port || parsed->ipv6_literal)
+        return SITE_IDENTITY_OTHER;
+    if (site_identity_host_is(parsed, "google.com")
+        || site_identity_host_is(parsed, "www.google.com"))
+        return SITE_IDENTITY_GOOGLE;
+    return site_identity_host_is(parsed, "accounts.google.com")
+        ? SITE_IDENTITY_ACCOUNTS : SITE_IDENTITY_OTHER;
+}
+
+static bool site_identity_parse_google(const char *url, TilefinchUrl *parsed)
+{
+    return site_identity_parse(url, parsed) == SITE_IDENTITY_GOOGLE;
 }
 
 bool site_identity_google_host(const char *url)
@@ -121,20 +143,84 @@ bool site_identity_take_google_opt_in_marker(
     return true;
 }
 
+bool site_identity_accounts_host(const char *url)
+{
+    TilefinchUrl parsed;
+    return site_identity_parse(url, &parsed) == SITE_IDENTITY_ACCOUNTS;
+}
+
 const char *site_identity_user_agent_override(const char *document_url)
 {
-    return site_identity_state.google_opted_in
-            && site_identity_google_host(document_url)
-        ? TILEFINCH_GOOGLE_USER_AGENT : NULL;
+    TilefinchUrl parsed;
+    SiteIdentityHost host = site_identity_parse(document_url, &parsed);
+    bool honest = host == SITE_IDENTITY_ACCOUNTS
+        ? !site_identity_state.accounts_refused
+        : host == SITE_IDENTITY_GOOGLE && site_identity_state.google_opted_in;
+    return honest ? TILEFINCH_GOOGLE_USER_AGENT : NULL;
+}
+
+bool site_identity_user_agent_derived(const char *user_agent)
+{
+    return user_agent == NULL
+        || strcmp(user_agent, TILEFINCH_GOOGLE_USER_AGENT) == 0;
+}
+
+static bool site_identity_path_starts(const TilefinchUrl *parsed,
+                                      const char *prefix)
+{
+    size_t length = strlen(prefix);
+    return parsed->path_length >= length
+        && memcmp(parsed->value + parsed->path_offset, prefix, length) == 0;
 }
 
 static bool site_identity_google_sorry(const char *url)
 {
     TilefinchUrl parsed;
     return site_identity_parse_google(url, &parsed)
-        && parsed.path_length >= sizeof("/sorry/") - 1u
-        && memcmp(parsed.value + parsed.path_offset, "/sorry/",
-                  sizeof("/sorry/") - 1u) == 0;
+        && site_identity_path_starts(&parsed, "/sorry/");
+}
+
+/* An accounts.google.com page that only says Google refused the browser. */
+static bool site_identity_accounts_refusal_page(const TilefinchUrl *parsed)
+{
+    return site_identity_path_starts(parsed, "/signin/rejected")
+        || site_identity_path_starts(parsed, "/v3/signin/rejected")
+        || site_identity_path_starts(parsed, "/sorry/");
+}
+
+bool site_identity_accounts_refusal(
+    const char *request_url, const char *source_url,
+    const char *effective_url, long status)
+{
+    if (site_identity_state.accounts_refused) return false;
+    TilefinchUrl parsed;
+    /* Redirect hops take their target's identity, so the final response
+       answered the honest UA exactly when it came from accounts. */
+    if (site_identity_parse(effective_url, &parsed) == SITE_IDENTITY_ACCOUNTS)
+        return status == 429 || site_identity_accounts_refusal_page(&parsed);
+    if (!site_identity_google_sorry(effective_url)) return false;
+    return site_identity_accounts_host(request_url)
+        || (site_identity_accounts_host(source_url)
+            && site_identity_google_sorry(request_url));
+}
+
+void site_identity_accounts_refused(const char *reload_url,
+                                    const char *source_url)
+{
+    site_identity_state.accounts_refused = true;
+    site_identity_state.google_fallback[0] = '\0';
+    const char *const candidates[] = {reload_url, source_url};
+    for (size_t i = 0; i < 2u; i++) {
+        TilefinchUrl parsed;
+        const char *url = candidates[i];
+        if (site_identity_parse(url, &parsed) != SITE_IDENTITY_ACCOUNTS
+            || site_identity_accounts_refusal_page(&parsed)
+            || strlen(url) >= sizeof(site_identity_state.google_fallback))
+            continue;
+        snprintf(site_identity_state.google_fallback,
+                 sizeof(site_identity_state.google_fallback), "%s", url);
+        return;
+    }
 }
 
 bool site_identity_google_refusal(
@@ -159,7 +245,8 @@ void site_identity_google_refused(const char *search_url)
 {
     site_identity_state.google_opted_in = false;
     site_identity_state.google_refusal_note = true;
-    site_identity_state.google_fallback[0] = '\0';
+    /* Without a search, keep a fallback an accounts refusal of the same
+       navigation recorded; each navigation starts with none. */
     if (site_identity_google_search_url(search_url)
         && strlen(search_url) < sizeof(site_identity_state.google_fallback))
         snprintf(site_identity_state.google_fallback,

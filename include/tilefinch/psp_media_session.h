@@ -597,7 +597,6 @@ bool psp_media_record_resume(PspMediaSession *media, bool persist);
  */
 void psp_media_suspend(PspMediaSession *media);
 void psp_media_resume(PspMediaSession *media);
-bool psp_media_system_suspended(const PspMediaSession *media);
 bool psp_media_open_work_pending(const PspMediaSession *media);
 /* A playback continuing across a pipeline rebuild whose timeline still takes
  * input: scrub, commit, cancel, play/pause (psp_media_scrub.h). */

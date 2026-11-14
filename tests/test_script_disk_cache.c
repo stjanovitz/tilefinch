@@ -8,6 +8,7 @@
    device path on host builds, and the test checks that it does. */
 #include "tilefinch/document.h"
 #include "tilefinch/js_runtime.h"
+#include "tilefinch/navigation.h"
 #include "tilefinch/session.h"
 #include "tilefinch/session_persistence.h"
 #include "tilefinch/url.h"
@@ -997,7 +998,7 @@ static int test_device_paths_refused(void)
 
 /* ---- modules ---- */
 
-#define MODULE_LIMIT 4u
+#define MODULE_LIMIT 8u
 
 typedef struct {
     const char *url[MODULE_LIMIT];
@@ -1166,6 +1167,474 @@ static int test_oversized_record_stays_in_ram(void)
     return 0;
 }
 
+/* ---- modules past the RAM table's ceiling ---- */
+
+/* A module of about `minimum` bytes that exports `name` and imports `deps`
+   (an import list, or ""). Caller frees. */
+static char *make_module(const char *tag, size_t minimum, const char *imports,
+                         const char *exports)
+{
+    char *body = make_script(tag, minimum);
+    if (body == NULL) return NULL;
+    size_t capacity = strlen(body) + strlen(imports) + strlen(exports) + 8u;
+    char *module = malloc(capacity);
+    if (module != NULL)
+        snprintf(module, capacity, "%s\n%s\n%s\n", imports, body, exports);
+    free(body);
+    return module;
+}
+
+/* A module table this small holds about one of these modules, so most of a
+   load's records can only reach the card through the write queue. */
+#define SMALL_MODULE_TABLE (20u * KIB)
+
+static bool small_table_session(PageFixture *fixture, BrowserSession *session,
+                                const char *directory)
+{
+    if (!session_start(fixture, session, directory, true)) return false;
+    browser_session_module_bytecode_set_limit(session, SMALL_MODULE_TABLE);
+    return true;
+}
+
+static void report_modules(const char *what, const ScriptResult *result,
+                           const BrowserSession *session)
+{
+    BrowserScriptDiskStats stats;
+    browser_session_script_disk_stats(session, &stats);
+    fprintf(stderr, "%s: summary=%s compiles=%zu hits=%zu misses=%zu "
+            "stores=%zu queued=%zu skips=%zu disk-hits=%zu direct=%zu "
+            "writes=%zu files=%zu queue-drops=%zu error=%s\n", what,
+            result->summary, result->module_compile_count,
+            result->module_bytecode_cache_hits,
+            result->module_bytecode_cache_misses,
+            result->module_bytecode_cache_stores,
+            result->module_bytecode_cache_disk_queued,
+            result->module_bytecode_cache_admission_skips,
+            result->script_bytecode_disk_hits, stats.direct_reads,
+            stats.writes, stats.files, stats.queue_drops, result->error);
+}
+
+/* Four modules whose bytecode is several times the module table: the
+   records the table cannot keep (the load's own records are never evicted
+   for one another) are queued and written at idle, so a restarted browser
+   restores all four from the card, the ones RAM has no room for straight
+   from their packs, and compiles nothing. A source change then misses for
+   that module alone, and its new pack replaces the old one. */
+static int test_modules_past_ram_ceiling_restore_after_restart(void)
+{
+    PageFixture fixture;
+    CHECK(page_open(&fixture));
+    char directory[600];
+    fresh_directory(directory, sizeof(directory));
+    char *a = make_module("ma", 14u * KIB, "", "export const a=f2(3).length;");
+    char *b = make_module("mb", 14u * KIB, "",
+                          "export const b=f3(4).length;");
+    char *c = make_module("mc", 14u * KIB, "",
+                          "export const c=f1(5).length;");
+    char *b2 = make_module("mB", 14u * KIB, "",
+                           "export const b=f3(4).length+1000;");
+    CHECK(a != NULL && b != NULL && c != NULL && b2 != NULL);
+    ModuleMap map = {
+        .url = {"https://mod.test/a.js", "https://mod.test/b.js",
+                "https://mod.test/c.js"},
+        .source = {a, b, c},
+        .count = 3
+    };
+    static const char root[] =
+        "import {a} from './a.js';import {b} from './b.js';"
+        "import {c} from './c.js';"
+        "globalThis.pocSummary='MOD:'+a+':'+b+':'+c";
+    BrowserSession session;
+    CHECK(small_table_session(&fixture, &session, directory));
+    ScriptResult first;
+    bool ok = module_visit(&fixture, &map, root, &first);
+    if (!ok || first.module_bytecode_cache_disk_queued < 2)
+        report_modules("first visit", &first, &session);
+    CHECK(ok && strncmp(first.summary, "MOD:", 4) == 0
+          && first.module_bytecode_cache_misses == 4
+          && first.module_bytecode_cache_disk_queued >= 2
+          && first.module_bytecode_cache_stores
+                 + first.module_bytecode_cache_disk_queued == 4
+          && first.module_bytecode_cache_admission_skips == 0);
+    /* Nothing reaches the card before idle work; then every record does. */
+    CHECK(count_files(directory, ".tfsc", NULL, 0) == 0
+          && browser_session_script_disk_queue_count(&session) >= 2);
+    (void) idle(&session, 1000);
+    CHECK(count_files(directory, ".tfsc", NULL, 0) == 4
+          && browser_session_script_disk_queue_count(&session) == 0
+          && browser_session_script_disk_queue_bytes(&session) == 0);
+    browser_session_destroy(&session);
+
+    /* Restart. */
+    CHECK(small_table_session(&fixture, &session, directory));
+    ScriptResult second;
+    ok = module_visit(&fixture, &map, root, &second);
+    BrowserScriptDiskStats stats;
+    browser_session_script_disk_stats(&session, &stats);
+    if (!ok || second.module_compile_count != 0)
+        report_modules("restart", &second, &session);
+    CHECK(ok && strcmp(second.summary, first.summary) == 0
+          && second.module_compile_count == 0
+          && second.module_bytecode_cache_hits == 4
+          && second.script_bytecode_disk_hits == 4
+          && stats.direct_reads >= 2 && stats.queued == 0);
+    /* The records restored straight from their packs are kept nowhere. */
+    CHECK(browser_session_module_bytecode_bytes(&session)
+              <= SMALL_MODULE_TABLE);
+    browser_session_destroy(&session);
+
+    /* Changed source: b misses (and runs its new code); the others hit. */
+    map.source[1] = b2;
+    CHECK(small_table_session(&fixture, &session, directory));
+    ScriptResult changed;
+    ok = module_visit(&fixture, &map, root, &changed);
+    if (!ok || changed.module_compile_count != 1)
+        report_modules("changed source", &changed, &session);
+    CHECK(ok && strcmp(changed.summary, first.summary) != 0
+          && changed.module_compile_count == 1
+          && changed.module_bytecode_cache_misses == 1
+          && changed.module_bytecode_cache_hits == 3
+          && changed.script_bytecode_disk_hits == 3);
+    (void) idle(&session, 1000);
+    CHECK(count_files(directory, ".tfsc", NULL, 0) == 4);
+    browser_session_destroy(&session);
+    CHECK(small_table_session(&fixture, &session, directory));
+    ScriptResult again;
+    ok = module_visit(&fixture, &map, root, &again);
+    if (!ok || again.module_compile_count != 0)
+        report_modules("after the change", &again, &session);
+    CHECK(ok && strcmp(again.summary, changed.summary) == 0
+          && again.module_compile_count == 0
+          && again.script_bytecode_disk_hits == 4);
+    browser_session_destroy(&session);
+    free(a);
+    free(b);
+    free(c);
+    free(b2);
+    CHECK(page_close(&fixture));
+    script_test_remove_tree(directory);
+    return 0;
+}
+
+/* A cyclic graph (root -> x -> y -> x) and a dynamic import(), with most
+   records past the table's ceiling: a restart restores every module from
+   the card, links the cycle and resolves the import() exactly as compiled
+   modules do. */
+static int test_module_cycle_and_dynamic_import_restore(void)
+{
+    PageFixture fixture;
+    CHECK(page_open(&fixture));
+    char directory[600];
+    fresh_directory(directory, sizeof(directory));
+    char *x = make_module("cx", 12u * KIB, "import {y} from './y.js';",
+                          "export function x(){return 'x'+f2(1).length}"
+                          "export const fromY=()=>y();");
+    char *y = make_module("cy", 12u * KIB, "import {x} from './x.js';",
+                          "export function y(){return 'y'+x()}");
+    char *lazy = make_module("cl", 12u * KIB, "import {x} from './x.js';",
+                             "export const lazy='L'+x();");
+    CHECK(x != NULL && y != NULL && lazy != NULL);
+    ModuleMap map = {
+        .url = {"https://mod.test/x.js", "https://mod.test/y.js",
+                "https://mod.test/lazy.js"},
+        .source = {x, y, lazy},
+        .count = 3
+    };
+    static const char root[] =
+        "import {fromY} from './x.js';"
+        "globalThis.pocSummary='PENDING';"
+        "import('./lazy.js').then(m=>{globalThis.pocSummary="
+        "'CYC:'+fromY()+':'+m.lazy},e=>{globalThis.pocSummary='ERR:'+e})";
+    BrowserSession session;
+    CHECK(small_table_session(&fixture, &session, directory));
+    ScriptResult first;
+    bool ok = module_visit(&fixture, &map, root, &first);
+    if (!ok || strncmp(first.summary, "CYC:", 4) != 0)
+        report_modules("cycle first visit", &first, &session);
+    CHECK(ok && strncmp(first.summary, "CYC:yx", 6) == 0
+          && first.module_bytecode_cache_misses == 4
+          && first.module_bytecode_cache_disk_queued >= 2);
+    (void) idle(&session, 1000);
+    CHECK(count_files(directory, ".tfsc", NULL, 0) == 4);
+    browser_session_destroy(&session);
+
+    CHECK(small_table_session(&fixture, &session, directory));
+    ScriptResult second;
+    ok = module_visit(&fixture, &map, root, &second);
+    BrowserScriptDiskStats stats;
+    browser_session_script_disk_stats(&session, &stats);
+    if (!ok || second.module_compile_count != 0)
+        report_modules("cycle restart", &second, &session);
+    CHECK(ok && strcmp(second.summary, first.summary) == 0
+          && second.module_compile_count == 0
+          && second.script_bytecode_disk_hits == 4
+          && stats.direct_reads >= 1);
+    browser_session_destroy(&session);
+    free(x);
+    free(y);
+    free(lazy);
+    CHECK(page_close(&fixture));
+    script_test_remove_tree(directory);
+    return 0;
+}
+
+/* The write queue under pressure, with synthetic records. The Budget
+   reclaim hook frees queued records before any RAM record; an unwritten
+   module record evicted for another page's moves to the queue and is
+   written; and the tier's size ceiling still holds against queued packs,
+   least recently used pack first. */
+static int test_module_queue_pressure_and_eviction(void)
+{
+    char directory[600];
+    fresh_directory(directory, sizeof(directory));
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    BrowserSession session;
+    /* Room for three packs of these records. */
+    CHECK(browser_session_init(&session, &budget, 64u * KIB)
+          && browser_session_script_disk_configure(&session, directory, true,
+                                                   200u * KIB));
+    browser_session_module_bytecode_set_limit(&session, 64u * KIB);
+    static unsigned char bytes[60u * KIB];
+    memset(bytes, 0x5a, sizeof(bytes));
+    char urls[6][64];
+    BrowserScriptBytecodeKey keys[6];
+    for (unsigned i = 0; i < 6; i++) {
+        snprintf(urls[i], sizeof(urls[i]), "https://site.test/m%u.js", i);
+        keys[i] = (BrowserScriptBytecodeKey) {
+            .module_name = urls[i], .response_url = urls[i],
+            .partition_key = "https://site.test",
+            .source = (const unsigned char *) urls[i],
+            .source_length = strlen(urls[i])
+        };
+    }
+    uint32_t page = browser_session_module_bytecode_generation(&session);
+    /* One RAM record (the table's ceiling holds one) and two queued. */
+    CHECK(browser_session_module_bytecode_put(&session, &keys[0], page,
+                                              bytes, sizeof(bytes)));
+    CHECK(!browser_session_module_bytecode_may_fit(&session, &keys[1],
+                                                   sizeof(bytes), page)
+          && browser_session_script_disk_queue(&session, &keys[1], bytes,
+                                               sizeof(bytes))
+          && browser_session_script_disk_queue(&session, &keys[2], bytes,
+                                               sizeof(bytes)));
+    /* Twice the table's ceiling: a third record does not fit the queue. */
+    CHECK(!browser_session_script_disk_may_queue(&session, &keys[3],
+                                                 sizeof(bytes))
+          && browser_session_script_disk_queue_count(&session) == 2);
+    /* Pressure: queued records go first, the RAM record stays. */
+    size_t before = budget.current;
+    size_t released = browser_session_script_bytecode_reclaim(&session, 1u);
+    CHECK(released >= sizeof(bytes)
+          && browser_session_script_disk_queue_count(&session) == 1
+          && browser_session_module_bytecode_entries(&session) == 1
+          && budget.current + sizeof(bytes) <= before);
+    released = browser_session_script_bytecode_reclaim(
+        &session, 2u * sizeof(bytes));
+    CHECK(browser_session_script_disk_queue_count(&session) == 0
+          && browser_session_script_disk_queue_bytes(&session) == 0);
+    BrowserScriptDiskStats stats;
+    browser_session_script_disk_stats(&session, &stats);
+    CHECK(stats.queue_drops == 2);
+    /* The reclaim reached the RAM record only after the queue was empty. */
+    CHECK(browser_session_module_bytecode_entries(&session) == 0);
+
+    /* Eviction: page 1 stores m0, unwritten; page 2's store evicts it from
+       RAM into the queue, so both are written. */
+    page = browser_session_module_bytecode_generation(&session);
+    CHECK(browser_session_module_bytecode_put(&session, &keys[0], page,
+                                              bytes, sizeof(bytes)));
+    uint32_t next = browser_session_module_bytecode_generation(&session);
+    CHECK(browser_session_module_bytecode_put(&session, &keys[1], next,
+                                              bytes, sizeof(bytes))
+          && browser_session_script_disk_queue_count(&session) == 1
+          && browser_session_module_bytecode_entries(&session) == 1);
+    (void) idle(&session, 1000);
+    browser_session_script_disk_stats(&session, &stats);
+    CHECK(count_files(directory, ".tfsc", NULL, 0) == 2
+          && stats.writes == 2
+          && browser_session_script_disk_queue_count(&session) == 0);
+
+    /* The ceiling: three more queued packs (one at a time, written in turn)
+       leave at most three on the card, the oldest removed first. */
+    for (unsigned i = 2; i < 5; i++) {
+        CHECK(browser_session_script_disk_queue(&session, &keys[i], bytes,
+                                                sizeof(bytes)));
+        (void) idle(&session, 1000);
+    }
+    uint64_t on_disk = 0;
+    size_t files = 0;
+    CHECK(browser_session_script_disk_usage(&session, &on_disk, &files)
+          && files == 3 && on_disk <= 200u * KIB
+          && count_files(directory, ".tfsc", NULL, 0) == 3);
+    browser_session_script_disk_stats(&session, &stats);
+    CHECK(stats.evictions == 2);
+    /* Clearing compiled scripts drops a queued record before it is
+       written, as does the browser cache clear. */
+    CHECK(browser_session_script_disk_queue(&session, &keys[5], bytes,
+                                            sizeof(bytes)));
+    CHECK(browser_session_script_disk_clear(&session)
+          && browser_session_script_disk_queue_count(&session) == 0);
+    CHECK(browser_session_script_disk_queue(&session, &keys[5], bytes,
+                                            sizeof(bytes)));
+    browser_session_cache_clear(&session);
+    CHECK(browser_session_script_disk_queue_count(&session) == 0);
+    (void) idle(&session, 1000);
+    CHECK(count_files(directory, ".tfsc", NULL, 0) == 0);
+    browser_session_destroy(&session);
+    CHECK(budget.current == 0);
+    script_test_remove_tree(directory);
+    return 0;
+}
+
+/* The writer takes the RAM table's records before the queue's: what a
+   load kept before the queue existed reaches the card first, so a short
+   stay or a reclaim before idle work catches up costs only queued
+   records. */
+static int test_writer_takes_ram_records_first(void)
+{
+    char directory[600];
+    fresh_directory(directory, sizeof(directory));
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    BrowserSession session;
+    CHECK(browser_session_init(&session, &budget, 64u * KIB)
+          && browser_session_script_disk_configure(&session, directory, true,
+                                                   0));
+    browser_session_module_bytecode_set_limit(&session, 64u * KIB);
+    static unsigned char bytes[40u * KIB];
+    memset(bytes, 0x33, sizeof(bytes));
+    char urls[2][64];
+    BrowserScriptBytecodeKey keys[2];
+    for (unsigned i = 0; i < 2; i++) {
+        snprintf(urls[i], sizeof(urls[i]), "https://site.test/w%u.js", i);
+        keys[i] = (BrowserScriptBytecodeKey) {
+            .module_name = urls[i], .response_url = urls[i],
+            .partition_key = "https://site.test",
+            .source = (const unsigned char *) urls[i],
+            .source_length = strlen(urls[i])
+        };
+    }
+    uint32_t realm = browser_session_module_bytecode_generation(&session);
+    /* Queued first, stored in RAM second: order of arrival is not order
+       of writing. */
+    CHECK(browser_session_script_disk_queue(&session, &keys[0], bytes,
+                                            sizeof(bytes))
+          && browser_session_module_bytecode_put(&session, &keys[1], realm,
+                                                 bytes, sizeof(bytes)));
+    BrowserScriptDiskStats stats;
+    unsigned turns = 0;
+    do {
+        if (!browser_session_script_disk_maintenance(&session)) break;
+        browser_session_script_disk_stats(&session, &stats);
+    } while (stats.writes == 0 && ++turns < 1000);
+    CHECK(stats.writes == 1
+          && browser_session_script_disk_queue_count(&session) == 1);
+    (void) idle(&session, 1000);
+    browser_session_script_disk_stats(&session, &stats);
+    CHECK(stats.writes == 2
+          && browser_session_script_disk_queue_count(&session) == 0);
+    browser_session_destroy(&session);
+    CHECK(budget.current == 0);
+    script_test_remove_tree(directory);
+    return 0;
+}
+
+/* A full layout rebuild with less free memory than its workspace reserve
+   reclaims the page's optional caches. Records that wait only for the
+   writer give way first and alone: when dropping them restores the
+   reserve, the page keeps its other caches (here its RAM module record)
+   and the queue loses only what the reserve needs, so holding them never
+   costs a load what it kept before the queue existed. */
+static size_t rebuild_reclaims;
+
+static void count_rebuild_reclaim(void *opaque)
+{
+    (void) opaque;
+    rebuild_reclaims++;
+}
+
+static int test_full_rebuild_drops_queue_alone(void)
+{
+    char directory[600];
+    fresh_directory(directory, sizeof(directory));
+    Budget budget;
+    budget_init(&budget, 32u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    BrowserSession session;
+    NavigationSession navigation;
+    CHECK(browser_session_init(&session, &budget, 64u * KIB)
+          && browser_session_script_disk_configure(&session, directory, true,
+                                                   0));
+    browser_session_module_bytecode_set_limit(&session, 1u * MIB);
+    CHECK(navigation_init(&navigation, &budget, 2));
+    navigation_attach_browser_session(&navigation, &session);
+    navigation_enable_scripts(&navigation, 3u * MIB, 1000);
+    navigation.relayout_preview_threshold_us = UINT64_MAX;
+    static const char html[] =
+        "<!doctype html><style>p{color:#123}</style><body><p id=a>text</p>";
+    uint64_t generation = navigation_begin(&navigation);
+    CHECK(navigation_commit_html(&navigation, generation,
+                                 "https://site.test/", html,
+                                 sizeof(html) - 1u, 480, NULL, NULL, true)
+          && navigation_complete_layout_sync(&navigation));
+    navigation.reclaim_optional = count_rebuild_reclaim;
+    navigation.reclaim_optional_opaque = NULL;
+
+    static unsigned char bytes[512u * KIB];
+    memset(bytes, 0x5a, sizeof(bytes));
+    char urls[3][64];
+    BrowserScriptBytecodeKey keys[3];
+    for (unsigned i = 0; i < 3; i++) {
+        snprintf(urls[i], sizeof(urls[i]), "https://site.test/r%u.js", i);
+        keys[i] = (BrowserScriptBytecodeKey) {
+            .module_name = urls[i], .response_url = urls[i],
+            .partition_key = "https://site.test",
+            .source = (const unsigned char *) urls[i],
+            .source_length = strlen(urls[i])
+        };
+    }
+    uint32_t realm = browser_session_module_bytecode_generation(&session);
+    CHECK(browser_session_module_bytecode_put(&session, &keys[0], realm,
+                                              bytes, 64u * KIB)
+          && browser_session_script_disk_queue(&session, &keys[1], bytes,
+                                               sizeof(bytes))
+          && browser_session_script_disk_queue(&session, &keys[2], bytes,
+                                               sizeof(bytes)));
+    /* Leave the rebuild a quarter of the queue short of its reserve (the
+       relayout's own small allocations come out of the rest): one of the
+       two queued records covers it. */
+    size_t reserve = budget.limit / 8u;
+    if (reserve > 4u * MIB) reserve = 4u * MIB;
+    size_t queued = browser_session_script_disk_queue_bytes(&session);
+    size_t remaining = budget_remaining(&budget);
+    size_t wanted = reserve - queued / 4u;
+    CHECK(remaining > wanted);
+    void *pad = budget_malloc(&budget, remaining - wanted);
+    CHECK(pad != NULL);
+    size_t full_before = navigation.performance.full_relayouts;
+    rebuild_reclaims = 0;
+    CHECK(script_runtime_evaluate_diagnostic(
+              navigation.page.runtime,
+              "document.querySelector('style').remove()",
+              "<rebuild>", &navigation.page.script_result)
+          && script_runtime_consume_relayout(navigation.page.runtime)
+          && navigation_relayout(&navigation));
+    bool full = navigation.performance.full_relayouts > full_before;
+    size_t entries = browser_session_module_bytecode_entries(&session);
+    size_t left = browser_session_script_disk_queue_count(&session);
+    budget_free(&budget, pad);
+    if (!full || rebuild_reclaims != 0 || entries != 1 || left != 1)
+        fprintf(stderr, "full rebuild: full=%d reclaims=%zu module-entries=%zu "
+                "queued=%zu\n", full ? 1 : 0, rebuild_reclaims, entries, left);
+    CHECK(full && rebuild_reclaims == 0 && entries == 1 && left == 1);
+    navigation_destroy(&navigation);
+    browser_session_destroy(&session);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    script_test_remove_tree(directory);
+    return 0;
+}
+
 int main(void)
 {
     if (!make_scratch_root()) {
@@ -1209,6 +1678,16 @@ int main(void)
     puts("script disk cache: oversized record stays in RAM");
     failed |= test_modules_restore_after_restart();
     puts("script disk cache: modules");
+    failed |= test_modules_past_ram_ceiling_restore_after_restart();
+    puts("script disk cache: modules past the RAM ceiling, changed source");
+    failed |= test_module_cycle_and_dynamic_import_restore();
+    puts("script disk cache: module cycle and dynamic import()");
+    failed |= test_module_queue_pressure_and_eviction();
+    puts("script disk cache: write queue pressure, eviction and ceiling");
+    failed |= test_writer_takes_ram_records_first();
+    puts("script disk cache: the writer takes RAM records first");
+    failed |= test_full_rebuild_drops_queue_alone();
+    puts("script disk cache: a full layout rebuild drops the queue alone");
     script_test_remove_tree(scratch_root);
     if (failed) {
         fprintf(stderr, "script disk cache: FAIL\n");

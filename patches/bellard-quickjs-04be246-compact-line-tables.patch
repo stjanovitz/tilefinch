@@ -1,0 +1,216 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -788,11 +788,26 @@
+     uint16_t var_ref_idx;
+ } JSBytecodeVarDef;
+ 
+-/* for the encoding of the pc2line table */
+-#define PC2LINE_BASE     (-1)
+-#define PC2LINE_RANGE    5
+-#define PC2LINE_OP_FIRST 1
+-#define PC2LINE_DIFF_PC_MAX ((255 - PC2LINE_OP_FIRST) / PC2LINE_RANGE)
++/* for the encoding of the pc2line table. Tilefinch: after the leb128
++   line and column of the definition, each entry starts with one byte:
++   - 0: leb128 diff_pc, sleb128 diff_line, sleb128 diff_col (any entry);
++   - [PC2LINE_SHORT_FIRST, PC2LINE_PAIR_FIRST): same line, diff_pc and
++     diff_col both in the byte;
++   - [PC2LINE_PAIR_FIRST, PC2LINE_NEXT_FIRST): same line, diff_pc in the
++     byte, then one byte of diff_col (int8_t);
++   - [PC2LINE_NEXT_FIRST, PC2LINE_OP_END): next line, diff_pc in the byte,
++     then the leb128 column (minus 1, as in the header).
++   Bytes from PC2LINE_OP_END are not used. The table is lossless: the
++   decoded positions are those of upstream's encoding. */
++#define PC2LINE_SHORT_FIRST 1
++#define PC2LINE_SHORT_PC    7   /* diff_pc in [0, 7) */
++#define PC2LINE_SHORT_COL   14  /* diff_col in [-14, 14) */
++#define PC2LINE_PAIR_FIRST  (PC2LINE_SHORT_FIRST + \
++                             PC2LINE_SHORT_PC * 2 * PC2LINE_SHORT_COL)
++#define PC2LINE_PAIR_PC     32  /* diff_pc in [0, 32), diff_col int8_t */
++#define PC2LINE_NEXT_FIRST  (PC2LINE_PAIR_FIRST + PC2LINE_PAIR_PC)
++#define PC2LINE_NEXT_PC     16  /* diff_pc in [0, 16), diff_line == 1 */
++#define PC2LINE_OP_END      (PC2LINE_NEXT_FIRST + PC2LINE_NEXT_PC)
+ 
+ typedef enum JSFunctionKindEnum {
+     JS_FUNC_NORMAL = 0,
+@@ -8751,6 +8766,59 @@
+     }
+     *pval = (val >> 1) ^ -(val & 1);
+     return ret;
++}
++
++/* Tilefinch: decode one pc2line entry at p (see PC2LINE_SHORT_FIRST),
++   advancing *ppc, *pline_num and *pcol_num. Returns the bytes read, or -1
++   for a truncated or invalid entry. */
++static int pc2line_get_entry(const uint8_t *p, const uint8_t *p_end,
++                             int *ppc, int *pline_num, int *pcol_num)
++{
++    const uint8_t *p_start = p;
++    unsigned int op;
++    uint32_t val;
++    int v, ret;
++
++    if (p >= p_end)
++        return -1;
++    op = *p++;
++    if (op == 0) {
++        ret = get_leb128(&val, p, p_end);
++        if (ret < 0)
++            return -1;
++        p += ret;
++        *ppc += val;
++        ret = get_sleb128(&v, p, p_end);
++        if (ret < 0)
++            return -1;
++        p += ret;
++        *pline_num += v;
++        ret = get_sleb128(&v, p, p_end);
++        if (ret < 0)
++            return -1;
++        p += ret;
++        *pcol_num += v;
++    } else if (op < PC2LINE_PAIR_FIRST) {
++        op -= PC2LINE_SHORT_FIRST;
++        *ppc += op / (2 * PC2LINE_SHORT_COL);
++        *pcol_num += (int)(op % (2 * PC2LINE_SHORT_COL)) - PC2LINE_SHORT_COL;
++    } else if (op < PC2LINE_NEXT_FIRST) {
++        if (p >= p_end)
++            return -1;
++        *ppc += op - PC2LINE_PAIR_FIRST;
++        *pcol_num += (int8_t)*p++;
++    } else if (op < PC2LINE_OP_END) {
++        ret = get_leb128(&val, p, p_end);
++        if (ret < 0)
++            return -1;
++        p += ret;
++        *ppc += op - PC2LINE_NEXT_FIRST;
++        *pline_num += 1;
++        *pcol_num = val + 1;
++    } else {
++        return -1;
++    }
++    return p - p_start;
+ }
+ 
+ /* use pc_value = -1 to get the position of the function definition */
+@@ -8758,9 +8826,8 @@
+                          uint32_t pc_value, int *pcol_num)
+ {
+     const uint8_t *p_end, *p;
+-    int new_line_num, line_num, pc, v, ret, new_col_num, col_num;
++    int new_line_num, line_num, pc, ret, new_col_num, col_num;
+     uint32_t val;
+-    unsigned int op;
+ 
+     if (!b->has_debug || !b->debug.pc2line_buf)
+         goto fail; /* function was stripped */
+@@ -8784,29 +8851,14 @@
+     if (pc_value != -1) {
+         pc = 0;
+         while (p < p_end) {
+-            op = *p++;
+-            if (op == 0) {
+-                ret = get_leb128(&val, p, p_end);
+-                if (ret < 0)
+-                    goto fail;
+-                pc += val;
+-                p += ret;
+-                ret = get_sleb128(&v, p, p_end);
+-                if (ret < 0)
+-                    goto fail;
+-                p += ret;
+-                new_line_num = line_num + v;
+-            } else {
+-                op -= PC2LINE_OP_FIRST;
+-                pc += (op / PC2LINE_RANGE);
+-                new_line_num = line_num + (op % PC2LINE_RANGE) + PC2LINE_BASE;
+-            }
+-            ret = get_sleb128(&v, p, p_end);
++            new_line_num = line_num;
++            new_col_num = col_num;
++            ret = pc2line_get_entry(p, p_end, &pc, &new_line_num,
++                                    &new_col_num);
+             if (ret < 0)
+                 goto fail;
+             p += ret;
+-            new_col_num = col_num + v;
+-            
++
+             if (pc_value < pc)
+                 goto done;
+             line_num = new_line_num;
+@@ -35758,8 +35810,7 @@
+ static __maybe_unused void dump_pc2line(JSContext *ctx, const uint8_t *buf, int len)
+ {
+     const uint8_t *p_end, *p;
+-    int pc, v, line_num, col_num, ret;
+-    unsigned int op;
++    int pc, line_num, col_num, ret;
+     uint32_t val;
+     
+     if (len <= 0)
+@@ -35787,29 +35838,11 @@
+     
+     pc = 0;
+     while (p < p_end) {
+-        op = *p++;
+-        if (op == 0) {
+-            ret = get_leb128(&val, p, p_end);
+-            if (ret < 0)
+-                goto fail;
+-            pc += val;
+-            p += ret;
+-            ret = get_sleb128(&v, p, p_end);
+-            if (ret < 0)
+-                goto fail;
+-            p += ret;
+-            line_num += v;
+-        } else {
+-            op -= PC2LINE_OP_FIRST;
+-            pc += (op / PC2LINE_RANGE);
+-            line_num += (op % PC2LINE_RANGE) + PC2LINE_BASE;
+-        }
+-        ret = get_sleb128(&v, p, p_end);
++        ret = pc2line_get_entry(p, p_end, &pc, &line_num, &col_num);
+         if (ret < 0)
+             goto fail;
+         p += ret;
+-        col_num += v;
+-        
++
+         printf("%5d %5d %5d\n", pc, line_num, col_num);
+     }
+  fail: ;
+@@ -37875,18 +37908,27 @@
+             if (diff_line == 0 && diff_col == 0)
+                 continue;
+ 
+-            if (diff_line >= PC2LINE_BASE &&
+-                diff_line < PC2LINE_BASE + PC2LINE_RANGE &&
+-                diff_pc <= PC2LINE_DIFF_PC_MAX) {
+-                dbuf_putc(&s->pc2line, (diff_line - PC2LINE_BASE) +
+-                          diff_pc * PC2LINE_RANGE + PC2LINE_OP_FIRST);
++            if (diff_line == 0 && diff_pc < PC2LINE_SHORT_PC &&
++                diff_col >= -PC2LINE_SHORT_COL &&
++                diff_col < PC2LINE_SHORT_COL) {
++                dbuf_putc(&s->pc2line, PC2LINE_SHORT_FIRST +
++                          diff_pc * 2 * PC2LINE_SHORT_COL +
++                          diff_col + PC2LINE_SHORT_COL);
++            } else if (diff_line == 0 && diff_pc < PC2LINE_PAIR_PC &&
++                       diff_col >= INT8_MIN && diff_col <= INT8_MAX) {
++                dbuf_putc(&s->pc2line, PC2LINE_PAIR_FIRST + diff_pc);
++                dbuf_putc(&s->pc2line, (uint8_t)(int8_t)diff_col);
++            } else if (diff_line == 1 && diff_pc < PC2LINE_NEXT_PC &&
++                       col_num >= 0) {
++                dbuf_putc(&s->pc2line, PC2LINE_NEXT_FIRST + diff_pc);
++                dbuf_put_leb128(&s->pc2line, col_num); /* column minus 1 */
+             } else {
+                 /* longer encoding */
+                 dbuf_putc(&s->pc2line, 0);
+                 dbuf_put_leb128(&s->pc2line, diff_pc);
+                 dbuf_put_sleb128(&s->pc2line, diff_line);
++                dbuf_put_sleb128(&s->pc2line, diff_col);
+             }
+-            dbuf_put_sleb128(&s->pc2line, diff_col);
+                 
+             last_pc = pc;
+             last_line_num = line_num;

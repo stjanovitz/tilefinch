@@ -826,6 +826,7 @@ void psp_sync_ui(PspUiState *ui, const BrowserEngine *engine,
     if (ui == NULL || !browser_engine_view_snapshot(engine, &view)) return;
     psp_ui_set_page(ui, view.title, view.url, view.secure);
     ui->youtube_signin_continue = browser_engine_youtube_signin_continue_available(engine);
+    ui->microphone_live = tilefinch_media_capture_live();
     psp_ui_set_history(ui, view.can_go_back, view.can_go_forward);
     psp_ui_set_scroll(ui, view.scroll_y, view.maximum_scroll_y);
     _Static_assert(sizeof(ui->focus_label) == sizeof(view.focus_label),
@@ -889,6 +890,8 @@ void psp_sync_ui(PspUiState *ui, const BrowserEngine *engine,
         ui->insecure_audio_site_answer =
             (unsigned) browser_session_insecure_audio_site(
                 security_session, view.url);
+        ui->microphone_site_answer = (uint8_t)
+            browser_profile_microphone_site(profile, view.url);
         ui->third_party_cookie_site_allowed =
             browser_profile_third_party_cookie_site_allowed(
                 profile, view.url);
@@ -904,6 +907,8 @@ void psp_sync_ui(PspUiState *ui, const BrowserEngine *engine,
             : browser_profile_content_blocker_mode(profile));
         ui->content_blocker_cosmetic_hiding =
             browser_profile_content_blocker_cosmetic_hiding(profile);
+        ui->content_blocker_paywall_scripts =
+            browser_profile_content_blocker_paywall_scripts(profile);
         ui->cookie_banner_hidden =
             browser_profile_cookie_banner_hidden(profile, view.url);
         uint64_t total_blocked =

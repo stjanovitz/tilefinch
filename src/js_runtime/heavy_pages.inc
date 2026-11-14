@@ -32,6 +32,11 @@ static void heavy_measure(ScriptRuntime *runtime, ScriptHeavyState *state)
     state->refused_scripts = bridge->heavy.refused_scripts;
     state->oversized_scripts = bridge->heavy.oversized_scripts;
     state->oversized_bytes = bridge->heavy.oversized_bytes;
+    state->memory_refusals = bridge->heavy.memory_refusals;
+    js_rt_saturating_add_size(&state->memory_refusals,
+                              script_runtime_heap_rejections(runtime));
+    js_rt_saturating_add_size(&state->memory_refusals,
+                              runtime->result.dynamic_script_memory_failures);
     state->largest_unit_bytes = bridge->heavy.largest_unit_bytes;
     state->waiting = bridge->heavy.waiting_scripts != 0
         && !bridge->heavy.answered;
@@ -148,6 +153,18 @@ void script_runtime_note_oversized_script(ScriptRuntime *runtime,
     if (runtime == NULL) return;
     js_rt_saturating_add_size(&runtime->bridge.heavy.oversized_scripts, 1);
     js_rt_saturating_add_size(&runtime->bridge.heavy.oversized_bytes, bytes);
+}
+
+void script_runtime_note_memory_refusal(ScriptRuntime *runtime)
+{
+    if (runtime == NULL) return;
+    js_rt_saturating_add_size(&runtime->bridge.heavy.memory_refusals, 1);
+}
+
+bool script_heavy_state_low_on_memory(const ScriptHeavyState *state)
+{
+    return state != NULL && state->memory_refusals != 0
+        && state->memory_free < SCRIPT_HEAVY_LOW_MEMORY_BYTES;
 }
 
 void js_rt_heavy_note_restored(ScriptRuntime *runtime, size_t source_bytes,

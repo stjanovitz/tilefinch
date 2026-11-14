@@ -14,6 +14,7 @@
 #include "tilefinch/style.h"
 #include "tilefinch/script_admission.h"
 #include "tilefinch/validation_cpu.h"
+#include "tilefinch/frame_lite.h"
 
 /* QuickJS parsing/bytecode generation is a dependency call. The vendored
    parser polls the watchdog, but admission still needs a hard byte ceiling
@@ -78,25 +79,51 @@ typedef enum {
 bool script_execution_policy_for_profile(
     ScriptExecutionProfile profile, ScriptExecutionPolicy *policy);
 
-/* Native DOM handles stay deliberately bounded on the PSP.  Generation tags
-   permit safe reuse after subtree destruction or collection of an unreachable
-   detached wrapper; pressure telemetry distinguishes simultaneous demand from
-   lifetime churn. */
-#define SCRIPT_DOM_HANDLE_INDEX_BITS 14u
+/* Native DOM handles stay bounded on the PSP.  Generation tags permit safe
+   reuse after subtree destruction or collection of an unreachable detached
+   wrapper; pressure telemetry distinguishes simultaneous demand from
+   lifetime churn.  A handle is (generation << INDEX_BITS) | (slot + 1) and
+   stays below 2^31, so 16 slot bits leave every slot 32,767 incarnations. */
+#define SCRIPT_DOM_HANDLE_INDEX_BITS 16u
 #define SCRIPT_DOM_HANDLE_INDEX_MASK \
     ((1u << SCRIPT_DOM_HANDLE_INDEX_BITS) - 1u)
+/* The table's ceiling under the strict profile (and for a policy that names
+   no ceiling). */
 #define SCRIPT_DOM_HANDLE_SLOT_CAPACITY 8192u
-/* The realistic PSP profile (32 MiB page envelope) may grow the table once a
-   page holds more live nodes than the base capacity: 16,384 less one 32-slot
-   word, the largest multiple of 32 the 14-bit slot field encodes. The base
-   table is allocated at creation exactly as before; the extra slots (about
-   21 bytes each on the PSP, plus the lazily allocated wrapper references)
-   are Budget-admitted only when a page needs them. */
-#define SCRIPT_DOM_HANDLE_SLOT_CAPACITY_REALISTIC 16352u
-#define SCRIPT_DOM_HANDLE_SLOT_CAPACITY_MAX \
-    SCRIPT_DOM_HANDLE_SLOT_CAPACITY_REALISTIC
+/* The hard bound the indices need: 65,536 less one 32-slot word, the
+   largest multiple of 32 whose slot + 1 fits the pointer index's 16-bit
+   entries. The realistic PSP profile (32 MiB page envelope) may grow the
+   table to it; memory decides first. */
+#define SCRIPT_DOM_HANDLE_SLOT_CAPACITY_MAX 65504u
+#define SCRIPT_DOM_HANDLE_SLOT_CAPACITY_REALISTIC \
+    SCRIPT_DOM_HANDLE_SLOT_CAPACITY_MAX
+/* Up to this many slots a table grows whenever the Budget allows, as
+   before growth was memory-admitted (news front pages hold 9-10 thousand
+   live elements). Past it, each growth step of
+   SCRIPT_DOM_HANDLE_SLOT_GROWTH_STEP slots is admitted only while the page
+   keeps SCRIPT_ADMISSION_PRESENTATION_RESERVE_BYTES free beside the bytes
+   the step keeps, as shadow roots and scripts are. A slot holds a node
+   that script has touched while its wrapper lives, or while something
+   still names its handle (a listener or other per-node state, a native
+   record, a kept bootstrap table); a connected node's slot is released at
+   an owner turn once nothing does. A page of web components that clone
+   templates can still walk past this. Every slot costs about 25 bytes on
+   the PSP: about 15.4 in the slot arrays (bitmaps included), 4 for the
+   wrapper reference (one pointer), 1 owner tag and 4 in the pointer index
+   (16-bit entries, exactly twice the slots), so a step keeps about 100 KB,
+   the index's 16 KiB share included. */
+#define SCRIPT_DOM_HANDLE_SLOT_BUDGET_CAPACITY 16352u
+#define SCRIPT_DOM_HANDLE_SLOT_GROWTH_STEP 4096u
+/* Slots a table starts with; it doubles when every slot is live, up to
+   SCRIPT_DOM_HANDLE_SLOT_BUDGET_CAPACITY. A top-level document starts at
+   TOP_LEVEL slots, a child frame's realm at CHILD_FRAME (a frame document
+   uses tens). Below SCRIPT_DOM_HANDLE_SLOT_CAPACITY a full table grows
+   before it reclaims dead wrappers, so no page collects garbage for handles
+   earlier than with a table allocated at that size. */
+#define SCRIPT_DOM_HANDLE_SLOT_INITIAL_TOP_LEVEL 1024u
+#define SCRIPT_DOM_HANDLE_SLOT_INITIAL_CHILD_FRAME 256u
 _Static_assert(DOCUMENT_CSSOM_SHEET_LIMIT == SCRIPT_DOM_HANDLE_SLOT_CAPACITY_MAX,
-               "the CSSOM override registry holds one entry per DOM handle");
+               "the CSSOM override cap matches the DOM handle bound");
 
 typedef struct {
     bool success;
@@ -149,6 +176,10 @@ typedef struct {
     size_t module_bytecode_cache_restore_failures;
     size_t module_bytecode_cache_bytes;
     size_t module_bytecode_cache_stored_bytes;
+    /* Compiled modules the RAM table could not keep, queued for the
+       persistent tier's writer instead (and their bytes). */
+    size_t module_bytecode_cache_disk_queued;
+    size_t module_bytecode_cache_disk_queued_bytes;
     unsigned long long module_bytecode_restore_us;
     /* The persistent compiled-script tier (classic and module): restores
        whose record this load read from disk, and the synchronous pack reads,
@@ -164,9 +195,14 @@ typedef struct {
     size_t dom_handle_slots_peak;
     size_t dom_handle_slots_high_water;
     size_t dom_handle_slot_reuses;
+    /* Free-slot bitmap words read past while looking for a free slot. */
+    size_t dom_handle_slot_search_words;
     size_t dom_handle_exhaustions;
     size_t dom_handle_wrapper_releases;
     size_t dom_handle_connected_preserves;
+    /* Connected nodes' slots retired when their wrappers died (nothing
+       else named their handles; see bridge_connected_slot_releasable). */
+    size_t dom_handle_connected_releases;
     /* Most wrappers one collection held for their expandos or weak-key use. */
     size_t dom_handle_wrappers_held_peak;
     size_t dom_handle_stale_releases;
@@ -178,6 +214,9 @@ typedef struct {
     size_t geometry_queries;
     size_t geometry_retained_fast_paths;
     size_t geometry_ancestor_visits;
+    /* Geometry answers built as a fresh object (getBoundingClientRect
+       refills its own array instead). */
+    size_t geometry_result_objects;
     size_t geometry_synchronous_layouts;
     size_t geometry_snapshot_builds;
     size_t geometry_snapshot_hits;
@@ -674,7 +713,9 @@ bool script_runtime_webgl_texture_cache_place(
 #define SCRIPT_WEBGL_GEOMETRY_CACHE_ENTRY_LIMIT 4u
 /* Cache hits the PSP GE may draw from the retained block itself per frame. */
 #define SCRIPT_WEBGL_GEOMETRY_DIRECT_DRAW_LIMIT 8u
-#define SCRIPT_WEBGL_GEOMETRY_CACHE_SIGNATURE_WORDS 40u
+/* 37 words describe a draw's inputs; a material draw's lit-vertex block
+   adds 14 (tag, texture transform, normal view and identity). */
+#define SCRIPT_WEBGL_GEOMETRY_CACHE_SIGNATURE_WORDS 52u
 #define SCRIPT_WEBGL_GEOMETRY_CACHE_BYTE_LIMIT (64u * 1024u)
 
 typedef struct {
@@ -686,6 +727,15 @@ typedef struct {
     size_t bytes;
     uint32_t age;
     bool valid;
+    /* A lit material draw's index span, validated when the record was
+       admitted: the lowest index, the span's vertices and the indices
+       drawn (0: expanded, not indexed). The signature names the index
+       buffer's identity and content generation, so a record whose
+       signature still matches has the same indices. */
+    bool lit_layout;
+    uint32_t lit_base;
+    uint32_t lit_vertices;
+    uint32_t lit_indices;
 } ScriptWebglGeometryCacheRecord;
 
 typedef struct {
@@ -709,6 +759,28 @@ bool script_runtime_webgl_geometry_cache_admit(
     size_t *slot,
     bool *hit,
     bool *reset);
+
+/* The lit layout kept with SIGNATURE's record for this realm and canvas,
+   so a recurring lit draw need not rescan its indices: false when no valid
+   record has one. Set by the PSP lit path right after it admitted a record
+   (SLOT) for a layout it computed. */
+bool script_runtime_webgl_geometry_cache_lit_layout(
+    const ScriptWebglGeometryCacheState *state,
+    uint32_t realm_epoch_high,
+    uint32_t realm_epoch_low,
+    int64_t canvas_handle,
+    const ScriptWebglGeometryCacheSignature *signature,
+    uint32_t *base,
+    uint32_t *vertices,
+    uint32_t *indices);
+void script_runtime_webgl_geometry_cache_set_lit_layout(
+    ScriptWebglGeometryCacheState *state, size_t slot, uint32_t base,
+    uint32_t vertices, uint32_t indices);
+/* INDEX rebased into the lit span [BASE, BASE + VERTICES): false when it
+   lies outside. A recalled span is keyed by the index buffer's JS-supplied
+   identity, not its bytes, so the PSP lit path checks every index. */
+bool script_runtime_webgl_lit_span_index(uint32_t base, uint32_t vertices,
+                                         uint32_t index, uint16_t *rebased);
 
 /* Host-testable admission rule for the PSP's bounded temporal edge pass.
    It accepts only small finite camera/projection changes and reports whether
@@ -808,6 +880,10 @@ typedef struct {
     /* First child-list record was an insertion from a detached tree. Only
        valid within this journal; never inferred from the final DOM alone. */
     bool inserted_from_detached;
+    /* A read installed this record's stylesheet change ahead of the
+       relayout (script_runtime_set_sheet_settle_callback): the sheet holds
+       it. Cleared when a later write coalesces here. */
+    bool sheet_settled;
     /* Some write this record coalesces may change a :has() answer
        (stylesheet_attribute_change_may_affect_has with the exact before and
        after values; always for tree, text and unclassified changes). The
@@ -1332,6 +1408,44 @@ size_t script_runtime_collect_and_trim(ScriptRuntime *runtime);
 size_t script_runtime_heap_remaining(const ScriptRuntime *runtime);
 /* Bytes the realm's QuickJS heap currently holds. */
 size_t script_runtime_heap_used(const ScriptRuntime *runtime);
+/* Memory-study diagnostics (TILEFINCH_MEMORY_DIAGNOSTICS builds; see
+   docs/engineering/VALIDATION_RECORDS.md, "Memory make-up"). Bytes are
+   Budget charges, headers included, unless named heap_*. */
+typedef struct {
+    size_t heap_used;             /* QuickJS malloc_size now */
+    size_t heap_limit;
+    size_t heap_after_bootstrap;  /* malloc_size once the bootstrap ran */
+    size_t budget_after_bootstrap;/* pool + source store then */
+    size_t pool_requested;        /* bytes QuickJS asked the pool for */
+    size_t pool_budget_bytes;     /* all the realm's pool holds */
+    size_t pool_header_bytes;     /* pool + Budget headers, live blocks */
+    size_t pool_live_blocks;
+    size_t pool_cached_blocks;
+    size_t pool_cached_bytes;     /* idle blocks in the class caches */
+    size_t pool_slack_bytes;      /* class rounding of the live blocks */
+    size_t source_entries;
+    size_t source_text_bytes;
+    size_t source_held_bytes;     /* function-source store, Budget bytes */
+    size_t source_plain_bytes;
+    size_t net_buffer_bytes;      /* EventSource/WebSocket/loader buffers */
+    size_t classic_queue_count;   /* deferred classic bytecode stores */
+    size_t classic_queue_source_bytes;
+    size_t classic_queue_bytes;   /* the queue array itself */
+    size_t memory_rescue_bytes;
+    size_t bridge_table_bytes;    /* DOM handle slot table, wrapper cache */
+    size_t wrappers;
+} ScriptRuntimeMemorySplit;
+bool script_runtime_memory_split(const ScriptRuntime *runtime,
+                                 ScriptRuntimeMemorySplit *split);
+/* Returns the realm's cached free QuickJS pool blocks to the page Budget;
+   returns the bytes released. A child frame's realm does so after its
+   bootstrap and again once its document has loaded. */
+size_t script_runtime_trim_pool(ScriptRuntime *runtime);
+/* The compact jsmem-census / jsmem-row record (tools/jsmem_report.py) of
+   this realm, through the validation log on a PSP. Builds with the heap
+   census compiled in only (host lab, PSP validation). */
+void script_runtime_heap_detail_census(ScriptRuntime *runtime,
+                                       const char *reason);
 /* Raise the realm's QuickJS limit by `additional` bytes, not past
    `ceiling`. The heap is charged to the page budget, which stays the
    authority; this only lets a realm whose budget has room keep loading
@@ -1482,8 +1596,25 @@ typedef struct {
        can still reach. */
     size_t memory_needed;
     size_t memory_free;
+    /* Times this page's scripts were refused memory: allocations the heap
+       refused (outside compiles abandoned with the realm intact), scripts
+       the loader skipped or did not compile for lack of memory, dynamic
+       scripts whose response did not fit, and lazy factory compiles the
+       heap could not admit. Zero while everything the page asked for fit,
+       however little is left. */
+    size_t memory_refusals;
     size_t visible_text_bytes;
 } ScriptHeavyState;
+
+/* Below this much reachable heap, a page whose scripts were already refused
+   memory is running low (script_heavy_state_low_on_memory). */
+#define SCRIPT_HEAVY_LOW_MEMORY_BYTES (2u * 1024u * 1024u)
+/* Whether the page's scripts are running low on memory: something was
+   refused for memory and little is left. Little left alone is not enough:
+   a page that fills its heap to the reserve and loads every script it asks
+   for (a bbc.co.uk article: 65 scripts, 0.8 MB admission headroom) has
+   nothing to warn about. */
+bool script_heavy_state_low_on_memory(const ScriptHeavyState *state);
 
 void script_runtime_set_heavy_policy(ScriptRuntime *runtime,
                                      ScriptHeavyPolicy policy);
@@ -1498,6 +1629,10 @@ bool script_runtime_heavy_state(ScriptRuntime *runtime,
    page is over the best case (SCRIPT_HEAVY_CLASS_OVER). */
 void script_runtime_note_oversized_script(ScriptRuntime *runtime,
                                           size_t bytes);
+/* Records that one of the page's scripts was refused memory: skipped or
+   not compiled because its working set did not fit (ScriptHeavyState's
+   memory_refusals). */
+void script_runtime_note_memory_refusal(ScriptRuntime *runtime);
 /* Measures the text the server sent once the page commits, before later
    author scripts change it (navigation commit). */
 void script_runtime_heavy_commit(ScriptRuntime *runtime);
@@ -1861,9 +1996,10 @@ long script_runtime_node_handle(ScriptRuntime *runtime,
 long script_runtime_node_weak_handle(ScriptRuntime *runtime,
                                      lxb_dom_node_t *node);
 void script_runtime_node_handle_release(ScriptRuntime *runtime, long handle);
-/* O(fixed handle-table capacity), allocation-free admission check used before
-   a native DOM transaction that will require one new provenance handle. No
-   author code runs between this check and registration. */
+/* O(handle-table capacity), allocation-free admission check used before a
+   native DOM transaction that will require one new provenance handle: a free
+   or reusable slot, or a growth step the table may take now. No author code
+   runs between this check and registration. */
 bool script_runtime_node_handle_capacity_available(
     const ScriptRuntime *runtime);
 /* Resolves only a still-live generation-tagged native handle.  The check does
@@ -1963,6 +2099,16 @@ void script_runtime_set_dialog_parent(ScriptRuntime *child,
 /* True for a top-level document realm, or a frame realm whose parent chain
    reaches one. */
 bool script_runtime_dialogs_allowed(ScriptRuntime *runtime);
+/* Microphone capture (tilefinch/media_capture.h). A child-frame realm may
+   capture only once navigation names the PARENT realm and ALLOWED (what
+   media_capture_frame_allowed() decided for its container); until then, or
+   with ALLOWED false, getUserMedia() is NotAllowedError. */
+void script_runtime_set_media_capture_parent(ScriptRuntime *child,
+                                             ScriptRuntime *parent,
+                                             bool allowed);
+/* True for a secure top-level realm, or a frame realm whose delegation
+   chain reaches one. */
+bool script_runtime_media_capture_allowed(ScriptRuntime *runtime);
 #if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
 /* Test seam: the policy state that decides RUNTIME's dialogs (its
    top-level realm's); false, with the realm's own refusal counts, for a
@@ -2095,7 +2241,9 @@ bool script_runtime_consume_relayout(ScriptRuntime *runtime);
 bool script_runtime_take_refresh_meta_mutation(ScriptRuntime *runtime);
 /* Read-only admission check for rollback-safe optional layout work. */
 bool script_runtime_has_pending_mutations(const ScriptRuntime *runtime);
-/* What the next relayout will consume, for its owner to look at. */
+/* What the next relayout will consume, for its owner to look at; NULL when
+   nothing was journaled or the journal could not be allocated (the next
+   consume then reports an overflowed journal). */
 const ScriptMutationJournal *script_runtime_pending_journal(
     const ScriptRuntime *runtime);
 /* Resource-completion callbacks can enqueue another resource pass after
@@ -2103,6 +2251,22 @@ const ScriptMutationJournal *script_runtime_pending_journal(
 bool script_runtime_has_pending_resource_mutations(const ScriptRuntime *runtime);
 void script_runtime_telemetry(const ScriptRuntime *runtime,
                               ScriptRuntimeTelemetry *telemetry);
+#if !defined(TILEFINCH_NO_TRACE) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+/* The live DOM handle table counters, without refreshing ScriptResult
+   (validation marks and hosts only). */
+typedef struct {
+    size_t live;
+    size_t peak;
+    size_t capacity;
+    size_t growths;
+    size_t growth_refusals;
+    size_t exhaustions;
+    size_t connected_releases;
+    size_t connected_preserves;
+} ScriptDomHandleCounters;
+void script_runtime_dom_handle_counters(const ScriptRuntime *runtime,
+                                        ScriptDomHandleCounters *counters);
+#endif
 /* Preserve the first author/runtime failure before a bounded parser stage
    retires its realm. This does not run author accessors or rewrite an earlier
    diagnostic already stored by the candidate navigation. */
@@ -2179,12 +2343,36 @@ void script_runtime_set_synchronous_layout_callback(
     ScriptRuntime *runtime, ScriptSynchronousLayoutCallback callback,
     void *opaque);
 /* A geometry-only owner callback flows the already installed cascade; it
-   cannot install pending stylesheet resources. Non-container-dependent
+   cannot install pending stylesheet resources (the sheet-settle callback
+   below installs what it can first). Non-container-dependent
    style-only reads need no such flow. Other callbacks retain the conservative
    contract above, including hosts that install new sheets while flushing. */
 void script_runtime_set_geometry_layout_callback(
     ScriptRuntime *runtime, ScriptSynchronousLayoutCallback callback,
     void *opaque);
+/* Installs the journal's pending stylesheet change (a constructed sheet
+   adopted, dropped or replaced in place, a <style> inserted) into the
+   cascade before a read that resolves style or geometry, so a read in the
+   turn that made the change sees its rules (CSSOM View: reads flush style
+   first). The callback returns whether the cascade now holds every change
+   the journal recorded; the runtime then clears the journal's
+   stylesheet_rebuild_required and its own style answers. Refused, the read
+   answers from the installed cascade and the next relayout applies the
+   change; the runtime asks again once the DOM changes. It may not run
+   author code. Installed after the geometry callback; clearing the
+   synchronous layout callback clears it too. The callback reports where
+   the change it installed reaches with
+   script_runtime_drop_computed_styles_within; unreported, the runtime
+   drops every style answer it keeps. */
+void script_runtime_set_sheet_settle_callback(
+    ScriptRuntime *runtime, ScriptSynchronousLayoutCallback callback,
+    void *opaque);
+/* The cascade of the runtime's stylesheet changed in place, without a new
+   sheet generation, and only within the subtrees of `roots` (what they
+   inherit included); NULL `roots`: anywhere. getComputedStyle's retained
+   answers there go before the next read. */
+void script_runtime_drop_computed_styles_within(
+    ScriptRuntime *runtime, lxb_dom_node_t *const *roots, size_t count);
 /* Candidate-only image sizing, before a complete page layout is published.
    Other measurement probes retain their existing fallback; installing the
    ordinary callback at commit restores full geometry support. */
@@ -2212,6 +2400,12 @@ bool script_runtime_flush_geometry_layout_reuse(
     ScriptRuntime *runtime, const ViewportContext *viewport,
     ScriptGeometryReuseCallback prepare, ScriptGeometryReuseRelease release,
     void *opaque);
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+/* Layout reuse study (validation only): whether script's forced geometry
+   is still adoptable, or why not. */
+const char *script_runtime_geometry_adoption_state(
+    const ScriptRuntime *runtime, const ViewportContext *viewport);
+#endif
 /* Owner-only move of a current complete geometry snapshot. The caller must
    exclude resource-changing journals; failure leaves the snapshot owned by
    the runtime. No author work runs during the move. */
@@ -2254,19 +2448,10 @@ bool scripts_run_document_at(PocDocument *document, Budget *budget,
                              size_t js_memory_limit, unsigned timeout_ms,
                              const char *document_url,
                              ScriptResult *result);
-bool scripts_run_document_at_context(
-    PocDocument *document, Budget *budget, size_t js_memory_limit,
-    unsigned timeout_ms, const char *document_url,
-    const ViewportContext *viewport, ScriptResult *result);
 bool scripts_run_document_at_context_with_policy(
     PocDocument *document, Budget *budget, size_t js_memory_limit,
     unsigned timeout_ms, const char *document_url,
     const ViewportContext *viewport,
     const ScriptExecutionPolicy *execution_policy, ScriptResult *result);
-bool scripts_run_document_at_viewport(
-    PocDocument *document, Budget *budget, size_t js_memory_limit,
-    unsigned timeout_ms, const char *document_url,
-    int css_viewport_width, int css_viewport_height,
-    int device_width, int device_height, ScriptResult *result);
 
 #endif

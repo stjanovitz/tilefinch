@@ -1438,15 +1438,6 @@ void psp_media_open_arm_wait_budget(PspMediaSession *media)
     media_http_range_set_wait_budget_us(media->audio_range, budget_us);
 }
 
-/* The same handoff for a seek, on the seek's own much smaller clock. */
-void psp_media_seek_arm_wait_budget(PspMediaSession *media)
-{
-    uint64_t budget_us = psp_media_seek_wait_budget_us(
-        media->job_started_us, psp_media_internal_now_us(media));
-    media_http_range_set_wait_budget_us(media->range, budget_us);
-    media_http_range_set_wait_budget_us(media->audio_range, budget_us);
-}
-
 void psp_media_open_clear_wait_budget(PspMediaSession *media)
 {
     media_http_range_clear_wait_budget(media->range);

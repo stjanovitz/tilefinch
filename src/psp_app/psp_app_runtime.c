@@ -134,7 +134,8 @@ void psp_presentation_init(PspPresentationResources *presentation)
        canvases; everything else keeps the CPU conversion and copy. */
     static const CanvasGeBackend canvas_ge_backend = {
         .scale = psp_canvas_ge_scale, .busy = psp_canvas_ge_busy,
-        .fail = psp_canvas_ge_fail, .context = NULL
+        .fail = psp_canvas_ge_fail, .release = psp_canvas_ge_release,
+        .context = NULL
     };
     canvas_ge_presenter_init(&psp_present_canvas_ge, &canvas_ge_backend);
     canvas_ge_presenter_enable(&psp_present_canvas_ge, true, false);
@@ -1341,6 +1342,10 @@ bool psp_present_internal(
         unsigned opaque_top = 0u, opaque_bottom = 0u;
         psp_ui_opaque_chrome_rows(ui, &opaque_top, &opaque_bottom);
         unsigned copy_end = PSP_SCREEN_HEIGHT - opaque_bottom;
+        if (psp_present_canvas_engine != NULL)
+            canvas_ge_presenter_set_page(
+                &psp_present_canvas_ge,
+                browser_engine_page_generation(psp_present_canvas_engine));
         int ge_copied = (int) canvas_ge_presenter_publish(
             &psp_present_canvas_ge,
             psp_present_canvas_engine == NULL ? NULL
@@ -1403,6 +1408,12 @@ bool psp_present_internal(
             psp_active_media->ui.seek_preview_active ? &preview : NULL,
             vram,
             PSP_SCREEN_WIDTH, PSP_SCREEN_HEIGHT, PSP_VRAM_STRIDE);
+        /* Capture ends when a player opens; until it has, the indicator
+           shows over the player too. */
+        if (tilefinch_media_capture_indicator())
+            psp_ui_draw_microphone_indicator(
+                vram, PSP_SCREEN_WIDTH, PSP_SCREEN_HEIGHT, PSP_VRAM_STRIDE,
+                false);
     } else if (ui != NULL) {
         psp_ui_composite(ui, vram, PSP_SCREEN_WIDTH, PSP_SCREEN_HEIGHT,
                          PSP_VRAM_STRIDE);
@@ -2390,6 +2401,8 @@ void psp_navigation_cooperate_end(const char *scope)
            can still be updating the tuple. */
         psp_completed_supervisor_media_intent = completed_media;
     }
+    /* The waiting command is the session's now: its note goes. */
+    psp_ui_media_clear_parked(psp_navigation_cooperate.media_owner);
     if ((!psp_navigation_cancel_requested()
          || (psp_navigation_cooperate.owner_thread_only
              && psp_navigation_cooperate.input_yield))
@@ -2946,7 +2959,7 @@ static void psp_work_ui_tick(bool owner_thread)
                 sceKernelGetSystemTimeWide();
             psp_ui_show_status(
                 &cooperate->supervisor_ui,
-                "BUSY - CIRCLE CANCELS", 120);
+                "BUSY  O CANCEL", 120);
             urgent_present = true;
             break;
         case PSP_INPUT_ROUTE_NONE:
@@ -3549,7 +3562,7 @@ bool psp_platform_cooperate(
 static uint64_t psp_boot_entrance_previous_us;
 
 void psp_present_boot_entrance(
-    unsigned frame, const char *stage, bool wave, const PspUiState *home)
+    unsigned frame, const char *stage, const PspUiState *home)
 {
     uint64_t now_us = (uint64_t) sceKernelGetSystemTimeWide();
     bool slow = psp_boot_entrance_previous_us != 0
@@ -3561,7 +3574,6 @@ void psp_present_boot_entrance(
     if (vram == NULL) return;
     PspUiBootEntranceView view = {
         .frame = frame,
-        .wave = wave,
         .branch_status = slow ? stage : NULL
     };
     psp_ui_boot_entrance_composite(

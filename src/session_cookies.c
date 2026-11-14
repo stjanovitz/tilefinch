@@ -16,19 +16,13 @@
 #include "tilefinch/public_suffix.h"
 #include "tilefinch/url.h"
 #include "diagnostic_trace.h"
+#include "fnv1a.h"
 
 #define budget_malloc(b, s) budget_malloc_category((b), BUDGET_CATEGORY_SESSION, (s))
 #define budget_calloc(b, n, s) budget_calloc_category((b), BUDGET_CATEGORY_SESSION, (n), (s))
 #define budget_realloc(b, p, s) budget_realloc_category((b), BUDGET_CATEGORY_SESSION, (p), (s))
 
-static uint64_t session_hash_bytes(uint64_t hash, const void *data,
-                                   size_t length)
-{
-    const unsigned char *bytes = data;
-    for (size_t i = 0; i < length; i++)
-        hash = (hash ^ bytes[i]) * UINT64_C(1099511628211);
-    return hash;
-}
+#define session_hash_bytes fnv1a64
 
 static int month_number(const char *value)
 {

@@ -35,8 +35,9 @@
 #define BROWSER_COOKIE_LONG_PATH_BYTES (8u * 1024u)
 /* The one bound on a Cookie request header, terminator included, shared by
    every header builder (provider and page requests) and the transport's
-   fixed request descriptors. The jar holds 4 KiB of cookie values by
-   default and a signed-in YouTube jar sends about 2.6 KB, so ordinary
+   fixed request descriptors. The jar holds 16 KiB of cookie values by
+   default (DEFAULT_COOKIE_BYTES in session.c), but a signed-in YouTube jar
+   sends about 2.6 KB to one site, so ordinary
    headers fit; one that would not leaves out its lowest-priority cookies
    instead of going out empty (see browser_session_cookie_header_context). */
 #define BROWSER_COOKIE_HEADER_CAPACITY 4096u
@@ -289,11 +290,7 @@ typedef enum {
    Tilefinch-release ABI. Bump this only when the QuickJS serializer, compiler
    configuration, or local compiler patches change incompatibly. Offline apps
    keep their source response and simply recompile when this does not match. */
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
 #define TILEFINCH_QUICKJS_BYTECODE_ABI UINT32_C(0x514a5302)
-#else
-#define TILEFINCH_QUICKJS_BYTECODE_ABI UINT32_C(0x514a4e01)
-#endif
 
 typedef enum {
     BROWSER_OFFLINE_CACHE_GENERIC = 0,
@@ -1091,8 +1088,8 @@ void browser_session_script_bytecode_invalidate(
     BrowserSession *session, BrowserScriptBytecodeKind kind,
     BrowserScriptBytecodeKey *key);
 /* Releases compiled-script memory until `target_bytes` are released or
-   nothing is left: the bundle-record queue, then least-recently-used
-   classic and module entries (from the larger table first), then bundle
+   nothing is left: the bundle-record queue, the persistent tier's write
+   queue, then least-recently-used classic and module entries (from the larger table first), then bundle
    records. Returns the bytes released. Frees only entries (never a table)
    and allocates nothing, so it is safe as the engine's Budget reclaim hook
    while an allocation is in progress anywhere, including inside a table. */
@@ -1150,12 +1147,23 @@ bool browser_session_module_bytecode_put(
  * - An index file is read once, on first use; a key it does not name costs
  *   no card access. A RAM miss reads the named pack whole (at most once per
  *   page load) and copies its records into the RAM table, where the lookup
- *   that follows finds them. Reads come after the same fetch, CSP, SRI,
- *   CORS and MIME admission as a RAM hit.
+ *   that follows finds them. A module record the RAM table has no room for
+ *   (it is full of records this load uses) is handed to the caller from
+ *   the pack instead, once, and not kept. Reads come after the same fetch,
+ *   CSP, SRI, CORS and MIME admission as a RAM hit.
  * - Writes are idle work only (browser_session_script_disk_maintenance):
  *   a pack is written from the RAM table's records stored while the tier
- *   writes, at most BROWSER_SCRIPT_DISK_WRITE_SLICE bytes per call, to a
- *   temporary name renamed into place when complete. Least recently used
+ *   writes, or from the write queue, at most BROWSER_SCRIPT_DISK_WRITE_SLICE
+ *   bytes per call, to a temporary name renamed into place when complete.
+ * - The write queue holds module records the RAM table cannot keep: a
+ *   compile the table has no room for (a page's own records are never
+ *   evicted for one another) and an unwritten record evicted for another
+ *   page's. Its records are written after the RAM table's and freed once
+ *   written. It is
+ *   optional memory, bounded by BROWSER_SCRIPT_DISK_QUEUE_LIMIT records and
+ *   twice the module table's ceiling, and the first compiled-script memory
+ *   the Budget reclaim hook frees; clears drop it like the RAM tables, and
+ *   it is filled only while the tier writes. Least recently used
  *   packs are removed first to stay under the size ceiling (default
  *   BROWSER_SCRIPT_DISK_DEFAULT_BYTES) and the file-count ceiling, one per
  *   call. The first maintenance calls of a writing session sweep the
@@ -1176,6 +1184,7 @@ bool browser_session_module_bytecode_put(
 #define BROWSER_SCRIPT_DISK_SCAN_SLICE 8u
 #define BROWSER_SCRIPT_DISK_SCAN_LIMIT 4096u
 #define BROWSER_SCRIPT_DISK_DIRECTORY_LIMIT 160u
+#define BROWSER_SCRIPT_DISK_QUEUE_LIMIT 64u
 
 typedef struct BrowserScriptDisk BrowserScriptDisk;
 
@@ -1203,6 +1212,13 @@ typedef struct {
     size_t write_restarts;
     size_t write_failures;
     size_t clears;
+    /* The write queue: records queued and their bytes, records dropped
+       unwritten (reclaim, clear, site data turned off), and records restored
+       straight from a pack because RAM had no room for them. */
+    size_t queued;
+    uint64_t queued_bytes;
+    size_t queue_drops;
+    size_t direct_reads;
     uint64_t read_ns;
     uint64_t verify_ns;
     uint64_t write_ns;
@@ -1230,6 +1246,45 @@ bool browser_session_script_disk_promote(BrowserSession *session,
                                          BrowserScriptBytecodeKind kind,
                                          const BrowserScriptBytecodeKey *key,
                                          uint32_t generation);
+/* As promote, for a module key: when the RAM table has no room for the
+   key's own record and that record matches the key exactly (source length,
+   flags and SHA-256), *direct receives a reference to its bytecode, which
+   no table keeps (the caller releases it after restoring). */
+bool browser_session_script_disk_promote_module(
+    BrowserSession *session, BrowserScriptBytecodeKey *key,
+    uint32_t generation, BrowserSharedBody **direct);
+/* Whether the write queue would take a module record of `bytecode_length`
+   bytes for `key` now: an admission hint before serializing. */
+bool browser_session_script_disk_may_queue(const BrowserSession *session,
+                                           const BrowserScriptBytecodeKey *key,
+                                           size_t bytecode_length);
+/* Copies a module record the RAM table cannot keep into the write queue,
+   replacing a queued or RAM record of the same module (an older source).
+   False, changing nothing, when the queue would not take it or an
+   allocation is refused. */
+bool browser_session_script_disk_queue(BrowserSession *session,
+                                       BrowserScriptBytecodeKey *key,
+                                       const unsigned char *bytecode,
+                                       size_t bytecode_length);
+/* Moves an unwritten (dirty) module RAM entry being evicted into the write
+   queue, taking its body and strings without allocating; the caller then
+   forgets the entry. False (the entry untouched) when the queue is full
+   or the tier does not write. */
+bool browser_session_script_disk_adopt(BrowserSession *session,
+                                       BrowserScriptBytecodeEntry *entry);
+/* Drops the queued record of this key's module (a RAM store supersedes
+   it). Frees only. */
+void browser_session_script_disk_unqueue(BrowserSession *session,
+                                         const BrowserScriptBytecodeKey *key);
+/* Drops queued records (of one top-level site, or all with NULL). */
+void browser_session_script_disk_queue_clear(BrowserSession *session,
+                                             const char *partition);
+/* Frees queued records, oldest first, until `target_bytes` are released;
+   returns the bytes released. Frees only (the Budget reclaim hook). */
+size_t browser_session_script_disk_queue_reclaim(BrowserSession *session,
+                                                 size_t target_bytes);
+size_t browser_session_script_disk_queue_bytes(const BrowserSession *session);
+size_t browser_session_script_disk_queue_count(const BrowserSession *session);
 /* The engine could not restore a record that came from this key's pack:
    remove the pack (writes on) or stop reading it this session. */
 void browser_session_script_disk_discard(BrowserSession *session,

@@ -1201,6 +1201,23 @@ static bool test_state_text(PspUiState *ui, TilefinchGlyphProvider *provider)
         CHECK(paint_media(&media, provider) && validate_frame(ui));
         CHECK(shown_whole(tilefinch_ui_text(progress[at])));
     }
+    /* A command waiting on the open says so on the loading panel. */
+    static const PspUiMediaAction parked[] = {
+        PSP_UI_MEDIA_ACTION_NEXT, PSP_UI_MEDIA_ACTION_PREVIOUS,
+        PSP_UI_MEDIA_ACTION_QUEUE_SELECT,
+        PSP_UI_MEDIA_ACTION_SELECT_AUDIO_TRACK, PSP_UI_MEDIA_ACTION_ROTATE,
+        PSP_UI_MEDIA_ACTION_CLOSE, PSP_UI_MEDIA_ACTION_RETRY};
+    static PspUiMediaPresentation parked_presentation;
+    for (size_t at = 0; at < sizeof(parked) / sizeof(parked[0]); at++) {
+        psp_ui_media_init(&media);
+        psp_ui_media_bind_presentation(&media, &parked_presentation);
+        psp_ui_media_set_resolving(&media, "Opening video");
+        psp_ui_media_set_resolving_progress(&media, "Loading...", 450u);
+        parked_presentation.parked_action = (uint8_t) parked[at];
+        CHECK(paint_media(&media, provider) && validate_frame(ui));
+        CHECK(shown_whole(tilefinch_ui_text(
+            psp_ui_media_parked_note(parked[at]))));
+    }
 
     /* The font-pack offer: checking, the signed size, and failures. */
     ui->screen = PSP_UI_SCREEN_GLYPH_OFFER;
@@ -1558,11 +1575,25 @@ static bool test_remaining_screens(PspUiState *ui, TilefinchGlyphProvider *provi
         ui->screen = PSP_UI_SCREEN_SITE_CONTROLS;
         for (unsigned state = 0; state < 4; state++) {
             ui->site_storage_state = (uint8_t) state;
-            ui->menu_selection = UI_SITE_CONTROLS_ITEM_COUNT - 1u;
+            ui->menu_selection = UI_SITE_CONTROLS_ITEM_COUNT - 2u;
             CHECK(paint(ui, provider)
                   && shown_whole(tilefinch_ui_text(states[state])));
         }
         ui->site_storage_state = 0;
+        /* The last row counts the requests blocked on this page. */
+        unsigned blocker_mode = ui->content_blocker_mode;
+        char page_url[sizeof(ui->url)];
+        memcpy(page_url, ui->url, sizeof(page_url));
+        ui->content_blocker_mode = CONTENT_BLOCKER_BASIC;
+        snprintf(ui->url, sizeof(ui->url), "https://example.test/");
+        ui->page_requests_blocked = 1234u;
+        ui->menu_selection = UI_SITE_CONTROLS_ITEM_COUNT - 1u;
+        CHECK(paint(ui, provider)
+              && shown_whole(tilefinch_ui_text("Blocked here"))
+              && shown_whole("1234"));
+        ui->page_requests_blocked = 0u;
+        ui->content_blocker_mode = blocker_mode;
+        memcpy(ui->url, page_url, sizeof(page_url));
         ui->menu_selection = 0;
 
         CHECK(test_site_information(ui, provider));
@@ -1597,7 +1628,7 @@ static bool test_composed_toasts(PspUiState *ui, TilefinchGlyphProvider *provide
         "SELECT ENGLISH UI AND RESTART BEFORE REMOVING THIS PACK",
         "YOUTUBE SIGN-IN NOT CONFIRMED - TRY SIGN IN AGAIN",
     };
-    enum { KINDS = 7 };
+    enum { KINDS = 8 };
     size_t count = sizeof(statuses) / sizeof(statuses[0]);
     bool english = !strcmp(language_code, "en");
     for (unsigned pack = 0; pack < TILEFINCH_GLYPH_PACK_COUNT && !english; pack++) {
@@ -1642,9 +1673,14 @@ static bool test_composed_toasts(PspUiState *ui, TilefinchGlyphProvider *provide
                     psp_ui_show_heavy_scripts_status(ui, headline, 60);
                     snprintf(second, sizeof(second), "%s",
                              tilefinch_ui_text("X Stop page scripts  O Keep reading"));
+                } else if (kind == 2) {
+                    headline = "THIS PAGE RAN OUT OF SCRIPT MEMORY LAST TIME";
+                    psp_ui_show_scripts_off_offer(ui);
+                    snprintf(second, sizeof(second), "%s",
+                             tilefinch_ui_text("Load without scripts?  X Yes  O No"));
                 } else {
                     headline = "PAGE UNAVAILABLE";
-                    psp_ui_show_tls_status(ui, headline, (TilefinchTlsGuidance) (kind - 1u), 60);
+                    psp_ui_show_tls_status(ui, headline, (TilefinchTlsGuidance) (kind - 2u), 60);
                     static const char *const guidance[] = {
                         "Make sure date/time in XMB Settings is correct",
                         "Try another Wi-Fi or update Tilefinch",
@@ -1652,8 +1688,8 @@ static bool test_composed_toasts(PspUiState *ui, TilefinchGlyphProvider *provide
                         "Secure connection unsupported. Update Tilefinch",
                         "Open Help & diagnostics for details"
                     };
-                    snprintf(second, sizeof(second), "%s", tilefinch_ui_text(guidance[kind - 2u]));
-                    CHECK(english || strcmp(second, guidance[kind - 2u]) != 0);
+                    snprintf(second, sizeof(second), "%s", tilefinch_ui_text(guidance[kind - 3u]));
+                    CHECK(english || strcmp(second, guidance[kind - 3u]) != 0);
                 }
                 snprintf(first, sizeof(first), "%s", tilefinch_ui_text(headline));
                 psp_ui_status_sentence_case(first);

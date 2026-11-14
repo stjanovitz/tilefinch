@@ -5495,11 +5495,13 @@ static YoutubeLiteLoadStatus lite_load_pump_step(
                 && lite_load_fallback_to_primary(job)) return job->status;
             if (job->continuation_page)
                 return lite_load_continuation_failed(job);
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
             if (job->supplemental_requested) {
                 fprintf(
                     stderr, "youtube-lite supplemental data unavailable: "
                     "continuation/configuration missing or request rejected\n");
             }
+#endif
             job->phase =
                 (job->route != YOUTUBE_LITE_ROUTE_HOME
                  || lite_topics_requested(job->url))
@@ -5551,9 +5553,11 @@ static YoutubeLiteLoadStatus lite_load_pump_step(
     }
     if (!fetched) {
         if (job->phase == YOUTUBE_LITE_JOB_SUPPLEMENTAL) {
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
             fprintf(stderr, "youtube-lite supplemental data unavailable: %s\n",
                     result->error[0] == '\0'
                         ? "transport failure" : result->error);
+#endif
             if (lite_load_fallback_to_primary(job))
                 return job->status;
             fetch_result_destroy(result);

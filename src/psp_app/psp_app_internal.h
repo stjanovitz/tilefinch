@@ -473,7 +473,7 @@ bool psp_present_supervisor_ui(const uint16_t *frame, const PspUiState *ui);
 void psp_present_boot_surface(
     PspUiStartupView view, const char *status, int progress_per_mille);
 void psp_present_boot_entrance(
-    unsigned frame, const char *stage, bool wave, const PspUiState *home);
+    unsigned frame, const char *stage, const PspUiState *home);
 void psp_refresh_page_color_mode(PspUiState *ui);
 bool psp_request_policy_clock(
     void *context, unsigned cpu_mhz, unsigned bus_mhz,
@@ -1165,6 +1165,12 @@ typedef struct {
     bool heavy_status_shown;
     bool heavy_low_memory_shown;
     bool heavy_rescue_shown;
+    /* This page's script-memory stop is noted for its site, and its site
+       was checked for the "load without scripts?" offer (R5). */
+    bool script_memory_noted;
+    bool scripts_off_offer_checked;
+    /* The offer on screen and the sites that let it pass this session. */
+    PspScriptsOffSession scripts_off_session;
     uint64_t heavy_shell_since_us;
     /* Polls left before the page is weighed again (psp_app_heavy.c). */
     uint8_t heavy_measure_countdown;
@@ -1229,6 +1235,20 @@ bool psp_page_dialog_show(void *context,
 /* Microseconds page dialogs have been open in all; a load loop pauses its
    watchdog by the growth (psp_navigation_watchdog_pause). */
 uint64_t psp_page_dialog_open_us(void);
+/* Another browser modal (the microphone prompt) was open this long. */
+void psp_page_dialog_add_open_us(uint64_t open_us);
+
+/* Page microphone capture (psp_app_media_capture.c). Bind the owners the
+   prompt draws on, the budget its buffers come from and the profile it
+   remembers answers in; they live for the process. Voice typing's
+   microphone flag in TEXT_INPUT is shared, so the input is initialized
+   once between them. */
+void psp_media_capture_bind(PspUiState *ui, PspEngineViews *views,
+                            PspTextInputService *text_input,
+                            PspInteractiveState *interactive,
+                            PspBrowserResources *browser, const char *argv0);
+/* Fills the media_capture services (tilefinch/platform.h). */
+void psp_media_capture_install(TilefinchPlatformServices *services);
 
 /* src/psp_app/psp_app_input.c. Callback-thread media input crosses one
    generation-bearing supervisor fence, then returns to the ordinary browser-
@@ -1445,6 +1465,9 @@ bool psp_app_set_basic_view(PspApp *app, const char *url, bool enable,
 void psp_app_heavy_boot(BrowserEngine *engine, const BrowserProfile *profile,
                         PspInteractiveState *interactive, PspUiState *ui);
 bool psp_app_heavy_poll(PspApp *app);
+/* The reader's answer to the "load without scripts?" offer. */
+void psp_app_scripts_off_answer(PspApp *app, PspAppFrameState *frame,
+                                bool accept);
 void psp_app_heavy_action(PspApp *app, PspAppFrameState *frame,
                           const PspUiIntent *intent);
 bool psp_app_heavy_setting(PspApp *app, PspAppFrameState *frame,

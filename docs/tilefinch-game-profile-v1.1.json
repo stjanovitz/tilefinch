@@ -1,0 +1,488 @@
+{
+  "profile_id": "tilefinch-game-profile-v1.1",
+  "title": "Tilefinch Game Profile",
+  "version": 1,
+  "minor_version": 1,
+  "satisfies": [
+    "tilefinch-game-profile-v1"
+  ],
+  "changes_from_v1": [
+    "webgl.shader_source_bytes_each 16384 -> 65536",
+    "webgl.vertex_uniform_vectors 16 -> 128 and fragment_uniform_vectors 4 -> 16, counted over active uniforms per stage",
+    "webgl.varying_vectors 2 -> 8",
+    "blendFuncSeparate accepts split alpha factors; the colour factors apply to all channels of the opaque drawing buffer",
+    "mipmap minification filters sample the base level; generateMipmap succeeds without building levels",
+    "uniform arrays and structs; int, bool, mat2 and mat3 uniform setters; vertexAttrib*fv; accepted no-op stencil and blendColor setters",
+    "numeric and uniform colour factors and uniform-only selections of them are applied exactly",
+    "a uniform alpha test discard is drawn as the GE alpha test",
+    "colour math reading only attributes, uniforms and numbers is evaluated per vertex and interpolated, linked with a warning; limits.webgl per_vertex_program_* added",
+    "built-in scene-library materials map onto GE per-vertex lighting, fog and point sprites",
+    "the 64 KiB GE display list is allocated by a realm's first WebGL frame and freed with the realm; if memory is exhausted at that frame the flush fails and the context is lost, as for any WebGL allocation failure",
+    "web_audio AudioParam automation timelines replace the v1 curve and target-ramp subset; linear and exponential ramp methods schedule ramps instead of setting the value at once",
+    "web_audio createBuffer, new AudioBuffer and channel data (8000-96000 Hz float buffers from the same PCM pool)",
+    "web_audio BiquadFilterNode, the first filter on a source's chain",
+    "web_audio decodeAudioData rejects MP3 and Ogg with EncodingError naming the format",
+    "limits.web_audio_automation added",
+    "web_audio source chains of up to 8 nodes (limits.web_audio_automation.nodes_per_source_chain); a source whose chain does not reach the destination is silent",
+    "web_audio MediaStreamAudioSourceNode for a getUserMedia microphone track, heard through the destination only while headphones are connected",
+    "web_audio AnalyserNode time-domain and frequency data, fftSize 32-2048; limits.web_audio_analysis added"
+  ],
+  "status": "experimental",
+  "authority": "docs/GAME_PROFILE.md",
+  "target": {
+    "device": "Sony PSP",
+    "cpu_clock_hz": 333000000,
+    "display_width_px": 480,
+    "display_height_px": 272,
+    "physical_memory_bytes": 67108864
+  },
+  "memory_profiles": {
+    "shipping": {
+      "page_budget_bytes": 33554432,
+      "javascript_heap_bytes": 5242880
+    },
+    "strict": {
+      "page_budget_bytes": 16777216,
+      "javascript_heap_bytes": 4194304
+    }
+  },
+  "performance_targets": {
+    "aspirational_frame_time_us": 16667,
+    "maximum_steady_frame_time_us": 33333,
+    "qualification_tail_threshold_us": 34000,
+    "physical_device_measurement_required": true
+  },
+  "performance_recipes": {
+    "simulation": {
+      "steps_per_animation_callback": 1,
+      "delta_policy": "bounded_variable_step_without_backlog_replay"
+    },
+    "dynamic_chrome": "retained_in_canvas_mesh",
+    "dom_mutation_in_frame_loop": false,
+    "repeated_geometry": "retained_unit_mesh_with_bounded_instancing",
+    "stable_draw_state": "stable_vao_program_index_range_and_render_state",
+    "dynamic_buffer_updates": "bufferSubData_changed_prefix_only",
+    "instance_draw_chunk_limit": 64,
+    "quantize_visual_state_before_upload": true,
+    "local_input_updates_each_present": true,
+    "background_simulation": "bounded_staggering_without_input_delay",
+    "long_soak_requires_repeated_action_spikes": true,
+    "per_frame_phase_timers": false,
+    "ui_rest_and_repeat_clock": "performance_now",
+    "per_frame_javascript_allocation": false,
+    "string_building": "append_to_function_local",
+    "shared_instance_tints": "quantized_palette",
+    "full_viewport_canvas_publication": "ge_direct_when_nothing_is_composited_above",
+    "focus_event_listeners": false,
+    "focus_styles": [
+      "outline",
+      "uniform_border_color",
+      "single_unblurred_inset_ring"
+    ],
+    "one_time_setup": "menu_time_or_bounded_slices_not_in_the_press",
+    "audio_start": "trusted_play_activation"
+  },
+  "apis": {
+    "canvas_2d": {
+      "status": "bounded_subset",
+      "interfaces": [
+        "CanvasRenderingContext2D",
+        "Path2D",
+        "ImageData",
+        "ImageBitmap",
+        "createImageBitmap"
+      ],
+      "capabilities": [
+        "paths",
+        "text",
+        "clipping",
+        "gradients",
+        "patterns",
+        "bounded_shadows",
+        "sprite_scaling",
+        "pixel_readback",
+        "png_export"
+      ]
+    },
+    "webgl": {
+      "status": "bounded_webgl_1_subset",
+      "version": "WebGL 1.0",
+      "extensions": [
+        "ANGLE_instanced_arrays",
+        "OES_vertex_array_object"
+      ],
+      "unsupported": [
+        "general_glsl",
+        "shader_loops",
+        "derivatives",
+        "discard_except_uniform_alpha_test",
+        "mipmap_levels",
+        "stencil",
+        "general_framebuffer_attachments"
+      ],
+      "fragment_colour_model": "texture2D * vertex_colour * instance_colour * (vec4_uniform | vec4_constant)",
+      "uniform_limit_counting": "active_uniforms_per_stage",
+      "blending": {
+        "factors": [
+          "ZERO",
+          "ONE",
+          "SRC_ALPHA",
+          "ONE_MINUS_SRC_ALPHA"
+        ],
+        "equation": "FUNC_ADD",
+        "split_alpha_factors": "colour_factors_apply_to_all_channels"
+      },
+      "mipmaps": {
+        "minification_filters": "sampled_at_base_level",
+        "generate_mipmap": "succeeds_without_levels"
+      },
+      "scene_library_materials": {
+        "status": "bounded_ge_mapping",
+        "recognition": "symbolic_evaluation_of_main",
+        "lit_shader_names": [
+          "MeshLambertMaterial",
+          "MeshPhongMaterial",
+          "MeshStandardMaterial",
+          "MeshPhysicalMaterial"
+        ],
+        "lights_per_draw": 4,
+        "light_types": [
+          "directional",
+          "point"
+        ],
+        "lighting_evaluation": "per_vertex",
+        "terms": [
+          "position_matrix_chain",
+          "uniform_colour_factors",
+          "texture_transform",
+          "vertex_colour",
+          "linear_fog",
+          "alpha_test",
+          "attenuated_point_sprites",
+          "ambient",
+          "emissive",
+          "blinn_phong_specular"
+        ],
+        "approximated_with_warning": [
+          "per_pixel_lighting_per_vertex",
+          "physically_based_as_blinn_phong",
+          "point_range_falloff_matched_at_half_range",
+          "spot_as_point",
+          "hemisphere_as_ambient",
+          "lights_beyond_four_dropped",
+          "smoothstep_and_exp2_fog_as_linear"
+        ],
+        "refused": [
+          "light_types_without_ge_equivalent",
+          "lighting_without_lit_shader_name",
+          "second_sampled_texture",
+          "instanced_draws"
+        ],
+        "disabled_normal_attribute": "drawn_as_0_0_1"
+      },
+      "shader_diagnostics": {
+        "link_refused": [
+          "shader_loops",
+          "discard_except_uniform_alpha_test",
+          "derivatives",
+          "per_vertex_or_per_pixel_control_flow",
+          "vertex_texture_lookups",
+          "non_texture2d_lookups",
+          "more_than_one_sampled_texture",
+          "lighting_the_ge_cannot_represent"
+        ],
+        "linked_with_warning": [
+          "uniform_only_control_flow_choosing_per_vertex_or_texture_terms",
+          "unapplied_colour_math",
+          "unapplied_position_math",
+          "material_approximations",
+          "per_vertex_colour_math"
+        ],
+        "channels": [
+          "getProgramInfoLog",
+          "console.warn_once_per_program",
+          "__tilefinchWebGLDiagnostics.shaderRefusals",
+          "__tilefinchWebGLDiagnostics.shaderWarnings"
+        ],
+        "applied_exactly": [
+          "numeric_and_uniform_colour_factors",
+          "uniform_only_selection_of_colour_factors",
+          "uniform_alpha_test_discard"
+        ]
+      }
+    },
+    "gamepad": {
+      "status": "supported",
+      "mapping": "standard",
+      "controllers": 1,
+      "capture_chord": "Start+Select",
+      "request_api": "navigator.tilefinch.requestPageControls(element?, options?)",
+      "request_notice_options": [
+        "always",
+        "once"
+      ],
+      "request_notice_once_scope": "page_load_after_first_notice",
+      "request_requires_trusted_activation": true,
+      "request_uses_fullscreen_lifecycle": true,
+      "exit_notice_native": true
+    },
+    "fullscreen": {
+      "status": "supported_top_level",
+      "trusted_activation_required": true,
+      "browser_escape_controls": [
+        "Triangle",
+        "Start+Select",
+        "HOME"
+      ]
+    },
+    "page_visibility": {
+      "status": "supported",
+      "members": [
+        "document.hidden",
+        "document.visibilityState",
+        "visibilitychange"
+      ]
+    },
+    "animation_frame": {
+      "status": "supported",
+      "maximum_callbacks_per_presented_frame": 1,
+      "backlog_policy": "skip_elapsed_frames",
+      "psp_page_clock_maximum_advance_per_loop_us": 16000
+    },
+    "web_audio": {
+      "status": "bounded_subset",
+      "interfaces": [
+        "AudioContext",
+        "AudioBufferSourceNode",
+        "GainNode",
+        "StereoPannerNode",
+        "OscillatorNode",
+        "BiquadFilterNode",
+        "AudioBuffer",
+        "MediaStreamAudioSourceNode",
+        "AnalyserNode"
+      ],
+      "trusted_activation_required": true,
+      "resume_without_activation_rejects": "NotAllowedError",
+      "decoded_formats": [
+        "PCM WAV"
+      ],
+      "refused_decoded_formats": [
+        "MP3",
+        "Ogg"
+      ],
+      "created_buffers": [
+        "BaseAudioContext.createBuffer",
+        "new AudioBuffer"
+      ],
+      "channel_data": "shared_live_float32",
+      "automation_methods": [
+        "setValueAtTime",
+        "linearRampToValueAtTime",
+        "exponentialRampToValueAtTime",
+        "setTargetAtTime",
+        "setValueCurveAtTime",
+        "cancelScheduledValues",
+        "cancelAndHoldAtTime"
+      ],
+      "automated_parameters": [
+        "GainNode.gain",
+        "OscillatorNode.frequency",
+        "OscillatorNode.detune",
+        "AudioBufferSourceNode.playbackRate",
+        "AudioBufferSourceNode.detune",
+        "BiquadFilterNode.frequency",
+        "BiquadFilterNode.detune",
+        "BiquadFilterNode.Q",
+        "BiquadFilterNode.gain"
+      ],
+      "immediate_only_parameters": [
+        "StereoPannerNode.pan"
+      ],
+      "biquad_filter_types": [
+        "lowpass",
+        "highpass",
+        "bandpass",
+        "lowshelf",
+        "highshelf",
+        "peaking",
+        "notch",
+        "allpass"
+      ],
+      "filters_applied_per_source": 1,
+      "unconnected_sources": "silent",
+      "media_stream_sources": "getUserMedia_audio_track",
+      "media_stream_output": "headphones_only",
+      "analyser_methods": [
+        "getFloatTimeDomainData",
+        "getByteTimeDomainData",
+        "getFloatFrequencyData",
+        "getByteFrequencyData"
+      ],
+      "analyser_window": "blackman",
+      "analyser_input": "mono_first_analyser_on_chain"
+    },
+    "storage": {
+      "local_storage": "bounded_user_persistence_policy",
+      "session_storage": "bounded_session_only",
+      "indexed_db": "bounded_non_durable_compatibility_subset",
+      "service_worker": "unsupported"
+    },
+    "offline_installation": {
+      "status": "supported_snapshot",
+      "requires_https": true,
+      "requires_same_origin_manifest": true,
+      "service_worker_required": false
+    }
+  },
+  "limits": {
+    "canvas_2d": {
+      "maximum_width_px": 480,
+      "maximum_height_px": 272,
+      "maximum_pixels": 131072,
+      "maximum_rgba_bytes_per_canvas": 524288,
+      "native_snapshot_count": 4,
+      "native_snapshot_bytes_total": 1048576,
+      "pending_commit_count": 8,
+      "path_commands": 256,
+      "rectangle_batch_commands": 64,
+      "image_batch_commands": 16,
+      "path_text_batch_commands": 16,
+      "image_bitmap_count": 8,
+      "image_bitmap_bytes_total": 1048576
+    },
+    "webgl": {
+      "contexts_per_realm": 2,
+      "buffer_objects": 24,
+      "buffer_bytes_total": 524288,
+      "texture_objects": 8,
+      "texture_bytes_total": 425984,
+      "shader_objects": 16,
+      "shader_source_bytes_each": 65536,
+      "program_objects": 8,
+      "vertex_array_objects": 8,
+      "draw_command_template_words": 96,
+      "draw_command_template_bytes_per_plan": 384,
+      "draw_command_template_bytes_maximum": 3456,
+      "framebuffer_objects": 4,
+      "renderbuffer_objects": 4,
+      "draws_per_submission": 64,
+      "effective_vertices_per_draw": 4096,
+      "instances_per_draw": 64,
+      "payload_sources": 32,
+      "maximum_texture_dimension_px": 512,
+      "maximum_width_px": 480,
+      "maximum_height_px": 272,
+      "maximum_pixels": 131072,
+      "vertex_attributes": 8,
+      "texture_image_units": 1,
+      "varying_vectors": 8,
+      "vertex_uniform_vectors": 128,
+      "fragment_uniform_vectors": 16,
+      "per_vertex_program_steps": 32,
+      "per_vertex_program_constant_vectors": 15,
+      "per_vertex_program_steps_per_draw": 65536
+    },
+    "web_audio": {
+      "contexts": 1,
+      "decoded_buffers": 8,
+      "simultaneous_voices": 4,
+      "audio_nodes": 16,
+      "decoded_pcm_bytes_total": 524288,
+      "mixer_block_frames": 512,
+      "curve_points_minimum": 2,
+      "curve_points_maximum": 64,
+      "curves_per_parameter": 1,
+      "schedule_ahead_us": 10000000,
+      "minimum_sample_rate_hz": 8000,
+      "maximum_sample_rate_hz": 48000,
+      "channels": [
+        1,
+        2
+      ],
+      "sample_bits": [
+        8,
+        16
+      ]
+    },
+    "web_audio_automation": {
+      "events_per_parameter": 32,
+      "automated_parameters": 16,
+      "automated_gains_per_source": 4,
+      "nodes_per_source_chain": 8,
+      "created_buffer_minimum_sample_rate_hz": 8000,
+      "created_buffer_maximum_sample_rate_hz": 96000,
+      "float_buffer_bytes_per_sample": 4,
+      "filter_coefficient_frames": 32
+    },
+    "web_audio_analysis": {
+      "analysers_per_context": 2,
+      "fft_size_minimum": 32,
+      "fft_size_maximum": 2048,
+      "fft_size_not_supported_maximum": 32768,
+      "analyser_history_samples": 4096,
+      "spectrum_bytes_per_analyser": 4096,
+      "analysis_scratch_bytes": 24576,
+      "media_stream_ring_samples": 8192,
+      "media_stream_prefill_samples": 1024,
+      "media_stream_burst_samples": 4096,
+      "media_stream_sources_count_as_voices": true
+    },
+    "storage": {
+      "site_initial_allowance_bytes": 32768,
+      "site_memory_allowance_bytes_maximum": 524288,
+      "memory_allowance_bytes_total": 1048576,
+      "memory_stick_site_bytes": 4194304,
+      "value_bytes_maximum": 1048576,
+      "site_items": 256,
+      "opfs_file_bytes": 65536,
+      "opfs_memory_stick_file_bytes": 524288
+    },
+    "offline_installation": {
+      "manifest_bytes": 65536,
+      "document_bytes": 1048576,
+      "resource_count": 32,
+      "resource_body_bytes_total": 1572864,
+      "classic_script_bytes_each": 524288,
+      "classic_script_compile_count": 8,
+      "classic_script_compile_source_bytes": 1048576,
+      "classic_script_bytecode_bytes": 1048576,
+      "classic_script_source_fallback": true,
+      "resource_pack_bytes": 2785280,
+      "native_icon_width_px": 16,
+      "native_icon_height_px": 16,
+      "native_icon_rgba_bytes": 1024,
+      "library_items": 12
+    },
+    "installed_app": {
+      "javascript_heap_floor_bytes": 9437184,
+      "strict_javascript_heap_floor_bytes": 6291456,
+      "psp_boot_keys": {
+        "app_heap_mb": 9,
+        "file_kb": 512
+      }
+    }
+  },
+  "lifecycle": {
+    "one_animation_frame_chain": true,
+    "pause_when_hidden": true,
+    "audio_starts_suspended": true,
+    "navigation_ends_gamepad_capture": true,
+    "native_media_ends_gamepad_capture": true,
+    "suspend_ends_gamepad_capture": true,
+    "webgl_restoration_uses_same_context_object": true,
+    "offline_launch_requires_network": false
+  },
+  "fallback_order": [
+    "webgl",
+    "canvas_2d",
+    "static_help"
+  ],
+  "references": [
+    "docs/WEBGL.md",
+    "docs/OFFLINE_LIBRARY.md",
+    "docs/DEVELOPMENT.md",
+    "examples/prism-break-3d/",
+    "examples/treadline-arena/"
+  ]
+}

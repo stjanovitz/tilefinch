@@ -1,8 +1,10 @@
 #include "tilefinch/js_runtime.h"
+#include "layout_validation_diff.h"
 #include "tilefinch/budget_quickjs.h"
 #include "tilefinch/content_blocker.h"
 #include "tilefinch/fetch.h"
 #include "tilefinch/media_discovery.h"
+#include "tilefinch/media_mp3.h"
 #include "tilefinch/request_context.h"
 #include "tilefinch/resource_integrity.h"
 #include "tilefinch/script_admission.h"
@@ -22,6 +24,12 @@
 #include "tilefinch/text_encoding.h"
 
 #include "js_runtime_internal.h"
+#if defined(TILEFINCH_JSMEM_CENSUS)
+#include <stdarg.h>
+#if defined(__PSP__)
+#include "tilefinch/psp_log.h"
+#endif
+#endif
 #include "js_source_store.h"
 #include "image_decode_internal.h"
 #include "tilefinch/image_retarget.h"

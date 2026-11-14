@@ -1,6 +1,9 @@
 (() => {
   const nativeMotionSource = globalThis.__tilefinchMotionSourceBridge;
   delete globalThis.__tilefinchMotionSourceBridge;
+  /* Loaded on first use, after the page may have replaced Event: extend
+     the interface hardening.js captured. */
+  const { Event } = globalThis.__tilefinchEventInterfaces;
   /*
    * CSS motion uses the same bounded property-effect scheduler as
    * Element.animate() and inline transitions.  The parser intentionally
@@ -441,6 +444,7 @@
       try {
         element.dispatchEvent(
           new AnimationEvent(type, {
+            __proto__: null,
             bubbles: true,
             animationName: config.name,
             elapsedTime,
@@ -904,7 +908,12 @@
       ruleCache = null;
       pending = false;
       throw error;
-    } finally { scanRunning = false; }
+    } finally {
+      scanRunning = false;
+      /* A suspended scan keeps raw handles of connected nodes across
+         owner turns: their slots must outlive their wrappers meanwhile. */
+      __tilefinchHoldHandleRelease(scanIterator !== null);
+    }
   };
   globalThis.__tilefinchMotionRecheck = () => {
     if (pending) {

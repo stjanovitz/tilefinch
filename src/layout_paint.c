@@ -808,16 +808,6 @@ bool add_fixed_range(LayoutDocument *layout, size_t start, size_t end,
     return true;
 }
 
-
-bool layout_node_within(const lxb_dom_node_t *node,
-                        const lxb_dom_node_t *ancestor)
-{
-    for (const lxb_dom_node_t *at = node; at != NULL; at = at->parent) {
-        if (at == ancestor) return true;
-    }
-    return false;
-}
-
 void layout_positioned_clip_index_prepare(
     const LayoutDocument *layout, LayoutPositionedClipIndex *index)
 {
@@ -980,6 +970,9 @@ void translate_node_subtree(LayoutDocument *layout,
     if (command_end > layout->count) command_end = layout->count;
     if (command_end - command_start > 2000u)
         tilefinch_platform_trace_step("layout-translate-subtree");
+    /* Visual-order glyphs hold absolute x: move them run by run with the
+       commands, skipping the ones a nested fixed range keeps in place. */
+    size_t moved_start = command_start;
     for (size_t i = command_start; i < command_end; i++) {
         bool viewport_fixed = false;
         for (size_t fixed = 0; fixed < layout->fixed_count; fixed++) {
@@ -991,10 +984,15 @@ void translate_node_subtree(LayoutDocument *layout,
                 break;
             }
         }
-        if (viewport_fixed) continue;
+        if (viewport_fixed) {
+            layout_bidi_translate_commands(layout, moved_start, i, dx);
+            moved_start = i + 1;
+            continue;
+        }
         layout->commands[i].x += dx;
         layout->commands[i].y += dy;
     }
+    layout_bidi_translate_commands(layout, moved_start, command_end, dx);
     for (size_t i = 0; i < layout->sticky_count; i++) {
         StickyRange *range = &layout->sticky_ranges[i];
         if (range->command_start >= command_start
@@ -2131,7 +2129,7 @@ void layout_translate_range(LayoutDocument *layout, size_t command_start,
 {
     if (layout->count - command_start > 2000u)
         tilefinch_platform_trace_step("layout-translate-range");
-    layout_bidi_translate_commands(layout, command_start, dx);
+    layout_bidi_translate_commands(layout, command_start, SIZE_MAX, dx);
     for (size_t i = command_start; i < layout->count; i++) {
         layout->commands[i].x += dx;
         layout->commands[i].y += dy;

@@ -1,4 +1,5 @@
 #include "tilefinch/psp_raster_fixture.h"
+#include "tilefinch/platform.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -155,15 +156,7 @@ static const char raster_fixture_html[] =
     "<div id=fallback>한 漢 あ Ж ộ 😀</div>"
     "<div id=baseline>Ag <small>small</small> Égj</div>";
 
-static void raster_error(
-    char *error, size_t error_size, const char *format, ...)
-{
-    if (error == NULL || error_size == 0) return;
-    va_list arguments;
-    va_start(arguments, format);
-    vsnprintf(error, error_size, format, arguments);
-    va_end(arguments);
-}
+#define raster_error tilefinch_format_error
 
 static unsigned rgb565_weight(uint16_t pixel)
 {

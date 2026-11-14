@@ -52,6 +52,12 @@ bool voice_job_lifecycle_disables_voice(const VoiceJobLifecycle *lifecycle)
     return lifecycle != NULL && lifecycle->timed_out;
 }
 
+bool voice_job_lifecycle_accepts_result(const VoiceJobLifecycle *lifecycle)
+{
+    return lifecycle != NULL && lifecycle->completed && !lifecycle->timed_out
+        && !voice_job_lifecycle_cancelled(lifecycle);
+}
+
 VoiceJobLifecycleResult voice_job_lifecycle_pump(
     VoiceJobLifecycle *lifecycle,
     const VoiceJobLifecyclePlatform *platform)

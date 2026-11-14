@@ -409,6 +409,25 @@ void script_runtime_telemetry(const ScriptRuntime *runtime,
     telemetry->dom_mutations = runtime->result.dom_mutations;
 }
 
+#if !defined(TILEFINCH_NO_TRACE) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+void script_runtime_dom_handle_counters(const ScriptRuntime *runtime,
+                                        ScriptDomHandleCounters *counters)
+{
+    if (counters == NULL) return;
+    memset(counters, 0, sizeof(*counters));
+    if (runtime == NULL) return;
+    const ScriptResult *result = &runtime->result;
+    counters->live = result->dom_handle_slots_live;
+    counters->peak = result->dom_handle_slots_peak;
+    counters->capacity = result->dom_handle_slot_capacity;
+    counters->growths = result->dom_handle_growths;
+    counters->growth_refusals = result->dom_handle_growth_refusals;
+    counters->exhaustions = result->dom_handle_exhaustions;
+    counters->connected_releases = result->dom_handle_connected_releases;
+    counters->connected_preserves = result->dom_handle_connected_preserves;
+}
+#endif
+
 void script_runtime_preserve_first_error(const ScriptRuntime *runtime,
                                          ScriptResult *result)
 {

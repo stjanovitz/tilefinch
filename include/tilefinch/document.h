@@ -4,12 +4,15 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
+#include <strings.h>
 
 #include <lexbor/html/html.h>
 #include <lexbor/html/tokenizer.h>
 
 #include "tilefinch/budget.h"
 #include "tilefinch/content_security_policy.h"
+#include "tilefinch/sha256.h"
 #include "tilefinch/text_encoding.h"
 
 typedef struct DocumentControlState DocumentControlState;
@@ -245,6 +248,22 @@ typedef struct {
     /* The process-wide frame-container insertion count when this document's
        parse began; see document_frames_impossible(). */
     uint64_t frame_insertions_at_parse;
+    /* The process-wide <meta> insertion count at this document's last meta
+       policy scan (document_apply_meta_csp). */
+    uint64_t meta_insertions_seen;
+    /* Told when a <meta> policy joins content_security_policy, so a realm
+       created earlier can adopt the restriction (eval is decided per
+       realm). Set by the realm that owns the document. */
+    void (*content_security_policy_changed)(void *opaque);
+    void *content_security_policy_changed_opaque;
+    /* Classic deferred/async requests prepared at their parser end tag.
+       A later meta policy does not judge that exact target. Missing or
+       refused records grant nothing; retired nodes lose their records. */
+    struct {
+        const void *node;
+        uint8_t target_digest[TILEFINCH_SHA256_DIGEST_BYTES];
+        uint8_t policies_before;
+    } meta_csp_prepared[16];
     /* Advances when document.write() may have inserted nodes: before each
        script a write closes and when a write() returns. A realm's DOM
        caches (its DOM version) follow it, since a script's own write()
@@ -260,6 +279,7 @@ static inline bool document_is_declared_video_card(
             || node == document->reader_declared_video_card_node);
 }
 
+
 /* Whether `node` is an element whose local name is the static lexbor tag
    `tag`. Every element's local name is interned lower-case and a name in
    lexbor's static table always takes that table's id, so this is exactly
@@ -273,6 +293,17 @@ static inline bool document_node_is_tag(const lxb_dom_node_t *node,
 {
     return node != NULL && node->type == LXB_DOM_NODE_TYPE_ELEMENT
         && node->local_name == tag;
+}
+
+/* Whether `node` is `ancestor` or lies inside it (parent links only, so
+   not through a shadow host). */
+static inline bool document_node_within(const lxb_dom_node_t *node,
+                                        const lxb_dom_node_t *ancestor)
+{
+    for (const lxb_dom_node_t *at = node; at != NULL; at = at->parent) {
+        if (at == ancestor) return true;
+    }
+    return false;
 }
 
 /* Replaces `element`'s children with parsed `markup`, as innerHTML does. */
@@ -346,6 +377,8 @@ typedef struct {
     bool truncated_script_overflow;
     bool discard_inert_script_text;
     bool scripting_enabled;
+    /* A navigation's page document: <meta> policies apply as parsed. */
+    bool apply_meta_csp;
     bool active;
     bool failed;
     bool input_ended;
@@ -425,6 +458,9 @@ bool document_parser_begin(DocumentParser *parser, Budget *budget);
    HTML tree builder instead of exposing its fallback elements to style and
    layout consumers. */
 bool document_parser_set_scripting(DocumentParser *parser, bool enabled);
+/* Before any input: apply each <meta http-equiv="Content-Security-Policy">
+   in the head as it is parsed (document_apply_meta_csp). */
+bool document_parser_set_meta_csp(DocumentParser *parser, bool enabled);
 /* When author scripts are disabled, avoid materializing their potentially
    multi-megabyte raw-text payloads in the DOM. A bounded amount of JSON-LD is
    retained for semantic media and Reader discovery. */
@@ -487,6 +523,30 @@ bool document_element_set_nonce(PocDocument *document,
 /* Called once a header-delivered policy is known; hides the nonces of
    already connected elements and of every element connected later. */
 bool document_nonce_hiding_enable(PocDocument *document);
+/* HTML's http-equiv "Content-Security-Policy" state: appends the policy of
+   every <meta http-equiv="Content-Security-Policy" content="..."> in the
+   document's head (Chrome's rule: a connected descendant of document.head)
+   to the document's policy. It runs where an element is inserted (the
+   streaming parser after each token, the DOM bridge after an insertion),
+   so a policy applies from its insertion on and never to what was already
+   checked; removing the element later does not remove the policy. Unless
+   `force`, the head is scanned only when some <meta> was inserted since
+   the document's last scan. Returns whether the enforced policy changed
+   (and then calls content_security_policy_changed). With `force` (a
+   document parsed whole before its scripts run) no element counts as
+   prepared before the policies. */
+bool document_apply_meta_csp(PocDocument *document, bool force);
+/* Called only at a parser script-close checkpoint. Remembers an eligible
+   classic deferred/async request's resolved URL and current policy count.
+   Refusal is fail-closed, never a reason to stop the document. */
+void document_meta_csp_prepare_script(PocDocument *document,
+                                      lxb_dom_node_t *node,
+                                      const char *document_url);
+/* Consumes the prepared record. Only that same resolved request target is
+   exempt from policies added after preparation; every other target gets 0. */
+uint8_t document_meta_csp_take_prepared_grant(PocDocument *document,
+                                             const lxb_dom_node_t *node,
+                                             const char *base_url);
 /* HTML cloning steps: copy each source element's [[CryptographicNonce]]
    to its clone (after Lexbor copied attributes and the caller cleared the
    clone's native state). False when the bounded walk is exceeded. */
@@ -514,18 +574,24 @@ bool document_nonce_clone_subtree(lxb_dom_node_t *source,
    refused registration leaves everything as it was. */
 #define DOCUMENT_ADOPTED_SHEETS_PER_ROOT 16u
 /* Lit gives every component instance's shadow root its class's sheets, so
-   a component page needs one list per live root (MDN: ~100 when its
-   budget admits that many roots; the Internet Archive's search results
-   ~385), bounded by DOM_BRIDGE_SHADOW_ROOT_LIMIT. The sorted index is
-   uint16_t; the registry exists only on pages that adopt sheets. */
-#define DOCUMENT_ADOPTION_ROOT_LIMIT 512u
+   a component page needs one list per live root (MDN: ~100; the Internet
+   Archive's search results six per result tile, ~385 for 64 tiles and
+   more as its infinite scroll adds them). How many roots a page attaches
+   is decided by memory (js_dom_register_shadow_root); this bound equals
+   the bridge's hard bound, DOM_BRIDGE_SHADOW_ROOT_LIMIT (asserted in
+   js_dom_handles.inc), the document's own list included. The list block
+   grows with use; the sorted index is uint16_t; the registry exists only
+   on pages that adopt sheets. */
+#define DOCUMENT_ADOPTION_ROOT_LIMIT 2048u
 #define DOCUMENT_CONSTRUCTED_SHEET_LIMIT 128u
 #define DOCUMENT_CONSTRUCTED_TEXT_LIMIT (1024u * 1024u)
-/* CSSOM override entries: at most one per script DOM handle, so this is
-   SCRIPT_DOM_HANDLE_SLOT_CAPACITY_MAX (js_runtime.h asserts they agree). */
-#define DOCUMENT_CSSOM_SHEET_LIMIT 16352u
+/* CSSOM override entries: one per <style> node a script edited. Each edit
+   needs a DOM handle, so this is SCRIPT_DOM_HANDLE_SLOT_CAPACITY_MAX
+   (js_runtime.h asserts they agree); an entry outlives a handle slot the
+   bridge released, so the cap, not the handle table, bounds the count. */
+#define DOCUMENT_CSSOM_SHEET_LIMIT 65504u
 /* CSSOM edits never change DOM text. Overrides have reusable Budget-owned
-   storage, one entry per admitted DOM handle and at most 1 MiB UTF-8 text
+   storage, one entry per edited <style> node and at most 1 MiB UTF-8 text
    per source (the bridge's 256 Ki UTF-16-unit quota). Aggregate text and
    capacity share the existing Budget ceiling; constructed sheet quotas
    remain unchanged. Author child/data edits reset even identical writes. */
@@ -787,7 +853,28 @@ void document_body_snapshot_destroy(DocumentBodySnapshot *snapshot);
 const char *document_body_text(PocDocument *document);
 void document_destroy(PocDocument *document);
 lxb_dom_node_t *document_body_node(const PocDocument *document);
+/* The live <head>: the first HEAD child of the root element, or NULL. Never
+   lexbor's cached head pointer, which can outlive the head it names. */
+lxb_dom_node_t *document_head_node(const PocDocument *document);
 const char *document_element_name(lxb_dom_node_t *node, size_t *length);
+/* Whether `node` is an element named exactly `wanted` (lower-case for HTML
+   elements), or named `wanted` up to ASCII case. */
+static inline bool document_element_name_is(lxb_dom_node_t *node,
+                                            const char *wanted)
+{
+    size_t length = 0;
+    const char *name = document_element_name(node, &length);
+    return name != NULL && strlen(wanted) == length
+        && memcmp(name, wanted, length) == 0;
+}
+static inline bool document_element_name_is_ignoring_case(
+    lxb_dom_node_t *node, const char *wanted)
+{
+    size_t length = 0;
+    const char *name = document_element_name(node, &length);
+    return name != NULL && strlen(wanted) == length
+        && strncasecmp(name, wanted, length) == 0;
+}
 const char *document_attribute(lxb_dom_node_t *node, const char *name,
                                size_t *length);
 /* An HTML <meta http-equiv=refresh> (ASCII case-insensitive). */
@@ -909,5 +996,36 @@ bool document_mobile_viewport(const PocDocument *document, int device_width,
    it against document_base_url before any network or storage operation. */
 const char *document_web_app_manifest_href(
     const PocDocument *document, size_t *length);
+
+/* Memory-study diagnostics (TILEFINCH_MEMORY_DIAGNOSTICS builds): the
+   make-up of one document's DOM, by a bounded walk at report time. Arena
+   figures are Budget charges (headers included); "used" is the bytes the
+   arena handed out, freed blocks it keeps for reuse included. */
+typedef struct {
+    size_t node_arena_chunks, node_arena_bytes, node_arena_used;
+    size_t text_arena_chunks, text_arena_bytes, text_arena_used;
+    size_t hash_bytes;
+    size_t script_text_bytes, script_text_nodes, script_text_largest;
+    size_t style_text_bytes, style_text_nodes, style_text_largest;
+    size_t other_text_bytes, comment_bytes;
+    size_t attribute_value_bytes;
+    size_t elements, text_nodes, attributes, nodes;
+    size_t tokenizer_capacity;
+    /* Lexbor's own objects outside the arenas: the document object, the
+       parser, tokenizer (its buffer, token pools and scratch arena) and
+       tree builder with their stacks, as Budget charges. */
+    size_t lexbor_object_bytes;
+    /* The extracted body text and Tilefinch's per-document side tables
+       (title, control states, nonce registry, adopted/CSSOM sheets,
+       registered properties, declared-video and media JSON caches, base
+       URL snapshots) charged DOM. */
+    size_t body_text_bytes;
+    size_t side_table_bytes;
+    bool truncated;
+} DocumentMemorySplit;
+bool document_memory_split(const PocDocument *document,
+                           DocumentMemorySplit *split);
+/* Largest tokenizer buffer any parse held between input windows. */
+size_t document_tokenizer_high_water(void);
 
 #endif

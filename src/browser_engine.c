@@ -56,6 +56,14 @@ typedef struct {
     BrowserNavigationJobStatus status;
     TilefinchDiagnosticSubsystem failure_subsystem;
     TilefinchDiagnosticCode failure_code;
+    /* Budget refusals made by the load's own steps (its start and its
+       pumps): a failure after one is reported as memory
+       (browser_engine_failure_code). The incumbent page keeps running on the
+       same Budget between pumps, and its recoverable refusals (cache puts,
+       optional decodes) are not the load's. */
+    size_t load_budget_failures;
+    /* engine->budget.failure_count when the step now running began. */
+    size_t budget_failures_mark;
     size_t previous_history_index;
     BrowserHistoryView restore;
     BrowserNavigationJobMetrics metrics;
@@ -306,6 +314,9 @@ struct BrowserEngine {
     size_t find_layout_generation;
     TilefinchDiagnosticSubsystem last_diagnostic_subsystem;
     TilefinchDiagnosticCode last_diagnostic_code;
+    /* The last load's failure (browser_engine_failure_code); OK after a
+       commit or a cancel. */
+    TilefinchDiagnosticCode last_navigation_failure_code;
     /* Compile-admission rejections already observed on the current page, so
        each rejection produces one warning event rather than one per frame. */
     size_t observed_compile_rejections;
@@ -394,7 +405,9 @@ static uint64_t browser_engine_recovery_now_us(void)
 }
 
 static bool browser_engine_input_ready(const BrowserEngine *engine);
-static bool browser_engine_complete_layout(BrowserEngine *engine);
+static bool browser_engine_complete_layout(
+    BrowserEngine *engine, const lxb_dom_node_t *const *through,
+    size_t through_count);
 static bool browser_engine_settle_bounded_layout(BrowserEngine *engine);
 static bool browser_engine_finish_input(BrowserEngine *engine,
                                         bool succeeded);
@@ -463,6 +476,32 @@ static bool set_error_code(BrowserEngine *engine,
             engine->last_error, 0, 0);
     }
     return false;
+}
+
+/* What a failed load ran into, for the frontend's headline
+   (browser_engine_navigation_failure_code) and the diagnostic event, from
+   typed facts rather than the engine sentence, which stays in last_error
+   for the Diagnostic QR. In order: the transport's timeout, the document
+   over its byte limit, an allocation the budget refused during the load,
+   no response at all; otherwise `fallback`. */
+static TilefinchDiagnosticCode browser_engine_failure_code(
+    const BrowserEngine *engine, size_t load_budget_failures,
+    TilefinchDiagnosticCode fallback)
+{
+    const NavigationSession *navigation = &engine->navigation;
+    if (navigation->last_transport_timed_out)
+        return TILEFINCH_DIAGNOSTIC_TIMEOUT;
+    if (navigation->last_response_limit_exceeded)
+        return TILEFINCH_DIAGNOSTIC_LIMIT_REACHED;
+    /* Before "no response": a load that could not reserve its transport
+       buffers never got one either. */
+    if (load_budget_failures != 0)
+        return TILEFINCH_DIAGNOSTIC_ALLOCATION_FAILED;
+    if (navigation->last_http_status == 0 && !navigation->last_response_started
+        && fallback == TILEFINCH_DIAGNOSTIC_NETWORK_FAILED)
+        return TILEFINCH_DIAGNOSTIC_NETWORK_FAILED;
+    return fallback == TILEFINCH_DIAGNOSTIC_NETWORK_FAILED
+        ? TILEFINCH_DIAGNOSTIC_INTERNAL_FAILED : fallback;
 }
 
 static void clear_error(BrowserEngine *engine)
@@ -1868,6 +1907,13 @@ bool browser_engine_last_tls_verification_failed(
         && engine->navigation.last_tls_verification_failed;
 }
 
+TilefinchDiagnosticCode browser_engine_navigation_failure_code(
+    const BrowserEngine *engine)
+{
+    return engine == NULL ? TILEFINCH_DIAGNOSTIC_INVALID_INPUT
+                          : engine->last_navigation_failure_code;
+}
+
 TilefinchDiagnosticCode browser_engine_last_diagnostic_code(
     const BrowserEngine *engine)
 {
@@ -1964,6 +2010,15 @@ bool browser_engine_content_blocker_set_allowed_sites(
     return engine != NULL && engine->state == BROWSER_ENGINE_ACTIVE
         && content_blocker_set_allowed_sites(
                engine->content_blocker, sites, count);
+}
+
+bool browser_engine_content_blocker_set_paywall_scripts(
+    BrowserEngine *engine, bool blocked)
+{
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        || engine->content_blocker == NULL) return false;
+    content_blocker_set_paywall_scripts(engine->content_blocker, blocked);
+    return true;
 }
 
 bool browser_engine_content_blocker_metrics(
@@ -2402,6 +2457,24 @@ static void browser_engine_copy_adapter_metrics(
     }
 }
 
+/* The load's own refusals so far: those of its finished steps and of the
+   one now running. */
+static size_t browser_engine_load_budget_failures(const BrowserEngine *engine)
+{
+    const BrowserEngineNavigationWork *work = &engine->navigation_work;
+    return work->load_budget_failures
+        + (engine->budget.failure_count - work->budget_failures_mark);
+}
+
+/* A load step ends: what it refused stays counted, and whatever the
+   incumbent page refuses before the next step is not. */
+static void browser_engine_note_load_step(BrowserEngine *engine)
+{
+    BrowserEngineNavigationWork *work = &engine->navigation_work;
+    work->load_budget_failures = browser_engine_load_budget_failures(engine);
+    work->budget_failures_mark = engine->budget.failure_count;
+}
+
 static BrowserNavigationJobStatus browser_engine_finish_navigation_work(
     BrowserEngine *engine, NavigationLoadStatus terminal)
 {
@@ -2546,6 +2619,10 @@ static BrowserNavigationJobStatus browser_engine_finish_navigation_work(
                ? engine->last_error : "navigation failed");
         work->status = BROWSER_NAVIGATION_JOB_FAILED;
         work->metrics.status = work->status;
+        work->failure_code = browser_engine_failure_code(
+            engine, browser_engine_load_budget_failures(engine),
+            work->failure_code);
+        engine->last_navigation_failure_code = work->failure_code;
         (void) set_error_code(
             engine, work->failure_subsystem, work->failure_code,
             "navigation-failed", message);
@@ -2573,6 +2650,10 @@ static bool browser_engine_begin_navigation_request(
         || url[0] == '\0' || strlen(url) >= NAVIGATION_URL_LIMIT
         || maximum_bytes == 0 || timeout_ms <= 0
         || browser_engine_navigation_pending(engine)) {
+        /* A pending load keeps its own outcome. */
+        if (engine != NULL && !browser_engine_navigation_pending(engine))
+            engine->last_navigation_failure_code =
+                TILEFINCH_DIAGNOSTIC_INVALID_INPUT;
         return set_error_code(
             engine, TILEFINCH_SUBSYSTEM_ENGINE,
             TILEFINCH_DIAGNOSTIC_INVALID_INPUT, "navigation-start",
@@ -2592,6 +2673,8 @@ static bool browser_engine_begin_navigation_request(
        If the user outruns Wi-Fi association, finish the two-face baseline
        here before the candidate is allowed to measure text. */
     if (!browser_engine_prepare_navigation_fonts(engine, method, url)) {
+        engine->last_navigation_failure_code =
+            TILEFINCH_DIAGNOSTIC_ALLOCATION_FAILED;
         return set_error_code(
             engine, TILEFINCH_SUBSYSTEM_RENDER,
             TILEFINCH_DIAGNOSTIC_ALLOCATION_FAILED, "font-baseline",
@@ -2625,6 +2708,7 @@ static bool browser_engine_begin_navigation_request(
         .status = BROWSER_NAVIGATION_JOB_PENDING,
         .failure_subsystem = TILEFINCH_SUBSYSTEM_NETWORK,
         .failure_code = TILEFINCH_DIAGNOSTIC_NETWORK_FAILED,
+        .budget_failures_mark = engine->budget.failure_count,
         .previous_backing = engine->backing,
         .previous_backing_valid =
             document_backing_valid(&engine->backing),
@@ -2632,6 +2716,7 @@ static bool browser_engine_begin_navigation_request(
             tilefinch_platform_monotonic_time_us(),
         .record_history = record_history
     };
+    engine->last_navigation_failure_code = TILEFINCH_DIAGNOSTIC_OK;
     snprintf(work->url, sizeof(work->url), "%s", url);
     work->metrics.status = BROWSER_NAVIGATION_JOB_PENDING;
     if (engine->navigation.page.loaded)
@@ -2688,6 +2773,7 @@ static bool browser_engine_begin_navigation_request(
                 engine, NAVIGATION_LOAD_FAILED);
             return false;
         }
+        browser_engine_note_load_step(engine);
         return true;
     }
     work->load = navigation_load_begin_request(
@@ -2705,6 +2791,7 @@ static bool browser_engine_begin_navigation_request(
             engine, NAVIGATION_LOAD_FAILED);
         return false;
     }
+    browser_engine_note_load_step(engine);
     return true;
 }
 
@@ -3021,8 +3108,10 @@ bool browser_engine_begin_navigation_history(
 /* A refused opted-in Google search (site_identity.h) fails without
    committing and clears the opt-in. Continue the same job on the local
    compatibility page for that query, which now carries its refusal note.
-   The fallback replaces or adds a history entry as the refused navigation
-   would have; a refused history traversal only restores its entry. */
+   A refused accounts.google.com page continues on that page, reloaded once
+   with the shipping identity. The fallback replaces or adds a history entry
+   as the refused navigation would have; a refused history traversal only
+   restores its entry. */
 static BrowserNavigationJobStatus browser_engine_google_fallback(
     BrowserEngine *engine, BrowserNavigationJobStatus finished)
 {
@@ -3030,7 +3119,8 @@ static BrowserNavigationJobStatus browser_engine_google_fallback(
     if (finished != BROWSER_NAVIGATION_JOB_FAILED
         || !site_identity_take_google_fallback(url, sizeof(url))
         || engine->navigation_work.history_move
-        || !site_adapter_handles_navigation("GET", url)) return finished;
+        || !(site_adapter_handles_navigation("GET", url)
+             || site_identity_accounts_host(url))) return finished;
     bool record_history = engine->navigation_work.record_history;
     engine->navigation.pending_navigation_referer[0] = '\0';
     engine->navigation.pending_navigation_user_activated = false;
@@ -3043,13 +3133,10 @@ static BrowserNavigationJobStatus browser_engine_google_fallback(
     return engine->navigation_work.status;
 }
 
-BrowserNavigationJobStatus browser_engine_pump_navigation(
+static BrowserNavigationJobStatus browser_engine_pump_navigation_step(
     BrowserEngine *engine, const BrowserNavigationJobQuota *quota)
 {
-    if (engine == NULL) return BROWSER_NAVIGATION_JOB_FAILED;
     BrowserEngineNavigationWork *work = &engine->navigation_work;
-    if (work->status != BROWSER_NAVIGATION_JOB_PENDING)
-        return work->status;
     if (work->adapter != NULL) {
         uint64_t started_us =
             tilefinch_platform_monotonic_time_us();
@@ -3195,6 +3282,21 @@ BrowserNavigationJobStatus browser_engine_pump_navigation(
     }
     return browser_engine_google_fallback(
         engine, browser_engine_finish_navigation_work(engine, status));
+}
+
+BrowserNavigationJobStatus browser_engine_pump_navigation(
+    BrowserEngine *engine, const BrowserNavigationJobQuota *quota)
+{
+    if (engine == NULL) return BROWSER_NAVIGATION_JOB_FAILED;
+    BrowserEngineNavigationWork *work = &engine->navigation_work;
+    if (work->status != BROWSER_NAVIGATION_JOB_PENDING)
+        return work->status;
+    work->budget_failures_mark = engine->budget.failure_count;
+    BrowserNavigationJobStatus status =
+        browser_engine_pump_navigation_step(engine, quota);
+    if (engine->navigation_work.status == BROWSER_NAVIGATION_JOB_PENDING)
+        browser_engine_note_load_step(engine);
+    return status;
 }
 
 void browser_engine_cancel_navigation(BrowserEngine *engine,
@@ -3435,6 +3537,25 @@ const char *browser_engine_pending_navigation_url(
         ? engine->navigation_work.url : NULL;
 }
 
+BrowserNavigationPhase browser_navigation_job_phase(
+    const BrowserNavigationJobMetrics *metrics)
+{
+    if (metrics == NULL) return BROWSER_NAVIGATION_PHASE_CONNECTING;
+    const NavigationLoadMetrics *load = &metrics->load;
+    bool scripts = load->scripts_evaluated != 0;
+    /* Past the network share of completion (navigation_load_metrics caps
+       it at 700): the document is in and the load builds and commits. */
+    if (metrics->completion_per_mille > 700u)
+        return scripts ? BROWSER_NAVIGATION_PHASE_RUNNING_SCRIPTS
+                       : BROWSER_NAVIGATION_PHASE_FINISHING;
+    if (scripts && load->response_received)
+        return BROWSER_NAVIGATION_PHASE_RUNNING_SCRIPTS;
+    if (load->stream.headers_delivered || load->body_bytes != 0
+        || load->stream.downloaded_bytes != 0)
+        return BROWSER_NAVIGATION_PHASE_RECEIVING;
+    return BROWSER_NAVIGATION_PHASE_CONNECTING;
+}
+
 bool browser_engine_navigation_job_metrics(
     const BrowserEngine *engine, BrowserNavigationJobMetrics *metrics)
 {
@@ -3511,6 +3632,8 @@ static bool browser_engine_run_load(BrowserEngine *engine,
         TILEFINCH_SUBSYSTEM_ENGINE, TILEFINCH_DIAGNOSTIC_LIFECYCLE,
         "navigation-start", "candidate load started",
         engine->navigation.loads_started + 1, 0);
+    size_t budget_failures_at_start = engine->budget.failure_count;
+    engine->last_navigation_failure_code = TILEFINCH_DIAGNOSTIC_OK;
     DocumentBacking previous = engine->backing;
     bool previous_valid = document_backing_valid(&previous);
     if (!navigation_set_candidate_commit_hooks(
@@ -3546,7 +3669,11 @@ static bool browser_engine_run_load(BrowserEngine *engine,
             ? engine->navigation.last_error
             : (engine->last_error[0] != '\0'
                ? engine->last_error : "navigation failed");
-        return set_error_code(engine, subsystem, failure_code,
+        engine->last_navigation_failure_code = browser_engine_failure_code(
+            engine, engine->budget.failure_count - budget_failures_at_start,
+            failure_code);
+        return set_error_code(engine, subsystem,
+                              engine->last_navigation_failure_code,
                               "navigation-failed", message);
     }
     if (!shell_ready) {
@@ -3820,12 +3947,14 @@ bool browser_engine_load_url_with_limits(
         engine, browser_engine_do_load_url, &load, TILEFINCH_SUBSYSTEM_NETWORK,
         TILEFINCH_DIAGNOSTIC_NETWORK_FAILED);
     /* The synchronous form of browser_engine_google_fallback(). The opt-in
-       is already cleared, so the retry is the bounded local page. */
+       or the accounts identity is already cleared, so the retry is the
+       bounded local page or a page that cannot be refused again. */
     char google_fallback[NAVIGATION_URL_LIMIT];
     if (!loaded
         && site_identity_take_google_fallback(
                google_fallback, sizeof(google_fallback))
-        && site_adapter_handles_navigation("GET", google_fallback)) {
+        && (site_adapter_handles_navigation("GET", google_fallback)
+            || site_identity_accounts_host(google_fallback))) {
         engine->config.maximum_document_bytes = saved_maximum;
         engine->config.navigation_timeout_ms = saved_timeout;
         return browser_engine_load_url_with_limits(
@@ -4026,7 +4155,7 @@ static bool browser_engine_settle_bounded_layout(BrowserEngine *engine)
     if (navigation_bounded_focus_region_end(&engine->navigation) == 0)
         return true;
     engine->navigation.performance.bounded_focus_input_settles++;
-    (void) browser_engine_complete_layout(engine);
+    (void) browser_engine_complete_layout(engine, NULL, 0);
     /* The pending mutations' relayout can retire a page that no longer
        fits: the input then has no page to act on. */
     if (!engine->navigation.page.loaded)
@@ -4830,14 +4959,6 @@ bool browser_engine_execute_action(BrowserEngine *engine,
             || !browser_engine_refresh_shell(engine))) return false;
     clear_error(engine);
     return true;
-}
-
-const RenderCanvasDeferral *browser_engine_canvas_deferral(
-    const BrowserEngine *engine, const uint16_t *frame)
-{
-    if (engine == NULL || frame == NULL || frame != engine->render.frame)
-        return NULL;
-    return tile_cache_canvas_deferral(&engine->render);
 }
 
 bool browser_engine_canvas_materialize(BrowserEngine *engine)
@@ -6081,9 +6202,20 @@ bool browser_engine_page_script_memory_failed(const BrowserEngine *engine)
     return navigation != NULL
         && (navigation->page.script_memory_limited
             || navigation->page.script_result.host_compile_memory_refusals
-                   != 0u
+                   > navigation_page_late_compile_memory_refusals(
+                         &navigation->page)
             || (navigation->page.runtime == NULL
                 && navigation->page.script_degradation_observed));
+}
+
+bool browser_engine_page_scripts_stopped_for_memory(
+    const BrowserEngine *engine)
+{
+    const NavigationSession *navigation =
+        browser_engine_active_navigation(engine);
+    return navigation != NULL && navigation->page.loaded
+        && navigation->page.script_stop.reason
+               == NAVIGATION_SCRIPT_STOP_MEMORY;
 }
 
 static bool browser_engine_copy_entry_text(
@@ -6225,6 +6357,18 @@ bool browser_engine_validation_counters(
            sizeof(counters->last_cf_mitigated));
     counters->managed_challenge_heap_raises =
         navigation->managed_challenge_heap_raises;
+    const NavigationEntry *entry = navigation_current(navigation);
+    int64_t top = entry == NULL ? 0 : entry->scroll_y;
+    int64_t bottom = top + navigation->viewport.css_height;
+    const LayoutDocument *layout = &navigation->page.layout;
+    for (size_t i = 0; i < layout->count; i++) {
+        const DrawCommand *command = &layout->commands[i];
+        if (command->type == DRAW_IMAGE && command->image != NULL
+            && command->width >= 32 && command->height >= 32
+            && command->y < bottom
+            && (int64_t) command->y + command->height > top)
+            counters->visible_images++;
+    }
     return true;
 }
 #endif
@@ -6382,6 +6526,9 @@ bool browser_engine_apply_presentation(
 
 #include "browser_engine/reader_recovery.inc"
 #include "browser_engine/embed_hop.inc"
+#if defined(TILEFINCH_MEMORY_DIAGNOSTICS)
+#include "browser_engine/memory_report.inc"
+#endif
 
 const NavigationSession *browser_engine_navigation_view(
     const BrowserEngine *engine)

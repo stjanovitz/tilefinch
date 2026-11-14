@@ -1674,6 +1674,33 @@
         CHECK(budget.current == 0);
     }
 
+    puts("test: a script-built style sheet over 256 KiB applies");
+    {
+        /* As a page that loads its CSS late: one Text node holding the
+           whole sheet goes into a <style>, which goes into <head>.
+           createTextNode used to return null above 256 KiB. */
+        static const char html[] =
+            "<!doctype html><head></head><body><p>large-sheet-probe</p>";
+        CHECK(navigation_init(&interactive, &budget, 4));
+        navigation_enable_scripts(&interactive, 8 * MIB, 1000);
+        uint64_t generation = navigation_begin(&interactive);
+        CHECK(navigation_commit_html(&interactive, generation,
+            "https://example.test/large-sheet", html, sizeof(html) - 1,
+            480, NULL, NULL, true));
+        CHECK(script_runtime_evaluate_diagnostic(interactive.page.runtime,
+            "var d=document.createElement('STYLE');d.type='text/css';"
+            "d.appendChild(document.createTextNode("
+            "'/*'+'x'.repeat(300000)+'*/p{color:#2a4b6c}'));"
+            "document.getElementsByTagName('HEAD')[0].appendChild(d);",
+            "<large-sheet>", &interactive.page.script_result)
+            && script_runtime_consume_relayout(interactive.page.runtime)
+            && navigation_relayout(&interactive));
+        CHECK(late_init_text_color(&interactive.page.layout,
+            "large-sheet-probe") == 0x2a4b6c);
+        navigation_destroy(&interactive);
+        CHECK(budget.current == 0);
+    }
+
     puts("test: node retirement scopes removals and innerHTML replacements");
     {
         /* Enough elements and rules for a page reuse cache with retained
@@ -2021,6 +2048,10 @@
     CHECK(test_retained_gate_follows_head_cut_and_adoption(&budget));
     puts("test: a full adopted root table keeps shadow-confined rules");
     CHECK(test_constructed_sheet_full_root_table(&budget));
+    puts("test: shadow roots are admitted by memory, not a share of the limit");
+    CHECK(test_shadow_root_memory_admission(&budget));
+    puts("test: ResizeObserver reads engine style, not getComputedStyle");
+    CHECK(test_resize_observer_reads_engine_style(&budget));
     puts("test: a dense match set keeps the shadow context order");
     CHECK(test_shadow_cascade_dense_matches(&budget));
     puts("test: inner important rules beat inline important");

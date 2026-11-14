@@ -9,6 +9,7 @@
 #include "diagnostic_trace.h"
 #include "tilefinch_test_faults.h"
 
+#include "tilefinch/media_capture.h"
 #include "tilefinch/page_dialog.h"
 #include "tilefinch/js_runtime.h"
 #ifndef __PSP__
@@ -76,6 +77,13 @@ typedef struct {
     uint64_t source_hash;
 } BrowserBootstrapBytecode;
 
+/* The atoms the embedded bytecode names by index: pinned first in every
+   runtime that restores it (JS_PinAtomTable), so its functions run from
+   ROM without a per-realm copy. */
+extern const unsigned char browser_bootstrap_atom_table[];
+extern const size_t browser_bootstrap_atom_table_length;
+extern const uint32_t browser_bootstrap_atom_count;
+
 /* Bootstrap declarations share the generation manifest, preventing authored
    modules, embedded sources, and embedded bytecode from drifting apart. */
 #define BOOTSTRAP_SOURCE(source_symbol, file_name, source_name,              \
@@ -120,10 +128,6 @@ JSValue js_dom_parse_color(JSContext *context,
    fragment builder; 64KB rejected the larger sections and
    left pages expanded.  Budget accounting still bounds the memory. */
 #define DOM_INNER_HTML_LIMIT (256u * 1024u)
-/* Text nodes carry no parse cost; some module loaders flush CSS as one
-   buffered <style> text that routinely exceeds the
-   innerHTML bound. */
-#define DOM_TEXT_NODE_LIMIT (256u * 1024u)
 #define DOM_MUTATION_BATCH_LIMIT 128u
 #define DOM_SCROLL_INTENT_LIMIT 16u
 #define SCRIPT_DEFAULT_SLOW_DEPENDENCY_US UINT64_C(16000)
@@ -177,12 +181,20 @@ JSValue js_dom_parse_color(JSContext *context,
 #define SCRIPT_REALM_MAXIMUM_SCRIPTS 256u
 #define SCRIPT_REALM_MAXIMUM_FILE_BYTES (8u * 1024u * 1024u)
 #define SCRIPT_REALM_MAXIMUM_TOTAL_BYTES (128u * 1024u * 1024u)
-#define SCRIPT_LAZY_BOOTSTRAP_FEATURE_COUNT 16u
+#define SCRIPT_LAZY_BOOTSTRAP_FEATURE_COUNT 17u
 /* A fully hydrated long article exceeds 4096 nodes several times
    over; a truncated walk silently drops querySelectorAll matches (the
    mobile section transform only saw the first few sections).
    Still bounded per call to keep PSP worst cases finite. */
 #define DOM_TRAVERSAL_VISIT_LIMIT 32768u
+
+/* The heap composition census (JS_ComputeMemoryDetail): the host lab's
+   TILEFINCH_TRACE_JS_HEAP_DETAIL, and PSP validation builds' report-time
+   census (validation_js_heap_detail). */
+#if defined(CONFIG_TILEFINCH_HEAP_DETAIL) \
+    && (!defined(TILEFINCH_NO_TRACE) || defined(TILEFINCH_PSP_VALIDATION_LOG))
+#define TILEFINCH_JSMEM_CENSUS 1
+#endif
 
 #undef budget_malloc
 #undef budget_calloc
@@ -217,34 +229,45 @@ typedef struct {
    far below it. */
 #define SCRIPT_ENTRY_REFUSAL_LIMIT 256u
 
-/* The base table size every runtime allocates at creation; a policy may let
-   it grow to DOM_BRIDGE_NODE_LIMIT_MAX (see DomBridge.node_capacity). */
+/* The table's default ceiling; below it a full table grows before it
+   reclaims (js_rt_bridge_register_node). A policy may raise the ceiling to
+   DOM_BRIDGE_NODE_LIMIT_MAX (see DomBridge.node_capacity); growth past
+   DOM_BRIDGE_NODE_BUDGET_CAPACITY is memory-admitted
+   (bridge_node_table_grow). */
 #define DOM_BRIDGE_NODE_LIMIT SCRIPT_DOM_HANDLE_SLOT_CAPACITY
 #define DOM_BRIDGE_NODE_LIMIT_MAX SCRIPT_DOM_HANDLE_SLOT_CAPACITY_MAX
+#define DOM_BRIDGE_NODE_BUDGET_CAPACITY SCRIPT_DOM_HANDLE_SLOT_BUDGET_CAPACITY
+#define DOM_BRIDGE_NODE_GROWTH_STEP SCRIPT_DOM_HANDLE_SLOT_GROWTH_STEP
 #define DOM_BRIDGE_WRAPPER_PLAIN_KEYS 6
-/* Live shadow roots per realm: the handle table's capacity. How many a page
-   may attach scales with its page budget (js_dom_register_shadow_root):
-   component sites nest them (MDN's Lit reference page attaches ~70), and
-   every root and the component behind it costs memory. Native members now
-   share one prototype instead of a full property/shape copy per root; the
-   unchanged 32 MiB page budget can admit the table's smaller representation.
-   A shared-prototype root costs about 8 KiB beside its host (host
-   fixture: 200 one-sheet components cost 11 KiB each, 200 plain subtrees
-   3.3 KiB), so 80 KiB of page budget per root leaves the component behind
-   it ample room: 32 MiB admits 409, enough for the Internet Archive's
-   50-result buffer (Chrome attaches ~385 roots). Actual allocations still
-   require the shared page Budget. shadow.js mirrors the hard bound as
-   ROOT_LIMIT for its identity table, as does DOCUMENT_ADOPTION_ROOT_LIMIT
-   for the adopted-sheet registry. */
-#define DOM_BRIDGE_SHADOW_ROOT_LIMIT 512u
+/* Live shadow roots per realm. Admission is memory-based, like script
+   admission (js_dom_register_shadow_root): a root is admitted while the
+   page Budget keeps SCRIPT_ADMISSION_PRESENTATION_RESERVE_BYTES free (for
+   the layout and stylesheet work the new content needs) beside
+   DOM_BRIDGE_SHADOW_ROOT_COST_BYTES. That cost is an upper bound on what a
+   component root takes with its content: the 64-bit host measures a
+   shared-prototype root with one adopted sheet and a small subtree at
+   6,757 bytes, layout included (test_shadow_root_memory_admission), and
+   the PSP's 32-bit build needs less. The first DOM_BRIDGE_SHADOW_ROOT_BASE roots are always
+   admitted; their allocations still need the Budget like any others.
+   Component sites nest roots (the Internet Archive's search results
+   attach six per result tile, and its infinite scroll keeps adding
+   tiles), so a fixed share of the budget per root refused real content
+   while memory was free.
+
+   DOM_BRIDGE_SHADOW_ROOT_LIMIT is the hard bound the indices need: the
+   registry below (Budget-allocated, grown on demand) and the tables that
+   mirror it, shadow.js's identity table (ROOT_LIMIT),
+   DOCUMENT_ADOPTION_ROOT_LIMIT (one adopted-sheet list per root) and
+   STYLE_SHADOW_SCOPE_LIMIT (one <style> scope per root). At the measured
+   cost 2048 roots need 14 MiB, so on a 32 MiB page memory decides first. */
+#define DOM_BRIDGE_SHADOW_ROOT_LIMIT 2048u
+#define DOM_BRIDGE_SHADOW_ROOT_COST_BYTES (16u * 1024u)
 /* Tainted canvases a realm can hold; past it a cross-origin draw is refused. */
 #define DOM_BRIDGE_CANVAS_TAINT_LIMIT 64u
 /* Native stores of ImageBitmaps that are not origin-clean; canvas.js keeps
    at most this many bitmaps alive. */
 #define DOM_BRIDGE_CANVAS_BITMAP_LIMIT 8u
 #define DOM_BRIDGE_SHADOW_ROOT_BASE 64u
-#define DOM_BRIDGE_SHADOW_ROOT_BUDGET_BYTES (512u * 1024u)
-#define DOM_BRIDGE_SHARED_SHADOW_ROOT_BUDGET_BYTES (80u * 1024u)
 #define BRIDGE_NODE_NATIVE_PIN 0x01u
 #define BRIDGE_NODE_LIVE_WRAPPER 0x02u
 #define BRIDGE_NODE_PENDING_RETIRE_NOTIFY 0x04u
@@ -289,6 +312,18 @@ _Static_assert(DOM_BRIDGE_NODE_LIMIT_MAX < UINT16_MAX
                    && DOM_BRIDGE_NODE_LIMIT % 32u == 0
                    && DOM_BRIDGE_NODE_LIMIT_MAX % 32u == 0,
                "DOM bridge node index entries are 16-bit slot + 1");
+_Static_assert(DOM_BRIDGE_NODE_LIMIT <= DOM_BRIDGE_NODE_BUDGET_CAPACITY
+                   && DOM_BRIDGE_NODE_BUDGET_CAPACITY <= DOM_BRIDGE_NODE_LIMIT_MAX
+                   && DOM_BRIDGE_NODE_BUDGET_CAPACITY % 32u == 0
+                   && DOM_BRIDGE_NODE_GROWTH_STEP % 32u == 0
+                   && DOM_BRIDGE_NODE_GROWTH_STEP != 0,
+               "memory-admitted growth starts within the ceiling, in whole bit words");
+_Static_assert(SCRIPT_DOM_HANDLE_SLOT_INITIAL_TOP_LEVEL % 32u == 0
+                   && SCRIPT_DOM_HANDLE_SLOT_INITIAL_CHILD_FRAME % 32u == 0
+                   && SCRIPT_DOM_HANDLE_SLOT_INITIAL_CHILD_FRAME >= 32u
+                   && SCRIPT_DOM_HANDLE_SLOT_INITIAL_TOP_LEVEL
+                          <= DOM_BRIDGE_NODE_LIMIT,
+               "initial handle tables are whole bit words within the ceiling");
 /* The bound of the native ancestor walks that stand in for script's own
    256-step walks (getRootNode, the transition watcher's display check). */
 #define DOM_ROOT_NODE_ANCESTOR_LIMIT 256u
@@ -545,7 +580,14 @@ typedef struct DomBridge {
     void *webgl_geometry_retired[SCRIPT_WEBGL_GEOMETRY_DIRECT_DRAW_LIMIT];
     size_t webgl_geometry_retired_count;
     bool *relayout_dirty;
-    ScriptMutationJournal mutations;
+    /* What changed since the host last consumed it, allocated on the first
+       connected mutation (js_rt_bridge_journal): many realms (most child
+       frames) never mutate their document. NULL is an empty journal. */
+    ScriptMutationJournal *mutations;
+    /* The journal could not be allocated: changes went unrecorded until the
+       next consume, which reports an overflowed journal whose roots were
+       lost (layout resets, resources are rescanned). */
+    bool mutations_unrecorded;
     BrowserSession *session;
     const FontSet *fonts;
     char *document_url;
@@ -566,14 +608,17 @@ typedef struct DomBridge {
     char referrer_policy[128];
     /* The slot table: parallel arrays of node_capacity entries carved from
        one Budget block (bridge_node_table_resize), allocated at runtime
-       creation with DOM_BRIDGE_NODE_LIMIT slots and grown, never beyond
-       node_capacity_limit, only when registration finds every slot live. */
+       creation with SCRIPT_DOM_HANDLE_SLOT_INITIAL_* slots and grown,
+       never beyond node_capacity_limit, only when registration finds every
+       slot live: doubled up to DOM_BRIDGE_NODE_BUDGET_CAPACITY, then by
+       DOM_BRIDGE_NODE_GROWTH_STEP (bridge_node_table_next_capacity). */
     lxb_dom_node_t **nodes;
     /* Owner identities are captured at registration so whole-document
        retirement never has to inspect a node which author mutation may have
        destroyed already. */
     uintptr_t *node_owner_document_identities;
-    uint32_t *node_generations;
+    /* At most DOM_BRIDGE_NODE_GENERATION_MAX (32,767). */
+    uint16_t *node_generations;
     uint32_t *node_wrapper_leases;
     /* Bit 0 pins a handle for native work; bit 1 records that the newest JS
        wrapper lease is still live. Sharing the byte avoids enlarging the
@@ -581,9 +626,23 @@ typedef struct DomBridge {
     unsigned char *node_retention_flags;
     /* NULL slots whose generation can still advance, one bit per slot. */
     uint32_t *node_reusable_bits;
+    /* Every node_reusable_bits word below this one is clear. */
+    size_t node_reusable_low_word;
     /* Slots whose wrapper one collection is holding; clear between
        collections (js_rt_bridge_collection_holds). */
     uint32_t *node_wrapper_held_bits;
+    /* Slots whose handle number is kept somewhere other than the node's
+       wrapper, one bit per slot: in native state (a weak or pinned native
+       handle, an image or script record) or in a handle-keyed bootstrap
+       table (form control state, focus, frame windows, shadow hosts).
+       Sticky until the slot retires. A connected node's slot is released
+       when its wrapper dies only while its bit is clear
+       (bridge_connected_slot_releasable). */
+    uint32_t *node_handle_kept_bits;
+    /* The bootstrap holds raw handles of connected nodes across owner turns
+       (a suspended motion scan, or a test realm's cleared wrapper cache):
+       connected slots are not released meanwhile. */
+    bool connected_release_held;
     size_t node_wrappers_held;
     /* A wrapper's own keys that a new wrapper would have again
        (bridge_note_plain_wrapper_keys). */
@@ -593,9 +652,11 @@ typedef struct DomBridge {
     size_t node_capacity_limit;
     /* Per handle slot, a weak target (JS_NewWeakTarget) of the live
        wrapper: the wrapper cache, which native getters and the bootstrap
-       (__tilefinchNodeWrapper) answer from. Budget-allocated on first
-       use; NULL when unavailable (the getters then ask script to wrap). */
-    JSValue *wrapper_refs;
+       (__tilefinchNodeWrapper) answer from. A weak target is the object
+       itself, so a slot keeps only its pointer (NULL for none; read it with
+       js_rt_bridge_wrapper_ref). Budget-allocated on first use; NULL when
+       unavailable (the getters then ask script to wrap). */
+    void **wrapper_refs;
     /* Per handle slot, the adopted owner document's tag: 0 unknown, 1 the
        script's document, 2 the template contents owner, 3-255 a script-side
        document the bootstrap names. Keeping it with the native node lets
@@ -610,8 +671,8 @@ typedef struct DomBridge {
        index and the reusable-slot bitmap (NULL slots whose generation can
        still advance) in step. */
     uint16_t *node_index;
-    /* A power of two of at least twice node_capacity, so the load factor
-       stays at or below one half. */
+    /* Twice node_capacity, so the load factor stays at or below one half
+       (bridge_node_index_home scales the hash to it). */
     size_t node_index_capacity;
     /* The last element getComputedStyle() cascaded, for consecutive
        property reads of one declaration. Valid while none of the cascade's
@@ -646,15 +707,41 @@ typedef struct DomBridge {
         /* Registered for node-removal eviction (see document.h); the ring
            is unusable without it. */
         bool removal_listening;
+        /* Replacement candidates drawn so far: the sequence the next
+           victim is drawn from (see computed_style_cache_victim). */
         size_t next;
         size_t hits;
         size_t misses;
         size_t lookup_probes;
-        /* Index+1 chains over the existing 64-entry replacement ring.
+        /* Used-geometry reads answered from the geometry records. */
+        size_t geometry_hits;
+        /* Index+1 chains over the 128 retained styles.
            Zero terminates; this does not enlarge the retained style set. */
-        uint8_t buckets[64];
-        uint8_t links[64];
+        uint8_t buckets[128];
+        uint8_t links[128];
+        /* Bit i set while slot i holds a style. Drops and node removals
+           vacate slots between reads; a new style takes a vacant slot
+           before it evicts a live one. */
+        uint8_t filled[128 / 8];
+        /* Bit i set when slot i's style was used since it was stored or
+           last passed over: a replacement candidate with the bit gets a
+           second chance. */
+        uint8_t referenced[128 / 8];
         struct ComputedStyleCacheEntry *entries;
+        /* What a used-geometry read (width, height, padding) needs of each
+           ancestor (whether it is a containing block, its horizontal
+           padding), as resolved in the epoch it is stamped with. An
+           open-addressed table beside the ring, so that a page reading
+           the sizes of many elements does not re-run the cascade for
+           whole ancestor chains the ring has cycled out. A walk allocates
+           it from the page Budget at its first store; a connected
+           mutation, a forced layout build or the end of the task releases
+           it. */
+        struct ComputedStyleGeometryRecord *geometry;
+        /* Set for good once a read meets an element with more ancestors
+           than a walk takes (64): such a walk resolves its top without
+           the parent style, and records must not stand in for it. */
+        bool geometry_off;
         /* Connected mutations since the last read, as subtrees whose
            cached styles they can change (see
            bridge_computed_style_note_mutation); `dirty_all` when that is
@@ -662,6 +749,17 @@ typedef struct DomBridge {
         lxb_dom_node_t *dirty[16];
         size_t dirty_count;
         bool dirty_all;
+        /* Drops queued without a content-generation move (a sheet change
+           navigation scoped, a host style write the bridge described:
+           js_rt_bridge_computed_style_drop_within): the next read applies
+           them as it applies a mutation's. */
+        bool drops_pending;
+        /* Calls of js_rt_bridge_computed_style_drop_within since the sheet
+           settle callback started, and whether one could not be scoped:
+           the settle keeps the retained styles outside the reported
+           subtrees only when navigation reported and none went whole. */
+        uint8_t scope_reports;
+        bool scope_whole;
         /* Elements whose own matched rules may have changed although
            their descendants' inputs did not (a sibling test, a :has()
            answer): only their entries go. A kept descendant is checked
@@ -686,6 +784,14 @@ typedef struct DomBridge {
         /* Selector dependencies of the sheet generation below. */
         const void *flags_sheet;
         uint64_t flags_generation;
+        /* The generation the key sets below were built for (they cost
+           several times the flags and are built only when a change
+           reaches a structural test); whole-sheet scans of each kind, for
+           the lab's style-cache report and tests. */
+        const void *keys_sheet;
+        uint64_t keys_generation;
+        size_t flag_scans;
+        size_t key_scans;
         bool flags_has;
         bool flags_structure;
         bool flags_focus;
@@ -784,8 +890,9 @@ typedef struct DomBridge {
        selectors must not cross their tree boundary.  Store encoded handles,
        rather than pointers, so slot generation prevents allocator reuse from
        granting a stale carrier identity. */
-    uint32_t shadow_root_handles[DOM_BRIDGE_SHADOW_ROOT_LIMIT];
+    uint32_t *shadow_root_handles;
     size_t shadow_root_count;
+    size_t shadow_root_capacity;
     ScriptRuntime *host;
     ScriptPostMessageCallback post_message;
     void *post_message_opaque;
@@ -860,6 +967,12 @@ typedef struct DomBridge {
     void *synchronous_layout_opaque;
     bool synchronous_layout_images_only;
     bool synchronous_layout_geometry_only;
+    /* script_runtime_set_sheet_settle_callback; a refusal stands until
+       dom_version moves past `sheet_settle_refused_version`. */
+    ScriptSynchronousLayoutCallback sheet_settle;
+    void *sheet_settle_opaque;
+    bool sheet_settle_refused;
+    uint64_t sheet_settle_refused_version;
     /* Layout the page forced from script (geometry reads, scrollIntoView):
        engine work inside a script entry that its watchdog also counts. */
     size_t synchronous_layout_calls;
@@ -923,6 +1036,8 @@ typedef struct DomBridge {
         size_t refused_scripts;
         size_t oversized_scripts;
         size_t oversized_bytes;
+        /* script_runtime_note_memory_refusal() */
+        size_t memory_refusals;
         size_t largest_unit_bytes;
         /* Source whose bytecode was restored instead of compiled: from the
            session's RAM tables (about 50 ms per MiB instead of 4 s), and
@@ -959,6 +1074,14 @@ typedef struct DomBridge {
     size_t webgl_native_frames;
 #endif
 } DomBridge;
+
+/* A slot's weak wrapper target as a value: the object, or undefined. */
+static inline JSValue js_rt_bridge_wrapper_ref(const DomBridge *bridge,
+                                               size_t slot)
+{
+    void *object = bridge->wrapper_refs[slot];
+    return object == NULL ? JS_UNDEFINED : JS_MKPTR(JS_TAG_OBJECT, object);
+}
 
 _Static_assert(SCRIPT_CLOCK_SOURCE_COUNT == 12,
                "deterministic clock source evidence layout changed");
@@ -1028,6 +1151,8 @@ typedef enum {
     SCRIPT_HOST_RETIRE_NATIVE_NODE_STATE,
     SCRIPT_HOST_HOLD_EVENT_STATE,
     SCRIPT_HOST_RELEASE_EVENT_HOLDERS,
+    /* compat.js: a microphone permission changed; statuses re-read. */
+    SCRIPT_HOST_PERMISSIONS_CHANGED,
     SCRIPT_HOST_CALLBACK_COUNT
 } ScriptHostCallback;
 
@@ -1171,8 +1296,9 @@ struct ScriptRuntime {
     /* Full JS_ComputeMemoryUsage walks paid on this realm. Decisions read
        the allocator-maintained count; only diagnostics take a census. */
     size_t heap_censuses;
-#if defined(CONFIG_TILEFINCH_HEAP_DETAIL) && !defined(TILEFINCH_NO_TRACE)
-    /* TILEFINCH_TRACE_JS_HEAP_DETAIL heap census state (host lab only). */
+#if defined(TILEFINCH_JSMEM_CENSUS)
+    /* Heap census state: TILEFINCH_TRACE_JS_HEAP_DETAIL in the host lab,
+       validation_js_heap_detail in a PSP validation build. */
     size_t jsmem_rejections_seen;
     size_t jsmem_next_high_water;
     unsigned jsmem_sequence;
@@ -1340,6 +1466,11 @@ struct ScriptRuntime {
        removed before evaluation returns to author code. */
     JSValue game_audio_host_suspend;
     JSValue game_audio_host_complete;
+    /* Installed by the lazy media-capture module and captured the same way:
+       ends this realm's live tracks after the browser stopped capture, and
+       names the track a MediaStreamAudioSourceNode takes from a stream. */
+    JSValue media_capture_host_event;
+    JSValue media_capture_stream_track;
     JSValue function_to_string;
     /* Trusted bootstrap callbacks retained before author code runs. The page
        may observe compatibility globals, but native scheduling, input
@@ -1391,6 +1522,32 @@ struct ScriptRuntime {
        may open dialogs at all (NULL refuses every dialog). */
     PageDialogPolicy page_dialogs;
     struct ScriptRuntime *dialog_parent;
+    /* Microphone capture (js_media_capture.c). A child frame reaches its
+       top-level owner through media_capture_parent only while navigation
+       found the frame allowed by Permissions Policy. The owner keeps the
+       page load's "Allow this time" grant and prompt limits; every realm
+       counts its own live tracks of session media_capture_generation, and
+       names each by a serial in media_capture_tracks (0 = a free slot)
+       with its enabled state (media_capture_disabled, a bit per slot), so a
+       MediaStreamAudioSourceNode follows its own track. */
+    struct ScriptRuntime *media_capture_parent;
+    bool media_capture_frame_allowed;
+    bool media_capture_session_grant;
+    bool media_capture_permission_watch;
+    uint8_t media_capture_dismissals;
+    uint8_t media_capture_live_tracks;
+    bool media_capture_prompting;
+    uint32_t media_capture_dismiss_gesture;
+    uint32_t media_capture_generation;
+    uint32_t media_capture_permission_epoch;
+    uint32_t media_capture_revoke_epoch;
+    uint32_t media_capture_tracks[MEDIA_CAPTURE_TRACK_LIMIT];
+    uint32_t media_capture_last_track;
+    /* Sessions whose tracks this realm forgot before "ended" reached
+       them (a request or release ran first); delivered next, oldest
+       first, 0 = none. */
+    uint32_t media_capture_ended_pending[2];
+    uint8_t media_capture_disabled;
     bool page_visibility_queue[2];
     uint8_t page_visibility_queue_head;
     uint8_t page_visibility_queue_count;
@@ -1412,6 +1569,12 @@ struct ScriptRuntime {
     struct ScriptSourceStore *source_store;
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     ScriptRuntimeTimingMetrics timing_metrics;
+#endif
+#if defined(TILEFINCH_MEMORY_DIAGNOSTICS)
+    /* QuickJS heap and this realm's Budget bytes when the browser
+       bootstrap had run, before any page script (memory study). */
+    size_t heap_after_bootstrap;
+    size_t budget_after_bootstrap;
 #endif
 };
 
@@ -1470,6 +1633,10 @@ bool js_rt_bridge_node_slot_for_handle(const DomBridge *bridge,
                                        int64_t handle, size_t *slot);
 int64_t js_rt_bridge_register_node(DomBridge *bridge, lxb_dom_node_t *node);
 /* The node's current handle, or 0 when it has none; never registers. */
+/* Marks the handle's slot as named by native state or a handle-keyed
+   bootstrap table: its connected node keeps the slot when its wrapper dies
+   (DomBridge.node_handle_kept_bits). */
+void js_rt_bridge_keep_node_handle(DomBridge *bridge, int64_t handle);
 int64_t js_rt_bridge_find_node_handle(const DomBridge *bridge,
                                       const lxb_dom_node_t *node);
 void js_rt_record_exception(JSContext *context, ScriptResult *result);
@@ -1506,8 +1673,14 @@ void js_rt_heap_census(ScriptRuntime *runtime, JSMemoryUsage *usage);
    caller is at a point where a forced collection is allowed. */
 void js_rt_jsmem_census_check(ScriptRuntime *runtime, const char *where,
                               bool safe);
-void js_rt_jsmem_census(ScriptRuntime *runtime, const char *reason, bool gc);
 bool js_rt_jsmem_enabled(void);
+#endif
+#if defined(TILEFINCH_JSMEM_CENSUS)
+void js_rt_jsmem_census(ScriptRuntime *runtime, const char *reason, bool gc);
+#endif
+#if defined(TILEFINCH_MEMORY_DIAGNOSTICS)
+/* Records heap_after_bootstrap and budget_after_bootstrap. */
+void js_rt_note_bootstrap_memory(ScriptRuntime *runtime);
 #endif
 /* HTML deliberately leaves the transient-activation duration to the user
    agent. Five seconds matches the interoperability window used by major
@@ -1997,6 +2170,9 @@ void bridge_pin_node_slot(DomBridge *bridge, size_t slot);
    only a script that reads layout after writing pays for it. */
 void js_rt_bridge_note_parser_writes(DomBridge *bridge);
 void js_rt_bridge_note_parser_writes_for_layout(DomBridge *bridge);
+/* Before a read resolves style: install a pending stylesheet change
+   (script_runtime_set_sheet_settle_callback). */
+void js_rt_bridge_settle_pending_sheets(DomBridge *bridge);
 bool js_rt_bridge_flush_synchronous_layout(DomBridge *bridge,
                                            lxb_dom_node_t *node);
 /* Script never observes a truncated layout (see bridge_state.inc). */
@@ -2096,6 +2272,36 @@ JSValue js_dom_page_controls_notice(JSContext *context,
                                     JSValueConst this_value,
                                     int argc, JSValueConst *argv);
 TilefinchGameAudio *js_rt_game_audio_engine(ScriptRuntime *runtime);
+/* A browser modal opened at OPENED_MS (js_rt_monotonic_time_ns() / 1e6)
+   inside script has closed: its time is moved out of the watchdog's
+   deadlines (page_dialogs.inc). */
+void js_rt_extend_watchdog_after_modal(ScriptRuntime *runtime,
+                                      uint64_t opened_ms);
+/* Microphone capture natives and lifecycle (js_media_capture.c). */
+JSValue js_media_capture_command(JSContext *context, JSValueConst this_value,
+                                 int argc, JSValueConst *argv);
+JSValue js_media_capture_permission(JSContext *context,
+                                    JSValueConst this_value, int argc,
+                                    JSValueConst *argv);
+/* Task-boundary work (runtime_loop.inc runs the author code): the
+   generation of a session the browser stopped while this realm held live
+   tracks (0 when none; the realm's count is cleared), and whether a
+   permissions.query() status must re-read its state. */
+uint32_t js_rt_media_capture_take_ended(ScriptRuntime *runtime);
+bool js_rt_media_capture_take_permission_change(ScriptRuntime *runtime);
+bool js_rt_media_capture_event_pending(const ScriptRuntime *runtime);
+/* Releases the realm's live tracks (teardown). */
+void js_rt_media_capture_release(ScriptRuntime *runtime);
+/* What a MediaStreamAudioSourceNode bound to TRACK (a serial the realm
+   handed to its track) plays: nothing once the track or its session ended,
+   silence while the page disabled it, else the microphone. */
+typedef enum {
+    JS_RT_MEDIA_TRACK_ENDED = 0,
+    JS_RT_MEDIA_TRACK_DISABLED,
+    JS_RT_MEDIA_TRACK_LIVE
+} JsRtMediaTrackState;
+JsRtMediaTrackState js_rt_media_capture_track_state(
+    const ScriptRuntime *runtime, uint32_t track);
 bool js_rt_game_audio_lifecycle(ScriptRuntime *runtime, bool destroy);
 /* The JS Web Audio reference (game-audio.js over the command channel below)
    serves host differential tests and explicit validation A/B runs. Shipping
@@ -2132,12 +2338,19 @@ JSValue js_canvas_raster_image_batch(JSContext *context,
                                      int argc, JSValueConst *argv);
 lxb_dom_node_t *dom_document_order_next(
     DomDocumentOrderTraversal *traversal);
+/* Continue after `node`'s subtree instead of inside it; `node` is the node
+   dom_document_order_next just returned. */
+void dom_document_order_skip_children(DomDocumentOrderTraversal *traversal,
+                                      lxb_dom_node_t *node);
 JSValue js_computed_style_get(JSContext *context,
                               JSValueConst this_value,
                               int argc, JSValueConst *argv);
 JSValue js_computed_style_read(JSContext *context,
                                JSValueConst this_value,
                                int argc, JSValueConst *argv);
+JSValue js_computed_style_values(JSContext *context,
+                                 JSValueConst this_value,
+                                 int argc, JSValueConst *argv);
 JSValue js_dom_rendered_text(JSContext *context, JSValueConst this_value,
                              int argc, JSValueConst *argv);
 JSValue js_transition_discover(JSContext *context, JSValueConst this_value,
@@ -2242,6 +2455,9 @@ JSValue js_dom_root_node(JSContext *context, JSValueConst this_value,
 JSValue js_dom_node_owner(JSContext *context, JSValueConst this_value,
                           int argc, JSValueConst *argv);
 void js_rt_bridge_computed_style_cache_free(DomBridge *bridge);
+/* Releases the used-geometry records (at a task boundary or before a
+   layout build). */
+void js_rt_bridge_computed_style_release_records(DomBridge *bridge);
 /* Drops the computed-style memo and the cached ancestor styles a connected
    script mutation can change (js_computed_style.c); the mutation journal
    calls it for every recorded mutation. */
@@ -2249,6 +2465,20 @@ void js_rt_bridge_computed_style_note_mutation(
     DomBridge *bridge, ScriptMutationKind kind, lxb_dom_node_t *node,
     const char *attribute, size_t attribute_length, bool relational,
     const uint32_t *changed_tokens, size_t changed_token_count);
+/* The cascade changed only within the subtrees of `roots` (and what they
+   pass on by inheritance), or anywhere when `roots` is NULL: the retained
+   styles there go at the next read. False when the change could not be
+   scoped (NULL roots, a full queue): every retained style goes. */
+bool js_rt_bridge_computed_style_drop_within(DomBridge *bridge,
+                                             lxb_dom_node_t *const *roots,
+                                             size_t count);
+/* After a host style write (document_style_changed) that the bridge made
+   with the generation folded to `before` just ahead of it, and whose every
+   effect on computed styles drops already queued cover: retained styles
+   keep following the host generation instead of all going at the next
+   read. Nothing changes when another host change came first. */
+void js_rt_bridge_computed_style_host_described(DomBridge *bridge,
+                                                uint64_t before);
 /* Bytes the getComputedStyle caches hold (ancestor styles plus the var()
    table), for the profile report and tests. */
 size_t js_rt_bridge_computed_style_cache_bytes(const DomBridge *bridge);
@@ -2274,11 +2504,21 @@ JSValue js_dom_make_fast_method(JSContext *context, JSValueConst this_value,
 void js_rt_bridge_wrapper_refs_free(DomBridge *bridge);
 void js_rt_bridge_hold_stateful_wrappers(DomBridge *bridge, bool hold);
 void js_rt_bridge_sweep_node_wrappers(DomBridge *bridge);
-/* Allocates the base slot table; `limit` (0 for the default) is the most
-   slots registration may later grow it to. Freed by
+/* Allocates the slot table with `initial` slots (rounded down to a multiple
+   of 32, at least 32, at most `limit`); `limit` (0 for the default) is the
+   most slots registration may later grow it to. Freed by
    js_rt_bridge_node_table_free after the realm's finalizers have run. */
-bool js_rt_bridge_node_table_init(DomBridge *bridge, size_t limit);
+bool js_rt_bridge_node_table_init(DomBridge *bridge, size_t limit,
+                                  size_t initial);
 void js_rt_bridge_node_table_free(DomBridge *bridge);
+/* Whether a full table could take one more growth step now: below its
+   ceiling, and past the Budget capacity with the step's memory free beside
+   the presentation reserve. Allocates nothing and frees no cache. */
+bool js_rt_bridge_node_table_can_grow(const DomBridge *bridge);
+/* The realm's mutation journal, allocated on first use; NULL (with
+   mutations_unrecorded set) when the Budget refused it. Freed with the
+   handle table. */
+ScriptMutationJournal *js_rt_bridge_journal(DomBridge *bridge);
 JSValue js_dom_closest(JSContext *context, JSValueConst this_value,
                        int argc, JSValueConst *argv);
 JSValue js_dom_matches(JSContext *context, JSValueConst this_value,
@@ -2352,6 +2592,10 @@ JSValue js_dom_pre_insert_clear(JSContext *context, JSValueConst this_value,
                                 int argc, JSValueConst *argv);
 JSValue js_dom_make_wrapper(JSContext *context, JSValueConst this_value,
                             int argc, JSValueConst *argv);
+JSValue js_dom_keep_node_handle(JSContext *context, JSValueConst this_value,
+                                int argc, JSValueConst *argv);
+JSValue js_dom_hold_handle_release(JSContext *context, JSValueConst this_value,
+                                   int argc, JSValueConst *argv);
 JSValue js_dom_retain_node_wrapper(JSContext *context,
                                    JSValueConst this_value,
                                    int argc, JSValueConst *argv);

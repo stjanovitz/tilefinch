@@ -10,7 +10,9 @@
    evaluated after dom.js and before platform.js. */
 globalThis.__tilefinchInstallFrames = (support) => {
   const trustedEvent =
-    __tilefinchRealmGlobal.__tilefinchTrustedEventShare.trustedEvent;
+      __tilefinchRealmGlobal.__tilefinchTrustedEventShare.trustedEvent,
+    newEvent =
+      __tilefinchRealmGlobal.__tilefinchTrustedEventShare.createBrowserEvent;
   const reflectDescriptor = Reflect.getOwnPropertyDescriptor,
     reflectKeys = Reflect.ownKeys,
     reflectDefine = Reflect.defineProperty,
@@ -319,6 +321,8 @@ globalThis.__tilefinchInstallFrames = (support) => {
       });
       state.proxy = proxy;
       initializeFrameRealm(state, handle, proxy);
+      /* The frame element's slot outlives its wrapper while this names it. */
+      __tilefinchKeepNodeHandle(handle);
       frameWindows.set(handle, state);
       } catch (error) {
         if (state?.scope) frameScope(state.scope);
@@ -398,7 +402,7 @@ globalThis.__tilefinchInstallFrames = (support) => {
       state.initialAboutBlank = false;
     queueMicrotask(() => {
       if (element.isConnected && state.loadGeneration === generation)
-        element.dispatchEvent(trustedEvent(new Event("load")));
+        element.dispatchEvent(trustedEvent(newEvent("load")));
     });
   };
   globalThis.__tilefinchSetFrameWindowState = (

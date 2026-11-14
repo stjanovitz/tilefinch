@@ -48,6 +48,7 @@ const char *psp_ui_action_name(PspUiAction action)
         case PSP_UI_ACTION_CANCEL_FILE_DOWNLOAD: return "cancel-file-download";
         case PSP_UI_ACTION_CONFIRM_ZIP_INSTALL: return "confirm-zip-install";
         case PSP_UI_ACTION_CANCEL_ZIP_INSTALL: return "cancel-zip-install";
+        case PSP_UI_ACTION_STOP_MICROPHONE: return "stop-microphone";
         case PSP_UI_ACTION_CONFIRM_OFFLINE_APP:
             return "confirm-offline-app";
         case PSP_UI_ACTION_CANCEL_OFFLINE_APP: return "cancel-offline-app";
@@ -108,6 +109,8 @@ const char *psp_ui_action_name(PspUiAction action)
         case PSP_UI_ACTION_HEAVY_RUN_ALWAYS: return "heavy-run-always";
         case PSP_UI_ACTION_HEAVY_CANCEL: return "heavy-cancel";
         case PSP_UI_ACTION_HEAVY_STOP_SCRIPTS: return "heavy-stop-scripts";
+        case PSP_UI_ACTION_SCRIPTS_OFF_ACCEPT: return "scripts-off-accept";
+        case PSP_UI_ACTION_SCRIPTS_OFF_DECLINE: return "scripts-off-decline";
         case PSP_UI_ACTION_EXIT: return "exit";
     }
     return "unknown";

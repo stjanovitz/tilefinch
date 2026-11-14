@@ -18,6 +18,15 @@ static bool navigation_commit_html_policy(
                  "HTML parsing failed within the page budget");
         return false;
     }
+    /* A page that runs scripts adopts its head's <meta> policies; it was
+       parsed whole, so they apply before its first script. A trusted
+       static commit (a site adapter's page) does not adopt author
+       security metadata. */
+    if (allow_runtime) {
+        tilefinch_csp_bind_document_origin(
+            &document.content_security_policy, url);
+        (void) document_apply_meta_csp(&document, true);
+    }
     char document_referrer_policy[
         sizeof(session->pending_response_referrer_policy)];
     snprintf(document_referrer_policy, sizeof(document_referrer_policy), "%s",

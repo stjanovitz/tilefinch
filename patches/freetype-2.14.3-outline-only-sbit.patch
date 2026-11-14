@@ -1,0 +1,43 @@
+--- a/src/sfnt/ttsbit.c
++++ b/src/sfnt/ttsbit.c
+@@ -449,6 +449,7 @@
+   }
+ 
+ 
++#ifndef TILEFINCH_FREETYPE_OUTLINE_ONLY
+   typedef struct  TT_SBitDecoderRec_
+   {
+     TT_Face          face;
+@@ -1623,6 +1624,7 @@
+     return error;
+   }
+ 
++#endif /* !TILEFINCH_FREETYPE_OUTLINE_ONLY */
+   FT_LOCAL_DEF( FT_Error )
+   tt_face_load_sbit_image( TT_Face              face,
+                            FT_ULong             strike_index,
+@@ -1634,6 +1636,16 @@
+                            FT_Bitmap           *map,
+                            TT_SBit_MetricsRec  *metrics )
+   {
++#ifdef TILEFINCH_FREETYPE_OUTLINE_ONLY
++    FT_UNUSED( face );
++    FT_UNUSED( strike_index );
++    FT_UNUSED( glyph_index );
++    FT_UNUSED( load_flags );
++    FT_UNUSED( stream );
++    FT_UNUSED( map );
++    FT_UNUSED( metrics );
++    return FT_THROW( Unimplemented_Feature );
++#else
+     FT_Error  error = FT_Err_Ok;
+ 
+ 
+@@ -1701,6 +1713,7 @@
+     }
+ 
+     return error;
++#endif /* TILEFINCH_FREETYPE_OUTLINE_ONLY */
+   }
+ 
+ #else /* !TT_CONFIG_OPTION_EMBEDDED_BITMAPS */

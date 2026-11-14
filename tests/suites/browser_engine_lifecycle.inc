@@ -718,15 +718,19 @@ static int test_engine_lifecycle(void)
                == (int) owned_controller->focus_kind
           && saved_view->focus_index == owned_controller->focus_index);
 
-    /* A failed candidate keeps the current page/backing usable. */
+    /* A failed candidate keeps the current page/backing usable. The
+       budget refused it, so it is reported as memory
+       (browser_engine_navigation_failure_code), not as a parse failure. */
     Budget *budget = browser_engine_budget(engine);
     CHECK(budget != NULL);
     budget_inject_failure_after(budget, 0);
     CHECK(!browser_engine_commit_html(
         engine, "https://failed.test/", "<p>candidate", 12, true));
     CHECK(browser_engine_last_diagnostic_code(engine)
-              == TILEFINCH_DIAGNOSTIC_PARSE_FAILED
-          && diagnostics.last_code == TILEFINCH_DIAGNOSTIC_PARSE_FAILED
+              == TILEFINCH_DIAGNOSTIC_ALLOCATION_FAILED
+          && browser_engine_navigation_failure_code(engine)
+              == TILEFINCH_DIAGNOSTIC_ALLOCATION_FAILED
+          && diagnostics.last_code == TILEFINCH_DIAGNOSTIC_ALLOCATION_FAILED
           && strcmp(diagnostics.last_name, "navigation-failed") == 0);
     budget_clear_failure_injection(budget);
     CHECK(browser_engine_navigation(engine)->page.loaded

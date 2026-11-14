@@ -42,6 +42,26 @@ static BootstrapInput inputs[] = {
 
 static const size_t input_count = sizeof(inputs) / sizeof(inputs[0]);
 
+/* The modules whose atoms are pinned (BOOTSTRAP_PINNED_ATOMS). */
+#define BOOTSTRAP_SOURCE(source_symbol, file_name, source_name,              \
+                         bytecode_symbol)
+#define BOOTSTRAP_DIAGNOSTIC(source_symbol, file_name, source_name)
+#define BOOTSTRAP_PINNED_ATOMS(source_symbol) #source_symbol,
+static const char *const pinned_sources[] = {
+#include "../src/bootstrap/sources.def"
+};
+#undef BOOTSTRAP_DIAGNOSTIC
+#undef BOOTSTRAP_SOURCE
+
+static int pinned_source(const BootstrapInput *input)
+{
+    for (size_t i = 0; i < sizeof(pinned_sources) / sizeof(pinned_sources[0]);
+         i++) {
+        if (strcmp(pinned_sources[i], input->source_symbol) == 0) return 1;
+    }
+    return 0;
+}
+
 static uint64_t source_hash(const char *source, size_t length)
 {
     uint64_t hash = UINT64_C(1469598103934665603);
@@ -292,9 +312,7 @@ static int verify_compaction(const BootstrapInput *input)
 {
     JSRuntime *runtime = JS_NewRuntime();
     if (runtime == NULL) return 0;
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
     JS_SetStripInfo(runtime, JS_STRIP_SOURCE | JS_STRIP_DEBUG);
-#endif
     JSContext *context = JS_NewContext(runtime);
     int equal = 0;
     if (context != NULL) {
@@ -465,8 +483,10 @@ static int emit_source_file(FILE *output)
     return !ferror(output);
 }
 
-static int emit_bytecode(FILE *output, JSContext *context,
-                         const BootstrapInput *input)
+/* Compile one module and serialize it with `flags`. */
+static uint8_t *compile_bytecode(JSContext *context,
+                                 const BootstrapInput *input, int flags,
+                                 size_t *bytecode_length)
 {
     JSValue function = JS_Eval(
         context, input->source, input->source_length, input->source_name,
@@ -479,12 +499,167 @@ static int emit_bytecode(FILE *output, JSContext *context,
                 message == NULL ? "" : message);
         if (message != NULL) JS_FreeCString(context, message);
         JS_FreeValue(context, exception);
+        return NULL;
+    }
+    uint8_t *bytecode = JS_WriteObject(
+        context, bytecode_length, function, flags);
+    JS_FreeValue(context, function);
+    return bytecode;
+}
+
+/* The atoms the BOOTSTRAP_PINNED_ATOMS modules name, pinned at JS_ATOM_END
+   and up in the generator's runtime and in every page runtime
+   (JS_PinAtomTable), so that those modules carry no atom table of their
+   own: QuickJS can then run
+   their read-only bytecode in place instead of copying each function's
+   code into the realm heap to relocate its atoms. Built by
+   collect_pinned_atoms(). */
+static unsigned char *pinned_table;
+static size_t pinned_table_length;
+static uint32_t pinned_count;
+
+static int put_leb128(unsigned char **buffer, size_t *length,
+                      size_t *capacity, uint32_t value)
+{
+    do {
+        if (*length == *capacity) {
+            size_t grown = *capacity ? *capacity * 2 : 4096;
+            unsigned char *next = realloc(*buffer, grown);
+            if (next == NULL) return 0;
+            *buffer = next;
+            *capacity = grown;
+        }
+        unsigned char byte = value & 0x7f;
+        value >>= 7;
+        (*buffer)[(*length)++] = (unsigned char) (byte | (value ? 0x80 : 0));
+    } while (value);
+    return 1;
+}
+
+static int read_leb128(const uint8_t **at, const uint8_t *end,
+                       uint32_t *value)
+{
+    uint32_t result = 0;
+    for (int shift = 0; shift < 35; shift += 7) {
+        if (*at >= end) return 0;
+        uint8_t byte = *(*at)++;
+        result |= (uint32_t) (byte & 0x7f) << shift;
+        if (!(byte & 0x80)) {
+            *value = result;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Every atom the pinned modules' ordinary serializations list, once each,
+   in first-use order. A serialization opens with its version byte, the atom
+   count and each atom in the bytecode string encoding; the pinned table
+   reuses that encoding (JS_PinAtomTable). */
+static int collect_pinned_atoms(void)
+{
+    JSRuntime *runtime = JS_NewRuntime();
+    if (runtime != NULL)
+        JS_SetStripInfo(runtime,
+                        getenv("TILEFINCH_BOOTSTRAP_KEEP_LINES") != NULL
+                            ? JS_STRIP_SOURCE
+                            : JS_STRIP_SOURCE | JS_STRIP_DEBUG);
+    JSContext *context = runtime == NULL ? NULL : JS_NewContext(runtime);
+    if (context == NULL) {
+        if (runtime != NULL) JS_FreeRuntime(runtime);
+        fputs("could not create QuickJS generator context\n", stderr);
         return 0;
     }
+    unsigned char *records = NULL;
+    size_t records_length = 0, records_capacity = 0;
+    /* Offsets of the collected records, for the duplicate check. */
+    size_t *offsets = NULL, offsets_capacity = 0;
+    uint32_t count = 0;
+    int ok = 1;
+    for (size_t i = 0; ok && i < input_count; i++) {
+        if (inputs[i].bytecode_symbol == NULL || !pinned_source(&inputs[i]))
+            continue;
+        size_t length = 0;
+        uint8_t *bytecode = compile_bytecode(
+            context, &inputs[i], JS_WRITE_OBJ_BYTECODE, &length);
+        if (bytecode == NULL) {
+            ok = 0;
+            break;
+        }
+        const uint8_t *at = bytecode + 1, *end = bytecode + length;
+        uint32_t atoms = 0;
+        ok = length > 0 && read_leb128(&at, end, &atoms);
+        for (uint32_t a = 0; ok && a < atoms; a++) {
+            const uint8_t *record = at;
+            uint32_t header = 0;
+            ok = read_leb128(&at, end, &header)
+                && (size_t) (end - at) >= ((size_t) (header >> 1)
+                                           << (header & 1));
+            if (!ok) break;
+            at += (size_t) (header >> 1) << (header & 1);
+            size_t record_length = (size_t) (at - record);
+            int seen = 0;
+            for (uint32_t k = 0; k < count && !seen; k++) {
+                size_t start = offsets[k],
+                    stop = k + 1 < count ? offsets[k + 1] : records_length;
+                seen = stop - start == record_length
+                    && memcmp(records + start, record, record_length) == 0;
+            }
+            if (seen) continue;
+            if (count == offsets_capacity) {
+                size_t grown = offsets_capacity ? offsets_capacity * 2 : 1024;
+                size_t *next = realloc(offsets, grown * sizeof(*offsets));
+                if (next == NULL) { ok = 0; break; }
+                offsets = next;
+                offsets_capacity = grown;
+            }
+            if (records_length + record_length > records_capacity) {
+                size_t grown = records_capacity ? records_capacity : 65536;
+                while (grown < records_length + record_length) grown *= 2;
+                unsigned char *next = realloc(records, grown);
+                if (next == NULL) { ok = 0; break; }
+                records = next;
+                records_capacity = grown;
+            }
+            offsets[count++] = records_length;
+            memcpy(records + records_length, record, record_length);
+            records_length += record_length;
+        }
+        js_free(context, bytecode);
+    }
+    JS_FreeContext(context);
+    JS_FreeRuntime(runtime);
+    free(offsets);
+    size_t capacity = 0;
+    free(pinned_table);
+    pinned_table = NULL;
+    pinned_table_length = 0;
+    ok = ok && count != 0
+        && put_leb128(&pinned_table, &pinned_table_length, &capacity, count);
+    if (ok) {
+        unsigned char *table = realloc(pinned_table,
+                                       pinned_table_length + records_length);
+        ok = table != NULL;
+        if (ok) {
+            pinned_table = table;
+            memcpy(pinned_table + pinned_table_length, records,
+                   records_length);
+            pinned_table_length += records_length;
+            pinned_count = count;
+        }
+    }
+    free(records);
+    if (!ok) fputs("could not collect the bootstrap atom table\n", stderr);
+    return ok;
+}
+
+static int emit_bytecode(FILE *output, JSContext *context,
+                         const BootstrapInput *input)
+{
     size_t bytecode_length = 0;
-    uint8_t *bytecode = JS_WriteObject(
-        context, &bytecode_length, function, JS_WRITE_OBJ_BYTECODE);
-    JS_FreeValue(context, function);
+    uint8_t *bytecode = compile_bytecode(
+        context, input, JS_WRITE_OBJ_BYTECODE | JS_WRITE_OBJ_PINNED_ATOMS,
+        &bytecode_length);
     if (bytecode == NULL) return 0;
     fprintf(output, "static const unsigned char %s_data[] = {\n    ",
             input->bytecode_symbol);
@@ -520,13 +695,18 @@ static int emit_bytecode_file(FILE *output)
        source with full debug information. A device profiling build can keep
        the line tables instead (TILEFINCH_BOOTSTRAP_KEEP_LINES=1 while
        regenerating; never commit that output). */
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
     if (runtime != NULL)
         JS_SetStripInfo(runtime,
                         getenv("TILEFINCH_BOOTSTRAP_KEEP_LINES") != NULL
                             ? JS_STRIP_SOURCE
                             : JS_STRIP_SOURCE | JS_STRIP_DEBUG);
-#endif
+    if (runtime != NULL && (!collect_pinned_atoms()
+            || JS_PinAtomTable(runtime, pinned_table, pinned_table_length)
+                   != 0)) {
+        fputs("could not pin the bootstrap atom table\n", stderr);
+        JS_FreeRuntime(runtime);
+        return 0;
+    }
     JSContext *context = runtime == NULL ? NULL : JS_NewContext(runtime);
     if (context == NULL) {
         if (runtime != NULL) JS_FreeRuntime(runtime);
@@ -535,6 +715,22 @@ static int emit_bytecode_file(FILE *output)
     }
     fputs("/* Generated from src/bootstrap/sources.def. Do not edit. */\n"
           "#include \"js_runtime_internal.h\"\n\n", output);
+    fprintf(output,
+            "/* The atoms the modules below name by index (JS_PinAtomTable):"
+            " %" PRIu32 " atoms. */\n"
+            "const unsigned char browser_bootstrap_atom_table[] = {\n    ",
+            pinned_count);
+    for (size_t i = 0; i < pinned_table_length; i++) {
+        fprintf(output, "0x%02x%s", pinned_table[i],
+                i + 1 == pinned_table_length ? "" : ",");
+        if (i + 1 != pinned_table_length && (i + 1) % 12 == 0)
+            fputs("\n    ", output);
+    }
+    fprintf(output,
+            "\n};\nconst size_t browser_bootstrap_atom_table_length = "
+            "sizeof(browser_bootstrap_atom_table);\n"
+            "const uint32_t browser_bootstrap_atom_count = %" PRIu32 ";\n\n",
+            pinned_count);
     int ok = 1;
     for (size_t i = 0; i < input_count; i++) {
         if (inputs[i].bytecode_symbol != NULL

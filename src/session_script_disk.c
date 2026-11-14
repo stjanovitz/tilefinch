@@ -114,6 +114,8 @@ typedef struct {
     uint16_t slots[SCRIPT_DISK_JOB_RECORDS];
     uint32_t serials[SCRIPT_DISK_JOB_RECORDS];
     uint32_t crc;
+    /* Writing one record of the write queue, not RAM-table records. */
+    bool queued;
 } ScriptDiskJob;
 
 struct BrowserScriptDisk {
@@ -143,6 +145,14 @@ struct BrowserScriptDisk {
     unsigned retry_wait;
     unsigned retry_backoff;
     ScriptDiskJob job;
+    /* The write queue (session.h): module records waiting for the writer
+       that no RAM table keeps. A slot is free when its bytecode is NULL;
+       stamps order the queue, serials tell a slot's reuse. */
+    BrowserScriptBytecodeEntry queue[BROWSER_SCRIPT_DISK_QUEUE_LIMIT];
+    size_t queue_count;
+    size_t queue_bytes;
+    size_t queue_clock;
+    uint32_t queue_serial;
     BrowserScriptDiskStats stats;
 };
 
@@ -534,6 +544,311 @@ static bool pack_remove_at(BrowserScriptDisk *disk, size_t at)
     return true;
 }
 
+/* ---- the write queue ---- */
+
+/* Bytes the queue may hold: twice the module table's ceiling. */
+static size_t queue_limit(const BrowserSession *session)
+{
+    size_t ceiling = session->maximum_module_bytecode_bytes;
+    return ceiling > SIZE_MAX / 2u ? SIZE_MAX : ceiling * 2u;
+}
+
+/* The largest record a pack of its own can hold. */
+static bool queue_record_fits_pack(const BrowserScriptDisk *disk,
+                                   size_t bytecode_length)
+{
+    const size_t overhead = SCRIPT_DISK_PACK_HEADER
+        + SCRIPT_DISK_RECORD_HEADER + SCRIPT_DISK_TRAILER;
+    return bytecode_length != 0
+        && bytecode_length <= BROWSER_SCRIPT_DISK_FILE_LIMIT - overhead
+        && overhead <= disk->maximum_bytes
+        && bytecode_length <= disk->maximum_bytes - overhead;
+}
+
+static bool queue_same_record(const BrowserScriptBytecodeEntry *entry,
+                              const char *name, const char *url,
+                              const char *partition)
+{
+    return entry->bytecode != NULL && strcmp(entry->module_name, name) == 0
+        && strcmp(entry->response_url, url) == 0
+        && strcmp(entry->partition_key, partition) == 0;
+}
+
+static BrowserScriptBytecodeEntry *queue_find(BrowserScriptDisk *disk,
+                                              const char *name,
+                                              const char *url,
+                                              const char *partition)
+{
+    for (size_t i = 0; i < BROWSER_SCRIPT_DISK_QUEUE_LIMIT; i++)
+        if (queue_same_record(&disk->queue[i], name, url, partition))
+            return &disk->queue[i];
+    return NULL;
+}
+
+static BrowserScriptBytecodeEntry *queue_free_slot(BrowserScriptDisk *disk)
+{
+    for (size_t i = 0; i < BROWSER_SCRIPT_DISK_QUEUE_LIMIT; i++)
+        if (disk->queue[i].bytecode == NULL) return &disk->queue[i];
+    return NULL;
+}
+
+static BrowserScriptBytecodeEntry *queue_oldest(BrowserScriptDisk *disk)
+{
+    BrowserScriptBytecodeEntry *oldest = NULL;
+    for (size_t i = 0; i < BROWSER_SCRIPT_DISK_QUEUE_LIMIT; i++) {
+        BrowserScriptBytecodeEntry *entry = &disk->queue[i];
+        if (entry->bytecode != NULL
+            && (oldest == NULL || entry->stamp < oldest->stamp))
+            oldest = entry;
+    }
+    return oldest;
+}
+
+/* Frees a queued record (written, superseded or dropped). Frees only. */
+static void queue_release(BrowserSession *session,
+                          BrowserScriptBytecodeEntry *entry, bool dropped)
+{
+    BrowserScriptDisk *disk = session->script_disk;
+    if (entry->bytecode == NULL) return;
+    disk->queue_bytes = entry->charged_bytes <= disk->queue_bytes
+        ? disk->queue_bytes - entry->charged_bytes : 0;
+    if (disk->queue_count != 0) disk->queue_count--;
+    if (dropped) disk->stats.queue_drops++;
+    browser_shared_body_release(entry->bytecode);
+    budget_free(session->budget, entry->module_name);
+    budget_free(session->budget, entry->response_url);
+    budget_free(session->budget, entry->partition_key);
+    memset(entry, 0, sizeof(*entry));
+}
+
+/* Whether a record charging `charge` bytes fits the queue, counting a
+   queued record of the same module (which it replaces) as free. */
+static bool queue_admits(const BrowserSession *session,
+                         const BrowserScriptBytecodeEntry *replaced,
+                         size_t charge)
+{
+    const BrowserScriptDisk *disk = session->script_disk;
+    size_t limit = queue_limit(session);
+    size_t used = disk->queue_bytes;
+    if (replaced != NULL)
+        used = replaced->charged_bytes <= used
+            ? used - replaced->charged_bytes : 0;
+    return (replaced != NULL
+            || disk->queue_count < BROWSER_SCRIPT_DISK_QUEUE_LIMIT)
+        && charge <= limit && used <= limit - charge;
+}
+
+/* Bytecode plus the three key strings, as the RAM tables charge it. */
+static bool queue_charge(const char *name, const char *url,
+                         const char *partition, size_t bytecode_length,
+                         size_t *charge)
+{
+    const char *parts[3] = {name, url, partition};
+    size_t total = bytecode_length;
+    for (size_t i = 0; i < 3; i++) {
+        size_t length = strlen(parts[i]);
+        if (length >= SIZE_MAX - total) return false;
+        total += length + 1u;
+    }
+    *charge = total;
+    return true;
+}
+
+static bool queue_key_valid(const BrowserScriptBytecodeKey *key)
+{
+    return key != NULL && key->module_name != NULL
+        && key->module_name[0] != '\0' && key->response_url != NULL
+        && key->response_url[0] != '\0' && key->partition_key != NULL
+        && key->partition_key[0] != '\0' && key->ordinal == 0
+        && key->source_length != 0 && key->source_length <= UINT32_MAX
+        && (key->source != NULL || key->digest_ready);
+}
+
+bool browser_session_script_disk_may_queue(const BrowserSession *session,
+                                           const BrowserScriptBytecodeKey *key,
+                                           size_t bytecode_length)
+{
+    size_t charge = 0;
+    if (!browser_session_script_disk_writable(session)
+        || !queue_key_valid(key)
+        || !queue_record_fits_pack(session->script_disk, bytecode_length)
+        || !queue_charge(key->module_name, key->response_url,
+                         key->partition_key, bytecode_length, &charge))
+        return false;
+    BrowserScriptDisk *disk = session->script_disk;
+    const BrowserScriptBytecodeEntry *replaced = queue_find(
+        disk, key->module_name, key->response_url, key->partition_key);
+    return queue_admits(session, replaced, charge);
+}
+
+static char *queue_copy_text(Budget *budget, const char *text)
+{
+    size_t length = strlen(text);
+    char *copy = budget_malloc_category(budget, BUDGET_CATEGORY_SESSION,
+                                        length + 1u);
+    if (copy != NULL) memcpy(copy, text, length + 1u);
+    return copy;
+}
+
+bool browser_session_script_disk_queue(BrowserSession *session,
+                                       BrowserScriptBytecodeKey *key,
+                                       const unsigned char *bytecode,
+                                       size_t bytecode_length)
+{
+    size_t charge = 0;
+    if (bytecode == NULL
+        || !browser_session_script_disk_may_queue(session, key,
+                                                  bytecode_length)
+        || !queue_charge(key->module_name, key->response_url,
+                         key->partition_key, bytecode_length, &charge))
+        return false;
+    if (!key->digest_ready)
+        key->digest_ready = tilefinch_sha256_digest(
+            key->source, key->source_length, key->source_digest);
+    if (!key->digest_ready) return false;
+    Budget *budget = session->budget;
+    /* Allocate everything first: a refusal changes nothing. An allocation
+       may run the Budget reclaim hook, which can empty the queue (never
+       free the tier), so admission is checked again afterwards. */
+    char *name = queue_copy_text(budget, key->module_name);
+    char *url = name == NULL ? NULL : queue_copy_text(budget,
+                                                      key->response_url);
+    char *partition = url == NULL ? NULL
+        : queue_copy_text(budget, key->partition_key);
+    unsigned char *data = partition == NULL ? NULL
+        : budget_malloc_category(budget, BUDGET_CATEGORY_SESSION,
+                                 bytecode_length);
+    BrowserSharedBody *body = NULL;
+    if (data != NULL) {
+        memcpy(data, bytecode, bytecode_length);
+        body = browser_shared_body_take(budget, data, bytecode_length);
+        if (body == NULL) budget_free(budget, data);
+    }
+    BrowserScriptDisk *disk = session->script_disk;
+    BrowserScriptBytecodeEntry *replaced = disk == NULL ? NULL
+        : queue_find(disk, key->module_name, key->response_url,
+                     key->partition_key);
+    BrowserScriptBytecodeEntry *slot = body == NULL || disk == NULL ? NULL
+        : replaced != NULL ? replaced : queue_free_slot(disk);
+    if (slot == NULL || !queue_admits(session, replaced, charge)) {
+        browser_shared_body_release(body);
+        budget_free(budget, name);
+        budget_free(budget, url);
+        budget_free(budget, partition);
+        return false;
+    }
+    if (replaced != NULL) queue_release(session, replaced, false);
+    /* An older RAM record of this module (another source) is stale: the
+       pack written from the queue replaces its group's pack. */
+    browser_session_script_bytecode_invalidate(
+        session, BROWSER_SCRIPT_BYTECODE_MODULE, key);
+    if (++disk->queue_serial == 0) disk->queue_serial = 1;
+    *slot = (BrowserScriptBytecodeEntry) {
+        .module_name = name,
+        .response_url = url,
+        .partition_key = partition,
+        .bytecode = body,
+        .source_length = key->source_length,
+        .charged_bytes = charge,
+        .stamp = ++disk->queue_clock,
+        .compile_flags = key->compile_flags,
+        .serial = disk->queue_serial,
+        .disk_state = BROWSER_SCRIPT_DISK_DIRTY
+    };
+    memcpy(slot->source_digest, key->source_digest,
+           sizeof(slot->source_digest));
+    disk->queue_count++;
+    disk->queue_bytes += charge;
+    disk->stats.queued++;
+    disk->stats.queued_bytes += bytecode_length;
+    return true;
+}
+
+bool browser_session_script_disk_adopt(BrowserSession *session,
+                                       BrowserScriptBytecodeEntry *entry)
+{
+    if (!browser_session_script_disk_writable(session) || entry == NULL
+        || entry->bytecode == NULL || entry->ordinal != 0
+        || entry->disk_state != BROWSER_SCRIPT_DISK_DIRTY
+        || entry->source_length > UINT32_MAX
+        || !queue_record_fits_pack(session->script_disk,
+                                   entry->bytecode->length)) return false;
+    BrowserScriptDisk *disk = session->script_disk;
+    /* A RAM store drops its module's queued record, so one found here is
+       older than the entry: the entry replaces it. */
+    BrowserScriptBytecodeEntry *replaced = queue_find(
+        disk, entry->module_name, entry->response_url, entry->partition_key);
+    if (!queue_admits(session, replaced, entry->charged_bytes)) return false;
+    if (replaced != NULL) queue_release(session, replaced, false);
+    BrowserScriptBytecodeEntry *slot = queue_free_slot(disk);
+    if (slot == NULL) return false;
+    *slot = *entry;
+    slot->stamp = ++disk->queue_clock;
+    if (++disk->queue_serial == 0) disk->queue_serial = 1;
+    slot->serial = disk->queue_serial;
+    disk->queue_count++;
+    disk->queue_bytes += slot->charged_bytes;
+    disk->stats.queued++;
+    disk->stats.queued_bytes += slot->bytecode->length;
+    return true;
+}
+
+void browser_session_script_disk_unqueue(BrowserSession *session,
+                                         const BrowserScriptBytecodeKey *key)
+{
+    if (session == NULL || session->script_disk == NULL || key == NULL
+        || key->module_name == NULL || key->response_url == NULL
+        || key->partition_key == NULL) return;
+    BrowserScriptBytecodeEntry *entry = queue_find(
+        session->script_disk, key->module_name, key->response_url,
+        key->partition_key);
+    if (entry != NULL) queue_release(session, entry, false);
+}
+
+void browser_session_script_disk_queue_clear(BrowserSession *session,
+                                             const char *partition)
+{
+    if (session == NULL || session->script_disk == NULL) return;
+    BrowserScriptDisk *disk = session->script_disk;
+    for (size_t i = 0; i < BROWSER_SCRIPT_DISK_QUEUE_LIMIT; i++) {
+        BrowserScriptBytecodeEntry *entry = &disk->queue[i];
+        if (entry->bytecode != NULL
+            && (partition == NULL
+                || strcmp(entry->partition_key, partition) == 0))
+            queue_release(session, entry, true);
+    }
+}
+
+size_t browser_session_script_disk_queue_reclaim(BrowserSession *session,
+                                                 size_t target_bytes)
+{
+    if (session == NULL || session->script_disk == NULL) return 0;
+    size_t released = 0;
+    while (released < target_bytes) {
+        BrowserScriptBytecodeEntry *oldest =
+            queue_oldest(session->script_disk);
+        if (oldest == NULL) break;
+        size_t charged = oldest->charged_bytes == 0
+            ? 1u : oldest->charged_bytes;
+        queue_release(session, oldest, true);
+        released = charged > SIZE_MAX - released
+            ? SIZE_MAX : released + charged;
+    }
+    return released;
+}
+
+size_t browser_session_script_disk_queue_bytes(const BrowserSession *session)
+{
+    return session == NULL || session->script_disk == NULL
+        ? 0 : session->script_disk->queue_bytes;
+}
+
+size_t browser_session_script_disk_queue_count(const BrowserSession *session)
+{
+    return session == NULL || session->script_disk == NULL
+        ? 0 : session->script_disk->queue_count;
+}
+
 /* ---- configuration ---- */
 
 static void job_abort(BrowserScriptDisk *disk)
@@ -556,6 +871,8 @@ static void disk_release(BrowserSession *session)
     if (disk == NULL) return;
     job_abort(disk);
     sweep_close(disk);
+    for (size_t i = 0; i < BROWSER_SCRIPT_DISK_QUEUE_LIMIT; i++)
+        queue_release(session, &disk->queue[i], false);
     /* Last-use stamps of a read-only session are not worth a write. */
     if (disk->write && disk->index_loaded
         && (disk->index_dirty || disk->index_stamps_dirty))
@@ -690,10 +1007,28 @@ static BrowserScriptBytecodeEntry *table_record(
     return NULL;
 }
 
-bool browser_session_script_disk_promote(BrowserSession *session,
-                                         BrowserScriptBytecodeKind kind,
-                                         const BrowserScriptBytecodeKey *key,
-                                         uint32_t generation)
+/* Whether a record read from a pack is exactly the key's: what the RAM
+   lookup would check before a hit. */
+static bool direct_record_matches(BrowserScriptBytecodeKey *key,
+                                  const BrowserScriptBytecodeKey *stored)
+{
+    if (stored->source_length != key->source_length
+        || stored->compile_flags != key->compile_flags) return false;
+    if (!key->digest_ready)
+        key->digest_ready = key->source != NULL && tilefinch_sha256_digest(
+            key->source, key->source_length, key->source_digest);
+    return key->digest_ready
+        && memcmp(stored->source_digest, key->source_digest,
+                  sizeof(key->source_digest)) == 0;
+}
+
+/* promote(), and with `direct` (module keys only) the record the RAM table
+   could not take, handed over from the pack buffer itself. */
+static bool promote_records(BrowserSession *session,
+                            BrowserScriptBytecodeKind kind,
+                            const BrowserScriptBytecodeKey *key,
+                            BrowserScriptBytecodeKey *direct_key,
+                            uint32_t generation, BrowserSharedBody **direct)
 {
     if (!browser_session_script_disk_enabled(session) || key == NULL
         || key->module_name == NULL || key->response_url == NULL
@@ -822,6 +1157,23 @@ bool browser_session_script_disk_promote(BrowserSession *session,
                 session, kind, &stored, bytes, generation);
             if (!browser_session_script_bytecode_put(session, kind, &stored,
                     generation, record + SCRIPT_DISK_RECORD_HEADER, bytes)) {
+                /* No room in RAM (it holds what this load uses): restore
+                   this one record from the pack itself. A module's group
+                   is that record alone, so nothing else is lost. */
+                if (pass == 0 && direct != NULL && count == 1
+                    && direct_record_matches(direct_key, &stored)) {
+                    memmove(data, record + SCRIPT_DISK_RECORD_HEADER, bytes);
+                    BrowserSharedBody *body = browser_shared_body_take(
+                        session->budget, data, bytes);
+                    if (body != NULL) {
+                        *direct = body;
+                        disk->stats.direct_reads++;
+                        entry->read_generation = generation;
+                        return true;
+                    }
+                    budget_free(session->budget, data);
+                    return false;
+                }
                 retry |= may_fit;
                 continue;
             }
@@ -838,6 +1190,23 @@ bool browser_session_script_disk_promote(BrowserSession *session,
     if (!retry) entry->read_generation = generation;
     budget_free(session->budget, data);
     return promoted_requested;
+}
+
+bool browser_session_script_disk_promote(BrowserSession *session,
+                                         BrowserScriptBytecodeKind kind,
+                                         const BrowserScriptBytecodeKey *key,
+                                         uint32_t generation)
+{
+    return promote_records(session, kind, key, NULL, generation, NULL);
+}
+
+bool browser_session_script_disk_promote_module(
+    BrowserSession *session, BrowserScriptBytecodeKey *key,
+    uint32_t generation, BrowserSharedBody **direct)
+{
+    if (direct != NULL) *direct = NULL;
+    return promote_records(session, BROWSER_SCRIPT_BYTECODE_MODULE, key, key,
+                           generation, direct);
 }
 
 void browser_session_script_disk_discard(BrowserSession *session,
@@ -1057,18 +1426,36 @@ static bool job_write(ScriptDiskJob *job, const void *data, size_t length)
 
 /* Chooses a group with records still to write and opens its pack, after
    making room; or marks a group that cannot be written as handled. */
+/* A group that will not be written: RAM records stay in RAM only; a
+   queued record, which only waits to be written, is dropped. */
+static void job_give_up(BrowserSession *session, BrowserScriptBytecodeKind kind,
+                        BrowserScriptBytecodeEntry *member, bool queued)
+{
+    if (queued) queue_release(session, member, true);
+    else group_mark(session, kind, member, BROWSER_SCRIPT_DISK_NONE);
+}
+
 static bool job_start(BrowserSession *session)
 {
     BrowserScriptDisk *disk = session->script_disk;
     BrowserScriptBytecodeKind kind = BROWSER_SCRIPT_BYTECODE_MODULE;
+    /* RAM records first, then the queue: a load's RAM records are the ones
+       it would have kept anyway, and a short stay or a reclaim that empties
+       both before idle work catches up must not cost them. */
     BrowserScriptBytecodeEntry *member = dirty_record(session, &kind);
+    bool queued = member == NULL;
+    if (queued) member = queue_oldest(disk);
     if (member == NULL) return false;
     ScriptDiskJob *job = &disk->job;
     memset(job, 0, sizeof(*job));
     BrowserScriptBytecodeTable *table = table_of(session, kind);
+    BrowserScriptBytecodeEntry *records = queued ? disk->queue
+        : table->entries;
+    size_t slots = queued ? BROWSER_SCRIPT_DISK_QUEUE_LIMIT
+        : BROWSER_SCRIPT_BYTECODE_ENTRIES;
     size_t bytes = SCRIPT_DISK_PACK_HEADER + SCRIPT_DISK_TRAILER;
-    for (size_t i = 0; i < BROWSER_SCRIPT_BYTECODE_ENTRIES; i++) {
-        BrowserScriptBytecodeEntry *entry = &table->entries[i];
+    for (size_t i = 0; i < slots; i++) {
+        BrowserScriptBytecodeEntry *entry = &records[i];
         if (entry->bytecode == NULL || !same_group(entry, member)) continue;
         if (entry->source_length > UINT32_MAX
             || entry->bytecode->length > BROWSER_SCRIPT_DISK_FILE_LIMIT
@@ -1092,7 +1479,7 @@ static bool job_start(BrowserSession *session)
         || !site_hash(member->partition_key, job->site)) {
         /* Larger than a pack may be: kept in RAM only. */
         disk->stats.skipped++;
-        group_mark(session, kind, member, BROWSER_SCRIPT_DISK_NONE);
+        job_give_up(session, kind, member, queued);
         return true;
     }
     /* Make room first, one removal per turn. The pack being replaced
@@ -1104,7 +1491,7 @@ static bool job_start(BrowserSession *session)
         || (existing == NULL
             && disk->count >= BROWSER_SCRIPT_DISK_FILE_COUNT_LIMIT)) {
         if (!evict_one(disk)) {
-            group_mark(session, kind, member, BROWSER_SCRIPT_DISK_NONE);
+            job_give_up(session, kind, member, queued);
             disk->stats.skipped++;
         }
         return true;
@@ -1115,11 +1502,12 @@ static bool job_start(BrowserSession *session)
     job->file = fopen(job->temporary, "wb");
     if (job->file == NULL) {
         disk->stats.write_failures++;
-        group_mark(session, kind, member, BROWSER_SCRIPT_DISK_NONE);
+        job_give_up(session, kind, member, queued);
         return true;
     }
     job->active = true;
     job->kind = kind;
+    job->queued = queued;
     job->expected_bytes = bytes;
     job->crc = checksum(0, NULL, 0);
     unsigned char header[SCRIPT_DISK_PACK_HEADER];
@@ -1132,7 +1520,7 @@ static bool job_start(BrowserSession *session)
     if (!job_write(job, header, sizeof(header))) {
         disk->stats.write_failures++;
         job_abort(disk);
-        group_mark(session, kind, member, BROWSER_SCRIPT_DISK_NONE);
+        job_give_up(session, kind, member, queued);
     }
     return true;
 }
@@ -1143,8 +1531,10 @@ static BrowserScriptBytecodeEntry *job_record(BrowserSession *session,
 {
     ScriptDiskJob *job = &session->script_disk->job;
     BrowserScriptBytecodeTable *table = table_of(session, job->kind);
-    if (table == NULL) return NULL;
-    BrowserScriptBytecodeEntry *entry = &table->entries[job->slots[at]];
+    if (!job->queued && table == NULL) return NULL;
+    BrowserScriptBytecodeEntry *entry = job->queued
+        ? &session->script_disk->queue[job->slots[at]]
+        : &table->entries[job->slots[at]];
     return entry->bytecode != NULL && entry->serial == job->serials[at]
         ? entry : NULL;
 }
@@ -1229,7 +1619,10 @@ static bool job_step(BrowserSession *session)
     disk->stats.written_bytes += job->bytes;
     for (size_t i = 0; i < job->count; i++) {
         BrowserScriptBytecodeEntry *entry = job_record(session, i);
-        if (entry != NULL) entry->disk_state = BROWSER_SCRIPT_DISK_CLEAN;
+        if (entry == NULL) continue;
+        /* Written: a queued record has nothing left to wait for. */
+        if (job->queued) queue_release(session, entry, false);
+        else entry->disk_state = BROWSER_SCRIPT_DISK_CLEAN;
     }
     memset(job, 0, sizeof(*job));
     return true;
@@ -1238,10 +1631,10 @@ failed:
     {
         BrowserScriptBytecodeEntry *member = job_record(session, 0);
         BrowserScriptBytecodeKind kind = job->kind;
+        bool queued = job->queued;
         job_abort(disk);
         /* Not retried this session: the card refused it. */
-        if (member != NULL)
-            group_mark(session, kind, member, BROWSER_SCRIPT_DISK_NONE);
+        if (member != NULL) job_give_up(session, kind, member, queued);
     }
     return true;
 }
@@ -1250,6 +1643,11 @@ bool browser_session_script_disk_maintenance(BrowserSession *session)
 {
     if (!browser_session_script_disk_enabled(session)) return false;
     BrowserScriptDisk *disk = session->script_disk;
+    /* Queued records wait only for writes: when the user turns site data
+       off they go (a captive sign-in only pauses them). */
+    if (disk->queue_count != 0 && !session_writes(session)
+        && session->captive_portal_stash == NULL)
+        browser_session_script_disk_queue_clear(session, NULL);
     if (!disk->index_loaded) {
         index_load(session);
         return true;
@@ -1307,6 +1705,7 @@ bool browser_session_script_disk_clear(BrowserSession *session)
     BrowserScriptDisk *disk = session->script_disk;
     job_abort(disk);
     sweep_close(disk);
+    browser_session_script_disk_queue_clear(session, NULL);
     if (!disk->write) {
         /* A read-only tier is never written: stop reading it instead. */
         disk->suspended = true;
@@ -1346,6 +1745,7 @@ bool browser_session_script_disk_clear_site(BrowserSession *session,
         return true;
     BrowserScriptDisk *disk = session->script_disk;
     uint8_t site[8];
+    browser_session_script_disk_queue_clear(session, partition);
     if (!site_hash(partition, site)) return false;
     if (!disk->write) {
         /* A read-only tier keeps the site's packs: stop reading it so

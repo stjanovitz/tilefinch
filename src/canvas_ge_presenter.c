@@ -19,6 +19,24 @@ void canvas_ge_presenter_enable(CanvasGePresenter *presenter, bool enabled,
     tile_cache_set_canvas_defer(presenter->enabled && !presenter->failed);
 }
 
+void canvas_ge_presenter_set_page(CanvasGePresenter *presenter,
+                                  uint64_t page)
+{
+    if (presenter != NULL) presenter->page = page;
+}
+
+/* Releases the backend's scratch once its page is gone. Called only on the
+   owner thread, with no submission outstanding and no deferral presented. */
+static void canvas_ge_presenter_release_scratch(CanvasGePresenter *presenter)
+{
+    if (!presenter->scratch_held
+        || presenter->scratch_page == presenter->page) return;
+    if (presenter->backend.release != NULL
+        && !presenter->backend.release(presenter->backend.context)) return;
+    presenter->scratch_held = false;
+    presenter->stats.scratch_releases++;
+}
+
 static void canvas_ge_presenter_verify(
     CanvasGePresenter *presenter, TileCache *cache, const uint16_t *frame,
     const uint16_t *back, size_t back_stride, unsigned width,
@@ -60,7 +78,10 @@ CanvasGePresentResult canvas_ge_presenter_publish(
     const RenderCanvasDeferral *deferral =
         cache != NULL && frame != NULL && frame == cache->frame
             ? tile_cache_canvas_deferral(cache) : NULL;
-    if (deferral == NULL) return CANVAS_GE_PRESENT_COPY;
+    if (deferral == NULL) {
+        if (owner_thread) canvas_ge_presenter_release_scratch(presenter);
+        return CANVAS_GE_PRESENT_COPY;
+    }
     if (!owner_thread) {
         stats->foreign_refusals++;
         return CANVAS_GE_PRESENT_REFUSE;
@@ -68,6 +89,12 @@ CanvasGePresentResult canvas_ge_presenter_publish(
     if (presenter->enabled && !presenter->failed && back != NULL
         && row_top < row_end && presenter->backend.scale != NULL) {
         uint64_t elapsed_us = 0;
+        /* The page that first made the backend allocate: an old page
+           still on screen after a navigation began must not re-date it. */
+        if (!presenter->scratch_held) {
+            presenter->scratch_held = true;
+            presenter->scratch_page = presenter->page;
+        }
         int drawn = presenter->backend.scale(
             presenter->backend.context, back, deferral, row_top, row_end,
             &elapsed_us);

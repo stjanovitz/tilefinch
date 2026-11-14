@@ -2,6 +2,12 @@ void script_runtime_destroy(ScriptRuntime *runtime)
 {
     if (runtime == NULL) return;
     Budget *budget = runtime->budget;
+    if (runtime->document != NULL
+        && runtime->document->content_security_policy_changed_opaque
+               == runtime) {
+        runtime->document->content_security_policy_changed = NULL;
+        runtime->document->content_security_policy_changed_opaque = NULL;
+    }
     image_preloads_destroy(runtime);
 #ifndef TILEFINCH_NO_TRACE
     if (tilefinch_trace_gc()) {
@@ -30,6 +36,7 @@ void script_runtime_destroy(ScriptRuntime *runtime)
         ((Stylesheet *) runtime->bridge.stylesheet)->fullscreen_node = NULL;
     runtime->bridge.fullscreen_node_handle = 0;
     audio_slots_retire(runtime);
+    js_rt_media_capture_release(runtime);
     document_body_snapshot_destroy(&runtime->memory_rescue);
     if (runtime->geometry_layout != NULL) {
         if (runtime->bridge.layout == runtime->geometry_layout)
@@ -148,6 +155,10 @@ void script_runtime_destroy(ScriptRuntime *runtime)
         JS_FreeValue(runtime->context, runtime->opfs_storage_manager);
         JS_FreeValue(runtime->context, runtime->game_audio_host_suspend);
         JS_FreeValue(runtime->context, runtime->game_audio_host_complete);
+        JS_FreeValue(runtime->context, runtime->media_capture_host_event);
+        runtime->media_capture_host_event = JS_UNDEFINED;
+        JS_FreeValue(runtime->context, runtime->media_capture_stream_track);
+        runtime->media_capture_stream_track = JS_UNDEFINED;
         JS_FreeValue(runtime->context, runtime->host_network_queue_stats);
         JS_FreeValue(runtime->context, runtime->host_indexed_db_stats);
         JS_FreeValue(runtime->context, runtime->motion_style_flushed);
@@ -191,7 +202,7 @@ void script_runtime_destroy(ScriptRuntime *runtime)
         JS_FreeRuntime(runtime->runtime);
     }
     /* After the runtime: freeing its functions released their texts. */
-#if defined(PSP_BROWSER_BELLARD_QUICKJS) && !defined(TILEFINCH_NO_TRACE)
+#if !defined(TILEFINCH_NO_TRACE)
     js_rt_source_store_census(runtime);
 #endif
     script_source_store_destroy(runtime->source_store);
@@ -199,6 +210,11 @@ void script_runtime_destroy(ScriptRuntime *runtime)
     /* Every opaque finalizer has run while its Budget owner remained live;
        wrapper finalizers were the last users of the handle table. */
     js_rt_bridge_node_table_free(&runtime->bridge);
+    if (runtime->game_audio_slots != NULL && runtime->game_audio_slots->fft_scratch != NULL) {
+        memset(runtime->game_audio_slots->fft_scratch, 0,
+               3u * TILEFINCH_GAME_AUDIO_FFT_SIZE_MAX * sizeof(float));
+        budget_free(budget, runtime->game_audio_slots->fft_scratch);
+    }
     budget_free(budget, runtime->game_audio_slots);
     runtime->game_audio_slots = NULL;
     /* Instance finalizers ran above; the idle WebAssembly runtime and its
@@ -230,31 +246,6 @@ bool scripts_run_document_at(PocDocument *document, Budget *budget,
     bool success = runtime != NULL;
     script_runtime_destroy(runtime);
     return success;
-}
-
-bool scripts_run_document_at_viewport(
-    PocDocument *document, Budget *budget, size_t js_memory_limit,
-    unsigned timeout_ms, const char *document_url,
-    int css_viewport_width, int css_viewport_height,
-    int device_width, int device_height, ScriptResult *result)
-{
-    ViewportContext viewport;
-    if (!viewport_context_init(&viewport, css_viewport_width,
-                               css_viewport_height, device_width,
-                               device_height)) return false;
-    return scripts_run_document_at_context(
-        document, budget, js_memory_limit, timeout_ms, document_url,
-        &viewport, result);
-}
-
-bool scripts_run_document_at_context(
-    PocDocument *document, Budget *budget, size_t js_memory_limit,
-    unsigned timeout_ms, const char *document_url,
-    const ViewportContext *viewport, ScriptResult *result)
-{
-    return scripts_run_document_at_context_with_policy(
-        document, budget, js_memory_limit, timeout_ms, document_url,
-        viewport, NULL, result);
 }
 
 bool scripts_run_document_at_context_with_policy(

@@ -1602,6 +1602,52 @@ void psp_webgl_measurement_mark(const char *mark)
                 (unsigned long) probe.mix_cpu_us[run], (unsigned long) probe.mix_max_us[run],
                 (unsigned long) probe.observer_us[run]);
     }
+    if (mark != NULL && strcmp(mark, "audio-program-probe") == 0) {
+        /* Web Audio program voices: the fixed scenarios' envelopes (compare
+           with the host renders) and four-voice mixer CPU. */
+        static const char *const names[TILEFINCH_GAME_AUDIO_SCENARIOS] = {
+            "beep", "noise", "sweep", "four"};
+        for (unsigned scenario = 0; scenario < TILEFINCH_GAME_AUDIO_SCENARIOS; scenario++) {
+            Budget budget;
+            budget_init(&budget, 256u * 1024u);
+            uint32_t rms[12];
+            bool okay = tilefinch_game_audio_validation_scenario_envelope(
+                &budget, scenario, rms, 12u);
+            printf("tilefinch-audio-scenario: name=%s okay=%u rms=", names[scenario],
+                   okay && budget.current == 0u ? 1u : 0u);
+            for (size_t at = 0; at < 12u; at++)
+                printf("%s%lu", at ? "," : "", okay ? (unsigned long) rms[at] : 0ul);
+            printf("\n");
+        }
+        TilefinchGameAudioProgramProbe probe;
+        bool okay = tilefinch_game_audio_validation_program_probe(&probe);
+        printf("tilefinch-audio-program-probe: okay=%u blocks=%lu\n", okay ? 1u : 0u,
+               (unsigned long) probe.blocks);
+        for (size_t run = 0; run < 6u; run++)
+            printf("tilefinch-audio-program-run: run=%lu program=%u blocks=256 mix-cpu=%lu "
+                   "mix-max=%lu mix-wall=%lu\n", (unsigned long) run, (run & 1u) ? 0u : 1u,
+                   (unsigned long) probe.mix_cpu_us[run], (unsigned long) probe.mix_max_us[run],
+                   (unsigned long) probe.mix_wall_us[run]);
+    }
+    if (mark != NULL && strcmp(mark, "audio-fft-probe") == 0) {
+        /* Microphone stream voices and AnalyserNodes: mixer cost with and
+           without analysers, then one frequency analysis per size. */
+        TilefinchGameAudioAnalyserProbe probe;
+        bool okay = tilefinch_game_audio_validation_analyser_probe(&probe);
+        printf("tilefinch-audio-fft-probe: okay=%u blocks=%lu\n", okay ? 1u : 0u,
+               (unsigned long) probe.blocks);
+        for (size_t run = 0; run < 6u; run++)
+            printf("tilefinch-audio-analyser-run: run=%lu analysers=%u blocks=256 mix-cpu=%lu "
+                   "mix-max=%lu mix-wall=%lu\n", (unsigned long) run, (run & 1u) ? 0u : 2u,
+                   (unsigned long) probe.mix_cpu_us[run], (unsigned long) probe.mix_max_us[run],
+                   (unsigned long) probe.mix_wall_us[run]);
+        static const unsigned sizes[3] = {256u, 1024u, 2048u};
+        for (size_t size = 0; size < 3u; size++)
+            printf("tilefinch-audio-analyser-fft: size=%u cpu=%lu wall=%lu peak-bin=%lu\n",
+                   sizes[size], (unsigned long) probe.fft_cpu_us[size],
+                   (unsigned long) probe.fft_wall_us[size],
+                   (unsigned long) probe.peak_bin[size]);
+    }
     if (mark != NULL && strcmp(mark, "audio-mix-on") == 0)
         tilefinch_game_audio_validation_mix_fast(true);
     else if (mark != NULL && strcmp(mark, "audio-mix-off") == 0)
@@ -2055,10 +2101,11 @@ void psp_vprobe_present_end(
         BrowserValidationCounters counters;
         (void) browser_engine_validation_counters(engine, &counters);
         printf("tilefinch-page-publication: at-us=%llu success=%d "
-               "presents=%u layout-text=%llu\n",
+               "presents=%u layout-text=%llu visible-images=%zu\n",
                (unsigned long long) canvas_present_finished_us,
                published ? 1 : 0, psp_display.presents,
-               (unsigned long long) counters.layout_text_fingerprint);
+               (unsigned long long) counters.layout_text_fingerprint,
+               counters.visible_images);
     }
     media_swdec_cpu_end(MEDIA_SWDEC_CPU_PROBE);
 }

@@ -14,15 +14,44 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
      the marker stays reachable from page code: the host captures its own
      reference and deletes __tilefinchTrustedEvent, and lazy worker.js
      receives the marker from the host. */
-  let trustedEventMark = null;
-  const trustedEvent = (event) => trustedEventMark(event);
+  let trustedEventMark = null, eventCreator = null, eventBrand = null,
+    eventInterfaces = null;
+  const trustedEvent = (event) => trustedEventMark(event),
+    /* Builds an event the browser fires with the bootstrap's own interface,
+       which compat.js captured before author code could replace the global:
+       `name` picks it ("Event" when omitted), and only `init`'s own fields
+       are read, so Object.prototype cannot supply any. Returns null until
+       compat.js has run. The share calls it createBrowserEvent, and
+       hardening.js publishes it for the lazy modules as
+       __tilefinchCreateEvent. */
+    newEvent = (type, init, name) =>
+      eventCreator === null ? null : eventCreator(type, init, name),
+    /* True only for an object the bootstrap's Event constructor built.
+       Dispatch checks this instead of instanceof against the global, which
+       a page can replace, give a Symbol.hasInstance, or satisfy with a
+       borrowed prototype. hardening.js publishes it for the lazy modules as
+       __tilefinchIsEvent. */
+    isEvent = (value) => eventBrand(value),
+    /* compat.js's frozen table of the interfaces above (Event,
+       EventTarget, UIEvent, MessageEvent...). hardening.js publishes it
+       as __tilefinchEventInterfaces for the lazy modules to extend. */
+    interfaces = () => eventInterfaces;
   Object.defineProperty(__tilefinchRealmGlobal, "__tilefinchTrustedEventShare", {
     configurable: true,
     value: Object.freeze({
       trustedEvent,
-      install(mark) {
-        if (trustedEventMark === null && typeof mark === "function")
+      createBrowserEvent: newEvent,
+      isEvent,
+      interfaces,
+      install(mark, create, brand, table) {
+        if (trustedEventMark === null && typeof mark === "function" &&
+            typeof create === "function" && typeof brand === "function" &&
+            typeof table === "object" && table !== null) {
           trustedEventMark = mark;
+          eventCreator = create;
+          eventBrand = brand;
+          eventInterfaces = table;
+        }
       },
     }),
   });
@@ -293,7 +322,8 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
     __tilefinchRealmGlobal.__tilefinchScheduleTask(() => {
       const pending = pendingElementScrolls;
       pendingElementScrolls = null;
-      for (const target of pending) target.dispatchEvent(new Event("scroll"));
+      for (const target of pending)
+        target.dispatchEvent(newEvent("scroll"));
     }, 0);
   };
   __tilefinchRealmGlobal.__tilefinchTaskRealm = "top";
@@ -394,7 +424,7 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
         typeof __tilefinchRealmGlobal.dispatchEvent === "function"
       )
         try {
-          const event = new Event("error", { cancelable: true });
+          const event = newEvent("error", { cancelable: true });
           event.message = error?.message || message;
           event.filename = "";
           event.lineno = 0;
@@ -523,6 +553,15 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
   };
   const cacheNode = (handle, wrapper) => {
     handle = Number(handle);
+    /* After a test cache clear, a wrapper from an older epoch may still be
+       live beside this one; the slot will track only the newer, so it must
+       not be released while the older one can name the handle. */
+    if (wrapperEpochs && weakNodeCache) {
+      const previous = slotWrapper(handle);
+      if (previous && previous !== wrapper
+          && wrapperEpochs.get(previous) !== wrapperEpoch)
+        __tilefinchKeepNodeHandle(handle);
+    }
     /* The handle slot holds the wrapper weakly: that is the cache. */
     const lease = weakNodeCache
       ? Number(__tilefinchRetainNodeWrapper(handle, wrapper)) : 0;
@@ -1277,14 +1316,38 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
   /* The attribute behind a property name, or null for a name no data-*
      attribute can produce (a symbol, or "-" before a lower-case letter).
      Only ASCII upper case maps to "-" plus lower case. */
-  const datasetAttribute = (key) => {
-      if (typeof key !== "string" || /-[a-z]/.test(key)) return null;
+  /* Name mappings computed, for the test census. */
+  let datasetNameMappings = 0;
+  const datasetAttributeOf = (key) => {
+      datasetNameMappings++;
+      if (/-[a-z]/.test(key)) return null;
       if (!/[A-Z]/.test(key)) return "data-" + key;
       let name = "data-";
       for (let at = 0; at < key.length; at++) {
         const code = key.charCodeAt(at);
         name += code >= 65 && code <= 90
           ? "-" + String.fromCharCode(code + 32) : key[at];
+      }
+      return name;
+    },
+    /* The mapping is a pure function of the name, and pages read the same
+       few names on every element (a virtual scroller reads each cell's
+       data-cell-index on every scroll sync), so short names keep their
+       answer. A null-prototype record has no inherited or author-reachable
+       members; it stops growing at its bound. */
+    DATASET_NAME_CACHE_LIMIT = 128,
+    DATASET_NAME_KEY_LIMIT = 64,
+    datasetNames = Object.create(null);
+  let datasetNameCount = 0;
+  const datasetAttribute = (key) => {
+      if (typeof key !== "string") return null;
+      if (key.length > DATASET_NAME_KEY_LIMIT) return datasetAttributeOf(key);
+      const known = datasetNames[key];
+      if (known !== undefined) return known;
+      const name = datasetAttributeOf(key);
+      if (datasetNameCount < DATASET_NAME_CACHE_LIMIT) {
+        datasetNames[key] = name;
+        datasetNameCount++;
       }
       return name;
     },
@@ -1716,6 +1779,7 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
       __tilefinchRealmGlobal.__tilefinchSubmittedBody =
         __tilefinchRealmGlobal.__tilefinchSubmissionBody?.(this, null) ?? null;
       __tilefinchRealmGlobal.__tilefinchSubmitted = true;
+      __tilefinchKeepNodeHandle(this.__handle);
       __tilefinchRealmGlobal.__tilefinchSubmittedFormHandle = this.__handle;
       __tilefinchRealmGlobal.__tilefinchSubmittedSubmitterHandle = 0;
     }
@@ -1737,11 +1801,11 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
       )
         return;
       const event = trustedEvent(
-        new SubmitEvent("submit", {
+        newEvent("submit", {
           bubbles: true,
           cancelable: true,
           submitter,
-        }),
+        }, "SubmitEvent"),
       );
       if (this.dispatchEvent(event)) {
         if (__tilefinchRealmGlobal.__tilefinchQueueFormSubmission?.(this, submitter))
@@ -1749,6 +1813,8 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
         __tilefinchRealmGlobal.__tilefinchSubmittedBody =
           __tilefinchRealmGlobal.__tilefinchSubmissionBody?.(this, submitter) ?? null;
         __tilefinchRealmGlobal.__tilefinchSubmitted = true;
+        __tilefinchKeepNodeHandle(this.__handle);
+        __tilefinchKeepNodeHandle(submitter?.__handle || 0);
         __tilefinchRealmGlobal.__tilefinchSubmittedFormHandle = this.__handle;
         __tilefinchRealmGlobal.__tilefinchSubmittedSubmitterHandle = submitter?.__handle || 0;
       }
@@ -2492,7 +2558,7 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
           replaceChild: root.replaceChild,
         }
       : null;
-    const sharedNative = !detached && shadowState.prepare(
+    if (!detached) shadowState.prepare(
       root, ShadowRoot.prototype, nativeLayer,
       __tilefinchRealmGlobal.__tilefinchPrepareNativePrototype);
     Object.setPrototypeOf(root, ShadowRoot.prototype);
@@ -2509,12 +2575,12 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
       __tilefinchSetAttribute(root.__handle, "style", "display:contents");
       if (!__tilefinchAppend(this.__handle, root.__handle))
         throw new Error("ShadowRoot connection failed");
-      let registered = registerNativeShadowRoot(root.__handle, false, sharedNative);
+      let registered = registerNativeShadowRoot(root.__handle, false);
       if (!registered) {
         /* Disconnect reactions may already have weakened every eligible
            entry. Dead native slots still need sweeping in that case. */
         shadowState.weaken();
-        registered = registerNativeShadowRoot(root.__handle, true, sharedNative);
+        registered = registerNativeShadowRoot(root.__handle, true);
       }
       if (!registered) {
         __tilefinchRemove(root.__handle);
@@ -3007,14 +3073,17 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
     configurable: true,
     value: "NodeList",
   });
+  /* The native querySelectorAll builds its static NodeList directly with
+     this prototype, in the shape nodeList() gives a copied list. */
+  const nodeListPrototype = NodeList.prototype;
   const nodeList = (values) => {
     const numericLength = numberFrom(values?.length),
       length = numberIsFinite(numericLength) && numericLength > 0
         ? mathMin(mathFloor(numericLength), 0xffffffff)
         : 0;
-    /* The node-handle index space; native results never exceed it, since
-       a walk that runs out of handles throws instead. */
-    if (length > 16384)
+    /* The node-handle index space (16 slot bits); native results never
+       exceed it, since a walk that runs out of handles throws instead. */
+    if (length > 65536)
       throw new RangeError("NodeList limit exceeded");
     const result = Object.create(NodeList.prototype);
     for (let index = 0; index < length; index++)
@@ -3245,7 +3314,7 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
           attributeState(slot, true).slotSnapshot = current.slice();
           if (changed || forced)
             slot.dispatchEvent(
-              new Event("slotchange", { bubbles: true }),
+              newEvent("slotchange", { bubbles: true }),
             );
         }
         for (const { slot, assignment: current } of
@@ -3257,7 +3326,7 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
           attributeState(slot, true).slotSnapshot = current.slice();
           if (changed || forced)
             slot.dispatchEvent(
-              new Event("slotchange", { bubbles: true }),
+              newEvent("slotchange", { bubbles: true }),
             );
         }
         removedSignalledSlotsByRoot.delete(root);
@@ -3533,7 +3602,8 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
     },
     querySelectorAll: {
       value: function querySelectorAll(selector) {
-        return nodeList(__tilefinchDocumentQuerySelectorAll.call(this, selector));
+        return __tilefinchDocumentQuerySelectorAll.call(
+          this, selector, false, nodeListPrototype);
       },
       writable: true,
       configurable: true,
@@ -3578,9 +3648,8 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
     },
     querySelectorAll: {
       value: function querySelectorAll(selector) {
-        return nodeList(
-          __tilefinchDocumentFragmentQuerySelectorAll.call(this, selector),
-        );
+        return __tilefinchDocumentFragmentQuerySelectorAll.call(
+          this, selector, false, nodeListPrototype);
       },
       writable: true,
       configurable: true,
@@ -3594,7 +3663,8 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
     },
     querySelectorAll: {
       value: function querySelectorAll(selector) {
-        return nodeList(__tilefinchElementQuerySelectorAll.call(this, selector));
+        return __tilefinchElementQuerySelectorAll.call(
+          this, selector, false, nodeListPrototype);
       },
       writable: true,
       configurable: true,
@@ -3688,7 +3758,7 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
       controlState = inputReset
         ? null
         : __tilefinchRealmGlobal.__tilefinchBeginControlDefault?.(this) || null,
-      clickEvent = new PointerEvent("click", {
+      clickEvent = newEvent("click", {
           bubbles: true,
           cancelable: true,
           composed: true,
@@ -3698,7 +3768,7 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
           pointerId: -1,
           pointerType: "",
           isPrimary: false,
-        });
+        }, "PointerEvent");
     clickEvent.__tilefinchControlDefaultPrepared = true;
     const proceed = this.dispatchEvent(clickEvent),
       controlHandled =
@@ -5380,7 +5450,21 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
     },
     getBoundingClientRect() {
       if (!this.isConnected) return new DOMRect(0, 0, 0, 0);
-      const g = this.__tilefinchGeometryValue();
+      const geometryValue = this.__tilefinchGeometryValue;
+      let g;
+      if (geometryValue === geometryValueMethod) {
+        /* The shipped method, answered without its result object: the
+           native refills geometryFields in its field order, read at once
+           (a flush below may run script that measures again). */
+        const nativeReceiver = this;
+        __tilefinchGeometry(nativeReceiver.__handle, geometryFields);
+        const x = geometryFields[0], y = geometryFields[1],
+          authoritative = geometryFields[3],
+          width = geometryFields[4], height = geometryFields[5];
+        if (authoritative && !(height <= 0 && shadowRootForHost(this)))
+          return new DOMRect(x, y, width, height);
+        g = { x, y, authoritative, width, height };
+      } else g = geometryValue.call(this);
       // Retained layout geometry already includes positioned layout,
       // transforms, ancestor/page scrolling and fixed-position adjustment.
       // Avoid rebuilding it with style and ancestor walks on the common
@@ -5958,7 +6042,7 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
     dispatchEvent(event) {
       const value = event;
       const controlState =
-        value instanceof Event &&
+        isEvent(value) &&
         value.type === "click" &&
         !value.__tilefinchControlDefaultPrepared
           ? __tilefinchRealmGlobal.__tilefinchBeginControlDefault?.(this) || null
@@ -6750,7 +6834,7 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
             acceptsX ? nextLeft : 0,
             acceptsY ? nextTop : 0,
           );
-          this.dispatchEvent(new Event("scroll"));
+          this.dispatchEvent(newEvent("scroll"));
         };
       smoothElementScrolls.delete(this);
       if (
@@ -7140,6 +7224,11 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
       return undefined;
     },
   });
+  /* getBoundingClientRect's refill target for __tilefinchGeometry, used
+     only while __tilefinchGeometryValue is still this method. */
+  const geometryValueMethod =
+    nativeNodeReceiverDescriptors.__tilefinchGeometryValue.value;
+  const geometryFields = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
   /* The hottest receiver getters run natively for ordinary nodes; each
      keeps its script getter above as the fallback for every other case. */
   for (const [name, kind] of [["parentNode", 0], ["parentElement", 1],
@@ -7484,6 +7573,8 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
       },
     });
     __tilefinchRealmGlobal.__tilefinchClearNodeCache = () => {
+      /* Connected slots stay releasable: only a slot that gets a second
+         wrapper while an older one lives is kept (cacheNode). */
       if (nodeCache) nodeCache.clear();
       wrapperEpochs ||= new WeakMap();
       wrapperEpoch++;
@@ -7892,7 +7983,34 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
         ];
       }
     }
-    const finiteLength = (style, name) => {
+    /* The computed values a box measurement reads, in one native call
+       (__tilefinchComputedStyleValues) rather than a declaration and a
+       call per property: every observation pass measures every target. A
+       value the native leaves undefined takes the declaration's general
+       path, exactly as a single read would. */
+    const RESIZE_STYLE_NAMES = [
+        "display", "padding-left", "padding-right", "padding-top",
+        "padding-bottom", "border-left-width", "border-right-width",
+        "border-top-width", "border-bottom-width", "width", "height",
+        "box-sizing",
+      ],
+      resizeStyle = (target) => {
+        const values = typeof __tilefinchComputedStyleValues === "function"
+          ? __tilefinchComputedStyleValues(target.__handle, RESIZE_STYLE_NAMES)
+          : undefined;
+        let style = null;
+        return {
+          getPropertyValue(name) {
+            const value = values?.[RESIZE_STYLE_NAMES.indexOf(name)];
+            if (value !== undefined) return value;
+            style ||= getComputedStyle(target);
+            return style.getPropertyValue(name);
+          },
+          get display() { return this.getPropertyValue("display"); },
+          get boxSizing() { return this.getPropertyValue("box-sizing"); },
+        };
+      },
+      finiteLength = (style, name) => {
         const value = parseFloat(style.getPropertyValue(name));
         return Number.isFinite(value) ? Math.max(0, value) : 0;
       },
@@ -7911,7 +8029,7 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
             borderHeight: 0,
           };
         const rect = target.getBoundingClientRect(),
-          style = getComputedStyle(target);
+          style = resizeStyle(target);
         if (style.display === "none")
           return {
             contentRect: new DOMRect(),
@@ -9222,6 +9340,7 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
       mutationObservers: { get: () => mutationObservers.length },
       slotAssignmentRoots: { get: () => pendingSlotRoots.size },
       motionInlineHintScans: { get: () => motionInlineHintScans },
+      datasetNameMappings: { get: () => datasetNameMappings },
     });
     __tilefinchRealmGlobal.__tilefinchRootCensus = census;
   }

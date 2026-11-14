@@ -647,7 +647,13 @@ static int test_reclaim_during_compile_and_restore(void)
         "globalThis.check = function () { return [lazyA(2), lazyB(3),"
         " String(lazyA), String(lazyB)].join('|') };\n/*");
     while (length < 20u * KIB) source[length++] = '.';
-    length += (size_t) snprintf(source + length, 24u * KIB - length, "*/\n");
+    /* A string constant above the engine's small-block size, so the
+       restore below allocates outside its arenas at least once (the small
+       records it reads may all fit blocks the arenas already hold). */
+    length += (size_t) snprintf(source + length, 24u * KIB - length,
+                                "*/\nvar padding = '");
+    for (size_t i = 0; i < 1024u; i++) source[length++] = 'p';
+    length += (size_t) snprintf(source + length, 24u * KIB - length, "';\n");
     static const char expected[] =
         "3|b3|function lazyA(n) { var k = function inner(q) { return q + n };"
         " return k(1) }|(s) => { return 'b' + s }";

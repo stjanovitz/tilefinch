@@ -55,6 +55,10 @@
    transient slot while a document is being fetched. */
 #define NAVIGATION_PAGE_FETCH_SLOT_LIMIT 16
 
+/* Shadow hosts a read-time sheet change can name for its image pass
+   (NAVIGATION_STYLE_IMAGE_HOST_LIMIT). */
+#define NAVIGATION_READ_SHEET_HOST_LIMIT 64u
+
 typedef struct {
     uint64_t total_us;
     uint64_t max_us;
@@ -98,6 +102,10 @@ typedef struct {
     long parent_handle;
     char parent_url[NAVIGATION_URL_LIMIT];
     char url[NAVIGATION_URL_LIMIT];
+    /* The origin of the container's src as resolved when the frame was
+       created (empty when it has none): Permissions Policy's 'src', which
+       a redirect or a later navigation of the child does not move. */
+    char src_origin[TILEFINCH_ORIGIN_SERIALIZED_LIMIT];
     char referrer_policy[128];
     long http_status;
     char server[64];
@@ -123,6 +131,12 @@ typedef struct {
     size_t discovery_node_count;
     bool opaque_origin;
     bool presentation_dirty;
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+    /* frame_lite lazy_realm (include/tilefinch/frame_lite.h): committed
+       with scripts allowed but no realm, because nothing in the document
+       can run script or take a press. Its snapshot is drawn without one. */
+    bool lite_realm_skipped;
+#endif
 } NavigationFrame;
 
 typedef struct {
@@ -333,6 +347,11 @@ typedef struct {
     /* Current-page memory admission/retirement failure. Header links do not
        prove an application initialized after this measured refusal. */
     bool script_memory_limited;
+    /* script_result.host_compile_memory_refusals when the page first
+       committed with a layout. A later refusal (a dynamic script, an ad
+       SDK) came after the content was built and cannot have kept it from
+       the page; see navigation_page_late_compile_memory_refusals. */
+    size_t script_compile_memory_refusals_at_commit;
     /* Why this document lost its realm, with the memory picture at that
        moment. First cause wins. Numbers only: it feeds a shareable report. */
     NavigationScriptStop script_stop;
@@ -480,6 +499,11 @@ typedef struct {
        pressure passes (tiles and images are reclaimable). */
     uint8_t layout_completion_failures;
     uint64_t layout_completion_retry_us;
+    /* The last jump into this provisional layout (navigation_note_layout_
+       jump): its target, and the scroll and box y it left. */
+    lxb_dom_node_t *layout_jump_node;
+    int layout_jump_scroll_y;
+    int layout_jump_box_y;
     /* A bounded focus relayout (navigation_relayout_plan) published a
        provisional layout on a page with a script realm: nonzero, it is the
        y above which that layout is proven to be the complete layout's own
@@ -509,6 +533,18 @@ typedef struct {
     ImagePriorityTarget *visual_batch_targets;
     size_t visual_batch_count;
     NavigationRefresh refresh;
+    /* A stylesheet change a script read applied ahead of its relayout
+       (navigation_settle_read_sheets): the relayout that consumes the
+       journal owes the image pass that change asked for. `hosts` are the
+       shadow hosts the new rules reach; a node retirement in between
+       drops them for the whole document. */
+    struct {
+        bool pending;
+        bool images;
+        bool whole_document;
+        uint8_t host_count;
+        lxb_dom_node_t *hosts[NAVIGATION_READ_SHEET_HOST_LIMIT];
+    } read_sheet_settle;
 } NavigationPage;
 
 typedef struct NavigationSession NavigationSession;
@@ -658,6 +694,13 @@ typedef struct {
     size_t provisional_extensions;
     size_t provisional_completions;
     size_t provisional_cancellations;
+    /* Readers of one node's box (a fragment, a Find match) that laid a
+       provisional page out only through it; those that still had to
+       complete it; and completions that found the box moved from where
+       the jump read it (navigation_settle_layout_jump). */
+    size_t layout_through_builds;
+    size_t layout_through_fallbacks;
+    size_t layout_jump_corrections;
     /* Focus-only relayouts that took the bounded (viewport plus two
        screens) build, those whose region check failed and fell back to
        the complete build, provisional layouts script completed before idle
@@ -724,6 +767,9 @@ typedef struct {
        of rebuilding it, and attempts that had to fall back. */
     size_t mutation_style_appends;
     size_t mutation_style_append_fallbacks;
+    /* Of those appends, the ones a script read made ahead of its relayout
+       so the read saw the new rules. */
+    size_t mutation_style_read_appends;
     /* Image discovery after an in-place style change that walked only the
        subtrees of the shadow hosts whose adopted sheets changed (and the
        journal's own roots) instead of the whole document. */
@@ -1072,6 +1118,11 @@ struct NavigationSession {
     bool last_tls_verify_result_available;
     bool last_tls_verification_failed;
     bool last_transport_timed_out;
+    /* The document's body crossed the load's maximum_bytes. */
+    bool last_response_limit_exceeded;
+    /* The document's response headers arrived (last_http_status is set
+       only when its transfer ends). */
+    bool last_response_started;
     bool last_tls12_compatibility_retry;
     char last_tls_version[16];
     char last_tls_peer_issuer[TILEFINCH_TLS_PEER_ISSUER_LIMIT];
@@ -1280,6 +1331,12 @@ typedef struct {
        evaluated and DOM mutations. A watchdog compares successive values
        to tell a slow, working load from a stuck one. */
     size_t progress_units;
+    /* The candidate page's scripts evaluated so far, in the parser's realm
+       or the candidate page's (its runtime's telemetry; 0 without one). */
+    size_t scripts_evaluated;
+    /* The transport has delivered the whole response; the parser may
+       still be working through it. */
+    bool response_received;
 } NavigationLoadMetrics;
 
 bool navigation_init(NavigationSession *session, Budget *budget,
@@ -1586,6 +1643,10 @@ bool navigation_layout_is_visually_blank(const LayoutDocument *layout);
 /* True once this page's realm ran out of memory, its server-rendered body
    was restored from the memory-rescue copy and the realm retired. */
 bool navigation_page_memory_rescued(const NavigationSession *session);
+/* Host compiles refused for memory since the page committed with a layout:
+   scripts that arrived after its content (dynamic scripts, an ad SDK). Zero
+   before commit, where every refusal may have kept content off the page. */
+size_t navigation_page_late_compile_memory_refusals(const NavigationPage *page);
 /* The active top-level realm alone receives built-in controller input. This
    matches the platform's explicit page-capture boundary and does not leak
    controller state into cross-origin child frames. A page without an author
@@ -1688,6 +1749,11 @@ void navigation_test_refuse_next_relayout(void);
 void navigation_test_refuse_next_frame_presentation(void);
 bool navigation_test_refresh_frame_presentation(
     NavigationSession *session, NavigationFrame *frame);
+/* The frame's snapshot size and whether it was drawn hidden (no pixels);
+   false when it has none. */
+bool navigation_test_frame_presentation(const NavigationFrame *frame,
+                                        int *width, int *height,
+                                        bool *hidden);
 bool navigation_test_configure_frame_messaging(
     NavigationSession *session, NavigationFrame *frame);
 bool navigation_test_install_frame_capability_trace(
@@ -1826,10 +1892,34 @@ bool navigation_layout_completion_awaited(const NavigationSession *session);
    adopts the result and records its damage like a relayout. */
 NavigationLayoutCompletion navigation_complete_layout(
     NavigationSession *session);
-/* Completes a provisional layout before a caller that reads the whole page
-   (find, fragment scrolling). False only when the build failed or was
-   cancelled; the provisional layout then stays in place. */
+/* Completes a provisional layout before a caller that reads the whole page.
+   False only when the build failed or was cancelled; the provisional layout
+   then stays in place. */
 bool navigation_complete_layout_sync(NavigationSession *session);
+/* `node`'s box when it is the complete layout's own, and so is the screen
+   from its top down: always in a complete layout, and in a provisional one
+   only when that is proven (see relayout.inc). NULL otherwise. */
+const LayoutNodeBox *navigation_exact_box(const NavigationSession *session,
+                                          const lxb_dom_node_t *node);
+/* Lays a provisional page out only as far as the first box of `nodes` (or
+   of a node's nearest ancestor, when it records none; at most
+   LAYOUT_THROUGH_TARGETS nodes) and the three screens below it; the rest
+   completes in idle work. A page with a script realm, or no nodes, is
+   completed outright. Failure as navigation_complete_layout_sync. */
+bool navigation_layout_through(NavigationSession *session,
+                               const lxb_dom_node_t *const *nodes,
+                               size_t count);
+/* navigation_layout_through for a caller that reads `node`'s box (fragment
+   scrolling): afterwards navigation_exact_box answers for it, or the layout
+   is complete, since a result that cannot be proven is completed. */
+bool navigation_complete_layout_through(NavigationSession *session,
+                                        const lxb_dom_node_t *node);
+/* Records that the reader was just scrolled to `node`'s box in a
+   provisional layout: the completion that adopts the complete layout moves
+   them with the box if it moved, unless they scrolled meanwhile or a
+   relayout intervened. */
+void navigation_note_layout_jump(NavigationSession *session,
+                                 lxb_dom_node_t *node);
 /* The region end of the page's bounded focus layout (see NavigationPage
    bounded_focus_region_end), or 0 when its layout is not one. */
 int navigation_bounded_focus_region_end(const NavigationSession *session);

@@ -11,6 +11,11 @@ struct NavigationFramePresentation {
     /* The child freed a node since this snapshot, and its layout's regions may
        name it. Input rebuilds the snapshot before reading them. */
     bool nodes_retired;
+    /* The frame's element had no box in its parent's complete layout
+       (display:none, itself or an ancestor): the child's layout was built,
+       but no pixels were drawn or published. Once the element has a box the
+       frame is drawn (navigation_deliver_frame_messages). */
+    bool hidden;
 };
 
 static void navigation_frame_presentation_note_retired(
@@ -971,6 +976,8 @@ static LayoutReuseCache *navigation_prepare_geometry_reuse(
     return session->page.layout_reuse;
 }
 
+static bool navigation_settle_read_sheets(void *opaque);
+
 static void navigation_release_geometry_reuse(void *opaque)
 {
     NavigationSession *session = opaque;
@@ -1060,6 +1067,10 @@ static void navigation_update_font_usage(NavigationSession *session)
 static void navigation_attach_layout(NavigationSession *session)
 {
     navigation_update_font_usage(session);
+#ifdef TILEFINCH_LAYOUT_DIFF
+    if (session != NULL)
+        layout_validation_set_reference(&session->page.layout);
+#endif
     if (session != NULL) {
         session->page.visual_image_publication_pending = false;
         session->page.layout_provisional =
@@ -1093,9 +1104,12 @@ static void navigation_attach_layout(NavigationSession *session)
                                   session->viewport.css_height);
         /* Commit installs the default once. Subsequent ordinary relayouts
            must preserve an explicitly supplied synchronous-layout callback. */
-        if (!session->page.loaded)
+        if (!session->page.loaded) {
             script_runtime_set_geometry_layout_callback(session->page.runtime,
                 navigation_flush_committed_geometry, session);
+            script_runtime_set_sheet_settle_callback(session->page.runtime,
+                navigation_settle_read_sheets, session);
+        }
         script_runtime_set_images(session->page.runtime,
                                   &session->page.images);
         /* The observer pass a commit queues reads its targets' geometry. A
@@ -2231,13 +2245,7 @@ static void navigation_accept_response_cookies(
     }
 }
 
-static bool node_name_is(lxb_dom_node_t *node, const char *wanted)
-{
-    size_t length = 0;
-    const char *name = document_element_name(node, &length);
-    return name != NULL && strlen(wanted) == length
-           && memcmp(name, wanted, length) == 0;
-}
+#define node_name_is document_element_name_is
 
 static bool navigation_token_contains(const char *value, size_t length,
                                       const char *wanted);

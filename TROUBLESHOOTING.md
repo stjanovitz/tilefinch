@@ -115,8 +115,12 @@ and then names the reason the last one could not play:
 - `PSP CAN'T PLAY THIS VIDEO FORMAT`: neither decoder can play this video
   and the page offered no version that fits. The second line names the
   cause, such as a B-frame pyramid, more than 3 reference frames, a
-  High-profile picture larger than 432x240, or a live stream format the
-  player does not support.
+  High-profile picture larger than 432x240, a streamed video whose playlist
+  is too long, or a live stream format the player does not support.
+- `VIDEO SOURCE COULD NOT OPEN` (`AUDIO SOURCE COULD NOT OPEN` for audio):
+  the server refused the video's address, or redirected it somewhere the
+  player cannot follow. The second line gives the server's status, for
+  example `HTTP 302`.
 
 - `STREAM OFFLINE OR NOT AVAILABLE`: a live channel is not streaming right
   now, or the stream's address no longer exists or has ended. Try again when
@@ -272,10 +276,17 @@ say leaves it. Password and payment fields never accept voice input.
 It should recover by itself. A new version that fails its first start is
 rolled back automatically, and the launcher's **Tilefinch Safe Start** screen
 offers to try the update again, discard it, or start the current version.
+The screen asks once: if you start the current version, or let its ten
+seconds run out, later starts are ordinary, and **Menu → Settings → Updates
+→ Version and update** says **UPDATE DID NOT FINISH STARTING** with X
+**TRY AGAIN** and Square **Discard**. The downloaded update stays on the
+Memory Stick until you choose.
 
 You can also start the previous version yourself: **hold L as you launch
-Tilefinch from the XMB**. This works once at least one update has been
-installed; a fresh install has no previous version yet.
+Tilefinch from the XMB**. This works once an update has finished its first
+start; a fresh install has no previous version yet. While a downloaded
+update has not finished its first start, L starts the version you were
+running.
 
 ## Where your data lives
 
@@ -314,8 +325,8 @@ entry. For a completely fresh start, also delete `recovery.cfg`,
 them are recreated with defaults. Some of these files keep one previous
 generation beside them as a crash-safety copy (`profile.cfg.bak`,
 `tabs-session.bin.bak`, `http-cache.bin.bak`, `local-storage.bin.bak`,
-`tls-sessions.bin.bak`); delete the `.bak` file too, or the browser restores
-from it.
+`tls-sessions.bin.bak`, `boot-overrides.cfg.bak`); delete the `.bak` file
+too, or the browser restores from it.
 
 Two things **not** to delete:
 

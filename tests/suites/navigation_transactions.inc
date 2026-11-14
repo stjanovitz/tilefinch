@@ -464,8 +464,9 @@ static bool test_caught_allocation_keeps_bounded_reader_runtime(void)
         "document.body.className='staged';"
         "try{new ArrayBuffer(8*1024*1024)}catch(error){"
         "globalThis.pocSummary='caught-bounded'}},1)</script></body>";
-    /* More paragraphs than the largest (4,096-node) extraction bound. */
-    const size_t paragraph_count = 4200u;
+    /* More paragraphs than the extraction bound this budget's free room
+       allows (one node per KiB above the reserve, Basic view's rule). */
+    const size_t paragraph_count = 5000u;
     const size_t html_length = sizeof(prefix) - 1u
         + paragraph_count * (sizeof(unit) - 1u)
         + sizeof(suffix) - 1u;
@@ -1148,6 +1149,107 @@ static bool frame_completion_oom_commit(NavigationSession *navigation,
 static const char frame_completion_child_html[] =
     "<!doctype html><body><p>Child document</p></body>";
 
+static bool test_remote_frame_local_replacement(void)
+{
+    static const char html[] =
+        "<!doctype html><body><p>Parent survives</p>"
+        "<iframe id=victim src='https://frame-oom.test/old'></iframe></body>";
+    static const char *const changes[] = {
+        "f.srcdoc='<p>Local replacement</p>';",
+        "f.removeAttribute('src');",
+        "f.src='';",
+        "f.src='about:blank';",
+        "f.src=URL.createObjectURL(new Blob(['<p>Blob replacement</p>'],"
+            "{type:'text/html'}));"
+    };
+    bool all_ok = true;
+    for (size_t variant = 0; variant < sizeof(changes) / sizeof(changes[0]);
+         variant++) {
+        Budget budget;
+        NavigationSession navigation = {0};
+        bool installed = false;
+        bool ready = frame_oom_session_init(&budget, &navigation, &installed);
+        bool ok = ready && frame_completion_oom_commit(
+            &navigation, html, sizeof(html) - 1u, NULL)
+            && navigation_test_complete_frame(
+                &navigation, &navigation.page.frames[0], 200,
+                frame_completion_child_html,
+                sizeof(frame_completion_child_html) - 1u);
+        ScriptResult probe = {0};
+        /* Retire a loaded descendant as well as messages already accepted
+           from both old realms. They must not outlive the local replacement. */
+        if (variant == 0u) {
+            ok = ok && script_runtime_evaluate_diagnostic(
+                navigation.page.frames[0].runtime,
+                "var child=document.createElement('iframe');"
+                "child.src='https://frame-oom.test/nested';"
+                "document.body.appendChild(child);",
+                "frame-local-test", &probe)
+                && navigation_advance_runtime(&navigation, 16, 4)
+                && navigation.page.frame_count == 2u
+                && navigation_test_complete_frame(
+                    &navigation, &navigation.page.frames[1], 200,
+                    frame_completion_child_html,
+                    sizeof(frame_completion_child_html) - 1u)
+                && script_runtime_evaluate_diagnostic(
+                    navigation.page.frames[1].runtime,
+                    "parent.postMessage('old descendant','*');",
+                    "frame-local-test", &probe);
+        }
+        ok = ok && script_runtime_evaluate_diagnostic(
+            navigation.page.frames[0].runtime,
+            "parent.postMessage('old remote','*');",
+            "frame-local-test", &probe)
+            && navigation.page.message_count != 0u;
+        size_t discovered = navigation.frames_discovered;
+        uint64_t old_generation = navigation.page.frames[0].lifecycle_generation;
+        char script[512];
+        snprintf(script, sizeof(script),
+            "var f=document.getElementById('victim');%s"
+            "f.contentWindow.replacementMarker='kept';", changes[variant]);
+        ok = ok && script_runtime_evaluate_diagnostic(
+            navigation.page.runtime, script, "frame-local-test", &probe)
+            && navigation_advance_runtime(&navigation, 16, 4);
+        bool retired = ok && navigation.page.frames[0].retired
+            && navigation.page.frames[0].runtime == NULL
+            && !navigation.page.frames[0].loaded
+            && !navigation.page.frames[0].fetch_pending
+            && navigation.frames_discovered == discovered
+            && navigation.page.message_count == 0u;
+        if (variant == 0u)
+            retired = retired && navigation.page.frames[1].retired
+                && navigation.page.frames[1].runtime == NULL;
+        bool local = ok && script_runtime_evaluate_diagnostic(
+            navigation.page.runtime,
+            "if(f.contentWindow.replacementMarker!=='kept')"
+            "throw Error('replacement proxy was reset');",
+            "frame-local-test", &probe);
+        bool restarted = local && script_runtime_evaluate_diagnostic(
+            navigation.page.runtime,
+            "f.removeAttribute('srcdoc');"
+            "f.src='https://frame-oom.test/new';",
+            "frame-local-test", &probe)
+            && navigation_advance_runtime(&navigation, 16, 4)
+            && !navigation.page.frames[0].retired
+            && navigation.page.frames[0].lifecycle_generation > old_generation
+            && navigation_test_complete_frame(
+                &navigation, &navigation.page.frames[0], 200,
+                frame_completion_child_html,
+                sizeof(frame_completion_child_html) - 1u)
+            && navigation.page.frames[0].loaded
+            && navigation.page.frames[0].runtime != NULL;
+        bool clean = frame_oom_session_clean(
+            &budget, &navigation, ready, installed);
+        if (!retired || !local || !restarted || !clean) {
+            fprintf(stderr, "local frame replacement %zu: setup=%d "
+                    "retired=%d local=%d restarted=%d clean=%d\n",
+                    variant, ok, retired, local, restarted, clean);
+            all_ok = false;
+        }
+    }
+    return all_ok;
+}
+
 static bool frame_completion_window_state_failure_keeps_page(unsigned failure)
 {
     /* The parent realm runs out of heap while it records the completed
@@ -1219,6 +1321,193 @@ static bool test_frame_completion_oom_cleanup_cannot_erase_failure(void)
 static bool test_frame_completion_author_error_keeps_realm(void)
 {
     return frame_completion_window_state_failure_keeps_page(2u);
+}
+
+#if defined(TILEFINCH_FRAME_LITE)
+/* frame_lite lazy_realm (prototype switch, include/tilefinch/frame_lite.h):
+   a child document with nothing that can run script or take a press
+   commits without a realm and is still drawn; one with a script, or with a
+   link, gets a realm as before; the parent's contentWindow.eval still
+   works, and posting to the realm-less child is harmless. */
+static bool frame_lite_complete_child(const char *child, size_t length,
+                                      bool *skipped, bool *has_runtime,
+                                      bool *presented, char *eval_result,
+                                      size_t eval_result_size)
+{
+    static const char html[] =
+        "<!doctype html><body><p id=out>parent</p>"
+        "<iframe id=f src='https://frame-lite.test/child.html'></iframe>"
+        "</body>";
+    Budget budget;
+    bool lexbor_installed = false;
+    NavigationSession navigation = {0};
+    bool ready = frame_oom_session_init(&budget, &navigation,
+                                        &lexbor_installed);
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool committed = ready && navigation_commit_html(
+        &navigation, generation, "https://frame-lite.test/", html,
+        sizeof(html) - 1u, 480, NULL, NULL, true)
+        && navigation.page.runtime != NULL
+        && navigation.page.frame_count == 1u;
+    bool completed = committed && navigation_test_complete_frame(
+        &navigation, &navigation.page.frames[0], 200, child, length);
+    NavigationFrame *frame = completed ? &navigation.page.frames[0] : NULL;
+    *skipped = frame != NULL && frame->lite_realm_skipped;
+    *has_runtime = frame != NULL && frame->runtime != NULL;
+    /* The unit session has no parent layout box for the frame, so the
+       snapshot is deferred (presentation_dirty) rather than built. */
+    *presented = frame != NULL && frame->loaded
+        && (frame->presentation != NULL || frame->presentation_dirty);
+    ScriptResult probe = {0};
+    bool evaluated = completed && script_runtime_evaluate_diagnostic(
+        navigation.page.runtime,
+        "const w=document.getElementById('f').contentWindow;"
+        "w.postMessage('ping','*');"
+        "document.getElementById('out').setAttribute('data-r',"
+        "String(w.eval('6*7')));",
+        "frame-lite-test", &probe);
+    bool idle = evaluated && navigation_advance_runtime(&navigation, 16, 4);
+    lxb_dom_node_t *out = idle ? test_find_id(
+        lxb_dom_interface_node(navigation.page.document.html), "out")
+        : NULL;
+    size_t value_length = 0;
+    const char *value = out == NULL ? NULL
+        : document_attribute(out, "data-r", &value_length);
+    snprintf(eval_result, eval_result_size, "%.*s",
+             value == NULL ? 0 : (int) value_length,
+             value == NULL ? "" : value);
+    bool clean = frame_oom_session_clean(&budget, &navigation, ready,
+                                         lexbor_installed);
+    return completed && idle && clean;
+}
+
+static bool test_frame_lite_lazy_realm(void)
+{
+    static const char plain[] =
+        "<!doctype html><body><p>Static child</p></body>";
+    static const char scripted[] =
+        "<!doctype html><body><script>window.x=1</script></body>";
+    static const char linked[] =
+        "<!doctype html><body><a href='/next'>Next</a></body>";
+    TilefinchFrameLiteSwitches saved = *tilefinch_frame_lite();
+    bool ok = true;
+    for (int on = 0; on <= 1; on++) {
+        tilefinch_frame_lite_set("lazy_realm", on ? "1" : "0");
+        bool skipped = false, runtime = false, presented = false;
+        char result[16];
+        bool done = frame_lite_complete_child(
+            plain, sizeof(plain) - 1u, &skipped, &runtime, &presented,
+            result, sizeof(result));
+        bool plain_ok = done && skipped == (on != 0)
+            && runtime == (on == 0) && presented
+            && strcmp(result, "42") == 0;
+        if (!plain_ok)
+            fprintf(stderr, "frame-lite plain on=%d done=%d skipped=%d "
+                    "runtime=%d presented=%d eval=%s\n", on, done,
+                    skipped, runtime, presented, result);
+        done = frame_lite_complete_child(
+            scripted, sizeof(scripted) - 1u, &skipped, &runtime,
+            &presented, result, sizeof(result));
+        bool scripted_ok = done && !skipped && runtime && presented;
+        if (!scripted_ok)
+            fprintf(stderr, "frame-lite scripted on=%d done=%d\n", on, done);
+        done = frame_lite_complete_child(
+            linked, sizeof(linked) - 1u, &skipped, &runtime, &presented,
+            result, sizeof(result));
+        bool linked_ok = done && !skipped && runtime && presented;
+        if (!linked_ok)
+            fprintf(stderr, "frame-lite linked on=%d done=%d\n", on, done);
+        ok = ok && plain_ok && scripted_ok && linked_ok;
+    }
+    tilefinch_frame_lite_restore(&saved);
+    return ok;
+}
+#endif
+
+/* A display:none frame gets its layout (its script sees the 300x150
+   viewport) but no pixels: nothing in the parent's image table. Once the
+   parent shows it, the owner tick finds its box and draws it at the box's
+   size, and the parent paints it. */
+static bool test_hidden_frame_snapshot_drawn_when_shown(void)
+{
+    static const char html[] =
+        "<!doctype html><body><p id=out>parent</p>"
+        "<iframe id=f style='display:none;width:200px;height:100px;border:0'"
+        " src='https://frame-hidden.test/child.html'></iframe></body>";
+    static const char child[] =
+        "<!doctype html><body style='margin:0;background:#0000ff'>"
+        "<p>Child</p><script>window.seen=innerWidth+':'+innerHeight"
+        "</script></body>";
+    Budget budget;
+    bool lexbor_installed = false;
+    NavigationSession navigation = {0};
+    bool ready = frame_oom_session_init(&budget, &navigation,
+                                        &lexbor_installed);
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool committed = ready && navigation_commit_html(
+        &navigation, generation, "https://frame-hidden.test/", html,
+        sizeof(html) - 1u, 480, NULL, NULL, true)
+        && navigation.page.runtime != NULL
+        && navigation.page.frame_count == 1u;
+    if (committed) navigation.images = &navigation.page.images;
+    bool completed = committed && navigation_test_complete_frame(
+        &navigation, &navigation.page.frames[0], 200, child,
+        sizeof(child) - 1u);
+    NavigationFrame *frame = completed ? &navigation.page.frames[0] : NULL;
+    int width = 0, height = 0;
+    bool drawn_hidden = false;
+    bool hidden = frame != NULL && frame->runtime != NULL
+        && navigation_test_frame_presentation(frame, &width, &height,
+                                              &drawn_hidden)
+        && drawn_hidden && !frame->presentation_dirty
+        && images_find_node(&navigation.page.images, frame->element) == NULL
+        && layout_box_for_node(&navigation.page.layout, frame->element)
+               == NULL;
+    ScriptResult probe = {0};
+    bool viewport = hidden && script_runtime_evaluate_diagnostic(
+        frame->runtime, "globalThis.pocSummary=window.seen",
+        "frame-hidden-viewport", &probe)
+        && strcmp(probe.summary, "300:150") == 0;
+    /* Another tick while hidden draws nothing. */
+    bool still_hidden = viewport
+        && navigation_advance_runtime(&navigation, 16, 4)
+        && navigation_test_frame_presentation(frame, NULL, NULL,
+                                              &drawn_hidden)
+        && drawn_hidden && images_find_node(&navigation.page.images, frame->element) == NULL;
+    bool shown_script = still_hidden && script_runtime_evaluate_diagnostic(
+        navigation.page.runtime,
+        "document.getElementById('f').style.display='block'",
+        "frame-hidden-show", &probe);
+    const ImageResource *image = NULL;
+    for (int tick = 0; shown_script && image == NULL && tick < 6; tick++) {
+        if (!navigation_advance_runtime(&navigation, 16, 4)) break;
+        image = images_find_node(&navigation.page.images, frame->element);
+    }
+    bool drawn = image != NULL && image->pixels != NULL
+        && navigation_test_frame_presentation(frame, &width, &height,
+                                              &drawn_hidden)
+        && !drawn_hidden && width == 200 && height == 100
+        && image->width == 200 && image->height == 100
+        && layout_box_for_node(&navigation.page.layout, frame->element)
+               != NULL;
+    /* The child's own pixels: its blue body, mid-frame. */
+    const unsigned char *pixel = drawn
+        ? image->pixels + ((size_t) 50 * 200u + 100u) * 4u : NULL;
+    bool painted = pixel != NULL && pixel[2] > 200 && pixel[0] < 60
+        && pixel[1] < 60;
+    bool resized = painted && script_runtime_evaluate_diagnostic(
+        frame->runtime, "globalThis.pocSummary=innerWidth+':'+innerHeight",
+        "frame-shown-viewport", &probe)
+        && strcmp(probe.summary, "200:100") == 0;
+    if (!resized)
+        fprintf(stderr, "hidden frame: committed=%d completed=%d hidden=%d "
+                "viewport=%d still=%d shown=%d drawn=%d painted=%d "
+                "resized=%d summary=%s\n", committed, completed, hidden,
+                viewport, still_hidden, shown_script, drawn, painted,
+                resized, probe.summary);
+    bool clean = frame_oom_session_clean(&budget, &navigation, ready,
+                                         lexbor_installed);
+    return resized && clean;
 }
 
 static bool test_frame_load_event_oom_retires_realm(void)

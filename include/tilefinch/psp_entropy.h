@@ -31,8 +31,9 @@ typedef void (*PspEntropyReport)(const char *line);
  * Call once from the main thread before any other thread can reach TLS or
  * DNS. `seed_path` names the persisted seed file (NULL for none); it is read
  * and rewritten when the pool is first seeded, not here, so configuring
- * costs no Memory Stick I/O. A NULL `report` prints to stdout. An
- * unconfigured process gets REQUIRE_CREDIT, no seed file, and stdout.
+ * costs no Memory Stick I/O. A NULL `report` prints to stdout in
+ * validation builds and reports nothing otherwise. An unconfigured process
+ * gets REQUIRE_CREDIT, no seed file, and that NULL report.
  */
 void psp_entropy_configure(const char *seed_path, PspEntropyPolicy policy,
                            PspEntropyReport report);

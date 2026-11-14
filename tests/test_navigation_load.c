@@ -5510,6 +5510,243 @@ static bool test_streaming_stylesheet_follows_late_viewport(void)
     return ok && clean;
 }
 
+/* How the parser-script stage stops in a script-refusal load. */
+typedef enum {
+    SCRIPT_REFUSAL_MUTATION,
+    SCRIPT_REFUSAL_TIME
+} ScriptRefusalKind;
+
+typedef struct {
+    uint64_t frame_hash;
+    uint64_t layout_digest;
+    size_t command_count;
+    size_t node_box_count;
+    size_t rules;
+    int layout_height;
+    int sheet_viewport_width;
+    size_t adoptions;
+    size_t commit_continuations;
+    size_t mutation_refusals;
+    size_t time_breakers;
+    uint32_t probe_color;
+    uint32_t tone_color;
+} ScriptRefusalSnapshot;
+
+/* Every draw command of the page, not only the first screen's pixels. */
+static uint64_t script_refusal_layout_digest(const LayoutDocument *layout)
+{
+    uint64_t hash = UINT64_C(1469598103934665603);
+    for (size_t i = 0; i < layout->count; i++) {
+        const DrawCommand *c = &layout->commands[i];
+        int64_t fields[] = {
+            c->type, c->x, c->y, c->width, c->height, (int64_t) c->color,
+            c->radius, c->font_size, c->font_weight, c->opacity_scale
+        };
+        const unsigned char *bytes = (const unsigned char *) fields;
+        for (size_t b = 0; b < sizeof(fields); b++)
+            hash = (hash ^ bytes[b]) * UINT64_C(1099511628211);
+        for (size_t b = 0; c->type == DRAW_TEXT && c->text != NULL
+             && b < c->text_length; b++)
+            hash = (hash ^ (unsigned char) c->text[b])
+                * UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+/* cnn.com's shape at a smaller scale: a <style> compiled at the legacy
+   width by an early parser-blocking script, then a <meta name=viewport>,
+   2,000 rules, a late <link>, a second parser-blocking script, and a body
+   <style> after it. The parser-script stage stops at the second script,
+   after its stylesheet checkpoint. */
+static bool capture_script_refusal_load(ScriptRefusalKind kind,
+                                        bool disable_continuation,
+                                        ScriptRefusalSnapshot *snapshot)
+{
+    enum { FRAME_WIDTH = 480, FRAME_HEIGHT = 272 };
+    memset(snapshot, 0, sizeof(*snapshot));
+    if (disable_continuation
+        ? setenv("TILEFINCH_DISABLE_STYLESHEET_CONTINUATION", "1", 1) != 0
+        : unsetenv("TILEFINCH_DISABLE_STYLESHEET_CONTINUATION") != 0)
+        return false;
+    char error[256] = {0};
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool lexbor_installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    TileCache cache = {0};
+    uint16_t *frame = NULL;
+    bool ready = lexbor_installed
+        && navigation_init(&navigation, &budget, 4)
+        && fetch_trace_replay_begin(
+               TILEFINCH_TEST_SOURCE_DIR
+               "/fixtures/http-stream-sheet-script-refusal",
+               error, sizeof(error));
+    if (ready) {
+        navigation_enable_scripts(&navigation, 3 * MIB, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 4, 32 * 1024, 16 * 1024, 1000);
+        navigation_enable_external_resources(
+            &navigation, 2, 256 * 1024, 16 * 1024,
+            2, 32 * 1024, 16 * 1024, 64 * 1024, 1000);
+        navigation_set_stream_delivery(
+            &navigation, 512, 0, 0, 0, 0, 0);
+        if (kind == SCRIPT_REFUSAL_TIME) {
+            /* Each author turn counts 10 ms against a 15 ms stage: the
+               breaker trips after the second script's turn. */
+            navigation_test_set_parser_script_stage_elapsed_us(10000u);
+            navigation_test_set_parser_script_stage_time_limit_us(15000u);
+        }
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    NavigationLoad *load = ready ? navigation_load_begin_url(
+        &navigation, generation, "https://script-refusal.test/document",
+        256 * 1024, 1000, FRAME_WIDTH, NULL, NULL, true) : NULL;
+    NavigationLoadQuota quota = {
+        .fetch = {
+            .maximum_body_callbacks = 1,
+            .maximum_body_bytes = 512,
+            .maximum_time_us = 10000
+        },
+        .maximum_parser_body_bytes = 512,
+        .maximum_parser_time_us = 10000
+    };
+    bool armed = false;
+    for (size_t i = 0; load != NULL && i < 4096; i++) {
+        if (navigation_load_status(load) != NAVIGATION_LOAD_PENDING) break;
+        /* The second build is the sheet at the meta viewport's width,
+           at the second script: that script's mutation checkpoint, the
+           next one, is refused. */
+        if (kind == SCRIPT_REFUSAL_MUTATION && !armed
+            && navigation.performance.blocking_stylesheet_builds >= 2) {
+            navigation_test_refuse_next_parser_checkpoint(
+                NAVIGATION_TEST_PARSER_CHECKPOINT_MUTATION);
+            armed = true;
+        }
+        (void) navigation_load_pump(load, &quota);
+    }
+    for (size_t i = 0; load != NULL && i < 256
+         && navigation_load_status(load) != NAVIGATION_LOAD_SUCCEEDED; i++) {
+        NavigationLoadStatus status = navigation_load_status(load);
+        if (status != NAVIGATION_LOAD_READY_TO_FINISH
+            && status != NAVIGATION_LOAD_FINALIZING) break;
+        (void) navigation_load_finish(load, &quota);
+    }
+    navigation_test_refuse_next_parser_checkpoint(
+        NAVIGATION_TEST_PARSER_CHECKPOINT_NONE);
+    navigation_test_set_parser_script_stage_elapsed_us(0u);
+    navigation_test_set_parser_script_stage_time_limit_us(0u);
+    bool loaded = load != NULL
+        && navigation_load_status(load) == NAVIGATION_LOAD_SUCCEEDED
+        && navigation.page.loaded;
+    size_t frame_pixels = (size_t) FRAME_WIDTH * FRAME_HEIGHT;
+    frame = loaded
+        ? budget_malloc(&budget, frame_pixels * sizeof(*frame)) : NULL;
+    bool rendered = frame != NULL
+        && tile_cache_init(&cache, &budget, &navigation.page.layout, 4)
+        && tile_cache_set_frame(&cache, frame, frame_pixels)
+        && tile_cache_render_frame(
+               &cache, 0, FRAME_WIDTH, FRAME_HEIGHT, NULL);
+    if (rendered) {
+        const LayoutDocument *layout = &navigation.page.layout;
+        const NavigationPerformance *performance = &navigation.performance;
+        snapshot->frame_hash = hash_frame_pixels(frame, frame_pixels);
+        snapshot->layout_digest = script_refusal_layout_digest(layout);
+        snapshot->command_count = layout->count;
+        snapshot->node_box_count = layout->node_box_count;
+        snapshot->rules = navigation.page.stylesheet.count;
+        snapshot->layout_height = layout->height;
+        snapshot->sheet_viewport_width =
+            navigation.page.stylesheet.viewport_width;
+        snapshot->adoptions = performance->blocking_stylesheet_adoptions;
+        snapshot->commit_continuations =
+            performance->blocking_stylesheet_commit_continuations;
+        snapshot->mutation_refusals =
+            performance->parser_checkpoint_mutation_refusals;
+        snapshot->time_breakers =
+            performance->parser_script_stage_time_breakers;
+        snapshot->probe_color = layout_text_color(layout, "probe");
+        snapshot->tone_color = layout_text_color(layout, "tone");
+    }
+    if (!rendered)
+        fprintf(stderr, "script refusal load kind=%d disabled=%d ready=%d "
+                "loaded=%d status=%d error=\"%s\" trace=\"%s\"\n",
+                (int) kind, disable_continuation, ready, loaded,
+                load == NULL ? -1 : (int) navigation_load_status(load),
+                navigation.last_error, error);
+    tile_cache_destroy(&cache);
+    budget_free(&budget, frame);
+    navigation_load_destroy(load);
+    if (ready) fetch_trace_end();
+    if (lexbor_installed) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (lexbor_installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return rendered && clean;
+}
+
+/* A parser-script refusal after the streaming sheet compiled (cnn.com: a
+   mutation checkpoint over its time limit) leaves that sheet to commit,
+   which appends the body <style> that followed and adopts it instead of
+   compiling every rule again. The page must be exactly the page a fresh
+   commit-time compile gives (the continuation switched off: the stream
+   then never appends, so commit builds the whole sheet). */
+static bool test_streaming_sheet_survives_script_refusal(void)
+{
+    static const ScriptRefusalKind kinds[] = {
+        SCRIPT_REFUSAL_MUTATION, SCRIPT_REFUSAL_TIME
+    };
+    bool all_ok = true;
+    for (size_t k = 0; k < sizeof(kinds) / sizeof(kinds[0]); k++) {
+        ScriptRefusalSnapshot adopted = {0}, fresh = {0};
+        bool captured =
+            capture_script_refusal_load(kinds[k], false, &adopted)
+            && capture_script_refusal_load(kinds[k], true, &fresh);
+        (void) unsetenv("TILEFINCH_DISABLE_STYLESHEET_CONTINUATION");
+        bool refused = kinds[k] == SCRIPT_REFUSAL_MUTATION
+            ? adopted.mutation_refusals == 1 && fresh.mutation_refusals == 1
+            : adopted.time_breakers == 1 && fresh.time_breakers == 1;
+        bool ok = captured && refused
+            && adopted.adoptions == 1 && adopted.commit_continuations == 1
+            && fresh.adoptions == 0
+            && adopted.frame_hash == fresh.frame_hash
+            && adopted.layout_digest == fresh.layout_digest
+            && adopted.command_count == fresh.command_count
+            && adopted.node_box_count == fresh.node_box_count
+            && adopted.rules == fresh.rules && adopted.rules > 2000
+            && adopted.layout_height == fresh.layout_height
+            && adopted.sheet_viewport_width == 480
+            && fresh.sheet_viewport_width == 480
+            && adopted.probe_color == 0x112233u
+            && adopted.tone_color == 0xfedcbau;
+        if (!ok) {
+            fprintf(stderr,
+                    "script refusal kind=%d captured=%d refused=%d "
+                    "adoptions=%zu/%zu commit-appends=%zu/%zu "
+                    "hash=%016llx/%016llx digest=%016llx/%016llx "
+                    "commands=%zu/%zu boxes=%zu/%zu rules=%zu/%zu "
+                    "height=%d/%d viewport=%d/%d probe=%06x tone=%06x\n",
+                    (int) kinds[k], captured, refused,
+                    adopted.adoptions, fresh.adoptions,
+                    adopted.commit_continuations, fresh.commit_continuations,
+                    (unsigned long long) adopted.frame_hash,
+                    (unsigned long long) fresh.frame_hash,
+                    (unsigned long long) adopted.layout_digest,
+                    (unsigned long long) fresh.layout_digest,
+                    adopted.command_count, fresh.command_count,
+                    adopted.node_box_count, fresh.node_box_count,
+                    adopted.rules, fresh.rules,
+                    adopted.layout_height, fresh.layout_height,
+                    adopted.sheet_viewport_width,
+                    fresh.sheet_viewport_width,
+                    (unsigned) adopted.probe_color,
+                    (unsigned) adopted.tone_color);
+        }
+        all_ok = all_ok && ok;
+    }
+    return all_ok;
+}
+
 static bool test_streaming_preview_rejects_incomplete_external_css(void)
 {
     Budget budget;
@@ -6228,6 +6465,8 @@ static bool prior_page(NavigationSession *navigation)
 #include "suites/navigation_document.inc"
 #include "suites/navigation_image_retarget.inc"
 #include "suites/navigation_transactions.inc"
+#include "suites/navigation_sheet_reads.inc"
+#include "suites/navigation_style_scope.inc"
 #include "suites/navigation_svg_retarget.inc"
 #include "suites/navigation_streaming.inc"
 #include "suites/navigation_runtime.inc"

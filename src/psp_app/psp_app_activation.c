@@ -547,12 +547,13 @@ void psp_app_route_controller_action(
                 action->url);
         }
         psp_ui_set_loading(&app->process->presentation.ui, true, -1);
-        psp_ui_show_status(
-            &app->process->presentation.ui,
-            reader_navigation
-                ? "LOADING READER PAGE"
-                : "LOADING - CIRCLE CANCELS",
-            reader_navigation ? 300 : 120);
+        if (reader_navigation)
+            psp_ui_show_status(&app->process->presentation.ui,
+                               "LOADING READER PAGE", 300);
+        else
+            psp_ui_show_loading_status(&app->process->presentation.ui,
+                                       BROWSER_NAVIGATION_PHASE_CONNECTING,
+                                       120);
         psp_navigation_cooperate_begin(
             &app->process->presentation.ui, engine_frame, engine);
         psp_text_input_before_navigation(&app->process->text_input);

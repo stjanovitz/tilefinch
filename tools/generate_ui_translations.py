@@ -9,7 +9,12 @@ from indic_sequences import encoded as indic_sequences
 ROOT = Path(__file__).resolve().parents[1]
 # The runtime bounds of include/tilefinch/ui_language.h.
 ROW_LIMIT = 2048
+# A file's byte bound. Until v17 the reader kept 16-bit value offsets, so
+# v12 to v16 were generated under 64 KiB - 1 (and stay so: they are
+# published). From v17 the offsets are 32-bit (src/ui_language.c).
 BYTE_LIMIT = 64 * 1024 - 1
+WIDE_VERSION = 17
+WIDE_BYTE_LIMIT = 128 * 1024
 # From v12 a catalog stores no English keys ("TFUI2", src/ui_language.c).
 # A row is found by the 32-bit FNV-1a hash of its ASCII-lowercased key (what
 # strcasecmp matched) and confirmed by the key's byte length.
@@ -45,6 +50,7 @@ CATALOGS.append((13, list(latest_languages.values())))
 CATALOGS.append((14, list(latest_languages.values())))
 CATALOGS.append((15, list(latest_languages.values())))
 CATALOGS.append((16, list(latest_languages.values())))
+CATALOGS.append((17, list(latest_languages.values())))
 ACTIVE_VERSION = CATALOGS[-1][0]
 # Keys a version drops because the browser no longer looks them up. Every
 # other key of the previous version must remain, so a newly added locale
@@ -69,7 +75,16 @@ RETIRED_KEYS = {12: {
          "response. Try another search.",
          "No public comments were returned within the bounded request.",
          "No public video entries were present in the bounded channel "
-         "response."}}
+         "response."},
+    # One loading and stop form: "<WHAT>  O CANCEL" or "<WHAT>  O STOP";
+    # a page load names its phase ("RECEIVING PAGE  O CANCEL").
+    17: {"BUSY - CIRCLE CANCELS", "INSTALLING HOMEBREW - O CANCEL",
+         "INSTALLING OFFLINE APP - CIRCLE STOPS", "LOADING  O CANCEL",
+         "LOADING - CIRCLE CANCELS", "PREPARING APP PREVIEW - CIRCLE STOPS",
+         "RECOMPILING OFFLINE APP - CIRCLE STOPS",
+         "REMOVING HOMEBREW - O STOP", "SAVING ARTICLE - CIRCLE STOPS",
+         # The retired wave background setting's toasts.
+         "WAVE BACKGROUND OFF", "WAVE BACKGROUND ON"}}
 # The signed glyph-pack revision whose pre-shaped clusters cover a catalog
 # version's labels: (glyphs, first catalog version) -> sequence. A catalog
 # that adds shaped labels needs a rebuilt pack and a new entry here.
@@ -85,6 +100,13 @@ def minimum_glyph_sequence(glyphs, version):
     return max([sequence for (script, first), sequence
                 in MINIMUM_GLYPH_SEQUENCES.items()
                 if script == glyphs and first <= version] or [1])
+
+def byte_limit(version):
+    """The largest file a reader of this catalog version accepts."""
+    if version >= WIDE_VERSION:
+        return WIDE_BYTE_LIMIT
+    return BYTE_LIMIT if version >= HASHED_VERSION else 32768
+
 
 def folded_key(key):
     """The key's UTF-8 bytes with only ASCII letters lowered, as
@@ -172,7 +194,7 @@ def outputs(resource_dir=None):
             data = hashed_catalog(code, rows, column, prepared=prepared) \
                 if version >= HASHED_VERSION else (f"TFUI1\t{code}\n" + "".join(
                     f"{r[0]}\t{r[column]}\n" for r in rows)).encode("utf-8")
-            if len(data) > (BYTE_LIMIT if version >= 12 else 32768):
+            if len(data) > byte_limit(version):
                 raise ValueError("locale exceeds runtime bound")
             resource_key = f"translations/ui/v{version}/{code}.tful"
             if resource_dir is not None:

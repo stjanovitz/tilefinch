@@ -8,7 +8,10 @@
 #include "tilefinch/request_context.h"
 #include "tilefinch/url.h"
 
-#define TILEFINCH_CSP_POLICY_LIMIT 4u
+/* Policies a response's header fields may deliver, and the total once
+   <meta http-equiv="Content-Security-Policy"> policies join them. */
+#define TILEFINCH_CSP_HEADER_POLICY_LIMIT 4u
+#define TILEFINCH_CSP_POLICY_LIMIT 7u
 /* Bounded independently from the response snapshot. Large production CSPs
    commonly exceed 4 KiB even after unrelated response fields are discarded. */
 #define TILEFINCH_CSP_STORAGE_BYTES 8192u
@@ -45,6 +48,11 @@ typedef struct {
 
 typedef struct {
     TilefinchCspDirectiveValue directives[TILEFINCH_CSP_DIRECTIVE_COUNT];
+    /* The policy's serialized text in `storage`. */
+    uint16_t text_offset;
+    uint16_t text_length;
+    /* Delivered by a <meta> element rather than a header field. */
+    bool meta;
 } TilefinchCspPolicy;
 
 typedef struct TilefinchContentSecurityPolicy {
@@ -53,7 +61,9 @@ typedef struct TilefinchContentSecurityPolicy {
     TilefinchCspPolicy policies[TILEFINCH_CSP_POLICY_LIMIT];
     size_t storage_used;
     size_t policy_count;
+    /* A header field delivered a policy (nonce hiding follows only this). */
     bool header_present;
+    /* False is fail-closed: every check refuses. */
     bool valid;
 } TilefinchContentSecurityPolicy;
 
@@ -67,6 +77,24 @@ bool tilefinch_csp_parse_response_headers(
     TilefinchContentSecurityPolicy *policy, const char *document_url,
     const char *headers, size_t headers_length,
     bool security_headers_truncated);
+/* Whether any policy is enforced: one from a header field or a <meta>. */
+bool tilefinch_csp_enforced(const TilefinchContentSecurityPolicy *policy);
+/* CSP3 with HTML's http-equiv "Content-Security-Policy" state: the content
+   of a <meta> in the document's head, appended as enforced policies (a
+   comma separates policies, as in a header field) beside any header
+   policies, all of which must allow. frame-ancestors is ignored in a meta
+   policy (report-uri and sandbox are not implemented at all). A policy
+   with the same text as an earlier meta policy changes nothing and is not
+   stored again. Policies only accumulate, so this can only restrict; a
+   policy that does not fit the bounded storage makes the policy
+   fail-closed. Returns whether the enforced policy changed. */
+bool tilefinch_csp_add_meta_policy(
+    TilefinchContentSecurityPolicy *policy, const char *content,
+    size_t content_length);
+/* Records `document_url`'s origin for 'self' when no response header parse
+   did (a document committed from memory). */
+void tilefinch_csp_bind_document_origin(
+    TilefinchContentSecurityPolicy *policy, const char *document_url);
 bool tilefinch_csp_allows_request(
     const TilefinchContentSecurityPolicy *policy,
     TilefinchRequestDestination destination, const char *target_url);

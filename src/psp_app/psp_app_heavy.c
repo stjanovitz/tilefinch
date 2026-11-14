@@ -21,15 +21,13 @@
  *   view (unless the Basic view fallback is Off), Reader and Return.
  * - (a) a heavy page that already shows content: its scripts run in the
  *   background; a status says so once, and X stops them. If the page then
- *   runs low on memory the status offers it once more.
+ *   runs low on memory (a script was refused memory and little is left,
+ *   script_heavy_state_low_on_memory) the status offers it once more.
  *
  * Settings > Browsing & input > Heavy pages chooses Ask (the above), Run
  * (never ask) or Basic view (refuse the big scripts of (b) and (c) pages).
  */
 
-/* An (a) page whose reachable heap falls below this has the stop offered
-   again. */
-#define PSP_HEAVY_LOW_MEMORY_BYTES (2u * 1024u * 1024u)
 #define PSP_HEAVY_STATUS_FRAMES 360u
 #define PSP_HEAVY_SHELL_GRACE_US UINT64_C(5000000)
 /* The poll runs every loop iteration for the page's whole life; weighing
@@ -165,14 +163,44 @@ bool psp_app_heavy_poll(PspApp *app)
     BrowserEngine *engine = app->browser->engine;
     if (browser_engine_navigation_pending(engine)) return false;
     uint64_t generation = browser_engine_page_generation(engine);
+    /* An offer left unanswered (it ran out, or the reader went on to
+       another page) is not shown for its site again this session. */
+    psp_scripts_off_session_settle(
+        &interactive->scripts_off_session, ui,
+        interactive->heavy_generation != generation);
     if (interactive->heavy_generation != generation) {
         interactive->heavy_generation = generation;
         interactive->heavy_offer_shown = false;
         interactive->heavy_status_shown = false;
         interactive->heavy_low_memory_shown = false;
         interactive->heavy_rescue_shown = false;
+        interactive->script_memory_noted = false;
+        interactive->scripts_off_offer_checked = false;
         interactive->heavy_shell_since_us = 0;
         interactive->heavy_measure_countdown = 0;
+    }
+    /* A page whose scripts ran out of memory is noted for its site; the
+       site's next page offers, once, to load without scripts. Never on the
+       visit that stopped, and never by itself. */
+    BrowserProfile *profile = app->browser->profile;
+    if (!interactive->script_memory_noted
+        && browser_engine_page_scripts_stopped_for_memory(engine)) {
+        interactive->script_memory_noted = true;
+        if (psp_scripts_off_note_stop(profile, ui))
+            psp_profile_store_mark_dirty(&app->browser->profile_store,
+                                         psp_time_us(NULL));
+    }
+    if (!interactive->scripts_off_offer_checked
+        && ui->screen == PSP_UI_SCREEN_PAGE) {
+        interactive->scripts_off_offer_checked = true;
+        if (!interactive->script_memory_noted
+            && psp_scripts_off_session_due(
+                   &interactive->scripts_off_session, profile, ui)) {
+            psp_ui_show_scripts_off_offer(ui);
+            psp_scripts_off_session_shown(
+                &interactive->scripts_off_session, ui);
+            return true;
+        }
     }
     /* A software-decoded video needed the room the page's scripts held
        (browser_engine_make_media_room). Said once, back on the page. */
@@ -274,6 +302,9 @@ bool psp_app_heavy_poll(PspApp *app)
                            PSP_HEAVY_STATUS_FRAMES);
         return true;
     }
+    /* The scripts-off offer stands until it is answered or ends. */
+    if (ui->toast_kind == PSP_UI_TOAST_SCRIPTS_OFF_OFFER
+        && ui->toast_frames != 0) return false;
     /* (a), or an app shell whose scripts were already running when it
        became heavy (they came with the page, not after it, so there was
        nothing to hold): say what it costs once, and offer the stop. */
@@ -301,7 +332,7 @@ bool psp_app_heavy_poll(PspApp *app)
     if (state.page_class == SCRIPT_HEAVY_CLASS_CONTENT
         && interactive->heavy_status_shown
         && !interactive->heavy_low_memory_shown
-        && state.memory_free < PSP_HEAVY_LOW_MEMORY_BYTES) {
+        && script_heavy_state_low_on_memory(&state)) {
         interactive->heavy_low_memory_shown = true;
         psp_ui_show_heavy_scripts_status(
             ui, "PAGE SCRIPTS ARE RUNNING LOW ON MEMORY",

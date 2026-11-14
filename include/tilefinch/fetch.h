@@ -757,13 +757,6 @@ uint64_t fetch_background_transport_enqueue(
 uint64_t fetch_background_transport_enqueue_stream(
     const char *url, const FetchRequest *request,
     size_t maximum_bytes, long timeout_ms);
-/* Diagnosed form for latency-sensitive callers. A zero request id is not
-   necessarily terminal: admission can close briefly during network rejoin,
-   and page work can occupy all bounded descriptors. */
-uint64_t fetch_background_transport_enqueue_stream_diagnosed(
-    const char *url, const FetchRequest *request,
-    size_t maximum_bytes, long timeout_ms,
-    FetchBackgroundEnqueueStatus *status);
 /* Foreground-media forms may use the descriptors reserved while a player
    route is active. Ordinary page/update work cannot consume those last two
    descriptors, so a busy incumbent page cannot prevent its selected video
@@ -848,9 +841,6 @@ bool fetch_background_transport_take_media_result_consumed(
 bool fetch_background_transport_take_media(
     uint64_t request_id, unsigned char *destination,
     size_t capacity, FetchBackgroundMediaResponse *result);
-bool fetch_background_transport_take(
-    uint64_t request_id, unsigned char *destination,
-    size_t capacity, FetchBackgroundResult *result);
 bool fetch_background_transport_cancel(
     uint64_t request_id, const char *reason);
 /* Browser-thread snapshot of operations that still own worker/curl state.
@@ -1471,6 +1461,11 @@ bool fetch_trace_replay_active(void);
 /* An HTTP trace is recording or replaying. The background transport neither
    records nor replays, so work that needs it stays off the network then. */
 bool fetch_trace_active(void);
+/* Memory-study diagnostics (TILEFINCH_MEMORY_DIAGNOSTICS builds): the
+   shared curl allocation pool's metrics (limit = its Budget reservation,
+   peak = in-use high-water). True while curl is live; afterwards the last
+   metrics taken at cleanup and false. */
+bool fetch_curl_pool_metrics(BudgetConcurrentPoolMetrics *metrics);
 /* Validation builds on PSP: new TLS connections configured, and leaf
    certificates verified. A resumed handshake verifies no certificate, so
    the difference counts resumptions. Zeros elsewhere. */

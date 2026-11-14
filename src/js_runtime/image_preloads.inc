@@ -203,7 +203,8 @@ static bool image_preload_slot_dead(ScriptRuntime *runtime, size_t at)
     JSValue owner = JS_UNDEFINED;
     if (js_rt_bridge_node_slot_for_handle(bridge, slot->handle, &native_slot)
         && bridge->wrapper_refs != NULL)
-        owner = JS_WeakTargetDeref(runtime->context, bridge->wrapper_refs[native_slot]);
+        owner = JS_WeakTargetDeref(runtime->context,
+            js_rt_bridge_wrapper_ref(bridge, native_slot));
     bool live = JS_IsObject(owner);
     JS_FreeValue(runtime->context, owner);
     return !live;
@@ -299,7 +300,8 @@ static JSValue image_preload_owner(ScriptRuntime *runtime, long handle)
     if (!js_rt_bridge_node_slot_for_handle(bridge, handle, &native_slot)
         || bridge->wrapper_refs == NULL) return JS_UNDEFINED;
     JSValue owner = JS_WeakTargetDeref(runtime->context,
-                                    bridge->wrapper_refs[native_slot]);
+                                    js_rt_bridge_wrapper_ref(
+                                        bridge, native_slot));
     if (JS_IsObject(owner)) return owner;
     JS_FreeValue(runtime->context, owner);
     return JS_UNDEFINED;
@@ -339,6 +341,7 @@ static void image_queue_page_failures(ScriptRuntime *runtime,
         long handle = (long) js_rt_bridge_find_node_handle(bridge, node);
         if (handle == 0) handle = script_runtime_node_weak_handle(runtime, node);
         if (handle == 0 || image_preloads_open(runtime) == NULL) continue;
+        js_rt_bridge_keep_node_handle(bridge, handle);
         ScriptImagePreloads *loads = runtime->image_preloads;
         bool queued = false;
         for (size_t at = 0; at < loads->error_count && !queued; at++)

@@ -59,10 +59,12 @@ static int directive_id(const char *name, size_t length)
 }
 
 static bool parse_one_policy(TilefinchContentSecurityPolicy *csp,
-                             const char *value, size_t length)
+                             const char *value, size_t length, bool meta)
 {
-    if (csp->policy_count >= TILEFINCH_CSP_POLICY_LIMIT
-        || length + 1u > sizeof(csp->storage) - csp->storage_used) {
+    if (csp->policy_count >= (meta ? TILEFINCH_CSP_POLICY_LIMIT
+                                   : TILEFINCH_CSP_HEADER_POLICY_LIMIT)
+        || length + 1u > sizeof(csp->storage) - csp->storage_used
+        || csp->storage_used + length > UINT16_MAX) {
         return false;
     }
     size_t base = csp->storage_used;
@@ -70,6 +72,9 @@ static bool parse_one_policy(TilefinchContentSecurityPolicy *csp,
     csp->storage[base + length] = '\0';
     csp->storage_used += length + 1u;
     TilefinchCspPolicy *policy = &csp->policies[csp->policy_count++];
+    policy->text_offset = (uint16_t) base;
+    policy->text_length = (uint16_t) length;
+    policy->meta = meta;
     size_t at = 0;
     while (at < length) {
         while (at < length && (value[at] == ';'
@@ -86,6 +91,8 @@ static bool parse_one_policy(TilefinchContentSecurityPolicy *csp,
             sources_end--;
         }
         int id = directive_id(value + name_start, name_end - name_start);
+        /* HTML: frame-ancestors is removed from a meta-delivered policy. */
+        if (meta && id == TILEFINCH_CSP_FRAME_ANCESTORS) id = -1;
         if (id >= 0 && !policy->directives[id].present) {
             if (at > UINT16_MAX || sources_end - at > UINT16_MAX
                 || base + at > UINT16_MAX) return false;
@@ -141,7 +148,7 @@ bool tilefinch_csp_parse_response_headers(
                 while (part_end > part
                        && isspace((unsigned char) part_end[-1])) part_end--;
                 if (!parse_one_policy(csp, part,
-                                      (size_t) (part_end - part))) {
+                                      (size_t) (part_end - part), false)) {
                     csp->valid = false;
                     return false;
                 }
@@ -152,6 +159,73 @@ bool tilefinch_csp_parse_response_headers(
         offset += line_length + (newline == NULL ? 0u : 1u);
     }
     return true;
+}
+
+static bool csp_active(const TilefinchContentSecurityPolicy *csp)
+{
+    return csp != NULL && (csp->header_present || csp->policy_count != 0);
+}
+
+bool tilefinch_csp_enforced(const TilefinchContentSecurityPolicy *csp)
+{
+    return csp_active(csp);
+}
+
+void tilefinch_csp_bind_document_origin(
+    TilefinchContentSecurityPolicy *csp, const char *document_url)
+{
+    if (csp == NULL || document_url == NULL || csp->document_origin[0] != '\0')
+        return;
+    if (!tilefinch_url_origin(document_url, csp->document_origin,
+                              sizeof(csp->document_origin)))
+        csp->document_origin[0] = '\0';
+}
+
+static bool csp_meta_policy_known(const TilefinchContentSecurityPolicy *csp,
+                                  const char *text, size_t length)
+{
+    for (size_t i = 0; i < csp->policy_count; i++) {
+        const TilefinchCspPolicy *policy = &csp->policies[i];
+        if (policy->meta && policy->text_length == length
+            && (size_t) policy->text_offset + length <= csp->storage_used
+            && memcmp(csp->storage + policy->text_offset, text, length) == 0)
+            return true;
+    }
+    return false;
+}
+
+bool tilefinch_csp_add_meta_policy(
+    TilefinchContentSecurityPolicy *csp, const char *content,
+    size_t content_length)
+{
+    if (csp == NULL || content == NULL || content_length == 0) return false;
+    /* A document whose policy was never parsed from a response (zeroed
+       storage) starts from the empty, valid policy list. */
+    if (!csp_active(csp) && csp->storage_used == 0) csp->valid = true;
+    /* Fail-closed already refuses everything; nothing can restrict more. */
+    if (!csp->valid) return false;
+    bool changed = false;
+    const char *limit = content + content_length;
+    const char *part = content;
+    for (const char *cursor = content;; cursor++) {
+        if (cursor != limit && *cursor != ',') continue;
+        const char *part_end = cursor;
+        while (part < part_end && isspace((unsigned char) *part)) part++;
+        while (part_end > part && isspace((unsigned char) part_end[-1]))
+            part_end--;
+        size_t length = (size_t) (part_end - part);
+        /* An empty policy has no directives and restricts nothing. */
+        if (length != 0 && !csp_meta_policy_known(csp, part, length)) {
+            changed = true;
+            if (!parse_one_policy(csp, part, length, true)) {
+                csp->valid = false;
+                break;
+            }
+        }
+        if (cursor == limit) break;
+        part = cursor + 1;
+    }
+    return changed;
 }
 
 static const TilefinchCspDirectiveValue *directive_for(
@@ -459,7 +533,7 @@ static bool csp_allows_url(const TilefinchContentSecurityPolicy *csp,
                            TilefinchCspDirective directive,
                            bool fallback_default, const char *url)
 {
-    if (csp == NULL || !csp->header_present) return true;
+    if (!csp_active(csp)) return true;
     if (!csp->valid || url == NULL) return false;
     for (size_t i = 0; i < csp->policy_count; i++) {
         if (!policy_allows_url(csp, &csp->policies[i], directive,
@@ -531,7 +605,7 @@ static bool csp_allows_request_granted(
     }
     TilefinchCspDirective directive;
     if (!csp_request_directive(destination, &directive)) return false;
-    if (csp == NULL || !csp->header_present) return true;
+    if (!csp_active(csp)) return true;
     if (!csp->valid || target_url == NULL) return false;
     for (size_t i = 0; i < csp->policy_count; i++) {
         if (!policy_allows_request(
@@ -553,7 +627,7 @@ bool tilefinch_csp_allows_websocket(
     const TilefinchContentSecurityPolicy *csp, const char *request_url,
     uint8_t grant)
 {
-    if (csp == NULL || !csp->header_present) return true;
+    if (!csp_active(csp)) return true;
     bool allowed = csp->valid && request_url != NULL;
     for (size_t i = 0; allowed && i < csp->policy_count; i++) {
         const TilefinchCspDirectiveValue *value = directive_for(
@@ -567,7 +641,7 @@ bool tilefinch_csp_allows_websocket(
 bool tilefinch_csp_allows_worker(
     const TilefinchContentSecurityPolicy *csp, const char *target_url)
 {
-    if (csp == NULL || !csp->header_present) return true;
+    if (!csp_active(csp)) return true;
     if (!csp->valid || target_url == NULL) return false;
     for (size_t i = 0; i < csp->policy_count; i++) {
         const TilefinchCspPolicy *policy = &csp->policies[i];
@@ -671,7 +745,7 @@ void tilefinch_csp_visit_nonce_sources(
     void (*visit)(void *opaque, const char *value, size_t length),
     void *opaque)
 {
-    if (csp == NULL || !csp->header_present || !csp->valid || visit == NULL)
+    if (!csp_active(csp) || !csp->valid || visit == NULL)
         return;
     NonceVisit state = {.visit = visit, .opaque = opaque};
     for (size_t i = 0; i < csp->policy_count; i++) {
@@ -695,7 +769,7 @@ uint8_t tilefinch_csp_request_grant(
     uint8_t grant = script && parser_inserted
         ? TILEFINCH_CSP_GRANT_PARSER_INSERTED : 0u;
     TilefinchCspDirective directive;
-    if (csp == NULL || !csp->header_present || !csp->valid
+    if (!csp_active(csp) || !csp->valid
         || (!script && destination != TILEFINCH_DESTINATION_STYLE)
         || !csp_request_directive(destination, &directive)) return grant;
     CspSpan span = {.value = nonce, .length = nonce == NULL ? 0 : nonce_length};
@@ -759,7 +833,7 @@ uint8_t tilefinch_csp_element_descendant_grant(
 {
     size_t nonce_length = 0;
     const char *nonce = element == NULL || csp == NULL
-        || !csp->header_present
+        || !csp_active(csp)
         ? NULL : csp_element_nonce(element, &nonce_length);
     return tilefinch_csp_request_grant(
         csp, TILEFINCH_DESTINATION_SCRIPT, nonce, nonce_length, NULL, 0,
@@ -773,7 +847,7 @@ uint8_t tilefinch_csp_element_grant(
 {
     size_t nonce_length = 0, integrity_length = 0;
     const char *nonce = NULL, *integrity = NULL;
-    if (element != NULL && csp != NULL && csp->header_present) {
+    if (element != NULL && csp_active(csp)) {
         nonce = csp_element_nonce(element, &nonce_length);
         if (destination == TILEFINCH_DESTINATION_SCRIPT) {
             integrity = document_attribute(
@@ -805,7 +879,7 @@ bool tilefinch_csp_allows_dynamic_code(
 static bool csp_allows_dynamic_code(
     const TilefinchContentSecurityPolicy *csp)
 {
-    if (csp == NULL || !csp->header_present) return true;
+    if (!csp_active(csp)) return true;
     if (!csp->valid) return false;
     for (size_t i = 0; i < csp->policy_count; i++) {
         const TilefinchCspDirectiveValue *value = directive_for(
@@ -970,7 +1044,7 @@ static bool csp_allows_inline(const TilefinchContentSecurityPolicy *csp,
                               TilefinchCspDirective directive,
                               struct lxb_dom_node *element)
 {
-    if (csp == NULL || !csp->header_present) return true;
+    if (!csp_active(csp)) return true;
     if (!csp->valid || element == NULL) return false;
     for (size_t i = 0; i < csp->policy_count; i++) {
         if (!policy_allows_inline(csp, &csp->policies[i], directive,
@@ -999,7 +1073,7 @@ static bool csp_allows_inline_attribute(
     const TilefinchContentSecurityPolicy *csp,
     TilefinchCspDirective directive)
 {
-    if (csp == NULL || !csp->header_present) return true;
+    if (!csp_active(csp)) return true;
     if (!csp->valid) return false;
     for (size_t i = 0; i < csp->policy_count; i++) {
         const TilefinchCspDirectiveValue *value = directive_for(
@@ -1044,7 +1118,7 @@ bool tilefinch_csp_allows_form_action(
 bool tilefinch_csp_has_frame_ancestors(
     const TilefinchContentSecurityPolicy *csp)
 {
-    if (csp == NULL || !csp->header_present || !csp->valid) return false;
+    if (!csp_active(csp) || !csp->valid) return false;
     for (size_t i = 0; i < csp->policy_count; i++) {
         if (csp->policies[i]
                 .directives[TILEFINCH_CSP_FRAME_ANCESTORS].present) {

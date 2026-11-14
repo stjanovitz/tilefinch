@@ -477,14 +477,7 @@ void layout_reuse_cache_end_font_publication(LayoutReuseCache *cache)
     if (cache != NULL) cache->font_publication_active = false;
 }
 
-static bool layout_node_is_within(lxb_dom_node_t *node,
-                                  lxb_dom_node_t *ancestor)
-{
-    for (lxb_dom_node_t *at = node; at != NULL; at = at->parent) {
-        if (at == ancestor) return true;
-    }
-    return false;
-}
+#define layout_node_is_within document_node_within
 
 static bool layout_reuse_measurement_touches_node(
     lxb_dom_node_t *measurement, lxb_dom_node_t *changed)

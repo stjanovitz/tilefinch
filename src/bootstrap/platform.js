@@ -1,6 +1,12 @@
 (() => {
+  /* Dispatch passes Event's phase numbers (1 capturing, 2 at target,
+     3 bubbling) as literals instead of reading them from the global Event,
+     which a page can replace. */
   const trustedEvent =
-    __tilefinchRealmGlobal.__tilefinchTrustedEventShare.trustedEvent;
+      __tilefinchRealmGlobal.__tilefinchTrustedEventShare.trustedEvent,
+    newEvent =
+      __tilefinchRealmGlobal.__tilefinchTrustedEventShare.createBrowserEvent,
+    isEvent = __tilefinchRealmGlobal.__tilefinchTrustedEventShare.isEvent;
   const wrap = __tilefinchRealmGlobal.__tilefinchWrap;
   const retentionStats = __tilefinchRealmGlobal.__tilefinchRetentionStats;
   const documentListeners = __tilefinchRealmGlobal.__tilefinchDocumentListeners;
@@ -253,7 +259,7 @@
       selectorList = (values) => {
         /* Same bound as dom.js nodeList: refuse, never truncate. */
         const length = Number(values?.length) >>> 0;
-        if (length > 16384) throw new RangeError("NodeList limit exceeded");
+        if (length > 65536) throw new RangeError("NodeList limit exceeded");
         const result = Object.create(NodeList.prototype);
         for (let index = 0; index < length; index++)
           Object.defineProperty(result, index, {
@@ -2111,8 +2117,11 @@
     },
     controlStateSet = (table, control, value) => {
       const handle = control?.__handle;
-      if (handle !== undefined) table.handles.set(handle, value);
-      else table.objects.set(control, value);
+      if (handle !== undefined) {
+        /* The control's slot outlives its wrapper while this names it. */
+        __tilefinchKeepNodeHandle(handle);
+        table.handles.set(handle, value);
+      } else table.objects.set(control, value);
       return value;
     },
     controlStateDelete = (table, control) => {
@@ -2621,7 +2630,8 @@
   let fullscreenElement = null;
   const dispatchFullscreenChange = (element) => {
       const target = element?.isConnected ? element : document;
-      target.dispatchEvent(new Event("fullscreenchange", { bubbles: true }));
+      target.dispatchEvent(
+        newEvent("fullscreenchange", { bubbles: true }));
     },
     leaveFullscreen = (fromHost = false) => {
       const previous = fullscreenElement;
@@ -2659,7 +2669,8 @@
           "Fullscreen requires a connected element and user activation",
           "NotAllowedError",
         );
-        this.dispatchEvent(new Event("fullscreenerror", { bubbles: true }));
+        this.dispatchEvent(
+          newEvent("fullscreenerror", { bubbles: true }));
         reject(error);
         return;
       }
@@ -3047,7 +3058,7 @@
     prototype.checkValidity = function checkValidity() {
       if (!this.willValidate || this.validity.valid) return true;
       this.dispatchEvent(
-        trustedEvent(new Event("invalid", { cancelable: true })),
+        trustedEvent(newEvent("invalid", { cancelable: true })),
       );
       return false;
     };
@@ -3361,7 +3372,7 @@
     HTMLFormElement.prototype.checkValidity;
   const resetForm = (form, deferCustomCallbacks = false) => {
     const event = trustedEvent(
-      new Event("reset", { bubbles: true, cancelable: true }),
+      newEvent("reset", { bubbles: true, cancelable: true }),
     );
     if (!form.dispatchEvent(event)) return false;
     const resetCallbacks = [];
@@ -3507,7 +3518,7 @@
           );
         constructingFormData.add(form);
         try {
-          const event = new Event("formdata", { bubbles: true });
+          const event = newEvent("formdata", { bubbles: true });
           Object.defineProperty(event, "formData", {
             configurable: true,
             enumerable: true,
@@ -3707,6 +3718,8 @@
     enumerable: false,
     writable: false,
     value: Object.freeze({
+      createPrivateSlot,
+      keys: trustedObjectKeys,
       apply: trustedFunctionApply,
       charCodeAt: trustedCharCodeAt,
       indexOf: trustedStringIndexOf,
@@ -4615,21 +4628,21 @@
                 path[at],
                 event,
                 true,
-                Event.CAPTURING_PHASE,
+                1,
               );
             if (!event.__stopped) {
               __tilefinchRealmGlobal.__tilefinchInvokeEventTarget(
                 this,
                 event,
                 true,
-                Event.AT_TARGET,
+                2,
               );
               if (!event.__stopped)
                 __tilefinchRealmGlobal.__tilefinchInvokeEventTarget(
                   this,
                   event,
                   false,
-                  Event.AT_TARGET,
+                  2,
                 );
             }
             if (event.bubbles && !event.__stopped)
@@ -4638,7 +4651,7 @@
                   path[at],
                   event,
                   false,
-                  Event.BUBBLING_PHASE,
+                  3,
                 );
             __tilefinchRealmGlobal.__tilefinchFinishEventDispatch(event);
             return !event.defaultPrevented;
@@ -5661,6 +5674,7 @@
     set(value) {
       activeElementValue = value || document.body;
       activeElementHandle = Number(activeElementValue?.__handle) || 0;
+      __tilefinchKeepNodeHandle(activeElementHandle);
     },
   });
   __tilefinchRealmGlobal.__tilefinchSetFocusHandle = (handle) => {
@@ -5673,6 +5687,7 @@
       );
     activeElementHandle = handle;
     activeElementValue = null;
+    __tilefinchKeepNodeHandle(handle);
     __tilefinchSetAttribute(handle, "data-tilefinch-focus", "");
     return true;
   };
@@ -6186,7 +6201,7 @@
     },
   };
   const selectionChanged = () =>
-    document.dispatchEvent(new Event("selectionchange"));
+    document.dispatchEvent(newEvent("selectionchange"));
   __tilefinchRealmGlobal.__tilefinchSelectionChanged = selectionChanged;
   const createRange = () => new Range();
   document.createRange = createRange;
@@ -6415,7 +6430,7 @@
           state.seeking = true;
           state.currentTime = value;
           state.ended = false;
-          this.dispatchEvent(new Event("seeking"));
+          this.dispatchEvent(newEvent("seeking"));
           if (
             !__tilefinchRequestMedia(
               this.__handle,
@@ -6425,7 +6440,7 @@
             )
           ) {
             state.seeking = false;
-            this.dispatchEvent(new Event("seeked"));
+            this.dispatchEvent(newEvent("seeked"));
           }
         },
       },
@@ -6450,7 +6465,7 @@
               "IndexSizeError",
             );
           stateFor(this).volume = value;
-          this.dispatchEvent(new Event("volumechange"));
+          this.dispatchEvent(newEvent("volumechange"));
         },
       },
       muted: {
@@ -6461,7 +6476,7 @@
         },
         set(value) {
           stateFor(this).muted = !!value;
-          this.dispatchEvent(new Event("volumechange"));
+          this.dispatchEvent(newEvent("volumechange"));
         },
       },
       defaultMuted: {
@@ -6490,7 +6505,7 @@
               "NotSupportedError",
             );
           stateFor(this).playbackRate = value;
-          this.dispatchEvent(new Event("ratechange"));
+          this.dispatchEvent(newEvent("ratechange"));
         },
       },
       defaultPlaybackRate: {
@@ -6573,7 +6588,7 @@
       state.ended = false;
       state.seeking = false;
       state.currentTime = 0;
-      this.dispatchEvent(new Event("emptied"));
+      this.dispatchEvent(newEvent("emptied"));
       const source = this.currentSrc;
       if (source && __tilefinchRequestMedia(this.__handle, 0, source, 0)) {
         state.networkState = HTMLMediaElement.NETWORK_LOADING;
@@ -6599,8 +6614,8 @@
         state.paused = false;
         state.ended = false;
         state.networkState = HTMLMediaElement.NETWORK_LOADING;
-        this.dispatchEvent(new Event("play"));
-        this.dispatchEvent(new Event("waiting"));
+        this.dispatchEvent(newEvent("play"));
+        this.dispatchEvent(newEvent("waiting"));
       }
       return Promise.resolve();
     };
@@ -6609,7 +6624,7 @@
       __tilefinchRequestMedia(this.__handle, 2, this.currentSrc, 0);
       if (!state.paused) {
         state.paused = true;
-        this.dispatchEvent(new Event("pause"));
+        this.dispatchEvent(newEvent("pause"));
       }
     };
     HTMLMediaElement.prototype.fastSeek = function fastSeek(time) {
@@ -6959,7 +6974,7 @@
     }
   };
   __tilefinchRealmGlobal.__tilefinchPrepareEvent = (event, target, path) => {
-    if (!(event instanceof Event)) throw new TypeError("Event required");
+    if (!isEvent(event)) throw new TypeError("Event required");
     if (!event.__initialized || !String(event.type))
       throw new DOMException("Event is not initialized", "InvalidStateError");
     if (event.__dispatching)
@@ -6974,7 +6989,7 @@
   };
   __tilefinchRealmGlobal.__tilefinchFinishEventDispatch = (event) => {
     event.currentTarget = null;
-    event.eventPhase = Event.NONE;
+    event.eventPhase = 0;
     event.__dispatching = false;
     /* Propagation flags belong to one dispatch. Keep defaultPrevented, which
        remains observable when the same Event is dispatched again. */
@@ -7186,7 +7201,7 @@
         else __tilefinchRealmGlobal.__tilefinchInvokeEventTargetCheckpointed(
           target,
           value,
-          Event.AT_TARGET,
+          2,
           errorObserver,
           null,
           finish,
@@ -7251,21 +7266,21 @@
           path[at],
           event,
           true,
-          Event.CAPTURING_PHASE,
+          1,
         );
       if (!event.__stopped) {
         __tilefinchRealmGlobal.__tilefinchInvokeEventTarget(
           this,
           event,
           true,
-          Event.AT_TARGET,
+          2,
         );
         if (!event.__stopped)
           __tilefinchRealmGlobal.__tilefinchInvokeEventTarget(
             this,
             event,
             false,
-            Event.AT_TARGET,
+            2,
           );
       }
       if (event.bubbles && !event.__stopped)
@@ -7274,7 +7289,7 @@
             path[at],
             event,
             false,
-            Event.BUBBLING_PHASE,
+            3,
           );
       __tilefinchRealmGlobal.__tilefinchFinishEventDispatch(event);
       return !event.defaultPrevented;
@@ -7971,19 +7986,20 @@
   __tilefinchRealmGlobal.__tilefinchCommitSameDocument = (url, oldURL) => {
     setSynchronizedLocation(url);
     historyLength++;
-    __tilefinchRealmGlobal.dispatchEvent(new HashChangeEvent("hashchange", {
+    __tilefinchRealmGlobal.dispatchEvent(newEvent("hashchange", {
       oldURL: String(oldURL),
       newURL: location.href,
-    }));
+    }, "HashChangeEvent"));
   };
   __tilefinchRealmGlobal.__tilefinchRestoreSameDocument = (url, oldURL) => {
     setSynchronizedLocation(url);
     __tilefinchRealmGlobal.dispatchEvent(
-      new PopStateEvent("popstate", { state: historyState }));
-    __tilefinchRealmGlobal.dispatchEvent(new HashChangeEvent("hashchange", {
+      newEvent("popstate", { state: historyState },
+        "PopStateEvent"));
+    __tilefinchRealmGlobal.dispatchEvent(newEvent("hashchange", {
       oldURL: String(oldURL),
       newURL: location.href,
-    }));
+    }, "HashChangeEvent"));
   };
   const windowMessageHandlers = new Map(),
     setWindowMessageHandler = (type, value) => {
@@ -8057,7 +8073,7 @@
         const handler = __tilefinchRealmGlobal["on" + value.type];
         if (typeof handler !== "function") return;
         value.currentTarget = __tilefinchRealmGlobal;
-        value.eventPhase = Event.AT_TARGET;
+        value.eventPhase = 2;
         try {
           __tilefinchRealmGlobal.__tilefinchRecordEventHandler();
           __tilefinchRealmGlobal.__tilefinchRunTask(
@@ -8074,7 +8090,7 @@
     else __tilefinchRealmGlobal.__tilefinchInvokeEventTargetCheckpointed(
       __tilefinchRealmGlobal,
       value,
-      Event.AT_TARGET,
+      2,
       null,
       invokeHandler,
       finish,
@@ -8775,9 +8791,16 @@
            publication begins only after the complete bootstrap, so resolve
            it at construction time rather than making platform.js depend on
            source ordering. */
-        if (typeof __tilefinchRealmGlobal.Event === "function") {
-          const event = new __tilefinchRealmGlobal.Event(type, init);
-          Object.setPrototypeOf(GamepadEvent.prototype, Event.prototype);
+        /* A page's init is a WebIDL dictionary: read its Event fields as
+           Event's constructor did, inherited ones included. */
+        const event = newEvent(type, {
+          bubbles: init.bubbles,
+          cancelable: init.cancelable,
+          composed: init.composed,
+        });
+        if (event !== null) {
+          Object.setPrototypeOf(GamepadEvent.prototype,
+            Object.getPrototypeOf(event));
           Object.setPrototypeOf(event, GamepadEvent.prototype);
           event.gamepad = init.gamepad || null;
           return event;
@@ -8822,7 +8845,8 @@
       if (connected === nextConnected) return;
       connected = nextConnected;
       const type = connected ? "gamepadconnected" : "gamepaddisconnected";
-      queueMicrotask(() => dispatchWindowEvent(new GamepadEvent(type, { gamepad })));
+      queueMicrotask(() => dispatchWindowEvent(
+        new GamepadEvent(type, { __proto__: null, gamepad })));
     };
   }
   {
@@ -9223,11 +9247,15 @@
     class MediaQueryListEvent {
       constructor(type, init = {}) {
         init ??= {};
-        if (typeof __tilefinchRealmGlobal.Event === "function") {
-          const event = new __tilefinchRealmGlobal.Event(type, init);
+        const event = newEvent(type, {
+          bubbles: init.bubbles,
+          cancelable: init.cancelable,
+          composed: init.composed,
+        });
+        if (event !== null) {
           Object.setPrototypeOf(
             MediaQueryListEvent.prototype,
-            __tilefinchRealmGlobal.Event.prototype,
+            Object.getPrototypeOf(event),
           );
           Object.setPrototypeOf(event, MediaQueryListEvent.prototype);
           event.media = String(init.media ?? "");
@@ -9349,6 +9377,7 @@
         query._lastMatch = matches;
         query.dispatchEvent(
           new MediaQueryListEvent("change", {
+            __proto__: null,
             media: query.media,
             matches,
           }),
@@ -9360,7 +9389,9 @@
     const matchMedia = (query) => new MediaQueryList(query);
     __tilefinchRealmGlobal.matchMedia = matchMedia;
   }
-  const performanceEntryState = new WeakMap(),
+  /* Owner slots allow callback/detail cycles to collect; globally rooted
+     WeakMap values do not have ephemeron semantics in this collector. */
+  const performanceEntryState = createPrivateSlot(),
     requirePerformanceEntryState = (value) => {
       const state = performanceEntryState.get(value);
       if (!state) throw new TypeError("Illegal invocation");
@@ -9652,7 +9683,7 @@
   }
   const sortPerformanceEntries = entries => entries.slice().sort(
       (left, right) => left.startTime - right.startTime),
-    performanceObserverEntryListState = new WeakMap();
+    performanceObserverEntryListState = createPrivateSlot();
   class PerformanceObserverEntryList {
     constructor(entries) {
       performanceObserverEntryListState.set(this, entries.slice());
@@ -9691,7 +9722,7 @@
   __tilefinchRealmGlobal.VisibilityStateEntry = VisibilityStateEntry;
   if (__tilefinchRealmGlobal.__tilefinchDeterministicDateFacade !== Date)
     Date.now = () => __tilefinchDateNow(0);
-  const performanceObserverState = new WeakMap(),
+  const performanceObserverState = createPrivateSlot(),
     performanceObservers = new Set(),
     performanceObserverLimit = 16,
     performanceObserverRecordLimit = 64,
@@ -10265,7 +10296,7 @@
       navigationTiming = navigationState.navigation,
       domInteractive = __tilefinchPerformanceNow(3);
     documentReadyState = "interactive";
-    document.dispatchEvent(new Event("readystatechange"));
+    document.dispatchEvent(newEvent("readystatechange"));
     navigationTiming.domInteractive = domInteractive;
     performanceTimingState.domInteractive =
       performanceTimeOrigin + domInteractive;
@@ -10273,11 +10304,12 @@
       __tilefinchPerformanceNow(3);
     performanceTimingState.domContentLoadedEventStart =
       performanceTimeOrigin + navigationTiming.domContentLoadedEventStart;
-    document.dispatchEvent(new Event("DOMContentLoaded", { bubbles: true }));
+    document.dispatchEvent(
+      newEvent("DOMContentLoaded", { bubbles: true }));
     __tilefinchRealmGlobal.__tilefinchMaybeStartMotion?.(true);
     const domContentLoadedEventEnd = __tilefinchPerformanceNow(3);
     documentReadyState = "complete";
-    document.dispatchEvent(new Event("readystatechange"));
+    document.dispatchEvent(newEvent("readystatechange"));
     const domComplete = __tilefinchPerformanceNow(3),
       loadEventStart = __tilefinchPerformanceNow(3);
     navigationTiming.domContentLoadedEventEnd = domContentLoadedEventEnd;
@@ -10288,7 +10320,7 @@
     performanceTimingState.domComplete = performanceTimeOrigin + domComplete;
     performanceTimingState.loadEventStart =
       performanceTimeOrigin + loadEventStart;
-    const loadEvent = new Event("load");
+    const loadEvent = newEvent("load");
     /*
      * HTMLBodyElement's onload handler reflects the Window load handler
      * surface.  Programmatic `document.body.onload = ...` assignments are

@@ -219,6 +219,14 @@ bool navigation_page_memory_rescued(const NavigationSession *session)
     return session != NULL && session->page.script_memory_rescued;
 }
 
+size_t navigation_page_late_compile_memory_refusals(const NavigationPage *page)
+{
+    if (page == NULL || !page->loaded) return 0u;
+    size_t total = page->script_result.host_compile_memory_refusals;
+    size_t at_commit = page->script_compile_memory_refusals_at_commit;
+    return total > at_commit ? total - at_commit : 0u;
+}
+
 bool navigation_advance_runtime(NavigationSession *session,
                                 unsigned elapsed_ms,
                                 size_t callback_budget)

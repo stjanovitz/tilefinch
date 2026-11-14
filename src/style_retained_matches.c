@@ -123,14 +123,7 @@ StyleRetainedMatches *style_retained_matches_attach(
     return previous;
 }
 
-static bool style_retained_node_within(const lxb_dom_node_t *node,
-                                       const lxb_dom_node_t *ancestor)
-{
-    for (const lxb_dom_node_t *at = node; at != NULL; at = at->parent) {
-        if (at == ancestor) return true;
-    }
-    return false;
-}
+#define style_retained_node_within document_node_within
 
 static size_t style_retained_home(const lxb_dom_node_t *node,
                                   PseudoElement pseudo);

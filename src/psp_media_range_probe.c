@@ -1,4 +1,5 @@
 #include "tilefinch/psp_media_range_probe.h"
+#include "tilefinch/platform.h"
 
 #ifdef __PSP__
 
@@ -55,15 +56,7 @@ typedef struct {
     PspMediaRangeSourceReport *report;
 } PspMediaRangeProbeSource;
 
-static void range_probe_error(
-    char *error, size_t error_size, const char *format, ...)
-{
-    if (error == NULL || error_size == 0) return;
-    va_list arguments;
-    va_start(arguments, format);
-    vsnprintf(error, error_size, format, arguments);
-    va_end(arguments);
-}
+#define range_probe_error tilefinch_format_error
 
 static void range_probe_collect(PspMediaRangeProbeSource *source)
 {

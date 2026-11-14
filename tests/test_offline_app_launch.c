@@ -874,7 +874,7 @@ static bool store_progress_line(const char *directory)
     CHECK(store.library.progress != NULL);
     store.library.progress(store.library.progress_context, 2u, 4u);
     CHECK(strcmp(shown_progress,
-                 "PREPARING 2 OF 4 SCRIPTS - CIRCLE STOPS") == 0
+                 "PREPARING 2 OF 4 SCRIPTS  O STOP") == 0
           && strcmp(psp_offline_store_status(&store), shown_progress) == 0);
     psp_offline_store_destroy(&store);
     browser_session_destroy(&session);

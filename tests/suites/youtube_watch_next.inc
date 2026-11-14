@@ -223,7 +223,7 @@ static const char watch_commit_avatar[] =
     "\x47\x0c\xc4\x71\x00\xfb\x13\x13\x21\x2c\x5d\xcd\x23\x00\x00\x00"
     "\x00\x49\x45\x4e\x44\xae\x42\x60\x82";
 
-/* perf-1110 R2: the channel avatar was the watch page's only eager visible
+/* The channel avatar was the watch page's only eager visible
    image, so the commit fetched it (on a live network, from a host the
    session has no connection to) between its layout passes. It waits in
    the idle image queue now, like the thumbnails and the poster, and loads
@@ -246,7 +246,7 @@ static int test_youtube_watch_commit_defers_avatar(void)
     /* navigation_begin zeroed the tallies: this is the commit's count. */
     TilefinchWorkCount commit_passes = tilefinch_work_tally.layout_passes;
     NavigationSession *navigation = browser_engine_navigation(engine);
-    /* perf-1110 R3: the action row's inline SVG icons are published before
+    /* The action row's inline SVG icons are published before
        the image-planning layout, so that layout is the page's final one:
        the commit lays the watch page out once, not twice. */
     size_t svg_published = 0;

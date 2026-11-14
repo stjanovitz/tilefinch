@@ -370,9 +370,7 @@ static bool wasm_task_checkpoint(JSContext *context)
         && !bridge->host->watchdog.interrupted
         && js_rt_runtime_native_checkpoint(bridge->host)) return true;
     JS_ThrowInternalError(context, "WebAssembly task deadline exceeded");
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
     JS_SetUncatchableException(context, true);
-#endif
     return false;
 }
 
@@ -824,18 +822,10 @@ bool js_wasm_runtime_init(JSRuntime *runtime)
 {
     if (runtime == NULL) return false;
     if (wasm_instance_class_id == 0) {
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
         JS_NewClassID(&wasm_instance_class_id);
-#else
-        JS_NewClassID(runtime, &wasm_instance_class_id);
-#endif
     }
     if (wasm_module_class_id == 0) {
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
         JS_NewClassID(&wasm_module_class_id);
-#else
-        JS_NewClassID(runtime, &wasm_module_class_id);
-#endif
     }
     return wasm_instance_class_id != 0 && wasm_module_class_id != 0
         && JS_NewClass(runtime, wasm_instance_class_id,

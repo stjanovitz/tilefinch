@@ -642,6 +642,10 @@ void psp_input_script_observe_page(
         mark, (int) browser_engine_youtube_feed_state(engine),
         (int) browser_engine_youtube_account_state(engine),
         (int) browser_engine_youtube_like_state(engine));
+    /* boot.cfg validation_js_heap_detail=1: the compact QuickJS heap census
+       of every live realm, tagged with this mark. */
+    if (psp_boot_config_validation_js_heap_detail())
+        browser_engine_memory_census(engine, mark);
     /* Explicit diagnostic marks only. Expose bounded hit-test geometry, not
        field values, link destinations or page text, so input journeys can
        target the actual control rather than guessing from screenshots. */
@@ -805,6 +809,16 @@ void psp_input_script_observe_page(
                growth.source_committed, growth.source_limit,
                growth.source_raises, growth.lazy_compile_failures,
                growth.reentrant_checkpoints);
+        ScriptDomHandleCounters handles;
+        script_runtime_dom_handle_counters(page->runtime, &handles);
+        printf("tilefinch-input-dom-handles: mark=%s live=%zu peak=%zu "
+               "capacity=%zu growths=%zu growth-refusals=%zu "
+               "exhaustions=%zu connected-releases=%zu "
+               "connected-preserves=%zu\n",
+               mark, handles.live, handles.peak, handles.capacity,
+               handles.growths, handles.growth_refusals,
+               handles.exhaustions, handles.connected_releases,
+               handles.connected_preserves);
         printf("tilefinch-input-script-gc: mark=%s collections=%zu "
                "threshold=%zu max-advance=%zu max-checkpoint=%zu "
                "starved=%zu backoffs=%zu gc-us=%llu live=%zu\n",
@@ -853,7 +867,7 @@ void psp_input_script_observe_page(
            "disk-hits=%zu disk-load-us=%llu classic-hits=%zu "
            "classic-misses=%zu "
            "key-us=%llu parse-us=%llu store-us=%llu source-bytes=%llu "
-           "fetch-us=%llu\n",
+           "fetch-us=%llu disk-queued=%zu disk-queued-bytes=%zu\n",
            mark,
            page->script_result.module_compile_count,
            page->script_result.module_compile_us,
@@ -872,7 +886,9 @@ void psp_input_script_observe_page(
            page->script_result.module_parse_us,
            page->script_result.module_store_us,
            page->script_result.module_source_bytes,
-           page->script_result.module_fetch_us);
+           page->script_result.module_fetch_us,
+           page->script_result.module_bytecode_cache_disk_queued,
+           page->script_result.module_bytecode_cache_disk_queued_bytes);
     /* Compiled-script caches: the classic table (with its idle-time
        stores) and the persistent tier, so a device run shows compile,
        restore, store and Memory Stick (or host0) activity. Compile totals
@@ -898,7 +914,9 @@ void psp_input_script_observe_page(
                "disk-written-bytes=%llu disk-write-us=%llu "
                "disk-index-writes=%zu disk-rejects=%zu disk-removed=%zu "
                "disk-evictions=%zu disk-skipped=%zu disk-write-failures=%zu "
-               "disk-files=%zu disk-bytes=%llu\n",
+               "disk-files=%zu disk-bytes=%llu disk-queued=%zu "
+               "disk-queued-bytes=%llu disk-queue-drops=%zu "
+               "disk-direct-reads=%zu\n",
                mark, js->host_compile_attempts, js->host_compile_source_bytes,
                (unsigned long long) js->host_compile_total_us,
                js->external_script_bytecode_cache_hits,
@@ -929,7 +947,9 @@ void psp_input_script_observe_page(
                (unsigned long long) (disk.write_ns / 1000u),
                disk.index_writes, disk.rejects, disk.removed,
                disk.evictions, disk.skipped, disk.write_failures,
-               disk.files, (unsigned long long) disk.bytes);
+               disk.files, (unsigned long long) disk.bytes, disk.queued,
+               (unsigned long long) disk.queued_bytes, disk.queue_drops,
+               disk.direct_reads);
     }
     /* Deterministic work counts for the document (LAB_USAGE.md, "Work
        vector"): the same record the host lab prints. */

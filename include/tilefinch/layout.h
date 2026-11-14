@@ -1294,7 +1294,19 @@ typedef struct LayoutDocument {
     size_t preview_cut_link_count;
     size_t preview_cut_control_count;
     size_t preview_cut_box_count;
+    /* The draw commands recorded before the cut, likewise. */
+    size_t preview_cut_command_count;
     bool preview_inexact;
+    /* A cut inside a container that can move content it laid out before
+       the cut (an inexact cut, a flex row aligning its items to a cut
+       sibling, a table row, a transform): preview_moved_top is the highest
+       such container's top. Content above it is the complete layout's own
+       wherever it was recorded before the cut. */
+    bool preview_moved;
+    int preview_moved_top;
+    /* Build-only (layout_build_context_through): NULL outside such a
+       build and once the box it waits for is recorded. */
+    struct LayoutPreviewThrough *preview_through;
     ViewportContext viewport;
     uint32_t page_background;
     /* True when this layout encountered an external image, mask, or
@@ -1446,6 +1458,25 @@ bool layout_build_context_preview(LayoutDocument *layout, Budget *budget,
                                   const ImageResources *images,
                                   const ViewportContext *viewport,
                                   LayoutReuseCache *reuse, int y_limit,
+                                  bool *truncated);
+/* layout_build_context_preview without a limit until a box is recorded
+   for one of the `through_count` nodes (at most LAYOUT_THROUGH_TARGETS),
+   or for one of its nearest ancestors when it records none, then limited
+   to that box's y plus `depth` CSS pixels. A truncated result's boxes
+   recorded before the cut are the complete layout's own except below
+   preview_moved_top; the node lies among them unless it was laid out
+   after the cut (positioned) or the limit came from a box recorded before
+   its final placement. */
+#define LAYOUT_THROUGH_TARGETS 4u
+bool layout_build_context_through(LayoutDocument *layout, Budget *budget,
+                                  const PocDocument *document,
+                                  const Stylesheet *stylesheet,
+                                  const FontSet *fonts,
+                                  const ImageResources *images,
+                                  const ViewportContext *viewport,
+                                  LayoutReuseCache *reuse,
+                                  const lxb_dom_node_t *const *through,
+                                  size_t through_count, int depth,
                                   bool *truncated);
 
 /* A transactional, resumable authoritative layout build.  The job owns its

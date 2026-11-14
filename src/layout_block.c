@@ -1584,7 +1584,7 @@ static bool layout_block_flow_children(LayoutContext *context,
                                 || reverse_column || style->flex_wrap))
             || (flow->definite_height
                 && document_node_is_tag(node, LXB_TAG_BUTTON))))
-        layout_note_preview_cut(context, true);
+        layout_note_preview_inexact(context, flow->outer_y);
     if (!flow->replaced_content) {
         layout_flush_line(line);
         line_finish_vertical(line);
@@ -1851,6 +1851,33 @@ out:
    src/layout_block_decoration.c. */
 
 
+/* Whether a preview cut inside `node`, a box with this style, can move what
+   the box laid out before the cut: everything but boxes whose children
+   stack in block flow. A flex row aligns its items to the cut one, a table
+   row its cells; an inline-level box's line aligns to its cut height; a
+   transform or a positioned offset can depend on it, and so can a
+   positioned descendant placed from the box's bottom (bottom_fixups).
+   Multicolumn, column flex and grid containers note their own cuts
+   (layout_note_preview_inexact). Out of layout_block_impl's frame: only a
+   box the cut ran through asks. */
+__attribute__((noinline))
+static bool layout_block_cut_can_move(const LayoutContext *context,
+                                      const lxb_dom_node_t *node,
+                                      const ComputedStyle *style)
+{
+    for (size_t i = 0; i < context->bottom_fixup_count; i++)
+        if (context->bottom_fixups[i].containing_node == node) return true;
+    bool column_flex = style->display == DISPLAY_FLEX
+        && (style->flex_direction == FLEX_COLUMN
+            || style->flex_direction == FLEX_COLUMN_REVERSE);
+    bool stacks = style->display == DISPLAY_BLOCK
+        || style->display == DISPLAY_FLOW_ROOT
+        || style->display == DISPLAY_GRID || column_flex;
+    return !stacks || style->has_transform || style->out_of_flow
+        || style->fixed_position || style->sticky_position
+        || (style->relative_position && style->inset_percent_mask != 0);
+}
+
 static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
                               const ComputedStyle *parent, int x, int y,
                               int width, int containing_height,
@@ -1871,6 +1898,7 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
     size_t node_link_start = context->layout->link_count;
     size_t node_control_start = context->layout->control_count;
     size_t node_box_start = context->layout->node_box_count;
+    bool cut_before = context->preview_truncated;
     ComputedStyle *style = &scratch->style;
     layout_style_for_node_into(context, node, parent, style);
     bool flex_or_grid_item = parent != NULL
@@ -3096,6 +3124,9 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
     if (context->positioned_height_job_count != 0
         && !finish_positioned_heights(context, node, descendant_positioned_box,
             border_height - style->border.top - style->border.bottom)) return false;
+    if (!cut_before && context->preview_truncated
+        && layout_block_cut_can_move(context, node, style))
+        layout_note_preview_moved(context, outer_y);
     if (!add_node_box(context->layout, node, outer_x, outer_y, outer_width,
                       border_height, client_width, client_height,
                       scroll_width, content_height,

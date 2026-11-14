@@ -38,6 +38,12 @@ void psp_profile_store_init(
 void psp_profile_store_mark_dirty(
     PspProfileStore *store, uint64_t now_us);
 
+struct BrowserSession;
+/* Retire the saved storage preference only after data deletion succeeds. */
+bool psp_profile_store_forget_site_storage(
+    PspProfileStore *store, struct BrowserSession *session,
+    const char *origin, uint64_t now_us);
+
 /* Saves a dirty profile now, unless it would write what the file already
    holds. */
 bool psp_profile_store_flush(PspProfileStore *store);

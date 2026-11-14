@@ -200,6 +200,24 @@ const char *budget_category_name(BudgetCategory category)
     return category_names[valid_category(category)];
 }
 
+#if defined(TILEFINCH_MEMORY_DIAGNOSTICS)
+static const Budget *budget_peak_observer_budget;
+static BudgetPeakObserver budget_peak_observer;
+static void *budget_peak_observer_opaque;
+static size_t budget_peak_observer_step;
+static size_t budget_peak_observer_next;
+
+void budget_set_peak_observer(const Budget *budget, BudgetPeakObserver fn,
+                              void *opaque, size_t step)
+{
+    budget_peak_observer_budget = fn == NULL ? NULL : budget;
+    budget_peak_observer = fn;
+    budget_peak_observer_opaque = opaque;
+    budget_peak_observer_step = step == 0 ? 1 : step;
+    budget_peak_observer_next = budget == NULL ? 0 : budget->peak;
+}
+#endif
+
 static void budget_capture_global_peak(Budget *budget)
 {
     if (budget->current <= budget->peak) return;
@@ -207,6 +225,16 @@ static void budget_capture_global_peak(Budget *budget)
     for (size_t i = 0; i < BUDGET_CATEGORY_COUNT; i++) {
         budget->global_peak_categories[i] = budget->categories[i].current;
     }
+#if defined(TILEFINCH_MEMORY_DIAGNOSTICS)
+    if (budget_peak_observer != NULL
+        && budget == budget_peak_observer_budget
+        && budget->peak >= budget_peak_observer_next) {
+        budget_peak_observer_next =
+            budget->peak > SIZE_MAX - budget_peak_observer_step
+                ? SIZE_MAX : budget->peak + budget_peak_observer_step;
+        budget_peak_observer(budget_peak_observer_opaque, budget);
+    }
+#endif
 }
 
 static void budget_category_grow(Budget *budget, BudgetCategory category,
@@ -696,6 +724,16 @@ void budget_free(Budget *budget, void *ptr)
     budget->free_count++;
     free(allocation);
 }
+
+#if defined(TILEFINCH_MEMORY_DIAGNOSTICS)
+size_t budget_allocation_charge(const void *ptr, BudgetCategory *category)
+{
+    const AllocationHeader *header = header_from_payload(ptr);
+    if (header == NULL || header->data.magic != BUDGET_MAGIC) return 0;
+    if (category != NULL) *category = header_category(header);
+    return sizeof(*header) + header->data.size;
+}
+#endif
 
 size_t budget_usable_size(const void *ptr)
 {
@@ -1441,14 +1479,6 @@ bool budget_lexbor_is_installed(const Budget *budget)
     return budget != NULL && lexbor_budget == budget;
 }
 
-#if !defined(PSP_BROWSER_BELLARD_QUICKJS)
-static void *js_calloc_hook(void *opaque, size_t count, size_t size)
-{
-    return budget_calloc_category(
-        (Budget *) opaque, BUDGET_CATEGORY_JAVASCRIPT, count, size);
-}
-#endif
-
 static void *js_malloc_hook(void *opaque, size_t size)
 {
     return budget_malloc_category(
@@ -1471,7 +1501,6 @@ static size_t js_usable_size_hook(const void *ptr)
     return budget_usable_size(ptr);
 }
 
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
 static bool bellard_growth_allowed(const JSMallocState *state,
                                    size_t old_size, size_t new_size)
 {
@@ -1523,26 +1552,15 @@ static void *bellard_realloc(JSMallocState *state, void *pointer, size_t size)
     state->malloc_size += js_usable_size_hook(resized);
     return resized;
 }
-#endif
 
 const JSMallocFunctions *budget_quickjs_allocator(void)
 {
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
     static const JSMallocFunctions functions = {
         .js_malloc = bellard_malloc,
         .js_free = bellard_free,
         .js_realloc = bellard_realloc,
         .js_malloc_usable_size = js_usable_size_hook,
     };
-#else
-    static const JSMallocFunctions functions = {
-        .js_calloc = js_calloc_hook,
-        .js_malloc = js_malloc_hook,
-        .js_free = js_free_hook,
-        .js_realloc = js_realloc_hook,
-        .js_malloc_usable_size = js_usable_size_hook,
-    };
-#endif
     return &functions;
 }
 
@@ -1732,21 +1750,6 @@ static void *quickjs_pool_malloc(void *opaque, size_t size)
     return header + 1;
 }
 
-#if !defined(PSP_BROWSER_BELLARD_QUICKJS)
-static void *quickjs_pool_calloc(void *opaque, size_t count, size_t size)
-{
-    BudgetQuickJSPool *pool = opaque;
-    size_t total;
-    if (!checked_product(count, size, &total)) {
-        if (pool != NULL) pool->budget->failure_count++;
-        return NULL;
-    }
-    void *value = quickjs_pool_malloc(opaque, total);
-    if (value != NULL) memset(value, 0, total == 0 ? 1 : total);
-    return value;
-}
-#endif
-
 static void quickjs_pool_free(void *opaque, void *ptr)
 {
     if (ptr == NULL) return;
@@ -1847,7 +1850,6 @@ static void *quickjs_pool_realloc(void *opaque, void *ptr, size_t size)
     return replacement;
 }
 
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
 /* The bytes QuickJS asked for: the heap accounting (malloc_size, limits,
    growth admission) stays on requested sizes. */
 static size_t quickjs_pool_requested_size(const void *ptr)
@@ -1858,7 +1860,6 @@ static size_t quickjs_pool_requested_size(const void *ptr)
     return header->data.magic == QUICKJS_POOL_MAGIC
         ? header->data.requested : 0;
 }
-#endif
 
 /* The engine's usable size is the block's class capacity, as a system
    malloc_usable_size reports its bin: QuickJS appends to a sole-owned
@@ -1953,6 +1954,36 @@ size_t budget_quickjs_pool_trim(BudgetQuickJSPool *pool,
     return released;
 }
 
+#if defined(TILEFINCH_MEMORY_DIAGNOSTICS)
+void budget_quickjs_pool_split(const BudgetQuickJSPool *pool,
+                               BudgetQuickJSPoolSplit *split)
+{
+    if (split == NULL) return;
+    memset(split, 0, sizeof(*split));
+    if (pool == NULL) return;
+    const size_t block_headers =
+        sizeof(QuickJSPoolHeader) + sizeof(AllocationHeader);
+    for (size_t slot = 0; slot <= QUICKJS_POOL_CLASS_COUNT; slot++) {
+        split->requested += pool->live_requested[slot];
+        split->live_blocks += pool->live_count[slot];
+        split->live_capacity += pool->live_capacity[slot];
+    }
+    for (size_t index = 0; index < QUICKJS_POOL_CLASS_COUNT; index++) {
+        /* Each list is bounded by its class's cache limit. */
+        for (const QuickJSPoolHeader *header = pool->free_lists[index];
+             header != NULL; header = header->data.next) {
+            split->cached_blocks++;
+            split->cached_bytes +=
+                block_headers + quickjs_pool_class_sizes[index];
+        }
+    }
+    split->header_bytes = split->live_blocks * block_headers;
+    split->budget_bytes = pool->reserved
+        + (split->live_blocks + split->cached_blocks)
+            * sizeof(AllocationHeader);
+}
+#endif
+
 void budget_quickjs_pool_set_cache_limits(BudgetQuickJSPool *pool,
                                           size_t small_class_limit,
                                           size_t large_class_limit)
@@ -1964,7 +1995,6 @@ void budget_quickjs_pool_set_cache_limits(BudgetQuickJSPool *pool,
         ? UINT8_MAX : large_class_limit);
 }
 
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
 typedef struct {
     size_t old_size;
     size_t size;
@@ -2314,40 +2344,15 @@ static void *bellard_pool_realloc(JSMallocState *state, void *pointer,
     bellard_pool_update_malloc_census(state->opaque, state->malloc_size);
     return resized;
 }
-#endif
-
-#if !defined(PSP_BROWSER_BELLARD_QUICKJS)
-void budget_quickjs_pool_set_stack_dump_hook(void (*hook)(void *opaque),
-                                             void *opaque)
-{
-    (void) hook;
-    (void) opaque;
-}
-
-void budget_quickjs_pool_report_rejects(FILE *stream)
-{
-    (void) stream;
-}
-#endif
 
 const JSMallocFunctions *budget_quickjs_pool_allocator(void)
 {
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
     static const JSMallocFunctions functions = {
         .js_malloc = bellard_pool_malloc,
         .js_free = bellard_pool_free,
         .js_realloc = bellard_pool_realloc,
         .js_malloc_usable_size = quickjs_pool_usable_size,
     };
-#else
-    static const JSMallocFunctions functions = {
-        .js_calloc = quickjs_pool_calloc,
-        .js_malloc = quickjs_pool_malloc,
-        .js_free = quickjs_pool_free,
-        .js_realloc = quickjs_pool_realloc,
-        .js_malloc_usable_size = quickjs_pool_usable_size,
-    };
-#endif
     return &functions;
 }
 
@@ -2386,11 +2391,9 @@ static void bellard_pool_note_request(void *opaque, size_t size)
             int count = backtrace(frames, 24);
             backtrace_symbols_fd(frames, count, 2);
 #endif
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
             if (budget_js_stack_dump_hook != NULL) {
                 budget_js_stack_dump_hook(budget_js_stack_dump_opaque);
             }
-#endif
         }
 #endif
     }

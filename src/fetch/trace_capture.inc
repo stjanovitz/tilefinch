@@ -148,12 +148,7 @@ static size_t response_header_count(const FetchResult *result)
 static uint64_t trace_body_hash_with_offset(const char *body, size_t length,
                                             uint64_t offset)
 {
-    uint64_t hash = offset;
-    for (size_t i = 0; i < length; i++) {
-        hash ^= (unsigned char) body[i];
-        hash *= UINT64_C(1099511628211);
-    }
-    return hash;
+    return fnv1a64(offset, body, length);
 }
 
 static uint64_t trace_body_hash(const char *body, size_t length)

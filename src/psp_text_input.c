@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include "tilefinch/danzeff_input.h"
+#include "tilefinch/media_capture.h"
 #include "tilefinch/psp_log.h"
 #include "tilefinch/work_ledger.h"
 
@@ -229,6 +230,9 @@ static bool open_keyboard(
     text_input_wait_vblank();
     sceGuDisplay(GU_TRUE);
 
+    /* The firmware keyboard covers the whole screen, the microphone
+       indicator too, so page capture cannot go on under it. */
+    tilefinch_media_capture_stop(MEDIA_CAPTURE_END_SYSTEM_SCREEN);
     bool initialized = sceUtilityOskInitStart(&params) >= 0;
     bool done = !initialized;
     bool cancelled = false;
@@ -752,6 +756,14 @@ static bool text_input_collect_voice(
     const PspTextInputRequest *request, char *output, size_t capacity)
 {
 #ifdef TILEFINCH_HAVE_PSP_VOICE
+    /* Voice typing and page capture share the one microphone; the user's
+       request wins and the page's tracks end. Voice listens only once the
+       input is free: a transfer of the stopped capture may still be
+       running, and a blocking capture on it could fail or never return. */
+    if (!tilefinch_media_capture_hand_over(MEDIA_CAPTURE_END_VOICE)) {
+        show_status(service, frame, ui, "MICROPHONE BUSY - TRY AGAIN SOON");
+        return false;
+    }
     if (service->voice_prepare != NULL)
         (void) service->voice_prepare(service->voice_prepare_user);
     for (;;) {

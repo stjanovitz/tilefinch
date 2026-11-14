@@ -4,8 +4,10 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #include "tilefinch/budget.h"
+#include "tilefinch/media_capture.h"
 #include "tilefinch/page_dialog.h"
 
 typedef struct {
@@ -116,6 +118,44 @@ typedef struct {
     bool (*page_dialog)(void *context,
                         const TilefinchPageDialogRequest *request,
                         TilefinchPageDialogResponse *response);
+    /* Optional: the microphone for page capture (tilefinch/media_capture.h),
+       all called on the engine's owner thread. Without media_capture_start
+       there is no microphone and every request is NotFoundError.
+       - available: whether this device has an input at all;
+       - permission: the decision remembered for ORIGIN, and whether an
+         "Always allow" for it could be remembered (*can_remember);
+       - prompt: show the browser-owned prompt and block until it is
+         answered, under the same rules as page_dialog; false means no
+         prompt could be shown (the request is refused, nothing kept);
+       - remember: store GRANTED or DENIED for ORIGIN (false when full);
+       - start: open the input, filling *format; returns GRANTED, NO_DEVICE,
+         BUSY or FAILED;
+       - stop: close the input and clear every sample it held. */
+    bool (*media_capture_available)(void *context);
+    MediaCapturePermission (*media_capture_permission)(
+        void *context, const char *origin, bool *can_remember);
+    bool (*media_capture_prompt)(void *context,
+                                 const TilefinchMediaCapturePrompt *request,
+                                 MediaCapturePromptAnswer *answer);
+    bool (*media_capture_remember)(void *context, const char *origin,
+                                   MediaCapturePermission permission);
+    MediaCaptureVerdict (*media_capture_start)(void *context,
+                                               MediaCaptureFormat *format);
+    void (*media_capture_stop)(void *context);
+    /* The samples since *cursor (media_capture_ring_since). */
+    uint32_t (*media_capture_read_since)(void *context, float *output,
+                                         uint32_t count, uint32_t *cursor);
+    /* Optional: the input started and has since failed or stalled; the
+       engine then ends capture (MEDIA_CAPTURE_END_DEVICE). */
+    bool (*media_capture_failed)(void *context);
+    /* Optional: with page capture stopped, whether the input is free for
+       the frontend's own capture (voice typing): no worker left and no
+       transfer that may still write. Answered at once. Without it, true. */
+    bool (*media_capture_input_free)(void *context);
+    /* Optional: whether audio output goes to headphones rather than a
+       speaker the microphone can hear. Page microphone audio is heard only
+       while this is true; without it, never. */
+    bool (*audio_output_private)(void *context);
 } TilefinchPlatformServices;
 
 void tilefinch_platform_set_services(const TilefinchPlatformServices *services);
@@ -151,6 +191,25 @@ void tilefinch_platform_log_message(const char *message);
 /* False when no frontend dialog service is installed or it declined. */
 bool tilefinch_platform_page_dialog(const TilefinchPageDialogRequest *request,
                                     TilefinchPageDialogResponse *response);
+/* The media_capture services; each is the "no microphone" answer when the
+   frontend installed none (unavailable, PROMPT, no prompt, NO_DEVICE). */
+bool tilefinch_platform_media_capture_available(void);
+MediaCapturePermission tilefinch_platform_media_capture_permission(
+    const char *origin, bool *can_remember);
+bool tilefinch_platform_media_capture_prompt(
+    const TilefinchMediaCapturePrompt *request,
+    MediaCapturePromptAnswer *answer);
+bool tilefinch_platform_media_capture_remember(
+    const char *origin, MediaCapturePermission permission);
+MediaCaptureVerdict tilefinch_platform_media_capture_start(
+    MediaCaptureFormat *format);
+void tilefinch_platform_media_capture_stop(void);
+bool tilefinch_platform_audio_output_private(void);
+uint32_t tilefinch_platform_media_capture_read_since(float *output,
+                                                    uint32_t count,
+                                                    uint32_t *cursor);
+bool tilefinch_platform_media_capture_failed(void);
+bool tilefinch_platform_media_capture_input_free(void);
 /* Publishes the closed file TEMPORARY under PATH on a filesystem whose
    rename may refuse to replace an existing file (the PSP's FAT).
 
@@ -167,6 +226,20 @@ bool tilefinch_platform_page_dialog(const TilefinchPageDialogRequest *request,
    discarded or kept for recovery. */
 bool tilefinch_platform_replace_file(const char *temporary, const char *path,
                                      const char *backup);
+/* fprintf for short records: formats with vsnprintf into a 1 KiB stack
+   buffer and writes the text with one fwrite. The shipping PSP image
+   formats only through snprintf, so writing files this way keeps newlib's
+   stream printf core (_vfprintf_r, about 13.5 KB of .text) out of it.
+   Returns the bytes written, or -1 when the text does not fit the buffer
+   or the write fails; longer values go out with fputs or fwrite. */
+int tilefinch_platform_file_printf(FILE *file, const char *format, ...)
+    __attribute__((format(printf, 2, 3)));
+/* Formats a message into a caller's error buffer (truncating to fit); does
+   nothing when ERROR is NULL or ERROR_SIZE is 0. Modules alias it under
+   their own short name (`#define hls_error tilefinch_format_error`). */
+void tilefinch_format_error(char *error, size_t error_size,
+                            const char *format, ...)
+    __attribute__((format(printf, 3, 4)));
 /* Validation builds: name a step of engine work so that a visible gap
    between two cooperate checkpoints can be attributed to the steps that ran
    inside it (`label` must be a string literal). No-op otherwise. */

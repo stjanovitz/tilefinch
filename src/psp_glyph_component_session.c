@@ -536,6 +536,7 @@ PspGlyphComponentPrimaryResult psp_glyph_component_session_primary(
             return PSP_GLYPH_COMPONENT_PRIMARY_NONE;
         }
     }
+    memset(&session->install_snapshot, 0, sizeof(session->install_snapshot));
     client_snapshot_refresh(session);
     switch (session->client_snapshot.phase) {
         case TILEFINCH_UPDATE_CLIENT_IDLE:
@@ -615,12 +616,17 @@ bool psp_glyph_component_session_pump_operation(
                    && tilefinch_glyph_component_install_activated(
                           session->installer)) {
             finish_activated_install(session, paths);
-        } else if (was_installing
-                   && !installer_owns_runtime(session)) {
+        } else if (session->install_snapshot.phase
+                       == TILEFINCH_UPDATE_INSTALL_ERROR
+                   || session->install_snapshot.phase
+                       == TILEFINCH_UPDATE_INSTALL_CANCELLED) {
             /* Failed/cancelled staging did not replace the incumbent, but
                it detached all packs too. Restore once after mutation ends,
-               retaining the terminal installer/error for UI and retry. */
-            session->reattach_pending = true;
+               retaining only the terminal snapshot for UI and retry. */
+            if (was_installing) session->reattach_pending = true;
+            session->auto_install = false;
+            tilefinch_glyph_component_install_destroy(session->installer);
+            session->installer = NULL;
         }
         return true;
     }
@@ -664,7 +670,10 @@ const char *psp_glyph_component_session_select_failure(
 
 static const char *operation_failure(const PspGlyphComponentSession *session)
 {
-    if (session->installer != NULL)
+    if (session->operation_initialized
+        && (session->installer != NULL
+            || session->install_snapshot.phase == TILEFINCH_UPDATE_INSTALL_ERROR
+            || session->install_snapshot.phase == TILEFINCH_UPDATE_INSTALL_CANCELLED))
         return session->install_snapshot.phase
                 == TILEFINCH_UPDATE_INSTALL_ERROR
             ? session->install_snapshot.message : NULL;

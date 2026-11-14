@@ -62,10 +62,11 @@ if(PSP)
         PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
     target_compile_options(tilefinch_psp_entropy PRIVATE -Wall -Wextra)
     # Validation builds only: the raw-sample hooks for the capture recorder
-    # (src/psp_entropy_capture.h, src/psp_app/psp_app_validation_entropy.c).
+    # (src/psp_entropy_capture.h, src/psp_app/psp_app_validation_entropy.c)
+    # and the status lines on stdout when no report sink is installed.
     if(TILEFINCH_PSP_VALIDATION_LOG)
         target_compile_definitions(tilefinch_psp_entropy PRIVATE
-            TILEFINCH_PSP_ENTROPY_CAPTURE=1)
+            TILEFINCH_PSP_ENTROPY_CAPTURE=1 TILEFINCH_PSP_VALIDATION_LOG=1)
     endif()
 endif()
 

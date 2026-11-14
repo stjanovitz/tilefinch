@@ -112,7 +112,7 @@ static void offline_store_progress(void *context, unsigned done,
 {
     PspOfflineStore *store = context;
     snprintf(store->status, sizeof(store->status),
-             "PREPARING %u OF %u SCRIPTS - CIRCLE STOPS", done, total);
+             "PREPARING %u OF %u SCRIPTS  O STOP", done, total);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     printf("tilefinch-offline-app-progress: status=\"%s\"\n", store->status);
 #endif

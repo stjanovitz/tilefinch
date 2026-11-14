@@ -1247,6 +1247,18 @@ static CURLcode fetch_tls_shape_client_hello(CURL *easy, void *ssl_config,
 }
 #endif /* TILEFINCH_PSP_OWNED_TRANSPORT */
 
+#if defined(TILEFINCH_MEMORY_DIAGNOSTICS)
+bool fetch_curl_pool_metrics(BudgetConcurrentPoolMetrics *metrics)
+{
+    if (metrics == NULL) return false;
+    if (curl_global_users != 0)
+        return budget_concurrent_pool_metrics(&curl_concurrent_pool,
+                                              metrics);
+    *metrics = curl_last_pool_metrics;
+    return false;
+}
+#endif
+
 void fetch_tls_resumption_counters(unsigned *connections,
                                    unsigned *certificates)
 {
@@ -1547,6 +1559,7 @@ static bool fetch_diagnostic_mobile_safari(void)
 }
 
 #include "fetch/security_metadata.inc"
+#include "fnv1a.h"
 #include "fetch/trace_capture.inc"
 #include "fetch/trace_replay.inc"
 #ifdef TILEFINCH_NO_FETCH_TRACE

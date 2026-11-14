@@ -83,8 +83,7 @@ static bool navigation_head_scripts_are_nonvisual(const NavigationPage *page,
                                                   lxb_dom_node_t *changed)
 {
     if (page == NULL || page->document.html == NULL) return false;
-    lxb_dom_node_t *head = lxb_dom_interface_node(
-        lxb_html_document_head_element(page->document.html));
+    lxb_dom_node_t *head = document_head_node(&page->document);
     if (head == NULL || head->parent == NULL
         || head->parent->local_name != LXB_TAG_HTML) return false;
     lxb_dom_node_t *previous = head->prev;
@@ -133,6 +132,11 @@ static void navigation_retire_subtree(void *opaque,
     NavigationSession *session = opaque;
     if (session == NULL) return;
     navigation_retire_style_sources(&session->page.stylesheet, root);
+    /* The read-time scope may name a host inside: walk the whole document. */
+    if (session->page.read_sheet_settle.host_count != 0) {
+        session->page.read_sheet_settle.whole_document = true;
+        session->page.read_sheet_settle.host_count = 0;
+    }
     if (session->page.layout_reuse == NULL) return;
     layout_reuse_cache_retire_subtree(session->page.layout_reuse, root);
 }

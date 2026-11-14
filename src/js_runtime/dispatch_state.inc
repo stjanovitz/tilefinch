@@ -533,35 +533,60 @@ bool script_runtime_take_refresh_meta_mutation(ScriptRuntime *runtime)
 
 bool script_runtime_has_pending_mutations(const ScriptRuntime *runtime)
 {
-    return runtime != NULL && (runtime->relayout_dirty
-        || runtime->bridge.mutations.count != 0
-        || runtime->bridge.mutations.overflowed);
+    if (runtime == NULL) return false;
+    const ScriptMutationJournal *journal = runtime->bridge.mutations;
+    return runtime->relayout_dirty || runtime->bridge.mutations_unrecorded
+        || (journal != NULL && (journal->count != 0 || journal->overflowed));
 }
 
 const ScriptMutationJournal *script_runtime_pending_journal(
     const ScriptRuntime *runtime)
 {
-    return runtime == NULL ? NULL : &runtime->bridge.mutations;
+    return runtime == NULL || runtime->bridge.mutations_unrecorded ? NULL
+        : runtime->bridge.mutations;
 }
 
 bool script_runtime_has_pending_resource_mutations(const ScriptRuntime *runtime)
 {
-    return runtime != NULL
-        && (runtime->bridge.mutations.resource_rebuild_required
-            || runtime->bridge.mutations.image_resource_scan_required
-            || runtime->bridge.mutations.conservative_resource_scan);
+    if (runtime == NULL) return false;
+    const ScriptMutationJournal *journal = runtime->bridge.mutations;
+    return runtime->bridge.mutations_unrecorded
+        || (journal != NULL
+            && (journal->resource_rebuild_required
+                || journal->image_resource_scan_required
+                || journal->conservative_resource_scan));
 }
 
 bool script_runtime_consume_mutations(ScriptRuntime *runtime,
                                       ScriptMutationJournal *result)
 {
     if (result != NULL) memset(result, 0, sizeof(*result));
-    if (runtime == NULL || runtime->bridge.mutations.count == 0) {
-        return false;
+    if (runtime == NULL) return false;
+    DomBridge *bridge = &runtime->bridge;
+    if (bridge->mutations_unrecorded) {
+        /* The Budget refused the journal: nothing since the last consume
+           was recorded, so report what a full journal that lost its
+           overflow roots reports, plus every resource cause. */
+        bridge->mutations_unrecorded = false;
+        if (result != NULL) {
+            result->overflowed = true;
+            result->overflow_roots_lost = true;
+            result->retirement_unobserved = true;
+            result->conservative_resource_scan = true;
+            result->resource_rebuild_required = true;
+            result->stylesheet_rebuild_required = true;
+            result->image_rebuild_required = true;
+            result->image_resource_scan_required = true;
+            result->image_resource_refresh_required = true;
+            result->image_reveal_possible = true;
+            result->relational_selector_sensitive = true;
+        }
+        return true;
     }
-    if (result != NULL) *result = runtime->bridge.mutations;
-    memset(&runtime->bridge.mutations, 0,
-           sizeof(runtime->bridge.mutations));
+    if (bridge->mutations == NULL || bridge->mutations->count == 0)
+        return false;
+    if (result != NULL) *result = *bridge->mutations;
+    memset(bridge->mutations, 0, sizeof(*bridge->mutations));
     return true;
 }
 
@@ -822,6 +847,41 @@ void script_runtime_set_layout_region(ScriptRuntime *runtime, int region_end)
         runtime->bridge.layout_region_end = region_end > 0 ? region_end : 0;
 }
 
+#ifdef TILEFINCH_LAYOUT_DIFF
+/* Study instrumentation: why script's forced geometry could or could not
+   be adopted by the relayout that follows it. */
+const char *script_runtime_geometry_adoption_state(
+    const ScriptRuntime *runtime, const ViewportContext *viewport)
+{
+    if (runtime == NULL) return "no-runtime";
+    if (runtime->geometry_layout == NULL) return "no-geometry";
+    if (runtime->geometry_paint_stale) return "paint-stale";
+    const LayoutDocument *layout = runtime->geometry_layout;
+    if (!geometry_environment_current(runtime, viewport, layout)) {
+        const DomBridge *bridge = &runtime->bridge;
+        if (bridge->layout != layout) return "environment-changed:incumbent";
+        if (bridge->document == NULL || bridge->stylesheet == NULL || layout->budget == NULL)
+            return "environment-changed:missing";
+        if (runtime->geometry_style_generation != document_style_generation())
+            return "environment-changed:style";
+        if (runtime->geometry_sheet_generation != bridge->stylesheet->build_generation)
+            return "environment-changed:sheet";
+        if (runtime->geometry_container_generation
+            != bridge->stylesheet->container_state_generation)
+            return "environment-changed:container";
+        if (runtime->geometry_font_generation != font_generation()
+            || layout->fonts != bridge->fonts
+            || layout->web_fonts != stylesheet_web_font_set(bridge->stylesheet))
+            return "environment-changed:font";
+        return "environment-changed:viewport";
+    }
+    if (runtime->geometry_content_generation
+        != runtime->bridge.document->content_generation)
+        return "dom-changed-after-read";
+    return "current";
+}
+#endif
+
 bool script_runtime_take_geometry_layout(ScriptRuntime *runtime,
                                          const ViewportContext *viewport,
                                          LayoutDocument *layout)
@@ -909,8 +969,11 @@ bool script_runtime_flush_geometry_layout_reuse(
 #endif
     bool unchanged = false;
     LayoutReuseCache *reuse = prepare == NULL ? NULL
-        : prepare(opaque, bridge->mutations.count != 0
-            || bridge->mutations.overflowed ? &bridge->mutations : NULL,
+        : prepare(opaque, !bridge->mutations_unrecorded
+                && bridge->mutations != NULL
+                && (bridge->mutations->count != 0
+                    || bridge->mutations->overflowed)
+            ? bridge->mutations : NULL,
             geometry_environment_current(runtime, viewport, bridge->layout)
                 && bridge->layout->content_limit_y == 0
                 ? &unchanged : NULL);
@@ -930,6 +993,10 @@ bool script_runtime_flush_geometry_layout_reuse(
 #endif
         return true;
     }
+    /* A build is where a read's memory peaks, and it usually follows a
+       mutation, which already emptied the geometry records: release their
+       table for it (the walk after the build stores afresh). */
+    js_rt_bridge_computed_style_release_records(bridge);
     if (runtime->geometry_layout == NULL) {
         runtime->geometry_layout = budget_calloc_category(
             runtime->budget, BUDGET_CATEGORY_LAYOUT, 1,
@@ -949,6 +1016,18 @@ bool script_runtime_flush_geometry_layout_reuse(
 #endif
     size_t failures = runtime->budget->failure_count;
     size_t injections = runtime->budget->injected_failure_count;
+#ifdef TILEFINCH_LAYOUT_DIFF
+    layout_validation_set_cause("geometry");
+    {
+        char note[48];
+        snprintf(note, sizeof(note), "mutations=%zu%s",
+                 bridge->mutations == NULL ? (size_t) 0
+                     : bridge->mutations->count,
+                 bridge->mutations != NULL && bridge->mutations->overflowed
+                     ? "+overflow" : "");
+        layout_validation_note(note);
+    }
+#endif
     bool built = layout_build_context_reuse(
         runtime->geometry_layout, runtime->budget, bridge->document,
         bridge->stylesheet, bridge->fonts, bridge->images, viewport, reuse);
@@ -993,8 +1072,10 @@ bool script_runtime_flush_geometry_layout_reuse(
             (unsigned long long)p->style_resolve_us,
             (unsigned long long)p->style_cache_hits,
             (unsigned long long)p->style_cache_misses,
-            bridge->mutations.count, (int)bridge->mutations.overflowed,
-            (int)bridge->mutations.resource_rebuild_required,
+            bridge->mutations == NULL ? 0 : bridge->mutations->count,
+            bridge->mutations != NULL && bridge->mutations->overflowed,
+            bridge->mutations != NULL
+                && bridge->mutations->resource_rebuild_required,
             runtime->geometry_layout->count);
     }
 #endif
@@ -1026,9 +1107,11 @@ bool js_rt_geometry_opacity_write_begin(DomBridge *bridge, lxb_dom_node_t *node)
     ScriptRuntime *runtime = bridge == NULL ? NULL : bridge->host;
     return runtime != NULL && runtime->geometry_layout != NULL
         && bridge->stylesheet != NULL && bridge->shadow_root_count == 0
-        && !bridge->mutations.overflowed
-        && !bridge->mutations.resource_rebuild_required
-        && !bridge->mutations.conservative_resource_scan
+        && !bridge->mutations_unrecorded
+        && (bridge->mutations == NULL
+            || (!bridge->mutations->overflowed
+                && !bridge->mutations->resource_rebuild_required
+                && !bridge->mutations->conservative_resource_scan))
         && !stylesheet_has_container_queries(bridge->stylesheet)
         && !style_container_layout_state_present(bridge->stylesheet)
         && geometry_layout_current(runtime, &runtime->geometry_layout->viewport)
@@ -1226,6 +1309,7 @@ static void runtime_queue_image_loads(ScriptRuntime *runtime, ImageResources *im
             if (handle == 0)
                 handle = script_runtime_node_weak_handle(runtime, image->node);
             if (handle == 0) continue;
+            js_rt_bridge_keep_node_handle(&runtime->bridge, handle);
             at = runtime->image_load_state_count++;
             runtime->image_load_states[at] = (ScriptImageLoadState) {.handle = handle};
         }
@@ -1298,6 +1382,14 @@ void script_runtime_set_stylesheet(ScriptRuntime *runtime,
     runtime->bridge.stylesheet = stylesheet;
 }
 
+void script_runtime_drop_computed_styles_within(
+    ScriptRuntime *runtime, lxb_dom_node_t *const *roots, size_t count)
+{
+    if (runtime != NULL)
+        (void) js_rt_bridge_computed_style_drop_within(&runtime->bridge,
+                                                       roots, count);
+}
+
 void script_runtime_set_synchronous_layout_callback(
     ScriptRuntime *runtime, ScriptSynchronousLayoutCallback callback,
     void *opaque)
@@ -1308,6 +1400,19 @@ void script_runtime_set_synchronous_layout_callback(
         callback == NULL ? NULL : opaque;
     runtime->bridge.synchronous_layout_images_only = false;
     runtime->bridge.synchronous_layout_geometry_only = false;
+    runtime->bridge.sheet_settle = NULL;
+    runtime->bridge.sheet_settle_opaque = NULL;
+    runtime->bridge.sheet_settle_refused = false;
+}
+
+void script_runtime_set_sheet_settle_callback(
+    ScriptRuntime *runtime, ScriptSynchronousLayoutCallback callback,
+    void *opaque)
+{
+    if (runtime == NULL) return;
+    runtime->bridge.sheet_settle = callback;
+    runtime->bridge.sheet_settle_opaque = callback == NULL ? NULL : opaque;
+    runtime->bridge.sheet_settle_refused = false;
 }
 
 void script_runtime_set_geometry_layout_callback(

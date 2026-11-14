@@ -700,11 +700,14 @@ static void translate_flex_item(LayoutDocument *layout, const FlatItem *item,
     }
     LayoutNodeBox *box = item->generated_box;
     if (box == NULL) return;
-    for (size_t i = box->command_start;
-         i < box->command_end && i < layout->count; i++) {
+    size_t command_end = box->command_end < layout->count
+        ? box->command_end : layout->count;
+    for (size_t i = box->command_start; i < command_end; i++) {
         layout->commands[i].x = layout_add_coordinate(layout->commands[i].x, dx);
         layout->commands[i].y = layout_add_coordinate(layout->commands[i].y, dy);
     }
+    /* Visual-order glyphs hold absolute x (layout_internal.h). */
+    layout_bidi_translate_commands(layout, box->command_start, command_end, dx);
     box->x = layout_add_coordinate(box->x, dx);
     box->y = layout_add_coordinate(box->y, dy);
 }

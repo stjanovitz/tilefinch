@@ -103,25 +103,35 @@ void js_rt_heap_census(ScriptRuntime *runtime, JSMemoryUsage *usage)
     JS_ComputeMemoryUsage(runtime->runtime, usage);
 }
 
-#if defined(CONFIG_TILEFINCH_HEAP_DETAIL) && !defined(TILEFINCH_NO_TRACE)
-/* Heap composition census (host lab only, CONFIG_TILEFINCH_HEAP_DETAIL).
+#if defined(TILEFINCH_JSMEM_CENSUS)
+/* Heap composition census (CONFIG_TILEFINCH_HEAP_DETAIL). In the host lab
    TILEFINCH_TRACE_JS_HEAP_DETAIL=1 prints
    a heap composition census (jsmem-* lines on stderr) at the first safe
    point after the realm's allocator refused a request, at every
    TILEFINCH_TRACE_JS_HEAP_DETAIL_STEP_KB (default 4096) high-water step, and with each
    memory report. TILEFINCH_TRACE_JS_HEAP_DETAIL=gc also collects after an OOM
-   census and takes a second one, measuring what a forced GC would free. */
+   census and takes a second one, measuring what a forced GC would free;
+   =compact prints the bounded row set a PSP validation build logs. A PSP
+   validation build takes a census only when its report asks
+   (validation_js_heap_detail=1), always compact, through the validation
+   log. */
+#if defined(__PSP__)
+static int jsmem_mode(void) { return 0; }
+#else
 static int jsmem_mode(void)
 {
     static int mode = -1;
     if (mode < 0) {
         const char *value = getenv("TILEFINCH_TRACE_JS_HEAP_DETAIL");
         mode = value == NULL || value[0] == '\0' ? 0
-            : strcmp(value, "gc") == 0 ? 2 : 1;
+            : strcmp(value, "gc") == 0 ? 2
+            : strcmp(value, "compact") == 0 ? 3 : 1;
     }
     return mode;
 }
+#endif
 
+#if defined(CONFIG_TILEFINCH_HEAP_DETAIL) && !defined(TILEFINCH_NO_TRACE)
 bool js_rt_jsmem_enabled(void)
 {
     return jsmem_mode() != 0;
@@ -137,43 +147,202 @@ static size_t jsmem_step(void)
     }
     return step;
 }
+#endif
+
+/* One output line, emitted whole: the PSP validation log takes a line per
+   call (at most 1 KiB), the host lab writes stderr. */
+typedef struct {
+    char text[960];
+    size_t length;
+} JsmemLine;
+
+static void jsmem_append(JsmemLine *line, const char *format, ...)
+#if defined(__GNUC__)
+    __attribute__((format(printf, 2, 3)))
+#endif
+    ;
+static void jsmem_append(JsmemLine *line, const char *format, ...)
+{
+    if (line->length >= sizeof(line->text) - 1u) return;
+    va_list arguments;
+    va_start(arguments, format);
+    int written = vsnprintf(line->text + line->length,
+                            sizeof(line->text) - line->length,
+                            format, arguments);
+    va_end(arguments);
+    if (written < 0) return;
+    line->length += (size_t) written;
+    if (line->length >= sizeof(line->text))
+        line->length = sizeof(line->text) - 1u;
+}
+
+/* Appends `text` with spaces/controls (and quotes) replaced. A PSP
+   validation log stops a script URL at its query or fragment: the log
+   leaves the device and must not carry tokens a page put there. */
+static void jsmem_append_safe(JsmemLine *line, const char *text,
+                              bool quoted)
+{
+    for (const char *c = text; c != NULL && *c != '\0'
+         && line->length < sizeof(line->text) - 1u; c++) {
+        unsigned char ch = (unsigned char) *c;
+#if defined(__PSP__)
+        if (ch == '?' || ch == '#') break;
+#endif
+        bool bad = quoted ? (ch == '"' || ch < 32) : ch < 33;
+        line->text[line->length++] = bad ? '_' : (char) ch;
+    }
+    line->text[line->length] = '\0';
+}
+
+static void jsmem_flush(JsmemLine *line)
+{
+#if defined(__PSP__)
+    psp_log_printf("%s\n", line->text);
+#else
+    fprintf(stderr, "%s\n", line->text);
+#endif
+    line->length = 0;
+    line->text[0] = '\0';
+}
+
+/* Compact mode keeps the log bounded: every row kind except the per-file
+   and prototype tables passes through; prototypes stop after the first
+   JSMEM_COMPACT_PROTOS (the walk emits them largest first); files are
+   summed into one file-total row and only the JSMEM_COMPACT_FILES largest
+   are kept, printed after the walk. The tostring row is dropped. */
+#define JSMEM_COMPACT_PROTOS 12
+#define JSMEM_COMPACT_FILES 8
+#define JSMEM_FILE_VALUES 13
+#define JSMEM_FILE_NAME_BYTES 120
+
+typedef struct {
+    char name[JSMEM_FILE_NAME_BYTES];
+    int64_t values[JSMEM_FILE_VALUES];
+    int count;
+    int64_t weight;
+} JsmemFileRow;
 
 typedef struct {
     unsigned sequence;
     const void *runtime;
+    bool compact;
+    int protos;
+    size_t files;
+    int file_values;
+    int64_t file_total[JSMEM_FILE_VALUES];
+    JsmemFileRow top[JSMEM_COMPACT_FILES];
 } JsmemRowContext;
+
+static void jsmem_emit_row(const JsmemRowContext *row, const char *kind,
+                           const char *name, const int64_t *values,
+                           int count)
+{
+    JsmemLine line = {{0}, 0};
+    jsmem_append(&line, "jsmem-row seq=%u rt=%p kind=%s", row->sequence,
+                 row->runtime, kind);
+    for (int i = 0; i < count; i++)
+        jsmem_append(&line, " v%d=%lld", i, (long long) values[i]);
+    jsmem_append(&line, " name=\"");
+    jsmem_append_safe(&line, name, true);
+    jsmem_append(&line, "\"");
+    jsmem_flush(&line);
+}
+
+/* The file bytes jsmem_report.py ranks scripts by. */
+static int64_t jsmem_file_weight(const int64_t *values, int count)
+{
+    static const int byte_fields[] = {1, 3, 4, 5, 6, 8, 9};
+    int64_t weight = 0;
+    for (size_t i = 0; i < sizeof(byte_fields) / sizeof(byte_fields[0]); i++)
+        if (byte_fields[i] < count) weight += values[byte_fields[i]];
+    return weight;
+}
 
 static void jsmem_row(void *opaque, const char *kind, const char *name,
                       const int64_t *values, int count)
 {
-    const JsmemRowContext *row = opaque;
-    fprintf(stderr, "jsmem-row seq=%u rt=%p kind=%s", row->sequence,
-            row->runtime, kind);
-    for (int i = 0; i < count; i++)
-        fprintf(stderr, " v%d=%lld", i, (long long) values[i]);
-    fprintf(stderr, " name=\"");
-    for (const char *c = name; c != NULL && *c != '\0'; c++)
-        fputc(*c == '"' || (unsigned char) *c < 32 ? '_' : *c, stderr);
-    fprintf(stderr, "\"\n");
+    JsmemRowContext *row = opaque;
+    if (!row->compact) {
+        jsmem_emit_row(row, kind, name, values, count);
+        return;
+    }
+    if (strcmp(kind, "tostring") == 0) return;
+    if (strcmp(kind, "proto") == 0) {
+        if (row->protos++ < JSMEM_COMPACT_PROTOS)
+            jsmem_emit_row(row, kind, name, values, count);
+        return;
+    }
+    if (strcmp(kind, "file") != 0) {
+        jsmem_emit_row(row, kind, name, values, count);
+        return;
+    }
+    if (count > JSMEM_FILE_VALUES) count = JSMEM_FILE_VALUES;
+    if (count > row->file_values) row->file_values = count;
+    row->files++;
+    for (int i = 0; i < count; i++) row->file_total[i] += values[i];
+    int64_t weight = jsmem_file_weight(values, count);
+    size_t slot = JSMEM_COMPACT_FILES;
+    for (size_t i = 0; i < JSMEM_COMPACT_FILES; i++) {
+        if (row->top[i].count == 0) { slot = i; break; }
+        if (slot == JSMEM_COMPACT_FILES
+            || row->top[i].weight < row->top[slot].weight) slot = i;
+    }
+    if (slot == JSMEM_COMPACT_FILES) return;
+    if (row->top[slot].count != 0 && row->top[slot].weight >= weight) return;
+    JsmemFileRow *top = &row->top[slot];
+    snprintf(top->name, sizeof(top->name), "%s", name == NULL ? "" : name);
+    memcpy(top->values, values, (size_t) count * sizeof(values[0]));
+    top->count = count;
+    top->weight = weight;
 }
 
-void js_rt_jsmem_census(ScriptRuntime *runtime, const char *reason, bool gc)
+static void jsmem_flush_files(JsmemRowContext *row)
+{
+    if (!row->compact || row->files == 0) return;
+    char name[32];
+    snprintf(name, sizeof(name), "<all-files:%zu>", row->files);
+    jsmem_emit_row(row, "file-total", name, row->file_total,
+                   row->file_values);
+    /* Largest first. */
+    for (size_t emitted = 0; emitted < JSMEM_COMPACT_FILES; emitted++) {
+        size_t best = JSMEM_COMPACT_FILES;
+        for (size_t i = 0; i < JSMEM_COMPACT_FILES; i++)
+            if (row->top[i].count != 0
+                && (best == JSMEM_COMPACT_FILES
+                    || row->top[i].weight > row->top[best].weight))
+                best = i;
+        if (best == JSMEM_COMPACT_FILES) break;
+        jsmem_emit_row(row, "file", row->top[best].name,
+                       row->top[best].values, row->top[best].count);
+        row->top[best].count = 0;
+    }
+}
+
+static void jsmem_census_run(ScriptRuntime *runtime, const char *reason,
+                             bool gc, bool compact)
 {
     if (runtime == NULL || runtime->runtime == NULL) return;
     for (int pass = 0; pass < (gc ? 2 : 1); pass++) {
         if (pass == 1) JS_RunGC(runtime->runtime);
-        JsmemRowContext row = {++runtime->jsmem_sequence,
-                               (const void *) runtime};
+        JsmemRowContext row;
+        memset(&row, 0, sizeof(row));
+        row.sequence = ++runtime->jsmem_sequence;
+        row.runtime = (const void *) runtime;
+        row.compact = compact;
         uint64_t started = js_rt_monotonic_time_ns();
         JSMemoryUsage usage;
         js_rt_heap_census(runtime, &usage);
-        fprintf(stderr,
-                "jsmem-census seq=%u rt=%p reason=%s%s pool-current=%zu "
+        JsmemLine line = {{0}, 0};
+        jsmem_append(&line,
+                "jsmem-census seq=%u rt=%p reason=", row.sequence,
+                row.runtime);
+        jsmem_append_safe(&line, reason, false);
+        jsmem_append(&line, "%s pool-current=%zu "
                 "pool-peak=%zu pool-reserved=%zu rejections=%zu "
                 "retained=%lld atoms=%lld/%lld strings=%lld/%lld "
                 "objects=%lld/%lld props=%lld shapes=%lld/%lld "
                 "funcs=%lld/%lld code=%lld pc2line=%lld binaries=%lld/%lld",
-                row.sequence, row.runtime, reason, pass ? "-aftergc" : "",
+                pass ? "-aftergc" : "",
                 budget_quickjs_pool_js_malloc_current(runtime->quickjs_pool),
                 budget_quickjs_pool_js_malloc_peak(runtime->quickjs_pool),
                 budget_quickjs_pool_reserved_current(runtime->quickjs_pool),
@@ -191,39 +360,57 @@ void js_rt_jsmem_census(ScriptRuntime *runtime, const char *reason, bool gc)
                 (long long) usage.binary_object_count,
                 (long long) usage.binary_object_size);
         if (runtime->budget != NULL) {
-            fprintf(stderr, " budget=%zu", runtime->budget->current);
+            jsmem_append(&line, " budget=%zu", runtime->budget->current);
             for (size_t i = 0; i < BUDGET_CATEGORY_COUNT; i++)
-                fprintf(stderr, " %s=%zu",
+                jsmem_append(&line, " %s=%zu",
                         budget_category_name((BudgetCategory) i),
                         runtime->budget->categories[i].current);
         }
         {
             BudgetQuickJSActivity activity;
             budget_quickjs_pool_activity(runtime->quickjs_pool, &activity);
-            fprintf(stderr, " reject-old=%zu reject-new=%zu reject-live=%zu",
+            jsmem_append(&line,
+                    " reject-old=%zu reject-new=%zu reject-live=%zu",
                     activity.rejected_old_bytes, activity.rejected_new_bytes,
                     activity.rejected_live_bytes);
         }
         if (runtime->jsmem_compile_name != NULL) {
-            fprintf(stderr, " compiling-bytes=%zu compiling=",
+            jsmem_append(&line, " compiling-bytes=%zu compiling=",
                     runtime->jsmem_compile_bytes);
-            for (const char *c = runtime->jsmem_compile_name;
-                 *c != '\0'; c++)
-                fputc(*c == ' ' || (unsigned char) *c < 33 ? '_' : *c, stderr);
+            jsmem_append_safe(&line, runtime->jsmem_compile_name, false);
         }
-        fprintf(stderr, " wrappers=%zu\n", runtime->bridge.node_count);
+        jsmem_append(&line, " wrappers=%zu%s", runtime->bridge.node_count,
+                     compact ? " compact=1" : "");
+        jsmem_flush(&line);
         JS_ComputeMemoryDetail(runtime->runtime, jsmem_row, &row);
+        jsmem_flush_files(&row);
+#if !defined(__PSP__)
         if (getenv("TILEFINCH_TRACE_JS_HEAP_DETAIL_RESOURCE") != NULL && pass == 0
             && strncmp(reason, "oom", 3) == 0 && runtime->budget != NULL
             && runtime->jsmem_oom_censuses == 1)
             budget_report_active(runtime->budget, BUDGET_CATEGORY_RESOURCE,
                                  4096, stderr);
-        fprintf(stderr, "jsmem-end seq=%u census-us=%llu\n", row.sequence,
+#endif
+        jsmem_append(&line, "jsmem-end seq=%u census-us=%llu", row.sequence,
                 (unsigned long long) ((js_rt_monotonic_time_ns() - started)
                                       / UINT64_C(1000)));
+        jsmem_flush(&line);
     }
 }
 
+void js_rt_jsmem_census(ScriptRuntime *runtime, const char *reason, bool gc)
+{
+    jsmem_census_run(runtime, reason, gc, jsmem_mode() == 3);
+}
+
+void script_runtime_heap_detail_census(ScriptRuntime *runtime,
+                                       const char *reason)
+{
+    jsmem_census_run(runtime, reason == NULL ? "report" : reason, false,
+                     true);
+}
+
+#if defined(CONFIG_TILEFINCH_HEAP_DETAIL) && !defined(TILEFINCH_NO_TRACE)
 void js_rt_jsmem_census_check(ScriptRuntime *runtime, const char *where,
                               bool safe)
 {
@@ -253,6 +440,16 @@ void js_rt_jsmem_census_check(ScriptRuntime *runtime, const char *where,
         snprintf(reason, sizeof(reason), "hw-%s", where);
         js_rt_jsmem_census(runtime, reason, false);
     }
+}
+#endif
+#endif /* TILEFINCH_JSMEM_CENSUS */
+#if defined(TILEFINCH_MEMORY_DIAGNOSTICS) && !defined(TILEFINCH_JSMEM_CENSUS)
+/* No census compiled in (a validation build without the heap walk). */
+void script_runtime_heap_detail_census(ScriptRuntime *runtime,
+                                       const char *reason)
+{
+    (void) runtime;
+    (void) reason;
 }
 #endif
 
@@ -290,6 +487,89 @@ static size_t script_runtime_current_limit(const ScriptRuntime *runtime)
     }
     return limit;
 }
+
+size_t script_runtime_trim_pool(ScriptRuntime *runtime)
+{
+    if (runtime == NULL || runtime->quickjs_pool == NULL) return 0;
+    size_t released = budget_quickjs_pool_trim(runtime->quickjs_pool, 0);
+#if defined(TILEFINCH_FRAME_LITE)
+    tilefinch_frame_lite_counters.pool_trims++;
+    tilefinch_frame_lite_counters.pool_trim_bytes += released;
+#endif
+    return released;
+}
+
+#if defined(TILEFINCH_MEMORY_DIAGNOSTICS)
+void js_rt_note_bootstrap_memory(ScriptRuntime *runtime)
+{
+    if (runtime == NULL) return;
+    runtime->heap_after_bootstrap = script_runtime_heap_used(runtime);
+    BudgetQuickJSPoolSplit pool;
+    budget_quickjs_pool_split(runtime->quickjs_pool, &pool);
+    ScriptSourceStoreStats source = {0};
+    if (runtime->source_store != NULL)
+        script_source_store_stats(runtime->source_store, &source);
+    runtime->budget_after_bootstrap = pool.budget_bytes + source.held_bytes;
+}
+
+bool script_runtime_memory_split(const ScriptRuntime *runtime,
+                                 ScriptRuntimeMemorySplit *split)
+{
+    if (split == NULL) return false;
+    memset(split, 0, sizeof(*split));
+    if (runtime == NULL || runtime->quickjs_pool == NULL) return false;
+    BudgetQuickJSPoolSplit pool;
+    budget_quickjs_pool_split(runtime->quickjs_pool, &pool);
+    split->heap_used = script_runtime_heap_used(runtime);
+    split->heap_limit = script_runtime_current_limit(runtime);
+    split->heap_after_bootstrap = runtime->heap_after_bootstrap;
+    split->budget_after_bootstrap = runtime->budget_after_bootstrap;
+    split->pool_requested = pool.requested;
+    split->pool_budget_bytes = pool.budget_bytes;
+    split->pool_header_bytes = pool.header_bytes;
+    split->pool_live_blocks = pool.live_blocks;
+    split->pool_cached_blocks = pool.cached_blocks;
+    split->pool_cached_bytes = pool.cached_bytes;
+    split->pool_slack_bytes = pool.live_capacity > pool.requested
+        ? pool.live_capacity - pool.requested : 0;
+    if (runtime->source_store != NULL) {
+        ScriptSourceStoreStats source;
+        script_source_store_stats(runtime->source_store, &source);
+        split->source_entries = source.entries;
+        split->source_text_bytes = source.text_bytes;
+        split->source_held_bytes = source.held_bytes;
+        split->source_plain_bytes = source.plain_bytes;
+    }
+    const DomBridge *bridge = &runtime->bridge;
+    size_t net = budget_allocation_charge(bridge->websocket_event_scratch,
+                                          NULL)
+        + budget_allocation_charge(bridge->multiplayer_event_scratch, NULL);
+    for (size_t i = 0; i < SCRIPT_EVENT_SOURCE_LIMIT; i++)
+        net += budget_allocation_charge(bridge->event_sources[i].pending,
+                                        NULL);
+    for (size_t i = 0; i < SCRIPT_DYNAMIC_TASK_LIMIT; i++)
+        net += budget_allocation_charge(
+            bridge->dynamic_scripts[i].resource_loader_source, NULL);
+    split->net_buffer_bytes = net;
+    split->classic_queue_count = runtime->bytecode_pending_count;
+    split->classic_queue_source_bytes = runtime->bytecode_pending_bytes;
+    split->classic_queue_bytes =
+        budget_allocation_charge(runtime->bytecode_pending, NULL);
+    split->memory_rescue_bytes =
+        budget_allocation_charge(runtime->memory_rescue.markup, NULL);
+    /* The slot table is one block carved at `nodes`; the wrapper cache,
+       owner tags, node index and deferred discards are blocks of their own
+       (a pointer into the slot block carries no header and charges 0). */
+    split->bridge_table_bytes =
+        budget_allocation_charge(bridge->nodes, NULL)
+        + budget_allocation_charge(bridge->wrapper_refs, NULL)
+        + budget_allocation_charge(bridge->node_owner_tags, NULL)
+        + budget_allocation_charge(bridge->node_index, NULL)
+        + budget_allocation_charge(bridge->deferred_discards, NULL);
+    split->wrappers = runtime->bridge.node_count;
+    return true;
+}
+#endif
 
 /* From the growth hook: the response cache's sole-owned classic script
    bodies (source this page compiled) give way for `needed` more bytes. */
@@ -784,13 +1064,11 @@ void script_runtime_heap_growth(const ScriptRuntime *runtime,
     growth->pacing_starved = runtime->gc_pacing_starved;
     growth->pacing_backoffs = runtime->gc_pacing_backoffs;
     growth->collection_us = runtime->gc_total_ns / UINT64_C(1000);
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
     if (runtime->runtime != NULL) {
         JSLazyFunctionStats stats;
         JS_GetLazyFunctionStats(runtime->runtime, &stats);
         growth->lazy_compile_failures = (size_t) stats.compile_failures;
     }
-#endif
     growth->source_committed = runtime->bridge.script_quota_bytes;
     growth->source_limit = runtime->bridge.maximum_script_bytes;
     growth->source_raises = runtime->bridge.script_quota_pressure_raises;
@@ -822,16 +1100,12 @@ void script_runtime_lazy_function_counts(const ScriptRuntime *runtime,
                                          size_t *deferred, size_t *compiled)
 {
     size_t deferred_count = 0, compiled_count = 0;
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
     if (runtime != NULL && runtime->runtime != NULL) {
         JSLazyFunctionStats stats;
         JS_GetLazyFunctionStats(runtime->runtime, &stats);
         deferred_count = (size_t) (stats.deferred + stats.restored);
         compiled_count = (size_t) stats.compiled;
     }
-#else
-    (void) runtime;
-#endif
     if (deferred != NULL) *deferred = deferred_count;
     if (compiled != NULL) *compiled = compiled_count;
 }

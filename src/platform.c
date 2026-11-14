@@ -3,6 +3,7 @@
 #include "tilefinch_test_faults.h"
 
 #include <errno.h>
+#include <stdarg.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,6 +20,29 @@
 #endif
 
 static TilefinchPlatformServices installed_services;
+
+int tilefinch_platform_file_printf(FILE *file, const char *format, ...)
+{
+    if (file == NULL || format == NULL) return -1;
+    char text[1024];
+    va_list arguments;
+    va_start(arguments, format);
+    int length = vsnprintf(text, sizeof(text), format, arguments);
+    va_end(arguments);
+    if (length < 0 || (size_t) length >= sizeof(text)) return -1;
+    return fwrite(text, 1, (size_t) length, file) == (size_t) length
+        ? length : -1;
+}
+
+void tilefinch_format_error(char *error, size_t error_size,
+                            const char *format, ...)
+{
+    if (error == NULL || error_size == 0) return;
+    va_list arguments;
+    va_start(arguments, format);
+    vsnprintf(error, error_size, format, arguments);
+    va_end(arguments);
+}
 /* Written by the owner thread only; other threads' checkpoints may read it
    (a frontend rejects them before looking at their flags). */
 static _Atomic unsigned render_shell_borrows;
@@ -361,6 +385,100 @@ bool tilefinch_platform_page_dialog(const TilefinchPageDialogRequest *request,
         || installed_services.page_dialog == NULL) return false;
     return installed_services.page_dialog(installed_services.context,
                                           request, response);
+}
+
+bool tilefinch_platform_media_capture_available(void)
+{
+    return installed_services.media_capture_start != NULL
+        && (installed_services.media_capture_available == NULL
+            || installed_services.media_capture_available(
+                   installed_services.context));
+}
+
+MediaCapturePermission tilefinch_platform_media_capture_permission(
+    const char *origin, bool *can_remember)
+{
+    if (can_remember != NULL) *can_remember = false;
+    if (origin == NULL || installed_services.media_capture_permission == NULL)
+        return MEDIA_CAPTURE_PERMISSION_PROMPT;
+    MediaCapturePermission permission =
+        installed_services.media_capture_permission(
+            installed_services.context, origin, can_remember);
+    return permission == MEDIA_CAPTURE_PERMISSION_GRANTED
+        || permission == MEDIA_CAPTURE_PERMISSION_DENIED
+        ? permission : MEDIA_CAPTURE_PERMISSION_PROMPT;
+}
+
+bool tilefinch_platform_media_capture_prompt(
+    const TilefinchMediaCapturePrompt *request,
+    MediaCapturePromptAnswer *answer)
+{
+    if (answer != NULL) *answer = MEDIA_CAPTURE_PROMPT_DISMISSED;
+    if (request == NULL || answer == NULL
+        || installed_services.media_capture_prompt == NULL) return false;
+    bool shown = installed_services.media_capture_prompt(
+        installed_services.context, request, answer);
+    if (!shown || (unsigned) *answer > (unsigned) MEDIA_CAPTURE_PROMPT_BLOCK
+        || (*answer == MEDIA_CAPTURE_PROMPT_ALLOW_ALWAYS
+            && !request->can_remember))
+        *answer = MEDIA_CAPTURE_PROMPT_DISMISSED;
+    return shown;
+}
+
+bool tilefinch_platform_media_capture_remember(
+    const char *origin, MediaCapturePermission permission)
+{
+    return origin != NULL
+        && installed_services.media_capture_remember != NULL
+        && installed_services.media_capture_remember(
+               installed_services.context, origin, permission);
+}
+
+MediaCaptureVerdict tilefinch_platform_media_capture_start(
+    MediaCaptureFormat *format)
+{
+    if (!tilefinch_platform_media_capture_available())
+        return MEDIA_CAPTURE_NO_DEVICE;
+    MediaCaptureVerdict verdict = installed_services.media_capture_start(
+        installed_services.context, format);
+    return verdict == MEDIA_CAPTURE_GRANTED || verdict == MEDIA_CAPTURE_BUSY
+        || verdict == MEDIA_CAPTURE_NO_DEVICE
+        ? verdict : MEDIA_CAPTURE_FAILED;
+}
+
+void tilefinch_platform_media_capture_stop(void)
+{
+    if (installed_services.media_capture_stop != NULL)
+        installed_services.media_capture_stop(installed_services.context);
+}
+
+uint32_t tilefinch_platform_media_capture_read_since(float *output,
+                                                    uint32_t count,
+                                                    uint32_t *cursor)
+{
+    if (output == NULL || cursor == NULL
+        || installed_services.media_capture_read_since == NULL) return 0;
+    return installed_services.media_capture_read_since(
+        installed_services.context, output, count, cursor);
+}
+
+bool tilefinch_platform_media_capture_failed(void)
+{
+    return installed_services.media_capture_failed != NULL
+        && installed_services.media_capture_failed(installed_services.context);
+}
+
+bool tilefinch_platform_media_capture_input_free(void)
+{
+    return installed_services.media_capture_input_free == NULL
+        || installed_services.media_capture_input_free(
+               installed_services.context);
+}
+
+bool tilefinch_platform_audio_output_private(void)
+{
+    return installed_services.audio_output_private != NULL
+        && installed_services.audio_output_private(installed_services.context);
 }
 
 void tilefinch_platform_log_message(const char *message)

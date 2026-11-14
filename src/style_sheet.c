@@ -9,6 +9,7 @@
 #include "style_cache_internal.h"
 #include "style_sparse_properties.h"
 
+#include <ctype.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -2402,16 +2403,6 @@ bool stylesheet_end_rule_batch(Stylesheet *sheet)
     return true;
 }
 
-bool stylesheet_build_viewport(Stylesheet *sheet, Budget *budget,
-                               const PocDocument *document,
-                               int viewport_width, int viewport_height)
-{
-    ViewportContext viewport;
-    if (!viewport_context_init(&viewport, viewport_width, viewport_height,
-                               viewport_width, viewport_height)) return false;
-    return stylesheet_build_context(sheet, budget, document, &viewport);
-}
-
 bool stylesheet_add_css(Stylesheet *sheet, const char *css, size_t length)
 {
     return stylesheet_add_css_from_context(
@@ -3011,7 +3002,60 @@ void stylesheet_note_style_source(Stylesheet *sheet,
     }
     sheet->style_source_first_order[sheet->style_source_count] =
         sheet->next_order;
+    sheet->style_source_revisions[sheet->style_source_count] = 0;
+    sheet->style_source_plain[sheet->style_source_count] = false;
     sheet->style_source_nodes[sheet->style_source_count++] = element;
+}
+
+static bool stylesheet_css_mentions(const char *css, size_t length,
+                                    const char *word)
+{
+    size_t word_length = strlen(word);
+    for (size_t i = 0; word_length <= length && i <= length - word_length;
+         i++) {
+        if (strncasecmp(css + i, word, word_length) == 0) return true;
+    }
+    return false;
+}
+
+bool stylesheet_constructed_text_plain(const char *css, size_t length)
+{
+    if (css == NULL || length == 0) return true;
+    static const char *const allowed[] = {
+        "media", "supports", "keyframes", "-webkit-keyframes"
+    };
+    for (size_t i = 0; i < length; i++) {
+        if (css[i] != '@') continue;
+        size_t end = i + 1;
+        while (end < length && (isalnum((unsigned char) css[end])
+                                || css[end] == '-' || css[end] == '_'))
+            end++;
+        size_t name_length = end - i - 1;
+        bool known = false;
+        for (size_t a = 0; !known && a < sizeof(allowed) / sizeof(allowed[0]);
+             a++)
+            known = strlen(allowed[a]) == name_length
+                && strncasecmp(css + i + 1, allowed[a], name_length) == 0;
+        if (!known) return false;
+        i = end - 1;
+    }
+    return !stylesheet_css_mentions(css, length, ":root")
+        && !stylesheet_css_mentions(css, length, "rtl")
+        && !stylesheet_css_mentions(css, length, "override");
+}
+
+bool stylesheet_constructed_sheet_plain(const lxb_dom_node_t *sheet)
+{
+    if (sheet == NULL) return false;
+    size_t length = 0;
+    const char *css = document_cssom_sheet_text(sheet, &length);
+    if (css == NULL) {
+        lxb_dom_node_t *child = sheet->first_child;
+        /* The builders parse a multi-child sheet as a <style> element. */
+        if (child != NULL && child->next != NULL) return false;
+        css = child == NULL ? NULL : document_text_data(child, &length);
+    }
+    return stylesheet_constructed_text_plain(css, length);
 }
 
 size_t stylesheet_style_source_count(const Stylesheet *sheet)
@@ -3027,12 +3071,6 @@ bool stylesheet_style_source_known(const Stylesheet *sheet,
         if (sheet->style_source_nodes[i] == element) return true;
     }
     return false;
-}
-
-const lxb_dom_node_t *stylesheet_last_style_source(const Stylesheet *sheet)
-{
-    if (sheet == NULL || sheet->style_source_count == 0) return NULL;
-    return sheet->style_source_nodes[sheet->style_source_count - 1];
 }
 
 /* Whether changing the class/id tokens `hashes` on some element can change
@@ -3724,21 +3762,26 @@ bool stylesheet_append_sources_tracked(
         if (new_sources != 0 && after_source < old_sources) {
             const lxb_dom_node_t *nodes[STYLE_SOURCE_NODE_LIMIT];
             unsigned firsts[STYLE_SOURCE_NODE_LIMIT];
+            uint32_t revisions[STYLE_SOURCE_NODE_LIMIT];
+            bool plain[STYLE_SOURCE_NODE_LIMIT];
             memcpy(nodes, sheet->style_source_nodes, sizeof(nodes));
             memcpy(firsts, sheet->style_source_first_order, sizeof(firsts));
+            memcpy(revisions, sheet->style_source_revisions, sizeof(revisions));
+            memcpy(plain, sheet->style_source_plain, sizeof(plain));
             size_t at = 0;
-            for (size_t s = 0; s < after_source; s++, at++) {
-                sheet->style_source_nodes[at] = nodes[s];
-                sheet->style_source_first_order[at] = firsts[s];
-            }
-            for (size_t s = old_sources; s < old_sources + new_sources; s++, at++) {
-                sheet->style_source_nodes[at] = nodes[s];
-                sheet->style_source_first_order[at] = firsts[s];
-            }
-            for (size_t s = after_source; s < old_sources; s++, at++) {
-                sheet->style_source_nodes[at] = nodes[s];
-                sheet->style_source_first_order[at] = firsts[s];
-            }
+#define STYLE_SOURCE_MOVE(s) do { \
+                sheet->style_source_nodes[at] = nodes[s]; \
+                sheet->style_source_first_order[at] = firsts[s]; \
+                sheet->style_source_revisions[at] = revisions[s]; \
+                sheet->style_source_plain[at] = plain[s]; \
+            } while (0)
+            for (size_t s = 0; s < after_source; s++, at++)
+                STYLE_SOURCE_MOVE(s);
+            for (size_t s = old_sources; s < old_sources + new_sources; s++, at++)
+                STYLE_SOURCE_MOVE(s);
+            for (size_t s = after_source; s < old_sources; s++, at++)
+                STYLE_SOURCE_MOVE(s);
+#undef STYLE_SOURCE_MOVE
         }
     }
     size_t order_span = (size_t) sheet->next_order;
@@ -4005,6 +4048,9 @@ bool stylesheet_remove_adopted_sources_tracked(
             taken += removed.end[r] - removed.begin[r];
         sheet->style_source_nodes[at] = sheet->style_source_nodes[base + k];
         sheet->style_source_first_order[at] = begin - taken;
+        sheet->style_source_revisions[at] =
+            sheet->style_source_revisions[base + k];
+        sheet->style_source_plain[at] = sheet->style_source_plain[base + k];
         at++;
     }
     sheet->style_source_count = at;
@@ -4187,6 +4233,12 @@ bool stylesheet_add_adopted_sheet(Stylesheet *sheet,
                                                        node, revision);
     if (own_batch && !stylesheet_end_rule_batch(sheet)) parsed = false;
     if (!parsed) return false;
+    for (size_t i = 0; i < sheet->style_source_count; i++) {
+        if (sheet->style_source_nodes[i] != node) continue;
+        sheet->style_source_revisions[i] = revision;
+        sheet->style_source_plain[i] = stylesheet_constructed_sheet_plain(node);
+        break;
+    }
     if (!known && stylesheet_style_source_known(sheet, node)
         && sheet->scopes.adopted_source_count < UINT8_MAX) {
         sheet->scopes.adopted_source_count++;
@@ -4217,15 +4269,7 @@ bool stylesheet_add_adopted_sheets(Stylesheet *sheet,
     return true;
 }
 
-static uint64_t stylesheet_signature_bytes(
-    uint64_t hash, const void *bytes, size_t length)
-{
-    const unsigned char *source = bytes;
-    for (size_t i = 0; i < length; i++) {
-        hash = (hash ^ source[i]) * UINT64_C(1099511628211);
-    }
-    return hash;
-}
+#define stylesheet_signature_bytes fnv1a64
 
 static uint64_t stylesheet_signature_container_queries(
     uint64_t hash, const Stylesheet *sheet)

@@ -98,7 +98,9 @@ segments), so a live instance does not hold its binary for its lifetime.
 Exported memory is aliased, not copied:
 `Memory.buffer` is an external `ArrayBuffer` over the interpreter's linear
 memory, refreshed at every wasm/JavaScript transition so growth (which moves
-the memory) detaches the stale buffer as the standard requires.
+the memory) detaches the stale buffer as the standard requires. Page script
+cannot detach that buffer itself: `transfer()`, `structuredClone` and
+`postMessage` transfer lists refuse it, as in other browsers.
 
 ## PSP ceilings
 

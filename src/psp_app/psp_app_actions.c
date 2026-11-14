@@ -1047,7 +1047,7 @@ static void psp_app_dispatch_heavy_action(
             bool removing = zip_install_preview(app->browser->offline_store.zip_install) != NULL
                 && zip_install_preview(app->browser->offline_store.zip_install)->removing;
             psp_ui_show_status(&app->process->presentation.ui,
-                removing ? "REMOVING HOMEBREW - O STOP" : "INSTALLING HOMEBREW - O CANCEL", 600);
+                removing ? "REMOVING HOMEBREW  O STOP" : "INSTALLING HOMEBREW  O CANCEL", 600);
             psp_work_cooperate_begin(&app->process->presentation.ui, engine_frame,
                 true, true, false, removing ? "STOPPING REMOVAL..." : "STOPPING INSTALLATION...", "zip-install", NULL, NULL);
             (void) psp_offline_store_install_prepared_zip(&app->browser->offline_store);
@@ -1066,9 +1066,16 @@ static void psp_app_dispatch_heavy_action(
         case PSP_UI_ACTION_CANCEL_ZIP_INSTALL:
             psp_offline_store_discard_zip(&app->browser->offline_store);
             break;
+        case PSP_UI_ACTION_STOP_MICROPHONE:
+            /* The page's tracks end with "ended" at its next task. */
+            tilefinch_media_capture_stop(MEDIA_CAPTURE_END_USER);
+            app->process->presentation.ui.microphone_live = false;
+            psp_ui_show_status(&app->process->presentation.ui,
+                               "MICROPHONE STOPPED", 150);
+            break;
         case PSP_UI_ACTION_SAVE_FOR_LATER: {
             psp_ui_show_status(
-                &app->process->presentation.ui, "SAVING ARTICLE - CIRCLE STOPS", 120);
+                &app->process->presentation.ui, "SAVING ARTICLE  O STOP", 120);
             psp_work_cooperate_begin(
                 &app->process->presentation.ui, engine_frame, true, true, false,
                 "STOPPING ARTICLE SAVE...", "offline-article", NULL, NULL);
@@ -1085,7 +1092,7 @@ static void psp_app_dispatch_heavy_action(
         }
         case PSP_UI_ACTION_INSTALL_OFFLINE_APP: {
             psp_ui_show_status(&app->process->presentation.ui,
-                               "PREPARING APP PREVIEW - CIRCLE STOPS", 120);
+                               "PREPARING APP PREVIEW  O STOP", 120);
             psp_work_cooperate_begin(
                 &app->process->presentation.ui, engine_frame, true, true,
                 false, "STOPPING APP PREVIEW...", "offline-app-preview",
@@ -1125,7 +1132,7 @@ static void psp_app_dispatch_heavy_action(
         }
         case PSP_UI_ACTION_CONFIRM_OFFLINE_APP: {
             psp_ui_show_status(&app->process->presentation.ui,
-                               "INSTALLING OFFLINE APP - CIRCLE STOPS", 120);
+                               "INSTALLING OFFLINE APP  O STOP", 120);
             psp_work_cooperate_begin(
                 &app->process->presentation.ui, engine_frame, true, true,
                 false, "STOPPING APP INSTALL...", "offline-app", NULL, NULL);
@@ -1188,7 +1195,7 @@ static void psp_app_dispatch_heavy_action(
                                     PSP_UI_COLLECTION_SAVED);
             if (!anyway) {
                 psp_ui_show_status(
-                    ui, "RECOMPILING OFFLINE APP - CIRCLE STOPS", 120);
+                    ui, "RECOMPILING OFFLINE APP  O STOP", 120);
                 psp_work_cooperate_begin(
                     ui, engine_frame, true, true, false,
                     "STOPPING RECOMPILE...", "offline-app-recompile",
@@ -1726,6 +1733,19 @@ static void psp_app_dispatch_heavy_action(
             psp_app_heavy_action(app, frame, intent);
             frame->page_dirty = true;
             break;
+        case PSP_UI_ACTION_SCRIPTS_OFF_ACCEPT:
+            /* As for the page-scripts notice: Cross on page media is Play. */
+            if (browser_engine_focus_on_page_media(engine)) {
+                psp_app_dispatch_activation(app, frame, false, engine_frame);
+                break;
+            }
+            psp_app_scripts_off_answer(app, frame, true);
+            frame->page_dirty = true;
+            break;
+        case PSP_UI_ACTION_SCRIPTS_OFF_DECLINE:
+            psp_app_scripts_off_answer(app, frame, false);
+            frame->page_dirty = true;
+            break;
         case PSP_UI_ACTION_CLOSE_DIAGNOSTIC_QR:
             psp_ui_set_diagnostic_qr(&app->process->presentation.ui, NULL);
             tilefinch_diagnostic_qr_destroy(app->process->diagnostic_qr);
@@ -1815,7 +1835,7 @@ static void psp_app_dispatch_heavy_action(
                         (uint64_t) sceKernelGetSystemTimeWide();
                     psp_ui_show_status(
                         &app->process->presentation.ui,
-                        "2 MIN VIDEO TEST - CIRCLE STOPS",
+                        "2 MIN VIDEO TEST  O STOP",
                         900);
                     printf(
                         "tilefinch-media-stability: event=queued "

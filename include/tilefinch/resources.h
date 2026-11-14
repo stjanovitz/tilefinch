@@ -992,8 +992,15 @@ bool images_priority_load_sources_current(ImagePriorityLoadJob *job);
    rebuilt layout around newly decoded pixels. */
 void images_priority_load_commit_progress(ImagePriorityLoadJob *job);
 size_t images_priority_load_target_count(const ImagePriorityLoadJob *job);
+/* Whether the last pump took a response off the network or decoded one:
+   work bounded by the batch's own pixels, not by the network. */
+bool images_priority_load_progressed(const ImagePriorityLoadJob *job);
 bool images_priority_load_contains_node(
     const ImagePriorityLoadJob *job, const lxb_dom_node_t *node);
+/* Whether the job's raster decode occupies the process-wide JPEG decoder:
+   submitted and not yet collected. A synchronous image load refuses while
+   it does (images_decode_worker_wait_cancelled). */
+bool images_priority_load_holds_decoder(const ImagePriorityLoadJob *job);
 void images_priority_load_destroy(ImagePriorityLoadJob *job);
 /* Stop the process-wide PSP JPEG worker before its owning Budget is torn
    down. Navigation cancellation itself never waits for the worker: a stale
@@ -1028,9 +1035,6 @@ const ImageResource *images_find_background_source(
 const ImageResource *images_find_mask_source(
     const ImageResources *images, const lxb_dom_node_t *node,
     const char *source, PseudoElement pseudo);
-const ImageResource *images_find_pseudo_mask(const ImageResources *images,
-                                             const lxb_dom_node_t *node,
-                                             PseudoElement pseudo);
 const ImageResource *images_find_pseudo_background(
     const ImageResources *images, const lxb_dom_node_t *node,
     PseudoElement pseudo);

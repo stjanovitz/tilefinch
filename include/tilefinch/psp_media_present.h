@@ -516,7 +516,6 @@ bool psp_media_present_dma_quarantine_refuses_staging(
     PspMediaDmaQuarantineState state);
 /* True while a transfer nobody joined is outstanding (LIVE or ABANDONED). */
 bool psp_media_present_ge_stage_dma_quarantined(void);
-bool psp_media_present_ge_stage_dma_quarantine_holds(int slot);
 bool psp_media_present_ge_stage_dma_quarantine_holds_staging(
     const void *destination);
 /* Poll the outstanding transfer once (never wait) and apply the step above.

@@ -198,6 +198,44 @@ bool page_find_build(PageFindIndex *index, Budget *budget,
     return true;
 }
 
+bool page_find_text_scan(const char *query, PageFindTextScan *scan,
+                         const char *text, size_t length)
+{
+    size_t query_length = query == NULL ? 0 : strlen(query);
+    if (query_length == 0 || query_length > PAGE_FIND_QUERY_LIMIT
+        || scan == NULL || text == NULL) return false;
+    uint8_t prefix[PAGE_FIND_QUERY_LIMIT] = {0};
+    for (size_t i = 1, matched = 0; i < query_length; i++) {
+        while (matched != 0 && find_fold((unsigned char) query[i])
+                                   != find_fold((unsigned char) query[matched]))
+            matched = prefix[matched - 1u];
+        if (find_fold((unsigned char) query[i])
+            == find_fold((unsigned char) query[matched])) matched++;
+        prefix[i] = (uint8_t) matched;
+    }
+    size_t matched = scan->matched < query_length ? scan->matched : 0;
+    for (size_t at = 0; at < length;) {
+        size_t consumed = 1;
+        bool is_space = find_space_at(
+            (const unsigned char *) text, length, at, &consumed);
+        unsigned char value = is_space ? ' '
+            : find_fold((unsigned char) text[at]);
+        at += consumed;
+        if (is_space && scan->previous_space) continue;
+        scan->previous_space = is_space;
+        while (matched != 0
+               && value != find_fold((unsigned char) query[matched]))
+            matched = prefix[matched - 1u];
+        if (value == find_fold((unsigned char) query[matched])) matched++;
+        if (matched == query_length) {
+            scan->matched = 0;
+            return true;
+        }
+    }
+    scan->matched = matched;
+    return false;
+}
+
 bool page_find_refresh_geometry(PageFindIndex *index,
                                 const LayoutDocument *layout)
 {

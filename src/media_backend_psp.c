@@ -1226,8 +1226,8 @@ static void psp_media_trace_take(uint64_t identity, int result)
 static int psp_media_me_boot_type = -1;
 static uint32_t psp_media_me_boot_resolved_nid;
 
-static void psp_media_error(char *error, size_t error_size,
-                            const char *format, ...);
+#define psp_media_error tilefinch_format_error
+
 static bool psp_media_validate_output_surface(
     PspMediaBackend *backend, unsigned write_slot,
     char *error, size_t error_size);
@@ -1994,16 +1994,6 @@ MediaPspPrepareResult media_psp_backend_prepare_pump(
     psp_media_modules_ready = true;
     psp_media_log("tilefinch-media-modules: stage=ready");
     return MEDIA_PSP_PREPARE_READY;
-}
-
-static void psp_media_error(char *error, size_t error_size,
-                            const char *format, ...)
-{
-    if (error == NULL || error_size == 0) return;
-    va_list arguments;
-    va_start(arguments, format);
-    vsnprintf(error, error_size, format, arguments);
-    va_end(arguments);
 }
 
 static uint64_t psp_media_timestamp_us(uint64_t value, uint32_t timescale)
@@ -3384,12 +3374,6 @@ void media_psp_backend_release_surface_quarantine(unsigned slot)
 {
     if (slot >= PSP_MEDIA_SURFACE_SLOTS) return;
     atomic_store(&psp_media_surface_quarantined[slot], 0);
-}
-
-bool media_psp_backend_surface_quarantined(unsigned slot)
-{
-    if (slot >= PSP_MEDIA_SURFACE_SLOTS) return false;
-    return atomic_load(&psp_media_surface_quarantined[slot]) != 0;
 }
 
 void media_psp_backend_release_surface(unsigned slot)
@@ -7887,13 +7871,6 @@ static void psp_media_presentation_release_quarantine(
     media_psp_backend_release_surface_quarantine(slot);
 }
 
-static bool psp_media_presentation_is_quarantined(
-    const void *opaque, unsigned slot)
-{
-    (void) opaque;
-    return media_psp_backend_surface_quarantined(slot);
-}
-
 static void psp_media_presentation_note_staged(
     void *opaque, const MediaVideoFrame *frame)
 {
@@ -7928,7 +7905,6 @@ static const MediaBackendPresentationOps psp_media_presentation_ops = {
     .end_auxiliary_read = psp_media_presentation_end_auxiliary_read,
     .quarantine = psp_media_presentation_quarantine,
     .release_quarantine = psp_media_presentation_release_quarantine,
-    .is_quarantined = psp_media_presentation_is_quarantined,
     .note_staged = psp_media_presentation_note_staged,
     .note_displayed = psp_media_presentation_note_displayed,
     .note_quiesced = psp_media_presentation_note_quiesced,

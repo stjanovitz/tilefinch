@@ -42,12 +42,9 @@ rm -rf "$work"
 mkdir -p "$work"
 mkdir -p "$work/data"
 cp "$root/tests/fixtures/ppsspp-pgo/profile.cfg" "$work/data/profile.cfg"
-# Let the transient large-page Stop shortcut expire before the first Cross.
-# Derive the journey rather than maintaining a second copy of its input route.
-awk '!waited && $0 == "wait-page 60" {
-    print "wait-page 1200"; waited = 1; next
-} { print }' "$root/tests/input-scripts/chatgpt-ask.txt" \
-    >"$work/data/input-script.txt"
+# The journey itself answers the heavy-page notice (Circle, Keep reading)
+# before its first Cross, with the Run preference too, so train on it as is.
+cp "$root/tests/input-scripts/chatgpt-ask.txt" "$work/data/input-script.txt"
 
 run() {  # run NAME RUNNER-ARGS...: one scripted run; keep its counters
     name=$1; shift

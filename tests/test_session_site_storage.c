@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #define CHECK(condition) do {                                                \
@@ -1097,11 +1098,127 @@ static int test_newer_and_foreign_logs_are_kept(void)
     return 0;
 }
 
-int main(void)
+static int test_retirement_unlink_refusal(unsigned action)
+{
+    for (unsigned failure = 1; failure <= 3; failure++) {
+        Budget budget; budget_init(&budget, 2u * MIB);
+        BrowserSession session;
+        CHECK(browser_session_init(&session, &budget, 32768)
+              && browser_session_site_storage_configure(&session, directory)
+              && browser_session_site_storage_set_policy(
+                     &session, game, BROWSER_SITE_STORAGE_STICK)
+              && browser_session_storage_set(&session, game, true, "keep", "value", 5));
+        char name[64], temporary[80], backup[80];
+        unsigned char bytes[256]; size_t length = 0;
+        CHECK(always_file(name, sizeof(name))
+              && read_log(name, bytes, sizeof(bytes), &length));
+        snprintf(temporary, sizeof(temporary), "%s.tmp", name);
+        snprintf(backup, sizeof(backup), "%s.bak", name);
+        CHECK(write_log(temporary, bytes, length) && write_log(backup, bytes, length));
+        tilefinch_test_faults()->fail_site_storage_remove_at = failure;
+        bool removed = action == 0 ? browser_session_site_storage_forget(&session, game)
+            : action == 1 ? browser_session_clear_site_data(&session, game)
+            : browser_session_storage_clear_all(&session, true);
+        CHECK(!removed && tilefinch_test_faults()->fail_site_storage_remove_at == 0);
+        /* A failed whole-site retirement must keep both the record and its
+           primary file usable. A localStorage clear has logged tombstones. */
+        CHECK(file_exists(name));
+        if (action != 2) {
+            const char *read = NULL; size_t size = 0;
+            CHECK(browser_session_storage_get(&session, game, true, "keep", &read, &size)
+                  && size == 5 && !memcmp(read, "value", 5));
+        } else {
+            /* Even before the retry, a restart must not recover the older
+               copy's values over the primary's committed removals. */
+            browser_session_destroy(&session);
+            CHECK(browser_session_init(&session, &budget, 32768)
+                  && browser_session_site_storage_configure(&session, directory)
+                  && browser_session_site_storage_set_policy(
+                         &session, game, BROWSER_SITE_STORAGE_STICK)
+                  && !browser_session_storage_get(&session, game, true, "keep", NULL, NULL));
+        }
+        CHECK(action == 0 ? browser_session_site_storage_forget(&session, game)
+            : action == 1 ? browser_session_clear_site_data(&session, game)
+            : browser_session_storage_clear_all(&session, true));
+        CHECK(!file_exists(name) && !file_exists(temporary) && !file_exists(backup));
+        browser_session_destroy(&session);
+        CHECK(browser_session_init(&session, &budget, 32768)
+              && browser_session_site_storage_configure(&session, directory)
+              && browser_session_site_storage_set_policy(
+                     &session, game, BROWSER_SITE_STORAGE_STICK)
+              && !browser_session_storage_get(&session, game, true, "keep", NULL, NULL)
+              && browser_session_site_storage_forget(&session, game));
+        browser_session_destroy(&session);
+        CHECK(budget.current == 0);
+    }
+    return 0;
+}
+
+static int test_session_cleanup_retry_marker(void)
+{
+    static const unsigned char data[] = "synthetic session data";
+    CHECK(write_log("s-00", data, sizeof(data))
+          && write_log("session-files", data, sizeof(data)));
+    tilefinch_test_faults()->fail_site_storage_remove_at = 1;
+    browser_site_storage_remove_session_files(directory);
+    CHECK(tilefinch_test_faults()->fail_site_storage_remove_at == 0
+          && file_exists("s-00") && file_exists("session-files"));
+    browser_site_storage_remove_session_files(directory);
+    CHECK(!file_exists("s-00") && !file_exists("session-files"));
+    return 0;
+}
+
+static int test_session_marker_admission(void)
+{
+    for (unsigned persistent = 0; persistent < 2; persistent++) {
+        Budget budget; budget_init(&budget, 2u * MIB);
+        BrowserSession session;
+        CHECK(browser_session_init(&session, &budget, 32768)
+              && browser_session_site_storage_configure(&session, directory)
+              && browser_session_storage_set(&session, game, true, "keep", "value", 5));
+        if (persistent)
+            CHECK(browser_session_site_storage_set_policy(
+                      &session, game, BROWSER_SITE_STORAGE_STICK));
+        char marker[256];
+        snprintf(marker, sizeof(marker), "%s/session-files", directory);
+        /* A real open failure, without changing permissions or host state. */
+        CHECK(mkdir(marker, 0700) == 0);
+        bool admitted = persistent ? browser_session_site_storage_set_policy(
+            &session, game, BROWSER_SITE_STORAGE_ASK)
+            : browser_session_site_storage_grant(&session, game, false);
+        CHECK(!admitted && !file_exists("s-00"));
+        BrowserSiteStorageInfo info;
+        const char *read = NULL; size_t length = 0;
+        CHECK(browser_session_site_storage_info_for(&session, game, &info)
+              && info.tier == (persistent ? BROWSER_SITE_STORAGE_STICK_ALWAYS
+                                         : BROWSER_SITE_STORAGE_MEMORY)
+              && browser_session_storage_get(&session, game, true, "keep", &read, &length)
+              && length == 5 && !memcmp(read, "value", 5));
+        CHECK(rmdir(marker) == 0);
+        CHECK(persistent ? browser_session_site_storage_set_policy(
+            &session, game, BROWSER_SITE_STORAGE_ASK)
+            : browser_session_site_storage_grant(&session, game, false));
+        CHECK(file_exists("session-files") && file_exists("s-00"));
+        browser_session_destroy(&session);
+        CHECK(budget.current == 0 && !file_exists("session-files") && !file_exists("s-00"));
+    }
+    return 0;
+}
+
+int main(int argc, char **argv)
 {
     snprintf(directory, sizeof(directory),
              "/tmp/tilefinch-site-storage-XXXXXX");
     if (mkdtemp(directory) == NULL) return 1;
+    if (argc == 2) {
+        int failed = !strcmp(argv[1], "forget-refusal") ? test_retirement_unlink_refusal(0)
+            : !strcmp(argv[1], "clear-site-refusal") ? test_retirement_unlink_refusal(1)
+            : !strcmp(argv[1], "clear-local-refusal") ? test_retirement_unlink_refusal(2)
+            : !strcmp(argv[1], "cleanup-marker") ? test_session_cleanup_retry_marker()
+            : !strcmp(argv[1], "marker-admission") ? test_session_marker_admission() : 1;
+        rmdir(directory);
+        return failed;
+    }
     int failed = test_per_site_allowances()
         || test_memory_storage_refusal_rollback()
         || test_background_growth()
@@ -1109,6 +1226,11 @@ int main(void)
         || test_decline_and_policies()
         || test_always_survives_reboot()
         || test_forget_and_clear()
+        || test_retirement_unlink_refusal(0)
+        || test_retirement_unlink_refusal(1)
+        || test_retirement_unlink_refusal(2)
+        || test_session_cleanup_retry_marker()
+        || test_session_marker_admission()
         || test_clear_scrubs_stick_values()
         || test_unflushed_append_is_refused()
         || test_newer_and_foreign_logs_are_kept()

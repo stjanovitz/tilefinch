@@ -85,4 +85,18 @@ void budget_quickjs_pool_report_classes(const BudgetQuickJSPool *pool,
 void budget_quickjs_pool_report_traffic(const BudgetQuickJSPool *pool,
                                         const char *label, FILE *output);
 
+/* Memory-study split of one realm's pool (TILEFINCH_MEMORY_DIAGNOSTICS
+   builds; walks the bounded free lists). */
+typedef struct {
+    size_t requested;      /* bytes QuickJS asked for, live blocks */
+    size_t live_blocks;
+    size_t live_capacity;  /* class capacity of the live blocks */
+    size_t cached_blocks;  /* blocks parked in the per-class free caches */
+    size_t cached_bytes;   /* their Budget charge, headers included */
+    size_t header_bytes;   /* pool + Budget headers of the live blocks */
+    size_t budget_bytes;   /* everything the pool holds in the Budget */
+} BudgetQuickJSPoolSplit;
+void budget_quickjs_pool_split(const BudgetQuickJSPool *pool,
+                               BudgetQuickJSPoolSplit *split);
+
 #endif

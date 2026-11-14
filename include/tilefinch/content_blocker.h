@@ -49,6 +49,12 @@ bool content_blocker_set_allowed_sites(
     ContentBlocker *blocker, const char *const *sites, size_t count);
 bool content_blocker_metrics(const ContentBlocker *blocker,
                              ContentBlockerMetrics *metrics);
+/* Whether BASIC also refuses third-party paywall and subscription SDK
+   hosts (Piano, Poool, Pelcro, LaterPay). Off when created; it survives
+   content_blocker_configure and does nothing in OFF or CUSTOM. */
+void content_blocker_set_paywall_scripts(ContentBlocker *blocker,
+                                         bool blocked);
+bool content_blocker_paywall_scripts(const ContentBlocker *blocker);
 
 /* Extracts the bounded registrable-site host used by the per-site allowlist.
    Raw Unicode/invalid URLs fail closed rather than creating ambiguous keys. */

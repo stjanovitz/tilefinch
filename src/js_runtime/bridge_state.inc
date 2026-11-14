@@ -1,7 +1,45 @@
+void js_rt_bridge_settle_pending_sheets(DomBridge *bridge)
+{
+    if (bridge == NULL || bridge->sheet_settle == NULL
+        || bridge->mutations_unrecorded || bridge->mutations == NULL)
+        return;
+    ScriptMutationJournal *journal = bridge->mutations;
+    if (!journal->stylesheet_rebuild_required || journal->overflowed
+        || journal->retirement_unobserved) return;
+    /* A refused change is not retried read by read: the walk that refused
+       it would only refuse again until the DOM changes. */
+    if (bridge->sheet_settle_refused
+        && bridge->sheet_settle_refused_version == bridge->dom_version)
+        return;
+    /* Navigation reports where the change it installs reaches
+       (js_rt_bridge_computed_style_drop_within) while it installs it. */
+    bridge->computed_style_cache.scope_reports = 0;
+    bridge->computed_style_cache.scope_whole = false;
+    unsigned split = script_split_enter(SCRIPT_SPLIT_LAYOUT);
+    bool settled = bridge->sheet_settle(bridge->sheet_settle_opaque);
+    script_split_leave(split);
+    bridge->sheet_settle_refused = !settled;
+    bridge->sheet_settle_refused_version = bridge->dom_version;
+    if (!settled) return;
+    /* The cascade holds the change now: the relayout keeps the sheet, and
+       no answer resolved against the old rules may stand. Navigation
+       queued the drops for where it reaches; without its report, all go. */
+    journal->stylesheet_rebuild_required = false;
+    for (size_t i = 0; i < journal->count; i++)
+        journal->records[i].sheet_settled = true;
+    bool scoped = bridge->computed_style_cache.scope_reports != 0
+        && !bridge->computed_style_cache.scope_whole;
+    uint64_t before = document_style_generation();
+    document_style_changed();
+    if (scoped) js_rt_bridge_computed_style_host_described(bridge, before);
+    else bridge->computed_style_cache.dirty_all = true;
+}
+
 bool js_rt_bridge_flush_synchronous_layout(DomBridge *bridge,
                                            lxb_dom_node_t *node)
 {
     if (bridge == NULL || bridge->synchronous_layout == NULL) return false;
+    js_rt_bridge_settle_pending_sheets(bridge);
     if (bridge->synchronous_layout_images_only) {
         size_t length = 0;
         const char *name = document_element_name(node, &length);
@@ -462,7 +500,9 @@ bool script_execution_policy_for_profile(
         policy->maximum_host_compile_source_bytes =
             SCRIPT_PSP_MAXIMUM_HOST_COMPILE_BYTES;
         /* News front pages carry 9-10 thousand elements and walk them
-           all; strict keeps the base table. */
+           all, and component pages keep tens of thousands of touched nodes
+           connected: the table grows as memory allows, up to the bound
+           the handle encoding needs. Strict keeps the base table. */
         policy->dom_handle_slot_capacity =
             SCRIPT_DOM_HANDLE_SLOT_CAPACITY_REALISTIC;
         return true;

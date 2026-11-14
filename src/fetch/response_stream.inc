@@ -1784,6 +1784,9 @@ struct FetchHopState {
     char referrer_policy[FETCH_REFERRER_POLICY_LIMIT];
     char *origin;
     char *fetch_site;
+    /* This hop's User-Agent, NULL for the shipping one. A top-level
+       navigation's hop takes its target's identity (site_identity.h). */
+    const char *user_agent;
     BrowserCookieOverlay *cookie_overlay;
     char *cookie_initiator;
     char *cookie_top_level;

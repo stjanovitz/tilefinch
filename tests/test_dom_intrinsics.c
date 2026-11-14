@@ -1150,6 +1150,34 @@ int main(int argc, char **argv)
         "if(Object.keys(svg.dataset).join()!=='kind'||svg.dataset.kind!=='icon')"
         "throw Error('svg dataset');"
         "globalThis.pocSummary='OK'})()");
+    /* A virtual scroller reads each cell's data-cell-index on every scroll
+       sync: the property-to-attribute name is computed once per name, not
+       per read, and every name still maps exactly as before, including
+       names past the memo's length and count bounds. */
+    ok &= run_case("dataset-name-mapping-computed-once",
+        "(()=>{const census=__tilefinchRootCensus;"
+        "const cells=[];for(let i=0;i<60;i++){const c=document.createElement('article');"
+        "c.setAttribute('data-cell-index',String(i));c.setAttribute('data-rendered','');"
+        "document.body.append(c);cells.push(c);}"
+        "const before=census.datasetNameMappings;let sum=0;"
+        "for(let pass=0;pass<3;pass++)for(const c of cells)"
+        "sum+=parseInt(c.dataset.cellIndex,10)+(c.dataset.rendered===''?1:0);"
+        "if(sum!==3*(1770+60))throw Error('values '+sum);"
+        "const spent=census.datasetNameMappings-before;"
+        "if(spent!==2)throw Error('name mappings per read: '+spent);"
+        "const e=document.createElement('div');document.body.append(e);"
+        "const expect=(key,attr)=>{if(attr===null){"
+        "let thrown=null;try{e.dataset[key]='v'}catch(x){thrown=x}"
+        "if(thrown?.name!=='SyntaxError')throw Error('accepted '+key);return;}"
+        "e.dataset[key]='v'+key.length;"
+        "if(e.getAttribute(attr)!=='v'+key.length||e.dataset[key]!=='v'+key.length)"
+        "throw Error('maps '+key+' to '+attr);e.removeAttribute(attr);};"
+        "for(let round=0;round<2;round++){"
+        "expect('cellIndex','data-cell-index');expect('x','data-x');"
+        "expect('aBC','data-a-b-c');expect('a-b',null);expect('a-B','data-a--b');"
+        "const long='k'.repeat(70)+'Q';expect(long,'data-'+'k'.repeat(70)+'-q');"
+        "for(let i=0;i<200;i++)expect('n'+i+'Z','data-n'+i+'-z');}"
+        "globalThis.pocSummary='OK'})()");
     /* A dataset write is an ordinary attribute write: removing or replacing
        the attribute afterwards leaves no stale value behind. */
     ok &= run_case("dataset-follows-attribute-changes",

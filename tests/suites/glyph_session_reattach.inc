@@ -510,7 +510,11 @@ static bool test_glyph_session_install_retirement(unsigned mode)
         CHECK(psp_glyph_component_session_pump_operation(&session, &paths, NULL));
     CHECK(session.install_snapshot.phase == (mode == 2u
           ? TILEFINCH_UPDATE_INSTALL_ERROR : TILEFINCH_UPDATE_INSTALL_CANCELLED));
-    CHECK(session.installer != NULL && session.reattach_pending);
+    if (budget.current != 0)
+        fprintf(stderr, "retired glyph installer retains %zu bytes\n", budget.current);
+    CHECK(session.installer == NULL && session.reattach_pending
+          && !session.auto_install && budget.current == 0
+          && budget_active_allocations(&budget, NULL) == 0);
     /* A failure gives its reason, once; a cancellation the user asked for is
        not a failure. */
     const char *reason = psp_glyph_component_session_take_failure(&session);
@@ -526,7 +530,7 @@ static bool test_glyph_session_install_retirement(unsigned mode)
     CHECK(session.attached_mask == bit && session.provider != NULL
           && !session.reattach_pending);
     /* Repeated terminal pumps cannot relatch restoration or erase the error. */
-    CHECK(psp_glyph_component_session_pump_operation(&session, &paths, NULL));
+    (void) psp_glyph_component_session_pump_operation(&session, &paths, NULL);
     CHECK(!session.reattach_pending && session.attached_mask == bit);
     psp_glyph_component_session_destroy(&session);
     psp_glyph_component_session_test_identity = NULL;

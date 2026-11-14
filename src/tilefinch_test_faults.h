@@ -81,6 +81,10 @@ typedef struct {
     bool refuse_next_image_load_setup;
     /* Report the image decoder busy (a worker decode in flight) while set. */
     bool image_decode_busy;
+    /* Withhold each finished worker decode from this many collects, as a
+       decode spanning several owner pumps on the PSP is; counts them. */
+    unsigned image_decode_collect_delay;
+    unsigned image_decode_collect_delayed;
     /* Hold the detached-image pump's sweep of dead slots while set, as
        when a node is released and its address reused before that pump. */
     bool defer_image_preload_sweep;
@@ -116,6 +120,8 @@ typedef struct {
     /* Fail the Nth record-header read (1-based) of the next site-storage
        log load as a read error, not a torn tail. Consumed once. */
     unsigned fail_site_storage_load_read_at;
+    /* Fail the Nth site-data retirement unlink, once, before touching disk. */
+    unsigned fail_site_storage_remove_at;
     /* Fail this many glyph-pack block reads as card read errors. */
     unsigned fail_glyph_block_reads;
     /* tilefinch_platform_replace_file: while set, rename refuses to
@@ -155,6 +161,11 @@ typedef struct {
        and body text inspected by the visible-content census. */
     unsigned long long css_statement_max_source_bytes;
     unsigned long long document_body_text_bytes_inspected;
+    /* While set, refuse every hand-over of a large <script> or <style>
+       body from the tokenizer buffer to its text node (Lexbor then copies
+       it, the reference the hand-over must reproduce); count those made. */
+    bool refuse_raw_text_adoption;
+    unsigned raw_text_adoptions;
     /* Host work observation: ancestor cascades run by the simplified-view
        image filter. Reset by the test. */
     unsigned long long reader_image_style_resolutions;

@@ -331,7 +331,7 @@ typedef struct {
     size_t classes_length;
     uintptr_t tag_id;
     /* The adopted sources whose carriers contain the element (see
-       style_adopted_scope_admits), found on first need. */
+       style_subject_adopted_scope), found on first need. */
     uint64_t adopted_scope;
     bool adopted_scope_known;
 } StyleMatchSubject;

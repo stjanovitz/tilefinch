@@ -484,7 +484,8 @@ static void bridge_mutation_journal_append(
     const uint32_t *changed_tokens, size_t changed_token_count,
     bool relational, uint64_t has_entries, uint32_t has_serial)
 {
-    ScriptMutationJournal *journal = &bridge->mutations;
+    ScriptMutationJournal *journal = js_rt_bridge_journal(bridge);
+    if (journal == NULL) return;
     if (has_serial != 0) {
         if (journal->has_serial == 0) journal->has_serial = has_serial;
         else if (journal->has_serial != has_serial)
@@ -497,6 +498,7 @@ static void bridge_mutation_journal_append(
             record->keeps_images =
                 record->keeps_images && bridge->mutation_keeps_images;
             record->relational |= relational;
+            record->sheet_settled = false;
             record->has_entries |= has_serial == 0 ? UINT64_MAX : has_entries;
             /* Coalescing the node/attribute must retain every dependency
                changed during this turn, not just the first write's tokens. */
@@ -559,6 +561,7 @@ static void bridge_mutation_journal_append(
     record->relational = relational;
     record->has_entries = has_serial == 0 ? UINT64_MAX : has_entries;
     record->inserted_from_detached = false;
+    record->sheet_settled = false;
     record->scope = NULL;
     record->removed_last = false;
     record->keeps_images = bridge->mutation_keeps_images;
@@ -660,6 +663,14 @@ static void bridge_mutated_summarized(
        first. Invalidating conservatively keeps the mutation fast and avoids a
        second subtree walk on the PSP hot path. */
     bridge->document_base_dirty = true;
+    /* A script-inserted <meta http-equiv="Content-Security-Policy"> in the
+       head applies from its insertion (a no-op unless a <meta> was
+       inserted since the document's last scan). */
+    if (kind != SCRIPT_MUTATION_ATTRIBUTE
+        && kind != SCRIPT_MUTATION_INLINE_STYLE
+        && kind != SCRIPT_MUTATION_CANVAS
+        && kind != SCRIPT_MUTATION_TEXT)
+        (void) document_apply_meta_csp(bridge->document, false);
     if (bridge->result != NULL) {
         bridge->result->dom_mutations++;
         bridge->result->relayout_required = true;
@@ -683,7 +694,6 @@ static void bridge_mutated_summarized(
         bridge->stats_mutations++;
     if (bridge->relayout_dirty != NULL) *bridge->relayout_dirty = true;
 
-    ScriptMutationJournal *journal = &bridge->mutations;
     if (kind == SCRIPT_MUTATION_INLINE_STYLE)
         bridge->mutation_keeps_images =
             !bridge_mutation_style_property_reaches_images(
@@ -903,7 +913,7 @@ static void bridge_mutated_summarized(
     if (refresh_meta) bridge->refresh_meta_mutated = true;
     /* identity_bounded and keeps_images rule the change out, and so does an
        attribute no selector tests that has no presentational effect. */
-    journal->image_reveal_possible |= node != NULL && !identity_bounded
+    bool image_reveal_possible = node != NULL && !identity_bounded
         && !keeps_images && kind != SCRIPT_MUTATION_TEXT
         && kind != SCRIPT_MUTATION_CANVAS && kind != SCRIPT_MUTATION_HEAD_SCRIPT
         && (kind != SCRIPT_MUTATION_ATTRIBUTE || attribute == NULL
@@ -917,24 +927,30 @@ static void bridge_mutated_summarized(
             || bridge_mutation_name_equal(attribute, attribute_length, "open")
             || stylesheet_selectors_reference_attribute_prefix(
                    bridge->stylesheet, attribute, attribute_length));
-    journal->resource_rebuild_required |= resource_rebuild;
-    journal->image_rebuild_required |= resource_rebuild && image_rebuild;
-    journal->stylesheet_rebuild_required |= resource_rebuild && stylesheet_cause;
-    journal->image_resource_scan_required |= image_resource_scan;
-    journal->image_resource_refresh_required |=
-        image_resource_refresh || descendant_image_sensitive;
-    journal->conservative_resource_scan |= conservative_scan;
     bool focus_marker = kind == SCRIPT_MUTATION_ATTRIBUTE
         && attribute != NULL
         && attribute_length == sizeof("data-tilefinch-focus") - 1
         && strncasecmp(
             attribute, "data-tilefinch-focus",
             sizeof("data-tilefinch-focus") - 1) == 0;
-    /* Focus has a dedicated ancestor-aware invalidator. Keep this aggregate
-       for unrelated records in the same author turn. */
-    if (!focus_marker) {
-        journal->relational_selector_sensitive |=
-            relational_selector_sensitive;
+    /* NULL when the journal was refused: the change goes unrecorded
+       (mutations_unrecorded), which its consumer reads as everything. */
+    ScriptMutationJournal *journal = bridge->mutations;
+    if (journal != NULL) {
+        journal->image_reveal_possible |= image_reveal_possible;
+        journal->resource_rebuild_required |= resource_rebuild;
+        journal->image_rebuild_required |= resource_rebuild && image_rebuild;
+        journal->stylesheet_rebuild_required |=
+            resource_rebuild && stylesheet_cause;
+        journal->image_resource_scan_required |= image_resource_scan;
+        journal->image_resource_refresh_required |=
+            image_resource_refresh || descendant_image_sensitive;
+        journal->conservative_resource_scan |= conservative_scan;
+        /* Focus has a dedicated ancestor-aware invalidator. Keep this
+           aggregate for unrelated records in the same author turn. */
+        if (!focus_marker)
+            journal->relational_selector_sensitive |=
+                relational_selector_sensitive;
     }
     if ((resource_rebuild || image_resource_scan || image_resource_refresh
          || conservative_scan)

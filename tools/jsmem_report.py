@@ -3,9 +3,15 @@
 "JavaScript heap composition").
 
   jsmem_report.py RUNROOT [PAGE...]
+  jsmem_report.py LOGFILE
 
 RUNROOT has one directory per page holding the lab's lab.log (stdout) and
-lab.err (stderr). For each page the census at the first refused allocation
+lab.err (stderr). A single LOGFILE (a PSP validation log with
+validation_js_heap_detail=1, or a lab stderr) is read as one page whose
+census lines and budget lines share the file. Compact censuses
+(`compact=1`: the PSP log, TILEFINCH_TRACE_JS_HEAP_DETAIL=compact) carry a
+kind=file-total row summing every script plus the eight largest; the
+script columns use the total. For each page the census at the first refused allocation
 (or, without one, the largest census) is split into MB columns: bytecode,
 line tables, retained source, atoms, strings, shapes, plain objects, DOM
 wrappers (instances of DOM prototypes), arrays, closures (function objects
@@ -42,9 +48,10 @@ def compose(c):
     malloc, limit, arenas, arena_alloc, cap, used, large = alloc[:7]
     gc = {r[1]: r[2] for r in rows if r[0] == 'gc'}
     files = [r for r in rows if r[0] == 'file']
-    bc = sum(f[2][1] + f[2][3] + f[2][9] for f in files)
-    pc2 = sum(f[2][4] for f in files)
-    src_own = sum(f[2][5] for f in files); src_sh = sum(f[2][6] for f in files)
+    totals = [r for r in rows if r[0] == 'file-total'] or files
+    bc = sum(f[2][1] + f[2][3] + f[2][9] for f in totals)
+    pc2 = sum(f[2][4] for f in totals)
+    src_own = sum(f[2][5] for f in totals); src_sh = sum(f[2][6] for f in totals)
     cls = collections.defaultdict(int)
     for k, n, v in rows:
         if k != 'class': continue
@@ -100,10 +107,15 @@ def pick(cens):
     return best, 'peak'
 
 def main():
-    root = sys.argv[1]; sites = sys.argv[2:] or sorted(os.listdir(root))
+    root = sys.argv[1]
+    if os.path.isfile(root):
+        pages = [(os.path.basename(root), root, root)]
+    else:
+        sites = sys.argv[2:] or sorted(os.listdir(root))
+        pages = [(s, os.path.join(root, s, 'lab.err'),
+                  os.path.join(root, s, 'lab.log')) for s in sites]
     table = []
-    for s in sites:
-        err = os.path.join(root, s, 'lab.err')
+    for s, err, logfile in pages:
         if not os.path.exists(err): continue
         cens = parse(err)
         # per realm: choose the realm with the largest pool
@@ -112,7 +124,8 @@ def main():
         comp, files, prot = compose(c)
         after = [x for x in cens if x['hdr']['reason'].endswith('aftergc') and x['hdr']['rt'] == c['hdr']['rt']]
         freed = (int(c['hdr']['pool-current']) - int(after[0]['hdr']['pool-current'])) if after else None
-        log = open(os.path.join(root, s, 'lab.log'), errors='replace').read()
+        log = open(logfile, errors='replace').read() if os.path.exists(logfile) else ''
+
         m = re.search(r'interactive teardown=.*?peak=(\d+)', log)
         jsp = re.search(r'memory-category name=javascript current=\d+ peak=(\d+)', log)
         ooms = log.count('InternalError: out of memory')

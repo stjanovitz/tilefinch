@@ -3,9 +3,10 @@
 This guide is for PSP owners. It covers everyday use beyond the basics in the
 [README](../README.md): tabs, bookmarks and history, typing, finding text,
 text size and page zoom, Reader mode and Basic view, saving and downloads, video and YouTube, language
-packs, games and page controls, screenshots, what happens when a page will
-not load, faster revisits, and the per-site controls. The button map is in
-the README's [Controls](../README.md#controls) table.
+packs, games and page controls, screenshots, reading a page while it loads,
+what happens when a page will not load, faster revisits, and the per-site
+controls. The button map is in the README's
+[Controls](../README.md#controls) table.
 
 Menu paths start from the menu that Select opens: **Menu → Page tools → Find
 in page** means press Select, choose **Page tools**, then **Find in page**.
@@ -171,7 +172,7 @@ shows its progress, speed, the remaining Memory Stick space, and a lasting
 failure reason; an interrupted download resumes from where it stopped instead
 of starting over. Square, then Square again, deletes an item.
 
-A completed homebrew ZIP offers **Details → Install homebrew…**, with a
+A completed homebrew ZIP offers **Details → Install homebrew?**, with a
 separate confirmation that shows where it will go. It installs one checked
 app folder under `PSP/GAME`, refuses folders that already exist and keeps the
 ZIP. Circle cancels and removes the current attempt's temporary files.
@@ -213,7 +214,10 @@ videos still show the player's normal explanation when opened.
   seeked.
 - A video still opening after about ten seconds says **Still loading**;
   Circle cancels it. If the player falls back to 240p, it says **Retrying at
-  240p**. A video that cannot play says why and what to try, with a short
+  240p**. A queue entry, track, rotation or close you choose while a video
+  opens waits until it has opened, and the loading panel says so (**Next
+  video after this opens**, **Track changes after this opens**). A video
+  that cannot play says why and what to try, with a short
   code underneath to quote in a bug report; see
   [A video won't play](../TROUBLESHOOTING.md#a-video-wont-play).
 
@@ -298,7 +302,11 @@ Search results, channel pages and feeds mark a live stream with a red
 scheduled stream or premiere with YouTube's **Upcoming** label and its start
 time. Selecting an upcoming stream opens its page rather than playing it.
 
-**Sign in** in the homepage header opens Google's sign-in page. Once signed
+**Sign in** in the homepage header opens Google's sign-in page. On that page
+Tilefinch names itself plainly as Tilefinch on a PSP, for which Google sends
+a lighter sign-in page that fits the PSP's memory. The page runs a security
+check before it accepts your account, so it takes noticeably longer than
+other pages to settle. Once signed
 in, recommendations replace the generic topics, and **Subscriptions** opens
 your subscription feed. A status line shows when suggestions are reloading.
 If you have moved down into the page, new results wait behind **Refresh
@@ -473,7 +481,11 @@ Language & emoji**:
   (**X Download pack**). The menu downloads at once, without the size
   question. After any install the selected language and color-emoji packs
   are attached again straight away, with no restart. If a download or install
-  fails, a notice gives the reason and the row offers **Try again**;
+  fails, a notice gives the reason and the row offers **Try again**. The
+  reason names the cause: the server's HTTP status (for example `HTTP 404`),
+  **NOT ENOUGH MEMORY FOR FONT PACK**, **FONT PACK FOLDER COULD NOT BE
+  CREATED** when the Memory Stick refuses the pack's folder, or **FONT PACK
+  INSTALL COULD NOT START**;
 - Square removes an installed pack;
 - **Offer language packs** turns the notice off (**Off**) or back on
   (**Ask**, the default);
@@ -504,7 +516,7 @@ as the primary face button.
   that cannot connect without a relay.
 
 Game authors should start with
-[Tilefinch Game Profile v1](GAME_PROFILE.md), the complete API,
+[Tilefinch Game Profile v1.1](GAME_PROFILE.md), the complete API,
 resource, lifecycle, packaging, and qualification contract, and then read the
 [WebGL guide](WEBGL.md) for renderer details.
 
@@ -548,6 +560,61 @@ message on, Square stops that page showing any more until it is loaded
 again. A page that keeps asking without you clicking or typing on it gets no
 more than three messages, and none while it is in the background.
 
+## Microphone
+
+A secure (HTTPS) page can ask to use the PSP's microphone (the one built
+into a PSP-3000 or PSP Go, or a headset microphone), for example to show
+how loud you are or to tune an instrument. Tilefinch asks first, in a box
+titled **Use your microphone?** under the address bar, with the site's
+address so you can tell which site is asking. Up and Down choose:
+
+- **Allow this time** lets the page listen until you leave it or reload it.
+- **Always allow on this site** lets the site listen on later visits
+  without asking.
+- **Block** refuses, and the site is not asked again.
+
+X chooses, and O cancels without remembering anything. X takes an Allow only
+once the box has been on screen for half a second, so a button pressed as it
+opens cannot allow by accident. A page that is not on screen never asks, a
+page whose question you cancelled asks again only after you click or type on
+it, and no more than three times per visit. A frame inside a page may ask
+only when the page lets it (`allow="microphone"`), and the box then names
+the page's site, which is the one that gets the answer.
+
+While a page listens, a red microphone shows at the top right of the screen,
+over the page, the menus and full screen alike; a page cannot cover or hide
+it.
+**Menu → Page tools → Stop microphone** stops listening (the row appears
+only while the microphone is on). Listening also stops when you leave or
+reload the page, close it, open the system keyboard or voice typing, open a
+video or audio in the player, change the site's answer, or put the PSP to
+sleep. What the microphone hears goes only to the page that asked;
+Tilefinch keeps no more than the last second of it in memory while it
+listens and never saves any of it to the Memory Stick.
+
+A page may also play what the microphone hears, for example as a karaoke or
+voice effect. You hear it only through headphones: with the PSP's own
+speaker the microphone would hear itself and howl, so Tilefinch keeps it
+silent there. Plug headphones in and the page's sound comes back at once;
+a level meter or tuner on the page works either way.
+
+**Permissions & controls → Microphone** shows what the site may do:
+**Ask**, **Allow** (always allowed) or **Block**. Cross changes it, and
+**Ask** forgets the site's answer. **Reset permissions** forgets it too.
+Tilefinch remembers the answers of up to 16 sites, and only the site's
+address and the answer; when that is full, **Always allow** is greyed out
+and **Block** refuses only this time.
+
+## While a page loads
+
+A page appears while it is still loading, as soon as its first screen has
+something to show, and the rest fills in as it arrives. When that first
+screen holds only a header whose pictures are still being drawn, with the
+first text further down, the bottom of the screen says **PREVIEW READY  R TO
+READ**: R pages down to the text while the page keeps loading. The note goes
+away once the screen shows text or a picture, when you press R or Circle,
+and when the page finishes loading or you go to another page.
+
 ## When a page will not load
 
 Tilefinch keeps the last usable page on screen and offers the recovery
@@ -574,8 +641,10 @@ time on top):
   articles do. Its scripts keep running in the background and you can read
   and scroll at once. A status says how much script the page runs and
   roughly how long it takes; while it shows, Cross stops the page's scripts
-  (Circle keeps reading). It comes back once more if the page runs low on
-  memory. Stopping scripts keeps the page as it is; if that leaves it blank
+  (Circle keeps reading). It comes back once more, as "Page scripts are
+  running low on memory", if the page's scripts have been refused memory
+  and little is left; a page that is merely near its limit but got
+  everything it asked for is not warned. Stopping scripts keeps the page as it is; if that leaves it blank
   or without links, **Basic view fallback** takes over as usual. If the
   scripts run out of memory and wipe the page as they fail, Tilefinch puts
   back the page the site sent, stops its scripts and says "Page scripts
@@ -596,6 +665,21 @@ time on top):
   **Try Reader mode**, turning off JavaScript for the site, or going back.
   On a page that already shows its content, a status says a large page
   script was skipped and you keep reading.
+
+When a page's scripts stop because they ran out of memory, Tilefinch
+remembers the site (only its name, for the last 8 such sites) while **URL
+history** is on; turning history off forgets these notes, and removing a page
+from history forgets its site's note. The next page
+you open on that site says "This page ran out of script memory last time"
+and asks **Load without scripts?**: Cross turns off JavaScript for the site
+and reloads the page, which then opens as the server sent it, much faster
+and in far less memory; Circle keeps scripts on and forgets the note until
+it happens again. An offer you let pass without an answer (it runs out, or
+you go on to another page) is not shown for that site again until the browser
+restarts. Tilefinch never turns scripts off by itself. **Menu → Page
+tools → Site information → Permissions & controls → JavaScript** turns them
+back on, and **Reset permissions** in
+**Site information** forgets the note.
 
 **Menu → Settings → Browsing & input → Heavy pages** chooses **Ask** (the
 default, as above), **Run** (never ask; scripts still show their status) or
@@ -623,7 +707,9 @@ space (at most 8 MB, shown on the row while it is on) and writes to the
 stick while you read a page. **Clear compiled scripts** below it empties
 it, and turning the option off removes its files. **Clear HTTP caches**
 empties it too, and **Clear data for this site** removes that site's
-compiled scripts. If a site misbehaves after it updates, clear the compiled
+compiled scripts. [Memory Stick storage](STORAGE.md#keep-compiled-scripts-persistent-tier-off-by-default)
+explains what it keeps, how each entry is checked before use, and why it is
+off by default. If a site misbehaves after it updates, clear the compiled
 scripts or turn the option off
 ([Troubleshooting](../TROUBLESHOOTING.md#a-site-misbehaves-after-it-updates)).
 
@@ -644,11 +730,14 @@ that cannot change on the current page says why when you press Cross.
 - **Ad blocking.** Basic blocking and conservative cosmetic hiding are on by
   default. Basic refuses third-party ad hosts and the scripts of tag managers
   (such as Google Tag Manager) and A/B testing services (such as Optimizely),
-  which are large and slow pages down while they load. Paywall SDKs (such as
-  Piano) load as the site sends them. **Menu → Settings → Privacy & security → Content blocker** chooses
-  Off, Basic, or Custom, and **Hide page ads** controls only the cosmetic
-  hiding. **Permissions & controls → Content blocking** turns both off for
-  the current site. Basic reads no list from the Memory Stick; Custom reads
+  which are large and slow pages down while they load. **Menu → Settings →
+  Privacy & security → Content blocker** chooses Off, Basic, or Custom,
+  **Hide page ads** controls only the cosmetic hiding, and **Paywall scripts
+  → Block** makes Basic refuse paywall and subscription SDKs (such as Piano)
+  too; they are allowed by default. **Permissions & controls → Content
+  blocking** turns blocking off for the current site, and **Blocked here**
+  shows how many requests were blocked while the page loaded. Basic reads
+  no list from the Memory Stick; Custom reads
   `data/adblock.txt`, and **Load allowlist** imports extra site exceptions
   from `data/adblock-allow.txt`, up to 32 sites in all.
   [The content-blocking reference](CONTENT_BLOCKING.md) lists the built-in
@@ -661,3 +750,5 @@ that cannot change on the current page says why when you press Cross.
   on this secure site plays over plain HTTP; **Allow** and **Block** answer
   for it. The choice covers only this site's audio and lasts until you exit
   Tilefinch ([Page audio and internet radio](#page-audio-and-internet-radio)).
+- **Microphone.** **Ask** (the default), **Allow** or **Block** for the
+  site's microphone requests; see [Microphone](#microphone).

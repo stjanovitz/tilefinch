@@ -6,6 +6,8 @@
 #include "tilefinch/build_version.h"
 #include "tilefinch/glyph_component_store.h"
 #include "tilefinch/ui_language.h"
+#include "tilefinch/media_capture.h"
+#include "tilefinch/platform.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -14,6 +16,26 @@
 
 #define PREVIEW_WIDTH 480
 #define PREVIEW_HEIGHT 272
+
+/* The microphone stills: a session the preview opens itself, so the real
+   indicator path draws. */
+static MediaCaptureVerdict preview_capture_start(void *context,
+                                                 MediaCaptureFormat *format)
+{
+    (void) context;
+    (void) format;
+    return MEDIA_CAPTURE_GRANTED;
+}
+
+static void preview_capture_live(void)
+{
+    static const TilefinchPlatformServices services = {
+        .media_capture_start = preview_capture_start
+    };
+    tilefinch_platform_set_services(&services);
+    uint32_t generation = 0;
+    (void) media_capture_session_open(&generation, NULL);
+}
 
 static uint16_t preview_rgb565(unsigned red, unsigned green, unsigned blue)
 {
@@ -167,7 +189,7 @@ int main(int argc, char **argv)
     psp_ui_set_text_budget(&font_budget);
     /*
      * The boot entrance's keyframes, so the choreography is reviewable as
-     * stills: mark-centred (frame one), wave-up, mid-glide, and the
+     * stills: mark-centred (frame one), mid-glide, settled, and the
      * slow-branch state that holds the mark and shows one muted line.
      * Fonts are loaded first because the glide keyframe draws real HOME.
      */
@@ -202,7 +224,7 @@ int main(int argc, char **argv)
            wifi bars -- the absent state, captured alongside the rest. */
         psp_ui_set_device_status(14, 8, 62, false, false, -1);
         PspUiBootEntranceView view = {
-            .frame = 0, .wave = true, .branch_status = NULL
+            .frame = 0, .branch_status = NULL
         };
         if (strncmp(mode, "boot-entrance-", 14) == 0) {
             char *end = NULL;
@@ -211,8 +233,7 @@ int main(int argc, char **argv)
                 && numbered <= PSP_UI_BOOT_ENTRANCE_FRAMES)
                 view.frame = (unsigned) numbered;
         }
-        if (strcmp(mode, "boot-entrance-wave") == 0) view.frame = 7;
-        else if (strcmp(mode, "boot-entrance-glide") == 0) view.frame = 13;
+        if (strcmp(mode, "boot-entrance-glide") == 0) view.frame = 13;
         else if (strcmp(mode, "boot-entrance-settled") == 0)
             view.frame = PSP_UI_BOOT_ENTRANCE_FRAMES;
         else if (strcmp(mode, "boot-entrance-slow") == 0)
@@ -533,6 +554,39 @@ int main(int argc, char **argv)
         ui.screen = PSP_UI_SCREEN_PAGE_TOOLS;
         ui.menu_selection = 5;
         ui.reader_mode = true;
+        ui.toast_frames = 0;
+    } else if (strcmp(mode, "microphone-prompt") == 0
+               || strcmp(mode, "microphone-prompt-full") == 0) {
+        static PspUiMicrophonePromptView microphone = {
+            .host = "tuner.example.com", .can_remember = true
+        };
+        psp_ui_set_page(&ui, "Guitar tuner", "https://tuner.example.com/",
+                        true);
+        microphone.can_remember = strcmp(mode, "microphone-prompt") == 0;
+        microphone.selection = microphone.can_remember ? 0u : 2u;
+        ui.toast_frames = 0;
+        psp_ui_show_microphone_prompt(&ui, &microphone);
+    } else if (strcmp(mode, "microphone-live") == 0
+               || strcmp(mode, "microphone-live-fullscreen") == 0) {
+        psp_ui_set_page(&ui, "Guitar tuner", "https://tuner.example.com/",
+                        true);
+        ui.toast_frames = 0;
+        if (strcmp(mode, "microphone-live-fullscreen") == 0) {
+            ui.chrome_visible = false;
+            ui.page_fullscreen = true;
+        }
+        preview_capture_live();
+    } else if (strcmp(mode, "page-tools-microphone") == 0) {
+        ui.screen = PSP_UI_SCREEN_PAGE_TOOLS;
+        ui.microphone_live = true;
+        ui.menu_selection = 9;
+        ui.toast_frames = 0;
+        preview_capture_live();
+    } else if (strcmp(mode, "site-controls-microphone") == 0) {
+        ui.screen = PSP_UI_SCREEN_SITE_CONTROLS;
+        ui.menu_selection = 7;
+        ui.microphone_site_answer = MEDIA_CAPTURE_PERMISSION_GRANTED;
+        ui.site_javascript_enabled = true;
         ui.toast_frames = 0;
     } else if (strcmp(mode, "site-controls") == 0) {
         ui.screen = PSP_UI_SCREEN_SITE_CONTROLS;

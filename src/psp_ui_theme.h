@@ -85,13 +85,4 @@
 #define PSP_THEME_MOTION_TOAST_FRAMES  5
 #define PSP_THEME_MOTION_FOCUS_FRAMES  3
 
-/* Ambient wave (home surface only): a pre-rendered 320px-wide tileable
-   band scrolled by source offset. Advances on a fixed-point accumulator
-   at WAVE_FPS; pauses after WAVE_IDLE_S of no input and whenever the
-   power policy has stepped the clock down. Off when the profile option
-   is off. */
-#define PSP_THEME_WAVE_FPS            20
-#define PSP_THEME_WAVE_BAND_WIDTH    320
-#define PSP_THEME_WAVE_IDLE_SECONDS   30
-
 #endif

@@ -241,19 +241,56 @@ int main(void)
     }
     CHECK(policy.empty_wait_elements == PREVIEW_POLICY_EMPTY_ELEMENTS_LIMIT);
     /* An empty attempt that covered the first screen (it reached its
-       limit) waits for the body to double, however many elements. */
+       limit) is laid out again at the refresh depth at once, with no new
+       input and after earlier empty attempts: content past the cut can
+       paint into the first screen (cnn.com's positioned headline). */
     preview_policy_init(&policy);
     in = input_at(100000, 60, 0);
     d = preview_policy_decide(&policy, &in);
+    CHECK(d.action == PREVIEW_ACTION_FIRST && d.limit_y == BASE && d.deepens);
+    preview_policy_note_check(&policy, &d);
+    preview_policy_attempt_started(&policy, &d, in.parsed_bytes);
+    preview_policy_empty(&policy, &d, in.closed_content_elements, false);
+    in.closed_content_elements += PREVIEW_POLICY_EMPTY_ELEMENTS;
+    d = preview_policy_decide(&policy, &in);
+    CHECK(d.action == PREVIEW_ACTION_FIRST && d.limit_y == BASE);
     preview_policy_note_check(&policy, &d);
     preview_policy_attempt_started(&policy, &d, in.parsed_bytes);
     preview_policy_empty(&policy, &d, in.closed_content_elements, true);
+    CHECK(policy.deep_first && policy.empty_attempts == 1);
+    policy.checks = PREVIEW_POLICY_CHECK_LIMIT;
+    d = preview_policy_decide(&policy, &in);
+    CHECK(d.action == PREVIEW_ACTION_FIRST && d.fresh && !d.deepens
+          && d.limit_y == 3 * VIEWPORT);
+    preview_policy_note_check(&policy, &d);
+    preview_policy_attempt_started(&policy, &d, in.parsed_bytes);
+    /* Covered and empty at that depth too: it waits for the body to
+       double, however many elements, and stays that deep. */
+    preview_policy_empty(&policy, &d, in.closed_content_elements, true);
+    CHECK(policy.empty_attempts == 2 && !policy.deep_retry);
     in.closed_content_elements += PREVIEW_POLICY_EMPTY_ELEMENTS_LIMIT - 1;
     in.parsed_bytes = 2 * 100000 - 1;
     d = preview_policy_decide(&policy, &in);
     CHECK(d.action == PREVIEW_ACTION_NONE && strcmp(d.reason, "empty") == 0);
     in.parsed_bytes += 1;
-    CHECK(preview_policy_decide(&policy, &in).action == PREVIEW_ACTION_FIRST);
+    d = preview_policy_decide(&policy, &in);
+    CHECK(d.action == PREVIEW_ACTION_FIRST && d.limit_y == 3 * VIEWPORT);
+    /* A deeper first attempt that paints settles as before. */
+    (void) attempt(&policy, &in, 3 * VIEWPORT, true, true);
+    CHECK(policy.phase == PREVIEW_PHASE_SETTLED);
+    /* A covered first screen whose base depth is already the refresh
+       depth is not laid out again. */
+    preview_policy_init(&policy);
+    in = input_at(100000, 60, 0);
+    in.base_limit_y = 3 * VIEWPORT;
+    d = preview_policy_decide(&policy, &in);
+    CHECK(d.action == PREVIEW_ACTION_FIRST && !d.deepens);
+    preview_policy_note_check(&policy, &d);
+    preview_policy_attempt_started(&policy, &d, in.parsed_bytes);
+    preview_policy_empty(&policy, &d, in.closed_content_elements, true);
+    CHECK(!policy.deep_first && policy.empty_attempts == 1);
+    d = preview_policy_decide(&policy, &in);
+    CHECK(d.action == PREVIEW_ACTION_NONE && strcmp(d.reason, "empty") == 0);
     /* An empty extension is an ordinary failure (no first-screen wait). */
     preview_policy_init(&policy);
     in = input_at(10000, 60, 0);

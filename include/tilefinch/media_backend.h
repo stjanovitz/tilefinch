@@ -535,7 +535,6 @@ typedef struct {
     void (*end_auxiliary_read)(void *opaque, unsigned slot);
     void (*quarantine)(void *opaque, unsigned slot);
     void (*release_quarantine)(void *opaque, unsigned slot);
-    bool (*is_quarantined)(const void *opaque, unsigned slot);
     void (*note_staged)(void *opaque, const MediaVideoFrame *frame);
     void (*note_displayed)(
         void *opaque, const MediaVideoFrame *frame, int present_path);
@@ -888,8 +887,6 @@ void media_playback_quarantine_video_slot(
     MediaPlayback *playback, unsigned slot);
 void media_playback_release_video_slot_quarantine(
     MediaPlayback *playback, unsigned slot);
-bool media_playback_video_slot_quarantined(
-    const MediaPlayback *playback, unsigned slot);
 void media_playback_note_frame_staged(
     MediaPlayback *playback, const MediaVideoFrame *frame);
 void media_playback_note_frame_displayed(
@@ -932,18 +929,6 @@ uint64_t media_playback_buffered_until_us(const MediaPlayback *playback);
  * leaves the connection to be made on the playing path as before.
  */
 bool media_playback_warm_video(MediaPlayback *playback, uint64_t target_us,
-                               char *error, size_t error_size);
-/*
- * The same for the adaptive audio source, at the position the seek left it.
- *
- * A seek that warmed only video left the audio window at a far offset to be
- * fetched on a connection whose burst allowance was spent: a device soak
- * measured it moving 16 KiB in six seconds, which held video back to keep the
- * interleave and ended the session. Audio is a tenth of video's bitrate and
- * its window is the one playback needs first. False for a progressive MP4,
- * which has no second source and whose audio was warmed with the video.
- */
-bool media_playback_warm_audio(MediaPlayback *playback, uint64_t target_us,
                                char *error, size_t error_size);
 typedef enum {
     MEDIA_PLAYBACK_SOURCE_PRIME_PENDING = 0,
@@ -1258,7 +1243,6 @@ void media_psp_backend_release_refusal_hold(void);
  */
 void media_psp_backend_quarantine_surface(unsigned slot);
 void media_psp_backend_release_surface_quarantine(unsigned slot);
-bool media_psp_backend_surface_quarantined(unsigned slot);
 /*
  * What is left of the calling pump's window, so a collect wait cannot outlast
  * the dead time that justified it. Zero restores the wait's own bound.

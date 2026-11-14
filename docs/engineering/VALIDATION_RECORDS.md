@@ -238,6 +238,47 @@ wall-paced replay (`trace_replay_pump_us`) rather than changing the recorded
 response delay by pumping faster; pump-paced captures cannot measure live
 network latency.
 
+## Memory make-up
+
+These records say what the page's memory is made of. A PSP validation log
+prints them at `pre-interaction` and `controlled-exit`, and the host lab
+prints them with the `memory-report [PHASE]` command
+([Lab usage](LAB_USAGE.md)). The code is in
+`src/browser_engine/memory_report.inc` and `src/psp_heap_reserve.c`, under
+`TILEFINCH_MEMORY_DIAGNOSTICS` (`include/tilefinch/budget.h`), which a
+shipping PSP build does not define.
+
+| Record | What it splits |
+|---|---|
+| `tilefinch-heap-commit` | PSP only. The newlib heap: `heap` (its size), `arena` (committed by `sbrk`), `in-use` and `arena-free` (mallinfo), `uncommitted`, `real-free` (uncommitted plus arena-free), `budget-current`, `budget-peak`, `non-budget` (in-use less budget-current: libc, PSPSDK, thread stacks, chunk overhead) and `system-free` (`sceKernelTotalFreeMemSize`). `phase=peak` is the sample with the most bytes in use, taken each time the Budget's global peak rises by 256 KiB. |
+| `tilefinch-budget-at-peak` | Each Budget category at the instant of the global peak. `sum` equals `peak`. |
+| `tilefinch-js-budget-split` | The JavaScript category, over every live realm: QuickJS pool (`heap-requested` + `pool-headers` + `pool-slack` + `pool-cache` = `pool-total`; `pool-check` is the pool ledger less those parts, 0 when they agree), the function-source store (plain and compressed), EventSource/WebSocket/loader buffers (`net-buffers`), the deferred classic bytecode queue (`classic-queue=count/source/array`), the `ScriptRuntime` structures and the DOM handle tables. Fetch and XHR response bodies are resource, not JavaScript. |
+| `tilefinch-dom-split` | The DOM category: the top document's node and text arenas (`bytes/used/chunks`), Lexbor's name hashes, Lexbor's own objects (document, parser, tokenizer, tree builder), body text and side tables, frame documents (`count/bytes`) and the memory-rescue copy. Each arena's figure includes its free-block tree, a fixed cost per arena. `script-text`, `style-text`, `other-text`, `comments` and `attr-values` divide the text arena's used bytes (`bytes/nodes/largest`); `tokenizer-hw` is the largest tokenizer buffer this process has held. A script or style of 64 KiB or more gives that buffer to its node as the node's text, so its high water is not a second copy of that text. |
+| `tilefinch-resource-split` | The resource category: decoded image pixels, session-cache leases, canvases, encoded images, render-cache decoded images, stylesheet bodies the page pins, web fonts, the application fonts, HTTP cache bodies, and the curl pool (`limit/current/peak`; its limit is reserved whole). A body shared by several owners counts once (`dedupe` is the pointer set's size). `fetch-reserved` is the scheduler's logical reservation, not an allocation. |
+| `tilefinch-session-split` | The session category: fixed tables, bytecode caches by kind and their tables, cookies, site storage, cache-entry metadata, shared-body headers and the disk queue. |
+| `tilefinch-render-split` | The render category: the framebuffer, the provisional frame, tiles (`bytes/count`, of which `reserved-tiles` are the base slots and `paint-ahead` the rest), tile tables, glyph pixels, scaled images, the overflow cache and the fixed layer. |
+| `tilefinch-frame-realm` | One line for the top document and one per live child frame: `origin-hash` (FNV-1a of `scheme://host`; the log names no page), `realm=own`, `page` (runs in the page's realm) or `none`, `heap-after-bootstrap` (pool bytes once the bootstrap ran), `heap-now`, `heap-limit`, `budget-javascript-bytes` (what the realm holds in the JavaScript category: pool, source store, buffers, handle tables and the runtime structure), `budget-after-bootstrap` (pool plus source store once the bootstrap ran), `document-dom-bytes`. `tilefinch-frame-realms` totals the child realms and repeats the navigation's frame counts. |
+| `tilefinch-frame-lite` | Frame memory counters since boot: `lazy_realm` (the validation-only boot key `frame_lite_lazy_realm`, host `TILEFINCH_FRAME_LITE_LAZY_REALM`: a child document nothing in which can run script or take a press commits without a realm; presses into it are not delivered), `realms-skipped`, `realms-created` and `realm-create-us` (child realms and the time creating them took), `pool-trims=count/bytes` (child-realm allocator trims), `handle-growths=count/total-us/max-us` (DOM handle table doublings in every realm), `hidden-snapshots-skipped` (frame snapshots laid out without pixels because the element had no box) and `mutation-journals` (journals allocated, one per realm that mutated its document). |
+
+Every split line ends with `remainder`: the category less every named part,
+clamped at 0, so a large remainder is unexplained memory and a part that
+grows past its category shows up as a remainder of 0 with the named parts
+summing above the category. Every figure is a Budget charge (allocation
+header included) unless the field says otherwise. The server-rendered body
+snapshot exists only while a document streams, so no report sees it.
+
+The JavaScript heap census (`jsmem-census`/`jsmem-row`, see
+[Development](../DEVELOPMENT.md)) joins the report with boot key
+`validation_js_heap_detail=1` (default 0): one compact census per live realm
+at `controlled-exit` and at every input-script mark. Script names stop at
+`?` or `#` on the PSP. `tools/jsmem_report.py LOG` reads a PSP log or a lab
+stderr file directly. On the host, `TILEFINCH_TRACE_JS_HEAP_DETAIL` makes
+`memory-report` take the same census.
+
+The census tables cost about 80 KiB of validation-image BSS on the PSP
+(`JSMD_*` sizes in `third_party/quickjs/quickjs.c`), and the report keeps a
+2048-entry pointer set; neither exists in a shipping image.
+
 ## Where a frame's time goes
 
 Validation builds also print one `tilefinch-loop-work` record per
@@ -466,6 +507,45 @@ recorded-frame workload separately, with output muted but mixing active.
 `audio-auto-probe` is the same comparison for the native automation path
 (gain and pan curves), and `audio-auto-off` / `audio-auto-on` select that path
 in validation builds.
+
+`audio-program-probe` (input script `webaudio-program-probe`) covers the Web
+Audio program voices. It logs `tilefinch-audio-scenario:` with the left-channel
+RMS of each 2048-frame window for four fixed renders: a beep (880 Hz sine,
+linear attack, exponential decay), a createBuffer noise burst with a
+`setTargetAtTime` release, a sawtooth under a swept Q 8 lowpass, and four
+ramped, filtered oscillators. `tilefinch-game-audio-program-tests` prints the
+same envelopes on the host (and writes WAVs when `TILEFINCH_GAME_AUDIO_WAV_DIR`
+is set); the two must match. It then logs `tilefinch-audio-program-run:` for
+six alternating 256-block runs: four program voices (gain ramp plus swept
+lowpass each) against four integer-path oscillators. PPSSPP reports no thread
+CPU, so compare `mix-wall` there; on a PSP use `mix-cpu`.
+
+A PPSSPP run at a fixed clock on 2026-11-13: envelopes identical to the
+host. Per 512-frame block (11.6 ms of audio), four program voices took
+1,041 us at 333 MHz and 1,571 us at 222 MHz; four integer oscillators took
+266 us and 404 us. The program path costs about 3.9 times the integer path,
+about 9 % of the CPU at 333 MHz. PPSSPP timing is an instruction-count proxy,
+not a device measurement.
+
+`audio-fft-probe` (input script `webaudio-fft-probe`) covers microphone
+stream voices and AnalyserNodes without opening the microphone: it feeds a
+stream voice synthetic samples. It logs `tilefinch-audio-fft-probe:`, then
+`tilefinch-audio-analyser-run:` for six alternating 256-block runs of a
+stream voice and a 1 kHz oscillator, each tapped by its own analyser, against
+the same two voices without analysers. Then it logs
+`tilefinch-audio-analyser-fft:` with the time of one `getFloatFrequencyData`
+computation (the mean of 32) at `fftSize` 256, 1024 and 2048, and the loudest
+bin, which must be 6, 23 and 46.
+
+A PPSSPP run at a fixed clock on 2026-11-13: peak bins 6, 23 and 46 at
+both clocks. Per 512-frame block (11.6 ms of audio), the two voices took
+about 357 us with analysers and 283 us without at 333 MHz (540 us and 432 us
+at 222 MHz), so two taps add about 74 us (108 us), under 1 % of the CPU at
+333 MHz. One frequency analysis took 370 us at fftSize 256, 1,485 us at 1024
+and 3,066 us at 2048 at 333 MHz (530, 2,253 and 4,652 us at 222 MHz). At
+most one analysis runs per analyser per 512-frame block, so a page polling
+a 2048-point analyser every frame spends about 3 ms of each 16.7 ms frame on
+it. PPSSPP timing is an instruction-count proxy, not a device measurement.
 
 Presentation and WebGL A/B marks select the same binary's previous path for
 a device comparison. Validation builds start on the shipping path, and
@@ -899,7 +979,8 @@ since the previous one (`--weight ticks`, the default; at most 3x the median
 step), so samples taken while the emulated clock stood still count for
 nothing, unlike unweighted counting (`--weight samples`).
 `tools/code_layout_order.py` turns report
-JSON into a link order (`PSP_BROWSER_PSP_SECTION_ORDERING_FILE`);
+JSON into a link order, such as the hot-function order experiment
+`cmake/PspHotOrder.ld` ([CODE_LAYOUT.md](CODE_LAYOUT.md));
 `tools/icache_conflicts.py` compares layouts statically. The report's
 `--lines FN` option counts how many 64-byte I-cache lines hold a function's
 samples.

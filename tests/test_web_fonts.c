@@ -1590,6 +1590,79 @@ static bool test_woff_truncation_boundaries(Budget *budget,
 }
 
 #ifdef TILEFINCH_TEST_HAVE_FREETYPE
+/* Add one real 1x1 monochrome strike to the outline fixture. Its image is
+   deliberately unlike the outline, so accidentally requesting bitmap glyphs
+   cannot pass the coverage comparison. Keep strike metrics exercised too. */
+static bool add_bitmap_strike(const unsigned char *sfnt, size_t length,
+                              unsigned glyph, unsigned char **output,
+                              size_t *output_length)
+{
+    CHECK(length >= 12 && length < 2u * MIB && glyph <= UINT16_MAX);
+    unsigned tables = read_be16(sfnt + 4);
+    size_t directory_end = 12u + (size_t)tables * 16u;
+    CHECK(tables > 0 && tables < 64 && directory_end <= length);
+    size_t eblc = (length + 32u + 3u) & ~(size_t)3u;
+    size_t ebdt = eblc + 80u;
+    size_t total = ebdt + 12u;
+    unsigned char *bytes = calloc(1, total);
+    CHECK(bytes != NULL);
+    memcpy(bytes, sfnt, directory_end);
+    memcpy(bytes + directory_end + 32u, sfnt + directory_end, length - directory_end);
+    unsigned count = tables + 2, power = 1, selector = 0;
+    while (power * 2 <= count) { power *= 2; selector++; }
+    store_be16(bytes + 4, count);
+    store_be16(bytes + 6, power * 16);
+    store_be16(bytes + 8, selector);
+    store_be16(bytes + 10, count * 16 - power * 16);
+    for (unsigned i = 0; i < tables; i++) {
+        unsigned char *record = bytes + 12u + i * 16u;
+        size_t offset = read_be32(record + 8), size = read_be32(record + 12);
+        CHECK(offset >= directory_end && offset <= length && size <= length - offset);
+        CHECK(memcmp(record, "EBLC", 4) && memcmp(record, "EBDT", 4));
+        store_be32(record + 8, (uint32_t)offset + 32u);
+    }
+    unsigned char *record = bytes + directory_end;
+    memcpy(record, "EBLC", 4); store_be32(record + 8, eblc); store_be32(record + 12, 80);
+    memcpy(record + 16, "EBDT", 4); store_be32(record + 24, ebdt); store_be32(record + 28, 10);
+    store_be32(bytes + eblc, 0x20000); store_be32(bytes + eblc + 4, 1);
+    unsigned char *strike = bytes + eblc + 8;
+    store_be32(strike, 56); store_be32(strike + 4, 24); store_be32(strike + 8, 1);
+    strike[16] = 12; strike[17] = (unsigned char)-4; strike[18] = 8;
+    strike[24] = 12; strike[25] = (unsigned char)-4;
+    store_be16(strike + 40, glyph); store_be16(strike + 42, glyph);
+    strike[44] = 16; strike[45] = 16; strike[46] = 1; strike[47] = 1;
+    unsigned char *index = bytes + eblc + 56;
+    store_be16(index, glyph); store_be16(index + 2, glyph); store_be32(index + 4, 8);
+    store_be16(index + 8, 1); store_be16(index + 10, 1); store_be32(index + 12, 4);
+    store_be32(index + 16, 0); store_be32(index + 20, 6);
+    store_be32(bytes + ebdt, 0x20000);
+    const unsigned char image[] = {1, 1, 0, 1, 1, 0x80};
+    memcpy(bytes + ebdt + 4, image, sizeof(image));
+    /* Canonical table order and checksums, including head.checkSumAdjustment. */
+    size_t head = 0;
+    for (unsigned i = 0; i < count; i++) {
+        for (unsigned j = i + 1; j < count; j++) {
+            unsigned char *a = bytes + 12 + i * 16, *b = bytes + 12 + j * 16;
+            if (memcmp(a, b, 4) > 0) {
+                unsigned char temporary[16]; memcpy(temporary, a, 16);
+                memcpy(a, b, 16); memcpy(b, temporary, 16);
+            }
+        }
+        record = bytes + 12 + i * 16;
+        size_t offset = read_be32(record + 8), size = read_be32(record + 12);
+        if (!memcmp(record, "head", 4)) { head = offset; store_be32(bytes + head + 8, 0); }
+        uint32_t sum = 0;
+        for (size_t n = 0; n < size; n += 4) sum += read_be32(bytes + offset + n);
+        store_be32(record + 4, sum);
+    }
+    CHECK(head != 0);
+    uint32_t sum = 0;
+    for (size_t i = 0; i < total; i += 4) sum += read_be32(bytes + i);
+    store_be32(bytes + head + 8, UINT32_C(0xb1b0afba) - sum);
+    *output = bytes; *output_length = total;
+    return true;
+}
+
 static bool test_web_glyph_coverage(const FontFace *face,
                                      const unsigned char *bytes, size_t length)
 {
@@ -1632,6 +1705,63 @@ static bool test_web_glyph_coverage(const FontFace *face,
     }
     FT_Done_Face(reference);
     FT_Done_FreeType(library);
+    return true;
+}
+
+static bool test_outline_only_embedded_strikes(bool require_decoder_absent)
+{
+    unsigned char *original = NULL, *bytes = NULL;
+    size_t length = 0, size = 0;
+    CHECK(read_file(TILEFINCH_TEST_SOURCE_DIR "/fonts/TilefinchSans-Regular.ttf",
+                    &original, &length));
+    FT_Library library; FT_Face reference;
+    CHECK(FT_Init_FreeType(&library) == 0);
+    CHECK(FT_New_Memory_Face(library, original, length, 0, &reference) == 0);
+    unsigned index = FT_Get_Char_Index(reference, 'A');
+    CHECK(index != 0 && add_bitmap_strike(original, length, index, &bytes, &size));
+    FT_Done_Face(reference);
+    CHECK(FT_New_Memory_Face(library, bytes, size, 0, &reference) == 0);
+    CHECK(FT_IS_SCALABLE(reference) && reference->num_fixed_sizes == 1);
+    CHECK(reference->available_sizes[0].x_ppem == 16 * 64);
+    CHECK(FT_Set_Pixel_Sizes(reference, 16, 16) == 0);
+    int bitmap_result = FT_Load_Glyph(reference, index, FT_LOAD_SBITS_ONLY);
+    if (require_decoder_absent) CHECK(bitmap_result != 0);
+    else CHECK(bitmap_result == 0 && reference->glyph->bitmap.width == 1);
+    FT_Done_Face(reference); FT_Done_FreeType(library);
+    Budget budget; budget_init(&budget, 8u * MIB);
+    FontFace face = {0};
+    CHECK(font_face_load_encoded(&face, &budget, bytes, size, 2u * MIB));
+    CHECK(test_web_glyph_coverage(&face, bytes, size));
+    uint64_t digest = UINT64_C(1469598103934665603);
+    /* Include exactly-at-strike and nearby fractional sizes, where removing
+       metadata rather than only the decoder could change size selection. */
+    for (int height = 15 * 64; height <= 17 * 64; height++) {
+        FontGlyph glyph = {0};
+        CHECK(font_glyph_load_at_size(&face, 'A', height, false, &glyph));
+        CHECK(glyph.width > 1 && glyph.height > 1);
+        const int metrics[] = {glyph.width, glyph.height, glyph.x_offset,
+                               glyph.y_offset, glyph.advance_fixed};
+        for (size_t i = 0; i < sizeof(metrics) / sizeof(metrics[0]); i++)
+            digest = (digest ^ (uint32_t)metrics[i]) * UINT64_C(1099511628211);
+        for (int i = 0; i < glyph.width * glyph.height; i++)
+            digest = (digest ^ glyph.pixels[i]) * UINT64_C(1099511628211);
+        font_glyph_destroy(&face, &glyph);
+    }
+    printf("outline-strike digest=%016llx\n", (unsigned long long)digest);
+    font_face_destroy(&face);
+    CHECK(budget.current == 0);
+    /* A bitmap-only face was not a supported page font before this trim. */
+    for (unsigned i = 0; i < read_be16(bytes + 4); i++) {
+        unsigned char *record = bytes + 12u + i * 16u;
+        if (!memcmp(record, "glyf", 4)) memcpy(record, "zzzz", 4);
+        if (!memcmp(record, "loca", 4)) memcpy(record, "yyyy", 4);
+    }
+    CHECK(FT_Init_FreeType(&library) == 0);
+    CHECK(FT_New_Memory_Face(library, bytes, size, 0, &reference) == 0);
+    CHECK(!FT_IS_SCALABLE(reference) && reference->num_fixed_sizes == 1);
+    FT_Done_Face(reference); FT_Done_FreeType(library);
+    CHECK(rejected_without_retention(&budget, bytes, size, 2u * MIB));
+    free(bytes); free(original);
     return true;
 }
 
@@ -2367,6 +2497,12 @@ static bool test_packed_font_storage(void)
 
 int main(int argc, char **argv)
 {
+#if defined(TILEFINCH_TEST_HAVE_FREETYPE) && defined(TILEFINCH_TEST_WOFF2)
+    if (argc == 2 && strcmp(argv[1], "--outline-strike-control") == 0)
+        return test_outline_only_embedded_strikes(false) ? 0 : 1;
+    if (argc == 2 && strcmp(argv[1], "--outline-strike-only") == 0)
+        return test_outline_only_embedded_strikes(true) ? 0 : 1;
+#endif
     if (argc == 2 && strcmp(argv[1], "--packed-font-only") == 0)
         return test_packed_font_storage() ? 0 : 1;
     if (!test_packed_font_storage()) return 1;
@@ -2401,7 +2537,7 @@ int main(int argc, char **argv)
             && test_exact_cached_web_font_advances() ? 0 : 1;
     }
 #if defined(TILEFINCH_TEST_WOFF2) && defined(TILEFINCH_TEST_HAVE_FREETYPE)
-    if (!test_bounded_woff2()) return 1;
+    if (!test_bounded_woff2() || !test_outline_only_embedded_strikes(true)) return 1;
 #endif
     if (!test_subset_source_priority() || !test_upright_oblique_range()
         || !test_embedded_font_loading()

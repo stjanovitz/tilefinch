@@ -248,6 +248,23 @@ void budget_report_categories(Budget *budget, const char *phase,
 void budget_dump_active(const Budget *budget, FILE *stream,
                         size_t maximum_entries);
 
+/* Memory-study diagnostics (host builds and PSP validation builds only;
+   a shipping PSP image defines none of these, so a call there fails to
+   link). See docs/engineering/VALIDATION_RECORDS.md, "Memory make-up". */
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+#define TILEFINCH_MEMORY_DIAGNOSTICS 1
+#endif
+/* The Budget charge (header included) of a live Budget allocation and its
+   category, or 0 when `ptr` is NULL or not a Budget payload. */
+size_t budget_allocation_charge(const void *ptr, BudgetCategory *category);
+/* Called on the owning thread, from inside the allocation that raised
+   `budget`'s global peak, each time the peak has risen by at least `step`
+   bytes since the previous call. It must not allocate from `budget`. One
+   observer per process; NULL removes it. */
+typedef void (*BudgetPeakObserver)(void *opaque, const Budget *budget);
+void budget_set_peak_observer(const Budget *budget, BudgetPeakObserver fn,
+                              void *opaque, size_t step);
+
 bool budget_reservation_acquire(BudgetReservation *reservation,
                                 Budget *budget, BudgetCategory category,
                                 size_t bytes);

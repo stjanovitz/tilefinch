@@ -1,5 +1,6 @@
 /* The hashed catalog format's structural checks and lookup, below the
-   SHA-256 pin that keeps crafted bytes away from the public entry points. */
+   SHA-256 pin that keeps crafted bytes away from the public entry points,
+   and the 32-bit value offsets that let a v17 file pass 64 KiB. */
 #include "../src/ui_language.c"
 #include <stdlib.h>
 
@@ -42,6 +43,117 @@ static size_t build(const char *code, Row *rows, size_t count)
 
 static TilefinchUiTranslation *parse(Budget *budget, size_t length)
 { return translation_parse(budget, TILEFINCH_UI_LANGUAGE_SPANISH, "es", file, length); }
+
+/* Rows whose values end past 64 KiB, in a file just under the bound. With
+   16-bit offsets every row after the wrap read another row's text, and an
+   Arabic display cache over 64 KiB refused the whole catalog. */
+enum { WIDE_ROWS = 1200 };
+static char wide_keys[WIDE_ROWS][16], wide_values[WIDE_ROWS][112];
+static Row wide[WIDE_ROWS];
+
+static bool wide_catalog(Budget *budget, unsigned language, const char *code,
+                         const char *fill)
+{
+    size_t fill_bytes = strlen(fill);
+    for (size_t i = 0; i < WIDE_ROWS; i++) {
+        snprintf(wide_keys[i], sizeof(wide_keys[i]), "Wide %zu", i);
+        int n = snprintf(wide_values[i], sizeof(wide_values[i]), "%zu ", i);
+        while ((size_t) n + fill_bytes < sizeof(wide_values[i]) - 8u) {
+            memcpy(wide_values[i] + n, fill, fill_bytes);
+            n += (int) fill_bytes;
+        }
+        wide_values[i][n] = 0;
+        wide[i] = (Row) {wide_keys[i], wide_values[i]};
+    }
+    size_t length = build(code, wide, WIDE_ROWS);
+    if (length <= 64u * 1024u || length > TILEFINCH_UI_TRANSLATION_BYTES) {
+        fprintf(stderr, "wide catalog is %zu bytes\n", length);
+        return false;
+    }
+    TilefinchUiTranslation *t = translation_parse(budget, language, code, file, length);
+    if (t == NULL) {
+        fprintf(stderr, "a %zu-byte %s catalog was refused\n", length, code);
+        return false;
+    }
+    bool okay = t->values[t->count - 1] > UINT16_MAX;
+    char probe[16];
+    for (size_t i = 0; okay && i < WIDE_ROWS; i++) {
+        snprintf(probe, sizeof(probe), "Wide %zu", i);
+        /* Each value starts with its own row number. */
+        tilefinch_ui_translation_bind(t);
+        const char *found = tilefinch_ui_logical_text(probe);
+        tilefinch_ui_translation_bind(NULL);
+        char expected[16];
+        snprintf(expected, sizeof(expected), "%zu ", i);
+        if (strncmp(found, expected, strlen(expected)) != 0
+            || strlen(found) != strlen(wide_values[i])) {
+            fprintf(stderr, "%s row %zu read \"%.24s\"\n", code, i, found);
+            okay = false;
+        }
+        const char *display = tilefinch_ui_translation_text(t, probe);
+        bool display_okay = display == found;
+        if (language == TILEFINCH_UI_LANGUAGE_ARABIC) {
+            /* The same value's display text from a one-row catalog. */
+            Row single[] = {{probe, wide_values[i]}};
+            TilefinchUiTranslation *reference = translation_parse(
+                budget, language, code, file, build(code, single, 1));
+            display_okay = reference != NULL && display != found
+                && strcmp(display, tilefinch_ui_translation_text(reference, probe)) == 0;
+            tilefinch_ui_translation_destroy(reference);
+        }
+        if (!display_okay) {
+            fprintf(stderr, "%s row %zu display text is wrong\n", code, i);
+            okay = false;
+        }
+    }
+    if (language == TILEFINCH_UI_LANGUAGE_ARABIC)
+        okay = okay && t->visual != NULL;
+    tilefinch_ui_translation_destroy(t);
+    return okay && budget->current == 0;
+}
+
+static bool wide_catalogs(Budget *budget)
+{
+    return wide_catalog(budget, TILEFINCH_UI_LANGUAGE_SPANISH, "es",
+                        "abcdefghij")
+        /* Two-byte letters become three-byte presentation forms. */
+        && wide_catalog(budget, TILEFINCH_UI_LANGUAGE_ARABIC, "ar",
+                        "\xd8\xb3\xd9\x84\xd8\xa7\xd9\x85 ");
+}
+
+/* Installed v15 and v16 files keep parsing: the wire layout did not
+   change. Each published file's rows all load. */
+static bool published_catalogs_parse(Budget *budget)
+{
+    static const unsigned versions[] = {15u, 16u};
+    for (size_t v = 0; v < sizeof(versions) / sizeof(versions[0]); v++) {
+        for (unsigned language = 1; language < TILEFINCH_UI_LANGUAGE_COUNT; language++) {
+            const char *code = tilefinch_ui_language_spec(language)->code;
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/translations/ui/v%u/%s.tful",
+                     TILEFINCH_UI_RESOURCE_ROOT, versions[v], code);
+            FILE *f = fopen(path, "rb");
+            if (f == NULL) { fprintf(stderr, "missing %s\n", path); return false; }
+            size_t length = fread(file, 1, sizeof(file), f);
+            fclose(f);
+            if (length == 0 || length > 64u * 1024u - 1u) {
+                fprintf(stderr, "%s is %zu bytes\n", path, length);
+                return false;
+            }
+            TilefinchUiTranslation *t = translation_parse(budget, language, code, file, length);
+            size_t rows = (size_t) file[strlen("TFUI2\t") + strlen(code) + 1u] << 8
+                | file[strlen("TFUI2\t") + strlen(code) + 2u];
+            bool okay = t != NULL && t->count == rows
+                && strcmp(tilefinch_ui_translation_text(t, "Settings"), "Settings") != 0;
+            tilefinch_ui_translation_destroy(t);
+            if (!okay || budget->current != 0) {
+                fprintf(stderr, "%s did not parse\n", path);
+                return false;
+            }
+        }
+    }
+    return true;
+}
 
 static bool refused(Budget *budget, size_t length)
 {
@@ -145,7 +257,7 @@ int main(void)
     CHECK((t = parse(&budget, length)) != NULL);
     CHECK(t->count == TILEFINCH_UI_TRANSLATION_ROWS);
     CHECK(budget.current - one_row == (TILEFINCH_UI_TRANSLATION_ROWS - 1u)
-          * (sizeof(uint32_t) + sizeof(uint16_t) + 1u + strlen("v\n")));
+          * (sizeof(uint32_t) + sizeof(uint32_t) + 1u + strlen("v\n")));
     char probe[16];
     for (size_t i = 0; i < TILEFINCH_UI_TRANSLATION_ROWS; i++) {
         snprintf(probe, sizeof(probe), "Label %zu", i);
@@ -159,5 +271,8 @@ int main(void)
     budget.limit = budget.current + 64;
     CHECK(refused(&budget, length));
     CHECK(budget.current == 0);
+    budget.limit = 1024u * 1024u;
+    if (!wide_catalogs(&budget)) return 1;
+    if (!published_catalogs_parse(&budget)) return 1;
     return 0;
 }

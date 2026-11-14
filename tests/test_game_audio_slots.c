@@ -7,6 +7,7 @@
 #include "tilefinch/viewport.h"
 #include "../src/js_runtime_internal.h"
 
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -410,6 +411,309 @@ static void run_oscillator_lane(bool native, OscillatorResult *result)
     end_case(&test);
 }
 
+static double mix_rms(AudioCase *test, int16_t *pcm, size_t frames, size_t from, size_t to)
+{
+    CHECK(frames <= TILEFINCH_GAME_AUDIO_OUTPUT_FRAMES && from < to && to <= frames);
+    size_t allocations = test->budget.allocation_count;
+    CHECK(tilefinch_game_audio_mix(test->runtime->game_audio, pcm, frames));
+    CHECK(test->budget.allocation_count == allocations);
+    double sum = 0;
+    for (size_t frame = from; frame < to; frame++)
+        sum += (double) pcm[frame * 2u] * pcm[frame * 2u];
+    return sqrt(sum / (double) (to - from));
+}
+
+/* Native-only Web Audio behaviour the legacy reference model never had:
+   timelines, value reads, AudioBuffer PCM access and BiquadFilterNode. */
+static void run_spec_lane(void)
+{
+    AudioCase test;
+    begin_case(&test, true);
+    static int16_t pcm[TILEFINCH_GAME_AUDIO_OUTPUT_FRAMES * 2u];
+    evaluate(&test,
+        "globalThis.specTest={context:new AudioContext()};"
+        "document.getElementById('start').onclick=()=>specTest.context.resume().then("
+        "()=>pocSummary='RUNNING');pocSummary='READY'", "READY");
+    activate(&test, "RUNNING");
+
+    /* Argument errors, the event quota and the pan restriction. */
+    evaluate(&test,
+        "(()=>{const c=specTest.context,g=c.createGain(),p=g.gain,names=[],"
+        "attempt=f=>{try{f();names.push('ok')}catch(e){names.push(e.name)}};"
+        "attempt(()=>p.exponentialRampToValueAtTime(0,1));"
+        "attempt(()=>p.setValueAtTime(NaN,1));"
+        "attempt(()=>p.setValueAtTime(1,-1));"
+        "attempt(()=>p.setTargetAtTime(1,1,-1));"
+        "attempt(()=>p.setValueCurveAtTime(new Float32Array([1]),1,1));"
+        "attempt(()=>p.setValueCurveAtTime(new Float32Array([0,1]),1,1));"
+        "attempt(()=>p.setValueAtTime(1,1.5));"
+        "attempt(()=>p.cancelAndHoldAtTime(0));"
+        "attempt(()=>p.cancelScheduledValues(0));"
+        "const chained=p.setValueAtTime(0,2)===p;p.cancelScheduledValues(0);"
+        "attempt(()=>{for(let i=0;i<33;i++)p.setValueAtTime(i/33,1+i/100)});"
+        "attempt(()=>c.createStereoPanner().pan.linearRampToValueAtTime(1,c.currentTime+1));"
+        "const expected='RangeError,TypeError,RangeError,RangeError,InvalidStateError,ok,"
+        "NotSupportedError,ok,ok,QuotaExceededError,NotSupportedError';"
+        "pocSummary=chained&&names.join()===expected?'ERRORS':names.join()})()", "ERRORS");
+
+    /* A beep, scheduled ahead: the 1024-frame ramp starts with the voice
+       and plays without JS ticks; the gain then holds 0.5. */
+    evaluate(&test,
+        "(()=>{const c=specTest.context,o=c.createOscillator(),g=c.createGain(),"
+        "t=c.currentTime+.02;o.connect(g).connect(c.destination);g.gain.setValueAtTime(0,t);"
+        "g.gain.linearRampToValueAtTime(.5,t+1024/44100);o.start(t);"
+        "specTest.beep={o,g,t};pocSummary='BEEP'})()", "BEEP");
+    static int16_t beep[6u * 512u * 2u];
+    for (size_t block = 0; block < 6u; block++)
+        (void) mix_rms(&test, beep + block * 1024u, 512, 0, 512);
+    size_t onset = 0;
+    while (onset < 6u * 512u && beep[onset * 2u] == 0) onset++;
+    CHECK(onset > 0u && onset + 1536u <= 6u * 512u);
+    double ramp_start = 0, ramp_end = 0, hold = 0;
+    for (size_t frame = 0; frame < 128u; frame++) {
+        double a = beep[(onset + frame) * 2u], b = beep[(onset + 896u + frame) * 2u];
+        ramp_start += a * a;
+        ramp_end += b * b;
+    }
+    for (size_t frame = onset + 1024u; frame < onset + 1536u; frame++)
+        hold += (double) beep[frame * 2u] * beep[frame * 2u];
+    hold = sqrt(hold / 512.0);
+    CHECK(ramp_end > 49.0 * ramp_start);
+    CHECK(hold > 0.5 * 0.7071 * 32768.0 * 0.97 && hold < 0.5 * 0.7071 * 32768.0 * 1.03);
+    evaluate(&test,
+        "(()=>{const b=specTest.beep;b.o.stop();pocSummary='BEEP-DONE'})()", "BEEP-DONE");
+    CHECK(mix_rms(&test, pcm, 512, 0, 512) == 0.0);
+    dispatch_completions(&test);
+
+    /* .value reads the timeline at currentTime. */
+    evaluate(&test,
+        "(()=>{const c=specTest.context,g=c.createGain(),t=c.currentTime;"
+        "g.gain.setValueAtTime(0,t);g.gain.linearRampToValueAtTime(1,t+1);"
+        "g.gain.setValueAtTime(.25,t+2);specTest.read={g,t};pocSummary='RAMP-SET'})()",
+        "RAMP-SET");
+    CHECK(script_runtime_advance(test.runtime, 500, 4, &test.result));
+    evaluate(&test,
+        "(()=>{const r=specTest.read,c=specTest.context,v=r.g.gain.value,"
+        "x=(c.currentTime-r.t);pocSummary=Math.abs(v-x)<.01&&x>.4&&x<.6?'VALUE-READ':"
+        "JSON.stringify([v,x])})()", "VALUE-READ");
+    evaluate(&test,
+        "(()=>{const r=specTest.read,c=specTest.context,p=r.g.gain,now=c.currentTime-r.t;"
+        "p.cancelAndHoldAtTime(c.currentTime);const held=p.value;"
+        "pocSummary=Math.abs(held-now)<.01?'HELD':JSON.stringify([held,now])})()", "HELD");
+
+    /* createBuffer + getChannelData: one shared view, heard as written. */
+    evaluate(&test,
+        "(()=>{const c=specTest.context,b=c.createBuffer(1,4,44100),d=b.getChannelData(0);"
+        "d.set([.5,-.5,.25,-.25]);const s=c.createBufferSource();s.buffer=b;s.loop=true;"
+        "s.connect(c.destination);s.start();specTest.pcm={b,d,s};"
+        "pocSummary=d===b.getChannelData(0)&&d instanceof Float32Array&&d.length===4&&"
+        "b.duration===4/44100?'BUFFER':'BAD-BUFFER'})()", "BUFFER");
+    CHECK(tilefinch_game_audio_mix(test.runtime->game_audio, pcm, 4));
+    static const int16_t written[4] = {16384, -16384, 8192, -8192};
+    for (size_t frame = 0; frame < 4u; frame++) {
+        CHECK(pcm[frame * 2u] == written[frame]);
+        CHECK(pcm[frame * 2u + 1u] == written[frame]);
+    }
+    evaluate(&test,
+        "(()=>{const p=specTest.pcm;p.d.fill(.125);const out=new Float32Array(6),"
+        "names=[];p.b.copyFromChannel(out,0,1);"
+        "p.b.copyToChannel(new Float32Array([-.125]),0,3);"
+        "for(const f of [()=>p.b.getChannelData(1),()=>p.b.copyToChannel([1],0),"
+        "()=>specTest.context.createBuffer(3,4,44100),"
+        "()=>specTest.context.createBuffer(1,4,4000),"
+        "()=>specTest.context.createBuffer(1,0,44100),"
+        "()=>new AudioBuffer({}),()=>specTest.context.createBuffer(2,200000,44100)])"
+        "try{f();names.push('ok')}catch(e){names.push(e.name)}"
+        "const made=new AudioBuffer({length:8,sampleRate:22050});"
+        "pocSummary=out.join()==='0.125,0.125,0.125,0,0,0'&&made.numberOfChannels===1&&"
+        "made.sampleRate===22050&&made.getChannelData(0).every(v=>v===0)&&names.join()==="
+        "'IndexSizeError,TypeError,NotSupportedError,NotSupportedError,NotSupportedError,"
+        "TypeError,NotSupportedError'?'COPIES':names.join()+' '+out.join()})()", "COPIES");
+    CHECK(tilefinch_game_audio_mix(test.runtime->game_audio, pcm, 4));
+    static const int16_t rewritten[4] = {4096, 4096, 4096, -4096};
+    for (size_t frame = 0; frame < 4u; frame++) CHECK(pcm[frame * 2u] == rewritten[frame]);
+    evaluate(&test, "specTest.pcm.s.stop();pocSummary='PCM-STOPPED'", "PCM-STOPPED");
+    CHECK(mix_rms(&test, pcm, 512, 0, 512) == 0.0);
+    dispatch_completions(&test);
+
+    /* Decoded WAV PCM reads back as normalized floats. */
+    evaluate(&test,
+        "(()=>{const b=new Uint8Array(52),v=new DataView(b.buffer),"
+        "text=(at,s)=>{for(let i=0;i<s.length;i++)b[at+i]=s.charCodeAt(i)};"
+        "text(0,'RIFF');v.setUint32(4,44,true);text(8,'WAVE');text(12,'fmt ');"
+        "v.setUint32(16,16,true);v.setUint16(20,1,true);v.setUint16(22,1,true);"
+        "v.setUint32(24,44100,true);v.setUint32(28,88200,true);v.setUint16(32,2,true);"
+        "v.setUint16(34,16,true);text(36,'data');v.setUint32(40,8,true);"
+        "[16384,-16384,8192,0].forEach((n,i)=>v.setInt16(44+i*2,n,true));"
+        "return specTest.context.decodeAudioData(b.buffer).then(buffer=>{"
+        "const out=new Float32Array(4);buffer.copyFromChannel(out,0);"
+        "const view=buffer.getChannelData(0);"
+        "pocSummary=out.join()==='0.5,-0.5,0.25,0'&&view.join()===out.join()"
+        "?'DECODED-PCM':out.join()+' '+view.join()})})()", "DECODED-PCM");
+
+    /* Compressed formats are refused by name. */
+    evaluate(&test,
+        "(()=>{const c=specTest.context,ogg=new Uint8Array(64),mp3=new Uint8Array(64);"
+        "ogg.set([79,103,103,83]);mp3.set([0xff,0xfb,0x90,0x64]);"
+        "const refused=b=>c.decodeAudioData(b.buffer).then(()=>'decoded',"
+        "e=>e.name+':'+/Ogg|MP3/.exec(e.message));"
+        "return Promise.all([refused(ogg),refused(mp3)]).then(r=>pocSummary="
+        "r.join()==='EncodingError:Ogg,EncodingError:MP3'?'COMPRESSED-REFUSED':r.join())})()",
+        "COMPRESSED-REFUSED");
+
+    /* BiquadFilterNode: attributes, then lowpass against highpass. */
+    evaluate(&test,
+        "(()=>{const c=specTest.context,f=c.createBiquadFilter(),g=new BiquadFilterNode(c,"
+        "{type:'peaking',Q:3,gain:6,frequency:1000});f.type='bogus';"
+        "pocSummary=f instanceof AudioNode&&f.type==='lowpass'&&f.frequency.value===350&&"
+        "f.Q.value===1&&f.gain.value===0&&f.detune.value===0&&g.type==='peaking'&&"
+        "g.Q.value===3&&g.gain.value===6&&g.frequency.value===1000&&"
+        "f.frequency.maxValue===22050?'FILTER-ATTRIBUTES':'BAD-FILTER'})()",
+        "FILTER-ATTRIBUTES");
+    double filtered[2];
+    for (unsigned pass = 0; pass < 2u; pass++) {
+        evaluate(&test, pass == 0u
+            ? "(()=>{const c=specTest.context,o=c.createOscillator(),f=c.createBiquadFilter();"
+              "f.frequency.value=100;o.connect(f).connect(c.destination);o.start();"
+              "specTest.filter={o,f};pocSummary='LOWPASS'})()"
+            : "(()=>{const c=specTest.context,o=c.createOscillator(),f=c.createBiquadFilter();"
+              "f.type='highpass';f.frequency.value=100;o.connect(f).connect(c.destination);"
+              "o.start();specTest.filter={o,f};pocSummary='HIGHPASS'})()",
+            pass == 0u ? "LOWPASS" : "HIGHPASS");
+        (void) mix_rms(&test, pcm, 512, 0, 512);
+        filtered[pass] = mix_rms(&test, pcm, 512, 0, 512);
+        evaluate(&test, "specTest.filter.o.stop();pocSummary='FILTER-STOPPED'",
+                 "FILTER-STOPPED");
+        CHECK(mix_rms(&test, pcm, 512, 0, 512) == 0.0);
+        dispatch_completions(&test);
+    }
+    /* 440 Hz is 2.2 octaves above a 100 Hz cutoff: about -26 dB lowpass. */
+    CHECK(filtered[0] > 0.0 && filtered[0] * 10.0 < filtered[1]);
+    CHECK(filtered[1] > 0.70 * 32768.0 * 0.9);
+
+    /* An automated cutoff sweep runs in the mixer. */
+    evaluate(&test,
+        "(()=>{const c=specTest.context,o=c.createOscillator(),f=c.createBiquadFilter(),"
+        "t=c.currentTime+.02;o.frequency.value=2000;f.frequency.setValueAtTime(100,t);"
+        "f.frequency.exponentialRampToValueAtTime(8000,t+1024/44100);"
+        "o.connect(f).connect(c.destination);o.start(t);specTest.filter={o,f};"
+        "pocSummary='SWEEP'})()", "SWEEP");
+    for (size_t block = 0; block < 6u; block++)
+        (void) mix_rms(&test, beep + block * 1024u, 512, 0, 512);
+    onset = 0;
+    while (onset < 6u * 512u && beep[onset * 2u] == 0) onset++;
+    CHECK(onset > 0u && onset + 1152u <= 6u * 512u);
+    double quiet = 0, open = 0;
+    for (size_t frame = 128; frame < 256u; frame++) {
+        double a = beep[(onset + frame) * 2u], b = beep[(onset + 896u + frame) * 2u];
+        quiet += a * a;
+        open += b * b;
+    }
+    /* A 2 kHz tone under a 100 Hz cutoff, then under an 8 kHz one. */
+    CHECK(quiet * 100.0 < open);
+    evaluate(&test, "specTest.filter.o.stop();pocSummary='SWEEP-STOPPED'", "SWEEP-STOPPED");
+    CHECK(mix_rms(&test, pcm, 512, 0, 512) == 0.0);
+    dispatch_completions(&test);
+    end_case(&test);
+}
+
+/* Graph edits that a playing source cannot take are refused for that call
+   only; lanes and node slots come back without the cycle collector where
+   they can; loop points follow the specification. Native only. */
+static void run_graph_lane(void)
+{
+    AudioCase test;
+    begin_case(&test, true);
+    static int16_t pcm[TILEFINCH_GAME_AUDIO_OUTPUT_FRAMES * 2u];
+    evaluate(&test,
+        "globalThis.G={context:new AudioContext(),kept:[]};"
+        "document.getElementById('start').onclick=()=>G.context.resume().then("
+        "()=>pocSummary='RUNNING');pocSummary='READY'", "READY");
+    activate(&test, "RUNNING");
+
+    /* A playing source through five gains, four automated: automating the
+       fifth, or connecting it to a fifth automated gain, throws, and the
+       graph is as it was, so later edits on the same path still work. */
+    evaluate(&test,
+        "(()=>{const c=G.context,o=c.createOscillator(),g=[],names=[],"
+        "attempt=f=>{try{f();names.push('ok')}catch(e){names.push(e.name)}};"
+        "for(let i=0;i<5;i++)g.push(c.createGain());o.connect(g[0]);"
+        "for(let i=0;i<4;i++)g[i].connect(g[i+1]);g[4].connect(c.destination);"
+        "const t=c.currentTime+1;for(let i=0;i<4;i++)g[i].gain.setValueAtTime(1,t);"
+        "o.start();attempt(()=>g[4].gain.setValueAtTime(.5,t));"
+        "attempt(()=>{g[4].gain.value=.25});"
+        "attempt(()=>{g[3].disconnect();g[3].connect(g[4])});"
+        "const h=c.createGain();h.gain.setValueAtTime(1,t);h.connect(c.destination);"
+        "attempt(()=>g[4].connect(h));attempt(()=>c.createGain().gain.setValueAtTime(1,t));"
+        "G.chain={o,g,h};pocSummary=names.join()+(g[4].gain.value===.25?'':' value')})()",
+        "NotSupportedError,ok,ok,NotSupportedError,ok");
+    (void) mix_rms(&test, pcm, 512, 0, 512);
+    double heard = mix_rms(&test, pcm, 512, 0, 512);
+    /* g[4] still reaches the destination, at its static 0.25. */
+    CHECK(heard > 0.25 * 0.7071 * 32768.0 * 0.97 && heard < 0.25 * 0.7071 * 32768.0 * 1.03);
+    evaluate(&test, "G.chain.o.stop();G.chain=null;pocSummary='CHAIN-STOPPED'",
+             "CHAIN-STOPPED");
+    CHECK(mix_rms(&test, pcm, 512, 0, 512) == 0.0);
+    dispatch_completions(&test);
+    end_case(&test);
+
+    /* Six kept sounds of three automated parameters each need 18 lanes of
+       16: the settled ones of earlier sounds go back without a collection
+       (none could free them: every node is reachable). */
+    begin_case(&test, true);
+    evaluate(&test,
+        "globalThis.G={context:new AudioContext(),kept:[]};"
+        "document.getElementById('start').onclick=()=>G.context.resume().then("
+        "()=>pocSummary='RUNNING');pocSummary='READY'", "READY");
+    activate(&test, "RUNNING");
+    static const char *const sounds[] = {"S1", "S2", "S3", "S4", "S5", "S6"};
+    for (size_t at = 0; at < 6u; at++) {
+        evaluate(&test,
+            "(()=>{const c=G.context,t=c.currentTime,o=c.createOscillator(),g=c.createGain();"
+            "g.gain.setValueAtTime(0,t);g.gain.linearRampToValueAtTime(.5,t+.01);"
+            "o.frequency.setValueAtTime(880,t);o.detune.setValueAtTime(100,t);"
+            "o.connect(g).connect(c.destination);G.kept.push({o,g,t});"
+            "pocSummary='S'+G.kept.length})()", sounds[at]);
+        CHECK(script_runtime_advance(test.runtime, 50, 4, &test.result));
+    }
+    /* A returned lane reads its settled value, and automation resuming on
+       a new lane ramps from the settled event (t + 0.01), not from now
+       (which would read 0.5); currentTime is quantized, hence 5e-3. */
+    evaluate(&test,
+        "(()=>{const k=G.kept[0],c=G.context,now=c.currentTime,end=k.t+.01;"
+        "const settled=k.g.gain.value===.5&&k.o.frequency.value===880&&"
+        "k.o.detune.value===100;k.g.gain.linearRampToValueAtTime(1,now+1);"
+        "const v=k.g.gain.value,want=.5+.5*(now-end)/(now+1-end);"
+        "pocSummary=settled&&now-end>.2&&Math.abs(v-want)<5e-3?'ANCHORED':"
+        "JSON.stringify([settled,v,want])})()", "ANCHORED");
+
+    /* Unreachable nodes whose params were read wait for the cycle
+       collector; a full table runs it before refusing. */
+    evaluate(&test,
+        "(()=>{const c=G.context;for(let i=0;i<24;i++){const g=c.createGain();"
+        "g.gain.value=.5}pocSummary='NODES'})()", "NODES");
+
+    /* loopStart/loopEnd: non-finite values throw; any finite pair is kept,
+       and one that is not a valid pair loops the whole buffer. */
+    evaluate(&test,
+        "(()=>{const c=G.context,s=c.createBufferSource(),names=[];"
+        "for(const v of [NaN,Infinity])try{s.loopStart=v;names.push('ok')}"
+        "catch(e){names.push(e.name)}"
+        "try{s.loopEnd=-Infinity;names.push('ok')}catch(e){names.push(e.name)}"
+        "s.loopStart=-1;s.loopEnd=-2;const kept=s.loopStart===-1&&s.loopEnd===-2;"
+        "const b=c.createBuffer(1,4,44100);b.getChannelData(0).set([.5,-.5,.25,-.25]);"
+        "s.buffer=b;s.loop=true;s.connect(c.destination);s.start();G.loop=s;"
+        "pocSummary=kept?names.join():'NOT-KEPT'})()", "TypeError,TypeError,TypeError");
+    CHECK(tilefinch_game_audio_mix(test.runtime->game_audio, pcm, 8));
+    static const int16_t looped[4] = {16384, -16384, 8192, -8192};
+    for (size_t frame = 0; frame < 8u; frame++)
+        CHECK(pcm[frame * 2u] == looped[frame % 4u]);
+    evaluate(&test, "G.loop.stop();G.loop=null;pocSummary='LOOP-STOPPED'", "LOOP-STOPPED");
+    CHECK(mix_rms(&test, pcm, 512, 0, 512) == 0.0);
+    dispatch_completions(&test);
+    end_case(&test);
+}
+
 static void run_context_construction_lane(bool native)
 {
     AudioCase test;
@@ -503,12 +807,20 @@ int main(int argc, char **argv)
     run_lane(true, &native);
     run_oscillator_lane(false, &reference_oscillators);
     run_oscillator_lane(true, &native_oscillators);
+    run_spec_lane();
+    run_graph_lane();
     script_runtime_configure_deterministic_replay(false, 0);
     CHECK(reference.count == native.count);
     CHECK(memcmp(reference.pcm, native.pcm, sizeof(reference.pcm)) == 0);
     CHECK(reference_oscillators.count == native_oscillators.count);
-    CHECK(memcmp(reference_oscillators.pcm, native_oscillators.pcm,
-                 sizeof(reference_oscillators.pcm)) == 0);
+    /* Native AudioParam curves follow the spec's interpolation over the
+       wall-clock timeline; the legacy reference model does not, so the two
+       agree only until the pitch curves have drifted their phases. */
+    for (unsigned i = 0; i < TILEFINCH_GAME_AUDIO_OUTPUT_FRAMES * 2u; i++)
+        CHECK(abs(reference_oscillators.pcm[0][i] - native_oscillators.pcm[0][i]) <= 64);
+    CHECK(memcmp(reference_oscillators.pcm[OSCILLATOR_BLOCKS - 1u],
+                 native_oscillators.pcm[OSCILLATOR_BLOCKS - 1u],
+                 sizeof(reference_oscillators.pcm[0])) == 0);
     puts("game audio slots: exact PCM, four voices, automation, compaction and lifecycle passed");
     return 0;
 }

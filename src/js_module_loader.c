@@ -105,11 +105,9 @@ bool script_compile_classic_bytecode(
            on PSP.  Strip them only for the large-game class. Small scripts
            keep line metadata, while every package still retains source for a
            compiler-ABI miss or ordinary source recompile. */
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
         JS_SetStripInfo(runtime,
             source_length >= 128u * 1024u
                 ? JS_STRIP_DEBUG : JS_STRIP_SOURCE);
-#endif
         context = JS_NewContext(runtime);
     }
     if (context != NULL) {
@@ -118,10 +116,6 @@ bool script_compile_classic_bytecode(
             JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
         if (!JS_IsException(compiled)) {
             int write_flags = JS_WRITE_OBJ_BYTECODE;
-#if !defined(PSP_BROWSER_BELLARD_QUICKJS)
-            write_flags |= source_length >= 128u * 1024u
-                ? JS_WRITE_OBJ_STRIP_DEBUG : JS_WRITE_OBJ_STRIP_SOURCE;
-#endif
             serialized = JS_WriteObject(
                 context, &serialized_length, compiled, write_flags);
         }
@@ -486,13 +480,8 @@ char output[BROWSER_MODULE_REFERRER_POLICY_LIMIT])
 
 static int script_module_strip_flags(size_t source_length)
 {
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
     return source_length >= SCRIPT_MODULE_STRIP_SOURCE_MINIMUM_BYTES
         ? JS_STRIP_SOURCE : 0;
-#else
-    (void) source_length;
-    return 0;
-#endif
 }
 
 /*
@@ -565,9 +554,19 @@ static BrowserSharedBody *script_bytecode_lookup(
         || !browser_session_script_disk_enabled(runtime->session))
         return cached;
     uint64_t started_ns = js_rt_monotonic_time_ns();
-    if (browser_session_script_disk_promote(
-            runtime->session, kind, key,
-            runtime->module_bytecode_generation)) {
+    /* A module record the RAM table has no room for (it holds this load's
+       own) comes straight from its pack. */
+    BrowserSharedBody *direct = NULL;
+    bool promoted = kind == BROWSER_SCRIPT_BYTECODE_MODULE
+        ? browser_session_script_disk_promote_module(
+              runtime->session, key, runtime->module_bytecode_generation,
+              &direct)
+        : browser_session_script_disk_promote(
+              runtime->session, kind, key,
+              runtime->module_bytecode_generation);
+    if (direct != NULL) {
+        cached = direct;
+    } else if (promoted) {
         cached = browser_session_script_bytecode_acquire(
             runtime->session, kind, key,
             runtime->module_bytecode_generation);
@@ -581,7 +580,10 @@ static BrowserSharedBody *script_bytecode_lookup(
 /* Serialize a freshly compiled module into the cache when there is room.
    Serialization is an optional accelerator beside a compiled module: it is
    skipped rather than allowed to consume the realm's remaining headroom, and
-   a refusal never affects the module. */
+   a refusal never affects the module. A record the RAM table cannot keep
+   (full of this load's own records, which are never evicted for one
+   another) goes to the persistent tier's write queue when the tier writes,
+   so the next visit restores it from the card instead of compiling. */
 static void module_bytecode_store(ScriptRuntime *runtime, JSContext *context,
                                   BrowserScriptBytecodeKey *key,
                                   JSValueConst compiled,
@@ -595,13 +597,17 @@ static void module_bytecode_store(ScriptRuntime *runtime, JSContext *context,
     const size_t budget_reserve = SCRIPT_ADMISSION_PRESENTATION_RESERVE_BYTES;
     size_t budget_left = budget_remaining(runtime->session->budget);
     size_t minimum_bytecode = source_length / 4u + 1u;
-    /* The persistent tier, when on, writes from the RAM table at idle. */
+    /* The persistent tier, when on, writes from the RAM table and its own
+       write queue at idle. */
+    bool ram = browser_session_module_bytecode_may_fit(
+        runtime->session, key, minimum_bytecode,
+        runtime->module_bytecode_generation);
+    bool disk = !ram && browser_session_script_disk_may_queue(
+        runtime->session, key, minimum_bytecode);
     if (script_runtime_heap_available(runtime) < heap_reserve
         || budget_left < budget_reserve
         || minimum_bytecode > budget_left - budget_reserve
-        || !browser_session_module_bytecode_may_fit(
-               runtime->session, key, minimum_bytecode,
-               runtime->module_bytecode_generation)) {
+        || (!ram && !disk)) {
         js_rt_saturating_add_size(
             &result->module_bytecode_cache_admission_skips, 1);
         return;
@@ -616,16 +622,25 @@ static void module_bytecode_store(ScriptRuntime *runtime, JSContext *context,
         return;
     }
     budget_left = budget_remaining(runtime->session->budget);
-    bool stored = length != 0 && budget_left >= budget_reserve
-        && length <= budget_left - budget_reserve
+    bool room = length != 0 && budget_left >= budget_reserve
+        && length <= budget_left - budget_reserve;
+    bool stored = room && ram
         && browser_session_module_bytecode_put(
                runtime->session, key, runtime->module_bytecode_generation,
                bytecode, length);
+    bool queued = room && !stored
+        && browser_session_script_disk_queue(runtime->session, key,
+                                             bytecode, length);
     js_free(context, bytecode);
     if (stored) {
         js_rt_saturating_add_size(&result->module_bytecode_cache_stores, 1);
         js_rt_saturating_add_size(
             &result->module_bytecode_cache_stored_bytes, length);
+    } else if (queued) {
+        js_rt_saturating_add_size(
+            &result->module_bytecode_cache_disk_queued, 1);
+        js_rt_saturating_add_size(
+            &result->module_bytecode_cache_disk_queued_bytes, length);
     } else {
         js_rt_saturating_add_size(
             &result->module_bytecode_cache_admission_skips, 1);
@@ -725,7 +740,6 @@ JSValue js_rt_module_compile_external(
         }
         js_rt_saturating_add_size(&result->module_bytecode_cache_misses, 1);
     }
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
     /* The strip flag is runtime-wide and read when each function definition
        is created, so it covers exactly this module's parse. Imports resolved
        inside JS_Eval run through runtime_module_loader(), which clears it
@@ -733,7 +747,6 @@ JSValue js_rt_module_compile_external(
     JSRuntime *js_runtime = JS_GetRuntime(context);
     int previous_strip = JS_GetStripInfo(js_runtime);
     JS_SetStripInfo(js_runtime, strip_flags);
-#endif
     uint64_t parse_started_ns = js_rt_monotonic_time_ns();
     uint64_t nested_before_ns = runtime->module_nested_ns;
     JSValue compiled = js_rt_compile_source_type(
@@ -747,9 +760,7 @@ JSValue js_rt_module_compile_external(
     result->module_parse_us +=
         (parse_ns > nested_ns ? parse_ns - nested_ns : 0) / 1000u;
     result->module_source_bytes += source_length;
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
     JS_SetStripInfo(js_runtime, previous_strip);
-#endif
     if (cacheable && *admitted && !JS_IsException(compiled)) {
         if (response_no_store) {
             /* As for a classic script: no-store asks that the response not
@@ -1287,7 +1298,6 @@ static JSModuleDef *runtime_module_loader(JSContext *context,
                                           const char *module_name,
                                           void *opaque)
 {
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
     /* QuickJS resolves a module's imports inside the JS_Eval that compiled
        it, i.e. while that module's strip flag is still installed. Nothing
        loaded or run from here inherits it; the dependency's own compile
@@ -1299,9 +1309,6 @@ static JSModuleDef *runtime_module_loader(JSContext *context,
         context, module_name, opaque);
     JS_SetStripInfo(js_runtime, previous_strip);
     return module;
-#else
-    return runtime_module_load_timed(context, module_name, opaque);
-#endif
 }
 
 void js_rt_runtime_module_metadata_clear(ScriptRuntime *runtime)
@@ -2002,6 +2009,8 @@ static bool script_runtime_evaluate_external_typed_at(
         request_url == NULL ? "<external-script>" : request_url;
     int64_t script_handle = js_rt_bridge_register_node(
         &runtime->bridge, script_node);
+    /* Kept across evaluation for its load or error event. */
+    js_rt_bridge_keep_node_handle(&runtime->bridge, script_handle);
     if (script_handle == 0) {
         runtime->promise_rejection_state.active_source =
             previous_rejection_source;

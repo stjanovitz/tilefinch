@@ -5,11 +5,13 @@
 #include "tilefinch/browser_profile.h"
 #include "tilefinch/install_paths.h"
 
-/* A catalog's value offsets are 16-bit. From v12 a catalog stores a hash
-   and length per English key instead of the key (src/ui_language.c). The
-   row count is a u16 field; a loaded catalog is sized to its actual rows,
-   so this bound reserves nothing. */
-#define TILEFINCH_UI_TRANSLATION_BYTES (64u * 1024u - 1u)
+/* From v12 a catalog stores a hash and length per English key instead of
+   the key (src/ui_language.c). The row count is a u16 field and a loaded
+   catalog's value offsets are 32-bit, so the file bound is not tied to a
+   16-bit offset. A loaded catalog is sized to its actual rows; only a
+   download's receive buffer is this size. v12 to v16 files were generated
+   under 64 KiB - 1 and still load. */
+#define TILEFINCH_UI_TRANSLATION_BYTES (128u * 1024u)
 #define TILEFINCH_UI_TRANSLATION_ROWS 2048u
 #define TILEFINCH_UI_TRANSLATION_VALUE_BYTES 256u
 

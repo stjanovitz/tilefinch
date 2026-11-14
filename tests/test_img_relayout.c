@@ -286,6 +286,52 @@ static bool test_adoption_keeps_other_styles(void)
     return close_page();
 }
 
+/* The image layers a sheet adopted mid-turn gives an element. */
+static size_t image_layers(void)
+{
+    size_t count = 0;
+    for (size_t i = 0; i < navigation.page.layout.count; i++)
+        if (navigation.page.layout.commands[i].type == DRAW_IMAGE
+            && navigation.page.layout.commands[i].image != NULL) count++;
+    return count;
+}
+
+/* A sheet a shadow root adopts, read in the same turn, gives an element a
+   background image: the read installs the sheet (so it sees 8px), and the
+   relayout still finds and loads the image, as it does when nothing read
+   in between. */
+static bool test_read_sheet_still_finds_images(void)
+{
+    static const char change[] =
+        "const s=new CSSStyleSheet();s.replaceSync('.pic{display:block;"
+        "width:8px;height:8px;background-image:url(" GIF ")}');"
+        "const r=document.getElementById('host').attachShadow({mode:'open'});"
+        "r.innerHTML='<i class=pic></i>';r.adoptedStyleSheets=[s];";
+    size_t layers[2] = {0}, tracked[2] = {0};
+    for (int read = 0; read < 2; read++) {
+        CHECK(open_page("", "<div id=host></div>", 1000, ""));
+        size_t before = image_layers();
+        size_t read_appends = navigation.performance.mutation_style_read_appends;
+        char script[1024];
+        snprintf(script, sizeof(script), "%s%s", change,
+                 read ? "globalThis.pocSummary=String("
+                        "r.querySelector('.pic').offsetHeight)" : "");
+        CHECK(step(script));
+        CHECK(navigation.performance.mutation_style_read_appends
+              == read_appends + (size_t) read);
+        if (read)
+            CHECK(strcmp(navigation.page.script_result.summary, "8") == 0);
+        layers[read] = image_layers() - before;
+        tracked[read] = navigation.page.images.count;
+        CHECK(close_page());
+    }
+    if (layers[0] != layers[1] || tracked[0] != tracked[1] || layers[0] == 0)
+        fprintf(stderr, "read sheet images: layers=%zu/%zu tracked=%zu/%zu\n",
+                layers[0], layers[1], tracked[0], tracked[1]);
+    CHECK(layers[0] == 1 && layers[1] == 1 && tracked[0] == tracked[1]);
+    return true;
+}
+
 /* A layout script already forced is adopted when the refresh had nothing to
    change: not built a second time. */
 static bool test_forced_layout_adopted_when_table_unchanged(void)
@@ -1097,11 +1143,14 @@ static bool queue_holds(const lxb_dom_node_t *node)
 
 /* Infinite scroll with a full table: each look queues a batch of lazy images
    just below the reader, where they rest, so the resting queue grows by a
-   batch a look. It once outgrew the rank's stack table, which overran it. */
+   batch a look. It once outgrew the rank's stack table, which overran it.
+   The icons sit in rows beside the reader, so none of them gives way to the
+   new images. */
 static bool test_resting_queue_stays_within_rank(void)
 {
-    CHECK(open_table_full_page("img{display:block}",
-        "<div style='height:600px'></div><div id=host></div>"));
+    CHECK(open_table_full_page(
+        "img{display:block}svg{display:inline-block!important}",
+        "<div id=host style='position:absolute;top:600px;left:0'></div>"));
     enum { ROUNDS = 20 };
     for (unsigned round = 0; round < ROUNDS; round++) {
         char script[512];
@@ -1283,6 +1332,7 @@ int main(int argc, char **argv)
         {"new sheet", test_new_sheet_still_walks_document},
         {"geometry write", test_geometry_write_keeps_table},
         {"adoption", test_adoption_keeps_other_styles},
+        {"read sheet images", test_read_sheet_still_finds_images},
         {"forced layout", test_forced_layout_adopted_when_table_unchanged},
         {"sibling list", test_long_sibling_list_keeps_styles},
         {"first free", test_first_free_leaves_layout_cache},

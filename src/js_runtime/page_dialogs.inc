@@ -76,11 +76,11 @@ static JSValue page_dialog_default(JSContext *context, PageDialogKind kind)
     return JS_UNDEFINED;
 }
 
-/* The time a dialog was open is not script time: move this entry's
+/* The time a dialog (or the microphone prompt) was open is not script time: move this entry's
    watchdog deadlines past it, so a slow answer does not stop the script
    that asked. */
-static void page_dialog_extend_watchdog(ScriptRuntime *runtime,
-                                        uint64_t opened_ms)
+void js_rt_extend_watchdog_after_modal(ScriptRuntime *runtime,
+                                      uint64_t opened_ms)
 {
     uint64_t now_ms = monotonic_time_ms();
     uint64_t open_ms = now_ms > opened_ms ? now_ms - opened_ms : 0;
@@ -192,7 +192,7 @@ static JSValue js_window_page_dialog(JSContext *context,
         page_dialog_open = true;
         bool shown = tilefinch_platform_page_dialog(&request, &response);
         page_dialog_open = false;
-        page_dialog_extend_watchdog(runtime, now_ms);
+        js_rt_extend_watchdog_after_modal(runtime, now_ms);
         if (!shown) {
             /* Nothing was on screen: give back the count and the rate
                slot, so a frontend's refusal is never held against the

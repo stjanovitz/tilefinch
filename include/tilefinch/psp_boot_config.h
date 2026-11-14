@@ -390,4 +390,14 @@ bool psp_boot_config_drop_unusable_exit_to(PspBootConfig *config);
 bool psp_boot_config_automation_requires_engine_first(
     const PspBootConfig *config);
 
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+/* Validation only: boot.cfg `validation_js_heap_detail=1` adds the compact
+   QuickJS heap census (jsmem-census/jsmem-row) to the memory report at
+   controlled-exit and at input-script marks. It lives outside PspBootConfig
+   so the shipping struct layout and parser are unchanged; the last
+   successful load sets it and psp_boot_config_disable_automation clears it.
+   Default 0. */
+bool psp_boot_config_validation_js_heap_detail(void);
+#endif
+
 #endif

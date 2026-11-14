@@ -17,6 +17,9 @@ authoritative when a focused manual is narrower.
 
 - [PSP_ENVELOPE.md](PSP_ENVELOPE.md): memory, CPU-slice, executable-size and
   storage budgets, and the link-time ratchets.
+- [CODE_LAYOUT.md](CODE_LAYOUT.md): why code placement moves PSP device
+  timings, how to compare device timings between builds, and the
+  hot-function order experiment.
 
 ## Input harness
 

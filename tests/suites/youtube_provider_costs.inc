@@ -596,7 +596,7 @@ static int test_youtube_rating_reuses_cached_identity(void)
     return 0;
 }
 
-/* perf-1110 R1: the PSP loop pumps a provider navigation again within one
+/* The PSP loop pumps a provider navigation again within one
    frame only while its progress counter moves, and its watchdog cancels a
    load whose counter stops. Both read load.progress_units, which a provider
    navigation left at zero: the watchdog then cancelled any provider load

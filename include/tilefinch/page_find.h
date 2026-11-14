@@ -51,6 +51,17 @@ bool page_find_build(PageFindIndex *index, Budget *budget,
                      const LayoutDocument *layout, const char *query);
 void page_find_clear(PageFindIndex *index);
 bool page_find_select_nearest(PageFindIndex *index, int document_y);
+/* A scan for `query` (as an index holds it, normalized) through text given
+   piece by piece, folded and space-collapsed as matches are: where a match
+   may lie in text not laid out yet. Generated text is not seen, and the
+   pieces are read as one run; the index built from the layout decides. */
+typedef struct PageFindTextScan {
+    size_t matched;
+    bool previous_space;
+} PageFindTextScan;
+/* Whether the query ends in `text`, given the scan of the text before it. */
+bool page_find_text_scan(const char *query, PageFindTextScan *scan,
+                         const char *text, size_t length);
 /* Reuses KMP positions when a relayout changed geometry but retained the
    exact same text stream and block/space boundaries. */
 bool page_find_refresh_geometry(PageFindIndex *index,

@@ -39,5 +39,8 @@ int psp_canvas_ge_scale(void *context, uint16_t *back,
                         uint64_t *elapsed_us);
 bool psp_canvas_ge_busy(void *context);
 void psp_canvas_ge_fail(void *context, const char *reason);
+/* Frees the list and vertex block (about 86 KiB, allocated by the first
+   scale()) unless a submission may still be reading it. */
+bool psp_canvas_ge_release(void *context);
 
 #endif

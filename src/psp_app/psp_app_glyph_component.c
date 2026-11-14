@@ -13,7 +13,10 @@ static void glyph_refresh_ui(
         ? PSP_UI_GLYPH_COMPONENT_READY
         : PSP_UI_GLYPH_COMPONENT_NOT_INSTALLED;
     int progress = -1;
-    if (session->installer != NULL) {
+    if (session->installer != NULL
+        || (session->operation_initialized
+            && (session->install_snapshot.phase == TILEFINCH_UPDATE_INSTALL_ERROR
+                || session->install_snapshot.phase == TILEFINCH_UPDATE_INSTALL_CANCELLED))) {
         if (session->install_snapshot.phase == TILEFINCH_UPDATE_INSTALL_ERROR
             || session->install_snapshot.phase
                    == TILEFINCH_UPDATE_INSTALL_CANCELLED) {
@@ -430,7 +433,7 @@ static bool glyph_offer_track(PspGlyphComponentSession *session,
        cancelled. Offline already raised the menu path's own notice. */
     session->offer_install_pending = false;
     const char *message = psp_glyph_component_session_take_failure(session);
-    if (message == NULL && session->installer != NULL
+    if (message == NULL && session->operation_initialized
         && session->install_snapshot.phase
                == TILEFINCH_UPDATE_INSTALL_CANCELLED)
         message = session->install_snapshot.message;

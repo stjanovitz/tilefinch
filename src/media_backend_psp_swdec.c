@@ -1,4 +1,5 @@
 #include "tilefinch/media_backend.h"
+#include "tilefinch/platform.h"
 
 #include <pspaudio.h>
 #include <pspkernel.h>
@@ -739,15 +740,7 @@ bool media_psp_swdec_backend_quarantined(void)
     return swdec_quarantined;
 }
 
-static void swdec_error(
-    char *error, size_t error_size, const char *format, ...)
-{
-    if (error == NULL || error_size == 0) return;
-    va_list arguments;
-    va_start(arguments, format);
-    vsnprintf(error, error_size, format, arguments);
-    va_end(arguments);
-}
+#define swdec_error tilefinch_format_error
 
 static uint64_t swdec_sample_time_us(const MediaMp4Sample *sample)
 {
@@ -2739,13 +2732,6 @@ static void swdec_release_quarantine(void *opaque, unsigned slot)
     /* A timed-out DMA may still read this memory. Process-lifetime only. */
 }
 
-static bool swdec_is_quarantined(const void *opaque, unsigned slot)
-{
-    const PspSwdecBackend *backend = opaque;
-    return backend == NULL || slot >= SWDEC_RING_SLOTS
-        || backend->slots[slot].quarantined;
-}
-
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
 static uint64_t swdec_read_u64(const uint64_t *value)
 {
@@ -3119,7 +3105,6 @@ static const MediaBackendPresentationOps swdec_presentation_ops = {
     .end_auxiliary_read = swdec_release,
     .quarantine = swdec_quarantine,
     .release_quarantine = swdec_release_quarantine,
-    .is_quarantined = swdec_is_quarantined,
     .note_displayed = swdec_note_displayed,
     .note_quiesced = swdec_note_quiesced
 };

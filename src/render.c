@@ -1773,7 +1773,8 @@ bool render_write_frame_ppm(const char *path, const uint16_t *frame,
     if (pixels > frame_pixels) return false;
     FILE *file = fopen(path, "wb");
     if (file == NULL) return false;
-    fprintf(file, "P6\n%d %d\n255\n", width, height);
+    (void) tilefinch_platform_file_printf(file, "P6\n%d %d\n255\n",
+                                          width, height);
     /* Convert in bounded chunks and write each with one fwrite; the former
        three fputc calls per pixel dominated capture cost. */
     enum { RENDER_PPM_CHUNK_PIXELS = 1024 };

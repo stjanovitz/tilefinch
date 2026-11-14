@@ -4160,6 +4160,99 @@ static int test_has_attribute_readers_agree(void)
     return failed ? 1 : 0;
 }
 
+/* A class write asks whether any :has() rule mentions a changed token
+   where it can move a :has() answer: inside the argument, or before a
+   sibling combinator. The tokens are collected once per sheet; each case
+   is one position rule, and the long selector holds the collection to one
+   pass over its text (the per-token rescan was quadratic: 0.47 s on the
+   PSP for cnn.com's :has() rules). */
+static int test_has_class_positions(void)
+{
+    static const struct {
+        const char *css;
+        const char *token;
+        bool sensitive;
+    } cases[] = {
+        {".w:has(.a){color:red}", "a", true},
+        {".a .w:has(.b){color:red}", "a", false},
+        {".a + .w:has(.b){color:red}", "a", true},
+        {".a~.w:has(.b){color:red}", "a", true},
+        {".w:has(.b) + .a{color:red}", "a", false},
+        {".w:has(.b) + .a{color:red}", "b", true},
+        {".w:has([title=\".q\"]){color:red}", "q", true},
+        {".w:has(:is(:not(.d))){color:red}", "d", true},
+        {".x:not(.e):has(.f){color:red}", "e", false},
+        {".x:not(.e):has(.f){color:red}", "f", true},
+        {".x:nth-child(2n+1 of .g):has(.f){color:red}", "g", false},
+        {".w:has(.b) .z{color:red}", "z", false},
+    };
+    bool failed = false;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        Budget budget;
+        budget_init(&budget, 8u * MIB);
+        CHECK(budget_install_lexbor(&budget));
+        PocDocument document = {0};
+        Stylesheet sheet = {0};
+        static const char html[] = "<div class=w>x</div>";
+        CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17)
+              && stylesheet_build(&sheet, &budget, &document, 480)
+              && stylesheet_add_css(&sheet, cases[i].css,
+                                    strlen(cases[i].css)));
+        bool sensitive = stylesheet_attribute_change_may_affect_has(
+            &sheet, "class", 5, NULL, 0, cases[i].token,
+            strlen(cases[i].token));
+        if (sensitive != cases[i].sensitive) {
+            fprintf(stderr, "has class case %zu (%s / %s): %d, want %d\n",
+                    i, cases[i].css, cases[i].token, sensitive,
+                    cases[i].sensitive);
+            failed = true;
+        }
+        stylesheet_destroy(&sheet);
+        document_destroy(&document);
+        CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    }
+    /* 2,000 rules of 1,000 bytes: a descendant chain of 140 classes the
+       position rule has to place, then one class inside the argument. */
+    Budget budget;
+    budget_init(&budget, 24u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    static const char html[] = "<div class=w>x</div>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    enum { RULES = 2000, CHAIN = 140 };
+    size_t capacity = (size_t) RULES * (CHAIN * 7u + 40u), used = 0;
+    char *css = malloc(capacity);
+    CHECK(css != NULL);
+    for (unsigned r = 0; r < RULES; r++) {
+        for (unsigned k = 0; k < CHAIN; k++)
+            used += (size_t) snprintf(css + used, capacity - used, ".p%u ",
+                                      k);
+        used += (size_t) snprintf(css + used, capacity - used,
+                                  ".w:has(.x%u){color:red}", r);
+    }
+    CHECK(used < capacity && stylesheet_add_css(&sheet, css, used));
+    free(css);
+    CHECK(sheet.count >= RULES);
+    uint64_t started = tilefinch_platform_monotonic_time_ns();
+    bool inside = stylesheet_attribute_change_may_affect_has(
+        &sheet, "class", 5, NULL, 0, "x1999", 5);
+    uint64_t elapsed = tilefinch_platform_monotonic_time_ns() - started;
+    bool chain = stylesheet_attribute_change_may_affect_has(
+        &sheet, "class", 5, NULL, 0, "p7", 2);
+    printf("has class positions: rules=%zu first-class-write-us=%llu\n",
+           sheet.count, (unsigned long long) (elapsed / 1000u));
+    CHECK(inside && !chain);
+    /* One pass per selector: 11 ms on the host. The rescan per token took
+       0.42 s. */
+    CHECK(elapsed < 100u * 1000u * 1000u);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return failed ? 1 : 0;
+}
+
 static int test_retained_focus_descendants(void)
 {
     Budget budget;
@@ -7765,6 +7858,8 @@ int main(int argc, char **argv)
         return test_retained_focus_descendants();
     if (argc == 2 && strcmp(argv[1], "--has-attribute-only") == 0)
         return test_has_attribute_readers_agree();
+    if (argc == 2 && strcmp(argv[1], "--has-class-positions-only") == 0)
+        return test_has_class_positions();
     if (argc == 2 && strcmp(argv[1], "--declaration-footprint-only") == 0)
         return test_unmatched_declaration_footprint();
     if (argc == 2 && strcmp(argv[1], "--custom-footprint-only") == 0)
@@ -7829,6 +7924,7 @@ int main(int argc, char **argv)
     CHECK(test_quoted_pseudo_element_punctuation() == 0);
     CHECK(test_retained_focus_descendants() == 0);
     CHECK(test_has_attribute_readers_agree() == 0);
+    CHECK(test_has_class_positions() == 0);
     if (argc == 2 && strcmp(argv[1], "--bounded-out-focus-only") == 0)
         return test_bounded_out_sheet_keeps_focus_fast_path();
     CHECK(test_bounded_out_sheet_keeps_focus_fast_path() == 0);

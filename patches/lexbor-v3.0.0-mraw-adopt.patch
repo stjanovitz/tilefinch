@@ -1,0 +1,117 @@
+--- a/source/lexbor/core/mraw.c
++++ b/source/lexbor/core/mraw.c
+@@ -386,6 +386,91 @@
+ }
+ 
+ void *
++lexbor_mraw_adopt(lexbor_mraw_t *mraw, uint8_t *block, size_t block_size,
++                  size_t size)
++{
++    size_t length, diff;
++    lexbor_mem_t *mem = mraw->mem;
++    lexbor_mem_chunk_t *chunk = mem->chunk, *adopted;
++
++    if (block == NULL || size == 0
++        || size > SIZE_MAX - LEXBOR_MEM_ALIGN_STEP - lexbor_mraw_meta_size())
++    {
++        return NULL;
++    }
++
++    size = lexbor_mem_align(size);
++    length = size + lexbor_mraw_meta_size();
++
++    if (length > block_size) {
++        return NULL;
++    }
++
++    if (chunk->length == 0) {
++        /* An empty current chunk takes the block as its data. */
++        lexbor_mem_chunk_destroy(mem, chunk, false);
++
++        chunk->data = block;
++        chunk->size = block_size;
++        chunk->length = length;
++    }
++    else {
++        if ((SIZE_MAX - mem->chunk_length) == 0) {
++            return NULL;
++        }
++
++        adopted = lexbor_calloc(1, sizeof(lexbor_mem_chunk_t));
++        if (adopted == NULL) {
++            return NULL;
++        }
++
++        /* Save the current chunk's tail to cache, as a new chunk does. */
++        diff = lexbor_mem_align_floor(chunk->size - chunk->length);
++
++        if (diff > lexbor_mraw_meta_size()) {
++            diff -= lexbor_mraw_meta_size();
++
++#if defined(LEXBOR_HAVE_ADDRESS_SANITIZER)
++            ASAN_UNPOISON_MEMORY_REGION(&chunk->data[chunk->length],
++                                        lexbor_mraw_meta_size());
++#endif
++
++            lexbor_mraw_meta_set(&chunk->data[chunk->length], &diff);
++
++#if defined(LEXBOR_HAVE_ADDRESS_SANITIZER)
++            ASAN_POISON_MEMORY_REGION(&chunk->data[chunk->length],
++                                      diff + lexbor_mraw_meta_size());
++#endif
++
++            lexbor_bst_insert(mraw->cache,
++                              lexbor_bst_root_ref(mraw->cache), diff,
++                              lexbor_mraw_data_begin(&chunk->data[chunk->length]));
++
++            chunk->length = chunk->size;
++        }
++
++        adopted->data = block;
++        adopted->size = block_size;
++        adopted->length = length;
++        adopted->prev = chunk;
++
++        chunk->next = adopted;
++        mem->chunk = adopted;
++        mem->chunk_length++;
++    }
++
++#if defined(LEXBOR_HAVE_ADDRESS_SANITIZER)
++    ASAN_POISON_MEMORY_REGION(block, block_size);
++    ASAN_UNPOISON_MEMORY_REGION(block, length);
++#endif
++
++    mraw->ref_count++;
++
++    lexbor_mraw_meta_set(block, &size);
++    return lexbor_mraw_data_begin(block);
++}
++
++void *
+ lexbor_mraw_free(lexbor_mraw_t *mraw, void *data)
+ {
+     size_t size = lexbor_mraw_data_size(data);
+--- a/source/lexbor/core/mraw.h
++++ b/source/lexbor/core/mraw.h
+@@ -58,7 +58,20 @@
+ LXB_API void *
+ lexbor_mraw_free(lexbor_mraw_t *mraw, void *data);
+ 
++/*
++ * Tilefinch: make a block from lexbor_malloc() an allocation of this mraw
++ * without copying it. The block holds lexbor_mraw_meta_size() bytes of room
++ * followed by the data; block_size is its whole allocated size and size the
++ * data size. The block becomes the current chunk, as lexbor_mraw_alloc()
++ * makes one for a large request, and is freed with the mraw. Returns the
++ * data, or NULL when the block is too small or the chunk record cannot be
++ * allocated; the caller then still owns the block.
++ */
++LXB_API void *
++lexbor_mraw_adopt(lexbor_mraw_t *mraw, uint8_t *block, size_t block_size,
++                  size_t size);
+ 
++
+ /*
+  * Inline functions
+  */

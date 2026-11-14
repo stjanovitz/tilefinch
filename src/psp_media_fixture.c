@@ -1,4 +1,5 @@
 #include "tilefinch/psp_media_fixture.h"
+#include "tilefinch/platform.h"
 
 #ifdef __PSP__
 
@@ -31,15 +32,7 @@ typedef struct {
     size_t length;
 } FixtureReader;
 
-static void fixture_error(
-    char *error, size_t error_size, const char *format, ...)
-{
-    if (error == NULL || error_size == 0) return;
-    va_list arguments;
-    va_start(arguments, format);
-    vsnprintf(error, error_size, format, arguments);
-    va_end(arguments);
-}
+#define fixture_error tilefinch_format_error
 
 static bool fixture_read(
     void *opaque, uint64_t offset, void *destination, size_t length)

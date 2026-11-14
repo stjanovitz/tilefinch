@@ -2203,7 +2203,8 @@ bool layout_block_grid_section(LayoutContext *context,
                                         &later)
                     && later.row <= laid_out_row;
             }
-            if (moved) layout_note_preview_cut(context, true);
+            if (moved)
+                layout_note_preview_inexact(context, row_starts[0]);
         }
         if (reshare_possible)
             grid_resolve_final_rows(

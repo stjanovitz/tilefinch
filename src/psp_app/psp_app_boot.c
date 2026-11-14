@@ -577,6 +577,9 @@ TILEFINCH_COLD_PATH void psp_boot_apply_profile_policy(
             "tilefinch-content-blocker: custom list unavailable; "
             "using basic mode\n");
     }
+    (void) browser_engine_content_blocker_set_paywall_scripts(
+        browser->engine,
+        browser_profile_content_blocker_paywall_scripts(browser->profile));
     if (!psp_content_blocker_apply_allowed_sites(browser->engine, browser->profile)) {
         printf("tilefinch-content-blocker: allowlist unavailable\n");
     }

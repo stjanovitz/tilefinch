@@ -2893,6 +2893,88 @@ static size_t has_decode_class(const char *selector, size_t length,
     return used;
 }
 
+/* has_selector_token_is_relational for every position of one selector in
+   a single forward pass. That test rescans the selector from its start for
+   each token, so collecting a long selector's classes was quadratic in its
+   length (on cnn.com the first class write of each sheet generation took
+   4 ms on the host and 0.47 s on the PSP). The answer is the same
+   function of the prefix: the state before a position is advanced to it
+   rather than rebuilt, and the sibling combinator the rescan looks for
+   after a clean position is the last one the pass finds. */
+typedef struct {
+    const char *selector;
+    size_t length;
+    size_t at;
+    size_t round;
+    int square;
+    char quote;
+    bool stack_full;
+    bool has_stack[16];
+    /* One past the last '+' or '~' outside quotes and brackets, else 0. */
+    size_t sibling_end;
+} HasRelationalScan;
+
+static void has_relational_scan_begin(HasRelationalScan *scan,
+                                      const char *selector, size_t length)
+{
+    memset(scan, 0, sizeof(*scan));
+    scan->selector = selector;
+    scan->length = length;
+    char quote = '\0';
+    int square = 0;
+    for (size_t i = 0; i < length; i++) {
+        char value = selector[i];
+        if (quote != '\0') {
+            if (value == '\\' && i + 1 < length) i++;
+            else if (value == quote) quote = '\0';
+            continue;
+        }
+        if (value == '\'' || value == '"') quote = value;
+        else if (value == '[') square++;
+        else if (value == ']' && square > 0) square--;
+        else if (square == 0 && (value == '+' || value == '~'))
+            scan->sibling_end = i + 1;
+    }
+}
+
+/* Positions must be asked for in increasing order. */
+static bool has_relational_scan_at(HasRelationalScan *scan, size_t token_at)
+{
+    const char *selector = scan->selector;
+    size_t length = scan->length;
+    size_t stack_limit = sizeof(scan->has_stack) / sizeof(scan->has_stack[0]);
+    for (; scan->at < token_at && scan->at < length && !scan->stack_full;
+         scan->at++) {
+        size_t i = scan->at;
+        char value = selector[i];
+        if (scan->quote != '\0') {
+            if (value == '\\' && i + 1 < length) scan->at++;
+            else if (value == scan->quote) scan->quote = '\0';
+            continue;
+        }
+        if (value == '\'' || value == '"') scan->quote = value;
+        else if (value == '[') scan->square++;
+        else if (value == ']' && scan->square > 0) scan->square--;
+        else if (scan->square == 0 && value == '(') {
+            if (scan->round == stack_limit) {
+                scan->stack_full = true;
+                break;
+            }
+            scan->has_stack[scan->round++] = i >= 4
+                && memcmp(selector + i - 4, ":has", 4) == 0;
+        } else if (scan->square == 0 && value == ')' && scan->round > 0) {
+            scan->round--;
+        }
+    }
+    /* The rescan returns at a seventeenth open parenthesis before the
+       token; positions past it all answer yes. */
+    if (scan->stack_full) return true;
+    for (size_t i = 0; i < scan->round; i++)
+        if (scan->has_stack[i]) return true;
+    if (scan->square != 0 || scan->quote != '\0') return true;
+    return scan->sibling_end > token_at;
+}
+
 static int has_hash_compare(const void *left, const void *right)
 {
     uint32_t a = *(const uint32_t *) left, b = *(const uint32_t *) right;
@@ -2904,6 +2986,8 @@ static bool has_collect_class_hashes(const char *selector, size_t length,
                                      size_t *count, bool *overflow)
 {
     if (!span_contains_text(selector, length, ":has(")) return true;
+    HasRelationalScan scan;
+    has_relational_scan_begin(&scan, selector, length);
     for (size_t i = 0; i + 1 < length; i++) {
         if (selector[i] != '.') continue;
         unsigned char token[256];
@@ -2915,7 +2999,7 @@ static bool has_collect_class_hashes(const char *selector, size_t length,
                 || selector[i + 1] == '\\') *overflow = true;
             continue;
         }
-        if (!has_selector_token_is_relational(selector, length, i)) continue;
+        if (!has_relational_scan_at(&scan, i)) continue;
         if (*count == capacity) {
             *overflow = true;
             return true;

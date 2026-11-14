@@ -19,6 +19,4 @@ CaptureStatus inspect_and_condition_capture(
     unsigned sample_rate
 );
 
-const char *capture_status_name(CaptureStatus status);
-
 #endif

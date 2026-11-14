@@ -6,6 +6,9 @@
 #include "tilefinch/ui_language.h"
 #include "tilefinch/pixel_math.h"
 #include "tilefinch/psp_power_policy.h"
+#include "tilefinch/media_capture.h"
+#include "tilefinch/platform.h"
+#include "../src/psp_ui_menu.h"
 #include "tilefinch/youtube_subtitles.h"
 #include "../src/psp_ui_theme.h"
 #include "../src/tilefinch_test_faults.h"
@@ -737,7 +740,7 @@ static bool test_input_mapping_and_menu(void)
        the last one. It cycles through the zoom steps from 100%. */
     input.pressed = PSP_UI_BUTTON_DOWN;
     intent = psp_ui_update(&ui, &input);
-    CHECK(ui.options_selection == 52 && ui.page_zoom_percent == 100);
+    CHECK(ui.options_selection == 53 && ui.page_zoom_percent == 100);
     static const unsigned zoom_right[] = {110, 125, 150, 50, 67};
     for (size_t i = 0; i < sizeof(zoom_right) / sizeof(zoom_right[0]); i++) {
         input.pressed = PSP_UI_BUTTON_RIGHT;
@@ -758,7 +761,7 @@ static bool test_input_mapping_and_menu(void)
     CHECK(ui.options_selection == 1);
     input.pressed = PSP_UI_BUTTON_DOWN;
     intent = psp_ui_update(&ui, &input);
-    CHECK(ui.options_selection == 52);
+    CHECK(ui.options_selection == 53);
     input.pressed = PSP_UI_BUTTON_DOWN;
     intent = psp_ui_update(&ui, &input);
     CHECK(ui.options_selection == 2);
@@ -1149,7 +1152,7 @@ static bool test_input_mapping_and_menu(void)
        index is the last one; Show by default, X hides banners. */
     input.pressed = PSP_UI_BUTTON_DOWN;
     intent = psp_ui_update(&ui, &input);
-    CHECK(ui.options_selection == 51 && ui.youtube_channel_banners);
+    CHECK(ui.options_selection == 52 && ui.youtube_channel_banners);
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_update(&ui, &input);
     CHECK(!ui.youtube_channel_banners
@@ -3251,7 +3254,7 @@ static bool test_site_storage_screens(void)
         BROWSER_SITE_STORAGE_ASK
     };
     ui.screen = PSP_UI_SCREEN_SITE_CONTROLS;
-    ui.menu_selection = 7;
+    ui.menu_selection = 8;
     ui.site_storage_state = BROWSER_SITE_STORAGE_ASK;
     for (size_t at = 0; at < 3; at++) {
         intent = site_storage_press(&ui, PSP_UI_BUTTON_CONFIRM);
@@ -3262,6 +3265,116 @@ static bool test_site_storage_screens(void)
     psp_ui_composite(&ui, frame, WIDTH, HEIGHT, WIDTH);
     intent = site_storage_press(&ui, PSP_UI_BUTTON_CONFIRM);
     CHECK(intent.setting.value.unsigned_value == BROWSER_SITE_STORAGE_STICK);
+    return true;
+}
+
+/* The microphone: its Permissions & controls row cycles Ask, Allow, Block;
+   Page tools offers Stop microphone only while capture is live; the prompt
+   and the indicator draw. */
+static MediaCaptureVerdict capture_start(void *context,
+                                         MediaCaptureFormat *format)
+{
+    (void) context;
+    (void) format;
+    return MEDIA_CAPTURE_GRANTED;
+}
+
+static bool frame_differs(const uint16_t *a, const uint16_t *b, size_t count)
+{
+    return memcmp(a, b, count * sizeof(*a)) != 0;
+}
+
+static bool test_microphone_screens(void)
+{
+    enum { WIDTH = 480, HEIGHT = 272 };
+    static uint16_t frame[WIDTH * HEIGHT], plain[WIDTH * HEIGHT];
+    PspUiState ui;
+    psp_ui_init(&ui);
+    psp_ui_set_page(&ui, "Tuner", "https://tuner.example/", true);
+    ui.screen = PSP_UI_SCREEN_SITE_CONTROLS;
+    ui.menu_selection = 7;
+    ui.microphone_site_answer = 0;
+    static const unsigned expected[] = {1u, 2u, 0u};
+    for (size_t at = 0; at < 3; at++) {
+        PspUiIntent intent = site_storage_press(&ui, PSP_UI_BUTTON_CONFIRM);
+        CHECK(intent.setting.id == PSP_UI_SETTING_MICROPHONE_SITE
+              && intent.setting.value.unsigned_value == expected[at]
+              && ui.microphone_site_answer == expected[at]);
+    }
+
+    /* Page tools: no stop row while nothing is live. */
+    ui.screen = PSP_UI_SCREEN_PAGE_TOOLS;
+    ui.youtube_signin_continue = false;
+    ui.microphone_live = false;
+    ui.menu_selection = UI_PAGE_TOOLS_ITEM_COUNT - 1u;
+    (void) site_storage_press(&ui, PSP_UI_BUTTON_DOWN);
+    CHECK(ui.menu_selection == 0u);
+    ui.microphone_live = true;
+    ui.menu_selection = UI_PAGE_TOOLS_ITEM_COUNT - 1u;
+    (void) site_storage_press(&ui, PSP_UI_BUTTON_DOWN);
+    CHECK(ui.menu_selection == UI_PAGE_TOOLS_ITEM_COUNT);
+    psp_ui_composite(&ui, frame, WIDTH, HEIGHT, WIDTH);
+    PspUiIntent intent = site_storage_press(&ui, PSP_UI_BUTTON_CONFIRM);
+    CHECK(intent.action == PSP_UI_ACTION_STOP_MICROPHONE);
+    CHECK(strcmp(psp_ui_action_name(PSP_UI_ACTION_STOP_MICROPHONE),
+                 "stop-microphone") == 0);
+    /* With Continue to YouTube too, the stop row comes after it. */
+    ui.screen = PSP_UI_SCREEN_PAGE_TOOLS;
+    ui.youtube_signin_continue = true;
+    ui.menu_selection = UI_PAGE_TOOLS_ITEM_COUNT;
+    intent = site_storage_press(&ui, PSP_UI_BUTTON_CONFIRM);
+    CHECK(intent.action == PSP_UI_ACTION_YOUTUBE_SIGNIN_CONTINUE);
+    ui.screen = PSP_UI_SCREEN_PAGE_TOOLS;
+    ui.menu_selection = UI_PAGE_TOOLS_ITEM_COUNT + 1u;
+    intent = site_storage_press(&ui, PSP_UI_BUTTON_CONFIRM);
+    CHECK(intent.action == PSP_UI_ACTION_STOP_MICROPHONE);
+
+    /* The prompt draws over the page, and clearing it returns there. */
+    psp_ui_init(&ui);
+    psp_ui_set_page(&ui, "Tuner", "https://tuner.example/", true);
+    ui.toast_frames = 0;
+    psp_ui_composite(&ui, plain, WIDTH, HEIGHT, WIDTH);
+    PspUiMicrophonePromptView view = {
+        .host = "tuner.example", .can_remember = true, .selection = 0
+    };
+    psp_ui_show_microphone_prompt(&ui, &view);
+    CHECK(ui.screen == PSP_UI_SCREEN_MICROPHONE_PROMPT
+          && ui.overlay_animation_frames == 0);
+    psp_ui_composite(&ui, frame, WIDTH, HEIGHT, WIDTH);
+    CHECK(frame_differs(frame, plain, WIDTH * HEIGHT));
+    view.selection = 2;
+    view.can_remember = false;
+    psp_ui_composite(&ui, frame, WIDTH, HEIGHT, WIDTH);
+    psp_ui_clear_microphone_prompt(&ui);
+    CHECK(ui.screen == PSP_UI_SCREEN_PAGE && ui.microphone_prompt == NULL);
+
+    /* The indicator: drawn whenever capture is live, whatever the page.
+       Composite draws over the buffer's page pixels, so both frames start
+       from the same blank page. */
+    memset(plain, 0, sizeof(plain));
+    psp_ui_composite(&ui, plain, WIDTH, HEIGHT, WIDTH);
+    TilefinchPlatformServices services = {
+        .media_capture_start = capture_start
+    };
+    tilefinch_platform_set_services(&services);
+    uint32_t generation = 0;
+    CHECK(media_capture_session_open(&generation, NULL)
+          == MEDIA_CAPTURE_GRANTED);
+    CHECK(tilefinch_media_capture_indicator());
+    memset(frame, 0, sizeof(frame));
+    psp_ui_composite(&ui, frame, WIDTH, HEIGHT, WIDTH);
+    CHECK(frame_differs(frame, plain, WIDTH * HEIGHT));
+    /* Only the top-right corner changed. */
+    for (int y = 0; y < HEIGHT; y++)
+        for (int x = 0; x < WIDTH; x++)
+            if (frame[y * WIDTH + x] != plain[y * WIDTH + x])
+                CHECK(x >= WIDTH - 40 && y < 70);
+    tilefinch_media_capture_stop(MEDIA_CAPTURE_END_USER);
+    CHECK(!tilefinch_media_capture_indicator());
+    memset(frame, 0, sizeof(frame));
+    psp_ui_composite(&ui, frame, WIDTH, HEIGHT, WIDTH);
+    CHECK(!frame_differs(frame, plain, WIDTH * HEIGHT));
+    tilefinch_platform_set_services(NULL);
     return true;
 }
 
@@ -3547,7 +3660,6 @@ static bool test_boot_entrance_becomes_home(void)
     psp_ui_composite(&ui, settled, WIDTH, HEIGHT, WIDTH);
     PspUiBootEntranceView view = {
         .frame = PSP_UI_BOOT_ENTRANCE_FRAMES,
-        .wave = true,
         .branch_status = NULL
     };
     psp_ui_boot_entrance_composite(
@@ -3581,23 +3693,15 @@ static bool test_boot_entrance_becomes_home(void)
         &view, &ui, frame, WIDTH, HEIGHT, WIDTH);
     CHECK(memcmp(entrance, frame, sizeof(entrance)) == 0);
 
-    /* The legacy wave preference is deliberately inert. Boot output is
-       identical for both values until a GPU-owned implementation exists. */
+    /* Before the glide the static entrance is still the mark alone. */
     view.frame = 8u;
-    view.wave = true;
-    psp_ui_boot_entrance_composite(
-        &view, &ui, frame, WIDTH, HEIGHT, WIDTH);
-    view.wave = false;
     psp_ui_boot_entrance_composite(
         &view, &ui, held, WIDTH, HEIGHT, WIDTH);
-    CHECK(memcmp(frame, held, sizeof(held)) == 0);
-    /* At this early frame the static entrance is still the mark alone. */
     CHECK(memcmp(entrance, held, sizeof(held)) == 0);
 
     /* The slow branch holds the mark wherever the choreography had got to,
        and adds one line. Nothing else moves. */
     view.frame = 16u;
-    view.wave = true;
     view.branch_status = "READING SETTINGS";
     psp_ui_boot_entrance_composite(
         &view, &ui, held, WIDTH, HEIGHT, WIDTH);
@@ -3905,7 +4009,7 @@ static bool test_page_toast_waits_under_menu(void)
     ui.screen = PSP_UI_SCREEN_MENU;
     psp_ui_composite(&ui, menu_plain, WIDTH, HEIGHT, WIDTH);
     ui.screen = PSP_UI_SCREEN_PAGE;
-    psp_ui_show_status(&ui, "LOADING - CIRCLE CANCELS", 120);
+    psp_ui_show_status(&ui, "LOADING PAGE  O CANCEL", 120);
     ui.toast_entry_frames = 0;
     psp_ui_composite(&ui, page_toast, WIDTH, HEIGHT, WIDTH);
     ui.screen = PSP_UI_SCREEN_MENU;
@@ -5315,7 +5419,6 @@ static bool test_startup_views_are_bounded_and_distinct(void)
        primitive list, so all non-XMB boot surfaces share one logo geometry. */
     PspUiBootEntranceView entrance_view = {
         .frame = 0u,
-        .wave = false,
         .branch_status = NULL
     };
     psp_ui_boot_entrance_composite(
@@ -6907,7 +7010,8 @@ static bool test_preview_hint_toast(void)
     PspUiState ui;
     psp_ui_init(&ui);
     PspUiInput idle = { .analog_x = 128, .analog_y = 128, .elapsed_ms = 16 };
-    psp_ui_show_status(&ui, "LOADING  O CANCEL", 120);
+    psp_ui_set_loading(&ui, true, -1);
+    psp_ui_show_loading_status(&ui, 1u, 120);
     psp_ui_set_preview_hint(&ui, true);
     CHECK(strcmp(ui.status, "PREVIEW READY  R TO READ") == 0
           && ui.toast_entry_frames != 0 && ui.toast_frames == 600);
@@ -6934,6 +7038,61 @@ static bool test_preview_hint_toast(void)
     CHECK(ui.toast_frames == 180
           && strcmp(ui.status, "PAGE LOAD STOPPED") == 0);
     psp_ui_set_preview_hint(NULL, true);
+    return true;
+}
+
+/* A page load's status names its phase in one form, follows it in place
+   (no new entry motion), comes back for a new phase while the load has no
+   preview on screen, leaves other toasts alone, and ends with the load. */
+static bool test_loading_status_follows_phase(void)
+{
+    PspUiState ui;
+    psp_ui_init(&ui);
+    PspUiInput idle = { .analog_x = 128, .analog_y = 128, .elapsed_ms = 16 };
+    static const char *const texts[4] = {
+        "CONNECTING  O CANCEL", "RECEIVING PAGE  O CANCEL",
+        "RUNNING PAGE SCRIPTS  O CANCEL", "LOADING PAGE  O CANCEL"};
+    for (unsigned phase = 0; phase < 4u; phase++)
+        CHECK(strcmp(psp_ui_loading_status_text(phase), texts[phase]) == 0);
+    CHECK(strcmp(psp_ui_loading_status_text(9u), texts[3]) == 0);
+    psp_ui_set_loading(&ui, true, -1);
+    psp_ui_show_loading_status(&ui, 0u, 120);
+    CHECK(strcmp(ui.status, texts[0]) == 0 && ui.toast_entry_frames != 0);
+    for (unsigned frame = 0; frame < 30; frame++)
+        (void) psp_ui_update(&ui, &idle);
+    CHECK(ui.toast_entry_frames == 0);
+    psp_ui_follow_loading_phase(&ui, 0u, true);
+    CHECK(strcmp(ui.status, texts[0]) == 0 && ui.toast_frames < 120);
+    psp_ui_follow_loading_phase(&ui, 1u, true);
+    CHECK(strcmp(ui.status, texts[1]) == 0 && ui.toast_entry_frames == 0
+          && ui.toast_frames >= 120);
+    /* Once it has timed out, the same phase does not bring it back... */
+    for (unsigned frame = 0; frame < 200 && ui.toast_frames != 0; frame++)
+        (void) psp_ui_update(&ui, &idle);
+    CHECK(ui.toast_frames == 0);
+    psp_ui_follow_loading_phase(&ui, 1u, true);
+    CHECK(ui.toast_frames == 0);
+    /* ...a new one does, unless the load's preview is on screen. */
+    psp_ui_follow_loading_phase(&ui, 2u, false);
+    CHECK(ui.toast_frames == 0);
+    psp_ui_follow_loading_phase(&ui, 2u, true);
+    CHECK(ui.toast_frames != 0 && strcmp(ui.status, texts[2]) == 0
+          && ui.toast_entry_frames != 0);
+    /* Another toast is left alone. */
+    psp_ui_show_status(&ui, "BOOKMARK SAVED", 120);
+    psp_ui_follow_loading_phase(&ui, 3u, true);
+    CHECK(strcmp(ui.status, "BOOKMARK SAVED") == 0);
+    /* The end of the load retires its status, and only its status. */
+    psp_ui_show_loading_status(&ui, 3u, 600);
+    psp_ui_set_loading(&ui, false, -1);
+    CHECK(ui.toast_frames == 0 && ui.status[0] == '\0');
+    psp_ui_set_loading(&ui, true, -1);
+    psp_ui_show_status(&ui, "PAGE LOAD STOPPED", 180);
+    psp_ui_set_loading(&ui, false, -1);
+    CHECK(ui.toast_frames == 180
+          && strcmp(ui.status, "PAGE LOAD STOPPED") == 0);
+    psp_ui_follow_loading_phase(NULL, 0u, true);
+    psp_ui_show_loading_status(NULL, 0u, 120);
     return true;
 }
 
@@ -7533,6 +7692,39 @@ static bool test_website_font_setting(void)
     input.pressed = PSP_UI_BUTTON_LEFT;
     PspUiIntent intent = psp_ui_update(&ui, &input);
     CHECK(intent.setting.value.web_font_mode == WEB_FONTS_ON);
+    return true;
+}
+
+/* Paywall scripts is the last row of Privacy & security, after the
+   content blocker's own rows, and toggles the opt-in (Allow by default). */
+static bool test_paywall_scripts_setting(void)
+{
+    PspUiState ui;
+    psp_ui_init(&ui);
+    CHECK(!ui.content_blocker_paywall_scripts);
+    ui.screen = PSP_UI_SCREEN_OPTIONS;
+    ui.options_group_selection = 3;
+    PspUiInput input = {.pressed = PSP_UI_BUTTON_CONFIRM};
+    (void) psp_ui_update(&ui, &input);
+    CHECK(ui.screen == PSP_UI_SCREEN_OPTION_ITEMS);
+    size_t first = ui.options_selection;
+    /* Up from the group's first row wraps to its last. */
+    input.pressed = PSP_UI_BUTTON_UP;
+    (void) psp_ui_update(&ui, &input);
+#ifdef TILEFINCH_PSP_POWER_TEST_MENU
+    CHECK(ui.options_selection == 53u && first != 53u);
+#else
+    CHECK(ui.options_selection == 51u && first != 51u);
+#endif
+    input.pressed = PSP_UI_BUTTON_RIGHT;
+    PspUiIntent intent = psp_ui_update(&ui, &input);
+    CHECK(intent.setting.id == PSP_UI_SETTING_CONTENT_BLOCKER_PAYWALL_SCRIPTS
+          && intent.setting.value.boolean
+          && ui.content_blocker_paywall_scripts);
+    intent = psp_ui_update(&ui, &input);
+    CHECK(intent.setting.id == PSP_UI_SETTING_CONTENT_BLOCKER_PAYWALL_SCRIPTS
+          && !intent.setting.value.boolean
+          && !ui.content_blocker_paywall_scripts);
     return true;
 }
 
@@ -8902,6 +9094,114 @@ static bool test_media_open_press_has_one_owner(void)
     return true;
 }
 
+/* A command chosen during a slow media open waits for the open's end; the
+   loading panel says so at once on the supervisor's copy, keeps saying so
+   on the owner's player once the press reaches it (and so on every copy
+   taken afresh), and drops the note when the command is handed over or a
+   new open starts. Timeline presses park nothing. */
+static bool test_media_parked_command_note(void)
+{
+    enum { W = 480, H = 272 };
+    static uint16_t plain[W * H], noted[W * H];
+    static PspUiMediaPresentation p, own;
+    PspUiMediaState owner;
+    psp_ui_media_init(&owner);
+    psp_ui_media_bind_presentation(&owner, &p);
+    psp_ui_media_set(&owner, true, false, false, UINT64_C(0),
+                     UINT64_C(60000000), "Queue entry");
+    psp_ui_media_set_resolving(&owner, "Opening video");
+    p.queue_active = p.queue_next = true;
+    p.queue_count = 6;
+    p.queue_position = 1;
+    CHECK(psp_ui_media_parked_note(PSP_UI_MEDIA_ACTION_NONE) == NULL
+          && psp_ui_media_parked_note(PSP_UI_MEDIA_ACTION_PLAY_PAUSE) == NULL
+          && psp_ui_media_parked_note(PSP_UI_MEDIA_ACTION_SEEK) == NULL
+          && psp_ui_media_parked_note(PSP_UI_MEDIA_ACTION_PREVIEW_SEEK) == NULL);
+    CHECK(strcmp(psp_ui_media_parked_note(PSP_UI_MEDIA_ACTION_NEXT),
+                 "Next video after this opens") == 0
+          && strcmp(psp_ui_media_parked_note(PSP_UI_MEDIA_ACTION_QUEUE_SELECT),
+                    "Chosen video plays after this opens") == 0
+          && strcmp(psp_ui_media_parked_note(PSP_UI_MEDIA_ACTION_CLOSE),
+                    "Closes after this opens") == 0);
+    psp_ui_media_composite(&owner, plain, W, H, W);
+
+    PspUiMediaState copy = owner;
+    PspUiMediaPressQueue queue = {0};
+    PspUiMediaIntent intent = {0};
+    CHECK(psp_ui_media_supervisor_press(&copy, &own, &queue,
+                                        PSP_UI_BUTTON_TOOLBAR, &intent));
+    CHECK(psp_ui_media_supervisor_press(&copy, &own, &queue,
+                                        PSP_UI_BUTTON_CONFIRM, &intent));
+    /* The menu closed on the chosen entry; the copy says it waits. */
+    CHECK(intent.action == PSP_UI_MEDIA_ACTION_QUEUE_SELECT
+          && intent.visual_changed);
+    CHECK(copy.presentation == &own
+          && own.parked_action == PSP_UI_MEDIA_ACTION_QUEUE_SELECT
+          && !own.track_menu_open);
+    CHECK(p.parked_action == PSP_UI_MEDIA_ACTION_NONE);
+    psp_ui_media_composite(&copy, noted, W, H, W);
+    CHECK(memcmp(plain, noted, sizeof(plain)) != 0);
+
+    /* The refresh hands the press to the owner: its player has the note,
+       and the fresh copy shows it borrowing the owner's presentation. */
+    PspUiMediaMailbox mailbox = {0};
+    psp_ui_media_press_queue_settle(&queue, &owner, &mailbox);
+    CHECK(mailbox.command.action == PSP_UI_MEDIA_ACTION_QUEUE_SELECT);
+    CHECK(p.parked_action == PSP_UI_MEDIA_ACTION_QUEUE_SELECT);
+    copy = owner;
+    static uint16_t refreshed[W * H];
+    psp_ui_media_composite(&copy, refreshed, W, H, W);
+    CHECK(memcmp(noted, refreshed, sizeof(noted)) == 0);
+
+    /* A 240p retry inside the same open keeps it; the hand-over ends it. */
+    psp_ui_media_set_resolving(&owner, "Opening video");
+    CHECK(p.parked_action == PSP_UI_MEDIA_ACTION_QUEUE_SELECT);
+    psp_ui_media_clear_parked(&owner);
+    CHECK(p.parked_action == PSP_UI_MEDIA_ACTION_NONE);
+    psp_ui_media_composite(&owner, refreshed, W, H, W);
+    CHECK(memcmp(plain, refreshed, sizeof(plain)) == 0);
+
+    /* A fresh open starts without one. */
+    p.parked_action = PSP_UI_MEDIA_ACTION_NEXT;
+    psp_ui_media_set(&owner, true, true, false, UINT64_C(0),
+                     UINT64_C(60000000), "Queue entry");
+    owner.resolving = false;
+    psp_ui_media_set_resolving(&owner, "Opening video");
+    CHECK(p.parked_action == PSP_UI_MEDIA_ACTION_NONE);
+
+    /* During a rewind's reopen, where the panel shows no cancel hint, the
+       note still shows. */
+    static PspUiMediaPresentation rp, rown;
+    PspUiMediaState rewind;
+    psp_ui_media_init(&rewind);
+    psp_ui_media_bind_presentation(&rewind, &rp);
+    psp_ui_media_set(&rewind, true, true, false, UINT64_C(95000000),
+                     UINT64_C(600000000), "Rewind");
+    const PspUiMediaTrack audio[] = {{"English"}, {"Deutsch"}};
+    psp_ui_media_set_tracks(&rewind, audio, 2u, 0, NULL, 0u, 0);
+    psp_ui_media_set_resolving(&rewind, "Seeking video");
+    psp_ui_media_commit_seek(&rewind, UINT64_C(20000000));
+    CHECK(rewind.seek_in_progress);
+    psp_ui_media_composite(&rewind, plain, W, H, W);
+    PspUiMediaState rcopy = rewind;
+    CHECK(psp_ui_media_supervisor_press(&rcopy, &rown, &queue,
+                                        PSP_UI_BUTTON_TOOLBAR, &intent));
+    CHECK(psp_ui_media_supervisor_press(&rcopy, &rown, &queue,
+                                        PSP_UI_BUTTON_DOWN, &intent));
+    CHECK(psp_ui_media_supervisor_press(&rcopy, &rown, &queue,
+                                        PSP_UI_BUTTON_CONFIRM, &intent));
+    CHECK(intent.action == PSP_UI_MEDIA_ACTION_SELECT_AUDIO_TRACK
+          && rown.parked_action == PSP_UI_MEDIA_ACTION_SELECT_AUDIO_TRACK);
+    rcopy.presentation->track_menu_open = false;
+    psp_ui_media_composite(&rcopy, noted, W, H, W);
+    rown.parked_action = PSP_UI_MEDIA_ACTION_NONE;
+    psp_ui_media_composite(&rcopy, refreshed, W, H, W);
+    CHECK(memcmp(noted, refreshed, sizeof(noted)) != 0);
+    queue.count = 0;
+    psp_ui_media_clear_parked(NULL);
+    return true;
+}
+
 /* One frame of a media open with the owner's mailbox, as
    psp_work_cooperate_refresh_media keeps it: the supervisor's copy takes
    each press, the refresh settles the queue into the mailbox and hands the
@@ -9225,6 +9525,7 @@ int main(void)
     if (!test_menu_cache_only_tracks_visible_catalogs()) return 1;
     if (!test_playlist_player_controls()) return 1;
     if (!test_website_font_setting()) return 1;
+    if (!test_paywall_scripts_setting()) return 1;
     if (!test_settings_table_and_profile_sync()) return 1;
     if (!test_bool_setting_failures_keep_one_value()
         || !test_web_font_and_night_mode_failures_keep_one_value()
@@ -9266,6 +9567,7 @@ int main(void)
         || !test_youtube_signin_continue_menu()
         || !test_site_storage_screens()
         || !test_heavy_page_screens()
+        || !test_microphone_screens()
         || !test_exit_needs_a_second_press()
         || !test_unavailable_permission_rows_explain()
         || !test_page_chrome_holds_its_edge_over_a_light_page()
@@ -9304,6 +9606,8 @@ int main(void)
         || !test_progress_status_updates_in_place()
         || !test_media_open_status_dismissed_at_scope_end()
         || !test_preview_hint_toast()
+        || !test_loading_status_follows_phase()
+        || !test_media_parked_command_note()
         || !test_media_title_glyphs_are_retained()
         || !test_loading_progress_ramp_pixels()
         || !test_native_surfaces_own_the_panel()

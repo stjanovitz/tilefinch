@@ -111,6 +111,31 @@ strings. Response cookies are associated with the URL of the redirect hop that
 supplied them, not unconditionally with the final URL. Redirects remain bounded
 to HTTP(S) and a maximum of eight hops.
 
+### Per-site User-Agent
+
+Every request carries `TILEFINCH_BROWSER_USER_AGENT` except where
+`src/site_identity.c` names a site. The identity belongs to the top-level
+document: a top-level navigation takes it from its target, and each redirect
+hop of that navigation takes it from the hop's own target, so every document
+gets the identity of the host that served it. Subresources (including
+third-party ones), frames and their requests, fetch/XHR, `sendBeacon` and
+workers carry the identity of their top-level document, and that document's
+realms report it as `navigator.userAgent` and `navigator.appVersion`. Client
+Hints are the same everywhere. A caller that sets an explicit User-Agent (a
+native service such as the YouTube provider) keeps it on every hop.
+
+Two Google sites get the plain `Mozilla/5.0 (PlayStation Portable)
+Tilefinch/0.1` instead:
+
+| Top-level host | When | Why | Refusal |
+|---|---|---|---|
+| `accounts.google.com` (exact host, default port) | Always | The usual UA gets Google's heavy sign-in page (about 3.9 MB of script, a 29.4 MB budget peak of 32 MB, a page script error, no anti-bot frame); the plain UA gets its light page of inline scripts (14.4 MB peak, anti-bot frame loads). Measured once per UA on 2026-11-11. | HTTP 429 from `accounts.google.com`, its `/signin/rejected` or `/v3/signin/rejected` page, or a `/sorry/` page that an `accounts.google.com` request redirects to or one of its pages opens. The page is not shown; `accounts.google.com` goes back to the usual UA until the browser restarts, and the browser loads the page once more (for a form submission, the page that sent it, so the form is never sent again). With the usual UA nothing is classified as a refusal, so the reload cannot repeat. A load that fails in the transport is not a refusal. |
+| `google.com`, `www.google.com` | After **Try Google anyway**, until the browser restarts | The usual UA gets a WAP "Update your browser" page. | HTTP 429, `/sorry/`, the XHTML-MP page, or a failed search load clears the choice and shows the local search page with a note. |
+
+YouTube (`www.youtube.com`, `accounts.youtube.com`), `gstatic.com` as a
+top-level page and every other Google host keep the usual UA. This is the only
+identity change: the browser claims no other browser, device or OS version.
+
 An HTTPS document cannot open an HTTP channel through scripts, stylesheets,
 frames, fonts, fetch/XHR, or other active content. Eligible image and media
 requests are upgraded once to HTTPS before transport and are blocked if that
@@ -362,7 +387,7 @@ their response-URL attributions are allocated from the shared budget only when
 received; `FetchResult` retains only the fixed pointer inventory, avoiding a
 large worst-case payload in every result and scheduler/stack frame. The PSP
 worker also bounds captured cookie text to a fixed 16 KiB pool. If a final
-response exceeds either the 32-field inventory or that aggregate pool,
+response exceeds either the 64-field inventory or that aggregate pool,
 Tilefinch accepts the page, retains the bounded prefix, and marks the cookie set
 as truncated so capture and replay preserve the same outcome. The same
 overflow on a followed redirect hop fails closed: a partial intermediate set
@@ -428,8 +453,8 @@ leave it until the next hibernation replaces it or the user deletes it.
 
 ## HTTP trace handling
 
-New captures use HTTP trace format v11. The replay reader stays compatible
-with v1–v10 for document and generic-fetch fixtures, but fails closed wherever
+New captures use HTTP trace format v13. The replay reader stays compatible
+with v1–v12 for document and generic-fetch fixtures, but fails closed wherever
 an older record cannot prove what a newer rule depends on. Each format version
 added a binding:
 
@@ -459,6 +484,11 @@ added a binding:
   (present, valid, malformed, duplicate, or truncated, per field), so replay
   feeds consumers the same typed metadata live responses produce instead of
   re-deriving it from raw header text.
+- **v12** records and requires the bit that marks a response's `Set-Cookie`
+  set as truncated, so replay keeps the bounded prefix and the truncation
+  outcome the live response had.
+- **v13** binds the request's cache mode; a record older than v13 replays
+  only for a request with the default cache mode.
 
 The transport-shaping match includes the selected diagnostic browser profile;
 a capture made with Mobile Safari diagnostics cannot replay as the ordinary
@@ -524,13 +554,16 @@ mode, method, origin, sorted header names and URL), for the response's
 `Access-Control-Max-Age`: 5 seconds when absent, at most 10 minutes, and only
 the request that asked when it is 0. A refusal is never reused.
 
-The bounded response-header CSP subset intersects up to four policies and
+The bounded CSP subset intersects up to four response-header policies, and
+up to seven once `<meta>` policies join them (below), and
 supports `default-src`, `script-src`, `style-src`, `img-src`, `media-src`,
 `font-src`, `connect-src`, `frame-src`, `object-src`, `base-uri`, `form-action`, and
 `frame-ancestors`, plus `worker-src` with the standard fallback to `script-src`
-and then `default-src`. It recognizes `'none'`, `'self'`, wildcard, scheme, bounded
+and then `default-src`, and the `script-src-elem`, `script-src-attr`,
+`style-src-elem` and `style-src-attr` refinements of `script-src` and
+`style-src`. It recognizes `'none'`, `'self'`, wildcard, scheme, bounded
 host/port/path sources, `data:` and `blob:` where the selected directive permits
-them, plus script/style nonces and SHA-256 hashes. A nonce or hash source makes
+them, plus script/style nonces, SHA-256 hashes and `'strict-dynamic'`. A nonce or hash source makes
 `'unsafe-inline'` ineffective for that directive. Authored inline style
 attributes and `on*` event-handler attributes are gated; CSSOM `element.style`
 mutation and programmatic event listeners remain allowed, matching the browser
@@ -538,6 +571,30 @@ distinction between inline content and an API operation. Permitted event-
 handler attributes are compiled lazily through a bounded host path that accepts
 only the attribute body. It does not reopen page access to `eval` or the
 Function constructor.
+
+A `<meta http-equiv="Content-Security-Policy">` in the document's head (a
+connected descendant of `document.head`, as in Chrome) adds its policies to
+the header's, and every policy must allow. It is enforced only:
+`Content-Security-Policy-Report-Only` in a meta is ignored, and
+`frame-ancestors` is dropped from a meta policy (`report-uri` and `sandbox`
+are not implemented at all). A meta policy applies from its insertion: the
+streaming parser adopts it before the next token, and a script that inserts
+one into the head adopts it before the insertion returns, so a script,
+stylesheet, image, frame, worker, `fetch()` or WebSocket admitted after that
+point is checked against it and an earlier script is not. The page's realm
+turns `eval` and the Function constructor off when a later meta policy
+refuses them, and inline event handlers compiled afterwards consult the
+updated policy. Removing the element does not remove the policy, a
+policy identical to an earlier meta one is not stored again, and a policy
+that does not fit the bounded table makes the document fail closed. The
+speculative preload scanner stops at a meta policy instead of fetching
+past it. A document parsed whole before any of its scripts run (a fetched
+child frame, a document committed from memory) adopts all of its head's
+meta policies before its first script; a site adapter's static page adopts
+none. Checks that run later than Chrome's fetch also see a policy for
+content before it: an image the page loads lazily, or an inline style that
+a stylesheet rebuild re-checks, is judged by the policy in force at that
+time, which can only refuse more.
 A declarative refresh (`<meta http-equiv=refresh>` or the `Refresh` header)
 is a top-level navigation from the document, built like a page-script
 navigation: the document is the referrer, it never carries user activation,
@@ -556,6 +613,11 @@ Page-originated `eval`, indirect eval, and the Function/AsyncFunction/
 GeneratorFunction constructors are disabled unless every applicable enforced
 `script-src`/`default-src` policy contains `'unsafe-eval'`. The gate is inside
 the pinned QuickJS interpreter rather than a replaceable JavaScript wrapper.
+Each frame realm holds its own decision: `eval` and `Function` reached
+through a frame's `contentWindow` follow that frame's document policy, not
+the calling page's, in both directions. A new frame realm starts with its
+parent's decision, as `about:blank` and `srcdoc` documents inherit the
+parent's policy, and committing a fetched document replaces it natively.
 Trusted bootstrap code runs before the gate is adopted; its temporary native
 worker compiler is captured in a private closure and removed from the page
 global before author script. Blob workers are then admitted by `worker-src`
@@ -751,10 +813,9 @@ the pressed element, frames, and navigations without a preceding
 its lists apply to subresources, and top-level document navigations are never
 blocked by host.
 
-This is intentionally not complete CSP. Meta-delivered policies,
-`Content-Security-Policy-Report-Only`, reporting, `strict-dynamic`, CSP
-`sandbox`, Trusted Types, the element/attribute directive
-families, and COOP/COEP process isolation are not implemented. The PSP has no
+This is intentionally not complete CSP.
+`Content-Security-Policy-Report-Only`, reporting, CSP `sandbox`, Trusted
+Types, `child-src`, and COOP/COEP process isolation are not implemented. The PSP has no
 process sandbox, so CSP reduces page authority inside one engine process; it
 does not contain a memory-safety flaw in the engine.
 
@@ -798,6 +859,89 @@ after half a second; Circle, Triangle and Square act at once. A dialog left
 unanswered for ten minutes is dismissed. Time spent in a dialog is not
 counted against the script watchdog or the navigation watchdog.
 
+## Page microphone capture
+
+`navigator.mediaDevices.getUserMedia({audio})` gives a page the PSP's
+microphone. The threats are a page that listens without the user knowing
+(in the background, from a frame, or after the user thinks it stopped), a
+page that fakes or hides the browser's prompt or indicator, and a page that
+tricks a button press into a grant. Every admission decision is made in C
+(`src/js_media_capture.c`); the page-side module is only the API surface, and
+a page calling its bridge directly meets the same checks.
+
+- **Secure contexts only.** `navigator.mediaDevices` and `MediaStream` are
+  absent from insecure documents. A request needs a potentially trustworthy,
+  non-opaque origin at every level up to the top-level document, and a
+  frame under an insecure parent gets `SecurityError`.
+- **Frames.** The permission belongs to the top-level origin. A child frame
+  may use it only through a chain of frames each delegated `microphone` by
+  its parent's `allow` attribute (default allowlist `'self'`; `*`, `'src'`,
+  `'self'` and exact origins admit, anything else, `'none'` included,
+  refuses), at most eight deep; anything
+  else gets `NotAllowedError` without a prompt. The prompt names the
+  top-level host, so a frame cannot ask under its own name. Workers have no
+  access.
+- **Hidden pages.** A page that is not visible never prompts and never
+  starts capture.
+- **The prompt** is drawn by the browser below its own address bar, which
+  stays on screen, names the requesting host with the page-dialog rules
+  (right end kept when cut), and cannot be styled or covered by the page.
+  It runs as a modal inside the page's script, as `alert()` does, and its
+  open time is paused out of the script and navigation watchdogs. Buttons
+  held when it opens never answer it, and the Allow rows arm after 500 ms;
+  Block and Circle act at once. An unanswered prompt is dismissed after two
+  minutes. A dismissal remembers nothing and gives `NotAllowedError`; the
+  page may ask again only after a new user activation, and at most three
+  dismissals per page load. One prompt can be open at a time; HOME and
+  suspend dismiss it, and it is refused (`NotAllowedError`) while the native
+  player or a system screen is up.
+- **Persistence.** "Always allow" and "Block" store only the origin and the
+  decision as `MIC` records in the site-permission profile, within its
+  16-site limit; with no room, "Always allow" is disabled and Block is not
+  stored. "Allow this time" is kept on the top-level realm and ends with the
+  page load. **Reset permissions**, the per-site **Microphone** row set to
+  Ask, and per-site removal forget it, and any change stops a live capture
+  that is no longer granted. `navigator.permissions.query({name:
+  "microphone"})` reports the current state and fires `change`.
+- **The indicator** is drawn by the browser over the final composite of
+  every screen (page, menus, full screen, the native player) while capture
+  is live. Its state is the capture session's own flag, set when the worker
+  starts and cleared only after it stops, never page state. A page can draw
+  a look-alike while not capturing, but cannot remove or cover the real one.
+- **Stopping.** Page tools → Stop microphone, navigation, page close, PSP
+  suspend, a native media session, voice typing, the system keyboard (which
+  would cover the indicator), revoking the permission and the end of the
+  page load stop capture, and so does an input that fails or stalls after
+  it started. Every track then gets a trusted `ended` event.
+  Page capture and voice typing never run together: voice typing listens
+  only once the stopped capture's worker has gone and no transfer of it may
+  still write; otherwise it shows **MICROPHONE BUSY - TRY AGAIN SOON** and
+  does not listen.
+- **Audio data.** One bounded capture worker fills a fixed ring of about
+  0.84 s of 16-bit mono samples, allocated under the browser budget while
+  capture is live and zeroed when it stops. The firmware cannot cancel a
+  transfer, so the two blocks the input writes are freed only once a poll
+  shows its last transfer ended; otherwise they stay allocated and the next
+  capture reuses them once the input is idle. Samples reach only the page
+  realm that holds a live track. Nothing is written to the Memory Stick,
+  logged (the log records duration, block count and peak level only) or
+  sent anywhere by the browser.
+- **Web Audio.** `createMediaStreamSource()` admits a stream only while the
+  track it chooses (the stream's first audio track by `id`) is a live track
+  of the calling realm in the live session, checked in C. Each source
+  follows that one track: the mixer feeds the source's path silence (zeros
+  before any filter or analyser) while the page has set its `enabled` to
+  false, and the browser stops the source when the track or the
+  session ends, even while a clone keeps the microphone on. The samples go through a
+  16 KiB ring inside the realm's own audio engine, which is cleared when the
+  last source ends and zeroed before it is freed. An `AnalyserNode` holds
+  what its sources played only in that engine. Microphone audio reaches the
+  output only while headphones are connected (`sceHprmIsHeadphoneExist`),
+  so a page cannot build an acoustic feedback loop through the PSP's own
+  speaker.
+- **Limits.** One capture session per process, at most eight live tracks per
+  realm (`clone()` included); more get `AbortError`.
+
 ## Native media and visual work bounds
 
 Native media and visual effects retain explicit work and destination bounds.
@@ -828,8 +972,8 @@ that origin, and whether its storage is in RAM or on the Memory Stick. Its
 described above, and **Site storage** opens Site data & storage on this site.
 “Clear data for this site” removes applicable cookies and exact-origin
 local/session storage and OPFS; “Reset permissions” removes the site's
-JavaScript, blocker, Reader, third-party-cookie, and mixed-content exceptions
-and its unencrypted-audio answer.
+JavaScript, blocker, Reader, third-party-cookie, and mixed-content exceptions,
+its unencrypted-audio answer and its microphone decision.
 Both destructive actions require confirmation. Inspection and deletion remain
 available even when global site-data admission is disabled.
 

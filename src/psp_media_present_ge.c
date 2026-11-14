@@ -663,13 +663,6 @@ bool psp_media_present_ge_stage_dma_quarantined(void)
     return psp_media_dma_quarantine_state != PSP_MEDIA_DMA_QUARANTINE_CLEAR;
 }
 
-bool psp_media_present_ge_stage_dma_quarantine_holds(int slot)
-{
-    return psp_media_present_dma_quarantine_refuses_slot(
-               psp_media_dma_quarantine_state)
-        && slot >= 0 && slot == psp_media_dma_quarantine_slot;
-}
-
 bool psp_media_present_ge_stage_dma_quarantine_holds_staging(
     const void *destination)
 {
@@ -1808,12 +1801,6 @@ PspMediaPresentDmaJoin psp_media_present_ge_stage_dma_join(void)
    quarantine is empty by construction here rather than by policy. */
 bool psp_media_present_ge_stage_dma_quarantined(void)
 {
-    return false;
-}
-
-bool psp_media_present_ge_stage_dma_quarantine_holds(int slot)
-{
-    (void) slot;
     return false;
 }
 

@@ -57,6 +57,40 @@ static bool run_case(const char *name, const char *source)
     return run_page_case(name, source, false);
 }
 
+/* Runs setup, has the host dispatch each of `types` (NULL-terminated) at
+   `selector` as user input, then runs check, which sets pocSummary. */
+static bool run_host_dispatch_case(const char *name, const char *setup,
+                                   const char *selector,
+                                   const char *const *types,
+                                   const char *check)
+{
+    if (selected_case != NULL && strcmp(name, selected_case) != 0) return true;
+    selected_case_ran = true;
+    ScriptPageFixture fixture;
+    if (!script_page_fixture_open(&fixture, "<script></script>", 0))
+        return false;
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_configured(
+        &fixture.document, &fixture.budget, 12u * 1024u * 1024u, 1000,
+        "https://dom-reentry.test/", &fixture.options, &result);
+    bool ok = runtime != NULL && script_runtime_evaluate_diagnostic(
+        runtime, setup, name, &result);
+    for (size_t i = 0; ok && types[i] != NULL; i++)
+        ok = script_runtime_dispatch(runtime, selector, types[i], &result);
+    ok = ok && script_runtime_evaluate_diagnostic(runtime, check, name,
+                                                  &result);
+    ok = ok && result.success && strcmp(result.summary, "OK") == 0;
+    if (!ok)
+        fprintf(stderr, "%s: summary=%s error=%s\n", name,
+                result.summary, result.error);
+    script_runtime_destroy(runtime);
+    bool zero_owned = script_page_fixture_close(&fixture);
+    if (!zero_owned) fprintf(stderr, "%s: nonzero teardown ownership\n", name);
+    printf("%s: %s teardown-owned-bytes=%zu\n", name,
+           ok && zero_owned ? "PASS" : "FAIL", fixture.budget.current);
+    return ok && zero_owned;
+}
+
 /* #g > #p > three <i>, #other, #d; parsed by innerHTML, so no wrappers. */
 #define REENTRY_BODY \
     "document.body.innerHTML='<div id=g><div id=p><i title=a></i>" \
@@ -88,6 +122,234 @@ static bool run_case(const char *name, const char *source)
     "if(fired){bad.push(label+' ran page accessors '+fired.trim());fired=''}" \
     "return r};" \
     "const own=(o,k)=>Object.prototype.hasOwnProperty.call(o,k);"
+
+/* Fires each event family compat.js builds and marks trusted: focus and
+   blur (FocusEvent), dialog cancel and close (Event), popover toggles
+   (ToggleEvent), FileReader and XMLHttpRequest progress (ProgressEvent, and
+   readystatechange as a plain Event) and MessageChannel delivery
+   (MessageEvent). The case captured the bootstrap's interfaces as NE, NF,
+   NT, NP and NM before it replaced any global, and defines finish(bad),
+   which runs once the three asynchronous families have reported. Every
+   event must be trusted, an instance of the bootstrap's interface, and
+   shaped as the browser fires it. */
+#define BROWSER_EVENTS_FIRE \
+    "document.body.insertAdjacentHTML('beforeend','<input id=a><input id=b>" \
+    "<dialog id=dl></dialog><div id=pp popover></div>');" \
+    "const bad=[],want=(c,m)=>{if(!c)bad.push(m)},$=id=>" \
+    "document.getElementById(id),a=$('a'),b=$('b'),dl=$('dl'),pp=$('pp');" \
+    "const is=(e,I)=>e.isTrusted===true&&e instanceof I&&e instanceof NE," \
+    "rt=e=>e.relatedTarget===document.body?'body':" \
+    "e.relatedTarget?e.relatedTarget.id:String(e.relatedTarget);" \
+    "const focus=[],focusLog=e=>focus.push([e.type,e.target.id,rt(e)," \
+    "e.bubbles,e.cancelable,is(e,NF)].join(':'));" \
+    "for(const t of['focus','blur','focusin','focusout'])" \
+    "{a.addEventListener(t,focusLog);b.addEventListener(t,focusLog)}" \
+    "const plain=[],plainLog=e=>plain.push([e.type,e.bubbles,e.cancelable," \
+    "is(e,NE)].join(':'));" \
+    "dl.addEventListener('cancel',plainLog);" \
+    "dl.addEventListener('close',plainLog);" \
+    "const toggles=[],toggleLog=e=>toggles.push([e.type,e.oldState," \
+    "e.newState,e.bubbles,e.cancelable,is(e,NT)].join(':'));" \
+    "pp.addEventListener('beforetoggle',toggleLog);" \
+    "pp.addEventListener('toggle',toggleLog);" \
+    "try{a.focus();b.focus();b.blur();dl.show();dl.requestClose();" \
+    "pp.showPopover();pp.hidePopover()}" \
+    "catch(error){bad.push('sync threw '+error)}" \
+    "want(focus.join()==='focus:a:body:false:false:true," \
+    "focusin:a:body:true:false:true,blur:a:b:false:false:true," \
+    "focusout:a:b:true:false:true,focus:b:a:false:false:true," \
+    "focusin:b:a:true:false:true,blur:b:body:false:false:true," \
+    "focusout:b:body:true:false:true','focus '+focus);" \
+    "want(plain.join()==='cancel:false:true:true,close:false:false:true'," \
+    "'dialog '+plain);" \
+    "want(toggles.join()==='beforetoggle:closed:open:false:true:true," \
+    "toggle:closed:open:false:false:true,beforetoggle:open:closed:false:" \
+    "false:true,toggle:open:closed:false:false:true','popover '+toggles);" \
+    "let pending=3;const settle=()=>{if(--pending===0)finish(bad)};" \
+    "const progress=(e)=>[e.type,e.lengthComputable,e.loaded,e.total," \
+    "e.bubbles,e.cancelable,is(e,NP)].join(':');" \
+    "const reader=new FileReader,read=[];" \
+    "for(const t of['loadstart','progress','load'])" \
+    "reader.addEventListener(t,e=>read.push(progress(e)));" \
+    "reader.onloadend=e=>{read.push(progress(e));want(read.join()===" \
+    "'loadstart:true:0:3:false:false:true,progress:true:3:3:false:false:" \
+    "true,load:true:3:3:false:false:true,loadend:true:3:3:false:false:true'," \
+    "'reader '+read);settle()};" \
+    "reader.readAsText(new Blob(['abc']));" \
+    "const url=URL.createObjectURL(new Blob(['xyz'])),xhr=new XMLHttpRequest," \
+    "states=[];xhr.onreadystatechange=e=>states.push([e.type,e.bubbles," \
+    "is(e,NE),e instanceof NP].join(':'));" \
+    "xhr.onloadend=e=>{want(states.length>0&&states.every(s=>s===" \
+    "'readystatechange:false:true:false'),'readystate '+states);" \
+    "want(progress(e)==='loadend:true:3:3:false:false:true'," \
+    "'xhr '+progress(e));settle()};" \
+    "xhr.onerror=()=>{bad.push('xhr error');settle()};" \
+    "xhr.open('GET',url);xhr.send();" \
+    "const channel=new MessageChannel;channel.port2.onmessage=e=>{" \
+    "want(e.type==='message'&&e.data==='hi'&&e.ports.length===0" \
+    "&&!e.bubbles&&!e.cancelable&&is(e,NM),'message '+[e.type,e.data," \
+    "e.isTrusted,e instanceof NM]);settle()};" \
+    "channel.port1.postMessage('hi');"
+
+/* Replaces each global interface in `names` with an author constructor
+   that counts its calls. With keep, it builds the bootstrap's event and
+   shares its prototype, as wrapping polyfills do; without, it returns a
+   plain object, as a page's own unrelated Event class would. */
+#define BROWSER_EVENTS_REPLACE(keep, names) \
+    "globalThis.pocSummary='PENDING';const NE=Event,NF=FocusEvent," \
+    "NT=ToggleEvent,NP=ProgressEvent,NM=MessageEvent;let made=0;" \
+    "for(const name of " names "){const Native=globalThis[name]," \
+    "Author=function(type,init){made++;" \
+    "return " keep "?new Native(type,init):{type:String(type)}};" \
+    "if(" keep ")Author.prototype=Native.prototype;globalThis[name]=Author}" \
+    "let finish=bad=>{if(made)bad.push('author constructor ran '+made);" \
+    "globalThis.pocSummary=bad.length?'BAD '+bad.join(' | '):'OK'};"
+
+/* The lazy modules define their Event and EventTarget subclasses on first
+   use, after author code has run. Before that first use, the page:
+   wrap     replaces both globals with counting constructors that build the
+            bootstrap's own object and share its prototype (polyfills);
+   replace  replaces both with unrelated constructors returning plain
+            objects;
+   proto    keeps the globals but rewrites the interfaces' prototypes:
+            `constructor` becomes a counting function and a page mark is
+            added (instances must inherit the mark, as in browsers);
+   none     leaves everything alone.
+   The family body then triggers the module and checks its classes against
+   NE and NET, the interfaces captured here before any change (and that
+   they still print as native code). The page's
+   constructors must never run, and every instance must be genuine: the
+   bootstrap's brand check accepts its events, its targets dispatch.
+   `pending` counts the outstanding asynchronous checks, one of them the
+   synchronous body; settle() ends one. */
+static const char lazy_events_prelude[] =
+    "(()=>{globalThis.pocSummary='PENDING';"
+    "const NE=Event,NET=EventTarget,isEv=__tilefinchIsEvent,bad=[],"
+    "want=(c,m)=>{if(!c)bad.push(m)},mode=%s;let made=0,pending=1;"
+    "const finish=()=>{if(made)bad.push('author constructor ran '+made);"
+    "pocSummary=bad.length?'BAD '+bad.join(' | '):'OK'},"
+    "settle=()=>{if(--pending===0)finish()},"
+    "inherits=(C,B)=>{for(let at=C,n=0;at&&n<8;"
+    "at=Object.getPrototypeOf(at),n++)if(at===B)return true;return false},"
+    "parent=(C,B)=>{want(typeof C==='function'&&Object.getPrototypeOf(C)===B"
+    "&&Object.getPrototypeOf(C.prototype)===B.prototype,"
+    "(C&&C.name)+' is not directly under '+B.name);"
+    "want(Function.prototype.toString.call(C)==='function '+C.name+"
+    "'() {\\n    [native code]\\n}',C.name+' source shows')},"
+    "marked=o=>mode!=='proto'||o.tfPageMark===1,"
+    "genuineTarget=(t,label)=>{want(t instanceof NET&&marked(t),"
+    "label+' is not an EventTarget');let got=0;const f=()=>got++;"
+    "try{t.addEventListener('tf-ping',f);t.dispatchEvent(new NE('tf-ping'));"
+    "t.removeEventListener('tf-ping',f)}"
+    "catch(error){bad.push(label+' dispatch threw '+error)}"
+    "want(got===1,label+' dispatch reached '+got)},"
+    "genuineEvent=(e,I,label)=>want(isEv(e)&&e instanceof I&&e instanceof NE"
+    "&&marked(e),label+' is not a genuine event');"
+    "if(mode==='wrap'||mode==='replace')"
+    "for(const[name,Native]of[['Event',NE],['EventTarget',NET]]){"
+    "const Author=function(...args){made++;return mode==='wrap'?"
+    "Reflect.construct(Native,args,new.target||Native):"
+    "{type:String(args[0])}};"
+    "if(mode==='wrap')Author.prototype=Native.prototype;"
+    "globalThis[name]=Author}"
+    "else if(mode==='proto')for(const Native of[NE,NET]){"
+    "Native.prototype.constructor=function Author(){made++;return{}};"
+    "Object.defineProperty(Native.prototype,'tfPageMark',"
+    "{value:1,configurable:true})}"
+    "try{%s}catch(error){bad.push('threw '+error)}settle()})()";
+
+static const struct {
+    const char *name;
+    const char *body;
+} lazy_event_families[] = {
+    {"motion",
+     "const AE=AnimationEvent;parent(AE,NE);"
+     "const e=new AE('animationstart',{animationName:'spin',elapsedTime:2});"
+     "genuineEvent(e,AE,'AnimationEvent');"
+     "want(e.animationName==='spin'&&e.elapsedTime===2,'AnimationEvent init');"
+     "const el=document.createElement('i');document.body.appendChild(el);"
+     "let got=0;el.addEventListener('animationstart',x=>{got+=x===e});"
+     "el.dispatchEvent(e);want(got===1,'AnimationEvent dispatch '+got);"},
+    {"speech",
+     "const U=SpeechSynthesisUtterance,SE=SpeechSynthesisEvent,"
+     "SEE=SpeechSynthesisErrorEvent;"
+     "parent(U,NET);parent(SpeechSynthesis,NET);parent(SE,NE);parent(SEE,SE);"
+     "const u=new U('hi');genuineTarget(u,'utterance');"
+     "genuineTarget(speechSynthesis,'speechSynthesis');"
+     "genuineEvent(new SE('boundary',{utterance:u,charIndex:1}),SE,"
+     "'SpeechSynthesisEvent');"
+     "pending++;u.addEventListener('error',e=>{"
+     "genuineEvent(e,SEE,'speech error');want(e.utterance===u&&"
+     "e.error==='synthesis-unavailable','speech error init');settle()});"
+     "speechSynthesis.speak(u);"},
+    {"media-source",
+     "for(const C of[MediaSource,SourceBuffer,SourceBufferList])"
+     "parent(C,NET);"
+     "const source=new MediaSource;genuineTarget(source,'MediaSource');"
+     "want(source.sourceBuffers instanceof SourceBufferList,"
+     "'sourceBuffers');genuineTarget(source.sourceBuffers,'sourceBuffers');"},
+    {"font-face-set",
+     "const fonts=document.fonts;parent(FontFaceSet,NET);"
+     "want(fonts instanceof FontFaceSet,'document.fonts');"
+     "genuineTarget(fonts,'document.fonts');"
+     "pending++;fonts.ready.then(f=>{want(f===fonts,'fonts.ready');settle()},"
+     "error=>{bad.push('fonts.ready '+error);settle()});"},
+    {"media-capture",
+     "for(const C of[MediaStream,MediaStreamTrack,MediaDevices])"
+     "parent(C,NET);parent(MediaStreamTrackEvent,NE);"
+     "const stream=new MediaStream;genuineTarget(stream,'MediaStream');"
+     "want(stream.getTracks().length===0,'empty stream');"
+     "genuineTarget(navigator.mediaDevices,'mediaDevices');"
+     "let threw=false;try{new MediaStreamTrackEvent('addtrack',{track:{}})}"
+     "catch(error){threw=error instanceof TypeError}"
+     "want(threw,'MediaStreamTrackEvent took a posing track');"},
+    {"indexeddb",
+     "for(const C of[IDBRequest,IDBOpenDBRequest,IDBTransaction,"
+     "IDBDatabase])want(inherits(C,NET),C.name+' is not an EventTarget');"
+     "pending++;const request=indexedDB.open('tf-lazy-events',1);"
+     "genuineTarget(request,'IDBOpenDBRequest');let upgraded=false;"
+     "request.onupgradeneeded=e=>{upgraded=true;"
+     "genuineEvent(e,NE,'upgradeneeded');"
+     "request.result.createObjectStore('s')};"
+     "request.onsuccess=e=>{genuineEvent(e,NE,'success');"
+     "want(upgraded&&e.target===request,'open events');"
+     "const db=request.result;genuineTarget(db,'IDBDatabase');db.close();"
+     "settle()};"
+     "request.onerror=()=>{bad.push('open failed');settle()};"},
+    {"game-audio",
+     "const context=new AudioContext;"
+     "for(const C of[BaseAudioContext,AudioContext,GainNode,"
+     "AudioBufferSourceNode])want(inherits(C,NET),"
+     "C.name+' is not an EventTarget');"
+     "parent(BaseAudioContext,NET);"
+     "genuineTarget(context,'AudioContext');"
+     "genuineTarget(context.createGain(),'GainNode');"},
+    /* The worker realm defines PromiseRejectionEvent, Worker and its
+       global scope classes from the owner's interfaces when a Worker is
+       constructed: it must take the captured ones too. */
+    {"worker",
+     "parent(Worker,NET);"
+     "const source=\"const P=PromiseRejectionEvent,out=[typeof P,"
+     "Object.getPrototypeOf(P).name,typeof self.addEventListener,"
+     "typeof performance.addEventListener];let hit=0;"
+     "self.addEventListener('tf-direct',()=>hit++);"
+     "const direct=new P('tf-direct',{promise:Promise.resolve(),reason:1});"
+     "self.dispatchEvent(direct);out.push(hit,direct.reason,"
+     "direct instanceof P);"
+     "self.addEventListener('unhandledrejection',e=>postMessage(["
+     "e.type,e.reason,e instanceof P,e.cancelable,"
+     "e.promise instanceof Promise].join(':')));"
+     "postMessage(out.join(':'));Promise.reject(5);\";"
+     "pending++;const worker=new Worker(URL.createObjectURL(new Blob("
+     "[source],{type:'text/javascript'})));genuineTarget(worker,'Worker');"
+     "const seen=[];worker.onmessage=e=>{"
+     "genuineEvent(e,MessageEvent,'worker message');seen.push(e.data);"
+     "if(seen.length<2)return;want(seen.join()==='function:Event:function:"
+     "function:1:1:true,unhandledrejection:5:true:true:true',"
+     "'worker saw '+seen);worker.terminate();settle()};"
+     "worker.onerror=e=>{bad.push('worker error '+(e&&e.message));"
+     "worker.terminate();settle()};"},
+};
 
 int main(int argc, char **argv)
 {
@@ -293,6 +555,206 @@ int main(int argc, char **argv)
         "form.requestSubmit();input.focus();"
         "check(submit===true,'requestSubmit event untrusted: '+submit);"
         "check(focus===true,'focus event untrusted: '+focus);"
+        "globalThis.pocSummary='OK'})()");
+    /* The browser builds the events it marks trusted with the bootstrap's
+       interfaces: a page that replaces the globals never has its
+       constructor called with browser-internal arguments, and never gets
+       its own object dispatched as a trusted event. */
+    ok &= run_case("browser-events-ignore-wrapped-constructors",
+        "(()=>{" BROWSER_EVENTS_REPLACE("true",
+            "['Event','FocusEvent','ToggleEvent','ProgressEvent',"
+            "'MessageEvent']")
+        BROWSER_EVENTS_FIRE "})()");
+    ok &= run_case("browser-events-ignore-replaced-constructors",
+        "(()=>{" BROWSER_EVENTS_REPLACE("false",
+            "['FocusEvent','ToggleEvent','ProgressEvent','MessageEvent']")
+        BROWSER_EVENTS_FIRE "})()");
+    /* The init dictionaries those events are built from have no
+       prototype: an accessor the page put on Object.prototype never runs
+       while the browser builds one, and cannot choose bubbles, cancelable
+       or a family field. Unarmed, the accessors behave as plain
+       properties so the page's own code is unaffected. */
+    ok &= run_case("browser-event-init-ignores-object-prototype",
+        "(()=>{" BROWSER_EVENTS_REPLACE("true", "[]")
+        "let fired='',armed=false;"
+        "for(const k of['bubbles','cancelable','composed','lengthComputable',"
+        "'loaded','total','data','origin','lastEventId','source','ports'])"
+        "Object.defineProperty(Object.prototype,k,{__proto__:null,"
+        "configurable:true,get(){if(armed)fired+=k+' ';return undefined},"
+        "set(v){if(armed)fired+=k+'= ';Object.defineProperty(this,k,"
+        "{__proto__:null,value:v,writable:true,enumerable:true,"
+        "configurable:true})}});"
+        "const done=finish;finish=bad=>{armed=false;"
+        "if(fired)bad.push('page accessors ran: '+fired.trim());done(bad)};"
+        "armed=true;" BROWSER_EVENTS_FIRE "})()");
+    /* Dispatch recognises an event by the bootstrap's own brand, not by
+       instanceof against the global: after a page replaces Event with an
+       unrelated constructor, its own dispatches of real events and the
+       browser's events (a worker's message included) still reach their
+       listeners, at the target phase. */
+    ok &= run_case("events-dispatch-after-unrelated-event-global",
+        "(()=>{" BROWSER_EVENTS_REPLACE("false",
+            "['Event','FocusEvent','ToggleEvent','ProgressEvent',"
+            "'MessageEvent']")
+        "document.body.insertAdjacentHTML('beforeend','<i id=pg></i>');"
+        "const pageLog=[],pageTargets=[['pg',document.getElementById('pg')],"
+        "['doc',document],['win',window]];"
+        "for(const[name,t]of pageTargets)t.addEventListener('ping',e=>"
+        "pageLog.push(name+':'+e.eventPhase+':'+(e.target===t)+':'"
+        "+e.isTrusted));"
+        "let pageError='';try{for(const[,t]of pageTargets)"
+        "t.dispatchEvent(new NE('ping'))}catch(error){pageError=String(error)}"
+        BROWSER_EVENTS_FIRE
+        "want(!pageError&&pageLog.join()==='pg:2:true:false,doc:2:true:false,"
+        "win:2:true:false','page dispatch '+pageError+' '+pageLog);"
+        "pending++;const worker=new Worker(URL.createObjectURL(new Blob(["
+        "'postMessage(7)'],{type:'text/javascript'})));"
+        "worker.onmessage=e=>{want(e.data===7&&is(e,NM)&&e.eventPhase===2,"
+        "'worker '+[e.data,e.isTrusted,e instanceof NM,e.eventPhase]);"
+        "worker.terminate();settle()};"
+        "worker.onerror=()=>{bad.push('worker error');settle()};"
+        "})()");
+    /* Objects that only pose as events stay refused, as before: neither a
+       page's Symbol.hasInstance, a borrowed prototype chain nor a replaced
+       global Event gets one dispatched. */
+    ok &= run_case("posing-events-stay-refused",
+        "(()=>{" REENTRY_BODY
+        "const NE=Event,log=[],el=document.getElementById('d');"
+        "for(const t of[el,document,window])"
+        "t.addEventListener('ping',()=>log.push('ran'));"
+        "const refuse=(label,make)=>{for(const t of[el,document,window]){"
+        "let threw=false;try{t.dispatchEvent(make())}catch(error){threw="
+        "error instanceof TypeError||error instanceof DOMException}"
+        "check(threw,label+' accepted')}};"
+        "refuse('plain object',()=>({type:'ping'}));"
+        "refuse('borrowed prototype',()=>Object.create(NE.prototype));"
+        "const Pose=function(){this.type='ping'};Pose.prototype=NE.prototype;"
+        "refuse('constructed on the prototype',()=>new Pose);"
+        "Object.defineProperty(NE,Symbol.hasInstance,{configurable:true,"
+        "value:()=>true});"
+        "refuse('hasInstance on Event',()=>({type:'ping'}));"
+        "delete NE[Symbol.hasInstance];"
+        "const Page=function(type){this.type=type};"
+        "Object.defineProperty(Page,Symbol.hasInstance,{value:()=>true});"
+        "globalThis.Event=Page;"
+        "refuse('replaced Event',()=>new Page('ping'));"
+        "refuse('replaced Event prototype',()=>Object.create(Page.prototype));"
+        "check(log.length===0,'posing event reached a listener');"
+        "el.dispatchEvent(new NE('ping'));"
+        "check(log.length===1,'real event refused');"
+        "globalThis.pocSummary='OK'})()");
+    /* Event and EventTarget subclasses defined by lazily loaded modules
+       stay under the bootstrap's interfaces whatever the page did to the
+       globals before the module loaded (lazy_events_prelude). */
+    {
+        static const char *const modes[] = {"wrap", "replace", "proto",
+                                            "none"};
+        for (size_t family = 0;
+             family < sizeof(lazy_event_families) /
+                          sizeof(lazy_event_families[0]);
+             family++)
+            for (size_t mode = 0; mode < sizeof(modes) / sizeof(modes[0]);
+                 mode++) {
+                char name[64], quoted[16], source[8192];
+                snprintf(name, sizeof(name), "lazy-events-%s-%s",
+                         lazy_event_families[family].name, modes[mode]);
+                snprintf(quoted, sizeof(quoted), "'%s'", modes[mode]);
+                int length = snprintf(source, sizeof(source),
+                                      lazy_events_prelude, quoted,
+                                      lazy_event_families[family].body);
+                if (length < 0 || (size_t) length >= sizeof(source)) {
+                    fprintf(stderr, "%s: source too long\n", name);
+                    ok = false;
+                    continue;
+                }
+                ok &= run_case(name, source);
+            }
+    }
+    /* What hardening.js publishes for the lazy modules to extend: a frozen,
+       null-prototype table whose every entry is the same interface object
+       the page already sees at the global of that name (so it grants
+       nothing the page lacks), in a non-writable, non-configurable,
+       non-enumerable global hidden from reflection like the others. */
+    ok &= run_case("lazy-event-interfaces-publication",
+        "(()=>{const check=(c,m)=>{if(!c)throw new Error(m)},"
+        "table=globalThis.__tilefinchEventInterfaces,"
+        "d=Object.getOwnPropertyDescriptor(globalThis,"
+        "'__tilefinchEventInterfaces');"
+        "check(d&&!d.writable&&!d.enumerable&&!d.configurable,'descriptor');"
+        "check(Object.isFrozen(table)&&Object.getPrototypeOf(table)===null,"
+        "'table is not frozen and prototype-free');"
+        "const keys=Reflect.ownKeys(table);"
+        "check(keys.includes('Event')&&keys.includes('EventTarget'),"
+        "'keys '+keys);"
+        "for(const key of keys)check(typeof table[key]==='function'&&"
+        "table[key]===globalThis[key],key+' is not the public interface');"
+        "check(!Object.getOwnPropertyNames(globalThis).includes("
+        "'__tilefinchEventInterfaces'),'visible to reflection');"
+        "const NE=Event;globalThis.Event=function(){};"
+        "globalThis.__tilefinchEventInterfaces=null;"
+        "check(globalThis.__tilefinchEventInterfaces===table&&"
+        "table.Event===NE,'table changed');"
+        "globalThis.pocSummary='OK'})()");
+    /* User input the host dispatches is built the same way: a page that
+       wraps or replaces the input event interfaces never builds the
+       trusted click, key, mouse, input, composition, submit or change. */
+    {
+        static const char *const input_types[] = {
+            "click", "keydown", "mousedown", "input", "compositionstart",
+            "submit", "change", NULL,
+        };
+        static const char host_input_check[] =
+            "(()=>{const want=['click:PointerEvent:true:true:true',"
+            "'keydown:KeyboardEvent:true:true:true',"
+            "'mousedown:MouseEvent:true:true:true',"
+            "'input:InputEvent:true:false:true',"
+            "'compositionstart:CompositionEvent:true:false:false',"
+            "'submit:SubmitEvent:true:true:false',"
+            "'change:Event:true:false:false'].join();"
+            "pocSummary=made===0&&seen.join()===want?'OK':"
+            "'BAD made='+made+' '+seen})()";
+#define HOST_INPUT_SETUP(keep, names) \
+        "(()=>{document.body.insertAdjacentHTML('beforeend'," \
+        "'<form id=t><input></form>');globalThis.made=0;" \
+        "const natives={};for(const name of['Event','PointerEvent'," \
+        "'KeyboardEvent','MouseEvent','InputEvent','CompositionEvent'," \
+        "'SubmitEvent'])natives[name]=globalThis[name];" \
+        "for(const name of " names "){const Native=globalThis[name]," \
+        "Author=function(type,init){made++;" \
+        "return " keep "?new Native(type,init):{type:String(type)}};" \
+        "if(" keep ")Author.prototype=Native.prototype;" \
+        "globalThis[name]=Author}" \
+        "globalThis.seen=[];const t=document.getElementById('t');" \
+        "for(const[type,name]of[['click','PointerEvent'],['keydown'," \
+        "'KeyboardEvent'],['mousedown','MouseEvent'],['input','InputEvent']," \
+        "['compositionstart','CompositionEvent'],['submit','SubmitEvent']," \
+        "['change','Event']])t.addEventListener(type,e=>{seen.push([e.type," \
+        "e instanceof natives[name]&&e instanceof natives.Event?name:'?'," \
+        "e.isTrusted,e.cancelable,e.composed].join(':'));" \
+        "if(type==='submit')e.preventDefault()});pocSummary='OK'})()"
+        ok &= run_host_dispatch_case("host-input-ignores-wrapped-constructors",
+            HOST_INPUT_SETUP("true",
+                "['Event','PointerEvent','KeyboardEvent','MouseEvent',"
+                "'InputEvent','CompositionEvent','SubmitEvent']"),
+            "#t", input_types, host_input_check);
+        ok &= run_host_dispatch_case("host-input-ignores-replaced-constructors",
+            HOST_INPUT_SETUP("false",
+                "['PointerEvent','KeyboardEvent','MouseEvent','InputEvent',"
+                "'CompositionEvent','SubmitEvent']"),
+            "#t", input_types, host_input_check);
+#undef HOST_INPUT_SETUP
+    }
+    /* isTrusted is defined with the bootstrap's own defineProperty, so a
+       page that replaces Object.defineProperty cannot define it as a
+       plain true value on the events it constructs. */
+    ok &= run_case("event-is-trusted-ignores-replaced-define-property",
+        "(()=>{" REENTRY_BODY
+        "const define=Object.defineProperty;let asked=0;"
+        "Object.defineProperty=function(o,k,d){if(k==='isTrusted'){asked++;"
+        "d={value:true,enumerable:true}}return define(o,k,d)};"
+        "let e;try{e=new Event('x')}finally{Object.defineProperty=define}"
+        "check(e.isTrusted===false&&asked===0,"
+        "'isTrusted forged: '+[e.isTrusted,asked]);"
         "globalThis.pocSummary='OK'})()");
     /* NB-06: NodeOwner coerces its tag before it reads the tag table, which
        valueOf can reallocate by growing the handle table. */

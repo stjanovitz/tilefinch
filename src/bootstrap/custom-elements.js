@@ -1,6 +1,8 @@
 (() => {
   const trustedEvent =
-    __tilefinchRealmGlobal.__tilefinchTrustedEventShare.trustedEvent;
+      __tilefinchRealmGlobal.__tilefinchTrustedEventShare.trustedEvent,
+    newEvent =
+      __tilefinchRealmGlobal.__tilefinchTrustedEventShare.createBrowserEvent;
   /* Definitions made in any registry, main or scoped. */
   let definedAnywhere = 0;
   const definitions = new Map(),
@@ -773,7 +775,7 @@
         if (!this.willValidate || this.validity.valid) return true;
         this.__target.dispatchEvent(
           trustedEvent(
-            new Event("invalid", { cancelable: true }),
+            newEvent("invalid", { cancelable: true }),
           ),
         );
         return false;

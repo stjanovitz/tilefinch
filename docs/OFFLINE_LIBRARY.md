@@ -67,7 +67,7 @@ manifest/icon preparation. The confirmed pass repeats every size, budget, and
 free-space check before publishing.
 
 Both passes compile at most one script at a time and show progress on the
-status line (**PREPARING 2 OF 4 SCRIPTS - CIRCLE STOPS**). Circle stops either
+status line (**PREPARING 2 OF 4 SCRIPTS  O STOP**). Circle stops either
 pass between scripts or pack records: a stopped preview keeps nothing, and a
 stopped install removes its temporary files and leaves the library unchanged.
 Because the preview keeps its bytecode, previewing and then installing
@@ -139,7 +139,7 @@ scripts will be recompiled, and **X Recompile**, **Square Open anyway**,
 **O Back**. Recompile reads the stored package record by record, compiles
 each classic script from its stored source (the same bounds as installing:
 up to eight scripts and 1 MiB of source and of bytecode), shows **PREPARING
-2 OF 4 SCRIPTS - CIRCLE STOPS**, and writes a new generation through the
+2 OF 4 SCRIPTS  O STOP**, and writes a new generation through the
 same temporary-file and index-first transaction as an install: the markup
 and icon are copied after their checksums are verified, the new pack is
 written beside the old one, the whole old pack must pass its checksum before
@@ -277,7 +277,7 @@ They do not bypass a site's authentication, API, or JavaScript requirements.
 
 ### Install homebrew from ZIP
 
-A completed ZIP offers **Install homebrew…** in Details, including when its
+A completed ZIP offers **Install homebrew?** in Details, including when its
 filename has no ZIP extension. This signature check is only a UI hint. A
 read-only validation pass must find exactly one `EBOOT.PBP` and an unambiguous
 app folder before showing the native confirmation with the destination,

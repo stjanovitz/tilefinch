@@ -30,6 +30,9 @@
 #define TILEFINCH_PSP_THREAD_PRIORITY_MODULE_LOADER 0x18
 #define TILEFINCH_PSP_THREAD_PRIORITY_AUDIO         0x18
 #define TILEFINCH_PSP_THREAD_PRIORITY_VOICE         0x18
+/* Page microphone capture: short polls of one 23 ms transfer, in the same
+   real-time service band as voice typing, which never runs beside it. */
+#define TILEFINCH_PSP_THREAD_PRIORITY_MICROPHONE    0x18
 #define TILEFINCH_PSP_THREAD_PRIORITY_CODEC         0x19
 #define TILEFINCH_PSP_THREAD_PRIORITY_PRESENT       0x1e
 #define TILEFINCH_PSP_THREAD_PRIORITY_TRANSPORT     0x1f
@@ -48,6 +51,9 @@ _Static_assert(TILEFINCH_PSP_THREAD_PRIORITY_WATCHDOG
 _Static_assert(TILEFINCH_PSP_THREAD_PRIORITY_DMA
                    < TILEFINCH_PSP_THREAD_PRIORITY_CODEC,
                "DMA staging must drain before the next codec job");
+_Static_assert(TILEFINCH_PSP_THREAD_PRIORITY_MICROPHONE
+                   < TILEFINCH_PSP_THREAD_PRIORITY_BROWSER,
+               "microphone transfers must not wait behind the browser");
 _Static_assert(TILEFINCH_PSP_THREAD_PRIORITY_AUDIO
                    < TILEFINCH_PSP_THREAD_PRIORITY_CODEC,
                "audio output must not queue behind firmware decode");

@@ -472,6 +472,18 @@ static void navigation_stream_preload_scan_tag(
         stream->preload_scan = NAVIGATION_PRELOAD_SCAN_DISABLED;
         return;
     }
+    /* A <meta> policy applies only once the parser inserts it, after the
+       scan has run ahead. Stop rather than fetch what it may refuse. */
+    if (navigation_span_equal(name, name_length, "meta")) {
+        const char *equiv = NULL;
+        size_t equiv_length = 0;
+        if (navigation_preload_scan_attribute(
+                tag, length, "http-equiv", &equiv, &equiv_length)
+            && equiv_length == 23u
+            && strncasecmp(equiv, "content-security-policy", 23u) == 0)
+            stream->preload_scan = NAVIGATION_PRELOAD_SCAN_DISABLED;
+        return;
+    }
     if (!navigation_span_equal(name, name_length, "link")) return;
     const char *disabled = NULL, *href = NULL, *rel = NULL;
     const char *crossorigin = NULL;

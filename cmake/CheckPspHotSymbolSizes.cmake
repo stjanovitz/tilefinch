@@ -61,6 +61,27 @@ if(NOT PSP_VALIDATION_LOG)
     check_absent_symbol(psp_entropy_capture_copy "[Bb]")
 endif()
 
+# The shipping image links no stream printf core (TilefinchTargets.cmake,
+# the validation-only _vfiprintf_r alias). One ungated printf or fprintf in a
+# shipping object, or a library member that references either core, links
+# 11-14 KB back in under the .text ceiling's slack. Validation code and its
+# memory diagnostics, gated `!__PSP__ || TILEFINCH_PSP_VALIDATION_LOG` in
+# their headers, must not reach the shipping image either.
+if(NOT PSP_VALIDATION_LOG)
+    foreach(validation_symbol IN ITEMS
+            _vfprintf_r _vfiprintf_r
+            tilefinch_frame_lite tilefinch_frame_lite_set
+            tilefinch_frame_lite_reset tilefinch_frame_lite_restore
+            layout_validation_enabled layout_validation_note
+            layout_validation_set_cause
+            browser_engine_memory_report browser_engine_memory_census
+            psp_heap_commit_watch psp_heap_commit_report
+            budget_set_peak_observer)
+        check_absent_symbol(${validation_symbol})
+    endforeach()
+    check_absent_symbol(tilefinch_frame_lite_counters "[BbDd]")
+endif()
+
 function(hot_symbol_size symbol out)
     string(REGEX MATCHALL
         "[0-9A-Fa-f]+[ \t]+[0-9A-Fa-f]+[ \t]+[Tt][ \t]+${symbol}(\\.[^ \t\r\n]+)?([\r\n]|$)"

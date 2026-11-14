@@ -1112,14 +1112,6 @@ static long stylesheet_remaining_ms(ResourceContext *context)
     return (long) remaining;
 }
 
-static bool name_is(lxb_dom_node_t *node, const char *wanted)
-{
-    size_t length = 0;
-    const char *name = document_element_name(node, &length);
-    return name != NULL && strlen(wanted) == length
-           && memcmp(name, wanted, length) == 0;
-}
-
 static bool token_contains(const char *text, size_t length, const char *wanted)
 {
     size_t wanted_length = strlen(wanted);
@@ -1176,7 +1168,7 @@ static void stylesheet_collect_alternate_themes(
     if (context == NULL || root == NULL) return;
     lxb_dom_node_t *html = root;
     size_t html_work = 0;
-    while (html != NULL && !name_is(html, "html") && html_work++ < 16) {
+    while (html != NULL && !document_element_name_is(html, "html") && html_work++ < 16) {
         html = html->first_child != NULL ? html->first_child : html->next;
     }
     if (html == NULL) return;
@@ -1212,7 +1204,7 @@ static void stylesheet_collect_alternate_themes(
                an incomplete later walk of a script-expanded document. */
             return;
         }
-        if (name_is(node, "link")
+        if (document_element_name_is(node, "link")
             && discovered_count < STYLESHEET_ALTERNATE_THEME_LIMIT) {
             size_t theme_length = 0, href_length = 0;
             const char *theme = document_attribute(
@@ -3074,7 +3066,7 @@ static bool process_stylesheet_node(
     ResourceContext *context, lxb_dom_node_t *node)
 {
     if (node == NULL || node->type != LXB_DOM_NODE_TYPE_ELEMENT) return true;
-    if (name_is(node, "style")) {
+    if (document_element_name_is(node, "style")) {
         if (!tilefinch_csp_allows_inline_style(
                 context->content_security_policy, node)) return true;
         size_t override_length = 0;
@@ -3127,7 +3119,7 @@ static bool process_stylesheet_node(
         return stylesheet_add_style_element(
             context->sheet, node, context->content_security_policy);
     }
-    return !name_is(node, "link")
+    return !document_element_name_is(node, "link")
         || queue_stylesheet_link(context, node);
 }
 
@@ -3208,7 +3200,7 @@ static bool reserve_applied_links(ResourceContext *context, lxb_dom_node_t *node
     lxb_dom_node_t *const boundary_parent = node->parent;
     for (size_t visited = 0; visited < 65536u; visited++) {
         if (!resource_work(context, 1, false)) return false;
-        if (name_is(node, "link")) {
+        if (document_element_name_is(node, "link")) {
             size_t rel_length = 0, href_length = 0, media_length = 0;
             const char *rel = document_attribute(
                 node, STYLESHEET_INPUT_REL, &rel_length);
@@ -3348,7 +3340,7 @@ bool stylesheets_settle_style_preloads_with_context(
         const char *rel = document_attribute(
             nodes[i], STYLESHEET_INPUT_REL, &rel_length);
         const char *as = document_attribute(nodes[i], "as", &as_length);
-        if (!name_is(nodes[i], "link") || rel == NULL
+        if (!document_element_name_is(nodes[i], "link") || rel == NULL
             || token_contains(rel, rel_length, "stylesheet")
             || !token_contains(rel, rel_length, "preload")
             || as == NULL || as_length != 5u

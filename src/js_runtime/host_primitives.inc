@@ -826,6 +826,19 @@ static bool fixed_box_offset(const LayoutDocument *layout,
     return true;
 }
 
+/* __tilefinchGeometry's fields, in definition order. */
+enum {
+    GEOMETRY_x, GEOMETRY_y, GEOMETRY_retained, GEOMETRY_authoritative,
+    GEOMETRY_width, GEOMETRY_height, GEOMETRY_clientWidth,
+    GEOMETRY_clientHeight, GEOMETRY_scrollWidth, GEOMETRY_scrollHeight,
+    GEOMETRY_scrollLeft, GEOMETRY_scrollTop, GEOMETRY_FIELD_COUNT
+};
+static const char *const geometry_field_names[GEOMETRY_FIELD_COUNT] = {
+    "x", "y", "retained", "authoritative", "width", "height",
+    "clientWidth", "clientHeight", "scrollWidth", "scrollHeight",
+    "scrollLeft", "scrollTop",
+};
+
 static JSValue js_element_geometry(JSContext *context,
                                    JSValueConst this_value,
                                    int argc, JSValueConst *argv)
@@ -912,8 +925,6 @@ static JSValue js_element_geometry(JSContext *context,
                 box == NULL ? 0 : box->height);
     }
 #endif
-    JSValue result = JS_NewObject(context);
-    if (JS_IsException(result)) return result;
     int x = box == NULL ? 0 : box->x;
     int y = box == NULL ? unknown_y : box->y;
     for (lxb_dom_node_t *parent = node == NULL ? NULL : node->parent;
@@ -938,19 +949,16 @@ static JSValue js_element_geometry(JSContext *context,
     } else {
         y -= bridge == NULL ? 0 : bridge->page_scroll_y;
     }
-#define SET_GEOMETRY(name, value) \
-    do { \
-        if (js_rt_define_field(context, result, name, \
-                              JS_NewInt32(context, value)) < 0) { \
-            JS_FreeValue(context, result); \
-            return JS_EXCEPTION; \
-        } \
-    } while (0)
-    SET_GEOMETRY("x", x);
-    SET_GEOMETRY("y", y);
-    SET_GEOMETRY("retained", box != NULL);
+    /* Every value is computed before anything is stored: defining entries
+       on a caller-supplied array (a Proxy passes JS_IsArray) can run
+       script. */
+    int values[GEOMETRY_FIELD_COUNT];
+#define SET_GEOMETRY(name, value) (values[GEOMETRY_##name] = (value))
+    SET_GEOMETRY(x, x);
+    SET_GEOMETRY(y, y);
+    SET_GEOMETRY(retained, box != NULL);
     SET_GEOMETRY(
-        "authoritative",
+        authoritative,
         unknown || (box != NULL
             && (box->cssom_geometry_authoritative || fixed_geometry)));
     if (box != NULL
@@ -968,16 +976,16 @@ static JSValue js_element_geometry(JSContext *context,
                              ? bridge->viewport_height : 65) : 0;
     ElementScrollIntent *intent = box == NULL
         ? bridge_scroll_intent_find(bridge, node) : NULL;
-    SET_GEOMETRY("width", box == NULL ? fallback_width : box->width);
-    SET_GEOMETRY("height", box == NULL ? fallback_height : box->height);
+    SET_GEOMETRY(width, box == NULL ? fallback_width : box->width);
+    SET_GEOMETRY(height, box == NULL ? fallback_height : box->height);
     /* CSSOM View defines the root element's client box as the layout
        viewport.  A retained layout box for <html> is an implementation
        detail and may legitimately have no content box of its own. */
-    SET_GEOMETRY("clientWidth", document_root && bridge != NULL
+    SET_GEOMETRY(clientWidth, document_root && bridge != NULL
                                 ? bridge->viewport_width
                                 : (box == NULL ? fallback_width
                                                : box->client_width));
-    SET_GEOMETRY("clientHeight", document_root && bridge != NULL
+    SET_GEOMETRY(clientHeight, document_root && bridge != NULL
                                  ? bridge->viewport_height
                                  : (box == NULL ? fallback_height
                                                 : box->client_height));
@@ -997,15 +1005,34 @@ static JSValue js_element_geometry(JSContext *context,
         scroll_height = page_height > bridge->viewport_height
             ? page_height : bridge->viewport_height;
     }
-    SET_GEOMETRY("scrollWidth", scroll_width);
-    SET_GEOMETRY("scrollHeight", scroll_height);
-    SET_GEOMETRY("scrollLeft", box == NULL
+    SET_GEOMETRY(scrollWidth, scroll_width);
+    SET_GEOMETRY(scrollHeight, scroll_height);
+    SET_GEOMETRY(scrollLeft, box == NULL
                                ? (intent == NULL ? 0 : intent->scroll_x)
                                : box->scroll_x);
-    SET_GEOMETRY("scrollTop", box == NULL
+    SET_GEOMETRY(scrollTop, box == NULL
                               ? (intent == NULL ? 0 : intent->scroll_y)
                               : box->scroll_y);
 #undef SET_GEOMETRY
+    /* getBoundingClientRect passes its own array to refill, indexed in
+       geometry_field_names order, sparing an object and twelve named properties per
+       call; every other caller takes the object. */
+    bool refill = argc > 1 && JS_IsArray(context, argv[1]) > 0;
+    JSValue result = refill ? JS_DupValue(context, argv[1])
+                            : JS_NewObject(context);
+    if (JS_IsException(result)) return result;
+    if (!refill && bridge != NULL && bridge->result != NULL)
+        bridge->result->geometry_result_objects++;
+    for (int i = 0; i < GEOMETRY_FIELD_COUNT; i++) {
+        JSValue value = JS_NewInt32(context, values[i]);
+        if ((refill
+             ? js_rt_define_index(context, result, (uint32_t) i, value)
+             : js_rt_define_field(context, result, geometry_field_names[i],
+                                  value)) < 0) {
+            JS_FreeValue(context, result);
+            return JS_EXCEPTION;
+        }
+    }
     return result;
 }
 
@@ -1083,7 +1110,6 @@ static bool frame_realm_prepare(JSContext *caller, ScriptRuntime *host,
         return false;
     }
     host->frame_realms[slot].intrinsic_state = 1;
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
     /* Same order as JS_NewContext, on the original raw global object. These
        native initializers do not execute author code. A partial failure is
        terminal: retrying would replace prototypes under retained values. */
@@ -1097,14 +1123,11 @@ static bool frame_realm_prepare(JSContext *caller, ScriptRuntime *host,
         JS_Throw(caller, JS_GetException(realm));
         return false;
     }
-#endif
     /* The new ArrayBuffer intrinsics exist now and no author code has run
        in this realm since they were created. */
     if (!js_wasm_guard_buffer_transfer(realm)) {
         host->frame_realms[slot].intrinsic_state = 3;
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
         JS_RetireContext(realm);
-#endif
         JS_Throw(caller, JS_GetException(realm));
         return false;
     }
@@ -1142,13 +1165,8 @@ static JSValue js_frame_scope(JSContext *context, JSValueConst this_value,
         }
         if (host->frame_realms[i].context != NULL) continue;
         JSContext *realm =
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
             JS_NewContextRaw(host->runtime);
-#else
-            JS_NewContext(host->runtime);
-#endif
         if (realm == NULL) return JS_ThrowOutOfMemory(context);
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
         /* BaseObjects defines eval/globalThis and autoinit properties that
            cannot be installed over the Window bindings. Install this core
            before exposing the global; defer the remaining intrinsic groups. */
@@ -1157,7 +1175,6 @@ static JSValue js_frame_scope(JSContext *context, JSValueConst this_value,
             JS_FreeContext(realm);
             return JS_Throw(context, exception);
         }
-#endif
         JS_SetContextOpaque(realm, bridge);
 #if defined(TILEFINCH_QUICKJS_DYNAMIC_CODE_POLICY)
         JS_SetDynamicCodeEnabled(realm, bridge->dynamic_code_allowed);
@@ -1170,9 +1187,6 @@ static JSValue js_frame_scope(JSContext *context, JSValueConst this_value,
         host->frame_realms[i].dynamic_code_allowed =
             bridge->dynamic_code_allowed;
         host->frame_realms[i].frame_handle = 0;
-#if !defined(PSP_BROWSER_BELLARD_QUICKJS)
-        host->frame_realms[i].intrinsic_state = 2;
-#endif
         return global;
     }
     if (argc > 1 && JS_ToBool(context, argv[1]))
@@ -1295,6 +1309,7 @@ static JSValue js_create_frame_eval(JSContext *context,
             JS_SetGlobalThis(bridge->host->frame_realms[i].context, argv[1]);
 #endif
             bridge->host->frame_realms[i].frame_handle = (long) frame_handle;
+            js_rt_bridge_keep_node_handle(bridge, frame_handle);
             break;
         }
     }
@@ -2057,18 +2072,6 @@ static JSValue js_media_matches(JSContext *context, JSValueConst this_value,
     return JS_NewBool(context, matches);
 }
 
-/* prefers-color-scheme for matchMedia: the same answer the CSS media
-   evaluator gives (Tilefinch night mode). */
-static JSValue js_prefers_dark_color_scheme(JSContext *context,
-                                            JSValueConst this_value,
-                                            int argc, JSValueConst *argv)
-{
-    (void) this_value;
-    (void) argc;
-    (void) argv;
-    return JS_NewBool(context, stylesheet_prefers_dark_color_scheme());
-}
-
 static JSValue js_crypto_random_fill(JSContext *context,
                                      JSValueConst this_value,
                                      int argc, JSValueConst *argv)
@@ -2747,7 +2750,6 @@ static JSValue base64_encoded_string(JSContext *context,
     if (count > (SIZE_MAX / 4u) * 3u - 2u)
         return JS_ThrowRangeError(context, "Invalid string length");
     size_t output_length = ((count + 2u) / 3u) * 4u;
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
     uint8_t *output = NULL;
     JSValue result = JS_NewStringLenLatin1UninitializedPortable(
         context, output_length, &output);
@@ -2755,15 +2757,6 @@ static JSValue base64_encoded_string(JSContext *context,
     if (output_length != 0)
         base64_encode_into((char *) output, source, count, latin1_utf8);
     return result;
-#else
-    char *output = js_malloc(context, output_length + 1u);
-    if (output == NULL) return JS_EXCEPTION;
-    base64_encode_into(output, source, count, latin1_utf8);
-    output[output_length] = '\0';
-    JSValue result = JS_NewStringLen(context, output, output_length);
-    js_free(context, output);
-    return result;
-#endif
 }
 
 static JSValue js_base64_encode_bytes(JSContext *context,
@@ -2884,23 +2877,12 @@ static JSValue js_base64_decode_string(JSContext *context,
     size_t output_capacity = (digit_count / 4u) * 3u
                              + (remainder == 0u ? 0u : remainder - 1u);
     uint8_t *output = NULL;
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
     JSValue result = JS_NewStringLenLatin1UninitializedPortable(
         context, output_capacity, &output);
     if (JS_IsException(result)) {
         JS_FreeCString(context, input);
         return JS_EXCEPTION;
     }
-#else
-    JSValue result = JS_UNDEFINED;
-    if (output_capacity != 0) {
-        output = js_malloc(context, output_capacity);
-        if (output == NULL) {
-            JS_FreeCString(context, input);
-            return JS_EXCEPTION;
-        }
-    }
-#endif
     size_t destination = 0;
     uint32_t packed = 0;
     unsigned group = 0;
@@ -2923,19 +2905,8 @@ static JSValue js_base64_decode_string(JSContext *context,
         output[destination++] = (uint8_t) (packed >> 2);
     }
     if (destination != output_capacity) {
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
         JS_FreeValue(context, result);
-#else
-        js_free(context, output);
-#endif
         result = JS_ThrowTypeError(context, "invalid base64 input");
-#if !defined(PSP_BROWSER_BELLARD_QUICKJS)
-    } else {
-        result = JS_NewStringLen(
-            context, output_capacity == 0 ? "" : (const char *) output,
-            output_capacity);
-        js_free(context, output);
-#endif
     }
     JS_FreeCString(context, input);
     return result;
@@ -2961,18 +2932,9 @@ static JSValue js_replay_math_random(JSContext *context,
    API error. Set the flag after throwing: Bellard's throw clears it first. */
 JSValue js_rt_throw_task_interruption(JSContext *context, const char *message)
 {
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
     JSValue exception = JS_ThrowInternalError(context, "%s", message);
     JS_SetUncatchableException(context, true);
     return exception;
-#else
-    JSValue exception = JS_NewInternalError(context, "%s", message);
-    /* Error construction can itself fail. Preserve and mark the pending
-       exception too, rather than turning cancellation into a catchable OOM. */
-    if (JS_IsException(exception)) exception = JS_GetException(context);
-    JS_SetUncatchableError(context, exception);
-    return JS_Throw(context, exception);
-#endif
 }
 
 /* Short callbacks can finish before VM polls. The bootstrap checks the
@@ -3191,6 +3153,7 @@ static JSValue script_profile_native_value(JSContext *context,
     }
 SCRIPT_SPLIT_NATIVE(js_computed_style_get, SCRIPT_SPLIT_STYLE)
 SCRIPT_SPLIT_NATIVE(js_computed_style_read, SCRIPT_SPLIT_STYLE)
+SCRIPT_SPLIT_NATIVE(js_computed_style_values, SCRIPT_SPLIT_STYLE)
 SCRIPT_SPLIT_NATIVE(js_transition_snapshot, SCRIPT_SPLIT_STYLE)
 SCRIPT_SPLIT_NATIVE(js_dom_query, SCRIPT_SPLIT_QUERY)
 SCRIPT_SPLIT_NATIVE(js_dom_query_all, SCRIPT_SPLIT_QUERY)
@@ -3214,6 +3177,7 @@ static JSCFunction *script_split_native(JSCFunction *function)
     } natives[] = {
         { js_computed_style_get, split_js_computed_style_get },
         { js_computed_style_read, split_js_computed_style_read },
+        { js_computed_style_values, split_js_computed_style_values },
         { js_transition_snapshot, split_js_transition_snapshot },
         { js_dom_query, split_js_dom_query },
         { js_dom_query_all, split_js_dom_query_all },

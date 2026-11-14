@@ -1976,26 +1976,6 @@ static inline uint64_t psp_media_open_wait_budget_us(
     return phase_left < total_left ? phase_left : total_left;
 }
 
-/*
- * And what a blocking read inside a seek may spend.
- *
- * A seek used to spend this budget decoding forward to an exact frame, and a
- * cold window at a far offset made that the whole five seconds and then a
- * failure. It now spends it warming the connection the position it landed on
- * will read from -- best effort, so an expired budget costs the first playing
- * frames a fetch rather than costing the viewer the seek. The open's much
- * larger budget stays the open's: a viewer waiting on a scrub is not a
- * loading screen.
- */
-static inline uint64_t psp_media_seek_wait_budget_us(
-    uint64_t started_us, uint64_t now_us)
-{
-    if (started_us == 0) return PSP_MEDIA_SEEK_TIMEOUT_US;
-    uint64_t spent = now_us > started_us ? now_us - started_us : 0;
-    return spent >= PSP_MEDIA_SEEK_TIMEOUT_US
-        ? 0 : PSP_MEDIA_SEEK_TIMEOUT_US - spent;
-}
-
 typedef enum {
     PSP_MEDIA_FIRST_FRAME_WAITING = 0,
     /* The pipeline spent the stalled window inside its bounded pump, which on

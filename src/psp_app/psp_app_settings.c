@@ -413,6 +413,23 @@ static void psp_app_reload_after_setting(
         240);
 }
 
+void psp_app_scripts_off_answer(PspApp *app, PspAppFrameState *frame,
+                                bool accept)
+{
+    psp_scripts_off_session_answered(&app->interactive->scripts_off_session);
+    if (psp_scripts_off_offer_answer(
+            app->browser->profile, app->browser->engine,
+            &app->process->presentation.ui, accept) != PSP_SETTING_APPLIED)
+        return;
+    psp_profile_store_mark_dirty(
+        &app->browser->profile_store, frame->ui_sample_us);
+    if (accept)
+        psp_app_reload_after_setting(
+            app, &app->views->frame, "SITE JAVASCRIPT OFF - RELOADING",
+            "SITE JAVASCRIPT OFF", "SITE JAVASCRIPT SAVED - RELOAD FAILED",
+            NULL);
+}
+
 static void psp_app_reload_for_site_security_setting(
     PspApp *app, PspAppFrameState *frame,
     const char *reloading_status, const char *saved_status)
@@ -941,6 +958,43 @@ static void psp_setting_insecure_audio_site(
     }
 }
 
+/* Permissions & controls > Microphone: Ask, Allow or Block for the page's
+   origin, remembered in the profile (Ask forgets it). A change takes away
+   every "Allow this time" too, and anything but Allow stops a live
+   capture now; the page sees the permission change at its next task. */
+static void psp_setting_microphone_site(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    PspUiState *ui = &app->process->presentation.ui;
+    BrowserProfile *profile = app->browser->profile;
+    MediaCapturePermission previous =
+        browser_profile_microphone_site(profile, ui->url);
+    unsigned value = intent->setting.value.unsigned_value;
+    MediaCapturePermission permission = value == 1u
+        ? MEDIA_CAPTURE_PERMISSION_GRANTED
+        : value == 2u ? MEDIA_CAPTURE_PERMISSION_DENIED
+                      : MEDIA_CAPTURE_PERMISSION_PROMPT;
+    if (!browser_profile_set_microphone_site(profile, ui->url, permission)) {
+        ui->microphone_site_answer = (uint8_t) previous;
+        psp_ui_show_status(ui, "SITE EXCEPTION LIMIT REACHED", 240);
+        return;
+    }
+    psp_profile_store_mark_dirty(&app->browser->profile_store,
+                                 frame->ui_sample_us);
+    tilefinch_media_capture_permissions_changed();
+    if (permission != MEDIA_CAPTURE_PERMISSION_GRANTED
+        && tilefinch_media_capture_live()) {
+        tilefinch_media_capture_stop(MEDIA_CAPTURE_END_PERMISSION);
+        ui->microphone_live = false;
+    }
+    psp_ui_show_status(
+        ui, permission == MEDIA_CAPTURE_PERMISSION_GRANTED
+                ? "MICROPHONE ALLOWED ON THIS SITE"
+            : permission == MEDIA_CAPTURE_PERMISSION_DENIED
+                ? "MICROPHONE BLOCKED ON THIS SITE"
+                : "MICROPHONE WILL ASK", 180);
+}
+
 static void psp_setting_third_party_cookies_site(
     PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
 {
@@ -1276,19 +1330,21 @@ static void psp_setting_content_blocker_mode(
             blocker_metrics.allow_rule_count,
             blocker_metrics.ignored_rule_count,
             blocker_metrics.retained_bytes);
-        char status[64];
-        snprintf(
-            status, sizeof(status),
-            requested == CONTENT_BLOCKER_OFF
-                ? "AD BLOCKING OFF"
-                : (requested == CONTENT_BLOCKER_BASIC
-                       ? "AD BLOCKING BASIC"
-                       : (blocker_metrics.truncated
-                              ? "CUSTOM %u RULES - %u IGNORED - LIST TOO LONG"
-                              : "CUSTOM %u RULES - %u IGNORED")),
-            (unsigned) blocker_metrics.rule_count,
-            (unsigned) blocker_metrics.ignored_rule_count);
-        psp_ui_show_status(&app->process->presentation.ui, status, 180);
+        if (requested == CONTENT_BLOCKER_CUSTOM) {
+            char status[64];
+            snprintf(status, sizeof(status),
+                     blocker_metrics.truncated
+                         ? "CUSTOM %u RULES - %u IGNORED - LIST TOO LONG"
+                         : "CUSTOM %u RULES - %u IGNORED",
+                     (unsigned) blocker_metrics.rule_count,
+                     (unsigned) blocker_metrics.ignored_rule_count);
+            psp_ui_show_status(&app->process->presentation.ui, status, 180);
+        } else {
+            psp_ui_show_status(&app->process->presentation.ui,
+                               requested == CONTENT_BLOCKER_OFF
+                                   ? "CONTENT BLOCKER: OFF"
+                                   : "CONTENT BLOCKER: BASIC", 180);
+        }
         char entry_buffer[NAVIGATION_URL_LIMIT];
         const char *entry_url = psp_app_current_url(
             app->browser->engine, entry_buffer, sizeof(entry_buffer));
@@ -1301,6 +1357,23 @@ static void psp_setting_content_blocker_mode(
         (void) psp_engine_views_refresh(app->views, engine);
         frame->page_dirty = true;
     }
+}
+
+/* Applies to the requests that follow; the open page keeps the scripts it
+   already has until it is reloaded. */
+static void psp_setting_content_blocker_paywall_scripts(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    bool blocked = intent->setting.value.boolean;
+    browser_profile_set_content_blocker_paywall_scripts(
+        app->browser->profile, blocked);
+    (void) browser_engine_content_blocker_set_paywall_scripts(
+        app->browser->engine, blocked);
+    psp_profile_store_mark_dirty(
+        &app->browser->profile_store, frame->ui_sample_us);
+    psp_ui_show_status(&app->process->presentation.ui,
+                       blocked ? "PAYWALL SCRIPTS: BLOCKED"
+                               : "PAYWALL SCRIPTS: ALLOWED", 180);
 }
 
 static void psp_setting_content_blocker_cosmetic_hiding(
@@ -1851,6 +1924,9 @@ void psp_app_apply_setting(
     case PSP_UI_SETTING_INSECURE_AUDIO_SITE:
         psp_setting_insecure_audio_site(app, intent);
         break;
+    case PSP_UI_SETTING_MICROPHONE_SITE:
+        psp_setting_microphone_site(app, frame, intent);
+        break;
     case PSP_UI_SETTING_THIRD_PARTY_COOKIES_SITE:
         psp_setting_third_party_cookies_site(app, frame, intent);
         break;
@@ -1899,6 +1975,9 @@ void psp_app_apply_setting(
         break;
     case PSP_UI_SETTING_CONTENT_BLOCKER_COSMETIC_HIDING:
         psp_setting_content_blocker_cosmetic_hiding(app, frame, intent);
+        break;
+    case PSP_UI_SETTING_CONTENT_BLOCKER_PAYWALL_SCRIPTS:
+        psp_setting_content_blocker_paywall_scripts(app, frame, intent);
         break;
     case PSP_UI_SETTING_CONTENT_BLOCKER_SITE_ALLOWED:
         psp_setting_content_blocker_site_allowed(app, frame, intent);

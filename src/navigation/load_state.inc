@@ -330,6 +330,7 @@ static bool navigation_load_headers(void *opaque,
 {
     NavigationLoad *load = opaque;
     if (load == NULL) return false;
+    load->session->last_response_started = true;
     const char *effective = metadata->effective_url[0] == '\0'
         ? load->request_url : metadata->effective_url;
     if (!tilefinch_url_normalize(effective, load->effective_history_url,
@@ -339,6 +340,22 @@ static bool navigation_load_headers(void *opaque,
         snprintf(load->session->last_error,
                  sizeof(load->session->last_error), "%s",
                  "response effective URL is invalid");
+        return false;
+    }
+    /* Google refusing the honest identity on accounts.google.com
+       (site_identity.h) never commits either: the session returns to the
+       shipping identity there and the browser reloads the page once. A
+       form submission is never sent again; its source page is reloaded. */
+    if (site_identity_accounts_refusal(
+            load->requested_url, load->source_url, effective,
+            metadata->status_code)) {
+        site_identity_accounts_refused(
+            strcasecmp(load->method, "GET") == 0 ? load->requested_url
+                                                 : NULL,
+            load->source_url);
+        snprintf(load->session->last_error,
+                 sizeof(load->session->last_error), "%s",
+                 "Google didn't accept this browser");
         return false;
     }
     /* A refused opted-in Google search (site_identity.h) never commits:
@@ -665,7 +682,8 @@ static bool navigation_load_begin_parser(NavigationLoad *load)
     }
     load->parser_active = true;
     if (!document_parser_set_scripting(
-            &load->parser, load->session->document_scripts_enabled)) {
+            &load->parser, load->session->document_scripts_enabled)
+        || !document_parser_set_meta_csp(&load->parser, true)) {
         return false;
     }
     if (!document_parser_set_inert_script_policy(
@@ -880,7 +898,8 @@ static bool navigation_load_reset_for_retry(NavigationLoad *load)
     }
     load->parser_active = true;
     if (!document_parser_set_scripting(
-            &load->parser, load->session->document_scripts_enabled)) {
+            &load->parser, load->session->document_scripts_enabled)
+        || !document_parser_set_meta_csp(&load->parser, true)) {
         return false;
     }
     if (!document_parser_set_inert_script_policy(
@@ -1338,6 +1357,8 @@ NavigationLoadStatus navigation_load_pump(
     session->last_tls_verification_failed =
         load->response.tls_verification_failed;
     session->last_transport_timed_out = load->response.timed_out;
+    session->last_response_limit_exceeded =
+        load->response.response_limit_exceeded;
     session->last_tls12_compatibility_retry =
         load->response.tls12_compatibility_retry;
     snprintf(session->last_tls_version,
@@ -1716,6 +1737,9 @@ static bool navigation_load_finalize_build(NavigationLoad *load)
                 if (load->layout_job != NULL) return true;
             }
         }
+#ifdef TILEFINCH_LAYOUT_DIFF
+        layout_validation_set_cause("load-commit");
+#endif
         if (layout_status != LAYOUT_BUILD_COMPLETE
             || !layout_build_job_take(
                    load->layout_job, &candidate->page.layout)) {
@@ -1794,6 +1818,8 @@ static void navigation_page_relocate_runtime_storage(
                                   session->viewport.css_height);
         script_runtime_set_geometry_layout_callback(session->page.runtime,
             navigation_flush_committed_geometry, session);
+        script_runtime_set_sheet_settle_callback(session->page.runtime,
+            navigation_settle_read_sheets, session);
         /* Transactional promotion memcpy-moves the inline NavigationPage.
            The realm's publication target must follow that move just like
            its document, layout, and stylesheet views.  Otherwise a later
@@ -2062,7 +2088,19 @@ bool navigation_load_metrics(const NavigationLoad *load,
                                  &telemetry);
         metrics->progress_units += telemetry.scripts_evaluated
             + telemetry.dom_mutations;
+        metrics->scripts_evaluated = telemetry.scripts_evaluated;
+    } else if (load->document_stream != NULL
+               && load->document_stream->runtime != NULL
+               && !load->document_stream->runtime_transferred) {
+        /* The parser's realm, before the candidate page adopts it. */
+        ScriptRuntimeTelemetry telemetry;
+        script_runtime_telemetry(load->document_stream->runtime, &telemetry);
+        metrics->scripts_evaluated = telemetry.scripts_evaluated;
     }
+    metrics->response_received = load->response_taken
+        || (load->status == NAVIGATION_LOAD_PENDING && load->request_id != 0
+            && fetch_scheduler_request_complete(load->scheduler,
+                                                load->request_id));
     if (load->status == NAVIGATION_LOAD_SUCCEEDED) {
         metrics->completion_per_mille = 1000;
     } else if (metrics->finalize_slices != 0

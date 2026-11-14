@@ -77,8 +77,6 @@ static bool test_native_script_element_state(Budget *budget)
         "crossOriginInvalid&&!crossScript.hasAttribute('crossorigin')&&"
         "crossScript.crossOrigin===null&&"
         "crossLink.crossOrigin==='anonymous';"
-        "globalThis.__tilefinchScheduleDynamicScript=()=>{throw new Error("
-        "'poison native scheduler');};"
         "globalThis.__tilefinchWrap=()=>({id:'poison-wrap'});"
         "globalThis.lateRuns=0;globalThis.nestedSyncOk=false;"
         "globalThis.lateScript=document.createElement('script');"

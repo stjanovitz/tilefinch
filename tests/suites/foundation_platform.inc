@@ -2608,6 +2608,7 @@ static int test_foundation(void)
     CHECK(budget.current == 0);
     puts("test: parser releases large-token storage");
     CHECK(test_parser_releases_large_token_storage(&budget));
+    CHECK(test_parser_hands_over_large_raw_text(&budget));
     CHECK(test_parser_streaming_inline_admission(&budget));
     CHECK(budget.current == 0);
 
@@ -3222,7 +3223,6 @@ static int test_foundation(void)
           && budget.current < pool_before_trim);
     CHECK(budget_quickjs_pool_destroy(quickjs_pool));
     CHECK(budget.current == pool_baseline);
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
     puts("test: exported Bellard allocator enforces the configured limit");
     const JSMallocFunctions *plain_allocator = budget_quickjs_allocator();
     JSMallocState plain_state = {
@@ -3312,7 +3312,6 @@ static int test_foundation(void)
     CHECK(budget_quickjs_pool_trim(limited_pool, 0) > 0
           && budget_quickjs_pool_destroy(limited_pool)
           && budget.current == pool_baseline);
-#endif
     char resolved[256];
     CHECK(fetch_resolve_url("https://en.wikipedia.org/wiki/PSP",
                             "../wiki/Sony", resolved, sizeof(resolved)));

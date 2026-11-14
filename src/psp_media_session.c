@@ -905,6 +905,10 @@ static void psp_media_dispatch(
         return;
     }
 
+    /* A native media session takes the audio hardware and the screen:
+       page microphone capture ends first (tilefinch/media_capture.h). */
+    if (event.type == PSP_MEDIA_EVENT_OPEN)
+        tilefinch_media_capture_stop(MEDIA_CAPTURE_END_MEDIA);
     media->dispatch_active = true;
     for (unsigned depth = 0; depth < 4u; depth++) {
         psp_media_dispatch_one(media, event, checkpoint);
@@ -1624,11 +1628,6 @@ void psp_media_resume(PspMediaSession *media)
     psp_media_session_checkpoint(media, "resume-end");
 }
 
-bool psp_media_system_suspended(const PspMediaSession *media)
-{
-    return media != NULL && media->system_suspended;
-}
-
 typedef enum {
     PSP_MEDIA_ROUTE_DOCUMENT = 0,
     PSP_MEDIA_ROUTE_PROVIDER_VIDEO,
@@ -2110,7 +2109,7 @@ const TilefinchContentSecurityPolicy *psp_media_page_content_security_policy(
 {
     const TilefinchContentSecurityPolicy *policy = media == NULL
         ? NULL : media->page_content_security_policy;
-    return policy != NULL && policy->header_present ? policy : NULL;
+    return tilefinch_csp_enforced(policy) ? policy : NULL;
 }
 
 /* Overwrites the session copy in place: a live range or HLS context of the
@@ -2119,7 +2118,7 @@ const TilefinchContentSecurityPolicy *psp_media_page_content_security_policy(
 static bool psp_media_snapshot_page_policy(
     PspMediaSession *media, const TilefinchContentSecurityPolicy *policy)
 {
-    if (policy == NULL || !policy->header_present) {
+    if (!tilefinch_csp_enforced(policy)) {
         if (media->page_content_security_policy != NULL)
             tilefinch_csp_init(media->page_content_security_policy);
         return true;

@@ -424,6 +424,8 @@ static void dynamic_snapshot_candidate(
         ScriptElementState *state = js_rt_script_element_state_find(bridge, node);
         int64_t handle = state == NULL ? 0
             : js_rt_bridge_register_node(bridge, node);
+        /* Inline scripts run between snapshot entries. */
+        js_rt_bridge_keep_node_handle(bridge, handle);
         if (handle != 0)
             ordered[(*count)++] = (ScriptElementSnapshot) {
                 .node_handle = handle, .identity = state->identity

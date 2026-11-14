@@ -251,10 +251,24 @@ static bool navigation_stream_suppress_optional_parser_work(
         memset(&stream->cssom_layout, 0, sizeof(stream->cssom_layout));
         stream->cssom_layout_ready = false;
     }
-    /* A checkpoint refusal makes the temporary sheet ineligible for final
-       adoption. EOF will build one authoritative sheet from the complete
-       DOM after the parser and transport pressure have cleared. */
-    navigation_stream_release_blocking_stylesheet(stream);
+    /* A refused metadata, fingerprint, stylesheet or CSSOM checkpoint
+       leaves the temporary sheet unproven: it is released, and EOF builds
+       the authoritative sheet from the complete DOM. A refusal of author
+       script work (a parser-script breaker, a failed mutation or timer
+       checkpoint) says nothing about a complete sheet, which stays
+       eligible for adoption: commit takes it only on the same proof as
+       after any script, a matching fingerprint (or an unchanged input
+       prefix it appends to) and the committed viewport, base URL and
+       referrer policy. Releasing it made cnn.com compile its 12,784 rules
+       again at commit (5.9 s on the device) after a mutation checkpoint
+       hit its time limit. A sheet still being prepared is released as
+       before. */
+    bool script_refusal = reason == NAVIGATION_PARSER_REFUSAL_SCRIPT
+        || reason == NAVIGATION_PARSER_REFUSAL_MUTATION;
+    if (!script_refusal || !stream->blocking_stylesheet_ready
+        || !stream->blocking_stylesheet_fingerprint_valid
+        || stream->style_prepare.phase != NAVIGATION_STYLE_PREPARE_IDLE)
+        navigation_stream_release_blocking_stylesheet(stream);
     if (reason == NAVIGATION_PARSER_REFUSAL_METADATA
         && strncmp(stream->session->last_error, "stream ", 7) == 0) {
         stream->session->last_error[0] = '\0';
@@ -879,6 +893,7 @@ static TILEFINCH_OUT_OF_LINE bool navigation_stream_script_closed(
         || stream->script_disabled_after_failure) {
         return true;
     }
+    document_meta_csp_prepare_script(document, element, stream->document_url);
     uint64_t callback_started = navigation_now_us();
     bool external = script_shape.external;
     size_t inline_source_bytes = script_shape.inline_source_bytes;

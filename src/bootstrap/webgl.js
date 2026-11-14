@@ -7,7 +7,9 @@
     globalThis.__tilefinchWebGLReleaseSurface,
     nativeIndexMaximum = globalThis.__tilefinchWebGLIndexMaximum,
     nativeFiniteFloat32 = globalThis.__tilefinchWebGLFiniteFloat32,
-    nativeCombineMatrix4 = globalThis.__tilefinchWebGLCombineMatrix4;
+    nativeCombineMatrix4 = globalThis.__tilefinchWebGLCombineMatrix4,
+    /* Loaded on first use, after the page may have replaced Event. */
+    createEvent = globalThis.__tilefinchCreateEvent;
 
   /* Tilefinch exposes the WebGL 1 object model, but deliberately translates
      only the fixed-function-compatible shader shapes the PSP GE can execute.
@@ -26,8 +28,15 @@
     /* One payload per admitted buffer and texture is the exact native cap.
        Changing either object limit requires re-measuring the PSP bridge. */
     MAX_NATIVE_SOURCES = MAX_BUFFER_OBJECTS + MAX_TEXTURE_OBJECTS,
-    MAX_SHADER_BYTES = 16 * 1024,
+    /* three.js r128's expanded built-in shaders reach ~52 KiB. */
+    MAX_SHADER_BYTES = 64 * 1024,
     MAX_INTERFACE_DECLARATIONS = 24,
+    /* WebGL 1's minimum limits. Uniform values are evaluated in JS per
+       draw, not held in GE registers, so the PSP needs no lower bound. */
+    MAX_VERTEX_UNIFORM_VECTORS = 128,
+    MAX_FRAGMENT_UNIFORM_VECTORS = 16,
+    /* WebGL 1's minimum. Varyings are followed symbolically, not stored. */
+    MAX_VARYING_VECTORS = 8,
     MAX_DRAWS = 64,
     MAX_INSTANCES = 64,
     /* Ordinary commands are packed and released as they enter the current
@@ -41,6 +50,13 @@
     TEXTURE_WORDS = 9,
     WIRE_HEADER_WORDS = 4,
     COMMAND_WIRE_MAGIC = 0x54465743,
+    MATERIAL_WIRE_MAGIC = 0x5446574d,
+    /* One material record per command slot (word 95 = slot + 1). */
+    MATERIAL_WORDS = 256,
+    /* Material records kept per program, one per recent input value set
+       (about 1.5 KiB each, allocated as value sets appear), and the miss
+       count after which draws look for one less and less often. */
+    MATERIAL_KEPT_RECORDS = 16, MATERIAL_MISS_STREAK = 8,
     TEXTURE_WIRE_MAGIC = 0x54465754,
     WIRE_VERSION = 5,
     FLUSH_FAILED = 0,
@@ -72,6 +88,8 @@
       maximumForcedFlushesPerFrame: 0,
       drawPlanHits: 0,
       drawPlanMisses: 0,
+      materialRecordHits: 0,
+      materialRecordBuilds: 0,
       commandTemplateHits: 0,
       commandTemplateMisses: 0,
       commandSlotTemplateHits: 0,
@@ -193,6 +211,23 @@
       return 0;
     },
     toWebGLInt32 = (value) => Number(value) | 0,
+    /* Exactly the same retained uniform value: 0 and -0 differ. */
+    sameMaterialValue = (a, b) => a === b && (a !== 0 || 1 / a === 1 / b),
+    /* Whether a material record key holds exactly `value` at `at`. */
+    materialKeyPartMatches = (key, at, value) => {
+      if (value instanceof Float32Array) {
+        const length = value.length;
+        if (key[at++] !== length) return false;
+        for (let k = 0; k < length; k++) {
+          const a = key[at++], b = value[k];
+          if (a !== b || (a === 0 && 1 / a !== 1 / b)) return false;
+        }
+        return true;
+      }
+      if (typeof value !== "number" || key[at++] !== -1) return false;
+      const a = key[at];
+      return a === value && (a !== 0 || 1 / a === 1 / value);
+    },
     identityMatrix = () => new Float32Array([
       1, 0, 0, 0, 0, 1, 0, 0,
       0, 0, 1, 0, 0, 0, 0, 1,
@@ -268,14 +303,14 @@
       }
       return { entries: found, excess };
     },
-    uniformVectors = (entries) => {
+    uniformVectors = (entries, limit) => {
       let vectors = 0;
       for (const entry of entries) {
         const columns = entry.type === "mat4" ? 4
           : entry.type === "mat3" ? 3 : entry.type === "mat2" ? 2 : 1;
         const consumed = columns * entry.size;
-        if (!Number.isSafeInteger(consumed) || consumed > 16 - vectors)
-          return 17;
+        if (!Number.isSafeInteger(consumed) || consumed > limit - vectors)
+          return limit + 1;
         vectors += consumed;
       }
       return vectors;
@@ -547,6 +582,7 @@
       vec3: constants.FLOAT_VEC3, vec4: constants.FLOAT_VEC4,
       mat2: constants.FLOAT_MAT2, mat3: constants.FLOAT_MAT3,
       mat4: constants.FLOAT_MAT4, sampler2D: constants.SAMPLER_2D,
+      bool: 0x8b56, int: 0x1404, samplerCube: 0x8b60,
     })[name] || constants.FLOAT,
     activeContexts = () => {
       const retained = [], active = [];
@@ -697,9 +733,10 @@
     }
   }
   class WebGLUniformLocation {
-    constructor(program, entry) {
+    constructor(program, entry, offset = 0) {
       this._program = program; this._name = entry.name;
       this._type = entry.type; this._size = entry.size;
+      this._offset = offset;
     }
   }
   class WebGLActiveInfo {
@@ -776,6 +813,1590 @@
     }
   }
 
+  /* BEGIN shader semantics */
+  /* Link-time GLSL semantics: a bounded preprocessor, a symbolic
+     evaluator of main() and the mapping of its outputs onto GE
+     fixed-function terms. Every walk is bounded; any construct
+     outside the mapping throws SemError and the caller keeps the
+     older inspector's refusal or warnings. */
+  const shaderSemantics = (() => {
+    /* Bounded GLSL ES 1.0 preprocessor. Input must already have comments
+       blanked.
+       Inactive lines become empty lines so line numbers are preserved. */
+    const PP_EXPANSIONS = 20000, PP_OUTPUT = 256 * 1024, PP_DEPTH = 32;
+    const preprocessShader = (text) => {
+      const defines = new Map(), lines = text.split("\n"), out = [],
+        stack = [], fail = (message, line) => ({ error:
+          `preprocessor line ${line + 1}: ${message}` });
+      let expansions = 0, bytes = 0;
+      const identifier = /[A-Za-z_]\w*/y;
+      const expand = (source, hidden, depth) => {
+        if (depth > PP_DEPTH) throw new Error("macro nesting is too deep");
+        let result = "", at = 0;
+        while (at < source.length) {
+          const c = source[at];
+          if (/[0-9.]/.test(c)) {
+            const number = /(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?[A-Za-z_\w]*/y;
+            number.lastIndex = at;
+            const m = number.exec(source);
+            if (m) { result += m[0]; at += m[0].length; continue; }
+          }
+          identifier.lastIndex = at;
+          const m = /[A-Za-z_]/.test(c) ? identifier.exec(source) : null;
+          if (!m) { result += c; at++; continue; }
+          const name = m[0], macro = defines.get(name);
+          at += name.length;
+          if (!macro || hidden.has(name)) { result += name; continue; }
+          if (++expansions > PP_EXPANSIONS) throw new Error("too many macro expansions");
+          if (!macro.params) {
+            hidden.add(name);
+            result += expand(macro.body, hidden, depth + 1);
+            hidden.delete(name);
+            continue;
+          }
+          let scan = at;
+          while (scan < source.length && /\s/.test(source[scan])) scan++;
+          if (source[scan] !== "(") { result += name; continue; }
+          const args = [];
+          let open = 0, start = scan + 1, end = -1;
+          for (let k = scan; k < source.length; k++) {
+            const t = source[k];
+            if (t === "(") open++;
+            else if (t === ")") {
+              if (--open === 0) { args.push(source.slice(start, k)); end = k; break; }
+            } else if (t === "," && open === 1) { args.push(source.slice(start, k)); start = k + 1; }
+          }
+          if (end < 0) throw new Error(`unterminated call of macro ${name}`);
+          if (args.length === 1 && !args[0].trim() && !macro.params.length) args.length = 0;
+          if (args.length !== macro.params.length)
+            throw new Error(`macro ${name} takes ${macro.params.length} arguments`);
+          const values = args.map((arg) => expand(arg.trim(), hidden, depth + 1));
+          const body = macro.body.replace(/[A-Za-z_]\w*/g, (word) => {
+            const index = macro.params.indexOf(word);
+            return index < 0 ? word : values[index];
+          });
+          hidden.add(name);
+          result += expand(body, hidden, depth + 1);
+          hidden.delete(name);
+          at = end + 1;
+        }
+        return result;
+      };
+      /* #if arithmetic: integers, defined(), unary ! ~ - +, binary C operators. */
+      const evaluate = (expression) => {
+        const resolved = expression.replace(
+          /\bdefined\s*(?:\(\s*([A-Za-z_]\w*)\s*\)|([A-Za-z_]\w*))/g,
+          (_, a, b) => defines.has(a || b) ? " 1 " : " 0 ");
+        const tokens = expand(resolved, new Set(), 0).match(
+          /0[xX][0-9a-fA-F]+|\d+(?:\.\d*)?|[A-Za-z_]\w*|<<|>>|<=|>=|==|!=|&&|\|\||\S/g) || [];
+        let i = 0;
+        const precedence = { "||": 1, "&&": 2, "|": 3, "^": 4, "&": 5, "==": 6, "!=": 6,
+          "<": 7, ">": 7, "<=": 7, ">=": 7, "<<": 8, ">>": 8, "+": 9, "-": 9,
+          "*": 10, "/": 10, "%": 10 };
+        const unary = () => {
+          const t = tokens[i++];
+          if (t === "(") { const v = binary(0); if (tokens[i++] !== ")") throw new Error("expected )"); return v; }
+          if (t === "!") return unary() ? 0 : 1;
+          if (t === "-") return -unary();
+          if (t === "+") return +unary();
+          if (t === "~") return ~unary();
+          if (t === undefined) throw new Error("incomplete #if expression");
+          if (/^\d/.test(t)) return Number.parseInt(t, /^0[xX]/.test(t) ? 16 : /^0\d/.test(t) ? 8 : 10);
+          if (/^[A-Za-z_]/.test(t)) return 0;
+          throw new Error(`unexpected '${t}' in #if`);
+        };
+        const binary = (minimum) => {
+          let left = unary();
+          for (;;) {
+            const op = tokens[i], level = precedence[op];
+            if (!level || level <= minimum - 1 || level < minimum) break;
+            i++;
+            const right = binary(level + 1);
+            left = op === "||" ? (left || right ? 1 : 0) : op === "&&" ? (left && right ? 1 : 0)
+              : op === "|" ? left | right : op === "^" ? left ^ right : op === "&" ? left & right
+              : op === "==" ? +(left === right) : op === "!=" ? +(left !== right)
+              : op === "<" ? +(left < right) : op === ">" ? +(left > right)
+              : op === "<=" ? +(left <= right) : op === ">=" ? +(left >= right)
+              : op === "<<" ? left << right : op === ">>" ? left >> right
+              : op === "+" ? left + right : op === "-" ? left - right
+              : op === "*" ? left * right
+              : right === 0 ? (() => { throw new Error("division by zero in #if"); })()
+              : op === "/" ? Math.trunc(left / right) : left % right;
+          }
+          return left;
+        };
+        const value = binary(0);
+        if (i !== tokens.length) throw new Error("trailing tokens in #if");
+        return value !== 0;
+      };
+      const active = () => stack.every((entry) => entry.active);
+      for (let line = 0; line < lines.length; line++) {
+        let text = lines[line];
+        const directive = /^\s*#\s*(\w*)\s*(.*)$/.exec(text);
+        try {
+          if (directive) {
+            const [, keyword, rest] = directive, live = active();
+            if (keyword === "ifdef" || keyword === "ifndef") {
+              const name = /^[A-Za-z_]\w*/.exec(rest)?.[0];
+              if (!name) return fail(`#${keyword} needs a macro name`, line);
+              const condition = live && (defines.has(name) === (keyword === "ifdef"));
+              stack.push({ active: condition, taken: condition, parent: live });
+            } else if (keyword === "if") {
+              const condition = live && evaluate(rest);
+              stack.push({ active: condition, taken: condition, parent: live });
+            } else if (keyword === "elif" || keyword === "else") {
+              const top = stack[stack.length - 1];
+              if (!top || top.sawElse) return fail(`unexpected #${keyword}`, line);
+              if (keyword === "else") top.sawElse = true;
+              const condition = top.parent && !top.taken
+                && (keyword === "else" || evaluate(rest));
+              top.active = condition; top.taken ||= condition;
+            } else if (keyword === "endif") {
+              if (!stack.pop()) return fail("unexpected #endif", line);
+            } else if (!live) {
+              /* skipped */
+            } else if (keyword === "define") {
+              const m = /^([A-Za-z_]\w*)(\(([^)]*)\))?\s*(.*)$/.exec(rest);
+              if (!m) return fail("malformed #define", line);
+              if (/^(GL_|__)/.test(m[1])) return fail(`#define of reserved ${m[1]}`, line);
+              if (defines.size >= 512 && !defines.has(m[1]))
+                return fail("too many macros", line);
+              defines.set(m[1], { params: m[2] === undefined ? null
+                : m[3].split(",").map((p) => p.trim()).filter(Boolean), body: m[4].trim() });
+            } else if (keyword === "undef") {
+              defines.delete(/^[A-Za-z_]\w*/.exec(rest)?.[0]);
+            } else if (keyword === "error") {
+              return fail(`#error ${rest}`, line);
+            } else if (!/^(version|extension|pragma|line|)$/.test(keyword)) {
+              return fail(`unknown directive #${keyword}`, line);
+            }
+            out.push("");
+            continue;
+          }
+          out.push(active() ? expand(text, new Set(), 0) : "");
+        } catch (error) {
+          return fail(error.message, line);
+        }
+        bytes += out[out.length - 1].length + 1;
+        if (bytes > PP_OUTPUT) return fail("expanded shader is too large", line);
+      }
+      if (stack.length) return fail("missing #endif", lines.length - 1);
+      return { text: out.join("\n"), defines };
+    };
+    /* The link-time semantic pass.
+       Symbolically evaluates the preprocessed vertex and fragment main() into
+       expression DAGs, inlining helper functions, then maps the outputs onto
+       the GE's fixed-function terms. Every walk is bounded. */
+
+    const SEM_TOKENS = 60000, SEM_NODES = 40000, SEM_STATEMENTS = 6000,
+      SEM_DEPTH = 24;
+
+    const tokenize = (text) => {
+      const tokens = [], at = [];
+      const pattern = /[A-Za-z_]\w*|(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?|\+\+|--|[-+*\/]=|==|!=|<=|>=|&&|\|\||\^\^|\S/g;
+      for (let m; (m = pattern.exec(text));) {
+        if (tokens.length >= SEM_TOKENS) throw new SemError("shader is too long to analyse");
+        tokens.push(m[0]); at.push(m.index);
+      }
+      return { tokens, at };
+    };
+
+    class SemError extends Error {}
+    const fail = (message) => { throw new SemError(message); };
+
+    const TYPES = new Set(["void", "bool", "int", "float", "vec2", "vec3", "vec4",
+      "bvec2", "bvec3", "bvec4", "ivec2", "ivec3", "ivec4", "mat2", "mat3", "mat4",
+      "sampler2D", "samplerCube"]);
+    const QUALIFIERS = new Set(["const", "in", "out", "inout", "highp", "mediump",
+      "lowp", "precision", "invariant", "uniform", "attribute", "varying"]);
+    const size = (type) => type === "float" || type === "int" || type === "bool" ? 1
+      : /^[bi]?vec([234])$/.test(type) ? Number(type.slice(-1))
+      : type === "mat2" ? 4 : type === "mat3" ? 9 : type === "mat4" ? 16 : 0;
+    const vecType = (n) => n === 1 ? "float" : "vec" + n;
+
+    /* ---- parsing ------------------------------------------------------- */
+    const parseProgram = (text) => {
+      const { tokens, at } = tokenize(text), structs = new Map(),
+        globals = new Map(), functions = new Map();
+      let i = 0;
+      const peek = (k = 0) => tokens[i + k], next = () => tokens[i++],
+        expect = (t) => { if (tokens[i] !== t) fail(`expected '${t}' near '${tokens[i]}'`); i++; };
+      const isType = (t) => TYPES.has(t) || structs.has(t);
+      const skipQualifiers = () => {
+        const found = [];
+        while (QUALIFIERS.has(peek())) found.push(next());
+        return found;
+      };
+      const parseStruct = () => {
+        expect("struct"); const name = next(); expect("{");
+        const fields = [];
+        while (peek() !== "}") {
+          skipQualifiers(); const type = next();
+          for (;;) {
+            const field = next(); let count = 0;
+            if (peek() === "[") { next(); count = Number(next()); expect("]"); }
+            fields.push({ name: field, type, count });
+            if (peek() === ",") { next(); continue; }
+            expect(";"); break;
+          }
+          if (i >= tokens.length) fail("unterminated struct");
+        }
+        expect("}");
+        structs.set(name, fields);
+        return name;
+      };
+      const skipBlock = () => {
+        const start = i; let depth = 0;
+        do {
+          if (tokens[i] === "{") depth++;
+          else if (tokens[i] === "}") depth--;
+          i++;
+        } while (depth > 0 && i < tokens.length);
+        return [start, i];
+      };
+      while (i < tokens.length) {
+        if (peek() === "precision") { while (next() !== ";"); continue; }
+        if (peek() === ";") { next(); continue; }
+        const qualifiers = skipQualifiers();
+        let type;
+        if (peek() === "struct") {
+          type = parseStruct();
+          if (peek() === ";") { next(); continue; }
+        } else type = next();
+        if (!isType(type)) fail(`unknown type '${type}'`);
+        const name = next();
+        if (peek() === "(") {
+          next(); const params = [];
+          while (peek() !== ")") {
+            const pq = skipQualifiers(), ptype = next();
+            if (ptype === "void" && peek() === ")") break;
+            const pname = next(); let count = 0;
+            if (peek() === "[") { next(); count = Number(next()); expect("]"); }
+            params.push({ name: pname, type: ptype, count,
+              out: pq.includes("out") || pq.includes("inout") });
+            if (peek() === ",") next();
+          }
+          expect(")");
+          if (peek() === ";") { next(); continue; }
+          const [start, end] = skipBlock();
+          functions.set(name, { name, type, params, start, end });
+          continue;
+        }
+        for (let declared = name;;) {
+          let count = 0, init = null;
+          if (peek() === "[") { next(); count = Number(next()); expect("]"); }
+          if (peek() === "=") {
+            next(); const s = i; let depth = 0;
+            while (i < tokens.length && !(depth === 0 && (peek() === "," || peek() === ";"))) {
+              if (peek() === "(") depth++; else if (peek() === ")") depth--; i++;
+            }
+            init = [s, i];
+          }
+          const storage = qualifiers.find((q) => q === "uniform" || q === "attribute"
+            || q === "varying") || (qualifiers.includes("const") ? "const" : "global");
+          globals.set(declared, { name: declared, type, count, storage, init, at: at[i - 1] });
+          if (peek() === ",") { next(); declared = next(); continue; }
+          expect(";"); break;
+        }
+      }
+      return { tokens, at, structs, globals, functions, text };
+    };
+
+    /* ---- expression nodes ---------------------------------------------- */
+    const F_UNIFORM = 1, F_ATTRIBUTE = 2, F_VARYING = 4, F_PIXEL = 8,
+      F_TEXTURE = 16, F_LIGHT = 32, F_UNKNOWN = 64;
+
+    const makeEvaluator = (program, stage, options) => {
+      let nodes = 0, statements = 0;
+      const { tokens, at, structs, globals, functions } = program;
+      const node = (props) => {
+        if (++nodes > SEM_NODES) fail("shader is too large to analyse");
+        props.flags ??= 0; return props;
+      };
+      const num = (v, t = "float") => node({ k: "num", t, v });
+      const isNum = (n, v) => n.k === "num" && (v === undefined || n.v === v);
+      const lightUniform = (g) => /Light$/.test(g.type) || g.name === "ambientLightColor"
+        || g.name === "lightProbe";
+      /* Globals referenced (transitively) by each function, for light opacity. */
+      const reads = new Map();
+      const functionReads = (fn, depth = 0) => {
+        if (reads.has(fn.name)) return reads.get(fn.name);
+        const found = new Set(); reads.set(fn.name, found);
+        for (let k = fn.start; k < fn.end; k++) {
+          const t = tokens[k];
+          if (globals.has(t)) found.add(t);
+          else if (functions.has(t) && t !== fn.name && depth < SEM_DEPTH)
+            for (const g of functionReads(functions.get(t), depth + 1)) found.add(g);
+        }
+        return found;
+      };
+      const readsLight = (fn) => [...functionReads(fn)].some((name) =>
+        lightUniform(globals.get(name)));
+
+      const typeOfMember = (type, field) => {
+        const fields = structs.get(type);
+        if (fields) {
+          const f = fields.find((x) => x.name === field);
+          if (!f) fail(`no field ${field} in ${type}`);
+          return f.type;
+        }
+        const n = size(type);
+        if (/^[bi]?vec/.test(type) || type === "float") {
+          if (!/^[xyzwrgbastpq]{1,4}$/.test(field)) fail(`bad swizzle .${field}`);
+          return (type[0] === "b" ? "bvec" : type[0] === "i" ? "ivec" : "vec")
+            .replace(/vec$/, field.length === 1 ? "" : "vec")
+            + (field.length === 1 ? (type[0] === "b" ? "bool" : type[0] === "i" ? "int" : "float") : field.length);
+        }
+        fail(`member .${field} of ${type}`);
+      };
+      const normSwizzle = (s) => s.replace(/[rs]/g, "x").replace(/[gt]/g, "y")
+        .replace(/[bp]/g, "z").replace(/[aq]/g, "w");
+      const opaqueOf = (origin, type, flags) => {
+        if (structs.has(type)) {
+          const fields = new Map();
+          for (const f of structs.get(type))
+            fields.set(f.name, opaqueOf({ ...origin, field: f.name }, f.type, flags));
+          return { k: "struct", t: type, fields, origin, flags };
+        }
+        return node({ k: "opaque", t: type, origin, flags });
+      };
+
+      /* -- constructors / folding -- */
+      const swizzle = (a, s, t) => {
+        s = normSwizzle(s);
+        if (a.k === "num") return num(a.v, t);
+        if (a.k === "ctor" && a.args.every((x) => size(x.t) === 1)
+            && a.args.length === size(a.t)) {
+          const picked = [...s].map((c) => a.args["xyzw".indexOf(c)]);
+          return picked.length === 1 ? picked[0] : ctor(t, picked);
+        }
+        if (a.k === "ctor" && a.args.length === 1 && size(a.args[0].t) === 1)
+          return s.length === 1 ? a.args[0] : ctor(t, [a.args[0]]);
+        if (s === "xyzw".slice(0, size(a.t)) && s.length === size(a.t)) return a;
+        if (a.k === "swz") {
+          const inner = [...s].map((c) => a.s["xyzw".indexOf(c)]).join("");
+          return swizzle(a.a, inner, t);
+        }
+        if (a.k === "ctor" && a.args.length >= 1) {
+          /* vec4(v3, f).xyz -> v3 ; .w -> f */
+          let offset = 0; const parts = [];
+          for (const arg of a.args) { parts.push({ arg, from: offset, n: size(arg.t) }); offset += size(arg.t); }
+          const idx = [...s].map((c) => "xyzw".indexOf(c));
+          const part = parts.find((p) => idx[0] >= p.from && idx[0] < p.from + p.n);
+          if (part && idx.every((x, k) => x === idx[0] + k) && idx[idx.length - 1] < part.from + part.n) {
+            const local = idx.map((x) => "xyzw"[x - part.from]).join("");
+            return local === "xyzw".slice(0, part.n) ? part.arg : swizzle(part.arg, local, t);
+          }
+        }
+        if (a.k === "merge") {
+          /* reading back the components a partial write replaced */
+          const idx = [...s].map((c) => "xyzw".indexOf(c)),
+            written = [...a.s].map((c) => "xyzw".indexOf(c));
+          if (idx.every((x) => written.includes(x))) {
+            const local = idx.map((x) => "xyzw"[written.indexOf(x)]).join("");
+            return local === "xyzw".slice(0, size(a.v.t)) && local.length === size(a.v.t)
+              ? a.v : swizzle(a.v, local, t);
+          }
+          if (idx.every((x) => !written.includes(x))) return swizzle(a.a, s, t);
+        }
+        return node({ k: "swz", t, a, s, flags: a.flags });
+      };
+      const ctor = (t, args) => {
+        if (args.length === 1 && args[0].t === t) return args[0];
+        if (args.length === 1 && args[0].k === "num" && size(t) <= 4)
+          return node({ k: "ctor", t, args: [args[0]], flags: 0 });
+        if (t === "float" && args.length === 1) return args[0].t === "float" ? args[0]
+          : swizzle(args[0], "x", "float");
+        return node({ k: "ctor", t, args, flags: args.reduce((f, a) => f | a.flags, 0) });
+      };
+      const binary = (o, a, b) => {
+        const t = resultType(o, a.t, b.t);
+        if (a.k === "num" && b.k === "num") {
+          const v = o === "+" ? a.v + b.v : o === "-" ? a.v - b.v : o === "*" ? a.v * b.v
+            : o === "/" ? a.v / b.v : null;
+          if (v !== null) return num(v, t);
+        }
+        if (o === "*" && isNum(a, 1) && size(b.t) >= size(a.t)) return b;
+        if (o === "*" && isNum(b, 1) && size(a.t) >= size(b.t)) return a;
+        if (o === "*" && a.k === "ctor" && a.args.length === 1 && isNum(a.args[0], 1)
+            && size(b.t) === size(a.t)) return b;
+        if (o === "*" && b.k === "ctor" && b.args.length === 1 && isNum(b.args[0], 1)
+            && size(a.t) === size(b.t)) return a;
+        if (o === "+" && (isNum(a, 0) || (a.k === "ctor" && a.args.length === 1 && isNum(a.args[0], 0)))
+            && size(b.t) >= size(a.t)) return b;
+        if (o === "+" && (isNum(b, 0) || (b.k === "ctor" && b.args.length === 1 && isNum(b.args[0], 0)))
+            && size(a.t) >= size(b.t)) return a;
+        return node({ k: "op", o, t, a, b, flags: a.flags | b.flags });
+      };
+      const resultType = (o, ta, tb) => {
+        if (["<", ">", "<=", ">=", "==", "!=", "&&", "||", "^^"].includes(o)) return "bool";
+        if (ta === tb) return ta;
+        if (o === "*" && /^mat/.test(ta) && /vec/.test(tb)) return tb;
+        if (o === "*" && /vec/.test(ta) && /^mat/.test(tb)) return ta;
+        return size(ta) >= size(tb) ? ta : tb;
+      };
+      const BUILTIN_TYPES = { dot: "float", length: "float", distance: "float",
+        any: "bool", all: "bool" };
+      const call = (f, args) => {
+        const t = BUILTIN_TYPES[f] || (f === "texture2D" ? "vec4"
+          : f === "cross" ? "vec3" : args[0]?.t || "float");
+        if (args.every((a) => a.k === "num")) {
+          const v = args.map((a) => a.v), M = Math;
+          const folded = { abs: M.abs, sqrt: M.sqrt, exp: M.exp, exp2: (x) => 2 ** x,
+            log: M.log, log2: M.log2, pow: M.pow, floor: M.floor, ceil: M.ceil, sin: M.sin,
+            cos: M.cos, min: M.min, max: M.max, sign: M.sign,
+            clamp: (x, lo, hi) => M.min(M.max(x, lo), hi), fract: (x) => x - M.floor(x),
+            mod: (x, y) => x - y * M.floor(x / y), inversesqrt: (x) => 1 / M.sqrt(x),
+            radians: (x) => x * M.PI / 180, degrees: (x) => x * 180 / M.PI }[f];
+          if (folded && t === "float") return num(folded(...v));
+        }
+        let flags = args.reduce((acc, a) => acc | a.flags, 0);
+        if (f === "texture2D") flags |= F_TEXTURE;
+        if (/^(dFdx|dFdy|fwidth)$/.test(f)) flags |= F_PIXEL;
+        return node({ k: "call", f, t, args, flags });
+      };
+
+      /* -- values for globals -- */
+      const globalCache = new Map();
+      const globalValue = (name) => {
+        if (globalCache.has(name)) return globalCache.get(name);
+        const g = globals.get(name);
+        let value;
+        const leaf = (path, type, flags, kind) => {
+          if (structs.has(type)) {
+            const fields = new Map();
+            for (const f of structs.get(type)) {
+              if (f.count) {
+                const items = [];
+                for (let k = 0; k < f.count; k++) items.push(leaf(`${path}.${f.name}[${k}]`, f.type, flags, kind));
+                fields.set(f.name, { k: "array", t: f.type, items });
+              } else fields.set(f.name, leaf(`${path}.${f.name}`, f.type, flags, kind));
+            }
+            return { k: "struct", t: type, fields, flags };
+          }
+          return node({ k: kind, t: type, name: path, flags });
+        };
+        if (g.storage === "uniform") {
+          const flags = F_UNIFORM | (lightUniform(g) ? F_LIGHT : 0);
+          if (g.count) {
+            const items = [];
+            for (let k = 0; k < g.count; k++) items.push(leaf(`${name}[${k}]`, g.type, flags, "unif"));
+            value = { k: "array", t: g.type, items };
+          } else value = leaf(name, g.type, flags, "unif");
+        } else if (g.storage === "attribute") value = node({ k: "attr", t: g.type, name, flags: F_ATTRIBUTE });
+        else if (g.storage === "varying") {
+          value = stage === "fragment"
+            ? node({ k: "vary", t: g.type, name, flags: F_VARYING | (options.varyingFlags?.get(name) || 0) })
+            : { k: "undef", t: g.type };
+        } else if (g.init) {
+          value = evalTokens(g.init[0], g.init[1], new Map());
+        } else value = { k: "undef", t: g.type };
+        globalCache.set(name, value);
+        return value;
+      };
+      const BUILTIN_INPUTS = { gl_FragCoord: "vec4", gl_PointCoord: "vec2", gl_FrontFacing: "bool" };
+
+      /* -- expression parser + evaluator over a token range -- */
+      const scopeLookup = (scopes, name) => {
+        for (let s = scopes.length - 1; s >= 0; s--) if (scopes[s].has(name)) return scopes[s];
+        return null;
+      };
+      let evalTokens; // assigned below
+      const parseExpression = (ctx) => {
+        const { scopes } = ctx;
+        const PREC = { "||": 1, "^^": 2, "&&": 3, "==": 4, "!=": 4, "<": 5, ">": 5,
+          "<=": 5, ">=": 5, "+": 6, "-": 6, "*": 7, "/": 7 };
+        const primary = () => {
+          const t = tokens[ctx.i++];
+          if (t === "(") { const v = ternary(); if (tokens[ctx.i++] !== ")") fail("expected )"); return postfix(v); }
+          if (t === "-") return unaryMinus(prefixed());
+          if (t === "+") return prefixed();
+          if (t === "!") { const v = prefixed(); return node({ k: "op", o: "!", t: "bool", a: v, b: num(0), flags: v.flags }); }
+          if (/^(\d|\.\d)/.test(t)) return postfix(num(Number(t), /[.eE]/.test(t) ? "float" : "int"));
+          if (t === "true" || t === "false") return num(t === "true" ? 1 : 0, "bool");
+          if (TYPES.has(t) || structs.has(t)) {
+            const args = callArgs();
+            if (structs.has(t)) {
+              const fields = new Map();
+              structs.get(t).forEach((f, k) => fields.set(f.name, args[k]));
+              return postfix({ k: "struct", t, fields, flags: args.reduce((a, x) => a | (x.flags || 0), 0) });
+            }
+            return postfix(construct(t, args));
+          }
+          if (/^[A-Za-z_]/.test(t)) {
+            if (tokens[ctx.i] === "(") {
+              const args = callArgs(true);
+              return postfix(invoke(t, args, ctx));
+            }
+            const scope = scopeLookup(scopes, t);
+            if (scope) return postfix(scope.get(t));
+            if (outputs.has(t)) return postfix(outputs.get(t));
+            if (globals.has(t)) return postfix(globalValue(t));
+            if (BUILTIN_INPUTS[t]) return postfix(node({ k: "input", t: BUILTIN_INPUTS[t], name: t, flags: F_PIXEL }));
+            fail(`unknown identifier '${t}'`);
+          }
+          fail(`unexpected '${t}'`);
+        };
+        const prefixed = () => {
+          if (tokens[ctx.i] === "++" || tokens[ctx.i] === "--") fail("'++' and '--' are not translated");
+          return primary();
+        };
+        const unaryMinus = (v) => v.k === "num" ? num(-v.v, v.t)
+          : node({ k: "op", o: "neg", t: v.t, a: v, b: num(0), flags: v.flags });
+        const callArgs = (rawLvalues = false) => {
+          if (tokens[ctx.i++] !== "(") fail("expected (");
+          const args = [];
+          if (tokens[ctx.i] === ")") { ctx.i++; return args; }
+          for (;;) {
+            const start = ctx.i;
+            args.push(ternary());
+            args[args.length - 1].__start = start; args[args.length - 1].__end = ctx.i;
+            const t = tokens[ctx.i++];
+            if (t === ")") break;
+            if (t !== ",") fail("expected , or )");
+          }
+          return args;
+        };
+        const postfix = (v) => {
+          for (;;) {
+            const t = tokens[ctx.i];
+            if (t === ".") {
+              ctx.i++; const field = tokens[ctx.i++];
+              if (v.k === "struct") {
+                if (!v.fields.has(field)) fail(`no field ${field}`);
+                v = v.fields.get(field);
+              } else if (v.k === "opaque" && structs.has(v.t)) {
+                v = opaqueOf({ ...v.origin, field }, typeOfMember(v.t, field), v.flags);
+              } else v = swizzle(v, field, typeOfMember(v.t, field));
+              if (v === undefined) fail(`undefined field ${field}`);
+            } else if (t === "[") {
+              ctx.i++; const index = ternary();
+              if (tokens[ctx.i++] !== "]") fail("expected ]");
+              if (index.k !== "num") fail("non-constant index");
+              if (v.k === "array") {
+                if (!v.items[index.v]) fail("index out of range");
+                v = v.items[index.v];
+              } else if (/^mat/.test(v.t)) {
+                v = node({ k: "col", t: vecType(Math.sqrt(size(v.t))), a: v, i: index.v, flags: v.flags });
+              } else v = swizzle(v, "xyzw"[index.v], v.t[0] === "i" ? "int" : "float");
+            } else if (t === "++" || t === "--") fail("'++' and '--' are not translated");
+            else return v;
+          }
+        };
+        const binaryLevel = (minimum) => {
+          let left = prefixed();
+          for (;;) {
+            const o = tokens[ctx.i], level = PREC[o];
+            if (!level || level < minimum) return left;
+            ctx.i++;
+            const right = binaryLevel(level + 1);
+            left = binary(o, left, right);
+          }
+        };
+        const ternary = () => {
+          const c = binaryLevel(1);
+          if (tokens[ctx.i] !== "?") return c;
+          ctx.i++; const a = ternary();
+          if (tokens[ctx.i++] !== ":") fail("expected :");
+          const b = ternary();
+          return select(c, a, b);
+        };
+        return { ternary, postfix };
+      };
+      const select = (c, a, b) => {
+        if (c.k === "num") return c.v ? a : b;
+        if (a === b) return a;
+        if (a.k === "struct" || b.k === "struct") {
+          const fields = new Map();
+          for (const [name, value] of a.fields) fields.set(name, select(c, value, b.fields.get(name)));
+          return { k: "struct", t: a.t, fields, flags: c.flags | a.flags | b.flags };
+        }
+        if (a.k === "undef") return b;
+        if (b.k === "undef") return a;
+        return node({ k: "sel", t: a.t, c, a, b, flags: c.flags | a.flags | b.flags });
+      };
+      const construct = (t, args) => {
+        const flat = args.flatMap((a) => a.k === "struct" ? fail("struct in vector constructor") : [a]);
+        if (/^mat/.test(t) && flat.length === 1 && /^mat/.test(flat[0].t))
+          return node({ k: "ctor", t, args: flat, flags: flat[0].flags });
+        return ctor(t, flat);
+      };
+      const invoke = (name, args, ctx) => {
+        const fn = functions.get(name);
+        if (!fn) return call(name, args);
+        if (ctx.depth >= SEM_DEPTH) fail("helper functions nest too deeply");
+        const argFlags = args.reduce((f, a) => f | (a.flags || 0) | (a.k === "struct" ? structFlags(a) : 0), 0);
+        /* A helper is a light term when it reads light uniforms or is handed a
+           light struct; plain math on lit values (tone mapping) still inlines. */
+        const lightStruct = args.some((a) => a.k === "struct" && (structFlags(a) & F_LIGHT));
+        if (lightStruct || readsLight(fn)) {
+          /* Lighting math is not translated; it becomes one opaque, recorded
+             term whose arguments the GE mapping reads. */
+          const origin = { fn: name, args };
+          if (lightCalls.length < 64) lightCalls.push(origin);
+          fn.params.forEach((p, k) => {
+            if (p.out) assign(ctx, args[k], opaqueOf({ ...origin, param: p.name }, p.type, F_LIGHT));
+          });
+          return fn.type === "void" ? { k: "void", t: "void" }
+            : opaqueOf(origin, fn.type, F_LIGHT | argFlags);
+        }
+        const scope = new Map();
+        fn.params.forEach((p, k) => scope.set(p.name, args[k]));
+        const inner = { scopes: [scope], depth: ctx.depth + 1, ret: null, guards: [] };
+        runBlock(fn.start + 1, fn.end - 1, inner);
+        fn.params.forEach((p, k) => { if (p.out) assign(ctx, args[k], scope.get(p.name)); });
+        if (fn.type === "void") return { k: "void", t: "void" };
+        if (!inner.ret) fail(`helper ${name} has no return`);
+        return inner.ret;
+      };
+      const structFlags = (s) => {
+        let f = s.flags || 0;
+        for (const v of s.fields.values()) f |= v.k === "struct" ? structFlags(v) : (v.flags || 0);
+        return f;
+      };
+      /* Assign through an argument expression captured as a token range. */
+      const assign = (ctx, arg, value) => {
+        if (arg.__start === undefined) fail("out argument is not an lvalue");
+        writeLvalue(ctx, arg.__start, arg.__end, "=", value);
+      };
+      const writeLvalue = (ctx, start, end, op, value) => {
+        const name = tokens[start];
+        const scope = scopeLookup(ctx.scopes, name);
+        let root;
+        if (scope) root = scope.get(name);
+        else if (name === "gl_FragColor" || name === "gl_Position" || name === "gl_PointSize"
+            || (globals.has(name) && globals.get(name).storage === "varying" && stage === "vertex")
+            || (globals.has(name) && globals.get(name).storage === "global")) {
+          root = outputs.has(name) ? outputs.get(name)
+            : globals.has(name) ? globalValue(name) : { k: "undef", t: name === "gl_PointSize" ? "float" : "vec4" };
+        } else fail(`cannot assign to '${name}'`);
+        const path = [];
+        for (let k = start + 1; k < end;) {
+          if (tokens[k] === ".") { path.push({ field: tokens[k + 1] }); k += 2; }
+          else if (tokens[k] === "[") {
+            const sub = { i: k + 1, scopes: ctx.scopes, depth: ctx.depth };
+            const index = parseExpression(sub).ternary();
+            if (index.k !== "num") fail("non-constant index in assignment");
+            path.push({ index: index.v }); k = sub.i + 1;
+          } else fail("unsupported assignment target");
+        }
+        const update = (current, steps) => {
+          if (!steps.length) {
+            if (op === "=") return value;
+            if (current.k === "undef") fail("compound assignment to an unset value");
+            return binary(op[0], current, value);
+          }
+          const [step, ...rest] = steps;
+          if (step.index !== undefined) {
+            if (current.k === "array") {
+              const items = current.items.slice();
+              items[step.index] = update(items[step.index], rest);
+              return { ...current, items };
+            }
+            fail("indexed write into a vector or matrix");
+          }
+          if (current.k === "struct" || (current.k === "undef" && structs.has(current.t))) {
+            const fields = new Map(current.k === "struct" ? current.fields : []);
+            if (current.k === "undef")
+              for (const f of structs.get(current.t)) fields.set(f.name, { k: "undef", t: f.type });
+            fields.set(step.field, update(fields.get(step.field), rest));
+            return { k: "struct", t: current.t, fields, flags: 0 };
+          }
+          if (current.k === "opaque" && structs.has(current.t)) {
+            const expanded = opaqueOf(current.origin, current.t, current.flags);
+            return update(expanded, steps);
+          }
+          if (rest.length) fail("nested swizzle write");
+          const s = normSwizzle(step.field), t = typeOfMember(current.t, step.field);
+          const old = current.k === "undef" ? null : swizzle(current, s, t);
+          const v = op === "=" ? value : binary(op[0], old ?? fail("partial write of unset"), value);
+          if (current.k === "undef") fail("partial write of an unset vector");
+          return node({ k: "merge", t: current.t, a: current, s, v, flags: current.flags | v.flags });
+        };
+        let next = update(root, path);
+        for (const guard of ctx.guards) next = select(guard, next, root);
+        if (scope) scope.set(name, next);
+        else outputs.set(name, next);
+      };
+
+      const outputs = new Map(), discards = [], lightCalls = [];
+      const runStatement = (ctx) => {
+        if (++statements > SEM_STATEMENTS) fail("shader has too many statements to analyse");
+        const t = tokens[ctx.i];
+        if (t === "{") {
+          ctx.i++; ctx.scopes.push(new Map());
+          while (tokens[ctx.i] !== "}") { if (ctx.i >= tokens.length) fail("unterminated block"); runStatement(ctx); }
+          ctx.i++; ctx.scopes.pop(); return;
+        }
+        if (t === ";") { ctx.i++; return; }
+        if (/^(for|while|do)$/.test(t)) fail(`'${t}' is not available on the PSP GE`);
+        if (t === "discard") {
+          ctx.i++; if (tokens[ctx.i++] !== ";") fail("expected ;");
+          discards.push({ guards: ctx.guards.slice() });
+          return;
+        }
+        if (t === "return") {
+          ctx.i++;
+          let value = { k: "void", t: "void" };
+          if (tokens[ctx.i] !== ";") value = parseExpression(ctx).ternary();
+          if (tokens[ctx.i++] !== ";") fail("expected ;");
+          let result = value;
+          for (let g = ctx.guards.length - 1; g >= 0; g--) result = { pendingGuard: ctx.guards[g], value: result };
+          if (!ctx.guards.length) {
+            ctx.ret = ctx.pending ? ctx.pending(value) : value;
+            ctx.done = true;
+          } else {
+            const guard = ctx.guards.reduce((a, b) => binary("&&", a, b));
+            const prior = ctx.pending;
+            ctx.pending = (rest) => {
+              const merged = select(guard, value, rest);
+              return prior ? prior(merged) : merged;
+            };
+            ctx.guards.push(node({ k: "op", o: "!", t: "bool", a: guard, b: num(0), flags: guard.flags }));
+            ctx.returnGuards = (ctx.returnGuards || 0) + 1;
+            ctx.skipRest = true;
+          }
+          return;
+        }
+        if (t === "if") {
+          ctx.i++; if (tokens[ctx.i++] !== "(") fail("expected (");
+          const c = parseExpression(ctx).ternary();
+          if (tokens[ctx.i++] !== ")") fail("expected )");
+          const thenStart = ctx.i; skipStatement(ctx); const thenEnd = ctx.i;
+          if (c.flags & (F_ATTRIBUTE | F_VARYING | F_PIXEL | F_TEXTURE)) {
+            /* The one per-pixel branch the GE has: 'if (alpha < ref) discard;'. */
+            const lone = (thenEnd - thenStart === 2 && tokens[thenStart] === "discard")
+              || (thenEnd - thenStart === 4 && tokens[thenStart] === "{" && tokens[thenStart + 1] === "discard");
+            if (stage === "fragment" && lone && tokens[ctx.i] !== "else") {
+              discards.push({ guards: ctx.guards.slice(), cond: c });
+              return;
+            }
+            fail(`'if' depends on per-${stage === "vertex" ? "vertex" : "pixel"} data`);
+          }
+          let elseStart = -1, elseEnd = -1;
+          if (tokens[ctx.i] === "else") { ctx.i++; elseStart = ctx.i; skipStatement(ctx); elseEnd = ctx.i; }
+          const resume = ctx.i;
+          if (c.k === "num") {
+            if (c.v) { ctx.i = thenStart; runStatement(ctx); }
+            else if (elseStart >= 0) { ctx.i = elseStart; runStatement(ctx); }
+            ctx.i = resume; return;
+          }
+          const notC = node({ k: "op", o: "!", t: "bool", a: c, b: num(0), flags: c.flags });
+          ctx.guards.push(c); ctx.i = thenStart; runStatement(ctx); ctx.guards.pop();
+          if (elseStart >= 0) { ctx.guards.push(notC); ctx.i = elseStart; runStatement(ctx); ctx.guards.pop(); }
+          ctx.i = resume; return;
+        }
+        /* declaration */
+        let k = ctx.i;
+        while (QUALIFIERS.has(tokens[k])) k++;
+        if ((TYPES.has(tokens[k]) || structs.has(tokens[k])) && /^[A-Za-z_]/.test(tokens[k + 1] || "")
+            && tokens[k + 1] !== "(") {
+          const type = tokens[k]; ctx.i = k + 1;
+          for (;;) {
+            const name = tokens[ctx.i++];
+            let count = 0;
+            if (tokens[ctx.i] === "[") { ctx.i++; count = Number(tokens[ctx.i++]); ctx.i++; }
+            let value = count ? { k: "array", t: type, items: Array.from({ length: count }, () => ({ k: "undef", t: type })) }
+              : { k: "undef", t: type };
+            if (tokens[ctx.i] === "=") { ctx.i++; value = parseExpression(ctx).ternary(); }
+            ctx.scopes[ctx.scopes.length - 1].set(name, value);
+            const sep = tokens[ctx.i++];
+            if (sep === ";") break;
+            if (sep !== ",") fail("expected , or ;");
+          }
+          return;
+        }
+        /* assignment or call */
+        const start = ctx.i;
+        let depth = 0, opAt = -1;
+        for (let j = ctx.i; j < tokens.length; j++) {
+          const tok = tokens[j];
+          if (tok === "(" || tok === "[") depth++;
+          else if (tok === ")" || tok === "]") depth--;
+          else if (depth === 0 && /^([-+*\/]?=)$/.test(tok)) { opAt = j; break; }
+          else if (depth === 0 && tok === ";") break;
+        }
+        if (opAt >= 0) {
+          ctx.i = opAt + 1;
+          const value = parseExpression(ctx).ternary();
+          if (tokens[ctx.i++] !== ";") fail("expected ;");
+          writeLvalue(ctx, start, opAt, tokens[opAt], value);
+          return;
+        }
+        parseExpression(ctx).ternary();
+        if (tokens[ctx.i++] !== ";") fail("expected ;");
+      };
+      const skipStatement = (ctx) => {
+        if (tokens[ctx.i] === "{") {
+          let depth = 0;
+          do { if (tokens[ctx.i] === "{") depth++; else if (tokens[ctx.i] === "}") depth--; ctx.i++; }
+          while (depth > 0 && ctx.i < tokens.length);
+          return;
+        }
+        if (tokens[ctx.i] === "if") {
+          ctx.i++; let depth = 0;
+          do { if (tokens[ctx.i] === "(") depth++; else if (tokens[ctx.i] === ")") depth--; ctx.i++; }
+          while (depth > 0);
+          skipStatement(ctx);
+          if (tokens[ctx.i] === "else") { ctx.i++; skipStatement(ctx); }
+          return;
+        }
+        let depth = 0;
+        while (ctx.i < tokens.length) {
+          const tok = tokens[ctx.i++];
+          if (tok === "(") depth++; else if (tok === ")") depth--;
+          else if (tok === ";" && depth === 0) return;
+        }
+      };
+      const runBlock = (start, end, ctx) => {
+        ctx.i = start;
+        while (ctx.i < end && !ctx.done) {
+          runStatement(ctx);
+        }
+        if (ctx.pending && !ctx.done) fail("helper does not return on every path");
+      };
+      evalTokens = (start, end, scope) => {
+        const ctx = { i: start, scopes: [scope], depth: 0, guards: [] };
+        const v = parseExpression(ctx).ternary();
+        return v;
+      };
+      const runMain = () => {
+        const main = functions.get("main");
+        if (!main) fail("no main()");
+        const ctx = { scopes: [new Map()], depth: 0, ret: null, guards: [] };
+        runBlock(main.start + 1, main.end - 1, ctx);
+        return { outputs, discards, lightCalls };
+      };
+      return { runMain, line: (index) => program.text.slice(0, index).split("\n").length };
+    };
+
+    const analyse = (vsText, fsText) => {
+      const vs = parseProgram(vsText), fs = parseProgram(fsText);
+      const vertex = makeEvaluator(vs, "vertex", {}).runMain();
+      const varyingFlags = new Map();
+      for (const [name, value] of vertex.outputs) varyingFlags.set(name, value.flags || 0);
+      const fragment = makeEvaluator(fs, "fragment", { varyingFlags }).runMain();
+      return { vs, fs, vertex, fragment };
+    };
+
+    /* ---- printing for inspection -------------------------------------- */
+    const show = (n, depth = 0) => {
+      if (!n) return "?";
+      if (depth > 12) return "…";
+      switch (n.k) {
+        case "num": return String(+n.v.toFixed(6));
+        case "unif": case "attr": case "vary": case "input": return n.name;
+        case "op": return n.o === "neg" ? `-(${show(n.a, depth + 1)})` : n.o === "!" ? `!(${show(n.a, depth + 1)})`
+          : `(${show(n.a, depth + 1)} ${n.o} ${show(n.b, depth + 1)})`;
+        case "call": return `${n.f}(${n.args.map((a) => show(a, depth + 1)).join(", ")})`;
+        case "ctor": return `${n.t}(${n.args.map((a) => show(a, depth + 1)).join(", ")})`;
+        case "swz": return `${show(n.a, depth + 1)}.${n.s}`;
+        case "col": return `${show(n.a, depth + 1)}[${n.i}]`;
+        case "sel": return `(${show(n.c, depth + 1)} ? ${show(n.a, depth + 1)} : ${show(n.b, depth + 1)})`;
+        case "merge": return `merge(${show(n.a, depth + 1)}.${n.s} = ${show(n.v, depth + 1)})`;
+        case "opaque": return `LIGHT<${n.origin.fn}${n.origin.param ? ":" + n.origin.param : ""}${n.origin.field ? "." + n.origin.field : ""}>`;
+        case "struct": return `{${[...n.fields].map(([k, v]) => k + ":" + show(v, depth + 1)).join(", ")}}`;
+        case "undef": return "undef";
+        default: return n.k;
+      }
+    };
+
+    /* Prototype: map the semantic DAGs onto GE fixed-function terms. */
+
+    const LIT_MODELS = { MeshLambertMaterial: "lambert", MeshPhongMaterial: "phong",
+      MeshStandardMaterial: "standard", MeshPhysicalMaterial: "standard" };
+
+    const uniformOnly = (n) => n && !(n.flags & ~F_UNIFORM) && n.k !== "opaque"
+      && n.k !== "struct" && n.k !== "array" && n.k !== "undef" && !hasKind(n, "input");
+    const hasKind = (n, kind, depth = 0) => {
+      if (!n || depth > 64) return false;
+      if (n.k === kind) return true;
+      for (const c of [n.a, n.b, n.c, n.v, ...(n.args || [])])
+        if (c && typeof c === "object" && hasKind(c, kind, depth + 1)) return true;
+      return false;
+    };
+    const isNum = (n, v) => n?.k === "num" && (v === undefined || n.v === v);
+
+    const buildPlan = (analysis, shaderName) => {
+      const warnings = [], vout = analysis.vertex.outputs, fout = analysis.fragment.outputs;
+      const vglobals = analysis.vs.globals, fglobals = analysis.fs.globals;
+      const position = vout.get("gl_Position"), fragColor = fout.get("gl_FragColor");
+      if (!position || position.k === "undef") fail("gl_Position is not written");
+      if (!fragColor || fragColor.k === "undef") fail("gl_FragColor is not written");
+      const used = { attributes: new Set(), uniforms: new Map() };
+      const noteUniforms = (n, depth = 0) => {
+        if (!n || typeof n !== "object" || depth > 200) return;
+        if (n.k === "unif") { used.uniforms.set(n.name, n.t); return; }
+        if (n.k === "struct") { for (const v of n.fields.values()) noteUniforms(v, depth + 1); return; }
+        if (n.k === "array") { for (const v of n.items) noteUniforms(v, depth + 1); return; }
+        if (n.k === "opaque") { for (const a of n.origin.args || []) noteUniforms(a, depth + 1); return; }
+        for (const c of [n.a, n.b, n.c, n.v, ...(n.args || [])]) noteUniforms(c, depth + 1);
+      };
+      /* -- position: a chain of mat4 uniforms applied to the position attribute -- */
+      const matrices = (n) => n.k === "unif" && n.t === "mat4" ? [n.name]
+        : n.k === "op" && n.o === "*" && n.t === "mat4" ? (() => {
+          const a = matrices(n.a), b = a && matrices(n.b); return b ? [...a, ...b] : null; })()
+        : null;
+      const base = (n) => {
+        if (n.k === "attr" && n.t === "vec4") return n.name;
+        if (n.k !== "ctor" || n.t !== "vec4") return null;
+        const [p, ...rest] = n.args;
+        if (p?.k !== "attr") return null;
+        const tail = rest.map((x) => x.k === "num" ? x.v : NaN);
+        if (p.t === "vec3" && tail.length === 1 && tail[0] === 1) return p.name;
+        if (p.t === "vec2" && tail.length === 2 && tail[0] === 0 && tail[1] === 1) return p.name;
+        return null;
+      };
+      const chain = (n) => {
+        const b = base(n);
+        if (b) return { matrices: [], attribute: b };
+        if (n.k !== "op" || n.o !== "*" || n.a.t !== "mat4") return null;
+        const m = matrices(n.a), rest = m && chain(n.b);
+        return rest ? { matrices: [...m, ...rest.matrices], attribute: rest.attribute } : null;
+      };
+      const clip = chain(position);
+      if (!clip) fail("gl_Position is not a matrix chain applied to the position attribute");
+      if (clip.matrices.length > 4) fail("position transform exceeds four matrices");
+      used.attributes.add(clip.attribute);
+      /* The eye-space split comes from any other output that reads the same
+         chain without its leading matrices (fog depth, point size, lighting). */
+      let eyeSplit = -1;
+      const suffix = (m) => m.length < clip.matrices.length
+        && m.every((name, k) => name === clip.matrices[clip.matrices.length - m.length + k])
+        && m.length > 0;
+      const findEye = (n, depth = 0) => {
+        if (!n || typeof n !== "object" || depth > 200) return;
+        if (n.k === "op" && n.o === "*" && n.a?.t === "mat4") {
+          const c = chain(n);
+          if (c && c.attribute === clip.attribute && suffix(c.matrices))
+            eyeSplit = Math.max(eyeSplit, clip.matrices.length - c.matrices.length);
+        }
+        if (n.k === "struct") { for (const v of n.fields.values()) findEye(v, depth + 1); return; }
+        if (n.k === "opaque") { for (const a of n.origin.args || []) findEye(a, depth + 1); return; }
+        for (const c of [n.a, n.b, n.c, n.v, ...(n.args || [])]) findEye(c, depth + 1);
+      };
+      for (const [name, value] of vout) if (name !== "gl_Position") findEye(value);
+      for (const call of analysis.vertex.lightCalls) for (const a of call.args) findEye(a);
+      const eyeDepth = (n) => n.k === "op" && n.o === "neg" && n.a.k === "swz" && n.a.s === "z"
+        && (() => { const c = chain(n.a.a); return c && c.attribute === clip.attribute
+          && (c.matrices.length === 0 ? false : suffix(c.matrices)); })();
+      const plan = { warnings, used, projection: [], modelView: clip.matrices,
+        position: clip.attribute, matrices: clip.matrices };
+      if (eyeSplit > 0) {
+        plan.projection = clip.matrices.slice(0, eyeSplit);
+        plan.modelView = clip.matrices.slice(eyeSplit);
+      }
+      for (const m of clip.matrices) used.uniforms.set(m, "mat4");
+
+      /* -- colour factors -- */
+      const vertexExpression = (n) => {
+        const v = vout.get(n.name);
+        if (!v || v.k === "undef") fail(`varying ${n.name} is not written`);
+        return v;
+      };
+      const color = { rgb: [], a: [], texture: null, vertexColor: null, light: [],
+        scale: { rgb: 1, a: 1 }, program: { rgb: [], a: [] } };
+      /* A colour term of attributes and uniforms only (varyings replaced by
+         their vertex-stage values) is shaded per vertex in software and
+         interpolated by the GE; anything reading a texture, the pixel or
+         lights is not. Returns the vertex-stage term, or null. */
+      const perVertex = (n, stage) => {
+        const seen = new Map();
+        const sub = (x, depth) => {
+          if (depth > 64) return null;
+          if (seen.has(x)) return seen.get(x);
+          let out = null;
+          if (x.k === "vary") out = stage === "fragment"
+            ? sub(vertexExpression(x), depth + 1) : null;
+          else if (x.k === "num" || x.k === "unif" || x.k === "attr") out = x;
+          else if (["op", "call", "ctor", "swz", "sel"].includes(x.k)) {
+            const copy = { ...x };
+            let ok = true, flags = 0;
+            for (const key of ["a", "b", "c"]) if (x[key]) {
+              copy[key] = sub(x[key], depth + 1); ok &&= !!copy[key];
+              flags |= copy[key]?.flags || 0;
+            }
+            if (x.args) {
+              copy.args = x.args.map((a) => sub(a, depth + 1));
+              ok &&= copy.args.every(Boolean);
+              for (const a of copy.args) flags |= a?.flags || 0;
+            }
+            copy.flags = flags;
+            out = ok ? copy : null;
+          }
+          seen.set(x, out);
+          return out;
+        };
+        const out = sub(n, 0);
+        return out && !(out.flags & ~(F_UNIFORM | F_ATTRIBUTE))
+          && (out.flags & F_ATTRIBUTE) ? out : null;
+      };
+      const addTexture = (n, sel) => {
+        const [sampler, coord] = n.args;
+        if (sampler.k !== "unif" || sampler.t !== "sampler2D") fail("texture2D needs a sampler uniform");
+        const key = sampler.name + "|" + show(coord);
+        if (color.texture && color.texture.key !== key) fail("more than one texture is sampled");
+        color.texture ??= { key, sampler: sampler.name, coord, sel: new Set() };
+        color.texture.sel.add(sel);
+        used.uniforms.set(sampler.name, "sampler2D");
+      };
+      const addVertexColor = (attribute, sel, channel) => {
+        if (color.vertexColor && color.vertexColor.name !== attribute.name) fail("two colour attributes");
+        color.vertexColor ??= { name: attribute.name, type: attribute.t, channels: new Set() };
+        color.vertexColor.channels.add(channel);
+        used.attributes.add(attribute.name);
+      };
+      /* channel: "rgb" or "a"; sel: which components of n feed it. */
+      const factor = (n, channel, sel, stage, depth = 0) => {
+        if (depth > 64) fail("colour expression is too deep");
+        if (n.k === "num") { color.scale[channel] *= n.v; return; }
+        if (n.k === "op" && n.o === "*" && (n.a.k === "num" || n.b.k === "num")) {
+          for (const side of [n.a, n.b])
+            factor(side, channel, side.t === "float" ? "x" : sel, stage, depth + 1);
+          return;
+        }
+        if (n.k === "ctor" && n.args.length === 1 && n.args[0].k === "num") {
+          color.scale[channel] *= n.args[0].v; return;
+        }
+        if (uniformOnly(n)) { color[channel].push({ node: n, sel }); noteUniforms(n); return; }
+        if (n.k === "op" && n.o === "*") {
+          for (const side of [n.a, n.b])
+            factor(side, channel, side.t === "float" ? "x" : sel, stage, depth + 1);
+          return;
+        }
+        if (n.k === "ctor" && n.t === "vec4" && n.args.length === 2 && n.args[0].t === "vec3") {
+          if (sel === "xyz") return factor(n.args[0], channel, "xyz", stage, depth + 1);
+          if (sel === "w") return factor(n.args[1], channel, "x", stage, depth + 1);
+        }
+        if (n.k === "ctor" && n.args.length === 1 && n.args[0].t === "float")
+          return factor(n.args[0], channel, "x", stage, depth + 1);
+        if (n.k === "swz") {
+          const s = sel === "x" ? n.s : sel === "xyz" && n.s.length === 3 ? n.s
+            : sel === "w" && n.s.length === 4 ? n.s[3] : null;
+          if (s === "xyz" || s === "w") return factor(n.a, channel, s, stage, depth + 1);
+          if (s === "x" && n.a.t === "float") return factor(n.a, channel, "x", stage, depth + 1);
+        }
+        if (n.k === "merge" && n.s === "xyz") {
+          if (sel === "xyz") return factor(n.v, channel, "xyz", stage, depth + 1);
+          if (sel === "w") return factor(n.a, channel, "w", stage, depth + 1);
+        }
+        if (n.k === "call" && n.f === "texture2D" && stage === "fragment") return addTexture(n, sel);
+        if (n.k === "vary" && stage === "fragment") {
+          const v = vertexExpression(n);
+          if (v.flags & F_LIGHT) { color.light.push({ name: n.name, node: v, channel, sel }); return; }
+          return factor(v, channel, sel, "vertex", depth + 1);
+        }
+        if (n.k === "attr" && stage === "vertex") {
+          if (n.t === "vec3" && sel !== "xyz") fail(`colour attribute ${n.name} has no alpha`);
+          return addVertexColor(n, sel, channel);
+        }
+        const shaded = perVertex(n, stage);
+        if (shaded) {
+          color.program[channel].push({ node: shaded, sel, text: show(n) });
+          return;
+        }
+        fail(`colour term ${show(n).slice(0, 60)} has no GE equivalent`);
+      };
+
+      /* -- fog: mix(colour, fogColor, f(depth)) over the rgb channels -- */
+      let rgbNode, alphaNode;
+      const split = (n) => {
+        if (n.k === "ctor" && n.t === "vec4" && n.args.length === 2 && n.args[0].t === "vec3")
+          return [n.args[0], n.args[1], "x"];
+        if (n.k === "merge" && n.s === "xyz") return [n.v, n.a, "w"];
+        return [{ k: "swz", t: "vec3", a: n, s: "xyz", flags: n.flags }, n, "w"];
+      };
+      const [rgb0, alpha0, alphaSel] = split(fragColor);
+      rgbNode = rgb0; alphaNode = alpha0;
+      if (rgbNode.k === "call" && rgbNode.f === "mix" && rgbNode.args[2]?.t === "float") {
+        const [under, fogColor, amount] = rgbNode.args;
+        if (!uniformOnly(fogColor)) fail("fog colour must be uniform");
+        const depthVary = (n) => n.k === "vary" && eyeDepth(vertexExpression(n));
+        let fog = null;
+        if (amount.k === "call" && amount.f === "smoothstep" && depthVary(amount.args[2])
+            && uniformOnly(amount.args[0]) && uniformOnly(amount.args[1])) {
+          fog = { kind: "linear", near: amount.args[0], far: amount.args[1] };
+          warnings.push("fragment: smoothstep fog is drawn as the GE's linear fog");
+        } else if (amount.k === "op" && amount.o === "-" && isNum(amount.a, 1)
+            && amount.b.k === "call" && amount.b.f === "exp") {
+          const e = amount.b.args[0];
+          /* exp(-d*d*z*z): fogDensity squared times depth squared */
+          const text = show(e);
+          const density = analysis.fs.globals.has("fogDensity") ? "fogDensity" : null;
+          if (density && /fogDensity/.test(text) && hasKind(e, "vary")) {
+            fog = { kind: "exp2", density: { k: "unif", t: "float", name: density, flags: F_UNIFORM } };
+            warnings.push("fragment: exponential fog is approximated by the GE's linear fog");
+          }
+        }
+        if (!fog) fail("fog factor has no GE equivalent");
+        fog.color = fogColor;
+        for (const k of ["near", "far", "density", "color"]) if (fog[k]) noteUniforms(fog[k]);
+        plan.fog = fog; rgbNode = under;
+        if (fog.kind === "exp2" || fog.kind === "linear") {
+          if (eyeSplit < 0) fail("fog depth does not read the eye-space position");
+        }
+      }
+
+      /* -- lighting -- */
+      const model = LIT_MODELS[shaderName];
+      const lightCalls = [...analysis.vertex.lightCalls, ...analysis.fragment.lightCalls];
+      const sum = (n, out = []) => {
+        if (n.k === "op" && n.o === "+") { sum(n.a, out); sum(n.b, out); } else out.push(n);
+        return out;
+      };
+      if (lightCalls.length || (rgbNode.flags & F_LIGHT)) {
+        if (!model) fail("lighting functions outside a known lit material");
+        const lighting = plan.lighting = { model, emissive: [], lights: [], ambient: null, probe: null };
+        if (eyeSplit < 0) fail("lighting does not read the eye-space position");
+        let materialStruct = null;
+        for (const call of lightCalls) {
+          for (const arg of call.args) {
+            if (arg.k === "struct" && /Light$/.test(arg.t)) {
+              const first = [...arg.fields.values()][0];
+              const path = first?.k === "unif" && /^(\w+)\[(\d+)\]\./.exec(first.name);
+              if (path) {
+                const key = `${path[1]}[${path[2]}]`;
+                if (!lighting.lights.some((l) => l.key === key))
+                  lighting.lights.push({ key, type: arg.t, fields: Object.fromEntries(
+                    [...arg.fields].map(([f, v]) => [f, v.name])) });
+                noteUniforms(arg);
+              }
+            } else if (arg.k === "unif" && arg.name === "ambientLightColor") {
+              lighting.ambient = arg.name; noteUniforms(arg);
+            } else if (arg.k === "array" && arg.items[0]?.name?.startsWith("lightProbe")) {
+              lighting.probe = "lightProbe"; noteUniforms(arg);
+            } else if (arg.k === "struct" && [...arg.fields.keys()].some((f) => /diffuseColor/.test(f))
+                && !(structFlags(arg) & F_LIGHT)) materialStruct ??= arg;
+          }
+        }
+        for (const light of lighting.lights)
+          if (!/^(Directional|Point|Spot|Hemisphere)Light$/.test(light.type))
+            fail(`${light.type} has no GE equivalent`);
+        if (lighting.lights.length > 4) {
+          warnings.push(`fragment: ${lighting.lights.length} lights; the GE applies the first 4`);
+          lighting.lights.length = 4;
+        }
+        if (lighting.lights.some((l) => l.type === "SpotLight"))
+          warnings.push("fragment: spot lights are drawn as point lights on the PSP");
+        if (lighting.lights.some((l) => l.type === "HemisphereLight"))
+          warnings.push("fragment: hemisphere lights are drawn as ambient light on the PSP");
+        let baseFound = false;
+        for (const term of sum(rgbNode)) {
+          if (!(term.flags & F_LIGHT)) {
+            if (!uniformOnly(term)) fail("unlit colour term is not uniform");
+            lighting.emissive.push(term); noteUniforms(term); continue;
+          }
+          if (model === "lambert") {
+            /* vLight * (k * diffuseColor) */
+            if (!baseFound) { factor(term, "rgb", "xyz", "fragment"); baseFound = true; }
+            continue;
+          }
+          if (term.k !== "opaque") fail("lit term is not one lighting function");
+        }
+        if (model === "lambert") {
+          if (color.light.length < 1) fail("Lambert lighting varying not found");
+          /* every light term must scale the same base colour: drop the
+             repeated factors the other terms add */
+        } else {
+          if (!materialStruct) fail("lit material inputs not found");
+          const field = (re) => [...materialStruct.fields].find(([f]) => re.test(f))?.[1];
+          const diffuse = field(/diffuseColor/);
+          factor(diffuse, "rgb", "xyz", "fragment");
+          if (model === "phong") {
+            lighting.specular = field(/specularColor/);
+            lighting.shininess = field(/specularShininess/);
+            if (!uniformOnly(lighting.specular) || !uniformOnly(lighting.shininess))
+              fail("specular inputs are not uniform");
+            noteUniforms(lighting.specular); noteUniforms(lighting.shininess);
+          } else {
+            lighting.roughness = analysis.fs.globals.has("roughness") ? "roughness" : null;
+            lighting.metalness = analysis.fs.globals.has("metalness") ? "metalness" : null;
+            for (const u of [lighting.roughness, lighting.metalness]) if (u) used.uniforms.set(u, "float");
+            warnings.push("fragment: physically based shading is approximated by GE Blinn-Phong lighting");
+          }
+          warnings.push(`fragment: per-pixel lighting is evaluated per vertex on the PSP`);
+        }
+        /* normal attribute: normalMatrix * normal */
+        const findNormal = (n, depth = 0) => {
+          if (!n || typeof n !== "object" || depth > 200) return null;
+          if (n.k === "op" && n.o === "*" && n.a?.k === "unif" && n.a.t === "mat3"
+              && n.b?.k === "attr" && n.b.t === "vec3") return { matrix: n.a.name, attribute: n.b.name };
+          if (n.k === "struct") { for (const v of n.fields.values()) { const r = findNormal(v, depth + 1); if (r) return r; } return null; }
+          if (n.k === "opaque") { for (const a of n.origin.args || []) { const r = findNormal(a, depth + 1); if (r) return r; } return null; }
+          for (const c of [n.a, n.b, n.c, n.v, ...(n.args || [])]) { const r = findNormal(c, depth + 1); if (r) return r; }
+          return null;
+        };
+        let normal = null;
+        for (const value of vout.values()) normal ??= findNormal(value);
+        for (const call of analysis.vertex.lightCalls) for (const a of call.args) normal ??= findNormal(a);
+        if (!normal) fail("lit shader has no normal attribute");
+        plan.normal = normal.attribute; used.attributes.add(normal.attribute);
+      } else {
+        factor(rgbNode, "rgb", "xyz", "fragment");
+      }
+      factor(alphaNode, "a", alphaSel, "fragment");
+      /* texture coordinates */
+      if (color.texture) {
+        const coord = color.texture.coord;
+        const affine = (n) => {
+          if (n.k === "swz" && n.s === "xy" && n.a.k === "op" && n.a.o === "*"
+              && uniformOnly(n.a.a) && n.a.a.t === "mat3" && n.a.b.k === "ctor"
+              && n.a.b.args.length === 2 && isNum(n.a.b.args[1], 1))
+            return { transform: n.a.a, inner: n.a.b.args[0] };
+          if (n.k === "swz" && n.s === "xy" && n.a.k === "op" && n.a.o === "*"
+              && uniformOnly(n.a.a) && n.a.a.t === "mat3" && n.a.b.k === "ctor"
+              && n.a.b.args.length === 3 && isNum(n.a.b.args[2], 1))
+            return { transform: n.a.a, inner: { k: "pair", x: n.a.b.args[0], y: n.a.b.args[1] } };
+          return { transform: null, inner: n };
+        };
+        let texcoord = null;
+        if (coord.k === "vary") {
+          const { transform, inner } = affine(vertexExpression(coord));
+          if (inner.k !== "attr" || inner.t !== "vec2") fail("texture coordinates are not an attribute");
+          texcoord = { attribute: inner.name, transform };
+          used.attributes.add(inner.name);
+        } else {
+          const { transform, inner } = affine(coord);
+          const pc = (n, s) => n.k === "swz" && n.s === s && n.a.k === "input" && n.a.name === "gl_PointCoord";
+          if (inner.k === "input" && inner.name === "gl_PointCoord") texcoord = { point: true, flipY: false, transform };
+          else if (inner.k === "pair" && pc(inner.x, "x") && inner.y.k === "op" && inner.y.o === "-"
+              && isNum(inner.y.a, 1) && pc(inner.y.b, "y")) texcoord = { point: true, flipY: true, transform };
+          else fail("texture coordinates have no GE equivalent");
+        }
+        if (texcoord.transform) noteUniforms(texcoord.transform);
+        plan.texcoord = texcoord; plan.sampler = color.texture.sampler;
+        if (color.texture.sel.size !== 2)
+          warnings.push("fragment: the GE modulates colour and alpha by the texture together");
+      }
+      if (color.vertexColor) {
+        plan.vertexColor = color.vertexColor.name;
+        if (color.vertexColor.type === "vec4" && color.vertexColor.channels.size !== 2)
+          fail("colour attribute alpha is applied to only one channel");
+      }
+      plan.colorRGB = color.rgb; plan.colorAlpha = color.a;
+      plan.colorScale = [plan.lighting ? 1 : color.scale.rgb, color.scale.a];
+      if (color.light.length && !plan.lighting) fail("lit varying without lighting");
+      /* alpha test */
+      for (const d of analysis.fragment.discards) {
+        if (!d.cond || d.guards.length) fail("discard has no GE alpha-test equivalent");
+        const c = d.cond;
+        if (c.k === "op" && c.o === "<" && uniformOnly(c.b) && show(c.a) === show(
+            alphaSel === "w" ? { k: "swz", a: alphaNode, s: "w", t: "float" } : alphaNode)) {
+          plan.alphaTest = c.b; noteUniforms(c.b);
+        } else fail("discard condition is not an alpha test");
+      }
+      /* point size */
+      const pointSize = vout.get("gl_PointSize");
+      if (pointSize && pointSize.k !== "undef") {
+        const rewrite = (n, depth = 0) => {
+          if (!n || typeof n !== "object" || depth > 100) return n;
+          if (eyeDepth(n)) return { k: "depth", t: "float", flags: F_UNIFORM };
+          if (!["op", "call", "ctor", "swz", "sel", "col", "merge"].includes(n.k)) return n;
+          const copy = { ...n };
+          for (const key of ["a", "b", "c", "v"]) if (n[key]) copy[key] = rewrite(n[key], depth + 1);
+          if (n.args) copy.args = n.args.map((x) => rewrite(x, depth + 1));
+          copy.flags = [copy.a, copy.b, copy.c, copy.v, ...(copy.args || [])]
+            .reduce((f, x) => f | (x?.flags || 0), 0);
+          return copy;
+        };
+        const size = rewrite(pointSize);
+        if (!uniformOnly(size)) fail("point size has no GE equivalent");
+        plan.pointSize = size; noteUniforms(size);
+      }
+      if (color.program.rgb.length || color.program.a.length) {
+        const slot = (attribute) => {
+          if (attribute.name === clip.attribute) return 0;
+          if (attribute.t === "vec2" || attribute.t === "float") {
+            if (plan.texcoord && plan.texcoord.attribute !== attribute.name)
+              fail(`attribute ${attribute.name} cannot be read per vertex`);
+            plan.texcoord ??= { attribute: attribute.name, transform: null };
+            used.attributes.add(attribute.name);
+            return 1;
+          }
+          if (attribute.t === "vec3") {
+            if (plan.normal && plan.normal !== attribute.name)
+              fail(`attribute ${attribute.name} cannot be read per vertex`);
+            plan.normal = attribute.name; used.attributes.add(attribute.name);
+            return 2;
+          }
+          fail(`attribute ${attribute.name} cannot be read per vertex`);
+        };
+        plan.program = compileVertexProgram(color.program, slot, noteUniforms);
+        for (const text of new Set([...color.program.rgb, ...color.program.a]
+          .map((term) => term.text.slice(0, 48))))
+          warnings.push(`fragment: '${text}' is shaded per vertex on the PSP`);
+      }
+      return plan;
+    };
+
+    /* ---- per-vertex programs ------------------------------------------- */
+    /* The native per-vertex interpreter (js_webgl_bridge.c, WebglProgram):
+       16 vec4 registers, r0-r2 the position, texture-coordinate and normal
+       attributes, r3 unused, r4-r15 temporaries. An instruction is two
+       words: op | dst << 6 | a << 10 | b << 14 | c << 18 | imm << 22, then
+       the a, b and c swizzles (2 bits per destination lane) and the
+       destination write mask << 24. */
+    const PROGRAM_STEPS = 32, PROGRAM_CONSTANTS = 15;
+    const POP = { mov: 0, add: 1, sub: 2, mul: 3, div: 4, neg: 5, min: 6, max: 7,
+      abs: 8, floor: 9, ceil: 10, fract: 11, sin: 12, cos: 13, sqrt: 14,
+      inversesqrt: 15, exp: 16, exp2: 17, log: 18, log2: 19, pow: 20, step: 21,
+      mod: 22, sign: 23, mix: 24, clamp: 25, smoothstep: 26, dot: 27,
+      const: 28, matvec: 29, sel: 30, "<": 31, "<=": 32, ">": 33, ">=": 34,
+      "==": 35, "!=": 36, not: 37 };
+    const compileVertexProgram = (terms, slot, noteUniforms) => {
+      const code = [], constants = [], constantAt = new Map();
+      const refs = new Array(16).fill(0), memo = new Map(), uses = new Map();
+      const XYZW = [0, 1, 2, 3], width = (t) => size(t) || 1;
+      const count = (x, depth = 0) => {
+        uses.set(x, (uses.get(x) || 0) + 1);
+        if (uses.get(x) > 1 || uniformOnly(x) || depth > 64) return;
+        for (const key of ["a", "b", "c"]) if (x[key]) count(x[key], depth + 1);
+        for (const a of x.args || []) count(a, depth + 1);
+      };
+      const roots = [...terms.rgb, ...terms.a];
+      for (const term of roots) count(term.node);
+      const temp = (n) => {
+        for (let r = 4; r < 16; r++) if (!refs[r]) { refs[r] = n; return r; }
+        fail("per-vertex colour needs more than 12 registers");
+      };
+      const release = (v) => { if (v.reg >= 4 && --refs[v.reg] === 0) refs[v.reg] = 0; };
+      const swz = (v) => v ? v.swz[0] | v.swz[1] << 2 | v.swz[2] << 4 | v.swz[3] << 6 : 0;
+      const emit = (op, dst, mask, a, b, c, imm = 0) => {
+        if (code.length >= PROGRAM_STEPS * 2)
+          fail(`per-vertex colour needs more than ${PROGRAM_STEPS} steps`);
+        code.push((op | dst << 6 | (a?.reg || 0) << 10 | (b?.reg || 0) << 14
+          | (c?.reg || 0) << 18 | imm << 22) >>> 0,
+          (swz(a) | swz(b) << 8 | swz(c) << 16 | mask << 24) >>> 0);
+      };
+      const broadcast = (v, n) => v.w === 1 && n > 1
+        ? { reg: v.reg, swz: [v.swz[0], v.swz[0], v.swz[0], v.swz[0]], w: n } : v;
+      const constant = (key, values, node) => {
+        if (!constantAt.has(key)) {
+          if (constants.length >= PROGRAM_CONSTANTS)
+            fail(`per-vertex colour needs more than ${PROGRAM_CONSTANTS} constants`);
+          constantAt.set(key, constants.length);
+          constants.push(values !== undefined ? { values } : node);
+          if (node?.node) noteUniforms(node.node);
+        }
+        return constantAt.get(key);
+      };
+      /* A value is { reg, swz, w }; it holds refs[reg] once per pending use. */
+      const value = (x, depth = 0) => {
+        if (depth > 64) fail("colour expression is too deep");
+        if (memo.has(x)) return memo.get(x);
+        let v;
+        const finish = (reg, n, lanes = XYZW) => {
+          v = { reg, swz: lanes, w: n };
+          if (reg >= 4) refs[reg] += (uses.get(x) || 1) - 1;
+        };
+        if (x.k === "attr") {
+          v = { reg: slot(x), swz: XYZW, w: width(x.t) };
+        } else if (x.k === "num" || uniformOnly(x)) {
+          if (/^mat/.test(x.t)) fail("a matrix is used outside a product");
+          const index = x.k === "num" ? constant("#" + x.v, [x.v])
+            : constant(show(x), undefined, { node: x });
+          const reg = temp(1);
+          emit(POP.const, reg, 15, null, null, null, index);
+          finish(reg, width(x.t));
+        } else if (x.k === "swz") {
+          const a = value(x.a, depth + 1), s = [...x.s].map((ch) => "xyzw".indexOf(ch
+            .replace(/[rs]/, "x").replace(/[gt]/, "y").replace(/[bp]/, "z").replace(/[aq]/, "w")));
+          const lanes = [0, 1, 2, 3].map((k) => a.swz[s[Math.min(k, s.length - 1)]]);
+          v = { reg: a.reg, swz: lanes, w: s.length };
+          if (a.reg >= 4) refs[a.reg] += (uses.get(x) || 1) - 1;
+          return memo.set(x, v), v;
+        } else if (x.k === "ctor") {
+          const parts = x.args.map((a) => value(a, depth + 1)), n = width(x.t);
+          if (/^mat/.test(x.t)) fail("a matrix is built per vertex");
+          if (parts.length === 1) {
+            v = broadcast(parts[0], n);
+            v = { ...v, w: n };
+            if (v.reg >= 4) refs[v.reg] += (uses.get(x) || 1) - 1;
+            return memo.set(x, v), v;
+          }
+          const reg = temp(1);
+          let at = 0;
+          for (const part of parts) {
+            const lanes = [0, 0, 0, 0];
+            let mask = 0;
+            for (let k = 0; k < part.w && at + k < 4; k++) {
+              lanes[at + k] = part.swz[k]; mask |= 1 << (at + k);
+            }
+            emit(POP.mov, reg, mask, { reg: part.reg, swz: lanes });
+            at += part.w; release(part);
+          }
+          finish(reg, n);
+        } else if (x.k === "op" && x.o === "*" && /^mat[34]$/.test(x.a.t)) {
+          if (!uniformOnly(x.a)) fail("a per-vertex matrix product");
+          const dims = x.a.t === "mat4" ? 4 : 3, key = show(x.a);
+          const first = constants.length;
+          if (!constantAt.has(key + "#0"))
+            for (let k = 0; k < dims; k++)
+              constant(key + "#" + k, undefined, { node: x.a, column: k, dims });
+          const b = value(x.b, depth + 1), reg = temp(1);
+          emit(POP.matvec, reg, 15, b, { reg: dims, swz: XYZW }, null,
+            constantAt.get(key + "#0") ?? first);
+          release(b); finish(reg, dims);
+        } else if (x.k === "op" || x.k === "call" || x.k === "sel") {
+          const name = x.k === "sel" ? "sel" : x.k === "op"
+            ? ({ "+": "add", "-": "sub", "*": "mul", "/": "div", neg: "neg",
+              "!": "not", "&&": "mul", "||": "max" }[x.o] || x.o) : x.f;
+          const argsOf = x.k === "sel" ? [x.c, x.a, x.b] : x.k === "op"
+            ? [x.a, x.b].filter(Boolean) : x.args;
+          const n = width(x.t);
+          if (name === "length" || name === "normalize") {
+            const a = value(argsOf[0], depth + 1), d = temp(1);
+            emit(POP.dot, d, 15, a, a, null, a.w);
+            const reg = name === "length" ? d : temp(1);
+            if (name === "length") emit(POP.sqrt, d, 15, { reg: d, swz: XYZW });
+            else {
+              emit(POP.inversesqrt, d, 15, { reg: d, swz: XYZW });
+              emit(POP.mul, reg, 15, a, { reg: d, swz: XYZW });
+              refs[d] = 0;
+            }
+            release(a); finish(reg, name === "length" ? 1 : a.w);
+          } else {
+            const op = POP[name];
+            if (op === undefined || name === "const" || name === "matvec")
+              fail(`'${name}' cannot be shaded per vertex`);
+            const args = argsOf.map((a) => value(a, depth + 1));
+            const wide = Math.max(...args.map((a) => a.w));
+            const lanes = name === "dot" ? args : name === "sel"
+              ? [broadcast(args[0], 4), ...args.slice(1).map((a) => broadcast(a, wide))]
+              : args.map((a) => broadcast(a, wide));
+            const reg = temp(1);
+            emit(op, reg, 15, lanes[0], lanes[1], lanes[2],
+              name === "dot" ? args[0].w : 0);
+            for (const a of args) release(a);
+            finish(reg, name === "dot" ? 1 : n);
+          }
+        } else fail(`'${show(x).slice(0, 40)}' cannot be shaded per vertex`);
+        memo.set(x, v);
+        return v;
+      };
+      const product = (list, pick) => {
+        let total = null;
+        for (const term of list) {
+          const v = pick(value(term.node), term.sel);
+          if (!total) { total = v; continue; }
+          const reg = temp(1);
+          emit(POP.mul, reg, 15, total, v); release(total); release(v);
+          total = { reg, swz: XYZW, w: v.w };
+        }
+        return total;
+      };
+      const rgb = product(terms.rgb, (v, sel) => sel === "x" ? broadcast(v, 3)
+        : { ...v, w: 3 });
+      const alpha = product(terms.a, (v, sel) => sel === "w"
+        ? broadcast({ reg: v.reg, swz: [v.swz[3], 0, 0, 0], w: 1 }, 4)
+        : broadcast(v, 4));
+      const out = temp(1);
+      if (rgb) emit(POP.mov, out, 7, rgb);
+      if (alpha) emit(POP.mov, out, 8, alpha);
+      return { code: Uint32Array.from(code), constants, steps: code.length / 2,
+        outputs: (rgb ? 1 : 0) | (alpha ? 2 : 0), out };
+    };
+    const structFlags = (s) => {
+      let f = s.flags || 0;
+      for (const v of s.fields.values()) f |= v.k === "struct" ? structFlags(v) : (v.flags || 0);
+      return f;
+    };
+
+    /* ---- per-draw evaluation of uniform-only nodes ---- */
+    const evaluate = (n, lookup, depth) => {
+      const ev = (x) => evaluate(x, lookup, depth);
+      const arr = (v) => typeof v === "number" ? [v] : Array.isArray(v) ? v : Array.from(v);
+      const map2 = (a, b, f) => {
+        a = arr(a); b = arr(b);
+        const n = Math.max(a.length, b.length), out = new Array(n);
+        for (let i = 0; i < n; i++) out[i] = f(a.length === 1 ? a[0] : a[i], b.length === 1 ? b[0] : b[i]);
+        return n === 1 ? out[0] : out;
+      };
+      switch (n.k) {
+        case "num": return n.v;
+        case "depth": return depth;
+        case "unif": return lookup(n.name, n.t);
+        case "ctor": {
+          const flat = n.args.flatMap((a) => arr(ev(a)));
+          const want = { float: 1, vec2: 2, vec3: 3, vec4: 4, mat3: 9, mat4: 16 }[n.t] || flat.length;
+          if (flat.length === 1 && want > 1) {
+            if (/^mat/.test(n.t)) { const d = Math.sqrt(want); return Array.from({ length: want }, (_, i) => i % (d + 1) ? 0 : flat[0]); }
+            return new Array(want).fill(flat[0]);
+          }
+          return want === 1 ? flat[0] : flat.slice(0, want);
+        }
+        case "swz": { const v = arr(ev(n.a)); const out = [...n.s].map((c) => v["xyzw".indexOf(c)]); return out.length === 1 ? out[0] : out; }
+        case "col": { const m = arr(ev(n.a)), d = Math.sqrt(m.length); return m.slice(n.i * d, n.i * d + d); }
+        case "merge": { const v = arr(ev(n.a)).slice(), w = arr(ev(n.v)); [...n.s].forEach((c, k) => { v["xyzw".indexOf(c)] = w[k]; }); return v; }
+        case "sel": return ev(n.c) ? ev(n.a) : ev(n.b);
+        case "op": {
+          const a = ev(n.a);
+          if (n.o === "neg") return map2(a, 0, (x) => -x);
+          if (n.o === "!") return a ? 0 : 1;
+          const b = ev(n.b);
+          if (n.o === "*" && /^mat/.test(n.a.t) && /vec/.test(n.b.t)) {
+            const d = arr(b).length, out = new Array(d).fill(0);
+            for (let c = 0; c < d; c++) for (let r = 0; r < d; r++) out[r] += a[c * d + r] * b[c];
+            return out;
+          }
+          if (n.o === "*" && /^mat/.test(n.a.t) && /^mat/.test(n.b.t)) {
+            const d = Math.sqrt(a.length), out = new Array(a.length).fill(0);
+            for (let c = 0; c < d; c++) for (let r = 0; r < d; r++) for (let k = 0; k < d; k++)
+              out[c * d + r] += a[k * d + r] * b[c * d + k];
+            return out;
+          }
+          const f = { "+": (x, y) => x + y, "-": (x, y) => x - y, "*": (x, y) => x * y, "/": (x, y) => x / y,
+            "<": (x, y) => +(x < y), ">": (x, y) => +(x > y), "<=": (x, y) => +(x <= y), ">=": (x, y) => +(x >= y),
+            "==": (x, y) => +(x === y), "!=": (x, y) => +(x !== y), "&&": (x, y) => +(x && y), "||": (x, y) => +(x || y) }[n.o];
+          if (!f) throw new SemError(`operator ${n.o}`);
+          if (n.o === "==" || n.o === "!=") {
+            const A = arr(a), B = arr(b), same = A.length === B.length && A.every((x, i) => x === B[i]);
+            return +(n.o === "==" ? same : !same);
+          }
+          return map2(a, b, f);
+        }
+        case "call": {
+          const v = n.args.map(ev), M = Math;
+          const one = { abs: M.abs, sqrt: M.sqrt, exp: M.exp, exp2: (x) => 2 ** x, log: M.log, log2: M.log2,
+            floor: M.floor, ceil: M.ceil, sin: M.sin, cos: M.cos, tan: M.tan, sign: M.sign,
+            fract: (x) => x - M.floor(x), inversesqrt: (x) => 1 / M.sqrt(x),
+            radians: (x) => x * M.PI / 180, degrees: (x) => x * 180 / M.PI }[n.f];
+          if (one) return map2(v[0], 0, (x) => one(x));
+          const two = { pow: M.pow, min: M.min, max: M.max, mod: (x, y) => x - y * M.floor(x / y),
+            step: (e, x) => +(x >= e) }[n.f];
+          if (two) return map2(v[0], v[1], two);
+          if (n.f === "clamp") return map2(map2(v[0], v[1], M.max), v[2], M.min);
+          if (n.f === "mix") return map2(map2(v[0], v[1], (x, y) => [x, y]), v[2], (p, t) => p[0] * (1 - t) + p[1] * t);
+          if (n.f === "dot") { const a = arr(v[0]), b = arr(v[1]); return a.reduce((s, x, i) => s + x * b[i], 0); }
+          if (n.f === "length") return M.hypot(...arr(v[0]));
+          if (n.f === "normalize") { const a = arr(v[0]), l = M.hypot(...a) || 1; return a.map((x) => x / l); }
+          if (n.f === "smoothstep") return map2(map2(v[0], v[1], (x, y) => [x, y]), v[2], (e, x) => {
+            const t = M.min(M.max((x - e[0]) / (e[1] - e[0]), 0), 1); return t * t * (3 - 2 * t); });
+          throw new SemError(`function ${n.f} is not evaluated per draw`);
+        }
+        default: throw new SemError(`node ${n.k} is not evaluated per draw`);
+      }
+    };
+
+    return { preprocessShader, analyse, buildPlan, evaluate, SemError, show };
+  })();
+  /* END shader semantics */
+
+  const materialTypeWidth = { float: 1, int: 1, bool: 1, vec2: 2, vec3: 3,
+      vec4: 4, mat2: 4, mat3: 9, mat4: 16 },
+    MATERIAL_LIGHTING = 1, MATERIAL_FOG = 2, MATERIAL_POINT_SIZE = 4,
+    MATERIAL_TEXTURE_TRANSFORM = 8, MATERIAL_SPECULAR = 16,
+    MATERIAL_ALPHA_TEST = 32, MATERIAL_POINT_COORD = 64,
+    MATERIAL_POINT_COORD_FLIP = 128, MATERIAL_SPLIT = 256,
+    MATERIAL_PROGRAM = 512,
+    /* Per-vertex program: header, 32 two-word steps, 15 vec4 constants. */
+    MATERIAL_PROGRAM_WORD = 128, MATERIAL_PROGRAM_CONSTANT_WORD = 194,
+    MATERIAL_PROGRAM_STEP_LIMIT = 65536,
+    MATERIAL_NORMAL_WORD = 58, MATERIAL_LIGHT_WORD = 64,
+    /* The normal buffer's id and generation: the native lit-vertex cache. */
+    MATERIAL_NORMAL_IDENTITY_WORD = 116,
+    MATERIAL_LIGHT_WORDS = 13, MATERIAL_LIGHTS = 4;
+
   const owned = (context, value, Type) =>
     value instanceof Type && value._owner === context && !value._deleted,
     attributeRole = (attributes, source, role) => {
@@ -800,8 +2421,30 @@
           shader._type === constants.FRAGMENT_SHADER);
       if (!vertex || !fragment || !vertex._compiled || !fragment._compiled)
         return { error: "A compiled vertex and fragment shader are required" };
-      const vs = shaderText(vertex._source), fs = shaderText(fragment._source),
-        attributeScan = declarations(vs, "attribute"),
+      const vertexText = shaderSemantics.preprocessShader(
+          shaderText(vertex._source)),
+        fragmentText = shaderSemantics.preprocessShader(
+          shaderText(fragment._source));
+      if (vertexText.error || fragmentText.error)
+        return { error: "ERROR: " + (vertexText.error
+          ? "vertex shader " + vertexText.error
+          : "fragment shader " + fragmentText.error) };
+      /* The inspector's exact result stands. Otherwise a program the
+         semantic pass understands whole replaces the inspector's refusal or
+         dropped terms: its warnings name approximations, not omissions. A
+         lit program it cannot map is refused, because the inspector's
+         fallback would draw it unlit. */
+      const legacy = inspectTranslation(vertexText.text, fragmentText.text);
+      if (!legacy.error && !legacy.warnings.length) return legacy;
+      const semantic = semanticTranslation(vertexText, fragmentText);
+      /* An interface past the WebGL limits is refused on either path. */
+      if (semantic.interface) return { error: semantic.error };
+      if (semantic.error)
+        return semantic.lit ? { error: "ERROR: " + semantic.error } : legacy;
+      return semantic;
+    },
+    inspectTranslation = (vs, fs) => {
+      const attributeScan = declarations(vs, "attribute"),
         vertexUniformScan = declarations(vs, "uniform"),
         fragmentUniformScan = declarations(fs, "uniform"),
         attributes = attributeScan.entries,
@@ -819,8 +2462,12 @@
           || attributes.reduce((slots, entry) =>
             slots + (entry.type === "mat4" ? 4 : 1), 0) > 8
           || attributes.some((entry) => entry.size !== 1)
-          || uniformVectors(vertexUniformScan.entries) > 16
-          || uniformVectors(fragmentUniformScan.entries) > 4
+          || uniformVectors(vertexUniformScan.entries,
+            MAX_VERTEX_UNIFORM_VECTORS) > MAX_VERTEX_UNIFORM_VECTORS
+          || uniformVectors(fragmentUniformScan.entries,
+            MAX_FRAGMENT_UNIFORM_VECTORS) > MAX_FRAGMENT_UNIFORM_VECTORS
+          || uniformVectors(declarations(fs, "varying").entries,
+            MAX_VARYING_VECTORS) > MAX_VARYING_VECTORS
           || conflictingUniform)
         return { error: "Shader interface exceeds the PSP WebGL limits" };
       const positionExpression = /\bgl_Position\s*=\s*([^;]+)/.exec(vs)?.[1] || "",
@@ -864,6 +2511,64 @@
         return { error: "Texture shaders require a sampler and texture-coordinate attribute" };
       translation.warnings = findings.warnings;
       return translation;
+    },
+    semanticTranslation = (vertexText, fragmentText) => {
+      let analysis, plan;
+      try {
+        analysis = shaderSemantics.analyse(vertexText.text, fragmentText.text);
+        plan = shaderSemantics.buildPlan(analysis,
+          (vertexText.defines.get("SHADER_NAME")?.body || "").trim());
+      } catch (error) {
+        return { error: String(error?.message || error),
+          lit: !!(analysis && (analysis.vertex.lightCalls.length
+            || analysis.fragment.lightCalls.length)) };
+      }
+      const global = (name) => analysis.vs.globals.get(name)
+        || analysis.fs.globals.get(name);
+      const attributes = [...plan.used.attributes].map((name) =>
+        ({ type: global(name)?.type, name, size: 1 }));
+      if (attributes.length > 8
+          || attributes.some((entry) => !/^(float|vec[234])$/.test(entry.type)))
+        return { error: "Shader interface exceeds the PSP WebGL limits" };
+      const uniforms = [], byName = new Map();
+      for (const [name, type] of plan.used.uniforms) {
+        const element = /^(\w+)\[(\d+)\]$/.exec(name),
+          base = element ? element[1] : name;
+        if (byName.has(base)) continue;
+        const entry = { type, name: base,
+          size: element ? global(base)?.count || 1 : 1 };
+        byName.set(base, entry); uniforms.push(entry);
+      }
+      /* Varyings the fragment stage reads from the vertex stage. */
+      const varyings = [...analysis.fs.globals.values()].filter((entry) =>
+        entry.storage === "varying"
+        && analysis.vs.globals.get(entry.name)?.storage === "varying")
+        .map((entry) => ({ type: entry.type, size: entry.count || 1 }));
+      if (uniformVectors(varyings, MAX_VARYING_VECTORS) > MAX_VARYING_VECTORS)
+        return { error: "Shader interface exceeds the PSP WebGL limits",
+          interface: true };
+      /* Active uniforms only, per stage, as WebGL counts them. */
+      const stage = (globals) => uniforms.filter((entry) =>
+        globals.get(entry.name)?.storage === "uniform");
+      if (uniformVectors(stage(analysis.vs.globals), MAX_VERTEX_UNIFORM_VECTORS)
+            > MAX_VERTEX_UNIFORM_VECTORS
+          || uniformVectors(stage(analysis.fs.globals),
+            MAX_FRAGMENT_UNIFORM_VECTORS) > MAX_FRAGMENT_UNIFORM_VECTORS)
+        return { error: "Shader interface exceeds the PSP WebGL limits",
+          interface: true };
+      const attribute = (name) => name
+        ? attributes.find((entry) => entry.name === name) || null : null;
+      return { attributes, uniforms, position: attribute(plan.position),
+        color: attribute(plan.vertexColor),
+        texcoord: attribute(plan.texcoord?.attribute),
+        normal: attribute(plan.normal),
+        instanceMatrix: null, instanceColor: null, instanceTransform: null,
+        matrices: plan.matrices.map((name) => byName.get(name)),
+        sampler: plan.sampler ? byName.get(plan.sampler) : null,
+        uniformColor: null, constantColor: null, usesTexture: !!plan.sampler,
+        material: plan,
+        warnings: plan.warnings.map((text) => "WARNING: "
+          + text.replace(/^(\w+): /, "$1 shader: ")) };
     },
     /* A refused or approximated program is reported on the console once,
        so an author who never reads the info log still sees it. */
@@ -1035,7 +2740,7 @@
       this._contextLostPending = true;
       diagnostics.lostContexts++; diagnostics.nativeFailures++;
       this._nativeReleasePending = !this._releaseNativeSurface();
-      const event = new Event("webglcontextlost", { cancelable: true });
+      const event = createEvent("webglcontextlost", { cancelable: true });
       Object.defineProperty(event, "statusMessage", { value: String(reason || "") });
       const canceled = this.canvas?.dispatchEvent(event) === false;
       this._lossDispatching = false;
@@ -1089,7 +2794,7 @@
       this._surfaceReady = false;
       this._resize();
       if (!this._lost)
-        this.canvas.dispatchEvent(new Event("webglcontextrestored"));
+        this.canvas.dispatchEvent(createEvent("webglcontextrestored"));
     }
     _schedule() {
       if (this._flushQueued || this._lost) return;
@@ -1408,6 +3113,7 @@
       }
       this._flushSourceUsedMask = 0;
       this._flushTextureUsedMask = 0;
+      this._flushHasMaterial = false;
       this._sourcePacketRetained = preserveSourcePacket;
       this._sourcePacketStable = true;
       this._sourcePacketChecked = false;
@@ -1448,7 +3154,9 @@
       command.instanceMatrix = null;
       command.instanceColor = null;
       command.instanceTransform = null;
-      command.texture = null;
+      command.texture = null; command.material = null;
+      if (command._normalStorage) command._normalStorage.data = null;
+      command.normal = null;
       command._indexStorage.data = null;
       command._positionStorage.data = null;
       command._colorStorage.data = null;
@@ -1736,7 +3444,10 @@
       writeCommandAttribute(
         this, wireI32, wireU32, base, 89,
         draw.instanceTransform, sources, null);
-      wireU32[base + 95] = 0;
+      wireU32[base + 95] = draw.material ? commandAt + 1 : 0;
+      if (draw.material)
+        this._writeMaterial(commandAt, draw.material, null, sources,
+          draw.normal);
     }
     _computeRasterStateKey() {
       const sourceBlendKey = this._blendSrc === constants.ZERO ? 0
@@ -1817,7 +3528,8 @@
     _enqueueDraw(mode, first, count, index, position, color, texcoord,
                  textureSnapshot, instanceCount, instanceMatrix,
                  instanceColor, instanceTransform, matrix, uniformColor,
-                 candidateSources, vertices, drawPlan) {
+                 candidateSources, vertices, drawPlan, material = null,
+                 normal = null) {
       const profile = diagnostics.profileDrawPhases;
       let profileAt = profile ? performance.now() : 0,
         profilePackStarted = profileAt;
@@ -1845,6 +3557,13 @@
         const command = this._takeCommand("draw");
         if (!command) { this._setError(constants.OUT_OF_MEMORY); return false; }
         command.matrix.set(matrix); command.uniformColor.set(uniformColor);
+        if (material) {
+          command.material = command._materialStorage
+            ||= new Float32Array(MATERIAL_WORDS);
+          command.material.set(material);
+          command.normal = this._snapshotLiveAttribute(
+            command._normalStorage ||= {}, normal);
+        } else command.material = null;
         if (index) {
           const retainedIndex = command._indexStorage;
           retainedIndex.data = index.data;
@@ -1979,6 +3698,8 @@
          so restore this per-draw value just as we do the instance count. */
       wireU32[base + 3] = count;
       wireU32[base + 76] = instanceCount;
+      wireU32[base + 95] = material ? commandAt + 1 : 0;
+      if (material) this._writeMaterial(commandAt, material, normal, sources);
       if (!packetIndexHit) {
         wireI32[base + 77] = this._sourceIndex(sources, null,
           instanceMatrix?.enabled ? instanceMatrix.buffer?._data : null);
@@ -2022,7 +3743,7 @@
       else this._retainCommandInputs(
         false, candidateSources, textureSnapshot, vertices);
       if (this._repeatedCommandCapture) {
-        if (textureSnapshot !== null
+        if (textureSnapshot !== null || material
             || drawPlan.commandPacketEpoch !== this._sourcePacketEpoch) {
           this._repeatedCommandCapture.failed = true;
         } else {
@@ -2113,10 +3834,16 @@
         this._lose("canvas was collected");
         return FLUSH_FAILED;
       }
+      let materialWire = null;
+      if (this._flushHasMaterial) {
+        materialWire = this._materialWireU32;
+        materialWire[0] = MATERIAL_WIRE_MAGIC; materialWire[1] = WIRE_VERSION;
+        materialWire[2] = MATERIAL_WORDS; materialWire[3] = this._commands.length;
+      }
       const outcome = __tilefinchWebGLRender(
         canvas.__handle, width, height, wireU32, sources,
         this._textureWireU32, this._attributes.antialias,
-        this._attributes.preserveDrawingBuffer,
+        this._attributes.preserveDrawingBuffer, materialWire,
       );
       if (outcome === 2) {
         diagnostics.deferredFlushes++;
@@ -2365,7 +4092,7 @@
       source = String(source);
       shader._source = source.length <= MAX_SHADER_BYTES ? source : "";
       shader._compiled = false;
-      shader._log = source.length <= MAX_SHADER_BYTES ? "" : "Shader source exceeds 16 KiB";
+      shader._log = source.length <= MAX_SHADER_BYTES ? "" : "Shader source exceeds 64 KiB";
     }
     getShaderSource(shader) { return owned(this, shader, WebGLShader) ? shader._source : null; }
     compileShader(shader) {
@@ -2488,7 +4215,67 @@
         ? program._attributes.find((entry) =>
           entry.name === translation.instanceTransform.name)?.location ?? -1
         : -1;
+      translation.normalLocation = translation.normal
+        ? program._attributes.find((entry) =>
+          entry.name === translation.normal.name)?.location ?? -1
+        : -1;
+      if (translation.material && !this._materialWireU32) {
+        const words = WIRE_HEADER_WORDS + MAX_DRAWS * MATERIAL_WORDS,
+          buffer = new ArrayBuffer(words * 4),
+          scratch = new ArrayBuffer(MATERIAL_WORDS * 4);
+        this._materialWireU32 = new Uint32Array(buffer);
+        this._materialWireI32 = new Int32Array(buffer);
+        this._materialWireF32 = new Float32Array(buffer);
+        this._materialScratchF32 = new Float32Array(scratch);
+        this._materialScratchU32 = new Uint32Array(scratch);
+        this._materialColorScratch = new Float32Array(4);
+        this._materialMatrixScratch = new Float32Array(32);
+      }
       program._translation = translation; program._linked = true;
+      program._materialCache = null; program._materialInputs = null;
+      program._materialInputNames = null; program._materialInputIndex = null;
+      if (translation.material) {
+        const plan = translation.material,
+          chained = new Set([...plan.modelView, ...plan.projection]);
+        /* The position matrices are copied into every draw's record, so a
+           change to one keeps the record, unless one of the record's own
+           terms (colour, lighting, fog, point size, texture transform,
+           alpha test, vertex program) reads it too. Eye depth is already a
+           depth term in those, so modelViewMatrix * position there does
+           not count. */
+        const read = new Set(), seen = new Set();
+        const visit = (node, depth) => {
+          if (!node || typeof node !== "object" || ArrayBuffer.isView(node)
+              || depth > 400 || seen.has(node)) return;
+          seen.add(node);
+          if (node.k === "unif" && typeof node.name === "string") {
+            read.add(node.name); return;
+          }
+          const values = node instanceof Map ? node.values()
+            : Array.isArray(node) ? node : Object.values(node);
+          for (const value of values) visit(value, depth + 1);
+        };
+        for (const [key, value] of Object.entries(plan))
+          if (key !== "used" && key !== "warnings") visit(value, 0);
+        program._materialInputs = new Set();
+        for (const name of plan.used.uniforms.keys())
+          if (!chained.has(name) || read.has(name))
+            program._materialInputs.add(name)
+              .add(name.replace(/\[\d+\]$/, ""));
+        /* The retained values a record is keyed on: those of the uniforms
+           whose setters invalidate it. */
+        /* Smallest first, so a compare that fails usually fails early. */
+        program._materialInputNames = program._uniforms
+          .filter((uniform) => program._materialInputs.has(uniform.name))
+          .map((uniform, at) => [(materialTypeWidth[uniform.type] || 1)
+            * uniform.size, at, uniform.name])
+          .sort((a, b) => a[0] - b[0] || a[1] - b[1])
+          .map((entry) => entry[2]);
+        program._materialInputIndex = new Map(program._materialInputNames
+          .map((name, index) => [name, index]));
+        program._materialCache = { valid: false, current: null,
+          records: [], hint: -1, misses: 0, seed: 0x9e3779b9 };
+      }
       program._log = translation.warnings.join("\n");
       if (program._log) { diagnostics.shaderWarnings++; reportProgram(program); }
       program._linkRevision++;
@@ -2514,7 +4301,20 @@
           if (translation.matrices.length === 1 && slot === 0)
             program._combinedMatrix = matrix;
         }
-        else if (uniform.type === "vec4") program._uniformValues.set(uniform.name, new Float32Array([1, 1, 1, 1]));
+        else if (uniform.type === "vec4" && uniform.size === 1) program._uniformValues.set(uniform.name, new Float32Array([1, 1, 1, 1]));
+        else if (translation.material && uniform.type !== "sampler2D") {
+          /* WebGL's initial uniform values: zero, and identity matrices. */
+          const width = materialTypeWidth[uniform.type] || 1;
+          if (width === 1 && uniform.size === 1)
+            program._uniformValues.set(uniform.name, 0);
+          else {
+            const value = new Float32Array(width * uniform.size);
+            if (uniform.type === "mat3")
+              for (let at = 0; at < uniform.size; at++)
+                value[at * 9] = value[at * 9 + 4] = value[at * 9 + 8] = 1;
+            program._uniformValues.set(uniform.name, value);
+          }
+        }
         else program._uniformValues.set(uniform.name, 0);
       }
     }
@@ -2552,9 +4352,15 @@
     }
     getUniformLocation(program, name) {
       if (!owned(this, program, WebGLProgram) || !program._linked) return null;
-      name = String(name).replace(/\[0\]$/, "");
-      const entry = program._uniforms.find((candidate) => candidate.name === name);
-      return entry ? new WebGLUniformLocation(program, entry) : null;
+      name = String(name);
+      const element = /^(.*)\[(\d+)\]$/.exec(name),
+        exact = program._uniforms.find((candidate) => candidate.name === name);
+      if (exact || !element) return exact ? new WebGLUniformLocation(program, exact) : null;
+      const entry = program._uniforms.find((candidate) =>
+          candidate.name === element[1]),
+        index = Number(element[2]);
+      return entry && index < entry.size
+        ? new WebGLUniformLocation(program, entry, index) : null;
     }
     getActiveAttrib(program, index) {
       const entry = owned(this, program, WebGLProgram) ? program._attributes[index] : null;
@@ -2562,13 +4368,30 @@
     }
     getActiveUniform(program, index) {
       const entry = owned(this, program, WebGLProgram) ? program._uniforms[index] : null;
-      return entry ? new WebGLActiveInfo(entry.size, glTypeFor(entry.type), entry.name) : null;
+      return entry ? new WebGLActiveInfo(entry.size, glTypeFor(entry.type),
+        entry.size > 1 ? entry.name + "[0]" : entry.name) : null;
     }
-    _touchProgramUniformState(program) {
+    /* Whether a set of this uniform should compare its value first: it is
+       an input of the program's current, valid material record. */
+    _watchesMaterialInput(program, name) {
+      return program._materialCache?.valid === true
+        && program._materialInputs.has(name);
+    }
+    _touchProgramUniformState(program, name, unchanged = false) {
       program._uniformStateRevision =
         (program._uniformStateRevision + 1) >>> 0;
       if (program._uniformStateRevision === 0)
         program._uniformStateRevision = 1;
+      /* A material's per-draw record is reused until a uniform it evaluates
+         is set to another value (the next draw then looks for a kept record
+         of the values); position matrices are recombined on every draw. */
+      const cache = program._materialCache;
+      if (!unchanged && cache && (name === undefined
+          || program._materialInputs.has(name))) {
+        if (cache.valid || cache.hint < 0)
+          cache.hint = program._materialInputIndex.get(name) ?? -1;
+        cache.valid = false;
+      }
     }
     _uniform(location, value, acceptedType) {
       if (location === null || this._lost) return;
@@ -2577,8 +4400,12 @@
           || location._type !== acceptedType) {
         this._setError(constants.INVALID_OPERATION); return;
       }
-      location._program._uniformValues.set(location._name, value);
-      this._touchProgramUniformState(location._program);
+      const values = location._program._uniformValues,
+        unchanged = this._watchesMaterialInput(location._program,
+          location._name) && sameMaterialValue(values.get(location._name), value);
+      values.set(location._name, value);
+      this._touchProgramUniformState(location._program, location._name,
+        unchanged);
       if (location._type === "mat4") location._program._matrixRevision++;
     }
     _uniformScalars(location, acceptedType, count, x, y, z, w) {
@@ -2594,19 +4421,28 @@
           || (count > 3 && !Number.isFinite(w))) {
         this._setError(constants.INVALID_VALUE); return;
       }
-      let retained = location._program._uniformValues.get(location._name);
+      let retained = location._program._uniformValues.get(location._name),
+        unchanged = false;
       if (!(retained instanceof Float32Array) || retained.length !== count) {
         retained = new Float32Array(count);
         location._program._uniformValues.set(location._name, retained);
-      }
+      } else if (this._watchesMaterialInput(location._program, location._name))
+        unchanged = sameMaterialValue(retained[0], Math.fround(x))
+          && (count < 2 || sameMaterialValue(retained[1], Math.fround(y)))
+          && (count < 3 || sameMaterialValue(retained[2], Math.fround(z)))
+          && (count < 4 || sameMaterialValue(retained[3], Math.fround(w)));
       retained[0] = x;
       if (count > 1) retained[1] = y;
       if (count > 2) retained[2] = z;
       if (count > 3) retained[3] = w;
-      this._touchProgramUniformState(location._program);
+      this._touchProgramUniformState(location._program, location._name,
+        unchanged);
     }
     _uniformFloatArray(location, value, count, acceptedType) {
       if (location === null || this._lost) return;
+      if (location instanceof WebGLUniformLocation
+          && (location._size > 1 || location._offset))
+        return this._uniformArray(location, value, count, acceptedType);
       if (!(location instanceof WebGLUniformLocation)
           || location._program !== this._program
           || location._type !== acceptedType) {
@@ -2629,21 +4465,87 @@
             this._setError(constants.INVALID_VALUE); return;
           }
       }
-      let retained = location._program._uniformValues.get(location._name);
+      let retained = location._program._uniformValues.get(location._name),
+        unchanged = false;
       if (!(retained instanceof Float32Array) || retained.length !== count) {
         retained = new Float32Array(count);
         location._program._uniformValues.set(location._name, retained);
+      } else if (this._watchesMaterialInput(location._program, location._name)) {
+        unchanged = true;
+        for (let index = 0; index < count && unchanged; index++)
+          unchanged = sameMaterialValue(retained[index],
+            Math.fround(Number(value[index])));
       }
       if (nativeCopy) retained.set(value);
       else for (let index = 0; index < count; index++)
         retained[index] = Number(value[index]);
-      this._touchProgramUniformState(location._program);
+      this._touchProgramUniformState(location._program, location._name,
+        unchanged);
       if (acceptedType === "mat4") location._program._matrixRevision++;
     }
-    uniform1i(location, value) {
-      this._uniform(location, toWebGLInt32(value), "sampler2D");
+    _uniformArray(location, value, count, acceptedType) {
+      if (location._program !== this._program
+          || location._type !== acceptedType) {
+        this._setError(constants.INVALID_OPERATION); return;
+      }
+      if ((!ArrayBuffer.isView(value) && !Array.isArray(value))
+          || value.length < count || value.length % count) {
+        this._setError(constants.INVALID_VALUE); return;
+      }
+      const length = Math.min(value.length,
+        (location._size - location._offset) * count);
+      for (let index = 0; index < length; index++)
+        if (!Number.isFinite(Number(value[index]))) {
+          this._setError(constants.INVALID_VALUE); return;
+        }
+      let retained = location._program._uniformValues.get(location._name),
+        unchanged = false;
+      if (!(retained instanceof Float32Array)
+          || retained.length !== count * location._size) {
+        retained = new Float32Array(count * location._size);
+        location._program._uniformValues.set(location._name, retained);
+      } else unchanged = this._watchesMaterialInput(location._program,
+        location._name);
+      const base = location._offset * count;
+      if (unchanged)
+        for (let index = 0; index < length; index++) {
+          const previous = retained[base + index];
+          retained[base + index] = Number(value[index]);
+          if (unchanged)
+            unchanged = sameMaterialValue(previous, retained[base + index]);
+        }
+      else for (let index = 0; index < length; index++)
+        retained[base + index] = Number(value[index]);
+      this._touchProgramUniformState(location._program, location._name,
+        unchanged);
     }
-    uniform1f(location, value) { const v = Number(value); if (Number.isFinite(v)) this._uniform(location, v, "float"); else this._setError(constants.INVALID_VALUE); }
+    uniform1i(location, value) {
+      const type = location instanceof WebGLUniformLocation
+        && (location._type === "int" || location._type === "bool")
+        ? location._type : "sampler2D";
+      this._uniform(location, toWebGLInt32(value), type);
+    }
+    uniform1iv(location, value) {
+      if (location instanceof WebGLUniformLocation && location._size > 1) {
+        this._uniformArray(location, value, 1, location._type); return;
+      }
+      if ((!ArrayBuffer.isView(value) && !Array.isArray(value)) || !value.length) {
+        this._setError(constants.INVALID_VALUE); return;
+      }
+      this.uniform1i(location, value[0]);
+    }
+    uniform2i(location, x, y) { this._uniformScalars(location, "ivec2", 2, x, y, 0, 0); }
+    uniform3i(location, x, y, z) { this._uniformScalars(location, "ivec3", 3, x, y, z, 0); }
+    uniform4i(location, x, y, z, w) { this._uniformScalars(location, "ivec4", 4, x, y, z, w); }
+    uniform2iv(location, value) { this._uniformFloatArray(location, value, 2, "ivec2"); }
+    uniform3iv(location, value) { this._uniformFloatArray(location, value, 3, "ivec3"); }
+    uniform4iv(location, value) { this._uniformFloatArray(location, value, 4, "ivec4"); }
+    uniform1f(location, value) {
+      const v = Number(value);
+      if (!Number.isFinite(v)) { this._setError(constants.INVALID_VALUE); return; }
+      this._uniform(location, v, location instanceof WebGLUniformLocation
+        && location._type === "bool" ? "bool" : "float");
+    }
     uniform2f(location, x, y) { this._uniformScalars(location, "vec2", 2, x, y, 0, 0); }
     uniform3f(location, x, y, z) { this._uniformScalars(location, "vec3", 3, x, y, z, 0); }
     uniform4f(location, x, y, z, w) { this._uniformScalars(location, "vec4", 4, x, y, z, w); }
@@ -2654,6 +4556,14 @@
     uniformMatrix4fv(location, transpose, value) {
       if (transpose) { this._setError(constants.INVALID_VALUE); return; }
       this._uniformFloatArray(location, value, 16, "mat4");
+    }
+    uniformMatrix3fv(location, transpose, value) {
+      if (transpose) { this._setError(constants.INVALID_VALUE); return; }
+      this._uniformFloatArray(location, value, 9, "mat3");
+    }
+    uniformMatrix2fv(location, transpose, value) {
+      if (transpose) { this._setError(constants.INVALID_VALUE); return; }
+      this._uniformFloatArray(location, value, 4, "mat2");
     }
     getUniform(program, location) {
       if (!owned(this, program, WebGLProgram)
@@ -2710,6 +4620,10 @@
         .revision++;
       this._touchRepeatedCommandState();
     }
+    vertexAttrib1fv(index, v) { this.vertexAttrib4f(index, v?.[0], 0, 0, 1); }
+    vertexAttrib2fv(index, v) { this.vertexAttrib4f(index, v?.[0], v?.[1], 0, 1); }
+    vertexAttrib3fv(index, v) { this.vertexAttrib4f(index, v?.[0], v?.[1], v?.[2], 1); }
+    vertexAttrib4fv(index, v) { this.vertexAttrib4f(index, v?.[0], v?.[1], v?.[2], v?.[3]); }
     vertexAttrib1f(index, x) { this.vertexAttrib4f(index, x, 0, 0, 1); }
     vertexAttrib2f(index, x, y) { this.vertexAttrib4f(index, x, y, 0, 1); }
     vertexAttrib3f(index, x, y, z) { this.vertexAttrib4f(index, x, y, z, 1); }
@@ -2772,6 +4686,12 @@
       const flushOutcome = this._flushForMutation();
       if (flushOutcome === FLUSH_FAILED) return;
       if (parameter === constants.TEXTURE_MIN_FILTER) {
+        /* The GE path samples level 0 only, so a mipmapped filter
+           minifies with its level-0 filter. */
+        if (value === constants.NEAREST_MIPMAP_NEAREST
+            || value === constants.NEAREST_MIPMAP_LINEAR) value = constants.NEAREST;
+        else if (value === constants.LINEAR_MIPMAP_NEAREST
+            || value === constants.LINEAR_MIPMAP_LINEAR) value = constants.LINEAR;
         if (![constants.NEAREST, constants.LINEAR].includes(value)) {
           this._setError(constants.INVALID_ENUM); return;
         }
@@ -2953,7 +4873,11 @@
       this._texture._generation++; this._texture._commandSnapshot = null;
       diagnostics.uploadedTextureBytes += pixels.byteLength;
     }
-    generateMipmap() { this._setError(constants.INVALID_OPERATION); }
+    /* Mipmaps are not built (level 0 only, see texParameteri). */
+    generateMipmap(target) {
+      if (target !== constants.TEXTURE_2D) this._setError(constants.INVALID_ENUM);
+      else if (!this._texture?._pixels) this._setError(constants.INVALID_OPERATION);
+    }
     clearColor(r, g, b, a) {
       r = Number(r); g = Number(g); b = Number(b); a = Number(a);
       if (!Number.isFinite(r) || !Number.isFinite(g)
@@ -3038,12 +4962,11 @@
           .every((factor) => factors.includes(factor))) {
         this._setError(constants.INVALID_ENUM); return;
       }
-      /* The PSP GE has one factor pair for all four channels. Refuse the
-         uncommon split-alpha shape instead of silently drawing different
-         pixels from WebGL. */
-      if (sourceRGB !== sourceAlpha || destinationRGB !== destinationAlpha) {
-        this._setError(constants.INVALID_OPERATION); return;
-      }
+      /* The PSP GE has one factor pair for all four channels. The drawing
+         buffer is opaque (alpha: false), so the alpha factors never reach
+         the screen: the colour factors apply to all four channels, which
+         keeps the common (SRC_ALPHA, ONE_MINUS_SRC_ALPHA, ONE,
+         ONE_MINUS_SRC_ALPHA) transparency shape drawing as WebGL does. */
       if (this._blendSrc !== sourceRGB || this._blendDst !== destinationRGB) {
         this._blendSrc = sourceRGB; this._blendDst = destinationRGB;
         this._rasterStateKey = this._computeRasterStateKey();
@@ -3121,8 +5044,24 @@
     depthMask(value) {
       if (!Boolean(value)) this._setError(constants.INVALID_OPERATION);
     }
-    stencilMask() { this._setError(constants.INVALID_OPERATION); }
-    stencilMaskSeparate() { this._setError(constants.INVALID_OPERATION); }
+    /* The context has no stencil buffer (stencil: false), so WebGL's
+       stencil state is retained and the stencil test always passes. */
+    stencilMask(mask) { this._stencilMask = toWebGLInt32(mask); }
+    stencilMaskSeparate(face, mask) { this._stencilMask = toWebGLInt32(mask); }
+    stencilFunc() {} stencilFuncSeparate() {} stencilOp() {} stencilOpSeparate() {}
+    clearStencil(value) { this._clearStencil = toWebGLInt32(value); }
+    /* Constant blend factors are refused by blendFunc, so the constant
+       colour is never read. */
+    blendColor(red, green, blue, alpha) {
+      this._blendColor = [red, green, blue, alpha].map(Number);
+    }
+    depthRange(near, far) {
+      near = Math.min(1, Math.max(0, Number(near)));
+      far = Math.min(1, Math.max(0, Number(far)));
+      if (near > far) { this._setError(constants.INVALID_OPERATION); return; }
+      /* The GE depth range is fixed at [0, 1]. */
+      if (near !== 0 || far !== 1) this._setError(constants.INVALID_OPERATION);
+    }
     polygonOffset() {} sampleCoverage() {} hint() {} flush() { this._flush(); }
     finish() { this._flush(); }
     _attributeRangeAvailable(attribute, first, count) {
@@ -3203,10 +5142,366 @@
           : combinedMatrix4Into(
             program._combinedMatrix, this._matrixScratch,
             translation.matrices, program._uniformValues);
-      for (let component = 0; component < matrix.length; component++)
-        if (!Number.isFinite(matrix[component])) return false;
+      /* The native product returns false for a non-finite result. */
+      if (!nativeCombined)
+        for (let component = 0; component < matrix.length; component++)
+          if (!Number.isFinite(matrix[component])) return false;
       program._combinedMatrixRevision = program._matrixRevision;
       return true;
+    }
+    /* Evaluates the program's uniform-only terms for this draw: the colour
+       (into _materialColorScratch) and the GE material record. */
+    _prepareMaterial(program, plan) {
+      const cache = program._materialCache;
+      let kept = cache?.valid ? cache.current : null;
+      /* Once MATERIAL_MISS_STREAK more draws built a record than two per
+         reuse (an input that changes every frame, or far more value sets
+         than records), a draw looks and keeps only at miss counts 8, 16
+         and 32 and then at every 64th: a look costs about 0.7 ms on the
+         PSP, enough to push a frame near the 60 Hz edge past it. */
+      const misses = cache?.misses ?? 0,
+        looks = cache && !kept && (misses < MATERIAL_MISS_STREAK
+          || (misses & (misses - 1)) === 0 || (misses & 63) === 0);
+      if (looks) {
+        /* An input was set to another value since the record was built.
+           A record is kept for each of the last few input value sets and
+           reused while the inputs hold exactly its values again: materials
+           of one type share a program and set their own colours before
+           each draw. The input whose change dropped the current record
+           rules most records out first. */
+        const hint = cache.hint, records = cache.records,
+          hinted = hint < 0 ? undefined
+            : program._uniformValues.get(program._materialInputNames[hint]);
+        for (let index = 0; index < records.length; index++) {
+          const entry = records[index];
+          if ((hint < 0 || materialKeyPartMatches(entry.key,
+                entry.offsets[hint], hinted))
+              && this._materialKeyMatches(program, entry.key)) {
+            kept = entry; break;
+          }
+        }
+        if (kept) { cache.current = kept; cache.valid = true; cache.hint = -1; }
+      }
+      if (kept) {
+        /* Two draws of credit per reuse, so a program that finds a kept
+           record at least a third of the time keeps looking. */
+        cache.misses = Math.max(0, cache.misses - 2);
+        diagnostics.materialRecordHits++;
+        this._materialScratchU32.set(kept.words);
+        this._materialColorScratch.set(kept.color);
+        if (plan.projection.length
+            && (!this._materialChain(program, plan.modelView, 2)
+              || !this._materialChain(program, plan.projection, 18)))
+          return null;
+        return this._materialScratchF32;
+      }
+      diagnostics.materialRecordBuilds++;
+      const record = this._buildMaterial(program, plan);
+      if (!record || !cache) return record;
+      /* A miss while records are still free is the program filling them,
+         not a sign that looking is wasted. */
+      if (!looks || cache.records.length === MATERIAL_KEPT_RECORDS)
+        cache.misses = Math.min(cache.misses + 1, 0x7fffffff);
+      if (!looks) return record;
+      /* A full program replaces a record picked at random (a fixed
+         sequence), so more value sets than records drawn in turn still
+         find some of theirs. */
+      const records = cache.records;
+      let entry = null;
+      if (records.length === MATERIAL_KEPT_RECORDS) {
+        let seed = cache.seed;
+        seed ^= seed << 13; seed ^= seed >>> 17; seed ^= seed << 5;
+        cache.seed = seed >>> 0 || 1;
+        entry = records[cache.seed % MATERIAL_KEPT_RECORDS];
+      }
+      /* False only for a retained value that is neither a number nor a
+         Float32Array, which the setters never store: such a record is not
+         kept and is built again on every draw. */
+      const slot = entry ?? { key: null, offsets: null,
+        words: new Uint32Array(MATERIAL_WORDS), color: new Float32Array(4) };
+      if (this._materialKey(program, slot)) {
+        if (!entry) records.push(slot);
+        slot.words.set(this._materialScratchU32);
+        slot.color.set(this._materialColorScratch);
+        cache.current = slot; cache.valid = true; cache.hint = -1;
+      }
+      return record;
+    }
+    /* Writes into entry.key a copy of the program's record inputs: per
+       uniform its length (-1 for a number) and then its values, and into
+       entry.offsets where each uniform starts. False, with the entry
+       untouched, when a value is neither. */
+    _materialKey(program, entry) {
+      const values = program._uniformValues,
+        names = program._materialInputNames;
+      let length = 0;
+      for (let index = 0; index < names.length; index++) {
+        const value = values.get(names[index]);
+        if (value instanceof Float32Array) length += value.length + 1;
+        else if (typeof value === "number") length += 2;
+        else return false;
+      }
+      if (entry.key?.length !== length) entry.key = new Float64Array(length);
+      entry.offsets ??= new Int32Array(names.length);
+      const key = entry.key, offsets = entry.offsets;
+      let at = 0;
+      for (let index = 0; index < names.length; index++) {
+        const value = values.get(names[index]);
+        offsets[index] = at;
+        if (typeof value === "number") {
+          key[at++] = -1; key[at++] = value;
+        } else {
+          key[at++] = value.length; key.set(value, at); at += value.length;
+        }
+      }
+      return true;
+    }
+    /* Whether the inputs hold exactly the key's values; 0 and -0 differ. */
+    _materialKeyMatches(program, key) {
+      const values = program._uniformValues,
+        names = program._materialInputNames;
+      let at = 0;
+      for (let index = 0; index < names.length; index++) {
+        const value = values.get(names[index]);
+        if (value instanceof Float32Array) {
+          const length = value.length;
+          if (key[at++] !== length) return false;
+          for (let k = 0; k < length; k++) {
+            const a = key[at++], b = value[k];
+            if (a !== b || (a === 0 && 1 / a !== 1 / b)) return false;
+          }
+        } else if (typeof value === "number") {
+          if (key[at++] !== -1) return false;
+          const a = key[at++];
+          if (a !== value || (a === 0 && 1 / a !== 1 / value)) return false;
+        } else return false;
+      }
+      return at === key.length;
+    }
+    /* Writes the product of the named mat4 uniforms into the record; false
+       when it is not finite. Uniform setters admit finite values only, so
+       a single matrix (three.js's modelViewMatrix, projectionMatrix) is
+       copied unchecked. */
+    _materialChain(program, names, at) {
+      const values = program._uniformValues;
+      if (names.length === 1) {
+        const value = values.get(names[0]);
+        if (!(value instanceof Float32Array) || value.length !== 16)
+          return false;
+        this._materialScratchF32.set(value, at);
+        return true;
+      }
+      const output = this._materialMatrixScratch.subarray(16, 32),
+        scratch = this._materialMatrixScratch;
+      output.fill(0); output[0] = output[5] = output[10] = output[15] = 1;
+      for (const name of names) {
+        multiplyMatrix4Into(scratch, output, values.get(name));
+        output.set(scratch.subarray(0, 16));
+      }
+      for (let k = 0; k < 16; k++)
+        if (!Number.isFinite(output[k])) return false;
+      this._materialScratchF32.set(output, at);
+      return true;
+    }
+    _buildMaterial(program, plan) {
+      const values = program._uniformValues, evaluate = shaderSemantics.evaluate,
+        record = this._materialScratchF32, words = this._materialScratchU32,
+        color = this._materialColorScratch;
+      const lookup = (name, type) => {
+        const value = values.get(name);
+        if (value !== undefined) return value;
+        const element = /^(\w+)\[(\d+)\]$/.exec(name),
+          array = element && values.get(element[1]),
+          width = materialTypeWidth[type] || 1;
+        if (!ArrayBuffer.isView(array)) return 0;
+        const at = Number(element[2]) * width;
+        return width === 1 ? array[at] : array.subarray(at, at + width);
+      };
+      const vector = (value) => typeof value === "number" ? [value] : value,
+        value3 = (name) => vector(lookup(name, "vec3"));
+      try {
+        color[0] = color[1] = color[2] = plan.colorScale[0];
+        color[3] = plan.colorScale[1];
+        for (const { node, sel } of plan.colorRGB) {
+          const value = vector(evaluate(node, lookup, 1));
+          for (let k = 0; k < 3; k++)
+            color[k] *= sel === "x" ? value[0] : value[k];
+        }
+        for (const { node, sel } of plan.colorAlpha)
+          color[3] *= vector(evaluate(node, lookup, 1))[sel === "w" ? 3 : 0];
+        record.fill(0);
+        let flags = 0;
+        if (plan.projection.length) {
+          flags |= MATERIAL_SPLIT;
+          if (!this._materialChain(program, plan.modelView, 2)
+              || !this._materialChain(program, plan.projection, 18))
+            return null;
+        }
+        const lighting = plan.lighting;
+        if (lighting) {
+          flags |= MATERIAL_LIGHTING;
+          const ambient = [0, 0, 0];
+          if (lighting.ambient) {
+            const v = value3(lighting.ambient);
+            for (let k = 0; k < 3; k++) ambient[k] += v[k];
+          }
+          if (lighting.probe) {
+            /* band 0 of the irradiance probe, over three's PI convention */
+            const v = values.get(lighting.probe);
+            for (let k = 0; k < 3; k++) ambient[k] += v[k] * 0.886227 / Math.PI;
+          }
+          let lights = 0;
+          for (const light of lighting.lights) {
+            const key = light.key, at = MATERIAL_LIGHT_WORD
+              + lights * MATERIAL_LIGHT_WORDS;
+            if (light.type === "HemisphereLight") {
+              const sky = value3(key + ".skyColor"),
+                ground = value3(key + ".groundColor");
+              for (let k = 0; k < 3; k++) ambient[k] += (sky[k] + ground[k]) / 2;
+              continue;
+            }
+            const directional = light.type === "DirectionalLight",
+              lightColor = value3(key + ".color");
+            words[at] = directional ? 1 : 2;
+            record.set(Array.from(value3(key
+              + (directional ? ".direction" : ".position"))).slice(0, 3), at + 1);
+            record.set(lightColor, at + 4); record.set(lightColor, at + 7);
+            record[at + 10] = 1;
+            if (!directional) {
+              /* three's (1 - d / distance) ^ decay range falloff, matched
+                 by GE 1 / (1 + k d) at half the range. */
+              const distance = Number(lookup(key + ".distance", "float")),
+                decay = Number(lookup(key + ".decay", "float"));
+              if (distance > 0 && decay > 0)
+                record[at + 11] = (2 ** decay - 1) * 2 / distance;
+            }
+            lights++;
+          }
+          words[1] = lights;
+          record.set(ambient, 34);
+          for (const node of lighting.emissive) {
+            const v = vector(evaluate(node, lookup, 1));
+            for (let k = 0; k < 3; k++) record[37 + k] += v[k];
+          }
+          let specular = null, shininess = 0;
+          if (lighting.model === "phong") {
+            specular = vector(evaluate(lighting.specular, lookup, 1));
+            shininess = Number(vector(evaluate(lighting.shininess, lookup, 1))[0]);
+          } else if (lighting.model === "standard") {
+            const roughness = Math.max(0.05,
+                Number(lookup(lighting.roughness || "", "float")) || 0),
+              metalness = Number(lookup(lighting.metalness || "", "float")) || 0,
+              base = vector(values.get("diffuse") || [1, 1, 1]);
+            shininess = Math.min(128, Math.max(1, 2 / roughness ** 4 - 2));
+            specular = [0, 1, 2].map((k) => 0.04 + (base[k] - 0.04) * metalness);
+          }
+          if (specular) {
+            /* three's normalized Blinn-Phong lobe, G = 1/4, at normal
+               incidence: S * (n / 2 + 1) / 4. */
+            const scale = 0.25 * (shininess * 0.5 + 1);
+            for (let k = 0; k < 3; k++)
+              record[40 + k] = Math.min(1, specular[k] * scale);
+            record[43] = Math.min(128, Math.max(0, shininess));
+            if (record[40] || record[41] || record[42]) flags |= MATERIAL_SPECULAR;
+          }
+        }
+        if (plan.fog) {
+          flags |= MATERIAL_FOG;
+          record.set(vector(evaluate(plan.fog.color, lookup, 1)).slice(0, 3), 44);
+          if (plan.fog.kind === "exp2") {
+            const density = Number(vector(evaluate(plan.fog.density, lookup, 1))[0]);
+            record[47] = 0; record[48] = density > 0 ? 1.73 / density : 1e30;
+          } else {
+            record[47] = Number(vector(evaluate(plan.fog.near, lookup, 1))[0]);
+            record[48] = Number(vector(evaluate(plan.fog.far, lookup, 1))[0]);
+          }
+        }
+        if (plan.pointSize) {
+          flags |= MATERIAL_POINT_SIZE;
+          const near = Number(vector(evaluate(plan.pointSize, lookup, 1))[0]),
+            far = Number(vector(evaluate(plan.pointSize, lookup, 2))[0]);
+          /* size = constant + scale / eye depth */
+          const scale = 2 * (near - far);
+          record[49] = near - scale; record[50] = scale;
+        }
+        if (plan.texcoord?.transform) {
+          flags |= MATERIAL_TEXTURE_TRANSFORM;
+          const m = vector(evaluate(plan.texcoord.transform, lookup, 1));
+          record[51] = m[0]; record[52] = m[3]; record[53] = m[6];
+          record[54] = m[1]; record[55] = m[4]; record[56] = m[7];
+        }
+        if (plan.texcoord?.point) {
+          flags |= MATERIAL_POINT_COORD;
+          if (plan.texcoord.flipY) flags |= MATERIAL_POINT_COORD_FLIP;
+        }
+        if (plan.alphaTest) {
+          flags |= MATERIAL_ALPHA_TEST;
+          record[57] = Number(vector(evaluate(plan.alphaTest, lookup, 1))[0]);
+        }
+        const vertexProgram = plan.program;
+        if (vertexProgram) {
+          flags |= MATERIAL_PROGRAM;
+          const constants = vertexProgram.constants;
+          words[MATERIAL_PROGRAM_WORD] = vertexProgram.steps
+            | constants.length << 8 | vertexProgram.outputs << 16
+            | vertexProgram.out << 20;
+          words.set(vertexProgram.code, MATERIAL_PROGRAM_WORD + 2);
+          const matrices = new Map();
+          for (let k = 0; k < constants.length; k++) {
+            const entry = constants[k], at = MATERIAL_PROGRAM_CONSTANT_WORD + k * 4;
+            let lanes = entry.values;
+            if (!lanes && entry.column !== undefined) {
+              const key = entry.node;
+              if (!matrices.has(key))
+                matrices.set(key, vector(evaluate(entry.node, lookup, 1)));
+              const m = matrices.get(key);
+              lanes = m.slice(entry.column * entry.dims,
+                (entry.column + 1) * entry.dims);
+            } else lanes ??= vector(evaluate(entry.node, lookup, 1));
+            for (let lane = 0; lane < 4; lane++) {
+              const v = Number(lanes[lane] ?? 0);
+              if (!Number.isFinite(v)) return null;
+              record[at + lane] = v;
+            }
+          }
+        }
+        words[0] = flags;
+        for (let at = 0; at < MATERIAL_PROGRAM_WORD; at++)
+          if (at !== 0 && at !== 1 && !(at >= MATERIAL_LIGHT_WORD
+              && (at - MATERIAL_LIGHT_WORD) % MATERIAL_LIGHT_WORDS === 0)
+              && at !== MATERIAL_NORMAL_IDENTITY_WORD
+              && at !== MATERIAL_NORMAL_IDENTITY_WORD + 1
+              && at !== MATERIAL_NORMAL_IDENTITY_WORD + 2
+              && !Number.isFinite(record[at])) return null;
+        for (let k = 0; k < 4; k++) if (!Number.isFinite(color[k])) return null;
+      } catch (error) {
+        return null;
+      }
+      return record;
+    }
+    _writeMaterial(commandAt, record, normal, sources, normalSnapshot) {
+      const base = WIRE_HEADER_WORDS + commandAt * MATERIAL_WORDS;
+      this._materialWireF32.set(record, base);
+      if (normalSnapshot !== undefined) {
+        writeCommandAttribute(this, this._materialWireI32,
+          this._materialWireU32, base, MATERIAL_NORMAL_WORD,
+          normalSnapshot, sources, null);
+        writeCommandSourceIdentity(this._materialWireI32, base,
+          MATERIAL_NORMAL_IDENTITY_WORD, normalSnapshot);
+      } else {
+        writeLiveSourceIdentity(this._materialWireI32, base,
+          MATERIAL_NORMAL_IDENTITY_WORD, normal);
+        const wire = this._materialWireI32, at = base + MATERIAL_NORMAL_WORD,
+          enabled = normal?.enabled && normal.buffer;
+        wire[at] = this._sourceIndex(sources, null,
+          enabled ? normal.buffer._data : null);
+        wire[at + 1] = enabled ? normal.size : 0;
+        wire[at + 2] = enabled ? normal.type : 0;
+        wire[at + 3] = enabled && normal.normalized ? 1 : 0;
+        wire[at + 4] = enabled ? normal.stride : 0;
+        wire[at + 5] = enabled ? normal.offset : 0;
+      }
+      this._flushHasMaterial = true;
     }
     _draw(mode, first, count, index = null, instanceCount = 1) {
       const profile = diagnostics.profileDrawPhases;
@@ -3236,7 +5531,7 @@
         previousPlan = vertexState.drawPlan;
       let cachedPlan = previousPlan;
       let position, color, texcoord, instanceMatrix, instanceColor,
-        instanceTransform;
+        instanceTransform, normal = null;
       const cacheHit = cachedPlan
         && cachedPlan.program === program
         && cachedPlan.linkRevision === program._linkRevision
@@ -3256,6 +5551,7 @@
         instanceMatrix = cachedPlan.instanceMatrix;
         instanceColor = cachedPlan.instanceColor;
         instanceTransform = cachedPlan.instanceTransform;
+        normal = cachedPlan.normal;
       } else {
         diagnostics.drawPlanMisses++;
         position = translation.positionLocation >= 0
@@ -3273,10 +5569,13 @@
           this._setError(constants.INVALID_OPERATION); return;
         }
         if (translation.usesTexture
-            && (!texcoord?.enabled || !texcoord.buffer
+            && ((translation.texcoord
+                 && (!texcoord?.enabled || !texcoord.buffer))
                 || !this._texture?._pixels)) {
           this._setError(constants.INVALID_OPERATION); return;
         }
+        normal = translation.normalLocation >= 0
+          ? this._attributesState[translation.normalLocation] : null;
         instanceMatrix = this._instanceMatrixAttribute(
           translation, instanceCount);
         instanceColor = this._instanceColorAttribute(
@@ -3296,7 +5595,12 @@
                   color, vertexFirst, vertexCount))
             || (texcoord?.enabled
                 && !this._attributeRangeAvailable(
-                  texcoord, vertexFirst, vertexCount))) {
+                  texcoord, vertexFirst, vertexCount))
+            || (normal?.enabled && (normal.divisor !== 0
+                || !this._attributeRangeAvailable(
+                  normal, vertexFirst, vertexCount)))
+            || (translation.material && (instanceCount > 1
+                || instanceMatrix || instanceColor || instanceTransform))) {
           this._setError(constants.INVALID_OPERATION); return;
         }
         cachedPlan = vertexState.drawPlan = {
@@ -3308,7 +5612,7 @@
           indexMaximum: index?.maximum || 0,
           bufferStorageRevision: this._bufferStorageRevision,
           position, color, texcoord, instanceMatrix, instanceColor,
-          instanceTransform, maximumInstanceCount: instanceCount,
+          instanceTransform, maximumInstanceCount: instanceCount, normal,
           uniformColorValue: translation.uniformColor
             ? program._uniformValues.get(translation.uniformColor.name)
             : translation.constantColor || DEFAULT_UNIFORM_COLOR,
@@ -3362,7 +5666,29 @@
         }
         textureSnapshot = selectedTexture._commandSnapshot;
       }
-      const selectedColor = cachedPlan.uniformColorValue;
+      let material = null;
+      const vertexProgram = translation.material?.program;
+      if (vertexProgram
+          && count * instanceCount * vertexProgram.steps
+            > MATERIAL_PROGRAM_STEP_LIMIT) {
+        /* Per-vertex shading is bounded per draw; refuse past it, once
+           reported on the console per program. */
+        if (!program._programLimitReported) {
+          program._programLimitReported = true;
+          globalThis.console?.warn?.("WebGL program " + program._id
+            + ": a draw of " + count * instanceCount + " vertices needs "
+            + count * instanceCount * vertexProgram.steps
+            + " per-vertex shading steps; the PSP limit is "
+            + MATERIAL_PROGRAM_STEP_LIMIT + " per draw, so it is not drawn");
+        }
+        this._setError(constants.OUT_OF_MEMORY); return;
+      }
+      if (translation.material) {
+        material = this._prepareMaterial(program, translation.material);
+        if (!material) { this._setError(constants.INVALID_OPERATION); return; }
+      }
+      const selectedColor = material
+        ? this._materialColorScratch : cachedPlan.uniformColorValue;
       let uniformColor = selectedColor;
       if (translation.color && !color?.enabled) {
         uniformColor = this._drawUniformColorScratch;
@@ -3379,7 +5705,7 @@
           mode, first, count, index, position, color, texcoord,
           textureSnapshot, instanceCount, instanceMatrix, instanceColor,
           instanceTransform, program._combinedMatrix, uniformColor,
-          null, count * instanceCount, cachedPlan)) return;
+          null, count * instanceCount, cachedPlan, material, normal)) return;
       if (profile) {
         const now = performance.now();
         diagnostics.profileEnqueueMs += now - profileAt;
@@ -3486,9 +5812,9 @@
         [constants.MAX_TEXTURE_IMAGE_UNITS]: 1,
         [constants.MAX_COMBINED_TEXTURE_IMAGE_UNITS]: 1,
         [constants.MAX_VERTEX_TEXTURE_IMAGE_UNITS]: 0,
-        [constants.MAX_VARYING_VECTORS]: 2,
-        [constants.MAX_VERTEX_UNIFORM_VECTORS]: 16,
-        [constants.MAX_FRAGMENT_UNIFORM_VECTORS]: 4,
+        [constants.MAX_VARYING_VECTORS]: MAX_VARYING_VECTORS,
+        [constants.MAX_VERTEX_UNIFORM_VECTORS]: MAX_VERTEX_UNIFORM_VECTORS,
+        [constants.MAX_FRAGMENT_UNIFORM_VECTORS]: MAX_FRAGMENT_UNIFORM_VECTORS,
         [constants.ARRAY_BUFFER_BINDING]: this._arrayBuffer,
         [constants.ELEMENT_ARRAY_BUFFER_BINDING]: this._elementBuffer,
         [constants.VERTEX_ARRAY_BINDING_OES]: this._vertexArray,

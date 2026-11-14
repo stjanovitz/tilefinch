@@ -1,11 +1,13 @@
 /* Page-level CSP3 nonce, hash and 'strict-dynamic' behavior. Each case
    loads a replayed document whose response carries the policy, so the
-   policy is known before the parser runs, exactly as on a real page. */
+   policy is known before the parser runs, exactly as on a real page; the
+   meta cases deliver it (or another) from <meta http-equiv> instead. */
 #include "tilefinch/budget.h"
 #include "tilefinch/fetch.h"
 #include "tilefinch/js_runtime.h"
 #include "tilefinch/navigation.h"
 #include "tilefinch/session.h"
+#include "tilefinch/sha256.h"
 #include "tilefinch/style.h"
 
 #include <stdbool.h>
@@ -14,6 +16,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+#include "script_test_support.h"
 
 #define MIB (1024u * 1024u)
 #define PAGE_URL "https://csp.test/"
@@ -134,10 +138,10 @@ static bool run_page_case(const PageCase *page)
     PageRecord records[16];
     char header[1024];
     snprintf(header, sizeof(header), "content-security-policy: %s",
-             page->policy);
+             page->policy == NULL ? "" : page->policy);
     records[0] = (PageRecord) {
         .url = PAGE_URL, .content_type = "text/html; charset=utf-8",
-        .body = page->html, .header = header
+        .body = page->html, .header = page->policy == NULL ? NULL : header
     };
     size_t count = 1;
     for (size_t i = 0; i < page->resource_count && count < 16; i++)
@@ -881,8 +885,545 @@ static const PageCase oversized_style_case = {
     .check = style_colors,
 };
 
+/* ---- the persistent compiled-script tier behind SRI and CSP ---- */
+
+/* Module records restored from the card still pass the page's admission:
+   the tier sits after fetch, CSP and SRI. One cache directory across four
+   browser starts: a visit with the right integrity writes the root and its
+   import (the import past the module table's ceiling, so through the write
+   queue); a page whose integrity names other bytes, and a page whose policy
+   refuses the root, neither run the module nor read a pack, though the
+   served bytes match the packs exactly; the right integrity then restores
+   both modules from the card and compiles nothing. */
+static char disk_dep[24576];
+static const char disk_root[] =
+    "import {dep} from './ddep.mjs';globalThis.root='yes';"
+    "globalThis.dep=dep;";
+
+static void base64_sha256(const char *text, char out[64])
+{
+    static const char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    uint8_t digest[TILEFINCH_SHA256_DIGEST_BYTES];
+    (void) tilefinch_sha256_digest((const uint8_t *) text, strlen(text),
+                                   digest);
+    size_t at = 0;
+    for (size_t i = 0; i < sizeof(digest); i += 3) {
+        uint32_t chunk = (uint32_t) digest[i] << 16;
+        if (i + 1 < sizeof(digest)) chunk |= (uint32_t) digest[i + 1] << 8;
+        if (i + 2 < sizeof(digest)) chunk |= digest[i + 2];
+        out[at++] = alphabet[(chunk >> 18) & 63u];
+        out[at++] = alphabet[(chunk >> 12) & 63u];
+        out[at++] = i + 1 < sizeof(digest) ? alphabet[(chunk >> 6) & 63u]
+                                           : '=';
+        out[at++] = i + 2 < sizeof(digest) ? alphabet[chunk & 63u] : '=';
+    }
+    out[at] = '\0';
+}
+
+typedef struct {
+    char summary[64];
+    size_t compiles, module_hits, disk_hits, stores, queued;
+    BrowserScriptDiskStats stats;
+} DiskVisit;
+
+static bool disk_visit(const char *cache, const char *policy,
+                       const char *integrity, DiskVisit *visit)
+{
+    memset(visit, 0, sizeof(*visit));
+    char html[512], header[256];
+    snprintf(html, sizeof(html),
+             "<!doctype html><head><script type=module "
+             "src='https://csp.test/droot.mjs' integrity='sha256-%s'>"
+             "</script></head><body></body>", integrity);
+    snprintf(header, sizeof(header), "content-security-policy: %s", policy);
+    PageRecord records[] = {
+        {.url = PAGE_URL, .content_type = "text/html; charset=utf-8",
+         .body = html, .header = header},
+        SCRIPT("https://csp.test/droot.mjs", disk_root),
+        SCRIPT("https://csp.test/ddep.mjs", disk_dep),
+    };
+    size_t count = sizeof(records) / sizeof(records[0]);
+    char directory[128] = {0};
+    bool written = write_fixture(directory, records, count);
+    Budget budget;
+    budget_init(&budget, 32u * MIB);
+    bool lexbor = budget_install_lexbor(&budget);
+    BrowserSession browser = {0};
+    NavigationSession navigation = {0};
+    bool browser_ready = written && lexbor
+        && browser_session_init(&browser, &budget, 256u * 1024u);
+    bool tier = browser_ready
+        && browser_session_script_disk_configure(&browser, cache, true, 0);
+    /* Room for the root's record, not the import's. */
+    if (tier) browser_session_module_bytecode_set_limit(&browser, 8u * 1024u);
+    bool navigation_ready = tier
+        && navigation_init(&navigation, &budget, 4);
+    if (navigation_ready) {
+        navigation_attach_browser_session(&navigation, &browser);
+        navigation_enable_scripts(&navigation, 8u * MIB, 2000);
+        navigation_enable_document_scripts(
+            &navigation, 16, 256u * 1024u, 64u * 1024u, 2000);
+        navigation_enable_external_resources(
+            &navigation, 4, 64u * 1024u, 32u * 1024u,
+            1, 16u * 1024u, 16u * 1024u, 64u * 1024u, 2000);
+    }
+    char error[256] = {0};
+    bool replaying = navigation_ready
+        && fetch_trace_replay_begin_response_keyed(
+               directory, error, sizeof(error));
+    uint64_t generation = replaying ? navigation_begin(&navigation) : 0;
+    bool loaded = replaying && navigation_load_url(
+        &navigation, generation, PAGE_URL, 64u * 1024u, 2000, 480,
+        NULL, NULL, true);
+    for (size_t step = 0; loaded && step < 32; step++)
+        (void) navigation_advance_runtime(&navigation, 1, 8);
+    ScriptResult result = {0};
+    bool probed = loaded && navigation.page.runtime != NULL
+        && script_runtime_evaluate_diagnostic(
+               navigation.page.runtime,
+               "globalThis.pocSummary=String(globalThis.root)+':'+"
+               "String(globalThis.dep)", "<disk-probe>", &result);
+    if (probed) {
+        snprintf(visit->summary, sizeof(visit->summary), "%s",
+                 result.summary);
+        const ScriptResult *page = &navigation.page.script_result;
+        visit->compiles = page->module_compile_count;
+        visit->module_hits = page->module_bytecode_cache_hits;
+        visit->disk_hits = page->script_bytecode_disk_hits;
+        visit->stores = page->module_bytecode_cache_stores;
+        visit->queued = page->module_bytecode_cache_disk_queued;
+    }
+    if (replaying) fetch_trace_end();
+    if (navigation_ready) navigation_destroy(&navigation);
+    /* Idle work writes what the visit queued or stored. */
+    for (unsigned turn = 0; tier && turn < 1000
+             && browser_session_script_disk_maintenance(&browser); turn++) {
+    }
+    if (tier) browser_session_script_disk_stats(&browser, &visit->stats);
+    if (browser_ready) browser_session_destroy(&browser);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0;
+    if (lexbor) clean = budget_uninstall_lexbor(&budget) && clean;
+    if (written) remove_fixture(directory, count);
+    if (!probed || !clean)
+        fprintf(stderr, "disk visit (%s): probed=%d clean=%d error=%s\n",
+                policy, probed, clean, error);
+    return probed && clean;
+}
+
+static bool module_disk_tier_behind_sri_and_csp(void)
+{
+    int used = snprintf(disk_dep, sizeof(disk_dep),
+                        "function big(n){var s=[];");
+    for (int i = 0; used < 11000; i++)
+        used += snprintf(disk_dep + used, sizeof(disk_dep) - (size_t) used,
+                         "s.push(n*%d+%d);", i, i * 7);
+    snprintf(disk_dep + used, sizeof(disk_dep) - (size_t) used,
+             "return s}export const dep='d'+big(2).length;");
+    char cache[512];
+    if (!script_test_make_scratch_root(cache, sizeof(cache), "csp-disk"))
+        return false;
+    char right[64], wrong[64];
+    base64_sha256(disk_root, right);
+    base64_sha256("globalThis.root='other';", wrong);
+    static const char allow[] = "script-src 'self'";
+    DiskVisit first = {0}, mismatch = {0}, refused = {0}, restored = {0};
+    bool ok = disk_visit(cache, allow, right, &first)
+        && strncmp(first.summary, "yes:d", 5) == 0
+        && first.stores == 1 && first.queued == 1
+        && first.stats.writes == 2;
+    ok = ok && disk_visit(cache, allow, wrong, &mismatch)
+        && strcmp(mismatch.summary, "undefined:undefined") == 0
+        && mismatch.disk_hits == 0 && mismatch.stats.reads == 0
+        && mismatch.stats.promoted == 0 && mismatch.stats.direct_reads == 0;
+    ok = ok && disk_visit(cache, "script-src 'none'", right, &refused)
+        && strcmp(refused.summary, "undefined:undefined") == 0
+        && refused.disk_hits == 0 && refused.stats.reads == 0;
+    ok = ok && disk_visit(cache, allow, right, &restored)
+        && strcmp(restored.summary, first.summary) == 0
+        && restored.compiles == 0 && restored.disk_hits == 2
+        && restored.stats.direct_reads >= 1;
+    script_test_remove_tree(cache);
+    if (!ok) {
+        const DiskVisit *visits[] = {&first, &mismatch, &refused, &restored};
+        for (size_t i = 0; i < 4; i++)
+            fprintf(stderr, "disk visit %zu: summary=%s compiles=%zu "
+                    "hits=%zu stores=%zu disk-queued=%zu disk-hits=%zu "
+                    "reads=%zu promoted=%zu direct=%zu writes=%zu\n", i,
+                    visits[i]->summary, visits[i]->compiles,
+                    visits[i]->module_hits, visits[i]->stores,
+                    visits[i]->queued, visits[i]->disk_hits,
+                    visits[i]->stats.reads, visits[i]->stats.promoted,
+                    visits[i]->stats.direct_reads, visits[i]->stats.writes);
+        fprintf(stderr, "module disk tier behind SRI and CSP failed\n");
+    }
+    return ok;
+}
+
+/* <meta http-equiv="Content-Security-Policy"> in the head, no header: it
+   applies from where the parser inserts it. Scripts before it run (a
+   deferred and an async one too, as their fetches began first); after it,
+   unlisted inline and external scripts are refused, eval and inline
+   handlers are off, and fetch() is refused. */
+static const PageRecord meta_resources[] = {
+    SCRIPT("https://cdn.test/deferred.js", "globalThis.deferred='1';"),
+    SCRIPT("https://cdn.test/async.js", "globalThis.async='1';"),
+    SCRIPT("https://cdn.test/ext.js", "globalThis.ext='1';"),
+    SCRIPT("https://allowed.test/ok.js", "globalThis.ok='1';"),
+    {.url = "https://cdn.test/data.json", .content_type = "application/json",
+     .body = "{}"},
+};
+
+static const PageCase meta_case = {
+    .name = "meta policy applies from its insertion",
+    .policy = NULL,
+    .html =
+        "<!doctype html><head>"
+        "<script>globalThis.before='1';globalThis.e1=String(eval('1'));"
+        "</script>"
+        "<script defer src='https://cdn.test/deferred.js'></script>"
+        "<script async src='https://cdn.test/async.js'></script>"
+        "<meta http-equiv=Content-Security-Policy content=\"script-src "
+        "'nonce-M3ta' https://allowed.test; connect-src 'none'\">"
+        "<script>globalThis.inline='1';</script>"
+        "<script src='https://cdn.test/ext.js'></script>"
+        "<script src='https://allowed.test/ok.js'></script>"
+        "<script nonce='M3ta'>globalThis.nonced='1';"
+        "try{eval('1');globalThis.e2='ran';}catch(e){globalThis.e2=e.name;}"
+        "const d=document.createElement('div');"
+        "d.setAttribute('onclick','globalThis.h=1');document.head.append(d);"
+        "d.click();"
+        "fetch('https://cdn.test/data.json').then(()=>globalThis.f='ok',"
+        "()=>globalThis.f='refused');</script>"
+        "</head><body></body>",
+    .resources = meta_resources,
+    .resource_count = sizeof(meta_resources) / sizeof(meta_resources[0]),
+    .probe = "globalThis.pocSummary=[globalThis.before,globalThis.deferred,"
+        "globalThis.async,globalThis.inline,globalThis.ext,globalThis.ok,"
+        "globalThis.nonced].map(v=>v?'1':'0').join('')+','+globalThis.e1+','"
+        "+globalThis.e2+','+globalThis.h+','+globalThis.f",
+    .expected = "1110011,1,TypeError,undefined,refused",
+};
+
+/* A meta outside the head is not the http-equiv state: one the parser puts
+   in the body and one a script appends there change nothing. */
+static const PageCase meta_body_case = {
+    .name = "meta policy in the body is ignored",
+    .policy = NULL,
+    .html =
+        "<!doctype html><head></head><body>"
+        "<meta http-equiv=Content-Security-Policy content=\"script-src "
+        "'none'\"><script>globalThis.ran='1';"
+        "const m=document.createElement('meta');"
+        "m.setAttribute('http-equiv','Content-Security-Policy');"
+        "m.setAttribute('content',\"script-src 'none'\");"
+        "document.body.append(m);"
+        "const s=document.createElement('script');"
+        "s.textContent='globalThis.ran2=1';document.body.append(s);"
+        "globalThis.e=String(eval('3'));</script></body>",
+    .probe = "globalThis.pocSummary=[globalThis.ran,globalThis.ran2,"
+        "globalThis.e].join(',')",
+    .expected = "1,1,3",
+};
+
+/* A script-inserted meta in the head applies from its insertion; one in a
+   detached tree does not. */
+static const PageCase meta_inserted_case = {
+    .name = "script-inserted meta policy",
+    .policy = NULL,
+    .html =
+        "<!doctype html><head><script>"
+        "const x=document.createElement('div');"
+        "x.innerHTML=\"<meta http-equiv=Content-Security-Policy "
+        "content=\\\"script-src 'none'\\\">\";"
+        "globalThis.e0=String(eval('2'));"
+        "const m=document.createElement('meta');"
+        "m.setAttribute('http-equiv','Content-Security-Policy');"
+        "m.setAttribute('content',\"script-src 'self'\");"
+        "document.head.append(m);"
+        "try{eval('1');globalThis.e1='ran';}catch(e){globalThis.e1=e.name;}"
+        "const s=document.createElement('script');"
+        "s.textContent='globalThis.after=1';document.head.append(s);"
+        "const d=document.createElement('div');"
+        "d.setAttribute('onclick','globalThis.h=1');document.head.append(d);"
+        "d.click();</script>"
+        "<script>globalThis.parsed=1;</script></head><body></body>",
+    .probe = "globalThis.pocSummary=[globalThis.e0,globalThis.e1,"
+        "globalThis.after,globalThis.h,globalThis.parsed].join(',')",
+    .expected = "2,TypeError,,,",
+};
+
+/* A page that replaces its head and puts a meta policy in the new one gets
+   the policy; one put in the replaced, detached head changes nothing. The
+   parser's cached head pointer still names the old head. */
+static const PageCase meta_replaced_head_case = {
+    .name = "meta policy in a replacement head",
+    .policy = NULL,
+    .html =
+        "<!doctype html><head><title>t</title></head><body><script>"
+        "const old=document.querySelector('head');"
+        "const h=document.createElement('head');"
+        "document.documentElement.replaceChild(h,old);"
+        "const stale=document.createElement('meta');"
+        "stale.setAttribute('http-equiv','Content-Security-Policy');"
+        "stale.setAttribute('content',\"script-src 'none'\");"
+        "old.append(stale);"
+        "globalThis.e0=String(eval('2'));"
+        "const m=document.createElement('meta');"
+        "m.setAttribute('http-equiv','Content-Security-Policy');"
+        "m.setAttribute('content',\"script-src 'self'\");"
+        "h.append(m);"
+        "try{eval('1');globalThis.e1='ran';}catch(e){globalThis.e1=e.name;}"
+        "</script><script>globalThis.parsed=1;</script></body>",
+    .probe = "globalThis.pocSummary=[globalThis.e0,globalThis.e1,"
+        "globalThis.parsed].join(',')",
+    .expected = "2,TypeError,",
+};
+
+/* The same through documentElement.innerHTML, which detaches the parsed
+   head along with everything else. */
+static const PageCase meta_reparsed_head_case = {
+    .name = "meta policy after documentElement.innerHTML",
+    .policy = NULL,
+    .html =
+        "<!doctype html><head><title>t</title></head><body><script>"
+        "document.documentElement.innerHTML="
+        "'<head><title>u</title></head><body><p>x</p></body>';"
+        "globalThis.e0=String(eval('2'));"
+        "const m=document.createElement('meta');"
+        "m.setAttribute('http-equiv','Content-Security-Policy');"
+        "m.setAttribute('content',\"script-src 'self'\");"
+        "document.querySelector('head').append(m);"
+        "try{eval('1');globalThis.e1='ran';}catch(e){globalThis.e1=e.name;}"
+        "</script></body>",
+    .probe = "globalThis.pocSummary=[globalThis.e0,globalThis.e1].join(',')",
+    .expected = "2,TypeError",
+};
+
+/* A head script removes the head while the parser still has it open. The
+   parser keeps inserting into that detached head, the metas after it too
+   (one through the after-head mode's head pointer): none is the document's
+   head, so neither policy applies. */
+static const PageCase meta_removed_head_parse_case = {
+    .name = "meta policy in a head removed while parsing",
+    .policy = NULL,
+    .html =
+        "<!doctype html><head><script>"
+        "document.querySelector('head').remove();</script>"
+        "<meta http-equiv=Content-Security-Policy content=\"script-src "
+        "'none'\"><title>t</title></head>"
+        "<meta http-equiv=Content-Security-Policy content=\"script-src "
+        "'none'\"><body><script>globalThis.ran='1';</script></body>",
+    .probe = "globalThis.pocSummary=[globalThis.ran,"
+        "document.querySelector('head')===null].join(',')",
+    .expected = "1,true",
+};
+
+/* A header policy and a meta policy are both enforced: a script runs only
+   if each allows it. */
+static const PageRecord combined_resources[] = {
+    SCRIPT("https://cdn.test/c.js", "globalThis.cdn='1';"),
+    SCRIPT("https://csp.test/self.js", "globalThis.own='1';"),
+};
+
+static const PageCase meta_combined_case = {
+    .name = "header and meta policies combine",
+    .policy = "script-src 'self' https://cdn.test 'unsafe-inline'",
+    .html =
+        "<!doctype html><head><script>globalThis.before='1';</script>"
+        "<meta http-equiv=Content-Security-Policy content=\"script-src "
+        "https://cdn.test 'nonce-C0mb'\">"
+        "<script src='https://cdn.test/c.js'></script>"
+        "<script src='/self.js'></script>"
+        "<script>globalThis.inline='1';</script>"
+        "<script nonce='C0mb'>globalThis.nonced='1';</script>"
+        "</head><body></body>",
+    .resources = combined_resources,
+    .resource_count = 2,
+    .probe = "globalThis.pocSummary=[globalThis.before,globalThis.cdn,"
+        "globalThis.own,globalThis.inline,globalThis.nonced]"
+        ".map(v=>v?'1':'0').join('')",
+    .expected = "11001",
+};
+
+/* The speculative scanner stops at a meta policy: it runs ahead of the
+   parser, which has not applied the policy yet, so a script after the meta
+   is neither preloaded nor run. */
+static const PageRecord meta_preload_resources[] = {
+    SCRIPT("https://cdn.test/before.js", "globalThis.before='1';"),
+    SCRIPT("https://cdn.test/after.js", "globalThis.after='1';"),
+};
+
+static bool meta_preload_stopped(NavigationSession *navigation)
+{
+    bool ok = navigation->preloads_discovered == 1
+        && navigation->preloads_launched == 1;
+    if (!ok)
+        fprintf(stderr, "meta preloads discovered=%zu launched=%zu\n",
+                navigation->preloads_discovered,
+                navigation->preloads_launched);
+    return ok;
+}
+
+static const PageCase meta_preload_case = {
+    .name = "preload scan stops at a meta policy",
+    .policy = NULL,
+    .html =
+        "<!doctype html><head>"
+        "<script src='https://cdn.test/before.js'></script>"
+        "<meta http-equiv=Content-Security-Policy content=\"script-src "
+        "https://allowed.test\">"
+        "<script src='https://cdn.test/after.js'></script>"
+        "</head><body></body>",
+    .resources = meta_preload_resources,
+    .resource_count = 2,
+    .probe = "globalThis.pocSummary=[globalThis.before,globalThis.after]"
+        ".map(v=>v?'1':'0').join('')",
+    .expected = "10",
+    .check = meta_preload_stopped,
+};
+
+/* Inline event handlers follow a later meta policy that refuses them even
+   while eval stays allowed: one compiled before the meta runs, one after
+   it does not. */
+static const PageCase meta_handler_case = {
+    .name = "meta policy refuses later inline handlers",
+    .policy = NULL,
+    .html =
+        "<!doctype html><head><script>"
+        "const a=document.createElement('div');"
+        "a.setAttribute('onclick','globalThis.h1=1');a.click();</script>"
+        "<meta http-equiv=Content-Security-Policy content=\"script-src "
+        "'nonce-H4nd' 'unsafe-eval'\">"
+        "<script nonce='H4nd'>const b=document.createElement('div');"
+        "b.setAttribute('onclick','globalThis.h2=1');b.click();"
+        "globalThis.e=String(eval('5'));</script></head><body></body>",
+    .probe = "globalThis.pocSummary=[globalThis.h1,globalThis.h2,"
+        "globalThis.e].join(',')",
+    .expected = "1,,5",
+};
+
+/* A connected inert element did not prepare a script request. Giving it an
+   executable type after a meta policy must use that policy, not acquire an
+   exemption merely because its src existed earlier. */
+static const PageRecord meta_prepare_resources[] = {
+    SCRIPT("https://cdn.test/prepared.js", "globalThis.prepared='ran';"),
+    SCRIPT("https://cdn.test/blocked.js", "globalThis.finished='ran';"),
+};
+
+static const PageCase meta_inert_activation_case = {
+    .name = "inert source does not acquire a prepared CSP grant",
+    .html =
+        "<!doctype html><head>"
+        "<script id=held type=application/json src='https://cdn.test/blocked.js'></script>"
+        "<script>const h=document.getElementById('held');"
+        "const m=document.createElement('meta');"
+        "m.httpEquiv='Content-Security-Policy';"
+        "m.content=\"script-src 'self' 'unsafe-inline' 'unsafe-eval'\";"
+        "document.head.append(m);h.onerror=()=>globalThis.finished='blocked';"
+        "h.type='text/javascript';"
+        "h.remove();document.head.append(h);</script></head><body></body>",
+    .resources = meta_prepare_resources,
+    .resource_count = sizeof(meta_prepare_resources) / sizeof(meta_prepare_resources[0]),
+    .probe = "globalThis.pocSummary=globalThis.finished||'pending'",
+    .expected = "blocked",
+};
+
+/* Preparing one URL cannot exempt a different URL, including a relative
+   source reinterpreted by a later base element. */
+static const PageCase meta_changed_source_case = {
+    .name = "prepared CSP grant is bound to its source URL",
+    .html =
+        "<!doctype html><head><script defer id=held src='https://cdn.test/prepared.js'></script>"
+        "<meta http-equiv=Content-Security-Policy content=\"script-src 'self' 'unsafe-inline' 'unsafe-eval'\">"
+        "<script>const h=document.getElementById('held');"
+        "h.onerror=()=>globalThis.finished='blocked';"
+        "h.src='https://cdn.test/blocked.js';</script></head><body></body>",
+    .resources = meta_prepare_resources,
+    .resource_count = sizeof(meta_prepare_resources) / sizeof(meta_prepare_resources[0]),
+    .probe = "globalThis.pocSummary=globalThis.finished||'pending'",
+    .expected = "blocked",
+};
+
+static const PageCase meta_changed_base_case = {
+    .name = "prepared CSP grant is bound to the original base resolution",
+    .html =
+        "<!doctype html><head><script defer id=held src='blocked.js'></script>"
+        "<meta http-equiv=Content-Security-Policy content=\"script-src 'self' 'unsafe-inline' 'unsafe-eval'\">"
+        "<script>document.getElementById('held').onerror=()=>globalThis.finished='blocked';"
+        "const b=document.createElement('base');b.href='https://cdn.test/';"
+        "document.head.append(b);</script></head><body></body>",
+    .resources = meta_prepare_resources,
+    .resource_count = sizeof(meta_prepare_resources) / sizeof(meta_prepare_resources[0]),
+    .probe = "globalThis.pocSummary=globalThis.finished||'pending'",
+    .expected = "blocked",
+};
+
+static const PageCase meta_nomodule_activation_case = {
+    .name = "nomodule removal does not prepare a request before its policy",
+    .html =
+        "<!doctype html><head><script defer nomodule id=held src='https://cdn.test/blocked.js'></script>"
+        "<meta http-equiv=Content-Security-Policy content=\"script-src 'self' 'unsafe-inline' 'unsafe-eval'\">"
+        "<script>const h=document.getElementById('held');"
+        "h.onerror=()=>globalThis.finished='blocked';h.removeAttribute('nomodule');"
+        "</script></head><body></body>",
+    .resources = meta_prepare_resources,
+    .resource_count = sizeof(meta_prepare_resources) / sizeof(meta_prepare_resources[0]),
+    .probe = "globalThis.pocSummary=globalThis.finished||'pending'",
+    .expected = "blocked",
+};
+
+static const PageCase meta_prepared_header_case = {
+    .name = "prepared meta grant never exempts an earlier header policy",
+    .policy = "script-src 'self' 'unsafe-inline' 'unsafe-eval'",
+    .html =
+        "<!doctype html><head><script defer id=held src='https://cdn.test/blocked.js'></script>"
+        "<meta http-equiv=Content-Security-Policy content=\"script-src * 'unsafe-inline' 'unsafe-eval'\">"
+        "<script>document.getElementById('held').onerror=()=>globalThis.finished='blocked';"
+        "</script></head><body></body>",
+    .resources = meta_prepare_resources,
+    .resource_count = sizeof(meta_prepare_resources) / sizeof(meta_prepare_resources[0]),
+    .probe = "globalThis.pocSummary=globalThis.finished||'pending'",
+    .expected = "blocked",
+};
+
+static const PageCase meta_prepared_data_case = {
+    .name = "prepared data URL keeps its later meta exemption",
+    .html =
+        "<!doctype html><head><script defer src=\"data:text/javascript,globalThis.finished='ran'\"></script>"
+        "<meta http-equiv=Content-Security-Policy content=\"script-src 'self'\">"
+        "</head><body></body>",
+    .probe = "globalThis.pocSummary=globalThis.finished||'pending'",
+    .expected = "ran",
+};
+
+static bool meta_prepared_long_data(void)
+{
+    char html[4096];
+    static const char prefix[] =
+        "<!doctype html><head><script defer src=\"data:text/javascript,"
+        "globalThis.finished='ran';/*";
+    static const char suffix[] =
+        "*/\"></script><meta http-equiv=Content-Security-Policy "
+        "content=\"script-src 'self'\"></head><body></body>";
+    size_t at = sizeof(prefix) - 1u;
+    memcpy(html, prefix, at);
+    memset(html + at, 'x', 3000u);
+    at += 3000u;
+    memcpy(html + at, suffix, sizeof(suffix));
+    const PageCase page = {
+        .name = "prepared data URL past the network URL bound",
+        .html = html,
+        .probe = "globalThis.pocSummary=globalThis.finished||'pending'",
+        .expected = "ran",
+    };
+    return run_page_case(&page);
+}
+
 int main(void)
 {
+    if (!meta_prepared_long_data()) return 1;
     int used = snprintf(
         long_data_html, sizeof(long_data_html),
         "<!doctype html><head><script type=module nonce='L0ng' src='"
@@ -911,12 +1452,20 @@ int main(void)
         &dangling_case, &clone_case, &exhaust_case, &module_nonce_case,
         &module_integrity_case, &gadget_case, &integrity_mismatch_case,
         &fragment_case, &oversized_style_case, &dynamic_sri_case,
-        &dynamic_grant_case,
+        &dynamic_grant_case, &meta_case, &meta_body_case,
+        &meta_inserted_case, &meta_replaced_head_case,
+        &meta_reparsed_head_case, &meta_removed_head_parse_case,
+        &meta_combined_case, &meta_preload_case,
+        &meta_handler_case, &meta_inert_activation_case,
+        &meta_changed_source_case,
+        &meta_changed_base_case, &meta_nomodule_activation_case,
+        &meta_prepared_header_case, &meta_prepared_data_case,
     };
     size_t failures = 0;
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         if (!run_page_case(cases[i])) failures++;
     }
+    if (!module_disk_tier_behind_sri_and_csp()) failures++;
     if (failures != 0) {
         fprintf(stderr, "tilefinch-csp-page-tests: %zu failure(s)\n",
                 failures);

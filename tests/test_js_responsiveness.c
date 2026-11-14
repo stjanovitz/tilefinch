@@ -19,6 +19,7 @@
 
 #include "tilefinch/platform.h"
 #include "tilefinch/runtime_clock.h"
+#include "tilefinch/script_admission.h"
 #include "tilefinch/script_split.h"
 #include "../src/js_runtime_internal.h"
 #include "../src/js_source_store.h"
@@ -44,7 +45,6 @@ static bool callback_abort_cooperate(void *context, const char *phase,
     return false;
 }
 
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
 /* Deterministic compile-abort driver: the cooperate service refuses to
    continue, so the parser's bounded interrupt poll aborts an admitted
    compile without depending on wall-clock timing. */
@@ -61,7 +61,6 @@ static bool compile_abort_cooperate(void *context, const char *phase,
     state->calls++;
     return false;
 }
-#endif
 
 #define CHECK(condition) do {                                                \
     if (!(condition)) {                                                      \
@@ -713,8 +712,9 @@ static int test_inserted_subtree_resource_classification(void)
         { "<link rel=preload href=s.js as=script>", "head", false, false },
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-        memset(&runtime->bridge.mutations, 0,
-               sizeof(runtime->bridge.mutations));
+        if (runtime->bridge.mutations != NULL)
+            memset(runtime->bridge.mutations, 0,
+                   sizeof(*runtime->bridge.mutations));
         char script[512];
         snprintf(script, sizeof(script),
                  "(()=>{const t=document.createElement('template');"
@@ -727,7 +727,9 @@ static int test_inserted_subtree_resource_classification(void)
         CHECK(script_runtime_evaluate_diagnostic(
                   runtime, script, "<classify>", &result)
               && strcmp(result.summary, "inserted") == 0);
-        const ScriptMutationJournal *journal = &runtime->bridge.mutations;
+        const ScriptMutationJournal *journal = runtime->bridge.mutations;
+        CHECK(journal != NULL);
+        if (journal == NULL) continue;
         if (journal->image_resource_scan_required != cases[i].image_scan
             || journal->resource_rebuild_required != cases[i].rebuild) {
             fprintf(stderr, "classification case %zu: scan=%d rebuild=%d\n",
@@ -3443,6 +3445,157 @@ static bool var_cache_eval(ScriptRuntime *runtime, const char *script,
     return true;
 }
 
+/* A buffered result grid: the Internet Archive scroller's ResizeObserver
+   measures about 61 cell wrappers twice per append, each read resolving the
+   wrapper and its own cell. Every wrapper and cell must stay cached across
+   the passes; a 64-slot ring evicted each before its next read. */
+static int test_computed_style_cache_holds_cell_buffer(void)
+{
+    Budget budget;
+    budget_init(&budget, 12u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ScriptRuntime *runtime = var_cache_runtime(&budget, &document, &sheet,
+        "<!doctype html><style>.grid{color:rgb(1, 2, 3)}"
+        ".cell{display:block;height:20px}</style><body>"
+        "<div id=grid class=grid></div>");
+    CHECK(runtime != NULL);
+    CHECK(var_cache_eval(runtime,
+        "(()=>{const grid=document.getElementById('grid');"
+        "for(let i=0;i<61;i++){const wrap=document.createElement('div'),"
+        "cell=document.createElement('div');wrap.className='wrap';"
+        "cell.className='cell';wrap.appendChild(cell);grid.appendChild(wrap)}"
+        "globalThis.cellReads=()=>{for(const w of grid.children)"
+        "if(getComputedStyle(w.firstChild).color!=='rgb(1, 2, 3)')"
+        "throw Error('cell color');return 'READ'};"
+        "return pocSummary=cellReads()})()", "READ"));
+    size_t misses_before = runtime->bridge.computed_style_cache.misses;
+    CHECK(var_cache_eval(runtime, "pocSummary=cellReads()", "READ"));
+    size_t misses = runtime->bridge.computed_style_cache.misses
+        - misses_before;
+    if (misses != 0) printf("cell buffer: second pass misses=%zu\n", misses);
+    CHECK(misses == 0);
+    script_runtime_destroy(runtime);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
+/* Removing a read subtree vacates its slots in the ring: the styles read
+   next take those slots instead of evicting live entries, so a nearly
+   full ring keeps everything still in the document. Replacing at the
+   hand would have evicted the oldest kept styles. */
+static int test_computed_style_cache_fills_vacated_slots(void)
+{
+    Budget budget;
+    budget_init(&budget, 12u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ScriptRuntime *runtime = var_cache_runtime(&budget, &document, &sheet,
+        "<!doctype html><style>.k{color:rgb(1, 2, 3)}"
+        ".g,.f{color:rgb(4, 5, 6)}</style><body>"
+        "<div id=keep></div><div id=gone></div>");
+    CHECK(runtime != NULL);
+    /* html, body, #keep and 100 kept cells, #gone and 20 cells: 124 of
+       the 128 slots. */
+    CHECK(var_cache_eval(runtime,
+        "(()=>{const fill=(parent,n,c)=>{for(let i=0;i<n;i++){"
+        "const e=document.createElement('div');e.className=c;"
+        "parent.appendChild(e)}};"
+        "const keep=document.getElementById('keep');fill(keep,100,'k');"
+        "fill(document.getElementById('gone'),20,'g');"
+        "globalThis.readAll=(parent,want)=>{for(const e of parent.children)"
+        "if(getComputedStyle(e).color!==want)throw Error(e.className);"
+        "return 'READ'};readAll(keep,'rgb(1, 2, 3)');"
+        "return pocSummary=readAll(document.getElementById('gone'),"
+        "'rgb(4, 5, 6)')})()", "READ"));
+    size_t misses = runtime->bridge.computed_style_cache.misses;
+    CHECK(var_cache_eval(runtime,
+        "pocSummary=readAll(document.getElementById('keep'),"
+        "'rgb(1, 2, 3)')", "READ"));
+    CHECK(runtime->bridge.computed_style_cache.misses == misses);
+    /* The removal drops #gone's subtree and body's own style (22 slots);
+       the fresh subtree and body take 22. */
+    CHECK(var_cache_eval(runtime,
+        "(()=>{document.getElementById('gone').remove();"
+        "const fresh=document.createElement('div');"
+        "for(let i=0;i<20;i++){const e=document.createElement('div');"
+        "e.className='f';fresh.appendChild(e)}"
+        "document.body.appendChild(fresh);"
+        "return pocSummary=readAll(fresh,'rgb(4, 5, 6)')})()", "READ"));
+    misses = runtime->bridge.computed_style_cache.misses;
+    CHECK(var_cache_eval(runtime,
+        "pocSummary=readAll(document.getElementById('keep'),"
+        "'rgb(1, 2, 3)')", "READ"));
+    size_t missed = runtime->bridge.computed_style_cache.misses - misses;
+    if (missed != 0) printf("vacated slots: kept cells missed=%zu\n", missed);
+    CHECK(missed == 0);
+    script_runtime_destroy(runtime);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* Replacement under the two read patterns that defeat in-order eviction.
+   A read cycle longer than the ring (archive.org's scroller re-reads 150
+   to 500 styles per check) lost every style before its next read; a
+   random victim keeps a share. A hot set read between runs of one-off
+   reads (a fixed toolbar beside a scrolled list) aged out every few runs;
+   the second chance keeps what reads keep using. */
+static int test_computed_style_cache_replacement_patterns(void)
+{
+    Budget budget;
+    budget_init(&budget, 12u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ScriptRuntime *runtime = var_cache_runtime(&budget, &document, &sheet,
+        "<!doctype html><style>.c{color:rgb(1, 2, 3)}"
+        ".h{color:rgb(4, 5, 6)}</style><body>"
+        "<div id=cycle></div><div id=hot></div><div id=once></div>");
+    CHECK(runtime != NULL);
+    CHECK(var_cache_eval(runtime,
+        "(()=>{const fill=(id,n,c)=>{const p=document.getElementById(id);"
+        "for(let i=0;i<n;i++){const e=document.createElement('div');"
+        "e.className=c;p.appendChild(e)}return [...p.children]};"
+        "const C=fill('cycle',180,'c'),H=fill('hot',16,'h'),"
+        "O=fill('once',600,'c');let k=0;"
+        "globalThis.cycle=()=>{for(const e of C)getComputedStyle(e).color;"
+        "return 'READ'};"
+        "globalThis.hot=()=>{for(const e of H)getComputedStyle(e).color;"
+        "return 'READ'};"
+        "globalThis.once=()=>{for(let i=0;i<24;i++)"
+        "getComputedStyle(O[k++]).color;return 'READ'};"
+        "return pocSummary=hot()})()", "READ"));
+    size_t hot_misses = 0, before = 0;
+    for (int round = 0; round < 20; round++) {
+        CHECK(var_cache_eval(runtime, "pocSummary=once()", "READ"));
+        before = runtime->bridge.computed_style_cache.misses;
+        CHECK(var_cache_eval(runtime, "pocSummary=hot()", "READ"));
+        hot_misses += runtime->bridge.computed_style_cache.misses - before;
+    }
+    CHECK(var_cache_eval(runtime, "pocSummary=cycle()", "READ"));
+    before = runtime->bridge.computed_style_cache.misses;
+    CHECK(var_cache_eval(runtime, "pocSummary=cycle()", "READ"));
+    size_t cycle_misses = runtime->bridge.computed_style_cache.misses
+        - before;
+    if (cycle_misses > 160 || hot_misses > 30)
+        printf("replacement: second cycle misses=%zu of 180, hot misses=%zu "
+               "over 20 runs\n", cycle_misses, hot_misses);
+    /* In-order replacement: 183 and 76; random alone: 123 and 61. */
+    CHECK(cycle_misses <= 160);
+    CHECK(hot_misses <= 30);
+    script_runtime_destroy(runtime);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 static bool count_style_layout_flush(void *opaque)
 {
     (*(size_t *) opaque)++;
@@ -3614,6 +3767,78 @@ static int test_computed_style_sibling_scopes(void)
     return 0;
 }
 
+/* What a mutation note reads off the sheet, and when. The selector
+   dependencies take a scan over every rule of a sheet generation (a large
+   news sheet holds 16,000 rules: over a second on the PSP per
+   generation), and the scope keys cost several times more than the flags.
+   A change the note settles without them (one it cannot scope, nothing
+   retained within reach, or a :has() sheet whose escaped selectors keep
+   relational changes conservative) must not pay for them; a structural
+   change still builds the keys and reads fresh. */
+static int test_computed_style_dependency_scans(void)
+{
+    Budget budget;
+    budget_init(&budget, 12u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ScriptRuntime *runtime = var_cache_runtime(&budget, &document, &sheet,
+        "<!doctype html><head><script id=hs>0</script>"
+        "<style>"
+        ".w:has([s\\74 yle*='red']){color:red}"
+        "li:first-child{color:rgb(4,4,4)}"
+        ".a + .b{color:rgb(1,1,1)}"
+        "#far{color:rgb(2,2,2)}"
+        "</style></head><body>"
+        "<div class=w id=w><span id=e>x</span></div>"
+        "<ul id=list><li id=l1>1</li><li id=l2>2</li></ul>"
+        "<section><div><p id=far>f</p></div></section>"
+        "<aside><div><div id=a></div><div id=b class=b>b</div></div></aside>"
+        "</body>");
+    CHECK(runtime != NULL);
+    __typeof__(runtime->bridge.computed_style_cache) *cache =
+        &runtime->bridge.computed_style_cache;
+    /* A head script leaving (a loader's bookkeeping) is not a change the
+       note scopes: it clears without consulting the sheet. */
+    CHECK(var_cache_eval(runtime,
+        "(()=>{if(getComputedStyle(document.getElementById('far')).color"
+        "!=='rgb(2, 2, 2)')throw Error('far');"
+        "document.getElementById('hs').remove();pocSummary='ok'})()", "ok"));
+    printf("dependency scans: head script flags=%zu keys=%zu\n",
+           cache->flag_scans, cache->key_scans);
+    CHECK(cache->flag_scans == 0 && cache->key_scans == 0);
+    /* The escaped :has() selector settles a relational change at the
+       flags: no keys. */
+    CHECK(var_cache_eval(runtime,
+        "(()=>{if(getComputedStyle(document.getElementById('far')).color"
+        "!=='rgb(2, 2, 2)')throw Error('far');"
+        "document.getElementById('e').className='hot';pocSummary='ok'})()",
+        "ok"));
+    printf("dependency scans: escaped :has() flags=%zu keys=%zu\n",
+           cache->flag_scans, cache->key_scans);
+    CHECK(cache->flag_scans == 1 && cache->key_scans == 0);
+    /* A structural change beside a retained style builds the keys once
+       and the retained style reads fresh. */
+    CHECK(var_cache_eval(runtime,
+        "(()=>{const l2=document.getElementById('l2'),"
+        "b=document.getElementById('b');"
+        "if(getComputedStyle(l2).color!=='rgb(0, 0, 0)')throw Error('l2');"
+        "if(getComputedStyle(b).color!=='rgb(0, 0, 0)')throw Error('b');"
+        "document.getElementById('l1').remove();"
+        "if(getComputedStyle(l2).color!=='rgb(4, 4, 4)')throw Error('l2 first');"
+        "document.getElementById('a').className='a';"
+        "if(getComputedStyle(b).color!=='rgb(1, 1, 1)')throw Error('b sibling');"
+        "pocSummary='ok'})()", "ok"));
+    printf("dependency scans: structural flags=%zu keys=%zu\n",
+           cache->flag_scans, cache->key_scans);
+    CHECK(cache->flag_scans == 1 && cache->key_scans == 1);
+    script_runtime_destroy(runtime);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 /* A runtime rebind detaches the page's document, destroys its tree
    wholesale (no per-node removal reaches the removal listener) and binds
    the next one. getComputedStyle's retained styles held the old tree's
@@ -3648,7 +3873,8 @@ static int test_inline_style_scoped_invalidation(void)
            runtime->bridge.computed_style_cache.scoped_clears,
            runtime->bridge.computed_style_cache.misses);
     CHECK(runtime->bridge.computed_style_cache.full_clears - full_before == 1);
-    CHECK(!runtime->bridge.mutations.relational_selector_sensitive);
+    CHECK(runtime->bridge.mutations == NULL
+          || !runtime->bridge.mutations->relational_selector_sensitive);
     script_runtime_destroy(runtime);
     stylesheet_destroy(&sheet);
     document_destroy(&document);
@@ -3672,7 +3898,8 @@ static int test_inline_style_scoped_invalidation(void)
         "throw Error('style selector');e.style.removeProperty('color');"
         "if(getComputedStyle(p).color!=='rgb(0, 0, 255)')throw Error('remove');"
         "pocSummary='INLINE-RELATIONAL-OK'})()", "INLINE-RELATIONAL-OK"));
-        CHECK(runtime->bridge.mutations.relational_selector_sensitive);
+        CHECK(runtime->bridge.mutations != NULL
+              && runtime->bridge.mutations->relational_selector_sensitive);
         script_runtime_destroy(runtime);
         stylesheet_destroy(&sheet);
         document_destroy(&document);
@@ -4067,7 +4294,8 @@ static int test_computed_style_keywords_without_layout(void)
     CHECK(var_cache_eval(runtime, "pocSummary=cs.width", "auto"));
     CHECK(flushes != 0);
     flushes = 0;
-    runtime->bridge.mutations.conservative_resource_scan = true;
+    CHECK(js_rt_bridge_journal(&runtime->bridge) != NULL);
+    runtime->bridge.mutations->conservative_resource_scan = true;
     CHECK(var_cache_eval(runtime, "pocSummary=cs.position", "relative"));
     CHECK(flushes != 0);
     /* A geometry-only callback cannot install stylesheets. Journal overflow
@@ -4075,7 +4303,7 @@ static int test_computed_style_keywords_without_layout(void)
        scratch layout for each property. Actual geometry reads still flush. */
     script_runtime_set_geometry_layout_callback(runtime,
         count_style_layout_flush, &flushes);
-    runtime->bridge.mutations.overflowed = true;
+    runtime->bridge.mutations->overflowed = true;
     flushes = 0;
     CHECK(var_cache_eval(runtime, "pocSummary=cs.transform", "translate(12px, 0px)"));
     CHECK(flushes == 0);
@@ -5268,13 +5496,17 @@ static int test_wrapper_cleanup_backlog(void)
 
 static int test_discarded_browser_state_ownership(unsigned kind)
 {
-    static const char *const names[] = {"abort", "indexeddb", "slots"};
+    static const char *const names[] = {"abort", "indexeddb", "slots",
+        "performance-observer", "performance-entry", "performance-list"};
     static const char *const warm[] = {
         "void new AbortController().signal;pocSummary='WARM'",
         "void indexedDB;void new IDBRequest();pocSummary='WARM'",
         "(()=>{const h=document.createElement('div');document.body.appendChild(h);"
         "const r=h.attachShadow({mode:'open'});r.appendChild(document.createElement('slot'));"
         "h.appendChild(document.createElement('span'));h.remove();pocSummary='WARM'})()",
+        "void new PerformanceObserver(()=>{});pocSummary='WARM'",
+        "void new PerformanceMark('warm',{detail:{}});pocSummary='WARM'",
+        "void new PerformanceObserverEntryList([]);pocSummary='WARM'",
     };
     static const char *const drop[] = {
         "(()=>{for(let i=0;i<32;i++){const c=new AbortController(),s=c.signal;"
@@ -5288,6 +5520,16 @@ static int test_discarded_browser_state_ownership(unsigned kind)
         "h.payload=new Uint8Array(8192);r.appendChild(document.createElement('slot'));"
         "h.appendChild(document.createElement('span'));h.remove();"
         "if(!i)globalThis.discardedOwner=new WeakRef(h)}pocSummary='DROPPED'})()",
+        "(()=>{for(let i=0;i<32;i++){const o=new PerformanceObserver(()=>o.payload);"
+        "o.payload=new Uint8Array(8192);if(i&1){o.observe({type:'mark'});o.disconnect()}"
+        "if(!i)globalThis.discardedOwner=new WeakRef(o)}pocSummary='DROPPED'})()",
+        "(()=>{for(let i=0;i<32;i++){const e=new PerformanceMark('dropped',"
+        "{detail:{payload:new Uint8Array(8192)}});e.detail.owner=e;"
+        "if(!i)globalThis.discardedOwner=new WeakRef(e)}pocSummary='DROPPED'})()",
+        "(()=>{for(let i=0;i<32;i++){const e=new PerformanceMark('dropped',"
+        "{detail:{payload:new Uint8Array(8192)}}),l=new PerformanceObserverEntryList([e]);"
+        "e.detail.owner=l;if(!i)globalThis.discardedOwner=new WeakRef(l)}"
+        "pocSummary='DROPPED'})()",
     };
     static const char *const keep[] = {
         "globalThis.heldController=new AbortController();globalThis.heldSignal=heldController.signal;"
@@ -5301,6 +5543,15 @@ static int test_discarded_browser_state_ownership(unsigned kind)
         "globalThis.heldSlot=document.createElement('slot');heldRoot.appendChild(heldSlot);"
         "globalThis.heldChild=document.createElement('span');heldHost.appendChild(heldChild);"
         "heldHost.remove();pocSummary='HELD'",
+        "globalThis.heldCalls=0;(()=>{const o=new PerformanceObserver((list,self)=>{"
+        "heldCalls+=list.getEntries().length;globalThis.sameObserver=self===o});"
+        "globalThis.heldObserver=new WeakRef(o);Object.freeze(o);o.observe({type:'mark'});"
+        "performance.mark('kept')})();pocSummary='HELD'",
+        "globalThis.heldEntry=new PerformanceMark('kept',{startTime:7,detail:{value:17}});"
+        "heldEntry.detail.owner=heldEntry;Object.freeze(heldEntry);pocSummary='HELD'",
+        "(()=>{const e=new PerformanceMark('kept',{startTime:7,detail:{value:17}});"
+        "globalThis.heldList=new PerformanceObserverEntryList([e]);"
+        "e.detail.owner=heldList;Object.freeze(heldList)})();pocSummary='HELD'",
     };
     static const char *const verify[] = {
         "heldController.abort('kept');pocSummary=heldSignal.aborted&&heldSignal.reason==='kept'"
@@ -5309,6 +5560,13 @@ static int test_discarded_browser_state_ownership(unsigned kind)
         "&&heldRequest.source===heldSource&&heldSource.request===heldRequest?'LIVE':'LOST'",
         "document.body.appendChild(heldHost);pocSummary=heldHost.shadowRoot===heldRoot"
         "&&heldSlot.assignedNodes()[0]===heldChild?'LIVE':'LOST'",
+        "heldObserver.deref().disconnect();performance.clearMarks();"
+        "pocSummary=heldCalls===1&&sameObserver?'LIVE':'LOST'",
+        "pocSummary=heldEntry.name==='kept'&&heldEntry.startTime===7"
+        "&&heldEntry.detail.value===17&&heldEntry.detail.owner===heldEntry?'LIVE':'LOST'",
+        "(()=>{const e=heldList.getEntriesByName('kept','mark')[0];"
+        "pocSummary=e&&e.startTime===7&&e.detail.value===17&&e.detail.owner===heldList"
+        "&&heldList.getEntriesByType('mark')[0]===e?'LIVE':'LOST'})()",
     };
     Budget budget;
     budget_init(&budget, 24u * MIB);
@@ -5333,6 +5591,113 @@ static int test_discarded_browser_state_ownership(unsigned kind)
     CHECK(var_cache_eval(runtime, keep[kind], "HELD"));
     CHECK(collect_and_drain_finalizers(runtime, &result));
     CHECK(var_cache_eval(runtime, verify[kind], "LIVE"));
+    script_runtime_destroy(runtime);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    CHECK(released && after < before + 128u * 1024u);
+    return 0;
+}
+
+static int test_worker_state_ownership(unsigned kind)
+{
+    Budget budget;
+    budget_init(&budget, 24u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    ScriptRuntime *runtime = var_cache_runtime(&budget, &document, &sheet,
+        "<!doctype html><body></body>");
+    CHECK(runtime != NULL);
+    ScriptResult result = {0};
+    CHECK(var_cache_eval(runtime,
+        "(()=>{const u=URL.createObjectURL(new Blob([''])),w=new Worker(u);"
+        "w.terminate();URL.revokeObjectURL(u);pocSummary='WARM'})()", "WARM"));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    size_t before = script_runtime_heap_used(runtime);
+    if (kind == 0) {
+        CHECK(var_cache_eval(runtime,
+            "(()=>{const u=URL.createObjectURL(new Blob(['']));"
+            "for(let i=0;i<16;i++){const w=new Worker(u);w.payload=new Uint8Array(8192);"
+            "w.onmessage=()=>w.payload;if(!i)globalThis.deadWorker=new WeakRef(w);"
+            "w.terminate()}URL.revokeObjectURL(u);pocSummary='DROPPED'})()", "DROPPED"));
+    } else if (kind == 3) {
+        for (unsigned attempt = 0; attempt < 16; attempt++) {
+            tilefinch_test_faults()->refuse_next_worker_realm = true;
+            bool refused = var_cache_eval(runtime,
+                "(()=>{const u=URL.createObjectURL(new Blob(['']));let refused=false;"
+                "try{new Worker(u)}catch(e){refused=true}finally{URL.revokeObjectURL(u)}"
+                "pocSummary=refused?'REFUSED':'ADMITTED'})()", "REFUSED");
+            tilefinch_test_faults()->refuse_next_worker_realm = false;
+            CHECK(refused);
+        }
+    } else if (kind == 2) {
+        CHECK(var_cache_eval(runtime,
+            "globalThis.workerURL=URL.createObjectURL(new Blob(["
+            "`const payload=new Uint8Array(512*1024);onmessage=()=>payload[0];"
+            "performance.mark('held',{detail:payload});postMessage('READY')`]));"
+            "globalThis.ownershipWorker=new Worker(workerURL);"
+            "ownershipWorker.onmessage=e=>pocSummary=e.data;"
+            "pocSummary='STARTING'", "STARTING"));
+        CHECK(collect_and_drain_finalizers(runtime, &result));
+        CHECK(strcmp(result.summary, "READY") == 0);
+        CHECK(var_cache_eval(runtime,
+            "ownershipWorker.terminate();URL.revokeObjectURL(workerURL);"
+            "pocSummary='STOPPED'", "STOPPED"));
+    } else {
+        CHECK(var_cache_eval(runtime,
+            "globalThis.workerURL=URL.createObjectURL(new Blob(["
+            "`let ref;onmessage=e=>{if(e.data==='drop'){for(let i=0;i<32;i++){"
+            "const o=new PerformanceObserver(()=>o.payload);o.payload=new Uint8Array(8192);"
+            "if(i&1){o.observe({type:'mark'});o.disconnect()}if(!i)ref=new WeakRef(o)}"
+            "postMessage('DROPPED')}else if(e.data==='check')postMessage(ref.deref()===undefined?'COLLECTED':'RETAINED');"
+            "else{const o=new PerformanceObserver(list=>{o.disconnect();postMessage(list.getEntries()[0].name)});"
+            "Object.freeze(o);o.observe({type:'mark'});performance.mark('LIVE')}};postMessage('READY')`]));"
+            "globalThis.ownershipWorker=new Worker(workerURL);"
+            "ownershipWorker.onmessage=e=>pocSummary=e.data;"
+            "ownershipWorker.onerror=e=>{pocSummary='ERROR:'+e.message;e.preventDefault()};"
+            "pocSummary='STARTING'", "STARTING"));
+        CHECK(collect_and_drain_finalizers(runtime, &result));
+        CHECK(strcmp(result.summary, "READY") == 0);
+        before = script_runtime_heap_used(runtime);
+        CHECK(var_cache_eval(runtime, "ownershipWorker.postMessage('drop');pocSummary='WAIT'", "WAIT"));
+        CHECK(collect_and_drain_finalizers(runtime, &result));
+        CHECK(strcmp(result.summary, "DROPPED") == 0);
+    }
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    size_t after = script_runtime_heap_used(runtime);
+    bool released;
+    if (kind == 0) {
+        released = var_cache_eval(runtime,
+            "pocSummary=deadWorker.deref()===undefined?'COLLECTED':'RETAINED'", "COLLECTED");
+        CHECK(var_cache_eval(runtime,
+            "(()=>{const u=URL.createObjectURL(new Blob(['']));globalThis.heldWorker=new Worker(u);"
+            "heldWorker.terminate();URL.revokeObjectURL(u);globalThis.workerEvents=0;"
+            "heldWorker.onmessage=()=>workerEvents++;Object.freeze(heldWorker);pocSummary='HELD'})()", "HELD"));
+        CHECK(collect_and_drain_finalizers(runtime, &result));
+        CHECK(var_cache_eval(runtime,
+            "heldWorker.dispatchEvent(new MessageEvent('message'));"
+            "heldWorker.terminate();pocSummary=workerEvents===1?'LIVE':'LOST'", "LIVE"));
+    } else if (kind == 3) {
+        released = var_cache_eval(runtime,
+            "(()=>{const u=URL.createObjectURL(new Blob([''])),w=new Worker(u);"
+            "w.terminate();URL.revokeObjectURL(u);pocSummary='RETRIED'})()", "RETRIED");
+    } else if (kind == 2) {
+        released = var_cache_eval(runtime,
+            "ownershipWorker.dispatchEvent(new MessageEvent('message',{data:'LIVE'}));"
+            "ownershipWorker.terminate();pocSummary=pocSummary==='LIVE'?'LIVE':'LOST'", "LIVE");
+    } else {
+        CHECK(var_cache_eval(runtime, "ownershipWorker.postMessage('check');pocSummary='WAIT'", "WAIT"));
+        CHECK(collect_and_drain_finalizers(runtime, &result));
+        released = strcmp(result.summary, "COLLECTED") == 0;
+        CHECK(var_cache_eval(runtime, "ownershipWorker.postMessage('live');pocSummary='WAIT'", "WAIT"));
+        CHECK(collect_and_drain_finalizers(runtime, &result));
+        CHECK(strcmp(result.summary, "LIVE") == 0);
+        CHECK(var_cache_eval(runtime,
+            "ownershipWorker.terminate();URL.revokeObjectURL(workerURL);pocSummary='STOPPED'", "STOPPED"));
+    }
+    printf("worker-ownership kind=%u retained-delta=%lld released=%d\n", kind,
+        (long long)after - (long long)before, released);
     script_runtime_destroy(runtime);
     stylesheet_destroy(&sheet);
     document_destroy(&document);
@@ -7819,9 +8184,12 @@ static int test_dom_handle_table_exhaustion(void)
 }
 
 /* A news front page holds 9-10 thousand live elements and walks them all
-   (apnews.com: 9,322). The realistic PSP profile grows the handle table on
-   demand to SCRIPT_DOM_HANDLE_SLOT_CAPACITY_REALISTIC; strict keeps the
-   base table. Growth is Budget-admitted, a refusal is the ordinary clean
+   (apnews.com: 9,322). A top-level table starts at
+   SCRIPT_DOM_HANDLE_SLOT_INITIAL_TOP_LEVEL slots and doubles; the realistic
+   PSP profile doubles it to SCRIPT_DOM_HANDLE_SLOT_BUDGET_CAPACITY and then
+   grows it in memory-admitted steps up to the index bound,
+   SCRIPT_DOM_HANDLE_SLOT_CAPACITY_MAX; strict stops at
+   SCRIPT_DOM_HANDLE_SLOT_CAPACITY. A refusal is the ordinary clean
    exhaustion, and teardown returns every byte. */
 static ScriptRuntime *handle_scaling_runtime(
     PocDocument *document, Budget *budget, ScriptExecutionProfile profile,
@@ -7872,8 +8240,13 @@ static int test_dom_handle_table_scales_with_profile(void)
         { SCRIPT_EXECUTION_PROFILE_PSP_STRICT, "WALK-clean:",
           SCRIPT_DOM_HANDLE_SLOT_CAPACITY },
         { SCRIPT_EXECUTION_PROFILE_PSP_REALISTIC, "WALK-OK:12003",
-          SCRIPT_DOM_HANDLE_SLOT_CAPACITY_REALISTIC },
+          SCRIPT_DOM_HANDLE_SLOT_BUDGET_CAPACITY },
     };
+    /* Doublings from the initial table to the strict ceiling. */
+    size_t base_growths = 0;
+    for (size_t at = SCRIPT_DOM_HANDLE_SLOT_INITIAL_TOP_LEVEL;
+         at < SCRIPT_DOM_HANDLE_SLOT_CAPACITY; at *= 2u)
+        base_growths++;
     for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
         Budget budget;
         budget_init(&budget, 64u * MIB);
@@ -7885,7 +8258,7 @@ static int test_dom_handle_table_scales_with_profile(void)
             &document, &budget, cases[c].profile, &result);
         CHECK(runtime != NULL);
         CHECK(result.dom_handle_slot_capacity
-              == SCRIPT_DOM_HANDLE_SLOT_CAPACITY);
+              == SCRIPT_DOM_HANDLE_SLOT_INITIAL_TOP_LEVEL);
         CHECK(script_runtime_evaluate_diagnostic(
             runtime, walk, "<handle-walk>", &result));
         if (strncmp(result.summary, cases[c].expected,
@@ -7901,27 +8274,48 @@ static int test_dom_handle_table_scales_with_profile(void)
         }
         CHECK(result.dom_handle_slot_capacity == cases[c].capacity);
         if (cases[c].capacity == SCRIPT_DOM_HANDLE_SLOT_CAPACITY) {
-            CHECK(result.dom_handle_growths == 0
+            CHECK(result.dom_handle_growths == base_growths
                   && result.dom_handle_exhaustions != 0);
         } else {
-            CHECK(result.dom_handle_growths == 1
+            CHECK(result.dom_handle_growths == base_growths + 1u
                   && result.dom_handle_exhaustions == 0
                   && result.dom_handle_slots_high_water >= 12003u);
-            /* Exhaustion at the grown size is the same clean RangeError,
+            /* Past the Budget capacity the table grows by one step at a
+               time while memory allows. */
+            CHECK(script_runtime_evaluate_diagnostic(
+                runtime,
+                "(()=>{const keep=globalThis.__extraKeep=[];"
+                "for(let i=0;i<8000;i++)keep.push(document.createElement('b'));"
+                "globalThis.pocSummary='EXTRA-OK:'+keep.length;})()",
+                "<handle-extra>", &result));
+            CHECK(strcmp(result.summary, "EXTRA-OK:8000") == 0
+                  && result.dom_handle_exhaustions == 0
+                  && result.dom_handle_growths == base_growths + 2u
+                  && result.dom_handle_slot_capacity
+                         == SCRIPT_DOM_HANDLE_SLOT_BUDGET_CAPACITY
+                                + SCRIPT_DOM_HANDLE_SLOT_GROWTH_STEP);
+            /* At the index bound exhaustion is the same clean RangeError,
                and the realm recovers once the nodes are released. */
             CHECK(script_runtime_evaluate_diagnostic(
                 runtime,
-                "(()=>{const keep=globalThis.__extraKeep=[];let error='';"
-                "try{for(let i=0;i<8000;i++)"
+                "(()=>{const keep=globalThis.__extraKeep;let error='';"
+                "try{for(let i=0;i<70000;i++)"
                 "keep.push(document.createElement('b'));}catch(caught){"
                 "error=caught instanceof RangeError&&/DOM node handle table "
                 "exhausted/.test(caught.message)?'clean':String(caught);}"
-                "globalThis.pocSummary='EXTRA-'+error+':'+keep.length;})()",
+                "globalThis.pocSummary='BOUND-'+error+':'+keep.length;})()",
                 "<handle-exhaust>", &result));
-            CHECK(strncmp(result.summary, "EXTRA-clean:", 12) == 0
-                  && result.dom_handle_exhaustions != 0
-                  && result.dom_handle_slot_capacity
-                         == SCRIPT_DOM_HANDLE_SLOT_CAPACITY_REALISTIC);
+            if (strncmp(result.summary, "BOUND-clean:", 12) != 0
+                || result.dom_handle_exhaustions == 0
+                || result.dom_handle_slot_capacity
+                       != SCRIPT_DOM_HANDLE_SLOT_CAPACITY_MAX) {
+                fprintf(stderr, "handle bound: %s capacity=%zu refusals=%zu "
+                        "exhaustions=%zu\n", result.summary,
+                        result.dom_handle_slot_capacity,
+                        result.dom_handle_growth_refusals,
+                        result.dom_handle_exhaustions);
+                CHECK(false);
+            }
             CHECK(script_runtime_evaluate_diagnostic(
                 runtime,
                 "(()=>{globalThis.__extraKeep=null;let made=0;"
@@ -7987,13 +8381,502 @@ static int test_dom_handle_table_scales_with_profile(void)
             "globalThis.pocSummary='GREW:'+keep.length;})()",
             "<handle-grew>", &result)
               && result.dom_handle_slot_capacity
-                     == SCRIPT_DOM_HANDLE_SLOT_CAPACITY_REALISTIC);
+                     == SCRIPT_DOM_HANDLE_SLOT_BUDGET_CAPACITY);
+        CHECK(collect_and_drain_finalizers(runtime, &result));
+        script_runtime_destroy(runtime);
+        document_destroy(&document);
+        CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    }
+    /* Past the Budget capacity a step needs its bytes free beside the
+       presentation reserve. With less, the Budget would still admit the
+       step, but growth is refused: registration raises the same catchable
+       RangeError, the page keeps running, and with memory free again the
+       table grows. */
+    {
+        Budget budget;
+        budget_init(&budget, 64u * MIB);
+        CHECK(budget_install_lexbor(&budget));
+        PocDocument document;
+        static const char small[] = "<!doctype html><body></body>";
+        CHECK(document_parse(&document, &budget, small,
+                             sizeof(small) - 1u, 17));
+        ScriptResult result = {0};
+        ScriptRuntime *runtime = handle_scaling_runtime(
+            &document, &budget, SCRIPT_EXECUTION_PROFILE_PSP_REALISTIC,
+            &result);
+        CHECK(runtime != NULL);
+        CHECK(script_runtime_evaluate_diagnostic(
+            runtime,
+            "(()=>{const keep=globalThis.__fill=[];"
+            "for(let i=0;i<16310;i++)keep.push(document.createElement('b'));"
+            "globalThis.pocSummary='FILLED:'+keep.length;})()",
+            "<handle-fill>", &result)
+              && strcmp(result.summary, "FILLED:16310") == 0);
+        CHECK(result.dom_handle_slot_capacity
+              == SCRIPT_DOM_HANDLE_SLOT_BUDGET_CAPACITY);
+        size_t refusals = result.dom_handle_growth_refusals;
+        size_t limit = budget.limit;
+        budget.limit = budget.current
+            + SCRIPT_ADMISSION_PRESENTATION_RESERVE_BYTES + 32u * 1024u;
+        CHECK(script_runtime_evaluate_diagnostic(
+            runtime,
+            "(()=>{const keep=globalThis.__fill;let error='',caught=null;try{"
+            "for(let i=0;i<200;i++)keep.push(document.createElement('s'));"
+            "}catch(e){caught=e;}"
+            "error=caught instanceof RangeError&&/DOM node handle table "
+            "exhausted/.test(caught.message)?'clean':String(caught);"
+            "globalThis.pocSummary='REFUSED-'+error+':'"
+            "+(document.body.firstChild===null);})()",
+            "<handle-admission-refused>", &result));
+        bool refused = strcmp(result.summary, "REFUSED-clean:true") == 0
+            && result.dom_handle_growth_refusals > refusals
+            && result.dom_handle_slot_capacity
+                   == SCRIPT_DOM_HANDLE_SLOT_BUDGET_CAPACITY
+            && budget.current <= budget.limit;
+        budget.limit = limit;
+        if (!refused) {
+            fprintf(stderr, "handle admission refusal: %s capacity=%zu "
+                    "refusals=%zu\n", result.summary,
+                    result.dom_handle_slot_capacity,
+                    result.dom_handle_growth_refusals);
+            CHECK(false);
+        }
+        CHECK(script_runtime_evaluate_diagnostic(
+            runtime,
+            "(()=>{const keep=globalThis.__fill;"
+            "for(let i=0;i<200;i++)keep.push(document.createElement('q'));"
+            "globalThis.pocSummary='GREW:'+keep.length;})()",
+            "<handle-admission-grew>", &result)
+              && strncmp(result.summary, "GREW:", 5) == 0
+              && result.dom_handle_slot_capacity
+                     == SCRIPT_DOM_HANDLE_SLOT_BUDGET_CAPACITY
+                            + SCRIPT_DOM_HANDLE_SLOT_GROWTH_STEP);
         CHECK(collect_and_drain_finalizers(runtime, &result));
         script_runtime_destroy(runtime);
         document_destroy(&document);
         CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
     }
     free(html);
+    return 0;
+}
+
+/* A page of web components (Internet Archive's search: lit templates in
+   shadow roots) clones a template for every component and walks each clone
+   with a TreeWalker to find its parts. Every node the walk touches keeps
+   its handle while it is connected, after its wrapper is gone, so the table
+   holds every rendered node: about 24 thousand on that page. With the table
+   capped at 16,352 slots the walk past that threw "DOM node handle table
+   exhausted" from createComment, and the components after it stayed empty.
+   The realistic profile grows past it while memory allows. */
+static int test_dom_handle_table_holds_component_pages(void)
+{
+    static const char page[] = "<!doctype html><body></body>";
+    static const char build[] =
+        "(()=>{const template=document.createElement('template');"
+        "template.innerHTML='<div class=tile><!--?lit$1$--><h3><!--?-->"
+        "title</h3>\\n <span><!--?--></span>\\n <a href=#><!--?--></a>"
+        "\\n <p>a\\n<b>b</b>\\n</p></div>';"
+        "let built=0,walked=0,error='';"
+        "try{for(let i=0;i<1000;i++){"
+        "const host=document.createElement('section');"
+        "document.body.appendChild(host);"
+        "const root=host.attachShadow({mode:'open'});"
+        "const clone=document.importNode(template.content,true);"
+        "const walker=document.createTreeWalker(clone,133);"
+        "while(walker.nextNode())walked++;"
+        "root.appendChild(clone);"
+        "root.appendChild(document.createComment('end'));built++;}"
+        "}catch(caught){error=String(caught);}"
+        "globalThis.pocSummary=error?'BUILD-'+error+':'+built"
+        ":'BUILD-OK:'+built+':'+walked;})()";
+    Budget budget;
+    budget_init(&budget, 64u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    CHECK(document_parse(&document, &budget, page, sizeof(page) - 1u, 17));
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = handle_scaling_runtime(
+        &document, &budget, SCRIPT_EXECUTION_PROFILE_PSP_REALISTIC, &result);
+    CHECK(runtime != NULL);
+    CHECK(script_runtime_evaluate_diagnostic(runtime, build, "<components>",
+                                             &result));
+    if (strncmp(result.summary, "BUILD-OK:1000:", 14) != 0
+        || result.dom_handle_exhaustions != 0
+        || result.dom_handle_slot_capacity
+               <= SCRIPT_DOM_HANDLE_SLOT_BUDGET_CAPACITY) {
+        fprintf(stderr, "component page: %s capacity=%zu high-water=%zu "
+                "exhaustions=%zu refusals=%zu\n", result.summary,
+                result.dom_handle_slot_capacity,
+                result.dom_handle_slots_high_water,
+                result.dom_handle_exhaustions,
+                result.dom_handle_growth_refusals);
+        CHECK(false);
+    }
+    /* The walk's wrappers are garbage now; the connected nodes keep their
+       slots, and walking them again reuses those handles. */
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    size_t high_water = result.dom_handle_slots_high_water;
+    CHECK(script_runtime_evaluate_diagnostic(
+        runtime,
+        "(()=>{let seen=0;for(const host of document.body.children){"
+        "const walker=document.createTreeWalker(host.shadowRoot,133);"
+        "while(walker.nextNode())seen++;}"
+        "globalThis.pocSummary='REWALK:'+seen;})()",
+        "<components-rewalk>", &result));
+    CHECK(strncmp(result.summary, "REWALK:", 7) == 0
+          && result.dom_handle_exhaustions == 0
+          && result.dom_handle_slots_high_water == high_water);
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* A connected node whose wrapper died gives its slot back at an owner turn
+   when nothing names its handle; its next wrapper is built as on a first
+   access, with a new handle. Nothing a page can see changes: listeners,
+   handler properties, expandos, weak keys, form control state, focus,
+   shadow roots and observers all survive, and the old handle resolves to
+   nothing even once its slot holds another node. Slots whose handles a
+   native record or a bootstrap hold names keep them. */
+static int test_dom_handle_release_connected_slots(void)
+{
+    static const char html[] =
+        "<!doctype html><body><div id=tiles></div>"
+        "<button id=listen>l</button><button id=onx>o</button>"
+        "<p id=expando></p><p id=wm></p><input id=in><input id=cb "
+        "type=checkbox><textarea id=ta></textarea><select id=sel>"
+        "<option value=1 id=opt1>1</option><option value=2 id=opt2>2"
+        "</option></select><button id=focus>f</button><div id=host></div>"
+        "<div id=obs><span>s</span></div><p id=weak></p><p id=pin></p>"
+        "</body>";
+    static const char build_tiles[] =
+        "(()=>{const tiles=document.getElementById('tiles');"
+        "for(let i=0;i<400;i++){const d=document.createElement('div');"
+        "d.innerHTML='<span>a</span>b<i>c</i>';tiles.appendChild(d);}"
+        "const w=document.createTreeWalker(tiles,133);let n=0;"
+        "while(w.nextNode())n++;globalThis.pocSummary='TILES:'+n;})()";
+    Budget budget;
+    budget_init(&budget, 32u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_with_session(
+        &document, &budget, 8u * MIB, 4000,
+        "https://handle-release.test/", NULL, &result);
+    CHECK(runtime != NULL);
+    CHECK(script_runtime_evaluate_diagnostic(
+        runtime,
+        "(()=>{const g=id=>document.getElementById(id);globalThis.g=g;"
+        "const tiles=g('tiles');"
+        "for(let i=0;i<400;i++){const d=document.createElement('div');"
+        "d.innerHTML='<span>a</span>b<i>c</i>';tiles.appendChild(d);}"
+        "const w=document.createTreeWalker(tiles,133);let n=0;"
+        "while(w.nextNode())n++;"
+        "globalThis.stale=tiles.firstElementChild.__handle;"
+        "globalThis.clicks=0;globalThis.onx=0;"
+        "g('listen').addEventListener('click',()=>clicks++);"
+        "g('onx').onclick=()=>onx++;g('expando').foo=7;"
+        "globalThis.wm=new WeakMap();wm.set(g('wm'),8);"
+        "g('in').value='typed';g('cb').checked=true;g('ta').value='area';"
+        "g('opt2').selected=true;g('focus').focus();"
+        "g('host').attachShadow({mode:'open'}).innerHTML='<b>in</b>';"
+        "globalThis.records=[];globalThis.mo=new MutationObserver(r=>{"
+        "for(const x of r)records.push(x);});mo.observe(g('obs'),{subtree:"
+        "true,attributes:true,childList:true,characterData:true});"
+        "globalThis.weakH=g('weak').__handle;globalThis.pinH=g('pin').__handle;"
+        "globalThis.pocSummary='SET:'+n+':'+stale+':'+weakH+':'+pinH;})()",
+        "<release-set>", &result));
+    long long walked = 0, stale = 0, weak_handle = 0, pin_handle = 0;
+    CHECK(sscanf(result.summary, "SET:%lld:%lld:%lld:%lld", &walked, &stale,
+                 &weak_handle, &pin_handle) == 4 && walked == 2400);
+    /* Native holders: a weak handle, and a pin released again (the pin is
+       one bit any holder's release clears; the handle stays kept). */
+    lxb_dom_node_t *weak_node =
+        script_runtime_node_handle_resolve(runtime, (long) weak_handle);
+    lxb_dom_node_t *pin_node =
+        script_runtime_node_handle_resolve(runtime, (long) pin_handle);
+    CHECK(weak_node != NULL && pin_node != NULL
+          && script_runtime_node_weak_handle(runtime, weak_node)
+                 == (long) weak_handle
+          && script_runtime_node_handle(runtime, pin_node)
+                 == (long) pin_handle);
+    script_runtime_node_handle_release(runtime, (long) pin_handle);
+    size_t live_before = result.dom_handle_slots_live;
+    size_t releases_before = result.dom_handle_connected_releases;
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    if (result.dom_handle_connected_releases < releases_before + 2000u
+        || result.dom_handle_slots_live + 2000u > live_before) {
+        fprintf(stderr, "connected release: live %zu -> %zu releases %zu -> "
+                "%zu preserves=%zu\n", live_before,
+                result.dom_handle_slots_live, releases_before,
+                result.dom_handle_connected_releases,
+                result.dom_handle_connected_preserves);
+        CHECK(false);
+    }
+    CHECK(script_runtime_node_handle_resolve(runtime, (long) stale) == NULL
+          && script_runtime_node_handle_resolve(runtime, (long) weak_handle)
+                 == weak_node
+          && script_runtime_node_handle_resolve(runtime, (long) pin_handle)
+                 == pin_node);
+    CHECK(script_runtime_evaluate_diagnostic(
+        runtime,
+        "(()=>{const out=[],tiles=g('tiles'),first=tiles.firstElementChild;"
+        "if(__tilefinchNodeWrapper(stale)!==null)out.push('stale');"
+        "if(first.__handle===stale)out.push('same-handle');"
+        "if(first!==tiles.firstElementChild||first!==tiles.children[0]"
+        "||!first.isSameNode(tiles.childNodes[0]))out.push('identity');"
+        "if(first.parentNode!==tiles||!tiles.contains(first)"
+        "||first.textContent!=='abc')out.push('tree');"
+        "if(tiles.querySelectorAll('i').length!==400)out.push('query');"
+        "g('listen').click();if(clicks!==1)out.push('listener');"
+        "g('onx').click();if(onx!==1)out.push('handler');"
+        "if(g('expando').foo!==7)out.push('expando');"
+        "if(wm.get(g('wm'))!==8)out.push('weakmap');"
+        "if(g('in').value!=='typed')out.push('input');"
+        "if(g('cb').checked!==true)out.push('checkbox');"
+        "if(g('ta').value!=='area')out.push('textarea');"
+        "if(!g('opt2').selected||g('sel').value!=='2')out.push('option');"
+        "if(document.activeElement!==g('focus'))out.push('focus');"
+        "const sr=g('host').shadowRoot;if(!sr||sr!==g('host').shadowRoot"
+        "||sr.firstChild.textContent!=='in')out.push('shadow');"
+        "if(g('weak').__handle!==weakH||g('pin').__handle!==pinH)"
+        "out.push('kept');"
+        "const span=g('obs').querySelector('span');globalThis.target=span;"
+        "span.setAttribute('data-x','1');span.firstChild.data='changed';"
+        "globalThis.pocSummary=out.length?out.join():'CHECK-OK';})()",
+        "<release-check>", &result));
+    if (strcmp(result.summary, "CHECK-OK") != 0)
+        fprintf(stderr, "connected release: %s\n", result.summary);
+    CHECK(strcmp(result.summary, "CHECK-OK") == 0);
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    /* The observer fires for a node whose wrapper (and slot) it never had,
+       with the node's current wrapper as the target. */
+    CHECK(script_runtime_evaluate_diagnostic(
+        runtime,
+        "globalThis.pocSummary=records.length===2&&records[0].target===target"
+        "&&records[0].attributeName==='data-x'&&records[1].type==="
+        "'characterData'&&records[1].target===target.firstChild"
+        "?'OBSERVED':'OBSERVED-'+records.length",
+        "<release-observed>", &result));
+    CHECK(strcmp(result.summary, "OBSERVED") == 0);
+    /* New nodes take the released slots; the old handle still names
+       nothing. */
+    size_t reuses_before = result.dom_handle_slot_reuses;
+    CHECK(script_runtime_evaluate_diagnostic(runtime, build_tiles,
+                                             "<release-reuse>", &result)
+          && strcmp(result.summary, "TILES:4800") == 0
+          && result.dom_handle_slot_reuses >= reuses_before + 2000u);
+    CHECK(script_runtime_evaluate_diagnostic(
+        runtime,
+        "globalThis.pocSummary=__tilefinchNodeWrapper(stale)===null"
+        "&&g('tiles').firstElementChild.__handle!==stale?'STALE-OK':'STALE'",
+        "<release-stale>", &result));
+    CHECK(strcmp(result.summary, "STALE-OK") == 0
+          && script_runtime_node_handle_resolve(runtime, (long) stale)
+                 == NULL);
+    /* While the bootstrap holds raw handles across turns, connected slots
+       are kept. */
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    CHECK(script_runtime_evaluate_diagnostic(
+        runtime, "__tilefinchHoldHandleRelease(true);",
+        "<release-hold>", &result));
+    CHECK(script_runtime_evaluate_diagnostic(runtime, build_tiles,
+                                             "<release-held-walk>", &result));
+    size_t held_releases = result.dom_handle_connected_releases;
+    CHECK(collect_and_drain_finalizers(runtime, &result)
+          && result.dom_handle_connected_releases == held_releases);
+    CHECK(script_runtime_evaluate_diagnostic(
+        runtime, "__tilefinchHoldHandleRelease(false);",
+        "<release-unhold>", &result));
+    CHECK(collect_and_drain_finalizers(runtime, &result)
+          && result.dom_handle_connected_releases > held_releases);
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+/* Tables start small and double: a top-level document at
+   SCRIPT_DOM_HANDLE_SLOT_INITIAL_TOP_LEVEL slots, a child frame's realm at
+   SCRIPT_DOM_HANDLE_SLOT_INITIAL_CHILD_FRAME. Below the strict ceiling a
+   full table grows before it reclaims, so a page that drops wrappers in a
+   loop gets a bigger table rather than a collection, and the grown table
+   keeps every handle it gave out. */
+static int test_dom_handle_table_starts_small(void)
+{
+    static const struct {
+        ScriptDocumentScope scope;
+        size_t initial;
+    } cases[] = {
+        { SCRIPT_DOCUMENT_SCOPE_TOP_LEVEL,
+          SCRIPT_DOM_HANDLE_SLOT_INITIAL_TOP_LEVEL },
+        { SCRIPT_DOCUMENT_SCOPE_CHILD_FRAME,
+          SCRIPT_DOM_HANDLE_SLOT_INITIAL_CHILD_FRAME },
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        Budget budget;
+        budget_init(&budget, 64u * MIB);
+        CHECK(budget_install_lexbor(&budget));
+        PocDocument document;
+        static const char html[] = "<!doctype html><body><p id=a>a</p>";
+        CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u,
+                             17));
+        ViewportContext viewport;
+        ScriptExecutionPolicy policy;
+        CHECK(viewport_context_init(&viewport, 480, 272, 480, 272)
+              && script_execution_policy_for_profile(
+                     SCRIPT_EXECUTION_PROFILE_PSP_REALISTIC, &policy));
+        ScriptRuntimeOptions options = {
+            .viewport = viewport,
+            .execution_policy = policy,
+            .document_scope = cases[c].scope,
+        };
+        ScriptResult result = {0};
+        ScriptRuntime *runtime = script_runtime_create_configured(
+            &document, &budget, 24u * MIB, 60000,
+            "https://handle-small.test/", &options, &result);
+        CHECK(runtime != NULL);
+        CHECK(result.dom_handle_slot_capacity == cases[c].initial
+              && result.dom_handle_growths == 0);
+        /* Hold three tables' worth, then check the first handle still
+           names its node: two doublings, handles unchanged. */
+        char script[512];
+        snprintf(script, sizeof(script),
+            "(()=>{const first=document.getElementById('a');"
+            "const keep=globalThis.__keep=[];"
+            "for(let i=0;i<%zu;i++)keep.push(document.createElement('b'));"
+            "globalThis.pocSummary=document.getElementById('a')===first"
+            "&&first.textContent==='a'?'SMALL-OK:'+keep.length:'SMALL-BAD';"
+            "})()", cases[c].initial * 3u);
+        CHECK(script_runtime_evaluate_diagnostic(
+            runtime, script, "<handle-small>", &result));
+        CHECK(strncmp(result.summary, "SMALL-OK:", 9) == 0);
+        CHECK(result.dom_handle_slot_capacity == cases[c].initial * 4u
+              && result.dom_handle_growths == 2
+              && result.dom_handle_exhaustions == 0);
+        /* Dropped wrappers made in one script: the table grows (it would
+           have had room at the old fixed size) instead of reclaiming. */
+        size_t reuses = result.dom_handle_slot_reuses;
+        snprintf(script, sizeof(script),
+            "(()=>{globalThis.__keep=null;let made=0;"
+            "for(let i=0;i<%zu;i++){document.createElement('u');made++;}"
+            "globalThis.pocSummary='DROPPED:'+made;})()",
+            cases[c].initial * 3u);
+        CHECK(script_runtime_evaluate_diagnostic(
+            runtime, script, "<handle-dropped>", &result));
+        CHECK(strncmp(result.summary, "DROPPED:", 8) == 0
+              && result.dom_handle_exhaustions == 0);
+        if (result.dom_handle_slot_capacity != cases[c].initial * 8u
+            || result.dom_handle_slot_reuses != reuses)
+            fprintf(stderr, "handle small scope=%d: capacity=%zu "
+                    "reuses=%zu->%zu growths=%zu\n", (int) cases[c].scope,
+                    result.dom_handle_slot_capacity, reuses,
+                    result.dom_handle_slot_reuses, result.dom_handle_growths);
+        CHECK(result.dom_handle_slot_capacity == cases[c].initial * 8u
+              && result.dom_handle_slot_reuses == reuses);
+        CHECK(collect_and_drain_finalizers(runtime, &result));
+        script_runtime_destroy(runtime);
+        document_destroy(&document);
+        CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    }
+    return 0;
+}
+
+/* The mutation journal is allocated on a realm's first connected mutation:
+   a realm that never changes its document (most child frames) holds none.
+   When the Budget refuses it, the change goes unrecorded and the next
+   consume reports an overflowed journal whose roots were lost, so the
+   owner rebuilds rather than trusting an empty journal. */
+static int test_mutation_journal_allocated_on_first_use(void)
+{
+    Budget budget;
+    budget_init(&budget, 48u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    static const char html[] =
+        "<!doctype html><body><p id=a>a</p><p id=b>b</p></body>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_with_session(
+        &document, &budget, 24u * MIB, 60000,
+        "https://journal-lazy.test/", NULL, &result);
+    CHECK(runtime != NULL);
+    /* Bootstrap and reads leave it unallocated. */
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "globalThis.pocSummary=document.getElementById('a')"
+              ".textContent+document.querySelectorAll('p').length",
+              "<journal-read>", &result)
+          && strcmp(result.summary, "a2") == 0);
+    CHECK(runtime->bridge.mutations == NULL);
+    CHECK(script_runtime_pending_journal(runtime) == NULL);
+    ScriptMutationJournal *taken = malloc(sizeof(*taken));
+    CHECK(taken != NULL);
+    CHECK(!script_runtime_consume_mutations(runtime, taken));
+    /* A detached construction tree is not journaled either. */
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "const d=document.createElement('div');d.textContent='x';"
+              "d.setAttribute('class','c');globalThis.pocSummary='detached'",
+              "<journal-detached>", &result));
+    CHECK(runtime->bridge.mutations == NULL);
+    /* The first connected change allocates and records it. */
+    size_t before = budget.current;
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, "document.getElementById('a').className='on'",
+              "<journal-first>", &result));
+    CHECK(runtime->bridge.mutations != NULL
+          && budget.current >= before + sizeof(ScriptMutationJournal));
+    CHECK(script_runtime_pending_journal(runtime) == runtime->bridge.mutations
+          && script_runtime_has_pending_mutations(runtime));
+    CHECK(script_runtime_consume_mutations(runtime, taken)
+          && taken->count == 1u && !taken->overflowed
+          && taken->records[0].kind == SCRIPT_MUTATION_ATTRIBUTE);
+    /* Consumed, the storage stays for the next turn. */
+    CHECK(runtime->bridge.mutations != NULL
+          && runtime->bridge.mutations->count == 0u);
+
+    /* A refused allocation: nothing is recorded, and the consume reports
+       the conservative overflow, once. */
+    budget_free(runtime->budget, runtime->bridge.mutations);
+    runtime->bridge.mutations = NULL;
+    size_t limit = budget.limit;
+    budget.limit = budget.current;
+    CHECK(js_rt_bridge_journal(&runtime->bridge) == NULL
+          && runtime->bridge.mutations_unrecorded);
+    budget.limit = limit;
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, "document.getElementById('b').remove();"
+              "globalThis.pocSummary='removed'",
+              "<journal-refused>", &result)
+          && strcmp(result.summary, "removed") == 0);
+    /* No retry until the unrecorded change has been consumed. */
+    CHECK(runtime->bridge.mutations == NULL);
+    CHECK(script_runtime_has_pending_mutations(runtime)
+          && script_runtime_has_pending_resource_mutations(runtime)
+          && script_runtime_pending_journal(runtime) == NULL);
+    CHECK(script_runtime_consume_mutations(runtime, taken)
+          && taken->count == 0u && taken->overflowed
+          && taken->overflow_roots_lost && taken->retirement_unobserved
+          && taken->conservative_resource_scan
+          && taken->resource_rebuild_required);
+    CHECK(!runtime->bridge.mutations_unrecorded
+          && !script_runtime_consume_mutations(runtime, taken));
+    /* With memory again, the next change journals normally. */
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, "document.getElementById('a').className='off'",
+              "<journal-again>", &result));
+    CHECK(runtime->bridge.mutations != NULL
+          && script_runtime_consume_mutations(runtime, taken)
+          && taken->count == 1u && !taken->overflowed);
+    free(taken);
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
     return 0;
 }
 
@@ -8632,9 +9515,30 @@ int main(int argc, char **argv)
         return test_discarded_browser_state_ownership(1);
     if (argc == 2 && strcmp(argv[1], "--slot-ownership-only") == 0)
         return test_discarded_browser_state_ownership(2);
+    if (argc == 2 && strcmp(argv[1], "--performance-observer-ownership-only") == 0)
+        return test_discarded_browser_state_ownership(3);
+    if (argc == 2 && strcmp(argv[1], "--performance-entry-ownership-only") == 0)
+        return test_discarded_browser_state_ownership(4);
+    if (argc == 2 && strcmp(argv[1], "--performance-list-ownership-only") == 0)
+        return test_discarded_browser_state_ownership(5);
+    if (argc == 2 && strcmp(argv[1], "--worker-ownership-only") == 0)
+        return test_worker_state_ownership(0);
+    if (argc == 2 && strcmp(argv[1], "--worker-observer-ownership-only") == 0)
+        return test_worker_state_ownership(1);
+    if (argc == 2 && strcmp(argv[1], "--worker-retirement-ownership-only") == 0)
+        return test_worker_state_ownership(2);
+    if (argc == 2 && strcmp(argv[1], "--worker-refusal-ownership-only") == 0)
+        return test_worker_state_ownership(3);
+    CHECK(test_worker_state_ownership(0) == 0);
+    CHECK(test_worker_state_ownership(1) == 0);
+    CHECK(test_worker_state_ownership(2) == 0);
+    CHECK(test_worker_state_ownership(3) == 0);
     CHECK(test_discarded_browser_state_ownership(0) == 0);
     CHECK(test_discarded_browser_state_ownership(1) == 0);
     CHECK(test_discarded_browser_state_ownership(2) == 0);
+    CHECK(test_discarded_browser_state_ownership(3) == 0);
+    CHECK(test_discarded_browser_state_ownership(4) == 0);
+    CHECK(test_discarded_browser_state_ownership(5) == 0);
     if (argc == 2 && strcmp(argv[1], "--detached-style-only") == 0)
         return test_detached_style_ownership();
     CHECK(test_detached_style_ownership() == 0);
@@ -8720,6 +9624,8 @@ int main(int argc, char **argv)
     CHECK(test_device_answer_checkpoint() == 0);
     if (argc == 2 && strcmp(argv[1], "--sibling-scopes-only") == 0)
         return test_computed_style_sibling_scopes();
+    if (argc == 2 && strcmp(argv[1], "--dependency-scans-only") == 0)
+        return test_computed_style_dependency_scans();
     if (argc == 2 && strcmp(argv[1], "--style-no-cascade-only") == 0)
         return test_computed_style_reads_without_cascade();
     if (argc == 2 && strcmp(argv[1], "--script-split-only") == 0)
@@ -8740,7 +9646,10 @@ int main(int argc, char **argv)
     CHECK(test_identical_cssom_write_is_not_a_mutation() == 0);
     if (argc == 2 && strcmp(argv[1], "--handle-table-only") == 0)
         return test_dom_handle_table_exhaustion()
-            || test_dom_handle_table_scales_with_profile();
+            || test_dom_handle_table_scales_with_profile()
+            || test_dom_handle_table_holds_component_pages()
+            || test_dom_handle_release_connected_slots()
+            || test_dom_handle_table_starts_small();
     if (argc == 2 && strcmp(argv[1], "--parser-timers-only") == 0)
         return test_parser_timer_checkpoint();
     CHECK(test_parser_timer_checkpoint() == 0);
@@ -8830,6 +9739,10 @@ int main(int argc, char **argv)
     CHECK(test_dom_order_without_sibling_wrappers() == 0);
     CHECK(test_dom_handle_table_exhaustion() == 0);
     CHECK(test_dom_handle_table_scales_with_profile() == 0);
+    CHECK(test_dom_handle_table_holds_component_pages() == 0);
+    CHECK(test_dom_handle_release_connected_slots() == 0);
+    CHECK(test_dom_handle_table_starts_small() == 0);
+    CHECK(test_mutation_journal_allocated_on_first_use() == 0);
     CHECK(test_stream_and_xhr_private_state_reclamation() == 0);
     CHECK(test_response_body_release_with_retained_wrappers() == 0);
     CHECK(test_runtime_task_time_slice() == 0);
@@ -8839,9 +9752,15 @@ int main(int argc, char **argv)
     CHECK(test_computed_style_native_cooperation() == 0);
     CHECK(test_computed_style_memo_invalidation() == 0);
     CHECK(test_computed_style_ancestor_cache() == 0);
+    if (argc == 2 && strcmp(argv[1], "--style-cell-buffer-only") == 0)
+        return test_computed_style_cache_holds_cell_buffer();
+    CHECK(test_computed_style_cache_holds_cell_buffer() == 0);
+    CHECK(test_computed_style_cache_fills_vacated_slots() == 0);
+    CHECK(test_computed_style_cache_replacement_patterns() == 0);
     CHECK(test_script_split_attributes_bridge_work() == 0);
     CHECK(test_computed_style_reads_without_cascade() == 0);
     CHECK(test_computed_style_sibling_scopes() == 0);
+    CHECK(test_computed_style_dependency_scans() == 0);
     CHECK(test_computed_style_container_cache(false) == 0);
     CHECK(test_computed_style_container_cache(true) == 0);
     CHECK(test_computed_style_scoped_invalidation() == 0);
@@ -10153,7 +11072,6 @@ int main(int argc, char **argv)
           && result.nonpreemptible_compile_count == 0
           && result.nonpreemptible_callback_count == 0);
 
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
     puts("test: watchdog aborts an admitted compile through parser polls");
     size_t abort_source_length = 48u * 1024u;
     char *abort_source = malloc(abort_source_length + 1);
@@ -10188,7 +11106,6 @@ int main(int argc, char **argv)
           && strcmp(result.summary, "RESPONSIVE-AFTER-ABORT") == 0
           && result.last_compile_admission
                == SCRIPT_COMPILE_ADMISSION_ACCEPTED);
-#endif
 
     puts("test: null external script completion is successful");
     size_t loaded_before_null = result.external_scripts_loaded;
@@ -11527,8 +12444,13 @@ int main(int argc, char **argv)
         "const stateError=g.getError()===g.INVALID_ENUM&&!g.isContextLost();"
         "const emptyRead=new Uint8Array(0);g.readPixels(0,0,0,0,g.RGBA,"
         "g.UNSIGNED_BYTE,emptyRead);const zeroRead=g.getError()===g.NO_ERROR;"
-        "g.blendFuncSeparate(g.ONE,g.ZERO,g.SRC_ALPHA,g.ONE_MINUS_SRC_ALPHA);"
-        "const splitError=g.getError()===g.INVALID_OPERATION;"
+        /* Split alpha factors are accepted: the opaque drawing buffer never
+           shows alpha, so the colour factors apply to all four channels. */
+        "g.blendFuncSeparate(g.SRC_ALPHA,g.ONE_MINUS_SRC_ALPHA,g.ONE,"
+        "g.ONE_MINUS_SRC_ALPHA);"
+        "const splitError=g.getError()===g.NO_ERROR"
+        "&&g.getParameter(g.BLEND_SRC_RGB)===g.SRC_ALPHA"
+        "&&g.getParameter(g.BLEND_DST_RGB)===g.ONE_MINUS_SRC_ALPHA;"
         "c.width=640;c.height=480;const boundedSize=g.drawingBufferWidth===362"
         "&&g.drawingBufferHeight===272;g.clearColor(.25,.5,.75,1);"
         "g.clear(g.COLOR_BUFFER_BIT|g.DEPTH_BUFFER_BIT);g.finish();"
@@ -13803,7 +14725,8 @@ int main(int argc, char **argv)
         "(()=>{const node=document.createElement('section');"
         "node.setAttribute('data-tilefinch-wrapper-probe','connected');"
         "document.body.appendChild(node);globalThis.__tilefinchProbeHandle="
-        "node.__handle;globalThis.__tilefinchProbeOldLease="
+        "node.__handle;__tilefinchKeepNodeHandle(node.__handle);"
+        "globalThis.__tilefinchProbeOldLease="
         "node.__tilefinchHandleLease;globalThis.pocSummary="
         "typeof WeakRef==='function'&&typeof FinalizationRegistry==='function'"
         "&&node.__tilefinchHandleLease>0"
@@ -13813,24 +14736,31 @@ int main(int argc, char **argv)
               runtime, connected_wrapper_setup,
               "<connected-wrapper-setup>", &result)
           && strcmp(result.summary, "WEAK-NODE-CACHE-SETUP-OK") == 0);
-    size_t connected_preserves_before =
-        result.dom_handle_connected_preserves;
+    size_t connected_releases_before =
+        result.dom_handle_connected_releases;
     bool connected_collected = collect_and_drain_finalizers(
         runtime, &result)
         && collect_and_drain_finalizers(runtime, &result);
-    if (!connected_collected || result.dom_handle_connected_preserves
-        <= connected_preserves_before) {
+    if (!connected_collected || result.dom_handle_connected_releases
+        <= connected_releases_before) {
         fprintf(stderr, "connected wrapper collection: ok=%d live=%zu "
-                "peak=%zu releases=%zu preserves=%zu stale=%zu\n",
+                "peak=%zu releases=%zu preserves=%zu connected-releases=%zu "
+                "stale=%zu\n",
                 connected_collected, result.dom_handle_slots_live,
                 result.dom_handle_slots_peak,
                 result.dom_handle_wrapper_releases,
                 result.dom_handle_connected_preserves,
+                result.dom_handle_connected_releases,
                 result.dom_handle_stale_releases);
     }
+    /* The connected nodes the reuse probe left without a wrapper (its host,
+       the re-appended text and the reattached span) name their handles
+       nowhere, so their slots are released (7d4d7636); the probe's section
+       keeps its slot because the probe keeps its handle, as any table that
+       stores a raw handle across owner turns must. */
     CHECK(connected_collected
-          && result.dom_handle_connected_preserves
-               > connected_preserves_before);
+          && result.dom_handle_connected_releases
+               > connected_releases_before);
 
     /* Reacquiring a connected native node after its wrapper is collected
        keeps the handle stable.  The old lease models a cleanup job that was
@@ -13932,6 +14862,7 @@ int main(int argc, char **argv)
         "document.body.appendChild(host);const kept=[];"
         "for(let i=0;i<2000;i++){const s=document.createElement('span');"
         "host.appendChild(s);kept.push(s.__handle);"
+        "__tilefinchKeepNodeHandle(s.__handle);"
         "document.createTextNode('t'+i).__handle;}"
         "globalThis.__tilefinchIndexKept=kept;__tilefinchClearNodeCache();"
         "globalThis.pocSummary='DOM-HANDLE-INDEX-SETUP';})()";

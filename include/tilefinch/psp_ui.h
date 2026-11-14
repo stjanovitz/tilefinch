@@ -179,6 +179,17 @@ typedef struct {
     const char *value;
 } PspUiPageDialogView;
 
+/* The browser's microphone question (tilefinch/media_capture.h), over the
+   page with the real address bar above it. host is the top-level page's
+   ASCII host, never page text. selection is the highlighted row: 0 Allow
+   this time, 1 Always allow on this site (skipped when !can_remember),
+   2 Block. */
+typedef struct {
+    const char *host;
+    bool can_remember;
+    uint8_t selection;
+} PspUiMicrophonePromptView;
+
 typedef enum {
     PSP_UI_BUTTON_UP       = 1u << 0,
     PSP_UI_BUTTON_DOWN     = 1u << 1,
@@ -295,6 +306,11 @@ typedef enum {
     PSP_UI_ACTION_HEAVY_RUN_ALWAYS,
     PSP_UI_ACTION_HEAVY_CANCEL,
     PSP_UI_ACTION_HEAVY_STOP_SCRIPTS,
+    /* The "load without scripts?" offer for a site whose page last ran
+       out of script memory: X accepts (site JavaScript off, reload), O
+       declines. */
+    PSP_UI_ACTION_SCRIPTS_OFF_ACCEPT,
+    PSP_UI_ACTION_SCRIPTS_OFF_DECLINE,
     PSP_UI_ACTION_EXIT,
     PSP_UI_ACTION_YOUTUBE_LOGIN_SAVE,
     PSP_UI_ACTION_YOUTUBE_LOGIN_ALWAYS,
@@ -305,7 +321,9 @@ typedef enum {
     PSP_UI_ACTION_CONFIRM_FILE_DOWNLOAD,
     PSP_UI_ACTION_CANCEL_FILE_DOWNLOAD,
     PSP_UI_ACTION_CONFIRM_ZIP_INSTALL,
-    PSP_UI_ACTION_CANCEL_ZIP_INSTALL
+    PSP_UI_ACTION_CANCEL_ZIP_INSTALL,
+    /* Page tools > Stop microphone: end the page's capture now. */
+    PSP_UI_ACTION_STOP_MICROPHONE
 } PspUiAction;
 
 /* Stable diagnostic spelling shared by the operation journal and validation
@@ -547,7 +565,10 @@ typedef enum {
     PSP_UI_SCREEN_ZIP_INSTALL,
     /* A page's simple dialog, over the page. Shown only by the modal loop
        in psp_app_page_dialog.c, which owns its input. */
-    PSP_UI_SCREEN_PAGE_DIALOG
+    PSP_UI_SCREEN_PAGE_DIALOG,
+    /* The browser's microphone question, over the page. Shown only by the
+       modal loop in psp_app_media_capture.c, which owns its input. */
+    PSP_UI_SCREEN_MICROPHONE_PROMPT
 } PspUiScreen;
 
 /* True for the native surfaces above, which draw instead of the page. */
@@ -592,7 +613,13 @@ typedef enum {
     PSP_UI_TOAST_GLYPH_OFFER,
     /* The saved interface language needs a download; toast_payload is the
        TilefinchUiLanguage. */
-    PSP_UI_TOAST_LANGUAGE_REPAIR
+    PSP_UI_TOAST_LANGUAGE_REPAIR,
+    /* A pending page load's status ("RECEIVING PAGE  O CANCEL");
+       toast_payload is its BrowserNavigationPhase. */
+    PSP_UI_TOAST_LOADING,
+    /* The site's page ran out of script memory last time: X loads it
+       without scripts, O keeps them (PSP_UI_ACTION_SCRIPTS_OFF_*). */
+    PSP_UI_TOAST_SCRIPTS_OFF_OFFER
 } PspUiToastKind;
 
 typedef struct {
@@ -613,6 +640,9 @@ typedef struct {
     /* Native locale uses the spare cursor-status bits, keeping snapshots
        within the existing 1 KiB admission ceiling. */
     uint8_t ui_language : 4;
+    /* Basic content blocking also blocks paywall scripts (opt-in); the
+       byte's last spare bit. */
+    uint8_t content_blocker_paywall_scripts : 1;
     uint8_t youtube_signin_diagnostics : 1;
     uint8_t youtube_login_policy : 2;
     uint8_t rotate_hint_always : 1;
@@ -621,6 +651,12 @@ typedef struct {
        BrowserInsecureAudioAnswer (Ask, Allow or Block) for the page's site,
        this session only. */
     uint8_t insecure_audio_site_answer : 2;
+    /* The Microphone row, a MediaCapturePermission (Ask, Allow, Block) for
+       the page's origin, and whether page capture is live (Page tools then
+       offers Stop microphone); bits that fill the padding before the
+       uint16_t below, so the 1 KiB state does not grow. */
+    uint8_t microphone_site_answer : 2;
+    uint8_t microphone_live : 1;
     /* The Update page offers TRY AGAIN (X) and DISCARD (Square) for a
        trial whose recovery screen was answered with O or timed out; one of
        this byte's spare bits. Every psp_ui_set_update clears it and
@@ -825,6 +861,7 @@ typedef struct {
         const PspUiFileDownloadPreview *file_download_preview;
         const ZipInstallPreview *zip_install_preview;
         const PspUiPageDialogView *page_dialog;
+        const PspUiMicrophonePromptView *microphone_prompt;
     };
     unsigned browser_ui_scale;
     /* Page text size and Page zoom (both at most 150%) share one word so
@@ -946,6 +983,12 @@ typedef struct {
 
 void psp_ui_show_failure_recovery(
     PspUiState *ui, const char *detail, uint8_t available_actions);
+/* A failed load's headline and next step on the failure page and in its
+   toast, for the TilefinchDiagnosticCode browser_engine_navigation_failure_code
+   gives: two catalog lines, the detail "headline\nnext step". The engine's
+   own sentence stays for the Diagnostic QR. */
+const char *psp_ui_failure_headline(unsigned diagnostic_code);
+const char *psp_ui_failure_next_step(unsigned diagnostic_code);
 /* Show the same bounded recovery surface while treating available_actions as
    authoritative.  Ordinary navigation failures use the convenience wrapper
    above, which always offers Reader; a successfully fetched hydration shell
@@ -1058,6 +1101,10 @@ typedef struct {
        note; and whether the open is a retry at 240p. */
     uint16_t resolving_elapsed_ms;
     bool lower_quality_retry;
+    /* The PspUiMediaAction chosen during this open that waits for its end
+       (a queue entry, a track, rotation, close), for the loading panel's
+       note ("Next video after this opens"); NONE otherwise. */
+    uint8_t parked_action;
     MediaChapter chapters[MEDIA_CHAPTER_LIMIT];
     char subtitle_text[PSP_UI_MEDIA_SUBTITLE_TEXT_CAPACITY];
     bool queue_active, queue_loading, queue_failed, queue_next, automatic_next;
@@ -1191,8 +1238,6 @@ typedef enum {
 
 typedef struct {
     unsigned frame;
-    /* Retained for source/fixture compatibility; currently ignored. */
-    bool wave;
     /*
      * The slow branch. When boot takes a long path the mark stays centred
      * and this one line -- the branch's own existing status string -- shows
@@ -1284,8 +1329,23 @@ void psp_ui_set_network_profile(
 void psp_ui_set_navigation_target(PspUiState *ui, const char *url);
 void psp_ui_set_history(PspUiState *ui, bool can_go_back,
                         bool can_go_forward);
+/* Ending a load (loading false) also retires its loading status. */
 void psp_ui_set_loading(PspUiState *ui, bool loading,
                         int progress_per_mille);
+/* A page load's status for its phase (a BrowserNavigationPhase), one form
+   for every load: "CONNECTING  O CANCEL", "RECEIVING PAGE  O CANCEL",
+   "RUNNING PAGE SCRIPTS  O CANCEL", "LOADING PAGE  O CANCEL". */
+const char *psp_ui_loading_status_text(unsigned phase);
+void psp_ui_show_loading_status(PspUiState *ui, unsigned phase,
+                                unsigned duration_frames);
+/* Follows a pending load's phase: a new phase replaces a showing loading
+   status in place; with `may_show` (the caller passes it until the load's
+   preview has been presented, so the status never covers a page being
+   read) it also shows it again, when no toast is showing, for a phase it
+   has not shown yet. Any other toast
+   (the preview's reading hint, a setting's confirmation) is left alone. */
+void psp_ui_follow_loading_phase(PspUiState *ui, unsigned phase,
+                                 bool may_show);
 /* Page script can enter fullscreen during a frame's dispatch or runtime
    advance, after that frame sampled input. The frontend adopts the state
    (page_fullscreen, Page controls) at the next input sample; call this with
@@ -1323,8 +1383,7 @@ void psp_ui_show_status(PspUiState *ui, const char *status,
 void psp_ui_dismiss_status(PspUiState *ui, const char *status);
 /* The load preview's reading hint (BrowserProvisionalViewport.reading_hint):
    shown, and kept up, while `shown`; retired otherwise. It takes the place
-   of the load's own "LOADING..." announcement and waits behind any other
-   toast. */
+   of the load's own loading status and waits behind any other toast. */
 void psp_ui_set_preview_hint(PspUiState *ui, bool shown);
 /* As psp_ui_show_status(), timed in real milliseconds (at most 60000) rather
    than UI frames, whose rate follows the page's presentation cadence. */
@@ -1429,6 +1488,16 @@ void psp_ui_page_dialog_prepare(
     char message[PSP_UI_PAGE_DIALOG_SHOWN_MESSAGE_BYTES],
     char value[PSP_UI_PAGE_DIALOG_SHOWN_VALUE_BYTES]);
 void psp_ui_clear_page_dialog(PspUiState *ui);
+/* Borrowed for as long as the prompt shows. */
+void psp_ui_show_microphone_prompt(PspUiState *ui,
+                                   const PspUiMicrophonePromptView *view);
+void psp_ui_clear_microphone_prompt(PspUiState *ui);
+/* The "microphone on" indicator, which psp_ui_composite draws last on every
+   frame while capture is live (tilefinch_media_capture_indicator); other
+   presenters (the media player) draw it the same way. */
+void psp_ui_draw_microphone_indicator(uint16_t *pixels, int width,
+                                      int height, int stride,
+                                      bool below_chrome);
 /* The same panel offered from Library > Saved (a recompile): Circle
    returns to the Library instead of Page tools. */
 void psp_ui_show_offline_app_offer(
@@ -1511,6 +1580,11 @@ void psp_ui_dismiss_youtube_login_offer(PspUiState *ui);
    dismisses while it shows. */
 void psp_ui_show_heavy_scripts_status(PspUiState *ui, const char *status,
                                       unsigned duration_frames);
+/* The offer to load this site's page without scripts, after its scripts
+   ran out of memory on the last visit; X and O answer it on the page for
+   PSP_UI_SCRIPTS_OFF_OFFER_MS of real time. */
+#define PSP_UI_SCRIPTS_OFF_OFFER_MS 12000u
+void psp_ui_show_scripts_off_offer(PspUiState *ui);
 /* The recovery sheet titled for a page too heavy for the PSP. */
 void psp_ui_show_heavy_recovery(PspUiState *ui, const char *detail,
                                 uint8_t actions);
@@ -1723,6 +1797,15 @@ bool psp_ui_media_supervisor_press(
     PspUiMediaState *copy, PspUiMediaPresentation *own,
     PspUiMediaPressQueue *queue, uint32_t pressed,
     PspUiMediaIntent *intent);
+/* The loading panel's note for a command waiting on the open
+   (PspUiMediaPresentation.parked_action), or NULL for none (no action, or
+   a timeline action, which the open takes at once). A press that parks a
+   command sets it on the supervisor's copy at once and on the owner's
+   player when the press reaches it; psp_ui_media_clear_parked() retires
+   it when the command is handed over, and a fresh open starts without
+   one. */
+const char *psp_ui_media_parked_note(PspUiMediaAction action);
+void psp_ui_media_clear_parked(PspUiMediaState *media);
 /* True only when psp_ui_media_update() has already changed pixels worth
  * publishing before the session consumes the intent. */
 bool psp_ui_media_intent_has_predispatch_visual(

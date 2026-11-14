@@ -992,10 +992,15 @@ bool browser_engine_page_memory_recovery_due(const BrowserEngine *engine)
     if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
         || !engine->navigation_ready || !engine->navigation.page.loaded
         || engine->navigation.page.runtime == NULL
-        || script_runtime_heap_rejections(engine->navigation.page.runtime)
-               == 0u) return false;
-    /* The same "little content" predicate the Basic offer itself applies
-       to a degraded page whose scripts were not stopped for memory. */
+        || (script_runtime_heap_rejections(engine->navigation.page.runtime)
+                == 0u
+            && navigation_page_late_compile_memory_refusals(
+                   &engine->navigation.page) == 0u)) return false;
+    /* A live realm refused heap, or a script that came after the page's
+       content refused its compile: the page keeps its partly-run scripts
+       unless it shows little, by the same predicate the Basic offer itself
+       applies to a degraded page whose scripts were not stopped for
+       memory. */
     return browser_engine_page_is_visually_blank(engine)
         || !browser_engine_has_visible_action_target(engine);
 }
@@ -1004,10 +1009,13 @@ BrowserBasicViewRecovery browser_engine_prepare_basic_view_recovery(
     BrowserEngine *engine, ReaderDocumentAnalysis *analysis)
 {
     if (analysis != NULL) *analysis = (ReaderDocumentAnalysis) {0};
+    /* Refused or stopped for memory before the content was built (a later
+       refusal is judged by the page's content below, like any degradation). */
     bool memory_limited = engine != NULL
         && (engine->navigation.page.script_memory_limited
             || engine->navigation.page.script_result.host_compile_memory_refusals
-                   != 0u);
+                   > navigation_page_late_compile_memory_refusals(
+                         &engine->navigation.page));
     if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
         || !engine->navigation_ready
         || browser_engine_navigation_pending(engine)

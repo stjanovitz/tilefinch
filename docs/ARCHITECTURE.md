@@ -159,6 +159,7 @@ genuinely runs concurrently:
 | DMA | framebuffer staging transfer | completion for the exact slot generation |
 | audio | PSP audio submission | consumed PCM position |
 | voice | optional recognizer job | bounded recognition result |
+| microphone | one `sceAudioInput` transfer pair while a page captures (a pair whose last transfer was never seen to end is kept and reused, never freed) | samples into a fixed single-producer ring the browser thread reads; an atomic level and run state |
 | clock/watchdog | platform timing or liveness observation | atomics and fixed records |
 
 These are operating-system threads. A page's Web Workers are not: each
@@ -544,7 +545,14 @@ document (`SCRIPT_DOCUMENT_SCOPE_CHILD_FRAME`) and shown in its parent as an
 opaque pixel snapshot at the iframe's box; the parent never reads the child's
 DOM. A child mutation marks the snapshot dirty for the owner tick to refresh
 (retrying after a refused allocation), and trusted input in a child notifies
-user activation on that realm and every ancestor before dispatch.
+user activation on that realm and every ancestor before dispatch. A frame
+whose element has no box in its parent's complete layout (`display:none`, on
+it or an ancestor) is laid out at its default size, so its script sees the
+same viewport, but no pixels are drawn; the owner tick draws it once the
+element has a box. A child realm returns its allocator's cached free blocks to
+the page after its bootstrap and again once its document has loaded, and, like
+every realm, allocates its mutation journal only at its first connected
+mutation.
 
 Every connected `<iframe>` and `<frame>` is a child navigable, loaded or not:
 `window.length`, `window[i]`, and `window[name]` answer the same WindowProxy
@@ -640,10 +648,14 @@ wrapper, because bootstrap state (listeners, observers) is keyed by handle.
 Such a wrapper can die and be remade, unless it carries an expando or is a
 WeakMap key: each collection holds those of connected nodes, so script reaches
 that state through the element. Nothing is held between collections.
-Every runtime allocates 8,192 slots at creation; the realistic profile may
-grow the table once, to 16,352, when every slot is live and no dead wrapper can
-be reclaimed. The growth is Budget-admitted like any page allocation, and a
-refusal is the same clean `RangeError` a full table reports.
+A top-level document's table starts at 1,024 slots and a child frame's at 256
+(`SCRIPT_DOM_HANDLE_SLOT_INITIAL_*`), and the table doubles when every slot is
+live, up to 8,192 slots (16,352 under the realistic profile). Below 8,192 a
+full table grows at once, so no page collects garbage for handles earlier
+than it would with a table of that size; at 8,192 dead wrappers are reclaimed
+first and only a table that is genuinely live grows. Growth is Budget-admitted
+like any page allocation, and a refusal is the same clean `RangeError` a full
+table reports.
 
 ### Computed style is one generated registry
 
@@ -763,6 +775,16 @@ rather than by its size ([PSP envelope](engineering/PSP_ENVELOPE.md#memory-profi
   text before the compile returns, and QuickJS keeps no pointer into it after.
   A script of several text children (built by DOM calls) is assembled into a
   copy, which its admission counts.
+- **Large raw text is handed over, not copied.** The tokenizer gathers a
+  script's or style's whole text in its own buffer before the tree builder
+  sees it. For a parsed `<script>` or `<style>` of at least 64 KiB, the
+  parser (`document_parser_adopt_raw_text`) gives that buffer to the
+  document's text arena as the node's storage (`lexbor_mraw_adopt`, a
+  Tilefinch Lexbor patch) and gives the tokenizer a fresh small buffer, so the
+  text exists once instead of twice while the script waits to compile.
+  Shorter text, text the tokenizer has already handed back to the network
+  buffer, and any refused step take Lexbor's ordinary copy, which produces the
+  same node.
 - **Data, not code.** Inert JSON script types stay DOM data. A narrow
   classic-script subset (`window`, `globalThis`, `var`, or bare global
   assignments of strict JSON) installs its data without compiling bytecode or

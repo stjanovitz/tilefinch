@@ -467,6 +467,13 @@ memory, its server-rendered body was put back and the realm retired
 so a lab run never waits); with `ask`, `heavy-answer run` or
 `heavy-answer stop` answers the scripts that wait, and `stop-scripts`
 retires the page's realms as the PSP's Stop page scripts does.
+`memory-report [PHASE]` prints the memory make-up lines the PSP validation
+log carries at pre-interaction and controlled-exit (budget at peak, the
+JavaScript, DOM, resource, session and render splits, and one
+`tilefinch-frame-realm` line per realm; see
+[VALIDATION_RECORDS.md](VALIDATION_RECORDS.md#memory-make-up)), tagged
+`phase=PHASE` (`lab` by default). With `TILEFINCH_TRACE_JS_HEAP_DETAIL` set it
+also prints the compact heap census of every realm on stderr.
 `refresh-status` prints the live document's declarative refresh (`loop-refresh
 state=none|pending|due|followed|cancelled|stopped|refused|offered`, delay,
 elapsed page-clock time, whether it came from the `Refresh` header, whether
@@ -493,6 +500,14 @@ run of such a page therefore ends with
 the queue's batches so far, and whether the queue is still running
 (`pending=no` with targets still queued means they are `loading=lazy` images
 waiting for the viewport). Measure image loading with `pump` or `drain`.
+`jump URL` activates a link to URL as Cross does, so a same-page
+`#fragment` scrolls there. Its `loop-jump` line gives the scroll position,
+the layout height, `limit` (where a provisional layout's content ends, 0
+once it is complete), the time, and the session's layout-through builds and
+fallbacks. `find TEXT`, `find-next` and `find-prev` run Find in page; each
+`loop-find` line gives the selected match, the match count (`+` while the
+layout is provisional), the scroll position, `limit`, the time and the
+layout-through builds.
 `--script-cache-dir DIR` (or the older `--module-cache-dir`) adds the
 persistent compiled-script tier, classic scripts and modules: a script
 missing from the RAM tables is restored from the pack in `DIR` that its

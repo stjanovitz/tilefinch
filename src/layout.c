@@ -5,6 +5,7 @@
 #include "layout_internal.h"
 #include "style_cache_internal.h"
 #include "tilefinch_test_faults.h"
+#include "layout_validation_diff.h"
 
 #include <ctype.h>
 #include <limits.h>
@@ -178,6 +179,28 @@ static void layout_release_context(LayoutContext *context, Budget *budget)
     budget_free(budget, context);
 }
 
+/* The first depth fallback of a layout names where it happened. A lab and
+   validation diagnostic: the shipping PSP build only counts fallbacks. */
+static void layout_report_depth_limit(lxb_dom_node_t *node, const char *phase)
+{
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+    size_t name_length = 0;
+    const char *name = document_element_name(node, &name_length);
+    if (name == NULL && node != NULL
+        && node->type == LXB_DOM_NODE_TYPE_TEXT) {
+        name = "#text";
+        name_length = 5;
+    }
+    fprintf(stderr, "layout-depth-limit phase=%s limit=%u node=%.*s\n",
+            phase == NULL ? "unknown" : phase,
+            (unsigned) LAYOUT_TREE_CALL_DEPTH_LIMIT,
+            (int) name_length, name == NULL ? "" : name);
+#else
+    (void) node;
+    (void) phase;
+#endif
+}
+
 bool layout_tree_enter(LayoutContext *context,
                               lxb_dom_node_t *node,
                               const char *phase)
@@ -185,18 +208,7 @@ bool layout_tree_enter(LayoutContext *context,
     if (context == NULL || context->cancelled) return false;
     if (context->tree_call_depth >= LAYOUT_TREE_CALL_DEPTH_LIMIT) {
         if (!context->depth_limit_reported) {
-            size_t name_length = 0;
-            const char *name = document_element_name(node, &name_length);
-            if (name == NULL && node != NULL
-                && node->type == LXB_DOM_NODE_TYPE_TEXT) {
-                name = "#text";
-                name_length = 5;
-            }
-            fprintf(stderr,
-                    "layout-depth-limit phase=%s limit=%u node=%.*s\n",
-                    phase == NULL ? "unknown" : phase,
-                    (unsigned) LAYOUT_TREE_CALL_DEPTH_LIMIT,
-                    (int) name_length, name == NULL ? "" : name);
+            layout_report_depth_limit(node, phase);
             context->depth_limit_reported = true;
         }
         context->depth_fallback_count++;
@@ -223,17 +235,7 @@ void layout_tree_note_fallback(LayoutContext *context,
     if (context == NULL) return;
     context->depth_fallback_count++;
     if (context->depth_limit_reported) return;
-    size_t name_length = 0;
-    const char *name = document_element_name(node, &name_length);
-    if (name == NULL && node != NULL
-        && node->type == LXB_DOM_NODE_TYPE_TEXT) {
-        name = "#text";
-        name_length = 5;
-    }
-    fprintf(stderr, "layout-depth-limit phase=%s limit=%u node=%.*s\n",
-            phase == NULL ? "unknown" : phase,
-            (unsigned) LAYOUT_TREE_CALL_DEPTH_LIMIT,
-            (int) name_length, name == NULL ? "" : name);
+    layout_report_depth_limit(node, phase);
     context->depth_limit_reported = true;
 }
 
@@ -387,6 +389,9 @@ static void layout_context_cancel(LayoutContext *context)
 
 bool layout_cooperate(LayoutContext *context, lxb_dom_node_t *node)
 {
+#if defined(TILEFINCH_LAYOUT_DIFF) && !defined(__PSP__)
+    layout_validation_time_node(context->layout, node);
+#endif
     context->layout->layout_work_units++;
     context->slice_units++;
     context->slice_last_node = node;
@@ -597,13 +602,7 @@ bool layout_node_is_hidden_input(lxb_dom_node_t *node)
         && attribute_is(node, "type", "hidden");
 }
 
-static bool node_descends_from(lxb_dom_node_t *node, lxb_dom_node_t *ancestor)
-{
-    for (lxb_dom_node_t *at = node; at != NULL; at = at->parent) {
-        if (at == ancestor) return true;
-    }
-    return false;
-}
+#define node_descends_from document_node_within
 
 bool node_effectively_disabled(lxb_dom_node_t *node)
 {
@@ -953,6 +952,15 @@ bool add_node_box(LayoutDocument *layout, lxb_dom_node_t *node,
         || link_start > UINT32_MAX || link_end > UINT32_MAX
         || control_start > UINT32_MAX || control_end > UINT32_MAX
         || link_start > link_end || control_start > control_end) return false;
+    const LayoutPreviewThrough *through = layout->preview_through;
+    for (size_t i = 0; through != NULL && i < through->count; i++) {
+        if (through->nodes[i] != node) continue;
+        int64_t limit = (int64_t) y + through->depth;
+        *through->limit = limit > INT_MAX ? INT_MAX
+            : (limit < 1 ? 1 : (int) limit);
+        layout->preview_through = NULL;
+        break;
+    }
     if ((clips_x || clips_y) && LAYOUT_TRACE(layout, CLIP)) {
         size_t id_length = 0, class_length = 0;
         const char *id = document_attribute(node, "id", &id_length);
@@ -1436,6 +1444,7 @@ struct LayoutBuildJob {
     bool retain_container_padding;
     bool preview_truncated;
     bool taken;
+    LayoutPreviewThrough preview_through;
 };
 
 #ifndef TILEFINCH_NO_TRACE
@@ -1511,6 +1520,9 @@ static bool layout_job_init(LayoutBuildJob *job)
     LayoutContext *context = budget_calloc(job->budget, 1, sizeof(*context));
     if (context == NULL) return false;
     job->context = context;
+#if defined(TILEFINCH_LAYOUT_DIFF) && !defined(__PSP__)
+    layout_validation_time_begin(&job->layout);
+#endif
     /* After a complete layout measured the geometry, a complete relayout
        (a script mutation, an image batch) usually measures the same and
        keeps its single probe; the log would only add its lookups. */
@@ -1554,7 +1566,13 @@ static bool layout_job_init(LayoutBuildJob *job)
     context->web_fonts = layout->web_fonts;
     context->images = job->images;
     context->reuse = job->reuse;
-    context->preview_y_limit = job->preview_y_limit;
+    context->preview_through = job->preview_through.count != 0;
+    context->preview_y_limit = context->preview_through
+        ? 0 : job->preview_y_limit;
+    if (context->preview_through) {
+        job->preview_through.limit = &context->preview_y_limit;
+        layout->preview_through = &job->preview_through;
+    }
     context->record_unresolved_visuals =
         job->reuse != NULL && job->reuse->record_unresolved_visuals;
     context->document_bidi_text_present = job->document->bidi_text_present;
@@ -2086,6 +2104,7 @@ LayoutBuildStatus layout_build_job_pump(LayoutBuildJob *job)
                 ? job->viewport_height : job->bottom, job->context);
         if (job->context->cancelled) { okay = false; break; }
         job->preview_truncated = job->context->preview_truncated;
+        job->layout.preview_through = NULL;
         layout_size_background_visuals(&job->layout);
         tilefinch_platform_trace_step("finish-trace");
         layout_job_trace_finished(job);
@@ -2189,6 +2208,9 @@ bool layout_build_job_take(LayoutBuildJob *job, LayoutDocument *layout)
 {
     if (job == NULL || layout == NULL
         || job->status != LAYOUT_BUILD_COMPLETE || job->taken) return false;
+#ifdef TILEFINCH_LAYOUT_DIFF
+    layout_validation_report_build(&job->layout);
+#endif
     *layout = job->layout;
     memset(&job->layout, 0, sizeof(job->layout));
     job->taken = true;
@@ -2228,7 +2250,9 @@ static bool layout_build_context_resumable_sync(
     LayoutDocument *layout, Budget *budget, const PocDocument *document,
     const Stylesheet *stylesheet, const FontSet *fonts,
     const ImageResources *images, const ViewportContext *viewport,
-    LayoutReuseCache *reuse, int preview_y_limit, bool *preview_truncated)
+    LayoutReuseCache *reuse, int preview_y_limit, bool *preview_truncated,
+    const lxb_dom_node_t *const *through, size_t through_count,
+    int through_depth)
 {
     if (layout == NULL) return false;
     LayoutBuildJob *job = layout_build_job_begin(
@@ -2238,6 +2262,16 @@ static bool layout_build_context_resumable_sync(
         return false;
     }
     job->preview_y_limit = preview_y_limit;
+    /* Each target with its nearest ancestors, an equal share of slots. */
+    size_t share = through_count == 0 ? 0
+        : LAYOUT_PREVIEW_THROUGH_NODES / through_count;
+    for (size_t i = 0; i < through_count; i++) {
+        const lxb_dom_node_t *at = through[i];
+        for (size_t level = 0; at != NULL && level < share;
+             level++, at = at->parent)
+            job->preview_through.nodes[job->preview_through.count++] = at;
+    }
+    job->preview_through.depth = through_depth;
     LayoutBuildStatus status = LAYOUT_BUILD_PENDING;
     while (status == LAYOUT_BUILD_PENDING) {
         status = layout_build_job_pump(job);
@@ -2374,7 +2408,7 @@ bool layout_build_context_reuse(LayoutDocument *layout, Budget *budget,
 {
     return layout_build_context_resumable_sync(
         layout, budget, document, stylesheet, fonts, images, viewport, reuse,
-        0, NULL);
+        0, NULL, NULL, 0, 0);
 }
 
 bool layout_build_context_preview(LayoutDocument *layout, Budget *budget,
@@ -2390,7 +2424,29 @@ bool layout_build_context_preview(LayoutDocument *layout, Budget *budget,
     *truncated = false;
     return layout_build_context_resumable_sync(
         layout, budget, document, stylesheet, fonts, images, viewport, reuse,
-        y_limit, truncated);
+        y_limit, truncated, NULL, 0, 0);
+}
+
+bool layout_build_context_through(LayoutDocument *layout, Budget *budget,
+                                  const PocDocument *document,
+                                  const Stylesheet *stylesheet,
+                                  const FontSet *fonts,
+                                  const ImageResources *images,
+                                  const ViewportContext *viewport,
+                                  LayoutReuseCache *reuse,
+                                  const lxb_dom_node_t *const *through,
+                                  size_t through_count, int depth,
+                                  bool *truncated)
+{
+    if (truncated == NULL || through == NULL || through_count == 0
+        || through_count > LAYOUT_THROUGH_TARGETS || depth <= 0)
+        return false;
+    *truncated = false;
+    /* A preview build to the job (style caches, recorded visuals); the
+       context holds no limit until the node's box sets one. */
+    return layout_build_context_resumable_sync(
+        layout, budget, document, stylesheet, fonts, images, viewport, reuse,
+        INT_MAX, truncated, through, through_count, depth);
 }
 
 bool layout_build_context(LayoutDocument *layout, Budget *budget,
@@ -2461,7 +2517,8 @@ ImagePriorityTarget *layout_note_unresolved_external_visual(
     layout->unresolved_external_visuals = true;
     /* Backgrounds and masks are always kept: they are few, and a later change
        can reveal one that only layout's style resolution would ever see. */
-    if (context->preview_y_limit <= 0 && kind == IMAGE_PRIORITY_KIND_DOCUMENT
+    if (context->preview_y_limit <= 0 && !context->preview_through
+        && kind == IMAGE_PRIORITY_KIND_DOCUMENT
         && !context->record_unresolved_visuals) return NULL;
     for (size_t i = 0; i < layout->visual_priority_count; i++) {
         ImagePriorityTarget *target = &layout->visual_priority_targets[i];
@@ -2887,6 +2944,9 @@ size_t layout_grid_columns_for_node(const LayoutDocument *layout,
 void layout_destroy(LayoutDocument *layout)
 {
     if (layout == NULL) return;
+#ifdef TILEFINCH_LAYOUT_DIFF
+    layout_validation_forget(layout);
+#endif
     if (layout->budget != NULL) {
         budget_free(layout->budget, layout->commands);
         budget_free(layout->budget, layout->links);
@@ -3127,6 +3187,9 @@ static void layout_image_boxes_note_floating(ImageLayoutBoxes *boxes,
 void layout_keep_image_boxes(LayoutDocument *layout, ImageLayoutBoxes *boxes)
 {
     if (layout == NULL || boxes == NULL || boxes->layout != layout) return;
+#ifdef TILEFINCH_LAYOUT_DIFF
+    layout_validation_forget(layout);
+#endif
     boxes->floating_count = 0;
     for (size_t r = 0; r < layout->fixed_count; r++)
         layout_image_boxes_note_floating(boxes,

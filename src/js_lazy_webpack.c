@@ -5,6 +5,7 @@
 
 #include "tilefinch/build_version.h"
 #include "tilefinch/platform.h"
+#include "fnv1a.h"
 #include "tilefinch/script_lazy.h"
 #include "tilefinch/sha256.h"
 #include "tilefinch/url.h"
@@ -57,12 +58,7 @@ static void lazy_trace_memory(ScriptRuntime *runtime, const char *phase,
    only: what caching compiled factories would hold and save. */
 static uint64_t census_fnv64(const unsigned char *data, size_t length)
 {
-    uint64_t hash = UINT64_C(14695981039346656037);
-    for (size_t i = 0; i < length; i++) {
-        hash ^= data[i];
-        hash *= UINT64_C(1099511628211);
-    }
-    return hash;
+    return fnv1a64(FNV1A64_SEED, data, length);
 }
 
 static void census_lazy_function_stats(JSRuntime *js_runtime,
@@ -70,15 +66,11 @@ static void census_lazy_function_stats(JSRuntime *js_runtime,
                                        uint64_t *deferred)
 {
     *compiled = *bytes = *deferred = 0;
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
     JSLazyFunctionStats stats;
     JS_GetLazyFunctionStats(js_runtime, &stats);
     *compiled = stats.compiled;
     *bytes = stats.compiled_source_bytes;
     *deferred = stats.deferred;
-#else
-    (void) js_runtime;
-#endif
 }
 
 /* The classic table's serialization (JS_WRITE_OBJ_BYTECODE); 0 when the
@@ -569,6 +561,7 @@ static JSValue lazy_factory_compile(JSContext *context,
             runtime, bundle, factory_index, factory)) {
         js_rt_saturating_add_size(
             &runtime->result.lazy_webpack_factory_compile_failures, 1);
+        script_runtime_note_memory_refusal(runtime);
         return JS_ThrowOutOfMemory(context);
     }
     char *program = NULL;
@@ -1695,6 +1688,8 @@ ScriptLazyEvaluation script_runtime_evaluate_external_lazy_webpack_recorded(
     int64_t script_handle = js_rt_bridge_register_node(
         &runtime->bridge, script_node);
     if (script_handle == 0) return SCRIPT_LAZY_EVALUATION_FALLBACK;
+    /* Kept across evaluation for its load or error event. */
+    js_rt_bridge_keep_node_handle(&runtime->bridge, script_handle);
     js_rt_saturating_add_size(&runtime->result.lazy_webpack_candidates, 1);
     JSValue global = JS_GetGlobalObject(runtime->context);
     JSValue page_trace = JS_GetPropertyStr(runtime->context, global,

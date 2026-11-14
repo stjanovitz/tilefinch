@@ -1,4 +1,5 @@
 #include "tilefinch/psp_swdec_component.h"
+#include "tilefinch/platform.h"
 
 #include <pspkernel.h>
 
@@ -40,15 +41,7 @@ void psp_swdec_component_window_step(void)
 }
 #endif
 
-static void component_error(
-    char *error, size_t error_size, const char *format, ...)
-{
-    if (error == NULL || error_size == 0) return;
-    va_list arguments;
-    va_start(arguments, format);
-    vsnprintf(error, error_size, format, arguments);
-    va_end(arguments);
-}
+#define component_error tilefinch_format_error
 
 static void component_log(const char *format, ...)
 {

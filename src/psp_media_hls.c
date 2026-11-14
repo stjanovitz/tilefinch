@@ -972,7 +972,9 @@ PspMediaHlsOpenStatus psp_media_hls_pump(
         if (psp_hls_playlist_retry_allowed(
                 context->playlist_open_attempts,
                 context->last_transport_retryable)) {
-#if !defined(TILEFINCH_NO_TRACE) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+            /* psp-browser-script never sees TILEFINCH_NO_TRACE (it is
+               private to tilefinch_core); __PSP__ marks the shipping build. */
+#if !defined(__PSP__) || defined(TILEFINCH_PSP_VALIDATION_LOG)
             printf("tilefinch-media-hls: event=playlist-retry "
                    "attempt=%u transport=%ld\n",
                    context->playlist_open_attempts,

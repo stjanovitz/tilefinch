@@ -60,4 +60,13 @@
 #undef TT_USE_BYTECODE_INTERPRETER
 #undef TT_SUPPORT_SUBPIXEL_HINTING_MINIMAL
 
+/* The backend rejects non-scalable faces and always passes FT_LOAD_NO_BITMAP.
+ * Keep embedded-strike metadata: even an outline-only FT_Set_Char_Size can
+ * select a strike and use its sizing metrics. Only the bitmap image decoder
+ * is unreachable, not the entire TT_CONFIG_OPTION_EMBEDDED_BITMAPS module.
+ * The narrow patch leaves a rejecting callback for accidental bitmap requests
+ * instead of a NULL function pointer. Built-in/downloaded glyph packs use
+ * Tilefinch's separate renderer and are unaffected. */
+#define TILEFINCH_FREETYPE_OUTLINE_ONLY
+
 /* EOF */

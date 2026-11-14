@@ -17,10 +17,12 @@ Show exceptions are kept.
 ## Modes
 
 - **Off** performs no request matching and disables cosmetic hiding.
-- **Basic** matches 51 host suffixes, only for third-party subresources:
-  36 advertising, auction and ad-verification hosts and 15 hosts of tag
-  managers and A/B testing clients. The table is compiled
-  into the browser; it performs no boot-time file I/O.
+- **Basic** matches 52 host suffixes, only for third-party subresources:
+  37 advertising, auction and ad-verification hosts and 15 hosts of tag
+  managers and A/B testing clients. **Menu → Settings → Privacy & security →
+  Paywall scripts → Block** adds 5 paywall and subscription SDK hosts (57 in
+  all); it is **Allow** by default. The table is compiled into the browser;
+  it performs no boot-time file I/O.
 - **Custom** reads `data/adblock.txt`. Switching to Custom fails without
   changing the active mode if the file cannot be read or validated.
 
@@ -43,13 +45,15 @@ once and is an independent switch: turning off **Hide page ads** leaves
 request blocking active.
 
 After a successful load, the bottom bar shows `B` and the number of requests
-blocked on that page, and the **Content blocker** row in Settings shows a
-small running total across successful loads. Only the count is saved;
-Tilefinch keeps no blocked URLs or per-site blocking history.
+blocked on that page, **Permissions & controls → Blocked here** shows the same
+number, and the **Content blocker** row in Settings shows a small running
+total across successful loads. Only the count is saved; the page's count is
+not saved at all. Tilefinch keeps no blocked URLs or per-site blocking
+history.
 
 ## Built-in Basic rules
 
-Basic blocks third-party subresources on these 36 dedicated advertising,
+Basic blocks third-party subresources on these 37 dedicated advertising,
 auction and ad-verification host suffixes (including their subdomains), and
 on the SDK hosts listed after them:
 
@@ -59,17 +63,24 @@ adsrvr.org                 amazon-adsystem.com        bidswitch.net
 btloader.com               casalemedia.com            confiant-integrations.net
 contextweb.com             criteo.com                 criteo.net
 demdex.net                 doubleclick.net            googleadservices.com
-googlesyndication.com      indexww.com                lijit.com
-mathtag.com                media.net                  moatads.com
-openx.net                  outbrain.com               pubmatic.com
-quantserve.com             rlcdn.com                  rubiconproject.com
-serving-sys.com            sharethrough.com           smartadserver.com
-smaato.net                 taboola.com                teads.tv
-triplelift.com             yieldmo.com                zedo.com
+googlesyndication.com      imasdk.googleapis.com      indexww.com
+lijit.com                  mathtag.com                media.net
+moatads.com                openx.net                  outbrain.com
+pubmatic.com               quantserve.com             rlcdn.com
+rubiconproject.com         serving-sys.com            sharethrough.com
+smartadserver.com          smaato.net                 taboola.com
+teads.tv                   triplelift.com             yieldmo.com
+zedo.com
 ```
 
+`imasdk.googleapis.com` serves only Google's IMA video-ad SDK (`ima3.js`,
+about 0.5 MB of script, which cnn.com loads once its page is up); the rest of
+`googleapis.com` (libraries, fonts, APIs) is not matched.
+
 Basic also refuses third-party requests to these 15 tag-manager and A/B
-testing host suffixes (including their subdomains):
+testing host suffixes, and, when **Paywall scripts** is set to **Block**, to
+the 5 paywall/subscription SDK host suffixes listed with them (including their
+subdomains):
 
 ```text
 Tag managers   googletagmanager.com (Google Tag Manager, gtag.js)
@@ -79,6 +90,8 @@ Tag managers   googletagmanager.com (Google Tag Manager, gtag.js)
 A/B testing    optimizely.com  visualwebsiteoptimizer.com (VWO)
                abtasty.com  googleoptimize.com  kameleoon.eu  kameleoon.io
                convertexperiments.com (Convert)  tt.omtrdc.net (Adobe Target)
+Paywall SDKs   piano.io  tinypass.com (Piano)  poool.fr  pelcro.com
+(opt-in)       laterpay.net
 ```
 
 These scripts are large, run while the page loads and hold script memory for
@@ -102,12 +115,17 @@ A page that waits on one of these scripts keeps working when it is refused:
 The refused script gets its ordinary `error` event. These answers apply
 whichever mode or rule refused the script, Custom included.
 
-Basic does not refuse paywall and subscription SDKs (Piano and its Tinypass
-hosts, Poool, Pelcro, LaterPay), so a metered or subscription page counts
-reads and shows its paywall as the site intends. A Custom list can refuse
-them; the refused script then gets only its `error` event, with no answer.
-A site that needs one of the refused scripts above can be restored with
-**Permissions & controls → Content blocking**; **Off** loads them everywhere.
+Paywall SDKs are loaded unless you choose to block them, because a refused
+one changes what a publisher's page shows. With **Paywall scripts → Block**, a
+metered or subscription page that counts reads or shows its paywall through a
+refused SDK appears as the site sent it: open on a site that sends the article
+and gates it in the browser, closed on a site that only sends the article to a
+signed-in reader. The change applies to the requests that follow; reload a
+page to apply it there. A Custom list can refuse them too; the refused script
+then gets only its `error` event, with no answer. A site that needs one of the
+refused scripts can be
+restored with **Permissions & controls → Content blocking**; **Off** loads them
+everywhere.
 
 Top-level navigation is never blocked, and a matching site exception bypasses
 both Basic/Custom request rules and cosmetic hiding.

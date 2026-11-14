@@ -1,0 +1,11 @@
+# Web Audio program voices under PPSSPP or on a PSP, from native HOME with
+# no page: the validation build renders the fixed scenarios (beep, noise
+# burst, filtered sweep, four filtered voices) through the real mixer with
+# no output and logs their envelopes (tilefinch-audio-scenario:, compare
+# with tilefinch-game-audio-program-tests), then times four program voices
+# against four integer-path oscillators (tilefinch-audio-program-run:).
+# A measurement scenario.
+wait 120
+mark audio-program-probe
+wait 30
+end

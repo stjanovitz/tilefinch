@@ -63,14 +63,6 @@ typedef struct {
     bool own;
 } MediaReferenceSite;
 
-static bool media_name_is(lxb_dom_node_t *node, const char *wanted)
-{
-    size_t length = 0;
-    const char *name = document_element_name(node, &length);
-    return name != NULL && strlen(wanted) == length
-        && memcmp(name, wanted, length) == 0;
-}
-
 MediaDiscoveryKind media_discovery_reference_kind(
     const char *value, size_t length)
 {
@@ -547,7 +539,6 @@ static void media_identity_add_address(
 
 static bool media_metadata_name_is(
     lxb_dom_node_t *node, const char *wanted);
-static bool media_name_is(lxb_dom_node_t *node, const char *wanted);
 static lxb_dom_node_t *media_walk_next(
     lxb_dom_node_t *root, lxb_dom_node_t *node);
 
@@ -601,8 +592,8 @@ static void media_context_init(
         for (unsigned level = 0; level < 2u; level++) {
             lxb_dom_node_t *parent = container->parent;
             if (parent == NULL || parent->type != LXB_DOM_NODE_TYPE_ELEMENT
-                || media_name_is(parent, "body")
-                || media_name_is(parent, "html")) break;
+                || document_element_name_is(parent, "body")
+                || document_element_name_is(parent, "html")) break;
             container = parent;
         }
         context->container = container;
@@ -618,8 +609,7 @@ static void media_context_init(
 static void media_context_add_head(
     MediaDiscoveryContext *context, const PocDocument *document)
 {
-    lxb_html_head_element_t *head = document->html->head;
-    lxb_dom_node_t *root = head == NULL ? NULL : lxb_dom_interface_node(head);
+    lxb_dom_node_t *root = document_head_node(document);
     size_t nodes = 0;
     for (lxb_dom_node_t *node = root;
          node != NULL && nodes++ < MEDIA_IDENTITY_HEAD_NODE_LIMIT;
@@ -628,12 +618,12 @@ static void media_context_add_head(
         size_t length = 0;
         const char *value = NULL;
         bool slugs = true;
-        if (media_name_is(node, "link")) {
+        if (document_element_name_is(node, "link")) {
             const char *rel = document_attribute(node, "rel", &length);
             if (rel == NULL || length != sizeof("canonical") - 1u
                 || strncasecmp(rel, "canonical", length) != 0) continue;
             value = document_attribute(node, "href", &length);
-        } else if (media_name_is(node, "meta")) {
+        } else if (document_element_name_is(node, "meta")) {
             if (media_metadata_name_is(node, "og:url")) {
                 value = document_attribute(node, "content", &length);
             } else {
@@ -717,8 +707,8 @@ static bool media_element_marked(lxb_dom_node_t *node)
     /* The element and three ancestors, short of the page-wide body. */
     for (unsigned level = 0;
          node != NULL && node->type == LXB_DOM_NODE_TYPE_ELEMENT
-             && level < 4u && !media_name_is(node, "body")
-             && !media_name_is(node, "html");
+             && level < 4u && !document_element_name_is(node, "body")
+             && !document_element_name_is(node, "html");
          node = node->parent, level++) {
         for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
             size_t length = 0;
@@ -1569,7 +1559,7 @@ static size_t media_scan_executable_scripts(
          node = media_walk_next(root, node)) {
         nodes++;
         if (node->type != LXB_DOM_NODE_TYPE_ELEMENT
-            || !media_name_is(node, "script")
+            || !document_element_name_is(node, "script")
             || !media_script_is_executable(node)) continue;
         /* Data-shaped scripts were read by the first pass. Classifying one
            costs a scan of its own, so it is done only for text that
@@ -2173,7 +2163,7 @@ static bool media_discover_candidates(
             media_consider_span(&best, value, length, 0, length,
                                 (MediaReferenceSite) {0}, node, NULL);
         }
-        if (!media_name_is(node, "script")
+        if (!document_element_name_is(node, "script")
             || !media_script_is_data(node, NULL)) {
             continue;
         }
@@ -2727,7 +2717,7 @@ static bool media_discover_structured_scripts(
          node = media_walk_next(root, node)) {
         dom_nodes++;
         if (node->type != LXB_DOM_NODE_TYPE_ELEMENT
-            || !media_name_is(node, "script")) continue;
+            || !document_element_name_is(node, "script")) continue;
         bool strict_json = false;
         if (!media_script_is_data(node, &strict_json)) continue;
         for (lxb_dom_node_t *child = node->first_child; child != NULL;
@@ -2901,7 +2891,7 @@ static bool media_discover_declared_video_uncached(
          node != NULL && nodes++ < MEDIA_DISCOVERY_NODE_LIMIT;
          node = media_walk_next(root, node)) {
         if (node->type != LXB_DOM_NODE_TYPE_ELEMENT
-            || !media_name_is(node, "meta")) continue;
+            || !document_element_name_is(node, "meta")) continue;
         size_t length = 0u;
         const char *content = document_attribute(node, "content", &length);
         if (content == NULL || length == 0u) continue;
@@ -3163,7 +3153,7 @@ static bool media_declarations_present(const PocDocument *document)
          && bytes < MEDIA_DISCOVERY_TEXT_LIMIT;
          node = media_walk_next(root, node)) {
         if (node->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
-        if (media_name_is(node, "meta")) {
+        if (document_element_name_is(node, "meta")) {
             size_t length = 0u;
             const char *type = media_metadata_name_is(node, "og:type")
                 ? document_attribute(node, "content", &length) : NULL;
@@ -3176,7 +3166,7 @@ static bool media_declarations_present(const PocDocument *document)
                 return true;
             continue;
         }
-        if (media_name_is(node, "script")
+        if (document_element_name_is(node, "script")
             && media_data_script_names_video(node, &bytes)) return true;
     }
     return false;
@@ -3211,7 +3201,7 @@ void media_declared_video_keep_closed(PocDocument *document,
     /* In the head, the head-close keep (with the head's identity tokens
        complete) takes it. */
     for (lxb_dom_node_t *at = script->parent; at != NULL; at = at->parent)
-        if (at->type == LXB_DOM_NODE_TYPE_ELEMENT && media_name_is(at, "head")
+        if (at->type == LXB_DOM_NODE_TYPE_ELEMENT && document_element_name_is(at, "head")
             && !document->declared_video_kept_checked) return;
     document->declared_video_keep_scans++;
     document->declared_video_cache = media_declared_video_record_scan(document);

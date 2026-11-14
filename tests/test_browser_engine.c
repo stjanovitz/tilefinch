@@ -184,6 +184,68 @@ static bool write_document_replay(
         && fclose(trace) == 0;
 }
 
+/* One classic no-cors script response for a response-keyed replay. Typed
+   resources need a v10 record: an older one cannot show that no security
+   header was dropped, so its script is refused a grant. */
+static bool write_script_replay(char directory[128], const char *url,
+                                const char *source, size_t length)
+{
+    snprintf(directory, 128, "/tmp/tilefinch-script-replay-XXXXXX");
+    if (mkdtemp(directory) == NULL) return false;
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (size_t i = 0; i < length; i++) {
+        hash ^= (unsigned char) source[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    char path[256];
+    snprintf(path, sizeof(path), "%s/0000.body", directory);
+    FILE *body = fopen(path, "wb");
+    bool ok = body != NULL && fwrite(source, 1, length, body) == length
+        && fclose(body) == 0;
+    snprintf(path, sizeof(path), "%s/0000.meta", directory);
+    FILE *meta = ok ? fopen(path, "wb") : NULL;
+    ok = meta != NULL && fprintf(
+        meta,
+        "psp-http-trace=10\ncookie-values=redacted\n"
+        "method=GET\nurl=%s\nlogical-request-url=%s\nsuccess=1\n"
+        "async-delay-pumps=0\nexternal-cancel=0\n"
+        "transport-timeout=0\nredirect-origin-tainted=0\nerror=\n"
+        "request-body-length=0\nrequest-body-hash=cbf29ce484222325\n"
+        "request-content-type=\n"
+        "request-cookie-bytes=0\nrequest-has-cf-clearance=0\n"
+        "request-extra-header-bytes=0\nrequest-extra-header-shape=\n"
+        "request-allow-http-errors=1\nrequest-enforce-cors=0\n"
+        "request-redirect-same-origin-only=0\n"
+        "request-cors-cached-response-validated=0\n"
+        "request-if-none-match=\nrequest-if-modified-since=\n"
+        "request-referer=\nrequest-origin=\nrequest-accept=\n"
+        "request-sec-fetch-dest=\nrequest-sec-fetch-mode=\n"
+        "request-sec-fetch-site=\n"
+        "request-send-client-hints=0\nrequest-client-hint-tokens=\n"
+        "request-client-hint-origin=\nrequest-send-low-client-hints=1\n"
+        "request-sec-fetch-user=0\nrequest-upgrade-insecure=0\n"
+        "request-user-agent=" TILEFINCH_BROWSER_USER_AGENT "\n"
+        "request-diagnostic-mobile-safari=0\nrequest-credentials=0\n"
+        "request-credential-origin=\nrequest-initiator-url=\n"
+        "request-referrer-source=\nrequest-referrer-policy=\n"
+        "status=200\nlength=%zu\nresponse-body-hash=%016llx\n"
+        "effective-url=%s\ncontent-type=text/javascript\netag=\n"
+        "last-modified=\ncf-mitigated=\naccept-ch=\ncritical-ch=\n"
+        "server=fixture\ncf-ray=\n"
+        "response-referrer-policy-metadata-valid=1\n"
+        "response-referrer-policy-present=0\nresponse-referrer-policy=\n"
+        "response-security-headers-truncated=0\n"
+        "response-header-count=1\nset-cookie-count=0\n"
+        "response-header-0=content-type: text/javascript\n",
+        url, url, length, (unsigned long long) hash, url) > 0
+        && fclose(meta) == 0;
+    snprintf(path, sizeof(path), "%s/trace.meta", directory);
+    FILE *trace = ok ? fopen(path, "wb") : NULL;
+    return trace != NULL
+        && fprintf(trace, "psp-http-trace-clock=1\norigin-ms=1000\n") > 0
+        && fclose(trace) == 0;
+}
+
 static bool write_history_form_replay(
     char directory[128], const char *html, size_t html_length,
     const char *effective_url)
@@ -270,15 +332,19 @@ static bool capture_provisional_present(
 #include "suites/youtube_page_builder.inc"
 #include "suites/browser_engine_lifecycle.inc"
 #include "suites/browser_engine_navigation.inc"
+#include "suites/browser_engine_layout_jump.inc"
 #include "suites/browser_engine_adapters.inc"
 #include "suites/youtube_provider_costs.inc"
 #include "suites/youtube_login_journey.inc"
 #include "suites/youtube_navigation_journey.inc"
+#include "suites/youtube_memory_journey.inc"
 #include "suites/youtube_watch_next.inc"
 #include "suites/browser_engine_teardown.inc"
 
 int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--layout-jump-only") == 0)
+        return test_layout_jump();
     if (argc == 2 && strcmp(argv[1], "--scroll-noop-only") == 0)
         return test_scroll_noop_reports_unchanged();
     if (argc == 2 && strcmp(argv[1], "--reader-screen-only") == 0) {
@@ -292,6 +358,7 @@ int main(int argc, char **argv)
         CHECK(test_basic_view_admission_and_presentation() == 0);
         CHECK(test_basic_view_recovery_memory_limited_with_navigation() == 0);
         CHECK(test_basic_view_recovery_live_realm_oom() == 0);
+        CHECK(test_basic_view_recovery_compile_refusal() == 0);
         CHECK(test_basic_view_recovery_large_and_hidden_pages() == 0);
         return 0;
     }
@@ -339,6 +406,8 @@ int main(int argc, char **argv)
         return test_youtube_provider_layout_states() || test_youtube_filters_and_chapters();
     if (argc == 2 && strcmp(argv[1], "--youtube-provider-costs-only") == 0)
         return test_youtube_provider_costs();
+    if (argc == 2 && strcmp(argv[1], "--youtube-memory-journey-only") == 0)
+        return test_youtube_repeated_journey_ownership();
     if (argc == 2 && strcmp(argv[1], "--youtube-watch-next-only") == 0)
         return test_youtube_watch_next_cards() || test_youtube_history_page()
             || test_youtube_watch_commit_defers_avatar();
@@ -410,6 +479,14 @@ int main(int argc, char **argv)
     if (argc == 2 && strcmp(argv[1], "--geometry-refusal-only") == 0)
         return test_geometry_refusal_not_retried_read_by_read()
             || test_geometry_refusal_gives_up_reuse_cache();
+    if (argc == 2 && strcmp(argv[1], "--image-pair-only") == 0)
+        return test_deferred_image_pair_shares_one_flow()
+            || test_relayout_image_load_while_deferred_decode_held()
+            || test_given_up_deferred_batch_keeps_script_images()
+            || test_filtered_page_fixed_images_publish_by_paint()
+            || test_full_image_table_gives_far_aliases_up_to_a_scan();
+    if (argc == 2 && strcmp(argv[1], "--geometry-records-only") == 0)
+        return test_computed_style_geometry_records();
     if (argc == 2 && strcmp(argv[1], "--computed-style-values-only") == 0)
         return test_computed_style_resolved_values();
     if (argc == 2 && strcmp(argv[1], "--container-style-only") == 0)
@@ -469,7 +546,8 @@ int main(int argc, char **argv)
         return test_background_interruption_journey();
     if (argc == 2 && strcmp(argv[1], "--google-identity-only") == 0)
         return test_google_search_compatibility_adapter()
-            || test_google_search_identity();
+            || test_google_search_identity()
+            || test_google_accounts_identity();
     if (argc == 2 && strcmp(argv[1], "--provider-navigation-only") == 0) {
         return test_cooperative_site_adapter_navigation();
     }
@@ -510,6 +588,7 @@ int main(int argc, char **argv)
     CHECK(test_deferred_script_navigation() == 0);
     CHECK(test_textarea_rows_geometry() == 0);
     CHECK(test_scroll_into_view_resolves_margin_math() == 0);
+    CHECK(test_computed_style_geometry_records() == 0);
     CHECK(test_grid_fr_rows_share_after_content() == 0);
     CHECK(test_grid_auto_row_stretch_and_focus_clip() == 0);
     CHECK(test_inset_pseudo_disc() == 0);
@@ -530,6 +609,11 @@ int main(int argc, char **argv)
     CHECK(test_cooperate_boundaries_reach_frontend() == 0);
     CHECK(test_raster_decode_checkpoints_borrow_render_shell() == 0);
     CHECK(test_deferred_image_publication_survives_rebuild() == 0);
+    CHECK(test_deferred_image_pair_shares_one_flow() == 0);
+    CHECK(test_relayout_image_load_while_deferred_decode_held() == 0);
+    CHECK(test_given_up_deferred_batch_keeps_script_images() == 0);
+    CHECK(test_filtered_page_fixed_images_publish_by_paint() == 0);
+    CHECK(test_full_image_table_gives_far_aliases_up_to_a_scan() == 0);
     CHECK(test_deferred_images_skip_oversized_pages() == 0);
     CHECK(test_same_document_and_script_free_defaults() == 0);
     CHECK(test_same_document_event_mutations_settle_immediately() == 0);
@@ -611,6 +695,7 @@ int main(int argc, char **argv)
     CHECK(test_youtube_lite_escaped_title_is_valid_utf8() == 0);
     CHECK(test_youtube_cooperative_build_convergence() == 0);
     CHECK(test_youtube_provider_costs() == 0);
+    CHECK(test_youtube_repeated_journey_ownership() == 0);
     CHECK(test_youtube_initial_tiles_are_coalesced() == 0);
     CHECK(test_youtube_home_topics_are_lazy() == 0);
     CHECK(test_settings_failure_policy_with_engine() == 0);
@@ -631,6 +716,7 @@ int main(int argc, char **argv)
     CHECK(test_youtube_missing_initial_data_terminates() == 0);
     CHECK(test_google_search_compatibility_adapter() == 0);
     CHECK(test_google_search_identity() == 0);
+    CHECK(test_google_accounts_identity() == 0);
     CHECK(test_reader_presentation_adapter() == 0);
     CHECK(test_reader_switch_reuses_page_stylesheet_responses() == 0);
     CHECK(test_blank_reader_frontend_recovery() == 0);
@@ -639,6 +725,7 @@ int main(int argc, char **argv)
     CHECK(test_basic_view_admission_and_presentation() == 0);
     CHECK(test_basic_view_recovery_memory_limited_with_navigation() == 0);
     CHECK(test_basic_view_recovery_live_realm_oom() == 0);
+    CHECK(test_basic_view_recovery_compile_refusal() == 0);
     CHECK(test_basic_view_recovery_large_and_hidden_pages() == 0);
     CHECK(test_basic_view_native_root_provenance() == 0);
     CHECK(test_basic_view_handle_capacity_is_transactional() == 0);

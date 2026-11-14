@@ -1925,3 +1925,511 @@ int test_loading_interaction_journey(void)
     browser_engine_destroy(engine);
     return 0;
 }
+
+static bool geometry_records_flush(void *opaque)
+{
+    return navigation_relayout(opaque);
+}
+
+/* Used-geometry reads (width, height, padding) answered from the
+   computed-style geometry records must equal the full ancestor walk. The
+   first pass mutates the document before each property read, so every
+   read walks; the second reads the same elements cyclically in one epoch,
+   as Internet Archive search does, over more ancestors than the 64-entry
+   ring holds. `mode` 1 adds a container query (records stay off: the
+   walk's unit basis can depend on the ancestors it resolved), mode 2 an
+   element with more ancestors than a walk takes. */
+static int computed_style_geometry_records_case(int mode)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 24u * MIB;
+    config.javascript.enabled = true;
+    config.resources.enabled = false;
+    char page[2048];
+    int page_length = snprintf(page, sizeof(page),
+        "<!doctype html><style>body{margin:0}"
+        "#root{width:440px;padding:0 5%%}"
+        ".col{padding:0 10%% 0 4%%}.cont{display:contents}"
+        ".inl{padding:0 7%%}"
+        ".rel{position:relative;width:300px;padding:0 12px}"
+        ".leaf{width:50%%;height:7px;padding:1px 10%% 2px 5%%}"
+        ".abs{position:absolute;top:0;left:0;width:40px}"
+        ".fix{position:fixed;top:0;left:0;width:30px}"
+        ".leaf::before{content:'';display:block;padding-left:10%%}"
+        ".deep{padding-left:1%%}%s</style><div id=root></div>",
+        mode == 1 ? "#root{container-type:inline-size}"
+                    "@container (min-width:100px){.leaf{padding-left:3cqw}}"
+                  : "");
+    CHECK(page_length > 0 && (size_t) page_length < sizeof(page));
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL);
+    CHECK(browser_engine_commit_html(engine, "https://geometry-records.test/",
+        page, (size_t) page_length, true));
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    CHECK(navigation != NULL && navigation->page.runtime != NULL);
+    ScriptRuntime *runtime = navigation->page.runtime;
+    script_runtime_set_synchronous_layout_callback(runtime,
+        geometry_records_flush, navigation);
+    ScriptResult result = {0};
+    char build[2048];
+    int build_length = snprintf(build, sizeof(build),
+        "(()=>{const root=document.getElementById('root'),el=(t,c)=>{"
+        "const e=document.createElement(t);e.className=c;return e};"
+        "globalThis.leaves=[];"
+        "for(let i=0;i<%d;i++){const a=el(i%%3?'div':'span',"
+        "['inl','col','cont'][i%%3]),b=el('div','col'),"
+        "c=el('div',i%%4?'col':'rel'),"
+        "leaf=el('div','leaf'+(i%%4?(i%%9?'':' fix'):' abs'));"
+        "c.appendChild(leaf);b.appendChild(c);a.appendChild(b);"
+        "root.appendChild(a);leaves.push(leaf)}"
+        "if(%d){let at=root;for(let i=0;i<70;i++){const d=el('div','deep');"
+        "at.appendChild(d);at=d}const leaf=el('div','leaf');"
+        "at.appendChild(leaf);leaves.push(leaf)}"
+        "let n=0;globalThis.readGeometry=(e,fresh)=>{"
+        "const s=getComputedStyle(e),p=getComputedStyle(e,'::before');"
+        "return [[s,'width'],[s,'height'],[s,'padding'],[s,'paddingLeft'],"
+        "[s,'paddingRight'],[p,'paddingLeft']].map(([d,k])=>{"
+        "if(fresh)document.body.setAttribute('data-n',String(n++));"
+        "return d[k]}).join('|')};"
+        "globalThis.walked=leaves.map(e=>readGeometry(e,true))})()", mode == 2 ? 4 : 72, mode == 2 ? 1 : 0);
+    CHECK(build_length > 0 && (size_t) build_length < sizeof(build));
+    bool walked = script_runtime_evaluate_diagnostic(runtime, build,
+        "<geometry-records-walk>", &result);
+    if (!walked) printf("geometry records walk: %s\n", result.error);
+    CHECK(walked);
+    /* The reference pass really walked. */
+    size_t hits_before = runtime->bridge.computed_style_cache.geometry_hits;
+    CHECK(hits_before == 0);
+    bool same = script_runtime_evaluate_diagnostic(runtime,
+        "(()=>{const bad=[];for(let pass=0;pass<3;pass++)"
+        "leaves.forEach((e,i)=>{const got=readGeometry(e);"
+        "if(got!==walked[i]&&bad.length<4)bad.push(i+':'+got+' vs '+walked[i])});"
+        "if(walked[1].split('|')[3]==='0px')bad.push('no percentage padding');"
+        "pocSummary=bad.length?bad.join(' ; '):'SAME'})()",
+        "<geometry-records-read>", &result);
+    if (!same || strcmp(result.summary, "SAME") != 0)
+        printf("geometry records mode %d: %s %s\n", mode, result.summary,
+               result.error);
+    CHECK(same && strcmp(result.summary, "SAME") == 0);
+    size_t geometry_hits =
+        runtime->bridge.computed_style_cache.geometry_hits - hits_before;
+    bool off = runtime->bridge.computed_style_cache.geometry_off;
+    printf("geometry records mode %d: hits=%zu off=%d\n", mode,
+           geometry_hits, off ? 1 : 0);
+    if (mode == 0) CHECK(geometry_hits >= 3u * 72u && !off);
+    if (mode == 1) CHECK(geometry_hits == 0 && !off);
+    if (mode == 2) CHECK(geometry_hits == 0 && off);
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+int test_computed_style_geometry_records(void)
+{
+    CHECK(computed_style_geometry_records_case(0) == 0);
+    CHECK(computed_style_geometry_records_case(1) == 0);
+    CHECK(computed_style_geometry_records_case(2) == 0);
+    return 0;
+}
+
+/* The two images of one row, requested together, share one flow even when
+   decoding the second takes several owner pumps after the first is in, as
+   on the PSP: pumps spent decoding do not count toward the wait for the
+   second. A second response still on the network after the first is in
+   holds the first for at most a few pumps. `collect_delay` withholds each
+   finished decode for that many pumps (host fault). Counts publications. */
+static bool image_command_bound(const NavigationSession *nav,
+                                const lxb_dom_node_t *node)
+{
+    const LayoutDocument *layout = &nav->page.layout;
+    for (size_t i = 0; i < layout->count; i++)
+        if (layout->commands[i].type == DRAW_IMAGE
+            && layout->commands[i].image != NULL
+            && layout->commands[i].image->node == node) return true;
+    return false;
+}
+
+static int deferred_image_pair_case(const char *url, unsigned collect_delay,
+                                    size_t *publications, uint64_t *frame,
+                                    unsigned *pumps_to_first)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 24u * MIB;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    config.resources.enabled = true;
+    config.resources.web_fonts_enabled = false;
+    config.resources.maximum_images = 12;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL);
+    bool replaying = fetch_trace_replay_begin(
+        TILEFINCH_TEST_SOURCE_DIR "/tests/fixtures/http-interactive-image-pair",
+        error, sizeof(error));
+    if (!replaying) fprintf(stderr, "image pair replay: %s\n", error);
+    CHECK(replaying);
+    CHECK(browser_engine_load_url(engine, url, true));
+    NavigationSession *nav = browser_engine_navigation(engine);
+    CHECK(nav->page.loaded && nav->page.image_continuation_pending
+        && nav->page.deferred_image_count == 2u);
+    lxb_dom_node_t *root = lxb_dom_interface_node(nav->page.document.html);
+    lxb_dom_node_t *left = test_reader_find_id(root, "left");
+    CHECK(left != NULL);
+    tilefinch_test_faults()->image_decode_collect_delay = collect_delay;
+    tilefinch_test_faults()->image_decode_collect_delayed = 0;
+    /* Every publication, a flow or a fixed-image paint, counts once. */
+    size_t before = nav->incremental_relayouts;
+    *pumps_to_first = 0;
+    for (unsigned pump = 0; nav->page.image_continuation_pending && pump < 1024; pump++) {
+        bool changed = false;
+        (void) browser_engine_run_deferred_image_work(engine, &changed);
+        if (*pumps_to_first == 0 && image_command_bound(nav, left))
+            *pumps_to_first = pump + 1u;
+    }
+    unsigned delayed = tilefinch_test_faults()->image_decode_collect_delayed;
+    tilefinch_test_faults()->image_decode_collect_delay = 0;
+    *publications = nav->incremental_relayouts - before;
+    CHECK(!nav->page.image_continuation_pending
+        && nav->performance.background_image_failures == 0
+        && nav->page.images.stats.failed == 0
+        && nav->performance.background_images_loaded == 2u);
+    /* Both went through the resumable raster decode the fault slows. */
+    CHECK(collect_delay == 0 || delayed >= 2u * collect_delay);
+    CHECK(browser_engine_render_frame(engine, NULL));
+    size_t count = 0;
+    const uint16_t *pixels = browser_engine_framebuffer(engine, &count);
+    CHECK(pixels != NULL && count != 0);
+    *frame = frame_checksum(pixels, count);
+    fetch_trace_end();
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+int test_deferred_image_pair_shares_one_flow(void)
+{
+    static const char page[] = "https://image-pair.test/page";
+    size_t relayouts = 0, slow_relayouts = 0; /* publications */
+    uint64_t frame = 0, slow_frame = 0;
+    unsigned first = 0, slow_first = 0;
+    CHECK(deferred_image_pair_case(page, 0, &relayouts, &frame, &first) == 0);
+    CHECK(deferred_image_pair_case(page, 6, &slow_relayouts, &slow_frame,
+                                   &slow_first) == 0);
+    fprintf(stderr, "image pair: relayouts=%zu/%zu first-at=%u/%u\n",
+            relayouts, slow_relayouts, first, slow_first);
+    CHECK(relayouts == 1u && slow_relayouts == 1u && frame == slow_frame);
+    /* A second response that is still on the network does not hold the
+       first image back: it appears within a few pumps of its decode, and
+       the second gets a flow of its own. */
+    size_t network_relayouts = 0;
+    uint64_t network_frame = 0;
+    unsigned network_first = 0;
+    CHECK(deferred_image_pair_case("https://image-pair.test/slow-page", 0,
+        &network_relayouts, &network_frame, &network_first) == 0);
+    fprintf(stderr, "image pair slow network: relayouts=%zu first-at=%u\n",
+            network_relayouts, network_first);
+    CHECK(network_relayouts == 2u && network_first <= first + 4u
+        && network_frame == frame);
+    return 0;
+}
+
+/* Internet Archive search on the PSP: a deferred thumbnail's JPEG decode
+   spans several owner pumps, and the page's next script cycle can change
+   what an image shows inside that window. The relayout's image load then
+   meets a decoder it did not start, and refusing it cost a full relayout
+   with a whole image-table rebuild (about 8 s each on the device), seen as
+   `full:image-scan-failed`. The relayout gives the deferred batch up
+   instead and stays incremental; the batch is loaded again afterwards. */
+int test_relayout_image_load_while_deferred_decode_held(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 24u * MIB;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    config.resources.enabled = true;
+    config.resources.web_fonts_enabled = false;
+    config.resources.maximum_images = 12;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    /* Keyed, as the device journeys replay: a given-up batch fetches its
+       thumbnails again. */
+    CHECK(engine != NULL && fetch_trace_replay_begin_response_keyed(
+        TILEFINCH_TEST_SOURCE_DIR "/tests/fixtures/http-interactive-image-pair",
+        error, sizeof(error)));
+    CHECK(browser_engine_load_url(engine, "https://image-pair.test/page", true));
+    NavigationSession *nav = browser_engine_navigation(engine);
+    CHECK(nav->page.loaded && nav->page.runtime != NULL
+        && nav->page.deferred_image_count == 2u);
+    lxb_dom_node_t *root = lxb_dom_interface_node(nav->page.document.html);
+    lxb_dom_node_t *left = test_reader_find_id(root, "left");
+    lxb_dom_node_t *right = test_reader_find_id(root, "right");
+    CHECK(left != NULL && right != NULL);
+    /* Hold each finished decode, as the PSP worker still decoding would. */
+    tilefinch_test_faults()->image_decode_collect_delay = 1000;
+    tilefinch_test_faults()->image_decode_collect_delayed = 0;
+    for (unsigned pump = 0; pump < 512
+         && !images_priority_load_holds_decoder(nav->page.deferred_image_job);
+         pump++) {
+        bool changed = false;
+        (void) browser_engine_run_deferred_image_work(engine, &changed);
+    }
+    CHECK(images_priority_load_holds_decoder(nav->page.deferred_image_job));
+    /* The page restyles the paragraph around an icon: the relayout refreshes
+       the icon's image synchronously. */
+    CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime,
+        "document.querySelector('p').insertAdjacentHTML('beforeend',"
+        "'<svg id=icon width=12 height=12><rect width=12 height=12 "
+        "fill=red /></svg>')",
+        "<decode-held-relayout>", &nav->page.script_result));
+    size_t full_before = nav->performance.full_relayouts;
+    CHECK(navigation_relayout(nav));
+    lxb_dom_node_t *icon = test_reader_find_id(root, "icon");
+    CHECK(nav->performance.full_relayouts == full_before);
+    CHECK(icon != NULL && image_resource_available(
+        images_find_node(&nav->page.images, icon)));
+    CHECK(!images_priority_load_holds_decoder(nav->page.deferred_image_job));
+    /* The given-up batch loads again once the decoder is free. */
+    tilefinch_test_faults()->image_decode_collect_delay = 0;
+    for (unsigned pump = 0; nav->page.image_continuation_pending && pump < 1024;
+         pump++) {
+        bool changed = false;
+        (void) browser_engine_run_deferred_image_work(engine, &changed);
+    }
+    CHECK(!nav->page.image_continuation_pending
+        && image_resource_available(images_find_node(&nav->page.images, left))
+        && image_resource_available(images_find_node(&nav->page.images, right))
+        && browser_engine_render_frame(engine, NULL));
+    fetch_trace_end();
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+/* A deferred batch waits on the network while the page's scripts add images
+   and a relayout's scan puts them in the same table. Giving that batch up
+   later (here: its decode holds the decoder when the next relayout comes)
+   rolled the table back to the batch's start, freeing the script's image and
+   restoring older counters, and a journal-scoped scan never came back to it. */
+int test_given_up_deferred_batch_keeps_script_images(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 24u * MIB;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    config.resources.enabled = true;
+    config.resources.web_fonts_enabled = false;
+    config.resources.maximum_images = 12;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL && fetch_trace_replay_begin_response_keyed(
+        TILEFINCH_TEST_SOURCE_DIR "/tests/fixtures/http-interactive-image-pair",
+        error, sizeof(error)));
+    CHECK(browser_engine_load_url(engine, "https://image-pair.test/page", true));
+    NavigationSession *nav = browser_engine_navigation(engine);
+    CHECK(nav->page.loaded && nav->page.runtime != NULL
+        && nav->page.deferred_image_count == 2u);
+    lxb_dom_node_t *root = lxb_dom_interface_node(nav->page.document.html);
+    tilefinch_test_faults()->image_decode_collect_delay = 1000;
+    tilefinch_test_faults()->image_decode_collect_delayed = 0;
+    /* The batch is out on the network (its responses take 20 pumps). */
+    for (unsigned pump = 0; pump < 8 && nav->page.deferred_image_job == NULL;
+         pump++) {
+        bool changed = false;
+        (void) browser_engine_run_deferred_image_work(engine, &changed);
+    }
+    CHECK(nav->page.deferred_image_job != NULL
+        && !images_priority_load_holds_decoder(nav->page.deferred_image_job));
+    CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime,
+        "document.querySelector('p').insertAdjacentHTML('beforeend',"
+        "'<svg id=early width=12 height=12><rect width=12 height=12 "
+        "fill=red /></svg>')",
+        "<waiting-batch-scan>", &nav->page.script_result));
+    CHECK(navigation_relayout(nav));
+    lxb_dom_node_t *early = test_reader_find_id(root, "early");
+    CHECK(early != NULL && image_resource_available(
+        images_find_node(&nav->page.images, early)));
+    CHECK(nav->page.deferred_image_job != NULL);
+    ExternalImageStats with_early = nav->page.images.stats;
+    for (unsigned pump = 0; pump < 512
+         && !images_priority_load_holds_decoder(nav->page.deferred_image_job);
+         pump++) {
+        bool changed = false;
+        (void) browser_engine_run_deferred_image_work(engine, &changed);
+    }
+    CHECK(images_priority_load_holds_decoder(nav->page.deferred_image_job));
+    CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime,
+        "document.querySelector('p').insertAdjacentHTML('beforeend',"
+        "'<svg id=late width=12 height=12><rect width=12 height=12 "
+        "fill=blue /></svg>')",
+        "<given-up-batch-scan>", &nav->page.script_result));
+    size_t full_before = nav->performance.full_relayouts;
+    CHECK(navigation_relayout(nav));
+    CHECK(nav->performance.full_relayouts == full_before
+        && !images_priority_load_holds_decoder(nav->page.deferred_image_job));
+    lxb_dom_node_t *late = test_reader_find_id(root, "late");
+    CHECK(late != NULL && image_resource_available(
+        images_find_node(&nav->page.images, late)));
+    /* The earlier script image and its accounting survive the give-up. */
+    CHECK(image_resource_available(images_find_node(&nav->page.images, early)));
+    CHECK(nav->page.images.stats.attempted > with_early.attempted
+        && nav->page.images.stats.loaded > with_early.loaded
+        && nav->page.images.stats.decoded_bytes > with_early.decoded_bytes);
+    /* And the batch still loads afterwards. */
+    tilefinch_test_faults()->image_decode_collect_delay = 0;
+    for (unsigned pump = 0; nav->page.image_continuation_pending && pump < 1024;
+         pump++) {
+        bool changed = false;
+        (void) browser_engine_run_deferred_image_work(engine, &changed);
+    }
+    CHECK(!nav->page.image_continuation_pending
+        && image_resource_available(images_find_node(&nav->page.images, early))
+        && image_resource_available(images_find_node(&nav->page.images, late))
+        && browser_engine_render_frame(engine, NULL));
+    fetch_trace_end();
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+/* Internet Archive search filters some of its elements (a colour filter such
+   as grayscale). Such a filter changes each command's own pixels and none
+   around it, so an arriving fixed-size thumbnail still publishes by paint
+   alone. Refusing that made every thumbnail and icon reached while
+   scrolling cost a relayout of the whole page (about 2.4 s each on the
+   device). The thumbnail here is filtered itself, and the painted frame must
+   equal a full flow's. */
+int test_filtered_page_fixed_images_publish_by_paint(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 24u * MIB;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    config.resources.enabled = true;
+    config.resources.web_fonts_enabled = false;
+    config.resources.maximum_images = 12;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL && fetch_trace_replay_begin(
+        TILEFINCH_TEST_SOURCE_DIR "/tests/fixtures/http-interactive-image-pair",
+        error, sizeof(error)));
+    CHECK(browser_engine_load_url(engine, "https://image-pair.test/page", true));
+    static const char css[] = "#left{filter:invert(1)}";
+    CHECK(browser_engine_apply_user_css(engine, css, sizeof(css) - 1u));
+    NavigationSession *nav = browser_engine_navigation(engine);
+    CHECK(nav->page.loaded && nav->page.image_continuation_pending
+        && nav->page.deferred_image_count == 2u);
+    bool filtered = false;
+    for (size_t i = 0; i < nav->page.layout.count; i++)
+        filtered = filtered
+            || draw_command_filter_code(&nav->page.layout.commands[i]) != 0;
+    CHECK(filtered && browser_engine_render_frame(engine, NULL));
+    size_t flows = nav->performance.background_image_relayouts;
+    size_t publications = nav->incremental_relayouts;
+    for (unsigned pump = 0; nav->page.image_continuation_pending && pump < 1024;
+         pump++) {
+        bool changed = false;
+        (void) browser_engine_run_deferred_image_work(engine, &changed);
+    }
+    CHECK(!nav->page.image_continuation_pending
+        && nav->performance.background_images_loaded == 2u
+        && nav->performance.background_image_failures == 0);
+    CHECK(nav->performance.background_image_relayouts == flows
+        && nav->incremental_relayouts > publications);
+    CHECK(browser_engine_render_frame(engine, NULL));
+    size_t count = 0;
+    const uint16_t *pixels = browser_engine_framebuffer(engine, &count);
+    CHECK(pixels != NULL && count != 0);
+    uint64_t painted = frame_checksum(pixels, count);
+    CHECK(navigation_relayout(nav) && browser_engine_render_frame(engine, NULL));
+    size_t reference_count = 0;
+    const uint16_t *reference = browser_engine_framebuffer(engine, &reference_count);
+    CHECK(reference_count == count
+        && frame_checksum(reference, reference_count) == painted);
+    fetch_trace_end();
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+/* Internet Archive search repeats the same inline-SVG icons in every tile of
+   a long list. Built up by the page's scripts, the list fills the image table
+   with aliases of icons far below the reader, and a full table refused the
+   images the page added next (the thumbnails near the top among them): only
+   viewport looks found those again, each costing the reader a flow. A scan
+   now makes the room it needs from laid-out entries far from the reader. */
+int test_full_image_table_gives_far_aliases_up_to_a_scan(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 24u * MIB;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    config.resources.enabled = true;
+    config.resources.web_fonts_enabled = false;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL);
+    static char html[32768];
+    size_t used = (size_t) snprintf(html, sizeof(html),
+        "<!doctype html><style>div.t{height:40px}</style><body>"
+        "<div id=top>Results</div>");
+    for (unsigned i = 0; i < IMAGE_TRACKED_NODE_LIMIT + 8u; i++) {
+        int n = snprintf(html + used, sizeof(html) - used,
+            "<div class=t id=t%u><svg width=12 height=12><rect width=12 "
+            "height=12 fill=green /></svg></div>", i);
+        CHECK(n > 0 && (size_t) n < sizeof(html) - used);
+        used += (size_t) n;
+    }
+    int n = snprintf(html + used, sizeof(html) - used,
+                     "<script>setInterval(function(){},1000)</script>");
+    CHECK(n > 0 && (size_t) n < sizeof(html) - used);
+    used += (size_t) n;
+    CHECK(browser_engine_commit_html(engine, "https://icons.test/", html,
+                                     used, true));
+    NavigationSession *nav = browser_engine_navigation(engine);
+    CHECK(nav->page.loaded && nav->page.runtime != NULL
+        && browser_engine_render_frame(engine, NULL));
+    CHECK(nav->page.images.count == IMAGE_TRACKED_NODE_LIMIT);
+    lxb_dom_node_t *root = lxb_dom_interface_node(nav->page.document.html);
+    char far_id[16];
+    snprintf(far_id, sizeof(far_id), "t%u", IMAGE_TRACKED_NODE_LIMIT - 1u);
+    lxb_dom_node_t *far_tile = test_reader_find_id(root, far_id);
+    CHECK(far_tile != NULL && far_tile->first_child != NULL
+        && images_find_node(&nav->page.images, far_tile->first_child) != NULL);
+    /* The page adds an icon of its own beside the reader. */
+    CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime,
+        "document.getElementById('top').insertAdjacentHTML('beforeend',"
+        "'<svg id=fresh width=20 height=20><circle cx=10 cy=10 r=9 "
+        "fill=blue /></svg>')",
+        "<full-table-scan>", &nav->page.script_result));
+    size_t full_before = nav->performance.full_relayouts;
+    CHECK(navigation_relayout(nav));
+    lxb_dom_node_t *fresh = test_reader_find_id(root, "fresh");
+    CHECK(nav->performance.full_relayouts == full_before);
+    CHECK(fresh != NULL && image_resource_available(
+        images_find_node(&nav->page.images, fresh)));
+    /* The room came from the far end of the list. */
+    CHECK(images_find_node(&nav->page.images, far_tile->first_child) == NULL
+        && nav->performance.viewport_image_evictions != 0);
+    CHECK(browser_engine_render_frame(engine, NULL));
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    return 0;
+}

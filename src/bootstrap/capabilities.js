@@ -2,6 +2,9 @@
   const createPrivateWeakMap = globalThis.__tilefinchCreatePrivateWeakMap;
   if (typeof createPrivateWeakMap !== "function")
     throw new Error("Private runtime storage is unavailable");
+  /* Loaded on first use, after the page may have replaced these globals:
+     extend the interfaces hardening.js captured. */
+  const { Event, EventTarget } = globalThis.__tilefinchEventInterfaces;
 
   /* PSP has no speech synthesizer, but exposing the bounded Web Speech shape
      lets feature detection observe an empty engine instead of failing while
@@ -98,6 +101,7 @@
         () =>
           utterance.dispatchEvent(
             new SpeechSynthesisErrorEvent("error", {
+              __proto__: null,
               utterance,
               error: "synthesis-unavailable",
             }),

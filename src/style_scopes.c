@@ -86,17 +86,6 @@ uint64_t style_subject_adopted_scope(const Stylesheet *sheet,
     return style_node_adopted_scope(sheet, node);
 }
 
-bool style_adopted_scope_admits(const Stylesheet *sheet, unsigned order,
-                                const lxb_dom_node_t *node,
-                                const StyleMatchSubject *subject)
-{
-    uint64_t bit = style_adopted_source_bit(sheet, order);
-    if (bit != 0 && style_adopted_scopes_document_only(sheet))
-        return (sheet->scopes.adopted_document_mask & bit) != 0;
-    if ((sheet->scopes.adopted_shadow_only_mask & bit) == 0) return true;
-    return (style_subject_adopted_scope(sheet, subject, node) & bit) != 0;
-}
-
 uint64_t style_adopted_cascade_order(const Stylesheet *sheet,
                                     const lxb_dom_node_t *node, unsigned order)
 {
@@ -568,6 +557,11 @@ static bool stylesheet_set_tracked_adopted_scopes(Stylesheet *sheet,
     if (changed_count != NULL) *changed_count = 0;
     if (global != NULL) *global = false;
     if (sheet == NULL || sheet->budget == NULL) return false;
+    /* A refused update left confined sources admitted nowhere
+       (style_adopted_scopes_document_only) while the committed table
+       still names their roots: installing a table now re-admits them
+       under every root, which a diff against that table cannot show. */
+    bool recovering = sheet->scopes.adopted_scopes_failed;
     size_t sources = sheet->scopes.adopted_source_count;
     if (sources > sheet->style_source_count || sheet->style_sources_bounded_out)
         sources = 0;
@@ -710,6 +704,7 @@ static bool stylesheet_set_tracked_adopted_scopes(Stylesheet *sheet,
     }
     sheet->scopes.adopted_shadow_only_mask = shadow_only;
     sheet->scopes.adopted_scopes_failed = false;
+    if (recovering && global != NULL) *global = true;
     sheet->scopes.adopted_order_varies = false;
     for (size_t i = 0; i < root_count; i++)
         stylesheet_note_adopted_order(sheet, roots[i].order, sources);

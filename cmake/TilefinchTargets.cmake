@@ -442,6 +442,7 @@ if(PSP)
             src/psp_app/psp_app_network.c
             src/psp_app/psp_app_page.c
             src/psp_app/psp_app_page_dialog.c
+            src/psp_app/psp_app_media_capture.c
             src/psp_app/psp_app_runtime.c
             src/psp_canvas_ge.c
             src/psp_app/psp_app_surfaces.c
@@ -466,7 +467,8 @@ if(PSP)
             src/psp_offline_store.c
             src/screenshot_png.c
             src/psp_text_input.c
-            src/psp_atomic_shims.c)
+            src/psp_atomic_shims.c
+            src/psp_newlib_shims.c)
         if(TILEFINCH_PSP_VALIDATION_LOG AND NOT PSP_BROWSER_CURL_STUB)
             target_sources(psp-browser-script PRIVATE
                 src/psp_update_e2e.c src/psp_update_route.c)
@@ -492,33 +494,66 @@ if(PSP)
             tilefinch_psp_media_present
             tilefinch_psp_app_support tilefinch_diagnostic_qr)
         # newlib's integer-only printf cores are pulled in only by newlib
-        # itself (assert -> fiprintf, strftime -> sniprintf), while the
-        # browser already links the full _vfprintf_r and _svfprintf_r for its
-        # own printf/snprintf calls. The full cores print every integer-only
-        # format identically, so resolve the integer-only entry points to them
-        # instead of linking a second copy of each (11.5 KB of .text). Only the
-        # browser does this: in an image without its own printf, the alias
-        # would pull the larger core in.
+        # itself (strftime -> sniprintf), while the browser already links the
+        # full _svfprintf_r for its own snprintf calls. The full core prints
+        # every integer-only format identically, so resolve the integer-only
+        # entry point to it instead of linking a second copy. The shipping
+        # image has no stream printf at all (src/psp_newlib_shims.c keeps
+        # assert and mallinfo from pulling one in); validation builds print
+        # through _vfprintf_r, so there the stream alias saves the second
+        # copy too. In an image without its own printf, an alias would pull
+        # the larger core in.
         target_link_options(psp-browser-script PRIVATE
-            "LINKER:--defsym=_vfiprintf_r=_vfprintf_r"
             "LINKER:--defsym=_svfiprintf_r=_svfprintf_r")
-        # Code-layout experiments (.private-investigations/PERFORMANCE_LEDGER.md,
-        # "Profile-ordered code layout"). Every function already has its own section
-        # (-ffunction-sections), so a
-        # GNU ld --section-ordering-file places a profiled hot set first and
-        # contiguous in .text, inside as few 8 KiB I-cache ways as it needs.
-        # Link-only: the objects, and so the instructions, are unchanged.
-        # Empty (the default) leaves the link exactly as before.
+        if(TILEFINCH_PSP_VALIDATION_LOG)
+            target_link_options(psp-browser-script PRIVATE
+                "LINKER:--defsym=_vfiprintf_r=_vfprintf_r")
+        endif()
+        # Hot-code placement experiment (docs/engineering/CODE_LAYOUT.md).
+        # Every function has its own section (-ffunction-sections), so a GNU
+        # ld --section-ordering-file can put the profiled hot functions first
+        # in .text, each tier starting on an 8 KiB link boundary (a fixed
+        # offset within an I-cache way). Link-only: the objects, and so the
+        # instructions and frame hashes, are unchanged. Off by default: on a
+        # PSP the ordered layout was slower than the natural link order
+        # (CODE_LAYOUT.md). With it on,
+        # tools/check_psp_hot_order.py fails a link that left more than 5% of
+        # the order's heat outside its block.
+        option(PSP_BROWSER_PSP_HOT_ORDER
+            "Link the profiled hot-function order (cmake/PspHotOrder.ld) first in PSP .text (experiment; slower on a PSP)" OFF)
+        # Experiments only: links another ordering file (a control layout,
+        # a candidate list, a padding control). Never set it in a shipping or
+        # baseline build.
         set(PSP_BROWSER_PSP_SECTION_ORDERING_FILE "" CACHE FILEPATH
-            "GNU ld section ordering file for the PSP browser links (experiment)")
+            "Replace the committed PSP hot order with this GNU ld section ordering file (experiment)")
         option(PSP_BROWSER_PSP_LINK_MAP
             "Write a linker map beside the PSP browser ELF and dev PRX" OFF)
-        set(TILEFINCH_PSP_LAYOUT_LINK_OPTIONS)
+        set(TILEFINCH_PSP_SECTION_ORDERING_FILE "")
         if(PSP_BROWSER_PSP_SECTION_ORDERING_FILE)
+            message(WARNING "PSP hot order replaced by "
+                "${PSP_BROWSER_PSP_SECTION_ORDERING_FILE}: experiment build")
+            set(TILEFINCH_PSP_SECTION_ORDERING_FILE
+                "${PSP_BROWSER_PSP_SECTION_ORDERING_FILE}")
+        elseif(PSP_BROWSER_PSP_HOT_ORDER)
+            set(TILEFINCH_PSP_SECTION_ORDERING_FILE
+                "${CMAKE_CURRENT_SOURCE_DIR}/cmake/PspHotOrder.ld")
+        endif()
+        set(TILEFINCH_PSP_HOT_ORDER_CHECK)
+        if(PSP_BROWSER_PSP_HOT_ORDER AND NOT PSP_BROWSER_PSP_SECTION_ORDERING_FILE)
+            find_package(Python3 REQUIRED COMPONENTS Interpreter)
+            set(TILEFINCH_PSP_HOT_ORDER_CHECK
+                "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_psp_hot_order.py"
+                --nm "${CMAKE_NM}"
+                --order "${TILEFINCH_PSP_SECTION_ORDERING_FILE}"
+                --min-placed 0.95)
+        endif()
+        set(TILEFINCH_PSP_LAYOUT_LINK_OPTIONS)
+        if(TILEFINCH_PSP_SECTION_ORDERING_FILE)
             list(APPEND TILEFINCH_PSP_LAYOUT_LINK_OPTIONS
-                "LINKER:--section-ordering-file,${PSP_BROWSER_PSP_SECTION_ORDERING_FILE}")
+                "LINKER:--section-ordering-file,${TILEFINCH_PSP_SECTION_ORDERING_FILE}")
             set_property(TARGET psp-browser-script APPEND PROPERTY
-                LINK_DEPENDS "${PSP_BROWSER_PSP_SECTION_ORDERING_FILE}")
+                LINK_DEPENDS "${TILEFINCH_PSP_SECTION_ORDERING_FILE}")
         endif()
         if(TILEFINCH_PSP_LAYOUT_LINK_OPTIONS)
             target_link_options(psp-browser-script PRIVATE
@@ -676,7 +711,7 @@ if(PSP)
         # additional kernel/user imports. Keep this final ordering explicit.
         target_link_libraries(psp-browser-script PRIVATE
             m pspdisplay pspge pspctrl pspgu pspdmac psppower
-            pspaudiocodec pspaudio psputility)
+            pspaudiocodec pspaudio psputility psphprm)
         if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.31")
             set_property(TARGET psp-browser-script PROPERTY
                 LINK_LIBRARIES_STRATEGY REORDER_MINIMALLY)
@@ -712,11 +747,12 @@ if(PSP)
         # PSP .text ratchets; history is in git. Raising either limit
         # needs a re-measurement and a device-cost justification (AGENTS.md).
         if(TILEFINCH_PSP_VALIDATION_LOG)
-            # Validation-only: 5,900,000 bytes, user-approved 2026-11-08 so
-            # the merged branches can still be tested on a PSP; validation
-            # logging adds about 370 KB to the shipping build, and this branch
-            # measured 5,544,952 bytes. Previously 5,556,000 (2026-11-07).
-            set(TILEFINCH_PSP_TEXT_LIMIT 5900000)
+            # Validation-only: 6,200,000 bytes, user-approved 2026-11-13 so
+            # the WebGL, Web Audio, microphone and layout branches keep room
+            # for validation logging (about 430 KB over the shipping build);
+            # this branch measured 5,815,172 bytes. Previously 5,900,000
+            # (2026-11-08) and 5,556,000 (2026-11-07).
+            set(TILEFINCH_PSP_TEXT_LIMIT 6200000)
         else()
             # Ordinary: 5,500,000 bytes, user-approved 2026-11-08 so the
             # page-audio, dialog, image and language-pack branches and their
@@ -804,6 +840,12 @@ if(PSP)
                 -DTILEFINCH_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CheckPspHotSymbolSizes.cmake"
             COMMENT "Checking PSP hot-function instruction-cache ratchets")
+        if(TILEFINCH_PSP_HOT_ORDER_CHECK)
+            add_custom_command(TARGET psp-browser-script POST_BUILD
+                COMMAND ${TILEFINCH_PSP_HOT_ORDER_CHECK}
+                    --elf $<TARGET_FILE:psp-browser-script>.unstripped
+                COMMENT "Checking the PSP hot-function order placement")
+        endif()
         add_custom_command(TARGET psp-browser-script POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E make_directory
                 $<TARGET_FILE_DIR:psp-browser-script>/fonts
@@ -969,8 +1011,11 @@ if(PSP)
         # The EBOOT's newlib printf aliases (see psp-browser-script above),
         # so a host0: hardware run executes the same printf cores it does.
         target_link_options(psp-browser-script-dev-prx PRIVATE
-            "LINKER:--defsym=_vfiprintf_r=_vfprintf_r"
             "LINKER:--defsym=_svfiprintf_r=_svfprintf_r")
+        if(TILEFINCH_PSP_VALIDATION_LOG)
+            target_link_options(psp-browser-script-dev-prx PRIVATE
+                "LINKER:--defsym=_vfiprintf_r=_vfprintf_r")
+        endif()
             # A target whose only sources are prebuilt objects has no language
             # to infer a linker from. The .elf name keeps this intermediate
             # from ever colliding with the EBOOT's own ELF, which every script
@@ -1042,7 +1087,7 @@ if(PSP)
             endif()
             target_link_libraries(psp-browser-script-dev-prx PRIVATE
                 m pspdisplay pspge pspctrl pspgu pspdmac psppower
-                pspaudiocodec pspaudio psputility)
+                pspaudiocodec pspaudio psputility psphprm)
             if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.31")
                 set_property(TARGET psp-browser-script-dev-prx PROPERTY
                     LINK_LIBRARIES_STRATEGY REORDER_MINIMALLY)
@@ -1067,11 +1112,17 @@ if(PSP)
                 target_link_options(psp-browser-script-dev-prx PRIVATE
                     ${TILEFINCH_PSP_LAYOUT_LINK_OPTIONS})
                 set_property(TARGET psp-browser-script-dev-prx APPEND PROPERTY
-                    LINK_DEPENDS "${PSP_BROWSER_PSP_SECTION_ORDERING_FILE}")
+                    LINK_DEPENDS "${TILEFINCH_PSP_SECTION_ORDERING_FILE}")
             endif()
             if(PSP_BROWSER_PSP_LINK_MAP)
                 target_link_options(psp-browser-script-dev-prx PRIVATE
                     "LINKER:-Map,${CMAKE_CURRENT_BINARY_DIR}/psp-browser-script-dev.map")
+            endif()
+            if(TILEFINCH_PSP_HOT_ORDER_CHECK)
+                add_custom_command(TARGET psp-browser-script-dev-prx POST_BUILD
+                    COMMAND ${TILEFINCH_PSP_HOT_ORDER_CHECK}
+                        --elf $<TARGET_FILE:psp-browser-script-dev-prx>
+                    COMMENT "Checking the PSP hot-function order placement")
             endif()
             add_custom_command(TARGET psp-browser-script-dev-prx POST_BUILD
                 COMMAND ${CMAKE_COMMAND}
@@ -1179,21 +1230,6 @@ if(PSP_BROWSER_LIBCURL_TRANSPORT AND NOT PSP)
     target_link_libraries(psp-browser-trace-acquire PRIVATE tilefinch_core)
     add_executable(psp-browser-trace-inventory src/trace_inventory_main.c)
     target_link_libraries(psp-browser-trace-inventory PRIVATE tilefinch_core)
-endif()
-
-if(NOT PSP_BROWSER_USE_BELLARD_QUICKJS)
-    add_executable(psp-browser-quickjs-allocator-bench
-        src/quickjs_allocator_bench.c)
-    target_link_libraries(psp-browser-quickjs-allocator-bench PRIVATE tilefinch_core)
-    if(PSP_BROWSER_PGO_GENERATE)
-        target_compile_options(psp-browser-quickjs-allocator-bench PRIVATE
-            "-fprofile-instr-generate=${PSP_BROWSER_PGO_GENERATE}")
-        target_link_options(psp-browser-quickjs-allocator-bench PRIVATE
-            "-fprofile-instr-generate=${PSP_BROWSER_PGO_GENERATE}")
-    elseif(PSP_BROWSER_PGO_USE)
-        target_compile_options(psp-browser-quickjs-allocator-bench PRIVATE
-            "-fprofile-instr-use=${PSP_BROWSER_PGO_USE}")
-    endif()
 endif()
 
 if(APPLE AND PSP_BROWSER_BUILD_JSC_SPIKE)

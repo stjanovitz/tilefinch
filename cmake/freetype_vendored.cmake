@@ -35,7 +35,7 @@ set(PSP_BROWSER_FREETYPE_OPTIONS
     "${CMAKE_CURRENT_SOURCE_DIR}/cmake/freetype/ftoption-tilefinch.h")
 
 if(PSP_BROWSER_VENDOR_DIR AND EXISTS "${PSP_BROWSER_VENDOR_DIR}/freetype/CMakeLists.txt")
-    # Offline mirror, matching how lexbor / quickjs-ng / stb / dejavu-fonts are
+    # Offline mirror, matching how lexbor / stb / dejavu-fonts / nanosvg are
     # handled.  The committed FetchContent URL + hash below still makes a clean
     # checkout self-contained.
     add_subdirectory("${PSP_BROWSER_VENDOR_DIR}/freetype"
@@ -92,6 +92,13 @@ execute_process(COMMAND "${CMAKE_COMMAND}"
 execute_process(COMMAND "${CMAKE_COMMAND}"
     "-DPATCH_SOURCE_DIR=${tilefinch_freetype_source}"
     "-DPATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/patches/freetype-2.14.3-variation-frame-bounds.patch"
+    "-DPATCH_EXECUTABLE=${PATCH_EXECUTABLE}"
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/apply_patch.cmake"
+    COMMAND_ERROR_IS_FATAL ANY)
+
+execute_process(COMMAND "${CMAKE_COMMAND}"
+    "-DPATCH_SOURCE_DIR=${tilefinch_freetype_source}"
+    "-DPATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/patches/freetype-2.14.3-outline-only-sbit.patch"
     "-DPATCH_EXECUTABLE=${PATCH_EXECUTABLE}"
     -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/apply_patch.cmake"
     COMMAND_ERROR_IS_FATAL ANY)

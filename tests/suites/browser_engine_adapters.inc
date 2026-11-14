@@ -2697,6 +2697,384 @@ static int test_google_search_identity(void)
     return 0;
 }
 
+/* accounts.google.com (site_identity.h): always the honest identity, for the
+   navigation (decided per redirect hop), its subresources, its frames and
+   its realms; every other host keeps the shipping one; Google refusing it
+   returns accounts.google.com to the shipping identity and reloads once. */
+static const char *accounts_identity_prepared(
+    const char *top_level_url, const char *document_url,
+    const char *target_url, TilefinchRequestDestination destination)
+{
+    static FetchPreparedPageRequest prepared;
+    FetchPageSecurityContext security = {
+        .document_url = document_url,
+        .top_level_url = top_level_url
+    };
+    FetchPageRequestDescriptor descriptor = {
+        .target_url = target_url,
+        .method = "GET",
+        .mode = destination == TILEFINCH_DESTINATION_FRAME
+            ? TILEFINCH_REQUEST_MODE_NAVIGATE
+            : TILEFINCH_REQUEST_MODE_NO_CORS,
+        .credentials = TILEFINCH_CREDENTIALS_INCLUDE,
+        .destination = destination
+    };
+    if (!fetch_prepare_page_request(&security, &descriptor, &prepared, NULL))
+        return "<refused>";
+    const FetchRequest *request = fetch_prepared_page_request(&prepared);
+    return request == NULL ? "<refused>" : request->user_agent;
+}
+
+/* The User-Agents replay saw for url, oldest first; returns their count. */
+static unsigned accounts_identity_requests(const char *url,
+                                           const char *agents[4])
+{
+    TilefinchTestFaults *faults = tilefinch_test_faults();
+    size_t capacity = sizeof(faults->replayed_requests)
+        / sizeof(faults->replayed_requests[0]);
+    unsigned count = faults->replayed_request_count, found = 0;
+    unsigned first = count > capacity ? count - (unsigned) capacity : 0u;
+    for (unsigned i = first; i < count; i++) {
+        size_t slot = i % capacity;
+        if (strcmp(faults->replayed_requests[slot].url, url) != 0) continue;
+        if (found < 4u) agents[found] = faults->replayed_requests[slot].user_agent;
+        found++;
+    }
+    return found;
+}
+
+static void accounts_identity_clear_requests(void)
+{
+    TilefinchTestFaults *faults = tilefinch_test_faults();
+    memset(faults->replayed_requests, 0, sizeof(faults->replayed_requests));
+    faults->replayed_request_count = 0;
+}
+
+static bool accounts_identity_realm(ScriptRuntime *runtime, const char *ua,
+                                    ScriptResult *result)
+{
+    char source[256];
+    snprintf(source, sizeof(source),
+             "if(navigator.userAgent!=='%s')throw Error(navigator.userAgent)",
+             ua);
+    bool ok = runtime != NULL && script_runtime_evaluate_diagnostic(
+        runtime, source, "<accounts-identity>", result)
+        && result->error[0] == '\0';
+    if (!ok)
+        fprintf(stderr, "accounts identity realm: %s\n",
+                runtime == NULL ? "(no runtime)" : result->error);
+    return ok;
+}
+
+static int test_google_accounts_identity(void)
+{
+    static const char google_ua[] = TILEFINCH_GOOGLE_USER_AGENT;
+    static const char shipping_ua[] = TILEFINCH_BROWSER_USER_AGENT;
+    static const char accounts[] =
+        "https://accounts.google.com/v3/signin/identifier?flowName=Test";
+    static const char youtube[] = "https://www.youtube.com/";
+    static const char set_sid[] =
+        "https://accounts.youtube.com/accounts/SetSID?ssdc=1";
+    static const char sorry[] =
+        "https://www.google.com/sorry/index?continue=z";
+    site_identity_reset();
+
+    /* Exact host, no opt-in. */
+    CHECK(site_identity_accounts_host(accounts)
+          && site_identity_accounts_host("http://ACCOUNTS.google.com/x")
+          && !site_identity_accounts_host("https://accounts.google.com:8443/")
+          && !site_identity_accounts_host(
+                 "https://accounts.google.com.evil.test/")
+          && !site_identity_accounts_host(set_sid)
+          && !site_identity_accounts_host("https://myaccount.google.com/")
+          && !site_identity_accounts_host("https://www.google.com/"));
+    CHECK(!site_identity_google_opted_in()
+          && google_identity_same(site_identity_user_agent_override(accounts),
+                                  google_ua)
+          && site_identity_user_agent_override(set_sid) == NULL
+          && site_identity_user_agent_override(youtube) == NULL
+          && site_identity_user_agent_override(
+                 "https://www.google.com/search?q=PSP") == NULL
+          && site_identity_user_agent_override(
+                 "https://www.gstatic.com/_/probe.js") == NULL
+          && site_identity_user_agent_derived(NULL)
+          && site_identity_user_agent_derived(google_ua)
+          && !site_identity_user_agent_derived(shipping_ua));
+
+    /* A navigation follows its target; subresources and frames, and the
+       requests a frame makes, follow the top-level document. */
+    CHECK(google_identity_same(google_identity_prepared_user_agent(
+              youtube, accounts, true), google_ua)
+          && google_identity_prepared_user_agent(accounts, youtube, true)
+                 == NULL
+          && google_identity_prepared_user_agent(accounts, set_sid, true)
+                 == NULL
+          && google_identity_same(google_identity_prepared_user_agent(
+              accounts, "https://www.gstatic.com/_/probe.js", false),
+              google_ua)
+          && google_identity_prepared_user_agent(
+              youtube, "https://accounts.google.com/_/probe.js", false)
+                 == NULL);
+    CHECK(google_identity_same(accounts_identity_prepared(
+              accounts, accounts, "https://accounts.google.com/_/bscframe",
+              TILEFINCH_DESTINATION_FRAME), google_ua)
+          && google_identity_same(accounts_identity_prepared(
+              accounts, "https://accounts.google.com/_/bscframe",
+              "https://www.gstatic.com/_/frame.js",
+              TILEFINCH_DESTINATION_SCRIPT), google_ua)
+          && accounts_identity_prepared(
+              youtube, youtube, "https://accounts.google.com/_/bscframe",
+              TILEFINCH_DESTINATION_FRAME) == NULL);
+
+    /* The refusal classifier: stable signals only. */
+    CHECK(!site_identity_accounts_refusal(accounts, NULL, accounts, 200)
+          && site_identity_accounts_refusal(accounts, NULL, accounts, 429)
+          && site_identity_accounts_refusal(youtube, NULL, accounts, 429)
+          && !site_identity_accounts_refusal(accounts, NULL, set_sid, 429)
+          && !site_identity_accounts_refusal(youtube, NULL, youtube, 429)
+          && site_identity_accounts_refusal(accounts, NULL, sorry, 200)
+          && site_identity_accounts_refusal(
+                 accounts, NULL,
+                 "https://accounts.google.com/v3/signin/rejected?rrk=1", 200)
+          && site_identity_accounts_refusal(
+                 accounts, NULL,
+                 "https://accounts.google.com/signin/rejected", 200)
+          && !site_identity_accounts_refusal(
+                 accounts, NULL,
+                 "https://accounts.google.com/v3/signin/challenge/pwd", 200)
+          && site_identity_accounts_refusal(sorry, accounts, sorry, 200)
+          && !site_identity_accounts_refusal(sorry, youtube, sorry, 200)
+          && !site_identity_accounts_refusal(
+                 "https://www.google.com/search?q=a", accounts, sorry, 200));
+
+    /* A refusal returns accounts.google.com to the shipping identity for the
+       session, keeps one fallback, never a refusal page, and is not
+       classified again. Search's opt-in is untouched. */
+    site_identity_accounts_refused(
+        "https://accounts.google.com/v3/signin/rejected?rrk=1", accounts);
+    char fallback[256];
+    CHECK(site_identity_user_agent_override(accounts) == NULL
+          && !site_identity_accounts_refusal(accounts, NULL, accounts, 429)
+          && site_identity_take_google_fallback(fallback, sizeof(fallback))
+          && strcmp(fallback, accounts) == 0
+          && !site_identity_take_google_fallback(fallback, sizeof(fallback))
+          && !site_identity_take_google_refusal_note()
+          && !site_identity_google_opted_in());
+    site_identity_google_opt_in();
+    CHECK(google_identity_same(site_identity_user_agent_override(
+              "https://www.google.com/search?q=PSP"), google_ua)
+          && site_identity_user_agent_override(accounts) == NULL);
+    site_identity_reset();
+    site_identity_accounts_refused(NULL, youtube);
+    CHECK(!site_identity_take_google_fallback(fallback, sizeof(fallback))
+          && site_identity_user_agent_override(accounts) == NULL);
+    site_identity_reset();
+
+    /* Through the engine, with every redirect hop on the replay lane as the
+       PSP's worker runs them. */
+    static const char accounts_page[] =
+        "<!doctype html><title>Sign in probe</title><p>identifier</p>"
+        "<iframe src='https://accounts.google.com/_/bscframe'></iframe>"
+        "<script>fetch('https://www.gstatic.com/_/probe.js');</script>";
+    static const char frame_page[] =
+        "<!doctype html><title>frame</title><script>"
+        "fetch('https://accounts.google.com/_/frame-probe');</script>";
+    static const char youtube_page[] =
+        "<!doctype html><title>Set SID probe</title><p>handoff</p>"
+        "<script>fetch('https://accounts.youtube.com/_/probe');</script>";
+    static const char refusal_page[] =
+        "<!doctype html><title>Refused</title><p>refused</p>";
+    static const char limited[] =
+        "https://accounts.google.com/v3/signin/identifier?flowName=Limited";
+    static const char sorried[] =
+        "https://accounts.google.com/v3/signin/identifier?flowName=Sorry";
+    const GoogleIdentityRecord records[] = {
+        {.url = "https://redirect.test/signin", .effective_url = accounts,
+         .status = 200, .content_type = "text/html", .body = accounts_page},
+        {.url = accounts, .status = 200, .content_type = "text/html",
+         .body = accounts_page},
+        {.url = "https://www.gstatic.com/_/probe.js", .status = 200,
+         .content_type = "text/javascript", .body = "void 0;"},
+        {.url = "https://accounts.google.com/_/bscframe", .status = 200,
+         .content_type = "text/html", .body = frame_page},
+        {.url = "https://accounts.google.com/_/frame-probe", .status = 204,
+         .content_type = "text/html", .body = ""},
+        {.url = "https://accounts.google.com/ServiceLogin?service=test",
+         .effective_url = set_sid, .status = 200,
+         .content_type = "text/html", .body = youtube_page},
+        {.url = set_sid, .status = 200, .content_type = "text/html",
+         .body = youtube_page},
+        {.url = "https://accounts.youtube.com/_/probe", .status = 204,
+         .content_type = "text/html", .body = ""},
+        {.url = limited, .status = 429, .content_type = "text/html",
+         .body = refusal_page},
+        {.url = sorried, .effective_url = sorry, .status = 200,
+         .content_type = "text/html", .body = refusal_page},
+        {.url = sorry, .status = 200, .content_type = "text/html",
+         .body = refusal_page}
+    };
+    size_t record_count = sizeof(records) / sizeof(records[0]);
+    char replay[128];
+    char error[256] = {0};
+    CHECK(write_google_identity_replay(replay, records, record_count)
+          && fetch_trace_replay_begin_response_keyed(
+                 replay, error, sizeof(error)));
+    TilefinchTestFaults *faults = tilefinch_test_faults();
+    faults->replay_lane_runs_page_hops = true;
+    accounts_identity_clear_requests();
+
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 24u * MIB;
+    config.tile_capacity = 0u;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    BrowserEngine *engine = browser_engine_create(
+        &config, error, sizeof(error));
+    CHECK(engine != NULL);
+    browser_engine_set_defer_script_navigation(engine, true);
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    ScriptResult *result = &navigation->page.script_result;
+
+    /* Into accounts.google.com from another host: the first hop keeps the
+       shipping identity, the accounts hop and everything its document,
+       frame and realms request use the honest one. */
+    CHECK(browser_engine_begin_navigation_url(
+              engine, "https://redirect.test/signin", 1u * MIB, 1000, true)
+          && google_identity_pump(engine) == BROWSER_NAVIGATION_JOB_SUCCEEDED);
+    for (unsigned tick = 0; tick < 64
+         && (google_identity_replayed_user_agent(
+                 "https://accounts.google.com/_/frame-probe") == NULL
+             || google_identity_replayed_user_agent(
+                 "https://www.gstatic.com/_/probe.js") == NULL);
+         tick++)
+        (void) browser_engine_advance_runtime(engine, 16u, 4u, NULL);
+    const char *agents[4] = {0};
+    const char *start_ua = google_identity_replayed_user_agent(
+        "https://redirect.test/signin");
+    const char *hop_ua = google_identity_replayed_user_agent(accounts);
+    const char *script_ua = google_identity_replayed_user_agent(
+        "https://www.gstatic.com/_/probe.js");
+    const char *frame_ua = google_identity_replayed_user_agent(
+        "https://accounts.google.com/_/bscframe");
+    const char *frame_fetch_ua = google_identity_replayed_user_agent(
+        "https://accounts.google.com/_/frame-probe");
+    if (!google_identity_same(start_ua, shipping_ua)
+        || !google_identity_same(hop_ua, google_ua)
+        || !google_identity_same(script_ua, google_ua)
+        || !google_identity_same(frame_ua, google_ua)
+        || !google_identity_same(frame_fetch_ua, google_ua))
+        fprintf(stderr, "accounts identity start=%s hop=%s script=%s "
+                "frame=%s frame-fetch=%s url=%s error=%s\n",
+                start_ua == NULL ? "(none)" : start_ua,
+                hop_ua == NULL ? "(none)" : hop_ua,
+                script_ua == NULL ? "(none)" : script_ua,
+                frame_ua == NULL ? "(none)" : frame_ua,
+                frame_fetch_ua == NULL ? "(none)" : frame_fetch_ua,
+                navigation->page.document_url,
+                browser_engine_last_error(engine));
+    CHECK(strcmp(navigation->page.document_url, accounts) == 0
+          && strcmp(navigation->page.document.title, "Sign in probe") == 0
+          && google_identity_same(start_ua, shipping_ua)
+          && google_identity_same(hop_ua, google_ua)
+          && google_identity_same(script_ua, google_ua)
+          && google_identity_same(frame_ua, google_ua)
+          && google_identity_same(frame_fetch_ua, google_ua)
+          && accounts_identity_realm(navigation->page.runtime, google_ua,
+                                     result)
+          && navigation->page.frame_count == 1u
+          && accounts_identity_realm(navigation->page.frames[0].runtime,
+                                     google_ua, result));
+
+    /* Out of accounts.google.com (YouTube's sign-in hands off through
+       accounts.youtube.com): each hop takes its own host's identity. */
+    accounts_identity_clear_requests();
+    CHECK(browser_engine_begin_navigation_url(
+              engine, "https://accounts.google.com/ServiceLogin?service=test",
+              1u * MIB, 1000, true)
+          && google_identity_pump(engine) == BROWSER_NAVIGATION_JOB_SUCCEEDED);
+    for (unsigned tick = 0; tick < 64
+         && google_identity_replayed_user_agent(
+                "https://accounts.youtube.com/_/probe") == NULL; tick++)
+        (void) browser_engine_advance_runtime(engine, 16u, 4u, NULL);
+    CHECK(strcmp(navigation->page.document_url, set_sid) == 0
+          && google_identity_same(google_identity_replayed_user_agent(
+                 "https://accounts.google.com/ServiceLogin?service=test"),
+                 google_ua)
+          && google_identity_same(google_identity_replayed_user_agent(
+                 set_sid), shipping_ua)
+          && google_identity_same(google_identity_replayed_user_agent(
+                 "https://accounts.youtube.com/_/probe"), shipping_ua)
+          && accounts_identity_realm(navigation->page.runtime, shipping_ua,
+                                     result));
+
+    /* HTTP 429: reloaded once with the shipping identity. The reload's own
+       429 commits; nothing is retried again. */
+    accounts_identity_clear_requests();
+    CHECK(browser_engine_begin_navigation_url(engine, limited, 1u * MIB,
+                                              1000, true));
+    BrowserNavigationJobStatus status = google_identity_pump(engine);
+    unsigned limited_count = accounts_identity_requests(limited, agents);
+    if (status != BROWSER_NAVIGATION_JOB_SUCCEEDED || limited_count != 2u)
+        fprintf(stderr, "accounts 429 status=%d requests=%u error=%s\n",
+                (int) status, limited_count,
+                browser_engine_last_error(engine));
+    CHECK(status == BROWSER_NAVIGATION_JOB_SUCCEEDED && limited_count == 2u
+          && google_identity_same(agents[0], google_ua)
+          && google_identity_same(agents[1], shipping_ua)
+          && strcmp(navigation->page.document_url, limited) == 0
+          && strcmp(navigation->page.document.title, "Refused") == 0
+          && site_identity_user_agent_override(accounts) == NULL
+          && !site_identity_google_opted_in());
+    CHECK(browser_engine_begin_navigation_url(engine, accounts, 1u * MIB,
+                                              1000, true)
+          && google_identity_pump(engine) == BROWSER_NAVIGATION_JOB_SUCCEEDED
+          && google_identity_same(google_identity_replayed_user_agent(
+                 accounts), shipping_ua)
+          && accounts_identity_realm(navigation->page.runtime, shipping_ua,
+                                     result));
+
+    /* A redirect to /sorry/: the same, once. */
+    site_identity_reset();
+    accounts_identity_clear_requests();
+    CHECK(browser_engine_begin_navigation_url(engine, sorried, 1u * MIB,
+                                              1000, true));
+    status = google_identity_pump(engine);
+    unsigned sorried_count = accounts_identity_requests(sorried, agents);
+    if (status != BROWSER_NAVIGATION_JOB_SUCCEEDED || sorried_count != 2u)
+        fprintf(stderr, "accounts sorry status=%d requests=%u error=%s\n",
+                (int) status, sorried_count,
+                browser_engine_last_error(engine));
+    CHECK(status == BROWSER_NAVIGATION_JOB_SUCCEEDED && sorried_count == 2u
+          && google_identity_same(agents[0], google_ua)
+          && google_identity_same(agents[1], shipping_ua)
+          && accounts_identity_requests(sorry, agents) == 2u
+          && google_identity_same(agents[0], shipping_ua)
+          && google_identity_same(agents[1], shipping_ua)
+          && strcmp(navigation->page.document_url, sorry) == 0
+          && site_identity_user_agent_override(accounts) == NULL);
+
+    /* The synchronous load path falls back the same way, once. */
+    site_identity_reset();
+    accounts_identity_clear_requests();
+    CHECK(browser_engine_load_url_with_limits(engine, limited, 1u * MIB,
+                                              1000, true)
+          && accounts_identity_requests(limited, agents) == 2u
+          && google_identity_same(agents[0], google_ua)
+          && google_identity_same(agents[1], shipping_ua)
+          && strcmp(navigation->page.document_url, limited) == 0);
+
+    fetch_trace_end();
+    faults->replay_lane_runs_page_hops = false;
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    remove_google_identity_replay(replay, record_count);
+    site_identity_reset();
+    return 0;
+}
+
 static const DrawCommand *test_reader_text_command(
     const LayoutDocument *layout, const char *text)
 {
@@ -5106,6 +5484,140 @@ static int test_basic_view_recovery_live_realm_oom(void)
 {
     CHECK(test_basic_view_recovery_live_realm_oom_case(false) == 0);
     CHECK(test_basic_view_recovery_live_realm_oom_case(true) == 0);
+    return 0;
+}
+
+/* A script refused its compile for memory after the page committed with its
+   content (as cnn.com's ima3.js ad SDK is) leaves the page and its partly-run
+   scripts alone; the same refusal while the page was being built still makes
+   it a memory-limited page that Basic view recovers. */
+static int test_basic_view_recovery_compile_refusal_case(bool late)
+{
+    /* A literal table of small objects compiles at about eleven times its
+       source (tests/suites/dynamic_script_quota.inc): admitted on the
+       planned working set, its compile then runs out of the realm's heap
+       and is refused with the realm intact, as ima3.js is on cnn.com. */
+    size_t entries = 20000u, capacity = entries * 24u + 64u, used = 0;
+    char *source = malloc(capacity);
+    CHECK(source != NULL);
+    used = (size_t) snprintf(source, capacity, "window.adTable=[");
+    for (size_t i = 0; i < entries && used < capacity; i++)
+        used += (size_t) snprintf(source + used, capacity - used,
+                                  "%s{a:%zu,b:\"x\"}", i == 0 ? "" : ",", i);
+    if (used < capacity)
+        used += (size_t) snprintf(source + used, capacity - used,
+                                  "];window.adRan=1;");
+    CHECK(used < capacity);
+    size_t source_length = used;
+    char fixture[128], error[256] = {0};
+    CHECK(write_script_replay(fixture, "https://ads.example.test/sdk.js",
+                              source, source_length));
+    free(source);
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 24u * MIB;
+    config.tile_capacity = 4u;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    config.javascript.heap_limit = 4u * MIB;
+    config.javascript.maximum_total_bytes = 4u * MIB;
+    config.javascript.maximum_file_bytes = 4u * MIB;
+    config.resources.enabled = true;
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL
+          && fetch_trace_replay_begin_response_keyed(
+                 fixture, error, sizeof(error)));
+    navigation_set_fixed_script_memory_limits(
+        browser_engine_navigation(engine), true);
+    browser_engine_test_set_recovery_time_us(UINT64_MAX);
+    /* Late: the page's own script appends the ad script after the page is
+       shown. Early: the page itself waits on it in its head. */
+    static const char page_format[] =
+        "<!doctype html><head>%s</head><header><a href='/'>Home</a></header>"
+        "<main><h1>Retained catalog</h1><p>The page's own scripts ran and "
+        "its content is here whether or not the ad script runs.</p>"
+        "<p><a id=next href='/next'>Next entry</a></p>"
+        "<form role=search action='/find'><label>Search<input name=q></label>"
+        "<button id=submit>Go</button></form>"
+        "<p>First retained catalog paragraph.</p>"
+        "<p>Second retained catalog paragraph.</p>"
+        "<p>Third retained catalog paragraph.</p></main>"
+        "<script>window.pageReady=1;%s</script>";
+    char page[sizeof(page_format) + 256u];
+    int length = snprintf(page, sizeof(page), page_format,
+        late ? "" : "<script src='https://ads.example.test/sdk.js'></script>",
+        late ? "setTimeout(function(){var s=document.createElement('script');"
+               "s.src='https://ads.example.test/sdk.js';"
+               "document.head.appendChild(s);},1000);" : "");
+    CHECK(length > 0 && (size_t) length < sizeof(page));
+    CHECK(browser_engine_commit_html(engine, "https://catalog.example.test/",
+                                    page, (size_t) length, true));
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    CHECK(navigation->page.loaded && navigation->page.runtime != NULL);
+    if (late) {
+        CHECK(navigation->page.script_result.host_compile_memory_refusals
+                  == 0u
+              && !browser_engine_page_memory_recovery_due(engine));
+    }
+    for (unsigned turn = 0; turn < 400u
+         && navigation->page.script_result.host_compile_memory_refusals
+                == 0u; turn++) {
+        bool changed = false;
+        CHECK(browser_engine_advance_runtime(engine, 50u, 4u, NULL));
+        (void) browser_engine_run_idle_work(engine, &changed);
+    }
+    CHECK(navigation->page.script_result.host_compile_memory_refusals == 1u
+          && strstr(navigation->page.script_result.error,
+                    "rejected while compiling") != NULL
+          && navigation->page.runtime != NULL
+          && !navigation->page.script_memory_limited
+          && navigation->page.layout.link_count > 0u
+          && !browser_engine_page_is_visually_blank(engine));
+    CHECK(navigation_page_late_compile_memory_refusals(&navigation->page)
+          == (late ? 1u : 0u));
+    /* The page's scripts ran; the refused one did not, and the realm lives. */
+    ScriptResult probe = {0};
+    CHECK(script_runtime_evaluate_diagnostic(
+        navigation->page.runtime,
+        "if(window.pageReady!==1||window.adRan)"
+        "throw Error('unexpected script state')",
+        "<compile-refusal-probe>", &probe));
+    ReaderDocumentAnalysis basic = {0};
+    if (late) {
+        CHECK(!browser_engine_page_script_memory_failed(engine)
+              && !browser_engine_page_memory_recovery_due(engine));
+        CHECK(browser_engine_prepare_basic_view_recovery(engine, &basic)
+                  == BROWSER_BASIC_VIEW_RECOVERY_NONE
+              && !basic.prepared && navigation->page.runtime != NULL);
+    } else {
+        CHECK(browser_engine_page_script_memory_failed(engine)
+              && browser_engine_page_memory_recovery_due(engine));
+        BrowserBasicViewRecovery recovery =
+            browser_engine_prepare_basic_view_recovery(engine, &basic);
+        for (unsigned turn = 0; turn < 16u
+             && recovery == BROWSER_BASIC_VIEW_RECOVERY_DEFERRED; turn++) {
+            (void) browser_engine_advance_runtime(engine, 1u, 4u, NULL);
+            recovery = browser_engine_prepare_basic_view_recovery(
+                engine, &basic);
+        }
+        CHECK(recovery == BROWSER_BASIC_VIEW_RECOVERY_AVAILABLE
+              && basic.kind == READER_PAGE_BASIC);
+    }
+    Budget *budget = browser_engine_budget(engine);
+    CHECK(browser_engine_shutdown(engine) && budget->current == 0u);
+    browser_engine_test_set_recovery_time_us(0u);
+    browser_engine_destroy(engine);
+    fetch_trace_end();
+    remove_large_youtube_replay(fixture);
+    return 0;
+}
+
+static int test_basic_view_recovery_compile_refusal(void)
+{
+    CHECK(test_basic_view_recovery_compile_refusal_case(true) == 0);
+    CHECK(test_basic_view_recovery_compile_refusal_case(false) == 0);
     return 0;
 }
 

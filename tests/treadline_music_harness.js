@@ -199,6 +199,10 @@ function createGame({music = true, gameFile, gameText, musicText, audio} = {}) {
     EventTarget, Event, DOMException, console,
     __tilefinchGameAudioCommand: (command, ...args) => native.command(command, ...args),
     __tilefinchGameAudioDecode: (buffer) => native.decode(buffer),
+    // hardening.js publishes this; game-audio.js builds its events with it.
+    __tilefinchCreateEvent: (type, init) => new Event(type, init),
+    // Also hardening.js's: the interfaces game-audio.js extends.
+    __tilefinchEventInterfaces: Object.freeze({__proto__: null, Event, EventTarget}),
     __tilefinchRunTask: (name, handler, self, args) => handler.apply(self, args),
     __tilefinchReportUncaught: (error) => { throw error; },
     state, preferences, playerTank: () => player, qualificationAIActive: false,

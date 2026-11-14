@@ -296,7 +296,7 @@ bool psp_begin_page_load(BrowserEngine *engine, PspUiState *ui,
        browser look as though it ignored the request. */
     psp_ui_set_navigation_target(ui, url);
     psp_ui_set_loading(ui, true, -1);
-    psp_ui_show_status(ui, "LOADING  O CANCEL", 120);
+    psp_ui_show_loading_status(ui, BROWSER_NAVIGATION_PHASE_CONNECTING, 120);
     psp_navigation_cooperate_begin(ui, frame, engine);
     psp_text_input_before_navigation(text_input);
     /* The loading surface is already visible while the provider's bounded
@@ -447,7 +447,7 @@ bool psp_run_initial_page_load(
 {
     if (stopped != NULL) *stopped = false;
     psp_ui_set_loading(ui, true, -1);
-    psp_ui_show_status(ui, "LOADING PAGE  O CANCEL", 600);
+    psp_ui_show_loading_status(ui, BROWSER_NAVIGATION_PHASE_CONNECTING, 600);
     psp_navigation_cooperate_begin(ui, frame, engine);
     if (!browser_engine_begin_navigation_url(
             engine, url, maximum_bytes, timeout_ms, true)) {
@@ -539,6 +539,10 @@ bool psp_run_initial_page_load(
         (void) browser_engine_navigation_job_metrics(engine, &metrics);
         psp_ui_set_loading(
             ui, true, (int) metrics.completion_per_mille);
+        if (status == BROWSER_NAVIGATION_JOB_PENDING)
+            psp_ui_follow_loading_phase(
+                ui, browser_navigation_job_phase(&metrics),
+                metrics.provisional_first_present_us == 0);
         uint64_t now_us = (uint64_t) sceKernelGetSystemTimeWide();
         if (psp_page_dialog_open_us() != dialog_open_us) {
             psp_navigation_watchdog_pause(
@@ -761,8 +765,15 @@ bool psp_run_initial_page_load(
             browser_engine_last_tls_verify_result_available(engine),
             browser_engine_last_tls_verification_failed(engine),
             &tls_guidance, visible_error, sizeof(visible_error));
-        if (tls_guidance == TILEFINCH_TLS_GUIDANCE_NONE)
-            psp_ui_show_status(ui, visible_detail, 300);
+        if (tls_guidance == TILEFINCH_TLS_GUIDANCE_NONE) {
+            /* The engine's sentence stays in the failure report. */
+            unsigned code = (unsigned) browser_engine_navigation_failure_code(
+                engine);
+            snprintf(visible_error, sizeof(visible_error), "%s\n%s",
+                     psp_ui_failure_headline(code),
+                     psp_ui_failure_next_step(code));
+            psp_ui_show_status(ui, visible_error, 300);
+        }
         else
             psp_ui_show_tls_status(
                 ui, visible_detail, tls_guidance, 300);

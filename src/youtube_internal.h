@@ -5,6 +5,7 @@
    from untrusted page and API values. */
 
 #include "tilefinch/url.h"
+#include "tilefinch/platform.h"
 
 #include <ctype.h>
 #include <stdarg.h>
@@ -96,17 +97,6 @@ static inline bool youtube_query_field_is(const YoutubeQueryField *field,
 bool youtube_start_seconds_parse(const char *value, const char *end,
                                  unsigned *seconds);
 
-static inline void youtube_error(char *error, size_t error_size,
-                                 const char *format, ...)
-    __attribute__((format(printf, 3, 4)));
-static inline void youtube_error(char *error, size_t error_size,
-                                 const char *format, ...)
-{
-    if (error == NULL || error_size == 0) return;
-    va_list arguments;
-    va_start(arguments, format);
-    vsnprintf(error, error_size, format, arguments);
-    va_end(arguments);
-}
+#define youtube_error tilefinch_format_error
 
 #endif

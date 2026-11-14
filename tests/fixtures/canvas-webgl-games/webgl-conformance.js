@@ -144,33 +144,53 @@
     && gl.getParameter(gl.UNPACK_ALIGNMENT) === 8;
   gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
 
-  const vertexUniforms = Array.from({length:16}, (_, i) =>
-    `uniform vec4 v${i};`).join("");
-  const fragmentUniforms = Array.from({length:4}, (_, i) =>
-    `uniform float f${i};`).join("");
+  /* The limits are WebGL 1's minimums (128 vertex and 16 fragment uniform
+     vectors), counted over active uniforms as WebGL does. */
   const exactUniformProgram = link(
-    `attribute vec2 aPosition;${vertexUniforms}`+
-      "void main(){gl_Position=vec4(aPosition,0.,1.);}",
-    `${fragmentUniforms}void main(){gl_FragColor=vec4(1.);}`);
+    "attribute vec2 aPosition;uniform vec4 v[124];uniform mat4 m;"+
+      "void main(){gl_Position=m*vec4(aPosition+v[123].xy,0.,1.);}",
+    "uniform vec4 f[16];void main(){gl_FragColor=f[15];}");
   const vertexOverflowProgram = link(
-    "attribute vec2 aPosition;uniform mat4 tooMany[5];"+
-      "void main(){gl_Position=vec4(aPosition,0.,1.);}",
+    "attribute vec2 aPosition;uniform mat4 tooMany[33];"+
+      "void main(){gl_Position=tooMany[32]*vec4(aPosition,0.,1.);}",
     "void main(){gl_FragColor=vec4(1.);}");
   const fragmentOverflowProgram = link(
     "attribute vec2 aPosition;void main(){gl_Position=vec4(aPosition,0.,1.);}",
-    "uniform vec4 tooMany[5];void main(){gl_FragColor=vec4(1.);}");
-  const excessDeclarations = Array.from({length:25}, (_, i) =>
+    "uniform vec4 tooMany[17];void main(){gl_FragColor=tooMany[16];}");
+  /* Eight varying vectors, WebGL 1's minimum, pass from stage to stage. */
+  const varyingsLink = (count) => {
+    const names = Array.from({length:count}, (_, i) => `v${i}`);
+    const tested = link("attribute vec2 aPosition;attribute vec4 aColor;"+
+      names.map((name) => `varying vec4 ${name};`).join("")+
+      "void main(){"+names.map((name) => `${name}=aColor;`).join("")+
+      "gl_Position=vec4(aPosition,0.,1.);}",
+      names.map((name) => `varying vec4 ${name};`).join("")+
+      `void main(){gl_FragColor=${names.join("*")};}`);
+    const linked = gl.getProgramParameter(tested, gl.LINK_STATUS);
+    for (const shader of gl.getAttachedShaders(tested) || [])
+      gl.deleteShader(shader);
+    gl.deleteProgram(tested);
+    return linked;
+  };
+  /* Declared but unused uniforms are inactive and cost nothing. */
+  const inactiveDeclarations = Array.from({length:25}, (_, i) =>
     `uniform float q${i};`).join("");
-  const declarationOverflowProgram = link(
+  const inactiveDeclarationProgram = link(
     "attribute vec2 aPosition;void main(){gl_Position=vec4(aPosition,0.,1.);}",
-    `${excessDeclarations}void main(){gl_FragColor=vec4(1.);}`);
+    `${inactiveDeclarations}void main(){gl_FragColor=vec4(1.);}`);
   const uniformLimitsWork = gl.getProgramParameter(
       exactUniformProgram, gl.LINK_STATUS)
     && !gl.getProgramParameter(vertexOverflowProgram, gl.LINK_STATUS)
     && !gl.getProgramParameter(fragmentOverflowProgram, gl.LINK_STATUS)
-    && !gl.getProgramParameter(declarationOverflowProgram, gl.LINK_STATUS);
+    && gl.getProgramParameter(inactiveDeclarationProgram, gl.LINK_STATUS)
+    && gl.getProgramParameter(inactiveDeclarationProgram,
+      gl.ACTIVE_UNIFORMS) === 0
+    && gl.getParameter(gl.MAX_VERTEX_UNIFORM_VECTORS) === 128
+    && gl.getParameter(gl.MAX_FRAGMENT_UNIFORM_VECTORS) === 16
+    && gl.getParameter(gl.MAX_VARYING_VECTORS) === 8
+    && varyingsLink(8) && !varyingsLink(9);
   for (const testedProgram of [exactUniformProgram, vertexOverflowProgram,
-    fragmentOverflowProgram, declarationOverflowProgram]) {
+    fragmentOverflowProgram, inactiveDeclarationProgram]) {
     for (const testedShader of gl.getAttachedShaders(testedProgram) || [])
       gl.deleteShader(testedShader);
   }

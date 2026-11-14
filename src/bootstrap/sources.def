@@ -3,7 +3,11 @@
  *
  * BOOTSTRAP_SOURCE(symbol, file, QuickJS source name, bytecode symbol)
  * BOOTSTRAP_DIAGNOSTIC(symbol, file, QuickJS source name)
+ * BOOTSTRAP_PINNED_ATOMS(symbol)
  */
+#ifndef BOOTSTRAP_PINNED_ATOMS
+#define BOOTSTRAP_PINNED_ATOMS(symbol)
+#endif
 BOOTSTRAP_SOURCE(browser_bootstrap_cssom, "cssom.js", "<browser-cssom>",
                  browser_bootstrap_cssom_bytecode)
 BOOTSTRAP_SOURCE(browser_deterministic_clock_bootstrap,
@@ -73,7 +77,24 @@ BOOTSTRAP_SOURCE(browser_bootstrap_forms, "forms.js",
 BOOTSTRAP_SOURCE(browser_bootstrap_cssom_rules, "cssom-rules.js",
                  "<browser-cssom-rules>",
                  browser_bootstrap_cssom_rules_bytecode)
+BOOTSTRAP_SOURCE(browser_bootstrap_media_capture, "media-capture.js",
+                 "<browser-media-capture>",
+                 browser_bootstrap_media_capture_bytecode)
 BOOTSTRAP_DIAGNOSTIC(browser_dpu_diagnostic, "dpu-diagnostic.js",
                      "<dpu-diagnostic>")
 BOOTSTRAP_DIAGNOSTIC(browser_eval_source_diagnostic,
                      "eval-source-diagnostic.js", "<eval-source-diagnostic>")
+/* The modules every realm evaluates when it is created (the unconditional
+   evaluate steps of runtime_bootstrap_sequence). The generator pins the
+   atoms they name, so they run from ROM in place (README.md). Other modules
+   share those atoms and relocate only their own: listing one here would
+   keep its atoms resident in every realm whether it loads or not. */
+BOOTSTRAP_PINNED_ATOMS(browser_bootstrap_cssom)
+BOOTSTRAP_PINNED_ATOMS(browser_bootstrap)
+BOOTSTRAP_PINNED_ATOMS(browser_bootstrap_frames)
+BOOTSTRAP_PINNED_ATOMS(browser_bootstrap_platform)
+BOOTSTRAP_PINNED_ATOMS(browser_bootstrap_custom_elements)
+BOOTSTRAP_PINNED_ATOMS(browser_bootstrap_compat)
+BOOTSTRAP_PINNED_ATOMS(browser_bootstrap_scheduler)
+BOOTSTRAP_PINNED_ATOMS(browser_bootstrap_hardening)
+#undef BOOTSTRAP_PINNED_ATOMS

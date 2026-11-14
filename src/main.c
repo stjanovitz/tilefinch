@@ -793,16 +793,13 @@ int main(int argc, char **argv)
         }
         /* Parser interrupt polls make a blown watchdog budget observable
            during compiles, so the lab budget must genuinely cover engine
-           bootstrap.  Sanitizer builds run several times slower; widen the
-           budget the same way the runtime widens its JS stack guard. */
-        unsigned script_timeout_ms = 100;
-#if defined(__has_feature)
-#if __has_feature(address_sanitizer)
-        script_timeout_ms = 1000;
-#endif
-#elif defined(__SANITIZE_ADDRESS__)
-        script_timeout_ms = 1000;
-#endif
+           bootstrap.  The budget is wall-clock time, and parallel ctest
+           runs share the host with other builds: demo.html's 8 ms of
+           script took 112 ms under a loaded -j8 gate on 2026-11-14 and
+           tripped the old 100 ms budget.  1000 ms keeps a runaway script
+           bounded with two orders of magnitude of headroom, which also
+           covers sanitizer builds (they run several times slower). */
+        const unsigned script_timeout_ms = 1000;
         phase_ms = now_ms();
         if (!scripts_run_document_at_context_with_policy(
                 &document, &budget, js_limit_mb * MIB, script_timeout_ms,
@@ -1497,13 +1494,15 @@ int main(int argc, char **argv)
            scripts.module_bytecode_restore_us);
     printf("javascript-dom-handles live=%zu peak=%zu high-water=%zu "
            "reuses=%zu exhaustions=%zu wrapper-releases=%zu "
-           "connected-preserves=%zu held-wrappers=%zu stale-releases=%zu capacity=%zu "
+           "connected-preserves=%zu connected-releases=%zu held-wrappers=%zu "
+           "stale-releases=%zu capacity=%zu "
            "growths=%zu growth-refusals=%zu\n",
            scripts.dom_handle_slots_live, scripts.dom_handle_slots_peak,
            scripts.dom_handle_slots_high_water,
            scripts.dom_handle_slot_reuses, scripts.dom_handle_exhaustions,
            scripts.dom_handle_wrapper_releases,
            scripts.dom_handle_connected_preserves,
+           scripts.dom_handle_connected_releases,
            scripts.dom_handle_wrappers_held_peak,
            scripts.dom_handle_stale_releases,
            scripts.dom_handle_slot_capacity,

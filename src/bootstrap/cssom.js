@@ -209,14 +209,18 @@
     },
     dispatchTransitionEvent = (node, type, property, elapsedMs) => {
       try {
-        const init = {
-          bubbles: true,
-          propertyName: property,
-          elapsedTime: Math.max(0, elapsedMs) / 1000,
-        };
-        node.dispatchEvent(new TransitionEvent(type, init));
+        /* Transitions run only after the bootstrap, so the hardened
+           creator exists (dom.js newEvent). */
+        const createEvent = globalThis.__tilefinchCreateEvent,
+          init = {
+            bubbles: true,
+            propertyName: property,
+            elapsedTime: Math.max(0, elapsedMs) / 1000,
+          };
+        node.dispatchEvent(createEvent(type, init, "TransitionEvent"));
         if (type === "transitionend" && node.__tilefinchWebkitTransitionEnd)
-          node.dispatchEvent(new TransitionEvent("webkitTransitionEnd", init));
+          node.dispatchEvent(
+            createEvent("webkitTransitionEnd", init, "TransitionEvent"));
       } catch (error) {
         globalThis.__tilefinchReportUncaught?.(error, "CSS transition event");
       }

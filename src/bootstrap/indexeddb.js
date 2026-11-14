@@ -1,5 +1,12 @@
 (() => {
   if (globalThis.indexedDB !== undefined) return;
+  /* Dispatch passes Event's phase numbers (1 capturing, 2 at target,
+     3 bubbling) as literals instead of reading them from the global Event,
+     which a page can replace. */
+  /* This module loads on first use, after author code; hardening.js
+     captured the bootstrap's event creator before that. */
+  const createEvent = globalThis.__tilefinchCreateEvent,
+    { EventTarget } = globalThis.__tilefinchEventInterfaces;
 
   const DATABASE_LIMIT = 8;
   const STORE_LIMIT = 64;
@@ -455,22 +462,22 @@
       };
       if (!event.__stopped) {
         globalThis.__tilefinchInvokeEventTarget(
-          this, event, true, Event.AT_TARGET, observeError);
+          this, event, true, 2, observeError);
         if (!event.__stopped)
           globalThis.__tilefinchInvokeEventTarget(
-            this, event, false, Event.AT_TARGET, observeError);
+            this, event, false, 2, observeError);
       }
       if (event.bubbles && !event.__stopped)
         for (const parent of parents) {
           globalThis.__tilefinchInvokeEventTarget(
-            parent, event, false, Event.BUBBLING_PHASE, observeError);
+            parent, event, false, 3, observeError);
           if (event.__stopped) break;
         }
       globalThis.__tilefinchFinishEventDispatch(event);
       return !event.defaultPrevented;
     }
     _dispatch(type, init = {}) {
-      const event = new Event(type, {
+      const event = createEvent(type, {
         bubbles: type === "error",
         cancelable: type === "error",
       });

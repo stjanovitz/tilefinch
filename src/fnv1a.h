@@ -1,9 +1,9 @@
 #ifndef TILEFINCH_FNV1A_H
 #define TILEFINCH_FNV1A_H
 
-/* 32-bit FNV-1a hashing shared by the style rule index and the interface
-   catalog. A neutral header: including it pulls in no subsystem's budget
-   category or internals. */
+/* FNV-1a hashing: 32-bit for the style rule index and the interface
+   catalog, 64-bit for content and state signatures. A neutral header:
+   including it pulls in no subsystem's budget category or internals. */
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -33,6 +33,17 @@ static inline uint32_t style_fnv1a(uint32_t hash, const void *data,
         if (fold) value = style_ascii_lower(value);
         hash = (hash ^ value) * UINT32_C(16777619);
     }
+    return hash;
+}
+
+/* 64-bit FNV-1a of a byte span, continued from `hash` (FNV1A64_SEED, or the
+   offset a caller's stored hashes were made with). */
+#define FNV1A64_SEED UINT64_C(14695981039346656037)
+static inline uint64_t fnv1a64(uint64_t hash, const void *data, size_t length)
+{
+    const unsigned char *bytes = data;
+    for (size_t i = 0; i < length; i++)
+        hash = (hash ^ bytes[i]) * UINT64_C(1099511628211);
     return hash;
 }
 

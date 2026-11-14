@@ -351,7 +351,16 @@ static void menu_update_site_controls(
                     ui->insecure_audio_site_answer;
                 break;
             }
-            case 7: {
+            case 7:
+                /* Ask -> Allow -> Block -> Ask, remembered for the page's
+                   origin (MediaCapturePermission order). */
+                ui->microphone_site_answer =
+                    (uint8_t) ((ui->microphone_site_answer + 1u) % 3u);
+                intent->setting.id = PSP_UI_SETTING_MICROPHONE_SITE;
+                intent->setting.value.unsigned_value =
+                    ui->microphone_site_answer;
+                break;
+            case 8: {
                 /* Ask -> Memory Stick -> RAM only -> Ask; a this-session
                    grant (3) steps to Memory Stick, making it permanent. */
                 static const uint8_t next[4] = {
@@ -366,6 +375,7 @@ static void menu_update_site_controls(
                     ui->site_storage_state;
                 break;
             }
+            /* 9, Blocked here, only shows the page's count. */
         }
         intent->visual_changed = true;
     } else if (pressed & PSP_UI_BUTTON_CANCEL) {
@@ -523,7 +533,7 @@ static void menu_update_page_tools(
             (ui->menu_selection + 1u) % count);
         intent->visual_changed = true;
     } else if (pressed & PSP_UI_BUTTON_CONFIRM) {
-        switch (ui->menu_selection) {
+        switch (psp_ui_page_tools_row(ui, ui->menu_selection)) {
             case 0: intent->action = PSP_UI_ACTION_OPEN_FIND; break;
             case 1: intent->action = PSP_UI_ACTION_TOGGLE_READER; break;
             case 2: intent->action = PSP_UI_ACTION_TOGGLE_BASIC; break;
@@ -538,7 +548,12 @@ static void menu_update_page_tools(
                 return;
             case 7: intent->action = PSP_UI_ACTION_INSTALL_OFFLINE_APP; break;
             case 8: intent->action = PSP_UI_ACTION_DOWNLOAD_LINK; break;
-            case 9: intent->action = PSP_UI_ACTION_YOUTUBE_SIGNIN_CONTINUE; break;
+            case UI_PAGE_TOOLS_ROW_YOUTUBE:
+                intent->action = PSP_UI_ACTION_YOUTUBE_SIGNIN_CONTINUE;
+                break;
+            case UI_PAGE_TOOLS_ROW_MICROPHONE:
+                intent->action = PSP_UI_ACTION_STOP_MICROPHONE;
+                break;
         }
         ui->menu_selection = UI_MENU_ROW_PAGE_TOOLS;
         menu_close(ui);

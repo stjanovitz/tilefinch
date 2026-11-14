@@ -8,8 +8,9 @@ import unicodedata
 
 MAX_SEQUENCES = 4096
 MAX_CODEPOINTS = 8
-# Two catalog columns (Bengali and Assamese) of at most 64 KiB each.
-MAX_LABEL_BYTES = 2 * 65536
+# Two catalog columns (Bengali and Assamese) of at most 128 KiB each (the
+# v17 file bound, generate_ui_translations.WIDE_BYTE_LIMIT).
+MAX_LABEL_BYTES = 2 * 128 * 1024
 SCRIPTS = {
     "hi": (0x0900, 0x097f, "\u094d"),
     "bn": (0x0980, 0x09ff, "\u09cd"),

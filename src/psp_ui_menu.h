@@ -20,9 +20,20 @@
 #define UI_PAGE_TOOLS_ITEM_COUNT 9u
 static inline size_t psp_ui_page_tools_count(const PspUiState *ui)
 {
-    return UI_PAGE_TOOLS_ITEM_COUNT + (ui->youtube_signin_continue ? 1u : 0u);
+    return UI_PAGE_TOOLS_ITEM_COUNT + (ui->youtube_signin_continue ? 1u : 0u)
+        + (ui->microphone_live ? 1u : 0u);
 }
-#define UI_SITE_CONTROLS_ITEM_COUNT 8u
+/* The page tools row ROW stands for: the fixed rows, then Continue to
+   YouTube and Stop microphone when they show. */
+#define UI_PAGE_TOOLS_ROW_YOUTUBE UI_PAGE_TOOLS_ITEM_COUNT
+#define UI_PAGE_TOOLS_ROW_MICROPHONE (UI_PAGE_TOOLS_ITEM_COUNT + 1u)
+static inline size_t psp_ui_page_tools_row(const PspUiState *ui, size_t row)
+{
+    if (row == UI_PAGE_TOOLS_ITEM_COUNT && !ui->youtube_signin_continue)
+        return UI_PAGE_TOOLS_ROW_MICROPHONE;
+    return row;
+}
+#define UI_SITE_CONTROLS_ITEM_COUNT 10u
 #define UI_HELP_ITEM_COUNT 6u
 #define UI_SETTINGS_GROUP_COUNT 7u
 #define UI_SITE_INFO_ACTION_COUNT 4u

@@ -62,6 +62,13 @@ each file below names the one it uses.
   with the higher generation. This is the strongest discipline and guards the
   update state machine.
 
+A rename must name two entries of one directory. The PSP firmware's
+`rename()` reports success for a target in another directory but leaves the
+file in the source directory under the target's name, and PPSSPP does the
+same. The language-pack, voice and update installers share their file steps
+in `src/component_store.c`, whose rename refuses a pair whose parent
+directories differ.
+
 Every free-space query in the tree goes through
 `tilefinch_update_query_free_space()` (`src/update_storage.c`), which reduces
 the path to the device string (`ms0:`) on PSP — full directory paths are
@@ -208,15 +215,33 @@ for development and then takes precedence over the menu.
 - On a RAM miss for a script whose group the index names, the whole pack is
   read at most once per page load, its CRC checked, and its records copied
   into the RAM table, where the lookup finds them by source digest exactly as a RAM
-  hit (after the same fetch, CSP, SRI, CORS and MIME admission). A pack
-  that fails the check, or whose bytecode does not restore, is removed and
-  the script compiles.
+  hit (after the same fetch, CSP, SRI, CORS and MIME admission). A module
+  record the RAM table has no room for (the current load's own records are
+  never evicted for it) is restored straight from the pack it was read in,
+  with the same length, flags and source digest check, and kept nowhere. A
+  pack that fails the check, or whose bytecode does not restore, is removed
+  and the script compiles.
+- A page with more module bytecode than the module table holds (a news
+  article's dozens of modules) would otherwise keep only its first modules.
+  While the tier may write, a module the table cannot take is serialized
+  into a write queue instead, and an unwritten module record that another
+  load evicts from the table moves to the queue rather than being lost. The
+  queue holds at most 64 records and twice the module table's ceiling, is
+  charged to the page Budget as optional memory, is the first thing the
+  Budget reclaim hook frees after deferred bundle records, gives way alone
+  (by what is needed) before a full layout rebuild short of memory reclaims
+  the page's other caches, and is emptied by every clear (**Clear compiled
+  scripts**, **Clear HTTP caches**, a site's **Clear data for this site**,
+  turning the tier off or site data being blocked). On a page whose script
+  heap needs that memory before the load goes idle, the queued records are
+  dropped and the page keeps what it kept without the queue.
 - Writing is idle work only: after the page's idle turns have stored its
   scripts in RAM, further idle turns write the RAM records not yet on the
-  card, 16 KiB per turn, to `<pack>.tmp`, and rename it into place when it
-  is complete; the index is saved once nothing is left to write. Before a
-  write, least recently used packs are removed, one per turn, until the new
-  pack fits under 8 MB and 256 files. A group larger than 2 MiB stays in RAM
+  card and then the queued module records, 16 KiB per turn, to
+  `<pack>.tmp`, and rename it into place when it is complete; the index is
+  saved once nothing is left to write. Before a write, least recently used
+  packs are removed, one per turn, until the new pack fits under 8 MB and
+  256 files. A group larger than 2 MiB stays in RAM
   only.
 - The first idle turns of a session that writes sweep the directory in
   bounded slices (8 entries, 2 ms) and remove other builds' packs, stray
@@ -226,9 +251,22 @@ for development and then takes precedence over the menu.
   blocks site data, and no-store responses, `data:`/`blob:` scripts and
   opaque-origin documents never reach the tables it writes from.
 
-Writing the tier is idle Memory Stick time spread over many pages. It avoids
-recompiling unchanged scripts after a restart; the benefit depends on the page
-and its cache hits.
+It is off by default because it writes to the Memory Stick on its own,
+during the idle turns of pages you only read: card writes and wear, and up
+to 8 MB of space, that nobody asked for. The writes wait until the page's
+scripts have run and been stored in RAM, so they do not hold up the load,
+but the card stays busy for those idle turns after it. A later visit, after
+a restart, reads each pack it needs once instead of compiling the scripts in
+it. Every entry is checked before use: a pack must name this build's
+engine fingerprint and bytecode ABI and pass its CRC-32, and a record is used
+only for byte-identical source (its SHA-256) after the same fetch, CSP, SRI,
+CORS and MIME admission as a fresh script. A pack that fails is removed and
+its scripts compile, so a stale or damaged entry costs a card read, never
+a wrong script (the CRC-32 catches damage, not a deliberate forgery; see
+[Security model](SECURITY_MODEL.md)). What it saves is the compile time of
+the scripts that are unchanged since the last visit: little on a page that
+compiles little or whose scripts change between visits, more on a
+script-heavy page revisited after a restart.
 
 ### Site storage
 
@@ -469,7 +507,7 @@ adds no storage path. Deciding whether to show it reads nothing for ordinary
 pages; for a page whose census qualifies it runs the resolver's few `stat`
 calls once, and it never writes. Its **Install** is the menu's install above.
 Native UI translations live in `data/ui-language/<code>-vN.tful`, at most
-64 KiB per supported non-English language plus one installation temporary.
+128 KiB per supported non-English language plus one installation temporary.
 Only explicit installation writes them, and a successful install removes
 that language's older-version files; startup verifies the selected file's
 SHA-256 against the browser catalog. Missing, incompatible or corrupt data
@@ -587,7 +625,8 @@ degrading when a pre-flight fails.
   (backup-rotated).
 - **At-most-one-generation loss**: settings, bookmarks and history
   (`profile.cfg` falls back to `.bak`, so a cut costs at most the save that
-  was in flight), tab session (falls back to `.bak`), in-flight video `.part`
+  was in flight), tab session (falls back to `.bak`), boot settings
+  (`boot-overrides.cfg` falls back to `.bak`), in-flight video `.part`
   progress (re-measured on next load).
 - **The last few writes**: an always-kept site's Memory Stick storage.
   Each record is flushed out of the C library's buffer before the write is
@@ -603,7 +642,7 @@ degrading when a pre-flight fails.
   reads; packs written after the last index save are removed by the next
   sweep and compiled again.
 - **Lost if the cut lands in the remove-rename window**: `recovery.cfg`
-  (start page falls back to the homepage), `tab-hibernation.bin` (that tab's
-  history), `boot-overrides.cfg` (written by the one-time compatibility
-  import). These are the tmp + remove + rename files above; they are the
-  only files on the stick without a recovery generation.
+  (start page falls back to the homepage), `tab-hibernation.bin` (that
+  tab's history) and `data/update-declined` (the safe-start screen shows
+  once more). These are the tmp + remove + rename files above; they are
+  the only files on the stick without a recovery generation.

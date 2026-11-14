@@ -206,7 +206,7 @@ static unsigned navigation_image_hold_bound_ms(
 {
     const LayoutDocument *layout = &session->page.layout;
     const NavigationEntry *entry = navigation_current(session);
-    if (entry == NULL || mutations->count == 0
+    if (entry == NULL || mutations == NULL || mutations->count == 0
         || mutations->count >= NAVIGATION_IMAGE_DIRECT_REFRESH_LIMIT
         || mutations->overflowed || mutations->resource_rebuild_required
         || mutations->retirement_unobserved
@@ -486,6 +486,172 @@ static void navigation_log_prepare_phases(
 }
 #endif
 
+/* The deferred job gives up its batch, which it reloads later against the
+   table the caller is about to change. What it already published stays, and
+   so does what other paths added to the table while it waited: destroying a
+   job that has not finished rolls the table back to the job's last commit. */
+static void navigation_deferred_image_job_release(NavigationSession *session)
+{
+    images_priority_load_commit_progress(session->page.deferred_image_job);
+    images_priority_load_destroy(session->page.deferred_image_job);
+    session->page.deferred_image_job = NULL;
+    session->page.deferred_image_batch_count = 0;
+    session->page.deferred_image_publication_age = 0;
+}
+
+/* Laid-out entries far from the reader give way, as for a viewport look
+   (deferred_images.inc). */
+static void navigation_evict_far_images(
+    NavigationSession *session, int64_t band_top, int64_t band_bottom,
+    size_t slots);
+
+/* The reader's band, as a viewport look takes it: a viewport either side. */
+static void navigation_reader_band(const NavigationSession *session,
+                                   int64_t *top, int64_t *bottom)
+{
+    const NavigationEntry *entry = navigation_current(session);
+    int64_t view_top = entry == NULL ? 0 : entry->scroll_y;
+    int64_t height = session->viewport.css_height;
+    *top = view_top - height;
+    *bottom = view_top + 2 * height;
+}
+
+static int navigation_node_pointer_compare(const void *left,
+                                           const void *right)
+{
+    uintptr_t a = (uintptr_t) *(const lxb_dom_node_t *const *) left;
+    uintptr_t b = (uintptr_t) *(const lxb_dom_node_t *const *) right;
+    return a < b ? -1 : a > b;
+}
+
+static bool navigation_node_queued(const NavigationPage *page,
+                                   const lxb_dom_node_t *node)
+{
+    for (size_t i = page->deferred_image_cursor;
+         page->deferred_image_targets != NULL && i < page->deferred_image_count;
+         i++)
+        if (page->deferred_image_targets[i].node == node) return true;
+    return false;
+}
+
+/* Whether an image element the table lacks may take room from far entries:
+   not failed, not waiting in the deferred queue (a scan leaves those to it),
+   and not laid out far from the reader either (a look admits those on its
+   way). `queued`, when not NULL, is the queue's waiting nodes sorted by
+   address (navigation_queued_nodes_sorted); otherwise the queue is read. */
+static bool navigation_image_wants_room(const NavigationSession *session,
+                                        const lxb_dom_node_t *node,
+                                        int64_t band_top, int64_t band_bottom,
+                                        const lxb_dom_node_t *const *queued,
+                                        size_t queued_count)
+{
+    const NavigationPage *page = &session->page;
+    if (images_find_node(&page->images, node) != NULL
+        || images_node_failed(&page->images, node)) return false;
+    if (queued == NULL ? navigation_node_queued(page, node)
+            : bsearch(&node, queued, queued_count, sizeof(*queued),
+                      navigation_node_pointer_compare) != NULL) return false;
+    const LayoutNodeBox *box = layout_box_for_node(&page->layout, node);
+    return box == NULL || ((int64_t) box->y + box->height > band_top
+                           && box->y < band_bottom);
+}
+
+/* The deferred queue's waiting nodes, sorted by address, in a Budget block
+   the caller frees; NULL (read the queue instead) when it is empty or the
+   Budget refuses. */
+static const lxb_dom_node_t **navigation_queued_nodes_sorted(
+    const NavigationSession *session, size_t *count)
+{
+    const NavigationPage *page = &session->page;
+    *count = 0;
+    if (page->deferred_image_targets == NULL
+        || page->deferred_image_cursor >= page->deferred_image_count)
+        return NULL;
+    size_t waiting = page->deferred_image_count - page->deferred_image_cursor;
+    const lxb_dom_node_t **nodes =
+        budget_malloc(session->budget, waiting * sizeof(*nodes));
+    if (nodes == NULL) return NULL;
+    for (size_t i = 0; i < waiting; i++)
+        nodes[i] = page->deferred_image_targets[
+            page->deferred_image_cursor + i].node;
+    qsort(nodes, waiting, sizeof(*nodes), navigation_node_pointer_compare);
+    *count = waiting;
+    return nodes;
+}
+
+/* The <img> and inline <svg> elements under `roots` (the whole document when
+   `count` is SIZE_MAX) that an additive image scan of them looks for and that
+   may take room for it (navigation_image_wants_room). The walk is the
+   scan's, so it keeps the DOM traversal ceiling and cooperates; cut short,
+   it answers what it found, and the scan admits what room there is. */
+static size_t navigation_untracked_image_elements(
+    NavigationSession *session, lxb_dom_node_t *const *roots,
+    size_t count)
+{
+    const NavigationPage *page = &session->page;
+    lxb_dom_node_t *document_root = page->document.html == NULL ? NULL
+        : lxb_dom_interface_node(page->document.html);
+    int64_t band_top = 0, band_bottom = 0;
+    navigation_reader_band(session, &band_top, &band_bottom);
+    size_t queued_count = 0;
+    const lxb_dom_node_t **queued =
+        navigation_queued_nodes_sorted(session, &queued_count);
+    size_t found = 0, visited = 0;
+    bool stopped = false;
+    for (size_t r = 0; !stopped && r < (count == SIZE_MAX ? 1u : count); r++) {
+        lxb_dom_node_t *root = count == SIZE_MAX ? document_root : roots[r];
+        lxb_dom_node_t *node = root;
+        while (node != NULL) {
+            if (visited == NAVIGATION_DOM_TRAVERSAL_NODE_LIMIT
+                || ((++visited & 255u) == 0
+                    && !tilefinch_platform_cooperate("image-room", visited))) {
+                stopped = true;
+                break;
+            }
+            bool image = node->type == LXB_DOM_NODE_TYPE_ELEMENT
+                && (document_node_is_tag(node, LXB_TAG_IMG)
+                    || document_node_is_tag(node, LXB_TAG_SVG));
+            if (image && navigation_image_wants_room(
+                    session, node, band_top, band_bottom,
+                    queued, queued_count)) found++;
+            /* An inline SVG is one image, whatever it draws with. */
+            lxb_dom_node_t *next = image ? NULL : node->first_child;
+            while (next == NULL && node != root) {
+                next = node->next;
+                if (next == NULL) node = node->parent;
+                if (node == NULL) break;
+            }
+            node = node == root && next == NULL ? NULL : next;
+        }
+    }
+    budget_free(session->budget, (void *) queued);
+    return found;
+}
+
+/* A page that repeats inline-SVG icons in every tile of a long list (Internet
+   Archive search) fills the table with aliases of icons a long way from the
+   reader while it builds the list. A full table then refuses the images the
+   page adds next, the thumbnails near the reader among them, and only the
+   viewport looks find them again: a flow each as the reader scrolls onto
+   them. Make room for `wanted` new entries first: an entry far from the
+   reader whose box keeps its size gives way, aliases and the farthest first,
+   as for a look. A look admits it again when the reader comes back near it. */
+static void navigation_make_image_room(NavigationSession *session,
+                                       size_t wanted)
+{
+    const ImageResources *images = &session->page.images;
+    size_t room = images->count < IMAGE_TRACKED_NODE_LIMIT
+        ? IMAGE_TRACKED_NODE_LIMIT - images->count : 0;
+    if (wanted <= room) return;
+    /* Eviction compacts the table the deferred job borrows, and the job's
+       rollback point would then name other entries and older counters. A
+       viewport look waits for the job; this gives the batch up instead. */
+    navigation_deferred_image_job_release(session);
+    int64_t band_top = 0, band_bottom = 0;
+    navigation_reader_band(session, &band_top, &band_bottom);
+    navigation_evict_far_images(session, band_top, band_bottom, wanted - room);
+}
+
 /* The image pass of a full rebuild without the stylesheet passes before
    it: the sheet is unchanged, so the table it derives is the rebuild's. */
 static bool navigation_rebuild_images(NavigationSession *session)
@@ -497,10 +663,7 @@ static bool navigation_rebuild_images(NavigationSession *session)
     uint64_t started = navigation_now_us();
 #endif
     /* The job borrows this image table (see the full rebuild). */
-    images_priority_load_destroy(session->page.deferred_image_job);
-    session->page.deferred_image_job = NULL;
-    session->page.deferred_image_batch_count = 0;
-    session->page.deferred_image_publication_age = 0;
+    navigation_deferred_image_job_release(session);
     lxb_dom_node_t *deferred[NAVIGATION_VISIBLE_IMAGE_PRIORITY_LIMIT];
     size_t deferred_count =
         navigation_live_deferred_nodes(&session->page, deferred);
@@ -663,11 +826,15 @@ static bool navigation_relayout_preview_eligible(
 }
 
 /* The viewport and the two screens below it, so the first page-downs land
-   on laid-out content, and at least minimum_limit deep. A truncated result
-   keeps keep_height as its scroll extent and marks where its content ends. */
+   on laid-out content, and at least minimum_limit deep; with `through`,
+   instead as far as the first of those nodes' boxes and the three screens
+   below it
+   (layout_build_context_through). A truncated result keeps keep_height as
+   its scroll extent and marks where its content ends. */
 static bool navigation_build_provisional_layout_limit(
     NavigationSession *session, LayoutDocument *layout, int keep_height,
-    int minimum_limit, int *limit_out)
+    int minimum_limit, int *limit_out, const lxb_dom_node_t *const *through,
+    size_t through_count)
 {
     const NavigationEntry *entry = navigation_current(session);
     int scroll_y = entry == NULL || entry->scroll_y < 0 ? 0 : entry->scroll_y;
@@ -677,10 +844,17 @@ static bool navigation_build_provisional_layout_limit(
     navigation_ensure_layout_reuse(session);
     bool truncated = false;
     layout->performance.cancelled = false;
-    bool built = layout_build_context_preview(
-        layout, session->budget, &session->page.document,
-        &session->page.stylesheet, session->fonts, session->images,
-        &session->viewport, session->page.layout_reuse, limit, &truncated);
+    bool built = through_count != 0
+        ? layout_build_context_through(
+              layout, session->budget, &session->page.document,
+              &session->page.stylesheet, session->fonts, session->images,
+              &session->viewport, session->page.layout_reuse, through,
+              through_count, 3 * session->viewport.css_height, &truncated)
+        : layout_build_context_preview(
+              layout, session->budget, &session->page.document,
+              &session->page.stylesheet, session->fonts, session->images,
+              &session->viewport, session->page.layout_reuse, limit,
+              &truncated);
     session->layout_build_cancelled = !built && layout->performance.cancelled;
     if (!built) return false;
     if (truncated) {
@@ -701,7 +875,7 @@ static bool navigation_build_provisional_layout(
     int minimum_limit)
 {
     return navigation_build_provisional_layout_limit(
-        session, layout, keep_height, minimum_limit, NULL);
+        session, layout, keep_height, minimum_limit, NULL, NULL, 0);
 }
 
 /* Whether `node` comes after `anchor` in document order without lying
@@ -1074,8 +1248,11 @@ bool navigation_layout_completion_awaited(const NavigationSession *session)
         && scroll_y + viewport >= session->page.layout.height;
 }
 
+static void navigation_settle_layout_jump(NavigationSession *session);
+
 static NavigationLayoutCompletion navigation_complete_layout_step(
-    NavigationSession *session, bool allow_extend)
+    NavigationSession *session, bool allow_extend,
+    const lxb_dom_node_t *const *through, size_t through_count)
 {
     if (!navigation_layout_provisional(session))
         return NAVIGATION_LAYOUT_COMPLETION_NONE;
@@ -1126,10 +1303,11 @@ static NavigationLayoutCompletion navigation_complete_layout_step(
     } else
 #endif
     if (!built)
-        built = extend
-        ? navigation_build_provisional_layout(
+        built = extend || through_count != 0
+        ? navigation_build_provisional_layout_limit(
               session, &next, old_height,
-              doubled > INT_MAX ? INT_MAX : (int) doubled)
+              doubled > INT_MAX ? INT_MAX : (int) doubled, NULL, through,
+              through_count)
         : navigation_build_layout(
               session, &next, session->fonts, session->images);
     if (discover)
@@ -1168,6 +1346,8 @@ static NavigationLayoutCompletion navigation_complete_layout_step(
     navigation_clamp_scroll_to_layout(session);
     if (discover && !session->page.layout_provisional)
         navigation_queue_discovered_visuals(session);
+    if (!session->page.layout_provisional)
+        navigation_settle_layout_jump(session);
     if (session->page.layout_provisional) {
         session->performance.provisional_extensions++;
         return NAVIGATION_LAYOUT_COMPLETION_EXTENDED;
@@ -1179,7 +1359,7 @@ static NavigationLayoutCompletion navigation_complete_layout_step(
 NavigationLayoutCompletion navigation_complete_layout(
     NavigationSession *session)
 {
-    return navigation_complete_layout_step(session, true);
+    return navigation_complete_layout_step(session, true, NULL, 0);
 }
 
 int navigation_bounded_focus_region_end(const NavigationSession *session)
@@ -1191,9 +1371,94 @@ int navigation_bounded_focus_region_end(const NavigationSession *session)
 bool navigation_complete_layout_sync(NavigationSession *session)
 {
     NavigationLayoutCompletion result =
-        navigation_complete_layout_step(session, false);
+        navigation_complete_layout_step(session, false, NULL, 0);
     return result == NAVIGATION_LAYOUT_COMPLETION_NONE
         || result == NAVIGATION_LAYOUT_COMPLETION_ADOPTED;
+}
+
+/* `node`'s box in the page's layout, when it is the complete layout's own
+   and so is the screen from its top down: any box of a complete layout;
+   in a provisional one, a box recorded before the cut whose screen lies
+   above both the cut and any container the cut may have moved
+   (LayoutDocument preview_moved_top). Content above the box precedes it,
+   so it is complete too, and no clamp to the shorter extent applies. */
+const LayoutNodeBox *navigation_exact_box(const NavigationSession *session,
+                                          const lxb_dom_node_t *node)
+{
+    const LayoutDocument *layout = &session->page.layout;
+    const LayoutNodeBox *box = layout_box_for_node(layout, node);
+    if (box == NULL || layout->content_limit_y == 0) return box;
+    int64_t screen_end = (int64_t) (box->y > 0 ? box->y : 0)
+        + session->viewport.css_height;
+    if ((size_t) (box - layout->node_boxes) >= layout->preview_cut_box_count
+        || screen_end > layout->content_limit_y
+        || (layout->preview_moved && screen_end > layout->preview_moved_top))
+        return NULL;
+    return box;
+}
+
+bool navigation_layout_through(NavigationSession *session,
+                               const lxb_dom_node_t *const *nodes,
+                               size_t count)
+{
+    if (!navigation_layout_provisional(session)) return true;
+    /* A page with a script realm is completed outright, like any reader
+       of the whole page (navigation_complete_layout_step). */
+    if (session->page.runtime != NULL || nodes == NULL || count == 0
+        || count > LAYOUT_THROUGH_TARGETS)
+        return navigation_complete_layout_sync(session);
+    session->performance.layout_through_builds++;
+    NavigationLayoutCompletion result =
+        navigation_complete_layout_step(session, false, nodes, count);
+    return result != NAVIGATION_LAYOUT_COMPLETION_CANCELLED
+        && result != NAVIGATION_LAYOUT_COMPLETION_FAILED;
+}
+
+bool navigation_complete_layout_through(NavigationSession *session,
+                                        const lxb_dom_node_t *node)
+{
+    if (!navigation_layout_provisional(session)
+        || navigation_exact_box(session, node) != NULL) return true;
+    if (!navigation_layout_through(session, &node, 1u)) return false;
+    if (!navigation_layout_provisional(session)
+        || navigation_exact_box(session, node) != NULL) return true;
+    session->performance.layout_through_fallbacks++;
+    return navigation_complete_layout_sync(session);
+}
+
+void navigation_note_layout_jump(NavigationSession *session,
+                                 lxb_dom_node_t *node)
+{
+    const NavigationEntry *entry = navigation_current(session);
+    const LayoutNodeBox *box = node == NULL ? NULL
+        : layout_box_for_node(&session->page.layout, node);
+    bool noted = entry != NULL && box != NULL
+        && navigation_layout_provisional(session);
+    session->page.layout_jump_node = noted ? node : NULL;
+    session->page.layout_jump_scroll_y = noted ? entry->scroll_y : 0;
+    session->page.layout_jump_box_y = noted ? box->y : 0;
+}
+
+/* The complete layout just adopted: a reader still where a jump into the
+   provisional one left them follows the target if it moved, so the jump
+   ends where the complete layout would have put it. The checks above make
+   this a guard, counted when it fires. */
+static void navigation_settle_layout_jump(NavigationSession *session)
+{
+    lxb_dom_node_t *node = session->page.layout_jump_node;
+    session->page.layout_jump_node = NULL;
+    const NavigationEntry *entry = navigation_current(session);
+    if (node == NULL || entry == NULL
+        || entry->scroll_y != session->page.layout_jump_scroll_y) return;
+    const LayoutNodeBox *box = layout_box_for_node(&session->page.layout,
+                                                   node);
+    if (box == NULL || box->y == session->page.layout_jump_box_y) return;
+    session->performance.layout_jump_corrections++;
+    int64_t scroll = (int64_t) entry->scroll_y + box->y
+        - session->page.layout_jump_box_y;
+    int maximum = navigation_max_scroll(session);
+    (void) navigation_set_scroll(session, scroll < 0 ? 0
+        : (scroll > maximum ? maximum : (int) scroll));
 }
 
 /* ---- Changes inside content that renders nothing -----------------------
@@ -1543,6 +1808,9 @@ static bool navigation_mutations_keep_committed_layout_servable(
 bool navigation_relayout(NavigationSession *session)
 {
     unsigned ledger = work_ledger_enter(WORK_LEDGER_LAYOUT);
+    /* A jump's target moves with this change as with any other: it is no
+       provisional difference for the completion to correct. */
+    if (session != NULL) session->page.layout_jump_node = NULL;
 #ifndef TILEFINCH_NO_TRACE
     /* One line per relayout (TILEFINCH_TRACE_RELAYOUT_CENSUS): which path
        it took, how long, and how many element styles its build resolved. */
@@ -1782,7 +2050,7 @@ static bool navigation_build_bounded_focus_layout(
     int limit = 0;
     if (!navigation_build_provisional_layout_limit(
             session, next, incumbent->height,
-            minimum > INT_MAX ? INT_MAX : (int) minimum, &limit))
+            minimum > INT_MAX ? INT_MAX : (int) minimum, &limit, NULL, 0))
         return false;
     if (next->content_limit_y == 0) return true;
     /* The page's extent (scroll range, scrollbar): the incumbent's, moved
@@ -1888,6 +2156,10 @@ static TILEFINCH_OUT_OF_LINE bool navigation_relayout_incremental(
     /* Forced geometry already performed the complete flow for this exact
        generation. Resource work must be settled without replacing any
        borrowed image storage before ownership can move to presentation. */
+#ifdef TILEFINCH_LAYOUT_DIFF
+    const char *geometry_state = script_runtime_geometry_adoption_state(
+        session->page.runtime, &session->viewport);
+#endif
     bool geometry_adopted = plan->mutation_driven && !provisional
         && !plan->style_append_tried && !plan->image_rebuild
         && !plan->image_resource_scan
@@ -1896,6 +2168,38 @@ static TILEFINCH_OUT_OF_LINE bool navigation_relayout_incremental(
         && !mutations->resource_rebuild_required
         && script_runtime_take_geometry_layout(session->page.runtime,
             &session->viewport, &next);
+#ifdef TILEFINCH_LAYOUT_DIFF
+    if (layout_validation_enabled()) {
+        char message[320];
+        snprintf(message, sizeof(message),
+            "tilefinch-geometry-adoption: adopted=%d geometry=%s "
+            "mutation-driven=%d provisional=%d bounded=%d style-append=%d "
+            "image-rebuild=%d image-scan=%d image-refresh=%d "
+            "image-table-unchanged=%d overflow=%d retirement=%d "
+            "resource-rebuild=%d records=%zu",
+            (int) geometry_adopted, geometry_state,
+            (int) plan->mutation_driven, (int) provisional, (int) bounded,
+            (int) plan->style_append_tried, (int) plan->image_rebuild,
+            (int) plan->image_resource_scan,
+            (int) plan->image_resource_refresh,
+            (int) plan->image_table_unchanged,
+            (int) (mutations != NULL && mutations->overflowed),
+            (int) (mutations != NULL && mutations->retirement_unobserved),
+            (int) (mutations != NULL && mutations->resource_rebuild_required),
+            mutations == NULL ? (size_t) 0 : mutations->count);
+        tilefinch_platform_log_message(message);
+        layout_validation_set_cause(provisional ? "relayout-provisional"
+            : bounded ? "relayout-bounded"
+            : plan->mutation_driven ? "relayout-mutation"
+            : "relayout-resource");
+        char note[96];
+        snprintf(note, sizeof(note), "records=%zu,images=%d%d%d",
+            mutations == NULL ? (size_t) 0 : mutations->count,
+            (int) plan->image_rebuild, (int) plan->image_resource_scan,
+            (int) plan->image_resource_refresh);
+        layout_validation_note(note);
+    }
+#endif
     /* Forced geometry, when script already built it, is the complete
        layout at no cost: a bounded focus build gives way to it. */
     bool built = geometry_adopted ? true : provisional
@@ -2111,8 +2415,18 @@ static TILEFINCH_OUT_OF_LINE bool navigation_relayout_full(
     size_t pass_injections = session->budget->injected_failure_count;
     size_t rebuild_reserve = session->budget->limit / 8u;
     if (rebuild_reserve > 4u*1024u*1024u) rebuild_reserve = 4u*1024u*1024u;
-    if (session->reclaim_optional != NULL
-        && budget_remaining(session->budget) < rebuild_reserve)
+    /* Module records waiting for the persistent tier's writer give way
+       alone first: memory held only until idle work writes it must not cost
+       the page every other cache a full rebuild would otherwise keep. */
+    size_t rebuild_free = budget_remaining(session->budget);
+    if (session->reclaim_optional != NULL && rebuild_free < rebuild_reserve
+        && session->browser_session != NULL
+        && session->browser_session->budget == session->budget) {
+        (void) browser_session_script_disk_queue_reclaim(
+            session->browser_session, rebuild_reserve - rebuild_free);
+        rebuild_free = budget_remaining(session->budget);
+    }
+    if (session->reclaim_optional != NULL && rebuild_free < rebuild_reserve)
         session->reclaim_optional(session->reclaim_optional_opaque);
     int old_height = session->page.layout.height;
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
@@ -2324,6 +2638,9 @@ static TILEFINCH_OUT_OF_LINE bool navigation_relayout_full(
     if (layout_free < rebuild_reserve)
         (void) images_reclaim_rebuildable_rasters(&session->page.images,
             session->browser_session, rebuild_reserve - layout_free);
+#ifdef TILEFINCH_LAYOUT_DIFF
+    layout_validation_set_cause("relayout-full");
+#endif
     bool built = navigation_build_layout(
         session, &session->page.layout, session->fonts, session->images);
 #if !defined(__PSP__)
@@ -2487,13 +2804,19 @@ static bool navigation_relayout_body(NavigationSession *session,
         /* Image causes are settled by the image rebuild; stylesheet causes
            need the sheet part inserted in place. */
         bool sheet_settled = !mutations.stylesheet_rebuild_required;
-        if (!sheet_settled
+        /* A read installed the sheet change part way through the turn: the
+           append still walks what came after it, and commits the resource
+           fingerprint of the DOM as the turn left it. If it cannot, the
+           read's installation stands (the fingerprint check decides). */
+        bool read_settled = sheet_settled
+            && session->page.read_sheet_settle.pending;
+        if ((!sheet_settled || read_settled)
 #ifndef TILEFINCH_NO_TRACE
             && getenv("TILEFINCH_DISABLE_STYLE_APPEND") == NULL
 #endif
             && navigation_try_append_style_sources(
                    session, &mutations, mutations.image_rebuild_required,
-                   &appended_images, &appended_scope)) {
+                   &appended_images, &appended_scope, false)) {
             sheet_settled = true;
             style_append_done = true;
         }
@@ -2501,6 +2824,25 @@ static bool navigation_relayout_body(NavigationSession *session,
             plan.full_rebuild = false;
             plan.image_rebuild = mutations.image_rebuild_required;
         }
+    }
+    /* A read in the turn already appended part of this journal's sheet
+       change (navigation_settle_read_sheets): its image pass is this
+       relayout's to run, unless a rebuild re-derives every image. */
+    if (session->page.read_sheet_settle.pending) {
+        if (plan.style_append_tried && !plan.full_rebuild
+            && session->page.read_sheet_settle.images) {
+            if (!appended_images) {
+                appended_scope.whole_document = false;
+                appended_scope.count = 0;
+            }
+            navigation_style_image_scope_merge(&appended_scope,
+                session->page.read_sheet_settle.whole_document,
+                session->page.read_sheet_settle.hosts,
+                session->page.read_sheet_settle.host_count);
+            appended_images = true;
+        }
+        memset(&session->page.read_sheet_settle, 0,
+               sizeof(session->page.read_sheet_settle));
     }
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     bool full_style_rebuild = session->style_rebuild_required;
@@ -2567,6 +2909,9 @@ static bool navigation_relayout_body(NavigationSession *session,
                 plan.image_rebuild = true;
             } else {
                 plan.full_rebuild = true;
+#ifdef TILEFINCH_LAYOUT_DIFF
+                layout_validation_note("full:fingerprint");
+#endif
             }
         }
         /* Overflow describes unknown mutations, not necessarily changed
@@ -2615,9 +2960,19 @@ static bool navigation_relayout_body(NavigationSession *session,
         && !navigation_rebuild_images(session)) {
         /* The table is gone; the full rebuild reloads it with everything. */
         plan.full_rebuild = true;
+#ifdef TILEFINCH_LAYOUT_DIFF
+        layout_validation_note("full:image-rebuild");
+#endif
     }
     if (!plan.full_rebuild && !plan.image_rebuild && session->external_resources_enabled
         && (plan.image_resource_scan || plan.image_resource_refresh)) {
+        /* The loads below refuse while a decode they did not start holds the
+           one JPEG decoder, and a refusal here costs a full relayout and an
+           image-table rebuild. The deferred job's thumbnail decode is the
+           one that can: give that batch up first, as a rebuild does. Its
+           decode is abandoned, and the loads wait out its tail. */
+        if (images_priority_load_holds_decoder(session->page.deferred_image_job))
+            navigation_deferred_image_job_release(session);
         const char *document_url =
             session->page.document_url[0] == '\0'
             ? (entry == NULL ? NULL : entry->url)
@@ -2691,6 +3046,17 @@ static bool navigation_relayout_body(NavigationSession *session,
                     if (direct_image_change) refresh[refresh_count++] = candidates[i];
                 }
             }
+            {
+                int64_t band_top = 0, band_bottom = 0;
+                navigation_reader_band(session, &band_top, &band_bottom);
+                size_t wanted = 0;
+                for (size_t i = 0; i < refresh_count; i++)
+                    if (navigation_image_wants_room(
+                            session, refresh[i], band_top, band_bottom,
+                            NULL, 0))
+                        wanted++;
+                navigation_make_image_room(session, wanted);
+            }
             /* Many of them cost as much as the additive traversal, and only it
                can admit part of what a table near its bound cannot hold. A
                full table can admit nothing, whichever walks to it. */
@@ -2726,9 +3092,6 @@ static bool navigation_relayout_body(NavigationSession *session,
                     && !scan_for_additions;
             }
         }
-        /* A full table can admit nothing, whichever walks to it. */
-        if (session->page.images.count >= IMAGE_TRACKED_NODE_LIMIT)
-            scan_for_additions = false;
         lxb_dom_node_t *scan_roots[NAVIGATION_IMAGE_SCAN_ROOT_LIMIT];
         size_t scan_root_count = images_loaded && scan_for_additions
             && journal_scan_only
@@ -2738,6 +3101,15 @@ static bool navigation_relayout_body(NavigationSession *session,
             if (!navigation_image_scan_root_add(scan_roots, &scan_root_count,
                                                 appended_scope.hosts[h]))
                 scan_root_count = SIZE_MAX;
+        }
+        if (images_loaded && scan_for_additions)
+            navigation_make_image_room(session,
+                navigation_untracked_image_elements(
+                    session, scan_roots, scan_root_count));
+        /* A full table can admit nothing, whichever walks to it. */
+        if (session->page.images.count >= IMAGE_TRACKED_NODE_LIMIT) {
+            scan_for_additions = false;
+            scan_root_count = SIZE_MAX;
         }
         if (appended_images && scan_root_count != SIZE_MAX)
             session->performance.style_append_scoped_image_scans++;
@@ -2775,13 +3147,26 @@ static bool navigation_relayout_body(NavigationSession *session,
                 session->browser_session, session->page.layout_reuse,
                 session->fonts, session->viewport.css_width, deferred, deferred_count);
         }
+        /* What the refresh and the scan put in the table is the page's: a
+           deferred job still waiting must not roll it back if it fails or
+           is given up later. */
+        images_priority_load_commit_progress(session->page.deferred_image_job);
         session->images = &session->page.images;
         layout_reuse_cache_update_images(
             session->page.layout_reuse, session->images);
         session->performance.mutation_image_resource_scans++;
         if (!images_loaded && !plan.image_rebuild) plan.full_rebuild = true;
-        if (plan.image_rebuild && !navigation_rebuild_images(session))
+#ifdef TILEFINCH_LAYOUT_DIFF
+        if (!images_loaded && !plan.image_rebuild)
+            layout_validation_note(session->page.images.stats.load_cancelled
+                ? "full:image-scan-cancelled" : "full:image-scan-failed");
+#endif
+        if (plan.image_rebuild && !navigation_rebuild_images(session)) {
             plan.full_rebuild = true;
+#ifdef TILEFINCH_LAYOUT_DIFF
+            layout_validation_note("full:image-rebuild");
+#endif
+        }
     }
 #if NAVIGATION_RELAYOUT_PHASE_LOG
     uint64_t images_done = navigation_now_us();

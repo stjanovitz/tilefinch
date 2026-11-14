@@ -10,6 +10,7 @@
 #include "tilefinch/gamepad.h"
 #include "tilefinch/font.h"
 #include "tilefinch/omnibox.h"
+#include "tilefinch/media_capture.h"
 #include "tilefinch/site_storage.h"
 
 #define BROWSER_PROFILE_BOOKMARK_LIMIT 32
@@ -200,6 +201,8 @@ typedef enum {
 
 /* Sites whose heavy app the user chose to always run. */
 #define BROWSER_PROFILE_HEAVY_SITE_LIMIT 16u
+/* Sites remembered for a script-memory stop; the oldest goes first. */
+#define BROWSER_PROFILE_SCRIPT_MEMORY_SITE_LIMIT 8u
 
 typedef enum {
     BROWSER_UPDATE_CHANNEL_STABLE = 0,
@@ -384,6 +387,9 @@ ContentBlockerMode browser_profile_content_blocker_mode(
     const BrowserProfile *profile);
 bool browser_profile_content_blocker_cosmetic_hiding(
     const BrowserProfile *profile);
+/* Basic blocking also refuses paywall SDK hosts; off by default. */
+bool browser_profile_content_blocker_paywall_scripts(
+    const BrowserProfile *profile);
 uint64_t browser_profile_content_blocker_total_blocked(
     const BrowserProfile *profile);
 BrowserReaderFont browser_profile_reader_font(const BrowserProfile *profile);
@@ -399,6 +405,11 @@ BrowserHeavyPagesMode browser_profile_heavy_pages_mode(
 /* Whether the user chose to always run this URL's site's heavy app. */
 bool browser_profile_heavy_site_allowed(const BrowserProfile *profile,
                                         const char *url);
+/* Whether this URL's site's page last stopped its scripts because they
+   ran out of memory: the next visit offers to load it without scripts.
+   Only the site is kept, as for the other per-site settings. */
+bool browser_profile_site_script_memory_stopped(
+    const BrowserProfile *profile, const char *url);
 BrowserBasicFallbackMode browser_profile_basic_fallback_mode(
     const BrowserProfile *profile);
 bool browser_profile_update_check_enabled(const BrowserProfile *profile);
@@ -414,8 +425,6 @@ uint16_t browser_profile_glyph_offer_declined_mask(
 /* Settings > Appearance > Language & emoji > Offer language packs: Ask
    (default) or Off. */
 bool browser_profile_glyph_offers_enabled(const BrowserProfile *profile);
-/* Ambient motion on the start surface. Default on. */
-bool browser_profile_wave_background(const BrowserProfile *profile);
 uint64_t browser_profile_update_check_last_unix(
     const BrowserProfile *profile);
 uint64_t browser_profile_update_check_available_sequence(
@@ -471,6 +480,19 @@ bool browser_profile_set_site_javascript_enabled(
    permission, and is preserved while the site's automatic-Reader bit clears. */
 bool browser_profile_reset_site_permissions(
     BrowserProfile *profile, const char *url);
+/* The microphone answer remembered for this URL's origin ("Always allow"
+   GRANTED, "Block" DENIED), PROMPT when none. At most
+   BROWSER_PROFILE_SECURITY_SITE_LIMIT origins; Reset permissions forgets
+   the page's. */
+MediaCapturePermission browser_profile_microphone_site(
+    const BrowserProfile *profile, const char *url);
+/* Whether an answer for this URL's origin can be remembered. */
+bool browser_profile_microphone_site_room(const BrowserProfile *profile,
+                                          const char *url);
+/* PROMPT forgets. False when the table is full or the URL has no origin. */
+bool browser_profile_set_microphone_site(
+    BrowserProfile *profile, const char *url,
+    MediaCapturePermission permission);
 void browser_profile_set_site_storage_offers(BrowserProfile *profile,
                                             bool enabled);
 /* False when the table is full (or the origin is too long to keep). */
@@ -524,6 +546,8 @@ void browser_profile_set_content_blocker_mode(
     BrowserProfile *profile, ContentBlockerMode mode);
 void browser_profile_set_content_blocker_cosmetic_hiding(
     BrowserProfile *profile, bool enabled);
+void browser_profile_set_content_blocker_paywall_scripts(
+    BrowserProfile *profile, bool blocked);
 void browser_profile_record_content_blocked(
     BrowserProfile *profile, uint64_t count);
 void browser_profile_set_reader_font(
@@ -538,9 +562,14 @@ bool browser_profile_set_heavy_pages_mode(
    list is full or the URL has no site. */
 bool browser_profile_set_heavy_site_allowed(
     BrowserProfile *profile, const char *url, bool allowed);
+/* Remembers (or forgets) a script-memory stop for this URL's site; a
+   full list drops its oldest site. True when the list changed. A note
+   names a visited site, so none is remembered while URL history is off;
+   turning history off forgets them all, and forgetting a history address
+   forgets its site's note. */
+bool browser_profile_set_site_script_memory_stopped(
+    BrowserProfile *profile, const char *url, bool stopped);
 void browser_profile_set_reader_auto_mode(
-    BrowserProfile *profile, bool enabled);
-void browser_profile_set_wave_background(
     BrowserProfile *profile, bool enabled);
 void browser_profile_set_update_check_enabled(
     BrowserProfile *profile, bool enabled);

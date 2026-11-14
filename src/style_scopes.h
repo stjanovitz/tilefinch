@@ -56,12 +56,6 @@ uint64_t style_adopted_cascade_order_in(const Stylesheet *sheet,
                                         StyleAdoptedOrderContext *context,
                                         unsigned order);
 
-/* Whether a rule of cascade order `order` may apply to `node`: false only
-   for a rule of an adopted sheet that just shadow roots adopt, at an
-   element outside every one of their carriers. */
-bool style_adopted_scope_admits(const Stylesheet *sheet, unsigned order,
-                                const lxb_dom_node_t *node,
-                                const StyleMatchSubject *subject);
 /* The adopted source (its bit, as in Stylesheet.scopes.adopted_shadow_only_mask)
    holding the rule of cascade order `order`; 0 for a document source. */
 uint64_t style_adopted_source_bit(const Stylesheet *sheet, unsigned order);
@@ -110,8 +104,11 @@ static inline bool style_subject_outside_custom_scopes(
         && !style_subject_near_shadow_tree(subject);
 }
 /* One shadow tree's <style> (Stylesheet.scopes.shadow_scopes): rules with
-   begin <= order < end belong to the tree under `carrier`. */
-#define STYLE_SHADOW_SCOPE_LIMIT 256u
+   begin <= order < end belong to the tree under `carrier`. A component
+   without adopted sheets keeps a <style> in each instance's root, so the
+   bound is one per admitted root, DOM_BRIDGE_SHADOW_ROOT_LIMIT (asserted
+   in js_dom_handles.inc); the table grows with use. */
+#define STYLE_SHADOW_SCOPE_LIMIT 2048u
 typedef struct StyleShadowScope {
     unsigned begin;
     unsigned end;

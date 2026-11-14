@@ -414,16 +414,21 @@ static lxb_dom_node_t *navigation_fragment_target(
                 : (!legacy_name
                     ? document_attribute(node, "id", &candidate_length)
                     : NULL);
-            const LayoutNodeBox *box = candidate != NULL
-                    && candidate_length == wanted_length
-                    && memcmp(candidate, wanted, wanted_length) == 0
-                ? layout_box_for_node(&session->page.layout, node) : NULL;
+            bool matched = candidate != NULL
+                && candidate_length == wanted_length
+                && memcmp(candidate, wanted, wanted_length) == 0;
             /* Extracted passes are restricted to the exact native root that
                matches the body's active presentation marker. This provenance
                makes its neutral markers and empty legacy anchors safe
                zero-size targets while preventing a hidden raw-tree duplicate
-               (or an authored look-alike elsewhere) from winning. */
-            if (box != NULL) return node;
+               (or an authored look-alike elsewhere) from winning. A
+               provisional layout has no box yet for a node below its cut,
+               so its first candidate is the one to lay out through
+               (navigation_scroll_to_fragment). */
+            if (matched && (session->page.layout_provisional
+                            || layout_box_for_node(&session->page.layout,
+                                                   node) != NULL))
+                return node;
             if (node->first_child != NULL) {
                 node = node->first_child;
                 continue;
@@ -453,15 +458,24 @@ bool navigation_scroll_to_fragment(
     if (target == NULL && length == 3u
         && strncasecmp(identifier, "top", 3u) == 0)
         return navigation_set_scroll(session, 0);
-    /* The target may lie below a provisional layout's placeholder. */
-    if (target != NULL) (void) navigation_complete_layout_sync(session);
+    /* The target may lie below a provisional layout's placeholder: the
+       page is laid out only through it and the screens below, where the
+       complete layout would place them (the rest follows in idle work),
+       or completed when that cannot be proven. The lookup then runs on the
+       new layout: a complete one may pick a later candidate. */
+    if (target != NULL && session->page.layout_provisional) {
+        (void) navigation_complete_layout_through(session, target);
+        target = navigation_fragment_target(session, identifier, length);
+    }
     const LayoutNodeBox *box = target == NULL ? NULL
         : layout_box_for_node(&session->page.layout, target);
     if (box == NULL) return true;
     int maximum = viewport_max_scroll_css(
         &session->viewport, session->page.layout.height);
     int scroll = box->y < 0 ? 0 : (box->y < maximum ? box->y : maximum);
-    return navigation_set_scroll(session, scroll);
+    bool scrolled = navigation_set_scroll(session, scroll);
+    navigation_note_layout_jump(session, target);
+    return scrolled;
 }
 
 void navigation_discard_current_page(NavigationSession *session)

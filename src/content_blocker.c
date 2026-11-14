@@ -48,6 +48,8 @@ struct ContentBlocker {
     size_t requests_considered;
     size_t requests_blocked;
     bool truncated;
+    /* BASIC also refuses paywall_hosts (content_blocker_set_paywall_scripts). */
+    bool paywall_scripts_blocked;
     /* The open player page's site, or empty (see player_page_hosts). */
     char player_site[CONTENT_BLOCKER_HOST_LIMIT];
 };
@@ -67,14 +69,17 @@ typedef struct {
 /* Deliberately conservative: these are dedicated advertising/auction and
    ad-verification hosts, not general analytics/CDN hosts. BASIC applies
    them only to third-party subresources to minimize compatibility
-   surprises. */
+   surprises. imasdk.googleapis.com serves only Google's IMA video-ad SDK
+   (ima3.js, about 0.5 MB of script; cnn.com loads it once its page is up);
+   the rest of googleapis.com is untouched. */
 static const char *const basic_hosts[] = {
     "33across.com", "adform.net", "adnxs.com", "adsrvr.org",
     "amazon-adsystem.com", "bidswitch.net", "btloader.com",
     "casalemedia.com", "confiant-integrations.net", "contextweb.com",
     "criteo.com", "criteo.net", "demdex.net",
     "doubleclick.net", "googleadservices.com", "googlesyndication.com",
-    "indexww.com", "lijit.com", "mathtag.com", "media.net",
+    "imasdk.googleapis.com", "indexww.com", "lijit.com", "mathtag.com",
+    "media.net",
     "moatads.com", "openx.net", "outbrain.com", "pubmatic.com",
     "quantserve.com", "rlcdn.com", "rubiconproject.com",
     "serving-sys.com", "sharethrough.com", "smartadserver.com",
@@ -105,16 +110,19 @@ static const char *const basic_sdk_hosts[] = {
     "convertexperiments.com", "tt.omtrdc.net"
 };
 
-/* Reserved for a future opt-in level (with its Settings row, catalog v17),
-   not part of BASIC: the hosts of paywall and subscription SDKs, Piano
-   (and its Tinypass hosts) piano.io and tinypass.com, Poool poool.fr,
-   Pelcro pelcro.com and LaterPay laterpay.net. BASIC leaves them alone so
-   that a metered or subscription page counts and gates its articles as the
-   site intends; a Custom list or a player page can still refuse them. */
+/* Paywall and subscription SDKs: Piano (and its Tinypass hosts), Poool,
+   Pelcro, LaterPay. Refused by BASIC only when the user opts in
+   (content_blocker_set_paywall_scripts), under the same third-party-only
+   rule: without them a metered article can stay open on a site that
+   gates it in the browser, which is the reader's choice to make. */
+static const char *const paywall_hosts[] = {
+    "piano.io", "tinypass.com", "poool.fr", "pelcro.com", "laterpay.net"
+};
 
 #define BASIC_RULE_COUNT \
     (sizeof(basic_hosts) / sizeof(basic_hosts[0]) \
      + sizeof(basic_sdk_hosts) / sizeof(basic_sdk_hosts[0]))
+#define PAYWALL_RULE_COUNT (sizeof(paywall_hosts) / sizeof(paywall_hosts[0]))
 
 /* What a page waits for from a refused script, by the script's host: the
    callbacks the loaded script would make (content_blocker.h). */
@@ -753,6 +761,9 @@ bool content_blocker_would_block(
                  && i < sizeof(basic_sdk_hosts) / sizeof(basic_sdk_hosts[0]);
                  i++)
                 blocked = blocker_host_suffix(host, basic_sdk_hosts[i]);
+            for (size_t i = 0; !blocked && blocker->paywall_scripts_blocked
+                 && i < PAYWALL_RULE_COUNT; i++)
+                blocked = blocker_host_suffix(host, paywall_hosts[i]);
         }
     } else {
         (void) blocker_custom_host_decision(
@@ -849,6 +860,17 @@ bool content_blocker_player_page(const ContentBlocker *blocker,
         && strcmp(site, blocker->player_site) == 0;
 }
 
+void content_blocker_set_paywall_scripts(ContentBlocker *blocker,
+                                         bool blocked)
+{
+    if (blocker != NULL) blocker->paywall_scripts_blocked = blocked;
+}
+
+bool content_blocker_paywall_scripts(const ContentBlocker *blocker)
+{
+    return blocker != NULL && blocker->paywall_scripts_blocked;
+}
+
 bool content_blocker_metrics(const ContentBlocker *blocker,
                              ContentBlockerMetrics *metrics)
 {
@@ -856,7 +878,9 @@ bool content_blocker_metrics(const ContentBlocker *blocker,
     *metrics = (ContentBlockerMetrics) {
         .mode = blocker->mode,
         .rule_count = blocker->mode == CONTENT_BLOCKER_BASIC
-            ? BASIC_RULE_COUNT : blocker->rule_count,
+            ? BASIC_RULE_COUNT
+                + (blocker->paywall_scripts_blocked ? PAYWALL_RULE_COUNT : 0u)
+            : blocker->rule_count,
         .allow_rule_count = blocker->allow_rule_count,
         .ignored_rule_count = blocker->ignored_rule_count,
         .allowed_site_count = blocker->allowed_site_count,

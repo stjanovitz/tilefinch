@@ -156,6 +156,10 @@ typedef struct {
     uint8_t packet_format;
 } MediaMp4Sample;
 
+/* Decode timestamp of a non-NULL sample, with the same floor/saturation
+   semantics as media_ticks_to_us. Presentation timestamps remain separate. */
+uint64_t media_mp4_sample_dts_us(const MediaMp4Sample *sample);
+
 typedef struct MediaMp4Demux MediaMp4Demux;
 
 MediaMp4Limits media_mp4_default_limits(void);

@@ -25,15 +25,7 @@
 #define OFFLINE_APP_BYTECODE_SCRIPT_LIMIT 8u
 #define OFFLINE_APP_BYTECODE_SOURCE_LIMIT (1024u * 1024u)
 
-static void offline_error(
-    char *error, size_t error_size, const char *format, ...)
-{
-    if (error == NULL || error_size == 0) return;
-    va_list arguments;
-    va_start(arguments, format);
-    vsnprintf(error, error_size, format, arguments);
-    va_end(arguments);
-}
+#define offline_error tilefinch_format_error
 
 static uint64_t offline_now_unix(void)
 {
@@ -526,8 +518,8 @@ static bool offline_write_file_tombstone(const char *path,
 {
     FILE *file = fopen(path, "wb");
     if (file == NULL) return false;
-    bool okay = fprintf(file, "%s\n", filename) > 0 && fflush(file) == 0
-        && ferror(file) == 0;
+    bool okay = fputs(filename, file) >= 0 && fputc('\n', file) != EOF
+        && fflush(file) == 0 && ferror(file) == 0;
     if (fclose(file) != 0) okay = false;
     if (!okay) (void) remove(path);
     return okay;

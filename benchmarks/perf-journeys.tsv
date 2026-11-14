@@ -4,9 +4,9 @@
 name	script	url	trace	trace_sha256	data_dir	boot	cpu_mhz	clock	sheet_marks	frames
 home-menu	menu-tour	-	-	-	tests/fixtures/ppsspp-menu-tour-data	-	-	-	-	-
 site-restore	site-restore	-	-	-	tests/fixtures/ppsspp-site-data	-	-	-	-	-
-article-scroll-during-load	scroll-during-load-live	https://en.wikipedia.org/w/index.php?search=PlayStation+Portable&title=Special%3ASearch&go=Go	wikipedia-article	cb64d13e10e7dab00e861ea88689261c6128c2048ac81ad719af123d63455783	-	-	-	-	-	-
-article-page-down-fast	scroll-fast-live	https://en.wikipedia.org/w/index.php?search=PlayStation+Portable&title=Special%3ASearch&go=Go	wikipedia-article	cb64d13e10e7dab00e861ea88689261c6128c2048ac81ad719af123d63455783	-	-	-	-	-	-
-article-drawer	drawer-scroll-during-completion-live	https://en.wikipedia.org/w/index.php?search=PlayStation+Portable&title=Special%3ASearch&go=Go	wikipedia-article	cb64d13e10e7dab00e861ea88689261c6128c2048ac81ad719af123d63455783	-	-	-	-	-	-
+article-scroll-during-load	scroll-during-load-live	https://en.wikipedia.org/w/index.php?search=PlayStation+Portable&title=Special%3ASearch&go=Go	wikipedia-article	594a2d634958f0c802782a275eb1c00f3c4236a2dec0dc982479829a5e5d4e3b	-	-	-	-	-	-
+article-page-down-fast	scroll-fast-live	https://en.wikipedia.org/w/index.php?search=PlayStation+Portable&title=Special%3ASearch&go=Go	wikipedia-article	594a2d634958f0c802782a275eb1c00f3c4236a2dec0dc982479829a5e5d4e3b	-	-	-	-	-	-
+article-drawer	drawer-scroll-during-completion-live	https://en.wikipedia.org/w/index.php?search=PlayStation+Portable&title=Special%3ASearch&go=Go	wikipedia-article	594a2d634958f0c802782a275eb1c00f3c4236a2dec0dc982479829a5e5d4e3b	-	-	-	-	-	-
 youtube-bbb	youtube-bbb	https://m.youtube.com/results?search_query=big+buck+bunny	youtube-bbb	fafb53c9be7d0b28f3e7e718ee4b7694859b247b316c55ac73242f7358ed26d0	-	-	-	-	returned	-
 chatgpt-ask	chatgpt-ask	https://chatgpt.com/	chatgpt-ask-send76	6440c59283ec5516a46d7842fc24362a71a3a1c139c563723a8f1625b991c676	-	trace_ignore_request_body=1;trace_volatile_uuids=1;validation_js_profile=0	333	-	-	-
 wiki-revisit	wiki-article-revisit	https://en.wikipedia.org/wiki/PlayStation_Portable	wiki-abc	03cc838a3734a80f72a2ba0df1327cbfa7c81fd47f90a8f823cee4ac307b2a9b	-	-	-	-	b-settled,c-settled	-

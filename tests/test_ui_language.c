@@ -205,8 +205,8 @@ int main(void)
     CHECK(!strcmp(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_PORTUGUESE)->code, "pt"));
     CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_PORTUGUESE)->glyphs
         == BROWSER_GLYPH_LANGUAGE_EMBEDDED);
-    CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_PORTUGUESE)->version == 16);
-    CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_SPANISH)->version == 16);
+    CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_PORTUGUESE)->version == 17);
+    CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_SPANISH)->version == 17);
     char url[256];
     CHECK(!tilefinch_ui_language_url(0, url, sizeof(url)));
     CHECK(!tilefinch_ui_language_url(1, url, 4));
@@ -214,7 +214,7 @@ int main(void)
     /* The configured models repository (the default here), not a copy. */
     CHECK(tilefinch_ui_language_url(TILEFINCH_UI_LANGUAGE_SPANISH, url, sizeof(url))
           && !strcmp(url, "https://raw.githubusercontent.com/stjanovitz/"
-                          "tilefinch-models/main/translations/ui/v16/es.tful"));
+                          "tilefinch-models/main/translations/ui/v17/es.tful"));
     size_t length = 0;
     for (unsigned language = 1; language < TILEFINCH_UI_LANGUAGE_COUNT; language++) {
         const TilefinchUiLanguageSpec *spec = tilefinch_ui_language_spec(language);
@@ -250,14 +250,14 @@ int main(void)
         CHECK(budget.categories[BUDGET_CATEGORY_UNCATEGORIZED].current
               - plain_before == budget.current - before);
         /* A loaded catalog holds its file's hashes, key lengths and values
-           plus a 16-bit offset per row it actually has (and, for Arabic,
+           plus a 32-bit offset per row it actually has (and, for Arabic,
            the display text): nothing scales with the row bound. */
         const unsigned char *count_at = memchr(bytes, '\n', length);
         CHECK(count_at && count_at + 2 < bytes + length);
         size_t rows = (size_t) count_at[1] << 8 | count_at[2];
         CHECK(rows > 0 && rows <= TILEFINCH_UI_TRANSLATION_ROWS);
         if (language != TILEFINCH_UI_LANGUAGE_ARABIC)
-            CHECK(budget.current - before <= length + 2u * rows + 256u);
+            CHECK(budget.current - before <= length + 4u * rows + 256u);
         if (language == TILEFINCH_UI_LANGUAGE_PORTUGUESE) {
             CHECK(!strcmp(tilefinch_ui_translation_text(t, "Settings"), "Definições"));
             CHECK(!strcmp(tilefinch_ui_translation_text(t, "Portuguese"), "Português"));
@@ -265,7 +265,7 @@ int main(void)
             CHECK(!strcmp(tilefinch_ui_translation_text(t, "Subtitles"), "Legendas"));
         }
         if (language == TILEFINCH_UI_LANGUAGE_BENGALI || language == TILEFINCH_UI_LANGUAGE_ASSAMESE) {
-            CHECK(tilefinch_ui_language_spec(language)->version == 16);
+            CHECK(tilefinch_ui_language_spec(language)->version == 17);
             CHECK(!strcmp(tilefinch_ui_translation_text(t, "Bengali"), "বাংলা"));
             CHECK(!strcmp(tilefinch_ui_translation_text(t, "Assamese"), "অসমীয়া"));
         }

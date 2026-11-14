@@ -1,9 +1,12 @@
 #include "tilefinch/psp_profile_store.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
 
 #include "tilefinch/budget.h"
+#include "tilefinch/session.h"
+#include "../src/tilefinch_test_faults.h"
 
 #define CHECK(condition) do { \
     if (!(condition)) { \
@@ -31,8 +34,37 @@ static void remove_generations(const char *path)
     (void) remove(other);
 }
 
+static int test_failed_forget_preserves_policy(void)
+{
+    char directory[] = "/tmp/tilefinch-profile-forget-XXXXXX";
+    CHECK(mkdtemp(directory) != NULL);
+    const char *origin = "https://storage.example.test/";
+    Budget budget; budget_init(&budget, 2u * 1024u * 1024u);
+    BrowserSession session;
+    BrowserProfile *profile = browser_profile_create(&budget);
+    CHECK(profile != NULL && browser_session_init(&session, &budget, 32768)
+          && browser_session_site_storage_configure(&session, directory)
+          && browser_session_site_storage_set_policy(&session, origin, BROWSER_SITE_STORAGE_STICK)
+          && browser_profile_set_site_storage_policy(profile, origin, BROWSER_SITE_STORAGE_STICK)
+          && browser_session_storage_set(&session, origin, true, "key", "value", 5));
+    PspProfileStore store;
+    psp_profile_store_init(&store, profile, NULL);
+    tilefinch_test_faults()->fail_site_storage_remove_at = 1;
+    CHECK(!psp_profile_store_forget_site_storage(&store, &session, origin, 123));
+    CHECK(!store.dirty && browser_profile_site_storage_policy(profile, origin)
+              == BROWSER_SITE_STORAGE_STICK);
+    CHECK(psp_profile_store_forget_site_storage(&store, &session, origin, 456)
+          && store.dirty && store.dirty_since_us == 456
+          && browser_profile_site_storage_policy(profile, origin) == BROWSER_SITE_STORAGE_ASK);
+    browser_session_destroy(&session);
+    browser_profile_destroy(profile);
+    CHECK(budget.current == 0 && rmdir(directory) == 0);
+    return 0;
+}
+
 int main(void)
 {
+    CHECK(test_failed_forget_preserves_policy() == 0);
     Budget budget;
     budget_init(&budget, 2u * 1024u * 1024u);
     BrowserProfile *profile = browser_profile_create(&budget);
