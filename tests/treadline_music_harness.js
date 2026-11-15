@@ -201,14 +201,18 @@ function createGame({music = true, gameFile, gameText, musicText, audio} = {}) {
     __tilefinchGameAudioDecode: (buffer) => native.decode(buffer),
     // hardening.js publishes this; game-audio.js builds its events with it.
     __tilefinchCreateEvent: (type, init) => new Event(type, init),
-    // Also hardening.js's: the interfaces game-audio.js extends.
-    __tilefinchEventInterfaces: Object.freeze({__proto__: null, Event, EventTarget}),
     __tilefinchRunTask: (name, handler, self, args) => handler.apply(self, args),
     __tilefinchReportUncaught: (error) => { throw error; },
     state, preferences, playerTank: () => player, qualificationAIActive: false,
     // music.js's test tables and build helpers (the harness flag).
     __treadlineEnableDebug: true,
   });
+  // Also hardening.js's: the interfaces game-audio.js extends and the
+  // realm's own constructors it builds with.
+  vm.runInContext("globalThis.__tilefinchEventInterfaces = Object.freeze({" +
+    "__proto__: null, Event, EventTarget, DOMException, TypeError, RangeError," +
+    " Promise, Map, WeakMap, Array, ArrayBuffer, Float32Array," +
+    " defineProperty: Object.defineProperty});", realm);
   if (audio) realm.AudioContext = audio(clock);
   else vm.runInContext(read("src/bootstrap/game-audio.js"), realm,
     {filename: "game-audio.js"});

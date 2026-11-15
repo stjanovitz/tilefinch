@@ -9,8 +9,8 @@ usually cannot.
 
 This is the detailed WebGL guide. The broader, versioned contract for Canvas,
 input, audio, storage, lifecycle, offline packaging, and qualification is
-[Tilefinch Game Profile v1.1](GAME_PROFILE.md), with a
-[machine-readable companion](tilefinch-game-profile-v1.1.json).
+[Tilefinch Game Profile v1.2](GAME_PROFILE.md), with a
+[machine-readable companion](tilefinch-game-profile-v1.2.json).
 
 ## Start with the PSP-sized surface
 
@@ -37,10 +37,71 @@ if (!gl) document.body.textContent = "WebGL is unavailable";
 ```
 
 The drawing buffer is opaque and stencil buffers are not advertised. Blending
-supports `ZERO`, `ONE`, `SRC_ALPHA` and `ONE_MINUS_SRC_ALPHA` with `FUNC_ADD`;
-`blendFuncSeparate()` with different alpha factors applies the colour factors
-to all four channels, which the opaque buffer never shows. Stencil, polygon
-offset and `blendColor()` setters are accepted and have no effect. An
+takes each WebGL 1 factor that the GE can weigh by exactly. The GE weighs the
+fragment by the drawing buffer's colour and the drawing buffer by the
+fragment's, but neither by its own colour, so which colour factors are taken
+depends on the slot:
+
+| Factor | Source factor | Destination factor |
+|---|---|---|
+| `ZERO`, `ONE`, `SRC_ALPHA`, `ONE_MINUS_SRC_ALPHA` | drawn | drawn |
+| `DST_COLOR`, `ONE_MINUS_DST_COLOR` | drawn | refused |
+| `SRC_COLOR`, `ONE_MINUS_SRC_COLOR` | refused | drawn |
+| `DST_ALPHA`, `ONE_MINUS_DST_ALPHA` | drawn as `ONE`, `ZERO` | drawn as `ONE`, `ZERO` |
+| `SRC_ALPHA_SATURATE` | drawn as `ZERO` | invalid in WebGL 1 |
+| `CONSTANT_COLOR`, `ONE_MINUS_CONSTANT_COLOR`, `CONSTANT_ALPHA`, `ONE_MINUS_CONSTANT_ALPHA` | drawn | drawn |
+
+A refused factor sets `INVALID_ENUM` and leaves the factors as they were. The
+drawing buffer's alpha is 1, so `DST_ALPHA` weighs as `ONE`, and
+`ONE_MINUS_DST_ALPHA` and `SRC_ALPHA_SATURATE` (the smaller of the source
+alpha and one minus the buffer's) as `ZERO`, exactly as WebGL draws them into
+an opaque buffer. The constant factors weigh by the `blendColor()` colour,
+clamped to [0, 1] as WebGL 1 does, which the GE holds as a fixed blend colour
+of one byte per channel: each channel of the factor rounds to the nearest
+1/255. `getParameter(BLEND_COLOR)` reports the colour as set; a browser that
+blends with the exact value can differ by one step in 255 where a channel of
+the factor is not a whole number of 255ths. As WebGL requires, a constant
+colour factor and a constant alpha factor in one colour pair set
+`INVALID_OPERATION`. `blendFuncSeparate()` applies the colour factors to all
+four channels; its alpha factors may be any WebGL 1 factor, since the opaque
+buffer never shows them, and `getParameter(BLEND_SRC_ALPHA)` and
+`getParameter(BLEND_DST_ALPHA)` report them.
+
+`blendEquation()` takes `FUNC_ADD`, `FUNC_SUBTRACT` (0x800A) and
+`FUNC_REVERSE_SUBTRACT` (0x800B). The subtractions use the blend factors:
+`FUNC_SUBTRACT` draws source × source factor − buffer × destination factor,
+and `FUNC_REVERSE_SUBTRACT` the reverse. A result below zero is stored as
+zero, as a WebGL unorm buffer clamps after the equation; with these factors
+a subtraction never exceeds one. The GE draws them with its own subtract and
+reverse-subtract operations and the same factor mapping as `FUNC_ADD`, and
+the host renderer gives the same pixels, clamped the same way.
+
+The GE truncates each weighted term where the host rounds the result once,
+so with any factor other than `ZERO` and `ONE` (alpha, colour or constant) a
+PSP channel can be one step in 255 away from the host's, as WebGL allows;
+every factor pair and equation of the conformance fixture stays within that
+step on a PSP.
+With `EXT_blend_minmax` enabled, `blendEquation()` also takes `MIN_EXT`
+(0x8007) and `MAX_EXT` (0x8008): each colour channel becomes the smaller or
+larger of the fragment and the drawing buffer, and the blend factors are
+ignored, as WebGL specifies. The GE draws them with its own minimum and
+maximum blend operations, and the host renderer gives the same pixels. In
+`blendEquationSeparate()` the RGB equation draws all channels; the alpha
+equation is kept and reported by `getParameter(BLEND_EQUATION_ALPHA)` but,
+like a separate alpha factor, never shows in the opaque buffer.
+
+Only a draw with blending off, or with `FUNC_ADD` and factors that are
+`ZERO`, `ONE`, `SRC_ALPHA`, `ONE_MINUS_SRC_ALPHA` or drawn as one of them,
+gets the antialiasing fringe. The fringe is a partial-coverage
+blend over the buffer, which has no exact form for `FUNC_SUBTRACT`,
+`FUNC_REVERSE_SUBTRACT`, `MIN_EXT` or `MAX_EXT` (a multisample buffer would
+clamp each sample before averaging), nor for a colour or constant factor: on
+the GE the fringe is an alpha blend, which would draw the edge of a multiply
+as a plain mix. three.js r128's `MultiplyBlending` (`ZERO`, `SRC_COLOR`) and
+`SubtractiveBlending` (`ZERO`, `ONE_MINUS_SRC_COLOR`), with or without
+`premultipliedAlpha`, draw as WebGL does, and a `CustomBlending` material
+draws with any equation and factors in the table above. Stencil and polygon
+offset setters are accepted and have no effect. An
 explicit `antialias:true` enables a bounded edge-coverage mode rather than a
 second multisample framebuffer: the PSP GE adds hardware-smoothed line and
 eligible triangle fringes, while the host fallback uses four fixed coverage
@@ -56,6 +117,10 @@ camera shake more stable. It keeps all ordinary vertex and work ceilings.
 Leave it off for deliberately pixelated art or when a measured scene needs
 every last millisecond. Check the returned context attributes and queried
 limits instead of assuming desktop defaults.
+
+`getSupportedExtensions()` lists `ANGLE_instanced_arrays`, `EXT_blend_minmax`,
+`OES_vertex_array_object` and `TILEFINCH_repeated_frame_commands`. Enable
+each with `getExtension()` before using its constants or functions.
 
 ## Use shaders the GE can translate
 
@@ -113,11 +178,11 @@ Everything else in `main()` is either refused or reported:
 
 | Construct | Result |
 |---|---|
-| `for`, `while`, `do`, `dFdx`/`dFdy`/`fwidth` | link fails |
+| `for`, `while`, `do`, `dFdx`/`dFdy`/`fwidth` | link fails, except derivatives inside a built-in lit material's bump map, which is [left out](#built-in-materials-from-scene-libraries) |
 | `discard` | link fails, except an alpha test `if (color.a < uniform) discard;` that the [material mapping](#built-in-materials-from-scene-libraries) draws as the GE alpha test |
 | `if` or `?:` whose condition reads a varying, attribute, texture sample, `gl_FragCoord`, `gl_FrontFacing`, `gl_PointCoord`, a helper function, or a local derived from them | link fails: the GE cannot branch per pixel or per vertex |
-| `texture2D` in the vertex shader; `textureCube`, `texture2DProj`, `texture2DLod` | link fails (`MAX_VERTEX_TEXTURE_IMAGE_UNITS` is 0; only 2D sampling exists) |
-| two or more samplers sampled | link fails (`MAX_TEXTURE_IMAGE_UNITS` is 1) |
+| `texture2D` in the vertex shader; `textureCube`, `texture2DProj`, `texture2DLod` | link fails (`MAX_VERTEX_TEXTURE_IMAGE_UNITS` is 0; only 2D sampling exists), except a built-in lit material's environment map, [left out with a warning](#built-in-materials-from-scene-libraries) |
+| two or more samplers sampled | link fails (`MAX_TEXTURE_IMAGE_UNITS` is 1), except the [extra maps of a built-in lit material](#built-in-materials-from-scene-libraries) |
 | `if` or `?:` that reads only uniforms and constants | evaluated per draw when it chooses a uniform or constant factor (`vColor * (uMode > .5 ? 1. : .25)`); otherwise links with a warning and neither branch is evaluated |
 | numeric and uniform colour factors (`vColor * 0.5`, `vec4(vColor.rgb * uTint, 1.0)`) | applied exactly, evaluated once per draw |
 | other colour math (`vColor * vColor.g`, `vColor + vec4(0.25)`, `gl_FragCoord` effects) | links with a warning naming the factor; the PSP draws the recognised factors |
@@ -183,10 +248,16 @@ finds onto GE terms:
 | other colour math that reads only attributes, uniforms and numbers, directly or through varyings (`0.5 + 0.5 * cos(uTime + vUv.xyx * 3.0)`) | evaluated per vertex in software (on the VFPU on a PSP) and interpolated by the GE |
 
 Lighting is recognised by data flow, not by matching source text: a helper
-that reads a light uniform (a struct uniform whose type ends in `Light`,
-`ambientLightColor` or `lightProbe`) or receives a light struct becomes one
-lighting term, and the light-struct uniforms passed to it (`pointLights[0]`,
-`directionalLights[1]`, ...) name the GE lights. The material struct passed
+that reads a light uniform (a struct uniform whose type ends in `Light`, or
+`ambientLightColor`) or receives a light struct becomes one lighting term,
+and the light-struct uniforms passed to it (`pointLights[0]`,
+`directionalLights[1]`, ...) name the GE lights. A light probe is recognised
+by what its helper computes, whatever the uniform, the helper and its
+parameters are called: a helper that takes a `vec3[9]` uniform array and
+evaluates three.js's spherical-harmonic irradiance on it (or only its band-0
+term, the first coefficient times 0.886227), directly or through helpers that
+pass the array on, adds the probe's band 0 to the GE ambient light. A helper
+that does anything else with such an array is not a light probe. The material struct passed
 beside them supplies the diffuse, specular and shininess inputs. `SHADER_NAME`
 only selects the reflectance model.
 
@@ -203,20 +274,48 @@ The approximations link with a warning:
 - colour math evaluated per vertex is interpolated across each triangle, so
   a term that is not linear in its inputs (a `cos` wave, a `step` edge) is
   only as fine as the mesh: subdivide the geometry where it matters.
+- a lit material's texture maps other than its base colour map are left out,
+  and the warning names each one (see below).
+
+The GE samples one texture. A lit material may read several: the base
+colour map, which multiplies the diffuse colour, is the one drawn, and every
+other map is recognised by where its value flows, whatever its sampler is
+called, and left out. Each map links with one warning,
+`WARNING: fragment shader: texture 'normalMap' perturbs the normal; the GE lights with vertex normals`
+for example, and the program draws exactly what the same material draws
+without that map:
+
+| The map's value | Example (three.js) | Drawn as | Warning ends |
+|---|---|---|---|
+| combined with the vertex normal into the normal the lighting reads | `normalMap`, `bumpMap` | vertex normals | `perturbs the normal; the GE lights with vertex normals` |
+| added to light handed to the lighting | `lightMap` | the lights alone | `adds light; the PSP draws without it` |
+| multiplying a lit term | `aoMap` | the lit term alone | `scales light; the PSP draws without it` |
+| multiplying the emissive colour | `emissiveMap` | the emissive colour | `scales the emissive colour; the PSP draws the colour without it` |
+| multiplying a material input (a uniform factor, or the specular strength) | `roughnessMap`, `metalnessMap`, `specularMap` | the uniform factor, `roughness` and `metalness` as uniforms | `scales a material input; the PSP draws the input without it` |
+| a cube map, or a 2D map looked up by anything but a mesh texture coordinate, blended into or added to the colour | `envMap` | no reflections | `is an environment map; the PSP draws no reflections` |
+| scaling only a dropped environment term | `specularMap` with `envMap` | no reflections | `scales the reflection; the PSP draws no reflections` |
+
+A material whose only texture is such a map draws untextured, with the same
+warning. A displacement map is never sampled: `MAX_VERTEX_TEXTURE_IMAGE_UNITS`
+is 0, so three.js leaves it out of the vertex shader and draws the mesh
+undisplaced, with no warning.
 
 Per-vertex colour math is bounded. A program may use at most 32 steps (one
 per operation or built-in call), 15 constant vectors (each number, uniform and
 `mat3`/`mat4` column it reads) and 12 temporaries; a larger one is refused at
 link time with the reason. A draw may run at most 65,536 steps in all
-(vertices × instances × steps), so a 32-step program draws up to 2,048
-vertices at once; a larger draw is not drawn, sets `OUT_OF_MEMORY`, and is
-reported once per program with `console.warn`. Programs that read a texture,
+(vertices × instances × steps) in one submission, so a 32-step program draws
+up to 2,048 vertices at once. A larger draw is made in several submissions,
+as described under [Large draws](#large-draws); a fan or loop that does not
+fit one submission is not drawn. Programs that read a texture,
 `gl_FragCoord`, `gl_PointCoord` or the lights are not evaluated per vertex.
 
 A lit program the mapping cannot represent is refused rather than drawn
 unlit, for example a light type with no GE equivalent, lighting in a program
-without a lit `SHADER_NAME`, or a second texture (normal, environment,
-light or AO maps). Custom `ShaderMaterial` programs go through the same
+without a lit `SHADER_NAME`, or a second texture in the colour itself: an
+alpha map, or two maps multiplying the diffuse colour. A program that is not
+a built-in lit material and samples two textures (a `ShaderMaterial` mixing
+two maps) is refused too. Custom `ShaderMaterial` programs go through the same
 checks: shapes the mapping understands draw exactly, and anything else is
 refused or warned as in the table above. Mapping happens at link time; each
 draw only evaluates the program's uniform terms into a 256-word material
@@ -269,6 +368,51 @@ one more than a submission's 64 draws. Buffer storage is capped at
 512 KiB and retained texture pixels at 416 KiB. Exceeding a true bound fails
 soft; it never grants an unbounded page allocation.
 
+### Large draws
+
+The 4,096-vertex bound belongs to one native submission, not to a draw. It
+exists because each submission's vertices are prepared in fixed scratch
+memory: on the GE, 24 bytes per vertex and twice that for lit materials,
+which also need room for their light terms; in the host renderer, one
+expanded vertex per drawn vertex. Raising it would raise every page's peak
+memory, and a failed allocation loses the context. The 64 KiB GE display list
+is not the bound, because a full list is submitted and refilled. Indexed
+draws are drawn index by index, so the bound counts indices, not the
+vertices they reach; `UNSIGNED_BYTE` and `UNSIGNED_SHORT` indices may reach
+any vertex in the buffer.
+
+A draw with more vertices × instances than one submission takes (4,096, or
+65,536 ÷ steps for a per-vertex colour program) is split into several
+submissions that draw exactly what one would, in the same order, with the
+same depth testing and blending:
+
+- `TRIANGLES`, `LINES` and `POINTS` split on whole triangles, segments and
+  points.
+- `TRIANGLE_STRIP` and `LINE_STRIP` parts overlap by two vertices or one, and
+  a triangle-strip part starts on an even triangle so the winding and culling
+  stay those of the whole strip.
+- `drawElements()` splits by index range; the indices stay where they are.
+- An instanced draw is split into groups of whole instances when its base
+  geometry fits a submission, and each instance's geometry into parts when
+  it does not.
+
+Each extra submission costs a GE list flush, so a split draw is slower than
+the same geometry in fewer, smaller draws, but nothing is left out. A strip
+part with a vertex that cannot be drawn (not finite, or past the clip range)
+is dropped by itself, where before the whole strip was. Draws that fit one
+submission are unchanged.
+
+Two kinds of draw cannot be split exactly and are refused with
+`OUT_OF_MEMORY` and one `console.warn` per program and draw shape:
+
+- a `TRIANGLE_FAN` or `LINE_LOOP` with more vertices than one submission
+  takes, for example `WebGL program 3: a TRIANGLE_FAN draw of 5000 vertices
+  is over the PSP limit of 4096 vertices per submission, and a fan cannot be
+  split into parts exactly, so it is not drawn; draw TRIANGLES or fans of at
+  most 4096 vertices`;
+- a draw of more than 64 instances, with `draw at most 64 instances at a
+  time`.
+
 The bounded instancing shader shape is deliberately narrow: the position
 expression may include one `mat4` attribute, with all four columns backed by
 one interleaved float buffer and divisor 1. Other vertex attributes retain
@@ -306,6 +450,15 @@ conversion and copy. The presenter's sprite list and vertices (86 KiB) are
 taken from the heap by the first frame it publishes and freed once the page
 has been left and no submission can still read them; if the heap cannot
 supply them, that page's frames use the CPU conversion.
+
+A canvas shows a frame only once it is complete. Draws are submitted when
+the task that made them ends; a submission forced earlier inside the task (a
+buffer or texture upload after a draw, more than 64 draws, `readPixels()`,
+`flush()` or `finish()`) draws part of the frame into the drawing buffer, and
+until the task's last submission the page, including the loading preview,
+keeps showing the previous complete frame, or nothing before the first. The
+previous frame is copied once per such frame (230 KB for a 320×180 canvas,
+kept while the canvas lives); a frame submitted in one piece copies nothing.
 
 The GE scale costs a fraction of the CPU conversion and copy, so authors
 benefit most from a 320×180 opaque canvas with the HUD drawn inside it: a DOM
@@ -453,6 +606,14 @@ The host rasterizer exercises pixels, clipping, depth, culling, blending,
 texture wrapping, and line closure. PPSSPP's software renderer is used when
 an end-to-end browser fixture must read GE pixels back into the page
 renderer.
+
+PPSSPP's hardware renderer does not always keep the WebGL surface in EDRAM in
+step with what the GE drew into it. When the GE scales a full-screen canvas
+straight from that surface, a recording from the emulator can show a frame
+drawn in parts with its later parts missing (for example the first frame of
+a three.js scene with one mesh absent), even though the browser presents it
+only once complete. A PSP shows the complete frame, so judge such frames on
+the device.
 
 ## Preflight checklist
 

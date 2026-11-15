@@ -2669,6 +2669,8 @@ static int test_foundation(void)
     CHECK(test_inline_svg_presentation_var(&budget));
     puts("test: mutation refresh reuses unchanged inline SVG rasters");
     CHECK(test_inline_svg_refresh_reuses_unchanged_rasters(&budget));
+    puts("test: committed page shares the loading preview's SVG rasters");
+    CHECK(test_inline_svg_preview_rasters_shared(&budget));
     CHECK(test_image_rebuild_near_budget_releases_unlent_images(&budget));
     CHECK(test_inline_svg_refresh_shares_style_memos(&budget));
     CHECK(test_inline_svg_refresh_reuses_layout_ancestry(&budget));

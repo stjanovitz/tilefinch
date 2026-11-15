@@ -42,11 +42,12 @@ and maintainers. Tilefinch's documentation has three layers:
   install offer, and degradation.
 - [Chrome themes](THEMES.md): built-in palettes, downloaded themes, and the
   interactive color designer.
-- [Game Profile v1.1](GAME_PROFILE.md): the developer and coding-agent
+- [Game Profile v1.2](GAME_PROFILE.md): the developer and coding-agent
   contract for PSP-sized Canvas/WebGL games, including APIs, hard ceilings,
   lifecycle, offline packaging, fallbacks, and qualification. Its
-  [v1.1 JSON companion](tilefinch-game-profile-v1.1.json) is machine-readable;
-  the released [v1 companion](tilefinch-game-profile-v1.json) is unchanged.
+  [v1.2 JSON companion](tilefinch-game-profile-v1.2.json) is machine-readable;
+  the released [v1.1 companion](tilefinch-game-profile-v1.1.json) and
+  [v1 companion](tilefinch-game-profile-v1.json) are unchanged.
 - [WebGL authoring](WEBGL.md): the PSP-efficient shader, resource, animation,
   input, and offline-packaging profile for small games and charts.
 - [WebAssembly](WEBASSEMBLY.md): the standards-facing JavaScript API,

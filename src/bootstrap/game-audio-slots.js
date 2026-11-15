@@ -1,4 +1,9 @@
 ((cap) => {
+  /* Loaded after the page may have replaced these globals: build
+     errors, promises and platform objects with the constructors
+     hardening.js captured. */
+  const { TypeError, DOMException, Promise } =
+    globalThis.__tilefinchEventInterfaces;
   // This packet stays in lexical scope. Node/Param state is exclusively C-owned.
   /* Loaded on first use, after the page may have replaced EventTarget:
      extend the interface hardening.js captured. */

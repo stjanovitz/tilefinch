@@ -8,6 +8,7 @@
 
 #include "tilefinch/layout.h"
 #include "tilefinch/integer_math.h"
+#include "tilefinch/text_bidi.h"
 #include "style_paint_internal.h"
 #include "style_cache_internal.h"
 
@@ -1442,6 +1443,32 @@ bool layout_bidi_measure_shaped_text(
     const char *text, size_t length, int font_size_fixed,
     bool synthetic_bold, bool metric_bold, int letter_spacing,
     TextTransformMode transform, bool kerning, int *width_fixed);
+/* Intrinsic sizing measures words outside any inline flow. A word of a
+   text node with Arabic letters whose letters changed form is as wide as
+   those forms, as the flow will draw it. A whole word whose forms cannot
+   depend on the rest of the node (no bracket, joiner or control) is shaped
+   on its own, and its width is retained in the reuse cache across nodes
+   and builds; the node's paragraph is analysed, at most once, only for the
+   other words. Begin and end bracket one node's words; byte ranges are
+   relative to the node's text. */
+typedef struct LayoutBidiIntrinsicShaping {
+    LayoutContext *context;
+    const char *text;
+    size_t length;
+    TextBidiParagraph *paragraph;
+    uint64_t generation;
+    bool joins;    /* Arabic letters, within the analysis limits */
+    bool analysed; /* paragraph creation was attempted */
+} LayoutBidiIntrinsicShaping;
+void layout_bidi_intrinsic_shaping_begin(
+    LayoutBidiIntrinsicShaping *shaping, LayoutContext *context,
+    const char *text, size_t length);
+void layout_bidi_intrinsic_shaping_end(LayoutBidiIntrinsicShaping *shaping);
+bool layout_bidi_intrinsic_shaped_width(
+    LayoutBidiIntrinsicShaping *shaping, size_t byte_start, size_t byte_end,
+    const FontFace *face, FontFamily metric_family, int font_size_fixed,
+    bool synthetic_bold, bool metric_bold, int letter_spacing,
+    TextTransformMode transform, bool kerning, int *width_fixed);
 bool layout_bidi_fitting_shaped_prefix(
     LineState *line, const FontFace *face, FontFamily metric_family,
     const char *text, size_t length, int font_size_fixed,
@@ -1705,6 +1732,22 @@ int layout_text_measure(LayoutReuseCache *cache, const FontFace *face,
                         bool synthetic_bold, bool metric_bold, int scale,
                         int letter_spacing, TextTransformMode transform,
                         bool kerning);
+/* The retained width of a contextually shaped whole word (26.6; -1 when
+   none of its letters changed form), keyed like layout_text_measure without
+   the scale. Only layout_bidi_intrinsic_shaped_width decides which words
+   are independent of their context; `generation` is the optional glyph
+   generation the width was measured under. */
+bool layout_text_measure_find_shaped(
+    LayoutReuseCache *cache, const FontFace *face, FontFamily metric_family,
+    const char *text, size_t length, int font_size_fixed,
+    bool synthetic_bold, bool metric_bold, int letter_spacing,
+    TextTransformMode transform, bool kerning, int *width_fixed);
+void layout_text_measure_store_shaped(
+    LayoutReuseCache *cache, const FontFace *face, FontFamily metric_family,
+    const char *text, size_t length, int font_size_fixed,
+    bool synthetic_bold, bool metric_bold, int letter_spacing,
+    TextTransformMode transform, bool kerning, int width_fixed,
+    uint64_t generation);
 /* Discards every retained measurement and frees the table. */
 size_t layout_text_measure_release(LayoutReuseCache *cache);
 /* Once per build (layout_reuse_cache_prepare): retry a refused table,

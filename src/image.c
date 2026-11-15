@@ -252,6 +252,9 @@ typedef struct {
        inside that unit and accidentally turn benign input into image failure. */
     bool externally_pumped;
     bool cooperate_cancelled;
+    /* Give every inline-SVG raster a shared pixel body, so a later table can
+       take a reference to it (images_rasterize_inline_svgs). */
+    bool share_svg_rasters;
 } ImageLoadContext;
 
 static bool image_count_exhausted(const ImageLoadContext *context)
@@ -991,6 +994,27 @@ static void image_canvas_native_forget(ImageResource *resource)
     resource->canvas_native_surface = NULL;
 }
 
+/* Frees the held-frame storage of `node`'s canvas (every canvas when node
+   is NULL) and closes any frame that showed it. */
+static void images_canvas_held_release(ImageResources *images, Budget *budget,
+                                       const lxb_dom_node_t *node)
+{
+    for (size_t slot = 0; slot < 2u; slot++) {
+        if (images->canvas_held[slot].pixels == NULL
+            || (node != NULL && images->canvas_held[slot].node != node))
+            continue;
+        const unsigned char *held = images->canvas_held[slot].pixels;
+        for (size_t i = 0; i < images->count; i++) {
+            if (images->items[i].canvas_held_frame != held) continue;
+            images->items[i].canvas_held_frame = NULL;
+            images->items[i].canvas_frame_open = false;
+        }
+        budget_free(budget, images->canvas_held[slot].pixels);
+        memset(&images->canvas_held[slot], 0,
+               sizeof(images->canvas_held[slot]));
+    }
+}
+
 ImageCanvasCommitResult images_prepare_canvas_surface(
     ImageResources *images, Budget *budget, lxb_dom_node_t *node,
     int width, int height, unsigned char **rgba_pixels)
@@ -1084,6 +1108,12 @@ ImageCanvasCommitResult images_prepare_canvas_surface(
     existing->height = height;
     existing->owns_pixels = true;
     image_canvas_native_forget(existing);
+    /* A resized drawing buffer starts a new surface: no frame of it has
+       been completed, and a held frame of the old size no longer fits. */
+    images_canvas_held_release(images, budget, node);
+    existing->canvas_frame_open = false;
+    existing->canvas_frame_published = false;
+    existing->canvas_held_frame = NULL;
     if (old_bytes <= images->stats.decoded_bytes) {
         images->stats.decoded_bytes -= old_bytes;
     } else {
@@ -1140,6 +1170,7 @@ bool images_release_canvas(ImageResources *images, Budget *budget,
 {
     if (images == NULL || budget == NULL || node == NULL
         || (images->budget != NULL && images->budget != budget)) return false;
+    images_canvas_held_release(images, budget, node);
     for (size_t i = 0; i < images->count; ) {
         ImageResource *resource = &images->items[i];
         if (resource->node != node || !resource->is_canvas) {
@@ -1393,6 +1424,84 @@ bool images_materialize_canvas_native_surface(ImageResources *images,
     return false;
 }
 
+static ImageResource *images_find_canvas(ImageResources *images,
+                                         const lxb_dom_node_t *node)
+{
+    for (size_t i = 0; images != NULL && node != NULL && i < images->count;
+         i++) {
+        ImageResource *item = &images->items[i];
+        if (item->node == node && item->is_canvas && !item->is_mask
+            && !item->is_background && item->pseudo == PSEUDO_NONE)
+            return item;
+    }
+    return NULL;
+}
+
+void images_canvas_frame_hold(ImageResources *images, Budget *budget,
+                              lxb_dom_node_t *node)
+{
+    ImageResource *resource = images_find_canvas(images, node);
+    if (resource == NULL || resource->canvas_frame_open) return;
+    resource->canvas_frame_open = true;
+    resource->canvas_held_frame = NULL;
+    if (!resource->canvas_frame_published || budget == NULL
+        || resource->pixels == NULL || resource->width <= 0
+        || resource->height <= 0) return;
+    size_t row_bytes = (size_t) resource->width * 4u;
+    size_t bytes = row_bytes * (size_t) resource->height;
+    size_t slot = 2u;
+    for (size_t at = 0; at < 2u; at++) {
+        if (images->canvas_held[at].node == node) {
+            slot = at;
+            break;
+        }
+        if (slot == 2u && images->canvas_held[at].node == NULL) slot = at;
+    }
+    /* Two WebGL contexts per realm: a third canvas (after a lost context)
+       shows nothing rather than its unfinished frame. */
+    if (slot == 2u) return;
+    if (images->canvas_held[slot].pixels != NULL
+        && images->canvas_held[slot].bytes != bytes) {
+        budget_free(budget, images->canvas_held[slot].pixels);
+        memset(&images->canvas_held[slot], 0,
+               sizeof(images->canvas_held[slot]));
+    }
+    if (images->canvas_held[slot].pixels == NULL) {
+        unsigned char *held = budget_malloc_cacheline_category(
+            budget, BUDGET_CATEGORY_RESOURCE, bytes);
+        if (held == NULL) return;
+        images->canvas_held[slot].node = node;
+        images->canvas_held[slot].pixels = held;
+        images->canvas_held[slot].bytes = bytes;
+    }
+    unsigned char *held = images->canvas_held[slot].pixels;
+    const unsigned char *source = NULL;
+    size_t stride = 0u;
+    /* The complete frame is where painters last read it: the PSP's EDRAM
+       surface while it is authoritative, else the page-owned pixels. */
+    if (image_resource_native_canvas_source(resource, &source, &stride)) {
+        tilefinch_platform_copy_pixel_rows(held, row_bytes, source, stride,
+                                            row_bytes, (size_t) resource->height);
+    } else {
+        tilefinch_platform_copy_pixel_rows(held, row_bytes, resource->pixels,
+                                            row_bytes, row_bytes,
+                                            (size_t) resource->height);
+    }
+    resource->canvas_held_frame = held;
+}
+
+bool images_canvas_frame_publish(ImageResources *images,
+                                 lxb_dom_node_t *node)
+{
+    ImageResource *resource = images_find_canvas(images, node);
+    if (resource == NULL) return false;
+    bool was_open = resource->canvas_frame_open;
+    resource->canvas_frame_open = false;
+    resource->canvas_frame_published = true;
+    resource->canvas_held_frame = NULL;
+    return was_open;
+}
+
 bool images_adopt_decoded_surface(ImageResources *images, Budget *budget,
                                   lxb_dom_node_t *node,
                                   unsigned char *rgba_pixels,
@@ -1566,14 +1675,18 @@ static bool image_node_in_refresh_set(
    its paint role: display retargeting may have resized or released it, and
    the borrower takes over that state with the markup. Without markup only a
    plain inline-SVG raster qualifies: budget-owned pixels at their source
-   size with no encoded body, session lease, canvas or paint role. */
+   size (in a body only when shared with a preview's table) with no encoded
+   body, session lease, canvas or paint role. */
 static bool image_refresh_svg_lendable(const ImageResource *item)
 {
     if (item->node == NULL || item->is_canvas || item->canvas_native_surface != NULL
         || item->width <= 0 || item->height <= 0) return false;
     if ((item->retarget_flags & IMAGE_RETARGET_VECTOR) != 0
         && item->encoded != NULL) return true;
-    return item->pixels != NULL && item->pixel_body == NULL
+    return item->pixels != NULL
+        && (item->pixel_body == NULL
+            || (item->shared_svg_raster
+                && item->pixel_body->data == item->pixels))
         && item->encoded == NULL && item->encoded_body == NULL
         && !item->is_mask && !item->is_background
         && item->pseudo == PSEUDO_NONE && item->source_hash == 0
@@ -1741,6 +1854,34 @@ static int image_refresh_borrow(ImageLoadContext *context,
     return 1;
 }
 
+/* A raster of the same markup in the lent preview table
+   (images_lend_preview_rasters) that fits `raster_limit`: the markup hash is
+   the rasterizer's whole input (see image_refresh_previous_svg), and an
+   entry still at its source size shows exactly what this load would
+   rasterize. */
+static const ImageResource *image_preview_svg_lender(
+    const ImageResources *images, uint64_t hash, size_t raster_limit)
+{
+    const ImageResources *preview = images->preview_rasters;
+    if (preview == NULL || preview == images
+        || preview->budget != images->budget) return NULL;
+    for (size_t i = 0; i < preview->count; i++) {
+        const ImageResource *item = &preview->items[i];
+        if (item->url_hash != hash || !item->shared_svg_raster
+            || item->pixels == NULL || item->pixel_body == NULL
+            || item->pixel_body->data != item->pixels
+            || item->is_mask || item->is_background
+            || item->pseudo != PSEUDO_NONE || item->source_hash != 0
+            || item->width <= 0 || item->height <= 0
+            || item->width != item->source_width
+            || item->height != item->source_height) continue;
+        size_t bytes = (size_t) item->width * (size_t) item->height * 4u;
+        if (bytes <= raster_limit && bytes <= item->pixel_body->length)
+            return item;
+    }
+    return NULL;
+}
+
 static bool load_inline_svg_source(ImageLoadContext *context, lxb_dom_node_t *node,
     const ComputedStyle *style, const FetchResult *sprite)
 {
@@ -1820,17 +1961,42 @@ static bool load_inline_svg_source(ImageLoadContext *context, lxb_dom_node_t *no
         raster_limit = IMAGE_COUNT_EXEMPT_DECODED_BYTES;
     }
     images->stats.attempted++;
-    images->stats.inline_svg_rasterized++;
-    image_trace("inline-svg-rasterize", source.data, source.length);
-    uint64_t rasterize_started = image_profile_enabled()
-        ? image_profile_now_us() : 0;
+    /* A preview drew this markup already: share its pixels. */
+    const ImageResource *lender = sprite == NULL
+        ? image_preview_svg_lender(images, hash, raster_limit) : NULL;
+    BrowserSharedBody *lent_body = lender == NULL ? NULL
+        : browser_shared_body_retain(lender->pixel_body);
+    unsigned char *pixels = NULL;
     bool limited = false;
-    unsigned char *pixels = image_svg_decode_bounded(
-        source.data, source.length, context->budget, raster_limit,
-        &width, &height, NULL, NULL, NULL, NULL, &limited);
+    uint64_t rasterize_started = 0;
+    ImageSvgDecodeProfile decode_before;
+    if (lent_body != NULL) {
+        pixels = lender->pixels;
+        width = lender->width;
+        height = lender->height;
+        images->stats.inline_svg_preview_reused++;
+        image_trace("inline-svg-preview-share", "", 0);
+    } else {
+        images->stats.inline_svg_rasterized++;
+        image_trace("inline-svg-rasterize", source.data, source.length);
+        rasterize_started = image_profile_enabled()
+            ? image_profile_now_us() : 0;
+        image_svg_decode_profile(&decode_before);
+        pixels = image_svg_decode_bounded(
+            source.data, source.length, context->budget, raster_limit,
+            &width, &height, NULL, NULL, NULL, NULL, &limited);
+    }
     if (rasterize_started != 0) {
         images->stats.inline_svg_rasterize_us +=
             image_profile_now_us() - rasterize_started;
+        ImageSvgDecodeProfile decode_after;
+        image_svg_decode_profile(&decode_after);
+        images->stats.inline_svg_parse_us +=
+            decode_after.parse_us - decode_before.parse_us;
+        images->stats.inline_svg_raster_us +=
+            decode_after.raster_us - decode_before.raster_us;
+        images->stats.inline_svg_cooperate_us +=
+            decode_after.cooperate_us - decode_before.cooperate_us;
     }
     if (pixels == NULL || width <= 0 || height <= 0
         || (size_t) width > SIZE_MAX / (size_t) height
@@ -1858,10 +2024,12 @@ static bool load_inline_svg_source(ImageLoadContext *context, lxb_dom_node_t *no
     }
     ImageResource resource = {
         .node = node, .url_hash = hash, .source_hash = source_hash, .pixels = pixels,
+        .pixel_body = lent_body,
         .cross_origin = sprite != NULL && image_response_cross_origin(
             context->document_url, sprite->effective_url),
         .source_width = width, .source_height = height,
-        .width = width, .height = height, .owns_pixels = true
+        .width = width, .height = height, .owns_pixels = true,
+        .shared_svg_raster = lent_body != NULL
     };
     /* The serialized markup is the rasterizer's whole input, so display
        retargeting can rasterize it again at the painted size. */
@@ -1881,10 +2049,14 @@ static bool load_inline_svg_source(ImageLoadContext *context, lxb_dom_node_t *no
     budget_free(context->budget, source.data);
     /* These pixels are immutable until retargeting replaces the surface.
        A shared lifetime lets render caches recognize an unchanged raster
-       borrowed by a later resource table, without relying on its address. */
-    if (resource.encoded != NULL)
+       borrowed by a later resource table, without relying on its address,
+       and lets a preview's raster be shared with the committed page. */
+    if (resource.pixel_body == NULL
+        && (resource.encoded != NULL || context->share_svg_rasters)) {
         resource.pixel_body = browser_shared_body_take(
             context->budget, pixels, decoded);
+        resource.shared_svg_raster = resource.pixel_body != NULL;
+    }
     if (!image_add(images, resource)) {
         image_resource_release_owned_pixels(context->budget, &resource);
         budget_free(context->budget, resource.encoded);
@@ -4973,9 +5145,11 @@ static bool images_load_external_impl(
     }
     if (images->budget == NULL) {
         ImageLayoutBoxes *boxes = images->layout_boxes;
+        const ImageResources *preview_rasters = images->preview_rasters;
         memset(images, 0, sizeof(*images));
         images->budget = budget;
         images->layout_boxes = boxes;
+        images->preview_rasters = preview_rasters;
     } else if (images->budget != budget) {
         if (owns_scheduler) fetch_scheduler_destroy(scheduler);
         return false;
@@ -5325,6 +5499,7 @@ static void image_rebuild_release_unlendable(ImageResources *images,
         budget_free(images->budget, images->canvas_depth[i].values);
         memset(&images->canvas_depth[i], 0, sizeof(images->canvas_depth[i]));
     }
+    images_canvas_held_release(images, images->budget, NULL);
 }
 
 void images_prepare_external_rebuild(ImageResources *images)
@@ -5370,6 +5545,17 @@ void images_retire_subtree(ImageResources *images,
                 budget_free(images->budget, images->canvas_depth[i].values);
                 memset(&images->canvas_depth[i], 0,
                        sizeof(images->canvas_depth[i]));
+                break;
+            }
+        }
+    }
+    for (size_t i = 0; i < 2u; i++) {
+        size_t depth = 0;
+        for (const lxb_dom_node_t *at = images->canvas_held[i].node;
+             at != NULL; at = at->parent) {
+            if (at == root || ++depth >= 4096u) {
+                images_canvas_held_release(images, images->budget,
+                                           images->canvas_held[i].node);
                 break;
             }
         }
@@ -6091,6 +6277,76 @@ bool images_refresh_external_nodes(
         scheduler, session, NULL, NULL, 0);
 }
 
+bool images_rasterize_inline_svgs(
+    const PocDocument *document, Stylesheet *stylesheet,
+    ImageResources *images, lxb_dom_node_t *const *nodes, size_t node_count,
+    Budget *budget, size_t maximum_decoded_bytes, size_t *added)
+{
+    if (added != NULL) *added = 0;
+    if (document == NULL || document->html == NULL || stylesheet == NULL
+        || images == NULL || budget == NULL || maximum_decoded_bytes == 0
+        || (node_count != 0 && nodes == NULL)) return false;
+    if (images->budget == NULL) {
+        ImageLayoutBoxes *boxes = images->layout_boxes;
+        memset(images, 0, sizeof(*images));
+        images->budget = budget;
+        images->layout_boxes = boxes;
+    } else if (images->budget != budget) {
+        return false;
+    }
+    size_t retained_count = images->count;
+    ExternalImageStats retained_stats = images->stats;
+    bool retained_priority_staged = images->priority_staged;
+    uint32_t retained_failure_serial = images->failure_serial;
+    /* No scheduler: nothing here may fetch. Markup that needs a response
+       (an external sprite, a generated image) is skipped below. */
+    ImageLoadContext context = {
+        .document = document,
+        .images = images,
+        .stylesheet = stylesheet,
+        .budget = budget,
+        .base_url = "",
+        .document_url = "",
+        .referrer_policy = "",
+        .maximum_count = MAX_IMAGE_FETCH_ATTEMPTS,
+        .maximum_total_encoded_bytes = maximum_decoded_bytes,
+        .maximum_single_encoded_bytes = maximum_decoded_bytes,
+        .maximum_decoded_bytes = maximum_decoded_bytes,
+        .timeout_ms = 1,
+        .viewport_width = stylesheet->viewport_width,
+        .layout_boxes = images->layout_boxes,
+        .deadline_ms = image_now_ms() + 1000.0,
+        .slice_started_us = tilefinch_platform_monotonic_time_us(),
+        .externally_pumped = true,
+        .share_svg_rasters = true
+    };
+    for (size_t i = 0; i < node_count; i++) {
+        lxb_dom_node_t *node = nodes[i];
+        if (node == NULL || !document_node_is_tag(node, LXB_TAG_SVG)
+            || images_find_node(images, node) != NULL
+            || image_inline_svg_is_sprite_sheet(node)
+            || inline_svg_external_use_href(node, NULL) != NULL) continue;
+        ComputedStyle parent;
+        bool has_parent = false, visible = false;
+        if (!image_resolve_inherited_style(
+                &context, node, &parent, &has_parent, &visible)) continue;
+        if (!visible) continue;
+        ComputedStyle style = style_for_node(
+            stylesheet, node, has_parent ? &parent : NULL);
+        if (style.display == DISPLAY_NONE || style.hidden
+            || style.generated_image) continue;
+        size_t before = images->count;
+        if (!load_inline_svg(&context, node, &style)) {
+            images_rollback_optional_suffix(
+                images, retained_count, &retained_stats,
+                retained_priority_staged, retained_failure_serial);
+            return false;
+        }
+        if (added != NULL && images->count > before) (*added)++;
+    }
+    return true;
+}
+
 bool images_load_external_priority_targets(
     const PocDocument *document, Stylesheet *stylesheet,
     ImageResources *images, const ImagePriorityTarget *targets,
@@ -6552,6 +6808,12 @@ void images_set_layout_boxes(ImageResources *images,
     if (images != NULL) images->layout_boxes = boxes;
 }
 
+void images_lend_preview_rasters(ImageResources *images,
+                                 const ImageResources *rasters)
+{
+    if (images != NULL) images->preview_rasters = rasters;
+}
+
 void images_destroy(ImageResources *images)
 {
     if (images == NULL) return;
@@ -6571,8 +6833,10 @@ void images_destroy(ImageResources *images)
                 }
             }
         }
-        for (size_t i = 0; i < 2u; i++)
+        for (size_t i = 0; i < 2u; i++) {
             budget_free(images->budget, images->canvas_depth[i].values);
+            budget_free(images->budget, images->canvas_held[i].pixels);
+        }
         budget_free(images->budget, images->items);
         budget_free(images->budget, images->failures);
     }

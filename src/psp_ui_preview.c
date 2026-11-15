@@ -377,7 +377,7 @@ int main(int argc, char **argv)
     PspUiCollectionsView collections_view = {
         .section = PSP_UI_COLLECTION_OFFLINE,
         .count = 4,
-        .empty_message = "NOTHING SAVED FOR OFFLINE YET",
+        .empty_message = "NOTHING SAVED YET",
         .rows = {
             {"PlayStation Portable", "en.wikipedia.org", "184 KB", true},
             {"Fixture video", "youtube.com", "6.2 MB", true},
@@ -517,7 +517,7 @@ int main(int argc, char **argv)
                                240);
         } else if (strncmp(mode, "language-pack-declined", 22) == 0) {
             psp_ui_show_status(
-                &ui, "Won't ask again. Install it later from:\n"
+                &ui, "Won't ask again. Install later from:\n"
                      "Settings > Appearance > Language & emoji", 300);
         } else if (strncmp(mode, "language-pack-error", 19) == 0) {
             psp_ui_show_status(&ui, "NOT ENOUGH FREE SPACE FOR UPDATE", 240);

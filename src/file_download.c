@@ -7,10 +7,16 @@
 #include <strings.h>
 #include <sys/stat.h>
 
+/* unicode_normalize; libunicode.h needs cutils.h first. */
+#include "cutils.h"
+#include "libunicode.h"
+
+#include "tilefinch/font.h"
 #include "tilefinch/platform.h"
 #include "tilefinch/update.h"
 #include "tilefinch/url.h"
 #include "tilefinch/user_agent.h"
+#include "tilefinch/utf8_encode.h"
 
 #define FILE_VALIDATOR_LIMIT 160u
 
@@ -39,32 +45,192 @@ bool file_download_url_supported(const char *url)
         && parsed.length < TILEFINCH_URL_SERIALIZED_LIMIT;
 }
 
-/* Response filenames are advisory. Use one conservative, portable basename,
-   including on FAT. Non-ASCII bytes become '_' until the device file picker
-   has a defined filename encoding; this never changes downloaded bytes. */
+/* A downloaded file has two names. Its title, kept in the library index and
+   shown by every list and question, is the server's name as UTF-8: a
+   basename, normalized to NFC, with control, bidi-override and FAT-reserved
+   characters replaced by '_'. Its Memory Stick name is that title with each
+   non-ASCII byte percent-encoded, cut to fit with the extension kept, so the
+   firmware's FAT layer only ever sees printable ASCII; the item's ID prefix
+   keeps every file's name unique. A title of printable ASCII, which is every
+   title saved before titles kept other characters, is its own Memory Stick
+   name. Neither name ever changes the downloaded bytes. */
+
+#define FILE_NAME_POINT_LIMIT 256u
+/* NFC of at most FILE_NAME_POINT_LIMIT code points, decomposed (at most a
+   few code points each) in one growing buffer. */
+#define FILE_NAME_NORMALIZE_ARENA 6144u
+
+static size_t name_utf8_decode(const unsigned char *text, size_t available,
+                               uint32_t *codepoint)
+{
+    unsigned char lead = text[0];
+    if (lead < 0x80u) { *codepoint = lead; return 1; }
+    size_t length;
+    uint32_t value, minimum;
+    if (lead >= 0xc2u && lead <= 0xdfu) { length = 2; value = lead & 0x1fu; minimum = 0x80u; }
+    else if ((lead & 0xf0u) == 0xe0u) { length = 3; value = lead & 0x0fu; minimum = 0x800u; }
+    else if (lead >= 0xf0u && lead <= 0xf4u) { length = 4; value = lead & 0x07u; minimum = 0x10000u; }
+    else return 0;
+    if (available < length) return 0;
+    for (size_t at = 1; at < length; at++) {
+        if ((text[at] & 0xc0u) != 0x80u) return 0;
+        value = (value << 6) | (text[at] & 0x3fu);
+    }
+    if (value < minimum || value > 0x10ffffu
+        || (value >= 0xd800u && value <= 0xdfffu)) return 0;
+    *codepoint = value;
+    return length;
+}
+
+/* Controls, FAT's reserved characters, and invisible characters that would
+   let a name draw as another (an override turning "gpj.exe" into "exe.jpg"). */
+static bool name_character_refused(uint32_t c)
+{
+    return c < 0x20u || (c >= 0x7fu && c <= 0x9fu)
+        || (c < 0x80u && strchr("<>:\"|?*/\\", (int) c) != NULL)
+        || c == 0x061cu || c == 0x200eu || c == 0x200fu
+        || (c >= 0x202au && c <= 0x202eu) || (c >= 0x2066u && c <= 0x2069u)
+        || c == 0x2028u || c == 0x2029u || c == 0xfeffu
+        || (c >= 0xfdd0u && c <= 0xfdefu) || (c & 0xfffeu) == 0xfffeu;
+}
+
+/* Continues the character before it: a mark, joiner, variation selector,
+   skin tone or tag. A cut never separates one from its base. */
+static bool name_character_extends(uint32_t c)
+{
+    return font_codepoint_combining_mark(c) || c == 0x200du
+        || (c >= 0xfe00u && c <= 0xfe0fu) || (c >= 0x1f3fbu && c <= 0x1f3ffu)
+        || (c >= 0xe0020u && c <= 0xe007fu) || (c >= 0xe0100u && c <= 0xe01efu);
+}
+
+/* ".zip": the last dot and one to five ASCII letters or digits after it,
+   the extension a cut keeps and the file-name row keeps in view. */
+static size_t name_extension_length(const char *name, size_t length)
+{
+    for (size_t count = 1; count <= 6u && count < length; count++) {
+        unsigned char c = (unsigned char) name[length - count];
+        if (c == '.') return count > 1u ? count : 0;
+        if (!((c >= '0' && c <= '9') || ((c | 0x20u) >= 'a' && (c | 0x20u) <= 'z')))
+            return 0;
+    }
+    return 0;
+}
+
+typedef struct {
+    unsigned char *data;
+    size_t used, capacity;
+    unsigned char *last;
+} NameArena;
+
+/* unicode_normalize's only buffer grows in place; anything else fails, and
+   the name keeps its unnormalized form. */
+static void *name_arena_realloc(void *opaque, void *pointer, size_t size)
+{
+    NameArena *arena = opaque;
+    if (size == 0) return NULL;
+    if (pointer == NULL) {
+        size_t start = (arena->used + 7u) & ~(size_t) 7u;
+        if (start > arena->capacity || size > arena->capacity - start) return NULL;
+        arena->last = arena->data + start;
+        arena->used = start + size;
+        return arena->last;
+    }
+    if (pointer != arena->last) return NULL;
+    size_t start = (size_t) (arena->last - arena->data);
+    if (size > arena->capacity - start) return NULL;
+    arena->used = start + size;
+    return pointer;
+}
+
+static bool name_ascii_valid(const char *name)
+{
+    size_t length = strnlen(name, FILE_DOWNLOAD_FILENAME_LIMIT);
+    if (length == 0 || length >= FILE_DOWNLOAD_FILENAME_LIMIT || name[0] == '.'
+        || name[length - 1] == '.' || name[length - 1] == ' ') return false;
+    for (size_t at = 0; at < length; at++) {
+        unsigned char c = (unsigned char) name[at];
+        if (c < 32 || c >= 127 || strchr("<>:\"|?*/\\", c)) return false;
+    }
+    size_t stem = strcspn(name, ".");
+    return !((stem == 3 && (!strncasecmp(name, "CON", 3)
+        || !strncasecmp(name, "PRN", 3) || !strncasecmp(name, "AUX", 3)
+        || !strncasecmp(name, "NUL", 3)))
+        || (stem == 4 && (!strncasecmp(name, "COM", 3)
+            || !strncasecmp(name, "LPT", 3)) && name[3] >= '1' && name[3] <= '9'));
+}
+
 static void sanitize_filename(const char *input,
                                char output[FILE_DOWNLOAD_FILENAME_LIMIT])
 {
     const char *base = input;
     for (const char *at = input; *at != '\0'; at++)
         if (*at == '/' || *at == '\\') base = at + 1;
-    size_t used = 0;
-    for (; *base != '\0' && used + 1 < FILE_DOWNLOAD_FILENAME_LIMIT; base++) {
-        unsigned char c = (unsigned char) *base;
-        output[used++] = c < 32 || c >= 127 || strchr("<>:\"|?*", c)
-            ? '_' : (char) c;
+    size_t length = strlen(base);
+    size_t extension = name_extension_length(base, length);
+    size_t stem_bytes = length - extension;
+    uint32_t points[FILE_NAME_POINT_LIMIT];
+    size_t count = 0;
+    for (size_t at = 0; at < stem_bytes && count < FILE_NAME_POINT_LIMIT;) {
+        uint32_t c = '_';
+        size_t step = name_utf8_decode((const unsigned char *) base + at,
+                                       stem_bytes - at, &c);
+        if (step == 0) { c = '_'; step = 1; }
+        else if (name_character_refused(c)) c = '_';
+        points[count++] = c;
+        at += step;
     }
+    bool truncated = count == FILE_NAME_POINT_LIMIT;
+    unsigned char arena_bytes[FILE_NAME_NORMALIZE_ARENA];
+    NameArena arena = {.data = arena_bytes, .capacity = sizeof(arena_bytes)};
+    uint32_t *normal = NULL;
+    int normal_count = count == 0 ? -1 : unicode_normalize(&normal, points,
+        (int) count, UNICODE_NFC, &arena, name_arena_realloc);
+    const uint32_t *stem = normal_count >= 0 && (size_t) normal_count <= count
+        ? normal : points;
+    if (stem == normal) count = (size_t) normal_count;
+    /* Fit the stem in front of the extension, then back the cut up to a
+       character that starts a cluster. */
+    size_t room = FILE_DOWNLOAD_FILENAME_LIMIT - 1u - extension, used = 0, kept = 0;
+    unsigned char bytes[4];
+    while (kept < count) {
+        size_t width = tilefinch_utf8_encode(stem[kept], bytes);
+        if (width == 0 || width > room - used) break;
+        used += width;
+        kept++;
+    }
+    if (kept < count || truncated) {
+        while (kept > 0 && kept < count && name_character_extends(stem[kept])) kept--;
+        /* A joiner left at the end gives up the emoji it joined. */
+        while (kept > 0 && stem[kept - 1u] == 0x200du) {
+            kept--;
+            while (kept > 0 && name_character_extends(stem[kept - 1u])) kept--;
+            if (kept > 0) kept--;
+        }
+        size_t flags = 0;
+        while (flags < kept && stem[kept - 1u - flags] >= 0x1f1e6u
+               && stem[kept - 1u - flags] <= 0x1f1ffu) flags++;
+        if (flags % 2u != 0 && kept < count && stem[kept] >= 0x1f1e6u
+            && stem[kept] <= 0x1f1ffu) kept--;
+    }
+    used = 0;
+    for (size_t at = 0; at < kept; at++) {
+        size_t width = tilefinch_utf8_encode(stem[at], bytes);
+        memcpy(output + used, bytes, width);
+        used += width;
+    }
+    memcpy(output + used, base + stem_bytes, extension);
+    used += extension;
     while (used != 0 && (output[used - 1] == '.' || output[used - 1] == ' ')) used--;
     output[used] = '\0';
     if (used == 0 || output[0] == '.') {
         snprintf(output, FILE_DOWNLOAD_FILENAME_LIMIT, "download.bin");
         return;
     }
-    size_t stem = strcspn(output, ".");
-    bool reserved = (stem == 3 && (!strncasecmp(output, "CON", 3)
+    size_t stem_length = strcspn(output, ".");
+    bool reserved = (stem_length == 3 && (!strncasecmp(output, "CON", 3)
         || !strncasecmp(output, "PRN", 3) || !strncasecmp(output, "AUX", 3)
         || !strncasecmp(output, "NUL", 3)))
-        || (stem == 4 && (!strncasecmp(output, "COM", 3)
+        || (stem_length == 4 && (!strncasecmp(output, "COM", 3)
             || !strncasecmp(output, "LPT", 3)) && output[3] >= '1' && output[3] <= '9');
     if (reserved) output[0] = '_';
 }
@@ -76,6 +242,45 @@ bool file_download_filename_valid(const char *name)
     char safe[FILE_DOWNLOAD_FILENAME_LIMIT];
     sanitize_filename(name, safe);
     return strcmp(name, safe) == 0;
+}
+
+bool file_download_stored_name_valid(const char *name)
+{
+    return name != NULL && name_ascii_valid(name);
+}
+
+bool file_download_stored_name(const char *name,
+                               char output[FILE_DOWNLOAD_FILENAME_LIMIT])
+{
+    if (output == NULL || !file_download_filename_valid(name)) return false;
+    static const char hex[] = "0123456789ABCDEF";
+    size_t length = strlen(name);
+    size_t extension = name_extension_length(name, length);
+    size_t stem = length - extension;
+    size_t room = FILE_DOWNLOAD_FILENAME_LIMIT - 1u - extension, used = 0;
+    bool cut = false;
+    for (size_t at = 0; at < stem;) {
+        size_t step = 1;
+        while (at + step < stem && ((unsigned char) name[at + step] & 0xc0u) == 0x80u)
+            step++;
+        bool ascii = (unsigned char) name[at] < 0x80u;
+        size_t width = ascii ? 1u : 3u * step;
+        if (width > room - used) { cut = true; break; }
+        for (size_t byte = 0; byte < step; byte++) {
+            unsigned char c = (unsigned char) name[at + byte];
+            if (ascii) { output[used++] = (char) c; continue; }
+            output[used++] = '%';
+            output[used++] = hex[c >> 4];
+            output[used++] = hex[c & 15u];
+        }
+        at += step;
+    }
+    while (cut && used != 0 && (output[used - 1] == '.' || output[used - 1] == ' '))
+        used--;
+    memcpy(output + used, name + stem, extension);
+    used += extension;
+    output[used] = '\0';
+    return name_ascii_valid(output);
 }
 
 static bool disposition_name(const char *header, bool extended,
@@ -194,10 +399,11 @@ bool file_download_path(const OfflineLibrary *library, uint32_t id,
                         char *output, size_t capacity)
 {
     const OfflineLibraryItem *item = offline_library_find(library, id);
+    char stored[FILE_DOWNLOAD_FILENAME_LIMIT];
     if (item == NULL || item->type != OFFLINE_ITEM_FILE
-        || !file_download_filename_valid(item->title)) return false;
+        || !file_download_stored_name(item->title, stored)) return false;
     int length = snprintf(output, capacity, "%s/%08x-%s", library->directory,
-                          (unsigned) id, item->title);
+                          (unsigned) id, stored);
     return length > 0 && (size_t) length < capacity;
 }
 

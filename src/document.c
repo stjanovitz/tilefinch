@@ -3989,6 +3989,43 @@ bool document_set_element_inner_html(PocDocument *document,
     return updated;
 }
 
+bool document_insert_markup_after(PocDocument *document,
+                                  lxb_dom_node_t *after,
+                                  const char *markup, size_t length)
+{
+    lxb_dom_node_t *parent = after == NULL ? NULL : after->parent;
+    if (document == NULL || document->html == NULL || parent == NULL
+        || parent->type != LXB_DOM_NODE_TYPE_ELEMENT
+        || (markup == NULL && length != 0)) return false;
+    size_t name_length = 0;
+    const char *name = document_element_name(parent, &name_length);
+    lxb_dom_element_t *container = name == NULL ? NULL
+        : lxb_dom_document_create_element(
+              &document->html->dom_document, (const lxb_char_t *) name,
+              name_length, NULL);
+    lxb_dom_node_t *holder = container == NULL ? NULL
+        : lxb_dom_interface_node(container);
+    if (holder != NULL
+        && (parent->ns == LXB_NS_SVG || parent->ns == LXB_NS_MATH))
+        holder->ns = parent->ns;
+    bool parsed = holder != NULL
+        && document_set_element_inner_html(
+               document, holder, markup == NULL ? "" : markup, length);
+    lxb_dom_node_t *before = after->next;
+    while (parsed && holder->first_child != NULL) {
+        lxb_dom_node_t *child = holder->first_child;
+        lxb_dom_node_remove(child);
+        if (before != NULL) lxb_dom_node_insert_before(before, child);
+        else lxb_dom_node_insert_child(parent, child);
+    }
+    if (holder != NULL) lxb_dom_node_destroy_deep(holder);
+    if (parsed) {
+        document->parser_writes++;
+        document_style_changed();
+    }
+    return parsed;
+}
+
 typedef struct {
     DocumentBodySnapshot *snapshot;
     bool failed;

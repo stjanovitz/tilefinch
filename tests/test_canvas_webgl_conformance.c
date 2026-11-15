@@ -1679,6 +1679,234 @@ typedef bool (*NativeRealmInspect)(PocDocument *document,
 /* One page realm with an image table, as the natives see it on a page:
    evaluates `script` and requires globalThis.pocSummary == `expected`
    (or, with `expected_prefix`, to start with it). */
+/* Runs page script without the microtask checkpoint that ends its task, so
+   the test sees the canvas as a painter would mid-task. */
+static bool frame_publication_eval(ScriptRuntime *runtime, const char *source)
+{
+    JSValue value = JS_Eval(runtime->context, source, strlen(source),
+                            "<webgl-frame-publication>", JS_EVAL_TYPE_GLOBAL);
+    bool ok = !JS_IsException(value);
+    if (!ok) {
+        JSValue exception = JS_GetException(runtime->context);
+        const char *text = JS_ToCString(runtime->context, exception);
+        fprintf(stderr, "frame publication script: %s\n",
+                text != NULL ? text : "?");
+        JS_FreeCString(runtime->context, text);
+        JS_FreeValue(runtime->context, exception);
+    }
+    JS_FreeValue(runtime->context, value);
+    return ok;
+}
+
+static bool frame_publication_end_task(ScriptRuntime *runtime)
+{
+    JSContext *job_context = NULL;
+    for (int jobs = 0; jobs < 64; jobs++) {
+        int executed = JS_ExecutePendingJob(
+            JS_GetRuntime(runtime->context), &job_context);
+        if (executed < 0) return false;
+        if (executed == 0) return true;
+    }
+    return false;
+}
+
+/* A WebGL frame flushed in parts inside one task (a buffer upload after a
+   draw forces the first part out) is published only by the flush that ends
+   the task. Until then the canvas shows the last complete frame, or nothing
+   before the first; a frame whose last part was forced is published with
+   nothing left to draw. */
+typedef struct {
+    const ImageResource *image;
+    unsigned calls;
+    bool handled, valid;
+} SnapshotCopyProbe;
+
+static bool snapshot_copy(void *opaque, unsigned char *destination,
+    size_t destination_stride, const unsigned char *source,
+    size_t source_stride, size_t row_bytes, size_t rows)
+{
+    SnapshotCopyProbe *probe = opaque;
+    probe->calls++;
+    probe->valid &= probe->image->canvas_frame_open
+        && probe->image->canvas_held_frame == NULL;
+    if (!probe->handled) return false;
+    for (size_t y = 0; y < rows; y++)
+        memcpy(destination + y * destination_stride,
+               source + y * source_stride, row_bytes);
+    return true;
+}
+
+static bool run_snapshot_copy_publication(void)
+{
+    static _Alignas(16) unsigned char native[512u * 4u * 272u];
+    lxb_dom_node_t identity = {0};
+    for (unsigned handled = 0; handled < 2; handled++) {
+        for (unsigned native_source = 0; native_source < 2; native_source++) {
+            Budget budget;
+            budget_init(&budget, 4u * MIB);
+            ImageResources images = {.budget = &budget};
+            unsigned char *live = NULL;
+            CHECK(images_prepare_canvas_surface(&images, &budget, &identity,
+                      480, 272, &live) != IMAGE_CANVAS_COMMIT_REFUSED);
+            CHECK(live != NULL);
+            ImageResource *image = &images.items[0];
+            for (size_t i = 0; i < 480u * 4u * 272u; i++) live[i] = (unsigned char)i;
+            for (size_t i = 0; i < sizeof(native); i++) native[i] = (unsigned char)(i * 197u);
+            if (native_source) CHECK(images_set_canvas_native_surface(
+                &images, &identity, native, 512u * 4u, 0));
+            images_canvas_frame_publish(&images, &identity);
+            SnapshotCopyProbe probe = {.image = image, .handled = handled != 0, .valid = true};
+            TilefinchPlatformServices services = {.context = &probe, .copy_pixel_rows = snapshot_copy};
+            tilefinch_platform_set_services(&services);
+            budget_inject_failure_after(&budget, 0);
+            images_canvas_frame_hold(&images, &budget, &identity);
+            CHECK(image->canvas_frame_open && image->canvas_held_frame == NULL
+                  && probe.calls == 0);
+            CHECK(images_canvas_frame_publish(&images, &identity));
+            budget_clear_failure_injection(&budget);
+            images_canvas_frame_hold(&images, &budget, &identity);
+            CHECK(probe.calls == 1 && probe.valid && image->canvas_frame_open
+                  && image->canvas_held_frame != NULL);
+            const unsigned char *source = native_source ? native : live;
+            size_t stride = native_source ? 512u * 4u : 480u * 4u;
+            for (size_t y = 0; y < 272u; y++) CHECK(memcmp(
+                image->canvas_held_frame + y * 480u * 4u,
+                source + y * stride, 480u * 4u) == 0);
+            unsigned char first = image->canvas_held_frame[0];
+            live[0] ^= 255u; native[0] ^= 255u;
+            images_canvas_frame_hold(&images, &budget, &identity);
+            CHECK(probe.calls == 1 && image->canvas_held_frame[0] == first);
+            CHECK(images_canvas_frame_publish(&images, &identity));
+            CHECK(!image->canvas_frame_open && image->canvas_held_frame == NULL);
+            tilefinch_platform_set_services(NULL);
+            images_destroy(&images);
+            CHECK(budget.current == 0);
+        }
+    }
+    return true;
+}
+
+static bool run_webgl_frame_publication(void)
+{
+    static const char html[] =
+        "<!doctype html><html><body><canvas id=gl width=4 height=4></canvas>"
+        "</body></html>";
+    Budget budget;
+    budget_init(&budget, 24u * MIB);
+    budget_install_lexbor(&budget);
+    PocDocument document;
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    lxb_dom_node_t *canvas = find_element_id(
+        lxb_dom_interface_node(document.html), "gl");
+    CHECK(canvas != NULL);
+    ViewportContext viewport;
+    CHECK(viewport_context_init(&viewport, 480, 272, 480, 272));
+    ScriptExecutionPolicy policy;
+    CHECK(script_execution_policy_for_profile(
+        SCRIPT_EXECUTION_PROFILE_PSP_REALISTIC, &policy));
+    policy.slow_compile_threshold_us = UINT64_MAX;
+    policy.slow_callback_threshold_us = UINT64_MAX;
+    ScriptRuntimeOptions options = {
+        .viewport = viewport, .execution_policy = policy
+    };
+    ScriptResult result;
+    ScriptRuntime *runtime = script_runtime_create_configured(
+        &document, &budget, 16u * MIB, 8000,
+        "https://games.test/frames", &options, &result);
+    CHECK(runtime != NULL && result.success);
+    ImageResources images = {.budget = &budget};
+    script_runtime_set_images(runtime, &images);
+    /* First frame, in the task that sets the context up: red, then an
+       upload forces it out, then green. Nothing was complete before it. */
+    CHECK(frame_publication_eval(runtime,
+              "const gl=document.getElementById('gl').getContext('webgl');"
+              "const shader=(kind,source)=>{const value=gl.createShader(kind);"
+              "gl.shaderSource(value,source);gl.compileShader(value);"
+              "return value};const program=gl.createProgram();"
+              "gl.attachShader(program,shader(gl.VERTEX_SHADER,"
+              "'attribute vec2 aPosition;void main(){gl_Position=vec4(aPosition,0.,1.);}'));"
+              "gl.attachShader(program,shader(gl.FRAGMENT_SHADER,"
+              "'precision mediump float;uniform vec4 uColor;"
+              "void main(){gl_FragColor=uColor;}'));"
+              "gl.linkProgram(program);gl.useProgram(program);"
+              "const color=gl.getUniformLocation(program,'uColor');"
+              "const position=gl.getAttribLocation(program,'aPosition');"
+              "const cover=new Float32Array([-1,-1,3,-1,-1,3]);"
+              "const buffers=[gl.createBuffer(),gl.createBuffer()];"
+              "for(const b of buffers){gl.bindBuffer(gl.ARRAY_BUFFER,b);"
+              "gl.bufferData(gl.ARRAY_BUFFER,cover,gl.DYNAMIC_DRAW);}"
+              "gl.enableVertexAttribArray(position);"
+              "globalThis.paint=(b,r,g,bl)=>{gl.bindBuffer(gl.ARRAY_BUFFER,buffers[b]);"
+              "gl.vertexAttribPointer(position,2,gl.FLOAT,false,0,0);"
+              "gl.uniform4f(color,r,g,bl,1);gl.drawArrays(gl.TRIANGLES,0,3)};"
+              "globalThis.upload=(b)=>{gl.bindBuffer(gl.ARRAY_BUFFER,buffers[b]);"
+              "gl.bufferSubData(gl.ARRAY_BUFFER,0,cover)};"
+              "gl.clearColor(0,0,0,1);gl.clear(gl.COLOR_BUFFER_BIT);"
+              "paint(0,1,0,0);upload(1);paint(1,0,1,0);"));
+    const ImageResource *image = images_find_node(&images, canvas);
+    CHECK(image != NULL && image->is_canvas && image->pixels != NULL
+          && image->canvas_frame_open && image->canvas_held_frame == NULL
+          && image->pixels[0] == 255 && image->pixels[1] == 0);
+    CHECK(frame_publication_end_task(runtime));
+    image = images_find_node(&images, canvas);
+    CHECK(image != NULL && !image->canvas_frame_open
+          && image->canvas_frame_published
+          && image->pixels[0] == 0 && image->pixels[1] == 255);
+    /* Second frame: its forced part (blue) is drawn while the green frame
+       stays shown. */
+    CHECK(frame_publication_eval(
+        runtime, "gl.clear(gl.COLOR_BUFFER_BIT);paint(0,0,0,1);upload(1);"
+                 "paint(1,1,1,0);"));
+    image = images_find_node(&images, canvas);
+    CHECK(image != NULL && image->canvas_frame_open
+          && image->canvas_held_frame != NULL
+          && image->canvas_held_frame[0] == 0
+          && image->canvas_held_frame[1] == 255
+          && image->canvas_held_frame[2] == 0
+          && image->pixels[2] == 255 && image->pixels[1] == 0);
+    /* An image table adopted inside the task (a relayout the script's own
+       geometry read started) flushes the rest without ending the frame. */
+    script_runtime_set_images(runtime, &images);
+    image = images_find_node(&images, canvas);
+    CHECK(image != NULL && image->canvas_frame_open
+          && image->canvas_held_frame != NULL
+          && image->canvas_held_frame[1] == 255
+          && image->pixels[0] == 255 && image->pixels[1] == 255);
+    CHECK(frame_publication_end_task(runtime));
+    image = images_find_node(&images, canvas);
+    CHECK(image != NULL && !image->canvas_frame_open
+          && image->canvas_held_frame == NULL
+          && image->pixels[0] == 255 && image->pixels[1] == 255);
+    /* Third frame: the forced part is all of it. */
+    CHECK(frame_publication_eval(
+        runtime, "gl.clear(gl.COLOR_BUFFER_BIT);paint(0,1,0,1);upload(0);"));
+    image = images_find_node(&images, canvas);
+    CHECK(image != NULL && image->canvas_frame_open
+          && image->canvas_held_frame != NULL
+          && image->canvas_held_frame[0] == 255
+          && image->canvas_held_frame[1] == 255);
+    CHECK(frame_publication_end_task(runtime));
+    image = images_find_node(&images, canvas);
+    CHECK(image != NULL && !image->canvas_frame_open
+          && image->pixels[0] == 255 && image->pixels[2] == 255
+          && image->pixels[1] == 0);
+    /* An ordinary frame is drawn in one flush and never held. */
+    CHECK(frame_publication_eval(
+        runtime, "gl.clear(gl.COLOR_BUFFER_BIT);paint(1,0,1,1);"));
+    image = images_find_node(&images, canvas);
+    CHECK(image != NULL && !image->canvas_frame_open);
+    CHECK(frame_publication_end_task(runtime));
+    image = images_find_node(&images, canvas);
+    CHECK(image != NULL && !image->canvas_frame_open
+          && image->pixels[0] == 0 && image->pixels[1] == 255);
+    script_runtime_destroy(runtime);
+    images_destroy(&images);
+    document_destroy(&document);
+    CHECK(budget.current == 0
+          && budget_active_allocations(&budget, NULL) == 0);
+    return true;
+}
+
 static bool run_native_realm_inspect(const char *html, const char *script,
                                      const char *label, const char *expected,
                                      bool expected_prefix,
@@ -5978,8 +6206,26 @@ int main(int argc, char **argv)
     puts("test: WebGL triangles sharing edges cover each pixel exactly once");
     if (!run_fixture("webgl-seams.js", "WEBGL-SEAMS-PASS", false, false))
         return 1;
+    puts("test: WebGL draws over one submission split exactly into parts");
+    if (!run_fixture(
+            "webgl-big-draws.js", "WEBGL-BIG-DRAWS-PASS", false, false))
+        return 1;
+    puts("test: EXT_blend_minmax takes per-channel minimum and maximum");
+    if (!run_fixture(
+            "webgl-blend-minmax.js", "WEBGL-BLEND-MINMAX-PASS", false, false))
+        return 1;
+    puts("test: FUNC_SUBTRACT and FUNC_REVERSE_SUBTRACT weight, subtract and clamp");
+    if (!run_fixture(
+            "webgl-blend-subtract.js", "WEBGL-BLEND-SUBTRACT-PASS", false, false))
+        return 1;
+    puts("test: every blend factor the GE takes, in both slots, with blendColor");
+    if (!run_fixture(
+            "webgl-blend-factors.js", "WEBGL-BLEND-FACTORS-PASS", false, false))
+        return 1;
     puts("test: detached WebGL flush retains commands until reattachment");
     if (!run_deferred_webgl_flush()) return 1;
+    puts("test: a WebGL frame flushed in parts is shown only once complete");
+    if (!run_snapshot_copy_publication() || !run_webgl_frame_publication()) return 1;
     if (!run_webgl_index_identity_invalidation()) return 1;
     if (!run_webgl_shader_diagnostics()) return 1;
     puts("test: installable Prism Break exercises levels, input, and effects");

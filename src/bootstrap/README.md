@@ -100,6 +100,13 @@ or bounded CSS animation hint synchronously evaluates the corresponding
 bytecode, replaces the accessors with the normal implementation, and continues
 the original operation. This keeps feature detection honest without charging
 every page realm for uncommon stateful APIs or the CSS-keyframe scanner.
+Window messaging's bounded structured-clone wire (`frame-clone.js`, the
+encoder and decoder every `postMessage()` between windows and frames uses)
+is built the first time a realm posts or receives such a message; it has
+no global names of its own, so `platform.js` asks for it through a private
+native, as the form collections, secondary documents and CSSOM rule
+modules do. It is the one lazy module whose atoms the generator pins with
+the eager modules' (`sources.def`), so it runs from ROM when it loads.
 `TILEFINCH_TRACE_JS_STARTUP=1` reports heap bytes after each eager or lazy
 module. Regression tests require an ordinary realm to start with zero lazy
 module loads, then verify that each first-use boundary activates only its

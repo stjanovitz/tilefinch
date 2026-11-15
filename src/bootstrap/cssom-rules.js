@@ -6,10 +6,16 @@
    through a rule rebuilds that rule's text and its ancestors' and replaces
    the top-level rule in the sheet, keeping every rule object; a refused
    write leaves every rule object as it was. */
-Object.defineProperty(globalThis, "__tilefinchCreateRuleModel", {
+globalThis.__tilefinchEventInterfaces.defineProperty(globalThis,
+    "__tilefinchCreateRuleModel", {
+  __proto__: null,
   configurable: true,
   value(ruleToken, makeTextStyle, splitRules, textLimit, ruleList,
         validRuleText, assertSelector) {
+    /* Loaded after the page may have replaced these globals: build
+       errors, promises and platform objects with the constructors
+       hardening.js captured. */
+    const { TypeError, DOMException } = globalThis.__tilefinchEventInterfaces;
     const quotaError = () =>
         new DOMException("Stylesheet exceeds bounded size", "QuotaExceededError"),
       mediaList = (text) => {

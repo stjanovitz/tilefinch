@@ -1,5 +1,15 @@
 (() => {
   "use strict";
+  /* Loaded after the page may have replaced these globals: build
+     errors, promises and platform objects with the constructors
+     hardening.js captured. */
+  const { Error, TypeError, RangeError, Promise, Set, Array,
+    ArrayBuffer, Uint8Array, claimHooks } =
+    globalThis.__tilefinchEventInterfaces;
+  /* This module's hook publisher, claimed first (hardening.js); a realm
+     without reserved hooks takes plain globals. */
+  const publish = claimHooks?.()
+    || ((name, value) => { globalThis[name] = value; });
   const available = globalThis.__tilefinchWasmAvailable,
     compileNative = globalThis.__tilefinchWasmCompile,
     instantiateNative = globalThis.__tilefinchWasmInstantiate,
@@ -129,10 +139,7 @@
      immutable compiled module can safely share its native handle while still
      receiving the distinct JavaScript wrapper required by structured clone.
      Other Wasm objects remain non-cloneable. */
-  Object.defineProperty(globalThis, "__tilefinchCloneWasmModule", {
-    configurable: false, enumerable: false, writable: false,
-    value: cloneModule,
-  });
+  publish("__tilefinchCloneWasmModule", cloneModule);
 
   class Module {
     constructor(source) {

@@ -948,7 +948,9 @@ minimal `js-bench` scenario) ends the run. `js_bench_dir=DIR` names an HTTP
 trace beside the EBOOT whose JavaScript records the bench compiles; it
 defaults to the replay trace when one is configured. The report is the
 run's `tilefinch-js-bench:` lines (one per kernel, then `outcome=complete`).
-`scripts/js-bench-device.sh` stages the boot.cfg for a host0 device run;
+`scripts/js-bench-device.sh` stages the boot.cfg for a host0 device run
+from the trace directory it is given (a required argument, or
+`JS_BENCH_TRACE`);
 under PPSSPP pass `--script js-bench --measure --boot validation_js_bench=1
 --trace DIR` at `TILEFINCH_PPSSPP_CPU_MHZ=333` (the runner's native-HOME
 boot gate fails afterwards because the bench key is a validation key; the

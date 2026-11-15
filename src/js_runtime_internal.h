@@ -181,7 +181,7 @@ JSValue js_dom_parse_color(JSContext *context,
 #define SCRIPT_REALM_MAXIMUM_SCRIPTS 256u
 #define SCRIPT_REALM_MAXIMUM_FILE_BYTES (8u * 1024u * 1024u)
 #define SCRIPT_REALM_MAXIMUM_TOTAL_BYTES (128u * 1024u * 1024u)
-#define SCRIPT_LAZY_BOOTSTRAP_FEATURE_COUNT 17u
+#define SCRIPT_LAZY_BOOTSTRAP_FEATURE_COUNT 19u
 /* A fully hydrated long article exceeds 4096 nodes several times
    over; a truncated walk silently drops querySelectorAll matches (the
    mobile section transform only saw the first few sections).
@@ -853,6 +853,13 @@ typedef struct DomBridge {
     uint64_t parser_writes_seen;
     /* The same for the layout (js_rt_bridge_note_parser_writes_for_layout). */
     uint64_t parser_writes_laid_out;
+    /* A script the whole-document loader runs (a page committed whole, not
+       streamed): document.write() has no parser to feed, so its markup
+       waits here until the loader takes it once the script returns
+       (script_runtime_whole_document_write_end). Budget-allocated. */
+    const lxb_dom_node_t *whole_document_writer;
+    char *whole_document_written;
+    size_t whole_document_written_length;
     DomIdMemo id_memo;
     /* Native setAttribute calls: total, those writing the value already
        present, and time spent in the native setter. */
@@ -1055,6 +1062,10 @@ typedef struct DomBridge {
     /* Descendant CSP grant of the script being evaluated (module roots and
        classic import() inherit it); zero outside a script element. */
     uint8_t current_script_csp_grant;
+    /* HTML's ignore-destructive-writes counter: external classic and module
+       scripts running now. document.write() with no insertion point is
+       ignored while it is not zero. */
+    uint16_t destructive_writes_ignored;
     /* Canvas elements that have drawn pixels which are not origin-clean,
        each with its native pixel store, and the stores of ImageBitmaps that
        are not origin-clean. Natives that hand a canvas's pixels to script
@@ -1376,6 +1387,10 @@ struct ScriptRuntime {
        keep their bytecode in ROM but do not occupy the page heap until a page
        first touches their standards-visible surface. */
     uint8_t lazy_bootstrap_state[SCRIPT_LAZY_BOOTSTRAP_FEATURE_COUNT];
+    /* The innermost lazy module loading, plus one (0: none), and whether
+       it has taken its one hook claim (js_runtime_lazy_loading). */
+    uint8_t lazy_loading_feature;
+    bool lazy_hook_claimed;
 #ifdef JS_RT_TEST_INSTRUMENTS
     /* The bootstrap, eager and lazy, publishes its test-only probes. Off
        only when a host test asks for the shipping realm surface. */
@@ -1385,6 +1400,26 @@ struct ScriptRuntime {
     DomBridge bridge;
     ScriptResult result;
     PromiseRejectionState promise_rejection_state;
+    /* While an external classic script fetched cross-origin without CORS
+       runs: its errors report muted (js_rt_report_script_error). */
+    bool script_errors_muted;
+    /* Set when an external classic or module script's own exception (a
+       throw, or a SyntaxError in its source or its module graph) went to
+       the window error event: that element then gets `load`, not `error`
+       (HTML "execute the script element"). The external evaluation clears
+       it before running and restores the outer value after. */
+    bool script_error_reported;
+    /* The same for any page script, inline ones included: set when its own
+       exception went to the window error event. Each script evaluation
+       entry clears it before running and restores the outer value after,
+       so a nested script's report stays its own; the entry leaves its
+       outcome in last_script_author_error
+       (script_runtime_last_script_author_error). */
+    bool script_author_error;
+    bool last_script_author_error;
+    /* Module imports the host could not fetch or admit
+       (runtime_module_load_record): not author errors. */
+    size_t module_host_failures;
     unsigned timeout_ms;
     /* Optional browser-owned absolute cap for the currently executing
        parser stage.  A later JS slice may arm after a blocking fetch, so a
@@ -1462,6 +1497,10 @@ struct ScriptRuntime {
        OPFS module receives this identity through a temporary native-only
        handoff so StorageManager branding never consults a mutable global. */
     JSValue opfs_storage_manager;
+    /* streams.js's WritableStream, captured as the lazy module defines it,
+       before page script can replace the global: opfs.js extends this
+       identity, handed over the same way. */
+    JSValue streams_writable_stream;
     /* Installed by the lazy game-audio module, captured immediately, and
        removed before evaluation returns to author code. */
     JSValue game_audio_host_suspend;
@@ -1625,6 +1664,8 @@ typedef struct ScriptLazyRuntimeBundle {
 typedef struct {
     JSValue value;
     uint8_t csp_grant;
+    /* The scope counts in DomBridge.destructive_writes_ignored. */
+    bool ignores_writes;
 } ScriptCurrentScriptScope;
 
 /* Cross-module helpers defined in js_runtime.c. */
@@ -1640,6 +1681,27 @@ void js_rt_bridge_keep_node_handle(DomBridge *bridge, int64_t handle);
 int64_t js_rt_bridge_find_node_handle(const DomBridge *bridge,
                                       const lxb_dom_node_t *node);
 void js_rt_record_exception(JSContext *context, ScriptResult *result);
+/* HTML "report an exception" for `error`, which an author script named
+   `name` threw while it compiled or ran: the Window's onerror and error
+   event, then the host log unless one cancels it (dom.js
+   __tilefinchReportUncaught, which timers and event handlers share).
+   False, reporting nothing, for the browser's own failures: an
+   interrupted or memory-exhausted run, a lazy factory (its requirer
+   reports it), or a script that is not the page's. */
+bool js_rt_report_script_error(JSContext *context, JSValueConst error,
+                               const char *name,
+                               ScriptCompileSourceKind source_kind);
+/* js_rt_record_exception for the pending exception of such a script's
+   compile or run, which is then reported as above (a refused allocation
+   is not); true when it was reported. */
+bool js_rt_record_script_exception(JSContext *context, const char *name,
+                                   ScriptCompileSourceKind source_kind,
+                                   ScriptResult *result);
+/* Whether the classic script `script_url` that `script_node` loaded is
+   cross-origin and was fetched without CORS (no crossorigin attribute). */
+bool js_rt_script_errors_muted(const ScriptRuntime *runtime,
+                               lxb_dom_node_t *script_node,
+                               const char *script_url);
 void js_rt_capture_error_source_context(const char *source, size_t length,
                                         const char *source_url,
                                         ScriptResult *result);
@@ -2231,6 +2293,8 @@ JSValue js_webgl_snapshot(JSContext *context,
 JSValue js_webgl_release_surface(JSContext *context,
                                  JSValueConst this_value,
                                  int argc, JSValueConst *argv);
+JSValue js_webgl_publish_frame(JSContext *context, JSValueConst this_value,
+                               int argc, JSValueConst *argv);
 bool js_webgl_realm_epoch_advance(DomBridge *bridge);
 void js_webgl_realm_epoch_release(DomBridge *bridge);
 bool js_wasm_runtime_init(JSRuntime *runtime);

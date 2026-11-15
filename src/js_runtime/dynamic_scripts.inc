@@ -246,10 +246,13 @@ static bool dynamic_evaluate_inline_classic_now(
     ScriptCurrentScriptScope previous = {.value = JS_UNDEFINED};
     bool scoped = js_rt_current_script_scope_begin(
         runtime->context, node, false, &previous, &runtime->result);
+    /* Its exception is its own, not the outer script's. */
+    bool outer_author_error = runtime->script_author_error;
     bool evaluated = scoped && evaluate_source_type(
         runtime->context, source, source_length, "<dynamic-inline-script>",
         JS_EVAL_TYPE_GLOBAL, SCRIPT_COMPILE_SOURCE_INLINE,
         &runtime->result);
+    runtime->script_author_error = outer_author_error;
     if (scoped && !js_rt_current_script_scope_end(
             runtime->context, &previous, &runtime->result)) {
         evaluated = false;

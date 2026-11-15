@@ -1135,6 +1135,11 @@ bool script_runtime_last_slice_interrupted(const ScriptRuntime *runtime)
     return runtime != NULL && runtime->result.interrupted;
 }
 
+bool script_runtime_last_script_author_error(const ScriptRuntime *runtime)
+{
+    return runtime != NULL && runtime->last_script_author_error;
+}
+
 size_t script_runtime_inline_execution_reserve(
     const ScriptRuntime *runtime, size_t source_length)
 {

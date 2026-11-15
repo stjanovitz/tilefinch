@@ -323,6 +323,47 @@ static bool browser_engine_provisional_frame_has_contrast(
         && contrasting >= required_pixels;
 }
 
+/* Every tile of the frame at y, in bounded slices between which the
+   frontend may run. */
+static RenderFrameWorkResult browser_engine_provisional_raster_frame(
+    TileCache *cache, int y, int width, int height)
+{
+    for (size_t slice = 1; ; slice++) {
+        RenderFrameWorkResult prepared = tile_cache_prepare_frame_bounded(
+            cache, y, width, height, BROWSER_PROVISIONAL_RASTER_SLICE_US,
+            SIZE_MAX);
+        if (prepared != RENDER_FRAME_WORK_PENDING) return prepared;
+        if (!tilefinch_platform_cooperate("provisional-raster", slice))
+            return RENDER_FRAME_WORK_CANCELLED;
+    }
+}
+
+/* Night mode maps light surfaces into a narrow dark range, so a page whose
+   first screen is a white masthead over a light grey band (bbc.com/news)
+   rasterizes to one colour although the page itself has contrast. Judge
+   such a frame as the page is authored: rasterize the screen again without
+   the night transform and, when that has contrast, once more with it, to
+   present. Only a first frame that came out flat at night pays for this.
+   True when `frame` then holds the night frame to present. */
+static bool browser_engine_provisional_contrast_before_night(
+    TileCache *cache, uint16_t *frame, size_t pixels, int y,
+    int width, int height)
+{
+    if (cache == NULL || !cache->forced_dark) return false;
+    tile_cache_set_forced_dark(cache, false);
+    bool contrast = browser_engine_provisional_raster_frame(
+            cache, y, width, height) == RENDER_FRAME_WORK_READY
+        && tile_cache_set_frame(cache, frame, pixels)
+        && tile_cache_render_frame(cache, y, width, height, NULL)
+        && browser_engine_provisional_frame_has_contrast(
+               frame, (size_t) width, (size_t) height);
+    tile_cache_set_forced_dark(cache, true);
+    return contrast
+        && browser_engine_provisional_raster_frame(
+               cache, y, width, height) == RENDER_FRAME_WORK_READY
+        && tile_cache_render_frame(cache, y, width, height, NULL);
+}
+
 static bool browser_engine_capture_provisional_viewport(
     BrowserEngine *engine, NavigationSession *candidate,
     const LayoutDocument *layout, size_t width, size_t height)
@@ -425,7 +466,10 @@ static bool browser_engine_capture_provisional_viewport(
        giving the user a page; the stream retries at a later checkpoint. */
     if (composed && first
         && !browser_engine_provisional_frame_has_contrast(
-               engine->provisional_frame, width, height)) {
+               engine->provisional_frame, width, height)
+        && !browser_engine_provisional_contrast_before_night(
+               back, engine->provisional_frame, pixels, y,
+               (int) width, (int) height)) {
         candidate->performance.streaming_preview_empty_raster_skips++;
         composed = false;
     }

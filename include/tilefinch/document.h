@@ -813,6 +813,13 @@ void document_refresh_attribute_totals(PocDocument *document);
 bool document_set_element_inner_html(PocDocument *document,
                                      lxb_dom_node_t *element,
                                      const char *html, size_t length);
+/* Parses `markup` as a fragment in the context of `after`'s parent element
+   and inserts it right after `after`, counting a parser write. The scripts
+   in it stay unstarted. False, with nothing inserted, when `after` has no
+   parent element or the parse fails. */
+bool document_insert_markup_after(PocDocument *document,
+                                  lxb_dom_node_t *after,
+                                  const char *markup, size_t length);
 /* Retain one complete, bounded server-rendered body across author-script
    execution. A partial serialization is never exposed as a fallback. */
 bool document_body_snapshot_capture(PocDocument *document,

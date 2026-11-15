@@ -93,7 +93,9 @@ requirement does not authorize rewriting already-published history.
 Public investigation pages may summarize findings, measurement limits, and
 conditions for revisiting rejected approaches; the ledgers themselves, local
 evidence paths, and internal branch references stay private
-([AGENTS.md](../AGENTS.md#verification-discipline)). Ignored files are not
+([AGENTS.md](../AGENTS.md#verification-discipline)). The cut script rejects
+local user or scratch paths, work-area paths and internal branch names in any
+tracked Markdown file or keyed input script. Ignored files are not
 included by an ordinary Git push, so copy both local ledgers into the private
 backup explicitly, along with the private state-machine audit when present.
 

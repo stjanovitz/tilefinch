@@ -1,4 +1,5 @@
 #include "psp_media_session_internal.h"
+#include "tilefinch/ui_language.h"
 #include "tilefinch/utf8_encode.h"
 #include "tilefinch/psp_log.h"
 
@@ -1170,7 +1171,8 @@ bool psp_media_retry_240p(
     psp_ui_media_set_resolving(
         &media->ui,
         media->stream.title[0] == '\0'
-            ? "YouTube video" : psp_media_shown_title(media));
+            ? tilefinch_ui_text("YouTube video")
+            : psp_media_shown_title(media));
     /* Say so, as the failure screen's own 240p choice does. */
     psp_ui_media_note_lower_quality_retry(&media->ui);
     psp_ui_media_set_resolving_progress(

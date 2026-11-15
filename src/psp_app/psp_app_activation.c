@@ -491,14 +491,13 @@ void psp_app_route_controller_action(
         if (zip_preview)
             psp_navigation_cooperate_end_adopting_buttons(
                 "zip-preview", &app->interactive->previous_buttons);
-        if (!trusted_source)
-            psp_ui_show_status(
-                &app->process->presentation.ui, "OFFLINE SAVE LINK REFUSED", 180);
-        else
-            psp_ui_show_status(
-                &app->process->presentation.ui,
-                psp_offline_store_status(&app->browser->offline_store),
-                240);
+        const char *offline_toast = !trusted_source
+            ? "OFFLINE SAVE LINK REFUSED"
+            : psp_offline_store_route_toast(
+                  &app->browser->offline_store, offline_result);
+        if (offline_toast != NULL)
+            psp_ui_show_status(&app->process->presentation.ui, offline_toast,
+                               trusted_source ? 240 : 180);
         if (offline_result != PSP_OFFLINE_ROUTE_NONE) {
             app->process->presentation.ui.reader_mode = false;
             app->process->presentation.ui.basic_mode = false;

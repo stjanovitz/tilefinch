@@ -1,4 +1,11 @@
 (() => {
+  /* Loaded after the page may have replaced these globals: build
+     errors, promises and platform objects with the constructors
+     hardening.js captured, and publish private hooks with its
+     defineProperty. */
+  const { defineProperty, TypeError, RangeError, DOMException, Promise, Map,
+    WeakMap, Array, ArrayBuffer, Float32Array } =
+    globalThis.__tilefinchEventInterfaces;
   /* A deliberately small Web Audio subset for game effects. Decoded PCM is
      native and budget-charged; JavaScript retains only fixed metadata and a
      four-voice graph. The context never starts audio without trusted input. */
@@ -511,7 +518,7 @@
   /* Native media and PSP suspend release the audio channel without running
      author callbacks on a lifecycle deadline. Keep the observable state in
      sync; a later trusted resume still dispatches the normal statechange. */
-  Object.defineProperty(globalThis, "__tilefinchSuspendGameAudioFromHost", {
+  defineProperty(globalThis, "__tilefinchSuspendGameAudioFromHost", { __proto__: null,
     configurable: true,
     writable: false,
     value: () => {
@@ -527,7 +534,7 @@
   /* The audio worker publishes only an integer generation token. Native code
      invokes this captured bridge later on the browser thread, where author
      callbacks and microtasks are safe. */
-  Object.defineProperty(globalThis, "__tilefinchCompleteGameAudioVoice", {
+  defineProperty(globalThis, "__tilefinchCompleteGameAudioVoice", { __proto__: null,
     configurable: true,
     writable: false,
     value: (handle) => {

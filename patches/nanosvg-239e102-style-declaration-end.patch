@@ -1,0 +1,18 @@
+diff --git a/src/nanosvg.h b/src/nanosvg.h
+--- a/src/nanosvg.h
++++ b/src/nanosvg.h
+@@ -2054,9 +2054,11 @@
+ 		while(*str && *str != ';') ++str;
+ 		end = str;
+ 
+-		// Right Trim
+-		while (end > start &&  (*end == ';' || nsvg__isspace(*end))) --end;
+-		++end;
++		// Right Trim, from the declaration's last character: one that ends
++		// the string (or is empty) must not take its terminator, or
++		// nsvg__parseNameValue reads past the end of a separately
++		// allocated class declaration.
++		while (end > start && nsvg__isspace(end[-1])) --end;
+ 
+ 		nsvg__parseNameValue(p, start, end);
+ 		if (*str) ++str;

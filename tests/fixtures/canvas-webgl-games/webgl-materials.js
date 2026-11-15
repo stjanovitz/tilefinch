@@ -638,9 +638,89 @@ vec3 getLightProbeIrradiance(const in vec3 lightProbe[9], const in vec3 n) {
   }
   gl.deleteProgram(probe);
 
+  /* A light probe is recognised by what its helper computes, not by a name:
+     renamed uniform, parameters and locals, other number spellings, and
+     three.js's whole irradiance evaluation behind a pass-through helper. */
+  const shBody = (c, n) => `{
+  float a = ${n}.x, b = ${n}.y, e = ${n}.z;
+  vec3 sum = ${c}[ 0 ] * .886227;
+  sum += ${c}[ 1 ] * 2. * 0.511664 * b;
+  sum += ${c}[ 2 ] * 2. * 0.511664 * e;
+  sum += ${c}[ 3 ] * 2. * 0.511664 * a;
+  sum += ${c}[ 4 ] * 2. * 0.429043 * a * b;
+  sum += ${c}[ 5 ] * 2. * 0.429043 * b * e;
+  sum += ${c}[ 6 ] * ( 0.743125 * e * e - 0.247708 );
+  sum += ${c}[ 7 ] * 2. * 0.429043 * a * e;
+  sum += ${c}[ 8 ] * 0.429043 * ( a * a - b * b );
+  return sum;
+}`;
+  const probeVariant = (helpers, count = 9) => lambertVs("MeshLambertMaterial", 1)
+    .replace("uniform vec3 ambientLightColor;", `uniform vec3 ambientLightColor;
+uniform vec3 uSH[${count}];
+${helpers}`).replace("  vLight += directIrradiance(directionalLights[0], n);",
+    `  vLight += directIrradiance(directionalLights[0], n);
+  vLight += probeTerm(uSH, n);`);
+  const probeOf = (program) => program._translation?.material?.lighting?.probe;
+  const recognised = {
+    "probe-renamed-full": `vec3 evalSH(vec3 q, vec3 c[9]) ${shBody("c", "q")}
+vec3 probeTerm(const in vec3 coeffs[9], const in vec3 m) {
+  vec3 w = normalize(m);
+  return evalSH(w, coeffs);
+}`,
+    "probe-renamed-band0":
+      "vec3 probeTerm(const in vec3 k[9], const in vec3 m) { return k[0] * 0.886227; }",
+  };
+  for (const [label, helpers] of Object.entries(recognised)) {
+    const renamed = build(probeVariant(helpers), lambertFs);
+    if (!expectLink(label, renamed, true)) {
+      gl.deleteProgram(renamed); continue;
+    }
+    if (probeOf(renamed) !== "uSH") failures.push(label + "-probe=" + probeOf(renamed));
+    attribute(renamed, "position", positions, 3);
+    attribute(renamed, "normal", normals, 3);
+    const lit = new Float32Array(27);
+    lit[0] = lit[1] = lit[2] = 1;
+    const base = { ...unlit, diffuse: [1, 0, 0], ambientLightColor: [0, 0, 0] };
+    gl.useProgram(renamed);
+    gl.uniform3fv(gl.getUniformLocation(renamed, "uSH"), new Float32Array(27));
+    near(label + "-dark", drawAndRead(renamed, base), [128, 0, 0]);
+    gl.useProgram(renamed);
+    gl.uniform3fv(gl.getUniformLocation(renamed, "uSH"), lit);
+    near(label + "-lit", drawAndRead(renamed, base), [199, 0, 0]);
+    release();
+    gl.deleteProgram(renamed);
+  }
+  /* Near misses: no light probe however named. Linking may refuse them or
+     draw them as other terms; none is mapped as a probe. */
+  const nearMisses = {
+    "probe-miss-scale":
+      "vec3 probeTerm(const in vec3 lightProbe[9], const in vec3 n) { return lightProbe[0] * 0.5; }",
+    "probe-miss-extra":
+      "vec3 probeTerm(const in vec3 k[9], const in vec3 n) { return k[0] * 0.886227 + k[1]; }",
+    "probe-miss-constant": `vec3 evalSH(vec3 q, vec3 c[9]) ${
+      shBody("c", "q").replace(".886227", ".886")}
+vec3 probeTerm(const in vec3 k[9], const in vec3 m) { return evalSH(m, k); }`,
+    "probe-miss-order": `vec3 evalSH(vec3 q, vec3 c[9]) ${shBody("c", "q")
+      .replace("0.743125 * e * e - 0.247708", "0.247708 * e * e - 0.743125")}
+vec3 probeTerm(const in vec3 k[9], const in vec3 m) { return evalSH(m, k); }`,
+    "probe-miss-pass": `vec3 halve(vec3 c[9]) { return c[0] * 0.5; }
+vec3 probeTerm(const in vec3 k[9], const in vec3 m) { return halve(k); }`,
+  };
+  for (const [label, helpers] of Object.entries(nearMisses)) {
+    const miss = build(probeVariant(helpers), lambertFs);
+    if (probeOf(miss)) failures.push(label + "=" + probeOf(miss));
+    gl.deleteProgram(miss);
+  }
+  const eight = build(probeVariant(
+    "vec3 probeTerm(const in vec3 k[8], const in vec3 m) { return k[0] * 0.886227; }",
+    8), lambertFs);
+  if (probeOf(eight)) failures.push("probe-miss-eight=" + probeOf(eight));
+  gl.deleteProgram(eight);
+
   /* Per-vertex shading: a colour term of attributes and uniforms read
      through varyings is evaluated per vertex and interpolated (linked with
-     a warning); past the per-draw step budget the draw is refused. */
+     a warning); past the step budget of one submission the draw is made
+     in parts. */
   const shadedVs = `precision highp float;
 uniform mat4 modelViewMatrix;
 uniform mat4 projectionMatrix;
@@ -697,20 +777,355 @@ void main() {
   attribute(ramp, "position", positions, 3);
   near("shaded-ramp", drawAndRead(ramp, {}), [68, 68, 68]);
   release();
-  /* 4096 vertices of a program past 16 steps exceed 65536 steps per draw. */
-  const bulk = buffer(new Array(4096 * 3).fill(0));
-  const bulkUv = buffer(new Array(4096 * 2).fill(0));
+  /* 4098 vertices of a program past 16 steps exceed 65536 steps in one
+     submission: the draw is made in parts and reads as the one triangle
+     it repeats. A fan that long cannot be split and is refused. */
+  const copies = 1366;
+  const bulk = buffer(new Array(copies).fill(
+    [-1, -1, -0.5, 3, -1, -0.5, -1, 3, -0.5]).flat());
+  const bulkUv = buffer(new Array(copies * 3).fill([0.1, 0.5]).flat());
   attribute(heavy, "position", positions, 3);
   attribute(heavy, "uv", uvs, 2);
-  drawAndRead(heavy, {});
+  const heavySingle = drawAndRead(heavy, {});
   release();
   attribute(heavy, "position", bulk, 3);
   attribute(heavy, "uv", bulkUv, 2);
-  gl.drawArrays(gl.TRIANGLES, 0, 4096);
+  near("shaded-split", drawAndRead(heavy, {}, gl.TRIANGLES, copies * 3),
+    heavySingle, 0);
+  gl.drawArrays(gl.TRIANGLE_FAN, 0, copies * 3);
   const refused = gl.getError();
   if (refused !== gl.OUT_OF_MEMORY) failures.push("shaded-step-limit=" + refused);
   release();
   for (const done of [wave, ramp, heavy]) gl.deleteProgram(done);
+
+  /* Texture maps beside the base colour map. A built-in lit material that
+     also reads a normal, bump, light, ambient-occlusion, emissive,
+     specular, roughness, metalness or environment map links with a warning
+     naming that map and draws exactly what the same material draws
+     without it, with or without a base colour map. A second texture in the
+     colour itself (an alpha map, two maps multiplied, a custom program
+     mixing two textures) is still refused. */
+  const mapsVs = (name) => `#define SHADER_NAME ${name}
+precision highp float;
+uniform mat4 modelViewMatrix;
+uniform mat4 projectionMatrix;
+uniform mat3 normalMatrix;
+uniform mat3 uvTransform;
+attribute vec3 position;
+attribute vec3 normal;
+attribute vec2 uv;
+attribute vec2 uv2;
+varying vec2 vUv;
+varying vec2 vUv2;
+varying vec3 vViewPosition;
+varying vec3 vNormal;
+varying vec3 vReflect;
+void main() {
+  vUv = (uvTransform * vec3(uv, 1.0)).xy;
+  vUv2 = uv2;
+  vec4 eye = modelViewMatrix * vec4(position, 1.0);
+  vNormal = normalize(normalMatrix * normal);
+  vViewPosition = -eye.xyz;
+  vReflect = reflect(normalize(eye.xyz), vNormal);
+  gl_Position = projectionMatrix * eye;
+}`;
+  const defines = (names) => names.map((name) => `#define ${name}\n`).join("");
+  const phongMapsFs = (names) => `${defines(names)}#extension GL_OES_standard_derivatives : enable
+precision mediump float;
+uniform vec3 diffuse;
+uniform vec3 emissive;
+uniform vec3 specular;
+uniform float shininess;
+uniform float opacity;
+uniform vec3 ambientLightColor;
+uniform sampler2D map;
+uniform sampler2D alphaMap;
+uniform sampler2D detailMap;
+uniform sampler2D emissiveMap;
+uniform sampler2D specularMap;
+uniform sampler2D normalMap;
+uniform sampler2D bumpMap;
+uniform sampler2D lightMap;
+uniform sampler2D aoMap;
+uniform samplerCube envMap;
+uniform float bumpScale;
+uniform float lightMapIntensity;
+uniform float aoMapIntensity;
+uniform float reflectivity;
+${lightStructs}
+uniform DirectionalLight directionalLights[1];
+struct Surface { vec3 diffuseColor; vec3 specularColor; float specularShininess;
+  float specularStrength; };
+struct Geometry { vec3 normal; vec3 viewDir; };
+struct Reflected { vec3 diffuse; vec3 specular; vec3 ambient; };
+varying vec2 vUv;
+varying vec2 vUv2;
+varying vec3 vViewPosition;
+varying vec3 vNormal;
+varying vec3 vReflect;
+vec3 ambientIrradiance(const in vec3 ambientLightColor) { return ambientLightColor; }
+void addDirect(const in DirectionalLight light, const in Geometry geometry,
+    const in Surface surface, inout Reflected reflected) {
+  float lambert = max(dot(geometry.normal, light.direction), 0.0);
+  vec3 h = normalize(light.direction + geometry.viewDir);
+  reflected.diffuse += light.color * lambert * surface.diffuseColor;
+  reflected.specular += light.color * lambert * surface.specularColor
+    * surface.specularStrength
+    * pow(max(dot(geometry.normal, h), 0.0), surface.specularShininess);
+}
+void addAmbient(const in vec3 irradiance, const in Surface surface,
+    inout Reflected reflected) {
+  reflected.ambient += irradiance * surface.diffuseColor;
+}
+vec3 perturb(const in vec3 n, const in vec3 mapN) { return normalize(n + mapN); }
+void main() {
+  vec4 diffuseColor = vec4(diffuse, opacity);
+#ifdef USE_MAP
+  diffuseColor *= texture2D(map, vUv);
+#endif
+#ifdef USE_DETAILMAP
+  diffuseColor *= texture2D(detailMap, vUv);
+#endif
+#ifdef USE_ALPHAMAP
+  diffuseColor.a *= texture2D(alphaMap, vUv).g;
+#endif
+  vec3 totalEmissive = emissive;
+#ifdef USE_EMISSIVEMAP
+  totalEmissive *= texture2D(emissiveMap, vUv).rgb;
+#endif
+  float specularStrength = 1.0;
+#ifdef USE_SPECULARMAP
+  specularStrength = texture2D(specularMap, vUv).r;
+#endif
+  vec3 n = normalize(vNormal);
+#ifdef USE_NORMALMAP
+  n = perturb(n, texture2D(normalMap, vUv).xyz * 2.0 - 1.0);
+#endif
+#ifdef USE_BUMPMAP
+  float height = texture2D(bumpMap, vUv).x;
+  n = normalize(n - vec3(dFdx(height), dFdy(height), 0.0) * bumpScale);
+#endif
+  Surface surface;
+  surface.diffuseColor = diffuseColor.rgb;
+  surface.specularColor = specular;
+  surface.specularShininess = shininess;
+  surface.specularStrength = specularStrength;
+  Geometry geometry;
+  geometry.normal = n;
+  geometry.viewDir = normalize(vViewPosition);
+  Reflected reflected = Reflected(vec3(0.0), vec3(0.0), vec3(0.0));
+  addDirect(directionalLights[0], geometry, surface, reflected);
+  vec3 irradiance = ambientIrradiance(ambientLightColor);
+#ifdef USE_LIGHTMAP
+  irradiance += texture2D(lightMap, vUv2).rgb * lightMapIntensity;
+#endif
+  addAmbient(irradiance, surface, reflected);
+#ifdef USE_AOMAP
+  reflected.ambient *= (texture2D(aoMap, vUv2).r - 1.0) * aoMapIntensity + 1.0;
+#endif
+  vec3 outgoing = reflected.diffuse + reflected.specular + reflected.ambient
+    + totalEmissive;
+#ifdef USE_ENVMAP
+  vec4 envColor = textureCube(envMap, vReflect);
+#ifdef ENVMAP_ADD
+  outgoing += envColor.xyz * specularStrength * reflectivity;
+#else
+  outgoing = mix(outgoing, outgoing * envColor.xyz, specularStrength * reflectivity);
+#endif
+#endif
+  gl_FragColor = vec4(outgoing, diffuseColor.a);
+}`;
+  const standardMapsFs = (names) => `${defines(names)}precision mediump float;
+uniform vec3 diffuse;
+uniform vec3 emissive;
+uniform float roughness;
+uniform float metalness;
+uniform float opacity;
+uniform vec3 ambientLightColor;
+uniform sampler2D map;
+uniform sampler2D roughnessMap;
+uniform sampler2D metalnessMap;
+${lightStructs}
+uniform DirectionalLight directionalLights[1];
+struct Physical { vec3 diffuseColor; float specularRoughness; vec3 specularColor; };
+struct Reflected { vec3 diffuse; vec3 specular; vec3 ambient; };
+varying vec2 vUv;
+varying vec3 vViewPosition;
+varying vec3 vNormal;
+vec3 ambientIrradiance(const in vec3 ambientLightColor) { return ambientLightColor; }
+void addDirect(const in DirectionalLight light, const in vec3 n, const in vec3 v,
+    const in Physical material, inout Reflected reflected) {
+  float dotNL = max(dot(n, light.direction), 0.0);
+  float a = material.specularRoughness * material.specularRoughness;
+  vec3 h = normalize(light.direction + v);
+  reflected.diffuse += light.color * dotNL * material.diffuseColor;
+  reflected.specular += light.color * dotNL * material.specularColor
+    * pow(max(dot(n, h), 0.0), 2.0 / (a * a) - 2.0);
+}
+void addAmbient(const in vec3 irradiance, const in Physical material,
+    inout Reflected reflected) {
+  reflected.ambient += irradiance * material.diffuseColor;
+}
+void main() {
+  vec4 diffuseColor = vec4(diffuse, opacity);
+#ifdef USE_MAP
+  diffuseColor *= texture2D(map, vUv);
+#endif
+  float roughnessFactor = roughness;
+#ifdef USE_ROUGHNESSMAP
+  roughnessFactor *= texture2D(roughnessMap, vUv).g;
+#endif
+  float metalnessFactor = metalness;
+#ifdef USE_METALNESSMAP
+  metalnessFactor *= texture2D(metalnessMap, vUv).b;
+#endif
+  Physical material;
+  material.diffuseColor = diffuseColor.rgb * (1.0 - metalnessFactor);
+  material.specularRoughness = max(roughnessFactor, 0.0525);
+  material.specularColor = mix(vec3(0.04), diffuseColor.rgb, metalnessFactor);
+  vec3 n = normalize(vNormal);
+  Reflected reflected = Reflected(vec3(0.0), vec3(0.0), vec3(0.0));
+  addDirect(directionalLights[0], n, normalize(vViewPosition), material, reflected);
+  addAmbient(ambientIrradiance(ambientLightColor), material, reflected);
+  gl_FragColor = vec4(reflected.diffuse + reflected.specular + reflected.ambient
+    + emissive, diffuseColor.a);
+}`;
+  const mapValues = {
+    modelViewMatrix: identity4, projectionMatrix: identity4,
+    normalMatrix: identity3, uvTransform: identity3,
+    diffuse: [0.5, 0.75, 1], emissive: [0.125, 0, 0], specular: [0.2, 0.2, 0.2],
+    shininess: 2, opacity: 1, roughness: 0.5, metalness: 0.5,
+    ambientLightColor: [0.25, 0.25, 0.25],
+    "directionalLights[0].direction": [0, 0, 1],
+    "directionalLights[0].color": [0.5, 0.5, 0.5],
+    bumpScale: 1, lightMapIntensity: 1, aoMapIntensity: 1, reflectivity: 1
+  };
+  /* Draws one program with every input it uses; null when it did not link. */
+  const drawMapped = (program) => {
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) return null;
+    gl.useProgram(program);
+    for (const [name, value] of Object.entries(mapValues)) {
+      const at = gl.getUniformLocation(program, name);
+      if (!at) continue;
+      if (typeof value === "number") gl.uniform1f(at, value);
+      else if (value.length === 16) gl.uniformMatrix4fv(at, false, value);
+      else if (value.length === 9) gl.uniformMatrix3fv(at, false, value);
+      else gl.uniform3fv(at, value);
+    }
+    const sampler = gl.getUniformLocation(program, "map");
+    if (sampler) gl.uniform1i(sampler, 0);
+    for (const [name, source, size] of [["position", positions, 3],
+        ["normal", normals, 3], ["uv", uvs, 2], ["uv2", uvs, 2]]) {
+      const at = gl.getAttribLocation(program, name);
+      if (at < 0) continue;
+      gl.bindBuffer(gl.ARRAY_BUFFER, source);
+      gl.vertexAttribPointer(at, size, gl.FLOAT, false, 0, 0);
+      gl.enableVertexAttribArray(at);
+      enabled.push(at);
+    }
+    gl.clearColor(0, 0, 0, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    gl.finish();
+    gl.readPixels(8, 8, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
+    const error = gl.getError();
+    if (error) failures.push("maps-gl-error=" + error);
+    release();
+    return Array.from(pixel.subarray(0, 3));
+  };
+  /* The red/blue map's red texel at u = 0.1 is the base colour map. */
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+  const mappedReference = {};
+  for (const [model, fs] of [["MeshPhongMaterial", phongMapsFs],
+      ["MeshStandardMaterial", standardMapsFs]])
+    for (const base of [["USE_MAP"], []]) {
+      const plain = build(mapsVs(model), fs(base));
+      mappedReference[model + base.length] = drawMapped(plain);
+      if (!mappedReference[model + base.length])
+        failures.push("maps-reference-" + model + base.length + "="
+          + JSON.stringify(gl.getProgramInfoLog(plain)));
+      gl.deleteProgram(plain);
+    }
+  /* The red texel removes the diffuse blue: specular and ambient remain. */
+  if (!(mappedReference.MeshPhongMaterial1?.[2] < mappedReference.MeshPhongMaterial0?.[2] / 4)
+      || !(mappedReference.MeshStandardMaterial1?.[2] < mappedReference.MeshStandardMaterial0?.[2] / 1.5))
+    failures.push("maps-reference-base=" + JSON.stringify(mappedReference));
+  const leftOut = {
+    USE_NORMALMAP: "texture 'normalMap' perturbs the normal; the GE lights with vertex normals",
+    USE_BUMPMAP: "texture 'bumpMap' perturbs the normal; the GE lights with vertex normals",
+    USE_LIGHTMAP: "texture 'lightMap' adds light; the PSP draws without it",
+    USE_AOMAP: "texture 'aoMap' scales light; the PSP draws without it",
+    USE_EMISSIVEMAP: "texture 'emissiveMap' scales the emissive colour; the PSP draws the colour without it",
+    USE_SPECULARMAP: "texture 'specularMap' scales a material input; the PSP draws the input without it",
+    USE_ENVMAP: "texture 'envMap' is an environment map; the PSP draws no reflections",
+    USE_ROUGHNESSMAP: "texture 'roughnessMap' scales a material input; the PSP draws the input without it",
+    USE_METALNESSMAP: "texture 'metalnessMap' scales a material input; the PSP draws the input without it",
+  };
+  const mapCases = [
+    ["MeshPhongMaterial", ["USE_NORMALMAP"]], ["MeshPhongMaterial", ["USE_BUMPMAP"]],
+    ["MeshPhongMaterial", ["USE_LIGHTMAP"]], ["MeshPhongMaterial", ["USE_AOMAP"]],
+    ["MeshPhongMaterial", ["USE_EMISSIVEMAP"]], ["MeshPhongMaterial", ["USE_SPECULARMAP"]],
+    ["MeshPhongMaterial", ["USE_ENVMAP"]], ["MeshPhongMaterial", ["USE_ENVMAP", "ENVMAP_ADD"]],
+    ["MeshPhongMaterial", ["USE_ENVMAP", "USE_SPECULARMAP"]],
+    ["MeshPhongMaterial", ["USE_NORMALMAP", "USE_LIGHTMAP", "USE_AOMAP", "USE_EMISSIVEMAP"]],
+    ["MeshStandardMaterial", ["USE_ROUGHNESSMAP"]], ["MeshStandardMaterial", ["USE_METALNESSMAP"]],
+    ["MeshStandardMaterial", ["USE_ROUGHNESSMAP", "USE_METALNESSMAP"]],
+  ];
+  for (const [model, names] of mapCases)
+    for (const base of [["USE_MAP"], []]) {
+      const label = "maps-" + model.slice(4, -8) + "-" + names.join("+")
+        + (base.length ? "-base" : "-alone");
+      const program = build(mapsVs(model), (model === "MeshPhongMaterial"
+        ? phongMapsFs : standardMapsFs)([...base, ...names]));
+      const log = gl.getProgramInfoLog(program), lines = log.split("\n");
+      const want = names.filter((name) => leftOut[name])
+        .map((name) => "WARNING: fragment shader: " + leftOut[name]);
+      if (!gl.getProgramParameter(program, gl.LINK_STATUS)
+          || want.some((line) => !lines.includes(line))
+          || lines.some((line) => !line.startsWith("WARNING: "))
+          /* one warning per map: the specular map is named for the
+             specular input it also scales, not for the dropped reflection */
+          || lines.filter((line) => line.includes("'specularMap'")).length
+            > names.includes("USE_SPECULARMAP"))
+        failures.push(label + "-link=" + JSON.stringify(log));
+      const got = drawMapped(program);
+      if (got) near(label, got, mappedReference[model + base.length], 1);
+      gl.deleteProgram(program);
+    }
+  /* Still refused: a second texture in the colour itself. */
+  const refusedMaps = {
+    "maps-alpha": phongMapsFs(["USE_MAP", "USE_ALPHAMAP"]),
+    "maps-two-colour": phongMapsFs(["USE_MAP", "USE_DETAILMAP"]),
+  };
+  for (const [label, fs] of Object.entries(refusedMaps)) {
+    const program = build(mapsVs("MeshPhongMaterial"), fs);
+    expectLink(label, program, false, [/^ERROR: /]);
+    gl.deleteProgram(program);
+  }
+  const mixVs = `precision highp float;
+uniform mat4 modelViewMatrix;
+uniform mat4 projectionMatrix;
+attribute vec3 position;
+attribute vec2 uv;
+varying vec2 vUv;
+void main() {
+  vUv = uv;
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+}`;
+  const mixFs = `precision mediump float;
+uniform sampler2D uFirst;
+uniform sampler2D uSecond;
+uniform float uBlend;
+varying vec2 vUv;
+void main() {
+  gl_FragColor = mix(texture2D(uFirst, vUv), texture2D(uSecond, vUv), uBlend);
+}`;
+  for (const name of ["", "#define SHADER_NAME ShaderMaterial\n"]) {
+    const program = build(name + mixVs, mixFs);
+    expectLink("maps-shader-material-mix" + (name ? "-named" : ""), program, false,
+      [/^ERROR: /]);
+    gl.deleteProgram(program);
+  }
 
   globalThis.pocSummary = failures.length
     ? "WEBGL-MATERIALS-FAIL:" + failures.join(" | ")

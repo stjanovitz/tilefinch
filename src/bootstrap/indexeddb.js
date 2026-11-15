@@ -1,4 +1,15 @@
 (() => {
+  /* Loaded after the page may have replaced these globals: build
+     errors, promises and platform objects with the constructors
+     hardening.js captured, and publish private hooks with its
+     defineProperty. */
+  const { defineProperty, Error, TypeError, DOMException, Promise, Map, Set,
+    Array, ArrayBuffer, Uint8Array, Date, RegExp, Blob, claimHooks } =
+    globalThis.__tilefinchEventInterfaces;
+  /* This module's hook publisher, claimed first (hardening.js); a realm
+     without reserved hooks takes plain globals. */
+  const publish = claimHooks?.()
+    || ((name, value) => { globalThis[name] = value; });
   if (globalThis.indexedDB !== undefined) return;
   /* Dispatch passes Event's phase numbers (1 capturing, 2 at target,
      3 bubbling) as literals instead of reading them from the global Event,
@@ -6,7 +17,8 @@
   /* This module loads on first use, after author code; hardening.js
      captured the bootstrap's event creator before that. */
   const createEvent = globalThis.__tilefinchCreateEvent,
-    { EventTarget } = globalThis.__tilefinchEventInterfaces;
+    { EventTarget, addListener, removeListener } =
+      globalThis.__tilefinchEventInterfaces;
 
   const DATABASE_LIMIT = 8;
   const STORE_LIMIT = 64;
@@ -94,7 +106,7 @@
         get: () => stats[key],
       });
     Object.freeze(statsView);
-    Object.defineProperty(globalThis, "__tilefinchIndexedDBStats", {
+    defineProperty(globalThis, "__tilefinchIndexedDBStats", { __proto__: null,
       value: statsView,
       writable: false,
       configurable: false,
@@ -506,11 +518,9 @@
             listener: (event) => entry.callback?.call(this, event),
           };
           state.set(type, entry);
-          EventTarget.prototype.addEventListener.call(
-            this, type, entry.listener);
+          addListener(this, type, entry.listener);
         } else if (entry && !next) {
-          EventTarget.prototype.removeEventListener.call(
-            this, type, entry.listener);
+          removeListener(this, type, entry.listener);
           state.delete(type);
         } else if (entry) entry.callback = next;
       },
@@ -1768,7 +1778,7 @@
             }
             connection._upgradeTransaction = transaction;
             prepareIDBUpgradeRequest(request, connection, transaction);
-            transaction.addEventListener("complete", () => {
+            addListener(transaction, "complete", () => {
               state.version = requested;
               connection.version = requested;
               connection._upgradeTransaction = null;
@@ -1782,7 +1792,7 @@
               }
               finishOpen(false);
             });
-            transaction.addEventListener("abort", () => {
+            addListener(transaction, "abort", () => {
               connection._upgradeTransaction = null;
               setIDBRequestTransaction(request, null);
               resetIDBRequest(request);
@@ -1878,25 +1888,20 @@
     IDBFactory,
   });
   globalThis.indexedDB = new IDBFactory();
-  Object.defineProperty(globalThis, "__tilefinchAbortIndexedDBForWorker", {
-    configurable: false,
-    enumerable: false,
-    writable: false,
-    value(database) {
-      if (!(database instanceof IDBDatabase)
-          || !database._state.connections.has(database)) return false;
-      const state = database._state,
-        cancellation = fail("Worker is terminated", "AbortError");
-      if (state.upgrading && state.upgrading.db === database)
-        state.upgrading._abort(cancellation);
-      for (const transaction of [...state.activeTransactions]) {
-        if (transaction.db === database) transaction._abort(cancellation);
-      }
-      for (const transaction of [...state.transactionQueue]) {
-        if (transaction.db === database) transaction._abort(cancellation);
-      }
-      database.close();
-      return true;
-    },
+  publish("__tilefinchAbortIndexedDBForWorker", (database) => {
+    if (!(database instanceof IDBDatabase)
+        || !database._state.connections.has(database)) return false;
+    const state = database._state,
+      cancellation = fail("Worker is terminated", "AbortError");
+    if (state.upgrading && state.upgrading.db === database)
+      state.upgrading._abort(cancellation);
+    for (const transaction of [...state.activeTransactions]) {
+      if (transaction.db === database) transaction._abort(cancellation);
+    }
+    for (const transaction of [...state.transactionQueue]) {
+      if (transaction.db === database) transaction._abort(cancellation);
+    }
+    database.close();
+    return true;
   });
 })();

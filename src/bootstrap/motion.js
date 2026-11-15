@@ -1,9 +1,20 @@
 (() => {
+  /* Loaded after the page may have replaced these globals: build
+     errors, promises and platform objects with the constructors
+     hardening.js captured. */
+  const { Map, Set, WeakMap, Array, claimHooks } =
+    globalThis.__tilefinchEventInterfaces;
+  /* Private hooks other modules call, reserved by hardening.js: this
+     module's publisher, claimed before any page code can run (a realm
+     without reserved hooks takes plain globals). */
+  const publish = claimHooks?.()
+    || ((name, value) => { globalThis[name] = value; });
   const nativeMotionSource = globalThis.__tilefinchMotionSourceBridge;
   delete globalThis.__tilefinchMotionSourceBridge;
-  /* Loaded on first use, after the page may have replaced Event: extend
-     the interface hardening.js captured. */
-  const { Event } = globalThis.__tilefinchEventInterfaces;
+  /* Loaded on first use, after the page may have replaced Event and
+     Element: extend and check against the interfaces hardening.js
+     captured. */
+  const { Event, Element } = globalThis.__tilefinchEventInterfaces;
   /*
    * CSS motion uses the same bounded property-effect scheduler as
    * Element.animate() and inline transitions.  The parser intentionally
@@ -915,7 +926,7 @@
       __tilefinchHoldHandleRelease(scanIterator !== null);
     }
   };
-  globalThis.__tilefinchMotionRecheck = () => {
+  publish("__tilefinchMotionRecheck", () => {
     if (pending) {
       if (scanIterator && !scanRunning) scanVersion++;
       return;
@@ -936,23 +947,23 @@
     const schedule =
       globalThis.__tilefinchScheduleRenderFixup || queueMicrotask;
     schedule(advanceScan);
-  };
+  });
   const beginObserving = () => {
     if (!observing && document.documentElement && documentHasMotionHint())
       observing = true;
   };
-  globalThis.__tilefinchBeginMotionObservation = beginObserving;
+  publish("__tilefinchBeginMotionObservation", beginObserving);
   /* A child-list or text change: one in the document's own tree can add or
      remove what the scan reads. (Class and style changes recheck wherever
      they happen.) Asked directly: a mutation observer here made a record of
      every mutation in the page. */
-  globalThis.__tilefinchMotionTreeChanged = (handle) => {
+  publish("__tilefinchMotionTreeChanged", (handle) => {
     if (!observing || (pending && (!scanIterator || scanRunning))) return;
     const root = document.documentElement?.__handle;
     if (root && (root === handle ||
         globalThis.__tilefinchIsAncestor(root, handle) !== false))
       globalThis.__tilefinchMotionRecheck();
-  };
+  });
 
   /*
    * Stylesheet transitions. Layout does not animate, but a page that waits
@@ -1238,7 +1249,7 @@
      (with oldValue), undefined for an inline style write, or null for an
      element that has just been watched. */
   let transitionDocumentListener = false;
-  globalThis.__tilefinchTransitionsDirty = (target, name, oldValue) => {
+  publish("__tilefinchTransitionsDirty", (target, name, oldValue) => {
     if (transitionWatched.size === 0) return;
     if (!target || transitionDirty.length >= TRANSITION_DIRTY_LIMIT * 3)
       transitionDirtyAll = true;
@@ -1247,7 +1258,7 @@
     if (transitionCheckQueued) return;
     transitionCheckQueued = true;
     queueMicrotask(checkTransitions);
-  };
+  });
   const watchTransitionElement = (target, observesSubtree = false) => {
     if (!(target instanceof Element) || !(target.__handle > 0)) return;
     if (transitionWatched.has(target)) {
@@ -1311,7 +1322,7 @@
     }
     return visited;
   };
-  globalThis.__tilefinchWatchTransitions = (target, type) => {
+  publish("__tilefinchWatchTransitions", (target, type) => {
     /* The events bubble that far, so the whole document is its subtree. */
     if (target === document || target === globalThis) {
       target = document.documentElement;
@@ -1332,7 +1343,7 @@
     watchTransitionElement(target, true);
     discoverTransitionDescendants(target, TRANSITION_DISCOVERY_LIMIT);
     globalThis.__tilefinchTransitionsDirty(target, null);
-  };
+  });
   /* A reveal followed by a forced geometry/style read establishes the
      before-change style immediately. A later change in this same author task
      can transition; waiting until its microtask would lose that baseline. */

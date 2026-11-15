@@ -4542,11 +4542,22 @@ static bool test_media_controls_and_composite(void)
     /* The initial meem, FEE3, is the last thing on the row. */
     CHECK(strlen(shown_title) >= 3u && memcmp(
               shown_title + strlen(shown_title) - 3u, "\xef\xbb\xa3", 3u) == 0);
-    /* A menu row is prepared once, in place; its ligature's alef draws nothing. */
+    /* A menu row is prepared once, in place; its ligature's alef draws
+       nothing, and the mark says it reads right to left. */
     char row_text[96] = "\xd9\x84\xd8\xa7"; /* lam alef */
     psp_ui_media_prepare_row_text(&caption_media, &caption_budget,
                                   row_text, sizeof(row_text));
-    CHECK(strcmp(row_text, "\xef\xbb\xbb") == 0);
+    CHECK(strcmp(row_text, "\xe2\x80\x8f\xef\xbb\xbb") == 0);
+    /* It is not cut to a width: the painter cuts it with the glyphs
+       attached when it is drawn, so a pack attached later refits it. */
+    char wide_row[128] = "";
+    for (int word = 0; word < 12; word++)
+        strcat(wide_row, word ? " \xd7\x90\xd7\x91\xd7\x92" : "\xd7\x90\xd7\x91\xd7\x92");
+    psp_ui_media_prepare_row_text(&caption_media, &caption_budget,
+                                  wide_row, sizeof(wide_row));
+    CHECK(strncmp(wide_row, "\xe2\x80\x8f", 3u) == 0
+          && strstr(wide_row, "...") == NULL
+          && strlen(wide_row) == 3u + 12u * 7u - 1u);
     char latin_row[96] = "English (auto)";
     psp_ui_media_prepare_row_text(&caption_media, &caption_budget,
                                   latin_row, sizeof(latin_row));
@@ -9094,6 +9105,50 @@ static bool test_media_open_press_has_one_owner(void)
     return true;
 }
 
+/* The same scope over an audio-only open (an MP3 or a station entry of a
+   queue, whose listening view keeps its controls up): one Down in the
+   queue menu moves one row on the owner and on what the copy shows, and
+   the Cross after it chooses that row once. */
+static bool test_media_open_press_has_one_owner_audio_only(void)
+{
+    static PspUiMediaPresentation p, own;
+    memset(&own, 0, sizeof(own));
+    PspUiMediaState owner;
+    psp_ui_media_init(&owner);
+    psp_ui_media_bind_presentation(&owner, &p);
+    psp_ui_media_set(&owner, true, false, false, 0, 0, "Station entry");
+    psp_ui_media_set_audio(&owner, true, "Dance", "radio.example", false,
+                           false);
+    psp_ui_media_set_resolving(&owner, "Opening audio");
+    CHECK(owner.visible && owner.audio_only && owner.resolving);
+    p.queue_active = p.queue_next = true;
+    p.queue_count = 4;
+    p.queue_position = 1;
+    PspUiMediaState copy = owner, shown;
+    PspUiMediaPressQueue queue = {0};
+    PspUiMediaIntent last = {0};
+    unsigned actions = 0;
+
+    CHECK(media_open_frame(&owner, &copy, &own, &queue,
+                           PSP_UI_BUTTON_TOOLBAR, &shown, &actions, &last));
+    CHECK(p.track_menu_open && p.track_menu_tab == PSP_UI_MEDIA_TAB_QUEUE);
+    unsigned row = p.track_menu_selection;
+    CHECK(row == PSP_UI_MEDIA_QUEUE_CONTROL_ROWS + 1u);
+    CHECK(media_open_frame(&owner, &copy, &own, &queue,
+                           PSP_UI_BUTTON_DOWN, &shown, &actions, &last));
+    CHECK(shown.presentation->track_menu_selection == row + 1u);
+    CHECK(p.track_menu_selection == row + 1u);
+    CHECK(media_copy_kept(&shown, &copy));
+    CHECK(actions == 0u);
+    CHECK(media_open_frame(&owner, &copy, &own, &queue,
+                           PSP_UI_BUTTON_CONFIRM, &shown, &actions, &last));
+    CHECK(actions == 1u && last.action == PSP_UI_MEDIA_ACTION_QUEUE_SELECT
+          && last.track_index
+                 == row + 1u - PSP_UI_MEDIA_QUEUE_CONTROL_ROWS);
+    CHECK(!p.track_menu_open && owner.audio_only);
+    return true;
+}
+
 /* A command chosen during a slow media open waits for the open's end; the
    loading panel says so at once on the supervisor's copy, keeps saying so
    on the owner's player once the press reaches it (and so on every copy
@@ -9504,6 +9559,7 @@ static bool test_media_open_complete_keeps_open_menu(void)
 int main(void)
 {
     if (!test_media_open_press_has_one_owner()) return 1;
+    if (!test_media_open_press_has_one_owner_audio_only()) return 1;
     if (!test_media_open_command_outlasts_later_presses()) return 1;
     if (!test_media_open_live_entry_reprojected_between_presses()) return 1;
     if (!test_media_open_complete_keeps_open_menu()) return 1;

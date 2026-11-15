@@ -1,10 +1,23 @@
 (() => {
   "use strict";
+  /* Loaded after the page may have replaced these globals: build
+     errors, promises and platform objects with the constructors
+     hardening.js captured, and publish private hooks with its
+     defineProperty. */
+  const { defineProperty, Error, DOMException, Map, Set, WeakMap, WeakRef,
+    Array, ArrayBuffer, Uint8Array, Uint8ClampedArray, Int32Array,
+    Uint32Array, Float32Array, Float64Array, RegExp, claimHooks } =
+    globalThis.__tilefinchEventInterfaces;
+  /* This module's hook publisher, claimed first (hardening.js); a realm
+     without reserved hooks takes plain globals. */
+  const publish = claimHooks?.()
+    || ((name, value) => { globalThis[name] = value; });
 
   /* Surface retirement also advances the native cache incarnation.  Page
      code never reads, selects, or serializes that process-issued identity. */
   const releaseNativeWebGLSurface =
     globalThis.__tilefinchWebGLReleaseSurface,
+    publishNativeWebGLFrame = globalThis.__tilefinchWebGLPublishFrame,
     nativeIndexMaximum = globalThis.__tilefinchWebGLIndexMaximum,
     nativeFiniteFloat32 = globalThis.__tilefinchWebGLFiniteFloat32,
     nativeCombineMatrix4 = globalThis.__tilefinchWebGLCombineMatrix4,
@@ -67,6 +80,20 @@
     CAP_DEPTH_TEST = 1 << 2,
     CAP_DITHER = 1 << 3,
     CAP_SCISSOR_TEST = 1 << 4,
+    /* Command word 27 carries the blend equation: 0 blending off, then
+       FUNC_ADD, EXT_blend_minmax's MIN_EXT and MAX_EXT, FUNC_SUBTRACT and
+       FUNC_REVERSE_SUBTRACT. */
+    MIN_EXT = 0x8007, MAX_EXT = 0x8008,
+    BLEND_WIRE = { [0x8006]: 1, [MIN_EXT]: 2, [MAX_EXT]: 3, [0x800a]: 4,
+      [0x800b]: 5 },
+    /* The WebGL 1 blend factors. Command words 31 and 32 carry a factor
+       enum, or BLEND_FIXED | 0xBBGGRR for a fixed colour (the GE's GU_FIX
+       layout), which _blendFactorWire resolves from blendColor(). */
+    BLEND_FACTORS = [0, 1, 0x0300, 0x0301, 0x0302, 0x0303, 0x0304, 0x0305,
+      0x0306, 0x0307, 0x0308, 0x8001, 0x8002, 0x8003, 0x8004],
+    BLEND_FIXED = 0x01000000,
+    DRAW_MODE_NAMES = ["POINTS", "LINES", "LINE_LOOP", "LINE_STRIP",
+      "TRIANGLES", "TRIANGLE_STRIP", "TRIANGLE_FAN"],
     DEFAULT_UNIFORM_COLOR = new Float32Array([1, 1, 1, 1]),
     contexts = new WeakMap(),
     repeatedCommandLists = new WeakMap(),
@@ -83,6 +110,8 @@
       vertices: 0,
       uploadedTextureBytes: 0,
       nativeFailures: 0,
+      splitDraws: 0,
+      splitParts: 0,
       deferredFlushes: 0,
       forcedFlushes: 0,
       maximumForcedFlushesPerFrame: 0,
@@ -125,7 +154,12 @@
       ONE_MINUS_SRC_ALPHA: 0x0303, DST_ALPHA: 0x0304,
       ONE_MINUS_DST_ALPHA: 0x0305, DST_COLOR: 0x0306,
       ONE_MINUS_DST_COLOR: 0x0307, SRC_ALPHA_SATURATE: 0x0308,
-      FUNC_ADD: 0x8006,
+      CONSTANT_COLOR: 0x8001, ONE_MINUS_CONSTANT_COLOR: 0x8002,
+      CONSTANT_ALPHA: 0x8003, ONE_MINUS_CONSTANT_ALPHA: 0x8004,
+      BLEND_COLOR: 0x8005, BLEND_DST_ALPHA: 0x80ca, BLEND_SRC_ALPHA: 0x80cb,
+      FUNC_ADD: 0x8006, FUNC_SUBTRACT: 0x800a,
+      FUNC_REVERSE_SUBTRACT: 0x800b, BLEND_EQUATION: 0x8009,
+      BLEND_EQUATION_RGB: 0x8009, BLEND_EQUATION_ALPHA: 0x883d,
       ARRAY_BUFFER: 0x8892, ELEMENT_ARRAY_BUFFER: 0x8893,
       ARRAY_BUFFER_BINDING: 0x8894, ELEMENT_ARRAY_BUFFER_BINDING: 0x8895,
       STREAM_DRAW: 0x88e0, STATIC_DRAW: 0x88e4, DYNAMIC_DRAW: 0x88e8,
@@ -232,6 +266,14 @@
       1, 0, 0, 0, 0, 1, 0, 0,
       0, 0, 1, 0, 0, 0, 0, 1,
     ]),
+    /* canvas.width reads back the bounded size; the page's request is the
+       attribute (HTML: a valid non-negative integer, else the default). */
+    requestedCanvasSize = (canvas, name, fallback) => {
+      const text = canvas.getAttribute?.(name);
+      if (typeof text !== "string" || !/^(?:0|[1-9][0-9]*)$/.test(text)) return fallback;
+      const value = Number(text);
+      return value <= 0x7fffffff ? value : fallback;
+    },
     boundedDrawingSize = (width, height) => {
       width = Number(width); height = Number(height);
       if (!Number.isInteger(width) || !Number.isInteger(height)
@@ -642,7 +684,7 @@
       _colorStorage: makeCommandAttribute(), color: null,
       _texcoordStorage: makeCommandAttribute(), texcoord: null,
       texture: null, matrix: new Float32Array(16),
-      uniformColor: new Float32Array(4), blend: false,
+      uniformColor: new Float32Array(4), blend: 0,
       depth: false, cull: false, depthFunc: 0,
       blendSrc: 0, blendDst: 0, cullFace: 0, frontFace: 0,
       viewport: new Int32Array(4),
@@ -680,6 +722,81 @@
       wireU32[slot + 3] = buffer && attribute.normalized ? 1 : 0;
       wireU32[slot + 4] = buffer ? attribute.stride : 0;
       wireU32[slot + 5] = buffer ? attribute.offset : 0;
+    },
+    /* [start, length] vertex ranges of one instance's split draw (see
+       _enqueueSplitDraw); n is over limit and the mode is not a loop or fan. */
+    splitVertexRanges = (mode, n, limit) => {
+      const ranges = [];
+      if (mode === constants.LINE_STRIP || mode === constants.TRIANGLE_STRIP) {
+        const shared = mode === constants.LINE_STRIP ? 1 : 2,
+          primitives = n - shared,
+          most = limit - shared - (mode === constants.LINE_STRIP ? 0
+            : (limit - shared) % 2),
+          parts = Math.ceil(primitives / most);
+        let size = Math.ceil(primitives / parts);
+        if (shared === 2) size += size % 2;
+        for (let start = 0; start < primitives; start += size)
+          ranges.push(start, Math.min(size, primitives - start) + shared);
+        return ranges;
+      }
+      const unit = mode === constants.TRIANGLES ? 3
+          : mode === constants.LINES ? 2 : 1,
+        usable = n - n % unit, most = limit - limit % unit,
+        parts = Math.ceil(usable / most),
+        size = Math.ceil(usable / parts / unit) * unit;
+      for (let start = 0; start < usable; start += size)
+        ranges.push(start, Math.min(size, usable - start));
+      return ranges;
+    },
+    /* The instance attribute as read from instance `base` onwards. */
+    shiftedInstanceAttribute = (attribute, base) => {
+      if (!attribute || !base) return attribute;
+      const stride = attribute.stride
+        || attribute.size * typeBytes(attribute.type);
+      return {
+        enabled: attribute.enabled, buffer: attribute.buffer,
+        size: attribute.size, type: attribute.type,
+        normalized: attribute.normalized, stride: attribute.stride,
+        offset: attribute.offset + base * stride, divisor: attribute.divisor,
+      };
+    },
+    /* The parts of a split draw, each with its own command template
+       (a part plan that inherits the draw plan's admission). */
+    splitDrawParts = (plan, mode, first, count, index, instances,
+                      instanceMatrix, instanceColor, instanceTransform,
+                      limit) => {
+      const parts = [],
+        add = (start, length, base, partInstances) => {
+          const partPlan = Object.create(plan);
+          partPlan.commandTemplateU32 = null;
+          partPlan.commandTemplateI32 = null;
+          partPlan.commandTemplateRevision = 0;
+          partPlan.commandTemplateId = 0;
+          partPlan.commandPacketEpoch = -1;
+          partPlan.commandPacketSlot = -1;
+          partPlan.commandPacketMask = 0;
+          parts.push({
+            start, first: index ? 0 : first + start, count: length,
+            instances: partInstances, plan: partPlan,
+            index: index ? makeCommandIndex() : null,
+            instanceMatrix: shiftedInstanceAttribute(instanceMatrix, base),
+            instanceColor: shiftedInstanceAttribute(instanceColor, base),
+            instanceTransform:
+              shiftedInstanceAttribute(instanceTransform, base),
+          });
+        };
+      if (count <= limit) {
+        const groups = Math.ceil(instances / Math.floor(limit / count)),
+          size = Math.ceil(instances / groups);
+        for (let base = 0; base < instances; base += size)
+          add(0, count, base, Math.min(size, instances - base));
+        return parts;
+      }
+      const ranges = splitVertexRanges(mode, count, limit);
+      for (let base = 0; base < instances; base++)
+        for (let at = 0; at < ranges.length; at += 2)
+          add(ranges[at], ranges[at + 1], base, 1);
+      return parts;
     };
 
   class GLObject {
@@ -800,6 +917,9 @@
         && array._everBound;
     }
     bindVertexArrayOES(array) { this._context._bindVertexArray(array); }
+  }
+  class ExtBlendMinmax {
+    constructor() { this.MIN_EXT = MIN_EXT; this.MAX_EXT = MAX_EXT; }
   }
   class TilefinchRepeatedFrameCommands {
     constructor(context) { this._context = context; }
@@ -1001,6 +1121,31 @@
       return { tokens, at };
     };
 
+    /* A token run with the identifier `keep` as P, every other identifier
+       (locals, parameters, fields) as _, and numbers in one spelling. */
+    const shapeTokens = (tokens, start, end, keep) => {
+      let shape = "";
+      for (let k = start; k < end; k++) {
+        const t = tokens[k];
+        shape += (t === keep ? "P" : /^\d|^\.\d/.test(t) ? String(Number(t))
+          : /^[A-Za-z_]/.test(t) && !TYPES.has(t) && t !== "return" ? "_" : t)
+          + " ";
+      }
+      return shape;
+    };
+    /* Light-probe bodies (probeParameter): band 0 of the probe alone, and
+       three.js r128's shGetIrradianceAt. */
+    const SH_PROBE_BODIES = ["{return P[0]*0.886227;}",
+      "{float x=n.x,y=n.y,z=n.z;vec3 r=P[0]*0.886227;"
+      + "r+=P[1]*2.0*0.511664*y;r+=P[2]*2.0*0.511664*z;"
+      + "r+=P[3]*2.0*0.511664*x;r+=P[4]*2.0*0.429043*x*y;"
+      + "r+=P[5]*2.0*0.429043*y*z;r+=P[6]*(0.743125*z*z-0.247708);"
+      + "r+=P[7]*2.0*0.429043*x*z;r+=P[8]*0.429043*(x*x-y*y);return r;}"];
+    let shProbeShapeList = null;
+    const shProbeShapes = () => shProbeShapeList ??= SH_PROBE_BODIES.map(
+      (body) => { const { tokens } = tokenize(body);
+        return shapeTokens(tokens, 0, tokens.length, "P"); });
+
     class SemError extends Error {}
     const fail = (message) => { throw new SemError(message); };
 
@@ -1105,6 +1250,9 @@
     /* ---- expression nodes ---------------------------------------------- */
     const F_UNIFORM = 1, F_ATTRIBUTE = 2, F_VARYING = 4, F_PIXEL = 8,
       F_TEXTURE = 16, F_LIGHT = 32, F_UNKNOWN = 64;
+    /* A texture read: only texture2D is drawn, but a built-in lit material's
+       cube environment map is recognised so that it can be left out. */
+    const SAMPLE_CALL = /^texture(2D|Cube)$/;
 
     const makeEvaluator = (program, stage, options) => {
       let nodes = 0, statements = 0;
@@ -1115,8 +1263,49 @@
       };
       const num = (v, t = "float") => node({ k: "num", t, v });
       const isNum = (n, v) => n.k === "num" && (v === undefined || n.v === v);
-      const lightUniform = (g) => /Light$/.test(g.type) || g.name === "ambientLightColor"
-        || g.name === "lightProbe";
+      const lightUniform = (g) => /Light$/.test(g.type) || g.name === "ambientLightColor";
+      /* The parameter at which a helper takes a light probe's nine
+         spherical-harmonic coefficients, or -1. Recognised by what the
+         helper computes, never by a name: a vec3[9] parameter whose body is
+         one of SH_PROBE_BODIES with every other identifier renamed (the
+         band-0 term alone, or three.js's whole irradiance evaluation), or
+         one used only as that argument of such a helper. */
+      const probeParameters = new Map();
+      const probeParameter = (fn, depth = 0) => {
+        if (probeParameters.has(fn.name)) return probeParameters.get(fn.name);
+        probeParameters.set(fn.name, -1);
+        let found = -1;
+        for (let k = 0; k < fn.params.length && found < 0; k++) {
+          const p = fn.params[k];
+          if (p.type === "vec3" && p.count === 9 && !p.out
+              && probeBody(fn, p.name, depth)) found = k;
+        }
+        probeParameters.set(fn.name, found);
+        return found;
+      };
+      const probeBody = (fn, name, depth) => {
+        if (shProbeShapes().includes(shapeTokens(tokens, fn.start, fn.end, name)))
+          return true;
+        let passed = false;
+        for (let k = fn.start; k < fn.end; k++) {
+          if (tokens[k] !== name) continue;
+          if (!/^[(,]$/.test(tokens[k - 1]) || !/^[),]$/.test(tokens[k + 1])
+              || depth >= SEM_DEPTH) return false;
+          let position = 0, nest = 0, open = -1;
+          for (let j = k - 1; j > fn.start && open < 0; j--) {
+            const t = tokens[j];
+            if (t === ")" || t === "]") nest++;
+            else if (t === "(" || t === "[") {
+              if (nest === 0) open = t === "(" ? j : 0; else nest--;
+            } else if (t === "," && nest === 0) position++;
+          }
+          const callee = open > 0 ? functions.get(tokens[open - 1]) : null;
+          if (!callee || callee === fn
+              || probeParameter(callee, depth + 1) !== position) return false;
+          passed = true;
+        }
+        return passed;
+      };
       /* Globals referenced (transitively) by each function, for light opacity. */
       const reads = new Map();
       const functionReads = (fn, depth = 0) => {
@@ -1238,7 +1427,7 @@
       const BUILTIN_TYPES = { dot: "float", length: "float", distance: "float",
         any: "bool", all: "bool" };
       const call = (f, args) => {
-        const t = BUILTIN_TYPES[f] || (f === "texture2D" ? "vec4"
+        const t = BUILTIN_TYPES[f] || (SAMPLE_CALL.test(f) ? "vec4"
           : f === "cross" ? "vec3" : args[0]?.t || "float");
         if (args.every((a) => a.k === "num")) {
           const v = args.map((a) => a.v), M = Math;
@@ -1251,7 +1440,7 @@
           if (folded && t === "float") return num(folded(...v));
         }
         let flags = args.reduce((acc, a) => acc | a.flags, 0);
-        if (f === "texture2D") flags |= F_TEXTURE;
+        if (SAMPLE_CALL.test(f)) flags |= F_TEXTURE;
         if (/^(dFdx|dFdy|fwidth)$/.test(f)) flags |= F_PIXEL;
         return node({ k: "call", f, t, args, flags });
       };
@@ -1429,10 +1618,14 @@
         /* A helper is a light term when it reads light uniforms or is handed a
            light struct; plain math on lit values (tone mapping) still inlines. */
         const lightStruct = args.some((a) => a.k === "struct" && (structFlags(a) & F_LIGHT));
-        if (lightStruct || readsLight(fn)) {
+        const probeAt = probeParameter(fn), probe = probeAt >= 0
+          && args[probeAt]?.k === "array" && args[probeAt].items.length === 9
+          && args[probeAt].items.every((item) => item.k === "unif")
+          ? args[probeAt] : null;
+        if (lightStruct || probe || readsLight(fn)) {
           /* Lighting math is not translated; it becomes one opaque, recorded
              term whose arguments the GE mapping reads. */
-          const origin = { fn: name, args };
+          const origin = { fn: name, args, probe };
           if (lightCalls.length < 64) lightCalls.push(origin);
           fn.params.forEach((p, k) => {
             if (p.out) assign(ctx, args[k], opaqueOf({ ...origin, param: p.name }, p.type, F_LIGHT));
@@ -1788,6 +1981,172 @@
       }
       for (const m of clip.matrices) used.uniforms.set(m, "mat4");
 
+      /* normal attribute: normalMatrix * normal */
+      const findNormal = (n, depth = 0) => {
+        if (!n || typeof n !== "object" || depth > 200) return null;
+        if (n.k === "op" && n.o === "*" && n.a?.k === "unif" && n.a.t === "mat3"
+            && n.b?.k === "attr" && n.b.t === "vec3") return { matrix: n.a.name, attribute: n.b.name };
+        if (n.k === "struct") { for (const v of n.fields.values()) { const r = findNormal(v, depth + 1); if (r) return r; } return null; }
+        if (n.k === "opaque") { for (const a of n.origin.args || []) { const r = findNormal(a, depth + 1); if (r) return r; } return null; }
+        for (const c of [n.a, n.b, n.c, n.v, ...(n.args || [])]) { const r = findNormal(c, depth + 1); if (r) return r; }
+        return null;
+      };
+
+      /* -- texture maps beside the base colour map --
+         The GE samples one texture. A built-in lit material may read more:
+         normal, environment, light, ambient-occlusion, emissive and
+         material-input maps. Each is recognised by where its value flows,
+         never by its name, and left out with a warning naming it. The base
+         colour map, the texture that multiplies the diffuse colour, is the
+         one drawn; a second texture there is still refused. */
+      const samplerOf = (n) => n?.k === "call" && SAMPLE_CALL.test(n.f)
+        && n.args[0]?.k === "unif" ? n.args[0] : null;
+      /* The texture reads a value makes, by sampler, outside lighting terms. */
+      const samplesIn = (n, out = new Map(), seen = new Set(), depth = 0) => {
+        if (!n || typeof n !== "object" || seen.has(n) || depth > 200) return out;
+        seen.add(n);
+        const sampler = samplerOf(n);
+        if (sampler && !out.has(sampler.name)) out.set(sampler.name, n);
+        if (n.k === "struct") for (const v of n.fields.values()) samplesIn(v, out, seen, depth + 1);
+        else if (n.k === "array") for (const v of n.items) samplesIn(v, out, seen, depth + 1);
+        else if (n.k !== "opaque")
+          for (const c of [n.a, n.b, n.c, n.v, ...(n.args || [])]) samplesIn(c, out, seen, depth + 1);
+        return out;
+      };
+      /* The samplers a colour multiplies directly (through products,
+         swizzles and constructors, not through sums or functions). */
+      const directSamplers = (n, out = new Set(), depth = 0) => {
+        if (!n || typeof n !== "object" || depth > 64) return out;
+        const sampler = samplerOf(n);
+        if (sampler) out.add(sampler.name);
+        else if ((n.k === "op" && n.o === "*") || n.k === "swz" || n.k === "ctor" || n.k === "merge")
+          for (const c of [n.a, n.b, n.v, ...(n.args || [])]) directSamplers(c, out, depth + 1);
+        return out;
+      };
+      /* An environment map is a cube map, or a 2D map looked up by anything
+         but a mesh texture coordinate (a reflection vector, for example). */
+      const meshVarying = (name) => {
+        let v = vout.get(name);
+        if (v?.k === "swz" && v.s === "xy" && v.a.k === "op" && v.a.o === "*"
+            && uniformOnly(v.a.a) && v.a.b.k === "ctor") v = v.a.b.args[0];
+        return v?.k === "attr" && v.t === "vec2";
+      };
+      const readsMeshCoordinate = (n, seen = new Set(), depth = 0) => {
+        if (!n || typeof n !== "object" || seen.has(n) || depth > 200) return false;
+        seen.add(n);
+        if (n.k === "vary") return meshVarying(n.name);
+        return [n.a, n.b, n.c, n.v, ...(n.args || [])]
+          .some((c) => readsMeshCoordinate(c, seen, depth + 1));
+      };
+      const environmentRead = (read) => read.args[0].t === "samplerCube"
+        || !readsMeshCoordinate(read.args[1]);
+      const normalVaryings = new Set([...vout].filter(([, v]) => findNormal(v))
+        .map(([name]) => name));
+      const readsNormal = (n, seen = new Set(), depth = 0) => {
+        if (!n || typeof n !== "object" || seen.has(n) || depth > 200) return false;
+        seen.add(n);
+        if (n.k === "vary") return normalVaryings.has(n.name);
+        if (n.k === "opaque" || n.k === "struct" || n.k === "array") return false;
+        return [n.a, n.b, n.c, n.v, ...(n.args || [])]
+          .some((c) => readsNormal(c, seen, depth + 1));
+      };
+      /* True when the value adds what the sampler reads to light. */
+      const addsLight = (n, name, seen = new Set(), depth = 0) => {
+        if (!n || typeof n !== "object" || seen.has(n) || depth > 200
+            || n.k === "opaque") return false;
+        seen.add(n);
+        if (n.k === "op" && (n.o === "+" || n.o === "-")
+            && [[n.a, n.b], [n.b, n.a]].some(([x, y]) =>
+              (y.flags & F_LIGHT) && samplesIn(x).has(name))) return true;
+        const children = n.k === "struct" ? [...n.fields.values()]
+          : [n.a, n.b, n.c, n.v, ...(n.args || [])];
+        return children.some((c) => addsLight(c, name, seen, depth + 1));
+      };
+      const MAP_ROLES = {
+        normal: "perturbs the normal; the GE lights with vertex normals",
+        environment: "is an environment map; the PSP draws no reflections",
+        reflection: "scales the reflection; the PSP draws no reflections",
+        light: "adds light; the PSP draws without it",
+        occlusion: "scales light; the PSP draws without it",
+        emissive: "scales the emissive colour; the PSP draws the colour without it",
+        input: "scales a material input; the PSP draws the input without it",
+      };
+      const leftOut = new Map();
+      const leaveOut = (name, role) => {
+        if (!leftOut.has(name)) leftOut.set(name, new Set());
+        leftOut.get(name).add(role);
+      };
+      /* The value with the given samplers read as white, folded. */
+      const fold = (n) => {
+        n.flags = [n.a, n.b, n.c, n.v, ...(n.args || [])]
+          .reduce((f, c) => f | (c && typeof c === "object" ? c.flags || 0 : 0), 0);
+        if (n.k === "call" && SAMPLE_CALL.test(n.f)) n.flags |= F_TEXTURE;
+        if (n.k === "call" && /^(dFdx|dFdy|fwidth)$/.test(n.f)) n.flags |= F_PIXEL;
+        if (!n.flags && n.k !== "sel" && size(n.t) && size(n.t) <= 4) {
+          let value;
+          try { value = evaluate(n, () => fail("constant"), 0); }
+          catch { fail(`'${show(n).slice(0, 40)}' has no GE equivalent`); }
+          const values = typeof value === "number" ? [value] : Array.from(value);
+          if (values.length === size(n.t) || values.length === 1) {
+            if (values.every((x) => x === values[0]))
+              return { k: "num", t: n.t, v: values[0], flags: 0 };
+            return { k: "ctor", t: n.t, flags: 0,
+              args: values.map((v) => ({ k: "num", t: "float", v, flags: 0 })) };
+          }
+        }
+        if (n.k === "op" && n.o === "*") {
+          if (isNum(n.a, 1) && n.b.t === n.t) return n.b;
+          if (isNum(n.b, 1) && n.a.t === n.t) return n.a;
+          if (isNum(n.a, 0) || isNum(n.b, 0)) return { k: "num", t: n.t, v: 0, flags: 0 };
+        }
+        if (n.k === "op" && (n.o === "+" || n.o === "-") && isNum(n.b, 0) && n.a.t === n.t)
+          return n.a;
+        if (n.k === "op" && n.o === "+" && isNum(n.a, 0) && n.b.t === n.t) return n.b;
+        return n;
+      };
+      const whiten = (n, names) => {
+        const memo = new Map();
+        const walk = (x, depth) => {
+          if (!x || typeof x !== "object" || depth > 200) return x;
+          if (memo.has(x)) return memo.get(x);
+          let out = x;
+          if (names.has(samplerOf(x)?.name))
+            out = { k: "ctor", t: x.t, args: [{ k: "num", t: "float", v: 1, flags: 0 }], flags: 0 };
+          else if (["op", "call", "ctor", "swz", "sel", "merge", "col"].includes(x.k)) {
+            const copy = { ...x };
+            let changed = false;
+            for (const key of ["a", "b", "c", "v"])
+              if (x[key] && typeof x[key] === "object") {
+                copy[key] = walk(x[key], depth + 1); changed ||= copy[key] !== x[key];
+              }
+            if (x.args) {
+              copy.args = x.args.map((a) => walk(a, depth + 1));
+              changed ||= copy.args.some((a, k) => a !== x.args[k]);
+            }
+            if (changed) out = fold(copy);
+          }
+          memo.set(x, out);
+          return out;
+        };
+        return walk(n, 0);
+      };
+      /* An environment map's blend into a lit material's colour,
+         mix(colour, f(environment), k), keeps the colour. */
+      const withoutEnvironmentBlend = (n) => {
+        const environmentIn = (x) => [...samplesIn(x)].some(([, read]) => environmentRead(read));
+        while (n.k === "call" && n.f === "mix" && !environmentIn(n.args[0])
+            && environmentIn({ k: "list", args: n.args.slice(1) })) {
+          for (const [name, read] of samplesIn({ k: "list", args: n.args.slice(1) }))
+            if (!samplesIn(n.args[0]).has(name))
+              leaveOut(name, environmentRead(read) ? "environment" : "reflection");
+          n = n.args[0];
+        }
+        return n;
+      };
+      let baseSamplers = null;
+      const extraSamplers = (n) => [...samplesIn(n)]
+        .filter(([name]) => !baseSamplers?.has(name));
+
       /* -- colour factors -- */
       const vertexExpression = (n) => {
         const v = vout.get(n.name);
@@ -1809,6 +2168,7 @@
           if (x.k === "vary") out = stage === "fragment"
             ? sub(vertexExpression(x), depth + 1) : null;
           else if (x.k === "num" || x.k === "unif" || x.k === "attr") out = x;
+          else if (samplerOf(x)) out = null;
           else if (["op", "call", "ctor", "swz", "sel"].includes(x.k)) {
             const copy = { ...x };
             let ok = true, flags = 0;
@@ -1890,6 +2250,16 @@
           if (n.t === "vec3" && sel !== "xyz") fail(`colour attribute ${n.name} has no alpha`);
           return addVertexColor(n, sel, channel);
         }
+        if (baseSamplers && stage === "fragment") {
+          /* A lit material's input map scaling a uniform factor of the
+             colour (metalness * texel.b): the factor is drawn without it. */
+          const extra = extraSamplers(n), white = extra.length
+            && whiten(n, new Set(extra.map(([name]) => name)));
+          if (white && uniformOnly(white) && (white.flags & F_UNIFORM)) {
+            for (const [name] of extra) leaveOut(name, "input");
+            return factor(white, channel, sel, stage, depth + 1);
+          }
+        }
         const shaded = perVertex(n, stage);
         if (shaded) {
           color.program[channel].push({ node: shaded, sel, text: show(n) });
@@ -1908,6 +2278,7 @@
       };
       const [rgb0, alpha0, alphaSel] = split(fragColor);
       rgbNode = rgb0; alphaNode = alpha0;
+      if (LIT_MODELS[shaderName]) rgbNode = withoutEnvironmentBlend(rgbNode);
       if (rgbNode.k === "call" && rgbNode.f === "mix" && rgbNode.args[2]?.t === "float") {
         const [under, fogColor, amount] = rgbNode.args;
         if (!uniformOnly(fogColor)) fail("fog colour must be uniform");
@@ -1963,8 +2334,9 @@
               }
             } else if (arg.k === "unif" && arg.name === "ambientLightColor") {
               lighting.ambient = arg.name; noteUniforms(arg);
-            } else if (arg.k === "array" && arg.items[0]?.name?.startsWith("lightProbe")) {
-              lighting.probe = "lightProbe"; noteUniforms(arg);
+            } else if (arg === call.probe) {
+              lighting.probe = /^(\w+)\[0\]$/.exec(arg.items[0].name)?.[1] ?? null;
+              noteUniforms(arg);
             } else if (arg.k === "struct" && [...arg.fields.keys()].some((f) => /diffuseColor/.test(f))
                 && !(structFlags(arg) & F_LIGHT)) materialStruct ??= arg;
           }
@@ -1980,8 +2352,44 @@
           warnings.push("fragment: spot lights are drawn as point lights on the PSP");
         if (lighting.lights.some((l) => l.type === "HemisphereLight"))
           warnings.push("fragment: hemisphere lights are drawn as ambient light on the PSP");
+        rgbNode = withoutEnvironmentBlend(rgbNode);
+        const field = (re) => materialStruct
+          && [...materialStruct.fields].find(([f]) => re.test(f))?.[1];
+        baseSamplers = directSamplers(model === "lambert"
+          ? sum(rgbNode).find((term) => term.flags & F_LIGHT) : field(/diffuseColor/));
+        /* The material inputs and geometry handed to the lighting helpers:
+           the GE lights with uniform inputs and vertex normals, so a map
+           read there is left out (the diffuse colour is mapped below). */
+        const handed = new Set();
+        for (const call of lightCalls) for (const arg of call.args) {
+          const values = arg.k === "struct" ? [...arg.fields].filter(([f]) =>
+            arg !== materialStruct || !/diffuseColor/.test(f)).map(([, v]) => v) : [arg];
+          for (const value of values) {
+            if (handed.has(value)) continue;
+            handed.add(value);
+            for (const [name, read] of extraSamplers(value))
+              leaveOut(name, environmentRead(read) ? "environment"
+                : addsLight(value, name) ? "light"
+                : value.t === "vec3" && readsNormal(value) ? "normal" : "input");
+          }
+        }
         let baseFound = false;
-        for (const term of sum(rgbNode)) {
+        for (let term of sum(rgbNode)) {
+          const extra = extraSamplers(term);
+          if (extra.some(([, read]) => environmentRead(read))) {
+            /* an environment term added to the colour */
+            for (const [name, read] of extra)
+              leaveOut(name, environmentRead(read) ? "environment" : "reflection");
+            continue;
+          }
+          if (extra.length) {
+            for (const [name] of extra)
+              leaveOut(name, !(term.flags & F_LIGHT) ? "emissive"
+                : addsLight(term, name) ? "light" : "occlusion");
+            term = whiten(term, new Set(extra.map(([name]) => name)));
+            /* a map that is the whole term, not a scale on it, is a colour */
+            if (!(term.flags & (F_LIGHT | F_UNIFORM))) fail("unlit colour term is not uniform");
+          }
           if (!(term.flags & F_LIGHT)) {
             if (!uniformOnly(term)) fail("unlit colour term is not uniform");
             lighting.emissive.push(term); noteUniforms(term); continue;
@@ -1999,7 +2407,6 @@
              repeated factors the other terms add */
         } else {
           if (!materialStruct) fail("lit material inputs not found");
-          const field = (re) => [...materialStruct.fields].find(([f]) => re.test(f))?.[1];
           const diffuse = field(/diffuseColor/);
           factor(diffuse, "rgb", "xyz", "fragment");
           if (model === "phong") {
@@ -2016,16 +2423,6 @@
           }
           warnings.push(`fragment: per-pixel lighting is evaluated per vertex on the PSP`);
         }
-        /* normal attribute: normalMatrix * normal */
-        const findNormal = (n, depth = 0) => {
-          if (!n || typeof n !== "object" || depth > 200) return null;
-          if (n.k === "op" && n.o === "*" && n.a?.k === "unif" && n.a.t === "mat3"
-              && n.b?.k === "attr" && n.b.t === "vec3") return { matrix: n.a.name, attribute: n.b.name };
-          if (n.k === "struct") { for (const v of n.fields.values()) { const r = findNormal(v, depth + 1); if (r) return r; } return null; }
-          if (n.k === "opaque") { for (const a of n.origin.args || []) { const r = findNormal(a, depth + 1); if (r) return r; } return null; }
-          for (const c of [n.a, n.b, n.c, n.v, ...(n.args || [])]) { const r = findNormal(c, depth + 1); if (r) return r; }
-          return null;
-        };
         let normal = null;
         for (const value of vout.values()) normal ??= findNormal(value);
         for (const call of analysis.vertex.lightCalls) for (const a of call.args) normal ??= findNormal(a);
@@ -2125,6 +2522,11 @@
         for (const text of new Set([...color.program.rgb, ...color.program.a]
           .map((term) => term.text.slice(0, 48))))
           warnings.push(`fragment: '${text}' is shaded per vertex on the PSP`);
+      }
+      for (const [name, roles] of leftOut) {
+        /* a map that also feeds a kept term is named for that term */
+        if (roles.size > 1) roles.delete("reflection");
+        for (const role of roles) warnings.push(`fragment: texture '${name}' ${MAP_ROLES[role]}`);
       }
       return plan;
     };
@@ -2363,7 +2765,10 @@
             radians: (x) => x * M.PI / 180, degrees: (x) => x * 180 / M.PI }[n.f];
           if (one) return map2(v[0], 0, (x) => one(x));
           const two = { pow: M.pow, min: M.min, max: M.max, mod: (x, y) => x - y * M.floor(x / y),
-            step: (e, x) => +(x >= e) }[n.f];
+            step: (e, x) => +(x >= e), lessThan: (x, y) => +(x < y),
+            lessThanEqual: (x, y) => +(x <= y), greaterThan: (x, y) => +(x > y),
+            greaterThanEqual: (x, y) => +(x >= y), equal: (x, y) => +(x === y),
+            notEqual: (x, y) => +(x !== y) }[n.f];
           if (two) return map2(v[0], v[1], two);
           if (n.f === "clamp") return map2(map2(v[0], v[1], M.max), v[2], M.min);
           if (n.f === "mix") return map2(map2(v[0], v[1], (x, y) => [x, y]), v[2], (p, t) => p[0] * (1 - t) + p[1] * t);
@@ -2619,8 +3024,15 @@
         [0, 0, this.drawingBufferWidth, this.drawingBufferHeight]);
       this._scissor = new Int32Array(
         [0, 0, this.drawingBufferWidth, this.drawingBufferHeight]);
+      /* The rectangles the native renderer gets: canvas units scaled to a
+         clamped drawing buffer (see _deviceRect). */
+      this._viewportRequest = new Int32Array(this._viewport);
+      this._deviceViewport = new Int32Array(this._viewport);
+      this._deviceScissor = new Int32Array(this._scissor);
       this._depthFunc = constants.LESS;
-      this._blendSrc = constants.ONE; this._blendDst = constants.ZERO;
+      this._blendColor = new Float32Array(4);
+      this._resetBlendFactors();
+      this._blendEquation = this._blendEquationAlpha = constants.FUNC_ADD;
       this._cullFace = constants.BACK; this._frontFace = constants.CCW;
       this._rasterStateKey = this._computeRasterStateKey();
       this._viewportRevision = 1; this._scissorRevision = 1;
@@ -2631,7 +3043,7 @@
          presented frame, and a fresh closure per frame would be steady
          QuickJS garbage pacing full collections onto gameplay. */
       this._flushMicrotask = () => {
-        this._flushQueued = false; this._flush();
+        this._flushQueued = false; this._flush(true);
         this._forcedFlushesInFrame = 0;
       };
       /* bufferSubData preserves storage and therefore every cached attribute
@@ -2655,6 +3067,7 @@
       this._matrixScratch = new Float32Array(16);
       this._drawUniformColorScratch = new Float32Array(4);
       this._instancedExtension = null;
+      this._blendMinmaxExtension = null;
       this._vertexArrayExtension = null;
       this._repeatedFrameExtension = null;
       this._repeatedCommandCapture = null;
@@ -2685,7 +3098,7 @@
       this._textureWireU32 = new Uint32Array(this._textureWireBuffer);
       this._textureWireI32 = new Int32Array(this._textureWireBuffer);
       this._resources = new Set();
-      this._surfaceReady = false;
+      this._surfaceReady = false; this._frameOpen = false;
       const drawingSize = boundedDrawingSize(canvas.width, canvas.height);
       this._drawingWidth = drawingSize?.width || 0;
       this._drawingHeight = drawingSize?.height || 0;
@@ -2785,13 +3198,15 @@
       this._invalidateCommandWireTemplates();
       this._clearColor.fill(0); this._clearDepth = 1;
       this._depthFunc = constants.LESS;
-      this._blendSrc = constants.ONE; this._blendDst = constants.ZERO;
+      this._blendColor.fill(0);
+      this._resetBlendFactors();
+      this._blendEquation = this._blendEquationAlpha = constants.FUNC_ADD;
       this._cullFace = constants.BACK; this._frontFace = constants.CCW;
       this._rasterStateKey = this._computeRasterStateKey();
       this._viewportRevision = 1; this._scissorRevision = 1;
       this._lineWidth = 1; this._flipY = false; this._premultiply = false;
       this._unpackAlignment = 4; this._packAlignment = 4;
-      this._surfaceReady = false;
+      this._surfaceReady = false; this._frameOpen = false;
       this._resize();
       if (!this._lost)
         this.canvas.dispatchEvent(createEvent("webglcontextrestored"));
@@ -3306,7 +3721,7 @@
         command.clearDepth = this._clearDepth;
         command.scissorEnabled =
           (this._enabledMask & CAP_SCISSOR_TEST) !== 0;
-        command.scissor.set(this._scissor);
+        command.scissor.set(this._deviceScissor);
         this._tailCommands.push(command);
         return true;
       }
@@ -3323,7 +3738,7 @@
       wireF32[base + 6] = this._clearDepth;
       wireU32[base + 39] =
         (this._enabledMask & CAP_SCISSOR_TEST) !== 0 ? 1 : 0;
-      wireI32.set(this._scissor, base + 40);
+      wireI32.set(this._deviceScissor, base + 40);
       this._captureRepeatedCommand({
         kind: 0, slot: commandAt,
         wireTemplate: this._repeatedWireTemplate(commandAt),
@@ -3417,7 +3832,7 @@
         texcoord, sources, null);
       const textureIndex = this._textureIndex(textures, draw.texture);
       wireI32[base + 26] = textureIndex;
-      wireU32[base + 27] = draw.blend ? 1 : 0;
+      wireU32[base + 27] = draw.blend;
       wireU32[base + 28] = draw.depth ? 1 : 0;
       wireU32[base + 29] = draw.cull ? 1 : 0;
       wireI32[base + 30] = draw.depthFunc;
@@ -3449,26 +3864,23 @@
         this._writeMaterial(commandAt, draw.material, null, sources,
           draw.normal);
     }
+    /* The blend factor words are compared by _drawTemplateStateMatches,
+       since a constant factor's word follows blendColor(). */
     _computeRasterStateKey() {
-      const sourceBlendKey = this._blendSrc === constants.ZERO ? 0
-        : this._blendSrc === constants.ONE ? 1
-        : this._blendSrc === constants.SRC_ALPHA ? 2 : 3;
-      const destinationBlendKey = this._blendDst === constants.ZERO ? 0
-        : this._blendDst === constants.ONE ? 1
-        : this._blendDst === constants.SRC_ALPHA ? 2 : 3;
       const cullKey = this._cullFace === constants.FRONT ? 0
         : this._cullFace === constants.BACK ? 1 : 2;
       return ((this._enabledMask & (CAP_BLEND | CAP_CULL_FACE
           | CAP_DEPTH_TEST | CAP_SCISSOR_TEST))
         | ((this._depthFunc - constants.NEVER) << 5)
-        | (sourceBlendKey << 8)
-        | (destinationBlendKey << 10)
         | (cullKey << 12)
-        | ((this._frontFace - constants.CW) << 14)) >>> 0;
+        | ((this._frontFace - constants.CW) << 14)
+        | (BLEND_WIRE[this._blendEquation] << 15)) >>> 0;
     }
     _drawTemplateStateMatches(plan) {
       return !!plan.commandTemplateU32
         && plan.commandTemplateRasterKey === this._rasterStateKey
+        && plan.commandTemplateI32[31] === this._blendSrcWire
+        && plan.commandTemplateI32[32] === this._blendDstWire
         && plan.commandTemplateViewportRevision === this._viewportRevision
         && plan.commandTemplateScissorRevision === this._scissorRevision;
     }
@@ -3492,15 +3904,16 @@
       writeTemplateAttribute(wireI32, wireU32, 14, color);
       writeTemplateAttribute(wireI32, wireU32, 20, texcoord);
       wireI32[26] = -1;
-      wireU32[27] = (this._enabledMask & CAP_BLEND) !== 0 ? 1 : 0;
+      wireU32[27] = (this._enabledMask & CAP_BLEND) !== 0
+        ? BLEND_WIRE[this._blendEquation] : 0;
       wireU32[28] = (this._enabledMask & CAP_DEPTH_TEST) !== 0 ? 1 : 0;
       wireU32[29] = (this._enabledMask & CAP_CULL_FACE) !== 0 ? 1 : 0;
       wireI32[30] = this._depthFunc;
-      wireI32[31] = this._blendSrc; wireI32[32] = this._blendDst;
+      wireI32[31] = this._blendSrcWire; wireI32[32] = this._blendDstWire;
       wireI32[33] = this._cullFace; wireI32[34] = this._frontFace;
-      wireI32.set(this._viewport, 35);
+      wireI32.set(this._deviceViewport, 35);
       wireU32[39] = (this._enabledMask & CAP_SCISSOR_TEST) !== 0 ? 1 : 0;
-      wireI32.set(this._scissor, 40);
+      wireI32.set(this._deviceScissor, 40);
       writeCommandSourceIdentity(wireI32, 0, 64, index);
       writeLiveSourceIdentity(wireI32, 0, 67, position);
       writeLiveSourceIdentity(wireI32, 0, 70, color);
@@ -3590,16 +4003,18 @@
           command._instanceColorStorage, instanceColor);
         command.instanceTransform = this._snapshotLiveAttribute(
           command._instanceTransformStorage, instanceTransform);
-        command.blend = (this._enabledMask & CAP_BLEND) !== 0;
+        command.blend = (this._enabledMask & CAP_BLEND) !== 0
+          ? BLEND_WIRE[this._blendEquation] : 0;
         command.depth = (this._enabledMask & CAP_DEPTH_TEST) !== 0;
         command.cull = (this._enabledMask & CAP_CULL_FACE) !== 0;
         command.depthFunc = this._depthFunc;
-        command.blendSrc = this._blendSrc; command.blendDst = this._blendDst;
+        command.blendSrc = this._blendSrcWire;
+        command.blendDst = this._blendDstWire;
         command.cullFace = this._cullFace; command.frontFace = this._frontFace;
-        command.viewport.set(this._viewport);
+        command.viewport.set(this._deviceViewport);
         command.scissorEnabled =
           (this._enabledMask & CAP_SCISSOR_TEST) !== 0;
-        command.scissor.set(this._scissor);
+        command.scissor.set(this._deviceScissor);
         this._tailCommands.push(command);
         this._retainCommandInputs(
           true, candidateSources, textureSnapshot, vertices);
@@ -3785,7 +4200,9 @@
       }
       return true;
     }
-    _flushCurrent() {
+    /* frameEnd: this batch ends the task's frame, which painters may then
+       show; any earlier flush leaves it open (images_canvas_frame_hold). */
+    _flushCurrent(frameEnd) {
       if (this._lost) return FLUSH_FAILED;
       if (!this._commands.length) return FLUSH_OK;
       const width = this.drawingBufferWidth, height = this.drawingBufferHeight;
@@ -3843,7 +4260,7 @@
       const outcome = __tilefinchWebGLRender(
         canvas.__handle, width, height, wireU32, sources,
         this._textureWireU32, this._attributes.antialias,
-        this._attributes.preserveDrawingBuffer, materialWire,
+        this._attributes.preserveDrawingBuffer, materialWire, !frameEnd,
       );
       if (outcome === 2) {
         diagnostics.deferredFlushes++;
@@ -3857,15 +4274,23 @@
         return FLUSH_FAILED;
       }
       diagnostics.flushes++; this._surfaceReady = true;
+      this._frameOpen = !frameEnd;
       return FLUSH_OK;
     }
-    _flush() {
+    /* frameEnd: the end of a task (the flush microtask), where the drawing
+       buffer holds a complete frame. */
+    _flush(frameEnd = false) {
       if (!this._commands.length && this._tailCommands.length)
         this._promoteTailQueue();
       while (this._commands.length) {
-        const outcome = this._flushCurrent();
+        const outcome = this._flushCurrent(
+          frameEnd && !this._tailCommands.length);
         if (outcome !== FLUSH_OK) return outcome;
         if (this._tailCommands.length) this._promoteTailQueue();
+      }
+      if (frameEnd && this._frameOpen) {
+        this._frameOpen = false;
+        if (this.canvas) publishNativeWebGLFrame(this.canvas.__handle);
       }
       return FLUSH_OK;
     }
@@ -3877,6 +4302,31 @@
         diagnostics.maximumForcedFlushesPerFrame,
         this._forcedFlushesInFrame);
       return this._flush();
+    }
+    /* A canvas larger than the PSP surface gets a proportionally smaller
+       drawing buffer, while pages keep sizing the viewport and scissor in
+       canvas units (three.js sets the viewport to the size it gave the
+       canvas). Scale such rectangles to the drawing buffer so the frame
+       keeps its layout; the native renderer refuses a viewport wider or
+       taller than the surface, so the viewport is also clamped to it. */
+    _deviceRect(rect, out, viewport) {
+      const canvas = this.canvas,
+        canvasWidth = canvas ? requestedCanvasSize(canvas, "width", 300) : 0,
+        canvasHeight = canvas ? requestedCanvasSize(canvas, "height", 150) : 0,
+        bufferWidth = this.drawingBufferWidth, bufferHeight = this.drawingBufferHeight,
+        sx = canvasWidth > bufferWidth ? bufferWidth / canvasWidth : 1,
+        sy = canvasHeight > bufferHeight ? bufferHeight / canvasHeight : 1;
+      if (sx === 1 && sy === 1) out.set(rect);
+      else {
+        const x0 = Math.round(rect[0] * sx), y0 = Math.round(rect[1] * sy);
+        out[0] = x0; out[1] = y0;
+        out[2] = Math.round((rect[0] + rect[2]) * sx) - x0;
+        out[3] = Math.round((rect[1] + rect[3]) * sy) - y0;
+      }
+      if (viewport) {
+        out[2] = Math.min(out[2], bufferWidth);
+        out[3] = Math.min(out[3], bufferHeight);
+      }
     }
     _resize() {
       this._resetCommandQueue();
@@ -3891,7 +4341,11 @@
       this._viewport[2] = this.drawingBufferWidth;
       this._viewport[3] = this.drawingBufferHeight;
       this._scissor.set(this._viewport);
-      this._surfaceReady = false;
+      this._viewportRequest.set(this._viewport);
+      this._deviceViewport.set(this._viewport);
+      this._deviceScissor.set(this._viewport);
+      this._viewportRevision++; this._scissorRevision++;
+      this._surfaceReady = false; this._frameOpen = false;
       this.clear(constants.COLOR_BUFFER_BIT |
         (this._attributes.depth ? constants.DEPTH_BUFFER_BIT : 0));
     }
@@ -4942,39 +5396,99 @@
       }
       return (this._enabledMask & bit) !== 0;
     }
+    _resetBlendFactors() {
+      this._blendSrc = this._blendSrcAlpha = constants.ONE;
+      this._blendDst = this._blendDstAlpha = constants.ZERO;
+      this._blendSrcWire = constants.ONE; this._blendDstWire = constants.ZERO;
+    }
+    /* The factor word a draw carries (BLEND_FACTORS). The drawing buffer is
+       opaque, so its alpha is 1: DST_ALPHA weighs as ONE, and
+       ONE_MINUS_DST_ALPHA and SRC_ALPHA_SATURATE (min(As, 1 - Ad) for the
+       colour channels) as ZERO. A constant factor is blendColor(), or one
+       minus it, rounded to a byte per channel: a GE fixed colour. */
+    _blendFactorWire(factor) {
+      if (factor === constants.DST_ALPHA) return constants.ONE;
+      if (factor === constants.ONE_MINUS_DST_ALPHA
+          || factor === constants.SRC_ALPHA_SATURATE) return constants.ZERO;
+      if (factor < constants.CONSTANT_COLOR) return factor;
+      const color = this._blendColor,
+        inverse = factor === constants.ONE_MINUS_CONSTANT_COLOR
+          || factor === constants.ONE_MINUS_CONSTANT_ALPHA;
+      let word = BLEND_FIXED;
+      for (let k = 0; k < 3; k++) {
+        const value = factor >= constants.CONSTANT_ALPHA ? color[3] : color[k];
+        word |= Math.round((inverse ? 1 - value : value) * 255) << (8 * k);
+      }
+      return word;
+    }
+    _updateBlendWire() {
+      const source = this._blendFactorWire(this._blendSrc),
+        destination = this._blendFactorWire(this._blendDst);
+      if (source === this._blendSrcWire && destination === this._blendDstWire)
+        return;
+      this._blendSrcWire = source; this._blendDstWire = destination;
+      this._touchRepeatedCommandState();
+    }
     blendFunc(source, destination) {
-      const factors = [constants.ZERO, constants.ONE, constants.SRC_ALPHA,
-        constants.ONE_MINUS_SRC_ALPHA];
-      if (!factors.includes(source) || !factors.includes(destination)) {
-        this._setError(constants.INVALID_ENUM); return;
-      }
-      if (this._blendSrc !== source || this._blendDst !== destination) {
-        this._blendSrc = source; this._blendDst = destination;
-        this._rasterStateKey = this._computeRasterStateKey();
-        this._touchRepeatedCommandState();
-      }
+      this.blendFuncSeparate(source, destination, source, destination);
     }
     blendFuncSeparate(sourceRGB, destinationRGB, sourceAlpha,
                       destinationAlpha) {
-      const factors = [constants.ZERO, constants.ONE, constants.SRC_ALPHA,
-        constants.ONE_MINUS_SRC_ALPHA];
-      if (![sourceRGB, destinationRGB, sourceAlpha, destinationAlpha]
-          .every((factor) => factors.includes(factor))) {
+      /* SRC_ALPHA_SATURATE is a source factor only, as in WebGL 1. The
+         GE's source operand weighs by the drawing buffer's colour and its
+         destination operand by the fragment's (pspgu.h GU_OTHER_COLOR);
+         neither squares a colour, so SRC_COLOR and ONE_MINUS_SRC_COLOR
+         are refused as source colour factors, and DST_COLOR and
+         ONE_MINUS_DST_COLOR as destination ones. */
+      const valid = (factor, source) => BLEND_FACTORS.includes(factor)
+        && (source || factor !== constants.SRC_ALPHA_SATURATE);
+      if (!valid(sourceRGB, true) || !valid(destinationRGB, false)
+          || !valid(sourceAlpha, true) || !valid(destinationAlpha, false)
+          || sourceRGB === constants.SRC_COLOR
+          || sourceRGB === constants.ONE_MINUS_SRC_COLOR
+          || destinationRGB === constants.DST_COLOR
+          || destinationRGB === constants.ONE_MINUS_DST_COLOR) {
         this._setError(constants.INVALID_ENUM); return;
+      }
+      /* WebGL refuses a constant colour factor with a constant alpha one. */
+      const constant = (factor) => factor < constants.CONSTANT_COLOR ? 0
+        : factor < constants.CONSTANT_ALPHA ? 1 : 2;
+      if (constant(sourceRGB) && constant(destinationRGB)
+          && constant(sourceRGB) !== constant(destinationRGB)) {
+        this._setError(constants.INVALID_OPERATION); return;
       }
       /* The PSP GE has one factor pair for all four channels. The drawing
          buffer is opaque (alpha: false), so the alpha factors never reach
-         the screen: the colour factors apply to all four channels, which
-         keeps the common (SRC_ALPHA, ONE_MINUS_SRC_ALPHA, ONE,
-         ONE_MINUS_SRC_ALPHA) transparency shape drawing as WebGL does. */
-      if (this._blendSrc !== sourceRGB || this._blendDst !== destinationRGB) {
-        this._blendSrc = sourceRGB; this._blendDst = destinationRGB;
+         the screen: they are kept and reported, and the colour factors
+         apply to all four channels, which keeps the common (SRC_ALPHA,
+         ONE_MINUS_SRC_ALPHA, ONE, ONE_MINUS_SRC_ALPHA) transparency shape
+         drawing as WebGL does. */
+      this._blendSrcAlpha = sourceAlpha; this._blendDstAlpha = destinationAlpha;
+      this._blendSrc = sourceRGB; this._blendDst = destinationRGB;
+      this._updateBlendWire();
+    }
+    _blendEquationValid(mode) {
+      return mode === constants.FUNC_ADD || mode === constants.FUNC_SUBTRACT
+        || mode === constants.FUNC_REVERSE_SUBTRACT
+        || (this._blendMinmaxExtension !== null
+          && (mode === MIN_EXT || mode === MAX_EXT));
+    }
+    blendEquation(mode) { this.blendEquationSeparate(mode, mode); }
+    blendEquationSeparate(rgb, alpha) {
+      if (!this._blendEquationValid(rgb) || !this._blendEquationValid(alpha)) {
+        this._setError(constants.INVALID_ENUM); return;
+      }
+      /* The GE has one blend equation, and the opaque drawing buffer never
+         shows alpha, so the RGB equation applies to all four channels.
+         FUNC_SUBTRACT and FUNC_REVERSE_SUBTRACT use the blend factors;
+         MIN_EXT and MAX_EXT ignore them, as in WebGL. */
+      this._blendEquationAlpha = alpha;
+      if (this._blendEquation !== rgb) {
+        this._blendEquation = rgb;
         this._rasterStateKey = this._computeRasterStateKey();
         this._touchRepeatedCommandState();
       }
     }
-    blendEquation(mode) { if (mode !== constants.FUNC_ADD) this._setError(constants.INVALID_ENUM); }
-    blendEquationSeparate(rgb, alpha) { if (rgb !== constants.FUNC_ADD || alpha !== constants.FUNC_ADD) this._setError(constants.INVALID_ENUM); }
     depthFunc(value) {
       if (value < constants.NEVER || value > constants.ALWAYS)
         this._setError(constants.INVALID_ENUM);
@@ -5010,12 +5524,14 @@
       if (width < 0 || height < 0) {
         this._setError(constants.INVALID_VALUE); return;
       }
-      width = Math.min(MAX_DRAWING_WIDTH, width);
-      height = Math.min(MAX_DRAWING_HEIGHT, height);
-      if (this._viewport[0] !== x || this._viewport[1] !== y
-          || this._viewport[2] !== width || this._viewport[3] !== height) {
+      const request = this._viewportRequest;
+      if (request[0] !== x || request[1] !== y
+          || request[2] !== width || request[3] !== height) {
+        request[0] = x; request[1] = y; request[2] = width; request[3] = height;
         this._viewport[0] = x; this._viewport[1] = y;
-        this._viewport[2] = width; this._viewport[3] = height;
+        this._viewport[2] = Math.min(MAX_DRAWING_WIDTH, width);
+        this._viewport[3] = Math.min(MAX_DRAWING_HEIGHT, height);
+        this._deviceRect(request, this._deviceViewport, true);
         this._viewportRevision++;
         this._touchRepeatedCommandState();
       }
@@ -5030,6 +5546,7 @@
           || this._scissor[2] !== width || this._scissor[3] !== height) {
         this._scissor[0] = x; this._scissor[1] = y;
         this._scissor[2] = width; this._scissor[3] = height;
+        this._deviceRect(this._scissor, this._deviceScissor, false);
         this._scissorRevision++;
         this._touchRepeatedCommandState();
       }
@@ -5050,10 +5567,14 @@
     stencilMaskSeparate(face, mask) { this._stencilMask = toWebGLInt32(mask); }
     stencilFunc() {} stencilFuncSeparate() {} stencilOp() {} stencilOpSeparate() {}
     clearStencil(value) { this._clearStencil = toWebGLInt32(value); }
-    /* Constant blend factors are refused by blendFunc, so the constant
-       colour is never read. */
+    /* Clamped to [0, 1], as in WebGL 1; constant factors read it. */
     blendColor(red, green, blue, alpha) {
-      this._blendColor = [red, green, blue, alpha].map(Number);
+      const values = [red, green, blue, alpha];
+      for (let k = 0; k < 4; k++) {
+        const value = Number(values[k]);
+        this._blendColor[k] = value > 0 ? (value < 1 ? value : 1) : 0;
+      }
+      this._updateBlendWire();
     }
     depthRange(near, far) {
       near = Math.min(1, Math.max(0, Number(near)));
@@ -5348,7 +5869,7 @@
           if (lighting.probe) {
             /* band 0 of the irradiance probe, over three's PI convention */
             const v = values.get(lighting.probe);
-            for (let k = 0; k < 3; k++) ambient[k] += v[k] * 0.886227 / Math.PI;
+            for (let k = 0; v && k < 3; k++) ambient[k] += v[k] * 0.886227 / Math.PI;
           }
           let lights = 0;
           for (const light of lighting.lights) {
@@ -5503,6 +6024,65 @@
       }
       this._flushHasMaterial = true;
     }
+    /* Reports a draw the PSP cannot make once per program, mode and
+       reason on the console; the caller sets the WebGL error. */
+    _reportDrawLimit(program, mode, reason, text, advice) {
+      const reported = program._drawLimitReports ||= new Set(),
+        key = reason + mode;
+      if (reported.has(key)) return;
+      reported.add(key);
+      globalThis.console?.warn?.("WebGL program " + program._id + ": "
+        + text + ", so it is not drawn; " + advice);
+    }
+    /* A draw over one submission's vertex budget is queued as several
+       draws, in the order one draw rasterizes its primitives, so ordering,
+       depth and blending are those of the single draw. Each part is a
+       whole number of primitives: TRIANGLES split on multiples of 3, LINES
+       on 2, POINTS on 1; strips overlap their neighbour by the shared
+       vertices (one for LINE_STRIP, two from an even start for
+       TRIANGLE_STRIP, keeping the winding). Indexed draws split by index
+       range and read the same vertices. Instanced draws split by instance
+       range (per-instance attributes start at the part's first instance),
+       or draw each instance in vertex parts when one instance is over the
+       budget. Parts that do not fit in the current batch flush it, as any
+       draw would. The parts are planned once per draw plan. */
+    _enqueueSplitDraw(mode, first, count, index, position, color, texcoord,
+                      texture, instanceCount, instanceMatrix, instanceColor,
+                      instanceTransform, matrix, uniformColor, plan,
+                      material, normal, partLimit) {
+      if (this._repeatedCommandCapture)
+        this._repeatedCommandCapture.failed = true;
+      if (plan.splitInstances !== instanceCount
+          || plan.splitLimit !== partLimit) {
+        plan.splitParts = splitDrawParts(plan, mode, first, count,
+          index, instanceCount, instanceMatrix, instanceColor,
+          instanceTransform, partLimit);
+        plan.splitInstances = instanceCount;
+        plan.splitLimit = partLimit;
+      }
+      const parts = plan.splitParts;
+      for (let at = 0; at < parts.length; at++) {
+        const part = parts[at];
+        let partIndex = null;
+        if (index) {
+          partIndex = part.index;
+          partIndex.data = index.data; partIndex.id = index.id;
+          partIndex.generation = index.generation;
+          partIndex.usage = index.usage; partIndex.type = index.type;
+          partIndex.maximum = index.maximum;
+          partIndex.offset = index.offset
+            + part.start * typeBytes(index.type);
+        }
+        if (!this._enqueueDraw(mode, part.first, part.count, partIndex,
+            position, color, texcoord, texture, part.instances,
+            part.instanceMatrix, part.instanceColor, part.instanceTransform,
+            matrix, uniformColor, null, part.count * part.instances,
+            part.plan, material, normal)) return false;
+      }
+      diagnostics.splitDraws++;
+      diagnostics.splitParts += parts.length;
+      return true;
+    }
     _draw(mode, first, count, index = null, instanceCount = 1) {
       const profile = diagnostics.profileDrawPhases;
       let profileAt = profile ? performance.now() : 0;
@@ -5516,17 +6096,40 @@
       }
       if (!Number.isInteger(instanceCount) || instanceCount < 0
           || instanceCount > MAX_INSTANCES) {
+        if (Number.isInteger(instanceCount) && count)
+          this._reportDrawLimit(this._program, mode, "instances", "a draw of "
+            + instanceCount + " instances is over the PSP limit of "
+            + MAX_INSTANCES + " instances per draw", "draw at most "
+            + MAX_INSTANCES + " instances at a time");
         this._setError(instanceCount > MAX_INSTANCES
           ? constants.OUT_OF_MEMORY : constants.INVALID_VALUE); return;
       }
       if (!count || !instanceCount) return;
-      if (count > MAX_VERTICES
-          || instanceCount > Math.floor(MAX_VERTICES / count)) {
-        this._setError(constants.OUT_OF_MEMORY); return;
-      }
       const program = this._program,
         translation = program._translation,
-        vertexState = this._vertexArray?._state
+        shadingSteps = translation.material?.program?.steps || 0,
+        /* One native submission holds MAX_VERTICES expanded vertices, and
+           a per-vertex shaded draw MATERIAL_PROGRAM_STEP_LIMIT steps. A
+           larger draw is queued in parts (_enqueueSplitDraw). */
+        partLimit = shadingSteps ? Math.min(MAX_VERTICES,
+          Math.floor(MATERIAL_PROGRAM_STEP_LIMIT / shadingSteps))
+          : MAX_VERTICES,
+        split = count * instanceCount > partLimit;
+      if (split && count > partLimit && (mode === constants.LINE_LOOP
+          || mode === constants.TRIANGLE_FAN)) {
+        const loop = mode === constants.LINE_LOOP;
+        this._reportDrawLimit(program, mode, "split", "a "
+          + DRAW_MODE_NAMES[mode] + " draw of " + count + " vertices is over"
+          + " the PSP limit of " + partLimit + " vertices per submission"
+          + (partLimit < MAX_VERTICES ? " for this program's " + shadingSteps
+            + "-step per-vertex shading" : "")
+          + ", and a " + (loop ? "loop" : "fan")
+          + " cannot be split into parts exactly", "draw "
+          + (loop ? "LINE_STRIP or loops" : "TRIANGLES or fans")
+          + " of at most " + partLimit + " vertices");
+        this._setError(constants.OUT_OF_MEMORY); return;
+      }
+      const vertexState = this._vertexArray?._state
           || this._defaultVertexArrayState,
         previousPlan = vertexState.drawPlan;
       let cachedPlan = previousPlan;
@@ -5667,22 +6270,6 @@
         textureSnapshot = selectedTexture._commandSnapshot;
       }
       let material = null;
-      const vertexProgram = translation.material?.program;
-      if (vertexProgram
-          && count * instanceCount * vertexProgram.steps
-            > MATERIAL_PROGRAM_STEP_LIMIT) {
-        /* Per-vertex shading is bounded per draw; refuse past it, once
-           reported on the console per program. */
-        if (!program._programLimitReported) {
-          program._programLimitReported = true;
-          globalThis.console?.warn?.("WebGL program " + program._id
-            + ": a draw of " + count * instanceCount + " vertices needs "
-            + count * instanceCount * vertexProgram.steps
-            + " per-vertex shading steps; the PSP limit is "
-            + MATERIAL_PROGRAM_STEP_LIMIT + " per draw, so it is not drawn");
-        }
-        this._setError(constants.OUT_OF_MEMORY); return;
-      }
       if (translation.material) {
         material = this._prepareMaterial(program, translation.material);
         if (!material) { this._setError(constants.INVALID_OPERATION); return; }
@@ -5701,11 +6288,16 @@
         diagnostics.profilePrepareMs += now - profileAt;
         profileAt = now;
       }
-      if (!this._enqueueDraw(
-          mode, first, count, index, position, color, texcoord,
-          textureSnapshot, instanceCount, instanceMatrix, instanceColor,
-          instanceTransform, program._combinedMatrix, uniformColor,
-          null, count * instanceCount, cachedPlan, material, normal)) return;
+      if (split ? !this._enqueueSplitDraw(
+            mode, first, count, index, position, color, texcoord,
+            textureSnapshot, instanceCount, instanceMatrix, instanceColor,
+            instanceTransform, program._combinedMatrix, uniformColor,
+            cachedPlan, material, normal, partLimit)
+          : !this._enqueueDraw(
+            mode, first, count, index, position, color, texcoord,
+            textureSnapshot, instanceCount, instanceMatrix, instanceColor,
+            instanceTransform, program._combinedMatrix, uniformColor,
+            null, count * instanceCount, cachedPlan, material, normal)) return;
       if (profile) {
         const now = performance.now();
         diagnostics.profileEnqueueMs += now - profileAt;
@@ -5742,9 +6334,6 @@
         this._setError(constants.INVALID_OPERATION); return;
       }
       if (!count) return;
-      if (count > MAX_VERTICES) {
-        this._setError(constants.OUT_OF_MEMORY); return;
-      }
       let maximum = this._elementBuffer._indexMaximum;
       if (this._elementBuffer._indexType !== type
           || this._elementBuffer._indexOffset !== offset
@@ -5826,6 +6415,11 @@
         [constants.DEPTH_FUNC]: this._depthFunc,
         [constants.BLEND_SRC_RGB]: this._blendSrc,
         [constants.BLEND_DST_RGB]: this._blendDst,
+        [constants.BLEND_SRC_ALPHA]: this._blendSrcAlpha,
+        [constants.BLEND_DST_ALPHA]: this._blendDstAlpha,
+        [constants.BLEND_COLOR]: new Float32Array(this._blendColor),
+        [constants.BLEND_EQUATION_RGB]: this._blendEquation,
+        [constants.BLEND_EQUATION_ALPHA]: this._blendEquationAlpha,
         [constants.CULL_FACE_MODE]: this._cullFace,
         [constants.FRONT_FACE]: this._frontFace,
         [constants.LINE_WIDTH]: this._lineWidth,
@@ -5842,8 +6436,8 @@
     }
     getShaderPrecisionFormat() { return new WebGLShaderPrecisionFormat(127, 127, 23); }
     getSupportedExtensions() {
-      return ["ANGLE_instanced_arrays", "OES_vertex_array_object",
-        "TILEFINCH_repeated_frame_commands"];
+      return ["ANGLE_instanced_arrays", "EXT_blend_minmax",
+        "OES_vertex_array_object", "TILEFINCH_repeated_frame_commands"];
     }
     getExtension(name) {
       name = String(name).toLowerCase();
@@ -5852,6 +6446,8 @@
           this._instancedExtension = new AngleInstancedArrays(this);
         return this._instancedExtension;
       }
+      if (name === "ext_blend_minmax")
+        return this._blendMinmaxExtension ||= new ExtBlendMinmax();
       if (name === "oes_vertex_array_object") {
         if (!this._vertexArrayExtension)
           this._vertexArrayExtension = new OesVertexArrayObject(this);
@@ -5918,7 +6514,7 @@
     Object.defineProperty(WebGLRenderingContext.prototype, name,
       { configurable: false, enumerable: true, value, writable: false });
 
-  globalThis.__tilefinchCreateWebGLContext = (canvas, attributes) => {
+  publish("__tilefinchCreateWebGLContext", (canvas, attributes) => {
     let context = contextForCanvas(canvas);
     if (context) return context;
     if (activeContexts().length >= MAX_CONTEXTS) return null;
@@ -5929,13 +6525,17 @@
     liveContexts.push(typeof WeakRef === "function" ? new WeakRef(context) : context);
     context._resize();
     diagnostics.contexts++; return context;
-  };
-  globalThis.__tilefinchWebGLResize = (canvas) => contextForCanvas(canvas)?._resize();
-  globalThis.__tilefinchWebGLConnected = (canvas) => contextForCanvas(canvas)?._schedule();
-  globalThis.__tilefinchFlushWebGLSurfaces = () => {
-    for (const context of activeContexts()) context._flush();
-  };
-  globalThis.__tilefinchWebGLReadback = (canvas) => {
+  });
+  publish("__tilefinchWebGLResize", (canvas) => contextForCanvas(canvas)?._resize());
+  publish("__tilefinchWebGLConnected", (canvas) => contextForCanvas(canvas)?._schedule());
+  /* Also runs inside a task (a relayout a script's geometry read starts
+     adopts the image table), where the frame is unfinished until the
+     task's own flush. */
+  publish("__tilefinchFlushWebGLSurfaces", () => {
+    for (const context of activeContexts())
+      context._flush(!context._flushQueued);
+  });
+  publish("__tilefinchWebGLReadback", (canvas) => {
     const context = contextForCanvas(canvas);
     if (!context || context._lost) return null;
     if (context._flush() !== FLUSH_OK) return null;
@@ -5943,11 +6543,11 @@
     return snapshot ? { width: Number(snapshot.width), height: Number(snapshot.height),
       pixels: new Uint8ClampedArray(snapshot.pixels), originClean: true,
       surfaceUnavailable: false } : null;
-  };
+  });
   Object.assign(globalThis, { WebGLRenderingContext, WebGLBuffer, WebGLTexture,
     WebGLShader, WebGLProgram, WebGLUniformLocation, WebGLActiveInfo,
     WebGLShaderPrecisionFormat, WebGLFramebuffer, WebGLRenderbuffer,
     WebGLVertexArrayOES });
-  Object.defineProperty(globalThis, "__tilefinchWebGLDiagnostics",
-    { value: diagnostics, configurable: false, enumerable: false });
+  defineProperty(globalThis, "__tilefinchWebGLDiagnostics",
+    { __proto__: null, value: diagnostics, configurable: false, enumerable: false });
 })();

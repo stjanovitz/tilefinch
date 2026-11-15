@@ -1114,10 +1114,12 @@ typedef struct {
     uint32_t queue_position;
     char queue_titles[6][128];
     char queue_error[160];
-    /* The stream title in display order, and what it was prepared from. */
+    /* The stream title in display order, and what it was prepared from;
+       a right-to-left title is set against the bar's right edge. */
     char shown_title[PSP_UI_MEDIA_TITLE_CAPACITY];
     uint32_t shown_title_hash;
     uint64_t shown_title_glyphs;
+    bool shown_title_right_to_left;
     /* Audio-only media (PspUiMediaState.audio_only): the station's own
        description (an ICY genre), where the audio comes from (host and
        port), and whether it arrives over plain HTTP. Author/network text,
@@ -1555,6 +1557,17 @@ void psp_ui_set_site_storage(PspUiState *ui,
                              const PspUiSiteStorageView *view);
 /* "812 KB", "1.4 MB", "3.2 GB". */
 void psp_ui_format_bytes(char *out, size_t capacity, uint64_t bytes);
+/* One line of chrome text joined from pieces in reading order: catalog
+   strings (already in display order), numbers with their units, versions
+   and hosts, and the spaces and punctuation between them. When the
+   interface language reads right to left the line starts at the right, so
+   the pieces are laid from the right, each kept whole, and a piece made only
+   of spaces and punctuation is turned around with its brackets mirrored;
+   otherwise the pieces are concatenated. NULL pieces are skipped; the line
+   is cut at a character boundary to fit capacity. Returns output. */
+const char *psp_ui_join_reading_order(char *output, size_t capacity,
+                                      const char *const *pieces,
+                                      size_t count);
 /* A site's host, "host:port" or "scheme://host[:port]" as the chrome stores
    it in a bounded field: anything after the host is dropped, and a host too
    long for capacity gives way at its start with a leading "...", never at
@@ -1726,7 +1739,10 @@ bool psp_ui_visual_text(Budget *budget, const char *text, int maximum_width,
 const char *psp_ui_media_shown_title(PspUiMediaState *media, Budget *budget,
                                      const char *source);
 /* Rewrites a menu row's text (a track label, chapter or queue title) in display
-   order, once, when it is set. Up to 128 bytes of capacity. */
+   order, once, when it is set. Up to 128 bytes of capacity. A row that reads
+   right to left starts with U+200F (RIGHT-TO-LEFT MARK), which the painter
+   takes off; the row is cut to its width when drawn, not here, so a language
+   pack attached later fits it again. */
 void psp_ui_media_prepare_row_text(PspUiMediaState *media, Budget *budget,
                                    char *text, size_t capacity);
 void psp_ui_media_set_subtitle_bidi(PspUiMediaState *media, Budget *budget,

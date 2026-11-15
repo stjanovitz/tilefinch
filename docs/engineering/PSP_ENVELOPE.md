@@ -273,6 +273,15 @@ Do not retry routing the inline-SVG viewBox and NanoSVG integer scans through
 `strtof`/`siscanf` to drop the floating scanner: the SDK's
 `__getTlsStructFromThread` still calls `sscanf`, so both scanner engines stay.
 
+The PSP FPU is single precision, so NanoSVG's double arithmetic runs in
+software. Its local patches read a number of at most 18 digits with a small
+exponent as one integer scaled by one float (or, when that is not exact,
+one double) operation instead of two `pow()` calls, and keep the
+rasterizer's per-edge fixed-point limit in integers. The result is the same
+float, so pixels are unchanged; `tests/test_svg_raster_parity.c` checks
+repository fixtures against recorded goldens and can diff a local corpus
+(`--record`, `--compare`).
+
 The PSP link gate reads the final ELF with PSP binutils:
 
 - total `.text` has separate ordinary and validation limits, set in

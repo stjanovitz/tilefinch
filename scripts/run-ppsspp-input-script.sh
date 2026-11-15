@@ -714,9 +714,13 @@ run_once() {
     done
     cp "$run_dir/script.ini" "$run_result/ppsspp-requested.ini"
     # Mark samples, and the full-resolution final frame dump_frame=1 asks for.
+    # A component-stage run's slot module writes its final frame beside
+    # itself, in slot-a/.
     for f in "$app_dir"/frame-mark-*.ppm "$app_dir"/data/frame-mark-*.ppm \
              "$app_dir"/frame-device-final.ppm \
-             "$app_dir"/data/frame-device-final.ppm; do
+             "$app_dir"/data/frame-device-final.ppm \
+             "$app_dir"/slot-a/frame-mark-*.ppm \
+             "$app_dir"/slot-a/frame-device-final.ppm; do
         [ -f "$f" ] && cp "$f" "$run_result/" 2>/dev/null || true
     done
     # An engine-PGO training build (PSP_BROWSER_QUICKJS_PGO_GENERATE) writes

@@ -248,6 +248,10 @@ void js_rt_bridge_node_table_free(DomBridge *bridge)
     bridge->mutations_unrecorded = false;
     budget_free(bridge->budget, bridge->nodes);
     budget_free(bridge->budget, bridge->node_index);
+    budget_free(bridge->budget, bridge->whole_document_written);
+    bridge->whole_document_written = NULL;
+    bridge->whole_document_written_length = 0;
+    bridge->whole_document_writer = NULL;
     /* Teardown frees the document, deferred subtrees with it. */
     budget_free(bridge->budget, bridge->deferred_discards);
     bridge->deferred_discards = NULL;

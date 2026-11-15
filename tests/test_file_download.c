@@ -2,6 +2,7 @@
 #include "tilefinch/psp_offline_store.h"
 #include "tilefinch/sha256.h"
 #include "tilefinch/platform.h"
+#include "tilefinch/text_encoding.h"
 
 #include "supervisor_view_probe.h"
 
@@ -759,6 +760,257 @@ static bool live_source_journey(const char *directory, const char *page_url,
     return live_download(directory, download_url, expected, NULL);
 }
 
+/* Byte length of a well-formed UTF-8 string, 0 when it is not. */
+static size_t utf8_checked_length(const char *text)
+{
+    size_t length = strlen(text);
+    return tilefinch_utf8_valid((const unsigned char *) text, length) ? length : 0;
+}
+
+static bool ends_with(const char *text, const char *suffix)
+{
+    size_t length = strlen(text), tail = strlen(suffix);
+    return length >= tail && !strcmp(text + length - tail, suffix);
+}
+
+static bool display_and_stored(const char *header, const char *title,
+                               const char *stored)
+{
+    char name[FILE_DOWNLOAD_FILENAME_LIMIT], disk[FILE_DOWNLOAD_FILENAME_LIMIT];
+    CHECK(file_download_filename(URL, header, name));
+    if (strcmp(name, title) != 0) fprintf(stderr, "title \"%s\" != \"%s\"\n", name, title);
+    CHECK(!strcmp(name, title) && file_download_filename_valid(name));
+    CHECK(file_download_stored_name(name, disk));
+    if (strcmp(disk, stored) != 0) fprintf(stderr, "stored \"%s\" != \"%s\"\n", disk, stored);
+    CHECK(!strcmp(disk, stored) && file_download_stored_name_valid(disk));
+    return true;
+}
+
+/* A long name keeps its extension, is well-formed UTF-8 and fits; so does
+   its Memory Stick name. */
+static bool long_name(const char *header, const char *extension, char title[FILE_DOWNLOAD_FILENAME_LIMIT])
+{
+    char disk[FILE_DOWNLOAD_FILENAME_LIMIT];
+    CHECK(file_download_filename(URL, header, title));
+    if (!file_download_filename_valid(title) || !ends_with(title, extension)) fprintf(stderr, "long \"%s\" %zu valid=%d\n", title, strlen(title), file_download_filename_valid(title));
+    CHECK(file_download_filename_valid(title) && ends_with(title, extension));
+    CHECK(utf8_checked_length(title) > 100u && strlen(title) < FILE_DOWNLOAD_FILENAME_LIMIT);
+    CHECK(file_download_stored_name(title, disk) && ends_with(disk, extension)
+          && file_download_stored_name_valid(disk));
+    return true;
+}
+
+static bool display_names(const char *directory)
+{
+    /* Arabic, Hebrew, CJK and emoji names keep their characters as the
+       title; the Memory Stick name is printable ASCII. */
+    CHECK(display_and_stored(
+        "attachment; filename*=UTF-8''%D8%B5%D9%88%D8%B1%D8%A9%20%D8%A7%D9%84%D8%B4%D9%85%D8%B3.jpg",
+        "\xd8\xb5\xd9\x88\xd8\xb1\xd8\xa9 \xd8\xa7\xd9\x84\xd8\xb4\xd9\x85\xd8\xb3.jpg",
+        "%D8%B5%D9%88%D8%B1%D8%A9 %D8%A7%D9%84%D8%B4%D9%85%D8%B3.jpg"));
+    CHECK(display_and_stored("attachment; filename*=utf-8'he'%D7%A7%D7%95%D7%91%D7%A5.pdf",
+        "\xd7\xa7\xd7\x95\xd7\x91\xd7\xa5.pdf", "%D7%A7%D7%95%D7%91%D7%A5.pdf"));
+    CHECK(display_and_stored(
+        "attachment; filename*=UTF-8''%E6%97%A5%E6%9C%AC%E8%AA%9E.zip",
+        "\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e.zip", "%E6%97%A5%E6%9C%AC%E8%AA%9E.zip"));
+    /* An emoji and a joined family stay whole. */
+    CHECK(display_and_stored(
+        "attachment; filename*=UTF-8''%F0%9F%8E%AE%20game%20%F0%9F%91%A8%E2%80%8D%F0%9F%91%A9%E2%80%8D%F0%9F%91%A7.png",
+        "\xf0\x9f\x8e\xae game \xf0\x9f\x91\xa8\xe2\x80\x8d\xf0\x9f\x91\xa9\xe2\x80\x8d\xf0\x9f\x91\xa7.png",
+        "%F0%9F%8E%AE game %F0%9F%91%A8%E2%80%8D%F0%9F%91%A9%E2%80%8D%F0%9F%91%A7.png"));
+    /* A raw UTF-8 filename= (common, though not RFC 6266) is kept too. */
+    CHECK(display_and_stored("attachment; filename=\"\xd7\xa7\xd7\x95\xd7\x91\xd7\xa5.txt\"",
+        "\xd7\xa7\xd7\x95\xd7\x91\xd7\xa5.txt", "%D7%A7%D7%95%D7%91%D7%A5.txt"));
+
+    /* NFD (as macOS servers name files) becomes NFC: one title, and one
+       Memory Stick name, for both spellings; Hangul jamo compose too. */
+    CHECK(display_and_stored("attachment; filename*=UTF-8''Cafe%CC%81.txt",
+        "Caf\xc3\xa9.txt", "Caf%C3%A9.txt"));
+    CHECK(display_and_stored("attachment; filename*=UTF-8''Caf%C3%A9.txt",
+        "Caf\xc3\xa9.txt", "Caf%C3%A9.txt"));
+    CHECK(display_and_stored("attachment; filename*=UTF-8''%E1%84%92%E1%85%A1%E1%86%AB.zip",
+        "\xed\x95\x9c.zip", "%ED%95%9C.zip"));
+    /* A mark with no precomposed form stays after its letter. */
+    CHECK(display_and_stored("attachment; filename*=UTF-8''%D8%A8%D9%91.zip",
+        "\xd8\xa8\xd9\x91.zip", "%D8%A8%D9%91.zip"));
+
+    /* Traversal, controls, reserved and invisible characters. */
+    CHECK(display_and_stored("attachment; filename*=UTF-8''..%2F..%2F%D8%B5.zip",
+        "\xd8\xb5.zip", "%D8%B5.zip"));
+    CHECK(display_and_stored("attachment; filename=\"..\\\\..\\\\%D8%B5.zip\"",
+        "%D8%B5.zip", "%D8%B5.zip"));
+    CHECK(display_and_stored("attachment; filename*=UTF-8''%C0%AF%C0%AE.zip", "____.zip", "____.zip"));
+    CHECK(display_and_stored("attachment; filename*=UTF-8''a%01b%C2%85c.zip", "a_b_c.zip", "a_b_c.zip"));
+    /* A right-to-left override would draw "invoice[U+202E]gpj.exe" as
+       "invoiceexe.jpg". */
+    CHECK(display_and_stored("attachment; filename*=UTF-8''invoice%E2%80%AEgpj.exe",
+        "invoice_gpj.exe", "invoice_gpj.exe"));
+    CHECK(display_and_stored("attachment; filename*=UTF-8''a%E2%81%A6b%E2%80%8Fc%EF%BB%BF.zip",
+        "a_b_c_.zip", "a_b_c_.zip"));
+    /* A fullwidth solidus is a character, never a separator on disk. */
+    CHECK(display_and_stored("attachment; filename*=UTF-8''a%EF%BC%8Fb.zip",
+        "a\xef\xbc\x8f" "b.zip", "a%EF%BC%8Fb.zip"));
+    /* Bytes that are not UTF-8 (a Latin-1 name) each become '_'. */
+    CHECK(display_and_stored("attachment; filename=\"caf\xe9.zip\"", "caf_.zip", "caf_.zip"));
+    CHECK(display_and_stored("attachment; filename*=UTF-8''CON.zip", "_ON.zip", "_ON.zip"));
+    CHECK(display_and_stored("attachment; filename*=UTF-8''%D8%B5%D9%88%D8%B1%D8%A9.", "\xd8\xb5\xd9\x88\xd8\xb1\xd8\xa9",
+        "%D8%B5%D9%88%D8%B1%D8%A9"));
+    CHECK(!file_download_filename_valid("a\xe2\x80\xae" "b.zip"));
+    CHECK(!file_download_filename_valid("caf\xe9.zip"));
+    CHECK(!file_download_filename_valid("Cafe\xcc\x81.txt")); /* NFD */
+    CHECK(!file_download_stored_name_valid("\xd8\xb5.zip")
+          && !file_download_stored_name_valid("a/b.zip")
+          && !file_download_stored_name_valid("..")
+          && file_download_stored_name_valid("%D8%B5.zip"));
+
+    /* Over-long names keep their extension and are cut between whole
+       characters: never inside a letter, between a letter and its mark,
+       inside a joined emoji or between a flag's two letters. */
+    char header[1400], title[FILE_DOWNLOAD_FILENAME_LIMIT];
+    size_t used = (size_t) snprintf(header, sizeof(header), "attachment; filename*=UTF-8''");
+    for (unsigned i = 0; i < 100; i++) used += (size_t) snprintf(header + used, sizeof(header) - used, "%%D8%%B5");
+    snprintf(header + used, sizeof(header) - used, ".zip");
+    CHECK(long_name(header, ".zip", title) && strlen(title) == 2u * 61u + 4u);
+    used = (size_t) snprintf(header, sizeof(header), "attachment; filename*=UTF-8''");
+    for (unsigned i = 0; i < 40; i++) used += (size_t) snprintf(header + used, sizeof(header) - used, "%%D8%%A8%%D9%%91");
+    snprintf(header + used, sizeof(header) - used, ".pdf");
+    CHECK(long_name(header, ".pdf", title));
+    CHECK(ends_with(title, "\xd8\xa8\xd9\x91.pdf") && strlen(title) == 4u * 30u + 4u);
+    used = (size_t) snprintf(header, sizeof(header), "attachment; filename*=UTF-8''x");
+    for (unsigned i = 0; i < 15; i++)
+        used += (size_t) snprintf(header + used, sizeof(header) - used,
+            "%%F0%%9F%%91%%A8%%E2%%80%%8D%%F0%%9F%%91%%A9%%E2%%80%%8D%%F0%%9F%%91%%A7");
+    snprintf(header + used, sizeof(header) - used, ".png");
+    CHECK(long_name(header, ".png", title));
+    CHECK(ends_with(title, "\xf0\x9f\x91\xa7.png") && (strlen(title) - 5u) % 18u == 0);
+    used = (size_t) snprintf(header, sizeof(header), "attachment; filename*=UTF-8''wxyz");
+    for (unsigned i = 0; i < 20; i++)
+        used += (size_t) snprintf(header + used, sizeof(header) - used, "%%F0%%9F%%87%%AF%%F0%%9F%%87%%B5");
+    snprintf(header + used, sizeof(header) - used, ".gif");
+    CHECK(long_name(header, ".gif", title) && strlen(title) == 4u + 8u * 14u + 4u);
+    /* A name with no extension of ASCII letters is cut as a whole. */
+    used = (size_t) snprintf(header, sizeof(header), "attachment; filename*=UTF-8''");
+    for (unsigned i = 0; i < 100; i++) used += (size_t) snprintf(header + used, sizeof(header) - used, "%%E6%%97%%A5");
+    CHECK(file_download_filename(URL, header, title) && file_download_filename_valid(title)
+          && strlen(title) == 3u * 42u);
+    char disk[FILE_DOWNLOAD_FILENAME_LIMIT];
+    CHECK(file_download_stored_name(title, disk) && strlen(disk) == 9u * 14u);
+    /* The Memory Stick name of a long title is cut between whole
+       characters, before its kept extension. */
+    used = (size_t) snprintf(header, sizeof(header), "attachment; filename*=UTF-8''");
+    for (unsigned i = 0; i < 60; i++) used += (size_t) snprintf(header + used, sizeof(header) - used, "%%D8%%B5");
+    snprintf(header + used, sizeof(header) - used, ".jpeg");
+    CHECK(long_name(header, ".jpeg", title));
+    CHECK(file_download_stored_name(title, disk) && !strcmp(disk + 6u * 20u, ".jpeg"));
+
+    /* Old saved names are printable ASCII, and each is its own Memory
+       Stick name, so files saved before this scheme are found where they
+       are. */
+    static const char *const old[] = {"homebrew.zip", "____ ____.jpg",
+        "a;b.zip", "_ON.zip", "100%.zip", "x.tar.gz", "a..zip", "download.bin"};
+    for (size_t i = 0; i < sizeof(old) / sizeof(old[0]); i++)
+        CHECK(file_download_filename_valid(old[i]) && file_download_stored_name(old[i], disk)
+              && !strcmp(disk, old[i]));
+
+    /* The library: titles round-trip through the index, and paths use the
+       Memory Stick name. Two files with one name get two IDs, so two
+       paths; publishing never overwrites. */
+    Budget budget; budget_init(&budget, 2u * 1024u * 1024u);
+    char root[512]; snprintf(root, sizeof(root), "%s/names", directory);
+    CHECK(mkdir(root, 0700) == 0);
+    OfflineLibrary library; offline_library_init(&library, &budget, root);
+    CHECK(offline_library_load(&library));
+    char error[128] = {0}; uint32_t first = 0, second = 0, legacy = 0;
+    static const char arabic[] = "\xd8\xb5\xd9\x88\xd8\xb1\xd8\xa9.jpg";
+    CHECK(file_download_enqueue(&library, "https://files.test/%D8%B5%D9%88%D8%B1%D8%A9.jpg", NULL,
+                                &first, error, sizeof(error)));
+    CHECK(file_download_enqueue(&library, URL, arabic, &second, error, sizeof(error)));
+    CHECK(file_download_enqueue(&library, URL, "____.jpg", &legacy, error, sizeof(error)));
+    CHECK(!strcmp(offline_library_find(&library, first)->title, arabic)
+          && !strcmp(offline_library_find(&library, second)->title, arabic));
+    char path[3][FILE_DOWNLOAD_PATH_LIMIT], expected[FILE_DOWNLOAD_PATH_LIMIT];
+    const uint32_t ids[3] = {first, second, legacy};
+    for (size_t i = 0; i < 3; i++) {
+        OfflineLibraryItem *item = offline_library_find_mutable(&library, ids[i]);
+        item->state = OFFLINE_ITEM_READY;
+        item->content_bytes = 3;
+        CHECK(file_download_path(&library, ids[i], path[i], sizeof(path[i])));
+        FILE *file = fopen(path[i], "wb");
+        CHECK(file != NULL && fputs("abc", file) >= 0 && fclose(file) == 0);
+    }
+    snprintf(expected, sizeof(expected), "%s/%08x-%%D8%%B5%%D9%%88%%D8%%B1%%D8%%A9.jpg", root, (unsigned) first);
+    CHECK(!strcmp(path[0], expected) && strcmp(path[0], path[1]) != 0);
+    snprintf(expected, sizeof(expected), "%s/%08x-____.jpg", root, (unsigned) legacy);
+    CHECK(!strcmp(path[2], expected));
+    CHECK(offline_library_save(&library));
+    /* A file title that is not printable ASCII writes index version 7,
+       which a release reading at most version 6 leaves alone rather than
+       look for the file under its title. */
+    unsigned char header_bytes[12] = {0};
+    snprintf(expected, sizeof(expected), "%s/library.bin", root);
+    FILE *index = fopen(expected, "rb");
+    CHECK(index != NULL && fread(header_bytes, 1, sizeof(header_bytes), index) == sizeof(header_bytes)
+          && fclose(index) == 0 && header_bytes[8] == 7u);
+    OfflineLibrary reread; offline_library_init(&reread, &budget, root);
+    CHECK(offline_library_load(&reread) && reread.count == 3);
+    CHECK(!strcmp(offline_library_find(&reread, first)->title, arabic)
+          && offline_library_find(&reread, first)->state == OFFLINE_ITEM_READY
+          && offline_library_find(&reread, legacy)->state == OFFLINE_ITEM_READY);
+    /* The saved-file page and Downloads show the title, and the page also
+       the path a USB copy finds. */
+    char *html = NULL; size_t length = 0;
+    CHECK(offline_library_build_file_page(&reread, &budget, first, &html, &length));
+    CHECK(strstr(html, "<p dir=auto>\xd8\xb5\xd9\x88\xd8\xb1\xd8\xa9.jpg</p>") != NULL
+          && strstr(html, "-%D8%B5%D9%88%D8%B1%D8%A9.jpg</p>") != NULL);
+    budget_free(&budget, html);
+    CHECK(offline_library_build_page(&reread, &budget, &html, &length));
+    CHECK(strstr(html, "<strong>\xd8\xb5\xd9\x88\xd8\xb1\xd8\xa9.jpg</strong>") != NULL);
+    budget_free(&budget, html);
+    /* Delete removes the file under its Memory Stick name. */
+    CHECK(offline_library_remove(&reread, first) && access(path[0], F_OK) != 0
+          && access(path[1], F_OK) == 0);
+    CHECK(offline_library_remove(&reread, second) && offline_library_remove(&reread, legacy)
+          && access(path[1], F_OK) != 0 && access(path[2], F_OK) != 0);
+    /* With only ASCII titles left, the index is version 6 again. */
+    CHECK(file_download_enqueue(&reread, URL, NULL, &legacy, error, sizeof(error)));
+    index = fopen(expected, "rb");
+    CHECK(index != NULL && fread(header_bytes, 1, sizeof(header_bytes), index) == sizeof(header_bytes)
+          && fclose(index) == 0 && header_bytes[8] == 6u);
+    CHECK(offline_library_remove(&reread, legacy));
+    clean(root);
+    return true;
+}
+
+/* A download whose response names it in Arabic is published under the
+   percent-encoded name and keeps the Arabic title. */
+static bool arabic_transfer(const char *directory, const char *corpus)
+{
+    Budget budget; budget_init(&budget, 2u * 1024u * 1024u);
+    BrowserSession session; CHECK(browser_session_init(&session, &budget, 65536));
+    char root[512]; snprintf(root, sizeof(root), "%s/arabic", directory);
+    CHECK(mkdir(root, 0700) == 0);
+    OfflineLibrary library; offline_library_init(&library, &budget, root);
+    CHECK(offline_library_load(&library));
+    OfflineDownloadManager manager;
+    offline_download_manager_init(&manager, &budget, &session, &library);
+    char error[128] = {0}; uint32_t id = 0;
+    CHECK(file_download_enqueue(&library, URL, NULL, &id, error, sizeof(error)));
+    CHECK(trace(corpus, 4096, 0, 200, "\"one\"",
+        "content-disposition: attachment; filename*=UTF-8''%D8%B5%D9%88%D8%B1%D8%A9.jpg", true));
+    CHECK(offline_download_manager_start(&manager, id) && complete(&manager));
+    const OfflineLibraryItem *item = offline_library_find(&library, id);
+    CHECK(item->state == OFFLINE_ITEM_READY
+          && !strcmp(item->title, "\xd8\xb5\xd9\x88\xd8\xb1\xd8\xa9.jpg"));
+    char expected[FILE_DOWNLOAD_PATH_LIMIT];
+    snprintf(expected, sizeof(expected), "%s/%08x-%%D8%%B5%%D9%%88%%D8%%B1%%D8%%A9.jpg", root, (unsigned) id);
+    CHECK(access(expected, F_OK) == 0 && exact_file(&library, id, 4096));
+    CHECK(offline_library_remove(&library, id) && access(expected, F_OK) != 0);
+    offline_download_manager_destroy(&manager);
+    browser_session_destroy(&session);
+    clean(root);
+    return true;
+}
+
 int main(int argc, char **argv)
 {
     char directory[] = "/tmp/tilefinch-file-test-XXXXXX";
@@ -770,7 +1022,8 @@ int main(int argc, char **argv)
         ? live_download(directory, argv[2], argv[3], argc == 5 ? argv[4] : NULL)
         : argc == 5 && !strcmp(argv[1], "--source-journey")
         ? live_source_journey(directory, argv[2], argv[3], argv[4])
-        : argc == 1 && filenames() && transfers(directory, corpus)
+        : argc == 1 && filenames() && display_names(directory)
+            && arabic_transfer(directory, corpus) && transfers(directory, corpus)
             && restart_speed(directory, corpus) && confirmation(directory, corpus)
             && link_activation() && extensionless_navigation(corpus)
             && audio_navigation(corpus);

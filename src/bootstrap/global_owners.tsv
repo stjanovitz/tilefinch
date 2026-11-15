@@ -25,3 +25,4 @@ URLSearchParams	platform.js
 VisibilityStateEntry	platform.js
 WebSocket	compat.js
 XMLHttpRequest	compat.js
+XMLSerializer	serialize.js

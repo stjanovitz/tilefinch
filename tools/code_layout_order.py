@@ -120,6 +120,16 @@ def pattern_for(name, path):
     return "*%s(%s)" % (os.path.basename(path), sections)
 
 
+# The --command header records which build the profiles came from. A commit
+# id there would name a development commit the public squashed history does
+# not contain, so the build is named by version and date instead.
+COMMIT_ID = re.compile(r"\b(?=[0-9a-f]*[0-9])(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b")
+
+
+def commit_ids(text):
+    return COMMIT_ID.findall(text)
+
+
 # Header-only libraries fetched at a pinned commit and compiled into
 # Tilefinch objects (stb_image, stb_truetype, nanosvg): their functions
 # change only with the pin, like any other vendored code.
@@ -173,7 +183,9 @@ def main():
                     "own), each on an 8 KiB way boundary: the committed "
                     "hot order")
     ap.add_argument("--command", default="",
-                    help="regeneration command recorded in the header")
+                    help="regeneration command recorded in the header, with "
+                    "the profiled build named by version and date (not by "
+                    "commit id) and the profiles it came from")
     ap.add_argument("--pin", action="append", default=[],
                     help="also place this function (repeatable): code the "
                     "profiles under-sample, such as the game audio mixer's "
@@ -181,6 +193,9 @@ def main():
                     "chosen function")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
+    if commit_ids(args.command):
+        ap.error("--command names commit %s: name the build by version and "
+                 "date" % ", ".join(commit_ids(args.command)))
 
     syms = load_symbols(args.elf, args.nm)
     addrs = [s[0] for s in syms]

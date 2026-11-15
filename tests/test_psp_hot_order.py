@@ -93,6 +93,17 @@ class HotOrderFileTests(unittest.TestCase):
             self.assertFalse(match.group("section").startswith(
                 (".text.unlikely", ".text.startup")))
 
+    def test_header_names_no_commit(self):
+        # Development commits are not in the public squashed history; the
+        # header names the profiled build by version and date.
+        generator = load_generator()
+        header = self.text[:self.text.index(".text : {\n")]
+        self.assertEqual(generator.commit_ids(header), [])
+        self.assertEqual(generator.commit_ids(
+            "(validation build of 230d3a83; profiles)"), ["230d3a83"])
+        self.assertEqual(generator.commit_ids(
+            "(0.1.49 validation build of 2026-11-13; deadbeef-free text)"), [])
+
     def test_heat_shares(self):
         total = sum(float(m.group("share")) for _, m in self.entries())
         self.assertGreater(total, 90.0)

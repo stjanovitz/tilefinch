@@ -1,5 +1,6 @@
 #include "tilefinch/zip_install.h"
 #include "tilefinch/file_download.h"
+#include "tilefinch/offline_library.h"
 #include "tilefinch/platform.h"
 #include "tilefinch/psp_offline_store.h"
 
@@ -155,8 +156,10 @@ static bool native_journey(const char *root, const char *archive, const char *ga
     psp_offline_store_init(&store, browser_engine_budget(engine), browser_engine_session(engine), root);
     store.game_directory = games;
     uint32_t id = 0;
+    /* An Arabic name: the archive is stored under its percent-encoded
+       name, and the install question still finds it. */
     CHECK(file_download_enqueue(&store.library, "https://downloads.example.test/get?id=1",
-        "download.bin", &id, error, sizeof(error)));
+        "\xd9\x84\xd8\xb9\xd8\xa8\xd8\xa9.bin", &id, error, sizeof(error)));
     char path[512]; CHECK(file_download_path(&store.library, id, path, sizeof(path)));
     FILE *source = fopen(archive, "rb"), *copy = fopen(path, "wb"); CHECK(source && copy);
     unsigned char buffer[4096]; size_t count, total = 0;
@@ -187,8 +190,30 @@ static bool native_journey(const char *root, const char *archive, const char *ga
                  "https://example.com/offline/homebrew-guide")
           && !psp_offline_store_route_cancel_status(
                  "https://tilefinch.local/offline/homebrew?page=2"));
-    CHECK(psp_offline_store_handle_url(&store, engine, NULL, url, NULL, true) == PSP_OFFLINE_ROUTE_ZIP_PREVIEW);
+    CHECK(strstr(path, "-%D9%84%D8%B9%D8%A8%D8%A9.bin") != NULL);
+    /* A finished download's toast is not shown again over the question,
+       nor over the saved-file page; a failed route still reports. */
+    snprintf(store.status, sizeof(store.status), "FILE SAVED");
+    PspOfflineRouteResult opened = psp_offline_store_handle_url(&store, engine, NULL, url, NULL, true);
+    CHECK(opened == PSP_OFFLINE_ROUTE_ZIP_PREVIEW && psp_offline_store_route_toast(&store, opened) == NULL);
     CHECK(store.zip_install && !strcmp(zip_install_preview(store.zip_install)->name, "Test"));
+    snprintf(store.status, sizeof(store.status), "FILE SAVED");
+    char page_url[128];
+    snprintf(page_url, sizeof(page_url), "https://tilefinch.local/offline/file?id=%u", (unsigned)id);
+    opened = psp_offline_store_handle_url(&store, engine, NULL, page_url, NULL, true);
+    CHECK(opened == PSP_OFFLINE_ROUTE_PAGE && psp_offline_store_route_toast(&store, opened) == NULL);
+    snprintf(store.status, sizeof(store.status), "FILE SAVED");
+    opened = psp_offline_store_handle_url(&store, engine, NULL, "https://tilefinch.local/offline/nowhere", NULL, true);
+    CHECK(opened == PSP_OFFLINE_ROUTE_ERROR
+          && !strcmp(psp_offline_store_route_toast(&store, opened), "OFFLINE LINK IS INVALID"));
+    /* Back or Forward that cannot move never reaches handle_url; it reports
+       its own failure, not the last route's message. */
+    snprintf(store.status, sizeof(store.status), "FILE SAVED");
+    opened = psp_offline_store_history_unavailable(&store);
+    CHECK(opened == PSP_OFFLINE_ROUTE_ERROR
+          && !strcmp(psp_offline_store_route_toast(&store, opened), "PAGE UNAVAILABLE"));
+    opened = psp_offline_store_handle_url(&store, engine, NULL, url, NULL, true);
+    CHECK(opened == PSP_OFFLINE_ROUTE_ZIP_PREVIEW && psp_offline_store_route_toast(&store, opened) == NULL);
     /* The sheet is up while a load is pending, and the navigation pump
        begins the supervisor again over it. Cancel frees the preview: the
        supervisor's copy must let go of it first. */
@@ -212,9 +237,11 @@ static bool native_journey(const char *root, const char *archive, const char *ga
     CHECK(offline_library_remove(&store.library, id));
     CHECK(access(path, F_OK)); /* Delete ZIP independently of the installation. */
     char names[4][ZIP_INSTALL_FOLDER_NAME_LIMIT]; size_t installed_count = 0;
-    CHECK(zip_install_list(games, names, 4, &installed_count) && installed_count == 1 && !strcmp(names[0], "Test"));
+    char titles[4][ZIP_INSTALL_TITLE_LIMIT];
+    CHECK(zip_install_list(games, names, titles, 4, &installed_count) && installed_count == 1
+          && !strcmp(names[0], "Test") && !strcmp(titles[0], "Test"));
     installed_count = 0; /* Count only. */
-    CHECK(zip_install_list(games, NULL, 4, &installed_count) && installed_count == 1);
+    CHECK(zip_install_list(games, NULL, NULL, 4, &installed_count) && installed_count == 1);
     /* The removal route's folder-name spelling round-trips, and only it. */
     char hex[ZIP_INSTALL_FOLDER_HEX_LIMIT], decoded[ZIP_INSTALL_FOLDER_NAME_LIMIT], longest[64];
     zip_install_encode_folder_name("Test", hex);
@@ -265,9 +292,115 @@ static bool native_journey(const char *root, const char *archive, const char *ga
     CHECK(psp_offline_store_handle_url(&store, engine, NULL,
         "https://tilefinch.local/offline/remove-homebrew?name=54657374", NULL, true) == PSP_OFFLINE_ROUTE_ZIP_PREVIEW);
     CHECK(psp_offline_store_install_prepared_zip(&store));
-    CHECK(access(boot, F_OK) && zip_install_list(games, names, 4, &installed_count) && installed_count == 0);
+    CHECK(access(boot, F_OK) && zip_install_list(games, names, NULL, 4, &installed_count) && installed_count == 0);
     CHECK(!zip_install_prepare_removal(browser_engine_budget(engine), games, "../Test", error, sizeof(error)));
     psp_offline_store_destroy(&store); browser_engine_destroy(engine);
+    return true;
+}
+
+static long receipt_size(const char *games, const char *folder)
+{
+    char path[768]; struct stat info;
+    snprintf(path, sizeof(path), "%s/%s/.tilefinch-homebrew", games, folder);
+    return lstat(path, &info) ? -1 : (long) info.st_size;
+}
+
+static bool install_bare(Budget *budget, const char *archive, const char *games,
+    const char *title, uint32_t id, const char *folder, const char *shown)
+{
+    char error[128];
+    ZipInstall *install = zip_install_prepare(budget, archive, games, title, id, error, sizeof(error));
+    CHECK(install);
+    const ZipInstallPreview *view = zip_install_preview(install);
+    char destination[600]; snprintf(destination, sizeof(destination), "%s/%s", games, folder);
+    if (strcmp(view->name, folder) || strcmp(view->title, shown) || strcmp(view->destination, destination))
+        fprintf(stderr, "bare ZIP %s: folder \"%s\" title \"%s\"\n", title, view->name, view->title);
+    CHECK(!strcmp(view->name, folder) && !strcmp(view->title, shown)
+          && !strcmp(view->destination, destination));
+    CHECK(zip_install_begin(install) && finish(install) == ZIP_INSTALL_DONE);
+    zip_install_destroy(install); CHECK(!budget->current);
+    char boot[700]; snprintf(boot, sizeof(boot), "%s/EBOOT.PBP", destination);
+    CHECK(!access(boot, F_OK));
+    return true;
+}
+
+static bool remove_installed(Budget *budget, const char *games, const char *folder, const char *shown)
+{
+    char error[128];
+    ZipInstall *job = zip_install_prepare_removal(budget, games, folder, error, sizeof(error));
+    CHECK(job && !strcmp(zip_install_preview(job)->title, shown));
+    CHECK(zip_install_begin(job) && finish(job) == ZIP_INSTALL_DONE);
+    zip_install_destroy(job); CHECK(!budget->current);
+    char path[600]; snprintf(path, sizeof(path), "%s/%s", games, folder);
+    CHECK(access(path, F_OK));
+    return true;
+}
+
+/* A top-level EBOOT.PBP installs to a folder named after the download.
+   A title that is not a plain ASCII folder name (other letters, or too
+   long) gets APP-<ID> instead, and the manager still shows the title. */
+static bool bare_titles(Budget *budget, const char *archive, const char *games)
+{
+    static const char arabic[] = "\xd9\x84\xd8\xb9\xd8\xa8\xd8\xa9"; /* lu'ba */
+    static const char hebrew[] = "\xd7\x9e\xd7\xa9\xd7\x97\xd7\xa7"; /* misxak */
+    char title[128], long_ascii[128], long_stem[128], error[128];
+    snprintf(title, sizeof(title), "%s.zip", arabic);
+    CHECK(install_bare(budget, archive, games, title, 7, "APP-00000007", arabic));
+    /* A version-2 receipt carries the title; ASCII-named apps keep the
+       version-1 receipt earlier releases read. */
+    CHECK(receipt_size(games, "APP-00000007") == 208);
+    CHECK(install_bare(budget, archive, games, "Plain Game.zip", 8, "Plain Game", "Plain Game"));
+    CHECK(receipt_size(games, "Plain Game") == 80);
+    /* Too long for a folder name: ASCII too. */
+    memset(long_stem, 'L', 70); long_stem[70] = 0;
+    snprintf(long_ascii, sizeof(long_ascii), "%s.zip", long_stem);
+    CHECK(install_bare(budget, archive, games, long_ascii, 9, "APP-00000009", long_stem));
+    /* The same title again: a new download gets its own folder... */
+    CHECK(install_bare(budget, archive, games, title, 10, "APP-0000000A", arabic));
+    /* ...and installing one download twice never replaces the first. */
+    CHECK(!zip_install_prepare(budget, archive, games, title, 7, error, sizeof(error))
+          && strstr(error, "already exists") && !budget->current);
+    /* Combining marks, CJK and an emoji title with no extension. */
+    static const char cjk[] = "\xe6\x97\xa5\xe6\x9c\xac\xf0\x9f\x8e\xae";
+    CHECK(install_bare(budget, archive, games, cjk, 11, "APP-0000000B", cjk));
+    snprintf(title, sizeof(title), "%s.zip", hebrew);
+    CHECK(install_bare(budget, archive, games, title, 12, "APP-0000000C", hebrew));
+    /* Titles the download namer would not keep are refused outright. */
+    static const char *const unsafe[] = {"../Escape.zip", "a/b.zip", ".hidden.zip",
+        "\xd9\x84\xe2\x80\xae.zip", "bad\xff.zip", ""};
+    for (size_t i = 0; i < sizeof(unsafe) / sizeof(unsafe[0]); i++)
+        CHECK(!zip_install_prepare(budget, archive, games, unsafe[i], 13, error, sizeof(error))
+              && !budget->current);
+    char names[8][ZIP_INSTALL_FOLDER_NAME_LIMIT], titles[8][ZIP_INSTALL_TITLE_LIMIT];
+    size_t count = 0;
+    CHECK(zip_install_list(games, names, titles, 8, &count) && count == 6);
+    bool seen_arabic = false;
+    for (size_t i = 0; i < count; i++)
+        if (!strcmp(names[i], "APP-00000007")) seen_arabic = !strcmp(titles[i], arabic);
+    CHECK(seen_arabic);
+    /* The manager page shows the title and links the folder's spelling. */
+    char *html = NULL; size_t length = 0;
+    CHECK(offline_library_build_homebrew_page(budget, games, &html, &length));
+    char hex[ZIP_INSTALL_FOLDER_HEX_LIMIT];
+    zip_install_encode_folder_name("APP-00000007", hex);
+    CHECK(strstr(html, arabic) && strstr(html, hex) && strstr(html, hebrew) && strstr(html, long_stem)
+          && !strstr(html, ">APP-"));
+    budget_free(budget, html); CHECK(!budget->current);
+    /* A changed title byte breaks the receipt: the app is no longer managed. */
+    char receipt_path[768];
+    snprintf(receipt_path, sizeof(receipt_path), "%s/APP-0000000C/.tilefinch-homebrew", games);
+    FILE *marker = fopen(receipt_path, "r+b"); CHECK(marker);
+    CHECK(!fseek(marker, 80, SEEK_SET) && fputc('X', marker) != EOF && !fclose(marker));
+    CHECK(zip_install_list(games, names, titles, 8, &count) && count == 5);
+    CHECK(!zip_install_prepare_removal(budget, games, "APP-0000000C", error, sizeof(error)));
+    char folder[600]; snprintf(folder, sizeof(folder), "%s/APP-0000000C", games);
+    CHECK(erase(folder, 0));
+    CHECK(remove_installed(budget, games, "APP-00000007", arabic));
+    CHECK(remove_installed(budget, games, "APP-0000000A", arabic));
+    CHECK(remove_installed(budget, games, "APP-00000009", long_stem));
+    CHECK(remove_installed(budget, games, "APP-0000000B", cjk));
+    CHECK(remove_installed(budget, games, "Plain Game", "Plain Game"));
+    CHECK(zip_install_list(games, names, titles, 8, &count) && count == 0);
     return true;
 }
 
@@ -387,8 +520,10 @@ static bool tests(const char *root)
     files[0] = boot; files[0].name = "EBOOT.PBP"; files[0].method = 0;
     CHECK(archive_write(archive, files, 1));
     install = zip_install_prepare(&budget, archive, games, "Test.v1.zip", 1, error, sizeof(error));
-    CHECK(install && !strcmp(zip_install_preview(install)->name, "Test.v1"));
+    CHECK(install && !strcmp(zip_install_preview(install)->name, "Test.v1")
+          && !strcmp(zip_install_preview(install)->title, "Test.v1"));
     zip_install_destroy(install); CHECK(!budget.current);
+    CHECK(bare_titles(&budget, archive, games));
     return true;
 }
 

@@ -334,11 +334,11 @@ static char *js_rt_inline_source_assemble(ScriptRuntime *runtime,
     return copy;
 }
 
-bool script_runtime_evaluate_inline(ScriptRuntime *runtime,
-                                    lxb_dom_node_t *script_node,
-                                    bool module, ScriptResult *result)
+static bool script_runtime_evaluate_inline_run(ScriptRuntime *runtime,
+                                               lxb_dom_node_t *script_node,
+                                               bool module,
+                                               ScriptResult *result)
 {
-    if (runtime == NULL || script_node == NULL) return false;
     /* A script document.write() runs inside its writer (nested) shares the
        writer's watchdog deadline; re-arming would let a writing loop run
        forever. */
@@ -446,6 +446,25 @@ bool script_runtime_evaluate_inline(ScriptRuntime *runtime,
        the complete ScriptResult. */
     if (result != NULL) js_rt_runtime_update_result(runtime, result);
     else js_rt_runtime_finish_slice_state(runtime);
+    return evaluated;
+}
+
+/* A failure is the script's own (script_runtime_last_script_author_error)
+   only when its exception reached the window error event at this level:
+   a script it ran nested (document.write, an inserted inline script)
+   reports for itself. */
+bool script_runtime_evaluate_inline(ScriptRuntime *runtime,
+                                    lxb_dom_node_t *script_node,
+                                    bool module, ScriptResult *result)
+{
+    if (runtime == NULL || script_node == NULL) return false;
+    bool outer_author_error = runtime->script_author_error;
+    runtime->script_author_error = false;
+    bool evaluated = script_runtime_evaluate_inline_run(
+        runtime, script_node, module, result);
+    runtime->last_script_author_error =
+        !evaluated && runtime->script_author_error;
+    runtime->script_author_error = outer_author_error;
     return evaluated;
 }
 

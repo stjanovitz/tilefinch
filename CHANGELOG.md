@@ -8,6 +8,26 @@ mechanics.
 
 ## Unreleased
 
+## 0.1.50 — 2026-11-15
+
+- Improve graphics and compatibility for WebGL games and 3D pages. Larger supported draws are submitted in complete primitive groups, oversized canvas viewports are scaled to the drawing buffer, and additional blend equations and factors use the PSP graphics hardware.
+- Render more built-in three.js material combinations. Extra texture maps the PSP cannot draw are reported and omitted rather than hiding the whole mesh; lighting and other documented PSP approximations remain. Light probes are recognized structurally even in minified shaders.
+- Show only completed WebGL frames between intermediate command flushes. Snapshot copying is faster on eligible PSP surfaces, while readback still sees the current drawing buffer. Menus over animated canvases retain their prepared translucent-color blending after rebuilding.
+- Publish Game Profile v1.2 and its machine-readable companion. Earlier profile documents remain unchanged.
+- Include inline SVG graphics in loading previews, including in Night mode. Draw SVG graphics more efficiently and reuse preview rasters when the finished page is published.
+- Expand interface translations across Settings, Collections, Themes, experimental options, navigation hints and player messages, and add a downloadable Hebrew interface translation. The new translations have not yet been reviewed by native speakers.
+- Improve mirrored menus, mixed-direction titles and filenames, numbered messages, Arabic button sizing, and right-to-left track, chapter and queue labels. Oversized labels are fitted without cutting a character or joined sequence.
+- Preserve international download filenames, accents and emoji in the interface, while using safe ASCII filenames on the Memory Stick. Keep filename extensions when shortening long names, reject misleading direction controls, and install supported top-level homebrew ZIPs with international or long names.
+- Fix stale saved-file messages over installation questions and restored offline pages. Unavailable saved pages now show an appropriate error.
+- Improve script-created HTML, XML, SVG and MathML documents and markup insertion. Add XMLSerializer, Element.getHTML(), ShadowRoot.getHTML() and outerText; generated XML namespace prefixes no longer conflict with existing bindings.
+- Correct document.write() replacement and execution behavior, and support bare worker addEventListener() calls.
+- Keep browser-internal DOM, event, worker, messaging and lazy-interface operations independent of page replacements of built-in constructors and methods.
+- Deliver script exceptions to the window error handler, distinguish script execution failures from loading failures, and preserve changes to window.onerror made during error dispatch. Ordinary script errors no longer stop later scripts; repeated resource-limit failures still stop the page's JavaScript safely.
+- Load cross-window messaging support only when needed, and fix a boundary over-read in SVG style declarations.
+- Refresh the public suffix list used for cookie-domain checks.
+
+**Compatibility:** newly saved international filenames may make the Library unreadable in older Tilefinch versions. Earlier versions also do not list homebrew installed using the new international-name folder scheme. Existing saved files and installed folders keep their locations.
+
 ## 0.1.49 — 2026-11-14
 
 - Reliability improvements and reduced memory use while browsing.

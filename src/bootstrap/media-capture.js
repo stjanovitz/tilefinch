@@ -1,4 +1,10 @@
 (() => {
+  /* Loaded after the page may have replaced these globals: build
+     errors, promises and platform objects with the constructors
+     hardening.js captured, and publish private hooks with its
+     defineProperty. */
+  const { defineProperty, Error, TypeError, Promise, Set, Array } =
+    globalThis.__tilefinchEventInterfaces;
   /* Media Capture and Streams for the PSP microphone: one mono audio input,
      no camera. Every admission decision (secure context, frame policy,
      visibility, the user's stored choice and the browser-owned prompt) is
@@ -10,9 +16,10 @@
     createPrivateWeakMap = globalThis.__tilefinchCreatePrivateWeakMap,
     createEvent = globalThis.__tilefinchCreateEvent,
     /* Loaded after the page may have replaced these globals: extend the
-       interfaces hardening.js captured. */
-    { Event, EventTarget } = globalThis.__tilefinchEventInterfaces,
-    NavigatorInterface = globalThis.Navigator;
+       interfaces hardening.js captured, and add mediaDevices to its
+       Navigator. Handler attributes register through its listener pair. */
+    { Event, EventTarget, DOMException, Navigator: NavigatorInterface,
+      addListener, removeListener } = globalThis.__tilefinchEventInterfaces;
   if (typeof command !== "function" || typeof createPrivateWeakMap !== "function" ||
       typeof createEvent !== "function")
     throw new Error("Media capture bridge is unavailable");
@@ -37,9 +44,9 @@
       set(value) {
         let slots = handlers.get(this);
         if (!slots) handlers.set(this, (slots = Object.create(null)));
-        if (slots[type]) this.removeEventListener(type, slots[type]);
+        if (slots[type]) removeListener(this, type, slots[type]);
         slots[type] = typeof value === "function" ? value : null;
-        if (slots[type]) this.addEventListener(type, slots[type]);
+        if (slots[type]) addListener(this, type, slots[type]);
       },
     });
   const trackState = (value) => {
@@ -439,7 +446,7 @@
   /* Native code captures this too: the serial of the track a
      MediaStreamAudioSourceNode of STREAM plays (the first audio track by id,
      as Web Audio chooses), or 0 when that track is not live. */
-  Object.defineProperty(globalThis, "__tilefinchMediaCaptureStreamTrack", {
+  defineProperty(globalThis, "__tilefinchMediaCaptureStreamTrack", { __proto__: null,
     configurable: true,
     writable: false,
     value: (stream) => {
@@ -453,7 +460,7 @@
       return chosen !== null && chosen.readyState === "live" ? chosen.serial : 0;
     },
   });
-  Object.defineProperty(globalThis, "__tilefinchMediaCaptureHostEvent", {
+  defineProperty(globalThis, "__tilefinchMediaCaptureHostEvent", { __proto__: null,
     configurable: true,
     writable: false,
     value: (generation, trusted) => {

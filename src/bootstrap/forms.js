@@ -3,7 +3,9 @@
    properties, RadioNodeList. Built on the first such read, so a realm whose
    script never asks pays nothing for them. platform.js captures every realm
    value this module reads before page script runs and passes them in. */
-Object.defineProperty(globalThis, "__tilefinchCreateFormCollections", {
+globalThis.__tilefinchEventInterfaces.defineProperty(globalThis,
+    "__tilefinchCreateFormCollections", {
+  __proto__: null,
   configurable: true,
   value({
     selectionOf,
@@ -28,6 +30,10 @@ Object.defineProperty(globalThis, "__tilefinchCreateFormCollections", {
     defineProperties,
     freeze,
   }) {
+    /* Loaded after the page may have replaced these globals: build
+       errors, promises and platform objects with the constructors
+       hardening.js captured. */
+    const { TypeError } = globalThis.__tilefinchEventInterfaces;
     /* RadioNodeList: the controls sharing one name, whose value is the
        checked radio button's. */
     const radioNodeList = (controls) => {

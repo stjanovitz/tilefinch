@@ -732,17 +732,26 @@ static int intrinsic_text_width_impl(LayoutContext *context,
                        == OVERFLOW_WRAP_ANYWHERE);
         int limit_fixed = limit > INT_MAX / 64 ? INT_MAX
                           : layout_fixed_from_integer(limit);
+        LayoutBidiIntrinsicShaping shaping;
+        layout_bidi_intrinsic_shaping_begin(&shaping, context, text, length);
         for (size_t at = 0; at < length;) {
             while (at < length && isspace((unsigned char) text[at])) at++;
             size_t end = at;
             while (end < length && !isspace((unsigned char) text[end])) end++;
             if (end == at) break;
-            int word_fixed = layout_text_measure(
-                context->reuse, face, metric_family, text + at, end - at,
-                computed_style_font_size_fixed(parent),
-                synthetic_bold, metric_bold, parent->font_scale,
-                parent->letter_spacing_fixed, parent->text_transform,
-                !computed_style_kerning_none(parent));
+            int word_fixed = 0;
+            if (!layout_bidi_intrinsic_shaped_width(
+                    &shaping, at, end, face, metric_family,
+                    computed_style_font_size_fixed(parent), synthetic_bold,
+                    metric_bold, parent->letter_spacing_fixed,
+                    parent->text_transform,
+                    !computed_style_kerning_none(parent), &word_fixed))
+                word_fixed = layout_text_measure(
+                    context->reuse, face, metric_family, text + at, end - at,
+                    computed_style_font_size_fixed(parent),
+                    synthetic_bold, metric_bold, parent->font_scale,
+                    parent->letter_spacing_fixed, parent->text_transform,
+                    !computed_style_kerning_none(parent));
             if (pair_intrinsics) {
                 int minimum_word = 0;
                 for (size_t segment_at = at; segment_at < end;) {
@@ -764,6 +773,17 @@ static int intrinsic_text_width_impl(LayoutContext *context,
                             && segment_at != at ? TEXT_TRANSFORM_NONE
                             : parent->text_transform,
                         !computed_style_kerning_none(parent));
+                    int shaped_fixed = 0;
+                    if (!discard && layout_bidi_intrinsic_shaped_width(
+                            &shaping, segment_at, segment_at + segment_length,
+                            face, metric_family,
+                            computed_style_font_size_fixed(parent),
+                            synthetic_bold, metric_bold,
+                            parent->letter_spacing_fixed,
+                            parent->text_transform,
+                            !computed_style_kerning_none(parent),
+                            &shaped_fixed))
+                        segment_width = layout_fixed_ceil(shaped_fixed);
                     if (break_for_minimum && !discard) {
                         segment_width = 0;
                         size_t segment_end = segment_at + segment_length;
@@ -819,9 +839,13 @@ static int intrinsic_text_width_impl(LayoutContext *context,
                         : 0,
                     word_fixed));
             has_word = true;
-            if (width_fixed >= limit_fixed) return limit;
+            if (width_fixed >= limit_fixed) {
+                layout_bidi_intrinsic_shaping_end(&shaping);
+                return limit;
+            }
             at = end;
         }
+        layout_bidi_intrinsic_shaping_end(&shaping);
         int maximum_width = layout_fixed_ceil(width_fixed);
         if (pair_intrinsics) {
             if (parent->white_space_mode == WHITE_SPACE_NOWRAP
@@ -1254,6 +1278,8 @@ static int intrinsic_min_text_width_impl(LayoutContext *context,
             || computed_style_overflow_wrap(parent)
                    == OVERFLOW_WRAP_ANYWHERE;
         int widest = 0;
+        LayoutBidiIntrinsicShaping shaping;
+        layout_bidi_intrinsic_shaping_begin(&shaping, context, text, length);
         for (size_t at = 0; at < length;) {
             while (at < length && isspace((unsigned char) text[at])) at++;
             size_t end = at;
@@ -1278,6 +1304,15 @@ static int intrinsic_min_text_width_impl(LayoutContext *context,
                         && segment_at != at ? TEXT_TRANSFORM_NONE
                         : parent->text_transform,
                     !computed_style_kerning_none(parent));
+                int shaped_fixed = 0;
+                if (!discard && layout_bidi_intrinsic_shaped_width(
+                        &shaping, segment_at, segment_at + segment_length,
+                        face, metric_family,
+                        computed_style_font_size_fixed(parent),
+                        synthetic_bold, metric_bold,
+                        parent->letter_spacing_fixed, parent->text_transform,
+                        !computed_style_kerning_none(parent), &shaped_fixed))
+                    segment_width = layout_fixed_ceil(shaped_fixed);
                 if (break_for_minimum && !discard) {
                     /* anywhere adds opportunities inside each ordinary
                        Unicode line-breaking segment. */
@@ -1309,10 +1344,11 @@ static int intrinsic_min_text_width_impl(LayoutContext *context,
                 segment_at += segment_length;
             }
             if (word > widest) widest = word;
-            if (widest >= limit) return limit;
+            if (widest >= limit) break;
             at = end;
         }
-        return widest;
+        layout_bidi_intrinsic_shaping_end(&shaping);
+        return widest >= limit ? limit : widest;
     }
     if (node->type != LXB_DOM_NODE_TYPE_ELEMENT) return 0;
     if (layout_node_is_hidden_input(node)) return 0;

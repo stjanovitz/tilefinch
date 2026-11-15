@@ -16,13 +16,21 @@ typedef struct {
        advance this counter, so parser recovery never mistakes dead URLs for
        a broken JavaScript realm. */
     size_t execution_failures;
+    /* A subset of `execution_failures`: the script's own exception (a
+       throw, or a SyntaxError) that the window error event reported, as
+       script_runtime_last_script_author_error() tells. The page goes on as
+       in Chromium, so parser hydration does not count these toward its
+       consecutive-failure breaker; the rest (out of memory, a watchdog
+       interrupt, a compile admission refusal, an engine failure) say the
+       realm is in trouble. */
+    size_t author_exceptions;
     /* Monotonic time spent inside the evaluator only. Fetching, stylesheet
        checkpoints and other element-close work are deliberately excluded. */
     uint64_t execution_us;
     /* Security-policy refusals remain part of `failed` for the existing
-       user-visible diagnostics, but are not author-code execution failures.
-       Parser hydration uses this subset to avoid opening its consecutive
-       execution-failure circuit on a deliberately restrictive page policy. */
+       user-visible diagnostics, but are not author-code execution failures,
+       so a deliberately restrictive page policy never opens parser
+       hydration's consecutive-failure breaker. */
     size_t policy_refusals;
     size_t skipped_cross_origin;
     size_t skipped_module;

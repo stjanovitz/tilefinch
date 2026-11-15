@@ -1142,6 +1142,53 @@ int main(int argc, char **argv)
               && strcmp(result.summary, "LAZY-MEASURED-ADMITTED") == 0);
     }
 
+    /* A registration that throws (here in the page's chunk push) still
+       ran: the window error event reports its exception, then the element
+       gets `load`, not `error` (HTML "execute the script element"). */
+    static const char install_throwing_push[] =
+        "(()=>{const target=document.getElementById('target');"
+        "const events=globalThis.__lazyThrowEvents=[];"
+        "globalThis.webpackChunk_boom=[];"
+        "globalThis.webpackChunk_boom.push=()=>{throw new Error('push-boom')};"
+        "onerror=m=>{events.push('on:'+m);return true};"
+        "target.onload=()=>events.push('load');"
+        "target.onerror=()=>events.push('error');})()";
+    CHECK(script_runtime_evaluate_diagnostic(
+        runtime, install_throwing_push, "<install-throwing-push>", &result));
+    static const char throwing_source[] =
+        "(self.webpackChunk_boom=self.webpackChunk_boom||[]).push([[4],{"
+        "4:(module,exports,require)=>{exports.four=require(5)},"
+        "5:module=>{module.exports=5}"
+        "}]);";
+    ScriptLazyWebpackPlan throwing_plan;
+    bool throwing_planned = plans(
+        &runtime_budget, throwing_source, &throwing_plan);
+    CHECK(throwing_planned && throwing_plan.factory_count == 2);
+    BrowserSharedBody *throwing_body = shared_source(
+        &runtime_budget, throwing_source);
+    CHECK(throwing_body != NULL);
+    if (throwing_planned && throwing_body != NULL) {
+        CHECK(script_runtime_evaluate_external_lazy_webpack(
+                  runtime, script, (const char *) throwing_body->data,
+                  throwing_body->length, "https://example.test/boom.js",
+                  &throwing_plan, throwing_body, release_shared_source,
+                  &result)
+              == SCRIPT_LAZY_EVALUATION_FAILED);
+        /* Its own exception, so the parser's failure breaker leaves it
+           uncounted. */
+        CHECK(script_runtime_last_script_author_error(runtime));
+        static const char verify_throwing[] =
+            "globalThis.pocSummary=globalThis.__lazyThrowEvents.join(',');"
+            "onerror=null";
+        CHECK(script_runtime_evaluate_diagnostic(
+                  runtime, verify_throwing, "<verify-throwing-push>",
+                  &result)
+              && strcmp(result.summary, "on:push-boom,load") == 0);
+    } else if (throwing_body != NULL) {
+        release_shared_source(throwing_body);
+    }
+    if (throwing_planned) script_lazy_webpack_plan_destroy(&throwing_plan);
+
     script_runtime_destroy(runtime);
     document_destroy(&document);
     browser_session_destroy(&runtime_session);

@@ -241,11 +241,16 @@ current page, so cancelling does not reload it or lose its scroll and focus.
 It shows the source origin, not a potentially sensitive query string.
 
 After confirmation, the existing **Downloads** section provides Pause,
-Resume/Retry, Details, and Delete. Each file receives an ID-prefixed safe
-filename under `data/offline/` on the Memory Stick. The server's
-Content-Disposition filename takes precedence over the URL basename; path
-components and unsafe FAT characters are removed. Non-ASCII filename bytes
-become underscores. Downloaded bytes are not changed or executed.
+Resume/Retry, Details, and Delete. The server's Content-Disposition filename
+(`filename*` first) takes precedence over the URL basename. The Library keeps
+it as the file's title in UTF-8, the name every list and question shows:
+path components are removed, it is normalized to NFC, controls, bidi
+overrides and unsafe FAT characters become `_`, and a name over 127 bytes
+keeps its extension and is cut between whole characters. Each file is saved
+under `data/offline/` as its ID and a printable-ASCII stored name: the title
+with non-ASCII bytes percent-encoded, cut to fit with the extension kept
+([Storage](STORAGE.md#dataoffline--offline-library) has the details and the
+compatibility rule). Downloaded bytes are not changed or executed.
 Use USB storage to move a file, or open a completed ZIP's Details to request
 the separately confirmed installation described below.
 
@@ -284,7 +289,13 @@ app folder before showing the native confirmation with the destination,
 expanded size and file count. Nothing is installed until **X Install**.
 
 Installation targets `ms0:/PSP/GAME/<app>` (or `ef0:` for an internal-storage
-library). Bare EBOOT archives receive a folder derived from the archive name.
+library). Bare EBOOT archives receive a folder named after the download
+without its extension. When that name is not a plain ASCII FAT name, because
+it has other letters (an Arabic or Japanese name) or is longer than 63
+characters, the folder is `APP-<8 hex digits>` from the download's ID
+instead, so it is never a `%` spelling, never too long and never the same as
+another download's; the confirmation and the manager show the download's
+name.
 Existing destinations are refused, including links; this is not an updater.
 Only install software you trust: ZIP checksums detect corruption, not
 malicious programs or publisher identity. No game is launched automatically.
@@ -318,7 +329,9 @@ remains so the remaining contents can be inventoried and removed on a retry.
 
 Each new installation includes an 80-byte, corruption-checked
 `.tilefinch-homebrew` ownership receipt containing only its folder name and
-local installation ID—not its source URL or credentials. ZIPs cannot supply
+local installation ID—not its source URL or credentials. An `APP-` folder's
+receipt is 208 bytes and adds the name the manager shows; versions before
+it do not list such an app (they could not install one). ZIPs cannot supply
 that reserved root file. Installations without a valid receipt, such as ones
 you copied yourself, are never offered for removal. The manager supports at
 most 64 installations and examines at most 512 GAME directory entries. Removal

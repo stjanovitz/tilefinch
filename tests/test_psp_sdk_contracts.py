@@ -1879,6 +1879,78 @@ int main(void) {
         self.assertEqual(v1["limits"]["webgl"]["vertex_uniform_vectors"], 16)
         self.assertEqual(v1["limits"]["webgl"]["fragment_uniform_vectors"], 4)
         self.assertEqual(v1["limits"]["webgl"]["varying_vectors"], 2)
+        # v1.1 was released in 0.1.49: its companion and its section of
+        # GAME_PROFILE.md stay byte-identical.
+        v11_path = ROOT / "docs/tilefinch-game-profile-v1.1.json"
+        self.assertEqual(
+            hashlib.sha256(v11_path.read_bytes()).hexdigest(),
+            "c682563580f7ae9e47f3998809bf7518dff58d8c83bb84ffcff3014724246e8c")
+        guide = (ROOT / "docs/GAME_PROFILE.md").read_text(encoding="utf-8")
+        v11_section = guide[guide.index("## Game Profile v1.1\n"):
+                            guide.index("## What compatibility means")]
+        self.assertEqual(
+            hashlib.sha256(v11_section.encode("utf-8")).hexdigest(),
+            "8dd6d380d101e5ad2deabf26fbba581fd364ad1b0c2df18fe4d79e26b054c47f")
+
+    def test_game_profile_v1_2_satisfies_v1_1(self):
+        v11 = json.loads((ROOT / "docs/tilefinch-game-profile-v1.1.json")
+                         .read_text(encoding="utf-8"))
+        v12 = json.loads((ROOT / "docs/tilefinch-game-profile-v1.2.json")
+                         .read_text(encoding="utf-8"))
+        self.assertEqual(v12["satisfies"], ["tilefinch-game-profile-v1",
+                                            "tilefinch-game-profile-v1.1"])
+        self.assertEqual(v12["changes_from_v1"], v11["changes_from_v1"])
+        # Every v1.1 ceiling exists in v1.2 (the per-draw vertex and step
+        # bounds now bound one submission) and is at least as large.
+        renamed = {
+            "effective_vertices_per_draw": "effective_vertices_per_submission",
+            "per_vertex_program_steps_per_draw":
+                "per_vertex_program_steps_per_submission"}
+        for category, ceilings in v11["limits"].items():
+            for key, value in ceilings.items():
+                with self.subTest(limit=f"{category}.{key}"):
+                    key = renamed.get(key, key)
+                    self.assertIn(key, v12["limits"][category])
+                    if isinstance(value, (int, float)):
+                        self.assertGreaterEqual(
+                            v12["limits"][category][key], value)
+                    else:
+                        self.assertEqual(v12["limits"][category][key], value)
+        for key, value in v11.items():
+            if key in ("profile_id", "minor_version", "satisfies", "limits",
+                       "apis"):
+                continue
+            self.assertEqual(v12[key], value, key)
+        for name, api in v11["apis"].items():
+            if name != "webgl":
+                self.assertEqual(v12["apis"][name], api, name)
+        webgl_v11, webgl_v12 = v11["apis"]["webgl"], v12["apis"]["webgl"]
+        for key in webgl_v11:
+            if key != "blending":
+                self.assertIn(key, webgl_v12)
+        self.assertLessEqual(set(webgl_v11["extensions"]),
+                             set(webgl_v12["extensions"]))
+        self.assertIn("EXT_blend_minmax", webgl_v12["extensions"])
+        self.assertEqual(webgl_v12["unsupported"], webgl_v11["unsupported"])
+        blending_v11, blending_v12 = (webgl_v11["blending"],
+                                      webgl_v12["blending"])
+        self.assertLessEqual(set(blending_v11["factors"]),
+                             set(blending_v12["factors"]))
+        self.assertEqual(blending_v12["split_alpha_factors"],
+                         blending_v11["split_alpha_factors"])
+        self.assertIn(blending_v11["equation"], blending_v12["equations"])
+        self.assertEqual(blending_v12["equations"], [
+            "FUNC_ADD", "FUNC_SUBTRACT", "FUNC_REVERSE_SUBTRACT"])
+        materials_v11 = webgl_v11["scene_library_materials"]
+        materials_v12 = webgl_v12["scene_library_materials"]
+        narrowed = {"second_sampled_texture":
+                    "second_sampled_texture_in_colour"}
+        self.assertEqual(materials_v12["refused"],
+                         [narrowed.get(item, item)
+                          for item in materials_v11["refused"]])
+        for key, value in materials_v11.items():
+            if key != "refused":
+                self.assertEqual(materials_v12[key], value, key)
 
     def test_game_profile_v1_1_satisfies_v1(self):
         v1 = json.loads((ROOT / "docs/tilefinch-game-profile-v1.json")
@@ -1930,13 +2002,13 @@ int main(void) {
                          [narrowed.get(item, item)
                           for item in webgl_v1["unsupported"]])
 
-    def test_game_profile_v1_1_matches_runtime_ceiling_contracts(self):
-        profile_path = ROOT / "docs/tilefinch-game-profile-v1.1.json"
+    def test_game_profile_v1_2_matches_runtime_ceiling_contracts(self):
+        profile_path = ROOT / "docs/tilefinch-game-profile-v1.2.json"
         profile = json.loads(profile_path.read_text(encoding="utf-8"))
         self.assertEqual(profile["profile_id"],
-                         "tilefinch-game-profile-v1.1")
+                         "tilefinch-game-profile-v1.2")
         self.assertEqual(profile["version"], 1)
-        self.assertEqual(profile["minor_version"], 1)
+        self.assertEqual(profile["minor_version"], 2)
         self.assertEqual(profile["authority"], "docs/GAME_PROFILE.md")
 
         engine_header = (ROOT / "include/tilefinch/browser_engine.h").read_text(
@@ -1986,7 +2058,8 @@ int main(void) {
             "framebuffer_objects": 4,
             "renderbuffer_objects": 4,
             "draws_per_submission": 64,
-            "effective_vertices_per_draw": 4096,
+            "effective_vertices_per_submission": 4096,
+            "fan_or_loop_vertices_per_draw": 4096,
             "instances_per_draw": 64,
             "payload_sources": 32,
             "maximum_texture_dimension_px": 512,
@@ -2000,7 +2073,7 @@ int main(void) {
             "fragment_uniform_vectors": 16,
             "per_vertex_program_steps": 32,
             "per_vertex_program_constant_vectors": 15,
-            "per_vertex_program_steps_per_draw": 65536,
+            "per_vertex_program_steps_per_submission": 65536,
         })
         # The per-vertex program bounds are enforced by the translator and
         # again by the native interpreter.
@@ -2281,10 +2354,12 @@ int main(void) {
 
         docs_map = (ROOT / "docs/README.md").read_text(encoding="utf-8")
         guide = (ROOT / "docs/GAME_PROFILE.md").read_text(encoding="utf-8")
-        self.assertIn("[Game Profile v1.1](GAME_PROFILE.md)", docs_map)
+        self.assertIn("[Game Profile v1.2](GAME_PROFILE.md)", docs_map)
         self.assertIn("tilefinch-game-profile-v1.json", docs_map)
+        self.assertIn("tilefinch-game-profile-v1.1.json", docs_map)
         self.assertIn("tilefinch-game-profile-v1.json", guide)
         self.assertIn("tilefinch-game-profile-v1.1.json", guide)
+        self.assertIn("tilefinch-game-profile-v1.2.json", guide)
 
     def test_page_fullscreen_retracts_chrome_before_its_first_present(self):
         # Page script enters fullscreen during dispatch or the runtime
@@ -2940,6 +3015,59 @@ int main(void) {
             runtime.index("bool psp_navigation_cancel_requested(")]
         self.assertIn("psp_work_cooperate_begin(", begin)
         self.assertIn('"media-open", NULL, media_ui', begin)
+
+    def test_media_scopes_are_the_only_supervisors_over_the_player(self):
+        # A supervised scope begun with a media UI routes every player press
+        # into the supervisor's copy (route MEDIA). The browser loop drops
+        # its own edges only for the media open (psp_input_loop_edges), and
+        # the one-frame decode scope begins and ends inside the media step,
+        # after the loop sampled the pad. A third scope over the player,
+        # held across loop frames, would give one press two receivers again
+        # (one Down moved a media menu two rows).
+        media_scopes = []
+        for path in sorted((ROOT / "src").rglob("*.c")):
+            source = without_comments(path.read_text(encoding="utf-8"))
+            for arguments in call_arguments(source,
+                                            "psp_work_cooperate_begin"):
+                last = split_arguments(arguments)[-1]
+                if last == "NULL" or last.startswith("PspUiMediaState"):
+                    continue
+                media_scopes.append((path.name, last))
+        self.assertEqual(
+            [("psp_app_runtime.c", "media_ui"),
+             ("psp_script_main.c", "&browser->media.ui")],
+            sorted(media_scopes))
+        runtime = without_comments(
+            (ROOT / "src/psp_app/psp_app_runtime.c").read_text(
+                encoding="utf-8"))
+        internal = [split_arguments(arguments)[-2:] for arguments in
+                    call_arguments(runtime,
+                                   "psp_work_cooperate_begin_internal")]
+        self.assertIn(["media_ui", "false"], internal)
+        self.assertEqual(
+            [["media_ui", "false"]],
+            [pair for pair in internal if pair[0] != "NULL"
+             and not pair[0].startswith("PspUiMediaState")])
+
+        # Each media scope hands the pad back at its end: the loop takes
+        # the supervisor's last sample as already seen, so a press the
+        # supervisor queued after the loop's last sample is not a new edge
+        # on the next frame. The sample is read before the end clears the
+        # record.
+        main = without_comments(
+            (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
+        # The definitions, not the prototypes at the top of the file.
+        media_frame = main[
+            main.rindex("void psp_loop_media_frame("):
+            main.rindex("void psp_loop_apply_media_request(")]
+        for phase in ('"video-decoder-submit"', '"media-open"'):
+            end = media_frame.index("psp_navigation_cooperate_end(%s)" % phase)
+            observed = media_frame.rindex(
+                "psp_ui_buttons(psp_navigation_observed_buttons())", 0, end)
+            adopt = media_frame.index(
+                "interactive->previous_buttons = observed_buttons;", end)
+            self.assertLess(observed, end)
+            self.assertNotIn("psp_loop_", media_frame[end:adopt])
 
     def test_hidden_media_does_not_run_background_decode_or_refresh(self):
         source = without_comments(

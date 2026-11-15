@@ -385,6 +385,8 @@ static int text_cache_layout_matches(Budget *budget, const FontSet *fonts,
                                - before.text_measure_hits;
     delta->text_measure_misses = after.text_measure_misses
                                  - before.text_measure_misses;
+    delta->text_measure_shaped_hits = after.text_measure_shaped_hits
+                                      - before.text_measure_shaped_hits;
     return 0;
 }
 
@@ -393,6 +395,103 @@ static int text_cache_layout_matches(Budget *budget, const FontSet *fonts,
 #define TEXT_CACHE_WORDS \
     "Wave AVATAR tolerably fine wording Wave AVATAR tolerably fine " \
     "wording Wave AVATAR tolerably"
+
+/* Arabic words sized by intrinsic widths (cells, inline blocks, floats,
+   buttons). The same letters recur in contexts that must not share a
+   retained width: beside brackets, which mirror by level; with joiners at
+   a word edge, whose level follows the text before them; inside a longer
+   word (a hyphenated pair, break-all and anywhere segments); in a node
+   with a paragraph separator; and under other measurement inputs. */
+#define TEXT_CACHE_ARABIC_WORDS \
+    "\xd9\x85\xd8\xb1\xd8\xad\xd8\xa8\xd8\xa7 " /* marhaba */ \
+    "\xd8\xa7\xd9\x84\xd8\xb9\xd8\xa7\xd9\x84\xd9\x85 " /* al-alam */ \
+    "\xd9\x84\xd8\xa7 " /* la (lam-alef) */ \
+    "\xd9\x83\xd9\x80\xd8\xaa\xd8\xa7\xd8\xa8. " /* kitab, tatweel */ \
+    "\xd9\xa1\xd9\xa2\xd9\xa3\xd8\xa8 " /* Arabic digits + beh */ \
+    "Wi-Fi \xd8\xb3\xd9\x8f\xd9\x85\xd8\xad " /* sumih, damma */ \
+    "\xd9\x85\xd8\xb1\xd8\xad\xd8\xa8\xd8\xa7"
+
+static int test_text_measure_cache_arabic(void)
+{
+    Budget budget;
+    budget_init(&budget, 32u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    FontSet fonts;
+    CHECK(font_set_load(&fonts, &budget, TILEFINCH_TEST_SANS_FONT,
+                        TILEFINCH_TEST_SERIF_FONT,
+                        TILEFINCH_TEST_SANS_ITALIC_FONT,
+                        TILEFINCH_TEST_SANS_BOLD_FONT,
+                        TILEFINCH_TEST_SERIF_BOLD_FONT,
+                        TILEFINCH_TEST_METRIC_SANS_FONT,
+                        TILEFINCH_TEST_METRIC_SANS_BOLD_FONT, 2 * MIB));
+    static const char page[] =
+        "<!doctype html><style>body{margin:0;font-size:13px}"
+        ".shrink{display:inline-block}.float{float:left}"
+        ".all{word-break:break-all}.any{overflow-wrap:anywhere}"
+        ".spaced{letter-spacing:1px}.bold{font-weight:bold}"
+        ".big{font-size:19px}.upper{text-transform:uppercase}"
+        ".pre{white-space:pre}"
+        "</style><body>"
+        "<table><tr><td>" TEXT_CACHE_ARABIC_WORDS "</td>"
+        "<td dir=rtl>" TEXT_CACHE_ARABIC_WORDS "</td>"
+        "<td dir=ltr>Latin " TEXT_CACHE_ARABIC_WORDS "</td></tr></table>"
+        "<p><span class=shrink>" TEXT_CACHE_ARABIC_WORDS "</span></p>"
+        "<p dir=rtl><span class=shrink>(" TEXT_CACHE_ARABIC_WORDS
+        ") [\xd9\x84\xd8\xa7]</span></p>"
+        "<p dir=ltr><span class=shrink>a \xe2\x80\x8d\xd8\xa8\xd8\xa8"
+        " \xd8\xa8\xd8\xa8\xe2\x80\x8d b</span></p>"
+        "<p dir=rtl><span class=shrink>\xe2\x80\x8d\xd8\xa8\xd8\xa8"
+        " \xd8\xa8\xd8\xa8\xe2\x80\x8d</span></p>"
+        "<p><span class=shrink>\xd9\x85\xd8\xb1\xd8\xad\xd8\xa8\xd8\xa7-"
+        "\xd8\xa7\xd9\x84\xd8\xb9\xd8\xa7\xd9\x84\xd9\x85</span></p>"
+        "<div class='float all'>" TEXT_CACHE_ARABIC_WORDS "</div>"
+        "<div class='float any'>" TEXT_CACHE_ARABIC_WORDS "</div>"
+        "<p><span class='shrink pre'>" TEXT_CACHE_ARABIC_WORDS "\n"
+        TEXT_CACHE_ARABIC_WORDS "</span></p>"
+        "<p><button class=spaced>" TEXT_CACHE_ARABIC_WORDS "</button>"
+        "<button class=bold>" TEXT_CACHE_ARABIC_WORDS "</button>"
+        "<button class=big>" TEXT_CACHE_ARABIC_WORDS "</button>"
+        "<button class=upper>" TEXT_CACHE_ARABIC_WORDS "</button></p>"
+        "<p><span class=shrink>\xd9\x85\xd8\xb1\xd8\xad\xd8\xa8\xd8\xa7"
+        "\xd9\x85\xd8\xb1\xd8\xad\xd8\xa8\xd8\xa7\xd9\x85\xd8\xb1"
+        "\xd8\xad\xd8\xa8\xd8\xa7\xd9\x85\xd8\xb1\xd8\xad\xd8\xa8"
+        "</span></p>"
+        "</body>";
+    LayoutReuseCache *cache = layout_reuse_cache_create(&budget);
+    CHECK(cache != NULL);
+    LayoutReuseStats delta;
+    /* Every build through the table must draw what an uncached build
+       draws, which shapes every word in place. */
+    CHECK(text_cache_layout_matches(&budget, &fonts, cache, page, 480,
+                                    &delta) == 0);
+    CHECK(delta.text_measure_misses > 0);
+    CHECK(text_cache_layout_matches(&budget, &fonts, cache, page, 480,
+                                    &delta) == 0);
+    /* The second document's words come from the first one's: a shaped
+       hit for each whole word of the cells, boxes and buttons. */
+    CHECK(delta.text_measure_misses == 0);
+    CHECK(delta.text_measure_shaped_hits > 60);
+    CHECK(text_cache_layout_matches(&budget, &fonts, cache, page, 140,
+                                    &delta) == 0);
+    CHECK(delta.text_measure_shaped_hits > 60);
+    /* Words whose forms can follow their surroundings are shaped in place
+       every time, never retained. */
+    static const char contextual[] =
+        "<!doctype html><style>body{margin:0;font-size:13px}</style><body>"
+        "<table><tr><td dir=rtl>(\xd9\x84\xd8\xa7) "
+        "\xc2\xab\xd9\x85\xd8\xb1\xd8\xad\xd8\xa8\xd8\xa7\xc2\xbb</td>"
+        "<td dir=ltr>a \xe2\x80\x8d\xd8\xa8\xd8\xa8 "
+        "\xd8\xa8\xe2\x80\x8c\xd8\xa8</td></tr></table></body>";
+    for (int pass = 0; pass < 2; pass++) {
+        CHECK(text_cache_layout_matches(&budget, &fonts, cache, contextual,
+                                        480, &delta) == 0);
+        CHECK(delta.text_measure_shaped_hits == 0);
+    }
+    layout_reuse_cache_destroy(cache);
+    font_set_destroy(&fonts);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
 
 static int test_text_measure_cache_layout(void)
 {

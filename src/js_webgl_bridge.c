@@ -507,11 +507,83 @@ enum {
     WEBGL_FLOAT = 0x1406,
     WEBGL_DEPTH_BUFFER_BIT = 0x0100,
     WEBGL_COLOR_BUFFER_BIT = 0x4000,
+    WEBGL_SRC_COLOR = 0x0300,
+    WEBGL_ONE_MINUS_SRC_COLOR = 0x0301,
     WEBGL_SRC_ALPHA = 0x0302,
     WEBGL_ONE_MINUS_SRC_ALPHA = 0x0303,
+    WEBGL_DST_COLOR = 0x0306,
+    WEBGL_ONE_MINUS_DST_COLOR = 0x0307,
     WEBGL_ONE = 1,
     WEBGL_ZERO = 0
 };
+
+/* Command words 31 and 32 carry the source and destination blend factors:
+   one of the enums above, or WEBGL_BLEND_FIXED | 0xBBGGRR, a fixed colour
+   (the GE's GU_FIX layout) that webgl.js resolves from blendColor() for
+   the constant factors. webgl.js sends DST_ALPHA as ONE, and
+   ONE_MINUS_DST_ALPHA and SRC_ALPHA_SATURATE as ZERO: the drawing
+   buffer's alpha is 1. */
+#define WEBGL_BLEND_FIXED 0x01000000
+
+static bool webgl_blend_fixed(int factor)
+{
+    return (factor & ~0x00ffffff) == WEBGL_BLEND_FIXED;
+}
+
+/* The factors each GE operand can weigh by (pspgu.h sceGuBlendFunc): both
+   take the source alpha factors and a fixed colour, and each takes the
+   other operand's colour (GU_OTHER_COLOR, GU_ONE_MINUS_OTHER_COLOR), so
+   the source is weighed by DST_COLOR and the destination by SRC_COLOR,
+   never the reverse. */
+static bool webgl_blend_factor_valid(int factor, bool source)
+{
+    switch (factor) {
+    case WEBGL_ZERO: case WEBGL_ONE:
+    case WEBGL_SRC_ALPHA: case WEBGL_ONE_MINUS_SRC_ALPHA:
+        return true;
+    case WEBGL_DST_COLOR: case WEBGL_ONE_MINUS_DST_COLOR:
+        return source;
+    case WEBGL_SRC_COLOR: case WEBGL_ONE_MINUS_SRC_COLOR:
+        return !source;
+    default:
+        return webgl_blend_fixed(factor);
+    }
+}
+
+/* Command word 27: blending off, or the blend equation (webgl.js BLEND_WIRE). */
+enum {
+    WEBGL_BLEND_OFF = 0,
+    WEBGL_BLEND_ADD = 1,
+    WEBGL_BLEND_MIN = 2,
+    WEBGL_BLEND_MAX = 3,
+    WEBGL_BLEND_SUBTRACT = 4,
+    WEBGL_BLEND_REVERSE_SUBTRACT = 5
+};
+
+static bool webgl_blend_alpha_factor(int factor)
+{
+    return factor == WEBGL_ZERO || factor == WEBGL_ONE
+        || factor == WEBGL_SRC_ALPHA || factor == WEBGL_ONE_MINUS_SRC_ALPHA;
+}
+
+/* Only an unblended draw, or a FUNC_ADD draw weighed by ZERO, ONE and the
+   source alpha, gets an antialiasing coverage fringe. The fringe is a
+   partial-coverage blend of the fragment over the retained pixel (an
+   "over" blend on the GE). MIN/MAX have no partial form, and a subtraction
+   clamps each sample at zero before a multisample resolve would average
+   it, so a coverage-weighted subtraction is not what a multisample buffer
+   would give; the GE's fixed "over" fringe would even lighten the edge of
+   a draw that darkens. A colour or fixed-colour factor (a multiply, a
+   constant opacity) has no coverage form in the fragment's alpha either:
+   the "over" fringe would draw a multiply's edge as a plain mix. */
+static bool webgl_blend_has_fringe(int blend, int source_factor,
+                                   int destination_factor)
+{
+    return blend == WEBGL_BLEND_OFF
+        || (blend == WEBGL_BLEND_ADD
+            && webgl_blend_alpha_factor(source_factor)
+            && webgl_blend_alpha_factor(destination_factor));
+}
 
 typedef struct {
     const uint8_t *bytes;
@@ -1794,45 +1866,76 @@ static bool webgl_blend_factors(const uint8_t *command, bool blend,
                               source)
         || !webgl_integer_in_range(webgl_wire_i32(command, 32u), 0, INT_MAX,
                                  destination)) return false;
-    bool source_valid = *source == WEBGL_ZERO || *source == WEBGL_ONE
-        || *source == WEBGL_SRC_ALPHA
-        || *source == WEBGL_ONE_MINUS_SRC_ALPHA;
-    bool destination_valid = *destination == WEBGL_ZERO
-        || *destination == WEBGL_ONE || *destination == WEBGL_SRC_ALPHA
-        || *destination == WEBGL_ONE_MINUS_SRC_ALPHA;
-    return source_valid && destination_valid;
+    return webgl_blend_factor_valid(*source, true)
+        && webgl_blend_factor_valid(*destination, false);
 }
 
-static float webgl_blend_weight(int factor, float source_alpha)
+/* The weight of one colour channel. SOURCE and DESTINATION are that
+   channel of the fragment and the drawing buffer, in [0, 1]. */
+static float webgl_blend_weight(int factor, size_t channel,
+                                float source_alpha, float source,
+                                float destination)
 {
-    if (factor == WEBGL_ZERO) return 0.0f;
-    if (factor == WEBGL_ONE) return 1.0f;
-    if (factor == WEBGL_SRC_ALPHA) return source_alpha;
-    return 1.0f - source_alpha;
+    switch (factor) {
+    case WEBGL_ZERO: return 0.0f;
+    case WEBGL_ONE: return 1.0f;
+    case WEBGL_SRC_ALPHA: return source_alpha;
+    case WEBGL_ONE_MINUS_SRC_ALPHA: return 1.0f - source_alpha;
+    case WEBGL_SRC_COLOR: return source;
+    case WEBGL_ONE_MINUS_SRC_COLOR: return 1.0f - source;
+    case WEBGL_DST_COLOR: return destination;
+    case WEBGL_ONE_MINUS_DST_COLOR: return 1.0f - destination;
+    default:
+        return (float) (((unsigned) factor >> (8u * channel)) & 0xffu)
+            / 255.0f;
+    }
 }
 
+/* BLEND is the command's blend word: WEBGL_BLEND_OFF, or the equation
+   (FUNC_ADD, FUNC_SUBTRACT or FUNC_REVERSE_SUBTRACT with the factors, or
+   EXT_blend_minmax's MIN/MAX, which take no factors, per channel, as the
+   GE's GU_MIN/GU_MAX). A subtraction clamps at zero, as a unorm buffer
+   does after the equation. */
 static void webgl_pixel(uint8_t *surface, int width, int height, int x, int y,
                         float red, float green, float blue, float alpha,
-                        bool blend, int source_factor,
+                        int blend, int source_factor,
                         int destination_factor)
 {
     if (x < 0 || y < 0 || x >= width || y >= height) return;
     size_t at = ((size_t) y * (size_t) width + (size_t) x) * 4u;
     float source_alpha = fmaxf(0.0f, fminf(1.0f, alpha / 255.0f));
-    if (blend) {
-        float source_weight = webgl_blend_weight(
-            source_factor, source_alpha);
-        float destination_weight = webgl_blend_weight(
-            destination_factor, source_alpha);
-        surface[at] = webgl_channel_byte(
-            red * source_weight
-                + (float) surface[at] * destination_weight + 0.5f);
-        surface[at + 1u] = webgl_channel_byte(
-            green * source_weight
-                + (float) surface[at + 1u] * destination_weight + 0.5f);
-        surface[at + 2u] = webgl_channel_byte(
-            blue * source_weight
-                + (float) surface[at + 2u] * destination_weight + 0.5f);
+    if (blend == WEBGL_BLEND_MIN || blend == WEBGL_BLEND_MAX) {
+        const float source[3] = {red, green, blue};
+        for (size_t channel = 0; channel < 3u; channel++) {
+            /* The fragment's colour as an unblended draw writes it. */
+            uint8_t value = webgl_channel_byte(source[channel]);
+            uint8_t retained = surface[at + channel];
+            surface[at + channel] = blend == WEBGL_BLEND_MIN
+                ? (value < retained ? value : retained)
+                : (value > retained ? value : retained);
+        }
+        surface[at + 3u] = 255u;
+    } else if (blend != WEBGL_BLEND_OFF) {
+        /* The source and destination signs of the equation. */
+        float source_sign = blend == WEBGL_BLEND_REVERSE_SUBTRACT
+            ? -1.0f : 1.0f;
+        float destination_sign = blend == WEBGL_BLEND_SUBTRACT
+            ? -1.0f : 1.0f;
+        const float source[3] = {red, green, blue};
+        for (size_t channel = 0; channel < 3u; channel++) {
+            float value = fmaxf(0.0f, fminf(255.0f, source[channel]));
+            float retained = (float) surface[at + channel];
+            float source_weight = webgl_blend_weight(
+                source_factor, channel, source_alpha, value / 255.0f,
+                retained / 255.0f);
+            float destination_weight = webgl_blend_weight(
+                destination_factor, channel, source_alpha, value / 255.0f,
+                retained / 255.0f);
+            surface[at + channel] = webgl_channel_byte(
+                source_sign * source[channel] * source_weight
+                    + destination_sign * retained * destination_weight
+                    + 0.5f);
+        }
         surface[at + 3u] = 255u;
     } else {
         surface[at] = webgl_channel_byte(red);
@@ -1857,7 +1960,7 @@ typedef struct {
     int depth_function;
     int cull_face;
     int front_face;
-    bool blend;
+    int blend;
     bool depth;
     bool cull;
     const WebglMaterial *material;
@@ -1878,7 +1981,11 @@ static void webgl_pixel_coverage(
                     state->source_factor, state->destination_factor);
         return;
     }
-    if (coverage <= 0.0f) return;
+    /* MIN/MAX, subtract and colour-factor draws keep only the pixels they
+       own (webgl_blend_has_fringe), and the GE draws no fringe for them. */
+    if (coverage <= 0.0f
+        || !webgl_blend_has_fringe(state->blend, state->source_factor,
+                                   state->destination_factor)) return;
     if (!state->blend) {
         webgl_pixel(surface, width, height, x, y,
                     red, green, blue, coverage * 255.0f, true,
@@ -1945,8 +2052,9 @@ static bool webgl_raster_state_decode(const uint8_t *command,
     int blend = 0, depth = 0, cull = 0;
     *state = (WebglRasterState) {0};
     if (!webgl_scissor_decode(command, surface_height, &state->scissor)
-        || !webgl_integer_in_range(webgl_wire_i32(command, 27u), 0, 1,
-                                   &blend)
+        || !webgl_integer_in_range(webgl_wire_i32(command, 27u),
+                                   WEBGL_BLEND_OFF,
+                                   WEBGL_BLEND_REVERSE_SUBTRACT, &blend)
         || !webgl_integer_in_range(webgl_wire_i32(command, 28u), 0, 1,
                                    &depth)
         || !webgl_integer_in_range(webgl_wire_i32(command, 29u), 0, 1,
@@ -1954,7 +2062,7 @@ static bool webgl_raster_state_decode(const uint8_t *command,
         || !webgl_blend_factors(command, blend != 0,
                                 &state->source_factor,
                                 &state->destination_factor)) return false;
-    state->blend = blend != 0;
+    state->blend = blend;
     state->depth = depth != 0;
     state->cull = cull != 0;
     if (state->depth
@@ -3812,6 +3920,31 @@ static bool webgl_ge_material_lit(
     return true;
 }
 
+#if defined(__PSP__)
+/* The GE code for a factor word in one operand (pspgu.h sceGuBlendFunc).
+   The colour codes name the other operand's colour: code 0 is the drawing
+   buffer's colour as a source factor (DST_COLOR) and the fragment's as a
+   destination factor (SRC_COLOR). ZERO, ONE and fixed colours are GU_FIX
+   with *FIX set. -1 when the operand cannot weigh by FACTOR. */
+static int webgl_ge_blend_factor(int factor, bool source, unsigned int *fix)
+{
+    *fix = 0;
+    if (!webgl_blend_factor_valid(factor, source)) return -1;
+    switch (factor) {
+    case WEBGL_ZERO: return GU_FIX;
+    case WEBGL_ONE: *fix = 0x00ffffffu; return GU_FIX;
+    case WEBGL_SRC_ALPHA: return GU_SRC_ALPHA;
+    case WEBGL_ONE_MINUS_SRC_ALPHA: return GU_ONE_MINUS_SRC_ALPHA;
+    case WEBGL_DST_COLOR: case WEBGL_SRC_COLOR: return GU_OTHER_COLOR;
+    case WEBGL_ONE_MINUS_DST_COLOR: case WEBGL_ONE_MINUS_SRC_COLOR:
+        return GU_ONE_MINUS_OTHER_COLOR;
+    default:
+        *fix = (unsigned int) factor & 0x00ffffffu;
+        return GU_FIX;
+    }
+}
+#endif
+
 static bool webgl_render_ge(DomBridge *bridge,
                             int64_t canvas_handle,
                             uint8_t *surface,
@@ -4440,35 +4573,50 @@ static bool webgl_render_ge(DomBridge *bridge,
             sceGuTexWrap(texture->repeat_s ? GU_REPEAT : GU_CLAMP,
                          texture->repeat_t ? GU_REPEAT : GU_CLAMP);
         } else sceGuDisable(GU_TEXTURE_2D);
-        if (webgl_wire_i32(command, 27u) != 0) {
-            int source_factor = 0, destination_factor = 0;
-            if (!webgl_integer_in_range(webgl_wire_i32(command, 31u), 0,
-                                      INT_MAX, &source_factor)
-                || !webgl_integer_in_range(webgl_wire_i32(command, 32u), 0,
-                                         INT_MAX, &destination_factor)) {
-                sceGuFinish(); sceGuSync(0, 0); budget_free(budget, scratch);
-                return false;
+        int blend_word = 0;
+        if (!webgl_integer_in_range(webgl_wire_i32(command, 27u),
+                                    WEBGL_BLEND_OFF,
+                                    WEBGL_BLEND_REVERSE_SUBTRACT,
+                                    &blend_word)) {
+            sceGuFinish(); sceGuSync(0, 0); budget_free(budget, scratch);
+            return false;
+        }
+        int source_factor = WEBGL_ONE, destination_factor = WEBGL_ZERO;
+        if (blend_word == WEBGL_BLEND_MIN || blend_word == WEBGL_BLEND_MAX) {
+            /* GU_MIN/GU_MAX compare the colours themselves (pspgu.h: "Cs < Cd
+               ? Cs : Cd"), as WebGL's MIN_EXT/MAX_EXT ignore the factors.
+               Fixed ONE factors keep the result exact even on a GE that
+               weighted the operands first. */
+            sceGuEnable(GU_BLEND);
+            sceGuBlendFunc(blend_word == WEBGL_BLEND_MIN ? GU_MIN : GU_MAX,
+                           GU_FIX, GU_FIX, UINT32_C(0x00ffffff),
+                           UINT32_C(0x00ffffff));
+        } else if (blend_word != WEBGL_BLEND_OFF) {
+            unsigned int source_fix = 0, destination_fix = 0;
+            int source_ge = -1, destination_ge = -1;
+            if (webgl_integer_in_range(webgl_wire_i32(command, 31u), 0,
+                                       INT_MAX, &source_factor)
+                && webgl_integer_in_range(webgl_wire_i32(command, 32u), 0,
+                                          INT_MAX, &destination_factor)) {
+                source_ge = webgl_ge_blend_factor(source_factor, true,
+                                                  &source_fix);
+                destination_ge = webgl_ge_blend_factor(
+                    destination_factor, false, &destination_fix);
             }
-            int source_ge = source_factor == WEBGL_ZERO ? GU_FIX
-                : source_factor == WEBGL_ONE ? GU_FIX
-                : source_factor == WEBGL_SRC_ALPHA ? GU_SRC_ALPHA
-                : source_factor == WEBGL_ONE_MINUS_SRC_ALPHA
-                    ? GU_ONE_MINUS_SRC_ALPHA : -1;
-            int destination_ge = destination_factor == WEBGL_ZERO ? GU_FIX
-                : destination_factor == WEBGL_ONE ? GU_FIX
-                : destination_factor == WEBGL_SRC_ALPHA ? GU_SRC_ALPHA
-                : destination_factor == WEBGL_ONE_MINUS_SRC_ALPHA
-                    ? GU_ONE_MINUS_SRC_ALPHA : -1;
             if (source_ge < 0 || destination_ge < 0) {
                 sceGuFinish(); sceGuSync(0, 0); budget_free(budget, scratch);
                 return false;
             }
+            /* GU_SUBTRACT is Cs*Bs - Cd*Bd and GU_REVERSE_SUBTRACT
+               Cd*Bd - Cs*Bs (pspgu.h), as FUNC_SUBTRACT and
+               FUNC_REVERSE_SUBTRACT; the GE clamps the result at zero as
+               WebGL's unorm buffer does. */
             sceGuEnable(GU_BLEND);
             sceGuBlendFunc(
-                GU_ADD, source_ge, destination_ge,
-                source_factor == WEBGL_ONE ? UINT32_C(0x00ffffff) : 0,
-                destination_factor == WEBGL_ONE
-                    ? UINT32_C(0x00ffffff) : 0);
+                blend_word == WEBGL_BLEND_SUBTRACT ? GU_SUBTRACT
+                    : blend_word == WEBGL_BLEND_REVERSE_SUBTRACT
+                        ? GU_REVERSE_SUBTRACT : GU_ADD,
+                source_ge, destination_ge, source_fix, destination_fix);
         } else sceGuDisable(GU_BLEND);
         if (webgl_wire_i32(command, 28u) != 0) {
             int depth_function = 0;
@@ -4690,8 +4838,12 @@ static bool webgl_render_ge(DomBridge *bridge,
            hardware coverage to line fragments.  Re-submit triangle edges as
            uint16 indices into the already transformed vertex array.  This
            keeps AA transient (two bytes per edge endpoint), and culling skips
-           it because line primitives cannot reproduce a culled face test. */
+           it because line primitives cannot reproduce a culled face test.
+           Only blending off or FUNC_ADD gets a fringe, as on the host
+           (webgl_blend_has_fringe). */
         if (antialias && !cull && mode >= WEBGL_TRIANGLES
+            && webgl_blend_has_fringe(blend_word, source_factor,
+                                      destination_factor)
             && edge_index_cursor < edge_index_capacity) {
             float compact_extent[3];
             bool compact_extent_valid =
@@ -5085,6 +5237,25 @@ JSValue js_webgl_release_surface(JSContext *context,
     return JS_NewBool(context, released);
 }
 
+/* Ends a frame whose last flush came before the end of its task (a forced
+   flush with nothing drawn after it): the drawing buffer is complete. */
+JSValue js_webgl_publish_frame(JSContext *context, JSValueConst this_value,
+                               int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    if (bridge == NULL || bridge->images == NULL || argc < 1)
+        return JS_NewBool(context, false);
+    int64_t handle = 0;
+    if (JS_ToInt64(context, &handle, argv[0]) < 0) return JS_EXCEPTION;
+    lxb_dom_node_t *node = webgl_resolve_canvas(bridge, handle);
+    if (node == NULL) return JS_NewBool(context, false);
+    bool published = images_canvas_frame_publish(bridge->images, node);
+    if (published && bridge_node_is_connected(node))
+        js_rt_bridge_note_canvas_mutation(bridge, node, true);
+    return JS_NewBool(context, published);
+}
+
 static lxb_dom_node_t *webgl_resolve_canvas(DomBridge *bridge, int64_t handle)
 {
     size_t slot = 0;
@@ -5102,7 +5273,9 @@ JSValue js_webgl_index_maximum(JSContext *context, JSValueConst this_value,
     if (JS_ToInt32(context, &type, argv[1]) < 0
         || JS_ToInt32(context, &offset, argv[2]) < 0
         || JS_ToInt32(context, &count, argv[3]) < 0) return JS_EXCEPTION;
-    if (offset < 0 || count < 0 || count > (int32_t) WEBGL_VERTEX_LIMIT
+    /* A draw over WEBGL_VERTEX_LIMIT is split into parts in webgl.js, but
+       its whole index range is admitted once; the buffer bounds it. */
+    if (offset < 0 || count < 0
         || (type != WEBGL_UNSIGNED_BYTE && type != WEBGL_UNSIGNED_SHORT))
         return JS_NewInt32(context, -1);
     const uint8_t *bytes = NULL;
@@ -5267,6 +5440,8 @@ JSValue js_webgl_render(JSContext *context, JSValueConst this_value,
     bool antialias = argc >= 7 && JS_ToBool(context, argv[6]) > 0;
     bool preserve_drawing_buffer = argc >= 8
         && JS_ToBool(context, argv[7]) > 0;
+    /* More of this frame follows in the same task (webgl.js _flush). */
+    bool frame_open = argc >= 10 && JS_ToBool(context, argv[9]) > 0;
 #if !defined(__PSP__)
     (void) preserve_drawing_buffer;
 #endif
@@ -5388,6 +5563,10 @@ JSValue js_webgl_render(JSContext *context, JSValueConst this_value,
     uint16_t *depth = NULL;
     if (rendered && needs_depth) rendered = images_prepare_canvas_depth(
         bridge->images, bridge->budget, node, width, height, &depth);
+    /* Before the drawing buffer takes part of a frame: painters keep
+       showing the last complete one until the frame's last flush. */
+    if (rendered && frame_open)
+        images_canvas_frame_hold(bridge->images, bridge->budget, node);
     if (rendered) {
 #if defined(__PSP__)
         bool native_authoritative = false;
@@ -5417,6 +5596,7 @@ JSValue js_webgl_render(JSContext *context, JSValueConst this_value,
     webgl_sources_release(context, sources, source_count);
     JS_FreeValue(context, command_buffer);
     if (!rendered) return JS_NewInt32(context, 0);
+    if (!frame_open) (void) images_canvas_frame_publish(bridge->images, node);
     (void) images_set_canvas_opaque(bridge->images, node, true);
     if (bridge_node_is_connected(node)) js_rt_bridge_note_canvas_mutation(
         bridge, node, prepared == IMAGE_CANVAS_COMMIT_UPDATED);

@@ -3806,6 +3806,169 @@ static bool svg_pixel_is(const ImageResources *images, lxb_dom_node_t *node,
         && (blue > 128 ? pixel[2] > 240 : pixel[2] < 16);
 }
 
+/* The committed page's load of a preview's table's markup. */
+static bool svg_preview_page_load(PocDocument *document,
+                                  Stylesheet *stylesheet,
+                                  ImageResources *page,
+                                  const ImageResources *preview,
+                                  Budget *budget)
+{
+    images_lend_preview_rasters(page, preview);
+    bool loaded = images_load_external(
+        document, stylesheet, page, budget,
+        "https://svg-refresh.test/", "https://svg-refresh.test/", NULL,
+        8, 64 * 1024, 32 * 1024, 64 * 1024, 1000, NULL, NULL);
+    images_lend_preview_rasters(page, NULL);
+    return loaded;
+}
+
+/* Whether `node`'s page entry shows `preview`'s raster for `preview_node`
+   through one more reference on the same body. */
+static bool svg_preview_shared(const ImageResources *page,
+                               lxb_dom_node_t *node,
+                               const ImageResources *preview,
+                               lxb_dom_node_t *preview_node,
+                               size_t references)
+{
+    const ImageResource *item = images_find_node(page, node);
+    const ImageResource *lent = images_find_node(preview, preview_node);
+    return item != NULL && lent != NULL && lent->pixel_body != NULL
+        && lent->shared_svg_raster && item->shared_svg_raster
+        && item->pixels == lent->pixels
+        && item->pixel_body == lent->pixel_body
+        && lent->pixel_body->references == references;
+}
+
+/* A loading preview rasterizes the first screen's inline SVGs
+   (images_rasterize_inline_svgs); the committed page's load shares those
+   rasters instead of drawing the same markup again, and each table keeps
+   its own reference, so either can go first (the stream drops the preview
+   after the commit; a cancelled or replaced page goes before it). */
+static bool test_inline_svg_preview_rasters_shared(Budget *budget)
+{
+    static const char html[] =
+        "<!doctype html><style>body{margin:0}.base{color:#ff0000}</style>"
+        "<body><div class=base>"
+        "<i id=a><svg width=16 height=16 viewBox='0 0 16 16'>"
+        "<path fill=currentColor d='M0 0h16v16H0z'/></svg></i>"
+        "<i id=b><svg width=16 height=16 viewBox='0 0 16 16'>"
+        "<path fill=currentColor d='M0 0h16v16H0z'/></svg></i>"
+        "<i id=c><svg width=16 height=16 viewBox='0 0 16 16'>"
+        "<path fill=currentColor d='M0 8L8 0L16 8L8 16z'/></svg></i>"
+        "<i id=d><svg width=12 height=12 viewBox='0 0 16 16'>"
+        "<path fill=currentColor d='M0 8L8 0L16 8L8 16z'/></svg></i>"
+        "</div></body>";
+    size_t baseline = budget->current;
+    PocDocument document = {0};
+    Stylesheet stylesheet = {0};
+    ImageResources preview = {0};
+    bool ok = document_parse(&document, budget, html, sizeof(html) - 1, 17)
+        && stylesheet_build(&stylesheet, budget, &document, 480);
+    lxb_dom_node_t *root = ok ? lxb_dom_interface_node(document.html) : NULL;
+    lxb_dom_node_t *nodes[4] = {NULL, NULL, NULL, NULL};
+    static const char *const wrappers[4] = {"a", "b", "c", "d"};
+    for (size_t i = 0; ok && i < 4; i++) {
+        lxb_dom_node_t *wrapper = find_id(root, wrappers[i]);
+        nodes[i] = wrapper == NULL ? NULL : wrapper->first_child;
+        ok = nodes[i] != NULL;
+    }
+    /* The preview drew a and c; b is a's markup, d nothing it drew. */
+    size_t added = 0;
+    lxb_dom_node_t *drawn[2] = {nodes[0], nodes[2]};
+    ok = ok && images_rasterize_inline_svgs(
+            &document, &stylesheet, &preview, drawn, 2, budget,
+            128u * 1024u, &added)
+        && added == 2 && preview.stats.inline_svg_rasterized == 2;
+    SvgRasterSnapshot expected[4];
+    for (size_t i = 0; ok && i < 4; i++) {
+        ImageResources fresh = {0};
+        ok = images_load_external(
+                &document, &stylesheet, &fresh, budget,
+                "https://svg-refresh.test/", "https://svg-refresh.test/",
+                NULL, 8, 64 * 1024, 32 * 1024, 64 * 1024, 1000, NULL, NULL)
+            && svg_raster_snapshot(&fresh, nodes[i], &expected[i]);
+        images_destroy(&fresh);
+    }
+    size_t preview_resident = budget->current;
+
+    /* (a) The page shares a's and c's rasters (b aliases a) and draws only
+       d; the pixels are a fresh decode's. */
+    ImageResources page = {0};
+    ok = ok && svg_preview_page_load(&document, &stylesheet, &page,
+                                     &preview, budget)
+        && page.count == 4
+        && page.stats.inline_svg_preview_reused == 2
+        && page.stats.inline_svg_rasterized == 1
+        && page.stats.duplicate == 1
+        && page.stats.decoded_bytes == 2u * 16u * 16u * 4u + 12u * 12u * 4u
+        && svg_preview_shared(&page, nodes[0], &preview, nodes[0], 2)
+        && svg_preview_shared(&page, nodes[2], &preview, nodes[2], 2);
+    for (size_t i = 0; ok && i < 4; i++)
+        ok = svg_raster_matches(&page, nodes[i], &expected[i]);
+
+    /* (b) A mutation refresh reuses the shared rasters like plain ones. */
+    size_t resident = budget->current;
+    ok = ok && svg_refresh(&document, &stylesheet, &page, budget, nodes, 4)
+        && page.stats.inline_svg_rasterized == 1
+        && page.stats.inline_svg_refresh_reused == 3
+        && budget->current == resident
+        && svg_preview_shared(&page, nodes[0], &preview, nodes[0], 2)
+        && svg_preview_shared(&page, nodes[2], &preview, nodes[2], 2);
+    for (size_t i = 0; ok && i < 4; i++)
+        ok = svg_raster_matches(&page, nodes[i], &expected[i]);
+
+    /* (c) The preview goes first: the page keeps the pixels alone. */
+    const BrowserSharedBody *a_body = ok
+        ? images_find_node(&page, nodes[0])->pixel_body : NULL;
+    images_destroy(&preview);
+    ok = ok && a_body->references == 1;
+    for (size_t i = 0; ok && i < 4; i++)
+        ok = svg_raster_matches(&page, nodes[i], &expected[i]);
+    images_destroy(&page);
+    ok = ok && images_rasterize_inline_svgs(
+            &document, &stylesheet, &preview, drawn, 2, budget,
+            128u * 1024u, &added)
+        && budget->current == preview_resident;
+
+    /* (d) The page goes first (a cancelled load, or the next navigation):
+       the preview's rasters are intact. */
+    ok = ok && svg_preview_page_load(&document, &stylesheet, &page,
+                                     &preview, budget)
+        && page.stats.inline_svg_preview_reused == 2;
+    images_destroy(&page);
+    ok = ok && budget->current == preview_resident
+        && svg_raster_matches(&preview, nodes[0], &expected[0])
+        && svg_raster_matches(&preview, nodes[2], &expected[2])
+        && images_find_node(&preview, nodes[0])->pixel_body->references == 1;
+
+    /* (e) Under refusal at every allocation step the page either loads,
+       sharing, or rolls back without a reference left behind. */
+    bool loaded = false;
+    for (size_t step = 0; ok && !loaded && step < 256; step++) {
+        budget_inject_failure_after(budget, step);
+        loaded = svg_preview_page_load(&document, &stylesheet, &page,
+                                       &preview, budget);
+        budget_clear_failure_injection(budget);
+        for (size_t i = 0; ok && i < 4; i++) {
+            const ImageResource *item = images_find_node(&page, nodes[i]);
+            ok = item == NULL || item->pixels == NULL
+                || svg_raster_matches(&page, nodes[i], &expected[i]);
+        }
+        images_destroy(&page);
+        ok = ok && budget->current == preview_resident
+            && images_find_node(&preview, nodes[0])->pixel_body->references
+                   == 1
+            && images_find_node(&preview, nodes[2])->pixel_body->references
+                   == 1;
+    }
+    ok = ok && loaded;
+
+    images_destroy(&preview);
+    stylesheet_destroy(&stylesheet);
+    document_destroy(&document);
+    return ok && budget->current == baseline;
+}
+
 static bool test_inline_svg_refresh_shares_style_memos(Budget *budget)
 {
     char html[8192];

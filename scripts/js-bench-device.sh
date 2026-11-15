@@ -3,12 +3,17 @@
 # PSPLink (host0, zero Memory Stick writes) and print the launch command.
 # It does not touch the device itself.
 #
-#   scripts/js-bench-device.sh [BUILD_DIR] [TRACE_DIR] [SCALE]
+#   scripts/js-bench-device.sh [BUILD_DIR] TRACE_DIR [SCALE]
+#   JS_BENCH_TRACE=TRACE_DIR scripts/js-bench-device.sh [BUILD_DIR]
 #
 # BUILD_DIR  a PSP validation build (default build-preset-psp-validation;
 #            build-psp-qjs-o2 for the engine-at--O2 variant)
-# TRACE_DIR  an HTTP trace whose JavaScript records the bench compiles
-#            (default ../tf-replay/perf/traces/chatgpt-ask-send76)
+# TRACE_DIR  required: an HTTP trace directory (with trace.meta) whose
+#            JavaScript records the bench compiles, as the second argument
+#            or in JS_BENCH_TRACE. There is no default: kernel timings depend
+#            on the trace, so every run names the one it measures. The
+#            boot.cfg opens https://chatgpt.com/, so a ChatGPT ask-and-send
+#            capture is the trace earlier results were measured with.
 # SCALE      validation_js_bench iteration scale (default 1; about 35 s of
 #            kernels under PPSSPP at 333 MHz, 2-3x that on the device)
 #
@@ -17,8 +22,15 @@
 #   python3 tools/js_bench_compare.py host=HOST.txt ppsspp=PPSSPP.txt device=LOG
 set -eu
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+usage() {
+    echo "usage: $0 [BUILD_DIR] TRACE_DIR [SCALE]" >&2
+    echo "   or: JS_BENCH_TRACE=TRACE_DIR $0 [BUILD_DIR]" >&2
+    echo "TRACE_DIR is an HTTP trace directory with trace.meta (required)" >&2
+    exit 2
+}
 H=${1:-$ROOT/build-preset-psp-validation}
-TRACE=${2:-$ROOT/../tf-replay/perf/traces/chatgpt-ask-send76}
+TRACE=${2:-${JS_BENCH_TRACE:-}}
+[ -n "$TRACE" ] || usage
 SCALE=${3:-1}
 [ -f "$H/EBOOT.PBP" ] || { echo "no EBOOT.PBP in $H" >&2; exit 2; }
 [ -f "$TRACE/trace.meta" ] || { echo "no trace.meta in $TRACE" >&2; exit 2; }

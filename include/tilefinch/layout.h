@@ -1131,6 +1131,9 @@ typedef struct {
     size_t text_measure_misses;
     size_t text_measure_evictions;
     size_t text_measure_bytes;
+    /* Of text_measure_hits, the shaped widths of whole Arabic words that
+       intrinsic sizing took instead of shaping the word's node. */
+    size_t text_measure_shaped_hits;
 } LayoutReuseStats;
 
 /* Exclusive flow attribution; native placement includes unclassified flow

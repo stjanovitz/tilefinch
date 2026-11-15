@@ -105,7 +105,9 @@ uint16_t *psp_display_back_buffer(const PspDisplay *display)
 
 #if defined(_MIPS_ARCH_ALLEGREX)
 static __attribute__((noinline)) void psp_display_copy_rows_vfpu(
-    uint16_t *back, const uint16_t *frame, unsigned top, unsigned end)
+    unsigned char *back, size_t destination_stride,
+    const unsigned char *frame, size_t source_stride,
+    size_t row_bytes, size_t rows)
 {
     uint32_t saved[16] __attribute__((aligned(16)));
     /* Only loads/stores: prefixes are neither applied nor consumed. Save
@@ -114,10 +116,10 @@ static __attribute__((noinline)) void psp_display_copy_rows_vfpu(
         "sv.q C000,0(%0)\n" "sv.q C010,16(%0)\n"
         "sv.q C020,32(%0)\n" "sv.q C030,48(%0)\n"
         : : "r" (saved) : "memory");
-    for (unsigned y = top; y < end; y++) {
-        const uint16_t *source = frame + (size_t) y * PSP_DISPLAY_SCREEN_WIDTH;
-        uint16_t *destination = back + (size_t) y * PSP_DISPLAY_STRIDE;
-        for (unsigned x = 0; x < PSP_DISPLAY_SCREEN_WIDTH; x += 32u) {
+    for (size_t y = 0; y < rows; y++) {
+        const unsigned char *source = frame + y * source_stride;
+        unsigned char *destination = back + y * destination_stride;
+        for (size_t x = 0; x < row_bytes; x += 64u) {
             __asm__ volatile (
                 "lv.q C000,0(%0)\n" "lv.q C010,16(%0)\n"
                 "lv.q C020,32(%0)\n" "lv.q C030,48(%0)\n"
@@ -132,6 +134,38 @@ static __attribute__((noinline)) void psp_display_copy_rows_vfpu(
         : : "r" (saved) : "memory");
 }
 #endif
+
+PspDisplayRowCopyResult psp_display_copy_pixel_rows(
+    unsigned char *destination, size_t destination_stride,
+    const unsigned char *source, size_t source_stride,
+    size_t row_bytes, size_t rows, bool vfpu_eligible)
+{
+    if (rows == 0 || row_bytes == 0) return PSP_DISPLAY_ROW_COPY_MEMCPY;
+    if (destination == NULL || source == NULL
+        || destination_stride < row_bytes || source_stride < row_bytes
+        || (rows - 1u) > (SIZE_MAX - row_bytes) / destination_stride
+        || (rows - 1u) > (SIZE_MAX - row_bytes) / source_stride)
+        return PSP_DISPLAY_ROW_COPY_REFUSED;
+    size_t destination_span = (rows - 1u) * destination_stride + row_bytes;
+    size_t source_span = (rows - 1u) * source_stride + row_bytes;
+    uintptr_t from = (uintptr_t) source, to = (uintptr_t) destination;
+    if (from <= to ? to - from < source_span : from - to < destination_span)
+        return PSP_DISPLAY_ROW_COPY_REFUSED;
+#if defined(_MIPS_ARCH_ALLEGREX)
+    if (vfpu_eligible && ((from | to | source_stride | destination_stride)
+                          & 15u) == 0u && row_bytes % 64u == 0u) {
+        psp_display_copy_rows_vfpu(destination, destination_stride, source,
+                                   source_stride, row_bytes, rows);
+        return PSP_DISPLAY_ROW_COPY_VFPU;
+    }
+#else
+    (void) vfpu_eligible;
+#endif
+    for (size_t y = 0; y < rows; y++)
+        memcpy(destination + y * destination_stride,
+               source + y * source_stride, row_bytes);
+    return PSP_DISPLAY_ROW_COPY_MEMCPY;
+}
 
 PspDisplayRowCopyResult psp_display_copy_rgb565_rows(
     PspDisplay *display, const uint16_t *frame, unsigned top, unsigned end,
@@ -156,7 +190,12 @@ PspDisplayRowCopyResult psp_display_copy_rgb565_rows(
     _Static_assert(PSP_DISPLAY_STRIDE % 8 == 0,
                    "VFPU destination rows must stay 16-byte aligned");
     if (vfpu_eligible && ((source | destination) & 15u) == 0u) {
-        psp_display_copy_rows_vfpu(back, frame, top, end);
+        psp_display_copy_rows_vfpu(
+            (unsigned char *) (back + (size_t) top * PSP_DISPLAY_STRIDE),
+            PSP_DISPLAY_STRIDE * sizeof(*back),
+            (const unsigned char *) (frame + (size_t) top * PSP_DISPLAY_SCREEN_WIDTH),
+            PSP_DISPLAY_SCREEN_WIDTH * sizeof(*frame),
+            PSP_DISPLAY_SCREEN_WIDTH * sizeof(*frame), end - top);
         return PSP_DISPLAY_ROW_COPY_VFPU;
     }
 #else
@@ -186,12 +225,11 @@ static uint32_t validation_untouched_hash(
     return hash;
 }
 
-unsigned psp_display_validation_probe_row_copy(
-    PspDisplay *display, const uint16_t *frame, unsigned top, unsigned end)
+unsigned psp_display_validation_probe_pixel_copy(
+    unsigned char *destination, size_t destination_stride,
+    const unsigned char *source, size_t source_stride,
+    size_t row_bytes, size_t rows)
 {
-    uint16_t *back = psp_display_back_buffer(display);
-    if (back == NULL || frame == NULL || top >= end
-        || end > PSP_DISPLAY_SCREEN_HEIGHT) return 1u;
 #if defined(_MIPS_ARCH_ALLEGREX)
     uint32_t saved[16] __attribute__((aligned(16)));
     uint32_t sentinel[16] __attribute__((aligned(16)));
@@ -201,7 +239,6 @@ unsigned psp_display_validation_probe_row_copy(
     uint32_t pd = UINT32_C(0x00000a5a);
     for (unsigned i = 0; i < 16u; i++)
         sentinel[i] = UINT32_C(0x7fc01234) ^ (i * UINT32_C(0x13579bdf));
-    uint32_t untouched = validation_untouched_hash(back, top, end);
     __asm__ volatile (
         "sv.q C000,0(%3)\n" "sv.q C010,16(%3)\n"
         "sv.q C020,32(%3)\n" "sv.q C030,48(%3)\n"
@@ -213,8 +250,9 @@ unsigned psp_display_validation_probe_row_copy(
         "lv.q C020,32(%3)\n" "lv.q C030,48(%3)\n"
         "mtvc %0,$128\n" "mtvc %1,$129\n" "mtvc %2,$130\n"
         : : "r" (ps), "r" (pt), "r" (pd), "r" (sentinel) : "memory");
-    PspDisplayRowCopyResult copied = psp_display_copy_rgb565_rows(
-        display, frame, top, end, true);
+    PspDisplayRowCopyResult copied = psp_display_copy_pixel_rows(
+        destination, destination_stride, source, source_stride,
+        row_bytes, rows, true);
     __asm__ volatile (
         "sv.q C000,0(%3)\n" "sv.q C010,16(%3)\n"
         "sv.q C020,32(%3)\n" "sv.q C030,48(%3)\n"
@@ -230,16 +268,31 @@ unsigned psp_display_validation_probe_row_copy(
     unsigned result = copied == PSP_DISPLAY_ROW_COPY_VFPU ? 0u : 1u;
     if (after_s != ps || after_t != pt || after_d != pd
         || memcmp(after, sentinel, sizeof(after)) != 0) result |= 4u;
-    for (unsigned y = top; y < end; y++)
-        if (memcmp(back + (size_t) y * PSP_DISPLAY_STRIDE,
-                   frame + (size_t) y * PSP_DISPLAY_SCREEN_WIDTH,
-                   PSP_DISPLAY_SCREEN_WIDTH * sizeof(*frame)) != 0)
+    for (size_t y = 0; y < rows; y++)
+        if (memcmp(destination + y * destination_stride,
+                   source + y * source_stride, row_bytes) != 0)
             result |= 2u;
-    if (untouched != validation_untouched_hash(back, top, end)) result |= 8u;
     return result;
 #else
     return 1u;
 #endif
+}
+
+unsigned psp_display_validation_probe_row_copy(
+    PspDisplay *display, const uint16_t *frame, unsigned top, unsigned end)
+{
+    uint16_t *back = psp_display_back_buffer(display);
+    if (back == NULL || frame == NULL || top >= end
+        || end > PSP_DISPLAY_SCREEN_HEIGHT) return 1u;
+    uint32_t untouched = validation_untouched_hash(back, top, end);
+    unsigned result = psp_display_validation_probe_pixel_copy(
+        (unsigned char *) (back + (size_t) top * PSP_DISPLAY_STRIDE),
+        PSP_DISPLAY_STRIDE * sizeof(*back),
+        (const unsigned char *) (frame + (size_t) top * PSP_DISPLAY_SCREEN_WIDTH),
+        PSP_DISPLAY_SCREEN_WIDTH * sizeof(*frame),
+        PSP_DISPLAY_SCREEN_WIDTH * sizeof(*frame), end - top);
+    if (untouched != validation_untouched_hash(back, top, end)) result |= 8u;
+    return result;
 }
 #endif
 

@@ -303,7 +303,7 @@ static void glyph_offer_answer(PspApp *app,
                             | (1u << (unsigned) pack)));
             psp_profile_store_mark_dirty(
                 &app->browser->profile_store, now_us);
-            psp_ui_show_status(ui, "Won't ask again. Install it later from:\n"
+            psp_ui_show_status(ui, "Won't ask again. Install later from:\n"
                                    "Settings > Appearance > Language & emoji",
                                300);
             break;

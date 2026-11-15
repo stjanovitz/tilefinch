@@ -2176,7 +2176,7 @@ const LayoutDocument *navigation_load_retained_preview(
     NavigationRetainedPreview *live = navigation_stream_live_preview(stream);
     if (live == NULL) return NULL;
     bool changed = navigation_retained_preview_resolve_images(
-        live, stream->images);
+        live, navigation_stream_preview_images(stream));
     if (images_changed != NULL) *images_changed = changed;
     return &live->layout;
 }

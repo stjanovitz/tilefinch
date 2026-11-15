@@ -719,6 +719,8 @@ static bool test_release_artifacts(void)
             browser_profile_set_ui_language(profile, TILEFINCH_UI_LANGUAGE_HINDI);
         else if (staged_language == BROWSER_GLYPH_LANGUAGE_ARABIC)
             browser_profile_set_ui_language(profile, TILEFINCH_UI_LANGUAGE_ARABIC);
+        else if (staged_language == BROWSER_GLYPH_LANGUAGE_HEBREW)
+            browser_profile_set_ui_language(profile, TILEFINCH_UI_LANGUAGE_HEBREW);
         else if (staged_language == BROWSER_GLYPH_LANGUAGE_BENGALI_ASSAMESE)
             browser_profile_set_ui_language(profile,
                 stage_selection != NULL && strcmp(stage_selection, "assamese") == 0

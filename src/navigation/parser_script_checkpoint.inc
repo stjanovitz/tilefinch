@@ -386,7 +386,48 @@ static bool navigation_stream_open_parser_script_circuit(
             ? &performance->parser_script_stage_time_breakers
             : &performance->parser_script_stage_work_breakers;
     if (*reason_count != SIZE_MAX) (*reason_count)++;
+#if !defined(TILEFINCH_NO_TRACE) || defined(TILEFINCH_PSP_VALIDATION_LOG)
+    char message[288];
+    snprintf(message, sizeof(message),
+             "tilefinch-script-breaker: reason=%s consecutive=%zu "
+             "stage-us=%llu stage-work=%zu author-exceptions=%zu "
+             "error=\"%.96s\"",
+             reason == NAVIGATION_PARSER_SCRIPT_BREAKER_FAILURES ? "failures"
+                 : reason == NAVIGATION_PARSER_SCRIPT_BREAKER_TIME ? "time"
+                 : "work",
+             stream->parser_script_consecutive_failures,
+             (unsigned long long) stream->parser_script_stage_us,
+             stream->parser_script_stage_work,
+             stream->scripts.early.author_exceptions,
+             stream->script_result.error);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    tilefinch_platform_log_message(message);
+#endif
+#ifndef TILEFINCH_NO_TRACE
+    if (tilefinch_trace_script_failures()) fprintf(stderr, "%s\n", message);
+#endif
+#endif
     return true;
+}
+
+/* Whether the script just run failed in a way that says the realm or the
+   page is in trouble: out of memory, a watchdog interrupt, a compile
+   admission refusal or an engine failure. The script's own exception (a
+   throw, or a SyntaxError the window error event reported) does not:
+   Chromium runs the page's later scripts after it, and the realm is as
+   usable as before. Such a script neither counts toward the consecutive
+   failure breaker nor resets it. The counters include what the scripts
+   it wrote added. */
+static bool navigation_parser_script_troubled(
+    NavigationDocumentStream *stream, size_t execution_failures_before,
+    size_t author_exceptions_before)
+{
+    const ExternalScriptMetrics *metrics = &stream->scripts.early;
+    size_t failures = metrics->execution_failures - execution_failures_before;
+    size_t author = metrics->author_exceptions - author_exceptions_before;
+    stream->session->performance.parser_script_author_exceptions =
+        metrics->author_exceptions;
+    return failures > author;
 }
 
 static bool navigation_stream_account_parser_script(
@@ -963,6 +1004,8 @@ static TILEFINCH_OUT_OF_LINE bool navigation_stream_script_closed(
         size_t failed_before = stream->scripts.early.failed;
         size_t execution_failures_before =
             stream->scripts.early.execution_failures;
+        size_t author_exceptions_before =
+            stream->scripts.early.author_exceptions;
         uint64_t execution_us_before = stream->scripts.early.execution_us;
         NavigationWrittenShare written_mark =
             navigation_stream_written_mark(stream);
@@ -1049,9 +1092,8 @@ static TILEFINCH_OUT_OF_LINE bool navigation_stream_script_closed(
         size_t failure_count = stream->scripts.early.failed >= failed_before
             ? stream->scripts.early.failed - failed_before : 0u;
         bool script_failed = failure_count != 0u;
-        bool execution_failed =
-            stream->scripts.early.execution_failures
-                > execution_failures_before;
+        bool execution_failed = navigation_parser_script_troubled(
+            stream, execution_failures_before, author_exceptions_before);
         bool cumulative_work_exhausted =
             process_result == DOCUMENT_SCRIPT_PROCESS_SOURCE_LIMIT
             && allowance.cumulative_work_limited;
@@ -1263,6 +1305,8 @@ static TILEFINCH_OUT_OF_LINE bool navigation_stream_script_closed(
     size_t failed_before = stream->scripts.early.failed;
     size_t execution_failures_before =
         stream->scripts.early.execution_failures;
+    size_t author_exceptions_before =
+        stream->scripts.early.author_exceptions;
     uint64_t execution_us_before = stream->scripts.early.execution_us;
     NavigationWrittenShare written_mark =
         navigation_stream_written_mark(stream);
@@ -1387,8 +1431,8 @@ static TILEFINCH_OUT_OF_LINE bool navigation_stream_script_closed(
     size_t failure_count = stream->scripts.early.failed >= failed_before
         ? stream->scripts.early.failed - failed_before : 0u;
     bool script_failed = failure_count != 0u;
-    bool execution_failed =
-        stream->scripts.early.execution_failures > execution_failures_before;
+    bool execution_failed = navigation_parser_script_troubled(
+        stream, execution_failures_before, author_exceptions_before);
     bool cumulative_work_exhausted =
         process_result == DOCUMENT_SCRIPT_PROCESS_SOURCE_LIMIT
         && allowance.cumulative_work_limited;

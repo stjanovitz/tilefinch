@@ -60,6 +60,15 @@ unsigned text_bidi_paragraph_level(const TextBidiParagraph *paragraph);
 const TextBidiUnit *text_bidi_paragraph_units(
     const TextBidiParagraph *paragraph);
 
+/* Shapes `text` as one run whose codepoints all share a level, without
+   paragraph analysis: units as text_bidi_paragraph_units gives them, with
+   Arabic joining applied, levels zero and nothing mirrored. It matches the
+   paragraph's units only where that holds: no mirrored character, no
+   explicit control or joiner, and no joining across the run's ends. 0 for
+   empty text or more than `capacity` codepoints; never allocates. */
+size_t text_bidi_shape_level_run(const char *text, size_t length,
+                                 TextBidiUnit *units, size_t capacity);
+
 /* Emits logical unit indices in line visual order. The line range uses unit
    indices, not UTF-8 byte offsets. Every successful call emits line_count
    entries exactly once. */

@@ -198,6 +198,21 @@ int main(void)
     CHECK(TILEFINCH_UI_LANGUAGE_ARABIC == 10);
     CHECK(TILEFINCH_UI_LANGUAGE_PORTUGUESE == 11);
     CHECK(TILEFINCH_UI_LANGUAGE_BENGALI == 12 && TILEFINCH_UI_LANGUAGE_ASSAMESE == 13);
+    /* Hebrew comes last, so saved settings keep their numbers. It joined
+       in v18, which every language now reads. */
+    CHECK(TILEFINCH_UI_LANGUAGE_HEBREW == 14);
+    CHECK(!strcmp(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_HEBREW)->code, "he"));
+    CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_HEBREW)->glyphs
+        == BROWSER_GLYPH_LANGUAGE_HEBREW);
+    CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_HEBREW)->version == 18);
+    CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_HEBREW)->minimum_glyph_sequence == 1);
+    /* Direction is a property of the language: Arabic and Hebrew read
+       right to left, every other language (and an unknown one) does not. */
+    for (unsigned language = 0; language <= TILEFINCH_UI_LANGUAGE_COUNT; language++)
+        CHECK(tilefinch_ui_language_right_to_left(language)
+              == (language == TILEFINCH_UI_LANGUAGE_ARABIC
+                  || language == TILEFINCH_UI_LANGUAGE_HEBREW));
+    CHECK(!tilefinch_ui_language_right_to_left(UINT32_MAX));
     CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_BENGALI)->glyphs
         == BROWSER_GLYPH_LANGUAGE_BENGALI_ASSAMESE);
     CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_ASSAMESE)->glyphs
@@ -205,8 +220,8 @@ int main(void)
     CHECK(!strcmp(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_PORTUGUESE)->code, "pt"));
     CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_PORTUGUESE)->glyphs
         == BROWSER_GLYPH_LANGUAGE_EMBEDDED);
-    CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_PORTUGUESE)->version == 17);
-    CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_SPANISH)->version == 17);
+    CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_PORTUGUESE)->version == 18);
+    CHECK(tilefinch_ui_language_spec(TILEFINCH_UI_LANGUAGE_SPANISH)->version == 18);
     char url[256];
     CHECK(!tilefinch_ui_language_url(0, url, sizeof(url)));
     CHECK(!tilefinch_ui_language_url(1, url, 4));
@@ -214,7 +229,7 @@ int main(void)
     /* The configured models repository (the default here), not a copy. */
     CHECK(tilefinch_ui_language_url(TILEFINCH_UI_LANGUAGE_SPANISH, url, sizeof(url))
           && !strcmp(url, "https://raw.githubusercontent.com/stjanovitz/"
-                          "tilefinch-models/main/translations/ui/v17/es.tful"));
+                          "tilefinch-models/main/translations/ui/v18/es.tful"));
     size_t length = 0;
     for (unsigned language = 1; language < TILEFINCH_UI_LANGUAGE_COUNT; language++) {
         const TilefinchUiLanguageSpec *spec = tilefinch_ui_language_spec(language);
@@ -256,7 +271,7 @@ int main(void)
         CHECK(count_at && count_at + 2 < bytes + length);
         size_t rows = (size_t) count_at[1] << 8 | count_at[2];
         CHECK(rows > 0 && rows <= TILEFINCH_UI_TRANSLATION_ROWS);
-        if (language != TILEFINCH_UI_LANGUAGE_ARABIC)
+        if (!tilefinch_ui_language_right_to_left(language))
             CHECK(budget.current - before <= length + 4u * rows + 256u);
         if (language == TILEFINCH_UI_LANGUAGE_PORTUGUESE) {
             CHECK(!strcmp(tilefinch_ui_translation_text(t, "Settings"), "Definições"));
@@ -265,9 +280,25 @@ int main(void)
             CHECK(!strcmp(tilefinch_ui_translation_text(t, "Subtitles"), "Legendas"));
         }
         if (language == TILEFINCH_UI_LANGUAGE_BENGALI || language == TILEFINCH_UI_LANGUAGE_ASSAMESE) {
-            CHECK(tilefinch_ui_language_spec(language)->version == 17);
+            CHECK(tilefinch_ui_language_spec(language)->version == 18);
             CHECK(!strcmp(tilefinch_ui_translation_text(t, "Bengali"), "বাংলা"));
             CHECK(!strcmp(tilefinch_ui_translation_text(t, "Assamese"), "অসমীয়া"));
+        }
+        if (language == TILEFINCH_UI_LANGUAGE_HEBREW) {
+            /* Hebrew labels are visually ordered once, never shaped: the
+               letters stay as they are, in reverse. */
+            CHECK(!strcmp(tilefinch_ui_translation_text(t, "Hebrew"), "תירבע"));
+            CHECK(!strcmp(tilefinch_ui_translation_text(t, "Back"), "הרזח"));
+            /* Button glyphs keep their order beside the reordered words:
+               logical "X ביטול   O חזרה" reads X first, at the right. */
+            CHECK(!strcmp(tilefinch_ui_translation_text(t, "X Cancel   O Back"),
+                          "הרזח O   לוטיב X"));
+            CHECK(!strcmp(tilefinch_ui_translation_text(t, "Settings"), "תורדגה"));
+            const char *settings = tilefinch_ui_translation_text(t, "Settings");
+            size_t owned = budget.current;
+            for (unsigned read = 0; read < 1000; read++)
+                CHECK(tilefinch_ui_translation_text(t, "Settings") == settings);
+            CHECK(budget.current == owned);
         }
         if (language == TILEFINCH_UI_LANGUAGE_ARABIC) {
             /* Arabic labels are shaped and visually ordered exactly once. */
@@ -291,6 +322,10 @@ int main(void)
         CHECK(translated_download_pages(&budget) == 0);
         if (language == TILEFINCH_UI_LANGUAGE_ARABIC)
             CHECK(!strcmp(tilefinch_ui_logical_text("Back"), "رجوع"));
+        if (language == TILEFINCH_UI_LANGUAGE_HEBREW) {
+            CHECK(!strcmp(tilefinch_ui_logical_text("Back"), "חזרה"));
+            CHECK(!strcmp(tilefinch_ui_logical_text("Hebrew"), "עברית"));
+        }
         CHECK(!strcmp(tilefinch_ui_text("Settings"), tilefinch_ui_translation_text(t, "Settings")));
         bytes[length-2] ^= 1;
         CHECK(!tilefinch_ui_translation_create(&budget, language, bytes, length));
@@ -304,7 +339,7 @@ int main(void)
         tilefinch_ui_translation_bind(NULL);
         tilefinch_ui_translation_destroy(t);
         CHECK(budget.current == 0);
-        if (language == TILEFINCH_UI_LANGUAGE_ARABIC) {
+        if (tilefinch_ui_language_right_to_left(language)) {
             /* Refuse the extra display cache after admitting the catalog. */
             budget.limit = length + 4096;
             CHECK(!tilefinch_ui_translation_create(&budget, language, bytes, length));

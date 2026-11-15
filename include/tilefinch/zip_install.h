@@ -12,6 +12,9 @@
 #define ZIP_INSTALL_NAME_LIMIT 192u
 /* An installed app's GAME folder name, terminator included. */
 #define ZIP_INSTALL_FOLDER_NAME_LIMIT 64u
+/* What the installer and manager show for an app (a download's UTF-8
+   title, see file_download.h), terminator included. */
+#define ZIP_INSTALL_TITLE_LIMIT 128u
 /* The folder name as lowercase hex (two digits per byte), terminated. */
 #define ZIP_INSTALL_FOLDER_HEX_LIMIT (2u * ZIP_INSTALL_FOLDER_NAME_LIMIT - 1u)
 /* Installations the manager keeps reachable, and GAME directory entries it
@@ -22,6 +25,9 @@
 typedef struct ZipInstall ZipInstall;
 typedef struct {
     char name[ZIP_INSTALL_FOLDER_NAME_LIMIT];
+    /* The app as the user knows it: the folder name, or for a folder
+       named after a download, that download's title without extension. */
+    char title[ZIP_INSTALL_TITLE_LIMIT];
     char destination[512];
     uint32_t unpacked_bytes;
     uint16_t files, skipped_files;
@@ -36,9 +42,11 @@ typedef enum {
 bool zip_install_path_candidate(const char *path);
 /* Only folders bearing Tilefinch's checked installation receipt are listed
    or accepted. The trusted frontend supplies GAME, never a page URL. With
-   NAMES NULL only *COUNT is reported (CAPACITY still bounds it). */
+   NAMES NULL only *COUNT is reported (CAPACITY still bounds it); TITLES,
+   when not NULL, receives each app's title beside its folder name. */
 bool zip_install_list(const char *game_directory,
-    char names[][ZIP_INSTALL_FOLDER_NAME_LIMIT], size_t capacity,
+    char names[][ZIP_INSTALL_FOLDER_NAME_LIMIT],
+    char titles[][ZIP_INSTALL_TITLE_LIMIT], size_t capacity,
     size_t *count);
 /* The removal route carries a folder name as lowercase hex. Decoding
    refuses anything the encoder cannot have produced. */
@@ -50,9 +58,13 @@ ZipInstall *zip_install_prepare_removal(Budget *budget, const char *game_directo
     const char *name, char *error, size_t error_capacity);
 
 /* Preparation is read-only and cooperatively cancellable. Only begin creates
-   a private staging directory; a complete CRC-checked app is renamed once. */
+   a private staging directory; a complete CRC-checked app is renamed once.
+   TITLE is the download's title (UTF-8). A ZIP with EBOOT.PBP at its top
+   level installs to a folder named after it without its extension when
+   that is a plain ASCII folder name; otherwise (any other letters, or too
+   long) to APP-<8 hex digits of ID>, still shown by its title. */
 ZipInstall *zip_install_prepare(Budget *budget, const char *archive,
-    const char *game_directory, const char *suggested_name, uint32_t id,
+    const char *game_directory, const char *title, uint32_t id,
     char *error, size_t error_capacity);
 const ZipInstallPreview *zip_install_preview(const ZipInstall *install);
 bool zip_install_begin(ZipInstall *install);

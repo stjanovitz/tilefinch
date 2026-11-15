@@ -38,6 +38,31 @@ static void navigation_stream_drop_previews(
     for (size_t i = 0; i < 2u; i++)
         navigation_retained_preview_clear(
             stream->session, &stream->previews[i]);
+    /* Rasterized against the sheet and DOM the previews borrowed. */
+    images_destroy(&stream->preview_svgs);
+}
+
+/* The image table a preview is laid out and resolved against: the load's
+   own, else the stream's first-screen SVG rasters. */
+static const ImageResources *navigation_stream_preview_images(
+    const NavigationDocumentStream *stream)
+{
+    if (stream == NULL) return NULL;
+    if (stream->images != NULL) return stream->images;
+    return stream->preview_svgs.count != 0 ? &stream->preview_svgs : NULL;
+}
+
+/* A fixed DRAW_IMAGE slot (an <img> or inline <svg> whose box does not
+   depend on its resource) borrows its node in `text`; mask slots are
+   marked and resolve differently. */
+static lxb_dom_node_t *navigation_preview_fixed_slot_node(
+    const DrawCommand *command)
+{
+    if (command->type != DRAW_IMAGE || command->text == NULL
+        || command->text_length != 0
+        || (command->font_family & LAYOUT_IMAGE_SLOT_MASK) != 0)
+        return NULL;
+    return (lxb_dom_node_t *) command->text;
 }
 
 static NavigationRetainedPreview *navigation_stream_live_preview(
@@ -55,7 +80,7 @@ static NavigationRetainedPreview *navigation_stream_live_preview(
    retention. */
 static bool navigation_retained_preview_detach(
     NavigationSession *session, NavigationRetainedPreview *preview,
-    const ImageResources *images)
+    const ImageResources *images, bool track_empty_slots)
 {
     LayoutDocument *layout = &preview->layout;
     uintptr_t owned = (uintptr_t) layout->generated_text_storage;
@@ -63,7 +88,11 @@ static bool navigation_retained_preview_detach(
     size_t bytes = 0, image_count = 0;
     for (size_t i = 0; i < layout->count; i++) {
         const DrawCommand *command = &layout->commands[i];
-        if (command->type == DRAW_IMAGE && command->image != NULL) image_count++;
+        if (command->type == DRAW_IMAGE
+            && (command->image != NULL
+                || (track_empty_slots
+                    && navigation_preview_fixed_slot_node(command) != NULL)))
+            image_count++;
         if (command->type != DRAW_TEXT || command->text == NULL
             || command->text_length == 0) continue;
         uintptr_t address = (uintptr_t) command->text;
@@ -118,6 +147,18 @@ static bool navigation_retained_preview_detach(
             preview->image_nodes[image] =
                 index == SIZE_MAX ? NULL : images->items[index].node;
             image++;
+        } else if (track_empty_slots
+                   && navigation_preview_fixed_slot_node(command) != NULL) {
+            /* An empty fixed slot of a load without an image table of its
+               own: its inline SVG may be rasterized while this preview is
+               on screen (navigation_stream_paint_preview_svgs) and binds
+               without a layout. A load with its own table keeps its empty
+               slots empty until the next preview, as before. */
+            preview->image_commands[image] = (uint32_t) i;
+            preview->image_indices[image] = UINT32_MAX;
+            preview->image_nodes[image] =
+                navigation_preview_fixed_slot_node(command);
+            image++;
         }
         if (command->type != DRAW_TEXT || command->text == NULL
             || command->text_length == 0) continue;
@@ -128,6 +169,7 @@ static bool navigation_retained_preview_detach(
         used += command->text_length;
     }
     preview->image_count = image_count;
+    preview->tracks_empty_slots = track_empty_slots;
     preview->image_base = images == NULL ? NULL : images->items;
     preview->image_table_count = table_count;
     return true;
@@ -153,7 +195,10 @@ static bool navigation_retained_preview_resolve_images(
         if (node != NULL && items != NULL) {
             if (index < count && items[index].node == node) {
                 resolved = &items[index];
-            } else {
+            } else if (!preview->tracks_empty_slots
+                       || index != UINT32_MAX || moved) {
+                /* An empty slot never found is looked for again only when
+                   the table changed. */
                 for (size_t j = 0; j < count; j++) {
                     if (items[j].node != node) continue;
                     resolved = &items[j];
@@ -163,7 +208,11 @@ static bool navigation_retained_preview_resolve_images(
             }
         }
         /* When the table moved, the old pointer is only compared, never
-           dereferenced. */
+           dereferenced. A fixed slot shows a resource only once it has
+           pixels, as layout binds it. */
+        if (resolved != NULL && preview->tracks_empty_slots
+            && navigation_preview_fixed_slot_node(command) != NULL
+            && !image_resource_available(resolved)) resolved = NULL;
         if (moved || command->image != resolved) {
             if (command->image != resolved) changed = true;
             command->image = resolved;
@@ -415,6 +464,152 @@ static void navigation_preview_trace_skip(
         NAVIGATION_PREVIEW_SKIP((stream), (reason)); \
     } while (0)
 
+/* Inline SVG needs no network, yet a load without an image table of its
+   own lays it out as empty slots: bbc.com/news's whole first screen is
+   such a masthead (logo, wordmark, menu icons) and stayed blank until the
+   page had loaded. Once a preview is on screen, rasterize the inline SVGs
+   on its first screen. One in a fixed slot binds at once and the preview
+   is painted again; one sized by its own aspect ratio (a logo with only a
+   height, a wordmark in a full-width heading) lays out no slot until it
+   has pixels, so the next first-screen refresh lays it out with them, and
+   such SVGs are rasterized only while a refresh can still come. Bounded:
+   a few icon-sized rasters per stream, none under memory pressure, and
+   the first present never waits for them. */
+#define NAVIGATION_PREVIEW_SVG_BATCH 8u
+#define NAVIGATION_PREVIEW_SVG_TABLE_LIMIT 16u
+#define NAVIGATION_PREVIEW_SVG_DECODED_BYTES (128u * 1024u)
+
+static void navigation_preview_svg_note(
+    const NavigationDocumentStream *stream, lxb_dom_node_t *node,
+    lxb_dom_node_t **nodes, size_t *count)
+{
+    if (node == NULL || *count == NAVIGATION_PREVIEW_SVG_BATCH
+        || !node_name_is(node, "svg")
+        || images_find_node(&stream->preview_svgs, node) != NULL) return;
+    for (size_t i = 0; i < *count; i++)
+        if (nodes[i] == node) return;
+    if (navigation_svg_has_renderable_content(node)) nodes[(*count)++] = node;
+}
+
+static bool navigation_preview_box_on_screen(
+    int x, int y, int box_width, int box_height, int width, int height)
+{
+    return box_width > 0 && box_height > 0 && x < width
+        && (int64_t) x + box_width > 0 && y < height
+        && (int64_t) y + box_height > 0;
+}
+
+static void navigation_stream_paint_preview_svgs(
+    NavigationDocumentStream *stream, NavigationRetainedPreview *live)
+{
+    NavigationSession *session = stream->session;
+    if (stream->images != NULL || live == NULL || !live->live
+        || session->progressive_paint == NULL
+        || stream->preview_svgs.count >= NAVIGATION_PREVIEW_SVG_TABLE_LIMIT
+        || stream->preview_svgs.stats.decoded_bytes
+               >= NAVIGATION_PREVIEW_SVG_DECODED_BYTES) return;
+    const LayoutDocument *layout = &live->layout;
+    int width = stream->viewport.css_width;
+    int height = stream->viewport.css_height;
+    if (width <= 0 || height <= 0) return;
+    lxb_dom_node_t *nodes[NAVIGATION_PREVIEW_SVG_BATCH];
+    size_t count = 0;
+    for (size_t i = 0; i < layout->count
+         && count < NAVIGATION_PREVIEW_SVG_BATCH; i++) {
+        const DrawCommand *command = &layout->commands[i];
+        if (command->image == NULL && command->opacity_scale != 0
+            && navigation_preview_box_on_screen(
+                   command->x, command->y, command->width, command->height,
+                   width, height))
+            navigation_preview_svg_note(
+                stream, navigation_preview_fixed_slot_node(command),
+                nodes, &count);
+    }
+    if (stream->preview_policy.phase == PREVIEW_PHASE_FIRST_SCREEN
+        && stream->preview_policy.refreshes < PREVIEW_POLICY_REFRESH_LIMIT) {
+        ImagePriorityTarget targets[NAVIGATION_PREVIEW_SVG_BATCH];
+        size_t target_count = 0;
+        navigation_collect_visible_image_priority(
+            layout, height, targets, NAVIGATION_PREVIEW_SVG_BATCH,
+            &target_count);
+        for (size_t i = 0; i < target_count; i++)
+            if (targets[i].kind == IMAGE_PRIORITY_KIND_DOCUMENT)
+                navigation_preview_svg_note(
+                    stream, targets[i].node, nodes, &count);
+        for (size_t i = 0; i < layout->node_box_count
+             && count < NAVIGATION_PREVIEW_SVG_BATCH; i++) {
+            const LayoutNodeBox *box = &layout->node_boxes[i];
+            if (navigation_preview_box_on_screen(
+                    box->x, box->y, box->width, box->height, width, height))
+                navigation_preview_svg_note(stream, box->node, nodes, &count);
+        }
+    }
+    if (count == 0) return;
+    if (budget_pressure_required(
+            session->budget, NAVIGATION_PREVIEW_SVG_DECODED_BYTES,
+            1u * 1024u * 1024u)) {
+        session->performance.streaming_preview_pressure_skips++;
+        budget_record_pressure(
+            session->budget, BUDGET_PRESSURE_SPECULATION,
+            NAVIGATION_PREVIEW_SVG_DECODED_BYTES, 0);
+        return;
+    }
+    uint64_t started = navigation_now_us();
+    size_t added = 0;
+    tilefinch_platform_trace_step("preview-svg");
+    bool rasterized = images_rasterize_inline_svgs(
+        &stream->parser->document, &stream->blocking_stylesheet,
+        &stream->preview_svgs, nodes, count, session->budget,
+        NAVIGATION_PREVIEW_SVG_DECODED_BYTES, &added);
+    uint64_t raster_elapsed = navigation_elapsed_us(
+        started, navigation_now_us());
+    session->performance.image_resource_us += raster_elapsed;
+    bool painted = false;
+    if (rasterized && added != 0) {
+        layout_reuse_cache_update_images(
+            stream->preview_layout_reuse, &stream->preview_svgs);
+        if (navigation_retained_preview_resolve_images(
+                live, navigation_stream_preview_images(stream))) {
+            uint64_t paint_started = navigation_now_us();
+            session->progressive_paint_retains = true;
+            painted = session->progressive_paint(
+                session->progressive_paint_opaque, session, &live->layout);
+            session->progressive_paint_retains = false;
+            uint64_t paint_elapsed = navigation_record_slice(
+                session, NAVIGATION_SLICE_PAINT, paint_started,
+                live->layout.count);
+            session->performance.progressive_paint_us += paint_elapsed;
+            session->performance.streaming_preview_paint_us += paint_elapsed;
+            if (painted) session->performance.partial_paints++;
+        }
+    }
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    {
+        char line[320];
+        const ExternalImageStats *svg_stats = &stream->preview_svgs.stats;
+        snprintf(line, sizeof(line),
+                 "tilefinch-preview-svg: at=%llums slots=%zu added=%zu "
+                 "rasterized=%d painted=%d raster=%lluus "
+                 "serialize-total=%lluus rasterize-total=%lluus "
+                 "parse-total=%lluus nsvg-raster-total=%lluus "
+                 "cooperate-total=%lluus",
+                 (unsigned long long) (session->navigation_started_us != 0
+                     ? (navigation_now_us() - session->navigation_started_us)
+                           / 1000u : 0u),
+                 count, added, rasterized ? 1 : 0, painted ? 1 : 0,
+                 (unsigned long long) raster_elapsed,
+                 (unsigned long long) svg_stats->inline_svg_serialize_us,
+                 (unsigned long long) svg_stats->inline_svg_rasterize_us,
+                 (unsigned long long) svg_stats->inline_svg_parse_us,
+                 (unsigned long long) svg_stats->inline_svg_raster_us,
+                 (unsigned long long) svg_stats->inline_svg_cooperate_us);
+        tilefinch_platform_log_message(line);
+    }
+#else
+    (void) painted;
+#endif
+}
+
 static void navigation_stream_try_pre_eof_preview(
     NavigationDocumentStream *stream)
 {
@@ -650,7 +845,8 @@ static void navigation_stream_try_pre_eof_preview(
     tilefinch_platform_trace_step("preview-layout");
     bool built = layout_build_context_preview(
         &preview, session->budget, document,
-        &stream->blocking_stylesheet, stream->fonts, stream->images,
+        &stream->blocking_stylesheet, stream->fonts,
+        navigation_stream_preview_images(stream),
         &stream->viewport, stream->preview_layout_reuse,
         preview_limit, &truncated);
     uint64_t layout_elapsed = built
@@ -811,7 +1007,8 @@ static void navigation_stream_try_pre_eof_preview(
             slot->content_end_y + 2 * stream->viewport.css_height;
     tilefinch_platform_trace_step("preview-retain");
     bool retains = navigation_retained_preview_detach(
-        session, slot, stream->images);
+        session, slot, navigation_stream_preview_images(stream),
+        stream->images == NULL);
     uint64_t paint_started = navigation_now_us();
     session->progressive_paint_retains = retains;
     bool painted = session->progressive_paint(
@@ -887,6 +1084,7 @@ static void navigation_stream_try_pre_eof_preview(
     if (painted && retains) {
         if (live != NULL) navigation_retained_preview_clear(session, live);
         slot->live = true;
+        navigation_stream_paint_preview_svgs(stream, slot);
     } else {
         navigation_retained_preview_clear(session, slot);
     }

@@ -41,7 +41,8 @@ void psp_tabs_sync_ui(
         view->count = 1;
         snprintf(view->titles[0], sizeof(view->titles[0]), "%.*s",
                  (int) sizeof(view->titles[0]) - 1,
-                 ui->title[0] == '\0' ? "CURRENT PAGE" : ui->title);
+                 ui->title[0] == '\0'
+                     ? tilefinch_ui_logical_text("CURRENT PAGE") : ui->title);
         psp_tabs_domain(ui->url, view->domains[0], sizeof(view->domains[0]));
     } else {
         size_t count = browser_tabs_count(tabs);
@@ -454,13 +455,19 @@ void psp_collections_sync_ui(
                          percent);
                 if (snapshot.bytes_per_second != 0
                     && snapshot.available_bytes != 0) {
-                    snprintf(surface->download_detail[rows],
-                             sizeof(surface->download_detail[rows]),
-                             "%lu KB/s  |  %llu %s",
+                    char speed[24], free_mb[24];
+                    snprintf(speed, sizeof(speed), "%lu KB/s",
                              (unsigned long)
-                                 (snapshot.bytes_per_second / 1024u),
+                                 (snapshot.bytes_per_second / 1024u));
+                    snprintf(free_mb, sizeof(free_mb), "%llu",
                              (unsigned long long)
-                                 (snapshot.available_bytes / UINT64_C(1048576)), tilefinch_ui_text("MB free"));
+                                 (snapshot.available_bytes / UINT64_C(1048576)));
+                    const char *pieces[] = {
+                        speed, "  |  ", free_mb, " ",
+                        tilefinch_ui_text("MB free")};
+                    psp_ui_join_reading_order(
+                        surface->download_detail[rows],
+                        sizeof(surface->download_detail[rows]), pieces, 5u);
                 } else {
                     snprintf(surface->download_detail[rows],
                              sizeof(surface->download_detail[rows]),
@@ -503,7 +510,10 @@ void psp_collections_sync_ui(
         }
         if (is_downloads && offline_store != NULL && offline_store->game_directory != NULL
             && rows < PSP_UI_COLLECTIONS_ROW_LIMIT) {
-            surface->view.rows[rows].title = tilefinch_ui_text("Installed homebrew");
+            /* Titles are drawn as page text, which puts them in display
+               order itself: the catalog's own display copy would be
+               turned around a second time. */
+            surface->view.rows[rows].title = tilefinch_ui_logical_text("Installed homebrew");
             surface->view.rows[rows].detail = tilefinch_ui_text("Manage apps installed by Tilefinch");
             surface->view.rows[rows].offline_state = UINT8_MAX; /* Navigation, not a transfer. */
             surface->id[rows++] = 0;

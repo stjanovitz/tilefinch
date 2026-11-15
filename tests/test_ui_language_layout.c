@@ -10,6 +10,8 @@
 #include "tilefinch/glyph_component_store.h"
 #include "tilefinch/browser_engine.h"
 #include "tilefinch/youtube_lite.h"
+#include "tilefinch/offline_library.h"
+#include "tilefinch/file_download.h"
 
 static void observe_text(const char *, int, int, int, int,
                          int, int, int, int, bool, bool);
@@ -21,6 +23,9 @@ enum { WIDTH = 480, HEIGHT = 272, STRIDE = 496, RUN_LIMIT = 96 };
 typedef struct {
     char text[512];
     int left, top, right, bottom;
+    /* Where the pen started and stopped: unlike the ink, also known for a
+       glyph no face has. */
+    int start, end;
     bool truncated, missing_glyph;
 } TextRun;
 static TextRun runs[RUN_LIMIT];
@@ -44,19 +49,33 @@ static RealPack real_packs[TILEFINCH_GLYPH_COMPONENT_PACK_LIMIT - 1u];
 static size_t real_pack_count;
 #include "ui_navigation_keys.inc"
 static size_t checked_navigation_labels;
+/* With a capture directory, every validated frame of a language is hashed
+   into frames-<language>.txt, one line each, with the snapshots named
+   between them, so two builds can be compared frame for frame (a
+   left-to-right language must not move a pixel). */
+static FILE *frame_log;
+static size_t frame_hash_count;
 
 static void observe_text(const char *text, int x, int y, int end, int maximum,
                          int left, int top, int right, int bottom, bool truncated,
                          bool missing_glyph)
 {
-    (void)x; (void)y; (void)end; (void)maximum;
+    (void)y; (void)maximum;
     if (!text[0]) return;
     if (run_count == RUN_LIMIT) { run_overflow = true; return; }
     TextRun *run = &runs[run_count++];
     snprintf(run->text, sizeof(run->text), "%s", text);
+    run->start = x; run->end = end;
     run->left = left; run->top = top; run->right = right; run->bottom = bottom;
     run->truncated = truncated;
     run->missing_glyph = missing_glyph;
+}
+
+/* The bound interface language reads right to left (Arabic, Hebrew). */
+static bool ui_rtl(void)
+{
+    return tilefinch_ui_language_right_to_left(
+        tilefinch_ui_translation_bound_language());
 }
 
 static bool catalog_text(const char *text)
@@ -72,6 +91,12 @@ static bool catalog_text(const char *text)
                 while (*tail >= '0' && *tail <= '9') tail++;
                 if (tail > text + length + 1 && !strcmp(tail, "%")) return true;
             }
+            /* Right-to-left text reads from the right: the count stands on the left. */
+            const char *digits = text;
+            while (*digits >= '0' && *digits <= '9') digits++;
+            if (ui_rtl() && digits > text
+                && digits[0] == '%' && digits[1] == ' '
+                && !strcmp(digits + 2, prefix)) return true;
         }
     }
     return false;
@@ -297,7 +322,31 @@ static bool validate_frame_geometry(const PspUiState *ui, int width, int height,
     for (size_t at = 0; at < 16; at++) CHECK(storage[at] == 0xa55a && storage[16 + stride * height + at] == 0xa55a);
     for (int y = 0; y < height; y++)
         for (int x = width; x < stride; x++) CHECK(storage[16 + y * stride + x] == 0xa55a);
+    if (capture_directory) {
+        if (frame_log == NULL) {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/frames-%s.txt", capture_directory,
+                     language_code != NULL ? language_code : "setup");
+            frame_log = fopen(path, "w");
+            CHECK(frame_log);
+        }
+        uint64_t hash = UINT64_C(14695981039346656037);
+        for (int y = 0; y < height; y++)
+            for (int x = 0; x < width; x++)
+                hash = (hash ^ storage[16 + y * stride + x])
+                    * UINT64_C(1099511628211);
+        CHECK(fprintf(frame_log, "%zu %016llx\n", frame_hash_count++,
+                      (unsigned long long) hash) > 0);
+    }
     checked_frames++;
+    return true;
+}
+
+static bool record_frame_hash(void)
+{
+    if (frame_log != NULL) CHECK(fclose(frame_log) == 0);
+    frame_log = NULL;
+    frame_hash_count = 0;
     return true;
 }
 
@@ -381,6 +430,34 @@ static bool player_has_text(const char *key)
 }
 
 static bool snapshot_geometry(const char *name, int width, int height, int stride);
+static const TextRun *run_with_text(const char *text);
+static bool shown_whole(const char *text);
+
+/* A painted file name: its run starts with PREFIX and, when given, ends with
+   SUFFIX; its pen starts at START or ends at END (-1: either), never past
+   LIMIT, and it is not cut again by the painter. */
+static bool file_name_run(const char *prefix, const char *suffix, int start,
+                          int end, int limit)
+{
+    for (size_t at = 0; at < run_count; at++) {
+        const TextRun *run = &runs[at];
+        size_t length = strlen(run->text);
+        if (strncmp(run->text, prefix, strlen(prefix)) != 0) continue;
+        if (suffix != NULL && (length < strlen(suffix)
+                || strcmp(run->text + length - strlen(suffix), suffix) != 0)) continue;
+        if ((start >= 0 && run->start != start) || (end >= 0 && run->end != end)
+            || run->end > limit || run->truncated || run->missing_glyph) {
+            fprintf(stderr, "file name locale=%s '%s' pen %d..%d truncated=%d\n",
+                    language_code, run->text, run->start, run->end, run->truncated);
+            return false;
+        }
+        return true;
+    }
+    fprintf(stderr, "file name locale=%s: no run '%s'\n", language_code, prefix);
+    for (size_t r = 0; r < run_count; r++)
+        fprintf(stderr, "  '%s' %d..%d\n", runs[r].text, runs[r].start, runs[r].end);
+    return false;
+}
 
 static bool queue_cache_matches_full(PspUiMediaState *media)
 {
@@ -426,6 +503,14 @@ static bool queue_cache_matches_full(PspUiMediaState *media)
     p->track_menu_selection = (uint8_t) old_selection;
     p->automatic_next = old_auto;
     return true;
+}
+
+/* A run whose text is exactly `text`, or NULL. */
+static const TextRun *run_with_text(const char *text)
+{
+    for (size_t i = 0; i < run_count; i++)
+        if (!strcmp(runs[i].text, text)) return &runs[i];
+    return NULL;
 }
 
 static bool test_player_language(const PspUiState *ui,
@@ -571,6 +656,16 @@ static bool test_player_language(const PspUiState *ui,
                     }
                     presentation.track_menu_tab = (uint8_t) saved_tab;
                 }
+                if (lane == 2) {
+                    /* The rows mirror with the interface language; the
+                       tabs above them (L and R) do not. */
+                    const TextRun *time = run_with_text("0:00"), *title = NULL;
+                    for (size_t at = 0; at < run_count; at++)
+                        if (!strncmp(runs[at].text, "Chapter 1:", 10)) title = &runs[at];
+                    CHECK(time && title);
+                    if (ui_rtl()) CHECK(time->left > title->right);
+                    else CHECK(time->right < title->left);
+                }
                 if (lane == 2 || lane == 7 || lane == 13 || lane == 15 || lane == 19) {
                     char name[48];
                     snprintf(name, sizeof(name), "player-%s-%s",
@@ -593,6 +688,7 @@ static bool test_player_language(const PspUiState *ui,
 static bool snapshot_geometry(const char *name, int width, int height, int stride)
 {
     if (!capture_directory) return true;
+    if (frame_log != NULL) CHECK(fprintf(frame_log, "# %s\n", name) > 0);
     char path[1024];
     snprintf(path, sizeof(path), "%s/%s-%s.ppm", capture_directory, language_code, name);
     FILE *file = fopen(path, "wb");
@@ -611,6 +707,12 @@ static bool snapshot(const char *name)
     return snapshot_geometry(name, WIDTH, HEIGHT, STRIDE);
 }
 
+/* A left-to-right name too long for any panel, and a right-to-left one. */
+static const char *const file_names[2] = {
+    "a-very-long-recording-of-the-whole-evening-concert-in-the-park.mp4",
+    "\xd8\xb5\xd9\x88\xd8\xb1\xd8\xa9 \xd8\xa7\xd9\x84\xd8\xb1\xd8\xad\xd9\x84\xd8\xa9.jpg"
+};
+
 static bool test_download_language(PspUiState *ui, TilefinchGlyphProvider *provider)
 {
     PspUiFileDownloadPreview file = {.name="Settings.zip", .origin="https://downloads.example.test"};
@@ -623,6 +725,21 @@ static bool test_download_language(PspUiState *ui, TilefinchGlyphProvider *provi
     for (size_t i = 0; i < run_count; i++) if (!strcmp(runs[i].text, "Settings.zip")) name = true;
     CHECK(name);
     CHECK(snapshot("download-save"));
+    /* File names are page text, in any interface language. */
+    for (unsigned at = 0; at < 2; at++) {
+        PspUiFileDownloadPreview named = {
+            .origin = "https://a-long-download-mirror-host.example.test"};
+        snprintf(named.name, sizeof(named.name), "%s", file_names[at]);
+        psp_ui_show_file_download(ui, &named);
+        ui->overlay_animation_frames = 0;
+        CHECK(paint(ui, provider));
+        CHECK(snapshot(at ? "download-save-rtl" : "download-save-long"));
+        /* The panel's text runs from x=58 to 422, mirrored or not. The
+           long name keeps its extension; the right-to-left one, in
+           display order ("jpg." and its letters), ends at the right. */
+        CHECK(file_name_run(at ? "jpg." : "a-very-long-", at ? NULL : "....mp4",
+                            at ? -1 : 58, at ? 422 : -1, 422));
+    }
     ZipInstallPreview zip = {.name="Homebrew", .destination="ms0:/PSP/GAME/Homebrew",
         .files=512, .skipped_files=511, .unpacked_bytes=ZIP_INSTALL_UNPACKED_LIMIT};
     for (unsigned removing=0; removing<2; removing++) {
@@ -634,11 +751,38 @@ static bool test_download_language(PspUiState *ui, TilefinchGlyphProvider *provi
         CHECK(player_has_text(removing ? "X Remove   O Cancel" : "X Install   O Cancel"));
         CHECK(player_has_text(removing ? "Saved data inside it will also be deleted." : "Only install software you trust."));
         CHECK(snapshot(removing ? "homebrew-remove" : "homebrew-install"));
+        /* Counts read in the interface language's order: Arabic, from the
+           right, puts each number on the right of its word and the size
+           last, on the left. */
+        bool arabic = ui_rtl(); /* any right-to-left language */
+        char counts[256];
+        if (arabic)
+            snprintf(counts, sizeof(counts), "%u KB | %s 512",
+                     (unsigned) (ZIP_INSTALL_UNPACKED_LIMIT / 1024u), tilefinch_ui_text("files"));
+        else
+            snprintf(counts, sizeof(counts), "512 %s | %u KB", tilefinch_ui_text("files"),
+                     (unsigned) (ZIP_INSTALL_UNPACKED_LIMIT / 1024u));
+        CHECK(shown_whole(counts));
+        if (!removing) {
+            snprintf(counts, sizeof(counts), arabic ? "%2$s %1$u" : "%1$u %2$s", 511u,
+                     tilefinch_ui_text("extras kept in ZIP"));
+            CHECK(shown_whole(counts));
+        }
     }
+    ZipInstallPreview long_zip = {
+        .name = "A-Homebrew-Game-With-A-Name-Too-Long-For-The-Panel",
+        .destination = "ms0:/PSP/GAME/A-Homebrew-Game-With-A-Name-Too-Long-For-The-Panel",
+        .files = 3, .skipped_files = 0, .unpacked_bytes = 1536};
+    psp_ui_show_zip_install(ui, &long_zip);
+    ui->overlay_animation_frames = 0;
+    CHECK(paint(ui, provider));
+    CHECK(snapshot("homebrew-install-long"));
     PspUiCollectionsView view = {.section=PSP_UI_COLLECTION_DOWNLOADS, .count=2};
     view.rows[0] = (PspUiCollectionsRow){.title="Settings.zip", .detail=tilefinch_ui_text("Memory Stick file"),
         .deletable=true, .is_file=true, .offline_state=OFFLINE_ITEM_READY};
-    view.rows[1] = (PspUiCollectionsRow){.title=tilefinch_ui_text("Installed homebrew"),
+    /* As the app sets it: the title is page text, put in display order
+       when drawn, so it is the catalog's logical text. */
+    view.rows[1] = (PspUiCollectionsRow){.title=tilefinch_ui_logical_text("Installed homebrew"),
         .detail=tilefinch_ui_text("Manage apps installed by Tilefinch"), .offline_state=UINT8_MAX};
     psp_ui_show_collections(ui, PSP_UI_COLLECTION_DOWNLOADS);
     ui->overlay_animation_frames = 0;
@@ -646,8 +790,14 @@ static bool test_download_language(PspUiState *ui, TilefinchGlyphProvider *provi
     for (unsigned row=0; row<2; row++) {
         ui->collections_selection = row;
         CHECK(paint(ui, provider));
-        CHECK(player_has_text("Downloads"));
+        CHECK(player_has_text("DOWNLOADS"));
         CHECK(player_has_text(row ? "X OPEN   L/R SECTION" : "X DETAILS   SQUARE DELETE   L/R SECTION"));
+        /* The catalog title reads as the catalog shows it, not turned
+           around twice. */
+        bool shown = false;
+        for (size_t r = 0; r < run_count; r++)
+            shown |= !strcmp(runs[r].text, tilefinch_ui_text("Installed homebrew"));
+        CHECK(shown);
         CHECK(snapshot(row ? "homebrew-manager-entry" : "downloads"));
     }
     ui->collections_selection = 0;
@@ -656,10 +806,361 @@ static bool test_download_language(PspUiState *ui, TilefinchGlyphProvider *provi
     CHECK(player_has_text("PRESS SQUARE AGAIN TO DELETE") && player_has_text("SQUARE DELETE   O CANCEL"));
     CHECK(snapshot("download-delete"));
     ui->collections_delete_confirmation = 0;
+    PspUiCollectionsView files = {.section=PSP_UI_COLLECTION_DOWNLOADS, .count=2};
+    for (unsigned at = 0; at < 2; at++)
+        files.rows[at] = (PspUiCollectionsRow){.title=file_names[at],
+            .detail=tilefinch_ui_text("Memory Stick file"), .deletable=true,
+            .is_file=true, .offline_state=OFFLINE_ITEM_READY};
+    psp_ui_set_collections(ui, &files);
+    CHECK(paint(ui, provider));
+    CHECK(snapshot("downloads-files"));
+    /* Collections keeps its geometry; the long name keeps its extension. */
+    CHECK(file_name_run("a-very-long-", "....mp4", 24, -1, WIDTH));
+    ui->collections_delete_confirmation = 0;
     ui->collections = NULL;
     ui->file_download_preview = NULL;
     ui->zip_install_preview = NULL;
     ui->screen = PSP_UI_SCREEN_PAGE;
+    return true;
+}
+
+/* A run whose text is exactly this. */
+static bool has_run(const char *text)
+{
+    for (size_t r = 0; r < run_count; r++)
+        if (!strcmp(runs[r].text, text)) return true;
+    return false;
+}
+
+/* In a translated interface, the English key is not what is shown. */
+static bool translated(const char *key)
+{
+    if (!strcmp(language_code, "en")) return true;
+    if (strcmp(tilefinch_ui_text(key), key) != 0) return true;
+    fprintf(stderr, "untranslated: locale=%s '%s'\n", language_code, key);
+    return false;
+}
+
+/* Collections: the header, every section's tab and each section's empty
+   line and hint are translated and whole. A strip too wide for the row
+   shows the run of tabs around the open one; the open tab always shows. */
+static bool test_collections_language(PspUiState *ui, TilefinchGlyphProvider *provider)
+{
+    static const char *const empty[PSP_UI_COLLECTION_SECTION_COUNT] = {
+        "NOTHING SAVED YET", "NO BOOKMARKS YET", "NO HISTORY YET",
+        "NO DOWNLOADS YET", "NO SCREENSHOT LIST AVAILABLE"
+    };
+    static const char *const tabs[PSP_UI_COLLECTION_SECTION_COUNT] = {
+        "Saved items", "BOOKMARKS", "HISTORY", "DOWNLOADS", "SHOTS"
+    };
+    for (unsigned section = 0; section < PSP_UI_COLLECTION_SECTION_COUNT; section++) {
+        PspUiCollectionsView view = {.section = (uint8_t) section,
+                                     .empty_message = empty[section]};
+        psp_ui_show_collections(ui, (PspUiCollectionSection) section);
+        ui->overlay_animation_frames = 0;
+        psp_ui_set_collections(ui, &view);
+        CHECK(paint(ui, provider));
+        CHECK(translated("COLLECTIONS") && shown_whole(tilefinch_ui_text("COLLECTIONS")));
+        CHECK(translated(empty[section]) && shown_whole(tilefinch_ui_text(empty[section])));
+        CHECK(translated("L/R SECTION   O BACK")
+              && shown_whole(tilefinch_ui_text("L/R SECTION   O BACK")));
+        size_t shown = 0;
+        for (unsigned at = 0; at < PSP_UI_COLLECTION_SECTION_COUNT; at++) {
+            const char *name = ui_collection_section_name(at);
+            CHECK(translated(tabs[at]) || (at == 0 && !strcmp(name, "SAVED")));
+            if (has_run(name)) {
+                CHECK(shown_whole(name));
+                shown++;
+            } else {
+                CHECK(at != section);
+            }
+        }
+        /* English, and every language whose names fit, shows all five. */
+        CHECK(shown >= 2 && (shown == PSP_UI_COLLECTION_SECTION_COUNT
+                             || strcmp(language_code, "en") != 0));
+        if (section == 0 && ui->chrome_theme == BROWSER_CHROME_THEME_FINCH)
+            CHECK(snapshot("collections-empty"));
+        if (shown != PSP_UI_COLLECTION_SECTION_COUNT && section == 0)
+            fprintf(stderr, "collections tabs: locale=%s shows %zu of %u\n",
+                    language_code, shown, (unsigned) PSP_UI_COLLECTION_SECTION_COUNT);
+    }
+    /* No view yet, and an installed web app awaiting its second press. */
+    ui->collections = NULL;
+    CHECK(paint(ui, provider));
+    CHECK(translated("NOTHING HERE YET") && shown_whole(tilefinch_ui_text("NOTHING HERE YET")));
+    PspUiCollectionsView apps = {.section = PSP_UI_COLLECTION_SAVED, .count = 1};
+    apps.rows[0] = (PspUiCollectionsRow){.title = "Offline app", .detail = "example.test",
+        .deletable = true, .is_web_app = true, .offline_state = UINT8_MAX};
+    psp_ui_show_collections(ui, PSP_UI_COLLECTION_SAVED);
+    ui->overlay_animation_frames = 0;
+    psp_ui_set_collections(ui, &apps);
+    ui->collections_delete_confirmation = 1;
+    CHECK(paint(ui, provider));
+    CHECK(translated("PRESS SQUARE AGAIN TO UNINSTALL")
+          && shown_whole(tilefinch_ui_text("PRESS SQUARE AGAIN TO UNINSTALL")));
+    ui->collections_delete_confirmation = 0;
+    ui->collections = NULL;
+    ui->screen = PSP_UI_SCREEN_PAGE;
+    return true;
+}
+
+/* The page's bottom bar in every language: each pair's word translated
+   and whole, the X and O pairs always shown, and the spacing rules of the
+   English row (check_legend_runs). */
+static bool check_legend_runs(const char *what, unsigned scale);
+static bool test_page_legend_language(PspUiState *ui, TilefinchGlyphProvider *provider)
+{
+    bool saved_chrome = ui->chrome_visible;
+    PspUiScreen saved_screen = ui->screen;
+    ui->screen = PSP_UI_SCREEN_PAGE;
+    ui->chrome_visible = true;
+    for (unsigned scale = 1; scale <= 2; scale++) {
+        for (unsigned variant = 0; variant < 3; variant++) {
+            ui->browser_ui_scale = scale;
+            ui->focus_editable = variant == 1;
+            ui->page_requests_blocked = variant == 2 ? 1234u : 0u;
+            const char *labels[] = {
+                ui->focus_editable ? "Edit" : "Open", "Back", "Bar",
+                ui->focus_editable ? "Enter" : "Search", "Reload"
+            };
+            bool settled = false;
+            for (unsigned pass = 0; pass < 64 && !settled; pass++) {
+                run_count = 0; run_overflow = false;
+                for (size_t at = 0; at < sizeof(storage) / sizeof(storage[0]); at++)
+                    storage[at] = 0xa55a;
+                draw_bottom_bar(ui, storage + 16, WIDTH, HEIGHT, STRIDE, 0, 0, 0);
+                bool changed = false;
+                size_t read = 0;
+                CHECK(tilefinch_glyph_provider_pump(provider, 65536, &changed, &read));
+                settled = read == 0;
+            }
+            CHECK(settled && validate_frame(ui));
+            char what[48];
+            snprintf(what, sizeof(what), "locale=%s variant=%u", language_code, variant);
+            CHECK(check_legend_runs(what, scale));
+            size_t words = 0;
+            for (size_t at = 0; at < 5; at++) {
+                CHECK(translated(labels[at]));
+                bool shown = has_run(tilefinch_ui_text(labels[at]));
+                words += shown;
+                /* X and O are kept longest. */
+                if (at < 2 && !shown)
+                    fprintf(stderr, "legend %s scale=%u lost '%s'\n", what, scale, labels[at]);
+                CHECK(shown || at >= 2);
+            }
+            if (words != 5)
+                fprintf(stderr, "legend %s scale=%u shows %zu of 5 pairs\n", what, scale, words);
+            if (variant == 0 && scale == 1 && ui->chrome_theme == BROWSER_CHROME_THEME_FINCH)
+                CHECK(snapshot("page-legend"));
+        }
+    }
+    ui->browser_ui_scale = 1;
+    ui->focus_editable = false;
+    ui->page_requests_blocked = 0;
+    ui->chrome_visible = saved_chrome;
+    ui->screen = saved_screen;
+    return true;
+}
+
+/* Settings: every listed option's one-line description is translated and
+   whole; an option with no category is never shown and keeps English. The
+   site-dependent rows of Permissions & controls read the translated N/A. */
+static bool test_settings_descriptions_language(PspUiState *ui, TilefinchGlyphProvider *provider)
+{
+    ui->screen = PSP_UI_SCREEN_OPTION_ITEMS;
+    for (unsigned option = 0; option < UI_OPTIONS_ITEM_COUNT; option++) {
+        UiOptionId id = ui_option_id(option);
+        if (ui_option_group_index(id) >= UI_SETTINGS_GROUP_COUNT) continue;
+        ui->options_selection = option;
+        CHECK(paint(ui, provider));
+        const char *description = ui_option_description(id);
+        CHECK(translated(description));
+        const TextRun *run = run_with_text(tilefinch_ui_text(description));
+        if (run == NULL || run->truncated)
+            fprintf(stderr, "description locale=%s option=%u '%s'\n",
+                    language_code, option, description);
+        CHECK(run != NULL && !run->truncated);
+    }
+    ui->options_selection = 0;
+    ui->screen = PSP_UI_SCREEN_SITE_CONTROLS;
+    CHECK(paint(ui, provider));
+    CHECK(translated("N/A") && has_run(tilefinch_ui_text("N/A")));
+    ui->screen = PSP_UI_SCREEN_PAGE;
+    return true;
+}
+
+/* The catalog has a row for KEY: its text is the language's own, even
+   where that reads like the English word (French "Cobalt"). */
+static bool has_row(const char *key)
+{
+    if (!strcmp(language_code, "en") || tilefinch_ui_text(key) != key) return true;
+    fprintf(stderr, "no row: locale=%s '%s'\n", language_code, key);
+    return false;
+}
+
+/* A row of catalog pieces, joined as the painter joins them. */
+static bool shown_joined(const char *const *pieces, size_t count)
+{
+    char joined[2 * TILEFINCH_UI_TRANSLATION_VALUE_BYTES + 32];
+    psp_ui_join_reading_order(joined, sizeof(joined), pieces, count);
+    return shown_whole(joined);
+}
+
+/* Themes, Experimental, HOME's open-pages list, the tab list's
+   placeholders, the Wi-Fi profile and content blocker values, the YouTube
+   login question and the startup splash: each line is the language's own
+   and whole. */
+static bool test_more_chrome_language(PspUiState *ui, TilefinchGlyphProvider *provider)
+{
+    ui->overlay_animation_frames = 0;
+    ui->screen = PSP_UI_SCREEN_THEME_OPTIONS;
+    for (unsigned selected = 0; selected < BROWSER_CHROME_THEME_CUSTOM; selected++) {
+        ui->data_options_selection = selected;
+        CHECK(paint(ui, provider));
+        CHECK(has_row("X Apply   O Back")
+              && shown_whole(tilefinch_ui_text("X Apply   O Back")));
+        CHECK(has_row("Themes") && has_run(tilefinch_ui_text("Themes")));
+        const char *hint = psp_ui_theme_catalog_count(psp_ui_theme_catalog_bound()) == 0u
+            ? "Copy .tfth files into data/themes" : "Built-ins and downloaded theme files";
+        CHECK(has_row(hint) && shown_whole(tilefinch_ui_text(hint)));
+        for (unsigned theme = 0; theme < BROWSER_CHROME_THEME_CUSTOM; theme++) {
+            const char *name = ui_chrome_theme_name((BrowserChromeTheme) theme);
+            CHECK(shown_whole(name));
+        }
+    }
+    static const char *const names[] = {"Midnight", "Cobalt", "Slate", "Ember", "Daylight"};
+    for (size_t at = 0; at < sizeof(names) / sizeof(names[0]); at++) CHECK(has_row(names[at]));
+
+    ui->screen = PSP_UI_SCREEN_EXPERIMENTAL_OPTIONS;
+    for (unsigned phase = 0; phase <= PSP_UI_VOICE_COMPONENT_LEGACY; phase++) {
+        for (unsigned remove = 0; remove < 2u; remove++) {
+            ui->voice_component_phase = phase;
+            ui->voice_component_remove_confirmation = remove;
+            ui->voice_component_progress_plus_one = 0;
+            ui->experimental_voice_input = phase & 1u;
+            ui->adaptive_voice_memory = remove;
+            ui->update_channel = phase % 3u;
+            ui->developer_update_available = remove;
+            for (unsigned row = 0; row < 6u; row++) {
+                ui->experimental_options_selection = (uint8_t) row;
+                CHECK(paint(ui, provider));
+                CHECK(has_run(tilefinch_ui_text("Experimental")));
+                const char *voice[] = {tilefinch_ui_text("Voice input"), "  ",
+                    tilefinch_ui_text(ui->experimental_voice_input ? "On" : "Off")};
+                CHECK(has_row("Voice input") && shown_joined(voice, 3u));
+                static const char *const states[] = {
+                    "Checking...", "Download (9.1 MB)", "Checking...", "Downloading...",
+                    "Installing...", "Installed", "Try again", "Legacy slot model"};
+                const char *model[] = {tilefinch_ui_text("Voice model"), "  ",
+                    tilefinch_ui_text(remove ? "Remove?" : states[phase])};
+                CHECK(has_row("Voice model") && has_row(states[phase]) && shown_joined(model, 3u));
+                const char *search[] = {tilefinch_ui_text("Voice search"),
+                    ui->experimental_voice_input ? "..." : "  (",
+                    ui->experimental_voice_input ? NULL : tilefinch_ui_text("Off"),
+                    ui->experimental_voice_input ? NULL : ")"};
+                CHECK(has_row("Voice search") && shown_joined(search, 4u));
+                const char *memory[] = {tilefinch_ui_text("Voice memory"), " ",
+                    tilefinch_ui_text(remove ? "Adaptive" : "Full")};
+                CHECK(has_row("Voice memory") && shown_joined(memory, 3u));
+                bool developer = ui->update_channel == BROWSER_UPDATE_CHANNEL_DEVELOPER;
+                const char *updates[] = {
+                    tilefinch_ui_text(developer ? "Updates" : "Update channel"), "  ",
+                    tilefinch_ui_text(developer ? "Dev URL (untrusted)"
+                        : ui->update_channel == BROWSER_UPDATE_CHANNEL_BETA ? "Beta" : "Stable")};
+                CHECK(has_row("Update channel") && shown_joined(updates, 3u));
+                const char *url[] = {tilefinch_ui_text("Developer URL"), "  ",
+                    tilefinch_ui_text(remove ? "Edit" : "Set"), "..."};
+                CHECK(has_row("Developer URL") && shown_joined(url, 4u));
+                const char *hint = row == 5u ? "X Edit URL   O Back" : "X Select   O Back";
+                if (row == 1u)
+                    hint = remove ? "X Remove model   O Cancel"
+                        : phase == PSP_UI_VOICE_COMPONENT_READY ? "X Remove model   O Back"
+                        : phase == PSP_UI_VOICE_COMPONENT_LEGACY ? "X Download shared copy   O Back"
+                        : phase == PSP_UI_VOICE_COMPONENT_CHECKING
+                              || phase == PSP_UI_VOICE_COMPONENT_DOWNLOADING
+                              || phase == PSP_UI_VOICE_COMPONENT_INSTALLING
+                            ? "X Cancel   O Back" : "X Download 9.1 MB   O Back";
+                CHECK(has_row(hint) && shown_whole(tilefinch_ui_text(hint)));
+            }
+        }
+    }
+    ui->voice_component_phase = 0;
+    ui->voice_component_remove_confirmation = false;
+    ui->experimental_options_selection = 0;
+    ui->update_channel = 0;
+
+    /* HOME with nothing open yet, and the tab list before any tab. */
+    PspUiHomeView home = {.tile_count = 1, .engine_ready = true};
+    snprintf(home.tiles[0].label, sizeof(home.tiles[0].label), "Wikipedia");
+    ui->home = &home;
+    ui->screen = PSP_UI_SCREEN_HOME;
+    CHECK(paint(ui, provider));
+    CHECK(has_row("CONTINUE") && shown_whole(tilefinch_ui_text("CONTINUE")));
+    CHECK(has_row("NOTHING OPEN YET") && shown_whole(tilefinch_ui_text("NOTHING OPEN YET")));
+    ui->home = NULL;
+    ui->tabs = NULL;
+    ui->screen = PSP_UI_SCREEN_TABS;
+    CHECK(paint(ui, provider));
+    CHECK(has_row("CURRENT PAGE") && has_row("Untitled") && has_row("UNTITLED PAGE")
+          && has_row("Page") && has_row("Opening page"));
+    CHECK(shown_whole(tilefinch_ui_text("CURRENT PAGE")));
+
+    /* Settings values built from catalog words and digits. */
+    ui->screen = PSP_UI_SCREEN_OPTION_ITEMS;
+    psp_ui_set_network_profile(ui, 3u, NULL);
+    unsigned blocker_mode = ui->content_blocker_mode;
+    ui->content_blocker_mode = CONTENT_BLOCKER_BASIC;
+    for (unsigned option = 0; option < UI_OPTIONS_ITEM_COUNT; option++) {
+        UiOptionId id = ui_option_id(option);
+        if (id != UI_OPTION_NETWORK_PROFILE && id != UI_OPTION_CONTENT_BLOCKER) continue;
+        ui->options_selection = option;
+        CHECK(paint(ui, provider));
+        const char *profile[] = {tilefinch_ui_text("Profile"), " ", "3"};
+        const char *blocker[] = {tilefinch_ui_text("Basic"), " / ", "0"};
+        if (id == UI_OPTION_NETWORK_PROFILE) CHECK(has_row("Profile") && shown_joined(profile, 3u));
+        else if (ui->total_requests_blocked == 0u) CHECK(shown_joined(blocker, 3u));
+    }
+    ui->content_blocker_mode = blocker_mode;
+    ui->options_selection = 0;
+
+    /* The YouTube login question: every line, at whichever scale fits. */
+    static const char *const login[] = {
+        "Save YouTube login?", "Session cookies, not your password.",
+        "Unencrypted on the Memory Stick.", "Anyone with the card may use your login.",
+        "Save; ask next time", "Always save; don't ask", "Not now; ask next time",
+        "Never save; don't ask"};
+    ui->screen = PSP_UI_SCREEN_TABS;
+    psp_ui_show_youtube_login_offer(ui);
+    ui->overlay_animation_frames = 0;
+    ui->menu_selection = 0u;
+    CHECK(paint(ui, provider));
+    for (size_t at = 0; at < sizeof(login) / sizeof(login[0]); at++)
+        CHECK(has_row(login[at]) && (at == 4u || shown_whole(tilefinch_ui_text(login[at]))));
+    const char *chosen[] = {"> ", tilefinch_ui_text(login[4])};
+    CHECK(shown_joined(chosen, 2u));
+    ui->screen = PSP_UI_SCREEN_PAGE;
+
+    /* A startup failure after the catalog is bound reads in the language. */
+    for (unsigned pass = 0;; pass++) {
+        CHECK(pass < 64u);
+        run_count = 0; run_overflow = false;
+        psp_ui_startup_composite(PSP_UI_STARTUP_SPLASH, NULL, 80, storage + 16, WIDTH, HEIGHT, STRIDE);
+        bool changed = false;
+        size_t read = 0;
+        CHECK(tilefinch_glyph_provider_pump(provider, 65536, &changed, &read));
+        if (!read) break;
+    }
+    CHECK(has_row("STARTING BROWSER") && shown_whole(tilefinch_ui_text("STARTING BROWSER")));
+    CHECK(has_row("HOLD L WHILE STARTING") && shown_whole(tilefinch_ui_text("HOLD L WHILE STARTING")));
+    psp_ui_theme_select((BrowserChromeTheme) ui->chrome_theme);
+
+    /* Video and subtitle language names, reader fonts, subtitle size and
+       the player's opening titles have rows. */
+    static const char *const rows[] = {
+        "Chinese (S)", "Chinese (T)", "Italian", "PSP system", "Same as audio", "Sans",
+        "Serif", "Standard", "Opening video", "Seeking video", "Refreshing video link",
+        "Unnamed", "Showing first 12 valid theme files", "Built-ins and downloaded theme files"};
+    for (size_t at = 0; at < sizeof(rows) / sizeof(rows[0]); at++) CHECK(has_row(rows[at]));
     return true;
 }
 
@@ -866,9 +1367,9 @@ static bool test_status_toasts(PspUiState *ui, TilefinchGlyphProvider *provider)
             char joined[600];
             if (run_count == 1)
                 snprintf(joined, sizeof(joined), "%s", runs[0].text);
-            /* Arabic catalog text is visual order: its first line is the
-               right part of the string. */
-            else if (run_count == 2 && !strcmp(language_code, "ar")
+            /* Right-to-left catalog text is visual order: its first line
+               is the right part of the string. */
+            else if (run_count == 2 && ui_rtl()
                      && tilefinch_ui_text(key) != key)
                 snprintf(joined, sizeof(joined), "%s %s", runs[1].text, runs[0].text);
             else if (run_count == 2)
@@ -910,7 +1411,11 @@ static bool expected_toast_line(const char *line, char *output, size_t size)
         char head[128];
         snprintf(head, sizeof(head), "%.*s", (int) (space - line), line);
         if (tilefinch_ui_text(head) != head) {
-            snprintf(output, size, "%s%s", tilefinch_ui_text(head), space);
+            /* Right-to-left text reads from the right: the count stands on the left. */
+            if (ui_rtl())
+                snprintf(output, size, "%s %s", space + 1, tilefinch_ui_text(head));
+            else
+                snprintf(output, size, "%s%s", tilefinch_ui_text(head), space);
             return true;
         }
     }
@@ -1130,10 +1635,17 @@ static bool test_state_text(PspUiState *ui, TilefinchGlyphProvider *provider)
                 at % 5u ? "" : "Decoder rebuild needed", at % 2u ? 500 : -1,
                 label, true, cancel);
             CHECK(paint(ui, provider));
+            if (scale == 2 && at == 1) CHECK(snapshot("update"));
             char current[160];
-            snprintf(current, sizeof(current), "%s  %s",
-                tilefinch_ui_text("Current version"),
-                at % 4u ? "0.1.30" : tilefinch_ui_text("Unknown"));
+            /* Right-to-left text reads from the right: the version stands on the left. */
+            if (ui_rtl())
+                snprintf(current, sizeof(current), "%s  %s",
+                    at % 4u ? "0.1.30" : tilefinch_ui_text("Unknown"),
+                    tilefinch_ui_text("Current version"));
+            else
+                snprintf(current, sizeof(current), "%s  %s",
+                    tilefinch_ui_text("Current version"),
+                    at % 4u ? "0.1.30" : tilefinch_ui_text("Unknown"));
             CHECK(shown_whole(tilefinch_ui_text("Tilefinch update"))
                   && shown_whole(current)
                   && shown_whole(tilefinch_ui_text(statuses[at]))
@@ -1232,7 +1744,11 @@ static bool test_state_text(PspUiState *ui, TilefinchGlyphProvider *provider)
         psp_ui_set_glyph_offer_size(ui, (uint8_t) pack, 41u * 1024u * 1024u / 10u);
         CHECK(paint(ui, provider));
         char title[160];
-        snprintf(title, sizeof(title), "%s  (4.1 MB)", label);
+        if (ui_rtl())
+            snprintf(title, sizeof(title), "(4.1 MB)  %s", label);
+        else
+            snprintf(title, sizeof(title), "%s  (4.1 MB)", label);
+        if (pack == 0) CHECK(snapshot("glyph-offer"));
         CHECK(shown_whole(title)
               && shown_whole(tilefinch_ui_text("Install this font pack?"))
               && shown_whole(tilefinch_ui_text("Signed, verified, kept on the Memory Stick."))
@@ -1305,7 +1821,8 @@ static bool test_site_information(PspUiState *ui, TilefinchGlyphProvider *provid
     static const char *const actions[UI_SITE_INFO_ACTION_COUNT] = {
         "Permissions & controls", "Site storage",
         "Clear data for this site", "Reset permissions"};
-    bool arabic = tilefinch_ui_translation_bound_language() == TILEFINCH_UI_LANGUAGE_ARABIC;
+    bool right_to_left = tilefinch_ui_language_right_to_left(
+        tilefinch_ui_translation_bound_language());
     unsigned session_both = 0;
     snprintf(ui->url, sizeof(ui->url), "https://www.example.org/news/today");
     char domain[64], detail[128];
@@ -1327,8 +1844,12 @@ static bool test_site_information(PspUiState *ui, TilefinchGlyphProvider *provid
         CHECK(strlen(issuer) < sizeof(ui->site_tls_issuer));
         snprintf(ui->site_tls_issuer, sizeof(ui->site_tls_issuer), "%s", issuer);
         char connection[TILEFINCH_UI_TRANSLATION_VALUE_BYTES + 24];
-        snprintf(connection, sizeof(connection), "%s  |  %s",
-                 tilefinch_ui_text(states[state]), ui->site_tls_version);
+        if (right_to_left)
+            snprintf(connection, sizeof(connection), "%s  |  %s",
+                     ui->site_tls_version, tilefinch_ui_text(states[state]));
+        else
+            snprintf(connection, sizeof(connection), "%s  |  %s",
+                     tilefinch_ui_text(states[state]), ui->site_tls_version);
         for (unsigned place = 0; place < 4; place++) {
             ui->site_storage_state = (uint8_t) place;
             /* The Site data & storage list's words for the place; a
@@ -1339,12 +1860,18 @@ static bool test_site_information(PspUiState *ui, TilefinchGlyphProvider *provid
             char where[2 * TILEFINCH_UI_TRANSLATION_VALUE_BYTES + 4], both[sizeof(where)];
             snprintf(where, sizeof(where), "%s",
                      place == 0 ? "RAM" : tilefinch_ui_text(places[place]));
-            snprintf(both, sizeof(both), "%s (%s)", tilefinch_ui_text("Memory Stick"),
-                     tilefinch_ui_text("This session"));
+            /* Right-to-left text reads from the right: each part's count stands on the
+               left of its label, and the parts run leftward. */
+            if (right_to_left)
+                snprintf(both, sizeof(both), "(%s) %s", tilefinch_ui_text("This session"),
+                         tilefinch_ui_text("Memory Stick"));
+            else
+                snprintf(both, sizeof(both), "%s (%s)", tilefinch_ui_text("Memory Stick"),
+                         tilefinch_ui_text("This session"));
             char data[2 * TILEFINCH_UI_TRANSLATION_VALUE_BYTES + 48];
-            if (arabic)
-                snprintf(data, sizeof(data), "120 %s  |  2048 %s  |  12288 KB",
-                         tilefinch_ui_text("Cookies:"), tilefinch_ui_text("Storage:"));
+            if (right_to_left)
+                snprintf(data, sizeof(data), "12288 KB  |  2048 %s  |  120 %s",
+                         tilefinch_ui_text("Storage:"), tilefinch_ui_text("Cookies:"));
             else
                 snprintf(data, sizeof(data), "%s 120  |  %s 2048  |  12288 KB",
                          tilefinch_ui_text("Cookies:"), tilefinch_ui_text("Storage:"));
@@ -1353,6 +1880,8 @@ static bool test_site_information(PspUiState *ui, TilefinchGlyphProvider *provid
                 for (unsigned armed = 0; armed < (row >= 2 ? 2u : 1u); armed++) {
                     ui->data_clear_confirmation = armed ? (uint8_t) (row + 1) : 0;
                     CHECK(paint(ui, provider));
+                    if (state == 0 && place == 3 && row == 1)
+                        CHECK(snapshot("site-information"));
                     CHECK(shown_whole(tilefinch_ui_text("Site information"))
                           && shown_whole(domain)
                           && shown_whole(connection) && shown_whole(issuer)
@@ -1397,13 +1926,18 @@ static bool test_site_information(PspUiState *ui, TilefinchGlyphProvider *provid
 static bool test_remaining_screens(PspUiState *ui, TilefinchGlyphProvider *provider)
 {
     bool english = !strcmp(language_code, "en");
+    bool arabic = ui_rtl(); /* any right-to-left language */
     char retry[TILEFINCH_UI_TRANSLATION_VALUE_BYTES + 4];
-    snprintf(retry, sizeof(retry), "X %s", tilefinch_ui_text("Retry"));
+    /* Right-to-left text reads from the right: a button stands on the right of the
+       word it names, and the second hint on the left of the first. */
+    snprintf(retry, sizeof(retry), arabic ? "%s X" : "X %s", tilefinch_ui_text("Retry"));
     char audio[TILEFINCH_UI_TRANSLATION_VALUE_BYTES + 16], both[600];
     /* Named the way the player's other hints name the buttons. */
-    snprintf(audio, sizeof(audio), "TRI %s", tilefinch_ui_text("Audio-only"));
+    snprintf(audio, sizeof(audio), arabic ? "%s TRI" : "TRI %s",
+             tilefinch_ui_text("Audio-only"));
     const char *lower = "\xe2\x96\xa1 240p";
-    snprintf(both, sizeof(both), "%s   %s", audio, lower);
+    snprintf(both, sizeof(both), "%s   %s", arabic ? lower : audio,
+             arabic ? audio : lower);
     for (unsigned scale = 1; scale <= 2; scale++) {
         ui->browser_ui_scale = scale;
         PspUiMediaState media = {.visible = true, .controls_visible = true};
@@ -1442,7 +1976,8 @@ static bool test_remaining_screens(PspUiState *ui, TilefinchGlyphProvider *provi
         /* The unencrypted-audio question: its Retry says "Play anyway",
            fits its chip and still answers through the Retry action. */
         char play[TILEFINCH_UI_TRANSLATION_VALUE_BYTES + 4];
-        snprintf(play, sizeof(play), "X %s", tilefinch_ui_text("Play anyway"));
+        snprintf(play, sizeof(play), arabic ? "%s X" : "X %s",
+                 tilefinch_ui_text("Play anyway"));
         psp_ui_media_set_error_reason(&media, "PLAY UNENCRYPTED AUDIO?",
                                       "This station is not encrypted");
         media.insecure_audio_offer = true;
@@ -1618,7 +2153,7 @@ static bool test_composed_toasts(PspUiState *ui, TilefinchGlyphProvider *provide
         "Color Emoji\nInstalled. Reload the page to redraw it",
         "Color Emoji\nInstalled",
         "Bengali-Assamese\nLanguage pack installed",
-        "Won't ask again. Install it later from:\n"
+        "Won't ask again. Install later from:\n"
             "Settings > Appearance > Language & emoji",
         "CONTENT BLOCKER IS OFF\nSETTINGS > PRIVACY & SECURITY",
         "JAVASCRIPT IS OFF FOR ALL SITES\nSETTINGS > BROWSING & INPUT",
@@ -1647,6 +2182,9 @@ static bool test_composed_toasts(PspUiState *ui, TilefinchGlyphProvider *provide
             bool first_translated = false;
             if (row < count) {
                 char english_lines[PSP_UI_STATUS_CAPACITY];
+                /* The status holds the whole English text, or a line's
+                   lookup would miss on the cut key. */
+                CHECK(strlen(statuses[row]) < sizeof(english_lines));
                 snprintf(english_lines, sizeof(english_lines), "%s", statuses[row]);
                 char *next = strchr(english_lines, '\n');
                 if (next != NULL) *next++ = '\0';
@@ -1696,11 +2234,13 @@ static bool test_composed_toasts(PspUiState *ui, TilefinchGlyphProvider *provide
             }
             ui->toast_entry_frames = 0;
             CHECK(paint(ui, provider));
+            if (row == 0 && scale == 2) CHECK(snapshot("toast-progress"));
             /* A long single line may wrap at a space; rejoined it must be
-               the expected text. Arabic catalog text is visual order, so
-               its first painted line is the right part of the string. */
+               the expected text. Right-to-left catalog text is visual
+               order, so its first painted line is the right part of the
+               string. */
             char rejoined[600] = "";
-            if (run_count == 2 && !strcmp(language_code, "ar") && first_translated)
+            if (run_count == 2 && ui_rtl() && first_translated)
                 snprintf(rejoined, sizeof(rejoined), "%s %s", runs[1].text, runs[0].text);
             else if (run_count == 2)
                 snprintf(rejoined, sizeof(rejoined), "%s %s", runs[0].text, runs[1].text);
@@ -1752,7 +2292,8 @@ static bool check_legend_runs(const char *what, unsigned scale)
         };
         bool must_fit = legend_button(a->text);
         for (size_t at = 0; at < sizeof(fixed) / sizeof(fixed[0]); at++)
-            must_fit |= !strcmp(a->text, fixed[at]);
+            must_fit |= !strcmp(a->text, fixed[at])
+                || !strcmp(a->text, tilefinch_ui_text(fixed[at]));
         if ((must_fit && a->truncated) || a->missing_glyph
             || a->left < 0 || a->right > WIDTH)
             fail = true;
@@ -1844,6 +2385,55 @@ static bool test_page_legend_row(void)
     return true;
 }
 
+/* Settings rows read from the interface language's start edge: in Arabic
+   and Hebrew the label ends at the panel's right edge and the chevron or value stands
+   at its left (the panel mirrored), elsewhere the other way round. */
+static bool settings_rows_follow_language(PspUiState *ui, TilefinchGlyphProvider *provider)
+{
+    bool mirrored = tilefinch_ui_language_right_to_left(
+        tilefinch_ui_translation_bound_language());
+    CHECK(mirrored == (!strcmp(language_code, "ar") || !strcmp(language_code, "he")));
+    /* The group list: box 42..438, labels from x=62, chevrons ending 418. */
+    ui->screen = PSP_UI_SCREEN_OPTIONS;
+    ui->options_group_selection = 0;
+    CHECK(paint(ui, provider));
+    for (size_t at = 0; at < UI_SETTINGS_GROUP_COUNT; at++) {
+        const TextRun *label = run_with_text(ui_option_group_at(at));
+        CHECK(label);
+        if (mirrored) CHECK(label->right >= 413 && label->right <= 418);
+        else CHECK(label->left >= 62 && label->left <= 67);
+    }
+    size_t chevrons = 0;
+    for (size_t i = 0; i < run_count; i++) {
+        if (strcmp(runs[i].text, mirrored ? "<" : ">")) continue;
+        CHECK(mirrored ? runs[i].left >= 62 && runs[i].left <= 67
+                       : runs[i].right >= 413 && runs[i].right <= 418);
+        chevrons++;
+    }
+    CHECK(chevrons == UI_SETTINGS_GROUP_COUNT && !run_with_text(mirrored ? ">" : "<"));
+    /* One item row: the label at the start edge, its value at the other. */
+    ui->screen = PSP_UI_SCREEN_OPTION_ITEMS;
+    ui->options_selection = UI_OPTION_ZOOM_INDEX;
+    CHECK(paint(ui, provider));
+    const char *label = "", *value = "";
+    char formatted[32];
+    ui_option_row_presentation(ui, UI_OPTION_ZOOM_INDEX, &label, &value,
+                               formatted, sizeof(formatted));
+    const TextRun *label_run = run_with_text(tilefinch_ui_text(label));
+    const TextRun *value_run = run_with_text(tilefinch_ui_text(value));
+    CHECK(label_run && value_run);
+    /* Box 58..422: labels from x=76, values ending at 406 (376 when the
+       group scrolls). */
+    if (mirrored) CHECK(label_run->right >= 399 && label_run->right <= 404
+                        && value_run->left >= 74 && value_run->left <= 110
+                        && value_run->right < label_run->left);
+    else CHECK(label_run->left >= 76 && label_run->left <= 81
+               && value_run->right >= 370 && value_run->right <= 406
+               && label_run->right < value_run->left);
+    ui->screen = PSP_UI_SCREEN_OPTIONS;
+    return true;
+}
+
 /* A page's title in the chrome reads in display order wherever it is shown,
    and a long right-to-left one loses its end, which is at the left. */
 static bool page_text_run(const char *text)
@@ -1875,6 +2465,12 @@ static bool test_page_text_display_order(void)
     psp_ui_composite(&ui, storage + 16, WIDTH, HEIGHT, STRIDE);
     CHECK(page_text_run(visual) && !page_text_run(logical));
     CHECK(page_text_run("Plain title"));
+    /* Each reads from its own start edge in a left-to-right interface: the
+       Hebrew title against the row's right end (x=414), the English one
+       from its left (x=134). */
+    CHECK(!tilefinch_ui_language_right_to_left(tilefinch_ui_translation_bound_language()));
+    CHECK(run_with_text(visual)->end == 414);
+    CHECK(run_with_text("Plain title")->start == 134);
     ui.tabs = NULL;
 
     PspUiHomeView home = {.tile_count = 1, .continue_count = 1,
@@ -1887,9 +2483,16 @@ static bool test_page_text_display_order(void)
     run_count = 0; run_overflow = false;
     psp_ui_composite(&ui, storage + 16, WIDTH, HEIGHT, STRIDE);
     size_t shown = 0;
+    UiRect tile = ui_home_row_rect(&ui, 0), row = ui_home_row_rect(&ui, 1);
     for (size_t i = 0; i < run_count; i++) {
         CHECK(strcmp(runs[i].text, logical) != 0);
-        shown += !strcmp(runs[i].text, visual);
+        if (strcmp(runs[i].text, visual) != 0) continue;
+        shown++;
+        /* The tile's title ends at its text rail, the CONTINUE row's
+           where its detail column begins. */
+        int end = runs[i].top < row.y ? tile.x + tile.width - PSP_THEME_SPACE_S
+                                      : row.x + row.width - 150;
+        CHECK(runs[i].end == end);
     }
     CHECK(shown == 2u);
     ui.home = NULL;
@@ -1899,6 +2502,12 @@ static bool test_page_text_display_order(void)
     run_count = 0; run_overflow = false;
     draw_top_bar(&ui, storage, WIDTH, HEIGHT, STRIDE, 0, 0, 0, 0);
     CHECK(page_text_run(visual) && !page_text_run(logical));
+    /* The address field's text rail ends 5 px inside it. */
+    int field_right = device_status.valid
+        ? WIDTH - 33 - chrome_text_width_bytes(device_status.clock,
+              strlen(device_status.clock), 1, false) - PSP_THEME_SPACE_S
+        : WIDTH - 8;
+    CHECK(run_with_text(visual)->end == field_right - 5);
 
     char longer[160] = "";
     for (int word = 0; word < 8; word++) strcat(longer, "\xd7\x90\xd7\x91\xd7\x92 ");
@@ -1935,6 +2544,55 @@ static bool test_page_text_display_order(void)
         CHECK(!runs[i].truncated);
     }
     CHECK(drawn && text_budget.current == 0);
+    return !run_overflow;
+}
+
+/* A player menu row is put in display order once, when it arrives, and cut
+   when it is drawn: a right-to-left row against the row's right end, its
+   left end (where it ends) giving way to dots when it is too long. */
+static bool test_player_rows_read_from_their_start(void)
+{
+    static Budget text_budget;
+    budget_init(&text_budget, 256u * 1024u);
+    PspUiMediaPresentation presentation = {0};
+    PspUiMediaState media = {
+        .visible = true, .playing = true, .controls_visible = true,
+        .seek_enabled = true, .duration_us = UINT64_C(900000000),
+        .presentation = &presentation
+    };
+    MediaChapter chapters[3] = {{0, ""}, {60, ""}, {120, "Plain chapter"}};
+    snprintf(chapters[0].title, sizeof(chapters[0].title),
+             "\xd7\x90\xd7\x91 \xd7\x92\xd7\x93"); /* alef bet, gimel dalet */
+    /* Chet tet, then wide Latin that the right-to-left row sets to its
+       left: far wider than the row. */
+    snprintf(chapters[1].title, sizeof(chapters[1].title),
+             "\xd7\x97\xd7\x98 WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW");
+    for (unsigned at = 0; at < 3; at++)
+        psp_ui_media_prepare_row_text(&media, &text_budget, chapters[at].title,
+                                      sizeof(chapters[at].title));
+    CHECK(text_budget.current == 0);
+    psp_ui_media_set_chapters(&media, chapters, 3);
+    presentation.track_menu_open = true;
+    presentation.track_menu_tab = PSP_UI_MEDIA_TAB_CHAPTERS;
+    run_count = 0; run_overflow = false;
+    psp_ui_media_composite(&media, storage + 16, WIDTH, HEIGHT, STRIDE);
+    UiRect box = media_track_menu_rect(&media, WIDTH, HEIGHT);
+    int label_x = box.x + 20 + 62, end = box.x + box.width - 42;
+    const TextRun *short_row = run_with_text("\xd7\x93\xd7\x92 \xd7\x91\xd7\x90");
+    const TextRun *plain = run_with_text("Plain chapter");
+    CHECK(short_row && short_row->end == end && short_row->start > label_x);
+    CHECK(plain && plain->start == label_x);
+    /* The long row keeps its start, chet tet, at the right end. */
+    const TextRun *kept = NULL, *dots = NULL;
+    for (size_t i = 0; i < run_count; i++) {
+        size_t length = strlen(runs[i].text);
+        if (length > 4 && !strcmp(runs[i].text + length - 4, "\xd7\x98\xd7\x97"))
+            kept = &runs[i];
+        if (!strcmp(runs[i].text, "...")) dots = &runs[i];
+    }
+    CHECK(kept && dots && kept->end == end && dots->start >= label_x
+          && dots->end == kept->start && !kept->truncated);
+    CHECK(strlen(kept->text) < strlen(chapters[1].title) - 3u);
     return !run_overflow;
 }
 
@@ -2240,6 +2898,55 @@ static bool text_has_logical_rtl_letter(const char *text, size_t length)
     return false;
 }
 
+/* A shrink-to-fit box's text, from its first glyph's left edge to its last
+   glyph's right edge, sits in the middle of the box: as much room on the
+   left as on the right, to a pixel's rounding. Shaped right-to-left text is
+   measured from the glyphs the painter places. */
+static bool answer_text_centred(const LayoutDocument *layout, const LayoutNodeBox *box)
+{
+    int left = INT_MAX, right = INT_MIN;
+    for (size_t at = box->command_start; at < box->command_end && at < layout->count; at++) {
+        const DrawCommand *command = &layout->commands[at];
+        if (command->type != DRAW_TEXT || command->text_length == 0) continue;
+        const LayoutBidiCommand *bidi = layout_bidi_command_for_index(layout, at);
+        if (bidi && bidi->glyph_count) {
+            for (size_t g = 0; g < bidi->glyph_count; g++) {
+                const LayoutBidiGlyph *glyph = &layout->bidi_glyphs[bidi->glyph_start + g];
+                if (glyph->advance_fixed == 0) continue;
+                int glyph_left = glyph->x_fixed / 64;
+                int glyph_right = (glyph->x_fixed + glyph->advance_fixed + 63) / 64;
+                if (glyph_left < left) left = glyph_left;
+                if (glyph_right > right) right = glyph_right;
+            }
+        } else {
+            if (command->x < left) left = command->x;
+            if (command->x + command->width > right) right = command->x + command->width;
+        }
+    }
+    CHECK(left < right);
+    int before = left - box->x, after = box->x + box->width - right;
+    if (abs(before - after) > 2) {
+        fprintf(stderr, "locale=%s answer text off centre: %d px left, %d px right (box %d+%d)\n",
+                language_code, before, after, box->x, box->width);
+        return false;
+    }
+    return true;
+}
+
+/* A provider notice (browser_engine_youtube_notice_paint) publishes the
+   catalog's display-order text straight into its draw command, with no bidi
+   sidecar. Hebrew display text keeps Hebrew letters, only reversed, so the
+   logical-letter test cannot tell it from unordered page text; it must be
+   exactly one of the catalog's reordered rows. */
+static bool catalog_display_text(const char *text, size_t length)
+{
+    for (size_t row = 0; row < key_count; row++)
+        if (strlen(values[row]) == length && !memcmp(values[row], text, length)
+            && strcmp(values[row], tilefinch_ui_logical_text(keys[row])) != 0)
+            return true;
+    return false;
+}
+
 static bool provider_text_fits(BrowserEngine *engine, const FontSet *fonts)
 {
     const LayoutDocument *layout = &browser_engine_navigation(engine)->page.layout;
@@ -2261,12 +2968,13 @@ static bool provider_text_fits(BrowserEngine *engine, const FontSet *fonts)
             fprintf(stderr, "text width=%d available=%d text=%.*s\n", width,
                 command->width, (int)command->text_length, command->text);
         CHECK(width <= command->width + 2);
-        if (text_has_logical_rtl_letter(command->text, command->text_length)
-            && !layout_bidi_command_for_index(layout, at))
+        bool ordered = !text_has_logical_rtl_letter(command->text, command->text_length)
+            || layout_bidi_command_for_index(layout, at)
+            || catalog_display_text(command->text, command->text_length);
+        if (!ordered)
             fprintf(stderr, "right-to-left text painted in logical order: %.*s\n",
                 (int)command->text_length, command->text);
-        CHECK(!text_has_logical_rtl_letter(command->text, command->text_length)
-            || layout_bidi_command_for_index(layout, at));
+        CHECK(ordered);
     }
     (void) fonts;
     return true;
@@ -2350,6 +3058,110 @@ static bool provider_paint(BrowserEngine *engine, TilefinchGlyphProvider *provid
         tile_cache_repaint_glyphs(browser_engine_render_shell(engine));
     }
     CHECK(false);
+}
+
+/* Pieces of a chrome line join in reading order: a right-to-left interface
+   language lays them from the right, each whole, joining punctuation turned
+   around and its brackets mirrored. */
+static bool test_reading_order_join(void)
+{
+    bool leftward = ui_rtl();
+    char line[32];
+    const char *pieces[] = {"\xd8\xa3", "  (", "12 KB", ")", NULL, " > ", "v1.2"};
+    psp_ui_join_reading_order(line, sizeof(line), pieces, 7u);
+    CHECK(!strcmp(line, leftward ? "v1.2 < (12 KB)  \xd8\xa3"
+                                 : "\xd8\xa3  (12 KB) > v1.2"));
+    /* Cut whole characters only: one byte short of the letter's two. */
+    char tight[6];
+    const char *letter[] = {"abcd", "\xd8\xa3"};
+    psp_ui_join_reading_order(tight, sizeof(tight), letter, 2u);
+    CHECK(!strcmp(tight, leftward ? "\xd8\xa3" "abc" : "abcd"));
+    CHECK(psp_ui_join_reading_order(tight, sizeof(tight), NULL, 2u) == tight
+          && tight[0] == '\0');
+    return true;
+}
+
+/* The first text command whose text starts with PREFIX. */
+static const DrawCommand *page_text_command(const LayoutDocument *layout,
+                                            const char *prefix)
+{
+    for (size_t at = 0; at < layout->count; at++) {
+        const DrawCommand *command = &layout->commands[at];
+        if (command->type == DRAW_TEXT && command->text != NULL
+            && command->text_length >= strlen(prefix)
+            && !memcmp(command->text, prefix, strlen(prefix))) return command;
+    }
+    return NULL;
+}
+
+/* The saved-file page and the library list name files as the page's own
+   text: a left-to-right name starts at the left even when the interface
+   language (and so the page around it) reads right to left. */
+static bool test_offline_pages_direction(TilefinchGlyphProvider *provider)
+{
+    char root[] = "/tmp/tilefinch-file-direction-XXXXXX";
+    CHECK(mkdtemp(root));
+    BrowserDeviceProfile device;
+    browser_device_profile_psp3000(&device);
+    BrowserConfig config;
+    browser_config_init(&config, &device);
+    config.memory_limit = 16u * 1024u * 1024u;
+    config.resources.enabled = false;
+    config.resources.web_fonts_enabled = false;
+    CHECK(browser_config_set_font_paths(&config,
+        TILEFINCH_TEST_ROOT "/fonts/DejaVuSans-Latin.ttf",
+        TILEFINCH_TEST_ROOT "/fonts/DejaVuSerif-Latin.ttf",
+        TILEFINCH_TEST_ROOT "/fonts/DejaVuSans-Oblique-Latin.ttf",
+        TILEFINCH_TEST_ROOT "/fonts/DejaVuSans-Bold-Latin.ttf",
+        TILEFINCH_TEST_ROOT "/fonts/DejaVuSerif-Bold-Latin.ttf",
+        TILEFINCH_TEST_ROOT "/fonts/TilefinchSans-Regular.ttf",
+        TILEFINCH_TEST_ROOT "/fonts/TilefinchSans-Bold.ttf", 1536u * 1024u));
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine);
+    Budget *budget = browser_engine_budget(engine);
+    OfflineLibrary library;
+    offline_library_init(&library, budget, root);
+    library.loaded = true;
+    library.count = 1;
+    library.items[0] = (OfflineLibraryItem){.id = 1, .type = OFFLINE_ITEM_FILE,
+        .state = OFFLINE_ITEM_READY, .content_bytes = 4};
+    strcpy(library.items[0].title, "video.mp4");
+    char path[512];
+    CHECK(file_download_path(&library, 1, path, sizeof(path)));
+    FILE *file = fopen(path, "wb");
+    CHECK(file && fwrite("data", 1, 4, file) == 4 && !fclose(file));
+    bool arabic = ui_rtl(); /* any right-to-left language */
+    for (unsigned page = 0; page < 2; page++) {
+        char *html = NULL;
+        size_t length = 0;
+        CHECK(page == 0
+            ? offline_library_build_file_page(&library, budget, 1, &html, &length)
+            : offline_library_build_page(&library, budget, &html, &length));
+        CHECK(browser_engine_commit_html(engine, "https://tilefinch.local/offline",
+                                         html, length, true));
+        budget_free(budget, html);
+        CHECK(provider_paint(engine, provider));
+        const LayoutDocument *layout = &browser_engine_navigation(engine)->page.layout;
+        /* Text is laid out a word at a time: the heading's first word,
+           which a right-to-left heading sets against the right. */
+        char heading[128];
+        snprintf(heading, sizeof(heading), "%s",
+                 tilefinch_ui_logical_text(page == 0 ? "File saved" : "Saved offline"));
+        char *space = strchr(heading, ' ');
+        if (space != NULL) *space = '\0';
+        const DrawCommand *name = page_text_command(layout, "video.mp4");
+        const DrawCommand *title = page_text_command(layout, heading);
+        CHECK(name && title);
+        /* The heading follows the interface language's side; the name
+           keeps its own. */
+        CHECK(name->x < 40);
+        if (arabic) CHECK(title->x + title->width > 400);
+        else CHECK(title->x < 40);
+    }
+    browser_engine_destroy(engine);
+    CHECK(!unlink(path) && !rmdir(root));
+    return true;
 }
 
 static bool test_provider_language(const FontSet *fonts, TilefinchGlyphProvider *provider)
@@ -2463,8 +3275,9 @@ static bool test_provider_language(const FontSet *fonts, TilefinchGlyphProvider 
         CHECK(provider_text_fits(engine, fonts));
         size_t query_length = 0;
         (void) document_attribute(search, "value", &query_length);
-        if (!strcmp(language_code, "ar") && !query_length) {
-            /* Read from the right: the box's edge, the Arabic words, YouTube. */
+        if (ui_rtl() && !query_length) {
+            /* Read from the right: the box's edge, the Arabic or Hebrew
+               words, YouTube. */
             const LayoutDocument *searched = &browser_engine_navigation(engine)->page.layout;
             const LayoutNodeBox *box = layout_box_for_node(searched, search);
             size_t found = searched->count;
@@ -2479,8 +3292,12 @@ static bool test_provider_language(const FontSet *fonts, TilefinchGlyphProvider 
             CHECK(glyphs[0].codepoint == 'Y' && glyphs[6].codepoint == 'e');
             for (size_t at = 1; at < bidi->glyph_count; at++)
                 CHECK(glyphs[at - 1].x_fixed <= glyphs[at].x_fixed);
-            CHECK(glyphs[bidi->glyph_count - 1].codepoint == 0x0627u
-                || glyphs[bidi->glyph_count - 1].codepoint == 0xfe8du);
+            /* The first logical letter, alef (or its isolated form) in
+               Arabic, het in Hebrew, is the rightmost glyph. */
+            CHECK(!strcmp(language_code, "he")
+                ? glyphs[bidi->glyph_count - 1].codepoint == 0x05d7u
+                : glyphs[bidi->glyph_count - 1].codepoint == 0x0627u
+                  || glyphs[bidi->glyph_count - 1].codepoint == 0xfe8du);
             CHECK(text->x + text->width > box->x + box->width / 2
                 && text->x + text->width <= box->x + box->width);
         }
@@ -2506,7 +3323,7 @@ static bool test_provider_language(const FontSet *fonts, TilefinchGlyphProvider 
                 int width = (font_text_width_at_size_fixed(face, text, strlen(text), 11 * 64, false) + 63) / 64;
                 CHECK(width <= notice->width);
             }
-            if (lane == 1 && !strcmp(language_code, "ar")) {
+            if (lane == 1 && ui_rtl()) {
                 for (size_t at = 0; at < notice_layout->bidi_command_count; at++) {
                     size_t command = notice_layout->bidi_commands[at].command_index;
                     CHECK(command < notice->command_start || command >= notice->command_end);
@@ -2552,6 +3369,10 @@ static bool test_provider_language(const FontSet *fonts, TilefinchGlyphProvider 
                 CHECK(answers[i] && answers[i]->x + answers[i]->width <= WIDTH - 5
                     && answers[i]->y + answers[i]->height <= HEIGHT);
             CHECK(controller_focused_node(browser_engine_controller(engine)) == cancel);
+            /* Each answer is a shrink-to-fit pill: its text fills it, with
+               the same padding on both sides, in every language. */
+            for (unsigned i = 0; i < 2u; i++)
+                CHECK(answer_text_centred(confirm, answers[i]));
             if (capture_directory) {
                 char path[1024];
                 snprintf(path, sizeof(path), "%s/%s-youtube-signout.ppm", capture_directory, language_code);
@@ -2760,11 +3581,12 @@ static bool test_page_text_cache_collision(void)
     const char *first = "אב c82b207b1aff19a7";
     const char *second = "אב 6a370ca42ae12b2f";
     char shown_first[256], shown_second[256], expected[256];
+    bool direction = false;
     memset(ui_page_text_rows, 0, sizeof(ui_page_text_rows));
     snprintf(shown_first, sizeof(shown_first), "%s",
-        ui_page_text_visual(first, 160, 1, NULL, false));
+        ui_page_text_visual(first, 160, 1, NULL, false, &direction));
     snprintf(shown_second, sizeof(shown_second), "%s",
-        ui_page_text_visual(second, 160, 1, NULL, false));
+        ui_page_text_visual(second, 160, 1, NULL, false, &direction));
     Budget scratch;
     budget_init(&scratch, 65536);
     CHECK(psp_ui_visual_text(&scratch, second, 160, 1, NULL, 1,
@@ -2798,14 +3620,15 @@ static bool test_page_text_cache_pending(void)
     CHECK(tilefinch_glyph_provider_attach(provider, pack, "glyph-ui-low-test"));
     const char *title = "אבकककककककककककककककककक";
     char pending[256], cached[256], expected[256];
+    bool direction = false;
     memset(ui_page_text_rows, 0, sizeof(ui_page_text_rows));
     uint64_t generation = font_optional_glyph_generation();
     snprintf(pending, sizeof(pending), "%s",
-        ui_page_text_visual(title, 100, 1, NULL, false));
+        ui_page_text_visual(title, 100, 1, NULL, false, &direction));
     CHECK(settled_chrome_glyph(provider, 0x0915) != NULL);
     CHECK(generation == font_optional_glyph_generation());
     snprintf(cached, sizeof(cached), "%s",
-        ui_page_text_visual(title, 100, 1, NULL, false));
+        ui_page_text_visual(title, 100, 1, NULL, false, &direction));
     Budget scratch;
     budget_init(&scratch, 65536);
     CHECK(psp_ui_visual_text(&scratch, title, 100, 1, NULL, 1,
@@ -2813,9 +3636,9 @@ static bool test_page_text_cache_pending(void)
     CHECK(strcmp(pending, expected) != 0);
     CHECK(strcmp(cached, expected) == 0 && scratch.current == 0);
     /* Once settled, repeated frames retain their measured row. */
-    const char *warm = ui_page_text_visual(title, 100, 1, NULL, false);
+    const char *warm = ui_page_text_visual(title, 100, 1, NULL, false, &direction);
     uint32_t state = chrome_glyph_state_generation;
-    CHECK(warm == ui_page_text_visual(title, 100, 1, NULL, false));
+    CHECK(warm == ui_page_text_visual(title, 100, 1, NULL, false, &direction));
     CHECK(state == chrome_glyph_state_generation);
     CHECK(font_optional_glyph_provider_uninstall(provider));
     tilefinch_glyph_provider_destroy(provider);
@@ -2974,6 +3797,9 @@ static bool test_all_languages(void)
             }
         }
         CHECK(test_provider_language(&fonts, provider));
+        if (!strcmp(language_code, "en") || ui_rtl())
+            CHECK(test_offline_pages_direction(provider));
+        CHECK(test_reading_order_join());
         if (language != TILEFINCH_UI_LANGUAGE_ENGLISH) {
             for (size_t key = 0; key < sizeof(navigation_keys) / sizeof(navigation_keys[0]); key++) {
                 CHECK(strcmp(tilefinch_ui_text(navigation_keys[key]), navigation_keys[key]) != 0);
@@ -2991,6 +3817,10 @@ static bool test_all_languages(void)
                 &ui, provider, theme ? "light" : "dark"));
             CHECK(test_download_language(&ui, provider));
             CHECK(test_page_dialog_language(&ui, provider));
+            CHECK(test_collections_language(&ui, provider));
+            if (theme == 0) CHECK(test_page_legend_language(&ui, provider));
+            if (theme == 0) CHECK(test_settings_descriptions_language(&ui, provider));
+            if (theme == 0) CHECK(test_more_chrome_language(&ui, provider));
             if (theme == 0) CHECK(test_status_toasts(&ui, provider));
             if (theme == 0) CHECK(test_composed_toasts(&ui, provider));
             if (theme == 0) CHECK(test_state_text(&ui, provider));
@@ -3070,6 +3900,7 @@ static bool test_all_languages(void)
                         faults->chrome_unicode_scans, faults->chrome_unicode_scan_hits);
             }
             CHECK(snapshot(theme ? "settings-light" : "settings-dark"));
+            CHECK(settings_rows_follow_language(&ui, provider));
             ui.screen = PSP_UI_SCREEN_OPTION_ITEMS;
             for (unsigned option = 0; option < UI_OPTIONS_ITEM_COUNT; option++) {
                 ui.options_selection = option;
@@ -3131,8 +3962,10 @@ static bool test_all_languages(void)
                         && (phase == PSP_UI_GLYPH_COMPONENT_DOWNLOADING
                             || phase == PSP_UI_GLYPH_COMPONENT_INSTALLING)) {
                         char progress[96];
-                        snprintf(progress, sizeof(progress), "%s 100%%", tilefinch_ui_text(
-                            phase == PSP_UI_GLYPH_COMPONENT_DOWNLOADING ? "Downloading" : "Installing"));
+                        snprintf(progress, sizeof(progress),
+                            ui_rtl() ? "100%% %s" : "%s 100%%",
+                            tilefinch_ui_text(phase == PSP_UI_GLYPH_COMPONENT_DOWNLOADING
+                                              ? "Downloading" : "Installing"));
                         bool shown = false;
                         for (size_t r = 0; r < run_count; r++)
                             shown |= !strcmp(runs[r].text, progress) && !runs[r].truncated;
@@ -3155,6 +3988,7 @@ static bool test_all_languages(void)
             for (unsigned choice = 0; choice < 4u; choice++) {
                 ui.menu_selection = (uint8_t) choice;
                 CHECK(paint(&ui, provider));
+                if (choice == 1 && theme == 0) CHECK(snapshot("youtube-login"));
             }
             ui.overlay_animation_frames = 0;
             ui.screen = PSP_UI_SCREEN_TABS;
@@ -3204,6 +4038,7 @@ static bool test_all_languages(void)
             for (unsigned row = 0; row < 1 + UI_SITE_DATA_FIXED_ROWS; row++) {
                 ui.data_options_selection = row;
                 CHECK(paint(&ui, provider));
+                if (row == 0 && theme == 0) CHECK(snapshot("site-data"));
             }
             ui.data_clear_confirmation = 1;
             CHECK(paint(&ui, provider));
@@ -3237,6 +4072,7 @@ static bool test_all_languages(void)
             CHECK(paint(&ui, provider));
             ui.home = NULL;
         }
+        CHECK(record_frame_hash());
         tilefinch_ui_translation_bind(NULL);
         tilefinch_ui_translation_destroy(translation);
     }
@@ -3408,6 +4244,7 @@ int main(int argc, char **argv)
     }
     return test_opaque_panel_row_copy() && test_menu_metadata_equivalence()
         && test_square_button_symbol() && test_page_text_display_order()
+        && test_player_rows_read_from_their_start()
         && test_long_host_keeps_its_end()
         && test_page_text_cache_collision() && test_page_text_cache_pending()
         && test_chrome_cache_follows_packs()

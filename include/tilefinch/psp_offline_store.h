@@ -92,6 +92,17 @@ bool psp_offline_store_resolve_media(
 bool psp_offline_store_pump(PspOfflineStore *store);
 void psp_offline_store_destroy(PspOfflineStore *store);
 const char *psp_offline_store_status(const PspOfflineStore *store);
+/* The toast for what handle_url just did: the status that route set; for an
+   error that set none, psp_offline_store_status()'s fallback; NULL for a
+   route that opened a page or a question and has nothing to report, so an
+   earlier status ("FILE SAVED") is never shown again over it. */
+const char *psp_offline_store_route_toast(const PspOfflineStore *store,
+                                          PspOfflineRouteResult result);
+/* The result of a Back or Forward step to an offline page that could not
+   move, so never reached handle_url: an error whose toast is
+   "PAGE UNAVAILABLE", not the status an earlier route left behind. */
+PspOfflineRouteResult psp_offline_store_history_unavailable(
+    PspOfflineStore *store);
 const unsigned char *psp_offline_store_app_icon(
     PspOfflineStore *store, uint32_t id);
 /* Opening `id` from the Library: true when its bytecode is stale and the

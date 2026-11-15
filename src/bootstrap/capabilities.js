@@ -1,10 +1,17 @@
 (() => {
+  /* Loaded after the page may have replaced these globals: build
+     errors, promises and platform objects with the constructors
+     hardening.js captured. */
+  const { Error, TypeError, Promise } = globalThis.__tilefinchEventInterfaces;
   const createPrivateWeakMap = globalThis.__tilefinchCreatePrivateWeakMap;
   if (typeof createPrivateWeakMap !== "function")
     throw new Error("Private runtime storage is unavailable");
   /* Loaded on first use, after the page may have replaced these globals:
-     extend the interfaces hardening.js captured. */
-  const { Event, EventTarget } = globalThis.__tilefinchEventInterfaces;
+     extend the interfaces hardening.js captured; handler attributes
+     register through its listener pair. */
+  const { Event, EventTarget, DOMException, PerformanceEntry,
+    Document: DocumentInterface, addListener, removeListener } =
+    globalThis.__tilefinchEventInterfaces;
 
   /* PSP has no speech synthesizer, but exposing the bounded Web Speech shape
      lets feature detection observe an empty engine instead of failing while
@@ -68,9 +75,9 @@
         const slots = handlerSlots.get(this);
         if (!slots) throw new TypeError("Illegal invocation");
         const prior = slots[type];
-        if (prior) this.removeEventListener(type, prior);
+        if (prior) removeListener(this, type, prior);
         slots[type] = typeof value === "function" ? value : null;
-        if (slots[type]) this.addEventListener(type, slots[type]);
+        if (slots[type]) addListener(this, type, slots[type]);
       },
     });
   class SpeechSynthesis extends EventTarget {
@@ -291,7 +298,6 @@
         requireFontSet(this)[type] = typeof value === "function" ? value : null;
       },
     });
-  const DocumentInterface = globalThis.Document;
   if (typeof DocumentInterface === "function")
     Object.defineProperty(DocumentInterface.prototype, "fonts", {
       configurable: true,

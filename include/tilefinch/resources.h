@@ -232,8 +232,10 @@ typedef struct ImageResource {
        the retained resource fixed-size. */
     uint64_t source_hash;
     unsigned char *pixels;
-    /* Non-NULL when pixels are an immutable session-cache lease. The one
-       resource with owns_pixels releases this body; aliases merely borrow. */
+    /* Non-NULL when pixels are an immutable session-cache lease, or an
+       inline-SVG raster shared between tables (shared_svg_raster). Each
+       resource with owns_pixels holds one reference and releases it;
+       aliases merely borrow. */
     BrowserSharedBody *pixel_body;
     unsigned char *encoded;
     BrowserSharedBody *encoded_body;
@@ -261,6 +263,14 @@ typedef struct ImageResource {
        bounded fallback/readback store; this borrowed pointer is never freed
        by ImageResources and is trusted only for its matching display epoch. */
     ImageCanvasNativeSurface *canvas_native_surface;
+    /* WebGL only (images_canvas_frame_hold): a frame is being drawn, flushed
+       in parts inside one task. Until the flush that ends it, painters show
+       canvas_held_frame instead of the drawing buffer: the last complete
+       frame, copied when this one began, or nothing while it is NULL (no
+       frame has been completed yet). The storage is ImageResources'. */
+    bool canvas_frame_open;
+    bool canvas_frame_published;
+    const unsigned char *canvas_held_frame;
     /* A no-CORS image whose final response origin differs from the owning
        document may be painted, but it taints any canvas that consumes it. */
     bool cross_origin;
@@ -282,6 +292,10 @@ typedef struct ImageResource {
        decoder or a frame snapshot), which keeps writing to them. A priority
        load rolling back its own suffix keeps such an entry. */
     bool adopted_surface;
+    /* An inline-SVG raster at its source size whose pixel_body a loading
+       preview's table and the committed page's can both hold (see
+       images_lend_preview_rasters); it is lendable like a plain one. */
+    bool shared_svg_raster;
     /* Display retargeting (src/image_retarget.c) once layout knows the
        painted size: the decoded size before the first retarget (zero until
        then; the surface never grows past it) and IMAGE_RETARGET_* state. */
@@ -409,13 +423,21 @@ typedef struct {
        timings are collected with the image profile. */
     size_t inline_svg_rasterized;
     size_t inline_svg_refresh_reused;
+    /* Inline <svg> rasters taken over from a loading preview's table
+       (images_lend_preview_rasters) instead of rasterized again. */
+    size_t inline_svg_preview_reused;
     uint64_t inline_svg_serialize_us;
     uint64_t inline_svg_rasterize_us;
+    /* inline_svg_rasterize_us split: markup parse, raster, and the
+       decoder's cooperation hooks (inside the other two). */
+    uint64_t inline_svg_parse_us;
+    uint64_t inline_svg_raster_us;
+    uint64_t inline_svg_cooperate_us;
     /* Nodes visited resolving inline <use> references by id. */
     size_t inline_svg_id_visits;
 } ExternalImageStats;
 
-typedef struct {
+typedef struct ImageResources {
     Budget *budget;
     ImageResource *items;
     size_t count;
@@ -427,6 +449,13 @@ typedef struct {
         int height;
     } canvas_depth[2];
     ImageCanvasNativeSurface canvas_native[2];
+    /* The last complete WebGL frame per canvas (canvas_held_frame), kept
+       for reuse while the canvas lives. */
+    struct {
+        lxb_dom_node_t *node;
+        unsigned char *pixels;
+        size_t bytes;
+    } canvas_held[2];
     ExternalImageStats stats;
     /* Display retargeting (src/image_retarget.c), never rolled back with
        the loader's stats. */
@@ -486,6 +515,11 @@ typedef struct {
        the size that layout paints it rather than at its source size. NULL
        when no layout is known. */
     struct ImageLayoutBoxes *layout_boxes;
+    /* Lent for one pass of loading (images_lend_preview_rasters): the inline
+       SVG rasters a loading preview drew, which this table's loads share
+       instead of rasterizing the same markup again. Never kept: a table
+       emptied or rebuilt drops it. */
+    const struct ImageResources *preview_rasters;
 } ImageResources;
 
 /* A layout's element boxes lent to image loading (tilefinch/layout.h). */
@@ -952,6 +986,16 @@ size_t images_evict_farthest(
     ImageResources *images, const uint32_t *distances, size_t slots,
     size_t maximum_total_encoded_bytes, size_t maximum_decoded_bytes,
     uint8_t *remap, bool *released);
+/* Rasterize the inline <svg> elements `nodes` into `images` without any
+   network: an SVG that is hidden, already tracked, a sprite sheet, or
+   draws through an external sprite is skipped. For a load preview, whose
+   layout already proved the slots visible. False only when an allocation
+   was refused; the table is then rolled back to its state on entry.
+   `*added` counts the new entries. */
+bool images_rasterize_inline_svgs(
+    const PocDocument *document, Stylesheet *stylesheet,
+    ImageResources *images, lxb_dom_node_t *const *nodes, size_t node_count,
+    Budget *budget, size_t maximum_decoded_bytes, size_t *added);
 bool images_load_external_priority_targets(
     const PocDocument *document, Stylesheet *stylesheet,
     ImageResources *images, const ImagePriorityTarget *targets,
@@ -1144,6 +1188,16 @@ bool image_resource_native_canvas_source(const ImageResource *image,
                                          const unsigned char **pixels,
                                          size_t *stride);
 bool image_resource_materialize_native_canvas(ImageResource *image);
+/* WebGL frame publication. A flush that leaves the frame unfinished (one
+   forced inside a task by a buffer upload, a full command queue or a
+   readback) is preceded by a hold: from then until the publish that follows
+   the task's last flush, painters show the last complete frame, or nothing
+   before the first one. A hold inside an open frame changes nothing. */
+void images_canvas_frame_hold(ImageResources *images, Budget *budget,
+                              lxb_dom_node_t *node);
+/* True when the canvas had a frame open. */
+bool images_canvas_frame_publish(ImageResources *images,
+                                 lxb_dom_node_t *node);
 /* Deterministically retire one canvas's page-owned color/depth storage.
    Used by WebGL context loss so a terminal context cannot retain one of the
    two bounded depth slots until whole-page teardown. */
@@ -1169,5 +1223,12 @@ void images_destroy(ImageResources *images);
    replacement table. */
 void images_set_layout_boxes(ImageResources *images,
                              struct ImageLayoutBoxes *boxes);
+/* Lend `rasters` (a table images_rasterize_inline_svgs filled, or NULL) to
+   the next load calls on `images`: an inline <svg> whose serialized markup
+   matches one of its rasters takes a reference to that raster's pixels
+   instead of rasterizing it again. The caller clears it (NULL) before
+   `rasters` is destroyed; the shared pixels then stay with `images`. */
+void images_lend_preview_rasters(ImageResources *images,
+                                 const ImageResources *rasters);
 
 #endif

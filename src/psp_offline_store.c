@@ -830,6 +830,8 @@ PspOfflineRouteResult psp_offline_store_handle_url(
     bool record_history)
 {
     size_t root_length = strlen(OFFLINE_ROOT);
+    /* Each route reports its own outcome; none inherits the last one. */
+    if (store != NULL) store->status[0] = '\0';
     if (store == NULL || engine == NULL || url == NULL
         || strncmp(url, OFFLINE_ROOT, root_length) != 0
         || (url[root_length] != '\0' && url[root_length] != '/'))
@@ -889,6 +891,8 @@ PspOfflineRouteResult psp_offline_store_handle_url(
             offline_status(store, "COMPLETED ZIP OR INSTALL DIRECTORY UNAVAILABLE");
             return PSP_OFFLINE_ROUTE_ERROR;
         }
+        /* A ZIP with EBOOT.PBP at its top level installs to a folder named
+           after the download (zip_install_prepare). */
         char error[128] = {0};
         store->zip_install = zip_install_prepare(store->library.budget, path,
             store->game_directory, item->title, id, error, sizeof(error));
@@ -1043,4 +1047,19 @@ const char *psp_offline_store_status(const PspOfflineStore *store)
 {
     return store == NULL || store->status[0] == 0
         ? "OFFLINE LIBRARY" : store->status;
+}
+
+const char *psp_offline_store_route_toast(const PspOfflineStore *store,
+                                          PspOfflineRouteResult result)
+{
+    if (store != NULL && store->status[0] != 0) return store->status;
+    return result == PSP_OFFLINE_ROUTE_ERROR
+        ? psp_offline_store_status(store) : NULL;
+}
+
+PspOfflineRouteResult psp_offline_store_history_unavailable(
+    PspOfflineStore *store)
+{
+    offline_status(store, "PAGE UNAVAILABLE");
+    return PSP_OFFLINE_ROUTE_ERROR;
 }

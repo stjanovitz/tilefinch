@@ -397,7 +397,11 @@ static bool canvas_fast_frame_candidate_impl(
                        >= (int64_t) scroll_y + viewport_height))
         /* Exact: kept by every commit (images_commit_canvas_surface), so a
            frame never rescans the surface's alpha. */
-        && candidate->image->canvas_opaque;
+        && candidate->image->canvas_opaque
+        /* A first WebGL frame still being drawn shows nothing yet: the
+           page beneath it is painted instead. */
+        && (!candidate->image->canvas_frame_open
+            || candidate->image->canvas_held_frame != NULL);
 }
 
 static bool canvas_fast_frame_candidate(
@@ -948,6 +952,9 @@ static void canvas_overlay_blend_plan(TileCache *cache,
         }
     }
     tables->planned = true;
+#ifndef __PSP__
+    tilefinch_test_faults()->canvas_overlay_blend_plans++;
+#endif
 }
 
 /* One overlay row over the frame with planned tables. A dithered panel
@@ -1003,10 +1010,12 @@ static void canvas_overlay_blit(TileCache *cache, uint16_t *frame,
 #ifndef __PSP__
     planned_tables = !tilefinch_test_faults()->raster_span_reference;
 #endif
+    /* Zeroed: `planned` is read before anything writes it, and reused heap
+       memory would skip the plan (or keep another allocation's tables). */
     if (planned_tables && cache->canvas_overlay_blend_cache == NULL
         && cache->budget != NULL)
-        cache->canvas_overlay_blend_cache = budget_malloc(
-            cache->budget, sizeof(*cache->canvas_overlay_blend_cache));
+        cache->canvas_overlay_blend_cache = budget_calloc(
+            cache->budget, 1, sizeof(*cache->canvas_overlay_blend_cache));
     if (planned_tables && cache->canvas_overlay_blend_cache != NULL) {
         tables = cache->canvas_overlay_blend_cache;
         if (!tables->planned) canvas_overlay_blend_plan(cache, tables);
@@ -1179,7 +1188,11 @@ static void rasterize_opaque_canvas_fast(
     size_t source_stride = (size_t) image->width * 4u;
     const unsigned char *native_pixels = NULL;
     size_t native_stride = 0u;
-    if (image_resource_native_canvas_source(
+    if (image->canvas_frame_open) {
+        /* Candidates without a held frame were refused. */
+        if (image->canvas_held_frame == NULL) return;
+        source_pixels = image->canvas_held_frame;
+    } else if (image_resource_native_canvas_source(
             image, &native_pixels, &native_stride)) {
         source_pixels = native_pixels;
         source_stride = native_stride;
@@ -1359,7 +1372,7 @@ static bool canvas_defer_admit(
     if (!overlay_ready || cache->canvas_overlay_region_count != 0
         || cache->layout->fixed_count != 0 || cache->layout->sticky_count != 0
         || (scroll_y > 0 && cache->layout->height > viewport_height)
-        || image == NULL
+        || image == NULL || image->canvas_frame_open
         || !image_resource_native_canvas_source(image, &source, &stride)
         || command->x != 0 || command->y != scroll_y
         || command->width != viewport_width

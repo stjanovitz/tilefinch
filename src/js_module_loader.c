@@ -237,7 +237,7 @@ ScriptModuleMapStatus script_runtime_module_map_status(
     size_t index = runtime_module_index_lookup(runtime, request_url);
     if (index == SIZE_MAX) return SCRIPT_MODULE_MAP_MISSING;
     uint8_t state = runtime->module_bases[index].root_state;
-    return state <= SCRIPT_MODULE_MAP_FAILED
+    return state <= SCRIPT_MODULE_MAP_ERRORED
         ? (ScriptModuleMapStatus) state : SCRIPT_MODULE_MAP_FAILED;
 }
 
@@ -1140,11 +1140,13 @@ static JSModuleDef *runtime_module_load_record(JSContext *context,
 {
     ScriptRuntime *runtime = opaque;
     if (runtime->module_load == NULL) {
+        runtime->module_host_failures++;
         JS_ThrowReferenceError(context, "module loading is disabled");
         return NULL;
     }
     size_t module_index = runtime_module_index_lookup(runtime, module_name);
     if (module_index == SIZE_MAX) {
+        runtime->module_host_failures++;
         JS_ThrowReferenceError(context,
                                "module metadata is missing for '%s'",
                                module_name);
@@ -1160,6 +1162,7 @@ static JSModuleDef *runtime_module_load_record(JSContext *context,
         referrer = runtime->module_bases[parent_index].response_url;
     }
     if (referrer == NULL) {
+        runtime->module_host_failures++;
         JS_ThrowReferenceError(context,
                                "module referrer is missing for '%s'",
                                module_name);
@@ -1174,6 +1177,7 @@ static JSModuleDef *runtime_module_load_record(JSContext *context,
         || strlen(referrer) >= sizeof(referrer_url)
         || entry_policy == NULL
         || strlen(entry_policy) >= sizeof(referrer_policy)) {
+        runtime->module_host_failures++;
         JS_ThrowRangeError(context, "module request metadata is too large");
         return NULL;
     }
@@ -1209,6 +1213,7 @@ static JSModuleDef *runtime_module_load_record(JSContext *context,
             && (loaded.source != NULL || loaded.response_url != NULL)) {
             runtime->module_release(runtime->module_opaque, &loaded);
         }
+        runtime->module_host_failures++;
         JS_ThrowReferenceError(context, "could not load module '%s'",
                                module_name);
         return NULL;
@@ -1220,6 +1225,7 @@ static JSModuleDef *runtime_module_load_record(JSContext *context,
         if (runtime->module_release != NULL) {
             runtime->module_release(runtime->module_opaque, &loaded);
         }
+        runtime->module_host_failures++;
         JS_ThrowRangeError(context, "module metadata limit exceeded");
         return NULL;
     }
@@ -1246,6 +1252,7 @@ static JSModuleDef *runtime_module_load_record(JSContext *context,
         if (runtime->module_release != NULL) {
             runtime->module_release(runtime->module_opaque, &loaded);
         }
+        runtime->module_host_failures++;
         JS_ThrowRangeError(context, "%s", runtime->result.error);
         return NULL;
     }
@@ -1974,7 +1981,7 @@ static char *js_rt_decode_classic_script_source(
     return decoded;
 }
 
-static bool script_runtime_evaluate_external_typed_at(
+static bool script_runtime_evaluate_external_typed_run(
     ScriptRuntime *runtime, lxb_dom_node_t *script_node,
     const char *source, size_t source_length, const char *request_url,
     const char *response_url, const char *module_referrer_policy,
@@ -2097,6 +2104,10 @@ static bool script_runtime_evaluate_external_typed_at(
     if (evaluated) {
         const char *name =
             request_url == NULL ? "<external-script>" : request_url;
+        bool previous_muted = runtime->script_errors_muted;
+        runtime->script_errors_muted = !module && js_rt_script_errors_muted(
+            runtime, script_node,
+            response_url != NULL ? response_url : request_url);
         bool classic_cacheable = !module && !page_diagnostic
             && classic_cache_url != NULL && runtime->session != NULL;
 #ifndef TILEFINCH_NO_TRACE
@@ -2287,6 +2298,7 @@ static bool script_runtime_evaluate_external_typed_at(
                 JS_EVAL_TYPE_GLOBAL, SCRIPT_COMPILE_SOURCE_EXTERNAL,
                 &runtime->result);
         }
+        runtime->script_errors_muted = previous_muted;
         if (!evaluated) {
             js_rt_capture_error_source_context(source, source_length, request_url,
                                          &runtime->result);
@@ -2297,6 +2309,12 @@ static bool script_runtime_evaluate_external_typed_at(
        Segmented registrations still have only one, final checkpoint. */
     if (evaluated && dispatch_completion) {
         evaluated = js_rt_runtime_run_jobs(runtime);
+    } else if (!evaluated && runtime->script_error_reported
+               && !js_rt_runtime_run_jobs(runtime)) {
+        /* The script ended at its exception, which the window error event
+           reported; its checkpoint still runs before the load event. One
+           that fails is the browser's (an interrupt or a refusal). */
+        runtime->script_error_reported = false;
     }
     if (current_script_active
         && !js_rt_current_script_scope_end(
@@ -2338,7 +2356,8 @@ static bool script_runtime_evaluate_external_typed_at(
             && js_rt_bridge_node_slot_for_handle(
                 &runtime->bridge, script_handle, &slot)) {
             (void) script_runtime_dispatch_node(
-                runtime, runtime->bridge.nodes[slot], "error", NULL);
+                runtime, runtime->bridge.nodes[slot],
+                runtime->script_error_reported ? "load" : "error", NULL);
         }
         js_rt_runtime_update_result(runtime, result);
         runtime->promise_rejection_state.active_source =
@@ -2364,6 +2383,36 @@ static bool script_runtime_evaluate_external_typed_at(
     js_rt_runtime_update_result(runtime, result);
     runtime->promise_rejection_state.active_source = previous_rejection_source;
     return dispatched;
+}
+
+/* HTML "execute the script element": the element gets `load` once its
+   script ran, even if it threw or failed to parse (the window error event
+   reported that), and `error` when the browser could not run it at all. */
+static bool script_runtime_evaluate_external_typed_at(
+    ScriptRuntime *runtime, lxb_dom_node_t *script_node,
+    const char *source, size_t source_length, const char *request_url,
+    const char *response_url, const char *module_referrer_policy,
+    TilefinchCredentialsMode module_credentials, bool module,
+    bool dispatch_completion, const char *classic_cache_url,
+    uint32_t classic_ordinal, bool response_no_store, ScriptResult *result)
+{
+    if (runtime == NULL) return false;
+    bool outer_reported = runtime->script_error_reported;
+    bool outer_author_error = runtime->script_author_error;
+    runtime->script_error_reported = false;
+    runtime->script_author_error = false;
+    bool evaluated = script_runtime_evaluate_external_typed_run(
+        runtime, script_node, source, source_length, request_url,
+        response_url, module_referrer_policy, module_credentials, module,
+        dispatch_completion, classic_cache_url, classic_ordinal,
+        response_no_store, result);
+    /* The element's `load` and the author-error outcome agree: both mean
+       the script ran and its own exception was reported. */
+    runtime->last_script_author_error =
+        !evaluated && runtime->script_error_reported;
+    runtime->script_error_reported = outer_reported;
+    runtime->script_author_error = outer_author_error;
+    return evaluated;
 }
 
 bool script_runtime_evaluate_external_typed(
@@ -2486,8 +2535,21 @@ bool js_rt_preflight_external_classic_segment(
         runtime->promise_rejection_state.active_source = previous_source;
         return true;
     }
+    /* A segment's SyntaxError is the whole script's: none of it runs, the
+       window error event reports it and the element gets `load`. */
+    bool reported = false;
     if (JS_IsException(compiled)) {
-        js_rt_record_exception(runtime->context, &runtime->result);
+        bool previous_muted = runtime->script_errors_muted;
+        bool outer_reported = runtime->script_error_reported;
+        bool outer_author_error = runtime->script_author_error;
+        runtime->script_errors_muted = js_rt_script_errors_muted(
+            runtime, script_node, source_url);
+        reported = js_rt_record_script_exception(
+            runtime->context, name, SCRIPT_COMPILE_SOURCE_EXTERNAL,
+            &runtime->result);
+        runtime->script_errors_muted = previous_muted;
+        runtime->script_error_reported = outer_reported;
+        runtime->script_author_error = outer_author_error;
     } else {
         JS_FreeValue(runtime->context, compiled);
     }
@@ -2504,7 +2566,7 @@ bool js_rt_preflight_external_classic_segment(
     runtime->result.success = true;
     (void) script_runtime_collect_and_trim(runtime);
     (void) script_runtime_dispatch_node(
-        runtime, script_node, "error", NULL);
+        runtime, script_node, reported ? "load" : "error", NULL);
     runtime->promise_rejection_state.active_source = previous_source;
     return false;
 }
@@ -2535,7 +2597,8 @@ bool script_runtime_evaluate_external_module_response(
     ScriptModuleMapStatus settled = script_runtime_module_map_status(
         runtime, request_url);
     if (settled == SCRIPT_MODULE_MAP_EVALUATED
-        || settled == SCRIPT_MODULE_MAP_FAILED) {
+        || settled == SCRIPT_MODULE_MAP_FAILED
+        || settled == SCRIPT_MODULE_MAP_ERRORED) {
         bool succeeded = settled == SCRIPT_MODULE_MAP_EVALUATED;
         if (succeeded) {
             js_rt_saturating_add_size(
@@ -2546,7 +2609,8 @@ bool script_runtime_evaluate_external_module_response(
         }
         runtime->result.success = true;
         bool dispatched = script_runtime_dispatch_node(
-            runtime, script_node, succeeded ? "load" : "error", result);
+            runtime, script_node,
+            settled == SCRIPT_MODULE_MAP_FAILED ? "error" : "load", result);
         js_rt_runtime_update_result(runtime, result);
         return succeeded && dispatched;
     }

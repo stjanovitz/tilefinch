@@ -92,7 +92,7 @@ static bool wide_catalog(Budget *budget, unsigned language, const char *code,
         }
         const char *display = tilefinch_ui_translation_text(t, probe);
         bool display_okay = display == found;
-        if (language == TILEFINCH_UI_LANGUAGE_ARABIC) {
+        if (tilefinch_ui_language_right_to_left(language)) {
             /* The same value's display text from a one-row catalog. */
             Row single[] = {{probe, wide_values[i]}};
             TilefinchUiTranslation *reference = translation_parse(
@@ -106,7 +106,7 @@ static bool wide_catalog(Budget *budget, unsigned language, const char *code,
             okay = false;
         }
     }
-    if (language == TILEFINCH_UI_LANGUAGE_ARABIC)
+    if (tilefinch_ui_language_right_to_left(language))
         okay = okay && t->visual != NULL;
     tilefinch_ui_translation_destroy(t);
     return okay && budget->current == 0;
@@ -118,7 +118,10 @@ static bool wide_catalogs(Budget *budget)
                         "abcdefghij")
         /* Two-byte letters become three-byte presentation forms. */
         && wide_catalog(budget, TILEFINCH_UI_LANGUAGE_ARABIC, "ar",
-                        "\xd8\xb3\xd9\x84\xd8\xa7\xd9\x85 ");
+                        "\xd8\xb3\xd9\x84\xd8\xa7\xd9\x85 ")
+        /* Hebrew letters keep their bytes and are only reordered. */
+        && wide_catalog(budget, TILEFINCH_UI_LANGUAGE_HEBREW, "he",
+                        "\xd7\xa9\xd7\x9c\xd7\x95\xd7\x9d ");
 }
 
 /* Installed v15 and v16 files keep parsing: the wire layout did not
@@ -127,7 +130,8 @@ static bool published_catalogs_parse(Budget *budget)
 {
     static const unsigned versions[] = {15u, 16u};
     for (size_t v = 0; v < sizeof(versions) / sizeof(versions[0]); v++) {
-        for (unsigned language = 1; language < TILEFINCH_UI_LANGUAGE_COUNT; language++) {
+        /* Hebrew's first catalog is v18. */
+        for (unsigned language = 1; language < TILEFINCH_UI_LANGUAGE_HEBREW; language++) {
             const char *code = tilefinch_ui_language_spec(language)->code;
             char path[1024];
             snprintf(path, sizeof(path), "%s/translations/ui/v%u/%s.tful",

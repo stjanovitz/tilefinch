@@ -1854,7 +1854,7 @@ static TILEFINCH_OUT_OF_LINE void psp_log_parser_checkpoint_refusals(
     printf("tilefinch-parser-checkpoint-soft: total=%zu metadata=%zu "
            "fingerprint=%zu stylesheet=%zu mutation=%zu cssom=%zu "
            "script=%zu stage-us=%llu stage-work=%zu stage-skipped=%zu "
-           "breakers=%zu reasons=%zu/%zu/%zu\n",
+           "breakers=%zu reasons=%zu/%zu/%zu author-exceptions=%zu\n",
            performance->parser_checkpoint_soft_refusals,
            performance->parser_checkpoint_metadata_refusals,
            performance->parser_checkpoint_fingerprint_refusals,
@@ -1868,7 +1868,8 @@ static TILEFINCH_OUT_OF_LINE void psp_log_parser_checkpoint_refusals(
            performance->parser_script_stage_breakers,
            performance->parser_script_stage_failure_breakers,
            performance->parser_script_stage_time_breakers,
-           performance->parser_script_stage_work_breakers);
+           performance->parser_script_stage_work_breakers,
+           performance->parser_script_author_exceptions);
 }
 
 /* Ordinary page changes retain the four-tile/2 ms input-latency discipline.
@@ -6061,6 +6062,7 @@ int main(int argc, char *argv[])
         .secure_random = psp_platform_secure_random,
         .cooperate_at = psp_platform_cooperate,
         .present_rgb565 = psp_platform_present,
+        .copy_pixel_rows = psp_platform_copy_pixel_rows,
         .retire_frame = psp_platform_retire_frame,
         .log_message = psp_log_message,
         .page_dialog = psp_page_dialog_show,

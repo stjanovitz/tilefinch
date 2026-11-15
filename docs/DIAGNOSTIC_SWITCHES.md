@@ -100,7 +100,7 @@ default applies, but the code and its strings ship.
 | `TILEFINCH_TRACE_REQUEST_BODY` | 1 | `src/diagnostic_trace.h` | host | Small page request bodies. |
 | `TILEFINCH_TRACE_RUNTIME_STEPS` | 1 | `src/diagnostic_trace.h` | host | Per-step timing inside a runtime advance. |
 | `TILEFINCH_TRACE_SCRIPT_ATTEMPTS` | 1 | `src/diagnostic_trace.h` | host | Every script load attempt by URL. |
-| `TILEFINCH_TRACE_SCRIPT_FAILURES` | 1 | `src/diagnostic_trace.h` | host | Script admission, compile, and execution failures (29 sites). |
+| `TILEFINCH_TRACE_SCRIPT_FAILURES` | 1 | `src/diagnostic_trace.h` | host | Script admission, compile, and execution failures, and parser-script breaker trips (30 sites). |
 | `TILEFINCH_TRACE_SCRIPT_RESIDENCY` | 1 | `src/diagnostic_trace.h` | host | Script residency phases; the value selects the mode. |
 | `TILEFINCH_TRACE_SCROLL` | 1 | `src/diagnostic_trace.h` | host | Script-requested scrolls. |
 | `TILEFINCH_TRACE_SCROLL_WIDTH` | 1 | `src/layout.c` | host | Scroll width computation. |

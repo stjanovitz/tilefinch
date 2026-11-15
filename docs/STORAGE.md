@@ -529,12 +529,12 @@ and never persisted.
 | `<id>.app.html`, `<id>.app.pack`, `<id>.app.icon` | `offline_library.c` | ≤ 1 MB markup + 1.5 MiB/32 same-origin responses + 1 MiB optional source-bound classic-script bytecode + 160 KiB pack metadata + 1 KiB icon | user delete or reinstall | each generation has a fresh id; lengths and FNV checksums gate restore, compiler-ABI mismatch falls back to retained source, and the index publishes before the prior generation is removed; while an app runs, a precompiled script's source is read back from `.app.pack` on demand and verified against a 64-bit FNV hash taken at launch; Library → Saved → Recompile (after an update changed the compiler) writes a complete new generation the same way and removes the old one only after the index names the new one |
 | `<id>.video.mp4`, `<id>.audio.mp4` | `offline_download.c` | ≤ 512 MB per stream | user delete | `.part` renamed into place after exact-length ranged download |
 | `<id>.video.part`, `<id>.audio.part` | `offline_download.c` | ≤ stream size | resumed, or reclaimed by the orphan sweep | append-only; size re-validated against the index on load |
-| `<id>-<safe filename>` | `file_download.c` | ≤ 512 MiB each | explicit Delete | published only after a completed, flushed HTTPS stream |
+| `<id>-<stored name>` | `file_download.c` | ≤ 512 MiB each | explicit Delete | published only after a completed, flushed HTTPS stream; the stored name is printable ASCII (below) |
 | `<id>.file.gone` | `offline_library.c` | one filename | removed when Delete finishes, or by the next load's sweep | written and flushed before the index drops the item |
 | `<id>.file.part`, `<id>.file.meta` (+`.tmp`) | `file_download.c` | ≤ 512 MiB body + bounded URL/validator | explicit Delete; orphan metadata/partials swept | matching If-Range and Content-Range required for append; no cookies/passwords |
 | `PSP/GAME/.tilefinch-unpack-<id>/` | `zip_install.c` | ≤ 256 MiB, 512 entries | cancelled/failed attempt cleanup; manual USB cleanup after power loss | created exclusively after native Install confirmation; complete CRC-checked tree renamed once |
 | `PSP/GAME/<app>/` | `zip_install.c` | ≤ 256 MiB installed data, 64 managed installations | confirmed Installed homebrew removal or manual USB cleanup | no overwrite, automatic execution, firmware changes or plugin activation; source ZIP retained |
-| `PSP/GAME/<app>/.tilefinch-homebrew` | `zip_install.c` | 80 bytes | successful app removal | checked folder name/local ID, no URL or credentials; independent of the ZIP's library record; kept through interrupted removal |
+| `PSP/GAME/<app>/.tilefinch-homebrew` | `zip_install.c` | 80 bytes, or 208 with a title | successful app removal | checked folder name/local ID, no URL or credentials; independent of the ZIP's library record; kept through interrupted removal |
 
 The library holds at most 12 items. Saves are refused up-front with honest
 messages when space is short: articles need `1 MB + 256 KB` free
@@ -552,7 +552,25 @@ write-protected card, so saved items still open and can be deleted to free
 space; the next `offline_library_load()` or change writes it. After a
 recovery from `.tmp` or `.bak` that could not be written, that load skips
 the sweep.
-A downloaded file is published under its own name (`<id>-<filename>`),
+A downloaded file keeps two names. Its title in the index is the server's
+name as UTF-8 (a basename in NFC, with controls, bidi overrides and FAT's
+reserved `<>:"|?*` replaced by `_`, cut to 127 bytes between whole
+characters with its extension kept), and the Downloads list, **Save file?**
+and the browser's pages show it. Its stored name on the Memory Stick is the
+title with each non-ASCII byte written as `%XX`, cut between whole
+characters to 127 bytes with the extension kept, so the firmware's FAT layer
+only ever sees printable ASCII; the 8-digit ID in front keeps every stored
+name unique. The firmware reads a file name's other bytes as Shift-JIS: a
+PSP creates, opens and removes a file named in UTF-8 or Latin-1 by the same
+bytes, but lists it under a different, cut-short name (a UTF-8 Arabic
+`عربي.txt` lists as its first seven bytes, a Latin-1 `café.txt` as `caf`),
+so a folder listing, or a computer over USB, would not find it by its name. A printable-ASCII title, which is every title written before
+titles kept other characters, is its own stored name, so earlier downloads
+are found where they were saved. An index with a non-ASCII file title is
+written as version 7, which releases that read at most version 6 leave
+alone instead of looking for the file under its title.
+
+A downloaded file is published under its stored name (`<id>-<stored name>`),
 which the sweep cannot tell from a file it does not own, so Delete first
 writes the name to `<id>.file.gone` and removes that note once the file is
 gone; the sweep finishes a note left by a power cut (a note without its

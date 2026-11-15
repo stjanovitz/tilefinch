@@ -1199,11 +1199,44 @@ static lxb_dom_node_t *bridge_wrapper_node(JSContext *context,
                                            JSValueConst value,
                                            JSValueConst handle_value);
 
+/* A write from the script the whole-document loader runs: keep the markup
+   for the loader, which inserts it after the script once it returns. */
+static JSValue bridge_whole_document_write(JSContext *context,
+                                           DomBridge *bridge,
+                                           JSValueConst value)
+{
+    size_t length = 0;
+    const char *markup = JS_ToCStringLen(context, &length, value);
+    if (markup == NULL) return JS_EXCEPTION;
+    size_t used = bridge->whole_document_written_length;
+    char *grown = length > DOCUMENT_PARSER_WRITE_PENDING_LIMIT - used ? NULL
+        : budget_realloc(bridge->budget, bridge->whole_document_written,
+                         used + length + 1u);
+    if (grown != NULL) {
+        memcpy(grown + used, markup, length);
+        grown[used + length] = '\0';
+        bridge->whole_document_written = grown;
+        bridge->whole_document_written_length = used + length;
+    }
+    JS_FreeCString(context, markup);
+    return grown != NULL ? JS_TRUE : JS_ThrowRangeError(
+        context, "document.write input exceeds bounded size");
+}
+
 /* __tilefinchParserWrite(markup): document.write() while the document's
    parser runs a script and that script is document.currentScript (a
    microtask after it, or a handler it dispatched, included): the markup is
    inserted at the insertion point (document_parser_write). False when there
-   is no such insertion point, so the bootstrap takes its other path. */
+   is no such insertion point, so the bootstrap takes its other path; 0
+   instead while an external classic or module script runs, whose write the
+   bootstrap then ignores (HTML's ignore-destructive-writes counter). */
+static JSValue bridge_no_insertion_point(JSContext *context,
+                                         const DomBridge *bridge)
+{
+    return bridge->destructive_writes_ignored != 0
+        ? JS_NewInt32(context, 0) : JS_FALSE;
+}
+
 JSValue js_dom_parser_write(JSContext *context, JSValueConst this_value,
                             int argc, JSValueConst *argv)
 {
@@ -1212,12 +1245,15 @@ JSValue js_dom_parser_write(JSContext *context, JSValueConst this_value,
     if (bridge == NULL || argc < 1) return JS_FALSE;
     lxb_dom_node_t *script =
         document_parser_executing_script(bridge->document);
+    if (script == NULL && bridge->whole_document_writer != NULL)
+        return bridge_whole_document_write(context, bridge, argv[0]);
     int64_t handle = script == NULL ? 0
         : js_rt_bridge_find_node_handle(bridge, script);
     JSValue handle_value = JS_NewInt64(context, handle);
     if (handle == 0
         || bridge_wrapper_node(context, bridge, bridge->current_script,
-                               handle_value) != script) return JS_FALSE;
+                               handle_value) != script)
+        return bridge_no_insertion_point(context, bridge);
     size_t length = 0;
     const char *markup = JS_ToCStringLen(context, &length, argv[0]);
     if (markup == NULL) return JS_EXCEPTION;
@@ -1226,7 +1262,7 @@ JSValue js_dom_parser_write(JSContext *context, JSValueConst this_value,
     JS_FreeCString(context, markup);
     switch (outcome) {
     case DOCUMENT_WRITE_NO_INSERTION_POINT:
-        return JS_FALSE;
+        return bridge_no_insertion_point(context, bridge);
     case DOCUMENT_WRITE_REFUSED:
         return JS_ThrowRangeError(
             context, "document.write input exceeds bounded size");
@@ -4249,25 +4285,37 @@ JSValue js_dom_get_inner_html(JSContext *context,
 /* `context_name`, when given, replaces the target's own name as the
    fragment parser's context element (Range.createContextualFragment parses
    into a new DocumentFragment, which has none) and leaves parsed scripts
-   unstarted instead of inert. */
+   unstarted instead of inert. `context_element`, when given instead, is the
+   context for a parse into an empty fragment (insertAdjacentHTML and the
+   outerHTML setter): its name and namespace, with an HTML <html> or a node
+   that is no element taken as <body>, as DOM Parsing requires; the scripts
+   stay inert. */
 static bool bridge_replace_inner_html(
     DomBridge *bridge, lxb_dom_node_t *node,
     const char *html, size_t length, bool prepare_dynamic_scripts,
-    const char *context_override, size_t context_override_length)
+    const char *context_override, size_t context_override_length,
+    lxb_dom_node_t *context_element)
 {
     if (bridge == NULL || bridge->document == NULL || node == NULL
         || (node->type != LXB_DOM_NODE_TYPE_ELEMENT
             && node->type != LXB_DOM_NODE_TYPE_DOCUMENT_FRAGMENT)
         || (html == NULL && length != 0)
         || length > DOM_INNER_HTML_LIMIT) return false;
-    static const char div_name[] = "div";
+    static const char div_name[] = "div", body_name[] = "body";
     size_t context_name_length = sizeof(div_name) - 1u;
     const char *context_name = div_name;
+    lxb_dom_node_t *named = context_element != NULL ? context_element : node;
     if (context_override != NULL) {
         context_name = context_override;
         context_name_length = context_override_length;
-    } else if (node->type == LXB_DOM_NODE_TYPE_ELEMENT)
-        context_name = document_element_name(node, &context_name_length);
+    } else if (context_element != NULL
+               && (named->type != LXB_DOM_NODE_TYPE_ELEMENT
+                   || (named->ns == LXB_NS_HTML
+                       && named->local_name == LXB_TAG_HTML))) {
+        context_name = body_name;
+        context_name_length = sizeof(body_name) - 1u;
+    } else if (named->type == LXB_DOM_NODE_TYPE_ELEMENT)
+        context_name = document_element_name(named, &context_name_length);
     /* Every connected change below is published as one INNER_HTML note.
        Brackets stay around Lexbor calls only (see js_dom_set_text). */
     document_style_quiet_begin();
@@ -4277,6 +4325,11 @@ static bool bridge_replace_inner_html(
               (const lxb_char_t *) context_name, context_name_length, NULL);
     lxb_dom_node_t *container_node = container == NULL ? NULL
         : lxb_dom_interface_node(container);
+    /* The parser takes the context's namespace too: markup set on an SVG
+       or MathML element parses as foreign content, as in Chromium. */
+    if (container_node != NULL && context_override == NULL
+        && (named->ns == LXB_NS_SVG || named->ns == LXB_NS_MATH))
+        container_node->ns = named->ns;
     bool valid = container_node != NULL
         && document_set_element_inner_html(
                bridge->document, container_node,
@@ -4326,7 +4379,7 @@ bool script_runtime_replace_element_inner_html(
         || element->owner_document != &document->html->dom_document)
         return false;
     return bridge_replace_inner_html(
-        &runtime->bridge, element, markup, length, false, NULL, 0);
+        &runtime->bridge, element, markup, length, false, NULL, 0, NULL);
 }
 
 bool script_runtime_replace_document_body(
@@ -4350,12 +4403,21 @@ JS_RT_GUARDED_NATIVE(, js_dom_set_inner_html)(JSContext *context,
         return JS_FALSE;
     }
     /* (fragment, html, contextName): Range.createContextualFragment's
-       parse into an empty DocumentFragment it just created. */
+       parse into an empty DocumentFragment it just created; (fragment,
+       html, contextHandle): insertAdjacentHTML's and outerHTML's, where a
+       handle naming no element (0 for a fragment or shadow-root parent)
+       is a <body> context. */
     const char *context_name = NULL;
     size_t context_length = 0;
-    if (argc > 2) {
-        if (node->type != LXB_DOM_NODE_TYPE_DOCUMENT_FRAGMENT
-            || node->first_child != NULL) return JS_FALSE;
+    lxb_dom_node_t *context_element = NULL;
+    if (argc > 2 && (node->type != LXB_DOM_NODE_TYPE_DOCUMENT_FRAGMENT
+                     || node->first_child != NULL)) return JS_FALSE;
+    if (argc > 2 && JS_IsNumber(argv[2])) {
+        context_element = js_rt_bridge_node_arg(context, bridge, argv[2]);
+        if (context_element == NULL
+            || context_element->type != LXB_DOM_NODE_TYPE_ELEMENT)
+            context_element = node;
+    } else if (argc > 2) {
         context_name = JS_ToCStringLen(context, &context_length, argv[2]);
         if (context_name == NULL) return JS_EXCEPTION;
         if (context_length == 0 || context_length > 64) {
@@ -4367,7 +4429,7 @@ JS_RT_GUARDED_NATIVE(, js_dom_set_inner_html)(JSContext *context,
     const char *html = JS_ToCStringLen(context, &length, argv[1]);
     bool valid = html != NULL && bridge_replace_inner_html(
         bridge, node, html, length, context_name == NULL,
-        context_name, context_length);
+        context_name, context_length, context_element);
     if (context_name != NULL) JS_FreeCString(context, context_name);
     if (html == NULL) return JS_EXCEPTION;
     JS_FreeCString(context, html);

@@ -649,9 +649,17 @@ typedef struct {
     size_t parser_script_stage_work;
     size_t parser_script_stage_skipped;
     size_t parser_script_stage_breakers;
+    /* Breakers opened by consecutive failures that say the realm is in
+       trouble (out of memory, watchdog interrupt, compile admission
+       refusal, engine failure). */
     size_t parser_script_stage_failure_breakers;
     size_t parser_script_stage_time_breakers;
     size_t parser_script_stage_work_breakers;
+    /* Scripts run while the document streamed, up to its last
+       parser-blocking script, that failed at their own exception
+       (ExternalScriptMetrics.author_exceptions): reported to the window
+       error event, and not counted by the failure breaker. */
+    size_t parser_script_author_exceptions;
     NavigationBlockingScriptSample blocking_script_samples[
         NAVIGATION_BLOCKING_SCRIPT_SAMPLE_LIMIT];
     size_t blocking_script_sample_count;

@@ -436,6 +436,8 @@ static bool runtime_evaluate_bootstrap_profiled(
     return evaluated;
 }
 
+/* hardening.js names the features that publish hooks by these values
+   (canvas 0, IndexedDB 1, motion 2, WebGL 5, WebAssembly 7). */
 typedef enum {
     LAZY_BOOTSTRAP_CANVAS = 0,
     LAZY_BOOTSTRAP_INDEXED_DB,
@@ -454,9 +456,14 @@ typedef enum {
     LAZY_BOOTSTRAP_FORMS,
     LAZY_BOOTSTRAP_CSSOM_RULES,
     LAZY_BOOTSTRAP_MEDIA_CAPTURE,
+    LAZY_BOOTSTRAP_SERIALIZE,
+    LAZY_BOOTSTRAP_FRAME_CLONE,
     LAZY_BOOTSTRAP_COUNT
 } LazyBootstrapFeature;
 
+_Static_assert(LAZY_BOOTSTRAP_INDEXED_DB == 1 && LAZY_BOOTSTRAP_MOTION == 2
+               && LAZY_BOOTSTRAP_WEBGL == 5 && LAZY_BOOTSTRAP_WASM == 7,
+               "hardening.js names hook features by these values");
 _Static_assert(LAZY_BOOTSTRAP_COUNT == SCRIPT_LAZY_BOOTSTRAP_FEATURE_COUNT,
                "lazy bootstrap state must cover every feature");
 
@@ -465,7 +472,10 @@ typedef enum {
     LAZY_BOOTSTRAP_CANVAS_PROTOTYPE,
     LAZY_BOOTSTRAP_STORAGE_MANAGER_PROTOTYPE,
     LAZY_BOOTSTRAP_DOCUMENT_PROTOTYPE,
-    LAZY_BOOTSTRAP_NAVIGATOR_PROTOTYPE
+    LAZY_BOOTSTRAP_NAVIGATOR_PROTOTYPE,
+    LAZY_BOOTSTRAP_ELEMENT_PROTOTYPE,
+    LAZY_BOOTSTRAP_HTML_ELEMENT_PROTOTYPE,
+    LAZY_BOOTSTRAP_SHADOW_ROOT_PROTOTYPE
 } LazyBootstrapTarget;
 
 typedef struct {
@@ -583,7 +593,13 @@ static const LazyBootstrapProperty lazy_bootstrap_properties[] = {
      LAZY_BOOTSTRAP_GLOBAL},
     {"MediaDevices", LAZY_BOOTSTRAP_MEDIA_CAPTURE, LAZY_BOOTSTRAP_GLOBAL},
     {"mediaDevices", LAZY_BOOTSTRAP_MEDIA_CAPTURE,
-     LAZY_BOOTSTRAP_NAVIGATOR_PROTOTYPE}
+     LAZY_BOOTSTRAP_NAVIGATOR_PROTOTYPE},
+    {"XMLSerializer", LAZY_BOOTSTRAP_SERIALIZE, LAZY_BOOTSTRAP_GLOBAL},
+    {"getHTML", LAZY_BOOTSTRAP_SERIALIZE, LAZY_BOOTSTRAP_ELEMENT_PROTOTYPE},
+    {"getHTML", LAZY_BOOTSTRAP_SERIALIZE,
+     LAZY_BOOTSTRAP_SHADOW_ROOT_PROTOTYPE},
+    {"outerText", LAZY_BOOTSTRAP_SERIALIZE,
+     LAZY_BOOTSTRAP_HTML_ELEMENT_PROTOTYPE}
 };
 
 static const char *runtime_lazy_bootstrap_name(LazyBootstrapFeature feature)
@@ -606,6 +622,8 @@ static const char *runtime_lazy_bootstrap_name(LazyBootstrapFeature feature)
     case LAZY_BOOTSTRAP_FORMS: return "Form collections";
     case LAZY_BOOTSTRAP_CSSOM_RULES: return "CSSOM rules";
     case LAZY_BOOTSTRAP_MEDIA_CAPTURE: return "Media capture";
+    case LAZY_BOOTSTRAP_SERIALIZE: return "Markup serialization";
+    case LAZY_BOOTSTRAP_FRAME_CLONE: return "Window messaging";
     default: return "Platform feature";
     }
 }
@@ -710,9 +728,23 @@ static JSValue runtime_lazy_bootstrap_target(
         ? "HTMLCanvasElement"
         : target == LAZY_BOOTSTRAP_DOCUMENT_PROTOTYPE ? "Document"
         : target == LAZY_BOOTSTRAP_NAVIGATOR_PROTOTYPE ? "Navigator"
+        : target == LAZY_BOOTSTRAP_ELEMENT_PROTOTYPE ? "Element"
+        : target == LAZY_BOOTSTRAP_HTML_ELEMENT_PROTOTYPE ? "HTMLElement"
+        : target == LAZY_BOOTSTRAP_SHADOW_ROOT_PROTOTYPE ? "ShadowRoot"
         : "StorageManager";
-    JSValue constructor = JS_GetPropertyStr(
-        context, global, constructor_name);
+    /* Triggers run after page script may have replaced these globals: take
+       the interface hardening.js captured before it ran (a frozen,
+       prototype-free table in a non-writable, non-configurable global, so
+       no page code runs here). The bootstrap installs the triggers before
+       that table exists, while the globals are still the originals. */
+    JSValue captured = JS_GetPropertyStr(
+        context, global, "__tilefinchEventInterfaces");
+    JSValue constructor = JS_IsObject(captured)
+        ? JS_GetPropertyStr(context, captured, constructor_name)
+        : JS_UNDEFINED;
+    JS_FreeValue(context, captured);
+    if (JS_IsUndefined(constructor))
+        constructor = JS_GetPropertyStr(context, global, constructor_name);
     JS_FreeValue(context, global);
     if (JS_IsException(constructor)) return constructor;
     JSValue prototype = JS_GetPropertyStr(context, constructor, "prototype");
@@ -1037,7 +1069,15 @@ static bool runtime_load_lazy_bootstrap(
     uint8_t *state = &runtime->lazy_bootstrap_state[feature];
     if (*state == 2) return true;
     if (*state == 1 || *state == 3) return false;
+    /* opfs.js extends streams.js's WritableStream: load Streams first, as
+       its own step, so that WritableStream is the captured one. */
+    bool prerequisites = feature != LAZY_BOOTSTRAP_OPFS
+        || runtime_load_lazy_bootstrap(runtime, LAZY_BOOTSTRAP_STREAMS);
     *state = 1;
+    uint8_t outer_loading = runtime->lazy_loading_feature;
+    bool outer_claimed = runtime->lazy_hook_claimed;
+    runtime->lazy_loading_feature = (uint8_t) (feature + 1);
+    runtime->lazy_hook_claimed = false;
     runtime_remove_lazy_bootstrap_properties(runtime->context, feature);
     bool trace = tilefinch_trace_js_startup();
     uint64_t total_us = 0;
@@ -1141,6 +1181,27 @@ static bool runtime_load_lazy_bootstrap(
             "<browser-streams-lazy>",
             &browser_bootstrap_streams_bytecode, false, trace,
             &total_us, &compile_us);
+        /* The module has just defined WritableStream as a data property and
+           no page script has run since. Anything else leaves the capture
+           empty, and the OPFS module then refuses to load. */
+        JSValue global = JS_GetGlobalObject(runtime->context);
+        JSAtom atom = JS_NewAtom(runtime->context, "WritableStream");
+        JSPropertyDescriptor slot;
+        if (evaluated && !JS_IsException(global) && atom != JS_ATOM_NULL
+            && JS_GetOwnProperty(runtime->context, &slot, global, atom) > 0) {
+            if ((slot.flags & JS_PROP_GETSET) == 0
+                && JS_IsFunction(runtime->context, slot.value)) {
+                JS_FreeValue(runtime->context,
+                             runtime->streams_writable_stream);
+                runtime->streams_writable_stream = slot.value;
+            } else {
+                JS_FreeValue(runtime->context, slot.value);
+            }
+            JS_FreeValue(runtime->context, slot.getter);
+            JS_FreeValue(runtime->context, slot.setter);
+        }
+        if (atom != JS_ATOM_NULL) JS_FreeAtom(runtime->context, atom);
+        JS_FreeValue(runtime->context, global);
     } else if (feature == LAZY_BOOTSTRAP_GAME_AUDIO) {
         if (runtime->game_audio_internal_slots) {
             evaluated = audio_slots_initialize(runtime);
@@ -1350,6 +1411,22 @@ static bool runtime_load_lazy_bootstrap(
                          browser_bootstrap_forms_bytecode),
             "<browser-forms-lazy>", &browser_bootstrap_forms_bytecode,
             false, trace, &total_us, &compile_us);
+    } else if (feature == LAZY_BOOTSTRAP_SERIALIZE) {
+        evaluated = runtime_evaluate_bootstrap_profiled(
+            runtime, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
+                         browser_bootstrap_serialize,
+                         browser_bootstrap_serialize_bytecode),
+            "<browser-serialize-lazy>",
+            &browser_bootstrap_serialize_bytecode, false, trace,
+            &total_us, &compile_us);
+    } else if (feature == LAZY_BOOTSTRAP_FRAME_CLONE) {
+        evaluated = runtime_evaluate_bootstrap_profiled(
+            runtime, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
+                         browser_bootstrap_frame_clone,
+                         browser_bootstrap_frame_clone_bytecode),
+            "<browser-frame-clone-lazy>",
+            &browser_bootstrap_frame_clone_bytecode, false, trace,
+            &total_us, &compile_us);
     } else if (feature == LAZY_BOOTSTRAP_CSSOM_RULES) {
         evaluated = runtime_evaluate_bootstrap_profiled(
             runtime, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
@@ -1422,15 +1499,25 @@ static bool runtime_load_lazy_bootstrap(
             runtime->context, "__tilefinchOpfsCommand");
         JSAtom storage_atom = JS_NewAtom(
             runtime->context, "__tilefinchOpfsStorageManager");
-        bool bridge_ready = !JS_IsException(global)
+        JSAtom writable_atom = JS_NewAtom(
+            runtime->context, "__tilefinchOpfsWritableStream");
+        bool bridge_ready = prerequisites && !JS_IsException(global)
+            && JS_IsFunction(runtime->context,
+                             runtime->streams_writable_stream)
             && bridge_atom != JS_ATOM_NULL
             && storage_atom != JS_ATOM_NULL
+            && writable_atom != JS_ATOM_NULL
             && js_rt_install_native(
                 runtime->context, global, &runtime_opfs_command)
             && JS_DefinePropertyValue(
                    runtime->context, global, storage_atom,
                    JS_DupValue(runtime->context,
                                runtime->opfs_storage_manager),
+                   JS_PROP_CONFIGURABLE) >= 0
+            && JS_DefinePropertyValue(
+                   runtime->context, global, writable_atom,
+                   JS_DupValue(runtime->context,
+                               runtime->streams_writable_stream),
                    JS_PROP_CONFIGURABLE) >= 0;
         if (bridge_ready) {
             evaluated = runtime_evaluate_bootstrap_profiled(
@@ -1449,6 +1536,11 @@ static bool runtime_load_lazy_bootstrap(
             (void) JS_DeleteProperty(
                 runtime->context, global, storage_atom, 0);
             JS_FreeAtom(runtime->context, storage_atom);
+        }
+        if (writable_atom != JS_ATOM_NULL) {
+            (void) JS_DeleteProperty(
+                runtime->context, global, writable_atom, 0);
+            JS_FreeAtom(runtime->context, writable_atom);
         }
         JS_FreeValue(runtime->context, global);
     }
@@ -1494,6 +1586,8 @@ static bool runtime_load_lazy_bootstrap(
         }
     }
 #endif
+    runtime->lazy_loading_feature = outer_loading;
+    runtime->lazy_hook_claimed = outer_claimed;
     *state = evaluated ? 2 : 3;
     if (evaluated) {
         js_rt_saturating_add_size(
@@ -1557,8 +1651,16 @@ static JSValue js_runtime_lazy_bootstrap_property(
     JSValue target = runtime_lazy_bootstrap_target(context, property->target);
     if (JS_IsException(target)) return target;
     if (argc != 0) {
-        int result = JS_SetPropertyStr(
-            context, target, property->name, JS_DupValue(context, argv[0]));
+        /* A prototype accessor (outerText) writes with the original
+           receiver too. */
+        JSAtom atom = JS_NewAtom(context, property->name);
+        int result = atom == JS_ATOM_NULL ? -1
+            : JS_SetPropertyInternal(
+                  context, target, atom, JS_DupValue(context, argv[0]),
+                  property->target == LAZY_BOOTSTRAP_GLOBAL
+                      ? target : this_value,
+                  JS_PROP_THROW);
+        if (atom != JS_ATOM_NULL) JS_FreeAtom(context, atom);
         JS_FreeValue(context, target);
         return result < 0 ? JS_EXCEPTION : JS_UNDEFINED;
     }
@@ -1615,6 +1717,31 @@ static bool runtime_install_lazy_bootstrap_feature(
         if (!ok) return false;
     }
     return true;
+}
+
+/* hardening.js captures this and deletes it. With no argument it is the
+   claim of the lazy module loading now: that module's LazyBootstrapFeature
+   the first time in its load, -1 after (and when none loads), so only the
+   module's own first statement gets its hook publisher. With a feature, it
+   is whether that feature is still loading. */
+static JSValue js_runtime_lazy_loading(
+    JSContext *context, JSValueConst this_value, int argc,
+    JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    ScriptRuntime *host = bridge == NULL ? NULL : bridge->host;
+    if (argc == 0 || JS_IsUndefined(argv[0])) {
+        if (host == NULL || host->lazy_loading_feature == 0
+            || host->lazy_hook_claimed) return JS_NewInt32(context, -1);
+        host->lazy_hook_claimed = true;
+        return JS_NewInt32(context, host->lazy_loading_feature - 1);
+    }
+    int32_t feature = -1;
+    if (JS_ToInt32(context, &feature, argv[0]) != 0) return JS_EXCEPTION;
+    return JS_NewBool(context, host != NULL && feature >= 0
+        && feature < LAZY_BOOTSTRAP_COUNT
+        && host->lazy_bootstrap_state[feature] == 1);
 }
 
 static JSValue js_runtime_ensure_shadow_bootstrap(
@@ -1674,6 +1801,21 @@ static JSValue js_runtime_ensure_rule_bootstrap(
             bridge->host, LAZY_BOOTSTRAP_CSSOM_RULES))
         return JS_ThrowInternalError(context,
             "CSSOM rules could not be initialized");
+    return JS_TRUE;
+}
+
+static JSValue js_runtime_ensure_frame_clone_bootstrap(
+    JSContext *context, JSValueConst this_value, int argc,
+    JSValueConst *argv)
+{
+    (void) this_value;
+    (void) argc;
+    (void) argv;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    if (bridge == NULL || !runtime_load_lazy_bootstrap(
+            bridge->host, LAZY_BOOTSTRAP_FRAME_CLONE))
+        return JS_ThrowInternalError(context,
+            "Window messaging could not be initialized");
     return JS_TRUE;
 }
 
@@ -2000,6 +2142,14 @@ static JSValue js_runtime_run_worker(
             result = JS_EXCEPTION;
         }
         if (!JS_IsException(result)) result = JS_EvalFunction(realm, result);
+        /* An evaluation that threw before its first await has rejected the
+           module's promise: report it as a classic worker's throw. */
+        if (!JS_IsException(result)
+            && JS_PromiseState(realm, result) == JS_PROMISE_REJECTED) {
+            JSValue reason = JS_PromiseResult(realm, result);
+            JS_FreeValue(realm, result);
+            result = JS_Throw(realm, reason);
+        }
     } else {
         result = JS_Eval(
             realm, source, source_length, url, JS_EVAL_TYPE_GLOBAL);
@@ -2171,6 +2321,10 @@ static const JsRtNative runtime_entry_natives[] = {
       js_runtime_ensure_forms_bootstrap, 0, 0 },
     { "__tilefinchEnsureRuleBootstrap",
       js_runtime_ensure_rule_bootstrap, 0, JS_RT_NATIVE_UNPROFILED },
+    { "__tilefinchEnsureFrameCloneBootstrap",
+      js_runtime_ensure_frame_clone_bootstrap, 0, 0 },
+    { "__tilefinchLazyLoading", js_runtime_lazy_loading, 0,
+      JS_RT_NATIVE_TRANSIENT | JS_RT_NATIVE_UNPROFILED },
 };
 
 static const JsRtNative runtime_natives_first[] = {
@@ -2236,6 +2390,7 @@ static const JsRtNative runtime_natives_first[] = {
     { "__tilefinchWebGLReadPixels", js_webgl_read_pixels, 7, 0 },
     { "__tilefinchWebGLSnapshot", js_webgl_snapshot, 1, 0 },
     { "__tilefinchWebGLReleaseSurface", js_webgl_release_surface, 1, 0 },
+    { "__tilefinchWebGLPublishFrame", js_webgl_publish_frame, 1, 0 },
     { "__tilefinchSetFullscreen", js_dom_set_fullscreen, 2, 0 },
     { "__tilefinchPageControlsNotice", js_dom_page_controls_notice, 1, 0 },
     { "__tilefinchCanvasRasterRect", js_canvas_raster_rect, 13, 0 },
@@ -2556,6 +2711,7 @@ static ScriptRuntime *runtime_create_host(
     host->media_update = JS_UNDEFINED;
     host->document_all_cache = JS_UNDEFINED;
     host->opfs_storage_manager = JS_UNDEFINED;
+    host->streams_writable_stream = JS_UNDEFINED;
     host->game_audio_host_suspend = JS_UNDEFINED;
     host->game_audio_host_complete = JS_UNDEFINED;
     host->media_capture_host_event = JS_UNDEFINED;
@@ -3164,6 +3320,8 @@ static const RuntimeBootstrapStep runtime_bootstrap_sequence[] = {
                                   LAZY_BOOTSTRAP_INTL),
     RUNTIME_BOOTSTRAP_LAZY_MODULE(RUNTIME_BOOTSTRAP_ALWAYS,
                                   LAZY_BOOTSTRAP_TRAVERSAL),
+    RUNTIME_BOOTSTRAP_LAZY_MODULE(RUNTIME_BOOTSTRAP_ALWAYS,
+                                  LAZY_BOOTSTRAP_SERIALIZE),
     RUNTIME_BOOTSTRAP_LAZY_MODULE(RUNTIME_BOOTSTRAP_IF_SECURE_ORIGIN,
                                   LAZY_BOOTSTRAP_OPFS),
     RUNTIME_BOOTSTRAP_LAZY_MODULE(RUNTIME_BOOTSTRAP_IF_SECURE_ORIGIN,

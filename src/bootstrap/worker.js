@@ -18,6 +18,16 @@ globalThis.__tilefinchInstallWorker = (
   /* Worker is intentionally a first-use module. Ordinary pages should not pay
      to compile its message/lifecycle machinery merely because the constructor
      is standards-visible. */
+  /* Loaded after the page may have replaced these globals: build
+     errors, promises and platform objects with the constructors
+     hardening.js captured. */
+  const { Error, TypeError, RangeError, DOMException, Promise, Map, Set,
+    Proxy, Array, URL, Headers, Response, Blob, TextEncoder, TextDecoder,
+    URLSearchParams, AbortController, Request,
+    /* The lifetime and fetch controllers below are the browser's own: they
+       abort and give their signals with AbortController's own methods. */
+    abortController: abortWith, controllerSignal, signalReason } =
+    globalThis.__tilefinchEventInterfaces;
   const blobForURL = globalThis.__tilefinchBlobForURL,
     trustedString = globalThis.__tilefinchTrustedString,
     workerIntrinsics = globalThis.__tilefinchWorkerIntrinsics,
@@ -32,13 +42,18 @@ globalThis.__tilefinchInstallWorker = (
     /* Worker, its global scopes and their performance objects extend it;
        the worker realm's initializer receives the same table. */
     eventInterfaces = globalThis.__tilefinchEventInterfaces,
-    { EventTarget } = eventInterfaces,
+    /* Handler attributes, the worker global's own listener methods and
+       the browser's bookkeeping listeners register through the captured
+       pair, never through a page's patched EventTarget.prototype. */
+    { EventTarget, addListener, removeListener, dispatch } = eventInterfaces,
     fetchForWorker = globalThis.__tilefinchFetchForWorker,
     fetchWorkerScript = globalThis.__tilefinchFetchWorkerScript,
     fetchWorkerScriptSync = globalThis.__tilefinchFetchWorkerScriptSync,
-    PerformanceEntryCtor = globalThis.PerformanceEntry,
-    PerformanceResourceTimingCtor = globalThis.PerformanceResourceTiming,
-    PerformanceObserverEntryListCtor = globalThis.PerformanceObserverEntryList,
+    {
+      PerformanceEntry: PerformanceEntryCtor,
+      PerformanceResourceTiming: PerformanceResourceTimingCtor,
+      PerformanceObserverEntryList: PerformanceObserverEntryListCtor,
+    } = eventInterfaces,
     markNative = globalThis.__tilefinchMarkNativeFunction,
     invokeEventTargetCheckpointed =
       globalThis.__tilefinchInvokeEventTargetCheckpointed,
@@ -148,10 +163,13 @@ globalThis.__tilefinchInstallWorker = (
   /* Worker code shares the owner's Event and EventTarget globals, which
      the owner page may have replaced, so the initializer's classes extend
      the owner's captured interfaces (scope.__tilefinchWorkerEventInterfaces
-     below). */
+     below). It runs before the worker's script, so the error and promise
+     constructors it builds with are captured from the worker's own global
+     then, not read after that script may have replaced them. */
   const workerRealmConstructorInit = `(()=>{
     const {Event,EventTarget}=globalThis.__tilefinchWorkerEventInterfaces;
     delete globalThis.__tilefinchWorkerEventInterfaces;
+    const {TypeError,RangeError,DOMException,Promise}=globalThis;
     const root=globalThis,proto=Object.getPrototypeOf(root),
       names=['AnimationEvent','XMLHttpRequest','XMLHttpRequestEventTarget',
         'XMLHttpRequestUpload','FileReader','File','FileList','CustomEvent',
@@ -760,11 +778,9 @@ globalThis.__tilefinchInstallWorker = (
           if (handled === true) event.preventDefault();
           return handled;
         };
-        EventTarget.prototype.addEventListener.call(
-          target, type, slot.wrapper, false);
+        addListener(target, type, slot.wrapper, false);
       } else if (callback === null && slot.wrapper !== null) {
-        EventTarget.prototype.removeEventListener.call(
-          target, type, slot.wrapper, false);
+        removeListener(target, type, slot.wrapper, false);
         slot.wrapper = null;
       }
     },
@@ -1390,13 +1406,18 @@ globalThis.__tilefinchInstallWorker = (
         workerProgress.outboundQueued++;
         workerProgress.lastId = state.id;
       };
+      /* The worker realm shares the owner's EventTarget.prototype; the
+         owner page's patches to it must not see the worker's listeners.
+         A bare addEventListener(...) call has no receiver: Web IDL uses
+         the global then, which is where worker messages are dispatched. */
       scope.addEventListener = function (type, callback, options = false) {
-        return EventTarget.prototype.addEventListener.call(
-          this, type, callback, options);
+        return addListener(this ?? state.scope, type, callback, options);
       };
       scope.removeEventListener = function (type, callback, options = false) {
-        return EventTarget.prototype.removeEventListener.call(
-          this, type, callback, options);
+        return removeListener(this ?? state.scope, type, callback, options);
+      };
+      scope.dispatchEvent = function (event) {
+        return dispatch(this ?? state.scope, event);
       };
       Object.defineProperties(scope, {
         onmessage: {
@@ -1666,23 +1687,27 @@ globalThis.__tilefinchInstallWorker = (
         const authorSignal = sourceRequest.signal,
           controller = new AbortController(),
           abort = () =>
-            controller.abort(
+            abortWith(controller,
               authorSignal && authorSignal.aborted
                 ? authorSignal.reason
                 : state.abortController
-                  ? state.abortController.signal.reason
+                  ? signalReason(controllerSignal(state.abortController))
                   : undefined,
             );
+        /* The lifetime signal below is the browser's own, so it listens
+           through the captured pair. authorSignal is not: it is read through
+           the Request's public signal getter, so it is whatever the worker's
+           script left there, and it is followed through that object's own
+           addEventListener and removeEventListener, on purpose. A page that
+           patches those only changes whether its own fetch aborts. */
         if (authorSignal) {
           if (authorSignal.aborted) abort();
           else authorSignal.addEventListener("abort", abort, { once: true });
         }
-        state.abortController.signal.addEventListener(
-          "abort", abort, { once: true },
-        );
-        const lifetimeSignal = state.abortController.signal,
-          cleanup = () => {
-            lifetimeSignal.removeEventListener("abort", abort);
+        const lifetimeSignal = controllerSignal(state.abortController);
+        addListener(lifetimeSignal, "abort", abort, { once: true });
+        const cleanup = () => {
+            removeListener(lifetimeSignal, "abort", abort);
             if (authorSignal)
               authorSignal.removeEventListener("abort", abort);
           },
@@ -1703,7 +1728,7 @@ globalThis.__tilefinchInstallWorker = (
              conversions.  This clone only substitutes the combined author
              and lifetime signal, preserving that exact URL and request. */
           const request = new WorkerRequest(sourceRequest, {
-              signal: controller.signal,
+              signal: controllerSignal(controller),
             }),
             timingName = request.url,
             timingStart = scope.performance.now();
@@ -2353,19 +2378,30 @@ globalThis.__tilefinchInstallWorker = (
          Only explicitly supported Web Platform names resolve, read-only, to
          the owner's implementations through this fallback deep in the
          prototype chain.  This keeps lazy constructor groups available while
-         preventing owner-defined page state from entering the worker realm. */
+         preventing owner-defined page state from entering the worker realm.
+         An eagerly defined shared name resolves to the value hardening.js
+         captured before the owner's script ran, so an owner that replaced
+         XMLHttpRequest, WebSocket or Event, say, does not hand its own
+         constructor to the worker. Known gap: a lazily defined name
+         (streams, IndexedDB, WebAssembly, Intl, ...) resolves to whatever
+         the owner page has left at that global when the worker reads it;
+         capturing those would need every lazy group's constructors
+         recorded as it loads. The owner page and its workers are one
+         origin, and the shared prototypes carry the owner's patches either
+         way. */
       const fallback = new Proxy(Object.create(EventTarget.prototype), {
         has(target, key) {
           const present = key in target ||
             (typeof key === "string" && workerSharedGlobalNames.has(key) &&
-              key in globalThis);
+              (key in eventInterfaces || key in globalThis));
           if (!present) traceMissingWorkerCapability("has", key);
           return present;
         },
         get(target, key, receiver) {
           if (key in target) return Reflect.get(target, key, receiver);
           if (typeof key === "string" && workerSharedGlobalNames.has(key))
-            return globalThis[key];
+            return key in eventInterfaces ? eventInterfaces[key]
+              : globalThis[key];
           traceMissingWorkerCapability("get", key);
           return undefined;
         },
@@ -2445,18 +2481,15 @@ globalThis.__tilefinchInstallWorker = (
          they are removed from the inherited scope before author code runs. */
       scope.__tilefinchRegisterWorkerXHR = (xhr) => {
         state.xhrs.add(xhr);
-        EventTarget.prototype.addEventListener.call(
-          xhr, "loadend", () => state.xhrs.delete(xhr));
+        addListener(xhr, "loadend", () => state.xhrs.delete(xhr));
       };
       scope.__tilefinchRegisterWorkerFileReader = (reader) => {
         state.fileReaders.add(reader);
-        EventTarget.prototype.addEventListener.call(
-          reader, "loadend", () => state.fileReaders.delete(reader));
+        addListener(reader, "loadend", () => state.fileReaders.delete(reader));
       };
       scope.__tilefinchRegisterWorkerWebSocket = (socket) => {
         state.webSockets.add(socket);
-        EventTarget.prototype.addEventListener.call(
-          socket, "close", () => state.webSockets.delete(socket));
+        addListener(socket, "close", () => state.webSockets.delete(socket));
       };
       scope.__tilefinchGetOwnerIndexedDB = () => globalThis.indexedDB;
       scope.__tilefinchOwnerGPU = ownerNavigator.gpu;
@@ -2464,7 +2497,7 @@ globalThis.__tilefinchInstallWorker = (
       scope.__tilefinchRegisterWorkerIDBRequest = (request, tracksDatabase) => {
         if (!tracksDatabase || !request ||
             typeof request.addEventListener !== "function") return;
-        request.addEventListener("success", () => {
+        addListener(request, "success", () => {
           let database = null;
           try { database = request.result; } catch (_) {}
           if (!database) return;
@@ -2557,7 +2590,7 @@ globalThis.__tilefinchInstallWorker = (
               mode: workerType === "module" ? "cors" : "same-origin",
               credentials: workerType === "module"
                 ? workerCredentials : "same-origin",
-              signal: state.abortController.signal,
+              signal: controllerSignal(state.abortController),
             }).then(response => {
               if (!response || !response.ok)
                 throw new DOMException(
@@ -2616,17 +2649,20 @@ globalThis.__tilefinchInstallWorker = (
       if (!state) throw new TypeError("Illegal invocation");
       setEventHandler(this, state.handlers, "messageerror", value);
     }
+    /* A page's own call: in browsers worker.addEventListener is
+       EventTarget.prototype's, so a page that patches that method (zone.js)
+       sees these calls, and still does. */
     addEventListener(type, callback, options = false) {
       const state = workerStates.get(this);
       if (!state) throw new TypeError("Illegal invocation");
-      return EventTarget.prototype.addEventListener.call(
-        this, type, callback, options);
+      return workerIntrinsics.apply(EventTarget.prototype.addEventListener,
+        this, [type, callback, options]);
     }
     removeEventListener(type, callback, options = false) {
       const state = workerStates.get(this);
       if (!state) throw new TypeError("Illegal invocation");
-      return EventTarget.prototype.removeEventListener.call(
-        this, type, callback, options);
+      return workerIntrinsics.apply(EventTarget.prototype.removeEventListener,
+        this, [type, callback, options]);
     }
     postMessage(value) {
       const state = workerStates.get(this);
@@ -2777,9 +2813,8 @@ globalThis.__tilefinchInstallWorker = (
        listener map until the object itself becomes unreachable. */
     if (state.abortController) {
       try {
-        state.abortController.abort(
-          new DOMException("Worker is terminated", "AbortError"),
-        );
+        abortWith(state.abortController,
+          new DOMException("Worker is terminated", "AbortError"));
       } catch (_) {}
       state.abortController = null;
     }

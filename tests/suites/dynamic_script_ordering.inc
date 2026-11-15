@@ -27,10 +27,12 @@ static bool test_dynamic_classic_and_error(Budget *budget)
     static const char append_error[] =
         "const broken=document.createElement('script');"
         "broken.id='dynamic-error';broken.src='/error.js';"
+        /* It ran and threw (window onerror's report): `load`, as in
+           Chromium; `error` is for a script that never ran. */
         "broken.addEventListener('load',()=>{globalThis.pocSummary="
-        "'error:unexpected-load';});"
+        "'error:load';});"
         "broken.addEventListener('error',()=>{globalThis.pocSummary="
-        "'error:delivered';});document.head.appendChild(broken);"
+        "'error:unexpected-error';});document.head.appendChild(broken);"
         "globalThis.pocSummary='error:append';";
     BrowserSession browser = {0};
     NavigationSession navigation = {0};
@@ -66,7 +68,7 @@ static bool test_dynamic_classic_and_error(Budget *budget)
     REQUIRE(strcmp(navigation.page.script_result.summary, "error:append") == 0);
     REQUIRE(browser.cache_hits == hits);
     REQUIRE(navigation.page.script_result.network_requests == requests);
-    REQUIRE(advance_until(&navigation, "error:delivered", 8, &advances));
+    REQUIRE(advance_until(&navigation, "error:load", 8, &advances));
     REQUIRE(advances > 0 && browser.cache_hits == hits + 1u);
     REQUIRE(navigation.page.script_result.network_requests == requests + 1u);
 

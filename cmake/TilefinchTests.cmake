@@ -572,6 +572,17 @@ if(PSP_BROWSER_BUILD_TESTS)
     set_tests_properties(tilefinch-paint-image-geometry-tests PROPERTIES
         LABELS "tilefinch;unit;layout;image" TIMEOUT 30)
 
+    tilefinch_add_test_binary(tilefinch-svg-raster-parity-tests
+        tests/test_svg_raster_parity.c)
+    target_link_libraries(tilefinch-svg-raster-parity-tests PRIVATE
+        tilefinch_core)
+    target_compile_definitions(tilefinch-svg-raster-parity-tests PRIVATE
+        TILEFINCH_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME tilefinch-svg-raster-parity-tests
+        COMMAND tilefinch-svg-raster-parity-tests)
+    set_tests_properties(tilefinch-svg-raster-parity-tests PROPERTIES
+        LABELS "tilefinch;unit;image" TIMEOUT 30)
+
     tilefinch_add_test_binary(tilefinch-media-mp4-tests tests/test_media_mp4.c)
     target_link_libraries(tilefinch-media-mp4-tests PRIVATE tilefinch_core)
     target_compile_definitions(tilefinch-media-mp4-tests PRIVATE
@@ -825,6 +836,16 @@ if(PSP_BROWSER_BUILD_TESTS)
     add_test(NAME tilefinch-document-write-tests
         COMMAND tilefinch-document-write-tests)
     set_tests_properties(tilefinch-document-write-tests PROPERTIES
+        LABELS "tilefinch;unit;web-platform"
+        TIMEOUT 60)
+
+    tilefinch_add_test_binary(tilefinch-script-error-event-tests
+        tests/test_script_error_events.c)
+    target_link_libraries(tilefinch-script-error-event-tests
+        PRIVATE tilefinch_core)
+    add_test(NAME tilefinch-script-error-event-tests
+        COMMAND tilefinch-script-error-event-tests)
+    set_tests_properties(tilefinch-script-error-event-tests PROPERTIES
         LABELS "tilefinch;unit;web-platform"
         TIMEOUT 60)
 
@@ -1492,6 +1513,16 @@ if(PSP_BROWSER_BUILD_TESTS)
     add_test(NAME tilefinch-bootstrap-footprint-tests
         COMMAND tilefinch-bootstrap-footprint-tests)
     set_tests_properties(tilefinch-bootstrap-footprint-tests PROPERTIES
+        LABELS "tilefinch;unit;javascript;budget"
+        TIMEOUT 60)
+
+    tilefinch_add_test_binary(tilefinch-blob-memory-budget-tests
+        tests/test_blob_memory_budget.c)
+    target_link_libraries(tilefinch-blob-memory-budget-tests
+        PRIVATE tilefinch_core)
+    add_test(NAME tilefinch-blob-memory-budget-tests
+        COMMAND tilefinch-blob-memory-budget-tests)
+    set_tests_properties(tilefinch-blob-memory-budget-tests PROPERTIES
         LABELS "tilefinch;unit;javascript;budget"
         TIMEOUT 60)
 
@@ -2720,6 +2751,11 @@ if(PSP_BROWSER_BUILD_TESTS)
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_swdec_bench_scripts.py)
         set_tests_properties(tilefinch-swdec-bench-script-tests PROPERTIES
             LABELS "tilefinch;unit;swdec;tooling" TIMEOUT 60)
+        add_test(NAME tilefinch-js-bench-device-script-tests
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_js_bench_device_script.py)
+        set_tests_properties(tilefinch-js-bench-device-script-tests PROPERTIES
+            LABELS "tilefinch;unit;tooling" TIMEOUT 30)
         add_test(NAME tilefinch-quickjs-pgo-training-tests
             COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_quickjs_pgo_training.py)

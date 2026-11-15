@@ -909,6 +909,17 @@ static void script_record_watchdog_miss(
     script_record_watchdog_profile(&signals, metrics);
 }
 
+/* One script's evaluation failed: count it, and say whether it was the
+   script's own exception (author_exceptions) rather than the browser's
+   refusal. */
+static void script_metrics_record_failure(
+    const ScriptRuntime *runtime, ExternalScriptMetrics *metrics)
+{
+    metrics->execution_failures++;
+    if (script_runtime_last_script_author_error(runtime))
+        metrics->author_exceptions++;
+}
+
 static void script_metrics_record_execution_time(
     ExternalScriptMetrics *metrics, uint64_t started_ns)
 {
@@ -1035,7 +1046,7 @@ static bool script_evaluate_external_node(
                                            : result->error);
                 }
                 bool succeeded = lazy == SCRIPT_LAZY_EVALUATION_SUCCEEDED;
-                if (!succeeded) metrics->execution_failures++;
+                if (!succeeded) script_metrics_record_failure(runtime, metrics);
                 budget_free(budget, result);
                 return succeeded;
             }
@@ -1055,7 +1066,7 @@ static bool script_evaluate_external_node(
     script_metrics_record_execution_time(metrics, evaluation_started_ns);
     if (script_runtime_source_released(runtime)) source = NULL;
     if (!ok) {
-        metrics->execution_failures++;
+        script_metrics_record_failure(runtime, metrics);
         script_record_watchdog_miss(
             runtime, source, source_length, metrics);
     }
@@ -1121,6 +1132,7 @@ static bool script_evaluate_inline_node(ScriptRuntime *runtime, Budget *budget,
     ScriptResult *result = trace_failure
         ? budget_calloc(budget, 1, sizeof(*result)) : NULL;
     bool ok = false;
+    bool compiled = false;
     ScriptInlineDataEvaluation data = SCRIPT_INLINE_DATA_FALLBACK;
     size_t data_bytes = 0;
     uint64_t evaluation_started_ns = tilefinch_platform_monotonic_time_ns();
@@ -1147,6 +1159,7 @@ static bool script_evaluate_inline_node(ScriptRuntime *runtime, Budget *budget,
         ok = false;
     } else {
         ok = script_runtime_evaluate_inline(runtime, node, module, result);
+        compiled = true;
     }
     script_metrics_record_execution_time(metrics, evaluation_started_ns);
     /* An author exception terminates this script, not the document.  In
@@ -1155,7 +1168,10 @@ static bool script_evaluate_inline_node(ScriptRuntime *runtime, Budget *budget,
        collect at this safe top-level boundary so DOMContentLoaded and later
        small scripts still have a chance to run inside the unchanged limit. */
     if (!ok) (void) script_runtime_collect_and_trim(runtime);
-    if (!ok) metrics->execution_failures++;
+    /* A data fast path that failed ran no author code: only the compiled
+       script can have thrown. */
+    if (!ok && compiled) script_metrics_record_failure(runtime, metrics);
+    else if (!ok) metrics->execution_failures++;
     if (!ok && script_runtime_last_slice_interrupted(runtime)) {
         script_record_watchdog_profile(&inline_cost, metrics);
     }
@@ -1658,13 +1674,17 @@ static bool execute_external_node(
         ScriptModuleMapStatus module_status =
             script_runtime_module_map_status(runtime, resolved);
         if (module_status == SCRIPT_MODULE_MAP_EVALUATED
-            || module_status == SCRIPT_MODULE_MAP_FAILED) {
+            || module_status == SCRIPT_MODULE_MAP_FAILED
+            || module_status == SCRIPT_MODULE_MAP_ERRORED) {
             bool succeeded = module_status == SCRIPT_MODULE_MAP_EVALUATED;
             metrics->module_map_hits++;
             if (succeeded) metrics->loaded++;
             else metrics->failed++;
+            /* A module that threw or failed to parse still ran: `load`. */
             (void) script_runtime_dispatch_node(
-                runtime, node, succeeded ? "load" : "error", NULL);
+                runtime, node,
+                module_status == SCRIPT_MODULE_MAP_FAILED ? "error" : "load",
+                NULL);
             return true;
         }
     }
@@ -3178,6 +3198,97 @@ static ModuleLoadContext *pipeline_module_loader_install(
     return module_context;
 }
 
+/* Markup written while a written script ran nests at most this deep. */
+#define WHOLE_DOCUMENT_WRITE_DEPTH_LIMIT 8u
+
+typedef struct {
+    PocDocument *document;
+    ScriptRuntime *runtime;
+    Budget *budget;
+    BrowserSession *session;
+    FetchScheduler *scheduler;
+    const char *base_url;
+    const char *document_url;
+    const char *referrer_policy;
+    size_t maximum_total_bytes;
+    size_t maximum_file_bytes;
+    long timeout_ms;
+    ExternalScriptMetrics *metrics;
+    ScriptExecutionPlan *plan;
+    size_t *script_count;
+} WholeDocumentScripts;
+
+/* The next node after `at` in document order below `parent`, entering
+   `at`'s children only when `descend`; NULL past `parent`'s subtree or
+   when `at` was taken out of it. */
+static lxb_dom_node_t *whole_document_next(lxb_dom_node_t *parent,
+                                           lxb_dom_node_t *at, bool descend)
+{
+    if (descend && at->first_child != NULL) return at->first_child;
+    while (at != NULL && at != parent && at->next == NULL) at = at->parent;
+    return at == NULL || at == parent ? NULL : at->next;
+}
+
+/* Runs a parser-blocking script of a document committed whole, then what it
+   wrote. With no parser to feed, document.write() kept its markup
+   (script_runtime_whole_document_write_begin); it goes in right after the
+   script, where the parser would have put it, and the scripts in it run in
+   document order, each followed by its own writes. HTML runs a written
+   inline script inside write(); here it runs once the writer returns.
+   False only for a pipeline failure. */
+static bool whole_document_run(const WholeDocumentScripts *scripts,
+                               lxb_dom_node_t *node, bool external,
+                               bool module, bool counted, bool inline_data,
+                               unsigned depth)
+{
+    script_runtime_whole_document_write_begin(scripts->runtime, node);
+    bool ok = external
+        ? execute_external_node_live(
+              scripts->document, scripts->runtime, scripts->budget,
+              scripts->session, scripts->scheduler, node, scripts->base_url,
+              scripts->document_url, scripts->referrer_policy, module,
+              counted, scripts->maximum_total_bytes,
+              scripts->maximum_file_bytes, scripts->timeout_ms,
+              scripts->metrics)
+        : script_execute_inline_admitted(
+              scripts->runtime, scripts->budget, node, module, counted,
+              inline_data, &scripts->document->content_security_policy,
+              scripts->metrics);
+    size_t length = 0;
+    char *written =
+        script_runtime_whole_document_write_end(scripts->runtime, &length);
+    lxb_dom_node_t *parent = node->parent, *end = node->next;
+    bool inserted = ok && written != NULL && parent != NULL
+        && document_insert_markup_after(scripts->document, node, written,
+                                        length);
+    budget_free(scripts->budget, written);
+    if (!inserted || depth >= WHOLE_DOCUMENT_WRITE_DEPTH_LIMIT) return ok;
+    ExternalScriptMetrics *metrics = scripts->metrics;
+    for (lxb_dom_node_t *at = node->next; at != NULL && at != end;) {
+        bool script = document_element_name_is(at, "script");
+        ScriptKind kind = script ? script_kind(at) : SCRIPT_KIND_INERT;
+        long handle = kind == SCRIPT_KIND_INERT ? 0
+            : script_runtime_node_weak_handle(scripts->runtime, at);
+        if (handle != 0 && *scripts->script_count < EXTERNAL_SCRIPT_HARD_LIMIT
+            && script_plan_record_handle(scripts->plan, handle,
+                                         *scripts->script_count)) {
+            scripts->plan->scripts[(*scripts->script_count)++] = handle;
+            metrics->discovered++;
+            metrics->parser_blocking++;
+            bool written_module = kind == SCRIPT_KIND_MODULE;
+            if (written_module) metrics->modules++;
+            size_t source_length = 0;
+            const char *source = script_source_attribute(at, &source_length);
+            if (!whole_document_run(
+                    scripts, at, source != NULL && source_length != 0,
+                    written_module, false, !written_module, depth + 1u))
+                return false;
+        }
+        at = whole_document_next(parent, at, !script);
+    }
+    return true;
+}
+
 static bool document_scripts_execute_internal(
     PocDocument *document, ScriptRuntime *runtime, Budget *budget,
     BrowserSession *session, const char *base_url,
@@ -3246,7 +3357,10 @@ static bool document_scripts_execute_internal(
     if (scan_discovered > script_count) {
         metrics->skipped_quota += scan_discovered - script_count;
     }
-    for (size_t i = 0; i < script_count; i++) {
+    /* Scripts a whole-document write adds run as they are written and join
+       the plan after these. */
+    const size_t parsed_count = script_count;
+    for (size_t i = 0; i < parsed_count; i++) {
         lxb_dom_node_t *node = script_runtime_node_handle_resolve(
             runtime, plan->scripts[i]);
         if (!script_node_is_attached(node)) continue;
@@ -3278,7 +3392,19 @@ static bool document_scripts_execute_internal(
         }
         if (asynchronous) metrics->asynchronous++;
         else metrics->parser_blocking++;
-        if (external) {
+        if (streaming == NULL && !asynchronous) {
+            const WholeDocumentScripts whole = {
+                document, runtime, budget, session, scheduler, base_url,
+                document_url, referrer_policy, maximum_total_bytes,
+                maximum_file_bytes, timeout_ms, metrics, plan, &script_count
+            };
+            if (!whole_document_run(
+                    &whole, node, external, module,
+                    plan->admission[i] == SCRIPT_ADMISSION_COUNTED,
+                    plan->admission[i] == SCRIPT_ADMISSION_INLINE_DATA, 0u))
+                return script_execution_plan_finish(
+                    module_context, plan, output_metrics, false);
+        } else if (external) {
             if (!execute_external_node_live(
                     document, runtime, budget, session, scheduler, node,
                     base_url, document_url, referrer_policy, module,

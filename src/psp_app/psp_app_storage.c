@@ -131,7 +131,9 @@ static void site_storage_fill(PspApp *app)
             where = info.policy == BROWSER_SITE_STORAGE_MEMORY_ONLY
                 ? tilefinch_ui_text("RAM only") : "RAM";
         }
-        snprintf(row->detail, sizeof(row->detail), "%s  %s", size, where);
+        const char *pieces[] = {size, "  ", where};
+        psp_ui_join_reading_order(row->detail, sizeof(row->detail), pieces,
+                                  3u);
         row->state = info.tier == BROWSER_SITE_STORAGE_STICK_SESSION
             ? 3u : (uint8_t) info.policy;
         view->count++;
@@ -142,8 +144,9 @@ static void site_storage_fill(PspApp *app)
                app->process->storage.site_storage, &free_bytes)) {
         char size[16];
         psp_ui_format_bytes(size, sizeof(size), free_bytes);
-        snprintf(view->stick_free, sizeof(view->stick_free), "%s %s",
-                 tilefinch_ui_text("Free space:"), size);
+        const char *pieces[] = {tilefinch_ui_text("Free space:"), " ", size};
+        psp_ui_join_reading_order(view->stick_free, sizeof(view->stick_free),
+                                  pieces, 3u);
     }
     /* From Site information, start on this site's row. */
     char origin[BROWSER_ORIGIN_LIMIT];

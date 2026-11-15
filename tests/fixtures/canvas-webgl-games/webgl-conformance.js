@@ -481,6 +481,51 @@
   const third = document.createElement("canvas").getContext("webgl");
   let lostEvents = 0;
   large.addEventListener("webglcontextlost", () => lostEvents++);
+  /* A canvas larger than the PSP surface keeps its layout: a viewport and
+     scissor given in canvas units (as three.js does) are scaled to the
+     clamped drawing buffer instead of overrunning it and losing the
+     context. */
+  const largeShader = (type, source) => {
+    const shader = largeContext.createShader(type);
+    largeContext.shaderSource(shader, source);
+    largeContext.compileShader(shader);
+    return shader;
+  };
+  const largeProgram = largeContext.createProgram();
+  largeContext.attachShader(largeProgram, largeShader(largeContext.VERTEX_SHADER,
+    "attribute vec2 aPosition;void main(){gl_Position=vec4(aPosition,0.,1.);}"));
+  largeContext.attachShader(largeProgram, largeShader(largeContext.FRAGMENT_SHADER,
+    "void main(){gl_FragColor=vec4(0.,1.,0.,1.);}"));
+  largeContext.linkProgram(largeProgram); largeContext.useProgram(largeProgram);
+  largeContext.bindBuffer(largeContext.ARRAY_BUFFER, largeContext.createBuffer());
+  largeContext.bufferData(largeContext.ARRAY_BUFFER,
+    new Float32Array([-1,-1, 3,-1, -1,3]), largeContext.STATIC_DRAW);
+  largeContext.vertexAttribPointer(0, 2, largeContext.FLOAT, false, 0, 0);
+  largeContext.enableVertexAttribArray(0);
+  const largePixel = (x, y) => {
+    const out = new Uint8Array(4);
+    largeContext.readPixels(x, y, 1, 1, largeContext.RGBA,
+      largeContext.UNSIGNED_BYTE, out);
+    return out[1];
+  };
+  largeContext.viewport(0, 0, 640, 480);
+  largeContext.clearColor(0, 0, 0, 1);
+  largeContext.clear(largeContext.COLOR_BUFFER_BIT);
+  largeContext.drawArrays(largeContext.TRIANGLES, 0, 3);
+  largeContext.finish();
+  const scaledViewportDraws = !largeContext.isContextLost()
+    && largePixel(0, 0) > 240 && largePixel(361, 271) > 240;
+  largeContext.enable(largeContext.SCISSOR_TEST);
+  largeContext.scissor(0, 0, 320, 480);
+  largeContext.clear(largeContext.COLOR_BUFFER_BIT);
+  largeContext.disable(largeContext.SCISSOR_TEST);
+  largeContext.finish();
+  const scaledScissorWorks = !largeContext.isContextLost()
+    && largePixel(178, 100) < 10 && largePixel(184, 100) > 240;
+  const viewportReadsBack = Array.from(
+    largeContext.getParameter(largeContext.VIEWPORT)).join() === "0,0,480,272";
+  const largeCanvasScaled = scaledViewportDraws && scaledScissorWorks
+    && viewportReadsBack && lostEvents === 0;
   largeContext._commands.push({
     kind:"draw", mode:0x7fffffff, first:0, count:0, index:null,
     position:null, color:null, texcoord:null, texture:null,
@@ -514,7 +559,7 @@
     && !gl.isBuffer(buffer)
     && largeContext.drawingBufferWidth === 362
     && largeContext.drawingBufferHeight === 272 && third === null
-    && terminalLoss && replacementContext;
+    && largeCanvasScaled && terminalLoss && replacementContext;
   globalThis.pocSummary = passed ? "WEBGL-CONFORMANCE-PASS" :
     `WEBGL-CONFORMANCE-FAIL:${defaultDrawingBufferDiscard}:${badRejected}:${pixel}:${boundedError}:` +
       `${alignedIndexError}:${boundedIndexError}:` +
@@ -530,7 +575,7 @@
       `${forcedFlushCounted}:`+
       `${exactSourceLimitWorks}:${lostResourcesReleased}:`+
       `${boundedAntialiasWorks}:`+
-      `${distinctErrorsRetained}:${terminalLoss}:${!!replacementContext}:`+
+      `${distinctErrorsRetained}:${largeCanvasScaled}:${terminalLoss}:${!!replacementContext}:`+
       `${largeContext.drawingBufferWidth}x${largeContext.drawingBufferHeight}:` +
       `${third === null}`;
 })();

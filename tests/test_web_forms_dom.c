@@ -309,6 +309,7 @@ int main(int argc, char **argv)
         {"range-text", "<div id=host></div>"},
         {"engine-markers", "<div id=host></div>"},
         {"offset-rounding", "<div id=host></div>"},
+        {"dom-gaps", "<div id=host><p id=para>a<b>b</b>c</p></div>"},
     };
     static const struct {
         const char *name;

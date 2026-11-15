@@ -30,6 +30,7 @@ typedef enum {
     TILEFINCH_UI_LANGUAGE_PORTUGUESE,
     TILEFINCH_UI_LANGUAGE_BENGALI,
     TILEFINCH_UI_LANGUAGE_ASSAMESE,
+    TILEFINCH_UI_LANGUAGE_HEBREW,
     TILEFINCH_UI_LANGUAGE_COUNT
 } TilefinchUiLanguage;
 
@@ -43,6 +44,8 @@ typedef struct {
     unsigned minimum_glyph_sequence;
     /* Immutable data resource relative to tilefinch-models/main. */
     const char *resource_key;
+    /* Reads right to left (Arabic, Hebrew). */
+    bool right_to_left;
 } TilefinchUiLanguageSpec;
 
 typedef struct TilefinchUiTranslation TilefinchUiTranslation;
@@ -69,6 +72,10 @@ bool tilefinch_ui_translation_install(
    Language changes apply after restart, never race the chrome supervisor. */
 void tilefinch_ui_translation_bind(const TilefinchUiTranslation *translation);
 unsigned tilefinch_ui_translation_bound_language(void);
+/* Whether the language reads right to left (its spec's right_to_left:
+   Arabic and Hebrew): its catalog rows are stored in display order, and the
+   browser's list panels are mirrored. */
+bool tilefinch_ui_language_right_to_left(unsigned language);
 const char *tilefinch_ui_text(const char *english);
 /* Logical text for HTML; the page renderer performs bidi/shaping itself. */
 const char *tilefinch_ui_logical_text(const char *english);

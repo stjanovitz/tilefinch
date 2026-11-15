@@ -2,7 +2,9 @@
    first use, so a realm that never makes one pays for none of these
    functions. compat.js captures every realm value this module reads before
    page script runs and passes them in; nothing here reads a global. */
-Object.defineProperty(globalThis, "__tilefinchCreateSecondaryDocuments", {
+globalThis.__tilefinchEventInterfaces.defineProperty(globalThis,
+    "__tilefinchCreateSecondaryDocuments", {
+  __proto__: null,
   configurable: true,
   value({
     factories,
@@ -32,7 +34,13 @@ Object.defineProperty(globalThis, "__tilefinchCreateSecondaryDocuments", {
     defineProperties,
     arrayFrom,
     planDocumentInsert,
+    listIndex,
+    listCopy,
   }) {
+    /* Loaded after the page may have replaced these globals: build
+       errors, promises and platform objects with the constructors
+       hardening.js captured. */
+    const { TypeError, apply } = globalThis.__tilefinchEventInterfaces;
     const nativeDocumentState = createPrivateSlot(),
       nativeDocumentPrototypes = new MapType(),
       xhtmlNamespace = "http://www.w3.org/1999/xhtml",
@@ -61,18 +69,24 @@ Object.defineProperty(globalThis, "__tilefinchCreateSecondaryDocuments", {
       /* The document's children (doctype, comments, the root element) are
          script-side; a child the page moved elsewhere leaves the list. */
       documentChildren = (doc) => {
-        const state = nativeDocumentOf(doc);
-        state.children = state.children.filter((node) =>
-          node.__handle === undefined
-            ? node.__detachedParent === doc
-            : node.parentNode === null && node.ownerDocument === doc,
-        );
-        return state.children;
+        /* By index here and below: no page patch of the Array methods or
+           the array iterator runs while a document's children change. */
+        const state = nativeDocumentOf(doc), children = [];
+        for (let at = 0; at < state.children.length; at++) {
+          const node = state.children[at];
+          if (node.__handle === undefined
+              ? node.__detachedParent === doc
+              : node.parentNode === null && node.ownerDocument === doc)
+            children[children.length] = node;
+        }
+        return (state.children = children);
       },
-      documentRoot = (doc) =>
-        documentChildren(doc).find(
-          (node) => node.nodeType === Node.ELEMENT_NODE,
-        ) || null,
+      documentRoot = (doc) => {
+        const children = documentChildren(doc);
+        for (let at = 0; at < children.length; at++)
+          if (children[at].nodeType === Node.ELEMENT_NODE) return children[at];
+        return null;
+      },
       rootChild = (doc, names) => {
         const root = documentRoot(doc);
         if (
@@ -120,16 +134,23 @@ Object.defineProperty(globalThis, "__tilefinchCreateSecondaryDocuments", {
          accepted in before `before`. */
       placeDocumentNodes = (doc, { items, before }) => {
         const state = nativeDocumentOf(doc);
-        for (const item of items) {
+        for (let at = 0; at < items.length; at++) {
+          const item = items[at];
           if (item.__handle !== undefined) item.parentNode?.removeChild(item);
           else factories.detach(item);
           if (item.nodeType === Node.DOCUMENT_TYPE_NODE)
             item.__detachedParent = doc;
           adoptIntoDocument(item, doc);
-          const list = state.children.filter((child) => child !== item),
-            index = before === null ? list.length : list.indexOf(before);
-          list.splice(index < 0 ? list.length : index, 0, item);
-          state.children = list;
+          const list = listCopy(state.children, item),
+            found = before === null ? -1 : listIndex(list, before),
+            index = found < 0 ? list.length : found,
+            next = [];
+          for (let n = 0; n < list.length; n++) {
+            if (n === index) next[next.length] = item;
+            next[next.length] = list[n];
+          }
+          if (index === list.length) next[next.length] = item;
+          state.children = next;
         }
       },
       insertDocumentChild = (doc, node, before = null) => {
@@ -139,9 +160,9 @@ Object.defineProperty(globalThis, "__tilefinchCreateSecondaryDocuments", {
       },
       removeDocumentChild = (doc, node) => {
         const state = nativeDocumentOf(doc);
-        if (!documentChildren(doc).includes(node))
+        if (listIndex(documentChildren(doc), node) < 0)
           throw new DOMException("Node is not a child", "NotFoundError");
-        state.children = state.children.filter((child) => child !== node);
+        state.children = listCopy(state.children, node);
         if (node.__handle === undefined) node.__detachedParent = null;
         return node;
       },
@@ -162,7 +183,12 @@ Object.defineProperty(globalThis, "__tilefinchCreateSecondaryDocuments", {
             configurable: true,
             enumerable: true,
             writable: true,
-            value: { [name](...args) { nativeDocumentOf(this); return call(this, ...args); } }[name],
+            value: { [name](...args) {
+              nativeDocumentOf(this);
+              const list = [this];
+              for (let at = 0; at < args.length; at++) list[at + 1] = args[at];
+              return apply(call, undefined, list);
+            } }[name],
           });
         defineProperties(proto, {
           /* The script-side child list, as shim documents expose it: a
@@ -389,8 +415,9 @@ Object.defineProperty(globalThis, "__tilefinchCreateSecondaryDocuments", {
           replaceChildren: method("replaceChildren", (doc, ...nodes) => {
             const plan = planDocumentInsert(documentChildren(doc), nodes, true,
               null);
-            for (const child of documentChildren(doc).slice())
-              removeDocumentChild(doc, child);
+            const children = listCopy(documentChildren(doc));
+            for (let at = 0; at < children.length; at++)
+              removeDocumentChild(doc, children[at]);
             placeDocumentNodes(doc, plan);
           }),
           adoptNode: method("adoptNode", (doc, node) => {

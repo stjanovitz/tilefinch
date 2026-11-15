@@ -12440,7 +12440,7 @@ int main(int argc, char **argv)
         "const loop=pixel[0]>200;const frames=[];for(let i=0;i<5;i++)"
         "frames.push(g.createFramebuffer());const bounded=frames[4]===null;"
         "g.deleteFramebuffer(frames[0]);const reclaimed=!!g.createFramebuffer();"
-        "while(g.getError()!==g.NO_ERROR){}g.blendFunc(g.DST_COLOR,g.ONE);"
+        "while(g.getError()!==g.NO_ERROR){}g.blendFunc(g.SRC_COLOR,g.ONE);"
         "const stateError=g.getError()===g.INVALID_ENUM&&!g.isContextLost();"
         "const emptyRead=new Uint8Array(0);g.readPixels(0,0,0,0,g.RGBA,"
         "g.UNSIGNED_BYTE,emptyRead);const zeroRead=g.getError()===g.NO_ERROR;"
@@ -13479,8 +13479,9 @@ int main(int argc, char **argv)
           /* Cumulative for this runtime: the compatibility probe above also
              loads the Worker module for its close() check, the Intl probes
              load the lazy Intl module, and an srcdoc frame's DOMParser
-             document loads the secondary-documents module. */
-          && result.bootstrap_lazy_module_loads == 9
+             document loads the secondary-documents module, and its
+             postMessage() probes load the window-messaging module. */
+          && result.bootstrap_lazy_module_loads == 10
           && result.bootstrap_lazy_module_failures == 0);
 
     static const char indexeddb_generator_probe[] =

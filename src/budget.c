@@ -2,6 +2,7 @@
 #include "tilefinch/budget.h"
 #include "tilefinch/budget_quickjs.h"
 #include "diagnostic_trace.h"
+#include "tilefinch_test_faults.h"
 
 /* QuickJS allocator activity counters (budget_quickjs_pool_activity): PSP
    validation builds and every host build; shipping PSP builds omit them. */
@@ -409,6 +410,10 @@ void *budget_malloc_category(Budget *budget, BudgetCategory category,
     budget_capture_global_peak(budget);
     budget->allocation_count++;
 
+#if !defined(__PSP__)
+    unsigned char fill = tilefinch_test_faults()->budget_fresh_fill;
+    if (fill != 0) memset(header + 1, fill, size);
+#endif
     return header + 1;
 }
 

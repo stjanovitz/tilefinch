@@ -108,6 +108,39 @@ int main(void)
         CHECK(delta <= 4u * KIB);
     }
 
+    /* Window messaging's bounded structured-clone wire (frame-clone.js)
+       is built by the first postMessage, not at bootstrap, and loads that
+       one module; the message still arrives intact. */
+    {
+        size_t before_message = used_bytes(runtime);
+        ScriptResult message_result;
+        memset(&message_result, 0, sizeof(message_result));
+        CHECK(script_runtime_evaluate_diagnostic(
+            runtime,
+            "addEventListener('message',e=>{globalThis.__footprintMessage="
+            "e.data.a.join()+':'+e.data.m.get(1)+':'+(e.data.u===undefined)}"
+            ");postMessage({a:[1,2],m:new Map([[1,'x']]),u:undefined},'*');"
+            "globalThis.pocSummary='posted'",
+            "<footprint-message>", &message_result));
+        CHECK(strcmp(message_result.summary, "posted") == 0);
+        CHECK(message_result.bootstrap_lazy_module_loads == 1);
+        for (unsigned turn = 0; turn < 4; turn++)
+            CHECK(script_runtime_advance(runtime, 16, 16, &message_result));
+        CHECK(script_runtime_evaluate_diagnostic(
+            runtime, "globalThis.pocSummary=String(globalThis.__footprintMessage)",
+            "<footprint-message-check>", &message_result));
+        size_t after_message = used_bytes(runtime);
+        size_t delta = after_message > before_message
+            ? after_message - before_message : 0u;
+        printf("footprint: lazy frame-clone retained=%zu (%zu KiB) "
+               "lazy-loads=%zu summary=%s\n",
+               delta, delta / KIB, message_result.bootstrap_lazy_module_loads,
+               message_result.summary);
+        CHECK(strcmp(message_result.summary, "1,2:x:true") == 0);
+        CHECK(message_result.bootstrap_lazy_module_loads == 1);
+        CHECK(delta <= FOOTPRINT_LAZY_MODULE_LIMIT_BYTES);
+    }
+
     static const LazyProbe probes[] = {
         {"streams", "typeof ReadableStream"},
         {"indexeddb", "typeof IDBFactory"},
@@ -118,6 +151,7 @@ int main(void)
         {"worker", "typeof Worker"},
         {"intl", "typeof Intl.NumberFormat"},
         {"traversal", "typeof document.createTreeWalker"},
+        {"serialize", "typeof XMLSerializer"},
     };
     size_t before = used_bytes(runtime);
     for (size_t i = 0; i < sizeof(probes) / sizeof(probes[0]); i++) {

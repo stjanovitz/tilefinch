@@ -16,7 +16,7 @@ request-send-low-client-hints=1
 request-sec-fetch-user=1
 request-upgrade-insecure=1
 status=200
-length=637
+length=760
 effective-url=https://script-circuit.test/document
 content-type=text/html; charset=utf-8
 etag=

@@ -422,6 +422,52 @@ static bool run_variant(PageVariant kind)
     return true;
 }
 
+/* A rebuilt overlay plans its blend tables even when its table memory
+   comes back from the heap holding another allocation's bytes: the planned
+   flag must not be read uninitialized. Each fill is a byte reused memory
+   could hold (1 reads as true everywhere; 0xA5 is not a valid bool). */
+static bool overlay_blend_plan_ignores_reused_memory(void)
+{
+    BrowserEngine *engine = make_engine();
+    CHECK(engine != NULL);
+    static char html[8192];
+    int length = page_html(html, sizeof(html), VARIANT_TRANSLATE);
+    CHECK(length > 0 && (size_t) length < sizeof(html));
+    CHECK(browser_engine_commit_html(
+        engine, "https://menu.test/index.html", html, (size_t) length,
+        true));
+    while (!browser_engine_baseline_fonts_ready(engine))
+        CHECK(browser_engine_pump_baseline_fonts(engine));
+    for (int frame = 0; frame < 6; frame++)
+        CHECK(advance_and_render(engine));
+    TileCache *cache = render_cache(engine);
+    CHECK(cache->canvas_overlay_ready
+          && cache->canvas_overlay_blend_cache != NULL);
+    static const unsigned char fills[] = {0x01, 0xa5};
+    for (size_t at = 0; at < sizeof(fills); at++) {
+        size_t builds = cache->canvas_overlay_builds;
+        tilefinch_test_faults()->canvas_overlay_blend_plans = 0;
+        tilefinch_test_faults()->budget_fresh_fill = fills[at];
+        (void) tile_cache_reclaim_optional(cache);
+        cache->canvas_paint_pending = true;
+        bool rendered = browser_engine_render_frame(engine, NULL);
+        tilefinch_test_faults()->budget_fresh_fill = 0;
+        CHECK(rendered);
+        CHECK(cache->canvas_overlay_builds == builds + 1u);
+        CHECK(cache->canvas_overlay_blend_cache != NULL);
+        if (tilefinch_test_faults()->canvas_overlay_blend_plans != 1u)
+            fprintf(stderr, "fill %02x: %u blend plans after an overlay "
+                    "rebuild\n", fills[at],
+                    tilefinch_test_faults()->canvas_overlay_blend_plans);
+        CHECK(tilefinch_test_faults()->canvas_overlay_blend_plans == 1u);
+        /* A steady frame keeps the plan. */
+        CHECK(advance_and_render(engine));
+        CHECK(tilefinch_test_faults()->canvas_overlay_blend_plans == 1u);
+    }
+    browser_engine_destroy(engine);
+    return true;
+}
+
 /* An in-place repaint of a page already on screen keeps its presented
    scroll position: the PSP frontend shows placeholder tiles only when the
    view moved, so a relayout never fills in tile by tile. */
@@ -717,6 +763,8 @@ int main(int argc, char **argv)
             && strcmp(argv[2], variant_names[kind]) != 0) continue;
         if (!run_variant((PageVariant) kind)) return 1;
     }
+    if (!timing_mode && !overlay_blend_plan_ignores_reused_memory())
+        return 1;
     if (!timing_mode && !alpha_blend_exhaustive()) return 1;
     if (!timing_mode && !page_fills_match_reference()) return 1;
     if (!timing_mode && !gradient_spans_match_reference()) return 1;

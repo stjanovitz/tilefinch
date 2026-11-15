@@ -21,11 +21,11 @@ IGNORE_RULES = {
     "/docs/engineering/MEMORY_EXPERIMENTS.md",
     "/docs/engineering/RELEASE_*_CHECKS.md",
 }
-# Public pages that summarize private investigations (the engineering index's
-# "Parked directions"); they must not point into private paths.
-PUBLIC_SUMMARIES = (
-    "docs/engineering/README.md",
-)
+# Public prose and replay scripts must not point into a maintainer's machine
+# or development workflow: every tracked Markdown file (docs, READMEs, the
+# changelog) and every keyed input script under tests/input-scripts/.
+PUBLIC_REFERENCE_SUFFIX = ".md"
+PUBLIC_REFERENCE_SCRIPT_DIR = "tests/input-scripts/"
 # The private ledgers live only in maintainers' ignored
 # .private-investigations/ directory. Public files may name them only by that
 # path, so no comment or link points at a document a clone cannot contain.
@@ -40,9 +40,12 @@ LEDGER_NAME_ALLOWED = {
     "docs/RELEASE_PROCESS.md",
     "tests/test_public_tree_hygiene.py",
 }
+# Local user paths, scratch paths, the private work area and its merge tools,
+# agent branch names, and "main checkout" (the maintainers' name for their
+# development clone).
 PRIVATE_REFERENCE = re.compile(
-    r"(?:/Users/[^/\s]+/|/home/[^/\s]+/|/private/tmp/|i/work/|"
-    r"\b(?:claude|codex)/[\w-]+)"
+    r"(?:/Users/[^/\s]+/|/home/[^/\s]+/|/private/tmp/|i/work/|merge-tools/|"
+    r"\b(?:claude|codex)/[\w-]+|(?i:\bmain checkout\b))"
 )
 
 
@@ -96,6 +99,29 @@ def private_ledger_references(root: Path) -> list[str]:
     return found
 
 
+def is_public_reference_file(name: str) -> bool:
+    if name.endswith(PUBLIC_REFERENCE_SUFFIX):
+        return True
+    return (name.startswith(PUBLIC_REFERENCE_SCRIPT_DIR)
+            and name.endswith(".txt")
+            and "/" not in name[len(PUBLIC_REFERENCE_SCRIPT_DIR):])
+
+
+def private_references(root: Path) -> list[str]:
+    found = []
+    for name in all_tracked_files(root):
+        if not is_public_reference_file(name):
+            continue
+        try:
+            text = (root / name).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        for number, line in enumerate(text.splitlines(), 1):
+            if PRIVATE_REFERENCE.search(line):
+                found.append(f"{name}:{number}")
+    return found
+
+
 def main() -> int:
     root = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
     ignore_lines = {
@@ -145,18 +171,11 @@ def main() -> int:
         for path in sorted(rejected):
             print(f"  {path}", file=sys.stderr)
         return 1
-    private_references = []
-    for name in PUBLIC_SUMMARIES:
-        path = root / name
-        if not path.exists():
-            continue
-        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-            if PRIVATE_REFERENCE.search(line):
-                private_references.append(f"{name}:{number}")
-    if private_references:
-        print("public-tree hygiene: private references in public summaries:",
-              file=sys.stderr)
-        for reference in private_references:
+    references = private_references(root)
+    if references:
+        print("public-tree hygiene: private references in public docs or "
+              "input scripts:", file=sys.stderr)
+        for reference in references:
             print(f"  {reference}", file=sys.stderr)
         return 1
     ledger_references = private_ledger_references(root)

@@ -5,7 +5,7 @@
 
 #define FILE_DOWNLOAD_LIMIT (512u * 1024u * 1024u)
 #define FILE_DOWNLOAD_FILENAME_LIMIT OFFLINE_LIBRARY_TITLE_LIMIT
-/* A file item's paths: "<directory>/<8-hex ID>-<name>" for the file and
+/* A file item's paths: "<directory>/<8-hex ID>-<stored name>" for the file and
    "<directory>/<8-hex ID><suffix>" for its part and metadata files. The 24
    bytes cover "/", the ID, "-" and the longest suffix, ".file.meta.tmp". */
 #define FILE_DOWNLOAD_PATH_LIMIT \
@@ -18,9 +18,19 @@ typedef struct FileDownloadManager FileDownloadManager;
 bool file_download_url_supported(const char *url);
 bool file_download_url_candidate(const char *url);
 bool file_download_response_candidate(const FetchResult *response);
+/* A file's name as the library stores and shows it: UTF-8, from the
+   response's Content-Disposition or else the URL's last path segment, as a
+   bounded basename that keeps its extension (see file_download.c). */
 bool file_download_filename(const char *url, const char *disposition,
                             char output[FILE_DOWNLOAD_FILENAME_LIMIT]);
 bool file_download_filename_valid(const char *name);
+/* The printable-ASCII name a valid file name has on the Memory Stick:
+   itself when it is printable ASCII, otherwise its non-ASCII bytes
+   percent-encoded and cut to fit with the extension kept. */
+bool file_download_stored_name(const char *name,
+                               char output[FILE_DOWNLOAD_FILENAME_LIMIT]);
+/* A name that may be written to the Memory Stick as it is. */
+bool file_download_stored_name_valid(const char *name);
 bool file_download_path(const OfflineLibrary *library, uint32_t id,
                         char *output, size_t capacity);
 bool file_download_enqueue(OfflineLibrary *library, const char *url,

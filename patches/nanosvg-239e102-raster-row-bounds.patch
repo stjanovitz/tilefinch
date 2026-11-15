@@ -1,0 +1,76 @@
+diff --git a/src/nanosvgrast.h b/src/nanosvgrast.h
+--- a/src/nanosvgrast.h
++++ b/src/nanosvgrast.h
+@@ -880,11 +880,13 @@
+ }
+ 
+ 
++// In integer arithmetic (the double version cost five software
++// floating-point calls per active edge per subsample row on PSP); the same
++// value for every width.
+ static int nsvg__fixedLimit(const NSVGrasterizer* r)
+ {
+-	double viewport = ((double)r->width + 2.0) * (double)NSVG__FIX;
+-	double ceiling = (double)INT_MAX / 4.0;
+-	return (int)(viewport < ceiling ? viewport : ceiling);
++	long long viewport = ((long long)r->width + 2) * NSVG__FIX;
++	return viewport < INT_MAX / 4 ? (int)viewport : INT_MAX / 4;
+ }
+ 
+ static int nsvg__boundedFixed(float value, int limit)
+@@ -898,7 +900,7 @@
+ }
+ 
+ 
+-static NSVGactiveEdge* nsvg__addActive(NSVGrasterizer* r, NSVGedge* e, float startPoint)
++static NSVGactiveEdge* nsvg__addActive(NSVGrasterizer* r, NSVGedge* e, float startPoint, int fixedLimit)
+ {
+ 	 NSVGactiveEdge* z;
+ 
+@@ -913,7 +915,6 @@
+ 	}
+ 
+ 	float dxdy = (e->x1 - e->x0) / (e->y1 - e->y0);
+-	int fixedLimit = nsvg__fixedLimit(r);
+ //	STBTT_assert(e->y0 <= start_point);
+ 	// round dx down to avoid going too far
+ 	z->dx = nsvg__boundedFixed(NSVG__FIX * dxdy, fixedLimit);
+@@ -1168,8 +1169,20 @@
+ 	int e = 0;
+ 	int maxWeight = (255 / NSVG__SUBSAMPLES);  // weight per vertical scanline
+ 	int xmin, xmax;
++	int fixedLimit = nsvg__fixedLimit(r);
+ 
+-	for (y = 0; y < r->height; y++) {
++	// Rows above the first edge (the edges are sorted by y0) and below the
++	// last active one draw nothing: skip them. A row starts one early, so
++	// its last subsample is still above that edge.
++	y = 0;
++	if (r->nedges > 0 && isfinite(r->edges[0].y0)
++		&& r->edges[0].y0 > (float)NSVG__SUBSAMPLES) {
++		float first = r->edges[0].y0 / (float)NSVG__SUBSAMPLES - 1.0f;
++		y = first < (float)r->height ? (int)first : r->height;
++	}
++	for (; y < r->height; y++) {
++		if (active == NULL && e >= r->nedges)
++			break;
+ 		memset(r->scanline, 0, r->width);
+ 		xmin = r->width;
+ 		xmax = 0;
+@@ -1187,7 +1200,6 @@
+ //					NSVG__assert(z->valid);
+ 					nsvg__freeActive(r, z);
+ 				} else {
+-					int fixedLimit = nsvg__fixedLimit(r);
+ 					if (z->dx > 0 && z->x > fixedLimit - z->dx)
+ 						z->x = fixedLimit;
+ 					else if (z->dx < 0 && z->x < -fixedLimit - z->dx)
+@@ -1219,7 +1231,7 @@
+ 			// insert all edges that start before the center of this scanline -- omit ones that also end on this scanline
+ 			while (e < r->nedges && r->edges[e].y0 <= scany) {
+ 				if (r->edges[e].y1 > scany) {
+-					NSVGactiveEdge* z = nsvg__addActive(r, &r->edges[e], scany);
++					NSVGactiveEdge* z = nsvg__addActive(r, &r->edges[e], scany, fixedLimit);
+ 					if (z == NULL) break;
+ 					// find insertion point
+ 					if (active == NULL) {

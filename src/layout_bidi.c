@@ -5,6 +5,7 @@
 #include "tilefinch/platform.h"
 #include "tilefinch/text_bidi.h"
 
+#include <ctype.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -667,7 +668,7 @@ static int bidi_shaped_unit_advance(
     const FontFace *face, FontFamily metric_family,
     const TextBidiUnit *unit, int font_size_fixed,
     bool synthetic_bold, bool metric_bold, TextTransformMode transform,
-    bool first, bool kerning)
+    bool first, bool kerning, bool *exact)
 {
     uint32_t codepoint = bidi_transform_codepoint(
         unit->shaped_codepoint, transform, first);
@@ -685,7 +686,53 @@ static int bidi_shaped_unit_advance(
                   face, metric_family, encoded, length, font_size_fixed,
                   synthetic_bold, metric_bold, kerning);
     }
+    /* A negative advance is the face refusing the size or variation. */
+    if (advance < 0 && exact != NULL) *exact = false;
     return advance < 0 ? 0 : advance;
+}
+
+/* The width of units [first, last), summed from the forms the shaper chose;
+   false when none of them changed form, so the ordinary whole-run path (its
+   kerning and optional sequences) still measures Hebrew, Latin and
+   unchanged Arabic text. `exact` (optional) turns false when a face could
+   not measure a form. */
+static bool bidi_shaped_units_width(
+    const TextBidiUnit *units, size_t first, size_t last,
+    size_t paragraph_byte, const FontFace *face, FontFamily metric_family,
+    int font_size_fixed, bool synthetic_bold, bool metric_bold,
+    int letter_spacing, TextTransformMode transform, bool kerning,
+    int *width_fixed, bool *exact)
+{
+    bool shaped = false;
+    for (size_t i = first; i < last; i++) {
+        if (units[i].shaped_codepoint != units[i].codepoint) {
+            shaped = true;
+            break;
+        }
+    }
+    if (!shaped) return false;
+    int width = 0;
+    bool visible = false;
+    for (size_t i = first; i < last; i++) {
+        uint32_t codepoint = units[i].shaped_codepoint;
+        bool ignored = font_codepoint_default_ignorable(codepoint);
+        int advance = bidi_shaped_unit_advance(
+            face, metric_family, &units[i], font_size_fixed,
+            synthetic_bold, metric_bold, transform,
+            units[i].byte_offset == paragraph_byte, kerning, exact);
+        if (visible && !ignored) {
+            advance = layout_fixed_add(
+                advance, letter_spacing);
+        }
+        width = layout_fixed_add(width, advance);
+        if (!ignored) visible = true;
+    }
+    /* An unattached optional Arabic pack can leave every contextual form
+       without a metric. Let the ordinary logical-codepoint fallback retain
+       its established .notdef advances until that pack is available. */
+    if (width <= 0) return false;
+    *width_fixed = width;
+    return true;
 }
 
 bool layout_bidi_measure_shaped_text(
@@ -700,40 +747,207 @@ bool layout_bidi_measure_shaped_text(
     size_t first = 0, last = 0, paragraph_byte = 0;
     if (!bidi_source_unit_range(
             flow, text, length, &first, &last, &paragraph_byte)) return false;
-    const TextBidiUnit *units = text_bidi_paragraph_units(flow->paragraph);
-    bool shaped = false;
-    for (size_t i = first; i < last; i++) {
-        if (units[i].shaped_codepoint != units[i].codepoint) {
-            shaped = true;
-            break;
-        }
+    return bidi_shaped_units_width(
+        text_bidi_paragraph_units(flow->paragraph), first, last,
+        paragraph_byte, face, metric_family, font_size_fixed,
+        synthetic_bold, metric_bold, letter_spacing, transform, kerning,
+        width_fixed, NULL);
+}
+
+/* Arabic, Arabic Supplement and Extended-A/B: the blocks whose letters join.
+   Hebrew and directional controls reorder but never change form. */
+static bool bidi_text_may_join(const char *text, size_t length)
+{
+    const unsigned char *bytes = (const unsigned char *) text;
+    for (size_t at = 0; at < length; at++) {
+        unsigned char lead = bytes[at];
+        if ((lead >= 0xd8u && lead <= 0xddu)
+            || (lead == 0xe0u && at + 1u < length
+                && bytes[at + 1u] >= 0xa1u && bytes[at + 1u] <= 0xa3u))
+            return true;
     }
-    /* Preserve the existing whole-run kerning and optional-sequence path for
-       Hebrew, Latin, and unchanged Arabic text. Only contextual substitutions
-       need the per-shaped-glyph measurement below. */
-    if (!shaped) return false;
-    int width = 0;
-    bool visible = false;
-    for (size_t i = first; i < last; i++) {
-        uint32_t codepoint = units[i].shaped_codepoint;
-        bool ignored = font_codepoint_default_ignorable(codepoint);
-        int advance = bidi_shaped_unit_advance(
-            face, metric_family, &units[i], font_size_fixed,
-            synthetic_bold, metric_bold, transform,
-            units[i].byte_offset == paragraph_byte, kerning);
-        if (visible && !ignored) {
-            advance = layout_fixed_add(
-                advance, letter_spacing);
+    return false;
+}
+
+/* Whether text_bidi_paragraph_create can analyse the whole node: valid
+   UTF-8 within the byte, codepoint and paragraph limits. Every separator
+   is counted, so a CR LF pair counts twice and the bound errs low. */
+static bool bidi_text_fits_analysis(const char *text, size_t length)
+{
+    if (length == 0 || length > TEXT_BIDI_PARAGRAPH_BYTE_LIMIT) return false;
+    size_t count = 0, separators = 0;
+    for (size_t at = 0; at < length;) {
+        unsigned codepoint = 0;
+        size_t used = font_utf8_next(text + at, length - at, &codepoint);
+        if (used == 0) return false;
+        if (++count > TEXT_BIDI_CODEPOINT_LIMIT) return false;
+        if (codepoint == 0x0au || codepoint == 0x0du
+            || (codepoint >= 0x1cu && codepoint <= 0x1eu)
+            || codepoint == 0x85u || codepoint == 0x2029u) {
+            if (++separators >= TEXT_BIDI_SEGMENT_LIMIT) return false;
         }
-        width = layout_fixed_add(width, advance);
-        if (!ignored) visible = true;
+        at += used;
     }
-    /* An unattached optional Arabic pack can leave every contextual form
-       without a metric. Let the ordinary logical-codepoint fallback retain
-       its established .notdef advances until that pack is available. */
-    if (width <= 0) return false;
-    *width_fixed = width;
     return true;
+}
+
+/* Codepoints whose unit can sit in a word shaped apart from its node:
+   neither mirrored nor a boundary neutral or explicit control. Printable
+   ASCII other than the brackets, no-break space, and the Arabic blocks
+   and presentation forms other than the letter mark (U+061C) and the
+   ornate parentheses. */
+static bool bidi_codepoint_context_free(unsigned codepoint)
+{
+    if (codepoint >= 0x21u && codepoint <= 0x7eu)
+        return codepoint != '(' && codepoint != ')' && codepoint != '<'
+            && codepoint != '>' && codepoint != '[' && codepoint != ']'
+            && codepoint != '{' && codepoint != '}';
+    return codepoint == 0xa0u
+        || (codepoint >= 0x0600u && codepoint <= 0x077fu
+            && codepoint != 0x061cu)
+        || (codepoint >= 0x0870u && codepoint <= 0x08ffu)
+        || (codepoint >= 0xfb50u && codepoint <= 0xfdffu
+            && codepoint != 0xfd3eu && codepoint != 0xfd3fu)
+        || (codepoint >= 0xfe70u && codepoint <= 0xfefcu);
+}
+
+/* Whether the forms of [start, end) do not depend on the rest of the node,
+   so its shaped width can be retained by its bytes alone. It must be a
+   whole word, bounded by white space or the node's ends: white space
+   neither joins nor is transparent, so joining stops there. Inside it,
+   only levels can carry context in, and only where two units must share
+   one to join. Every joining letter in these blocks is strong
+   right-to-left, so the word's letters share a level wherever it stands,
+   and a neighbour on another level (a digit, a Latin letter, punctuation)
+   would not have joined anyway. A mirrored bracket takes its form from
+   its level, and a joiner (U+200C, U+200D) or other boundary neutral can
+   take its level from the text before the word, so a word holding one is
+   shaped in place. */
+static bool bidi_word_shapes_alone(const char *text, size_t length,
+                                   size_t start, size_t end)
+{
+    if ((start != 0 && !isspace((unsigned char) text[start - 1u]))
+        || (end != length && !isspace((unsigned char) text[end])))
+        return false;
+    for (size_t at = start; at < end;) {
+        unsigned codepoint = 0;
+        size_t used = font_utf8_next(text + at, end - at, &codepoint);
+        if (used == 0 || !bidi_codepoint_context_free(codepoint))
+            return false;
+        at += used;
+    }
+    return true;
+}
+
+/* Whether no unit of the word can change form: ASCII without a mirrored
+   bracket. Such a word neither joins nor mirrors, wherever it stands. */
+static bool bidi_word_keeps_form(const char *text, size_t length)
+{
+    for (size_t at = 0; at < length; at++) {
+        unsigned char byte = (unsigned char) text[at];
+        if (byte >= 0x80u || byte == '(' || byte == ')' || byte == '<'
+            || byte == '>' || byte == '[' || byte == ']' || byte == '{'
+            || byte == '}') return false;
+    }
+    return true;
+}
+
+void layout_bidi_intrinsic_shaping_begin(
+    LayoutBidiIntrinsicShaping *shaping, LayoutContext *context,
+    const char *text, size_t length)
+{
+    *shaping = (LayoutBidiIntrinsicShaping) {
+        .context = context, .text = text, .length = length
+    };
+    shaping->joins = context != NULL && context->layout != NULL
+        && text != NULL && bidi_text_may_join(text, length)
+        && bidi_text_fits_analysis(text, length);
+    if (shaping->joins)
+        shaping->generation = font_optional_glyph_generation();
+}
+
+void layout_bidi_intrinsic_shaping_end(LayoutBidiIntrinsicShaping *shaping)
+{
+    if (shaping == NULL) return;
+    text_bidi_paragraph_destroy(shaping->paragraph);
+    shaping->paragraph = NULL;
+}
+
+/* Words shaped on their own; a longer one is found in its node's paragraph. */
+#define BIDI_INTRINSIC_WORD_UNITS 32u
+
+bool layout_bidi_intrinsic_shaped_width(
+    LayoutBidiIntrinsicShaping *shaping, size_t byte_start, size_t byte_end,
+    const FontFace *face, FontFamily metric_family, int font_size_fixed,
+    bool synthetic_bold, bool metric_bold, int letter_spacing,
+    TextTransformMode transform, bool kerning, int *width_fixed)
+{
+    if (shaping == NULL || !shaping->joins || width_fixed == NULL
+        || byte_end <= byte_start || byte_end > shaping->length)
+        return false;
+    LayoutReuseCache *cache = shaping->context->reuse;
+    const char *word = shaping->text + byte_start;
+    size_t word_length = byte_end - byte_start;
+    if (bidi_word_keeps_form(word, word_length)) return false;
+    bool alone = bidi_word_shapes_alone(
+        shaping->text, shaping->length, byte_start, byte_end);
+    bool retained = alone && cache != NULL
+        && word_length <= LAYOUT_TEXT_MEASURE_BYTES;
+    int width = 0;
+    if (retained && layout_text_measure_find_shaped(
+            cache, face, metric_family, word, word_length, font_size_fixed,
+            synthetic_bold, metric_bold, letter_spacing, transform, kerning,
+            &width)) {
+        if (width < 0) return false;
+        *width_fixed = width;
+        return true;
+    }
+    bool exact = true;
+    bool shaped;
+    TextBidiUnit run[BIDI_INTRINSIC_WORD_UNITS];
+    size_t run_count = alone ? text_bidi_shape_level_run(
+        word, word_length, run, BIDI_INTRINSIC_WORD_UNITS) : 0;
+    if (run_count != 0) {
+        /* The word's own forms are its forms in the node. */
+        shaped = bidi_shaped_units_width(
+            run, 0, run_count, 0, face, metric_family, font_size_fixed,
+            synthetic_bold, metric_bold, letter_spacing, transform, kerning,
+            &width, &exact);
+    } else {
+        if (!shaping->analysed) {
+            shaping->analysed = true;
+            TextBidiStatus status;
+            /* Joining does not depend on direction, so the base is
+               immaterial. */
+            shaping->paragraph = text_bidi_paragraph_create(
+                shaping->context->layout->budget, shaping->text,
+                shaping->length, TEXT_BIDI_BASE_AUTO_LTR, &status);
+        }
+        if (shaping->paragraph == NULL) return false;
+        const TextBidiUnit *units =
+            text_bidi_paragraph_units(shaping->paragraph);
+        size_t count = text_bidi_paragraph_count(shaping->paragraph);
+        size_t low = 0, high = count;
+        while (low < high) {
+            size_t middle = low + (high - low) / 2u;
+            if (units[middle].byte_offset < byte_start) low = middle + 1u;
+            else high = middle;
+        }
+        size_t last = low;
+        while (last < count && units[last].byte_offset < byte_end) last++;
+        shaped = bidi_shaped_units_width(
+            units, low, last, byte_start, face, metric_family,
+            font_size_fixed, synthetic_bold, metric_bold, letter_spacing,
+            transform, kerning, &width, &exact);
+    }
+    if (retained && exact) {
+        layout_text_measure_store_shaped(
+            cache, face, metric_family, word, word_length, font_size_fixed,
+            synthetic_bold, metric_bold, letter_spacing, transform, kerning,
+            shaped ? width : -1, shaping->generation);
+    }
+    if (shaped) *width_fixed = width;
+    return shaped;
 }
 
 bool layout_bidi_fitting_shaped_prefix(
@@ -767,7 +981,7 @@ bool layout_bidi_fitting_shaped_prefix(
         int advance = bidi_shaped_unit_advance(
             face, metric_family, &units[i], font_size_fixed,
             synthetic_bold, metric_bold, transform,
-            units[i].byte_offset == paragraph_byte, kerning);
+            units[i].byte_offset == paragraph_byte, kerning, NULL);
         if (visible && !ignored) {
             advance = layout_fixed_add(
                 advance, letter_spacing);

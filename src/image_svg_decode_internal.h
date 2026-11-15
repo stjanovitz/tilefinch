@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #include "tilefinch/budget.h"
 
@@ -66,6 +67,17 @@ unsigned char *image_svg_parse_rasterize(ImageSvgParse *parse,
 void image_svg_parse_release(ImageSvgParse *parse);
 /* Documents parsed by this decoder since start (a work counter). */
 size_t image_svg_parse_count(void);
+/* Time this decoder spent since start, when image profiling is on (host
+   traces and validation builds; zero otherwise): parsing markup,
+   rasterizing parsed documents, and inside the cooperation hooks either
+   ran (already counted in the other two). */
+typedef struct {
+    uint64_t parse_us;
+    uint64_t raster_us;
+    uint64_t cooperate_us;
+    size_t rasters;
+} ImageSvgDecodeProfile;
+void image_svg_decode_profile(ImageSvgDecodeProfile *profile);
 unsigned char *image_svg_decode(const void *data, size_t length,
                                 Budget *budget,
                                 size_t maximum_decoded_bytes,

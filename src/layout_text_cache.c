@@ -15,7 +15,11 @@
    What the run's measurement does not take is not part of the key: the
    available width, white-space, word spacing and the line position act
    on these widths in flow_text and are evaluated on every relayout.
-   Contextually shaped runs (layout_bidi) never reach here.
+   Contextually shaped runs in an inline flow never reach here. Intrinsic
+   sizing retains the shaped width of a whole Arabic word under its own
+   key bit (layout_text_measure_find_shaped): a word bounded by white
+   space joins only within itself, so its forms do not depend on the text
+   around it (layout_bidi_intrinsic_shaped_width says which words qualify).
 
    The table is set-associative, charged to the layout category, admitted
    only with the style payloads' working headroom, grown (to a fixed
@@ -30,7 +34,8 @@
 enum {
     TEXT_MEASURE_SYNTHETIC_BOLD = 1u << 0,
     TEXT_MEASURE_METRIC_BOLD = 1u << 1,
-    TEXT_MEASURE_KERNING = 1u << 2
+    TEXT_MEASURE_KERNING = 1u << 2,
+    TEXT_MEASURE_SHAPED = 1u << 3
 };
 
 static size_t layout_text_measure_bytes(size_t capacity)
@@ -147,32 +152,35 @@ void layout_text_measure_prepare(LayoutReuseCache *cache)
     cache->stats.text_measure_bytes = layout_text_measure_bytes(grown);
 }
 
-int layout_text_measure(LayoutReuseCache *cache, const FontFace *face,
-                        FontFamily metric_family, const char *text,
-                        size_t length, int font_size_fixed,
-                        bool synthetic_bold, bool metric_bold, int scale,
-                        int letter_spacing, TextTransformMode transform,
-                        bool kerning)
+typedef struct {
+    const FontFace *face;
+    const char *text;
+    size_t length;
+    uint32_t hash;
+    int32_t font_size_fixed;
+    int16_t letter_spacing;
+    int16_t scale;
+    uint8_t metric_family;
+    uint8_t transform;
+    uint8_t flags;
+} TextMeasureKey;
+
+/* False when the run or an argument does not fit an entry. */
+static bool text_measure_key(
+    TextMeasureKey *key, const FontFace *face, FontFamily metric_family,
+    const char *text, size_t length, int font_size_fixed,
+    bool synthetic_bold, bool metric_bold, int scale, int letter_spacing,
+    TextTransformMode transform, bool kerning, bool shaped)
 {
-    if (cache == NULL || face == NULL || face->serial == 0 || text == NULL
+    if (face == NULL || face->serial == 0 || text == NULL
         || length == 0 || length > LAYOUT_TEXT_MEASURE_BYTES
         || letter_spacing < INT16_MIN || letter_spacing > INT16_MAX
         || scale < INT16_MIN || scale > INT16_MAX
-        || (unsigned) metric_family > UINT8_MAX) {
-        return measured_flow_text_width_fixed(
-            face, metric_family, text, length, font_size_fixed,
-            synthetic_bold, metric_bold, scale, letter_spacing, transform,
-            kerning);
-    }
-    uint64_t generation = font_optional_glyph_generation();
-    if (cache->text_measures != NULL
-        && generation != cache->text_measure_generation) {
-        layout_text_measure_clear(cache);
-        cache->text_measure_generation = generation;
-    }
+        || (unsigned) metric_family > UINT8_MAX) return false;
     uint8_t flags = (uint8_t) ((synthetic_bold ? TEXT_MEASURE_SYNTHETIC_BOLD : 0u)
         | (metric_bold ? TEXT_MEASURE_METRIC_BOLD : 0u)
-        | (kerning ? TEXT_MEASURE_KERNING : 0u));
+        | (kerning ? TEXT_MEASURE_KERNING : 0u)
+        | (shaped ? TEXT_MEASURE_SHAPED : 0u));
     uint32_t parameters[5] = {
         (uint32_t) face->serial, (uint32_t) (face->serial >> 32),
         (uint32_t) font_size_fixed,
@@ -181,40 +189,65 @@ int layout_text_measure(LayoutReuseCache *cache, const FontFace *face,
     };
     uint32_t hash = style_fnv1a(STYLE_FNV1A_SEED, text, length, false);
     hash = style_fnv1a(hash, parameters, sizeof(parameters), false);
-    if (hash == 0) hash = 1;
-    LayoutTextMeasureEntry *set = NULL;
+    *key = (TextMeasureKey) {
+        .face = face, .text = text, .length = length,
+        .hash = hash == 0 ? 1u : hash,
+        .font_size_fixed = font_size_fixed,
+        .letter_spacing = (int16_t) letter_spacing,
+        .scale = (int16_t) scale,
+        .metric_family = (uint8_t) metric_family,
+        .transform = (uint8_t) transform,
+        .flags = flags
+    };
+    return true;
+}
+
+static bool text_measure_find(LayoutReuseCache *cache,
+                              const TextMeasureKey *key, int *width)
+{
+    uint64_t generation = font_optional_glyph_generation();
+    if (cache->text_measures != NULL
+        && generation != cache->text_measure_generation) {
+        layout_text_measure_clear(cache);
+        cache->text_measure_generation = generation;
+    }
     if (cache->text_measures != NULL) {
-        set = layout_text_measure_set(cache->text_measures,
-                                      cache->text_measure_capacity, hash);
+        LayoutTextMeasureEntry *set = layout_text_measure_set(
+            cache->text_measures, cache->text_measure_capacity, key->hash);
         for (size_t way = 0; way < LAYOUT_TEXT_MEASURE_WAYS; way++) {
             LayoutTextMeasureEntry *entry = &set[way];
-            if (entry->hash == hash && entry->length == length
-                && entry->face_serial == face->serial
-                && entry->font_size_fixed == font_size_fixed
-                && entry->letter_spacing == letter_spacing
-                && entry->scale == scale
-                && entry->metric_family == (uint8_t) metric_family
-                && entry->transform == transform
-                && entry->flags == flags
-                && memcmp(entry->text, text, length) == 0) {
+            if (entry->hash == key->hash && entry->length == key->length
+                && entry->face_serial == key->face->serial
+                && entry->font_size_fixed == key->font_size_fixed
+                && entry->letter_spacing == key->letter_spacing
+                && entry->scale == key->scale
+                && entry->metric_family == key->metric_family
+                && entry->transform == key->transform
+                && entry->flags == key->flags
+                && memcmp(entry->text, key->text, key->length) == 0) {
                 entry->stamp = ++cache->text_measure_clock;
                 cache->stats.text_measure_hits++;
-                return entry->width;
+                if ((key->flags & TEXT_MEASURE_SHAPED) != 0)
+                    cache->stats.text_measure_shaped_hits++;
+                *width = entry->width;
+                return true;
             }
         }
     }
     cache->stats.text_measure_misses++;
-    bool exact = false;
-    int width = measured_flow_text_width_fixed_checked(
-        face, metric_family, text, length, font_size_fixed, synthetic_bold,
-        metric_bold, scale, letter_spacing, transform, kerning, &exact);
-    if (!exact) return width;
+    return false;
+}
+
+static void text_measure_store(LayoutReuseCache *cache,
+                               const TextMeasureKey *key, int width,
+                               uint64_t generation)
+{
     /* Measuring can allocate (a face's glyph state), and an allocation can
        run the Budget's reclaim hook, which may have yielded the table:
        find the set again. */
-    if (!layout_text_measure_admit(cache, generation)) return width;
-    set = layout_text_measure_set(cache->text_measures,
-                                  cache->text_measure_capacity, hash);
+    if (!layout_text_measure_admit(cache, generation)) return;
+    LayoutTextMeasureEntry *set = layout_text_measure_set(
+        cache->text_measures, cache->text_measure_capacity, key->hash);
     /* The clock orders entries for replacement; restart it, and the table,
        before it wraps. */
     if (cache->text_measure_clock == UINT32_MAX)
@@ -231,17 +264,73 @@ int layout_text_measure(LayoutReuseCache *cache, const FontFace *face,
         cache->stats.text_measure_evictions++;
         cache->text_measure_build_evictions++;
     }
-    victim->face_serial = face->serial;
-    victim->hash = hash;
+    victim->face_serial = key->face->serial;
+    victim->hash = key->hash;
     victim->stamp = ++cache->text_measure_clock;
     victim->width = width;
-    victim->font_size_fixed = font_size_fixed;
-    victim->letter_spacing = (int16_t) letter_spacing;
-    victim->scale = (int16_t) scale;
-    victim->length = (uint8_t) length;
-    victim->metric_family = (uint8_t) metric_family;
-    victim->transform = transform;
-    victim->flags = flags;
-    memcpy(victim->text, text, length);
+    victim->font_size_fixed = key->font_size_fixed;
+    victim->letter_spacing = key->letter_spacing;
+    victim->scale = key->scale;
+    victim->length = (uint8_t) key->length;
+    victim->metric_family = key->metric_family;
+    victim->transform = key->transform;
+    victim->flags = key->flags;
+    memcpy(victim->text, key->text, key->length);
+}
+
+int layout_text_measure(LayoutReuseCache *cache, const FontFace *face,
+                        FontFamily metric_family, const char *text,
+                        size_t length, int font_size_fixed,
+                        bool synthetic_bold, bool metric_bold, int scale,
+                        int letter_spacing, TextTransformMode transform,
+                        bool kerning)
+{
+    TextMeasureKey key;
+    if (cache == NULL || !text_measure_key(
+            &key, face, metric_family, text, length, font_size_fixed,
+            synthetic_bold, metric_bold, scale, letter_spacing, transform,
+            kerning, false)) {
+        return measured_flow_text_width_fixed(
+            face, metric_family, text, length, font_size_fixed,
+            synthetic_bold, metric_bold, scale, letter_spacing, transform,
+            kerning);
+    }
+    uint64_t generation = font_optional_glyph_generation();
+    int width = 0;
+    if (text_measure_find(cache, &key, &width)) return width;
+    bool exact = false;
+    width = measured_flow_text_width_fixed_checked(
+        face, metric_family, text, length, font_size_fixed, synthetic_bold,
+        metric_bold, scale, letter_spacing, transform, kerning, &exact);
+    if (exact) text_measure_store(cache, &key, width, generation);
     return width;
+}
+
+bool layout_text_measure_find_shaped(
+    LayoutReuseCache *cache, const FontFace *face, FontFamily metric_family,
+    const char *text, size_t length, int font_size_fixed,
+    bool synthetic_bold, bool metric_bold, int letter_spacing,
+    TextTransformMode transform, bool kerning, int *width_fixed)
+{
+    TextMeasureKey key;
+    return cache != NULL && width_fixed != NULL
+        && text_measure_key(&key, face, metric_family, text, length,
+                            font_size_fixed, synthetic_bold, metric_bold, 0,
+                            letter_spacing, transform, kerning, true)
+        && text_measure_find(cache, &key, width_fixed);
+}
+
+void layout_text_measure_store_shaped(
+    LayoutReuseCache *cache, const FontFace *face, FontFamily metric_family,
+    const char *text, size_t length, int font_size_fixed,
+    bool synthetic_bold, bool metric_bold, int letter_spacing,
+    TextTransformMode transform, bool kerning, int width_fixed,
+    uint64_t generation)
+{
+    TextMeasureKey key;
+    if (cache != NULL
+        && text_measure_key(&key, face, metric_family, text, length,
+                            font_size_fixed, synthetic_bold, metric_bold, 0,
+                            letter_spacing, transform, kerning, true))
+        text_measure_store(cache, &key, width_fixed, generation);
 }

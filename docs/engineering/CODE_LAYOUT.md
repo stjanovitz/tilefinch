@@ -157,7 +157,8 @@ quietly lose its place. Two checks catch that:
    runs on every audio block or lit draw; a pinned function gets the heat
    of the coldest listed one, so it clusters with its callers. `--command`
    records in the file header how the file was made, including which build
-   and profiles it came from.
+   (by version and date; the generator refuses a commit id, which the public
+   history would not contain) and profiles it came from.
 5. Run `ctest -R tilefinch-psp-hot-order-tests`, rebuild both PSP presets
    with the option on, and check frame hashes with PPSSPP journeys. Then
    time the new list on a PSP against the natural link order, each with

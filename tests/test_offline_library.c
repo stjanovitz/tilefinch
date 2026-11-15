@@ -115,7 +115,7 @@ static int test_newer_index_is_left_alone(Budget *budget, const char *root)
         size_t length = 0;
         CHECK(read_whole(primary, index, sizeof(index), &length)
               && length > 20u);
-        index[8] = 7u; /* version: the body checksum does not cover it */
+        index[8] = 8u; /* version: the body checksum does not cover it */
         if (newer_at != 0) CHECK(unlink(primary) == 0);
         if (newer_at == 2) CHECK(unlink(backup) == 0);
         CHECK(write_whole(newer_path, index, length));

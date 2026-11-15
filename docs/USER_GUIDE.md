@@ -30,7 +30,9 @@ in page** means press Select, choose **Page tools**, then **Find in page**.
 
 The Library (its screen is headed **COLLECTIONS**) has five sections:
 **Saved**, **Bookmarks**, **History**, **Downloads** and **Shots**
-(screenshots). L/R switches between them.
+(screenshots). L/R switches between them. In languages whose section names
+do not all fit on the row, the row shows the current section with its
+neighbours, and an arrow at either end marks more sections that way.
 
 ## Typing
 
@@ -163,7 +165,14 @@ articles, apps, videos and files in all.
 - **Files.** **Menu → Page tools → Download focused link** saves an HTTPS
   file to the Memory Stick after you confirm. Common archive links,
   attachment responses and homebrew binary links offer this directly.
-  Downloads never install or run automatically.
+  Downloads never install or run automatically. **Save file?**, Downloads
+  and the saved file's page show the file's own name in any language, such
+  as an Arabic, Hebrew or Japanese name. On the Memory Stick each character
+  outside plain English letters, digits and punctuation is spelled as `%`
+  and two hexadecimal digits for each of its bytes (`صورة.jpg` is
+  `%D8%B5%D9%88%D8%B1%D8%A9.jpg`), after the item's number; the saved
+  file's page shows that path, which is where a USB copy finds it. A name
+  too long for the Library keeps its extension.
 - **YouTube videos.** **Save video offline** on a video's page downloads it
   at your **Menu → Settings → Video → YouTube** quality.
 
@@ -175,13 +184,18 @@ of starting over. Square, then Square again, deletes an item.
 A completed homebrew ZIP offers **Details → Install homebrew?**, with a
 separate confirmation that shows where it will go. It installs one checked
 app folder under `PSP/GAME`, refuses folders that already exist and keeps the
-ZIP. Circle cancels and removes the current attempt's temporary files.
+ZIP. A ZIP with the app's files at its top level installs to a folder named
+after the download; when that name has letters other than plain English ones
+or is too long, the folder is `APP-` and a number instead, and the
+confirmation and **Installed homebrew** still show the download's name. Circle cancels and removes the current attempt's temporary files.
 **Downloads → Installed homebrew** removes a Tilefinch-installed app even
 after its ZIP is gone, with a separate confirmation warning that saved data
 inside the app folder is removed too. Other apps are not touched.
 
 While the Library holds a downloaded file, older Tilefinch versions cannot
-read it. If you return to an earlier version with safe start or the update
+read it; while it holds a file whose name is not all plain English letters,
+digits and punctuation, versions before that name was kept cannot read it
+either. If you return to an earlier version with safe start or the update
 picker, that version does not show your saved items.
 
 [The offline library reference](OFFLINE_LIBRARY.md) has the formats and
@@ -424,12 +438,23 @@ For the browser interface, open **Menu → Settings → Appearance → Language 
 emoji → Interface language**. Choose with Left/Right and press Cross to
 install; press Cross again while it installs to cancel. English, Spanish,
 French, German, Japanese, Russian, Ukrainian, Simplified Chinese, Korean,
-Hindi, Arabic, Portuguese, Bengali and Assamese are available. Languages
+Hindi, Arabic, Portuguese, Bengali, Assamese and Hebrew are available. The
+Hebrew translation, and the newest labels in the other languages (the
+page's bottom bar, Collections, Settings descriptions), have not been
+reviewed by native speakers. Languages
 that need extra glyphs also download their font pack. Restart to apply. This
 is separate from page fonts and preferred audio/subtitle languages; it does
 not translate websites or games. Advanced messages not yet translated stay
 in English. Translations and signed glyph packs are downloaded from
 [tilefinch-models](https://github.com/stjanovitz/tilefinch-models).
+
+In Arabic and Hebrew, the menu, tabs, Settings lists and the player's menu
+rows are mirrored: each row's name starts at the right, with its setting or arrow at
+the left. The bars, HOME and Collections keep their layout, and the player's
+tabs keep their order for **L** and **R**. Page titles and file names, in any
+interface language, start at the side their own language starts from, so an
+Arabic or Hebrew title sits at the right of its row and `video.mp4` at the
+left. A file name too long for its row keeps its extension.
 
 If the selected language's file or font pack is missing or damaged, the menus
 fall back to English. Once per start, an English notice names the language
@@ -516,7 +541,7 @@ as the primary face button.
   that cannot connect without a relay.
 
 Game authors should start with
-[Tilefinch Game Profile v1.1](GAME_PROFILE.md), the complete API,
+[Tilefinch Game Profile v1.2](GAME_PROFILE.md), the complete API,
 resource, lifecycle, packaging, and qualification contract, and then read the
 [WebGL guide](WEBGL.md) for renderer details.
 

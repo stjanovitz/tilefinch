@@ -2333,6 +2333,19 @@ static bool navigation_publish_static_svg(NavigationSession *session,
 
 /* Images: reserve the frame tail, load the visible-priority images (from a
    preview layout, a static plan or the markup) and plan the rest. */
+/* The inline-SVG rasters the loading preview drew, lent to the page's
+   image loads so each markup is rasterized once per load. The stream keeps
+   the table until it drops its previews, after this commit's loads. */
+static void navigation_lend_preview_svgs(NavigationSession *session,
+                                         const NavigationCommitTxn *txn)
+{
+    const NavigationDocumentStream *stream = txn->streaming;
+    images_lend_preview_rasters(
+        &session->page.images,
+        stream != NULL && stream->preview_svgs.count != 0
+            ? &stream->preview_svgs : NULL);
+}
+
 static TILEFINCH_OUT_OF_LINE bool commit_images(NavigationSession *session,
                                                 NavigationCommitTxn *txn)
 {
@@ -2454,6 +2467,7 @@ static TILEFINCH_OUT_OF_LINE bool commit_images(NavigationSession *session,
         bool image_pipeline_refused = false;
         ImageLayoutBoxes image_scale;
         navigation_lend_image_scale(session, &image_scale);
+        navigation_lend_preview_svgs(session, txn);
         bool priority_loaded = !static_svg_refused
             && (image_priority_count == 0
             || images_load_external_priority_targets(
@@ -2468,6 +2482,7 @@ static TILEFINCH_OUT_OF_LINE bool commit_images(NavigationSession *session,
                 session->resource_timeout_ms,
                 session->page.resource_scheduler,
                 session->browser_session));
+        images_lend_preview_rasters(&session->page.images, NULL);
         navigation_return_image_boxes(session, &image_scale);
         if (!priority_loaded) {
             if (session->page.images.stats.load_cancelled) {
@@ -2540,6 +2555,7 @@ static TILEFINCH_OUT_OF_LINE bool commit_images(NavigationSession *session,
             ImageLayoutBoxes awaiting_layout;
             navigation_lend_image_scale(session, &awaiting_layout);
             awaiting_layout.decode_after_layout = true;
+            navigation_lend_preview_svgs(session, txn);
             bool walked = images_load_external_reusing_layout_styles_deferred(
                 &session->page.document, &session->page.stylesheet,
                 &session->page.images, session->budget,
@@ -2553,6 +2569,7 @@ static TILEFINCH_OUT_OF_LINE bool commit_images(NavigationSession *session,
                 session->browser_session, session->page.layout_reuse,
                 txn->fonts, session->viewport.css_width,
                 defer_mutable_document_images);
+            images_lend_preview_rasters(&session->page.images, NULL);
             navigation_return_image_boxes(session, &awaiting_layout);
             if (!walked) {
                 if (session->page.images.stats.load_cancelled) {
@@ -2581,6 +2598,23 @@ static TILEFINCH_OUT_OF_LINE bool commit_images(NavigationSession *session,
         session->performance.resource_us +=
             navigation_record_resource_slices(
                 session, phase_started, NULL, &session->page.images.stats);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        const ExternalImageStats *svg = &session->page.images.stats;
+        char line[256];
+        snprintf(line, sizeof(line),
+                 "tilefinch-commit-svg: rasterized=%zu reused=%zu "
+                 "preview-shared=%zu "
+                 "serialize=%lluus rasterize=%lluus parse=%lluus "
+                 "nsvg-raster=%lluus cooperate=%lluus",
+                 svg->inline_svg_rasterized, svg->inline_svg_refresh_reused,
+                 svg->inline_svg_preview_reused,
+                 (unsigned long long) svg->inline_svg_serialize_us,
+                 (unsigned long long) svg->inline_svg_rasterize_us,
+                 (unsigned long long) svg->inline_svg_parse_us,
+                 (unsigned long long) svg->inline_svg_raster_us,
+                 (unsigned long long) svg->inline_svg_cooperate_us);
+        tilefinch_platform_log_message(line);
+#endif
     }
     return navigation_commit_checkpoint(
             session, "navigation-images",

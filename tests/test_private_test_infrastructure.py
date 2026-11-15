@@ -137,6 +137,53 @@ class PublicTreeHygiene(unittest.TestCase):
                         ".private-investigations/tests/synthetic.txt"]):
                     self.assertEqual(hygiene.main(), 1)
 
+    def run_reference_scan(self, files):
+        """Return main()'s status and stderr for a synthetic tree whose
+        tracked files are exactly `files` (name -> text)."""
+        with tempfile.TemporaryDirectory(prefix="tf-private-hygiene-") as directory:
+            root = Path(directory)
+            (root / ".gitignore").write_text(
+                "\n".join(sorted(hygiene.IGNORE_RULES)) + "\n", encoding="utf-8")
+            for name, text in files.items():
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                (root / name).write_text(text, encoding="utf-8")
+            errors = io.StringIO()
+            with patch.object(sys, "argv", ["hygiene", str(root)]), \
+                    patch.object(hygiene, "tracked_paths", return_value=[]), \
+                    patch.object(hygiene, "all_tracked_files",
+                                 return_value=sorted(files)), \
+                    contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(errors):
+                return hygiene.main(), errors.getvalue()
+
+    def test_planted_private_references_are_rejected(self):
+        clean = {"docs/GUIDE.md": "Run the release build.\n",
+                 "tests/input-scripts/journey.txt": "# open the menu\n"}
+        self.assertEqual(self.run_reference_scan(clean)[0], 0)
+        planted = (
+            ("docs/GUIDE.md", "See /Users/someone/notes.\n"),
+            ("docs/engineering/TOPIC.md", "Measured in i/work/topic.\n"),
+            ("README.md", "Lives on claude/topic-branch.\n"),
+            ("CHANGELOG.md", "Built from the Main checkout.\n"),
+            ("docs/GUIDE.md", "Use merge-tools/run.sh.\n"),
+            ("tests/input-scripts/journey.txt", "# trace in /private/tmp/x\n"),
+        )
+        for name, text in planted:
+            with self.subTest(name=name, text=text):
+                files = dict(clean)
+                files[name] = "Intro line.\n" + text
+                status, errors = self.run_reference_scan(files)
+                self.assertEqual(status, 1)
+                self.assertIn(f"{name}:2", errors)
+
+    def test_reference_scan_covers_only_docs_and_input_scripts(self):
+        # Source comments and nested fixture data are other gates' business.
+        status, _ = self.run_reference_scan({
+            "scripts/tool.sh": "# from /Users/someone/tool\n",
+            "tests/input-scripts/nested/data.txt": "i/work/x\n",
+        })
+        self.assertEqual(status, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

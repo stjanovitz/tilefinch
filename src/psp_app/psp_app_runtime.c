@@ -27,6 +27,16 @@ PspLifecycle psp_lifecycle;
    The supervisor also presents pages but has no VFPU thread context. */
 static atomic_int psp_present_vfpu_owner;
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
+static bool psp_snapshot_vfpu_copy_enabled = true;
+static unsigned psp_snapshot_vfpu_copies;
+unsigned psp_snapshot_validation_vfpu_copies(void)
+{
+    return psp_snapshot_vfpu_copies;
+}
+void psp_snapshot_validation_vfpu_copy(bool enabled)
+{
+    psp_snapshot_vfpu_copy_enabled = enabled;
+}
 /* On, as in shipping builds; copy-vfpu-off selects the scalar copy for an
    A/B run, and copy-vfpu-check compares each copy (a mismatch turns the
    VFPU copy off). */
@@ -50,6 +60,29 @@ void psp_present_validation_vfpu_copy_counts(
 }
 
 #endif
+
+bool psp_platform_copy_pixel_rows(
+    void *context, unsigned char *destination, size_t destination_stride,
+    const unsigned char *source, size_t source_stride,
+    size_t row_bytes, size_t rows)
+{
+    (void) context;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    if (!psp_snapshot_vfpu_copy_enabled) return false;
+#endif
+    if (sceKernelGetThreadId() != atomic_load_explicit(
+            &psp_present_vfpu_owner, memory_order_relaxed)) return false;
+    if ((((uintptr_t)destination | (uintptr_t)source
+          | destination_stride | source_stride) & 15u) != 0u
+        || row_bytes % 64u != 0u) return false;
+    PspDisplayRowCopyResult copied = psp_display_copy_pixel_rows(
+        destination, destination_stride, source, source_stride,
+        row_bytes, rows, true);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    if (copied == PSP_DISPLAY_ROW_COPY_VFPU) psp_snapshot_vfpu_copies++;
+#endif
+    return copied != PSP_DISPLAY_ROW_COPY_REFUSED;
+}
 
 /* GE-direct canvas publication (canvas_ge_presenter.h, psp_canvas_ge.h).
    The engine pointer only identifies whose RAM frame a present is handed. */

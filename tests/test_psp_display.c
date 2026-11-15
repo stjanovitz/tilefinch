@@ -741,9 +741,46 @@ static bool test_player_pacing_credit_follows_success_not_format(void)
     return true;
 }
 
+static bool test_pixel_copy_preserves_padding_and_refuses_invalid_spans(void)
+{
+    _Alignas(16) unsigned char source[512], destination[640];
+    for (size_t i = 0; i < sizeof(source); i++) source[i] = (unsigned char)(i * 197u);
+    for (unsigned offset = 0; offset < 2; offset++) {
+        for (unsigned eligible = 0; eligible < 2; eligible++) {
+            memset(destination, 0xa5, sizeof(destination));
+            CHECK(psp_display_copy_pixel_rows(destination + offset, 160,
+                source + offset, 128, 64, 4, eligible != 0)
+                == PSP_DISPLAY_ROW_COPY_MEMCPY);
+            for (size_t i = 0; i < sizeof(destination); i++) {
+                bool copied = i >= offset && (i - offset) / 160 < 4
+                    && (i - offset) % 160 < 64;
+                CHECK(destination[i] == (copied
+                    ? source[offset + ((i - offset) / 160) * 128
+                              + (i - offset) % 160] : 0xa5));
+            }
+        }
+    }
+    CHECK(psp_display_copy_pixel_rows(NULL, 0, NULL, 0, 0, 4, true)
+          == PSP_DISPLAY_ROW_COPY_MEMCPY);
+    CHECK(psp_display_copy_pixel_rows(NULL, 64, source, 64, 64, 1, true)
+          == PSP_DISPLAY_ROW_COPY_REFUSED);
+    CHECK(psp_display_copy_pixel_rows(destination, 63, source, 64, 64, 1, true)
+          == PSP_DISPLAY_ROW_COPY_REFUSED);
+    CHECK(psp_display_copy_pixel_rows(destination, SIZE_MAX, source, 64, 64, 2, true)
+          == PSP_DISPLAY_ROW_COPY_REFUSED);
+    CHECK(psp_display_copy_pixel_rows(destination, 64, source, SIZE_MAX, 64, 2, true)
+          == PSP_DISPLAY_ROW_COPY_REFUSED);
+    CHECK(psp_display_copy_pixel_rows(source + 1, 64, source, 64, 64, 2, true)
+          == PSP_DISPLAY_ROW_COPY_REFUSED);
+    CHECK(psp_display_copy_pixel_rows(source, 64, source + 1, 64, 64, 2, true)
+          == PSP_DISPLAY_ROW_COPY_REFUSED);
+    return true;
+}
+
 int main(void)
 {
-    bool ok = test_player_pacing_credit_follows_success_not_format()
+    bool ok = test_pixel_copy_preserves_padding_and_refuses_invalid_spans()
+        && test_player_pacing_credit_follows_success_not_format()
         && test_row_copy_preserves_pixels_padding_and_display_state()
         && test_serviced_publication_keeps_rotation_behind_the_latch()
         && test_row_copy_refuses_invalid_or_overlapping_bands()

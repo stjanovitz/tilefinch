@@ -1745,6 +1745,13 @@ void script_runtime_lazy_function_counts(const ScriptRuntime *runtime,
 /* Result of the most recently completed top-level evaluation slice. This is
    an O(1), allocation-free telemetry read used by admission tuning. */
 bool script_runtime_last_slice_interrupted(const ScriptRuntime *runtime);
+/* Whether the last script evaluation to return (an inline script, an
+   external classic or module script, a lazy webpack registration) failed
+   at the script's own exception: a throw, or a SyntaxError, that the window
+   error event reported. False for a success and for the browser's own
+   failures: out of memory, a watchdog interrupt, a compile admission
+   refusal, an engine failure. */
+bool script_runtime_last_script_author_error(const ScriptRuntime *runtime);
 /* Inline bootstraps can expand DOM-embedded state independently of source
    length. This returns the bounded reserve selected from the configured heap
    ceiling; it never changes that ceiling. */
@@ -2022,6 +2029,15 @@ bool script_runtime_dynamic_script_is_scheduled(
    later clone copies the flag. Never allocates state. */
 void script_runtime_script_mark_started(ScriptRuntime *runtime,
                                         const lxb_dom_node_t *node);
+/* The whole-document script loader (a page committed whole, not streamed)
+   runs the parser-blocking `script`: until the matching end, the realm's
+   document.write() keeps its markup instead of appending it to the body.
+   End returns that markup, NUL-terminated and Budget-allocated (the caller
+   frees it), or NULL when the script wrote nothing. */
+void script_runtime_whole_document_write_begin(ScriptRuntime *runtime,
+                                               const lxb_dom_node_t *script);
+char *script_runtime_whole_document_write_end(ScriptRuntime *runtime,
+                                              size_t *length);
 /* HTML's parser-inserted flag for CSP 'strict-dynamic': false only for a
    script element the realm created (createElement, cloned from one). */
 bool script_runtime_script_parser_inserted(
@@ -2149,7 +2165,11 @@ typedef enum {
     SCRIPT_MODULE_MAP_MISSING = 0,
     SCRIPT_MODULE_MAP_LOADING,
     SCRIPT_MODULE_MAP_EVALUATED,
-    SCRIPT_MODULE_MAP_FAILED
+    /* Not fetched, or refused by the browser: elements get `error`. */
+    SCRIPT_MODULE_MAP_FAILED,
+    /* Its graph failed to parse, or it threw while it ran, and the window
+       error event reported it: elements get `load`. */
+    SCRIPT_MODULE_MAP_ERRORED
 } ScriptModuleMapStatus;
 /* A module-map entry is keyed by its resolved request URL. Settled entries
    are reusable by later <script type=module> elements without another

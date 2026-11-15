@@ -1747,7 +1747,11 @@ static bool test_outline_only_embedded_strikes(bool require_decoder_absent)
             digest = (digest ^ glyph.pixels[i]) * UINT64_C(1099511628211);
         font_glyph_destroy(&face, &glyph);
     }
-    printf("outline-strike digest=%016llx\n", (unsigned long long)digest);
+    /* The 129 sizes' metrics and pixels; the same with or without the
+       embedded-bitmap decoder (see --outline-strike-control in main()). */
+    if (digest != UINT64_C(0x55d9f849e672057f))
+        fprintf(stderr, "outline-strike digest=%016llx\n", (unsigned long long)digest);
+    CHECK(digest == UINT64_C(0x55d9f849e672057f));
     font_face_destroy(&face);
     CHECK(budget.current == 0);
     /* A bitmap-only face was not a supported page font before this trim. */
@@ -2498,6 +2502,11 @@ static bool test_packed_font_storage(void)
 int main(int argc, char **argv)
 {
 #if defined(TILEFINCH_TEST_HAVE_FREETYPE) && defined(TILEFINCH_TEST_WOFF2)
+    /* Manual control, not registered with CTest: it fails in every checked-in
+       build, because FreeType is patched to drop its embedded-bitmap decoder
+       (patches/freetype-2.14.3-outline-only-sbit.patch). Run it against a
+       build without that patch to check that the decoder decodes the planted
+       strike and that the outline digest is the same as without it. */
     if (argc == 2 && strcmp(argv[1], "--outline-strike-control") == 0)
         return test_outline_only_embedded_strikes(false) ? 0 : 1;
     if (argc == 2 && strcmp(argv[1], "--outline-strike-only") == 0)

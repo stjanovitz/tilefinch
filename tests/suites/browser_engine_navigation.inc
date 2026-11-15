@@ -188,7 +188,8 @@ static int test_animated_canvas_follows_transactional_page_move(void)
    body grows even without scripts, whose checkpoints used to be the only
    retry; a header-only preview is repainted once real content arrives, and
    the first-present time stays that of the first paint. */
-static int test_provisional_preview_retries_and_refreshes(bool focus_decoration)
+static int test_provisional_preview_retries_and_refreshes(
+    bool focus_decoration, bool night)
 {
     BrowserDeviceProfile profile;
     browser_device_profile_psp3000(&profile);
@@ -211,6 +212,10 @@ static int test_provisional_preview_retries_and_refreshes(bool focus_decoration)
         "h1::after{content:'#';position:absolute;visibility:hidden}";
     if (focus_decoration)
         CHECK(browser_engine_set_user_css(engine, preview_css, sizeof(preview_css)-1));
+    /* At night the rule is judged as authored (one row, no contrast) and
+       is still rejected: a frame flat before the night transform stays
+       declined. */
+    if (night) CHECK(browser_engine_set_forced_dark(engine, true));
     ProvisionalPresentProbe present_probe = {0};
     TilefinchPlatformServices present_services = {
         .context = &present_probe,
@@ -1352,11 +1357,15 @@ typedef struct {
     bool hint_after_press;
     bool hint_after_load;
     unsigned pressed;
+    /* The committed page's inline SVG rasters: drawn by its own load, and
+       shared from the preview's table. */
+    size_t page_svg_rasterized;
+    size_t page_svg_preview_shared;
 } ReaderScreenRun;
 
 static int run_reader_screen_load(const char *fixture, bool keyed,
                                  const char *url, unsigned page_downs,
-                                 ReaderScreenRun *run)
+                                 bool night, ReaderScreenRun *run)
 {
     memset(run, 0, sizeof(*run));
     BrowserDeviceProfile profile;
@@ -1373,6 +1382,7 @@ static int run_reader_screen_load(const char *fixture, bool keyed,
     BrowserEngine *engine = browser_engine_create(
         &config, error, sizeof(error));
     CHECK(engine != NULL);
+    if (night) CHECK(browser_engine_set_forced_dark(engine, true));
     ProvisionalPresentProbe present_probe = {0};
     TilefinchPlatformServices present_services = {
         .context = &present_probe,
@@ -1426,6 +1436,10 @@ static int run_reader_screen_load(const char *fixture, bool keyed,
     run->hint_after_load = browser_engine_provisional_viewport(engine, &after)
         && after.reading_hint;
     run->status = status;
+    run->page_svg_rasterized =
+        navigation->page.images.stats.inline_svg_rasterized;
+    run->page_svg_preview_shared =
+        navigation->page.images.stats.inline_svg_preview_reused;
     (void) browser_engine_navigation_job_metrics(engine, &run->job);
     fetch_trace_end();
     tilefinch_platform_set_services(NULL);
@@ -1444,7 +1458,8 @@ static void report_reader_screen_run(const char *label,
     fprintf(stderr,
             "reader-screen %s status=%d previewed=%d hint=%d/%d/%d "
             "pressed=%u first-present=%llu first-content=%llu "
-            "first-text=%llu hint-us=%llu/%llu elapsed=%llu paints=%zu\n",
+            "first-text=%llu hint-us=%llu/%llu elapsed=%llu paints=%zu "
+            "page-svg=%zu/%zu\n",
             label, (int) run->status, run->previewed, run->hinted_at_first,
             run->hint_after_press, run->hint_after_load, run->pressed,
             (unsigned long long) run->job.provisional_first_present_us,
@@ -1453,52 +1468,219 @@ static void report_reader_screen_run(const char *label,
             (unsigned long long) run->job.reading_hint_shown_us,
             (unsigned long long) run->job.reading_hint_cleared_us,
             (unsigned long long) run->job.elapsed_us,
-            run->job.provisional_paints);
+            run->job.provisional_paints, run->page_svg_rasterized,
+            run->page_svg_preview_shared);
 }
 
 /* bbc.com/news's first screen (fixtures/http-preview-slot-screens
-   /masthead): an inline-SVG logo slot that is not rasterized yet over a
-   grey band, the first text at y=309. The preview paints, but the reader's
-   screen holds nothing to read: first-present counts that frame,
-   first-content and first-text must not, and the preview offers the
-   reading hint until a page press, or the load's end, takes it away. */
+   /masthead): an inline-SVG logo in a fixed slot over a grey band, the
+   first text at y=309. The first preview frame comes before the logo is
+   rasterized and offers the reading hint; the logo needs no network, so
+   it is rasterized into the preview on screen, well before the load ends,
+   and the screen then holds content (never text). The committed page shares
+   that raster rather than drawing the logo again. A page press reaches the
+   first headline, still before the load ends. */
 static int test_reader_screen_masthead(void)
 {
     const char *fixture =
         TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-preview-slot-screens";
     const char *url = "https://preview-slots.test/masthead";
     ReaderScreenRun idle, paged;
-    CHECK(run_reader_screen_load(fixture, true, url, 0, &idle) == 0);
+    CHECK(run_reader_screen_load(fixture, true, url, 0, false, &idle) == 0);
     bool idle_ok = idle.status == BROWSER_NAVIGATION_JOB_SUCCEEDED
-        && idle.previewed && idle.hinted_at_first && !idle.hint_after_load
+        && idle.previewed && !idle.hint_after_load
+        && idle.job.provisional_paints >= 2
         && idle.job.provisional_first_present_us != 0
         && idle.job.reading_hint_shown_us
                == idle.job.provisional_first_present_us
-        /* Not cleared before the load ended: nothing on the screen. */
-        && idle.job.reading_hint_cleared_us == idle.job.elapsed_us
-        /* The committed first screen has the logo, never text. */
-        && idle.job.first_content_us == idle.job.elapsed_us
+        /* The logo: content in the preview, before the load's end. */
         && idle.job.first_content_us > idle.job.provisional_first_present_us
-        && idle.job.first_text_us == 0;
+        && idle.job.first_content_us < idle.job.elapsed_us
+        && idle.job.reading_hint_cleared_us == idle.job.first_content_us
+        && idle.job.first_text_us == 0
+        && idle.page_svg_preview_shared == 1
+        && idle.page_svg_rasterized == 0;
     if (!idle_ok) report_reader_screen_run("idle", &idle);
     CHECK(idle_ok);
 
-    CHECK(run_reader_screen_load(fixture, true, url, 1, &paged) == 0);
+    CHECK(run_reader_screen_load(fixture, true, url, 1, false, &paged) == 0);
     bool paged_ok = paged.status == BROWSER_NAVIGATION_JOB_SUCCEEDED
-        && paged.previewed && paged.hinted_at_first && paged.pressed == 1
+        && paged.previewed && paged.pressed == 1
         && !paged.hint_after_press && !paged.hint_after_load
-        && paged.job.reading_hint_shown_us != 0
-        && paged.job.reading_hint_cleared_us
-               >= paged.job.reading_hint_shown_us
-        && paged.job.reading_hint_cleared_us < paged.job.elapsed_us
+        && paged.job.first_content_us > paged.job.provisional_first_present_us
+        && paged.job.first_content_us < paged.job.elapsed_us
         /* The paged screen holds the first headline, before the load
-           ends; first-present stays the blank first frame's. */
+           ends; first-present stays the first frame's. */
         && paged.job.first_text_us != 0
-        && paged.job.first_text_us > paged.job.provisional_first_present_us
-        && paged.job.first_text_us < paged.job.elapsed_us
-        && paged.job.first_content_us == paged.job.first_text_us;
+        && paged.job.first_text_us > paged.job.first_content_us
+        && paged.job.first_text_us < paged.job.elapsed_us;
     if (!paged_ok) report_reader_screen_run("paged", &paged);
     CHECK(paged_ok);
+    return 0;
+}
+
+/* The same masthead at night. The night transform maps its white header
+   and light grey band to one dark colour, so the first frame, before the
+   logo, is flat; the page as authored has contrast, so it is still
+   presented (it used to be declined until the load ended). */
+static int test_reader_screen_masthead_night(void)
+{
+    ReaderScreenRun night;
+    CHECK(run_reader_screen_load(
+              TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-preview-slot-screens",
+              true, "https://preview-slots.test/masthead", 0, true,
+              &night) == 0);
+    bool ok = night.status == BROWSER_NAVIGATION_JOB_SUCCEEDED
+        && night.previewed && !night.hint_after_load
+        && night.job.provisional_first_present_us != 0
+        && night.job.reading_hint_shown_us
+               == night.job.provisional_first_present_us
+        && night.job.first_content_us > night.job.provisional_first_present_us
+        && night.job.first_content_us < night.job.elapsed_us
+        && night.job.first_text_us == 0
+        && night.page_svg_preview_shared == 1
+        && night.page_svg_rasterized == 0;
+    if (!ok) report_reader_screen_run("night", &night);
+    CHECK(ok);
+    return 0;
+}
+
+/* Pumps the engine's pending navigation until it ends, or `pumps`
+   times when that is not zero; returns the last status. */
+static BrowserNavigationJobStatus masthead_share_pump(
+    BrowserEngine *engine, size_t pumps)
+{
+    BrowserNavigationJobQuota quota = {
+        .load = {
+            .fetch = {
+                .maximum_body_bytes = 64,
+                .maximum_body_callbacks = 1,
+                .maximum_time_us = 10000
+            },
+            .maximum_parser_body_bytes = 64,
+            .maximum_parser_time_us = 10000,
+            .maximum_finalize_work_units = 8,
+            .maximum_finalize_time_us = 1000
+        }
+    };
+    BrowserNavigationJobStatus status = BROWSER_NAVIGATION_JOB_PENDING;
+    for (size_t pump = 0; status == BROWSER_NAVIGATION_JOB_PENDING
+         && pump < (pumps != 0 ? pumps : 4096); pump++)
+        status = browser_engine_pump_navigation(engine, &quota);
+    return status;
+}
+
+/* The committed masthead page holds the logo raster it shares with the
+   loading preview: its pixels and its one SVG entry. */
+static bool masthead_share_page_logo(const NavigationSession *navigation)
+{
+    const ImageResources *images = &navigation->page.images;
+    for (size_t i = 0; i < images->count; i++) {
+        const ImageResource *item = &images->items[i];
+        if (document_node_is_tag(item->node, LXB_TAG_SVG))
+            return item->pixels != NULL && item->owns_pixels
+                && item->shared_svg_raster && item->pixel_body != NULL
+                && item->pixel_body->data == item->pixels
+                && item->pixel_body->references == 1;
+    }
+    return false;
+}
+
+/* The shared logo raster across the ways a load ends: a load cancelled at
+   every step of the way (before the preview drew the logo, after, and
+   inside the commit's image load), the committed page then replaced by
+   another and restored with Back, all ending with nothing left in the
+   budget. */
+static int test_reader_screen_masthead_share_lifetimes(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 16u * MIB;
+    config.session_cache_limit = 256u * 1024u;
+    config.maximum_document_bytes = 1u * MIB;
+    config.tile_capacity = 4;
+    config.resources.enabled = true;
+    config.javascript.enabled = false;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(
+        &config, error, sizeof(error));
+    CHECK(engine != NULL);
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    navigation_set_stream_delivery(navigation, 64, 0, 0, 0, 0, 0);
+    CHECK(fetch_trace_replay_begin_response_keyed(
+        TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-preview-slot-screens",
+        error, sizeof(error)));
+    const char *masthead = "https://preview-slots.test/masthead";
+    /* A load cancelled after each number of pumps, until one finishes
+       first; the cancelled loads leave the previous page (none, then the
+       committed masthead) as it was. */
+    size_t cancelled = 0;
+    bool finished = false, committed = false, intact = true;
+    for (size_t pumps = 1; pumps < 4096 && !finished; pumps++) {
+        CHECK(browser_engine_begin_navigation_url(
+            engine, masthead, 256u * 1024u, 1000, true));
+        BrowserNavigationJobStatus status =
+            masthead_share_pump(engine, pumps);
+        if (status == BROWSER_NAVIGATION_JOB_PENDING) {
+            browser_engine_cancel_navigation(engine, "test cancel");
+            cancelled++;
+            intact = intact
+                && (!committed || masthead_share_page_logo(navigation));
+            continue;
+        }
+        finished = status == BROWSER_NAVIGATION_JOB_SUCCEEDED;
+        committed = finished;
+    }
+    bool first_shared = finished
+        && navigation->page.images.stats.inline_svg_preview_reused == 1
+        && navigation->page.images.stats.inline_svg_rasterized == 0
+        && masthead_share_page_logo(navigation);
+    /* Cancel each step of a second load over the committed page. */
+    size_t over_page = 0;
+    bool second_finished = false;
+    for (size_t pumps = 1; finished && pumps < 4096 && !second_finished;
+         pumps++) {
+        CHECK(browser_engine_begin_navigation_url(
+            engine, masthead, 256u * 1024u, 1000, true));
+        if (masthead_share_pump(engine, pumps)
+                == BROWSER_NAVIGATION_JOB_PENDING) {
+            browser_engine_cancel_navigation(engine, "test cancel");
+            over_page++;
+            intact = intact && masthead_share_page_logo(navigation);
+        } else {
+            second_finished = true;
+        }
+    }
+    /* Another page replaces it; Back restores it, sharing again. */
+    bool replaced = second_finished
+        && browser_engine_begin_navigation_url(
+               engine, "https://preview-slots.test/pixel", 256u * 1024u,
+               1000, true)
+        && masthead_share_pump(engine, 0) == BROWSER_NAVIGATION_JOB_SUCCEEDED;
+    bool restored = replaced
+        && browser_engine_begin_navigation_history(
+               engine, false, 256u * 1024u, 1000)
+        && masthead_share_pump(engine, 0) == BROWSER_NAVIGATION_JOB_SUCCEEDED
+        && masthead_share_page_logo(navigation);
+    bool ok = finished && first_shared && cancelled != 0 && intact
+        && second_finished && over_page != 0 && replaced && restored;
+    if (!ok)
+        fprintf(stderr, "masthead-share finished=%d shared=%d cancelled=%zu "
+                "intact=%d second=%d over-page=%zu replaced=%d "
+                "restored=%d page-svg=%zu/%zu\n", finished, first_shared,
+                cancelled, intact, second_finished, over_page, replaced,
+                restored, navigation->page.images.stats.inline_svg_rasterized,
+                navigation->page.images.stats.inline_svg_preview_reused);
+    fetch_trace_end();
+    CHECK(browser_engine_shutdown(engine));
+    BrowserEngineMetrics metrics = {0};
+    CHECK(browser_engine_metrics(engine, &metrics)
+          && metrics.budget_current == 0
+          && metrics.budget_active_allocations == 0);
+    browser_engine_destroy(engine);
+    CHECK(ok);
     return 0;
 }
 
@@ -1510,7 +1692,8 @@ static int test_reader_screen_text_first(void)
     ReaderScreenRun run;
     CHECK(run_reader_screen_load(
               TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-stream-preview",
-              false, "https://stream-preview.test/document", 0, &run) == 0);
+              false, "https://stream-preview.test/document", 0, false,
+              &run) == 0);
     bool ok = run.status == BROWSER_NAVIGATION_JOB_SUCCEEDED
         && run.previewed && !run.hinted_at_first && !run.hint_after_load
         && run.job.reading_hint_shown_us == 0

@@ -1329,12 +1329,17 @@ static bool test_oversized_resource_loader_envelope_is_segmented(
         "globalThis.pocSummary='unrecognized:pending';";
     static const char append_invalid[] =
         "globalThis.segmentEvents=[];"
+        "onerror=(m,f,l,c,e)=>{segmentEvents.push(e instanceof SyntaxError"
+        "?'syntax':'other');return true};"
         "const invalid=document.createElement('script');"
         "invalid.src='/invalid.js';"
+        /* A SyntaxError in any segment is the whole script's: no segment
+           runs, the window error event reports it, and (as for any
+           script that failed to parse) the element then gets `load`. */
         "invalid.addEventListener('load',()=>{"
-        "globalThis.pocSummary='invalid:load';});"
+        "globalThis.pocSummary='invalid:load:'+segmentEvents.join(',');});"
         "invalid.addEventListener('error',()=>{"
-        "globalThis.pocSummary='invalid:error:'+segmentEvents.join(',');});"
+        "globalThis.pocSummary='invalid:error';});"
         "document.head.appendChild(invalid);"
         "globalThis.pocSummary='invalid:pending';";
     char *recognized = make_resource_loader_envelope(250u);
@@ -1417,7 +1422,7 @@ static bool test_oversized_resource_loader_envelope_is_segmented(
     REQUIRE(evaluate(&navigation, append_invalid, "<append-invalid-envelope>"));
     size_t invalid_advances = 0;
     REQUIRE(advance_until(
-        &navigation, "invalid:error:", 16, &invalid_advances));
+        &navigation, "invalid:load:syntax", 16, &invalid_advances));
     REQUIRE(invalid_advances > 1u);
     REQUIRE(navigation.page.script_result.dynamic_scripts_failed == 1u);
 

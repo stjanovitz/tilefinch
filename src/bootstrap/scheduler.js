@@ -1,4 +1,10 @@
 (() => {
+  const Object = __tilefinchObject;
+  /* Bound before author code runs: what this module converts, collects
+     and throws with stays the realm's own when a page replaces the
+     global. */
+  const { String, Number, Map, Set, Error, TypeError, RangeError,
+    DOMException } = globalThis;
   /* See dom.js: the timer clock mirror is written on the first pump, which
      is well after hardening.js has taken its snapshot. */
   Object.defineProperty(__tilefinchRealmGlobal, "__tilefinchNow", {
@@ -13,7 +19,36 @@
     createMessageEvent = __tilefinchRealmGlobal.__tilefinchCreateMessageEvent,
     diagnosticString = String,
     diagnosticOwnDescriptor = Object.getOwnPropertyDescriptor,
-    timerApply = Reflect.apply;
+    timerApply = Reflect.apply,
+    /* MessagePort's handler attributes register through these, never
+       through a page's patched EventTarget.prototype methods. */
+    trustedAddListener = Function.call.bind(
+      EventTarget.prototype.addEventListener),
+    trustedRemoveListener = Function.call.bind(
+      EventTarget.prototype.removeEventListener),
+    /* The browser's own delivery (input, pointer capture, scroll,
+       BroadcastChannel) dispatches with the methods targets inherit before
+       author code runs, as in browsers: a page's replacement of
+       dispatchEvent sees only its own calls. */
+    dispatchTarget = Function.call.bind(EventTarget.prototype.dispatchEvent),
+    dispatchDocument = document.dispatchEvent,
+    dispatchNode =
+      __tilefinchRealmGlobal.__tilefinchTrustedEventShare.dispatchNode,
+    isNode = Function.call.bind(Object.prototype.isPrototypeOf, Node.prototype),
+    browserDispatch = (target, event) => target === document
+      ? dispatchDocument(event)
+      : isNode(target) ? dispatchNode(target, event)
+        : dispatchTarget(target, event),
+    /* Input focuses, unfocuses and activates with the steps themselves,
+       never a page's replacement of focus(), blur() or click(). */
+    isElement = Function.call.bind(Object.prototype.isPrototypeOf,
+      Element.prototype),
+    focusSteps = Element.prototype.focus,
+    blurSteps = Element.prototype.blur,
+    clickSteps = HTMLElement.prototype.click,
+    focusElement = (target) => {
+      if (isElement(target)) timerApply(focusSteps, target, []);
+    };
   /* Native memory the event loop reads every turn instead of calling into
      JS (ScriptRuntime.host_state; slot order is ScriptHostStateSlot). */
   const hostState = __tilefinchRealmGlobal.__tilefinchHostChannel.state,
@@ -340,10 +375,13 @@
       blockedDrains.delete(endpoint);
       return true;
     };
+    /* After every retired timer: no page-patchable Set iterator. */
+    const drainsForEach = Function.call.bind(Set.prototype.forEach);
     retryMessageDrains = () => {
-      for (const endpoint of blockedDrains) {
-        if (!scheduleEndpointDrain(endpoint)) break;
-      }
+      let blocked = false;
+      drainsForEach(blockedDrains, (endpoint) => {
+        if (!blocked && !scheduleEndpointDrain(endpoint)) blocked = true;
+      });
     };
     class MessagePort extends EventTarget {
       constructor(key, owner, endpoint = null) {
@@ -377,9 +415,9 @@
       set onmessage(callback) {
         const next = typeof callback === "function" ? callback : null;
         if (this._onmessage === null && next !== null)
-          super.addEventListener("message", this._onmessageListener);
+          trustedAddListener(this, "message", this._onmessageListener);
         else if (this._onmessage !== null && next === null)
-          super.removeEventListener("message", this._onmessageListener);
+          trustedRemoveListener(this, "message", this._onmessageListener);
         this._onmessage = next;
         if (this._onmessage) this.start();
       }
@@ -389,11 +427,11 @@
       set onmessageerror(callback) {
         const next = typeof callback === "function" ? callback : null;
         if (this._onmessageerror === null && next !== null)
-          super.addEventListener(
-            "messageerror", this._onmessageerrorListener);
+          trustedAddListener(
+            this, "messageerror", this._onmessageerrorListener);
         else if (this._onmessageerror !== null && next === null)
-          super.removeEventListener(
-            "messageerror", this._onmessageerrorListener);
+          trustedRemoveListener(
+            this, "messageerror", this._onmessageerrorListener);
         this._onmessageerror = next;
       }
       start() {
@@ -410,10 +448,10 @@
           blockedDrains.delete(this._endpoint);
         }
         if (this._onmessage !== null)
-          super.removeEventListener("message", this._onmessageListener);
+          trustedRemoveListener(this, "message", this._onmessageListener);
         if (this._onmessageerror !== null)
-          super.removeEventListener(
-            "messageerror", this._onmessageerrorListener);
+          trustedRemoveListener(
+            this, "messageerror", this._onmessageerrorListener);
         this._onmessage = null;
         this._onmessageerror = null;
         this._owner.closed++;
@@ -498,10 +536,10 @@
             port._peer = null;
             port._closed = true;
             if (port._onmessage !== null)
-              EventTarget.prototype.removeEventListener.call(
+              trustedRemoveListener(
                 port, "message", port._onmessageListener);
             if (port._onmessageerror !== null)
-              EventTarget.prototype.removeEventListener.call(
+              trustedRemoveListener(
                 port, "messageerror", port._onmessageerrorListener);
             port._onmessage = null;
             port._onmessageerror = null;
@@ -512,7 +550,17 @@
     });
   }
   {
+    /* Delivery reads no page-patchable collection method or global. */
     const channels = new Map(),
+      cloneMessage = structuredClone,
+      channelGet = Function.call.bind(Map.prototype.get),
+      channelSet = Function.call.bind(Map.prototype.set),
+      channelDelete = Function.call.bind(Map.prototype.delete),
+      groupAdd = Function.call.bind(Set.prototype.add),
+      groupDelete = Function.call.bind(Set.prototype.delete),
+      groupForEach = Function.call.bind(Set.prototype.forEach),
+      groupSize = Function.call.bind(
+        Object.getOwnPropertyDescriptor(Set.prototype, "size").get),
       channelLimit = 32,
       nameLimit = 256;
     let channelCount = 0;
@@ -536,12 +584,12 @@
         this.__closed = false;
         this.onmessage = null;
         this.onmessageerror = null;
-        let group = channels.get(name);
+        let group = channelGet(channels, name);
         if (!group) {
           group = new Set();
-          channels.set(name, group);
+          channelSet(channels, name, group);
         }
-        group.add(this);
+        groupAdd(group, this);
         channelCount++;
       }
       get name() {
@@ -555,12 +603,14 @@
           );
         if (arguments.length === 0)
           throw new TypeError("Broadcast message required");
-        const group = channels.get(this.__name);
+        const group = channelGet(channels, this.__name);
         if (!group) return;
-        const message = structuredClone(value);
-        for (const target of group) {
+        const message = cloneMessage(value), targets = [];
+        groupForEach(group, (target) => { targets[targets.length] = target; });
+        for (let at = 0; at < targets.length; at++) {
+          const target = targets[at];
           if (target === this || target.__closed) continue;
-          const data = structuredClone(message);
+          const data = cloneMessage(message);
           if (
             !schedule(
               () => {
@@ -579,7 +629,7 @@
                   } catch (error) {
                     __tilefinchReportUncaught(error, "broadcast channel");
                   }
-                target.dispatchEvent(event);
+                dispatchTarget(target, event);
               },
               0,
               false,
@@ -596,9 +646,11 @@
       close() {
         if (this.__closed) return;
         this.__closed = true;
-        const group = channels.get(this.__name);
-        group?.delete(this);
-        if (group?.size === 0) channels.delete(this.__name);
+        const group = channelGet(channels, this.__name);
+        if (group) {
+          groupDelete(group, this);
+          if (groupSize(group) === 0) channelDelete(channels, this.__name);
+        }
         channelCount--;
       }
     }
@@ -641,6 +693,23 @@
   const cancelIdleCallback = (handle) => clear(handle);
   __tilefinchRealmGlobal.requestIdleCallback = requestIdleCallback;
   __tilefinchRealmGlobal.cancelIdleCallback = cancelIdleCallback;
+  const deliverViewportEvent = (viewport, event) => {
+    const type = String(event.type);
+    dispatchTarget(viewport, event);
+    const handler = viewport["on" + type];
+    if (typeof handler === "function")
+      try {
+        __tilefinchRealmGlobal.__tilefinchRunTask(
+          "visual-viewport-handler:" + type,
+          handler,
+          viewport,
+          [event],
+        );
+      } catch (error) {
+        __tilefinchReportUncaught(error, "visualViewport " + type);
+      }
+    return !event.defaultPrevented;
+  };
   {
     const viewport = {
       width: innerWidth,
@@ -655,27 +724,15 @@
       onresize: null,
       onscroll: null,
       dispatchEvent(event) {
-        const type = String(event.type);
-        EventTarget.prototype.dispatchEvent.call(viewport, event);
-        const handler = viewport["on" + type];
-        if (typeof handler === "function")
-          try {
-            __tilefinchRealmGlobal.__tilefinchRunTask(
-              "visual-viewport-handler:" + type,
-              handler,
-              viewport,
-              [event],
-            );
-          } catch (error) {
-            __tilefinchReportUncaught(error, "visualViewport " + type);
-          }
-        return !event.defaultPrevented;
+        return deliverViewportEvent(viewport, event);
       },
     };
     Object.setPrototypeOf(viewport, EventTarget.prototype);
     __tilefinchRealmGlobal.visualViewport = viewport;
   }
   {
+    /* The page can replace the global and the viewport's own methods. */
+    const viewport = __tilefinchRealmGlobal.visualViewport;
     let pageTop = 0,
       pending = false,
       smoothGeneration = 0;
@@ -684,7 +741,7 @@
       const next = Math.max(0, Math.min(2147483647, Number(value) || 0));
       if (next === pageTop) return false;
       pageTop = next;
-      visualViewport.pageTop = next;
+      viewport.pageTop = next;
       if (notify) {
         pending = true;
         hostState[HOST_SCROLL_PENDING] = 1;
@@ -729,9 +786,8 @@
       hostState[HOST_SCROLL_PENDING] = 0;
       /* Viewport scrolling targets Document and bubbles to Window. Dispatching
          directly on Window skips document listeners used by sticky controls. */
-      document.dispatchEvent(
-        trusted(newEvent("scroll", { bubbles: true })));
-      visualViewport.dispatchEvent(trusted(newEvent("scroll")));
+      dispatchDocument(trusted(newEvent("scroll", { bubbles: true })));
+      deliverViewportEvent(viewport, trusted(newEvent("scroll")));
       return true;
     };
     const scrollTo = (xOrOptions = undefined, y = undefined) => {
@@ -947,15 +1003,11 @@
         : document,
       name = String(type);
     if (!target) return false;
-    if (name === "focus" && typeof target.focus === "function") {
-      target.focus();
+    if ((name === "focus" || name === "blur") && isElement(target)) {
+      timerApply(name === "focus" ? focusSteps : blurSteps, target, []);
       return true;
     }
-    if (name === "blur" && typeof target.blur === "function") {
-      target.blur();
-      return true;
-    }
-    return target.dispatchEvent(tilefinchEvent(name));
+    return browserDispatch(target, tilefinchEvent(name));
   };
   __tilefinchRealmGlobal.__tilefinchDispatchHandle = (handle, type) => {
     const name = String(type);
@@ -967,30 +1019,26 @@
       return true;
     const target = trustedWrap(Number(handle));
     if (!target) return false;
-    if (name === "focus" && typeof target.focus === "function") {
-      target.focus();
+    if ((name === "focus" || name === "blur") && isElement(target)) {
+      timerApply(name === "focus" ? focusSteps : blurSteps, target, []);
       return true;
     }
-    if (name === "blur" && typeof target.blur === "function") {
-      target.blur();
-      return true;
-    }
-    return target.dispatchEvent(tilefinchEvent(name));
+    return browserDispatch(target, tilefinchEvent(name));
   };
   __tilefinchRealmGlobal.__tilefinchLabelDefault = (target, native = false) => {
     if (!(target instanceof HTMLLabelElement)) return false;
     const control = target.control;
     if (!control || control.disabled) return false;
-    control.focus?.();
+    focusElement(control);
     if (!native) {
-      control.click();
+      timerApply(clickSteps, control, []);
       return true;
     }
     const state =
         __tilefinchRealmGlobal.__tilefinchBeginControlDefault?.(control, true) || null,
       clickEvent = tilefinchEvent("click");
     clickEvent.__tilefinchControlDefaultPrepared = true;
-    const accepted = control.dispatchEvent(clickEvent);
+    const accepted = browserDispatch(control, clickEvent);
     __tilefinchRealmGlobal.__tilefinchFinishControlDefault?.(state, accepted);
     return true;
   };
@@ -1004,16 +1052,15 @@
       throw new DOMException("Unknown pointer", "NotFoundError");
     if (pointerCaptureTarget === this) return;
     if (pointerCaptureTarget)
-      pointerCaptureTarget.dispatchEvent(
-        tilefinchEvent("lostpointercapture", { pointerId: 1 }),
-      );
+      browserDispatch(pointerCaptureTarget,
+        tilefinchEvent("lostpointercapture", { pointerId: 1 }));
     pointerCaptureTarget = this;
-    this.dispatchEvent(tilefinchEvent("gotpointercapture", { pointerId: 1 }));
+    browserDispatch(this, tilefinchEvent("gotpointercapture", { pointerId: 1 }));
   };
   Element.prototype.releasePointerCapture = function releasePointerCapture(pointerId) {
     if (Number(pointerId) !== 1 || pointerCaptureTarget !== this) return;
     pointerCaptureTarget = null;
-    this.dispatchEvent(tilefinchEvent("lostpointercapture", { pointerId: 1 }));
+    browserDispatch(this, tilefinchEvent("lostpointercapture", { pointerId: 1 }));
   };
   Element.prototype.hasPointerCapture = function hasPointerCapture(pointerId) {
     return Number(pointerId) === 1 && pointerCaptureTarget === this;
@@ -1037,9 +1084,8 @@
     )
       shared++;
     const fire = (target, name, relatedTarget) =>
-      target.dispatchEvent(
-        tilefinchEvent(name, { ...point, relatedTarget }),
-      );
+      browserDispatch(target,
+        tilefinchEvent(name, { ...point, relatedTarget }));
     let accepted = true;
     if (previous) accepted = fire(previous, "pointerout", next) && accepted;
     for (let at = 0; at < previousPath.length - shared; at++)
@@ -1112,7 +1158,7 @@
         pressure: buttons ? 0.5 : 0,
       };
     }
-    const fire = (name) => target.dispatchEvent(tilefinchEvent(name, point));
+    const fire = (name) => browserDispatch(target, tilefinchEvent(name, point));
     if (phase === 1) {
       const hoverAccepted =
         target === pointerHoverTarget ||
@@ -1140,12 +1186,7 @@
     if (phase === 2) {
       const pointerAccepted = fire("pointerdown"),
         mouseAccepted = fire("mousedown");
-      if (
-        pointerAccepted &&
-        mouseAccepted &&
-        typeof target.focus === "function"
-      )
-        target.focus();
+      if (pointerAccepted && mouseAccepted) focusElement(target);
       return pointerAccepted && mouseAccepted;
     }
     if (phase === 3) {
@@ -1154,9 +1195,8 @@
       if (pointerCaptureTarget) {
         const captured = pointerCaptureTarget;
         pointerCaptureTarget = null;
-        captured.dispatchEvent(
-          tilefinchEvent("lostpointercapture", { pointerId: 1 }),
-        );
+        browserDispatch(captured,
+          tilefinchEvent("lostpointercapture", { pointerId: 1 }));
       }
       return pointerAccepted && mouseAccepted;
     }
@@ -1165,9 +1205,8 @@
       if (pointerCaptureTarget) {
         const captured = pointerCaptureTarget;
         pointerCaptureTarget = null;
-        captured.dispatchEvent(
-          tilefinchEvent("lostpointercapture", { pointerId: 1 }),
-        );
+        browserDispatch(captured,
+          tilefinchEvent("lostpointercapture", { pointerId: 1 }));
       }
       return accepted;
     }
@@ -1179,7 +1218,7 @@
       let accepted = false,
         completed = false;
       try {
-        accepted = target.dispatchEvent(clickEvent);
+        accepted = browserDispatch(target, clickEvent);
         completed = true;
         if (
           accepted &&
@@ -1206,13 +1245,12 @@
        empty pointerType; low-level pointer/mouse events are reserved for the
        actual pointer path above. */
     if (phase === 0) {
-      if (typeof target.focus === "function") target.focus();
+      focusElement(target);
       return clickDefault();
     }
     const pointerAccepted = fire("pointerdown"),
       mouseAccepted = fire("mousedown");
-    if (pointerAccepted && mouseAccepted && typeof target.focus === "function")
-      target.focus();
+    if (pointerAccepted && mouseAccepted) focusElement(target);
     fire("pointerup");
     fire("mouseup");
     return clickDefault();
@@ -1236,9 +1274,9 @@
         data !== null && String(data) !== "") {
       const text = createBootstrapEvent.call(document, "TextEvent");
       text.initTextEvent("textInput", true, true, __tilefinchRealmGlobal, String(data));
-      if (!target.dispatchEvent(trusted(text))) return false;
+      if (!browserDispatch(target, trusted(text))) return false;
     }
-    return target.dispatchEvent(
+    return browserDispatch(target,
       trusted(
         newEvent(name, {
           bubbles: true,
@@ -1255,7 +1293,7 @@
     if (!form) return false;
     if (!form.noValidate && !submitter?.formNoValidate && !form.checkValidity())
       return false;
-    const proceed = form.dispatchEvent(
+    const proceed = browserDispatch(form,
       trusted(
         newEvent("submit", {
           bubbles: true,

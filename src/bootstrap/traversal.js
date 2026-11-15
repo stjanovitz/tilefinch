@@ -3,9 +3,16 @@
    Document.prototype.createTreeWalker/createNodeIterator, so pages that never
    walk the tree pay nothing for it at bootstrap. */
 (() => {
+  /* Loaded after the page may have replaced these globals: build
+     errors, promises and platform objects with the constructors
+     hardening.js captured. */
+  const { Error, TypeError, DOMException, WeakMap, WeakRef } =
+    globalThis.__tilefinchEventInterfaces;
   const wrap = globalThis.__tilefinchWrap,
     __tilefinchTraverse = globalThis.__tilefinchTraverse,
-    nativeDescendants = globalThis.__tilefinchDescendants;
+    nativeDescendants = globalThis.__tilefinchDescendants,
+    /* Loaded after the page may have replaced the global. */
+    { Document, Node } = globalThis.__tilefinchEventInterfaces;
   if (typeof wrap !== "function" || typeof __tilefinchTraverse !== "function")
     throw new Error("DOM traversal bridge is unavailable");
   /* Both walkers are live: every step starts from the current DOM, so

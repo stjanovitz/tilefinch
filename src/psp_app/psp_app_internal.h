@@ -481,6 +481,14 @@ bool psp_request_policy_clock(
 bool psp_platform_present(
     void *context, const uint16_t *pixels, size_t width,
     size_t height, size_t stride_pixels);
+bool psp_platform_copy_pixel_rows(
+    void *context, unsigned char *destination, size_t destination_stride,
+    const unsigned char *source, size_t source_stride,
+    size_t row_bytes, size_t rows);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+void psp_snapshot_validation_vfpu_copy(bool enabled);
+unsigned psp_snapshot_validation_vfpu_copies(void);
+#endif
 void psp_show_page_script_clock(PspUiState *ui, const BrowserEngine *engine);
 /* The engine's cooperate_at service: BOUNDARY is the checkpoint's
    TilefinchCooperateBoundary flags; PHASE names it for the log only. */

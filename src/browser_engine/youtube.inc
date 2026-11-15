@@ -183,7 +183,8 @@ static bool browser_engine_youtube_notice_paint(BrowserEngine *engine,
             uint32_t text_length = first_text ? (uint32_t) strlen(label) : 0u;
             int width = first_text ? box->width : 0;
             int x = box->x;
-            if (first_text && tilefinch_ui_translation_bound_language() == TILEFINCH_UI_LANGUAGE_ARABIC) {
+            if (first_text && tilefinch_ui_language_right_to_left(
+                    tilefinch_ui_translation_bound_language())) {
                 const FontFace *face = font_context_face(layout->fonts,
                     layout->web_fonts, draw_command_font_family(command));
                 int fixed = font_text_width_at_size_fixed(face, text, text_length,

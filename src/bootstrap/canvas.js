@@ -1,4 +1,16 @@
 (() => {
+  /* Loaded after the page may have replaced these globals: build
+     errors, promises and platform objects with the constructors
+     hardening.js captured. */
+  const { defineProperty, TypeError, RangeError, DOMException, Promise, Map,
+    WeakMap, Array, ArrayBuffer, Uint8Array, Uint8ClampedArray, Float32Array,
+    Float64Array, Blob, TextEncoder, claimHooks } =
+    globalThis.__tilefinchEventInterfaces;
+  /* Private hooks other modules call, reserved by hardening.js: this
+     module's publisher, claimed before any page code can run (a realm
+     without reserved hooks takes plain globals). */
+  const publish = claimHooks?.()
+    || ((name, value) => { globalThis[name] = value; });
   /* Origin-clean authority, and every pixel that is not origin-clean, is
      native (DomBridge.canvas_taints). The host installs these bridges only
      while this module is evaluated: capture them before anything else runs,
@@ -15,6 +27,9 @@
   delete globalThis.__tilefinchCanvasRasterPattern;
   delete globalThis.__tilefinchCanvasOriginClean;
   delete globalThis.__tilefinchCanvasPngChecksum;
+  /* Loaded after the page may have replaced the global: add members to,
+     and recognise canvases by, the interface hardening.js captured. */
+  const { HTMLCanvasElement } = globalThis.__tilefinchEventInterfaces;
   /* A canvas is origin-clean only while both the bootstrap's flag and the
      native registry agree. Tainting is one-way (HTML keeps the flag false
      across a bitmap reset) and moves the canvas's pixels into a native
@@ -3304,7 +3319,7 @@
       );
     }, 0);
   };
-  globalThis.__tilefinchCanvasAttributeChanged = (node, name) => {
+  publish("__tilefinchCanvasAttributeChanged", (node, name) => {
     if (
       node instanceof HTMLCanvasElement &&
       (name === "width" || name === "height")
@@ -3320,17 +3335,17 @@
         }
       }
     }
-  };
-  globalThis.__tilefinchCanvasDimension = (node, name) => {
+  });
+  publish("__tilefinchCanvasDimension", (node, name) => {
     const size = dimensions(node);
     return name === "width" ? size.width : size.height;
-  };
-  globalThis.__tilefinchSetCanvasDimension = (node, name, value) =>
-    node.setAttribute(name, String(Number(value) >>> 0));
-  globalThis.__tilefinchFlushCanvasSurfaces = flushCanvasSurfaces;
+  });
+  publish("__tilefinchSetCanvasDimension", (node, name, value) =>
+    node.setAttribute(name, String(Number(value) >>> 0)));
+  publish("__tilefinchFlushCanvasSurfaces", flushCanvasSurfaces);
   /* webgl.js's texImage2D(canvas) source. It is page-callable, so it hands
      out a copy of an origin-clean canvas only, never the live state. */
-  globalThis.__tilefinchCanvasReadbackState = (canvas) => {
+  publish("__tilefinchCanvasReadbackState", (canvas) => {
     if (!(canvas instanceof HTMLCanvasElement)) return null;
     const state = canvasReadbackState(canvas);
     if (!state || state.originClean === false ||
@@ -3338,16 +3353,17 @@
     return { width: state.width, height: state.height,
       pixels: state.pixels ? state.pixels.slice().buffer : null,
       originClean: true };
-  };
+  });
   /* Batching counters for host tests (test-probe realms only). */
   if (globalThis.__tilefinchTestProbes)
-    Object.defineProperty(globalThis, "__tilefinchCanvasDiagnostics", {
+    defineProperty(globalThis, "__tilefinchCanvasDiagnostics", {
+      __proto__: null,
       configurable: false,
       enumerable: false,
       value: canvasDiagnostics,
       writable: false,
     });
-  globalThis.__tilefinchCanvasConnected = (root) => {
+  publish("__tilefinchCanvasConnected", (root) => {
     /* DOMParser, createHTMLDocument, and ordinary detached construction use
        the same Node wrappers as the live page.  They must remain inert: even
        calling a page-visible querySelectorAll override here is observable and
@@ -3370,7 +3386,7 @@
       const state = states.get(canvas);
       if (state?.dirty) scheduleCanvasCommit(state, state.dirty);
     }
-  };
+  });
   Object.assign(globalThis, {
     CanvasGradient,
     CanvasPattern,

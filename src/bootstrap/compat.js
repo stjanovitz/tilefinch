@@ -1,4 +1,13 @@
 (() => {
+  const Object = __tilefinchObject;
+  /* Bound before author code runs: what this module converts, collects
+     and throws with stays the realm's own when a page replaces the
+     global. DOMException is bound where this module defines it. */
+  const { String, Number, Map, Set, Error, TypeError, RangeError, Node,
+    Document, ShadowRoot, HTMLInputElement, HTMLButtonElement,
+    HTMLSelectElement, HTMLDetailsElement, HTMLSummaryElement, Text, Comment,
+    DocumentType } = globalThis;
+  let DOMException;
   const boundedAncestorPath = globalThis.__tilefinchBoundedAncestorPath,
     ancestorLimit = globalThis.__tilefinchAncestorLimit,
     tilefinchBlobBytes = globalThis.__tilefinchBlobBytes,
@@ -9,6 +18,15 @@
     ).get,
     tilefinchBlobSize = Object.getOwnPropertyDescriptor(Blob.prototype, "size").get,
     trustedFunctionApply = Function.call.bind(Function.prototype.apply),
+    containerEventTarget = EventTarget.prototype,
+    dispatchNode =
+      __tilefinchRealmGlobal.__tilefinchTrustedEventShare.dispatchNode,
+    /* Event handler attributes register through these, never through a
+       page's replacement of the EventTarget methods or global. */
+    trustedAddEventListener = Function.call.bind(
+      EventTarget.prototype.addEventListener),
+    trustedRemoveEventListener = Function.call.bind(
+      EventTarget.prototype.removeEventListener),
     /* Host and validation realms only (see hardening.js). */
     testProbes = !!globalThis.__tilefinchTestProbes,
     TrustedObject = Object,
@@ -157,8 +175,8 @@
     document.exitPointerLock = { exitPointerLock() {} }.exitPointerLock;
   }
   const domShared = globalThis.__tilefinchDomShared,
-    { reflectString, secondaryDocumentPrototype, asciiLower, checkDoctypeName } =
-      domShared;
+    { reflectString, secondaryDocumentPrototype, asciiLower, checkDoctypeName,
+      contextFragment } = domShared;
   delete globalThis.__tilefinchDomShared;
   {
     /* Reflected <meta> attributes. Without the interface, meta.content fell
@@ -1052,12 +1070,18 @@
   const messageEventStates = new WeakMap(),
     messageEventStateGet = messageEventStates.get.bind(messageEventStates),
     messageEventStateSet = messageEventStates.set.bind(messageEventStates),
+    trustedIsArray = Array.isArray,
     messageEventPorts = (ports) => {
       const result = [];
-      if (ports != null)
+      /* The browser's own port lists are arrays, copied by index so a
+         page's array iterator never runs; other iterables are sequences. */
+      if (trustedIsArray(ports))
+        for (let at = 0; at < ports.length && at < 16; at++)
+          result[at] = ports[at];
+      else if (ports != null)
         for (const port of ports) {
           if (result.length >= 16) break;
-          result.push(port);
+          result[result.length] = port;
         }
       return Object.freeze(result);
     },
@@ -1534,7 +1558,7 @@
       (type === "text" || type === "number")
     ) {
       const parent = target.parentNode,
-        offset = Array.from(parent?.childNodes || []).indexOf(target);
+        offset = domShared.listIndex(parent?.childNodes || [], target);
       if (parent && offset >= 0) getSelection().collapse(parent, offset);
     } else if (target.isContentEditable && target.firstChild) {
       getSelection().collapse(target.firstChild, 0);
@@ -1564,7 +1588,7 @@
     const shadow = globalThis.__tilefinchShadowRootForHost?.(this);
     if (shadow?.delegatesFocus) {
       let delegated = null;
-      for (const candidate of Array.from(shadow.querySelectorAll("*")).slice(
+      for (const candidate of __tilefinchArrayFrom(shadow.querySelectorAll("*")).slice(
         0,
         128,
       ))
@@ -1573,7 +1597,7 @@
           break;
         }
       if (delegated && delegated !== this) {
-        delegated.focus();
+        trustedFunctionApply(focusElement, delegated, []);
         return;
       }
     }
@@ -1593,10 +1617,10 @@
       markFocus(this, true);
       return;
     }
+    /* Focus events are the browser's own: never a page's dispatchEvent. */
     const fire = (target, type, options) =>
-      target.dispatchEvent(
-        trustedEvent(browserEvent(FocusEventInterface, type, options)),
-      );
+      dispatchNode(target,
+        trustedEvent(browserEvent(FocusEventInterface, type, options)));
     if (previous && previous !== document.body) {
       markFocus(previous, false);
       globalThis.__tilefinchActiveElement = document.body;
@@ -1613,7 +1637,7 @@
     if (globalThis.__tilefinchActiveElement !== this) return;
     const next = document.body,
       fire = (type, options) =>
-        this.dispatchEvent(
+        dispatchNode(this,
           trustedEvent(browserEvent(FocusEventInterface, type, options)));
     markFocus(this, false);
     fire("blur", { relatedTarget: next });
@@ -1720,7 +1744,7 @@
         const id = this.htmlFor;
         const candidates = id
           ? [document.getElementById(id)]
-          : Array.from(this.querySelectorAll("*"));
+          : __tilefinchArrayFrom(this.querySelectorAll("*"));
         for (const candidate of candidates) {
           if (
             /^(?:button|input|meter|output|progress|select|textarea)$/.test(
@@ -1762,7 +1786,7 @@
   globalThis.__tilefinchBeginControlDefault = (target, native = false) => {
     if (native && target instanceof HTMLSelectElement) {
       /* options is a live HTMLOptionsCollection; take a snapshot. */
-      const options = Array.from(target.options),
+      const options = __tilefinchArrayFrom(target.options),
         states = options.map((option) => [option, option.selected]);
       if (!options.length) return null;
       let next = target.selectedIndex;
@@ -1815,7 +1839,7 @@
     const form = target.closest("form"),
       name = target.name,
       peers = name
-        ? Array.from(document.querySelectorAll("input"))
+        ? __tilefinchArrayFrom(document.querySelectorAll("input"))
             .filter(
               (item) =>
                 item instanceof HTMLInputElement &&
@@ -1903,12 +1927,15 @@
         : !!force;
     return setPopoverState(this, open);
   };
-  globalThis.DOMException = class DOMException extends Error {
+  globalThis.DOMException = DOMException = class DOMException extends Error {
+    /* The browser throws these too: its String and code table, not the
+       page's String or Object.prototype. */
     constructor(message = "", name = "Error") {
-      super(String(message));
-      this.name = String(name);
+      super(TrustedString(message));
+      this.name = TrustedString(name);
       this.code =
         {
+          __proto__: null,
           IndexSizeError: 1,
           HierarchyRequestError: 3,
           WrongDocumentError: 4,
@@ -1934,6 +1961,9 @@
         }[this.name] || 0;
     }
   };
+  /* dom.js, platform.js and custom-elements.js bind it now. */
+  __tilefinchRealmGlobal.__tilefinchTrustedEventShare.defineDOMException(
+    DOMException);
   for (const [name, code] of Object.entries({
     INDEX_SIZE_ERR: 1,
     DOMSTRING_SIZE_ERR: 2,
@@ -1974,7 +2004,8 @@
       parentKind = (node) => Number(node?.nodeType),
       parentOf = (node) =>
         node?.__tilefinchDetachedParent || node?.parentNode || null,
-      childrenOf = (node) => Array.from(node?.childNodes || []),
+      /* By index: a page's patch of the array iterator never runs. */
+      childrenOf = (node) => domShared.listCopy(node?.childNodes || []),
       nativeRootNode = globalThis.__tilefinchRootNode,
       wrapHandle = globalThis.__tilefinchWrap,
       /* Is `node` a host-including inclusive ancestor of `parent`: one native
@@ -2053,15 +2084,18 @@
         );
       const nodeType = parentKind(node);
       if (
-        ![
-          Node.DOCUMENT_FRAGMENT_NODE,
-          Node.DOCUMENT_TYPE_NODE,
-          Node.ELEMENT_NODE,
-          Node.TEXT_NODE,
-          Node.CDATA_SECTION_NODE,
-          Node.PROCESSING_INSTRUCTION_NODE,
-          Node.COMMENT_NODE,
-        ].includes(nodeType)
+        domShared.listIndex(
+          [
+            Node.DOCUMENT_FRAGMENT_NODE,
+            Node.DOCUMENT_TYPE_NODE,
+            Node.ELEMENT_NODE,
+            Node.TEXT_NODE,
+            Node.CDATA_SECTION_NODE,
+            Node.PROCESSING_INSTRUCTION_NODE,
+            Node.COMMENT_NODE,
+          ],
+          nodeType,
+        ) < 0
       )
         throw new DOMException(
           "Node type cannot be inserted",
@@ -2078,11 +2112,13 @@
       /* The shared document check (platform.js), on the children as this
          node and reference see them. */
       if (replacingAll) planDocumentInsert([], node, false, null);
-      else
-        planDocumentInsert(
-          childrenOf(parent).map((item) =>
-            sameNode(item, node) ? node : sameNode(item, child) ? child : item),
-          node, false, child ?? null);
+      else {
+        const children = childrenOf(parent);
+        for (let at = 0; at < children.length; at++)
+          children[at] = sameNode(children[at], node) ? node
+            : sameNode(children[at], child) ? child : children[at];
+        planDocumentInsert(children, node, false, child ?? null);
+      }
       return true;
     };
     globalThis.__tilefinchValidatePreInsert = validatePreInsert;
@@ -2110,21 +2146,30 @@
       if (parent.nodeType === Node.DOCUMENT_NODE) {
         const plan = planDocumentInsert(
           childrenOf(parent), values, true, prepend ? undefined : null);
-        if (Array.isArray(parent.__detachedChildren)) {
-          for (const item of plan.items)
-            rawDetachedInsert(parent, item, plan.before);
+        const { items } = plan;
+        if (trustedIsArray(parent.__detachedChildren)) {
+          for (let at = 0; at < items.length; at++)
+            rawDetachedInsert(parent, items[at], plan.before);
           return;
         }
         /* The page's document takes no new children (platform.js
            replaceChildren): a call that leaves the children as they are,
            such as append(root, root), changes nothing, as in Chromium, and
            any other throws before an argument moves. */
-        const children = childrenOf(parent),
-          after = children.filter((child) => !plan.items.includes(child));
-        after.splice(plan.before ? after.indexOf(plan.before) : after.length, 0,
-          ...plan.items);
-        if (after.some((child, at) => child !== children[at])
-            || after.length !== children.length)
+        const children = childrenOf(parent), after = [];
+        for (let at = 0; at < children.length; at++)
+          if (domShared.listIndex(items, children[at]) < 0)
+            after[after.length] = children[at];
+        const place = plan.before
+            ? domShared.listIndex(after, plan.before) : after.length,
+          /* As splice() takes it: -1 is before the last. */
+          start = place >= 0 ? place : after.length > 0 ? after.length - 1 : 0;
+        let same = after.length + items.length === children.length;
+        for (let at = 0; same && at < children.length; at++)
+          same = children[at] === (at < start ? after[at]
+            : at < start + items.length ? items[at - start]
+            : after[at - items.length]);
+        if (!same)
           throw new DOMException("The document cannot take new children",
             "HierarchyRequestError");
         return;
@@ -2178,6 +2223,7 @@
         prepend: { configurable: true, writable: true, value: prepend },
       });
     }
+    let markupOf = null;
     const detachedTreeConnected = (node) => {
         for (
           let at = node, steps = 0;
@@ -2195,48 +2241,60 @@
         if (!node || node.nodeType === Node.DOCUMENT_NODE) return;
         if ("__detachedOwner" in node) node.__detachedOwner = owner;
         else globalThis.__tilefinchSetNodeOwner(node, owner);
-        for (const child of node.childNodes || []) adoptTreeOwner(child, owner);
+        const children = node.childNodes || [];
+        for (let at = 0; at < children.length; at++)
+          adoptTreeOwner(children[at], owner);
       },
       rawDetachedInsert = (parent, node, child) => {
         if (node === child) return node;
         const values =
-          node.nodeType === Node.DOCUMENT_FRAGMENT_NODE
-            ? childrenOf(node)
-            : [node],
-          removals = values.map((value) => ({
+            node.nodeType === Node.DOCUMENT_FRAGMENT_NODE
+              ? childrenOf(node)
+              : [node],
+          removals = [];
+        for (let at = 0; at < values.length; at++) {
+          const value = values[at];
+          removals[at] = {
             value,
             parent: parentOf(value),
             connected: detachedTreeConnected(value),
             owner: value.ownerDocument || null,
             previousSibling: value.previousSibling,
             nextSibling: value.nextSibling,
-          }));
-        for (const removal of removals)
-          if (removal.connected)
+          };
+        }
+        for (let at = 0; at < removals.length; at++)
+          if (removals[at].connected)
             globalThis.__tilefinchCustomElementDisconnected?.(
-              removal.value,
+              removals[at].value,
             );
-        for (const value of values) {
-          const old = parentOf(value);
-          if (Array.isArray(old?.__detachedChildren)) {
-            const oldAt = old.__detachedChildren.indexOf(value);
-            if (oldAt >= 0) old.__detachedChildren.splice(oldAt, 1);
+        for (let at = 0; at < values.length; at++) {
+          const value = values[at],
+            old = parentOf(value);
+          if (trustedIsArray(old?.__detachedChildren)) {
+            const list = old.__detachedChildren;
+            domShared.listDrop(list, domShared.listIndex(list, value));
           }
           if (value.__detachedParent !== undefined)
             value.__detachedParent = null;
           value.__tilefinchDetachedParent = null;
         }
-        let at =
-          child === null || child === undefined
-            ? parent.__detachedChildren.length
-            : parent.__detachedChildren.indexOf(child);
+        const list = parent.__detachedChildren,
+          at =
+            child === null || child === undefined
+              ? list.length
+              : domShared.listIndex(list, child);
         if (at < 0)
           throw new DOMException(
             "Reference node is not a child",
             "NotFoundError",
           );
-        parent.__detachedChildren.splice(at, 0, ...values);
-        for (const value of values) {
+        for (let move = list.length - 1; move >= at; move--)
+          list[move + values.length] = list[move];
+        for (let index = 0; index < values.length; index++)
+          list[at + index] = values[index];
+        for (let index = 0; index < values.length; index++) {
+          const value = values[index];
           if (value.__detachedParent !== undefined)
             value.__detachedParent = parent;
           value.__tilefinchDetachedParent = parent;
@@ -2247,7 +2305,7 @@
               : parent.ownerDocument,
           );
           const nextOwner = value.ownerDocument || null,
-            removal = removals.find((item) => item.value === value);
+            removal = removals[index];
           if (removal?.owner && nextOwner && removal.owner !== nextOwner) {
             globalThis.__tilefinchPrepareCustomElementAdoptionTree?.(
               value,
@@ -2264,23 +2322,23 @@
             value.__tilefinchDetachedRemove = value.remove;
           value.remove = function () {
             const owner = parentOf(this);
-            if (Array.isArray(owner?.__detachedChildren))
+            if (trustedIsArray(owner?.__detachedChildren))
               owner.removeChild(this);
             else if (typeof this.__tilefinchDetachedRemove === "function")
               this.__tilefinchDetachedRemove.call(this);
           };
         }
-        for (const removal of removals)
-          if (removal.parent)
+        for (let index = 0; index < removals.length; index++)
+          if (removals[index].parent)
             globalThis.__tilefinchNotifyMutation?.(
-              removal.parent,
+              removals[index].parent,
               "childList",
               null,
               [],
-              [removal.value],
+              [removals[index].value],
               null,
-              removal.previousSibling,
-              removal.nextSibling,
+              removals[index].previousSibling,
+              removals[index].nextSibling,
             );
         if (values.length)
           globalThis.__tilefinchNotifyMutation?.(
@@ -2294,22 +2352,50 @@
             values[values.length - 1].nextSibling,
           );
         if (detachedTreeConnected(parent))
-          for (const value of values)
-            globalThis.__tilefinchCustomElementConnected?.(value, true);
+          for (let index = 0; index < values.length; index++)
+            globalThis.__tilefinchCustomElementConnected?.(values[index], true);
+        return node;
+      },
+      /* Script-side nodes have no native serializer: serialize.js walks
+         them (HTML for an HTML document's nodes, XML otherwise). Loading it
+         through the XMLSerializer accessor captured here survives a page
+         that replaced the global. */
+      loadMarkup = Object.getOwnPropertyDescriptor(globalThis,
+                                                   "XMLSerializer")?.get,
+      detachedMarkup = (node, self) => {
+        if (!markupOf) {
+          loadMarkup?.call(globalThis);
+          markupOf = globalThis.__tilefinchMarkup;
+          delete globalThis.__tilefinchMarkup;
+        }
+        return markupOf(node,
+                        (node.ownerDocument || node).contentType !== "text/html",
+                        self);
+      },
+      markupAccessor = (node) => {
+        if (node.nodeType === Node.ELEMENT_NODE)
+          Object.defineProperty(node, "innerHTML", {
+            configurable: true,
+            get() {
+              return detachedMarkup(this, false);
+            },
+            set: Object.getOwnPropertyDescriptor(node, "innerHTML")?.set,
+          });
         return node;
       },
       installContainer = (container) => {
+        markupAccessor(container);
         Object.defineProperties(container, {
           addEventListener: {
             configurable: true,
             writable: true,
+            /* As in browsers, EventTarget's methods read when called, so a
+               page's patch of them (zone.js) still sees the call; the
+               prototype itself and the call are taken before author code. */
             value: function addEventListener(type, callback, options = false) {
-              return EventTarget.prototype.addEventListener.call(
-                this,
-                type,
-                callback,
-                options,
-              );
+              return trustedFunctionApply(
+                containerEventTarget.addEventListener,
+                this, [type, callback, options]);
             },
           },
           removeEventListener: {
@@ -2320,12 +2406,9 @@
               callback,
               options = false,
             ) {
-              return EventTarget.prototype.removeEventListener.call(
-                this,
-                type,
-                callback,
-                options,
-              );
+              return trustedFunctionApply(
+                containerEventTarget.removeEventListener,
+                this, [type, callback, options]);
             },
           },
           dispatchEvent: {
@@ -2402,29 +2485,28 @@
                   ? planDocumentInsert(childrenOf(this), values, true, null).items
                   : null,
                 owner = this.ownerDocument || this,
-                nodes = values.map((value) =>
-                  value instanceof Node
-                    ? value
-                    : owner.createTextNode(String(value)),
-                ),
-                insertion =
-                  nodes.length === 1
-                    ? nodes[0]
-                    : owner.createDocumentFragment(),
+                nodes = [],
                 moves = [];
-              for (const node of nodes) {
-                const candidates =
-                  node.nodeType === Node.DOCUMENT_FRAGMENT_NODE
-                    ? [...node.childNodes]
-                    : [node];
-                for (const candidate of candidates)
+              /* By index: no page patch of the Array methods or iterator. */
+              for (let at = 0; at < values.length; at++)
+                nodes[at] = values[at] instanceof Node ? values[at]
+                  : owner.createTextNode(String(values[at]));
+              const insertion =
+                nodes.length === 1 ? nodes[0] : owner.createDocumentFragment();
+              for (let at = 0; at < nodes.length; at++) {
+                const node = nodes[at],
+                  candidates = node.nodeType === Node.DOCUMENT_FRAGMENT_NODE
+                    ? childrenOf(node) : [node];
+                for (let n = 0; n < candidates.length; n++) {
+                  const candidate = candidates[n];
                   if (candidate.parentNode)
-                    moves.push({
+                    moves[moves.length] = {
                       node: candidate,
                       parent: candidate.parentNode,
                       previousSibling: candidate.previousSibling,
                       nextSibling: candidate.nextSibling,
-                    });
+                    };
+                }
               }
               if (!items) validatePreInsert(this, insertion, null, true);
               globalThis.__tilefinchMutationSuppressed =
@@ -2432,16 +2514,20 @@
               let removed;
               try {
                 if (!items && nodes.length !== 1)
-                  for (const node of nodes) insertion.appendChild(node);
-                removed = [...this.childNodes];
-                for (const child of removed) this.removeChild(child);
+                  for (let at = 0; at < nodes.length; at++)
+                    insertion.appendChild(nodes[at]);
+                removed = childrenOf(this);
+                for (let at = 0; at < removed.length; at++)
+                  this.removeChild(removed[at]);
                 if (items)
-                  for (const item of items) rawDetachedInsert(this, item, null);
+                  for (let at = 0; at < items.length; at++)
+                    rawDetachedInsert(this, items[at], null);
                 else if (nodes.length) this.appendChild(insertion);
               } finally {
                 globalThis.__tilefinchMutationSuppressed--;
               }
-              for (const move of moves)
+              for (let at = 0; at < moves.length; at++) {
+                const move = moves[at];
                 globalThis.__tilefinchNotifyMutation?.(
                   move.parent,
                   "childList",
@@ -2452,6 +2538,7 @@
                   move.previousSibling,
                   move.nextSibling,
                 );
+              }
               if (removed.length || nodes.length)
                 globalThis.__tilefinchNotifyMutation?.(
                   this,
@@ -2471,10 +2558,10 @@
               const previousSibling = node.previousSibling,
                 nextSibling = node.nextSibling,
                 connected = detachedTreeConnected(node),
-                at = this.__detachedChildren.indexOf(node);
+                at = domShared.listIndex(this.__detachedChildren, node);
               if (connected)
                 globalThis.__tilefinchCustomElementDisconnected?.(node);
-              this.__detachedChildren.splice(at, 1);
+              domShared.listDrop(this.__detachedChildren, at);
               if (node.__detachedParent !== undefined)
                 node.__detachedParent = null;
               node.__tilefinchDetachedParent = null;
@@ -2562,7 +2649,7 @@
             const p = this.__detachedParent;
             if (!p) return null;
             return (
-              p.__detachedChildren[p.__detachedChildren.indexOf(this) + 1] ||
+              p.__detachedChildren[domShared.listIndex(p.__detachedChildren, this) + 1] ||
               null
             );
           },
@@ -2572,7 +2659,7 @@
             const p = this.__detachedParent;
             if (!p) return null;
             return (
-              p.__detachedChildren[p.__detachedChildren.indexOf(this) - 1] ||
+              p.__detachedChildren[domShared.listIndex(p.__detachedChildren, this) - 1] ||
               null
             );
           },
@@ -2614,14 +2701,17 @@
               writable: true,
               value: parent,
             });
-          if (Array.isArray(node?.__detachedChildren)) {
+          if (trustedIsArray(node?.__detachedChildren)) {
             installContainer(node);
           }
-          for (const child of childrenOf(node)) upgrade(child, node);
+          const children = childrenOf(node);
+          for (let at = 0; at < children.length; at++)
+            upgrade(children[at], node);
           return node;
         };
         installContainer(doc);
-        for (const child of childrenOf(doc)) upgrade(child, doc);
+        const children = childrenOf(doc);
+        for (let at = 0; at < children.length; at++) upgrade(children[at], doc);
         const originalCreateElement = doc.createElement,
           originalCreateElementNS = doc.createElementNS,
           originalCreateFragment = doc.createDocumentFragment;
@@ -2643,13 +2733,30 @@
         Object.defineProperty(doc, "doctype", {
           configurable: true,
           get() {
-            return (
-              this.__detachedChildren.find(
-                (node) => node.nodeType === Node.DOCUMENT_TYPE_NODE,
-              ) || null
+            return domShared.listOfType(
+              this.__detachedChildren,
+              Node.DOCUMENT_TYPE_NODE,
+              true,
             );
           },
         });
+        return doc;
+      };
+    /* An empty frame's document keeps its own tree code; its elements get
+       the innerHTML getter only. */
+    const originalFrameDocument = globalThis.__tilefinchCreateFrameDocument;
+    if (typeof originalFrameDocument === "function")
+      globalThis.__tilefinchCreateFrameDocument = (standards) => {
+        const doc = originalFrameDocument(standards),
+          { createElement, createElementNS } = doc,
+          walk = (node) => {
+            markupAccessor(node);
+            for (const child of node.__detachedChildren || []) walk(child);
+          };
+        walk(doc);
+        doc.createElement = (tag) => markupAccessor(createElement(tag));
+        doc.createElementNS = (namespace, tag) =>
+          markupAccessor(createElementNS(namespace, tag));
         return doc;
       };
     const originalNewDocument = globalThis.__tilefinchNewDocument;
@@ -2706,6 +2813,8 @@
         defineProperties: Object.defineProperties,
         arrayFrom: Array.from,
         planDocumentInsert,
+        listIndex: domShared.listIndex,
+        listCopy: domShared.listCopy,
       },
       ensureDocumentsBootstrap = globalThis.__tilefinchEnsureDocumentsBootstrap;
     let documentBuilder = null;
@@ -2743,24 +2852,23 @@
       nativeDocuments().createNativeHTMLDocument(title);
     Object.defineProperty(Element.prototype, "outerHTML", Object.getOwnPropertyDescriptor({
       get outerHTML() {
+        if (this.__handle === undefined && this.__detachedChildren)
+          return detachedMarkup(this, true);
         const container = (
           this.__handle !== undefined ? document : this.ownerDocument || document
         ).createElement("div");
         container.appendChild(this.cloneNode(true));
         return container.innerHTML;
       },
+      /* The parent is the parser's context (domShared.contextFragment). */
       set outerHTML(value) {
         const parent = this.parentNode;
         if (!parent) return;
-        const owner =
-            this.__handle !== undefined
-              ? document
-              : this.ownerDocument || document,
-          container = owner.createElement("div");
-        container.innerHTML = String(value);
-        const added = [...container.childNodes],
-          fragment = owner.createDocumentFragment();
-        for (const node of added) fragment.appendChild(node);
+        if (parent.nodeType === Node.DOCUMENT_NODE)
+          throw new DOMException("The element's parent is a document",
+            "NoModificationAllowedError");
+        const fragment = contextFragment(parent, String(value), this),
+          added = [...fragment.childNodes];
         const previousSibling = this.previousSibling,
           nextSibling = this.nextSibling;
         globalThis.__tilefinchMutationSuppressed =
@@ -2988,7 +3096,9 @@
           try { algorithm(); } catch (error) {
             __tilefinchReportUncaught(error, "AbortSignal algorithm");
           }
-        current.dispatchEvent(browserEvent(EventInterface, "abort"));
+        /* EventTarget's own dispatch, never a page's replacement. */
+        trustedFunctionApply(fileReaderDispatch, current,
+          [browserEvent(EventInterface, "abort")]);
         current = next;
       }
     };
@@ -3033,9 +3143,9 @@
       const state = abortSignalState(this);
       const next = typeof callback === "function" ? callback : null;
       if (state.onabort === null && next !== null)
-        super.addEventListener("abort", state.onabortListener);
+        trustedAddEventListener(this, "abort", state.onabortListener);
       else if (state.onabort !== null && next === null)
-        super.removeEventListener("abort", state.onabortListener);
+        trustedRemoveEventListener(this, "abort", state.onabortListener);
       state.onabort = next;
     }
     throwIfAborted() {
@@ -5664,9 +5774,9 @@
         if (typeof active === "function") return active.call(this, event);
       };
       state.handlerListeners.set(type, listener);
-      EventTarget.prototype.addEventListener.call(target, type, listener);
+      trustedAddEventListener(target, type, listener);
     } else if (!callback && wrapper) {
-      EventTarget.prototype.removeEventListener.call(target, type, wrapper);
+      trustedRemoveEventListener(target, type, wrapper);
       state.handlerListeners.delete(type);
     }
   };
@@ -6622,9 +6732,11 @@ storage-access window-management ";
     get onchange() { return permissionStatusState(this).onchange; }
     set onchange(value) {
       const state = permissionStatusState(this);
-      if (state.onchange) this.removeEventListener("change", state.onchange);
+      if (state.onchange)
+        trustedRemoveEventListener(this, "change", state.onchange);
       state.onchange = typeof value === "function" ? value : null;
-      if (state.onchange) this.addEventListener("change", state.onchange);
+      if (state.onchange)
+        trustedAddEventListener(this, "change", state.onchange);
     }
   }
   class Permissions {

@@ -30,7 +30,9 @@ runtime assets or immutable engine data.
   MIT text satisfies either alternative.
 - **NanoSVG**, commit `239e102ec2c691f2902e20ace2ed36ee4a35cfe6`: zlib
   License. The build uses its parser and rasterizer with budget-allocation
-  hooks.
+  hooks. Local patches under `patches/` bound hostile geometry, read short
+  numbers in single precision, skip rows the rasterizer draws nothing on,
+  and keep a style declaration that ends its text from reading past it.
 - **libwebp 1.6.0**: BSD-3-Clause-style license plus Google's additional
   patent grant. Tilefinch links only the static decode library, with encoders,
   tools, animation helpers, SIMD, and threading disabled. Decode output is a

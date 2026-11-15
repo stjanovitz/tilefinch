@@ -219,7 +219,7 @@ try{
         script = r'''
 const fs=require('fs'),vm=require('vm'),path=require('path');
 const source=fs.readFileSync(path.join(path.dirname(process.argv[1]),'../src/bootstrap/intl.js'),'utf8');
-const engine=vm.createContext({});vm.runInContext('Intl=undefined;'+source,engine);
+const engine=vm.createContext({});vm.runInContext('globalThis.__tilefinchEventInterfaces=Object.freeze({__proto__:null,TypeError,RangeError,WeakMap,Array,Date});Intl=undefined;'+source,engine);
 const native=Intl.NumberFormat;
 const capture=require(process.argv[1]);
 globalThis.location={href:'https://parts.test/'};globalThis.top=globalThis;
@@ -1660,7 +1660,7 @@ capture.installReplayEnvironment({
 const instant = 1700000000042;
 const fs = require('node:fs'), vm = require('node:vm'), path = require('node:path');
 const engine = vm.createContext({});
-vm.runInContext('__tilefinchDefaultTimeZone=Intl.DateTimeFormat().resolvedOptions().timeZone; Intl = undefined;' + fs.readFileSync(
+vm.runInContext('globalThis.__tilefinchEventInterfaces=Object.freeze({__proto__:null,TypeError,RangeError,WeakMap,Array,Date});__tilefinchDefaultTimeZone=Intl.DateTimeFormat().resolvedOptions().timeZone; Intl = undefined;' + fs.readFileSync(
   path.join(path.dirname(process.argv[1]), '../src/bootstrap/intl.js'), 'utf8'), engine);
 function segmentState(Constructor) {
   return ['grapheme', 'word', 'sentence'].flatMap(granularity =>

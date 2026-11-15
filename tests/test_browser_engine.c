@@ -349,7 +349,11 @@ int main(int argc, char **argv)
         return test_scroll_noop_reports_unchanged();
     if (argc == 2 && strcmp(argv[1], "--reader-screen-only") == 0) {
         CHECK(test_reader_screen_masthead() == 0);
+        CHECK(test_reader_screen_masthead_night() == 0);
+        CHECK(test_reader_screen_masthead_share_lifetimes() == 0);
         CHECK(test_reader_screen_text_first() == 0);
+        CHECK(test_provisional_preview_retries_and_refreshes(false, true)
+              == 0);
         return 0;
     }
     if (argc == 2 && strcmp(argv[1], "--grid-columns-only") == 0)
@@ -680,9 +684,12 @@ int main(int argc, char **argv)
     CHECK(test_animated_canvas_follows_transactional_page_move() == 0);
     CHECK(test_scrollable_provisional_navigation() == 0);
     CHECK(test_reader_screen_masthead() == 0);
+    CHECK(test_reader_screen_masthead_night() == 0);
+    CHECK(test_reader_screen_masthead_share_lifetimes() == 0);
     CHECK(test_reader_screen_text_first() == 0);
-    CHECK(test_provisional_preview_retries_and_refreshes(false) == 0);
-    CHECK(test_provisional_preview_retries_and_refreshes(true) == 0);
+    CHECK(test_provisional_preview_retries_and_refreshes(false, false) == 0);
+    CHECK(test_provisional_preview_retries_and_refreshes(true, false) == 0);
+    CHECK(test_provisional_preview_retries_and_refreshes(false, true) == 0);
     CHECK(test_provisional_preview_empty_backoff() == 0);
     CHECK(test_large_static_page_commits_provisionally() == 0);
     CHECK(test_scroll_noop_reports_unchanged() == 0);

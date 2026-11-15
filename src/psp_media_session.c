@@ -220,8 +220,28 @@ static bool psp_media_rotation_supported(const PspMediaSession *media)
         && media->frame.height <= PSP_MEDIA_PRESENT_ROTATION_MAX_HEIGHT;
 }
 
+static void psp_media_raise_error_shown(
+    PspMediaSession *media, const char *message, const char *reason,
+    const char *shown_cause);
+
 void psp_media_raise_error(
     PspMediaSession *media, const char *message, const char *reason)
+{
+    psp_media_raise_error_shown(media, message, reason, NULL);
+}
+
+void psp_media_raise_coded_error(
+    PspMediaSession *media, const char *message, const char *cause,
+    const char *code)
+{
+    char shown[PSP_UI_STATUS_CAPACITY];
+    snprintf(shown, sizeof(shown), "%s\n%s", cause, code);
+    psp_media_raise_error_shown(media, message, code, shown);
+}
+
+static void psp_media_raise_error_shown(
+    PspMediaSession *media, const char *message, const char *reason,
+    const char *shown_cause)
 {
     if (media == NULL) return;
     bool was_failed = media->ui.failed;
@@ -230,7 +250,8 @@ void psp_media_raise_error(
        cannot play, a 4xx answer) is shown as a short catalog headline with
        the cause on the details line. The log below keeps the engine text. */
     MediaFailureMessage friendly;
-    const char *shown = message, *shown_reason = reason;
+    const char *shown = message, *shown_reason =
+        shown_cause != NULL ? shown_cause : reason;
     if (reason == NULL && media_failure_message(message, &friendly)) {
         shown = media->audio_only
             ? media_failure_audio_headline(friendly.kind) : friendly.headline;
@@ -621,7 +642,8 @@ static bool psp_media_present_audio_view(PspMediaSession *media)
 const char *psp_media_resolving_title(const PspMediaSession *media,
                                       const char *video_title)
 {
-    if (media == NULL || !media->audio_only) return video_title;
+    if (media == NULL || !media->audio_only)
+        return tilefinch_ui_text(video_title);
     if (media->stream.title[0] != '\0') return media->stream.title;
     if (media->audio_station[0] != '\0') return media->audio_station;
     if (media->page_media_label[0] != '\0') return media->page_media_label;
@@ -4323,8 +4345,9 @@ bool psp_media_advance(
                      media->decode_no_progress_ms);
         }
         psp_media_retire_first_frame(media);
-        psp_media_raise_error(
-            media, "VIDEO DECODER MADE NO PROGRESS", stalled_reason);
+        psp_media_raise_coded_error(
+            media, "VIDEO DECODER MADE NO PROGRESS",
+            "Retry, or restart Tilefinch", stalled_reason);
         printf("tilefinch-media: bounded decoder stalled for %ums "
                "calls=%zu yielded=%zu packets=%zu would-block=%zu "
                "refilling=%d state=%d audio-hold=%d/%d floor=%lluus "
@@ -4417,9 +4440,11 @@ bool psp_media_advance(
             media->ui.playing = false;
             media->decode_job_pending = false;
             psp_media_retire_first_frame(media);
-            psp_media_raise_error(
+            psp_media_raise_coded_error(
                 media, psp_media_first_output_timeout_headline(
-                           media->audio_only), reason);
+                           media->audio_only),
+                network ? "Check Wi-Fi, then press X to retry"
+                        : "Retry, or restart Tilefinch", reason);
             return true;
         }
     }

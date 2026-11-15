@@ -7,7 +7,22 @@ const __tilefinchRealmGlobal = this;
    Register on first use
    so unused observers do not add eager closures to small startup heaps. */
 const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
+/* Object as it is before author code: its statics (create, defineProperty
+   and the rest) copied onto a frozen function that calls the realm's own
+   Object. Each eager module binds its `Object` to it first thing, so a page
+   that replaces Object.create or another static never reaches the
+   bootstrap. Array.from and Array.isArray likewise. */
+const __tilefinchObject = (() => {
+    const copy = (value) => Object(value), keys = Reflect.ownKeys(Object);
+    for (let at = 0; at < keys.length; at++)
+      if (keys[at] !== "length" && keys[at] !== "name")
+        Reflect.defineProperty(copy, keys[at], { value: Object[keys[at]] });
+    return Object.freeze(copy);
+  })(),
+  __tilefinchArrayFrom = Array.from,
+  __tilefinchArrayIsArray = Array.isArray;
 (() => {
+  const Object = __tilefinchObject;
   /* The trusted-event marker is compat.js's (it owns event state); the
      modules evaluated before it reach it through this share, which each
      captures at its start and hardening.js deletes. Neither the share nor
@@ -16,6 +31,13 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
      receives the marker from the host. */
   let trustedEventMark = null, eventCreator = null, eventBrand = null,
     eventInterfaces = null;
+  /* compat.js's, defined after this module, platform.js and
+     custom-elements.js: each binds it through the share when compat.js
+     calls defineDOMException, so none reads the page's global. */
+  let DOMException;
+  /* Bound before author code runs, as the other modules do. */
+  const { String } = globalThis;
+  const domExceptionBinders = [(value) => { DOMException = value; }];
   const trustedEvent = (event) => trustedEventMark(event),
     /* Builds an event the browser fires with the bootstrap's own interface,
        which compat.js captured before author code could replace the global:
@@ -43,6 +65,18 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
       createBrowserEvent: newEvent,
       isEvent,
       interfaces,
+      /* The dispatch every node wrapper inherits, for the browser's own
+         delivery (scheduler.js) when a page has replaced the method. */
+      dispatchNode: (target, event) => dispatchNodeEvent(target, event),
+      bindDOMException(bind) {
+        if (DOMException === undefined)
+          domExceptionBinders[domExceptionBinders.length] = bind;
+      },
+      defineDOMException(value) {
+        if (DOMException !== undefined || typeof value !== "function") return;
+        for (let at = 0; at < domExceptionBinders.length; at++)
+          domExceptionBinders[at](value);
+      },
       install(mark, create, brand, table) {
         if (trustedEventMark === null && typeof mark === "function" &&
             typeof create === "function" && typeof brand === "function" &&
@@ -63,6 +97,26 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
     /* Host and validation realms only (see hardening.js). */
     testProbes = !!__tilefinchRealmGlobal.__tilefinchTestProbes,
     ancestorApply = Reflect.apply,
+    /* The native-layer prototypes (nativeLayer below): a node under one
+       registers listeners with that layer's own methods. */
+    nativeLayers = new WeakSet(),
+    nativeLayerHas = Function.call.bind(WeakSet.prototype.has),
+    nativeLayerAdd = Function.call.bind(WeakSet.prototype.add),
+    prototypeOf = Object.getPrototypeOf,
+    /* nativeLayer's table and builders: it makes a layer when a page's
+       first node of an interface is wrapped, after author code. */
+    layerGet = Function.call.bind(WeakMap.prototype.get),
+    layerSet = Function.call.bind(WeakMap.prototype.set),
+    createObject = Object.create,
+    defineProperties = Object.defineProperties,
+    setPrototypeOf = Object.setPrototypeOf,
+    /* A copy of a list read by index: no page patch of Array.from or the
+       array iterator runs. */
+    copyList = (list) => {
+      const copy = [];
+      for (let at = 0; at < list.length; at++) copy[at] = list[at];
+      return copy;
+    },
     numberFrom = Number,
     numberIsFinite = Number.isFinite,
     mathFloor = Math.floor,
@@ -310,6 +364,30 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
      them then adopts them into the receiver's owner. */
   const factoryDocument = (node) =>
     node.__handle !== undefined ? document : node.ownerDocument || document;
+  /* insertAdjacentHTML's and the outerHTML setter's fragment, parsed with
+     `context` as the parser's context element (its namespace too: markup
+     beside an SVG child is SVG, as in Chromium); a context that is no
+     element (a fragment or shadow root), or <html>, is <body>. Scripts in
+     it are inert, as innerHTML's. A script-side element (`node` has no
+     native node) parses in a <div>, or its SVG or MathML namespace. */
+  const contextFragment = (context, markup, node) => {
+    const owner = factoryDocument(node),
+      fragment = owner.createDocumentFragment();
+    if (node.__handle !== undefined) {
+      if (!__tilefinchSetInnerHTML(fragment.__handle, markup,
+          context.nodeType === Node.ELEMENT_NODE ? context.__handle : 0))
+        throw new Error("innerHTML mutation failed");
+      return fragment;
+    }
+    const space = context.namespaceURI,
+      holder = space === "http://www.w3.org/2000/svg" ||
+        space === "http://www.w3.org/1998/Math/MathML"
+        ? owner.createElementNS(space, context.localName)
+        : owner.createElement("div");
+    holder.innerHTML = markup;
+    for (const child of [...holder.childNodes]) fragment.appendChild(child);
+    return fragment;
+  };
   const documentListeners = new Map(),
     smoothElementScrolls = new WeakMap();
   let pendingElementScrolls = null;
@@ -323,7 +401,7 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
       const pending = pendingElementScrolls;
       pendingElementScrolls = null;
       for (const target of pending)
-        target.dispatchEvent(newEvent("scroll"));
+        dispatchNodeEvent(target, newEvent("scroll"));
     }, 0);
   };
   __tilefinchRealmGlobal.__tilefinchTaskRealm = "top";
@@ -366,24 +444,42 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
   const uncaughtErrors = [];
   let uncaughtReportDepth = 0;
   let uncaughtReportCount = 0;
+  /* A report invokes Window.onerror with its legacy five arguments before
+     ordinary listeners. Suppress only that event's attribute wrapper;
+     its live callback remains observable and editable during dispatch. */
+  let reportedWindowErrorEvent = null;
   __tilefinchRealmGlobal.__tilefinchUncaughtErrors = uncaughtErrors;
   __tilefinchRealmGlobal.__tilefinchUncaughtErrorCount = 0;
   if (testProbes) __tilefinchRealmGlobal.__tilefinchLastUncaughtTask = "";
-  __tilefinchRealmGlobal.__tilefinchReportUncaught = (error, context = "callback") => {
+  /* Captured before author code: the host log is not page-replaceable and
+     never page-visible (only a TILEFINCH_TRACE_CONSOLE run prints it). */
+  const hostConsoleLog = __tilefinchRealmGlobal.__tilefinchConsoleLog;
+  /*
+   * HTML "report an exception". Script evaluation (evaluation.inc) passes
+   * the script's location, and `muted` for a cross-origin classic script
+   * fetched without CORS; its failure is already counted as a failed
+   * script, so only callbacks feed the uncaught-callback diagnostics.
+   */
+  const reportUncaught = (
+    error, context = "callback", filename, lineno = 0, colno = 0,
+    muted = false,
+  ) => {
     uncaughtReportDepth++;
+    const script = filename !== undefined;
     try {
       /* Count before any string/stack allocation: an OOM must not disappear
          merely because formatting its diagnostic also fails. Existing own
          property + int32 value keep this publication allocation-free. */
-      if (uncaughtReportCount < 2147483647) uncaughtReportCount++;
-      __tilefinchRealmGlobal.__tilefinchUncaughtErrorCount = uncaughtReportCount;
+      if (!script && uncaughtReportCount < 2147483647) uncaughtReportCount++;
+      if (!script)
+        __tilefinchRealmGlobal.__tilefinchUncaughtErrorCount = uncaughtReportCount;
       const message = String(error),
         stack = String((error && error.stack) || ""),
         detail =
           stack && stack.indexOf(message) < 0
             ? message + "\n" + stack
             : stack || message;
-      if (testProbes)
+      if (testProbes && !script)
         __tilefinchRealmGlobal.__tilefinchLastUncaughtTask =
           "realm=" +
           String(__tilefinchRealmGlobal.__tilefinchTaskRealm || "unknown") +
@@ -393,8 +489,10 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
           String(activeTaskSequence) +
           " context=" +
           String(context).slice(0, 64);
-      if (uncaughtErrors.length >= 16) uncaughtErrors.shift();
-      uncaughtErrors.push(String(context) + ": " + detail);
+      if (!script) {
+        if (uncaughtErrors.length >= 16) uncaughtErrors.shift();
+        uncaughtErrors.push(String(context) + ": " + detail);
+      }
       /*
        * Exceptions reported by platform callbacks are observable through the
        * Window error channel.  Custom-element construction in particular must
@@ -402,56 +500,59 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
        * before console logging so test and application error handlers see the
        * original value even when diagnostic formatting later fails.
        */
-      const onerror = __tilefinchRealmGlobal.onerror;
+      const onerror = __tilefinchRealmGlobal.onerror,
+        init = muted
+          ? { cancelable: true, message: "Script error.", filename: "",
+              lineno: 0, colno: 0, error: null }
+          : { cancelable: true, message: String(error?.message || message),
+              filename: script ? String(filename) : "", lineno, colno, error };
+      /* onerror returning true, or a listener's preventDefault(), cancels
+         the default report (the host log below). */
+      let canceled = false;
       /* HTML's exception-reporting algorithm must not recursively report an
          exception raised while it is already firing the Window error event.
          Without this guard, one throwing `error` listener recursively creates
-         error events until Tilefinch's callback budget retires the realm. */
+         error events until Tilefinch's callback budget retires the realm. A
+         handler's own exception is logged, never re-fired. */
       if (uncaughtReportDepth === 1 && typeof onerror === "function")
         try {
-          onerror.call(
-            __tilefinchRealmGlobal,
-            error?.message || message,
-            "",
-            0,
-            0,
-            error,
-          );
-        } catch (_) {}
-      if (
-        uncaughtReportDepth === 1 &&
-        typeof __tilefinchRealmGlobal.Event === "function" &&
-        typeof __tilefinchRealmGlobal.dispatchEvent === "function"
-      )
+          canceled = ancestorApply(onerror, __tilefinchRealmGlobal, [
+            init.message, init.filename, init.lineno, init.colno, init.error,
+          ]) === true;
+        } catch (nested) {
+          reportUncaught(nested, "error handler");
+        }
+      if (uncaughtReportDepth === 1 && domShared.browserDispatch)
         try {
-          const event = newEvent("error", { cancelable: true });
-          event.message = error?.message || message;
-          event.filename = "";
-          event.lineno = 0;
-          event.colno = 0;
-          event.error = error;
+          const event = trustedEvent(newEvent("error", init, "ErrorEvent"));
+          if (canceled) event.preventDefault();
           /*
-           * dispatchEvent invokes the onerror event-handler attribute with an
+           * Dispatch invokes the onerror event-handler attribute with an
            * Event argument, while the legacy Window.onerror callback above
-           * requires five arguments. Avoid invoking that same property twice;
-           * registered "error" listeners still receive the ErrorEvent-shaped
-           * value.
+           * requires five arguments. Avoid invoking that same handler twice
+           * for this particular event, without changing the live handler
+           * record or its listener position; registered
+           * "error" listeners still receive the ErrorEvent. The Window's own
+           * dispatch runs, never a page's replacement of dispatchEvent.
            */
-          __tilefinchRealmGlobal.onerror = null;
+          const previousErrorEvent = reportedWindowErrorEvent;
+          reportedWindowErrorEvent = event;
           try {
-            __tilefinchRealmGlobal.dispatchEvent(event);
+            domShared.browserDispatch(__tilefinchRealmGlobal, event);
           } finally {
-            __tilefinchRealmGlobal.onerror = onerror;
+            reportedWindowErrorEvent = previousErrorEvent;
           }
+          canceled = event.defaultPrevented;
         } catch (_) {}
-      if (__tilefinchRealmGlobal.console && typeof console.error === "function")
-        console.error("Uncaught " + String(context), detail, provenance);
+      if (!canceled && typeof hostConsoleLog === "function")
+        hostConsoleLog("error", "Uncaught " + String(context), detail);
     } catch (_) {
       /* Reporting must never turn an isolated callback exception into a failed host dispatch, including when the JS heap is exhausted. */
     } finally {
       uncaughtReportDepth--;
     }
   };
+  __tilefinchRealmGlobal.__tilefinchReportUncaught = reportUncaught;
   const retentionStats = {
     listenerDrops: 0,
     handlerDrops: 0,
@@ -505,7 +606,8 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
   const typedArrayLength = Function.call.bind(
       Object.getOwnPropertyDescriptor(
         Object.getPrototypeOf(Float64Array.prototype), "length").get),
-    nodeCacheDelete = Function.call.bind(Map.prototype.delete);
+    nodeCacheDelete = Function.call.bind(Map.prototype.delete),
+    handlerRecordGet = Function.call.bind(Map.prototype.get);
   /* Native code calls this in the middle of DOM operations (a discard, a
      handle-table reclaim), so it and the cleanups it runs use captured
      intrinsics only: no page-replaceable global, prototype method or
@@ -1030,17 +1132,38 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
         token === inlineHandlerRecordToken;
       if (wantsWrapper && record.wrapper === null) {
         record.wrapper = function (event) {
+          if (node === __tilefinchRealmGlobal && type === "error"
+              && event === reportedWindowErrorEvent) return;
           const current = record.callback;
           if (typeof current !== "function") return;
           const returned = ancestorApply(current, this, [event]);
           if (returned === false) event.preventDefault();
         };
-        node.addEventListener(type, record.wrapper, false);
+        handlerListener(node, true, type, record.wrapper);
       } else if (!wantsWrapper && record.wrapper !== null) {
-        node.removeEventListener(type, record.wrapper, false);
+        handlerListener(node, false, type, record.wrapper);
         record.wrapper = null;
       }
       return record.callback;
+    },
+    /* A handler attribute's listener goes in with the target's own
+       registration, as in browsers, never through a page's patch or
+       replacement of addEventListener or removeEventListener: a node's
+       native layer, or EventTarget's methods as hardening.js captured
+       them (the window, the document, detached nodes). */
+    handlerListener = (node, add, type, wrapper) => {
+      for (let at = prototypeOf(node), hops = 0; at && hops < 32;
+           at = prototypeOf(at), hops++)
+        if (nativeLayerHas(nativeLayers, at))
+          return ancestorApply(nativeNodeEventDescriptors[
+            add ? "addEventListener" : "removeEventListener"].value,
+            node, [type, wrapper, false]);
+      const table = __tilefinchRealmGlobal.__tilefinchEventInterfaces;
+      if (!table)
+        return add ? node.addEventListener(type, wrapper, false)
+          : node.removeEventListener(type, wrapper, false);
+      return (add ? table.addListener : table.removeListener)(
+        node, type, wrapper, false);
     },
     inlineEventHandler = (node, type, name) => {
       const retained = eventHandlerMap(node, false);
@@ -1704,6 +1827,7 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
     checkQualifiedName,
     asciiLower,
     checkDoctypeName,
+    contextFragment,
     removeSelectOption: null,
   };
   __tilefinchRealmGlobal.__tilefinchDomShared = domShared;
@@ -1807,7 +1931,7 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
           submitter,
         }, "SubmitEvent"),
       );
-      if (this.dispatchEvent(event)) {
+      if (dispatchNodeEvent(this, event)) {
         if (__tilefinchRealmGlobal.__tilefinchQueueFormSubmission?.(this, submitter))
           return;
         __tilefinchRealmGlobal.__tilefinchSubmittedBody =
@@ -1969,7 +2093,7 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
     }
     get styleSheets() {
       if (!this.isConnected) return [];
-      return Array.from(this.querySelectorAll("style"))
+      return __tilefinchArrayFrom(this.querySelectorAll("style"))
         .map((node) => node.sheet)
         .filter(Boolean);
     }
@@ -2069,7 +2193,7 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
         }
         if (memoEntries.length < memoEntryLimit) {
           entry = { owner, values, version, task };
-          memoEntries.push(entry);
+          memoEntries[memoEntries.length] = entry;
           return values;
         }
         entry = memoEntries[memoNext];
@@ -2081,7 +2205,12 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
       entry.task = task;
       return values;
     },
-    readChildNodes = (node) => __tilefinchChildNodes(node.__handle).map(wrap);
+    /* By index: a page's patch of Array.prototype.map never runs. */
+    readChildNodes = (node) => {
+      const handles = __tilefinchChildNodes(node.__handle), nodes = [];
+      for (let at = 0; at < handles.length; at++) nodes[at] = wrap(handles[at]);
+      return nodes;
+    };
   class Window extends EventTarget {}
   const domInterfaces = {
     EventTarget,
@@ -2408,7 +2537,7 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
       const root = shadowRootForHost(host),
         source =
           host.__handle === undefined
-            ? Array.from(host.__detachedChildren || host.childNodes || [])
+            ? __tilefinchArrayFrom(host.__detachedChildren || host.childNodes || [])
             : __tilefinchChildNodes(host.__handle).map(wrap),
         values = source
           .filter(
@@ -2627,18 +2756,18 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
         configurable: true,
         enumerable: true,
         get() {
-          return nodeList(Array.from(this.__detachedChildren || []));
+          return nodeList(copyList(this.__detachedChildren || []));
         },
       };
       rootDescriptors.children = {
         configurable: true,
         enumerable: true,
         get() {
-          return nodeList(
-            Array.from(this.__detachedChildren || []).filter(
-              (node) => node?.nodeType === Node.ELEMENT_NODE,
-            ),
-          );
+          const list = this.__detachedChildren || [], elements = [];
+          for (let at = 0; at < list.length; at++)
+            if (list[at]?.nodeType === Node.ELEMENT_NODE)
+              elements[elements.length] = list[at];
+          return nodeList(elements);
         },
       };
       rootDescriptors.firstChild = {
@@ -3119,7 +3248,7 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
     slotsForRoot = (root) => {
       let slots = attributeState(root)?.slots;
       if (slots) return slots;
-      slots = Array.from(root?.querySelectorAll?.("slot") || [])
+      slots = __tilefinchArrayFrom(root?.querySelectorAll?.("slot") || [])
         .filter(
           (slot) =>
             slot instanceof HTMLSlotElement &&
@@ -3293,7 +3422,7 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
       )
         return;
       slotFlushScheduled = false;
-      const roots = Array.from(pendingSlotRoots);
+      const roots = __tilefinchArrayFrom(pendingSlotRoots);
       pendingSlotRoots.clear();
       /*
        * Slot assignment propagates from an inner tree to the slots that
@@ -3313,9 +3442,8 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
               current.some((node, index) => node !== previous[index]);
           attributeState(slot, true).slotSnapshot = current.slice();
           if (changed || forced)
-            slot.dispatchEvent(
-              newEvent("slotchange", { bubbles: true }),
-            );
+            dispatchNodeEvent(slot,
+              newEvent("slotchange", { bubbles: true }));
         }
         for (const { slot, assignment: current } of
           removedSignalledSlotsByRoot.get(root) || []) {
@@ -3325,9 +3453,8 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
               current.some((node, index) => node !== previous[index]);
           attributeState(slot, true).slotSnapshot = current.slice();
           if (changed || forced)
-            slot.dispatchEvent(
-              newEvent("slotchange", { bubbles: true }),
-            );
+            dispatchNodeEvent(slot,
+              newEvent("slotchange", { bubbles: true }));
         }
         removedSignalledSlotsByRoot.delete(root);
       }
@@ -3530,7 +3657,7 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
       throw new TypeError("Illegal invocation");
     const select = native
       ? () => query.call(root, selector)
-      : () => Array.from(root.querySelectorAll(selector));
+      : () => __tilefinchArrayFrom(root.querySelectorAll(selector));
     return __tilefinchRealmGlobal.__tilefinchLiveHTMLCollection(
       filter ? () => select().filter(filter) : select,
       native,
@@ -3631,7 +3758,7 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
       value: function getElementsByName(name) {
         name = String(name);
         return nodeList(
-          Array.from(this.querySelectorAll("[name]")).filter(
+          __tilefinchArrayFrom(this.querySelectorAll("[name]")).filter(
             (element) => element.getAttribute("name") === name,
           ),
         );
@@ -3770,7 +3897,7 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
           isPrimary: false,
         }, "PointerEvent");
     clickEvent.__tilefinchControlDefaultPrepared = true;
-    const proceed = this.dispatchEvent(clickEvent),
+    const proceed = dispatchNodeEvent(this, clickEvent),
       controlHandled =
         __tilefinchRealmGlobal.__tilefinchFinishControlDefault?.(controlState, proceed) ||
         false;
@@ -3827,16 +3954,12 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
         "Invalid adjacent HTML position",
         "SyntaxError",
       );
-    if (
-      (position === "beforebegin" || position === "afterend") &&
-      !this.parentNode
-    )
-      return;
-    const template = factoryDocument(this).createElement("template");
-    template.innerHTML = String(source);
-    const fragment = factoryDocument(this).createDocumentFragment();
-    for (const child of [...template.content.childNodes])
-      fragment.appendChild(child);
+    const outside = position === "beforebegin" || position === "afterend",
+      context = outside ? this.parentNode : this;
+    if (!context || context.nodeType === Node.DOCUMENT_NODE)
+      throw new DOMException("The element has no parent",
+        "NoModificationAllowedError");
+    const fragment = contextFragment(context, String(source), this);
     if (position === "beforebegin")
       this.parentNode.insertBefore(fragment, this);
     else if (position === "afterbegin")
@@ -3881,7 +4004,7 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
     #timing;
     constructor(target, keyframes, options) {
       this.#target = target ?? null;
-      this.#keyframes = Array.isArray(keyframes)
+      this.#keyframes = __tilefinchArrayIsArray(keyframes)
         ? keyframes.slice(0, 16).map((frame) => ({ ...frame }))
         : keyframes && typeof keyframes === "object"
           ? [{ ...keyframes }]
@@ -6173,7 +6296,7 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
           __tilefinchRealmGlobal.__tilefinchCustomElementLifecycleNeeded?.(this) ||
           false,
         removedNodes = customLifecycle
-          ? Array.from(this.childNodes).slice(0, 256)
+          ? __tilefinchArrayFrom(this.childNodes).slice(0, 256)
           : mutationChildSnapshot(this),
         target =
           String(this.tagName).toLowerCase() === "template"
@@ -6191,7 +6314,7 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
         const container = document.createElement("div");
         if (!__tilefinchSetInnerHTML(container.__handle, value))
           throw new Error("innerHTML mutation failed");
-        const replacements = Array.from(container.childNodes);
+        const replacements = __tilefinchArrayFrom(container.childNodes);
         __tilefinchRealmGlobal.__tilefinchMutationSuppressed =
           (__tilefinchRealmGlobal.__tilefinchMutationSuppressed || 0) + 1;
         dynamicPreparationSuppressed++;
@@ -6208,7 +6331,7 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
         throw new Error("innerHTML mutation failed");
       }
       const addedNodes = customLifecycle
-        ? Array.from(this.childNodes).slice(0, 256)
+        ? __tilefinchArrayFrom(this.childNodes).slice(0, 256)
         : mutationChildSnapshot(this);
       if (
         customLifecycle &&
@@ -6834,7 +6957,7 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
             acceptsX ? nextLeft : 0,
             acceptsY ? nextTop : 0,
           );
-          this.dispatchEvent(newEvent("scroll"));
+          dispatchNodeEvent(this, newEvent("scroll"));
         };
       smoothElementScrolls.delete(this);
       if (
@@ -7224,6 +7347,10 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
       return undefined;
     },
   });
+  const nodeDispatch = nativeNodeReceiverDescriptors.dispatchEvent.value,
+    /* The browser's own events on nodes: never a page's dispatchEvent. */
+    dispatchNodeEvent = (target, event) =>
+      ancestorApply(nodeDispatch, target, [event]);
   /* getBoundingClientRect's refill target for __tilefinchGeometry, used
      only while __tilefinchGeometryValue is still this method. */
   const geometryValueMethod =
@@ -7308,6 +7435,7 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
     [HTMLAnchorElement.prototype, "href hreflang rel type"],
     [HTMLImageElement.prototype, "src width height"],
     [HTMLTemplateElement.prototype, "content"],
+    [ShadowRoot.prototype, "innerHTML"],
   ])
     for (const name of names.split(" "))
       if (!Object.hasOwn(prototype, name) && nativeNodeReceiverDescriptors[name])
@@ -7421,23 +7549,29 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
   });
   const nativePrototypes = new WeakMap();
   const nativeLayer = (base) => {
-    let prototype = nativePrototypes.get(base);
+    let prototype = layerGet(nativePrototypes, base);
     if (!prototype) {
-      if (sharedLayerPrototypes.includes(base)) {
+      let shared = false;
+      for (let at = 0; at < sharedLayerPrototypes.length; at++)
+        if (sharedLayerPrototypes[at] === base) shared = true;
+      if (shared) {
         /* A member-less interface: its prototype itself sits above
            HTMLElement's layer, so its wrappers inherit the same native
            members without another copy of the layer. */
         nativeLayer(HTMLElement.prototype);
         prototype = base;
       } else {
-        prototype = Object.create(base);
-        Object.defineProperties(prototype, nativeNodeEventDescriptors);
-        Object.defineProperties(prototype, nativeNodeReceiverDescriptors);
+        prototype = createObject(base);
+        nativeLayerAdd(nativeLayers, prototype);
+        defineProperties(prototype, nativeNodeEventDescriptors);
+        defineProperties(prototype, nativeNodeReceiverDescriptors);
+        /* A DocumentFragment has no innerHTML (a ShadowRoot has its own). */
+        if (base === DocumentFragment.prototype) delete prototype.innerHTML;
         if (base === HTMLElement.prototype)
-          for (const shared of sharedLayerPrototypes)
-            Object.setPrototypeOf(shared, prototype);
+          for (let at = 0; at < sharedLayerPrototypes.length; at++)
+            setPrototypeOf(sharedLayerPrototypes[at], prototype);
       }
-      nativePrototypes.set(base, prototype);
+      layerSet(nativePrototypes, base, prototype);
     }
     return prototype;
   };
@@ -7865,7 +7999,7 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
         attributeFilter:
           options.attributeFilter === undefined
             ? null
-            : Array.from(options.attributeFilter, String),
+            : __tilefinchArrayFrom(options.attributeFilter, String),
         characterData:
           options.characterData === undefined
             ? options.characterDataOldValue !== undefined
@@ -8339,7 +8473,7 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
           ? [0]
           : typeof threshold === "number"
             ? [threshold]
-            : Array.from(threshold);
+            : __tilefinchArrayFrom(threshold);
       if (!values.length) values.push(0);
       for (let index = 0; index < values.length; index++) {
         const value = Number(values[index]);
@@ -8491,14 +8625,14 @@ const __tilefinchTimerCapacity = [null, null, null, null, 0, null];
         if (!pass) {
           if (!passRequested) break;
           passRequested = false;
-          pass = { observers: Array.from(active), at: 0, items: null, item: 0 };
+          pass = { observers: __tilefinchArrayFrom(active), at: 0, items: null, item: 0 };
         }
         const observer = pass.observers[pass.at];
         if (!observer) {
           pass = null;
           continue;
         }
-        pass.items ||= Array.from(observer.targets);
+        pass.items ||= __tilefinchArrayFrom(observer.targets);
         while (pass.item < pass.items.length && budget > 0) {
           const item = pass.items[pass.item++];
           if (observer.targets.has(item)) visit(observer, item);

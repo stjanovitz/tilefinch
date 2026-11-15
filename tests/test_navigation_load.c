@@ -3024,6 +3024,11 @@ static bool test_parser_checkpoint_refusals_preserve_server_dom(void)
     return all_ok && hard_ok && clean;
 }
 
+/* The three parser-stage breakers keep the server page usable. Case 0:
+   a script that throws (its own exception: it neither counts nor resets)
+   and three that run out of memory open the consecutive-failure breaker
+   at the third. Case 1: the cumulative source-work bound. Case 2: the
+   stage time bound, at the first script. */
 static bool test_parser_script_stage_circuit_preserves_actions(void)
 {
     bool all_ok = true;
@@ -3122,6 +3127,9 @@ static bool test_parser_script_stage_circuit_preserves_actions(void)
                           .parser_script_stage_failure_breakers == 1u
                         && navigation.performance
                                .parser_script_stage_work_breakers == 0u
+                        && navigation.performance
+                               .parser_script_author_exceptions == 1u
+                        && navigation.script_failed == 4u
                         && strstr(navigation.page.script_result.error,
                                   "first expected failure") != NULL
                     : work_case == 1u
@@ -3925,6 +3933,9 @@ static bool test_parser_script_stage_watchdog_and_failure_reset(void)
     if (installed)
         preload_clean = budget_uninstall_lexbor(&budget) && preload_clean;
 
+    /* Out-of-memory failures in pairs, each followed by a healthy script:
+       the healthy script resets the consecutive count, so the breaker
+       never opens and the tail still runs. */
     budget_init(&budget, 16 * MIB);
     installed = budget_install_lexbor(&budget);
     memset(&browser, 0, sizeof(browser));
@@ -3957,6 +3968,7 @@ static bool test_parser_script_stage_watchdog_and_failure_reset(void)
         && tail != NULL && tail_length == 3u
         && navigation.page.runtime != NULL
         && navigation.script_failed == 4u
+        && navigation.performance.parser_script_author_exceptions == 0u
         && navigation.performance.parser_script_stage_breakers == 0u
         && navigation.performance.parser_script_stage_failure_breakers == 0u
         && navigation.performance.optional_work_sheds == 0u
@@ -3965,7 +3977,7 @@ static bool test_parser_script_stage_watchdog_and_failure_reset(void)
         fprintf(stderr,
                 "parser failure reset ready=%d loaded=%d reset=%.*s "
                 "tail=%.*s runtime=%p failed=%zu breaker=%zu/%zu "
-                "degraded=%d error=\"%s\"\n",
+                "degraded=%d error=\"%s\" author=%zu sheds=%zu\n",
                 ready ? 1 : 0, loaded ? 1 : 0,
                 (int) reset_length, reset == NULL ? "" : reset,
                 (int) tail_length, tail == NULL ? "" : tail,
@@ -3973,7 +3985,9 @@ static bool test_parser_script_stage_watchdog_and_failure_reset(void)
                 navigation.performance.parser_script_stage_breakers,
                 navigation.performance.parser_script_stage_failure_breakers,
                 navigation.page.script_degradation_observed ? 1 : 0,
-                navigation.last_error);
+                navigation.last_error,
+                navigation.performance.parser_script_author_exceptions,
+                navigation.performance.optional_work_sheds);
     }
     if (ready) fetch_trace_end();
     if (installed) navigation_destroy(&navigation);

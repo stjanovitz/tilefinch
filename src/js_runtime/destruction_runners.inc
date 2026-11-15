@@ -153,6 +153,8 @@ void script_runtime_destroy(ScriptRuntime *runtime)
         JS_FreeValue(runtime->context, runtime->media_update);
         JS_FreeValue(runtime->context, runtime->document_all_cache);
         JS_FreeValue(runtime->context, runtime->opfs_storage_manager);
+        JS_FreeValue(runtime->context, runtime->streams_writable_stream);
+        runtime->streams_writable_stream = JS_UNDEFINED;
         JS_FreeValue(runtime->context, runtime->game_audio_host_suspend);
         JS_FreeValue(runtime->context, runtime->game_audio_host_complete);
         JS_FreeValue(runtime->context, runtime->media_capture_host_event);

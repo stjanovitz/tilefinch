@@ -221,6 +221,19 @@ PspDisplayRowCopyResult psp_display_copy_rgb565_rows(
     PspDisplay *display, const uint16_t *frame, unsigned top, unsigned end,
     bool vfpu_eligible);
 
+/* Bit-exact rows into caller-owned storage, never framebuffer publication.
+   Spans must not overlap. The same calling-thread VFPU rule holds. */
+PspDisplayRowCopyResult psp_display_copy_pixel_rows(
+    unsigned char *destination, size_t destination_stride,
+    const unsigned char *source, size_t source_stride,
+    size_t row_bytes, size_t rows, bool vfpu_eligible);
+#if defined(__PSP__) && defined(TILEFINCH_PSP_VALIDATION_LOG)
+unsigned psp_display_validation_probe_pixel_copy(
+    unsigned char *destination, size_t destination_stride,
+    const unsigned char *source, size_t source_stride,
+    size_t row_bytes, size_t rows);
+#endif
+
 #if defined(__PSP__) && defined(TILEFINCH_PSP_VALIDATION_LOG)
 /* Run before opting a VFPU-capable owner thread into the copy candidate.
    Uses the real source/back buffer and performs the requested copy; call

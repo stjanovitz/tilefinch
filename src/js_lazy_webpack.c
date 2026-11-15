@@ -1888,13 +1888,33 @@ ScriptLazyEvaluation script_runtime_evaluate_external_lazy_webpack_recorded(
         runtime->context, compiled_registration);
     document_allocation_owner_leave(runtime->document, previous_owner);
     bool evaluated = !JS_IsException(evaluated_value);
+    bool threw = !evaluated;
+    /* A registration run that threw, reported to the window error event,
+       still ran: the element gets `load` (HTML "execute the script
+       element"). */
+    bool reported = false;
     JS_FreeValue(runtime->context, evaluated_value);
+    if (threw) {
+        bool previous_muted = runtime->script_errors_muted;
+        bool outer_reported = runtime->script_error_reported;
+        bool outer_author_error = runtime->script_author_error;
+        runtime->script_errors_muted = js_rt_script_errors_muted(
+            runtime, script_node, source_url);
+        reported = js_rt_record_script_exception(
+            runtime->context,
+            source_url == NULL ? "<external-script>" : source_url,
+            SCRIPT_COMPILE_SOURCE_EXTERNAL, &runtime->result);
+        runtime->script_errors_muted = previous_muted;
+        runtime->script_error_reported = outer_reported;
+        runtime->script_author_error = outer_author_error;
+    }
     if (evaluated) evaluated = js_rt_runtime_run_jobs(runtime);
+    else if (reported) reported = js_rt_runtime_run_jobs(runtime);
     if (!js_rt_current_script_scope_end(
             runtime->context, &previous_current_script,
             &runtime->result)) evaluated = false;
     if (!evaluated) {
-        js_rt_record_exception(runtime->context, &runtime->result);
+        if (!threw) js_rt_record_exception(runtime->context, &runtime->result);
         js_rt_capture_error_source_context(source, source_length, source_url,
                                      &runtime->result);
     }
@@ -1916,9 +1936,11 @@ ScriptLazyEvaluation script_runtime_evaluate_external_lazy_webpack_recorded(
             && js_rt_bridge_node_slot_for_handle(
                 &runtime->bridge, script_handle, &slot)) {
             (void) script_runtime_dispatch_node(
-                runtime, runtime->bridge.nodes[slot], "error", NULL);
+                runtime, runtime->bridge.nodes[slot],
+                reported ? "load" : "error", NULL);
         }
         js_rt_runtime_update_result(runtime, result);
+        runtime->last_script_author_error = reported;
         return SCRIPT_LAZY_EVALUATION_FAILED;
     }
     runtime->result.external_scripts_loaded++;
@@ -1930,6 +1952,7 @@ ScriptLazyEvaluation script_runtime_evaluate_external_lazy_webpack_recorded(
         runtime, runtime->bridge.nodes[slot], "load", result);
     runtime->result.success = dispatched;
     js_rt_runtime_update_result(runtime, result);
+    runtime->last_script_author_error = false;
     return dispatched ? SCRIPT_LAZY_EVALUATION_SUCCEEDED
                       : SCRIPT_LAZY_EVALUATION_FAILED;
 }

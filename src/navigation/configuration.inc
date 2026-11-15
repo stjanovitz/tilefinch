@@ -626,6 +626,9 @@ typedef struct {
     size_t image_count;
     const ImageResource *image_base;
     size_t image_table_count;
+    /* Its empty fixed image slots are tracked too (a load without an image
+       table of its own, whose inline SVGs may be rasterized for it). */
+    bool tracks_empty_slots;
     /* Where laid-out content ends; rows below it are placeholder. */
     int content_end_y;
     /* Stopped at its layout limit: more of the parsed DOM remains. */
@@ -735,5 +738,10 @@ typedef struct {
     /* Two slots: a new preview is built and painted at its final address
        while the live one stays scrollable. At most one is live. */
     NavigationRetainedPreview previews[2];
+    /* Rasters of the inline SVGs in the preview's first screen (icons and
+       logos in fixed slots), made without the network once a preview is on
+       screen; used only when the load has no image table of its own, and
+       dropped with the previews. */
+    ImageResources preview_svgs;
     NavigationStylePrepare style_prepare;
 } NavigationDocumentStream;

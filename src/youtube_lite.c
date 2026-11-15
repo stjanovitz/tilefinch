@@ -1729,7 +1729,8 @@ static bool lite_html_header(YoutubeLiteHtml *html, const char *query,
                 "input{width:calc(100% - 116px)}button{width:110px;font-size:13px;padding:0 8px}"
                 ".top{gap:6px}.account{padding:4px}.feed-home h1{padding-right:170px}"
                 ".feed-home .feed-refresh.corner{width:160px;text-align:right}"))
-        && (tilefinch_ui_translation_bound_language() != TILEFINCH_UI_LANGUAGE_ARABIC
+        && (!tilefinch_ui_language_right_to_left(
+                tilefinch_ui_translation_bound_language())
             || lite_html_text(html,
                 ".account,.account-panel,.feed-status,.feed-refresh,.hint,h1,h2,button{direction:rtl}"))
         && lite_html_text(html, style_end)

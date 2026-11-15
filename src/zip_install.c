@@ -18,6 +18,14 @@
 #define ZIP_DIRECTORY_LIMIT 512u
 #define ZIP_REMOVAL_LIMIT 1024u
 #define ZIP_RECEIPT ".tilefinch-homebrew"
+/* Receipt records: version 1 is magic, folder name, ID and CRC; version 2,
+   written only when an app's title is not its folder name, adds the title
+   before the CRC. Releases that know only version 1 do not list a version
+   2 app (they could not have installed one). */
+#define ZIP_RECEIPT_V1 80u
+#define ZIP_RECEIPT_V2 (ZIP_RECEIPT_V1 + ZIP_INSTALL_TITLE_LIMIT)
+_Static_assert(ZIP_INSTALL_TITLE_LIMIT == FILE_DOWNLOAD_FILENAME_LIMIT,
+               "an app title holds one download title");
 
 typedef struct {
     char name[ZIP_INSTALL_NAME_LIMIT];
@@ -85,48 +93,71 @@ static bool path_valid(const char *name)
             /* Ordinary dotfiles are app data, not traversal. Validate their
                remaining basename too; '.', '..' and aliases stay forbidden. */
             const char *base = part[0] == '.' ? part + 1 : part;
-            if (!*base || *base == '.' || !file_download_filename_valid(base)) return false;
+            if (!*base || *base == '.' || !file_download_stored_name_valid(base)) return false;
             component = i + 1;
         } else if (c < 32 || c >= 127 || strchr("\\<>:\"|?*", c)) return false;
     }
     return true;
 }
 
-static bool receipt(const char *directory, const char *name, uint32_t *id, bool write)
+/* An app title is a download title: valid UTF-8 the download namer would
+   keep as it is. */
+static bool title_valid(const char *title)
 {
-    unsigned char record[80] = {0};
+    return title && *title && strlen(title) < ZIP_INSTALL_TITLE_LIMIT
+        && file_download_filename_valid(title);
+}
+
+/* Writes the receipt for NAME with *ID and TITLE (NULL or NAME: version 1),
+   or checks it and reads *ID and, when TITLE is not NULL, the title. */
+static bool receipt(const char *directory, const char *name, uint32_t *id,
+    char title[ZIP_INSTALL_TITLE_LIMIT], bool write)
+{
+    unsigned char record[ZIP_RECEIPT_V2] = {0};
     char path[ZIP_PATH];
     if (strlen(directory) + sizeof("/" ZIP_RECEIPT) > sizeof(path)
         || !name || !*name || strlen(name) >= ZIP_INSTALL_FOLDER_NAME_LIMIT || name[0] == '.'
         || strchr(name, '/') || !path_valid(name)) return false;
     snprintf(path, sizeof(path), "%s/" ZIP_RECEIPT, directory);
+    size_t size = ZIP_RECEIPT_V1;
     if (write) {
-        memcpy(record, "TFHB001", 8); strcpy((char *) record + 8, name);
+        bool titled = title && strcmp(title, name);
+        if (titled && !title_valid(title)) return false;
+        size = titled ? ZIP_RECEIPT_V2 : ZIP_RECEIPT_V1;
+        memcpy(record, titled ? "TFHB002" : "TFHB001", 8); strcpy((char *) record + 8, name);
         for (unsigned i = 0; i < 4; i++) record[72+i] = (uint8_t)(*id >> (i*8));
-        uint32_t crc = (uint32_t) crc32(0, record, 76);
-        for (unsigned i = 0; i < 4; i++) record[76+i] = (uint8_t)(crc >> (i*8));
+        if (titled) strcpy((char *) record + 76, title);
+        uint32_t crc = (uint32_t) crc32(0, record, (uInt) (size - 4));
+        for (unsigned i = 0; i < 4; i++) record[size-4+i] = (uint8_t)(crc >> (i*8));
     } else {
         struct stat info;
-        if (lstat(path, &info) || !S_ISREG(info.st_mode) || info.st_size != sizeof(record)) return false;
+        if (lstat(path, &info) || !S_ISREG(info.st_mode)
+            || (info.st_size != ZIP_RECEIPT_V1 && info.st_size != ZIP_RECEIPT_V2)) return false;
+        size = (size_t) info.st_size;
     }
     FILE *file = fopen(path, write ? "wbx" : "rb");
     if (!file) return false;
-    bool okay = write ? fwrite(record, 1, sizeof(record), file) == sizeof(record)
-        : fread(record, 1, sizeof(record), file) == sizeof(record) && fgetc(file) == EOF;
+    bool okay = write ? fwrite(record, 1, size, file) == size
+        : fread(record, 1, size, file) == size && fgetc(file) == EOF;
     if (write && fflush(file)) okay = false;
     if (ferror(file)) okay = false;
     if (fclose(file)) okay = false;
     if (!okay) { if (write) remove(path); return false; }
     if (write) return true;
-    if (memcmp(record, "TFHB001", 8) || !memchr(record+8, 0, ZIP_INSTALL_FOLDER_NAME_LIMIT)
-        || strcmp((char *)record+8, name) || u32(record+76) != (uint32_t)crc32(0, record, 76)
+    bool titled = size == ZIP_RECEIPT_V2;
+    if (memcmp(record, titled ? "TFHB002" : "TFHB001", 8)
+        || !memchr(record+8, 0, ZIP_INSTALL_FOLDER_NAME_LIMIT)
+        || strcmp((char *)record+8, name) || u32(record+size-4) != (uint32_t)crc32(0, record, (uInt) (size - 4))
         || !u32(record+72)) return false;
+    if (titled && (!memchr(record+76, 0, ZIP_INSTALL_TITLE_LIMIT)
+        || !strcmp((char *)record+76, name) || !title_valid((char *)record+76))) return false;
     *id = u32(record+72);
+    if (title) strcpy(title, titled ? (char *)record+76 : name);
     return true;
 }
 
 bool zip_install_list(const char *root, char names[][ZIP_INSTALL_FOLDER_NAME_LIMIT],
-    size_t capacity, size_t *count)
+    char titles[][ZIP_INSTALL_TITLE_LIMIT], size_t capacity, size_t *count)
 {
     if (!root || !count || !capacity) return false;
     *count = 0;
@@ -136,12 +167,13 @@ bool zip_install_list(const char *root, char names[][ZIP_INSTALL_FOLDER_NAME_LIM
     while ((entry = readdir(dir))) {
         if (++visited > ZIP_INSTALL_GAME_SCAN_LIMIT) { okay = false; break; }
         if (entry->d_name[0] == '.' || strlen(entry->d_name) >= ZIP_INSTALL_FOLDER_NAME_LIMIT) continue;
-        char path[ZIP_PATH]; struct stat info; uint32_t id = 0;
+        char path[ZIP_PATH], title[ZIP_INSTALL_TITLE_LIMIT]; struct stat info; uint32_t id = 0;
         int length = snprintf(path, sizeof(path), "%s/%s", root, entry->d_name);
         if (length < 0 || (size_t)length >= sizeof(path)) { okay = false; break; }
-        if (!lstat(path, &info) && S_ISDIR(info.st_mode) && receipt(path, entry->d_name, &id, false)) {
+        if (!lstat(path, &info) && S_ISDIR(info.st_mode) && receipt(path, entry->d_name, &id, title, false)) {
             if (*count == capacity) { okay = false; break; }
             if (names) strcpy(names[*count], entry->d_name);
+            if (names && titles) strcpy(titles[*count], title);
             ++*count;
         }
         if (!tilefinch_platform_cooperate("homebrew-list", visited)) { okay = false; break; }
@@ -225,7 +257,7 @@ ZipInstall *zip_install_prepare_removal(Budget *budget, const char *root,
     snprintf(job->view.destination, sizeof(job->view.destination), "%s/%s", root, name);
     job->view.removing = true;
     if (lstat(job->view.destination, &info) || !S_ISDIR(info.st_mode)
-        || !receipt(job->view.destination, name, &job->id, false)) goto refused;
+        || !receipt(job->view.destination, name, &job->id, job->view.title, false)) goto refused;
     job->entries = budget_calloc_category(budget, BUDGET_CATEGORY_SESSION, ZIP_REMOVAL_LIMIT, sizeof(ZipEntry));
     if (!job->entries || !removal_inventory(job, "", 0)) goto refused;
     return job;
@@ -300,6 +332,27 @@ static bool desktop_metadata(const char *name)
         || (base[0] == '.' && base[1] == '_');
 }
 
+/* A top-level EBOOT.PBP's folder: TITLE without its extension when that is
+   a plain ASCII folder name, otherwise APP-<ID>. Either way the ID keeps the
+   choice from colliding with another download's, and an existing folder is
+   refused rather than replaced. */
+static void root_folder(ZipInstall *install, const char *title)
+{
+    const char *extension = strrchr(title, '.');
+    size_t length = extension && extension != title
+        ? (size_t) (extension - title) : strlen(title);
+    char stem[ZIP_INSTALL_TITLE_LIMIT];
+    memcpy(stem, title, length); stem[length] = 0;
+    snprintf(install->view.title, sizeof(install->view.title), "%s",
+             title_valid(stem) ? stem : title);
+    if (length < sizeof(install->view.name) && stem[0] != '.' && path_valid(stem)) {
+        strcpy(install->view.name, stem);
+        return;
+    }
+    snprintf(install->view.name, sizeof(install->view.name), "APP-%08X",
+             (unsigned) install->id);
+}
+
 static bool choose_root(ZipInstall *install, const char *suggested)
 {
     ZipEntry *boot = NULL;
@@ -320,12 +373,8 @@ static bool choose_root(ZipInstall *install, const char *suggested)
         char *base = strrchr(prefix, '/'); base = base ? base+1 : prefix;
         if (strlen(base) >= sizeof(install->view.name)) return false;
         strcpy(install->view.name, base);
-    } else {
-        const char *extension = strrchr(suggested, '.');
-        size_t length = extension ? (size_t) (extension - suggested) : strlen(suggested);
-        if (!length || length >= sizeof(install->view.name)) return false;
-        memcpy(install->view.name, suggested, length);
-    }
+        strcpy(install->view.title, base);
+    } else root_folder(install, suggested);
     if (install->view.name[0] == '.' || !path_valid(install->view.name)
         || strchr(install->view.name, '/')) return false;
     snprintf(install->view.destination, sizeof(install->view.destination), "%s/%s", install->root, install->view.name);
@@ -418,12 +467,12 @@ static bool directory_read(ZipInstall *install, uint32_t size, const char *sugge
 }
 
 ZipInstall *zip_install_prepare(Budget *budget, const char *archive,
-    const char *game_directory, const char *suggested_name, uint32_t id,
+    const char *game_directory, const char *title, uint32_t id,
     char *error, size_t error_capacity)
 {
     ZipInstall *install = NULL;
-    if (!budget || !archive || !game_directory || !suggested_name || !id
-        || strlen(game_directory) >= 256 || !file_download_filename_valid(suggested_name)) goto refused;
+    if (!budget || !archive || !game_directory || !title || !id
+        || strlen(game_directory) >= 256 || !title_valid(title)) goto refused;
     install = budget_calloc_category(budget, BUDGET_CATEGORY_SESSION, 1, sizeof(*install));
     if (!install) goto refused;
     install->budget = budget;
@@ -434,7 +483,7 @@ ZipInstall *zip_install_prepare(Budget *budget, const char *archive,
     struct stat status;
     if (!install->archive || fstat(fileno(install->archive), &status) || !S_ISREG(status.st_mode)
         || status.st_size < 22 || (uint64_t)status.st_size > FILE_DOWNLOAD_LIMIT
-        || !directory_read(install, (uint32_t) status.st_size, suggested_name)) goto refused;
+        || !directory_read(install, (uint32_t) status.st_size, title)) goto refused;
     if (lstat(install->view.destination, &status) == 0 || errno != ENOENT) {
         if (error && error_capacity) snprintf(error, error_capacity, "Destination already exists; nothing was replaced");
         zip_install_destroy(install); return NULL;
@@ -442,7 +491,7 @@ ZipInstall *zip_install_prepare(Budget *budget, const char *archive,
     /* Keep every installer-created folder reachable in the bounded manager.
        ZIP deletion does not free this independent installation slot. */
     size_t installed_count = 0;
-    if (!zip_install_list(game_directory, NULL, ZIP_INSTALL_MANAGED_LIMIT, &installed_count)
+    if (!zip_install_list(game_directory, NULL, NULL, ZIP_INSTALL_MANAGED_LIMIT, &installed_count)
         || installed_count == ZIP_INSTALL_MANAGED_LIMIT) goto refused;
     return install;
 refused:
@@ -500,7 +549,7 @@ bool zip_install_begin(ZipInstall *install)
         uint32_t id = 0;
         struct stat info;
         if (lstat(install->view.destination, &info) || !S_ISDIR(info.st_mode)
-            || !receipt(install->view.destination, install->view.name, &id, false) || id != install->id)
+            || !receipt(install->view.destination, install->view.name, &id, NULL, false) || id != install->id)
             return fail(install, "Installation changed; removal refused");
         install->status = ZIP_INSTALL_PENDING; return true;
     }
@@ -563,7 +612,8 @@ ZipInstallStatus zip_install_pump(ZipInstall *install)
                 if (remove(path) || rmdir(install->view.destination)) {
                     /* Preserve discoverability if a concurrent new file prevents
                        the final rmdir. A retry inventories only what remains. */
-                    (void) receipt(install->view.destination, install->view.name, &install->id, true);
+                    (void) receipt(install->view.destination, install->view.name, &install->id,
+                                   install->view.title, true);
                     fail(install, "Removal incomplete; retry or finish through USB");
                 } else install->status = ZIP_INSTALL_DONE;
                 break;
@@ -587,7 +637,8 @@ ZipInstallStatus zip_install_pump(ZipInstall *install)
     for (unsigned steps = 0; steps < 16 && written < 32768; steps++) {
         if (install->current == install->count) {
             struct stat exists;
-            bool marked = receipt(install->stage, install->view.name, &install->id, true);
+            bool marked = receipt(install->stage, install->view.name, &install->id,
+                                  install->view.title, true);
             install->receipt_owned = marked;
             if (!marked || !lstat(install->view.destination, &exists) || errno != ENOENT
                 || rename(install->stage, install->view.destination))

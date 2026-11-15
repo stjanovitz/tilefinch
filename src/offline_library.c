@@ -16,7 +16,12 @@
 #include "tilefinch/js_runtime.h"
 #include "tilefinch/update.h"
 
-#define OFFLINE_INDEX_VERSION 6u
+/* 6: the index holds a downloaded file. 7: a downloaded file's title is not
+   printable ASCII, so its Memory Stick name differs from it; a release that
+   reads at most 6 would look for that file under its title. Each is written
+   only when needed, so older releases keep reading every index they can. */
+#define OFFLINE_INDEX_VERSION 7u
+#define OFFLINE_INDEX_FILE_VERSION 6u
 #define OFFLINE_INDEX_MINIMUM_VERSION 1u
 #define OFFLINE_INDEX_HEADER_BYTES 20u
 #define OFFLINE_ARTICLE_NODE_LIMIT 32768u
@@ -357,7 +362,12 @@ static bool offline_library_save_with_buffer(
     uint32_t version = 5u; /* Existing libraries remain readable by old apps. */
     for (size_t index = 0; index < library->count; index++)
     {
-        if (library->items[index].type == OFFLINE_ITEM_FILE) version = OFFLINE_INDEX_VERSION;
+        const OfflineLibraryItem *item = &library->items[index];
+        if (item->type == OFFLINE_ITEM_FILE && version < OFFLINE_INDEX_FILE_VERSION)
+            version = OFFLINE_INDEX_FILE_VERSION;
+        if (item->type == OFFLINE_ITEM_FILE
+            && !file_download_stored_name_valid(item->title))
+            version = OFFLINE_INDEX_VERSION;
         if (!encode_item(
                 data, OFFLINE_LIBRARY_INDEX_LIMIT, &used,
                 &library->items[index]))
@@ -539,7 +549,7 @@ static void offline_finish_file_tombstone(const OfflineLibrary *library,
         char published[FILE_DOWNLOAD_PATH_LIMIT];
         int written = snprintf(published, sizeof(published), "%s/%08x-%s",
                                library->directory, (unsigned) id, filename);
-        if (file_download_filename_valid(filename) && written > 0
+        if (file_download_stored_name_valid(filename) && written > 0
             && (size_t) written < sizeof(published)) {
             struct stat status;
             if (remove(published) != 0 && stat(published, &status) == 0)
@@ -2530,11 +2540,13 @@ bool offline_library_remove(OfflineLibrary *library, uint32_t id)
     bool have_file = library->items[index].state == OFFLINE_ITEM_READY
         && file_download_path(library, id, downloaded_file, sizeof(downloaded_file));
     char tombstone[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 40u];
+    char stored[FILE_DOWNLOAD_FILENAME_LIMIT];
     /* Best effort: on a full card the removal must still go ahead. */
     bool noted = have_file
         && offline_library_item_path(library, id, ".file.gone", tombstone,
                                      sizeof(tombstone))
-        && offline_write_file_tombstone(tombstone, library->items[index].title);
+        && file_download_stored_name(library->items[index].title, stored)
+        && offline_write_file_tombstone(tombstone, stored);
     bool held = offline_library_fence_acquire(library);
     if (index + 1u < library->count)
         memmove(&library->items[index], &library->items[index + 1u],
@@ -2662,9 +2674,12 @@ bool offline_library_build_homebrew_page(Budget *budget, const char *root,
     *output = NULL; *length = 0;
     char (*names)[ZIP_INSTALL_FOLDER_NAME_LIMIT] = budget_calloc_category(budget,
         BUDGET_CATEGORY_SESSION, ZIP_INSTALL_MANAGED_LIMIT, ZIP_INSTALL_FOLDER_NAME_LIMIT);
+    char (*titles)[ZIP_INSTALL_TITLE_LIMIT] = names == NULL ? NULL
+        : budget_calloc_category(budget, BUDGET_CATEGORY_SESSION,
+              ZIP_INSTALL_MANAGED_LIMIT, ZIP_INSTALL_TITLE_LIMIT);
     size_t count = 0;
-    if (!names || !zip_install_list(root, names, ZIP_INSTALL_MANAGED_LIMIT, &count)) {
-        budget_free(budget, names); return false;
+    if (!titles || !zip_install_list(root, names, titles, ZIP_INSTALL_MANAGED_LIMIT, &count)) {
+        budget_free(budget, titles); budget_free(budget, names); return false;
     }
     OfflineHtml html = {.budget = budget};
     bool okay = html_append(&html, "<!doctype html><meta name=viewport content=\"width=device-width\"><title>")
@@ -2682,11 +2697,12 @@ bool offline_library_build_homebrew_page(Budget *budget, const char *root,
         char encoded[ZIP_INSTALL_FOLDER_HEX_LIMIT];
         zip_install_encode_folder_name(names[i], encoded);
         okay = html_append(&html, "<a href=\"https://tilefinch.local/offline/remove-homebrew?name=%s\">", encoded)
-            && html_label(&html, "Remove") && html_append(&html, " ")
-            && html_escape(&html, names[i]) && html_append(&html, "...</a>");
+            && html_label(&html, "Remove") && html_append(&html, " <span dir=auto>")
+            && html_escape(&html, titles[i]) && html_append(&html, "</span>...</a>");
     }
     okay = okay && html_append(&html, "<a href=\"https://tilefinch.local/offline\">")
         && html_label(&html, "Downloads") && html_append(&html, "</a>");
+    budget_free(budget, titles);
     budget_free(budget, names);
     if (!okay) { budget_free(budget, html.data); return false; }
     *output = html.data; *length = html.length; return true;
@@ -2709,8 +2725,8 @@ bool offline_library_build_file_page(const OfflineLibrary *library,
         && html_append(&html, "</title><style>body{font-family:sans-serif;padding:16px;"
         "background:#f4f4f4;color:#202020}h1{font-size:22px}p{overflow-wrap:anywhere}"
         "a{display:inline-block;padding:10px;margin:6px 12px 6px 0}</style><body dir=auto><h1>")
-        && html_label(&html, "File saved") && html_append(&html, "</h1><p>")
-        && html_escape(&html, item->title) && html_append(&html, "</p><p>")
+        && html_label(&html, "File saved") && html_append(&html, "</h1><p dir=auto>")
+        && html_escape(&html, item->title) && html_append(&html, "</p><p dir=auto>")
         && html_escape(&html, path) && html_append(&html, "</p><p>%llu ", (unsigned long long)item->content_bytes)
         && html_label(&html, "bytes") && html_append(&html, ". ")
         && html_label(&html, "Keep this file, or copy it elsewhere using USB storage.")
@@ -2743,7 +2759,7 @@ bool offline_library_build_page(
         "<style>body{font:16px/1.4 sans-serif;margin:0;padding:14px;background:#f6f4ee;"
         "color:#202020}h1{font-size:22px}.item{background:white;border:1px solid #ccc;"
         "border-radius:8px;padding:10px;margin:9px 0}.meta{color:#666;font-size:13px}"
-        "a{color:#0645ad;margin-right:14px}</style><h1>")
+        "a{color:#0645ad;margin-right:14px}</style><body dir=auto><h1>")
         && html_label(&html, "Saved offline") && html_append(&html, "</h1><p>")
         && html_label(&html, "Articles, offline web apps, videos, and downloaded files are stored on the Memory Stick.")
         && html_append(&html, "</p><a href=\"https://tilefinch.local/offline/homebrew\">")
@@ -2795,9 +2811,10 @@ bool offline_library_build_page(
             total = item->downloaded_bytes;
         if (total != 0)
             percent = (unsigned) (item->downloaded_bytes * 100u / total);
-        okay = html_append(&html, "<section class=item><strong>")
+        /* A title, often a file name, starts from its own side. */
+        okay = html_append(&html, "<section class=item><div dir=auto><strong>")
             && html_escape(&html, item->title)
-            && html_append(&html, "</strong><div class=meta>")
+            && html_append(&html, "</strong></div><div class=meta>")
             && html_label(&html,
                 item->type == OFFLINE_ITEM_ARTICLE ? "Reader article"
                     : item->type == OFFLINE_ITEM_FILE ? "Downloaded file"

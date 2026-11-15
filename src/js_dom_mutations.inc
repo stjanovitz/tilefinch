@@ -78,7 +78,8 @@ static bool bridge_mutation_has_inline_svg_rasters(const DomBridge *bridge)
 {
     return bridge->images != NULL
         && (bridge->images->stats.inline_svg_rasterized != 0
-            || bridge->images->stats.inline_svg_refresh_reused != 0);
+            || bridge->images->stats.inline_svg_refresh_reused != 0
+            || bridge->images->stats.inline_svg_preview_reused != 0);
 }
 
 /* Inline-style properties that can change what an SVG beneath resolves for

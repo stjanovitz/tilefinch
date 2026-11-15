@@ -2778,7 +2778,8 @@ int main(int argc, char **argv)
     printf("parser-blocking-attribution samples=%zu dropped=%zu "
            "compile-us=%llu execute-us=%llu rescan-us=%llu mutations=%zu "
            "stage-us=%llu stage-work=%zu stage-skipped=%zu breakers=%zu "
-           "failure-breakers=%zu time-breakers=%zu work-breakers=%zu\n",
+           "failure-breakers=%zu time-breakers=%zu work-breakers=%zu "
+           "author-exceptions=%zu\n",
            navigation.performance.blocking_script_sample_count,
            navigation.performance.blocking_script_samples_dropped,
            (unsigned long long)
@@ -2795,7 +2796,8 @@ int main(int argc, char **argv)
            navigation.performance.parser_script_stage_breakers,
            navigation.performance.parser_script_stage_failure_breakers,
            navigation.performance.parser_script_stage_time_breakers,
-           navigation.performance.parser_script_stage_work_breakers);
+           navigation.performance.parser_script_stage_work_breakers,
+           navigation.performance.parser_script_author_exceptions);
     for (size_t i = 0;
          i < navigation.performance.blocking_script_sample_count; i++) {
         const NavigationBlockingScriptSample *sample =
@@ -3040,10 +3042,11 @@ int main(int argc, char **argv)
            navigation.performance.layout_reuse_has_dropped,
            navigation.performance.layout_reuse_has_scans);
     printf("layout-text-measure hits=%zu misses=%zu evictions=%zu "
-           "bytes=%zu\n", reuse_stats.text_measure_hits,
+           "bytes=%zu shaped-hits=%zu\n", reuse_stats.text_measure_hits,
            reuse_stats.text_measure_misses,
            reuse_stats.text_measure_evictions,
-           reuse_stats.text_measure_bytes);
+           reuse_stats.text_measure_bytes,
+           reuse_stats.text_measure_shaped_hits);
     printf("progressive-paint attempts=%zu skips=%zu failures=%zu "
            "adoptions=%zu "
            "layouts=%zu paints=%zu layout-us=%llu paint-us=%llu "

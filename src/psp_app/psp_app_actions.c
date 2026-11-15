@@ -692,7 +692,8 @@ static void psp_app_history_step(
             ? psp_offline_store_handle_url(
                   &app->browser->offline_store, engine, profile,
                   moved_entry.url, moved_entry.title, false)
-            : PSP_OFFLINE_ROUTE_ERROR;
+            : psp_offline_store_history_unavailable(
+                  &app->browser->offline_store);
         if (result == PSP_OFFLINE_ROUTE_ERROR && moved) {
             (void) browser_engine_history_step_rollback(
                 engine, forward);
@@ -712,10 +713,10 @@ static void psp_app_history_step(
             || frame->page_dirty;
         if (recovery_return && result == PSP_OFFLINE_ROUTE_PAGE)
             psp_app_clear_lifecycle_retry(app);
-        psp_ui_show_status(
-            &app->process->presentation.ui,
-            psp_offline_store_status(&app->browser->offline_store),
-            180);
+        const char *toast = psp_offline_store_route_toast(
+            &app->browser->offline_store, result);
+        if (toast != NULL)
+            psp_ui_show_status(&app->process->presentation.ui, toast, 180);
         return;
     }
     /* Fragment history is a document-local restore. Handle it before
@@ -877,10 +878,10 @@ static void psp_app_reload(
         psp_tabs_sync_ui(&app->process->presentation.ui, tabs, &app->process->presentation.tab_view);
         frame->page_dirty = result == PSP_OFFLINE_ROUTE_PAGE
             || frame->page_dirty;
-        psp_ui_show_status(
-            &app->process->presentation.ui,
-            psp_offline_store_status(&app->browser->offline_store),
-            180);
+        const char *toast = psp_offline_store_route_toast(
+            &app->browser->offline_store, result);
+        if (toast != NULL)
+            psp_ui_show_status(&app->process->presentation.ui, toast, 180);
         if (result == PSP_OFFLINE_ROUTE_PAGE) {
             app->interactive->recovery_offer = PSP_RECOVERY_OFFER_NONE;
         }

@@ -87,11 +87,23 @@ them trips the breaker or a parser refusal, the writing script finishes
 first (later written scripts in it are skipped) and the page's JavaScript
 stops once it returns.
 
-Outside such a script (timers, events, asynchronous, deferred and module
-scripts, after load) `write()` has no insertion point: it appends the markup
-to the end of the body in a microtask, and a script in it does not run.
-Chromium instead ignores writes from asynchronous scripts and otherwise
-replaces the document.
+Outside such a script `write()` has no insertion point, and it does what
+Chromium does with the two cases that matter on real pages. A write from an
+external classic script (asynchronous, deferred or script-inserted `src`, as
+ad loaders are) or a module script, or from a microtask they queue, is
+ignored: HTML's ignore-destructive-writes counter, kept in the DOM bridge
+while such a script runs. Any other write (a timer, an event handler, a
+callback) once the document is parsed opens it first, which replaces the
+page: the body's children are removed and the written markup takes their
+place. The opened document takes every later write, from any script, until
+`document.close()`; the next write after that opens it again. Written markup
+is parsed in a microtask (or at `close()`), and a script in it does not run:
+Chromium runs it as a parser-inserted script, and inserting it from the
+bootstrap would make it a script-inserted one, which a policy's
+`'strict-dynamic'` trusts. The head, its styles and the listeners are kept.
+A timer's or handler's write while the document is still parsing is added at
+the end of the body instead, where Chromium would stop the parse and blank
+the page.
 
 The parser progressively resolves:
 
@@ -137,6 +149,17 @@ A preview that would be blank until its images arrive is dropped, and the
 next attempt waits for more of the document. The PSP compositor declines a
 first preview that rasters to one colour, as such a masthead can in night
 mode; a declined slots-only preview backs off the same way.
+
+A live preview rasterizes the inline SVGs on its first screen that need no
+network (up to 128 KiB of pixels) into the stream's own image table and
+paints again. The committed page's image loads share those rasters
+(`images_lend_preview_rasters`): an inline `<svg>` whose serialized markup
+matches one takes a reference to its pixels instead of rasterizing it
+again, so each such SVG is rasterized once per load. Each table holds its
+own reference, so the stream dropping its previews after the commit, or a
+cancelled load, frees nothing the other still shows. The PSP validation log
+reports both: `tilefinch-preview-svg:` per preview pass and
+`tilefinch-commit-svg: ... preview-shared=` for the commit.
 
 A painted preview whose current screen shows no text or decoded image while
 the preview holds some further down sets the provisional viewport's
@@ -222,8 +245,9 @@ constructed part of its document.
 
 - Enormous documents whose final DOM/layout exceed the content budget are
   rejected even though their response body can be streamed.
-- `document.write()` without an insertion point appends to the body
-  instead of opening a new document.
+- `document.write()` without an insertion point empties the body and parses
+  into it rather than opening a new document and parser; while the document
+  is still parsing it appends to the body.
 - Live-site challenge clearance is not part of navigation.
 - Desktop replay timing is not PSP network or CPU timing.
 

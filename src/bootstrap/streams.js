@@ -1,4 +1,9 @@
 (() => {
+  /* Loaded after the page may have replaced these globals: build
+     errors, promises and platform objects with the constructors
+     hardening.js captured. */
+  const { TypeError, RangeError, Promise, WeakSet, ArrayBuffer, Uint8Array,
+    TextEncoder, TextDecoder } = globalThis.__tilefinchEventInterfaces;
   let readableState;
   const streamQueueLimit = 64,
     streamByteLimit = 256 * 1024,

@@ -7,6 +7,11 @@
    compat.js routes here. benchmarks/capture-reference.js keeps a copy of
    NumberFormat in lockstep for reference captures. */
 (() => {
+  /* Loaded after the page may have replaced these globals: build
+     errors, promises and platform objects with the constructors
+     hardening.js captured. */
+  const { TypeError, RangeError, WeakMap, Array, Date } =
+    globalThis.__tilefinchEventInterfaces;
   if (globalThis.Intl === undefined) {
     const localeTag = (value) =>
       String(value === undefined ? "en-US" : value).replace(/_/g, "-");

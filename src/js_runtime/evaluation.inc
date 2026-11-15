@@ -1313,12 +1313,26 @@ static void interrupt_split_sample(ScriptRuntime *owner)
 }
 #endif
 
+/* The time the watchdog compares with an entry's deadline: the monotonic
+   clock's `now`, or on the host the virtual clock a test can select
+   (TilefinchTestFaults.watchdog_poll_ms). Call after counting the poll. */
+static uint64_t watchdog_now_ms(const Watchdog *watchdog, uint64_t now)
+{
+#ifndef __PSP__
+    uint64_t step = tilefinch_test_faults()->watchdog_poll_ms;
+    if (step != 0) return watchdog->started_ms + watchdog->polls * step;
+#else
+    (void) watchdog;
+#endif
+    return now;
+}
+
 static int interrupt_handler(JSRuntime *runtime, void *opaque)
 {
     Watchdog *watchdog = opaque;
     uint64_t now_ns = js_rt_monotonic_time_ns();
-    uint64_t now = now_ns / UINT64_C(1000000);
     watchdog->polls++;
+    uint64_t now = watchdog_now_ms(watchdog, now_ns / UINT64_C(1000000));
     watchdog_add_work(watchdog, 1);
 #if !defined(TILEFINCH_NO_TRACE) || defined(TILEFINCH_PSP_VALIDATION_LOG)
     ScriptRuntime *profiled = (ScriptRuntime *) (void *)
@@ -1464,7 +1478,8 @@ bool js_rt_runtime_callback_checkpoint(ScriptRuntime *runtime)
        bounded by the host's callback budget and gives Circle/input a chance
        before any author callback starts. */
     if (!watchdog_cooperate(watchdog)) return false;
-    if (monotonic_time_ms() >= watchdog->deadline_ms) {
+    if (watchdog_now_ms(watchdog, monotonic_time_ms())
+        >= watchdog->deadline_ms) {
         watchdog->interrupted = true;
         return false;
     }
@@ -1620,6 +1635,161 @@ void js_rt_record_exception(JSContext *context, ScriptResult *result)
     tilefinch_platform_log_message(diagnostic);
     runtime_report_heap_failure(bridge == NULL ? NULL : bridge->host);
 #endif
+}
+
+/* The line and column of the innermost frame of `name` in the error's
+   stack: a run's "(name:line:column)", or a compile's "at name:line:column"
+   (QuickJS counts both from 1 in the compiled source). 0 when absent: the
+   value is not an Error, or its script kept no line table. */
+static void script_error_location(JSContext *context, JSValueConst error,
+                                  const char *name, int32_t *line,
+                                  int32_t *column)
+{
+    *line = 0;
+    *column = 0;
+    if (name == NULL || name[0] == '\0' || !JS_IsError(context, error))
+        return;
+    JSValue stack_value = JS_GetPropertyStr(context, error, "stack");
+    if (JS_IsException(stack_value)) {
+        js_rt_clear_formatting_exception(context);
+        return;
+    }
+    const char *stack = JS_IsString(stack_value)
+        ? js_rt_exception_to_cstring(context, stack_value) : NULL;
+    JS_FreeValue(context, stack_value);
+    if (stack == NULL) return;
+    size_t name_length = strlen(name);
+    for (const char *at = strstr(stack, name); at != NULL;
+         at = strstr(at + 1, name)) {
+        if (at == stack || (at[-1] != '(' && at[-1] != ' ')
+            || at[name_length] != ':') continue;
+        char *end = NULL;
+        unsigned long line_number = strtoul(at + name_length + 1, &end, 10);
+        if (end == at + name_length + 1 || *end != ':') continue;
+        const char *column_text = end + 1;
+        unsigned long column_number = strtoul(column_text, &end, 10);
+        if (end == column_text) continue;
+        *line = line_number > INT32_MAX ? INT32_MAX : (int32_t) line_number;
+        *column = column_number > INT32_MAX ? INT32_MAX
+            : (int32_t) column_number;
+        break;
+    }
+    JS_FreeCString(context, stack);
+}
+
+bool js_rt_script_errors_muted(const ScriptRuntime *runtime,
+                               lxb_dom_node_t *script_node,
+                               const char *script_url)
+{
+    if (runtime == NULL || script_url == NULL
+        || (strncmp(script_url, "http:", 5) != 0
+            && strncmp(script_url, "https:", 6) != 0)) return false;
+    if (script_node != NULL && script_node->type == LXB_DOM_NODE_TYPE_ELEMENT
+        && lxb_dom_element_has_attribute(
+               lxb_dom_interface_element(script_node),
+               (const lxb_char_t *) "crossorigin", 11)) return false;
+    return runtime->bridge.opaque_origin
+        || runtime->bridge.document_url == NULL
+        || !tilefinch_url_same_origin(runtime->bridge.document_url,
+                                      script_url);
+}
+
+bool js_rt_report_script_error(JSContext *context, JSValueConst error,
+                               const char *name,
+                               ScriptCompileSourceKind source_kind)
+{
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    ScriptRuntime *runtime = bridge == NULL ? NULL : bridge->host;
+    /* A lazy factory throws inside the script that required it, which
+       reports it. An interrupted or memory-exhausted entry runs no more
+       author code. */
+    if (runtime == NULL || !compile_kind_is_page(source_kind)
+        || source_kind == SCRIPT_COMPILE_SOURCE_LAZY_FACTORY
+        || runtime->watchdog.interrupted
+        || runtime->watchdog.memory_exhausted) return false;
+    runtime->script_author_error = true;
+    /* An inline script's (classic or module) filename is its document's.
+       It has no element event, so it leaves script_error_reported alone
+       when it runs inside an external script. */
+    const char *filename = name == NULL ? "" : name;
+    if (source_kind == SCRIPT_COMPILE_SOURCE_INLINE
+        || strstr(filename, "#inline-module-") != NULL) {
+        filename = bridge->document_url == NULL ? "" : bridge->document_url;
+    } else {
+        runtime->script_error_reported = true;
+    }
+    bool muted = source_kind == SCRIPT_COMPILE_SOURCE_EXTERNAL
+        && runtime->script_errors_muted;
+    int32_t line = 0, column = 0;
+    if (!muted) script_error_location(context, error, name, &line, &column);
+    JSValue global = JS_GetGlobalObject(context);
+    JSValue report = JS_GetPropertyStr(context, global,
+                                       "__tilefinchReportUncaught");
+    JSValue context_name = JS_NewString(context, "script");
+    JSValue file = JS_NewString(context, filename);
+    if (JS_IsFunction(context, report) && !JS_IsException(context_name)
+        && !JS_IsException(file)) {
+        JSValueConst arguments[6] = {
+            error, context_name, file, JS_NewInt32(context, line),
+            JS_NewInt32(context, column), JS_NewBool(context, muted)
+        };
+        BudgetAllocationOwner previous_owner =
+            bridge_document_owner_enter(bridge);
+        unsigned ledger = work_ledger_enter(WORK_LEDGER_SCRIPT);
+        unsigned split = script_split_enter(SCRIPT_SPLIT_JS);
+        JSValue returned = JS_Call(context, report, global, 6, arguments);
+        script_split_leave(split);
+        work_ledger_leave(ledger);
+        bridge_document_owner_leave(bridge, previous_owner);
+        /* The routine catches everything but an interrupt or a refusal. */
+        if (JS_IsException(returned)) js_rt_clear_formatting_exception(context);
+        JS_FreeValue(context, returned);
+    } else if (JS_HasException(context)) {
+        js_rt_clear_formatting_exception(context);
+    }
+    JS_FreeValue(context, file);
+    JS_FreeValue(context, context_name);
+    JS_FreeValue(context, report);
+    JS_FreeValue(context, global);
+    return true;
+}
+
+bool js_rt_record_script_exception(JSContext *context, const char *name,
+                                   ScriptCompileSourceKind source_kind,
+                                   ScriptResult *result)
+{
+    if (!JS_HasException(context)) {
+        js_rt_record_exception(context, result);
+        return false;
+    }
+    JSValue exception = JS_GetException(context);
+    JS_Throw(context, JS_DupValue(context, exception));
+    js_rt_record_exception(context, result);
+    /* A refused allocation is the host's failure, not the script's. QuickJS
+       throws "InternalError: out of memory", or null when it could not
+       allocate even that error object, and the error's text can itself
+       fail to allocate while the heap is still full (the "JavaScript
+       exception" fallback). A page can throw null, or a value whose text
+       throws, itself, so those count as out of memory only when the
+       realm's heap refused an allocation during this entry into
+       JavaScript. */
+    static const char out_of_memory[] = "InternalError: out of memory",
+                      unformatted[] = "JavaScript exception";
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    const Watchdog *watchdog = bridge == NULL || bridge->host == NULL
+        ? NULL : &bridge->host->watchdog;
+    bool heap_refused = watchdog != NULL && watchdog->pool != NULL
+        && budget_quickjs_pool_rejection_count(watchdog->pool)
+               > watchdog->pool_rejections_started;
+    bool host_failure = strncmp(result->error, out_of_memory,
+                                sizeof(out_of_memory) - 1) == 0
+        || (heap_refused && (JS_IsNull(exception)
+                             || strncmp(result->error, unformatted,
+                                        sizeof(unformatted) - 1) == 0));
+    bool reported = !host_failure
+        && js_rt_report_script_error(context, exception, name, source_kind);
+    JS_FreeValue(context, exception);
+    return reported;
 }
 
 static void promise_rejection_tracker(JSContext *context,
@@ -2087,7 +2257,12 @@ bool js_rt_evaluate_compiled_source(
     size_t source_length, ScriptResult *result)
 {
     DomBridge *bridge = JS_GetContextOpaque(context);
-    if (JS_IsException(compiled)) return false;
+    if (JS_IsException(compiled)) {
+        /* A compile's SyntaxError, still pending. */
+        js_rt_record_script_exception(
+            context, name, SCRIPT_COMPILE_SOURCE_EXTERNAL, result);
+        return false;
+    }
     if (bridge != NULL && bridge->host != NULL
         && !js_rt_runtime_script_checkpoint(bridge->host, 1)) {
         JS_FreeValue(context, compiled);
@@ -2118,7 +2293,8 @@ bool js_rt_evaluate_compiled_source(
 #endif
     if (JS_IsException(compiled)) {
         JS_FreeValue(context, compiled);
-        js_rt_record_exception(context, result);
+        js_rt_record_script_exception(
+            context, name, SCRIPT_COMPILE_SOURCE_EXTERNAL, result);
         script_residency_trace_settled(
             JS_GetRuntime(context), name, source_length, false);
         return false;
@@ -2715,6 +2891,8 @@ static bool evaluate_source_type_at(JSContext *context, const char *source,
                 runtime, name, SCRIPT_MODULE_MAP_LOADING)) return false;
     }
     bool admitted = false;
+    size_t module_host_failures = runtime == NULL ? 0
+        : runtime->module_host_failures;
     uint64_t compile_started_us = tilefinch_platform_monotonic_time_us();
     JSValue value = module && external_module
         ? js_rt_module_compile_external(
@@ -2734,6 +2912,11 @@ static bool evaluate_source_type_at(JSContext *context, const char *source,
         }
         return false;
     }
+    /* A module graph whose import the host could not fetch or admit fires
+       only the element's error event (HTML "fetch a module script graph");
+       its parse errors and failed specifiers are author errors. */
+    bool graph_fetch_failed = module && JS_IsException(value)
+        && runtime->module_host_failures != module_host_failures;
     if (!JS_IsException(value) && bridge != NULL && bridge->host != NULL
         && !js_rt_runtime_script_checkpoint(bridge->host, 1)) {
         JS_FreeValue(context, value);
@@ -2774,6 +2957,14 @@ static bool evaluate_source_type_at(JSContext *context, const char *source,
         script_split_leave(split);
         work_ledger_leave(ledger);
     }
+    /* A module's evaluation settles its promise; one that threw before its
+       first await has rejected it already. */
+    if (module && !JS_IsException(value)
+        && JS_PromiseState(context, value) == JS_PROMISE_REJECTED) {
+        JSValue reason = JS_PromiseResult(context, value);
+        js_rt_report_script_error(context, reason, name, source_kind);
+        JS_FreeValue(context, reason);
+    }
     if (result != NULL && (unsigned) source_kind < 6u) {
         result->execute_us[source_kind] +=
             tilefinch_platform_monotonic_time_us() - execute_started_us;
@@ -2793,12 +2984,16 @@ static bool evaluate_source_type_at(JSContext *context, const char *source,
     bridge_document_owner_leave(bridge, previous_owner);
     if (JS_IsException(value)) {
         JS_FreeValue(context, value);
-        js_rt_record_exception(context, result);
+        bool reported = false;
+        if (graph_fetch_failed) js_rt_record_exception(context, result);
+        else reported = js_rt_record_script_exception(
+            context, name, source_kind, result);
         script_residency_trace_settled(
             JS_GetRuntime(context), name, length, false);
         if (module) {
             (void) js_rt_runtime_module_root_state_set(
-                runtime, name, SCRIPT_MODULE_MAP_FAILED);
+                runtime, name, reported ? SCRIPT_MODULE_MAP_ERRORED
+                                        : SCRIPT_MODULE_MAP_FAILED);
         }
         return false;
     }
@@ -2996,6 +3191,14 @@ bool js_rt_current_script_scope_begin(JSContext *context,
         JS_FreeValue(context, previous->value);
         previous->value = JS_UNDEFINED;
     }
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    previous->ignores_writes = set && bridge != NULL
+        && bridge->destructive_writes_ignored < UINT16_MAX
+        && (module || (node != NULL && node->type == LXB_DOM_NODE_TYPE_ELEMENT
+                       && lxb_dom_element_has_attribute(
+                              lxb_dom_interface_element(node),
+                              (const lxb_char_t *) "src", 3)));
+    if (previous->ignores_writes) bridge->destructive_writes_ignored++;
     return set;
 }
 
@@ -3008,6 +3211,10 @@ bool js_rt_current_script_scope_end(JSContext *context,
         context, JS_DupValue(context, previous->value), result);
     DomBridge *bridge = JS_GetContextOpaque(context);
     if (bridge != NULL) bridge->current_script_csp_grant = previous->csp_grant;
+    if (bridge != NULL && previous->ignores_writes
+        && bridge->destructive_writes_ignored != 0)
+        bridge->destructive_writes_ignored--;
+    previous->ignores_writes = false;
     JS_FreeValue(context, previous->value);
     previous->value = JS_UNDEFINED;
     return restored;

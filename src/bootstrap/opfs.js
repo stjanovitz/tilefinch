@@ -1,17 +1,30 @@
 (() => {
+  /* Loaded after the page may have replaced these globals: build
+     errors, promises and platform objects with the constructors
+     hardening.js captured. */
+  const { Error, TypeError, DOMException, Promise, ArrayBuffer, Uint8Array,
+    Blob, TextEncoder } = globalThis.__tilefinchEventInterfaces;
   const command = globalThis.__tilefinchOpfsCommand,
     createPrivateWeakMap = globalThis.__tilefinchCreatePrivateWeakMap,
     blobBytes = globalThis.__tilefinchBlobBytes,
     scheduleTask = globalThis.__tilefinchScheduleTask,
     storageManager = globalThis.__tilefinchOpfsStorageManager,
-    TrustedPromise = Promise,
-    trustedPromiseReject = Function.call.bind(Promise.reject, Promise),
-    trustedPromiseThen = Function.call.bind(Promise.prototype.then);
+    /* Streams' own WritableStream, which the page may have replaced at the
+       global by now. */
+    WritableStream = globalThis.__tilefinchOpfsWritableStream,
+    /* getDirectory goes on the interface hardening.js captured, and the
+       promises it returns are the realm's, settled through Promise's own
+       reject and then as they were before author code ran. */
+    { StorageManager, promiseReject: trustedPromiseReject,
+      promiseThen: trustedPromiseThen } = globalThis.__tilefinchEventInterfaces,
+    TrustedPromise = Promise;
   if (typeof command !== "function" || typeof createPrivateWeakMap !== "function"
-      || typeof blobBytes !== "function" || typeof scheduleTask !== "function")
+      || typeof blobBytes !== "function" || typeof scheduleTask !== "function"
+      || typeof WritableStream !== "function")
     throw new Error("Origin-private file system bridge is unavailable");
   delete globalThis.__tilefinchOpfsCommand;
   delete globalThis.__tilefinchOpfsStorageManager;
+  delete globalThis.__tilefinchOpfsWritableStream;
 
   const OP_STAT = 0, OP_CREATE = 1, OP_READ = 2, OP_WRITE = 3,
     OP_REMOVE = 4, OP_LIST = 5,

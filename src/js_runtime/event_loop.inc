@@ -1482,6 +1482,26 @@ void script_runtime_script_mark_started(ScriptRuntime *runtime,
         || source_length != 0) state->already_started = true;
 }
 
+void script_runtime_whole_document_write_begin(ScriptRuntime *runtime,
+                                               const lxb_dom_node_t *script)
+{
+    if (runtime != NULL) runtime->bridge.whole_document_writer = script;
+}
+
+char *script_runtime_whole_document_write_end(ScriptRuntime *runtime,
+                                              size_t *length)
+{
+    if (length != NULL) *length = 0;
+    if (runtime == NULL) return NULL;
+    DomBridge *bridge = &runtime->bridge;
+    char *written = bridge->whole_document_written;
+    if (length != NULL) *length = bridge->whole_document_written_length;
+    bridge->whole_document_writer = NULL;
+    bridge->whole_document_written = NULL;
+    bridge->whole_document_written_length = 0;
+    return written;
+}
+
 bool script_runtime_script_parser_inserted(
     const ScriptRuntime *runtime, const lxb_dom_node_t *node)
 {

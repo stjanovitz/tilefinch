@@ -18,6 +18,13 @@ typedef struct {
     unsigned audio_slot_allocation_fail_at;
     unsigned audio_slot_install_fail_at;
     unsigned audio_slot_publish_fail_at;
+    /* Run the host watchdog on a virtual clock: when nonzero, each poll of
+       an entry (the VM's interrupt and each callback checkpoint) moves the
+       entry's time on by this many milliseconds, from the moment it was
+       armed, instead of reading the monotonic clock. A script then reaches
+       its deadline after the same amount of work however loaded the
+       machine is, so a test of what a timeout counts as is deterministic. */
+    unsigned watchdog_poll_ms;
     /* Expire the host watchdog at the Nth WebAssembly task checkpoint. */
     unsigned wasm_task_checkpoints;
     /* Refuse the next WebAssembly memory alias buffer allocation once. */
@@ -148,6 +155,14 @@ typedef struct {
        interior spans, core runs or the translucent blend memo: the
        reference those must reproduce. */
     bool raster_span_reference;
+    /* Host work observation: translucent blend plans the retained canvas
+       overlay builds (one per overlay change). Reset by the test. */
+    unsigned canvas_overlay_blend_plans;
+    /* While nonzero, fill every new budget_malloc payload with this byte,
+       as reused heap memory would hold, so a field read before it is
+       written gives the same wrong value on every run. budget_calloc still
+       zeroes. */
+    unsigned char budget_fresh_fill;
     /* Host observation for index-refusal tests: linear node-box lookups.
        Reset by the test; never present on the PSP. */
     unsigned long long layout_node_box_scans;

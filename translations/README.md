@@ -7,36 +7,64 @@ Appearance → Language & emoji → Interface language**; the
 explains how.
 
 The catalog offers Spanish, French, German, Japanese, Russian, Ukrainian,
-Simplified Chinese, Korean, Hindi, Arabic, Portuguese, Bengali and Assamese
-besides the built-in English. Each non-English language is a small,
+Simplified Chinese, Korean, Hindi, Arabic, Portuguese, Bengali, Assamese and
+Hebrew besides the built-in English. Each non-English language is a small,
 data-only translation file downloaded from
 [tilefinch-models](https://github.com/stjanovitz/tilefinch-models). Japanese,
 Chinese and Korean also install their signed glyph packs; Russian and
-Ukrainian install the Cyrillic pack, Hindi installs Devanagari, Arabic uses
-the Arabic pack, and Bengali and Assamese share the Bengali–Assamese pack.
+Ukrainian install the Cyrillic pack, Hindi installs Devanagari, Arabic and
+Hebrew use their own packs, and Bengali and Assamese share the
+Bengali–Assamese pack.
 Spanish, French, German and Portuguese use the built-in font. Page fonts,
 preferred video languages and HTTP language preferences are independent.
 
 Common native navigation, settings labels, controls and status messages are
 translated; advanced diagnostics and messages without a catalog entry stay
 in English. Missing or damaged translation or font files fall back to
-English without blocking startup. Arabic labels are contextually shaped and
-ordered right-to-left once when the catalog loads; ASCII hints and digits
-keep their order, and the browser's panel geometry is not mirrored. Hindi,
+English without blocking startup. Arabic and Hebrew read right to left (the
+generator's `RIGHT_TO_LEFT`, each spec's `right_to_left`): their labels are
+ordered right to left once when the catalog loads, Arabic's also
+contextually shaped; ASCII hints and digits keep their order, and the
+browser's list panels are mirrored
+([Browser chrome direction](../docs/TEXT_BIDI.md#browser-chrome-direction)).
+Hebrew labels are unpointed modern Hebrew and need no shaping. Hindi,
 Bengali and Assamese labels use pre-shaped syllable clusters from their
 packs, which cover every current interface label and common syllables, not
-all possible complex-script shaping. There is no Hebrew interface
-translation.
+all possible complex-script shaping.
+
+The Hebrew translation, and the rows v18 adds for the other languages (the
+page's bottom bar, the Collections, Themes and Experimental screens, Settings
+descriptions, HOME, tabs, the YouTube login question, the player's titles and
+language names, and a few settings values), have not been reviewed by native
+speakers.
 
 ## Editing and publishing
 
-The current catalog version is **v17**. All thirteen downloadable languages
-use it, and `src/generated/ui_languages.inc` pins each language's file name,
-SHA-256 and the signed glyph-pack revision its shaped labels need (Devanagari
-revision 9 for Hindi, Bengali–Assamese revision 5 for Bengali and Assamese).
+The newest catalog version is **v18**, which holds every language, Hebrew
+last. Hebrew joined in v18; because v18 was not yet published when the next
+rows arrived, those rows went into v18 for all fourteen languages rather
+than into a v19, so one catalog is published. Browsers that pin v18 read
+every language from it; v17 stays published for older browsers.
+`src/generated/ui_languages.inc` pins each language's file name, SHA-256
+and the signed glyph-pack revision its shaped labels need (Devanagari
+revision 9 for Hindi, Bengali–Assamese revision 5 for Bengali and
+Assamese).
 
-Edit the active catalog's `translations/ui/v17/source.tsv`, then run
-`python3 tools/generate_ui_translations.py`.
+v17 is immutable, and so is v18 once published. The next change to any row
+after that makes v19: copy v18's source into
+`translations/ui/v19/source.tsv`, add
+`CATALOGS.append((19, list(latest_languages.values())))` to the generator,
+then run `python3 tools/generate_ui_translations.py`. A new version keeps
+every key of the one before it, except keys listed under its number in the
+generator's `RETIRED_KEYS` (for a label the browser no longer draws, or one
+whose English text changed).
+
+A browser that pins v18 can install a language only once its
+`translations/ui/v18/<code>.tful` is published to tilefinch-models, so all
+fourteen v18 files are published together. They need no new glyph-pack
+revision: v18's Hindi, Bengali and Assamese labels stay within the
+sequences their current packs were built from, and both published Hebrew
+pack revisions cover every Hebrew label.
 Commit the authored sources, generated Hindi and Bengali–Assamese sequences
 and `src/generated/ui_languages.inc` here, not the `.tful` downloads. Each
 language spec carries a versioned `resource_key` relative to
@@ -82,8 +110,8 @@ The file stores no offsets: the reader finds each value by scanning the
 lines once while loading and keeps a 32-bit offset per row. Until v17 that
 offset was 16-bit, which held every file under 64 KiB; the wire layout did
 not change, so v12 to v16 files still load. A loaded catalog costs its
-file's size plus 4 bytes per row; Arabic also keeps its display text, with
-another 4 bytes per row.
+file's size plus 4 bytes per row; Arabic and Hebrew also keep their display
+text, with another 4 bytes per row.
 
 ### Files on the Memory Stick
 
@@ -100,8 +128,9 @@ performs in-memory lookups, with no filesystem access.
 
 `tilefinch-ui-language-layout-tests` exercises the real native painter at
 480×272 in every interface language, in light and dark themes and both menu
-text sizes. It covers settings, language choices, installation/cancellation
-states, themes, tabs, page tools, site controls and help. Every translated
+text sizes. It covers settings and their descriptions, language choices,
+installation/cancellation states, themes, tabs, page tools, the page's
+bottom bar, Collections, site controls and help. Every translated
 label must be complete, stay onscreen, and have at least five pixels of space
 from adjacent text. Frame and row-padding canaries catch out-of-bounds writes.
 It also renders the YouTube provider's signed-out and signed-in home pages,

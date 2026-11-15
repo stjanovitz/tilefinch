@@ -89,6 +89,12 @@ typedef struct {
     bool (*poll_input)(void *context, TilefinchPlatformInput *input);
     bool (*present_rgb565)(void *context, const uint16_t *pixels,
                            size_t width, size_t height, size_t stride_pixels);
+    /* Optional synchronous, bit-exact snapshot copy. False asks the engine
+       to use memcpy. No format conversion or publication takes place. */
+    bool (*copy_pixel_rows)(void *context, unsigned char *destination,
+                            size_t destination_stride,
+                            const unsigned char *source, size_t source_stride,
+                            size_t row_bytes, size_t rows);
     /* Optional: pixels once presented are about to be freed. A frontend
        that repaints the last presented frame from another thread stops
        using them before this returns. */
@@ -173,6 +179,12 @@ bool tilefinch_platform_poll_input(TilefinchPlatformInput *input);
 bool tilefinch_platform_present_rgb565(const uint16_t *pixels, size_t width,
                                     size_t height, size_t stride_pixels);
 void tilefinch_platform_retire_frame(const uint16_t *pixels);
+/* The caller supplies nonoverlapping, valid row spans. Completes all rows
+   synchronously, including when the optional platform accelerator declines. */
+void tilefinch_platform_copy_pixel_rows(
+    unsigned char *destination, size_t destination_stride,
+    const unsigned char *source, size_t source_stride,
+    size_t row_bytes, size_t rows);
 /* A checkpoint with no boundary meaning: work a frontend may only pace. */
 bool tilefinch_platform_cooperate(const char *phase,
                                size_t completed_work_units);

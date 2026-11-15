@@ -84,7 +84,9 @@
   const left = new Uint8Array(4), right = new Uint8Array(4);
   gl.readPixels(2, 3, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, left);
   gl.readPixels(6, 3, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, right);
-  ext.drawArraysInstancedANGLE(gl.TRIANGLES, 0, 65, 64);
+  /* More than 64 instances is refused; more than 4,096 expanded vertices
+     is drawn in parts (webgl-big-draws.js). */
+  ext.drawArraysInstancedANGLE(gl.TRIANGLES, 0, 3, 65);
   const expandedWorkBounded = gl.getError() === gl.OUT_OF_MEMORY;
   ext.vertexAttribDivisorANGLE(matrixLocation, 2);
   const bounded = gl.getError() === gl.INVALID_OPERATION;

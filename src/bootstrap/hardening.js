@@ -77,18 +77,126 @@
     writable: false,
     value: isEvent,
   });
-  /* compat.js's frozen, null-prototype table of the event interfaces it
-     captured before author code: Event, EventTarget and the Event
-     subclasses it defines, keyed by global name. Lazy modules evaluate
-     after the page may have replaced those globals, so they extend these
-     instead (`const { Event, EventTarget } = __tilefinchEventInterfaces`).
-     Every entry is the object the page itself received at that global, so
-     the table grants a page nothing it lacked. */
+  /* The interfaces lazy modules extend or construct, keyed by global
+     name: compat.js's event interfaces (Event, EventTarget and the Event
+     subclasses it defines), captured before author code, and DOMException
+     and PerformanceEntry, captured here, still before author code. Lazy
+     modules evaluate after the page may have replaced those globals, so
+     they take these instead (`const { Event, EventTarget } =
+     __tilefinchEventInterfaces`). Every entry is the object the page
+     itself received at that global, so the table grants a page nothing it
+     lacked. Navigator, Document and the element interfaces are those whose
+     prototypes lazy modules add members to; the native lazy-module
+     triggers find those prototypes here too (runtime_creation.inc). The
+     other names in the loop below are the eagerly defined globals a Worker
+     shares with its owner (worker.js): the worker reads these instead of
+     whatever the owner page left at the global. The loop reads
+     descriptors, so it never starts a lazy module. addListener and
+     removeListener are EventTarget's own methods as call-bound functions
+     (`addListener(target, type, f)`): event handler attributes and the
+     browser's own listeners register through them, never through a
+     page's patched EventTarget.prototype method, as in browsers; dispatch
+     is dispatchEvent the same way. The ECMAScript and platform
+     constructors after console are those lazy modules build errors,
+     promises, collections and platform objects with: a lazy module
+     destructures the ones it names, so its `new TypeError(...)` is the
+     realm's whatever the page left at the global. defineProperty, apply,
+     promiseThen and promiseReject are Object.defineProperty, Reflect.apply,
+     Promise.prototype.then (call-bound) and Promise.reject as they were
+     before author code ran; lazy modules publish their factories and
+     private hooks through defineProperty. */
+  const captured = {
+      __proto__: null,
+      ...eventInterfaces,
+      DOMException: globalThis.DOMException,
+      PerformanceEntry: globalThis.PerformanceEntry,
+    },
+    eventTargetPrototype = eventInterfaces.EventTarget.prototype;
+  for (const name of [
+    "Navigator", "Document", "Node", "Element", "HTMLElement",
+    "HTMLCanvasElement", "ShadowRoot", "StorageManager",
+    "AbortController", "AbortSignal", "BroadcastChannel", "Crypto",
+    "CustomEvent", "DOMRect", "EventSource", "File", "FileList", "FileReader",
+    "FormData", "GPU", "MessageChannel", "MessagePort", "NavigatorUAData",
+    "NetworkInformation", "PerformanceMark", "PerformanceMeasure",
+    "PerformanceObserverEntryList", "PerformanceResourceTiming",
+    "PermissionStatus", "Permissions", "SubtleCrypto",
+    "WGSLLanguageFeatures", "WebSocket", "XMLHttpRequest",
+    "XMLHttpRequestEventTarget", "XMLHttpRequestUpload", "console",
+    "Error", "TypeError", "RangeError", "SyntaxError", "Promise", "Map",
+    "Set", "WeakMap", "WeakSet", "WeakRef", "Proxy", "Array", "ArrayBuffer",
+    "Uint8Array", "Uint8ClampedArray", "Int32Array", "Uint32Array",
+    "Float32Array", "Float64Array", "Date", "RegExp", "URL", "Headers",
+    "Request", "Response", "Blob", "TextEncoder", "TextDecoder",
+    "URLSearchParams",
+  ]) {
+    const value = getDescriptor(globalThis, name)?.value;
+    if (value !== undefined) captured[name] = value;
+  }
+  captured.addListener = Function.call.bind(
+    eventTargetPrototype.addEventListener);
+  captured.removeListener = Function.call.bind(
+    eventTargetPrototype.removeEventListener);
+  captured.dispatch = Function.call.bind(eventTargetPrototype.dispatchEvent);
+  captured.defineProperty = defineProperty;
+  /* AbortController's own abort() and signal getter, and AbortSignal's
+     reason getter, call-bound: worker.js ends a worker's lifetime signal
+     with these, never with a page's patch of them. */
+  const controllerPrototype = globalThis.AbortController.prototype;
+  captured.abortController = Function.call.bind(controllerPrototype.abort);
+  captured.controllerSignal = Function.call.bind(
+    getDescriptor(controllerPrototype, "signal").get);
+  captured.signalReason = Function.call.bind(
+    getDescriptor(globalThis.AbortSignal.prototype, "reason").get);
+  captured.apply = Reflect.apply;
+  captured.promiseThen = Function.call.bind(Promise.prototype.then);
+  captured.promiseReject = Promise.reject.bind(Promise);
+  /* The private hooks lazy modules publish for eager modules and native
+     code to call by name, reserved before author code as getters: a page
+     can neither define one before its module loads (so its function is
+     never called in the module's place) nor set or replace one. A module
+     sets its own feature's hooks through the publisher claimHooks() gives
+     it as its first statement: the host hands each load one claim
+     (__tilefinchLazyLoading), so page code that runs while the module
+     loads gets none, and a publisher works only while its load lasts.
+     The indices are the host's LazyBootstrapFeature values. */
+  const lazyLoading = globalThis.__tilefinchLazyLoading;
+  deleteProperty(globalThis, "__tilefinchLazyLoading");
+  if (typeof lazyLoading === "function") {
+    const hooks = { __proto__: null }, owner = { __proto__: null },
+      features = [
+        [0, "CanvasAttributeChanged", "CanvasConnected", "CanvasDimension",
+          "CanvasReadbackState", "FlushCanvasSurfaces", "SetCanvasDimension"],
+        [1, "AbortIndexedDBForWorker"],
+        [2, "BeginMotionObservation", "MotionRecheck", "MotionTreeChanged",
+          "TransitionsDirty", "WatchTransitions"],
+        [5, "CreateWebGLContext", "FlushWebGLSurfaces", "WebGLConnected",
+          "WebGLReadback", "WebGLResize"],
+        [7, "CloneWasmModule"],
+      ];
+    for (let group = 0; group < features.length; group++)
+      for (let at = 1; at < features[group].length; at++) {
+        const name = "__tilefinch" + features[group][at];
+        if (getDescriptor(globalThis, name)) continue;
+        owner[name] = features[group][0];
+        defineProperty(globalThis, name, {
+          __proto__: null, configurable: false, enumerable: false,
+          get: () => hooks[name], set() {},
+        });
+      }
+    captured.claimHooks = () => {
+      const feature = lazyLoading();
+      return feature < 0 ? null : (name, value) => {
+        if (owner[name] === feature && hooks[name] === undefined
+            && lazyLoading(feature)) hooks[name] = value;
+      };
+    };
+  }
   defineProperty(globalThis, "__tilefinchEventInterfaces", {
     configurable: false,
     enumerable: false,
     writable: false,
-    value: eventInterfaces,
+    value: freeze(captured),
   });
   for (const name of [
     "Blob", "DOMImplementation", "MutationObserver", "Navigator", "NavigatorUAData",

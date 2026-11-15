@@ -1,4 +1,5 @@
 #include "image_svg_decode_internal.h"
+#include "diagnostic_trace.h"
 #include "tilefinch/platform.h"
 #include "tilefinch_test_faults.h"
 
@@ -20,6 +21,35 @@ static uint64_t svg_slice_started_us;
    allocations survive the scratch rollback. */
 static BudgetAllocationOwner svg_caller_owner;
 static void svg_raster_shape(void *shape, int width, int height, float scale);
+/* Where decode time goes (image_svg_decode_profile). Host and validation
+   builds only: constant false otherwise, so the clock reads compile out. */
+static ImageSvgDecodeProfile svg_profile;
+
+static bool svg_profile_enabled(void)
+{
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    return true;
+#else
+    return tilefinch_trace_image_profile();
+#endif
+}
+
+static uint64_t svg_profile_now_us(void)
+{
+    return svg_profile_enabled() ? tilefinch_platform_monotonic_time_us() : 0;
+}
+
+static void svg_profile_add(uint64_t *total, uint64_t started)
+{
+    if (started == 0) return;
+    uint64_t now = tilefinch_platform_monotonic_time_us();
+    if (now > started) *total += now - started;
+}
+
+void image_svg_decode_profile(ImageSvgDecodeProfile *profile)
+{
+    if (profile != NULL) *profile = svg_profile;
+}
 static bool svg_raster_coverage(void *rasterizer, unsigned char *coverage,
                                  int first, int last, int row);
 
@@ -39,10 +69,12 @@ static void svg_cooperate(void)
     uint64_t now = tilefinch_platform_monotonic_time_us();
     if (now >= svg_slice_started_us
         && now - svg_slice_started_us < UINT64_C(8000)) return;
+    uint64_t cooperate_started = svg_profile_now_us();
     BudgetAllocationOwner scratch = budget_allocation_owner_enter(
         svg_budget, svg_caller_owner);
     (void) tilefinch_platform_cooperate("svg-decode", svg_allocations);
     budget_allocation_owner_leave(svg_budget, scratch);
+    svg_profile_add(&svg_profile.cooperate_us, cooperate_started);
     svg_slice_started_us = tilefinch_platform_monotonic_time_us();
 }
 
@@ -147,6 +179,7 @@ static unsigned char *svg_rasterize(Budget *budget,
     svg_clips = context;
     BudgetAllocationOwner previous_owner =
         budget_allocation_owner_enter(budget, scratch_owner);
+    uint64_t raster_started = svg_profile_now_us();
     NSVGrasterizer *rasterizer = nsvgCreateRasterizer();
     if (rasterizer != NULL) {
         float scale_x = (float) output_width / svg->width;
@@ -156,6 +189,8 @@ static unsigned char *svg_rasterize(Budget *budget,
                       output_width, output_height, output_width * 4);
         nsvgDeleteRasterizer(rasterizer);
     }
+    svg_profile_add(&svg_profile.raster_us, raster_started);
+    if (raster_started != 0) svg_profile.rasters++;
     budget_allocation_owner_leave(budget, previous_owner);
     if (rasterizer == NULL || svg_allocation_failed) {
         budget_free(budget, pixels);
@@ -265,7 +300,9 @@ unsigned char *image_svg_decode_deferrable(
     NSVGimage *svg = NULL;
     if (source != NULL) {
         svg_parses++;
+        uint64_t parse_started = svg_profile_now_us();
         svg = svg_parse_viewports(source, budget);
+        svg_profile_add(&svg_profile.parse_us, parse_started);
     }
     budget_allocation_owner_leave(budget, previous_owner);
     unsigned char *pixels = NULL;

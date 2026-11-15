@@ -9,6 +9,11 @@
    observes a privileged bridge on the global object. This module must be
    evaluated after dom.js and before platform.js. */
 globalThis.__tilefinchInstallFrames = (support) => {
+  /* Bound before author code runs: what this module converts, collects
+     and throws with stays the realm's own when a page replaces the
+     global. */
+  const { String, Number, Map, Set, Error, TypeError, RangeError,
+    HTMLIFrameElement } = globalThis;
   const trustedEvent =
       __tilefinchRealmGlobal.__tilefinchTrustedEventShare.trustedEvent,
     newEvent =
@@ -31,6 +36,7 @@ globalThis.__tilefinchInstallFrames = (support) => {
     blobBytes,
     normalizePostMessageTarget,
     location,
+    browserDispatch,
   } = support;
   const frameSandboxPolicy = (element) => {
       const value = element?.getAttribute?.("sandbox");
@@ -402,7 +408,7 @@ globalThis.__tilefinchInstallFrames = (support) => {
       state.initialAboutBlank = false;
     queueMicrotask(() => {
       if (element.isConnected && state.loadGeneration === generation)
-        element.dispatchEvent(trustedEvent(newEvent("load")));
+        browserDispatch(element, trustedEvent(newEvent("load")));
     });
   };
   globalThis.__tilefinchSetFrameWindowState = (

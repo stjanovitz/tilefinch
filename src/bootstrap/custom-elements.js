@@ -1,8 +1,15 @@
 (() => {
+  const Object = __tilefinchObject;
   const trustedEvent =
       __tilefinchRealmGlobal.__tilefinchTrustedEventShare.trustedEvent,
     newEvent =
       __tilefinchRealmGlobal.__tilefinchTrustedEventShare.createBrowserEvent;
+  /* compat.js's, defined after this module: bound when it is, so what this
+     module throws is never the page's global. */
+  let DOMException;
+  const { Node, Document } = globalThis;
+  __tilefinchRealmGlobal.__tilefinchTrustedEventShare.bindDOMException(
+    (value) => { DOMException = value; });
   /* Definitions made in any registry, main or scoped. */
   let definedAnywhere = 0;
   const definitions = new Map(),
@@ -59,7 +66,7 @@
       typeof value[Symbol.iterator] !== "function"
     )
       throw new TypeError("Iterable sequence required");
-    return Array.from(value, String).slice(0, limit);
+    return __tilefinchArrayFrom(value, String).slice(0, limit);
   };
   const callback = (prototype, name) => {
     const value = prototype[name];
@@ -92,33 +99,32 @@
        inserted node. */
     const start = root?.nodeType === Node.DOCUMENT_NODE
       ? root.documentElement : root;
+    /* Index loops, here and over its result: no page patch of push, pop,
+       Array.from or the array iterator runs. */
+    const pushChildren = (list) => {
+      for (let index = list.length - 1; index >= 0; index--)
+        pending[pending.length] = list[index];
+    };
     if (Number(start?.__handle) > 0 && typeof nativeCandidates === "function"
         && typeof wrapHandle === "function") {
       const handles = nativeCandidates(start.__handle);
       for (let index = 0; index < handles.length && values.length < 4096; index++) {
         const node = wrapHandle(handles[index]);
-        if (node) values.push(node);
+        if (node) values[values.length] = node;
       }
       return values;
     }
-    if (root instanceof Element) pending.push(root);
+    if (root instanceof Element) pending[0] = root;
     else if (root === document && document.documentElement)
-      pending.push(document.documentElement);
-    else {
-      const children = Array.from(root?.children || []);
-      for (let index = children.length - 1; index >= 0; index--)
-        pending.push(children[index]);
-    }
+      pending[0] = document.documentElement;
+    else pushChildren(root?.children || []);
     while (pending.length && values.length < 4096) {
-      const node = pending.pop();
-      values.push(node);
-      const light = Array.from(node.children || []);
-      for (let index = light.length - 1; index >= 0; index--)
-        pending.push(light[index]);
-      const shadow = globalThis.__tilefinchShadowRootForHost?.(node),
-        shadowChildren = Array.from(shadow?.children || []);
-      for (let index = shadowChildren.length - 1; index >= 0; index--)
-        pending.push(shadowChildren[index]);
+      const node = pending[pending.length - 1];
+      pending.length--;
+      values[values.length] = node;
+      pushChildren(node.children || []);
+      const shadow = globalThis.__tilefinchShadowRootForHost?.(node);
+      pushChildren(shadow?.children || []);
     }
     return values;
   };
@@ -463,7 +469,7 @@
       definedAnywhere++;
       activeConstructors.set(constructor, name);
       definitionByConstructor.set(constructor, definition);
-      for (const node of descendants(scoped?.document || document)) {
+      for (let dIndex = 0, dList = descendants(scoped?.document || document), node = dList[0]; dIndex < dList.length; node = dList[++dIndex]) {
         const found = definitionForRegistry(node, activeDefinitions);
         /* upgradeOne would look an undefined definition up a second time. */
         if (found || scoped) upgradeOne(node, found);
@@ -518,7 +524,7 @@
       if (!(root instanceof Node)) throw new TypeError("Node required");
       const scoped = scopedRegistryStates.get(this),
         activeDefinitions = scoped?.definitions || definitions;
-      for (const node of descendants(root))
+      for (let dIndex = 0, dList = descendants(root), node = dList[0]; dIndex < dList.length; node = dList[++dIndex])
         upgradeOne(node, definitionForRegistry(node, activeDefinitions));
     }
   }
@@ -1300,7 +1306,7 @@
   {
     const adoptedByTarget = new WeakMap(),
       setAdopted = (target, value) => {
-        const next = Array.from(value);
+        const next = __tilefinchArrayFrom(value);
         if (next.length > 16)
           throw new DOMException(
             "Adopted stylesheet limit reached",
@@ -1458,7 +1464,7 @@
         && typeof nativeCandidates === "function"
         && !nativeCandidates(root.__handle, true))
       return;
-    for (const node of descendants(root)) {
+    for (let dIndex = 0, dList = descendants(root), node = dList[0]; dIndex < dList.length; node = dList[++dIndex]) {
       globalThis.__tilefinchShadowRootForHost?.(node, true);
       const definition = definitionFor(node);
       upgradeOne(node, definition);
@@ -1497,7 +1503,7 @@
     /* Only a custom element has a disconnect reaction, and none exists
        before the first definition: skip wrapping the removed subtree. */
     if (!definedAnywhere) return;
-    for (const node of descendants(root))
+    for (let dIndex = 0, dList = descendants(root), node = dList[0]; dIndex < dList.length; node = dList[++dIndex])
       if (node.__tilefinchCustomElementState === "custom") {
         globalThis.__tilefinchShadowRootForHost?.(node, false);
         const definition = definitionFor(node);
@@ -1518,7 +1524,7 @@
   };
   globalThis.__tilefinchCustomElementMoved = (root) => {
     if (!definedAnywhere) return;
-    for (const node of descendants(root)) {
+    for (let dIndex = 0, dList = descendants(root), node = dList[0]; dIndex < dList.length; node = dList[++dIndex]) {
       if (node.__tilefinchCustomElementState !== "custom") continue;
       const definition = definitionFor(node);
       if (definition?.callbacks.connectedMoveCallback)
@@ -1543,7 +1549,7 @@
            before any registry has defined a custom element. Detached
            construction must not wrap the whole subtree at each insertion. */
         if (!definedAnywhere) return;
-        for (const node of descendants(root)) {
+        for (let dIndex = 0, dList = descendants(root), node = dList[0]; dIndex < dList.length; node = dList[++dIndex]) {
           const definition = definitionFor(node);
           synchronizeFormOwner(node, definition);
           synchronizeDisabled(node, definition);
@@ -1563,9 +1569,9 @@
       const localName = String(node?.localName || "").toLowerCase();
       if ((localName === "form" && lowerName === "id") ||
           (localName === "fieldset" && lowerName === "disabled"))
-        for (const candidate of descendants(
+        for (let dIndex = 0, dList = descendants(
           localName === "fieldset" ? node : document,
-        )) {
+        ), candidate = dList[0]; dIndex < dList.length; candidate = dList[++dIndex]) {
           const candidateDefinition = definitionFor(candidate);
           synchronizeFormOwner(candidate, candidateDefinition);
           synchronizeDisabled(candidate, candidateDefinition);
@@ -1642,7 +1648,7 @@
     oldDocument,
     newDocument,
   ) => {
-    for (const node of descendants(root))
+    for (let dIndex = 0, dList = descendants(root), node = dList[0]; dIndex < dList.length; node = dList[++dIndex])
       if (node.__tilefinchCustomElementState === "custom")
         pendingAdoptions.set(node, {
           node,
@@ -1678,7 +1684,7 @@
     oldDocument,
     newDocument,
   ) => {
-    for (const node of descendants(root))
+    for (let dIndex = 0, dList = descendants(root), node = dList[0]; dIndex < dList.length; node = dList[++dIndex])
       globalThis.__tilefinchCustomElementAdopted(
         node,
         oldDocument,

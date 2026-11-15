@@ -291,6 +291,25 @@ bool tilefinch_platform_present_rgb565(const uint16_t *pixels, size_t width,
         installed_services.context, pixels, width, height, stride_pixels);
 }
 
+void tilefinch_platform_copy_pixel_rows(
+    unsigned char *destination, size_t destination_stride,
+    const unsigned char *source, size_t source_stride,
+    size_t row_bytes, size_t rows)
+{
+    if (rows == 0 || row_bytes == 0) return;
+    if (installed_services.copy_pixel_rows != NULL
+        && installed_services.copy_pixel_rows(installed_services.context,
+               destination, destination_stride, source, source_stride,
+               row_bytes, rows)) return;
+    if (destination_stride == row_bytes && source_stride == row_bytes) {
+        memcpy(destination, source, row_bytes * rows);
+        return;
+    }
+    for (size_t y = 0; y < rows; y++)
+        memcpy(destination + y * destination_stride,
+               source + y * source_stride, row_bytes);
+}
+
 void tilefinch_platform_retire_frame(const uint16_t *pixels)
 {
     if (pixels == NULL || installed_services.retire_frame == NULL) return;

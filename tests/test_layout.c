@@ -958,11 +958,13 @@ int main(int argc, char **argv)
         int keys = test_text_measure_cache_keys();
         int yields = test_text_measure_cache_yields();
         int layout = test_text_measure_cache_layout();
-        return keys != 0 || yields != 0 || layout != 0;
+        int arabic = test_text_measure_cache_arabic();
+        return keys != 0 || yields != 0 || layout != 0 || arabic != 0;
     }
     CHECK(test_text_measure_cache_keys() == 0);
     CHECK(test_text_measure_cache_yields() == 0);
     CHECK(test_text_measure_cache_layout() == 0);
+    CHECK(test_text_measure_cache_arabic() == 0);
     if (argc == 2 && strcmp(argv[1], "--legacy-mobile-styles-only") == 0)
         return test_legacy_mobile_style_fallbacks();
     CHECK(test_legacy_mobile_style_fallbacks() == 0);

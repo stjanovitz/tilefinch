@@ -350,6 +350,98 @@ static bool canvas_presenter_frame(TileCache *cache, Budget *budget,
                == RENDER_CANVAS_FRAME_COMPLETE;
 }
 
+/* A WebGL frame still being drawn (images_canvas_frame_hold) is never
+   shown: the generic, fast and deferred canvas paths show the held last
+   complete frame, or the page beneath before the first one, never the
+   drawing buffer (RAM or the PSP's EDRAM surface). */
+static int test_canvas_frame_in_progress(void)
+{
+    enum { W = 480, H = 272, SOURCE_STRIDE = 2048 };
+    static _Alignas(16) unsigned char live[320 * 180 * 4];
+    static _Alignas(16) unsigned char held[320 * 180 * 4];
+    static _Alignas(16) unsigned char native_pixels[SOURCE_STRIDE * 180];
+    static _Alignas(16) uint16_t frame[W * H];
+    for (size_t i = 0; i < sizeof(live); i += 4) {
+        live[i] = 255; live[i + 1] = 0; live[i + 2] = 0; live[i + 3] = 255;
+        held[i] = 0; held[i + 1] = 255; held[i + 2] = 0; held[i + 3] = 255;
+    }
+    for (size_t i = 0; i < sizeof(native_pixels); i += 4) {
+        native_pixels[i] = 0; native_pixels[i + 1] = 0;
+        native_pixels[i + 2] = 255; native_pixels[i + 3] = 255;
+    }
+    const uint16_t red = 0xf800u, green = 0x07e0u, blue = 0x001fu;
+    Budget budget;
+    budget_init(&budget, 4 * MIB);
+    /* 0 open with a held frame, 1 open before any complete frame,
+       2 published (the drawing buffer is shown). */
+    for (unsigned scenario = 0; scenario < 3u; scenario++) {
+        ImageCanvasNativeSurface native = {
+            .pixels = native_pixels, .stride = SOURCE_STRIDE,
+            .authoritative = false
+        };
+        ImageResource image = {
+            .pixels = live, .width = 320, .height = 180,
+            .source_width = 320, .source_height = 180,
+            .is_canvas = true, .canvas_opaque = true,
+            .canvas_native_surface = &native,
+            .canvas_frame_open = scenario != 2u,
+            .canvas_frame_published = scenario != 1u,
+            .canvas_held_frame = scenario == 0u ? held : NULL
+        };
+        DrawCommand command = {
+            .image = &image, .x = 0, .y = 0, .width = W, .height = H,
+            .opacity_scale = 256, .type = DRAW_IMAGE,
+            .image_fit = LAYOUT_IMAGE_FIT_STRETCH
+        };
+        uint32_t order = 0;
+        uint8_t flags = 0;
+        LayoutDocument layout = {
+            .budget = &budget, .commands = &command, .count = 1,
+            .paint_order = &order, .paint_order_count = 1,
+            .command_flags = &flags, .width = W, .scroll_width = W, .height = H
+        };
+        TileCache cache;
+        for (size_t i = 0; i < (size_t) W * H; i++) frame[i] = 0x5a5au;
+        CHECK(tile_cache_init(&cache, &budget, &layout, 1)
+              && tile_cache_set_frame(&cache, frame, W * H)
+              && tile_cache_render_frame(&cache, 0, W, H, NULL));
+        uint16_t generic = frame[(size_t) 100 * W + 100];
+        if (scenario == 0u) CHECK(generic == green);
+        else if (scenario == 1u)
+            CHECK(generic != red && generic != green && generic != blue
+                  && generic != 0x5a5au);
+        else CHECK(generic == red);
+        /* The GE has drawn into the EDRAM surface since. */
+        native.authoritative = true;
+        tile_cache_set_canvas_defer(true);
+        cache.canvas_defer_allowed = true;
+        RenderCanvasFrameResult fast = RENDER_CANVAS_FRAME_FAILED;
+        CHECK(tile_cache_sync_canvas_paint(&cache, 0, 0, W, H));
+        fast = tile_cache_render_canvas_frame_fast(&cache, 0, W, H);
+        const RenderCanvasDeferral *deferral =
+            tile_cache_canvas_deferral(&cache);
+        if (scenario == 0u) {
+            CHECK(fast == RENDER_CANVAS_FRAME_COMPLETE && deferral == NULL
+                  && frame[(size_t) 100 * W + 100] == green
+                  && frame[0] == green && frame[W * H - 1] == green);
+        } else if (scenario == 1u) {
+            CHECK(fast == RENDER_CANVAS_FRAME_NOT_APPLICABLE
+                  && deferral == NULL
+                  && tile_cache_render_frame(&cache, 0, W, H, NULL)
+                  && frame[(size_t) 100 * W + 100] == generic);
+        } else {
+            CHECK(fast == RENDER_CANVAS_FRAME_COMPLETE && deferral != NULL
+                  && deferral->source == native_pixels);
+        }
+        /* The live surface itself is never touched by a painter. */
+        CHECK(live[0] == 255 && live[1] == 0 && held[1] == 255);
+        tile_cache_set_canvas_defer(false);
+        tile_cache_destroy(&cache);
+        CHECK(budget.current == 0);
+    }
+    return 0;
+}
+
 static int test_canvas_ge_presenter(void)
 {
     static _Alignas(16) unsigned char native_pixels[2048 * 180];
@@ -675,6 +767,8 @@ static int test_web_runtime(void)
     puts("test: canvas setup admission preserves production pixels, guards and borrowed sources");
     if (test_canvas_setup_publication() != 0) return 1;
     if (test_canvas_deferred_publication() != 0) return 1;
+    puts("test: a WebGL frame still being drawn shows its last complete frame");
+    if (test_canvas_frame_in_progress() != 0) return 1;
     if (test_canvas_ge_presenter() != 0) return 1;
     if (test_ge_scratch() != 0) return 1;
     Budget budget;

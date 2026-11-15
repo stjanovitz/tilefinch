@@ -237,6 +237,116 @@ static PspCanvasCpuSample psp_canvas_cpu_sample(void)
     return sample;
 }
 
+/* A bounded, owner-thread-only copy experiment. The EDRAM source is read-only
+   and outside the page framebuffer; no GE commands or publication are made.
+   Timed loops contain copies only. Equality, guards and VFPU state checks are
+   outside those loops. No pixels or identifying content enter the report. */
+static atomic_bool psp_snapshot_probe_requested;
+static void psp_snapshot_copy_probe(void)
+{
+    enum { WIDTH = 480, HEIGHT = 272, ROW = WIDTH * 4, BATCH = 8, RUNS = 8 };
+    Budget budget;
+    budget_init(&budget, 4u * 1024u * 1024u);
+    uint64_t allocation_begin = (uint64_t)sceKernelGetSystemTimeWide();
+    unsigned char *ram = budget_malloc_cacheline_category(
+        &budget, BUDGET_CATEGORY_RESOURCE, (ROW + 64u) * HEIGHT);
+    unsigned char *destination = budget_malloc_cacheline_category(
+        &budget, BUDGET_CATEGORY_RESOURCE, (ROW + 64u) * HEIGHT);
+    uint64_t allocation_us = (uint64_t)sceKernelGetSystemTimeWide() - allocation_begin;
+    unsigned errors = 0;
+    if (ram == NULL || destination == NULL) { errors = 1; goto done; }
+    for (size_t i = 0; i < (ROW + 64u) * HEIGHT; i++)
+        ram[i] = (unsigned char)(i * 197u ^ i >> 7u);
+    struct CopyRecord {
+        uint64_t wall, cpu, uncertainty;
+        unsigned accelerated;
+        int cpu_mhz, bus_mhz;
+        bool valid;
+    } records[2][RUNS] = {{{0}}};
+    const unsigned char *sources[2] = {
+        ram, (const unsigned char *)sceGeEdramGetAddr() + 0x0cc000u
+    };
+    lxb_dom_node_t identity = {0};
+    ImageCanvasNativeSurface native = {
+        .pixels = sources[1], .stride = 512u * 4u,
+        .epoch = psp_display_edram_content_epoch(), .authoritative = true
+    };
+    ImageResource image = {
+        .node = &identity, .pixels = ram, .width = WIDTH, .height = HEIGHT,
+        .is_canvas = true, .canvas_frame_published = true
+    };
+    /* Borrow these probe-owned buffers; never hand this stack table to the
+       resource destructor. This is the real reused-snapshot hold path. */
+    ImageResources images = {.budget = &budget, .items = &image, .count = 1};
+    images.canvas_held[0].node = &identity;
+    images.canvas_held[0].pixels = destination;
+    images.canvas_held[0].bytes = ROW * HEIGHT;
+    for (unsigned kind = 0; kind < 2; kind++) {
+        size_t source_stride = kind == 0 ? ROW : 512u * 4u;
+        image.canvas_native_surface = kind == 0 ? NULL : &native;
+        memset(destination, 0xa5, (ROW + 64u) * HEIGHT);
+        errors |= psp_display_validation_probe_pixel_copy(destination, ROW + 64u,
+            sources[kind], source_stride, ROW, HEIGHT);
+        for (size_t y = 0; y < HEIGHT; y++)
+            for (size_t x = ROW; x < ROW + 64u; x++)
+                if (destination[y * (ROW + 64u) + x] != 0xa5) errors |= 8u;
+        for (unsigned run = 0; run < RUNS; run++) {
+            bool enabled = (run & 1u) != 0;
+            psp_snapshot_validation_vfpu_copy(enabled);
+            /* Warm both lanes, then use exactly the production copy seam. */
+            images_canvas_frame_hold(&images, &budget, &identity);
+            if (image.canvas_held_frame != destination) errors |= 16u;
+            images_canvas_frame_publish(&images, &identity);
+            unsigned copies_before = psp_snapshot_validation_vfpu_copies();
+            int cpu_mhz = scePowerGetCpuClockFrequencyInt();
+            int bus_mhz = scePowerGetBusClockFrequencyInt();
+            PspCanvasCpuSample before = psp_canvas_cpu_sample();
+            uint64_t started = (uint64_t)sceKernelGetSystemTimeWide();
+            for (unsigned copy = 0; copy < BATCH; copy++) {
+                images_canvas_frame_hold(&images, &budget, &identity);
+                images_canvas_frame_publish(&images, &identity);
+            }
+            uint64_t ended = (uint64_t)sceKernelGetSystemTimeWide();
+            PspCanvasCpuSample after = psp_canvas_cpu_sample();
+            records[kind][run] = (struct CopyRecord){
+                .wall = ended - started, .cpu = after.run_us - before.run_us,
+                .uncertainty = before.query_end_us - before.query_begin_us
+                    + after.query_end_us - after.query_begin_us,
+                .accelerated = psp_snapshot_validation_vfpu_copies() - copies_before,
+                .cpu_mhz = cpu_mhz, .bus_mhz = bus_mhz,
+                .valid = before.valid && after.valid && after.run_us >= before.run_us
+                    && cpu_mhz == scePowerGetCpuClockFrequencyInt()
+                    && bus_mhz == scePowerGetBusClockFrequencyInt()
+            };
+            if (!records[kind][run].valid
+                || records[kind][run].accelerated != (enabled ? BATCH : 0u))
+                errors |= 32u;
+            if (image.canvas_frame_open || image.canvas_held_frame != NULL)
+                errors |= 16u;
+            for (size_t y = 0; y < HEIGHT; y++)
+                if (memcmp(destination + y * ROW,
+                           sources[kind] + y * source_stride, ROW) != 0) errors |= 2u;
+        }
+    }
+    for (unsigned kind = 0; kind < 2; kind++)
+        for (unsigned run = 0; run < RUNS; run++) {
+            const struct CopyRecord *record = &records[kind][run];
+            printf("tilefinch-snapshot-copy: source=%s run=%u vfpu=%u copies=%u "
+                   "bytes=%u wall-us=%llu cpu-us=%llu clock-bound-us=%llu "
+                   "accelerated=%u cpu-mhz=%d bus-mhz=%d valid=%u\n",
+                kind == 0 ? "ram" : "edram", run, run & 1u, BATCH, ROW * HEIGHT,
+                (unsigned long long)record->wall, (unsigned long long)record->cpu,
+                (unsigned long long)record->uncertainty, record->accelerated,
+                record->cpu_mhz, record->bus_mhz, record->valid ? 1u : 0u);
+        }
+done:
+    psp_snapshot_validation_vfpu_copy(true);
+    budget_free(&budget, destination);
+    budget_free(&budget, ram);
+    printf("tilefinch-snapshot-copy: allocation-us=%llu errors=%u owned=%lu\n",
+        (unsigned long long)allocation_us, errors, (unsigned long)budget.current);
+}
+
 /* Cumulative translator clocks already exist. Copy/difference them only at
    runtime batch boundaries; do not introduce clocks per vertex/instance. The
    instance matrix/color clocks are children of vertex, not sibling costs. */
@@ -1438,6 +1548,8 @@ static atomic_int psp_validation_video_copy_requested;
    the busy-frame supervisor, so the reset cannot split a frame. */
 void psp_webgl_measurement_main_frame(void)
 {
+    if (atomic_exchange(&psp_snapshot_probe_requested, false))
+        psp_snapshot_copy_probe();
     /* Live marks can be consumed by the busy-frame supervisor. It may queue
        a request, but must not reset owner-thread presentation counters or
        change a GE copy while that owner's draw is in progress. */
@@ -1470,6 +1582,8 @@ void psp_webgl_measurement_main_frame(void)
 
 void psp_webgl_measurement_mark(const char *mark)
 {
+    if (mark != NULL && strcmp(mark, "snapshot-copy-probe") == 0)
+        atomic_store(&psp_snapshot_probe_requested, true);
     if (mark != NULL && strcmp(mark, "queue-perf") == 0) {
         bool passed = psp_webgl_measurement_navigation != NULL
             && psp_queue_menu_profile(psp_webgl_measurement_navigation->budget);

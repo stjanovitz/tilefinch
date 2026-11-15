@@ -1,5 +1,7 @@
 /* Component ownership is first-use state, not part of every tiny realm. */
-Object.defineProperty(globalThis, "__tilefinchCreateShadowState", {
+globalThis.__tilefinchEventInterfaces.defineProperty(globalThis,
+    "__tilefinchCreateShadowState", {
+  __proto__: null,
   configurable: true,
   value(MapType, WeakRefType, deref, apply, connected, emptyArguments,
         createPrivateSlot, mapDelete) {

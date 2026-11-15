@@ -26,6 +26,9 @@
 #define PAGE_URL "https://write.test/"
 /* The script watchdog timeout every page case gets. */
 #define SCRIPT_TIMEOUT_MS 2000
+#ifndef WATCHDOG_POLL_MS
+#define WATCHDOG_POLL_MS 1u
+#endif
 /* A spin that lasts this long on any host, however loaded: wall time, not
    a loop count, bounds it. */
 #define SPIN_TEXT(ms_) "for(var t=Date.now();Date.now()-t<" #ms_ ";);"
@@ -154,8 +157,13 @@ typedef struct {
     /* The page's cookies after the load (refused or not), or NULL. */
     const char *cookies;
     /* The script watchdog timeout for the load and its scripts, in
-       milliseconds (SCRIPT_TIMEOUT_MS when 0). */
+       milliseconds (SCRIPT_TIMEOUT_MS when 0). It is counted on the
+       watchdog's virtual clock (WATCHDOG_POLL_MS a poll), so what a
+       timeout stops does not depend on the machine's load, unless
+       `wall_clock` keeps the real clock for a case whose scripts spin for
+       wall time (SPIN). */
     long timeout_ms;
+    bool wall_clock;
     /* Loads of another scheduler that nobody pumps during the load hold
        this many ordinary worker descriptors, under the replay lane with
        the PSP's descriptors (as test_browser_engine's stuck-loads case).
@@ -178,6 +186,10 @@ typedef struct {
     /* The element children of #box after the load, read from the DOM (so
        also when the realm is gone), in BOX_CHILDREN's form, or NULL. */
     const char *box_children;
+    /* Scripts that failed at their own exception, which the breaker does
+       not count (NavigationPerformance.parser_script_author_exceptions;
+       checked when not 0). */
+    size_t author_exceptions;
 } PageCase;
 
 static lxb_dom_node_t *find_id(lxb_dom_node_t *node, const char *id)
@@ -314,6 +326,10 @@ static bool run_page_case(const PageCase *page)
         && fetch_trace_replay_begin_response_keyed(
                directory, error, sizeof(error));
     TilefinchTestFaults *faults = tilefinch_test_faults();
+    /* Script deadlines count work, not wall time (watchdog_poll_ms), so a
+       loaded machine cannot turn a script's out-of-memory stop into a
+       timeout, or stop a writer before it writes. */
+    faults->watchdog_poll_ms = page->wall_clock ? 0 : WATCHDOG_POLL_MS;
     FetchScheduler *held = NULL;
     uint64_t held_ids[STUCK_LOAD_LIMIT] = {0};
     bool holding = true;
@@ -411,6 +427,18 @@ static bool run_page_case(const PageCase *page)
                 page->pressure_refusals);
         passed = false;
     }
+    if (page->author_exceptions != 0
+        && (navigation.performance.parser_script_author_exceptions
+                != page->author_exceptions
+            || navigation.performance.parser_script_stage_failure_breakers
+                != 0u)) {
+        fprintf(stderr, "  %zu author exception(s), expected %zu; %zu "
+                "failure breaker(s)\n",
+                navigation.performance.parser_script_author_exceptions,
+                page->author_exceptions,
+                navigation.performance.parser_script_stage_failure_breakers);
+        passed = false;
+    }
     if (page->leave_free != 0 && !hold.reserved) {
         fprintf(stderr, "  the page Budget was not held\n");
         passed = false;
@@ -460,6 +488,7 @@ static bool run_page_case(const PageCase *page)
     if (held != NULL) fetch_scheduler_destroy(held);
     faults->replay_lane_worker_descriptors = false;
     faults->replay_lane_runs_page_hops = false;
+    faults->watchdog_poll_ms = 0;
     if (replaying) fetch_trace_end();
     if (navigation_ready) navigation_destroy(&navigation);
     if (browser_ready || blocker != NULL) {
@@ -613,6 +642,7 @@ static const PageCase runaway_case = {
         "document.body.setAttribute(\"data-order\",++n);"
         SPIN(RUNAWAY_SPIN_MS) "<\\/script>');</script></body>",
     .recorded_check = runaway_stopped,
+    .wall_clock = true,
 };
 
 /* A written script's time is part of its writer's: the parser-script
@@ -634,6 +664,7 @@ static const PageCase stage_time_case = {
         "</script></body>",
     .expected = "inner,outer,writer",
     .stage_within_load = true,
+    .wall_clock = true,
 };
 
 /* Input waiting behind a pending script is bounded: a write that would
@@ -714,13 +745,17 @@ static const PageCase recursion_case = {
     .expected = "22",
 };
 
-/* Written scripts that throw count towards the parser's circuit breaker
-   (three failing scripts in a row stop the page's JavaScript). The breaker
-   trips while the writing script is still inside write(): the realm must
-   live on until that script returns, and only then be stopped. It used to
-   be destroyed under the writer (an assertion in QuickJS, or a hang). */
+/* A script that runs until the page's JavaScript heap refuses it, then
+   lets go of everything it allocated: out of memory, the browser's own
+   failure, which the parser's circuit breaker counts (three in a row stop
+   the page's JavaScript). It has no quotes, so it can be written. */
+#define OOM_TEXT "(function(){var a=[];for(;;)a.push(new Array(4096).fill(1))})()"
+
+/* A script's own exception (a throw, or a SyntaxError) goes to the window
+   error event, and the page goes on, as in Chromium: written scripts that
+   throw do not count towards the breaker, however many there are. */
 static const PageCase failing_written_case = {
-    .name = "written scripts that throw stop JavaScript after the writer",
+    .name = "written scripts that throw do not stop JavaScript",
     .html =
         "<!doctype html><body><script>" REC
         "document.write('<script>rec(\"a\");throw new Error(\"x1\")"
@@ -729,22 +764,109 @@ static const PageCase failing_written_case = {
         "<\\/script><script>rec(\"d\")<\\/script>');"
         "rec('outer-after');var o={};for(var i=0;i<1000;i++)o['k'+i]=[i];"
         "rec('outer-done');</script><script>rec('next')</script></body>",
+    .expected = "a,b,c,d,outer-after,outer-done,next",
+    .author_exceptions = 3,
+};
+
+/* Written scripts that run out of memory trip the breaker while the
+   writing script is still inside write(): the realm must live on until
+   that script returns, and only then be stopped. It used to be destroyed
+   under the writer (an assertion in QuickJS, or a hang). */
+static const PageCase oom_written_case = {
+    .name = "written scripts out of memory stop JavaScript after the writer",
+    .html =
+        "<!doctype html><body><script>" REC
+        "document.write('<script>rec(\"a\");" OOM_TEXT
+        "<\\/script><script>rec(\"b\");" OOM_TEXT
+        "<\\/script><script>rec(\"c\");" OOM_TEXT
+        "<\\/script><script>rec(\"d\")<\\/script>');"
+        "rec('outer-after');var o={};for(var i=0;i<1000;i++)o['k'+i]=[i];"
+        "rec('outer-done');</script><script>rec('next')</script></body>",
     .stopped_order = "a,b,c,outer-after,outer-done",
     .stopped_summary =
         "Limited page: JavaScript stopped after repeated failures",
 };
 
-/* The failure count runs across the page: two failing response scripts
-   and one failing written script trip the breaker inside write(). */
+/* The failure count runs across the page: two response scripts and one
+   written script out of memory trip the breaker inside write(). */
 static const PageCase failing_mixed_case = {
-    .name = "a failing written script after failing response scripts",
+    .name = "a written script out of memory after two response scripts",
     .html =
-        "<!doctype html><body><script>" REC "undefinedFn1()</script>"
-        "<script>rec('s2');undefinedFn2()</script><script>"
-        "document.write('<script>rec(\"w\");undefinedFn3()<\\/script>');"
+        "<!doctype html><body><script>" REC OOM_TEXT "</script>"
+        "<script>rec('s2');" OOM_TEXT "</script><script>"
+        "document.write('<script>rec(\"w\");" OOM_TEXT "<\\/script>');"
         "rec('writer-continues');</script><script>rec('next')</script>"
         "</body>",
     .stopped_order = "s2,w,writer-continues",
+    .stopped_summary =
+        "Limited page: JavaScript stopped after repeated failures",
+};
+
+/* Five scripts in a row that throw (an Error, a ReferenceError, a
+   SyntaxError, a TypeError, and an external script's Error): each reaches
+   the window error event, the external one's element gets `load`, and the
+   healthy script after them runs. The breaker used to stop the page's
+   JavaScript at the third, with no sign to the page. */
+static const PageRecord throwing_resources[] = {
+    SCRIPT("https://write.test/throw.js",
+           "rec('ext');throw new Error('external')"),
+};
+
+static const PageCase throwing_scripts_case = {
+    .name = "five scripts that throw leave the next one running",
+    .html =
+        "<!doctype html><body><script>" REC
+        "globalThis.errors=0;addEventListener('error',()=>errors++);"
+        "</script><script>rec('t1');throw new Error('one')</script>"
+        "<script>rec('t2');undefinedFn()</script>"
+        "<script>rec('never');}{</script>"
+        "<script>rec('t4');null.x</script>"
+        "<script src=\"/throw.js\" onload=\"rec('ext-load')\" "
+        "onerror=\"rec('ext-error')\"></script>"
+        "<script>rec('healthy:'+errors)</script></body>",
+    .resources = throwing_resources,
+    .resource_count = 1,
+    .expected = "t1,t2,t4,ext,ext-load,healthy:5",
+    .author_exceptions = 5,
+};
+
+/* A thrown exception between out-of-memory failures neither counts nor
+   resets the count: it says nothing about the realm, which ran out of
+   memory twice before it. The third out-of-memory failure trips. */
+static const PageCase interleaved_case = {
+    .name = "throws between out-of-memory failures neither count nor reset",
+    .html =
+        "<!doctype html><body><script>" REC "rec('m1');" OOM_TEXT
+        "</script><script>rec('t1');throw new Error('one')</script>"
+        "<script>rec('m2');" OOM_TEXT "</script>"
+        "<script>rec('never');}{</script>"
+        "<script>rec('m3');" OOM_TEXT "</script>"
+        "<script>rec('next')</script></body>",
+    .stopped_order = "m1,t1,m2,m3",
+    .stopped_summary =
+        "Limited page: JavaScript stopped after repeated failures",
+};
+
+/* Three external scripts in a row the watchdog interrupts trip the
+   breaker too. (An interrupted inline script already stops the page's
+   JavaScript at the mutation checkpoint that follows it.) */
+static const PageRecord spinning_resources[] = {
+    SCRIPT("https://write.test/i1.js", "rec('i1');for(;;);"),
+    SCRIPT("https://write.test/i2.js", "rec('i2');for(;;);"),
+    SCRIPT("https://write.test/i3.js", "rec('i3');for(;;);"),
+};
+
+static const PageCase interrupted_case = {
+    .name = "three interrupted scripts stop JavaScript",
+    .html =
+        "<!doctype html><body><script>" REC "</script>"
+        "<script src=\"/i1.js\"></script><script src=\"/i2.js\"></script>"
+        "<script src=\"/i3.js\"></script>"
+        "<script>rec('next')</script></body>",
+    .resources = spinning_resources,
+    .resource_count = 3,
+    .timeout_ms = 300,
+    .stopped_order = "i1,i2,i3",
     .stopped_summary =
         "Limited page: JavaScript stopped after repeated failures",
 };
@@ -935,15 +1057,15 @@ static PageCase watchdog_lane_case = {
     .expected = "spinning,aRan:1,SCRIPT/SCRIPT/P#rest/B#resp",
 };
 
-/* The same stop as the third failure in a row: the page's JavaScript is
-   stopped after the writer returns, so the pending script is forgotten
-   (never fetched), but the markup written behind it still keeps its
-   place in the DOM, ahead of the response's. */
+/* The same stop as the third failure in a row (after two scripts out of
+   memory): the page's JavaScript is stopped after the writer returns, so
+   the pending script is forgotten (never fetched), but the markup written
+   behind it still keeps its place in the DOM, ahead of the response's. */
 static const PageCase watchdog_stopped_case = {
     .name = "a writer stopped as the third failure leaves no input behind",
     .html =
-        "<!doctype html><body><script>" REC "undefinedFn1()</script>"
-        "<script>rec('s2');undefinedFn2()</script><div id=box><script>"
+        "<!doctype html><body><script>" REC OOM_TEXT "</script>"
+        "<script>rec('s2');" OOM_TEXT "</script><div id=box><script>"
         "document.write('<script src=\"/a.js\"><\\/script><p id=rest></p>');"
         "rec('spinning');for(;;);</script><b id=resp></b></div>"
         "<script>rec('next')</script></body>",
@@ -989,6 +1111,79 @@ static const PageCase admission_case = {
     .leave_free = 4u * MIB,
     .pressure_refusals = 1,
     .expected = "writer,big-error,next:false,SCRIPT/SCRIPT/P#rest/B#resp",
+};
+
+/* The element children of the body, as BOX_CHILDREN lists #box's. */
+#define BODY_CHILDREN \
+    "[...document.body.children].map(e=>e.tagName+(e.id?'#'+e.id:''))" \
+    ".join('/')"
+
+/* A write with no insertion point once the page is parsed (a timer here)
+   opens the document, as in Chromium, so the page is replaced, not added
+   to. The opened document takes the next task's write too; after close(),
+   a write opens it again. Written markup goes in at the next microtask or
+   close(), and scripts in it stay inert. */
+static const PageCase late_write_case = {
+    .name = "a write after the page is parsed replaces the page",
+    .html =
+        "<!doctype html><body><p id=old>old</p><script>globalThis.order=[];"
+        "addEventListener('load',()=>setTimeout(()=>{"
+        "document.write('<b id=one></b><script>window.ran=1<\\/script>');"
+        "setTimeout(()=>{document.write('<b id=two></b>');document.close();"
+        "order.push(" BODY_CHILDREN ");"
+        "document.write('<i id=three></i>');document.close();"
+        "order.push(" BODY_CHILDREN ",'ran:'+window.ran)})}))"
+        "</script></body>",
+    .expected = "B#one/SCRIPT/B#two,I#three,ran:undefined",
+};
+
+/* An external or module script's write with no insertion point is
+   ignored (HTML's ignore-destructive-writes counter, microtasks included),
+   as Chromium ignores an async ad script's: the page is neither replaced
+   nor added to. */
+static const PageRecord ignored_resources[] = {
+    SCRIPT("https://write.test/async.js",
+           "document.write('<i id=fromAsync></i>');"
+           "Promise.resolve().then(()=>{document.write('<i id=fromJob></i>');"
+           "window.asyncRan=1});"),
+};
+
+static const PageCase ignored_write_case = {
+    .name = "an external or module script's late write is ignored",
+    .html =
+        "<!doctype html><body><p id=keep></p><script>globalThis.order=[];"
+        "function check(n){if(!(window.asyncRan&&window.moduleRan)&&n<64)"
+        "return setTimeout(()=>check(n+1));order.push(!!window.asyncRan+':'"
+        "+!!window.moduleRan+':'+" BODY_CHILDREN ")}"
+        "addEventListener('load',()=>check(0))</script>"
+        "<script async src=\"/async.js\"></script><script type=module>"
+        "document.write('<i id=fromModule></i>');window.moduleRan=1"
+        "</script></body>",
+    .resources = ignored_resources,
+    .resource_count = 1,
+    .expected = "true:true:P#keep/SCRIPT/SCRIPT/SCRIPT",
+};
+
+/* The same writes after the page replaced Node and Document: they are
+   still ignored, never a TypeError ("Node required", "Illegal
+   invocation") from the bootstrap reading the page's globals. */
+#define REPLACED_INTERFACES_IGNORED_WRITE_HTML \
+    "<!doctype html><body><p id=keep></p><script>globalThis.order=[];" \
+    "window.Node=function Node(){};window.Document=function Document(){};" \
+    "function check(n){if(!(window.asyncRan&&window.moduleRan)&&n<64)" \
+    "return setTimeout(()=>check(n+1));order.push(!!window.asyncRan+':'" \
+    "+!!window.moduleRan+':'+" BODY_CHILDREN ")}" \
+    "addEventListener('load',()=>check(0))</script>" \
+    "<script async src=\"/async.js\"></script><script type=module>" \
+    "document.write('<i id=fromModule></i>');window.moduleRan=1" \
+    "</script></body>"
+
+static const PageCase replaced_interfaces_ignored_write_case = {
+    .name = "a late write is ignored after the page replaced Node and Document",
+    .html = REPLACED_INTERFACES_IGNORED_WRITE_HTML,
+    .resources = ignored_resources,
+    .resource_count = 1,
+    .expected = "true:true:P#keep/SCRIPT/SCRIPT/SCRIPT",
 };
 
 static void build_generated_pages(void)
@@ -1101,21 +1296,125 @@ static bool run_failed_write_parser_case(void)
     return passed && clean;
 }
 
+/* A page committed whole (navigation_commit_html: offline pages, the
+   app's own pages) has no parser to feed: write()'s markup waits until the
+   writing script returns, then goes in right after it, and the scripts in
+   it run in document order, each followed by its own writes. A written
+   inline script therefore runs after, not inside, the write() call. */
+typedef struct {
+    const char *name;
+    const char *html;
+    const PageRecord *resources;
+    size_t resource_count;
+    const char *expected;
+} WholeCase;
+
+static const WholeCase whole_cases[] = {
+    {"whole document: written inline script runs after the writer",
+     "<!doctype html><body><div id=box><script>globalThis.order=[];"
+     "document.write('<script>window.x=1;order.push(\"written\")"
+     "<\\/script><span id=w></span>');"
+     "order.push('returned:'+window.x+':'"
+     "+!!document.getElementById('w'));</script><i id=tail></i></div>"
+     "<script>" BOX_CHILDREN "</script></body>",
+     NULL, 0,
+     "returned:undefined:false,written,SCRIPT/SCRIPT/SPAN#w/I#tail"},
+    {"whole document: written scripts run in order and write in place",
+     "<!doctype html><body><div id=box><script>globalThis.order=[];"
+     "document.write('<script src=\"/one.js\"><\\/script>"
+     "<script>order.push(\"tail\")<\\/script>');order.push('outer');"
+     "</script><b id=after></b></div><script>order.push('next');"
+     BOX_CHILDREN "</script></body>",
+     chain_resources, 2,
+     "outer,one,one-returned,inner,two,tail,next,"
+     "SCRIPT/SCRIPT/SCRIPT/SCRIPT/SCRIPT/B#after"},
+    {"whole document: a script split across writes",
+     "<!doctype html><body><script>globalThis.order=[];"
+     "document.write('<scr'+'ipt>order.push(');"
+     "document.write('\"split\")');order.push('open');"
+     "document.write('<\\/script>');order.push('closed');</script>"
+     "<script>order.push('next')</script></body>",
+     NULL, 0, "open,closed,split,next"},
+};
+
+static bool run_whole_document_case(const WholeCase *page)
+{
+    PageRecord records[16];
+    size_t count = 0;
+    for (size_t i = 0; i < page->resource_count && count < 16; i++)
+        records[count++] = page->resources[i];
+    records[count++] = (PageRecord) {
+        .url = PAGE_URL, .content_type = "text/html; charset=utf-8",
+        .body = page->html
+    };
+    char directory[128] = {0};
+    bool written = write_fixture(directory, records, count);
+    Budget budget;
+    budget_init(&budget, 32u * MIB);
+    bool lexbor = budget_install_lexbor(&budget);
+    BrowserSession browser = {0};
+    NavigationSession navigation = {0};
+    bool browser_ready = written && lexbor
+        && browser_session_init(&browser, &budget, 256u * 1024u);
+    bool navigation_ready = browser_ready
+        && navigation_init(&navigation, &budget, 4);
+    if (navigation_ready) {
+        navigation_attach_browser_session(&navigation, &browser);
+        navigation_enable_scripts(&navigation, 8u * MIB, SCRIPT_TIMEOUT_MS);
+        navigation_enable_document_scripts(&navigation, 32, 256u * 1024u,
+                                           64u * 1024u, SCRIPT_TIMEOUT_MS);
+    }
+    char error[256] = {0};
+    bool replaying = navigation_ready
+        && fetch_trace_replay_begin_response_keyed(
+               directory, error, sizeof(error));
+    bool loaded = replaying && navigation_commit_html(
+        &navigation, navigation_begin(&navigation), PAGE_URL, page->html,
+        strlen(page->html), 480, NULL, NULL, true);
+    ScriptResult result = {0};
+    bool matched = loaded && navigation.page.runtime != NULL
+        && script_runtime_evaluate_diagnostic(
+               navigation.page.runtime, probe, "<write-probe>", &result)
+        && strcmp(result.summary, page->expected) == 0;
+    if (!matched)
+        fprintf(stderr, "%s: loaded=%d order=\"%s\" expected \"%s\" "
+                "error=%s load=%s replay=%s\n", page->name, loaded,
+                result.summary, page->expected, result.error,
+                navigation.last_error, error);
+    if (replaying) fetch_trace_end();
+    if (navigation_ready) navigation_destroy(&navigation);
+    if (browser_ready) browser_session_destroy(&browser);
+    bool clean = !lexbor || budget.current == 0;
+    if (!clean)
+        fprintf(stderr, "%s: %zu bytes left owned\n", page->name,
+                budget.current);
+    if (lexbor) clean = budget_uninstall_lexbor(&budget) && clean;
+    if (written) remove_fixture(directory, count);
+    return matched && clean;
+}
+
 int main(void)
 {
     const PageCase *cases[] = {
         &inline_case, &external_case, &chain_case, &stream_case,
         &split_case, &blocker_case, &nonce_case, &recursion_case,
-        &runaway_case, &failing_written_case, &failing_mixed_case,
+        &runaway_case, &failing_written_case, &oom_written_case,
+        &failing_mixed_case, &throwing_scripts_case, &interleaved_case,
+        &interrupted_case,
         &forgotten_case, &lists_case, &failed_write_case,
         &style_case, &cap_case, &stage_time_case, &gtm_case,
         &replaced_layer_case, &lane_case, &watchdog_lane_case,
-        &watchdog_stopped_case, &admission_case,
+        &watchdog_stopped_case, &admission_case, &late_write_case,
+        &ignored_write_case, &replaced_interfaces_ignored_write_case,
     };
     build_generated_pages();
     size_t failures = run_failed_write_parser_case() ? 0 : 1;
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         if (!run_page_case(cases[i])) failures++;
+    }
+    for (size_t i = 0; i < sizeof(whole_cases) / sizeof(whole_cases[0]);
+         i++) {
+        if (!run_whole_document_case(&whole_cases[i])) failures++;
     }
     if (failures != 0) {
         fprintf(stderr, "tilefinch-document-write-tests: %zu failure(s)\n",

@@ -13,6 +13,38 @@ values are bytes, pixels, counts, or microseconds as named. Authors should use
 feature detection and queried WebGL limits at runtime; the JSON is for build
 tools, coding agents, and preflight checks, not page fingerprinting.
 
+## Game Profile v1.2
+
+The current Tilefinch build implements **Game Profile v1.2**, whose
+machine-readable companion is
+[`tilefinch-game-profile-v1.2.json`](tilefinch-game-profile-v1.2.json). It
+keeps every v1.1 API, ceiling, lifecycle rule and recipe, and accepts calls or
+draws that v1.1 refused, so a game that is v1.1 compatible is also v1.2
+compatible, and so is a v1 game. Each WebGL item below was checked on a PSP. The
+[v1.1 section](#game-profile-v11) that follows is the released v1.1 text and
+the v1.1 companion stays as published. A game that needs any item below
+should say it targets v1.2:
+
+| Area | v1.1 | v1.2 |
+|---|---|---|
+| `EXT_blend_minmax` | unavailable | `MIN_EXT` and `MAX_EXT` take the per-channel minimum or maximum of the fragment and the drawing buffer; the blend factors are ignored |
+| `FUNC_SUBTRACT`, `FUNC_REVERSE_SUBTRACT` | refused (`INVALID_ENUM`) | drawn with the blend factors; a channel below zero is stored as zero. The GE truncates each weighted term, so with factors other than `ZERO` and `ONE` a channel can be one step in 255 from a browser's |
+| blend factors | `ZERO`, `ONE`, `SRC_ALPHA`, `ONE_MINUS_SRC_ALPHA` | also `DST_COLOR` and `ONE_MINUS_DST_COLOR` as source factors, `SRC_COLOR` and `ONE_MINUS_SRC_COLOR` as destination factors, `DST_ALPHA` and `ONE_MINUS_DST_ALPHA` (drawn as `ONE` and `ZERO`, the buffer being opaque), `SRC_ALPHA_SATURATE` as a source factor (drawn as `ZERO`), and the four constant factors with `blendColor()` rounded to a byte per channel; any factor in the other slot is refused (`INVALID_ENUM`). A draw with a colour or constant factor gets no antialiasing fringe. `blendFuncSeparate()` alpha factors may be any WebGL 1 factor; `getParameter` answers `BLEND_SRC_ALPHA`, `BLEND_DST_ALPHA` and `BLEND_COLOR`. As with the alpha factors, the GE truncates each weighted term, one step in 255 at most |
+| `blendEquationSeparate()` | `FUNC_ADD` only | the RGB equation draws all channels of the opaque buffer; the alpha equation is reported by `getParameter(BLEND_EQUATION_ALPHA)`. Only `FUNC_ADD` draws get the antialiasing fringe |
+| a draw over one native submission (4,096 vertices × instances, or 65,536 per-vertex shading steps) | not drawn (`OUT_OF_MEMORY`) | drawn in several submissions on whole primitives, with the same pixels; a `TRIANGLE_FAN` or `LINE_LOOP` over one submission and a draw of more than 64 instances set `OUT_OF_MEMORY` with one console warning |
+| a built-in lit material with texture maps beyond its base colour map | link refused | linked and drawn without the extra maps, one warning per map; a second texture in the colour itself is still refused |
+| a canvas larger than 480×272 | the first frame could lose the context when the viewport was wider than the drawing buffer | drawn into a proportionally smaller drawing buffer; the viewport and scissor, given in canvas units, are scaled to it |
+| a `<script src>` that loads but throws, or has a syntax error | its element received `error` | its exception reaches `window.onerror` (and window `error` listeners) first, then its element receives `load`, as in browsers; a fetch failure, refusal or skipped script (such as one over `file_kb`) still receives `error` |
+
+The details are in the [WebGL guide](WEBGL.md): blending, [Large
+draws](WEBGL.md#large-draws) and [Built-in
+materials](WEBGL.md#built-in-materials-from-scene-libraries). In the v1.2
+companion, `limits.webgl.effective_vertices_per_draw` and
+`per_vertex_program_steps_per_draw` are named per submission, and
+`fan_or_loop_vertices_per_draw` is the bound a single fan or loop keeps.
+Qualification is unchanged: describe a game as **Tilefinch Game Profile v1.2
+compatible** after the same checklist, run on a build that implements v1.2.
+
 ## Game Profile v1.1
 
 The current Tilefinch build implements **Game Profile v1.1**, whose

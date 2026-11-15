@@ -1,4 +1,17 @@
 (() => {
+  const Object = __tilefinchObject;
+  /* Bound before author code runs: what this module converts, collects,
+     checks and throws with stays the realm's own when a page replaces the
+     global. DOMException is compat.js's, bound when compat.js defines it. */
+  const { String, Number, Map, Set, Error, TypeError, RangeError, Node,
+    Document, HTMLDocument, XMLDocument, DocumentType, Element, HTMLElement,
+    SVGElement, Text, ShadowRoot, NodeList, HTMLCollection, HTMLBodyElement,
+    HTMLFrameSetElement, HTMLIFrameElement, HTMLStyleElement, HTMLImageElement,
+    HTMLMediaElement, HTMLAudioElement, HTMLVideoElement, HTMLSourceElement,
+    HTMLFormElement, HTMLInputElement, HTMLButtonElement, HTMLSelectElement,
+    HTMLOptionElement, HTMLTextAreaElement, HTMLLabelElement,
+    HTMLFieldSetElement, HTMLOutputElement } = globalThis;
+  let DOMException;
   /* Dispatch passes Event's phase numbers (1 capturing, 2 at target,
      3 bubbling) as literals instead of reading them from the global Event,
      which a page can replace. */
@@ -6,7 +19,11 @@
       __tilefinchRealmGlobal.__tilefinchTrustedEventShare.trustedEvent,
     newEvent =
       __tilefinchRealmGlobal.__tilefinchTrustedEventShare.createBrowserEvent,
-    isEvent = __tilefinchRealmGlobal.__tilefinchTrustedEventShare.isEvent;
+    isEvent = __tilefinchRealmGlobal.__tilefinchTrustedEventShare.isEvent,
+    dispatchNode =
+      __tilefinchRealmGlobal.__tilefinchTrustedEventShare.dispatchNode;
+  __tilefinchRealmGlobal.__tilefinchTrustedEventShare.bindDOMException(
+    (value) => { DOMException = value; });
   const wrap = __tilefinchRealmGlobal.__tilefinchWrap;
   const retentionStats = __tilefinchRealmGlobal.__tilefinchRetentionStats;
   const documentListeners = __tilefinchRealmGlobal.__tilefinchDocumentListeners;
@@ -64,12 +81,18 @@
     },
     trustedStringFromCodePoint = Function.call.bind(String.fromCodePoint),
     trustedTypeErrorPrototype = TypeError.prototype,
+    /* dom.js's; a page can replace the global, not this prototype. */
+    trustedEventTargetPrototype = EventTarget.prototype,
     TrustedUint8Array = Uint8Array;
-  const trustedMapGet = Function.call.bind(Map.prototype.get),
+  const TrustedMap = Map,
+    trustedMapGet = Function.call.bind(Map.prototype.get),
     trustedMapSet = Function.call.bind(Map.prototype.set),
+    trustedMapHas = Function.call.bind(Map.prototype.has),
     trustedMapDelete = Function.call.bind(Map.prototype.delete),
-    trustedMapEntries = Function.call.bind(Map.prototype.entries),
-    trustedSetValues = Function.call.bind(Set.prototype.values),
+    /* forEach, not entries()/values(): an iterator's next() is a
+       page-patchable prototype method. */
+    trustedMapForEach = Function.call.bind(Map.prototype.forEach),
+    trustedSetForEach = Function.call.bind(Set.prototype.forEach),
     trustedSetAdd = Function.call.bind(Set.prototype.add),
     trustedDateTime = Function.call.bind(Date.prototype.getTime),
     trustedRegExpSource = Function.call.bind(
@@ -280,7 +303,7 @@
         const scoped = selector.match(/^:scope\s*>\s*([\s\S]+)$/);
         if (scoped && root instanceof Element)
           return selectorList(
-            Array.from(root.children).filter((child) =>
+            trustedArrayFrom(root.children).filter((child) =>
               elementMatches.call(child, scoped[1].trim()),
             ),
           );
@@ -321,7 +344,7 @@
         )
           return !element.checkValidity();
         if (/^(?:fieldset|form)$/.test(String(element.localName || "")))
-          return Array.from(element.querySelectorAll("*")).some((control) => {
+          return trustedArrayFrom(element.querySelectorAll("*")).some((control) => {
             const custom =
               __tilefinchRealmGlobal.__tilefinchElementInternalsFor?.(control);
             if (custom)
@@ -908,7 +931,7 @@
       }
       if (query !== null && typeof query[Symbol.iterator] === "function") {
         for (const pair of query) {
-          const values = Array.from(pair);
+          const values = trustedArrayFrom(pair);
           if (values.length !== 2)
             throw new TypeError(
               "URLSearchParams sequence pair must contain exactly two items",
@@ -1850,7 +1873,7 @@
   };
   __tilefinchRealmGlobal.FileList = class FileList {
     constructor(files = []) {
-      const retained = Array.from(files).slice(0, 32);
+      const retained = trustedArrayFrom(files).slice(0, 32);
       this.length = retained.length;
       for (let index = 0; index < retained.length; index++)
         Object.defineProperty(this, index, {
@@ -2144,11 +2167,11 @@
     selectOptions = (select) =>
       selectList(
         select?.__handle !== undefined
-          ? Array.from(select.querySelectorAll("option"))
-          : Array.from(select?.children || []).flatMap((child) =>
+          ? trustedArrayFrom(select.querySelectorAll("option"))
+          : trustedArrayFrom(select?.children || []).flatMap((child) =>
               child instanceof HTMLOptionElement
                 ? [child]
-                : Array.from(child.children || []).filter(
+                : trustedArrayFrom(child.children || []).filter(
                     (option) => option instanceof HTMLOptionElement,
                   ),
             ),
@@ -2205,7 +2228,7 @@
     },
     selectedOptionSet = (select) => selectionOf(select).selected,
     selectedContentCandidates = (select) =>
-      Array.from(select.querySelectorAll("selectedcontent")).filter(
+      trustedArrayFrom(select.querySelectorAll("selectedcontent")).filter(
         (candidate) => {
           let at = candidate.parentElement;
           for (let depth = 0; at && depth < 64; depth++, at = at.parentElement) {
@@ -2238,7 +2261,7 @@
         )
           continue;
         const clones = source
-          ? Array.from(source.childNodes).map((child) => child.cloneNode(true))
+          ? trustedArrayFrom(source.childNodes).map((child) => child.cloneNode(true))
           : [];
         candidate.replaceChildren(...clones);
         selectedContentSnapshots.set(candidate, { source, signature });
@@ -2629,8 +2652,7 @@
      standards-facing element identity and events. */
   let fullscreenElement = null;
   const dispatchFullscreenChange = (element) => {
-      const target = element?.isConnected ? element : document;
-      target.dispatchEvent(
+      browserDispatch(element?.isConnected ? element : document,
         newEvent("fullscreenchange", { bubbles: true }));
     },
     leaveFullscreen = (fromHost = false) => {
@@ -2669,7 +2691,7 @@
           "Fullscreen requires a connected element and user activation",
           "NotAllowedError",
         );
-        this.dispatchEvent(
+        browserDispatch(this,
           newEvent("fullscreenerror", { bubbles: true }));
         reject(error);
         return;
@@ -3057,9 +3079,8 @@
     };
     prototype.checkValidity = function checkValidity() {
       if (!this.willValidate || this.validity.valid) return true;
-      this.dispatchEvent(
-        trustedEvent(newEvent("invalid", { cancelable: true })),
-      );
+      browserDispatch(this,
+        trustedEvent(newEvent("invalid", { cancelable: true })));
       return false;
     };
     prototype.reportValidity = prototype.checkValidity;
@@ -3124,7 +3145,7 @@
       get() {
         const target = this.htmlFor
           ? this.ownerDocument?.getElementById(this.htmlFor)
-          : Array.from(this.querySelectorAll("*")).find(labelableControl);
+          : trustedArrayFrom(this.querySelectorAll("*")).find(labelableControl);
         return labelableControl(target) ? target : null;
       },
     },
@@ -3374,7 +3395,7 @@
     const event = trustedEvent(
       newEvent("reset", { bubbles: true, cancelable: true }),
     );
-    if (!form.dispatchEvent(event)) return false;
+    if (!browserDispatch(form, event)) return false;
     const resetCallbacks = [];
     for (const control of formControls(form)) {
       if (control instanceof HTMLInputElement) {
@@ -3524,7 +3545,7 @@
             enumerable: true,
             value: this,
           });
-          form.dispatchEvent(trustedEvent(event));
+          browserDispatch(form, trustedEvent(event));
         } finally {
           constructingFormData.delete(form);
         }
@@ -3740,12 +3761,10 @@
      Bounds are on the total number of values and the number of distinct
      objects, so a wide shallow message and a deep narrow one both fail
      predictably instead of exhausting the 5 MiB realm. */
-  const cloneError = (message) => {
-    const DOMExceptionType = __tilefinchRealmGlobal.DOMException;
-    return typeof DOMExceptionType === "function"
-      ? new DOMExceptionType(message, "DataCloneError")
-      : new TypeError(message);
-  };
+  /* DOMException is unbound only during the bootstrap. */
+  const cloneError = (message) => DOMException
+    ? new DOMException(message, "DataCloneError")
+    : new TypeError(message);
   const workerCloneConstructorNames = Object.freeze([
       "Object", "Array", "ArrayBuffer", "DataView", "Date", "RegExp", "Promise",
       "Blob", "File", "MessagePort",
@@ -3772,6 +3791,7 @@
     }),
   });
   const cloneErrorTypes = (intrinsics) => ({
+    __proto__: null,
     EvalError: intrinsics.EvalError,
     RangeError: intrinsics.RangeError,
     ReferenceError: intrinsics.ReferenceError,
@@ -3783,7 +3803,7 @@
       let userTag = false;
       for (let at = first, steps = 0; steps < 32; steps++) {
         if (at === null) return userTag ? 2 : 1;
-        if (at === EventTarget.prototype) return 0;
+        if (at === trustedEventTargetPrototype) return 0;
         const tag = trustedObjectDescriptor(at, Symbol.toStringTag);
         if (tag) {
           const constructor = trustedObjectDescriptor(at, "constructor");
@@ -3814,16 +3834,19 @@
        trap can run as a side effect of postMessage/structuredClone. */
     if (__tilefinchRealmGlobal.__tilefinchIsProxy(value))
       throw cloneError("Proxy values could not be cloned");
-    const memory = state.memory;
-    if (memory.has(value)) return memory.get(value);
+    /* Copies are objects, so a miss is undefined. */
+    const memory = state.memory,
+      seen = trustedMapGet(memory, value);
+    if (seen !== undefined) return seen;
     if (depth > 64) throw cloneError("worker message nesting limit");
-    if (memory.size >= 16384) throw cloneError("worker message object limit");
+    if (trustedMapSize(memory) >= 16384)
+      throw cloneError("worker message object limit");
     const remember = (copy) => {
-      memory.set(value, copy);
+      trustedMapSet(memory, value, copy);
       return copy;
     };
-    if (state.transferMap?.has(value))
-      return remember(state.transferMap.get(value));
+    const transferred = trustedMapGet(state.transferMap, value);
+    if (transferred !== undefined) return remember(transferred);
     const clone = (item) => cloneWorkerValueInternal(item, state, depth + 1);
     const intrinsics = state.intrinsics;
     const blobState = trustedWeakMapGet(blobStates, value);
@@ -3910,10 +3933,10 @@
       if (mapSize > 1024) throw cloneError("worker message item limit");
       const copy = remember(new intrinsics.Map());
       let count = 0;
-      for (const [key, item] of trustedMapEntries(value)) {
+      trustedMapForEach(value, (item, key) => {
         if (++count > 1024) throw cloneError("worker message item limit");
         trustedMapSet(copy, clone(key), clone(item));
-      }
+      });
       return copy;
     }
     let setSize;
@@ -3924,10 +3947,10 @@
       if (setSize > 1024) throw cloneError("worker message item limit");
       const copy = remember(new intrinsics.Set());
       let count = 0;
-      for (const item of trustedSetValues(value)) {
+      trustedSetForEach(value, (item) => {
         if (++count > 1024) throw cloneError("worker message item limit");
         trustedSetAdd(copy, clone(item));
-      }
+      });
       return copy;
     }
     if (trustedArrayIsArray(value)) {
@@ -3939,7 +3962,8 @@
       const keys = trustedObjectKeys(value);
       if (keys.length > 1152)
         throw cloneError("worker message item limit");
-      for (const key of keys) {
+      for (let at = 0; at < keys.length; at++) {
+        const key = keys[at];
         trustedDefineProperty(copy, key, {
           configurable: true,
           enumerable: true,
@@ -3955,9 +3979,9 @@
     /* Error has no dedicated public brand getter. Object#toString is safe
        only when no page-controlled @@toStringTag exists in the chain. */
     if (prototypeKind === 1 && trustedObjectTag(value) === "[object Error]") {
-      const ErrorType = cloneErrorTypes(intrinsics)[String(value.name)]
+      const ErrorType = cloneErrorTypes(intrinsics)[trustedString(value.name)]
         || intrinsics.Error;
-      const copy = new ErrorType(String(value.message));
+      const copy = new ErrorType(trustedString(value.message));
       try {
         if (typeof value.stack === "string") copy.stack = value.stack;
       } catch (_) {}
@@ -3971,7 +3995,8 @@
          assignment here would invoke an inherited setter in the receiving
          realm and gives __proto__ its legacy mutation semantics, allowing a
          valid Worker message to arrive with fields missing or redirected. */
-      for (const key of keys) {
+      for (let at = 0; at < keys.length; at++) {
+        const key = keys[at];
         trustedDefineProperty(copy, key, {
           configurable: true,
           enumerable: true,
@@ -3994,8 +4019,9 @@
       }
       if (values.length > 16)
         throw cloneError("worker transfer list limit");
-      const seen = new Set(), entries = [];
-      for (const value of values) {
+      const entries = [];
+      for (let at = 0; at < values.length; at++) {
+        const value = values[at];
         let kind = 0;
         try {
           trustedArrayBufferByteLength(value);
@@ -4005,49 +4031,56 @@
         if (kind === 1 && typeof __tilefinchRealmGlobal
             .__tilefinchPrepareMessagePortTransfer !== "function")
           throw cloneError("unsupported transferable object");
-        if (seen.has(value))
-          throw cloneError("duplicate transferable object");
+        for (let prior = 0; prior < entries.length; prior++)
+          if (entries[prior].value === value)
+            throw cloneError("duplicate transferable object");
         /* A WebAssembly.Memory buffer cannot be detached; refuse the list
            before anything in it is serialized or detached. */
         if (kind === 0 && !detachArrayBuffer(value, true))
           throw cloneError("WebAssembly memory buffer is not transferable");
-        seen.add(value);
-        entries.push({ value, kind });
+        entries[entries.length] = { value, kind };
       }
       return entries;
     },
     cloneWorkerValue = (
       value, intrinsics = ownerWorkerCloneIntrinsics, transfer, portsOut,
     ) => {
+      /* Every list and map here is the browser's own: walked by index and
+         through the captured Map functions, never a page-patchable method. */
       const transferList = collectWorkerTransferList(transfer),
-        transferMap = new Map(),
+        transferMap = new TrustedMap(),
         preparedPorts = [];
-      for (const entry of transferList) {
+      for (let at = 0; at < transferList.length; at++) {
+        const entry = transferList[at];
         if (entry.kind !== 1) continue;
         const prepared = __tilefinchRealmGlobal.__tilefinchPrepareMessagePortTransfer(
           entry.value, intrinsics.MessagePort?.prototype);
         if (!prepared) throw cloneError("unsupported transferable object");
-        if (preparedPorts.some((item) =>
-            item.original === prepared.peer || item.peer === prepared.original))
-          throw cloneError("entangled message ports cannot transfer together");
-        preparedPorts.push(prepared);
-        transferMap.set(entry.value, prepared.copy);
+        for (let prior = 0; prior < preparedPorts.length; prior++) {
+          const item = preparedPorts[prior];
+          if (item.original === prepared.peer || item.peer === prepared.original)
+            throw cloneError("entangled message ports cannot transfer together");
+        }
+        preparedPorts[preparedPorts.length] = prepared;
+        trustedMapSet(transferMap, entry.value, prepared.copy);
       }
       const cloneState = {
-          memory: new Map(), remaining: 262144, intrinsics, transferMap,
+          memory: new TrustedMap(), remaining: 262144, intrinsics, transferMap,
         },
         copy = cloneWorkerValueInternal(
           value, cloneState, 0);
       /* Clone is transactional: detach only after every reachable value has
          serialized successfully. The native sink repeats the class check. */
-      if (preparedPorts.some((prepared) => !prepared.canCommit()))
-        throw cloneError("message port transfer could not commit");
-      for (const entry of transferList)
-        if (entry.kind === 0) detachArrayBuffer(entry.value);
-      for (const prepared of preparedPorts) {
+      for (let at = 0; at < preparedPorts.length; at++)
+        if (!preparedPorts[at].canCommit())
+          throw cloneError("message port transfer could not commit");
+      for (let at = 0; at < transferList.length; at++)
+        if (transferList[at].kind === 0) detachArrayBuffer(transferList[at].value);
+      for (let at = 0; at < preparedPorts.length; at++) {
+        const prepared = preparedPorts[at];
         if (!prepared.commit())
           throw cloneError("message port transfer could not commit");
-        if (portsOut) portsOut.push(prepared.copy);
+        if (portsOut) portsOut[portsOut.length] = prepared.copy;
       }
       return copy;
     };
@@ -4074,16 +4107,16 @@
       "search",
       "hash",
     ];
-  let locationRevision = Number(tilefinchDocumentURLRevision()) >>> 0,
+  let locationRevision = tilefinchDocumentURLRevision() >>> 0,
     locationSynchronizing = false;
   const synchronizeLocation = () => {
       if (locationSynchronizing) return;
-      const revision = Number(tilefinchDocumentURLRevision()) >>> 0;
+      const revision = tilefinchDocumentURLRevision() >>> 0;
       if (revision === locationRevision) return;
       const href = tilefinchCurrentDocumentURL();
       locationSynchronizing = true;
       try {
-        locationURL._set(String(href));
+        locationURL._set(trustedString(href));
         locationRevision = revision;
       } finally {
         locationSynchronizing = false;
@@ -4092,8 +4125,8 @@
     setSynchronizedLocation = (href) => {
       locationSynchronizing = true;
       try {
-        locationURL._set(String(href));
-        locationRevision = Number(tilefinchDocumentURLRevision()) >>> 0;
+        locationURL._set(trustedString(href));
+        locationRevision = tilefinchDocumentURLRevision() >>> 0;
       } finally {
         locationSynchronizing = false;
       }
@@ -4200,7 +4233,7 @@
     enumerable: true,
     get() {
       return (documentForms ||= __tilefinchRealmGlobal.__tilefinchLiveHTMLCollection(
-        () => Array.from(document.querySelectorAll("form")), true));
+        () => trustedArrayFrom(document.querySelectorAll("form")), true));
     },
   });
   /* A change to a document's own children, checked as the DOM standard's
@@ -4224,53 +4257,113 @@
      root; a lone node argument moves nothing. A documents.js document's
      child has no parentNode: planDocumentInsert.releaseChild (set by
      documents.js once it is built) takes it out of its document. */
+  /* Index loops over the browser's own lists: no page patch of the Array
+     methods, the array iterator or Array.from runs. A NodeList is read
+     by index too. */
+  const listIndex = (list, value) => {
+      for (let at = 0; at < list.length; at++) if (list[at] === value) return at;
+      return -1;
+    },
+    listCopy = (list, skip) => {
+      const copy = [];
+      for (let at = 0; at < list.length; at++)
+        if (list[at] !== skip || skip === undefined) copy[copy.length] = list[at];
+      return copy;
+    },
+    /* The nodes of `type` (the first one, or null, when `first`). */
+    listOfType = (list, type, first) => {
+      const found = [];
+      for (let at = 0; at < list.length; at++)
+        if (list[at].nodeType === type) {
+          if (first) return list[at];
+          found[found.length] = list[at];
+        }
+      return first ? null : found;
+    },
+    /* In place: drop the item at `at`, or put `value` before it. */
+    listDrop = (list, at) => {
+      if (at < 0 || at >= list.length) return;
+      for (; at + 1 < list.length; at++) list[at] = list[at + 1];
+      list.length--;
+    },
+    listPut = (list, at, value) => {
+      for (let move = list.length; move > at; move--) list[move] = list[move - 1];
+      list[at] = value;
+    },
+    nodesOf = (value) =>
+      value.nodeType === Node.DOCUMENT_FRAGMENT_NODE
+        ? listCopy(value.childNodes) : [value];
   const planDocumentInsert = (children, values, many, before, old = null) => {
     const refuse = (name = "HierarchyRequestError") => {
       if (many)
-        for (const value of values)
-          if (value instanceof Node && (values.length > 1 || value.nodeType === 11))
-            for (const node of value.nodeType === 11 ? [...value.childNodes] : [value])
+        for (let at = 0; at < values.length; at++) {
+          const value = values[at];
+          if (value instanceof Node && (values.length > 1 || value.nodeType === 11)) {
+            const nodes = nodesOf(value);
+            for (let n = 0; n < nodes.length; n++) {
+              const node = nodes[n];
               node.parentNode ? node.parentNode.removeChild(node)
                 : planDocumentInsert.releaseChild?.(node);
+            }
+          }
+        }
       throw new DOMException("Invalid document child", name);
     };
+    const list = many ? values : [values];
     let items = [];
-    for (const value of many ? values : [values]) {
+    for (let at = 0; at < list.length; at++) {
+      const value = list[at];
       if (!(value instanceof Node)) {
         if (many) refuse();
         throw new TypeError("Node required");
       }
-      for (const item of value.nodeType === Node.DOCUMENT_FRAGMENT_NODE
-        ? Array.from(value.childNodes) : [value]) {
-        items = items.filter((other) => other !== item);
-        items.push(item);
+      const nodes = nodesOf(value);
+      for (let n = 0; n < nodes.length; n++) {
+        items = listCopy(items, nodes[n]);
+        items[items.length] = nodes[n];
       }
     }
-    if ((before && !children.includes(before)) || (old && !children.includes(old)))
+    if ((before && listIndex(children, before) < 0) ||
+        (old && listIndex(children, old) < 0))
       refuse("NotFoundError");
-    const stay = children.filter((child) => child !== old &&
-        !(many && values.length > 1 && items.includes(child))),
-      at = before === undefined ? 0
-        : old ? children.indexOf(old)
-        : before === null ? stay.length : stay.indexOf(before),
-      kinds = [...stay.slice(0, at), ...items, ...stay.slice(at)]
-        .map((node) => node.nodeType),
-      element = kinds.indexOf(1),
-      doctype = kinds.indexOf(10);
-    if (
-      items.some((node) => ![1, 7, 8, 10].includes(node.nodeType)) ||
-      kinds.lastIndexOf(1) !== element ||
-      kinds.lastIndexOf(10) !== doctype ||
-      (element >= 0 && doctype > element)
-    )
-      refuse();
+    const stay = [];
+    for (let at = 0; at < children.length; at++) {
+      const child = children[at];
+      if (child !== old &&
+          !(many && values.length > 1 && listIndex(items, child) >= 0))
+        stay[stay.length] = child;
+    }
+    let at = before === undefined ? 0
+      : old ? listIndex(children, old)
+      : before === null ? stay.length : listIndex(stay, before);
+    /* As slice() takes it: a negative index counts from the end. */
+    at = at < 0 ? (stay.length + at < 0 ? 0 : stay.length + at)
+      : at > stay.length ? stay.length : at;
+    let element = -1, doctype = -1, bad = false;
+    const kind = (index, type) => {
+      if (type === 1) element < 0 ? element = index : bad = true;
+      else if (type === 10) doctype < 0 ? doctype = index : bad = true;
+    };
+    for (let n = 0; n < at; n++) kind(n, stay[n].nodeType);
+    for (let n = 0; n < items.length; n++) {
+      const type = items[n].nodeType;
+      if (type !== 1 && type !== 7 && type !== 8 && type !== 10) bad = true;
+      kind(at + n, type);
+    }
+    for (let n = at; n < stay.length; n++)
+      kind(items.length + n, stay[n].nodeType);
+    if (bad || (element >= 0 && doctype > element)) refuse();
     let next = before === undefined ? stay[0] ?? null
-      : old ? children[children.indexOf(old) + 1] ?? null : before;
-    while (next && items.includes(next))
-      next = children[children.indexOf(next) + 1] ?? null;
+      : old ? children[listIndex(children, old) + 1] ?? null : before;
+    while (next && listIndex(items, next) >= 0)
+      next = children[listIndex(children, next) + 1] ?? null;
     return { items, before: next };
   };
   domShared.planDocumentInsert = planDocumentInsert;
+  domShared.listIndex = listIndex;
+  domShared.listCopy = listCopy;
+  domShared.listOfType = listOfType;
+  domShared.listDrop = listDrop;
   /* The page's own document: the same checks, then the children that are
      not kept leave. The native document takes no new children (its
      appendChild and insertBefore refuse them too), so a call that would
@@ -4278,15 +4371,16 @@
      changes. */
   document.replaceChildren = function replaceChildren(...values) {
     if (this !== document) throw new TypeError("Illegal invocation");
-    const children = Array.from(document.childNodes),
+    const children = listCopy(document.childNodes),
       { items } = planDocumentInsert(children, values, true, null);
     let kept = 0;
-    for (const child of children)
-      if (child === items[kept]) kept++;
+    for (let at = 0; at < children.length; at++)
+      if (children[at] === items[kept]) kept++;
     if (kept < items.length)
       throw new DOMException("The document cannot take new children",
         "HierarchyRequestError");
-    for (const child of children) if (!items.includes(child)) child.remove();
+    for (let at = 0; at < children.length; at++)
+      if (listIndex(items, children[at]) < 0) children[at].remove();
   };
   {
     const htmlNamespace = "http://www.w3.org/1999/xhtml",
@@ -4301,19 +4395,19 @@
         if (node.__handle !== undefined && adoptAttributeObjects)
           adoptAttributeObjects(node, owner);
         else
-          for (const attribute of node.attributes || [])
-            attribute.__tilefinchAttributeOwnerDocument = owner;
+          for (let at = 0, list = node.attributes || []; at < list.length; at++)
+            list[at].__tilefinchAttributeOwnerDocument = owner;
         if (previousOwner && previousOwner !== owner)
-          records.push({ node, oldDocument: previousOwner, newDocument: owner });
+          records[records.length] = { node, oldDocument: previousOwner, newDocument: owner };
         const shadow = __tilefinchRealmGlobal.__tilefinchShadowRootForHost?.(node);
         if (shadow) {
           if ("__detachedOwner" in shadow) shadow.__detachedOwner = owner;
           else setNodeOwner(shadow, owner);
-          for (const child of shadow.childNodes || [])
-            collectAdoption(child, owner, records);
+          for (let at = 0, list = shadow.childNodes || []; at < list.length; at++)
+            collectAdoption(list[at], owner, records);
         }
-        for (const child of node.childNodes || [])
-          collectAdoption(child, owner, records);
+        for (let at = 0, list = node.childNodes || []; at < list.length; at++)
+          collectAdoption(list[at], owner, records);
       },
       adoptOwner = (node, owner) => {
         /* Insertion already keeps a subtree in one node document. Moving
@@ -4325,11 +4419,11 @@
         collectAdoption(node, owner, records);
         __tilefinchRealmGlobal.__tilefinchPrepareCustomElementAdoptions?.(records);
         try {
-          for (const record of records)
+          for (let at = 0; at < records.length; at++)
             __tilefinchRealmGlobal.__tilefinchCustomElementAdopted?.(
-              record.node,
-              record.oldDocument,
-              record.newDocument,
+              records[at].node,
+              records[at].oldDocument,
+              records[at].newDocument,
             );
         } finally {
           __tilefinchRealmGlobal.__tilefinchFinishCustomElementAdoptions?.();
@@ -4346,8 +4440,7 @@
             }
             at = at.__detachedParent;
           }
-          const at = parent.__detachedChildren.indexOf(node);
-          if (at >= 0) parent.__detachedChildren.splice(at, 1);
+          listDrop(parent.__detachedChildren, listIndex(parent.__detachedChildren, node));
           node.__detachedParent = null;
           node.__tilefinchDetachedParent = null;
           if (connected)
@@ -4358,11 +4451,12 @@
         return node;
       },
       insert = (parent, node, before = null) => {
-        if (!node || !Array.isArray(parent.__detachedChildren))
+        if (!node || !trustedArrayIsArray(parent.__detachedChildren))
           throw new TypeError("Node required");
         if (node.nodeType === Node.DOCUMENT_FRAGMENT_NODE) {
-          const children = Array.from(node.childNodes || []);
-          for (const child of children) insert(parent, child, before);
+          const children = listCopy(node.childNodes || []);
+          for (let at = 0; at < children.length; at++)
+            insert(parent, children[at], before);
           return node;
         }
         const liveParent =
@@ -4372,13 +4466,13 @@
         const at =
           before === null
             ? parent.__detachedChildren.length
-            : parent.__detachedChildren.indexOf(before);
+            : listIndex(parent.__detachedChildren, before);
         if (at < 0)
           throw new DOMException(
             "Reference node is not a child",
             "NotFoundError",
           );
-        parent.__detachedChildren.splice(at, 0, node);
+        listPut(parent.__detachedChildren, at, node);
         node.__detachedParent = parent;
         node.__tilefinchDetachedParent = parent;
         adoptOwner(
@@ -4406,7 +4500,7 @@
       sibling = (node, step) => {
         const parent = node.__detachedParent;
         if (!parent) return null;
-        const at = parent.__detachedChildren.indexOf(node) + step;
+        const at = listIndex(parent.__detachedChildren, node) + step;
         return at >= 0 && at < parent.__detachedChildren.length
           ? parent.__detachedChildren[at]
           : null;
@@ -4445,7 +4539,14 @@
         // container, then copy into the detached document's ownership model.
         // This keeps createHTMLDocument useful without retaining a second
         // parser or exposing live-document nodes through the detached tree.
-        const parsed = document.createElement("div");
+        // An SVG or MathML target is the context's namespace too. An XML
+        // document's markup is parsed as HTML as well: there is no XML
+        // fragment parser (Chromium's keeps case and default namespaces).
+        const space = target.namespaceURI,
+          parsed = space === "http://www.w3.org/2000/svg" ||
+            space === "http://www.w3.org/1998/Math/MathML"
+            ? document.createElementNS(space, target.localName)
+            : document.createElement("div");
         parsed.innerHTML = source;
         const replacements = [],
           state = { nodes: 0 };
@@ -4517,7 +4618,7 @@
           },
           childNodes: {
             get() {
-              return this.__detachedChildren.slice();
+              return listCopy(this.__detachedChildren);
             },
           },
           children: {
@@ -4528,9 +4629,7 @@
                   "__detachedChildrenCollection",
                   {
                     value: __tilefinchLiveHTMLCollection(() =>
-                      this.__detachedChildren.filter(
-                        (node) => node.nodeType === Node.ELEMENT_NODE,
-                      ),
+                      listOfType(this.__detachedChildren, Node.ELEMENT_NODE),
                     ),
                   },
                 );
@@ -4596,22 +4695,19 @@
             },
           },
         });
+        /* As in browsers, these are EventTarget's methods read when called,
+           so a page's patch of them (zone.js) still sees the call; the
+           prototype itself and the call are taken before author code. */
         Object.assign(proto, {
           addEventListener(type, callback, options = false) {
-            return EventTarget.prototype.addEventListener.call(
-              this,
-              type,
-              callback,
-              options,
-            );
+            return trustedFunctionApply(
+              trustedEventTargetPrototype.addEventListener,
+              this, [type, callback, options]);
           },
           removeEventListener(type, callback, options = false) {
-            return EventTarget.prototype.removeEventListener.call(
-              this,
-              type,
-              callback,
-              options,
-            );
+            return trustedFunctionApply(
+              trustedEventTargetPrototype.removeEventListener,
+              this, [type, callback, options]);
           },
           dispatchEvent(event) {
             const path = boundedAncestorPath(
@@ -4973,9 +5069,10 @@
           return node;
         },
         walk = (root, selector, output) => {
-          for (const child of Array.from(
-            root.__detachedChildren || root.childNodes || [],
-          )) {
+          const children =
+            listCopy(root.__detachedChildren || root.childNodes || []);
+          for (let at = 0; at < children.length; at++) {
+            const child = children[at];
             if (child.nodeType !== Node.ELEMENT_NODE) continue;
             const match =
               selector[0] === "#"
@@ -4983,7 +5080,7 @@
                 : child.namespaceURI === htmlNamespace && !xml
                   ? child.localName === selector.toLowerCase()
                   : child.tagName === selector;
-            if (match) output.push(child);
+            if (match) output[output.length] = child;
             walk(child, selector, output);
           }
         };
@@ -4992,9 +5089,7 @@
         writable: true,
       });
       const rootElement = () =>
-          doc.__detachedChildren.find(
-            (node) => node.nodeType === Node.ELEMENT_NODE,
-          ) || null,
+          listOfType(doc.__detachedChildren, Node.ELEMENT_NODE, true),
         directElement = (root, names) => {
           if (
             !root ||
@@ -5026,11 +5121,7 @@
         doctype: {
           configurable: true,
           get() {
-            return (
-              this.__detachedChildren.find(
-                (node) => node.nodeType === Node.DOCUMENT_TYPE_NODE,
-              ) || null
-            );
+            return listOfType(this.__detachedChildren, Node.DOCUMENT_TYPE_NODE, true);
           },
         },
         head: {
@@ -5114,7 +5205,7 @@
         },
         childNodes: {
           get() {
-            return this.__detachedChildren.slice();
+            return listCopy(this.__detachedChildren);
           },
         },
         children: {
@@ -5122,9 +5213,7 @@
             if (!this.__detachedChildrenCollection)
               Object.defineProperty(this, "__detachedChildrenCollection", {
                 value: __tilefinchLiveHTMLCollection(() =>
-                  this.__detachedChildren.filter(
-                    (node) => node.nodeType === Node.ELEMENT_NODE,
-                  ),
+                  listOfType(this.__detachedChildren, Node.ELEMENT_NODE),
                 ),
               });
             return this.__detachedChildrenCollection;
@@ -5398,7 +5487,7 @@
       let collection = imagesCollections.get(this);
       if (!collection) {
         collection = __tilefinchRealmGlobal.__tilefinchLiveHTMLCollection(() =>
-          Array.from(this.querySelectorAll("img")),
+          trustedArrayFrom(this.querySelectorAll("img")),
           /* The document's own list is native; a detached shim's is not. */
           this === document);
         imagesCollections.set(this, collection);
@@ -5416,7 +5505,7 @@
         let collection = linksCollections.get(this);
         if (!collection) {
           collection = __tilefinchRealmGlobal.__tilefinchLiveHTMLCollection(() =>
-            Array.from(this.querySelectorAll("a[href],area[href]")),
+            trustedArrayFrom(this.querySelectorAll("a[href],area[href]")),
             this === document);
           linksCollections.set(this, collection);
         }
@@ -5428,7 +5517,7 @@
         let collection = anchorsCollections.get(this);
         if (!collection) {
           collection = __tilefinchRealmGlobal.__tilefinchLiveHTMLCollection(() =>
-            Array.from(this.querySelectorAll("a[name]")),
+            trustedArrayFrom(this.querySelectorAll("a[name]")),
             this === document);
           anchorsCollections.set(this, collection);
         }
@@ -5562,7 +5651,9 @@
   Object.defineProperty(document, "childNodes", {
     configurable: true,
     get() {
-      return __tilefinchDocumentChildNodes().map(wrap);
+      const handles = __tilefinchDocumentChildNodes(), nodes = [];
+      for (let at = 0; at < handles.length; at++) nodes[at] = wrap(handles[at]);
+      return nodes;
     },
   });
   for (const [name, pick] of [
@@ -6201,7 +6292,7 @@
     },
   };
   const selectionChanged = () =>
-    document.dispatchEvent(newEvent("selectionchange"));
+    browserDispatch(document, newEvent("selectionchange"));
   __tilefinchRealmGlobal.__tilefinchSelectionChanged = selectionChanged;
   const createRange = () => new Range();
   document.createRange = createRange;
@@ -6430,7 +6521,7 @@
           state.seeking = true;
           state.currentTime = value;
           state.ended = false;
-          this.dispatchEvent(newEvent("seeking"));
+          browserDispatch(this, newEvent("seeking"));
           if (
             !__tilefinchRequestMedia(
               this.__handle,
@@ -6440,7 +6531,7 @@
             )
           ) {
             state.seeking = false;
-            this.dispatchEvent(newEvent("seeked"));
+            browserDispatch(this, newEvent("seeked"));
           }
         },
       },
@@ -6465,7 +6556,7 @@
               "IndexSizeError",
             );
           stateFor(this).volume = value;
-          this.dispatchEvent(newEvent("volumechange"));
+          browserDispatch(this, newEvent("volumechange"));
         },
       },
       muted: {
@@ -6476,7 +6567,7 @@
         },
         set(value) {
           stateFor(this).muted = !!value;
-          this.dispatchEvent(newEvent("volumechange"));
+          browserDispatch(this, newEvent("volumechange"));
         },
       },
       defaultMuted: {
@@ -6505,7 +6596,7 @@
               "NotSupportedError",
             );
           stateFor(this).playbackRate = value;
-          this.dispatchEvent(newEvent("ratechange"));
+          browserDispatch(this, newEvent("ratechange"));
         },
       },
       defaultPlaybackRate: {
@@ -6588,7 +6679,7 @@
       state.ended = false;
       state.seeking = false;
       state.currentTime = 0;
-      this.dispatchEvent(newEvent("emptied"));
+      browserDispatch(this, newEvent("emptied"));
       const source = this.currentSrc;
       if (source && __tilefinchRequestMedia(this.__handle, 0, source, 0)) {
         state.networkState = HTMLMediaElement.NETWORK_LOADING;
@@ -6614,8 +6705,8 @@
         state.paused = false;
         state.ended = false;
         state.networkState = HTMLMediaElement.NETWORK_LOADING;
-        this.dispatchEvent(newEvent("play"));
-        this.dispatchEvent(newEvent("waiting"));
+        browserDispatch(this, newEvent("play"));
+        browserDispatch(this, newEvent("waiting"));
       }
       return Promise.resolve();
     };
@@ -6624,7 +6715,7 @@
       __tilefinchRequestMedia(this.__handle, 2, this.currentSrc, 0);
       if (!state.paused) {
         state.paused = true;
-        this.dispatchEvent(newEvent("pause"));
+        browserDispatch(this, newEvent("pause"));
       }
     };
     HTMLMediaElement.prototype.fastSeek = function fastSeek(time) {
@@ -6787,7 +6878,7 @@
     callback,
     options = false,
   ) => {
-    const key = String(type),
+    const key = trustedString(type),
       capture = listenerCapture(options),
       once = typeof options === "object" && !!options?.once,
       passive = typeof options === "object" && !!options?.passive,
@@ -6799,8 +6890,8 @@
         throw new TypeError("AbortSignal required");
       if (inspectSignal(signal)) return;
     }
-    if (!map.has(key)) map.set(key, []);
-    const list = map.get(key);
+    if (!trustedMapHas(map, key)) trustedMapSet(map, key, []);
+    const list = trustedMapGet(map, key);
     /* Large lists occur on application message buses. Keep the optional
        index on the owning list, not a global map that roots callback cycles.
        Refusal or excessive cardinality falls back to the existing scan. */
@@ -6862,7 +6953,7 @@
     options = false,
   ) => {
     const capture = listenerCapture(options);
-    const list = map.get(String(type));
+    const list = trustedMapGet(map, trustedString(type));
     if (!list) return;
     const at = list.findIndex(
         (item) => item.callback === callback && item.capture === capture,
@@ -6910,7 +7001,7 @@
       if (typeof item.callback === "function") {
         __tilefinchRealmGlobal.__tilefinchRecordEventHandler();
         __tilefinchRealmGlobal.__tilefinchRunTask(
-          "event:" + String(event.type),
+          "event:" + trustedString(event.type),
           item.callback,
           target,
           [event],
@@ -6924,7 +7015,7 @@
           throw new TypeError("event listener handleEvent is not callable");
         __tilefinchRealmGlobal.__tilefinchRecordEventHandler();
         __tilefinchRealmGlobal.__tilefinchRunTask(
-          "event-object:" + String(event.type),
+          "event-object:" + trustedString(event.type),
           handleEvent,
           item.callback,
           [event],
@@ -6956,6 +7047,11 @@
         (event.target === __tilefinchRealmGlobal.visualViewport
           ? "visualViewport " : "event ") + event.type);
   };
+  const copyList = (list) => {
+    const copy = [];
+    for (let at = 0; at < list.length; at++) copy[at] = list[at];
+    return copy;
+  };
   __tilefinchRealmGlobal.__tilefinchInvokeListenerList = (
     map,
     target,
@@ -6963,9 +7059,9 @@
     capture,
     errorObserver = null,
   ) => {
-    const list = map.get(String(event.type)) || [];
-    /* A snapshot, walked by index (no iterator per target and phase). */
-    const items = [...list];
+    const list = trustedMapGet(map, trustedString(event.type)) || [];
+    /* A snapshot, copied and walked by index: no page-patchable iterator. */
+    const items = copyList(list);
     for (let index = 0; index < items.length; index++) {
       const item = items[index];
       if (!item.active || item.capture !== capture) continue;
@@ -6975,12 +7071,12 @@
   };
   __tilefinchRealmGlobal.__tilefinchPrepareEvent = (event, target, path) => {
     if (!isEvent(event)) throw new TypeError("Event required");
-    if (!event.__initialized || !String(event.type))
+    if (!event.__initialized || !trustedString(event.type))
       throw new DOMException("Event is not initialized", "InvalidStateError");
     if (event.__dispatching)
       throw new DOMException("Event is already dispatching", "InvalidStateError");
     event.__dispatching = true;
-    event.type = String(event.type);
+    event.type = trustedString(event.type);
     event.target = target;
     event.currentTarget = null;
     event.eventPhase = 0;
@@ -7007,7 +7103,7 @@
       capture,
     );
   };
-  document.dispatchEvent = (event) => {
+  const dispatchDocument = document.dispatchEvent = (event) => {
     const value = event,
       path = [document, __tilefinchRealmGlobal];
     __tilefinchRealmGlobal.__tilefinchPrepareEvent(value, document, path);
@@ -7036,7 +7132,7 @@
     const mapFor = (target) => {
       if (target === document) return documentListeners;
       listenerSlot ||= createPrivateSlot();
-      return listenerSlot.get(target) ?? listenerSlot.set(target, new Map());
+      return listenerSlot.get(target) ?? listenerSlot.set(target, new TrustedMap());
     };
     __tilefinchRealmGlobal.__tilefinchInvokeEventTarget = (
       target,
@@ -7070,8 +7166,8 @@
       complete,
     ) => {
       const map = mapFor(target);
-      let live = map.get(String(event.type)) || [],
-        listeners = [...live],
+      let live = trustedMapGet(map, trustedString(event.type)) || [],
+        listeners = copyList(live),
         refreshBubbleListeners = false,
         pendingException = null;
       let completed = false,
@@ -7123,8 +7219,8 @@
                capture listener therefore joins this dispatch, while a new
                capture listener waits for the next one. */
             if (refreshBubbleListeners) {
-              live = map.get(String(event.type)) || [];
-              listeners = [...live];
+              live = trustedMapGet(map, trustedString(event.type)) || [];
+              listeners = copyList(live);
               refreshBubbleListeners = false;
             }
             const capture = listenerPhase === 0;
@@ -7300,7 +7396,14 @@
   {
     /* While the parser runs a script of this document, write() feeds the
        parser at its insertion point (written scripts run, in HTML's order);
-       the native reports false when there is no insertion point. */
+       the native reports false when there is no insertion point. Without
+       one, as in Chromium: an external script's write (an async, deferred
+       or inserted src script; ad loaders) is ignored, and any other write
+       (timer, event, callback) once the document is parsed first opens it,
+       which replaces the page (see open()). A document already opened takes
+       every write until close(). While the main document is still parsing,
+       such a write is added at the end of the body instead: Chromium would
+       abort the parse and blank the page. */
     const parserWrite = __tilefinchRealmGlobal.__tilefinchParserWrite;
     delete __tilefinchRealmGlobal.__tilefinchParserWrite;
     const documentWriteStates = new WeakMap(),
@@ -7309,7 +7412,7 @@
           throw new TypeError("Illegal invocation");
         let state = documentWriteStates.get(receiver);
         if (!state) {
-          state = { buffer: "", pending: false };
+          state = { buffer: "", pending: false, opened: false };
           documentWriteStates.set(receiver, state);
         }
         return state;
@@ -7324,6 +7427,12 @@
         const target = receiver.body || receiver.documentElement;
         if (!target) return;
         while (container.firstChild) target.appendChild(container.firstChild);
+      },
+      reopen = (receiver, state) => {
+        if (receiver === document && receiver.readyState === "loading") return;
+        state.buffer = "";
+        state.opened = true;
+        receiver.body?.replaceChildren();
       };
     Object.defineProperties(Document.prototype, {
       write: {
@@ -7332,7 +7441,12 @@
         value: function write(...parts) {
           const state = stateFor(this),
             addition = parts.map(String).join("");
-          if (this === document && parserWrite(addition)) return;
+          const written = this === document && parserWrite(addition);
+          if (written === true) return;
+          if (!state.opened) {
+            if (written === 0) return;
+            reopen(this, state);
+          }
           if (state.buffer.length + addition.length > 256 * 1024)
             throw new RangeError("document.write buffer exceeds bounded size");
           state.buffer += addition;
@@ -7355,6 +7469,7 @@
         value: function close() {
           const state = stateFor(this);
           if (state.pending) flush(this, state);
+          state.opened = false;
         },
       },
       /* Outside a parser-run script (no insertion point) Tilefinch's
@@ -7366,7 +7481,9 @@
          queued writes are dropped and the body's children removed, so the
          write()/close() that follow replace the page as they would in a
          browser. The head (and its styles) and listeners are kept, and a
-         <script> written this way does not run. */
+         <script> written this way does not run (Chromium runs it as a
+         parser-inserted script; inserting it from here would make it a
+         script-inserted one, which a CSP's 'strict-dynamic' trusts). */
       open: {
         configurable: true,
         writable: true,
@@ -7380,10 +7497,7 @@
               "open() is not supported on XML documents",
               "InvalidStateError",
             );
-          if (this === document && this.readyState === "loading") return this;
-          state.buffer = "";
-          const body = this.body;
-          if (body) body.replaceChildren();
+          reopen(this, state);
           return this;
         },
       },
@@ -7595,285 +7709,75 @@
   });
   __tilefinchRealmGlobal.scrollX = __tilefinchRealmGlobal.pageXOffset = 0;
   __tilefinchRealmGlobal.scrollY = __tilefinchRealmGlobal.pageYOffset = 0;
-  /* Cross-document postMessage crosses independent QuickJS runtimes. JSON is
-     not a structured-clone transport: it drops undefined and non-finite
-     numbers, destroys aliases/cycles, and turns typed arrays into records.
-     Keep a small, versioned graph wire instead. The final 64 KiB native queue
-     bound remains authoritative; the limits here stop hostile graphs before
-     serialization creates proportional intermediate state. */
-  const frameCloneMagic = "tilefinch-clone-v1",
-    frameCloneObjectLimit = 512,
-    frameClonePropertyLimit = 4096,
-    frameCloneDepthLimit = 64,
-    frameCloneBinaryLimit = 48 * 1024,
-    frameCloneWireLimit = 64 * 1024,
+  /* Cross-document postMessage's bounded structured-clone wire lives in
+     frame-clone.js, built the first time this realm posts or receives a
+     window or frame message, after page script may have replaced these
+     globals: the constructors it builds values with are captured now. The
+     tables have no prototype, so a wire's view or error name finds only
+     these. */
+  const frameCloneConstructors = Object.freeze({
+      __proto__: null, Array, BigInt, Date, Map, Number, RegExp, Set, String,
+    }),
+    frameCloneErrorTypes = Object.freeze({
+      __proto__: null, Error, EvalError, RangeError, ReferenceError,
+      SyntaxError, TypeError, URIError,
+    }),
     frameCloneViewTypes = Object.freeze({
-      Int8Array, Uint8Array, Uint8ClampedArray, Int16Array, Uint16Array,
+      __proto__: null, Int8Array, Uint8Array, Uint8ClampedArray, Int16Array, Uint16Array,
       Int32Array, Uint32Array, Float32Array, Float64Array,
       BigInt64Array: __tilefinchRealmGlobal.BigInt64Array,
       BigUint64Array: __tilefinchRealmGlobal.BigUint64Array,
       DataView,
     }),
-    frameCloneError = (message) =>
-      new DOMException(String(message), "DataCloneError"),
-    frameCloneBytesToBase64 = (bytes) => {
-      if (bytes.byteLength > frameCloneBinaryLimit)
-        throw frameCloneError("message binary data exceeds bounded size");
-      return __tilefinchBase64EncodeBytes(bytes);
+    ensureFrameCloneBootstrap =
+      __tilefinchRealmGlobal.__tilefinchEnsureFrameCloneBootstrap;
+  let frameClone = null;
+  const frameCloneCodec = () => {
+      if (frameClone) return frameClone;
+      ensureFrameCloneBootstrap();
+      const create = __tilefinchRealmGlobal.__tilefinchCreateFrameClone;
+      delete __tilefinchRealmGlobal.__tilefinchCreateFrameClone;
+      return (frameClone = create({
+        constructors: frameCloneConstructors,
+        errorTypes: frameCloneErrorTypes,
+        viewTypes: frameCloneViewTypes,
+        ordinaryClonePrototypeKind,
+        isProxy: __tilefinchRealmGlobal.__tilefinchIsProxy,
+        base64Encode: __tilefinchBase64EncodeBytes,
+        base64Decode: __tilefinchBase64DecodeString,
+        TrustedUint8Array,
+        trustedCharCodeAt,
+        trustedStringSlice,
+        trustedNumberIsNaN,
+        trustedNumberIsInteger,
+        trustedObjectIs,
+        trustedObjectTag,
+        trustedObjectKeys,
+        trustedObjectPrototype,
+        trustedDefineProperty,
+        trustedArrayIsArray,
+        trustedArrayBufferIsView,
+        trustedDateTime,
+        trustedRegExpSource,
+        trustedRegExpFlags,
+        trustedMapForEach,
+        trustedMapGet,
+        trustedMapSet,
+        trustedSetForEach,
+        trustedSetAdd,
+        trustedTypedArrayBuffer,
+        trustedTypedArrayByteOffset,
+        trustedTypedArrayLength,
+        trustedTypedArrayName,
+        trustedDataViewBuffer,
+        trustedDataViewByteOffset,
+        trustedDataViewByteLength,
+        trustedJSONStringify,
+        trustedJSONParse,
+      }));
     },
-    frameCloneBytesFromBase64 = (text) => {
-      const binary = __tilefinchBase64DecodeString(String(text));
-      if (binary.length > frameCloneBinaryLimit)
-        throw frameCloneError("message binary data exceeds bounded size");
-      const bytes = new TrustedUint8Array(binary.length);
-      for (let at = 0; at < binary.length; at++)
-        bytes[at] = trustedCharCodeAt(binary, at);
-      return bytes;
-    },
-    encodeFrameMessage = (value) => {
-      const memory = new Map(),
-        nodes = [];
-      let propertyCount = 0,
-        diagnosticEvent = "";
-      const encode = (item, depth) => {
-        if (depth > frameCloneDepthLimit)
-          throw frameCloneError("message nesting exceeds bounded depth");
-        if (item === null || typeof item === "string" ||
-            typeof item === "boolean") return item;
-        if (item === undefined) return ["u"];
-        if (typeof item === "number") {
-          if (trustedNumberIsNaN(item)) return ["n", "nan"];
-          if (item === Infinity) return ["n", "+inf"];
-          if (item === -Infinity) return ["n", "-inf"];
-          if (trustedObjectIs(item, -0)) return ["n", "-0"];
-          return item;
-        }
-        if (typeof item === "bigint") return ["bi", String(item)];
-        if (typeof item === "function" || typeof item === "symbol")
-          throw frameCloneError("message contains an unsupported value");
-        /* A Proxy is never structured-cloneable. Reject it before tag,
-           prototype, or key inspection so page traps cannot run as a side
-           effect of cross-realm postMessage. */
-        if (__tilefinchRealmGlobal.__tilefinchIsProxy(item))
-          throw frameCloneError("Proxy values could not be cloned");
-        if (memory.has(item)) return ["r", memory.get(item)];
-        if (nodes.length >= frameCloneObjectLimit)
-          throw frameCloneError("message object count exceeds bounded size");
-        const id = nodes.length,
-          tag = trustedObjectTag(item);
-        memory.set(item, id);
-        nodes.push(null);
-        if (tag === "[object ArrayBuffer]") {
-          nodes[id] = {
-            t: "b",
-            v: frameCloneBytesToBase64(new TrustedUint8Array(item)),
-          };
-          return ["r", id];
-        }
-        if (tag === "[object DataView]") {
-          nodes[id] = {
-            t: "v", c: "DataView", b: encode(item.buffer, depth + 1),
-            o: item.byteOffset, l: item.byteLength,
-          };
-          return ["r", id];
-        }
-        if (trustedArrayBufferIsView(item)) {
-          nodes[id] = {
-            t: "v", c: tag.slice(8, -1),
-            b: encode(item.buffer, depth + 1),
-            o: item.byteOffset, l: item.length,
-          };
-          return ["r", id];
-        }
-        if (tag === "[object Date]") {
-          nodes[id] = { t: "d", v: trustedDateTime(item) };
-          return ["r", id];
-        }
-        if (tag === "[object RegExp]") {
-          nodes[id] = {
-            t: "x", s: trustedRegExpSource(item), f: trustedRegExpFlags(item),
-          };
-          return ["r", id];
-        }
-        if (tag === "[object Map]") {
-          const entries = [];
-          for (const pair of trustedMapEntries(item)) {
-            if (++propertyCount > frameClonePropertyLimit)
-              throw frameCloneError("message item count exceeds bounded size");
-            entries.push([
-              encode(pair[0], depth + 1), encode(pair[1], depth + 1),
-            ]);
-          }
-          nodes[id] = { t: "m", e: entries };
-          return ["r", id];
-        }
-        if (tag === "[object Set]") {
-          const entries = [];
-          for (const entry of trustedSetValues(item)) {
-            if (++propertyCount > frameClonePropertyLimit)
-              throw frameCloneError("message item count exceeds bounded size");
-            entries.push(encode(entry, depth + 1));
-          }
-          nodes[id] = { t: "s", e: entries };
-          return ["r", id];
-        }
-        if (tag.endsWith("Error]")) {
-          nodes[id] = {
-            t: "e", n: String(item.name || "Error"),
-            m: String(item.message || ""), s: String(item.stack || ""),
-          };
-          return ["r", id];
-        }
-        const isArray = trustedArrayIsArray(item),
-          prototype = trustedObjectPrototype(item);
-        /* Structured clone serializes ordinary class instances as ordinary
-           objects in the receiving realm. Requiring Object.prototype or a
-           null prototype incorrectly rejected those instances even though
-           their enumerable data is cloneable. Keep platform/native objects
-           outside the bounded profile through the same prototype classifier
-           used by the Worker clone path. */
-        if (!isArray && !(tag === "[object Object]" &&
-                          ordinaryClonePrototypeKind(prototype) !== 0))
-          throw frameCloneError("message contains an unsupported object");
-        if (isArray && item.length > frameClonePropertyLimit)
-          throw frameCloneError("message array length exceeds bounded size");
-        const properties = [],
-          keys = trustedObjectKeys(item);
-        if (propertyCount + keys.length > frameClonePropertyLimit)
-          throw frameCloneError("message property count exceeds bounded size");
-        propertyCount += keys.length;
-        for (const key of keys) {
-          const propertyValue = item[key],
-            encoded = encode(propertyValue, depth + 1);
-          properties.push([key, encoded]);
-          if (depth === 0 && key === "event" &&
-              typeof propertyValue === "string")
-            diagnosticEvent = trustedStringSlice(propertyValue, 0, 64);
-        }
-        nodes[id] = {
-          t: isArray ? "a" : "o",
-          l: isArray ? item.length : 0,
-          p: properties,
-        };
-        return ["r", id];
-      };
-      const root = encode(value, 0),
-        envelope = {
-          tilefinchClone: frameCloneMagic,
-          event: diagnosticEvent,
-          root,
-          nodes,
-        },
-        wire = trustedJSONStringify(envelope);
-      if (wire.length > frameCloneWireLimit)
-        throw frameCloneError("message exceeds bounded wire size");
-      return wire;
-    },
-    decodeFrameMessage = (wire) => {
-      const text = String(wire);
-      if (text.length > frameCloneWireLimit)
-        throw frameCloneError("message exceeds bounded wire size");
-      const envelope = trustedJSONParse(text);
-      if (!envelope || envelope.tilefinchClone !== frameCloneMagic ||
-          !trustedArrayIsArray(envelope.nodes))
-        return envelope;
-      if (envelope.nodes.length > frameCloneObjectLimit)
-        throw frameCloneError("message object count exceeds bounded size");
-      const nodes = new Array(envelope.nodes.length),
-        source = envelope.nodes,
-        errorTypes = {
-          Error, EvalError, RangeError, ReferenceError, SyntaxError, TypeError,
-          URIError,
-        };
-      let decodedItemCount = 0;
-      for (let at = 0; at < source.length; at++) {
-        const node = source[at];
-        if (!node || typeof node.t !== "string")
-          throw frameCloneError("message contains an invalid node");
-        if (node.t === "a") {
-          const length = Number(node.l);
-          if (!trustedNumberIsInteger(length) || length < 0 ||
-              length > frameClonePropertyLimit)
-            throw frameCloneError("message array length exceeds bounded size");
-          nodes[at] = new Array(length);
-        }
-        else if (node.t === "o") nodes[at] = {};
-        else if (node.t === "b")
-          nodes[at] = frameCloneBytesFromBase64(node.v).buffer;
-        else if (node.t === "d") nodes[at] = new Date(Number(node.v));
-        else if (node.t === "x") nodes[at] = new RegExp(node.s, node.f);
-        else if (node.t === "m") nodes[at] = new Map();
-        else if (node.t === "s") nodes[at] = new Set();
-        else if (node.t === "e") {
-          const ErrorType = errorTypes[String(node.n)] || Error;
-          nodes[at] = new ErrorType(String(node.m || ""));
-          try { nodes[at].stack = String(node.s || ""); } catch (_) {}
-        } else if (node.t !== "v")
-          throw frameCloneError("message contains an invalid node type");
-      }
-      const decode = (item) => {
-        if (!trustedArrayIsArray(item)) return item;
-        if (item[0] === "u") return undefined;
-        if (item[0] === "bi") return BigInt(item[1]);
-        if (item[0] === "n") {
-          if (item[1] === "nan") return NaN;
-          if (item[1] === "+inf") return Infinity;
-          if (item[1] === "-inf") return -Infinity;
-          if (item[1] === "-0") return -0;
-        }
-        if (item[0] !== "r" || !trustedNumberIsInteger(item[1]) ||
-            item[1] < 0 || item[1] >= nodes.length)
-          throw frameCloneError("message contains an invalid reference");
-        return nodes[item[1]];
-      };
-      for (let at = 0; at < source.length; at++) {
-        const node = source[at];
-        if (node.t === "v") {
-          const buffer = decode(node.b),
-            constructor = frameCloneViewTypes[node.c];
-          if (!(buffer instanceof ArrayBuffer) || typeof constructor !== "function")
-            throw frameCloneError("message contains an invalid view");
-          nodes[at] = node.c === "DataView"
-            ? new constructor(buffer, Number(node.o), Number(node.l))
-            : new constructor(buffer, Number(node.o), Number(node.l));
-        }
-      }
-      for (let at = 0; at < source.length; at++) {
-        const node = source[at], target = nodes[at];
-        if (node.t === "a" || node.t === "o") {
-          if (!trustedArrayIsArray(node.p) ||
-              node.p.length > frameClonePropertyLimit ||
-              decodedItemCount > frameClonePropertyLimit - node.p.length)
-            throw frameCloneError("message contains invalid properties");
-          decodedItemCount += node.p.length;
-          for (const pair of node.p) {
-            if (!trustedArrayIsArray(pair) || pair.length !== 2)
-              throw frameCloneError("message contains an invalid property");
-            trustedDefineProperty(target, String(pair[0]), {
-              configurable: true, enumerable: true, writable: true,
-              value: decode(pair[1]),
-            });
-          }
-        } else if (node.t === "m") {
-          if (!trustedArrayIsArray(node.e) ||
-              decodedItemCount > frameClonePropertyLimit - node.e.length)
-            throw frameCloneError("message contains invalid map entries");
-          decodedItemCount += node.e.length;
-          for (const pair of node.e) {
-            if (!trustedArrayIsArray(pair) || pair.length !== 2)
-              throw frameCloneError("message contains an invalid map entry");
-            trustedMapSet(target, decode(pair[0]), decode(pair[1]));
-          }
-        } else if (node.t === "s") {
-          if (!trustedArrayIsArray(node.e) ||
-              decodedItemCount > frameClonePropertyLimit - node.e.length)
-            throw frameCloneError("message contains invalid set entries");
-          decodedItemCount += node.e.length;
-          for (const entry of node.e) trustedSetAdd(target, decode(entry));
-        }
-      }
-      return decode(envelope.root);
-    };
+    encodeFrameMessage = (value) => frameCloneCodec().encode(value),
+    decodeFrameMessage = (wire) => frameCloneCodec().decode(wire);
   const normalizePostMessageTarget = (value, senderOrigin) => {
       /* HTML exposes both the legacy postMessage(message, targetOrigin)
          signature and the options-dictionary overload.  Resolve the overload
@@ -7883,8 +7787,8 @@
          list is still fully useful and is the form used by current web apps. */
       if (value !== null && typeof value === "object")
         value = value.targetOrigin;
-      if (value === undefined || value === "/") return String(senderOrigin);
-      const text = String(value);
+      if (value === undefined || value === "/") return trustedString(senderOrigin);
+      const text = trustedString(value);
       if (text === "*") return text;
       if (!/^[A-Za-z][A-Za-z0-9+.-]*:/.test(text))
         throw new DOMException("Invalid target origin", "SyntaxError");
@@ -7947,10 +7851,11 @@
     trustedStringLower,
     trustedCharCodeAt,
     trustedStringSlice,
-    blobForURL: (url) => blobURLs.get(url),
+    blobForURL: (url) => trustedMapGet(blobURLs, url),
     blobBytes,
     normalizePostMessageTarget,
     location,
+    browserDispatch,
   });
   delete __tilefinchRealmGlobal.__tilefinchInstallFrames;
   let historyState = null,
@@ -7986,27 +7891,33 @@
   __tilefinchRealmGlobal.__tilefinchCommitSameDocument = (url, oldURL) => {
     setSynchronizedLocation(url);
     historyLength++;
-    __tilefinchRealmGlobal.dispatchEvent(newEvent("hashchange", {
+    dispatchWindowEvent(newEvent("hashchange", {
       oldURL: String(oldURL),
       newURL: location.href,
     }, "HashChangeEvent"));
   };
   __tilefinchRealmGlobal.__tilefinchRestoreSameDocument = (url, oldURL) => {
     setSynchronizedLocation(url);
-    __tilefinchRealmGlobal.dispatchEvent(
+    dispatchWindowEvent(
       newEvent("popstate", { state: historyState },
         "PopStateEvent"));
-    __tilefinchRealmGlobal.dispatchEvent(newEvent("hashchange", {
+    dispatchWindowEvent(newEvent("hashchange", {
       oldURL: String(oldURL),
       newURL: location.href,
     }, "HashChangeEvent"));
   };
-  const windowMessageHandlers = new Map(),
+  /* Handler attributes register through the bootstrap's own listener
+     methods, never a page's replacement of them. */
+  const trustedAddEventListener = Function.call.bind(
+      trustedEventTargetPrototype.addEventListener),
+    trustedRemoveEventListener = Function.call.bind(
+      trustedEventTargetPrototype.removeEventListener),
+    windowMessageHandlers = new TrustedMap(),
     setWindowMessageHandler = (type, value) => {
-      let slot = windowMessageHandlers.get(type);
+      let slot = trustedMapGet(windowMessageHandlers, type);
       if (!slot) {
         slot = { value: null, wrapper: null };
-        windowMessageHandlers.set(type, slot);
+        trustedMapSet(windowMessageHandlers, type, slot);
       }
       const callback = typeof value === "function" ? value : null;
       if (callback === slot.value) return;
@@ -8020,10 +7931,10 @@
           if (typeof current === "function")
             return trustedFunctionApply(current, this, [event]);
         };
-        EventTarget.prototype.addEventListener.call(
+        trustedAddEventListener(
           __tilefinchRealmGlobal, type, slot.wrapper, false);
       } else if (callback === null && slot.wrapper !== null) {
-        EventTarget.prototype.removeEventListener.call(
+        trustedRemoveEventListener(
           __tilefinchRealmGlobal, type, slot.wrapper, false);
         slot.wrapper = null;
       }
@@ -8032,7 +7943,7 @@
     Object.defineProperty(__tilefinchRealmGlobal, "on" + type, {
       configurable: true,
       enumerable: true,
-      get() { return windowMessageHandlers.get(type)?.value || null; },
+      get() { return trustedMapGet(windowMessageHandlers, type)?.value || null; },
       set(value) { setWindowMessageHandler(type, value); },
     });
   __tilefinchRealmGlobal.__tilefinchInvokeWindowEvent = (event, capture) => {
@@ -8060,6 +7971,15 @@
     __tilefinchRecordEvent();
     return !value.defaultPrevented;
   };
+  /* The browser's own events dispatch with the methods their targets
+     inherit, as scheduler.js's do: a page's replacement of dispatchEvent
+     sees only its own calls. dom.js reports errors through it. */
+  function browserDispatch(target, event) {
+    return target === document ? dispatchDocument(event)
+      : target === __tilefinchRealmGlobal ? dispatchWindowEvent(event)
+      : dispatchNode(target, event);
+  }
+  domShared.browserDispatch = browserDispatch;
   __tilefinchRealmGlobal.__tilefinchDispatchWindowEventCheckpointed = (event) => {
     const value = event,
       path = [__tilefinchRealmGlobal];
@@ -8069,7 +7989,7 @@
         __tilefinchRecordEvent();
       },
       invokeHandler = () => {
-        if (windowMessageHandlers.has(String(value.type))) return;
+        if (trustedMapHas(windowMessageHandlers, trustedString(value.type))) return;
         const handler = __tilefinchRealmGlobal["on" + value.type];
         if (typeof handler !== "function") return;
         value.currentTarget = __tilefinchRealmGlobal;
@@ -8077,7 +7997,7 @@
         try {
           __tilefinchRealmGlobal.__tilefinchRecordEventHandler();
           __tilefinchRealmGlobal.__tilefinchRunTask(
-            "window-handler:" + String(value.type),
+            "window-handler:" + trustedString(value.type),
             handler,
             __tilefinchRealmGlobal,
             [value],
@@ -8895,7 +8815,7 @@
   {
     /* The browser's wording: the message carries no input details. */
     const invalidBase64 = (message) => {
-      throw __tilefinchRealmGlobal.DOMException
+      throw DOMException
         ? new DOMException(message, "InvalidCharacterError")
         : new TypeError("InvalidCharacterError: " + message);
     };
@@ -9282,68 +9202,39 @@
         if (query._listeners.size || query._onchange) return;
         liveMediaQueries.delete(query);
         query._registered = false;
-      };
-    class MediaQueryList {
-      constructor(query) {
-        if (
-          __tilefinchRealmGlobal.EventTarget &&
-          Object.getPrototypeOf(MediaQueryList.prototype) !==
-            __tilefinchRealmGlobal.EventTarget.prototype
-        )
-          Object.setPrototypeOf(
-            MediaQueryList.prototype,
-            __tilefinchRealmGlobal.EventTarget.prototype,
-          );
-        this.media = canonicalMediaQuery(query);
-        this._listeners = new Set();
-        this._onchange = null;
-        this._registered = false;
-        this._lastMatch = this.matches;
-      }
-      get matches() {
-        return nativeMediaMatches(this.media, innerWidth, innerHeight, devicePixelRatio);
-      }
-      get onchange() {
-        return this._onchange;
-      }
-      set onchange(callback) {
-        this._onchange = typeof callback === "function" ? callback : null;
-        if (this._onchange) registerMediaQuery(this);
-        else unregisterMediaQuery(this);
-      }
-      addListener(callback) {
-        this.addEventListener("change", callback);
-      }
-      removeListener(callback) {
-        this.removeEventListener("change", callback);
-      }
-      addEventListener(type, callback) {
+      },
+      /* addListener, removeListener and the browser's change delivery run
+         these steps directly: a page's replacement of the public methods
+         sees only its own calls. */
+      mediaMatches = (query) =>
+        nativeMediaMatches(query.media, innerWidth, innerHeight, devicePixelRatio),
+      addMediaListener = (query, type, callback) => {
         if (
           String(type) !== "change" ||
           (typeof callback !== "function" &&
             typeof callback?.handleEvent !== "function")
         )
           return;
-        if (this._listeners.size >= 64 && !this._listeners.has(callback)) {
+        if (query._listeners.size >= 64 && !query._listeners.has(callback)) {
           retentionStats.observerDrops++;
           return;
         }
-        this._listeners.add(callback);
-        registerMediaQuery(this);
-      }
-      removeEventListener(type, callback) {
-        if (String(type) === "change") this._listeners.delete(callback);
-        unregisterMediaQuery(this);
-      }
-      dispatchEvent(event) {
+        query._listeners.add(callback);
+        registerMediaQuery(query);
+      },
+      removeMediaListener = (query, type, callback) => {
+        if (String(type) === "change") query._listeners.delete(callback);
+        unregisterMediaQuery(query);
+      },
+      deliverMediaEvent = (query, event) => {
         if (String(event?.type) !== "change") return true;
-        for (const callback of this._listeners)
+        trustedSetForEach(query._listeners, (callback) => {
           try {
             if (typeof callback === "function")
               __tilefinchRealmGlobal.__tilefinchRunTask(
                 "media-query-change",
                 callback,
-                this,
+                query,
                 [event],
               );
             else
@@ -9356,34 +9247,70 @@
           } catch (error) {
             __tilefinchReportUncaught(error, "matchMedia change");
           }
-        if (this._onchange)
+        });
+        if (query._onchange)
           try {
             __tilefinchRealmGlobal.__tilefinchRunTask(
               "media-query-onchange",
-              this._onchange,
-              this,
+              query._onchange,
+              query,
               [event],
             );
           } catch (error) {
             __tilefinchReportUncaught(error, "matchMedia onchange");
           }
         return !event.defaultPrevented;
+      };
+    class MediaQueryList {
+      constructor(query) {
+        this.media = canonicalMediaQuery(query);
+        this._listeners = new Set();
+        this._onchange = null;
+        this._registered = false;
+        this._lastMatch = mediaMatches(this);
+      }
+      get matches() {
+        return mediaMatches(this);
+      }
+      get onchange() {
+        return this._onchange;
+      }
+      set onchange(callback) {
+        this._onchange = typeof callback === "function" ? callback : null;
+        if (this._onchange) registerMediaQuery(this);
+        else unregisterMediaQuery(this);
+      }
+      addListener(callback) {
+        addMediaListener(this, "change", callback);
+      }
+      removeListener(callback) {
+        removeMediaListener(this, "change", callback);
+      }
+      addEventListener(type, callback) {
+        addMediaListener(this, type, callback);
+      }
+      removeEventListener(type, callback) {
+        removeMediaListener(this, type, callback);
+      }
+      dispatchEvent(event) {
+        return deliverMediaEvent(this, event);
       }
     }
     __tilefinchRealmGlobal.__tilefinchMediaRecheck = () => {
-      for (const query of liveMediaQueries) {
-        const matches = query.matches;
-        if (matches === query._lastMatch) continue;
+      trustedSetForEach(liveMediaQueries, (query) => {
+        const matches = mediaMatches(query);
+        if (matches === query._lastMatch) return;
         query._lastMatch = matches;
-        query.dispatchEvent(
+        deliverMediaEvent(query,
           new MediaQueryListEvent("change", {
             __proto__: null,
             media: query.media,
             matches,
-          }),
-        );
-      }
+          }));
+      });
     };
+    Object.setPrototypeOf(MediaQueryList.prototype,
+                          trustedEventTargetPrototype);
     __tilefinchRealmGlobal.MediaQueryList = MediaQueryList;
     __tilefinchRealmGlobal.MediaQueryListEvent = MediaQueryListEvent;
     const matchMedia = (query) => new MediaQueryList(query);
@@ -9760,16 +9687,16 @@
       }
     },
     notifyPerformanceObservers = (entry) => {
-      for (const observer of performanceObservers) {
+      trustedSetForEach(performanceObservers, (observer) => {
         const state = performanceObserverState.get(observer);
-        if (!state || !state.types.has(entry.entryType)) continue;
+        if (!state || !state.types.has(entry.entryType)) return;
         if (state.records.length >= performanceObserverRecordLimit) {
           state.records.shift();
           state.dropped++;
         }
         state.records.push(entry);
         schedulePerformanceObserver(observer, state);
-      }
+      });
     },
     navigationPerformanceEntry =
       new PerformanceNavigationTiming(location.href),
@@ -10235,7 +10162,7 @@
       state.mode = requestedMode;
       const requested = hasType
           ? [String(options.type)]
-          : Array.from(options.entryTypes, String),
+          : trustedArrayFrom(options.entryTypes, String),
         types = new Set(
           requested.filter((type) =>
             supportedPerformanceEntryTypes.includes(type),
@@ -10296,7 +10223,7 @@
       navigationTiming = navigationState.navigation,
       domInteractive = __tilefinchPerformanceNow(3);
     documentReadyState = "interactive";
-    document.dispatchEvent(newEvent("readystatechange"));
+    dispatchDocument(newEvent("readystatechange"));
     navigationTiming.domInteractive = domInteractive;
     performanceTimingState.domInteractive =
       performanceTimeOrigin + domInteractive;
@@ -10304,12 +10231,11 @@
       __tilefinchPerformanceNow(3);
     performanceTimingState.domContentLoadedEventStart =
       performanceTimeOrigin + navigationTiming.domContentLoadedEventStart;
-    document.dispatchEvent(
-      newEvent("DOMContentLoaded", { bubbles: true }));
+    dispatchDocument(newEvent("DOMContentLoaded", { bubbles: true }));
     __tilefinchRealmGlobal.__tilefinchMaybeStartMotion?.(true);
     const domContentLoadedEventEnd = __tilefinchPerformanceNow(3);
     documentReadyState = "complete";
-    document.dispatchEvent(newEvent("readystatechange"));
+    dispatchDocument(newEvent("readystatechange"));
     const domComplete = __tilefinchPerformanceNow(3),
       loadEventStart = __tilefinchPerformanceNow(3);
     navigationTiming.domContentLoadedEventEnd = domContentLoadedEventEnd;
@@ -10331,11 +10257,11 @@
     const bodyOnload = document.body?.onload;
     if (typeof bodyOnload === "function")
       try {
-        bodyOnload.call(__tilefinchRealmGlobal, loadEvent);
+        trustedFunctionApply(bodyOnload, __tilefinchRealmGlobal, [loadEvent]);
       } catch (error) {
         __tilefinchReportUncaught(error, "body onload");
       }
-    __tilefinchRealmGlobal.dispatchEvent(loadEvent);
+    dispatchWindowEvent(loadEvent);
     const loadEventEnd = __tilefinchPerformanceNow(3);
     navigationState.base[3] = Math.max(
       0, loadEventEnd - navigationPerformanceEntry.startTime);

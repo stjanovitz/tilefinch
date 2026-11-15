@@ -327,6 +327,30 @@ static void arabic_shape(TextBidiParagraph *paragraph)
     }
 }
 
+size_t text_bidi_shape_level_run(const char *text, size_t length,
+                                 TextBidiUnit *units, size_t capacity)
+{
+    if (text == NULL || units == NULL || length == 0) return 0;
+    size_t count = 0;
+    for (size_t at = 0; at < length;) {
+        unsigned codepoint = 0;
+        size_t used = font_utf8_next(text + at, length - at, &codepoint);
+        if (used == 0 || used > UINT8_MAX || count == capacity
+            || at > UINT32_MAX) return 0;
+        units[count++] = (TextBidiUnit) {
+            .codepoint = codepoint,
+            .shaped_codepoint = codepoint,
+            .byte_offset = (uint32_t) at,
+            .byte_length = (uint8_t) used,
+            .cluster_extender = bidi_cluster_extender(codepoint)
+        };
+        at += used;
+    }
+    TextBidiParagraph run = {.units = units, .count = count};
+    arabic_shape(&run);
+    return count;
+}
+
 TextBidiParagraph *text_bidi_paragraph_create(
     Budget *budget, const char *text, size_t length, TextBidiBase base,
     TextBidiStatus *status)

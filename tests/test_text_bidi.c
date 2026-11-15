@@ -24,6 +24,100 @@ static bool permutation_once(const uint16_t *order, size_t count)
     return true;
 }
 
+/* text_bidi_shape_level_run gives a whole word the units its node's
+   paragraph gives it, whatever surrounds the word and whatever the base,
+   for words of Arabic-block letters, marks, digits and punctuation, ASCII
+   other than brackets and no-break space (intrinsic sizing shapes such
+   words alone). */
+static int test_level_run_matches_paragraph(Budget *budget)
+{
+    static const char *const words[] = {
+        "\xd9\x85\xd8\xb1\xd8\xad\xd8\xa8\xd8\xa7",
+        "\xd8\xa8\xd9\x90\xd8\xb3\xd9\x92\xd9\x85\xd9\x90",
+        "\xd9\x84\xd8\xa7", "\xd9\x84\xd9\x8e\xd8\xa3",
+        "\xd8\xa7\xd9\x84\xd9\x84\xd8\xba\xd8\xa9",
+        "\xd9\x83\xd9\x80\xd9\x80\xd8\xaa\xd8\xa7\xd8\xa8",
+        "\xd9\x8e\xd8\xa8\xd8\xa8", "\xd8\xa8\xd8\xa8\xd9\x8e",
+        "\xd9\xa1\xd9\xa2\xd8\xa8\xd8\xa8\xd9\xa3",
+        "12\xd8\xa8\xd8\xa8%", "\xd8\xa8.\xd8\xa8", "\xd8\xa8:\xd8\xa8,",
+        "Wi-Fi\xd8\xa8\xd8\xa8", "\xd8\xa8\xd8\xa8" "abc\xd8\xa8",
+        "\xd8\xa8\xc2\xa0\xd8\xa8", "\xd8\xa8\xd8\x8c\xd8\xa8\xd8\x9f",
+        "\xd9\x8e.\xd9\x8e\xd8\xa8", "\xd8\xa8\xd8\xa1\xd8\xa8",
+        "\xdb\x8c\xdb\x8c\xda\xa9", "\xef\xba\x8f\xd8\xa8",
+    };
+    static const char *const before[] = {
+        "", "abc ", "\xd9\x85\xd9\x86 ", "123 ", "( ",
+        "\xe2\x80\xab\xd9\x85 ", "\xe2\x80\xaa", "\xe2\x80\xad",
+        "\xe2\x81\xa7", "\xe2\x81\xa6x ", "\xe2\x80\x8f ",
+    };
+    static const char *const after[] = {
+        "", " abc", " \xd9\x85\xd9\x86", " 4", " )",
+        " \xe2\x80\xac", " \xe2\x81\xa9",
+    };
+    static const TextBidiBase bases[] = {
+        TEXT_BIDI_BASE_AUTO_LTR, TEXT_BIDI_BASE_LTR, TEXT_BIDI_BASE_RTL,
+        TEXT_BIDI_BASE_AUTO_RTL
+    };
+    for (size_t w = 0; w < sizeof(words) / sizeof(words[0]); w++) {
+        TextBidiUnit alone[32];
+        size_t word_length = strlen(words[w]);
+        size_t count = text_bidi_shape_level_run(words[w], word_length,
+                                                 alone, 32);
+        CHECK(count != 0);
+        for (size_t b = 0; b < sizeof(before) / sizeof(before[0]); b++) {
+            for (size_t a = 0; a < sizeof(after) / sizeof(after[0]); a++) {
+                char text[128];
+                int written = snprintf(text, sizeof(text), "%s%s%s",
+                                       before[b], words[w], after[a]);
+                CHECK(written > 0 && (size_t) written < sizeof(text));
+                /* The word is whole: white space or an end on each side,
+                   or a control that neither joins nor is transparent. */
+                size_t start = strlen(before[b]);
+                for (size_t k = 0; k < sizeof(bases) / sizeof(bases[0]);
+                     k++) {
+                    TextBidiStatus status;
+                    TextBidiParagraph *paragraph = text_bidi_paragraph_create(
+                        budget, text, (size_t) written, bases[k], &status);
+                    CHECK(paragraph != NULL);
+                    const TextBidiUnit *units =
+                        text_bidi_paragraph_units(paragraph);
+                    size_t total = text_bidi_paragraph_count(paragraph);
+                    size_t first = 0;
+                    while (first < total && units[first].byte_offset < start)
+                        first++;
+                    CHECK(first + count <= total);
+                    for (size_t i = 0; i < count; i++) {
+                        const TextBidiUnit *in = &units[first + i];
+                        if (in->codepoint != alone[i].codepoint
+                            || in->shaped_codepoint
+                                   != alone[i].shaped_codepoint
+                            || in->byte_offset - start
+                                   != alone[i].byte_offset
+                            || in->byte_length != alone[i].byte_length
+                            || in->cluster_extender
+                                   != alone[i].cluster_extender) {
+                            fprintf(stderr, "level run %zu/%zu/%zu/%zu "
+                                    "unit %zu: U+%04X shaped %04X vs %04X\n",
+                                    w, b, a, k, i,
+                                    (unsigned) in->codepoint,
+                                    (unsigned) in->shaped_codepoint,
+                                    (unsigned) alone[i].shaped_codepoint);
+                            text_bidi_paragraph_destroy(paragraph);
+                            return 1;
+                        }
+                    }
+                    text_bidi_paragraph_destroy(paragraph);
+                }
+            }
+        }
+    }
+    TextBidiUnit few[2];
+    CHECK(text_bidi_shape_level_run(
+              "\xd9\x85\xd8\xb1\xd8\xad", 6, few, 2) == 0);
+    CHECK(text_bidi_shape_level_run("\xd9\x85", 0, few, 2) == 0);
+    return 0;
+}
+
 int main(void)
 {
     Budget budget;
@@ -323,6 +417,7 @@ int main(void)
         TEXT_BIDI_CODEPOINT_LIMIT, &runs));
     CHECK(runs > TEXT_BIDI_RUN_LIMIT);
     text_bidi_paragraph_destroy(paragraph);
+    CHECK(test_level_run_matches_paragraph(&budget) == 0);
     CHECK(budget.current == 0 && budget_categories_reconcile(&budget));
     puts("text-bidi-tests: ok");
     return 0;

@@ -16,7 +16,7 @@ request-send-low-client-hints=1
 request-sec-fetch-user=1
 request-upgrade-insecure=1
 status=200
-length=474
+length=603
 effective-url=https://script-failure-reset.test/document
 content-type=text/html; charset=utf-8
 etag=

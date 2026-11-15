@@ -186,7 +186,7 @@ The [user guide](docs/USER_GUIDE.md) covers everyday use in detail:
 
 - **Browser menus** can be shown in Spanish, French, German, Japanese,
   Russian, Ukrainian, Simplified Chinese, Korean, Hindi, Arabic, Portuguese,
-  Bengali or Assamese as well as English. Translations download on request
+  Bengali, Assamese or Hebrew as well as English. Translations download on request
   from **Menu → Settings → Appearance → Language & emoji → Interface
   language**. They change Tilefinch's menus, not the text of websites, games
   or subtitles.

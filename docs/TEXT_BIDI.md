@@ -12,8 +12,11 @@ analysis entirely.
 
 This contract covers page content. Arabic browser labels reuse the same
 shaping and visual-order helpers once at translation load; they do not rewrite
-the page DOM or mirror panel geometry. A general text-selection UI and general
-complex-script shaping beyond the Arabic family are not part of this contract.
+the page DOM. How the browser's own panels follow the direction of the
+interface language and of page text shown in them is in
+[Browser chrome direction](#browser-chrome-direction). A general
+text-selection UI and general complex-script shaping beyond the Arabic family
+are not part of this contract.
 
 ## Pipeline
 
@@ -68,6 +71,21 @@ scratch arena; it never allocates per codepoint. Temporary paragraph state is
 released when its block flow completes. Only sparse visual glyph mappings
 needed by the retained layout survive. Allocation refusal and hostile control
 nesting fall back to logical order, never to reversing codepoints.
+
+Intrinsic sizing (max-content and min-content widths, which size
+shrink-to-fit boxes such as an inline-block button) measures a word whose
+Arabic letters change form from those forms, as the inline flow draws it.
+It falls back to the stored letters when nothing changes form, the node is
+past the paragraph bounds above, or no attached pack has metrics for the
+forms. A whole word that holds no bracket, joiner or directional control
+cannot take its forms from the text around it (its joining letters share a
+level wherever it stands, and white space stops joining), so it is shaped on
+its own; the node's paragraph is analysed, at most once per measurement,
+only for its other words. The shaped width of such a word of up to 32 bytes
+is kept with the page's retained word measurements, keyed by its bytes and
+every measurement input, so later measurements of it, in any node, take it
+without shaping. Layouts built without the page's reuse cache (a stylesheet
+change, a child frame) shape every word again.
 
 Text shadows are omitted for bidi-shaped commands.
 That cosmetic degradation avoids duplicating shaped sidecars and never changes
@@ -138,6 +156,63 @@ notice, its buttons and its settings. The offer also appears over Reader mode
 and Basic view, which draw with the same faces. When an install finishes, the
 page is laid out again in place, because text measured against blank cells
 has the wrong widths.
+
+## Browser chrome direction
+
+Two rules decide where text sits in the browser's own panels:
+
+1. **The interface language sets the panel's direction.** Each language's
+   catalog entry says whether it reads right to left (Arabic and Hebrew do,
+   `tilefinch_ui_language_right_to_left()`); when it does, the list panels
+   are mirrored: the menu, tabs,
+   every Settings list, Page tools, Site controls, Page information, Help,
+   the update screens, Site storage and the questions asked in that panel
+   family. A row's label starts at the right edge; its value, chevron or
+   count stands at the left; a lone chevron points left; the panel's
+   shadow stays below and to the right. The player menu's rows mirror the
+   same way, under tabs that keep their order because **L** and **R** step
+   through them. The top and bottom bars, HOME and Collections (a grid
+   moved through with Left and Right, and pointer targets), the keyboard,
+   find, a page's own dialog (which sets itself by its text) and toasts keep
+   their geometry.
+2. **Page text reads from its own start edge.** A title, host, file name
+   or path, certificate issuer, track, chapter or queue name is laid out by
+   its first strong character, as UAX #9 does without a `dir`: a
+   right-to-left one against the right end of its space, a left-to-right one
+   against the left, whatever the interface language. Mirroring moves the
+   space, not the text's side of it. A right-to-left title that does not fit
+   loses its end, which is on its left, behind three dots. A file name that
+   does not fit keeps its extension (one to five ASCII letters or digits
+   after its last dot) and loses the end of its stem instead:
+   `a-long-recording....mp4`; a right-to-left stem keeps its start on the
+   right, and the extension stands at the left end, where the name ends.
+3. **A line built from parts reads in the interface language's order.**
+   Catalog strings are stored in display order, but a line that joins one to
+   a number, a size, a version or a host ("512 files | 2048 KB", "Current
+   version  0.1.49", "Downloading 45%") is put together in reading order
+   (`psp_ui_join_reading_order`). In a right-to-left interface language the
+   parts are laid from the right, each kept whole, so a number and its unit
+   still read left to right; the spaces and punctuation between them are
+   turned around and their brackets mirrored. The player's time
+   ("1:23 / 4:56") is one part.
+
+Page text is put in display order before it is drawn, because the chrome
+painter draws left to right and cannot shape. Tab, HOME, address-bar,
+saved-page and suggestion titles are ordered and cut together, at draw
+time, in a small cache keyed by the attached packs. A player menu row is
+ordered once, when it arrives, and marked with U+200F RIGHT-TO-LEFT MARK
+when it reads right to left; the painter takes the mark off and cuts the row
+to its space when it draws it, so a pack attached later fits it again. The
+player's title bar keeps the direction beside its ordered title. Catalog
+strings are stored in display order already and are never passed through
+the page-text path, which would turn them around a second time. Arabic rows
+are shaped and ordered when the catalog loads; Hebrew rows are only ordered
+(no joining, and the catalog uses unpointed text without niqqud or
+presentation forms).
+
+The browser's own pages that list files (the saved file, Saved offline and
+Installed homebrew) set `dir=auto` on the page and on each file name, so
+the page follows the interface language and each name its own text.
 
 ## Qualification
 

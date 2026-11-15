@@ -44,8 +44,9 @@ struct TilefinchUiTranslation {
     const uint32_t *values;
     const uint8_t *key_lengths;
     const char *text;
-    /* Arabic only: one allocation of a display offset per row (UINT32_MAX
-       when the value is used as is), followed by the display text. */
+    /* Right-to-left languages only: one allocation of a display offset per
+       row (UINT32_MAX when the value is used as is), followed by the
+       display text. */
     uint32_t *visual;
     const char *visual_text;
     size_t count;
@@ -54,9 +55,10 @@ struct TilefinchUiTranslation {
 
 static const TilefinchUiTranslation *bound_translation;
 
-/* Shaping maps a two-byte Arabic letter to a three-byte presentation form,
-   and mirroring keeps ASCII brackets ASCII, so a character's display bytes
-   never exceed max(its own bytes, 3). The fill below still checks. */
+/* Shaping maps a two-byte Arabic letter to a three-byte presentation form
+   (Hebrew letters are only reordered), and mirroring keeps ASCII brackets
+   ASCII, so a character's display bytes never exceed max(its own bytes, 3).
+   The fill below still checks. */
 static size_t translation_visual_bound(const char *value)
 {
     size_t bytes = 1; /* NUL */
@@ -115,6 +117,12 @@ static bool translation_prepare_visual_text(TilefinchUiTranslation *t)
     t->visual = visual;
     t->visual_text = (const char *) visual + offsets;
     return true;
+}
+
+bool tilefinch_ui_language_right_to_left(unsigned language)
+{
+    return language < TILEFINCH_UI_LANGUAGE_COUNT
+        && ui_languages[language].right_to_left;
 }
 
 const TilefinchUiLanguageSpec *tilefinch_ui_language_spec(unsigned language)
@@ -238,7 +246,7 @@ static TilefinchUiTranslation *translation_parse(
         at = end + 1;
     }
     if (row != count || at != value_bytes) goto invalid;
-    if (language == TILEFINCH_UI_LANGUAGE_ARABIC
+    if (tilefinch_ui_language_right_to_left(language)
         && !translation_prepare_visual_text(t)) goto invalid;
     return t;
 invalid:

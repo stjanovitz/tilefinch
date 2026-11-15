@@ -801,11 +801,23 @@ rather than by its size ([PSP envelope](engineering/PSP_ENVELOPE.md#memory-profi
 - **Circuit breaker.** One navigation's parser stage may spend at most the
   realm's source allowance in source work, twenty seconds across its blocking
   checkpoints (the PSP shows "PAGE SCRIPTS NS OF 20S" once a load has spent
-  three), or three consecutive failed scripts. When a bound trips, the
-  remaining blocking scripts are soft-skipped, parsing continues, the page is
-  marked Limited, and the author realm is retired for that document so
-  queued deferred, asynchronous, and dynamic work cannot resume the abandoned
-  hydration.
+  three), or three consecutive scripts that fail in a way that says the realm
+  is in trouble: out of memory, a watchdog interrupt, a compile admission
+  refusal, a refused mutation checkpoint, or another engine failure. A
+  script's own exception (a throw, or a SyntaxError) goes to the window
+  `error` event and the page goes on, as in Chromium, which has no such
+  breaker: it neither counts nor resets the run (a healthy script resets
+  it), and the time and work bounds already cap what failing scripts cost.
+  Transport, CSP, SRI and memory-admission skips never reached the
+  evaluator and do not count either. When a bound trips, the remaining
+  blocking scripts are soft-skipped, parsing continues, the page is marked
+  Limited, and the author realm is retired for that document so queued
+  deferred, asynchronous, and dynamic work cannot resume the abandoned
+  hydration (no element event fires for the skipped scripts: no realm is
+  left to observe one). The validation log and the host's
+  `TILEFINCH_TRACE_SCRIPT_FAILURES` trace print a `tilefinch-script-breaker`
+  line with the reason; the lab's parser-checkpoint line counts the author
+  exceptions the breaker left uncounted (`author-exceptions=`).
 
 Compiled scripts are reused, never trusted. ES modules and classic scripts
 each have a bounded session table of bytecode keyed by the response, the

@@ -248,6 +248,12 @@ set(PSP_BROWSER_NANOSVG_ALLOCATION_PATCH
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/nanosvg-239e102-allocation-growth.patch")
 set(PSP_BROWSER_NANOSVG_COVERAGE_PATCH
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/nanosvg-239e102-coverage-hooks.patch")
+set(PSP_BROWSER_NANOSVG_NUMBER_PATCH
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/nanosvg-239e102-float-number-parse.patch")
+set(PSP_BROWSER_NANOSVG_ROWS_PATCH
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/nanosvg-239e102-raster-row-bounds.patch")
+set(PSP_BROWSER_NANOSVG_STYLE_PATCH
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/nanosvg-239e102-style-declaration-end.patch")
 set(PSP_BROWSER_POCKETSPHINX_SOURCE_DIR "" CACHE PATH
     "Optional prepared PocketSphinx 5.1.1 source tree for PSP voice input")
 option(PSP_BROWSER_PACKED_VOICE_LEXICON
@@ -274,6 +280,9 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${PSP_BROWSER_NANOSVG_GEOMETRY_PATCH}"
     "${PSP_BROWSER_NANOSVG_DIVISIONS_PATCH}"
     "${PSP_BROWSER_NANOSVG_COVERAGE_PATCH}"
+    "${PSP_BROWSER_NANOSVG_NUMBER_PATCH}"
+    "${PSP_BROWSER_NANOSVG_ROWS_PATCH}"
+    "${PSP_BROWSER_NANOSVG_STYLE_PATCH}"
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/pocketsphinx/pocketsphinx-5.1.1-psp-int32.patch"
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/pocketsphinx/pocketsphinx-5.1.1-psp-no-mmap.patch"
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/pocketsphinx/pocketsphinx-5.1.1-psp-timer.patch"
@@ -1058,10 +1067,42 @@ else()
     )
     FetchContent_MakeAvailable(nanosvg)
 endif()
-foreach(nanosvg_patch IN ITEMS
-        "${PSP_BROWSER_NANOSVG_PATCH}" "${PSP_BROWSER_NANOSVG_GEOMETRY_PATCH}"
-        "${PSP_BROWSER_NANOSVG_DIVISIONS_PATCH}" "${PSP_BROWSER_NANOSVG_ALLOCATION_PATCH}"
-        "${PSP_BROWSER_NANOSVG_COVERAGE_PATCH}")
+set(nanosvg_patches
+    "${PSP_BROWSER_NANOSVG_PATCH}" "${PSP_BROWSER_NANOSVG_GEOMETRY_PATCH}"
+    "${PSP_BROWSER_NANOSVG_DIVISIONS_PATCH}" "${PSP_BROWSER_NANOSVG_ALLOCATION_PATCH}"
+    "${PSP_BROWSER_NANOSVG_COVERAGE_PATCH}"
+    "${PSP_BROWSER_NANOSVG_NUMBER_PATCH}" "${PSP_BROWSER_NANOSVG_ROWS_PATCH}"
+    "${PSP_BROWSER_NANOSVG_STYLE_PATCH}")
+# The NanoSVG patches form a chain: a later one may rewrite lines an earlier
+# one added (the row-bounds patch rewrites the bounded-fixed-edges limit), so
+# once it is in, the earlier patch no longer reverses cleanly on its own.
+# Find the last patch already in the source (one that reverses cleanly;
+# --forward keeps patch from offering to apply an unapplied one instead) and
+# apply only the ones after it.
+list(LENGTH nanosvg_patches nanosvg_patch_count)
+set(nanosvg_patch_index ${nanosvg_patch_count})
+set(nanosvg_patches_applied 0)
+while(nanosvg_patch_index GREATER 0)
+    math(EXPR nanosvg_patch_index "${nanosvg_patch_index} - 1")
+    list(GET nanosvg_patches ${nanosvg_patch_index} nanosvg_patch)
+    execute_process(
+        COMMAND "${PATCH_EXECUTABLE}" --forward --dry-run --silent -R -p1
+            -i "${nanosvg_patch}"
+        WORKING_DIRECTORY "${nanosvg_SOURCE_DIR}"
+        RESULT_VARIABLE nanosvg_patch_reverse_result
+        OUTPUT_QUIET
+        ERROR_QUIET)
+    if(nanosvg_patch_reverse_result EQUAL 0)
+        math(EXPR nanosvg_patches_applied "${nanosvg_patch_index} + 1")
+        break()
+    endif()
+endwhile()
+if(nanosvg_patches_applied EQUAL nanosvg_patch_count)
+    set(nanosvg_patches "")
+elseif(nanosvg_patches_applied GREATER 0)
+    list(SUBLIST nanosvg_patches ${nanosvg_patches_applied} -1 nanosvg_patches)
+endif()
+foreach(nanosvg_patch IN LISTS nanosvg_patches)
     execute_process(
         COMMAND "${CMAKE_COMMAND}"
             -DPATCH_SOURCE_DIR=${nanosvg_SOURCE_DIR}

@@ -108,6 +108,19 @@ class ResourceTests(unittest.TestCase):
             "translations/ui/v16/pt.tful": "43704abf269667b59ecd129a6728a0cf480c7429c0ed577af71ebd089564d954",
             "translations/ui/v16/bn.tful": "3abd4a97e1ab4ac4cd9e6227afcfacc014ea746f44d57bb6a3a759ecd9666641",
             "translations/ui/v16/as.tful": "1b14d3af11c10fc4d6ad845395da38adaa0f85c257f7fc84ea368438a2ed57eb",
+            "translations/ui/v17/es.tful": "6c45c52fae6251e77a3c2104de9923a5326c68246ca485538a2fb4481e489019",
+            "translations/ui/v17/fr.tful": "9fdb1c0a282867f2f44ee0123875ba2e5d26b6cd075f6168adc9acca70b762d6",
+            "translations/ui/v17/de.tful": "3381d8c6d8b5a8bfd1eb2f4f88438c4f3697813e14ba5116c70061846ab2667a",
+            "translations/ui/v17/ja.tful": "cdeabd3a5ff2e0f1e9eda6ba0f7d16b1bc6c74b48651ad15b5aa6a6238faac76",
+            "translations/ui/v17/ru.tful": "d482a3250cb3d0f4139f2e99754d24a6d9ab751cdbdcd9980ab4ed405c666050",
+            "translations/ui/v17/uk.tful": "22364f9b68535581f9446b56633d801c1339f23b45fc072f8d04e0239679ae14",
+            "translations/ui/v17/zh-hans.tful": "2471a39dc2fa5b515275f23334a5c67e3a4900344f8b11afe1f9e17cc1d2237f",
+            "translations/ui/v17/ko.tful": "5eb1a45bd74244d2785276eecc8fa1650613e10c16fc46ababad603634bcd7a9",
+            "translations/ui/v17/hi.tful": "f4245bf0f1f5177e3072f35ac5df89e12778a0b63fb6ac3eeecb229b8d9317a9",
+            "translations/ui/v17/ar.tful": "53b421c9ad09a33b2f0a783f70189848ee58c2f4d3e576e62671a9d592596ebc",
+            "translations/ui/v17/pt.tful": "d345414e6b472071bb60e69eb9df288f5ffbd41997d379d10c6d3062d811f592",
+            "translations/ui/v17/bn.tful": "aea1a6de553a79526fcf860221653c515d3db2b139d410d84438533d1e1c7b23",
+            "translations/ui/v17/as.tful": "17ac666499a2f692fb24ce40577d660528162fbfb048703e4c2fa3b014aff8c5",
         }
         generated = outputs(resources)
         for key, digest in published.items():
@@ -127,13 +140,13 @@ class ResourceTests(unittest.TestCase):
         old_languages = generator.CATALOGS[6][1]
         rows = generator.read_rows(7, old_languages)
         for column, (code, label, glyphs) in enumerate(old_languages, 1):
-            self.assertIn(f'"translations/ui/v17/{code}.tful"', manifest)
-        self.assertIn('"translations/ui/v17/pt.tful"', manifest)
+            self.assertIn(f'"translations/ui/v18/{code}.tful"', manifest)
+        self.assertIn('"translations/ui/v18/pt.tful"', manifest)
         portuguese = generator.read_rows(8, generator.CATALOGS[7][1])
         self.assertGreaterEqual({row[0] for row in portuguese}, {row[0] for row in rows})
         self.assertEqual(dict(portuguese)["Portuguese"], "Português")
-        self.assertIn('"translations/ui/v17/bn.tful"', manifest)
-        self.assertIn('"translations/ui/v17/as.tful"', manifest)
+        self.assertIn('"translations/ui/v18/bn.tful"', manifest)
+        self.assertIn('"translations/ui/v18/as.tful"', manifest)
 
     def test_v16_stays_frozen_under_the_narrow_bound(self):
         # v16 is pinned by the release candidate, whose reader has 16-bit
@@ -155,14 +168,51 @@ class ResourceTests(unittest.TestCase):
         header = (ROOT / "include/tilefinch/ui_language.h").read_text()
         self.assertIn("#define TILEFINCH_UI_TRANSLATION_BYTES (128u * 1024u)", header)
 
+    def test_v17_stays_frozen(self):
+        # v17 is published and pinned by released browsers; Hebrew and the
+        # rows after it went into v18 instead of new columns and rows here.
+        for name, digest in (("source.tsv", "dbdab76c36c9ef4ba8202ff7e4ef9b2ec71c3ab0b9632eb059401c2d5c91cc39"),
+                             ("hi.sequences", "c764fd269b0f8ed2ca8d8c3a7779df2105f2d287f18091c3d8d148527f20cb09"),
+                             ("bengali-assamese.sequences", "6b6b9b9838821bf6545b5404b0b5e412dfaf0c13398b3c76cbb39544347970aa")):
+            self.assertEqual(hashlib.sha256((ROOT / "translations/ui/v17" / name)
+                                            .read_bytes()).hexdigest(), digest, name)
+
+    def test_v18_catalog(self):
+        # v18 holds every language, Hebrew last, and keeps every v17 key
+        # it does not retire.
+        # Hebrew reads right to left with Arabic and needs no shaping: no
+        # niqqud or cantillation marks, no presentation forms.
+        version, languages = generator.CATALOGS[-1]
+        self.assertEqual(version, 18)
+        self.assertEqual(languages, generator.CATALOGS[-2][1] + [("he", "Hebrew", "HEBREW")])
+        self.assertEqual(generator.RIGHT_TO_LEFT, {"ar", "he"})
+        rows = generator.read_rows(18, languages)
+        v17 = generator.read_rows(17, generator.CATALOGS[-2][1])
+        self.assertLessEqual({row[0] for row in v17} - generator.RETIRED_KEYS[18],
+                             {row[0] for row in rows})
+        hebrew = [(row[0], row[-1]) for row in rows]
+        self.assertEqual(dict(hebrew)["Hebrew"], "עברית")
+        for key, value in hebrew:
+            self.assertRegex(value, "[\u05d0-\u05ea]|^[^A-Za-z]*$|^(JavaScript|Memory Stick|Shorts)$", key)
+            self.assertFalse(any(0x0591 <= ord(c) <= 0x05c7 or 0xfb1d <= ord(c) <= 0xfb4f
+                                 for c in value), key)
+        manifest = outputs()[ROOT / "src/generated/ui_languages.inc"].decode()
+        self.assertIn('BROWSER_GLYPH_LANGUAGE_HEBREW', manifest)
+        self.assertRegex(manifest, r'\{"he", "Hebrew", BROWSER_GLYPH_LANGUAGE_HEBREW, "[0-9a-f]{64}", 18, 1, '
+                                   r'"translations/ui/v18/he.tful", true\},')
+        self.assertRegex(manifest, r'\{"ar", "Arabic", .*, true\},')
+        self.assertEqual(manifest.count(", true},"), 2)
+
     def test_active_clusters_are_in_the_required_glyph_revision(self):
         # A pack revision is built from the sequences of the catalog that
         # introduced it (MINIMUM_GLYPH_SEQUENCES). A later catalog that keeps
         # that revision must not need a cluster outside those sequences;
         # otherwise reword the row or raise the revision and rebuild the pack.
-        active = generator.ACTIVE_VERSION
         for glyphs, name in (("DEVANAGARI", "hi.sequences"),
                              ("BENGALI_ASSAMESE", "bengali-assamese.sequences")):
+            # The newest catalog with this script's labels.
+            active = max(version for version, languages in generator.CATALOGS
+                         if any(script == glyphs for _, _, script in languages))
             required = generator.minimum_glyph_sequence(glyphs, active)
             built_from = max(first for (script, first), sequence
                              in generator.MINIMUM_GLYPH_SEQUENCES.items()
@@ -188,6 +238,37 @@ class ResourceTests(unittest.TestCase):
             self.assertTrue(all(value != key for value in labels[key]), key)
         header = (ROOT / "include/tilefinch/ui_language.h").read_text()
         self.assertLessEqual(len(rows), int(re.search(r"TILEFINCH_UI_TRANSLATION_ROWS (\d+)u", header).group(1)))
+
+    def test_chrome_labels_have_translations(self):
+        # The page's bottom bar, the Collections screen and the Settings
+        # screens draw these keys; every language translates them.
+        rows = generator.read_rows(generator.ACTIVE_VERSION, generator.CATALOGS[-1][1])
+        # Lookups fold ASCII case: COLLECTIONS reads the Collections row.
+        labels = {generator.folded_key(row[0]): row[1:] for row in rows}
+        required = {"Open", "Back", "Bar", "Search", "Reload", "Edit", "Enter", "Cancel",
+            "COLLECTIONS", "BOOKMARKS", "HISTORY", "DOWNLOADS",
+            "Saved items", "SHOTS", "NOTHING HERE YET", "NO DOWNLOADS YET",
+            "NOTHING SAVED YET", "NO BOOKMARKS YET", "NO HISTORY YET",
+            "NO SCREENSHOT LIST AVAILABLE", "L/R SECTION   O BACK",
+            "PRESS SQUARE AGAIN TO UNINSTALL", "N/A", "Always", "Never", "Smart",
+            "Website fonts", "Save YouTube login",
+            "X Edit URL   O Back", "X Apply   O Back", "Copy .tfth files into data/themes",
+            "Showing first 12 valid theme files", "Themes", "Midnight", "Cobalt", "Slate",
+            "Ember", "Daylight", "CONTINUE", "NOTHING OPEN YET", "CURRENT PAGE", "Untitled",
+            "Page", "Profile", "STARTING BROWSER", "HOLD L WHILE STARTING", "Opening video",
+            "Chinese (S)", "Chinese (T)", "Italian", "Sans", "Serif", "Standard",
+            "Save YouTube login?", "Voice input", "Update channel"}
+        # Words that read the same in the language itself.
+        shared = {("COLLECTIONS", "fr"), ("DOWNLOADS", "de"), ("Smart", "de"),
+                  ("Cobalt", "fr"), ("Page", "fr"), ("Sans", "es"), ("Sans", "fr"),
+                  ("Serif", "es"), ("Serif", "fr")}
+        codes = [code for code, _, _ in generator.CATALOGS[-1][1]]
+        for key in required:
+            values = labels.get(generator.folded_key(key))
+            self.assertIsNotNone(values, key)
+            for code, value in zip(codes, values):
+                if (key, code) not in shared:
+                    self.assertNotEqual(value.casefold(), key.casefold(), (key, code))
 
     def test_build_resource_list_includes_each_immutable_download(self):
         listed = subprocess.check_output([sys.executable, str(ROOT / "tools/generate_ui_translations.py"),
